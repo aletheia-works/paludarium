@@ -4,7 +4,7 @@
 
 The first release version is decided as `0.1.0` (Build and Test Q7,
 2026-10-18). The Cargo workspace version, the eleven internal dependency
-versions and the npm package `@paludarium/wasm` are all `0.1.0`;
+versions and the npm package `@aletheia-works/paludarium-wasm` are all `0.1.0`;
 `Cargo.lock` and `fuzz/Cargo.lock` changed only in the workspace crates'
 version lines. The fuzz crate (`paludarium-fuzz`, `publish = false`) keeps its
 own `0.0.0`. Nothing has been published yet: FR10.1 stays unverified until the
@@ -137,7 +137,7 @@ the one-time first publication with scoped tokens (steps 3 and 4b below).
 `release_gate` accepts exactly one of the two: `trusted_publishers_registered:
 true` (OIDC), or `first_publication: true` when the protected publish job's
 own live query finds all eleven crate names on crates.io and
-`@paludarium/wasm` on npm absent, or, to resume a first publication that
+`@aletheia-works/paludarium-wasm` on npm absent, or, to resume a first publication that
 stopped partway, finds every name that is present holding exactly the
 release version with the approved digest (step 3). Any `registries_absent`,
 `registry_presence` or `registry_resume_verified` value in the document is
@@ -194,7 +194,7 @@ and its registry checks are complete.
    `can_admins_bypass: false` (preflight refuses a missing rule, an empty
    reviewer list, or bypass `true` or unknown).
 3. **Decide name ownership and the first publication.** When: before
-   step 4. Confirm that all eleven crate names and `@paludarium/wasm` are
+   step 4. Confirm that all eleven crate names and `@aletheia-works/paludarium-wasm` are
    free (not yet on crates.io or npm) or owned by the project. crates.io
    lets a Trusted Publisher be registered only for a crate that already
    exists, so the first publication cannot use OIDC. For that one release
@@ -209,10 +209,13 @@ and its registry checks are complete.
      also any other crate name that starts with `paludarium`, so it is
      broader than the eleven crates.
    - npm: create a granular access token with the shortest expiration the
-     release needs, "Read and write" permission limited to the
-     `@paludarium` scope (organization), and no other packages; it must be
-     usable from CI for publishing (check npm's current settings for
-     two-factor bypass when creating it).
+     release needs and "Read and write" permission limited to the
+     `@aletheia-works` scope (organization); it must be usable from CI for
+     publishing (check npm's current settings for two-factor bypass when
+     creating it). A package that does not exist yet cannot be selected on
+     its own, so this token also covers the organization's other packages
+     (such as `@aletheia-works/terrarium`): keep its expiration short and
+     revoke it right after the first publication (step 4b).
    - Store them as **environment secrets of `release`** (not repository or
      organization secrets): `U15_FIRST_CRATES_IO_TOKEN` and
      `U15_FIRST_NPM_TOKEN`. Environment secrets reach only the protected
@@ -240,8 +243,8 @@ and its registry checks are complete.
      every one of the eleven crates must have (users by login, teams as
      `github:<org>:<team>`, exactly as `https://crates.io/api/v1/crates/<name>/owners`
      lists them in `users[].login`), and `U15_NPM_MAINTAINERS` to the
-     comma-separated npm maintainer names of `@paludarium/wasm` (as
-     `https://registry.npmjs.org/%40paludarium%2Fwasm` lists them in
+     comma-separated npm maintainer names of `@aletheia-works/paludarium-wasm` (as
+     `https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm` lists them in
      `maintainers[].name`). A resume (below) is refused when either is
      unset, or when a present name has any other owner set (an extra or
      missing owner included).
@@ -256,7 +259,7 @@ and its registry checks are complete.
      same `publish.yml` run (same tag and head; it needs the `release`
      approval again; the tokens must not have expired). The publish job's
      live check then accepts `first_publication: true` only when every
-     crate name and `@paludarium/wasm` that is already present holds
+     crate name and `@aletheia-works/paludarium-wasm` that is already present holds
      exactly `0.1.0` with the approved digest: the crates.io `checksum`
      equals the SHA-256 of that crate's approved `.crate`, and the npm
      `dist.integrity` equals the approved tarball's SHA-512 integrity
@@ -273,14 +276,14 @@ and its registry checks are complete.
      overwriting a published version.
    The first publication is accepted only when the acceptance document
    declares `first_publication: true` (step 5) and the publish job's live
-   query finds none of the eleven crates nor `@paludarium/wasm` on any
+   query finds none of the eleven crates nor `@aletheia-works/paludarium-wasm` on any
    registry, or only matching versions as in the resume above. If a
    crate's `0.1.0` is uploaded outside `publish.yml`, `publish.yml` later
    only verifies it, and stops unless the registry checksum equals the
    `.crate` digest built by `release-check.yml` for the release head.
    Confirm: before step 5, `https://crates.io/api/v1/crates/<name>` returns
    404 for each of the eleven names and
-   `https://registry.npmjs.org/%40paludarium%2Fwasm` returns 404, and the
+   `https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm` returns 404, and the
    `release` environment lists both secrets (names only).
 4. **Register the Trusted Publishers.** When: for the first release,
    right after its publication (step 6) succeeded; for a later release,
@@ -290,7 +293,7 @@ and its registry checks are complete.
    release on, only OIDC (Trusted Publishing) is used, and the publish job
    refuses to run in OIDC mode while either secret is still set. For each
    of the eleven crates on crates.io and for
-   `@paludarium/wasm` on npm, register repository
+   `@aletheia-works/paludarium-wasm` on npm, register repository
    `aletheia-works/paludarium`, workflow `publish.yml` and environment
    `release`. npm also requires `repository.url` in `package.json` to
    match (it does) and its supported runner and CLI (npm 12.2.0 on Node
@@ -331,10 +334,10 @@ and its registry checks are complete.
    deployment. Confirm: the run
    succeeded and `publication-progress.json` (in the run's artifact
    `u15-publication-progress-attempt-<n>`) lists all eleven
-   crates and `@paludarium/wasm`; then, independently, each crate's
+   crates and `@aletheia-works/paludarium-wasm`; then, independently, each crate's
    `https://crates.io/api/v1/crates/<name>/0.1.0` `checksum` equals the
    `.crate` SHA-256 in the `u15-package` artifact, `npm view
-   @paludarium/wasm@0.1.0 dist.integrity` equals the tarball's SHA-512
+   @aletheia-works/paludarium-wasm@0.1.0 dist.integrity` equals the tarball's SHA-512
    integrity, and the npm provenance attestation names the upstream
    repository, `publish.yml` and that head. Only then FR10.1 becomes OK.
    After the first release, do step 4 (Trusted Publishers) and 4b

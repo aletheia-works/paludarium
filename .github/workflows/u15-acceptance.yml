@@ -9,11 +9,11 @@ on:
   workflow_dispatch:
     inputs:
       trusted_publishers_registered:
-        description: Set true only after a person registered the Trusted Publisher (upstream, publish.yml, release) for all eleven crates and @paludarium/wasm.
+        description: Set true only after a person registered the Trusted Publisher (upstream, publish.yml, release) for all eleven crates and @aletheia-works/paludarium-wasm.
         type: boolean
         default: false
       first_publication:
-        description: Set true only for the one-time first publication with the scoped tokens in the release environment; the publish job still requires all eleven crates and @paludarium/wasm to be absent from every registry. Never true together with trusted_publishers_registered.
+        description: Set true only for the one-time first publication with the scoped tokens in the release environment; the publish job still requires all eleven crates and @aletheia-works/paludarium-wasm to be absent from every registry. Never true together with trusted_publishers_registered.
         type: boolean
         default: false
 permissions:

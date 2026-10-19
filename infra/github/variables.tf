@@ -51,7 +51,7 @@ variable "crates_io_owners" {
 }
 
 variable "npm_maintainers" {
-  description = "npm maintainer names @paludarium/wasm must have (U15_NPM_MAINTAINERS, see docs/release.md)"
+  description = "npm maintainer names @aletheia-works/paludarium-wasm must have (U15_NPM_MAINTAINERS, see docs/release.md)"
   type        = list(string)
   default     = ["jambalaya56562"]
 }

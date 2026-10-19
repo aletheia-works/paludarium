@@ -66,7 +66,7 @@ def registry_state(status,body,version,digest):
 def publish_sequence(state,inventory,upload,verify):
     """Adapter boundary tested with mocks; CLI never invokes upload."""
     eligible=policy.release_gate(state,inventory);completed=[]
-    for name in eligible['order']+['@paludarium/wasm']:
+    for name in eligible['order']+['@aletheia-works/paludarium-wasm']:
         result=upload(name,eligible['version'])
         policy.require(result.get('published') is True,'upload failed; later uploads stopped')
         completed.append(name)
@@ -90,8 +90,8 @@ def validate(root):
 
 REGISTRY_USER_AGENT='paludarium-release (https://github.com/aletheia-works/paludarium)'
 CRATES_API='https://crates.io/api/v1/crates/'
-NPM_NAME='@paludarium/wasm'
-NPM_PACKAGE_URL='https://registry.npmjs.org/%40paludarium%2Fwasm'
+NPM_NAME='@aletheia-works/paludarium-wasm'
+NPM_PACKAGE_URL='https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm'
 CARGO_TOKEN_NAMES=('CARGO_REGISTRY_TOKEN','U15_OIDC_CRATES_IO_TOKEN')
 FIRST_TOKEN_NAMES=('U15_FIRST_CRATES_IO_TOKEN','U15_FIRST_NPM_TOKEN')
 # Step17 (R-17): each publication child gets only the variables it needs (allow-list).
@@ -187,7 +187,7 @@ def present_mismatch(name,version,expected,owners):
     return None
 
 def registries_absent(order,version=None,approved=None,owners=None):
-    """Live check of the eleven crate names and @paludarium/wasm.
+    """Live check of the eleven crate names and @aletheia-works/paludarium-wasm.
     Step17 (R-16): when some names are present and `approved` (the approved digests, or a
     loader called only then) is given, each present name must hold exactly the approved
     version with the approved digest; `resume` is True only when every present one matches.
@@ -365,12 +365,12 @@ def publish_artifacts(root,evidence):
             with urllib.request.urlopen(url,timeout=30) as response:body=json.load(response)
         except urllib.error.HTTPError as error:
             if error.code!=404:raise
-            attempted.append('@paludarium/wasm')
+            attempted.append('@aletheia-works/paludarium-wasm')
             require_success(run_command([str(node),str(npm),'publish',str(tarballs[0]),'--access','public','--provenance','--ignore-scripts'],root,directory/'publish-npm',120,npm_env))
-            uploaded.append('@paludarium/wasm')
+            uploaded.append('@aletheia-works/paludarium-wasm')
             with urllib.request.urlopen(url,timeout=30) as response:body=json.load(response)
         registry_state(200,dict(version=body['version'],digest=body['dist']['integrity']),approved['version'],integrity)
-        completed.append('@paludarium/wasm')
+        completed.append('@aletheia-works/paludarium-wasm')
         return dict(published=completed,head=approved['head'],version=approved['version'],authentication=approved['authentication'])
     finally:
         with (directory/'publication-progress.json').open('x') as f:json.dump(dict(completed=completed,attempted=attempted,uploaded_but_possibly_unverified=uploaded,automatic_retry=False),f,indent=2)

@@ -107,7 +107,7 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(result['absent']);self.assertEqual(len(result['checked']),12);self.assertEqual(len(registry.requests),12)
         self.assertTrue(all(r.get_method()=='GET' and r.get_header('User-agent')==check.REGISTRY_USER_AGENT for r in registry.requests))
     def test_registry_name_present(self):
-        for name in ('paludarium-types','@paludarium/wasm'):
+        for name in ('paludarium-types','@aletheia-works/paludarium-wasm'):
             with self.subTest(name):
                 result=self.absence(Registry(present=[name]))
                 self.assertFalse(result['absent']);self.assertEqual(result['present'],[name])

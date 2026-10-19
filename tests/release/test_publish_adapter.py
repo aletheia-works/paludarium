@@ -27,7 +27,7 @@ class PublishAdapterTests(unittest.TestCase):
             p=self.art/'source/target/package'/(name+'-0.1.0.crate');p.parent.mkdir(parents=True,exist_ok=True)
             tar(p,{'Cargo.toml':m.encode(),'LICENSE':b'Apache','README.md':b'usage'},name+'-0.1.0');self.crates.append(p)
         files={n:b'export {};' for n in package.REQUIRED_JS}
-        files.update({'package.json':b'{"name":"@paludarium/wasm","version":"0.1.0"}',
+        files.update({'package.json':b'{"name":"@aletheia-works/paludarium-wasm","version":"0.1.0"}',
           'paludarium.wasm':b'\0asm\x01\0\0\0','index.d.ts':b'export {};','LICENSE':b'Apache','README.md':b'usage'})
         self.npm=self.art/'wasm.tgz';tar(self.npm,files)
         with zipfile.ZipFile(self.art/'source-snapshot.zip','x') as z:
@@ -98,12 +98,12 @@ class PublishAdapterTests(unittest.TestCase):
         self.env.update(U15_FIRST_CRATES_IO_TOKEN=CANARY['U15_FIRST_CRATES_IO_TOKEN'],U15_FIRST_NPM_TOKEN=CANARY['U15_FIRST_NPM_TOKEN'])
     def test_resume_uploads_only_remaining(self):
         self.first_mode();done=self.inv['order'][:3];self.uploaded=set(done)
-        result=self.execute();self.assertEqual(result['published'],self.inv['order']+['@paludarium/wasm'])
+        result=self.execute();self.assertEqual(result['published'],self.inv['order']+['@aletheia-works/paludarium-wasm'])
         names=[n for n,_ in self.envs]
         self.assertFalse([n for n in names if any(n.endswith('-'+d) for d in done)])
         self.assertEqual(len([n for n in names if n.startswith('publish-') and n!='publish-npm']),8);self.assertIn('publish-npm',names)
         progress=json.loads((self.out/'publication-progress.json').read_text())
-        self.assertEqual(progress['attempted'],self.inv['order'][3:]+['@paludarium/wasm']);self.assertFalse(progress['automatic_retry'])
+        self.assertEqual(progress['attempted'],self.inv['order'][3:]+['@aletheia-works/paludarium-wasm']);self.assertFalse(progress['automatic_retry'])
     # Step24 (review 04, finding 6a): `authorize` is replaced here, so what stops this run is the
     # publish loop's own registry_state check of a present version, not the R-16 resume check
     # (that one is tested through check.authorize in test_api.py).
@@ -124,9 +124,9 @@ class PublishAdapterTests(unittest.TestCase):
         self.assertEqual(self.uploaded,{first});self.assertEqual(self.envs,[])
     def test_approved_digests_from_package_artifact(self):
         digests=check.approved_digests(self.root,self.head)
-        self.assertEqual(set(digests),set(self.inv['order'])|{'@paludarium/wasm'})
+        self.assertEqual(set(digests),set(self.inv['order'])|{'@aletheia-works/paludarium-wasm'})
         self.assertEqual(digests['paludarium-types'],self.result['crates']['paludarium-types']['sha256'])
-        self.assertEqual(digests['@paludarium/wasm'],'sha512-'+base64.b64encode(hashlib.sha512(self.npm.read_bytes()).digest()).decode())
+        self.assertEqual(digests['@aletheia-works/paludarium-wasm'],'sha512-'+base64.b64encode(hashlib.sha512(self.npm.read_bytes()).digest()).decode())
         with self.assertRaisesRegex(ValueError,'wrong head'):check.approved_digests(self.root,'b'*40)
         self.npm.write_bytes(self.npm.read_bytes()+b'changed')
         with self.assertRaisesRegex(ValueError,'tarball differs'):check.approved_digests(self.root,self.head)

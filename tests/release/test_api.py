@@ -77,7 +77,7 @@ class ApiTests(unittest.TestCase):
     def test_document_cannot_assert_absence(self):
         from test_check import Registry
         with self.assertRaisesRegex(ValueError,'trusted publishers unregistered'):
-            self.authorize_first(Registry(present=['@paludarium/wasm']),registries_absent=True)
+            self.authorize_first(Registry(present=['@aletheia-works/paludarium-wasm']),registries_absent=True)
     # Step17 (R-16): a stopped first publication continues only over matching present versions.
     def test_first_publication_resumes_when_present_versions_match(self):
         from test_check import Registry,approved_set
@@ -101,9 +101,9 @@ class ApiTests(unittest.TestCase):
             self.authorize_first(Registry(present=done,versions={n:approved[n] for n in done},yanked=done),approved)
     def test_first_publication_resume_refused_on_one_difference(self):
         from test_check import Registry,approved_set
-        approved=approved_set(self.inv['order']);done=self.inv['order'][:4]+['@paludarium/wasm']
-        versions={n:approved[n] for n in done};versions['@paludarium/wasm']='sha512-other'
-        with self.assertRaisesRegex(ValueError,'resume refused: @paludarium/wasm'):self.authorize_first(Registry(present=done,versions=versions),approved)
+        approved=approved_set(self.inv['order']);done=self.inv['order'][:4]+['@aletheia-works/paludarium-wasm']
+        versions={n:approved[n] for n in done};versions['@aletheia-works/paludarium-wasm']='sha512-other'
+        with self.assertRaisesRegex(ValueError,'resume refused: @aletheia-works/paludarium-wasm'):self.authorize_first(Registry(present=done,versions=versions),approved)
     def test_document_cannot_assert_resume(self):
         from test_check import Registry
         with self.assertRaisesRegex(ValueError,'resume refused'):

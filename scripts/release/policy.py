@@ -52,7 +52,7 @@ def inventory(root):
     require(set(packages)==set(PUBLIC) and set(private)==PRIVATE,'public/private package population differs')
     order=dependency_order(packages)
     npm=json.loads((root/'packages/paludarium-wasm/package.json').read_bytes())
-    require(npm['name']=='@paludarium/wasm' and npm['version']==version,'npm identity/version differs')
+    require(npm['name']=='@aletheia-works/paludarium-wasm' and npm['version']==version,'npm identity/version differs')
     return dict(version=version,packages=packages,private=private,order=order,npm=npm)
 
 def protected_environment(environment):
@@ -74,7 +74,7 @@ def authentication(state):
     # Step17 (R-16): a stopped first publication continues only when the live check found every
     # present crate/npm version equal to the approved artifact (registry_resume_verified).
     verified=state.get('registries_absent') is True or state.get('registry_resume_verified') is True
-    require(first and verified,'trusted publishers unregistered and no verified first publication (all eleven crates and @paludarium/wasm absent from every registry, or every present one at the approved version and digest)')
+    require(first and verified,'trusted publishers unregistered and no verified first publication (all eleven crates and @aletheia-works/paludarium-wasm absent from every registry, or every present one at the approved version and digest)')
     return 'first-publication-token'
 
 def release_gate(state, manifests):

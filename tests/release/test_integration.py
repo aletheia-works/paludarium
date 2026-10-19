@@ -17,7 +17,7 @@ class ReleaseIntegrationTests(unittest.TestCase):
         state,inventory=valid();uploaded=[]
         def upload(n,v):uploaded.append(n);return dict(published=len(uploaded)<3)
         with self.assertRaises(ValueError):check.publish_sequence(state,inventory,upload,lambda n,r:True)
-        self.assertEqual(len(uploaded),3);self.assertNotIn('@paludarium/wasm',uploaded)
+        self.assertEqual(len(uploaded),3);self.assertNotIn('@aletheia-works/paludarium-wasm',uploaded)
     def test_post_publication_digest_failure(self):
         state,inventory=valid();uploaded=[]
         def upload(n,v):uploaded.append(n);return dict(published=True)

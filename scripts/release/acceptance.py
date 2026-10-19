@@ -12,7 +12,7 @@ input), not a registry check: registry ownership and Trusted Publisher
 registration can only be proven by the real publication. first_publication
 (also a declaration, default false) asks for the one-time scoped-token path;
 release_gate accepts it only after the protected publish job has found every
-public crate and @paludarium/wasm absent from the registries.
+public crate and @aletheia-works/paludarium-wasm absent from the registries.
 """
 import argparse
 import hashlib
@@ -424,7 +424,7 @@ def produce(api, head, trusted_publishers_registered, first_publication=False):
                 trusted_publishers_basis='human declaration through the workflow_dispatch input; not verified against registries',
                 first_publication=first_publication,
                 first_publication_basis=('human declaration through the workflow_dispatch input; the protected publish job '
-                                         'must still find all eleven crates and @paludarium/wasm absent from every registry'),
+                                         'must still find all eleven crates and @aletheia-works/paludarium-wasm absent from every registry'),
                 published=False)
 
 

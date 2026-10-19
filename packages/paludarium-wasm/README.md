@@ -1,10 +1,10 @@
-# @paludarium/wasm
+# @aletheia-works/paludarium-wasm
 
 Runs Linux x86-64 guest programs in a shared WebAssembly memory with dedicated
 execution Workers. JIT is not available in this package.
 
 ```js
-import { createPaludarium } from "@paludarium/wasm";
+import { createPaludarium } from "@aletheia-works/paludarium-wasm";
 
 const launcher = await createPaludarium({ wasmUrl: "/paludarium.wasm" });
 try {

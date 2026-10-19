@@ -3,7 +3,7 @@
 ## Supported versions
 
 Security fixes target the current `main` branch and the latest published
-release of the paludarium crates and `@paludarium/wasm`. Older versions do not
+release of the paludarium crates and `@aletheia-works/paludarium-wasm`. Older versions do not
 have a separate long-term support commitment.
 
 ## Reporting a vulnerability

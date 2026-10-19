@@ -98,7 +98,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(sorted(internal),sorted(policy.PUBLIC));self.assertEqual({v['version'] for v in internal.values()},{'0.1.0'})
         self.assertEqual(len(inv['packages']),11);self.assertEqual({r['version'] for r in inv['packages'].values()},{'0.1.0'})
         self.assertEqual({v for r in inv['packages'].values() for v in r['dependencies'].values()},{'0.1.0'})
-        self.assertEqual(inv['npm']['version'],'0.1.0');self.assertEqual(inv['npm']['name'],'@paludarium/wasm')
+        self.assertEqual(inv['npm']['version'],'0.1.0');self.assertEqual(inv['npm']['name'],'@aletheia-works/paludarium-wasm')
     def test_single_version_drift_rejected(self):
         drifts={'workspace dependency':('Cargo.toml','paludarium-mmu = { path = "crates/paludarium-mmu", version = "0.1.0" }','paludarium-mmu = { path = "crates/paludarium-mmu", version = "0.1.1" }'),
                 'npm package':('packages/paludarium-wasm/package.json','"version":"0.1.0"','"version":"0.1.1"'),

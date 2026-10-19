@@ -15,7 +15,7 @@ class PackageTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(dir=ROOT/'target/u15');self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name);self.path=self.root/'npm.tgz'
         self.files={n:b'export {};' for n in package.REQUIRED_JS}
-        self.files.update({'package.json':json.dumps(dict(name='@paludarium/wasm',version='0.0.0')).encode(),
+        self.files.update({'package.json':json.dumps(dict(name='@aletheia-works/paludarium-wasm',version='0.0.0')).encode(),
           'index.d.ts':b'export {};','paludarium.wasm':b'\0asm\x01\0\0\0','LICENSE':b'Apache-2.0','README.md':b'usage'})
     def inspect(self,extra=None,expected_change=None):
         tar(self.path,self.files,extra=extra)

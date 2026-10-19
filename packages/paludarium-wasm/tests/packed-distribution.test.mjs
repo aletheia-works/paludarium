@@ -24,7 +24,7 @@ const packReport = JSON.parse(run(npm, ["pack", "--json", "--ignore-scripts", "-
 const reports = Array.isArray(packReport) ? packReport : Object.values(packReport);
 assert.equal(reports.length, 1, "exactly one distribution must be packed");
 const packed = reports[0];
-assert.equal(packed.name, "@paludarium/wasm");
+assert.equal(packed.name, "@aletheia-works/paludarium-wasm");
 run("/usr/bin/tar", ["-xzf", resolve(workspace, packed.filename), "-C", workspace]);
 const extracted = resolve(workspace, "package");
 const invoke = (directory, mode) => run(process.execPath, [child, directory, guest, mode]);

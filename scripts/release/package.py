@@ -27,7 +27,7 @@ def members(path,prefix):
 def inspect_npm(path,expected):
     policy.require(sha(path.read_bytes())==expected['tar_sha256'],'tarball digest mismatch')
     files=members(path,'package');metadata=json.loads(files['package.json'])
-    policy.require(metadata['name']=='@paludarium/wasm' and metadata['version']==expected['version'],'npm metadata mismatch')
+    policy.require(metadata['name']=='@aletheia-works/paludarium-wasm' and metadata['version']==expected['version'],'npm metadata mismatch')
     required=REQUIRED_JS|{'index.d.ts','paludarium.wasm','LICENSE','README.md','package.json'}
     policy.require(required<=set(files),'required npm file missing')
     policy.require([n for n in files if n.endswith('.wasm')]==['paludarium.wasm'],'exactly one production Wasm required')

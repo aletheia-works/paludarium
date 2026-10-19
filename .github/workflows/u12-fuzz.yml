@@ -20,6 +20,11 @@ jobs:
       ASAN_OPTIONS: detect_leaks=1
       LSAN_OPTIONS: suppressions=/work/fuzz/lsan.supp
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false

@@ -40,6 +40,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         env:
           GIT_CONFIG_COUNT: 1
@@ -207,6 +212,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -245,6 +255,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -285,6 +300,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -306,6 +326,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -325,6 +350,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -362,6 +392,11 @@ jobs:
       PALUDARIUM_U5_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
       PALUDARIUM_U6_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -485,6 +520,11 @@ jobs:
       PALUDARIUM_U3_NATIVE_FAULTS: ${{ github.workspace }}/target/u3-guests/fault-observe.native
       PALUDARIUM_U3_NATIVE_CPUID: ${{ github.workspace }}/target/u3-guests/cpuid-observe.native
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -540,6 +580,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false

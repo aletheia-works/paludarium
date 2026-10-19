@@ -30,7 +30,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
       - run: rustup toolchain install nightly-2026-10-11 --profile minimal
       - run: rustup target add x86_64-unknown-linux-musl --toolchain nightly-2026-10-11
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
         with:
           tool: cargo-deny
       - name: Runner readiness before native expectations

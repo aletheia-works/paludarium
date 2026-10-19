@@ -47,7 +47,7 @@ jobs:
       - name: Python comparison boundary regressions and defined coverage scope
         run: python3 -m coverage run --data-file=target/u12-python.coverage --include='tests/guests/u12/settings.py,tests/guests/u12/oracle.py,tests/guests/u12/host_comparison.py' -m unittest discover -s tests/guests/u12/runner-tests -p 'test_*.py'
       - run: rustup toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
         with:
           tool: cargo-llvm-cov@0.9.1
       - name: Record actual inputs and run native Host boundaries
@@ -186,7 +186,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.24
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.24
         with:
           tool: cargo-deny
       # Licenses compatible with Apache-2.0, crates.io only, RustSec,
@@ -265,7 +265,7 @@ jobs:
               (out/'native-input-receipt.json').write_text(json.dumps(rows,indent=2)+'\n')
               assert code==0 and len(data.splitlines())==expected_rows and not (out/(name+'.stderr')).read_bytes()
           PY_NATIVE
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.24
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.24
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

@@ -135,7 +135,6 @@ locals {
 
     # Applied by .github/labeler.yml.
     "ci"           = { color = "ededed", description = "CI and GitHub Actions" }
-    "infra"        = { color = "1d76db", description = "Infrastructure as Code under infra/" }
     "dependencies" = { color = "0366d6", description = "Pull requests that update a dependency file" }
     "emulator"     = { color = "5319e7", description = "Emulator crates and fuzz targets" }
     "wasm"         = { color = "6f42c1", description = "WebAssembly runtime, JIT and npm package" }
@@ -147,12 +146,28 @@ locals {
     "status: blocked"       = { color = "000000", description = "Blocked by something" }
     "status: in-progress"   = { color = "0052cc", description = "Currently being worked on" }
     "status: apply-failure" = { color = "b60205", description = "Auto-filed when Terraform Apply fails on main; auto-closed on recovery" }
+
+    # The organization's terraform-apply workflow files its failure issue with
+    # "type: bug", "priority: p0", "scope: infra" and "status: apply-failure".
+    "scope: infra" = { color = "5319e7", description = "Infrastructure as Code under infra/" }
+    "priority: p0" = { color = "b60205", description = "Critical - must fix immediately" }
+    "priority: p1" = { color = "d93f0b", description = "High - important for near-term" }
+    "priority: p2" = { color = "fbca04", description = "Medium - normal priority" }
+    "priority: p3" = { color = "0e8a16", description = "Low - nice to have" }
+
+    # Added by Dependabot to its pull requests.
+    "github_actions" = { color = "000000", description = "Pull requests that update GitHub Actions code" }
+    "javascript"     = { color = "168700", description = "Pull requests that update javascript code" }
   }
 
-  # GitHub's default labels, created with the repository.
+  # Labels that existed before this module manages them: GitHub's defaults,
+  # the labels of the first failed apply's issue, the labeler's "ci" and
+  # Dependabot's labels.
   existing_labels = toset([
     "bug", "documentation", "duplicate", "enhancement", "good first issue",
     "help wanted", "invalid", "question", "wontfix",
+    "type: bug", "priority: p0", "scope: infra", "status: apply-failure",
+    "ci", "dependencies", "github_actions", "javascript",
   ])
 }
 

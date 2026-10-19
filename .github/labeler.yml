@@ -2,7 +2,7 @@ ci:
   - changed-files:
       - any-glob-to-any-file:
           - ".github/**"
-infra:
+"scope: infra":
   - changed-files:
       - any-glob-to-any-file:
           - "infra/**"

@@ -81,9 +81,10 @@ jobs:
       - run: rustup toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
       - name: Compile and lint the Windows configuration, including actual FFI and tests
         run: cargo clippy --locked -p paludarium-host -p paludarium-harness --all-targets -- -D warnings
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+      - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          tool: cargo-llvm-cov@0.9.1
+          install_args: aqua:taiki-e/cargo-llvm-cov
+          cache: false
       - name: Record actual inputs and run native Host boundaries
         run: |
           mkdir -p target/u13/windows
@@ -275,9 +276,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.24
+      - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          tool: cargo-deny
+          install_args: cargo-deny
+          cache: false
       # Licenses compatible with Apache-2.0, crates.io only, RustSec,
       # forbidden crates (NFR8.1, NFR8.4).
       - run: cargo deny --locked check
@@ -354,9 +356,10 @@ jobs:
               (out/'native-input-receipt.json').write_text(json.dumps(rows,indent=2)+'\n')
               assert code==0 and len(data.splitlines())==expected_rows and not (out/(name+'.stderr')).read_bytes()
           PY_NATIVE
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.24
+      - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          tool: cargo-llvm-cov
+          install_args: aqua:taiki-e/cargo-llvm-cov
+          cache: false
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # NFR3.3: fails below 80% of lines. The floor is never lowered.
       - name: Workspace line coverage >= 80%

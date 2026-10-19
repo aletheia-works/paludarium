@@ -18,9 +18,10 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
       - run: rustup toolchain install nightly-2026-10-11 --profile minimal --component rust-src
       - run: rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown --toolchain nightly-2026-10-11
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+      - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          tool: cargo-deny
+          install_args: cargo-deny
+          cache: false
       - name: Runner tests
         run: python3 -m unittest discover -s tests/guests/u11/runner-tests -p 'test_*.py'
       - name: Build fixed guests and audit dependencies

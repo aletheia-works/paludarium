@@ -1,4 +1,4 @@
-# The protected environment of the publish job in .github/workflows/release.yml
+# The protected environment of the publish job in .github/workflows/publish.yml
 # (docs/release.md, step 2). Release preflight refuses an environment without
 # a required reviewer or with administrator bypass on.
 data "github_user" "release_reviewers" {
@@ -44,4 +44,17 @@ resource "github_actions_environment_variable" "npm_maintainers" {
   environment   = github_repository_environment.release.environment
   variable_name = "U15_NPM_MAINTAINERS"
   value         = join(",", var.npm_maintainers)
+}
+
+# Release Please (.github/workflows/release.yml) runs only while this is true.
+variable "release_automation_enabled" {
+  description = "Enable release PR generation and, on dispatch, tag/GitHub release creation"
+  type        = bool
+  default     = true
+}
+
+resource "github_actions_variable" "release_automation" {
+  repository    = github_repository.this.name
+  variable_name = "RELEASE_AUTOMATION_ENABLED"
+  value         = tostring(var.release_automation_enabled)
 }

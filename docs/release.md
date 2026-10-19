@@ -146,17 +146,38 @@ or both `true`, is refused. Unit and integration tests
 replace the GitHub adapter with in-memory data: they do not prove that any
 real run, artifact or registration exists.
 
+## Release Please
+
+`.github/workflows/release.yml` runs Release Please as in the other
+aletheia-works repositories, with the `aletheia-works-bot` App token
+(`vars.BOT_CLIENT_ID`, `secrets.BOT_PRIVATE_KEY`) and only while the
+repository variable `RELEASE_AUTOMATION_ENABLED` (managed in
+`infra/github/release.tf`) is `true`. Unlike those repositories, a push to
+main only creates or updates the release PR (`skip-github-release`): the
+same-head evidence of step 5 must exist for the release PR's merge commit
+before any tag, so only a manual dispatch creates the tag and the GitHub
+release. The labels `autorelease: pending` and `autorelease: tagged` are
+managed in `infra/github/main.tf`.
+
+`.github/release-please-config.json` uses the `simple` release type and
+updates the workspace version, the eleven internal dependency versions, the
+workspace crates' entries in `Cargo.lock` and `fuzz/Cargo.lock` (the fuzz
+crate keeps `0.0.0`), and the npm package version. `release-as: 0.1.0`
+fixes the first version; remove it in the first change after `v0.1.0` is
+published, or the next release PR proposes `0.1.0` again.
+
 ## Owner hand-off (Step 16)
 
 U15 does not publish. The person (and, where noted, an upstream
 administrator) does these steps in order. FR10.1 stays a GAP until step 6
 and its registry checks are complete.
 
-1. **Bring the change to upstream main.** When: after the fork CI for
-   the release head has passed and the person approved it. An upstream
-   administrator opens and merges a pull request from fork
-   `codex/build-and-test` into `aletheia-works/paludarium` `main`.
-   Confirm: note the new main head SHA;
+1. **Merge the release PR.** When: when the version Release Please
+   proposes is the one to publish. `release.yml` (Release Please) keeps a
+   release PR open from every push to main; it changes only the versions
+   (`Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock`, `package.json`), the
+   manifest and `CHANGELOG.md`. Merging it creates no tag. Confirm: note
+   the merge commit, the new main head SHA;
    `gh api repos/aletheia-works/paludarium/commits/<sha> --jq .commit.verification.verified`
    prints `true`, and the `CI` (`ci.yml`) push run for that SHA starts.
 2. **Create the protected `release` environment.** When: before any tag
@@ -177,7 +198,7 @@ and its registry checks are complete.
    free (not yet on crates.io or npm) or owned by the project. crates.io
    lets a Trusted Publisher be registered only for a crate that already
    exists, so the first publication cannot use OIDC. For that one release
-   only, `release.yml` can publish with short-lived, scoped tokens that the
+   only, `publish.yml` can publish with short-lived, scoped tokens that the
    person creates (Step14b, Q4); it never creates a token itself:
    - crates.io: on crates.io, Account Settings, API Tokens, create a new
      token with an expiration date as short as the release needs (for
@@ -195,7 +216,7 @@ and its registry checks are complete.
    - Store them as **environment secrets of `release`** (not repository or
      organization secrets): `U15_FIRST_CRATES_IO_TOKEN` and
      `U15_FIRST_NPM_TOKEN`. Environment secrets reach only the protected
-     publish job, after the deployment approval. `release.yml` passes them
+     publish job, after the deployment approval. `publish.yml` passes them
      only to the `cargo publish` and `npm publish` child processes (dry
      runs get no token), never prints them, and receipts and
      `publication-progress.json` record no token value. Each child gets
@@ -228,11 +249,11 @@ and its registry checks are complete.
      timeout, network error). Do not delete, yank or re-upload anything,
      and do not move the tag. Keep the artifact
      `u15-publication-progress-attempt-<n>` of the stopped run (Step24:
-     `release.yml` uploads `publication-progress.json` and the command
+     `publish.yml` uploads `publication-progress.json` and the command
      receipts, which hold no token values, even when the job stops; keep
      it before its 90-day retention ends) and the job logs. After the cause is gone (for the rate limit,
      after the waiting time crates.io names), re-run the publish job of the
-     same `release.yml` run (same tag and head; it needs the `release`
+     same `publish.yml` run (same tag and head; it needs the `release`
      approval again; the tokens must not have expired). The publish job's
      live check then accepts `first_publication: true` only when every
      crate name and `@paludarium/wasm` that is already present holds
@@ -248,13 +269,13 @@ and its registry checks are complete.
      different digest, a digest that cannot be read, a yanked version, or
      other or unreadable owners, the job refuses before uploading
      anything. Then the owner decides the recovery
-     outside `release.yml` (for example a new version), never by
+     outside `publish.yml` (for example a new version), never by
      overwriting a published version.
    The first publication is accepted only when the acceptance document
    declares `first_publication: true` (step 5) and the publish job's live
    query finds none of the eleven crates nor `@paludarium/wasm` on any
    registry, or only matching versions as in the resume above. If a
-   crate's `0.1.0` is uploaded outside `release.yml`, `release.yml` later
+   crate's `0.1.0` is uploaded outside `publish.yml`, `publish.yml` later
    only verifies it, and stops unless the registry checksum equals the
    `.crate` digest built by `release-check.yml` for the release head.
    Confirm: before step 5, `https://crates.io/api/v1/crates/<name>` returns
@@ -270,14 +291,14 @@ and its registry checks are complete.
    refuses to run in OIDC mode while either secret is still set. For each
    of the eleven crates on crates.io and for
    `@paludarium/wasm` on npm, register repository
-   `aletheia-works/paludarium`, workflow `release.yml` and environment
+   `aletheia-works/paludarium`, workflow `publish.yml` and environment
    `release`. npm also requires `repository.url` in `package.json` to
    match (it does) and its supported runner and CLI (npm 12.2.0 on Node
    26.12.0 here). Confirm: each crate's and the npm package's Trusted
    Publishing settings show exactly that repository, workflow and
    environment.
 5. **Produce same-head quality and acceptance evidence.** When: on the
-   main head from step 1, after steps 2 and 3 (first release) or 2 to 4
+   release PR's merge commit from step 1, while it is still the main head, after steps 2 and 3 (first release) or 2 to 4
    (later releases). The `ci.yml` push run
    starts by itself; dispatch each of the others once:
    `gh workflow run u12-quality.yml --repo aletheia-works/paludarium --ref main`,
@@ -294,10 +315,16 @@ and its registry checks are complete.
    `release-evidence.json`, with that head, eight `quality` rows, the five
    `acceptance` IDs all `passed: true`, and exactly one of
    `first_publication: true` or `trusted_publishers_registered: true`.
-6. **Push the tag and approve the environment.** When: after step 5,
+6. **Create the tag and approve the environment.** When: after step 5,
    with the person's explicit approval of the exact version, tag, head,
    registries, artifact digests, authentication and environment settings.
-   Create `v0.1.0` on exactly that main head and push it. `release.yml`
+   Dispatch Release Please once:
+   `gh workflow run release.yml --repo aletheia-works/paludarium --ref main`.
+   It finds the merged release PR, creates tag `v<version>` on its merge
+   commit and the GitHub release, and the tag starts `publish.yml`. If any
+   commit landed on main after the merge commit, preflight still accepts
+   the tag only when the merge commit is reachable from main and every
+   evidence run in step 5 is for that commit. `publish.yml`
    then runs preflight and the package check and waits at the `release`
    environment; a required reviewer (the maintainer, unless self-review is
    prevented) checks the head, version and digests and approves the
@@ -309,7 +336,7 @@ and its registry checks are complete.
    `.crate` SHA-256 in the `u15-package` artifact, `npm view
    @paludarium/wasm@0.1.0 dist.integrity` equals the tarball's SHA-512
    integrity, and the npm provenance attestation names the upstream
-   repository, `release.yml` and that head. Only then FR10.1 becomes OK.
+   repository, `publish.yml` and that head. Only then FR10.1 becomes OK.
    After the first release, do step 4 (Trusted Publishers) and 4b
    (revoke and delete both tokens) before any later tag.
 
@@ -327,8 +354,8 @@ performance rerun is used to wait for a passing result.
 
 Only after the user explicitly approves the precise version, tag/head,
 registries, artifact digests, authentication and protection configuration may
-the owner create/push a version tag. No plan approval authorizes tag creation
-or publication by itself. `release.yml` accepts only an exact
+the owner dispatch `release.yml` to create the version tag. No plan approval authorizes tag creation
+or publication by itself. `publish.yml` accepts only an exact
 `vMAJOR.MINOR.PATCH` after Python validation, verifies signed main
 reachability and actual environment protection before builds, then requires
 the protected human approval.

@@ -78,7 +78,7 @@ def validate(root):
     for row in inv['packages'].values():
         policy.require(bool(row['description']) and bool(row['repository']) and bool(row['readme']),'public metadata incomplete: '+row['name'])
     policy.require(all(row['publish'] is False for row in inv['private'].values()),'private package is publishable')
-    for name in ['release-check.yml','release.yml']:
+    for name in ['release-check.yml','publish.yml']:
         text=(root/'.github/workflows'/name).read_text()
         policy.require('persist-credentials: false' in text and 'timeout-minutes:' in text,'workflow isolation/timeout absent')
         import re
@@ -387,7 +387,7 @@ def main():
     elif args.mode=='authorize':
         result=authorize(ROOT,args.evidence)
         if os.environ.get('GITHUB_OUTPUT'):
-            # A fixed enum value selects the release.yml credential step; no secret is written.
+            # A fixed enum value selects the publish.yml credential step; no secret is written.
             with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('authentication='+result['authentication']+'\n')
     elif args.mode=='fetch-acceptance':result=fetch_acceptance(ROOT)
     else:result=publish_artifacts(ROOT,args.evidence)

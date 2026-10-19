@@ -14,7 +14,7 @@ Organization settings, including the allowed GitHub Actions, live in
 | Vulnerability alerts | `main.tf` |
 | Branch ruleset for `main`, with the required status checks | `main.tf` |
 | Issue/PR labels | `main.tf` |
-| `release` environment, its `v*.*.*` tag policy and its variables | `release.tf` |
+| `release` environment, its `v*.*.*` tag policy and its variables, and `RELEASE_AUTOMATION_ENABLED` | `release.tf` |
 
 The repository and GitHub's default labels existed before this module and are
 adopted by `import` blocks in `main.tf`, so the first apply starts from an

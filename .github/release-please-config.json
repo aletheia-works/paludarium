@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "665313e43a911fb9f5f5bb60757955c09413cf4b",
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "pull-request-header": "Release Please calculated this version from Conventional Commits. Merging this PR only bumps the versions: produce the same-head evidence on the merge commit (docs/release.md), then dispatch the Release workflow to create the tag and GitHub release, which starts the approved registry publication.",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "component": "paludarium",
+      "include-component-in-tag": false,
+      "release-as": "0.1.0",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.dependencies.*.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='paludarium' || @.name.value=='paludarium-cpu' || @.name.value=='paludarium-decoder' || @.name.value=='paludarium-harness' || @.name.value=='paludarium-host' || @.name.value=='paludarium-jit' || @.name.value=='paludarium-kernel' || @.name.value=='paludarium-loader' || @.name.value=='paludarium-mmu' || @.name.value=='paludarium-runtime' || @.name.value=='paludarium-types' || @.name.value=='paludarium-vfs' || @.name.value=='paludarium-wasm')].version"
+        },
+        {
+          "type": "toml",
+          "path": "fuzz/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='paludarium-cpu' || @.name.value=='paludarium-decoder' || @.name.value=='paludarium-host' || @.name.value=='paludarium-jit' || @.name.value=='paludarium-kernel' || @.name.value=='paludarium-loader' || @.name.value=='paludarium-mmu' || @.name.value=='paludarium-types' || @.name.value=='paludarium-vfs')].version"
+        },
+        {
+          "type": "json",
+          "path": "packages/paludarium-wasm/package.json",
+          "jsonpath": "$.version"
+        }
+      ]
+    }
+  }
+}

@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       trusted_publishers_registered:
-        description: Set true only after a person registered the Trusted Publisher (upstream, release.yml, release) for all eleven crates and @paludarium/wasm.
+        description: Set true only after a person registered the Trusted Publisher (upstream, publish.yml, release) for all eleven crates and @paludarium/wasm.
         type: boolean
         default: false
       first_publication:

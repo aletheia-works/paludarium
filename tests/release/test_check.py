@@ -140,13 +140,13 @@ class CheckTests(unittest.TestCase):
         text=(self.root/'receipt/receipt.json').read_text()
         self.assertFalse([v for v in CANARY.values() if v in text])
     def test_release_workflow_secret_scope(self):
-        text=(ROOT/'.github/workflows/release.yml').read_text();publish=text.split('\n  publish:\n',1)[1]
+        text=(ROOT/'.github/workflows/publish.yml').read_text();publish=text.split('\n  publish:\n',1)[1]
         self.assertEqual(sorted(re.findall(r'secrets\.(\w+)',text)),['U15_FIRST_CRATES_IO_TOKEN','U15_FIRST_NPM_TOKEN'])
         self.assertEqual(len(re.findall(r'secrets\.',publish)),2);self.assertIn('    environment: release\n',publish)
         self.assertFalse([l for l in text.splitlines() if 'secrets.' in l and not re.fullmatch(r'\s+U15_FIRST_\w+: \$\{\{ secrets\.U15_FIRST_\w+ \}\}',l)])
         oidc=publish.split('id: crates\n',1)[1].split('\n',1)[0]
         self.assertEqual(oidc.strip(),"if: steps.authorize.outputs.authentication == 'oidc'")
-        for name in ('release.yml','u15-acceptance.yml','release-check.yml'):
+        for name in ('publish.yml','u15-acceptance.yml','release-check.yml'):
             self.assertNotRegex((ROOT/'.github/workflows'/name).read_text(),r'(?i)echo[^\n]*(token|secret)')
     # Step17 (R-16): resuming a stopped first publication.
     def presence(self,registry,approved,owners=OWNERS):
@@ -229,7 +229,7 @@ class CheckTests(unittest.TestCase):
     def job_environment(self):
         return dict(PATH='/bin',HOME='/home/runner',CI='true',GITHUB_ACTIONS='true',GH_TOKEN='canary-gh-0004',GITHUB_TOKEN='canary-gh-0005',
             ACTIONS_ID_TOKEN_REQUEST_URL='https://oidc.example.invalid',ACTIONS_ID_TOKEN_REQUEST_TOKEN='canary-oidc-request-0006',
-            GITHUB_REPOSITORY=policy.REPOSITORY,GITHUB_SHA='a'*40,GITHUB_WORKFLOW_REF=policy.REPOSITORY+'/.github/workflows/release.yml@refs/tags/v0.1.0',
+            GITHUB_REPOSITORY=policy.REPOSITORY,GITHUB_SHA='a'*40,GITHUB_WORKFLOW_REF=policy.REPOSITORY+'/.github/workflows/publish.yml@refs/tags/v0.1.0',
             RUNNER_ENVIRONMENT='github-hosted',NPM_CONFIG_USERCONFIG='/tmp/.npmrc',RUSTC='/toolchain/rustc',UNRELATED_SECRET='canary-other-0007',
             PALUDARIUM_RELEASE_NPM='/npm-cli.js')
     def test_cargo_children_get_no_github_or_oidc_request_variables(self):

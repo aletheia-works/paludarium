@@ -116,6 +116,10 @@ resource "github_repository_ruleset" "main" {
 
 locals {
   labels = {
+    # Release Please (.github/workflows/release.yml) requires both.
+    "autorelease: pending" = { color = "ededed", description = "Release PR awaiting merge" }
+    "autorelease: tagged"  = { color = "ededed", description = "Release PR tagged by release-please" }
+
     "bug"              = { color = "d73a4a", description = "Something isn't working" }
     "documentation"    = { color = "0075ca", description = "Improvements or additions to documentation" }
     "duplicate"        = { color = "cfd3d7", description = "This issue or pull request already exists" }

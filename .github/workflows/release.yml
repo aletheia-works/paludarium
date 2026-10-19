@@ -1,100 +1,59 @@
-name: Approved registry release
+name: Release
+
+# Release Please keeps the release PR up to date on every push to main.
+# Merging that PR only bumps the versions. The tag and GitHub release are
+# created only by a manual dispatch, after the same-head evidence for the
+# merge commit exists (docs/release.md); the tag then starts publish.yml.
 on:
   push:
-    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+    branches: [main]
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Terraform Apply']
+    types: [completed]
+
 permissions:
   contents: read
-  actions: read
+
 concurrency:
-  group: registry-release-${{ github.ref }}
+  group: release-please
   cancel-in-progress: false
+
 jobs:
-  preflight:
-    runs-on: ubuntu-24.04
+  release:
+    name: Update release PR or create release
+    if: >-
+      github.repository == 'aletheia-works/paludarium' &&
+      github.ref == 'refs/heads/main' &&
+      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
+      (github.event_name != 'workflow_run' ||
+        (github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.head_branch == 'main'))
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get an aletheia-works-bot token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.15.0'
-      - name: Verify actual repository, exact version tag, signed main head and reviewers
+          client-id: ${{ vars.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Require the IaC-managed release labels
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: python -B scripts/release/check.py --mode preflight
-  packages:
-    needs: preflight
-    uses: ./.github/workflows/release-check.yml
-    permissions:
-      contents: read
-  publish:
-    needs: [preflight, packages]
-    environment: release
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.15.0'
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '26.12.0'
-          registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: u15-package
-          path: target/u15
-      - name: Obtain same-head acceptance evidence
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python -B scripts/release/check.py --mode fetch-acceptance --output target/u15/release-evidence.json
-      - name: Verify official runs, all acceptance conditions, actual human environment approval and authentication mode
-        id: authorize
-        env:
-          GH_TOKEN: ${{ github.token }}
-          # Expected owners of names already present when a first publication resumes (docs/release.md step 3).
-          U15_CRATES_IO_OWNERS: ${{ vars.U15_CRATES_IO_OWNERS }}
-          U15_NPM_MAINTAINERS: ${{ vars.U15_NPM_MAINTAINERS }}
-        run: python -B scripts/release/check.py --mode authorize --evidence target/u15/release-evidence.json
-      # Trusted Publishing (OIDC) is the default. Only a verified first
-      # publication (authentication=first-publication-token) skips it and uses
-      # the person's scoped, expiring tokens from the release environment.
-      - name: Temporary crates.io OIDC token (revoked by action post step)
-        id: crates
-        if: steps.authorize.outputs.authentication == 'oidc'
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-      - name: Fixed tools for publishing verified artifacts
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          npm install --prefix target/u15/tools --ignore-scripts npm@12.2.0
-          rustup toolchain install nightly-2026-10-11 --profile minimal
-      - name: Publish in dependency order and verify registry digests
-        env:
-          GH_TOKEN: ${{ github.token }}
-          U15_OIDC_CRATES_IO_TOKEN: ${{ steps.crates.outputs.token }}
-          U15_FIRST_CRATES_IO_TOKEN: ${{ secrets.U15_FIRST_CRATES_IO_TOKEN }}
-          U15_FIRST_NPM_TOKEN: ${{ secrets.U15_FIRST_NPM_TOKEN }}
-          U15_CRATES_IO_OWNERS: ${{ vars.U15_CRATES_IO_OWNERS }}
-          U15_NPM_MAINTAINERS: ${{ vars.U15_NPM_MAINTAINERS }}
-        run: |
-          PALUDARIUM_TEST_NODE="$(command -v node)" PALUDARIUM_RELEASE_NPM="$GITHUB_WORKSPACE/target/u15/tools/node_modules/npm/bin/npm-cli.js" python -B scripts/release/check.py --mode publish --evidence target/u15/release-evidence.json
-      # Step24 (review 04, finding 5): keep the progress record and the command receipts after the
-      # runner is gone, also when publishing stopped. They hold no token values (check.py records none).
-      - name: Keep the publication progress and command receipts
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+          gh api "repos/$GITHUB_REPOSITORY/labels/autorelease%3A%20pending" > /dev/null
+          gh api "repos/$GITHUB_REPOSITORY/labels/autorelease%3A%20tagged" > /dev/null
+
+      - name: Update release PR, or create tag and GitHub release on dispatch
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          name: u15-publication-progress-attempt-${{ github.run_attempt }}
-          path: |
-            target/u15/publication-progress.json
-            target/u15/dry-*/receipt.json
-            target/u15/publish-*/receipt.json
-          if-no-files-found: warn
-          retention-days: 90
+          token: ${{ steps.app-token.outputs.token }}
+          target-branch: main
+          config-file: .github/release-please-config.json
+          manifest-file: .github/release-please-manifest.json
+          skip-github-release: ${{ github.event_name != 'workflow_dispatch' }}

@@ -1,0 +1,16 @@
+{
+  "name": "paludarium-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "stage": "bun scripts/stage-assets.ts",
+    "dev": "bun run stage && bun --bun vitepress dev",
+    "build": "bun run stage && bun --bun vitepress build",
+    "preview": "bun --bun vitepress preview"
+  },
+  "devDependencies": {
+    "@aletheia-works/paludarium-wasm": "0.1.0",
+    "coi-serviceworker": "0.1.7",
+    "vitepress": "1.6.4"
+  }
+}

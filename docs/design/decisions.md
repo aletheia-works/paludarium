@@ -1,0 +1,93 @@
+# Design decisions
+
+The main decisions made while building paludarium, and why.
+
+## Using existing components
+
+External crates and tools are welcome, after checking that their licence is
+compatible with Apache-2.0. Anything with copyright or licence concerns, or
+with bugs or a poor fit, is written in-house for that part. Dependencies come
+from crates.io only, and `cargo deny` checks them.
+
+No code is copied from other emulators. blink and others are references for
+behaviour and design only. The blink derivatives whose history contained
+malware (`lanmower/blink` and its line) are never referenced or depended on.
+
+## Wrapping an existing decoder
+
+The first plan was to write the decoder too. When the policy on external
+components was revised, [iced-x86](https://github.com/icedland/iced) (MIT) was
+chosen instead. `paludarium-decoder` wraps it and shows only its own
+instruction types to other crates, so the decoder can be replaced, or partly
+rewritten, without touching anything else.
+
+## A software MMU
+
+WebAssembly (wasm32) memory stops at 4 GB, so a guest's 64-bit address space
+cannot be placed in it directly. paludarium therefore uses a software MMU with
+two-level page tables of 4 KiB pages on every host. Every access is checked; a
+missing page or a permission violation becomes a guest exception.
+
+## Owning the waiting primitives
+
+`futex`, `epoll` and `eventfd` are implemented in paludarium's kernel instead of
+with the host's equivalents. macOS and Windows have no Linux `futex`, and in
+WebAssembly the only way to wait is `Atomics.wait` and `notify`. The host
+provides only the smallest tools: wait, wake, and sleep with a deadline. The
+price is care with races in the wait queues.
+
+## Separating the CPU and the kernel
+
+The CPU stops at a system call or an exception and returns the reason; it does
+not know the kernel. The kernel owns the thread state. Each can then be tested
+alone, and the JIT and the interpreter are easy to swap.
+
+## Separating the kernel and the filesystem
+
+The filesystem is separate from the kernel so that the guarantee "a guest
+cannot leave the given directory" can be checked in `paludarium-vfs` alone, and
+fuzzed with a narrow target. Host directories are reached only relative to a
+directory capability opened when the Session is created (with cap-std on
+native hosts).
+
+## Threads in WebAssembly
+
+This was one of the biggest uncertainties, so it was tried at small scale in
+the first stage: two Workers sharing memory used `memory.atomic.wait32` and
+`notify` successfully on Node.js, Chromium, Firefox and the real Safari before
+the real work started.
+
+- The JavaScript launcher creates the Workers: WebAssembly cannot create
+  Workers itself, the main thread cannot wait, and the launcher can stop them
+  all at once.
+- To share the whole emulator (the Rust heap and std) between Workers, std is
+  rebuilt with atomics and every Worker gets its own stack and TLS.
+
+## The JIT as a separate component
+
+The JIT is a component of its own, next to the interpreter. A setting turns it
+on or off, and the same tests compare both. Instruction semantics then live in
+two places, the CPU and the JIT, so differential tests keep them equal.
+
+Rust translates blocks into WebAssembly bytes; the JavaScript in the guest's
+Worker compiles and runs them. Generated code keeps the MMU's permission and
+range checks, and translations of rewritten pages are discarded.
+
+## Three entry points
+
+A library, a command and a WebAssembly package give each kind of user a fitting
+entry point, and the command serves the differential tests. The price is more
+interfaces to keep compatible.
+
+## Explicit CPU differences
+
+When a `REP` instruction faults midway, Intel and AMD leave different flags.
+paludarium does not inspect the host CPU to choose; it models the behaviour
+explicitly, following Intel's design by default.
+
+## Trusted Publishing only
+
+Releases go to crates.io and npm by Trusted Publishing (OIDC) only, with no
+long-lived token stored anywhere, and npm packages carry provenance. Published
+versions cannot be deleted, so a problem is handled with a crates.io yank or an
+npm deprecation and a fixed release.

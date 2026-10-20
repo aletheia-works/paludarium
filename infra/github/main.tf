@@ -21,7 +21,15 @@ resource "github_repository" "this" {
 
   lifecycle {
     prevent_destroy = true
+    # github_repository_pages below manages Pages.
+    ignore_changes = [pages]
   }
+}
+
+# The documentation site (docs/), built and deployed by .github/workflows/docs.yml.
+resource "github_repository_pages" "this" {
+  repository = github_repository.this.name
+  build_type = "workflow"
 }
 
 # The repository and GitHub's default labels existed before this module: the

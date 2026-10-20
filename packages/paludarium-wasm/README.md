@@ -1,7 +1,8 @@
 # @aletheia-works/paludarium-wasm
 
 Runs Linux x86-64 guest programs in a shared WebAssembly memory with dedicated
-execution Workers. JIT is not available in this package.
+execution Workers. Pass `jit: true` to `run()` to translate blocks of x86-64
+register instructions into WebAssembly; it is off by default.
 
 ```js
 import { createPaludarium } from "@aletheia-works/paludarium-wasm";

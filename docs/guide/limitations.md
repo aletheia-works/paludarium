@@ -1,0 +1,40 @@
+# Limitations
+
+paludarium is a young project. These things are not possible yet, or not
+verified.
+
+## Not supported
+
+- **Dynamically linked programs**: only statically linked programs run.
+- **32-bit x86, AVX, AVX-512, x87, MMX**: out of scope.
+- **Network**: `socket()` always returns `EAFNOSUPPORT`; only AF_UNIX
+  `socketpair` is available.
+- **Some system calls**: `clone3`, `timerfd`, file-backed `mmap`,
+  `chmod`/`fchmod`, `CLONE_SIGHAND` between separate processes, stop and
+  continue notifications from `wait`, and `wait` by process group are not there
+  yet. Unimplemented system calls return `ENOSYS`, so some programs can carry
+  on without the feature.
+- **A native JIT**: only the WebAssembly build has a JIT; native builds use the
+  interpreter.
+- **Stable Rust**: a nightly Rust is required.
+
+## Not verified
+
+- What is verified are the programs listed under
+  [Supported features](./features) and the per-instruction tests. Other
+  programs are not yet guaranteed to behave exactly the same.
+- Fuzzing shows that no problem was found in a fixed time. It is not a proof
+  that every input is safe.
+- Differential references were taken on some recorded AMD and Intel CPUs. On a
+  CPU profile not observed yet, the tests stop on purpose.
+- There are no limits yet on memory, threads or files. An untrusted program
+  could use up the host's resources.
+- Automated Safari tests sometimes timed out while waiting for the browser to
+  start. A fix passed ten times in a row, which does not guarantee it never
+  happens again.
+
+## Found a problem?
+
+When paludarium stops on an error, it prints the instruction address and bytes,
+or the system call number, where it stopped. Please include them in an
+[issue](https://github.com/aletheia-works/paludarium/issues).

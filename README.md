@@ -1,5 +1,9 @@
 # paludarium
 
+**Documentation: <https://aletheia-works.github.io/paludarium/>**
+([日本語](https://aletheia-works.github.io/paludarium/ja/)) — what paludarium is,
+how to install and use it, supported features, design, and a live demo.
+
 A Rust re-implementation of [jart/blink](https://github.com/jart/blink), the
 x86-64 Linux user-mode emulator written in C (ISC licensed). It is meant to
 eventually replace the emulator core of the sibling project

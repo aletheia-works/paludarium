@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/aletheia-works/paludarium/compare/v0.1.0...v0.1.1) (2026-10-20)
+
+
+### Bug Fixes
+
+* **harness:** run ignored U3 tests in the bounded child ([#24](https://github.com/aletheia-works/paludarium/issues/24)) ([971bcc4](https://github.com/aletheia-works/paludarium/commit/971bcc43c2256aa896b55e28a23c08cf167c5098))
+* **release:** find the release notes under a linked changelog heading ([#27](https://github.com/aletheia-works/paludarium/issues/27)) ([da7f723](https://github.com/aletheia-works/paludarium/commit/da7f723a3264f5e54be483b04e7211fe62f502e4))
+
 ## 0.1.0 (2026-10-20)
 
 

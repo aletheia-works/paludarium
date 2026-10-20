@@ -66,6 +66,30 @@ class PublishAdapterTests(unittest.TestCase):
     def test_older_cargo_dry_run_location(self):
         self.dry_dir='target/package'
         self.assertEqual(len(self.execute()['published']),12)
+    def test_upload_that_shows_up_late_is_waited_for(self):
+        request=self.request;misses={'npm':3,'paludarium':2};sleeps=[]
+        def late(url,timeout):
+            key='npm' if 'npmjs' in url else url.split('/')[-2]
+            if key in self.uploaded and misses.get(key):
+                misses[key]-=1;raise check.urllib.error.HTTPError(url,404,'not yet',{},None)
+            return request(url,timeout)
+        self.request=late
+        with patch.object(check.time,'sleep',side_effect=sleeps.append):
+            self.assertEqual(len(self.execute()['published']),12)
+        self.assertEqual(sleeps,[check.UPLOAD_POLL_SECONDS]*5)
+    def test_upload_that_never_shows_up_stops(self):
+        request=self.request;now=[0]
+        def never(url,timeout):
+            if 'npmjs' in url and 'npm' in self.uploaded:raise check.urllib.error.HTTPError(url,404,'absent',{},None)
+            return request(url,timeout)
+        self.request=never
+        def sleep(seconds):now[0]+=seconds
+        with patch.object(check.time,'sleep',side_effect=sleep),patch.object(check.time,'monotonic',side_effect=lambda:now[0]):
+            with self.assertRaises(check.urllib.error.HTTPError):self.execute()
+        self.assertGreaterEqual(now[0],check.UPLOAD_VISIBLE_SECONDS)
+        progress=json.loads((self.out/'publication-progress.json').read_text())
+        self.assertIn('@aletheia-works/paludarium-wasm',progress['uploaded_but_possibly_unverified'])
+        self.assertNotIn('@aletheia-works/paludarium-wasm',progress['completed'])
     def test_missing_dry_run_crate_stops_before_upload(self):
         self.dry_dir='target/elsewhere'
         with self.assertRaisesRegex(ValueError,'dry-run crate absent or ambiguous'):self.execute()

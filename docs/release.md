@@ -400,7 +400,9 @@ tarball. Cargo dry-run reassembly must have the approved byte digest before
 upload; original source/locks must remain unchanged. Existing versions are
 queried first: an equal digest is verified without re-upload, a different
 digest or unknown network result stops the sequence. The same npm tarball is
-uploaded. Registry checksums/integrity are checked after each upload.
+uploaded. Registry checksums/integrity are checked after each upload; a
+just-uploaded version that still answers 404 is asked again every 15 seconds
+for up to 15 minutes (the first npm upload took about five minutes to appear).
 
 On partial failure, preserve `publication-progress.json` (the run's artifact
 `u15-publication-progress-attempt-<n>`, uploaded even when the job stops), attempted uploads,

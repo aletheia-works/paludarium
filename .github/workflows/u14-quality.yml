@@ -637,7 +637,7 @@ jobs:
       - name: Fixed U14 Python coverage and fail-closed boundaries
         run: |
           mkdir -p target/u14
-          python3 -B -m coverage run --data-file=target/u14/python.coverage --include='*/scripts/u14-run.py,*/scripts/build-u14-cost-profile.py,*/tests/guests/u14/guest_policy.py,*/tests/guests/u14/lock_overlay.py,*/tests/guests/u10/build.py,*/tests/guests/u10/evidence.py' -m unittest discover -s tests/guests/u14/runner-tests -p 'test_*.py'
+          python3 -B -m coverage run --data-file=target/u14/python.coverage --include='*/scripts/u14-run.py,*/scripts/build-u14-cost-profile.py,*/tests/guests/u10/build.py,*/tests/guests/u10/evidence.py' -m unittest discover -s tests/guests/u14/runner-tests -p 'test_*.py'
           python3 -B -m coverage report --data-file=target/u14/python.coverage --fail-under=80
           python3 -B -m coverage json --data-file=target/u14/python.coverage -o target/u14/python-coverage.json
       - if: always()

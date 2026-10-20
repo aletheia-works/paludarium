@@ -46,7 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          python tests/guests/u10/build.py target/guests/u10 --advisory-policy u15-fixed-aube-zip9-name 2>&1 | tee target/u12-native-first/build.log
+          python tests/guests/u10/build.py target/guests/u10 2>&1 | tee target/u12-native-first/build.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/u12-native-first/build-exit.txt
           test "$status" = 0

@@ -39,7 +39,6 @@ jobs:
           python --version > target/u13-native-first/python.txt
           cargo deny --version > target/u13-native-first/deny.txt
           sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml deny.toml tests/guests/u10/source-lock.json > target/u13-native-first/inputs-before.sha256
-          python -m unittest discover -s tests/guests/u14 -p 'test_guest_policy.py' -v
           python -m unittest discover -s tests/guests/u10/runner-tests -p 'test_*.py'
           python scripts/u13-run.py --self-test
           cargo test --locked -p paludarium-host --test u9_public_api
@@ -49,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          python tests/guests/u10/build.py target/guests/u10 --advisory-policy u15-fixed-aube-zip9-name 2>&1 | tee target/u13-native-first/build.log
+          python tests/guests/u10/build.py target/guests/u10 2>&1 | tee target/u13-native-first/build.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/u13-native-first/build-exit.txt
           test "$status" = 0

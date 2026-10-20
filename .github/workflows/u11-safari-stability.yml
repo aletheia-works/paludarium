@@ -39,7 +39,7 @@ jobs:
           install_args: cargo-deny
           cache: false
       - name: Build fixed guests and audit dependencies
-        run: python tests/guests/u10/build.py target/guests/u10 --advisory-policy u15-fixed-aube-zip9-name
+        run: python tests/guests/u10/build.py target/guests/u10
       - name: Fresh Linux oracle with filesystem metadata
         run: sudo unshare --net python3 scripts/u11-run.py --native-only --guest-dir target/guests/u10 --output target/u11/native
       - name: Build one production wasm module for every run

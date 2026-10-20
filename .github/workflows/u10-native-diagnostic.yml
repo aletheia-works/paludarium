@@ -49,7 +49,7 @@ jobs:
           python3 scripts/u10-run.py --self-test
           python3 -m unittest discover -s tests/guests/u10/runner-tests -p 'test_*.py'
       - name: Build fixed unmodified static-musl guests and audit dependencies
-        run: python tests/guests/u10/build.py target/guests/u10 --advisory-policy u15-fixed-aube-zip9-name
+        run: python tests/guests/u10/build.py target/guests/u10
       - name: Observe fresh native expectations without network or node
         run: sudo unshare --net python3 scripts/u10-run.py --native-only --guest-dir target/guests/u10 --output target/u10/native
       - name: Retain build and native evidence, including failures

@@ -32,7 +32,7 @@ jobs:
       - name: Runner tests
         run: python3 -m unittest discover -s tests/guests/u11/runner-tests -p 'test_*.py'
       - name: Build fixed guests and audit dependencies
-        run: python3 tests/guests/u10/build.py target/guests/u10 --advisory-policy u15-fixed-aube-zip9-name
+        run: python3 tests/guests/u10/build.py target/guests/u10
       - name: Fresh Linux oracle with filesystem metadata
         run: sudo unshare --net python3 scripts/u11-run.py --native-only --guest-dir target/guests/u10 --output target/u11/native
       - name: Build one production wasm module for every environment

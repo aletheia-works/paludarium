@@ -38,7 +38,7 @@ class PublishAdapterTests(unittest.TestCase):
             crates=package.inspect_crates(self.crates,self.inv),npm=package.inspect_npm(self.npm,expected))
         (self.out/'package-result.json').write_text(json.dumps(self.result));self.uploaded=set()
         self.env=dict(PALUDARIUM_TEST_NODE=sys.executable,PALUDARIUM_RELEASE_NPM=__file__,U15_OIDC_CRATES_IO_TOKEN=CANARY['U15_OIDC_CRATES_IO_TOKEN'])
-        self.mode='oidc';self.envs=[];self.yanked=set()
+        self.mode='oidc';self.envs=[];self.yanked=set();self.dry_dir='target/package/tmp-crate'
     def request(self,url,timeout):
         if 'crates.io/' in url:
             name=url.split('/')[-2]
@@ -52,7 +52,7 @@ class PublishAdapterTests(unittest.TestCase):
         if '-p' in argv:
             name=argv[argv.index('-p')+1]
             if '--dry-run' in argv:
-                target=Path(cwd)/'target/package'/(name+'-0.1.0.crate');target.parent.mkdir(parents=True,exist_ok=True)
+                target=Path(cwd)/self.dry_dir/(name+'-0.1.0.crate');target.parent.mkdir(parents=True,exist_ok=True)
                 original=next(p for p in self.crates if p.name==target.name);shutil.copyfile(original,target)
             else:self.uploaded.add(name)
         else:self.uploaded.add('npm')
@@ -63,6 +63,13 @@ class PublishAdapterTests(unittest.TestCase):
             return check.publish_artifacts(self.root,None)
     def test_mocked_upload_transport(self):
         self.assertEqual(len(self.execute()['published']),12)
+    def test_older_cargo_dry_run_location(self):
+        self.dry_dir='target/package'
+        self.assertEqual(len(self.execute()['published']),12)
+    def test_missing_dry_run_crate_stops_before_upload(self):
+        self.dry_dir='target/elsewhere'
+        with self.assertRaisesRegex(ValueError,'dry-run crate absent or ambiguous'):self.execute()
+        self.assertEqual(self.uploaded,set())
     def test_existing_versions_are_not_uploaded(self):
         self.uploaded=set(self.inv['order'])|{'npm'}
         self.assertEqual(len(self.execute()['published']),12)

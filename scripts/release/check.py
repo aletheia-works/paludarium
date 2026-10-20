@@ -320,6 +320,13 @@ def fetch_acceptance(root):
     policy.require(data['head']==head,'acceptance document wrong head')
     return data
 
+def dry_run_crate(source,name,version):
+    # Current Cargo writes the dry-run crate to target/package/tmp-crate/; older Cargo to target/package/.
+    file=name+'-'+version+'.crate'
+    found=[p for p in (source/'target/package/tmp-crate'/file,source/'target/package'/file) if p.is_file()]
+    policy.require(len(found)==1,'dry-run crate absent or ambiguous: '+file+'; no upload allowed')
+    return found[0]
+
 def publish_artifacts(root,evidence):
     """Reachable only in the protected CI tag job, after official approval."""
     import zipfile
@@ -357,7 +364,7 @@ def publish_artifacts(root,evidence):
                 completed.append(name);continue
             # Dry-run reassembly must match the previously checked artifact.
             checked_command([str(cargo),'publish','--locked','--dry-run','--no-verify','--manifest-path',str(source/'Cargo.toml'),'-p',name],source,directory/('dry-'+name),[Path(n) for n in names],900,dry_env)
-            candidate=source/'target/package'/(name+'-'+approved['version']+'.crate')
+            candidate=dry_run_crate(source,name,approved['version'])
             policy.require(package.sha(candidate.read_bytes())==actual[name]['sha256'],'publish reassembly changed; no upload allowed')
             attempted.append(name)
             checked_command([str(cargo),'publish','--locked','--no-verify','--manifest-path',str(source/'Cargo.toml'),'-p',name],source,directory/('publish-'+name),[Path(n) for n in names],900,cargo_env)

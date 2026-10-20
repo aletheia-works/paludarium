@@ -7,12 +7,13 @@ import check,package,policy
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
-        self.s,self.inv=valid();self.env=dict(GITHUB_ACTIONS='true',GITHUB_REPOSITORY=policy.REPOSITORY,GITHUB_REF_NAME='v0.1.0',GITHUB_REF_TYPE='tag',GITHUB_SHA='a'*40,GITHUB_RUN_ID='101',GH_TOKEN='not-a-real-token')
+        self.s,self.inv=valid();self.env=dict(GITHUB_ACTIONS='true',GITHUB_REPOSITORY=policy.REPOSITORY,GITHUB_REF='refs/heads/main',GITHUB_SHA='a'*40,GITHUB_RUN_ID='101',GH_TOKEN='not-a-real-token')
         self.temp=tempfile.TemporaryDirectory(dir=ROOT/'target/u15');self.addCleanup(self.temp.cleanup);self.path=Path(self.temp.name)/'evidence.json';self.path.write_text(json.dumps(self.s))
     def github(self,route):
         if route.startswith('commits/'):return self.s['commit']
         if route.startswith('compare/'):return self.s['main_compare']
         if route=='environments/release':return self.s['environment']
+        if route.startswith('git/matching-refs/tags/'):return [dict(ref='refs/tags/v0.1.01')]  # a longer tag is not this version's
         return dict(head_sha='a'*40,repository=dict(full_name=policy.REPOSITORY),status='completed',conclusion='success')
     def test_official_authorization_adapter(self):
         with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=self.github),patch.object(policy,'inventory',return_value=self.inv):
@@ -35,6 +36,22 @@ class ApiTests(unittest.TestCase):
     def test_fork_preflight_rejected(self):
         with patch.dict(os.environ,dict(self.env,GITHUB_REPOSITORY='attacker/fork')),patch.object(policy,'inventory',return_value=self.inv):
             with self.assertRaises(ValueError):check.preflight(ROOT)
+    # Publish first, tag last: publication runs on main, never for a tag or an already tagged version.
+    def test_preflight_runs_only_on_main_for_an_untagged_version(self):
+        with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=self.github),patch.object(policy,'inventory',return_value=self.inv):
+            self.assertTrue(check.preflight(ROOT)['preflight'])
+        for ref in ('refs/tags/v0.1.0','refs/heads/other',None):
+            env=dict(self.env);env.pop('GITHUB_REF')
+            if ref:env['GITHUB_REF']=ref
+            with self.subTest(ref),patch.dict(os.environ,env,clear=True),patch.object(check,'github',side_effect=self.github),patch.object(policy,'inventory',return_value=self.inv):
+                with self.assertRaisesRegex(ValueError,'only on main'):check.preflight(ROOT)
+        tagged=lambda r:[dict(ref='refs/tags/v0.1.0')] if r.startswith('git/matching-refs/tags/') else self.github(r)
+        with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=tagged),patch.object(policy,'inventory',return_value=self.inv):
+            with self.assertRaisesRegex(ValueError,'already tagged'):check.preflight(ROOT)
+    def test_authorize_derives_the_tag_from_the_version(self):
+        with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=self.github),patch.object(policy,'inventory',return_value=self.inv),\
+             patch.object(policy,'release_gate',side_effect=lambda state,inv:state) as gate:
+            self.assertEqual(check.authorize(ROOT,self.path)['tag'],'v'+self.inv['version'])
     def test_official_environment_missing(self):
         with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=lambda r:{} if r=='environments/release' else self.github(r)),patch.object(policy,'inventory',return_value=self.inv):
             with self.assertRaises(ValueError):check.preflight(ROOT)

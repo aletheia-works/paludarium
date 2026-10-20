@@ -14,7 +14,7 @@ Organization settings, including the allowed GitHub Actions, live in
 | Vulnerability alerts | `main.tf` |
 | Branch ruleset for `main`, with the required status checks | `main.tf` |
 | Issue/PR labels | `main.tf` |
-| `release` environment and its `v*.*.*` tag policy | `release.tf` |
+| `release` environment and its `main` branch policy | `release.tf` |
 
 The repository and GitHub's default labels existed before this module and are
 adopted by `import` blocks in `main.tf`, so the first apply starts from an
@@ -26,8 +26,9 @@ Keep `local.required_checks` equal to the job check names whenever a job in
 
 The `release` environment is the one `docs/release.md` (step 2) and release
 preflight require: administrator bypass off and deployments limited to
-`v*.*.*` tags. It has no required reviewer: publication waits for no
-approval, because the same-head evidence gate decides it. Publication is by
+`main` (publication runs on main; the tag is made after it). It has no
+required reviewer: publication waits for no approval, because the same-head
+evidence gate decides it. Publication is by
 Trusted Publishing (OIDC) only, so it holds no registry token; the Trusted
 Publisher of every crate and of the npm package names this environment.
 
@@ -103,7 +104,7 @@ infra/github/
 ├── providers.tf                # GitHub provider config
 ├── variables.tf                # Input variables
 ├── main.tf                     # Repository settings, main ruleset, labels
-├── release.tf                  # release environment, tag policy, variables
+├── release.tf                  # release environment and its branch policy
 ├── terraform.tfvars.example    # Template for terraform.tfvars
 ├── .gitignore                  # Excludes state and secrets
 ├── .terraform.lock.hcl         # Provider version lock (committed)

@@ -78,7 +78,7 @@ def validate(root):
     for row in inv['packages'].values():
         policy.require(bool(row['description']) and bool(row['repository']) and bool(row['readme']),'public metadata incomplete: '+row['name'])
     policy.require(all(row['publish'] is False for row in inv['private'].values()),'private package is publishable')
-    for name in ['release-check.yml','publish.yml','release-evidence.yml']:
+    for name in ['release-check.yml','publish.yml']:
         text=(root/'.github/workflows'/name).read_text()
         policy.require('persist-credentials: false' in text and 'timeout-minutes:' in text,'workflow isolation/timeout absent')
         import re
@@ -169,7 +169,11 @@ def github(route):
 def preflight(root):
     inv=policy.inventory(root);version=inv['version']
     policy.require(os.environ.get('GITHUB_REPOSITORY')==policy.REPOSITORY,'publishing from fork is forbidden')
-    policy.require(version!='0.0.0' and os.environ.get('GITHUB_REF_NAME')=='v'+version,'version/tag not decided or mismatched')
+    policy.require(version!='0.0.0','release version not decided')
+    # Publish first, tag last: the release runs on main, and its tag must not exist yet.
+    policy.require(os.environ.get('GITHUB_REF')=='refs/heads/main','publication runs only on main')
+    refs=github('git/matching-refs/tags/v'+version)
+    policy.require(not any(r.get('ref')=='refs/tags/v'+version for r in refs),'v'+version+' is already tagged')
     head=os.environ['GITHUB_SHA'];commit=github('commits/'+head)
     policy.require(commit['sha']==head and commit['commit']['verification']['verified'] is True,'unsigned head')
     compare=github('compare/'+head+'...main')
@@ -178,10 +182,10 @@ def preflight(root):
     return dict(preflight=True,head=head,version=version,environment=environment)
 
 def authorize(root,evidence):
-    policy.require(os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('GITHUB_REF_TYPE')=='tag','publication authorization is CI tag-only')
+    policy.require(os.environ.get('GITHUB_ACTIONS')=='true','publication authorization is CI-only')
     pre=preflight(root);policy.require(evidence is not None and evidence.is_file(),'same-head acceptance evidence artifact missing')
     state=json.loads(evidence.read_bytes());head=pre['head']
-    state.update(repository=policy.REPOSITORY,tag=os.environ['GITHUB_REF_NAME'],commit=github('commits/'+head),
+    state.update(repository=policy.REPOSITORY,tag='v'+pre['version'],commit=github('commits/'+head),
         main_compare=github('compare/'+head+'...main'),environment=pre['environment'])
     for row in state.get('quality',[]):
         actual=github('actions/runs/'+str(row['id']))
@@ -236,7 +240,7 @@ def dry_run_crate(source,name,version):
     return found[0]
 
 def publish_artifacts(root,evidence):
-    """Reachable only in the protected CI tag job, after official approval."""
+    """Reachable only in the CI publish job on main, after the same-head evidence."""
     import zipfile
     approved=authorize(root,evidence);directory=root/'target/u15'
     result=json.loads((directory/'package-result.json').read_bytes())

@@ -1,5 +1,5 @@
-# U15 same-head acceptance evidence (FR10.1). release-evidence.yml (or a
-# person) dispatches this on main of the upstream repository after the
+# U15 same-head acceptance evidence (FR10.1). publish.yml's evidence job (or
+# a person) dispatches this on main of the upstream repository after the
 # same-head quality runs listed in docs/release.md have completed. It only reads official run, job and
 # artifact metadata and produces one artifact, u15-acceptance, holding
 # release-evidence.json. It never tags, approves or publishes. Actions are

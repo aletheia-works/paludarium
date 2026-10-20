@@ -2,7 +2,7 @@ name: Merge release PR
 
 # Once a week, enable auto-merge on the pending release PR, as in the other
 # aletheia-works repositories. GitHub merges it after the required checks
-# pass; the merge push then starts release-evidence.yml.
+# pass; the merge push then starts the release in publish.yml.
 on:
   schedule:
     - cron: '23 0 * * 1'

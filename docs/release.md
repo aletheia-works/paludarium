@@ -125,7 +125,7 @@ artifact must be produced within 7 days of the quality runs.
 ### Producer
 
 `.github/workflows/u15-acceptance.yml` runs only by dispatch (by a person,
-or by `release-evidence.yml` below), with
+or by the evidence job of `publish.yml` below), with
 `contents: read` and `actions: read`, SHA-pinned actions and
 `persist-credentials: false`. It runs
 `python -B scripts/release/acceptance.py --output target/u15/release-evidence.json`
@@ -146,9 +146,9 @@ aletheia-works repositories, with the `aletheia-works-bot` App token
 repositories, a push to
 main only creates or updates the release PR (`skip-github-release`): the
 same-head evidence of step 5 must exist for the release PR's merge commit
-before any tag, so Release Please never tags: `release-evidence.yml`
-creates the tag and the GitHub release once that evidence exists (steps 5
-and 6). The labels `autorelease: pending` and `autorelease: tagged` are
+before anything is published, so Release Please never tags: `publish.yml`
+publishes that commit and creates the tag and the GitHub release last
+(steps 5 and 6), as biome and mise do. The labels `autorelease: pending` and `autorelease: tagged` are
 managed in `infra/github/main.tf`.
 
 `.github/workflows/release-merge.yml` enables auto-merge on the pending
@@ -176,14 +176,15 @@ itself.
    on Monday. `release.yml` (Release Please) keeps a
    release PR open from every push to main; it changes only the versions
    (`Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock`, `package.json`), the
-   manifest and `CHANGELOG.md`. Merging it creates no tag. Confirm: note
+   manifest and `CHANGELOG.md`. Merging it starts the release in
+   `publish.yml` (steps 5 and 6). Confirm: note
    the merge commit, the new main head SHA;
    `gh api repos/aletheia-works/paludarium/commits/<sha> --jq .commit.verification.verified`
    prints `true`, and the `CI` (`ci.yml`) push run for that SHA starts.
-2. **Create the `release` environment.** When: before any tag is pushed
+2. **Create the `release` environment.** When: before the first release
    (release preflight rejects a missing environment). `infra/github`
    manages environment `release` with administrator bypass off and
-   deployments limited to `v*.*.*` tags. It has no required reviewer:
+   deployments limited to `main`. It has no required reviewer:
    publication waits for no approval, because the same-head evidence gate
    (step 5) decides it. Confirm:
    `gh api repos/aletheia-works/paludarium/environments/release` shows
@@ -192,7 +193,7 @@ itself.
    crate or npm package that is not on its registry yet is published once
    by hand (by its owner, from the release head, with a short-lived token
    that is revoked right after), and its Trusted Publisher is registered as
-   in step 4 before the next release. `release-evidence.yml` stops before
+   in step 4 before the next release. The evidence job of `publish.yml` stops before
    any dispatch while a package is missing. crates.io also limits how many
    new crates one account can create in a short time (the first
    publication stopped after five and resumed every ten minutes). Each
@@ -216,21 +217,20 @@ itself.
    a registered Trusted Publisher, the publish job's OIDC token exchange
    fails before any upload.
 5. **Same-head evidence: automatic.**
-   `.github/workflows/release-evidence.yml` runs on every push to main.
-   While tag `v<version>` of the workspace version does not exist and the
-   main head is that push, `scripts/release/evidence.py` first requires
-   every crate and the npm package to exist on its registry without this
-   version: a missing package (step 3) or a version already partly on a
-   registry (re-run the stopped publish job instead) stops it before any
-   dispatch. It then waits for the `ci.yml`
-   push run, dispatches `u12-quality.yml`, `u14-quality.yml` and
-   `release-check.yml` once each (a run a person already dispatched for the
-   head is reused, never doubled), waits for all of them, then dispatches
-   `u15-acceptance.yml` once and waits for it. A
+   `.github/workflows/publish.yml` runs on every push to main. Its
+   `evidence` job runs `scripts/release/evidence.py`: while tag
+   `v<version>` of the workspace version does not exist and the main head
+   is that push, it first requires every crate and the npm package to exist
+   on its registry without this version: a missing package (step 3) or a
+   version already partly on a registry (re-run the stopped jobs of the
+   earlier `Publish` run instead) stops it before any dispatch. It then
+   waits for the `ci.yml` push run, dispatches `u12-quality.yml`,
+   `u14-quality.yml` and `release-check.yml` once each (a run a person
+   already dispatched for the head is reused, never doubled), waits for all
+   of them, then dispatches `u15-acceptance.yml` once and waits for it. A
    failed run is not dispatched again (FR8.3 is measured once per head);
    the head then needs a person. When the version is already tagged or the
-   head is no longer main, the run does nothing. Confirm: the `Release
-   evidence` run succeeded.
+   head is no longer main, the run does nothing.
 
    **By hand** (only when the automatic run stopped and the cause is
    fixed). On the release head, while it is still the main head, the
@@ -240,21 +240,23 @@ itself.
    have succeeded (do not dispatch `u14-quality.yml` again to wait for a
    passing FR8.3; if FR8.3 fails, record it and stop), dispatch, within 7
    days,
-   `gh workflow run u15-acceptance.yml --repo aletheia-works/paludarium --ref main`.
-   Then dispatch
-   `release-evidence.yml` once: it reuses those runs and creates the tag.
-   Confirm: the run succeeded and its artifact `u15-acceptance` holds only
+   `gh workflow run u15-acceptance.yml --repo aletheia-works/paludarium --ref main`,
+   then `publish.yml` once: its evidence job reuses those runs. Confirm:
+   the u15 run succeeded and its artifact `u15-acceptance` holds only
    `release-evidence.json`, with that head, eight `quality` rows and the
    five `acceptance` IDs all `passed: true`.
-6. **Tag and publication: automatic.** When the evidence of step 5
-   succeeded, the `tag` job of `release-evidence.yml` creates tag
-   `v<version>` and the GitHub release (notes from `CHANGELOG.md`) on that
-   head with the `aletheia-works-bot` App token, and moves the merged
-   release PR from `autorelease: pending` to `autorelease: tagged`, as
-   Release Please does when it tags; Release Please itself never tags. The
-   tag starts `publish.yml`, which runs preflight, the package check and the
-   publish job without waiting for an approval. Confirm: the run
-   succeeded and `publication-progress.json` (in the run's artifact
+6. **Publication, then tag: automatic.** When the evidence of step 5
+   succeeded, the same `Publish` run continues with `preflight` (main,
+   untagged version, signed head, environment), `packages` (the package
+   check of that head) and `publish` (every crate and the npm package by
+   Trusted Publishing, without waiting for an approval). Only after all of
+   them succeeded does its `tag` job create tag `v<version>` and the GitHub
+   release (notes from `CHANGELOG.md`) on that head with the workflow's own
+   token, and move the merged release PR from `autorelease: pending` to
+   `autorelease: tagged`, as Release Please does when it tags. A version
+   that was not published therefore never gets a tag, and no tag is ever
+   deleted or moved. Confirm: the run succeeded and
+   `publication-progress.json` (in the run's artifact
    `u15-publication-progress-attempt-<n>`) lists all eleven
    crates and `@aletheia-works/paludarium-wasm`; then, independently, each crate's
    `https://crates.io/api/v1/crates/<name>/<version>` `checksum` equals the
@@ -274,10 +276,10 @@ performance rerun is used to wait for a passing result.
 
 ## Publication and recovery
 
-`release-evidence.yml` creates the version tag once the same-head evidence
-exists. `publish.yml` accepts only an exact `vMAJOR.MINOR.PATCH` after
-Python validation, verifies signed main reachability and the `release`
-environment before builds, and publishes without waiting for an approval.
+`publish.yml` publishes only on main, only an exact `vMAJOR.MINOR.PATCH`
+version that has no tag yet, after Python validation; it verifies the signed
+head, its reachability from main and the `release` environment before
+builds, publishes without waiting for an approval, and tags last.
 
 Only the publish job receives `id-token: write`. crates-io-auth-action
 obtains a short-lived crates.io token and revokes it in its post step, only
@@ -299,8 +301,8 @@ On partial failure, preserve `publication-progress.json` (the run's artifact
 `u15-publication-progress-attempt-<n>`, uploaded even when the job stops), attempted uploads,
 unverified uploads and all logs. Do not delete, replace, move a tag or retry
 publication automatically. An owner must inspect registry state and propose
-the remaining recovery. Re-running the stopped publish job of the same run
-(same tag and head) is safe: every version already present is only verified
+the remaining recovery. Re-running the stopped jobs of the same `Publish`
+run (same head; nothing is tagged yet) is safe: every version already present is only verified
 (it must equal the approved digest and must not be yanked), and only the
 remaining ones are uploaded. The cargo and npm children
 get allow-listed environments only (step 3); the allow-list for

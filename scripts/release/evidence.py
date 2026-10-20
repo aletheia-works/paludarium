@@ -1,16 +1,16 @@
 """Automatic same-head release evidence for an untagged version on main.
 
-release-evidence.yml runs this on every push to main of the upstream
-repository. When tag v<version> of the workspace version already exists, it
-does nothing. Otherwise, for the main head only, it waits for the ci.yml push
-run, dispatches u12-quality.yml, u14-quality.yml and release-check.yml once
-each (a run a person already dispatched for the head is reused, never
-doubled, because acceptance.py accepts exactly one run per workflow), waits
-for all of them, then dispatches u15-acceptance.yml once and waits for it.
-Only when every run succeeded does it write ready=true, the version and the
-head to GITHUB_OUTPUT; the workflow then creates the tag and the GitHub
-release, which start publish.yml; it publishes without waiting for any
-approval. A failed run is never dispatched again
+The evidence job of publish.yml runs this on every push to main of the
+upstream repository. When tag v<version> of the workspace version already
+exists, it does nothing. Otherwise, for the main head only, it waits for the
+ci.yml push run, dispatches u12-quality.yml, u14-quality.yml and
+release-check.yml once each (a run a person already dispatched for the head
+is reused, never doubled, because acceptance.py accepts exactly one run per
+workflow), waits for all of them, then dispatches u15-acceptance.yml once
+and waits for it. Only when every run succeeded does it write ready=true,
+the version and the head to GITHUB_OUTPUT; publish.yml then publishes that
+head and creates the tag and the GitHub release last, so a version that was
+not published never gets a tag. A failed run is never dispatched again
 (FR8.3 is measured once per head); the head then needs a person.
 
 Publication is by Trusted Publishing only, so every package must already exist
@@ -181,7 +181,7 @@ def main(environ=None, api=None, **kwargs):
 if __name__ == '__main__':
     import sys
     if sys.argv[1:2] == ['notes']:
-        # release-evidence.yml: evidence.py notes <version> <CHANGELOG.md> > release-notes.md
+        # publish.yml (tag job): evidence.py notes <version> <CHANGELOG.md> > release-notes.md
         sys.stdout.write(release_notes(Path(sys.argv[3]).read_text(), sys.argv[2]))
     else:
         main()

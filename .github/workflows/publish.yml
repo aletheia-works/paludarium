@@ -1,17 +1,41 @@
 name: Publish
+
+# While the workspace version has no tag yet, a push to main releases that
+# head, in the order the other Rust projects use (publish first, tag last):
+#   1. evidence: scripts/release/evidence.py waits for the CI push run,
+#      dispatches the quality runs and then u15-acceptance once each, and
+#      waits for all of them (docs/release.md).
+#   2. preflight and packages: the signed head, the release environment and
+#      the package check of that head.
+#   3. publish: every crate and the npm package by Trusted Publishing (OIDC)
+#      only, without waiting for an approval.
+#   4. tag: the tag and the GitHub release, only after all of it succeeded,
+#      so a version that was not published never gets a tag.
+# A stopped job is re-run in the same run; nothing is tagged until then.
 on:
   push:
-    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+    branches: [main]
+  workflow_dispatch:
 permissions:
   contents: read
-  actions: read
 concurrency:
-  group: registry-release-${{ github.ref }}
+  group: publish
   cancel-in-progress: false
 jobs:
-  preflight:
+  evidence:
+    name: Produce same-head evidence
+    if: >-
+      github.repository == 'aletheia-works/paludarium' &&
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      ready: ${{ steps.evidence.outputs.ready }}
+      version: ${{ steps.evidence.outputs.version }}
+      head: ${{ steps.evidence.outputs.head }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -19,7 +43,27 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.15.0'
-      - name: Verify actual repository, exact version tag, signed main head and environment
+      - name: Dispatch and wait for the same-head quality and acceptance runs
+        id: evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -B scripts/release/evidence.py
+
+  preflight:
+    needs: evidence
+    if: needs.evidence.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.15.0'
+      - name: Verify actual repository, untagged version, signed main head and environment
         env:
           GH_TOKEN: ${{ github.token }}
         run: python -B scripts/release/check.py --mode preflight
@@ -29,7 +73,7 @@ jobs:
     permissions:
       contents: read
   publish:
-    needs: [preflight, packages]
+    needs: [evidence, preflight, packages]
     environment: release
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -93,3 +137,45 @@ jobs:
             target/u15/publish-*/receipt.json
           if-no-files-found: warn
           retention-days: 90
+
+  tag:
+    name: Create tag and GitHub release
+    needs: [evidence, publish]
+    if: needs.evidence.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Nothing starts from the tag any more, so the workflow's own token is
+    # enough and this workflow holds no secret at all.
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.evidence.outputs.head }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.15.0'
+
+      - name: Tag the published v${{ needs.evidence.outputs.version }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.evidence.outputs.version }}
+          HEAD_SHA: ${{ needs.evidence.outputs.head }}
+        run: |
+          mkdir -p target
+          python -B scripts/release/evidence.py notes "$VERSION" CHANGELOG.md > target/release-notes.md
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$HEAD_SHA" --title "v$VERSION" --notes-file target/release-notes.md
+
+      # What Release Please does when it tags: the merged release PR stops
+      # being pending, so Release Please opens the next release PR again.
+      - name: Mark the merged release PR as tagged
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr list --repo "$GITHUB_REPOSITORY" --state merged --label 'autorelease: pending' --json number --jq '.[].number' |
+            while read -r number; do
+              gh pr edit "$number" --repo "$GITHUB_REPOSITORY" --remove-label 'autorelease: pending' --add-label 'autorelease: tagged'
+            done

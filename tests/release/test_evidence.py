@@ -1,4 +1,4 @@
-"""release-evidence.yml driver tests. The GitHub API and the registries are
+"""Release evidence driver tests (the evidence and tag jobs of publish.yml). The GitHub API and the registries are
 replaced by in-memory fakes; nothing reaches the network, and a passing test
 is not evidence that any real run, tag or registry state exists."""
 import itertools
@@ -263,13 +263,26 @@ class ReleaseNotes(unittest.TestCase):
 
 
 class EvidenceWorkflow(unittest.TestCase):
-    def test_workflow_is_pinned_and_tags_with_the_app_token(self):
-        text = (ROOT / '.github/workflows/release-evidence.yml').read_text()
+    def test_publish_workflow_publishes_first_and_tags_last(self):
+        text = (ROOT / '.github/workflows/publish.yml').read_text()
+        self.assertFalse((ROOT / '.github/workflows/release-evidence.yml').exists())
         actions = re.findall(r'uses:\s+([^\s#]+)', text)
-        self.assertTrue(actions and all(re.fullmatch(r'[^@]+@[0-9a-f]{40}', a) for a in actions))
-        self.assertEqual(text.count('persist-credentials: false'), 2)
+        self.assertTrue(actions and all(re.fullmatch(r'[^@]+@[0-9a-f]{40}', a) or a.startswith('./') for a in actions))
+        trigger = text.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
+        self.assertIn('branches: [main]', trigger)
+        self.assertNotIn('tags', trigger)
+        parts = re.split(r'^  ([a-z]+):\n', text.split('\njobs:\n', 1)[1], flags=re.M)
+        jobs = dict(zip(parts[1::2], parts[2::2]))
+        self.assertEqual(list(jobs), ['evidence', 'preflight', 'packages', 'publish', 'tag'])
+        self.assertIn('needs: evidence', jobs['preflight'])
+        self.assertIn('needs: [evidence, preflight, packages]', jobs['publish'])
+        self.assertIn('needs: [evidence, publish]', jobs['tag'])
+        self.assertIn('environment: release', jobs['publish'])
+        self.assertNotIn('id-token', jobs['tag'])
+        self.assertIn('GH_TOKEN: ${{ github.token }}', jobs['tag'])
+        self.assertEqual(text.count('persist-credentials: false'), 4)
         self.assertNotIn('RELEASE_AUTOMATION_ENABLED', text)
-        self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token }}', text)
+        self.assertNotIn('secrets.', text)
         self.assertIn('--target "$HEAD_SHA"', text)
         self.assertIn('python -B scripts/release/evidence.py notes "$VERSION" CHANGELOG.md > target/release-notes.md', text)
         self.assertNotIn('awk', text)

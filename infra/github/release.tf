@@ -1,8 +1,9 @@
 # The environment of the publish job in .github/workflows/publish.yml
 # (docs/release.md, step 2). It needs no reviewer: the same-head evidence gate
-# decides publication. Only v*.*.* tags deploy, and release preflight refuses
-# administrator bypass. The Trusted Publisher of every crate and of the npm
-# package names this environment.
+# decides publication. Only main deploys (publish first, tag last: the tag is
+# made after publication), and release preflight refuses administrator
+# bypass. The Trusted Publisher of every crate and of the npm package names
+# this environment.
 
 resource "github_repository_environment" "release" {
   repository  = github_repository.this.name
@@ -17,8 +18,8 @@ resource "github_repository_environment" "release" {
   }
 }
 
-resource "github_repository_environment_deployment_policy" "release_tags" {
-  repository  = github_repository.this.name
-  environment = github_repository_environment.release.environment
-  tag_pattern = "v*.*.*"
+resource "github_repository_environment_deployment_policy" "release_main" {
+  repository     = github_repository.this.name
+  environment    = github_repository_environment.release.environment
+  branch_pattern = "main"
 }

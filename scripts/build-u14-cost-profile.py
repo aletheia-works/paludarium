@@ -75,7 +75,9 @@ def main():
     source = source_snapshot()
     source_digest = digest(json.dumps(source, sort_keys=True, separators=(',', ':')).encode())
     pin = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
-    candidates = list((Path.home() / '.rustup/toolchains').glob(pin + '-*/bin/cargo'))
+    # RUSTUP_HOME when set (CI uses a job-local one), else ~/.rustup.
+    rustup_home = Path(os.environ.get('RUSTUP_HOME') or Path.home() / '.rustup')
+    candidates = list((rustup_home / 'toolchains').glob(pin + '-*/bin/cargo'))
     if len(candidates) != 1:
         raise ValueError('one actual project-pinned Rust toolchain is required')
     cargo = candidates[0]

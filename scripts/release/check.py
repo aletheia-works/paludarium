@@ -88,6 +88,10 @@ def validate(root):
     if inv['version']=='0.0.0':outstanding.insert(0,'release version')
     return dict(validated=True,version=inv['version'],crates=11,publish_eligible=False,outstanding=outstanding)
 
+def rustup_toolchains():
+    """The toolchains rustup installed: RUSTUP_HOME when set (CI uses a job-local one), else ~/.rustup."""
+    return Path(os.environ.get('RUSTUP_HOME') or Path.home()/'.rustup')/'toolchains'
+
 REGISTRY_USER_AGENT='paludarium-release (https://github.com/aletheia-works/paludarium)'
 CRATES_API='https://crates.io/api/v1/crates/'
 NPM_NAME='@aletheia-works/paludarium-wasm'
@@ -335,7 +339,7 @@ def publish_artifacts(root,evidence):
             target=source/path;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(archive.read(name))
     policy.require(package.sha(json.dumps(snapshot(source,[Path(n) for n in names]),sort_keys=True).encode())==result['source_sha256'],'source snapshot differs')
     toolchain=__import__('tomllib').loads((source/'rust-toolchain.toml').read_text())['toolchain']['channel']
-    cargos=list((Path.home()/'.rustup/toolchains').glob(toolchain+'-*/bin/cargo'));policy.require(len(cargos)==1,'actual pinned Cargo absent')
+    cargos=list(rustup_toolchains().glob(toolchain+'-*/bin/cargo'));policy.require(len(cargos)==1,'actual pinned Cargo absent')
     cargo=cargos[0];env=dict(os.environ,RUSTC=str(cargo.with_name('rustc')),RUSTDOC=str(cargo.with_name('rustdoc')),PATH=str(cargo.parent)+os.pathsep+os.environ['PATH'])
     dry_env,cargo_env,npm_env=publication_environments(approved['authentication'],env)
     completed=[];attempted=[];uploaded=[]

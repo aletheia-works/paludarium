@@ -86,7 +86,7 @@ def package_check(root):
     with zipfile.ZipFile(out/'source-snapshot.zip','x',compression=zipfile.ZIP_DEFLATED) as archive:
         for path in paths:archive.writestr(path.as_posix(),(copy/path).read_bytes())
     inv=policy.inventory(copy);pin=tomllib.loads((copy/'rust-toolchain.toml').read_text())['toolchain']['channel']
-    tools=list((Path.home()/'.rustup/toolchains').glob(pin+'-*/bin/cargo'))
+    tools=list(check.rustup_toolchains().glob(pin+'-*/bin/cargo'))
     policy.require(len(tools)==1,'one actual pinned Cargo required');cargo=tools[0]
     env=dict(os.environ,RUSTC=str(cargo.with_name('rustc')),RUSTDOC=str(cargo.with_name('rustdoc')),RUSTC_WRAPPER='',RUSTFLAGS='',CARGO_HOME=str(out/'cargo-home'),
              PATH=str(cargo.parent)+os.pathsep+os.environ['PATH'])
@@ -106,7 +106,7 @@ def package_check(root):
         with make_registry(out,archives) as registry:
             (consumer/'.cargo').mkdir();(consumer/'.cargo/config.toml').write_text('[registries.u15]\nindex="'+registry+'"\n')
             check.require_success(check.run_command([str(cargo),'build','--manifest-path',str(consumer/'Cargo.toml')],consumer,out/'consumer-nightly',900,env))
-            stable=list((Path.home()/'.rustup/toolchains').glob('1.99.1-*/bin/cargo'));policy.require(len(stable)==1,'actual verified stable1.99.1 Cargo required')
+            stable=list(check.rustup_toolchains().glob('1.99.1-*/bin/cargo'));policy.require(len(stable)==1,'actual verified stable1.99.1 Cargo required')
             stableenv=dict(env,RUSTC=str(stable[0].with_name('rustc')),RUSTDOC=str(stable[0].with_name('rustdoc')))
             stable_result=check.run_command([str(stable[0]),'build','--manifest-path',str(consumer/'Cargo.toml'),'--target-dir',str(out/'stable-target')],consumer,out/'consumer-stable',900,stableenv)
         stage='production-wasm'

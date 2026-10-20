@@ -25,7 +25,3 @@ github_owner = "aletheia-works"
 #
 # repository_name        = "paludarium"
 # repository_visibility  = "public"
-#
-# Release environment (docs/release.md, steps 2 and 3):
-# crates_io_owners = ["JamBalaya56562"]
-# npm_maintainers  = ["jambalaya56562"]

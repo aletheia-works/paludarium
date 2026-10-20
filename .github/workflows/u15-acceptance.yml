@@ -1,21 +1,12 @@
-# U15 same-head acceptance evidence (FR10.1). A person dispatches this on
-# main of the upstream repository after the same-head quality runs listed in
-# docs/release.md have completed. It only reads official run, job and
+# U15 same-head acceptance evidence (FR10.1). release-evidence.yml (or a
+# person) dispatches this on main of the upstream repository after the
+# same-head quality runs listed in docs/release.md have completed. It only reads official run, job and
 # artifact metadata and produces one artifact, u15-acceptance, holding
 # release-evidence.json. It never tags, approves or publishes. Actions are
 # pinned by commit SHA and the token is read-only (NFR8.2).
 name: U15 same-head acceptance evidence
 on:
   workflow_dispatch:
-    inputs:
-      trusted_publishers_registered:
-        description: Set true only after a person registered the Trusted Publisher (upstream, publish.yml, release) for all eleven crates and @aletheia-works/paludarium-wasm.
-        type: boolean
-        default: false
-      first_publication:
-        description: Set true only for the one-time first publication with the scoped tokens in the release environment; the publish job still requires all eleven crates and @aletheia-works/paludarium-wasm to be absent from every registry. Never true together with trusted_publishers_registered.
-        type: boolean
-        default: false
 permissions:
   contents: read
   actions: read
@@ -36,8 +27,6 @@ jobs:
       - name: Collect same-head official quality and acceptance evidence
         env:
           GH_TOKEN: ${{ github.token }}
-          U15_TRUSTED_PUBLISHERS_REGISTERED: ${{ inputs.trusted_publishers_registered }}
-          U15_FIRST_PUBLICATION: ${{ inputs.first_publication }}
         run: python -B scripts/release/acceptance.py --output target/u15/release-evidence.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

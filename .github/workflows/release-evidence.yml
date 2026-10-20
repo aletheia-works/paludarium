@@ -5,7 +5,7 @@ name: Release evidence
 # the CI push run, dispatches the quality runs and then u15-acceptance once
 # each, and creates the tag and GitHub release on that head when all of them
 # succeeded. The tag starts publish.yml, which publishes without waiting for
-# an approval. Only the first publication is automated so far.
+# an approval, by Trusted Publishing (OIDC) only.
 on:
   push:
     branches: [main]

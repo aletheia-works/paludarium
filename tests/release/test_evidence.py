@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts/release'))
@@ -17,10 +18,6 @@ import policy  # noqa: E402
 HEAD = 'a' * 40
 OTHER = 'c' * 40
 VERSION = policy.inventory(ROOT)['version']
-
-
-def absent(order):
-    return dict(absent=True, present=[])
 
 
 class FakeGitHub:
@@ -74,9 +71,21 @@ class Clock:
         return self.now
 
 
-def produce(api, registries=absent):
+INVENTORY = policy.inventory(ROOT)
+CHECKED = sorted(INVENTORY['order'] + [check.NPM_NAME])
+
+
+def published(order):
+    return dict(present=CHECKED, checked=CHECKED)
+
+
+def never(name, version):
+    return False
+
+
+def produce(api, presence=published, present=never):
     clock = Clock()
-    return E.produce(api, ROOT, HEAD, absent=registries, sleep=clock.sleep, clock=clock)
+    return E.produce(api, ROOT, HEAD, presence=presence, present=present, sleep=clock.sleep, clock=clock)
 
 
 class Evidence(unittest.TestCase):
@@ -85,7 +94,7 @@ class Evidence(unittest.TestCase):
         self.assertEqual(produce(api), dict(ready='true', version=VERSION, head=HEAD))
         self.assertEqual([p[0] for p in api.posts], ['actions/workflows/%s/dispatches' % w for w in
                                                       ('u12-quality.yml', 'u14-quality.yml', 'release-check.yml', 'u15-acceptance.yml')])
-        self.assertEqual(api.posts[-1][1], dict(ref='main', inputs=dict(first_publication='true')))
+        self.assertEqual(api.posts[-1][1], dict(ref='main', inputs={}))
         self.assertTrue(all(p[1]['ref'] == 'main' for p in api.posts))
 
     def test_tagged_version_does_nothing(self):
@@ -107,11 +116,38 @@ class Evidence(unittest.TestCase):
             produce(api)
         self.assertEqual(api.posts, [])
 
-    def test_present_registry_stops_before_any_dispatch(self):
+    def test_a_package_not_on_a_registry_yet_stops_before_any_dispatch(self):
+        for present in (CHECKED[1:], [n for n in CHECKED if n != check.NPM_NAME], []):
+            with self.subTest(present=present):
+                api = FakeGitHub()
+                missing = sorted(set(CHECKED) - set(present))
+                some = lambda order, present=present: dict(present=present, checked=CHECKED)
+                with self.assertRaisesRegex(ValueError, 'not on a registry yet: ' + re.escape(', '.join(missing)) + ';'):
+                    produce(api, some)
+                self.assertEqual(api.posts, [])
+
+    def test_version_already_partly_published_stops(self):
         api = FakeGitHub()
-        with self.assertRaisesRegex(ValueError, 'trusted_publishers_registered=true by hand'):
-            produce(api, lambda order: dict(absent=False, present=['paludarium']))
+        partly = lambda name, version: name in ('paludarium-types', check.NPM_NAME)
+        with self.assertRaisesRegex(ValueError, VERSION + ' already on a registry: '
+                                    + re.escape(', '.join(n for n in CHECKED if partly(n, VERSION)))
+                                    + '; re-run the stopped publish job instead'):
+            produce(api, present=partly)
         self.assertEqual(api.posts, [])
+
+    def test_publishable_checks_every_name_at_this_version(self):
+        orders, asked = [], []
+        E.publishable(INVENTORY, lambda order: orders.append(order) or published(order),
+                      lambda name, version: asked.append((name, version)) or False)
+        self.assertEqual(orders, [INVENTORY['order']])
+        self.assertEqual(asked, [(n, VERSION) for n in CHECKED])
+
+    def test_version_present_asks_the_version_url(self):
+        asked = []
+        with patch.object(check, 'registry_present', side_effect=lambda url: asked.append(url) or True):
+            self.assertTrue(E.version_present('paludarium-cpu', '0.2.0'))
+            self.assertTrue(E.version_present(check.NPM_NAME, '0.2.0'))
+        self.assertEqual(asked, [check.CRATES_API + 'paludarium-cpu/0.2.0', check.NPM_PACKAGE_URL + '/0.2.0'])
 
     def test_a_run_a_person_already_dispatched_is_reused(self):
         api = FakeGitHub()
@@ -168,7 +204,8 @@ class Evidence(unittest.TestCase):
             self.assertEqual(E.main(dict(env, GITHUB_OUTPUT=str(output)), api), dict(ready='false'))
             self.assertEqual(output.read_text(), 'ready=false\n')
             clock = Clock()
-            E.main(dict(env, GITHUB_OUTPUT=str(output)), FakeGitHub(), absent=absent, sleep=clock.sleep, clock=clock)
+            E.main(dict(env, GITHUB_OUTPUT=str(output)), FakeGitHub(), presence=published, present=never,
+                   sleep=clock.sleep, clock=clock)
             self.assertEqual(output.read_text().splitlines()[1:], ['head=' + HEAD, 'ready=true', 'version=' + VERSION])
         for bad in (dict(GITHUB_REPOSITORY='Marukome0743/paludarium'), dict(GITHUB_REF='refs/heads/other'), dict(GITHUB_SHA='x')):
             with self.assertRaises(ValueError):
@@ -182,6 +219,7 @@ class Evidence(unittest.TestCase):
         self.assertIn('vars.RELEASE_AUTOMATION_ENABLED', text)
         self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token }}', text)
         self.assertIn('--target "$HEAD_SHA"', text)
+        self.assertNotIn('TRUSTED_PUBLISHERS_REGISTERED', text)
         self.assertEqual(check.validate(ROOT)['validated'], True)
 
 

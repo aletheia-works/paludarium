@@ -163,8 +163,8 @@ class AcceptanceTests(unittest.TestCase):
     def setUp(self):
         self.world = World()
 
-    def produce(self, trusted=False):
-        return A.produce(self.world.api(), HEAD, trusted)
+    def produce(self):
+        return A.produce(self.world.api(), HEAD)
 
     def rejected(self, pattern):
         with self.assertRaisesRegex(ValueError, pattern):
@@ -172,7 +172,7 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_success_document_shape(self):
         api = self.world.api()
-        document = A.produce(api, HEAD, False)
+        document = A.produce(api, HEAD)
         self.assertTrue(all(r.startswith('actions/runs') for r in api.routes))
         self.assertEqual({r['purpose'] for r in document['quality']}, policy.REQUIRED)
         self.assertEqual(len(document['quality']), len(policy.REQUIRED))
@@ -181,7 +181,9 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual({r['id'] for r in document['acceptance']}, policy.ACCEPTANCE)
         self.assertTrue(all(r['passed'] is True and r['head'] == HEAD and re.fullmatch('[0-9a-f]{64}', r['artifact_sha256'])
                             for r in document['acceptance']))
-        self.assertIs(document['trusted_publishers_registered'], False)
+        for key in ('trusted_publishers_registered', 'first_publication', 'registries_absent', 'registry_resume_verified'):
+            self.assertNotIn(key, document)
+        self.assertFalse([key for key in document if key.endswith('_basis')])
         self.assertEqual(document['evidence']['performance']['result']['p'], 1 / 1024)
         self.assertIs(document['published'], False)
 
@@ -273,7 +275,7 @@ class AcceptanceTests(unittest.TestCase):
     def test_paginated_listing_refused(self):
         api = self.world.api();api.listings['runs'] = api.listings['runs'] * 30
         with self.assertRaisesRegex(ValueError, 'paginated listing refused'):
-            A.produce(api, HEAD, False)
+            A.produce(api, HEAD)
 
     def test_unreadable_artifact(self):
         # A ZIP whose official digest matches but whose bytes are not an archive.
@@ -282,48 +284,25 @@ class AcceptanceTests(unittest.TestCase):
         api.archives[item['archive_download_url']] = b'not a zip'
         item.update(digest='sha256:' + A.sha(b'not a zip'), size_in_bytes=9)
         with self.assertRaisesRegex(ValueError, 'u12-macos-host: unreadable artifact'):
-            A.produce(api, HEAD, False)
+            A.produce(api, HEAD)
 
     def test_main_writes_exclusive_output(self):
-        environ = dict(GITHUB_REPOSITORY=policy.REPOSITORY, GITHUB_REF='refs/heads/main', GITHUB_SHA=HEAD,
-                       U15_TRUSTED_PUBLISHERS_REGISTERED='true')
+        environ = dict(GITHUB_REPOSITORY=policy.REPOSITORY, GITHUB_REF='refs/heads/main', GITHUB_SHA=HEAD)
         with tempfile.TemporaryDirectory(dir=ROOT / 'target/u15') as directory:
             output = Path(directory) / 'out/release-evidence.json'
             with patch('builtins.print'):
                 summary = A.main(['--output', str(output)], environ, self.world.api())
-            self.assertEqual(summary['quality'], 8);self.assertTrue(summary['trusted_publishers_registered'])
+            self.assertEqual(summary['quality'], 8);self.assertEqual(set(summary), {'head', 'quality', 'acceptance', 'output'})
             self.assertEqual(json.loads(output.read_bytes())['head'], HEAD)
             with patch('builtins.print'), self.assertRaises(FileExistsError):
                 A.main(['--output', str(output)], environ, self.world.api())
 
-    def test_main_rejects_non_main_ref_and_bad_declaration(self):
+    def test_main_rejects_non_main_ref_and_bad_head(self):
         base = dict(GITHUB_REPOSITORY=policy.REPOSITORY, GITHUB_REF='refs/heads/main', GITHUB_SHA=HEAD)
         with self.assertRaisesRegex(ValueError, 'only for main'):
             A.main(['--output', 'unused.json'], dict(base, GITHUB_REF='refs/heads/codex/build-and-test'), self.world.api())
-        with self.assertRaisesRegex(ValueError, 'exactly true or false'):
-            A.main(['--output', 'unused.json'], dict(base, U15_TRUSTED_PUBLISHERS_REGISTERED='yes'), self.world.api())
         with self.assertRaisesRegex(ValueError, 'invalid head'):
             A.main(['--output', 'unused.json'], dict(base, GITHUB_SHA='v0.1.0'), self.world.api())
-        with self.assertRaisesRegex(ValueError, 'must be boolean'):
-            A.produce(self.world.api(), HEAD, 'true')
-
-    # Step14b (Q4): the first-publication declaration, default false.
-    def test_first_publication_declaration(self):
-        base = dict(GITHUB_REPOSITORY=policy.REPOSITORY, GITHUB_REF='refs/heads/main', GITHUB_SHA=HEAD)
-        with tempfile.TemporaryDirectory(dir=ROOT / 'target/u15') as directory:
-            output = Path(directory) / 'release-evidence.json'
-            with patch('builtins.print'):
-                summary = A.main(['--output', str(output)], dict(base, U15_FIRST_PUBLICATION='true'), self.world.api())
-            document = json.loads(output.read_bytes())
-        self.assertIs(summary['first_publication'], True);self.assertIs(document['first_publication'], True)
-        self.assertIs(document['trusted_publishers_registered'], False);self.assertNotIn('registries_absent', document)
-        self.assertIs(self.produce()['first_publication'], False)
-        with self.assertRaisesRegex(ValueError, 'U15_FIRST_PUBLICATION must be exactly'):
-            A.main(['--output', 'unused.json'], dict(base, U15_FIRST_PUBLICATION='1'), self.world.api())
-        with self.assertRaisesRegex(ValueError, 'conflicting'):
-            A.produce(self.world.api(), HEAD, True, True)
-        with self.assertRaisesRegex(ValueError, 'must be boolean'):
-            A.produce(self.world.api(), HEAD, False, 'true')
 
 
 class AdapterTests(unittest.TestCase):
@@ -382,14 +361,17 @@ class AdapterTests(unittest.TestCase):
         self.assertIn('persist-credentials: false', text);self.assertIn('timeout-minutes:', text)
         self.assertEqual(re.findall(r'\n\s+name: (u15-[a-z-]+)\n', text), ['u15-acceptance'])
         self.assertEqual(re.findall(r'\n\s+path: (\S+)\n', text), ['target/u15/release-evidence.json'])
-        self.assertIn('default: false', text)
+        # Trusted Publishing only: dispatched with no inputs and no declaration.
+        self.assertEqual(trigger.strip(), 'workflow_dispatch:')
+        for name in ('inputs', 'U15_TRUSTED_PUBLISHERS_REGISTERED', 'U15_FIRST_PUBLICATION'):
+            self.assertNotIn(name, text)
 
 
 class AcceptanceIntegrationTests(unittest.TestCase):
     """Produced document -> check.fetch_acceptance -> policy.release_gate (mocked GitHub only)."""
 
-    def gate_state(self, trusted, first=False):
-        document = A.produce(World().api(), HEAD, trusted, first)
+    def gate_state(self):
+        document = A.produce(World().api(), HEAD)
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, 'w') as archive:
             archive.writestr('release-evidence.json', json.dumps(document))
@@ -411,21 +393,9 @@ class AcceptanceIntegrationTests(unittest.TestCase):
         return state, inventory
 
     def test_document_passes_fetch_and_release_gate(self):
-        state, inventory = self.gate_state(True)
+        state, inventory = self.gate_state()
         result = policy.release_gate(state, inventory)
-        self.assertTrue(result['eligible']);self.assertEqual(result['head'], HEAD)
-
-    def test_unregistered_trusted_publishers_rejected_by_gate(self):
-        state, inventory = self.gate_state(False)
-        with self.assertRaisesRegex(ValueError, 'trusted publishers'):
-            policy.release_gate(state, inventory)
-
-    def test_first_publication_document_needs_live_absence(self):
-        state, inventory = self.gate_state(False, True)
-        with self.assertRaisesRegex(ValueError, 'no verified first publication'):
-            policy.release_gate(state, inventory)
-        state['registries_absent'] = True  # set only by check.authorize after its live registry check
-        self.assertEqual(policy.release_gate(state, inventory)['authentication'], 'first-publication-token')
+        self.assertTrue(result['eligible']);self.assertEqual(result['head'], HEAD);self.assertNotIn('authentication', result)
 
 
 if __name__ == '__main__':

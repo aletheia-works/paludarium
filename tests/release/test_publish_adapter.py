@@ -38,7 +38,7 @@ class PublishAdapterTests(unittest.TestCase):
             crates=package.inspect_crates(self.crates,self.inv),npm=package.inspect_npm(self.npm,expected))
         (self.out/'package-result.json').write_text(json.dumps(self.result));self.uploaded=set()
         self.env=dict(PALUDARIUM_TEST_NODE=sys.executable,PALUDARIUM_RELEASE_NPM=__file__,U15_OIDC_CRATES_IO_TOKEN=CANARY['U15_OIDC_CRATES_IO_TOKEN'])
-        self.mode='oidc';self.envs=[];self.yanked=set();self.dry_dir='target/package/tmp-crate'
+        self.envs=[];self.yanked=set();self.dry_dir='target/package/tmp-crate'
     def request(self,url,timeout):
         if 'crates.io/' in url:
             name=url.split('/')[-2]
@@ -58,7 +58,7 @@ class PublishAdapterTests(unittest.TestCase):
         else:self.uploaded.add('npm')
         return dict(exit=0,timeout=False,error=None,reaped=True)
     def execute(self):
-        approved=dict(head=self.head,version='0.1.0',order=self.inv['order'],authentication=self.mode)
+        approved=dict(eligible=True,head=self.head,version='0.1.0',order=self.inv['order'])
         with patch.dict(os.environ,self.env),patch.object(check,'authorize',return_value=approved),patch.object(check,'checked_command',side_effect=self.command),patch.object(check,'run_command',side_effect=self.command),patch.object(check.urllib.request,'urlopen',side_effect=self.request):
             return check.publish_artifacts(self.root,None)
     def test_mocked_upload_transport(self):
@@ -105,30 +105,24 @@ class PublishAdapterTests(unittest.TestCase):
         self.npm.write_bytes(self.npm.read_bytes()+b'changed')
         with self.assertRaises(ValueError):self.execute()
         self.assertEqual(self.uploaded,set())
-    # Step14b (Q4): the first publication uses the scoped tokens, only for uploads, never recorded.
-    def test_first_publication_tokens_reach_uploads_only(self):
-        self.mode='first-publication-token';del self.env['U15_OIDC_CRATES_IO_TOKEN']
-        self.env.update(U15_FIRST_CRATES_IO_TOKEN=CANARY['U15_FIRST_CRATES_IO_TOKEN'],U15_FIRST_NPM_TOKEN=CANARY['U15_FIRST_NPM_TOKEN'])
-        result=self.execute();self.assertEqual(result['authentication'],'first-publication-token')
-        crates,npm=CANARY['U15_FIRST_CRATES_IO_TOKEN'],CANARY['U15_FIRST_NPM_TOKEN']
+    # Trusted Publishing only: the OIDC token reaches the cargo uploads only and is never recorded.
+    def test_oidc_token_reaches_uploads_only(self):
+        result=self.execute();self.assertNotIn('authentication',result)
+        token=CANARY['U15_OIDC_CRATES_IO_TOKEN']
         dry=[e for n,e in self.envs if n.startswith('dry-')];uploads=[e for n,e in self.envs if n.startswith('publish-') and n!='publish-npm']
         npm_env=[e for n,e in self.envs if n=='publish-npm']
         self.assertEqual((len(dry),len(uploads),len(npm_env)),(11,11,1))
-        self.assertTrue(all(not set(CANARY.values())&set(e.values()) for e in dry))
-        self.assertTrue(all(e['CARGO_REGISTRY_TOKEN']==crates and npm not in e.values() for e in uploads))
-        self.assertEqual(npm_env[0]['NODE_AUTH_TOKEN'],npm);self.assertNotIn(crates,npm_env[0].values())
+        self.assertTrue(all(token not in e.values() for e in dry+npm_env));self.assertTrue(all(e['CARGO_REGISTRY_TOKEN']==token for e in uploads))
         recorded=json.dumps(result)+(self.out/'publication-progress.json').read_text()
-        self.assertFalse([v for v in CANARY.values() if v in recorded])
-    def test_oidc_mode_refuses_leftover_first_token(self):
-        self.env['U15_FIRST_CRATES_IO_TOKEN']=CANARY['U15_FIRST_CRATES_IO_TOKEN']
-        with self.assertRaisesRegex(ValueError,'still configured'):self.execute()
+        self.assertNotIn(token,recorded)
+    def test_missing_oidc_token_stops_before_any_command(self):
+        del self.env['U15_OIDC_CRATES_IO_TOKEN']
+        with patch.dict(os.environ,{'U15_OIDC_CRATES_IO_TOKEN':''}):
+            with self.assertRaisesRegex(ValueError,'OIDC token absent'):self.execute()
         self.assertEqual(self.uploaded,set());self.assertEqual(self.envs,[])
-    # Step17 (R-16): resuming a stopped first publication uploads only what is missing.
-    def first_mode(self):
-        self.mode='first-publication-token';del self.env['U15_OIDC_CRATES_IO_TOKEN']
-        self.env.update(U15_FIRST_CRATES_IO_TOKEN=CANARY['U15_FIRST_CRATES_IO_TOKEN'],U15_FIRST_NPM_TOKEN=CANARY['U15_FIRST_NPM_TOKEN'])
+    # Step17 (R-16): resuming a stopped publication uploads only what is missing.
     def test_resume_uploads_only_remaining(self):
-        self.first_mode();done=self.inv['order'][:3];self.uploaded=set(done)
+        done=self.inv['order'][:3];self.uploaded=set(done)
         result=self.execute();self.assertEqual(result['published'],self.inv['order']+['@aletheia-works/paludarium-wasm'])
         names=[n for n,_ in self.envs]
         self.assertFalse([n for n in names if any(n.endswith('-'+d) for d in done)])
@@ -136,10 +130,9 @@ class PublishAdapterTests(unittest.TestCase):
         progress=json.loads((self.out/'publication-progress.json').read_text())
         self.assertEqual(progress['attempted'],self.inv['order'][3:]+['@aletheia-works/paludarium-wasm']);self.assertFalse(progress['automatic_retry'])
     # Step24 (review 04, finding 6a): `authorize` is replaced here, so what stops this run is the
-    # publish loop's own registry_state check of a present version, not the R-16 resume check
-    # (that one is tested through check.authorize in test_api.py).
+    # publish loop's own registry_state check of a present version.
     def test_publish_loop_registry_state_refuses_different_present_digest(self):
-        self.first_mode();first=self.inv['order'][0];self.uploaded={first}
+        first=self.inv['order'][0];self.uploaded={first}
         request=self.request
         def tampered(url,timeout):
             body=request(url,timeout)
@@ -150,30 +143,9 @@ class PublishAdapterTests(unittest.TestCase):
         self.assertEqual(self.uploaded,{first});self.assertEqual(self.envs,[])
     # Step24 (review 04, finding 4): the publish loop never takes a yanked present version as published.
     def test_publish_loop_refuses_yanked_present_version(self):
-        self.first_mode();first=self.inv['order'][0];self.uploaded={first};self.yanked={first}
+        first=self.inv['order'][0];self.uploaded={first};self.yanked={first}
         with self.assertRaisesRegex(ValueError,'existing version is yanked'):self.execute()
         self.assertEqual(self.uploaded,{first});self.assertEqual(self.envs,[])
-    def test_approved_digests_from_package_artifact(self):
-        digests=check.approved_digests(self.root,self.head)
-        self.assertEqual(set(digests),set(self.inv['order'])|{'@aletheia-works/paludarium-wasm'})
-        self.assertEqual(digests['paludarium-types'],self.result['crates']['paludarium-types']['sha256'])
-        self.assertEqual(digests['@aletheia-works/paludarium-wasm'],'sha512-'+base64.b64encode(hashlib.sha512(self.npm.read_bytes()).digest()).decode())
-        with self.assertRaisesRegex(ValueError,'wrong head'):check.approved_digests(self.root,'b'*40)
-        self.npm.write_bytes(self.npm.read_bytes()+b'changed')
-        with self.assertRaisesRegex(ValueError,'tarball differs'):check.approved_digests(self.root,self.head)
-    # Step24 (review 04, finding 6c): the passed / local_snapshot / tarball-count branches refuse.
-    def test_approved_digests_refuses_failed_local_or_ambiguous_artifacts(self):
-        for field,value in (('passed',False),('passed',None),('local_snapshot',True),('local_snapshot',None)):
-            with self.subTest(field=field,value=value):
-                (self.out/'package-result.json').write_text(json.dumps(dict(self.result,**{field:value})))
-                with self.assertRaisesRegex(ValueError,'wrong head/result'):check.approved_digests(self.root,self.head)
-        (self.out/'package-result.json').write_text(json.dumps(self.result))
-        second=self.out/'package-other';second.mkdir();shutil.copyfile(self.npm,second/'wasm.tgz')
-        with self.assertRaisesRegex(ValueError,'absent/ambiguous'):check.approved_digests(self.root,self.head)
-        shutil.rmtree(second);self.npm.unlink()
-        with self.assertRaisesRegex(ValueError,'absent/ambiguous'):check.approved_digests(self.root,self.head)
-        (self.out/'package-result.json').unlink()
-        with self.assertRaisesRegex(ValueError,'approved package artifact absent'):check.approved_digests(self.root,self.head)
     # Step17 (R-17): the job's GitHub token and OIDC request variables never reach cargo.
     def test_cargo_uploads_never_see_github_or_oidc_request_variables(self):
         self.env.update(GH_TOKEN='canary-gh-0004',ACTIONS_ID_TOKEN_REQUEST_URL='https://oidc.example.invalid',ACTIONS_ID_TOKEN_REQUEST_TOKEN='canary-oidc-request-0006',GITHUB_ACTIONS='true')

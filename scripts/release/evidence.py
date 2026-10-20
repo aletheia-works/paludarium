@@ -13,10 +13,11 @@ release, which start publish.yml; it publishes without waiting for any
 approval. A failed run is never dispatched again
 (FR8.3 is measured once per head); the head then needs a person.
 
-Only the first publication is automated: u15-acceptance.yml is dispatched with
-first_publication=true when every crate and the npm package are absent from
-the registries. When any is present, registering the Trusted Publishers is a
-person's declaration, so it stops and names the manual dispatch.
+Publication is by Trusted Publishing only, so every package must already exist
+on its registry without this version. A new package (it needs one publication
+by hand before its Trusted Publisher can be registered) or a version already
+partly published (the stopped publish job is re-run instead) stops it before
+any dispatch.
 """
 import json
 import os
@@ -103,7 +104,24 @@ def tag_exists(api, version):
     return any(r.get('ref') == 'refs/tags/v' + version for r in refs)
 
 
-def produce(api, root, head, absent=check.registries_absent, sleep=time.sleep, clock=time.monotonic):
+def version_present(name, version):
+    url = check.NPM_PACKAGE_URL if name == check.NPM_NAME else check.CRATES_API + name
+    return check.registry_present(url + '/' + version)
+
+
+def publishable(inv, presence=check.registry_presence, present=version_present):
+    """ValueError unless every package exists on its registry without this version."""
+    found = presence(inv['order'])
+    new = sorted(set(found['checked']) - set(found['present']))
+    policy.require(not new, 'not on a registry yet: %s; publish it once by hand and register its Trusted Publisher '
+                   '(docs/release.md)' % ', '.join(new))
+    partial = [n for n in found['checked'] if present(n, inv['version'])]
+    policy.require(not partial, '%s already on a registry: %s; re-run the stopped publish job instead'
+                   % (inv['version'], ', '.join(partial)))
+
+
+def produce(api, root, head, presence=check.registry_presence, present=version_present,
+            sleep=time.sleep, clock=time.monotonic):
     inv = policy.inventory(root)
     version = inv['version']
     policy.require(version != '0.0.0', 'release version not decided')
@@ -111,15 +129,12 @@ def produce(api, root, head, absent=check.registries_absent, sleep=time.sleep, c
         raise Stop('v%s is already tagged' % version)
     if main_head(api) != head:
         raise Stop('%s is no longer the main head' % head)
-    presence = absent(inv['order'])
-    policy.require(presence['absent'], 'already on a registry: %s. Trusted Publishing releases are not automated yet; '
-                   'dispatch u15-acceptance.yml with trusted_publishers_registered=true by hand (docs/release.md)'
-                   % ', '.join(presence['present']))
+    publishable(inv, presence, present)
     waiter = Waiter(api, head, sleep, clock)
     runs = [waiter.one(CI, 'push')] + [waiter.dispatch(w) for w in QUALITY]
     for run in runs:
         waiter.succeeded(run)
-    waiter.succeeded(waiter.dispatch(PRODUCER, dict(first_publication='true')))
+    waiter.succeeded(waiter.dispatch(PRODUCER))
     return dict(ready='true', version=version, head=head)
 
 

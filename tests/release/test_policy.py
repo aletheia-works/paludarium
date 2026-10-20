@@ -10,8 +10,7 @@ def valid():
        main_compare=dict(base_commit=dict(sha=head),status='ahead'),
        quality=[dict(purpose=k,repository=policy.REPOSITORY,head_sha=head,status='completed',conclusion='success',id=i+1) for i,k in enumerate(sorted(policy.REQUIRED))],
        acceptance=[dict(id=k,head=head,passed=True,artifact_sha256='b'*64) for k in sorted(policy.ACCEPTANCE)],
-       environment=dict(name='release',can_admins_bypass=False,protection_rules=[dict(type='required_reviewers',prevent_self_review=True,reviewers=[dict(type='User',reviewer=dict(id=1))])]),
-       trusted_publishers_registered=True)
+       environment=dict(name='release',can_admins_bypass=False,protection_rules=[dict(type='required_reviewers',prevent_self_review=True,reviewers=[dict(type='User',reviewer=dict(id=1))])]))
     return state,inv
 
 class PolicyTests(unittest.TestCase):
@@ -33,7 +32,6 @@ class PolicyTests(unittest.TestCase):
     def test_unsigned(self):self.s['commit']['commit']['verification']['verified']=False;self.reject()
     def test_no_environment(self):self.s['environment']={};self.reject()
     def test_admin_bypass(self):self.s['environment']['can_admins_bypass']=True;self.reject()
-    def test_unregistered(self):self.s['trusted_publishers_registered']=False;self.reject()
     def test_cycle(self):
         with self.assertRaises(ValueError):policy.dependency_order({'a':dict(dependencies={'b':'1'}),'b':dict(dependencies={'a':'1'})})
     def test_unknown_dependency(self):
@@ -52,32 +50,11 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(rules):
                 self.s['environment']['protection_rules']=rules;self.assertTrue(policy.release_gate(self.s,self.i)['eligible'])
     def test_admin_bypass_unknown(self):del self.s['environment']['can_admins_bypass'];self.reject()
-    # Step14b (Q4): OIDC normally; the scoped token only for a verified first publication.
-    def test_oidc_mode(self):self.assertEqual(policy.release_gate(self.s,self.i)['authentication'],'oidc')
-    def first(self,**fields):self.s.update(dict(trusted_publishers_registered=False,first_publication=True),**fields)
-    def test_first_publication_absent_allowed(self):
-        self.first(registries_absent=True)
-        self.assertEqual(policy.release_gate(self.s,self.i)['authentication'],'first-publication-token')
-    def test_first_publication_existing_rejected(self):
-        self.first(registries_absent=False)
-        with self.assertRaisesRegex(ValueError,'trusted publishers unregistered'):policy.release_gate(self.s,self.i)
-    def test_first_publication_unchecked_rejected(self):
-        self.first();self.reject()
-        self.first(registries_absent='true');self.reject()
-    def test_no_declaration_rejected(self):
-        self.s['trusted_publishers_registered']=False;self.s['registries_absent']=True
-        with self.assertRaisesRegex(ValueError,'trusted publishers'):policy.release_gate(self.s,self.i)
-    # Step17 (R-16): only the live-verified resume flag lets a stopped first publication continue.
-    def test_first_publication_verified_resume_allowed(self):
-        self.first(registries_absent=False,registry_resume_verified=True)
-        self.assertEqual(policy.release_gate(self.s,self.i)['authentication'],'first-publication-token')
-    def test_resume_flag_needs_declaration_and_exact_true(self):
-        self.first(registries_absent=False,registry_resume_verified='true');self.reject()
-        self.s.update(first_publication=False,registry_resume_verified=True)
-        with self.assertRaisesRegex(ValueError,'trusted publishers unregistered'):policy.release_gate(self.s,self.i)
-    def test_conflicting_declarations_rejected(self):
-        self.s.update(first_publication=True,registries_absent=True)
-        with self.assertRaisesRegex(ValueError,'conflicting'):policy.release_gate(self.s,self.i)
+    # Trusted Publishing only: no declaration, no authentication mode.
+    def test_oidc_only_without_declaration(self):
+        result=policy.release_gate(self.s,self.i)
+        self.assertEqual(result,dict(eligible=True,head='a'*40,version='0.1.0',order=self.i['order']));self.assertNotIn('authentication',result)
+        for key in ('trusted_publishers_registered','first_publication','registries_absent','registry_resume_verified'):self.assertNotIn(key,self.s)
     def inherited_dependency(self,field):
         with tempfile.TemporaryDirectory(dir=ROOT/'target/u15') as directory:
             root=Path(directory);workspace=(ROOT/'Cargo.toml').read_text()

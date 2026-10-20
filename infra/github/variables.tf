@@ -38,14 +38,4 @@ variable "repository_topics" {
   ]
 }
 
-variable "crates_io_owners" {
-  description = "crates.io owner logins every published crate must have (U15_CRATES_IO_OWNERS, see docs/release.md)"
-  type        = list(string)
-  default     = ["JamBalaya56562"]
-}
 
-variable "npm_maintainers" {
-  description = "npm maintainer names @aletheia-works/paludarium-wasm must have (U15_NPM_MAINTAINERS, see docs/release.md)"
-  type        = list(string)
-  default     = ["jambalaya56562"]
-}

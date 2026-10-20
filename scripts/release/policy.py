@@ -58,21 +58,9 @@ def inventory(root):
 def protected_environment(environment):
     require(environment.get('name')=='release','release environment absent')
     # Publication needs no person's approval: the same-head evidence gate decides.
-    # The environment still holds the first-publication secrets and names the
-    # Trusted Publisher, and administrator bypass stays off.
+    # The environment names the Trusted Publisher, and administrator bypass stays off.
     require(environment.get('can_admins_bypass') is False,'admin protection bypass is enabled/unknown')
     return True
-
-def authentication(state):
-    """OIDC once Trusted Publishers are registered; a scoped token only for a verified first publication."""
-    registered=state.get('trusted_publishers_registered') is True;first=state.get('first_publication') is True
-    require(not(registered and first),'conflicting declarations: trusted publishers registered and first publication')
-    if registered:return 'oidc'
-    # Step17 (R-16): a stopped first publication continues only when the live check found every
-    # present crate/npm version equal to the approved artifact (registry_resume_verified).
-    verified=state.get('registries_absent') is True or state.get('registry_resume_verified') is True
-    require(first and verified,'trusted publishers unregistered and no verified first publication (all eleven crates and @aletheia-works/paludarium-wasm absent from every registry, or every present one at the approved version and digest)')
-    return 'first-publication-token'
 
 def release_gate(state, manifests):
     require(state.get('repository')==REPOSITORY,'repository is not authorized')
@@ -93,5 +81,4 @@ def release_gate(state, manifests):
     require({e['id'] for e in evidence}==ACCEPTANCE and len(evidence)==len(ACCEPTANCE),'missing acceptance condition')
     for e in evidence:require(e['head']==head and e['passed'] is True and re.fullmatch('[0-9a-f]{64}',e['artifact_sha256']),'acceptance unverified')
     protected_environment(state.get('environment',{}))
-    mode=authentication(state)
-    return dict(eligible=True,head=head,version=version,order=manifests['order'],authentication=mode)
+    return dict(eligible=True,head=head,version=version,order=manifests['order'])

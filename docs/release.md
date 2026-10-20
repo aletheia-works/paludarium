@@ -7,8 +7,10 @@ The first release version is decided as `0.1.0` (Build and Test Q7,
 versions and the npm package `@aletheia-works/paludarium-wasm` are all `0.1.0`;
 `Cargo.lock` and `fuzz/Cargo.lock` changed only in the workspace crates'
 version lines. The fuzz crate (`paludarium-fuzz`, `publish = false`) keeps its
-own `0.0.0`. Nothing has been published yet: FR10.1 stays unverified until the
-real publication and the registry checks below.
+own `0.0.0`. `v0.1.0` was published on 2026-10-20 (tag on 0f456d07, publish
+run 39373383076) with one-time scoped tokens, because crates.io lets a Trusted
+Publisher be registered only for a crate that already exists; every later
+release is by Trusted Publishing (OIDC) only.
 
 The eleven public crates are types, host, mmu, vfs, loader, decoder, cpu,
 jit, kernel, runtime and paludarium, in the dependency order calculated from
@@ -128,24 +130,13 @@ or by `release-evidence.yml` below), with
 `persist-credentials: false`. It runs
 `python -B scripts/release/acceptance.py --output target/u15/release-evidence.json`
 and uploads one artifact `u15-acceptance` whose only member is
-`release-evidence.json` (fields `head`, `quality`, `acceptance`,
-`trusted_publishers_registered`, plus the checked `evidence`). The producer
-refuses to run outside upstream or for a ref other than `refs/heads/main`.
-Its input `trusted_publishers_registered` (default `false`) is the person's
-declaration that step 4 below is done; it is not checked against the
-registries. Its second input `first_publication` (default `false`) declares
-the one-time first publication with scoped tokens (steps 3 and 4b below).
-`release_gate` accepts exactly one of the two: `trusted_publishers_registered:
-true` (OIDC), or `first_publication: true` when the protected publish job's
-own live query finds all eleven crate names on crates.io and
-`@aletheia-works/paludarium-wasm` on npm absent, or, to resume a first publication that
-stopped partway, finds every name that is present holding exactly the
-release version with the approved digest (step 3). Any `registries_absent`,
-`registry_presence` or `registry_resume_verified` value in the document is
-discarded, and any registry answer other than 200/404 stops. Both `false`,
-or both `true`, is refused. Unit and integration tests
-replace the GitHub adapter with in-memory data: they do not prove that any
-real run, artifact or registration exists.
+`release-evidence.json` (fields `head`, `quality`, `acceptance`, plus the
+checked `evidence`). The producer refuses to run outside upstream or for a
+ref other than `refs/heads/main`. It has no inputs: publication is by Trusted
+Publishing only, so no authentication declaration exists; the publish job's
+OIDC token exchange is what proves the registry side. Unit and integration
+tests replace the GitHub adapter with in-memory data: they do not prove that
+any real run, artifact or registration exists.
 
 ## Release Please
 
@@ -156,10 +147,9 @@ repository variable `RELEASE_AUTOMATION_ENABLED` (managed in
 `infra/github/release.tf`) is `true`. Unlike those repositories, a push to
 main only creates or updates the release PR (`skip-github-release`): the
 same-head evidence of step 5 must exist for the release PR's merge commit
-before any tag. For the first publication, `release-evidence.yml` creates
-the tag and the GitHub release once that evidence exists (step 5); later
-releases still use a manual dispatch of `release.yml` until Trusted
-Publishing is automated. The labels `autorelease: pending` and `autorelease: tagged` are
+before any tag, so Release Please never tags: `release-evidence.yml`
+creates the tag and the GitHub release once that evidence exists (steps 5
+and 6). The labels `autorelease: pending` and `autorelease: tagged` are
 managed in `infra/github/main.tf`.
 
 `.github/workflows/release-merge.yml` enables auto-merge on the pending
@@ -176,11 +166,11 @@ fixed with `release-as: 0.1.0`, removed after `v0.1.0` was published; Release
 Please now calculates each version from the Conventional Commits since the
 last release.
 
-## Owner hand-off (Step 16)
+## Release steps
 
-U15 does not publish. The person (and, where noted, an upstream
-administrator) does these steps in order. FR10.1 stays a GAP until step 6
-and its registry checks are complete.
+A release needs a person only to merge the release PR (step 1, or Monday's
+auto-merge), and once per new package (step 3); everything else runs by
+itself.
 
 1. **Merge the release PR.** When: when the version Release Please
    proposes is the one to publish, or let `release-merge.yml` merge it
@@ -199,178 +189,85 @@ and its registry checks are complete.
    (step 5) decides it. Confirm:
    `gh api repos/aletheia-works/paludarium/environments/release` shows
    `can_admins_bypass: false` (preflight refuses bypass `true` or unknown).
-3. **Decide name ownership and the first publication.** When: before
-   step 4. Confirm that all eleven crate names and `@aletheia-works/paludarium-wasm` are
-   free (not yet on crates.io or npm) or owned by the project. crates.io
-   lets a Trusted Publisher be registered only for a crate that already
-   exists, so the first publication cannot use OIDC. For that one release
-   only, `publish.yml` can publish with short-lived, scoped tokens that the
-   person creates (Step14b, Q4); it never creates a token itself:
-   - crates.io: on crates.io, Account Settings, API Tokens, create a new
-     token with an expiration date as short as the release needs (for
-     example 1 to 7 days, long enough to cover a resumed run below), the
-     endpoint scope `publish-new` only, and crate scopes listing the eleven
-     names one by one (recommended). A pattern such as `paludarium*` is a
-     prefix match: it covers `paludarium` and the `paludarium-*` names, but
-     also any other crate name that starts with `paludarium`, so it is
-     broader than the eleven crates.
-   - npm: create a granular access token with the shortest expiration the
-     release needs and "Read and write" permission limited to the
-     `@aletheia-works` scope (organization); it must be usable from CI for
-     publishing (check npm's current settings for two-factor bypass when
-     creating it). A package that does not exist yet cannot be selected on
-     its own, so this token also covers the organization's other packages
-     (such as `@aletheia-works/terrarium`): keep its expiration short and
-     revoke it right after the first publication (step 4b).
-   - Store them as **environment secrets of `release`** (not repository or
-     organization secrets): `U15_FIRST_CRATES_IO_TOKEN` and
-     `U15_FIRST_NPM_TOKEN`. Environment secrets reach only the publish
-     job, which runs only for a `v*.*.*` tag. `publish.yml` passes them
-     only to the `cargo publish` and `npm publish` child processes (dry
-     runs get no token), never prints them, and receipts and
-     `publication-progress.json` record no token value. Each child gets
-     only an allow-list of variables (`CARGO_ENVIRONMENT` and
-     `NPM_ENVIRONMENT` in `scripts/release/check.py`): `cargo` never
-     receives `GH_TOKEN`, `GITHUB_TOKEN` or `ACTIONS_ID_TOKEN_REQUEST_*`,
-     and `npm` receives only what `npm publish --provenance` needs (CI
-     detection, the OIDC request variables, the GitHub context named in
-     the provenance statement, setup-node's `.npmrc` and its token).
-   - **crates.io new-crate rate limit.** crates.io limits how many new
-     crates one account can create in a short time, and all eleven crates
-     are new in the first publication. Before step 6, check the current
-     limit on crates.io (its documentation or help@crates.io); if it is
-     lower than eleven within the publish job's 30 minutes, ask crates.io
-     (help@crates.io) to raise it for this account first. If it is not
-     raised, expect the run to stop at the limit and resume as below.
-   - **Declare the expected owners** (Step24). As **environment variables
-     of `release`** (Settings, Environments, `release`, Environment
-     variables; not secrets, they are not secret), set
-     `U15_CRATES_IO_OWNERS` to the comma-separated crates.io owner logins
-     every one of the eleven crates must have (users by login, teams as
-     `github:<org>:<team>`, exactly as `https://crates.io/api/v1/crates/<name>/owners`
-     lists them in `users[].login`), and `U15_NPM_MAINTAINERS` to the
-     comma-separated npm maintainer names of `@aletheia-works/paludarium-wasm` (as
-     `https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm` lists them in
-     `maintainers[].name`). A resume (below) is refused when either is
-     unset, or when a present name has any other owner set (an extra or
-     missing owner included).
-   - **Resuming a first publication that stopped partway** (rate limit,
-     timeout, network error). Do not delete, yank or re-upload anything,
-     and do not move the tag. Keep the artifact
-     `u15-publication-progress-attempt-<n>` of the stopped run (Step24:
-     `publish.yml` uploads `publication-progress.json` and the command
-     receipts, which hold no token values, even when the job stops; keep
-     it before its 90-day retention ends) and the job logs. After the cause is gone (for the rate limit,
-     after the waiting time crates.io names), re-run the publish job of the
-     same `publish.yml` run (same tag and head; the tokens must not have expired). The publish job's
-     live check then accepts `first_publication: true` only when every
-     crate name and `@aletheia-works/paludarium-wasm` that is already present holds
-     exactly `0.1.0` with the approved digest: the crates.io `checksum`
-     equals the SHA-256 of that crate's approved `.crate`, and the npm
-     `dist.integrity` equals the approved tarball's SHA-512 integrity
-     (both taken from the `u15-package` artifact for the release head).
-     The crates.io version must also say `yanked: false`, and the name's
-     crates.io owners or npm maintainers must equal the declared ones
-     above exactly (Step24, review 04 findings 3 and 4).
-     Those versions are only verified; the remaining ones are uploaded in
-     dependency order. If even one present name has another version, a
-     different digest, a digest that cannot be read, a yanked version, or
-     other or unreadable owners, the job refuses before uploading
-     anything. Then the owner decides the recovery
-     outside `publish.yml` (for example a new version), never by
-     overwriting a published version.
-   The first publication is accepted only when the acceptance document
-   declares `first_publication: true` (step 5) and the publish job's live
-   query finds none of the eleven crates nor `@aletheia-works/paludarium-wasm` on any
-   registry, or only matching versions as in the resume above. If a
-   crate's `0.1.0` is uploaded outside `publish.yml`, `publish.yml` later
-   only verifies it, and stops unless the registry checksum equals the
-   `.crate` digest built by `release-check.yml` for the release head.
-   Confirm: before step 5, `https://crates.io/api/v1/crates/<name>` returns
-   404 for each of the eleven names and
-   `https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm` returns 404, and the
-   `release` environment lists both secrets (names only).
-4. **Register the Trusted Publishers.** When: for the first release,
-   right after its publication (step 6) succeeded; for a later release,
-   before step 5. After the first publication, also (4b) revoke both
-   tokens on crates.io and npm and delete `U15_FIRST_CRATES_IO_TOKEN` and
-   `U15_FIRST_NPM_TOKEN` from the `release` environment: from the second
-   release on, only OIDC (Trusted Publishing) is used, and the publish job
-   refuses to run in OIDC mode while either secret is still set. For each
-   of the eleven crates on crates.io and for
-   `@aletheia-works/paludarium-wasm` on npm, register repository
-   `aletheia-works/paludarium`, workflow `publish.yml` and environment
-   `release`. npm also requires `repository.url` in `package.json` to
-   match (it does) and its supported runner and CLI (npm 12.2.0 on Node
-   26.12.0 here). Confirm: each crate's and the npm package's Trusted
-   Publishing settings show exactly that repository, workflow and
-   environment.
-5. **Same-head evidence, first publication: automatic.**
+3. **New packages.** Trusted Publishing needs the package to exist, so a
+   crate or npm package that is not on its registry yet is published once
+   by hand (by its owner, from the release head, with a short-lived token
+   that is revoked right after), and its Trusted Publisher is registered as
+   in step 4 before the next release. `release-evidence.yml` stops before
+   any dispatch while a package is missing. crates.io also limits how many
+   new crates one account can create in a short time (the first
+   publication stopped after five and resumed every ten minutes). Each
+   cargo and npm child of the publish job gets only an allow-list of
+   variables (`CARGO_ENVIRONMENT` and `NPM_ENVIRONMENT` in
+   `scripts/release/check.py`): `cargo` never receives `GH_TOKEN`,
+   `GITHUB_TOKEN` or `ACTIONS_ID_TOKEN_REQUEST_*`, and `npm` receives only
+   what `npm publish --provenance` needs (CI detection, the OIDC request
+   variables, the GitHub context named in the provenance statement and
+   setup-node's `.npmrc`). Receipts and `publication-progress.json` record
+   no token value.
+4. **Register the Trusted Publishers.** For each of the eleven crates on
+   crates.io and for `@aletheia-works/paludarium-wasm` on npm, register
+   repository `aletheia-works/paludarium`, workflow `publish.yml` and
+   environment `release`. npm also requires `repository.url` in
+   `package.json` to match (it does) and its supported runner and CLI (npm
+   12.2.0 on Node 26.12.0 here). Revoke the one-time tokens of the first
+   publication on crates.io and npm and delete their `release` environment
+   secrets. Confirm: each crate's and the npm package's Trusted Publishing
+   settings show exactly that repository, workflow and environment. Without
+   a registered Trusted Publisher, the publish job's OIDC token exchange
+   fails before any upload.
+5. **Same-head evidence: automatic.**
    `.github/workflows/release-evidence.yml` runs on every push to main.
-   While tag `v<version>` of the workspace version does not exist, the main
-   head is that push, and every crate and the npm package are absent from
-   the registries, `scripts/release/evidence.py` waits for the `ci.yml`
+   While tag `v<version>` of the workspace version does not exist and the
+   main head is that push, `scripts/release/evidence.py` first requires
+   every crate and the npm package to exist on its registry without this
+   version: a missing package (step 3) or a version already partly on a
+   registry (re-run the stopped publish job instead) stops it before any
+   dispatch. It then waits for the `ci.yml`
    push run, dispatches `u12-quality.yml`, `u14-quality.yml` and
    `release-check.yml` once each (a run a person already dispatched for the
    head is reused, never doubled), waits for all of them, then dispatches
-   `u15-acceptance.yml` with `first_publication=true` once and waits for it.
-   When all succeeded, its `tag` job creates tag `v<version>` and the
-   GitHub release (notes from `CHANGELOG.md`) on that head with the
-   `aletheia-works-bot` App token, and the tag starts `publish.yml`; it then
-   moves the merged release PR from `autorelease: pending` to
-   `autorelease: tagged`, as Release Please does when it tags. A
+   `u15-acceptance.yml` once and waits for it. A
    failed run is not dispatched again (FR8.3 is measured once per head);
    the head then needs a person. When the version is already tagged or the
-   head is no longer main, the run does nothing. When a registry already
-   has a package (a later release), it stops and the manual steps below
-   apply. Confirm: the `Release evidence` run succeeded and the `Publish`
-   run started for its head.
+   head is no longer main, the run does nothing. Confirm: the `Release
+   evidence` run succeeded.
 
-   **Manual (later releases).** When: on the
-   release PR's merge commit from step 1, while it is still the main head, after steps 2 and 3 (first release) or 2 to 4
-   (later releases). The `ci.yml` push run
-   starts by itself; dispatch each of the others once:
+   **By hand** (only when the automatic run stopped and the cause is
+   fixed). On the release head, while it is still the main head, the
+   `ci.yml` push run starts by itself; dispatch each of the others once:
    `gh workflow run u12-quality.yml --repo aletheia-works/paludarium --ref main`,
    the same for `u14-quality.yml` and `release-check.yml`. When all four
    have succeeded (do not dispatch `u14-quality.yml` again to wait for a
    passing FR8.3; if FR8.3 fails, record it and stop), dispatch, within 7
-   days:
-   for the first release
-   `gh workflow run u15-acceptance.yml --repo aletheia-works/paludarium --ref main -f first_publication=true`,
-   and for later releases
-   `gh workflow run u15-acceptance.yml --repo aletheia-works/paludarium --ref main -f trusted_publishers_registered=true`
-   (`true` only when step 4 is complete). Never set both. Confirm: the run
-   succeeded and its artifact `u15-acceptance` holds only
-   `release-evidence.json`, with that head, eight `quality` rows, the five
-   `acceptance` IDs all `passed: true`, and exactly one of
-   `first_publication: true` or `trusted_publishers_registered: true`.
-6. **Create the tag.** For the first publication the tag already exists
-   (step 5). For later releases: when: after step 5, dispatch Release
-   Please once:
-   `gh workflow run release.yml --repo aletheia-works/paludarium --ref main`.
-   It finds the merged release PR, creates tag `v<version>` on its merge
-   commit and the GitHub release, and the tag starts `publish.yml`. If any
-   commit landed on main after the merge commit, preflight still accepts
-   the tag only when the merge commit is reachable from main and every
-   evidence run in step 5 is for that commit. `publish.yml`
-   then runs preflight, the package check and the publish job without
-   waiting for an approval. Confirm: the run
+   days,
+   `gh workflow run u15-acceptance.yml --repo aletheia-works/paludarium --ref main`.
+   Then dispatch
+   `release-evidence.yml` once: it reuses those runs and creates the tag.
+   Confirm: the run succeeded and its artifact `u15-acceptance` holds only
+   `release-evidence.json`, with that head, eight `quality` rows and the
+   five `acceptance` IDs all `passed: true`.
+6. **Tag and publication: automatic.** When the evidence of step 5
+   succeeded, the `tag` job of `release-evidence.yml` creates tag
+   `v<version>` and the GitHub release (notes from `CHANGELOG.md`) on that
+   head with the `aletheia-works-bot` App token, and moves the merged
+   release PR from `autorelease: pending` to `autorelease: tagged`, as
+   Release Please does when it tags; Release Please itself never tags. The
+   tag starts `publish.yml`, which runs preflight, the package check and the
+   publish job without waiting for an approval. Confirm: the run
    succeeded and `publication-progress.json` (in the run's artifact
    `u15-publication-progress-attempt-<n>`) lists all eleven
    crates and `@aletheia-works/paludarium-wasm`; then, independently, each crate's
-   `https://crates.io/api/v1/crates/<name>/0.1.0` `checksum` equals the
+   `https://crates.io/api/v1/crates/<name>/<version>` `checksum` equals the
    `.crate` SHA-256 in the `u15-package` artifact, `npm view
-   @aletheia-works/paludarium-wasm@0.1.0 dist.integrity` equals the tarball's SHA-512
+   @aletheia-works/paludarium-wasm@<version> dist.integrity` equals the tarball's SHA-512
    integrity, and the npm provenance attestation names the upstream
-   repository, `publish.yml` and that head. Only then FR10.1 becomes OK.
-   After the first release, do step 4 (Trusted Publishers) and 4b
-   (revoke and delete both tokens) before any later tag.
+   repository, `publish.yml` and that head.
 
 The evidence document follows `policy.release_gate`: exact head/tag/repository,
 official completed successful quality run identities for every required
-purpose, each acceptance ID with its verified artifact digest, and either the
-Trusted Publisher declaration or the first-publication declaration confirmed
-by the live registry-absence check. The authorization step re-fetches GitHub
+purpose and each acceptance ID with its verified artifact digest. The
+authorization step re-fetches GitHub
 commit, reachability, environment and run history.
 Evidence from old U14 measurements is historical unless the declared source
 and build closure are independently proven equivalent. No same-binary
@@ -378,21 +275,15 @@ performance rerun is used to wait for a passing result.
 
 ## Publication and recovery
 
-For the first publication, `release-evidence.yml` creates the version tag
-once the same-head evidence exists; for later releases the owner dispatches
-`release.yml`. `publish.yml` accepts only an exact `vMAJOR.MINOR.PATCH` after
+`release-evidence.yml` creates the version tag once the same-head evidence
+exists. `publish.yml` accepts only an exact `vMAJOR.MINOR.PATCH` after
 Python validation, verifies signed main reachability and the `release`
 environment before builds, and publishes without waiting for an approval.
 
-Only the publish job receives `id-token: write`. The authorize step writes the
-fixed value `authentication=oidc` or `authentication=first-publication-token`
-to its step output. With `oidc`, crates-io-auth-action obtains a short-lived
-token and revokes it in its post step, and npm uses Trusted Publishing; the
-job refuses if a first-publication secret is still set. With
-`first-publication-token` (the first release only), the OIDC step is skipped
-and the person's scoped, expiring tokens from the `release` environment
-secrets are used; the job refuses if an OIDC token is present or either
-secret is missing. npm provenance is requested in both modes. All
+Only the publish job receives `id-token: write`. crates-io-auth-action
+obtains a short-lived crates.io token and revokes it in its post step, only
+the `cargo publish` children receive it, and npm uses Trusted Publishing
+with provenance. No registry token is stored anywhere. All
 third-party actions are pinned to
 officially resolved commit SHAs. The fork is never substituted for upstream.
 
@@ -409,10 +300,10 @@ On partial failure, preserve `publication-progress.json` (the run's artifact
 `u15-publication-progress-attempt-<n>`, uploaded even when the job stops), attempted uploads,
 unverified uploads and all logs. Do not delete, replace, move a tag or retry
 publication automatically. An owner must inspect registry state and propose
-the remaining recovery. For a first publication, the owner may re-run the
-publish job as described in step 3 ("Resuming a first publication"): it
-continues only when every version already present equals the approved
-artifact, and uploads only the remaining ones. The cargo and npm children
+the remaining recovery. Re-running the stopped publish job of the same run
+(same tag and head) is safe: every version already present is only verified
+(it must equal the approved digest and must not be yanked), and only the
+remaining ones are uploaded. The cargo and npm children
 get allow-listed environments only (step 3); the allow-list for
 `npm publish --provenance` follows npm's provenance generator for GitHub
 Actions and is proven only by the real publication. A successful workflow alone does not establish

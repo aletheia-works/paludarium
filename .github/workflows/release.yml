@@ -1,9 +1,9 @@
 name: Release
 
 # Release Please keeps the release PR up to date on every push to main.
-# Merging that PR only bumps the versions. The tag and GitHub release are
-# created only by a manual dispatch, after the same-head evidence for the
-# merge commit exists (docs/release.md); the tag then starts publish.yml.
+# Merging that PR only bumps the versions. It never creates the tag or the
+# GitHub release: release-evidence.yml does, after the same-head evidence for
+# the merge commit exists (docs/release.md); the tag then starts publish.yml.
 on:
   push:
     branches: [main]
@@ -49,11 +49,11 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/labels/autorelease%3A%20pending" > /dev/null
           gh api "repos/$GITHUB_REPOSITORY/labels/autorelease%3A%20tagged" > /dev/null
 
-      - name: Update release PR, or create tag and GitHub release on dispatch
+      - name: Update release PR
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ steps.app-token.outputs.token }}
           target-branch: main
           config-file: .github/release-please-config.json
           manifest-file: .github/release-please-manifest.json
-          skip-github-release: ${{ github.event_name != 'workflow_dispatch' }}
+          skip-github-release: true

@@ -84,7 +84,7 @@ def validate(root):
         import re
         actions=re.findall(r'uses:\s+([^\s#]+)',text)
         policy.require(bool(actions) and all(a.startswith('./') or re.fullmatch(r'[^@]+@[0-9a-f]{40}',a) for a in actions),'unpinned workflow action')
-    outstanding=['initial registry ownership/publishers','protected environment','same-head acceptance and explicit publication approval']
+    outstanding=['Trusted Publishers','release environment','same-head acceptance evidence']
     if inv['version']=='0.0.0':outstanding.insert(0,'release version')
     return dict(validated=True,version=inv['version'],crates=11,publish_eligible=False,outstanding=outstanding)
 
@@ -97,7 +97,6 @@ CRATES_API='https://crates.io/api/v1/crates/'
 NPM_NAME='@aletheia-works/paludarium-wasm'
 NPM_PACKAGE_URL='https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm'
 CARGO_TOKEN_NAMES=('CARGO_REGISTRY_TOKEN','U15_OIDC_CRATES_IO_TOKEN')
-FIRST_TOKEN_NAMES=('U15_FIRST_CRATES_IO_TOKEN','U15_FIRST_NPM_TOKEN')
 # Step17 (R-17): each publication child gets only the variables it needs (allow-list).
 COMMON_ENVIRONMENT=('PATH','HOME','TMPDIR','LANG','LC_ALL','TZ','SSL_CERT_FILE','SSL_CERT_DIR',
     'HTTPS_PROXY','HTTP_PROXY','NO_PROXY','https_proxy','http_proxy','no_proxy')
@@ -106,7 +105,7 @@ CARGO_ENVIRONMENT=COMMON_ENVIRONMENT+('CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHA
 # npm publish --provenance on GitHub Actions: ci detection, the OIDC request for
 # provenance signing and Trusted Publishing, and the GitHub context the provenance
 # statement names. NPM_CONFIG_USERCONFIG/NODE_AUTH_TOKEN are setup-node's .npmrc
-# and its placeholder (replaced by the scoped token in a first publication).
+# and its placeholder; Trusted Publishing needs no token.
 NPM_ENVIRONMENT=COMMON_ENVIRONMENT+('CI','GITHUB_ACTIONS','ACTIONS_ID_TOKEN_REQUEST_URL','ACTIONS_ID_TOKEN_REQUEST_TOKEN',
     'GITHUB_SERVER_URL','GITHUB_REPOSITORY','GITHUB_REPOSITORY_ID','GITHUB_REPOSITORY_OWNER_ID','GITHUB_WORKFLOW_REF',
     'GITHUB_EVENT_NAME','GITHUB_REF','GITHUB_SHA','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','RUNNER_ENVIRONMENT',
@@ -137,117 +136,26 @@ def registry_version(url):
     except ValueError:return {}
     return body if isinstance(body,dict) else {}
 
-def published_digest(name,version):
-    """('absent'|'unreadable'|'yanked'|'present', digest) of the approved version of a present name:
-    the crates.io `checksum` (.crate SHA-256) or the npm `dist.integrity`. A crates.io version
-    must say `yanked: false`; a yanked one never matches (Step24, review 04 finding 4)."""
-    body=registry_version((NPM_PACKAGE_URL if name==NPM_NAME else CRATES_API+name)+'/'+version)
-    if body is None:return 'absent',None
-    if name==NPM_NAME:
-        dist=body.get('dist');number=body.get('version')
-        digest=dist.get('integrity') if isinstance(dist,dict) else None
-    else:
-        row=body.get('version');row=row if isinstance(row,dict) else {}
-        number,digest=row.get('num'),row.get('checksum')
-        if number==version and row.get('yanked') is True:return 'yanked',None
-        if row.get('yanked') is not False:return 'unreadable',None
-    if number!=version or not isinstance(digest,str) or not digest:return 'unreadable',None
-    return 'present',digest
-
-# Step24 (review 04, finding 3): the expected owners of every present name come from the
-# person, as variables of the protected `release` environment (comma-separated; see docs/release.md).
-OWNER_VARIABLES={'crates':'U15_CRATES_IO_OWNERS','npm':'U15_NPM_MAINTAINERS'}
-
-def expected_owners(environ):
-    """{'crates': [...], 'npm': [...]} from the release environment variables, or None when either is unset or empty."""
-    out={}
-    for key,variable in OWNER_VARIABLES.items():
-        names=sorted({n.strip() for n in environ.get(variable,'').split(',') if n.strip()})
-        if not names:return None
-        out[key]=names
-    return out
-
-def registry_owners(name):
-    """Sorted owner logins (crates.io `users[].login`) or npm `maintainers[].name`; None when unreadable or absent."""
-    body=registry_version(NPM_PACKAGE_URL if name==NPM_NAME else CRATES_API+name+'/owners')
-    rows=(body or {}).get('maintainers' if name==NPM_NAME else 'users')
-    key='name' if name==NPM_NAME else 'login'
-    if not isinstance(rows,list) or not rows or not all(isinstance(r,dict) and isinstance(r.get(key),str) and r[key] for r in rows):return None
-    return sorted({r[key] for r in rows})
-
-def present_mismatch(name,version,expected,owners):
-    """The reason a present name cannot be resumed over, or None when it holds the approved, unyanked
-    version with the approved digest and exactly the declared owners."""
-    state,digest=published_digest(name,version)
-    if state=='absent':return 'name exists without the approved version '+version
-    if state=='yanked':return 'published '+version+' is yanked'
-    if state=='unreadable':return 'published digest of '+version+' unreadable'
-    if not expected.get(name) or digest!=expected[name]:return 'published '+version+' differs from the approved artifact'
-    if owners is None:return 'expected owners not declared ('+', '.join(OWNER_VARIABLES.values())+' in the release environment)'
-    actual=registry_owners(name)
-    if actual is None:return 'owners unreadable'
-    declared=owners['npm' if name==NPM_NAME else 'crates']
-    if actual!=declared:return 'owners '+','.join(actual)+' differ from the declared owners '+','.join(declared)
-    return None
-
-def registries_absent(order,version=None,approved=None,owners=None):
-    """Live check of the eleven crate names and @aletheia-works/paludarium-wasm.
-    Step17 (R-16): when some names are present and `approved` (the approved digests, or a
-    loader called only then) is given, each present name must hold exactly the approved
-    version with the approved digest; `resume` is True only when every present one matches.
-    Step24: the version must not be yanked and the name's owners (crates.io owners, npm
-    maintainers) must equal `owners` exactly. Every reason is listed in `mismatched`; without
-    `approved`, present names are listed as unverifiable (never an empty `mismatched`)."""
+def registry_presence(order):
+    """Which of the eleven crate names and @aletheia-works/paludarium-wasm exist on their registry."""
     urls={name:CRATES_API+name for name in order}
     urls[NPM_NAME]=NPM_PACKAGE_URL
-    present=sorted(name for name,url in sorted(urls.items()) if registry_present(url))
-    result=dict(absent=not present,present=present,checked=sorted(urls),matching=[],mismatched=[],resume=False)
-    if not present:return result
-    if approved is None:
-        result['mismatched']=[dict(name=name,reason='approved digests not supplied; present versions cannot be verified') for name in present]
-        return result
-    policy.require(isinstance(version,str) and bool(version),'approved version required to verify present registry versions')
-    expected=approved() if callable(approved) else approved
-    for name in present:
-        reason=present_mismatch(name,version,expected,owners)
-        if reason:result['mismatched'].append(dict(name=name,reason=reason))
-        else:result['matching'].append(name)
-    result['resume']=not result['mismatched']
-    return result
+    return dict(present=sorted(name for name,url in sorted(urls.items()) if registry_present(url)),checked=sorted(urls))
 
 def npm_integrity(raw):
     return 'sha512-'+base64.b64encode(hashlib.sha512(raw).digest()).decode()
 
-def approved_digests(root,head):
-    """Digests of the approved release-check artifact for `head`: each .crate SHA-256 and the npm integrity."""
-    directory=Path(root)/'target/u15';path=directory/'package-result.json'
-    policy.require(path.is_file(),'approved package artifact absent; present registry versions cannot be verified')
-    result=json.loads(path.read_bytes())
-    policy.require(result.get('passed') is True and result.get('head')==head and result.get('local_snapshot') is False,'package artifact wrong head/result')
-    tarballs=list(directory.glob('package-*/*.tgz'));policy.require(len(tarballs)==1,'npm artifact absent/ambiguous')
-    raw=tarballs[0].read_bytes();policy.require(package.sha(raw)==result['npm']['tar_sha256'],'npm tarball differs from the approved package result')
-    digests={name:row['sha256'] for name,row in result['crates'].items()}
-    digests[NPM_NAME]=npm_integrity(raw)
-    return digests
-
 def allowed(environ,names,**extra):
     return dict({k:environ[k] for k in names if k in environ},**extra)
 
-def publication_environments(mode,environ):
+def publication_environments(environ):
     """(dry-run, cargo upload, npm upload) child environments, built from allow-lists.
-    Only the token of the approved mode reaches an upload; dry runs get none. Values never
-    enter results, receipts or progress records (receipts keep only whitelisted non-secret keys)."""
-    oidc=environ.get('U15_OIDC_CRATES_IO_TOKEN','');first={k:environ.get(k,'') for k in FIRST_TOKEN_NAMES}
-    dry=allowed(environ,CARGO_ENVIRONMENT)
-    if mode=='oidc':
-        policy.require(bool(oidc),'crates.io OIDC token absent')
-        policy.require(not any(first.values()),'first-publication tokens still configured; delete them from the release environment after the first publication')
-        return dry,allowed(environ,CARGO_ENVIRONMENT,CARGO_REGISTRY_TOKEN=oidc),allowed(environ,NPM_ENVIRONMENT)
-    policy.require(mode=='first-publication-token','unknown publication authentication')
-    policy.require(not oidc,'OIDC token present during a first publication')
-    policy.require(all(first.values()),'first-publication tokens absent from the release environment')
-    return (dry,allowed(environ,CARGO_ENVIRONMENT,CARGO_REGISTRY_TOKEN=first['U15_FIRST_CRATES_IO_TOKEN']),
-            allowed(environ,NPM_ENVIRONMENT,NODE_AUTH_TOKEN=first['U15_FIRST_NPM_TOKEN']))
+    Only the cargo upload gets the short-lived crates.io OIDC token; npm uses Trusted
+    Publishing itself and dry runs get none. Values never enter results, receipts or
+    progress records (receipts keep only whitelisted non-secret keys)."""
+    oidc=environ.get('U15_OIDC_CRATES_IO_TOKEN','')
+    policy.require(bool(oidc),'crates.io OIDC token absent')
+    return allowed(environ,CARGO_ENVIRONMENT),allowed(environ,CARGO_ENVIRONMENT,CARGO_REGISTRY_TOKEN=oidc),allowed(environ,NPM_ENVIRONMENT)
 
 def github(route):
     token=os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
@@ -273,16 +181,6 @@ def authorize(root,evidence):
     policy.require(os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('GITHUB_REF_TYPE')=='tag','publication authorization is CI tag-only')
     pre=preflight(root);policy.require(evidence is not None and evidence.is_file(),'same-head acceptance evidence artifact missing')
     state=json.loads(evidence.read_bytes());head=pre['head']
-    # Only the live registry check below may assert absence or a verified resume; document values are discarded.
-    for key in ('registries_absent','registry_presence','registry_resume_verified'):state.pop(key,None)
-    if state.get('first_publication') is True and state.get('trusted_publishers_registered') is not True:
-        inv=policy.inventory(root)
-        # Step17 (R-16): a stopped first publication may continue only when every version
-        # already present equals the approved artifact; the remaining ones are then uploaded.
-        presence=registries_absent(inv['order'],inv['version'],lambda:approved_digests(root,head),expected_owners(os.environ))
-        policy.require(not presence['mismatched'],'trusted publishers unregistered; first-publication resume refused: '+
-            '; '.join(m['name']+': '+m['reason'] for m in presence['mismatched']))
-        state.update(registries_absent=presence['absent'],registry_resume_verified=presence['resume'] and not presence['absent'],registry_presence=presence)
     state.update(repository=policy.REPOSITORY,tag=os.environ['GITHUB_REF_NAME'],commit=github('commits/'+head),
         main_compare=github('compare/'+head+'...main'),environment=pre['environment'])
     for row in state.get('quality',[]):
@@ -361,7 +259,7 @@ def publish_artifacts(root,evidence):
     toolchain=__import__('tomllib').loads((source/'rust-toolchain.toml').read_text())['toolchain']['channel']
     cargos=list(rustup_toolchains().glob(toolchain+'-*/bin/cargo'));policy.require(len(cargos)==1,'actual pinned Cargo absent')
     cargo=cargos[0];env=dict(os.environ,RUSTC=str(cargo.with_name('rustc')),RUSTDOC=str(cargo.with_name('rustdoc')),PATH=str(cargo.parent)+os.pathsep+os.environ['PATH'])
-    dry_env,cargo_env,npm_env=publication_environments(approved['authentication'],env)
+    dry_env,cargo_env,npm_env=publication_environments(env)
     completed=[];attempted=[];uploaded=[]
     try:
         for name in approved['order']:
@@ -395,7 +293,7 @@ def publish_artifacts(root,evidence):
             body=uploaded_metadata(url)
         registry_state(200,dict(version=body['version'],digest=body['dist']['integrity']),approved['version'],integrity)
         completed.append('@aletheia-works/paludarium-wasm')
-        return dict(published=completed,head=approved['head'],version=approved['version'],authentication=approved['authentication'])
+        return dict(published=completed,head=approved['head'],version=approved['version'])
     finally:
         with (directory/'publication-progress.json').open('x') as f:json.dump(dict(completed=completed,attempted=attempted,uploaded_but_possibly_unverified=uploaded,automatic_retry=False),f,indent=2)
 
@@ -408,11 +306,7 @@ def main():
         from package import package_check
         result=package_check(ROOT)
     elif args.mode=='preflight':result=preflight(ROOT)
-    elif args.mode=='authorize':
-        result=authorize(ROOT,args.evidence)
-        if os.environ.get('GITHUB_OUTPUT'):
-            # A fixed enum value selects the publish.yml credential step; no secret is written.
-            with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('authentication='+result['authentication']+'\n')
+    elif args.mode=='authorize':result=authorize(ROOT,args.evidence)
     elif args.mode=='fetch-acceptance':result=fetch_acceptance(ROOT)
     else:result=publish_artifacts(ROOT,args.evidence)
     if args.output:

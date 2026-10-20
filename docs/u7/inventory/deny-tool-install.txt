@@ -1,6 +1,0 @@
-cargo-binstall:  INFO resolve: Resolving package: 'cargo-deny'
-cargo-binstall:  WARN The package cargo-deny v0.20.2 (x86_64-pc-windows-msvc) has been downloaded from github.com
-cargo-binstall:  INFO This will install the following binaries:
-cargo-binstall:  INFO   - cargo-deny.exe => target/aidlc-tools\cargo-deny.exe
-cargo-binstall:  INFO Installing binaries...
-cargo-binstall:  INFO Done in 3.967704s

@@ -52,8 +52,7 @@ export default defineConfig({
   title: 'paludarium',
   cleanUrls: true,
   lastUpdated: true,
-  // The AI-DLC working records under docs/ are not part of the site.
-  srcExclude: ['reports/**', 'u*/**', 'aidlc-checkpoint-repair.md', 'node_modules/**', 'scripts/**'],
+  srcExclude: ['node_modules/**', 'scripts/**'],
   head: [
     // SharedArrayBuffer needs cross-origin isolation; GitHub Pages cannot send
     // COOP/COEP headers, so this service worker adds them (it reloads once).

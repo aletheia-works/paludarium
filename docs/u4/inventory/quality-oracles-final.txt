@@ -1,2 +1,0 @@
-    Checking paludarium-harness v0.0.0 (/work/crates/paludarium-harness)
-    Finished `dev` profile [optimized + debuginfo] target(s) in 0.96s

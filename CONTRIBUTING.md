@@ -8,13 +8,14 @@ used, and verify the output before submitting it.
 ## Getting started
 
 Use [README.md](README.md) for the toolchain, builds, and test commands, and
-[docs/release.md](docs/release.md) for packaging and publication.
-[AGENTS.md](AGENTS.md) contains repository development rules. Repository
-settings (rulesets, labels, the `release` environment) are managed with OpenTofu
-in [infra/github/](infra/github/README.md); change them there, not in the UI. The requirements,
-designs, and per-unit plans and results live under
-[aidlc/](aidlc/spaces/default/intents/261004-rust-blink-port/); read the
-requirements and the affected unit's records before changing emulator behavior.
+[docs/release.md](docs/release.md) for packaging and publication. Repository
+settings (rulesets, labels, the `release` and `github-pages` environments) are
+managed with OpenTofu in [infra/github/](infra/github/README.md); change them
+there, not in the UI. The documentation site
+(<https://aletheia-works.github.io/paludarium/>, sources in [docs/](docs/))
+describes the supported features, the architecture, the design decisions and
+how correctness is verified; read the relevant pages before changing emulator
+behaviour, and update them with it.
 
 This repository uses Jujutsu (`jj`), including for fork synchronization:
 

@@ -1,5 +1,5 @@
-# Toolchain settings needed for wasm threads (recorded in
-# docs/reports/wasm-threads.md, BR8.2):
+# Toolchain settings needed for wasm threads (see "Threads in WebAssembly"
+# in docs/design/decisions.md):
 # - target features atomics + bulk-memory + mutable-globals,
 # - core rebuilt with those features (-Z build-std, nightly + rust-src),
 # - an imported, shared memory with a fixed maximum.

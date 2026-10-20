@@ -60,11 +60,12 @@ jobs:
                whose generator was not rerun.
 
             2. Contradictions with what the repository already states.
-               Hold the diff against AGENTS.md, the rules and decisions
-               in aidlc/spaces/default/memory/ (project.md first), the
-               requirements in
-               aidlc/spaces/default/intents/261004-rust-blink-port/inception/requirements-analysis/requirements.md,
-               docs/release.md for anything touching publication,
+               Hold the diff against the principles in
+               docs/guide/introduction.md, the supported features and
+               limitations in docs/guide/, the architecture, design
+               decisions and verification rules in docs/design/,
+               CONTRIBUTING.md, docs/release.md for anything touching
+               publication,
                and the README.md nearest the changed code. Read the
                rules; do not work from a list of the ones somebody
                remembered. Quote the sentence the change breaks. Either

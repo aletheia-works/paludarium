@@ -1,5 +1,0 @@
-    Checking paludarium-kernel v0.0.0 (/work/crates/paludarium-kernel)
-    Checking paludarium-runtime v0.0.0 (/work/crates/paludarium-runtime)
-    Checking paludarium v0.0.0 (/work/crates/paludarium)
-    Checking paludarium-harness v0.0.0 (/work/crates/paludarium-harness)
-    Finished `dev` profile [optimized + debuginfo] target(s) in 2m 55s

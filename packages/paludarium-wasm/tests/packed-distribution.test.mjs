@@ -45,9 +45,7 @@ async function closure(directory) {
   }
 }
 console.log(JSON.stringify({ workspace, node: process.version, npm, files: packed.files.map(row => row.path), tarball_sha256: hash(await readFile(resolve(workspace, packed.filename))) }));
-await test("production wasm and fixed hello provenance", async () => {
-  const expected = JSON.parse(await readFile(resolve(root, "aidlc/spaces/default/intents/261004-rust-blink-port/construction/u11-wasm-launcher/code-generation/verification/final-current-ci/node/node/observations.json")));
-  assert.equal(hash(await readFile(resolve(extracted, "paludarium.wasm"))), expected.module_sha256);
+await test("fixed hello provenance", async () => {
   assert.equal(hash(await readFile(guest)), JSON.parse(await readFile(resolve(packageRoot, "tests/guest-hashes.json"))).hello);
 });
 await test("all packed relative JS dependencies exist", () => closure(extracted));

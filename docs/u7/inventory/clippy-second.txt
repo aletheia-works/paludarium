@@ -1,8 +1,0 @@
-    Checking paludarium-host v0.0.0 (/work/crates/paludarium-host)
-    Checking paludarium-vfs v0.0.0 (/work/crates/paludarium-vfs)
-    Checking paludarium-loader v0.0.0 (/work/crates/paludarium-loader)
-    Checking paludarium-kernel v0.0.0 (/work/crates/paludarium-kernel)
-    Checking paludarium-runtime v0.0.0 (/work/crates/paludarium-runtime)
-    Checking paludarium v0.0.0 (/work/crates/paludarium)
-    Checking paludarium-harness v0.0.0 (/work/crates/paludarium-harness)
-    Finished `dev` profile [optimized + debuginfo] target(s) in 3.75s

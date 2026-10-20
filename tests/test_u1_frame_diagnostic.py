@@ -10,10 +10,6 @@ SPEC.loader.exec_module(diagnostic)
 
 
 class FrameDiagnosticTests(unittest.TestCase):
-    def test_original_exact_saved_archive(self):
-        archive = Path(__file__).parents[1] / "aidlc/spaces/default/intents/261004-rust-blink-port/construction/u1-skeleton/code-generation/verification/r04-attempt1-failure/11714208388.zip"
-        self.assertEqual(len(diagnostic.original(archive)), 10128)
-
     def test_wrong_archive_rejected_before_extraction(self):
         with patch.object(Path, "read_bytes", return_value=b"not original"):
             with self.assertRaisesRegex(ValueError, "archive digest mismatch"):

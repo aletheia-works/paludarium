@@ -1,8 +1,0 @@
-{
-  "validator": "package_semantics.py",
-  "logical_reads": {
-    "Cargo.toml": 1,
-    "packages/paludarium-wasm/package.json": 1
-  },
-  "code_loads": []
-}

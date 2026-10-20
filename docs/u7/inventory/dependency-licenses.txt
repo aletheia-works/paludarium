@@ -1,8 +1,0 @@
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cap-std-4.0.3/Cargo.toml:38:license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cap-std-4.0.3/Cargo.toml:39:repository = "https://github.com/bytecodealliance/cap-std"
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cap-fs-ext-4.0.3/Cargo.toml:30:license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cap-fs-ext-4.0.3/Cargo.toml:31:repository = "https://github.com/bytecodealliance/cap-std"
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs2-0.4.3/Cargo.toml:20:license = "MIT/Apache-2.0"
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs2-0.4.3/Cargo.toml:21:repository = "https://github.com/danburkert/fs2-rs"
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs2-0.4.3/Cargo.toml:30:repository = "danburkert/fs2-rs"
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs2-0.4.3/Cargo.toml:33:repository = "danburkert/fs2-rs"

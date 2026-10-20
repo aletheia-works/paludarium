@@ -1,1 +1,0 @@
-2026-10-06 05:07:07 [ERROR] failed to acquire advisory database lock: failed to obtain lock file 'C:\Users\Jam\.cargo\advisory-dbs\db.lock': attempted to take an exclusive lock on a read-only path

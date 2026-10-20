@@ -1,5 +1,0 @@
-stopped=19 exit=7 signal=0
-stopped=20 exit=7 signal=0
-stopped=19 exit=7 signal=0
-stopped=19 exit=-1 signal=9
-stopped=0 exit=7 signal=0

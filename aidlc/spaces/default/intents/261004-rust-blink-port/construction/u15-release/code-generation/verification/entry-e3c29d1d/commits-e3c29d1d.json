@@ -1,8 +1,0 @@
-{
-  "schema": 1,
-  "source": "gh api (read-only GET), 2026-10-19 JST: fields sha, parents[].sha, commit.tree.sha, commit.verification.verified and commit.verification.reason copied from GET repos/Marukome0743/paludarium/commits/<sha> for every commit of the chain. Saved for entry-e.py (the person's decision of 2026-10-18: compare each commit's tree hash instead of the compare file list).",
-  "repository": "Marukome0743/paludarium",
-  "commits": [
-    {"sha": "e3c29d1d8c2dae3c705d54de2c6fb0a2451e46d9", "parents": [{"sha": "a54315f9493d6e9fb8d4792ffcefd12203540311"}], "commit": {"tree": {"sha": "6d6e3995e3e2f9c3a246beb291b9b516cc3a3dcb"}, "verification": {"verified": true, "reason": "valid"}}}
-  ]
-}

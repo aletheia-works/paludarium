@@ -1,4 +1,4 @@
-# Agent workflow tooling, generated locally by its CLI; not committed.
+# Local Claude Code settings; not committed.
 /.claude/
 
 # Logs
@@ -26,33 +26,6 @@ dist-ssr
 *.sln
 *.sw?
 
-# BEGIN AI-DLC:gitignore
-# AI-DLC: local working files
-aidlc/active-space
-aidlc/spaces/*/intents/active-intent
-aidlc/.aidlc-clone-id
-aidlc.settings.local.json
-aidlc/.aidlc-unit-scope.json
-aidlc/.aidlc-unit-parked
-aidlc/.aidlc-claim-generations.json
-aidlc/.aidlc-unit-participant
-aidlc/.aidlc-claim-registry.json
-aidlc/.aidlc-unit-releases/
-aidlc/.aidlc-unit-merges/
-aidlc/.aidlc-active-space-*.tmp
-aidlc/active-memory/
-aidlc/.aidlc-sessions/
-aidlc/.aidlc-request-text/
-aidlc/spaces/*/intents/.aidlc-*
-**/aidlc/spaces/*/intents/**/.aidlc-engine/
-**/aidlc/spaces/*/intents/**/.aidlc-sensors/
-aidlc/spaces/*/knowledge/documentkb/.journal/
-aidlc/spaces/*/knowledge/.sources.local.json
-aidlc/spaces/*/intents/*/runtime-graph.json
-aidlc/spaces/*/intents/*/.aidlc-*
-aidlc/diagnostics/
-# END AI-DLC:gitignore
-
 # Rust build output. Cargo.lock is committed (NFR8.3).
 /target/
 /fuzz/target/
@@ -65,6 +38,3 @@ aidlc/diagnostics/
 /packages/paludarium-wasm/paludarium.wasm
 *.profraw
 
-# Codex workflow tooling, generated locally by AI-DLC.
-/.codex/
-/.agents/

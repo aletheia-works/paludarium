@@ -1,7 +1,7 @@
 //! The U1 instruction list (BR4.4) and which differential-test guest covers
 //! each instruction (NFR1.2). The list is the union of the instructions the
 //! C and Rust hello worlds execute natively, found with
-//! `tools/insn-trace/insn-census.sh` (results in `docs/u1/census/`).
+//! `tools/insn-trace/insn-census.sh`.
 //!
 //! Each entry names the guest and a fragment of its source that exercises
 //! the instruction, so the record is checked against the real sources.

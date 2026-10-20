@@ -1,9 +1,0 @@
-{
-  "note": "各正規化form文字列と出現数を全件照合する。binary全bytesの同一性・全経路到達性は主張しない。",
-  "rebuilt_binary_sha256": "ff54cffe389cc2cc589d2a737c3499e1b7be4589e9a2fe3bf37c6e7c205cca4a",
-  "original_forms": 4658,
-  "original_binary_sha256": "11a363b499dcb356845d7b13d5f1cd2e644fb6d5764bfe1eaf5769e5b8880f4b",
-  "differences": [],
-  "rebuilt_forms": 4658,
-  "kind": "normalized-form-comparison"
-}

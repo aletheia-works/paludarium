@@ -152,7 +152,6 @@ locals {
     "wasm"         = { color = "6f42c1", description = "WebAssembly runtime, JIT and npm package" }
     "tests"        = { color = "bfdadc", description = "Tests and verification" }
     "tooling"      = { color = "fef2c0", description = "Development and release tooling" }
-    "records"      = { color = "c2e0c6", description = "AI-DLC records under aidlc/" }
 
     "status: triage"        = { color = "e99695", description = "Needs initial triage" }
     "status: blocked"       = { color = "000000", description = "Blocked by something" }

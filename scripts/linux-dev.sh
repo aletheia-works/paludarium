@@ -44,7 +44,7 @@ fi
 # Copy the working tree (without build output and VCS data) into the volume,
 # removing files that no longer exist locally but keeping /work/target.
 tar -C "$root" \
-  --exclude=./target --exclude=./.git --exclude=./.jj --exclude=./aidlc \
+  --exclude=./target --exclude=./.git --exclude=./.jj \
   --exclude=./.claude --exclude=./fuzz/target --exclude=./node_modules \
   --exclude='./spikes/*/target' --exclude='./spikes/*/node_modules' \
   --exclude='./tests/guests/hello-rs/target' \

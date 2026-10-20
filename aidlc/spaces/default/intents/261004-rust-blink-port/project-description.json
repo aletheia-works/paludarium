@@ -1,1 +1,0 @@
-"jart/blink（C 製の x86-64 Linux ユーザーモードエミュレータ、ISC）と同等のものを Rust で再実装する。将来は formicarium のエミュレータコア（wasm モジュール 1 つ＋起動用 JS という境界）を置き換える。まずは blink と同等の既存 Rust 実装がないかを調べ、使えるものがなければ自分で作る。背景資料は formicarium の knowledge にある documents/research/cheerpx-oss.md。"

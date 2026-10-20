@@ -66,7 +66,8 @@ class CheckTests(unittest.TestCase):
     # Step14b (Q2): a decided version is no longer reported as outstanding.
     def test_validate_outstanding_follows_version(self):
         decided=check.validate(ROOT)
-        self.assertEqual(decided['version'],'0.1.0');self.assertNotIn('release version',decided['outstanding'])
+        self.assertEqual(decided['version'],policy.inventory(ROOT)['version']);self.assertNotEqual(decided['version'],'0.0.0')
+        self.assertNotIn('release version',decided['outstanding'])
         self.assertIn('Trusted Publishers',decided['outstanding'])
         undecided=copy.deepcopy(policy.inventory(ROOT));undecided['version']='0.0.0'
         with patch.object(policy,'inventory',return_value=undecided):

@@ -78,7 +78,7 @@ def validate(root):
     for row in inv['packages'].values():
         policy.require(bool(row['description']) and bool(row['repository']) and bool(row['readme']),'public metadata incomplete: '+row['name'])
     policy.require(all(row['publish'] is False for row in inv['private'].values()),'private package is publishable')
-    for name in ['release-check.yml','publish.yml']:
+    for name in ['release-check.yml','publish.yml','release-evidence.yml']:
         text=(root/'.github/workflows'/name).read_text()
         policy.require('persist-credentials: false' in text and 'timeout-minutes:' in text,'workflow isolation/timeout absent')
         import re

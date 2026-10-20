@@ -122,7 +122,8 @@ artifact must be produced within 7 days of the quality runs.
 
 ### Producer
 
-`.github/workflows/u15-acceptance.yml` runs only by manual dispatch, with
+`.github/workflows/u15-acceptance.yml` runs only by dispatch (by a person,
+or by `release-evidence.yml` below), with
 `contents: read` and `actions: read`, SHA-pinned actions and
 `persist-credentials: false`. It runs
 `python -B scripts/release/acceptance.py --output target/u15/release-evidence.json`
@@ -155,8 +156,10 @@ repository variable `RELEASE_AUTOMATION_ENABLED` (managed in
 `infra/github/release.tf`) is `true`. Unlike those repositories, a push to
 main only creates or updates the release PR (`skip-github-release`): the
 same-head evidence of step 5 must exist for the release PR's merge commit
-before any tag, so only a manual dispatch creates the tag and the GitHub
-release. The labels `autorelease: pending` and `autorelease: tagged` are
+before any tag. For the first publication, `release-evidence.yml` creates
+the tag and the GitHub release once that evidence exists (step 5); later
+releases still use a manual dispatch of `release.yml` until Trusted
+Publishing is automated. The labels `autorelease: pending` and `autorelease: tagged` are
 managed in `infra/github/main.tf`.
 
 `.github/release-please-config.json` uses the `simple` release type and
@@ -300,7 +303,28 @@ and its registry checks are complete.
    26.12.0 here). Confirm: each crate's and the npm package's Trusted
    Publishing settings show exactly that repository, workflow and
    environment.
-5. **Produce same-head quality and acceptance evidence.** When: on the
+5. **Same-head evidence, first publication: automatic.**
+   `.github/workflows/release-evidence.yml` runs on every push to main.
+   While tag `v<version>` of the workspace version does not exist, the main
+   head is that push, and every crate and the npm package are absent from
+   the registries, `scripts/release/evidence.py` waits for the `ci.yml`
+   push run, dispatches `u12-quality.yml`, `u14-quality.yml` and
+   `release-check.yml` once each (a run a person already dispatched for the
+   head is reused, never doubled), waits for all of them, then dispatches
+   `u15-acceptance.yml` with `first_publication=true` once and waits for it.
+   When all succeeded, its `tag` job creates tag `v<version>` and the
+   GitHub release (notes from `CHANGELOG.md`) on that head with the
+   `aletheia-works-bot` App token, and the tag starts `publish.yml`; it then
+   moves the merged release PR from `autorelease: pending` to
+   `autorelease: tagged`, as Release Please does when it tags. A
+   failed run is not dispatched again (FR8.3 is measured once per head);
+   the head then needs a person. When the version is already tagged or the
+   head is no longer main, the run does nothing. When a registry already
+   has a package (a later release), it stops and the manual steps below
+   apply. Confirm: the `Release evidence` run succeeded and step 6's
+   approval request is for its head.
+
+   **Manual (later releases).** When: on the
    release PR's merge commit from step 1, while it is still the main head, after steps 2 and 3 (first release) or 2 to 4
    (later releases). The `ci.yml` push run
    starts by itself; dispatch each of the others once:
@@ -318,7 +342,9 @@ and its registry checks are complete.
    `release-evidence.json`, with that head, eight `quality` rows, the five
    `acceptance` IDs all `passed: true`, and exactly one of
    `first_publication: true` or `trusted_publishers_registered: true`.
-6. **Create the tag and approve the environment.** When: after step 5,
+6. **Create the tag and approve the environment.** For the first
+   publication the tag already exists (step 5): only approve the
+   environment. For later releases: when: after step 5,
    with the person's explicit approval of the exact version, tag, head,
    registries, artifact digests, authentication and environment settings.
    Dispatch Release Please once:
@@ -357,7 +383,9 @@ performance rerun is used to wait for a passing result.
 
 Only after the user explicitly approves the precise version, tag/head,
 registries, artifact digests, authentication and protection configuration may
-the owner dispatch `release.yml` to create the version tag. No plan approval authorizes tag creation
+the owner dispatch `release.yml` to create the version tag. For the first
+publication, `release-evidence.yml` creates it once the same-head evidence
+exists, and the person's decision is the `release` environment approval. No plan approval authorizes tag creation
 or publication by itself. `publish.yml` accepts only an exact
 `vMAJOR.MINOR.PATCH` after Python validation, verifies signed main
 reachability and actual environment protection before builds, then requires

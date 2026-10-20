@@ -11,3 +11,4 @@
 ### Bug Fixes
 
 * **ci:** install the pinned toolchain into a job-local rustup home ([#14](https://github.com/aletheia-works/paludarium/issues/14)) ([a34572c](https://github.com/aletheia-works/paludarium/commit/a34572c6573ecd5df9fcc8f276e2da337c053810))
+* **release:** keep the GitHub token off the artifact download redirect ([#16](https://github.com/aletheia-works/paludarium/issues/16)) ([1cda73d](https://github.com/aletheia-works/paludarium/commit/1cda73d13541e8bac31270c2751f99a0f4305a66))

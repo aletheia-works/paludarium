@@ -23,8 +23,7 @@ jobs:
     name: Produce same-head evidence
     if: >-
       github.repository == 'aletheia-works/paludarium' &&
-      github.ref == 'refs/heads/main' &&
-      vars.RELEASE_AUTOMATION_ENABLED == 'true'
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:

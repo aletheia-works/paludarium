@@ -142,9 +142,8 @@ any real run, artifact or registration exists.
 
 `.github/workflows/release.yml` runs Release Please as in the other
 aletheia-works repositories, with the `aletheia-works-bot` App token
-(`vars.BOT_CLIENT_ID`, `secrets.BOT_PRIVATE_KEY`) and only while the
-repository variable `RELEASE_AUTOMATION_ENABLED` (managed in
-`infra/github/release.tf`) is `true`. Unlike those repositories, a push to
+(`vars.BOT_CLIENT_ID`, `secrets.BOT_PRIVATE_KEY`). Unlike those
+repositories, a push to
 main only creates or updates the release PR (`skip-github-release`): the
 same-head evidence of step 5 must exist for the release PR's merge commit
 before any tag, so Release Please never tags: `release-evidence.yml`

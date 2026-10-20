@@ -22,17 +22,3 @@ resource "github_repository_environment_deployment_policy" "release_tags" {
   environment = github_repository_environment.release.environment
   tag_pattern = "v*.*.*"
 }
-
-# Release Please (.github/workflows/release.yml), release-evidence.yml and
-# release-merge.yml run only while this is true.
-variable "release_automation_enabled" {
-  description = "Enable release PR generation, its weekly auto-merge, and the automatic same-head evidence, tag and GitHub release"
-  type        = bool
-  default     = true
-}
-
-resource "github_actions_variable" "release_automation" {
-  repository    = github_repository.this.name
-  variable_name = "RELEASE_AUTOMATION_ENABLED"
-  value         = tostring(var.release_automation_enabled)
-}

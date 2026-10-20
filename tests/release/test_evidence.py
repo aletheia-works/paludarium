@@ -216,7 +216,7 @@ class Evidence(unittest.TestCase):
         actions = re.findall(r'uses:\s+([^\s#]+)', text)
         self.assertTrue(actions and all(re.fullmatch(r'[^@]+@[0-9a-f]{40}', a) for a in actions))
         self.assertEqual(text.count('persist-credentials: false'), 2)
-        self.assertIn('vars.RELEASE_AUTOMATION_ENABLED', text)
+        self.assertNotIn('RELEASE_AUTOMATION_ENABLED', text)
         self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token }}', text)
         self.assertIn('--target "$HEAD_SHA"', text)
         self.assertNotIn('TRUSTED_PUBLISHERS_REGISTERED', text)

@@ -171,9 +171,10 @@ current head once the required checks pass.
 `.github/release-please-config.json` uses the `simple` release type and
 updates the workspace version, the eleven internal dependency versions, the
 workspace crates' entries in `Cargo.lock` and `fuzz/Cargo.lock` (the fuzz
-crate keeps `0.0.0`), and the npm package version. `release-as: 0.1.0`
-fixes the first version; remove it in the first change after `v0.1.0` is
-published, or the next release PR proposes `0.1.0` again.
+crate keeps `0.0.0`), and the npm package version. The first version was
+fixed with `release-as: 0.1.0`, removed after `v0.1.0` was published; Release
+Please now calculates each version from the Conventional Commits since the
+last release.
 
 ## Owner hand-off (Step 16)
 

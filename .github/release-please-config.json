@@ -3,13 +3,12 @@
   "bootstrap-sha": "665313e43a911fb9f5f5bb60757955c09413cf4b",
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": false,
-  "pull-request-header": "Release Please calculated this version from Conventional Commits. Merging this PR only bumps the versions: produce the same-head evidence on the merge commit (docs/release.md), then dispatch the Release workflow to create the tag and GitHub release, which starts the approved registry publication.",
+  "pull-request-header": "Release Please calculated this version from Conventional Commits. Merging this PR only bumps the versions; the tag, the GitHub release and the registry publication follow once the same-head evidence for the merge commit exists (docs/release.md).",
   "packages": {
     ".": {
       "release-type": "simple",
       "component": "paludarium",
       "include-component-in-tag": false,
-      "release-as": "0.1.0",
       "extra-files": [
         {
           "type": "toml",

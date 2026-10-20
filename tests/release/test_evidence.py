@@ -211,6 +211,58 @@ class Evidence(unittest.TestCase):
             with self.assertRaises(ValueError):
                 E.main(dict(env, **bad), FakeGitHub())
 
+
+
+CHANGELOG = """# Changelog
+
+## [0.1.1](https://github.com/aletheia-works/paludarium/compare/v0.1.0...v0.1.1) (2026-10-20)
+
+
+### Bug Fixes
+
+* **harness:** run ignored U3 tests in the bounded child
+
+## 0.1.0 (2026-10-20)
+
+
+### Features
+
+* **wasm:** publish the npm package as @aletheia-works/paludarium-wasm
+"""
+
+
+class ReleaseNotes(unittest.TestCase):
+    def test_section_with_a_compare_link(self):
+        self.assertEqual(E.release_notes(CHANGELOG, '0.1.1'),
+                         '### Bug Fixes\n\n* **harness:** run ignored U3 tests in the bounded child\n')
+
+    def test_first_release_section_without_a_link(self):
+        self.assertEqual(E.release_notes(CHANGELOG, '0.1.0'),
+                         '### Features\n\n* **wasm:** publish the npm package as @aletheia-works/paludarium-wasm\n')
+
+    def test_a_version_prefix_is_not_a_match(self):
+        with self.assertRaisesRegex(ValueError, '0 sections for 0.1'):
+            E.release_notes(CHANGELOG, '0.1')
+
+    def test_missing_duplicate_or_empty_section_stops(self):
+        with self.assertRaisesRegex(ValueError, '0 sections for 0.2.0'):
+            E.release_notes(CHANGELOG, '0.2.0')
+        with self.assertRaisesRegex(ValueError, '2 sections for 0.1.0'):
+            E.release_notes(CHANGELOG + '\n## 0.1.0 (again)\n\n* x\n', '0.1.0')
+        with self.assertRaisesRegex(ValueError, 'section for 0.3.0 is empty'):
+            E.release_notes('## [0.3.0](link) (date)\n\n\n## 0.2.0 (date)\n\n* x\n', '0.3.0')
+
+    def test_command_line_writes_the_section(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'CHANGELOG.md'
+            path.write_text(CHANGELOG)
+            out = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/release/evidence.py'), 'notes', '0.1.1', str(path)],
+                                 capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out, E.release_notes(CHANGELOG, '0.1.1'))
+
+
+class EvidenceWorkflow(unittest.TestCase):
     def test_workflow_is_pinned_and_tags_with_the_app_token(self):
         text = (ROOT / '.github/workflows/release-evidence.yml').read_text()
         actions = re.findall(r'uses:\s+([^\s#]+)', text)
@@ -219,6 +271,8 @@ class Evidence(unittest.TestCase):
         self.assertNotIn('RELEASE_AUTOMATION_ENABLED', text)
         self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token }}', text)
         self.assertIn('--target "$HEAD_SHA"', text)
+        self.assertIn('python -B scripts/release/evidence.py notes "$VERSION" CHANGELOG.md > target/release-notes.md', text)
+        self.assertNotIn('awk', text)
         self.assertNotIn('TRUSTED_PUBLISHERS_REGISTERED', text)
         self.assertEqual(check.validate(ROOT)['validated'], True)
 

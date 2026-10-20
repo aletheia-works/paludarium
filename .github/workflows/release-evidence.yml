@@ -57,6 +57,9 @@ jobs:
         with:
           ref: ${{ needs.evidence.outputs.head }}
           persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.15.0'
 
       # A tag created with the workflow's own token would not start publish.yml.
       - name: Get an aletheia-works-bot token
@@ -76,8 +79,7 @@ jobs:
           HEAD_SHA: ${{ needs.evidence.outputs.head }}
         run: |
           mkdir -p target
-          awk -v heading="## $VERSION " 'index($0, heading) == 1 {found = 1; next} found && /^## / {exit} found' CHANGELOG.md > target/release-notes.md
-          test -s target/release-notes.md
+          python -B scripts/release/evidence.py notes "$VERSION" CHANGELOG.md > target/release-notes.md
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$HEAD_SHA" --title "v$VERSION" --notes-file target/release-notes.md
 
       # What Release Please does when it tags: the merged release PR stops

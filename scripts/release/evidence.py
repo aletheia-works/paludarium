@@ -138,6 +138,26 @@ def produce(api, root, head, presence=check.registry_presence, present=version_p
     return dict(ready='true', version=version, head=head)
 
 
+def release_notes(changelog, version):
+    """The CHANGELOG.md section of version, without its heading.
+
+    Release Please writes `## 0.1.0 (date)` for a first release and
+    `## [0.1.1](compare link) (date)` once a previous tag exists.
+    """
+    lines = changelog.splitlines()
+    starts = [i for i, line in enumerate(lines)
+              if line.startswith('## %s ' % version) or line.startswith('## [%s](' % version)]
+    policy.require(len(starts) == 1, 'CHANGELOG.md has %d sections for %s (exactly one required)' % (len(starts), version))
+    body = []
+    for line in lines[starts[0] + 1:]:
+        if line.startswith('## '):
+            break
+        body.append(line)
+    text = '\n'.join(body).strip()
+    policy.require(bool(text), 'CHANGELOG.md section for %s is empty' % version)
+    return text + '\n'
+
+
 def main(environ=None, api=None, **kwargs):
     env = os.environ if environ is None else environ
     policy.require(env.get('GITHUB_REPOSITORY') == policy.REPOSITORY, 'release evidence runs only in ' + policy.REPOSITORY)
@@ -159,4 +179,9 @@ def main(environ=None, api=None, **kwargs):
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    if sys.argv[1:2] == ['notes']:
+        # release-evidence.yml: evidence.py notes <version> <CHANGELOG.md> > release-notes.md
+        sys.stdout.write(release_notes(Path(sys.argv[3]).read_text(), sys.argv[2]))
+    else:
+        main()

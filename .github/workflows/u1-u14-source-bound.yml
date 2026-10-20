@@ -56,6 +56,10 @@ jobs:
           persist-credentials: false
       # Restore before anything is written to target/: on a partial cache
       # match rust-cache cleans target/ first.
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record signed source and actual compiler
         run: |
@@ -110,6 +114,10 @@ jobs:
           GIT_CONFIG_VALUE_0: false
         with:
           persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record signed source and actual compiler
         run: |
@@ -162,6 +170,10 @@ jobs:
           GIT_CONFIG_VALUE_0: false
         with:
           persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - name: Record signed source and actual compiler
         run: |
           mkdir -p target/u1-source-bound
@@ -214,6 +226,10 @@ jobs:
           persist-credentials: false
       # Restore before anything is written to target/: on a partial cache
       # match rust-cache cleans target/ first.
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record signed source and actual compiler
         run: |
@@ -355,6 +371,10 @@ jobs:
           persist-credentials: false
       # Restore before anything is written to target/: on a partial cache
       # match rust-cache cleans target/ first.
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record signed source and actual compiler
         run: |

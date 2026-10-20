@@ -36,8 +36,10 @@ jobs:
         with:
           python-version: '3.15.0'
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
-      - run: rustup toolchain install nightly-2026-10-11 --profile minimal
-      - run: rustup target add x86_64-unknown-linux-musl --toolchain nightly-2026-10-11
+      - shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal
+      - shell: bash
+        run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl --toolchain nightly-2026-10-11
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: cargo-deny
@@ -83,7 +85,8 @@ jobs:
           name: u10-native-first
           path: target
       - run: chmod +x target/guests/u10/probe target/guests/u10/aube
-      - run: rustup toolchain install nightly-2026-10-11 --profile minimal
+      - shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal
       - name: Compile C10 harness before network isolation
         run: |
           u10_cargo_home="${CARGO_HOME:-$HOME/.cargo}"

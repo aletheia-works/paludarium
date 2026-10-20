@@ -21,8 +21,10 @@ jobs:
         with:
           python-version: '3.15.0'
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
-      - run: rustup toolchain install nightly-2026-10-11 --profile minimal --component rust-src
-      - run: rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown --toolchain nightly-2026-10-11
+      - shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component rust-src
+      - shell: bash
+        run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl wasm32-unknown-unknown --toolchain nightly-2026-10-11
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: cargo-deny
@@ -100,7 +102,7 @@ jobs:
         run: sudo safaridriver --enable
       - name: Project Rust source for strict control module
         if: matrix.environment == 'node'
-        run: rustup toolchain install nightly-2026-10-11 --profile minimal --component rust-src
+        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component rust-src
       - name: Fresh same-source control for existing Node boundary entry
         if: matrix.environment == 'node'
         run: python3 -B scripts/build-u14-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"

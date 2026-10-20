@@ -29,7 +29,8 @@ jobs:
         with:
           persist-credentials: false
       - run: ln -s "$GITHUB_WORKSPACE" /work
-      - run: rustup toolchain install nightly-2026-10-11 --profile minimal
+      - shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal
       - run: cargo install --locked --version 0.13.2 cargo-fuzz
       - run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
       - name: Prepare the observed LLVM symbolizer for the decoder-table suppression

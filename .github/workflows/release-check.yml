@@ -32,8 +32,8 @@ jobs:
           python -m venv .venv-u15
           .venv-u15/bin/python -m pip install coverage==7.16.2
           npm install --prefix target/u15/tools --ignore-scripts npm@12.2.0
-          rustup toolchain install nightly-2026-10-11 --profile minimal --component rust-src --target wasm32-unknown-unknown
-          rustup toolchain install 1.99.1 --profile minimal
+          bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component rust-src --target wasm32-unknown-unknown
+          bash scripts/rustup-retry.sh toolchain install 1.99.1 --profile minimal
       - name: Release unit and mock integration tests
         run: .venv-u15/bin/python -B -m coverage run --data-file=target/u15/python.coverage --include='*/scripts/release/policy.py,*/scripts/release/package.py,*/scripts/release/check.py,*/scripts/release/acceptance.py' -m unittest discover -s tests/release -p 'test_*.py' -v
       - name: Static configuration

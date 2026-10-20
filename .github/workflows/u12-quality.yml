@@ -51,7 +51,8 @@ jobs:
       - run: python3 -m pip install 'coverage==7.16.2'
       - name: Python comparison boundary regressions and defined coverage scope
         run: python3 -m coverage run --data-file=target/u12-python.coverage --include='tests/guests/u12/settings.py,tests/guests/u12/oracle.py,tests/guests/u12/host_comparison.py' -m unittest discover -s tests/guests/u12/runner-tests -p 'test_*.py'
-      - run: rustup toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
+      - shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: aqua:taiki-e/cargo-llvm-cov
@@ -129,7 +130,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: '26.11.1'
-      - run: rustup component add rust-src --toolchain nightly-2026-10-11
+      - shell: bash
+        run: bash scripts/rustup-retry.sh component add rust-src --toolchain nightly-2026-10-11
       - name: Generate and execute fresh native fixtures
         run: |
           mkdir -p target/production-wasm-evidence
@@ -167,6 +169,10 @@ jobs:
         with:
           persist-credentials: false
       # rustup installs the toolchain pinned in rust-toolchain.toml (NFR9.1).
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Unit tests (U1 crates)
@@ -189,6 +195,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: rustfmt
         run: |
@@ -212,6 +222,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: cargo-deny
@@ -235,6 +249,10 @@ jobs:
           persist-credentials: false
       # Restore before anything is written to target/: on a partial cache
       # match rust-cache cleans target/ first.
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile
@@ -276,6 +294,10 @@ jobs:
           persist-credentials: false
       # Restore before anything is written to target/: on a partial cache
       # match rust-cache cleans target/ first.
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile

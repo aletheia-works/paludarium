@@ -38,12 +38,6 @@ variable "repository_topics" {
   ]
 }
 
-variable "release_reviewers" {
-  description = "GitHub logins whose approval the release environment requires before publishing"
-  type        = list(string)
-  default     = ["JamBalaya56562"]
-}
-
 variable "crates_io_owners" {
   description = "crates.io owner logins every published crate must have (U15_CRATES_IO_OWNERS, see docs/release.md)"
   type        = list(string)

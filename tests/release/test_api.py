@@ -13,7 +13,6 @@ class ApiTests(unittest.TestCase):
         if route.startswith('commits/'):return self.s['commit']
         if route.startswith('compare/'):return self.s['main_compare']
         if route=='environments/release':return self.s['environment']
-        if route.endswith('/approvals'):return [dict(state='approved',environments=[dict(name='release')])]
         return dict(head_sha='a'*40,repository=dict(full_name=policy.REPOSITORY),status='completed',conclusion='success')
     def test_official_authorization_adapter(self):
         with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=self.github),patch.object(policy,'inventory',return_value=self.inv):
@@ -25,10 +24,11 @@ class ApiTests(unittest.TestCase):
             return d
         with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=api),patch.object(policy,'inventory',return_value=self.inv):
             with self.assertRaises(ValueError):check.authorize(ROOT,self.path)
-    def test_missing_live_approval(self):
-        def api(route):return [] if route.endswith('/approvals') else self.github(route)
+    def test_no_environment_approval_needed(self):
+        def api(route):
+            self.assertFalse(route.endswith('/approvals'));return self.github(route)
         with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=api),patch.object(policy,'inventory',return_value=self.inv):
-            with self.assertRaises(ValueError):check.authorize(ROOT,self.path)
+            self.assertTrue(check.authorize(ROOT,self.path)['eligible'])
     def test_missing_acceptance_file(self):
         with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=self.github),patch.object(policy,'inventory',return_value=self.inv):
             with self.assertRaises(ValueError):check.authorize(ROOT,None)

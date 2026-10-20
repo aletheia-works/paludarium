@@ -407,7 +407,7 @@ class AcceptanceIntegrationTests(unittest.TestCase):
             data = check.fetch_acceptance(ROOT)
         fixture, inventory = valid()
         state = dict(data, repository=policy.REPOSITORY, tag='v' + inventory['version'], commit=fixture['commit'],
-                     main_compare=fixture['main_compare'], environment=fixture['environment'], human_approved_head=HEAD)
+                     main_compare=fixture['main_compare'], environment=fixture['environment'])
         return state, inventory
 
     def test_document_passes_fetch_and_release_gate(self):

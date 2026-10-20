@@ -9,8 +9,8 @@ doubled, because acceptance.py accepts exactly one run per workflow), waits
 for all of them, then dispatches u15-acceptance.yml once and waits for it.
 Only when every run succeeded does it write ready=true, the version and the
 head to GITHUB_OUTPUT; the workflow then creates the tag and the GitHub
-release, which start publish.yml. The release environment approval in
-publish.yml stays the person's gate. A failed run is never dispatched again
+release, which start publish.yml; it publishes without waiting for any
+approval. A failed run is never dispatched again
 (FR8.3 is measured once per head); the head then needs a person.
 
 Only the first publication is automated: u15-acceptance.yml is dispatched with

@@ -289,9 +289,6 @@ def authorize(root,evidence):
         actual=github('actions/runs/'+str(row['id']))
         policy.require(actual['head_sha']==row['head_sha'] and actual['repository']['full_name']==row['repository'] and
             actual['status']==row['status'] and actual['conclusion']==row['conclusion'],'official quality run differs')
-    approvals=github('actions/runs/'+os.environ['GITHUB_RUN_ID']+'/approvals')
-    policy.require(any(r.get('state')=='approved' and any(e.get('name')=='release' for e in r.get('environments',[])) for r in approvals),'actual environment approval absent')
-    state['human_approved_head']=head
     return policy.release_gate(state,policy.inventory(root))
 
 def fetch_acceptance(root):

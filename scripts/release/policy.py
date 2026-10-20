@@ -57,12 +57,9 @@ def inventory(root):
 
 def protected_environment(environment):
     require(environment.get('name')=='release','release environment absent')
-    rules=environment.get('protection_rules',[])
-    reviews=[r for r in rules if r.get('type')=='required_reviewers']
-    require(len(reviews)==1 and bool(reviews[0].get('reviewers')),'required reviewers not configured')
-    # Step14b (Q3): a sole maintainer approves their own deployment, so
-    # prevent_self_review is recorded but not required. Reviewers and no
-    # administrator bypass stay mandatory.
+    # Publication needs no person's approval: the same-head evidence gate decides.
+    # The environment still holds the first-publication secrets and names the
+    # Trusted Publisher, and administrator bypass stays off.
     require(environment.get('can_admins_bypass') is False,'admin protection bypass is enabled/unknown')
     return True
 
@@ -97,5 +94,4 @@ def release_gate(state, manifests):
     for e in evidence:require(e['head']==head and e['passed'] is True and re.fullmatch('[0-9a-f]{64}',e['artifact_sha256']),'acceptance unverified')
     protected_environment(state.get('environment',{}))
     mode=authentication(state)
-    require(state.get('human_approved_head')==head,'human release approval missing')
     return dict(eligible=True,head=head,version=version,order=manifests['order'],authentication=mode)

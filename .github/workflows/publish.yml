@@ -19,7 +19,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.15.0'
-      - name: Verify actual repository, exact version tag, signed main head and reviewers
+      - name: Verify actual repository, exact version tag, signed main head and environment
         env:
           GH_TOKEN: ${{ github.token }}
         run: python -B scripts/release/check.py --mode preflight
@@ -61,7 +61,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python -B scripts/release/check.py --mode fetch-acceptance --output target/u15/release-evidence.json
-      - name: Verify official runs, all acceptance conditions, actual human environment approval and authentication mode
+      - name: Verify official runs, all acceptance conditions and authentication mode
         id: authorize
         env:
           GH_TOKEN: ${{ github.token }}

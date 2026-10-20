@@ -27,6 +27,5 @@ github_owner = "aletheia-works"
 # repository_visibility  = "public"
 #
 # Release environment (docs/release.md, steps 2 and 3):
-# release_reviewers = ["JamBalaya56562"]
-# crates_io_owners  = ["JamBalaya56562"]
-# npm_maintainers   = ["jambalaya56562"]
+# crates_io_owners = ["JamBalaya56562"]
+# npm_maintainers  = ["jambalaya56562"]

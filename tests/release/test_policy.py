@@ -11,7 +11,7 @@ def valid():
        quality=[dict(purpose=k,repository=policy.REPOSITORY,head_sha=head,status='completed',conclusion='success',id=i+1) for i,k in enumerate(sorted(policy.REQUIRED))],
        acceptance=[dict(id=k,head=head,passed=True,artifact_sha256='b'*64) for k in sorted(policy.ACCEPTANCE)],
        environment=dict(name='release',can_admins_bypass=False,protection_rules=[dict(type='required_reviewers',prevent_self_review=True,reviewers=[dict(type='User',reviewer=dict(id=1))])]),
-       trusted_publishers_registered=True,human_approved_head=head)
+       trusted_publishers_registered=True)
     return state,inv
 
 class PolicyTests(unittest.TestCase):
@@ -31,7 +31,6 @@ class PolicyTests(unittest.TestCase):
     def test_failed(self):self.s['quality'][0]['conclusion']='failure';self.reject()
     def test_missing(self):self.s['quality'].pop();self.reject()
     def test_unsigned(self):self.s['commit']['commit']['verification']['verified']=False;self.reject()
-    def test_unapproved(self):self.s['human_approved_head']=None;self.reject()
     def test_no_environment(self):self.s['environment']={};self.reject()
     def test_admin_bypass(self):self.s['environment']['can_admins_bypass']=True;self.reject()
     def test_unregistered(self):self.s['trusted_publishers_registered']=False;self.reject()
@@ -48,9 +47,10 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(value):
                 rule['prevent_self_review']=value;self.assertTrue(policy.release_gate(self.s,self.i)['eligible'])
         del rule['prevent_self_review'];self.assertTrue(policy.protected_environment(self.s['environment']))
-    def test_required_reviewers_still_required(self):
-        self.s['environment']['protection_rules'][0]['reviewers']=[];self.reject()
-        self.s['environment']['protection_rules']=[dict(type='wait_timer',wait_timer=5)];self.reject()
+    def test_no_reviewers_required(self):
+        for rules in ([dict(type='required_reviewers',reviewers=[])],[dict(type='wait_timer',wait_timer=5)],[]):
+            with self.subTest(rules):
+                self.s['environment']['protection_rules']=rules;self.assertTrue(policy.release_gate(self.s,self.i)['eligible'])
     def test_admin_bypass_unknown(self):del self.s['environment']['can_admins_bypass'];self.reject()
     # Step14b (Q4): OIDC normally; the scoped token only for a verified first publication.
     def test_oidc_mode(self):self.assertEqual(policy.release_gate(self.s,self.i)['authentication'],'oidc')

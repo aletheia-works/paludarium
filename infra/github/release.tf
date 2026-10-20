@@ -1,10 +1,7 @@
-# The protected environment of the publish job in .github/workflows/publish.yml
-# (docs/release.md, step 2). Release preflight refuses an environment without
-# a required reviewer or with administrator bypass on.
-data "github_user" "release_reviewers" {
-  for_each = toset(var.release_reviewers)
-  username = each.value
-}
+# The environment of the publish job in .github/workflows/publish.yml
+# (docs/release.md, step 2). It needs no reviewer: the same-head evidence gate
+# decides publication. Only v*.*.* tags deploy, and release preflight refuses
+# administrator bypass.
 
 resource "github_repository_environment" "release" {
   repository  = github_repository.this.name
@@ -12,10 +9,6 @@ resource "github_repository_environment" "release" {
 
   can_admins_bypass   = false
   prevent_self_review = false
-
-  reviewers {
-    users = [for user in data.github_user.release_reviewers : tonumber(user.id)]
-  }
 
   deployment_branch_policy {
     protected_branches     = false

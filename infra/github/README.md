@@ -25,8 +25,9 @@ Keep `local.required_checks` equal to the job check names whenever a job in
 `ci.yml` is added, removed or renamed.
 
 The `release` environment is the one `docs/release.md` (step 2) and release
-preflight require: at least one required reviewer, administrator bypass off,
-and deployments limited to `v*.*.*` tags. It also holds the environment
+preflight require: administrator bypass off and deployments limited to
+`v*.*.*` tags. It has no required reviewer: publication waits for no
+approval, because the same-head evidence gate decides it. It also holds the environment
 variables `U15_CRATES_IO_OWNERS` and `U15_NPM_MAINTAINERS` (step 3). The
 first-publication tokens `U15_FIRST_CRATES_IO_TOKEN` and `U15_FIRST_NPM_TOKEN`
 are environment secrets the maintainer sets by hand; they are never in this

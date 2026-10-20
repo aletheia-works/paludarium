@@ -1,0 +1,59 @@
+name: Merge release PR
+
+# Once a week, enable auto-merge on the pending release PR, as in the other
+# aletheia-works repositories. GitHub merges it after the required checks
+# pass; the merge push then starts release-evidence.yml.
+on:
+  schedule:
+    - cron: '23 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Enable release PR auto-merge
+    if: >-
+      github.repository == 'aletheia-works/paludarium' &&
+      github.ref == 'refs/heads/main' &&
+      vars.RELEASE_AUTOMATION_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Get an aletheia-works-bot token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Enable auto-merge for the pending release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          candidates=$(gh pr list --repo "$REPO" --state open --base main \
+            --head release-please--branches--main--components--paludarium \
+            --label 'autorelease: pending' \
+            --json number,author,isDraft,isCrossRepository,headRefOid \
+            --jq '[.[] | select(.author.login == "app/aletheia-works-bot" and
+              .isDraft == false and .isCrossRepository == false)]')
+          count=$(jq 'length' <<< "$candidates")
+          if [ "$count" -eq 0 ]; then
+            echo '::notice::No eligible release PR is pending.'
+            exit 0
+          fi
+          if [ "$count" -ne 1 ]; then
+            echo '::error::Expected exactly one release PR; refusing to select one.'
+            exit 1
+          fi
+          number=$(jq -r '.[0].number' <<< "$candidates")
+          head=$(jq -r '.[0].headRefOid' <<< "$candidates")
+          gh pr merge "$number" --repo "$REPO" --squash --auto --match-head-commit "$head"

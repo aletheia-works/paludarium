@@ -162,6 +162,12 @@ releases still use a manual dispatch of `release.yml` until Trusted
 Publishing is automated. The labels `autorelease: pending` and `autorelease: tagged` are
 managed in `infra/github/main.tf`.
 
+`.github/workflows/release-merge.yml` enables auto-merge on the pending
+release PR every Monday (00:23 UTC) or on dispatch, as in the other
+aletheia-works repositories: only one open, non-draft PR from the bot on the
+release-please branch with `autorelease: pending`, merged by squash at its
+current head once the required checks pass.
+
 `.github/release-please-config.json` uses the `simple` release type and
 updates the workspace version, the eleven internal dependency versions, the
 workspace crates' entries in `Cargo.lock` and `fuzz/Cargo.lock` (the fuzz
@@ -176,26 +182,22 @@ administrator) does these steps in order. FR10.1 stays a GAP until step 6
 and its registry checks are complete.
 
 1. **Merge the release PR.** When: when the version Release Please
-   proposes is the one to publish. `release.yml` (Release Please) keeps a
+   proposes is the one to publish, or let `release-merge.yml` merge it
+   on Monday. `release.yml` (Release Please) keeps a
    release PR open from every push to main; it changes only the versions
    (`Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock`, `package.json`), the
    manifest and `CHANGELOG.md`. Merging it creates no tag. Confirm: note
    the merge commit, the new main head SHA;
    `gh api repos/aletheia-works/paludarium/commits/<sha> --jq .commit.verification.verified`
    prints `true`, and the `CI` (`ci.yml`) push run for that SHA starts.
-2. **Create the protected `release` environment.** When: before any tag
-   is pushed (release preflight rejects a missing or unprotected
-   environment). An upstream administrator creates environment `release`
-   with required reviewers (at least one) and administrator bypass off;
-   limiting deployments to `v*.*.*` tags is recommended. "Prevent
-   self-review" is optional (Step14b, Q3): the project has one maintainer,
-   who both pushes the tag and approves the deployment, so `release_gate`
-   no longer requires it. Turning it on is stricter and still accepted,
-   but then a second reviewer is needed.
-   Confirm: `gh api repos/aletheia-works/paludarium/environments/release`
-   shows a `required_reviewers` rule with at least one reviewer and
-   `can_admins_bypass: false` (preflight refuses a missing rule, an empty
-   reviewer list, or bypass `true` or unknown).
+2. **Create the `release` environment.** When: before any tag is pushed
+   (release preflight rejects a missing environment). `infra/github`
+   manages environment `release` with administrator bypass off and
+   deployments limited to `v*.*.*` tags. It has no required reviewer:
+   publication waits for no approval, because the same-head evidence gate
+   (step 5) decides it. Confirm:
+   `gh api repos/aletheia-works/paludarium/environments/release` shows
+   `can_admins_bypass: false` (preflight refuses bypass `true` or unknown).
 3. **Decide name ownership and the first publication.** When: before
    step 4. Confirm that all eleven crate names and `@aletheia-works/paludarium-wasm` are
    free (not yet on crates.io or npm) or owned by the project. crates.io
@@ -221,8 +223,8 @@ and its registry checks are complete.
      revoke it right after the first publication (step 4b).
    - Store them as **environment secrets of `release`** (not repository or
      organization secrets): `U15_FIRST_CRATES_IO_TOKEN` and
-     `U15_FIRST_NPM_TOKEN`. Environment secrets reach only the protected
-     publish job, after the deployment approval. `publish.yml` passes them
+     `U15_FIRST_NPM_TOKEN`. Environment secrets reach only the publish
+     job, which runs only for a `v*.*.*` tag. `publish.yml` passes them
      only to the `cargo publish` and `npm publish` child processes (dry
      runs get no token), never prints them, and receipts and
      `publication-progress.json` record no token value. Each child gets
@@ -259,8 +261,7 @@ and its registry checks are complete.
      receipts, which hold no token values, even when the job stops; keep
      it before its 90-day retention ends) and the job logs. After the cause is gone (for the rate limit,
      after the waiting time crates.io names), re-run the publish job of the
-     same `publish.yml` run (same tag and head; it needs the `release`
-     approval again; the tokens must not have expired). The publish job's
+     same `publish.yml` run (same tag and head; the tokens must not have expired). The publish job's
      live check then accepts `first_publication: true` only when every
      crate name and `@aletheia-works/paludarium-wasm` that is already present holds
      exactly `0.1.0` with the approved digest: the crates.io `checksum`
@@ -321,8 +322,8 @@ and its registry checks are complete.
    the head then needs a person. When the version is already tagged or the
    head is no longer main, the run does nothing. When a registry already
    has a package (a later release), it stops and the manual steps below
-   apply. Confirm: the `Release evidence` run succeeded and step 6's
-   approval request is for its head.
+   apply. Confirm: the `Release evidence` run succeeded and the `Publish`
+   run started for its head.
 
    **Manual (later releases).** When: on the
    release PR's merge commit from step 1, while it is still the main head, after steps 2 and 3 (first release) or 2 to 4
@@ -342,22 +343,17 @@ and its registry checks are complete.
    `release-evidence.json`, with that head, eight `quality` rows, the five
    `acceptance` IDs all `passed: true`, and exactly one of
    `first_publication: true` or `trusted_publishers_registered: true`.
-6. **Create the tag and approve the environment.** For the first
-   publication the tag already exists (step 5): only approve the
-   environment. For later releases: when: after step 5,
-   with the person's explicit approval of the exact version, tag, head,
-   registries, artifact digests, authentication and environment settings.
-   Dispatch Release Please once:
+6. **Create the tag.** For the first publication the tag already exists
+   (step 5). For later releases: when: after step 5, dispatch Release
+   Please once:
    `gh workflow run release.yml --repo aletheia-works/paludarium --ref main`.
    It finds the merged release PR, creates tag `v<version>` on its merge
    commit and the GitHub release, and the tag starts `publish.yml`. If any
    commit landed on main after the merge commit, preflight still accepts
    the tag only when the merge commit is reachable from main and every
    evidence run in step 5 is for that commit. `publish.yml`
-   then runs preflight and the package check and waits at the `release`
-   environment; a required reviewer (the maintainer, unless self-review is
-   prevented) checks the head, version and digests and approves the
-   deployment. Confirm: the run
+   then runs preflight, the package check and the publish job without
+   waiting for an approval. Confirm: the run
    succeeded and `publication-progress.json` (in the run's artifact
    `u15-publication-progress-attempt-<n>`) lists all eleven
    crates and `@aletheia-works/paludarium-wasm`; then, independently, each crate's
@@ -374,22 +370,18 @@ official completed successful quality run identities for every required
 purpose, each acceptance ID with its verified artifact digest, and either the
 Trusted Publisher declaration or the first-publication declaration confirmed
 by the live registry-absence check. The authorization step re-fetches GitHub
-commit, reachability, environment, run and actual environment-review history.
+commit, reachability, environment and run history.
 Evidence from old U14 measurements is historical unless the declared source
 and build closure are independently proven equivalent. No same-binary
 performance rerun is used to wait for a passing result.
 
 ## Publication and recovery
 
-Only after the user explicitly approves the precise version, tag/head,
-registries, artifact digests, authentication and protection configuration may
-the owner dispatch `release.yml` to create the version tag. For the first
-publication, `release-evidence.yml` creates it once the same-head evidence
-exists, and the person's decision is the `release` environment approval. No plan approval authorizes tag creation
-or publication by itself. `publish.yml` accepts only an exact
-`vMAJOR.MINOR.PATCH` after Python validation, verifies signed main
-reachability and actual environment protection before builds, then requires
-the protected human approval.
+For the first publication, `release-evidence.yml` creates the version tag
+once the same-head evidence exists; for later releases the owner dispatches
+`release.yml`. `publish.yml` accepts only an exact `vMAJOR.MINOR.PATCH` after
+Python validation, verifies signed main reachability and the `release`
+environment before builds, and publishes without waiting for an approval.
 
 Only the publish job receives `id-token: write`. The authorize step writes the
 fixed value `authentication=oidc` or `authentication=first-publication-token`

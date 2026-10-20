@@ -4,8 +4,8 @@ name: Release evidence
 # same-head evidence by itself (scripts/release/evidence.py): it waits for
 # the CI push run, dispatches the quality runs and then u15-acceptance once
 # each, and creates the tag and GitHub release on that head when all of them
-# succeeded. The tag starts publish.yml, whose release environment approval
-# is the person's gate. Only the first publication is automated so far.
+# succeeded. The tag starts publish.yml, which publishes without waiting for
+# an approval. Only the first publication is automated so far.
 on:
   push:
     branches: [main]

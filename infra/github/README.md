@@ -10,7 +10,7 @@ Organization settings, including the allowed GitHub Actions, live in
 
 | Resource | File |
 |---|---|
-| Repository (merge methods, features, topics) | `main.tf` |
+| Repository (About: description, homepage and topics; merge methods, features) | `main.tf` |
 | Vulnerability alerts | `main.tf` |
 | Branch ruleset for `main`, with the required status checks | `main.tf` |
 | Issue/PR labels | `main.tf` |

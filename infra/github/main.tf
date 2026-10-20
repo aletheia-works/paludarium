@@ -1,8 +1,12 @@
+# description, homepage_url and topics are the About box. homepage_url is the
+# documentation site that docs.yml deploys; it is a literal, since
+# github_repository_pages depends on this resource.
 resource "github_repository" "this" {
-  name        = var.repository_name
-  description = var.repository_description
-  visibility  = var.repository_visibility
-  topics      = var.repository_topics
+  name         = var.repository_name
+  description  = "Run unmodified static x86-64 Linux binaries on Linux, macOS, Windows and in the browser — a user-mode emulator in Rust with a WebAssembly JIT."
+  homepage_url = "https://aletheia-works.github.io/paludarium/"
+  visibility   = var.repository_visibility
+  topics       = ["blink", "browser", "emulator", "jit", "linux", "macos", "nodejs", "rust", "user-mode-emulation", "webassembly", "windows", "x86-64"]
 
   has_issues      = true
   has_discussions = false

@@ -9,12 +9,6 @@ variable "repository_name" {
   default     = "paludarium"
 }
 
-variable "repository_description" {
-  description = "Repository description"
-  type        = string
-  default     = "A Rust re-implementation of the blink x86-64 Linux user-mode emulator (work in progress)"
-}
-
 variable "repository_visibility" {
   description = "Repository visibility (public or private)"
   type        = string
@@ -25,17 +19,4 @@ variable "repository_visibility" {
     error_message = "visibility must be either \"public\" or \"private\"."
   }
 }
-
-variable "repository_topics" {
-  description = "Topics to attach to the repository"
-  type        = list(string)
-  default = [
-    "emulator",
-    "x86-64",
-    "linux",
-    "webassembly",
-    "rust",
-  ]
-}
-
 

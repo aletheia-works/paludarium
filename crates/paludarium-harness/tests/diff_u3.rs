@@ -79,6 +79,43 @@ fn u3_runner_bootstrap() {
     );
 }
 
+/// Started only by `u3_bounded_reaches_ignored_tests`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+#[ignore = "probe for the bounded runner; started by u3_bounded_reaches_ignored_tests"]
+fn u3_bounded_ignored_probe() {
+    support::bounded("u3_bounded_ignored_probe", || {
+        let marker = std::env::var_os("PALUDARIUM_U3_PROBE_MARKER").expect("probe marker path");
+        std::fs::write(marker, "ran").expect("write probe marker");
+    });
+}
+
+/// `cargo test -- --ignored` must reach the body of an ignored bounded test:
+/// its isolated child used to filter the test out, run nothing and pass.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn u3_bounded_reaches_ignored_tests() {
+    let marker = paludarium_harness::workspace_root()
+        .join("target/u3-bounded")
+        .join(format!("probe-{}.marker", std::process::id()));
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&marker);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "u3_bounded_ignored_probe",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("PALUDARIUM_U3_PROBE_MARKER", &marker)
+        .env_remove("PALUDARIUM_U3_CHILD")
+        .status()
+        .unwrap();
+    assert!(status.success(), "ignored bounded probe: {status}");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+    std::fs::remove_file(&marker).unwrap();
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 #[ignore = "Explicit native-only collection; does not assert emulator agreement"]

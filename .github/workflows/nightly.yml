@@ -2,7 +2,8 @@
 # fuzzing (u14-fuzz.yml: thirteen targets for 600 seconds each with ASan and LSan) and the
 # full quality check (u14-quality.yml: Linux, macOS and Windows, the four wasm environments
 # with the real Safari, JIT on/off agreement and the frozen performance measurement).
-# A failure opens an Issue to be fixed; it never blocks a merge. Actions are pinned by
+# A failure opens an Issue to be fixed (a later failing night comments on it) and the
+# next passing night closes it; it never blocks a merge. Actions are pinned by
 # commit SHA and the default token is read-only; only the reporting job may write Issues.
 name: Nightly
 
@@ -20,19 +21,53 @@ jobs:
   quality:
     uses: ./.github/workflows/u14-quality.yml
 
-  report-failure:
+  report:
     needs: [fuzz, quality]
-    if: failure()
+    # A cancelled night neither opens nor closes anything.
+    if: >-
+      always() &&
+      (contains(needs.*.result, 'failure') ||
+       (needs.fuzz.result == 'success' && needs.quality.result == 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - name: Open an Issue
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: Find the open nightly failure Issues
+        id: open
         run: |
-          gh issue create --repo "$GITHUB_REPOSITORY" \
-            --title "Nightly checks failed ($(date -u +%Y-%m-%d))" \
-            --body "The nightly fuzzing or quality check failed: $RUN_URL"
+          numbers=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title,author \
+            --jq '[.[] | select(.author.login == "app/github-actions" and
+              (.title | startswith("Nightly checks failed")))] | map(.number) | sort | join(" ")')
+          echo "numbers=$numbers" >> "$GITHUB_OUTPUT"
+
+      # One Issue per failure streak: a later failing night comments on it.
+      - name: Open an Issue, or comment on the open one
+        if: contains(needs.*.result, 'failure')
+        env:
+          NUMBERS: ${{ steps.open.outputs.numbers }}
+        run: |
+          if [ -z "$NUMBERS" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "Nightly checks failed ($(date -u +%Y-%m-%d))" \
+              --body "The nightly fuzzing or quality check failed: $RUN_URL"
+          else
+            for number in $NUMBERS; do
+              gh issue comment "$number" --repo "$GITHUB_REPOSITORY" \
+                --body "The nightly checks failed again ($(date -u +%Y-%m-%d)): $RUN_URL"
+            done
+          fi
+
+      - name: Close the open Issues after a passing night
+        if: needs.fuzz.result == 'success' && needs.quality.result == 'success'
+        env:
+          NUMBERS: ${{ steps.open.outputs.numbers }}
+        run: |
+          for number in $NUMBERS; do
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY" --reason completed \
+              --comment "The nightly checks passed again: $RUN_URL"
+          done

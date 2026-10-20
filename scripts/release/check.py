@@ -308,7 +308,10 @@ def fetch_acceptance(root):
     policy.require(len(candidates)==1,'same-head reviewed u15-acceptance artifact absent/ambiguous')
     artifact=candidates[0];policy.require(artifact['workflow_run']['head_sha']==head,'acceptance artifact wrong source')
     token=os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
-    request=urllib.request.Request(artifact['archive_download_url'],headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json'})
+    request=urllib.request.Request(artifact['archive_download_url'],headers={'Accept':'application/vnd.github+json'})
+    # GitHub answers with a redirect to a pre-signed storage URL that rejects any
+    # Authorization header, so the token goes to the API request only.
+    request.add_unredirected_header('Authorization','Bearer '+token)
     with urllib.request.urlopen(request,timeout=30) as response:raw=response.read(64*1024*1024+1)
     policy.require(len(raw)<=64*1024*1024 and artifact['digest']=='sha256:'+package.sha(raw),'official acceptance ZIP digest differs')
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:

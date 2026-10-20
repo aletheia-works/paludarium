@@ -54,6 +54,34 @@ class ApiTests(unittest.TestCase):
             return dict(total_count=1,artifacts=[artifact])
         with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=api),patch.object(check.urllib.request,'urlopen',return_value=io.BytesIO(raw)):
             self.assertEqual(check.fetch_acceptance(ROOT)['head'],'a'*40)
+    def test_acceptance_fetch_follows_redirect_without_token(self):
+        # The artifact API redirects to pre-signed storage, which refuses an Authorization header (401).
+        import http.server,threading
+        buf=io.BytesIO()
+        with zipfile.ZipFile(buf,'w') as a:a.writestr('release-evidence.json',json.dumps(dict(head='a'*40)))
+        raw=buf.getvalue();seen={}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self,*args):pass
+            def do_GET(self):
+                if self.path=='/api/zip':
+                    seen['api']=self.headers.get('Authorization');self.send_response(302)
+                    self.send_header('Location','http://127.0.0.1:%d/blob'%self.server.server_port);self.end_headers()
+                elif self.headers.get('Authorization'):
+                    seen['blob']=self.headers.get('Authorization');self.send_response(401);self.end_headers()
+                else:
+                    self.send_response(200);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+        server=http.server.HTTPServer(('127.0.0.1',0),Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            artifact=dict(name='u15-acceptance',expired=False,workflow_run=dict(head_sha='a'*40),digest='sha256:'+package.sha(raw),
+                          archive_download_url='http://127.0.0.1:%d/api/zip'%server.server_port)
+            def api(route):
+                if route.startswith('actions/runs?'):return dict(total_count=1,workflow_runs=[dict(id=1,head_sha='a'*40,repository=dict(full_name=policy.REPOSITORY))])
+                return dict(total_count=1,artifacts=[artifact])
+            with patch.dict(os.environ,self.env),patch.object(check,'github',side_effect=api):
+                self.assertEqual(check.fetch_acceptance(ROOT)['head'],'a'*40)
+        finally:
+            server.shutdown();server.server_close()
+        self.assertTrue(seen['api'].startswith('Bearer '));self.assertNotIn('blob',seen)
     def test_acceptance_missing(self):
         with patch.dict(os.environ,self.env),patch.object(check,'github',return_value=dict(total_count=0,workflow_runs=[])):
             with self.assertRaises(ValueError):check.fetch_acceptance(ROOT)

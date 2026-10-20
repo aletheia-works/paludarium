@@ -54,6 +54,9 @@ jobs:
           GIT_CONFIG_VALUE_0: false
         with:
           persist-credentials: false
+      # Restore before anything is written to target/: on a partial cache
+      # match rust-cache cleans target/ first.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record signed source and actual compiler
         run: |
           mkdir -p target/u1-source-bound
@@ -81,7 +84,6 @@ jobs:
           retention-days: 14
       # rustup installs the toolchain pinned in rust-toolchain.toml (NFR9.1).
       - run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Unit tests (U1 crates)
         shell: bash
         run: |
@@ -210,6 +212,9 @@ jobs:
           GIT_CONFIG_VALUE_0: false
         with:
           persist-credentials: false
+      # Restore before anything is written to target/: on a partial cache
+      # match rust-cache cleans target/ first.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record signed source and actual compiler
         run: |
           mkdir -p target/u1-source-bound
@@ -241,7 +246,6 @@ jobs:
           mkdir -p target/u3-guests
           uname -a > target/u3-guests/uname.txt
           lscpu > target/u3-guests/cpu.txt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Builds the guests from source (BR7.2), runs each natively and under
       # the emulator, compares stdout/stderr/exit status (BR7.1) and prints
       # the run times (NFR6.1).
@@ -349,6 +353,9 @@ jobs:
           GIT_CONFIG_VALUE_0: false
         with:
           persist-credentials: false
+      # Restore before anything is written to target/: on a partial cache
+      # match rust-cache cleans target/ first.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record signed source and actual compiler
         run: |
           mkdir -p target/u1-source-bound
@@ -375,7 +382,6 @@ jobs:
           path: target/u1-source-bound/
           retention-days: 14
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record native architectural profile
         run: |
           mkdir -p target/u3-guests

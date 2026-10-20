@@ -358,6 +358,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Restore before anything is written to target/: on a partial cache
+      # match rust-cache cleans target/ first.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "26.12.0"
@@ -367,7 +370,6 @@ jobs:
           mkdir -p target/u3-guests
           uname -a > target/u3-guests/uname.txt
           lscpu > target/u3-guests/cpu.txt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Builds the guests from source (BR7.2), runs each natively and under
       # the emulator, compares stdout/stderr/exit status (BR7.1) and prints
       # the run times (NFR6.1).
@@ -400,11 +402,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Restore before anything is written to target/: on a partial cache
+      # match rust-cache cleans target/ first.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "26.12.0"
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record native architectural profile
         run: |
           mkdir -p target/u3-guests

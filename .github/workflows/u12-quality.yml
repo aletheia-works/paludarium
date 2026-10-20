@@ -233,13 +233,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Restore before anything is written to target/: on a partial cache
+      # match rust-cache cleans target/ first.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile
         run: |
           mkdir -p target/u3-guests
           uname -a > target/u3-guests/uname.txt
           lscpu > target/u3-guests/cpu.txt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Builds the guests from source (BR7.2), runs each natively and under
       # the emulator, compares stdout/stderr/exit status (BR7.1) and prints
       # the run times (NFR6.1).
@@ -272,6 +274,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Restore before anything is written to target/: on a partial cache
+      # match rust-cache cleans target/ first.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile
         run: |
@@ -306,7 +311,6 @@ jobs:
         with:
           install_args: aqua:taiki-e/cargo-llvm-cov
           cache: false
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # NFR3.3: fails below 80% of lines. The floor is never lowered.
       - name: Workspace line coverage >= 80%
         run: |

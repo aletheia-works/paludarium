@@ -26,11 +26,11 @@ jobs:
           install_args: cargo-deny
           cache: false
       - name: Runner tests
-        run: python3 -m unittest discover -s tests/guests/u11/runner-tests -p 'test_*.py'
+        run: python3 -m unittest discover -s tests/guests/wasm/runner-tests -p 'test_*.py'
       - name: Build fixed guests and audit dependencies
-        run: python3 tests/guests/u10/build.py target/guests/u10
+        run: python3 tests/guests/programs/build.py target/guests/u10
       - name: Fresh Linux oracle with filesystem metadata
-        run: sudo unshare --net python3 scripts/u11-run.py --native-only --guest-dir target/guests/u10 --output target/u11/native
+        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/u10 --output target/u11/native
       - name: Build one production wasm module for every environment
         run: bash mise-tasks/wasm/build.sh
       - name: Preserve inputs and fresh oracle
@@ -101,7 +101,7 @@ jobs:
         run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component rust-src
       - name: Fresh same-source control for existing Node boundary entry
         if: matrix.environment == 'node'
-        run: python3 -B scripts/build-u14-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"
+        run: python3 -B scripts/build-jit-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"
       - name: Launcher component and C12 boundary tests
         env:
           PALUDARIUM_U14_CONTROL_WASM: target/u14-cost-profile/acceptance-control.wasm
@@ -109,20 +109,20 @@ jobs:
         run: |
           mkdir -p target/u11/node/v8
           export NODE_V8_COVERAGE="$PWD/target/u11/node/v8"
-          node --test packages/paludarium-wasm/tests/u11-*.test.mjs packages/paludarium-wasm/tests/u14-*.test.mjs
-          node packages/paludarium-wasm/tests/u11-api-check.mjs packages/paludarium-wasm/paludarium.wasm
+          node --test packages/paludarium-wasm/tests/wasm-*.test.mjs packages/paludarium-wasm/tests/jit-*.test.mjs
+          node packages/paludarium-wasm/tests/wasm-api-check.mjs packages/paludarium-wasm/paludarium.wasm
       - name: Compare identical fourteen cases in both execution modes
         env:
           U14_ENVIRONMENT: ${{ matrix.environment }}
-        run: python3 -B scripts/u14-run.py --environment "$U14_ENVIRONMENT" --wasm packages/paludarium-wasm/paludarium.wasm --native target/u11/native/observations.json --guests target/guests/u10 --output "target/u11/$U14_ENVIRONMENT"
+        run: python3 -B scripts/jit-run.py --environment "$U14_ENVIRONMENT" --wasm packages/paludarium-wasm/paludarium.wasm --native target/u11/native/observations.json --guests target/guests/u10 --output "target/u11/$U14_ENVIRONMENT"
       - name: Fixed production JavaScript coverage
         if: matrix.environment == 'node'
-        run: node packages/paludarium-wasm/tests/u14-coverage.mjs target/u11/node/v8 target/u11/node/js-coverage.json
+        run: node packages/paludarium-wasm/tests/jit-coverage.mjs target/u11/node/v8 target/u11/node/js-coverage.json
       - name: Frozen paired full-probe performance
         # Measured by hand before a release and by the nightly schedule (ci-config.md); never on push or pull_request.
         if: matrix.environment == 'node' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
         continue-on-error: true
-        run: node packages/paludarium-wasm/tests/u14-performance-check.mjs packages/paludarium-wasm/paludarium.wasm target/u11/native/observations.json target/guests/u10 target/u11/node/performance
+        run: node packages/paludarium-wasm/tests/jit-performance-check.mjs packages/paludarium-wasm/paludarium.wasm target/u11/native/observations.json target/guests/u10 target/u11/node/performance
       - name: Preserve raw results and cleanup evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

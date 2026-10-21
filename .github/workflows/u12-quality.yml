@@ -40,7 +40,7 @@ jobs:
           path: target
       - run: python3 -m pip install 'coverage==7.16.2'
       - name: Python comparison boundary regressions and defined coverage scope
-        run: python3 -m coverage run --data-file=target/u12-python.coverage --include='tests/guests/u12/settings.py,tests/guests/u12/oracle.py,tests/guests/u12/host_comparison.py' -m unittest discover -s tests/guests/u12/runner-tests -p 'test_*.py'
+        run: python3 -m coverage run --data-file=target/u12-python.coverage --include='tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py' -m unittest discover -s tests/guests/macos/runner-tests -p 'test_*.py'
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
@@ -61,15 +61,15 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
-          cargo test --locked -p paludarium-harness --test diff_u12 --no-run --message-format=json > target/u12/macos/build.jsonl
+          cargo test --locked -p paludarium-harness --test diff_macos --no-run --message-format=json > target/u12/macos/build.jsonl
           python3 - <<'PY'
           import json, pathlib, subprocess
           rows = [json.loads(line) for line in pathlib.Path('target/u12/macos/build.jsonl').read_text().splitlines()]
-          binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_u12' and row.get('executable')]
+          binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_macos' and row.get('executable')]
           if len(binaries) != 1:
               raise RuntimeError('expected exactly one U12 harness executable')
-          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u12-python.coverage', '--include=tests/guests/u12/settings.py,tests/guests/u12/oracle.py,tests/guests/u12/host_comparison.py', 'scripts/u12-run.py', '--guest-dir', 'target/guests/u10', '--native', 'target/u12/native/observations.json', '--output', 'target/u12/macos/comparison', '--emulator', binaries[0]], check=True)
-          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u12-python.coverage', '--include=tests/guests/u12/settings.py,tests/guests/u12/oracle.py,tests/guests/u12/host_comparison.py', 'scripts/u12-run.py', '--original-argv', '--guest-dir', 'target/guests/u10', '--native', 'target/u12/native-original/observations.json', '--output', 'target/u12/macos/comparison-original', '--emulator', binaries[0]], check=True)
+          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u12-python.coverage', '--include=tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py', 'scripts/macos-run.py', '--guest-dir', 'target/guests/u10', '--native', 'target/u12/native/observations.json', '--output', 'target/u12/macos/comparison', '--emulator', binaries[0]], check=True)
+          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u12-python.coverage', '--include=tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py', 'scripts/macos-run.py', '--original-argv', '--guest-dir', 'target/guests/u10', '--native', 'target/u12/native-original/observations.json', '--output', 'target/u12/macos/comparison-original', '--emulator', binaries[0]], check=True)
           PY
           python3 -m coverage json --data-file=target/u12-python.coverage -o target/u12/macos/python-coverage.json
           python3 -m coverage report --data-file=target/u12-python.coverage --fail-under=80

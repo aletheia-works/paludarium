@@ -34,15 +34,15 @@ jobs:
           cargo -V > target/u12-native-first/cargo.txt
           python --version > target/u12-native-first/python.txt
           cargo deny --version > target/u12-native-first/deny.txt
-          sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml tests/guests/u10/source-lock.json > target/u12-native-first/inputs-before.sha256
-          python scripts/u12-run.py --self-test
+          sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml tests/guests/programs/source-lock.json > target/u12-native-first/inputs-before.sha256
+          python scripts/macos-run.py --self-test
           cargo test --locked -p paludarium-host --lib signals_time_tests:: -- --test-threads=1
       - name: Fixed unmodified guests with license audits
         shell: bash
         run: |
           set -euo pipefail
           set +e
-          python tests/guests/u10/build.py target/guests/u10 2>&1 | tee target/u12-native-first/build.log
+          python tests/guests/programs/build.py target/guests/u10 2>&1 | tee target/u12-native-first/build.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/u12-native-first/build-exit.txt
           test "$status" = 0
@@ -51,12 +51,12 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          sudo unshare --net "$(command -v python)" scripts/u12-run.py --native-only --guest-dir target/guests/u10 --output target/u12/native 2>&1 | tee target/u12-native-first/native.log
+          sudo unshare --net "$(command -v python)" scripts/macos-run.py --native-only --guest-dir target/guests/u10 --output target/u12/native 2>&1 | tee target/u12-native-first/native.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/u12-native-first/native-exit.txt
           test "$status" = 0
           python -c 'import json; r=json.load(open("target/u12/native/observations.json")); assert r["native_complete"] and len(r["rows"])==14; assert all(x["exit"]==0 and not x["timed_out"] and 0<=x["wall_seconds"]<=30 for x in r["rows"].values())'
-          sudo unshare --net "$(command -v python)" scripts/u12-run.py --native-only --original-argv --guest-dir target/guests/u10 --output target/u12/native-original 2>&1 | tee target/u12-native-first/native-original.log
+          sudo unshare --net "$(command -v python)" scripts/macos-run.py --native-only --original-argv --guest-dir target/guests/u10 --output target/u12/native-original 2>&1 | tee target/u12-native-first/native-original.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/u12-native-first/native-original-exit.txt
           test "$status" = 0
@@ -65,7 +65,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml tests/guests/u10/source-lock.json > target/u12-native-first/inputs-after.sha256
+          sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml tests/guests/programs/source-lock.json > target/u12-native-first/inputs-after.sha256
           cmp target/u12-native-first/inputs-before.sha256 target/u12-native-first/inputs-after.sha256
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()

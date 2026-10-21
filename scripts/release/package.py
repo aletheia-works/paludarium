@@ -174,8 +174,8 @@ def package_check(root):
             "LICENSE",
             "deny.toml",
             "fuzz/Cargo.lock",
-            "tests/guests/u10/probe/Cargo.lock",
-            "tests/guests/u10/source-lock.json",
+            "tests/guests/programs/probe/Cargo.lock",
+            "tests/guests/programs/source-lock.json",
         )
     ]
     for folder in ("crates", "packages", "scripts", "tests"):

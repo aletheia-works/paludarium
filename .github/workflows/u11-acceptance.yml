@@ -26,11 +26,11 @@ jobs:
           install_args: cargo-deny
           cache: false
       - name: Runner tests
-        run: python3 -m unittest discover -s tests/guests/u11/runner-tests -p 'test_*.py'
+        run: python3 -m unittest discover -s tests/guests/wasm/runner-tests -p 'test_*.py'
       - name: Build fixed guests and audit dependencies
-        run: python tests/guests/u10/build.py target/guests/u10
+        run: python tests/guests/programs/build.py target/guests/u10
       - name: Fresh Linux oracle with filesystem metadata
-        run: sudo unshare --net python3 scripts/u11-run.py --native-only --guest-dir target/guests/u10 --output target/u11/native
+        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/u10 --output target/u11/native
       - name: Build one production wasm module for every environment
         run: bash mise-tasks/wasm/build.sh
       - name: Preserve inputs and fresh oracle
@@ -103,23 +103,23 @@ jobs:
       - name: Launcher component and C12 boundary tests
         if: matrix.environment == 'node'
         run: |
-          node --test packages/paludarium-wasm/tests/u11-*.test.mjs
-          node packages/paludarium-wasm/tests/u11-api-check.mjs packages/paludarium-wasm/paludarium.wasm
+          node --test packages/paludarium-wasm/tests/wasm-*.test.mjs
+          node packages/paludarium-wasm/tests/wasm-api-check.mjs packages/paludarium-wasm/paludarium.wasm
       - name: Compare fourteen actual guest executions with fresh Linux
         env:
           U11_ENVIRONMENT: ${{ matrix.environment }}
         run: |
           python3 - <<'PY'
           import json, os, pathlib, sys
-          sys.path.insert(0, 'tests/guests/u11')
+          sys.path.insert(0, 'tests/guests/wasm')
           from supervisor import supervise
           environment = os.environ['U11_ENVIRONMENT']
           output = pathlib.Path('target/u11') / environment
           output.mkdir(parents=True, exist_ok=True)
           if environment == 'node':
-              command = ['node', 'packages/paludarium-wasm/tests/u11-node-check.mjs']
+              command = ['node', 'packages/paludarium-wasm/tests/wasm-node-check.mjs']
           else:
-              command = ['node', 'packages/paludarium-wasm/tests/u11-browser-check.mjs', environment]
+              command = ['node', 'packages/paludarium-wasm/tests/wasm-browser-check.mjs', environment]
           command += ['packages/paludarium-wasm/paludarium.wasm', 'target/u11/native/observations.json', 'target/guests/u10', str(output)]
           result = supervise(command, cwd=pathlib.Path.cwd())
           (output / 'suite-supervisor.json').write_text(json.dumps(result, indent=2) + '\n')

@@ -58,7 +58,7 @@ jobs:
           python3 - <<'PYCODE'
           import hashlib, json, pathlib, subprocess
           root = pathlib.Path('target/u13/windows-byte-audit')
-          names = ['deny.toml', 'Cargo.lock', 'fuzz/Cargo.lock', 'rust-toolchain.toml', 'tests/guests/u10/fixtures/outside/linked/package.json', 'tests/guests/u10/fixtures/app/package.json', 'tests/guests/u10/fixtures/app/filedep/package.json']
+          names = ['deny.toml', 'Cargo.lock', 'fuzz/Cargo.lock', 'rust-toolchain.toml', 'tests/guests/programs/fixtures/outside/linked/package.json', 'tests/guests/programs/fixtures/app/package.json', 'tests/guests/programs/fixtures/app/filedep/package.json']
           rows = []
           for name in names:
               actual = pathlib.Path(name).read_bytes()
@@ -83,7 +83,7 @@ jobs:
           path: target
       - run: python3 -m pip install 'coverage==7.16.2'
       - name: Python comparison boundary regressions and defined coverage scope
-        run: python3 -m coverage run --data-file=target/u13-python.coverage --include='tests/guests/u13/settings.py,tests/guests/u13/oracle.py,tests/guests/u13/host_comparison.py,tests/guests/u13/fixture.py,tests/guests/u13/operation.py,tests/guests/u13/runner.py,tests/guests/u13/windows_job.py' -m unittest discover -s tests/guests/u13/runner-tests -p 'test_*.py'
+        run: python3 -m coverage run --data-file=target/u13-python.coverage --include='tests/guests/windows/settings.py,tests/guests/windows/oracle.py,tests/guests/windows/host_comparison.py,tests/guests/windows/fixture.py,tests/guests/windows/operation.py,tests/guests/windows/runner.py,tests/guests/windows/windows_job.py' -m unittest discover -s tests/guests/windows/runner-tests -p 'test_*.py'
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
@@ -110,11 +110,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/u13/windows/uninstrumented
-          cargo test --locked -p paludarium-harness --test diff_u13 --no-run --message-format=json > target/u13/windows/uninstrumented/build.jsonl
+          cargo test --locked -p paludarium-harness --test diff_windows --no-run --message-format=json > target/u13/windows/uninstrumented/build.jsonl
           python3 - <<'PY'
           import hashlib, json, os, pathlib, subprocess
           rows = [json.loads(line) for line in pathlib.Path('target/u13/windows/uninstrumented/build.jsonl').read_text().splitlines()]
-          binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_u13' and row.get('executable')]
+          binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_windows' and row.get('executable')]
           if len(binaries) != 1:
               raise RuntimeError('expected exactly one uninstrumented U13 harness executable')
           flags = {name: os.environ.get(name) for name in ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_TARGET_DIR', 'RUSTC_WRAPPER', '__CARGO_LLVM_COV_RUSTC_WRAPPER', '__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS', '__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES')}
@@ -125,7 +125,7 @@ jobs:
           receipt = {'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'compiler': subprocess.check_output(['rustc', '-Vv'], text=True), 'flags': flags, 'binary_sha256': hashlib.sha256(pathlib.Path(binaries[0]).read_bytes()).hexdigest()}
           pathlib.Path('target/u13/windows/native-build-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
           for original, oracle, output in [(False, 'native', 'comparison'), (True, 'native-original', 'comparison-original')]:
-              command = ['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u13-python.coverage', '--include=tests/guests/u13/settings.py,tests/guests/u13/oracle.py,tests/guests/u13/host_comparison.py,tests/guests/u13/fixture.py,tests/guests/u13/operation.py,tests/guests/u13/runner.py,tests/guests/u13/windows_job.py', 'scripts/u13-run.py', '--guests', 'target/guests/u10', '--native-report', f'target/u13/{oracle}/observations.json', '--output', f'target/u13/windows/{output}', '--emulator', binaries[0]]
+              command = ['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u13-python.coverage', '--include=tests/guests/windows/settings.py,tests/guests/windows/oracle.py,tests/guests/windows/host_comparison.py,tests/guests/windows/fixture.py,tests/guests/windows/operation.py,tests/guests/windows/runner.py,tests/guests/windows/windows_job.py', 'scripts/windows-run.py', '--guests', 'target/guests/u10', '--native-report', f'target/u13/{oracle}/observations.json', '--output', f'target/u13/windows/{output}', '--emulator', binaries[0]]
               if original:
                   command.append('--original-argv')
               subprocess.run(command, check=True)
@@ -136,21 +136,21 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
-          cargo test --locked -p paludarium-harness --test diff_u13 --no-run --message-format=json > target/u13/windows/build.jsonl
+          cargo test --locked -p paludarium-harness --test diff_windows --no-run --message-format=json > target/u13/windows/build.jsonl
           python3 - <<'PY'
           import hashlib, json, os, pathlib, subprocess
           rows = [json.loads(line) for line in pathlib.Path('target/u13/windows/build.jsonl').read_text().splitlines()]
-          binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_u13' and row.get('executable')]
+          binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_windows' and row.get('executable')]
           if len(binaries) != 1:
               raise RuntimeError('expected exactly one U13 harness executable')
           flags = {name: os.environ.get(name) for name in ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_TARGET_DIR', 'RUSTC_WRAPPER', '__CARGO_LLVM_COV_RUSTC_WRAPPER', '__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS', '__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES')}
           if os.environ.get('CARGO_ENCODEDRUSTFLAGS') is not None:
               raise RuntimeError('misspelled encoded Rust flag variable')
-          if flags['__CARGO_LLVM_COV_RUSTC_WRAPPER'] != '1' or not flags['RUSTC_WRAPPER'] or 'diff_u13' not in (flags['__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES'] or '').split(',') or 'instrument-coverage' not in (flags['__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS'] or ''):
+          if flags['__CARGO_LLVM_COV_RUSTC_WRAPPER'] != '1' or not flags['RUSTC_WRAPPER'] or 'diff_windows' not in (flags['__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES'] or '').split(',') or 'instrument-coverage' not in (flags['__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS'] or ''):
               raise RuntimeError('coverage executable lacks instrumentation')
           receipt = {'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'compiler': subprocess.check_output(['rustc', '-Vv'], text=True), 'flags': flags, 'binary_sha256': hashlib.sha256(pathlib.Path(binaries[0]).read_bytes()).hexdigest()}
           pathlib.Path('target/u13/windows/coverage-build-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
-          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u13-python.coverage', '--include=tests/guests/u13/settings.py,tests/guests/u13/oracle.py,tests/guests/u13/host_comparison.py,tests/guests/u13/fixture.py,tests/guests/u13/operation.py,tests/guests/u13/runner.py,tests/guests/u13/windows_job.py', 'scripts/u13-run.py', '--guests', 'target/guests/u10', '--native-report', 'target/u13/native/observations.json', '--output', 'target/u13/windows/coverage-comparison', '--emulator', binaries[0]], check=True)
+          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u13-python.coverage', '--include=tests/guests/windows/settings.py,tests/guests/windows/oracle.py,tests/guests/windows/host_comparison.py,tests/guests/windows/fixture.py,tests/guests/windows/operation.py,tests/guests/windows/runner.py,tests/guests/windows/windows_job.py', 'scripts/windows-run.py', '--guests', 'target/guests/u10', '--native-report', 'target/u13/native/observations.json', '--output', 'target/u13/windows/coverage-comparison', '--emulator', binaries[0]], check=True)
           PY
           python3 -m coverage json --data-file=target/u13-python.coverage -o target/u13/windows/python-coverage.json
           python3 -m coverage report --data-file=target/u13-python.coverage --fail-under=80
@@ -359,7 +359,7 @@ jobs:
       # Builds the guests from source (BR7.2), runs each natively and under
       # the emulator, compares stdout/stderr/exit status (BR7.1) and prints
       # the run times (NFR6.1).
-      - run: cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_u14 -- --nocapture
+      - run: cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_jit -- --nocapture
       - name: Retain fresh U3 architectural observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -581,15 +581,15 @@ jobs:
         with:
           args: toolchain install nightly-2026-10-11 --profile minimal --component rust-src
       - name: Fresh same-source control for strict Python/JS regressions
-        run: python3 -B scripts/build-u14-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"
+        run: python3 -B scripts/build-jit-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"
       - name: Dedicated prepared-control distribution integration
         env:
           PALUDARIUM_U14_CONTROL_WASM: target/u14-cost-profile/acceptance-control.wasm
-        run: node --test packages/paludarium-wasm/tests/u14-control-distribution.test.mjs
+        run: node --test packages/paludarium-wasm/tests/jit-control-distribution.test.mjs
       - name: Fixed U14 Python coverage and fail-closed boundaries
         run: |
           mkdir -p target/u14
-          python3 -B -m coverage run --data-file=target/u14/python.coverage --include='*/scripts/u14-run.py,*/scripts/build-u14-cost-profile.py,*/tests/guests/u10/build.py,*/tests/guests/u10/evidence.py' -m unittest discover -s tests/guests/u14/runner-tests -p 'test_*.py'
+          python3 -B -m coverage run --data-file=target/u14/python.coverage --include='*/scripts/jit-run.py,*/scripts/build-jit-cost-profile.py,*/tests/guests/programs/build.py,*/tests/guests/programs/evidence.py' -m unittest discover -s tests/guests/jit/runner-tests -p 'test_*.py'
           python3 -B -m coverage report --data-file=target/u14/python.coverage --fail-under=80
           python3 -B -m coverage json --data-file=target/u14/python.coverage -o target/u14/python-coverage.json
       - if: always()

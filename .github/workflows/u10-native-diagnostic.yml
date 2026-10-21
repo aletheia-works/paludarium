@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - run: sudo unshare --net python3 tests/guests/u10/metadata.py target/u10/metadata/native-stat.json
+      - run: sudo unshare --net python3 tests/guests/programs/metadata.py target/u10/metadata/native-stat.json
       - name: Retain native stat evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -42,12 +42,12 @@ jobs:
           cache: false
       - name: Runner readiness before native expectations
         run: |
-          python3 scripts/u10-run.py --self-test
-          python3 -m unittest discover -s tests/guests/u10/runner-tests -p 'test_*.py'
+          python3 scripts/programs-run.py --self-test
+          python3 -m unittest discover -s tests/guests/programs/runner-tests -p 'test_*.py'
       - name: Build fixed unmodified static-musl guests and audit dependencies
-        run: python tests/guests/u10/build.py target/guests/u10
+        run: python tests/guests/programs/build.py target/guests/u10
       - name: Observe fresh native expectations without network or node
-        run: sudo unshare --net python3 scripts/u10-run.py --native-only --guest-dir target/guests/u10 --output target/u10/native
+        run: sudo unshare --net python3 scripts/programs-run.py --native-only --guest-dir target/guests/u10 --output target/u10/native
       - name: Retain build and native evidence, including failures
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -82,14 +82,14 @@ jobs:
       - name: Compile C10 harness before network isolation
         run: |
           u10_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          CARGO_HOME="$u10_cargo_home" cargo +nightly-2026-10-11 test --locked -p paludarium-harness --test diff_u10 --no-run
+          CARGO_HOME="$u10_cargo_home" cargo +nightly-2026-10-11 test --locked -p paludarium-harness --test diff_programs --no-run
       - name: Fresh native oracle then bounded C10 differential without network
         run: |
           u10_cargo="$(rustup which --toolchain nightly-2026-10-11 cargo)"
           u10_rustc="$(rustup which --toolchain nightly-2026-10-11 rustc)"
           u10_bin="$(dirname "$u10_cargo")"
           u10_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          sudo unshare --net env GITHUB_SHA="$GITHUB_SHA" PATH="$u10_bin:$PATH" RUSTC="$u10_rustc" CARGO_HOME="$u10_cargo_home" "$u10_cargo" test --locked --offline -p paludarium-harness --test diff_u10 -- --include-ignored --nocapture
+          sudo unshare --net env GITHUB_SHA="$GITHUB_SHA" PATH="$u10_bin:$PATH" RUSTC="$u10_rustc" CARGO_HOME="$u10_cargo_home" "$u10_cargo" test --locked --offline -p paludarium-harness --test diff_programs -- --include-ignored --nocapture
       - name: Make differential evidence readable after isolated execution
         if: always()
         run: |

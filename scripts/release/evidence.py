@@ -36,6 +36,9 @@ PRODUCER = 'u15-acceptance.yml'
 APPEAR_SECONDS = 15 * 60
 COMPLETE_SECONDS = 150 * 60
 POLL_SECONDS = 60
+RELEASE_BRANCH = 'release-please--branches--main--components--paludarium'
+RELEASE_BOT = 'aletheia-works-bot[bot]'
+PENDING = 'autorelease: pending'
 
 
 class Stop(Exception):
@@ -138,24 +141,47 @@ def produce(api, root, head, presence=check.registry_presence, present=version_p
     return dict(ready='true', version=version, head=head)
 
 
-def release_notes(changelog, version):
-    """The CHANGELOG.md section of version, without its heading.
+def release_notes(text, version):
+    """The release notes section of version, without its heading.
 
     Release Please writes `## 0.1.0 (date)` for a first release and
-    `## [0.1.1](compare link) (date)` once a previous tag exists.
+    `## [0.1.1](compare link) (date)` once a previous tag exists. In a release
+    PR body the section ends at the `---` line before the footer.
     """
-    lines = changelog.splitlines()
+    lines = text.splitlines()
     starts = [i for i, line in enumerate(lines)
               if line.startswith('## %s ' % version) or line.startswith('## [%s](' % version)]
-    policy.require(len(starts) == 1, 'CHANGELOG.md has %d sections for %s (exactly one required)' % (len(starts), version))
+    policy.require(len(starts) == 1, 'release notes have %d sections for %s (exactly one required)' % (len(starts), version))
     body = []
     for line in lines[starts[0] + 1:]:
-        if line.startswith('## '):
+        if line.startswith('## ') or line == '---':
             break
         body.append(line)
     text = '\n'.join(body).strip()
-    policy.require(bool(text), 'CHANGELOG.md section for %s is empty' % version)
+    policy.require(bool(text), 'release notes section for %s is empty' % version)
     return text + '\n'
+
+
+def release_pr_notes(api, head, version):
+    """The notes of version from the body of its merged release PR.
+
+    Release Please writes no CHANGELOG.md (skip-changelog); the release PR body
+    holds the same section. Exactly one merged release PR from the bot on the
+    release-please branch may still be pending, and head must contain its
+    merge commit (main may have moved on after the release PR was merged).
+    """
+    owner = policy.REPOSITORY.split('/')[0]
+    pulls = api.get('pulls?state=closed&base=main&head=%s:%s&per_page=100' % (owner, RELEASE_BRANCH))
+    policy.require(isinstance(pulls, list) and len(pulls) < 100, 'release PR listing incomplete or paginated')
+    pending = [p for p in pulls
+               if p.get('merged_at') and p['user']['login'] == RELEASE_BOT
+               and p['head']['repo']['full_name'] == policy.REPOSITORY
+               and PENDING in {label['name'] for label in p['labels']}]
+    policy.require(len(pending) == 1, '%d merged release PRs are pending (exactly one required)' % len(pending))
+    merge = pending[0]['merge_commit_sha']
+    status = api.get('compare/%s...%s' % (merge, head))['status']
+    policy.require(status in ('ahead', 'identical'), 'release PR #%d merge commit is not in %s' % (pending[0]['number'], head))
+    return release_notes(pending[0]['body'] or '', version)
 
 
 def main(environ=None, api=None, **kwargs):
@@ -181,7 +207,10 @@ def main(environ=None, api=None, **kwargs):
 if __name__ == '__main__':
     import sys
     if sys.argv[1:2] == ['notes']:
-        # publish.yml (tag job): evidence.py notes <version> <CHANGELOG.md> > release-notes.md
-        sys.stdout.write(release_notes(Path(sys.argv[3]).read_text(), sys.argv[2]))
+        # publish.yml (tag job): evidence.py notes <version> <head> > release-notes.md
+        version, head = sys.argv[2:4]
+        policy.require(bool(acceptance.HEAD.fullmatch(head)), 'invalid head')
+        api = GitHubApi(os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN'))
+        sys.stdout.write(release_pr_notes(api, head, version))
     else:
         main()

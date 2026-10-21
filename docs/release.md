@@ -148,7 +148,9 @@ same-head evidence of step 5 must exist for the release PR's merge commit
 before anything is published, so Release Please never tags: `publish.yml`
 publishes that commit and creates the tag and the GitHub release last
 (steps 5 and 6), as biome and mise do. The labels `autorelease: pending` and `autorelease: tagged` are
-managed in `infra/github/main.tf`.
+managed in `infra/github/main.tf`. Release Please writes no `CHANGELOG.md`
+(`skip-changelog`): the release PR body holds the release notes, and the
+`tag` job copies that section into the GitHub release.
 
 `.github/workflows/release-merge.yml` enables auto-merge on the pending
 release PR every Monday (00:23 UTC) or on dispatch, as in the other
@@ -174,8 +176,8 @@ itself.
    proposes is the one to publish, or let `release-merge.yml` merge it
    on Monday. `release.yml` (Release Please) keeps a
    release PR open from every push to main; it changes only the versions
-   (`Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock`, `package.json`), the
-   manifest and `CHANGELOG.md`. Merging it starts the release in
+   (`Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock`, `package.json`) and the
+   manifest; its body holds the release notes. Merging it starts the release in
    `publish.yml` (steps 5 and 6). Confirm: note
    the merge commit, the new main head SHA;
    `gh api repos/aletheia-works/paludarium/commits/<sha> --jq .commit.verification.verified`
@@ -250,7 +252,8 @@ itself.
    check of that head) and `publish` (every crate and the npm package by
    Trusted Publishing, without waiting for an approval). Only after all of
    them succeeded does its `tag` job create tag `v<version>` and the GitHub
-   release (notes from `CHANGELOG.md`) on that head with the workflow's own
+   release (notes from the body of the merged release PR, whose merge commit
+   that head must contain) on that head with the workflow's own
    token, and move the merged release PR from `autorelease: pending` to
    `autorelease: tagged`, as Release Please does when it tags. A version
    that was not published therefore never gets a tag, and no tag is ever

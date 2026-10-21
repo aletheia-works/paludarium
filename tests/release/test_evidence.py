@@ -2,6 +2,7 @@
 replaced by in-memory fakes; nothing reaches the network, and a passing test
 is not evidence that any real run, tag or registry state exists."""
 import itertools
+import json
 import re
 import sys
 import tempfile
@@ -213,7 +214,9 @@ class Evidence(unittest.TestCase):
 
 
 
-CHANGELOG = """# Changelog
+BODY = """Release Please calculated this version from Conventional Commits.
+---
+
 
 ## [0.1.1](https://github.com/aletheia-works/paludarium/compare/v0.1.0...v0.1.1) (2026-10-20)
 
@@ -222,44 +225,105 @@ CHANGELOG = """# Changelog
 
 * **harness:** run ignored U3 tests in the bounded child
 
+---
+This PR was generated with [Release Please](https://github.com/googleapis/release-please).
+"""
+FIRST = """Release Please calculated this version from Conventional Commits.
+---
+
+
 ## 0.1.0 (2026-10-20)
 
 
 ### Features
 
 * **wasm:** publish the npm package as @aletheia-works/paludarium-wasm
+
+---
+This PR was generated with [Release Please](https://github.com/googleapis/release-please).
 """
+MERGE = 'b' * 40
+
+
+def release_pr(number=25, merged=True, login=E.RELEASE_BOT, repository=policy.REPOSITORY,
+               labels=(E.PENDING,), merge=MERGE, body=BODY):
+    return dict(number=number, merged_at='2026-10-20T11:47:24Z' if merged else None, user=dict(login=login),
+                head=dict(ref=E.RELEASE_BRANCH, repo=dict(full_name=repository)),
+                labels=[dict(name=n) for n in labels], merge_commit_sha=merge, body=body)
+
+
+class FakePulls:
+    def __init__(self, pulls, status='ahead'):
+        self.pulls, self.status, self.routes = pulls, status, []
+
+    def get(self, route):
+        self.routes.append(route)
+        if route.startswith('pulls?'):
+            return self.pulls
+        return dict(status=self.status)
 
 
 class ReleaseNotes(unittest.TestCase):
-    def test_section_with_a_compare_link(self):
-        self.assertEqual(E.release_notes(CHANGELOG, '0.1.1'),
+    def test_section_with_a_compare_link_stops_at_the_footer(self):
+        self.assertEqual(E.release_notes(BODY, '0.1.1'),
                          '### Bug Fixes\n\n* **harness:** run ignored U3 tests in the bounded child\n')
 
     def test_first_release_section_without_a_link(self):
-        self.assertEqual(E.release_notes(CHANGELOG, '0.1.0'),
+        self.assertEqual(E.release_notes(FIRST, '0.1.0'),
                          '### Features\n\n* **wasm:** publish the npm package as @aletheia-works/paludarium-wasm\n')
 
     def test_a_version_prefix_is_not_a_match(self):
         with self.assertRaisesRegex(ValueError, '0 sections for 0.1'):
-            E.release_notes(CHANGELOG, '0.1')
+            E.release_notes(BODY, '0.1')
 
     def test_missing_duplicate_or_empty_section_stops(self):
         with self.assertRaisesRegex(ValueError, '0 sections for 0.2.0'):
-            E.release_notes(CHANGELOG, '0.2.0')
-        with self.assertRaisesRegex(ValueError, '2 sections for 0.1.0'):
-            E.release_notes(CHANGELOG + '\n## 0.1.0 (again)\n\n* x\n', '0.1.0')
+            E.release_notes(BODY, '0.2.0')
+        with self.assertRaisesRegex(ValueError, '2 sections for 0.1.1'):
+            E.release_notes(BODY + '\n## 0.1.1 (again)\n\n* x\n', '0.1.1')
         with self.assertRaisesRegex(ValueError, 'section for 0.3.0 is empty'):
-            E.release_notes('## [0.3.0](link) (date)\n\n\n## 0.2.0 (date)\n\n* x\n', '0.3.0')
+            E.release_notes('## [0.3.0](link) (date)\n\n\n---\nfooter\n', '0.3.0')
 
-    def test_command_line_writes_the_section(self):
+    def test_notes_from_the_merged_pending_release_pr(self):
+        api = FakePulls([release_pr(17, merged=False), release_pr(12, labels=('autorelease: tagged',), body=FIRST),
+                         release_pr()])
+        self.assertEqual(E.release_pr_notes(api, HEAD, '0.1.1'), E.release_notes(BODY, '0.1.1'))
+        self.assertEqual(api.routes, ['pulls?state=closed&base=main&head=aletheia-works:%s&per_page=100' % E.RELEASE_BRANCH,
+                                      'compare/%s...%s' % (MERGE, HEAD)])
+        self.assertEqual(E.release_pr_notes(FakePulls([release_pr()], 'identical'), HEAD, '0.1.1'),
+                         E.release_notes(BODY, '0.1.1'))
+
+    def test_only_the_bots_merged_pending_pr_from_this_repository_counts(self):
+        for pr in (release_pr(merged=False), release_pr(login='someone'), release_pr(repository='fork/paludarium'),
+                   release_pr(labels=('autorelease: tagged',))):
+            with self.assertRaisesRegex(ValueError, '0 merged release PRs are pending'):
+                E.release_pr_notes(FakePulls([pr]), HEAD, '0.1.1')
+        with self.assertRaisesRegex(ValueError, '2 merged release PRs are pending'):
+            E.release_pr_notes(FakePulls([release_pr(), release_pr(26)]), HEAD, '0.1.1')
+
+    def test_head_must_contain_the_release_merge_commit(self):
+        for status in ('behind', 'diverged'):
+            with self.assertRaisesRegex(ValueError, 'merge commit is not in'):
+                E.release_pr_notes(FakePulls([release_pr()], status), HEAD, '0.1.1')
+
+    def test_paginated_listing_or_missing_section_stops(self):
+        with self.assertRaisesRegex(ValueError, 'paginated'):
+            E.release_pr_notes(FakePulls([release_pr(n) for n in range(100)]), HEAD, '0.1.1')
+        with self.assertRaisesRegex(ValueError, '0 sections for 0.2.0'):
+            E.release_pr_notes(FakePulls([release_pr()]), HEAD, '0.2.0')
+        with self.assertRaisesRegex(ValueError, '0 sections for 0.1.1'):
+            E.release_pr_notes(FakePulls([release_pr(body=None)]), HEAD, '0.1.1')
+
+    def test_command_line_refuses_a_bad_head_or_missing_token_before_any_request(self):
+        import os
         import subprocess
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'CHANGELOG.md'
-            path.write_text(CHANGELOG)
-            out = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/release/evidence.py'), 'notes', '0.1.1', str(path)],
-                                 capture_output=True, text=True, check=True).stdout
-        self.assertEqual(out, E.release_notes(CHANGELOG, '0.1.1'))
+        env = {k: v for k, v in os.environ.items() if k not in ('GH_TOKEN', 'GITHUB_TOKEN')}
+        for head, message in (('x', 'invalid head'), (HEAD, 'GitHub read token unavailable')):
+            out = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/release/evidence.py'), 'notes', '0.1.1', head],
+                                 capture_output=True, text=True, env=env)
+            self.assertNotEqual(out.returncode, 0)
+            self.assertIn(message, out.stderr)
+            self.assertEqual(out.stdout, '')
 
 
 class EvidenceWorkflow(unittest.TestCase):
@@ -284,7 +348,10 @@ class EvidenceWorkflow(unittest.TestCase):
         self.assertNotIn('RELEASE_AUTOMATION_ENABLED', text)
         self.assertNotIn('secrets.', text)
         self.assertIn('--target "$HEAD_SHA"', text)
-        self.assertIn('python -B scripts/release/evidence.py notes "$VERSION" CHANGELOG.md > target/release-notes.md', text)
+        self.assertIn('python -B scripts/release/evidence.py notes "$VERSION" "$HEAD_SHA" > target/release-notes.md', text)
+        self.assertFalse((ROOT / 'CHANGELOG.md').exists())
+        config = json.loads((ROOT / '.github/release-please-config.json').read_text())
+        self.assertIs(config['packages']['.']['skip-changelog'], True)
         self.assertNotIn('awk', text)
         self.assertNotIn('TRUSTED_PUBLISHERS_REGISTERED', text)
         self.assertEqual(check.validate(ROOT)['validated'], True)

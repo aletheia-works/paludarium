@@ -166,7 +166,7 @@ jobs:
           HEAD_SHA: ${{ needs.evidence.outputs.head }}
         run: |
           mkdir -p target
-          python -B scripts/release/evidence.py notes "$VERSION" CHANGELOG.md > target/release-notes.md
+          python -B scripts/release/evidence.py notes "$VERSION" "$HEAD_SHA" > target/release-notes.md
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$HEAD_SHA" --title "v$VERSION" --notes-file target/release-notes.md
 
       # What Release Please does when it tags: the merged release PR stops

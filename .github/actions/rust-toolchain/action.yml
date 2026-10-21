@@ -1,0 +1,32 @@
+name: Rust toolchain
+description: >-
+  Use a job-local rustup home, then run rustup through scripts/rustup-retry.sh
+  (by default `toolchain install`: the toolchain of rust-toolchain.toml).
+  Runs after actions/checkout, which provides the script.
+
+inputs:
+  args:
+    description: rustup arguments, split on whitespace.
+    required: false
+    default: toolchain install
+
+runs:
+  using: composite
+  steps:
+    - name: Use a job-local rustup home
+      # GitHub-hosted runners sometimes ship a partially installed toolchain in
+      # ~/.rustup, which makes rustup fail with "detected conflict".
+      shell: bash
+      run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
+    - name: Run rustup, retried
+      # static.rust-lang.org downloads sometimes fail on CI.
+      shell: bash
+      env:
+        RUSTUP_ARGS: ${{ inputs.args }}
+      run: |
+        set -euo pipefail
+        # $GITHUB_WORKSPACE, not github.workspace: inside a container job only the
+        # environment variable names the container's path.
+        cd "$GITHUB_WORKSPACE"
+        read -r -a args <<< "$RUSTUP_ARGS"
+        bash scripts/rustup-retry.sh "${args[@]}"

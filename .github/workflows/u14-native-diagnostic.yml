@@ -24,17 +24,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
-      - shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          args: toolchain install nightly-2026-10-11 --profile minimal
       - shell: bash
         run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl --toolchain nightly-2026-10-11
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
@@ -69,11 +65,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -82,8 +73,9 @@ jobs:
           name: u10-native-first
           path: target
       - run: chmod +x target/guests/u10/probe target/guests/u10/aube
-      - shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          args: toolchain install nightly-2026-10-11 --profile minimal
       - name: Compile C10 harness before network isolation
         run: |
           u10_cargo_home="${CARGO_HOME:-$HOME/.cargo}"

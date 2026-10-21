@@ -41,19 +41,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: '26.11.1'
-      - shell: bash
-        run: bash scripts/rustup-retry.sh component add rust-src --toolchain nightly-2026-10-11
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          args: component add rust-src --toolchain nightly-2026-10-11
       - name: Generate and execute fresh native fixtures
         run: |
           mkdir -p target/production-wasm-evidence
@@ -82,19 +78,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # rustup installs the toolchain pinned in rust-toolchain.toml (NFR9.1).
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Unit tests (U1 crates)
@@ -111,18 +101,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: rustup retry script tests
         shell: bash
@@ -141,18 +125,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: cargo-deny
@@ -166,11 +144,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -178,8 +151,7 @@ jobs:
       # match rust-cache cleans target/ first.
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile
@@ -211,11 +183,6 @@ jobs:
       PALUDARIUM_U5_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
       PALUDARIUM_U6_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -223,8 +190,7 @@ jobs:
       # match rust-cache cleans target/ first.
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile

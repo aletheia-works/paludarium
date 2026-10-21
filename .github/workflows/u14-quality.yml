@@ -40,11 +40,6 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         env:
           GIT_CONFIG_COUNT: 1
@@ -89,8 +84,9 @@ jobs:
       - run: python3 -m pip install 'coverage==7.16.2'
       - name: Python comparison boundary regressions and defined coverage scope
         run: python3 -m coverage run --data-file=target/u13-python.coverage --include='tests/guests/u13/settings.py,tests/guests/u13/oracle.py,tests/guests/u13/host_comparison.py,tests/guests/u13/fixture.py,tests/guests/u13/operation.py,tests/guests/u13/runner.py,tests/guests/u13/windows_job.py' -m unittest discover -s tests/guests/u13/runner-tests -p 'test_*.py'
-      - shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          args: toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
       - name: Compile and lint the Windows configuration, including actual FFI and tests
         run: cargo clippy --locked -p paludarium-host -p paludarium-harness --all-targets -- -D warnings
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
@@ -213,11 +209,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -227,8 +218,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: '26.12.0'
-      - shell: bash
-        run: bash scripts/rustup-retry.sh component add rust-src --toolchain nightly-2026-10-11
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          args: component add rust-src --toolchain nightly-2026-10-11
       - name: Generate and execute fresh native fixtures
         run: |
           mkdir -p target/production-wasm-evidence
@@ -257,18 +249,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "26.12.0"
@@ -306,18 +292,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "26.12.0"
@@ -336,18 +316,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "26.12.0"
@@ -364,11 +338,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -376,8 +345,7 @@ jobs:
       # match rust-cache cleans target/ first.
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
@@ -412,11 +380,6 @@ jobs:
       PALUDARIUM_U5_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
       PALUDARIUM_U6_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -424,8 +387,7 @@ jobs:
       # match rust-cache cleans target/ first.
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
@@ -546,18 +508,12 @@ jobs:
       PALUDARIUM_U3_NATIVE_FAULTS: ${{ github.workspace }}/target/u3-guests/fault-observe.native
       PALUDARIUM_U3_NATIVE_CPUID: ${{ github.workspace }}/target/u3-guests/cpuid-observe.native
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
-        shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install
+        uses: ./.github/actions/rust-toolchain
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: '26.12.0'
@@ -610,11 +566,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -626,8 +577,9 @@ jobs:
           node-version: '26.12.0'
       - run: python3 -m pip install 'coverage==7.16.2'
       - run: npm install --global npm@12.2.0
-      - shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component rust-src
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          args: toolchain install nightly-2026-10-11 --profile minimal --component rust-src
       - name: Fresh same-source control for strict Python/JS regressions
         run: python3 -B scripts/build-u14-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"
       - name: Dedicated prepared-control distribution integration

@@ -11,11 +11,6 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-10-11
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -23,8 +18,9 @@ jobs:
         with:
           python-version: '3.15.0'
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
-      - shell: bash
-        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview --target x86_64-unknown-linux-musl
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          args: toolchain install nightly-2026-10-11 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview --target x86_64-unknown-linux-musl
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: cargo-deny

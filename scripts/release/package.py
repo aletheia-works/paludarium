@@ -187,7 +187,8 @@ def package_check(root):
             and not any(
                 s in ("target", "node_modules", "__pycache__") for s in p.relative_to(root).parts
             )
-            and p.suffix in (".rs", ".toml", ".mjs", ".json", ".py", ".ts")
+            # Each published crate carries its own LICENSE (no suffix).
+            and (p.suffix in (".rs", ".toml", ".mjs", ".json", ".py", ".ts") or p.name == "LICENSE")
         )
     paths = sorted(set(paths))
     before = check.snapshot(root, paths)

@@ -3,8 +3,8 @@
 //! [`run`] executes instructions on a [`CpuState`] until a system call, a
 //! guest exception or the instruction budget stops it, and reports why as an
 //! [`ExitReason`] (ADR-004). The CPU knows nothing about the kernel.
-//! Instructions outside the implemented set stop with `InvalidOpcode`
-//! (BR4.1). The implemented set is the one the U1 guests execute (BR4.4).
+//! Instructions outside the implemented set stop with `InvalidOpcode`. The
+//! implemented set is the one the core guests execute.
 #![forbid(unsafe_code)]
 
 mod alu;
@@ -269,7 +269,7 @@ fn fetch_for_state(state: &mut CpuState, mem: &AddressSpace) -> Result<Instructi
     }
 }
 
-/// Runs at most `budget` instructions (BR4.3). Returns why execution stopped;
+/// Runs at most `budget` instructions. Returns why execution stopped;
 /// `BudgetExhausted` when the budget ran out.
 pub fn run(state: &mut CpuState, mem: &AddressSpace, budget: u64) -> ExitReason {
     run_cached(state, mem, budget, &mut DecodeCache::new())
@@ -872,7 +872,7 @@ mod tests {
             0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0x31, 0xc9, 0xf9, 0xd3, 0xe0, 0xf4,
         ];
         let (mut s, mem) = machine(&code);
-        // stc is not in the U1 set; set CF directly and start after it.
+        // stc is not in the core set; set CF directly and start after it.
         let reason = run(&mut s, &mem, 2);
         assert!(matches!(reason, ExitReason::BudgetExhausted { .. }));
         s.rflags |= flag::CF;

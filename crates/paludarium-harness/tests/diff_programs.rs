@@ -18,7 +18,7 @@ fn programs_differential() {
         .unwrap();
     assert!(
         status.success(),
-        "U10 differential failed; inspect target/programs/differential"
+        "fixed guest programs differential failed; inspect target/programs/differential"
     );
 }
 

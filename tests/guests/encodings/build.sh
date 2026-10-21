@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# U3 guest runner bootstrap. Instruction fixtures follow native-oracle design.
+# Encodings guest runner bootstrap. Instruction fixtures follow native-oracle design.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 out="${1:?output directory required}"

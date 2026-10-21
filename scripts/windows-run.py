@@ -26,8 +26,8 @@ def main():
 
         row = run([sys.executable, "-c", "pass"], cwd=ROOT, env={})
         if row["exit"] != 0 or row["timed_out"]:
-            raise RuntimeError("U13 bounded runner not ready")
-        print("U13 Linux runner ready: fixed fourteen cases, thirty-second deadline")
+            raise RuntimeError("Windows bounded runner not ready")
+        print("Windows Linux runner ready: fixed fourteen cases, thirty-second deadline")
         return
     if args.native_only:
         if args.guests is None or args.output is None or args.native_report is not None:

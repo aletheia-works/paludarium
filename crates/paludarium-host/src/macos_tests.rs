@@ -47,7 +47,7 @@ fn macos_native_thread_join_visibility() {
 #[test]
 fn macos_native_thread_panic_linux_errno() {
     assert_eq!(
-        threads::spawn(Box::new(|| panic!("U12 controlled panic")))
+        threads::spawn(Box::new(|| panic!("macOS controlled panic")))
             .unwrap()
             .join(),
         Err(Errno::EIO)

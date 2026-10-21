@@ -1,4 +1,4 @@
-//! U13 fixed guest operation. The Python supervisor owns the hard deadline.
+//! Windows host fixed guest operation. The Python supervisor owns the hard deadline.
 #[path = "support/windows.rs"]
 // The reused operation fixture intentionally fails tests on setup/I/O errors.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

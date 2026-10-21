@@ -154,7 +154,7 @@ fn write_goes_to_host_streams_only_for_fd_1_and_2() {
 fn unknown_syscalls_are_enosys_and_network_is_rejected() {
     let mut f = fixture();
     assert_eq!(f.ret(nr::SOCKET, &[2, 1, 0]), errno(Errno(97)));
-    assert_eq!(f.ret(0, &[0, DATA, 1]), 0); // U7 stdin EOF
+    assert_eq!(f.ret(0, &[0, DATA, 1]), 0); // files: stdin EOF
     assert_eq!(f.ret(u64::MAX, &[]), errno(Errno::ENOSYS));
     assert_eq!(f.ret(1_000_000, &[]), errno(Errno::ENOSYS));
     assert!(SyscallTable::u1().contains(nr::SOCKET));
@@ -300,12 +300,12 @@ fn memory_syscalls_map_protect_unmap_and_brk() {
     assert_eq!(fixed, a);
     assert_eq!(f.mem.read_u64(GuestAddr(a)).unwrap(), 0);
     assert_eq!(f.ret(nr::MUNMAP, &[a, 12288]), 0);
-    // U4 native memory CASE1 verifies shared anonymous mappings are valid.
+    // The signals/time native memory CASE1 verifies shared anonymous mappings are valid.
     let shared = f.ret(nr::MMAP, &[0, 4096, 3, 0x21, u64::MAX, 0]);
     assert!(shared < USER_ADDRESS_LIMIT && shared.is_multiple_of(4096));
     assert_eq!(f.mem.read_u64(GuestAddr(shared)).unwrap(), 0);
     assert_eq!(f.ret(nr::MUNMAP, &[shared, 4096]), 0);
-    // File-backed forms remain U7.
+    // File-backed forms belong to the files tests.
     assert_eq!(
         f.ret(nr::MMAP, &[0, 4096, 3, 0x02, 3, 0]),
         errno(Errno::EBADF)

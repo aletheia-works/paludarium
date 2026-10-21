@@ -113,7 +113,7 @@ impl Execution {
                 }
                 _ => self.stopped.store(false, Ordering::SeqCst),
             }
-            // U14 blocks execute at most 64 instructions. Smaller explicit
+            // JIT blocks execute at most 64 instructions. Smaller explicit
             // budgets retain exact interpreter checkpoint/kill semantics.
             let reason = if self.accelerated && self.budget >= 64 {
                 run_cached_with_counted_hook(

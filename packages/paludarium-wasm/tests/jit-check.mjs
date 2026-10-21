@@ -43,6 +43,6 @@ try{if(!crossOriginIsolated)throw Error('Shared memory unavailable');const input
     result = await runBrowser(environment, `http://127.0.0.1:${server.address().port}/`, 1200000);
   }
   Object.assign(report, result); await persist();
-  if (!report.complete || !report.passed || report.caseCount !== 28) throw Error("U14 JIT/interpreter acceptance failed");
+  if (!report.complete || !report.passed || report.caseCount !== 28) throw Error("JIT/interpreter acceptance failed");
 } catch (error) { report.error = String(error); await persist(); process.exitCode = 1; }
 finally { if (server) await new Promise(resolve => server.close(resolve)); }

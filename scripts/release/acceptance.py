@@ -138,10 +138,10 @@ HOST_PAIRS = {
 NATIVE_SOURCES = ("linux-native", "macos-native", "windows-native")
 WASM_SOURCES = tuple("wasm-" + e for e in WASM_OS)
 ACCEPTANCE_SOURCES = {
-    "FR6.3": NATIVE_SOURCES + WASM_SOURCES,
-    "FR7.2": NATIVE_SOURCES + WASM_SOURCES,
-    "FR8.2": WASM_SOURCES,
-    "FR8.3": ("performance",),
+    "probe": NATIVE_SOURCES + WASM_SOURCES,
+    "aube": NATIVE_SOURCES + WASM_SOURCES,
+    "wasm-modes": WASM_SOURCES,
+    "performance": ("performance",),
 }
 DIGEST_DEFINITION = (
     "artifact_sha256 is the SHA-256 of the canonical JSON list of "
@@ -334,7 +334,7 @@ def row_ok(row):
 
 
 def probe_passed(rows):
-    """FR6.3: every probe item prints exactly its PASS line, exit 0."""
+    """Probe condition: every probe item prints exactly its PASS line, exit 0."""
     for item in PROBE_ITEMS:
         row = rows["probe-" + item]
         if row["exit"] != 0 or row["stdout"].splitlines() != ["PASS " + item]:
@@ -349,7 +349,7 @@ def probe_passed(rows):
 
 
 def aube_matches(rows, native):
-    """FR7.2 bound check: same exit for all four commands and identical --version stdout."""
+    """aube condition: same exit for all four commands and identical --version stdout."""
     return (
         all(rows[n]["exit"] == native[n]["exit"] for n in AUBE_ROWS)
         and rows["version"]["stdout"] == native["version"]["stdout"]
@@ -377,7 +377,7 @@ def guest_hashes(document, key, label):
 
 
 def verdicts(rows, native):
-    return {"FR6.3": probe_passed(rows), "FR7.2": aube_matches(rows, native)}
+    return {"probe": probe_passed(rows), "aube": aube_matches(rows, native)}
 
 
 def native_oracle(document, label):
@@ -556,11 +556,11 @@ def bind(results):
 def condition_passed(condition, checked):
     for label in ACCEPTANCE_SOURCES[condition]:
         result = checked[label]["result"]
-        if condition == "FR8.3":
+        if condition == "performance":
             ok = result["passed"]
-        elif condition == "FR8.2":
+        elif condition == "wasm-modes":
             ok = all(
-                m["mode_passed"] and m["FR6.3"] and m["FR7.2"] for m in result["modes"].values()
+                m["mode_passed"] and m["probe"] and m["aube"] for m in result["modes"].values()
             )
         elif label in WASM_SOURCES:
             ok = (

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""U11 bounded test entry point; native oracle is generated afresh on Linux."""
+"""Wasm bounded test entry point; native oracle is generated afresh on Linux."""
 
 import argparse
 import json
@@ -33,7 +33,7 @@ def main():
         row = run([sys.executable, "-c", "pass"], cwd=ROOT, env={})
         if row["exit"] != 0 or row["timed_out"]:
             raise RuntimeError("bounded test runner failed readiness")
-        print("U11 runner ready: fresh native fourteen cases, 30-second external deadline")
+        print("wasm runner ready: fresh native fourteen cases, 30-second external deadline")
         return
     if args.native_only:
         if args.guest_dir is None or args.output is None or args.browser:

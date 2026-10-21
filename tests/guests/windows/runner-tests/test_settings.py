@@ -1,4 +1,4 @@
-"""U13比較条件と実装前runner準備の境界。"""
+"""Windows host比較条件と実装前runner準備の境界。"""
 
 import pathlib
 import runpy

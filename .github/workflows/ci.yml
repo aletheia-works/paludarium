@@ -2,7 +2,7 @@
 # macOS and Windows, fmt, clippy (-D warnings), dependency checks, the
 # x86-64 Linux differential tests and the 80% line-coverage floor.
 # Every job must pass before merging. Actions are pinned by commit SHA and
-# the default token is read-only (NFR8.2).
+# the default token is read-only.
 name: CI
 
 on:
@@ -20,7 +20,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   PALUDARIUM_TEST_NODE: node
-  # The U1 crates (unit-test-instructions.md).
+  # The core crates.
   CORE_PACKAGES: >-
     -p paludarium-types -p paludarium-decoder -p paludarium-mmu
     -p paludarium-cpu -p paludarium-loader -p paludarium-vfs
@@ -81,13 +81,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # rustup installs the toolchain pinned in rust-toolchain.toml (NFR9.1).
+      # rustup installs the toolchain pinned in rust-toolchain.toml.
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
         uses: ./.github/actions/rust-toolchain
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Unit tests (U1 crates)
+      - name: Unit tests (core crates)
         shell: bash
         run: |
           read -r -a packages <<< "$CORE_PACKAGES"
@@ -136,7 +136,7 @@ jobs:
           install_args: cargo-deny
           cache: false
       # Licenses compatible with Apache-2.0, crates.io only, RustSec,
-      # forbidden crates (NFR8.1, NFR8.4).
+      # forbidden crates.
       - run: cargo deny --locked check
 
   differential:
@@ -159,11 +159,10 @@ jobs:
           mkdir -p target/encodings-guests
           uname -a > target/encodings-guests/uname.txt
           lscpu > target/encodings-guests/cpu.txt
-      # Builds the guests from source (BR7.2), runs each natively and under
-      # the emulator, compares stdout/stderr/exit status (BR7.1) and prints
-      # the run times (NFR6.1).
+      # Builds the guests from source, runs each natively and under the
+      # emulator, compares stdout/stderr/exit status and prints the run times.
       - run: cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes -- --nocapture
-      - name: Retain fresh U3 architectural observations
+      - name: Retain fresh encodings architectural observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -198,7 +197,7 @@ jobs:
           mkdir -p target/encodings-guests
           uname -a > target/encodings-guests/uname.txt
           lscpu > target/encodings-guests/cpu.txt
-      - name: Generate fresh U3 native inputs before instrumented library tests
+      - name: Generate fresh encodings native inputs before instrumented library tests
         shell: bash
         run: |
           bash tests/guests/encodings/build.sh target/encodings-guests
@@ -226,7 +225,7 @@ jobs:
         with:
           install_args: aqua:taiki-e/cargo-llvm-cov
           cache: false
-      # NFR3.3: fails below 80% of lines. The floor is never lowered.
+      # Fails below 80% of lines. The floor is never lowered.
       - name: Workspace line coverage >= 80%
         run: |
           cargo llvm-cov clean --workspace
@@ -240,17 +239,17 @@ jobs:
           # Instrumented independent cases run serially; race cases still
           # launch their own host workers and retain the 30-second watchdog.
           RUST_TEST_THREADS: "1"
-      - name: U11 changed Rust components line coverage >= 80%
+      - name: Wasm changed Rust components line coverage >= 80%
         run: |
           cargo llvm-cov --locked -p paludarium-host -p paludarium-vfs -p paludarium-kernel -p paludarium-runtime -p paludarium-wasm --lib --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|jit)/' --fail-under-lines 80 --lcov --output-path target/wasm-coverage.lcov
-      - name: Retain U11 coverage observations
+      - name: Retain wasm coverage observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: wasm-coverage-lcov
           path: target/wasm-coverage.lcov
-      - name: U1 package line coverage >= 80%
-        # Keep the same U1 production file set; fresh architectural tests live
+      - name: Core package line coverage >= 80%
+        # Keep the same core production file set; fresh architectural tests live
         # in Harness and must execute when measuring the newly shared CPU code.
         run: |
           cargo llvm-cov clean --workspace
@@ -264,19 +263,19 @@ jobs:
         env:
           RUST_TEST_THREADS: "1"
 
-      - name: U9 target crates line coverage >= 80%
+      - name: Terminal target crates line coverage >= 80%
         run: |
           cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_terminal --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/' --fail-under-lines 80 --lcov --output-path target/terminal-coverage.lcov
           cargo llvm-cov report --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/'
         env:
           RUST_TEST_THREADS: "1"
-      - name: U3 CPU and Decoder line coverage >= 80%
+      - name: Encodings CPU and Decoder line coverage >= 80%
         run: |
           cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/' --fail-under-lines 80 --lcov --output-path target/encodings-coverage.lcov
           cargo llvm-cov report --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/'
         env:
           RUST_TEST_THREADS: "1"
-      - name: Retain U3 coverage observations
+      - name: Retain encodings coverage observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -290,7 +289,7 @@ jobs:
           name: encodings-coverage-native-observations
           path: target/encodings-guests/
           retention-days: 7
-      - name: Retain U9 coverage line observations
+      - name: Retain terminal coverage line observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:

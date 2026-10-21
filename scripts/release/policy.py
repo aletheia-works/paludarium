@@ -30,7 +30,7 @@ REQUIRED = {
     "terminal-coverage",
     "package-check",
 }
-ACCEPTANCE = {"FR6.3", "FR7.2", "FR8.2", "FR8.3"}
+ACCEPTANCE = {"probe", "aube", "wasm-modes", "performance"}
 
 
 def require(value, message):

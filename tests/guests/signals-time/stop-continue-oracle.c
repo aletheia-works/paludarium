@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <errno.h>
 
-/* Native-only parent/child observer. Guest clone remains U5. */
+/* Native-only parent/child observer. Guest clone is not under test here. */
 int main(int argc, char **argv) {
     if(argc!=2)return 90;
     int mode=atoi(argv[1]), stop=(mode==1||mode==4)?SIGTSTP:SIGSTOP;

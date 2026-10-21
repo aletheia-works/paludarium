@@ -1,4 +1,4 @@
-//! U3 runner bootstrap, using an already implemented encoding.
+//! Encodings runner bootstrap, using an already implemented encoding.
 use super::{Mnemonic, decode};
 use paludarium_types::GuestAddr;
 

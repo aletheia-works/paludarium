@@ -1,5 +1,5 @@
 [toolchain]
-# Pinned nightly (NFR9.1). CI and local builds use exactly this toolchain.
+# Pinned nightly. CI and local builds use exactly this toolchain.
 channel = "nightly-2026-10-11"
 components = ["rustfmt", "clippy", "llvm-tools", "rust-src"]
 targets = ["x86_64-unknown-linux-musl", "wasm32-unknown-unknown"]

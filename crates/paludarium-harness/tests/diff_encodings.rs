@@ -1,4 +1,4 @@
-//! U3 runner bootstrap. Native instruction cases are populated in Step3.
+//! Encodings runner bootstrap. Native instruction cases follow native observations.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -131,7 +131,7 @@ fn native_observation() {
                 .arg(root.join("tests/guests/encodings/build.sh"))
                 .arg(&output)
                 .status()
-                .expect("build native U3 fixtures")
+                .expect("build native encodings fixtures")
                 .success()
         );
         for name in ["observe", "cpuid-observe", "fault-observe"] {

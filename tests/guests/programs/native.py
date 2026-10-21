@@ -68,4 +68,6 @@ def observe(guests, output, config, *, extra_snapshot=None, prepare_fixture=None
                 raise ValueError("native aube failed: " + case["name"])
         observations["native_complete"] = True
         (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
-    print("U10 native: probe eight items + standard run; aube four commands; node ENOENT")
+    print(
+        "fixed guest programs native: probe eight items + standard run; aube four commands; node ENOENT"
+    )

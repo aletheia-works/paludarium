@@ -200,7 +200,7 @@ class CoverageCheck(unittest.TestCase):
                 row["summary"]["lines"].update(covered=1, percent=50)
         self.replace_raw("json", json.dumps(j).encode())
         self.replace_raw("report", b"TOTAL 1 0 100% 1 0 100% 46 13 71.74%\n")
-        with self.assertRaisesRegex(ValueError, "one U9 group"):
+        with self.assertRaisesRegex(ValueError, "one terminal group"):
             self.check()
 
     def test_json_summary_difference(self):

@@ -1,5 +1,5 @@
-//! ELF loading must reject or load any file without panicking (NFR2.1) and
-//! must never accept more than 4 GiB of segments (R-01).
+//! ELF loading must reject or load any file without panicking and must
+//! never accept more than 4 GiB of segments.
 //!
 //! Inputs whose first byte is odd are used as the whole file. Otherwise a
 //! valid tiny executable is built in code and the rest of the input is a

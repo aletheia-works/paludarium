@@ -2,7 +2,7 @@
 # macOS and Windows, fmt, clippy (-D warnings), dependency checks, the
 # x86-64 Linux differential tests and the 80% line-coverage floor.
 # Every job must pass before merging. Actions are pinned by commit SHA and
-# the default token is read-only (NFR8.2).
+# the default token is read-only.
 name: Full quality
 
 on:
@@ -21,7 +21,7 @@ env:
   PALUDARIUM_TEST_NODE: node
   PYTHONDONTWRITEBYTECODE: "1"
   CARGO_TERM_COLOR: always
-  # The U1 crates (unit-test-instructions.md).
+  # The core crates.
   CORE_PACKAGES: >-
     -p paludarium-types -p paludarium-decoder -p paludarium-mmu
     -p paludarium-cpu -p paludarium-loader -p paludarium-vfs
@@ -116,7 +116,7 @@ jobs:
           rows = [json.loads(line) for line in pathlib.Path('target/windows/windows/uninstrumented/build.jsonl').read_text().splitlines()]
           binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_windows' and row.get('executable')]
           if len(binaries) != 1:
-              raise RuntimeError('expected exactly one uninstrumented U13 harness executable')
+              raise RuntimeError('expected exactly one uninstrumented Windows harness executable')
           flags = {name: os.environ.get(name) for name in ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_TARGET_DIR', 'RUSTC_WRAPPER', '__CARGO_LLVM_COV_RUSTC_WRAPPER', '__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS', '__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES')}
           if os.environ.get('CARGO_ENCODEDRUSTFLAGS') is not None:
               raise RuntimeError('misspelled encoded Rust flag variable')
@@ -142,7 +142,7 @@ jobs:
           rows = [json.loads(line) for line in pathlib.Path('target/windows/windows/build.jsonl').read_text().splitlines()]
           binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_windows' and row.get('executable')]
           if len(binaries) != 1:
-              raise RuntimeError('expected exactly one U13 harness executable')
+              raise RuntimeError('expected exactly one Windows harness executable')
           flags = {name: os.environ.get(name) for name in ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_TARGET_DIR', 'RUSTC_WRAPPER', '__CARGO_LLVM_COV_RUSTC_WRAPPER', '__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS', '__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES')}
           if os.environ.get('CARGO_ENCODEDRUSTFLAGS') is not None:
               raise RuntimeError('misspelled encoded Rust flag variable')
@@ -258,10 +258,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "26.12.0"
-      # rustup installs the toolchain pinned in rust-toolchain.toml (NFR9.1).
+      # rustup installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Unit tests (U1 crates)
+      - name: Unit tests (core crates)
         shell: bash
         run: |
           read -r -a packages <<< "$CORE_PACKAGES"
@@ -330,7 +330,7 @@ jobs:
           install_args: cargo-deny
           cache: false
       # Licenses compatible with Apache-2.0, crates.io only, RustSec,
-      # forbidden crates (NFR8.1, NFR8.4).
+      # forbidden crates.
       - run: cargo deny --locked check
 
   differential:
@@ -356,11 +356,10 @@ jobs:
           mkdir -p target/encodings-guests
           uname -a > target/encodings-guests/uname.txt
           lscpu > target/encodings-guests/cpu.txt
-      # Builds the guests from source (BR7.2), runs each natively and under
-      # the emulator, compares stdout/stderr/exit status (BR7.1) and prints
-      # the run times (NFR6.1).
+      # Builds the guests from source, runs each natively and under the
+      # emulator, compares stdout/stderr/exit status and prints the run times.
       - run: cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_jit -- --nocapture
-      - name: Retain fresh U3 architectural observations
+      - name: Retain fresh encodings architectural observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -398,7 +397,7 @@ jobs:
           mkdir -p target/encodings-guests
           uname -a > target/encodings-guests/uname.txt
           lscpu > target/encodings-guests/cpu.txt
-      - name: Generate fresh U3 native inputs before instrumented library tests
+      - name: Generate fresh encodings native inputs before instrumented library tests
         shell: bash
         run: |
           bash tests/guests/encodings/build.sh target/encodings-guests
@@ -426,7 +425,7 @@ jobs:
         with:
           install_args: aqua:taiki-e/cargo-llvm-cov
           cache: false
-      # NFR3.3: fails below 80% of lines. The floor is never lowered.
+      # Fails below 80% of lines. The floor is never lowered.
       - name: Workspace line coverage >= 80%
         run: |
           cargo llvm-cov clean --workspace
@@ -440,17 +439,17 @@ jobs:
           # Instrumented independent cases run serially; race cases still
           # launch their own host workers and retain the 30-second watchdog.
           RUST_TEST_THREADS: "1"
-      - name: U11 changed Rust components line coverage >= 80%
+      - name: Wasm changed Rust components line coverage >= 80%
         run: |
           cargo llvm-cov --locked -p paludarium-host -p paludarium-vfs -p paludarium-kernel -p paludarium-runtime -p paludarium-wasm --lib --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|jit)/' --fail-under-lines 80 --lcov --output-path target/wasm-coverage.lcov
-      - name: Retain U11 coverage observations
+      - name: Retain wasm coverage observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: wasm-coverage-lcov
           path: target/wasm-coverage.lcov
-      - name: U1 package line coverage >= 80%
-        # Keep the same U1 production file set; fresh architectural tests live
+      - name: Core package line coverage >= 80%
+        # Keep the same core production file set; fresh architectural tests live
         # in Harness and must execute when measuring the newly shared CPU code.
         run: |
           cargo llvm-cov clean --workspace
@@ -464,19 +463,19 @@ jobs:
         env:
           RUST_TEST_THREADS: "1"
 
-      - name: U9 target crates line coverage >= 80%
+      - name: Terminal target crates line coverage >= 80%
         run: |
           cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_terminal --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/' --fail-under-lines 80 --lcov --output-path target/terminal-coverage.lcov
           cargo llvm-cov report --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/'
         env:
           RUST_TEST_THREADS: "1"
-      - name: U3 CPU and Decoder line coverage >= 80%
+      - name: Encodings CPU and Decoder line coverage >= 80%
         run: |
           cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/' --fail-under-lines 80 --lcov --output-path target/encodings-coverage.lcov
           cargo llvm-cov report --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/'
         env:
           RUST_TEST_THREADS: "1"
-      - name: Retain U3 coverage observations
+      - name: Retain encodings coverage observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -490,7 +489,7 @@ jobs:
           name: encodings-coverage-native-observations
           path: target/encodings-guests/
           retention-days: 7
-      - name: Retain U9 coverage line observations
+      - name: Retain terminal coverage line observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -528,7 +527,7 @@ jobs:
           mkdir -p target/encodings-guests
           uname -a > target/encodings-guests/uname.txt
           lscpu > target/encodings-guests/cpu.txt
-      - name: Generate fresh U3 native inputs before instrumented library tests
+      - name: Generate fresh encodings native inputs before instrumented library tests
         shell: bash
         run: |
           bash tests/guests/encodings/build.sh target/encodings-guests
@@ -586,7 +585,7 @@ jobs:
         env:
           PALUDARIUM_JIT_CONTROL_WASM: target/jit-cost-profile/acceptance-control.wasm
         run: node --test packages/paludarium-wasm/tests/jit-control-distribution.test.mjs
-      - name: Fixed U14 Python coverage and fail-closed boundaries
+      - name: Fixed JIT Python coverage and fail-closed boundaries
         run: |
           mkdir -p target/jit
           python3 -B -m coverage run --data-file=target/jit/python.coverage --include='*/scripts/jit-run.py,*/scripts/build-jit-cost-profile.py,*/tests/guests/programs/build.py,*/tests/guests/programs/evidence.py' -m unittest discover -s tests/guests/jit/runner-tests -p 'test_*.py'

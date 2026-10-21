@@ -1,4 +1,4 @@
-// Input encodings measured by native U3 observer CI; no expected states.
+// Input encodings measured by the native encodings observer CI; no expected states.
 const NATIVE_ENCODINGS: &[&[u8]] = &[
     &[0x66, 0x0f, 0x58, 0xc1],
     &[0x0f, 0x58, 0xc1],

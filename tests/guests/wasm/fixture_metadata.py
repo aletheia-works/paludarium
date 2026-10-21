@@ -1,4 +1,4 @@
-"""U11 fixture metadata; inode identity is normalized by first path."""
+"""Wasm fixture metadata; inode identity is normalized by first path."""
 
 import base64
 import hashlib

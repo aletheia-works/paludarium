@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-# U1 spike (BR8.1, BR8.2): a stand-alone wasm module that two Workers share
+# Core emulator spike: a stand-alone wasm module that two Workers share
 # through a shared WebAssembly.Memory. It does not use the Host trait.
 # Build: spikes/wasm-threads/build.sh
 

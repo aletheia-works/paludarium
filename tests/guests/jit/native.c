@@ -12,7 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* Native x86-64 observations precede U14 translation. Arithmetic flag masks
+/* Native x86-64 observations precede JIT translation. Arithmetic flag masks
  * exclude undefined/reserved bits; MOV/SSE/RET do not define arithmetic flags. */
 struct instruction_case {
     const char *name;

@@ -3,7 +3,7 @@
 //! A [`Session`] places the configured files in the virtual file system,
 //! loads the program, and runs the thread loop (W2, W3): the CPU runs for a
 //! budget of instructions, the kernel handles each stop, and between budget
-//! slices the loop checks whether [`Session::kill`] was requested (BR4.3).
+//! slices the loop checks whether [`Session::kill`] was requested.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -23,19 +23,19 @@ use paludarium_types::{Error, ErrorKind, ExitReason, ExitStatus};
 use paludarium_vfs::{GuestFile, HostFs, MemFs, MountedFs};
 use workers::Execution;
 
-/// Instructions run between two checks of the kill request (BR4.3,
-/// entities.md SessionConfig: internal, default 100000).
+/// Instructions run between two checks of the kill request
+/// (entities.md SessionConfig: internal, default 100000).
 pub const DEFAULT_BUDGET: u64 = 100_000;
 
-/// A host directory shown to the guest (`--mount`). Implemented in U7; U1
-/// accepts only an empty list.
+/// A host directory shown to the guest (`--mount`). Implemented by the files
+/// support; the core emulator accepts only an empty list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mount {
     pub host: PathBuf,
     pub guest: Vec<u8>,
 }
 
-/// Terminal size given to the guest. Used from U9.
+/// Terminal size given to the guest. Used by the terminal support.
 /// ```compile_fail
 /// use paludarium_runtime::TerminalInfo;
 /// let _ = TerminalInfo { columns: 80, rows: 24 };
@@ -142,7 +142,7 @@ impl Session {
         self.accelerated = true;
         self
     }
-    /// Validates the configuration. Mounts are not implemented in U1.
+    /// Validates the configuration. Mounts are not implemented in the core emulator.
     pub fn new(config: Config, host: Arc<dyn Host>) -> Result<Self, Error> {
         if let Some(cwd) = &config.cwd
             && (!cwd.starts_with(b"/") || paludarium_vfs::normalize_path(cwd).is_err())
@@ -213,14 +213,13 @@ impl Session {
         self
     }
 
-    /// Requests the guest to stop; it ends with SIGKILL at the next budget
-    /// boundary (BR4.3).
+    /// Requests the guest to stop; it ends with SIGKILL at the next budget boundary.
     pub fn kill(&self) {
         self.kill_requested.store(true, Ordering::SeqCst);
         self.signal_inbox.interrupt();
     }
 
-    /// Sends a Linux signal to the single guest process (U4).
+    /// Sends a Linux signal to the single guest process.
     pub fn signal(&self, number: i32) -> Result<(), paludarium_types::Errno> {
         self.signal_inbox.send(number)
     }

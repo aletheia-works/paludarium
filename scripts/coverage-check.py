@@ -1,4 +1,4 @@
-"""Fail-closed dedicated U9 evidence aggregation. Never runs a test or guest."""
+"""Fail-closed dedicated terminal evidence aggregation. Never runs a test or guest."""
 
 import argparse
 import hashlib
@@ -91,7 +91,7 @@ def parse_lcov(raw, prefix):
 
 
 def validate(lcov_raw, scope, evidence, root=ROOT, evidence_root=ROOT):
-    need(scope == json.loads(read(SCOPE)), "fixed U9 scope changed")
+    need(scope == json.loads(read(SCOPE)), "fixed terminal scope changed")
     need(
         evidence["schema"] == 1 and re.fullmatch(r"[0-9a-f]{40}", evidence["head"]),
         "invalid evidence head",
@@ -195,7 +195,7 @@ def validate(lcov_raw, scope, evidence, root=ROOT, evidence_root=ROOT):
         "exports use different binary/profile",
     )
     rows = parse_lcov(lcov_raw, prefix)
-    need(set(rows) == set(paths), "missing or extra U9 SF")
+    need(set(rows) == set(paths), "missing or extra terminal SF")
     exported = json.loads(raw["json"])
     need(
         exported["type"] == "llvm.coverage.json.export" and len(exported["data"]) == 1,
@@ -243,7 +243,7 @@ def validate(lcov_raw, scope, evidence, root=ROOT, evidence_root=ROOT):
         result[group] = dict(
             hit=hit, lines=total, percent=100 * hit / total, passed=hit / total >= 0.8
         )
-    need(all(r["passed"] for r in result.values()), "one U9 group below fixed80 floor")
+    need(all(r["passed"] for r in result.values()), "one terminal group below fixed80 floor")
     return dict(
         schema=1,
         head=evidence["head"],

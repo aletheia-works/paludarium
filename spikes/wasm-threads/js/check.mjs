@@ -1,4 +1,4 @@
-// The wasm thread check itself (BR8.1), shared by the Node.js and browser
+// The wasm thread check itself, shared by the Node.js and browser
 // runners. Two Workers instantiate the same module with one shared
 // WebAssembly.Memory; Worker A waits on the shared word with
 // memory.atomic.wait32, Worker B stores 42 and notifies. The check passes

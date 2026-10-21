@@ -1,4 +1,4 @@
-//! U2 native expectations are generated on every execution.
+//! Instruction-form native expectations are generated on every execution.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[path = "support/instructions.rs"]

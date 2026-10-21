@@ -1,4 +1,4 @@
-# cargo-deny configuration (NFR8.1, NFR8.4).
+# cargo-deny configuration.
 # Run: cargo deny --locked check
 
 [graph]
@@ -33,15 +33,15 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 # Blink-derived projects with a known malware history must never be used,
-# directly or transitively (project.md Forbidden, NFR8.4).
+# directly or transitively.
 deny = [
-  { name = "webix", reason = "Blink-based webix lineage is forbidden (NFR8.4)" },
-  { name = "portabox", reason = "Blink-based portabox lineage is forbidden (NFR8.4)" },
-  { name = "lanmower-blink", reason = "lanmower/blink fork is forbidden (NFR8.4)" },
+  { name = "webix", reason = "Blink-based webix lineage is forbidden" },
+  { name = "portabox", reason = "Blink-based portabox lineage is forbidden" },
+  { name = "lanmower-blink", reason = "lanmower/blink fork is forbidden" },
 ]
 
 [sources]
-# Dependencies come from crates.io only (project.md Mandated, NFR8.1).
+# Dependencies come from crates.io only.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

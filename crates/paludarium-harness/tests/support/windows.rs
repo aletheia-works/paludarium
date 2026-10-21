@@ -47,7 +47,7 @@ fn fixture_files(config: &mut Config, directory: &Path, guest: &str) {
             let mode = fixture_mode(&entry.path());
             assert_eq!(
                 mode, 0o644,
-                "U13 fixture permissions must match native 0644"
+                "Windows host fixture permissions must match native 0644"
             );
             *config = std::mem::take(config).with_file_mode(
                 path,

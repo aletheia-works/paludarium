@@ -18,9 +18,9 @@ def validate(report):
         or report.get("passed") is not True
         or report.get("caseCount") != 28
     ):
-        raise ValueError("U14 suite incomplete or failed")
+        raise ValueError("JIT suite incomplete or failed")
     if set(report.get("rows", {})) != {"interpreter", "jit"}:
-        raise ValueError("U14 execution mode inventory changed")
+        raise ValueError("JIT execution mode inventory changed")
     expected = [
         "probe-" + name
         for name in (
@@ -39,7 +39,7 @@ def validate(report):
     for mode in ("interpreter", "jit"):
         rows = report.get("rows", {}).get(mode, {})
         if list(rows) != expected:
-            raise ValueError("U14 case inventory changed")
+            raise ValueError("JIT case inventory changed")
         for row in rows.values():
             seconds = row.get("seconds")
             if (
@@ -52,7 +52,7 @@ def validate(report):
                 or not isinstance(row.get("errors"), list)
                 or row.get("errors")
             ):
-                raise ValueError("U14 guest failure or deadline")
+                raise ValueError("JIT guest failure or deadline")
             if mode == "jit":
                 for key in ("executedBlocks", "executedInstructions"):
                     value = row.get("jit", {}).get(key)
@@ -62,7 +62,7 @@ def validate(report):
                         or not value.isdecimal()
                         or int(value) <= 0
                     ):
-                        raise ValueError("U14 real translation execution missing")
+                        raise ValueError("JIT real translation execution missing")
 
 
 def main():
@@ -90,7 +90,7 @@ def main():
     print(result["stdout"])
     print(result["stderr"], file=sys.stderr)
     if result["exit"] != 0 or result["timed_out"] or not result["process_group_cleaned"]:
-        raise RuntimeError("U14 supervised acceptance failed; partial rows retained")
+        raise RuntimeError("JIT supervised acceptance failed; partial rows retained")
     validate(json.loads((args.output / "observations.json").read_text()))
 
 

@@ -1,4 +1,4 @@
-//! Native-generated U6 expectations, using the process-group watchdog runner.
+//! Native-generated events expectations, using the process-group watchdog runner.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::{path::PathBuf, process::Command, sync::OnceLock};
@@ -38,7 +38,7 @@ fn case(id: usize) {
             .status()
             .unwrap()
             .success(),
-        "U6 native/emulator case {id}"
+        "events native/emulator case {id}"
     );
 }
 macro_rules! cases { ($($name:ident => $id:literal),* $(,)?) => {$(

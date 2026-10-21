@@ -18,7 +18,7 @@ async function stopDriver(driver) {
   try { await stopped; } finally { clearTimeout(force); }
 }
 
-// The one safaridriver failure that is retried (NFR7): on a fresh macOS runner, session creation can fail while
+// The one safaridriver failure that is retried: on a fresh macOS runner, session creation can fail while
 // safaridriver waits for its first Safari launch, e.g. run 39114110570 attempt 1:
 // {"error":"session not created","message":"Could not create a session: The session timed out while connecting to a Safari instance. ..."}
 export function isSafariLaunchTimeout(error) {

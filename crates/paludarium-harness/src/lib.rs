@@ -2,9 +2,9 @@
 //!
 //! A guest program is run natively on x86-64 Linux and under the emulator;
 //! standard output, standard error and the exit status must match byte for
-//! byte (BR7.1, NFR1.1). The expected result is always produced by the
-//! native run at test time, never stored (team.md Testing Posture, Q6).
-//! Each run has a 30-second limit (NFR7.1).
+//! byte. The expected result is always produced by the native run at test
+//! time, never stored (team.md Testing Posture, Q6).
+//! Each run has a 30-second limit.
 //!
 //! This crate is test tooling: unlike the emulator crates it uses
 //! `std::process`, `std::thread` and `std::time` directly.
@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use paludarium::testing::RecordingHost;
 use paludarium::{Config, ExitReason, ExitStatus, Session};
 
-/// Time limit of one run (NFR7.1).
+/// Time limit of one run.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Which toolchain builds a guest (entities.md DiffTestCase.guestSource).
@@ -31,8 +31,8 @@ pub enum GuestSource {
     RustMusl,
 }
 
-/// One differential test (entities.md DiffTestCase). U1 compares stdout,
-/// stderr and the exit status for every case.
+/// One differential test (entities.md DiffTestCase). The core tests compare
+/// stdout, stderr and the exit status for every case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffTestCase {
     pub name: &'static str,
@@ -70,8 +70,8 @@ pub fn guest_dir() -> PathBuf {
     )
 }
 
-/// Builds the guests once per test process with `tests/guests/build.sh`
-/// (BR7.2) and returns the guest directory.
+/// Builds the guests once per test process with `tests/guests/build.sh` and
+/// returns the guest directory.
 pub fn ensure_guests_built() -> Result<PathBuf, String> {
     static BUILT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     BUILT
@@ -163,7 +163,7 @@ pub fn run_native(program: &Path, argv0: &str, args: &[String]) -> Result<Outcom
 }
 
 /// Runs `program` under paludarium, placed at `/<file name>` like the
-/// command does (BR5.4). Returns the outcome and the stop that ended the
+/// command does. Returns the outcome and the stop that ended the
 /// guest when it died of an exception (for diagnostics).
 pub fn run_emulated(
     program: &Path,
@@ -238,7 +238,7 @@ fn first_difference(a: &[u8], b: &[u8]) -> String {
     )
 }
 
-/// Compares two outcomes byte for byte (BR7.1); the error describes the
+/// Compares two outcomes byte for byte; the error describes the
 /// first mismatch.
 pub fn compare(native: &Outcome, emulated: &Outcome) -> Result<(), String> {
     let mut problems = Vec::new();

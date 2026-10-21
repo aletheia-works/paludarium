@@ -21,7 +21,7 @@ pub(crate) struct WakeReceipt {
     pub interrupted: bool,
 }
 impl SignalInbox {
-    /// Queues a signal for the single guest process (U4).
+    /// Queues a signal for the single guest process.
     pub fn send(&self, number: i32) -> Result<(), Errno> {
         self.send_pending(signals::PendingSignal::user(number, 0))
     }

@@ -1,9 +1,9 @@
 # Release evidence, dispatched by scripts/release/evidence.py (docs/release.md):
 # the macOS host compared with a fresh native Linux oracle (macos-oracle, then
-# macos-host) and the U12 fuzz targets. The checks every pull request runs
+# macos-host) and the macOS fuzz targets. The checks every pull request runs
 # (unit tests, lint, dependencies, differential tests, coverage, production
 # wasm) live in ci.yml and are not repeated here. Actions are pinned by commit
-# SHA and the default token is read-only (NFR8.2).
+# SHA and the default token is read-only.
 name: macOS host and fuzz
 
 on:
@@ -67,7 +67,7 @@ jobs:
           rows = [json.loads(line) for line in pathlib.Path('target/macos/macos/build.jsonl').read_text().splitlines()]
           binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_macos' and row.get('executable')]
           if len(binaries) != 1:
-              raise RuntimeError('expected exactly one U12 harness executable')
+              raise RuntimeError('expected exactly one macOS harness executable')
           subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/macos-python.coverage', '--include=tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py', 'scripts/macos-run.py', '--guest-dir', 'target/guests/programs', '--native', 'target/macos/native/observations.json', '--output', 'target/macos/macos/comparison', '--emulator', binaries[0]], check=True)
           subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/macos-python.coverage', '--include=tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py', 'scripts/macos-run.py', '--original-argv', '--guest-dir', 'target/guests/programs', '--native', 'target/macos/native-original/observations.json', '--output', 'target/macos/macos/comparison-original', '--emulator', binaries[0]], check=True)
           PY

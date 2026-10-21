@@ -47,7 +47,7 @@ fn windows_native_thread_join_visibility() {
 #[test]
 fn windows_native_thread_panic_linux_errno() {
     assert_eq!(
-        threads::spawn(Box::new(|| panic!("U13 controlled panic")))
+        threads::spawn(Box::new(|| panic!("Windows controlled panic")))
             .unwrap()
             .join(),
         Err(Errno::EIO)
@@ -190,7 +190,7 @@ fn windows_fs_io_metadata() {
     options.read(true);
     let plain = capability.open_with("filedep", &options).map(|_| ());
     eprintln!(
-        "U13 directory plain open: {:?}",
+        "Windows directory plain open: {:?}",
         plain
             .as_ref()
             .map_err(|error| (error.kind(), error.raw_os_error()))
@@ -199,7 +199,7 @@ fn windows_fs_io_metadata() {
     options.maybe_dir(true);
     let capable = capability.open_with("filedep", &options).map(|_| ());
     eprintln!(
-        "U13 directory maybe_dir open: {:?}",
+        "Windows directory maybe_dir open: {:?}",
         capable
             .as_ref()
             .map_err(|error| (error.kind(), error.raw_os_error()))
@@ -207,7 +207,7 @@ fn windows_fs_io_metadata() {
     capable.unwrap();
     for flags in [65536, 65536 | 524288 | 2048] {
         let opened = x.fs().open(b"filedep", flags, 0).map(|_| ());
-        eprintln!("U13 directory Host open flags={flags}: {opened:?}");
+        eprintln!("Windows directory Host open flags={flags}: {opened:?}");
         opened.unwrap();
     }
     assert!(matches!(x.fs().open(b"io", 65536, 0), Err(Errno::ENOTDIR)));
@@ -246,28 +246,28 @@ fn windows_fs_symlink_hardlink() {
     x.fs().symlink(b"dependency", b"dependency-link").unwrap();
     let linked = x.root.join("root/dependency-link");
     eprintln!(
-        "U13 directory symlink std metadata: {:?}",
+        "Windows directory symlink std metadata: {:?}",
         std::fs::metadata(&linked)
     );
     eprintln!(
-        "U13 directory symlink std read_dir: {:?}",
+        "Windows directory symlink std read_dir: {:?}",
         std::fs::read_dir(&linked).map(|_| ())
     );
     eprintln!(
-        "U13 directory symlink canonicalize: {:?}",
+        "Windows directory symlink canonicalize: {:?}",
         std::fs::canonicalize(&linked)
     );
     eprintln!(
-        "U13 directory symlink Host metadata: {:?}",
+        "Windows directory symlink Host metadata: {:?}",
         x.fs().metadata(b"dependency-link", true)
     );
     eprintln!(
-        "U13 directory symlink Host read_dir: {:?}",
+        "Windows directory symlink Host read_dir: {:?}",
         x.fs().read_dir(b"dependency-link")
     );
     let read = x.fs().open(b"dependency-link/package.json", 0, 0);
     eprintln!(
-        "U13 directory symlink Host nested open: {:?}",
+        "Windows directory symlink Host nested open: {:?}",
         read.as_ref().map(|_| ())
     );
     let mut bytes = [0; 19];
@@ -298,7 +298,7 @@ fn windows_fs_symlink_hardlink() {
     for name in symlinks {
         let inode = x.fs().metadata(name, false).unwrap().inode;
         eprintln!(
-            "U13 symlink Host inode {}: {inode}",
+            "Windows symlink Host inode {}: {inode}",
             String::from_utf8_lossy(name)
         );
         assert!(
@@ -319,7 +319,7 @@ fn windows_fs_symlink_hardlink() {
                 .unwrap()
                 .file_index();
             eprintln!(
-                "U13 symlink Windows file_index {}: {raw:?}",
+                "Windows symlink Windows file_index {}: {raw:?}",
                 String::from_utf8_lossy(name)
             );
             assert_eq!(Some(inode), raw);

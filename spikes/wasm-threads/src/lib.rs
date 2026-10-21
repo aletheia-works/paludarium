@@ -1,4 +1,4 @@
-//! wasm thread spike (U1, BR8.1): wait on an address in shared memory in
+//! wasm thread spike: wait on an address in shared memory in
 //! one Worker and wake it from another.
 //!
 //! The exported functions only touch the shared flag and never use the

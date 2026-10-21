@@ -296,7 +296,7 @@ BODY = """Release Please calculated this version from Conventional Commits.
 
 ### Bug Fixes
 
-* **harness:** run ignored U3 tests in the bounded child
+* **harness:** run ignored encodings tests in the bounded child
 
 ---
 This PR was generated with [Release Please](https://github.com/googleapis/release-please).
@@ -353,7 +353,7 @@ class ReleaseNotes(unittest.TestCase):
     def test_section_with_a_compare_link_stops_at_the_footer(self):
         self.assertEqual(
             E.release_notes(BODY, "0.1.1"),
-            "### Bug Fixes\n\n* **harness:** run ignored U3 tests in the bounded child\n",
+            "### Bug Fixes\n\n* **harness:** run ignored encodings tests in the bounded child\n",
         )
 
     def test_first_release_section_without_a_link(self):

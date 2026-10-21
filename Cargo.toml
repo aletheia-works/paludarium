@@ -50,8 +50,8 @@ unwrap_used = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
 # The emulator runs whole guest programs in tests; unoptimised code is too
-# slow for the 30-second differential-test limit (NFR7.1), so dev/test
-# builds are optimised while keeping debug assertions and overflow checks.
+# slow for the 30-second differential-test limit, so dev/test builds are
+# optimised while keeping debug assertions and overflow checks.
 [profile.dev]
 opt-level = 1
 

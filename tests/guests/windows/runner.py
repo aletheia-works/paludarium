@@ -1,4 +1,4 @@
-"""U13の30秒supervisor。Windowsのjobと既存Unix process groupを分ける。"""
+"""Windows hostの30秒supervisor。Windowsのjobと既存Unix process groupを分ける。"""
 
 import importlib.util
 import math

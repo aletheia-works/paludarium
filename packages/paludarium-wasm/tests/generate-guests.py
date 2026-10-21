@@ -13,7 +13,7 @@ CODES = {
     "infinite": "ebfe",
 }
 
-# U3 instruction forms execute through the production Session/launcher. These
+# Encodings instruction forms execute through the production Session/launcher. These
 # bytes are inputs only; native output and signal expectations are regenerated.
 ENCODINGS_OPS = {
     "encodings-packed": "660f3804c1",  # PMADDUBSW: signed saturation and lane pairing

@@ -153,12 +153,12 @@ fn runtime_environment_reaches_stack() {
     mov(&mut code, 0xb8, 60);
     mov(&mut code, 0xbf, 0);
     code.extend([0x0f, 0x05]);
-    let config = Config::new("/prog", vec![b"u9".to_vec()])
-        .with_env("U9", "test")
+    let config = Config::new("/prog", vec![b"tt".to_vec()])
+        .with_env("TT", "test")
         .with_file("/prog", tiny_exec(&code, b""));
     assert_eq!(
         Session::new(config, host.clone()).unwrap().run(),
         Ok(ExitStatus::Exited(0))
     );
-    assert_eq!(host.stdout(), b"U9=test");
+    assert_eq!(host.stdout(), b"TT=test");
 }

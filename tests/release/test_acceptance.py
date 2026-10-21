@@ -307,7 +307,7 @@ class AcceptanceTests(unittest.TestCase):
                 "performance/observations.json",
                 lambda d: d.update(head=OTHER),
             )
-            self.rejected("FR8.3 not met by performance")
+            self.rejected("performance not met by performance")
 
     def test_other_repository(self):
         with self.subTest("fork pull request run is not official"):
@@ -335,7 +335,7 @@ class AcceptanceTests(unittest.TestCase):
             document["result"]["pass"] = False
 
         self.world.edit(A.FULL_QUALITY, "wasm-node", "performance/observations.json", failed)
-        self.rejected("FR8.3 not met by performance")
+        self.rejected("performance not met by performance")
 
     def test_duplicate_purpose_runs(self):
         second = dict(copy.deepcopy(self.world.runs[A.CI]), id=999, event="workflow_dispatch")
@@ -361,7 +361,7 @@ class AcceptanceTests(unittest.TestCase):
         self.world.edit(
             A.FULL_QUALITY, "windows-host", "windows/comparison/observations.json", fail
         )
-        self.rejected("FR6.3 not met by windows-native")
+        self.rejected("probe not met by windows-native")
 
     def test_jit_mode_failure(self):
         self.world.edit(
@@ -370,7 +370,7 @@ class AcceptanceTests(unittest.TestCase):
             "observations.json",
             lambda d: d["modes"]["jit"].update(passed=False),
         )
-        self.rejected("FR8.2 not met by wasm-firefox")
+        self.rejected("wasm-modes not met by wasm-firefox")
 
     def test_guest_bytes_differ_from_oracle(self):
         self.world.edit(

@@ -90,7 +90,7 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          # A fresh runner launches Safari for the first time here, so safaridriver does not wait for that first launch (NFR7).
+          # A fresh runner launches Safari for the first time here, so safaridriver does not wait for that first launch.
           bounded() { perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }
           bounded 30 open -a Safari; echo "warm-up: open -a Safari exit=$?"
           sleep 10

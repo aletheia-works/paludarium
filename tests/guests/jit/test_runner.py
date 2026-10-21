@@ -1,4 +1,4 @@
-"""Fail-closed U14 acceptance report regression cases."""
+"""Fail-closed JIT acceptance report regression cases."""
 
 import copy
 import importlib.util

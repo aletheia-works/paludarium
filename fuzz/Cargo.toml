@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-# Fuzz targets (NFR2.2, BR9.1). Run with the pinned nightly:
+# Fuzz targets. Run with the pinned nightly:
 #   cargo fuzz run <target> -- -max_total_time=600
 [package.metadata]
 cargo-fuzz = true

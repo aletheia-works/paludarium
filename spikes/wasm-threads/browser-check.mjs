@@ -1,4 +1,4 @@
-// Browser runner of the wasm thread check (BR8.1). Serves the page with
+// Browser runner of the wasm thread check. Serves the page with
 // COOP/COEP, opens it in the requested browsers and prints one
 // WasmThreadReport (JSON) per browser. Exits 1 if any browser fails.
 //

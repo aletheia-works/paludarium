@@ -2,7 +2,7 @@
   "name": "paludarium-wasm-threads-spike",
   "private": true,
   "type": "module",
-  "description": "U1 spike: wasm wait/notify across two Workers sharing memory (BR8.1)",
+  "description": "Core emulator spike: wasm wait/notify across two Workers sharing memory",
   "license": "Apache-2.0",
   "scripts": {
     "build": "bash build.sh",

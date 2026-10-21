@@ -12,7 +12,7 @@ pub fn bounded(name: &str, run: impl FnOnce()) {
         .env("PALUDARIUM_SIGNALS_TIME_CHILD", name)
         .stdin(Stdio::null())
         .spawn()
-        .expect("isolated U4 test");
+        .expect("isolated signals/time test");
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait().expect("poll child") {

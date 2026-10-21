@@ -3,10 +3,9 @@
 //! The kernel owns the process and thread state (ADR-002). It receives the
 //! CPU's [`ExitReason`] and decides what happens next: system calls are
 //! dispatched by number through an explicit table and unknown numbers return
-//! `-ENOSYS`; nothing is ever passed through to the host by number
-//! (BR3.1, BR3.2, NFR4.1). Guest exceptions end the process with the
-//! matching signal; U1 records signal registrations but never delivers
-//! signals (BR4.5).
+//! `-ENOSYS`; nothing is ever passed through to the host by number. Guest
+//! exceptions end the process with the matching signal; the core emulator
+//! records signal registrations but never delivers signals.
 #![forbid(unsafe_code)]
 
 mod inbox;
@@ -70,7 +69,7 @@ impl Thread {
 }
 
 /// A registered signal action (`struct k_sigaction` on x86-64). Recorded
-/// only; U1 does not deliver signals (BR4.5).
+/// only; the core emulator does not deliver signals.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SignalAction {
     pub handler: u64,
@@ -141,7 +140,7 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    /// Creates a kernel that performs host I/O through `host` (BR6.1).
+    /// Creates a kernel that performs host I/O through `host`.
     pub fn new(host: Arc<dyn Host>) -> Self {
         let files = files::Files::with_host(Arc::clone(&host));
         let group = Arc::new(ThreadGroup::default());

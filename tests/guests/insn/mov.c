@@ -1,4 +1,4 @@
-/* Data movement and control transfer: mov (all U1 forms), movabs, movsx,
+/* Data movement and control transfer: mov (all core forms), movabs, movsx,
  * movsxd, movzx, cdqe, lea, xchg, push/pop, call/jmp (direct, register,
  * memory), ret, and the nop forms (multi-byte, cs-prefixed, xchg ax,ax,
  * endbr64). None of these change flags; flags are printed to prove it. */

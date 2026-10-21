@@ -7,7 +7,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends musl-tools binutils strace gdb \
  && rm -rf /var/lib/apt/lists/*
 
-# Same pinned nightly as rust-toolchain.toml (NFR9.1).
+# Same pinned nightly as rust-toolchain.toml.
 ARG TOOLCHAIN=nightly-2026-10-10
 RUN rustup toolchain install "$TOOLCHAIN" --profile minimal \
       --component rustfmt,clippy,llvm-tools,rust-src \

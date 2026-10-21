@@ -1,4 +1,4 @@
-"""U12 fixed comparison contract regressions; fixtures stay immutable."""
+"""macOS fixed comparison contract regressions; fixtures stay immutable."""
 
 import copy
 import json

@@ -1,5 +1,5 @@
 /*
- * Common helpers for the per-instruction differential-test guests (NFR1.2).
+ * Common helpers for the per-instruction differential-test guests.
  *
  * Each guest is built with -nostdlib (no libc): it provides its own _start,
  * runs one instruction family on fixed inputs and prints the resulting

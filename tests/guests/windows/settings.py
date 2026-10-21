@@ -1,4 +1,4 @@
-"""Frozen U10 inventory, with the approved append-only comparison reporter."""
+"""Frozen fixed guest programs inventory, with the approved append-only comparison reporter."""
 
 import json
 
@@ -21,7 +21,7 @@ def configuration(root, *, original=False):
         or config["deadline_seconds"] != 30
         or tuple(config["probe"]) != PROBE_ITEMS
     ):
-        raise ValueError("fixed U13 inventory/deadline changed")
+        raise ValueError("fixed Windows inventory/deadline changed")
     expected = [
         ("version", ["--version"]),
         ("install", ["install"]),

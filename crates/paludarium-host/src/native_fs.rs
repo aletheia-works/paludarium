@@ -729,7 +729,7 @@ mod files_tests {
                     if start.elapsed() > std::time::Duration::from_secs(30) {
                         child.kill().unwrap();
                         child.wait().unwrap();
-                        panic!("U7 race exceeded 30 seconds")
+                        panic!("files race exceeded 30 seconds")
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }

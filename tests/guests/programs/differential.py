@@ -173,7 +173,7 @@ def differential(executable, *, original_argv=False):
             )
         observations["differential_complete"] = True
         (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
-    print("U10 differential: eight probe items and four aube commands passed")
+    print("fixed guest programs differential: eight probe items and four aube commands passed")
 
 
 if __name__ == "__main__":

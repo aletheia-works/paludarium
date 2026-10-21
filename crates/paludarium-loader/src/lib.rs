@@ -3,8 +3,8 @@
 //! Loads static x86-64 executables (`ET_EXEC`, and `ET_DYN` static-pie
 //! without an interpreter) into a guest address space and builds the initial
 //! stack with argc, argv, envp and the auxiliary vector exactly as Linux lays
-//! them out (BR1.1–BR1.4). Static-pie images relocate themselves (musl's
-//! start code), so the loader does not apply relocations.
+//! them out. Static-pie images relocate themselves (musl's start code), so
+//! the loader does not apply relocations.
 #![forbid(unsafe_code)]
 
 pub mod elf;
@@ -16,13 +16,13 @@ use paludarium_vfs::FileSystem;
 
 pub use elf::{ElfInfo, MAX_LOAD_SIZE, ProgramHeader, parse};
 
-/// Load base of static-pie (`ET_DYN`) programs (BR1.4).
+/// Load base of static-pie (`ET_DYN`) programs.
 pub const STATIC_PIE_BASE: u64 = 0x5555_5555_4000;
 
 /// Exclusive top of the initial stack.
 pub const STACK_TOP: u64 = 0x7fff_ffff_f000;
 
-/// Size of the initial stack mapping: 8 MiB (BR1.3).
+/// Size of the initial stack mapping: 8 MiB.
 pub const STACK_SIZE: u64 = 8 << 20;
 
 /// Lowest address a segment may occupy (Linux `mmap_min_addr`).
@@ -32,7 +32,7 @@ pub const MIN_SEGMENT_ADDR: u64 = 0x10000;
 /// stack, as Linux does.
 pub const MAX_ARG_BYTES: u64 = STACK_SIZE / 4;
 
-/// Values of the auxiliary vector entries the loader writes (BR1.3).
+/// Values of the auxiliary vector entries the loader writes.
 pub mod auxv {
     pub const AT_NULL: u64 = 0;
     pub const AT_PHDR: u64 = 3;
@@ -119,8 +119,8 @@ fn prot_of(flags: u32) -> Prot {
     prot
 }
 
-/// Places the `PT_LOAD` segments (BR1.2, BR1.4). Returns the load base and
-/// the end of the highest segment.
+/// Places the `PT_LOAD` segments. Returns the load base and the end of the
+/// highest segment.
 fn map_segments(
     bytes: &[u8],
     info: &ElfInfo,
@@ -206,8 +206,8 @@ impl StackWriter<'_> {
     }
 }
 
-/// Builds the initial stack (BR1.3). Returns the 16-byte aligned stack
-/// pointer, which points at argc.
+/// Builds the initial stack. Returns the 16-byte aligned stack pointer,
+/// which points at argc.
 fn build_stack(
     mem: &mut AddressSpace,
     start: &StartInfo<'_>,

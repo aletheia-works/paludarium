@@ -1,4 +1,4 @@
-# U5 native-first 比較
+# threads native-first 比較
 
 各 native x86-64 Linux CI 実行で oracle を生成する。`threads.c` は libc に依存せず、観測値を little-endian signed 64-bit で出力する。stdout、stderr、終了ステータス、定義されたメモリ観測値を完全一致で比較する。TID 数値は出力せず、clone 戻り値、parent TID、child TID、gettid の一致関係へ正規化する。アドレス、時刻の生値、スケジューラの実行順序は比較しない。既存WAKEケースはwaiter登録まで繰り返す。追加signal/timerケースは親のready flag後に子を50ms（timeoutケース150ms）遅延させる有限guestで、Host待機登録の正確な同期は内部部品テストで別に検証する。
 

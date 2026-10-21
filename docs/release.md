@@ -48,7 +48,7 @@ corrupt Wasm. A mock upload test is not a registry or OIDC test.
 It measures the fixed policy/package/check/acceptance file population (four
 files), each at least 80%, including the actual package path (validate and
 package-check are appended to the unit-test coverage data). Existing
-Rust/JS/workspace/U9 floors remain unchanged. A branch-only workflow may need
+Rust/JS/workspace/terminal floors remain unchanged. A branch-only workflow may need
 a PR and owner Actions approval before GitHub allows it to run; dispatch
 registration is not assumed.
 
@@ -65,7 +65,7 @@ must be exactly one such run, and it must be completed and successful: none,
 two or more, unfinished or failed runs stop the producer. Every listed job
 must exist once and have succeeded at that head. Job names below were read
 from the current workflow files and checked against saved job listings and
-artifacts (U14 runs 38840433942 and 38897611874, macOS run 38996219364);
+artifacts (JIT runs 38840433942 and 38897611874, macOS run 38996219364);
 the producer re-checks them on the live run and fails loudly if GitHub
 names them differently.
 
@@ -78,7 +78,7 @@ names them differently.
 | `dependencies` | `ci.yml` | `dependencies` |
 | `linux-differential` | `ci.yml` | `differential tests (x86-64 Linux)`, `fixed guest programs / differential` |
 | `rust-coverage` | `ci.yml` | `line coverage >= 80%` |
-| `terminal-coverage` | `ci.yml` | `line coverage >= 80%` (its step `U9 target crates line coverage >= 80%` fails under 80%) |
+| `terminal-coverage` | `ci.yml` | `line coverage >= 80%` (its step `Terminal target crates line coverage >= 80%` fails under 80%) |
 | `js-coverage` | `quality.yml` (dispatch on main) | `wasm-programs / differential (ubuntu-latest, node)` (its step `Fixed production JavaScript coverage` fails under 80%) |
 | `package-check` | `release-check.yml` (dispatch on main) | `packages` |
 
@@ -99,10 +99,10 @@ built guests differ by design.
 
 | Condition | Sources | What is checked in the artifact content |
 |---|---|---|
-| FR6.3 | all native and Wasm sources (Wasm interpreter mode) | every probe row exits 0 and prints exactly its `PASS <item>` line; `probe-all` prints all eight; `probe-environment` starts with `PASS` |
-| FR7.2 | same | the four aube commands have the oracle's exit codes and the same `--version` stdout; the job's own runner compares full stdout/exit and fails the job on a difference |
-| FR8.2 | the four Wasm sources | `complete` and `passed`, 28 cases, both `interpreter` and `jit` modes complete and passed, every row `pass: true`, probe and aube checks above in both modes |
-| FR8.3 | performance | `head` equals the released head, `complete`, `passed`, `warmupsPassed`, `result.pass`, `p < 0.05`, mean JIT time below mean interpreter time, 20 rows all exit 0 and passed |
+| Probe | all native and Wasm sources (Wasm interpreter mode) | every probe row exits 0 and prints exactly its `PASS <item>` line; `probe-all` prints all eight; `probe-environment` starts with `PASS` |
+| aube | same | the four aube commands have the oracle's exit codes and the same `--version` stdout; the job's own runner compares full stdout/exit and fails the job on a difference |
+| Wasm modes | the four Wasm sources | `complete` and `passed`, 28 cases, both `interpreter` and `jit` modes complete and passed, every row `pass: true`, probe and aube checks above in both modes |
+| Performance | performance | `head` equals the released head, `complete`, `passed`, `warmupsPassed`, `result.pass`, `p < 0.05`, mean JIT time below mean interpreter time, 20 rows all exit 0 and passed |
 
 Shared checks: all native documents are complete (`differential_complete`,
 `native_complete`), each artifact is unexpired, belongs to the selected run
@@ -113,11 +113,14 @@ oracle and probe. `artifact_sha256` of each condition is the SHA-256 of the
 sorted `[source, artifact, artifact id, official digest]` list it was checked
 against; the document also keeps every member's SHA-256.
 
-The FR8.3 step in `quality.yml` runs only on `workflow_dispatch` and has
-`continue-on-error: true`, so a successful run does not mean FR8.3 passed:
-only `performance/observations.json` decides. It is measured once per head;
-dispatching again to wait for a pass is not allowed (a second run is also
-rejected as ambiguous). Most source artifacts are kept for 7 days
+`release-evidence.json` records the four conditions as `probe`, `aube`,
+`wasm-modes` and `performance`.
+
+The performance step in `quality.yml` runs only on `workflow_dispatch` and
+has `continue-on-error: true`, so a successful run does not mean the
+performance condition passed: only `performance/observations.json`
+decides. It is measured once per head; dispatching again to wait for a pass
+is not allowed (a second run is also rejected as ambiguous). Most source artifacts are kept for 7 days
 (`macos-host` and the native-first oracles for 14), so the acceptance
 artifact must be produced within 7 days of the quality runs.
 
@@ -229,7 +232,7 @@ itself.
    `quality.yml` and `release-check.yml` once each (a run a person
    already dispatched for the head is reused, never doubled), waits for all
    of them, then dispatches `release-acceptance.yml` once and waits for it. A
-   failed run is not dispatched again (FR8.3 is measured once per head);
+   failed run is not dispatched again (performance is measured once per head);
    the head then needs a person. When the version is already tagged or the
    head is no longer main, the run does nothing.
 
@@ -239,8 +242,8 @@ itself.
    `gh workflow run macos-quality.yml --repo aletheia-works/paludarium --ref main`,
    the same for `quality.yml` and `release-check.yml`. When all four
    have succeeded (do not dispatch `quality.yml` again to wait for a
-   passing FR8.3; if FR8.3 fails, record it and stop), dispatch, within 7
-   days,
+   passing performance condition; if it fails, record it and stop),
+   dispatch, within 7 days,
    `gh workflow run release-acceptance.yml --repo aletheia-works/paludarium --ref main`,
    then `publish.yml` once: its evidence job reuses those runs. Confirm:
    the release-acceptance run succeeded and its artifact `release-acceptance` holds only
@@ -272,7 +275,7 @@ official completed successful quality run identities for every required
 purpose and each acceptance ID with its verified artifact digest. The
 authorization step re-fetches GitHub
 commit, reachability, environment and run history.
-Evidence from old U14 measurements is historical unless the declared source
+Evidence from old JIT measurements is historical unless the declared source
 and build closure are independently proven equivalent. No same-binary
 performance rerun is used to wait for a passing result.
 
@@ -309,8 +312,8 @@ run (same head; nothing is tagged yet) is safe: every version already present is
 remaining ones are uploaded. The cargo and npm children
 get allow-listed environments only (step 3); the allow-list for
 `npm publish --provenance` follows npm's provenance generator for GitHub
-Actions and is proven only by the real publication. A successful workflow alone does not establish
-FR10.1: registry retrieval/source/provenance verification is required.
+Actions and is proven only by the real publication. A successful workflow alone is not
+enough: registry retrieval/source/provenance verification is required.
 
 ## Official references
 

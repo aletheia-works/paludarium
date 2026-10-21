@@ -1,4 +1,4 @@
-//! U1 differential tests (BR7.1, NFR1.1, NFR1.2): every guest runs natively
+//! Core differential tests: every guest runs natively
 //! on x86-64 Linux and under paludarium, and the results must be identical.
 //!
 //!   cargo test --locked -p paludarium-harness --test diff_core
@@ -22,7 +22,7 @@ fn case(name: &'static str, binary: &'static str, source: GuestSource) -> DiffTe
 fn check(case: &DiffTestCase) {
     match run_case(case) {
         Ok((native, emulated)) => {
-            // Run-time record (NFR6.1): printed with --nocapture / in CI logs.
+            // Run-time record: printed with --nocapture / in CI logs.
             println!(
                 "timing {}: native {:?}, emulated {:?}",
                 case.name, native.elapsed, emulated.elapsed

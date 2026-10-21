@@ -1,4 +1,4 @@
-# U6 有限比較ケース
+# events 有限比較ケース
 
 ## Catalog
 
@@ -103,6 +103,6 @@ raw Linux ABI guestは0〜81の82件、Rust target guest timer/unixの2件、計
 
 初回64 Cケース成功後のRust adapter、getrandomとmusl clone flagの接続を経て、Tokio timer/UnixStreamと追加backpressure3件を含むLinux69件が成功した。backpressure製品動作は追加64〜66のnative先行取得と親goの後に実装した。fillは64KiB単位1024回、drainは2048回で有限。OSのsend-buffer設定に依存するqueue容量やshort writeの具体バイト数は比較せず、飽和errno、部分成功、OUTの遷移、drainによる進捗という関係を比較する。これはゲストへの資源上限追加ではなくfixture自身の有限境界である。
 
-case66はclone共有Threadがrelease atomicを受けてpeerをdrainし、親のblocking writeを進め、clear-child-TID futexで終了を回収する。releaseはsyscall開始前なので実Host waitへの到達をこのguestだけで保証しない。実待機開始後の解除は内部Host同期テストで別に確かめた。Node/実Safariでは非threaded0〜65とunixを含め、timerと66のguest threadingはU11境界として明示する。登録/通知競合とtimer metadataの内部同期テストは製品実装後の単体テストで検証した。現moduleのNode/実Safari結果は最終原本取得まで未検証。
+case66はclone共有Threadがrelease atomicを受けてpeerをdrainし、親のblocking writeを進め、clear-child-TID futexで終了を回収する。releaseはsyscall開始前なので実Host waitへの到達をこのguestだけで保証しない。実待機開始後の解除は内部Host同期テストで別に確かめた。Node/実Safariでは非threaded0〜65とunixを含め、timerと66のguest threadingはwasm境界として明示する。登録/通知競合とtimer metadataの内部同期テストは製品実装後の単体テストで検証した。現moduleのNode/実Safari結果は最終原本取得まで未検証。
 
-新しいobservable syscall動作が必要になれば追加guestをnative先行で取得し、この固定84ケースを削らず追加する。Wasmは0〜81のうち66を除く81 Cケース+unix=82件、既存21との合計103件を予定し、全新結果は未検証。DGRAM/SEQPACKETとネットワーク通信は承認済み対応範囲と区別する。U10 probe全量、U11 guest Worker達成を有限結果から推測しない。
+新しいobservable syscall動作が必要になれば追加guestをnative先行で取得し、この固定84ケースを削らず追加する。Wasmは0〜81のうち66を除く81 Cケース+unix=82件、既存21との合計103件を予定し、全新結果は未検証。DGRAM/SEQPACKETとネットワーク通信は承認済み対応範囲と区別する。固定ゲストプログラムのprobe全量、wasm guest Worker達成を有限結果から推測しない。

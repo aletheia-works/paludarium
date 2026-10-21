@@ -1,11 +1,11 @@
-//! Host abstraction for paludarium (contract C2, U1 subset).
+//! Host abstraction for paludarium (contract C2).
 //!
 //! Every host facility the emulator uses goes through the [`Host`] trait
-//! (BR6.1, ADR-007), so that the native and wasm implementations differ only
-//! here. U1 provides standard I/O and randomness (for `AT_RANDOM`); threads,
-//! time and host files are added by later units.
+//! (ADR-007), so that the native and wasm implementations differ only here.
+//! The core emulator needs standard I/O and randomness (for `AT_RANDOM`);
+//! threads, time and host files are added on top.
 //!
-//! This is the only crate where `unsafe` is permitted (NFR3.1). The U1
+//! This is the only crate where `unsafe` is permitted. The core
 //! implementation does not need any.
 
 #![cfg_attr(windows, feature(windows_by_handle))]
@@ -149,7 +149,7 @@ impl TerminalInfo {
 
 /// Facilities the emulator needs from its host.
 pub trait Host: Send + Sync {
-    /// Starts one native execution worker; wasm guest Workers are connected in U11.
+    /// Starts one native execution worker; wasm guest Workers are connected by the wasm host.
     fn spawn_thread(&self, task: Box<dyn FnOnce() + Send>) -> Result<Box<dyn ThreadHandle>, Errno> {
         threads::spawn(task)
     }
@@ -267,8 +267,8 @@ impl Host for NativeHost {
     }
 }
 
-/// Reads a program file from the host file system for the command line
-/// (BR5.4). Kept here so that no other crate touches `std::fs` (BR6.1).
+/// Reads a program file from the host file system for the command line.
+/// Kept here so that no other crate touches `std::fs`.
 pub fn read_program_file(path: &Path) -> Result<Vec<u8>, Error> {
     std::fs::read(path).map_err(|_| Error::new(ErrorKind::Host, "cannot read the program file"))
 }

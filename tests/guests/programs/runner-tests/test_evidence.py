@@ -28,7 +28,7 @@ def elf(*, pie=False, interpreter=False, needed=False):
 class BuildEvidence(unittest.TestCase):
     def test_push_never_runs_diagnostic_or_formal_measurement(self):
         root = pathlib.Path(__file__).resolve().parents[4]
-        # u14-cost-diagnostic.yml was removed in the CI cleanup (U15 Step 23, ci-config.md), so no push can run it.
+        # u14-cost-diagnostic.yml was removed in the CI cleanup, so no push can run it.
         self.assertFalse((root / ".github/workflows/u14-cost-diagnostic.yml").exists())
         acceptance = (root / ".github/workflows/jit-wasm-programs.yml").read_text()
         # The frozen performance measurement runs only by hand or on the nightly schedule, never on push or pull_request.

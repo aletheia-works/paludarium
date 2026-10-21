@@ -1,4 +1,4 @@
-"""Expose diagnostic collector/runner rejection regressions in the U14 suite."""
+"""Expose diagnostic collector/runner rejection regressions in the JIT suite."""
 
 import os
 import shutil

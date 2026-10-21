@@ -3,7 +3,7 @@
  * the address of every executed instruction (one hex address per line).
  *
  * Used to derive the list of instructions a guest actually executes
- * (BR4.4, functional-spec W7). ASLR is disabled for the child so a
+ * (functional-spec W7). ASLR is disabled for the child so a
  * static-pie guest is placed at 0x555555554000 like the emulator does.
  *
  *   insn-trace <trace-output-file> <program> [args...]

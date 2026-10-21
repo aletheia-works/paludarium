@@ -6,7 +6,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* Native-only pending-order observer; guest fork remains U5. */
+/* Native-only pending-order observer; guest fork is not under test here. */
 static volatile sig_atomic_t count, numbers[4], codes[4];
 static void observe(int number, siginfo_t *info, void *context) {
     (void)context;

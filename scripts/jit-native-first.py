@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Named U14 Linux oracle generator: observations are CI outputs, never fixtures."""
+"""Named JIT Linux oracle generator: observations are CI outputs, never fixtures."""
 
 import argparse
 import hashlib

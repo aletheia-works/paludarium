@@ -1,4 +1,4 @@
-// Worker for the wasm thread check (BR8.1). Runs unchanged in a Node.js
+// Worker for the wasm thread check. Runs unchanged in a Node.js
 // worker_threads Worker and in a browser module Worker.
 //
 // Messages in:  { module, memory, role: "waiter" | "waker", timeoutMs }

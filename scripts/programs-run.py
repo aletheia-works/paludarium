@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""U10 entry point; observations are generated anew, never used as golden files."""
+"""Fixed guest programs entry point; observations are generated anew, never used as golden files."""
 
 import argparse
 import json
@@ -19,14 +19,14 @@ def main():
     args = parser.parse_args()
     config = json.loads((ROOT / "tests/guests/programs/cases.json").read_text())
     if config["deadline_seconds"] != 30 or config["schema"] != 1:
-        raise ValueError("invalid U10 runner contract")
+        raise ValueError("invalid fixed guest programs runner contract")
     if args.self_test:
         from runner import run
 
         result = run([sys.executable, "-c", "pass"], cwd=ROOT, env={})
         if result["exit"] != 0 or result["timed_out"]:
             raise RuntimeError("bounded runner is not ready")
-        print("U10 runner ready: schema 1, 30-second operation deadline")
+        print("fixed guest programs runner ready: schema 1, 30-second operation deadline")
         return
     if not args.native_only or args.guest_dir is None or args.output is None:
         parser.error("provide --native-only --guest-dir --output")

@@ -1,4 +1,4 @@
-// Browser side of the wasm thread check (BR8.1). The result is shown on the
+// Browser side of the wasm thread check. The result is shown on the
 // page and stored in window.__wasmThreadReport for the automation scripts.
 
 import { runCheck } from "/js/check.mjs";

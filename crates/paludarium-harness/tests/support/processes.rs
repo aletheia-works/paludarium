@@ -17,7 +17,7 @@ pub fn bounded(name: &str, run: impl FnOnce()) {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().expect("isolated U8 test");
+    let mut child = command.spawn().expect("isolated processes test");
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait().expect("poll child") {

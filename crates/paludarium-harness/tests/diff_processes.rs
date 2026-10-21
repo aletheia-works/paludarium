@@ -11,7 +11,7 @@ fn runner_ready() {
     assert_eq!(
         platform,
         ("linux".to_owned(), "x86_64".to_owned()),
-        "U8 native oracle requires x86-64 Linux; unsupported platform is not a zero-test PASS"
+        "processes native oracle requires x86-64 Linux; unsupported platform is not a zero-test PASS"
     );
     assert!(
         std::process::Command::new("musl-gcc")

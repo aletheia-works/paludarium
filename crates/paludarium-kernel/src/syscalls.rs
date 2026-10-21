@@ -1,5 +1,5 @@
-//! System-call handlers implemented in U1 (BR3.3, plus `mprotect`, which the
-//! Rust hello world calls natively; see the U1 code summary).
+//! System-call handlers of the core emulator (plus `mprotect`, which the Rust
+//! hello world calls natively).
 //!
 //! Every handler validates its arguments and reads or writes guest memory
 //! only through the MMU; bad pointers give `-EFAULT`.
@@ -13,7 +13,7 @@ use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 
 use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState, signals};
 
-/// Linux x86-64 system-call numbers used by U1.
+/// Linux x86-64 system-call numbers used by the core emulator.
 pub mod nr {
     pub const SETITIMER: u64 = 38;
     pub const RT_SIGRETURN: u64 = 15;
@@ -62,14 +62,13 @@ pub(crate) enum Outcome {
 
 type Handler = fn(&mut Context<'_>, [u64; 6]) -> Outcome;
 
-/// The explicit dispatch table (BR3.1). Numbers missing from it get
-/// `-ENOSYS` (BR3.2).
+/// The explicit dispatch table. Numbers missing from it get `-ENOSYS`.
 pub struct SyscallTable {
     handlers: BTreeMap<u64, Handler>,
 }
 
 impl SyscallTable {
-    /// The U1 table.
+    /// The core table.
     #[must_use]
     pub fn u1() -> Self {
         let entries: [(u64, Handler); 24] = [
@@ -418,7 +417,7 @@ fn sys_write(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         return crate::files::dispatch(c, a);
     }
     let (fd, buf, count) = (a[0], a[1], a[2].min(MAX_RW_COUNT));
-    // Only stdout and stderr are connected in U1 (BR3.4).
+    // Only stdout and stderr are connected in the core emulator.
     let write: fn(&dyn Host, &[u8]) -> Result<usize, Errno> = match fd {
         1 => |h, b| h.write_stdout(b),
         2 => |h, b| h.write_stderr(b),
@@ -519,7 +518,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         return err(Errno::EINVAL);
     }
     if flags & MAP_ANONYMOUS == 0 {
-        // No file descriptor in U1 can be mapped.
+        // No file descriptor in the core emulator can be mapped.
         return err(if (0..=2).contains(&fd) {
             Errno::ENODEV
         } else {
@@ -592,7 +591,7 @@ fn sys_munmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 fn sys_brk(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    // brk(0) and invalid requests return the current break (BR2.3).
+    // brk(0) and invalid requests return the current break.
     ok(c.mem.set_break_shared(GuestAddr(a[0])).0)
 }
 
@@ -771,7 +770,7 @@ fn exit_code(value: u64) -> i32 {
 }
 
 fn sys_exit(_: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    // One thread in U1: exit ends the process like exit_group (BR5.1).
+    // One thread in the core emulator: exit ends the process like exit_group.
     Outcome::Exit(exit_code(a[0]))
 }
 

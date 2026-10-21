@@ -1,10 +1,9 @@
 //! Software MMU for paludarium (contract C4).
 //!
-//! A guest address space is a two-level page table of 4 KiB pages
-//! (BR2.1): a sparse directory (one entry per 512 pages) pointing at dense
-//! tables of 512 page entries. Every access goes through checked guest
-//! addresses; a missing page or a protection violation returns a [`Fault`]
-//! and never panics (BR2.2, NFR2.1, NFR4.4).
+//! A guest address space is a two-level page table of 4 KiB pages: a sparse
+//! directory (one entry per 512 pages) pointing at dense tables of 512 page
+//! entries. Every access goes through checked guest addresses; a missing
+//! page or a protection violation returns a [`Fault`] and never panics.
 //!
 //! Page contents are byte-wise atomics so that `read`/`write` work through a
 //! shared reference without `unsafe` (the CPU writes guest memory while the
@@ -104,7 +103,7 @@ impl Mapping {
 }
 
 /// A failed guest memory access: the faulting address and whether it was a
-/// write. Becomes SIGSEGV for the guest (BR2.2).
+/// write. Becomes SIGSEGV for the guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fault {
     pub addr: GuestAddr,
@@ -786,7 +785,7 @@ impl AddressSpaceData {
         self.current_break
     }
 
-    /// `brk` semantics (BR2.3): requests below the initial break, or that
+    /// `brk` semantics: requests below the initial break, or that
     /// would overlap another mapping, leave the break unchanged. Returns the
     /// resulting break.
     pub fn set_break(&mut self, addr: GuestAddr) -> GuestAddr {
@@ -1066,7 +1065,7 @@ impl AddressSpace {
     ) -> Result<GuestAddr, Errno> {
         self.map_shared(addr, len, prot, kind)
     }
-    /// Mapping access for host workers sharing an address space (guest threads U5).
+    /// Mapping access for host workers sharing an address space (guest threads).
     pub fn map_shared(
         &self,
         addr: Option<GuestAddr>,

@@ -1,4 +1,4 @@
-"""Fresh x86-64 Linux U8 oracle; never read checked-in expectations."""
+"""Fresh x86-64 Linux processes oracle; never read checked-in expectations."""
 
 import argparse
 import hashlib
@@ -79,7 +79,7 @@ def main():
                 indent=2,
             )
         )
-    print(f"U8 native oracle: {len(rows)} cases passed")
+    print(f"processes native oracle: {len(rows)} cases passed")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-/* Native syscall oracle. No libc: only the U4 syscall and integer ISA under test. */
+/* Native syscall oracle. No libc: only the signals/time syscall and integer ISA under test. */
 typedef unsigned long u64;
 static long sc(u64 n,u64 a,u64 b,u64 c,u64 d,u64 e,u64 f){
  register u64 r10 __asm__("r10")=d,r8 __asm__("r8")=e,r9 __asm__("r9")=f; long ret;

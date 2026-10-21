@@ -483,7 +483,7 @@ pub enum RepPrefix {
 }
 
 /// Maximum number of explicit operands kept (x86 has at most four; the
-/// U1 instruction set needs three).
+/// core instruction set needs three).
 pub const MAX_OPERANDS: usize = 3;
 
 /// A decoded instruction.

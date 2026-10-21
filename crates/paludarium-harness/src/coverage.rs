@@ -1,6 +1,6 @@
-//! The U1 instruction list (BR4.4) and which differential-test guest covers
-//! each instruction (NFR1.2). The list is the union of the instructions the
-//! C and Rust hello worlds execute natively, found with
+//! The core instruction list and which differential-test guest covers each
+//! instruction. The list is the union of the instructions the C and Rust
+//! hello worlds execute natively, found with
 //! `tools/insn-trace/insn-census.sh`.
 //!
 //! Each entry names the guest and a fragment of its source that exercises
@@ -78,7 +78,7 @@ pub const CORE_INSTRUCTIONS: &[(&str, &str, &str)] = &[
     ("xorps", "insn/sse.c", "xorps %%xmm2"),
 ];
 
-/// (instructions with at least one differential test, all U1 instructions)
+/// (instructions with at least one differential test, all core instructions)
 pub fn instruction_coverage(guest_sources: &std::path::Path) -> (usize, usize) {
     let covered = CORE_INSTRUCTIONS
         .iter()
@@ -98,7 +98,7 @@ mod tests {
     fn every_core_instruction_has_a_differential_test() {
         let sources = crate::workspace_root().join("tests").join("guests");
         let (covered, total) = instruction_coverage(&sources);
-        println!("U1 instruction coverage by differential tests: {covered}/{total}");
+        println!("Core instruction coverage by differential tests: {covered}/{total}");
         let missing: Vec<&str> = CORE_INSTRUCTIONS
             .iter()
             .filter(|(_, file, evidence)| {

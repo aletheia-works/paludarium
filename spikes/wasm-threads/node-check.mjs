@@ -1,4 +1,4 @@
-// Node.js runner of the wasm thread check (BR8.1). Prints one
+// Node.js runner of the wasm thread check. Prints one
 // WasmThreadReport as JSON and exits 0 on pass, 1 on failure.
 //
 //   node spikes/wasm-threads/node-check.mjs

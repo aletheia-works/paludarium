@@ -9,7 +9,7 @@
 #include <ucontext.h>
 #include <unistd.h>
 
-/* Native-only oracle: fork/pipe are test infrastructure, not guest U4 APIs. */
+/* Native-only oracle: fork/pipe are test infrastructure, not guest signals/time APIs. */
 extern char write_site[], write_after[];
 static volatile long observed_rax, observed_site;
 static void handler(int number, siginfo_t *info, void *raw) {

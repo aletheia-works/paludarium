@@ -7,9 +7,9 @@
 //!   --mount HOST:GUEST expose one explicit host directory (repeatable)
 //! ```
 //!
-//! Exit codes (BR5.2, BR5.3): the guest's exit code; 128 + signal number when
-//! the guest was killed by a signal; 2 for usage errors; 70 for errors of the
-//! emulator itself.
+//! Exit codes: the guest's exit code; 128 + signal number when the guest was
+//! killed by a signal; 2 for usage errors; 70 for errors of the emulator
+//! itself.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -20,11 +20,11 @@ use paludarium_host::{Host, read_program_file};
 use paludarium_runtime::{Config, Mount, Session};
 use paludarium_types::{Error, ExitStatus};
 
-/// Exit code for command-line usage errors (BR5.3).
+/// Exit code for command-line usage errors.
 pub const EXIT_USAGE: i32 = 2;
 
-/// Exit code for errors of the emulator itself (BR5.2; C11 open question,
-/// decided in U1: 70 = `EX_SOFTWARE`).
+/// Exit code for errors of the emulator itself (C11 open question, decided
+/// with the core emulator: 70 = `EX_SOFTWARE`).
 pub const EXIT_EMULATOR_ERROR: i32 = 70;
 
 /// Usage text printed on errors and for `--help`.
@@ -136,7 +136,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
     }))
 }
 
-/// The guest path a host program is placed at: `/<file name>` (BR5.4).
+/// The guest path a host program is placed at: `/<file name>`.
 pub fn guest_path(program: &Path) -> Result<Vec<u8>, UsageError> {
     let name = program
         .file_name()
@@ -146,7 +146,7 @@ pub fn guest_path(program: &Path) -> Result<Vec<u8>, UsageError> {
     Ok(path)
 }
 
-/// The command's exit code for a run result (BR5.2).
+/// The command's exit code for a run result.
 #[must_use]
 pub fn exit_code(result: &Result<ExitStatus, Error>) -> i32 {
     match result {

@@ -1,4 +1,4 @@
-"""U6 native-first/differential runner with independent process-group watchdogs."""
+"""Events native-first/differential runner with independent process-group watchdogs."""
 
 import argparse
 import contextlib

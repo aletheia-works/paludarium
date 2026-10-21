@@ -103,7 +103,7 @@ def observe(executable, guests, native_path, output, root, *, original=False):
             )
             store(case["name"], row)
     if len(data["rows"]) != 14 or len(data["default_rows"]) != 2:
-        raise ValueError("incomplete U13 inventory")
+        raise ValueError("incomplete Windows inventory")
     data["differential_complete"] = True
     (output / "observations.json").write_text(json.dumps(data, indent=2) + "\n")
-    print("U13 native host: fourteen Linux comparisons and two default VFS cases passed")
+    print("Windows native host: fourteen Linux comparisons and two default VFS cases passed")

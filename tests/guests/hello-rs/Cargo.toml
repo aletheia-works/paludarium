@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-# Built for x86_64-unknown-linux-musl by tests/guests/build.sh (BR7.2).
+# Built for x86_64-unknown-linux-musl by tests/guests/build.sh.
 [workspace]
 
 [dependencies]

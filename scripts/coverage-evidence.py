@@ -1,4 +1,4 @@
-"""Capture dedicated U9 raw coverage before a later clean replaces profiles.
+"""Capture dedicated terminal raw coverage before a later clean replaces profiles.
 
 This internal receipt deliberately has NO artifact ID/digest. The host joins
 official GitHub metadata after upload; artifact self-digests are circular.

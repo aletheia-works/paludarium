@@ -46,4 +46,4 @@ for (const item of cases) {
   row.streams_equal_without_normalization = row.stdout === oracle.rows[item.name].stdout && row.stderr === oracle.rows[item.name].stderr;
   report.rows[item.name] = row; await persist(); console.log(JSON.stringify({ name: item.name, exit: row.exit, timed_out: row.timed_out, errors: row.errors }));
 }
-console.log(`Observed ${cases.length} baseline cases; this diagnostic does not claim U11 acceptance`);
+console.log(`Observed ${cases.length} baseline cases; this diagnostic does not claim wasm acceptance`);

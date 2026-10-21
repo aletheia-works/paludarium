@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the differential-test guests from source (BR7.2). x86-64 Linux only:
+# Build the differential-test guests from source. x86-64 Linux only:
 # CI's ubuntu runner, or locally inside mise-tasks/linux-dev.sh.
 #
 #   tests/guests/build.sh [output-dir]      (default: target/guests)
@@ -29,7 +29,7 @@ cargo build --quiet --locked --release \
   --target-dir "$out/hello-rs-target"
 cp "$out/hello-rs-target/x86_64-unknown-linux-musl/release/hello-rs" "$out/hello-rs"
 
-# Per-instruction guests (NFR1.2): no libc, own _start, so the only
+# Per-instruction guests: no libc, own _start, so the only
 # instructions executed are the ones under test plus the tiny print helpers.
 shopt -s nullglob
 for src in "$here"/insn/*.c; do

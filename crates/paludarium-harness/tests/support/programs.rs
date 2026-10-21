@@ -47,7 +47,7 @@ fn fixture_files(config: &mut Config, directory: &Path, guest: &str) {
             let mode = fixture_mode(&entry.path());
             assert_eq!(
                 mode, 0o644,
-                "U10 fixture permissions must match native 0644"
+                "fixed guest program fixture permissions must match native 0644"
             );
             *config = std::mem::take(config).with_file_mode(
                 path,
@@ -66,7 +66,7 @@ fn fixture_mode(path: &Path) -> u32 {
 
 #[cfg(not(unix))]
 fn fixture_mode(_path: &Path) -> u32 {
-    panic!("U10 fixture metadata requires Unix")
+    panic!("fixed guest program fixture metadata requires Unix")
 }
 
 /// Executed only as a child of the 30-second Python group watchdog.

@@ -1,4 +1,4 @@
-//! U3 runner bootstrap. Semantic cases follow native observations.
+//! Encodings runner bootstrap. Semantic cases follow native observations.
 #![allow(unexpected_cfgs)]
 use super::{CpuState, INITIAL_MXCSR};
 use paludarium_types::GuestAddr;

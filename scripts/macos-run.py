@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""U12 native-host entry point; Linux expectations are built before host changes."""
+"""macOS native-host entry point; Linux expectations are built before host changes."""
 
 import argparse
 import pathlib
@@ -26,8 +26,8 @@ def main():
 
         row = run([sys.executable, "-c", "pass"], cwd=ROOT, env={})
         if row["exit"] != 0 or row["timed_out"]:
-            raise RuntimeError("U12 bounded runner not ready")
-        print("U12 runner ready: fixed fourteen cases, external thirty-second deadline")
+            raise RuntimeError("macOS bounded runner not ready")
+        print("macOS runner ready: fixed fourteen cases, external thirty-second deadline")
         return
     if args.native_only:
         if args.guest_dir is None or args.output is None or args.native is not None:

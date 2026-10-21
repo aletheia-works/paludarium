@@ -12,7 +12,7 @@ pub fn bounded(name: &str, run: impl FnOnce()) {
     if std::env::var("PALUDARIUM_ENCODINGS_CHILD").as_deref() == Ok(name) {
         run();
         if let Some(done) = std::env::var_os("PALUDARIUM_ENCODINGS_CHILD_DONE") {
-            std::fs::write(done, name).expect("write U3 child marker");
+            std::fs::write(done, name).expect("write encodings child marker");
         }
         return;
     }
@@ -29,10 +29,10 @@ pub fn bounded(name: &str, run: impl FnOnce()) {
         .process_group(0)
         .stdin(Stdio::null())
         .spawn()
-        .expect("start isolated U3 test");
+        .expect("start isolated encodings test");
     let start = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().expect("poll isolated U3 test") {
+        if let Some(status) = child.try_wait().expect("poll isolated encodings test") {
             assert!(status.success(), "isolated {name}: {status}");
             let ran = std::fs::read_to_string(&done).is_ok_and(|marker| marker == name);
             let _ = std::fs::remove_file(&done);
@@ -46,7 +46,7 @@ pub fn bounded(name: &str, run: impl FnOnce()) {
             let _ = child.wait();
             assert!(
                 killed.is_ok_and(|s| s.success()),
-                "whole U3 process-group cleanup failed"
+                "whole encodings process-group cleanup failed"
             );
             panic!("{name}: outer 30-second watchdog expired");
         }

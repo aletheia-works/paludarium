@@ -1,4 +1,4 @@
-/* Cases precede U2 CPU rotate/scan/bit/atomic implementation. */
+/* Cases precede the instruction-form CPU rotate/scan/bit/atomic implementation. */
 #include "insn.h"
 static const u64 counts[] = {0,1,2,8,9,16,17,31,32,63,64,65};
 #define ROTATE(OP,SUFFIX,SIZE,REG) do { \

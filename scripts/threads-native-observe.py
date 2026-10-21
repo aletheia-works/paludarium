@@ -1,4 +1,4 @@
-"""U5 native-first/differential runner with independent process-group watchdogs."""
+"""Threads native-first/differential runner with independent process-group watchdogs."""
 
 import argparse
 import contextlib

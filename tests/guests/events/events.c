@@ -1,4 +1,4 @@
-/* U6 finite raw Linux ABI observations; no libc/runtime startup. */
+/* Events finite raw Linux ABI observations; no libc/runtime startup. */
 typedef unsigned long U;
 typedef long I;
 static I sc(I n,U a,U b,U c,U d,U e,U f) {

@@ -1,4 +1,4 @@
-//! U4 expectations are produced by x86-64 Linux on each test execution.
+//! Signals and time expectations are produced by x86-64 Linux on each test execution.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[path = "support/signals_time_oracles.rs"]
@@ -17,7 +17,7 @@ fn build_signals_time() -> std::path::PathBuf {
                     .arg(workspace_root().join("tests/guests/signals-time/build.sh"))
                     .arg(&out)
                     .status()
-                    .expect("U4 native build")
+                    .expect("signals/time native build")
                     .success()
             );
         });
@@ -29,8 +29,9 @@ fn guest(group: &str, name: &'static str, case: usize) {
     support::bounded(name, || {
         let binary = format!("{group}-{case}");
         let path = out.join(&binary);
-        let native = run_native(&path, &binary, &[]).expect("native U4 memory");
-        let (emulated, stop) = run_emulated(&path, &binary, &[]).expect("emulated U4 memory");
+        let native = run_native(&path, &binary, &[]).expect("native signals/time memory");
+        let (emulated, stop) =
+            run_emulated(&path, &binary, &[]).expect("emulated signals/time memory");
         println!(
             "{name}: native={:?}/{:02x?}; emulated={:?}/{:02x?}; stop={stop:?}",
             native.status, native.stdout, emulated.status, emulated.stdout

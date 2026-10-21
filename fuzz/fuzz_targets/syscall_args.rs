@@ -1,6 +1,6 @@
 //! Any system call number with any arguments must be handled without a
-//! panic (NFR2.1, R-02): implemented calls validate their arguments, the
-//! rest return -ENOSYS.
+//! panic: implemented calls validate their arguments, the rest return
+//! -ENOSYS.
 #![no_main]
 
 use std::sync::Arc;

@@ -1,4 +1,4 @@
-# U10 comparison specification (before guest implementation)
+# Fixed guest programs comparison specification (before guest implementation)
 
 ## Inputs and state
 

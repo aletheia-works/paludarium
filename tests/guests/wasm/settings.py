@@ -1,11 +1,11 @@
-"""Small runner contract; reuses the immutable U10 guest and case definitions."""
+"""Small runner contract; reuses the immutable fixed guest programs and case definitions."""
 
 import json
 
 
 def validate(config):
     if config.get("schema") != 1 or config.get("deadline_seconds") != 30:
-        raise ValueError("invalid U11 case schema or external operation deadline")
+        raise ValueError("invalid wasm case schema or external operation deadline")
     expected = [
         "tokio-timer",
         "unix-stream-pair",

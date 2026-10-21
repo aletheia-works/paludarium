@@ -1,4 +1,4 @@
-//! Parsing and validation of ELF64 executables (BR1.1). Pure functions over
+//! Parsing and validation of ELF64 executables. Pure functions over
 //! untrusted bytes: every offset and size is checked; nothing panics.
 
 use crate::LoadError;

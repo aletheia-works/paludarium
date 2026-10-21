@@ -1,9 +1,9 @@
-# Same-head release acceptance evidence (FR10.1). publish.yml's evidence job (or
+# Same-head release acceptance evidence. publish.yml's evidence job (or
 # a person) dispatches this on main of the upstream repository after the
 # same-head quality runs listed in docs/release.md have completed. It only reads official run, job and
 # artifact metadata and produces one artifact, release-acceptance, holding
 # release-evidence.json. It never tags, approves or publishes. Actions are
-# pinned by commit SHA and the token is read-only (NFR8.2).
+# pinned by commit SHA and the token is read-only.
 name: Same-head release acceptance evidence
 on:
   workflow_dispatch:

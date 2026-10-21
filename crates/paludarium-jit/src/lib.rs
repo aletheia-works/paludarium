@@ -1,8 +1,9 @@
 //! JIT code-cache interface for paludarium (contract C9).
 //!
 //! The runtime asks the cache first and falls back to the interpreter when
-//! it returns `None`. U1 ships only [`NoopCodeCache`], which never has
-//! translated code; U14 provides the wasm implementation (ADR-005).
+//! it returns `None`. The core emulator ships only [`NoopCodeCache`], which
+//! never has translated code; the JIT provides the wasm implementation
+//! (ADR-005).
 #![forbid(unsafe_code)]
 
 mod block;
@@ -148,7 +149,7 @@ mod eligibility_tests {
     }
 }
 
-/// The code cache used when there is no JIT (always native in U1).
+/// The code cache used when there is no JIT (always native in the core emulator).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopCodeCache;
 

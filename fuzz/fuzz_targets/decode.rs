@@ -1,5 +1,5 @@
 //! The decoder wrapper must accept any byte sequence at any address without
-//! panicking (NFR2.1). The first 8 bytes choose the instruction address.
+//! panicking. The first 8 bytes choose the instruction address.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

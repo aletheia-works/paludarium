@@ -7,7 +7,7 @@ const [modulePath] = process.argv.slice(2);
 if (!modulePath) throw new Error("usage: wasm-api-check.mjs module");
 const wasmUrl = pathToFileURL(resolve(modulePath));
 const first = await createPaludarium({ wasmUrl }), second = await createPaludarium({ wasmUrl });
-const deadline = setTimeout(() => { console.error("U11 API test deadline"); process.exit(1); }, 30000);
+const deadline = setTimeout(() => { console.error("wasm API test deadline"); process.exit(1); }, 30000);
 try {
   const filesystem = await first.createFileSystem({ files: { "/file": new Uint8Array([73]) }, fileModes: { "/file": 0o644 } });
   assert.equal((await filesystem.snapshot()).find(entry => entry.path === "/file").mode, 0o100644);
@@ -57,5 +57,5 @@ try {
   assert.equal(new Set(probe.workers.map(worker => worker.threadToken)).size, 2);
   assert.equal(new Set(probe.workers.map(worker => worker.tlsAfter)).size, 2);
   assert.ok(probe.workers.every(worker => worker.token === 73 && worker.tlsAfter > 0));
-  console.log("U11 API: modes, ownership, concurrent disposal, large FS, busy rejection/retry, terminal validation, kill/release PASS");
+  console.log("wasm API: modes, ownership, concurrent disposal, large FS, busy rejection/retry, terminal validation, kill/release PASS");
 } finally { clearTimeout(deadline); await first.dispose(); await second.dispose(); }

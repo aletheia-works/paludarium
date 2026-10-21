@@ -68,4 +68,4 @@ Build the one production Wasm module from the repository root with
 and its required Workers, TypeScript declarations, and Apache-2.0 license.
 Publishing is a separate lifecycle step. Verification uses fixed probe/aube
 binaries and a fresh Linux oracle for Node, Chromium, Firefox, and real Safari;
-results apply to the versions and fixtures recorded in the U11 evidence.
+results apply to the versions and fixtures recorded in the wasm evidence.

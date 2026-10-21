@@ -1,6 +1,6 @@
 // A minimal static server for the browser check. Every response carries the
 // COOP/COEP headers that make the page cross-origin isolated, which
-// browsers require before they expose SharedArrayBuffer (BR8.1).
+// browsers require before they expose SharedArrayBuffer.
 //
 //   node spikes/wasm-threads/serve.mjs [port]     (default 8787)
 

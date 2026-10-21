@@ -11,7 +11,7 @@ and waits for it. Only when every run succeeded does it write ready=true,
 the version and the head to GITHUB_OUTPUT; publish.yml then publishes that
 head and creates the tag and the GitHub release last, so a version that was
 not published never gets a tag. A failed run is never dispatched again
-(FR8.3 is measured once per head); the head then needs a person.
+(performance is measured once per head); the head then needs a person.
 
 Publication is by Trusted Publishing only, so every package must already exist
 on its registry without this version. A new package (it needs one publication

@@ -9,7 +9,7 @@
 
 use core::fmt;
 
-/// Size of a guest page in bytes (BR2.1).
+/// Size of a guest page in bytes.
 pub const PAGE_SIZE: u64 = 4096;
 
 /// Exclusive upper bound of the guest user address space: the lower half of
@@ -20,7 +20,7 @@ pub const USER_ADDRESS_LIMIT: u64 = 1 << 47;
 pub const MAX_INSTRUCTION_LEN: usize = 15;
 
 /// A guest virtual address. Never mixed with host `usize` values; conversions
-/// are checked (team.md Code Style, BR2.1).
+/// are checked (team.md Code Style).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestAddr(pub u64);
 
@@ -145,7 +145,7 @@ impl fmt::Display for Errno {
     }
 }
 
-/// Linux signal numbers used by U1.
+/// Linux signal numbers used by the core emulator.
 pub mod signal {
     pub const SIGILL: i32 = 4;
     pub const SIGFPE: i32 = 8;
@@ -260,15 +260,15 @@ impl ExitReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExitStatus {
-    /// `exit`/`exit_group` with the low 8 bits of the code (BR5.1).
+    /// `exit`/`exit_group` with the low 8 bits of the code.
     Exited(i32),
     /// Terminated by the signal with this number.
     Signaled(i32),
 }
 
 impl ExitStatus {
-    /// The exit code a command reports for this status (BR5.2):
-    /// the guest code, or 128 + signal number.
+    /// The exit code a command reports for this status: the guest code, or
+    /// 128 + signal number.
     #[must_use]
     pub const fn command_exit_code(self) -> i32 {
         match self {
@@ -309,7 +309,7 @@ impl ErrorKind {
 ///
 /// Its display is limited to the kind, a fixed message, the instruction
 /// address and bytes and the system call number; it never contains host paths
-/// or environment variables (NFR2.4).
+/// or environment variables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     pub kind: ErrorKind,

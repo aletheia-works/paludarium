@@ -107,7 +107,7 @@ async function runGuest(args,jit){
  let launcher,row,error;
  try{
   launcher=await createPaludarium({wasmUrl:pathToFileURL(resolve(modulePath))});
-  row=await observeProgram(launcher,{program:'/probe',args:['/probe'],env:input.oracle.case_config.environment,files:{'/probe':new Uint8Array(input.probe),'/home/u10/.keep':new Uint8Array()},jit});
+  row=await observeProgram(launcher,{program:'/probe',args:['/probe'],env:input.oracle.case_config.environment,files:{'/probe':new Uint8Array(input.probe),'/home/guest/.keep':new Uint8Array()},jit});
   row.jit=jit;row.cleaned=false;
   if(jit&&!row.timed_out)row.statistics=(await launcher.diagnostics()).workers.filter(w=>!w.guestThread).at(-1)?.jit;
   compare(input.oracle.rows['probe-all'],row,input.oracle.fixture_root);row.pass=true;

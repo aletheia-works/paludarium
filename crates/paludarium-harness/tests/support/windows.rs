@@ -89,7 +89,7 @@ pub fn operation() {
     let mut config = Config::new("/program", args)
         .with_file("/program", std::fs::read(binary).unwrap())
         .with_file("/tmp/.u10", Vec::new())
-        .with_file("/home/u10/.u10", Vec::new());
+        .with_file("/home/guest/.guest", Vec::new());
     for line in std::fs::read_to_string(directory.join("environment"))
         .unwrap()
         .lines()

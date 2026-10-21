@@ -69,7 +69,7 @@ def differential(executable, *, original_argv=False):
     config = original if original_argv else comparison_config(original)
     compare_rows = compare_original if original_argv else compare
     guests = pathlib.Path(
-        os.environ.get("PALUDARIUM_U10_GUEST_DIR", ROOT / "target/guests/u10")
+        os.environ.get("PALUDARIUM_U10_GUEST_DIR", ROOT / "target/guests/programs")
     ).resolve()
     output = ROOT / "target/programs/differential"
     if original_argv:
@@ -148,7 +148,7 @@ def differential(executable, *, original_argv=False):
         # A root mount routes /tmp and /home descendants into this bounded
         # fixture. Prepare the same runtime directories as the native oracle.
         (fixture / "app/tmp").mkdir()
-        (fixture / "app/home/u10").mkdir(parents=True)
+        (fixture / "app/home/guest").mkdir(parents=True)
         for case in config["aube"]:
             if case.get("before") == "remove-node-modules":
                 shutil.rmtree(fixture / "app/node_modules")

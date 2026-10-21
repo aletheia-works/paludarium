@@ -42,22 +42,22 @@ jobs:
           python3 scripts/programs-run.py --self-test
           python3 -m unittest discover -s tests/guests/programs/runner-tests -p 'test_*.py'
       - name: Build fixed unmodified static-musl guests and audit dependencies
-        run: python3 tests/guests/programs/build.py target/guests/u10
+        run: python3 tests/guests/programs/build.py target/guests/programs
       - name: Observe fresh native expectations without network or node
-        run: sudo unshare --net python3 scripts/programs-run.py --native-only --guest-dir target/guests/u10 --output target/programs/native
+        run: sudo unshare --net python3 scripts/programs-run.py --native-only --guest-dir target/guests/programs --output target/programs/native
       - name: Retain build and native evidence, including failures
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: programs-native-first
           path: |
-            target/guests/u10/build-receipt.json
-            target/guests/u10/*-build.log
-            target/guests/u10/*-dependencies.log
-            target/guests/u10/aube-deny.toml
-            target/guests/u10/licenses/
-            target/guests/u10/probe
-            target/guests/u10/aube
+            target/guests/programs/build-receipt.json
+            target/guests/programs/*-build.log
+            target/guests/programs/*-dependencies.log
+            target/guests/programs/aube-deny.toml
+            target/guests/programs/licenses/
+            target/guests/programs/probe
+            target/guests/programs/aube
             target/programs/native/
           retention-days: 7
   differential:
@@ -72,7 +72,7 @@ jobs:
         with:
           name: programs-native-first
           path: target
-      - run: chmod +x target/guests/u10/probe target/guests/u10/aube
+      - run: chmod +x target/guests/programs/probe target/guests/programs/aube
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install nightly-2026-10-11 --profile minimal

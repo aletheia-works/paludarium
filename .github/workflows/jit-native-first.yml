@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          python tests/guests/programs/build.py target/guests/u10 2>&1 | tee target/windows-native-first/build.log
+          python tests/guests/programs/build.py target/guests/programs 2>&1 | tee target/windows-native-first/build.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/windows-native-first/build-exit.txt
           test "$status" = 0
@@ -52,19 +52,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo unshare --net "$(command -v python)" scripts/wasm-run.py --native-only --guest-dir target/guests/u10 --output target/jit/native-metadata 2>&1 | tee target/windows-native-first/native-metadata.log
+          sudo unshare --net "$(command -v python)" scripts/wasm-run.py --native-only --guest-dir target/guests/programs --output target/jit/native-metadata 2>&1 | tee target/windows-native-first/native-metadata.log
           python -c 'import json; r=json.load(open("target/jit/native-metadata/observations.json")); assert r["native_complete"] and len(r["rows"])==14; assert all(x["exit"]==0 and not x["timed_out"] and 0<=x["wall_seconds"]<=30 for x in r["rows"].values()); assert all("filesystem_metadata" in r["rows"][n] for n in ("version", "install", "frozen", "list"))'
       - name: Fresh isolated Linux fourteen cases
         shell: bash
         run: |
           set -euo pipefail
           set +e
-          sudo unshare --net "$(command -v python)" scripts/windows-run.py --native-only --guests target/guests/u10 --output target/windows/native 2>&1 | tee target/windows-native-first/native.log
+          sudo unshare --net "$(command -v python)" scripts/windows-run.py --native-only --guests target/guests/programs --output target/windows/native 2>&1 | tee target/windows-native-first/native.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/windows-native-first/native-exit.txt
           test "$status" = 0
           python -c 'import json; r=json.load(open("target/windows/native/observations.json")); assert r["native_complete"] and len(r["rows"])==14; assert all(x["exit"]==0 and not x["timed_out"] and 0<=x["wall_seconds"]<=30 for x in r["rows"].values())'
-          sudo unshare --net "$(command -v python)" scripts/windows-run.py --native-only --original-argv --guests target/guests/u10 --output target/windows/native-original 2>&1 | tee target/windows-native-first/native-original.log
+          sudo unshare --net "$(command -v python)" scripts/windows-run.py --native-only --original-argv --guests target/guests/programs --output target/windows/native-original 2>&1 | tee target/windows-native-first/native-original.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/windows-native-first/native-original-exit.txt
           test "$status" = 0
@@ -84,13 +84,13 @@ jobs:
             target/windows/native/
             target/windows/native-original/
             target/jit/native-metadata/
-            target/guests/u10/build-receipt.json
-            target/guests/u10/*-build.log
-            target/guests/u10/*-dependencies.log
-            target/guests/u10/aube-deny.toml
-            target/guests/u10/licenses/
-            target/guests/u10/probe
-            target/guests/u10/aube
+            target/guests/programs/build-receipt.json
+            target/guests/programs/*-build.log
+            target/guests/programs/*-dependencies.log
+            target/guests/programs/aube-deny.toml
+            target/guests/programs/licenses/
+            target/guests/programs/probe
+            target/guests/programs/aube
           retention-days: 14
 
   instruction-native:

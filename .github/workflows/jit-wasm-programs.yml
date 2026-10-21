@@ -28,9 +28,9 @@ jobs:
       - name: Runner tests
         run: python3 -m unittest discover -s tests/guests/wasm/runner-tests -p 'test_*.py'
       - name: Build fixed guests and audit dependencies
-        run: python3 tests/guests/programs/build.py target/guests/u10
+        run: python3 tests/guests/programs/build.py target/guests/programs
       - name: Fresh Linux oracle with filesystem metadata
-        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/u10 --output target/wasm/native
+        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/programs --output target/wasm/native
       - name: Build one production wasm module for every environment
         run: bash mise-tasks/wasm/build.sh
       - name: Preserve inputs and fresh oracle
@@ -39,13 +39,13 @@ jobs:
         with:
           name: wasm-acceptance-inputs
           path: |
-            target/guests/u10/probe
-            target/guests/u10/aube
-            target/guests/u10/build-receipt.json
-            target/guests/u10/*-build.log
-            target/guests/u10/*-dependencies.log
-            target/guests/u10/aube-deny.toml
-            target/guests/u10/licenses/
+            target/guests/programs/probe
+            target/guests/programs/aube
+            target/guests/programs/build-receipt.json
+            target/guests/programs/*-build.log
+            target/guests/programs/*-dependencies.log
+            target/guests/programs/aube-deny.toml
+            target/guests/programs/licenses/
             target/wasm/native/
             packages/paludarium-wasm/paludarium.wasm
           retention-days: 7
@@ -114,7 +114,7 @@ jobs:
       - name: Compare identical fourteen cases in both execution modes
         env:
           U14_ENVIRONMENT: ${{ matrix.environment }}
-        run: python3 -B scripts/jit-run.py --environment "$U14_ENVIRONMENT" --wasm packages/paludarium-wasm/paludarium.wasm --native target/wasm/native/observations.json --guests target/guests/u10 --output "target/wasm/$U14_ENVIRONMENT"
+        run: python3 -B scripts/jit-run.py --environment "$U14_ENVIRONMENT" --wasm packages/paludarium-wasm/paludarium.wasm --native target/wasm/native/observations.json --guests target/guests/programs --output "target/wasm/$U14_ENVIRONMENT"
       - name: Fixed production JavaScript coverage
         if: matrix.environment == 'node'
         run: node packages/paludarium-wasm/tests/jit-coverage.mjs target/wasm/node/v8 target/wasm/node/js-coverage.json
@@ -122,7 +122,7 @@ jobs:
         # Measured by hand before a release and by the nightly schedule (ci-config.md); never on push or pull_request.
         if: matrix.environment == 'node' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
         continue-on-error: true
-        run: node packages/paludarium-wasm/tests/jit-performance-check.mjs packages/paludarium-wasm/paludarium.wasm target/wasm/native/observations.json target/guests/u10 target/wasm/node/performance
+        run: node packages/paludarium-wasm/tests/jit-performance-check.mjs packages/paludarium-wasm/paludarium.wasm target/wasm/native/observations.json target/guests/programs target/wasm/node/performance
       - name: Preserve raw results and cleanup evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

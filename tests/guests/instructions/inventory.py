@@ -5,7 +5,7 @@ import json
 import pathlib
 import re
 
-root = pathlib.Path("/work/target/u2-inventory")
+root = pathlib.Path("/work/target/instructions-inventory")
 prefixes = {
     "lock",
     "rep",

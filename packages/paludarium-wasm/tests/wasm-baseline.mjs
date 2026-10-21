@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { createPaludarium } from "../index.mjs";
 import { U11_DEADLINE_MS, U11_PROBES, validateOracle } from "./wasm-contract.mjs";
 
-const [modulePath, oraclePath, guestDirectory = "target/guests/u10", outputDirectory = "target/wasm/baseline"] = process.argv.slice(2);
+const [modulePath, oraclePath, guestDirectory = "target/guests/programs", outputDirectory = "target/wasm/baseline"] = process.argv.slice(2);
 if (!modulePath || !oraclePath) throw new Error("usage: wasm-baseline.mjs module oracle [guests] [output]");
 const oracle = validateOracle(JSON.parse(await readFile(oraclePath, "utf8")));
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -29,7 +29,7 @@ for (const item of cases) {
   let launcher, timer;
   try {
     launcher = await createPaludarium({ wasmUrl: pathToFileURL(resolve(modulePath)) });
-    const guest = launcher.run({ program: `/${item.guest}`, args: [`/${item.guest}`, ...item.args], env: config.environment, files: { [`/${item.guest}`]: guests[item.guest], ...fixture, "/tmp/.keep": new Uint8Array(), "/home/u10/.keep": new Uint8Array() } });
+    const guest = launcher.run({ program: `/${item.guest}`, args: [`/${item.guest}`, ...item.args], env: config.environment, files: { [`/${item.guest}`]: guests[item.guest], ...fixture, "/tmp/.keep": new Uint8Array(), "/home/guest/.keep": new Uint8Array() } });
     const capture = async (stream, key) => {
       const reader = stream.getReader(), decoder = new TextDecoder();
       try { for (;;) { const chunk = await reader.read(); if (chunk.done) break; row[key] += decoder.decode(chunk.value, { stream: true }); } row[key] += decoder.decode(); }

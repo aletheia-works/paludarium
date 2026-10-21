@@ -42,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          python tests/guests/programs/build.py target/guests/u10 2>&1 | tee target/macos-native-first/build.log
+          python tests/guests/programs/build.py target/guests/programs 2>&1 | tee target/macos-native-first/build.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/macos-native-first/build-exit.txt
           test "$status" = 0
@@ -51,12 +51,12 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          sudo unshare --net "$(command -v python)" scripts/macos-run.py --native-only --guest-dir target/guests/u10 --output target/macos/native 2>&1 | tee target/macos-native-first/native.log
+          sudo unshare --net "$(command -v python)" scripts/macos-run.py --native-only --guest-dir target/guests/programs --output target/macos/native 2>&1 | tee target/macos-native-first/native.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/macos-native-first/native-exit.txt
           test "$status" = 0
           python -c 'import json; r=json.load(open("target/macos/native/observations.json")); assert r["native_complete"] and len(r["rows"])==14; assert all(x["exit"]==0 and not x["timed_out"] and 0<=x["wall_seconds"]<=30 for x in r["rows"].values())'
-          sudo unshare --net "$(command -v python)" scripts/macos-run.py --native-only --original-argv --guest-dir target/guests/u10 --output target/macos/native-original 2>&1 | tee target/macos-native-first/native-original.log
+          sudo unshare --net "$(command -v python)" scripts/macos-run.py --native-only --original-argv --guest-dir target/guests/programs --output target/macos/native-original 2>&1 | tee target/macos-native-first/native-original.log
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" > target/macos-native-first/native-original-exit.txt
           test "$status" = 0
@@ -75,11 +75,11 @@ jobs:
             target/macos-native-first/
             target/macos/native/
             target/macos/native-original/
-            target/guests/u10/build-receipt.json
-            target/guests/u10/*-build.log
-            target/guests/u10/*-dependencies.log
-            target/guests/u10/aube-deny.toml
-            target/guests/u10/licenses/
-            target/guests/u10/probe
-            target/guests/u10/aube
+            target/guests/programs/build-receipt.json
+            target/guests/programs/*-build.log
+            target/guests/programs/*-dependencies.log
+            target/guests/programs/aube-deny.toml
+            target/guests/programs/licenses/
+            target/guests/programs/probe
+            target/guests/programs/aube
           retention-days: 14

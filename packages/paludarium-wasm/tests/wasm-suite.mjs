@@ -8,7 +8,7 @@ export async function runSuite({ wasmUrl, oracle, config, probe, aube, fixtures,
   for (const item of probeCases()) {
     const launcher = await launch();
     try {
-      const row = await observeProgram(launcher, { program: "/probe", args: ["/probe", ...item.args], env: config.environment, files: { "/probe": probe, "/home/u10/.keep": new Uint8Array() }, jit });
+      const row = await observeProgram(launcher, { program: "/probe", args: ["/probe", ...item.args], env: config.environment, files: { "/probe": probe, "/home/guest/.keep": new Uint8Array() }, jit });
       if (jit) {
         try { row.jit = (await launcher.diagnostics()).workers.filter(worker => !worker.guestThread).at(-1)?.jit; }
         catch (cause) { row.jit_diagnostics_error = String(cause); }

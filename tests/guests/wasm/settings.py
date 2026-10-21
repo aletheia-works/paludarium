@@ -37,7 +37,7 @@ def validate(config):
         raise ValueError("fixed aube inventory changed")
     if config["aube"][2].get("before") != "remove-node-modules":
         raise ValueError("frozen command must remove node_modules")
-    if config.get("environment", {}).get("PATH") != "/u10-no-node":
+    if config.get("environment", {}).get("PATH") != "/no-node":
         raise ValueError("node absence boundary changed")
     if not all(
         config.get("comparison", {}).get(key) is True for key in ("stdout", "stderr", "exit")

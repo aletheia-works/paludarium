@@ -6,7 +6,7 @@ import { createPaludarium } from "../index.mjs";
 import { validateOracle } from "./wasm-contract.mjs";
 import { compare, observeProgram, probeCases } from "./wasm-programs.mjs";
 import { compareFilesystem } from "./wasm-filesystem.mjs";
-const [modulePath, oraclePath, guestDirectory = "target/guests/u10", outputDirectory = "target/wasm/node", slice] = process.argv.slice(2);
+const [modulePath, oraclePath, guestDirectory = "target/guests/programs", outputDirectory = "target/wasm/node", slice] = process.argv.slice(2);
 if (!modulePath || !oraclePath) throw new Error("usage: wasm-node-check.mjs module oracle [guests] [output] [--probe-only]");
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const oracle = validateOracle(JSON.parse((await readFile(oraclePath, "utf8")).replace(/("mtime_ns"\s*:\s*)(\d+)/g, '$1"$2"')));
@@ -21,7 +21,7 @@ await persist(); let failed = false;
 for (const item of probeCases()) {
   const launcher = await createPaludarium({ wasmUrl: pathToFileURL(resolve(modulePath)) });
   try {
-    const row = await observeProgram(launcher, { program: "/probe", args: ["/probe", ...item.args], env: config.environment, files: { "/probe": probe, "/home/u10/.keep": new Uint8Array() } });
+    const row = await observeProgram(launcher, { program: "/probe", args: ["/probe", ...item.args], env: config.environment, files: { "/probe": probe, "/home/guest/.keep": new Uint8Array() } });
     try { compare(oracle.rows[item.name], row, oracle.fixture_root); row.pass = true; }
     catch (cause) { row.pass = false; row.comparison_error = String(cause); failed = true; }
     report.rows[item.name] = row; await persist(); console.log(JSON.stringify({ name: item.name, exit: row.exit, pass: row.pass, timed_out: row.timed_out, errors: row.errors }));

@@ -10,8 +10,8 @@ let diagnostics;
 const timer = setTimeout(async () => { try { diagnostics = await launcher.diagnostics(); } catch (error) { diagnostics = { error: String(error) }; } }, 25000);
 try {
   const row = await observeProgram(launcher, { program: "/probe", args: ["/probe", name],
-    env: { PATH: "/u10-no-node", HOME: "/home/u10", TMPDIR: "/tmp", NO_COLOR: "1", TERM: "dumb", LANG: "C", LC_ALL: "C", TZ: "UTC" },
-    files: { "/probe": probe, "/home/u10/.keep": new Uint8Array() }, jit: true });
+    env: { PATH: "/no-node", HOME: "/home/guest", TMPDIR: "/tmp", NO_COLOR: "1", TERM: "dumb", LANG: "C", LC_ALL: "C", TZ: "UTC" },
+    files: { "/probe": probe, "/home/guest/.keep": new Uint8Array() }, jit: true });
   try { diagnostics = await launcher.diagnostics(); } catch (error) { row.diagnostics_error = String(error); }
   await mkdir(output, { recursive: true });
   const result = { name, row, diagnostics };

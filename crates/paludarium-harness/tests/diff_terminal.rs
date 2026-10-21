@@ -18,7 +18,7 @@ fn decode_hex(hex: &str) -> Vec<u8> {
 fn case(name: &'static str, id: usize) {
     static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let root = workspace_root();
-    let out = root.join("target/guests/u9");
+    let out = root.join("target/guests/terminal");
     if std::env::var_os("PALUDARIUM_U9_CHILD").is_none() {
         BUILT.get_or_init(|| {
             assert!(

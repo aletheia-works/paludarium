@@ -8,7 +8,7 @@ mod support;
 use paludarium_harness::{compare, run_emulated, run_native, workspace_root};
 
 fn build_u4() -> std::path::PathBuf {
-    let out = workspace_root().join("target/guests/u4");
+    let out = workspace_root().join("target/guests/signals-time");
     if std::env::var("PALUDARIUM_U4_CHILD").is_err() {
         static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         BUILT.get_or_init(|| {

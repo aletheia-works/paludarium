@@ -5,7 +5,7 @@ use std::{path::PathBuf, process::Command, sync::OnceLock};
 
 fn case(id: usize) {
     let root = paludarium_harness::workspace_root();
-    let guests = root.join("target/guests/u5");
+    let guests = root.join("target/guests/threads");
     static BUILT: OnceLock<()> = OnceLock::new();
     BUILT.get_or_init(|| {
         assert!(
@@ -30,7 +30,7 @@ fn case(id: usize) {
             .arg("--guests")
             .arg(&guests)
             .arg("--out")
-            .arg(root.join(format!("target/u5-diff/{id}")))
+            .arg(root.join(format!("target/threads-diff/{id}")))
             .arg("--case")
             .arg(id.to_string())
             .arg("--emulator")

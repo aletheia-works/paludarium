@@ -57,7 +57,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_guest_environment_has_no_node_or_network_config(self):
         config = json.loads((HERE / "cases.json").read_text())
-        self.assertEqual(config["environment"]["PATH"], "/u10-no-node")
+        self.assertEqual(config["environment"]["PATH"], "/no-node")
         self.assertEqual(config["deadline_seconds"], 30)
         self.assertIn("network namespace", config["network"])
         row = self.execute('import os; print(os.environ.get("PATH","absent"))')

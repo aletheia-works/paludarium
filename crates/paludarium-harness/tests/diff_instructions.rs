@@ -28,14 +28,14 @@ cases!(
     u2_set => "insn-cond-set", u2_cmov => "insn-cond-cmov",
     u2_branch => "insn-cond-jcc", u2_move => "insn-mov",
     u2_string => "insn-string", u2_atomic => "insn-atomic",
-    u2_integer_forms => "insn-u2-integer",
-    u2_string_forms => "insn-u2-string",
-    u2_atomic_pairs => "insn-u2-pairs",
-    u2_control_forms => "insn-u2-control",
-    u2_bmi_forms => "insn-u2-bmi",
-    u2_frame_forms => "insn-u2-frame",
-    u2_frame_caller_boundaries => "insn-u2-frame-boundary",
-    u2_segment_atomic_forms => "insn-u2-segment-atomic",
+    u2_integer_forms => "insn-forms-integer",
+    u2_string_forms => "insn-forms-string",
+    u2_atomic_pairs => "insn-forms-pairs",
+    u2_control_forms => "insn-forms-control",
+    u2_bmi_forms => "insn-forms-bmi",
+    u2_frame_forms => "insn-forms-frame",
+    u2_frame_caller_boundaries => "insn-forms-frame-boundary",
+    u2_segment_atomic_forms => "insn-forms-segment-atomic",
 );
 
 fn cmps_fault(name: &'static str, completed: u64) {
@@ -44,7 +44,9 @@ fn cmps_fault(name: &'static str, completed: u64) {
         use paludarium_mmu::{AddressSpace, MappingKind, Prot};
         use paludarium_types::{ExitReason, GuestAddr};
         let root = paludarium_harness::workspace_root();
-        let dir = paludarium_harness::guest_dir().join("u2").join(name);
+        let dir = paludarium_harness::guest_dir()
+            .join("instructions")
+            .join(name);
         let built = std::process::Command::new("bash")
             .arg(root.join("tests/guests/instructions/build.sh"))
             .arg(&dir)
@@ -171,7 +173,7 @@ fn atomic_fault(name: &'static str, scenario: &'static str, misaligned: bool, cr
         use paludarium_cpu::{CpuState, reg};
         use paludarium_mmu::{AddressSpace, MappingKind, Prot};
         use paludarium_types::{ExitReason, GuestAddr};
-        let dir = guest_dir().join("u2").join(name);
+        let dir = guest_dir().join("instructions").join(name);
         assert!(
             std::process::Command::new("bash")
                 .arg(
@@ -324,7 +326,9 @@ fn divide_fault(name: &'static str, scenario: &'static str, signed: bool, overfl
         use paludarium_mmu::{AddressSpace, MappingKind, Prot};
         use paludarium_types::{ExitReason, GuestAddr};
         let root = paludarium_harness::workspace_root();
-        let dir = paludarium_harness::guest_dir().join("u2").join(name);
+        let dir = paludarium_harness::guest_dir()
+            .join("instructions")
+            .join(name);
         assert!(
             std::process::Command::new("bash")
                 .arg(root.join("tests/guests/instructions/build.sh"))
@@ -413,7 +417,7 @@ fn u2_pop_fault_preserves_stack_and_flags() {
         use paludarium_cpu::{CpuState, reg};
         use paludarium_mmu::{AddressSpace, MappingKind, Prot};
         use paludarium_types::{ExitReason, GuestAddr};
-        let dir = paludarium_harness::guest_dir().join("u2/pop-fault");
+        let dir = paludarium_harness::guest_dir().join("instructions/pop-fault");
         assert!(
             std::process::Command::new("bash")
                 .arg(
@@ -478,7 +482,7 @@ fn enter_fault(name: &'static str, allocation: bool) {
         use paludarium_cpu::{CpuState, reg};
         use paludarium_mmu::{AddressSpace, MappingKind, Prot};
         use paludarium_types::{ExitReason, GuestAddr};
-        let dir = guest_dir().join("u2").join(name);
+        let dir = guest_dir().join("instructions").join(name);
         assert!(
             std::process::Command::new("bash")
                 .arg(

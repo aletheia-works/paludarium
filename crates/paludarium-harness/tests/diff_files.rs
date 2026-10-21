@@ -11,7 +11,7 @@ fn case(name_arg: &'static str, id: usize) {
     let _fixture = FIXTURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let out = workspace_root().join("target/guests/u7");
+    let out = workspace_root().join("target/guests/files");
     let name = name_arg;
     if std::env::var("PALUDARIUM_U7_CHILD").is_err() {
         static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -118,7 +118,7 @@ cases!(u7_host_read_write=>3,u7_host_hard_link=>4,u7_host_symlink=>5,u7_host_ren
 #[test]
 fn u7_host_signed_mtime_stat_fstat() {
     let name = "u7_host_signed_mtime_stat_fstat";
-    let out = workspace_root().join("target/guests/u7");
+    let out = workspace_root().join("target/guests/files");
     assert!(
         std::process::Command::new("bash")
             .arg(workspace_root().join("tests/guests/files/build.sh"))

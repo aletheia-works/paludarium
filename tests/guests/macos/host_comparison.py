@@ -81,7 +81,7 @@ def observe(executable, guests, native_path, output, root, *, original=False):
             )
             store(case["name"], row, default=True)
         (fixture / "app/tmp").mkdir()
-        (fixture / "app/home/u10").mkdir(parents=True)
+        (fixture / "app/home/guest").mkdir(parents=True)
         for case in config["aube"]:
             if case.get("before") == "remove-node-modules":
                 shutil.rmtree(fixture / "app/node_modules")

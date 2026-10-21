@@ -57,7 +57,7 @@ export async function measure({ wasmUrl, probe, oracle, onObservation }) {
       await launcher.diagnostics();
       const preparationSeconds = (performance.now() - prepared) / 1000;
       const row = await observeProgram(launcher, { program: "/probe", args: ["/probe"],
-        env: oracle.case_config.environment, files: { "/probe": probe, "/home/u10/.keep": new Uint8Array() }, jit });
+        env: oracle.case_config.environment, files: { "/probe": probe, "/home/guest/.keep": new Uint8Array() }, jit });
       if (jit && !row.timed_out) {
         try { row.statistics = (await launcher.diagnostics()).workers.filter(worker => !worker.guestThread).at(-1)?.jit; }
         catch (error) { row.diagnostics_error = String(error); }

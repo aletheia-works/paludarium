@@ -1,7 +1,7 @@
 /* Reuse the exact instruction fixture, but drive its frame calls from seven
  * caller stack placements. This guest never executes an unsafe old LEAVE. */
 #define test_main frame_full_test_main
-#include "u2-frame.c"
+#include "forms-frame.c"
 #undef test_main
 
 static u8 caller_stack[3 * 65536] __attribute__((aligned(65536), used));

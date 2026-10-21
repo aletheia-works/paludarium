@@ -180,7 +180,7 @@ def build(directory):
             ]
             env = dict(os.environ, AUBE_PRIMER_PATH=str(primer))
             command(args, ROOT, directory / f"{name}-build.log", env)
-            binary_name = "paludarium-probe-u10" if name == "probe" else "aube"
+            binary_name = "paludarium-probe" if name == "probe" else "aube"
             shutil.copy2(
                 directory / "targets" / name / lock["target"] / "release" / binary_name,
                 directory / name,

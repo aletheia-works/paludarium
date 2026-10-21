@@ -98,7 +98,7 @@ export async function collectProfile({ modulePath, oraclePath, guests, output })
       let row;
       try {
         row = await observeProgram(launcher, { program: "/probe", args: ["/probe"], env: oracle.case_config.environment,
-          files: { "/probe": new Uint8Array(probe), "/home/u10/.keep": new Uint8Array() }, jit });
+          files: { "/probe": new Uint8Array(probe), "/home/guest/.keep": new Uint8Array() }, jit });
         row.jit = jit; row.cleaned = false; report.rows.push(row); await persist();
         compare(oracle.rows["probe-all"], row, oracle.fixture_root);
         need(row.exit === 0 && !row.timed_out, "Diagnostic probe failed");

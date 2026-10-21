@@ -43,7 +43,7 @@ def run(command, prefix, timeout=30):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--guests", type=Path, default=Path("target/guests/u5"))
+    parser.add_argument("--guests", type=Path, default=Path("target/guests/threads"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--emulator", type=Path)
     parser.add_argument("--smoke", action="store_true")

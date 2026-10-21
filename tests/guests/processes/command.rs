@@ -9,7 +9,7 @@ fn main() {
     }
     let executable = &args[2];
     if mode == "missing" {
-        let error = Command::new("/u8-not-present").spawn().err().unwrap();
+        let error = Command::new("/paludarium-not-present").spawn().err().unwrap();
         println!("errno={}", error.raw_os_error().unwrap());
         return;
     }

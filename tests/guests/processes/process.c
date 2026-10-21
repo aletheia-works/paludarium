@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
         char writer[16], reader[16];
         snprintf(writer, sizeof writer, "%d", thread_block[1]);
         snprintf(reader, sizeof reader, "%d", thread_block[0]);
-        char *args[] = { "u8-process", "exec-thread-child", (char *)self, writer, reader, NULL };
+        char *args[] = { "process", "exec-thread-child", (char *)self, writer, reader, NULL };
         char *env[] = { NULL };
         execve(self, args, env);
         return 81;
@@ -81,9 +81,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "enoent") || !strcmp(mode, "bad-elf") || !strcmp(mode, "exec-fault")) {
-        const char *path = "/u8-not-present";
+        const char *path = "/paludarium-not-present";
         if (!strcmp(mode, "bad-elf")) {
-            path = "/tmp/u8-invalid-elf";
+            path = "/tmp/paludarium-invalid-elf";
             int fd = open(path, O_CREAT|O_TRUNC|O_WRONLY, 0700);
             if (fd < 0 || write(fd, "invalid", 7) != 7 || close(fd)) return 98;
         }
@@ -124,9 +124,9 @@ int main(int argc, char **argv) {
     *shared = 13;
     int fd = -1;
     if (!strcmp(mode, "offset") || !strcmp(mode, "cloexec")) {
-        fd = open("/tmp/u8-offset", O_CREAT|O_TRUNC|O_RDWR, 0600);
+        fd = open("/tmp/paludarium-offset", O_CREAT|O_TRUNC|O_RDWR, 0600);
         if (fd < 0 || write(fd, "abc", 3) != 3 || lseek(fd, 0, SEEK_SET)) return 95;
-        unlink("/tmp/u8-offset");
+        unlink("/tmp/paludarium-offset");
         if (!strcmp(mode, "cloexec")) {
             if (dup2(fd, 9) != 9 || dup2(fd, 10) != 10 || fcntl(9, F_SETFD, FD_CLOEXEC)) return 94;
         }
@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
     if (!pid) {
         if (!strcmp(mode, "vfork-exit")) _exit(9);
         if (!strcmp(mode, "exec") || !strcmp(mode, "vfork-exec") || !strcmp(mode, "cloexec")) {
-            char *args[] = { "u8-process", !strcmp(mode, "cloexec") ? "fd-child" : "child", (char *)self, "argument", NULL };
+            char *args[] = { "process", !strcmp(mode, "cloexec") ? "fd-child" : "child", (char *)self, "argument", NULL };
             char *env[] = { "U8_VALUE=value", NULL };
             execve(self, args, env);
             _exit(92);

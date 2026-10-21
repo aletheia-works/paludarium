@@ -5,7 +5,7 @@ use std::{path::PathBuf, process::Command, sync::OnceLock};
 
 fn case(id: usize) {
     let root = paludarium_harness::workspace_root();
-    let guests = root.join("target/guests/u6");
+    let guests = root.join("target/guests/events");
     static BUILT: OnceLock<()> = OnceLock::new();
     BUILT.get_or_init(|| {
         assert!(
@@ -30,7 +30,7 @@ fn case(id: usize) {
             .arg("--guests")
             .arg(&guests)
             .arg("--out")
-            .arg(root.join(format!("target/u6-diff/{id}")))
+            .arg(root.join(format!("target/events-diff/{id}")))
             .arg("--case")
             .arg(id.to_string())
             .arg("--emulator")
@@ -130,7 +130,7 @@ fn named_case(name: &str) {
     assert!(
         Command::new("bash")
             .arg(root.join("tests/guests/events/build.sh"))
-            .arg(root.join("target/guests/u6"))
+            .arg(root.join("target/guests/events"))
             .status()
             .unwrap()
             .success()
@@ -141,9 +141,9 @@ fn named_case(name: &str) {
             .arg("--case")
             .arg(name)
             .arg("--guests")
-            .arg(root.join("target/guests/u6"))
+            .arg(root.join("target/guests/events"))
             .arg("--out")
-            .arg(root.join(format!("target/u6-diff/{name}")))
+            .arg(root.join(format!("target/events-diff/{name}")))
             .arg("--emulator")
             .arg(
                 std::env::var_os("PALUDARIUM_U6_EMULATOR")

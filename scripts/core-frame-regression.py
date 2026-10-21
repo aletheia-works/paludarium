@@ -80,7 +80,7 @@ def main():
         "emulator_sha256": hashlib.sha256(args.emulator.read_bytes()).hexdigest(),
     }
     try:
-        for name in ("insn-u2-frame", "insn-u2-frame-boundary"):
+        for name in ("insn-forms-frame", "insn-forms-frame-boundary"):
             program = (args.guests / name).resolve()
             receipt["fixtures"][name] = hashlib.sha256(program.read_bytes()).hexdigest()
             for index in range(args.runs):

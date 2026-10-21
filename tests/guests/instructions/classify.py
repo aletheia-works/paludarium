@@ -5,7 +5,7 @@ import json
 import pathlib
 import re
 
-root = pathlib.Path("/work/target/u2-inventory")
+root = pathlib.Path("/work/target/instructions-inventory")
 ranges = []
 for line in (root / "aube.frames").open():
     match = re.search(r"pc=(?:0x)?([0-9a-f]+)\.\.(?:0x)?([0-9a-f]+)", line)

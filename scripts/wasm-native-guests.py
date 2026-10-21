@@ -17,7 +17,7 @@ for name in (
     "infinite",
     "integer",
     "stdin",
-    *sorted(path.name for path in root.iterdir() if path.name.startswith("u3-")),
+    *sorted(path.name for path in root.iterdir() if path.name.startswith("encodings-")),
 ):
     guest = root / name
     guest.chmod(0o755)
@@ -41,8 +41,8 @@ for name in (
             check=False,
         )
         stdout, stderr, code = result.stdout, result.stderr, result.returncode
-    if name.startswith("u3-"):
-        assert code == (-8 if name == "u3-fault" else 0), (
+    if name.startswith("encodings-"):
+        assert code == (-8 if name == "encodings-fault" else 0), (
             f"{name}: native feature/fixture failed, exit {code}"
         )
     rows.append(

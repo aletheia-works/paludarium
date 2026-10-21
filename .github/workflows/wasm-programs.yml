@@ -28,9 +28,9 @@ jobs:
       - name: Runner tests
         run: python3 -m unittest discover -s tests/guests/wasm/runner-tests -p 'test_*.py'
       - name: Build fixed guests and audit dependencies
-        run: python tests/guests/programs/build.py target/guests/u10
+        run: python tests/guests/programs/build.py target/guests/programs
       - name: Fresh Linux oracle with filesystem metadata
-        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/u10 --output target/wasm/native
+        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/programs --output target/wasm/native
       - name: Build one production wasm module for every environment
         run: bash mise-tasks/wasm/build.sh
       - name: Preserve inputs and fresh oracle
@@ -39,13 +39,13 @@ jobs:
         with:
           name: wasm-acceptance-inputs
           path: |
-            target/guests/u10/probe
-            target/guests/u10/aube
-            target/guests/u10/build-receipt.json
-            target/guests/u10/*-build.log
-            target/guests/u10/*-dependencies.log
-            target/guests/u10/aube-deny.toml
-            target/guests/u10/licenses/
+            target/guests/programs/probe
+            target/guests/programs/aube
+            target/guests/programs/build-receipt.json
+            target/guests/programs/*-build.log
+            target/guests/programs/*-dependencies.log
+            target/guests/programs/aube-deny.toml
+            target/guests/programs/licenses/
             target/wasm/native/
             packages/paludarium-wasm/paludarium.wasm
           retention-days: 7
@@ -120,7 +120,7 @@ jobs:
               command = ['node', 'packages/paludarium-wasm/tests/wasm-node-check.mjs']
           else:
               command = ['node', 'packages/paludarium-wasm/tests/wasm-browser-check.mjs', environment]
-          command += ['packages/paludarium-wasm/paludarium.wasm', 'target/wasm/native/observations.json', 'target/guests/u10', str(output)]
+          command += ['packages/paludarium-wasm/paludarium.wasm', 'target/wasm/native/observations.json', 'target/guests/programs', str(output)]
           result = supervise(command, cwd=pathlib.Path.cwd())
           (output / 'suite-supervisor.json').write_text(json.dumps(result, indent=2) + '\n')
           print(result['stdout'])

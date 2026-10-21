@@ -84,7 +84,7 @@ class BuildIntegration(unittest.TestCase):
                     / name
                     / self.lock["target"]
                     / "release"
-                    / ("aube" if name == "aube" else "paludarium-probe-u10")
+                    / ("aube" if name == "aube" else "paludarium-probe")
                 )
                 binary.parent.mkdir(parents=True)
                 binary.write_bytes(elf())

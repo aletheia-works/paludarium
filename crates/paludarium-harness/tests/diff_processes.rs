@@ -45,7 +45,7 @@ mod linux {
         let _fixture = FIXTURE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = workspace_root().join("target/guests/u8");
+        let dir = workspace_root().join("target/guests/processes");
         if std::env::var("PALUDARIUM_U8_CHILD").is_err() {
             static BUILT: OnceLock<()> = OnceLock::new();
             BUILT.get_or_init(|| {
@@ -104,34 +104,34 @@ mod linux {
     }
     macro_rules! cases {($($name:ident => ($mode:literal,$binary:literal)),* $(,)?) => {$(#[test] fn $name(){case(concat!("linux::",stringify!($name)),$mode,$binary);})*};}
     cases!(
-        u8_fork => ("fork","u8-process"),
-        u8_private => ("private","u8-process"),
-        u8_shared => ("shared","u8-process"),
-        u8_offset => ("offset","u8-process"),
-        u8_vfork_exec => ("vfork-exec","u8-process"),
-        u8_vfork_exit => ("vfork-exit","u8-process"),
-        u8_exec => ("exec","u8-process"),
-        u8_exec_thread => ("exec-thread","u8-process"),
-        u8_clone_vm => ("clone-vm","u8-process"),
-        u8_wait_interrupt => ("wait-interrupt","u8-process"),
-        u8_wait_restart => ("wait-restart","u8-process"),
-        u8_enoent => ("enoent","u8-process"),
-        u8_exec_fault => ("exec-fault","u8-process"),
-        u8_bad_elf => ("bad-elf","u8-process"),
-        u8_cloexec => ("cloexec","u8-process"),
-        u8_wait_specific => ("wait-specific","u8-process"),
-        u8_wait_any => ("wait-any","u8-process"),
-        u8_wnohang => ("wnohang","u8-process"),
-        u8_signal => ("signal","u8-process"),
-        u8_double_reap => ("double-reap","u8-process"),
-        u8_wait_fault => ("wait-fault","u8-process"),
-        u8_usage => ("usage","u8-process"),
-        u8_no_child => ("no-child","u8-process"),
-        u8_invalid_clone => ("invalid-clone","u8-process"),
-        u8_invalid_wait => ("invalid-wait","u8-process"),
-        u8_command_spawn => ("spawn","u8-command"),
-        u8_command_status => ("status","u8-command"),
-        u8_command_output => ("output","u8-command"),
-        u8_command_missing => ("missing","u8-command"),
+        u8_fork => ("fork","process"),
+        u8_private => ("private","process"),
+        u8_shared => ("shared","process"),
+        u8_offset => ("offset","process"),
+        u8_vfork_exec => ("vfork-exec","process"),
+        u8_vfork_exit => ("vfork-exit","process"),
+        u8_exec => ("exec","process"),
+        u8_exec_thread => ("exec-thread","process"),
+        u8_clone_vm => ("clone-vm","process"),
+        u8_wait_interrupt => ("wait-interrupt","process"),
+        u8_wait_restart => ("wait-restart","process"),
+        u8_enoent => ("enoent","process"),
+        u8_exec_fault => ("exec-fault","process"),
+        u8_bad_elf => ("bad-elf","process"),
+        u8_cloexec => ("cloexec","process"),
+        u8_wait_specific => ("wait-specific","process"),
+        u8_wait_any => ("wait-any","process"),
+        u8_wnohang => ("wnohang","process"),
+        u8_signal => ("signal","process"),
+        u8_double_reap => ("double-reap","process"),
+        u8_wait_fault => ("wait-fault","process"),
+        u8_usage => ("usage","process"),
+        u8_no_child => ("no-child","process"),
+        u8_invalid_clone => ("invalid-clone","process"),
+        u8_invalid_wait => ("invalid-wait","process"),
+        u8_command_spawn => ("spawn","command"),
+        u8_command_status => ("status","command"),
+        u8_command_output => ("output","command"),
+        u8_command_missing => ("missing","command"),
     );
 }

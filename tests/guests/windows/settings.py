@@ -32,7 +32,7 @@ def configuration(root, *, original=False):
         raise ValueError("fixed aube arguments changed")
     if config["aube"][2].get("before") != "remove-node-modules":
         raise ValueError("frozen cleanup changed")
-    if config["environment"]["PATH"] != "/u10-no-node":
+    if config["environment"]["PATH"] != "/no-node":
         raise ValueError("node absence boundary changed")
     if any(config["comparison"][key] is not True for key in ("stdout", "stderr", "exit")):
         raise ValueError("required comparison removed")

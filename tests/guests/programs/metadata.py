@@ -59,7 +59,7 @@ def observe(output):
         result = run(
             [sys.executable, str(HERE / "metadata.py"), "--child", str(directory)],
             cwd=directory,
-            env={"PATH": "/u10-no-node"},
+            env={"PATH": "/no-node"},
             timeout=30,
         )
         output.parent.mkdir(parents=True, exist_ok=True)

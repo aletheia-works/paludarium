@@ -43,7 +43,7 @@ def run(command, prefix, timeout=30):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--guests", type=Path, default=Path("target/guests/u6"))
+    parser.add_argument("--guests", type=Path, default=Path("target/guests/events"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--emulator", type=Path)
     parser.add_argument("--smoke", action="store_true")
@@ -60,7 +60,7 @@ def main():
     )
     for case in cases:
         case = int(case) if str(case).isdigit() else case
-        guest = args.guests / (f"event-{case}" if isinstance(case, int) else f"u6-{case}")
+        guest = args.guests / (f"event-{case}" if isinstance(case, int) else f"events-{case}")
         native = run([str(guest.resolve())], args.out / f"native-{case}")
         if native["exit"] != (-9 if case == 60 else 0) or native["stderr"]:
             raise RuntimeError(f"Unexpected native case {case}: {native}")

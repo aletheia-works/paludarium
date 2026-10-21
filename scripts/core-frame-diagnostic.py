@@ -37,7 +37,7 @@ def original(archive):
     if hashlib.sha256(raw).hexdigest() != ARCHIVE_SHA:
         raise ValueError("initial artifact archive digest mismatch")
     with zipfile.ZipFile(archive) as saved:
-        elf = saved.read("guests/insn-u2-frame")
+        elf = saved.read("guests/insn-forms-frame")
     if hashlib.sha256(elf).hexdigest() != ELF_SHA:
         raise ValueError("initial native ELF digest mismatch")
     return elf
@@ -73,7 +73,7 @@ def main():
         parser.error("runs must be 1..100")
     elf = original(args.archive)
     args.output.mkdir(parents=True, exist_ok=False)
-    binary = (args.output / "insn-u2-frame").resolve()
+    binary = (args.output / "insn-forms-frame").resolve()
     binary.write_bytes(elf)
     binary.chmod(0o755)
     metadata = {
@@ -83,7 +83,7 @@ def main():
         "stdin": "null",
         "stdout": "pipe",
         "stderr": "pipe",
-        "argv0": "insn-u2-frame",
+        "argv0": "insn-forms-frame",
         "historical_coverage_parent": "not reconstructed",
         "cause": "unresolved",
         "runs": [],
@@ -114,7 +114,7 @@ def main():
     # The debugger phase is explicitly auxiliary: observer effects are not parity.
     for index in range(args.runs):
         out, err, code, timeout, elapsed = bounded(
-            ["insn-u2-frame"], environment={}, executable=str(binary)
+            ["insn-forms-frame"], environment={}, executable=str(binary)
         )
         (args.output / f"native-{index:03}.stdout").write_bytes(out)
         (args.output / f"native-{index:03}.stderr").write_bytes(err)

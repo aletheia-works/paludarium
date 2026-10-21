@@ -1,5 +1,5 @@
 [package]
-name = "u6-target-guests"
+name = "event-guests"
 version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -8,11 +8,11 @@ publish = false
 [workspace]
 
 [[bin]]
-name = "u6-timer"
+name = "events-timer"
 path = "timer.rs"
 
 [[bin]]
-name = "u6-unix"
+name = "events-unix"
 path = "unix.rs"
 
 [dependencies]

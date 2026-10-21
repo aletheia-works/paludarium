@@ -29,7 +29,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(configuration(ROOT, original=True)["aube"][1]["args"], ["install"])
 
     def test_no_node(self):
-        self.assertEqual(configuration(ROOT)["environment"]["PATH"], "/u10-no-node")
+        self.assertEqual(configuration(ROOT)["environment"]["PATH"], "/no-node")
 
     def test_runner_ready(self):
         row = run([sys.executable, "-c", "pass"], cwd=ROOT, env={})
@@ -51,7 +51,7 @@ class SettingsTests(unittest.TestCase):
             "windows-run.py",
             "--native-only",
             "--guests",
-            "target/guests/u10",
+            "target/guests/programs",
             "--output",
             "target/windows/native",
         ]
@@ -61,7 +61,7 @@ class SettingsTests(unittest.TestCase):
             runpy.run_path(str(ROOT / "scripts/windows-run.py"), run_name="__main__")
         observe.assert_called_once()
         actual = observe.call_args.args
-        self.assertEqual(actual[0], (ROOT / "target/guests/u10").resolve())
+        self.assertEqual(actual[0], (ROOT / "target/guests/programs").resolve())
         self.assertEqual(actual[2], configuration(ROOT, original=original))
 
 

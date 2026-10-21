@@ -26,52 +26,45 @@ reference; no code is copied). Its first user is
 ### Requirements
 
 - Rust: the nightly pinned in `rust-toolchain.toml` (rustup installs it).
+- [mise](https://mise.jdx.dev/): `mise install` provides the other tools (bun,
+  Node.js, Python, cargo-deny, cargo-llvm-cov, OpenTofu and the linters), and
+  `mise tasks` lists the tasks below. mise also reads `rust-toolchain.toml`, so
+  a global `rust` in mise does not override the pinned nightly here.
 - Differential tests, coverage and fuzzing: x86-64 Linux (CI's Ubuntu runners,
   or the development container below) with musl-tools.
-- The npm package and the documentation site: [mise](https://mise.jdx.dev/)
-  (`mise install` provides bun, cargo-deny, cargo-llvm-cov and Python).
 
 ### Build and run
 
 ```sh
-cargo build --release --locked
-./target/release/paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] <program> [args...]
-bash scripts/build-wasm.sh    # paludarium.wasm for packages/paludarium-wasm
+mise run build         # cargo build --release --locked
+paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] <program> [args...]
+mise run wasm:build    # paludarium.wasm for packages/paludarium-wasm
 ```
 
-### Tests
+Within mise, `target/release` is on `PATH`.
 
-Unit tests (Linux, macOS, Windows):
+### Tests and checks
 
-```sh
-cargo test --locked -p paludarium-types -p paludarium-decoder -p paludarium-mmu -p paludarium-cpu -p paludarium-loader -p paludarium-vfs -p paludarium-kernel -p paludarium-host -p paludarium-jit -p paludarium-runtime -p paludarium
-```
+| Task | What it runs |
+|---|---|
+| `mise run test` | Unit tests of every crate (Linux, macOS, Windows) |
+| `mise run test:diff` | Differential tests (x86-64 Linux only) |
+| `mise run coverage` | Line coverage; fails under 80 % (x86-64 Linux) |
+| `mise run fuzz <target> [--seconds N]` | One target in `fuzz/fuzz_targets/` with the nightly's settings (x86-64 Linux) |
+| `mise run deny` | `cargo deny --locked check` |
+| `mise run lint:all` | `rust:check` (rustfmt, clippy) and `shell:check` (ShellCheck) |
+| `mise run ci` | `lint:all`, `build`, `test` and `deny` |
 
-Differential tests (x86-64 Linux only) build the guests under `tests/guests/`
-from source, run each one natively and in the emulator, and compare standard
-output, standard error and the exit status byte for byte (instruction guests
-also compare registers, flags and memory; undefined flags are listed in
+`actions:check` (actionlint), `python:check` (Ruff), `toml:check` (Tombi) and
+`markdown:check` (rumdl) are available but not yet part of `lint:all`. Each
+`<lang>:check` has a `<lang>:check:fix`.
+
+Differential tests build the guests under `tests/guests/` from source, run each
+one natively and in the emulator, and compare standard output, standard error
+and the exit status byte for byte (instruction guests also compare registers,
+flags and memory; undefined flags are listed in
 `tests/guests/insn/UNDEFINED.md`). Expected results are produced natively on
 every run and never stored. Each case has a 30-second timeout.
-
-```sh
-cargo test --locked -p paludarium-harness --test diff_u1 --test diff_u2 --test parallel_u2 --test diff_u4 --test diff_u9 --test diff_u3 --test diff_u8 -- --nocapture
-```
-
-Coverage (x86-64 Linux; fails under 80 % of lines):
-
-```sh
-cargo llvm-cov --locked --workspace --fail-under-lines 80
-```
-
-Fuzzing (x86-64 Linux, nightly), for the targets in `fuzz/fuzz_targets/`:
-
-```sh
-cd fuzz
-LSAN_OPTIONS=suppressions=$PWD/lsan.supp cargo fuzz run -O decode -- -max_total_time=600
-```
-
-Dependencies: `cargo deny --locked check`.
 
 ### Linux tests from macOS or Windows
 
@@ -79,7 +72,7 @@ Dependencies: `cargo deny --locked check`.
 differential tests, coverage and fuzzing need:
 
 ```sh
-scripts/linux-dev.sh cargo test --locked -p paludarium-harness --test diff_u1 -- --nocapture
+mise run linux-dev -- cargo test --locked -p paludarium-harness --test diff_u1 -- --nocapture
 ```
 
 The working tree is copied into a named volume first, so Docker Desktop does
@@ -90,10 +83,11 @@ are not evidence of native Linux behaviour; CI is.
 ### Documentation site
 
 ```sh
-cd docs
-bun install
-bun run dev      # http://localhost:5173/paludarium/
+mise run docs:dev      # http://localhost:5173/paludarium/
 ```
+
+mise installs the site's packages (`bun install`) when you enter the directory
+or run a task.
 
 ## CI
 

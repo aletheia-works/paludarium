@@ -64,7 +64,7 @@ directory. `tty` optionally supplies columns and rows in the range 0–65535.
 No host filesystem mount or network access is exposed by this API.
 
 Build the one production Wasm module from the repository root with
-`bash scripts/build-wasm.sh`. The npm archive includes that module, the launcher
+`mise run wasm:build`. The npm archive includes that module, the launcher
 and its required Workers, TypeScript declarations, and Apache-2.0 license.
 Publishing is a separate lifecycle step. Verification uses fixed probe/aube
 binaries and a fresh Linux oracle for Node, Chromium, Firefox, and real Safari;

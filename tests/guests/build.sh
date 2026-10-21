@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the differential-test guests from source (BR7.2). x86-64 Linux only:
-# CI's ubuntu runner, or locally inside scripts/linux-dev.sh.
+# CI's ubuntu runner, or locally inside mise-tasks/linux-dev.sh.
 #
 #   tests/guests/build.sh [output-dir]      (default: target/guests)
 #

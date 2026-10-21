@@ -225,7 +225,7 @@ jobs:
           python3 packages/paludarium-wasm/tests/generate-guests.py --check
           python3 scripts/wasm-native-guests.py > target/production-wasm-evidence/native-results.json
       - name: Build actual production Session module
-        run: bash scripts/build-wasm.sh
+        run: bash mise-tasks/wasm/build.sh
       - name: Compare production wasm with native results
         run: |
           node --test packages/paludarium-wasm/tests/import-check.mjs

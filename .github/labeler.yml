@@ -38,6 +38,7 @@ tooling:
   - changed-files:
       - any-glob-to-any-file:
           - "scripts/**"
+          - "mise-tasks/**"
           - "mise.toml"
           - "rust-toolchain.toml"
           - "deny.toml"

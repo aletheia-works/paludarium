@@ -44,7 +44,8 @@ TypeScript の型が入っています。ブラウザで使うときは、cross-
 git clone https://github.com/aletheia-works/paludarium.git
 cd paludarium
 cargo build --release --locked       # paludarium コマンド
-bash scripts/build-wasm.sh           # npm パッケージの paludarium.wasm
+mise run wasm:build                  # npm パッケージの paludarium.wasm
 ```
 
 `rust-toolchain.toml` に固定した nightly を、rustup が自動で入れます。
+`mise run` には [mise](https://mise.jdx.dev/) が必要です。`mise tasks` ですべてのタスクを確認できます。

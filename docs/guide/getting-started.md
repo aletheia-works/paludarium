@@ -44,7 +44,8 @@ TypeScript types. In the browser, the page must be cross-origin isolated; see
 git clone https://github.com/aletheia-works/paludarium.git
 cd paludarium
 cargo build --release --locked       # the paludarium command
-bash scripts/build-wasm.sh           # paludarium.wasm of the npm package
+mise run wasm:build                  # paludarium.wasm of the npm package
 ```
 
 rustup installs the nightly pinned in `rust-toolchain.toml` automatically.
+`mise run` needs [mise](https://mise.jdx.dev/); `mise tasks` lists every task.

@@ -45,6 +45,9 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 PALUDARIUM_TEST_NODE=<absolute path to node> cargo test --locked --workspace
 ```
 
+`mise run lint:all` runs the first two and `mise run test` the unit tests;
+`mise tasks` lists the other checks (differential tests, coverage, fuzzing).
+
 The emulator is correct when it matches native x86-64 Linux. Differential tests,
 line coverage (80% floor), and fuzzing only produce real evidence on x86-64
 Linux, which CI runs on every pull request; a macOS or Windows run is not a

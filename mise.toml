@@ -1,6 +1,147 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+# Development tools and tasks. `mise tasks` lists every task; longer ones are
+# files under mise-tasks/ (`mise run wasm:build` runs mise-tasks/wasm/build.sh).
+# The Rust toolchain itself is the nightly pinned in rust-toolchain.toml.
+min_version = "2026.10.15"
+
+[env]
+# `paludarium` after `mise run build`.
+_.path = ["target/release"]
+
+[settings]
+experimental = true
+# Rust is the nightly pinned in rust-toolchain.toml. Reading it here makes mise set
+# RUSTUP_TOOLCHAIN to that pin, so a global `rust` in mise does not override it.
+idiomatic_version_file_enable_tools = ["rust"]
+
 [tools]
-bun = "latest"
+# Rust. CI runs plain Cargo, so mbx (mr-boxington) is not wrapped here: mise-action
+# exports this file's command wrappers to CI's PATH. Enable it per machine with
+# `mise use --global --tool-option mr_boxington=true rust mr-boxington`.
 cargo-deny = "latest"
 "aqua:taiki-e/cargo-llvm-cov" = "latest"
-python = "3.15.0"
-uv = "0.13.1"
+# The npm package, its tests and the documentation site.
+node = "latest"
+bun = "latest"
+# Release and test scripts.
+python = "latest"
+uv = "latest"
+# infra/github.
+opentofu = "latest"
+# Linters.
+actionlint = "latest"
+shellcheck = "latest"
+ruff = "latest"
+tombi = "latest"
+rumdl = "latest"
+
+[deps.bun-docs]
+auto = true
+sources = ["package.json", "bun.lock"]
+outputs = ["node_modules"]
+run = "bun install --frozen-lockfile"
+dir = "docs"
+
+[deps.tofu]
+sources = ["versions.tf", "providers.tf", ".terraform.lock.hcl"]
+outputs = [".terraform/providers"]
+run = "tofu init"
+dir = "infra/github"
+
+[hooks]
+enter = ["mise deps -q"]
+
+[tasks.build]
+description = "Build the paludarium command (release)"
+run = "cargo build --release --locked"
+
+[tasks.test]
+description = "Unit tests of every crate (Linux, macOS, Windows)"
+run = '''
+PALUDARIUM_TEST_NODE="${PALUDARIUM_TEST_NODE:-$(command -v node)}" cargo test --locked \
+  -p paludarium-types -p paludarium-decoder -p paludarium-mmu -p paludarium-cpu -p paludarium-loader \
+  -p paludarium-vfs -p paludarium-kernel -p paludarium-host -p paludarium-jit -p paludarium-runtime -p paludarium
+'''
+
+[tasks."test:diff"]
+description = "Differential tests against native Linux (x86-64 Linux only; elsewhere use `mise run linux-dev -- ...`)"
+run = "cargo test --locked -p paludarium-harness --test diff_u1 --test diff_u2 --test parallel_u2 --test diff_u4 --test diff_u9 --test diff_u3 --test diff_u8 -- --nocapture"
+
+[tasks.coverage]
+description = "Line coverage with the 80 % floor (x86-64 Linux)"
+run = "cargo llvm-cov --locked --workspace --fail-under-lines 80"
+
+[tasks.deny]
+description = "cargo-deny: advisories, licenses, bans and sources"
+run = "cargo deny --locked check"
+
+[tasks.ci]
+description = "The local checks a pull request needs: lint, build, unit tests and cargo-deny"
+depends = ["lint:all", "build", "test", "deny"]
+
+[tasks."release:check"]
+description = "Validate the release configuration (scripts/release/check.py)"
+run = "python3 -B scripts/release/check.py --mode validate"
+
+[tasks."docs:dev"]
+description = "Run the documentation site at http://localhost:5173/paludarium/"
+dir = "docs"
+run = "bun run dev"
+
+[tasks."docs:build"]
+description = "Build the documentation site to docs/.vitepress/dist"
+dir = "docs"
+run = "bun run build"
+
+[tasks."docs:preview"]
+description = "Preview the built documentation site"
+dir = "docs"
+run = "bun run preview"
+
+[tasks."infra:init"]
+description = "Initialise OpenTofu for infra/github"
+dir = "infra/github"
+run = "tofu init"
+
+[tasks."infra:fmt"]
+description = "Format the OpenTofu files (infra/)"
+dir = "infra"
+run = "tofu fmt -recursive"
+
+[tasks."infra:plan"]
+description = "Plan infra/github (repository settings)"
+depends = ["infra:init"]
+dir = "infra/github"
+run = "tofu plan"
+
+[tasks."python:check"]
+description = "Ruff — Python format check + lint (read-only; not yet part of lint:all)"
+run = "ruff format --check && ruff check"
+
+[tasks."python:check:fix"]
+description = "Ruff — apply Python format + lint --fix (in-place)"
+run = "ruff format && ruff check --fix"
+
+[tasks."toml:check"]
+description = "Tombi — TOML format check + lint (read-only; not yet part of lint:all)"
+run = "tombi format --check && tombi lint"
+
+[tasks."toml:check:fix"]
+description = "Tombi — apply TOML format (in-place)"
+run = "tombi format"
+
+[tasks."markdown:check"]
+description = "rumdl — Markdown lint (read-only; not yet part of lint:all)"
+run = "rumdl check ."
+
+[tasks."markdown:check:fix"]
+description = "rumdl — apply Markdown autofix (in-place)"
+run = "rumdl fmt ."
+
+[tasks."lint:all"]
+description = "Run the formatters/linters the tree passes today (read-only) — Rust + ShellCheck"
+depends = ["rust:check", "shell:check"]
+
+[tasks."lint:all:fix"]
+description = "Apply the autofixes of lint:all (in-place)"
+depends = ["rust:check:fix"]

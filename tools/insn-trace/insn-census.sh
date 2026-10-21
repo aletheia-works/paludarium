@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Produce the list of instructions a guest program actually executes natively
-# (BR4.4, W7). Run inside the Linux dev container (scripts/linux-dev.sh).
+# (BR4.4, W7). Run inside the Linux dev container (mise-tasks/linux-dev.sh).
 #
 #   tools/insn-trace/insn-census.sh <program> <output-prefix>
 #

@@ -36,7 +36,7 @@ jobs:
       - name: Fresh Linux oracle with filesystem metadata
         run: sudo unshare --net python3 scripts/u11-run.py --native-only --guest-dir target/guests/u10 --output target/u11/native
       - name: Build one production wasm module for every environment
-        run: bash scripts/build-wasm.sh
+        run: bash mise-tasks/wasm/build.sh
       - name: Preserve inputs and fresh oracle
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

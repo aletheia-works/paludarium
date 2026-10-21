@@ -1,17 +1,17 @@
 [package]
 name = "paludarium-decoder"
-description = "x86-64 instruction decoder wrapper for paludarium"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
-repository.workspace = true
+description = "x86-64 instruction decoder wrapper for paludarium"
 readme.workspace = true
+repository.workspace = true
+license.workspace = true
 license-file.workspace = true
 
 [dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "instr_info", "std"] }
 paludarium-types.workspace = true
-iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 
 [lints]
 workspace = true

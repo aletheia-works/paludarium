@@ -1,19 +1,19 @@
 [package]
 name = "paludarium-jit"
-description = "JIT code cache interface for paludarium"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
-repository.workspace = true
+description = "JIT code cache interface for paludarium"
 readme.workspace = true
+repository.workspace = true
+license.workspace = true
 license-file.workspace = true
 
 [dependencies]
-paludarium-types.workspace = true
 paludarium-cpu.workspace = true
-paludarium-mmu.workspace = true
 paludarium-decoder.workspace = true
+paludarium-mmu.workspace = true
+paludarium-types.workspace = true
 
 [features]
 fuzzing = []

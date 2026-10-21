@@ -10,109 +10,109 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
-[dependencies]
-paludarium-vfs = { path = "../crates/paludarium-vfs" }
-libfuzzer-sys = "0.4"
-paludarium-types = { path = "../crates/paludarium-types" }
-paludarium-decoder = { path = "../crates/paludarium-decoder" }
-paludarium-mmu = { path = "../crates/paludarium-mmu" }
-paludarium-cpu = { path = "../crates/paludarium-cpu" }
-paludarium-loader = { path = "../crates/paludarium-loader" }
-paludarium-kernel = { path = "../crates/paludarium-kernel" }
-paludarium-host = { path = "../crates/paludarium-host" }
-paludarium-jit = { path = "../crates/paludarium-jit", features = ["fuzzing"] }
-
 # Not part of the main workspace (needs nightly sanitizer flags).
 [workspace]
 members = ["."]
 
 [[bin]]
+bench = false
+doc = false
 name = "cpu_u2"
 path = "fuzz_targets/cpu_u2.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "jit_compile"
 path = "fuzz_targets/jit_compile.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "jit_cache"
 path = "fuzz_targets/jit_cache.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "mmu_u2"
 path = "fuzz_targets/mmu_u2.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "decode"
 path = "fuzz_targets/decode.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "load_elf"
 path = "fuzz_targets/load_elf.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "mmu_ops"
 path = "fuzz_targets/mmu_ops.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "syscall_args"
 path = "fuzz_targets/syscall_args.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "vfs_paths"
 path = "fuzz_targets/vfs_paths.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "kernel_threads_u5"
 path = "fuzz_targets/kernel_threads_u5.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "kernel_futex_u5"
 path = "fuzz_targets/kernel_futex_u5.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "kernel_events_u6"
 path = "fuzz_targets/kernel_events_u6.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "kernel_sockets_u6"
 path = "fuzz_targets/kernel_sockets_u6.rs"
 test = false
-doc = false
-bench = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+paludarium-cpu = { path = "../crates/paludarium-cpu" }
+paludarium-decoder = { path = "../crates/paludarium-decoder" }
+paludarium-host = { path = "../crates/paludarium-host" }
+paludarium-jit = { path = "../crates/paludarium-jit", features = ["fuzzing"] }
+paludarium-kernel = { path = "../crates/paludarium-kernel" }
+paludarium-loader = { path = "../crates/paludarium-loader" }
+paludarium-mmu = { path = "../crates/paludarium-mmu" }
+paludarium-types = { path = "../crates/paludarium-types" }
+paludarium-vfs = { path = "../crates/paludarium-vfs" }

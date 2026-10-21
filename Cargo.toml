@@ -1,54 +1,54 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/paludarium-types",
-    "crates/paludarium-decoder",
-    "crates/paludarium-mmu",
-    "crates/paludarium-cpu",
-    "crates/paludarium-loader",
-    "crates/paludarium-vfs",
-    "crates/paludarium-kernel",
-    "crates/paludarium-host",
-    "crates/paludarium-jit",
-    "crates/paludarium-runtime",
-    "crates/paludarium",
-    "crates/paludarium-harness",
-    "crates/paludarium-wasm",
+  "crates/paludarium",
+  "crates/paludarium-cpu",
+  "crates/paludarium-decoder",
+  "crates/paludarium-harness",
+  "crates/paludarium-host",
+  "crates/paludarium-jit",
+  "crates/paludarium-kernel",
+  "crates/paludarium-loader",
+  "crates/paludarium-mmu",
+  "crates/paludarium-runtime",
+  "crates/paludarium-types",
+  "crates/paludarium-vfs",
+  "crates/paludarium-wasm",
 ]
 # Guest programs, fuzz targets and spikes are built separately (other targets
 # or other toolchain flags), so they are not workspace members.
-exclude = ["tests/guests/hello-rs", "fuzz", "spikes/wasm-threads"]
+exclude = ["fuzz", "spikes/wasm-threads", "tests/guests/hello-rs"]
 
 [workspace.package]
 version = "0.1.1"
 edition = "2024"
-license = "Apache-2.0"
 rust-version = "1.101"
-repository = "https://github.com/aletheia-works/paludarium"
 readme = "README.md"
+repository = "https://github.com/aletheia-works/paludarium"
+license = "Apache-2.0"
 license-file = "LICENSE"
 
 [workspace.dependencies]
-paludarium-types = { path = "crates/paludarium-types", version = "0.1.1" }
-paludarium-decoder = { path = "crates/paludarium-decoder", version = "0.1.1" }
-paludarium-mmu = { path = "crates/paludarium-mmu", version = "0.1.1" }
+paludarium = { path = "crates/paludarium", version = "0.1.1" }
 paludarium-cpu = { path = "crates/paludarium-cpu", version = "0.1.1" }
-paludarium-loader = { path = "crates/paludarium-loader", version = "0.1.1" }
-paludarium-vfs = { path = "crates/paludarium-vfs", version = "0.1.1" }
-paludarium-kernel = { path = "crates/paludarium-kernel", version = "0.1.1" }
+paludarium-decoder = { path = "crates/paludarium-decoder", version = "0.1.1" }
 paludarium-host = { path = "crates/paludarium-host", version = "0.1.1" }
 paludarium-jit = { path = "crates/paludarium-jit", version = "0.1.1" }
+paludarium-kernel = { path = "crates/paludarium-kernel", version = "0.1.1" }
+paludarium-loader = { path = "crates/paludarium-loader", version = "0.1.1" }
+paludarium-mmu = { path = "crates/paludarium-mmu", version = "0.1.1" }
 paludarium-runtime = { path = "crates/paludarium-runtime", version = "0.1.1" }
-paludarium = { path = "crates/paludarium", version = "0.1.1" }
-
-[workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
+paludarium-types = { path = "crates/paludarium-types", version = "0.1.1" }
+paludarium-vfs = { path = "crates/paludarium-vfs", version = "0.1.1" }
 
 [workspace.lints.clippy]
-unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
 
 # The emulator runs whole guest programs in tests; unoptimised code is too
 # slow for the 30-second differential-test limit (NFR7.1), so dev/test

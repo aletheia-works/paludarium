@@ -52,12 +52,12 @@ Within mise, `target/release` is on `PATH`.
 | `mise run coverage` | Line coverage; fails under 80 % (x86-64 Linux) |
 | `mise run fuzz <target> [--seconds N]` | One target in `fuzz/fuzz_targets/` with the nightly's settings (x86-64 Linux) |
 | `mise run deny` | `cargo deny --locked check` |
-| `mise run lint:all` | `rust:check` (rustfmt, clippy) and `shell:check` (ShellCheck) |
+| `mise run lint:all` | `rust:check` (rustfmt, clippy), `shell:check` (ShellCheck), `actions:check` (actionlint), `toml:check` (Tombi) and `markdown:check` (rumdl) |
 | `mise run ci` | `lint:all`, `build`, `test` and `deny` |
 
-`actions:check` (actionlint), `python:check` (Ruff), `toml:check` (Tombi) and
-`markdown:check` (rumdl) are available but not yet part of `lint:all`. Each
-`<lang>:check` has a `<lang>:check:fix`.
+`python:check` (Ruff) is available but not yet part of `lint:all`. Each
+`<lang>:check` has a `<lang>:check:fix`, and CI runs `lint:all` on every pull
+request (`test-lint-check.yml`).
 
 Differential tests build the guests under `tests/guests/` from source, run each
 one natively and in the emulator, and compare standard output, standard error

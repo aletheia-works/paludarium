@@ -68,6 +68,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
           cargo test --locked -p paludarium-harness --test diff_u12 --no-run --message-format=json > target/u12/macos/build.jsonl
           python3 - <<'PY'
@@ -177,7 +178,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Unit tests (U1 crates)
         shell: bash
-        run: cargo test --locked $U1_PACKAGES -- --nocapture
+        run: |
+          read -r -a packages <<< "$U1_PACKAGES"
+          cargo test --locked "${packages[@]}" -- --nocapture
         env:
           RUST_BACKTRACE: "1"
       - name: Harness unit tests
@@ -338,6 +341,7 @@ jobs:
         run: |
           cargo llvm-cov clean --workspace
           (
+            # shellcheck disable=SC1090
             source <(cargo llvm-cov show-env --sh)
             cargo build --locked -p paludarium --target-dir target/llvm-cov-target
           )
@@ -361,10 +365,12 @@ jobs:
         run: |
           cargo llvm-cov clean --workspace
           (
+            # shellcheck disable=SC1090
             source <(cargo llvm-cov show-env --sh)
             cargo build --locked -p paludarium --target-dir target/llvm-cov-target
           )
-          cargo llvm-cov --no-clean --locked $U1_PACKAGES -p paludarium-harness --ignore-filename-regex 'paludarium-harness/' --fail-under-lines 80
+          read -r -a packages <<< "$U1_PACKAGES"
+          cargo llvm-cov --no-clean --locked "${packages[@]}" -p paludarium-harness --ignore-filename-regex 'paludarium-harness/' --fail-under-lines 80
         env:
           RUST_TEST_THREADS: "1"
 

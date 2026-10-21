@@ -4,12 +4,16 @@ version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
+
 [workspace]
-[dependencies]
-tokio = { version = "=1.48.0", features = ["rt-multi-thread", "time", "net"] }
+
 [[bin]]
 name = "u6-timer"
 path = "timer.rs"
+
 [[bin]]
 name = "u6-unix"
 path = "unix.rs"
+
+[dependencies]
+tokio = { version = "=1.48.0", features = ["net", "rt-multi-thread", "time"] }

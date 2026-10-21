@@ -1,22 +1,22 @@
 [package]
 name = "paludarium-harness"
-description = "Differential test harness for paludarium (not published)"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
+description = "Differential test harness for paludarium (not published)"
+license.workspace = true
 publish = false
 
 [dependencies]
 paludarium.workspace = true
 
 [dev-dependencies]
-paludarium-host.workspace = true
-paludarium-kernel.workspace = true
 paludarium-cpu.workspace = true
+paludarium-host.workspace = true
+paludarium-jit.workspace = true
+paludarium-kernel.workspace = true
 paludarium-mmu.workspace = true
 paludarium-types.workspace = true
-paludarium-jit.workspace = true
 
 [lints]
 workspace = true

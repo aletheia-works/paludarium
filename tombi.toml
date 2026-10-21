@@ -1,0 +1,13 @@
+toml-version = "v1.0.0"
+
+[files]
+include = ["**/*.toml"]
+exclude = [
+  "**/node_modules/**",
+  "**/target/**",
+  "**/dist/**",
+  "spikes/*/pkg/**",
+]
+
+[schema]
+enabled = true

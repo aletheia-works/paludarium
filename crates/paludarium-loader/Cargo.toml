@@ -1,17 +1,17 @@
 [package]
 name = "paludarium-loader"
-description = "Static ELF loader for paludarium"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
-repository.workspace = true
+description = "Static ELF loader for paludarium"
 readme.workspace = true
+repository.workspace = true
+license.workspace = true
 license-file.workspace = true
 
 [dependencies]
-paludarium-types.workspace = true
 paludarium-mmu.workspace = true
+paludarium-types.workspace = true
 paludarium-vfs.workspace = true
 
 [lints]

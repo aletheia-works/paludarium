@@ -40,6 +40,8 @@ tooling:
           - "scripts/**"
           - "mise-tasks/**"
           - "mise.toml"
+          - "tombi.toml"
+          - ".rumdl.toml"
           - "rust-toolchain.toml"
           - "deny.toml"
           - "clippy.toml"

@@ -10,7 +10,7 @@ have a separate long-term support commitment.
 
 Do not disclose vulnerabilities in public issues. If the repository's Security
 tab offers **Report a vulnerability**, use GitHub Private Vulnerability Reporting.
-Otherwise email **jambalaya.pyoncafe@gmail.com**, the organization's security contact.
+Otherwise email **<jambalaya.pyoncafe@gmail.com>**, the organization's security contact.
 
 paludarium runs untrusted x86-64 Linux programs. Reports of a guest escaping
 its virtual file system or reaching host resources it was not given, a guest

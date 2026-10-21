@@ -14,15 +14,15 @@ ignore = []
 version = 2
 # Only licenses compatible with paludarium's Apache-2.0.
 allow = [
-    "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "MIT",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "0BSD",
-    "Zlib",
-    "Unicode-3.0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "0BSD",
+  "Zlib",
+  "Unicode-3.0",
 ]
 confidence-threshold = 0.93
 # The allow list is a policy, not a census: unused entries are fine.
@@ -35,9 +35,9 @@ allow-wildcard-paths = true
 # Blink-derived projects with a known malware history must never be used,
 # directly or transitively (project.md Forbidden, NFR8.4).
 deny = [
-    { name = "webix", reason = "Blink-based webix lineage is forbidden (NFR8.4)" },
-    { name = "portabox", reason = "Blink-based portabox lineage is forbidden (NFR8.4)" },
-    { name = "lanmower-blink", reason = "lanmower/blink fork is forbidden (NFR8.4)" },
+  { name = "webix", reason = "Blink-based webix lineage is forbidden (NFR8.4)" },
+  { name = "portabox", reason = "Blink-based portabox lineage is forbidden (NFR8.4)" },
+  { name = "lanmower-blink", reason = "lanmower/blink fork is forbidden (NFR8.4)" },
 ]
 
 [sources]

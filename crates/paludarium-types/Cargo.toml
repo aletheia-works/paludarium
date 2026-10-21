@@ -1,12 +1,12 @@
 [package]
 name = "paludarium-types"
-description = "Shared types for the paludarium x86-64 Linux user-mode emulator"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
-repository.workspace = true
+description = "Shared types for the paludarium x86-64 Linux user-mode emulator"
 readme.workspace = true
+repository.workspace = true
+license.workspace = true
 license-file.workspace = true
 
 [dependencies]

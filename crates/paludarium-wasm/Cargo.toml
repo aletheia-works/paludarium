@@ -1,25 +1,30 @@
 [package]
-name="paludarium-wasm"
-publish=false
-version.workspace=true
-edition.workspace=true
-license.workspace=true
-rust-version.workspace=true
+name = "paludarium-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
 [lib]
-crate-type=["cdylib","rlib"]
-[features]
-u14-cost-profile=["paludarium-runtime/u14-cost-profile", "paludarium-jit/u14-cost-profile"]
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-paludarium-runtime.workspace=true
-paludarium-host.workspace=true
-paludarium-types.workspace=true
-paludarium-mmu.workspace=true
-paludarium-vfs.workspace=true
-paludarium-jit.workspace=true
+crate-type = ["cdylib", "rlib"]
+
 [dev-dependencies]
-paludarium-runtime.workspace=true
-paludarium-host.workspace=true
-paludarium-types.workspace=true
-paludarium-vfs.workspace=true
+paludarium-host.workspace = true
+paludarium-runtime.workspace = true
+paludarium-types.workspace = true
+paludarium-vfs.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+paludarium-host.workspace = true
+paludarium-jit.workspace = true
+paludarium-mmu.workspace = true
+paludarium-runtime.workspace = true
+paludarium-types.workspace = true
+paludarium-vfs.workspace = true
+
+[features]
+u14-cost-profile = ["paludarium-jit/u14-cost-profile", "paludarium-runtime/u14-cost-profile"]
+
 [lints]
-workspace=true
+workspace = true

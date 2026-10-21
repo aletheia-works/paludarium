@@ -52,7 +52,8 @@ jobs:
           mkdir -p target/u11-fuzz
           rustc -Vv > target/u11-fuzz/toolchain.txt
           sha256sum Cargo.lock fuzz/Cargo.lock > target/u11-fuzz/locks-before.sha256
-          export ASAN_SYMBOLIZER_PATH="$(command -v llvm-symbolizer-24)"
+          ASAN_SYMBOLIZER_PATH="$(command -v llvm-symbolizer-24)"
+          export ASAN_SYMBOLIZER_PATH
           printf '%s\n' "$ASAN_SYMBOLIZER_PATH" > target/u11-fuzz/symbolizer-path.txt
           "$ASAN_SYMBOLIZER_PATH" --version > target/u11-fuzz/symbolizer-version.txt
           dpkg-query -W llvm-24 > target/u11-fuzz/symbolizer-package.txt

@@ -2,6 +2,7 @@
 # Development tools and tasks. `mise tasks` lists every task; longer ones are
 # files under mise-tasks/ (`mise run wasm:build` runs mise-tasks/wasm/build.sh).
 # The Rust toolchain itself is the nightly pinned in rust-toolchain.toml.
+
 min_version = "2026.10.15"
 
 [env]
@@ -123,7 +124,7 @@ description = "Ruff — apply Python format + lint --fix (in-place)"
 run = "ruff format && ruff check --fix"
 
 [tasks."toml:check"]
-description = "Tombi — TOML format check + lint (read-only; not yet part of lint:all)"
+description = "Tombi — TOML format check + lint (read-only)"
 run = "tombi format --check && tombi lint"
 
 [tasks."toml:check:fix"]
@@ -131,7 +132,7 @@ description = "Tombi — apply TOML format (in-place)"
 run = "tombi format"
 
 [tasks."markdown:check"]
-description = "rumdl — Markdown lint (read-only; not yet part of lint:all)"
+description = "rumdl — Markdown lint (read-only)"
 run = "rumdl check ."
 
 [tasks."markdown:check:fix"]
@@ -139,9 +140,9 @@ description = "rumdl — apply Markdown autofix (in-place)"
 run = "rumdl fmt ."
 
 [tasks."lint:all"]
-description = "Run the formatters/linters the tree passes today (read-only) — Rust + ShellCheck"
-depends = ["rust:check", "shell:check"]
+description = "Run all formatters/linters (read-only) — Rust + ShellCheck + actionlint + Tombi + rumdl; Python is not yet part of it"
+depends = ["rust:check", "shell:check", "actions:check", "toml:check", "markdown:check"]
 
 [tasks."lint:all:fix"]
 description = "Apply the autofixes of lint:all (in-place)"
-depends = ["rust:check:fix"]
+depends = ["rust:check:fix", "toml:check:fix", "markdown:check:fix"]

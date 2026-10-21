@@ -1,0 +1,18 @@
+[global]
+include = ["**/*.md"]
+
+exclude = [
+  ".git",
+  ".github",
+  "node_modules",
+  "target",
+  "dist",
+  "**/node_modules/**",
+  "**/target/**",
+]
+
+disable = ["MD013", "MD033", "MD036", "MD041", "MD057"]
+
+respect-gitignore = true
+
+flavor = "gfm"

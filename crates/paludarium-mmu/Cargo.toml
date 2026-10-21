@@ -1,12 +1,12 @@
 [package]
 name = "paludarium-mmu"
-description = "Software MMU (guest address spaces) for paludarium"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
-repository.workspace = true
+description = "Software MMU (guest address spaces) for paludarium"
 readme.workspace = true
+repository.workspace = true
+license.workspace = true
 license-file.workspace = true
 
 [dependencies]

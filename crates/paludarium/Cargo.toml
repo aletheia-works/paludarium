@@ -1,19 +1,19 @@
 [package]
 name = "paludarium"
-description = "x86-64 Linux user-mode emulator (library and command)"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
-repository.workspace = true
+description = "x86-64 Linux user-mode emulator (library and command)"
 readme.workspace = true
+repository.workspace = true
+license.workspace = true
 license-file.workspace = true
 
 [dependencies]
-paludarium-types.workspace = true
 paludarium-host.workspace = true
-paludarium-runtime.workspace = true
 paludarium-loader.workspace = true
+paludarium-runtime.workspace = true
+paludarium-types.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,41 @@
+name: Test polyglot lint
+
+# `mise run lint:all` on every pull request, as in the other aletheia-works
+# repositories: rustfmt and clippy, ShellCheck, actionlint, Tombi and rumdl.
+# Actions are pinned by commit SHA and the default token is read-only.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-lint-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Polyglot lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Use a job-local rustup home
+        # GitHub-hosted runners sometimes ship a partially installed toolchain in
+        # ~/.rustup, which makes rustup fail with "detected conflict".
+        shell: bash
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI. mise then
+        # finds the toolchain of rust-toolchain.toml already installed.
+        shell: bash
+        run: bash scripts/rustup-retry.sh toolchain install
+      - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
+        with:
+          install: true
+          cache: false
+      - name: Run polyglot lint
+        run: mise run lint:all

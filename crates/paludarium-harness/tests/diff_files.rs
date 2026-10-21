@@ -13,7 +13,7 @@ fn case(name_arg: &'static str, id: usize) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let out = workspace_root().join("target/guests/files");
     let name = name_arg;
-    if std::env::var("PALUDARIUM_U7_CHILD").is_err() {
+    if std::env::var("PALUDARIUM_FILES_CHILD").is_err() {
         static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         BUILT.get_or_init(|| {
             assert!(
@@ -89,7 +89,7 @@ fn run_mounted(
     paludarium_harness::Outcome,
     Option<paludarium_types::ExitReason>,
 ) {
-    let root = std::env::temp_dir().join(format!("paludarium-u7-host-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("paludarium-files-host-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let mut config = paludarium::Config::new("/program", vec![name.as_bytes().to_vec()])
         .with_file("/program", std::fs::read(program).unwrap());
@@ -128,7 +128,8 @@ fn host_signed_mtime_stat_fstat() {
             .success()
     );
     support::bounded(name, || {
-        let root = std::env::temp_dir().join(format!("paludarium-u7-mtime-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("paludarium-files-mtime-{}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("mtime");
         let file = std::fs::File::create(&path).unwrap();
@@ -167,7 +168,7 @@ fn host_signed_mtime_stat_fstat() {
                     i64::try_from(ns.rem_euclid(1_000_000_000)).unwrap()
                 ]
             );
-            println!("U7_MTIME_NATIVE ns={ns} values={values:?}");
+            println!("FILES_MTIME_NATIVE ns={ns} values={values:?}");
             let mut config = paludarium::Config::new(
                 "/program",
                 vec![b"mtime".to_vec(), b"/fixture/mtime".to_vec()],
@@ -189,7 +190,7 @@ fn host_signed_mtime_stat_fstat() {
                 status,
                 elapsed: start.elapsed(),
             };
-            println!("U7_MTIME_EMULATED ns={ns} bytes={:?}", emulated.stdout);
+            println!("FILES_MTIME_EMULATED ns={ns} bytes={:?}", emulated.stdout);
             if let Err(error) = compare(&native, &emulated) {
                 mismatches.push(format!("ns={ns}: {error}"));
             }

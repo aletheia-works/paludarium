@@ -15,7 +15,7 @@ HERE = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
 import evidence  # noqa: E402
 
-spec = importlib.util.spec_from_file_location("u10_build_tests", HERE / "build.py")
+spec = importlib.util.spec_from_file_location("programs_build_tests", HERE / "build.py")
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 

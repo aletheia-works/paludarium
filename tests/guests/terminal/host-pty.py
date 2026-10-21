@@ -18,7 +18,7 @@ try:
         [sys.argv[1], "--exact", "terminal_tests::native_managed_pty", "--nocapture"],
         stdin=slave,
         capture_output=True,
-        env={**os.environ, "PALUDARIUM_U9_HOST_CHILD": "1"},
+        env={**os.environ, "PALUDARIUM_TERMINAL_HOST_CHILD": "1"},
         timeout=30,
     )
     sys.stdout.buffer.write(result.stdout)

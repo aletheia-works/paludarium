@@ -107,13 +107,13 @@ jobs:
           node packages/paludarium-wasm/tests/wasm-api-check.mjs packages/paludarium-wasm/paludarium.wasm
       - name: Compare fourteen actual guest executions with fresh Linux
         env:
-          U11_ENVIRONMENT: ${{ matrix.environment }}
+          WASM_ENVIRONMENT: ${{ matrix.environment }}
         run: |
           python3 - <<'PY'
           import json, os, pathlib, sys
           sys.path.insert(0, 'tests/guests/wasm')
           from supervisor import supervise
-          environment = os.environ['U11_ENVIRONMENT']
+          environment = os.environ['WASM_ENVIRONMENT']
           output = pathlib.Path('target/wasm') / environment
           output.mkdir(parents=True, exist_ok=True)
           if environment == 'node':

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location(
-    "u14_runner", Path(__file__).resolve().parents[3] / "scripts/jit-run.py"
+    "jit_runner", Path(__file__).resolve().parents[3] / "scripts/jit-run.py"
 )
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)

@@ -3,14 +3,14 @@ use std::time::{Duration, Instant};
 
 /// Isolate both executions in a process group and reap it on timeout.
 pub fn bounded(name: &str, run: impl FnOnce()) {
-    if std::env::var("PALUDARIUM_U8_CHILD").as_deref() == Ok(name) {
+    if std::env::var("PALUDARIUM_PROCESSES_CHILD").as_deref() == Ok(name) {
         run();
         return;
     }
     let mut command = Command::new(std::env::current_exe().expect("test executable"));
     command
         .args(["--exact", name, "--nocapture"])
-        .env("PALUDARIUM_U8_CHILD", name)
+        .env("PALUDARIUM_PROCESSES_CHILD", name)
         .stdin(Stdio::null());
     #[cfg(unix)]
     {

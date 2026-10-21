@@ -111,7 +111,7 @@ class PublishAdapterTests(unittest.TestCase):
         self.env = dict(
             PALUDARIUM_TEST_NODE=sys.executable,
             PALUDARIUM_RELEASE_NPM=__file__,
-            U15_OIDC_CRATES_IO_TOKEN=CANARY["U15_OIDC_CRATES_IO_TOKEN"],
+            RELEASE_OIDC_CRATES_IO_TOKEN=CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"],
         )
         self.envs = []
         self.yanked = set()
@@ -244,7 +244,7 @@ class PublishAdapterTests(unittest.TestCase):
     def test_oidc_token_reaches_uploads_only(self):
         result = self.execute()
         self.assertNotIn("authentication", result)
-        token = CANARY["U15_OIDC_CRATES_IO_TOKEN"]
+        token = CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"]
         dry = [e for n, e in self.envs if n.startswith("dry-")]
         uploads = [e for n, e in self.envs if n.startswith("publish-") and n != "publish-npm"]
         npm_env = [e for n, e in self.envs if n == "publish-npm"]
@@ -255,9 +255,9 @@ class PublishAdapterTests(unittest.TestCase):
         self.assertNotIn(token, recorded)
 
     def test_missing_oidc_token_stops_before_any_command(self):
-        del self.env["U15_OIDC_CRATES_IO_TOKEN"]
+        del self.env["RELEASE_OIDC_CRATES_IO_TOKEN"]
         with (
-            patch.dict(os.environ, {"U15_OIDC_CRATES_IO_TOKEN": ""}),
+            patch.dict(os.environ, {"RELEASE_OIDC_CRATES_IO_TOKEN": ""}),
             self.assertRaisesRegex(ValueError, "OIDC token absent"),
         ):
             self.execute()
@@ -351,7 +351,7 @@ class PublishAdapterTests(unittest.TestCase):
         self.execute()
         self.assertTrue(
             all(
-                e["CARGO_REGISTRY_TOKEN"] == CANARY["U15_OIDC_CRATES_IO_TOKEN"]
+                e["CARGO_REGISTRY_TOKEN"] == CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"]
                 for n, e in self.envs
                 if n.startswith("publish-") and n != "publish-npm"
             )

@@ -465,7 +465,7 @@ mod files_tests {
                 }
                 Err(error) => {
                     eprintln!(
-                        "U7_WINDOWS_EXCHANGE operation={name} os_error={:?} error={error}",
+                        "FILES_WINDOWS_EXCHANGE operation={name} os_error={:?} error={error}",
                         error.raw_os_error()
                     );
                     return Err(error);
@@ -560,7 +560,7 @@ mod files_tests {
     impl Fixture {
         fn new() -> Self {
             let base = std::env::temp_dir().join(format!(
-                "paludarium-u7-{}-{}",
+                "paludarium-files-{}-{}",
                 std::process::id(),
                 SEQ.fetch_add(1, Ordering::Relaxed)
             ));
@@ -714,10 +714,10 @@ mod files_tests {
         #[cfg(unix)]
         {
             const NAME: &str = "native_fs::files_tests::native_symlink_rename_race";
-            if std::env::var_os("PALUDARIUM_U7_RACE_CHILD").is_none() {
+            if std::env::var_os("PALUDARIUM_FILES_RACE_CHILD").is_none() {
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", NAME, "--nocapture"])
-                    .env("PALUDARIUM_U7_RACE_CHILD", "1")
+                    .env("PALUDARIUM_FILES_RACE_CHILD", "1")
                     .spawn()
                     .unwrap();
                 let start = std::time::Instant::now();
@@ -835,7 +835,7 @@ mod files_tests {
         child.write(b"inside").unwrap();
         let error = std::fs::rename(root.join("parent"), root.join("moved")).unwrap_err();
         println!(
-            "U7_WINDOWS_OPEN_CHILD_RENAME os_error={:?}",
+            "FILES_WINDOWS_OPEN_CHILD_RENAME os_error={:?}",
             error.raw_os_error()
         );
         assert_eq!(error.raw_os_error(), Some(5));
@@ -854,10 +854,10 @@ mod files_tests {
     fn native_windows_symlink_rename_race() {
         use std::sync::{Barrier, atomic::AtomicBool};
         const NAME: &str = "native_fs::files_tests::native_windows_symlink_rename_race";
-        if std::env::var_os("PALUDARIUM_U7_WINDOWS_RACE_CHILD").is_none() {
+        if std::env::var_os("PALUDARIUM_FILES_WINDOWS_RACE_CHILD").is_none() {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture"])
-                .env("PALUDARIUM_U7_WINDOWS_RACE_CHILD", "1")
+                .env("PALUDARIUM_FILES_WINDOWS_RACE_CHILD", "1")
                 .spawn()
                 .unwrap();
             let start = std::time::Instant::now();
@@ -865,7 +865,7 @@ mod files_tests {
                 if let Some(status) = child.try_wait().unwrap() {
                     assert!(status.success(), "Windows fixture child failed: {status}");
                     println!(
-                        "U7_WINDOWS_WATCHDOG elapsed_ms={} child_exit={status}",
+                        "FILES_WINDOWS_WATCHDOG elapsed_ms={} child_exit={status}",
                         start.elapsed().as_millis()
                     );
                     return;
@@ -893,7 +893,7 @@ mod files_tests {
                 .is_symlink()
         );
         std::fs::remove_dir(root.join("permission-probe")).unwrap();
-        println!("U7_WINDOWS_SYMLINK_PERMISSION=true");
+        println!("FILES_WINDOWS_SYMLINK_PERMISSION=true");
         x.fs().mkdir(b"pivot", 0o700).unwrap();
         x.fs()
             .open(b"pivot/sentinel", 66, 0o600)
@@ -923,7 +923,7 @@ mod files_tests {
                         .is_err_and(|error| error.raw_os_error() == Some(5))
                     {
                         eprintln!(
-                            "U7_WINDOWS_RENAME_CONTEXT active_operation={} pivot_metadata={:?} held_exists={}",
+                            "FILES_WINDOWS_RENAME_CONTEXT active_operation={} pivot_metadata={:?} held_exists={}",
                             active.load(Ordering::Acquire),
                             std::fs::symlink_metadata(root.join("pivot"))
                                 .map(|m| (m.is_dir(), m.is_symlink())),
@@ -935,7 +935,7 @@ mod files_tests {
                 let link = std::os::windows::fs::symlink_dir(&outside, root.join("pivot"));
                 if let Err(error) = link {
                     eprintln!(
-                        "U7_WINDOWS_EXCHANGE operation=create-pivot-symlink os_error={:?} error={error}",
+                        "FILES_WINDOWS_EXCHANGE operation=create-pivot-symlink os_error={:?} error={error}",
                         error.raw_os_error()
                     );
                     std::fs::rename(root.join("held"), root.join("pivot"))?;
@@ -998,10 +998,10 @@ mod files_tests {
         drop(x); // Closes NativeFs directory handle before strict fixture deletion.
         assert!(!base.exists());
         println!(
-            "U7_WINDOWS_RACE iterations=1000 exchanges={exchanges} outside_unchanged=true cleanup=true"
+            "FILES_WINDOWS_RACE iterations=1000 exchanges={exchanges} outside_unchanged=true cleanup=true"
         );
         println!(
-            "U7_WINDOWS_SHARING_CONFLICTS={}",
+            "FILES_WINDOWS_SHARING_CONFLICTS={}",
             sharing_conflicts.load(Ordering::Relaxed)
         );
     }

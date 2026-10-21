@@ -244,9 +244,9 @@ def package_check(root):
         (consumer / "src").mkdir(parents=True)
         # Registry wiring is generated below from exactly these .crate bytes.
         consumer_manifest = (
-            '[package]\nname="u15-external-consumer"\nversion="0.0.0"\nedition="2024"\n[workspace]\n[dependencies]\npaludarium = { version="='
+            '[package]\nname="release-external-consumer"\nversion="0.0.0"\nedition="2024"\n[workspace]\n[dependencies]\npaludarium = { version="='
             + inv["version"]
-            + '", registry="u15" }\n'
+            + '", registry="release" }\n'
         )
         (consumer / "Cargo.toml").write_text(consumer_manifest)
         (consumer / "src/main.rs").write_text(
@@ -255,7 +255,7 @@ def package_check(root):
         with make_registry(out, archives) as registry:
             (consumer / ".cargo").mkdir()
             (consumer / ".cargo/config.toml").write_text(
-                '[registries.u15]\nindex="' + registry + '"\n'
+                '[registries.release]\nindex="' + registry + '"\n'
             )
             check.require_success(
                 check.run_command(

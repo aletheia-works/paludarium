@@ -88,8 +88,9 @@ fn emulator_errors_exit_with_seventy() {
 
 #[test]
 fn cli_root_mount_keeps_private_program() {
-    let path = write_guest("u7-root", &GUEST, b"out\nE!");
-    let root = std::env::temp_dir().join(format!("paludarium-u7-cli-root-{}", std::process::id()));
+    let path = write_guest("files-root", &GUEST, b"out\nE!");
+    let root =
+        std::env::temp_dir().join(format!("paludarium-files-cli-root-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("sentinel"), b"unchanged").unwrap();
     let option = format!("{}:/", root.display());
@@ -102,15 +103,17 @@ fn cli_root_mount_keeps_private_program() {
     assert_eq!(out.stderr, b"\nE");
     assert_eq!(out.status.code(), Some(5));
     assert_eq!(std::fs::read(root.join("sentinel")).unwrap(), b"unchanged");
-    assert!(!root.join("u7-root").exists());
+    assert!(!root.join("files-root").exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn cli_mount_missing_root_is_emulator_error() {
-    let path = write_guest("u7-missing-root", &GUEST, b"out\nE!");
-    let root =
-        std::env::temp_dir().join(format!("paludarium-u7-cli-missing-{}", std::process::id()));
+    let path = write_guest("files-missing-root", &GUEST, b"out\nE!");
+    let root = std::env::temp_dir().join(format!(
+        "paludarium-files-cli-missing-{}",
+        std::process::id()
+    ));
     assert!(!root.exists());
     let out = binary()
         .args(["--mount", &format!("{}:/data", root.display())])
@@ -124,7 +127,7 @@ fn cli_mount_missing_root_is_emulator_error() {
 
 #[test]
 fn cli_forward_stdout_stderr() {
-    let path = write_guest("u9-streams", &GUEST, b"outERR");
+    let path = write_guest("terminal-streams", &GUEST, b"outERR");
     let out = binary().arg(&path).output().unwrap();
     assert_eq!(out.stdout, b"out");
     assert_eq!(out.stderr, b"ER");
@@ -137,7 +140,7 @@ fn cli_empty_argument_is_preserved() {
         0x48, 0x8b, 0x74, 0x24, 0x10, 0xb8, 1, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0xba, 1, 0, 0, 0, 0x0f,
         0x05, 0xb8, 60, 0, 0, 0, 0xbf, 0, 0, 0, 0, 0x0f, 0x05,
     ];
-    let path = write_guest("u9-empty", &code, b"");
+    let path = write_guest("terminal-empty", &code, b"");
     let out = binary()
         .arg(&path)
         .arg("")

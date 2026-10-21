@@ -95,13 +95,13 @@ _Static_assert(offsetof(struct sse_state, xmm) == 144, "xmm offset");
 _Static_assert(sizeof(struct sse_state) == 400, "state size");
 #define SSE_FLAG_MASK UINT64_C(0x8d5)
 
-void u14_sse_trampoline(const struct sse_state *in, struct sse_state *out,
+void jit_sse_trampoline(const struct sse_state *in, struct sse_state *out,
                         const unsigned char *entry);
 __asm__(
     ".text\n"
-    ".globl u14_sse_trampoline\n"
-    ".type u14_sse_trampoline,@function\n"
-    "u14_sse_trampoline:\n"
+    ".globl jit_sse_trampoline\n"
+    ".type jit_sse_trampoline,@function\n"
+    "jit_sse_trampoline:\n"
     "  push %rbx\n  push %rbp\n  push %r12\n  push %r13\n  push %r14\n  push %r15\n"
     "  push %rsi\n" /* out */
     "  push %rdx\n" /* entry */
@@ -139,7 +139,7 @@ __asm__(
     "  add $16,%rsp\n"
     "  pop %r15\n  pop %r14\n  pop %r13\n  pop %r12\n  pop %rbp\n  pop %rbx\n"
     "  ret\n"
-    ".size u14_sse_trampoline,.-u14_sse_trampoline\n");
+    ".size jit_sse_trampoline,.-jit_sse_trampoline\n");
 
 struct sse_case {
     const char *name;
@@ -246,7 +246,7 @@ static void observe_sse(const struct sse_case *item) {
     struct sse_state in, out;
     sse_input(item,&in);
     memset(&out,0,sizeof out);
-    u14_sse_trampoline(&in,&out,mapping);
+    jit_sse_trampoline(&in,&out,mapping);
     printf("{\"name\":\"%s\",\"signal\":0,\"child_exit\":0,\"code\":\"",item->name);
     for (size_t index=0; index<item->size; index++) printf("%02x",item->code[index]);
     printf("\",\"in_flags\":\"%016" PRIx64 "\"",in.flags);

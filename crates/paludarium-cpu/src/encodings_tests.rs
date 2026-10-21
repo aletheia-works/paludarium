@@ -91,7 +91,7 @@ fn runner_bootstrap_preserves_existing_state_layout() {
 #[test]
 #[cfg_attr(
     not(coverage),
-    ignore = "requires PALUDARIUM_U3_NATIVE_OBSERVATIONS from the native runner"
+    ignore = "requires PALUDARIUM_ENCODINGS_NATIVE_OBSERVATIONS from the native runner"
 )]
 fn packed_and_crypto_native_replay() {
     use paludarium_decoder::{Mnemonic as M, decode};
@@ -103,9 +103,10 @@ fn packed_and_crypto_native_replay() {
             .map(|n| u8::from_str_radix(&value[n..n + 2], 16).unwrap())
             .collect()
     }
-    let path = std::env::var("PALUDARIUM_U3_NATIVE_OBSERVATIONS").expect("native observation path");
+    let path =
+        std::env::var("PALUDARIUM_ENCODINGS_NATIVE_OBSERVATIONS").expect("native observation path");
     let observations = std::fs::read_to_string(path).unwrap();
-    let full = std::env::var_os("PALUDARIUM_U3_FULL_REPLAY").is_some();
+    let full = std::env::var_os("PALUDARIUM_ENCODINGS_FULL_REPLAY").is_some();
     let mut count = 0;
     for row in observations.lines() {
         let fields: Vec<_> = row.split('|').collect();
@@ -303,7 +304,7 @@ fn cpuid_zero_extends_all_outputs_and_advances_rip() {
 #[test]
 #[cfg_attr(
     not(coverage),
-    ignore = "requires PALUDARIUM_U3_NATIVE_FAULTS from the native runner"
+    ignore = "requires PALUDARIUM_ENCODINGS_NATIVE_FAULTS from the native runner"
 )]
 fn packed_crypto_movement_fault_replay() {
     use super::exec::Stop;
@@ -315,14 +316,14 @@ fn packed_crypto_movement_fault_replay() {
             .map(|n| u8::from_str_radix(&value[n..n + 2], 16).unwrap())
             .collect()
     }
-    let path = std::env::var("PALUDARIUM_U3_NATIVE_FAULTS").expect("native fault path");
+    let path = std::env::var("PALUDARIUM_ENCODINGS_NATIVE_FAULTS").expect("native fault path");
     let cpuid = std::fs::read_to_string(
-        std::env::var("PALUDARIUM_U3_NATIVE_CPUID").expect("native CPU profile path"),
+        std::env::var("PALUDARIUM_ENCODINGS_NATIVE_CPUID").expect("native CPU profile path"),
     )
     .unwrap();
     let amd = native_contract::amd_profile(&cpuid);
     let mut differences = std::collections::BTreeSet::new();
-    let full = std::env::var_os("PALUDARIUM_U3_FULL_REPLAY").is_some();
+    let full = std::env::var_os("PALUDARIUM_ENCODINGS_FULL_REPLAY").is_some();
     let mut count = 0;
     for row in std::fs::read_to_string(path).unwrap().lines() {
         let f: Vec<_> = row.split('|').collect();

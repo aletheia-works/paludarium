@@ -212,7 +212,7 @@ cases.append(("stmxcsr", "stmxcsr [rdx+256]"))
 assembly = [".intel_syntax noprefix", ".text"]
 declarations = []
 for i, (_name, insn) in enumerate(cases):
-    label = f"u3_case_{i}"
+    label = f"encodings_case_{i}"
     declarations.append(
         f"extern void {label}(void *, const void *, void *); extern unsigned char {label}_op[], {label}_end[];"
     )
@@ -238,9 +238,9 @@ for i, (_name, insn) in enumerate(cases):
     ]
 assembly += ['.section .note.GNU-stack,"",@progbits']
 (output / "cases.S").write_text("\n".join(assembly) + "\n")
-header = "\n".join(declarations) + "\nstatic const struct u3_case cases[] = {\n"
+header = "\n".join(declarations) + "\nstatic const struct encodings_case cases[] = {\n"
 header += "\n".join(
-    f'{{"{n}",u3_case_{i},u3_case_{i}_op,u3_case_{i}_end,{int("[rdx" in insn)}}},'
+    f'{{"{n}",encodings_case_{i},encodings_case_{i}_op,encodings_case_{i}_end,{int("[rdx" in insn)}}},'
     for i, (n, insn) in enumerate(cases)
 )
 (output / "cases.h").write_text(header + "\n};\n")

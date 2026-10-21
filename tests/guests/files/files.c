@@ -4,7 +4,7 @@ static long call(long n,long a,long b,long c,long d,long e,long f) {
  long out; __asm__ volatile("syscall":"=a"(out):"a"(n),"D"(a),"S"(b),"d"(c),"r"(r10),"r"(r8),"r"(r9):"rcx","r11","memory"); return out;
 }
 #define S(n,a,b,c) call(n,(long)(a),(long)(b),(long)(c),0,0,0)
-static char p[]="/tmp/paludarium-u7-fixture",q[]="/tmp/paludarium-u7-link",r[]="/tmp/paludarium-u7-renamed";
+static char p[]="/tmp/paludarium-files-fixture",q[]="/tmp/paludarium-files-link",r[]="/tmp/paludarium-files-renamed";
 static char buf[4096]; static long results[16]; static unsigned char st[144];
 void _start(void) {
  long fd,x=0;
@@ -43,7 +43,7 @@ void _start(void) {
  if(CASE==29){S(83,r,0755,0);results[x++]=S(4,r,st,0);results[x++]=*(long*)(st+16);S(84,r,0,0);}
  if(CASE==30){S(86,p,q,0);results[x++]=S(82,p,q,0);results[x++]=S(4,p,st,0);results[x++]=*(long*)(st+16);S(2,r,66,0600);results[x++]=S(82,p,r,0);results[x++]=S(4,r,st,0);results[x++]=*(long*)(st+16);}
  if(CASE==31){long d=S(2,p,64,0600);results[x++]=d>=0;results[x++]=S(0,d,buf,1);S(3,d,0,0);}
- if(CASE==32){S(83,r,0755,0);S(88,r,q,0);results[x++]=S(84,"/tmp/paludarium-u7-link/",0,0);results[x++]=S(82,"/tmp/paludarium-u7-link/",p,0);results[x++]=S(87,"/tmp/paludarium-u7-link/",0,0);results[x++]=S(4,r,st,0);results[x++]=S(6,q,st,0);results[x++]=S(2,"/tmp/paludarium-u7-unused",64|65536,0600);results[x++]=S(4,"/tmp/paludarium-u7-unused",st,0);S(87,"/tmp/paludarium-u7-unused",0,0);S(87,q,0,0);S(84,r,0,0);}
+ if(CASE==32){S(83,r,0755,0);S(88,r,q,0);results[x++]=S(84,"/tmp/paludarium-files-link/",0,0);results[x++]=S(82,"/tmp/paludarium-files-link/",p,0);results[x++]=S(87,"/tmp/paludarium-files-link/",0,0);results[x++]=S(4,r,st,0);results[x++]=S(6,q,st,0);results[x++]=S(2,"/tmp/paludarium-files-unused",64|65536,0600);results[x++]=S(4,"/tmp/paludarium-files-unused",st,0);S(87,"/tmp/paludarium-files-unused",0,0);S(87,q,0,0);S(84,r,0,0);}
  S(3,fd,0,0);S(87,p,0,0);S(87,q,0,0);S(87,r,0,0);
  }
  S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);

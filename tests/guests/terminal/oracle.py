@@ -35,7 +35,7 @@ def run(directory, case):
             )
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 37, 101, 0, 0))
         arguments = ["u9", "", "two words"]
-        with tempfile.TemporaryDirectory(prefix="paludarium-u9-") as fixture:
+        with tempfile.TemporaryDirectory(prefix="paludarium-terminal-") as fixture:
             if case == 11:
                 file = Path(fixture) / "regular"
                 file.write_bytes(b"fixture")
@@ -46,7 +46,7 @@ def run(directory, case):
             result = subprocess.run(
                 arguments,
                 executable=str(Path(directory).resolve() / f"io-{case}"),
-                env={"U9_TEST": "value with spaces"},
+                env={"TERMINAL_TEST": "value with spaces"},
                 **streams,
                 capture_output=True,
                 timeout=30,

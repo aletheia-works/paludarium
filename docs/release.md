@@ -78,7 +78,7 @@ names them differently.
 | `dependencies` | `ci.yml` | `dependencies` |
 | `linux-differential` | `ci.yml` | `differential tests (x86-64 Linux)`, `fixed guest programs / differential` |
 | `rust-coverage` | `ci.yml` | `line coverage >= 80%` |
-| `u9-coverage` | `ci.yml` | `line coverage >= 80%` (its step `U9 target crates line coverage >= 80%` fails under 80%) |
+| `terminal-coverage` | `ci.yml` | `line coverage >= 80%` (its step `U9 target crates line coverage >= 80%` fails under 80%) |
 | `js-coverage` | `quality.yml` (dispatch on main) | `wasm-programs / differential (ubuntu-latest, node)` (its step `Fixed production JavaScript coverage` fails under 80%) |
 | `package-check` | `release-check.yml` (dispatch on main) | `packages` |
 

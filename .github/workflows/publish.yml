@@ -121,7 +121,7 @@ jobs:
       - name: Publish in dependency order and verify registry digests
         env:
           GH_TOKEN: ${{ github.token }}
-          U15_OIDC_CRATES_IO_TOKEN: ${{ steps.crates.outputs.token }}
+          RELEASE_OIDC_CRATES_IO_TOKEN: ${{ steps.crates.outputs.token }}
         run: |
           PALUDARIUM_TEST_NODE="$(command -v node)" PALUDARIUM_RELEASE_NPM="$GITHUB_WORKSPACE/target/release-evidence/tools/node_modules/npm/bin/npm-cli.js" python -B scripts/release/check.py --mode publish --evidence target/release-evidence/release-evidence.json
       # Step24 (review 04, finding 5): keep the progress record and the command receipts after the

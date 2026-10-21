@@ -9,7 +9,7 @@ macro_rules! cases {
     ($($name:ident => $binary:literal),* $(,)?) => {$(
         #[test]
         fn $name() {
-            if std::env::var("PALUDARIUM_U2_CHILD").is_err() {
+            if std::env::var("PALUDARIUM_INSTRUCTIONS_CHILD").is_err() {
                 GUESTS.get_or_init(|| { ensure_guests_built().expect("build native guests"); });
             }
             support::bounded(stringify!($name), || {

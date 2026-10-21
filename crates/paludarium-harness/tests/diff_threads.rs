@@ -17,7 +17,7 @@ fn case(id: usize) {
                 .success()
         );
     });
-    let emulator = std::env::var_os("PALUDARIUM_U5_EMULATOR")
+    let emulator = std::env::var_os("PALUDARIUM_THREADS_EMULATOR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("target/debug/paludarium"));
     assert!(

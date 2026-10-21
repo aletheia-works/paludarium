@@ -25,14 +25,16 @@ def operation(executable, binary, args, directory, environment, fixture=None, mo
         "".join(k + "=" + v + "\n" for k, v in environment.items())
     )
     env = dict(
-        os.environ, PALUDARIUM_U10_OPERATION=str(directory), PALUDARIUM_U10_BINARY=str(binary)
+        os.environ,
+        PALUDARIUM_PROGRAMS_OPERATION=str(directory),
+        PALUDARIUM_PROGRAMS_BINARY=str(binary),
     )
-    env.pop("PALUDARIUM_U10_FIXTURE", None)
-    env.pop("PALUDARIUM_U10_MOUNTED", None)
+    env.pop("PALUDARIUM_PROGRAMS_FIXTURE", None)
+    env.pop("PALUDARIUM_PROGRAMS_MOUNTED", None)
     if fixture is not None:
-        env["PALUDARIUM_U10_FIXTURE"] = str(fixture)
+        env["PALUDARIUM_PROGRAMS_FIXTURE"] = str(fixture)
     if mounted:
-        env["PALUDARIUM_U10_MOUNTED"] = "1"
+        env["PALUDARIUM_PROGRAMS_MOUNTED"] = "1"
     child = run(
         [str(executable), "--exact", "programs_guest_operation", "--nocapture"], cwd=ROOT, env=env
     )
@@ -69,7 +71,7 @@ def differential(executable, *, original_argv=False):
     config = original if original_argv else comparison_config(original)
     compare_rows = compare_original if original_argv else compare
     guests = pathlib.Path(
-        os.environ.get("PALUDARIUM_U10_GUEST_DIR", ROOT / "target/guests/programs")
+        os.environ.get("PALUDARIUM_PROGRAMS_GUEST_DIR", ROOT / "target/guests/programs")
     ).resolve()
     output = ROOT / "target/programs/differential"
     if original_argv:
@@ -108,7 +110,7 @@ def differential(executable, *, original_argv=False):
             flush=True,
         )
 
-    with tempfile.TemporaryDirectory(prefix="paludarium-u10-emulated-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="paludarium-programs-emulated-") as temporary:
         scratch = pathlib.Path(temporary)
         for name in config["probe"] + ["all", "environment"]:
             args = [] if name == "all" else [name]

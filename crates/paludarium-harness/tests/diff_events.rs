@@ -17,7 +17,7 @@ fn case(id: usize) {
                 .success()
         );
     });
-    let emulator = std::env::var_os("PALUDARIUM_U6_EMULATOR")
+    let emulator = std::env::var_os("PALUDARIUM_EVENTS_EMULATOR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("target/debug/paludarium"));
     assert!(
@@ -146,7 +146,7 @@ fn named_case(name: &str) {
             .arg(root.join(format!("target/events-diff/{name}")))
             .arg("--emulator")
             .arg(
-                std::env::var_os("PALUDARIUM_U6_EMULATOR")
+                std::env::var_os("PALUDARIUM_EVENTS_EMULATOR")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| root.join("target/debug/paludarium"))
             )

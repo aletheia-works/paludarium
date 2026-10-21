@@ -21,8 +21,8 @@ try {
  if (!crossOriginIsolated) throw new Error('Shared memory unavailable');
  const input = await (await fetch('/input.json')).json(), decode = text => Uint8Array.from(atob(text), char => char.charCodeAt(0));
  input.probe=decode(input.probe); input.aube=decode(input.aube); for(const key of Object.keys(input.fixtures)) input.fixtures[key]=decode(input.fixtures[key]);
- window.__u11Report = await runSuite({...input,wasmUrl:'/production.wasm',onRow: async(name,row)=>{await fetch('/row',{method:'POST',body:JSON.stringify({name,row})});}});
-} catch(error) {window.__u11Report={passed:false,complete:false,error:String(error)};}
+ window.__wasmReport = await runSuite({...input,wasmUrl:'/production.wasm',onRow: async(name,row)=>{await fetch('/row',{method:'POST',body:JSON.stringify({name,row})});}});
+} catch(error) {window.__wasmReport={passed:false,complete:false,error:String(error)};}
 </script>`;
 const server = createServer(async (request, response) => {
   const headers = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp", "Cache-Control": "no-store" };

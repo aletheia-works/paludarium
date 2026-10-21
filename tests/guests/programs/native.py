@@ -31,7 +31,7 @@ def observe(guests, output, config, *, extra_snapshot=None, prepare_fixture=None
         "binary_hashes": {n: digest(guests / n) for n in ("probe", "aube")},
         "rows": {},
     }
-    with tempfile.TemporaryDirectory(prefix="paludarium-u10-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="paludarium-programs-") as scratch:
         root = pathlib.Path(scratch)
         env = dict(config["environment"], HOME=str(root / "home"), TMPDIR=str(root / "tmp"))
         (root / "home").mkdir()

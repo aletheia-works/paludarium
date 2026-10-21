@@ -6,7 +6,7 @@ mod support;
 
 #[test]
 fn windows_guest_operation() {
-    if std::env::var_os("PALUDARIUM_U13_OPERATION").is_some() {
+    if std::env::var_os("PALUDARIUM_WINDOWS_OPERATION").is_some() {
         support::operation();
     }
 }

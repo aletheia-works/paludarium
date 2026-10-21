@@ -3,13 +3,13 @@ use std::time::{Duration, Instant};
 
 /// Enclose the complete native/emulated comparison in a kill-and-reap watchdog.
 pub fn bounded(name: &str, run: impl FnOnce()) {
-    if std::env::var("PALUDARIUM_U4_CHILD").as_deref() == Ok(name) {
+    if std::env::var("PALUDARIUM_SIGNALS_TIME_CHILD").as_deref() == Ok(name) {
         run();
         return;
     }
     let mut child = Command::new(std::env::current_exe().expect("test executable"))
         .args(["--exact", name, "--nocapture"])
-        .env("PALUDARIUM_U4_CHILD", name)
+        .env("PALUDARIUM_SIGNALS_TIME_CHILD", name)
         .stdin(Stdio::null())
         .spawn()
         .expect("isolated U4 test");

@@ -11,8 +11,8 @@ const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 // Dedicated module-prepared integration entry. Missing input is an error;
 // native expected-results preflight loads only the separate pure cost tests.
 test("same-source control packs, imports and runs real hello with natural cleanup", async () => {
-  const input=process.env.PALUDARIUM_U14_CONTROL_WASM;
-  assert.ok(input,"PALUDARIUM_U14_CONTROL_WASM must explicitly select the fresh control module");
+  const input=process.env.PALUDARIUM_JIT_CONTROL_WASM;
+  assert.ok(input,"PALUDARIUM_JIT_CONTROL_WASM must explicitly select the fresh control module");
   const root=resolve(dirname(fileURLToPath(import.meta.url)),"../../..");
   const pkg=resolve(root,"packages/paludarium-wasm"), module=await readFile(resolve(root,input));
   const receipt=JSON.parse(await readFile(resolve(root,input)+".receipt.json","utf8"));

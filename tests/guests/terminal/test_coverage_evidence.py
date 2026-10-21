@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
-SPEC = importlib.util.spec_from_file_location("u9_producer", ROOT / "scripts/coverage-evidence.py")
+SPEC = importlib.util.spec_from_file_location(
+    "terminal_producer", ROOT / "scripts/coverage-evidence.py"
+)
 P = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(P)
 
@@ -24,7 +26,7 @@ def suite(passed, ignored=0):
 
 class Evidence(unittest.TestCase):
     def capture(self):
-        tmp = tempfile.TemporaryDirectory(dir=ROOT / "target", prefix="u9-capture-")
+        tmp = tempfile.TemporaryDirectory(dir=ROOT / "target", prefix="terminal-capture-")
         self.addCleanup(tmp.cleanup)
         return P.Capture(Path(tmp.name) / "fresh")
 
@@ -121,7 +123,7 @@ class Evidence(unittest.TestCase):
         self.assertEqual(c.commands[0]["stream_mode"], "stderr-merged-into-stdout")
 
     def test_nested_14_children_and_host84_keep_only_diff_outer(self):
-        child = "running 1 test\ntest u9_case ... ok\n" + result(1, filtered=13) + "ok\n"
+        child = "running 1 test\ntest terminal_case ... ok\n" + result(1, filtered=13) + "ok\n"
         diff = (
             " Running tests/diff_terminal.rs (target/diff_terminal)\nrunning 14 tests\n"
             + child * 14

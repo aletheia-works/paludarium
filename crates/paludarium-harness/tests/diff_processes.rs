@@ -46,7 +46,7 @@ mod linux {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = workspace_root().join("target/guests/processes");
-        if std::env::var("PALUDARIUM_U8_CHILD").is_err() {
+        if std::env::var("PALUDARIUM_PROCESSES_CHILD").is_err() {
             static BUILT: OnceLock<()> = OnceLock::new();
             BUILT.get_or_init(|| {
                 assert!(

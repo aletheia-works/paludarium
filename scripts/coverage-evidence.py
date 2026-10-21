@@ -230,7 +230,7 @@ def main():
         "--output-path",
         str(original_lcov),
     ]
-    out, err, measured = capture.run("dedicated-u9", command, merge=True)
+    out, err, measured = capture.run("dedicated-terminal", command, merge=True)
     tests, ignored = diff_counts((out + err).decode("utf-8", "replace"))
     measured.update(tests=tests, ignored=ignored)
     covdir = ROOT / "target/llvm-cov-target"

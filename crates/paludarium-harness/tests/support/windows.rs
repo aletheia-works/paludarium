@@ -77,8 +77,8 @@ fn fixture_mode(path: &Path) -> u32 {
 
 /// Executed only as a child of the 30-second Python group watchdog.
 pub fn operation() {
-    let directory = PathBuf::from(std::env::var_os("PALUDARIUM_U13_OPERATION").unwrap());
-    let binary = PathBuf::from(std::env::var_os("PALUDARIUM_U13_BINARY").unwrap());
+    let directory = PathBuf::from(std::env::var_os("PALUDARIUM_WINDOWS_OPERATION").unwrap());
+    let binary = PathBuf::from(std::env::var_os("PALUDARIUM_WINDOWS_BINARY").unwrap());
     let mut args = vec![b"/program".to_vec()];
     args.extend(
         std::fs::read_to_string(directory.join("args"))
@@ -99,9 +99,9 @@ pub fn operation() {
             .env
             .push((key.as_bytes().to_vec(), value.as_bytes().to_vec()));
     }
-    if let Some(fixture) = std::env::var_os("PALUDARIUM_U13_FIXTURE") {
+    if let Some(fixture) = std::env::var_os("PALUDARIUM_WINDOWS_FIXTURE") {
         let fixture = PathBuf::from(fixture).canonicalize().unwrap();
-        if std::env::var_os("PALUDARIUM_U13_MOUNTED").is_some() {
+        if std::env::var_os("PALUDARIUM_WINDOWS_MOUNTED").is_some() {
             config.mounts.push(Mount {
                 host: fixture.join("app"),
                 guest: b"/".to_vec(),
@@ -116,8 +116,8 @@ pub fn operation() {
         }
     }
     let host = Arc::new(CaptureHost(RecordingHost::new()));
-    let fixture_modes = if std::env::var_os("PALUDARIUM_U13_MOUNTED").is_some() {
-        let fixture = PathBuf::from(std::env::var_os("PALUDARIUM_U13_FIXTURE").unwrap());
+    let fixture_modes = if std::env::var_os("PALUDARIUM_WINDOWS_MOUNTED").is_some() {
+        let fixture = PathBuf::from(std::env::var_os("PALUDARIUM_WINDOWS_FIXTURE").unwrap());
         [
             ("app/package.json", "/package.json"),
             ("app/filedep/package.json", "/filedep/package.json"),

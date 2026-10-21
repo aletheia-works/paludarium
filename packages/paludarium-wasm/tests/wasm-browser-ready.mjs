@@ -14,9 +14,9 @@ try {
       worker.postMessage(shared);
     });
     if (Atomics.load(word,0) !== 73) throw new Error('actual Worker did not share memory');
-    window.__u11Report = {readiness:true, passed:true, crossOriginIsolated, sharedWorker:true};
+    window.__wasmReport = {readiness:true, passed:true, crossOriginIsolated, sharedWorker:true};
   } finally { worker.terminate(); }
-} catch(error) { window.__u11Report = {readiness:true, passed:false, error:String(error)}; }
+} catch(error) { window.__wasmReport = {readiness:true, passed:false, error:String(error)}; }
 </script>`;
 const server = createServer((request, response) => {
   const headers = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp", "Cache-Control": "no-store" };

@@ -27,7 +27,7 @@ REQUIRED = {
     "linux-differential",
     "rust-coverage",
     "js-coverage",
-    "u9-coverage",
+    "terminal-coverage",
     "package-check",
 }
 ACCEPTANCE = {"FR6.3", "FR7.2", "FR8.2", "FR8.3"}

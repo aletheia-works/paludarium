@@ -12,12 +12,14 @@ mod oracle;
 #[ignore = "diagnostic replay requires explicitly supplied native observations"]
 fn saved_observation_replay() {
     let normal =
-        std::fs::read_to_string(std::env::var("PALUDARIUM_U3_NATIVE_OBSERVATIONS").unwrap())
+        std::fs::read_to_string(std::env::var("PALUDARIUM_ENCODINGS_NATIVE_OBSERVATIONS").unwrap())
             .unwrap();
     let fault =
-        std::fs::read_to_string(std::env::var("PALUDARIUM_U3_NATIVE_FAULTS").unwrap()).unwrap();
+        std::fs::read_to_string(std::env::var("PALUDARIUM_ENCODINGS_NATIVE_FAULTS").unwrap())
+            .unwrap();
     let cpuid =
-        std::fs::read_to_string(std::env::var("PALUDARIUM_U3_NATIVE_CPUID").unwrap()).unwrap();
+        std::fs::read_to_string(std::env::var("PALUDARIUM_ENCODINGS_NATIVE_CPUID").unwrap())
+            .unwrap();
     println!(
         "normal:{} fault:{}",
         oracle::compare(&normal, false),
@@ -85,7 +87,8 @@ fn runner_bootstrap() {
 #[ignore = "probe for the bounded runner; started by bounded_reaches_ignored_tests"]
 fn bounded_ignored_probe() {
     support::bounded("bounded_ignored_probe", || {
-        let marker = std::env::var_os("PALUDARIUM_U3_PROBE_MARKER").expect("probe marker path");
+        let marker =
+            std::env::var_os("PALUDARIUM_ENCODINGS_PROBE_MARKER").expect("probe marker path");
         std::fs::write(marker, "ran").expect("write probe marker");
     });
 }
@@ -107,8 +110,8 @@ fn bounded_reaches_ignored_tests() {
             "--ignored",
             "--nocapture",
         ])
-        .env("PALUDARIUM_U3_PROBE_MARKER", &marker)
-        .env_remove("PALUDARIUM_U3_CHILD")
+        .env("PALUDARIUM_ENCODINGS_PROBE_MARKER", &marker)
+        .env_remove("PALUDARIUM_ENCODINGS_CHILD")
         .status()
         .unwrap();
     assert!(status.success(), "ignored bounded probe: {status}");

@@ -8,7 +8,7 @@ import time
 import gdb
 
 started = time.monotonic()
-start_point = os.environ.get("U2_TRACE_START", "elf-entry")
+start_point = os.environ.get("INSTRUCTIONS_TRACE_START", "elf-entry")
 start_evidence = {"pc": hex(int(gdb.selected_frame().pc()))}
 if start_point == "first-fixture-open":
     while True:
@@ -59,7 +59,7 @@ try:
         gdb.execute("stepi", to_string=True)
 except gdb.error as error:
     reason = "inferior-exited" if not gdb.selected_inferior().pid else str(error)
-output = os.environ["U2_TRACE_OUTPUT"]
+output = os.environ["INSTRUCTIONS_TRACE_OUTPUT"]
 with open(output, "w", encoding="utf-8") as stream:
     json.dump(
         {
@@ -77,6 +77,6 @@ with open(output, "w", encoding="utf-8") as stream:
         stream,
         indent=2,
     )
-print("U2_TRACE", steps, reason, output)
+print("INSTRUCTIONS_TRACE", steps, reason, output)
 if gdb.selected_inferior().pid:
     gdb.execute("kill", to_string=True)

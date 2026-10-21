@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createPaludarium } from "../index.mjs";
-import { U11_DEADLINE_MS, U11_PROBES, validateOracle } from "./wasm-contract.mjs";
+import { WASM_DEADLINE_MS, WASM_PROBES, validateOracle } from "./wasm-contract.mjs";
 
 const [modulePath, oraclePath, guestDirectory = "target/guests/programs", outputDirectory = "target/wasm/baseline"] = process.argv.slice(2);
 if (!modulePath || !oraclePath) throw new Error("usage: wasm-baseline.mjs module oracle [guests] [output]");
@@ -23,7 +23,7 @@ const report = { schema: 1, baseline: true, module_sha256: hash(await readFile(m
 await mkdir(outputDirectory, { recursive: true });
 const persist = () => writeFile(resolve(outputDirectory, "observations.json"), JSON.stringify(report, null, 2) + "\n");
 await persist();
-const cases = [...[...U11_PROBES, "all", "environment"].map(name => ({ name: `probe-${name}`, guest: "probe", args: name === "all" ? [] : [name] })), ...config.aube.map(row => ({ ...row, guest: "aube" }))];
+const cases = [...[...WASM_PROBES, "all", "environment"].map(name => ({ name: `probe-${name}`, guest: "probe", args: name === "all" ? [] : [name] })), ...config.aube.map(row => ({ ...row, guest: "aube" }))];
 for (const item of cases) {
   const start = performance.now(), row = { stdout: "", stderr: "", exit: null, timed_out: false, errors: [] };
   let launcher, timer;
@@ -38,7 +38,7 @@ for (const item of cases) {
     };
     const writer = guest.stdin.getWriter(); await writer.close(); writer.releaseLock();
     const finished = Promise.all([capture(guest.stdout, "stdout"), capture(guest.stderr, "stderr"), guest.exited.then(status => { row.exit = status.kind === "exited" ? status.code : 128 + status.signal; }).catch(error => row.errors.push({ kind: error.kind, message: String(error) }))]);
-    await Promise.race([finished, new Promise((_, reject) => { timer = setTimeout(() => { row.timed_out = true; guest.kill(); reject(new Error("external 30-second baseline deadline")); }, U11_DEADLINE_MS); })]);
+    await Promise.race([finished, new Promise((_, reject) => { timer = setTimeout(() => { row.timed_out = true; guest.kill(); reject(new Error("external 30-second baseline deadline")); }, WASM_DEADLINE_MS); })]);
   } catch (error) { row.errors.push({ kind: error.kind, message: String(error) }); }
   finally { clearTimeout(timer); await launcher?.dispose(); }
   row.seconds = (performance.now() - start) / 1000;

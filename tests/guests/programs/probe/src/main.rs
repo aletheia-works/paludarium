@@ -166,7 +166,7 @@ fn turns(
 }
 
 fn directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let path = std::env::temp_dir().join("paludarium-u10-probe");
+    let path = std::env::temp_dir().join("paludarium-programs-probe");
     fs::create_dir(&path)?;
     Ok(path)
 }

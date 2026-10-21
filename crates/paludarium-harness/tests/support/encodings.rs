@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 /// `--ignored` is not filtered out there, and it writes a marker after `run`
 /// returns: a child that ran no test cannot pass as a success.
 pub fn bounded(name: &str, run: impl FnOnce()) {
-    if std::env::var("PALUDARIUM_U3_CHILD").as_deref() == Ok(name) {
+    if std::env::var("PALUDARIUM_ENCODINGS_CHILD").as_deref() == Ok(name) {
         run();
-        if let Some(done) = std::env::var_os("PALUDARIUM_U3_CHILD_DONE") {
+        if let Some(done) = std::env::var_os("PALUDARIUM_ENCODINGS_CHILD_DONE") {
             std::fs::write(done, name).expect("write U3 child marker");
         }
         return;
@@ -24,8 +24,8 @@ pub fn bounded(name: &str, run: impl FnOnce()) {
     let _ = std::fs::remove_file(&done);
     let mut child = Command::new(std::env::current_exe().expect("test executable"))
         .args(["--exact", name, "--include-ignored", "--nocapture"])
-        .env("PALUDARIUM_U3_CHILD", name)
-        .env("PALUDARIUM_U3_CHILD_DONE", &done)
+        .env("PALUDARIUM_ENCODINGS_CHILD", name)
+        .env("PALUDARIUM_ENCODINGS_CHILD_DONE", &done)
         .process_group(0)
         .stdin(Stdio::null())
         .spawn()

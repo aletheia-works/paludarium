@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "child")) {
         result("argv", argc == 4 && !strcmp(argv[3], "argument"));
-        result("env", getenv("U8_VALUE") && !strcmp(getenv("U8_VALUE"), "value"));
+        result("env", getenv("PROCESSES_VALUE") && !strcmp(getenv("PROCESSES_VALUE"), "value"));
         return 7;
     }
     if (!strcmp(mode, "fd-child")) {
@@ -159,7 +159,7 @@ int main(int argc, char **argv) {
         if (!strcmp(mode, "vfork-exit")) _exit(9);
         if (!strcmp(mode, "exec") || !strcmp(mode, "vfork-exec") || !strcmp(mode, "cloexec")) {
             char *args[] = { "process", !strcmp(mode, "cloexec") ? "fd-child" : "child", (char *)self, "argument", NULL };
-            char *env[] = { "U8_VALUE=value", NULL };
+            char *env[] = { "PROCESSES_VALUE=value", NULL };
             execve(self, args, env);
             _exit(92);
         }

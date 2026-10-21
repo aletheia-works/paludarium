@@ -186,7 +186,8 @@ fn runtime_tmp() {
 }
 #[test]
 fn runtime_mount() {
-    let path = std::env::temp_dir().join(format!("paludarium-runtime-u7-{}", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("paludarium-runtime-files-{}", std::process::id()));
     std::fs::create_dir_all(&path).unwrap();
     std::fs::write(path.join("a"), b"hello").unwrap();
     let mut config = Config::new("/prog", vec![]).with_file("/prog", tiny_exec(&HELLO, b"hi\n"));
@@ -210,7 +211,7 @@ fn runtime_mount() {
 fn runtime_missing_mount_root() {
     let mut c = Config::new("/prog", vec![]);
     c.mounts.push(Mount {
-        host: PathBuf::from("/paludarium-u7-does-not-exist"),
+        host: PathBuf::from("/paludarium-files-does-not-exist"),
         guest: b"/mnt".to_vec(),
     });
     assert!(Session::new(c, Arc::new(paludarium_host::NativeHost::new())).is_err());
@@ -234,7 +235,7 @@ fn runtime_invalid_placement() {
 }
 #[test]
 fn runtime_cross_mount() {
-    let root = std::env::temp_dir().join(format!("paludarium-u7-cross-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("paludarium-files-cross-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let mut fs = MountedFs::new(MemFs::new());
     fs.mount(

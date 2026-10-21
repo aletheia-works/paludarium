@@ -29,23 +29,23 @@ jobs:
           node-version: '26.12.0'
       - name: Fixed project-local verification tools
         run: |
-          python -m venv .venv-u15
-          .venv-u15/bin/python -m pip install coverage==7.16.2
+          python -m venv .venv-release
+          .venv-release/bin/python -m pip install coverage==7.16.2
           npm install --prefix target/release-evidence/tools --ignore-scripts npm@12.2.0
           bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component rust-src --target wasm32-unknown-unknown
           bash scripts/rustup-retry.sh toolchain install 1.99.1 --profile minimal
       - name: Release unit and mock integration tests
-        run: .venv-u15/bin/python -B -m coverage run --data-file=target/release-evidence/python.coverage --include='*/scripts/release/policy.py,*/scripts/release/package.py,*/scripts/release/check.py,*/scripts/release/acceptance.py' -m unittest discover -s tests/release -p 'test_*.py' -v
+        run: .venv-release/bin/python -B -m coverage run --data-file=target/release-evidence/python.coverage --include='*/scripts/release/policy.py,*/scripts/release/package.py,*/scripts/release/check.py,*/scripts/release/acceptance.py' -m unittest discover -s tests/release -p 'test_*.py' -v
       - name: Static configuration
-        run: .venv-u15/bin/python -B -m coverage run --append --data-file=target/release-evidence/python.coverage scripts/release/check.py --mode validate
+        run: .venv-release/bin/python -B -m coverage run --append --data-file=target/release-evidence/python.coverage scripts/release/check.py --mode validate
       - name: Actual eleven crates, isolated registry and same npm tarball
         run: |
-          PALUDARIUM_TEST_NODE="$(command -v node)" PALUDARIUM_RELEASE_NPM="$GITHUB_WORKSPACE/target/release-evidence/tools/node_modules/npm/bin/npm-cli.js" .venv-u15/bin/python -B -m coverage run --append --data-file=target/release-evidence/python.coverage scripts/release/check.py --mode package-check --output target/release-evidence/package-result.json
+          PALUDARIUM_TEST_NODE="$(command -v node)" PALUDARIUM_RELEASE_NPM="$GITHUB_WORKSPACE/target/release-evidence/tools/node_modules/npm/bin/npm-cli.js" .venv-release/bin/python -B -m coverage run --append --data-file=target/release-evidence/python.coverage scripts/release/check.py --mode package-check --output target/release-evidence/package-result.json
       - name: Each fixed release component retains 80 percent
         run: |
-          .venv-u15/bin/python -m coverage json --data-file=target/release-evidence/python.coverage -o target/release-evidence/python-coverage.json
-          .venv-u15/bin/python -m coverage report --data-file=target/release-evidence/python.coverage --fail-under=80
-          .venv-u15/bin/python -c 'import json; d=json.load(open("target/release-evidence/python-coverage.json")); rows={k:v for k,v in d["files"].items() if k in ("scripts/release/policy.py","scripts/release/package.py","scripts/release/check.py","scripts/release/acceptance.py")}; assert len(rows)==4; assert all(r["summary"]["percent_covered"]>=80 for r in rows.values())'
+          .venv-release/bin/python -m coverage json --data-file=target/release-evidence/python.coverage -o target/release-evidence/python-coverage.json
+          .venv-release/bin/python -m coverage report --data-file=target/release-evidence/python.coverage --fail-under=80
+          .venv-release/bin/python -c 'import json; d=json.load(open("target/release-evidence/python-coverage.json")); rows={k:v for k,v in d["files"].items() if k in ("scripts/release/policy.py","scripts/release/package.py","scripts/release/check.py","scripts/release/acceptance.py")}; assert len(rows)==4; assert all(r["summary"]["percent_covered"]>=80 for r in rows.values())'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

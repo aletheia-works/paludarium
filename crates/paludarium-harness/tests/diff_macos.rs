@@ -6,7 +6,7 @@ mod support;
 
 #[test]
 fn programs_guest_operation() {
-    if std::env::var_os("PALUDARIUM_U10_OPERATION").is_some() {
+    if std::env::var_os("PALUDARIUM_PROGRAMS_OPERATION").is_some() {
         support::operation();
     }
 }

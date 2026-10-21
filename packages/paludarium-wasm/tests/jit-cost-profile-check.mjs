@@ -126,7 +126,7 @@ export async function superviseProfile(args) {
   await mkdir(output, { recursive: true });
   const windows = process.platform === "win32";
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...args], {
-    env: { ...process.env, U14_COST_PROFILE_CHILD: "1" }, detached: !windows, stdio: "inherit" });
+    env: { ...process.env, JIT_COST_PROFILE_CHILD: "1" }, detached: !windows, stdio: "inherit" });
   let timed_out = false, process_group_cleaned = false;
   const terminate = () => {
     try { if (windows) child.kill("SIGKILL"); else process.kill(-child.pid, "SIGKILL"); }
@@ -154,7 +154,7 @@ export async function superviseProfile(args) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   try {
-    if (process.env.U14_COST_PROFILE_CHILD === "1") {
+    if (process.env.JIT_COST_PROFILE_CHILD === "1") {
       need(args.length === 4, "usage: diagnostic-module fresh-native-oracle guests output");
       const [modulePath, oraclePath, guests, output] = args;
       const report = await collectProfile({ modulePath, oraclePath, guests, output });

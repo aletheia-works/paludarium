@@ -78,15 +78,15 @@ jobs:
           args: toolchain install nightly-2026-10-11 --profile minimal
       - name: Compile C10 harness before network isolation
         run: |
-          u10_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          CARGO_HOME="$u10_cargo_home" cargo +nightly-2026-10-11 test --locked -p paludarium-harness --test diff_programs --no-run
+          programs_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          CARGO_HOME="$programs_cargo_home" cargo +nightly-2026-10-11 test --locked -p paludarium-harness --test diff_programs --no-run
       - name: Fresh native oracle then bounded C10 differential without network
         run: |
-          u10_cargo="$(rustup which --toolchain nightly-2026-10-11 cargo)"
-          u10_rustc="$(rustup which --toolchain nightly-2026-10-11 rustc)"
-          u10_bin="$(dirname "$u10_cargo")"
-          u10_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          sudo unshare --net env GITHUB_SHA="$GITHUB_SHA" PATH="$u10_bin:$PATH" RUSTC="$u10_rustc" CARGO_HOME="$u10_cargo_home" "$u10_cargo" test --locked --offline -p paludarium-harness --test diff_programs -- --include-ignored --nocapture
+          programs_cargo="$(rustup which --toolchain nightly-2026-10-11 cargo)"
+          programs_rustc="$(rustup which --toolchain nightly-2026-10-11 rustc)"
+          programs_bin="$(dirname "$programs_cargo")"
+          programs_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          sudo unshare --net env GITHUB_SHA="$GITHUB_SHA" PATH="$programs_bin:$PATH" RUSTC="$programs_rustc" CARGO_HOME="$programs_cargo_home" "$programs_cargo" test --locked --offline -p paludarium-harness --test diff_programs -- --include-ignored --nocapture
       - name: Make differential evidence readable after isolated execution
         if: always()
         run: |

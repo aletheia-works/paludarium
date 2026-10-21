@@ -21,7 +21,7 @@ env:
   CARGO_TERM_COLOR: always
   PALUDARIUM_TEST_NODE: node
   # The U1 crates (unit-test-instructions.md).
-  U1_PACKAGES: >-
+  CORE_PACKAGES: >-
     -p paludarium-types -p paludarium-decoder -p paludarium-mmu
     -p paludarium-cpu -p paludarium-loader -p paludarium-vfs
     -p paludarium-kernel -p paludarium-host -p paludarium-jit
@@ -90,7 +90,7 @@ jobs:
       - name: Unit tests (U1 crates)
         shell: bash
         run: |
-          read -r -a packages <<< "$U1_PACKAGES"
+          read -r -a packages <<< "$CORE_PACKAGES"
           cargo test --locked "${packages[@]}" -- --nocapture
         env:
           RUST_BACKTRACE: "1"
@@ -176,12 +176,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      PALUDARIUM_U3_FULL_REPLAY: '1'
-      PALUDARIUM_U3_NATIVE_OBSERVATIONS: ${{ github.workspace }}/target/encodings-guests/observe.native
-      PALUDARIUM_U3_NATIVE_FAULTS: ${{ github.workspace }}/target/encodings-guests/fault-observe.native
-      PALUDARIUM_U3_NATIVE_CPUID: ${{ github.workspace }}/target/encodings-guests/cpuid-observe.native
-      PALUDARIUM_U5_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
-      PALUDARIUM_U6_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
+      PALUDARIUM_ENCODINGS_FULL_REPLAY: '1'
+      PALUDARIUM_ENCODINGS_NATIVE_OBSERVATIONS: ${{ github.workspace }}/target/encodings-guests/observe.native
+      PALUDARIUM_ENCODINGS_NATIVE_FAULTS: ${{ github.workspace }}/target/encodings-guests/fault-observe.native
+      PALUDARIUM_ENCODINGS_NATIVE_CPUID: ${{ github.workspace }}/target/encodings-guests/cpuid-observe.native
+      PALUDARIUM_THREADS_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
+      PALUDARIUM_EVENTS_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -259,7 +259,7 @@ jobs:
             source <(cargo llvm-cov show-env --sh)
             cargo build --locked -p paludarium --target-dir target/llvm-cov-target
           )
-          read -r -a packages <<< "$U1_PACKAGES"
+          read -r -a packages <<< "$CORE_PACKAGES"
           cargo llvm-cov --no-clean --locked "${packages[@]}" -p paludarium-harness --ignore-filename-regex 'paludarium-harness/' --fail-under-lines 80
         env:
           RUST_TEST_THREADS: "1"

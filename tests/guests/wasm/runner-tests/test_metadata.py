@@ -7,7 +7,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[4]
 SPEC = importlib.util.spec_from_file_location(
-    "u11_metadata", ROOT / "tests/guests/wasm/fixture_metadata.py"
+    "wasm_metadata", ROOT / "tests/guests/wasm/fixture_metadata.py"
 )
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)

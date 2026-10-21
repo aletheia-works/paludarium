@@ -301,7 +301,7 @@ struct Run {
 
 #[test]
 fn fresh_linux_instruction_differential() {
-    if std::env::var_os("PALUDARIUM_U14_INSTRUCTION_CHILD").is_none() {
+    if std::env::var_os("PALUDARIUM_JIT_INSTRUCTION_CHILD").is_none() {
         assert!(
             Command::new("python3")
                 .arg(
@@ -317,7 +317,7 @@ fn fresh_linux_instruction_differential() {
     }
     {
         let root = paludarium_harness::workspace_root();
-        let directory = paludarium_harness::guest_dir().join("u14-instructions");
+        let directory = paludarium_harness::guest_dir().join("jit-instructions");
         std::fs::create_dir_all(&directory).unwrap();
         let binary = directory.join("oracle");
         assert!(

@@ -57,14 +57,19 @@ fn call(k: &mut Kernel, t: &mut Thread, m: &mut AddressSpace, number: u64, args:
     k.handle(t, m, ExitReason::Syscall { rip: t.cpu.rip })
 }
 fn native(binary: &str, mode: usize) -> String {
-    let out = run_native(&build_u4().join(binary), binary, &[mode.to_string()]).unwrap();
+    let out = run_native(
+        &build_signals_time().join(binary),
+        binary,
+        &[mode.to_string()],
+    )
+    .unwrap();
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.stderr.is_empty());
     String::from_utf8(out.stdout).unwrap()
 }
 #[test]
 fn write_restart_native_oracle() {
-    build_u4();
+    build_signals_time();
     support::bounded("oracles::write_restart_native_oracle", || {
         for restart in 0..=1 {
             let expected = native("write-restart-oracle", restart);
@@ -120,7 +125,7 @@ fn write_restart_native_oracle() {
 }
 #[test]
 fn stop_continue_native_oracle() {
-    build_u4();
+    build_signals_time();
     support::bounded("oracles::stop_continue_native_oracle", || {
         for mode in 0..7 {
             let expected = native("stop-continue-oracle", mode);
@@ -176,7 +181,7 @@ fn stop_continue_native_oracle() {
 
 #[test]
 fn realtime_order_native_oracle() {
-    build_u4();
+    build_signals_time();
     support::bounded("oracles::realtime_order_native_oracle", || {
         let mut mismatches = Vec::new();
         println!(

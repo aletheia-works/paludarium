@@ -45,7 +45,7 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate(self.config)
 
-    def test_reporter_is_exact_and_u10_is_unchanged(self):
+    def test_reporter_is_exact_and_programs_is_unchanged(self):
         import json
 
         self.assertEqual(self.config["aube"][1]["args"], ["install", "--reporter=append-only"])

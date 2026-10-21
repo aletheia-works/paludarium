@@ -286,7 +286,7 @@ mod real_console {
                 "windows::real_console::real_console_child",
                 "--nocapture",
             ])
-            .env("PALUDARIUM_U13_CONSOLE_CASE", case)
+            .env("PALUDARIUM_WINDOWS_CONSOLE_CASE", case)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -335,7 +335,7 @@ mod real_console {
     }
     #[test]
     fn real_console_child() {
-        let Ok(case) = std::env::var("PALUDARIUM_U13_CONSOLE_CASE") else {
+        let Ok(case) = std::env::var("PALUDARIUM_WINDOWS_CONSOLE_CASE") else {
             subprocess("0");
             return;
         };

@@ -347,7 +347,7 @@ mod mount_tests {
     impl Fixture {
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
-                "paludarium-u7-mount-{}-{}",
+                "paludarium-files-mount-{}-{}",
                 std::process::id(),
                 ID.fetch_add(1, Ordering::Relaxed)
             ));

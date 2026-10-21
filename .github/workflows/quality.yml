@@ -22,7 +22,7 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
   CARGO_TERM_COLOR: always
   # The U1 crates (unit-test-instructions.md).
-  U1_PACKAGES: >-
+  CORE_PACKAGES: >-
     -p paludarium-types -p paludarium-decoder -p paludarium-mmu
     -p paludarium-cpu -p paludarium-loader -p paludarium-vfs
     -p paludarium-kernel -p paludarium-host -p paludarium-jit
@@ -264,7 +264,7 @@ jobs:
       - name: Unit tests (U1 crates)
         shell: bash
         run: |
-          read -r -a packages <<< "$U1_PACKAGES"
+          read -r -a packages <<< "$CORE_PACKAGES"
           cargo test --locked "${packages[@]}" -- --nocapture
         env:
           RUST_BACKTRACE: "1"
@@ -277,13 +277,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           for ($iteration = 1; $iteration -le 10; $iteration++) {
-            Write-Output "U7_WINDOWS_REQUIRED_RUN=$iteration/10 head=$env:GITHUB_SHA"
+            Write-Output "FILES_WINDOWS_REQUIRED_RUN=$iteration/10 head=$env:GITHUB_SHA"
             $lines = & cargo test --locked -p paludarium-host --lib native_fs::files_tests::native_windows_symlink_rename_race -- --exact --nocapture 2>&1
             $exitCode = $LASTEXITCODE
             $lines | Write-Output
             if ($exitCode -ne 0) { throw "Windows exchange run $iteration failed: exit $exitCode" }
             $text = $lines -join "`n"
-            if ($text -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;' -or $text -notmatch 'U7_WINDOWS_WATCHDOG elapsed_ms=') {
+            if ($text -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;' -or $text -notmatch 'FILES_WINDOWS_WATCHDOG elapsed_ms=') {
               throw "Windows exchange run $iteration did not execute the required watchdog test"
             }
           }
@@ -373,12 +373,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      PALUDARIUM_U3_FULL_REPLAY: '1'
-      PALUDARIUM_U3_NATIVE_OBSERVATIONS: ${{ github.workspace }}/target/encodings-guests/observe.native
-      PALUDARIUM_U3_NATIVE_FAULTS: ${{ github.workspace }}/target/encodings-guests/fault-observe.native
-      PALUDARIUM_U3_NATIVE_CPUID: ${{ github.workspace }}/target/encodings-guests/cpuid-observe.native
-      PALUDARIUM_U5_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
-      PALUDARIUM_U6_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
+      PALUDARIUM_ENCODINGS_FULL_REPLAY: '1'
+      PALUDARIUM_ENCODINGS_NATIVE_OBSERVATIONS: ${{ github.workspace }}/target/encodings-guests/observe.native
+      PALUDARIUM_ENCODINGS_NATIVE_FAULTS: ${{ github.workspace }}/target/encodings-guests/fault-observe.native
+      PALUDARIUM_ENCODINGS_NATIVE_CPUID: ${{ github.workspace }}/target/encodings-guests/cpuid-observe.native
+      PALUDARIUM_THREADS_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
+      PALUDARIUM_EVENTS_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -459,7 +459,7 @@ jobs:
             source <(cargo llvm-cov show-env --sh)
             cargo build --locked -p paludarium --target-dir target/llvm-cov-target
           )
-          read -r -a packages <<< "$U1_PACKAGES"
+          read -r -a packages <<< "$CORE_PACKAGES"
           cargo llvm-cov --no-clean --locked "${packages[@]}" -p paludarium-harness --ignore-filename-regex 'paludarium-harness/' --fail-under-lines 80
         env:
           RUST_TEST_THREADS: "1"
@@ -503,10 +503,10 @@ jobs:
     timeout-minutes: 20
     env:
       PALUDARIUM_TEST_NODE: node
-      PALUDARIUM_U3_FULL_REPLAY: '1'
-      PALUDARIUM_U3_NATIVE_OBSERVATIONS: ${{ github.workspace }}/target/encodings-guests/observe.native
-      PALUDARIUM_U3_NATIVE_FAULTS: ${{ github.workspace }}/target/encodings-guests/fault-observe.native
-      PALUDARIUM_U3_NATIVE_CPUID: ${{ github.workspace }}/target/encodings-guests/cpuid-observe.native
+      PALUDARIUM_ENCODINGS_FULL_REPLAY: '1'
+      PALUDARIUM_ENCODINGS_NATIVE_OBSERVATIONS: ${{ github.workspace }}/target/encodings-guests/observe.native
+      PALUDARIUM_ENCODINGS_NATIVE_FAULTS: ${{ github.workspace }}/target/encodings-guests/fault-observe.native
+      PALUDARIUM_ENCODINGS_NATIVE_CPUID: ${{ github.workspace }}/target/encodings-guests/cpuid-observe.native
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -584,7 +584,7 @@ jobs:
         run: python3 -B scripts/build-jit-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"
       - name: Dedicated prepared-control distribution integration
         env:
-          PALUDARIUM_U14_CONTROL_WASM: target/jit-cost-profile/acceptance-control.wasm
+          PALUDARIUM_JIT_CONTROL_WASM: target/jit-cost-profile/acceptance-control.wasm
         run: node --test packages/paludarium-wasm/tests/jit-control-distribution.test.mjs
       - name: Fixed U14 Python coverage and fail-closed boundaries
         run: |

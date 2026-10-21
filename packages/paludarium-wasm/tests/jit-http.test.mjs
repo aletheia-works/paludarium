@@ -2,10 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, request } from "node:http";
 import { once } from "node:events";
-import { createU14Handler } from "./jit-http.mjs";
+import { createJitHandler } from "./jit-http.mjs";
 
 async function withServer(t, overrides = {}) {
-  const handler = createU14Handler({ root: process.cwd(), modulePath: "production.wasm", page: "page", encoded: { ok: true }, oracle: { rows: { probe: {} } }, onRow: async () => {}, ...overrides });
+  const handler = createJitHandler({ root: process.cwd(), modulePath: "production.wasm", page: "page", encoded: { ok: true }, oracle: { rows: { probe: {} } }, onRow: async () => {}, ...overrides });
   const server = createServer(handler);
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
@@ -30,13 +30,13 @@ test("static bytes and wasm MIME are retained", async t => {
 });
 test("missing file yields one 500 response and server survives", async t => {
   const url = await withServer(t);
-  const response = await fetch(url + "/missing-u14-regression-file");
+  const response = await fetch(url + "/missing-regression-file");
   assert.equal(response.status, 500); assert.match(await response.text(), /ENOENT/);
   assert.equal((await fetch(url + "/")).status, 200);
 });
 test("concurrent missing and successful requests remain independent", async t => {
   const url = await withServer(t);
-  const results = await Promise.all(Array.from({ length: 20 }, (_, i) => fetch(url + (i % 2 ? "/" : "/missing-u14-regression-file"))));
+  const results = await Promise.all(Array.from({ length: 20 }, (_, i) => fetch(url + (i % 2 ? "/" : "/missing-regression-file"))));
   assert.deepEqual(results.map(r => r.status), Array.from({ length: 20 }, (_, i) => i % 2 ? 200 : 500));
   await Promise.all(results.map(r => r.text()));
 });

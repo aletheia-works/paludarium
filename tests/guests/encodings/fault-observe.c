@@ -7,7 +7,7 @@
 #include <setjmp.h>
 #include <sys/mman.h>
 #include <ucontext.h>
-struct u3_case { const char *name; void (*run)(void *, const void *, void *); const unsigned char *op,*end; int memory; };
+struct encodings_case { const char *name; void (*run)(void *, const void *, void *); const unsigned char *op,*end; int memory; };
 #include "cases.h"
 static sigjmp_buf jump;
 static unsigned char captured[280];

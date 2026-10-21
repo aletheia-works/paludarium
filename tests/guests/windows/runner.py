@@ -13,7 +13,7 @@ def run(command, *, cwd, env, timeout=30):
         from windows_job import run as supervise
     else:
         path = pathlib.Path(__file__).resolve().parents[1] / "programs/runner.py"
-        spec = importlib.util.spec_from_file_location("u13_unix_supervisor", path)
+        spec = importlib.util.spec_from_file_location("windows_unix_supervisor", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         supervise = module.run

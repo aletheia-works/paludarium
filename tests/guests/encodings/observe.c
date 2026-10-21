@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <cpuid.h>
-struct u3_case { const char *name; void (*run)(void *, const void *, void *); const unsigned char *op, *end; int memory; };
+struct encodings_case { const char *name; void (*run)(void *, const void *, void *); const unsigned char *op, *end; int memory; };
 #include "cases.h"
 static void hex(const unsigned char *p,size_t n) { for(size_t i=0;i<n;i++) printf("%02x",p[i]); }
 int main(void) {

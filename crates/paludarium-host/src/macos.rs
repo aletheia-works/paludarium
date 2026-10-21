@@ -354,7 +354,7 @@ mod tests {
     }
     #[test]
     fn stderr_terminal_in_child() {
-        const CHILD: &str = "PALUDARIUM_U12_STDERR_PTY";
+        const CHILD: &str = "PALUDARIUM_MACOS_STDERR_PTY";
         if std::env::var_os(CHILD).is_some() {
             use crate::{Host, NativeHost, StreamId};
             assert!(

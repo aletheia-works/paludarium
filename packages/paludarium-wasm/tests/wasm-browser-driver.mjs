@@ -83,7 +83,7 @@ async function safariAttempt(url, timeout) {
     phase = "script-report";
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
-      const report = await webdriverRequest(base, "POST", `/session/${sessionId}/execute/sync`, { script: "return window.__u11Report || null;", args: [] });
+      const report = await webdriverRequest(base, "POST", `/session/${sessionId}/execute/sync`, { script: "return window.__wasmReport || null;", args: [] });
       if (report) return { environment: "safari", version: session.capabilities?.browserVersion ?? "unknown", ...report };
       await sleep(100);
     }
@@ -113,8 +113,8 @@ export async function runBrowser(name, url, timeout = 600000) {
   try {
     const page = await browser.newPage();
     await page.goto(url, { timeout: 30000 });
-    await page.waitForFunction(() => window.__u11Report !== undefined, null, { timeout });
-    const report = await page.evaluate(() => window.__u11Report);
+    await page.waitForFunction(() => window.__wasmReport !== undefined, null, { timeout });
+    const report = await page.evaluate(() => window.__wasmReport);
     return { environment: name, version: browser.version(), ...report };
   } finally { await browser.close(); }
 }

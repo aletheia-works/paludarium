@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location(
-    "u9_coverage_check", ROOT / "scripts/coverage-check.py"
+    "terminal_coverage_check", ROOT / "scripts/coverage-check.py"
 )
 C = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(C)
@@ -14,7 +14,7 @@ SPEC.loader.exec_module(C)
 
 class CoverageCheck(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="u9-check-", dir=ROOT / "target")
+        self.tmp = tempfile.TemporaryDirectory(prefix="terminal-check-", dir=ROOT / "target")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.scope = json.loads(C.SCOPE.read_bytes())

@@ -18,14 +18,16 @@ def operation(executable, binary, args, directory, environment, fixture=None, mo
         "".join(k + "=" + v + "\n" for k, v in environment.items()), encoding="utf-8"
     )
     env = dict(
-        os.environ, PALUDARIUM_U13_OPERATION=str(directory), PALUDARIUM_U13_BINARY=str(binary)
+        os.environ,
+        PALUDARIUM_WINDOWS_OPERATION=str(directory),
+        PALUDARIUM_WINDOWS_BINARY=str(binary),
     )
-    env.pop("PALUDARIUM_U13_FIXTURE", None)
-    env.pop("PALUDARIUM_U13_MOUNTED", None)
+    env.pop("PALUDARIUM_WINDOWS_FIXTURE", None)
+    env.pop("PALUDARIUM_WINDOWS_MOUNTED", None)
     if fixture is not None:
-        env["PALUDARIUM_U13_FIXTURE"] = str(fixture)
+        env["PALUDARIUM_WINDOWS_FIXTURE"] = str(fixture)
     if mounted:
-        env["PALUDARIUM_U13_MOUNTED"] = "1"
+        env["PALUDARIUM_WINDOWS_MOUNTED"] = "1"
     child = run(
         [str(executable), "--exact", "windows_guest_operation", "--nocapture"], cwd=ROOT, env=env
     )

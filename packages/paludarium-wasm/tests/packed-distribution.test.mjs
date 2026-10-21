@@ -8,8 +8,8 @@ import { createHash } from "node:crypto";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const packageRoot = resolve(root, "packages/paludarium-wasm");
-const npm = process.env.U11_NPM;
-assert.ok(npm && npm.startsWith("/"), "U11_NPM must name the real mise npm executable");
+const npm = process.env.WASM_NPM;
+assert.ok(npm && npm.startsWith("/"), "WASM_NPM must name the real mise npm executable");
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const child = resolve(packageRoot, "tests/packed-distribution-child.mjs");
 const guest = resolve(packageRoot, "tests/guests/hello");

@@ -134,7 +134,7 @@ impl Fixture {
     fn new() -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "paludarium-u13-{}-{}",
+            "paludarium-windows-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));

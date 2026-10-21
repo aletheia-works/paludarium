@@ -1,5 +1,5 @@
 // Same real-program observation boundary for Node and browser acceptance.
-import { U11_DEADLINE_MS, U11_PROBES } from "./wasm-contract.mjs";
+import { WASM_DEADLINE_MS, WASM_PROBES } from "./wasm-contract.mjs";
 export function normalize(text, root) {
   return text.replace(/\x1b\[[0-9;]*m/g, "").split(root).join("<FIXTURE>").replace(/(?<= in )\d+(?:\.\d+)?(?:ms|s)\b/g, "<ELAPSED>");
 }
@@ -24,7 +24,7 @@ export async function observeProgram(launcher, options) {
   try {
     const writer = guest.stdin.getWriter(); await writer.close(); writer.releaseLock();
     const completed = Promise.all([capture(guest.stdout, "stdout"), capture(guest.stderr, "stderr"), guest.exited.then(status => { row.exit = status.kind === "exited" ? status.code : 128 + status.signal; }).catch(cause => row.errors.push({ kind: cause.kind, message: String(cause) }))]);
-    await Promise.race([completed, new Promise(resolve => { timer = setTimeout(() => { row.timed_out = true; guest.kill(); resolve(); }, U11_DEADLINE_MS); })]);
+    await Promise.race([completed, new Promise(resolve => { timer = setTimeout(() => { row.timed_out = true; guest.kill(); resolve(); }, WASM_DEADLINE_MS); })]);
     if (row.timed_out) await launcher.dispose();
   } catch (cause) { row.errors.push({ kind: cause.kind, message: String(cause) }); }
   finally { clearTimeout(timer); }
@@ -32,5 +32,5 @@ export async function observeProgram(launcher, options) {
   return row;
 }
 export function probeCases() {
-  return [...U11_PROBES, "all", "environment"].map(name => ({ name: `probe-${name}`, args: name === "all" ? [] : [name] }));
+  return [...WASM_PROBES, "all", "environment"].map(name => ({ name: `probe-${name}`, args: name === "all" ? [] : [name] }));
 }

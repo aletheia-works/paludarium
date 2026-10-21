@@ -298,7 +298,7 @@ fn readonly_failed_cmpxchg_parallel() {
 fn parallel_runner_bootstrap() {
     // Build fixtures before the execution watchdog, as in diff_instructions. The isolated
     // child inherits their directory, but not ensure_guests_built's OnceLock.
-    if std::env::var("PALUDARIUM_U2_CHILD").is_err() {
+    if std::env::var("PALUDARIUM_INSTRUCTIONS_CHILD").is_err() {
         paludarium_harness::ensure_guests_built().expect("build native guests");
     }
     support::bounded("parallel_runner_bootstrap", || {

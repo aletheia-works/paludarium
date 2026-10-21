@@ -53,7 +53,7 @@ def observe(output):
         raise RuntimeError("metadata oracle requires x86-64 Linux")
     if os.readlink("/proc/self/ns/net") == os.readlink("/proc/1/ns/net"):
         raise RuntimeError("metadata oracle requires isolated network namespace")
-    with tempfile.TemporaryDirectory(prefix="u10-native-metadata-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="programs-native-metadata-") as temporary:
         directory = pathlib.Path(temporary) / "fixture"
         shutil.copytree(HERE / "fixtures", directory)
         result = run(

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tests/guests/wasm"))
 from supervisor import supervise  # noqa: E402
 
-os.environ["PALUDARIUM_U14_INSTRUCTION_CHILD"] = "1"
+os.environ["PALUDARIUM_JIT_INSTRUCTION_CHILD"] = "1"
 result = supervise(
     [sys.argv[1], "--exact", "fresh_linux_instruction_differential", "--nocapture"],
     cwd=ROOT,

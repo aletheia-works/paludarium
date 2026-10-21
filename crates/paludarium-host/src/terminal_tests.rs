@@ -63,7 +63,7 @@ fn stdout_stderr_remain_separate() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_managed_pty() {
-    if std::env::var_os("PALUDARIUM_U9_HOST_CHILD").is_some() {
+    if std::env::var_os("PALUDARIUM_TERMINAL_HOST_CHILD").is_some() {
         let info = NativeHost.terminal_info(StreamId::Stdin).unwrap().unwrap();
         assert_eq!((info.rows, info.columns), (37, 101));
         assert_eq!(info.attributes.control_flags, 0xbf);

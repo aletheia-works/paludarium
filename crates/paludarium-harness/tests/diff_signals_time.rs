@@ -7,9 +7,9 @@ mod oracles;
 mod support;
 use paludarium_harness::{compare, run_emulated, run_native, workspace_root};
 
-fn build_u4() -> std::path::PathBuf {
+fn build_signals_time() -> std::path::PathBuf {
     let out = workspace_root().join("target/guests/signals-time");
-    if std::env::var("PALUDARIUM_U4_CHILD").is_err() {
+    if std::env::var("PALUDARIUM_SIGNALS_TIME_CHILD").is_err() {
         static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         BUILT.get_or_init(|| {
             assert!(
@@ -25,7 +25,7 @@ fn build_u4() -> std::path::PathBuf {
     out
 }
 fn guest(group: &str, name: &'static str, case: usize) {
-    let out = build_u4();
+    let out = build_signals_time();
     support::bounded(name, || {
         let binary = format!("{group}-{case}");
         let path = out.join(&binary);

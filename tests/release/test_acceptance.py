@@ -97,23 +97,23 @@ class World:
             "observations.json": encode(emulated()),
             "native/observations.json": encode(native()),
         }
-        self.members[A.U12]["macos-host"] = {
+        self.members[A.MACOS_QUALITY]["macos-host"] = {
             "comparison/observations.json": encode(emulated()),
             "comparison-original/observations.json": encode(emulated()),
         }
-        self.members[A.U12]["macos-native-first"] = {
+        self.members[A.MACOS_QUALITY]["macos-native-first"] = {
             "macos/native/observations.json": encode(native()),
             "macos/native-original/observations.json": encode(native()),
         }
-        self.members[A.U14]["windows-host"] = {
+        self.members[A.FULL_QUALITY]["windows-host"] = {
             "windows/comparison/observations.json": encode(emulated()),
             "windows/comparison-original/observations.json": encode(emulated()),
         }
-        self.members[A.U14]["windows-native-first"] = {
+        self.members[A.FULL_QUALITY]["windows-native-first"] = {
             "windows/native/observations.json": encode(native()),
             "windows/native-original/observations.json": encode(native()),
         }
-        self.members[A.U14]["wasm-acceptance-inputs"] = {
+        self.members[A.FULL_QUALITY]["wasm-acceptance-inputs"] = {
             "target/wasm/native/observations.json": self.oracle
         }
         for environment in A.WASM_OS:
@@ -161,7 +161,7 @@ class World:
                         },
                     }
                 )
-            self.members[A.U14]["wasm-" + environment] = members
+            self.members[A.FULL_QUALITY]["wasm-" + environment] = members
         self.tamper = {}
 
     def add_job(self, workflow, name):
@@ -284,7 +284,7 @@ class AcceptanceTests(unittest.TestCase):
         self.rejected("ci.yml: run unfinished or not successful")
 
     def test_unfinished_run(self):
-        self.world.runs[A.U14].update(status="in_progress", conclusion=None)
+        self.world.runs[A.FULL_QUALITY].update(status="in_progress", conclusion=None)
         self.rejected("quality.yml: run unfinished")
 
     def test_failed_job(self):
@@ -293,7 +293,7 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_other_head(self):
         with self.subTest("run"):
-            self.world.runs[A.U12]["head_sha"] = OTHER
+            self.world.runs[A.MACOS_QUALITY]["head_sha"] = OTHER
             self.rejected("macos-quality.yml: 0 official")
         with self.subTest("artifact"):
             self.world = World()
@@ -302,13 +302,18 @@ class AcceptanceTests(unittest.TestCase):
         with self.subTest("performance document"):
             self.world = World()
             self.world.edit(
-                A.U14, "wasm-node", "performance/observations.json", lambda d: d.update(head=OTHER)
+                A.FULL_QUALITY,
+                "wasm-node",
+                "performance/observations.json",
+                lambda d: d.update(head=OTHER),
             )
             self.rejected("FR8.3 not met by performance")
 
     def test_other_repository(self):
         with self.subTest("fork pull request run is not official"):
-            self.world.runs[A.U12]["head_repository"] = dict(full_name="attacker/paludarium")
+            self.world.runs[A.MACOS_QUALITY]["head_repository"] = dict(
+                full_name="attacker/paludarium"
+            )
             self.rejected("macos-quality.yml: 0 official")
         with self.subTest("fork workflow run"):
             environ = dict(
@@ -329,7 +334,7 @@ class AcceptanceTests(unittest.TestCase):
             document["result"].update(p=529 / 1024, meanJit=5.4987, meanInterpreter=5.4972)
             document["result"]["pass"] = False
 
-        self.world.edit(A.U14, "wasm-node", "performance/observations.json", failed)
+        self.world.edit(A.FULL_QUALITY, "wasm-node", "performance/observations.json", failed)
         self.rejected("FR8.3 not met by performance")
 
     def test_duplicate_purpose_runs(self):
@@ -353,12 +358,14 @@ class AcceptanceTests(unittest.TestCase):
         def fail(document):
             document["rows"]["probe-rayon"]["stdout"] = "FAIL rayon\n"
 
-        self.world.edit(A.U14, "windows-host", "windows/comparison/observations.json", fail)
+        self.world.edit(
+            A.FULL_QUALITY, "windows-host", "windows/comparison/observations.json", fail
+        )
         self.rejected("FR6.3 not met by windows-native")
 
     def test_jit_mode_failure(self):
         self.world.edit(
-            A.U14,
+            A.FULL_QUALITY,
             "wasm-firefox",
             "observations.json",
             lambda d: d["modes"]["jit"].update(passed=False),
@@ -367,7 +374,7 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_guest_bytes_differ_from_oracle(self):
         self.world.edit(
-            A.U14,
+            A.FULL_QUALITY,
             "windows-host",
             "windows/comparison/observations.json",
             lambda d: d["binary_hashes"].update(aube="9" * 64),
@@ -376,7 +383,10 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_wasm_module_differs(self):
         self.world.edit(
-            A.U14, "wasm-safari", "observations.json", lambda d: d.update(module_sha256="4" * 64)
+            A.FULL_QUALITY,
+            "wasm-safari",
+            "observations.json",
+            lambda d: d.update(module_sha256="4" * 64),
         )
         self.rejected("wasm environments ran different modules")
 
@@ -397,7 +407,7 @@ class AcceptanceTests(unittest.TestCase):
         api = self.world.api()
         item = next(
             i
-            for i in api.listings[("artifacts", self.world.runs[A.U12]["id"])]
+            for i in api.listings[("artifacts", self.world.runs[A.MACOS_QUALITY]["id"])]
             if i["name"] == "macos-host"
         )
         api.archives[item["archive_download_url"]] = b"not a zip"
@@ -506,7 +516,11 @@ class AdapterTests(unittest.TestCase):
         )
         # Trusted Publishing only: dispatched with no inputs and no declaration.
         self.assertEqual(trigger.strip(), "workflow_dispatch:")
-        for name in ("inputs", "U15_TRUSTED_PUBLISHERS_REGISTERED", "U15_FIRST_PUBLICATION"):
+        for name in (
+            "inputs",
+            "RELEASE_TRUSTED_PUBLISHERS_REGISTERED",
+            "RELEASE_FIRST_PUBLICATION",
+        ):
             self.assertNotIn(name, text)
 
 

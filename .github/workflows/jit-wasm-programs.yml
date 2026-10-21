@@ -104,7 +104,7 @@ jobs:
         run: python3 -B scripts/build-jit-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"
       - name: Launcher component and C12 boundary tests
         env:
-          PALUDARIUM_U14_CONTROL_WASM: target/jit-cost-profile/acceptance-control.wasm
+          PALUDARIUM_JIT_CONTROL_WASM: target/jit-cost-profile/acceptance-control.wasm
         if: matrix.environment == 'node'
         run: |
           mkdir -p target/wasm/node/v8
@@ -113,8 +113,8 @@ jobs:
           node packages/paludarium-wasm/tests/wasm-api-check.mjs packages/paludarium-wasm/paludarium.wasm
       - name: Compare identical fourteen cases in both execution modes
         env:
-          U14_ENVIRONMENT: ${{ matrix.environment }}
-        run: python3 -B scripts/jit-run.py --environment "$U14_ENVIRONMENT" --wasm packages/paludarium-wasm/paludarium.wasm --native target/wasm/native/observations.json --guests target/guests/programs --output "target/wasm/$U14_ENVIRONMENT"
+          JIT_ENVIRONMENT: ${{ matrix.environment }}
+        run: python3 -B scripts/jit-run.py --environment "$JIT_ENVIRONMENT" --wasm packages/paludarium-wasm/paludarium.wasm --native target/wasm/native/observations.json --guests target/guests/programs --output "target/wasm/$JIT_ENVIRONMENT"
       - name: Fixed production JavaScript coverage
         if: matrix.environment == 'node'
         run: node packages/paludarium-wasm/tests/jit-coverage.mjs target/wasm/node/v8 target/wasm/node/js-coverage.json

@@ -19,7 +19,7 @@ fn case(name: &'static str, id: usize) {
     static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let root = workspace_root();
     let out = root.join("target/guests/terminal");
-    if std::env::var_os("PALUDARIUM_U9_CHILD").is_none() {
+    if std::env::var_os("PALUDARIUM_TERMINAL_CHILD").is_none() {
         BUILT.get_or_init(|| {
             assert!(
                 Command::new("bash")
@@ -76,7 +76,7 @@ fn case(name: &'static str, id: usize) {
             b"two words".to_vec(),
         ];
         let config = Config::new("/prog", args)
-            .with_env("U9_TEST", "value with spaces")
+            .with_env("TERMINAL_TEST", "value with spaces")
             .with_file("/prog", binary)
             .with_file("/regular", b"fixture".to_vec());
         let session = Session::new(config, host.clone()).unwrap();

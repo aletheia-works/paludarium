@@ -15,7 +15,7 @@ CODES = {
 
 # U3 instruction forms execute through the production Session/launcher. These
 # bytes are inputs only; native output and signal expectations are regenerated.
-U3_OPS = {
+ENCODINGS_OPS = {
     "encodings-packed": "660f3804c1",  # PMADDUBSW: signed saturation and lane pairing
     "encodings-sha": "0f38cbc10f38ccc10f38cdc1",
     "encodings-aes": "660f38dcc1660f38ddc1",
@@ -23,7 +23,7 @@ U3_OPS = {
     "encodings-float": "660f58c1f20f59c1f20f51c0",  # ADDPD, MULSD, SQRTSD
     "encodings-fault": "f20f51c0",  # SQRTSD negative finite operand: SIGFPE
 }
-for name, operation in U3_OPS.items():
+for name, operation in ENCODINGS_OPS.items():
     load = "48b80020400000000000f30f6f00f30f6f4810"
     # Unmask invalid only for the explicit fault fixture.
     control = "0fae9040000000" if name == "encodings-fault" else ""

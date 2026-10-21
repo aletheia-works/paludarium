@@ -32,10 +32,10 @@ HEAD = re.compile("[0-9a-f]{40}")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 CI = ".github/workflows/ci.yml"
-U12 = ".github/workflows/macos-quality.yml"
-U14 = ".github/workflows/quality.yml"
+MACOS_QUALITY = ".github/workflows/macos-quality.yml"
+FULL_QUALITY = ".github/workflows/quality.yml"
 RELEASE_CHECK = ".github/workflows/release-check.yml"
-U10_JOB = "fixed guest programs / differential"
+PROGRAMS_JOB = "fixed guest programs / differential"
 NODE_JOB = "wasm-programs / differential (ubuntu-latest, node)"
 EVIDENCE_EVENTS = ("push", "workflow_dispatch")
 
@@ -47,10 +47,10 @@ QUALITY = {
     ),
     "lint": (CI, ("lint",)),
     "dependencies": (CI, ("dependencies",)),
-    "linux-differential": (CI, ("differential tests (x86-64 Linux)", U10_JOB)),
+    "linux-differential": (CI, ("differential tests (x86-64 Linux)", PROGRAMS_JOB)),
     "rust-coverage": (CI, ("line coverage >= 80%",)),
-    "js-coverage": (U14, (NODE_JOB,)),
-    "u9-coverage": (CI, ("line coverage >= 80%",)),
+    "js-coverage": (FULL_QUALITY, (NODE_JOB,)),
+    "terminal-coverage": (CI, ("line coverage >= 80%",)),
     "package-check": (RELEASE_CHECK, ("packages",)),
 }
 
@@ -78,15 +78,15 @@ WASM_OS = {
 # Guests are rebuilt in every job (aube embeds its build date), so each
 # environment is checked against the fresh native oracle of its own run,
 # with equal guest bytes; guests are never compared across runs.
-U11_INPUTS = {"wasm-acceptance-inputs": ("target/wasm/native/observations.json",)}
+WASM_INPUTS = {"wasm-acceptance-inputs": ("target/wasm/native/observations.json",)}
 SOURCES = {
     "linux-native": (
         CI,
-        U10_JOB,
+        PROGRAMS_JOB,
         {"programs-differential": ("observations.json", "native/observations.json")},
     ),
     "macos-native": (
-        U12,
+        MACOS_QUALITY,
         "macos-host",
         {
             "macos-host": (
@@ -100,7 +100,7 @@ SOURCES = {
         },
     ),
     "windows-native": (
-        U14,
+        FULL_QUALITY,
         "windows-host",
         {
             "windows-host": (
@@ -113,13 +113,13 @@ SOURCES = {
             ),
         },
     ),
-    "performance": (U14, NODE_JOB, {"wasm-node": ("performance/observations.json",)}),
+    "performance": (FULL_QUALITY, NODE_JOB, {"wasm-node": ("performance/observations.json",)}),
 }
 for _env, _os in WASM_OS.items():
     SOURCES["wasm-" + _env] = (
-        U14,
+        FULL_QUALITY,
         f"wasm-programs / differential ({_os}, {_env})",
-        {"wasm-" + _env: ("observations.json",), **U11_INPUTS},
+        {"wasm-" + _env: ("observations.json",), **WASM_INPUTS},
     )
 # Emulated document -> its native oracle, per host source.
 HOST_PAIRS = {
@@ -412,7 +412,7 @@ def native_result(label, documents):
 
 def wasm(label, documents, digests):
     environment = label.removeprefix("wasm-")
-    document, oracle_name = documents["observations.json"], U11_INPUTS["wasm-acceptance-inputs"][0]
+    document, oracle_name = documents["observations.json"], WASM_INPUTS["wasm-acceptance-inputs"][0]
     hashes, oracle = native_oracle(documents[oracle_name], label + " oracle")
     policy.require(
         document.get("environment") == environment

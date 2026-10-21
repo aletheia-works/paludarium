@@ -52,7 +52,7 @@ def main():
             prepare_fixture=prepare_epoch_fixture,
         )
         receipt = {
-            "unit": "u11-wasm-launcher",
+            "unit": "wasm-launcher",
             "native_oracle_sha256": digest(output / "observations.json"),
             "cases_sha256": digest(ROOT / "tests/guests/programs/cases.json"),
             "source_lock_sha256": digest(ROOT / "tests/guests/programs/source-lock.json"),
@@ -70,7 +70,7 @@ def main():
                 )
             },
         }
-        (output / "u11-oracle-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        (output / "wasm-oracle-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
         return
     if args.baseline:
         if (

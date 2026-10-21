@@ -192,7 +192,7 @@ REGISTRY_USER_AGENT = "paludarium-release (https://github.com/aletheia-works/pal
 CRATES_API = "https://crates.io/api/v1/crates/"
 NPM_NAME = "@aletheia-works/paludarium-wasm"
 NPM_PACKAGE_URL = "https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm"
-CARGO_TOKEN_NAMES = ("CARGO_REGISTRY_TOKEN", "U15_OIDC_CRATES_IO_TOKEN")
+CARGO_TOKEN_NAMES = ("CARGO_REGISTRY_TOKEN", "RELEASE_OIDC_CRATES_IO_TOKEN")
 # Step17 (R-17): each publication child gets only the variables it needs (allow-list).
 COMMON_ENVIRONMENT = (
     "PATH",
@@ -312,7 +312,7 @@ def publication_environments(environ):
     Only the cargo upload gets the short-lived crates.io OIDC token; npm uses Trusted
     Publishing itself and dry runs get none. Values never enter results, receipts or
     progress records (receipts keep only whitelisted non-secret keys)."""
-    oidc = environ.get("U15_OIDC_CRATES_IO_TOKEN", "")
+    oidc = environ.get("RELEASE_OIDC_CRATES_IO_TOKEN", "")
     policy.require(bool(oidc), "crates.io OIDC token absent")
     return (
         allowed(environ, CARGO_ENVIRONMENT),

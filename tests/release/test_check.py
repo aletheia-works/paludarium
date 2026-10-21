@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts/release"))
 import check  # noqa: E402
 import policy  # noqa: E402
 
-CANARY = {"U15_OIDC_CRATES_IO_TOKEN": "canary-oidc-0001"}
+CANARY = {"RELEASE_OIDC_CRATES_IO_TOKEN": "canary-oidc-0001"}
 # (canary values are test strings, never real tokens)
 
 
@@ -195,30 +195,30 @@ class CheckTests(unittest.TestCase):
     def test_oidc_environments(self):
         env = dict(
             PATH="/bin",
-            U15_OIDC_CRATES_IO_TOKEN=CANARY["U15_OIDC_CRATES_IO_TOKEN"],
+            RELEASE_OIDC_CRATES_IO_TOKEN=CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"],
             CARGO_REGISTRY_TOKEN="stale",
         )
         dry, cargo, npm = check.publication_environments(env)
-        self.assertEqual(cargo["CARGO_REGISTRY_TOKEN"], CANARY["U15_OIDC_CRATES_IO_TOKEN"])
-        self.assertNotIn("U15_OIDC_CRATES_IO_TOKEN", cargo)
+        self.assertEqual(cargo["CARGO_REGISTRY_TOKEN"], CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"])
+        self.assertNotIn("RELEASE_OIDC_CRATES_IO_TOKEN", cargo)
         for e in (dry, npm):
-            self.assertFalse(set(e) & {"CARGO_REGISTRY_TOKEN", "U15_OIDC_CRATES_IO_TOKEN"})
-            self.assertNotIn(CANARY["U15_OIDC_CRATES_IO_TOKEN"], e.values())
+            self.assertFalse(set(e) & {"CARGO_REGISTRY_TOKEN", "RELEASE_OIDC_CRATES_IO_TOKEN"})
+            self.assertNotIn(CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"], e.values())
         with self.assertRaisesRegex(ValueError, "OIDC token absent"):
             check.publication_environments(dict(PATH="/bin"))
         with self.assertRaisesRegex(ValueError, "OIDC token absent"):
-            check.publication_environments(dict(PATH="/bin", U15_OIDC_CRATES_IO_TOKEN=""))
+            check.publication_environments(dict(PATH="/bin", RELEASE_OIDC_CRATES_IO_TOKEN=""))
 
     def test_upload_tokens_not_in_receipt(self):
         env = dict(
             os.environ,
-            CARGO_REGISTRY_TOKEN=CANARY["U15_OIDC_CRATES_IO_TOKEN"],
+            CARGO_REGISTRY_TOKEN=CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"],
             NODE_AUTH_TOKEN="canary-npm-0003",
         )
         check.run_command([sys.executable, "-c", "pass"], self.root, self.root / "receipt", env=env)
         text = (self.root / "receipt/receipt.json").read_text()
         self.assertFalse(
-            [v for v in (CANARY["U15_OIDC_CRATES_IO_TOKEN"], "canary-npm-0003") if v in text]
+            [v for v in (CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"], "canary-npm-0003") if v in text]
         )
 
     def test_release_workflow_secret_scope(self):
@@ -226,11 +226,11 @@ class CheckTests(unittest.TestCase):
         publish = text.split("\n  publish:\n", 1)[1]
         # Trusted Publishing only: no stored registry token, owner variable or authentication mode output.
         self.assertEqual(re.findall(r"secrets\.(\w+)", text), [])
-        self.assertNotIn("U15_FIRST_", text)
+        self.assertNotIn("RELEASE_FIRST_", text)
         self.assertIn("    environment: release\n", publish)
         for name in (
-            "U15_CRATES_IO_OWNERS",
-            "U15_NPM_MAINTAINERS",
+            "RELEASE_CRATES_IO_OWNERS",
+            "RELEASE_NPM_MAINTAINERS",
             "steps.authorize.outputs",
             "NODE_AUTH_TOKEN:",
         ):
@@ -241,7 +241,7 @@ class CheckTests(unittest.TestCase):
         self.assertIn("        id: crates\n", step)
         self.assertIn("uses: rust-lang/crates-io-auth-action@", step)
         self.assertNotRegex(step, r"\n\s+if:")
-        self.assertIn("U15_OIDC_CRATES_IO_TOKEN: ${{ steps.crates.outputs.token }}", publish)
+        self.assertIn("RELEASE_OIDC_CRATES_IO_TOKEN: ${{ steps.crates.outputs.token }}", publish)
         for name in ("publish.yml", "release-acceptance.yml", "release-check.yml"):
             self.assertNotRegex(
                 (ROOT / ".github/workflows" / name).read_text(), r"(?i)echo[^\n]*(token|secret)"
@@ -272,7 +272,8 @@ class CheckTests(unittest.TestCase):
     def test_cargo_children_get_no_github_or_oidc_request_variables(self):
         dry, cargo, _ = check.publication_environments(
             dict(
-                self.job_environment(), U15_OIDC_CRATES_IO_TOKEN=CANARY["U15_OIDC_CRATES_IO_TOKEN"]
+                self.job_environment(),
+                RELEASE_OIDC_CRATES_IO_TOKEN=CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"],
             )
         )
         for env in (dry, cargo):
@@ -286,7 +287,7 @@ class CheckTests(unittest.TestCase):
         npm = check.publication_environments(
             dict(
                 self.job_environment(),
-                U15_OIDC_CRATES_IO_TOKEN=CANARY["U15_OIDC_CRATES_IO_TOKEN"],
+                RELEASE_OIDC_CRATES_IO_TOKEN=CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"],
                 NODE_AUTH_TOKEN="XXXXX-XXXXX-XXXXX-XXXXX",
             )
         )[2]
@@ -308,7 +309,7 @@ class CheckTests(unittest.TestCase):
             "RUSTC",
             "PALUDARIUM_RELEASE_NPM",
             "CARGO_REGISTRY_TOKEN",
-            "U15_OIDC_CRATES_IO_TOKEN",
+            "RELEASE_OIDC_CRATES_IO_TOKEN",
         ):
             self.assertNotIn(name, npm)
         self.assertEqual(npm["NODE_AUTH_TOKEN"], "XXXXX-XXXXX-XXXXX-XXXXX")

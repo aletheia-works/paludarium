@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 
-export function createU14Handler({ root, modulePath, page, encoded, oracle, onRow, read = readFile }) {
+export function createJitHandler({ root, modulePath, page, encoded, oracle, onRow, read = readFile }) {
   const headers = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp", "Cache-Control": "no-store" };
   return async (request, response) => {
     const send = (status, body, type) => {

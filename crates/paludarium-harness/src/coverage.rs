@@ -7,7 +7,7 @@
 //! the instruction, so the record is checked against the real sources.
 
 /// (instruction, guest source under tests/guests, evidence in that source)
-pub const U1_INSTRUCTIONS: &[(&str, &str, &str)] = &[
+pub const CORE_INSTRUCTIONS: &[(&str, &str, &str)] = &[
     ("add", "insn/alu.c", "BIN_RR(\"add64\""),
     ("and", "insn/alu.c", "BIN_RR(\"and64\""),
     ("bt", "insn/bt.c", "BIN_RR(\"bt32\""),
@@ -80,14 +80,14 @@ pub const U1_INSTRUCTIONS: &[(&str, &str, &str)] = &[
 
 /// (instructions with at least one differential test, all U1 instructions)
 pub fn instruction_coverage(guest_sources: &std::path::Path) -> (usize, usize) {
-    let covered = U1_INSTRUCTIONS
+    let covered = CORE_INSTRUCTIONS
         .iter()
         .filter(|(_, file, evidence)| {
             std::fs::read_to_string(guest_sources.join(file))
                 .is_ok_and(|text| text.contains(evidence))
         })
         .count();
-    (covered, U1_INSTRUCTIONS.len())
+    (covered, CORE_INSTRUCTIONS.len())
 }
 
 #[cfg(test)]
@@ -95,11 +95,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_u1_instruction_has_a_differential_test() {
+    fn every_core_instruction_has_a_differential_test() {
         let sources = crate::workspace_root().join("tests").join("guests");
         let (covered, total) = instruction_coverage(&sources);
         println!("U1 instruction coverage by differential tests: {covered}/{total}");
-        let missing: Vec<&str> = U1_INSTRUCTIONS
+        let missing: Vec<&str> = CORE_INSTRUCTIONS
             .iter()
             .filter(|(_, file, evidence)| {
                 !std::fs::read_to_string(sources.join(file)).is_ok_and(|t| t.contains(evidence))
@@ -116,6 +116,6 @@ mod tests {
     fn coverage_counts_missing_sources_as_uncovered() {
         let (covered, total) = instruction_coverage(std::path::Path::new("/nonexistent"));
         assert_eq!(covered, 0);
-        assert_eq!(total, U1_INSTRUCTIONS.len());
+        assert_eq!(total, CORE_INSTRUCTIONS.len());
     }
 }

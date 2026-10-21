@@ -65,7 +65,7 @@ def observe(executable, guests, native_path, output, root, *, original=False):
         store(key, row)
         if name != "environment":
             probe_pass(row, config["probe"] if name == "all" else [name])
-    with tempfile.TemporaryDirectory(prefix="paludarium-u12-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="paludarium-macos-") as scratch:
         fixture = pathlib.Path(scratch) / "fixture"
         shutil.copytree(root / "tests/guests/programs/fixtures", fixture)
         if fixture_inputs(fixture) != native["fixture_input_modes"]:

@@ -5,7 +5,7 @@ import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { runBrowser } from "./wasm-browser-driver.mjs";
 import { runJitSuite } from "./jit-suite.mjs";
-import { createU14Handler } from "./jit-http.mjs";
+import { createJitHandler } from "./jit-http.mjs";
 
 const [environment, modulePath, oraclePath, guestDirectory, outputDirectory] = process.argv.slice(2);
 if (!outputDirectory || !["node", "chromium", "firefox", "safari"].includes(environment)) throw new Error("usage: jit-check.mjs node|chromium|firefox|safari module oracle guests output");
@@ -37,8 +37,8 @@ try {
       fixtures: Object.fromEntries(Object.entries(fixtures).map(([name, bytes]) => [name, Buffer.from(bytes).toString("base64")])) };
     const page = `<!doctype html><script type="module">
 import{runJitSuite}from'/packages/paludarium-wasm/tests/jit-suite.mjs';
-try{if(!crossOriginIsolated)throw Error('Shared memory unavailable');const input=await(await fetch('/input.json')).json();const decode=text=>Uint8Array.from(atob(text),c=>c.charCodeAt(0));input.probe=decode(input.probe);input.aube=decode(input.aube);for(const name of Object.keys(input.fixtures))input.fixtures[name]=decode(input.fixtures[name]);window.__u11Report=await runJitSuite({...input,wasmUrl:'/production.wasm',onRow:async(mode,name,row)=>{await fetch('/row',{method:'POST',body:JSON.stringify({mode,name,row})});}});}catch(error){window.__u11Report={complete:false,passed:false,error:String(error)};}</script>`;
-    server = createServer(createU14Handler({ root, modulePath, page, encoded, oracle, onRow }));
+try{if(!crossOriginIsolated)throw Error('Shared memory unavailable');const input=await(await fetch('/input.json')).json();const decode=text=>Uint8Array.from(atob(text),c=>c.charCodeAt(0));input.probe=decode(input.probe);input.aube=decode(input.aube);for(const name of Object.keys(input.fixtures))input.fixtures[name]=decode(input.fixtures[name]);window.__wasmReport=await runJitSuite({...input,wasmUrl:'/production.wasm',onRow:async(mode,name,row)=>{await fetch('/row',{method:'POST',body:JSON.stringify({mode,name,row})});}});}catch(error){window.__wasmReport={complete:false,passed:false,error:String(error)};}</script>`;
+    server = createServer(createJitHandler({ root, modulePath, page, encoded, oracle, onRow }));
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     result = await runBrowser(environment, `http://127.0.0.1:${server.address().port}/`, 1200000);
   }

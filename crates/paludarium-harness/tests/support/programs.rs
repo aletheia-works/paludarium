@@ -71,8 +71,8 @@ fn fixture_mode(_path: &Path) -> u32 {
 
 /// Executed only as a child of the 30-second Python group watchdog.
 pub fn operation() {
-    let directory = PathBuf::from(std::env::var_os("PALUDARIUM_U10_OPERATION").unwrap());
-    let binary = PathBuf::from(std::env::var_os("PALUDARIUM_U10_BINARY").unwrap());
+    let directory = PathBuf::from(std::env::var_os("PALUDARIUM_PROGRAMS_OPERATION").unwrap());
+    let binary = PathBuf::from(std::env::var_os("PALUDARIUM_PROGRAMS_BINARY").unwrap());
     let mut args = vec![b"/program".to_vec()];
     args.extend(
         std::fs::read_to_string(directory.join("args"))
@@ -93,9 +93,9 @@ pub fn operation() {
             .env
             .push((key.as_bytes().to_vec(), value.as_bytes().to_vec()));
     }
-    if let Some(fixture) = std::env::var_os("PALUDARIUM_U10_FIXTURE") {
+    if let Some(fixture) = std::env::var_os("PALUDARIUM_PROGRAMS_FIXTURE") {
         let fixture = PathBuf::from(fixture).canonicalize().unwrap();
-        if std::env::var_os("PALUDARIUM_U10_MOUNTED").is_some() {
+        if std::env::var_os("PALUDARIUM_PROGRAMS_MOUNTED").is_some() {
             config.mounts.push(Mount {
                 host: fixture.join("app"),
                 guest: b"/".to_vec(),

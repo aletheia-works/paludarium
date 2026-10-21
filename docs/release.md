@@ -26,7 +26,8 @@ adapter additionally needs nightly build-std and atomic-wait support.
 
 ## Non-publishing checks
 
-Use the real Python 3.15 executable and project-local coverage 7.16.2:
+Use the real executable of the latest Python release and project-local
+coverage 7.16.2:
 
 ```sh
 python3 -B -m unittest discover -s tests/release -p 'test_*.py' -v

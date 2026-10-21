@@ -131,7 +131,7 @@ impl SignalInbox {
 mod signals_time_tests {
     use super::*;
     #[test]
-    fn u4_inbox_control_signal_survives_realtime_backlog() {
+    fn inbox_control_signal_survives_realtime_backlog() {
         let inbox = SignalInbox::default();
         for _ in 0..2048 {
             inbox.send(32).unwrap();
@@ -149,7 +149,7 @@ mod signals_time_tests {
         );
     }
     #[test]
-    fn u4_inbox_sender_drain_race_preserves_realtime_count() {
+    fn inbox_sender_drain_race_preserves_realtime_count() {
         let inbox = Arc::new(SignalInbox::default());
         let sender = inbox.clone();
         let runner = std::thread::spawn(move || {

@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn u2_cmps_repe_keeps_implicit_width() {
+    fn cmps_repe_keeps_implicit_width() {
         let i = decode(&[0xf3, 0xa6], GuestAddr(0x1000)).unwrap();
         assert_eq!(
             (i.mnemonic, i.rep, i.implicit_size),
@@ -817,7 +817,7 @@ mod tests {
         );
     }
     #[test]
-    fn u2_scas_repne_and_address32() {
+    fn scas_repne_and_address32() {
         let i = decode(&[0x67, 0xf2, 0xae], GuestAddr(0)).unwrap();
         assert_eq!(
             (i.mnemonic, i.rep, i.implicit_size),
@@ -826,7 +826,7 @@ mod tests {
         assert!(i.string_address_size_32);
     }
     #[test]
-    fn u2_string_16bit_and_source_segment() {
+    fn string_16bit_and_source_segment() {
         let i = decode(&[0x64, 0x66, 0xf3, 0xa5], GuestAddr(0)).unwrap();
         assert_eq!(
             (i.mnemonic, i.implicit_size, i.string_segment),
@@ -834,19 +834,19 @@ mod tests {
         );
     }
     #[test]
-    fn u2_lods_has_implicit_accumulator() {
+    fn lods_has_implicit_accumulator() {
         let i = decode(&[0x48, 0xad], GuestAddr(0)).unwrap();
         assert_eq!((i.mnemonic, i.implicit_size), (Mnemonic::Lodsq, 8));
     }
     #[test]
-    fn u2_cmpxchg16b_is_integer_memory_pair() {
+    fn cmpxchg16b_is_integer_memory_pair() {
         let i = decode(&[0xf0, 0x48, 0x0f, 0xc7, 0x0f], GuestAddr(0)).unwrap();
         assert!(i.lock);
         assert_eq!((i.mnemonic, i.implicit_size), (Mnemonic::Cmpxchg16b, 16));
         assert!(matches!(i.operand(0),Some(Operand::Memory(m)) if m.size == 16));
     }
     #[test]
-    fn u2_invalid_lock_and_truncated_form_are_distinct() {
+    fn invalid_lock_and_truncated_form_are_distinct() {
         assert_eq!(
             decode(&[0xf0, 0x48, 0x01, 0xc0], GuestAddr(0)),
             Err(DecodeError::Invalid)
@@ -857,7 +857,7 @@ mod tests {
         );
     }
     #[test]
-    fn u2_rotate_and_xadd_expose_scalar_operands() {
+    fn rotate_and_xadd_expose_scalar_operands() {
         let r = decode(&[0x48, 0xd3, 0xc0], GuestAddr(0)).unwrap();
         assert_eq!(r.mnemonic, Mnemonic::Rol);
         let a = decode(&[0xf0, 0x48, 0x0f, 0xc1, 0x07], GuestAddr(0)).unwrap();
@@ -980,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn u2_integer_vex_does_not_enable_simd_vex() {
+    fn integer_vex_does_not_enable_simd_vex() {
         assert_eq!(
             decode(&[0xc4, 0x42, 0x50, 0xf2, 0xc7], RIP)
                 .unwrap()
@@ -994,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn u2_word_stack_forms_keep_two_byte_operand_width() {
+    fn word_stack_forms_keep_two_byte_operand_width() {
         for bytes in [
             &[0x66, 0x9c][..],
             &[0x66, 0x9d][..],

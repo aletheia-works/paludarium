@@ -318,7 +318,7 @@ mod events_tests {
         )
     }
     #[test]
-    fn u6_epoll_lt() {
+    fn events_epoll_lt() {
         let (e, f) = setup();
         e.control(1, 3, Arc::clone(&f), IN, 7).unwrap();
         f.write(&1u64.to_le_bytes()).unwrap();
@@ -326,7 +326,7 @@ mod events_tests {
         assert_eq!(e.collect(1), vec![(IN, 7)]);
     }
     #[test]
-    fn u6_epoll_et() {
+    fn events_epoll_et() {
         let (e, f) = setup();
         e.control(1, 3, Arc::clone(&f), IN | ET, 7).unwrap();
         f.write(&1u64.to_le_bytes()).unwrap();
@@ -337,7 +337,7 @@ mod events_tests {
         assert_eq!(e.collect(1).len(), 1);
     }
     #[test]
-    fn u6_epoll_event_output_read_callback() {
+    fn epoll_event_output_read_callback() {
         let hub = Arc::default();
         let e = EpollInstance::new(Arc::clone(&hub));
         let f: Arc<dyn FileHandle> = Arc::new(EventCounter::new(2, 1, hub).unwrap());
@@ -348,7 +348,7 @@ mod events_tests {
         assert!(e.collect(1).is_empty());
     }
     #[test]
-    fn u6_epoll_socket_output_consumed_write_callbacks() {
+    fn epoll_socket_output_consumed_write_callbacks() {
         let hub = Arc::default();
         let e = EpollInstance::new(Arc::clone(&hub));
         let [writer, reader] = crate::sockets::SocketPairEnd::pair(0x801, hub).unwrap();
@@ -366,7 +366,7 @@ mod events_tests {
         assert_eq!(e.collect(1), vec![(OUT, 81)]);
     }
     #[test]
-    fn u6_epoll_oneshot() {
+    fn events_epoll_oneshot() {
         let (e, f) = setup();
         f.write(&1u64.to_le_bytes()).unwrap();
         e.control(1, 3, Arc::clone(&f), IN | ONESHOT, 1).unwrap();
@@ -376,7 +376,7 @@ mod events_tests {
         assert_eq!(e.collect(1), vec![(IN, 2)]);
     }
     #[test]
-    fn u6_epoll_errors() {
+    fn epoll_errors() {
         let (e, f) = setup();
         assert_eq!(e.control(3, 3, Arc::clone(&f), IN, 0), Err(Errno::ENOENT));
         e.control(1, 3, Arc::clone(&f), IN, 0).unwrap();
@@ -384,7 +384,7 @@ mod events_tests {
         assert_eq!(e.control(4, 3, f, 0, 0), Err(Errno::EINVAL));
     }
     #[test]
-    fn u6_epoll_delete() {
+    fn epoll_delete() {
         let (e, f) = setup();
         e.control(1, 3, Arc::clone(&f), IN, 0).unwrap();
         e.control(2, 3, Arc::clone(&f), 0, 0).unwrap();
@@ -392,7 +392,7 @@ mod events_tests {
         assert!(e.collect(1).is_empty());
     }
     #[test]
-    fn u6_epoll_last_close() {
+    fn epoll_last_close() {
         let (e, f) = setup();
         f.write(&1u64.to_le_bytes()).unwrap();
         e.control(1, 3, Arc::clone(&f), IN, 0).unwrap();
@@ -400,7 +400,7 @@ mod events_tests {
         assert!(e.collect(1).is_empty());
     }
     #[test]
-    fn u6_epoll_dup_entries() {
+    fn epoll_dup_entries() {
         let (e, f) = setup();
         f.write(&1u64.to_le_bytes()).unwrap();
         e.control(1, 3, Arc::clone(&f), IN, 1).unwrap();
@@ -408,7 +408,7 @@ mod events_tests {
         assert_eq!(e.collect(2), vec![(IN, 1), (IN, 2)]);
     }
     #[test]
-    fn u6_epoll_fairness() {
+    fn events_epoll_fairness() {
         let (e, f) = setup();
         f.write(&1u64.to_le_bytes()).unwrap();
         e.control(1, 3, Arc::clone(&f), IN, 1).unwrap();

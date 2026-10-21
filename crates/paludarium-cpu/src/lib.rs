@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_hook_reaches_supported_boundary_after_interpreter_instruction() {
+    fn hook_reaches_supported_boundary_after_interpreter_instruction() {
         let (mut state, memory) = machine(&[0x90, 0xb8, 42, 0, 0, 0, 0xf4]);
         let mut seen = Vec::new();
         let result = run_cached_with_hook(
@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_hook_none_preserves_interpreter_exit_and_state() {
+    fn hook_none_preserves_interpreter_exit_and_state() {
         for code in [
             vec![0x90, 0xf4],
             vec![0xb8, 60, 0, 0, 0, 0x0f, 0x05],
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_hook_respects_zero_and_exact_remaining_budget() {
+    fn hook_respects_zero_and_exact_remaining_budget() {
         let (mut state, memory) = machine(&[0x90, 0x90, 0xf4]);
         let mut remaining = Vec::new();
         let zero = run_cached_with_hook(
@@ -612,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_hook_short_budget_never_accelerates() {
+    fn hook_short_budget_never_accelerates() {
         let (mut state, memory) = machine(&[0x90, 0xf4]);
         let result = run_cached_with_hook(
             &mut state,
@@ -631,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_hook_backward_blocks_remain_finitely_charged() {
+    fn hook_backward_blocks_remain_finitely_charged() {
         let (mut state, memory) = machine(&[0x90]);
         let mut calls = 0;
         let result = run_cached_with_hook(
@@ -655,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_hook_continues_to_syscall_after_charged_block() {
+    fn hook_continues_to_syscall_after_charged_block() {
         let (mut state, memory) = machine(&[0x90, 0x0f, 0x05]);
         state.gpr[reg::RAX] = 60;
         let result = run_cached_with_hook(
@@ -678,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_hook_continues_to_fault_after_charged_block() {
+    fn hook_continues_to_fault_after_charged_block() {
         let (mut state, memory) = machine(&[0x90, 0x48, 0x8b, 0x07]);
         let mut expected = state.clone();
         expected.rip = GuestAddr(CODE + 1);

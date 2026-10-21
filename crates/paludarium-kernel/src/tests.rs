@@ -210,7 +210,7 @@ fn guest_exceptions_end_the_process_with_signals() {
 }
 
 #[test]
-fn u2_arithmetic_fault_terminates_with_sigfpe() {
+fn arithmetic_fault_terminates_with_sigfpe() {
     let mut f = fixture();
     assert_eq!(
         f.kernel.handle(
@@ -225,7 +225,7 @@ fn u2_arithmetic_fault_terminates_with_sigfpe() {
 }
 
 #[test]
-fn u3_floating_point_fault_codes_terminate_with_sigfpe() {
+fn floating_point_fault_codes_terminate_with_sigfpe() {
     for code in [3, 4, 5, 6, 7] {
         let mut f = fixture();
         assert_eq!(
@@ -388,41 +388,41 @@ mod signals_time_tests {
 }
 
 #[test]
-fn u7_syscall_huge_bad_read_buffer() {
+fn syscall_huge_bad_read_buffer() {
     let mut f = fixture();
     assert_eq!(f.ret(0, &[0, 1, u64::MAX]), errno(Errno::EFAULT));
 }
 #[test]
-fn u7_syscall_huge_bad_write_buffer() {
+fn syscall_huge_bad_write_buffer() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
     let fd = f.ret(2, &[DATA, 66, 0o600]);
     assert_eq!(f.ret(1, &[fd, 1, u64::MAX]), errno(Errno::EFAULT));
 }
 #[test]
-fn u7_syscall_bad_path() {
+fn syscall_bad_path() {
     let mut f = fixture();
     assert_eq!(f.ret(2, &[1, 0, 0]), errno(Errno::EFAULT));
 }
 #[test]
-fn u7_syscall_stat_null() {
+fn syscall_stat_null() {
     let mut f = fixture();
     assert_eq!(f.ret(4, &[0, DATA]), errno(Errno::EFAULT));
 }
 #[test]
-fn u7_syscall_empty_path() {
+fn syscall_empty_path() {
     let mut f = fixture();
     assert_eq!(f.ret(4, &[DATA, DATA + 100]), errno(Errno::ENOENT));
 }
 #[test]
-fn u7_syscall_stat_buffer() {
+fn syscall_stat_buffer() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
     let fd = f.ret(2, &[DATA, 66, 0o600]);
     assert_eq!(f.ret(5, &[fd, 1]), errno(Errno::EFAULT));
 }
 #[test]
-fn u7_syscall_fcntl_owner() {
+fn syscall_fcntl_owner() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
     let fd = f.ret(2, &[DATA, 66, 0o600]);
@@ -433,7 +433,7 @@ fn u7_syscall_fcntl_owner() {
     assert_eq!(f.ret(5, &[dup, DATA + 100]), 0);
 }
 #[test]
-fn u7_syscall_flock_cancel() {
+fn syscall_flock_cancel() {
     let mut f = fixture();
     let fs = paludarium_vfs::MemFs::new();
     use paludarium_host::HostFs;

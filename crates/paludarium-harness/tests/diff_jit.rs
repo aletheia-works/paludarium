@@ -300,7 +300,7 @@ struct Run {
 }
 
 #[test]
-fn u14_fresh_linux_instruction_differential() {
+fn fresh_linux_instruction_differential() {
     if std::env::var_os("PALUDARIUM_U14_INSTRUCTION_CHILD").is_none() {
         assert!(
             Command::new("python3")

@@ -19,7 +19,7 @@ pub(crate) struct PipeEnd {
     reader: bool,
 }
 #[cfg(test)]
-mod u8_pipe_tests {
+mod pipe_tests {
     use super::*;
     fn pair() -> [Arc<PipeEnd>; 2] {
         PipeEnd::pair(0, Arc::default()).unwrap()
@@ -425,7 +425,7 @@ mod events_tests {
         SocketPairEnd::pair(1, Arc::default()).unwrap()
     }
     #[test]
-    fn u6_socket_backpressure_partial_write_and_out_edge() {
+    fn socket_backpressure_partial_write_and_out_edge() {
         let [a, b] = pair();
         let bytes = vec![7; SEND_WINDOW + 1];
         assert_eq!(a.write(&bytes), Ok(SEND_WINDOW));
@@ -439,11 +439,11 @@ mod events_tests {
         assert_eq!(a.write(&[1]), Ok(1));
     }
     #[test]
-    fn u6_socket_empty() {
+    fn events_socket_empty() {
         assert_eq!(pair()[0].read(&mut [0]), Err(Errno::EAGAIN));
     }
     #[test]
-    fn u6_socket_transfer() {
+    fn events_socket_transfer() {
         let [a, b] = pair();
         a.write(b"hi").unwrap();
         let mut bytes = [0; 2];
@@ -451,7 +451,7 @@ mod events_tests {
         assert_eq!(&bytes, b"hi");
     }
     #[test]
-    fn u6_socket_bidirectional() {
+    fn events_socket_bidirectional() {
         let [a, b] = pair();
         a.write(b"a").unwrap();
         b.write(b"b").unwrap();
@@ -462,14 +462,14 @@ mod events_tests {
         assert_eq!(byte, [b'a']);
     }
     #[test]
-    fn u6_socket_partial() {
+    fn events_socket_partial() {
         let [a, b] = pair();
         a.write(b"abc").unwrap();
         assert_eq!(b.read(&mut [0; 2]), Ok(2));
         assert_eq!(b.read(&mut [0; 2]), Ok(1));
     }
     #[test]
-    fn u6_socket_peer_lifetime() {
+    fn socket_peer_lifetime() {
         let [a, b] = pair();
         let copy = Arc::clone(&a);
         drop(a);
@@ -479,7 +479,7 @@ mod events_tests {
         assert_eq!(b.write(b"x"), Err(Errno(32)));
     }
     #[test]
-    fn u6_socket_shutdown() {
+    fn events_socket_shutdown() {
         let [a, b] = pair();
         a.shutdown(1).unwrap();
         assert_eq!(b.read(&mut [0]), Ok(0));
@@ -487,7 +487,7 @@ mod events_tests {
         assert_eq!(a.shutdown(3), Err(Errno::EINVAL));
     }
     #[test]
-    fn u6_socket_edges() {
+    fn socket_edges() {
         let [a, b] = pair();
         a.write(b"abc").unwrap();
         let e = b.readiness().unwrap().1;
@@ -498,7 +498,7 @@ mod events_tests {
         assert_eq!(b.readiness().unwrap().1, e + 1);
     }
     #[test]
-    fn u6_socket_flags() {
+    fn events_socket_flags() {
         let [a, _b] = SocketPairEnd::pair(1 | NONBLOCK | CLOEXEC, Arc::default()).unwrap();
         assert_eq!(a.flags(), 2 | NONBLOCK);
         a.set_flags(0).unwrap();

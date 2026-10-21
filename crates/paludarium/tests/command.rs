@@ -87,7 +87,7 @@ fn emulator_errors_exit_with_seventy() {
 }
 
 #[test]
-fn u7_cli_root_mount_keeps_private_program() {
+fn cli_root_mount_keeps_private_program() {
     let path = write_guest("u7-root", &GUEST, b"out\nE!");
     let root = std::env::temp_dir().join(format!("paludarium-u7-cli-root-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
@@ -107,7 +107,7 @@ fn u7_cli_root_mount_keeps_private_program() {
 }
 
 #[test]
-fn u7_cli_mount_missing_root_is_emulator_error() {
+fn cli_mount_missing_root_is_emulator_error() {
     let path = write_guest("u7-missing-root", &GUEST, b"out\nE!");
     let root =
         std::env::temp_dir().join(format!("paludarium-u7-cli-missing-{}", std::process::id()));
@@ -123,7 +123,7 @@ fn u7_cli_mount_missing_root_is_emulator_error() {
 }
 
 #[test]
-fn u9_cli_forward_stdout_stderr() {
+fn cli_forward_stdout_stderr() {
     let path = write_guest("u9-streams", &GUEST, b"outERR");
     let out = binary().arg(&path).output().unwrap();
     assert_eq!(out.stdout, b"out");
@@ -132,7 +132,7 @@ fn u9_cli_forward_stdout_stderr() {
     std::fs::remove_file(path).unwrap();
 }
 #[test]
-fn u9_cli_empty_argument_is_preserved() {
+fn cli_empty_argument_is_preserved() {
     let code = vec![
         0x48, 0x8b, 0x74, 0x24, 0x10, 0xb8, 1, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0xba, 1, 0, 0, 0, 0x0f,
         0x05, 0xb8, 60, 0, 0, 0, 0xbf, 0, 0, 0, 0, 0x0f, 0x05,

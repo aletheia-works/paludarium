@@ -163,7 +163,7 @@ impl PrivateFs {
 mod tests {
     use super::*;
     #[test]
-    fn u7_mtime_snapshot_signed_bytes_and_positive_range() {
+    fn mtime_snapshot_signed_bytes_and_positive_range() {
         for ns in [
             -1_000_000_000,
             -500_000_000,
@@ -198,17 +198,17 @@ mod tests {
         .unwrap()
     }
     #[test]
-    fn u11_filesystem_close_idle() {
+    fn filesystem_close_idle() {
         assert_eq!(fixture().close(), Ok(()));
     }
     #[test]
-    fn u11_filesystem_close_active_rejected() {
+    fn filesystem_close_active_rejected() {
         let fs = fixture();
         let _lease = fs.acquire().unwrap();
         assert_eq!(fs.close(), Err(Errno::EAGAIN));
     }
     #[test]
-    fn u11_filesystem_close_after_release() {
+    fn filesystem_close_after_release() {
         let fs = fixture();
         let lease = fs.acquire().unwrap();
         assert_eq!(fs.close(), Err(Errno::EAGAIN));
@@ -216,31 +216,31 @@ mod tests {
         assert_eq!(fs.close(), Ok(()));
     }
     #[test]
-    fn u11_filesystem_closed_acquire_rejected() {
+    fn filesystem_closed_acquire_rejected() {
         let fs = fixture();
         fs.close().unwrap();
         assert!(matches!(fs.acquire(), Err(Errno::EAGAIN)));
     }
     #[test]
-    fn u11_filesystem_closed_snapshot_rejected() {
+    fn filesystem_closed_snapshot_rejected() {
         let fs = fixture();
         fs.close().unwrap();
         assert_eq!(fs.snapshot(), Err(Errno::EAGAIN));
     }
     #[test]
-    fn u11_filesystem_closed_remove_rejected() {
+    fn filesystem_closed_remove_rejected() {
         let fs = fixture();
         fs.close().unwrap();
         assert_eq!(fs.remove(b"/guest", false), Err(Errno::EAGAIN));
     }
     #[test]
-    fn u11_filesystem_closed_close_rejected() {
+    fn filesystem_closed_close_rejected() {
         let fs = fixture();
         fs.close().unwrap();
         assert_eq!(fs.close(), Err(Errno::EAGAIN));
     }
     #[test]
-    fn u11_filesystem_modes_and_contents() {
+    fn filesystem_modes_and_contents() {
         let fs = fixture();
         let entries = fs.snapshot().unwrap();
         let guest = entries
@@ -259,14 +259,14 @@ mod tests {
         );
     }
     #[test]
-    fn u11_filesystem_active_mutation_rejected() {
+    fn filesystem_active_mutation_rejected() {
         let fs = fixture();
         let _lease = fs.acquire().unwrap();
         assert_eq!(fs.remove(b"/guest", false), Err(Errno::EAGAIN));
         assert_eq!(fs.snapshot(), Err(Errno::EAGAIN));
     }
     #[test]
-    fn u11_filesystem_second_borrow_rejected_and_drop_releases() {
+    fn filesystem_second_borrow_rejected_and_drop_releases() {
         let fs = fixture();
         let lease = fs.acquire().unwrap();
         assert!(matches!(fs.acquire(), Err(Errno::EAGAIN)));
@@ -274,7 +274,7 @@ mod tests {
         assert!(fs.acquire().is_ok());
     }
     #[test]
-    fn u11_filesystem_recursive_removal_preserves_other_files() {
+    fn filesystem_recursive_removal_preserves_other_files() {
         let fs = fixture();
         fs.remove(b"/nested", true).unwrap();
         let entries = fs.snapshot().unwrap();
@@ -286,17 +286,17 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.path == b"/guest"));
     }
     #[test]
-    fn u11_filesystem_root_and_missing_removal_rejected() {
+    fn filesystem_root_and_missing_removal_rejected() {
         let fs = fixture();
         assert_eq!(fs.remove(b"/", true), Err(Errno::EINVAL));
         assert_eq!(fs.remove(b"/missing", true), Err(Errno::ENOENT));
     }
     #[test]
-    fn u11_filesystem_nonrecursive_directory_failure() {
+    fn filesystem_nonrecursive_directory_failure() {
         assert_eq!(fixture().remove(b"/nested", false), Err(Errno(39)));
     }
     #[test]
-    fn u11_filesystem_instances_are_isolated_and_lease_retains_state() {
+    fn filesystem_instances_are_isolated_and_lease_retains_state() {
         let first = fixture();
         let second = fixture();
         let lease = first.acquire().unwrap();

@@ -10,7 +10,7 @@ mod oracle;
 
 #[test]
 #[ignore = "diagnostic replay requires explicitly supplied native observations"]
-fn u3_saved_observation_replay() {
+fn saved_observation_replay() {
     let normal =
         std::fs::read_to_string(std::env::var("PALUDARIUM_U3_NATIVE_OBSERVATIONS").unwrap())
             .unwrap();
@@ -27,8 +27,8 @@ fn u3_saved_observation_replay() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn u3_fresh_native_differential() {
-    support::bounded("u3_fresh_native_differential", || {
+fn fresh_native_differential() {
+    support::bounded("fresh_native_differential", || {
         let root = paludarium_harness::workspace_root();
         let output = root.join("target/encodings-guests");
         assert!(
@@ -71,7 +71,7 @@ fn u3_fresh_native_differential() {
 }
 
 #[test]
-fn u3_runner_bootstrap() {
+fn runner_bootstrap() {
     assert!(
         paludarium_harness::workspace_root()
             .join("tests/guests/encodings/build.sh")
@@ -79,12 +79,12 @@ fn u3_runner_bootstrap() {
     );
 }
 
-/// Started only by `u3_bounded_reaches_ignored_tests`.
+/// Started only by `bounded_reaches_ignored_tests`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-#[ignore = "probe for the bounded runner; started by u3_bounded_reaches_ignored_tests"]
-fn u3_bounded_ignored_probe() {
-    support::bounded("u3_bounded_ignored_probe", || {
+#[ignore = "probe for the bounded runner; started by bounded_reaches_ignored_tests"]
+fn bounded_ignored_probe() {
+    support::bounded("bounded_ignored_probe", || {
         let marker = std::env::var_os("PALUDARIUM_U3_PROBE_MARKER").expect("probe marker path");
         std::fs::write(marker, "ran").expect("write probe marker");
     });
@@ -94,7 +94,7 @@ fn u3_bounded_ignored_probe() {
 /// its isolated child used to filter the test out, run nothing and pass.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn u3_bounded_reaches_ignored_tests() {
+fn bounded_reaches_ignored_tests() {
     let marker = paludarium_harness::workspace_root()
         .join("target/encodings-bounded")
         .join(format!("probe-{}.marker", std::process::id()));
@@ -103,7 +103,7 @@ fn u3_bounded_reaches_ignored_tests() {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "u3_bounded_ignored_probe",
+            "bounded_ignored_probe",
             "--ignored",
             "--nocapture",
         ])
@@ -119,8 +119,8 @@ fn u3_bounded_reaches_ignored_tests() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 #[ignore = "Explicit native-only collection; does not assert emulator agreement"]
-fn u3_native_observation() {
-    support::bounded("u3_native_observation", || {
+fn native_observation() {
+    support::bounded("native_observation", || {
         let root = paludarium_harness::workspace_root();
         let output = root.join("target/encodings-guests");
         assert!(

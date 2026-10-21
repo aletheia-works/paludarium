@@ -5,7 +5,7 @@ mod support;
 /// Python owns the per-operation process-group watchdog and fresh oracle.
 #[test]
 #[ignore = "fixed guest artifacts and isolated x86 Linux namespace required"]
-fn u10_differential() {
+fn programs_differential() {
     assert_eq!(
         (std::env::consts::OS, std::env::consts::ARCH),
         ("linux", "x86_64")
@@ -23,7 +23,7 @@ fn u10_differential() {
 }
 
 #[test]
-fn u10_guest_operation() {
+fn programs_guest_operation() {
     if std::env::var_os("PALUDARIUM_U10_OPERATION").is_some() {
         support::operation();
     }

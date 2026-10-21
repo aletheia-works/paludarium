@@ -193,32 +193,32 @@ mod tests {
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_peek_positive_does_not_touch_recency() {
+    fn peek_positive_does_not_touch_recency() {
         unchanged(1, 4096, 2, Peek::Present(Some(42)));
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_peek_negative_does_not_touch_hint() {
+    fn peek_negative_does_not_touch_hint() {
         unchanged(1, 8192, 2, Peek::Present(None));
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_peek_stale_does_not_delete_entry() {
+    fn peek_stale_does_not_delete_entry() {
         unchanged(1, 4096, 3, Peek::Stale);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_peek_missing_does_not_insert_entry() {
+    fn peek_missing_does_not_insert_entry() {
         unchanged(1, 12288, 2, Peek::Missing);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_peek_other_space_is_not_positive() {
+    fn peek_other_space_is_not_positive() {
         unchanged(2, 4096, 2, Peek::Missing);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_peek_does_not_trigger_clock_exhaustion() {
+    fn peek_does_not_trigger_clock_exhaustion() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, Some(42));
         cache.state.lock().unwrap().clock = u64::MAX;
@@ -228,7 +228,7 @@ mod tests {
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_peek_does_not_change_eviction_order() {
+    fn peek_does_not_change_eviction_order() {
         let cache = EpochCache::new();
         for rip in 0..1024 {
             cache.insert(1, rip, 1, 1, Some(rip));
@@ -239,7 +239,7 @@ mod tests {
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_peek_invalidated_mapping_stays_missing() {
+    fn peek_invalidated_mapping_stays_missing() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, Some(42));
         cache.invalidate(4096);
@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_negative_cache_hit_does_not_mutate_recency() {
+    fn negative_cache_hit_does_not_mutate_recency() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, None::<u64>);
         let clock = cache.state.lock().unwrap().clock;
@@ -262,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_lru_preserves_hot_low_rip_and_evicts_oldest() {
+    fn cache_lru_preserves_hot_low_rip_and_evicts_oldest() {
         let cache = EpochCache::new();
         for rip in 0..1024 {
             cache.insert(1, rip * 4096, 1, 1, rip);
@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_lru_epoch_removal_and_invalidation_remove_recency() {
+    fn cache_lru_epoch_removal_and_invalidation_remove_recency() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, 42);
         assert_eq!(cache.get(1, 4096, 2), None);
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_lru_recency_exhaustion_discards_safely() {
+    fn cache_lru_recency_exhaustion_discards_safely() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 1, 1, 42);
         cache.state.lock().unwrap().clock = u64::MAX;
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_returns_only_matching_epoch() {
+    fn cache_returns_only_matching_epoch() {
         let cache = EpochCache::new();
         assert!(cache.insert(1, 4096, 2, 10, 42));
         assert_eq!(cache.get(1, 4096, 2), Some(42));
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_separates_address_spaces() {
+    fn cache_separates_address_spaces() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 2, 10, 42);
         cache.insert(2, 4096, 2, 10, 17);
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_cross_page_invalidation_covers_entire_block() {
+    fn cache_cross_page_invalidation_covers_entire_block() {
         let cache = EpochCache::new();
         cache.insert(1, 8191, 2, 10, 42);
         cache.invalidate(8192);
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_unrelated_page_is_preserved() {
+    fn cache_unrelated_page_is_preserved() {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 2, 10, 42);
         cache.invalidate(8192);
@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_rejects_overflow_and_unbounded_blocks() {
+    fn cache_rejects_overflow_and_unbounded_blocks() {
         let cache = EpochCache::new();
         assert!(!cache.insert(1, u64::MAX, 2, 1, 42));
         assert!(!cache.insert(1, 0, 2, 961, 42));
@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_evicts_safely_at_capacity() {
+    fn cache_evicts_safely_at_capacity() {
         let cache = EpochCache::new();
         for index in 0..1025 {
             assert!(cache.insert(1, index, 2, 1, index));
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cache_serializes_shared_worker_invalidation() {
+    fn cache_serializes_shared_worker_invalidation() {
         let cache = std::sync::Arc::new(EpochCache::new());
         cache.insert(1, 4096, 2, 10, 42);
         let other = cache.clone();

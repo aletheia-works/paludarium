@@ -123,7 +123,7 @@ fn truncated_crypto_and_illegal_lock_are_distinct() {
         Err(DecodeError::Invalid)
     );
 }
-include!("u3_native_encodings.rs");
+include!("native_encodings.rs");
 
 #[test]
 fn all_native_observer_input_encodings_connect() {

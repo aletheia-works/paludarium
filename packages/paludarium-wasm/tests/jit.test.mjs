@@ -27,28 +27,28 @@ function setup(bytes = moduleBytes()) {
     run(key = 1) { return this.bridge.prepare(key, 512, this.bytes.length) === 0
       ? this.bridge.execute(key, 512, this.bytes.length, 64, S) : -1; } };
 }
-test("u14 bridge executes actual synchronous shared-memory wasm", () => {
+test("bridge executes actual synchronous shared-memory wasm", () => {
   const s = setup();
   assert.equal(s.run(), 0);
   assert.equal(new BigUint64Array(s.memory.buffer, 64, 50)[0], 42n);
 });
-test("u14 bridge reuses immutable Worker-local compiled module", () => {
+test("bridge reuses immutable Worker-local compiled module", () => {
   const s = setup();
   assert.equal(s.run(), 0);
   assert.equal(s.run(), 0);
 });
-test("u14 bridge rejects changed bytes for an existing module ID", () => {
+test("bridge rejects changed bytes for an existing module ID", () => {
   const s = setup();
   assert.equal(s.run(), 0);
   new Uint8Array(s.memory.buffer)[512] = 1;
   assert.equal(s.run(), -1);
 });
-test("u14 bridge malformed wasm preserves state", () => {
+test("bridge malformed wasm preserves state", () => {
   const s = setup(Uint8Array.of(1, 2, 3));
   assert.equal(s.run(), -1);
   assert.equal(new BigUint64Array(s.memory.buffer, 64, 50)[0], 0n);
 });
-test("u14 bridge trap rolls back scratch state and permits retry", () => {
+test("bridge trap rolls back scratch state and permits retry", () => {
   const s = setup(moduleBytes([0x20, 0, 0x42, 42, 0x37, 3, 0, 0]));
   assert.equal(s.run(), -1);
   assert.equal(new BigUint64Array(s.memory.buffer, 64, 50)[0], 0n);
@@ -56,21 +56,21 @@ test("u14 bridge trap rolls back scratch state and permits retry", () => {
   new Uint8Array(s.memory.buffer, 512, s.bytes.length).set(s.bytes);
   assert.equal(s.run(), 0);
 });
-test("u14 bridge validates buffer range and exact state ABI", () => {
+test("bridge validates buffer range and exact state ABI", () => {
   const s = setup();
   assert.equal(JIT_STATE_BYTES, S);
   assert.equal(s.bridge.execute(1, 65535, 2, 64, S), -1);
   assert.equal(s.bridge.execute(1, 512, s.bytes.length, 64, S - 1), -1);
   assert.equal(s.bridge.execute(0, 512, s.bytes.length, 64, S), -1);
 });
-test("u14 bridge remains usable after shared memory growth", () => {
+test("bridge remains usable after shared memory growth", () => {
   const s = setup();
   assert.equal(s.run(), 0);
   s.memory.grow(1);
   assert.equal(s.run(), 0);
   assert.equal(new BigUint64Array(s.memory.buffer, 64, 50)[0], 42n);
 });
-test("u14 execution cannot compile an unprepared module", () => {
+test("execution cannot compile an unprepared module", () => {
   const s = setup();
   assert.equal(s.bridge.execute(1, 512, s.bytes.length, 64, S), -2);
   assert.equal(new BigUint64Array(s.memory.buffer, 64, 50)[0], 0n);
@@ -79,13 +79,13 @@ test("u14 execution cannot compile an unprepared module", () => {
 });
 
 import { requireJitProof } from './jit-suite.mjs';
-test('u14 provisional observation survives and completed proof has no stale error', () => {
+test('provisional observation survives and completed proof has no stale error', () => {
  const row={pass:false,exit:0}; requireJitProof(row);
  assert.equal(row.jit_error,undefined);
  row.jit={executedBlocks:'1',executedInstructions:'2'};row.pass=true;
  requireJitProof(row);assert.equal(row.pass,true);assert.equal(row.jit_error,undefined);
 });
-test('u14 final fallback-only and original failure remain failures', () => {
+test('final fallback-only and original failure remain failures', () => {
  const missing={pass:true,exit:0};requireJitProof(missing);assert.equal(missing.pass,false);
  const failed={pass:false,timed_out:true,error:'original timeout'};
  requireJitProof(failed);assert.equal(failed.error,'original timeout');assert.equal(failed.pass,false);
@@ -97,11 +97,11 @@ const scratch=(s,pointer=64)=>new Uint8Array(s.memory.buffer,pointer,S);
 const pattern=(s,pointer=64,seed=0)=>{
   const bytes=scratch(s,pointer);for(let i=0;i<S;i++)bytes[i]=(i+seed)&255;return bytes.slice();
 };
-test('u14 reused rollback restores every400byte after actual wasm fill and trap',()=>{
+test('reused rollback restores every400byte after actual wasm fill and trap',()=>{
   const s=setup(fillAndTrap()),before=pattern(s);
   assert.equal(s.run(),-1);assert.deepEqual(scratch(s),before);
 });
-test('u14 sequential trap snapshots remain independent across scratch pointers',()=>{
+test('sequential trap snapshots remain independent across scratch pointers',()=>{
   const s=setup(fillAndTrap()),first=pattern(s,64,1),second=pattern(s,1024,7);
   assert.equal(s.bridge.prepare(1,512,s.bytes.length),0);
   assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),-1);
@@ -109,7 +109,7 @@ test('u14 sequential trap snapshots remain independent across scratch pointers',
   assert.equal(s.bridge.execute(2,512,s.bytes.length,1024,S),-1);
   assert.deepEqual(scratch(s,64),first);assert.deepEqual(scratch(s,1024),second);
 });
-test('u14 cost callback reentry cannot overwrite shared rollback buffer',()=>{
+test('cost callback reentry cannot overwrite shared rollback buffer',()=>{
   const s=setup();let entered=false,inner;
   s.bridge=jitImports(s.memory,field=>{
     if(field===19&&!entered){entered=true;inner=s.bridge.execute(1,512,s.bytes.length,64,S);}
@@ -117,31 +117,31 @@ test('u14 cost callback reentry cannot overwrite shared rollback buffer',()=>{
   assert.equal(s.run(),0);assert.equal(inner,-1);
   assert.equal(new BigUint64Array(s.memory.buffer,64,50)[0],42n);
 });
-test('u14 successful state becomes next full rollback baseline',()=>{
+test('successful state becomes next full rollback baseline',()=>{
   const s=setup();assert.equal(s.run(),0);const before=scratch(s).slice();
   s.bytes=fillAndTrap();new Uint8Array(s.memory.buffer,512,s.bytes.length).set(s.bytes);
   assert.equal(s.run(2),-1);assert.deepEqual(scratch(s),before);
 });
-test('u14 reused rollback refreshes state view after shared memory growth',()=>{
+test('reused rollback refreshes state view after shared memory growth',()=>{
   const s=setup(fillAndTrap()),before=pattern(s,64,3);
   assert.equal(s.bridge.prepare(1,512,s.bytes.length),0);s.memory.grow(1);
   assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),-1);
   assert.deepEqual(scratch(s),before);
 });
-test('u14 byte loop rejects last-byte mutation before execution',()=>{
+test('byte loop rejects last-byte mutation before execution',()=>{
   const s=setup(),before=pattern(s);
   assert.equal(s.bridge.prepare(1,512,s.bytes.length),0);
   new Uint8Array(s.memory.buffer)[512+s.bytes.length-1]^=1;
   assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),-1);
   assert.deepEqual(scratch(s),before);
 });
-test('u14 byte loop rejects different length without touching scratch',()=>{
+test('byte loop rejects different length without touching scratch',()=>{
   const s=setup(),before=pattern(s);
   assert.equal(s.bridge.prepare(1,512,s.bytes.length),0);
   assert.equal(s.bridge.execute(1,512,s.bytes.length-1,64,S),-1);
   assert.deepEqual(scratch(s),before);
 });
-test('u14 cost callback exception restores guard and remains an exception',()=>{
+test('cost callback exception restores guard and remains an exception',()=>{
   const s=setup();let fail=true;
   s.bridge=jitImports(s.memory,field=>{if(field===19&&fail){fail=false;throw Error('cost callback failure');}});
   assert.equal(s.bridge.prepare(1,512,s.bytes.length),0);
@@ -162,7 +162,7 @@ const finish = [0x41, 0];
 const trap = [0x00, 0x41, 0];
 const words = (s, pointer = 64) => new BigUint64Array(s.memory.buffer, pointer, 50);
 
-test('u14 import rejects the former 144-byte and off-by-one state lengths', () => {
+test('import rejects the former 144-byte and off-by-one state lengths', () => {
   const s = setup(moduleBytes([...storeXmm(0, 0xaa), ...finish])), before = pattern(s);
   assert.equal(s.bridge.prepare(1, 512, s.bytes.length), 0);
   for (const length of [144, S - 1, S + 1, 0x7fffffff]) {
@@ -171,7 +171,7 @@ test('u14 import rejects the former 144-byte and off-by-one state lengths', () =
   }
   assert.equal(s.bridge.execute(1, 512, s.bytes.length, 64, S), 0);
 });
-test('u14 state pointer must leave room for all 400 bytes', () => {
+test('state pointer must leave room for all 400 bytes', () => {
   const s = setup(moduleBytes([...storeXmm(15, 1), ...finish]));
   assert.equal(s.bridge.prepare(1, 512, s.bytes.length), 0);
   const end = s.memory.buffer.byteLength;
@@ -179,26 +179,26 @@ test('u14 state pointer must leave room for all 400 bytes', () => {
   assert.equal(s.bridge.execute(1, 512, s.bytes.length, end - S, S), 0);
   assert.deepEqual([...new Uint8Array(s.memory.buffer, end - 16, 16)], Array(16).fill(1));
 });
-test('u14 trap after every XMM store restores the full 400 bytes', () => {
+test('trap after every XMM store restores the full 400 bytes', () => {
   const body = [];
   for (let n = 0; n < 16; n++) body.push(...storeXmm(n, 0x10 + n));
   const s = setup(moduleBytes([...body, ...trap])), before = pattern(s, 64, 5);
   assert.equal(s.run(), -1);
   assert.deepEqual(scratch(s), before);
 });
-test('u14 rollback covers the final XMM15 byte at offset 399', () => {
+test('rollback covers the final XMM15 byte at offset 399', () => {
   const s = setup(moduleBytes([...storeXmm(15, 0xee), ...trap])), before = pattern(s, 64, 9);
   assert.equal(s.run(), -1);
   assert.equal(scratch(s)[S - 1], before[S - 1]);
   assert.deepEqual(scratch(s), before);
 });
-test('u14 partial trap after GPR and XMM writes restores both regions', () => {
+test('partial trap after GPR and XMM writes restores both regions', () => {
   const s = setup(moduleBytes([...gpr0(42), ...storeXmm(3, 0x33), ...trap])), before = pattern(s, 64, 11);
   assert.equal(s.run(), -1);
   assert.deepEqual(scratch(s).subarray(0, XMM), before.subarray(0, XMM));
   assert.deepEqual(scratch(s).subarray(XMM), before.subarray(XMM));
 });
-test('u14 XMM low and high lanes keep little-endian u128 order', () => {
+test('XMM low and high lanes keep little-endian u128 order', () => {
   // xmm0 = xmm1; then gpr0/gpr1 = i64x2 lanes 0/1 of xmm1.
   const lane = (target, index) => [0x20, 0, 0x20, 0, ...simd(0x00, ...xmmArg(1)), ...simd(0x1d, index), 0x37, 3, target * 8];
   const s = setup(moduleBytes([...moveXmm(0, 1), ...lane(0, 0), ...lane(1, 1), ...finish]));
@@ -209,7 +209,7 @@ test('u14 XMM low and high lanes keep little-endian u128 order', () => {
   assert.equal(w[0], 0x1111222233334444n); assert.equal(w[1], 0xaaaabbbbccccddddn);
   assert.notEqual(w[18], w[19]);
 });
-test('u14 successful XMM run becomes the next rollback baseline', () => {
+test('successful XMM run becomes the next rollback baseline', () => {
   const s = setup(moduleBytes([...storeXmm(7, 0x77), ...finish]));
   pattern(s, 64, 13);
   assert.equal(s.run(), 0);
@@ -220,7 +220,7 @@ test('u14 successful XMM run becomes the next rollback baseline', () => {
   assert.equal(s.run(2), -1);
   assert.deepEqual(scratch(s), after);
 });
-test('u14 Workers keep independent compiled modules and rollback buffers', async () => {
+test('Workers keep independent compiled modules and rollback buffers', async () => {
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
   const failing = moduleBytes([...storeXmm(0, 0xf0), ...trap]);
   const passing = moduleBytes([...storeXmm(0, 0x0f), ...gpr0(42), ...finish]);

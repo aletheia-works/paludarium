@@ -213,19 +213,19 @@ mod tests {
     }
 
     #[test]
-    fn u12_input_flag_translation() {
+    fn input_flag_translation() {
         let mut value = blank();
         value.c_iflag = libc::IXON | libc::IXOFF | libc::ICRNL;
         assert_eq!(attributes(&value).unwrap().input_flags, 0x1500);
     }
     #[test]
-    fn u12_output_flag_translation() {
+    fn output_flag_translation() {
         let mut value = blank();
         value.c_oflag = libc::OPOST | libc::ONLCR;
         assert_eq!(attributes(&value).unwrap().output_flags, 5);
     }
     #[test]
-    fn u12_control_width_baud_translation() {
+    fn control_width_baud_translation() {
         let mut value = blank();
         value.c_cflag = libc::CS8 | libc::CREAD | libc::HUPCL;
         value.c_ospeed = libc::B9600;
@@ -245,13 +245,13 @@ mod tests {
         }
     }
     #[test]
-    fn u12_local_flag_translation() {
+    fn local_flag_translation() {
         let mut value = blank();
         value.c_lflag = libc::ISIG | libc::ICANON | libc::ECHO | libc::IEXTEN;
         assert_eq!(attributes(&value).unwrap().local_flags, 0x800b);
     }
     #[test]
-    fn u12_control_character_order_and_disabled() {
+    fn control_character_order_and_disabled() {
         let mut value = blank();
         value.c_cc.fill(255);
         value.c_cc[libc::VINTR] = 3;
@@ -268,14 +268,14 @@ mod tests {
         assert_eq!((chars[5], chars[6]), (255, 255));
     }
     #[test]
-    fn u12_input_speed_and_extended_baud() {
+    fn input_speed_and_extended_baud() {
         let mut value = blank();
         value.c_ospeed = libc::B115200;
         value.c_ispeed = libc::B9600;
         assert_eq!(attributes(&value).unwrap().control_flags, 0xd1002);
     }
     #[test]
-    fn u12_unrepresentable_attributes_rejected() {
+    fn unrepresentable_attributes_rejected() {
         let mut value = blank();
         value.c_ospeed = libc::B7200;
         assert_eq!(attributes(&value), Err(Errno::EINVAL));
@@ -288,14 +288,14 @@ mod tests {
     }
 
     #[test]
-    fn u12_real_pty_attributes() {
+    fn real_pty_attributes() {
         let (_master, slave) = pty();
         let terminal = terminal_info(slave.as_raw_fd()).unwrap().unwrap();
         assert_ne!(terminal.attributes.local_flags & 2, 0);
         assert_eq!(terminal.attributes.control_chars[0], 3);
     }
     #[test]
-    fn u12_real_pty_positive_dimensions() {
+    fn real_pty_positive_dimensions() {
         let (_master, slave) = pty();
         let size = libc::winsize {
             ws_row: 37,
@@ -316,7 +316,7 @@ mod tests {
         );
     }
     #[test]
-    fn u12_real_pty_zero_dimensions() {
+    fn real_pty_zero_dimensions() {
         let (_master, slave) = pty();
         let size = libc::winsize {
             ws_row: 0,
@@ -337,23 +337,23 @@ mod tests {
         );
     }
     #[test]
-    fn u12_dev_null_is_not_terminal() {
+    fn dev_null_is_not_terminal() {
         let file = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(terminal_info(file.as_raw_fd()), Ok(None));
     }
     #[test]
-    fn u12_invalid_descriptor_errno_is_linux() {
+    fn invalid_descriptor_errno_is_linux() {
         assert_eq!(terminal_info(-1), Err(Errno::EBADF));
     }
     #[test]
-    fn u12_pty_drop_closes_descriptor() {
+    fn pty_drop_closes_descriptor() {
         let (_master, slave) = pty();
         let fd = slave.as_raw_fd();
         drop(slave);
         assert_eq!(terminal_info(fd), Err(Errno::EBADF));
     }
     #[test]
-    fn u12_stderr_terminal_in_child() {
+    fn stderr_terminal_in_child() {
         const CHILD: &str = "PALUDARIUM_U12_STDERR_PTY";
         if std::env::var_os(CHILD).is_some() {
             use crate::{Host, NativeHost, StreamId};
@@ -369,7 +369,7 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "macos::tests::u12_stderr_terminal_in_child",
+                "macos::tests::stderr_terminal_in_child",
                 "--test-threads=1",
             ])
             .env(CHILD, "1")

@@ -1,6 +1,6 @@
 use crate::*;
 #[test]
-fn u7_create_read_write_seek() {
+fn create_read_write_seek() {
     let fs = MemFs::new();
     let f = fs.open(b"/a", 66, 0o644).unwrap();
     f.write(b"abc").unwrap();
@@ -10,7 +10,7 @@ fn u7_create_read_write_seek() {
     assert_eq!(&b[..3], b"abc");
 }
 #[test]
-fn u7_links_and_unlink_lifetime() {
+fn links_and_unlink_lifetime() {
     let fs = MemFs::new();
     let f = fs.open(b"/a", 66, 0o644).unwrap();
     fs.link(b"/a", b"/b").unwrap();
@@ -20,7 +20,7 @@ fn u7_links_and_unlink_lifetime() {
     assert_eq!(&*fs.read_file(b"/b").unwrap(), b"x");
 }
 #[test]
-fn u7_symlink_component_dotdot() {
+fn symlink_component_dotdot() {
     let fs = MemFs::new();
     fs.mkdir(b"/a", 0o755).unwrap();
     fs.mkdir(b"/a/sub", 0o755).unwrap();
@@ -30,14 +30,14 @@ fn u7_symlink_component_dotdot() {
     assert_eq!(fs.metadata(b"/s", false).unwrap().mode, 0o120777);
 }
 #[test]
-fn u7_symlink_loop() {
+fn symlink_loop() {
     let fs = MemFs::new();
     fs.symlink(b"/b", b"/a").unwrap();
     fs.symlink(b"/a", b"/b").unwrap();
     assert_eq!(fs.metadata(b"/a", true), Err(Errno(40)));
 }
 #[test]
-fn u7_directory_rename_and_errors() {
+fn directory_rename_and_errors() {
     let fs = MemFs::new();
     fs.mkdir(b"/d", 0o755).unwrap();
     fs.open(b"/d/a", 66, 0o644).unwrap();
@@ -47,7 +47,7 @@ fn u7_directory_rename_and_errors() {
     assert_eq!(fs.read_dir(b"/d").unwrap().len(), 3);
 }
 #[test]
-fn u7_flock_shared_and_release() {
+fn flock_shared_and_release() {
     let fs = MemFs::new();
     let a = fs.open(b"/a", 66, 0o644).unwrap();
     let b = fs.open(b"/a", 2, 0).unwrap();
@@ -59,7 +59,7 @@ fn u7_flock_shared_and_release() {
     a.flock(8).unwrap();
 }
 #[test]
-fn u7_append_truncate_and_flags() {
+fn append_truncate_and_flags() {
     let fs = MemFs::new();
     let a = fs.open(b"/a", 66, 0o644).unwrap();
     a.write(b"a").unwrap();
@@ -72,7 +72,7 @@ fn u7_append_truncate_and_flags() {
     assert_eq!(a.seek(-1, 0), Err(Errno::EINVAL));
 }
 #[test]
-fn u7_non_utf8_nofollow_and_invalid() {
+fn non_utf8_nofollow_and_invalid() {
     let fs = MemFs::new();
     fs.open(b"/\xff", 66, 0o644).unwrap();
     fs.symlink(b"/\xff", b"/s").unwrap();
@@ -82,43 +82,43 @@ fn u7_non_utf8_nofollow_and_invalid() {
 }
 
 #[test]
-fn u7_path_missing_component_before_dotdot() {
+fn path_missing_component_before_dotdot() {
     let fs = MemFs::new();
     assert_eq!(fs.metadata(b"/missing/../", true), Err(Errno::ENOENT));
 }
 #[test]
-fn u7_path_regular_before_dotdot() {
+fn path_regular_before_dotdot() {
     let fs = MemFs::new();
     fs.open(b"/a", 66, 0o600).unwrap();
     assert_eq!(fs.metadata(b"/a/../", true), Err(Errno::ENOTDIR));
 }
 #[test]
-fn u7_path_trailing_slash() {
+fn path_trailing_slash() {
     let fs = MemFs::new();
     fs.open(b"/a", 66, 0o600).unwrap();
     assert_eq!(fs.metadata(b"/a/", true), Err(Errno::ENOTDIR));
 }
 #[test]
-fn u7_path_name_limit() {
+fn path_name_limit() {
     let fs = MemFs::new();
     let mut p = b"/".to_vec();
     p.extend([b'a'; 256]);
     assert_eq!(fs.metadata(&p, true), Err(Errno::ENAMETOOLONG));
 }
 #[test]
-fn u7_path_root_clamped() {
+fn path_root_clamped() {
     let fs = MemFs::new();
     assert_eq!(fs.metadata(b"/../../", true).unwrap().inode, 1);
 }
 #[test]
-fn u7_path_dangling_create() {
+fn path_dangling_create() {
     let fs = MemFs::new();
     fs.symlink(b"a", b"/s").unwrap();
     fs.open(b"/s", 66, 0o600).unwrap();
     assert!(fs.metadata(b"/a", true).is_ok());
 }
 #[test]
-fn u7_inode_directory_links() {
+fn inode_directory_links() {
     let fs = MemFs::new();
     assert_eq!(fs.metadata(b"/", true).unwrap().links, 2);
     fs.mkdir(b"/d", 0o755).unwrap();
@@ -127,7 +127,7 @@ fn u7_inode_directory_links() {
     assert_eq!(fs.metadata(b"/", true).unwrap().links, 2);
 }
 #[test]
-fn u7_inode_unlink_reclaims_map() {
+fn inode_unlink_reclaims_map() {
     let fs = MemFs::new();
     let f = fs.open(b"/a", 66, 0o600).unwrap();
     let id = f.stat().unwrap().inode;
@@ -136,39 +136,39 @@ fn u7_inode_unlink_reclaims_map() {
     assert_eq!(f.write(b"alive"), Ok(5));
 }
 #[test]
-fn u7_open_readonly_write() {
+fn open_readonly_write() {
     let fs = MemFs::new();
     fs.open(b"/a", 66, 0o600).unwrap();
     assert_eq!(fs.open(b"/a", 0, 0).unwrap().write(b"x"), Err(Errno::EBADF));
 }
 #[test]
-fn u7_open_writeonly_read() {
+fn open_writeonly_read() {
     let fs = MemFs::new();
     let f = fs.open(b"/a", 65, 0o600).unwrap();
     assert_eq!(f.read(&mut [0]), Err(Errno::EBADF));
 }
 #[test]
-fn u7_open_exclusive() {
+fn open_exclusive() {
     let fs = MemFs::new();
     fs.open(b"/a", 66, 0o600).unwrap();
     assert!(matches!(fs.open(b"/a", 194, 0o600), Err(Errno::EEXIST)));
 }
 #[test]
-fn u7_open_directory_flags() {
+fn open_directory_flags() {
     let fs = MemFs::new();
     fs.open(b"/a", 66, 0o600).unwrap();
     assert!(matches!(fs.open(b"/a", 65536, 0), Err(Errno::ENOTDIR)));
     assert!(matches!(fs.open(b"/", 2, 0), Err(Errno::EISDIR)));
 }
 #[test]
-fn u7_open_truncate() {
+fn open_truncate() {
     let fs = MemFs::new();
     fs.open(b"/a", 66, 0o600).unwrap().write(b"data").unwrap();
     fs.open(b"/a", 514, 0).unwrap();
     assert_eq!(fs.metadata(b"/a", true).unwrap().size, 0);
 }
 #[test]
-fn u7_open_sparse() {
+fn open_sparse() {
     let fs = MemFs::new();
     let f = fs.open(b"/a", 66, 0o600).unwrap();
     f.seek(3, 0).unwrap();
@@ -176,13 +176,13 @@ fn u7_open_sparse() {
     assert_eq!(&*fs.read_file(b"/a").unwrap(), b"\0\0\0x");
 }
 #[test]
-fn u7_open_eof() {
+fn open_eof() {
     let fs = MemFs::new();
     let f = fs.open(b"/a", 66, 0o600).unwrap();
     assert_eq!(f.read(&mut [0; 4]), Ok(0));
 }
 #[test]
-fn u7_open_shared_lock_drop() {
+fn open_shared_lock_drop() {
     let fs = MemFs::new();
     let a = fs.open(b"/a", 66, 0o600).unwrap();
     let dup = Arc::clone(&a);

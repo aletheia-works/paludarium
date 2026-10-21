@@ -417,15 +417,15 @@ mod tests {
                 }
             };
         }
-        fault_case!(u4_fault_maperr_read, false, false, false, false);
-        fault_case!(u4_fault_maperr_fetch, false, true, false, false);
-        fault_case!(u4_fault_accerr_resident_write, true, false, true, true);
-        fault_case!(u4_fault_accerr_virgin_write, true, false, true, false);
-        fault_case!(u4_fault_accerr_resident_fetch, false, true, true, true);
+        fault_case!(fault_maperr_read, false, false, false, false);
+        fault_case!(fault_maperr_fetch, false, true, false, false);
+        fault_case!(fault_accerr_resident_write, true, false, true, true);
+        fault_case!(fault_accerr_virgin_write, true, false, true, false);
+        fault_case!(fault_accerr_resident_fetch, false, true, true, true);
     }
 
     #[test]
-    fn u2_arithmetic_fault_retains_instruction_pointer() {
+    fn arithmetic_fault_retains_instruction_pointer() {
         let rip = GuestAddr(0x401123);
         assert_eq!(ExitReason::ArithmeticFault { rip }.rip(), rip);
     }

@@ -1,6 +1,6 @@
 use crate::*;
 #[test]
-fn u7_mtime_preserves_unsigned_clock_maximum() {
+fn mtime_preserves_unsigned_clock_maximum() {
     let fs = MemFs::with_clock(Arc::new(|| Ok(u64::MAX)));
     let file = fs.open(b"/maximum", 0o100 | 2, 0o644).unwrap();
     assert_eq!(file.stat().unwrap().mtime_ns, i128::from(u64::MAX));
@@ -20,7 +20,7 @@ fn fixture() -> (MemFs, Arc<AtomicU64>) {
     )
 }
 #[test]
-fn u11_mtime_initial_epoch_and_created_clock() {
+fn mtime_initial_epoch_and_created_clock() {
     let (mut fs, _) = fixture();
     fs.add_file(GuestFile::new(b"/input".to_vec(), vec![1]))
         .unwrap();
@@ -35,7 +35,7 @@ fn u11_mtime_initial_epoch_and_created_clock() {
     );
 }
 #[test]
-fn u11_mtime_write_truncate_and_hardlink_share_time() {
+fn mtime_write_truncate_and_hardlink_share_time() {
     let (fs, time) = fixture();
     let file = fs.open(b"/a", 66, 0o644).unwrap();
     fs.link(b"/a", b"/b").unwrap();
@@ -47,7 +47,7 @@ fn u11_mtime_write_truncate_and_hardlink_share_time() {
     assert_eq!(file.stat().unwrap().mtime_ns, 3_000_000_000);
 }
 #[test]
-fn u11_mtime_realtime_can_move_backwards() {
+fn mtime_realtime_can_move_backwards() {
     let (fs, time) = fixture();
     let file = fs.open(b"/a", 66, 0o644).unwrap();
     time.store(42, Ordering::SeqCst);
@@ -58,13 +58,13 @@ fn u11_mtime_realtime_can_move_backwards() {
     assert_eq!(file.stat().unwrap().mtime_ns, 42);
 }
 #[test]
-fn u11_mtime_clock_failure_does_not_create_file() {
+fn mtime_clock_failure_does_not_create_file() {
     let fs = MemFs::with_clock(Arc::new(|| Err(Errno::EIO)));
     assert!(matches!(fs.open(b"/a", 66, 0o644), Err(Errno::EIO)));
     assert_eq!(fs.metadata(b"/a", false), Err(Errno::ENOENT));
 }
 #[test]
-fn u11_mtime_open_truncate_updates_clock() {
+fn mtime_open_truncate_updates_clock() {
     let (fs, time) = fixture();
     fs.open(b"/a", 66, 0o644).unwrap().write(b"abc").unwrap();
     time.store(700, Ordering::SeqCst);
@@ -73,7 +73,7 @@ fn u11_mtime_open_truncate_updates_clock() {
     assert_eq!(file.stat().unwrap().size, 0);
 }
 #[test]
-fn u11_mtime_default_preserves_epoch() {
+fn mtime_default_preserves_epoch() {
     let fs = MemFs::new();
     let file = fs.open(b"/a", 66, 0o644).unwrap();
     file.write(b"bytes").unwrap();
@@ -81,7 +81,7 @@ fn u11_mtime_default_preserves_epoch() {
     assert_eq!(file.stat().unwrap().mtime_ns, 0);
 }
 #[test]
-fn u11_mtime_failed_write_keeps_bytes_and_time() {
+fn mtime_failed_write_keeps_bytes_and_time() {
     let time = Arc::new(AtomicU64::new(9));
     let clock = time.clone();
     let fs = MemFs::with_clock(Arc::new(move || {

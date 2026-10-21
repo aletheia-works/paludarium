@@ -15,7 +15,7 @@ try:
     termios.tcsetattr(slave, termios.TCSANOW, [0, 0, 0xBF, 0, termios.B38400, termios.B38400, cc])
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 37, 101, 0, 0))
     result = subprocess.run(
-        [sys.argv[1], "--exact", "terminal_tests::u9_native_managed_pty", "--nocapture"],
+        [sys.argv[1], "--exact", "terminal_tests::native_managed_pty", "--nocapture"],
         stdin=slave,
         capture_output=True,
         env={**os.environ, "PALUDARIUM_U9_HOST_CHILD": "1"},

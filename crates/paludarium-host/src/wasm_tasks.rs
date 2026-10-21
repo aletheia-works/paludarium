@@ -108,7 +108,7 @@ mod tests {
     use super::*;
     use crate::testing::RecordingHost;
     #[test]
-    fn u11_task_executes_once() {
+    fn task_executes_once() {
         let value = Arc::new(AtomicU32::new(0));
         let copy = value.clone();
         let id = register(Box::new(move || {
@@ -121,11 +121,11 @@ mod tests {
         unregister(id);
     }
     #[test]
-    fn u11_task_bad_handle() {
+    fn task_bad_handle() {
         assert_eq!(run_task(0), Err(Errno::EINVAL));
     }
     #[test]
-    fn u11_task_join_reclaims_registration() {
+    fn task_join_reclaims_registration() {
         let id = register(Box::new(|| {})).unwrap();
         let handle = WasmThread::new(id, Arc::new(RecordingHost::default())).unwrap();
         assert_eq!(run_task(id), Ok(()));
@@ -133,14 +133,14 @@ mod tests {
         assert!(task(id).is_none());
     }
     #[test]
-    fn u11_task_panic_is_host_failure() {
+    fn task_panic_is_host_failure() {
         let id = register(Box::new(|| panic!("test-only task panic"))).unwrap();
         assert_eq!(run_task(id), Err(Errno::EIO));
         let handle = WasmThread::new(id, Arc::new(RecordingHost::default())).unwrap();
         assert_eq!(Box::new(handle).join(), Err(Errno::EIO));
     }
     #[test]
-    fn u11_task_start_failure_releases_closure() {
+    fn task_start_failure_releases_closure() {
         let value = Arc::new(());
         let retained = value.clone();
         let id = register(Box::new(move || drop(retained))).unwrap();
@@ -149,7 +149,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&value), 1);
     }
     #[test]
-    fn u11_task_handle_after_unregister_rejected() {
+    fn task_handle_after_unregister_rejected() {
         let id = register(Box::new(|| {})).unwrap();
         unregister(id);
         assert!(matches!(
@@ -158,7 +158,7 @@ mod tests {
         ));
     }
     #[test]
-    fn u11_task_registrations_are_independent() {
+    fn task_registrations_are_independent() {
         let first = register(Box::new(|| {})).unwrap();
         let second = register(Box::new(|| {})).unwrap();
         assert_ne!(first, second);

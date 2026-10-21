@@ -115,34 +115,34 @@ mod eligibility_tests {
         assert_eq!(crate::block::extract(bytes, 4096).is_some(), expected);
     }
     #[test]
-    fn u14_eligible_mov_immediate() {
+    fn eligible_mov_immediate() {
         check(&[0xb8, 42, 0, 0, 0], true);
     }
     #[test]
-    fn u14_eligible_arithmetic_immediate() {
+    fn eligible_arithmetic_immediate() {
         check(&[0x48, 0x83, 0xc0, 1], true);
     }
     #[test]
-    fn u14_eligible_je_and_jne() {
+    fn eligible_je_and_jne() {
         check(&[0x74, 0], true);
         check(&[0x75, 0], true);
     }
     #[test]
-    fn u14_eligible_rejects_memory() {
+    fn eligible_rejects_memory() {
         check(&[0x48, 0x8b, 7], false);
     }
     #[test]
-    fn u14_eligible_rejects_syscall() {
+    fn eligible_rejects_syscall() {
         check(&[0x0f, 5], false);
     }
     #[test]
-    fn u14_eligible_sse_register_only_and_rejects_return() {
+    fn eligible_sse_register_only_and_rejects_return() {
         check(&[0x66, 0x0f, 0xef, 0x07], false);
         check(&[0x66, 0x0f, 0xef, 0xc0], true);
         check(&[0xc3], false);
     }
     #[test]
-    fn u14_eligible_rejects_wrong_width_or_condition() {
+    fn eligible_rejects_wrong_width_or_condition() {
         check(&[0x83, 0xc0, 1], false);
         check(&[0x77, 0], false);
     }

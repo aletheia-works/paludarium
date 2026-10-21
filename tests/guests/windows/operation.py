@@ -27,7 +27,7 @@ def operation(executable, binary, args, directory, environment, fixture=None, mo
     if mounted:
         env["PALUDARIUM_U13_MOUNTED"] = "1"
     child = run(
-        [str(executable), "--exact", "u13_guest_operation", "--nocapture"], cwd=ROOT, env=env
+        [str(executable), "--exact", "windows_guest_operation", "--nocapture"], cwd=ROOT, env=env
     )
     (directory / "runner.json").write_text(json.dumps(child, indent=2) + "\n", encoding="utf-8")
     if child["timed_out"] or child["exit"] != 0:

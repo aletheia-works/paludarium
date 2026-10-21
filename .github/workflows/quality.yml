@@ -278,7 +278,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           for ($iteration = 1; $iteration -le 10; $iteration++) {
             Write-Output "U7_WINDOWS_REQUIRED_RUN=$iteration/10 head=$env:GITHUB_SHA"
-            $lines = & cargo test --locked -p paludarium-host --lib native_fs::files_tests::u7_native_windows_symlink_rename_race -- --exact --nocapture 2>&1
+            $lines = & cargo test --locked -p paludarium-host --lib native_fs::files_tests::native_windows_symlink_rename_race -- --exact --nocapture 2>&1
             $exitCode = $LASTEXITCODE
             $lines | Write-Output
             if ($exitCode -ne 0) { throw "Windows exchange run $iteration failed: exit $exitCode" }

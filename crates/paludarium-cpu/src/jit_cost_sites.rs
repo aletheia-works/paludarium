@@ -113,7 +113,7 @@ pub fn reset() {
 mod tests {
     use super::*;
     #[test]
-    fn u14_sites_same_key_counts_without_formatting_again() {
+    fn sites_same_key_counts_without_formatting_again() {
         let mut s = Sites::new();
         assert!(s.observe((1, 2, 3, 4), || "x".into()));
         assert!(s.observe((1, 2, 3, 4), || panic!("must not reformat")));
@@ -121,28 +121,28 @@ mod tests {
         assert_eq!(s.rows.len(), 1);
     }
     #[test]
-    fn u14_sites_space_is_separate() {
+    fn sites_space_is_separate() {
         let mut s = Sites::new();
         s.observe((1, 2, 3, 4), String::new);
         s.observe((2, 2, 3, 4), String::new);
         assert_eq!(s.rows.len(), 2);
     }
     #[test]
-    fn u14_sites_epoch_is_separate() {
+    fn sites_epoch_is_separate() {
         let mut s = Sites::new();
         s.observe((1, 2, 3, 4), String::new);
         s.observe((1, 3, 3, 4), String::new);
         assert_eq!(s.rows.len(), 2);
     }
     #[test]
-    fn u14_sites_class_is_separate() {
+    fn sites_class_is_separate() {
         let mut s = Sites::new();
         s.observe((1, 2, 3, 4), String::new);
         s.observe((1, 2, 3, 5), String::new);
         assert_eq!(s.rows.len(), 2);
     }
     #[test]
-    fn u14_sites_capacity_drop_never_replaces_retained_entry() {
+    fn sites_capacity_drop_never_replaces_retained_entry() {
         let mut s = Sites::new();
         for i in 0..CAPACITY {
             assert!(s.observe((0, 0, i as u64, 0), String::new));
@@ -153,7 +153,7 @@ mod tests {
         assert_eq!(s.rows.len(), CAPACITY);
     }
     #[test]
-    fn u14_sites_counter_never_wraps() {
+    fn sites_counter_never_wraps() {
         let mut s = Sites::new();
         s.observe((0, 0, 0, 0), String::new);
         s.rows[0].count = u64::MAX;
@@ -161,14 +161,14 @@ mod tests {
         assert_eq!(s.field(0, 4), Some(u64::MAX));
     }
     #[test]
-    fn u14_sites_label_is_bounded_and_truncation_explicit() {
+    fn sites_label_is_bounded_and_truncation_explicit() {
         let mut s = Sites::new();
         s.observe((0, 0, 0, 0), || "x".repeat(300));
         assert_eq!(s.field(0, 5), Some(256));
         assert_eq!(s.field(0, 6), Some(1));
     }
     #[test]
-    fn u14_sites_invalid_reads_do_not_insert() {
+    fn sites_invalid_reads_do_not_insert() {
         let s = Sites::new();
         assert_eq!(s.field(0, 0), None);
         assert!(s.rows.is_empty());

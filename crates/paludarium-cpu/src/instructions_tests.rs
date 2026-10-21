@@ -23,7 +23,7 @@ fn fixture(code: &[u8]) -> (CpuState, AddressSpace) {
     (CpuState::new(GuestAddr(0x10000), GuestAddr(0)), memory)
 }
 #[test]
-fn u2_zero_rep_count_does_not_touch_invalid_memory() {
+fn zero_rep_count_does_not_touch_invalid_memory() {
     let (mut s, m) = fixture(&[0xf3, 0xa6]);
     s.gpr[reg::RSI] = u64::MAX;
     s.gpr[reg::RDI] = u64::MAX;
@@ -34,7 +34,7 @@ fn u2_zero_rep_count_does_not_touch_invalid_memory() {
     assert!(s.repeat_continuation.is_none());
 }
 #[test]
-fn u2_address32_string_wraps_count_and_indices() {
+fn address32_string_wraps_count_and_indices() {
     let (mut s, m) = fixture(&[0x67, 0xf3, 0xa4]);
     s.gpr[reg::RSI] = 0x123440000000;
     s.gpr[reg::RDI] = 0xabcd40000010;
@@ -49,7 +49,7 @@ fn u2_address32_string_wraps_count_and_indices() {
     assert_eq!(byte, [0x42]);
 }
 #[test]
-fn u2_string_source_segment_does_not_apply_to_destination() {
+fn string_source_segment_does_not_apply_to_destination() {
     let (mut s, m) = fixture(&[0x64, 0xa4]);
     s.fs_base = 0x40000000;
     s.gpr[reg::RSI] = 3;
@@ -75,14 +75,14 @@ fn continuation() -> (CpuState, AddressSpace) {
     (s, m)
 }
 #[test]
-fn u2_repeat_context_clears_on_different_instruction() {
+fn repeat_context_clears_on_different_instruction() {
     let (mut s, m) = continuation();
     s.rip = GuestAddr(0x10002);
     step(&mut s, &m).unwrap();
     assert!(s.repeat_continuation.is_none());
 }
 #[test]
-fn u2_repeat_fetch_fault_applies_explicit_flags_model_and_clears_context() {
+fn repeat_fetch_fault_applies_explicit_flags_model_and_clears_context() {
     for policy in [
         RepFaultFlags::RestoreInitial,
         RepFaultFlags::PreserveCompleted,
@@ -109,7 +109,7 @@ fn u2_repeat_fetch_fault_applies_explicit_flags_model_and_clears_context() {
 }
 
 #[test]
-fn u2_repeat_data_fault_applies_explicit_flags_model() {
+fn repeat_data_fault_applies_explicit_flags_model() {
     assert_eq!(
         CpuState::default().rep_fault_flags,
         RepFaultFlags::RestoreInitial
@@ -157,7 +157,7 @@ fn u2_repeat_data_fault_applies_explicit_flags_model() {
     }
 }
 #[test]
-fn u2_code_change_invalidates_cached_repeat_context() {
+fn code_change_invalidates_cached_repeat_context() {
     let (mut s, m) = continuation();
     m.write_initial(GuestAddr(0x10000), &[0x90]).unwrap();
     let flags = s.rflags;
@@ -167,7 +167,7 @@ fn u2_code_change_invalidates_cached_repeat_context() {
     assert_eq!(s.rip, GuestAddr(0x10001));
 }
 #[test]
-fn u2_failed_cmpxchg16b_preflights_all_write_permissions() {
+fn failed_cmpxchg16b_preflights_all_write_permissions() {
     let (mut s, mut m) = fixture(&[0xf0, 0x48, 0x0f, 0xc7, 0x0f]);
     s.gpr[reg::RDI] = 0x40000000;
     m.write_u64(GuestAddr(0x40000000), 7).unwrap();
@@ -181,7 +181,7 @@ fn u2_failed_cmpxchg16b_preflights_all_write_permissions() {
     assert_eq!(m.read_u64(GuestAddr(0x40000000)).unwrap(), 7);
 }
 #[test]
-fn u2_address32_loop_zero_extends_ecx_without_modifying_flags() {
+fn address32_loop_zero_extends_ecx_without_modifying_flags() {
     let (mut s, m) = fixture(&[0x67, 0xe2, 0]);
     s.gpr[reg::RCX] = 0x123400000000;
     let flags = s.rflags;
@@ -220,7 +220,7 @@ fn segmented_fixture(code: &[u8], fs: bool) -> (CpuState, AddressSpace) {
 }
 
 #[test]
-fn u2_segment_atomic_paths_truncate_offset_before_adding_base() {
+fn segment_atomic_paths_truncate_offset_before_adding_base() {
     let cases: &[(&[u8], u64, u64, bool)] = &[
         (&[0xf0, 0x48, 0x01, 0x37], 44, 0, false),
         (&[0xf0, 0x48, 0x11, 0x37], 45, 0, false),
@@ -266,7 +266,7 @@ fn u2_segment_atomic_paths_truncate_offset_before_adding_base() {
 }
 
 #[test]
-fn u2_segment_pair_alignment_uses_final_linear_address() {
+fn segment_pair_alignment_uses_final_linear_address() {
     let code = [0xf0, 0x48, 0x0f, 0xc7, 0x0f];
     let (mut state, memory) = segmented_fixture(&code, false);
     state.gs_base += 1;
@@ -285,7 +285,7 @@ fn u2_segment_pair_alignment_uses_final_linear_address() {
 }
 
 #[test]
-fn u2_segment_failed_compare_preflights_final_write_permissions() {
+fn segment_failed_compare_preflights_final_write_permissions() {
     for fs in [true, false] {
         let (mut state, mut memory) = segmented_fixture(&[0xf0, 0x48, 0x0f, 0xb1, 0x37], fs);
         state.gpr[reg::RAX] = 0;
@@ -308,7 +308,7 @@ fn u2_segment_failed_compare_preflights_final_write_permissions() {
 }
 
 #[test]
-fn u2_segment_unmapped_atomic_fault_reports_final_address() {
+fn segment_unmapped_atomic_fault_reports_final_address() {
     let (mut state, memory) = fixture(&[0x65, 0xf0, 0x48, 0xff, 0x07]);
     state.gpr[reg::RDI] = 0x40000000;
     state.gs_base = 0x1_00000000;
@@ -325,7 +325,7 @@ fn u2_segment_unmapped_atomic_fault_reports_final_address() {
 }
 
 #[test]
-fn u2_segment_pair_failed_compare_zero_extends_registers() {
+fn segment_pair_failed_compare_zero_extends_registers() {
     let (mut state, memory) = segmented_fixture(&[0xf0, 0x0f, 0xc7, 0x0f], false);
     memory
         .write_u64(GuestAddr(0x1_40000000), 0x1122334455667788)

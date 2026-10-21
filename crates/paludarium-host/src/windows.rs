@@ -178,21 +178,21 @@ mod tests {
         }
     }
     #[test]
-    fn u13_console_processed_flags() {
+    fn console_processed_flags() {
         let info = convert(7, 1, viewport()).unwrap();
         assert_eq!(info.attributes.local_flags, 11);
         assert_eq!(info.attributes.output_flags, 1);
         assert_eq!(info.attributes.control_chars[0], 3);
     }
     #[test]
-    fn u13_console_raw_flags() {
+    fn console_raw_flags() {
         let info = convert(0, 0, viewport()).unwrap();
         assert_eq!(info.attributes.local_flags, 0);
         assert_eq!(info.attributes.output_flags, 0);
         assert_eq!(info.attributes.control_flags, 0);
     }
     #[test]
-    fn u13_console_viewport_not_buffer() {
+    fn console_viewport_not_buffer() {
         let info = convert(3, 3, viewport()).unwrap();
         assert_eq!(
             (info.columns, info.rows, info.x_pixels, info.y_pixels),
@@ -200,19 +200,19 @@ mod tests {
         );
     }
     #[test]
-    fn u13_console_unknown_input_rejected() {
+    fn console_unknown_input_rejected() {
         assert_eq!(convert(0x400, 0, viewport()), Err(Errno::EINVAL));
     }
     #[test]
-    fn u13_console_unknown_output_rejected() {
+    fn console_unknown_output_rejected() {
         assert_eq!(convert(0, 0x20, viewport()), Err(Errno::EINVAL));
     }
     #[test]
-    fn u13_console_echo_without_line_rejected() {
+    fn console_echo_without_line_rejected() {
         assert_eq!(convert(4, 0, viewport()), Err(Errno::EINVAL));
     }
     #[test]
-    fn u13_console_inverted_rectangle_rejected() {
+    fn console_inverted_rectangle_rejected() {
         assert_eq!(
             convert(
                 0,
@@ -239,7 +239,7 @@ mod tests {
         );
     }
     #[test]
-    fn u13_console_negative_origin_rejected() {
+    fn console_negative_origin_rejected() {
         assert_eq!(
             convert(
                 0,
@@ -253,7 +253,7 @@ mod tests {
         );
     }
     #[test]
-    fn u13_console_one_cell() {
+    fn console_one_cell() {
         let info = convert(
             0x3ff,
             0x1f,
@@ -283,7 +283,7 @@ mod real_console {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "windows::real_console::u13_real_console_child",
+                "windows::real_console::real_console_child",
                 "--nocapture",
             ])
             .env("PALUDARIUM_U13_CONSOLE_CASE", case)
@@ -306,35 +306,35 @@ mod real_console {
         }
     }
     #[test]
-    fn u13_real_console_stdin() {
+    fn real_console_stdin() {
         subprocess("0");
     }
     #[test]
-    fn u13_real_console_stdout() {
+    fn real_console_stdout() {
         subprocess("1");
     }
     #[test]
-    fn u13_real_console_stderr() {
+    fn real_console_stderr() {
         subprocess("2");
     }
     #[test]
-    fn u13_real_console_redirected_stdin() {
+    fn real_console_redirected_stdin() {
         subprocess("3");
     }
     #[test]
-    fn u13_real_console_redirected_stdout() {
+    fn real_console_redirected_stdout() {
         subprocess("4");
     }
     #[test]
-    fn u13_real_console_redirected_stderr() {
+    fn real_console_redirected_stderr() {
         subprocess("5");
     }
     #[test]
-    fn u13_real_console_invalid_handle() {
+    fn real_console_invalid_handle() {
         subprocess("6");
     }
     #[test]
-    fn u13_real_console_child() {
+    fn real_console_child() {
         let Ok(case) = std::env::var("PALUDARIUM_U13_CONSOLE_CASE") else {
             subprocess("0");
             return;

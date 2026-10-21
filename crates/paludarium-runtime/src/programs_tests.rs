@@ -11,7 +11,7 @@ fn config() -> Config {
 }
 
 #[test]
-fn u10_existing_with_file_keeps_0755() {
+fn existing_with_file_keeps_0755() {
     let session = configured(config().with_file("/data", b"contents".to_vec()));
     assert_eq!(
         session
@@ -26,7 +26,7 @@ fn u10_existing_with_file_keeps_0755() {
 }
 
 #[test]
-fn u10_explicit_0644_keeps_contents_and_links() {
+fn explicit_0644_keeps_contents_and_links() {
     let session = configured(config().with_file_mode("/data", b"contents".to_vec(), 0o644));
     let fs = session.file_system().unwrap();
     let metadata = fs.metadata(b"/data", true).unwrap();
@@ -41,7 +41,7 @@ fn u10_explicit_0644_keeps_contents_and_links() {
 }
 
 #[test]
-fn u10_mode_zero_keeps_regular_file_type() {
+fn mode_zero_keeps_regular_file_type() {
     let session = configured(config().with_file_mode("/data", Vec::new(), 0));
     assert_eq!(
         session
@@ -55,7 +55,7 @@ fn u10_mode_zero_keeps_regular_file_type() {
 }
 
 #[test]
-fn u10_permissions_preserve_type_and_normalized_path() {
+fn permissions_preserve_type_and_normalized_path() {
     let session = configured(config().with_file_mode("/directory/../data", Vec::new(), 0o6755));
     assert_eq!(
         session
@@ -69,7 +69,7 @@ fn u10_permissions_preserve_type_and_normalized_path() {
 }
 
 #[test]
-fn u10_invalid_permission_bits_rejected_before_run() {
+fn invalid_permission_bits_rejected_before_run() {
     for mode in [0o100644, 0o10000, u32::MAX] {
         let error = Session::new(
             config().with_file_mode("/data", Vec::new(), mode),
@@ -82,7 +82,7 @@ fn u10_invalid_permission_bits_rejected_before_run() {
 }
 
 #[test]
-fn u10_invalid_or_missing_override_path_rejected() {
+fn invalid_or_missing_override_path_rejected() {
     for path in [
         b"".to_vec(),
         b"relative".to_vec(),
@@ -110,7 +110,7 @@ fn u10_invalid_or_missing_override_path_rejected() {
 }
 
 #[test]
-fn u10_duplicate_normalized_override_rejected() {
+fn duplicate_normalized_override_rejected() {
     let mut duplicate = config().with_file_mode("/data", Vec::new(), 0o644);
     duplicate
         .file_modes

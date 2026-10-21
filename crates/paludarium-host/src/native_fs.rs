@@ -419,7 +419,7 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
 mod files_tests {
     use super::*;
     #[test]
-    fn u7_mtime_system_time_before_epoch() {
+    fn mtime_system_time_before_epoch() {
         for ns in [1, 99, 100, 101, 500_000_000, 1_000_000_000] {
             let represented_ns = if cfg!(windows) { ns / 100 * 100 } else { ns };
             assert_eq!(
@@ -429,7 +429,7 @@ mod files_tests {
         }
     }
     #[test]
-    fn u7_mtime_system_time_epoch_positive_range() {
+    fn mtime_system_time_epoch_positive_range() {
         for ns in [0, 1, 99, 100, 101, 1_500_000_000, u64::MAX] {
             let represented_ns = if cfg!(windows) { ns / 100 * 100 } else { ns };
             assert_eq!(
@@ -475,7 +475,7 @@ mod files_tests {
     }
 
     #[test]
-    fn u7_fixture_directory_rename_retries_transient_handle_denial() {
+    fn fixture_directory_rename_retries_transient_handle_denial() {
         for code in [5, 32] {
             let conflicts = AtomicU64::new(0);
             let mut calls = 0;
@@ -500,7 +500,7 @@ mod files_tests {
     }
 
     #[test]
-    fn u7_fixture_persistent_directory_permission_is_deadline_failure() {
+    fn fixture_persistent_directory_permission_is_deadline_failure() {
         let conflicts = AtomicU64::new(0);
         let mut calls = 0;
         let error = retry_fixture_exchange(
@@ -519,7 +519,7 @@ mod files_tests {
     }
 
     #[test]
-    fn u7_fixture_nonrename_permission_is_not_retried() {
+    fn fixture_nonrename_permission_is_not_retried() {
         let conflicts = AtomicU64::new(0);
         let mut calls = 0;
         let error = retry_fixture_exchange(
@@ -539,7 +539,7 @@ mod files_tests {
     }
 
     #[test]
-    fn u7_fixture_unrelated_errors_propagate_unchanged() {
+    fn fixture_unrelated_errors_propagate_unchanged() {
         let conflicts = AtomicU64::new(0);
         let error = retry_fixture_exchange(
             "directory-rename",
@@ -580,7 +580,7 @@ mod files_tests {
         }
     }
     #[test]
-    fn u7_native_io() {
+    fn native_io() {
         let x = Fixture::new();
         let f = x.fs().open(b"a", 66, 0o600).unwrap();
         assert_eq!(f.write(b"abc"), Ok(3));
@@ -591,7 +591,7 @@ mod files_tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
-    fn u7_mtime_retained_file_and_path_stat_pre_epoch() {
+    fn mtime_retained_file_and_path_stat_pre_epoch() {
         let x = Fixture::new();
         let handle = x.fs().open(b"mtime", 66, 0o600).unwrap();
         let file = std::fs::File::open(x.base.join("root/mtime")).unwrap();
@@ -609,7 +609,7 @@ mod files_tests {
         }
     }
     #[test]
-    fn u7_native_links() {
+    fn native_links() {
         let x = Fixture::new();
         let file = x.fs().open(b"a", 66, 0o600).unwrap();
         x.fs().link(b"a", b"b").unwrap();
@@ -620,7 +620,7 @@ mod files_tests {
         assert_eq!(file.stat().unwrap().links, 1);
     }
     #[test]
-    fn u7_native_error_namespace() {
+    fn native_error_namespace() {
         use std::io::{Error, ErrorKind};
         assert_eq!(lock_err(fs2::lock_contended_error()), Errno::EAGAIN);
         for (kind, expected) in [
@@ -638,7 +638,7 @@ mod files_tests {
         assert_eq!(err(Error::from_raw_os_error(35)), Errno::EAGAIN);
     }
     #[test]
-    fn u7_fixture_releases_root_before_removing_directory() {
+    fn fixture_releases_root_before_removing_directory() {
         let fixture = Fixture::new();
         let base = fixture.base.clone();
         fixture.fs().open(b"a", 66, 0o600).unwrap();
@@ -646,7 +646,7 @@ mod files_tests {
         assert!(!base.exists());
     }
     #[test]
-    fn u7_native_rename() {
+    fn native_rename() {
         let x = Fixture::new();
         x.fs()
             .open(b"a", 66, 0o600)
@@ -658,7 +658,7 @@ mod files_tests {
         assert_eq!(x.fs().metadata(b"b", true).unwrap().size, 4);
     }
     #[test]
-    fn u7_native_directory() {
+    fn native_directory() {
         let x = Fixture::new();
         x.fs().mkdir(b"d", 0o700).unwrap();
         x.fs().open(b"d/a", 66, 0o600).unwrap();
@@ -668,7 +668,7 @@ mod files_tests {
         x.fs().unlink(b"d", true).unwrap();
     }
     #[test]
-    fn u7_native_parent_escape() {
+    fn native_parent_escape() {
         let x = Fixture::new();
         assert!(x.fs().open(b"../sentinel", 2, 0).is_err());
         assert!(x.fs().rename(b"../sentinel", b"stolen").is_err());
@@ -677,7 +677,7 @@ mod files_tests {
     }
     #[test]
     #[cfg(unix)]
-    fn u7_native_symlink_escape() {
+    fn native_symlink_escape() {
         let x = Fixture::new();
         #[cfg(unix)]
         {
@@ -689,7 +689,7 @@ mod files_tests {
         }
     }
     #[test]
-    fn u7_native_lock() {
+    fn native_lock() {
         let x = Fixture::new();
         let a = x.fs().open(b"a", 66, 0o600).unwrap();
         let b = x.fs().open(b"a", 2, 0).unwrap();
@@ -699,7 +699,7 @@ mod files_tests {
         b.flock(2 | 4).unwrap();
     }
     #[test]
-    fn u7_native_nofollow() {
+    fn native_nofollow() {
         let x = Fixture::new();
         x.fs().open(b"a", 66, 0o600).unwrap();
         x.fs().symlink(b"a", b"s").unwrap();
@@ -710,10 +710,10 @@ mod files_tests {
         );
     }
     #[test]
-    fn u7_native_symlink_rename_race() {
+    fn native_symlink_rename_race() {
         #[cfg(unix)]
         {
-            const NAME: &str = "native_fs::files_tests::u7_native_symlink_rename_race";
+            const NAME: &str = "native_fs::files_tests::native_symlink_rename_race";
             if std::env::var_os("PALUDARIUM_U7_RACE_CHILD").is_none() {
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", NAME, "--nocapture"])
@@ -783,7 +783,7 @@ mod files_tests {
 
     #[cfg(windows)]
     #[test]
-    fn u7_native_windows_recreated_symlink_has_distinct_handle_identity() {
+    fn native_windows_recreated_symlink_has_distinct_handle_identity() {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         let x = Fixture::new();
         let outside = x.base.join("outside");
@@ -827,7 +827,7 @@ mod files_tests {
 
     #[cfg(windows)]
     #[test]
-    fn u7_native_windows_open_child_blocks_parent_rename_until_close() {
+    fn native_windows_open_child_blocks_parent_rename_until_close() {
         let x = Fixture::new();
         let root = x.base.join("root");
         x.fs().mkdir(b"parent", 0o700).unwrap();
@@ -851,9 +851,9 @@ mod files_tests {
 
     #[cfg(windows)]
     #[test]
-    fn u7_native_windows_symlink_rename_race() {
+    fn native_windows_symlink_rename_race() {
         use std::sync::{Barrier, atomic::AtomicBool};
-        const NAME: &str = "native_fs::files_tests::u7_native_windows_symlink_rename_race";
+        const NAME: &str = "native_fs::files_tests::native_windows_symlink_rename_race";
         if std::env::var_os("PALUDARIUM_U7_WINDOWS_RACE_CHILD").is_none() {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture"])

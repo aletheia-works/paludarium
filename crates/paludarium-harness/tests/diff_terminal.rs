@@ -94,4 +94,4 @@ fn case(name: &'static str, id: usize) {
 }
 
 macro_rules! cases {($($name:ident=>$id:literal),* $(,)?)=>{$(#[test] fn $name(){case(stringify!($name),$id);})*};}
-cases!(u9_args_env=>0,u9_stdin_short_eof=>1,u9_streams=>2,u9_pipe_tcgets=>3,u9_pipe_winsize=>4,u9_bad_fd=>5,u9_tty_tcgets=>6,u9_tty_winsize=>7,u9_tty_bad_pointer=>8,u9_tty_unknown=>9,u9_tty_dup=>10,u9_regular_file=>11,u9_closed_fd=>12,u9_stream_identity=>13);
+cases!(args_env=>0,stdin_short_eof=>1,terminal_streams=>2,pipe_tcgets=>3,pipe_winsize=>4,bad_fd=>5,tty_tcgets=>6,tty_winsize=>7,tty_bad_pointer=>8,tty_unknown=>9,tty_dup=>10,regular_file=>11,closed_fd=>12,stream_identity=>13);

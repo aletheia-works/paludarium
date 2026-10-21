@@ -63,9 +63,9 @@ fn native(binary: &str, mode: usize) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 #[test]
-fn u4_write_restart_native_oracle() {
+fn write_restart_native_oracle() {
     build_u4();
-    support::bounded("oracles::u4_write_restart_native_oracle", || {
+    support::bounded("oracles::write_restart_native_oracle", || {
         for restart in 0..=1 {
             let expected = native("write-restart-oracle", restart);
             let (mut k, mut t, mut m) = setup(Arc::new(WriteHost(AtomicBool::new(false))));
@@ -119,9 +119,9 @@ fn u4_write_restart_native_oracle() {
     });
 }
 #[test]
-fn u4_stop_continue_native_oracle() {
+fn stop_continue_native_oracle() {
     build_u4();
-    support::bounded("oracles::u4_stop_continue_native_oracle", || {
+    support::bounded("oracles::stop_continue_native_oracle", || {
         for mode in 0..7 {
             let expected = native("stop-continue-oracle", mode);
             let (mut k, mut t, mut m) = setup(Arc::new(RecordingHost::new()));
@@ -175,9 +175,9 @@ fn u4_stop_continue_native_oracle() {
 }
 
 #[test]
-fn u4_realtime_order_native_oracle() {
+fn realtime_order_native_oracle() {
     build_u4();
-    support::bounded("oracles::u4_realtime_order_native_oracle", || {
+    support::bounded("oracles::realtime_order_native_oracle", || {
         let mut mismatches = Vec::new();
         println!(
             "native_same_process_queue_fifo={:?}",

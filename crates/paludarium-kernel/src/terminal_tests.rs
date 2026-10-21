@@ -63,7 +63,7 @@ fn tty() -> TerminalInfo {
     TerminalInfo::new(Default::default(), 101, 37, 7, 9)
 }
 #[test]
-fn u9_winsize_guest_layout() {
+fn winsize_guest_layout() {
     let mut f = fixture();
     f.host.set_terminal_info(StreamId::Stdin, Some(tty()));
     assert_eq!(f.ret(16, &[0, 0x5413, DATA]), 0);
@@ -72,7 +72,7 @@ fn u9_winsize_guest_layout() {
     assert_eq!(b, [37, 0, 101, 0, 7, 0, 9, 0]);
 }
 #[test]
-fn u9_tcgets_guest_layout() {
+fn tcgets_guest_layout() {
     let mut f = fixture();
     let mut info = tty();
     info.attributes.input_flags = 0x12345678;
@@ -86,7 +86,7 @@ fn u9_tcgets_guest_layout() {
     assert_eq!(b[36], 0);
 }
 #[test]
-fn u9_unknown_request_and_nonterminal_precede_pointer() {
+fn unknown_request_and_nonterminal_precede_pointer() {
     let mut f = fixture();
     assert_eq!(
         f.ret(16, &[0, 0x5413, 1]),
@@ -99,7 +99,7 @@ fn u9_unknown_request_and_nonterminal_precede_pointer() {
     );
 }
 #[test]
-fn u9_invalid_and_closed_fd() {
+fn invalid_and_closed_fd() {
     let mut f = fixture();
     assert_eq!(
         f.ret(16, &[999, 0x5413, DATA]),
@@ -112,7 +112,7 @@ fn u9_invalid_and_closed_fd() {
     );
 }
 #[test]
-fn u9_bad_pointer_and_boundary() {
+fn bad_pointer_and_boundary() {
     let mut f = fixture();
     f.host.set_terminal_info(StreamId::Stdin, Some(tty()));
     assert_eq!(
@@ -125,7 +125,7 @@ fn u9_bad_pointer_and_boundary() {
     );
 }
 #[test]
-fn u9_duplicate_resolves_original_stream() {
+fn duplicate_resolves_original_stream() {
     let mut f = fixture();
     f.host.set_terminal_info(StreamId::Stdin, Some(tty()));
     let dup = f.ret(32, &[0]);
@@ -137,7 +137,7 @@ fn u9_duplicate_resolves_original_stream() {
     );
 }
 #[test]
-fn u9_regular_file_is_not_terminal() {
+fn regular_file_is_not_terminal() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), b"/regular\0").unwrap();
     let fd = f.ret(2, &[DATA, 66, 0o600]);
@@ -149,7 +149,7 @@ fn u9_regular_file_is_not_terminal() {
     );
 }
 #[test]
-fn u9_explicit_size_overrides_host() {
+fn explicit_size_overrides_host() {
     let mut f = fixture();
     f.host.set_terminal_info(StreamId::Stdin, Some(tty()));
     f.kernel = f.kernel.with_terminal_size(120, 40);

@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(err, "paludarium: invalid-program: not an ELF file\n");
     }
     #[test]
-    fn u7_cli_mount_separate_argument() {
+    fn cli_mount_separate_argument() {
         let Command::Run(i) = parse(os(&["--mount", "fixtures:/data", "prog"])).unwrap() else {
             panic!()
         };
@@ -310,7 +310,7 @@ mod tests {
         );
     }
     #[test]
-    fn u7_cli_mount_equals_and_repeat() {
+    fn cli_mount_equals_and_repeat() {
         let Command::Run(i) = parse(os(&["--mount=a:/", "--mount=b:/data", "prog"])).unwrap()
         else {
             panic!()
@@ -320,14 +320,14 @@ mod tests {
         assert_eq!(i.mounts[1].host, std::path::PathBuf::from("b"));
     }
     #[test]
-    fn u7_cli_mount_windows_drive() {
+    fn cli_mount_windows_drive() {
         let Command::Run(i) = parse(os(&["--mount=C:\\fixtures:/data", "prog"])).unwrap() else {
             panic!()
         };
         assert_eq!(i.mounts[0].host, std::path::PathBuf::from("C:\\fixtures"));
     }
     #[test]
-    fn u7_cli_mount_invalid() {
+    fn cli_mount_invalid() {
         for args in [
             &["--mount"][..],
             &["--mount=x", "prog"],
@@ -339,7 +339,7 @@ mod tests {
         }
     }
     #[test]
-    fn u7_cli_mount_after_program_is_guest_argument() {
+    fn cli_mount_after_program_is_guest_argument() {
         let Command::Run(i) = parse(os(&["prog", "--mount=a:/x"])).unwrap() else {
             panic!()
         };
@@ -348,7 +348,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn u7_cli_mount_non_utf8() {
+    fn cli_mount_non_utf8() {
         use std::os::unix::ffi::OsStringExt;
         let value = OsString::from_vec(b"--mount=\xff:/data".to_vec());
         let Command::Run(i) = parse([value, "prog".into()]).unwrap() else {

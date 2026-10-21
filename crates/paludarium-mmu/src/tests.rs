@@ -11,7 +11,7 @@ fn memory(pages: u64) -> AddressSpace {
     m
 }
 #[test]
-fn u2_atomic_width_wraps_without_touching_neighbors() {
+fn atomic_width_wraps_without_touching_neighbors() {
     let m = memory(1);
     m.write(GuestAddr(0x10000), &[7, 255, 9]).unwrap();
     assert_eq!(
@@ -25,7 +25,7 @@ fn u2_atomic_width_wraps_without_touching_neighbors() {
     assert_eq!(b, [7, 0, 9]);
 }
 #[test]
-fn u2_failed_cmpxchg_requires_write_permission() {
+fn failed_cmpxchg_requires_write_permission() {
     let m = memory(1);
     m.write_u64(GuestAddr(0x10000), 7).unwrap();
     m.protect_shared(GuestAddr(0x10000), PAGE_SIZE, Prot::READ)
@@ -50,7 +50,7 @@ fn u2_failed_cmpxchg_requires_write_permission() {
     assert_eq!(m.read_u64(GuestAddr(0x10000)).unwrap(), 7);
 }
 #[test]
-fn u2_cross_page_fault_has_no_partial_write() {
+fn cross_page_fault_has_no_partial_write() {
     let m = memory(1);
     m.write(GuestAddr(0x10ffc), &[1, 2, 3, 4]).unwrap();
     assert_eq!(
@@ -68,7 +68,7 @@ fn u2_cross_page_fault_has_no_partial_write() {
     assert_eq!(b, [1, 2, 3, 4]);
 }
 #[test]
-fn u2_unaligned_cross_page_128bit_exchange() {
+fn unaligned_cross_page_128bit_exchange() {
     let m = memory(2);
     let address = GuestAddr(0x10ff9);
     let value = 0x112233445566778899aabbccddeeff00;
@@ -86,7 +86,7 @@ fn u2_unaligned_cross_page_128bit_exchange() {
     );
 }
 #[test]
-fn u2_compare_exchange_returns_old_and_success() {
+fn compare_exchange_returns_old_and_success() {
     let m = memory(1);
     let a = GuestAddr(0x10000);
     assert_eq!(
@@ -122,7 +122,7 @@ fn u2_compare_exchange_returns_old_and_success() {
     assert_eq!(m.read_u64(a).unwrap(), 7);
 }
 #[test]
-fn u2_atomic_operations_share_normal_memory_view() {
+fn atomic_operations_share_normal_memory_view() {
     let m = memory(1);
     let a = GuestAddr(0x10000);
     m.write_u64(a, 0xff).unwrap();
@@ -139,7 +139,7 @@ fn u2_atomic_operations_share_normal_memory_view() {
     assert_eq!(m.read_u64(a).unwrap(), 0x1c);
 }
 #[test]
-fn u2_mapping_mutation_and_fetch_use_same_view() {
+fn mapping_mutation_and_fetch_use_same_view() {
     let m = memory(1);
     let a = GuestAddr(0x10000);
     m.protect_shared(a, PAGE_SIZE, Prot::READ_EXEC.union(Prot::WRITE))
@@ -155,7 +155,7 @@ fn u2_mapping_mutation_and_fetch_use_same_view() {
     assert!(m.fetch(a, &mut b).is_err());
 }
 #[test]
-fn u2_all_bytes_permissions_preflight_before_128_update() {
+fn all_bytes_permissions_preflight_before_128_update() {
     let m = memory(2);
     let a = GuestAddr(0x10ff8);
     m.write(a, &[0xa5; 16]).unwrap();
@@ -170,7 +170,7 @@ fn u2_all_bytes_permissions_preflight_before_128_update() {
     assert_eq!(b, [0xa5; 16]);
 }
 #[test]
-fn u2_stack_write_probe_preserves_bytes_and_observes_protection() {
+fn stack_write_probe_preserves_bytes_and_observes_protection() {
     let m = memory(1);
     m.write_u64(GuestAddr(0x10000), 0x123456789abcdef0).unwrap();
     m.check_write(GuestAddr(0x10000), 8).unwrap();

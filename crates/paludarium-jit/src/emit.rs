@@ -327,7 +327,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_emit_mov_module_has_real_wasm_header() {
+    fn emit_mov_module_has_real_wasm_header() {
         assert_eq!(
             &emit(&block(Operation::Move {
                 register: 0,
@@ -338,7 +338,7 @@ mod tests {
         );
     }
     #[test]
-    fn u14_emit_signed_integer_extremes_are_bounded() {
+    fn emit_signed_integer_extremes_are_bounded() {
         for value in [0, 63, 64, 127, 128, u64::MAX, 1 << 63] {
             let mut bytes = Vec::new();
             constant(&mut bytes, value);
@@ -347,7 +347,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_emit_rejects_empty_and_unbounded_blocks() {
+    fn emit_rejects_empty_and_unbounded_blocks() {
         let mut block = block(Operation::Move {
             register: 0,
             value: 42,
@@ -364,7 +364,7 @@ mod tests {
         assert!(emit(&block).is_none());
     }
     #[test]
-    fn u14_emit_rejects_invalid_register_scratch_offsets() {
+    fn emit_rejects_invalid_register_scratch_offsets() {
         assert!(
             emit(&block(Operation::Move {
                 register: 16,
@@ -374,7 +374,7 @@ mod tests {
         );
     }
     #[test]
-    fn u14_emit_add_and_sub_are_distinct_modules() {
+    fn emit_add_and_sub_are_distinct_modules() {
         let add = emit(&block(Operation::Arithmetic {
             kind: Arithmetic::Add,
             register: 0,
@@ -390,7 +390,7 @@ mod tests {
         assert_ne!(add, sub);
     }
     #[test]
-    fn u14_emit_conditional_branch_preserves_two_targets() {
+    fn emit_conditional_branch_preserves_two_targets() {
         let equal = emit(&block(Operation::Branch {
             equal: true,
             target: 8192,
@@ -416,7 +416,7 @@ mod tests {
         code.windows(needle.len()).any(|window| window == needle)
     }
     #[test]
-    fn u14_emit_vector_shift_counts_of_32_or_more_store_zero() {
+    fn emit_vector_shift_counts_of_32_or_more_store_zero() {
         for count in [32, 33, 255, u64::MAX] {
             for kind in [
                 Vector::ShiftLeftDwords(count),
@@ -435,13 +435,13 @@ mod tests {
         assert!(contains(&code, &[0x41, 0, 0xfd, 0xad, 1]));
     }
     #[test]
-    fn u14_emit_vector_rejects_out_of_range_registers() {
+    fn emit_vector_rejects_out_of_range_registers() {
         assert!(emit(&vector_block(Vector::Xor, 16, 0)).is_none());
         assert!(emit(&vector_block(Vector::Xor, 0, 16)).is_none());
         assert!(emit(&vector_block(Vector::ShiftLeftDwords(1), 255, 255)).is_none());
     }
     #[test]
-    fn u14_emit_pshufd_lanes_select_whole_dwords_for_every_imm8() {
+    fn emit_pshufd_lanes_select_whole_dwords_for_every_imm8() {
         for selector in 0..=255u8 {
             let dwords: [u8; 4] = std::array::from_fn(|n| (selector >> (n * 2)) & 3);
             let lanes = dword_lanes(dwords);
@@ -458,14 +458,14 @@ mod tests {
         }
     }
     #[test]
-    fn u14_emit_punpckldq_interleaves_low_dwords_of_both_operands() {
+    fn emit_punpckldq_interleaves_low_dwords_of_both_operands() {
         assert_eq!(
             dword_lanes([0, 4, 1, 5]),
             [0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23]
         );
     }
     #[test]
-    fn u14_emit_pmuludq_masks_odd_dwords_before_64_bit_multiply() {
+    fn emit_pmuludq_masks_odd_dwords_before_64_bit_multiply() {
         let code = emit(&vector_block(Vector::MultiplyUnsignedDwords, 0, 1)).unwrap();
         let mut mask = vec![0xfd, 0x0c];
         mask.extend(LOW_DWORDS.to_le_bytes());
@@ -474,7 +474,7 @@ mod tests {
         assert!(contains(&code, &[0xfd, 0xd5, 1]));
     }
     #[test]
-    fn u14_emit_each_vector_kind_is_a_distinct_deterministic_module() {
+    fn emit_each_vector_kind_is_a_distinct_deterministic_module() {
         let kinds = [
             Vector::Move,
             Vector::And,
@@ -502,7 +502,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_emit_gpr_only_blocks_use_no_simd_instructions() {
+    fn emit_gpr_only_blocks_use_no_simd_instructions() {
         let code = emit(&block(Operation::Arithmetic {
             kind: Arithmetic::Add,
             register: 1,
@@ -514,7 +514,7 @@ mod tests {
         assert!(contains(&code, &[0xfd, 0xae, 1]));
     }
     #[test]
-    fn u14_emit_is_deterministic_for_worker_compilation() {
+    fn emit_is_deterministic_for_worker_compilation() {
         let block = block(Operation::Move {
             register: 0,
             value: 42,

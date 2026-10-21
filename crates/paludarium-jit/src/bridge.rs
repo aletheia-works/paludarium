@@ -416,42 +416,42 @@ mod tests {
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_observe_missing_never_prepares() {
+    fn observe_missing_never_prepares() {
         observation_case(0, 0);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_observe_positive_only_queries_worker() {
+    fn observe_positive_only_queries_worker() {
         observation_case(1, 3);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_observe_unprepared_never_compiles() {
+    fn observe_unprepared_never_compiles() {
         observation_case(2, 3);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_observe_negative_never_queries_worker() {
+    fn observe_negative_never_queries_worker() {
         observation_case(3, 0);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_observe_stale_never_queries_worker() {
+    fn observe_stale_never_queries_worker() {
         observation_case(4, 0);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_observe_other_space_never_queries_worker() {
+    fn observe_other_space_never_queries_worker() {
         observation_case(5, 0);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_observe_invalidated_never_recreates_entry() {
+    fn observe_invalidated_never_recreates_entry() {
         observation_case(6, 0);
     }
     #[cfg(feature = "cost-profile")]
     #[test]
-    fn u14_observe_default_bridge_reports_unavailable_without_prepare() {
+    fn observe_default_bridge_reports_unavailable_without_prepare() {
         let bridge = WarmBridge::default();
         assert_eq!(bridge.diagnostic_prepared(17, &[]), None);
         assert_eq!(bridge.prepares.load(Ordering::Relaxed), 0);
@@ -484,7 +484,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_warm_bridge_reuses_prepared_entry_without_second_prepare() {
+    fn warm_bridge_reuses_prepared_entry_without_second_prepare() {
         let (mut state, memory) = machine(&[0xb8, 42, 0, 0, 0], 0);
         let bridge = Arc::new(WarmBridge::default());
         let cache = WasmCodeCache::new(bridge.clone());
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(cache.statistics().executed_blocks, 2);
     }
     #[test]
-    fn u14_warm_bridge_failure_rolls_back_cpu_and_does_not_hint() {
+    fn warm_bridge_failure_rolls_back_cpu_and_does_not_hint() {
         let (mut state, memory) = machine(&[0xb8, 42, 0, 0, 0], 17);
         let bridge = Arc::new(WarmBridge::default());
         let cache = WasmCodeCache::new(bridge.clone());
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(state, before);
     }
     #[test]
-    fn u14_warm_bridge_epoch_change_requires_new_module_preparation() {
+    fn warm_bridge_epoch_change_requires_new_module_preparation() {
         let (mut state, memory) = machine(&[0xb8, 42, 0, 0, 0], 0);
         let bridge = Arc::new(WarmBridge::default());
         let cache = WasmCodeCache::new(bridge.clone());
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(bridge.prepares.load(Ordering::Relaxed), 2);
     }
     #[test]
-    fn u14_warm_bridge_separate_workers_prepare_independently() {
+    fn warm_bridge_separate_workers_prepare_independently() {
         let (mut state, memory) = machine(&[0xb8, 42, 0, 0, 0], 0);
         let left = Arc::new(WarmBridge::default());
         let right = Arc::new(WarmBridge::default());
@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(right.prepares.load(Ordering::Relaxed), 1);
     }
     #[test]
-    fn u14_bridge_prepare_failure_never_executes_or_changes_state() {
+    fn bridge_prepare_failure_never_executes_or_changes_state() {
         struct Reject;
         impl ExecutionBridge for Reject {
             fn prepare(&self, _: u32, _: &[u8]) -> bool {
@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_bridge_write_during_prepare_invalidates_before_execution() {
+    fn bridge_write_during_prepare_invalidates_before_execution() {
         struct Mutate(Arc<AddressSpace>);
         impl ExecutionBridge for Mutate {
             fn prepare(&self, _: u32, _: &[u8]) -> bool {
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(cache.statistics().executed_blocks, 0);
     }
     #[test]
-    fn u14_bridge_short_selection_fallback_preserves_state_and_counts() {
+    fn bridge_short_selection_fallback_preserves_state_and_counts() {
         let mut memory = AddressSpace::new();
         memory
             .map(
@@ -672,7 +672,7 @@ mod tests {
         memory
     }
     #[test]
-    fn u14_admission_three_rejects_two_without_preparing_or_mutating() {
+    fn admission_three_rejects_two_without_preparing_or_mutating() {
         let memory = admission_fixture(&[0xb8, 42, 0, 0, 0, 0x48, 0x83, 0xc0, 1, 0xc3]);
         let cache = WasmCodeCache::new(Arc::new(NodeBridge)).with_minimum_block(3);
         let mut state = CpuState::new(GuestAddr(4096), GuestAddr(8192));
@@ -683,7 +683,7 @@ mod tests {
         assert_eq!(cache.statistics().translated_blocks, 0);
     }
     #[test]
-    fn u14_admission_three_accepts_three_actual_wasm_instructions() {
+    fn admission_three_accepts_three_actual_wasm_instructions() {
         let memory = admission_fixture(&[
             0xb8, 42, 0, 0, 0, 0x48, 0x83, 0xc0, 1, 0x48, 0x83, 0xc0, 1, 0xc3,
         ]);
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(state.rip.0, 4109);
     }
     #[test]
-    fn u14_admission_three_rejected_bytes_change_can_become_eligible() {
+    fn admission_three_rejected_bytes_change_can_become_eligible() {
         let memory = admission_fixture(&[0xb8, 42, 0, 0, 0, 0x48, 0x83, 0xc0, 1, 0xc3]);
         let cache = WasmCodeCache::new(Arc::new(NodeBridge)).with_minimum_block(3);
         let mut state = CpuState::new(GuestAddr(4096), GuestAddr(8192));
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(cache.statistics().executed_instructions, instructions);
     }
     #[test]
-    fn u14_bridge_real_wasm_mov_matches_interpreter() {
+    fn bridge_real_wasm_mov_matches_interpreter() {
         differential(
             &[
                 0x48, 0xb8, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 1, 0xc3,
@@ -798,15 +798,15 @@ mod tests {
         );
     }
     #[test]
-    fn u14_bridge_real_wasm_add_carry_matches_interpreter() {
+    fn bridge_real_wasm_add_carry_matches_interpreter() {
         differential(&[0x48, 0x83, 0xc0, 1, 0xc3], u64::MAX, 1);
     }
     #[test]
-    fn u14_bridge_real_wasm_sub_overflow_matches_interpreter() {
+    fn bridge_real_wasm_sub_overflow_matches_interpreter() {
         differential(&[0x48, 0x83, 0xe8, 1, 0xc3], 1 << 63, 1);
     }
     #[test]
-    fn u14_bridge_real_wasm_compare_and_branch_matches_interpreter() {
+    fn bridge_real_wasm_compare_and_branch_matches_interpreter() {
         for rax in [7, 8] {
             differential(
                 &[0x48, 0x83, 0xf8, 7, 0x75, 6, 0xb8, 42, 0, 0, 0, 0xc3],
@@ -836,17 +836,17 @@ mod tests {
         assert_eq!(state.gpr[0], if rax == 7 { 9 } else { 42 });
     }
     #[test]
-    fn u14_bridge_real_wasm_je_zf1_taken_matches_fresh_native() {
+    fn bridge_real_wasm_je_zf1_taken_matches_fresh_native() {
         // c3df1156 native13 oracle: input7 => RAX9, arithmetic flags0x44.
         observed_je(7, 12, 0x44);
     }
     #[test]
-    fn u14_bridge_real_wasm_je_zf0_not_taken_matches_fresh_native() {
+    fn bridge_real_wasm_je_zf0_not_taken_matches_fresh_native() {
         // c3df1156 native13 oracle: input8 => RAX42, arithmetic flags0.
         observed_je(8, 6, 0);
     }
     #[test]
-    fn u14_bridge_unsupported_fallback_leaves_all_state_untouched() {
+    fn bridge_unsupported_fallback_leaves_all_state_untouched() {
         // PXOR xmm0, [rdi]: memory operands stay with the interpreter.
         let (mut state, memory) = machine(&[0x66, 0x0f, 0xef, 0x07], 17);
         let before = state.clone();
@@ -856,7 +856,7 @@ mod tests {
         assert_eq!(cache.statistics().executed_blocks, 0);
     }
     #[test]
-    fn u14_bridge_failure_rolls_back_cpu_state() {
+    fn bridge_failure_rolls_back_cpu_state() {
         struct Failing;
         impl ExecutionBridge for Failing {
             fn execute(&self, _: u32, _: &[u8], state: &mut JitState) -> bool {
@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(state, before);
     }
     #[test]
-    fn u14_bridge_real_wasm_self_modification_recompiles() {
+    fn bridge_real_wasm_self_modification_recompiles() {
         let (mut state, memory) = machine(&[0xb8, 42, 0, 0, 0], 17);
         let cache = WasmCodeCache::new(Arc::new(NodeBridge));
         assert!(cache.try_run(&mut state, &memory).is_some());
@@ -912,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_state_layout_places_gpr_flags_rip_then_xmm_pairs() {
+    fn state_layout_places_gpr_flags_rip_then_xmm_pairs() {
         let state = patterned_state(1);
         let scratch = scratch_from(&state);
         assert_eq!(scratch[..16], state.gpr);
@@ -924,7 +924,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_state_round_trip_is_identity() {
+    fn state_round_trip_is_identity() {
         for seed in 0..32 {
             let state = patterned_state(seed);
             let mut target = CpuState::default();
@@ -936,7 +936,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_state_commit_keeps_registers_outside_scratch() {
+    fn state_commit_keeps_registers_outside_scratch() {
         let mut state = patterned_state(2);
         let before = state.clone();
         let mut scratch = scratch_from(&state);
@@ -950,7 +950,7 @@ mod tests {
         assert_eq!(state.gpr[0], before.gpr[0] ^ 1);
     }
     #[test]
-    fn u14_state_xmm_low_and_high_halves_are_not_swapped() {
+    fn state_xmm_low_and_high_halves_are_not_swapped() {
         let mut state = CpuState::default();
         state.xmm[5] = (0xaaaa_aaaa_aaaa_aaaa_u128 << 64) | 0x5555_5555_5555_5555;
         let scratch = scratch_from(&state);
@@ -965,7 +965,7 @@ mod tests {
         assert_eq!(target.xmm[5], state.xmm[5]);
     }
     #[test]
-    fn u14_state_each_xmm_word_belongs_to_one_register() {
+    fn state_each_xmm_word_belongs_to_one_register() {
         for word in 18..STATE_WORDS {
             let state = CpuState::default();
             let mut scratch = scratch_from(&state);
@@ -987,7 +987,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_state_last_register_occupies_last_words() {
+    fn state_last_register_occupies_last_words() {
         let mut state = CpuState::default();
         state.xmm[15] = u128::MAX - 1;
         let scratch = scratch_from(&state);
@@ -996,7 +996,7 @@ mod tests {
         assert!(scratch[18..48].iter().all(|word| *word == 0));
     }
     #[test]
-    fn u14_state_scratch_is_an_independent_copy() {
+    fn state_scratch_is_an_independent_copy() {
         let mut state = patterned_state(3);
         let scratch = scratch_from(&state);
         state.xmm[0] = 0;
@@ -1009,19 +1009,19 @@ mod tests {
     // ABI layout shared by bridge.rs, emit.rs, paludarium-wasm abi.rs and
     // packages/paludarium-wasm/jit-support.mjs.
     #[test]
-    fn u14_abi_state_is_four_hundred_bytes() {
+    fn abi_state_is_four_hundred_bytes() {
         assert_eq!(STATE_WORDS, 50);
         assert_eq!(STATE_BYTES, 400);
         assert_eq!(std::mem::size_of::<JitState>(), STATE_BYTES);
     }
     #[test]
-    fn u14_abi_keeps_original_144_byte_prefix() {
+    fn abi_keeps_original_144_byte_prefix() {
         assert_eq!(XMM_OFFSET, 144);
         assert_eq!(RFLAGS_WORD * 8, 128);
         assert_eq!(RIP_WORD * 8, 136);
     }
     #[test]
-    fn u14_abi_xmm_bytes_are_little_endian_u128() {
+    fn abi_xmm_bytes_are_little_endian_u128() {
         let state = patterned_state(4);
         let bytes: Vec<u8> = scratch_from(&state)
             .iter()
@@ -1037,7 +1037,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_abi_emitted_offsets_match_transfer_layout() {
+    fn abi_emitted_offsets_match_transfer_layout() {
         for register in 0..16u8 {
             let block = block::Block {
                 entry: 4096,
@@ -1072,7 +1072,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_abi_javascript_import_uses_same_state_length() {
+    fn abi_javascript_import_uses_same_state_length() {
         let support = include_str!("../../../packages/paludarium-wasm/jit-support.mjs");
         assert!(support.contains(&format!("export const JIT_STATE_BYTES = {STATE_BYTES};")));
         assert!(support.contains("stateLength !== JIT_STATE_BYTES"));
@@ -1080,14 +1080,14 @@ mod tests {
         assert!(!support.contains("Uint8Array(144)") && !support.contains("!== 144"));
     }
     #[test]
-    fn u14_abi_worker_bridge_passes_state_bytes_constant() {
+    fn abi_worker_bridge_passes_state_bytes_constant() {
         let abi = include_str!("../../paludarium-wasm/src/abi.rs");
         assert_eq!(abi.matches("paludarium_jit::STATE_BYTES").count(), 2);
         assert!(!abi.contains("state.as_mut_ptr(), 144"));
         assert_eq!(abi.matches("&mut paludarium_jit::JitState").count(), 2);
     }
     #[test]
-    fn u14_abi_module_signature_and_memory_import_are_unchanged() {
+    fn abi_module_signature_and_memory_import_are_unchanged() {
         let block = block::extract(&[0x66, 0x0f, 0xfe, 0xc1], 4096).unwrap();
         let code = emit::emit(&block).unwrap();
         assert!(code.starts_with(b"\0asm\x01\0\0\0"));
@@ -1118,7 +1118,7 @@ mod tests {
         (patterned_state(seed), memory)
     }
     #[test]
-    fn u14_rollback_failed_execute_keeps_all_registers() {
+    fn rollback_failed_execute_keeps_all_registers() {
         let (mut state, memory) = sse_machine(&[0x66, 0x0f, 0xfe, 0xc1, 0xc3], 5);
         let before = state.clone();
         let cache = WasmCodeCache::new(Arc::new(Scribble(false)));
@@ -1126,7 +1126,7 @@ mod tests {
         assert_eq!(state, before);
     }
     #[test]
-    fn u14_rollback_failed_ready_execution_keeps_xmm() {
+    fn rollback_failed_ready_execution_keeps_xmm() {
         let (mut state, memory) = sse_machine(&[0x66, 0x0f, 0xfe, 0xc1, 0xc3], 6);
         let before = state.clone();
         let cache = WasmCodeCache::new(Arc::new(Scribble(true)));
@@ -1135,7 +1135,7 @@ mod tests {
         assert_eq!(cache.statistics().executed_blocks, 0);
     }
     #[test]
-    fn u14_rollback_prepare_rejection_keeps_xmm() {
+    fn rollback_prepare_rejection_keeps_xmm() {
         struct Reject;
         impl ExecutionBridge for Reject {
             fn prepare(&self, _: u32, _: &[u8]) -> bool {
@@ -1152,7 +1152,7 @@ mod tests {
         assert_eq!(state, before);
     }
     #[test]
-    fn u14_rollback_write_during_prepare_keeps_xmm() {
+    fn rollback_write_during_prepare_keeps_xmm() {
         struct Mutate(Arc<AddressSpace>);
         impl ExecutionBridge for Mutate {
             fn prepare(&self, _: u32, _: &[u8]) -> bool {
@@ -1180,7 +1180,7 @@ mod tests {
         wasm
     }
     #[test]
-    fn u14_rollback_real_wasm_partial_trap_commits_nothing() {
+    fn rollback_real_wasm_partial_trap_commits_nothing() {
         struct Trap;
         impl ExecutionBridge for Trap {
             fn execute(&self, id: u32, wasm: &[u8], state: &mut JitState) -> bool {
@@ -1204,7 +1204,7 @@ mod tests {
         assert_eq!(state, expected);
     }
     #[test]
-    fn u14_rollback_real_wasm_trap_scratch_is_never_returned() {
+    fn rollback_real_wasm_trap_scratch_is_never_returned() {
         let block = block::extract(&[0x66, 0x0f, 0xfe, 0xc1], 4096).unwrap();
         let wasm = emit::emit(&block).unwrap();
         let state = scratch_from(&patterned_state(10));
@@ -1217,7 +1217,7 @@ mod tests {
         assert_eq!(committed[20..], state[20..]);
     }
     #[test]
-    fn u14_rollback_sequential_failures_restore_each_pattern() {
+    fn rollback_sequential_failures_restore_each_pattern() {
         for seed in 11..15 {
             let (mut state, memory) = sse_machine(&[0x66, 0x0f, 0xfa, 0xc1, 0xc3], seed);
             let before = state.clone();
@@ -1280,7 +1280,7 @@ mod tests {
         bytes
     }
     #[test]
-    fn u14_sse_real_wasm_every_pshufd_imm8_matches_interpreter() {
+    fn sse_real_wasm_every_pshufd_imm8_matches_interpreter() {
         let cases: Vec<_> = (0..=255u8)
             .map(|selector| {
                 let destination = selector % 16;
@@ -1294,7 +1294,7 @@ mod tests {
         sse_differential(&cases);
     }
     #[test]
-    fn u14_sse_real_wasm_shift_counts_at_and_above_32_clear_dwords() {
+    fn sse_real_wasm_shift_counts_at_and_above_32_clear_dwords() {
         let mut cases = Vec::new();
         for count in [0u8, 1, 7, 31, 32, 33, 63, 64, 128, 255] {
             for (extension, register) in [(6u8, 3u8), (2, 12)] {
@@ -1316,7 +1316,7 @@ mod tests {
         assert_eq!(interpreted.xmm[3], 0);
     }
     #[test]
-    fn u14_sse_real_wasm_packuswb_saturates_like_interpreter() {
+    fn sse_real_wasm_packuswb_saturates_like_interpreter() {
         let words = |values: [u16; 8]| {
             values
                 .iter()
@@ -1344,7 +1344,7 @@ mod tests {
         sse_differential(&cases);
     }
     #[test]
-    fn u14_sse_real_wasm_binary_forms_and_all_registers_match_interpreter() {
+    fn sse_real_wasm_binary_forms_and_all_registers_match_interpreter() {
         let mut cases = Vec::new();
         for opcode in [0x6f, 0x7f, 0xdb, 0xeb, 0xef, 0xfe, 0xfa, 0xf4, 0x62, 0x67] {
             for (destination, source) in [(0u8, 1u8), (15, 0), (7, 8), (13, 13)] {
@@ -1358,7 +1358,7 @@ mod tests {
         sse_differential(&cases);
     }
     #[test]
-    fn u14_sse_real_wasm_wraparound_and_pmuludq_edges_match_interpreter() {
+    fn sse_real_wasm_wraparound_and_pmuludq_edges_match_interpreter() {
         let dwords = |values: [u32; 4]| {
             values
                 .iter()
@@ -1379,7 +1379,7 @@ mod tests {
         sse_differential(&cases);
     }
     #[test]
-    fn u14_sse_real_wasm_long_block_of_every_form_matches_interpreter() {
+    fn sse_real_wasm_long_block_of_every_form_matches_interpreter() {
         let mut code = Vec::new();
         for (index, opcode) in [
             0xfe, 0x70, 0xf4, 0x62, 0xfa, 0x67, 0xdb, 0xeb, 0xef, 0x6f, 0x7f,
@@ -1398,7 +1398,7 @@ mod tests {
         sse_differential(&[(code, patterned_state(777))]);
     }
     #[test]
-    fn u14_sse_cache_runs_translated_block_and_counts_instructions() {
+    fn sse_cache_runs_translated_block_and_counts_instructions() {
         // movdqa xmm1,xmm2 ; paddd xmm1,xmm3 ; pslld xmm1,4 ; ret
         let code = [
             0x66, 0x0f, 0x6f, 0xca, 0x66, 0x0f, 0xfe, 0xcb, 0x66, 0x0f, 0x72, 0xf1, 4, 0xc3,
@@ -1414,7 +1414,7 @@ mod tests {
         assert_eq!(statistics.executed_instructions, 3);
     }
     #[test]
-    fn u14_sse_memory_operand_falls_back_without_state_change() {
+    fn sse_memory_operand_falls_back_without_state_change() {
         for code in [
             &[0x66, 0x0f, 0xfe, 0x07, 0xc3][..],   // PADDD xmm0,[rdi]
             &[0x66, 0x0f, 0x7f, 0x07, 0xc3],       // MOVDQA [rdi],xmm0
@@ -1435,7 +1435,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_sse_block_stops_before_memory_form_and_interpreter_continues() {
+    fn sse_block_stops_before_memory_form_and_interpreter_continues() {
         // paddd xmm0,xmm1 ; paddd xmm0,[rdi] ; ret
         let code = [0x66, 0x0f, 0xfe, 0xc1, 0x66, 0x0f, 0xfe, 0x07, 0xc3];
         let (mut state, memory) = sse_machine(&code, 22);
@@ -1447,7 +1447,7 @@ mod tests {
         assert_eq!(state.rip.0, 4100);
     }
     #[test]
-    fn u14_sse_self_modifying_code_retranslates() {
+    fn sse_self_modifying_code_retranslates() {
         let (mut state, memory) = sse_machine(&[0x66, 0x0f, 0xfe, 0xc1, 0xc3], 23);
         let initial = state.clone();
         let cache = WasmCodeCache::new(Arc::new(NodeBridge));
@@ -1462,7 +1462,7 @@ mod tests {
         assert_eq!(cache.statistics().translated_blocks, 2);
     }
     #[test]
-    fn u14_sse_epoch_change_requires_new_preparation() {
+    fn sse_epoch_change_requires_new_preparation() {
         let (mut state, memory) = sse_machine(&[0x66, 0x0f, 0xfe, 0xc1, 0xc3], 24);
         let bridge = Arc::new(WarmBridge::default());
         let cache = WasmCodeCache::new(bridge.clone());
@@ -1478,7 +1478,7 @@ mod tests {
         assert_eq!(cache.statistics().translated_blocks, 2);
     }
     #[test]
-    fn u14_sse_eviction_retranslates_with_same_result() {
+    fn sse_eviction_retranslates_with_same_result() {
         let (state, memory) = sse_machine(&[0x66, 0x0f, 0xf4, 0xc1, 0xc3], 25);
         let mut expected = state.clone();
         paludarium_cpu::run(&mut expected, &memory, 1);

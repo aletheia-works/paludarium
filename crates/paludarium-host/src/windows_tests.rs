@@ -6,34 +6,34 @@ use std::sync::{
 use std::time::{Duration, UNIX_EPOCH};
 
 #[test]
-fn u13_native_monotonic_forward() {
+fn windows_native_monotonic_forward() {
     let h = NativeHost::new();
     let before = h.clock(ClockId::Monotonic).unwrap();
     std::thread::sleep(Duration::from_millis(1));
     assert!(h.clock(ClockId::Monotonic).unwrap() >= before);
 }
 #[test]
-fn u13_native_realtime_epoch() {
+fn windows_native_realtime_epoch() {
     let lower = UNIX_EPOCH.elapsed().unwrap().as_nanos();
     let value = u128::from(NativeHost::new().clock(ClockId::Realtime).unwrap());
     assert!((lower..=UNIX_EPOCH.elapsed().unwrap().as_nanos()).contains(&value));
 }
 #[test]
-fn u13_native_past_deadline() {
+fn windows_native_past_deadline() {
     assert_eq!(
         NativeHost::new().wait_until(ClockId::Monotonic, 0, &AtomicBool::new(false)),
         Ok(WaitOutcome::Complete)
     );
 }
 #[test]
-fn u13_native_cancelled_wait() {
+fn windows_native_cancelled_wait() {
     assert_eq!(
         NativeHost::new().wait_until(ClockId::Monotonic, u64::MAX, &AtomicBool::new(true)),
         Ok(WaitOutcome::Interrupted)
     );
 }
 #[test]
-fn u13_native_thread_join_visibility() {
+fn windows_native_thread_join_visibility() {
     let state = Arc::new(AtomicUsize::new(0));
     let child = state.clone();
     threads::spawn(Box::new(move || {
@@ -45,7 +45,7 @@ fn u13_native_thread_join_visibility() {
     assert_eq!(state.load(Ordering::SeqCst), 7);
 }
 #[test]
-fn u13_native_thread_panic_linux_errno() {
+fn windows_native_thread_panic_linux_errno() {
     assert_eq!(
         threads::spawn(Box::new(|| panic!("U13 controlled panic")))
             .unwrap()
@@ -54,7 +54,7 @@ fn u13_native_thread_panic_linux_errno() {
     );
 }
 #[test]
-fn u13_native_ticket_and_empty_stdio() {
+fn windows_native_ticket_and_empty_stdio() {
     let token = WaitToken::default();
     token.notify();
     assert_eq!(
@@ -66,7 +66,7 @@ fn u13_native_ticket_and_empty_stdio() {
 }
 
 #[test]
-fn u13_native_ticket_future_deadline() {
+fn native_ticket_future_deadline() {
     let host = NativeHost::new();
     let token = WaitToken::default();
     let deadline = host.clock(ClockId::Monotonic).unwrap() + 5_000_000;
@@ -85,7 +85,7 @@ fn u13_native_ticket_future_deadline() {
 }
 
 #[test]
-fn u13_native_one_notify_releases_two_waiters() {
+fn native_one_notify_releases_two_waiters() {
     let token = Arc::new(WaitToken::default());
     let ready = Arc::new(std::sync::Barrier::new(3));
     let completed = Arc::new(AtomicUsize::new(0));
@@ -164,14 +164,14 @@ impl Drop for Fixture {
     }
 }
 #[test]
-fn u13_fs_missing_linux_errno() {
+fn windows_fs_missing_linux_errno() {
     assert_eq!(
         Fixture::new().fs().metadata(b"missing", true),
         Err(Errno::ENOENT)
     );
 }
 #[test]
-fn u13_fs_io_metadata() {
+fn windows_fs_io_metadata() {
     let x = Fixture::new();
     let f = x.fs().open(b"io", 66, 0o600).unwrap();
     f.write(b"abc").unwrap();
@@ -217,20 +217,20 @@ fn u13_fs_io_metadata() {
     ));
 }
 #[test]
-fn u13_fs_nul_rejected() {
+fn windows_fs_nul_rejected() {
     assert_eq!(
         Fixture::new().fs().metadata(b"nul\0path", true),
         Err(Errno::EINVAL)
     );
 }
 #[test]
-fn u13_fs_parent_escape_denied() {
+fn windows_fs_parent_escape_denied() {
     let x = Fixture::new();
     assert!(x.fs().open(b"../outside", 0, 0).is_err());
     assert_eq!(std::fs::read(x.root.join("outside")).unwrap(), b"sentinel");
 }
 #[test]
-fn u13_fs_symlink_hardlink() {
+fn windows_fs_symlink_hardlink() {
     let x = Fixture::new();
     x.fs().open(b"original", 66, 0o600).unwrap();
     x.fs().symlink(b"original", b"sym").unwrap();
@@ -340,7 +340,7 @@ fn u13_fs_symlink_hardlink() {
     );
 }
 #[test]
-fn u13_fs_flock_contention() {
+fn windows_fs_flock_contention() {
     let x = Fixture::new();
     let a = x.fs().open(b"lock", 66, 0o600).unwrap();
     let b = x.fs().open(b"lock", 2, 0).unwrap();
@@ -350,7 +350,7 @@ fn u13_fs_flock_contention() {
     b.flock(6).unwrap();
 }
 #[test]
-fn u13_fs_negative_mtime() {
+fn windows_fs_negative_mtime() {
     let x = Fixture::new();
     let h = x.fs().open(b"mtime", 66, 0o600).unwrap();
     // Windows SetFileTime needs write access to the fixture's attributes.

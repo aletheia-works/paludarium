@@ -6,34 +6,34 @@ use std::sync::{
 use std::time::{Duration, UNIX_EPOCH};
 
 #[test]
-fn u12_native_monotonic_forward() {
+fn macos_native_monotonic_forward() {
     let h = NativeHost::new();
     let before = h.clock(ClockId::Monotonic).unwrap();
     std::thread::sleep(Duration::from_millis(1));
     assert!(h.clock(ClockId::Monotonic).unwrap() >= before);
 }
 #[test]
-fn u12_native_realtime_epoch() {
+fn macos_native_realtime_epoch() {
     let lower = UNIX_EPOCH.elapsed().unwrap().as_nanos();
     let value = u128::from(NativeHost::new().clock(ClockId::Realtime).unwrap());
     assert!((lower..=UNIX_EPOCH.elapsed().unwrap().as_nanos()).contains(&value));
 }
 #[test]
-fn u12_native_past_deadline() {
+fn macos_native_past_deadline() {
     assert_eq!(
         NativeHost::new().wait_until(ClockId::Monotonic, 0, &AtomicBool::new(false)),
         Ok(WaitOutcome::Complete)
     );
 }
 #[test]
-fn u12_native_cancelled_wait() {
+fn macos_native_cancelled_wait() {
     assert_eq!(
         NativeHost::new().wait_until(ClockId::Monotonic, u64::MAX, &AtomicBool::new(true)),
         Ok(WaitOutcome::Interrupted)
     );
 }
 #[test]
-fn u12_native_thread_join_visibility() {
+fn macos_native_thread_join_visibility() {
     let state = Arc::new(AtomicUsize::new(0));
     let child = state.clone();
     threads::spawn(Box::new(move || {
@@ -45,7 +45,7 @@ fn u12_native_thread_join_visibility() {
     assert_eq!(state.load(Ordering::SeqCst), 7);
 }
 #[test]
-fn u12_native_thread_panic_linux_errno() {
+fn macos_native_thread_panic_linux_errno() {
     assert_eq!(
         threads::spawn(Box::new(|| panic!("U12 controlled panic")))
             .unwrap()
@@ -54,7 +54,7 @@ fn u12_native_thread_panic_linux_errno() {
     );
 }
 #[test]
-fn u12_native_ticket_and_empty_stdio() {
+fn macos_native_ticket_and_empty_stdio() {
     let token = WaitToken::default();
     token.notify();
     assert_eq!(
@@ -105,14 +105,14 @@ impl Drop for Fixture {
     }
 }
 #[test]
-fn u12_fs_missing_linux_errno() {
+fn macos_fs_missing_linux_errno() {
     assert_eq!(
         Fixture::new().fs().metadata(b"missing", true),
         Err(Errno::ENOENT)
     );
 }
 #[test]
-fn u12_fs_io_metadata() {
+fn macos_fs_io_metadata() {
     let x = Fixture::new();
     let f = x.fs().open(b"io", 66, 0o600).unwrap();
     f.write(b"abc").unwrap();
@@ -123,21 +123,21 @@ fn u12_fs_io_metadata() {
     assert_eq!(f.stat().unwrap().size, 3);
 }
 #[test]
-fn u12_fs_nul_rejected() {
+fn macos_fs_nul_rejected() {
     assert_eq!(
         Fixture::new().fs().metadata(b"nul\0path", true),
         Err(Errno::EINVAL)
     );
 }
 #[test]
-fn u12_fs_parent_escape_denied() {
+fn macos_fs_parent_escape_denied() {
     let x = Fixture::new();
     assert!(x.fs().open(b"../outside", 0, 0).is_err());
     assert_eq!(std::fs::read(x.root.join("outside")).unwrap(), b"sentinel");
 }
 #[cfg(unix)]
 #[test]
-fn u12_fs_symlink_hardlink() {
+fn macos_fs_symlink_hardlink() {
     let x = Fixture::new();
     x.fs().open(b"original", 66, 0o600).unwrap();
     x.fs().symlink(b"original", b"sym").unwrap();
@@ -146,7 +146,7 @@ fn u12_fs_symlink_hardlink() {
     assert_eq!(x.fs().metadata(b"hard", true).unwrap().links, 2);
 }
 #[test]
-fn u12_fs_flock_contention() {
+fn macos_fs_flock_contention() {
     let x = Fixture::new();
     let a = x.fs().open(b"lock", 66, 0o600).unwrap();
     let b = x.fs().open(b"lock", 2, 0).unwrap();
@@ -157,7 +157,7 @@ fn u12_fs_flock_contention() {
 }
 #[cfg(unix)]
 #[test]
-fn u12_fs_negative_mtime() {
+fn macos_fs_negative_mtime() {
     let x = Fixture::new();
     let h = x.fs().open(b"mtime", 66, 0o600).unwrap();
     let f = std::fs::File::open(x.root.join("root/mtime")).unwrap();

@@ -17,7 +17,7 @@ fn code() -> AddressSpace {
 }
 
 #[test]
-fn u14_snapshot_captures_bytes_and_epoch_together() {
+fn snapshot_captures_bytes_and_epoch_together() {
     let memory = code();
     let snapshot = memory.code_snapshot(GuestAddr(4096), 2).unwrap();
     assert_eq!(snapshot.bytes, [0x90, 0xc3]);
@@ -28,7 +28,7 @@ fn u14_snapshot_captures_bytes_and_epoch_together() {
 }
 
 #[test]
-fn u14_snapshot_allocation_is_bounded() {
+fn snapshot_allocation_is_bounded() {
     assert_eq!(
         code()
             .code_snapshot(GuestAddr(4096), usize::MAX)
@@ -40,7 +40,7 @@ fn u14_snapshot_allocation_is_bounded() {
 }
 
 #[test]
-fn u14_snapshot_fetch_requires_execute_permission() {
+fn snapshot_fetch_requires_execute_permission() {
     let mut memory = code();
     memory
         .protect(GuestAddr(4096), 8192, Prot::READ_WRITE)
@@ -49,7 +49,7 @@ fn u14_snapshot_fetch_requires_execute_permission() {
 }
 
 #[test]
-fn u14_write_rejects_captured_epoch() {
+fn write_rejects_captured_epoch() {
     let memory = code();
     let snapshot = memory.code_snapshot(GuestAddr(4096), 2).unwrap();
     memory.write(GuestAddr(4096), &[0xcc]).unwrap();
@@ -62,7 +62,7 @@ fn u14_write_rejects_captured_epoch() {
 }
 
 #[test]
-fn u14_different_address_space_rejects_epoch() {
+fn different_address_space_rejects_epoch() {
     let first = code();
     let snapshot = first.code_snapshot(GuestAddr(4096), 2).unwrap();
     assert_eq!(
@@ -72,7 +72,7 @@ fn u14_different_address_space_rejects_epoch() {
 }
 
 #[test]
-fn u14_snapshot_crosses_page_boundary() {
+fn snapshot_crosses_page_boundary() {
     let memory = code();
     memory.write(GuestAddr(8191), &[0x48, 0x89, 0xc0]).unwrap();
     assert_eq!(
@@ -82,7 +82,7 @@ fn u14_snapshot_crosses_page_boundary() {
 }
 
 #[test]
-fn u14_private_data_write_preserves_code_epoch() {
+fn private_data_write_preserves_code_epoch() {
     let mut memory = code();
     memory
         .map(
@@ -98,7 +98,7 @@ fn u14_private_data_write_preserves_code_epoch() {
 }
 
 #[test]
-fn u14_protect_rejects_previous_execution_epoch() {
+fn protect_rejects_previous_execution_epoch() {
     let mut memory = code();
     let snapshot = memory.code_snapshot(GuestAddr(4096), 2).unwrap();
     memory
@@ -112,7 +112,7 @@ fn u14_protect_rejects_previous_execution_epoch() {
 }
 
 #[test]
-fn u14_unmap_remap_same_address_rejects_previous_execution_epoch() {
+fn unmap_remap_same_address_rejects_previous_execution_epoch() {
     let mut memory = code();
     let snapshot = memory.code_snapshot(GuestAddr(4096), 2).unwrap();
     memory.unmap(GuestAddr(4096), 8192).unwrap();
@@ -136,7 +136,7 @@ fn u14_unmap_remap_same_address_rejects_previous_execution_epoch() {
 }
 
 #[test]
-fn u14_epoch_guard_serializes_another_workers_write() {
+fn epoch_guard_serializes_another_workers_write() {
     use std::sync::{Arc, mpsc};
     let memory = Arc::new(code());
     let snapshot = memory.code_snapshot(GuestAddr(4096), 2).unwrap();

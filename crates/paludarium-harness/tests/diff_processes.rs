@@ -3,7 +3,7 @@
 mod support;
 
 #[test]
-fn u8_runner_ready() {
+fn runner_ready() {
     let platform = (
         std::env::consts::OS.to_owned(),
         std::env::consts::ARCH.to_owned(),
@@ -29,7 +29,7 @@ fn u8_runner_ready() {
         Some(124),
         "watchdog must interrupt blocked guests"
     );
-    support::bounded("u8_runner_ready", || {});
+    support::bounded("runner_ready", || {});
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -104,34 +104,34 @@ mod linux {
     }
     macro_rules! cases {($($name:ident => ($mode:literal,$binary:literal)),* $(,)?) => {$(#[test] fn $name(){case(concat!("linux::",stringify!($name)),$mode,$binary);})*};}
     cases!(
-        u8_fork => ("fork","process"),
-        u8_private => ("private","process"),
-        u8_shared => ("shared","process"),
-        u8_offset => ("offset","process"),
-        u8_vfork_exec => ("vfork-exec","process"),
-        u8_vfork_exit => ("vfork-exit","process"),
-        u8_exec => ("exec","process"),
-        u8_exec_thread => ("exec-thread","process"),
-        u8_clone_vm => ("clone-vm","process"),
-        u8_wait_interrupt => ("wait-interrupt","process"),
-        u8_wait_restart => ("wait-restart","process"),
-        u8_enoent => ("enoent","process"),
-        u8_exec_fault => ("exec-fault","process"),
-        u8_bad_elf => ("bad-elf","process"),
-        u8_cloexec => ("cloexec","process"),
-        u8_wait_specific => ("wait-specific","process"),
-        u8_wait_any => ("wait-any","process"),
-        u8_wnohang => ("wnohang","process"),
-        u8_signal => ("signal","process"),
-        u8_double_reap => ("double-reap","process"),
-        u8_wait_fault => ("wait-fault","process"),
-        u8_usage => ("usage","process"),
-        u8_no_child => ("no-child","process"),
-        u8_invalid_clone => ("invalid-clone","process"),
-        u8_invalid_wait => ("invalid-wait","process"),
-        u8_command_spawn => ("spawn","command"),
-        u8_command_status => ("status","command"),
-        u8_command_output => ("output","command"),
-        u8_command_missing => ("missing","command"),
+        processes_fork => ("fork","process"),
+        processes_private => ("private","process"),
+        processes_shared => ("shared","process"),
+        processes_offset => ("offset","process"),
+        vfork_exec => ("vfork-exec","process"),
+        vfork_exit => ("vfork-exit","process"),
+        processes_exec => ("exec","process"),
+        exec_thread => ("exec-thread","process"),
+        clone_vm => ("clone-vm","process"),
+        wait_interrupt => ("wait-interrupt","process"),
+        wait_restart => ("wait-restart","process"),
+        processes_enoent => ("enoent","process"),
+        exec_fault => ("exec-fault","process"),
+        bad_elf => ("bad-elf","process"),
+        processes_cloexec => ("cloexec","process"),
+        wait_specific => ("wait-specific","process"),
+        wait_any => ("wait-any","process"),
+        processes_wnohang => ("wnohang","process"),
+        processes_signal => ("signal","process"),
+        double_reap => ("double-reap","process"),
+        wait_fault => ("wait-fault","process"),
+        processes_usage => ("usage","process"),
+        no_child => ("no-child","process"),
+        invalid_clone => ("invalid-clone","process"),
+        invalid_wait => ("invalid-wait","process"),
+        command_spawn => ("spawn","command"),
+        command_status => ("status","command"),
+        command_output => ("output","command"),
+        command_missing => ("missing","command"),
     );
 }

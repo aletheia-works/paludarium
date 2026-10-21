@@ -45,27 +45,27 @@ fn specialized_fallback_equivalence(
 }
 
 #[test]
-fn u14_specialized_zero_budget_matches_both_policies() {
+fn specialized_zero_budget_matches_both_policies() {
     specialized_fallback_equivalence(0, 64, false, &[]);
 }
 #[test]
-fn u14_specialized_short_budget_matches_both_policies() {
+fn specialized_short_budget_matches_both_policies() {
     specialized_fallback_equivalence(63, 64, false, &[]);
 }
 #[test]
-fn u14_specialized_exact_budget_matches_both_policies() {
+fn specialized_exact_budget_matches_both_policies() {
     specialized_fallback_equivalence(64, 64, false, &[4096]);
 }
 #[test]
-fn u14_specialized_disabled_acceleration_matches_both_policies() {
+fn specialized_disabled_acceleration_matches_both_policies() {
     specialized_fallback_equivalence(65, 0, false, &[]);
 }
 #[test]
-fn u14_specialized_syscall_matches_both_policies() {
+fn specialized_syscall_matches_both_policies() {
     specialized_fallback_equivalence(65, 64, true, &[4096, 4097]);
 }
 #[test]
-fn u14_specialized_opt_out_ignores_existing_rejection() {
+fn specialized_opt_out_ignores_existing_rejection() {
     let (mut state, memory) = machine();
     let mut cache = DecodeCache::new();
     assert_eq!(hint_attempt(&mut state, &memory, &mut cache, true, true), 1);
@@ -76,7 +76,7 @@ fn u14_specialized_opt_out_ignores_existing_rejection() {
     );
 }
 #[test]
-fn u14_specialized_policy_switch_preserves_epoch_invalidation() {
+fn specialized_policy_switch_preserves_epoch_invalidation() {
     let (mut state, memory) = machine();
     let mut cache = DecodeCache::new();
     assert_eq!(hint_attempt(&mut state, &memory, &mut cache, true, true), 1);
@@ -123,31 +123,31 @@ fn hinted_dispatch_matches_interpreter(bytes: &[u8], budget: u64, maximum: u64) 
     assert_eq!(hinted, ordinary);
 }
 #[test]
-fn u14_negative_dispatch_zero_budget() {
+fn negative_dispatch_zero_budget() {
     hinted_dispatch_matches_interpreter(&[0x90], 0, 64);
 }
 #[test]
-fn u14_negative_dispatch_one_budget() {
+fn negative_dispatch_one_budget() {
     hinted_dispatch_matches_interpreter(&[0x90], 1, 64);
 }
 #[test]
-fn u14_negative_dispatch_disabled_maximum() {
+fn negative_dispatch_disabled_maximum() {
     hinted_dispatch_matches_interpreter(&[0x90], 1, 0);
 }
 #[test]
-fn u14_negative_dispatch_maximum_u64() {
+fn negative_dispatch_maximum_u64() {
     hinted_dispatch_matches_interpreter(&[0x90], 1, u64::MAX);
 }
 #[test]
-fn u14_negative_dispatch_register_effect() {
+fn negative_dispatch_register_effect() {
     hinted_dispatch_matches_interpreter(&[0xb8, 42, 0, 0, 0], 1, 64);
 }
 #[test]
-fn u14_negative_dispatch_syscall_exit() {
+fn negative_dispatch_syscall_exit() {
     hinted_dispatch_matches_interpreter(&[0x0f, 0x05], 64, 64);
 }
 #[test]
-fn u14_negative_dispatch_memory_fault() {
+fn negative_dispatch_memory_fault() {
     hinted_dispatch_matches_interpreter(&[0x48, 0x8b, 0x00], 64, 64);
 }
 
@@ -159,12 +159,12 @@ fn cached_boundary() -> (DecodeCache, paludarium_decoder::Instruction) {
 }
 
 #[test]
-fn u14_decode_hint_empty_boundary_requires_fetch() {
+fn decode_hint_empty_boundary_requires_fetch() {
     assert!(DecodeCache::new().get_with_hint(4096, 1).is_none());
 }
 
 #[test]
-fn u14_decode_hint_hit_preserves_exact_decoded_instruction() {
+fn decode_hint_hit_preserves_exact_decoded_instruction() {
     let (cache, expected) = cached_boundary();
     let (instruction, rejected) = cache.get_with_hint(4096, 1).unwrap();
     assert_eq!(instruction, expected);
@@ -172,21 +172,21 @@ fn u14_decode_hint_hit_preserves_exact_decoded_instruction() {
 }
 
 #[test]
-fn u14_decode_hint_deterministic_rejection_is_returned_with_same_entry() {
+fn decode_hint_deterministic_rejection_is_returned_with_same_entry() {
     let (mut cache, expected) = cached_boundary();
     cache.reject_acceleration(4096, 1);
     assert_eq!(cache.get_with_hint(4096, 1), Some((expected, true)));
 }
 
 #[test]
-fn u14_decode_hint_wrong_generation_cannot_reuse_instruction_or_rejection() {
+fn decode_hint_wrong_generation_cannot_reuse_instruction_or_rejection() {
     let (mut cache, _) = cached_boundary();
     cache.reject_acceleration(4096, 1);
     assert!(cache.get_with_hint(4096, 2).is_none());
 }
 
 #[test]
-fn u14_decode_hint_slot_collision_cannot_transfer_rejection() {
+fn decode_hint_slot_collision_cannot_transfer_rejection() {
     let (mut cache, _) = cached_boundary();
     cache.reject_acceleration(4096, 1);
     let collision = (0..4096)
@@ -202,7 +202,7 @@ fn u14_decode_hint_slot_collision_cannot_transfer_rejection() {
 }
 
 #[test]
-fn u14_decode_hint_new_decode_clears_stale_rejection() {
+fn decode_hint_new_decode_clears_stale_rejection() {
     let (mut cache, instruction) = cached_boundary();
     cache.reject_acceleration(4096, 1);
     cache.put(4096, 2, instruction);
@@ -210,7 +210,7 @@ fn u14_decode_hint_new_decode_clears_stale_rejection() {
 }
 
 #[test]
-fn u14_decode_hint_does_not_change_ordinary_interpreter_cache_contract() {
+fn decode_hint_does_not_change_ordinary_interpreter_cache_contract() {
     let (mut cache, instruction) = cached_boundary();
     cache.reject_acceleration(4096, 1);
     assert_eq!(cache.get(4096, 1), Some(instruction));
@@ -245,7 +245,7 @@ fn hint_attempt(
 }
 
 #[test]
-fn u14_counted_negative_hint_skips_only_same_epoch_boundary() {
+fn counted_negative_hint_skips_only_same_epoch_boundary() {
     let (mut state, memory) = machine();
     let mut cache = DecodeCache::new();
     assert_eq!(hint_attempt(&mut state, &memory, &mut cache, true, true), 1);
@@ -254,7 +254,7 @@ fn u14_counted_negative_hint_skips_only_same_epoch_boundary() {
     assert_eq!(hint_attempt(&mut state, &memory, &mut cache, true, true), 1);
 }
 #[test]
-fn u14_counted_transient_rejection_remains_retryable() {
+fn counted_transient_rejection_remains_retryable() {
     let (mut state, memory) = machine();
     let mut cache = DecodeCache::new();
     assert_eq!(
@@ -267,7 +267,7 @@ fn u14_counted_transient_rejection_remains_retryable() {
     );
 }
 #[test]
-fn u14_counted_default_opt_out_does_not_cache_rejections() {
+fn counted_default_opt_out_does_not_cache_rejections() {
     let (mut state, memory) = machine();
     let mut cache = DecodeCache::new();
     assert_eq!(
@@ -280,7 +280,7 @@ fn u14_counted_default_opt_out_does_not_cache_rejections() {
     );
 }
 #[test]
-fn u14_counted_negative_hint_protect_change_invalidates() {
+fn counted_negative_hint_protect_change_invalidates() {
     let (mut state, mut memory) = machine();
     let mut cache = DecodeCache::new();
     hint_attempt(&mut state, &memory, &mut cache, true, true);
@@ -290,7 +290,7 @@ fn u14_counted_negative_hint_protect_change_invalidates() {
     assert_eq!(hint_attempt(&mut state, &memory, &mut cache, true, true), 1);
 }
 #[test]
-fn u14_counted_negative_hint_unmap_preserves_fetch_fault() {
+fn counted_negative_hint_unmap_preserves_fetch_fault() {
     let (mut state, mut memory) = machine();
     let mut cache = DecodeCache::new();
     hint_attempt(&mut state, &memory, &mut cache, true, true);
@@ -304,7 +304,7 @@ fn u14_counted_negative_hint_unmap_preserves_fetch_fault() {
     ));
 }
 #[test]
-fn u14_counted_negative_hint_remap_invalidates() {
+fn counted_negative_hint_remap_invalidates() {
     let (mut state, mut memory) = machine();
     let mut cache = DecodeCache::new();
     hint_attempt(&mut state, &memory, &mut cache, true, true);
@@ -321,7 +321,7 @@ fn u14_counted_negative_hint_remap_invalidates() {
     assert_eq!(hint_attempt(&mut state, &memory, &mut cache, true, true), 1);
 }
 #[test]
-fn u14_counted_negative_hint_other_worker_write_invalidates() {
+fn counted_negative_hint_other_worker_write_invalidates() {
     let (mut state, memory) = machine();
     let memory = std::sync::Arc::new(memory);
     let mut cache = DecodeCache::new();
@@ -348,7 +348,7 @@ fn machine() -> (CpuState, AddressSpace) {
 }
 
 #[test]
-fn u14_counted_hook_charges_actual_instructions() {
+fn counted_hook_charges_actual_instructions() {
     let (mut state, memory) = machine();
     let mut calls = 0;
     let result = run_cached_with_counted_hook(
@@ -368,7 +368,7 @@ fn u14_counted_hook_charges_actual_instructions() {
     assert_eq!(result, ExitReason::BudgetExhausted { rip: state.rip });
 }
 #[test]
-fn u14_counted_hook_small_budget_never_calls_hook() {
+fn counted_hook_small_budget_never_calls_hook() {
     let (mut state, memory) = machine();
     run_cached_with_counted_hook(
         &mut state,
@@ -381,7 +381,7 @@ fn u14_counted_hook_small_budget_never_calls_hook() {
     assert_eq!(state.rip, GuestAddr(4159));
 }
 #[test]
-fn u14_counted_hook_zero_budget_preserves_state() {
+fn counted_hook_zero_budget_preserves_state() {
     let (mut state, memory) = machine();
     let before = state.clone();
     run_cached_with_counted_hook(
@@ -395,7 +395,7 @@ fn u14_counted_hook_zero_budget_preserves_state() {
     assert_eq!(state, before);
 }
 #[test]
-fn u14_counted_hook_rejection_executes_decoded_instruction() {
+fn counted_hook_rejection_executes_decoded_instruction() {
     let (mut state, memory) = machine();
     let mut calls = 0;
     run_cached_with_counted_hook(
@@ -414,7 +414,7 @@ fn u14_counted_hook_rejection_executes_decoded_instruction() {
     assert_eq!(state.rip, GuestAddr(4160));
 }
 #[test]
-fn u14_counted_hook_fetch_fault_does_not_call_hook() {
+fn counted_hook_fetch_fault_does_not_call_hook() {
     let (mut state, _) = machine();
     assert!(matches!(
         run_cached_with_counted_hook(
@@ -430,7 +430,7 @@ fn u14_counted_hook_fetch_fault_does_not_call_hook() {
 }
 
 #[test]
-fn u14_counted_hook_exact_maximum_exhausts_remaining_budget() {
+fn counted_hook_exact_maximum_exhausts_remaining_budget() {
     let (mut state, memory) = machine();
     let mut calls = 0;
     run_cached_with_counted_hook(
@@ -450,7 +450,7 @@ fn u14_counted_hook_exact_maximum_exhausts_remaining_budget() {
 }
 
 #[test]
-fn u14_counted_hook_syscall_after_short_block_returns_immediately() {
+fn counted_hook_syscall_after_short_block_returns_immediately() {
     let (mut state, memory) = machine();
     memory.write_initial(GuestAddr(4098), &[0x0f, 5]).unwrap();
     let reason = run_cached_with_counted_hook(
@@ -469,7 +469,7 @@ fn u14_counted_hook_syscall_after_short_block_returns_immediately() {
 }
 
 #[test]
-fn u14_counted_hook_fault_after_short_block_is_preserved() {
+fn counted_hook_fault_after_short_block_is_preserved() {
     let (mut state, memory) = machine();
     let reason = run_cached_with_counted_hook(
         &mut state,
@@ -493,7 +493,7 @@ fn u14_counted_hook_fault_after_short_block_is_preserved() {
 }
 #[test]
 #[should_panic(expected = "invalid accelerator instruction count")]
-fn u14_counted_hook_rejects_zero_count() {
+fn counted_hook_rejects_zero_count() {
     let (mut state, memory) = machine();
     run_cached_with_counted_hook(
         &mut state,
@@ -506,7 +506,7 @@ fn u14_counted_hook_rejects_zero_count() {
 }
 #[test]
 #[should_panic(expected = "invalid accelerator instruction count")]
-fn u14_counted_hook_rejects_excessive_count() {
+fn counted_hook_rejects_excessive_count() {
     let (mut state, memory) = machine();
     run_cached_with_counted_hook(
         &mut state,

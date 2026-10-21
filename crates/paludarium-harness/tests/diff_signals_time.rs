@@ -42,54 +42,54 @@ macro_rules! cases { ($($name:ident => $case:literal),* $(,)?) => {$(
     #[test] fn $name(){guest("memory",stringify!($name),$case);}
 )*}; }
 cases!(
-    u4_memory_zero_length => 0,
-    u4_memory_shared_anonymous => 1,
-    u4_memory_fixed_invalid_non_destructive => 2,
-    u4_memory_noreplace_non_destructive => 3,
-    u4_memory_protect_holes => 4,
-    u4_memory_unmap_holes_fault => 5,
-    u4_memory_break => 6,
-    u4_memory_unaligned_hint => 7,
+    memory_zero_length => 0,
+    memory_shared_anonymous => 1,
+    memory_fixed_invalid_non_destructive => 2,
+    memory_noreplace_non_destructive => 3,
+    memory_protect_holes => 4,
+    memory_unmap_holes_fault => 5,
+    memory_break => 6,
+    memory_unaligned_hint => 7,
 );
 
 macro_rules! time_cases { ($($name:ident => $case:literal),* $(,)?) => {$(
     #[test] fn $name(){guest("time",stringify!($name),$case);}
 )*}; }
 time_cases!(
- u4_time_monotonic => 0,
- u4_time_realtime => 1,
- u4_time_clock_invalid_pointer => 2,
- u4_time_zero_sleep => 3,
- u4_time_nanoseconds_and_pointer => 4,
- u4_time_negative_sleep => 5,
- u4_time_absolute_past => 6,
- u4_time_absolute_invalid_pointer => 7,
+ time_monotonic => 0,
+ time_realtime => 1,
+ time_clock_invalid_pointer => 2,
+ time_zero_sleep => 3,
+ time_nanoseconds_and_pointer => 4,
+ time_negative_sleep => 5,
+ time_absolute_past => 6,
+ time_absolute_invalid_pointer => 7,
 );
 
 macro_rules! signal_cases { ($($name:ident => $case:literal),* $(,)?) => {$(
     #[test] fn $name(){guest("signals",stringify!($name),$case);}
 )*}; }
 signal_cases!(
- u4_signal_registration => 0,
- u4_signal_self_handler => 1,
- u4_signal_ignore => 2,
- u4_signal_default => 3,
- u4_signal_blocked_pending => 4,
- u4_signal_altstack => 5,
- u4_signal_nodefer_nested => 6,
- u4_signal_reset_hand => 7,
- u4_signal_segv_maperr_context => 8,
- u4_signal_segv_accerr_context => 9,
- u4_signal_ill_context => 10,
- u4_signal_fpe_context => 11,
- u4_signal_modified_return => 12,
- u4_signal_malformed_return => 13,
- u4_signal_abi_offsets => 14,
+ signal_registration => 0,
+ signal_self_handler => 1,
+ signal_ignore => 2,
+ signal_default => 3,
+ signal_blocked_pending => 4,
+ signal_altstack => 5,
+ signal_nodefer_nested => 6,
+ signal_reset_hand => 7,
+ signal_segv_maperr_context => 8,
+ signal_segv_accerr_context => 9,
+ signal_ill_context => 10,
+ signal_fpe_context => 11,
+ signal_modified_return => 12,
+ signal_malformed_return => 13,
+ signal_abi_offsets => 14,
 );
 
-signal_cases!(u4_signal_fpstate_alignment => 15,u4_signal_timer_interrupt => 16,u4_signal_timer_restart_sleep => 17);
+signal_cases!(signal_fpstate_alignment => 15,signal_timer_interrupt => 16,signal_timer_restart_sleep => 17);
 
-cases!(u4_memory_partial_protect_fault=>8,u4_memory_offset_alignment=>9);
-signal_cases!(u4_signal_relocated_frame=>18,u4_signal_huge_sleep_interrupt=>19);
+cases!(memory_partial_protect_fault=>8,memory_offset_alignment=>9);
+signal_cases!(signal_relocated_frame=>18,signal_huge_sleep_interrupt=>19);
 
-signal_cases!(u4_signal_execute_fault_context=>20,u4_signal_none_fault_context=>21,u4_signal_virgin_readonly_fault=>22);
+signal_cases!(signal_execute_fault_context=>20,signal_none_fault_context=>21,signal_virgin_readonly_fault=>22);

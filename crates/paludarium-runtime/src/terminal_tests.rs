@@ -43,7 +43,7 @@ fn terminal() -> HostTerminal {
     HostTerminal::new(Default::default(), 101, 37, 0, 0)
 }
 #[test]
-fn u9_runtime_uses_host_size() {
+fn runtime_uses_host_size() {
     let host = Arc::new(RecordingHost::new());
     host.set_terminal_info(StreamId::Stdin, Some(terminal()));
     assert_eq!(
@@ -52,7 +52,7 @@ fn u9_runtime_uses_host_size() {
     );
 }
 #[test]
-fn u9_runtime_explicit_size_precedes_host() {
+fn runtime_explicit_size_precedes_host() {
     let host = Arc::new(RecordingHost::new());
     host.set_terminal_info(StreamId::Stdin, Some(terminal()));
     let out = query(
@@ -66,7 +66,7 @@ fn u9_runtime_explicit_size_precedes_host() {
     assert_eq!(&out[8..], [40, 0, 120, 0, 0, 0, 0, 0]);
 }
 #[test]
-fn u9_runtime_virtual_terminal_without_native_tty() {
+fn runtime_virtual_terminal_without_native_tty() {
     let out = query(
         Arc::new(RecordingHost::new()),
         Some(TerminalInfo {
@@ -78,12 +78,12 @@ fn u9_runtime_virtual_terminal_without_native_tty() {
     assert_eq!(&out[8..], [24, 0, 80, 0, 0, 0, 0, 0]);
 }
 #[test]
-fn u9_runtime_none_remains_nonterminal() {
+fn runtime_none_remains_nonterminal() {
     let out = query(Arc::new(RecordingHost::new()), None, 0x5413);
     assert_eq!(&out[..8], &(-25i64).to_le_bytes());
 }
 #[test]
-fn u9_runtime_override_preserves_attributes() {
+fn runtime_override_preserves_attributes() {
     let host = Arc::new(RecordingHost::new());
     let mut info = terminal();
     info.attributes.input_flags = 0x12345678;
@@ -99,7 +99,7 @@ fn u9_runtime_override_preserves_attributes() {
     assert_eq!(&out[8..12], &0x12345678u32.to_le_bytes());
 }
 #[test]
-fn u9_runtime_stdout_stderr_are_distinct() {
+fn runtime_stdout_stderr_are_distinct() {
     let host = Arc::new(RecordingHost::new());
     let mut code = Vec::new();
     for fd in [1, 2] {
@@ -122,7 +122,7 @@ fn u9_runtime_stdout_stderr_are_distinct() {
     assert_eq!(host.stderr(), b"abc");
 }
 #[test]
-fn u9_runtime_empty_argument_reaches_stack() {
+fn runtime_empty_argument_reaches_stack() {
     let host = Arc::new(RecordingHost::new());
     // argv[1] starts with NUL; output that byte, preserving the empty argument.
     let mut code = vec![0x48, 0x8b, 0x74, 0x24, 0x10];
@@ -142,7 +142,7 @@ fn u9_runtime_empty_argument_reaches_stack() {
     assert_eq!(host.stdout(), [0]);
 }
 #[test]
-fn u9_runtime_environment_reaches_stack() {
+fn runtime_environment_reaches_stack() {
     let host = Arc::new(RecordingHost::new());
     // argc=1: envp[0] is the pointer at rsp+24 after argv[0] and its NULL.
     let mut code = vec![0x48, 0x8b, 0x74, 0x24, 0x18];

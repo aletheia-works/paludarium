@@ -205,31 +205,31 @@ mod events_tests {
         Ok(u64::from_le_bytes(b))
     }
     #[test]
-    fn u6_event_initial() {
+    fn events_event_initial() {
         assert_eq!(take(&counter(7, 0)), Ok(7));
     }
     #[test]
-    fn u6_event_accumulate() {
+    fn event_accumulate() {
         let c = counter(0, 0);
         c.write(&2u64.to_le_bytes()).unwrap();
         c.write(&3u64.to_le_bytes()).unwrap();
         assert_eq!(take(&c), Ok(5));
     }
     #[test]
-    fn u6_event_semaphore() {
+    fn events_event_semaphore() {
         let c = counter(2, 1);
         assert_eq!(take(&c), Ok(1));
         assert_eq!(take(&c), Ok(1));
         assert_eq!(take(&c), Err(Errno::EAGAIN));
     }
     #[test]
-    fn u6_event_zero() {
+    fn event_zero() {
         let c = counter(0, 0);
         c.write(&0u64.to_le_bytes()).unwrap();
         assert_eq!(take(&c), Err(Errno::EAGAIN));
     }
     #[test]
-    fn u6_event_maximum() {
+    fn event_maximum() {
         let c = counter(0, 0);
         assert_eq!(c.write(&u64::MAX.to_le_bytes()), Err(Errno::EINVAL));
         c.write(&(u64::MAX - 1).to_le_bytes()).unwrap();
@@ -237,13 +237,13 @@ mod events_tests {
         assert_eq!(take(&c), Ok(u64::MAX - 1));
     }
     #[test]
-    fn u6_event_short_abi() {
+    fn event_short_abi() {
         let c = counter(1, 0);
         assert_eq!(c.read(&mut [0; 7]), Err(Errno::EINVAL));
         assert_eq!(c.write(&[0; 7]), Err(Errno::EINVAL));
     }
     #[test]
-    fn u6_event_edges() {
+    fn event_edges() {
         let c = counter(0, 0);
         let before = c.readiness().unwrap();
         c.write(&1u64.to_le_bytes()).unwrap();
@@ -255,7 +255,7 @@ mod events_tests {
         assert_eq!(c.readiness().unwrap().1, before.1 + 3);
     }
     #[test]
-    fn u6_event_flags() {
+    fn event_flags() {
         let c = counter(0, NONBLOCK | CLOEXEC);
         assert_eq!(c.flags(), 2 | NONBLOCK);
         c.set_flags(0).unwrap();

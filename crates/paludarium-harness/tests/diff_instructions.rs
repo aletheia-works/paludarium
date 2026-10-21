@@ -22,20 +22,20 @@ macro_rules! cases {
     )*};
 }
 cases!(
-    u2_alu => "insn-alu", u2_cmptest => "insn-cmptest",
-    u2_incdec => "insn-incdec", u2_shift => "insn-shift",
-    u2_muldiv => "insn-muldiv", u2_bt => "insn-bt",
-    u2_set => "insn-cond-set", u2_cmov => "insn-cond-cmov",
-    u2_branch => "insn-cond-jcc", u2_move => "insn-mov",
-    u2_string => "insn-string", u2_atomic => "insn-atomic",
-    u2_integer_forms => "insn-forms-integer",
-    u2_string_forms => "insn-forms-string",
-    u2_atomic_pairs => "insn-forms-pairs",
-    u2_control_forms => "insn-forms-control",
-    u2_bmi_forms => "insn-forms-bmi",
-    u2_frame_forms => "insn-forms-frame",
-    u2_frame_caller_boundaries => "insn-forms-frame-boundary",
-    u2_segment_atomic_forms => "insn-forms-segment-atomic",
+    instructions_alu => "insn-alu", instructions_cmptest => "insn-cmptest",
+    instructions_incdec => "insn-incdec", instructions_shift => "insn-shift",
+    instructions_muldiv => "insn-muldiv", instructions_bt => "insn-bt",
+    instructions_set => "insn-cond-set", instructions_cmov => "insn-cond-cmov",
+    instructions_branch => "insn-cond-jcc", instructions_move => "insn-mov",
+    instructions_string => "insn-string", instructions_atomic => "insn-atomic",
+    integer_forms => "insn-forms-integer",
+    string_forms => "insn-forms-string",
+    atomic_pairs => "insn-forms-pairs",
+    control_forms => "insn-forms-control",
+    bmi_forms => "insn-forms-bmi",
+    frame_forms => "insn-forms-frame",
+    frame_caller_boundaries => "insn-forms-frame-boundary",
+    segment_atomic_forms => "insn-forms-segment-atomic",
 );
 
 fn cmps_fault(name: &'static str, completed: u64) {
@@ -144,28 +144,28 @@ fn cmps_fault(name: &'static str, completed: u64) {
 }
 
 #[test]
-fn u2_cmps_fault_start() {
-    cmps_fault("u2_cmps_fault_start", 0);
+fn cmps_fault_start() {
+    cmps_fault("cmps_fault_start", 0);
 }
 #[test]
-fn u2_cmps_fault_partial() {
-    cmps_fault("u2_cmps_fault_partial", 17);
+fn cmps_fault_partial() {
+    cmps_fault("cmps_fault_partial", 17);
 }
 #[test]
-fn u2_cmps_fault_budget() {
-    cmps_fault("u2_cmps_fault_budget", 4096);
+fn cmps_fault_budget() {
+    cmps_fault("cmps_fault_budget", 4096);
 }
 #[test]
-fn u2_scas_fault_start() {
-    cmps_fault("u2_scas_fault_start", 0);
+fn scas_fault_start() {
+    cmps_fault("scas_fault_start", 0);
 }
 #[test]
-fn u2_scas_fault_partial() {
-    cmps_fault("u2_scas_fault_partial", 17);
+fn scas_fault_partial() {
+    cmps_fault("scas_fault_partial", 17);
 }
 #[test]
-fn u2_scas_fault_budget() {
-    cmps_fault("u2_scas_fault_budget", 4096);
+fn scas_fault_budget() {
+    cmps_fault("scas_fault_budget", 4096);
 }
 
 fn atomic_fault(name: &'static str, scenario: &'static str, misaligned: bool, cross: bool) {
@@ -280,40 +280,40 @@ fn atomic_fault(name: &'static str, scenario: &'static str, misaligned: bool, cr
     });
 }
 #[test]
-fn u2_atomic_gs_readonly_failed_cmpxchg() {
+fn atomic_gs_readonly_failed_cmpxchg() {
     atomic_fault(
-        "u2_atomic_gs_readonly_failed_cmpxchg",
+        "atomic_gs_readonly_failed_cmpxchg",
         "atomic-gs-readonly",
         false,
         false,
     );
 }
 #[test]
-fn u2_atomic_gs_misaligned_cmpxchg16b() {
+fn atomic_gs_misaligned_cmpxchg16b() {
     atomic_fault(
-        "u2_atomic_gs_misaligned_cmpxchg16b",
+        "atomic_gs_misaligned_cmpxchg16b",
         "atomic-gs-misaligned",
         true,
         false,
     );
 }
 #[test]
-fn u2_atomic_readonly_failed_cmpxchg() {
+fn atomic_readonly_failed_cmpxchg() {
     atomic_fault(
-        "u2_atomic_readonly_failed_cmpxchg",
+        "atomic_readonly_failed_cmpxchg",
         "atomic-readonly",
         false,
         false,
     );
 }
 #[test]
-fn u2_atomic_cross_page_readonly() {
-    atomic_fault("u2_atomic_cross_page_readonly", "atomic-cross", false, true);
+fn atomic_cross_page_readonly() {
+    atomic_fault("atomic_cross_page_readonly", "atomic-cross", false, true);
 }
 #[test]
-fn u2_atomic_misaligned_cmpxchg16b() {
+fn atomic_misaligned_cmpxchg16b() {
     atomic_fault(
-        "u2_atomic_misaligned_cmpxchg16b",
+        "atomic_misaligned_cmpxchg16b",
         "atomic-misaligned",
         true,
         false,
@@ -395,25 +395,25 @@ fn divide_fault(name: &'static str, scenario: &'static str, signed: bool, overfl
     });
 }
 #[test]
-fn u2_div_zero() {
-    divide_fault("u2_div_zero", "div-zero", false, false);
+fn div_zero() {
+    divide_fault("div_zero", "div-zero", false, false);
 }
 #[test]
-fn u2_div_overflow() {
-    divide_fault("u2_div_overflow", "div-overflow", false, true);
+fn div_overflow() {
+    divide_fault("div_overflow", "div-overflow", false, true);
 }
 #[test]
-fn u2_idiv_zero() {
-    divide_fault("u2_idiv_zero", "idiv-zero", true, false);
+fn idiv_zero() {
+    divide_fault("idiv_zero", "idiv-zero", true, false);
 }
 #[test]
-fn u2_idiv_overflow() {
-    divide_fault("u2_idiv_overflow", "idiv-overflow", true, true);
+fn idiv_overflow() {
+    divide_fault("idiv_overflow", "idiv-overflow", true, true);
 }
 
 #[test]
-fn u2_pop_fault_preserves_stack_and_flags() {
-    support::bounded("u2_pop_fault_preserves_stack_and_flags", || {
+fn pop_fault_preserves_stack_and_flags() {
+    support::bounded("pop_fault_preserves_stack_and_flags", || {
         use paludarium_cpu::{CpuState, reg};
         use paludarium_mmu::{AddressSpace, MappingKind, Prot};
         use paludarium_types::{ExitReason, GuestAddr};
@@ -493,7 +493,7 @@ fn enter_fault(name: &'static str, allocation: bool) {
                 .unwrap()
                 .success()
         );
-        let scenario = if name == "u2_enter_word_fault" {
+        let scenario = if name == "enter_word_fault" {
             "enter-word"
         } else if allocation {
             "enter-allocation"
@@ -524,7 +524,7 @@ fn enter_fault(name: &'static str, allocation: bool) {
                 MappingKind::Anonymous,
             )
             .unwrap();
-        let bytes: &[u8] = if name == "u2_enter_word_fault" {
+        let bytes: &[u8] = if name == "enter_word_fault" {
             &[0x66, 0xc8, 24, 0, 6]
         } else if allocation {
             &[0xc8, 0, 0x20, 0]
@@ -558,15 +558,15 @@ fn enter_fault(name: &'static str, allocation: bool) {
     });
 }
 #[test]
-fn u2_enter_chain_fault() {
-    enter_fault("u2_enter_chain_fault", false);
+fn enter_chain_fault() {
+    enter_fault("enter_chain_fault", false);
 }
 #[test]
-fn u2_enter_allocation_fault() {
-    enter_fault("u2_enter_allocation_fault", true);
+fn enter_allocation_fault() {
+    enter_fault("enter_allocation_fault", true);
 }
 
 #[test]
-fn u2_enter_word_fault() {
-    enter_fault("u2_enter_word_fault", false);
+fn enter_word_fault() {
+    enter_fault("enter_word_fault", false);
 }

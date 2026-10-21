@@ -12,7 +12,7 @@ from supervisor import supervise  # noqa: E402
 
 os.environ["PALUDARIUM_U14_INSTRUCTION_CHILD"] = "1"
 result = supervise(
-    [sys.argv[1], "--exact", "u14_fresh_linux_instruction_differential", "--nocapture"],
+    [sys.argv[1], "--exact", "fresh_linux_instruction_differential", "--nocapture"],
     cwd=ROOT,
     seconds=30,
 )

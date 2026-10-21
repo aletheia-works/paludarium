@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 const DATA: u64 = 0x600000;
 #[test]
-fn u6_et_unread_write_during_host_wait() {
+fn et_unread_write_during_host_wait() {
     for socket in [false, true] {
         let mut f = Fixture::new();
         let (fd, writer) = if socket {
@@ -38,7 +38,7 @@ fn u6_et_unread_write_during_host_wait() {
     }
 }
 #[test]
-fn u6_pwait_handler_uses_temporary_mask_and_returns_original() {
+fn pwait_handler_uses_temporary_mask_and_returns_original() {
     for nodefer in [false, true] {
         let mut f = Fixture::new();
         let e = f.epoll();
@@ -81,7 +81,7 @@ fn u6_pwait_handler_uses_temporary_mask_and_returns_original() {
     }
 }
 #[test]
-fn u6_pwait_mask_restores_without_handler_for_masked_ignored_metadata() {
+fn pwait_mask_restores_without_handler_for_masked_ignored_metadata() {
     for mode in 0..3 {
         let mut f = Fixture::new();
         let e = f.epoll();
@@ -113,7 +113,7 @@ fn u6_pwait_mask_restores_without_handler_for_masked_ignored_metadata() {
     }
 }
 #[test]
-fn u6_tokio_musl_clone_accepts_ignored_detached_bit() {
+fn tokio_musl_clone_accepts_ignored_detached_bit() {
     let mut f = Fixture::new();
     let flags = 0x100
         | 0x200
@@ -136,7 +136,7 @@ fn u6_tokio_musl_clone_accepts_ignored_detached_bit() {
     assert_eq!(child.state.clear_child_tid, DATA + 40);
 }
 #[test]
-fn u6_blocking_socket_write_retries_after_host_entry_and_metadata() {
+fn blocking_socket_write_retries_after_host_entry_and_metadata() {
     use paludarium_host::FileHandle;
     for metadata in [false, true] {
         let mut f = Fixture::new();
@@ -170,7 +170,7 @@ fn u6_blocking_socket_write_retries_after_host_entry_and_metadata() {
     }
 }
 #[test]
-fn u6_tokio_getrandom_checked_host_boundary() {
+fn tokio_getrandom_checked_host_boundary() {
     let mut f = Fixture::new();
     assert_eq!(f.ret(318, [DATA, 16, 4, 0, 0, 0]), 16);
     let mut bytes = [1; 16];
@@ -297,7 +297,7 @@ impl Fixture {
 }
 
 #[test]
-fn u6_ofd_dup_keeps_interest() {
+fn ofd_dup_keeps_interest() {
     let mut f = Fixture::new();
     let fd = f.event(0);
     let dup = f.ret(32, [fd, 0, 0, 0, 0, 0]);
@@ -309,7 +309,7 @@ fn u6_ofd_dup_keeps_interest() {
     assert_eq!(f.data(), 11);
 }
 #[test]
-fn u6_ofd_last_close_removes_interest() {
+fn ofd_last_close_removes_interest() {
     let mut f = Fixture::new();
     let fd = f.event(1);
     let e = f.epoll();
@@ -318,7 +318,7 @@ fn u6_ofd_last_close_removes_interest() {
     assert_eq!(f.poll(e, 0), 0);
 }
 #[test]
-fn u6_ofd_reuse_is_new_description() {
+fn ofd_reuse_is_new_description() {
     let mut f = Fixture::new();
     let fd = f.event(1);
     let e = f.epoll();
@@ -332,7 +332,7 @@ fn u6_ofd_reuse_is_new_description() {
     assert_eq!(f.data(), 22);
 }
 #[test]
-fn u6_ofd_duplicates_register_separately() {
+fn ofd_duplicates_register_separately() {
     let mut f = Fixture::new();
     let fd = f.event(1);
     let dup = f.ret(32, [fd, 0, 0, 0, 0, 0]);
@@ -342,7 +342,7 @@ fn u6_ofd_duplicates_register_separately() {
     assert_eq!(f.poll(e, 0), 2);
 }
 #[test]
-fn u6_ofd_status_flags_are_shared() {
+fn ofd_status_flags_are_shared() {
     let mut f = Fixture::new();
     let fd = f.event(0);
     let dup = f.ret(32, [fd, 0, 0, 0, 0, 0]);
@@ -350,7 +350,7 @@ fn u6_ofd_status_flags_are_shared() {
     assert_eq!(f.ret(72, [fd, 3, 0, 0, 0, 0]), 2);
 }
 #[test]
-fn u6_ofd_cloexec_is_per_descriptor() {
+fn ofd_cloexec_is_per_descriptor() {
     let mut f = Fixture::new();
     let fd = f.ret(290, [0, 0x80800, 0, 0, 0, 0]);
     let dup = f.ret(32, [fd, 0, 0, 0, 0, 0]);
@@ -358,7 +358,7 @@ fn u6_ofd_cloexec_is_per_descriptor() {
     assert_eq!(f.ret(72, [dup, 1, 0, 0, 0, 0]), 0);
 }
 #[test]
-fn u6_ofd_clone_shared_table() {
+fn ofd_clone_shared_table() {
     let mut f = Fixture::new();
     let fd = f.event(1);
     let child = f.kernel.files.for_clone(true, false);
@@ -370,7 +370,7 @@ fn u6_ofd_clone_shared_table() {
     assert!(child.descriptor(fd).is_err());
 }
 #[test]
-fn u6_ofd_clone_copied_table_keeps_description() {
+fn ofd_clone_copied_table_keeps_description() {
     let mut f = Fixture::new();
     let fd = f.event(1);
     let child = f.kernel.files.for_clone(false, false);
@@ -381,7 +381,7 @@ fn u6_ofd_clone_copied_table_keeps_description() {
 }
 
 #[test]
-fn u6_integration_nested_epoll() {
+fn integration_nested_epoll() {
     let mut f = Fixture::new();
     let fd = f.event(1);
     let child = f.epoll();
@@ -392,7 +392,7 @@ fn u6_integration_nested_epoll() {
     assert_eq!(f.data(), 32);
 }
 #[test]
-fn u6_integration_guest_pointer_errors() {
+fn integration_guest_pointer_errors() {
     let mut f = Fixture::new();
     let fd = f.event(1);
     assert_eq!(
@@ -409,14 +409,14 @@ fn u6_integration_guest_pointer_errors() {
     );
 }
 #[test]
-fn u6_integration_epoll_timeout() {
+fn integration_epoll_timeout() {
     let mut f = Fixture::new();
     let e = f.epoll();
     assert_eq!(f.poll(e, 20), 0);
     assert_eq!(f.host.now.load(Ordering::SeqCst), 20_000_000);
 }
 #[test]
-fn u6_integration_timer_metadata_before_wait() {
+fn integration_timer_metadata_before_wait() {
     let mut f = Fixture::new();
     let inbox = Arc::new(SignalInbox::default());
     f.kernel = f.kernel.with_signal_inbox(Arc::clone(&inbox));
@@ -426,7 +426,7 @@ fn u6_integration_timer_metadata_before_wait() {
     assert_eq!(f.host.now.load(Ordering::SeqCst), 20_000_000);
 }
 #[test]
-fn u6_integration_metadata_during_wait() {
+fn integration_metadata_during_wait() {
     let mut f = Fixture::new();
     let inbox = Arc::new(SignalInbox::default());
     f.kernel = f.kernel.with_signal_inbox(Arc::clone(&inbox));
@@ -436,7 +436,7 @@ fn u6_integration_metadata_during_wait() {
     assert_eq!(f.host.now.load(Ordering::SeqCst), 20_000_000);
 }
 #[test]
-fn u6_integration_ready_before_host_registration() {
+fn integration_ready_before_host_registration() {
     let mut f = Fixture::new();
     let fd = f.event(0);
     let e = f.epoll();
@@ -450,7 +450,7 @@ fn u6_integration_ready_before_host_registration() {
     assert_eq!(f.data(), 12);
 }
 #[test]
-fn u6_integration_timer_signal_interrupts_wait() {
+fn integration_timer_signal_interrupts_wait() {
     let mut f = Fixture::new();
     let e = f.epoll();
     f.thread.cpu.gpr[reg::RSP] = DATA + 0x4000;
@@ -471,7 +471,7 @@ fn u6_integration_timer_signal_interrupts_wait() {
     assert_eq!(f.host.now.load(Ordering::SeqCst), 5_000_000);
 }
 #[test]
-fn u6_integration_policy_and_socket_transfer() {
+fn integration_policy_and_socket_transfer() {
     let mut f = Fixture::new();
     for domain in [2, 10] {
         assert_eq!(

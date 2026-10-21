@@ -336,7 +336,7 @@ impl HostFs for MountedFs {
     }
 }
 #[cfg(test)]
-mod u7_mount_tests {
+mod mount_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static ID: AtomicU64 = AtomicU64::new(0);
@@ -371,7 +371,7 @@ mod u7_mount_tests {
         }
     }
     #[test]
-    fn u7_mount_open_metadata() {
+    fn mount_open_metadata() {
         let x = Fixture::new();
         x.fs.open(b"/mnt/a", 66, 0o600)
             .unwrap()
@@ -381,7 +381,7 @@ mod u7_mount_tests {
         assert_eq!(&*x.fs.read_file(b"/mnt/a").unwrap(), b"value");
     }
     #[test]
-    fn u7_mount_directory_listing() {
+    fn mount_directory_listing() {
         let x = Fixture::new();
         assert!(
             x.fs.read_dir(b"/")
@@ -401,7 +401,7 @@ mod u7_mount_tests {
         x.fs.unlink(b"/mnt/d", true).unwrap();
     }
     #[test]
-    fn u7_mount_link_unlink() {
+    fn mount_link_unlink() {
         let x = Fixture::new();
         x.fs.open(b"/mnt/a", 66, 0o600).unwrap();
         x.fs.link(b"/mnt/a", b"/mnt/b").unwrap();
@@ -410,7 +410,7 @@ mod u7_mount_tests {
         assert_eq!(x.fs.metadata(b"/mnt/b", true).unwrap().links, 1);
     }
     #[test]
-    fn u7_mount_symlink() {
+    fn mount_symlink() {
         let x = Fixture::new();
         x.fs.open(b"/mnt/a", 66, 0o600).unwrap();
         x.fs.symlink(b"a", b"/mnt/s").unwrap();
@@ -422,7 +422,7 @@ mod u7_mount_tests {
         assert!(x.fs.metadata(b"/mnt/s", true).is_ok());
     }
     #[test]
-    fn u7_mount_rename() {
+    fn mount_rename() {
         let x = Fixture::new();
         x.fs.open(b"/mnt/a", 66, 0o600)
             .unwrap()
@@ -433,14 +433,14 @@ mod u7_mount_tests {
         assert_eq!(x.fs.metadata(b"/mnt/a", true), Err(Errno::ENOENT));
     }
     #[test]
-    fn u7_mount_cross_device() {
+    fn mount_cross_device() {
         let x = Fixture::new();
         x.fs.open(b"/a", 66, 0o600).unwrap();
         assert_eq!(x.fs.link(b"/a", b"/mnt/a"), Err(Errno(18)));
         assert_eq!(x.fs.rename(b"/a", b"/mnt/a"), Err(Errno(18)));
     }
     #[test]
-    fn u7_mount_duplicate() {
+    fn mount_duplicate() {
         let mut x = Fixture::new();
         assert_eq!(
             x.fs.mount(b"/mnt".to_vec(), Arc::new(MemFs::new())),
@@ -448,13 +448,13 @@ mod u7_mount_tests {
         );
     }
     #[test]
-    fn u7_mount_prefix_boundary() {
+    fn mount_prefix_boundary() {
         let x = Fixture::new();
         assert!(x.fs.open(b"/mntx/a", 66, 0o600).is_err());
         assert!(std::fs::read_dir(&x.root).unwrap().next().is_none());
     }
     #[test]
-    fn u7_mount_private_to_host_link() {
+    fn mount_private_to_host_link() {
         let x = Fixture::new();
         x.fs.open(b"/mnt/a", 66, 0o600)
             .unwrap()
@@ -464,7 +464,7 @@ mod u7_mount_tests {
         assert_eq!(&*x.fs.read_file(b"/s").unwrap(), b"host");
     }
     #[test]
-    fn u7_mount_host_to_private_link() {
+    fn mount_host_to_private_link() {
         let x = Fixture::new();
         x.fs.open(b"/a", 66, 0o600)
             .unwrap()
@@ -476,7 +476,7 @@ mod u7_mount_tests {
         assert_eq!(x.fs.metadata(b"/mnt/s", false).unwrap().size, 2);
     }
     #[test]
-    fn u7_mount_link_dotdot_namespace() {
+    fn mount_link_dotdot_namespace() {
         let x = Fixture::new();
         x.fs.mkdir(b"/mnt/d", 0o700).unwrap();
         x.fs.open(b"/mnt/a", 66, 0o600)
@@ -487,14 +487,14 @@ mod u7_mount_tests {
         assert_eq!(&*x.fs.read_file(b"/s/../a").unwrap(), b"a");
     }
     #[test]
-    fn u7_mount_cross_namespace_loop() {
+    fn mount_cross_namespace_loop() {
         let x = Fixture::new();
         x.fs.symlink(b"/mnt/s", b"/s").unwrap();
         x.fs.symlink(b"/s", b"/mnt/s").unwrap();
         assert_eq!(x.fs.metadata(b"/s", true), Err(Errno(40)));
     }
     #[test]
-    fn u7_mount_link_lifetime() {
+    fn mount_link_lifetime() {
         let x = Fixture::new();
         x.fs.symlink(b"/a", b"/mnt/s").unwrap();
         x.fs.link(b"/mnt/s", b"/mnt/t").unwrap();
@@ -505,7 +505,7 @@ mod u7_mount_tests {
         assert!(lock(&x.fs.targets).is_empty());
     }
     #[test]
-    fn u7_mount_relative_link_after_rename() {
+    fn mount_relative_link_after_rename() {
         let x = Fixture::new();
         x.fs.mkdir(b"/mnt/d", 0o700).unwrap();
         x.fs.mkdir(b"/mnt/e", 0o700).unwrap();
@@ -522,7 +522,7 @@ mod u7_mount_tests {
         );
     }
     #[test]
-    fn u7_mount_root_private_preload() {
+    fn mount_root_private_preload() {
         let x = Fixture::new();
         std::fs::write(x.root.join("program"), b"host").unwrap();
         let base = MemFs::new();
@@ -546,7 +546,7 @@ mod u7_mount_tests {
         );
     }
     #[test]
-    fn u7_mount_private_nested_preload() {
+    fn mount_private_nested_preload() {
         let x = Fixture::new();
         let base = MemFs::new();
         base.mkdir(b"/d", 0o700).unwrap();

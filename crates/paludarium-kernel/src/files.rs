@@ -220,7 +220,7 @@ fn linux_mtime(ns: i128) -> Result<(i64, u64), Errno> {
 mod mtime_tests {
     use super::*;
     #[test]
-    fn u7_mtime_stat_codec_signed_boundaries() {
+    fn mtime_stat_codec_signed_boundaries() {
         for (ns, seconds, nanos) in [
             (-1_000_000_000, -1i64, 0u64),
             (-500_000_000, -1, 500_000_000),
@@ -240,7 +240,7 @@ mod mtime_tests {
         }
     }
     #[test]
-    fn u7_mtime_stat_codec_checked_seconds_overflow() {
+    fn mtime_stat_codec_checked_seconds_overflow() {
         for ns in [
             i128::MIN,
             i128::MAX,
@@ -795,54 +795,54 @@ mod files_tests {
         }
     }
     #[test]
-    fn u7_fd_allocate() {
+    fn fd_allocate() {
         let fs = MemFs::new();
         let mut f = Files::default();
         assert_eq!(f.allocate(d(&fs, b"/a"), 3), Ok(3));
         assert_eq!(f.allocate(d(&fs, b"/b"), 3), Ok(4));
     }
     #[test]
-    fn u7_fd_minimum() {
+    fn fd_minimum() {
         let fs = MemFs::new();
         assert_eq!(Files::default().allocate(d(&fs, b"/a"), 20), Ok(20));
     }
     #[test]
-    fn u7_fd_bad() {
+    fn fd_bad() {
         assert!(matches!(
             Files::default().descriptor(100),
             Err(Errno::EBADF)
         ));
     }
     #[test]
-    fn u7_fd_relative() {
+    fn fd_relative() {
         assert_eq!(
             Files::default().path((-100i32) as u64, b"a".to_vec()),
             Ok(b"/a".to_vec())
         );
     }
     #[test]
-    fn u7_fd_absolute_ignores_bad_dir() {
+    fn fd_absolute_ignores_bad_dir() {
         assert_eq!(
             Files::default().path(999, b"/a".to_vec()),
             Ok(b"/a".to_vec())
         );
     }
     #[test]
-    fn u7_fd_empty() {
+    fn fd_empty() {
         assert_eq!(
             Files::default().path((-100i32) as u64, vec![]),
             Err(Errno::ENOENT)
         );
     }
     #[test]
-    fn u7_fd_directory_type() {
+    fn fd_directory_type() {
         let fs = MemFs::new();
         let mut f = Files::default();
         f.allocate(d(&fs, b"/a"), 3).unwrap();
         assert_eq!(f.path(3, b"b".to_vec()), Err(Errno::ENOTDIR));
     }
     #[test]
-    fn u7_fd_shared_offset() {
+    fn fd_shared_offset() {
         let fs = MemFs::new();
         let x = d(&fs, b"/a");
         x.file.write(b"abc").unwrap();

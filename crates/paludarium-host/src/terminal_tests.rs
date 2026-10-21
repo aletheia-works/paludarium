@@ -1,14 +1,14 @@
 use super::*;
 use testing::RecordingHost;
 #[test]
-fn u9_default_is_nonterminal() {
+fn default_is_nonterminal() {
     let host = RecordingHost::new();
     for stream in [StreamId::Stdin, StreamId::Stdout, StreamId::Stderr] {
         assert_eq!(host.terminal_info(stream), Ok(None));
     }
 }
 #[test]
-fn u9_terminal_streams_are_independent() {
+fn terminal_streams_are_independent() {
     let host = RecordingHost::new();
     let tty = TerminalInfo {
         columns: 101,
@@ -21,21 +21,21 @@ fn u9_terminal_streams_are_independent() {
     assert_eq!(host.terminal_info(StreamId::Stderr), Ok(None));
 }
 #[test]
-fn u9_terminal_can_be_removed() {
+fn terminal_can_be_removed() {
     let host = RecordingHost::new();
     host.set_terminal_info(StreamId::Stderr, Some(TerminalInfo::default()));
     host.set_terminal_info(StreamId::Stderr, None);
     assert_eq!(host.terminal_info(StreamId::Stderr), Ok(None));
 }
 #[test]
-fn u9_zero_dimensions_remain_terminal() {
+fn zero_dimensions_remain_terminal() {
     let host = RecordingHost::new();
     host.set_terminal_info(StreamId::Stdout, Some(TerminalInfo::default()));
     let info = host.terminal_info(StreamId::Stdout).unwrap().unwrap();
     assert_eq!((info.columns, info.rows), (0, 0));
 }
 #[test]
-fn u9_attributes_preserve_control_characters() {
+fn attributes_preserve_control_characters() {
     let host = RecordingHost::new();
     let mut info = TerminalInfo::default();
     info.attributes.control_chars[18] = 91;
@@ -44,7 +44,7 @@ fn u9_attributes_preserve_control_characters() {
     assert_eq!(host.terminal_info(StreamId::Stdin), Ok(Some(info)));
 }
 #[test]
-fn u9_short_stdin_and_eof() {
+fn short_stdin_and_eof() {
     let host = RecordingHost::with_stdin(b"abc");
     let mut b = [0; 8];
     assert_eq!(host.read_stdin(&mut b), Ok(3));
@@ -53,7 +53,7 @@ fn u9_short_stdin_and_eof() {
     assert_eq!(host.read_stdin(&mut []), Ok(0));
 }
 #[test]
-fn u9_stdout_stderr_remain_separate() {
+fn stdout_stderr_remain_separate() {
     let host = RecordingHost::new();
     assert_eq!(host.write_stdout(b"out"), Ok(3));
     assert_eq!(host.write_stderr(b"err"), Ok(3));
@@ -62,7 +62,7 @@ fn u9_stdout_stderr_remain_separate() {
 }
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn u9_native_managed_pty() {
+fn native_managed_pty() {
     if std::env::var_os("PALUDARIUM_U9_HOST_CHILD").is_some() {
         let info = NativeHost.terminal_info(StreamId::Stdin).unwrap().unwrap();
         assert_eq!((info.rows, info.columns), (37, 101));

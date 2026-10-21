@@ -240,19 +240,19 @@ mod tests {
         c
     }
     #[test]
-    fn u14_chain_empty_stop_has_no_invented_block() {
+    fn chain_empty_stop_has_no_invented_block() {
         let c = observe(0, Counter::StopFallback);
         assert_eq!(c.get(Counter::StopFallback as usize), Some(1));
         assert_eq!(c.get(Counter::ChainLength1 as usize), Some(0));
     }
     #[test]
-    fn u14_chain_one_block_unsupported_stop() {
+    fn chain_one_block_unsupported_stop() {
         let c = observe(1, Counter::StopUnsupported);
         assert_eq!(c.get(Counter::ChainLength1 as usize), Some(1));
         assert_eq!(c.get(Counter::StopUnsupported as usize), Some(1));
     }
     #[test]
-    fn u14_chain_exact_two_and_three() {
+    fn chain_exact_two_and_three() {
         for (length, field) in [(2, Counter::ChainLength2), (3, Counter::ChainLength3)] {
             assert_eq!(
                 observe(length, Counter::StopNegative).get(field as usize),
@@ -261,7 +261,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_chain_bounded_histogram_four_to_seven() {
+    fn chain_bounded_histogram_four_to_seven() {
         for length in 4..=7 {
             assert_eq!(
                 observe(length, Counter::StopBudget).get(Counter::ChainLength4to7 as usize),
@@ -270,14 +270,14 @@ mod tests {
         }
     }
     #[test]
-    fn u14_chain_long_run_aggregates_without_executing_extra_blocks() {
+    fn chain_long_run_aggregates_without_executing_extra_blocks() {
         assert_eq!(
             observe(1000, Counter::StopBudget).get(Counter::ChainLength8plus as usize),
             Some(1)
         );
     }
     #[test]
-    fn u14_chain_epoch_change_flushes_previous_chain() {
+    fn chain_epoch_change_flushes_previous_chain() {
         let c = Collector::new();
         let mut chain = Chain::default();
         chain.success(1, |f, v| {
@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(c.get(Counter::StopEpoch as usize), Some(1));
     }
     #[test]
-    fn u14_chain_interpreter_break_cannot_join_later_blocks() {
+    fn chain_interpreter_break_cannot_join_later_blocks() {
         let c = Collector::new();
         let mut chain = Chain::default();
         for _ in 0..2 {
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(c.get(Counter::ChainLength2 as usize), Some(0));
     }
     #[test]
-    fn u14_chain_exit_flush_is_not_duplicated() {
+    fn chain_exit_flush_is_not_duplicated() {
         let c = Collector::new();
         let mut chain = Chain::default();
         chain.success(1, |f, v| {

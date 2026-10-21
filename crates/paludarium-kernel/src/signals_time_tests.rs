@@ -1,5 +1,5 @@
 #[test]
-fn u4_memory_shared_anonymous_rounds_length() {
+fn memory_shared_anonymous_rounds_length() {
     let mut f = fixture();
     let at = 0x6000_0000;
     assert_eq!(
@@ -12,7 +12,7 @@ fn u4_memory_shared_anonymous_rounds_length() {
     assert_eq!(byte, [42]);
 }
 #[test]
-fn u4_memory_hint_rounds_down() {
+fn memory_hint_rounds_down() {
     let mut f = fixture();
     assert_eq!(
         f.ret(
@@ -23,13 +23,13 @@ fn u4_memory_hint_rounds_down() {
     );
 }
 #[test]
-fn u4_memory_prot_sem_accepted() {
+fn memory_prot_sem_accepted() {
     let mut f = fixture();
     assert_eq!(f.ret(syscalls::nr::MPROTECT, &[DATA, 4096, 8]), 0);
     assert!(f.mem.read(GuestAddr(DATA), &mut [0]).is_err());
 }
 #[test]
-fn u4_memory_noreplace_preserves_bytes() {
+fn memory_noreplace_preserves_bytes() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), &[41]).unwrap();
     assert_eq!(
@@ -41,7 +41,7 @@ fn u4_memory_noreplace_preserves_bytes() {
     assert_eq!(byte, [41]);
 }
 #[test]
-fn u4_memory_fixed_overflow_preserves_bytes() {
+fn memory_fixed_overflow_preserves_bytes() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), &[41]).unwrap();
     assert_eq!(
@@ -53,7 +53,7 @@ fn u4_memory_fixed_overflow_preserves_bytes() {
     assert_eq!(byte, [41]);
 }
 #[test]
-fn u4_memory_zero_length_rejected() {
+fn memory_zero_length_rejected() {
     let mut f = fixture();
     assert_eq!(
         f.ret(syscalls::nr::MMAP, &[0, 0, 3, 0x22, u64::MAX, 0]),
@@ -65,7 +65,7 @@ fn u4_memory_zero_length_rejected() {
     );
 }
 #[test]
-fn u4_memory_fixed_replacement_zero_fills() {
+fn memory_fixed_replacement_zero_fills() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), &[41]).unwrap();
     assert_eq!(
@@ -77,7 +77,7 @@ fn u4_memory_fixed_replacement_zero_fills() {
     assert_eq!(byte, [0]);
 }
 #[test]
-fn u4_memory_brk_failure_returns_current() {
+fn memory_brk_failure_returns_current() {
     let mut f = fixture();
     assert_eq!(f.ret(syscalls::nr::BRK, &[u64::MAX]), 0x20_0000);
 }
@@ -89,7 +89,7 @@ fn timespec(f: &mut Fixture, sec: i64, nsec: i64) {
         .unwrap();
 }
 #[test]
-fn u4_time_clock_serialization() {
+fn time_clock_serialization() {
     let mut f = fixture();
     f.host
         .set_clock(paludarium_host::ClockId::Monotonic, 2_000_000_007);
@@ -98,7 +98,7 @@ fn u4_time_clock_serialization() {
     assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 7);
 }
 #[test]
-fn u4_time_bad_clock() {
+fn time_bad_clock() {
     let mut f = fixture();
     assert_eq!(
         f.ret(syscalls::nr::CLOCK_GETTIME, &[u64::MAX, DATA]),
@@ -106,7 +106,7 @@ fn u4_time_bad_clock() {
     );
 }
 #[test]
-fn u4_time_bad_pointer() {
+fn time_bad_pointer() {
     let mut f = fixture();
     assert_eq!(
         f.ret(syscalls::nr::CLOCK_GETTIME, &[1, 1]),
@@ -114,7 +114,7 @@ fn u4_time_bad_pointer() {
     );
 }
 #[test]
-fn u4_time_negative_seconds() {
+fn time_negative_seconds() {
     let mut f = fixture();
     timespec(&mut f, -1, 0);
     assert_eq!(
@@ -123,7 +123,7 @@ fn u4_time_negative_seconds() {
     );
 }
 #[test]
-fn u4_time_nanoseconds_range() {
+fn time_nanoseconds_range() {
     let mut f = fixture();
     timespec(&mut f, 0, 1_000_000_000);
     assert_eq!(
@@ -132,7 +132,7 @@ fn u4_time_nanoseconds_range() {
     );
 }
 #[test]
-fn u4_time_relative_deadline() {
+fn time_relative_deadline() {
     let mut f = fixture();
     f.host.set_clock(paludarium_host::ClockId::Monotonic, 100);
     timespec(&mut f, 0, 42);
@@ -140,7 +140,7 @@ fn u4_time_relative_deadline() {
     assert_eq!(f.host.clock(paludarium_host::ClockId::Monotonic), Ok(142));
 }
 #[test]
-fn u4_time_absolute_deadline() {
+fn time_absolute_deadline() {
     let mut f = fixture();
     f.host.set_clock(paludarium_host::ClockId::Monotonic, 100);
     timespec(&mut f, 0, 42);
@@ -151,7 +151,7 @@ fn u4_time_absolute_deadline() {
     assert_eq!(f.host.clock(paludarium_host::ClockId::Monotonic), Ok(100));
 }
 #[test]
-fn u4_time_interrupt_remaining() {
+fn time_interrupt_remaining() {
     let mut f = fixture();
     timespec(&mut f, 2, 42);
     f.host.interrupt_next_wait();
@@ -180,7 +180,7 @@ impl paludarium_host::Host for InterruptedWriteHost {
 }
 
 #[test]
-fn u4_signal_write_restart_frame_matches_native_context() {
+fn signal_write_restart_frame_matches_native_context() {
     // Native write-restart-oracle: no restart (-4, after); restart (1, site).
     for (flags, expected_rax, expected_rip) in
         [(0, (-4i64) as u64, 0x400002), (0x10000000, 1, 0x400000)]
@@ -229,7 +229,7 @@ fn signal_fixture() -> Fixture {
     f
 }
 #[test]
-fn u4_signal_blocked_queue_delivers_after_unmask() {
+fn signal_blocked_queue_delivers_after_unmask() {
     let mut f = signal_fixture();
     f.thread.state.signal_mask = 1 << 9;
     f.kernel.queue_signal(&mut f.thread, 10).unwrap();
@@ -240,14 +240,14 @@ fn u4_signal_blocked_queue_delivers_after_unmask() {
     assert_eq!(f.thread.cpu.rip, GuestAddr(0x400100));
 }
 #[test]
-fn u4_signal_standard_queue_coalesces() {
+fn signal_standard_queue_coalesces() {
     let mut f = signal_fixture();
     f.kernel.queue_signal(&mut f.thread, 10).unwrap();
     f.kernel.queue_signal(&mut f.thread, 10).unwrap();
     assert_eq!(f.thread.state.pending.len(), 1);
 }
 #[test]
-fn u4_signal_frame_fault_does_not_change_registers_or_memory() {
+fn signal_frame_fault_does_not_change_registers_or_memory() {
     let mut f = signal_fixture();
     f.thread.cpu.gpr[reg::RSP] = 0x70000000;
     let before = f.thread.cpu.clone();
@@ -261,7 +261,7 @@ fn u4_signal_frame_fault_does_not_change_registers_or_memory() {
     assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 41);
 }
 #[test]
-fn u4_signal_return_preserves_registers_sse_and_mask() {
+fn signal_return_preserves_registers_sse_and_mask() {
     let mut f = signal_fixture();
     f.thread.cpu.gpr[reg::R12] = 77;
     f.thread.cpu.xmm[3] = 0x123456789;
@@ -277,7 +277,7 @@ fn u4_signal_return_preserves_registers_sse_and_mask() {
     assert_eq!(f.thread.state.signal_mask, 1 << 11);
 }
 #[test]
-fn u4_signal_frame_ignores_privileged_flag_edits() {
+fn signal_frame_ignores_privileged_flag_edits() {
     let mut f = signal_fixture();
     let flags = f.thread.cpu.rflags;
     f.kernel.queue_signal(&mut f.thread, 10).unwrap();
@@ -291,7 +291,7 @@ fn u4_signal_frame_ignores_privileged_flag_edits() {
     assert_eq!(f.thread.cpu.rflags & (3 << 12), flags & (3 << 12));
 }
 #[test]
-fn u4_signal_bad_fp_pointer_rejects_context() {
+fn signal_bad_fp_pointer_rejects_context() {
     let mut f = signal_fixture();
     f.kernel.queue_signal(&mut f.thread, 10).unwrap();
     f.kernel.checkpoint(&mut f.thread, &f.mem);
@@ -306,7 +306,7 @@ fn u4_signal_bad_fp_pointer_rejects_context() {
     );
 }
 #[test]
-fn u4_signal_timer_periodic_coalesces_and_advances() {
+fn signal_timer_periodic_coalesces_and_advances() {
     let mut f = signal_fixture();
     f.thread.state.timer = signals::RealTimer {
         deadline: Some(10),
@@ -319,7 +319,7 @@ fn u4_signal_timer_periodic_coalesces_and_advances() {
     assert_eq!(f.thread.state.pending.len(), 1);
 }
 #[test]
-fn u4_signal_realtime_queue_has_no_invented_quota() {
+fn signal_realtime_queue_has_no_invented_quota() {
     let mut f = signal_fixture();
     for _ in 0..2048 {
         f.kernel.queue_signal(&mut f.thread, 32).unwrap();
@@ -333,7 +333,7 @@ fn u4_signal_realtime_queue_has_no_invented_quota() {
 }
 
 #[test]
-fn u4_signal_realtime_selection_keeps_fifo_and_masks() {
+fn signal_realtime_selection_keeps_fifo_and_masks() {
     let mut f = signal_fixture();
     // Native same-process kill then sigqueue yielded si_code 0 then -1.
     signals::queue(&mut f.thread.state, signals::PendingSignal::user(36, 0));
@@ -350,7 +350,7 @@ fn u4_signal_realtime_selection_keeps_fifo_and_masks() {
 }
 
 #[test]
-fn u4_signal_pending_targets_keep_number_order_fifo_and_coalescing() {
+fn signal_pending_targets_keep_number_order_fifo_and_coalescing() {
     let mut f = signal_fixture();
     for pending in [
         signals::PendingSignal::user(35, 0),
@@ -395,7 +395,7 @@ fn u4_signal_pending_targets_keep_number_order_fifo_and_coalescing() {
 }
 
 #[test]
-fn u4_signal_synchronous_fault_selects_thread_pending_queue() {
+fn signal_synchronous_fault_selects_thread_pending_queue() {
     let mut f = signal_fixture();
     let action = f.thread.state.signal_actions[&10];
     f.thread.state.signal_actions.insert(8, action);
@@ -423,7 +423,7 @@ fn u4_signal_synchronous_fault_selects_thread_pending_queue() {
 }
 
 #[test]
-fn u4_signal_thread_target_restart_preview_matches_delivery() {
+fn signal_thread_target_restart_preview_matches_delivery() {
     for restart in [false, true] {
         let mut f = fixture();
         f.kernel = Kernel::new(Arc::new(InterruptedWriteHost));
@@ -464,7 +464,7 @@ fn u4_signal_thread_target_restart_preview_matches_delivery() {
 }
 
 #[test]
-fn u4_signal_restart_preview_uses_selected_realtime_handler() {
+fn signal_restart_preview_uses_selected_realtime_handler() {
     for restart in [false, true] {
         let mut f = fixture();
         f.kernel = Kernel::new(Arc::new(InterruptedWriteHost));
@@ -501,7 +501,7 @@ fn u4_signal_restart_preview_uses_selected_realtime_handler() {
     }
 }
 #[test]
-fn u4_signal_rep_budget_context_roundtrip() {
+fn signal_rep_budget_context_roundtrip() {
     let mut f = signal_fixture();
     f.mem
         .map(
@@ -529,7 +529,7 @@ fn u4_signal_rep_budget_context_roundtrip() {
     assert_eq!(f.thread.cpu, before);
 }
 #[test]
-fn u4_signal_changed_rep_return_discards_continuation() {
+fn signal_changed_rep_return_discards_continuation() {
     let mut f = signal_fixture();
     f.mem
         .map(
@@ -557,7 +557,7 @@ fn u4_signal_changed_rep_return_discards_continuation() {
     assert!(f.thread.cpu.repeat_continuation.is_none());
 }
 #[test]
-fn u4_signal_nested_altstack_frames_do_not_overlap() {
+fn signal_nested_altstack_frames_do_not_overlap() {
     let mut f = signal_fixture();
     f.thread.state.alt_stack = AltStack {
         sp: DATA,
@@ -583,7 +583,7 @@ fn u4_signal_nested_altstack_frames_do_not_overlap() {
     assert_eq!(f.thread.cpu.gpr[reg::RSP], DATA + 8192);
 }
 #[test]
-fn u4_default_stop_is_not_process_termination() {
+fn default_stop_is_not_process_termination() {
     for number in [19, 20] {
         let mut f = fixture();
         let before = f.thread.cpu.clone();
@@ -601,7 +601,7 @@ fn u4_default_stop_is_not_process_termination() {
     }
 }
 #[test]
-fn u4_blocked_tstp_defers_stop_until_unmask() {
+fn blocked_tstp_defers_stop_until_unmask() {
     let mut f = fixture();
     f.thread.state.signal_mask = 1 << 19;
     f.kernel.queue_signal(&mut f.thread, 20).unwrap();

@@ -31,7 +31,7 @@ fn case(name_arg: &'static str, id: usize) {
         let path = out.join(&name);
         let native = run_native(&path, &name, &[]).unwrap();
         println!("native {id}: {:?} {:02x?}", native.status, native.stdout);
-        let (emulated, stop) = if name_arg.starts_with("u7_host_") {
+        let (emulated, stop) = if name_arg.starts_with("host_") {
             run_mounted(&path, &name)
         } else {
             run_emulated(&path, &name, &[]).unwrap()
@@ -44,8 +44,8 @@ fn case(name_arg: &'static str, id: usize) {
     });
 }
 macro_rules! cases {($($name:ident=>$id:literal),*)=>{$(#[test]fn $name(){case(stringify!($name),$id);})*};}
-cases!(u7_trailing_operations=>32,u7_host_trailing_operations=>32);
-cases!(u7_null_stat=>0,u7_null_lstat=>1,u7_null_statat=>2,u7_read_write=>3,u7_hard_link=>4,u7_symlink=>5,u7_rename=>6,u7_flock=>7,u7_fstat_errors=>8,u7_unlink_open=>9,u7_dup_offset=>10,u7_open_errors=>11,u7_directory=>12,u7_getdents=>13,u7_at_operations=>14,u7_symlinkat=>15,u7_statat_flags=>16,u7_truncate=>17,u7_fcntl=>18,u7_dangling=>19,u7_empty_path=>20,u7_create_dangling=>21,u7_renamed_dirfd=>22,u7_closed_stdio=>23,u7_redirect_stdout=>24,u7_dup_stdout=>25,u7_flock_dup_close=>26,u7_append_fcntl=>27,u7_huge_invalid_buffer=>28,u7_directory_link_count=>29,u7_rename_replace=>30,u7_readonly_create=>31);
+cases!(trailing_operations=>32,host_trailing_operations=>32);
+cases!(null_stat=>0,null_lstat=>1,null_statat=>2,read_write=>3,files_hard_link=>4,files_symlink=>5,files_rename=>6,files_flock=>7,fstat_errors=>8,unlink_open=>9,dup_offset=>10,open_errors=>11,files_directory=>12,getdents=>13,at_operations=>14,symlinkat=>15,statat_flags=>16,files_truncate=>17,fcntl=>18,files_dangling=>19,empty_path=>20,create_dangling=>21,renamed_dirfd=>22,closed_stdio=>23,redirect_stdout=>24,dup_stdout=>25,flock_dup_close=>26,append_fcntl=>27,huge_invalid_buffer=>28,directory_link_count=>29,rename_replace=>30,files_readonly_create=>31);
 
 use paludarium_host::{ClockId, Host, WaitOutcome, testing::RecordingHost};
 struct MountedHost {
@@ -113,11 +113,11 @@ fn run_mounted(
     std::fs::remove_dir_all(root).unwrap();
     (out, stop)
 }
-cases!(u7_host_read_write=>3,u7_host_hard_link=>4,u7_host_symlink=>5,u7_host_rename=>6,u7_host_flock=>7,u7_host_fstat_errors=>8,u7_host_unlink_open=>9,u7_host_dup_offset=>10,u7_host_open_errors=>11,u7_host_directory=>12,u7_host_getdents=>13,u7_host_at_operations=>14,u7_host_symlinkat=>15,u7_host_statat_flags=>16,u7_host_truncate=>17,u7_host_fcntl=>18,u7_host_dangling=>19,u7_host_empty_path=>20,u7_host_create_dangling=>21,u7_host_renamed_dirfd=>22,u7_host_closed_stdio=>23,u7_host_redirect_stdout=>24,u7_host_dup_stdout=>25,u7_host_flock_dup_close=>26,u7_host_append_fcntl=>27,u7_host_huge_invalid_buffer=>28,u7_host_directory_link_count=>29,u7_host_rename_replace=>30,u7_host_readonly_create=>31);
+cases!(host_read_write=>3,host_hard_link=>4,host_symlink=>5,host_rename=>6,host_flock=>7,host_fstat_errors=>8,host_unlink_open=>9,host_dup_offset=>10,host_open_errors=>11,host_directory=>12,host_getdents=>13,host_at_operations=>14,host_symlinkat=>15,host_statat_flags=>16,host_truncate=>17,host_fcntl=>18,host_dangling=>19,host_empty_path=>20,host_create_dangling=>21,host_renamed_dirfd=>22,host_closed_stdio=>23,host_redirect_stdout=>24,host_dup_stdout=>25,host_flock_dup_close=>26,host_append_fcntl=>27,host_huge_invalid_buffer=>28,host_directory_link_count=>29,host_rename_replace=>30,host_readonly_create=>31);
 
 #[test]
-fn u7_host_signed_mtime_stat_fstat() {
-    let name = "u7_host_signed_mtime_stat_fstat";
+fn host_signed_mtime_stat_fstat() {
+    let name = "host_signed_mtime_stat_fstat";
     let out = workspace_root().join("target/guests/files");
     assert!(
         std::process::Command::new("bash")

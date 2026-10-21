@@ -249,7 +249,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn u14_block_extracts_observed_mov64() {
+    fn block_extracts_observed_mov64() {
         let block = extract(
             &[
                 0x48, 0xb8, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 1, 0xc3,
@@ -267,13 +267,13 @@ mod tests {
         assert_eq!(block.end, 4106);
     }
     #[test]
-    fn u14_block_stops_before_guest_memory() {
+    fn block_stops_before_guest_memory() {
         assert!(extract(&[0x48, 0x8b, 7], 4096).is_none());
         let block = extract(&[0xb8, 42, 0, 0, 0, 0x48, 0x8b, 7], 4096).unwrap();
         assert_eq!(block.end, 4101);
     }
     #[test]
-    fn u14_block_stops_before_syscall() {
+    fn block_stops_before_syscall() {
         assert!(extract(&[0x0f, 5], 4096).is_none());
         assert_eq!(
             extract(&[0xb8, 42, 0, 0, 0, 0x0f, 5], 4096).unwrap().end,
@@ -281,11 +281,11 @@ mod tests {
         );
     }
     #[test]
-    fn u14_block_rejects_partial_decode() {
+    fn block_rejects_partial_decode() {
         assert!(extract(&[0x48, 0xb8, 1], 4096).is_none());
     }
     #[test]
-    fn u14_block_observed_arithmetic_and_branch_terminate_block() {
+    fn block_observed_arithmetic_and_branch_terminate_block() {
         let block = extract(&[0x48, 0x83, 0xf8, 7, 0x75, 6, 0xb8, 42, 0, 0, 0], 4096).unwrap();
         assert_eq!(block.operations.len(), 2);
         assert_eq!(
@@ -298,14 +298,14 @@ mod tests {
         );
     }
     #[test]
-    fn u14_block_bounds_instruction_count() {
+    fn block_bounds_instruction_count() {
         let code = [0xb8, 42, 0, 0, 0].repeat(100);
         let block = extract(&code, 4096).unwrap();
         assert_eq!(block.operations.len(), 64);
         assert_eq!(block.end - block.entry, 320);
     }
     #[test]
-    fn u14_block_unsupported_sse_is_clean_fallback() {
+    fn block_unsupported_sse_is_clean_fallback() {
         // PXOR xmm0, [rdi] (memory operand) and VEX VPXOR stay interpreted.
         assert!(extract(&[0x66, 0x0f, 0xef, 0x07], 4096).is_none());
         assert!(extract(&[0xc5, 0xf9, 0xef, 0xc0], 4096).is_none());
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_block_sse_binary_register_forms_are_accepted() {
+    fn block_sse_binary_register_forms_are_accepted() {
         let forms: [(&[u8], Vector); 9] = [
             (&[0x66, 0x0f, 0x6f, 0xc1], Vector::Move),
             (&[0x66, 0x0f, 0xdb, 0xc1], Vector::And),
@@ -343,7 +343,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_block_sse_movdqa_store_register_form_keeps_intel_order() {
+    fn block_sse_movdqa_store_register_form_keeps_intel_order() {
         // 66 0F 7F /r with mod=3: ModRM.rm (xmm2) is the destination.
         assert_eq!(
             vector_of(&[0x66, 0x0f, 0x7f, 0xda]),
@@ -351,7 +351,7 @@ mod tests {
         );
     }
     #[test]
-    fn u14_block_sse_rex_selects_high_registers() {
+    fn block_sse_rex_selects_high_registers() {
         assert_eq!(
             vector_of(&[0x66, 0x45, 0x0f, 0xdb, 0xd7]),
             vector(Vector::And, 10, 15)
@@ -362,7 +362,7 @@ mod tests {
         );
     }
     #[test]
-    fn u14_block_sse_every_pshufd_imm8_is_kept() {
+    fn block_sse_every_pshufd_imm8_is_kept() {
         for selector in 0..=255u8 {
             assert_eq!(
                 vector_of(&[0x66, 0x0f, 0x70, 0xc1, selector]),
@@ -371,7 +371,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_block_sse_shift_immediates_include_large_counts() {
+    fn block_sse_shift_immediates_include_large_counts() {
         for count in [0u8, 1, 31, 32, 255] {
             assert_eq!(
                 vector_of(&[0x66, 0x0f, 0x72, 0xf3, count]),
@@ -384,7 +384,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_block_sse_non_register_and_prefixed_forms_fall_back() {
+    fn block_sse_non_register_and_prefixed_forms_fall_back() {
         let rejected: [&[u8]; 12] = [
             &[0x66, 0x0f, 0xfe, 0x07],       // PADDD xmm0, [rdi]
             &[0x66, 0x0f, 0x70, 0x07, 0x1b], // PSHUFD xmm0, [rdi], imm8
@@ -411,7 +411,7 @@ mod tests {
         }
     }
     #[test]
-    fn u14_block_sse_mixes_with_gpr_forms_and_stops_at_unsupported() {
+    fn block_sse_mixes_with_gpr_forms_and_stops_at_unsupported() {
         // mov ecx,4; paddd; pshufd; sub ecx,1 (32-bit, unsupported)
         let block = extract(
             &[
@@ -433,7 +433,7 @@ mod tests {
         );
     }
     #[test]
-    fn u14_block_sse_encoding_check_rejects_truncated_lengths() {
+    fn block_sse_encoding_check_rejects_truncated_lengths() {
         assert!(!legacy_sse_encoding(
             &[0x66, 0x0f, 0xfe],
             4,
@@ -452,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_block_saved_jit_compile_crash_translates_without_panic() {
+    fn block_saved_jit_compile_crash_translates_without_panic() {
         // Original jit_compile crash 4dabc170d4fa7cd3…: eight-byte RIP
         // header followed by decoder input. This finite regression checks
         // the saved input, not a replacement for the sanitizer campaign.

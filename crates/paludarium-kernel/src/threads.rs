@@ -558,7 +558,7 @@ impl Kernel {
 }
 
 #[cfg(test)]
-mod u8_exec_thread_tests {
+mod exec_thread_tests {
     use super::*;
     fn group() -> ThreadGroup {
         let group = ThreadGroup::default();

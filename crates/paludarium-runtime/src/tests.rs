@@ -27,7 +27,7 @@ fn runs_a_program_to_exit_and_captures_output() {
 }
 
 #[test]
-fn u14_runtime_cache_fallback_preserves_syscall_output_and_exit() {
+fn runtime_cache_fallback_preserves_syscall_output_and_exit() {
     struct Fallback(std::sync::atomic::AtomicUsize);
     impl CodeCache for Fallback {
         fn try_run(
@@ -50,7 +50,7 @@ fn u14_runtime_cache_fallback_preserves_syscall_output_and_exit() {
 }
 
 #[test]
-fn u14_runtime_default_and_explicit_fallback_preserve_fault_detail() {
+fn runtime_default_and_explicit_fallback_preserve_fault_detail() {
     for explicit_cache in [false, true] {
         let host = Arc::new(RecordingHost::new());
         let s = session(&[0x0f, 0x0b], host);
@@ -150,7 +150,7 @@ fn environment_reaches_the_guest_stack() {
 mod signals_time_tests;
 
 #[test]
-fn u7_runtime_preload() {
+fn runtime_preload() {
     let host = Arc::new(RecordingHost::new());
     let s = session(&HELLO, host);
     let fs = s.file_system().unwrap();
@@ -160,7 +160,7 @@ fn u7_runtime_preload() {
     );
 }
 #[test]
-fn u7_runtime_default_private() {
+fn runtime_default_private() {
     let host = Arc::new(RecordingHost::new());
     let s = session(&HELLO, host);
     assert!(
@@ -171,7 +171,7 @@ fn u7_runtime_default_private() {
     );
 }
 #[test]
-fn u7_runtime_tmp() {
+fn runtime_tmp() {
     let host = Arc::new(RecordingHost::new());
     let s = session(&HELLO, host);
     assert_eq!(
@@ -185,7 +185,7 @@ fn u7_runtime_tmp() {
     );
 }
 #[test]
-fn u7_runtime_mount() {
+fn runtime_mount() {
     let path = std::env::temp_dir().join(format!("paludarium-runtime-u7-{}", std::process::id()));
     std::fs::create_dir_all(&path).unwrap();
     std::fs::write(path.join("a"), b"hello").unwrap();
@@ -207,7 +207,7 @@ fn u7_runtime_mount() {
     std::fs::remove_dir_all(path).unwrap();
 }
 #[test]
-fn u7_runtime_missing_mount_root() {
+fn runtime_missing_mount_root() {
     let mut c = Config::new("/prog", vec![]);
     c.mounts.push(Mount {
         host: PathBuf::from("/paludarium-u7-does-not-exist"),
@@ -216,7 +216,7 @@ fn u7_runtime_missing_mount_root() {
     assert!(Session::new(c, Arc::new(paludarium_host::NativeHost::new())).is_err());
 }
 #[test]
-fn u7_runtime_duplicate_mount() {
+fn runtime_duplicate_mount() {
     let mut c = Config::new("/prog", vec![]);
     for _ in 0..2 {
         c.mounts.push(Mount {
@@ -227,13 +227,13 @@ fn u7_runtime_duplicate_mount() {
     assert!(Session::new(c, Arc::new(paludarium_host::NativeHost::new())).is_err());
 }
 #[test]
-fn u7_runtime_invalid_placement() {
+fn runtime_invalid_placement() {
     let c = Config::new("/prog", vec![]).with_file(b"/bad\0".to_vec(), vec![]);
     let s = Session::new(c, Arc::new(RecordingHost::new())).unwrap();
     assert!(s.file_system().is_err());
 }
 #[test]
-fn u7_runtime_cross_mount() {
+fn runtime_cross_mount() {
     let root = std::env::temp_dir().join(format!("paludarium-u7-cross-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let mut fs = MountedFs::new(MemFs::new());

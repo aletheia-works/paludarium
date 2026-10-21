@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn u4_kill_before_run_prevents_first_instruction() {
+fn kill_before_run_prevents_first_instruction() {
     let host = Arc::new(RecordingHost::new());
     let s = session(&HELLO, host.clone());
     s.kill();
@@ -9,7 +9,7 @@ fn u4_kill_before_run_prevents_first_instruction() {
     assert!(host.stdout().is_empty());
 }
 #[test]
-fn u4_budget_one_still_reaches_syscalls() {
+fn budget_one_still_reaches_syscalls() {
     let host = Arc::new(RecordingHost::new());
     assert_eq!(
         session(&HELLO, host.clone()).with_budget(0).run(),
@@ -18,7 +18,7 @@ fn u4_budget_one_still_reaches_syscalls() {
     assert_eq!(host.stdout(), b"hi\n");
 }
 #[test]
-fn u4_default_signal_from_syscall_terminates() {
+fn default_signal_from_syscall_terminates() {
     // kill(1,SIGTERM); an exit syscall must never be reached.
     let code = [
         0xb8, 62, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0xbe, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
@@ -31,7 +31,7 @@ fn u4_default_signal_from_syscall_terminates() {
     );
 }
 #[test]
-fn u4_invalid_signal_errno_reaches_next_syscall() {
+fn invalid_signal_errno_reaches_next_syscall() {
     // kill(1,65); exit_group(-return) => EINVAL.
     let code = [
         0xb8, 62, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0xbe, 65, 0, 0, 0, 0x0f, 0x05, 0x48, 0xf7, 0xd8, 0x48,
@@ -43,7 +43,7 @@ fn u4_invalid_signal_errno_reaches_next_syscall() {
     );
 }
 #[test]
-fn u4_malformed_return_terminates_without_host_panic() {
+fn malformed_return_terminates_without_host_panic() {
     let code = [0xb8, 15, 0, 0, 0, 0x0f, 0x05];
     assert_eq!(
         session(&code, Arc::new(RecordingHost::new())).run(),
@@ -51,7 +51,7 @@ fn u4_malformed_return_terminates_without_host_panic() {
     );
 }
 #[test]
-fn u4_fetch_fault_records_immutable_access_kind() {
+fn fetch_fault_records_immutable_access_kind() {
     // Jump to an unmapped canonical address.
     let code = [0xb8, 0, 0, 0, 0x70, 0xff, 0xe0];
     let s = session(&code, Arc::new(RecordingHost::new()));
@@ -67,7 +67,7 @@ fn u4_fetch_fault_records_immutable_access_kind() {
     ));
 }
 #[test]
-fn u4_zero_sleep_returns_without_advancing_fake_clock() {
+fn zero_sleep_returns_without_advancing_fake_clock() {
     let host = Arc::new(RecordingHost::new());
     let code = [
         0xb8, 35, 0, 0, 0, 0xbf, 0, 0x20, 0x40, 0, 0x31, 0xf6, 0x0f, 0x05, 0x48, 0x89, 0xc7, 0xb8,
@@ -81,7 +81,7 @@ fn u4_zero_sleep_returns_without_advancing_fake_clock() {
     assert_eq!(host.clock(paludarium_host::ClockId::Monotonic), Ok(0));
 }
 #[test]
-fn u4_kill_interrupts_native_wait_with_bounded_join() {
+fn kill_interrupts_native_wait_with_bounded_join() {
     // nanosleep(60 seconds), then exit. The wait must observe Session::kill.
     let code = [
         0xb8, 35, 0, 0, 0, 0xbf, 0, 0x20, 0x40, 0, 0x31, 0xf6, 0x0f, 0x05, 0xb8, 231, 0, 0, 0,
@@ -115,7 +115,7 @@ fn wait_for_stop(s: &Session) {
     }
 }
 #[test]
-fn u4_stop_continue_retains_cpu_until_resumed() {
+fn stop_continue_retains_cpu_until_resumed() {
     let host = Arc::new(RecordingHost::new());
     let s = Arc::new(session(&HELLO, host.clone()).with_budget(1));
     s.signal(19).unwrap();
@@ -135,7 +135,7 @@ fn u4_stop_continue_retains_cpu_until_resumed() {
     assert!(!s.is_stopped());
 }
 #[test]
-fn u4_stopped_guest_remains_killable() {
+fn stopped_guest_remains_killable() {
     let s = Arc::new(session(&[0xeb, 0xfe], Arc::new(RecordingHost::new())));
     s.signal(19).unwrap();
     let worker = s.clone();
@@ -150,7 +150,7 @@ fn u4_stopped_guest_remains_killable() {
     runner.join().unwrap();
 }
 #[test]
-fn u4_pending_kill_wins_while_stopped() {
+fn pending_kill_wins_while_stopped() {
     let s = Arc::new(session(&[0xeb, 0xfe], Arc::new(RecordingHost::new())));
     s.signal(19).unwrap();
     let worker = s.clone();

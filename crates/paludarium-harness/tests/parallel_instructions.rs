@@ -36,8 +36,8 @@ fn workers<T: Send + 'static>(operation: impl Fn() -> T + Send + Sync + 'static)
     threads.into_iter().map(|t| t.join().unwrap()).collect()
 }
 #[test]
-fn u2_atomic_add_parallel_native() {
-    support::bounded("u2_atomic_add_parallel_native", || {
+fn atomic_add_parallel_native() {
+    support::bounded("atomic_add_parallel_native", || {
         let native = Arc::new(AtomicU64::new(0));
         let n = native.clone();
         let mut expected: Vec<_> = workers(move || {
@@ -72,8 +72,8 @@ fn u2_atomic_add_parallel_native() {
     });
 }
 #[test]
-fn u2_cpu_lock_xadd_parallel_native() {
-    support::bounded("u2_cpu_lock_xadd_parallel_native", || {
+fn cpu_lock_xadd_parallel_native() {
+    support::bounded("cpu_lock_xadd_parallel_native", || {
         let native = Arc::new(AtomicU64::new(0));
         let n = native.clone();
         let mut expected: Vec<_> = workers(move || {
@@ -119,8 +119,8 @@ fn u2_cpu_lock_xadd_parallel_native() {
     });
 }
 #[test]
-fn u2_compare_exchange_parallel_native() {
-    support::bounded("u2_compare_exchange_parallel_native", || {
+fn compare_exchange_parallel_native() {
+    support::bounded("compare_exchange_parallel_native", || {
         let n = Arc::new(AtomicU64::new(0));
         let mut expected =
             workers(
@@ -149,8 +149,8 @@ fn u2_compare_exchange_parallel_native() {
     });
 }
 #[test]
-fn u2_atomic_exchange_reads_no_tearing() {
-    support::bounded("u2_atomic_exchange_reads_no_tearing", || {
+fn atomic_exchange_reads_no_tearing() {
+    support::bounded("atomic_exchange_reads_no_tearing", || {
         let m = memory();
         workers(move || {
             for j in 0..512 {
@@ -172,8 +172,8 @@ fn u2_atomic_exchange_reads_no_tearing() {
     });
 }
 #[test]
-fn u2_atomic_vs_normal_writes_no_tearing() {
-    support::bounded("u2_atomic_vs_normal_writes_no_tearing", || {
+fn atomic_vs_normal_writes_no_tearing() {
+    support::bounded("atomic_vs_normal_writes_no_tearing", || {
         let m = memory();
         workers(move || {
             for j in 0..512 {
@@ -189,8 +189,8 @@ fn u2_atomic_vs_normal_writes_no_tearing() {
     });
 }
 #[test]
-fn u2_mapping_protect_competes_with_atomic() {
-    support::bounded("u2_mapping_protect_competes_with_atomic", || {
+fn mapping_protect_competes_with_atomic() {
+    support::bounded("mapping_protect_competes_with_atomic", || {
         let m = memory();
         workers(move || {
             for j in 0..128 {
@@ -213,8 +213,8 @@ fn u2_mapping_protect_competes_with_atomic() {
     });
 }
 #[test]
-fn u2_mapping_unmap_remap_competes() {
-    support::bounded("u2_mapping_unmap_remap_competes", || {
+fn mapping_unmap_remap_competes() {
+    support::bounded("mapping_unmap_remap_competes", || {
         let m = memory();
         workers(move || {
             for _ in 0..128 {
@@ -233,8 +233,8 @@ fn u2_mapping_unmap_remap_competes() {
     });
 }
 #[test]
-fn u2_unaligned_cross_page_parallel() {
-    support::bounded("u2_unaligned_cross_page_parallel", || {
+fn unaligned_cross_page_parallel() {
+    support::bounded("unaligned_cross_page_parallel", || {
         let native = Arc::new(AtomicU64::new(0));
         let n = native.clone();
         let mut expected: Vec<_> = workers(move || {
@@ -269,8 +269,8 @@ fn u2_unaligned_cross_page_parallel() {
     });
 }
 #[test]
-fn u2_readonly_failed_cmpxchg_parallel() {
-    support::bounded("u2_readonly_failed_cmpxchg_parallel", || {
+fn readonly_failed_cmpxchg_parallel() {
+    support::bounded("readonly_failed_cmpxchg_parallel", || {
         let m = memory();
         m.write_u64(GuestAddr(0x10000), 7).unwrap();
         m.protect_shared(GuestAddr(0x10000), 4096, Prot::READ)
@@ -295,13 +295,13 @@ fn u2_readonly_failed_cmpxchg_parallel() {
     });
 }
 #[test]
-fn u2_parallel_runner_bootstrap() {
+fn parallel_runner_bootstrap() {
     // Build fixtures before the execution watchdog, as in diff_instructions. The isolated
     // child inherits their directory, but not ensure_guests_built's OnceLock.
     if std::env::var("PALUDARIUM_U2_CHILD").is_err() {
         paludarium_harness::ensure_guests_built().expect("build native guests");
     }
-    support::bounded("u2_parallel_runner_bootstrap", || {
+    support::bounded("parallel_runner_bootstrap", || {
         let workers: Vec<_> = ["insn-alu", "insn-atomic"]
             .into_iter()
             .map(|binary| {

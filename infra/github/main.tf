@@ -60,21 +60,9 @@ locals {
     "differential tests (x86-64 Linux)",
     "line coverage >= 80%",
     "production wasm (shared Rust heap, nested Workers)",
-    "U10 fixed guests and fresh native differential / native-first",
-    "U10 fixed guests and fresh native differential / fixture-metadata-oracle",
-    "U10 fixed guests and fresh native differential / differential",
-    "u11-programs / build-oracle",
-    "u11-programs / differential (ubuntu-latest, node)",
-    "u11-programs / differential (ubuntu-latest, chromium)",
-    "u11-programs / differential (ubuntu-latest, firefox)",
-    "u11-programs / differential (macos-latest, safari)",
-    "u11-fuzz / fuzz (load_elf)",
-    "u11-fuzz / fuzz (syscall_args)",
-    "u11-fuzz / fuzz (vfs_paths)",
-    "u11-fuzz / fuzz (kernel_futex_u5)",
-    "u11-fuzz / fuzz (kernel_threads_u5)",
-    "u11-fuzz / fuzz (kernel_events_u6)",
-    "u11-fuzz / fuzz (kernel_sockets_u6)",
+    # The fixed-guest programs, wasm programs and fuzz gates are left out while
+    # their jobs are renamed after the units they cover; the renaming change
+    # adds them back under the new names.
   ]
 }
 

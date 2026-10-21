@@ -7,7 +7,6 @@ description = "Static ELF loader for paludarium"
 readme.workspace = true
 repository.workspace = true
 license.workspace = true
-license-file.workspace = true
 
 [dependencies]
 paludarium-mmu.workspace = true

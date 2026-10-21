@@ -26,7 +26,6 @@ rust-version = "1.101"
 readme = "README.md"
 repository = "https://github.com/aletheia-works/paludarium"
 license = "Apache-2.0"
-license-file = "LICENSE"
 
 [workspace.dependencies]
 paludarium = { path = "crates/paludarium", version = "0.1.1" }

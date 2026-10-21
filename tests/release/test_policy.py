@@ -212,6 +212,20 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(inv["npm"]["version"], version)
         self.assertEqual(inv["npm"]["name"], "@aletheia-works/paludarium-wasm")
 
+    def test_published_crates_carry_the_root_license(self):
+        # Each published crate ships its own copy of LICENSE (the manifests set only the
+        # SPDX `license`); the copies must stay identical to the root file.
+        workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]
+        self.assertNotIn("license-file", workspace["package"])
+        license_text = (ROOT / "LICENSE").read_bytes()
+        for name in policy.PUBLIC:
+            with self.subTest(crate=name):
+                crate = ROOT / workspace["dependencies"][name]["path"]
+                self.assertEqual((crate / "LICENSE").read_bytes(), license_text)
+                package = tomllib.loads((crate / "Cargo.toml").read_text())["package"]
+                self.assertEqual(package["license"], {"workspace": True})
+                self.assertNotIn("license-file", package)
+
     def test_single_version_drift_rejected(self):
         version = policy.inventory(ROOT)["version"]
         major, minor, patch = map(int, version.split("."))

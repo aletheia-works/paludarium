@@ -7,7 +7,6 @@ description = "Host abstraction (stdio, randomness) for paludarium"
 readme.workspace = true
 repository.workspace = true
 license.workspace = true
-license-file.workspace = true
 
 [dependencies]
 paludarium-types.workspace = true

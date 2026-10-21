@@ -22,7 +22,7 @@ def compare_original(expected, actual, expected_root, actual_root):
     The primary comparison checks stderr with the same official reporter.
     Original reporter heartbeat output varies with elapsed wall time, so this
     supplemental observation checks exit/stdout and retains both raw reports.
-    Dependency reports are independently checked by reproduced().
+    Dependency reports are independently checked by local_versions().
     """
     if expected['timed_out'] or actual['timed_out']:
         raise ValueError('original operation timed out')

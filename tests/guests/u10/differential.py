@@ -6,7 +6,7 @@ import shutil
 import sys
 import tempfile
 
-from comparison import compare, probe_pass, reproduced
+from comparison import compare, probe_pass, local_versions
 from comparison_args import comparison_config, compare_original
 from evidence import snapshot
 from native import observe
@@ -106,7 +106,7 @@ def differential(executable, *, original_argv=False):
             store(case['name'], row)
             rows[case['name']] = row
             compare_rows(native['rows'][case['name']], row, str(pathlib.Path(native['fixture_root']) / 'fixture/app'), '/')
-        reproduced(rows)
+        local_versions(rows)
         observations['differential_complete'] = True
         (output / 'observations.json').write_text(json.dumps(observations, indent=2) + '\n')
     print('U10 differential: eight probe items and four aube commands passed')

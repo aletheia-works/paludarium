@@ -238,13 +238,13 @@ def probe_passed(rows):
             and environment['exit'] == 0 and environment['stdout'].startswith('PASS '))
 
 
-def reproduced_1645(rows):
-    """FR7.3: frozen install and aube list show 0.0.0 for both local dependencies."""
+def local_versions_reported(rows):
+    """FR7.3: frozen install and aube list show both local dependencies at their own versions."""
     frozen, listed = rows['frozen'], rows['list']
     stderr, stdout = ANSI.sub('', frozen['stderr']), ANSI.sub('', listed['stdout'])
     return (frozen['exit'] == 0 and listed['exit'] == 0
-            and all(re.search(p, stderr, re.M) for p in (r'^\+ filedep@0\.0\.0$', r'^\+ linked@0\.0\.0$'))
-            and all(re.search(p, stdout, re.M) for p in (r'^├── filedep 0\.0\.0$', r'^└── linked 0\.0\.0$')))
+            and all(re.search(p, stderr, re.M) for p in (r'^\+ filedep@1\.0\.0$', r'^\+ linked@2\.0\.0$'))
+            and all(re.search(p, stdout, re.M) for p in (r'^├── filedep 1\.0\.0$', r'^└── linked 2\.0\.0$')))
 
 
 def aube_matches(rows, native):
@@ -266,14 +266,14 @@ def guest_hashes(document, key, label):
 
 
 def verdicts(rows, native):
-    return {'FR6.3': probe_passed(rows), 'FR7.2': aube_matches(rows, native), 'FR7.3': reproduced_1645(rows)}
+    return {'FR6.3': probe_passed(rows), 'FR7.2': aube_matches(rows, native), 'FR7.3': local_versions_reported(rows)}
 
 
 def native_oracle(document, label):
-    """A fresh native x86-64 Linux oracle that itself shows the expected probe and #1645 results."""
+    """A fresh native x86-64 Linux oracle that itself shows the expected probe and local dependency results."""
     policy.require(document.get('native_complete') is True, label + ': native oracle incomplete')
     rows = rows_of(document, 'rows', label)
-    policy.require(probe_passed(rows) and reproduced_1645(rows), label + ': native oracle does not show the expected results')
+    policy.require(probe_passed(rows) and local_versions_reported(rows), label + ': native oracle does not show the expected results')
     return guest_hashes(document, 'binary_hashes', label), rows
 
 

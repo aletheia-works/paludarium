@@ -101,7 +101,7 @@ built guests differ by design.
 |---|---|---|
 | FR6.3 | all native and Wasm sources (Wasm interpreter mode) | every probe row exits 0 and prints exactly its `PASS <item>` line; `probe-all` prints all eight; `probe-environment` starts with `PASS` |
 | FR7.2 | same | the four aube commands have the oracle's exit codes and the same `--version` stdout; the job's own runner compares full stdout/exit and fails the job on a difference |
-| FR7.3 | same | frozen install stderr shows `+ filedep@0.0.0` and `+ linked@0.0.0`; `aube list` shows both at `0.0.0` |
+| FR7.3 | same | frozen install stderr shows `+ filedep@1.0.0` and `+ linked@2.0.0`; `aube list` shows both at those versions |
 | FR8.2 | the four Wasm sources | `complete` and `passed`, 28 cases, both `interpreter` and `jit` modes complete and passed, every row `pass: true`, probe and aube checks above in both modes |
 | FR8.3 | performance | `head` equals the released head, `complete`, `passed`, `warmupsPassed`, `result.pass`, `p < 0.05`, mean JIT time below mean interpreter time, 20 rows all exit 0 and passed |
 

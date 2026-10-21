@@ -38,10 +38,10 @@ def guest_rows(passing=False):
     rows = {'probe-' + i: row('PASS %s\n' % i) for i in A.PROBE_ITEMS}
     rows['probe-all'] = row(''.join('PASS %s\n' % i for i in A.PROBE_ITEMS))
     rows['probe-environment'] = row('PASS environment linux x86_64\n')
-    rows['version'] = row('2.6.1 linux-x64 (2026-10-18)\n')
+    rows['version'] = row('2.8.1 linux-x64 (2026-10-20)\n')
     rows['install'] = row('Packages: +2\n')
-    rows['frozen'] = row(stderr='\x1b[32m+ filedep@0.0.0\x1b[0m\n+ linked@0.0.0\n')
-    rows['list'] = row('app\n├── filedep 0.0.0\n└── linked 0.0.0\n')
+    rows['frozen'] = row(stderr='\x1b[32m+ filedep@1.0.0\x1b[0m\n+ linked@2.0.0\n')
+    rows['list'] = row('app\n├── filedep 1.0.0\n└── linked 2.0.0\n')
     if passing:
         for value in rows.values():
             value['pass'] = True
@@ -250,9 +250,9 @@ class AcceptanceTests(unittest.TestCase):
         self.world.edit(A.U14, 'u13-windows-host', 'windows/comparison/observations.json', fail)
         self.rejected('FR6.3 not met by windows-native')
 
-    def test_1645_not_reproduced(self):
+    def test_local_versions_not_reported(self):
         self.world.edit(A.U12, 'u12-macos-host', 'comparison/observations.json',
-                        lambda d: d['rows']['list'].update(stdout='├── filedep 1.0.0\n└── linked 1.0.0\n'))
+                        lambda d: d['rows']['list'].update(stdout='├── filedep 0.0.0\n└── linked 0.0.0\n'))
         self.rejected('FR7.3 not met by macos-native')
 
     def test_jit_mode_failure(self):

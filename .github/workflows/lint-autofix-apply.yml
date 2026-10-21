@@ -4,7 +4,7 @@ name: Polyglot lint autofix apply
 # the other aletheia-works repositories. The patch comes from the pull request's
 # own code, so it is checked first: only files the fixers edit, no workflows,
 # no new, deleted, renamed or re-moded files, and only while the branch has not
-# moved. The push uses TF_TOKEN_GITHUB.
+# moved. aletheia-works-bot commits through GitHub's API, so GitHub signs the commit.
 
 on:
   workflow_run:
@@ -91,34 +91,80 @@ jobs:
           [ "${headers}" -gt 0 ] || fail "no file headers"
           echo "apply=true" >> "${GITHUB_OUTPUT}"
 
-      - name: Checkout PR branch
+      - name: Checkout PR head (read-only)
         if: steps.patch.outputs.apply == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.event.workflow_run.head_repository.full_name }}
-          ref: ${{ github.event.workflow_run.head_branch }}
-          token: ${{ secrets.TF_TOKEN_GITHUB }}
-          persist-credentials: true
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
           allow-unsafe-pr-checkout: true
           path: pr
 
-      - name: Apply and push
+      - name: Get an aletheia-works-bot token
+        if: steps.patch.outputs.apply == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          permission-contents: write
+
+      # The commit is created through GitHub's API as aletheia-works-bot, so GitHub
+      # signs it (as vivarium's bot-pull-request action does). A pull request from
+      # a fork needs "Allow edits by maintainers" for the bot to write to it.
+      - name: Commit the fixes as aletheia-works-bot
         if: steps.patch.outputs.apply == 'true'
         working-directory: pr
         env:
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEADLINE: "style: polyglot lint autofix (cargo fmt/clippy, ruff, tombi, rumdl)"
         run: |
           set -euo pipefail
 
-          current="$(git rev-parse HEAD)"
+          current="$(gh api "repos/${HEAD_REPO}/commits/${HEAD_BRANCH}" --jq .sha)"
           if [ "${current}" != "${HEAD_SHA}" ]; then
             echo "Branch moved (${HEAD_SHA} -> ${current}); skipping stale patch."
             exit 0
           fi
 
           git apply --index "${GITHUB_WORKSPACE}/autofix-in/autofix.patch"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "style: polyglot lint autofix (cargo fmt/clippy, ruff, tombi, rumdl)"
-          git push origin "HEAD:${HEAD_BRANCH}"
+          echo '[]' > "${RUNNER_TEMP}/additions.json"
+          while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+            read -r _ new_mode _ _ status <<< "${meta#:}"
+            if [ "${status}" != M ] || [ "${new_mode}" != 100644 ]; then
+              echo "::error::${path}: ${status} to mode ${new_mode}; only edits of regular files can be committed."
+              exit 1
+            fi
+            git show ":${path}" | base64 -w0 > "${RUNNER_TEMP}/blob"
+            jq -c --arg p "${path}" --rawfile c "${RUNNER_TEMP}/blob" '. + [{path: $p, contents: $c}]' \
+              "${RUNNER_TEMP}/additions.json" > "${RUNNER_TEMP}/next.json"
+            mv "${RUNNER_TEMP}/next.json" "${RUNNER_TEMP}/additions.json"
+          done < <(git diff --cached --no-renames --raw -z HEAD)
+
+          # shellcheck disable=SC2016
+          jq -n --arg repo "${HEAD_REPO}" --arg branch "${HEAD_BRANCH}" --arg head "${HEAD_SHA}" \
+            --arg headline "${HEADLINE}" --slurpfile additions "${RUNNER_TEMP}/additions.json" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: {input: {
+                branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+                expectedHeadOid: $head,
+                message: {headline: $headline},
+                fileChanges: {additions: $additions[0]}
+              }}
+            }' > "${RUNNER_TEMP}/commit.json"
+          if ! gh api graphql --input "${RUNNER_TEMP}/commit.json" --jq .data.createCommitOnBranch.commit.oid \
+            > "${RUNNER_TEMP}/commit.oid" 2> "${RUNNER_TEMP}/commit.err"; then
+            cat "${RUNNER_TEMP}/commit.err" >&2
+            echo "::error::aletheia-works-bot could not commit to ${HEAD_REPO}:${HEAD_BRANCH}. For a pull request from a fork, enable \"Allow edits by maintainers\"; or run mise run lint:all:fix and push the fixes."
+            exit 1
+          fi
+          commit="$(cat "${RUNNER_TEMP}/commit.oid")"
+          echo "Committed ${commit} to ${HEAD_REPO}:${HEAD_BRANCH}."
+          if [ "$(gh api "repos/${HEAD_REPO}/commits/${commit}" --jq .commit.verification.verified)" != true ]; then
+            echo "::warning::${commit} is not marked verified."
+          fi

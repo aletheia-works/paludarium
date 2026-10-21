@@ -57,8 +57,9 @@ Within mise, `target/release` is on `PATH`.
 
 Each `<lang>:check` has a `<lang>:check:fix`, and CI runs `lint:all` on every
 pull request (`test-lint-check.yml`). `lint-autofix.yml` runs `lint:all:fix`
-there too and pushes any fixes to the pull request branch as a `style:` commit;
-fetch it before pushing to that branch again.
+there too, and aletheia-works-bot commits any fixes to the pull request branch
+as a signed `style:` commit (a pull request from a fork needs "Allow edits by
+maintainers"); fetch it before pushing to that branch again.
 
 Differential tests build the guests under `tests/guests/` from source, run each
 one natively and in the emulator, and compare standard output, standard error

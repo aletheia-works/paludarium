@@ -1,9 +1,9 @@
 //! U4 expectations are produced by x86-64 Linux on each test execution.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#[path = "support/u4_oracles.rs"]
+#[path = "support/signals_time_oracles.rs"]
 mod oracles;
-#[path = "support/u4.rs"]
+#[path = "support/signals_time.rs"]
 mod support;
 use paludarium_harness::{compare, run_emulated, run_native, workspace_root};
 
@@ -14,7 +14,7 @@ fn build_u4() -> std::path::PathBuf {
         BUILT.get_or_init(|| {
             assert!(
                 std::process::Command::new("bash")
-                    .arg(workspace_root().join("tests/guests/u4/build.sh"))
+                    .arg(workspace_root().join("tests/guests/signals-time/build.sh"))
                     .arg(&out)
                     .status()
                     .expect("U4 native build")

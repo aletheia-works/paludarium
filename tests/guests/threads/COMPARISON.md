@@ -27,7 +27,7 @@
 
 38–42ではseq-cst ready store/load（release/acquire以上）により、子のtimer syscall完了が親待機入口より前と確定する。新signal handler/送信は追加しない。出力はsyscall結果・handler回数・経過150ms以上600ms未満のboolであり、期待値はnative実測で確定する。生時刻/TIDは比較しない。elapsed起点はclone前、41の絶対deadlineはready確認後のclock取得から200ms。各ケース30秒watchdogを維持し、既存0–37の観測規則を変更しない。
 
-`scripts/u5-native-observe.py --out target/u5-native-first` は全ケースを独立した30秒の process-group watchdog、kill/reap、raw log 付きで実行する。`--emulator target/debug/paludarium` を追加すると native 実行後に emulator と比較する。ケース16は17、他は0で終了する。native の不一致・エラー観測値はデータとして記録し、errno 表から推定しない。
+`scripts/threads-native-observe.py --out target/u5-native-first` は全ケースを独立した30秒の process-group watchdog、kill/reap、raw log 付きで実行する。`--emulator target/debug/paludarium` を追加すると native 実行後に emulator と比較する。ケース16は17、他は0で終了する。native の不一致・エラー観測値はデータとして記録し、errno 表から推定しない。
 
 ケース23は不正 CLONE_PARENT_SETTID ポインタに対する Linux の実動作を観測し、成功した clone を1に正規化する。Linux が parent-TID 書き込み失敗を無視した場合に clone が失敗すると仮定しない。
 

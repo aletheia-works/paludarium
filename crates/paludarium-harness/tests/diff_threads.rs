@@ -10,7 +10,7 @@ fn case(id: usize) {
     BUILT.get_or_init(|| {
         assert!(
             Command::new("bash")
-                .arg(root.join("tests/guests/u5/build.sh"))
+                .arg(root.join("tests/guests/threads/build.sh"))
                 .arg(&guests)
                 .status()
                 .unwrap()
@@ -26,7 +26,7 @@ fn case(id: usize) {
     );
     assert!(
         Command::new("python3")
-            .arg(root.join("scripts/u5-native-observe.py"))
+            .arg(root.join("scripts/threads-native-observe.py"))
             .arg("--guests")
             .arg(&guests)
             .arg("--out")

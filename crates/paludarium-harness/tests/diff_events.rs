@@ -10,7 +10,7 @@ fn case(id: usize) {
     BUILT.get_or_init(|| {
         assert!(
             Command::new("bash")
-                .arg(root.join("tests/guests/u6/build.sh"))
+                .arg(root.join("tests/guests/events/build.sh"))
                 .arg(&guests)
                 .status()
                 .unwrap()
@@ -26,7 +26,7 @@ fn case(id: usize) {
     );
     assert!(
         Command::new("python3")
-            .arg(root.join("scripts/u6-native-observe.py"))
+            .arg(root.join("scripts/events-native-observe.py"))
             .arg("--guests")
             .arg(&guests)
             .arg("--out")
@@ -129,7 +129,7 @@ fn named_case(name: &str) {
     let root = paludarium_harness::workspace_root();
     assert!(
         Command::new("bash")
-            .arg(root.join("tests/guests/u6/build.sh"))
+            .arg(root.join("tests/guests/events/build.sh"))
             .arg(root.join("target/guests/u6"))
             .status()
             .unwrap()
@@ -137,7 +137,7 @@ fn named_case(name: &str) {
     );
     assert!(
         Command::new("python3")
-            .arg(root.join("scripts/u6-native-observe.py"))
+            .arg(root.join("scripts/events-native-observe.py"))
             .arg("--case")
             .arg(name)
             .arg("--guests")

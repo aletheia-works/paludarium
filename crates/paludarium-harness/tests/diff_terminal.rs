@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use paludarium_harness::workspace_root;
 use std::process::Command;
-#[path = "support/u9.rs"]
+#[path = "support/terminal.rs"]
 mod support;
 use paludarium::{Config, Session};
 use paludarium_host::{StreamId, TerminalAttributes, TerminalInfo, testing::RecordingHost};
@@ -23,7 +23,7 @@ fn case(name: &'static str, id: usize) {
         BUILT.get_or_init(|| {
             assert!(
                 Command::new("bash")
-                    .arg(root.join("tests/guests/u9/build.sh"))
+                    .arg(root.join("tests/guests/terminal/build.sh"))
                     .arg(&out)
                     .status()
                     .unwrap()
@@ -33,7 +33,7 @@ fn case(name: &'static str, id: usize) {
     }
     support::bounded(name, || {
         let native = Command::new("python3")
-            .arg(root.join("tests/guests/u9/oracle.py"))
+            .arg(root.join("tests/guests/terminal/oracle.py"))
             .arg(&out)
             .arg(id.to_string())
             .output()

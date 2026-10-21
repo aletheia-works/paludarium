@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 SPEC = importlib.util.spec_from_file_location(
-    "frame_diagnostic", Path(__file__).parents[1] / "scripts/u1-frame-diagnostic.py"
+    "frame_diagnostic", Path(__file__).parents[1] / "scripts/core-frame-diagnostic.py"
 )
 diagnostic = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(diagnostic)

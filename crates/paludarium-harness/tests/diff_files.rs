@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#[path = "support/u7.rs"]
+#[path = "support/files.rs"]
 mod support;
 use paludarium_harness::{compare, run_emulated, run_native, workspace_root};
 fn case(name_arg: &'static str, id: usize) {
@@ -18,7 +18,7 @@ fn case(name_arg: &'static str, id: usize) {
         BUILT.get_or_init(|| {
             assert!(
                 std::process::Command::new("bash")
-                    .arg(workspace_root().join("tests/guests/u7/build.sh"))
+                    .arg(workspace_root().join("tests/guests/files/build.sh"))
                     .arg(&out)
                     .status()
                     .unwrap()
@@ -121,7 +121,7 @@ fn u7_host_signed_mtime_stat_fstat() {
     let out = workspace_root().join("target/guests/u7");
     assert!(
         std::process::Command::new("bash")
-            .arg(workspace_root().join("tests/guests/u7/build.sh"))
+            .arg(workspace_root().join("tests/guests/files/build.sh"))
             .arg(&out)
             .status()
             .unwrap()

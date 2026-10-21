@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location(
-    "u9_coverage_check", ROOT / "scripts/u9-coverage-check.py"
+    "u9_coverage_check", ROOT / "scripts/coverage-check.py"
 )
 C = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(C)
@@ -60,7 +60,7 @@ class CoverageCheck(unittest.TestCase):
             p.write_bytes(b"lock")
         commands = [
             dict(
-                argv=["cargo", "test", "--test", "diff_u9"],
+                argv=["cargo", "test", "--test", "diff_terminal"],
                 tests=1,
                 ignored=0,
                 exit=0,

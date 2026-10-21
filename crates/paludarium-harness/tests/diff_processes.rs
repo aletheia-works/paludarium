@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#[path = "support/u8.rs"]
+#[path = "support/processes.rs"]
 mod support;
 
 #[test]
@@ -51,7 +51,7 @@ mod linux {
             BUILT.get_or_init(|| {
                 assert!(
                     std::process::Command::new("bash")
-                        .arg(workspace_root().join("tests/guests/u8/build.sh"))
+                        .arg(workspace_root().join("tests/guests/processes/build.sh"))
                         .arg(&dir)
                         .status()
                         .unwrap()

@@ -2,7 +2,7 @@
 #![allow(unexpected_cfgs)]
 use super::{CpuState, INITIAL_MXCSR};
 use paludarium_types::GuestAddr;
-#[path = "../../../tests/guests/u3/native-contract.rs"]
+#[path = "../../../tests/guests/encodings/native-contract.rs"]
 mod native_contract;
 
 fn sha_memory_contract(opcode: u8, crossing: bool) {

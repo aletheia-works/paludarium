@@ -39,13 +39,13 @@ def diff_counts(output):
     matches = []
     for section in sections:
         first = section.splitlines()[0] if section.splitlines() else ""
-        if not re.match(r"tests/diff_u9\.rs \(", first):
+        if not re.match(r"tests/diff_terminal\.rs \(", first):
             continue
         stack, outer = [], []
         for line in section.splitlines()[1:]:
             start = re.fullmatch(r"running (\d+) tests?", line)
             if start:
-                need(stack or not outer, "duplicate diff_u9 outer harness")
+                need(stack or not outer, "duplicate diff_terminal outer harness")
                 stack.append(int(start[1]))
                 continue
             if not line.startswith("test result:"):
@@ -54,7 +54,7 @@ def diff_counts(output):
                 r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;",
                 line,
             )
-            need(summary and stack, "unmatched diff_u9 harness summary")
+            need(summary and stack, "unmatched diff_terminal harness summary")
             passed, failed, ignored, measured, filtered = map(int, summary.groups()[1:])
             need(
                 summary[1] == "ok"
@@ -62,16 +62,16 @@ def diff_counts(output):
                 and ignored == 0
                 and measured == 0
                 and passed + failed + ignored + measured == stack.pop(),
-                "diff_u9 harness failed/incomplete",
+                "diff_terminal harness failed/incomplete",
             )
             if not stack:
-                need(filtered == 0, "outer diff_u9 filtered tests")
+                need(filtered == 0, "outer diff_terminal filtered tests")
                 outer.append((passed, ignored))
-        need(not stack and len(outer) == 1, "diff_u9 result absent/ambiguous")
+        need(not stack and len(outer) == 1, "diff_terminal result absent/ambiguous")
         matches.append(outer[0])
     need(
         len(matches) == 1 and matches[0][0] > 0 and matches[0][1] == 0,
-        "diff_u9 zero/ignored/not executed",
+        "diff_terminal zero/ignored/not executed",
     )
     return matches[0]
 
@@ -206,7 +206,7 @@ def main():
             tool.is_absolute() and tool.is_file() and os.access(tool, os.X_OK),
             "actual tool executable required",
         )
-    scope = json.loads((ROOT / "tests/guests/u9/coverage-scope.json").read_bytes())
+    scope = json.loads((ROOT / "tests/guests/terminal/coverage-scope.json").read_bytes())
     capture = Capture(args.output)
     before = source_snapshot(scope)
     locks = {n: sha((ROOT / n).read_bytes()) for n in ("Cargo.lock", "fuzz/Cargo.lock")}
@@ -219,7 +219,7 @@ def main():
     command += [
         "--lib",
         "--test",
-        "diff_u9",
+        "diff_terminal",
         "--test",
         "command",
         "--ignore-filename-regex",

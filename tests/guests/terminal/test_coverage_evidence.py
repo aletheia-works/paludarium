@@ -6,9 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
-SPEC = importlib.util.spec_from_file_location(
-    "u9_producer", ROOT / "scripts/u9-coverage-evidence.py"
-)
+SPEC = importlib.util.spec_from_file_location("u9_producer", ROOT / "scripts/coverage-evidence.py")
 P = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(P)
 
@@ -18,8 +16,9 @@ def result(passed, ignored=0, filtered=0):
 
 
 def suite(passed, ignored=0):
-    return f" Running tests/diff_u9.rs (target/x)\nrunning {passed + ignored} tests\n" + result(
-        passed, ignored
+    return (
+        f" Running tests/diff_terminal.rs (target/x)\nrunning {passed + ignored} tests\n"
+        + result(passed, ignored)
     )
 
 
@@ -48,8 +47,8 @@ class Evidence(unittest.TestCase):
 
     def test_separate_stream_concatenation_reproduces_missing_result(self):
         stdout = b"test result: ok. 70 passed; 0 failed; 0 ignored;\ntest result: ok. 7 passed; 0 failed; 0 ignored;\n"
-        stderr = b" Running unittests lib.rs (x)\n Running tests/diff_u9.rs (x)\n"
-        with self.assertRaisesRegex(ValueError, "diff_u9 result absent/ambiguous"):
+        stderr = b" Running unittests lib.rs (x)\n Running tests/diff_terminal.rs (x)\n"
+        with self.assertRaisesRegex(ValueError, "diff_terminal result absent/ambiguous"):
             P.diff_counts((stdout + stderr).decode())
 
     def test_merged_stream_preserves_suite_identity(self):
@@ -83,7 +82,7 @@ class Evidence(unittest.TestCase):
 
         stdout = ("running 7 tests\n" + result(7)).encode()
         code = (
-            'import os;os.write(2,b" Running tests/diff_u9.rs (x)\\n");os.write(1,'
+            'import os;os.write(2,b" Running tests/diff_terminal.rs (x)\\n");os.write(1,'
             + repr(stdout)
             + ")"
         )
@@ -124,7 +123,7 @@ class Evidence(unittest.TestCase):
     def test_nested_14_children_and_host84_keep_only_diff_outer(self):
         child = "running 1 test\ntest u9_case ... ok\n" + result(1, filtered=13) + "ok\n"
         diff = (
-            " Running tests/diff_u9.rs (target/diff_u9)\nrunning 14 tests\n"
+            " Running tests/diff_terminal.rs (target/diff_terminal)\nrunning 14 tests\n"
             + child * 14
             + result(14)
         )
@@ -136,19 +135,19 @@ class Evidence(unittest.TestCase):
         self.assertEqual(P.diff_counts(diff + host), (14, 0))
 
     def test_nested_child_without_outer_summary_rejected(self):
-        text = " Running tests/diff_u9.rs (x)\nrunning 14 tests\nrunning 1 test\n" + result(
+        text = " Running tests/diff_terminal.rs (x)\nrunning 14 tests\nrunning 1 test\n" + result(
             1, filtered=13
         )
         with self.assertRaises(ValueError):
             P.diff_counts(text)
 
     def test_outer_filtered_rejected(self):
-        text = " Running tests/diff_u9.rs (x)\nrunning 1 test\n" + result(1, filtered=13)
+        text = " Running tests/diff_terminal.rs (x)\nrunning 1 test\n" + result(1, filtered=13)
         with self.assertRaises(ValueError):
             P.diff_counts(text)
 
     def test_outer_declared_population_mismatch_rejected(self):
-        text = " Running tests/diff_u9.rs (x)\nrunning 14 tests\n" + result(1)
+        text = " Running tests/diff_terminal.rs (x)\nrunning 14 tests\n" + result(1)
         with self.assertRaises(ValueError):
             P.diff_counts(text)
 

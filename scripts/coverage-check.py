@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCOPE = ROOT / "tests/guests/u9/coverage-scope.json"
+SCOPE = ROOT / "tests/guests/terminal/coverage-scope.json"
 
 
 def need(value, message):
@@ -152,7 +152,7 @@ def validate(lcov_raw, scope, evidence, root=ROOT, evidence_root=ROOT):
         ),
         "coverage command failed",
     )
-    diff = [r for r in commands if "--test" in r["argv"] and "diff_u9" in r["argv"]]
+    diff = [r for r in commands if "--test" in r["argv"] and "diff_terminal" in r["argv"]]
     need(
         diff
         and all(
@@ -162,7 +162,7 @@ def validate(lcov_raw, scope, evidence, root=ROOT, evidence_root=ROOT):
             and r["ignored"] == 0
             for r in diff
         ),
-        "diff_u9 zero/ignored population",
+        "diff_terminal zero/ignored population",
     )
     need(
         any("llvm-cov" in r["argv"] and "--lcov" in r["argv"] for r in commands)

@@ -2,7 +2,7 @@
 use paludarium_cpu::{CpuState, step};
 use paludarium_mmu::{AddressSpace, MappingKind, Prot};
 use paludarium_types::{ExitReason, GuestAddr};
-#[path = "../../../../tests/guests/u3/native-contract.rs"]
+#[path = "../../../../tests/guests/encodings/native-contract.rs"]
 mod native_contract;
 
 fn bytes(text: &str) -> Vec<u8> {

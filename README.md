@@ -74,7 +74,7 @@ every run and never stored. Each case has a 30-second timeout.
 differential tests, coverage and fuzzing need:
 
 ```sh
-mise run linux-dev -- cargo test --locked -p paludarium-harness --test diff_u1 -- --nocapture
+mise run linux-dev -- cargo test --locked -p paludarium-harness --test diff_core -- --nocapture
 ```
 
 The working tree is copied into a named volume first, so Docker Desktop does

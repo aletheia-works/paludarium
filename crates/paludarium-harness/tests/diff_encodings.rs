@@ -2,10 +2,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[path = "support/u3.rs"]
+#[path = "support/encodings.rs"]
 mod support;
 
-#[path = "support/u3_oracle.rs"]
+#[path = "support/encodings_oracle.rs"]
 mod oracle;
 
 #[test]
@@ -33,7 +33,7 @@ fn u3_fresh_native_differential() {
         let output = root.join("target/u3-guests");
         assert!(
             std::process::Command::new("bash")
-                .arg(root.join("tests/guests/u3/build.sh"))
+                .arg(root.join("tests/guests/encodings/build.sh"))
                 .arg(&output)
                 .status()
                 .unwrap()
@@ -74,7 +74,7 @@ fn u3_fresh_native_differential() {
 fn u3_runner_bootstrap() {
     assert!(
         paludarium_harness::workspace_root()
-            .join("tests/guests/u3/build.sh")
+            .join("tests/guests/encodings/build.sh")
             .is_file()
     );
 }
@@ -125,7 +125,7 @@ fn u3_native_observation() {
         let output = root.join("target/u3-guests");
         assert!(
             std::process::Command::new("bash")
-                .arg(root.join("tests/guests/u3/build.sh"))
+                .arg(root.join("tests/guests/encodings/build.sh"))
                 .arg(&output)
                 .status()
                 .expect("build native U3 fixtures")

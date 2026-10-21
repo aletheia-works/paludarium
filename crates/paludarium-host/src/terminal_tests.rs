@@ -73,8 +73,8 @@ fn u9_native_managed_pty() {
         assert_eq!(NativeHost.terminal_info(StreamId::Stdout), Ok(None));
         return;
     }
-    let helper =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/guests/u9/host-pty.py");
+    let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/guests/terminal/host-pty.py");
     assert!(
         std::process::Command::new("python3")
             .arg(helper)

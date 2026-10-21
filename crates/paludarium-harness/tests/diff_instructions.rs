@@ -1,7 +1,7 @@
 //! U2 native expectations are generated on every execution.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#[path = "support/u2.rs"]
+#[path = "support/instructions.rs"]
 mod support;
 use paludarium_harness::{compare, ensure_guests_built, guest_dir, run_emulated, run_native};
 static GUESTS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -46,7 +46,7 @@ fn cmps_fault(name: &'static str, completed: u64) {
         let root = paludarium_harness::workspace_root();
         let dir = paludarium_harness::guest_dir().join("u2").join(name);
         let built = std::process::Command::new("bash")
-            .arg(root.join("tests/guests/u2/build.sh"))
+            .arg(root.join("tests/guests/instructions/build.sh"))
             .arg(&dir)
             .status()
             .expect("build native fault observer");
@@ -174,7 +174,9 @@ fn atomic_fault(name: &'static str, scenario: &'static str, misaligned: bool, cr
         let dir = guest_dir().join("u2").join(name);
         assert!(
             std::process::Command::new("bash")
-                .arg(paludarium_harness::workspace_root().join("tests/guests/u2/build.sh"))
+                .arg(
+                    paludarium_harness::workspace_root().join("tests/guests/instructions/build.sh")
+                )
                 .arg(&dir)
                 .status()
                 .unwrap()
@@ -325,7 +327,7 @@ fn divide_fault(name: &'static str, scenario: &'static str, signed: bool, overfl
         let dir = paludarium_harness::guest_dir().join("u2").join(name);
         assert!(
             std::process::Command::new("bash")
-                .arg(root.join("tests/guests/u2/build.sh"))
+                .arg(root.join("tests/guests/instructions/build.sh"))
                 .arg(&dir)
                 .status()
                 .unwrap()
@@ -414,7 +416,9 @@ fn u2_pop_fault_preserves_stack_and_flags() {
         let dir = paludarium_harness::guest_dir().join("u2/pop-fault");
         assert!(
             std::process::Command::new("bash")
-                .arg(paludarium_harness::workspace_root().join("tests/guests/u2/build.sh"))
+                .arg(
+                    paludarium_harness::workspace_root().join("tests/guests/instructions/build.sh")
+                )
                 .arg(&dir)
                 .status()
                 .unwrap()
@@ -477,7 +481,9 @@ fn enter_fault(name: &'static str, allocation: bool) {
         let dir = guest_dir().join("u2").join(name);
         assert!(
             std::process::Command::new("bash")
-                .arg(paludarium_harness::workspace_root().join("tests/guests/u2/build.sh"))
+                .arg(
+                    paludarium_harness::workspace_root().join("tests/guests/instructions/build.sh")
+                )
                 .arg(&dir)
                 .status()
                 .unwrap()

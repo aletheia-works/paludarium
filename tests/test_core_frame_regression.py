@@ -4,7 +4,7 @@ import importlib.util
 import unittest
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts/u1-frame-regression.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts/core-frame-regression.py"
 SPEC = importlib.util.spec_from_file_location("frame_regression", SCRIPT)
 regression = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(regression)

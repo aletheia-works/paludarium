@@ -3,7 +3,7 @@
 # Run a command inside the native x86-64 Linux development container
 # (ci/linux-dev/Dockerfile).
 #
-#   mise run linux-dev -- cargo test --locked -p paludarium-harness --test diff_u1
+#   mise run linux-dev -- cargo test --locked -p paludarium-harness --test diff_core
 #
 # By default the working tree is copied (tar) into the named volume
 # `paludarium-work` before every run, so it also works when Docker Desktop does

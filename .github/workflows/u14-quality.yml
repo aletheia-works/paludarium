@@ -359,7 +359,7 @@ jobs:
       # Builds the guests from source (BR7.2), runs each natively and under
       # the emulator, compares stdout/stderr/exit status (BR7.1) and prints
       # the run times (NFR6.1).
-      - run: cargo test --locked -p paludarium-harness --test diff_u1 --test diff_u2 --test parallel_u2 --test diff_u4 --test diff_u9 --test diff_u3 --test diff_u8 --test diff_u14 -- --nocapture
+      - run: cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_u14 -- --nocapture
       - name: Retain fresh U3 architectural observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -401,7 +401,7 @@ jobs:
       - name: Generate fresh U3 native inputs before instrumented library tests
         shell: bash
         run: |
-          bash tests/guests/u3/build.sh target/u3-guests
+          bash tests/guests/encodings/build.sh target/u3-guests
           python3 - <<'PY_NATIVE'
           from pathlib import Path
           import subprocess, os, signal, json, hashlib
@@ -466,13 +466,13 @@ jobs:
 
       - name: U9 target crates line coverage >= 80%
         run: |
-          cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_u9 --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/' --fail-under-lines 80 --lcov --output-path target/u9-coverage.lcov
+          cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_terminal --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/' --fail-under-lines 80 --lcov --output-path target/u9-coverage.lcov
           cargo llvm-cov report --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/'
         env:
           RUST_TEST_THREADS: "1"
       - name: U3 CPU and Decoder line coverage >= 80%
         run: |
-          cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_u3 --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/' --fail-under-lines 80 --lcov --output-path target/u3-coverage.lcov
+          cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/' --fail-under-lines 80 --lcov --output-path target/u3-coverage.lcov
           cargo llvm-cov report --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/'
         env:
           RUST_TEST_THREADS: "1"
@@ -531,7 +531,7 @@ jobs:
       - name: Generate fresh U3 native inputs before instrumented library tests
         shell: bash
         run: |
-          bash tests/guests/u3/build.sh target/u3-guests
+          bash tests/guests/encodings/build.sh target/u3-guests
           python3 - <<'PY_NATIVE'
           from pathlib import Path
           import subprocess, os, signal, json, hashlib

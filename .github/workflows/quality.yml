@@ -49,7 +49,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: "26.12.0"
+          node-version: 'latest'
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.15'
@@ -214,10 +214,10 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: "26.12.0"
+          node-version: 'latest'
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: '26.12.0'
+          node-version: 'latest'
       - uses: ./.github/actions/rust-toolchain
         with:
           args: component add rust-src --toolchain nightly-2026-10-11
@@ -257,7 +257,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: "26.12.0"
+          node-version: 'latest'
       # rustup installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -300,7 +300,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: "26.12.0"
+          node-version: 'latest'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: rustfmt
         run: |
@@ -324,7 +324,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: "26.12.0"
+          node-version: 'latest'
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: cargo-deny
@@ -349,7 +349,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: "26.12.0"
+          node-version: 'latest'
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile
         run: |
@@ -390,7 +390,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: "26.12.0"
+          node-version: 'latest'
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile
         run: |
@@ -515,7 +515,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: '26.12.0'
+          node-version: 'latest'
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: aqua:taiki-e/cargo-llvm-cov
@@ -573,7 +573,7 @@ jobs:
           python-version: '3.15.0'
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: '26.12.0'
+          node-version: 'latest'
       - run: python3 -m pip install 'coverage==7.16.2'
       - run: npm install --global npm@12.2.0
       - uses: ./.github/actions/rust-toolchain

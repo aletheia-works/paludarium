@@ -34,7 +34,7 @@ Before each release, the same code is checked to give the same results on all
 of these ([Testing and verification](../design/quality)):
 
 - Linux, macOS and Windows (GitHub Actions runners)
-- Node.js 26.12.0
+- Node.js (the latest release at the time of the check)
 - Chromium, Firefox, and the real Safari (on a macOS runner)
 
 ## In the browser

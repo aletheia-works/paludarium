@@ -316,12 +316,7 @@ def package_check(root):
         for name in ("README.md", "LICENSE"):
             shutil.copyfile(root / name, copy / "packages/paludarium-wasm" / name)
         stage = "npm"
-        node = Path(
-            os.environ.get(
-                "PALUDARIUM_TEST_NODE",
-                "/Users/mutoakio/.local/share/mise/installs/node/26.12.0/bin/node",
-            )
-        )
+        node = Path(os.environ.get("PALUDARIUM_TEST_NODE") or shutil.which("node") or "node")
         npm = Path(
             os.environ.get(
                 "PALUDARIUM_RELEASE_NPM",

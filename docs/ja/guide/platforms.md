@@ -33,7 +33,7 @@ macOS と Windows でも、Linux のバイナリを直接 exec するのでは�
 （[テストと検証](../design/quality)）。
 
 - Linux・macOS・Windows（GitHub Actions のランナー）
-- Node.js 26.12.0
+- Node.js（確かめた時点の最新版）
 - Chromium、Firefox、本物の Safari（macOS のランナー）
 
 ## ブラウザで必要なもの

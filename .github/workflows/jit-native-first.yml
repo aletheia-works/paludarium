@@ -105,15 +105,15 @@ jobs:
           python-version: '3.15.0'
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: "26.12.0"
+          node-version: 'latest'
       - name: Bounded native instruction observations
         shell: bash
         run: |
           set -euo pipefail
           node_path="$(command -v node)"
           case "$node_path" in /*/shims/*) exit 1 ;; /*) ;; *) exit 1 ;; esac
-          test "$("$node_path" --version)" = v26.12.0
           mkdir -p target/jit-native-first
+          "$node_path" --version > target/jit-native-first/node.txt
           uname -a > target/jit-native-first/platform.txt
           gcc --version > target/jit-native-first/compiler.txt
           python --version > target/jit-native-first/python.txt

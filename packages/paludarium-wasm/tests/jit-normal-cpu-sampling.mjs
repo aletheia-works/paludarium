@@ -120,7 +120,7 @@ async function runGuest(args,jit){
 }
 export async function main(args){
  need(args.length===5,'usage: normal-module receipt fresh-oracle probe exclusive-output');
- need(process.version==='v26.12.0'&&!process.execPath.includes('/shims/'),'actual Node26.12 required');
+ need(!process.execPath.includes('/shims/'),'actual Node required, not a version-manager shim');
  const input=await identity(...args.slice(0,4));const out=resolve(args[4]);await mkdir(out,{recursive:false});
  const inputHashes=Object.fromEntries(await Promise.all(args.slice(0,4).map(async p=>[resolve(p),sha(await readFile(p))])));
  const report={schema:1,purpose:'normal-cpu-sampling',performanceAcceptance:false,...input.identity,tools:{node:process.version,nodePath:process.execPath,v8:process.versions.v8},samplingIntervalMicroseconds:1000,scope:'full process window including startup, guest and strict cleanup; sampled counts not elapsed attribution or acceptance',rows:[],complete:false,passed:false};

@@ -71,7 +71,7 @@ def differential(executable, *, original_argv=False):
     guests = pathlib.Path(
         os.environ.get("PALUDARIUM_U10_GUEST_DIR", ROOT / "target/guests/u10")
     ).resolve()
-    output = ROOT / "target/u10/differential"
+    output = ROOT / "target/programs/differential"
     if original_argv:
         output = output / "original-argv"
     output.mkdir(parents=True, exist_ok=True)

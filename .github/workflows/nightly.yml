@@ -1,6 +1,6 @@
 # Nightly checks (team.md Testing Posture, Q7; CI Pipeline design ci-config.md, Q2 A):
-# fuzzing (u14-fuzz.yml: thirteen targets for 600 seconds each with ASan and LSan) and the
-# full quality check (u14-quality.yml: Linux, macOS and Windows, the four wasm environments
+# fuzzing (fuzz-nightly.yml: thirteen targets for 600 seconds each with ASan and LSan) and the
+# full quality check (quality.yml: Linux, macOS and Windows, the four wasm environments
 # with the real Safari, JIT on/off agreement and the frozen performance measurement).
 # A failure opens an Issue to be fixed (a later failing night comments on it) and the
 # next passing night closes it; it never blocks a merge. Actions are pinned by
@@ -17,9 +17,9 @@ permissions:
 
 jobs:
   fuzz:
-    uses: ./.github/workflows/u14-fuzz.yml
+    uses: ./.github/workflows/fuzz-nightly.yml
   quality:
-    uses: ./.github/workflows/u14-quality.yml
+    uses: ./.github/workflows/quality.yml
 
   report:
     needs: [fuzz, quality]

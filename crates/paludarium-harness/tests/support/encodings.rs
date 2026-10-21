@@ -17,7 +17,7 @@ pub fn bounded(name: &str, run: impl FnOnce()) {
         return;
     }
     let done = paludarium_harness::workspace_root()
-        .join("target/u3-bounded")
+        .join("target/encodings-bounded")
         .join(format!("{name}-{}.done", std::process::id()));
     std::fs::create_dir_all(done.parent().expect("marker directory"))
         .expect("create marker directory");

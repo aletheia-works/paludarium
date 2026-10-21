@@ -60,9 +60,21 @@ locals {
     "differential tests (x86-64 Linux)",
     "line coverage >= 80%",
     "production wasm (shared Rust heap, nested Workers)",
-    # The fixed-guest programs, wasm programs and fuzz gates are left out while
-    # their jobs are renamed after the units they cover; the renaming change
-    # adds them back under the new names.
+    "fixed guest programs / native-first",
+    "fixed guest programs / fixture-metadata-oracle",
+    "fixed guest programs / differential",
+    "wasm-programs / build-oracle",
+    "wasm-programs / differential (ubuntu-latest, node)",
+    "wasm-programs / differential (ubuntu-latest, chromium)",
+    "wasm-programs / differential (ubuntu-latest, firefox)",
+    "wasm-programs / differential (macos-latest, safari)",
+    "fuzz / fuzz (load_elf)",
+    "fuzz / fuzz (syscall_args)",
+    "fuzz / fuzz (vfs_paths)",
+    "fuzz / fuzz (kernel_futex)",
+    "fuzz / fuzz (kernel_threads)",
+    "fuzz / fuzz (kernel_events)",
+    "fuzz / fuzz (kernel_sockets)",
   ]
 }
 

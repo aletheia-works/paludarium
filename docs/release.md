@@ -34,7 +34,7 @@ python3 -B scripts/release/check.py --mode validate
 python3 -B scripts/release/check.py --mode package-check
 ```
 
-`package-check` creates an exclusive `target/u15/package-*` directory. It
+`package-check` creates an exclusive `target/release-evidence/package-*` directory. It
 retains argv, tool SHA, stdout, stderr, real exit/timeout/reaping, source and
 lock before/after hashes. The original source is never rewritten. It builds
 eleven real `.crate` files, checks all members and normalized dependencies,
@@ -76,10 +76,10 @@ names them differently.
 | `three-os` | `ci.yml` (push to main) | `unit tests (ubuntu-latest)`, `unit tests (macos-latest)`, `unit tests (windows-latest)` |
 | `lint` | `ci.yml` | `lint` |
 | `dependencies` | `ci.yml` | `dependencies` |
-| `linux-differential` | `ci.yml` | `differential tests (x86-64 Linux)`, `U10 fixed guests and fresh native differential / differential` |
+| `linux-differential` | `ci.yml` | `differential tests (x86-64 Linux)`, `fixed guest programs / differential` |
 | `rust-coverage` | `ci.yml` | `line coverage >= 80%` |
 | `u9-coverage` | `ci.yml` | `line coverage >= 80%` (its step `U9 target crates line coverage >= 80%` fails under 80%) |
-| `js-coverage` | `u14-quality.yml` (dispatch on main) | `u11-programs / differential (ubuntu-latest, node)` (its step `Fixed production JavaScript coverage` fails under 80%) |
+| `js-coverage` | `quality.yml` (dispatch on main) | `wasm-programs / differential (ubuntu-latest, node)` (its step `Fixed production JavaScript coverage` fails under 80%) |
 | `package-check` | `release-check.yml` (dispatch on main) | `packages` |
 
 ### Acceptance conditions (`ACCEPTANCE`)
@@ -91,11 +91,11 @@ built guests differ by design.
 
 | Source | Workflow / job | Artifact: members read |
 |---|---|---|
-| Linux native | `ci.yml` / `U10 fixed guests and fresh native differential / differential` | `u10-differential`: `observations.json`, `native/observations.json` |
-| macOS native | `u12-quality.yml` / `macos-host` | `u12-macos-host`: `comparison/observations.json`, `comparison-original/observations.json`; `u12-native-first`: `u12/native/observations.json`, `u12/native-original/observations.json` |
-| Windows native | `u14-quality.yml` / `windows-host` | `u13-windows-host`: `windows/comparison/observations.json`, `windows/comparison-original/observations.json`; `u13-native-first`: `u13/native/observations.json`, `u13/native-original/observations.json` |
-| Wasm Node, Chromium, Firefox, Safari | `u14-quality.yml` / `u11-programs / differential (ubuntu-latest, node)`, `(ubuntu-latest, chromium)`, `(ubuntu-latest, firefox)`, `(macos-latest, safari)` | `u11-<environment>`: `observations.json`; `u11-acceptance-inputs`: `target/u11/native/observations.json` |
-| Performance | `u14-quality.yml` / `u11-programs / differential (ubuntu-latest, node)` | `u11-node`: `performance/observations.json` |
+| Linux native | `ci.yml` / `fixed guest programs / differential` | `programs-differential`: `observations.json`, `native/observations.json` |
+| macOS native | `macos-quality.yml` / `macos-host` | `macos-host`: `comparison/observations.json`, `comparison-original/observations.json`; `macos-native-first`: `macos/native/observations.json`, `macos/native-original/observations.json` |
+| Windows native | `quality.yml` / `windows-host` | `windows-host`: `windows/comparison/observations.json`, `windows/comparison-original/observations.json`; `windows-native-first`: `windows/native/observations.json`, `windows/native-original/observations.json` |
+| Wasm Node, Chromium, Firefox, Safari | `quality.yml` / `wasm-programs / differential (ubuntu-latest, node)`, `(ubuntu-latest, chromium)`, `(ubuntu-latest, firefox)`, `(macos-latest, safari)` | `wasm-<environment>`: `observations.json`; `wasm-acceptance-inputs`: `target/wasm/native/observations.json` |
+| Performance | `quality.yml` / `wasm-programs / differential (ubuntu-latest, node)` | `wasm-node`: `performance/observations.json` |
 
 | Condition | Sources | What is checked in the artifact content |
 |---|---|---|
@@ -108,27 +108,27 @@ Shared checks: all native documents are complete (`differential_complete`,
 `native_complete`), each artifact is unexpired, belongs to the selected run
 and head, and its ZIP matches the official `digest` and size. The four Wasm
 environments must report one module and one oracle digest (the exact bytes of
-`u11-acceptance-inputs`), and the measurement must name the same module,
+`wasm-acceptance-inputs`), and the measurement must name the same module,
 oracle and probe. `artifact_sha256` of each condition is the SHA-256 of the
 sorted `[source, artifact, artifact id, official digest]` list it was checked
 against; the document also keeps every member's SHA-256.
 
-The FR8.3 step in `u14-quality.yml` runs only on `workflow_dispatch` and has
+The FR8.3 step in `quality.yml` runs only on `workflow_dispatch` and has
 `continue-on-error: true`, so a successful run does not mean FR8.3 passed:
 only `performance/observations.json` decides. It is measured once per head;
 dispatching again to wait for a pass is not allowed (a second run is also
 rejected as ambiguous). Most source artifacts are kept for 7 days
-(`u12-macos-host` and the native-first oracles for 14), so the acceptance
+(`macos-host` and the native-first oracles for 14), so the acceptance
 artifact must be produced within 7 days of the quality runs.
 
 ### Producer
 
-`.github/workflows/u15-acceptance.yml` runs only by dispatch (by a person,
+`.github/workflows/release-acceptance.yml` runs only by dispatch (by a person,
 or by the evidence job of `publish.yml` below), with
 `contents: read` and `actions: read`, SHA-pinned actions and
 `persist-credentials: false`. It runs
-`python -B scripts/release/acceptance.py --output target/u15/release-evidence.json`
-and uploads one artifact `u15-acceptance` whose only member is
+`python -B scripts/release/acceptance.py --output target/release-evidence/release-evidence.json`
+and uploads one artifact `release-acceptance` whose only member is
 `release-evidence.json` (fields `head`, `quality`, `acceptance`, plus the
 checked `evidence`). The producer refuses to run outside upstream or for a
 ref other than `refs/heads/main`. It has no inputs: publication is by Trusted
@@ -225,10 +225,10 @@ itself.
    on its registry without this version: a missing package (step 3) or a
    version already partly on a registry (re-run the stopped jobs of the
    earlier `Publish` run instead) stops it before any dispatch. It then
-   waits for the `ci.yml` push run, dispatches `u12-quality.yml`,
-   `u14-quality.yml` and `release-check.yml` once each (a run a person
+   waits for the `ci.yml` push run, dispatches `macos-quality.yml`,
+   `quality.yml` and `release-check.yml` once each (a run a person
    already dispatched for the head is reused, never doubled), waits for all
-   of them, then dispatches `u15-acceptance.yml` once and waits for it. A
+   of them, then dispatches `release-acceptance.yml` once and waits for it. A
    failed run is not dispatched again (FR8.3 is measured once per head);
    the head then needs a person. When the version is already tagged or the
    head is no longer main, the run does nothing.
@@ -236,14 +236,14 @@ itself.
    **By hand** (only when the automatic run stopped and the cause is
    fixed). On the release head, while it is still the main head, the
    `ci.yml` push run starts by itself; dispatch each of the others once:
-   `gh workflow run u12-quality.yml --repo aletheia-works/paludarium --ref main`,
-   the same for `u14-quality.yml` and `release-check.yml`. When all four
-   have succeeded (do not dispatch `u14-quality.yml` again to wait for a
+   `gh workflow run macos-quality.yml --repo aletheia-works/paludarium --ref main`,
+   the same for `quality.yml` and `release-check.yml`. When all four
+   have succeeded (do not dispatch `quality.yml` again to wait for a
    passing FR8.3; if FR8.3 fails, record it and stop), dispatch, within 7
    days,
-   `gh workflow run u15-acceptance.yml --repo aletheia-works/paludarium --ref main`,
+   `gh workflow run release-acceptance.yml --repo aletheia-works/paludarium --ref main`,
    then `publish.yml` once: its evidence job reuses those runs. Confirm:
-   the u15 run succeeded and its artifact `u15-acceptance` holds only
+   the release-acceptance run succeeded and its artifact `release-acceptance` holds only
    `release-evidence.json`, with that head, eight `quality` rows and the
    four `acceptance` IDs all `passed: true`.
 6. **Publication, then tag: automatic.** When the evidence of step 5
@@ -259,10 +259,10 @@ itself.
    that was not published therefore never gets a tag, and no tag is ever
    deleted or moved. Confirm: the run succeeded and
    `publication-progress.json` (in the run's artifact
-   `u15-publication-progress-attempt-<n>`) lists all eleven
+   `publication-progress-attempt-<n>`) lists all eleven
    crates and `@aletheia-works/paludarium-wasm`; then, independently, each crate's
    `https://crates.io/api/v1/crates/<name>/<version>` `checksum` equals the
-   `.crate` SHA-256 in the `u15-package` artifact, `npm view
+   `.crate` SHA-256 in the `release-package` artifact, `npm view
    @aletheia-works/paludarium-wasm@<version> dist.integrity` equals the tarball's SHA-512
    integrity, and the npm provenance attestation names the upstream
    repository, `publish.yml` and that head.
@@ -300,7 +300,7 @@ just-uploaded version that still answers 404 is asked again every 15 seconds
 for up to 15 minutes (the first npm upload took about five minutes to appear).
 
 On partial failure, preserve `publication-progress.json` (the run's artifact
-`u15-publication-progress-attempt-<n>`, uploaded even when the job stops), attempted uploads,
+`publication-progress-attempt-<n>`, uploaded even when the job stops), attempted uploads,
 unverified uploads and all logs. Do not delete, replace, move a tag or retry
 publication automatically. An owner must inspect registry state and propose
 the remaining recovery. Re-running the stopped jobs of the same `Publish`

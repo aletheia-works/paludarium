@@ -1,17 +1,17 @@
-# U15 same-head acceptance evidence (FR10.1). publish.yml's evidence job (or
+# Same-head release acceptance evidence (FR10.1). publish.yml's evidence job (or
 # a person) dispatches this on main of the upstream repository after the
 # same-head quality runs listed in docs/release.md have completed. It only reads official run, job and
-# artifact metadata and produces one artifact, u15-acceptance, holding
+# artifact metadata and produces one artifact, release-acceptance, holding
 # release-evidence.json. It never tags, approves or publishes. Actions are
 # pinned by commit SHA and the token is read-only (NFR8.2).
-name: U15 same-head acceptance evidence
+name: Same-head release acceptance evidence
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: u15-acceptance-${{ github.sha }}
+  group: release-acceptance-${{ github.sha }}
   cancel-in-progress: false
 jobs:
   acceptance:
@@ -27,9 +27,9 @@ jobs:
       - name: Collect same-head official quality and acceptance evidence
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python -B scripts/release/acceptance.py --output target/u15/release-evidence.json
+        run: python -B scripts/release/acceptance.py --output target/release-evidence/release-evidence.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: u15-acceptance
-          path: target/u15/release-evidence.json
+          name: release-acceptance
+          path: target/release-evidence/release-evidence.json
           if-no-files-found: error

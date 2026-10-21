@@ -1,4 +1,4 @@
-"""u15-acceptance producer tests. The GitHub adapter is replaced by an in-memory
+"""release-acceptance producer tests. The GitHub adapter is replaced by an in-memory
 world built from the real artifact schemas; nothing reaches the network, and a
 passing test is not evidence that any real run, registry or approval exists."""
 
@@ -93,28 +93,28 @@ class World:
         for workflow, name, _ in A.SOURCES.values():
             self.add_job(workflow, name)
         self.members = {w: {} for w in self.runs}
-        self.members[A.CI]["u10-differential"] = {
+        self.members[A.CI]["programs-differential"] = {
             "observations.json": encode(emulated()),
             "native/observations.json": encode(native()),
         }
-        self.members[A.U12]["u12-macos-host"] = {
+        self.members[A.U12]["macos-host"] = {
             "comparison/observations.json": encode(emulated()),
             "comparison-original/observations.json": encode(emulated()),
         }
-        self.members[A.U12]["u12-native-first"] = {
-            "u12/native/observations.json": encode(native()),
-            "u12/native-original/observations.json": encode(native()),
+        self.members[A.U12]["macos-native-first"] = {
+            "macos/native/observations.json": encode(native()),
+            "macos/native-original/observations.json": encode(native()),
         }
-        self.members[A.U14]["u13-windows-host"] = {
+        self.members[A.U14]["windows-host"] = {
             "windows/comparison/observations.json": encode(emulated()),
             "windows/comparison-original/observations.json": encode(emulated()),
         }
-        self.members[A.U14]["u13-native-first"] = {
-            "u13/native/observations.json": encode(native()),
-            "u13/native-original/observations.json": encode(native()),
+        self.members[A.U14]["windows-native-first"] = {
+            "windows/native/observations.json": encode(native()),
+            "windows/native-original/observations.json": encode(native()),
         }
-        self.members[A.U14]["u11-acceptance-inputs"] = {
-            "target/u11/native/observations.json": self.oracle
+        self.members[A.U14]["wasm-acceptance-inputs"] = {
+            "target/wasm/native/observations.json": self.oracle
         }
         for environment in A.WASM_OS:
             document = dict(
@@ -161,7 +161,7 @@ class World:
                         },
                     }
                 )
-            self.members[A.U14]["u11-" + environment] = members
+            self.members[A.U14]["wasm-" + environment] = members
         self.tamper = {}
 
     def add_job(self, workflow, name):
@@ -285,7 +285,7 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_unfinished_run(self):
         self.world.runs[A.U14].update(status="in_progress", conclusion=None)
-        self.rejected("u14-quality.yml: run unfinished")
+        self.rejected("quality.yml: run unfinished")
 
     def test_failed_job(self):
         self.world.jobs[A.CI]["lint"]["conclusion"] = "failure"
@@ -294,22 +294,22 @@ class AcceptanceTests(unittest.TestCase):
     def test_other_head(self):
         with self.subTest("run"):
             self.world.runs[A.U12]["head_sha"] = OTHER
-            self.rejected("u12-quality.yml: 0 official")
+            self.rejected("macos-quality.yml: 0 official")
         with self.subTest("artifact"):
             self.world = World()
-            self.world.tamper["u12-macos-host"] = dict(workflow_run=dict(id=0, head_sha=OTHER))
-            self.rejected("u12-macos-host: expired or from another run/head")
+            self.world.tamper["macos-host"] = dict(workflow_run=dict(id=0, head_sha=OTHER))
+            self.rejected("macos-host: expired or from another run/head")
         with self.subTest("performance document"):
             self.world = World()
             self.world.edit(
-                A.U14, "u11-node", "performance/observations.json", lambda d: d.update(head=OTHER)
+                A.U14, "wasm-node", "performance/observations.json", lambda d: d.update(head=OTHER)
             )
             self.rejected("FR8.3 not met by performance")
 
     def test_other_repository(self):
         with self.subTest("fork pull request run is not official"):
             self.world.runs[A.U12]["head_repository"] = dict(full_name="attacker/paludarium")
-            self.rejected("u12-quality.yml: 0 official")
+            self.rejected("macos-quality.yml: 0 official")
         with self.subTest("fork workflow run"):
             environ = dict(
                 GITHUB_REPOSITORY="Marukome0743/paludarium",
@@ -320,8 +320,8 @@ class AcceptanceTests(unittest.TestCase):
                 A.main(["--output", "unused.json"], environ, self.world.api())
 
     def test_artifact_digest_differs(self):
-        self.world.tamper["u12-macos-host"] = dict(digest="sha256:" + "0" * 64)
-        self.rejected("u12-macos-host: official artifact digest/size differs")
+        self.world.tamper["macos-host"] = dict(digest="sha256:" + "0" * 64)
+        self.rejected("macos-host: official artifact digest/size differs")
 
     def test_fr83_not_passed(self):
         def failed(document):
@@ -329,7 +329,7 @@ class AcceptanceTests(unittest.TestCase):
             document["result"].update(p=529 / 1024, meanJit=5.4987, meanInterpreter=5.4972)
             document["result"]["pass"] = False
 
-        self.world.edit(A.U14, "u11-node", "performance/observations.json", failed)
+        self.world.edit(A.U14, "wasm-node", "performance/observations.json", failed)
         self.rejected("FR8.3 not met by performance")
 
     def test_duplicate_purpose_runs(self):
@@ -353,13 +353,13 @@ class AcceptanceTests(unittest.TestCase):
         def fail(document):
             document["rows"]["probe-rayon"]["stdout"] = "FAIL rayon\n"
 
-        self.world.edit(A.U14, "u13-windows-host", "windows/comparison/observations.json", fail)
+        self.world.edit(A.U14, "windows-host", "windows/comparison/observations.json", fail)
         self.rejected("FR6.3 not met by windows-native")
 
     def test_jit_mode_failure(self):
         self.world.edit(
             A.U14,
-            "u11-firefox",
+            "wasm-firefox",
             "observations.json",
             lambda d: d["modes"]["jit"].update(passed=False),
         )
@@ -368,7 +368,7 @@ class AcceptanceTests(unittest.TestCase):
     def test_guest_bytes_differ_from_oracle(self):
         self.world.edit(
             A.U14,
-            "u13-windows-host",
+            "windows-host",
             "windows/comparison/observations.json",
             lambda d: d["binary_hashes"].update(aube="9" * 64),
         )
@@ -376,13 +376,13 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_wasm_module_differs(self):
         self.world.edit(
-            A.U14, "u11-safari", "observations.json", lambda d: d.update(module_sha256="4" * 64)
+            A.U14, "wasm-safari", "observations.json", lambda d: d.update(module_sha256="4" * 64)
         )
         self.rejected("wasm environments ran different modules")
 
     def test_incomplete_rows(self):
         self.world.edit(
-            A.CI, "u10-differential", "observations.json", lambda d: d["rows"].pop("frozen")
+            A.CI, "programs-differential", "observations.json", lambda d: d["rows"].pop("frozen")
         )
         self.rejected("row population incomplete")
 
@@ -398,18 +398,18 @@ class AcceptanceTests(unittest.TestCase):
         item = next(
             i
             for i in api.listings[("artifacts", self.world.runs[A.U12]["id"])]
-            if i["name"] == "u12-macos-host"
+            if i["name"] == "macos-host"
         )
         api.archives[item["archive_download_url"]] = b"not a zip"
         item.update(digest="sha256:" + A.sha(b"not a zip"), size_in_bytes=9)
-        with self.assertRaisesRegex(ValueError, "u12-macos-host: unreadable artifact"):
+        with self.assertRaisesRegex(ValueError, "macos-host: unreadable artifact"):
             A.produce(api, HEAD)
 
     def test_main_writes_exclusive_output(self):
         environ = dict(
             GITHUB_REPOSITORY=policy.REPOSITORY, GITHUB_REF="refs/heads/main", GITHUB_SHA=HEAD
         )
-        with tempfile.TemporaryDirectory(dir=ROOT / "target/u15") as directory:
+        with tempfile.TemporaryDirectory(dir=ROOT / "target/release-evidence") as directory:
             output = Path(directory) / "out/release-evidence.json"
             with patch("builtins.print"):
                 summary = A.main(["--output", str(output)], environ, self.world.api())
@@ -485,7 +485,7 @@ class AdapterTests(unittest.TestCase):
         self.assertIsInstance(A.GitHubApi("t").opener, urllib.request.OpenerDirector)
 
     def test_workflow_contract(self):
-        text = (ROOT / ".github/workflows/u15-acceptance.yml").read_text()
+        text = (ROOT / ".github/workflows/release-acceptance.yml").read_text()
         trigger = text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         self.assertIn("workflow_dispatch:", trigger)
         self.assertNotRegex(trigger, r"\n  (push|pull_request|schedule|workflow_call):")
@@ -497,9 +497,12 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", a) for a in actions))
         self.assertIn("persist-credentials: false", text)
         self.assertIn("timeout-minutes:", text)
-        self.assertEqual(re.findall(r"\n\s+name: (u15-[a-z-]+)\n", text), ["u15-acceptance"])
         self.assertEqual(
-            re.findall(r"\n\s+path: (\S+)\n", text), ["target/u15/release-evidence.json"]
+            re.findall(r"\n\s+name: (release-[a-z-]+)\n", text), ["release-acceptance"]
+        )
+        self.assertEqual(
+            re.findall(r"\n\s+path: (\S+)\n", text),
+            ["target/release-evidence/release-evidence.json"],
         )
         # Trusted Publishing only: dispatched with no inputs and no declaration.
         self.assertEqual(trigger.strip(), "workflow_dispatch:")
@@ -517,7 +520,7 @@ class AcceptanceIntegrationTests(unittest.TestCase):
             archive.writestr("release-evidence.json", json.dumps(document))
         raw = buffer.getvalue()
         artifact = dict(
-            name="u15-acceptance",
+            name="release-acceptance",
             expired=False,
             workflow_run=dict(head_sha=HEAD),
             digest="sha256:" + A.sha(raw),

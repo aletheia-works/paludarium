@@ -27,7 +27,7 @@ class ApiTests(unittest.TestCase):
             GITHUB_RUN_ID="101",
             GH_TOKEN="not-a-real-token",
         )
-        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "target/u15")
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "target/release-evidence")
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "evidence.json"
         self.path.write_text(json.dumps(self.s))
@@ -183,7 +183,7 @@ class ApiTests(unittest.TestCase):
             a.writestr("release-evidence.json", json.dumps(dict(head="a" * 40)))
         raw = buf.getvalue()
         artifact = dict(
-            name="u15-acceptance",
+            name="release-acceptance",
             expired=False,
             workflow_run=dict(head_sha="a" * 40),
             digest="sha256:" + package.sha(raw),
@@ -245,7 +245,7 @@ class ApiTests(unittest.TestCase):
         thread.start()
         try:
             artifact = dict(
-                name="u15-acceptance",
+                name="release-acceptance",
                 expired=False,
                 workflow_run=dict(head_sha="a" * 40),
                 digest="sha256:" + package.sha(raw),

@@ -21,8 +21,8 @@ test("same-source control packs, imports and runs real hello with natural cleanu
   assert.equal(WebAssembly.Module.exports(new WebAssembly.Module(module)).filter(x=>["u14_cost_","u14_micro_","u14_length_"].some(prefix=>x.name.startsWith(prefix))).length,0);
   for(const[name,digest]of Object.entries(receipt.source_files)) assert.equal(hash(await readFile(resolve(root,name))),digest,"fresh control source changed: "+name);
   const manifest=JSON.parse(await readFile(resolve(pkg,"package.json"),"utf8"));
-  await mkdir(resolve(root,"target/u14-v2-packed"),{recursive:true});
-  const work=await mkdtemp(resolve(root,"target/u14-v2-packed/run-")), staged=resolve(work,"staged");
+  await mkdir(resolve(root,"target/jit-v2-packed"),{recursive:true});
+  const work=await mkdtemp(resolve(root,"target/jit-v2-packed/run-")), staged=resolve(work,"staged");
   await mkdir(staged); await cp(resolve(pkg,"package.json"),resolve(staged,"package.json"));
   for(const name of manifest.files) if(name!=="paludarium.wasm") await cp(resolve(pkg,name),resolve(staged,name));
   await writeFile(resolve(staged,"paludarium.wasm"),module);
@@ -41,7 +41,7 @@ test("same-source control packs, imports and runs real hello with natural cleanu
   assert.equal(candidates.length,1,"select exactly one real project npm CLI");
   const run=(command,args,cwd=root)=>execFileSync(command,args,{cwd,encoding:"utf8",timeout:60000,killSignal:"SIGKILL",env:{...process.env,PATH:dirname(process.execPath)+":"+process.env.PATH}});
   assert.equal(run(process.execPath,[candidates[0],"--version"]).trim(),"12.2.0");
-  const packed=JSON.parse(run(process.execPath,[candidates[0],"pack","--json","--ignore-scripts","--pack-destination",work,"--cache",resolve(root,"target/u14-v2-npm-cache")],staged));
+  const packed=JSON.parse(run(process.execPath,[candidates[0],"pack","--json","--ignore-scripts","--pack-destination",work,"--cache",resolve(root,"target/jit-v2-npm-cache")],staged));
   const reports=Array.isArray(packed)?packed:Object.values(packed); assert.equal(reports.length,1);
   assert.ok(reports[0].files.some(x=>x.path==="jit-support.mjs"));
   run("/usr/bin/tar",["-xzf",resolve(work,reports[0].filename),"-C",work]);

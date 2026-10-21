@@ -17,8 +17,8 @@ members = ["."]
 [[bin]]
 bench = false
 doc = false
-name = "cpu_u2"
-path = "fuzz_targets/cpu_u2.rs"
+name = "cpu_instructions"
+path = "fuzz_targets/cpu_instructions.rs"
 test = false
 
 [[bin]]
@@ -38,8 +38,8 @@ test = false
 [[bin]]
 bench = false
 doc = false
-name = "mmu_u2"
-path = "fuzz_targets/mmu_u2.rs"
+name = "mmu_instructions"
+path = "fuzz_targets/mmu_instructions.rs"
 test = false
 
 [[bin]]
@@ -80,29 +80,29 @@ test = false
 [[bin]]
 bench = false
 doc = false
-name = "kernel_threads_u5"
-path = "fuzz_targets/kernel_threads_u5.rs"
+name = "kernel_threads"
+path = "fuzz_targets/kernel_threads.rs"
 test = false
 
 [[bin]]
 bench = false
 doc = false
-name = "kernel_futex_u5"
-path = "fuzz_targets/kernel_futex_u5.rs"
+name = "kernel_futex"
+path = "fuzz_targets/kernel_futex.rs"
 test = false
 
 [[bin]]
 bench = false
 doc = false
-name = "kernel_events_u6"
-path = "fuzz_targets/kernel_events_u6.rs"
+name = "kernel_events"
+path = "fuzz_targets/kernel_events.rs"
 test = false
 
 [[bin]]
 bench = false
 doc = false
-name = "kernel_sockets_u6"
-path = "fuzz_targets/kernel_sockets_u6.rs"
+name = "kernel_sockets"
+path = "fuzz_targets/kernel_sockets.rs"
 test = false
 
 [dependencies]

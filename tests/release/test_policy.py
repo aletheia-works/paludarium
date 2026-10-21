@@ -169,7 +169,7 @@ class PolicyTests(unittest.TestCase):
             self.assertNotIn(key, self.s)
 
     def inherited_dependency(self, field):
-        with tempfile.TemporaryDirectory(dir=ROOT / "target/u15") as directory:
+        with tempfile.TemporaryDirectory(dir=ROOT / "target/release-evidence") as directory:
             root = Path(directory)
             workspace = (ROOT / "Cargo.toml").read_text()
             workspace = workspace.replace(
@@ -250,7 +250,7 @@ class PolicyTests(unittest.TestCase):
         for label, (path, old, new) in drifts.items():
             with (
                 self.subTest(label),
-                tempfile.TemporaryDirectory(dir=ROOT / "target/u15") as directory,
+                tempfile.TemporaryDirectory(dir=ROOT / "target/release-evidence") as directory,
             ):
                 root = Path(directory)
                 members = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["members"]

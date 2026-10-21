@@ -420,10 +420,12 @@ def fetch_acceptance(root):
         catalog = github("actions/runs/" + str(run["id"]) + "/artifacts?per_page=100")
         policy.require(catalog["total_count"] <= 100, "artifact pagination required")
         candidates.extend(
-            a for a in catalog["artifacts"] if a["name"] == "u15-acceptance" and not a["expired"]
+            a
+            for a in catalog["artifacts"]
+            if a["name"] == "release-acceptance" and not a["expired"]
         )
     policy.require(
-        len(candidates) == 1, "same-head reviewed u15-acceptance artifact absent/ambiguous"
+        len(candidates) == 1, "same-head reviewed release-acceptance artifact absent/ambiguous"
     )
     artifact = candidates[0]
     policy.require(artifact["workflow_run"]["head_sha"] == head, "acceptance artifact wrong source")
@@ -487,7 +489,7 @@ def publish_artifacts(root, evidence):
     import zipfile
 
     approved = authorize(root, evidence)
-    directory = root / "target/u15"
+    directory = root / "target/release-evidence"
     result = json.loads((directory / "package-result.json").read_bytes())
     policy.require(
         result["passed"] is True
@@ -514,7 +516,7 @@ def publish_artifacts(root, evidence):
     package.inspect_npm(tarballs[0], expected)
     archives = list(directory.glob("package-*/source-snapshot.zip"))
     policy.require(len(archives) == 1, "source snapshot ambiguous")
-    source = root / "target/u15/publish-source"
+    source = root / "target/release-evidence/publish-source"
     source.mkdir()
     with zipfile.ZipFile(archives[0]) as archive:
         names = archive.namelist()

@@ -6,7 +6,7 @@ import { createPaludarium } from "../index.mjs";
 import { validateOracle } from "./wasm-contract.mjs";
 import { compare, observeProgram, probeCases } from "./wasm-programs.mjs";
 import { compareFilesystem } from "./wasm-filesystem.mjs";
-const [modulePath, oraclePath, guestDirectory = "target/guests/u10", outputDirectory = "target/u11/node", slice] = process.argv.slice(2);
+const [modulePath, oraclePath, guestDirectory = "target/guests/u10", outputDirectory = "target/wasm/node", slice] = process.argv.slice(2);
 if (!modulePath || !oraclePath) throw new Error("usage: wasm-node-check.mjs module oracle [guests] [output] [--probe-only]");
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const oracle = validateOracle(JSON.parse((await readFile(oraclePath, "utf8")).replace(/("mtime_ns"\s*:\s*)(\d+)/g, '$1"$2"')));

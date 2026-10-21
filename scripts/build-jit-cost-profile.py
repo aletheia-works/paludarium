@@ -107,7 +107,7 @@ def main():
         raise ValueError("one actual project-pinned Rust toolchain is required")
     cargo = candidates[0]
     rustc = cargo.with_name("rustc")
-    directory = ROOT / "target/u14-cost-profile"
+    directory = ROOT / "target/jit-cost-profile"
     directory.mkdir(parents=True, exist_ok=True)
     output = directory / (args.kind + ".wasm")
     env = dict(os.environ, RUSTC=str(rustc), RUSTC_WRAPPER="", RUSTFLAGS=FLAGS)

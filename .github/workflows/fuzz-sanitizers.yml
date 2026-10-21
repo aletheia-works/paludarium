@@ -1,0 +1,88 @@
+name: Fuzz eleven targets with ASan and LSan
+on:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [cpu_instructions, mmu_instructions, decode, load_elf, mmu_ops, syscall_args, vfs_paths, kernel_threads, kernel_futex, kernel_events, kernel_sockets]
+    container:
+      image: rust:1-bookworm
+      options: --cap-add=SYS_PTRACE --security-opt=seccomp=unconfined --ulimit=stack=-1
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-10-11
+      ASAN_OPTIONS: detect_leaks=1
+      LSAN_OPTIONS: suppressions=/work/fuzz/lsan.supp
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ln -s "$GITHUB_WORKSPACE" /work
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          args: toolchain install nightly-2026-10-11 --profile minimal
+      - run: cargo install --locked --version 0.13.2 cargo-fuzz
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+      - name: Prepare the observed LLVM symbolizer for the decoder-table suppression
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl
+          curl --fail --location https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          printf '%s\n' 'deb https://apt.llvm.org/bookworm/ llvm-toolchain-bookworm main' > /etc/apt/sources.list.d/llvm-symbolizer.list
+          apt-get update
+          apt-cache policy llvm-24
+          apt-get install -y --no-install-recommends llvm-24
+      - name: Fresh 600 second ASan and LSan observation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /work
+          mkdir -p target/macos-fuzz
+          rustc -Vv > target/macos-fuzz/toolchain.txt
+          cargo -V > target/macos-fuzz/cargo.txt
+          cargo fuzz --version > target/macos-fuzz/cargo-fuzz.txt
+          printf '%s\n' "$GITHUB_SHA" > target/macos-fuzz/head.txt
+          find crates tests packages scripts fuzz/fuzz_targets -type f -print0 | sort -z | xargs -0 sha256sum > target/macos-fuzz/source-before.sha256
+          sha256sum Cargo.lock fuzz/Cargo.lock > target/macos-fuzz/locks-before.sha256
+          ASAN_SYMBOLIZER_PATH="$(command -v llvm-symbolizer-24)"
+          export ASAN_SYMBOLIZER_PATH
+          printf '%s\n' "$ASAN_SYMBOLIZER_PATH" > target/macos-fuzz/symbolizer-path.txt
+          "$ASAN_SYMBOLIZER_PATH" --version > target/macos-fuzz/symbolizer-version.txt
+          dpkg-query -W llvm-24 > target/macos-fuzz/symbolizer-package.txt
+          printf 'ASAN_OPTIONS=%s\nLSAN_OPTIONS=%s\nASAN_SYMBOLIZER_PATH=%s\n' "$ASAN_OPTIONS" "$LSAN_OPTIONS" "${ASAN_SYMBOLIZER_PATH:-}" > target/macos-fuzz/settings.txt
+          sha256sum fuzz/Cargo.lock > target/macos-fuzz/lock-before.sha256
+          date -u > target/macos-fuzz/start.txt
+          extra=()
+          if [ '${{ matrix.target }}' = cpu_instructions ]; then extra=(-max_len=4096); fi
+          if [ '${{ matrix.target }}' = mmu_instructions ]; then extra=(-max_len=4608); fi
+          printf 'seed=1\nmax_total_time=600\ntimeout=30\nrss_limit_mb=2048\nmax_len=%s\n' "${extra[*]:-libFuzzer-default}" >> target/macos-fuzz/settings.txt
+          set +e
+          cargo fuzz run --fuzz-dir fuzz --sanitizer address '${{ matrix.target }}' -- -seed=1 -max_total_time=600 -timeout=30 -rss_limit_mb=2048 "${extra[@]}" 2>&1 | tee target/macos-fuzz/raw.log
+          status=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$status" > target/macos-fuzz/exit.txt
+          date -u > target/macos-fuzz/end.txt
+          sha256sum fuzz/Cargo.lock > target/macos-fuzz/lock-after.sha256
+          cmp target/macos-fuzz/lock-before.sha256 target/macos-fuzz/lock-after.sha256
+          sha256sum Cargo.lock fuzz/Cargo.lock > target/macos-fuzz/locks-after.sha256
+          cmp target/macos-fuzz/locks-before.sha256 target/macos-fuzz/locks-after.sha256
+          sha256sum 'fuzz/target/x86_64-unknown-linux-gnu/release/${{ matrix.target }}' > target/macos-fuzz/binary.sha256
+          find crates tests packages scripts fuzz/fuzz_targets -type f -print0 | sort -z | xargs -0 sha256sum > target/macos-fuzz/source-after.sha256
+          cmp target/macos-fuzz/source-before.sha256 target/macos-fuzz/source-after.sha256
+          test "$status" = 0
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: fuzz-sanitizers-${{ matrix.target }}
+          path: |
+            target/macos-fuzz
+            fuzz/artifacts
+            fuzz/target/x86_64-unknown-linux-gnu/release/${{ matrix.target }}

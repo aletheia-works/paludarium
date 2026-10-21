@@ -215,7 +215,7 @@ def main():
     command = [str(args.cargo), "llvm-cov", "--locked"]
     for package in PACKAGES:
         command += ["-p", package]
-    original_lcov = ROOT / "target/u9-coverage.lcov"
+    original_lcov = ROOT / "target/terminal-coverage.lcov"
     command += [
         "--lib",
         "--test",

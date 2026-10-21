@@ -1,4 +1,4 @@
-"""Same-head acceptance evidence producer for the u15-acceptance artifact.
+"""Same-head acceptance evidence producer for the release-acceptance artifact.
 
 It reads official GitHub run, job and artifact metadata and artifact ZIPs of
 the authorized upstream repository only, through the GitHubApi adapter, and
@@ -32,11 +32,11 @@ HEAD = re.compile("[0-9a-f]{40}")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 CI = ".github/workflows/ci.yml"
-U12 = ".github/workflows/u12-quality.yml"
-U14 = ".github/workflows/u14-quality.yml"
+U12 = ".github/workflows/macos-quality.yml"
+U14 = ".github/workflows/quality.yml"
 RELEASE_CHECK = ".github/workflows/release-check.yml"
-U10_JOB = "U10 fixed guests and fresh native differential / differential"
-NODE_JOB = "u11-programs / differential (ubuntu-latest, node)"
+U10_JOB = "fixed guest programs / differential"
+NODE_JOB = "wasm-programs / differential (ubuntu-latest, node)"
 EVIDENCE_EVENTS = ("push", "workflow_dispatch")
 
 # Quality purpose -> (official workflow, jobs that must exist and succeed).
@@ -78,24 +78,24 @@ WASM_OS = {
 # Guests are rebuilt in every job (aube embeds its build date), so each
 # environment is checked against the fresh native oracle of its own run,
 # with equal guest bytes; guests are never compared across runs.
-U11_INPUTS = {"u11-acceptance-inputs": ("target/u11/native/observations.json",)}
+U11_INPUTS = {"wasm-acceptance-inputs": ("target/wasm/native/observations.json",)}
 SOURCES = {
     "linux-native": (
         CI,
         U10_JOB,
-        {"u10-differential": ("observations.json", "native/observations.json")},
+        {"programs-differential": ("observations.json", "native/observations.json")},
     ),
     "macos-native": (
         U12,
         "macos-host",
         {
-            "u12-macos-host": (
+            "macos-host": (
                 "comparison/observations.json",
                 "comparison-original/observations.json",
             ),
-            "u12-native-first": (
-                "u12/native/observations.json",
-                "u12/native-original/observations.json",
+            "macos-native-first": (
+                "macos/native/observations.json",
+                "macos/native-original/observations.json",
             ),
         },
     ),
@@ -103,33 +103,36 @@ SOURCES = {
         U14,
         "windows-host",
         {
-            "u13-windows-host": (
+            "windows-host": (
                 "windows/comparison/observations.json",
                 "windows/comparison-original/observations.json",
             ),
-            "u13-native-first": (
-                "u13/native/observations.json",
-                "u13/native-original/observations.json",
+            "windows-native-first": (
+                "windows/native/observations.json",
+                "windows/native-original/observations.json",
             ),
         },
     ),
-    "performance": (U14, NODE_JOB, {"u11-node": ("performance/observations.json",)}),
+    "performance": (U14, NODE_JOB, {"wasm-node": ("performance/observations.json",)}),
 }
 for _env, _os in WASM_OS.items():
     SOURCES["wasm-" + _env] = (
         U14,
-        f"u11-programs / differential ({_os}, {_env})",
-        {"u11-" + _env: ("observations.json",), **U11_INPUTS},
+        f"wasm-programs / differential ({_os}, {_env})",
+        {"wasm-" + _env: ("observations.json",), **U11_INPUTS},
     )
 # Emulated document -> its native oracle, per host source.
 HOST_PAIRS = {
     "macos-native": (
-        ("comparison/observations.json", "u12/native/observations.json"),
-        ("comparison-original/observations.json", "u12/native-original/observations.json"),
+        ("comparison/observations.json", "macos/native/observations.json"),
+        ("comparison-original/observations.json", "macos/native-original/observations.json"),
     ),
     "windows-native": (
-        ("windows/comparison/observations.json", "u13/native/observations.json"),
-        ("windows/comparison-original/observations.json", "u13/native-original/observations.json"),
+        ("windows/comparison/observations.json", "windows/native/observations.json"),
+        (
+            "windows/comparison-original/observations.json",
+            "windows/native-original/observations.json",
+        ),
     ),
 }
 NATIVE_SOURCES = ("linux-native", "macos-native", "windows-native")
@@ -409,7 +412,7 @@ def native_result(label, documents):
 
 def wasm(label, documents, digests):
     environment = label.removeprefix("wasm-")
-    document, oracle_name = documents["observations.json"], U11_INPUTS["u11-acceptance-inputs"][0]
+    document, oracle_name = documents["observations.json"], U11_INPUTS["wasm-acceptance-inputs"][0]
     hashes, oracle = native_oracle(documents[oracle_name], label + " oracle")
     policy.require(
         document.get("environment") == environment

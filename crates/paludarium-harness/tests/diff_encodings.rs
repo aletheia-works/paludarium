@@ -30,7 +30,7 @@ fn u3_saved_observation_replay() {
 fn u3_fresh_native_differential() {
     support::bounded("u3_fresh_native_differential", || {
         let root = paludarium_harness::workspace_root();
-        let output = root.join("target/u3-guests");
+        let output = root.join("target/encodings-guests");
         assert!(
             std::process::Command::new("bash")
                 .arg(root.join("tests/guests/encodings/build.sh"))
@@ -96,7 +96,7 @@ fn u3_bounded_ignored_probe() {
 #[test]
 fn u3_bounded_reaches_ignored_tests() {
     let marker = paludarium_harness::workspace_root()
-        .join("target/u3-bounded")
+        .join("target/encodings-bounded")
         .join(format!("probe-{}.marker", std::process::id()));
     std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
     let _ = std::fs::remove_file(&marker);
@@ -122,7 +122,7 @@ fn u3_bounded_reaches_ignored_tests() {
 fn u3_native_observation() {
     support::bounded("u3_native_observation", || {
         let root = paludarium_harness::workspace_root();
-        let output = root.join("target/u3-guests");
+        let output = root.join("target/encodings-guests");
         assert!(
             std::process::Command::new("bash")
                 .arg(root.join("tests/guests/encodings/build.sh"))

@@ -25,7 +25,7 @@ def tar(path, files, prefix="package", extra=None):
 
 class PackageTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "target/u15")
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "target/release-evidence")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.path = self.root / "npm.tgz"

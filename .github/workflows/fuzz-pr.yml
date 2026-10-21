@@ -1,4 +1,4 @@
-name: U11 affected MMU filesystem and kernel fuzz
+name: Fuzz the MMU, filesystem and kernel targets
 on:
   workflow_call:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [vfs_paths, load_elf, syscall_args, kernel_threads_u5, kernel_futex_u5, kernel_events_u6, kernel_sockets_u6]
+        target: [vfs_paths, load_elf, syscall_args, kernel_threads, kernel_futex, kernel_events, kernel_sockets]
     container:
       image: rust:1-bookworm
       options: --cap-add=SYS_PTRACE --security-opt=seccomp=unconfined --ulimit=stack=-1
@@ -45,34 +45,34 @@ jobs:
         run: |
           set -euo pipefail
           cd /work
-          mkdir -p target/u11-fuzz
-          rustc -Vv > target/u11-fuzz/toolchain.txt
-          sha256sum Cargo.lock fuzz/Cargo.lock > target/u11-fuzz/locks-before.sha256
+          mkdir -p target/wasm-fuzz
+          rustc -Vv > target/wasm-fuzz/toolchain.txt
+          sha256sum Cargo.lock fuzz/Cargo.lock > target/wasm-fuzz/locks-before.sha256
           ASAN_SYMBOLIZER_PATH="$(command -v llvm-symbolizer-24)"
           export ASAN_SYMBOLIZER_PATH
-          printf '%s\n' "$ASAN_SYMBOLIZER_PATH" > target/u11-fuzz/symbolizer-path.txt
-          "$ASAN_SYMBOLIZER_PATH" --version > target/u11-fuzz/symbolizer-version.txt
-          dpkg-query -W llvm-24 > target/u11-fuzz/symbolizer-package.txt
-          printf 'ASAN_OPTIONS=%s\nLSAN_OPTIONS=%s\nASAN_SYMBOLIZER_PATH=%s\n' "$ASAN_OPTIONS" "$LSAN_OPTIONS" "${ASAN_SYMBOLIZER_PATH:-}" > target/u11-fuzz/settings.txt
-          sha256sum fuzz/Cargo.lock > target/u11-fuzz/lock-before.sha256
-          date -u > target/u11-fuzz/start.txt
+          printf '%s\n' "$ASAN_SYMBOLIZER_PATH" > target/wasm-fuzz/symbolizer-path.txt
+          "$ASAN_SYMBOLIZER_PATH" --version > target/wasm-fuzz/symbolizer-version.txt
+          dpkg-query -W llvm-24 > target/wasm-fuzz/symbolizer-package.txt
+          printf 'ASAN_OPTIONS=%s\nLSAN_OPTIONS=%s\nASAN_SYMBOLIZER_PATH=%s\n' "$ASAN_OPTIONS" "$LSAN_OPTIONS" "${ASAN_SYMBOLIZER_PATH:-}" > target/wasm-fuzz/settings.txt
+          sha256sum fuzz/Cargo.lock > target/wasm-fuzz/lock-before.sha256
+          date -u > target/wasm-fuzz/start.txt
           set +e
-          cargo fuzz run --fuzz-dir fuzz --sanitizer address '${{ matrix.target }}' -- -seed=1 -max_total_time=600 -timeout=30 -rss_limit_mb=2048 2>&1 | tee target/u11-fuzz/raw.log
+          cargo fuzz run --fuzz-dir fuzz --sanitizer address '${{ matrix.target }}' -- -seed=1 -max_total_time=600 -timeout=30 -rss_limit_mb=2048 2>&1 | tee target/wasm-fuzz/raw.log
           status=${PIPESTATUS[0]}
           set -e
-          printf '%s\n' "$status" > target/u11-fuzz/exit.txt
-          date -u > target/u11-fuzz/end.txt
-          sha256sum fuzz/Cargo.lock > target/u11-fuzz/lock-after.sha256
-          cmp target/u11-fuzz/lock-before.sha256 target/u11-fuzz/lock-after.sha256
-          sha256sum Cargo.lock fuzz/Cargo.lock > target/u11-fuzz/locks-after.sha256
-          cmp target/u11-fuzz/locks-before.sha256 target/u11-fuzz/locks-after.sha256
-          sha256sum 'fuzz/target/x86_64-unknown-linux-gnu/release/${{ matrix.target }}' > target/u11-fuzz/binary.sha256
+          printf '%s\n' "$status" > target/wasm-fuzz/exit.txt
+          date -u > target/wasm-fuzz/end.txt
+          sha256sum fuzz/Cargo.lock > target/wasm-fuzz/lock-after.sha256
+          cmp target/wasm-fuzz/lock-before.sha256 target/wasm-fuzz/lock-after.sha256
+          sha256sum Cargo.lock fuzz/Cargo.lock > target/wasm-fuzz/locks-after.sha256
+          cmp target/wasm-fuzz/locks-before.sha256 target/wasm-fuzz/locks-after.sha256
+          sha256sum 'fuzz/target/x86_64-unknown-linux-gnu/release/${{ matrix.target }}' > target/wasm-fuzz/binary.sha256
           test "$status" = 0
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u11-fuzz-${{ matrix.target }}
+          name: fuzz-pr-${{ matrix.target }}
           path: |
-            target/u11-fuzz
+            target/wasm-fuzz
             fuzz/artifacts
             fuzz/target/x86_64-unknown-linux-gnu/release/${{ matrix.target }}

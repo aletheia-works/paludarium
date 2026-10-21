@@ -13,13 +13,13 @@ assert.ok(npm && npm.startsWith("/"), "U11_NPM must name the real mise npm execu
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const child = resolve(packageRoot, "tests/packed-distribution-child.mjs");
 const guest = resolve(packageRoot, "tests/guests/hello");
-await mkdir(resolve(root, "target/u11-packed"), { recursive: true });
-const workspace = await mkdtemp(resolve(root, "target/u11-packed/run-"));
+await mkdir(resolve(root, "target/wasm-packed"), { recursive: true });
+const workspace = await mkdtemp(resolve(root, "target/wasm-packed/run-"));
 const run = (command, argv, cwd = root) => execFileSync(command, argv, {
   cwd, encoding: "utf8", timeout: 60000, killSignal: "SIGKILL", stdio: "pipe",
   env: { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH}` },
 });
-const packReport = JSON.parse(run(npm, ["pack", "--json", "--ignore-scripts", "--pack-destination", workspace, "--cache", resolve(root, "target/u11-packaging-cache")], packageRoot));
+const packReport = JSON.parse(run(npm, ["pack", "--json", "--ignore-scripts", "--pack-destination", workspace, "--cache", resolve(root, "target/wasm-packaging-cache")], packageRoot));
 // npm 12 uses package-name keys; npm 11 emitted an array.
 const reports = Array.isArray(packReport) ? packReport : Object.values(packReport);
 assert.equal(reports.length, 1, "exactly one distribution must be packed");

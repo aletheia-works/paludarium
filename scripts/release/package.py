@@ -162,7 +162,7 @@ def package_check(root):
     import check
 
     root = Path(root)
-    out = root / "target/u15" / ("package-" + str(time.time_ns()))
+    out = root / "target/release-evidence" / ("package-" + str(time.time_ns()))
     out.mkdir(parents=True)
     paths = [
         Path(n)

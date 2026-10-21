@@ -30,7 +30,7 @@ class BuildEvidence(unittest.TestCase):
         root = pathlib.Path(__file__).resolve().parents[4]
         # u14-cost-diagnostic.yml was removed in the CI cleanup (U15 Step 23, ci-config.md), so no push can run it.
         self.assertFalse((root / ".github/workflows/u14-cost-diagnostic.yml").exists())
-        acceptance = (root / ".github/workflows/u14-wasm-acceptance.yml").read_text()
+        acceptance = (root / ".github/workflows/jit-wasm-programs.yml").read_text()
         # The frozen performance measurement runs only by hand or on the nightly schedule, never on push or pull_request.
         self.assertIn(
             "- name: Frozen paired full-probe performance\n"

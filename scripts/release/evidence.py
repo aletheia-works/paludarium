@@ -3,10 +3,10 @@
 The evidence job of publish.yml runs this on every push to main of the
 upstream repository. When tag v<version> of the workspace version already
 exists, it does nothing. Otherwise, for the main head only, it waits for the
-ci.yml push run, dispatches u12-quality.yml, u14-quality.yml and
+ci.yml push run, dispatches macos-quality.yml, quality.yml and
 release-check.yml once each (a run a person already dispatched for the head
 is reused, never doubled, because acceptance.py accepts exactly one run per
-workflow), waits for all of them, then dispatches u15-acceptance.yml once
+workflow), waits for all of them, then dispatches release-acceptance.yml once
 and waits for it. Only when every run succeeded does it write ready=true,
 the version and the head to GITHUB_OUTPUT; publish.yml then publishes that
 head and creates the tag and the GitHub release last, so a version that was
@@ -32,8 +32,8 @@ import check
 import policy
 
 CI = "ci.yml"
-QUALITY = ("u12-quality.yml", "u14-quality.yml", "release-check.yml")
-PRODUCER = "u15-acceptance.yml"
+QUALITY = ("macos-quality.yml", "quality.yml", "release-check.yml")
+PRODUCER = "release-acceptance.yml"
 APPEAR_SECONDS = 15 * 60
 COMPLETE_SECONDS = 150 * 60
 POLL_SECONDS = 60

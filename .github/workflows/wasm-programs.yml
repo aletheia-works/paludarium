@@ -1,4 +1,4 @@
-name: U14 on-off wasm guest acceptance
+name: Wasm guest programs
 on:
   workflow_call:
   workflow_dispatch:
@@ -28,16 +28,16 @@ jobs:
       - name: Runner tests
         run: python3 -m unittest discover -s tests/guests/wasm/runner-tests -p 'test_*.py'
       - name: Build fixed guests and audit dependencies
-        run: python3 tests/guests/programs/build.py target/guests/u10
+        run: python tests/guests/programs/build.py target/guests/u10
       - name: Fresh Linux oracle with filesystem metadata
-        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/u10 --output target/u11/native
+        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/u10 --output target/wasm/native
       - name: Build one production wasm module for every environment
         run: bash mise-tasks/wasm/build.sh
       - name: Preserve inputs and fresh oracle
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u11-acceptance-inputs
+          name: wasm-acceptance-inputs
           path: |
             target/guests/u10/probe
             target/guests/u10/aube
@@ -46,7 +46,7 @@ jobs:
             target/guests/u10/*-dependencies.log
             target/guests/u10/aube-deny.toml
             target/guests/u10/licenses/
-            target/u11/native/
+            target/wasm/native/
             packages/paludarium-wasm/paludarium.wasm
           retention-days: 7
   differential:
@@ -66,27 +66,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - name: Use a job-local rustup home
-        # GitHub-hosted runners sometimes ship a partially installed toolchain in
-        # ~/.rustup, which makes rustup fail with "detected conflict".
-        shell: bash
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: '3.15.0'
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
-          node-version: '26.12.0'
-      - name: Latest independently pinned npm CLI
-        run: |
-          npm install --global npm@12.2.0
-          test "$(npm --version)" = 12.2.0
+          node-version: '26.11.1'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: u11-acceptance-inputs
+          name: wasm-acceptance-inputs
           path: .
       - name: Install pinned browser driver
         if: matrix.environment == 'chromium' || matrix.environment == 'firefox'
@@ -96,37 +84,56 @@ jobs:
       - name: Enable actual Safari on CI runner
         if: matrix.environment == 'safari'
         run: sudo safaridriver --enable
-      - name: Project Rust source for strict control module
-        if: matrix.environment == 'node'
-        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component rust-src
-      - name: Fresh same-source control for existing Node boundary entry
-        if: matrix.environment == 'node'
-        run: python3 -B scripts/build-jit-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"
+      - name: Warm up actual Safari once (never fails the job)
+        if: matrix.environment == 'safari'
+        timeout-minutes: 3
+        continue-on-error: true
+        run: |
+          set +e
+          # A fresh runner launches Safari for the first time here, so safaridriver does not wait for that first launch (NFR7).
+          bounded() { perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }
+          bounded 30 open -a Safari; echo "warm-up: open -a Safari exit=$?"
+          sleep 10
+          echo "warm-up: Safari processes after launch: $(pgrep -x Safari | tr '\n' ' ')"
+          bounded 30 osascript -e 'with timeout of 20 seconds' -e 'tell application "Safari" to quit' -e 'end timeout'; echo "warm-up: osascript quit exit=$?"
+          sleep 3
+          pkill -x Safari; echo "warm-up: pkill -x Safari exit=$? (1 means no Safari process was left)"
+          echo "warm-up: Safari processes at the end: $(pgrep -x Safari | tr '\n' ' ')"
+          exit 0
       - name: Launcher component and C12 boundary tests
-        env:
-          PALUDARIUM_U14_CONTROL_WASM: target/u14-cost-profile/acceptance-control.wasm
         if: matrix.environment == 'node'
         run: |
-          mkdir -p target/u11/node/v8
-          export NODE_V8_COVERAGE="$PWD/target/u11/node/v8"
-          node --test packages/paludarium-wasm/tests/wasm-*.test.mjs packages/paludarium-wasm/tests/jit-*.test.mjs
+          node --test packages/paludarium-wasm/tests/wasm-*.test.mjs
           node packages/paludarium-wasm/tests/wasm-api-check.mjs packages/paludarium-wasm/paludarium.wasm
-      - name: Compare identical fourteen cases in both execution modes
+      - name: Compare fourteen actual guest executions with fresh Linux
         env:
-          U14_ENVIRONMENT: ${{ matrix.environment }}
-        run: python3 -B scripts/jit-run.py --environment "$U14_ENVIRONMENT" --wasm packages/paludarium-wasm/paludarium.wasm --native target/u11/native/observations.json --guests target/guests/u10 --output "target/u11/$U14_ENVIRONMENT"
-      - name: Fixed production JavaScript coverage
-        if: matrix.environment == 'node'
-        run: node packages/paludarium-wasm/tests/jit-coverage.mjs target/u11/node/v8 target/u11/node/js-coverage.json
-      - name: Frozen paired full-probe performance
-        # Measured by hand before a release and by the nightly schedule (ci-config.md); never on push or pull_request.
-        if: matrix.environment == 'node' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
-        continue-on-error: true
-        run: node packages/paludarium-wasm/tests/jit-performance-check.mjs packages/paludarium-wasm/paludarium.wasm target/u11/native/observations.json target/guests/u10 target/u11/node/performance
+          U11_ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, 'tests/guests/wasm')
+          from supervisor import supervise
+          environment = os.environ['U11_ENVIRONMENT']
+          output = pathlib.Path('target/wasm') / environment
+          output.mkdir(parents=True, exist_ok=True)
+          if environment == 'node':
+              command = ['node', 'packages/paludarium-wasm/tests/wasm-node-check.mjs']
+          else:
+              command = ['node', 'packages/paludarium-wasm/tests/wasm-browser-check.mjs', environment]
+          command += ['packages/paludarium-wasm/paludarium.wasm', 'target/wasm/native/observations.json', 'target/guests/u10', str(output)]
+          result = supervise(command, cwd=pathlib.Path.cwd())
+          (output / 'suite-supervisor.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(result['stdout'])
+          print(result['stderr'], file=sys.stderr)
+          assert result['exit'] == 0 and not result['timed_out'] and result['process_group_cleaned'], result
+          report = json.loads((output / 'observations.json').read_text())
+          assert report['complete'] is True and len(report['rows']) == 14
+          assert all(row['pass'] and row['exit'] == 0 and not row['timed_out'] for row in report['rows'].values())
+          PY
       - name: Preserve raw results and cleanup evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u11-${{ matrix.environment }}
-          path: target/u11/${{ matrix.environment }}/
+          name: wasm-${{ matrix.environment }}
+          path: target/wasm/${{ matrix.environment }}/
           retention-days: 7

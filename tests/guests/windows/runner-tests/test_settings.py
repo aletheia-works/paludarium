@@ -53,7 +53,7 @@ class SettingsTests(unittest.TestCase):
             "--guests",
             "target/guests/u10",
             "--output",
-            "target/u13/native",
+            "target/windows/native",
         ]
         if original:
             args.append("--original-argv")

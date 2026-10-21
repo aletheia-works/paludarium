@@ -26,7 +26,7 @@ VERSION = policy.inventory(ROOT)["version"]
 
 class PublishAdapterTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "target/u15")
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "target/release-evidence")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.head = "a" * 40
@@ -45,7 +45,7 @@ class PublishAdapterTests(unittest.TestCase):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(b)
         self.inv = policy.inventory(self.root)
-        self.out = self.root / "target/u15"
+        self.out = self.root / "target/release-evidence"
         self.art = self.out / "package-test"
         self.art.mkdir(parents=True)
         self.crates = []

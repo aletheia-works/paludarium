@@ -28,13 +28,13 @@ env:
     -p paludarium-runtime -p paludarium
 
 jobs:
-  u11-programs:
-    uses: ./.github/workflows/u11-acceptance.yml
-  u11-fuzz:
-    uses: ./.github/workflows/u11-fuzz.yml
-  u10-programs:
-    name: U10 fixed guests and fresh native differential
-    uses: ./.github/workflows/u10-native-diagnostic.yml
+  wasm-programs:
+    uses: ./.github/workflows/wasm-programs.yml
+  fuzz:
+    uses: ./.github/workflows/fuzz-pr.yml
+  programs:
+    name: fixed guest programs
+    uses: ./.github/workflows/programs.yml
 
   production-wasm:
     name: production wasm (shared Rust heap, nested Workers)
@@ -156,9 +156,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile
         run: |
-          mkdir -p target/u3-guests
-          uname -a > target/u3-guests/uname.txt
-          lscpu > target/u3-guests/cpu.txt
+          mkdir -p target/encodings-guests
+          uname -a > target/encodings-guests/uname.txt
+          lscpu > target/encodings-guests/cpu.txt
       # Builds the guests from source (BR7.2), runs each natively and under
       # the emulator, compares stdout/stderr/exit status (BR7.1) and prints
       # the run times (NFR6.1).
@@ -167,8 +167,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u3-differential-observations
-          path: target/u3-guests/
+          name: encodings-differential-observations
+          path: target/encodings-guests/
           retention-days: 7
 
   coverage:
@@ -177,9 +177,9 @@ jobs:
     timeout-minutes: 30
     env:
       PALUDARIUM_U3_FULL_REPLAY: '1'
-      PALUDARIUM_U3_NATIVE_OBSERVATIONS: ${{ github.workspace }}/target/u3-guests/observe.native
-      PALUDARIUM_U3_NATIVE_FAULTS: ${{ github.workspace }}/target/u3-guests/fault-observe.native
-      PALUDARIUM_U3_NATIVE_CPUID: ${{ github.workspace }}/target/u3-guests/cpuid-observe.native
+      PALUDARIUM_U3_NATIVE_OBSERVATIONS: ${{ github.workspace }}/target/encodings-guests/observe.native
+      PALUDARIUM_U3_NATIVE_FAULTS: ${{ github.workspace }}/target/encodings-guests/fault-observe.native
+      PALUDARIUM_U3_NATIVE_CPUID: ${{ github.workspace }}/target/encodings-guests/cpuid-observe.native
       PALUDARIUM_U5_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
       PALUDARIUM_U6_EMULATOR: ${{ github.workspace }}/target/llvm-cov-target/debug/paludarium
     steps:
@@ -195,17 +195,17 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Record native architectural profile
         run: |
-          mkdir -p target/u3-guests
-          uname -a > target/u3-guests/uname.txt
-          lscpu > target/u3-guests/cpu.txt
+          mkdir -p target/encodings-guests
+          uname -a > target/encodings-guests/uname.txt
+          lscpu > target/encodings-guests/cpu.txt
       - name: Generate fresh U3 native inputs before instrumented library tests
         shell: bash
         run: |
-          bash tests/guests/encodings/build.sh target/u3-guests
+          bash tests/guests/encodings/build.sh target/encodings-guests
           python3 - <<'PY_NATIVE'
           from pathlib import Path
           import subprocess, os, signal, json, hashlib
-          out=Path('target/u3-guests')
+          out=Path('target/encodings-guests')
           rows=[]
           for name, expected_rows in [('observe',23576),('fault-observe',1162),('cpuid-observe',12)]:
               binary=out/name
@@ -242,13 +242,13 @@ jobs:
           RUST_TEST_THREADS: "1"
       - name: U11 changed Rust components line coverage >= 80%
         run: |
-          cargo llvm-cov --locked -p paludarium-host -p paludarium-vfs -p paludarium-kernel -p paludarium-runtime -p paludarium-wasm --lib --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|jit)/' --fail-under-lines 80 --lcov --output-path target/u11-coverage.lcov
+          cargo llvm-cov --locked -p paludarium-host -p paludarium-vfs -p paludarium-kernel -p paludarium-runtime -p paludarium-wasm --lib --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|jit)/' --fail-under-lines 80 --lcov --output-path target/wasm-coverage.lcov
       - name: Retain U11 coverage observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u11-coverage-lcov
-          path: target/u11-coverage.lcov
+          name: wasm-coverage-lcov
+          path: target/wasm-coverage.lcov
       - name: U1 package line coverage >= 80%
         # Keep the same U1 production file set; fresh architectural tests live
         # in Harness and must execute when measuring the newly shared CPU code.
@@ -266,13 +266,13 @@ jobs:
 
       - name: U9 target crates line coverage >= 80%
         run: |
-          cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_terminal --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/' --fail-under-lines 80 --lcov --output-path target/u9-coverage.lcov
+          cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_terminal --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/' --fail-under-lines 80 --lcov --output-path target/terminal-coverage.lcov
           cargo llvm-cov report --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/'
         env:
           RUST_TEST_THREADS: "1"
       - name: U3 CPU and Decoder line coverage >= 80%
         run: |
-          cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/' --fail-under-lines 80 --lcov --output-path target/u3-coverage.lcov
+          cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/' --fail-under-lines 80 --lcov --output-path target/encodings-coverage.lcov
           cargo llvm-cov report --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/'
         env:
           RUST_TEST_THREADS: "1"
@@ -280,20 +280,20 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u3-coverage-lcov
-          path: target/u3-coverage.lcov
+          name: encodings-coverage-lcov
+          path: target/encodings-coverage.lcov
           retention-days: 7
       - name: Retain native states even when coverage fails
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u3-coverage-native-observations
-          path: target/u3-guests/
+          name: encodings-coverage-native-observations
+          path: target/encodings-guests/
           retention-days: 7
       - name: Retain U9 coverage line observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u9-coverage-lcov
-          path: target/u9-coverage.lcov
+          name: terminal-coverage-lcov
+          path: target/terminal-coverage.lcov
           retention-days: 7

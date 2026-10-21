@@ -18,7 +18,7 @@ fn u10_differential() {
         .unwrap();
     assert!(
         status.success(),
-        "U10 differential failed; inspect target/u10/differential"
+        "U10 differential failed; inspect target/programs/differential"
     );
 }
 

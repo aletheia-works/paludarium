@@ -1,4 +1,4 @@
-name: U13 fresh Linux oracle before Windows Host changes
+name: Fresh Linux oracle for the macOS host
 on:
   workflow_call:
   workflow_dispatch:
@@ -29,53 +29,52 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/u13-native-first
-          rustc -Vv > target/u13-native-first/compiler.txt
-          cargo -V > target/u13-native-first/cargo.txt
-          python --version > target/u13-native-first/python.txt
-          cargo deny --version > target/u13-native-first/deny.txt
-          sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml tests/guests/programs/source-lock.json > target/u13-native-first/inputs-before.sha256
-          python scripts/windows-run.py --self-test
-          cargo test --locked -p paludarium-host --test u9_public_api
-          python -m unittest discover -s tests/guests/windows/runner-tests -p 'test_*.py'
+          mkdir -p target/macos-native-first
+          rustc -Vv > target/macos-native-first/compiler.txt
+          cargo -V > target/macos-native-first/cargo.txt
+          python --version > target/macos-native-first/python.txt
+          cargo deny --version > target/macos-native-first/deny.txt
+          sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml tests/guests/programs/source-lock.json > target/macos-native-first/inputs-before.sha256
+          python scripts/macos-run.py --self-test
+          cargo test --locked -p paludarium-host --lib signals_time_tests:: -- --test-threads=1
       - name: Fixed unmodified guests with license audits
         shell: bash
         run: |
           set -euo pipefail
           set +e
-          python tests/guests/programs/build.py target/guests/u10 2>&1 | tee target/u13-native-first/build.log
+          python tests/guests/programs/build.py target/guests/u10 2>&1 | tee target/macos-native-first/build.log
           status=${PIPESTATUS[0]}
-          printf '%s\n' "$status" > target/u13-native-first/build-exit.txt
+          printf '%s\n' "$status" > target/macos-native-first/build-exit.txt
           test "$status" = 0
       - name: Fresh isolated Linux fourteen cases
         shell: bash
         run: |
           set -euo pipefail
           set +e
-          sudo unshare --net "$(command -v python)" scripts/windows-run.py --native-only --guests target/guests/u10 --output target/u13/native 2>&1 | tee target/u13-native-first/native.log
+          sudo unshare --net "$(command -v python)" scripts/macos-run.py --native-only --guest-dir target/guests/u10 --output target/macos/native 2>&1 | tee target/macos-native-first/native.log
           status=${PIPESTATUS[0]}
-          printf '%s\n' "$status" > target/u13-native-first/native-exit.txt
+          printf '%s\n' "$status" > target/macos-native-first/native-exit.txt
           test "$status" = 0
-          python -c 'import json; r=json.load(open("target/u13/native/observations.json")); assert r["native_complete"] and len(r["rows"])==14; assert all(x["exit"]==0 and not x["timed_out"] and 0<=x["wall_seconds"]<=30 for x in r["rows"].values())'
-          sudo unshare --net "$(command -v python)" scripts/windows-run.py --native-only --original-argv --guests target/guests/u10 --output target/u13/native-original 2>&1 | tee target/u13-native-first/native-original.log
+          python -c 'import json; r=json.load(open("target/macos/native/observations.json")); assert r["native_complete"] and len(r["rows"])==14; assert all(x["exit"]==0 and not x["timed_out"] and 0<=x["wall_seconds"]<=30 for x in r["rows"].values())'
+          sudo unshare --net "$(command -v python)" scripts/macos-run.py --native-only --original-argv --guest-dir target/guests/u10 --output target/macos/native-original 2>&1 | tee target/macos-native-first/native-original.log
           status=${PIPESTATUS[0]}
-          printf '%s\n' "$status" > target/u13-native-first/native-original-exit.txt
+          printf '%s\n' "$status" > target/macos-native-first/native-original-exit.txt
           test "$status" = 0
       - name: Unchanged lock inputs
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml tests/guests/programs/source-lock.json > target/u13-native-first/inputs-after.sha256
-          cmp target/u13-native-first/inputs-before.sha256 target/u13-native-first/inputs-after.sha256
+          sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml tests/guests/programs/source-lock.json > target/macos-native-first/inputs-after.sha256
+          cmp target/macos-native-first/inputs-before.sha256 target/macos-native-first/inputs-after.sha256
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
-          name: u13-native-first
+          name: macos-native-first
           path: |
-            target/u13-native-first/
-            target/u13/native/
-            target/u13/native-original/
+            target/macos-native-first/
+            target/macos/native/
+            target/macos/native-original/
             target/guests/u10/build-receipt.json
             target/guests/u10/*-build.log
             target/guests/u10/*-dependencies.log

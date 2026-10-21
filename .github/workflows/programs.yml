@@ -1,4 +1,4 @@
-name: U10 native expectations
+name: Fixed guest programs
 on:
   workflow_call:
   workflow_dispatch:
@@ -12,13 +12,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - run: sudo unshare --net python3 tests/guests/programs/metadata.py target/u10/metadata/native-stat.json
+      - run: sudo unshare --net python3 tests/guests/programs/metadata.py target/programs/metadata/native-stat.json
       - name: Retain native stat evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u10-native-metadata
-          path: target/u10/metadata/
+          name: programs-native-metadata
+          path: target/programs/metadata/
           retention-days: 7
   native-first:
     runs-on: ubuntu-latest
@@ -47,12 +47,12 @@ jobs:
       - name: Build fixed unmodified static-musl guests and audit dependencies
         run: python tests/guests/programs/build.py target/guests/u10
       - name: Observe fresh native expectations without network or node
-        run: sudo unshare --net python3 scripts/programs-run.py --native-only --guest-dir target/guests/u10 --output target/u10/native
+        run: sudo unshare --net python3 scripts/programs-run.py --native-only --guest-dir target/guests/u10 --output target/programs/native
       - name: Retain build and native evidence, including failures
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u10-native-first
+          name: programs-native-first
           path: |
             target/guests/u10/build-receipt.json
             target/guests/u10/*-build.log
@@ -61,7 +61,7 @@ jobs:
             target/guests/u10/licenses/
             target/guests/u10/probe
             target/guests/u10/aube
-            target/u10/native/
+            target/programs/native/
           retention-days: 7
   differential:
     needs: native-first
@@ -73,7 +73,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: u10-native-first
+          name: programs-native-first
           path: target
       - run: chmod +x target/guests/u10/probe target/guests/u10/aube
       - uses: ./.github/actions/rust-toolchain
@@ -93,13 +93,13 @@ jobs:
       - name: Make differential evidence readable after isolated execution
         if: always()
         run: |
-          if [ -d target/u10/differential ]; then
-            sudo chown -R "$(id -u):$(id -g)" target/u10/differential
+          if [ -d target/programs/differential ]; then
+            sudo chown -R "$(id -u):$(id -g)" target/programs/differential
           fi
       - name: Retain differential observations and watchdog failure records
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u10-differential
-          path: target/u10/differential/
+          name: programs-differential
+          path: target/programs/differential/
           retention-days: 7

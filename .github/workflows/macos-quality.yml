@@ -1,10 +1,10 @@
 # Release evidence, dispatched by scripts/release/evidence.py (docs/release.md):
-# the macOS host compared with a fresh native Linux oracle (u12-oracle, then
+# the macOS host compared with a fresh native Linux oracle (macos-oracle, then
 # macos-host) and the U12 fuzz targets. The checks every pull request runs
 # (unit tests, lint, dependencies, differential tests, coverage, production
 # wasm) live in ci.yml and are not repeated here. Actions are pinned by commit
 # SHA and the default token is read-only (NFR8.2).
-name: U12 macOS host and fuzz
+name: macOS host and fuzz
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: u12-quality-${{ github.ref }}
+  group: macos-quality-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -21,10 +21,10 @@ env:
   PALUDARIUM_TEST_NODE: node
 
 jobs:
-  u12-oracle:
-    uses: ./.github/workflows/u12-native-first.yml
+  macos-oracle:
+    uses: ./.github/workflows/macos-native-first.yml
   macos-host:
-    needs: u12-oracle
+    needs: macos-oracle
     runs-on: macos-latest
     timeout-minutes: 40
     steps:
@@ -36,11 +36,11 @@ jobs:
           python-version: '3.15'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: u12-native-first
+          name: macos-native-first
           path: target
       - run: python3 -m pip install 'coverage==7.16.2'
       - name: Python comparison boundary regressions and defined coverage scope
-        run: python3 -m coverage run --data-file=target/u12-python.coverage --include='tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py' -m unittest discover -s tests/guests/macos/runner-tests -p 'test_*.py'
+        run: python3 -m coverage run --data-file=target/macos-python.coverage --include='tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py' -m unittest discover -s tests/guests/macos/runner-tests -p 'test_*.py'
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
@@ -50,9 +50,9 @@ jobs:
           cache: false
       - name: Record actual inputs and run native Host boundaries
         run: |
-          mkdir -p target/u12/macos
-          rustc -Vv > target/u12/macos/compiler.txt
-          shasum -a 256 Cargo.lock fuzz/Cargo.lock rust-toolchain.toml > target/u12/macos/inputs-before.sha256
+          mkdir -p target/macos/macos
+          rustc -Vv > target/macos/macos/compiler.txt
+          shasum -a 256 Cargo.lock fuzz/Cargo.lock rust-toolchain.toml > target/macos/macos/inputs-before.sha256
           cargo llvm-cov clean --workspace
           cargo llvm-cov test --no-report --locked -p paludarium-host --lib -- --test-threads=1
       - name: Same fixed bytes through macOS emulator, instrumented
@@ -61,42 +61,42 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
-          cargo test --locked -p paludarium-harness --test diff_macos --no-run --message-format=json > target/u12/macos/build.jsonl
+          cargo test --locked -p paludarium-harness --test diff_macos --no-run --message-format=json > target/macos/macos/build.jsonl
           python3 - <<'PY'
           import json, pathlib, subprocess
-          rows = [json.loads(line) for line in pathlib.Path('target/u12/macos/build.jsonl').read_text().splitlines()]
+          rows = [json.loads(line) for line in pathlib.Path('target/macos/macos/build.jsonl').read_text().splitlines()]
           binaries = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'diff_macos' and row.get('executable')]
           if len(binaries) != 1:
               raise RuntimeError('expected exactly one U12 harness executable')
-          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u12-python.coverage', '--include=tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py', 'scripts/macos-run.py', '--guest-dir', 'target/guests/u10', '--native', 'target/u12/native/observations.json', '--output', 'target/u12/macos/comparison', '--emulator', binaries[0]], check=True)
-          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/u12-python.coverage', '--include=tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py', 'scripts/macos-run.py', '--original-argv', '--guest-dir', 'target/guests/u10', '--native', 'target/u12/native-original/observations.json', '--output', 'target/u12/macos/comparison-original', '--emulator', binaries[0]], check=True)
+          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/macos-python.coverage', '--include=tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py', 'scripts/macos-run.py', '--guest-dir', 'target/guests/u10', '--native', 'target/macos/native/observations.json', '--output', 'target/macos/macos/comparison', '--emulator', binaries[0]], check=True)
+          subprocess.run(['python3', '-m', 'coverage', 'run', '--append', '--data-file=target/macos-python.coverage', '--include=tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py', 'scripts/macos-run.py', '--original-argv', '--guest-dir', 'target/guests/u10', '--native', 'target/macos/native-original/observations.json', '--output', 'target/macos/macos/comparison-original', '--emulator', binaries[0]], check=True)
           PY
-          python3 -m coverage json --data-file=target/u12-python.coverage -o target/u12/macos/python-coverage.json
-          python3 -m coverage report --data-file=target/u12-python.coverage --fail-under=80
+          python3 -m coverage json --data-file=target/macos-python.coverage -o target/macos/macos/python-coverage.json
+          python3 -m coverage report --data-file=target/macos-python.coverage --fail-under=80
       - name: Fixed six-file native Host coverage, at least eighty percent
         run: |
-          cargo llvm-cov report --json --output-path target/u12/macos/coverage.json
+          cargo llvm-cov report --json --output-path target/macos/macos/coverage.json
           python3 - <<'PY'
           import json, pathlib
           expected = {'lib.rs', 'clock.rs', 'threads.rs', 'native_fs.rs', 'fs.rs', 'macos.rs'}
-          data = json.loads(pathlib.Path('target/u12/macos/coverage.json').read_text())
+          data = json.loads(pathlib.Path('target/macos/macos/coverage.json').read_text())
           files = [row for row in data['data'][0]['files'] if '/paludarium-host/src/' in row['filename'] and pathlib.Path(row['filename']).name in expected]
           if {pathlib.Path(row['filename']).name for row in files} != expected:
               raise RuntimeError('coverage denominator missing a native Host file')
           lines = sum(row['summary']['lines']['count'] for row in files)
           covered = sum(row['summary']['lines']['covered'] for row in files)
           result = {'files': sorted(expected), 'lines': lines, 'covered': covered, 'percent': 100 * covered / lines if lines else 0}
-          pathlib.Path('target/u12/macos/coverage-scope.json').write_text(json.dumps(result, indent=2) + '\n')
+          pathlib.Path('target/macos/macos/coverage-scope.json').write_text(json.dumps(result, indent=2) + '\n')
           if not lines or covered / lines < .8:
               raise RuntimeError('native Host coverage below eighty percent')
           PY
-          shasum -a 256 Cargo.lock fuzz/Cargo.lock rust-toolchain.toml > target/u12/macos/inputs-after.sha256
-          cmp target/u12/macos/inputs-before.sha256 target/u12/macos/inputs-after.sha256
+          shasum -a 256 Cargo.lock fuzz/Cargo.lock rust-toolchain.toml > target/macos/macos/inputs-after.sha256
+          cmp target/macos/macos/inputs-before.sha256 target/macos/macos/inputs-after.sha256
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: u12-macos-host
-          path: target/u12/macos
+          name: macos-host
+          path: target/macos/macos
           retention-days: 14
-  u12-fuzz:
-    uses: ./.github/workflows/u12-fuzz.yml
+  fuzz:
+    uses: ./.github/workflows/fuzz-sanitizers.yml

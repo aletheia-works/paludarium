@@ -120,10 +120,10 @@ class Evidence(unittest.TestCase):
             [
                 f"actions/workflows/{w}/dispatches"
                 for w in (
-                    "u12-quality.yml",
-                    "u14-quality.yml",
+                    "macos-quality.yml",
+                    "quality.yml",
                     "release-check.yml",
-                    "u15-acceptance.yml",
+                    "release-acceptance.yml",
                 )
             ],
         )
@@ -203,15 +203,17 @@ class Evidence(unittest.TestCase):
 
     def test_a_run_a_person_already_dispatched_is_reused(self):
         api = FakeGitHub()
-        api.add("u12-quality.yml", "workflow_dispatch")
+        api.add("macos-quality.yml", "workflow_dispatch")
         produce(api)
-        self.assertNotIn("actions/workflows/u12-quality.yml/dispatches", [p[0] for p in api.posts])
-        self.assertEqual(len([r for r in api.runs if r["path"].endswith("/u12-quality.yml")]), 1)
+        self.assertNotIn(
+            "actions/workflows/macos-quality.yml/dispatches", [p[0] for p in api.posts]
+        )
+        self.assertEqual(len([r for r in api.runs if r["path"].endswith("/macos-quality.yml")]), 1)
 
     def test_two_runs_of_one_workflow_are_refused(self):
         api = FakeGitHub()
-        api.add("u14-quality.yml", "workflow_dispatch")
-        api.add("u14-quality.yml", "workflow_dispatch")
+        api.add("quality.yml", "workflow_dispatch")
+        api.add("quality.yml", "workflow_dispatch")
         with self.assertRaisesRegex(ValueError, "exactly one allowed"):
             produce(api)
 
@@ -220,7 +222,7 @@ class Evidence(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "concluded failure; not dispatched again"):
             produce(api)
         self.assertNotIn(
-            "actions/workflows/u15-acceptance.yml/dispatches", [p[0] for p in api.posts]
+            "actions/workflows/release-acceptance.yml/dispatches", [p[0] for p in api.posts]
         )
         self.assertEqual(len(api.posts), 3)
 
@@ -235,12 +237,12 @@ class Evidence(unittest.TestCase):
         original = api.get
 
         def moving(route):
-            if route.startswith("actions/workflows/u14-quality.yml/"):
+            if route.startswith("actions/workflows/quality.yml/"):
                 api.main = OTHER
             return original(route)
 
         api.get = moving
-        with self.assertRaisesRegex(ValueError, "main moved before dispatching u14-quality.yml"):
+        with self.assertRaisesRegex(ValueError, "main moved before dispatching quality.yml"):
             produce(api)
 
     def test_run_that_never_completes_is_refused(self):

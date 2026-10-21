@@ -44,7 +44,7 @@ class Registry:
 
 class CheckTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "target/u15")
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "target/release-evidence")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
@@ -242,7 +242,7 @@ class CheckTests(unittest.TestCase):
         self.assertIn("uses: rust-lang/crates-io-auth-action@", step)
         self.assertNotRegex(step, r"\n\s+if:")
         self.assertIn("U15_OIDC_CRATES_IO_TOKEN: ${{ steps.crates.outputs.token }}", publish)
-        for name in ("publish.yml", "u15-acceptance.yml", "release-check.yml"):
+        for name in ("publish.yml", "release-acceptance.yml", "release-check.yml"):
             self.assertNotRegex(
                 (ROOT / ".github/workflows" / name).read_text(), r"(?i)echo[^\n]*(token|secret)"
             )

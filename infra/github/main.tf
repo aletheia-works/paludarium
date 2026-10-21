@@ -48,33 +48,12 @@ resource "github_repository_vulnerability_alerts" "this" {
 }
 
 locals {
-  # The pull-request gates of ci.yml (team.md, Testing Posture) and the
-  # commit-format check. Keep each context equal to the job's check name.
+  # The commit-format check and ci-ok, the job of ci.yml that passes when
+  # every other job passed or was not needed for the pull request's changes
+  # (scripts/ci-changes.py). Keep each context equal to the job's check name.
   required_checks = [
     "check / Commitlint",
-    "lint",
-    "dependencies",
-    "unit tests (ubuntu-latest)",
-    "unit tests (macos-latest)",
-    "unit tests (windows-latest)",
-    "differential tests (x86-64 Linux)",
-    "line coverage >= 80%",
-    "production wasm (shared Rust heap, nested Workers)",
-    "fixed guest programs / native-first",
-    "fixed guest programs / fixture-metadata-oracle",
-    "fixed guest programs / differential",
-    "wasm-programs / build-oracle",
-    "wasm-programs / differential (ubuntu-latest, node)",
-    "wasm-programs / differential (ubuntu-latest, chromium)",
-    "wasm-programs / differential (ubuntu-latest, firefox)",
-    "wasm-programs / differential (macos-latest, safari)",
-    "fuzz / fuzz (load_elf)",
-    "fuzz / fuzz (syscall_args)",
-    "fuzz / fuzz (vfs_paths)",
-    "fuzz / fuzz (kernel_futex)",
-    "fuzz / fuzz (kernel_threads)",
-    "fuzz / fuzz (kernel_events)",
-    "fuzz / fuzz (kernel_sockets)",
+    "ci-ok",
   ]
 }
 

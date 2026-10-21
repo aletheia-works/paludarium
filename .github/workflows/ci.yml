@@ -1,8 +1,10 @@
-# Pull-request gate (team.md Testing Posture, Q7): unit tests on Linux,
-# macOS and Windows, fmt, clippy (-D warnings), dependency checks, the
-# x86-64 Linux differential tests and the 80% line-coverage floor.
-# Every job must pass before merging. Actions are pinned by commit SHA and
-# the default token is read-only.
+# Pull-request gate: unit tests on Linux, macOS and Windows, fmt, clippy
+# (-D warnings), dependency checks, the x86-64 Linux differential tests and
+# the 80% line-coverage floor. A pull request runs the jobs its changed
+# files need (scripts/ci-changes.py) and a push to main runs every job;
+# ci-ok, the required check, passes only when every job passed or was not
+# needed. Actions are pinned by commit SHA and the default token is
+# read-only.
 name: CI
 
 on:
@@ -28,16 +30,58 @@ env:
     -p paludarium-runtime -p paludarium
 
 jobs:
+  # Which job groups this pull request's changed files need
+  # (scripts/ci-changes.py); a push to main runs every job.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.groups.outputs.rust }}
+      dependencies: ${{ steps.groups.outputs.dependencies }}
+      fuzz: ${{ steps.groups.outputs.fuzz }}
+      wasm: ${{ steps.groups.outputs.wasm }}
+      programs: ${{ steps.groups.outputs.programs }}
+      production_wasm: ${{ steps.groups.outputs.production_wasm }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 scripts/ci-changes.py --self-test
+      - id: groups
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            python3 scripts/ci-changes.py --all
+          else
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
+              --jq '.[] | .filename, (.previous_filename // empty)' |
+              python3 scripts/ci-changes.py
+          fi
+
   wasm-programs:
+    needs: changes
+    if: needs.changes.outputs.wasm == 'true'
     uses: ./.github/workflows/wasm-programs.yml
   fuzz:
+    needs: changes
+    if: needs.changes.outputs.fuzz == 'true'
     uses: ./.github/workflows/fuzz-pr.yml
   programs:
     name: fixed guest programs
+    needs: changes
+    if: needs.changes.outputs.programs == 'true'
     uses: ./.github/workflows/programs.yml
 
   production-wasm:
     name: production wasm (shared Rust heap, nested Workers)
+    needs: changes
+    if: needs.changes.outputs.production_wasm == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -71,6 +115,8 @@ jobs:
           retention-days: 7
   test:
     name: unit tests (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -98,6 +144,8 @@ jobs:
         run: cargo test --locked -p paludarium-harness --lib
 
   lint:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -122,6 +170,8 @@ jobs:
         run: cargo build --locked -p paludarium-decoder -p paludarium-mmu -p paludarium-cpu --target wasm32-unknown-unknown
 
   dependencies:
+    needs: changes
+    if: needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -141,6 +191,8 @@ jobs:
 
   differential:
     name: differential tests (x86-64 Linux)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -172,6 +224,8 @@ jobs:
 
   coverage:
     name: line coverage >= 80%
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -296,3 +350,21 @@ jobs:
           name: terminal-coverage-lcov
           path: target/terminal-coverage.lcov
           retention-days: 7
+
+  # The one required check: every job above passed or was not needed.
+  ci-ok:
+    if: always()
+    needs: [changes, wasm-programs, fuzz, programs, production-wasm, test, lint, dependencies, differential, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done

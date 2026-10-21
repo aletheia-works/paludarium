@@ -50,8 +50,8 @@ PALUDARIUM_TEST_NODE=<absolute path to node> cargo test --locked --workspace
 
 The emulator is correct when it matches native x86-64 Linux. Differential tests,
 line coverage (80% floor), and fuzzing only produce real evidence on x86-64
-Linux, which CI runs on every pull request; a macOS or Windows run is not a
-substitute. Do not lower coverage floors, add skips, or weaken comparison masks
+Linux, which CI runs on every pull request that changes what they cover (and on
+every push to main); a macOS or Windows run is not a substitute. Do not lower coverage floors, add skips, or weaken comparison masks
 to make a check pass. Measure speed only with background load stopped. For
 documentation or GitHub configuration changes, check syntax, referenced paths,
 and the final diff; a full emulator rebuild is unnecessary.

@@ -56,7 +56,9 @@ Within mise, `target/release` is on `PATH`.
 | `mise run ci` | `lint:all`, `build`, `test` and `deny` |
 
 Each `<lang>:check` has a `<lang>:check:fix`, and CI runs `lint:all` on every
-pull request (`test-lint-check.yml`).
+pull request (`test-lint-check.yml`). `lint-autofix.yml` runs `lint:all:fix`
+there too and pushes any fixes to the pull request branch as a `style:` commit;
+fetch it before pushing to that branch again.
 
 Differential tests build the guests under `tests/guests/` from source, run each
 one natively and in the emulator, and compare standard output, standard error

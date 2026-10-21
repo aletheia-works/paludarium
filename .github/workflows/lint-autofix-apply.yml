@@ -1,0 +1,124 @@
+name: Polyglot lint autofix apply
+
+# Applies the patch lint-autofix.yml produced to the pull request branch, as in
+# the other aletheia-works repositories. The patch comes from the pull request's
+# own code, so it is checked first: only files the fixers edit, no workflows,
+# no new, deleted, renamed or re-moded files, and only while the branch has not
+# moved. The push uses TF_TOKEN_GITHUB.
+
+on:
+  workflow_run:
+    workflows: ['Polyglot lint autofix']
+    types:
+      - completed
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: >-
+    lint-autofix-apply-${{ github.event.workflow_run.head_repository.full_name }}-${{
+    github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    name: Apply polyglot lint autofix
+    if: |
+      github.repository_owner == 'aletheia-works' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download autofix patch
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lint-autofix-patch
+          path: ./autofix-in
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect patch
+        id: patch
+        run: |
+          set -euo pipefail
+          patch=./autofix-in/autofix.patch
+          if [ ! -s "${patch}" ]; then
+            echo "No autofix changes to apply."
+            echo "apply=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          # The PR's own mise.toml produced this patch, so it is untrusted.
+          fail() { echo "::error::Autofix patch rejected: $1"; exit 1; }
+          if grep -qE '^(index [0-9a-f]+\.\.[0-9a-f]+ (120000|160000)|new file mode|deleted file mode|old mode|new mode|rename from|rename to|copy from|copy to|similarity index|dissimilarity index|Binary files|GIT binary patch)' "${patch}"; then
+            fail "it creates, deletes, renames, copies or re-modes a file, edits a symlink or submodule, or is binary"
+          fi
+          allowed='\.(py|rs|toml|md)$'
+          check_path() {
+            case "$1" in
+              .github/workflows/* | ../* | */../* | */.. | /*) fail "path not allowed: $1" ;;
+            esac
+            [[ "$1" =~ ${allowed} ]] || fail "not a file type the fixers touch: $1"
+          }
+          echo "Patch touches:"
+          headers=0
+          in_header=false
+          while IFS= read -r line; do
+            case "${line}" in
+              'diff --git '*)
+                headers=$((headers + 1))
+                in_header=true
+                rest=${line#diff --git a/}
+                [ "${rest}" != "${line}" ] || fail "unexpected header: ${line}"
+                path=${rest:0:$(((${#rest} - 3) / 2))}
+                [ "${rest}" = "${path} b/${path}" ] || fail "header names two paths: ${line}"
+                check_path "${path}"
+                echo "  ${path}"
+                ;;
+              '@@'*) in_header=false ;;
+              '--- '* | '+++ '*)
+                if ${in_header}; then
+                  p=${line:4}
+                  case "${p}" in
+                    a/* | b/*) check_path "${p:2}" ;;
+                    *) fail "unexpected path line: ${line}" ;;
+                  esac
+                fi
+                ;;
+            esac
+          done <"${patch}"
+          [ "${headers}" -gt 0 ] || fail "no file headers"
+          echo "apply=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout PR branch
+        if: steps.patch.outputs.apply == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.workflow_run.head_repository.full_name }}
+          ref: ${{ github.event.workflow_run.head_branch }}
+          token: ${{ secrets.TF_TOKEN_GITHUB }}
+          persist-credentials: true
+          allow-unsafe-pr-checkout: true
+          path: pr
+
+      - name: Apply and push
+        if: steps.patch.outputs.apply == 'true'
+        working-directory: pr
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          current="$(git rev-parse HEAD)"
+          if [ "${current}" != "${HEAD_SHA}" ]; then
+            echo "Branch moved (${HEAD_SHA} -> ${current}); skipping stale patch."
+            exit 0
+          fi
+
+          git apply --index "${GITHUB_WORKSPACE}/autofix-in/autofix.patch"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "style: polyglot lint autofix (cargo fmt/clippy, ruff, tombi, rumdl)"
+          git push origin "HEAD:${HEAD_BRANCH}"

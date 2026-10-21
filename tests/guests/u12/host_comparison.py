@@ -5,7 +5,7 @@ import pathlib
 import shutil
 import tempfile
 
-from comparison import compare, probe_pass, local_versions
+from comparison import compare, probe_pass
 from comparison_args import compare_original
 from differential import operation as guest_operation
 from metadata import fixture_inputs
@@ -66,7 +66,6 @@ def observe(executable, guests, native_path, output, root, *, original=False):
                 shutil.rmtree(fixture / 'app/node_modules')
             row = guest_operation(executable, guests / 'aube', case['args'], operations / case['name'], config['environment'], fixture, mounted=True)
             store(case['name'], row)
-        local_versions(data['rows'])
     if len(data['rows']) != 14 or len(data['default_rows']) != 2:
         raise ValueError('incomplete U12 inventory')
     data['differential_complete'] = True

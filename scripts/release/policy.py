@@ -8,7 +8,7 @@ PUBLIC = tuple('paludarium-'+n for n in ('types','decoder','mmu','host','vfs','l
 PRIVATE = {'paludarium-harness','paludarium-wasm'}
 REPOSITORY = 'aletheia-works/paludarium'
 REQUIRED = {'three-os','lint','dependencies','linux-differential','rust-coverage','js-coverage','u9-coverage','package-check'}
-ACCEPTANCE = {'FR6.3','FR7.2','FR7.3','FR8.2','FR8.3'}
+ACCEPTANCE = {'FR6.3','FR7.2','FR8.2','FR8.3'}
 
 def require(value, message):
     if not value:

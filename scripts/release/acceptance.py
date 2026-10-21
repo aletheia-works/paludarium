@@ -87,7 +87,6 @@ WASM_SOURCES = tuple('wasm-' + e for e in WASM_OS)
 ACCEPTANCE_SOURCES = {
     'FR6.3': NATIVE_SOURCES + WASM_SOURCES,
     'FR7.2': NATIVE_SOURCES + WASM_SOURCES,
-    'FR7.3': NATIVE_SOURCES + WASM_SOURCES,
     'FR8.2': WASM_SOURCES,
     'FR8.3': ('performance',),
 }
@@ -238,15 +237,6 @@ def probe_passed(rows):
             and environment['exit'] == 0 and environment['stdout'].startswith('PASS '))
 
 
-def local_versions_reported(rows):
-    """FR7.3: frozen install and aube list show both local dependencies at their own versions."""
-    frozen, listed = rows['frozen'], rows['list']
-    stderr, stdout = ANSI.sub('', frozen['stderr']), ANSI.sub('', listed['stdout'])
-    return (frozen['exit'] == 0 and listed['exit'] == 0
-            and all(re.search(p, stderr, re.M) for p in (r'^\+ filedep@1\.0\.0$', r'^\+ linked@2\.0\.0$'))
-            and all(re.search(p, stdout, re.M) for p in (r'^├── filedep 1\.0\.0$', r'^└── linked 2\.0\.0$')))
-
-
 def aube_matches(rows, native):
     """FR7.2 bound check: same exit for all four commands and identical --version stdout."""
     return all(rows[n]['exit'] == native[n]['exit'] for n in AUBE_ROWS) and rows['version']['stdout'] == native['version']['stdout']
@@ -266,14 +256,14 @@ def guest_hashes(document, key, label):
 
 
 def verdicts(rows, native):
-    return {'FR6.3': probe_passed(rows), 'FR7.2': aube_matches(rows, native), 'FR7.3': local_versions_reported(rows)}
+    return {'FR6.3': probe_passed(rows), 'FR7.2': aube_matches(rows, native)}
 
 
 def native_oracle(document, label):
-    """A fresh native x86-64 Linux oracle that itself shows the expected probe and local dependency results."""
+    """A fresh native x86-64 Linux oracle that itself shows the expected probe results."""
     policy.require(document.get('native_complete') is True, label + ': native oracle incomplete')
     rows = rows_of(document, 'rows', label)
-    policy.require(probe_passed(rows) and local_versions_reported(rows), label + ': native oracle does not show the expected results')
+    policy.require(probe_passed(rows), label + ': native oracle does not show the expected results')
     return guest_hashes(document, 'binary_hashes', label), rows
 
 

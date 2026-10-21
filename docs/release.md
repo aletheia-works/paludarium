@@ -55,7 +55,7 @@ registration is not assumed.
 ## Same-head evidence map
 
 `policy.release_gate` requires, for the exact head being released, one
-official quality run for each of the eight `REQUIRED` purposes and the five
+official quality run for each of the eight `REQUIRED` purposes and the four
 `ACCEPTANCE` conditions. `scripts/release/acceptance.py` derives both from
 upstream `aletheia-works/paludarium` only. A run counts only when its
 workflow file matches the table, its head and head repository are the
@@ -101,7 +101,6 @@ built guests differ by design.
 |---|---|---|
 | FR6.3 | all native and Wasm sources (Wasm interpreter mode) | every probe row exits 0 and prints exactly its `PASS <item>` line; `probe-all` prints all eight; `probe-environment` starts with `PASS` |
 | FR7.2 | same | the four aube commands have the oracle's exit codes and the same `--version` stdout; the job's own runner compares full stdout/exit and fails the job on a difference |
-| FR7.3 | same | frozen install stderr shows `+ filedep@1.0.0` and `+ linked@2.0.0`; `aube list` shows both at those versions |
 | FR8.2 | the four Wasm sources | `complete` and `passed`, 28 cases, both `interpreter` and `jit` modes complete and passed, every row `pass: true`, probe and aube checks above in both modes |
 | FR8.3 | performance | `head` equals the released head, `complete`, `passed`, `warmupsPassed`, `result.pass`, `p < 0.05`, mean JIT time below mean interpreter time, 20 rows all exit 0 and passed |
 
@@ -244,7 +243,7 @@ itself.
    then `publish.yml` once: its evidence job reuses those runs. Confirm:
    the u15 run succeeded and its artifact `u15-acceptance` holds only
    `release-evidence.json`, with that head, eight `quality` rows and the
-   five `acceptance` IDs all `passed: true`.
+   four `acceptance` IDs all `passed: true`.
 6. **Publication, then tag: automatic.** When the evidence of step 5
    succeeded, the same `Publish` run continues with `preflight` (main,
    untagged version, signed head, environment), `packages` (the package

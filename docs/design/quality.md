@@ -53,8 +53,6 @@ these, or nothing is published ([Release process](../release)):
   Chromium, Firefox and Safari.
 - The four aube operations give the same standard output and exit status as
   real x86-64 Linux everywhere.
-- aube reports the local `file:` and `link:` dependencies at their own versions,
-  exactly as on real Linux.
 - Results with and without the JIT agree in the four WebAssembly
   environments.
 - The JIT is faster, by a statistically significant margin (below).

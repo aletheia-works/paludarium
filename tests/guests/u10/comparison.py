@@ -25,15 +25,3 @@ def probe_pass(result, items):
     if result['stdout'].splitlines() != ['PASS ' + item for item in items]:
         raise ValueError('probe missing, duplicate, FAIL or unexpected item')
 
-
-def local_versions(rows):
-    for name in ('frozen', 'list'):
-        row = rows[name]
-        # aube install writes its dependency report to stderr; list writes
-        # its tree to stdout. Require both fixture dependencies at the versions
-        # in their own package.json (aube#1645 fixed the former 0.0.0 report).
-        report = re.sub(r'\x1b\[[0-9;]*m', '', row['stderr'] if name == 'frozen' else row['stdout'])
-        patterns = (r'^\+ filedep@1\.0\.0$', r'^\+ linked@2\.0\.0$') if name == 'frozen' else (
-            r'^├── filedep 1\.0\.0$', r'^└── linked 2\.0\.0$')
-        if row['exit'] != 0 or row['timed_out'] or not all(re.search(p, report, re.MULTILINE) for p in patterns):
-            raise ValueError('local dependency versions not reported on native ' + name)

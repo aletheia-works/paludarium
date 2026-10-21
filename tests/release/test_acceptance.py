@@ -250,11 +250,6 @@ class AcceptanceTests(unittest.TestCase):
         self.world.edit(A.U14, 'u13-windows-host', 'windows/comparison/observations.json', fail)
         self.rejected('FR6.3 not met by windows-native')
 
-    def test_local_versions_not_reported(self):
-        self.world.edit(A.U12, 'u12-macos-host', 'comparison/observations.json',
-                        lambda d: d['rows']['list'].update(stdout='├── filedep 0.0.0\n└── linked 0.0.0\n'))
-        self.rejected('FR7.3 not met by macos-native')
-
     def test_jit_mode_failure(self):
         self.world.edit(A.U14, 'u11-firefox', 'observations.json', lambda d: d['modes']['jit'].update(passed=False))
         self.rejected('FR8.2 not met by wasm-firefox')

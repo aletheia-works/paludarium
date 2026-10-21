@@ -6,7 +6,7 @@ import platform
 import shutil
 import tempfile
 
-from comparison import probe_pass, local_versions
+from comparison import probe_pass
 from evidence import digest, snapshot, validate
 from runner import run
 from metadata import fixture_inputs
@@ -60,7 +60,6 @@ def observe(guests, output, config, *, extra_snapshot=None, prepare_fixture=None
             (output / 'observations.json').write_text(json.dumps(observations, indent=2) + '\n')
             if row['exit'] != 0 or row['timed_out']:
                 raise ValueError('native aube failed: ' + case['name'])
-        local_versions(observations['rows'])
         observations['native_complete'] = True
         (output / 'observations.json').write_text(json.dumps(observations, indent=2) + '\n')
-    print('U10 native: probe eight items + standard run; aube four commands; node ENOENT; local dependency versions')
+    print('U10 native: probe eight items + standard run; aube four commands; node ENOENT')

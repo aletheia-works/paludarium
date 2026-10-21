@@ -332,7 +332,7 @@ def package_check(root):
             )
         )
         npmenv = dict(os.environ, PATH=str(node.parent) + os.pathsep + os.environ["PATH"])
-        module_script = 'const fs=require("node:fs");const m=new WebAssembly.Module(fs.readFileSync(process.argv[1]));const names=WebAssembly.Module.exports(m).map(x=>x.name);if(names.some(n=>/^u14_(cost|micro|length)/.test(n)))throw Error("diagnostic exports in release");console.log(JSON.stringify({diagnosticExports:0,exports:names.length}));'
+        module_script = 'const fs=require("node:fs");const m=new WebAssembly.Module(fs.readFileSync(process.argv[1]));const names=WebAssembly.Module.exports(m).map(x=>x.name);if(names.some(n=>/^(cost|micro|length)_/.test(n)))throw Error("diagnostic exports in release");console.log(JSON.stringify({diagnosticExports:0,exports:names.length}));'
         check.require_success(
             check.run_command(
                 [str(node), "-e", module_script, str(wasm)],

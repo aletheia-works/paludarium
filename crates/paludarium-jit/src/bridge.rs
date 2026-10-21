@@ -2,7 +2,7 @@
 //! register-only execution runs inside it and cannot reenter guest memory.
 use crate::{CodeCache, block, cache::EpochCache, emit};
 use paludarium_cpu::CpuState;
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 use paludarium_cpu::jit_cost::{self, Counter};
 use paludarium_mmu::AddressSpace;
 use paludarium_types::{ExitReason, GuestAddr};
@@ -57,7 +57,7 @@ pub(crate) fn commit(state: &mut CpuState, scratch: &JitState) {
 pub trait ExecutionBridge: Send + Sync {
     /// Feature-only no-touch observation. None means unsupported observation,
     /// not a missing prepared entry, and never requests preparation.
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     fn diagnostic_prepared(&self, _module_id: u32, _wasm: &[u8]) -> Option<bool> {
         None
     }
@@ -134,7 +134,7 @@ impl WasmCodeCache {
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
         }
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     fn observe_next(&self, memory: &AddressSpace, space: u64, generation: u64, rip: u64) {
         use crate::cache::Peek;
         jit_cost::add(Counter::ObservationLookups, 1);
@@ -175,21 +175,21 @@ impl WasmCodeCache {
             {
                 Some(translation) => {
                     *deterministic_rejection = translation.is_none();
-                    #[cfg(feature = "u14-cost-profile")]
+                    #[cfg(feature = "cost-profile")]
                     if translation.is_none() {
                         jit_cost::add(Counter::NegativeHits, 1);
                     }
                     (translation?, space, generation)
                 }
                 None => {
-                    #[cfg(feature = "u14-cost-profile")]
+                    #[cfg(feature = "cost-profile")]
                     jit_cost::add(Counter::CacheMisses, 1);
-                    #[cfg(feature = "u14-cost-profile")]
+                    #[cfg(feature = "cost-profile")]
                     jit_cost::add(Counter::ColdSnapshots, 1);
                     let snapshot = memory.code_snapshot(state.rip, 960).ok()?;
-                    #[cfg(feature = "u14-cost-profile")]
+                    #[cfg(feature = "cost-profile")]
                     jit_cost::add(Counter::SnapshotBytes, snapshot.bytes.len() as u64);
-                    #[cfg(feature = "u14-cost-profile")]
+                    #[cfg(feature = "cost-profile")]
                     jit_cost::add(Counter::ColdExtracts, 1);
                     let Some(block) = block::extract(&snapshot.bytes, state.rip.0) else {
                         *deterministic_rejection = true;
@@ -215,7 +215,7 @@ impl WasmCodeCache {
                         );
                         return None;
                     }
-                    #[cfg(feature = "u14-cost-profile")]
+                    #[cfg(feature = "cost-profile")]
                     jit_cost::add(Counter::ColdEmits, 1);
                     let code = emit::emit(&block)?;
                     // Never reuse an ID, even on exhaustion: Worker-local JS caches
@@ -236,7 +236,7 @@ impl WasmCodeCache {
                         return None;
                     }
                     self.translated.fetch_add(1, Ordering::Relaxed);
-                    #[cfg(feature = "u14-cost-profile")]
+                    #[cfg(feature = "cost-profile")]
                     jit_cost::add(Counter::TranslatedBlocks, 1);
                     (translation, snapshot.address_space, snapshot.generation)
                 }
@@ -246,37 +246,37 @@ impl WasmCodeCache {
             self.bridge
                 .execute_ready(translation.id, &translation.code, &mut scratch)
         });
-        #[cfg(feature = "u14-cost-profile")]
+        #[cfg(feature = "cost-profile")]
         if ready.is_none() {
             jit_cost::add(Counter::EpochInvalidations, 1);
         }
         let ready = ready?;
         let success = if let Some(success) = ready {
-            #[cfg(feature = "u14-cost-profile")]
+            #[cfg(feature = "cost-profile")]
             jit_cost::add(Counter::WarmExecutions, 1);
             Some(success)
         } else {
-            #[cfg(feature = "u14-cost-profile")]
+            #[cfg(feature = "cost-profile")]
             jit_cost::add(Counter::PrepareCalls, 1);
             if !self.bridge.prepare(translation.id, &translation.code) {
-                #[cfg(feature = "u14-cost-profile")]
+                #[cfg(feature = "cost-profile")]
                 jit_cost::add(Counter::PrepareRejections, 1);
                 return None;
             }
             memory.with_code_epoch(space, generation, || {
-                #[cfg(feature = "u14-cost-profile")]
+                #[cfg(feature = "cost-profile")]
                 jit_cost::add(Counter::ExecuteCalls, 1);
                 self.bridge
                     .execute(translation.id, &translation.code, &mut scratch)
             })
         };
-        #[cfg(feature = "u14-cost-profile")]
+        #[cfg(feature = "cost-profile")]
         if success.is_none() {
             jit_cost::add(Counter::EpochInvalidations, 1);
         }
         let success = success?;
         if !success {
-            #[cfg(feature = "u14-cost-profile")]
+            #[cfg(feature = "cost-profile")]
             jit_cost::add(Counter::ExecuteRejections, 1);
             return None;
         }
@@ -284,7 +284,7 @@ impl WasmCodeCache {
         self.executed.fetch_add(1, Ordering::Relaxed);
         self.instructions
             .fetch_add(translation.instruction_count as u64, Ordering::Relaxed);
-        #[cfg(feature = "u14-cost-profile")]
+        #[cfg(feature = "cost-profile")]
         {
             jit_cost::add(Counter::ExecutedBlocks, 1);
             jit_cost::add(
@@ -327,7 +327,7 @@ impl CodeCache for WasmCodeCache {
         let result = self.run(state, memory, &mut deterministic_rejection);
         if result.is_none() {
             self.fallbacks.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "u14-cost-profile")]
+            #[cfg(feature = "cost-profile")]
             jit_cost::add(Counter::Fallbacks, 1);
         }
         (result, deterministic_rejection)
@@ -347,14 +347,14 @@ mod tests {
     };
 
     struct NodeBridge;
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[derive(Default)]
     struct ObservingBridge {
         queries: AtomicU32,
         prepares: AtomicU32,
         executes: AtomicU32,
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     impl ExecutionBridge for ObservingBridge {
         fn diagnostic_prepared(&self, id: u32, _: &[u8]) -> Option<bool> {
             self.queries.fetch_add(1, Ordering::Relaxed);
@@ -369,7 +369,7 @@ mod tests {
             false
         }
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     fn observation_case(kind: u32, expected_queries: u32) {
         let (state, memory) = machine(&[0xb8, 42, 0, 0, 0], 0);
         let before = state.clone();
@@ -414,42 +414,42 @@ mod tests {
         assert_eq!(state, before);
         assert_eq!(memory.code_epoch(), epoch);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_observe_missing_never_prepares() {
         observation_case(0, 0);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_observe_positive_only_queries_worker() {
         observation_case(1, 3);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_observe_unprepared_never_compiles() {
         observation_case(2, 3);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_observe_negative_never_queries_worker() {
         observation_case(3, 0);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_observe_stale_never_queries_worker() {
         observation_case(4, 0);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_observe_other_space_never_queries_worker() {
         observation_case(5, 0);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_observe_invalidated_never_recreates_entry() {
         observation_case(6, 0);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_observe_default_bridge_reports_unavailable_without_prepare() {
         let bridge = WarmBridge::default();

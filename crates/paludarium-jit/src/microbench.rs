@@ -255,44 +255,44 @@ mod tests {
         DiagnosticBench::new(kind, max, false, Arc::new(Never)).unwrap()
     }
     #[test]
-    fn u14_micro_loop() {
+    fn micro_loop() {
         let mut b = run(0, false);
         assert_eq!(b.chunk(1024), Some(1024));
         assert_eq!(b.operations(), 1024);
     }
     #[test]
-    fn u14_micro_interpreter_short() {
+    fn micro_interpreter_short() {
         assert_eq!(run(1, false).chunk(2), Some(86));
     }
     #[test]
-    fn u14_micro_interpreter_max() {
+    fn micro_interpreter_max() {
         assert_eq!(run(1, true).chunk(2), Some(2));
     }
     #[test]
-    fn u14_micro_negative_preserves_cpu() {
+    fn micro_negative_preserves_cpu() {
         assert_eq!(run(3, false).chunk(2), Some(2));
     }
     #[test]
-    fn u14_micro_snapshot() {
+    fn micro_snapshot() {
         assert_eq!(run(6, false).chunk(1), Some(960));
     }
     #[test]
-    fn u14_micro_extract_max() {
+    fn micro_extract_max() {
         assert_eq!(run(7, true).chunk(1), Some(64));
     }
     #[test]
-    fn u14_micro_emit_actual_wasm() {
+    fn micro_emit_actual_wasm() {
         assert!(run(8, false).chunk(1).unwrap() > 8);
     }
     #[test]
-    fn u14_micro_invalid_bounds() {
+    fn micro_invalid_bounds() {
         let mut b = run(0, false);
         assert_eq!(b.chunk(0), None);
         assert_eq!(b.chunk(1025), None);
         assert_eq!(b.operations(), 0);
     }
     #[test]
-    fn u14_micro_hint_warmup_covers_every_measured_boundary() {
+    fn micro_hint_warmup_covers_every_measured_boundary() {
         let mut bench = run(10, false);
         assert_eq!(bench.operations(), 0);
         let mut state = CpuState::new(GuestAddr(4096), GuestAddr(8192));
@@ -502,42 +502,42 @@ mod length_tests {
         assert_eq!(bench.operations(), 1024);
     }
     #[test]
-    fn u14_length_two_full_cpu_budget_stop() {
+    fn length_two_full_cpu_budget_stop() {
         verify(2);
     }
     #[test]
-    fn u14_length_three_full_cpu_budget_stop() {
+    fn length_three_full_cpu_budget_stop() {
         verify(3);
     }
     #[test]
-    fn u14_length_six_full_cpu_budget_stop() {
+    fn length_six_full_cpu_budget_stop() {
         verify(6);
     }
     #[test]
-    fn u14_length_sixtyfour_full_cpu_budget_stop() {
+    fn length_sixtyfour_full_cpu_budget_stop() {
         verify(64);
     }
     #[test]
-    fn u14_length_invalid_lengths() {
+    fn length_invalid_lengths() {
         for length in [0, 1, 4, 63, 65, u32::MAX] {
             assert!(LengthBench::new(1, length, false, Arc::new(NoBridge)).is_none());
         }
     }
     #[test]
-    fn u14_length_invalid_kinds() {
+    fn length_invalid_kinds() {
         for kind in [0, 3, 5, 11, u32::MAX] {
             assert!(LengthBench::new(kind, 3, false, Arc::new(NoBridge)).is_none());
         }
     }
     #[test]
-    fn u14_length_chunk_bounds_do_not_charge() {
+    fn length_chunk_bounds_do_not_charge() {
         let mut bench = LengthBench::new(1, 3, false, Arc::new(NoBridge)).unwrap();
         assert_eq!(bench.chunk(0), None);
         assert_eq!(bench.chunk(1025), None);
         assert_eq!(bench.operations(), 0);
     }
     #[test]
-    fn u14_length_every_site_warmup_has_exact_cpu() {
+    fn length_every_site_warmup_has_exact_cpu() {
         let bench = LengthBench::new(1, 3, false, Arc::new(NoBridge)).unwrap();
         assert_eq!(bench.expected(0).gpr[1], 34);
         assert_eq!(bench.expected(63).gpr[2], 3);

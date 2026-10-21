@@ -9,12 +9,12 @@ mod block;
 mod bridge;
 mod cache;
 mod emit;
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 pub mod microbench;
 pub use bridge::{
     ExecutionBridge, JitState, JitStatistics, STATE_BYTES, STATE_WORDS, WasmCodeCache,
 };
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 pub use paludarium_cpu::jit_cost;
 
 /// Bounded native sanitizer entry points; absent from production builds.

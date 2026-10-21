@@ -14,7 +14,7 @@ paludarium-mmu.workspace = true
 paludarium-types.workspace = true
 
 [features]
-u14-cost-profile = []
+cost-profile = []
 
 [lints]
 workspace = true

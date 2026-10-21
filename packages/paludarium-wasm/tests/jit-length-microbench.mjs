@@ -38,32 +38,32 @@ export function validateLengthRow(row){
 async function child(){
   const {moduleBytes,kind,length,observe}=workerData;
   const memory=new WebAssembly.Memory({initial:128,maximum:16384,shared:true});let e,jit;
-  const cost=(field,value)=>need(e.u14_cost_add(field,BigInt(value))===0,'cost overflow');
+  const cost=(field,value)=>need(e.cost_add(field,BigInt(value))===0,'cost overflow');
   const base=imports(memory,{cost});jit=jitImports(memory,cost);
   base.paludarium.jit_prepare=(...args)=>{if(kind==='cold')jit=jitImports(memory,cost);return jit.prepare(...args)};
   base.paludarium.jit_execute=(...args)=>jit.execute(...args);
   e=(await WebAssembly.instantiate(moduleBytes,base)).instance.exports;
-  need(e.u14_cost_version()===3&&typeof e.u14_length_new==='function','diagnostic length ABI missing');
-  e.u14_cost_reset();
-  const handle=e.u14_length_new({interpreter:1,cold:2,warm:4}[kind],length,Number(observe));
+  need(e.cost_version()===3&&typeof e.length_new==='function','diagnostic length ABI missing');
+  e.cost_reset();
+  const handle=e.length_new({interpreter:1,cold:2,warm:4}[kind],length,Number(observe));
   need(handle>0,'all64site CPU initialization failed');
-  const warmupCount=Number(e.u14_length_stat(handle,1));
-  need(warmupCount===64&&e.u14_length_stat(handle,0)===0n,'warmup counted as timed work');
-  const before=COST_FIELDS.map((_,i)=>e.u14_cost_stat(i));
+  const warmupCount=Number(e.length_stat(handle,1));
+  need(warmupCount===64&&e.length_stat(handle,0)===0n,'warmup counted as timed work');
+  const before=COST_FIELDS.map((_,i)=>e.cost_stat(i));
   const warmupCounters=Object.fromEntries(['executedBlocks','executedInstructions','interpreterSteps'].map(n=>[n,String(before[COST_FIELDS.indexOf(n)])]));
-  const sitesBefore=e.u14_cost_site_count();
-  const previous=e.u14_cost_measurement(Number(observe));need(previous===1,'fresh Worker measurement state');
+  const sitesBefore=e.cost_site_count();
+  const previous=e.cost_measurement(Number(observe));need(previous===1,'fresh Worker measurement state');
   const chunks=[],clockOnly=[];let checksum;
   try{
     for(let i=0;i<CHUNKS;i++){
       const c=performance.now();clockOnly.push(performance.now()-c);
-      const start=performance.now();checksum=e.u14_length_chunk(handle,OPERATIONS);chunks.push(performance.now()-start);
+      const start=performance.now();checksum=e.length_chunk(handle,OPERATIONS);chunks.push(performance.now()-start);
       need(checksum===BigInt((i+1)*OPERATIONS),'exact block CPU/budget/count failed');
     }
-  }finally{need(e.u14_cost_measurement(previous)===Number(observe),'measurement scope restoration');}
-  const operations=Number(e.u14_length_stat(handle,0));
-  const counters=Object.fromEntries(COST_FIELDS.map((n,i)=>[n,String(e.u14_cost_stat(i)-before[i])]));
-  const siteCount=e.u14_cost_site_count();need(e.u14_cost_overflow()===0,'diagnostic overflow');e.u14_length_drop(handle);
+  }finally{need(e.cost_measurement(previous)===Number(observe),'measurement scope restoration');}
+  const operations=Number(e.length_stat(handle,0));
+  const counters=Object.fromEntries(COST_FIELDS.map((n,i)=>[n,String(e.cost_stat(i)-before[i])]));
+  const siteCount=e.cost_site_count();need(e.cost_overflow()===0,'diagnostic overflow');e.length_drop(handle);
   parentPort.postMessage({kind,length,observe,chunks,clockOnly,operations,cpuBudget:length,fixtureInstructions:length,
     clockCalls:256,measuredClockCalls:128,clockControlCalls:128,checksum:String(checksum),counters,
     warmupCount,warmupCounters,warmupCpuVerified:true,sitesBefore,siteCount,measurementRestored:true,warmupExcluded:true,
@@ -91,7 +91,7 @@ export async function main(args){
   validateBuildReceipt(receipt,hash(bytes),process.env.GITHUB_SHA);
   for(const [path,digest]of Object.entries(receipt.source_files))need(hash(await readFile(path))===digest,'current source changed: '+path);
   await mkdir(output,{recursive:false});
-  const report={schema:1,purpose:'u14-fixed-length-worker-microbench',performanceAcceptance:false,
+  const report={schema:1,purpose:'fixed-length-worker-microbench',performanceAcceptance:false,
     head:receipt.head,source_digest:receipt.source_digest,module_sha256:hash(bytes),lengths:LENGTHS,kinds:KINDS,
     chunks:64,operationsPerChunk:1024,tools:{node:process.version,v8:process.versions.v8},rows:[],complete:false};
   try{

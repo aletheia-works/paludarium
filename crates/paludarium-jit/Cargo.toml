@@ -15,8 +15,8 @@ paludarium-mmu.workspace = true
 paludarium-types.workspace = true
 
 [features]
+cost-profile = ["paludarium-cpu/cost-profile"]
 fuzzing = []
-u14-cost-profile = ["paludarium-cpu/u14-cost-profile"]
 
 [lints]
 workspace = true

@@ -14,8 +14,8 @@ const need = (value, message) => { if (!value) throw Error(message); };
 const digestMap = rows => hash(JSON.stringify(Object.fromEntries(Object.keys(rows).sort().map(name => [name, rows[name]]))));
 
 export function validateBuildReceipt(receipt, moduleHash, expectedHead) {
-  need(receipt.schema === 3 && receipt.diagnostic_version === 3 && receipt.purpose === "u14-cost-profile"
-    && JSON.stringify(receipt.features) === '["u14-cost-profile"]', "Diagnostic build receipt required");
+  need(receipt.schema === 3 && receipt.diagnostic_version === 3 && receipt.purpose === "cost-profile"
+    && JSON.stringify(receipt.features) === '["cost-profile"]', "Diagnostic build receipt required");
   need(receipt.module_sha256 === moduleHash && hex(moduleHash) && hex(receipt.source_digest), "Diagnostic module identity mismatch");
   need(receipt.source_files && typeof receipt.source_files === "object"
     && !Array.isArray(receipt.source_files) && Object.keys(receipt.source_files).length > 0, "Source closure missing");
@@ -31,7 +31,7 @@ export function validateBuildReceipt(receipt, moduleHash, expectedHead) {
 }
 
 export function validateProfileReport(report, identity) {
-  need(report.schema === 3 && report.purpose === "u14-cost-profile"
+  need(report.schema === 3 && report.purpose === "cost-profile"
     && report.performanceAcceptance === false && report.complete === true, "Not a completed diagnostic report");
   for (const key of ["head", "module_sha256", "source_digest", "oracle_sha256", "probe_sha256"]) {
     need(report[key] === identity[key], "Diagnostic receipt identity mismatch: " + key);
@@ -42,7 +42,7 @@ export function validateProfileReport(report, identity) {
       && row.errors.length === 0 && Number.isFinite(row.seconds) && row.seconds > 0 && row.seconds <= 30
       && row.cleaned === true, "Diagnostic guest failed/deadline/cleanup");
     const cost = row.costProfile;
-    need(cost?.schema === 3 && cost.purpose === "u14-cost-profile" && cost.overflow === false, "Diagnostic collector missing/overflow");
+    need(cost?.schema === 3 && cost.purpose === "cost-profile" && cost.overflow === false, "Diagnostic collector missing/overflow");
     need(JSON.stringify(Object.keys(cost.counters ?? {})) === JSON.stringify(COST_FIELDS), "Diagnostic field population mismatch");
     for (const value of Object.values(cost.counters)) need(typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value) && BigInt(value) <= 0xffffffffffffffffn, "Invalid diagnostic counter");
     need(cost.sites?.capacity === 16384 && cost.sites.retainedOnly === true && Array.isArray(cost.sites.rows)
@@ -76,7 +76,7 @@ export async function collectProfile({ modulePath, oraclePath, guests, output })
   const moduleBytes = await readFile(modulePath), receipt = JSON.parse(await readFile(modulePath + ".receipt.json", "utf8"));
   validateBuildReceipt(receipt, hash(moduleBytes), process.env.GITHUB_SHA);
   const module = new WebAssembly.Module(moduleBytes);
-  need(WebAssembly.Module.exports(module).some(x => x.name === "u14_cost_version"), "Ordinary release module is not a diagnostic module");
+  need(WebAssembly.Module.exports(module).some(x => x.name === "cost_version"), "Ordinary release module is not a diagnostic module");
   for (const [name, digest] of Object.entries(receipt.source_files)) {
     const path = resolve(ROOT, name);
     need(!(await lstat(path)).isSymbolicLink() && hash(await readFile(path)) === digest, "Current source differs from diagnostic build: " + name);
@@ -85,7 +85,7 @@ export async function collectProfile({ modulePath, oraclePath, guests, output })
   need(oracle.native_complete === true && hash(probe) === oracle.binary_hashes.probe && oracle.rows["probe-all"]?.exit === 0, "Fresh matching probe/native oracle required");
   const identity = { head: receipt.head, module_sha256: hash(moduleBytes), source_digest: receipt.source_digest,
     oracle_sha256: hash(oracleBytes), probe_sha256: hash(probe) };
-  const report = { schema: 3, purpose: "u14-cost-profile", performanceAcceptance: false, ...identity,
+  const report = { schema: 3, purpose: "cost-profile", performanceAcceptance: false, ...identity,
     baseline_signed_head: receipt.baseline_signed_head, local_snapshot: receipt.local_snapshot, tools: { node: process.version },
     scope: "one fresh launcher/shared heap per mode; all guest Workers aggregate; times are diagnostic only",
     rows: [], complete: false, passed: false };
@@ -145,7 +145,7 @@ export async function superviseProfile(args) {
       }
     }
   } finally { clearTimeout(timer); }
-  const result = { schema: 1, purpose: "u14-cost-profile-supervisor", exit: code, timed_out, process_group_cleaned };
+  const result = { schema: 1, purpose: "cost-profile-supervisor", exit: code, timed_out, process_group_cleaned };
   await writeFile(resolve(output, "supervisor.json"), JSON.stringify(result, null, 2) + "\n");
   need(code === 0 && !timed_out && process_group_cleaned, "Diagnostic child failed or leaked process group");
   return result;

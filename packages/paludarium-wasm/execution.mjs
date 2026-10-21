@@ -18,9 +18,9 @@ port.listen(async message => {
       port.send({ type: "wait-done", result }); return;
     }
     if (message.type !== "execute") return;
-    const diagnostic = WebAssembly.Module.exports(message.module).some(item => item.name === "u14_cost_version");
+    const diagnostic = WebAssembly.Module.exports(message.module).some(item => item.name === "cost_version");
     const cost = diagnostic ? (field, value) => {
-      if (!Number.isSafeInteger(value) || value < 0 || e.u14_cost_add(field, BigInt(value)) !== 0) throw Error("Diagnostic counter rejected");
+      if (!Number.isSafeInteger(value) || value < 0 || e.cost_add(field, BigInt(value)) !== 0) throw Error("Diagnostic counter rejected");
     } : undefined;
     const instance = await WebAssembly.instantiate(message.module, imports(message.memory, { spawnTask: handle => port.send({ type: "spawn-task", handle }), cost }));
     e = instance.exports;

@@ -38,7 +38,7 @@ async function child(){
   const {moduleBytes,kind,maximum,observe}=workerData;
   const module=new WebAssembly.Module(moduleBytes),memory=new WebAssembly.Memory({initial:128,maximum:16384,shared:true});
   let e,jit;
-  const cost=(field,value)=>{need(Number.isSafeInteger(value)&&value>=0,'cost value');need(e.u14_cost_add(field,BigInt(value))===0,'cost overflow')};
+  const cost=(field,value)=>{need(Number.isSafeInteger(value)&&value>=0,'cost value');need(e.cost_add(field,BigInt(value))===0,'cost overflow')};
   const base=imports(memory,{cost});
   jit=jitImports(memory,cost);
   // Cold reset includes JS cache allocation/reset in the measured cost. A new
@@ -46,27 +46,27 @@ async function child(){
   base.paludarium.jit_prepare=(...args)=>{if(['cold','epoch','prepare'].includes(kind))jit=jitImports(memory,cost);return jit.prepare(...args)};
   base.paludarium.jit_execute=(...args)=>jit.execute(...args);
   e=(await WebAssembly.instantiate(module,base)).exports;
-  need(e.u14_cost_version()===3&&typeof e.u14_micro_new==='function','diagnostic microbench ABI missing');
-  e.u14_cost_reset();
-  const handle=e.u14_micro_new(KINDS.indexOf(kind),Number(maximum),Number(observe));
+  need(e.cost_version()===3&&typeof e.micro_new==='function','diagnostic microbench ABI missing');
+  e.cost_reset();
+  const handle=e.micro_new(KINDS.indexOf(kind),Number(maximum),Number(observe));
   need(handle>0,'fixture initialization/untimed warmup failed');
-  const before=COST_FIELDS.map((_,i)=>e.u14_cost_stat(i));
-  const sitesBefore=e.u14_cost_site_count();
-  const previous=e.u14_cost_measurement(Number(observe));
+  const before=COST_FIELDS.map((_,i)=>e.cost_stat(i));
+  const sitesBefore=e.cost_site_count();
+  const previous=e.cost_measurement(Number(observe));
   need(previous===1,'fresh Worker measurement state');
   const chunks=[],clockOnly=[];let checksum;
   try{
   for(let i=0;i<CHUNKS;i++){
     const c=performance.now();clockOnly.push(performance.now()-c);
-    const start=performance.now();checksum=e.u14_micro_chunk(handle,OPERATIONS);chunks.push(performance.now()-start);
+    const start=performance.now();checksum=e.micro_chunk(handle,OPERATIONS);chunks.push(performance.now()-start);
     need(checksum!==0xffffffffffffffffn,'CPU/bridge fixture failed');
   }
-  }finally{need(e.u14_cost_measurement(previous)===Number(observe),'measurement scope restoration');}
-  const operations=Number(e.u14_micro_operations(handle));
-  const counters=Object.fromEntries(COST_FIELDS.map((name,i)=>[name,String(e.u14_cost_stat(i)-before[i])]));
-  const siteCount=e.u14_cost_site_count();
-  need(e.u14_cost_overflow()===0,'diagnostic counter overflow');
-  e.u14_micro_drop(handle);
+  }finally{need(e.cost_measurement(previous)===Number(observe),'measurement scope restoration');}
+  const operations=Number(e.micro_operations(handle));
+  const counters=Object.fromEntries(COST_FIELDS.map((name,i)=>[name,String(e.cost_stat(i)-before[i])]));
+  const siteCount=e.cost_site_count();
+  need(e.cost_overflow()===0,'diagnostic counter overflow');
+  e.micro_drop(handle);
   parentPort.postMessage({kind,maximum,observe,chunks,clockOnly,operations,clockCalls:4*CHUNKS,
     measuredClockCalls:2*CHUNKS,clockControlCalls:2*CHUNKS,
     checksum:String(checksum),counters,siteCount,sitesBefore,measurementRestored:true,warmupExcluded:true,unit:'milliseconds per 1024 operations',
@@ -96,7 +96,7 @@ export async function main(args,kinds=KINDS){
   validateBuildReceipt(receipt,hash(bytes),process.env.GITHUB_SHA);
   for(const [path,digest]of Object.entries(receipt.source_files))need(hash(await readFile(path))===digest,'current source changed: '+path);
   await mkdir(output,{recursive:false});
-  const report={schema:3,purpose:'u14-worker-cost-microbench',performanceAcceptance:false,
+  const report={schema:3,purpose:'worker-cost-microbench',performanceAcceptance:false,
     head:receipt.head,source_digest:receipt.source_digest,module_sha256:hash(bytes),
     tools:{node:process.version,v8:process.versions.v8},chunks:CHUNKS,operationsPerChunk:OPERATIONS,rows:[],complete:false};
   try{

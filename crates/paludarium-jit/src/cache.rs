@@ -36,7 +36,7 @@ pub(crate) struct EpochCache<T> {
     state: Mutex<State<T>>,
 }
 
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Peek<T> {
     Missing,
@@ -46,7 +46,7 @@ pub(crate) enum Peek<T> {
 
 impl<T: Clone> EpochCache<T> {
     /// Diagnostic observation only: even stale entries retain their recency.
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     pub(crate) fn peek(&self, space: u64, rip: u64, generation: u64) -> Peek<T> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match state.entries.get(&(space, rip)) {
@@ -80,19 +80,19 @@ impl<T: Clone> EpochCache<T> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let key = (space, rip);
         if state.entries.get(&key)?.generation != generation {
-            #[cfg(feature = "u14-cost-profile")]
+            #[cfg(feature = "cost-profile")]
             paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::EpochInvalidations, 1);
             state.remove(&key);
             return None;
         }
-        #[cfg(feature = "u14-cost-profile")]
+        #[cfg(feature = "cost-profile")]
         paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::CacheHits, 1);
         let entry = state.entries.get(&key)?;
         if !touch(&entry.translation) {
             return Some(entry.translation.clone());
         }
         let access = state.tick();
-        #[cfg(feature = "u14-cost-profile")]
+        #[cfg(feature = "cost-profile")]
         {
             use paludarium_cpu::jit_cost::{Counter, add};
             add(Counter::LruUpdates, 1);
@@ -122,7 +122,7 @@ impl<T: Clone> EpochCache<T> {
         };
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let access = state.tick();
-        #[cfg(feature = "u14-cost-profile")]
+        #[cfg(feature = "cost-profile")]
         paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::LruUpdates, 1);
         let key = (space, rip);
         state.remove(&key);
@@ -166,7 +166,7 @@ impl<T: Clone> EpochCache<T> {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     fn snapshot(cache: &EpochCache<Option<u64>>) -> String {
         let state = cache.state.lock().unwrap();
         format!(
@@ -180,7 +180,7 @@ mod tests {
             state.clock
         )
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     fn unchanged(space: u64, rip: u64, generation: u64, expected: Peek<Option<u64>>) {
         let cache = EpochCache::new();
         cache.insert(1, 4096, 2, 1, Some(42));
@@ -191,32 +191,32 @@ mod tests {
         }
         assert_eq!(snapshot(&cache), before);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_peek_positive_does_not_touch_recency() {
         unchanged(1, 4096, 2, Peek::Present(Some(42)));
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_peek_negative_does_not_touch_hint() {
         unchanged(1, 8192, 2, Peek::Present(None));
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_peek_stale_does_not_delete_entry() {
         unchanged(1, 4096, 3, Peek::Stale);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_peek_missing_does_not_insert_entry() {
         unchanged(1, 12288, 2, Peek::Missing);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_peek_other_space_is_not_positive() {
         unchanged(2, 4096, 2, Peek::Missing);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_peek_does_not_trigger_clock_exhaustion() {
         let cache = EpochCache::new();
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(cache.peek(1, 4096, 1), Peek::Present(Some(42)));
         assert_eq!(snapshot(&cache), before);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_peek_does_not_change_eviction_order() {
         let cache = EpochCache::new();
@@ -237,7 +237,7 @@ mod tests {
         cache.insert(1, 1024, 1, 1, Some(1024));
         assert_eq!(cache.peek(1, 0, 1), Peek::Missing);
     }
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     #[test]
     fn u14_peek_invalidated_mapping_stays_missing() {
         let cache = EpochCache::new();

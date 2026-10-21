@@ -21,9 +21,9 @@ static CONFIGS: Table<Config> = OnceLock::new();
 static RUNS: Table<Arc<Run>> = OnceLock::new();
 static REGIONS: Table<Box<[u128]>> = OnceLock::new();
 static FILESYSTEMS: Table<Arc<PrivateFs>> = OnceLock::new();
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 static MICRO: Table<paludarium_jit::microbench::DiagnosticBench> = OnceLock::new();
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 static LENGTH: Table<paludarium_jit::microbench::LengthBench> = OnceLock::new();
 struct Run {
     session: Option<Arc<Session>>,
@@ -46,7 +46,7 @@ unsafe extern "C" {
 }
 struct WorkerJit;
 impl paludarium_jit::ExecutionBridge for WorkerJit {
-    #[cfg(feature = "u14-cost-profile")]
+    #[cfg(feature = "cost-profile")]
     fn diagnostic_prepared(&self, module: u32, wasm: &[u8]) -> Option<bool> {
         paludarium_jit::jit_cost::add(paludarium_jit::jit_cost::Counter::JsTransitions, 1);
         // SAFETY: immutable live Rust code; length0/null state is a diagnostic
@@ -63,7 +63,7 @@ impl paludarium_jit::ExecutionBridge for WorkerJit {
         wasm: &[u8],
         state: &mut paludarium_jit::JitState,
     ) -> Option<bool> {
-        #[cfg(feature = "u14-cost-profile")]
+        #[cfg(feature = "cost-profile")]
         {
             use paludarium_jit::jit_cost::{self, Counter};
             jit_cost::add(Counter::JsTransitions, 1);
@@ -86,13 +86,13 @@ impl paludarium_jit::ExecutionBridge for WorkerJit {
         }
     }
     fn prepare(&self, module: u32, wasm: &[u8]) -> bool {
-        #[cfg(feature = "u14-cost-profile")]
+        #[cfg(feature = "cost-profile")]
         paludarium_jit::jit_cost::add(paludarium_jit::jit_cost::Counter::JsTransitions, 1);
         // SAFETY: immutable Rust code bytes stay live for the synchronous import.
         unsafe { jit_prepare(module, wasm.as_ptr(), wasm.len()) == 0 }
     }
     fn execute(&self, module: u32, wasm: &[u8], state: &mut paludarium_jit::JitState) -> bool {
-        #[cfg(feature = "u14-cost-profile")]
+        #[cfg(feature = "cost-profile")]
         paludarium_jit::jit_cost::add(paludarium_jit::jit_cost::Counter::JsTransitions, 1);
         // SAFETY: both buffers belong to Rust, are live for this synchronous
         // import, and state is exclusively borrowed scratch of exactly
@@ -242,14 +242,14 @@ pub extern "C" fn session_jit_stat(id: u32, field: u32) -> u64 {
 // Diagnostic-only ABI. None of these exports or collector operations is
 // present in the ordinary acceptance module. The fresh coordinator resets
 // before spawning Workers; all reads/additions are lock-free counters.
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_cost_version() -> u32 {
+pub extern "C" fn cost_version() -> u32 {
     3
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_cost_measurement(enabled: u32) -> i32 {
+pub extern "C" fn cost_measurement(enabled: u32) -> i32 {
     if enabled > 1 {
         return -1;
     }
@@ -257,48 +257,48 @@ pub extern "C" fn u14_cost_measurement(enabled: u32) -> i32 {
         enabled == 1,
     ))
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_cost_site_count() -> u32 {
+pub extern "C" fn cost_site_count() -> u32 {
     paludarium_jit::jit_cost::site_count() as u32
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_cost_site_stat(index: u32, field: u32) -> u64 {
+pub extern "C" fn cost_site_stat(index: u32, field: u32) -> u64 {
     paludarium_jit::jit_cost::site_field(index as usize, field as usize).unwrap_or(0)
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_cost_fields() -> u32 {
+pub extern "C" fn cost_fields() -> u32 {
     paludarium_jit::jit_cost::FIELD_COUNT as u32
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_cost_stat(field: u32) -> u64 {
+pub extern "C" fn cost_stat(field: u32) -> u64 {
     paludarium_jit::jit_cost::get(field as usize).unwrap_or(0)
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_cost_overflow() -> u32 {
+pub extern "C" fn cost_overflow() -> u32 {
     u32::from(paludarium_jit::jit_cost::overflowed())
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_cost_add(field: u32, value: u64) -> i32 {
+pub extern "C" fn cost_add(field: u32, value: u64) -> i32 {
     if paludarium_jit::jit_cost::add_field(field as usize, value) {
         0
     } else {
         -1
     }
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_cost_reset() {
+pub extern "C" fn cost_reset() {
     paludarium_jit::jit_cost::reset();
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_micro_new(kind: u32, maximum: u32, observe: u32) -> u32 {
+pub extern "C" fn micro_new(kind: u32, maximum: u32, observe: u32) -> u32 {
     if maximum > 1 || observe > 1 {
         return 0;
     }
@@ -310,9 +310,9 @@ pub extern "C" fn u14_micro_new(kind: u32, maximum: u32, observe: u32) -> u32 {
     )
     .map_or(0, |bench| insert(&MICRO, bench))
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_micro_chunk(id: u32, count: u32) -> u64 {
+pub extern "C" fn micro_chunk(id: u32, count: u32) -> u64 {
     table(&MICRO)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -320,35 +320,35 @@ pub extern "C" fn u14_micro_chunk(id: u32, count: u32) -> u64 {
         .and_then(|bench| bench.chunk(count))
         .unwrap_or(u64::MAX)
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_micro_operations(id: u32) -> u64 {
+pub extern "C" fn micro_operations(id: u32) -> u64 {
     table(&MICRO)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&id)
         .map_or(u64::MAX, |bench| bench.operations())
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_micro_drop(id: u32) {
+pub extern "C" fn micro_drop(id: u32) {
     table(&MICRO)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .remove(&id);
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_length_new(kind: u32, length: u32, observe: u32) -> u32 {
+pub extern "C" fn length_new(kind: u32, length: u32, observe: u32) -> u32 {
     if observe > 1 {
         return 0;
     }
     paludarium_jit::microbench::LengthBench::new(kind, length, observe == 1, Arc::new(WorkerJit))
         .map_or(0, |bench| insert(&LENGTH, bench))
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_length_chunk(id: u32, count: u32) -> u64 {
+pub extern "C" fn length_chunk(id: u32, count: u32) -> u64 {
     table(&LENGTH)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -356,9 +356,9 @@ pub extern "C" fn u14_length_chunk(id: u32, count: u32) -> u64 {
         .and_then(|bench| bench.chunk(count))
         .unwrap_or(u64::MAX)
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_length_stat(id: u32, field: u32) -> u64 {
+pub extern "C" fn length_stat(id: u32, field: u32) -> u64 {
     table(&LENGTH)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -370,9 +370,9 @@ pub extern "C" fn u14_length_stat(id: u32, field: u32) -> u64 {
         })
         .unwrap_or(u64::MAX)
 }
-#[cfg(feature = "u14-cost-profile")]
+#[cfg(feature = "cost-profile")]
 #[unsafe(no_mangle)]
-pub extern "C" fn u14_length_drop(id: u32) {
+pub extern "C" fn length_drop(id: u32) {
     table(&LENGTH)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)

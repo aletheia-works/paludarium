@@ -11,7 +11,7 @@ const need=(v,m)=>{if(!v)throw Error(m)},sha=b=>createHash('sha256').update(b).d
 const hex=(v,n=64)=>typeof v==='string'&&new RegExp('^[a-f0-9]{'+n+'}$').test(v);
 const persist=(p,v)=>writeFile(p,JSON.stringify(v,null,2)+'\n',{flag:'wx'});
 export function validateNormalIdentity(r,moduleHash,head){
- need(hex(head,40)&&r.schema===3&&r.purpose==='u14-acceptance-control'&&r.diagnostic_version===null&&r.local_snapshot===false,'normal signed receipt required');
+ need(hex(head,40)&&r.schema===3&&r.purpose==='acceptance-control'&&r.diagnostic_version===null&&r.local_snapshot===false,'normal signed receipt required');
  need(r.head===head&&r.baseline_signed_head===head&&r.module_sha256===moduleHash&&hex(moduleHash),'normal head/module mismatch');
  need(Array.isArray(r.features)&&r.features.length===0,'normal feature mismatch');
  need(r.source_files&&typeof r.source_files==='object'&&!Array.isArray(r.source_files)&&Object.keys(r.source_files).length>0,'source missing');
@@ -94,7 +94,7 @@ async function identity(modulePath,receiptPath,oraclePath,probePath){
  const bytes=await readFile(modulePath),rr=await readFile(receiptPath),r=JSON.parse(rr);
  validateNormalIdentity(r,sha(bytes),process.env.GITHUB_SHA);
  const module=new WebAssembly.Module(bytes);
- need(WebAssembly.Module.exports(module).filter(e=>/^u14_(cost|micro|length)_/.test(e.name)).length===0,'diagnostic export in normal module');
+ need(WebAssembly.Module.exports(module).filter(e=>/^(cost|micro|length)__/.test(e.name)).length===0,'diagnostic export in normal module');
  const oracleBytes=await readFile(oraclePath),oracle=JSON.parse(oracleBytes),probe=await readFile(probePath);
  need(oracle.native_complete===true&&oracle.binary_hashes.probe===sha(probe)&&oracle.rows['probe-all']?.exit===0,'fresh oracle/probe mismatch');
  const before={};
@@ -123,7 +123,7 @@ export async function main(args){
  need(process.version==='v26.12.0'&&!process.execPath.includes('/shims/'),'actual Node26.12 required');
  const input=await identity(...args.slice(0,4));const out=resolve(args[4]);await mkdir(out,{recursive:false});
  const inputHashes=Object.fromEntries(await Promise.all(args.slice(0,4).map(async p=>[resolve(p),sha(await readFile(p))])));
- const report={schema:1,purpose:'u14-normal-cpu-sampling',performanceAcceptance:false,...input.identity,tools:{node:process.version,nodePath:process.execPath,v8:process.versions.v8},samplingIntervalMicroseconds:1000,scope:'full process window including startup, guest and strict cleanup; sampled counts not elapsed attribution or acceptance',rows:[],complete:false,passed:false};
+ const report={schema:1,purpose:'normal-cpu-sampling',performanceAcceptance:false,...input.identity,tools:{node:process.version,nodePath:process.execPath,v8:process.versions.v8},samplingIntervalMicroseconds:1000,scope:'full process window including startup, guest and strict cleanup; sampled counts not elapsed attribution or acceptance',rows:[],complete:false,passed:false};
  const controllerStarted=Date.now(),deadline=controllerStarted+180000;
  let activeTerminate=null,wholeTimedOut=false;
  const wholeTimer=setTimeout(()=>{wholeTimedOut=true;try{activeTerminate?.()}catch{}},180000);

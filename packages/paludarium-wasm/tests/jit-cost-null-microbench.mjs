@@ -42,7 +42,7 @@ export function validateNullRow(row){
   return true;
 }
 export function validateNullReport(report){
-  need(report.schema===1&&report.purpose==='u14-length-js-cost-boundary-control'&&report.performanceAcceptance===false&&report.complete===true,'distinct complete control report');
+  need(report.schema===1&&report.purpose==='length-js-cost-boundary-control'&&report.performanceAcceptance===false&&report.complete===true,'distinct complete control report');
   const schedule=matrix();need(report.rows.length===schedule.length,'fixed24 population');
   report.rows.forEach((r,i)=>{const f=schedule[i];need(r.length===f.length&&r.kind===f.kind&&r.variant===f.variant,'fixed alternating schedule');validateNullRow(r)});
   return true;
@@ -50,39 +50,39 @@ export function validateNullReport(report){
 async function child(){
   const {moduleBytes,kind,length,variant,functional=false}=workerData;
   const memory=new WebAssembly.Memory({initial:128,maximum:16384,shared:true});let e,jit,calls=0;
-  const callback=(field,value)=>{calls++;need(e.u14_cost_add(field,BigInt(value))===0,'cost overflow')};
+  const callback=(field,value)=>{calls++;need(e.cost_add(field,BigInt(value))===0,'cost overflow')};
   const connection=makeCostConnection(variant,callback,cost=>jitImports(memory,cost));
   const base=imports(memory,{cost:connection.cost});jit=connection.fresh();
   base.paludarium.jit_prepare=(...args)=>{if(kind==='cold')jit=connection.fresh();return jit.prepare(...args)};
   base.paludarium.jit_execute=(...args)=>jit.execute(...args);
   e=(await WebAssembly.instantiate(moduleBytes,base)).instance.exports;
-  need(e.u14_cost_version()===3&&typeof e.u14_length_new==='function','length diagnostic ABI');
-  e.u14_cost_reset();
-  const handle=e.u14_length_new({interpreter:1,cold:2,warm:4}[kind],length,0);
+  need(e.cost_version()===3&&typeof e.length_new==='function','length diagnostic ABI');
+  e.cost_reset();
+  const handle=e.length_new({interpreter:1,cold:2,warm:4}[kind],length,0);
   need(handle>0,'all64site CPU initialization failed');
-  const warmupCount=Number(e.u14_length_stat(handle,1));
-  need(warmupCount===64&&e.u14_length_stat(handle,0)===0n,'warmup exact64');
-  const before=COST_FIELDS.map((_,i)=>e.u14_cost_stat(i));
+  const warmupCount=Number(e.length_stat(handle,1));
+  need(warmupCount===64&&e.length_stat(handle,0)===0n,'warmup exact64');
+  const before=COST_FIELDS.map((_,i)=>e.cost_stat(i));
   const warmupCounters=Object.fromEntries(['executedBlocks','executedInstructions','interpreterSteps'].map(n=>[n,String(before[COST_FIELDS.indexOf(n)])]));
-  const sitesBefore=e.u14_cost_site_count(),callsBefore=calls;
-  const previous=e.u14_cost_measurement(0);need(previous===1,'fresh measurement state');
+  const sitesBefore=e.cost_site_count(),callsBefore=calls;
+  const previous=e.cost_measurement(0);need(previous===1,'fresh measurement state');
   const chunks=[],clockOnly=[];let checksum,restored=false;
   try{
     for(let i=0;i<64;i++){
-      if(functional){checksum=e.u14_length_chunk(handle,1);chunks.push(0);clockOnly.push(0)}
+      if(functional){checksum=e.length_chunk(handle,1);chunks.push(0);clockOnly.push(0)}
       else{
         const c=performance.now();clockOnly.push(performance.now()-c);
-        const start=performance.now();checksum=e.u14_length_chunk(handle,1024);chunks.push(performance.now()-start);
+        const start=performance.now();checksum=e.length_chunk(handle,1024);chunks.push(performance.now()-start);
       }
       need(checksum===BigInt((i+1)*(functional?1:1024)),'fullCPU/budget/operation assertion failed');
     }
   }finally{
-    need(e.u14_cost_measurement(previous)===0,'measurement restoration');restored=true;
+    need(e.cost_measurement(previous)===0,'measurement restoration');restored=true;
   }
-  const operations=Number(e.u14_length_stat(handle,0));
-  const counters=Object.fromEntries(COST_FIELDS.map((n,i)=>[n,String(e.u14_cost_stat(i)-before[i])]));
-  const siteCount=e.u14_cost_site_count();need(e.u14_cost_overflow()===0,'counter overflow');
-  e.u14_length_drop(handle);
+  const operations=Number(e.length_stat(handle,0));
+  const counters=Object.fromEntries(COST_FIELDS.map((n,i)=>[n,String(e.cost_stat(i)-before[i])]));
+  const siteCount=e.cost_site_count();need(e.cost_overflow()===0,'counter overflow');
+  e.length_drop(handle);
   parentPort.postMessage({kind,length,variant,observe:false,chunks,clockOnly,operations,cpuBudget:length,fixtureInstructions:length,
     clockCalls:functional?0:256,measuredClockCalls:functional?0:128,clockControlCalls:functional?0:128,
     checksum:String(checksum),counters,warmupCount,warmupCounters,warmupCpuVerified:true,sitesBefore,siteCount,
@@ -113,7 +113,7 @@ export async function main(args){
   validateBuildReceipt(receipt,hash(bytes),process.env.GITHUB_SHA);
   for(const [p,d]of Object.entries(receipt.source_files))need(hash(await readFile(p))===d,'current source changed: '+p);
   await mkdir(output,{recursive:false});
-  const report={schema:1,purpose:'u14-length-js-cost-boundary-control',performanceAcceptance:false,head:receipt.head,source_digest:receipt.source_digest,
+  const report={schema:1,purpose:'length-js-cost-boundary-control',performanceAcceptance:false,head:receipt.head,source_digest:receipt.source_digest,
     module_sha256:hash(bytes),schedule:matrix(),tools:{node:process.version,v8:process.versions.v8},rows:[],complete:false};
   try{
     for(const f of matrix()){

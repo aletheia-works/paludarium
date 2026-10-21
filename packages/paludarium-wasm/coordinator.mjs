@@ -10,7 +10,7 @@ let abandoned = false;
 const failure = (kind, message) => ({ kind, message });
 function check(value, name) { if (value < 0) throw new Error(`${name} rejected`); return value; }
 function jitDiagnostics(job) {
-  if (job.diagnostics && typeof e.u14_cost_version === "function") job.diagnostics.costProfile = costSnapshot(e);
+  if (job.diagnostics && typeof e.cost_version === "function") job.diagnostics.costProfile = costSnapshot(e);
   if (!job.diagnostics || typeof e.session_jit_stat !== "function") return;
   job.diagnostics.jit = {
     translatedBlocks: String(e.session_jit_stat(job.handle, 0)),
@@ -178,7 +178,7 @@ port.listen(async message => {
     if (message.type === "init") {
       module = message.module; memory = message.memory;
       e = (await WebAssembly.instantiate(module, imports(memory))).exports;
-      if (typeof e.u14_cost_reset === "function") e.u14_cost_reset();
+      if (typeof e.cost_reset === "function") e.cost_reset();
       port.send({ type: "ready", exports: WebAssembly.Module.exports(module), imports: WebAssembly.Module.imports(module) });
     } else if (message.type === "filesystem-new") {
       const config = withBytes(encoder.encode("/"), id => e.config_new(id));

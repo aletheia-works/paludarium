@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cost_fresh_collector_has_complete_zero_population() {
+    fn cost_fresh_collector_has_complete_zero_population() {
         let c = Collector::new();
         assert_eq!(Counter::BudgetCharged as usize + 1, BASE_FIELDS);
         assert_eq!(FIELD_COUNT, 120);
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cost_accumulates_exact_values() {
+    fn cost_accumulates_exact_values() {
         let c = Collector::new();
         assert!(c.add(Counter::CacheMisses as usize, 4));
         assert!(c.add(Counter::CacheMisses as usize, 7));
@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cost_invalid_field_is_rejected_without_mutation() {
+    fn cost_invalid_field_is_rejected_without_mutation() {
         let c = Collector::new();
         assert!(!c.add(FIELD_COUNT, 1));
         assert_eq!(c.get(FIELD_COUNT), None);
@@ -350,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cost_overflow_never_wraps_and_is_sticky() {
+    fn cost_overflow_never_wraps_and_is_sticky() {
         let c = Collector::new();
         assert!(c.add(0, u64::MAX));
         assert!(!c.add(0, 1));
@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cost_exclusive_reset_clears_values_and_overflow() {
+    fn cost_exclusive_reset_clears_values_and_overflow() {
         let c = Collector::new();
         c.add(0, u64::MAX);
         c.add(0, 1);
@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cost_block_histogram_separates_one_two_and_sixty_four() {
+    fn cost_block_histogram_separates_one_two_and_sixty_four() {
         let c = Collector::new();
         for length in [1, 2, 2, 64] {
             assert!(c.block_length(length));
@@ -382,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cost_invalid_block_lengths_fail_closed() {
+    fn cost_invalid_block_lengths_fail_closed() {
         for length in [0, 65, usize::MAX] {
             let c = Collector::new();
             assert!(!c.block_length(length));
@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn u14_cost_shared_workers_accumulate_without_lost_updates() {
+    fn cost_shared_workers_accumulate_without_lost_updates() {
         let c = std::sync::Arc::new(Collector::new());
         let workers = (0..4)
             .map(|_| {

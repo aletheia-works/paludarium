@@ -19,7 +19,7 @@ paludarium-types.workspace = true
 paludarium-vfs.workspace = true
 
 [features]
-u14-cost-profile = ["paludarium-cpu/u14-cost-profile", "paludarium-jit/u14-cost-profile"]
+cost-profile = ["paludarium-cpu/cost-profile", "paludarium-jit/cost-profile"]
 
 [lints]
 workspace = true

@@ -196,7 +196,7 @@ jobs:
             target/windows/windows-byte-audit
           retention-days: 14
   wasm-programs:
-    if: ${{ !contains(github.event.head_commit.message, '[u14-diagnostic-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[diagnostic-only]') }}
     uses: ./.github/workflows/jit-wasm-programs.yml
   fuzz:
     uses: ./.github/workflows/fuzz-nightly.yml
@@ -553,7 +553,7 @@ jobs:
               assert code==0 and len(data.splitlines())==expected_rows and not (out/(name+'.stderr')).read_bytes()
           PY_NATIVE
       - name: Diagnostic and selection Rust components, feature enabled fixed population
-        run: cargo llvm-cov --locked -p paludarium-cpu -p paludarium-jit -p paludarium-runtime --features u14-cost-profile --lib --fail-under-lines 80 --lcov --output-path target/jit-cost-profile.lcov
+        run: cargo llvm-cov --locked -p paludarium-cpu -p paludarium-jit -p paludarium-runtime --features cost-profile --lib --fail-under-lines 80 --lcov --output-path target/jit-cost-profile.lcov
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:

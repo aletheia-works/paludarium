@@ -126,7 +126,7 @@ def main():
         "--target-dir",
         str(directory / "build"),
     ]
-    features = ["u14-cost-profile"] if args.kind == "diagnostic" else []
+    features = ["cost-profile"] if args.kind == "diagnostic" else []
     if features:
         command += ["--features", ",".join(features)]
     run_directory = directory / "runs" / (str(time.time_ns()) + "-" + args.kind)
@@ -202,7 +202,7 @@ def main():
     receipt = {
         "schema": 3,
         "diagnostic_version": 3 if features else None,
-        "purpose": "u14-cost-profile" if features else "u14-acceptance-control",
+        "purpose": "cost-profile" if features else "acceptance-control",
         "head": head or "local:" + source_digest,
         "local_snapshot": head is None,
         "baseline_signed_head": args.baseline_head,

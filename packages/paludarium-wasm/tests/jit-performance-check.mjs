@@ -9,7 +9,7 @@ const [modulePath, oraclePath, guests, output] = process.argv.slice(2);
 if (!output) throw Error("usage: module native-oracle guests output");
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const moduleBytes = await readFile(modulePath), oracleBytes = await readFile(oraclePath);
-if (WebAssembly.Module.exports(new WebAssembly.Module(moduleBytes)).some(item => item.name === "u14_cost_version")) throw Error("Diagnostic module cannot be used for performance acceptance");
+if (WebAssembly.Module.exports(new WebAssembly.Module(moduleBytes)).some(item => item.name === "cost_version")) throw Error("Diagnostic module cannot be used for performance acceptance");
 const oracle = JSON.parse(oracleBytes);
 const probe = await readFile(resolve(guests, "probe"));
 if (!oracle.native_complete || hash(probe) !== oracle.binary_hashes.probe) throw Error("Fresh native probe identity mismatch");

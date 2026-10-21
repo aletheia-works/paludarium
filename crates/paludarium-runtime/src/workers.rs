@@ -96,10 +96,10 @@ impl Execution {
     ) -> Result<ExitStatus, Error> {
         let mut decode = DecodeCache::new();
         loop {
-            #[cfg(feature = "u14-cost-profile")]
+            #[cfg(feature = "cost-profile")]
             paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::Checkpoints, 1);
             if self.kill.load(Ordering::SeqCst) {
-                #[cfg(feature = "u14-cost-profile")]
+                #[cfg(feature = "cost-profile")]
                 paludarium_cpu::jit_cost::add(paludarium_cpu::jit_cost::Counter::StopKill, 1);
                 self.processes
                     .stop_all(ExitStatus::Signaled(signal::SIGKILL));
@@ -130,7 +130,7 @@ impl Execution {
                             *deterministic_rejection = true;
                             return None;
                         }
-                        #[cfg(feature = "u14-cost-profile")]
+                        #[cfg(feature = "cost-profile")]
                         paludarium_cpu::jit_cost::add(
                             paludarium_cpu::jit_cost::Counter::HookAttempts,
                             1,

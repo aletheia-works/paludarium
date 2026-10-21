@@ -419,7 +419,7 @@ impl FileHandle for SocketPairEnd {
     }
 }
 #[cfg(test)]
-mod u6_tests {
+mod events_tests {
     use super::*;
     fn pair() -> [Arc<SocketPairEnd>; 2] {
         SocketPairEnd::pair(1, Arc::default()).unwrap()

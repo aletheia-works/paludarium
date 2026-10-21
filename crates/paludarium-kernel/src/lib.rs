@@ -498,15 +498,15 @@ impl Kernel {
 mod tests;
 
 #[cfg(test)]
-mod u9_tests;
+mod terminal_tests;
 
 #[cfg(test)]
-mod u5_tests;
+mod threads_tests;
 
 #[cfg(test)]
-mod u6_tests;
+mod events_tests;
 
 #[cfg(test)]
-mod u11_tests;
+mod processes_tests;
 #[cfg(test)]
-mod u8_tests;
+mod wasm_tests;

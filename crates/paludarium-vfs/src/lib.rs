@@ -321,11 +321,11 @@ impl MemFs {
     }
 }
 #[cfg(test)]
-mod u11_tests;
+mod core_tests;
 #[cfg(test)]
-mod u1_tests;
+mod files_tests;
 #[cfg(test)]
-mod u7_tests;
+mod wasm_tests;
 
 mod mount;
 pub use mount::MountedFs;

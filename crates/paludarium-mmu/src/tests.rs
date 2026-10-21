@@ -182,7 +182,7 @@ fn u2_stack_write_probe_preserves_bytes_and_observes_protection() {
     assert_eq!(m.read_u64(GuestAddr(0x10000)).unwrap(), 0x123456789abcdef0);
 }
 
-mod u4_tests {
+mod signals_time_tests {
     use super::*;
-    include!("u4_tests.rs");
+    include!("signals_time_tests.rs");
 }

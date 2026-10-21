@@ -146,8 +146,8 @@ fn environment_reaches_the_guest_stack() {
     );
     assert_eq!(host.stdout(), b"A=1");
 }
-#[path = "u4_tests.rs"]
-mod u4_tests;
+#[path = "signals_time_tests.rs"]
+mod signals_time_tests;
 
 #[test]
 fn u7_runtime_preload() {

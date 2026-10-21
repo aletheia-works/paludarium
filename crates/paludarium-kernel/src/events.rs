@@ -194,7 +194,7 @@ impl FileHandle for EventCounter {
 }
 
 #[cfg(test)]
-mod u6_tests {
+mod events_tests {
     use super::*;
     fn counter(value: u32, flags: u32) -> EventCounter {
         EventCounter::new(value, flags, Arc::default()).unwrap()

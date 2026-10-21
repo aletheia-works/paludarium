@@ -54,7 +54,7 @@ impl FileHandle for NullFile {
     }
 }
 #[cfg(test)]
-mod u8_tests {
+mod processes_tests {
     use super::*;
     #[test]
     fn read_eof() {

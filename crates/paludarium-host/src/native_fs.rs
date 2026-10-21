@@ -416,7 +416,7 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
     }
 }
 #[cfg(test)]
-mod u7_tests {
+mod files_tests {
     use super::*;
     #[test]
     fn u7_mtime_system_time_before_epoch() {
@@ -713,7 +713,7 @@ mod u7_tests {
     fn u7_native_symlink_rename_race() {
         #[cfg(unix)]
         {
-            const NAME: &str = "native_fs::u7_tests::u7_native_symlink_rename_race";
+            const NAME: &str = "native_fs::files_tests::u7_native_symlink_rename_race";
             if std::env::var_os("PALUDARIUM_U7_RACE_CHILD").is_none() {
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", NAME, "--nocapture"])
@@ -853,7 +853,7 @@ mod u7_tests {
     #[test]
     fn u7_native_windows_symlink_rename_race() {
         use std::sync::{Barrier, atomic::AtomicBool};
-        const NAME: &str = "native_fs::u7_tests::u7_native_windows_symlink_rename_race";
+        const NAME: &str = "native_fs::files_tests::u7_native_windows_symlink_rename_race";
         if std::env::var_os("PALUDARIUM_U7_WINDOWS_RACE_CHILD").is_none() {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture"])

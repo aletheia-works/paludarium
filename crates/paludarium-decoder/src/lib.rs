@@ -10,7 +10,7 @@
 //! as [`DecodeError::Unsupported`]. Later units extend [`Mnemonic`].
 #![forbid(unsafe_code)]
 #[cfg(test)]
-mod u3_tests;
+mod encodings_tests;
 
 use iced_x86 as iced;
 use paludarium_types::GuestAddr;

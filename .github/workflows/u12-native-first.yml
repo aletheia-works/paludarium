@@ -36,7 +36,7 @@ jobs:
           cargo deny --version > target/u12-native-first/deny.txt
           sha256sum Cargo.lock fuzz/Cargo.lock rust-toolchain.toml tests/guests/u10/source-lock.json > target/u12-native-first/inputs-before.sha256
           python scripts/u12-run.py --self-test
-          cargo test --locked -p paludarium-host --lib u4_tests:: -- --test-threads=1
+          cargo test --locked -p paludarium-host --lib signals_time_tests:: -- --test-threads=1
       - name: Fixed unmodified guests with license audits
         shell: bash
         run: |

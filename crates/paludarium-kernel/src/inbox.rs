@@ -128,7 +128,7 @@ impl SignalInbox {
 }
 
 #[cfg(test)]
-mod u4_tests {
+mod signals_time_tests {
     use super::*;
     #[test]
     fn u4_inbox_control_signal_survives_realtime_backlog() {

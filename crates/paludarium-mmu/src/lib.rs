@@ -894,12 +894,12 @@ impl std::ops::DerefMut for AddressSpaceGuard<'_> {
 }
 
 #[cfg(test)]
-mod u8_tests;
+mod processes_tests;
 
 #[cfg(test)]
-mod u14_tests;
+mod jit_tests;
 #[cfg(test)]
-mod u5_tests;
+mod threads_tests;
 impl Default for AddressSpace {
     fn default() -> Self {
         Self::new()
@@ -1363,4 +1363,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "tests.rs"]
-mod u2_tests;
+mod instructions_tests;

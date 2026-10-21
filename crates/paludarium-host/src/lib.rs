@@ -347,7 +347,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod u4_tests;
+mod signals_time_tests;
 
 // Linux x86-64 kernel ABI, not libc's larger `struct termios`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -422,11 +422,11 @@ fn native_terminal_info(stream: StreamId) -> Result<Option<TerminalInfo>, Errno>
 }
 
 #[cfg(test)]
-mod u9_tests;
+mod terminal_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod u12_tests;
+mod macos_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod u13_tests;
+mod threads_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod u5_tests;
+mod windows_tests;

@@ -376,7 +376,7 @@ impl std::error::Error for Error {}
 mod tests {
     use super::*;
 
-    mod u4_tests {
+    mod signals_time_tests {
         use super::*;
         macro_rules! fault_case {
             ($name:ident,$write:literal,$fetch:literal,$mapped:literal,$present:literal) => {

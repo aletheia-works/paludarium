@@ -785,7 +785,7 @@ impl FileHandle for StandardFile {
     }
 }
 #[cfg(test)]
-mod u7_tests {
+mod files_tests {
     use super::*;
     fn d(fs: &MemFs, p: &[u8]) -> Descriptor {
         Descriptor {

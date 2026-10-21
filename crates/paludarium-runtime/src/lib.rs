@@ -341,13 +341,13 @@ impl Session {
 mod tests;
 
 #[cfg(test)]
-mod u9_tests;
+mod terminal_tests;
 
 #[cfg(test)]
-mod u10_tests;
+mod programs_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod u5_tests;
+mod threads_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod u8_tests;
+mod processes_tests;

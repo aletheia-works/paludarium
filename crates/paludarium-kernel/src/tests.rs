@@ -382,9 +382,9 @@ fn poll_and_sigaltstack() {
     );
 }
 
-mod u4_tests {
+mod signals_time_tests {
     use super::*;
-    include!("u4_tests.rs");
+    include!("signals_time_tests.rs");
 }
 
 #[test]

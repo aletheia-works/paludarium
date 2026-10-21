@@ -12,7 +12,11 @@ mod alu;
 mod counted_hook_tests;
 mod cpuid;
 mod crypto;
+#[cfg(test)]
+mod encodings_tests;
 mod exec;
+#[cfg(test)]
+mod instructions_tests;
 /// Opt-in diagnostic counters; absent from ordinary release builds.
 #[cfg(feature = "u14-cost-profile")]
 pub mod jit_cost;
@@ -21,10 +25,6 @@ mod jit_cost_sites;
 mod softfloat;
 mod sse;
 mod state;
-#[cfg(test)]
-mod u2_tests;
-#[cfg(test)]
-mod u3_tests;
 
 use paludarium_decoder::{DecodeError, Instruction, decode};
 use paludarium_mmu::AddressSpace;

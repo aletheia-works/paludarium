@@ -337,5 +337,5 @@ fn u2_segment_pair_failed_compare_zero_extends_registers() {
     assert_eq!(state.gpr[reg::RDX], 0x11223344);
     assert_eq!(memory.read_u64(GuestAddr(0x40000000)).unwrap(), 99);
 }
-#[path = "u4_tests.rs"]
-mod u4_tests;
+#[path = "signals_time_tests.rs"]
+mod signals_time_tests;

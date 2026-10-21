@@ -307,7 +307,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
 }
 #[cfg(test)]
-mod u6_tests {
+mod events_tests {
     use super::*;
     use crate::events::EventCounter;
     fn setup() -> (EpollInstance, Arc<dyn FileHandle>) {

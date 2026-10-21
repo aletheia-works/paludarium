@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/aletheia-works/paludarium/compare/v0.1.1...v0.1.2) (2026-10-21)
+
+
+### Bug Fixes
+
+* **guests:** pin aube v2.8.1 and drop the guest lock overlay ([#36](https://github.com/aletheia-works/paludarium/issues/36)) ([bc470c9](https://github.com/aletheia-works/paludarium/commit/bc470c997a6710b14ba7cccaafb02ec7ad435c49))
+
 ## [0.1.1](https://github.com/aletheia-works/paludarium/compare/v0.1.0...v0.1.1) (2026-10-20)
 
 

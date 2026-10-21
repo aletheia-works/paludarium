@@ -1,9 +1,11 @@
 """Bounded native GDB inventory; a budget stop is explicitly incomplete."""
+
 import collections
-import gdb
 import json
 import os
 import time
+
+import gdb
 
 started = time.monotonic()
 start_point = os.environ.get("U2_TRACE_START", "elf-entry")
@@ -59,11 +61,22 @@ except gdb.error as error:
     reason = "inferior-exited" if not gdb.selected_inferior().pid else str(error)
 output = os.environ["U2_TRACE_OUTPUT"]
 with open(output, "w", encoding="utf-8") as stream:
-    json.dump({"steps": steps, "reason": reason, "complete_runtime_inventory": False,
-               "sample_completed": reason == "inferior-exited", "start_point": start_point,
-               "start_evidence": start_evidence,
-               "forms": [{"asm": form, "bytes": samples[form], "count": count}
-                         for form, count in sorted(forms.items())]}, stream, indent=2)
+    json.dump(
+        {
+            "steps": steps,
+            "reason": reason,
+            "complete_runtime_inventory": False,
+            "sample_completed": reason == "inferior-exited",
+            "start_point": start_point,
+            "start_evidence": start_evidence,
+            "forms": [
+                {"asm": form, "bytes": samples[form], "count": count}
+                for form, count in sorted(forms.items())
+            ],
+        },
+        stream,
+        indent=2,
+    )
 print("U2_TRACE", steps, reason, output)
 if gdb.selected_inferior().pid:
     gdb.execute("kill", to_string=True)

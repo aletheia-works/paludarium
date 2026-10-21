@@ -116,7 +116,7 @@ dir = "infra/github"
 run = "tofu plan"
 
 [tasks."python:check"]
-description = "Ruff — Python format check + lint (read-only; not yet part of lint:all)"
+description = "Ruff — Python format check + lint (read-only)"
 run = "ruff format --check && ruff check"
 
 [tasks."python:check:fix"]
@@ -140,9 +140,9 @@ description = "rumdl — apply Markdown autofix (in-place)"
 run = "rumdl fmt ."
 
 [tasks."lint:all"]
-description = "Run all formatters/linters (read-only) — Rust + ShellCheck + actionlint + Tombi + rumdl; Python is not yet part of it"
-depends = ["rust:check", "shell:check", "actions:check", "toml:check", "markdown:check"]
+description = "Run all formatters/linters (read-only) — Rust + ShellCheck + actionlint + Ruff + Tombi + rumdl"
+depends = ["rust:check", "shell:check", "actions:check", "python:check", "toml:check", "markdown:check"]
 
 [tasks."lint:all:fix"]
 description = "Apply the autofixes of lint:all (in-place)"
-depends = ["rust:check:fix", "toml:check:fix", "markdown:check:fix"]
+depends = ["rust:check:fix", "python:check:fix", "toml:check:fix", "markdown:check:fix"]

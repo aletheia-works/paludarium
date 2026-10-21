@@ -1,7 +1,8 @@
 """Reject invalid measurements and mismatched differential results."""
+
 import importlib.util
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/u1-frame-regression.py"
 SPEC = importlib.util.spec_from_file_location("frame_regression", SCRIPT)
@@ -22,22 +23,21 @@ class ComparisonTests(unittest.TestCase):
 
     def test_nonzero_exit_in_either_execution(self):
         for code in (1, -11, 127):
-            for pair in ((outcome(exit=code), outcome()),
-                         (outcome(), outcome(exit=code))):
+            for pair in ((outcome(exit=code), outcome()), (outcome(), outcome(exit=code))):
                 with self.assertRaises(ValueError):
                     regression.compare(*pair)
 
     def test_timeout_in_either_execution(self):
-        for pair in ((outcome(timeout=True), outcome()),
-                     (outcome(), outcome(timeout=True))):
+        for pair in ((outcome(timeout=True), outcome()), (outcome(), outcome(timeout=True))):
             with self.assertRaises(ValueError):
                 regression.compare(*pair)
 
     def test_invalid_times_are_rejected(self):
-        for seconds in (-1, 30.001, float("nan"), float("inf"),
-                        float("-inf"), True, "0.5", None):
-            for pair in ((outcome(seconds=seconds), outcome()),
-                         (outcome(), outcome(seconds=seconds))):
+        for seconds in (-1, 30.001, float("nan"), float("inf"), float("-inf"), True, "0.5", None):
+            for pair in (
+                (outcome(seconds=seconds), outcome()),
+                (outcome(), outcome(seconds=seconds)),
+            ):
                 with self.assertRaises(ValueError):
                     regression.compare(*pair)
 

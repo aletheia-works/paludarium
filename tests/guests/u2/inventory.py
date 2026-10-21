@@ -1,12 +1,36 @@
 """Summarize static disassembly; static presence does not prove execution."""
+
 import collections
 import json
 import pathlib
 import re
 
 root = pathlib.Path("/work/target/u2-inventory")
-prefixes = {"lock", "rep", "repe", "repz", "repne", "repnz", "data16", "addr32", "cs", "ds", "es", "ss", "fs", "gs", "bnd", "xacquire", "xrelease", "{evex}"}
-registers = re.compile(r"\b(?:r(?:1[0-5]|[89])(?:d|w|b)?|[re]?(?:ax|bx|cx|dx|si|di|bp|sp)|[abcd][hl]|[xyz]mm\d+)\b")
+prefixes = {
+    "lock",
+    "rep",
+    "repe",
+    "repz",
+    "repne",
+    "repnz",
+    "data16",
+    "addr32",
+    "cs",
+    "ds",
+    "es",
+    "ss",
+    "fs",
+    "gs",
+    "bnd",
+    "xacquire",
+    "xrelease",
+    "{evex}",
+}
+registers = re.compile(
+    r"\b(?:r(?:1[0-5]|[89])(?:d|w|b)?|[re]?(?:ax|bx|cx|dx|si|di|bp|sp)|[abcd][hl]|[xyz]mm\d+)\b"
+)
+
+
 def register_class(match):
     name = match.group(0)
     if name.startswith(("xmm", "ymm", "zmm")):
@@ -18,6 +42,8 @@ def register_class(match):
     if name.endswith("w") or name in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
         return "reg16"
     return "reg32" if name.startswith("e") or name.endswith("d") else "reg64"
+
+
 for name in ("probe", "aube"):
     counts = collections.Counter()
     samples = {}
@@ -30,7 +56,9 @@ for name in ("probe", "aube"):
         asm = matched.group(2).split("#", 1)[0].strip()
         tokens = asm.split()
         index = 0
-        while index < len(tokens) and (tokens[index] in prefixes or tokens[index].startswith("rex")):
+        while index < len(tokens) and (
+            tokens[index] in prefixes or tokens[index].startswith("rex")
+        ):
             index += 1
         if index == len(tokens):
             continue
@@ -44,10 +72,19 @@ for name in ("probe", "aube"):
         form = re.sub(r"\b(?:0x[0-9a-f]+|[0-9][0-9a-f]*)\b", "IMM", form)
         counts[form] += 1
         samples.setdefault(form, {"address": matched.group(1), "asm": asm})
-    result = {"binary": name, "kind": "static-presence", "complete_runtime_inventory": False,
-              "instruction_rows": sum(mnemonics.values()), "invalid_disassembly_rows": invalid_rows,
-              "mnemonics": dict(sorted(mnemonics.items())),
-              "forms": [{"form": form, "count": count, "sample": samples[form]}
-                        for form, count in sorted(counts.items())]}
+    result = {
+        "binary": name,
+        "kind": "static-presence",
+        "complete_runtime_inventory": False,
+        "instruction_rows": sum(mnemonics.values()),
+        "invalid_disassembly_rows": invalid_rows,
+        "mnemonics": dict(sorted(mnemonics.items())),
+        "forms": [
+            {"form": form, "count": count, "sample": samples[form]}
+            for form, count in sorted(counts.items())
+        ],
+    }
     (root / (name + ".static.json")).write_text(json.dumps(result, indent=2))
-    print(name, "rows", result["instruction_rows"], "mnemonics", len(mnemonics), "forms", len(counts))
+    print(
+        name, "rows", result["instruction_rows"], "mnemonics", len(mnemonics), "forms", len(counts)
+    )

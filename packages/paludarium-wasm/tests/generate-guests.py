@@ -1,4 +1,5 @@
 """Deterministic freestanding x86-64 Linux ELF fixtures; no assembler dependency."""
+
 import argparse
 import pathlib
 import struct
@@ -29,7 +30,9 @@ for name, operation in U3_OPS.items():
     store = "f30f7f8020000000"
     write_exit = "b801000000bf0100000048be2020400000000000ba100000000f05b83c00000031ff0f05"
     CODES[name] = load + control + operation + store + write_exit
-CODES["u3-cpuid"] = "b80100000031c90fa248bf20204000000000008907895f04894f0889570cb801000000bf0100000048be2020400000000000ba100000000f05b83c00000031ff0f05"
+CODES["u3-cpuid"] = (
+    "b80100000031c90fa248bf20204000000000008907895f04894f0889570cb801000000bf0100000048be2020400000000000ba100000000f05b83c00000031ff0f05"
+)
 
 
 def guest(name):
@@ -43,11 +46,15 @@ def guest(name):
             data[:32] = bytes((n * 17 + 3) & 255 for n in range(32))
     ident = b"\x7fELF\x02\x01\x01" + bytes(9)
     header = ident + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, 0x401000, 64, 0, 0, 64, 56, 2, 0, 0, 0)
-    code_segment = struct.pack("<IIQQQQQQ", 1, 5, 4096, 0x401000, 0x401000, len(code), len(code), 4096)
-    data_segment = struct.pack("<IIQQQQQQ", 1, 6, 8192, 0x402000, 0x402000, len(data), len(data), 4096)
+    code_segment = struct.pack(
+        "<IIQQQQQQ", 1, 5, 4096, 0x401000, 0x401000, len(code), len(code), 4096
+    )
+    data_segment = struct.pack(
+        "<IIQQQQQQ", 1, 6, 8192, 0x402000, 0x402000, len(data), len(data), 4096
+    )
     image = bytearray(8192 + len(data))
     image[:176] = header + code_segment + data_segment
-    image[4096:4096 + len(code)] = code
+    image[4096 : 4096 + len(code)] = code
     image[8192:] = data
     return bytes(image)
 
@@ -67,4 +74,8 @@ if __name__ == "__main__":
         else:
             path.write_bytes(image)
             path.chmod(0o755)
-    print(f"All {len(CODES)} deterministic ELF fixtures match" if args.check else f"Generated {len(CODES)} ELF fixtures")
+    print(
+        f"All {len(CODES)} deterministic ELF fixtures match"
+        if args.check
+        else f"Generated {len(CODES)} ELF fixtures"
+    )

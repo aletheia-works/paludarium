@@ -1,6 +1,9 @@
 # Local Claude Code settings; not committed.
 /.claude/
 
+# Python bytecode
+__pycache__/
+
 # Logs
 logs
 *.log

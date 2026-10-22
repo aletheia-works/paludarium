@@ -105,6 +105,9 @@ mod linux {
     macro_rules! cases {($($name:ident => ($mode:literal,$binary:literal)),* $(,)?) => {$(#[test] fn $name(){case(concat!("linux::",stringify!($name)),$mode,$binary);})*};}
     cases!(
         processes_fork => ("fork","process"),
+        processes_uname => ("uname","process"),
+        processes_affinity => ("affinity","process"),
+        processes_ids => ("ids","process"),
         processes_private => ("private","process"),
         processes_shared => ("shared","process"),
         processes_offset => ("offset","process"),

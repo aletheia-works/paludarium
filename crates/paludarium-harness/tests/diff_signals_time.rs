@@ -51,6 +51,8 @@ cases!(
     memory_unmap_holes_fault => 5,
     memory_break => 6,
     memory_unaligned_hint => 7,
+    memory_madvise_dontneed_free => 10,
+    memory_madvise_errors => 11,
 );
 
 macro_rules! time_cases { ($($name:ident => $case:literal),* $(,)?) => {$(

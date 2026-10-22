@@ -8,6 +8,9 @@
   },
   "cases": [
     {"name":"fork","binary":"process"},
+    {"name":"uname","binary":"process"},
+    {"name":"affinity","binary":"process"},
+    {"name":"ids","binary":"process"},
     {"name":"clone-vm","binary":"process"},
     {"name":"wait-interrupt","binary":"process"},
     {"name":"wait-restart","binary":"process"},

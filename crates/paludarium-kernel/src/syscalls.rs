@@ -40,6 +40,13 @@ pub mod nr {
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const EXIT_GROUP: u64 = 231;
+    pub const MADVISE: u64 = 28;
+    pub const UNAME: u64 = 63;
+    pub const GETUID: u64 = 102;
+    pub const GETGID: u64 = 104;
+    pub const GETEUID: u64 = 107;
+    pub const GETEGID: u64 = 108;
+    pub const SCHED_GETAFFINITY: u64 = 204;
 }
 
 pub(crate) struct Context<'a> {
@@ -71,7 +78,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 24] = [
+        let entries: [(u64, Handler); 31] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -96,6 +103,13 @@ impl SyscallTable {
             (nr::ARCH_PRCTL, sys_arch_prctl),
             (nr::SET_TID_ADDRESS, sys_set_tid_address),
             (nr::EXIT_GROUP, sys_exit_group),
+            (nr::MADVISE, sys_madvise),
+            (nr::UNAME, sys_uname),
+            (nr::GETUID, sys_root_id),
+            (nr::GETGID, sys_root_id),
+            (nr::GETEUID, sys_root_id),
+            (nr::GETEGID, sys_root_id),
+            (nr::SCHED_GETAFFINITY, sys_sched_getaffinity),
         ];
         let mut handlers: BTreeMap<u64, Handler> = entries.into_iter().collect();
         for number in crate::files::NUMBERS {
@@ -565,6 +579,64 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
 }
 
+const MADV_DONTNEED: u64 = 4;
+const MADV_FREE: u64 = 8;
+
+fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (addr, len, advice) = (a[0], a[1], a[2]);
+    // Of the advice values, only the access-pattern hints and the two that
+    // give memory back are implemented; the others are rejected rather than
+    // ignored, so that a guest relying on one of them notices.
+    if !matches!(advice, 0..=3 | MADV_DONTNEED | MADV_FREE) {
+        return err(Errno::EINVAL);
+    }
+    if addr & 4095 != 0 {
+        return err(Errno::EINVAL);
+    }
+    let Some(length) = len.checked_add(4095).map(|l| l & !4095) else {
+        return err(Errno::EINVAL);
+    };
+    if length == 0 {
+        return ok(0);
+    }
+    let Some(end) = addr.checked_add(length) else {
+        return err(Errno::EINVAL);
+    };
+    if end > USER_ADDRESS_LIMIT {
+        return err(Errno::ENOMEM);
+    }
+    if advice == MADV_DONTNEED {
+        return match c.mem.discard_shared(GuestAddr(addr), length) {
+            Ok(()) => ok(0),
+            Err(e) => err(e),
+        };
+    }
+    if advice == MADV_FREE {
+        // Linux frees such pages only under memory pressure, which the
+        // emulator never has, so their contents stay as they are.
+        return match c.mem.check_private_anonymous(GuestAddr(addr), length) {
+            Ok(()) => ok(0),
+            Err(e) => err(e),
+        };
+    }
+    let mapped = c
+        .mem
+        .mappings()
+        .filter(|m| m.start.0 < end && m.end() > addr);
+    let covered = mapped.fold(addr, |covered, m| {
+        if m.start.0 <= covered {
+            covered.max(m.end())
+        } else {
+            covered
+        }
+    });
+    if covered < end {
+        err(Errno::ENOMEM)
+    } else {
+        ok(0)
+    }
+}
+
 fn sys_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // PROT_SEM (0x8) has no effect on x86-64, but Linux accepts it.
     let Some(prot) = Prot::from_bits(a[2] & !8) else {
@@ -856,6 +928,58 @@ fn sys_arch_prctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             }
         }
         _ => err(Errno::EINVAL),
+    }
+}
+
+/// The guest runs as root, the owner `stat` reports for every file.
+fn sys_root_id(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
+    ok(0)
+}
+
+/// Linux's `struct utsname`: six NUL-terminated fields of 65 bytes. The host's
+/// name and kernel are not revealed, as with `CPUID`.
+fn sys_uname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    const FIELD: usize = 65;
+    let fields: [&[u8]; 6] = [
+        b"Linux",
+        b"paludarium",
+        b"6.12.0-paludarium",
+        b"#1 SMP PREEMPT_DYNAMIC",
+        b"x86_64",
+        b"(none)",
+    ];
+    let mut bytes = [0u8; FIELD * 6];
+    for (i, field) in fields.iter().enumerate() {
+        bytes[i * FIELD..i * FIELD + field.len()].copy_from_slice(field);
+    }
+    match c.mem.write(GuestAddr(a[0]), &bytes) {
+        Ok(()) => ok(0),
+        Err(_) => err(Errno::EFAULT),
+    }
+}
+
+/// Every guest thread may run on each of the host's CPUs, numbered from 0.
+fn sys_sched_getaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (pid, len) = (a[0] as u32 as i32, a[1] as u32);
+    let cpus = c.host.cpu_count().clamp(1, 8192);
+    if (len as usize) * 8 < cpus || len % 8 != 0 {
+        return err(Errno::EINVAL);
+    }
+    let known =
+        pid == 0 || u32::try_from(pid).is_ok_and(|p| p == c.process.pid || c.group.has_member(p));
+    if !known {
+        return err(Errno(3)); // ESRCH
+    }
+    // Linux copies its whole CPU mask, a whole number of 64-bit words.
+    let size = cpus.div_ceil(64) * 8;
+    let mut mask = vec![0u8; size];
+    for cpu in 0..cpus {
+        mask[cpu / 8] |= 1 << (cpu % 8);
+    }
+    let copied = size.min(len as usize);
+    match c.mem.write(GuestAddr(a[2]), &mask[..copied]) {
+        Ok(()) => ok(copied as u64),
+        Err(_) => err(Errno::EFAULT),
     }
 }
 

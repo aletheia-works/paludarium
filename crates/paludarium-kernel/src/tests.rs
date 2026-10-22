@@ -161,6 +161,84 @@ fn unknown_syscalls_are_enosys_and_network_is_rejected() {
 }
 
 #[test]
+fn madvise_drops_private_pages_and_checks_its_arguments() {
+    let mut f = fixture();
+    f.mem.write_u64(GuestAddr(DATA), 5).unwrap();
+    f.mem.write_u64(GuestAddr(DATA + 0x1000), 6).unwrap();
+    assert_eq!(f.ret(nr::MADVISE, &[DATA, 1, 4]), 0); // MADV_DONTNEED
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 0x1000)).unwrap(), 6);
+    assert_eq!(f.ret(nr::MADVISE, &[DATA, 0x2000, 8]), 0); // MADV_FREE
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 0x1000)).unwrap(), 6);
+    f.mem.write_u64(GuestAddr(DATA), 7).unwrap();
+    assert_eq!(f.ret(nr::MADVISE, &[DATA, 0x2000, 2]), 0); // MADV_SEQUENTIAL
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 7);
+    assert_eq!(f.ret(nr::MADVISE, &[DATA, 0, 4]), 0);
+    assert_eq!(
+        f.ret(nr::MADVISE, &[DATA, 0x2000, 99]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(nr::MADVISE, &[DATA + 1, 1, 4]), errno(Errno::EINVAL));
+    assert_eq!(
+        f.ret(nr::MADVISE, &[DATA, u64::MAX, 4]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(nr::MADVISE, &[DATA, 0x3000, 0]), errno(Errno::ENOMEM));
+    assert_eq!(f.ret(nr::MADVISE, &[DATA, 0x3000, 4]), errno(Errno::ENOMEM));
+    assert_eq!(f.ret(nr::MADVISE, &[DATA, 0x3000, 8]), errno(Errno::ENOMEM));
+    f.mem.mark_shared(GuestAddr(DATA), 0x2000).unwrap();
+    assert_eq!(f.ret(nr::MADVISE, &[DATA, 0x2000, 8]), errno(Errno::EINVAL));
+}
+
+#[test]
+fn uname_names_linux_x86_64_and_ids_are_root() {
+    let mut f = fixture();
+    assert_eq!(f.ret(nr::UNAME, &[DATA]), 0);
+    let mut fields = [0u8; 390];
+    f.mem.read(GuestAddr(DATA), &mut fields).unwrap();
+    let field = |i: usize| {
+        let bytes = &fields[i * 65..(i + 1) * 65];
+        bytes[..bytes.iter().position(|&b| b == 0).unwrap()].to_vec()
+    };
+    assert_eq!(field(0), b"Linux");
+    assert_eq!(field(4), b"x86_64");
+    assert_eq!(field(5), b"(none)");
+    assert_eq!(f.ret(nr::UNAME, &[0]), errno(Errno::EFAULT));
+    for number in [nr::GETUID, nr::GETGID, nr::GETEUID, nr::GETEGID] {
+        assert_eq!(f.ret(number, &[]), 0);
+    }
+}
+
+#[test]
+fn sched_getaffinity_reports_every_host_cpu() {
+    let mut f = fixture();
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let size = cpus.div_ceil(64) as u64 * 8;
+    assert_eq!(f.ret(nr::SCHED_GETAFFINITY, &[0, 128, DATA]), size);
+    let mut mask = vec![0u8; size as usize];
+    f.mem.read(GuestAddr(DATA), &mut mask).unwrap();
+    let ones: u32 = mask.iter().map(|b| b.count_ones()).sum();
+    assert_eq!(ones as usize, cpus);
+    assert_eq!(f.ret(nr::SCHED_GETAFFINITY, &[1, 8, DATA]), 8.min(size));
+    assert_eq!(
+        f.ret(nr::SCHED_GETAFFINITY, &[0, 12, DATA]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(nr::SCHED_GETAFFINITY, &[0, 0, DATA]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(nr::SCHED_GETAFFINITY, &[99, 8, DATA]),
+        errno(Errno(3))
+    );
+    assert_eq!(
+        f.ret(nr::SCHED_GETAFFINITY, &[0, 8, 0]),
+        errno(Errno::EFAULT)
+    );
+}
+
+#[test]
 fn exit_and_exit_group_keep_low_eight_bits() {
     let mut f = fixture();
     assert_eq!(

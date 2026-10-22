@@ -764,6 +764,62 @@ impl AddressSpaceData {
         }
     }
 
+    /// Drops the contents of the private pages in `[addr, addr+len)`, so they
+    /// read as zeros again (`MADV_DONTNEED`). Shared pages keep theirs, as
+    /// their memory outlives the mapping, and so do ELF segments, which
+    /// Linux would refill from the file. Applies the mapped parts and
+    /// returns `ENOMEM` when the range has a hole, as Linux does.
+    pub fn discard(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
+        let end = checked_range(addr, len)?;
+        let mut covered = addr.0;
+        let mut hole = false;
+        let mut private = Vec::new();
+        for (_, m) in self.mappings.range(..end) {
+            if m.end() <= addr.0 {
+                continue;
+            }
+            hole |= m.start.0 > covered;
+            covered = m.end();
+            let start = m.start.0.max(addr.0);
+            if m.kind != MappingKind::ElfSegment && self.shared_at(start).is_none() {
+                private.push((start, m.end().min(end)));
+            }
+        }
+        hole |= covered < end;
+        if !private.is_empty() {
+            self.bump_code_generation();
+        }
+        for (start, end) in private {
+            self.for_populated(start, end, |entry| *entry = None);
+        }
+        if hole { Err(Errno::ENOMEM) } else { Ok(()) }
+    }
+
+    /// Whether `[addr, addr+len)` is all private anonymous memory, as
+    /// `MADV_FREE` requires: `EINVAL` for a shared page or an ELF segment
+    /// (file-backed on Linux), else `ENOMEM` for a hole.
+    pub fn check_private_anonymous(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
+        let end = checked_range(addr, len)?;
+        let mut covered = addr.0;
+        let mut hole = false;
+        for (_, m) in self.mappings.range(..end) {
+            if m.end() <= addr.0 {
+                continue;
+            }
+            hole |= m.start.0 > covered;
+            covered = m.end();
+            if m.kind == MappingKind::ElfSegment || self.shared_at(m.start.0.max(addr.0)).is_some()
+            {
+                return Err(Errno::EINVAL);
+            }
+        }
+        if hole || covered < end {
+            Err(Errno::ENOMEM)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Sets the initial program break (end of the last loaded segment,
     /// page-aligned). Called once by the loader.
     pub fn set_initial_break(&mut self, addr: GuestAddr) {
@@ -1083,6 +1139,14 @@ impl AddressSpace {
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.protect_shared(addr, len, prot)
     }
+    /// See [`AddressSpaceData::discard`].
+    pub fn discard_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
+        self.locked().discard(addr, len)
+    }
+    /// See [`AddressSpaceData::check_private_anonymous`].
+    pub fn check_private_anonymous(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
+        self.locked().check_private_anonymous(addr, len)
+    }
     pub fn protect_shared(&self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.locked().protect(addr, len, prot)
     }
@@ -1356,6 +1420,47 @@ mod tests {
             .unwrap();
         assert_eq!(space.set_break(GuestAddr(0x80000)), GuestAddr(0x62000));
         assert_eq!(space.current_break(), GuestAddr(0x62000));
+    }
+
+    #[test]
+    fn discard_zeroes_private_pages_and_keeps_shared_and_elf_ones() {
+        let space = space_with(0x10000, 2 * PAGE_SIZE, Prot::READ);
+        space.write_initial(GuestAddr(0x10008), &[7]).unwrap();
+        space.write_initial(GuestAddr(0x11008), &[8]).unwrap();
+        space.discard_shared(GuestAddr(0x10000), PAGE_SIZE).unwrap();
+        assert_eq!(space.read_u64(GuestAddr(0x10008)).unwrap(), 0);
+        assert_eq!(space.read_u64(GuestAddr(0x11008)).unwrap(), 8);
+        // The mapping and its protection stay.
+        assert!(space.write_u64(GuestAddr(0x10008), 1).is_err());
+
+        let shared = space
+            .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        space.mark_shared(shared, PAGE_SIZE).unwrap();
+        space.write_u64(shared, 9).unwrap();
+        let elf = space
+            .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::ElfSegment)
+            .unwrap();
+        space.write_u64(elf, 10).unwrap();
+        space.discard_shared(shared, PAGE_SIZE).unwrap();
+        space.discard_shared(elf, PAGE_SIZE).unwrap();
+        assert_eq!(space.read_u64(shared).unwrap(), 9);
+        assert_eq!(space.read_u64(elf).unwrap(), 10);
+    }
+
+    #[test]
+    fn discard_applies_the_mapped_part_of_a_range_with_a_hole() {
+        let space = space_with(0x10000, PAGE_SIZE, Prot::READ_WRITE);
+        space.write_u64(GuestAddr(0x10000), 1).unwrap();
+        assert_eq!(
+            space.discard_shared(GuestAddr(0x10000), 2 * PAGE_SIZE),
+            Err(Errno::ENOMEM)
+        );
+        assert_eq!(space.read_u64(GuestAddr(0x10000)).unwrap(), 0);
+        assert_eq!(
+            space.discard_shared(GuestAddr(0xf000), 2 * PAGE_SIZE),
+            Err(Errno::ENOMEM)
+        );
     }
 }
 

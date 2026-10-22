@@ -9,6 +9,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `REP` の文字列命令（途中で止まったときの再開を含む）、`CMPXCHG8B`／`CMPXCHG16B`、
   BMI 系（`ADCX`／`ADOX`、`ANDN`、`BZHI`、`MULX`、`PEXT`、`RORX`、`SHLX`／`SHRX`）、
   `MOVBE`、`ENTER`／`LEAVE` など。
+- **ヒントの命令**：`PAUSE` と、プリフェッチの `PREFETCHNTA`／`PREFETCHT0`／`T1`／`T2`。
+  状態を何も変えず、フォールトも起こしません。
 - **SSE 系**：実際のプログラム（probe と aube）が使う SSE 系の 129 の命令と、
   AES・PCLMUL・SHA などの暗号の命令。浮動小数点はソフトウェアで計算します。
 - 命令のデコードには [iced-x86](https://github.com/icedland/iced) を使っています。
@@ -25,8 +27,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | 主なシステムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex` |
-| メモリ | `mmap`（anonymous）、`munmap`、`mprotect`、`brk`、`arch_prctl` |
+| プロセスとスレッド | `clone`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity` |
+| メモリ | `mmap`（anonymous）、`munmap`、`mprotect`、`madvise`、`brk`、`arch_prctl` |
+| システムの情報 | `uname`、`getuid`、`geteuid`、`getgid`、`getegid` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer` |
 | 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep` |
 | ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd` |
@@ -39,6 +42,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
 - `socket()` はいつも `EAFNOSUPPORT` を返します。ネットワークは使えません。
+- `madvise`：`MADV_DONTNEED` を受けたプライベートなページは空になり、0 として読めます。
+  `MADV_FREE` では中身を残します。メモリが足りているときの Linux と同じです。
+  アクセスの仕方のヒントは受け付け、ほかの指定には `EINVAL` を返します。
+- `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
+  そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
+- `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、
+  ホストのことは見せません。ゲストは root（ユーザーとグループが 0）として動きます。
+  `stat` がどのファイルについても返す持ち主と同じです。
 - 不正なポインタを渡されたときは `EFAULT` を返します。
 
 ## スレッドとプロセス

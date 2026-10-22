@@ -162,6 +162,12 @@ impl ThreadGroup {
                 .subscribe(&wake);
         }
     }
+    pub(crate) fn has_member(&self, tid: u32) -> bool {
+        self.members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&tid)
+    }
     pub fn status(&self) -> Option<ExitStatus> {
         *self.status.lock().unwrap_or_else(PoisonError::into_inner)
     }

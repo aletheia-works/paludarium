@@ -8,6 +8,20 @@ fn runner_bootstrap_decodes_existing_pxor() {
     assert!(matches!(instruction, Ok(i) if i.mnemonic == Mnemonic::Pxor));
 }
 #[test]
+fn prefetch_hints_decode_as_nop() {
+    // prefetchnta [r11], prefetcht0 [r11+0x40], prefetcht1 [rax], prefetcht2 [rax]
+    for bytes in [
+        &[0x41, 0x0f, 0x18, 0x03][..],
+        &[0x41, 0x0f, 0x18, 0x4b, 0x40],
+        &[0x0f, 0x18, 0x10],
+        &[0x0f, 0x18, 0x18],
+    ] {
+        let instruction = decode(bytes, GuestAddr(0x400000)).unwrap();
+        assert_eq!(instruction.mnemonic, Mnemonic::Nop);
+        assert_eq!(usize::from(instruction.len), bytes.len());
+    }
+}
+#[test]
 fn scalar_movsd_is_distinct_from_string_movsd() {
     use crate::{Mnemonic, decode};
     use paludarium_types::GuestAddr;

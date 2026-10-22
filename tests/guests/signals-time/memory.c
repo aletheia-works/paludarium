@@ -31,6 +31,19 @@ void test_main(void){
  sc(9,at,4096,3,0x32,-1,0);sc(9,at+8192,4096,3,0x32,-1,0);emit(sc(10,at,12288,0,0,0,0),0,0);long value=*(volatile char*)at;emit(value,0,0);
 #elif CASE == 9
  sc(9,at,4096,3,0x32,-1,0);*(volatile char*)at=41;emit(sc(9,at,4096,3,0x32,-1,1),*(volatile char*)at,0);
+#elif CASE == 10
+ /* MADV_DONTNEED zeroes private anonymous pages; shared ones keep their contents. */
+ sc(9,at,8192,3,0x32,-1,0);*(volatile char*)at=41;*(volatile char*)(at+4096)=42;
+ r=sc(28,at,1,4,0,0,0);emit(r,*(volatile char*)at,*(volatile char*)(at+4096));
+ p=sc(9,at+65536,4096,3,0x31,-1,0);*(volatile char*)p=43;
+ r=sc(28,p,4096,4,0,0,0);emit(r,*(volatile char*)p,sc(28,p,4096,8,0,0,0));
+ emit(sc(28,at,8192,8,0,0,0),sc(28,at,8192,2,0,0,0),sc(28,at,0,4,0,0,0));
+#elif CASE == 11
+ /* Invalid advice, alignment and length, and a hole in the range. */
+ sc(9,at,4096,3,0x32,-1,0);*(volatile char*)at=41;
+ emit(sc(28,at,4096,99,0,0,0),sc(28,at+1,4096,4,0,0,0),sc(28,at,~(u64)0,4,0,0,0));
+ p=sc(28,at,12288,0,0,0,0);r=sc(28,at,12288,4,0,0,0);emit(p,r,*(volatile char*)at);
+ emit(sc(28,at,12288,8,0,0,0),sc(28,at+4096,4096,0,0,0,0),0);
 #elif CASE == 7
  p=sc(9,at+123,4096,3,0x22,-1,0);emit(p==(long)at,p>=0,p>=0?sc(11,p,4096,0,0,0,0):p);
 #endif

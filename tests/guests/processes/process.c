@@ -9,6 +9,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -95,6 +97,57 @@ int main(int argc, char **argv) {
         result("errno", errno);
         result("old-state", 1);
         if (!strcmp(mode, "bad-elf")) unlink(path);
+        return 0;
+    }
+    if (!strcmp(mode, "uname")) {
+        struct utsname names;
+        result("uname", uname(&names));
+        result("sysname", !strcmp(names.sysname, "Linux"));
+        result("machine", !strcmp(names.machine, "x86_64"));
+        result("nodename", names.nodename[0] != 0);
+        result("release", names.release[0] >= '0' && names.release[0] <= '9');
+        errno = 0;
+        result("fault", syscall(SYS_uname, (void *)1));
+        result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "affinity")) {
+        unsigned long mask[16] = {0};
+        long size = syscall(SYS_sched_getaffinity, 0, 8, mask);
+        result("size", size);
+        /* The same machine runs both sides, so the CPU counts agree. */
+        result("cpus", __builtin_popcountl(mask[0]));
+        result("online", sysconf(_SC_NPROCESSORS_ONLN) == __builtin_popcountl(mask[0]));
+        result("pid", syscall(SYS_sched_getaffinity, getpid(), 8, mask));
+        result("tid", syscall(SYS_sched_getaffinity, syscall(SYS_gettid), 8, mask));
+        long lengths[] = {12, 0, 4};
+        for (int i = 0; i < 3; i++) {
+            errno = 0;
+            result("length", syscall(SYS_sched_getaffinity, 0, lengths[i], mask));
+            result("errno", errno);
+        }
+        errno = 0;
+        result("missing", syscall(SYS_sched_getaffinity, 0x3fffffff, 8, mask));
+        result("errno", errno);
+        errno = 0;
+        result("fault", syscall(SYS_sched_getaffinity, 0, 8, (void *)1));
+        result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "ids")) {
+        /* Native IDs are the runner's and emulated ones root, so compare
+           each with the owner of a newly created file. */
+        const char *path = "/tmp/paludarium-processes-ids";
+        unlink(path);
+        int fd = open(path, O_CREAT|O_RDWR, 0600);
+        struct stat st;
+        result("stat", fstat(fd, &st));
+        result("uid", getuid() == st.st_uid);
+        result("euid", geteuid() == getuid());
+        result("gid", getgid() == st.st_gid);
+        result("egid", getegid() == getgid());
+        close(fd);
+        unlink(path);
         return 0;
     }
     if (!strcmp(mode, "no-child")) {

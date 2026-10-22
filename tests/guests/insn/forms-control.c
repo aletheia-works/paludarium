@@ -13,6 +13,11 @@ static const u64 counts[]={0,1,2,15,16,17,31,32,63,64,65};
  __asm__ volatile("pushq %[fi]; popfq; " OP "; pushfq; popq %[f]" \
  :"+a"(a),"+d"(d),[f] "=&r"(f):[fi] "r"(fi):"cc"); \
  report(OP,vectors[i],0,fi,a,f,F_ARITH);report_value("rdx",d); }while(0)
+/* Prefetches are hints: no fault, not even for an unmapped address. */
+#define PREFETCH(OP,ADDR) do {u64 a=vectors[i],f,fi=F_ARITH|2;const void *p=(const void*)(ADDR); \
+ __asm__ volatile("pushq %[fi]; popfq; " OP " (%[p]); pushfq; popq %[f]" \
+ :"+a"(a),[f] "=&r"(f):[p] "r"(p),[fi] "r"(fi):"cc","memory"); \
+ report(OP,(u64)(ADDR),0,fi,a,f,F_ARITH); }while(0)
 #define LOCK_BINARY(OP,SUF,REG,MASK) do {u64 a=vectors[i],b=vectors[NVEC-1-i],f,fi=F_ARITH|2; \
  __asm__ volatile("pushq %[fi]; popfq; lock " OP SUF " " REG "[b],%[a]; pushfq; popq %[f]" \
  :[a] "+m"(a),[f] "=&r"(f):[b] "r"(b),[fi] "r"(fi):"cc","memory"); \
@@ -31,6 +36,8 @@ int test_main(void){
   DOUBLE("shld","l",32,"%k");DOUBLE("shrd","l",32,"%k");
   DOUBLE("shld","q",64,"%");DOUBLE("shrd","q",64,"%");
   FLAGS("cbtw");FLAGS("cwtl");FLAGS("cwtd");FLAGS("clc");FLAGS("stc");FLAGS("cmc");FLAGS("lahf");FLAGS("sahf");FLAGS("pause");
+  PREFETCH("prefetchnta",&vectors[i]);PREFETCH("prefetcht0",&vectors[i]);
+  PREFETCH("prefetcht1",0);PREFETCH("prefetcht2",0xdead0000UL);
   LOCK_BINARY("add","b","%b",F_ARITH);LOCK_BINARY("adc","w","%w",F_ARITH);
   LOCK_BINARY("sub","l","%k",F_ARITH);LOCK_BINARY("sbb","q","%",F_ARITH);
   LOCK_BINARY("and","q","%",F_LOGIC);LOCK_BINARY("or","q","%",F_LOGIC);LOCK_BINARY("xor","q","%",F_LOGIC);

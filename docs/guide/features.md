@@ -11,6 +11,8 @@ Linux.
   restart after an interruption), `CMPXCHG8B`/`CMPXCHG16B`, BMI
   (`ADCX`/`ADOX`, `ANDN`, `BZHI`, `MULX`, `PEXT`, `RORX`, `SHLX`/`SHRX`),
   `MOVBE`, `ENTER`/`LEAVE` and more.
+- **Hints**: `PAUSE` and the `PREFETCHNTA`/`PREFETCHT0`/`T1`/`T2` prefetches,
+  which change nothing and never fault.
 - **SSE**: the 129 SSE-family instructions real programs (probe and aube) use,
   and cryptographic instructions such as AES, PCLMUL and SHA. Floating point is
   computed in software.
@@ -29,8 +31,9 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 
 | Group | Main system calls |
 |---|---|
-| Processes and threads | `clone`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex` |
-| Memory | `mmap` (anonymous), `munmap`, `mprotect`, `brk`, `arch_prctl` |
+| Processes and threads | `clone`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity` |
+| Memory | `mmap` (anonymous), `munmap`, `mprotect`, `madvise`, `brk`, `arch_prctl` |
+| System information | `uname`, `getuid`, `geteuid`, `getgid`, `getegid` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer` |
 | Time | `clock_gettime`, `nanosleep`, `clock_nanosleep` |
 | Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd` |
@@ -44,6 +47,14 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
 - `socket()` always returns `EAFNOSUPPORT`: there is no network.
+- `madvise`: `MADV_DONTNEED` empties private pages, which then read as zeros;
+  `MADV_FREE` keeps their contents, as Linux does without memory pressure.
+  The access-pattern hints are accepted and other advice gives `EINVAL`.
+- `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
+  so the guest sees as many CPUs as the host has (one in WebAssembly).
+- `uname` reports Linux on x86_64 with the host name `paludarium`; like
+  `CPUID`, it does not reveal the host. The guest runs as root (user and group
+  0), the owner `stat` reports for every file.
 - Invalid pointers return `EFAULT`.
 
 ## Threads and processes

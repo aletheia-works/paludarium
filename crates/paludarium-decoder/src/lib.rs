@@ -354,7 +354,12 @@ fn map_mnemonic(insn: &iced::Instruction) -> Option<Mnemonic> {
     if insn.code() == iced::Code::Cmpsd_xmm_xmmm64_imm8 {
         return Some(Mnemonic::CmpsdSse);
     }
-    if m == M::Pause {
+    // Spin-loop and cache hints change no architectural state, and a
+    // prefetch never faults, not even for an unmapped address.
+    if matches!(
+        m,
+        M::Pause | M::Prefetchnta | M::Prefetcht0 | M::Prefetcht1 | M::Prefetcht2
+    ) {
         return Some(Mnemonic::Nop);
     }
     let conditional = match m {

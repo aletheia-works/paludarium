@@ -186,6 +186,11 @@ pub trait Host: Send + Sync {
     fn clock(&self, _clock: ClockId) -> Result<u64, Errno> {
         Err(Errno::ENOSYS)
     }
+    /// How many CPUs the guest may run on: the host's available parallelism,
+    /// or 1 where it is unknown (WebAssembly).
+    fn cpu_count(&self) -> usize {
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+    }
     /// Waits until a deadline while polling cancellation outside guest memory locks.
     fn wait_until(
         &self,

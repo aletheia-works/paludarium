@@ -94,3 +94,10 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 
 All of them give the same results as a real x86-64 Linux on Linux, macOS and
 Windows, and on Node.js, Chromium, Firefox and Safari.
+
+- **ripgrep**: a text search tool written in Rust (15.2.0), which runs its
+  searches on several threads. Eight searches, including a regular expression
+  replacement, a parallel search and two errors, give the same output and exit
+  status as on real Linux. This is checked on x86-64 Linux only so far.
+  `--version` is not compared, because it reports the SIMD features `CPUID`
+  shows, which paludarium limits on purpose.

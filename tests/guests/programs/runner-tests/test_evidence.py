@@ -68,12 +68,12 @@ class BuildEvidence(unittest.TestCase):
     def test_rejects_tampered_binary_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            for name in ("probe", "aube"):
+            for name in ("probe", "aube", "ripgrep"):
                 (root / name).write_bytes(elf())
             receipt = {
                 "exit": 0,
                 "source_unchanged": True,
-                "binaries": {n: {"sha256": digest(root / n)} for n in ("probe", "aube")},
+                "binaries": {n: {"sha256": digest(root / n)} for n in ("probe", "aube", "ripgrep")},
             }
             (root / "aube").write_bytes(b"tampered")
             with self.assertRaisesRegex(ValueError, "hash differs"):

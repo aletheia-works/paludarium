@@ -15,6 +15,18 @@ from runner import run
 HERE = pathlib.Path(__file__).resolve().parent
 
 
+def observe_ripgrep(guests, app, env):
+    """ripgrep's rows, kept apart from the probe and aube rows other hosts check."""
+    cases = json.loads((HERE / "ripgrep-cases.json").read_text())["cases"]
+    rows = {}
+    for case in cases:
+        row = run([str(guests / "ripgrep"), *case["args"]], cwd=app, env=env)
+        if row["timed_out"]:
+            raise ValueError("native ripgrep timed out: " + case["name"])
+        rows[case["name"]] = row
+    return {"binary_sha256": digest(guests / "ripgrep"), "rows": rows}
+
+
 def observe(guests, output, config, *, extra_snapshot=None, prepare_fixture=None):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise RuntimeError("native oracle requires x86-64 Linux")
@@ -55,6 +67,8 @@ def observe(guests, output, config, *, extra_snapshot=None, prepare_fixture=None
             observations["fixture_preparation"] = prepare_fixture(root / "fixture")
         app = root / "fixture/app"
         observations["fixture_input_modes"] = fixture_inputs(root / "fixture")
+        observations["ripgrep"] = observe_ripgrep(guests, app, env)
+        (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
         for case in config["aube"]:
             if case.get("before") == "remove-node-modules":
                 shutil.rmtree(app / "node_modules")

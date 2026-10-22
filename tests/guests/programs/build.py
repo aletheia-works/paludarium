@@ -59,6 +59,20 @@ def retain_licenses(metadata, exceptions, directory):
     return retained
 
 
+def fetch(source, name, repository, revision, directory):
+    """Extract `repository` at `revision` to source/name, unless it is there."""
+    upstream = source / name
+    if not upstream.exists():
+        archive = directory / f"{name}-source.tar.gz"
+        urllib.request.urlretrieve(
+            f"https://codeload.github.com/{repository}/tar.gz/{revision}", archive
+        )
+        with tarfile.open(archive) as tar:
+            tar.extractall(source, filter="data")
+        (source / f"{repository.split('/')[1]}-{revision}").rename(upstream)
+    return upstream
+
+
 def build(directory):
     directory.mkdir(parents=True, exist_ok=True)
     lock = json.loads((HERE / "source-lock.json").read_text())
@@ -68,6 +82,7 @@ def build(directory):
         "toolchain": lock["toolchain"],
         "target": lock["target"],
         "aube": lock["aube"],
+        "ripgrep": lock["ripgrep"],
         "binaries": {},
         "audits": {},
     }
@@ -75,6 +90,7 @@ def build(directory):
     source = directory / "source"
     source.mkdir(exist_ok=True)
     upstream = source / "aube"
+    ripgrep = source / "ripgrep"
     try:
         # cargo-deny 0.20.2 graph/config arguments are top-level options,
         # before `check`. Validate parsing before downloading/building guests.
@@ -93,18 +109,14 @@ def build(directory):
             ROOT,
             directory / "cli-dependencies.log",
         )
-        if not upstream.exists():
-            archive = directory / "aube-source.tar.gz"
-            revision = lock["aube"]["revision"]
-            urllib.request.urlretrieve(
-                f"https://codeload.github.com/aubepkg/aube/tar.gz/{revision}", archive
-            )
-            with tarfile.open(archive) as tar:
-                tar.extractall(source, filter="data")
-            (source / f"aube-{revision}").rename(upstream)
+        fetch(source, "aube", "aubepkg/aube", lock["aube"]["revision"], directory)
         if digest(upstream / "Cargo.lock") != lock["aube"]["lock_sha256"]:
             raise ValueError("fixed aube Cargo.lock mismatch")
+        fetch(source, "ripgrep", "BurntSushi/ripgrep", lock["ripgrep"]["revision"], directory)
+        if digest(ripgrep / "Cargo.lock") != lock["ripgrep"]["lock_sha256"]:
+            raise ValueError("fixed ripgrep Cargo.lock mismatch")
         receipt["source_before"] = snapshot(upstream)
+        receipt["ripgrep_source_before"] = snapshot(ripgrep)
         root_policy = (ROOT / "deny.toml").read_bytes()
         guest_config = directory / "aube-deny.toml"
         guest_config.write_bytes(guest_policy(root_policy, lock["guest_license_exceptions"]))
@@ -140,11 +152,13 @@ def build(directory):
             ["rustc", "+" + lock["toolchain"], "--version"], text=True
         ).strip()
         receipt["cargo"] = subprocess.check_output([*cargo, "--version"], text=True).strip()
-        # Audit both guests before any cross-compilation can fail on the host
-        # linker; every advisory category remains mandatory.
+        # Audit every guest before any cross-compilation can fail on the host
+        # linker; every advisory category remains mandatory. ripgrep needs no
+        # license exception, so it is held to the root policy itself.
         for name, manifest, config in [
             ("probe", HERE / "probe/Cargo.toml", ROOT / "deny.toml"),
             ("aube", upstream / "Cargo.toml", guest_config),
+            ("ripgrep", ripgrep / "Cargo.toml", ROOT / "deny.toml"),
         ]:
             command(
                 [
@@ -161,9 +175,10 @@ def build(directory):
                 directory / f"{name}-dependencies.log",
             )
             receipt["audits"][name] = 0
-        for name, manifest, extra in [
-            ("probe", HERE / "probe/Cargo.toml", []),
-            ("aube", upstream / "Cargo.toml", ["-p", "aube", "--bin", "aube"]),
+        for name, manifest, extra, binary_name in [
+            ("probe", HERE / "probe/Cargo.toml", [], "paludarium-probe"),
+            ("aube", upstream / "Cargo.toml", ["-p", "aube", "--bin", "aube"], "aube"),
+            ("ripgrep", ripgrep / "Cargo.toml", ["-p", "ripgrep", "--bin", "rg"], "rg"),
         ]:
             args = [
                 *cargo,
@@ -180,7 +195,6 @@ def build(directory):
             ]
             env = dict(os.environ, AUBE_PRIMER_PATH=str(primer))
             command(args, ROOT, directory / f"{name}-build.log", env)
-            binary_name = "paludarium-probe" if name == "probe" else "aube"
             shutil.copy2(
                 directory / "targets" / name / lock["target"] / "release" / binary_name,
                 directory / name,
@@ -200,6 +214,7 @@ def build(directory):
     finally:
         try:
             record_source_after(upstream, receipt)
+            record_source_after(ripgrep, receipt, "ripgrep_source")
         except Exception as error:
             receipt["exit"] = 1
             receipt["source_unchanged"] = False

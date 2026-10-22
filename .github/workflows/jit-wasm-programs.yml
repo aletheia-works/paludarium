@@ -42,6 +42,7 @@ jobs:
           path: |
             target/guests/programs/probe
             target/guests/programs/aube
+            target/guests/programs/ripgrep
             target/guests/programs/build-receipt.json
             target/guests/programs/*-build.log
             target/guests/programs/*-dependencies.log

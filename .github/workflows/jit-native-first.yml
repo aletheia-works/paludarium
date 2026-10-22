@@ -91,6 +91,7 @@ jobs:
             target/guests/programs/licenses/
             target/guests/programs/probe
             target/guests/programs/aube
+            target/guests/programs/ripgrep
           retention-days: 14
 
   instruction-native:

@@ -5,6 +5,8 @@ import pathlib
 import struct
 
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+# The guest binaries every build produces.
+GUESTS = ("probe", "aube", "ripgrep")
 # Guest-only license exceptions for the fixed aube source. Each crate's full
 # license text is retained from its crates.io package: (file, required text).
 LICENSE_EXCEPTIONS = [
@@ -51,7 +53,7 @@ def policy_receipt_valid(directory, receipt, root_bytes):
             raise ValueError("license text hash differs")
         if retained["source"] != REGISTRY:
             raise ValueError("license exception crate is not from crates.io")
-    if receipt["audits"] != {"probe": 0, "aube": 0}:
+    if receipt["audits"] != {"probe": 0, "aube": 0, "ripgrep": 0}:
         raise ValueError("full guest dependency audits did not pass")
 
 
@@ -106,7 +108,7 @@ def static_elf(data):
 def validate(directory, receipt):
     if receipt["exit"] != 0 or not receipt["source_unchanged"]:
         raise ValueError("build failure or modified upstream source")
-    for name in ("probe", "aube"):
+    for name in GUESTS:
         binary = directory / name
         if digest(binary) != receipt["binaries"][name]["sha256"]:
             raise ValueError("binary hash differs")
@@ -115,12 +117,13 @@ def validate(directory, receipt):
     policy_receipt_valid(directory, receipt, root_bytes)
 
 
-def record_source_after(upstream, receipt):
-    if "source_before" not in receipt:
+def record_source_after(upstream, receipt, key="source"):
+    if f"{key}_before" not in receipt:
         return
-    receipt["source_after"] = snapshot(upstream)
-    receipt["source_unchanged"] = receipt["source_after"] == receipt["source_before"]
-    if not receipt["source_unchanged"]:
+    receipt[f"{key}_after"] = snapshot(upstream)
+    unchanged = receipt[f"{key}_after"] == receipt[f"{key}_before"]
+    receipt["source_unchanged"] = receipt.get("source_unchanged", True) and unchanged
+    if not unchanged:
         receipt["exit"] = 1
         receipt["source_error"] = "upstream source changed during build or audit"
 

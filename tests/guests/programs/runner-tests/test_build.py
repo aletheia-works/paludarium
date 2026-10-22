@@ -46,9 +46,16 @@ class BuildIntegration(unittest.TestCase):
         self.upstream.mkdir(parents=True)
         (self.upstream / "Cargo.lock").write_text("version = 4\n")
         (self.upstream / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="1.0.0"\n')
+        self.ripgrep = self.directory / "source/ripgrep"
+        self.ripgrep.mkdir(parents=True)
+        (self.ripgrep / "Cargo.lock").write_text("version = 4 # ripgrep\n")
+        (self.ripgrep / "Cargo.toml").write_text('[package]\nname="ripgrep"\nversion="1.0.0"\n')
         self.lock = evidence.json_source_lock()
         self.lock["aube"] = dict(
             self.lock["aube"], lock_sha256=evidence.digest(self.upstream / "Cargo.lock")
+        )
+        self.lock["ripgrep"] = dict(
+            self.lock["ripgrep"], lock_sha256=evidence.digest(self.ripgrep / "Cargo.lock")
         )
         self.metadata = {"packages": []}
         for exception in self.lock["guest_license_exceptions"]:
@@ -77,14 +84,11 @@ class BuildIntegration(unittest.TestCase):
             if failure and failure in str(log):
                 raise subprocess.CalledProcessError(1, args)
             if "build" in args:
-                name = "aube" if "aube" in args else "probe"
+                outputs = {"aube": "aube", "ripgrep": "rg"}
+                name = next((n for n in outputs if n in args), "probe")
+                output = outputs.get(name, "paludarium-probe")
                 binary = (
-                    self.directory
-                    / "targets"
-                    / name
-                    / self.lock["target"]
-                    / "release"
-                    / ("aube" if name == "aube" else "paludarium-probe")
+                    self.directory / "targets" / name / self.lock["target"] / "release" / output
                 )
                 binary.parent.mkdir(parents=True)
                 binary.write_bytes(elf())
@@ -131,9 +135,14 @@ class BuildIntegration(unittest.TestCase):
         aube_commands = [args for args in commands if str(self.upstream / "Cargo.toml") in args]
         self.assertEqual(len(aube_commands), 2)
         self.assertTrue(all("--locked" in args for args in aube_commands))
-        # Both audits run before any guest is compiled.
+        ripgrep_commands = [args for args in commands if str(self.ripgrep / "Cargo.toml") in args]
+        self.assertEqual(len(ripgrep_commands), 2)
+        self.assertIn(str(HERE.parents[2] / "deny.toml"), ripgrep_commands[0])
+        self.assertEqual(receipt["audits"], {"probe": 0, "aube": 0, "ripgrep": 0})
+        self.assertEqual(receipt["ripgrep_source_before"], evidence.snapshot(self.ripgrep))
+        # Every audit runs before any guest is compiled.
         kinds = ["deny" if "deny" in args else "build" for args in commands[1:]]
-        self.assertEqual(kinds, ["deny", "deny", "build", "build"])
+        self.assertEqual(kinds, ["deny"] * 3 + ["build"] * 3)
 
     def test_no_advisory_exception_is_added(self):
         self.run_build()
@@ -178,9 +187,23 @@ class BuildIntegration(unittest.TestCase):
             self.run_build()
 
     def test_lock_digest_mismatch_rejected(self):
-        self.lock["aube"]["lock_sha256"] = "0" * 64
-        with self.assertRaisesRegex(ValueError, "Cargo.lock mismatch"):
-            self.run_build()
+        for name in ("aube", "ripgrep"):
+            with self.subTest(name=name):
+                self.setUp()
+                self.lock[name]["lock_sha256"] = "0" * 64
+                with self.assertRaisesRegex(ValueError, f"fixed {name} Cargo.lock mismatch"):
+                    self.run_build()
+
+    def test_ripgrep_source_mutation_invalidates_success(self):
+        def hook(args):
+            if "build" in args and "ripgrep" in args:
+                (self.ripgrep / "Cargo.toml").write_text("changed")
+
+        with self.assertRaises(ValueError):
+            self.run_build(hook=hook)
+        receipt = self.receipt()
+        self.assertEqual(receipt["exit"], 1)
+        self.assertFalse(receipt["source_unchanged"])
 
     def test_download_extracts_fixed_revision(self):
         revision = self.lock["aube"]["revision"]

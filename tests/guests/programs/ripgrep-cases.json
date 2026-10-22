@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "note": "Run in fixture/app before aube changes it. --version is left out: it prints the SIMD features CPUID reports, which differ by design. Several paths without --sort are searched in parallel, so those cases match one file only.",
+  "cases": [
+    {"name": "lines", "args": ["--line-number", "--sort", "path", "version", "package.json", "filedep", "../outside"]},
+    {"name": "files", "args": ["--files", "--sort", "path", "package.json", "filedep", "../outside"]},
+    {"name": "count", "args": ["--count", "--sort", "path", "name", "package.json", "filedep", "../outside"]},
+    {"name": "replace", "args": ["--only-matching", "--sort", "path", "--replace", "<$1>", "\"([a-z]+)\":\"[0-9.]+\"", "package.json", "filedep"]},
+    {"name": "parallel", "args": ["--files-with-matches", "link:\\.\\./outside", "package.json", "filedep", "../outside"]},
+    {"name": "no-match", "args": ["no-such-text", "package.json"]},
+    {"name": "bad-regex", "args": ["(", "package.json"]},
+    {"name": "missing-file", "args": ["name", "missing.json"]}
+  ]
+}

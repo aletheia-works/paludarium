@@ -62,6 +62,7 @@ jobs:
             target/guests/programs/licenses/
             target/guests/programs/probe
             target/guests/programs/aube
+            target/guests/programs/ripgrep
             target/programs/native/
           retention-days: 7
   differential:
@@ -76,7 +77,7 @@ jobs:
         with:
           name: programs-native-first
           path: target
-      - run: chmod +x target/guests/programs/probe target/guests/programs/aube
+      - run: chmod +x target/guests/programs/probe target/guests/programs/aube target/guests/programs/ripgrep
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install $RUST_TOOLCHAIN --profile minimal

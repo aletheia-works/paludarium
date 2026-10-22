@@ -73,7 +73,7 @@ class PolicyTests(unittest.TestCase):
                 license_file.write_bytes(b"complete test license fixture\n")
                 licenses[exception["crate"]] = {"source": REGISTRY, "sha256": digest(license_file)}
             receipt = {
-                "audits": {"probe": 0, "aube": 0},
+                "audits": {"probe": 0, "aube": 0, "ripgrep": 0},
                 "license_policy": {
                     "exceptions": copy.deepcopy(LICENSE_EXCEPTIONS),
                     "root_config_sha256": hashlib.sha256(root).hexdigest(),

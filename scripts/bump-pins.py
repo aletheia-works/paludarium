@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Move a pin to its latest release: the nightly Rust or the aube guest.
+"""Move a pin to its latest release: the nightly Rust, or the aube or ripgrep guest.
 
     bump-pins.py toolchain --body body.md   # rust-toolchain.toml, source-lock.json
     bump-pins.py aube --body body.md        # source-lock.json, the feature pages
+    bump-pins.py ripgrep --body body.md     # the same for ripgrep
     bump-pins.py --self-test
 
 When the pin moves, the pull request title goes to stdout and its body to
@@ -26,7 +27,8 @@ TOOLCHAIN_FILE = "rust-toolchain.toml"
 SOURCE_LOCK = "tests/guests/programs/source-lock.json"
 FEATURE_PAGES = ("docs/guide/features.md", "docs/ja/guide/features.md")
 DIST = "https://static.rust-lang.org/dist"
-AUBE = "aubepkg/aube"
+# The guests built from a fixed release: their GitHub repositories.
+GUESTS = {"aube": "aubepkg/aube", "ripgrep": "BurntSushi/ripgrep"}
 # The hosts CI and contributors build on; each needs the whole toolchain.
 HOSTS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc")
 # A nightly with a missing component is skipped; give up after this many days.
@@ -115,41 +117,47 @@ def version(tag):
     return tuple(int(part) for part in re.findall(r"\d+", tag))
 
 
-def bump_aube(get=fetch):
-    lock = json.loads((ROOT / SOURCE_LOCK).read_text())["aube"]
-    release = json.loads(get(f"https://api.github.com/repos/{AUBE}/releases/latest"))
+def edit_line(path, marker, old, new):
+    """Replaces `old` with `new` on the one line of `path` that has `marker` and `old`."""
+    file = ROOT / path
+    lines = file.read_text().splitlines(keepends=True)
+    hits = [i for i, line in enumerate(lines) if marker in line and old in line]
+    if len(hits) != 1:
+        raise SystemExit(f"{path}: expected one {marker} line naming {old}, found {len(hits)}")
+    lines[hits[0]] = replace_once(lines[hits[0]], old, new, path)
+    file.write_text("".join(lines))
+
+
+def bump_guest(name, get=fetch):
+    repository = GUESTS[name]
+    lock = json.loads((ROOT / SOURCE_LOCK).read_text())[name]
+    release = json.loads(get(f"https://api.github.com/repos/{repository}/releases/latest"))
     tag = release["tag_name"]
     if version(tag) <= version(lock["tag"]):
         return None
-    commit = json.loads(get(f"https://api.github.com/repos/{AUBE}/commits/{tag}"))["sha"]
-    cargo_lock = get(f"https://raw.githubusercontent.com/{AUBE}/{commit}/Cargo.lock")
+    commit = json.loads(get(f"https://api.github.com/repos/{repository}/commits/{tag}"))["sha"]
+    cargo_lock = get(f"https://raw.githubusercontent.com/{repository}/{commit}/Cargo.lock")
     lock_sha256 = hashlib.sha256(cargo_lock).hexdigest()
-    edit(SOURCE_LOCK, f'"tag": "{lock["tag"]}"', f'"tag": "{tag}"')
-    edit(SOURCE_LOCK, f'"revision": "{lock["revision"]}"', f'"revision": "{commit}"')
-    edit(SOURCE_LOCK, f'"lock_sha256": "{lock["lock_sha256"]}"', f'"lock_sha256": "{lock_sha256}"')
+    # source-lock.json holds each guest on one line.
+    marker = f'"{name}": {{'
+    edit_line(SOURCE_LOCK, marker, f'"tag": "{lock["tag"]}"', f'"tag": "{tag}"')
+    edit_line(SOURCE_LOCK, marker, lock["revision"], commit)
+    edit_line(SOURCE_LOCK, marker, lock["lock_sha256"], lock_sha256)
     for page in FEATURE_PAGES:
-        file = ROOT / page
-        lines = file.read_text().splitlines(keepends=True)
-        hits = [i for i, line in enumerate(lines) if "**aube**" in line and lock["tag"] in line]
-        if len(hits) != 1:
-            raise SystemExit(
-                f"{page}: expected one aube line naming {lock['tag']}, found {len(hits)}"
-            )
-        lines[hits[0]] = lines[hits[0]].replace(lock["tag"], tag)
-        file.write_text("".join(lines))
+        edit_line(page, f"**{name}**", lock["tag"], tag)
     body = "\n".join(
         [
-            f"Moves the aube guest from {lock['tag']} to {tag} ({commit}), its latest release.",
+            f"Moves the {name} guest from {lock['tag']} to {tag} ({commit}), its latest release.",
             "",
             f"- Release notes: {release['html_url']}",
-            f"- Changes: https://github.com/{AUBE}/compare/{lock['tag']}...{tag}",
+            f"- Changes: https://github.com/{repository}/compare/{lock['tag']}...{tag}",
             f"- Cargo.lock SHA-256: `{lock_sha256}`",
             "",
             "If the guest build, its audit or the differential tests fail, fix the cause",
-            "in aube itself rather than adding an exception here.",
+            f"in {name} itself rather than adding an exception here.",
         ]
     )
-    return f"chore(guests): bump aube to {tag}", body
+    return f"chore(guests): bump {name} to {tag}", body
 
 
 def self_test():
@@ -252,17 +260,27 @@ def self_test():
         # Already the latest.
         assert bump_toolchain(fake({"latest": manifest("2026-10-11")})) is None
 
-        # aube: a newer release moves the tag, revision, lock digest and both pages.
+        # A newer release moves the guest's tag, revision, lock digest and both
+        # pages, and leaves the other guest alone.
+        def guest_line(name, tag, revision, digest):
+            return (
+                f'  "{name}": {{"tag": "{tag}", "revision": "{revision}", '
+                f'"lock_sha256": "{digest}"}}'
+            )
+
         (ROOT / SOURCE_LOCK).write_text(
-            '{\n  "aube": {"tag": "v2.8.1", "revision": "'
-            + "a" * 40
-            + '", "lock_sha256": "'
-            + "b" * 64
-            + '"}\n}\n'
+            "{\n"
+            + guest_line("aube", "v2.8.1", "a" * 40, "b" * 64)
+            + ",\n"
+            + guest_line("ripgrep", "15.2.0", "d" * 40, "e" * 64)
+            + "\n}\n"
         )
         for page in FEATURE_PAGES:
             (ROOT / page).parent.mkdir(parents=True, exist_ok=True)
-            (ROOT / page).write_text("- **probe**: x\n- **aube**: a package manager (v2.8.1).\n")
+            (ROOT / page).write_text(
+                "- **probe**: x\n- **aube**: a package manager (v2.8.1).\n"
+                "- **ripgrep**: a search tool (15.2.0).\n"
+            )
 
         def aube_get(tag):
             def get(url):
@@ -276,9 +294,9 @@ def self_test():
 
             return get
 
-        assert bump_aube(aube_get("v2.8.1")) is None
-        assert bump_aube(aube_get("v2.7.9")) is None
-        title, _ = bump_aube(aube_get("v2.10.0"))
+        assert bump_guest("aube", aube_get("v2.8.1")) is None
+        assert bump_guest("aube", aube_get("v2.7.9")) is None
+        title, _ = bump_guest("aube", aube_get("v2.10.0"))
         assert title == "chore(guests): bump aube to v2.10.0", title
         lock = json.loads((ROOT / SOURCE_LOCK).read_text())["aube"]
         assert lock == {
@@ -288,6 +306,13 @@ def self_test():
         }, lock
         for page in FEATURE_PAGES:
             assert "(v2.10.0)" in (ROOT / page).read_text()
+        title, _ = bump_guest("ripgrep", aube_get("15.10.0"))
+        assert title == "chore(guests): bump ripgrep to 15.10.0", title
+        locks = json.loads((ROOT / SOURCE_LOCK).read_text())
+        assert locks["ripgrep"]["tag"] == "15.10.0" and locks["aube"] == lock, locks
+        for page in FEATURE_PAGES:
+            text = (ROOT / page).read_text()
+            assert "(15.10.0)" in text and "(v2.10.0)" in text, text
 
         # A value that is not there exactly once stops the bump.
         try:
@@ -301,7 +326,7 @@ def self_test():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("pin", nargs="?", choices=("toolchain", "aube"))
+    parser.add_argument("pin", nargs="?", choices=("toolchain", *GUESTS))
     parser.add_argument("--body", type=Path, help="where to write the pull request body")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -310,7 +335,7 @@ def main():
         return
     if not args.pin:
         parser.error("name a pin, or pass --self-test")
-    result = bump_toolchain() if args.pin == "toolchain" else bump_aube()
+    result = bump_toolchain() if args.pin == "toolchain" else bump_guest(args.pin)
     if result is None:
         print(f"{args.pin} is already the latest", file=sys.stderr)
         return

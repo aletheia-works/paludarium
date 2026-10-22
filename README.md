@@ -95,7 +95,7 @@ or run a task.
 
 - `ci.yml` (every pull request): unit tests on three OSes, rustfmt, clippy
   (`-D warnings`), the wasm32 build, cargo-deny, differential tests, 80 %
-  coverage, probe and aube differential tests, the WebAssembly acceptance
+  coverage, probe, aube and ripgrep differential tests, the WebAssembly acceptance
   tests, polyglot lint, the documentation build and the release package
   check. A pull request runs the jobs its changed files need
   (`scripts/ci-changes.py`); `ci-ok`, the required check, passes when every
@@ -105,7 +105,7 @@ or run a task.
   real Safari, with and without the JIT). A failure opens an issue; the next
   passing night closes it.
 - `bump-pins.yml` (every Monday): moves the nightly pinned in
-  `rust-toolchain.toml` and the aube guest in
+  `rust-toolchain.toml` and the aube and ripgrep guests in
   `tests/guests/programs/source-lock.json` to their latest releases
   (`scripts/bump-pins.py`), one pull request each from aletheia-works-bot that
   merges itself once `ci-ok` passes. Workflows name the toolchain through

@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { createJitHandler } from "./jit-http.mjs";
 
 async function withServer(t, overrides = {}) {
-  const handler = createJitHandler({ root: process.cwd(), modulePath: "production.wasm", page: "page", encoded: { ok: true }, oracle: { rows: { probe: {} } }, onRow: async () => {}, ...overrides });
+  const handler = createJitHandler({ root: process.cwd(), modulePath: "production.wasm", page: "page", encoded: { ok: true }, oracle: { rows: { probe: {} }, ripgrep: { rows: { mmap: {} } } }, onRow: async () => {}, ...overrides });
   const server = createServer(handler);
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
@@ -44,11 +44,13 @@ test("valid row persists before acknowledgement", async t => {
   let saved;
   const url = await withServer(t, { onRow: async (...args) => { saved = args; } });
   const response = await fetch(url + "/row", { method: "POST", body: JSON.stringify({ mode: "jit", name: "probe", row: { pass: true } }) });
-  assert.equal(response.status, 200); assert.deepEqual(saved, ["jit", "probe", { pass: true }]);
+  assert.equal(response.status, 200); assert.deepEqual(saved, ["jit", "probe", { pass: true }, "rows"]);
+  const ripgrep = await fetch(url + "/row", { method: "POST", body: JSON.stringify({ mode: "interpreter", name: "mmap", row: { pass: true }, group: "ripgrep" }) });
+  assert.equal(ripgrep.status, 200); assert.deepEqual(saved, ["interpreter", "mmap", { pass: true }, "ripgrep"]);
 });
 test("invalid rows and persistence failures finish with 500", async t => {
   const url = await withServer(t, { onRow: async () => { throw Error("persist failed"); } });
-  for (const body of ["invalid", JSON.stringify({ mode: "jit", name: "other" }), JSON.stringify({ mode: "jit", name: "probe", row: {} })]) {
+  for (const body of ["invalid", JSON.stringify({ mode: "jit", name: "other" }), JSON.stringify({ mode: "jit", name: "probe", group: "ripgrep" }), JSON.stringify({ mode: "jit", name: "mmap", group: "other" }), JSON.stringify({ mode: "jit", name: "probe", row: {} })]) {
     const response = await fetch(url + "/row", { method: "POST", body });
     assert.equal(response.status, 500); await response.text();
   }

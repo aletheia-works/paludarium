@@ -47,6 +47,10 @@ export async function observeRipgrep(launch, { ripgrep, cases, oracle, fixtures,
     const filesystem = await launcher.createFileSystem({ files, fileModes });
     for (const item of cases) {
       const row = await observeProgram(launcher, { program: "/ripgrep", cwd: fixtureRoot + "/app", args: ["/ripgrep", ...item.args], env: environment, filesystem, jit });
+      if (jit) {
+        try { row.jit = (await launcher.diagnostics()).workers.filter(worker => !worker.guestThread).at(-1)?.jit; }
+        catch (cause) { row.jit_diagnostics_error = String(cause); }
+      }
       const expected = native.rows[item.name];
       try {
         if (row.timed_out || expected.timed_out || row.errors.length) throw new Error("Guest operation timed out or failed");

@@ -7,14 +7,15 @@ export function requireJitProof(row) {
   return row;
 }
 
-// Identical 14 cases, fixture state, masks and deadline for both execution modes.
+// Identical 14 cases and ripgrep searches, fixture state, masks and deadline
+// for both execution modes. The ripgrep rows are kept apart from the 28 cases.
 export async function runJitSuite(input) {
   const modes = {};
   for (const jit of [false, true]) {
     const mode = jit ? "jit" : "interpreter";
-    const result = await runSuite({ ...input, jit, onRow: async (name, row) => {
+    const result = await runSuite({ ...input, jit, onRow: async (name, row, group = "rows") => {
       if (jit) requireJitProof(row);
-      await input.onRow?.(mode, name, row);
+      await input.onRow?.(mode, name, row, group);
     } });
     modes[mode] = result;
   }

@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -27,6 +28,14 @@ NAMES = [
 ] + ["version", "install", "frozen", "list"]
 
 
+RIPGREP = [
+    case["name"]
+    for case in json.loads(
+        (Path(__file__).resolve().parents[1] / "programs/ripgrep-cases.json").read_text()
+    )["cases"]
+]
+
+
 def valid():
     row = dict(
         seconds=1.0,
@@ -43,6 +52,12 @@ def valid():
         caseCount=28,
         rows={
             mode: {name: copy.deepcopy(row) for name in NAMES} for mode in ("interpreter", "jit")
+        },
+        ripgrep={
+            mode: {
+                name: dict(copy.deepcopy(row), exit=index % 3) for index, name in enumerate(RIPGREP)
+            }
+            for mode in ("interpreter", "jit")
         },
     )
 
@@ -118,6 +133,26 @@ class RunnerTests(unittest.TestCase):
         for field, value in (("complete", False), ("passed", False), ("caseCount", 27)):
             with self.subTest(field=field):
                 self.rejected(lambda r, field=field, value=value: r.update({field: value}))
+
+    def test_ripgrep(self):
+        # Any key order is accepted, as Safari's WebDriver returns.
+        report = valid()
+        report["ripgrep"]["jit"] = dict(reversed(list(report["ripgrep"]["jit"].items())))
+        runner.validate(report)
+        first = RIPGREP[0]
+        for change in (
+            lambda r: r.pop("ripgrep"),
+            lambda r: r["ripgrep"].pop("jit"),
+            lambda r: r["ripgrep"]["interpreter"].pop(first),
+            lambda r: r["ripgrep"]["jit"].update(extra=r["ripgrep"]["jit"][first]),
+            lambda r: r["ripgrep"]["interpreter"][first].update(exit=3),
+            lambda r: r["ripgrep"]["interpreter"][first].update({"pass": False}),
+            lambda r: r["ripgrep"]["interpreter"][first].update(timed_out=True),
+            lambda r: r["ripgrep"]["interpreter"][first].update(seconds=31),
+            lambda r: r["ripgrep"]["jit"][first]["jit"].update(executedBlocks="0"),
+        ):
+            with self.subTest():
+                self.rejected(change)
 
 
 if __name__ == "__main__":

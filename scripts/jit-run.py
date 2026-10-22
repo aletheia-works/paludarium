@@ -12,6 +12,33 @@ sys.path.insert(0, str(ROOT / "tests/guests/wasm"))
 from supervisor import supervise  # noqa: E402
 
 
+def translated(row):
+    for key in ("executedBlocks", "executedInstructions"):
+        value = row.get("jit", {}).get(key)
+        if (
+            not isinstance(value, str)
+            or not value.isascii()
+            or not value.isdecimal()
+            or int(value) <= 0
+        ):
+            raise ValueError("JIT real translation execution missing")
+
+
+def finished(row, exit_ok):
+    seconds = row.get("seconds")
+    if (
+        type(seconds) not in (int, float)
+        or not 0 <= seconds <= 30
+        or type(row.get("exit")) is not int
+        or not exit_ok(row["exit"])
+        or row.get("timed_out") is not False
+        or row.get("pass") is not True
+        or not isinstance(row.get("errors"), list)
+        or row.get("errors")
+    ):
+        raise ValueError("JIT guest failure or deadline")
+
+
 def validate(report):
     if (
         report.get("complete") is not True
@@ -41,28 +68,22 @@ def validate(report):
         if list(rows) != expected:
             raise ValueError("JIT case inventory changed")
         for row in rows.values():
-            seconds = row.get("seconds")
-            if (
-                type(seconds) not in (int, float)
-                or not 0 <= seconds <= 30
-                or type(row.get("exit")) is not int
-                or row.get("exit") != 0
-                or row.get("timed_out") is not False
-                or row.get("pass") is not True
-                or not isinstance(row.get("errors"), list)
-                or row.get("errors")
-            ):
-                raise ValueError("JIT guest failure or deadline")
+            finished(row, lambda code: code == 0)
             if mode == "jit":
-                for key in ("executedBlocks", "executedInstructions"):
-                    value = row.get("jit", {}).get(key)
-                    if (
-                        not isinstance(value, str)
-                        or not value.isascii()
-                        or not value.isdecimal()
-                        or int(value) <= 0
-                    ):
-                        raise ValueError("JIT real translation execution missing")
+                translated(row)
+    # The ripgrep searches, kept apart from the 28 cases; some end with 1 or 2.
+    cases = json.loads((ROOT / "tests/guests/programs/ripgrep-cases.json").read_text())["cases"]
+    if set(report.get("ripgrep", {})) != {"interpreter", "jit"}:
+        raise ValueError("JIT ripgrep mode inventory changed")
+    for mode in ("interpreter", "jit"):
+        rows = report["ripgrep"][mode]
+        # Safari's WebDriver returns the report without its key order.
+        if sorted(rows) != sorted(case["name"] for case in cases):
+            raise ValueError("JIT ripgrep case inventory changed")
+        for row in rows.values():
+            finished(row, lambda code: code in (0, 1, 2))
+            if mode == "jit":
+                translated(row)
 
 
 def main():

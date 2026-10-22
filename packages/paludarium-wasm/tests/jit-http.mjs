@@ -19,9 +19,10 @@ export function createJitHandler({ root, modulePath, page, encoded, oracle, onRo
           if (size > 16 * 1024 * 1024) throw Error("Evidence row too large");
           chunks.push(chunk);
         }
-        const { mode, name, row } = JSON.parse(Buffer.concat(chunks));
-        if (!["interpreter", "jit"].includes(mode) || !Object.hasOwn(oracle.rows, name)) throw Error("Unknown evidence row");
-        await onRow(mode, name, row);
+        const { mode, name, row, group = "rows" } = JSON.parse(Buffer.concat(chunks));
+        const known = group === "ripgrep" ? oracle.ripgrep?.rows ?? {} : group === "rows" ? oracle.rows : {};
+        if (!["interpreter", "jit"].includes(mode) || !Object.hasOwn(known, name)) throw Error("Unknown evidence row");
+        await onRow(mode, name, row, group);
         send(200);
       } else {
         const path = request.url === "/production.wasm" ? resolve(modulePath) : resolve(root, "." + new URL(request.url, "http://localhost").pathname);

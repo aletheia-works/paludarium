@@ -47,6 +47,7 @@ macOS と Windows でも、Linux のバイナリを直接 exec するのでは�
 
 ## Rust のツールチェーン
 
-- 日付を固定した nightly（今は `nightly-2026-10-11`）で作って確かめています。
+- 日付を固定した nightly（`rust-toolchain.toml` にあるもの。毎週、最新の nightly へ
+  上げます）で作って確かめています。
 - crate の MSRV は 1.101 なので、今の stable の Rust ではビルドできません。
 - WebAssembly 版は、さらに nightly の `build-std` と atomics の機能を使います。

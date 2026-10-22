@@ -10,8 +10,8 @@ paludarium is published as crates on crates.io and as a package on npm.
 
 ## Rust
 
-paludarium is built and tested with a pinned nightly Rust
-(`nightly-2026-10-11`). The crates declare 1.101 as their MSRV (the oldest Rust
+paludarium is built and tested with a pinned nightly Rust (the one in
+`rust-toolchain.toml`, moved to the latest nightly every week). The crates declare 1.101 as their MSRV (the oldest Rust
 they support), so today's stable Rust cannot build them; use a nightly Rust.
 
 ```sh

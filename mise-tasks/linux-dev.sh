@@ -13,7 +13,10 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-image="${PALUDARIUM_DEV_IMAGE:-paludarium-dev}"
+# The image is tagged with the toolchain pinned in rust-toolchain.toml, so a
+# toolchain bump builds a new image rather than reusing one with the old nightly.
+toolchain="$(cd "$root" && bash scripts/rust-toolchain.sh)"
+image="${PALUDARIUM_DEV_IMAGE:-paludarium-dev:$toolchain}"
 docker_bin="${DOCKER:-docker}"
 mode="${PALUDARIUM_DEV_MOUNT:-sync}"
 
@@ -26,7 +29,8 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 
 if ! "$docker_bin" image inspect "$image" >/dev/null 2>&1; then
-  "$docker_bin" build --platform linux/amd64 --ulimit stack=-1 -t "$image" "$host_root/ci/linux-dev"
+  "$docker_bin" build --platform linux/amd64 --ulimit stack=-1 \
+    --build-arg TOOLCHAIN="$toolchain" -t "$image" "$host_root/ci/linux-dev"
 fi
 
 common=(--rm --platform linux/amd64

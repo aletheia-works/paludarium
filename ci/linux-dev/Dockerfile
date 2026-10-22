@@ -1,15 +1,19 @@
 # Native x86-64 Linux environment for paludarium: builds the musl guests,
 # runs them natively (differential tests), strace/objdump, coverage, fuzzing.
-# Build: docker build --platform linux/amd64 -t paludarium-dev ci/linux-dev
+# Build it with `mise run linux-dev`, which passes the pinned toolchain:
+#   docker build --platform linux/amd64 --build-arg TOOLCHAIN="$(bash scripts/rust-toolchain.sh)" \
+#     -t paludarium-dev:<toolchain> ci/linux-dev
 FROM rust:1-bookworm
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends musl-tools binutils strace gdb \
  && rm -rf /var/lib/apt/lists/*
 
-# Same pinned nightly as rust-toolchain.toml.
-ARG TOOLCHAIN=nightly-2026-10-10
-RUN rustup toolchain install "$TOOLCHAIN" --profile minimal \
+# The nightly pinned in rust-toolchain.toml. No default, so that an image is
+# never built with an old one.
+ARG TOOLCHAIN
+RUN test -n "$TOOLCHAIN" || { echo "pass --build-arg TOOLCHAIN" >&2; exit 1; } \
+ && rustup toolchain install "$TOOLCHAIN" --profile minimal \
       --component rustfmt,clippy,llvm-tools,rust-src \
       --target x86_64-unknown-linux-musl,wasm32-unknown-unknown \
  && rustup default "$TOOLCHAIN"

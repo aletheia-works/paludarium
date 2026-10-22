@@ -48,6 +48,7 @@ of these ([Testing and verification](../design/quality)):
 
 ## Rust toolchain
 
-- Built and tested with a pinned nightly (now `nightly-2026-10-11`).
+- Built and tested with a pinned nightly (the one in `rust-toolchain.toml`,
+  moved to the latest nightly every week).
 - The crates' MSRV is 1.101, so today's stable Rust cannot build them.
 - The WebAssembly build also uses nightly `build-std` and atomics.

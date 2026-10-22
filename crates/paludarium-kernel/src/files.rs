@@ -651,6 +651,19 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     Ok(0)
                 }
                 3 => Ok(d.file.flags() as u64),
+                // F_SETPIPE_SZ and F_GETPIPE_SZ, for pipes only.
+                1031 | 1032 => {
+                    let pipe = d
+                        .file
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<crate::sockets::PipeEnd>())
+                        .ok_or(Errno::EBADF)?;
+                    if a[1] == 1031 {
+                        pipe.set_size(a[2] as u32)
+                    } else {
+                        Ok(pipe.size())
+                    }
+                }
                 4 => {
                     d.file.set_flags(a[2] as u32)?;
                     Ok(0)

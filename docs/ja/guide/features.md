@@ -42,6 +42,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
 - `socket()` はいつも `EAFNOSUPPORT` を返します。ネットワークは使えません。
+- パイプは Linux と同じく 64 KiB を持ちます。`fcntl` の `F_SETPIPE_SZ` と
+  `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。大きさは
+  1 ページ以上の 2 のべき乗で、読まれていないデータより小さくすると `EBUSY`、
+  2³¹ を超えると `EINVAL` です。
 - `SOCK_DGRAM` の組は、`SOCK_SEQPACKET` と同じくメッセージの区切りを保ちますが、
   ファイルの終わりがありません。相手が閉じると、読み込みは待ち続け、次の送信は
   `ECONNREFUSED`、その後は `ENOTCONN` になります。`EPIPE` で `SIGPIPE` を送るのは、

@@ -47,6 +47,9 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
 - `socket()` always returns `EAFNOSUPPORT`: there is no network.
+- A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
+  `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
+  at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.
 - A `SOCK_DGRAM` pair keeps message boundaries like `SOCK_SEQPACKET`, but has
   no end of file: when the peer closes, reads wait and the next send gets
   `ECONNREFUSED`, then `ENOTCONN`. Only `SOCK_STREAM` raises `SIGPIPE` with

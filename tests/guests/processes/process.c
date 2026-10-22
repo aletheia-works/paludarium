@@ -21,6 +21,10 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifndef F_SETPIPE_SZ
+#define F_SETPIPE_SZ 1031
+#define F_GETPIPE_SZ 1032
+#endif
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434
 #endif
@@ -852,6 +856,35 @@ int main(int argc, char **argv) {
         result("errno", errno);
         errno = 0;
         result("rusage-fault", syscall(SYS_getrusage, RUSAGE_SELF, (void *)1));
+        result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "pipe-size")) {
+        /* brush sizes the pipe of a here-doc to its text. */
+        int pipefd[2];
+        pipe(pipefd);
+        result("default", fcntl(pipefd[0], F_GETPIPE_SZ));
+        result("one-page", fcntl(pipefd[1], F_SETPIPE_SZ, 5));
+        result("other-end", fcntl(pipefd[0], F_GETPIPE_SZ));
+        result("rounded", fcntl(pipefd[0], F_SETPIPE_SZ, 5000));
+        fcntl(pipefd[1], F_SETFL, O_NONBLOCK);
+        static char bytes[10000];
+        result("partial", write(pipefd[1], bytes, sizeof bytes));
+        errno = 0;
+        result("full", write(pipefd[1], bytes, 1));
+        result("errno", errno);
+        errno = 0;
+        result("busy", fcntl(pipefd[0], F_SETPIPE_SZ, 4096));
+        result("errno", errno);
+        result("drain", read(pipefd[0], bytes, sizeof bytes));
+        result("shrink", fcntl(pipefd[0], F_SETPIPE_SZ, 4096));
+        result("grow", fcntl(pipefd[0], F_SETPIPE_SZ, 1 << 20));
+        errno = 0;
+        result("too-large", fcntl(pipefd[0], F_SETPIPE_SZ, (1U << 31) + 1));
+        result("errno", errno);
+        int null = open("/dev/null", O_RDONLY);
+        errno = 0;
+        result("not-a-pipe", fcntl(null, F_GETPIPE_SZ));
         result("errno", errno);
         return 0;
     }

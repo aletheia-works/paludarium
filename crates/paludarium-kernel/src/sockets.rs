@@ -5,7 +5,7 @@ use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 use paludarium_types::GuestAddr;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 // Per-stream flow-control window, not a per-guest memory/fd quota. Native
@@ -82,9 +82,12 @@ mod pipe_tests {
         assert_eq!(r.read(&mut [0]), Ok(0));
     }
 }
+/// A new pipe holds 16 pages, as on Linux.
+const PIPE_DEFAULT: usize = 16 * 4096;
 impl PipeEnd {
     pub(crate) fn pair(flags: u32, hub: Arc<ReadinessHub>) -> Result<[Arc<Self>; 2], Errno> {
         let [reader, writer] = SocketPairEnd::pair(1 | flags, hub)?;
+        reader.pair.window.store(PIPE_DEFAULT, Ordering::SeqCst);
         reader.shutdown(1)?;
         writer.shutdown(0)?;
         Ok([
@@ -97,6 +100,43 @@ impl PipeEnd {
                 reader: false,
             }),
         ])
+    }
+}
+impl PipeEnd {
+    /// `F_GETPIPE_SZ`.
+    pub(crate) fn size(&self) -> u64 {
+        self.endpoint.pair.window() as u64
+    }
+    /// `F_SETPIPE_SZ`, as Linux's `pipe_set_size`: the size rounds up to a
+    /// power of two of at least a page (`EINVAL` past 2^31), and may not drop
+    /// below the pages the unread data fills (`EBUSY`). The guest is root,
+    /// so no limit applies. Returns the new size.
+    pub(crate) fn set_size(&self, size: u32) -> Result<u64, Errno> {
+        if size > 1 << 31 {
+            return Err(Errno::EINVAL);
+        }
+        let size = size.max(4096).next_power_of_two() as usize;
+        let sides = self
+            .endpoint
+            .pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // The unread bytes are the reader's; each page holds 4096 of them.
+        let unread = sides[if self.reader {
+            self.endpoint.side
+        } else {
+            1 - self.endpoint.side
+        }]
+        .bytes
+        .len();
+        if size / 4096 < unread.div_ceil(4096) {
+            return Err(Errno(16)); // EBUSY
+        }
+        self.endpoint.pair.window.store(size, Ordering::SeqCst);
+        drop(sides);
+        self.endpoint.pair.hub.changed();
+        Ok(size as u64)
     }
 }
 impl FileHandle for PipeEnd {
@@ -241,10 +281,16 @@ struct Pair {
     /// boundaries: each write is one message, and each read returns one
     /// whole message, truncated to the buffer, as on Linux.
     kind: u32,
+    /// How many unread bytes each direction holds: the socket send buffer,
+    /// or a pipe's capacity (`F_SETPIPE_SZ`).
+    window: AtomicUsize,
 }
 impl Pair {
     fn messages(&self) -> bool {
         self.kind != SOCK_STREAM
+    }
+    fn window(&self) -> usize {
+        self.window.load(Ordering::SeqCst)
     }
 }
 const SOCK_STREAM: u32 = 1;
@@ -271,6 +317,7 @@ impl SocketPairEnd {
         }
         let pair = Arc::new(Pair {
             kind: kind & 0xf,
+            window: AtomicUsize::new(SEND_WINDOW),
             sides: Mutex::new(std::array::from_fn(|_| Side {
                 output_epoch: 1,
                 ..Side::default()
@@ -386,12 +433,12 @@ impl FileHandle for SocketPairEnd {
             // Only this side's own shutdowns show; a closed peer does not.
             let shut = (u32::from(own.read_shutdown) * (IN | 0x2000))
                 | (u32::from(own.read_shutdown && own.write_shutdown) * 0x10);
-            let writable = peer.bytes.len() < SEND_WINDOW || peer.closed;
+            let writable = peer.bytes.len() < self.pair.window() || peer.closed;
             let mask = (u32::from(writable) * OUT) | (u32::from(readable) * IN) | shut;
             return Ok((mask, own.input_epoch, own.output_epoch));
         }
         let eof = own.read_shutdown || peer.closed || peer.write_shutdown;
-        let mask = (u32::from(peer.bytes.len() < SEND_WINDOW || peer.closed) * OUT)
+        let mask = (u32::from(peer.bytes.len() < self.pair.window() || peer.closed) * OUT)
             | (u32::from(readable || eof) * IN)
             | if peer.closed {
                 0x2010
@@ -417,7 +464,7 @@ impl FileHandle for SocketPairEnd {
         let eof = sides[self.side].read_shutdown
             || sides[1 - self.side].closed
             || sides[1 - self.side].write_shutdown;
-        let full = sides[self.side].bytes.len() == SEND_WINDOW;
+        let full = sides[self.side].bytes.len() >= self.pair.window();
         let own = &mut sides[self.side];
         if own.read_shutdown {
             return Ok(0);
@@ -470,7 +517,7 @@ impl FileHandle for SocketPairEnd {
                 return Err(Errno(32));
             }
             // A closed peer's receive queue is freed with it.
-            if !peer.closed && SEND_WINDOW - peer.bytes.len() < buf.len() {
+            if !peer.closed && self.pair.window().saturating_sub(peer.bytes.len()) < buf.len() {
                 return Err(Errno::EAGAIN);
             }
             if own.disconnected {
@@ -506,7 +553,7 @@ impl FileHandle for SocketPairEnd {
             if buf.len() > MAX_MESSAGE {
                 return Err(Errno(90));
             }
-            if SEND_WINDOW - peer.bytes.len() < buf.len() {
+            if self.pair.window().saturating_sub(peer.bytes.len()) < buf.len() {
                 return Err(Errno::EAGAIN);
             }
             peer.bytes
@@ -519,7 +566,9 @@ impl FileHandle for SocketPairEnd {
             self.pair.hub.changed();
             return Ok(buf.len());
         }
-        let count = buf.len().min(SEND_WINDOW.saturating_sub(peer.bytes.len()));
+        let count = buf
+            .len()
+            .min(self.pair.window().saturating_sub(peer.bytes.len()));
         if count == 0 && !buf.is_empty() {
             return Err(Errno::EAGAIN);
         }

@@ -468,7 +468,8 @@ impl Kernel {
             | 0x100000
             | 0x200000
             | 0x400000
-            | 0x1000000;
+            | 0x1000000
+            | CLONE_CLEAR_SIGHAND;
         if flags & 0x800 != 0 && flags & 0x100 == 0 || flags & 0xff > 64 {
             return Err(Errno::EINVAL);
         }
@@ -485,6 +486,11 @@ impl Kernel {
         }
         let pid = self.processes.allocate()?;
         let group = Arc::new(self.group.fork());
+        // CLONE_CLEAR_SIGHAND resets handled signals to their default and
+        // keeps ignored ones, as execve does.
+        if flags & CLONE_CLEAR_SIGHAND != 0 {
+            group.exec_actions();
+        }
         let inbox = Arc::new(SignalInbox::default());
         group.set_process_inbox(inbox.clone());
         group.register(pid, inbox.clone());
@@ -497,6 +503,9 @@ impl Kernel {
         state.clear_child_tid = if flags & 0x200000 != 0 { a[3] } else { 0 };
         if flags & 0x100 != 0 {
             state.alt_stack = crate::AltStack::default();
+        }
+        if flags & CLONE_CLEAR_SIGHAND != 0 {
+            state.signal_actions.retain(|_, action| action.handler == 1);
         }
         let mut cpu = parent.cpu.clone();
         cpu.gpr[reg::RAX] = 0;
@@ -651,6 +660,74 @@ impl Kernel {
         self.release_vfork();
         Ok(())
     }
+}
+/// `clone3`'s own flag: reset the signal handlers in the child.
+pub(crate) const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
+
+/// Reads `struct clone_args` for `clone3` with Linux's checks in Linux's
+/// order (`copy_clone_args_from_user`, then `clone3_args_valid` and
+/// `kernel_clone`), and returns the legacy `clone` arguments: flags with the
+/// exit signal, the stack top, the parent and child TID addresses and the
+/// TLS. `set_tid` and `CLONE_INTO_CGROUP` are not supported (`EINVAL`).
+pub(crate) fn clone3_args(mem: &AddressSpace, address: u64, size: u64) -> Result<[u64; 6], Errno> {
+    const VER0: u64 = 64;
+    const KNOWN: u64 = 88;
+    if size > 4096 {
+        return Err(Errno(7)); // E2BIG
+    }
+    if size < VER0 {
+        return Err(Errno::EINVAL);
+    }
+    // copy_struct_from_user: a larger struct is fine if the rest is zero.
+    let mut bytes = vec![0; usize::try_from(size).unwrap_or(4096)];
+    mem.read(GuestAddr(address), &mut bytes)
+        .map_err(|_| Errno::EFAULT)?;
+    if bytes.iter().skip(KNOWN as usize).any(|&b| b != 0) {
+        return Err(Errno(7));
+    }
+    bytes.resize(KNOWN as usize, 0);
+    let word =
+        |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+    let [
+        flags,
+        _pidfd,
+        child_tid,
+        parent_tid,
+        exit_signal,
+        stack,
+        stack_size,
+        tls,
+        set_tid,
+        set_tid_size,
+    ] = std::array::from_fn(word);
+    if set_tid_size > 32 || (set_tid == 0) != (set_tid_size == 0) || exit_signal & !0xff != 0 {
+        return Err(Errno::EINVAL);
+    }
+    const LEGACY: u64 = 0xffff_ffff & !0xff;
+    const DETACHED: u64 = 0x400000;
+    const SIGHAND: u64 = 0x800;
+    const THREAD_OR_PARENT: u64 = 0x10000 | 0x8000;
+    // CSIGNAL's bits are clone3's exit_signal; CLONE_NEWTIME (0x80) is the
+    // one flag among them.
+    if flags & !(LEGACY | 0x80 | CLONE_CLEAR_SIGHAND) != 0
+        || flags & (DETACHED | 0x7f) != 0
+        || flags & (SIGHAND | CLONE_CLEAR_SIGHAND) == SIGHAND | CLONE_CLEAR_SIGHAND
+        || flags & THREAD_OR_PARENT != 0 && exit_signal != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    let top = match (stack, stack_size) {
+        (0, 0) => 0,
+        (0, _) | (_, 0) => return Err(Errno::EINVAL),
+        (stack, size) => stack
+            .checked_add(size)
+            .filter(|&top| top <= paludarium_types::USER_ADDRESS_LIMIT)
+            .ok_or(Errno::EINVAL)?,
+    };
+    if set_tid != 0 || exit_signal > 64 {
+        return Err(Errno::EINVAL);
+    }
+    Ok([flags | exit_signal, top, parent_tid, child_tid, tls, 0])
 }
 fn read_string(
     mem: &AddressSpace,

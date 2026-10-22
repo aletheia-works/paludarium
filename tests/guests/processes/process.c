@@ -34,6 +34,19 @@ static void *blocked_sibling(void *unused) {
     read(thread_block[0], &byte, 1);
     _exit(84);
 }
+struct clone3_args { unsigned long long flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls; };
+static long clone3(void *args, unsigned long size) { return syscall(435, args, size); }
+static long clone3_error(struct clone3_args args) {
+    errno = 0;
+    long r = clone3(&args, sizeof args);
+    if (r == 0) _exit(99);
+    return r < 0 ? -errno : 1000;
+}
+static int reaped(long pid) {
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
 static void finish(pid_t pid) {
     int status = 0;
     result("wait", waitpid(pid, &status, 0) == pid);
@@ -372,6 +385,57 @@ int main(int argc, char **argv) {
         errno = 0;
         result("unknown", prctl(9999));
         result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "clone3")) {
+        signal(SIGUSR1, interrupted);
+        signal(SIGUSR2, SIG_IGN);
+        int parent_tid = 0;
+        struct clone3_args args = {0x100000, 0, 0, (unsigned long)&parent_tid, SIGCHLD, 0, 0, 0};
+        long pid = clone3(&args, sizeof args);
+        if (pid == 0) _exit(7);
+        result("exit", reaped(pid));
+        result("parent-tid", parent_tid == pid);
+        /* CLONE_CLEAR_SIGHAND: handlers go back to the default, ignored stays ignored. */
+        struct clone3_args clear = {1ULL << 32, 0, 0, 0, SIGCHLD, 0, 0, 0};
+        pid = clone3(&clear, sizeof clear);
+        if (pid == 0) {
+            struct sigaction one, two;
+            sigaction(SIGUSR1, NULL, &one);
+            sigaction(SIGUSR2, NULL, &two);
+            _exit((one.sa_handler == SIG_DFL) | (two.sa_handler == SIG_IGN) << 1);
+        }
+        result("cleared", reaped(pid));
+        struct sigaction kept;
+        sigaction(SIGUSR1, NULL, &kept);
+        result("parent-kept", kept.sa_handler == interrupted);
+        /* A larger struct is fine while the part Linux does not know is zero. */
+        unsigned long long larger[16] = {0};
+        larger[4] = SIGCHLD;
+        pid = clone3(larger, sizeof larger);
+        if (pid == 0) _exit(9);
+        result("larger", reaped(pid));
+        larger[12] = 1;
+        errno = 0;
+        result("larger-nonzero", clone3(larger, sizeof larger));
+        result("errno", errno);
+        errno = 0;
+        result("too-small", clone3(&args, 63));
+        result("errno", errno);
+        errno = 0;
+        result("too-large", clone3(&args, 4097));
+        result("errno", errno);
+        errno = 0;
+        result("fault", clone3((void *)1, 64));
+        result("errno", errno);
+        result("exit-signal-bits", clone3_error((struct clone3_args){0, 0, 0, 0, 0x100, 0, 0, 0}));
+        result("detached", clone3_error((struct clone3_args){0x400000, 0, 0, 0, SIGCHLD, 0, 0, 0}));
+        result("csignal-flag", clone3_error((struct clone3_args){SIGCHLD, 0, 0, 0, 0, 0, 0, 0}));
+        result("sighand-clear", clone3_error((struct clone3_args){(1ULL << 32) | 0xd00, 0, 0, 0, 0, 0, 0, 0}));
+        result("thread-signal", clone3_error((struct clone3_args){0x10900, 0, 0, 0, SIGCHLD, 0, 0, 0}));
+        result("size-no-stack", clone3_error((struct clone3_args){0, 0, 0, 0, SIGCHLD, 0, 4096, 0}));
+        result("stack-no-size", clone3_error((struct clone3_args){0, 0, 0, 0, SIGCHLD, 4096, 0, 0}));
+        result("bad-signal", clone3_error((struct clone3_args){0, 0, 0, 0, 65, 0, 0, 0}));
         return 0;
     }
     if (!strcmp(mode, "pdeathsig")) {

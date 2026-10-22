@@ -17,10 +17,10 @@ verified.
   make a shared file mapping writable (`EACCES`), as nothing would write it
   back to the file. A page wholly past the end of the file reads as zeros
   instead of raising `SIGBUS`.
-- **Some system calls**: `clone3`, `timerfd`, `CLONE_SIGHAND` between separate processes, stop and
-  continue notifications from `wait`, and `wait` by process group are not there
-  yet. Unimplemented system calls return `ENOSYS`, so some programs can carry
-  on without the feature.
+- **Some system calls**: `timerfd`, `CLONE_SIGHAND` between separate
+  processes, stop and continue notifications from `wait`, and `wait` by
+  process group are not there yet. Unimplemented system calls return
+  `ENOSYS`, so some programs can carry on without the feature.
 - **A native JIT**: only the WebAssembly build has a JIT; native builds use the
   interpreter.
 - **Stable Rust**: a nightly Rust is required.

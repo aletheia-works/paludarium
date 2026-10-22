@@ -31,7 +31,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 
 | Group | Main system calls |
 |---|---|
-| Processes and threads | `clone`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait` |
@@ -87,6 +87,10 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   (`SIGEV_NONE`); `SIGEV_THREAD_ID` and CPU-time clocks give `EINVAL`. They are
   not inherited by `fork` and are deleted by `execve`. `rt_sigtimedwait` also
   takes blocked signals pending for the whole process.
+- `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a
+  longer struct whose extra part is not zero) and then runs as the `clone` it
+  describes; `CLONE_CLEAR_SIGHAND` resets handled signals to their default.
+  `set_tid` and `CLONE_INTO_CGROUP` give `EINVAL`.
 - `prctl` supports `PR_SET_PDEATHSIG` (the signal is sent when the parent
   exits), `PR_SET_DUMPABLE` and `PR_SET_NO_NEW_PRIVS` with their `PR_GET_*`;
   other options give `EINVAL`.

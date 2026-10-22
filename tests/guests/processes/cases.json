@@ -19,6 +19,7 @@
     {"name":"posix-timer","binary":"process"},
     {"name":"prctl","binary":"process"},
     {"name":"pdeathsig","binary":"process"},
+    {"name":"clone3","binary":"process"},
     {"name":"seqpacket","binary":"process"},
     {"name":"pre-exec","binary":"command"},
     {"name":"pre-exec-missing","binary":"command"},

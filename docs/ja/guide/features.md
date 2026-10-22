@@ -27,7 +27,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | 主なシステムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait` |
@@ -79,6 +79,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   知らせません（`SIGEV_NONE`）。`SIGEV_THREAD_ID` と CPU 時間の時計は `EINVAL` を
   返します。`fork` では受け継がれず、`execve` で消えます。`rt_sigtimedwait` は、
   プロセス全体に届いてブロックされているシグナルも受け取ります。
+- `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が
+  0 でない長い構造体には `E2BIG`）、それが表す `clone` として動きます。
+  `CLONE_CLEAR_SIGHAND` は、ハンドラを設定したシグナルを既定に戻します。`set_tid` と
+  `CLONE_INTO_CGROUP` は `EINVAL` を返します。
 - `prctl` は `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、
   `PR_SET_DUMPABLE`、`PR_SET_NO_NEW_PRIVS` と、それぞれの `PR_GET_*` に対応します。
   ほかの指定には `EINVAL` を返します。

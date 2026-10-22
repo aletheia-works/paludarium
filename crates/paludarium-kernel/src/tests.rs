@@ -983,3 +983,45 @@ fn mremap_flags_and_msync_arguments() {
         errno(Errno::ENOMEM)
     );
 }
+#[test]
+fn clone3_arguments_follow_linux() {
+    let f = fixture();
+    let put = |words: &[u64]| {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        f.mem.write(GuestAddr(DATA), &bytes).unwrap();
+    };
+    let args = |size| crate::processes::clone3_args(&f.mem, DATA, size);
+    // flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls.
+    put(&[
+        0x10_0000, 0, 0x200, 0x300, 17, 0x1000, 0x800, 0x400, 0, 0, 0,
+    ]);
+    assert_eq!(args(64), Ok([0x10_0011, 0x1800, 0x300, 0x200, 0x400, 0]));
+    assert_eq!(args(63), Err(Errno::EINVAL));
+    assert_eq!(args(4097), Err(Errno(7)));
+    assert_eq!(args(96), Ok([0x10_0011, 0x1800, 0x300, 0x200, 0x400, 0]));
+    f.mem.write(GuestAddr(DATA + 90), &[1]).unwrap();
+    assert_eq!(args(96), Err(Errno(7)));
+    for words in [
+        [0, 0, 0, 0, 0x100, 0, 0, 0],          // exit_signal above CSIGNAL
+        [0x40_0000, 0, 0, 0, 17, 0, 0, 0],     // CLONE_DETACHED
+        [0x11, 0, 0, 0, 0, 0, 0, 0],           // a CSIGNAL bit in the flags
+        [0x1_0000_0800, 0, 0, 0, 0, 0, 0, 0],  // SIGHAND with CLEAR_SIGHAND
+        [0x1_0900, 0, 0, 0, 17, 0, 0, 0],      // THREAD with an exit signal
+        [0, 0, 0, 0, 17, 0, 0x800, 0],         // a size without a stack
+        [0, 0, 0, 0, 17, 0x1000, 0, 0],        // a stack without a size
+        [0, 0, 0, 0, 65, 0, 0, 0],             // not a signal
+        [0x2_0000_0000, 0, 0, 0, 17, 0, 0, 0], // CLONE_INTO_CGROUP
+    ] {
+        put(&[&words[..], &[0, 0, 0]].concat());
+        assert_eq!(args(88), Err(Errno::EINVAL), "{words:x?}");
+    }
+    // set_tid and its size come together, and are not supported.
+    put(&[0, 0, 0, 0, 17, 0, 0, 0, 0, 1, 0]);
+    assert_eq!(args(88), Err(Errno::EINVAL));
+    put(&[0, 0, 0, 0, 17, 0, 0, 0, DATA, 1, 0]);
+    assert_eq!(args(88), Err(Errno::EINVAL));
+    assert_eq!(
+        crate::processes::clone3_args(&f.mem, 0x10, 64),
+        Err(Errno::EFAULT)
+    );
+}

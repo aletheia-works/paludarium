@@ -437,8 +437,8 @@ impl Kernel {
     fn syscall(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         self.sync_actions(thread);
         self.group.sync_timer(&mut thread.state);
-        let number = thread.cpu.gpr[reg::RAX];
-        let args = [
+        let mut number = thread.cpu.gpr[reg::RAX];
+        let mut args = [
             thread.cpu.gpr[reg::RDI],
             thread.cpu.gpr[reg::RSI],
             thread.cpu.gpr[reg::RDX],
@@ -446,6 +446,16 @@ impl Kernel {
             thread.cpu.gpr[reg::R8],
             thread.cpu.gpr[reg::R9],
         ];
+        // clone3 runs as the clone it describes.
+        if number == 435 {
+            match processes::clone3_args(mem, args[0], args[1]) {
+                Ok(legacy) => (number, args) = (56, legacy),
+                Err(error) => {
+                    thread.cpu.gpr[reg::RAX] = error.to_syscall_return();
+                    return Next::Resume;
+                }
+            }
+        }
         if let Some(next) = self.process_syscall(thread, mem, number, args) {
             return next;
         }

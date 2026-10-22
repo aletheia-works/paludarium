@@ -769,6 +769,65 @@ int main(int argc, char **argv) {
         pthread_join(thread, NULL);
         return 0;
     }
+    if (!strcmp(mode, "job-stop")) {
+        /* A child stops itself, then is stopped and continued by kill; waits
+           report each event once, and SIGCHLD follows unless SA_NOCLDSTOP.
+           The child polls its gate, so no blocking call of its is interrupted
+           by the stop. */
+        sigset_t chld;
+        sigemptyset(&chld);
+        sigaddset(&chld, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &chld, NULL);
+        int gate[2];
+        if (pipe2(gate, O_NONBLOCK)) return 81;
+        pid_t pid = child();
+        if (pid == 0) {
+            /* Not raise(): after a raw fork glibc's cached tid is the parent's. */
+            kill(getpid(), SIGSTOP);
+            char byte;
+            while (read(gate[0], &byte, 1) != 1) sched_yield();
+            _exit(7);
+        }
+        int status;
+        result("untraced", waitpid(pid, &status, WUNTRACED) == pid);
+        result("stopped", WIFSTOPPED(status));
+        result("stop-signal", WSTOPSIG(status));
+        sigset_t pending;
+        sigpending(&pending);
+        result("sigchld-stop", sigismember(&pending, SIGCHLD));
+        siginfo_t info;
+        result("sigchld", sigwaitinfo(&chld, &info));
+        memset(&info, 0x55, sizeof info);
+        result("consumed", waitid(P_PID, pid, &info, WSTOPPED | WNOHANG));
+        result("consumed-pid", info.si_pid);
+        result("not-untraced", waitpid(pid, &status, WNOHANG));
+        kill(pid, SIGCONT);
+        result("nowait", waitid(P_PID, pid, &info, WCONTINUED | WNOWAIT));
+        result("code", info.si_code);
+        result("status", info.si_status);
+        result("pid", info.si_pid == pid);
+        result("continued", waitpid(pid, &status, WCONTINUED) == pid);
+        result("ifcontinued", WIFCONTINUED(status));
+        result("raw", status);
+        result("sigchld-cont", sigwaitinfo(&chld, &info));
+        result("again", waitpid(pid, &status, WCONTINUED | WNOHANG));
+        /* A stop by kill, now with SA_NOCLDSTOP: no SIGCHLD for it. */
+        struct sigaction quiet = { .sa_handler = SIG_DFL, .sa_flags = SA_NOCLDSTOP };
+        sigaction(SIGCHLD, &quiet, NULL);
+        kill(pid, SIGTSTP);
+        result("waitid-stop", waitid(P_PID, pid, &info, WSTOPPED));
+        result("code", info.si_code);
+        result("status", info.si_status);
+        kill(pid, SIGCONT);
+        result("waitid-cont", waitid(P_ALL, 0, &info, WCONTINUED));
+        result("code", info.si_code);
+        sigpending(&pending);
+        result("sigchld-quiet", sigismember(&pending, SIGCHLD));
+        if (write(gate[1], "x", 1) != 1) return 82;
+        result("exited", waitpid(pid, &status, 0) == pid);
+        result("code", WEXITSTATUS(status));
+        return 0;
+    }
     if (!strcmp(mode, "clone3")) {
         signal(SIGUSR1, interrupted);
         signal(SIGUSR2, SIG_IGN);

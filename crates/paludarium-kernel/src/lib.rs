@@ -306,7 +306,9 @@ impl Kernel {
             }
             if signal.number == 19 || action.handler == 0 && matches!(signal.number, 20..=22) {
                 thread.state.stopped = true;
-                self.group.job_stop();
+                // A group stop is reported once, by the thread that starts it.
+                self.processes
+                    .job_stop(self.process.pid, &self.group, signal.number);
                 return Next::Stopped;
             }
             if action.handler == 0 || signal.number == 9 {

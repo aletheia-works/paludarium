@@ -235,6 +235,45 @@ mod process {
             Errno(10).to_syscall_return()
         );
     }
+    const EXITS: crate::processes::WaitFor = crate::processes::WaitFor {
+        keep: false,
+        exits: true,
+        stops: false,
+        continues: false,
+    };
+    #[test]
+    fn stop_and_continue_reports() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let pid = u64::from(ct.tid);
+        // The child stops itself; only WUNTRACED sees it, once.
+        syscall(&mut c, &mut ct, &cm, 62, [0, 19, 0, 0, 0, 0]);
+        assert!(c.group.is_stopped());
+        assert_eq!(syscall(&mut k, &mut t, &m, 61, [pid, DATA, 1, 0, 0, 0]), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [pid, DATA, 3, 0, 0, 0]),
+            pid
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA)).unwrap() as u32, 0x137f);
+        assert_eq!(syscall(&mut k, &mut t, &m, 61, [pid, DATA, 3, 0, 0, 0]), 0);
+        // SIGCONT records a continue: WNOWAIT leaves it, CLD_CONTINUED.
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 18, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 247, [1, pid, DATA, 0x0100_0009, 0, 0]),
+            0
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA + 8)).unwrap() as u32, 6);
+        assert_eq!(m.read_u64(GuestAddr(DATA + 24)).unwrap() as u32, 18);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [pid, DATA, 9, 0, 0, 0]),
+            pid
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA)).unwrap() as u32, 0xffff);
+        assert_eq!(syscall(&mut k, &mut t, &m, 61, [pid, DATA, 9, 0, 0, 0]), 0);
+        // A continue of a running child is no event.
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 18, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 61, [pid, DATA, 9, 0, 0, 0]), 0);
+    }
     #[test]
     fn racing_reapers() {
         let (mut k, mut t, m) = setup();
@@ -244,10 +283,8 @@ mod process {
         let ids = std::thread::scope(|scope| {
             let a = processes.clone();
             let b = processes.clone();
-            let first =
-                scope.spawn(move || a.reap(1, crate::processes::Wanted::Any, false, true, false));
-            let second =
-                scope.spawn(move || b.reap(1, crate::processes::Wanted::Any, false, true, false));
+            let first = scope.spawn(move || a.reap(1, crate::processes::Wanted::Any, EXITS));
+            let second = scope.spawn(move || b.reap(1, crate::processes::Wanted::Any, EXITS));
             [first.join().unwrap(), second.join().unwrap()]
         });
         assert_eq!(

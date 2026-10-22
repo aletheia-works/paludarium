@@ -362,6 +362,25 @@ fn signal_registration_is_recorded_but_not_delivered() {
         f.ret(nr::RT_SIGPROCMASK, &[7, DATA, 0, 8]),
         errno(Errno::EINVAL)
     );
+    // rt_sigpending: only blocked signals are pending, from either queue.
+    f.mem.write_u64(GuestAddr(DATA), 1 << 9 | 1 << 16).unwrap();
+    assert_eq!(f.ret(nr::RT_SIGPROCMASK, &[0, DATA, 0, 8]), 0);
+    let pid = u64::from(f.thread.state.pid);
+    assert_eq!(f.ret(62, &[pid, 17]), 0);
+    assert_eq!(f.ret(nr::TKILL, &[u64::from(f.thread.tid), 10]), 0);
+    assert_eq!(f.ret(nr::RT_SIGPENDING, &[DATA + 8, 8]), 0);
+    assert_eq!(
+        f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(),
+        1 << 9 | 1 << 16
+    );
+    f.mem.write_u64(GuestAddr(DATA + 8), u64::MAX).unwrap();
+    assert_eq!(f.ret(nr::RT_SIGPENDING, &[DATA + 8, 1]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), u64::MAX << 8);
+    assert_eq!(
+        f.ret(nr::RT_SIGPENDING, &[DATA + 8, 9]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(nr::RT_SIGPENDING, &[0x1000, 8]), errno(Errno::EFAULT));
 }
 
 #[test]

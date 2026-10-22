@@ -250,8 +250,22 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = inbox;
     }
-    pub(crate) fn job_stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+    /// Whether a child's stop or continue sends this process SIGCHLD: not
+    /// when it ignores SIGCHLD or set SA_NOCLDSTOP, as in Linux's
+    /// `do_notify_parent_cldstop`.
+    pub(crate) fn wants_stop_notices(&self) -> bool {
+        self.actions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&17)
+            .is_none_or(|action| action.handler != 1 && action.flags & 1 == 0)
+    }
+    /// Starts a group stop; false when the group was already stopped.
+    pub(crate) fn job_stop(&self) -> bool {
+        !self.stopped.swap(true, Ordering::SeqCst)
     }
     pub(crate) fn job_continue(&self) {
         self.stopped.store(false, Ordering::SeqCst);
@@ -290,6 +304,21 @@ impl ThreadGroup {
             .drain_process(&mut pending);
         let index = signals::lowest_in(&pending.pending, set)?;
         Some(pending.pending.remove(index))
+    }
+    /// The process-directed signals waiting here, as a signal set.
+    pub(crate) fn process_pending_set(&self) -> u64 {
+        let mut pending = self
+            .process_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.process_inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain_process(&mut pending);
+        pending
+            .pending
+            .iter()
+            .fold(0, |set, signal| set | 1 << (signal.number - 1))
     }
     pub(crate) fn set_action(&self, n: i32, a: SignalAction) {
         self.actions

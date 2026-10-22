@@ -34,7 +34,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage` |
-| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait` |
+| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigpending` |
 | Time | `clock_gettime`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
@@ -126,8 +126,10 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   kept the same way, and `wait4` and `waitid` can wait for one.
 - `waitid` follows Linux's checks and copy-out: its siginfo fields are zero
   when no child is reported, even on an error, and an exited child cannot be
-  waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). Stopped and
-  continued children are never reported. A pidfd from `pidfd_open` becomes
+  waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). A stop and a
+  continue are reported once each to a wait with `WUNTRACED` (`WSTOPPED`) or
+  `WCONTINUED` (`WNOWAIT` leaves them), and `SIGCHLD` tells the parent unless
+  it set `SA_NOCLDSTOP`. A pidfd from `pidfd_open` becomes
   readable when its process exits (and hung up once it is reaped), so `epoll`
   can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives `EAGAIN`.
   `pidfd_send_signal` takes no siginfo and no scope flags, and `PIDFD_THREAD`

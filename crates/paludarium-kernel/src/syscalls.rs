@@ -59,6 +59,7 @@ pub mod nr {
     pub const TIMER_GETOVERRUN: u64 = 225;
     pub const TIMER_DELETE: u64 = 226;
     pub const RT_SIGTIMEDWAIT: u64 = 128;
+    pub const RT_SIGPENDING: u64 = 127;
 }
 
 pub(crate) struct Context<'a> {
@@ -91,7 +92,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 43] = [
+        let entries: [(u64, Handler); 44] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -135,6 +136,7 @@ impl SyscallTable {
             (nr::TIMER_GETOVERRUN, sys_timer_getoverrun),
             (nr::TIMER_DELETE, sys_timer_delete),
             (nr::RT_SIGTIMEDWAIT, sys_rt_sigtimedwait),
+            (nr::RT_SIGPENDING, sys_rt_sigpending),
         ];
         let mut handlers: BTreeMap<u64, Handler> = entries.into_iter().collect();
         for number in crate::files::NUMBERS {
@@ -1120,6 +1122,29 @@ fn sys_rt_sigaction(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     ok(0)
 }
 
+/// The blocked signals waiting for this thread or its process. As in Linux,
+/// a set smaller than eight bytes gets its first bytes.
+fn sys_rt_sigpending(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    if a[1] > SIGSET_SIZE {
+        return err(Errno::EINVAL);
+    }
+    c.inbox.drain(c.process);
+    let pending = c
+        .process
+        .pending
+        .iter()
+        .fold(c.group.process_pending_set(), |set, signal| {
+            set | 1 << (signal.number - 1)
+        })
+        & c.process.signal_mask;
+    match c
+        .mem
+        .write(GuestAddr(a[0]), &pending.to_le_bytes()[..a[1] as usize])
+    {
+        Ok(()) => ok(0),
+        Err(_) => err(Errno::EFAULT),
+    }
+}
 fn sys_rt_sigprocmask(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (how, set, oldset, size) = (a[0], a[1], a[2], a[3]);
     if size != SIGSET_SIZE {

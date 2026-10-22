@@ -28,6 +28,9 @@ struct Entry {
     /// PR_SET_DUMPABLE and PR_SET_NO_NEW_PRIVS, recorded for PR_GET_*.
     dumpable: bool,
     no_new_privs: bool,
+    /// A stop by this signal, and a continue, not yet reported to a wait.
+    stop_report: Option<i32>,
+    continue_report: bool,
 }
 
 /// RLIMIT_CPU ... RLIMIT_RTTIME.
@@ -74,6 +77,8 @@ impl Processes {
                     death_signal: 0,
                     dumpable: true,
                     no_new_privs: false,
+                    stop_report: None,
+                    continue_report: false,
                 },
             )])),
         }
@@ -103,6 +108,8 @@ impl Processes {
                 death_signal: 0,
                 dumpable,
                 no_new_privs,
+                stop_report: None,
+                continue_report: false,
             },
         );
     }
@@ -243,18 +250,18 @@ impl Processes {
             entry.group.stop(status);
         }
     }
-    /// The first exited child of `parent` that `wanted` selects, removed
-    /// unless `keep` (WNOWAIT). Without `exits` (WEXITED) none is reported.
-    /// `ECHILD` when no child can be waited for: as Linux's `do_wait` has
-    /// it, an exited child counts only with WEXITED or WCONTINUED.
+    /// The first child of `parent`, in PID order, that `wanted` selects and
+    /// that has an event `wait` asks for, as Linux's `do_wait` looks: an
+    /// exit (removing the child), else an unreported stop, else an
+    /// unreported continue. With `keep` (WNOWAIT) nothing is consumed.
+    /// `ECHILD` when no child can be waited for: as in `do_wait`, an exited
+    /// child counts only with WEXITED or WCONTINUED.
     pub(crate) fn reap(
         &self,
         parent: u32,
         wanted: Wanted,
-        keep: bool,
-        exits: bool,
-        continued: bool,
-    ) -> Result<Option<(u32, ExitStatus)>, Errno> {
+        wait: WaitFor,
+    ) -> Result<Option<(u32, ChildEvent)>, Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let matching = |pid: u32, entry: &Entry| {
             entry.parent == parent
@@ -265,25 +272,64 @@ impl Processes {
                 }
         };
         if !entries.iter().any(|(&pid, entry)| {
-            matching(pid, entry) && (entry.status.is_none() || exits || continued)
+            matching(pid, entry) && (entry.status.is_none() || wait.exits || wait.continues)
         }) {
             return Err(Errno(10));
         }
-        if !exits {
-            return Ok(None);
-        }
         let ready = entries.iter().find_map(|(&pid, entry)| {
-            (matching(pid, entry))
-                .then_some(entry.status)
-                .flatten()
-                .map(|status| (pid, status))
+            if !matching(pid, entry) {
+                return None;
+            }
+            match entry.status {
+                Some(status) => wait.exits.then_some((pid, ChildEvent::Exited(status))),
+                None => match entry.stop_report {
+                    Some(signal) if wait.stops => Some((pid, ChildEvent::Stopped(signal))),
+                    _ => (wait.continues && entry.continue_report)
+                        .then_some((pid, ChildEvent::Continued)),
+                },
+            }
         });
-        if let Some((pid, _)) = ready
-            && !keep
+        if let Some((pid, event)) = ready
+            && !wait.keep
         {
-            entries.remove(&pid);
+            match event {
+                ChildEvent::Exited(_) => {
+                    entries.remove(&pid);
+                }
+                ChildEvent::Stopped(_) => {
+                    if let Some(entry) = entries.get_mut(&pid) {
+                        entry.stop_report = None;
+                    }
+                }
+                ChildEvent::Continued => {
+                    if let Some(entry) = entries.get_mut(&pid) {
+                        entry.continue_report = false;
+                    }
+                }
+            }
         }
         Ok(ready)
+    }
+    /// Stops `group` (process `pid`) on `signal`. A new group stop is
+    /// recorded for the parent's wait, and the parent gets SIGCHLD unless it
+    /// ignores it or asked for SA_NOCLDSTOP. Under the table's lock, so a
+    /// SIGCONT from [`Self::signal`] comes wholly before or after it.
+    pub(crate) fn job_stop(&self, pid: u32, group: &ThreadGroup, signal: i32) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if !group.job_stop() {
+            return;
+        }
+        let Some(entry) = entries.get_mut(&pid) else {
+            return;
+        };
+        entry.stop_report = Some(signal);
+        entry.continue_report = false;
+        let parent = entry.parent;
+        if let Some(parent) = entries.get(&parent)
+            && parent.group.wants_stop_notices()
+        {
+            parent.group.notify_child();
+        }
     }
     /// Whether `pid` has exited: `None` once it is reaped (or never was).
     fn exited(&self, pid: u32) -> Option<bool> {
@@ -303,14 +349,44 @@ impl Processes {
         }
     }
     fn signal(&self, pid: u32, number: i32) -> Result<(), Errno> {
-        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = entries.get(&pid).ok_or(Errno(3))?;
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
         if number == 0 {
-            Ok(())
-        } else {
-            entry.group.send_process(number)
+            return Ok(());
         }
+        // SIGCONT resumes a stopped process at once, as Linux's
+        // prepare_signal does, and its parent's wait can see that.
+        if number == 18 && entry.status.is_none() && entry.group.is_stopped() {
+            entry.group.send_process(number)?;
+            entry.group.job_continue();
+            entry.stop_report = None;
+            entry.continue_report = true;
+            let parent = entry.parent;
+            if let Some(parent) = entries.get(&parent)
+                && parent.group.wants_stop_notices()
+            {
+                parent.group.notify_child();
+            }
+            return Ok(());
+        }
+        entry.group.send_process(number)
     }
+}
+
+/// What a wait reports, and whether it consumes it (see [`Processes::reap`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WaitFor {
+    pub keep: bool,
+    pub exits: bool,
+    pub stops: bool,
+    pub continues: bool,
+}
+/// A child's event a wait reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildEvent {
+    Exited(ExitStatus),
+    Stopped(i32),
+    Continued,
 }
 
 /// Which children a wait looks at.
@@ -706,16 +782,20 @@ impl Kernel {
             pgid if pgid < 0 => Wanted::Pgid(pgid.unsigned_abs()),
             pid => Wanted::Pid(pid as u32),
         };
+        let wait = WaitFor {
+            exits: true,
+            stops: a[2] & 2 != 0,
+            continues: a[2] & 8 != 0,
+            ..WaitFor::default()
+        };
         loop {
-            let continued = a[2] & 8 != 0;
-            if let Some((pid, status)) =
-                self.processes
-                    .reap(self.process.pid, wanted, false, true, continued)?
-            {
-                let raw = match status {
-                    ExitStatus::Exited(code) => (code & 255) << 8,
-                    ExitStatus::Signaled(signal) => signal & 127,
-                    _ => return Err(Errno::EINVAL),
+            if let Some((pid, event)) = self.processes.reap(self.process.pid, wanted, wait)? {
+                let raw = match event {
+                    ChildEvent::Exited(ExitStatus::Exited(code)) => (code & 255) << 8,
+                    ChildEvent::Exited(ExitStatus::Signaled(signal)) => signal & 127,
+                    ChildEvent::Exited(_) => return Err(Errno::EINVAL),
+                    ChildEvent::Stopped(signal) => (signal << 8) | 0x7f,
+                    ChildEvent::Continued => 0xffff,
                 };
                 // Native wait-fault oracle: Linux consumes the zombie before copyout.
                 if a[1] != 0 {
@@ -751,7 +831,7 @@ impl Kernel {
     /// copy-out: the siginfo fields (`si_signo`, `si_errno`, `si_code`,
     /// `si_pid`, `si_uid`, `si_status`) are written, as zeros when no child
     /// is reported, even on an error; the rusage (all zero here) only with a
-    /// child. Stopped and continued children are never reported.
+    /// child.
     fn waitid(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         let found = self.waitid_child(thread, a);
         if let Ok(Some(_)) = found
@@ -762,8 +842,15 @@ impl Kernel {
         }
         if a[2] != 0 {
             let (signo, code, pid, status) = match found {
-                Ok(Some((pid, ExitStatus::Exited(code)))) => (17, 1, pid, code & 255),
-                Ok(Some((pid, ExitStatus::Signaled(signal)))) => (17, 2, pid, signal),
+                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Exited(code))))) => {
+                    (17, 1, pid, code & 255)
+                }
+                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Signaled(signal))))) => {
+                    (17, 2, pid, signal)
+                }
+                // CLD_STOPPED and CLD_CONTINUED.
+                Ok(Some((pid, ChildEvent::Stopped(signal)))) => (17, 5, pid, signal),
+                Ok(Some((pid, ChildEvent::Continued))) => (17, 6, pid, 18),
                 _ => (0, 0, 0, 0),
             };
             let mut info = [0; 28];
@@ -779,7 +866,7 @@ impl Kernel {
         &self,
         thread: &mut Thread,
         a: [u64; 6],
-    ) -> Result<Option<(u32, ExitStatus)>, Errno> {
+    ) -> Result<Option<(u32, ChildEvent)>, Errno> {
         const KNOWN: u64 =
             WNOHANG | 2 | WEXITED | 8 | WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
         let options = u64::from(a[3] as u32);
@@ -807,13 +894,15 @@ impl Kernel {
             _ => return Err(Errno::EINVAL),
         };
         loop {
-            // Only exits are reported, so without WEXITED nothing is ready.
             let found = self.processes.reap(
                 self.process.pid,
                 wanted,
-                options & WNOWAIT != 0,
-                options & WEXITED != 0,
-                options & 8 != 0,
+                WaitFor {
+                    keep: options & WNOWAIT != 0,
+                    exits: options & WEXITED != 0,
+                    stops: options & 2 != 0,
+                    continues: options & 8 != 0,
+                },
             )?;
             if found.is_some() || options & WNOHANG != 0 {
                 return Ok(found);

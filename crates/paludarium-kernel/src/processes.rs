@@ -17,7 +17,38 @@ struct Entry {
     parent: u32,
     group: Arc<ThreadGroup>,
     status: Option<ExitStatus>,
+    /// Process group ID; inherited on fork and kept across exec.
+    pgid: u32,
+    /// Resource limits (soft, hard), inherited on fork and kept across exec.
+    /// They are recorded and reported, not enforced.
+    limits: [(u64, u64); RLIMITS],
 }
+
+/// RLIMIT_CPU ... RLIMIT_RTTIME.
+pub(crate) const RLIMITS: usize = 16;
+const INFINITY: u64 = u64::MAX;
+/// The limits a fresh Linux process gets from the kernel, with NPROC and
+/// SIGPENDING (which Linux sizes from memory) fixed at 4096.
+const DEFAULT_LIMITS: [(u64, u64); RLIMITS] = [
+    (INFINITY, INFINITY), // CPU
+    (INFINITY, INFINITY), // FSIZE
+    (INFINITY, INFINITY), // DATA
+    (8 << 20, INFINITY),  // STACK
+    (0, INFINITY),        // CORE
+    (INFINITY, INFINITY), // RSS
+    (4096, 4096),         // NPROC
+    (1024, 4096),         // NOFILE
+    (8 << 20, 8 << 20),   // MEMLOCK
+    (INFINITY, INFINITY), // AS
+    (INFINITY, INFINITY), // LOCKS
+    (4096, 4096),         // SIGPENDING
+    (819_200, 819_200),   // MSGQUEUE
+    (0, 0),               // NICE
+    (0, 0),               // RTPRIO
+    (INFINITY, INFINITY), // RTTIME
+];
+/// fs.nr_open: the highest RLIMIT_NOFILE Linux accepts by default.
+const NR_OPEN: u64 = 1 << 20;
 pub struct Processes {
     next: AtomicU32,
     entries: Mutex<BTreeMap<u32, Entry>>,
@@ -32,6 +63,8 @@ impl Processes {
                     parent: 0,
                     group,
                     status: None,
+                    pgid: 1,
+                    limits: DEFAULT_LIMITS,
                 },
             )])),
         }
@@ -44,17 +77,65 @@ impl Processes {
             .map_err(|_| Errno::EAGAIN)
     }
     pub(crate) fn insert(&self, pid: u32, parent: u32, group: Arc<ThreadGroup>) {
-        self.entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                pid,
-                Entry {
-                    parent,
-                    group,
-                    status: None,
-                },
-            );
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let (pgid, limits) = entries
+            .get(&parent)
+            .map_or((pid, DEFAULT_LIMITS), |p| (p.pgid, p.limits));
+        entries.insert(
+            pid,
+            Entry {
+                parent,
+                group,
+                status: None,
+                pgid,
+                limits,
+            },
+        );
+    }
+    fn pgid(&self, pid: u32) -> Result<u32, Errno> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.get(&pid).map(|e| e.pgid).ok_or(Errno(3))
+    }
+    /// `setpgid` from `caller`: the target is the caller or one of its
+    /// children, and a new group either is the target's own or already exists.
+    fn set_pgid(&self, caller: u32, pid: u32, pgid: u32) -> Result<(), Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let target = entries.get(&pid).ok_or(Errno(3))?;
+        if pid != caller && target.parent != caller {
+            return Err(Errno(3)); // ESRCH
+        }
+        if pgid != pid
+            && !entries
+                .values()
+                .any(|e| e.status.is_none() && e.pgid == pgid)
+        {
+            return Err(Errno::EPERM);
+        }
+        if let Some(entry) = entries.get_mut(&pid) {
+            entry.pgid = pgid;
+        }
+        Ok(())
+    }
+    /// `prlimit64`: returns the old limit, after setting `new` if given.
+    fn limit(
+        &self,
+        pid: u32,
+        resource: usize,
+        new: Option<(u64, u64)>,
+    ) -> Result<(u64, u64), Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
+        let old = *entry.limits.get(resource).ok_or(Errno::EINVAL)?;
+        if let Some((soft, hard)) = new {
+            if soft > hard {
+                return Err(Errno::EINVAL);
+            }
+            if resource == 7 && hard > NR_OPEN {
+                return Err(Errno::EPERM);
+            }
+            entry.limits[resource] = (soft, hard);
+        }
+        Ok(old)
     }
     fn parent(&self, pid: u32) -> u32 {
         self.entries
@@ -203,6 +284,17 @@ impl Kernel {
             },
             61 => self.wait4(thread, mem, a),
             110 => Ok(u64::from(self.processes.parent(self.process.pid))),
+            // setpgid, getpgid, getpgrp
+            109 => self.setpgid(a),
+            121 => self
+                .target_pid(a[0])
+                .and_then(|pid| self.processes.pgid(pid))
+                .map(u64::from),
+            111 => self.processes.pgid(self.process.pid).map(u64::from),
+            // prlimit64, getrlimit, setrlimit
+            302 => self.prlimit(mem, a[0], a[1], a[2], a[3]),
+            97 => self.prlimit(mem, 0, a[0], 0, a[1]),
+            160 => self.prlimit(mem, 0, a[0], a[1], 0),
             62 => {
                 if a[1] > 64 {
                     Err(Errno::EINVAL)
@@ -237,6 +329,55 @@ impl Kernel {
             thread.cpu.gpr[reg::RAX] = n;
         }
         Some(self.checkpoint(thread, mem))
+    }
+    /// A pid argument: 0 is the caller; anything that is not a pid is ESRCH.
+    fn target_pid(&self, value: u64) -> Result<u32, Errno> {
+        match value as u32 as i32 {
+            0 => Ok(self.process.pid),
+            pid if pid > 0 => Ok(pid as u32),
+            _ => Err(Errno(3)),
+        }
+    }
+    fn setpgid(&self, a: [u64; 6]) -> Result<u64, Errno> {
+        let pgid = a[1] as u32 as i32;
+        if pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pid = self.target_pid(a[0])?;
+        let pgid = if pgid == 0 { pid } else { pgid as u32 };
+        self.processes
+            .set_pgid(self.process.pid, pid, pgid)
+            .map(|()| 0)
+    }
+    fn prlimit(
+        &self,
+        mem: &AddressSpace,
+        pid: u64,
+        resource: u64,
+        new: u64,
+        old: u64,
+    ) -> Result<u64, Errno> {
+        // Linux's order: read the new limit, find the process, check and set
+        // the limit, and only then write the old one out.
+        let new = if new == 0 {
+            None
+        } else {
+            let soft = mem.read_u64(GuestAddr(new)).map_err(|_| Errno::EFAULT)?;
+            let hard = mem
+                .read_u64(GuestAddr(new + 8))
+                .map_err(|_| Errno::EFAULT)?;
+            Some((soft, hard))
+        };
+        let pid = self.target_pid(pid)?;
+        let resource = usize::try_from(resource as u32).map_err(|_| Errno::EINVAL)?;
+        let (soft, hard) = self.processes.limit(pid, resource, new)?;
+        if old != 0 {
+            mem.write_u64(GuestAddr(old), soft)
+                .map_err(|_| Errno::EFAULT)?;
+            mem.write_u64(GuestAddr(old + 8), hard)
+                .map_err(|_| Errno::EFAULT)?;
+        }
+        Ok(0)
     }
     fn return_process_error(&self, thread: &mut Thread, error: Errno) -> Next {
         thread.cpu.gpr[reg::RAX] = error.to_syscall_return();

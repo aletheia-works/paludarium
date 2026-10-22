@@ -27,12 +27,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | 主なシステムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity` |
+| プロセスとスレッド | `clone`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit` |
 | メモリ | `mmap`（anonymous）、`munmap`、`mprotect`、`madvise`、`brk`、`arch_prctl` |
-| システムの情報 | `uname`、`getuid`、`geteuid`、`getgid`、`getegid` |
+| システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer` |
 | 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep` |
-| ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64` |
+| ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2` |
 | 入出力 | `poll`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
 | イベント | `eventfd2`、`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socketpair`（AF_UNIX）、`sendto`、`recvfrom`、`shutdown` |
@@ -57,6 +57,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   umask は、Linux で `CLONE_FS` が共有するのと同じく、スレッドの間で共有します。
   `fsync` と `fdatasync` はファイルとディレクトリでは成功し、パイプ・ソケット・端末では
   `EINVAL` を返します。`fadvise64` はヒントとして受け付けます。
+- `access` は root として、読み書きはいつも許し、実行は実行のビットがあるか
+  ディレクトリのときに許します。`getgroups` はグループを返しません。
+- `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
+  見せません。起動からの時間は単調時計の値です。
+- 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
+  8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ただし
+  paludarium はその上限を守らせません。プロセスグループも同じように持ちますが、
+  プロセスグループを選ぶ `wait` はまだありません。
 - 不正なポインタを渡されたときは `EFAULT` を返します。
 
 ## スレッドとプロセス

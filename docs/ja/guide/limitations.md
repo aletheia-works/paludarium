@@ -6,8 +6,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 
 - **動的リンクのプログラム**：静的にリンクしたプログラムだけを動かせます。
 - **32-bit の x86、AVX、AVX-512、x87、MMX**：対象外です。
-- **ネットワーク**：`socket()` はいつも `EAFNOSUPPORT` を返します。AF_UNIX の
-  `socketpair` だけを使えます。
+- **ネットワーク**：`socket()` はいつも `EAFNOSUPPORT` を返します。使えるのは、
+  AF_UNIX で `SOCK_STREAM` の `socketpair` だけです。Rust の `std::process::Command`
+  は、`posix_spawn` を使えないとき（たとえば `pre_exec` を使うとき）に
+  `SOCK_SEQPACKET` の組を使うので、そうした起動は `ESOCKTNOSUPPORT` で失敗します。
 - **一部のシステムコール**：`clone3`、`timerfd`、ファイルを元にした `mmap`、
   別のプロセスとの `CLONE_SIGHAND`、停止と再開の `wait` の通知、
   プロセスグループを選ぶ `wait` などは、まだありません。実装していないシステムコールは

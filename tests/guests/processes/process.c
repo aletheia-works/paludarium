@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/sysinfo.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
@@ -148,6 +149,127 @@ int main(int argc, char **argv) {
         result("egid", getegid() == getgid());
         close(fd);
         unlink(path);
+        return 0;
+    }
+    if (!strcmp(mode, "access")) {
+        /* The native side is an ordinary user and the emulated one root:
+           only results both give are compared (no write without permission). */
+        const char *path = "/tmp/paludarium-processes-access";
+        unlink(path);
+        int fd = open(path, O_CREAT|O_RDWR, 0644);
+        result("exists", access(path, F_OK));
+        result("read-write", access(path, R_OK|W_OK));
+        errno = 0;
+        result("execute", access(path, X_OK));
+        result("errno", errno);
+        chmod(path, 0755);
+        result("executable", access(path, X_OK));
+        result("directory", faccessat(AT_FDCWD, "/tmp", X_OK, 0));
+        result("empty-path", syscall(439, fd, "", R_OK, AT_EMPTY_PATH));
+        errno = 0;
+        result("missing", access("/tmp/paludarium-processes-missing", F_OK));
+        result("errno", errno);
+        errno = 0;
+        result("bad-mode", syscall(SYS_access, path, 8));
+        result("errno", errno);
+        errno = 0;
+        result("bad-flags", syscall(439, AT_FDCWD, path, F_OK, 0x400));
+        result("errno", errno);
+        close(fd);
+        unlink(path);
+        return 0;
+    }
+    if (!strcmp(mode, "rlimit")) {
+        struct rlimit limit, old;
+        getrlimit(RLIMIT_NOFILE, &limit);
+        rlim_t hard = limit.rlim_max;
+        limit.rlim_cur = 256;
+        result("set", setrlimit(RLIMIT_NOFILE, &limit));
+        getrlimit(RLIMIT_NOFILE, &old);
+        result("soft", old.rlim_cur);
+        result("hard-kept", old.rlim_max == hard);
+        result("prlimit", syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, NULL, &old));
+        result("prlimit-soft", old.rlim_cur);
+        pid_t pid = child();
+        if (pid == 0) {
+            struct rlimit inherited;
+            getrlimit(RLIMIT_NOFILE, &inherited);
+            _exit(inherited.rlim_cur == 256 ? 0 : 1);
+        }
+        finish(pid);
+        limit.rlim_cur = hard;
+        limit.rlim_max = 1;
+        errno = 0;
+        result("soft-above-hard", setrlimit(RLIMIT_NOFILE, &limit));
+        result("errno", errno);
+        errno = 0;
+        result("bad-resource", syscall(SYS_prlimit64, 0, 99, NULL, &old));
+        result("errno", errno);
+        errno = 0;
+        result("missing", syscall(SYS_prlimit64, 0x3fffffff, RLIMIT_NOFILE, NULL, &old));
+        result("errno", errno);
+        errno = 0;
+        result("bad-new", syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, (void *)1, &old));
+        result("errno", errno);
+        /* The new limit is set before the old one is written out. */
+        limit.rlim_cur = 128;
+        limit.rlim_max = hard;
+        errno = 0;
+        result("bad-old", syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &limit, (void *)1));
+        result("errno", errno);
+        getrlimit(RLIMIT_NOFILE, &old);
+        result("applied", old.rlim_cur);
+        return 0;
+    }
+    if (!strcmp(mode, "pgid")) {
+        result("same", getpgrp() == getpgid(0));
+        result("own", setpgid(0, 0));
+        result("leader", getpgrp() == getpid());
+        int ready[2], go[2];
+        if (pipe(ready) || pipe(go)) return 81;
+        pid_t pid = child();
+        if (pid == 0) {
+            char byte;
+            int inherited = getpgid(0) == getppid();
+            if (write(ready[1], &byte, 1) != 1) _exit(85);
+            if (read(go[0], &byte, 1) != 1) _exit(86);
+            _exit(inherited && getpgid(0) == getpid() ? 0 : 1);
+        }
+        char byte;
+        if (read(ready[0], &byte, 1) != 1) return 82;
+        result("child-inherits", getpgid(pid) == getpid());
+        result("child-own", setpgid(pid, pid));
+        result("child-moved", getpgid(pid) == pid);
+        errno = 0;
+        result("no-group", setpgid(pid, 0x3ffffff0));
+        result("errno", errno);
+        if (write(go[1], &byte, 1) != 1) return 83;
+        finish(pid);
+        errno = 0;
+        result("no-process", setpgid(0x3fffffff, 0));
+        result("errno", errno);
+        errno = 0;
+        result("negative", setpgid(0, -1));
+        result("errno", errno);
+        errno = 0;
+        result("getpgid-missing", getpgid(0x3fffffff));
+        result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "sysinfo")) {
+        struct sysinfo info;
+        result("sysinfo", sysinfo(&info));
+        result("unit", info.mem_unit >= 1);
+        result("ram", info.totalram > 0 && info.freeram <= info.totalram);
+        result("procs", info.procs >= 1);
+        errno = 0;
+        result("fault", syscall(SYS_sysinfo, (void *)1));
+        result("errno", errno);
+        result("yield", sched_yield());
+        result("groups", getgroups(0, NULL) >= 0);
+        errno = 0;
+        result("negative-groups", syscall(SYS_getgroups, -1, NULL));
+        result("errno", errno);
         return 0;
     }
     if (!strcmp(mode, "no-child")) {

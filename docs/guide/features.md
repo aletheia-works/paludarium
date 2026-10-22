@@ -31,12 +31,12 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 
 | Group | Main system calls |
 |---|---|
-| Processes and threads | `clone`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity` |
+| Processes and threads | `clone`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit` |
 | Memory | `mmap` (anonymous), `munmap`, `mprotect`, `madvise`, `brk`, `arch_prctl` |
-| System information | `uname`, `getuid`, `geteuid`, `getgid`, `getegid` |
+| System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer` |
 | Time | `clock_gettime`, `nanosleep`, `clock_nanosleep` |
-| Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64` |
+| Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2` |
 | I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socketpair` (AF_UNIX), `sendto`, `recvfrom`, `shutdown` |
@@ -62,6 +62,14 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   file in a mounted directory. The umask is shared by threads, as `CLONE_FS` shares it on
   Linux. `fsync` and `fdatasync` succeed on files and directories and give
   `EINVAL` on pipes, sockets and terminals; `fadvise64` is accepted as a hint.
+- As root, `access` allows reading and writing, and executing when the file
+  has an execute bit or is a directory; `getgroups` returns no groups.
+- `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
+  revealing the host's; the uptime is the monotonic clock's.
+- Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
+  `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
+  read and changed, but paludarium does not enforce them. Process groups are
+  kept the same way; `wait` cannot select by process group yet.
 - Invalid pointers return `EFAULT`.
 
 ## Threads and processes

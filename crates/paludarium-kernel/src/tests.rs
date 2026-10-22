@@ -591,6 +591,83 @@ fn fsync_sync_and_fadvise_check_the_descriptor() {
     assert_eq!(f.ret(221, &[99, 0, 0, 0]), errno(Errno::EBADF));
 }
 #[test]
+fn access_grants_root_reading_and_writing_but_execution_needs_a_bit() {
+    let mut f = fixture();
+    let cwd = (-100i64) as u64;
+    f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x10), b"/tmp\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x20), b"\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x30), b"/none\0").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(21, &[DATA, 0]), 0);
+    assert_eq!(f.ret(21, &[DATA, 6]), 0);
+    assert_eq!(f.ret(21, &[DATA, 1]), errno(Errno(13)));
+    assert_eq!(f.ret(90, &[DATA, 0o700]), 0);
+    assert_eq!(f.ret(21, &[DATA, 7]), 0);
+    assert_eq!(f.ret(269, &[cwd, DATA + 0x10, 1]), 0);
+    assert_eq!(f.ret(439, &[fd, DATA + 0x20, 4, 0x1000]), 0);
+    assert_eq!(f.ret(21, &[DATA + 0x30, 0]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(21, &[DATA, 8]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(439, &[cwd, DATA, 0, 0x400]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(21, &[0, 0]), errno(Errno::EFAULT));
+}
+#[test]
+fn sysinfo_getgroups_and_sched_yield() {
+    let mut f = fixture();
+    assert_eq!(f.ret(nr::SYSINFO, &[DATA]), 0);
+    let mut info = [0u8; 112];
+    f.mem.read(GuestAddr(DATA), &mut info).unwrap();
+    let word = |i: usize| u64::from_le_bytes(info[i..i + 8].try_into().unwrap());
+    assert_eq!((word(32), word(40)), (4 << 30, 4 << 30)); // totalram, freeram
+    assert_eq!(u32::from_le_bytes(info[104..108].try_into().unwrap()), 1);
+    assert!(u16::from_le_bytes([info[80], info[81]]) >= 1);
+    assert_eq!(f.ret(nr::SYSINFO, &[1]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(nr::GETGROUPS, &[0, 0]), 0);
+    assert_eq!(f.ret(nr::GETGROUPS, &[u64::MAX, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(nr::SCHED_YIELD, &[]), 0);
+}
+#[test]
+fn resource_limits_are_recorded_in_linux_order() {
+    let mut f = fixture();
+    let (new, old) = (DATA, DATA + 0x10);
+    assert_eq!(f.ret(97, &[7, old]), 0); // getrlimit(NOFILE)
+    assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 1024);
+    assert_eq!(f.mem.read_u64(GuestAddr(old + 8)).unwrap(), 4096);
+    f.mem.write_u64(GuestAddr(new), 256).unwrap();
+    f.mem.write_u64(GuestAddr(new + 8), 4096).unwrap();
+    assert_eq!(f.ret(160, &[7, new]), 0); // setrlimit
+    assert_eq!(f.ret(302, &[0, 7, 0, old]), 0); // prlimit64
+    assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 256);
+    // The limit is set before a bad output buffer is reported.
+    f.mem.write_u64(GuestAddr(new), 128).unwrap();
+    assert_eq!(f.ret(302, &[0, 7, new, 1]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(97, &[7, old]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 128);
+    f.mem.write_u64(GuestAddr(new), 5000).unwrap();
+    assert_eq!(f.ret(160, &[7, new]), errno(Errno::EINVAL)); // soft > hard
+    f.mem.write_u64(GuestAddr(new + 8), 1 << 21).unwrap();
+    assert_eq!(f.ret(160, &[7, new]), errno(Errno::EPERM)); // above nr_open
+    assert_eq!(f.ret(97, &[16, old]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(302, &[99, 7, 0, old]), errno(Errno(3)));
+    assert_eq!(f.ret(302, &[0, 7, 1, old]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(97, &[3, old]), 0); // STACK: 8 MiB, unlimited
+    assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 8 << 20);
+    assert_eq!(f.mem.read_u64(GuestAddr(old + 8)).unwrap(), u64::MAX);
+}
+#[test]
+fn process_groups_start_at_the_first_process() {
+    let mut f = fixture();
+    assert_eq!(f.ret(111, &[]), 1); // getpgrp
+    assert_eq!(f.ret(121, &[0]), 1); // getpgid
+    assert_eq!(f.ret(109, &[0, 0]), 0); // setpgid
+    assert_eq!(f.ret(109, &[1, 1]), 0);
+    assert_eq!(f.ret(109, &[0, 77]), errno(Errno::EPERM));
+    assert_eq!(f.ret(109, &[0, u64::MAX]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(109, &[99, 0]), errno(Errno(3)));
+    assert_eq!(f.ret(121, &[99]), errno(Errno(3)));
+    assert_eq!(f.ret(121, &[u64::MAX]), errno(Errno(3)));
+}
+#[test]
 fn syscall_bad_path() {
     let mut f = fixture();
     assert_eq!(f.ret(2, &[1, 0, 0]), errno(Errno::EFAULT));

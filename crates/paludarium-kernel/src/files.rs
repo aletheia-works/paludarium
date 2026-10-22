@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
-    0, 2, 3, 4, 5, 6, 8, 20, 22, 32, 33, 72, 73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 84, 85, 86,
-    87, 88, 89, 90, 91, 95, 162, 217, 221, 257, 258, 262, 263, 264, 265, 266, 267, 268, 280, 292,
-    293,
+    0, 2, 3, 4, 5, 6, 8, 20, 21, 22, 32, 33, 72, 73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 84, 85,
+    86, 87, 88, 89, 90, 91, 95, 162, 217, 221, 257, 258, 262, 263, 264, 265, 266, 267, 268, 269,
+    280, 292, 293, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -197,6 +197,29 @@ fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
 }
 fn at(c: &Context<'_>, dir: u64, ptr: u64) -> Result<Vec<u8>, Errno> {
     c.files.path(dir, path(c, ptr)?)
+}
+/// `faccessat2(dirfd, path, mode, flags)`. The guest is root, so reading and
+/// writing are always allowed and executing needs an execute bit (or a
+/// directory), as Linux grants root.
+fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<u64, Errno> {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EACCESS: u64 = 0x200;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if mode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let raw = path(c, ptr)?;
+    let stat = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        c.files.descriptor(dir)?.file.stat()?
+    } else {
+        let p = c.files.path(dir, raw)?;
+        c.files.fs.metadata(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?
+    };
+    let directory = stat.mode & 0o170000 == 0o040000;
+    if mode & 1 != 0 && !directory && stat.mode & 0o111 == 0 {
+        return Err(Errno(13)); // EACCES
+    }
+    Ok(0)
 }
 const UTIME_NOW: u64 = (1 << 30) - 1;
 const UTIME_OMIT: u64 = (1 << 30) - 2;
@@ -787,6 +810,10 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.files.fs.set_mode(&p, a[2] as u32).map(|()| 0)
         }
         280 => utimensat(c, a),
+        // access, faccessat, faccessat2
+        21 => access(c, (-100i32) as u64, a[0], a[1], 0),
+        269 => access(c, a[0], a[1], a[2], 0),
+        439 => access(c, a[0], a[1], a[2], a[3]),
         // fsync, fdatasync: both write everything, as nothing is cached
         74 | 75 => c.files.descriptor(a[0])?.file.sync().map(|()| 0),
         // sync: nothing is cached, so there is nothing to write

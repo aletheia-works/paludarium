@@ -47,6 +47,9 @@ pub mod nr {
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
     pub const SCHED_GETAFFINITY: u64 = 204;
+    pub const SCHED_YIELD: u64 = 24;
+    pub const SYSINFO: u64 = 99;
+    pub const GETGROUPS: u64 = 115;
 }
 
 pub(crate) struct Context<'a> {
@@ -78,7 +81,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 31] = [
+        let entries: [(u64, Handler); 34] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -110,6 +113,9 @@ impl SyscallTable {
             (nr::GETEUID, sys_root_id),
             (nr::GETEGID, sys_root_id),
             (nr::SCHED_GETAFFINITY, sys_sched_getaffinity),
+            (nr::SCHED_YIELD, sys_sched_yield),
+            (nr::SYSINFO, sys_sysinfo),
+            (nr::GETGROUPS, sys_getgroups),
         ];
         let mut handlers: BTreeMap<u64, Handler> = entries.into_iter().collect();
         for number in crate::files::NUMBERS {
@@ -953,6 +959,45 @@ fn sys_uname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         bytes[i * FIELD..i * FIELD + field.len()].copy_from_slice(field);
     }
     match c.mem.write(GuestAddr(a[0]), &bytes) {
+        Ok(()) => ok(0),
+        Err(_) => err(Errno::EFAULT),
+    }
+}
+
+fn sys_sched_yield(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
+    std::thread::yield_now();
+    ok(0)
+}
+
+/// Root has no supplementary groups, so the list is always empty.
+fn sys_getgroups(_c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    if (a[0] as u32 as i32) < 0 {
+        return err(Errno::EINVAL);
+    }
+    ok(0)
+}
+
+/// Memory a guest is told it has; like `uname`, the host's is not revealed.
+const SYSINFO_RAM: u64 = 4 << 30;
+
+/// `struct sysinfo` (112 bytes): the uptime is the monotonic clock's, the
+/// memory is a fixed [`SYSINFO_RAM`] with nothing used and no swap, the load
+/// averages are 0 and `procs` counts this process's threads.
+fn sys_sysinfo(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let uptime = match c.host.clock(ClockId::Monotonic) {
+        Ok(ns) => ns / 1_000_000_000,
+        Err(e) => return err(e),
+    };
+    let mut info = [0u8; 112];
+    info[0..8].copy_from_slice(&uptime.to_le_bytes());
+    info[32..40].copy_from_slice(&SYSINFO_RAM.to_le_bytes()); // totalram
+    info[40..48].copy_from_slice(&SYSINFO_RAM.to_le_bytes()); // freeram
+    let procs = u16::try_from(c.group.active_threads())
+        .unwrap_or(u16::MAX)
+        .max(1);
+    info[80..82].copy_from_slice(&procs.to_le_bytes());
+    info[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
+    match c.mem.write(GuestAddr(a[0]), &info) {
         Ok(()) => ok(0),
         Err(_) => err(Errno::EFAULT),
     }

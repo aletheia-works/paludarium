@@ -8,7 +8,10 @@ verified.
 - **Dynamically linked programs**: only statically linked programs run.
 - **32-bit x86, AVX, AVX-512, x87, MMX**: out of scope.
 - **Network**: `socket()` always returns `EAFNOSUPPORT`; only AF_UNIX
-  `socketpair` is available.
+  `socketpair` of type `SOCK_STREAM` is available. Rust's
+  `std::process::Command` needs a `SOCK_SEQPACKET` pair when it cannot use
+  `posix_spawn` (for example with `pre_exec`), so such spawns fail with
+  `ESOCKTNOSUPPORT`.
 - **Some system calls**: `clone3`, `timerfd`, file-backed `mmap`,
   `CLONE_SIGHAND` between separate processes, stop and
   continue notifications from `wait`, and `wait` by process group are not there

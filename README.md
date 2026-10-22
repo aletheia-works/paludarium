@@ -56,7 +56,7 @@ Within mise, `target/release` is on `PATH`.
 | `mise run ci` | `lint:all`, `build`, `test` and `deny` |
 
 Each `<lang>:check` has a `<lang>:check:fix`, and CI runs `lint:all` on every
-pull request (`test-lint-check.yml`). `lint-autofix.yml` runs `lint:all:fix`
+pull request (`test-lint-check.yml`, called by `ci.yml`). `lint-autofix.yml` runs `lint:all:fix`
 there too, and aletheia-works-bot commits any fixes to the pull request branch
 as a signed `style:` commit (a pull request from a fork needs "Allow edits by
 maintainers"); fetch it before pushing to that branch again.
@@ -95,13 +95,17 @@ or run a task.
 
 - `ci.yml` (every pull request): unit tests on three OSes, rustfmt, clippy
   (`-D warnings`), the wasm32 build, cargo-deny, differential tests, 80 %
-  coverage, probe and aube differential tests, and the WebAssembly acceptance
-  tests.
+  coverage, probe and aube differential tests, the WebAssembly acceptance
+  tests, polyglot lint, the documentation build and the release package
+  check. A pull request runs the jobs its changed files need
+  (`scripts/ci-changes.py`); `ci-ok`, the required check, passes when every
+  job passed or was not needed.
 - `nightly.yml`: fuzzing of every target for 600 seconds with ASan and LSan,
   and the full quality run (macOS, Windows, Node.js, Chromium, Firefox and the
   real Safari, with and without the JIT). A failure opens an issue; the next
   passing night closes it.
-- `docs.yml`: builds the documentation site, and deploys it from main.
+- `docs.yml`: builds the documentation site (`docs-build.yml`) and deploys it
+  from main.
 - `release.yml`, `release-merge.yml`, `publish.yml`: releases; see
   [docs/release.md](docs/release.md).
 

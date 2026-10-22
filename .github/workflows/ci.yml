@@ -45,6 +45,8 @@ jobs:
       wasm: ${{ steps.groups.outputs.wasm }}
       programs: ${{ steps.groups.outputs.programs }}
       production_wasm: ${{ steps.groups.outputs.production_wasm }}
+      docs: ${{ steps.groups.outputs.docs }}
+      release_check: ${{ steps.groups.outputs.release_check }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,6 +79,18 @@ jobs:
     needs: changes
     if: needs.changes.outputs.programs == 'true'
     uses: ./.github/workflows/programs.yml
+  # The pull-request checks of other workflows, so that ci-ok waits for them.
+  polyglot-lint:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/test-lint-check.yml
+  docs:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.docs == 'true'
+    uses: ./.github/workflows/docs-build.yml
+  release-check:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.release_check == 'true'
+    uses: ./.github/workflows/release-check.yml
 
   production-wasm:
     name: production wasm (shared Rust heap, nested Workers)
@@ -354,7 +368,20 @@ jobs:
   # The one required check: every job above passed or was not needed.
   ci-ok:
     if: always()
-    needs: [changes, wasm-programs, fuzz, programs, production-wasm, test, lint, dependencies, differential, coverage]
+    needs:
+      - changes
+      - wasm-programs
+      - fuzz
+      - programs
+      - polyglot-lint
+      - docs
+      - release-check
+      - production-wasm
+      - test
+      - lint
+      - dependencies
+      - differential
+      - coverage
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

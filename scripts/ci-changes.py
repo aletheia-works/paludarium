@@ -5,7 +5,16 @@ import argparse
 import os
 import sys
 
-GROUPS = ("rust", "dependencies", "fuzz", "wasm", "programs", "production_wasm")
+GROUPS = (
+    "rust",
+    "dependencies",
+    "fuzz",
+    "wasm",
+    "programs",
+    "production_wasm",
+    "docs",
+    "release_check",
+)
 ALL = frozenset(GROUPS)
 NONE = frozenset()
 # The pull-request files API lists at most 3000 files; a longer list may be cut.
@@ -37,13 +46,27 @@ RULES = (
         {"programs", "wasm"},
         (".github/workflows/programs.yml", "scripts/programs-run.py", "tests/guests/programs/"),
     ),
-    ({"wasm", "production_wasm"}, ("packages/paludarium-wasm/", "mise-tasks/wasm/")),
+    (
+        {"wasm", "production_wasm", "release_check"},
+        ("packages/paludarium-wasm/", "mise-tasks/wasm/"),
+    ),
     ({"production_wasm"}, ("scripts/wasm-native-guests.py",)),
     ({"rust", "dependencies", "fuzz"}, ("fuzz/",)),
     ({"dependencies"}, ("deny.toml",)),
     ({"rust"}, ("clippy.toml",)),
-    # Release scripts and their tests run in release-check.yml.
-    (NONE, ("scripts/release/", "tests/release/")),
+    # The release package check: its scripts and tests, and the files every
+    # package ships.
+    (
+        {"release_check"},
+        (
+            ".github/workflows/release-check.yml",
+            "scripts/release/",
+            "tests/release/",
+            "README.md",
+            "LICENSE",
+        ),
+    ),
+    ({"docs"}, ("docs/", ".github/workflows/docs.yml", ".github/workflows/docs-build.yml")),
     # Guests, coverage scripts and their tests are used by the Rust jobs.
     ({"rust"}, ("tests/", "scripts/", "tools/")),
     # Documentation, infrastructure, the other workflows, lint settings and
@@ -51,12 +74,10 @@ RULES = (
     (
         NONE,
         (
-            "docs/",
             "infra/",
             "spikes/",
             ".github/",
             "*.md",
-            "LICENSE",
             ".gitignore",
             ".rumdl.toml",
             "ruff.toml",
@@ -92,19 +113,20 @@ def needed(paths):
 
 def self_test():
     cases = {
-        "docs/release.md": NONE,
-        "README.md": NONE,
+        "docs/release.md": {"docs"},
+        "README.md": {"release_check"},
+        "CONTRIBUTING.md": NONE,
         "infra/github/main.tf": NONE,
         ".github/workflows/release.yml": NONE,
-        "scripts/release/acceptance.py": NONE,
-        "tests/release/test_acceptance.py": NONE,
+        "scripts/release/acceptance.py": {"release_check"},
+        "tests/release/test_acceptance.py": {"release_check"},
         "crates/paludarium-cpu/src/lib.rs": ALL,
         "crates/paludarium-cpu/README.md": ALL,
         "Cargo.lock": ALL,
         ".github/workflows/ci.yml": ALL,
         ".github/actions/rust-toolchain/action.yml": ALL,
         "fuzz/fuzz_targets/load_elf.rs": {"rust", "dependencies", "fuzz"},
-        "packages/paludarium-wasm/index.mjs": {"wasm", "production_wasm"},
+        "packages/paludarium-wasm/index.mjs": {"wasm", "production_wasm", "release_check"},
         "tests/guests/programs/cases.json": {"programs", "wasm"},
         "tests/guests/encodings/observe.c": {"rust"},
         "scripts/coverage-check.py": {"rust"},
@@ -119,7 +141,9 @@ def self_test():
             raise AssertionError(f"{path}: {sorted(got)} != {sorted(expected)}")
     if needed([]) != ALL or needed(["docs/a.md"] * API_LIMIT) != ALL:
         raise AssertionError("an empty or possibly cut file list must need every group")
-    if needed(["docs/a.md", "deny.toml"]) != {"dependencies"}:
+    if needed(["infra/github/main.tf", ".github/labeler.yml"]) != NONE:
+        raise AssertionError("infrastructure and bot settings need no group")
+    if needed(["docs/a.md", "deny.toml"]) != {"docs", "dependencies"}:
         raise AssertionError("groups of several files must be joined")
     print(f"ci-changes ready: {len(cases)} paths checked")
 

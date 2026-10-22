@@ -1,6 +1,6 @@
 name: Release package checks
 on:
-  pull_request:
+  # Pull requests: called by ci.yml, so ci-ok includes it.
   workflow_dispatch:
   workflow_call:
 permissions:

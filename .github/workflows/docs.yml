@@ -1,20 +1,17 @@
 name: Docs
 
-# The documentation site (VitePress, docs/). Pull requests build it; a push to
-# main builds it and deploys it to GitHub Pages
-# (https://aletheia-works.github.io/paludarium/).
+# The documentation site (VitePress, docs/). A push to main builds it
+# (docs-build.yml) and deploys it to GitHub Pages
+# (https://aletheia-works.github.io/paludarium/); ci.yml builds it for pull
+# requests that change it.
 on:
-  pull_request:
-    paths:
-      - 'docs/**'
-      - 'mise.toml'
-      - '.github/workflows/docs.yml'
   push:
     branches: [main]
     paths:
       - 'docs/**'
       - 'mise.toml'
       - '.github/workflows/docs.yml'
+      - '.github/workflows/docs-build.yml'
   workflow_dispatch:
 
 permissions:
@@ -22,37 +19,16 @@ permissions:
 
 concurrency:
   group: docs-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: Build docs
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: docs
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0 # for the lastUpdated timestamps
-          persist-credentials: false
-      - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
-        with:
-          install_args: bun
-      - run: bun install --frozen-lockfile
-      - run: bun run build
-      - name: Upload Pages artifact
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: docs/.vitepress/dist
+    uses: ./.github/workflows/docs-build.yml
 
   deploy:
     name: Deploy to GitHub Pages
     needs: build
     if: >-
-      github.event_name != 'pull_request' &&
       github.repository == 'aletheia-works/paludarium' &&
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04

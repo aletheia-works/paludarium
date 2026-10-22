@@ -1,9 +1,8 @@
-//! JIT code-cache interface for paludarium (contract C9).
+//! JIT code-cache interface for paludarium.
 //!
 //! The runtime asks the cache first and falls back to the interpreter when
 //! it returns `None`. The core emulator ships only [`NoopCodeCache`], which
-//! never has translated code; the JIT provides the wasm implementation
-//! (ADR-005).
+//! never has translated code; the JIT provides the wasm implementation.
 #![forbid(unsafe_code)]
 
 mod block;

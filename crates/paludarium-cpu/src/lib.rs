@@ -1,8 +1,8 @@
-//! x86-64 interpreter for paludarium (contract C5).
+//! x86-64 interpreter for paludarium.
 //!
 //! [`run`] executes instructions on a [`CpuState`] until a system call, a
 //! guest exception or the instruction budget stops it, and reports why as an
-//! [`ExitReason`] (ADR-004). The CPU knows nothing about the kernel.
+//! [`ExitReason`]. The CPU knows nothing about the kernel.
 //! Instructions outside the implemented set stop with `InvalidOpcode`. The
 //! implemented set is the one the core guests execute.
 #![forbid(unsafe_code)]

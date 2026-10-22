@@ -1,4 +1,4 @@
-"""Short native Linux stat oracle before the C10 bootstrap mode change."""
+"""Short native Linux stat oracle before the bootstrap mode change."""
 
 import json
 import os

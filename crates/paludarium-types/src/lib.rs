@@ -1,6 +1,6 @@
-//! Shared types for the paludarium x86-64 Linux user-mode emulator (contract C1).
+//! Shared types for the paludarium x86-64 Linux user-mode emulator.
 //!
-//! Three kinds of failure are kept apart by type (team.md Code Style):
+//! Three kinds of failure are kept apart by type:
 //! - [`Errno`]: an error returned to the guest by a system call;
 //! - [`ExitReason`]: why the CPU stopped (system call, guest exception, budget);
 //! - [`Error`]: a problem of the emulator itself (unimplemented, internal,
@@ -13,14 +13,14 @@ use core::fmt;
 pub const PAGE_SIZE: u64 = 4096;
 
 /// Exclusive upper bound of the guest user address space: the lower half of
-/// the 48-bit canonical space (entities.md AddressSpace).
+/// the 48-bit canonical space.
 pub const USER_ADDRESS_LIMIT: u64 = 1 << 47;
 
 /// Longest possible x86-64 instruction in bytes.
 pub const MAX_INSTRUCTION_LEN: usize = 15;
 
 /// A guest virtual address. Never mixed with host `usize` values; conversions
-/// are checked (team.md Code Style).
+/// are checked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestAddr(pub u64);
 
@@ -201,7 +201,7 @@ impl fmt::Display for HexBytes<'_> {
     }
 }
 
-/// Why the CPU (or a JIT) stopped executing guest code (C1, ADR-004).
+/// Why the CPU (or a JIT) stopped executing guest code.
 ///
 /// The system call number is not stored here; the kernel reads it from `rax`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,7 +305,7 @@ impl ErrorKind {
     }
 }
 
-/// A problem of the emulator itself, distinct from the guest's exit (C1, Q4).
+/// A problem of the emulator itself, distinct from the guest's exit.
 ///
 /// Its display is limited to the kind, a fixed message, the instruction
 /// address and bytes and the system call number; it never contains host paths

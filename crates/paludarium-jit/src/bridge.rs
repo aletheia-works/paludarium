@@ -1,4 +1,4 @@
-//! Synchronous C9 bridge. Compilation runs outside the MMU epoch guard;
+//! Synchronous JIT bridge. Compilation runs outside the MMU epoch guard;
 //! register-only execution runs inside it and cannot reenter guest memory.
 use crate::{CodeCache, block, cache::EpochCache, emit};
 use paludarium_cpu::CpuState;
@@ -883,7 +883,7 @@ mod tests {
         assert_eq!(cache.statistics().translated_blocks, 2);
     }
 
-    // ----- Loop-back 1 Step33: XMM scratch state, transfer and rollback -----
+    // ----- XMM scratch state, transfer and rollback -----
 
     /// Deterministic distinct 128-bit patterns (splitmix64 halves).
     fn pattern(seed: u64) -> u128 {
@@ -1229,7 +1229,7 @@ mod tests {
         }
     }
 
-    // ----- Loop-back 1 Step34: integer-SSE translation against interpreter -----
+    // ----- Integer-SSE translation against interpreter -----
 
     /// Every case: interpreter result and real-wasm result of the same block
     /// on the same patterned state, compared on the whole CPU state.

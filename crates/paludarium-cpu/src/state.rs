@@ -1,4 +1,4 @@
-//! Architectural register state of one guest thread (entities.md CpuState).
+//! Architectural register state of one guest thread.
 
 use paludarium_decoder::Instruction;
 use paludarium_types::{GuestAddr, InstructionBytes};
@@ -72,7 +72,7 @@ pub const INITIAL_RFLAGS: u64 = flag::IF | flag::RESERVED1;
 /// Initial `mxcsr`: all exceptions masked, round to nearest.
 pub const INITIAL_MXCSR: u32 = 0x1f80;
 
-/// Registers of one guest thread. Owned by the kernel's thread (ADR-002);
+/// Registers of one guest thread. Owned by the kernel's thread;
 /// the CPU only executes on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuState {

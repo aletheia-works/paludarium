@@ -34,7 +34,7 @@ class BuildEvidence(unittest.TestCase):
         # The frozen performance measurement runs only by hand or on the nightly schedule, never on push or pull_request.
         self.assertIn(
             "- name: Frozen paired full-probe performance\n"
-            "        # Measured by hand before a release and by the nightly schedule (ci-config.md); never on push or pull_request.\n"
+            "        # Measured by hand before a release and by the nightly schedule; never on push or pull_request.\n"
             "        if: matrix.environment == 'node' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')\n",
             acceptance,
         )

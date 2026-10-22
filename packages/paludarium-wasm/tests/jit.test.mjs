@@ -149,7 +149,7 @@ test('cost callback exception restores guard and remains an exception',()=>{
   assert.equal(s.bridge.execute(1,512,s.bytes.length,64,S),0);
 });
 
-// ----- Loop-back 1 Step33: XMM slots (bytes 144..399) at the JS boundary -----
+// ----- XMM slots (bytes 144..399) at the JS boundary -----
 
 const simd = (op, ...rest) => [0xfd, ...leb(op), ...rest];
 const xmmArg = n => [3, ...leb(XMM + 16 * n)];

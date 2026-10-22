@@ -1,4 +1,4 @@
-# Nightly checks (team.md Testing Posture, Q7; CI Pipeline design ci-config.md, Q2 A):
+# Nightly checks:
 # fuzzing (fuzz-nightly.yml: thirteen targets for 600 seconds each with ASan and LSan) and the
 # full quality check (quality.yml: Linux, macOS and Windows, the four wasm environments
 # with the real Safari, JIT on/off agreement and the frozen performance measurement).

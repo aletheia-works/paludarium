@@ -1,7 +1,7 @@
-//! Host abstraction for paludarium (contract C2).
+//! Host abstraction for paludarium.
 //!
-//! Every host facility the emulator uses goes through the [`Host`] trait
-//! (ADR-007), so that the native and wasm implementations differ only here.
+//! Every host facility the emulator uses goes through the [`Host`] trait,
+//! so that the native and wasm implementations differ only here.
 //! The core emulator needs standard I/O and randomness (for `AT_RANDOM`);
 //! threads, time and host files are added on top.
 //!

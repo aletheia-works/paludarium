@@ -1,4 +1,4 @@
-//! Software MMU for paludarium (contract C4).
+//! Software MMU for paludarium.
 //!
 //! A guest address space is a two-level page table of 4 KiB pages: a sparse
 //! directory (one entry per 512 pages) pointing at dense tables of 512 page
@@ -76,7 +76,7 @@ impl Prot {
     }
 }
 
-/// What a mapping was created for (entities.md Mapping.kind).
+/// What a mapping was created for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MappingKind {
     ElfSegment,
@@ -161,8 +161,7 @@ impl Page {
     }
 }
 
-/// Lower level of the page table: 512 consecutive pages (entities.md
-/// PageTable). Entries are populated lazily, on the first write to a page
+/// Lower level of the page table: 512 consecutive pages. Entries are populated lazily, on the first write to a page
 /// of a mapping, so mapping a huge region costs nothing until it is used
 /// (a guest `brk`/`mmap` of terabytes must not exhaust host memory).
 struct PageTable {
@@ -194,7 +193,7 @@ struct SharedMapping {
 
 static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// One process's guest address space (entities.md AddressSpace).
+/// One process's guest address space.
 ///
 /// `mappings` is the source of truth for what is mapped and with which
 /// protection; the two-level page table caches populated pages and holds

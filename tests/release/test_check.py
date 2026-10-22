@@ -138,7 +138,7 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(receipt["tool_environment"]["RUSTFLAGS"], "")
         self.assertNotIn("never-log-this", (self.root / "receipt/receipt.json").read_text())
 
-    # Step14b (Q2): a decided version is no longer reported as outstanding.
+    # A decided version is no longer reported as outstanding.
     def test_validate_outstanding_follows_version(self):
         decided = check.validate(ROOT)
         self.assertEqual(decided["version"], policy.inventory(ROOT)["version"])
@@ -247,7 +247,7 @@ class CheckTests(unittest.TestCase):
                 (ROOT / ".github/workflows" / name).read_text(), r"(?i)echo[^\n]*(token|secret)"
             )
 
-    # Step17 (R-17): allow-listed child environments.
+    # Allow-listed child environments.
     def job_environment(self):
         return dict(
             PATH="/bin",

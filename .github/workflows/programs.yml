@@ -80,11 +80,11 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install nightly-2026-10-11 --profile minimal
-      - name: Compile C10 harness before network isolation
+      - name: Compile the harness before network isolation
         run: |
           programs_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           CARGO_HOME="$programs_cargo_home" cargo +nightly-2026-10-11 test --locked -p paludarium-harness --test diff_programs --no-run
-      - name: Fresh native oracle then bounded C10 differential without network
+      - name: Fresh native oracle then bounded differential without network
         run: |
           programs_cargo="$(rustup which --toolchain nightly-2026-10-11 cargo)"
           programs_rustc="$(rustup which --toolchain nightly-2026-10-11 rustc)"

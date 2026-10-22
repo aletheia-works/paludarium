@@ -129,7 +129,7 @@ def registry_state(status, body, version, digest):
         "registry returned different version",
     )
     policy.require(body.get("digest") == digest, "existing version digest mismatch")
-    # Step24 (review 04, finding 4): a yanked version never counts as the published release.
+    # A yanked version never counts as the published release.
     policy.require(body.get("yanked") is not True, "existing version is yanked")
     return dict(state="PUBLISHED_MATCH", upload_allowed=False)
 
@@ -193,7 +193,7 @@ CRATES_API = "https://crates.io/api/v1/crates/"
 NPM_NAME = "@aletheia-works/paludarium-wasm"
 NPM_PACKAGE_URL = "https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm"
 CARGO_TOKEN_NAMES = ("CARGO_REGISTRY_TOKEN", "RELEASE_OIDC_CRATES_IO_TOKEN")
-# Step17 (R-17): each publication child gets only the variables it needs (allow-list).
+# Each publication child gets only the variables it needs (allow-list).
 COMMON_ENVIRONMENT = (
     "PATH",
     "HOME",

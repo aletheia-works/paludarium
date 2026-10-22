@@ -1,4 +1,4 @@
-//! End-to-end tests of the `paludarium` binary (C11) with a guest built in
+//! End-to-end tests of the `paludarium` binary with a guest built in
 //! code. They run on Linux, macOS and Windows: the guest is emulated.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

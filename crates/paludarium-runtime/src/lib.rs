@@ -1,4 +1,4 @@
-//! Session and execution loop for paludarium (contract C10 internals).
+//! Session and execution loop for paludarium.
 //!
 //! A [`Session`] places the configured files in the virtual file system,
 //! loads the program, and runs the thread loop (W2, W3): the CPU runs for a
@@ -24,7 +24,7 @@ use paludarium_vfs::{GuestFile, HostFs, MemFs, MountedFs};
 use workers::Execution;
 
 /// Instructions run between two checks of the kill request
-/// (entities.md SessionConfig: internal, default 100000).
+/// (internal, default 100000).
 pub const DEFAULT_BUDGET: u64 = 100_000;
 
 /// A host directory shown to the guest (`--mount`). Implemented by the files
@@ -54,7 +54,7 @@ impl TerminalInfo {
     }
 }
 
-/// Configuration of one run (C10 `Config`, entities.md SessionConfig).
+/// Configuration of one run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Config {

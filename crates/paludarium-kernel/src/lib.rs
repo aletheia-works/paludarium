@@ -1,6 +1,6 @@
-//! Linux system-call layer for paludarium (contract C8).
+//! Linux system-call layer for paludarium.
 //!
-//! The kernel owns the process and thread state (ADR-002). It receives the
+//! The kernel owns the process and thread state. It receives the
 //! CPU's [`ExitReason`] and decides what happens next: system calls are
 //! dispatched by number through an explicit table and unknown numbers return
 //! `-ENOSYS`; nothing is ever passed through to the host by number. Guest
@@ -47,7 +47,7 @@ pub enum Next {
     Exit(ExitStatus),
 }
 
-/// A guest thread: its id and registers (entities.md CpuState).
+/// A guest thread: its id and registers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Thread {
     pub tid: u32,

@@ -3,7 +3,7 @@
 //! A guest program is run natively on x86-64 Linux and under the emulator;
 //! standard output, standard error and the exit status must match byte for
 //! byte. The expected result is always produced by the native run at test
-//! time, never stored (team.md Testing Posture, Q6).
+//! time, never stored.
 //! Each run has a 30-second limit.
 //!
 //! This crate is test tooling: unlike the emulator crates it uses
@@ -24,14 +24,14 @@ use paludarium::{Config, ExitReason, ExitStatus, Session};
 /// Time limit of one run.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Which toolchain builds a guest (entities.md DiffTestCase.guestSource).
+/// Which toolchain builds a guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestSource {
     CMusl,
     RustMusl,
 }
 
-/// One differential test (entities.md DiffTestCase). The core tests compare
+/// One differential test. The core tests compare
 /// stdout, stderr and the exit status for every case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffTestCase {

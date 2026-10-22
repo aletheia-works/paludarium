@@ -1,4 +1,4 @@
-//! The `paludarium` command (contract C11):
+//! The `paludarium` command:
 //!
 //! ```text
 //! paludarium [options] <program> [args...]
@@ -23,8 +23,7 @@ use paludarium_types::{Error, ExitStatus};
 /// Exit code for command-line usage errors.
 pub const EXIT_USAGE: i32 = 2;
 
-/// Exit code for errors of the emulator itself (C11 open question, decided
-/// with the core emulator: 70 = `EX_SOFTWARE`).
+/// Exit code for errors of the emulator itself (70 = `EX_SOFTWARE`).
 pub const EXIT_EMULATOR_ERROR: i32 = 70;
 
 /// Usage text printed on errors and for `--help`.

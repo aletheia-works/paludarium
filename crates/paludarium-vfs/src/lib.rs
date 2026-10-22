@@ -1,4 +1,4 @@
-//! Safe in-memory filesystem and the host capability mount boundary (C6).
+//! Safe in-memory filesystem and the host capability mount boundary.
 #![forbid(unsafe_code)]
 pub use paludarium_host::{DirectoryEntry, FileHandle, FileStat, HostFs};
 use paludarium_types::Errno;

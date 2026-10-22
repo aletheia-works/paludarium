@@ -1,12 +1,13 @@
-# Pull-request gate (team.md Testing Posture, Q7): unit tests on Linux,
-# macOS and Windows, fmt, clippy (-D warnings), dependency checks, the
-# x86-64 Linux differential tests and the 80% line-coverage floor.
-# Every job must pass before merging. Actions are pinned by commit SHA and
-# the default token is read-only.
+# Full quality, run by nightly.yml and dispatched once per release head
+# (docs/release.md): the ci.yml checks on Linux, macOS and Windows, the
+# Windows host comparison, fuzzing, the four wasm environments with the real
+# Safari, JIT on/off agreement, the frozen performance measurement and the JIT
+# and Python coverage. Actions are pinned by commit SHA and the default token
+# is read-only.
 name: Full quality
 
 on:
-  # Called by nightly.yml (ci-config.md); dispatched by hand before a release.
+  # Called by nightly.yml; dispatched for a release by scripts/release/evidence.py.
   workflow_call:
   workflow_dispatch:
 

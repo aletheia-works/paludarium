@@ -129,7 +129,7 @@ class PolicyTests(unittest.TestCase):
         self.s["acceptance"].pop()
         self.reject()
 
-    # Step14b (Q3): self-review prevention is no longer required.
+    # Self-review prevention is no longer required.
     def test_self_review_allowed(self):
         rule = self.s["environment"]["protection_rules"][0]
         for value in (False, None):

@@ -1,7 +1,7 @@
-//! x86-64 instruction decoder for paludarium (contract C3).
+//! x86-64 instruction decoder for paludarium.
 //!
 //! Wraps the `iced-x86` crate (MIT). None of its types appear in this
-//! crate's API (ADR-006): callers get [`Instruction`], [`Operand`] and
+//! crate's API: callers get [`Instruction`], [`Operand`] and
 //! [`Mnemonic`] defined here, so the decoder can be replaced or partly
 //! re-implemented without touching the CPU.
 //!

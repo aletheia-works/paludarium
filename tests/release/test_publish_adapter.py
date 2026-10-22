@@ -264,7 +264,7 @@ class PublishAdapterTests(unittest.TestCase):
         self.assertEqual(self.uploaded, set())
         self.assertEqual(self.envs, [])
 
-    # Step17 (R-16): resuming a stopped publication uploads only what is missing.
+    # Resuming a stopped publication uploads only what is missing.
     def test_resume_uploads_only_remaining(self):
         done = self.inv["order"][:3]
         self.uploaded = set(done)
@@ -284,7 +284,7 @@ class PublishAdapterTests(unittest.TestCase):
         )
         self.assertFalse(progress["automatic_retry"])
 
-    # Step24 (review 04, finding 6a): `authorize` is replaced here, so what stops this run is the
+    # `authorize` is replaced here, so what stops this run is the
     # publish loop's own registry_state check of a present version.
     def test_publish_loop_registry_state_refuses_different_present_digest(self):
         first = self.inv["order"][0]
@@ -307,7 +307,7 @@ class PublishAdapterTests(unittest.TestCase):
         self.assertEqual(self.uploaded, {first})
         self.assertEqual(self.envs, [])
 
-    # Step24 (review 04, finding 4): the publish loop never takes a yanked present version as published.
+    # The publish loop never takes a yanked present version as published.
     def test_publish_loop_refuses_yanked_present_version(self):
         first = self.inv["order"][0]
         self.uploaded = {first}
@@ -317,7 +317,7 @@ class PublishAdapterTests(unittest.TestCase):
         self.assertEqual(self.uploaded, {first})
         self.assertEqual(self.envs, [])
 
-    # Step17 (R-17): the job's GitHub token and OIDC request variables never reach cargo.
+    # The job's GitHub token and OIDC request variables never reach cargo.
     def test_cargo_uploads_never_see_github_or_oidc_request_variables(self):
         self.env.update(
             GH_TOKEN="canary-gh-0004",

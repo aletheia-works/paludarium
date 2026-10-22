@@ -1,4 +1,4 @@
-//! Static ELF loader for paludarium (contract C7).
+//! Static ELF loader for paludarium.
 //!
 //! Loads static x86-64 executables (`ET_EXEC`, and `ET_DYN` static-pie
 //! without an interpreter) into a guest address space and builds the initial
@@ -83,7 +83,7 @@ impl From<LoadError> for Error {
     }
 }
 
-/// The result of loading a program (entities.md LoadedImage).
+/// The result of loading a program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadedImage {
     pub entry_point: GuestAddr,

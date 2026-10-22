@@ -6,8 +6,8 @@
 //   node spikes/wasm-threads/browser-check.mjs safari      (macOS)
 //
 // Chromium and Firefox are driven by Playwright. Safari is the real Safari,
-// driven through Apple's safaridriver (WebDriver), never a WebKit build
-// (team.md Testing Posture, Q12). Run `safaridriver --enable` once on the
+// driven through Apple's safaridriver (WebDriver), never a WebKit build.
+// Run `safaridriver --enable` once on the
 // Mac (CI does this) before using it.
 
 import { spawn } from "node:child_process";

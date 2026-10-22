@@ -1,4 +1,4 @@
-//! paludarium: an x86-64 Linux user-mode emulator (public API, contract C10).
+//! paludarium: an x86-64 Linux user-mode emulator (public API).
 //!
 //! ```no_run
 //! use std::sync::Arc;

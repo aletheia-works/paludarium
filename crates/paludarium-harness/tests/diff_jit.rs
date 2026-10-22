@@ -81,9 +81,9 @@ fn xmms(row: &str, key: &str) -> [u128; 16] {
     std::array::from_fn(|index| u128::from_str_radix(values[index], 16).unwrap())
 }
 
-/// Integer-SSE register forms (Loop-back 1 Step32). Inputs come from the same
+/// Integer-SSE register forms. Inputs come from the same
 /// fresh native run (`in_*`); the bytes are checked against the native row.
-/// Since Step34 the JIT translates these forms, so a run where they only
+/// The JIT translates these forms, so a run where they only
 /// fell back to the interpreter is rejected (see `compare_sse`).
 const SSE_CASES: [(&str, &[u8]); 15] = [
     ("sse-pshufd-00", &[0x66, 0x0f, 0x70, 0xc1, 0x00, 0xc3]),

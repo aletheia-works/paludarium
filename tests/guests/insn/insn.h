@@ -5,8 +5,7 @@
  * runs one instruction family on fixed inputs and prints the resulting
  * registers, flags and memory as text. The same binary runs natively on
  * x86-64 Linux and under paludarium, and the harness compares the output
- * bytes, so the expected values always come from native execution
- * (team.md Testing Posture, Q6).
+ * bytes, so the expected values always come from native execution.
  *
  * Flags that x86 leaves undefined for an instruction are masked out before
  * printing; UNDEFINED.md lists what is not compared.

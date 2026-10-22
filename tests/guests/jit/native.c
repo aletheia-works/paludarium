@@ -77,7 +77,7 @@ static void observe(const struct instruction_case *item) {
     _exit(0);
 }
 
-/* Integer-SSE register forms (Loop-back 1 Step32): every operand is an XMM
+/* Integer-SSE register forms: every operand is an XMM
  * register. The trampoline loads RFLAGS, XMM0-15 and every GPR except RSP from
  * `in`, calls the case, and stores the same registers to `out`. RSP is an
  * address that differs per run, so it is neither loaded nor observed. A case

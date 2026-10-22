@@ -121,7 +121,7 @@ jobs:
         if: matrix.environment == 'node'
         run: node packages/paludarium-wasm/tests/jit-coverage.mjs target/wasm/node/v8 target/wasm/node/js-coverage.json
       - name: Frozen paired full-probe performance
-        # Measured by hand before a release and by the nightly schedule (ci-config.md); never on push or pull_request.
+        # Measured by hand before a release and by the nightly schedule; never on push or pull_request.
         if: matrix.environment == 'node' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
         continue-on-error: true
         run: node packages/paludarium-wasm/tests/jit-performance-check.mjs packages/paludarium-wasm/paludarium.wasm target/wasm/native/observations.json target/guests/programs target/wasm/node/performance

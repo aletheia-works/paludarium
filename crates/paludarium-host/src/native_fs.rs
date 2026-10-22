@@ -49,19 +49,63 @@ fn system_time(ns: i128) -> Result<std::time::SystemTime, Errno> {
     }
     .ok_or(Errno::EINVAL)
 }
-/// Host permissions for guest mode bits. Windows keeps only "read-only",
-/// which is set when no write bit is.
-fn permissions(mode: u32, current: std::fs::Permissions) -> std::fs::Permissions {
-    #[cfg(unix)]
-    {
-        let _ = current;
-        std::os::unix::fs::PermissionsExt::from_mode(mode & 0o7777)
+/// Windows keeps only a read-only attribute, which is set when the guest mode
+/// has no write bit. std's `File::set_permissions` cannot clear it when it is
+/// the only attribute: it writes the attributes through `FILE_BASIC_INFO`,
+/// where 0 means "unchanged". This writes `FILE_ATTRIBUTE_NORMAL` instead.
+#[cfg(windows)]
+mod read_only {
+    use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+    const READONLY: u32 = 0x1;
+    const NORMAL: u32 = 0x80;
+    const FILE_BASIC_INFO_CLASS: i32 = 0;
+    /// `FILE_BASIC_INFO`; zero times are left unchanged.
+    #[repr(C)]
+    struct BasicInfo {
+        creation: i64,
+        access: i64,
+        write: i64,
+        change: i64,
+        attributes: u32,
     }
-    #[cfg(not(unix))]
-    {
-        let mut permissions = current;
-        permissions.set_readonly(mode & 0o222 == 0);
-        permissions
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            handle: *mut core::ffi::c_void,
+            class: i32,
+            info: *const core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    pub(super) fn set(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+        let current = file.metadata()?.file_attributes();
+        let attributes = match (current & !READONLY, mode & 0o222 == 0) {
+            (rest, true) => rest | READONLY,
+            (0, false) => NORMAL,
+            (rest, false) => rest,
+        };
+        let info = BasicInfo {
+            creation: 0,
+            access: 0,
+            write: 0,
+            change: 0,
+            attributes,
+        };
+        // SAFETY: `file` owns a live handle for the call, and `info` is a
+        // FILE_BASIC_INFO that outlives it; the size passed is its own.
+        let done = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FILE_BASIC_INFO_CLASS,
+                std::ptr::from_ref(&info).cast(),
+                u32::try_from(size_of::<BasicInfo>()).unwrap_or(u32::MAX),
+            )
+        };
+        if done == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 }
 fn path(b: &[u8]) -> Result<PathBuf, Errno> {
@@ -220,9 +264,12 @@ impl FileHandle for NativeFile {
     }
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         let file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
-        let current = file.metadata().map_err(err)?.permissions();
-        file.set_permissions(permissions(mode, current))
-            .map_err(err)
+        #[cfg(unix)]
+        return file
+            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode & 0o7777))
+            .map_err(err);
+        #[cfg(windows)]
+        return read_only::set(&file, mode).map_err(err);
     }
     fn set_times(&self, atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
         let mut times = std::fs::FileTimes::new();
@@ -335,15 +382,24 @@ impl HostFs for NativeFs {
     fn set_mode(&self, p: &[u8], mode: u32) -> Result<(), Errno> {
         let p = path(p)?;
         #[cfg(unix)]
-        let permissions =
-            <cap_std::fs::Permissions as cap_std::fs::PermissionsExt>::from_mode(mode & 0o7777);
-        #[cfg(not(unix))]
-        let permissions = {
-            let mut permissions = self.root.metadata(&p).map_err(err)?.permissions();
-            permissions.set_readonly(mode & 0o222 == 0);
-            permissions
-        };
-        self.root.set_permissions(p, permissions).map_err(err)
+        return self
+            .root
+            .set_permissions(
+                p,
+                <cap_std::fs::Permissions as cap_std::fs::PermissionsExt>::from_mode(mode & 0o7777),
+            )
+            .map_err(err);
+        #[cfg(windows)]
+        {
+            // The explicit access mode, FILE_READ_ATTRIBUTES |
+            // FILE_WRITE_ATTRIBUTES, replaces read(true) and is allowed on a
+            // read-only file; the open goes through the retained capability.
+            use cap_std::fs::OpenOptionsExt;
+            let mut options = OpenOptions::new();
+            options.read(true).access_mode(0x80 | 0x100).maybe_dir(true);
+            let file = self.root.open_with(p, &options).map_err(err)?.into_std();
+            read_only::set(&file, mode).map_err(err)
+        }
     }
     fn set_times(
         &self,

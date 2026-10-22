@@ -80,9 +80,13 @@ jobs:
           path: .
       - name: Install pinned browser driver
         if: matrix.environment == 'chromium' || matrix.environment == 'firefox'
-        run: |
-          npm ci --prefix spikes/wasm-threads
-          node spikes/wasm-threads/node_modules/playwright/cli.js install --with-deps ${{ matrix.environment }}
+        run: npm ci --prefix spikes/wasm-threads
+      - name: Install Playwright browser
+        if: matrix.environment == 'chromium' || matrix.environment == 'firefox'
+        uses: aletheia-works/.github/actions/install-playwright@237aeceec82d1ac86155fae871a80d4c1b436845 # v1.2.0
+        with:
+          browsers: ${{ matrix.environment }}
+          command: node spikes/wasm-threads/node_modules/playwright/cli.js
       - name: Enable actual Safari on CI runner
         if: matrix.environment == 'safari'
         run: sudo safaridriver --enable

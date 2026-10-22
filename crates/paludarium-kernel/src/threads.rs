@@ -27,6 +27,8 @@ pub struct ThreadGroup {
     timer_generation: AtomicU64,
     pub(crate) futexes: Futexes,
     pub(crate) timers: Mutex<crate::timers::Timers>,
+    /// Every thread's CPU time, live or exited, for the process's total.
+    cpu: Mutex<Vec<Arc<AtomicU64>>>,
 }
 impl Default for ThreadGroup {
     fn default() -> Self {
@@ -42,6 +44,7 @@ impl Default for ThreadGroup {
             timer_generation: AtomicU64::new(0),
             futexes: Futexes::default(),
             timers: Mutex::default(),
+            cpu: Mutex::default(),
         }
     }
 }
@@ -86,6 +89,21 @@ impl ThreadGroup {
             ),
             ..Self::default()
         }
+    }
+    pub(crate) fn register_cpu(&self, used: Arc<AtomicU64>) {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(used);
+    }
+    /// The process's CPU time: the sum of its threads' latest accounts.
+    pub(crate) fn process_cpu(&self) -> u64 {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|used| used.load(Ordering::SeqCst))
+            .fold(0u64, u64::saturating_add)
     }
     pub(crate) fn notify_child(&self) {
         let _ = self

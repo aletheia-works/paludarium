@@ -33,9 +33,9 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
-| System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage` |
+| System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait` |
-| Time | `clock_gettime`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
+| Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
@@ -95,9 +95,19 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
   capabilities and so on) without the memory and CPU ones, which nothing
   measures.
-- `getrusage` reports all zeros for the process, its children and the
-  thread, as do the rusage of `wait4` and `waitid`: no CPU time or memory
-  use is measured yet.
+- CPU time is the host thread's CPU time (user and system together) from a
+  guest thread's first system call, where the host can measure it (Linux,
+  macOS, Windows); elsewhere, as in WebAssembly, it is wall time instead.
+  `CLOCK_THREAD_CPUTIME_ID` reads the thread's, and `CLOCK_PROCESS_CPUTIME_ID`
+  the sum of the process's threads, each as of its latest system call. A
+  child starts from zero, and its time joins its parent's children's when it
+  is waited for. `getrusage`, `times` and the rusage of `wait4` and `waitid`
+  report it all as user time, as the emulator's work for system calls runs
+  in the host's user space; memory use is not measured.
+- `clock_gettime` also reads `CLOCK_MONOTONIC_RAW`, the coarse clocks,
+  `CLOCK_BOOTTIME` (the host never suspends), the alarm clocks and
+  `CLOCK_TAI` (with a TAI offset of 0). `clock_getres` gives 1 ns, and 4 ms
+  for the coarse clocks.
 - As root, `access` allows reading and writing, and executing when the file
   has an execute bit or is a directory; `getgroups` returns no groups.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
@@ -108,7 +118,8 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   (`SIGEV_NONE`). The kernel takes `SIGEV_THREAD` as `SIGEV_SIGNAL`, as Linux
   does; the C library builds the thread on `SIGEV_THREAD_ID`. A thread's timer
   signal adds to its overrun only while the thread has not taken it yet, and
-  is lost if the thread has exited. CPU-time clocks give `EINVAL`. Timers are
+  is lost if the thread has exited. Timers on the CPU-time clocks give
+  `EINVAL`. Timers are
   not inherited by `fork` and are deleted by `execve`. `rt_sigtimedwait` also
   takes blocked signals pending for the whole process.
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a

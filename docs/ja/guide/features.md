@@ -29,9 +29,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
-| システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups`、`getrusage` |
+| システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups`、`getrusage`、`times` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait` |
-| 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
+| 時刻 | `clock_gettime`、`clock_getres`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
 | イベント | `eventfd2`、`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
@@ -88,8 +88,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   開けるディレクトリです。`/proc/self/status` は、Linux と同じ項目を同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。ただし、何も
   測っていないメモリと CPU の項目はありません。
-- `getrusage` は、プロセス、子、スレッドのどれについても 0 を返します。`wait4` と
-  `waitid` が返す rusage も同じです。CPU 時間とメモリの使用量は、まだ測っていません。
+- CPU 時間は、ホストが測れるところ（Linux・macOS・Windows）では、ゲストのスレッドの
+  最初のシステムコールからの、ホストのスレッドの CPU 時間（ユーザーとシステムの合計）
+  です。WebAssembly などそれ以外では、代わりに経過時間を数えます。
+  `CLOCK_THREAD_CPUTIME_ID` はそのスレッドの時間、`CLOCK_PROCESS_CPUTIME_ID` は
+  プロセスのスレッドの合計（それぞれ最後のシステムコールの時点）を返します。子は 0 から
+  始まり、待たれたときに親の「子の時間」に足されます。`getrusage`、`times`、`wait4` と
+  `waitid` の rusage は、すべてをユーザーの時間として返します。システムコールのための
+  エミュレータの処理も、ホストのユーザー空間で動くためです。メモリの使用量は測りません。
+- `clock_gettime` は、`CLOCK_MONOTONIC_RAW`、粗い時計、`CLOCK_BOOTTIME`（ホストは
+  サスペンドしないものとします）、アラームの時計、`CLOCK_TAI`（TAI のずれは 0）も
+  読めます。`clock_getres` は 1 ns、粗い時計では 4 ms を返します。
 - `access` は root として、読み書きはいつも許し、実行は実行のビットがあるか
   ディレクトリのときに許します。`getgroups` はグループを返しません。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
@@ -100,7 +109,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`SIGEV_NONE`）。`SIGEV_THREAD` は、Linux と同じく `SIGEV_SIGNAL` として扱います
   （スレッドは C ライブラリが `SIGEV_THREAD_ID` を使って作ります）。スレッドへの
   タイマーのシグナルは、そのスレッドがまだ受け取っていない間だけオーバーランに足され、
-  スレッドが終わっていれば失われます。CPU 時間の時計は `EINVAL` を返します。タイマーは
+  スレッドが終わっていれば失われます。CPU 時間の時計のタイマーは `EINVAL` を返します。タイマーは
   `fork` では受け継がれず、`execve` で消えます。`rt_sigtimedwait` は、プロセス全体に
   届いてブロックされているシグナルも受け取ります。
 - `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が

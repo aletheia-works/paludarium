@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
+#include <sys/times.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -941,6 +942,49 @@ int main(int argc, char **argv) {
         int null = open("/dev/null", O_RDONLY);
         errno = 0;
         result("not-a-pipe", fcntl(null, F_GETPIPE_SZ));
+        result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "cpu-clocks")) {
+        /* CPU time itself differs from host to host; its rules do not. */
+        struct timespec a, b, res;
+        result("thread", clock_gettime(CLOCK_THREAD_CPUTIME_ID, &a));
+        result("process", clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &b));
+        result("ordered", b.tv_sec > a.tv_sec || (b.tv_sec == a.tv_sec && b.tv_nsec >= a.tv_nsec));
+        result("valid", a.tv_nsec >= 0 && a.tv_nsec < 1000000000 && b.tv_nsec < 1000000000);
+        result("monotone", clock_gettime(CLOCK_THREAD_CPUTIME_ID, &b) == 0
+            && (b.tv_sec > a.tv_sec || (b.tv_sec == a.tv_sec && b.tv_nsec >= a.tv_nsec)));
+        for (int id = 2; id <= 3; id++) {
+            result("res", clock_getres(id, &res));
+            result("res-ns", res.tv_sec * 1000000000L + res.tv_nsec);
+        }
+        int clocks[] = {CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME};
+        for (size_t i = 0; i < sizeof clocks / sizeof *clocks; i++)
+            result("other-clock", clock_gettime(clocks[i], &a));
+        errno = 0;
+        result("unknown", clock_gettime(10, &a));
+        result("errno", errno);
+        errno = 0;
+        /* 10 was CLOCK_SGI_CYCLE: no kernel has it; 16 on are auxiliary clocks now. */
+        result("unknown-res", clock_getres(10, &res));
+        result("errno", errno);
+        result("res-null", clock_getres(CLOCK_PROCESS_CPUTIME_ID, NULL));
+        struct rusage usage;
+        result("rusage", getrusage(RUSAGE_SELF, &usage));
+        result("rusage-valid", usage.ru_utime.tv_usec < 1000000 && usage.ru_stime.tv_usec < 1000000);
+        /* A child's time joins the children's once it is waited for. */
+        pid_t pid = child();
+        if (pid == 0) _exit(0);
+        int status;
+        struct rusage reaped;
+        result("wait4", wait4(pid, &status, 0, &reaped) == pid);
+        result("wait4-valid", reaped.ru_utime.tv_usec < 1000000);
+        result("children", getrusage(RUSAGE_CHILDREN, &usage));
+        struct tms tms;
+        result("times", times(&tms) != (clock_t)-1);
+        result("times-null", times(NULL) != (clock_t)-1);
+        errno = 0;
+        result("times-fault", syscall(SYS_times, (void *)1));
         result("errno", errno);
         return 0;
     }

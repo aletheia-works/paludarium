@@ -101,6 +101,47 @@ impl Default for AltStack {
     }
 }
 
+/// A guest thread's CPU time: the host thread's CPU time (or, where the host
+/// cannot measure it, wall time) since the guest thread's first system call,
+/// published for the thread group's total. A clone starts again from zero,
+/// as a new Linux thread or process does.
+#[derive(Debug, Default)]
+pub(crate) struct CpuAccount {
+    base: Option<u64>,
+    used: Arc<std::sync::atomic::AtomicU64>,
+}
+impl Clone for CpuAccount {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+impl PartialEq for CpuAccount {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.used, &other.used)
+    }
+}
+impl Eq for CpuAccount {}
+
+/// Brings the thread's CPU time up to date and returns it in nanoseconds;
+/// called at every system call, which publishes it for the process clock,
+/// and by the system calls that read the CPU clocks.
+pub(crate) fn account_cpu(host: &dyn Host, group: &ThreadGroup, state: &mut ThreadState) -> u64 {
+    let now = host
+        .thread_cpu_time()
+        .or_else(|_| host.clock(paludarium_host::ClockId::Monotonic))
+        .unwrap_or(0);
+    let account = &mut state.cpu;
+    let base = *account.base.get_or_insert_with(|| {
+        group.register_cpu(Arc::clone(&account.used));
+        now
+    });
+    let used = now.saturating_sub(base);
+    account
+        .used
+        .store(used, std::sync::atomic::Ordering::SeqCst);
+    used
+}
+
 /// Thread-owned Linux signal context and lifecycle state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThreadState {
@@ -120,6 +161,7 @@ pub struct ThreadState {
     pub stopped: bool,
     /// The thread's name (`comm`), NUL-padded: PR_SET_NAME and PR_GET_NAME.
     pub(crate) name: [u8; 16],
+    pub(crate) cpu: CpuAccount,
 }
 
 impl ThreadState {
@@ -450,6 +492,7 @@ impl Kernel {
     fn syscall(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         self.sync_actions(thread);
         self.group.sync_timer(&mut thread.state);
+        account_cpu(&*self.host, &self.group, &mut thread.state);
         let mut number = thread.cpu.gpr[reg::RAX];
         let mut args = [
             thread.cpu.gpr[reg::RDI],

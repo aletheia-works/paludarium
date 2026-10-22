@@ -19,6 +19,7 @@
     {"name":"posix-timer","binary":"process"},
     {"name":"prctl","binary":"process"},
     {"name":"pdeathsig","binary":"process"},
+    {"name":"cpu-clocks","binary":"process"},
     {"name":"pipe-size","binary":"process"},
     {"name":"poll","binary":"process"},
     {"name":"proc-status","binary":"process"},

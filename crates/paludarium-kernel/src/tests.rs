@@ -1077,3 +1077,47 @@ fn poll_waits_for_its_timeout_and_dup2_replaces_stdin() {
     set(&mut f, 0);
     assert_eq!(f.ret(nr::POLL, &[DATA, 1, 0]), 0);
 }
+#[test]
+fn cpu_clocks_count_the_threads_time() {
+    let mut f = fixture();
+    let read = |f: &mut Fixture, clock: u64| {
+        assert_eq!(f.ret(nr::CLOCK_GETTIME, &[clock, DATA]), 0);
+        let [s, ns] = [
+            f.mem.read_u64(GuestAddr(DATA)).unwrap(),
+            f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(),
+        ];
+        s * 1_000_000_000 + ns
+    };
+    let start = read(&mut f, 3);
+    // The recording host measures no CPU time, so wall time counts instead.
+    f.mem.write_u64(GuestAddr(DATA + 0x100), 2).unwrap();
+    f.mem.write_u64(GuestAddr(DATA + 0x108), 0).unwrap();
+    assert_eq!(f.ret(nr::NANOSLEEP, &[DATA + 0x100, 0]), 0);
+    let thread = read(&mut f, 3);
+    assert!(thread >= start + 2_000_000_000, "{start} {thread}");
+    assert!(read(&mut f, 2) >= thread);
+    for clock in [0, 1, 4, 5, 6, 7, 8, 9, 11] {
+        read(&mut f, clock);
+    }
+    assert_eq!(f.ret(nr::CLOCK_GETTIME, &[10, DATA]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(229, &[2, DATA]), 0);
+    assert_eq!(
+        (
+            f.mem.read_u64(GuestAddr(DATA)).unwrap(),
+            f.mem.read_u64(GuestAddr(DATA + 8)).unwrap()
+        ),
+        (0, 1)
+    );
+    assert_eq!(f.ret(229, &[6, DATA]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 4_000_000);
+    assert_eq!(f.ret(229, &[3, 0]), 0);
+    assert_eq!(f.ret(229, &[12, DATA]), errno(Errno::EINVAL));
+    // getrusage and times report the same time; no child has been waited for.
+    assert_eq!(f.ret(98, &[0, DATA]), 0);
+    assert!(f.mem.read_u64(GuestAddr(DATA)).unwrap() >= 2);
+    assert_eq!(f.ret(98, &[u64::MAX, DATA]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 0);
+    assert!(f.ret(100, &[DATA]) as i64 >= 200);
+    assert!(f.mem.read_u64(GuestAddr(DATA)).unwrap() >= 200);
+    assert_eq!(f.ret(100, &[0x10]), errno(Errno::EFAULT));
+}

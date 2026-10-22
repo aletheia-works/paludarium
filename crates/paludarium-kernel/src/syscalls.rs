@@ -42,6 +42,8 @@ pub mod nr {
     pub const EXIT_GROUP: u64 = 231;
     pub const MREMAP: u64 = 25;
     pub const GETRUSAGE: u64 = 98;
+    pub const TIMES: u64 = 100;
+    pub const CLOCK_GETRES: u64 = 229;
     pub const MSYNC: u64 = 26;
     pub const MADVISE: u64 = 28;
     pub const UNAME: u64 = 63;
@@ -91,7 +93,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 43] = [
+        let entries: [(u64, Handler); 45] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -128,6 +130,8 @@ impl SyscallTable {
             (nr::SCHED_YIELD, sys_sched_yield),
             (nr::SYSINFO, sys_sysinfo),
             (nr::GETRUSAGE, sys_getrusage),
+            (nr::TIMES, sys_times),
+            (nr::CLOCK_GETRES, sys_clock_getres),
             (nr::GETGROUPS, sys_getgroups),
             (nr::TIMER_CREATE, sys_timer_create),
             (nr::TIMER_SETTIME, sys_timer_settime),
@@ -232,10 +236,51 @@ fn write_timespec(mem: &AddressSpace, addr: u64, nanos: u64) -> Result<(), Errno
     mem.write(GuestAddr(addr), &bytes)
         .map_err(|_| Errno::EFAULT)
 }
+/// What a `clockid_t` reads: a host clock, or this process's or thread's
+/// CPU time. MONOTONIC_RAW, the coarse clocks, BOOTTIME (this host never
+/// suspends), the two alarm clocks and TAI (with a TAI offset of 0, as
+/// Linux has until NTP sets one) read the monotonic and real-time clocks.
+enum GuestClock {
+    Host(ClockId),
+    ProcessCpu,
+    ThreadCpu,
+}
+fn guest_clock(id: u64) -> Result<GuestClock, Errno> {
+    Ok(match id {
+        0 | 5 | 8 | 11 => GuestClock::Host(ClockId::Realtime),
+        1 | 4 | 6 | 7 | 9 => GuestClock::Host(ClockId::Monotonic),
+        2 => GuestClock::ProcessCpu,
+        3 => GuestClock::ThreadCpu,
+        _ => return Err(Errno::EINVAL),
+    })
+}
+fn read_clock(c: &mut Context<'_>, clock: GuestClock) -> Result<u64, Errno> {
+    let thread = crate::account_cpu(c.host, c.group, c.process);
+    match clock {
+        GuestClock::Host(id) => c.host.clock(id),
+        GuestClock::ProcessCpu => Ok(c.group.process_cpu()),
+        GuestClock::ThreadCpu => Ok(thread),
+    }
+}
 fn sys_clock_gettime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let result = clock_id(a[0])
-        .and_then(|id| c.host.clock(id))
+    let result = guest_clock(a[0])
+        .and_then(|clock| read_clock(c, clock))
         .and_then(|value| write_timespec(c.mem, a[1], value));
+    match result {
+        Ok(()) => ok(0),
+        Err(e) => err(e),
+    }
+}
+/// `clock_getres`: 1 ns for every clock, as Linux's high-resolution timers
+/// give, except the coarse ones, which tick with the scheduler (4 ms here).
+fn sys_clock_getres(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let result = guest_clock(a[0]).and_then(|_| {
+        if a[1] == 0 {
+            return Ok(());
+        }
+        let resolution = if matches!(a[0], 5 | 6) { 4_000_000 } else { 1 };
+        write_timespec(c.mem, a[1], resolution)
+    });
     match result {
         Ok(()) => ok(0),
         Err(e) => err(e),
@@ -1360,20 +1405,57 @@ fn sys_getgroups(_c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// Memory a guest is told it has; like `uname`, the host's is not revealed.
 const SYSINFO_RAM: u64 = 4 << 30;
 
-/// `struct sysinfo` (112 bytes): the uptime is the monotonic clock's, the
-/// `getrusage(who, usage)`: RUSAGE_SELF, RUSAGE_CHILDREN and RUSAGE_THREAD
-/// report all zeros, as no CPU time or memory use is measured (the rusage
-/// `wait4` and `waitid` return is zero too); any other `who` is `EINVAL`.
+/// A `struct rusage` with `cpu` nanoseconds as user time. The emulator's
+/// own work for the guest's system calls happens in user space on the host,
+/// so the system time is 0, and memory use is not measured.
+pub(crate) fn rusage(cpu: u64) -> [u8; 144] {
+    let mut bytes = [0u8; 144];
+    bytes[..8].copy_from_slice(&(cpu / 1_000_000_000).to_le_bytes());
+    bytes[8..16].copy_from_slice(&(cpu % 1_000_000_000 / 1000).to_le_bytes());
+    bytes
+}
+
+/// `getrusage(who, usage)`: the CPU time of the process (RUSAGE_SELF), the
+/// thread (RUSAGE_THREAD) or the children waited for (RUSAGE_CHILDREN), as
+/// [`rusage`] lays it out; any other `who` is `EINVAL`.
 fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    if !matches!(a[0] as i32, -1..=1) {
-        return err(Errno::EINVAL);
-    }
-    match c.mem.write(GuestAddr(a[1]), &[0; 144]) {
+    let thread = crate::account_cpu(c.host, c.group, c.process);
+    let cpu = match a[0] as i32 {
+        0 => c.group.process_cpu(),
+        1 => thread,
+        -1 => c.processes.children_cpu(c.process.pid),
+        _ => return err(Errno::EINVAL),
+    };
+    match c.mem.write(GuestAddr(a[1]), &rusage(cpu)) {
         Ok(()) => ok(0),
         Err(_) => err(Errno::EFAULT),
     }
 }
 
+/// `times(buf)`: the same CPU times in clock ticks (USER_HZ is 100), and the
+/// monotonic clock in ticks as the return value.
+fn sys_times(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let result = (|| {
+        crate::account_cpu(c.host, c.group, c.process);
+        let ticks = |ns: u64| ns / 10_000_000;
+        if a[0] != 0 {
+            let words = [
+                ticks(c.group.process_cpu()),
+                0,
+                ticks(c.processes.children_cpu(c.process.pid)),
+                0,
+            ];
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            c.mem
+                .write(GuestAddr(a[0]), &bytes)
+                .map_err(|_| Errno::EFAULT)?;
+        }
+        Ok(ticks(c.host.clock(ClockId::Monotonic)?))
+    })();
+    outcome(result)
+}
+
+/// `struct sysinfo` (112 bytes): the uptime is the monotonic clock's, the
 /// memory is a fixed [`SYSINFO_RAM`] with nothing used and no swap, the load
 /// averages are 0 and `procs` counts this process's threads.
 fn sys_sysinfo(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {

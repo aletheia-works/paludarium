@@ -2,27 +2,24 @@
 
 ## Current status
 
-The first release version is decided as `0.1.0` (Build and Test Q7,
-2026-10-18). The Cargo workspace version, the eleven internal dependency
-versions and the npm package `@aletheia-works/paludarium-wasm` are all `0.1.0`;
-`Cargo.lock` and `fuzz/Cargo.lock` changed only in the workspace crates'
-version lines. The fuzz crate (`paludarium-fuzz`, `publish = false`) keeps its
-own `0.0.0`. `v0.1.0` was published on 2026-10-20 (tag on 0f456d07, publish
-run 39373383076) with one-time scoped tokens, because crates.io lets a Trusted
-Publisher be registered only for a crate that already exists; every later
-release is by Trusted Publishing (OIDC) only.
+The latest release is `v0.2.0` (2026-10-22, tag on 4125399f, publish run
+39701905461). The eleven crates and `@aletheia-works/paludarium-wasm` are
+published only by Trusted Publishing (OIDC) from `publish.yml`, after the
+same-head evidence of the head (steps 5 and 6 below). Only the first release,
+`v0.1.0` (2026-10-20, tag on 0f456d07), was published by hand with one-time
+scoped tokens, because crates.io lets a Trusted Publisher be registered only
+for a crate that already exists.
 
 The eleven public crates are types, host, mmu, vfs, loader, decoder, cpu,
 jit, kernel, runtime and paludarium, in the dependency order calculated from
-the manifests. Harness and the Rust Wasm adapter have `publish = false`.
+the manifests. They share the workspace version, which Release Please sets
+together with the internal dependency versions and the npm package version.
+Harness, the Rust Wasm adapter and the fuzz crate have `publish = false`.
 
-The tested toolchain remains `nightly-2026-10-11`. A real external consumer
-using the eleven generated crates through a private loopback sparse registry
-built successfully. The initial stable 1.99.0 probe failed because every
-crate declares MSRV 1.101. The separately installed latest stable 1.99.1 also
-failed with exit 101 for the same declared MSRV; both raw failures are retained,
-never labeled stable support. The Wasm
-adapter additionally needs nightly build-std and atomic-wait support.
+The tested toolchain is the nightly pinned in `rust-toolchain.toml`. Every
+crate declares MSRV 1.101, so the current stable release (1.99.1) cannot
+build them, and stable support is not claimed. The Wasm adapter
+additionally needs nightly build-std and atomic-wait support.
 
 ## Non-publishing checks
 

@@ -169,6 +169,9 @@ fn macos_fs_negative_mtime() {
     );
     assert_eq!(h.stat().unwrap().mtime_ns, -1_000_000_000);
 }
+// Unix hosts keep every mode bit and nanosecond times; Windows is tested in
+// windows_tests.
+#[cfg(unix)]
 #[test]
 fn macos_fs_mode_times_and_sync() {
     let x = Fixture::new();

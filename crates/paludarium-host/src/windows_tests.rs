@@ -367,3 +367,29 @@ fn windows_fs_negative_mtime() {
     );
     assert_eq!(h.stat().unwrap().mtime_ns, -1_000_000_000);
 }
+// Windows keeps only a read-only attribute and 100 ns times.
+#[cfg(windows)]
+#[test]
+fn windows_fs_mode_is_the_read_only_attribute() {
+    let x = Fixture::new();
+    let f = x.fs().open(b"file", 66, 0o644).unwrap();
+    let readonly = || {
+        std::fs::metadata(x.root.join("root/file"))
+            .unwrap()
+            .permissions()
+            .readonly()
+    };
+    x.fs().set_mode(b"file", 0o444).unwrap();
+    assert!(readonly());
+    f.set_mode(0o644).unwrap();
+    assert!(!readonly());
+    x.fs()
+        .set_times(b"file", true, None, Some(1_234_567_890_123_456_700))
+        .unwrap();
+    assert_eq!(
+        x.fs().metadata(b"file", false).unwrap().mtime_ns,
+        1_234_567_890_123_456_700
+    );
+    assert_eq!(f.sync(), Ok(()));
+    assert_eq!(x.fs().set_mode(b"missing", 0o600), Err(Errno::ENOENT));
+}

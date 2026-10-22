@@ -56,7 +56,8 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   `CPUID`, it does not reveal the host. The guest runs as root (user and group
   0), the owner `stat` reports for every file.
 - `chmod` and `utimensat` work in the in-memory filesystem and in mounted
-  host directories. `stat` reports only the modification time, with access
+  host directories; on a Windows host, `chmod` only sets or clears the
+  read-only attribute. `stat` reports only the modification time, with access
   and change times of 0; the host still records both times it is given for a
   file in a mounted directory. The umask is shared by threads, as `CLONE_FS` shares it on
   Linux. `fsync` and `fdatasync` succeed on files and directories and give

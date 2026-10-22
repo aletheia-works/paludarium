@@ -115,13 +115,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - **aube**：Rust で書かれた Node.js のパッケージマネージャ（v2.8.1）。`--version`、
   `install`、`install --frozen-lockfile`、`list` の 4 つの操作が、本物の Linux と
   同じ出力と終了コードになります。
-
-これらは、Linux・macOS・Windows と、Node.js・Chromium・Firefox・Safari のすべてで、
-本物の x86-64 Linux と同じ結果になることを確かめています。
-
 - **ripgrep**：Rust で書かれたテキストの検索のツール（15.2.0）。検索を複数のスレッドで
   動かします。正規表現での置き換え、並列の検索、ファイルをメモリへマップした検索、2 つの
   エラーを含む 9 つの検索が、本物の Linux と同じ出力と終了コードになります。
-  今のところ確かめているのは x86-64 Linux だけです。
   `--version` は比べていません。`CPUID` が見せる SIMD の機能を表示するためで、
   paludarium はそれをわざと絞っています。
+
+これらは、Linux・macOS・Windows と、Node.js・Chromium・Firefox・Safari のすべてで、
+本物の x86-64 Linux と同じ結果になることを確かめています。

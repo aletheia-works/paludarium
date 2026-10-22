@@ -9,9 +9,10 @@ import tempfile
 
 from comparison import compare, probe_pass
 from comparison_args import compare_original, comparison_config
-from evidence import digest, snapshot
+from evidence import snapshot
 from metadata import fixture_inputs
 from native import observe
+from ripgrep import compare_ripgrep
 from runner import run
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -129,40 +130,25 @@ def differential(executable, *, original_argv=False):
         shutil.copytree(HERE / "fixtures", fixture)
         if fixture_inputs(fixture) != native["fixture_input_modes"]:
             raise ValueError("native/emulated fixture input mode mismatch")
-        ripgrep = native["ripgrep"]
-        if ripgrep["binary_sha256"] != digest(guests / "ripgrep"):
-            raise ValueError("native ripgrep observed different bytes")
         observations["ripgrep"] = {}
-        for case in json.loads((HERE / "ripgrep-cases.json").read_text())["cases"]:
-            name = "ripgrep-" + case["name"]
-            row = operation(
+
+        def record_ripgrep(name, row):
+            observations["ripgrep"][name] = row
+            (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
+
+        compare_ripgrep(
+            native,
+            guests,
+            lambda case: operation(
                 executable,
                 guests / "ripgrep",
                 case["args"],
-                operations / name,
+                operations / ("ripgrep-" + case["name"]),
                 config["environment"],
                 fixture,
-            )
-            observations["ripgrep"][case["name"]] = row
-            (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
-            expected = ripgrep["rows"][case["name"]]
-            fields = ("exit", "timed_out", "stdout", "stderr", "wall_seconds")
-            print(
-                json.dumps(
-                    {
-                        "case": name,
-                        "native": {k: expected[k] for k in fields},
-                        "emulated": {k: row[k] for k in fields},
-                    }
-                ),
-                flush=True,
-            )
-            # ripgrep prints only the relative paths it is given, so its rows
-            # match exactly; the root normalization aube needs would rewrite
-            # every "/" of the emulated output.
-            for field in ("timed_out", "exit", "stdout", "stderr"):
-                if expected[field] != row[field]:
-                    raise ValueError(f"{name}: {field} mismatch")
+            ),
+            record_ripgrep,
+        )
         for case in config["aube"][:2]:
             name = "default-" + case["name"]
             row = operation(

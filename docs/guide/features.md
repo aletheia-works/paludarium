@@ -122,14 +122,12 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 - **aube**: a Node.js package manager written in Rust (v2.8.1). `--version`,
   `install`, `install --frozen-lockfile` and `list` give the same output and
   exit status as on real Linux.
-
-All of them give the same results as a real x86-64 Linux on Linux, macOS and
-Windows, and on Node.js, Chromium, Firefox and Safari.
-
 - **ripgrep**: a text search tool written in Rust (15.2.0), which runs its
   searches on several threads. Nine searches, including a regular expression
   replacement, a parallel search, one through a memory-mapped file and two
-  errors, give the same output and exit
-  status as on real Linux. This is checked on x86-64 Linux only so far.
-  `--version` is not compared, because it reports the SIMD features `CPUID`
-  shows, which paludarium limits on purpose.
+  errors, give the same output and exit status as on real Linux. `--version`
+  is not compared, because it reports the SIMD features `CPUID` shows, which
+  paludarium limits on purpose.
+
+All of them give the same results as a real x86-64 Linux on Linux, macOS and
+Windows, and on Node.js, Chromium, Firefox and Safari.

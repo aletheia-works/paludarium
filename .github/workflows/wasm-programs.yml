@@ -107,7 +107,7 @@ jobs:
         run: |
           node --test packages/paludarium-wasm/tests/wasm-*.test.mjs
           node packages/paludarium-wasm/tests/wasm-api-check.mjs packages/paludarium-wasm/paludarium.wasm
-      - name: Compare fourteen actual guest executions with fresh Linux
+      - name: Compare fourteen actual guest executions and the ripgrep searches with fresh Linux
         env:
           WASM_ENVIRONMENT: ${{ matrix.environment }}
         run: |
@@ -131,6 +131,10 @@ jobs:
           report = json.loads((output / 'observations.json').read_text())
           assert report['complete'] is True and len(report['rows']) == 14
           assert all(row['pass'] and row['exit'] == 0 and not row['timed_out'] for row in report['rows'].values())
+          cases = json.loads(pathlib.Path('tests/guests/programs/ripgrep-cases.json').read_text())['cases']
+          # Safari's WebDriver returns the report without its key order.
+          assert sorted(report['ripgrep']) == sorted(case['name'] for case in cases)
+          assert all(row['pass'] and not row['timed_out'] for row in report['ripgrep'].values())
           PY
       - name: Preserve raw results and cleanup evidence
         if: always()

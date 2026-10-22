@@ -11,6 +11,7 @@ from comparison_args import compare_original
 from fixture import fixture_inputs
 from operation import operation as guest_operation
 from oracle import load
+from ripgrep import compare_ripgrep
 from settings import configuration
 
 
@@ -77,6 +78,26 @@ def observe(executable, guests, native_path, output, root, *, original=False):
         shutil.copytree(root / "tests/guests/programs/fixtures", fixture)
         if fixture_inputs(fixture) != native["fixture_input_modes"]:
             raise ValueError("native/emulated fixture mode mismatch")
+        if not original:
+            data["ripgrep"] = {}
+
+            def record_ripgrep(name, row):
+                data["ripgrep"][name] = row
+                (output / "observations.json").write_text(json.dumps(data, indent=2) + "\n")
+
+            compare_ripgrep(
+                native,
+                guests,
+                lambda case: guest_operation(
+                    executable,
+                    guests / "ripgrep",
+                    case["args"],
+                    operations / ("ripgrep-" + case["name"]),
+                    config["environment"],
+                    fixture,
+                ),
+                record_ripgrep,
+            )
         for case in config["aube"][:2]:
             row = guest_operation(
                 executable,
@@ -106,4 +127,8 @@ def observe(executable, guests, native_path, output, root, *, original=False):
         raise ValueError("incomplete Windows inventory")
     data["differential_complete"] = True
     (output / "observations.json").write_text(json.dumps(data, indent=2) + "\n")
-    print("Windows native host: fourteen Linux comparisons and two default VFS cases passed")
+    print(
+        "Windows native host: fourteen Linux comparisons, two default VFS cases"
+        + ("" if original else " and the ripgrep searches")
+        + " passed"
+    )

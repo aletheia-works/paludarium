@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { createPaludarium } from "../index.mjs";
 import { validateOracle } from "./wasm-contract.mjs";
-import { compare, observeProgram, probeCases } from "./wasm-programs.mjs";
+import { compare, observeProgram, observeRipgrep, probeCases } from "./wasm-programs.mjs";
 import { compareFilesystem } from "./wasm-filesystem.mjs";
 const [modulePath, oraclePath, guestDirectory = "target/guests/programs", outputDirectory = "target/wasm/node", slice] = process.argv.slice(2);
 if (!modulePath || !oraclePath) throw new Error("usage: wasm-node-check.mjs module oracle [guests] [output] [--probe-only]");
@@ -30,6 +30,14 @@ for (const item of probeCases()) {
 if (slice !== "--probe-only") {
   const aube = new Uint8Array(await readFile(resolve(guestDirectory, "aube")));
   if (hash(aube) !== oracle.binary_hashes.aube) throw new Error("Aube differs from fresh native binary");
+  const ripgrep = new Uint8Array(await readFile(resolve(guestDirectory, "ripgrep")));
+  if (hash(ripgrep) !== oracle.ripgrep?.binary_sha256) throw new Error("ripgrep differs from fresh native binary");
+  const ripgrepCases = JSON.parse(await readFile("tests/guests/programs/ripgrep-cases.json", "utf8")).cases, fixtures = {};
+  for (const relative of ["app/package.json", "app/filedep/package.json", "outside/linked/package.json"]) fixtures[relative] = new Uint8Array(await readFile("tests/guests/programs/fixtures/" + relative));
+  report.ripgrep = await observeRipgrep(() => createPaludarium({ wasmUrl: pathToFileURL(resolve(modulePath)) }), { ripgrep, cases: ripgrepCases, oracle, fixtures, onRow: async (name, row) => {
+    report.ripgrep = { ...report.ripgrep, [name]: row }; await persist(); console.log(JSON.stringify({ name: "ripgrep-" + name, exit: row.exit, pass: row.pass, timed_out: row.timed_out, errors: row.errors }));
+  } });
+  failed ||= Object.values(report.ripgrep).some(row => !row.pass) || Object.keys(report.ripgrep).length !== ripgrepCases.length;
   const files = { "/aube": aube }, fileModes = {};
   const environment = oracle.guest_environment ?? config.environment;
   const fixtureRoot = oracle.fixture_root + "/fixture", cwd = fixtureRoot + "/app";

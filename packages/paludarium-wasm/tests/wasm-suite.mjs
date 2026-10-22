@@ -1,8 +1,8 @@
 import { createPaludarium } from "../index.mjs";
 import { validateOracle } from "./wasm-contract.mjs";
-import { compare, observeProgram, probeCases } from "./wasm-programs.mjs";
+import { compare, observeProgram, observeRipgrep, probeCases } from "./wasm-programs.mjs";
 import { compareFilesystem } from "./wasm-filesystem.mjs";
-export async function runSuite({ wasmUrl, oracle, config, probe, aube, fixtures, jit = false, onRow = () => {} }) {
+export async function runSuite({ wasmUrl, oracle, config, probe, aube, ripgrep, ripgrepCases, fixtures, jit = false, onRow = () => {} }) {
   validateOracle(oracle);
   const rows = {}, launch = () => createPaludarium({ wasmUrl });
   for (const item of probeCases()) {
@@ -18,6 +18,8 @@ export async function runSuite({ wasmUrl, oracle, config, probe, aube, fixtures,
       rows[item.name] = row; await onRow(item.name, row);
     } finally { await launcher.dispose(); }
   }
+  // The ripgrep rows are optional, so the JIT suite can leave them out.
+  const ripgrepRows = ripgrep ? await observeRipgrep(launch, { ripgrep, cases: ripgrepCases, oracle, fixtures, jit, onRow }) : undefined;
   const environment = oracle.guest_environment, fixtureRoot = oracle.fixture_root + "/fixture", cwd = fixtureRoot + "/app";
   if (!environment) throw new Error("Fresh native exact environment is required");
   const files = { "/aube": aube, [environment.HOME + "/.keep"]: new Uint8Array(), [environment.TMPDIR + "/.keep"]: new Uint8Array() }, fileModes = {};
@@ -45,5 +47,6 @@ export async function runSuite({ wasmUrl, oracle, config, probe, aube, fixtures,
       rows[item.name] = row; await onRow(item.name, row);
     }
   } finally { await launcher.dispose(); }
-  return { rows, complete: Object.keys(rows).length === 14 && Object.values(rows).every(row => row.pass), passed: Object.values(rows).every(row => row.pass) };
+  const ripgrepPassed = Object.values(ripgrepRows ?? {}).every(row => row.pass);
+  return { rows, ripgrep: ripgrepRows, complete: Object.keys(rows).length === 14 && Object.values(rows).every(row => row.pass) && ripgrepPassed && (!ripgrep || Object.keys(ripgrepRows).length === ripgrepCases.length), passed: Object.values(rows).every(row => row.pass) && ripgrepPassed };
 }

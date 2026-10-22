@@ -34,3 +34,27 @@ export async function observeProgram(launcher, options) {
 export function probeCases() {
   return [...WASM_PROBES, "all", "environment"].map(name => ({ name: `probe-${name}`, args: name === "all" ? [] : [name] }));
 }
+// ripgrep reads the fixture before aube changes it and prints only the
+// relative paths it is given, so its rows must match the Linux rows exactly.
+export async function observeRipgrep(launch, { ripgrep, cases, oracle, fixtures, jit = false, onRow = () => {} }) {
+  const native = oracle.ripgrep, environment = oracle.guest_environment, fixtureRoot = oracle.fixture_root + "/fixture";
+  if (!native || !environment) throw new Error("Fresh native ripgrep rows and environment are required");
+  if (Object.keys(native.rows).join() !== cases.map(item => item.name).join()) throw new Error("Unexpected native ripgrep inventory");
+  const files = { "/ripgrep": ripgrep }, fileModes = {};
+  for (const [relative, data] of Object.entries(fixtures)) { const path = fixtureRoot + "/" + relative; files[path] = data; fileModes[path] = 0o644; }
+  const rows = {}, launcher = await launch();
+  try {
+    const filesystem = await launcher.createFileSystem({ files, fileModes });
+    for (const item of cases) {
+      const row = await observeProgram(launcher, { program: "/ripgrep", cwd: fixtureRoot + "/app", args: ["/ripgrep", ...item.args], env: environment, filesystem, jit });
+      const expected = native.rows[item.name];
+      try {
+        if (row.timed_out || expected.timed_out || row.errors.length) throw new Error("Guest operation timed out or failed");
+        for (const key of ["exit", "stdout", "stderr"]) if (row[key] !== expected[key]) throw new Error(`${key} mismatch`);
+        row.pass = true;
+      } catch (cause) { row.pass = false; row.comparison_error = String(cause); }
+      rows[item.name] = row; await onRow(item.name, row, "ripgrep");
+    }
+  } finally { await launcher.dispose(); }
+  return rows;
+}

@@ -1042,3 +1042,38 @@ fn getrusage_checks_who_and_the_pointer() {
     assert_eq!(f.ret(98, &[2, DATA]), errno(Errno::EINVAL));
     assert_eq!(f.ret(98, &[0, 0x10]), errno(Errno::EFAULT));
 }
+#[test]
+fn poll_waits_for_its_timeout_and_dup2_replaces_stdin() {
+    let mut f = fixture();
+    assert_eq!(f.ret(22, &[DATA + 0x100]), 0);
+    let mut fds = [0u8; 8];
+    f.mem.read(GuestAddr(DATA + 0x100), &mut fds).unwrap();
+    let (reader, writer) = (
+        u64::from(u32::from_le_bytes(fds[..4].try_into().unwrap())),
+        u64::from(u32::from_le_bytes(fds[4..].try_into().unwrap())),
+    );
+    let set = |f: &mut Fixture, fd: u64| {
+        f.mem
+            .write(GuestAddr(DATA), &(fd as i32).to_le_bytes())
+            .unwrap();
+        f.mem.write(GuestAddr(DATA + 4), &[1, 0, 0, 0]).unwrap();
+    };
+    let revents = |f: &Fixture| {
+        let mut b = [0u8; 2];
+        f.mem.read(GuestAddr(DATA + 6), &mut b).unwrap();
+        u16::from_le_bytes(b)
+    };
+    // An empty pipe: the 50 ms pass (on the recording host's clock) with nothing ready.
+    set(&mut f, reader);
+    assert_eq!(f.ret(nr::POLL, &[DATA, 1, 50]), 0);
+    assert_eq!(revents(&f), 0);
+    f.mem.write(GuestAddr(DATA + 0x200), b"x").unwrap();
+    assert_eq!(f.ret(1, &[writer, DATA + 0x200, 1]), 1);
+    assert_eq!(f.ret(nr::POLL, &[DATA, 1, u64::MAX]), 1);
+    assert_eq!(revents(&f), 1);
+    assert_eq!(f.ret(0, &[reader, DATA + 0x200, 1]), 1);
+    // Once a pipe replaces stdin, fd 0 is that pipe, not the host's stream.
+    assert_eq!(f.ret(33, &[reader, 0]), 0);
+    set(&mut f, 0);
+    assert_eq!(f.ret(nr::POLL, &[DATA, 1, 0]), 0);
+}

@@ -117,6 +117,7 @@ mod linux {
         processes_prctl => ("prctl","process"),
         processes_pdeathsig => ("pdeathsig","process"),
         processes_pipe_size => ("pipe-size","process"),
+        processes_poll => ("poll","process"),
         processes_proc_status => ("proc-status","process"),
         processes_waitid => ("waitid","process"),
         processes_thread_name => ("thread-name","process"),

@@ -57,6 +57,28 @@ pub fn spawn(_task: Box<dyn FnOnce() + Send>) -> Result<Box<dyn ThreadHandle>, E
     Err(Errno::ENOSYS)
 }
 
+/// Waits in real time, at most `nanos`, for `token` to leave `expected`.
+pub(crate) fn wait_briefly(token: &WaitToken, expected: u32, nanos: u64) {
+    #[cfg(target_arch = "wasm32")]
+    // SAFETY: as in `wait`, the borrowed token pins its aligned AtomicU32.
+    unsafe {
+        core::arch::wasm32::memory_atomic_wait32(
+            token.state.as_ptr().cast(),
+            expected as i32,
+            nanos as i64,
+        );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let gate = token.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        if token.value() == expected {
+            let _ = token
+                .changed
+                .wait_timeout(gate, std::time::Duration::from_nanos(nanos))
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
 pub fn wait<H: Host + ?Sized>(
     host: &H,
     token: &WaitToken,

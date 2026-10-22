@@ -859,6 +859,62 @@ int main(int argc, char **argv) {
         result("errno", errno);
         return 0;
     }
+    if (!strcmp(mode, "poll")) {
+        int pipefd[2];
+        pipe(pipefd);
+        struct pollfd fds[3] = {{pipefd[0], POLLIN, 0}, {-1, POLLIN, 7}, {99, POLLIN, 0}};
+        /* An empty pipe: the timeout passes; the other two entries still count. */
+        result("timeout", poll(fds, 1, 20));
+        result("revents", fds[0].revents);
+        result("ignored-and-invalid", poll(fds + 1, 2, 20));
+        result("negative", fds[1].revents);
+        result("invalid", fds[2].revents);
+        struct pollfd writable = {pipefd[1], POLLOUT, 0};
+        result("writable", poll(&writable, 1, -1));
+        result("revents", writable.revents);
+        /* A child's write wakes a wait without a timeout. */
+        pid_t pid = child();
+        if (pid == 0) {
+            write(pipefd[1], "x", 1);
+            _exit(0);
+        }
+        result("woken", poll(fds, 1, -1));
+        result("revents", fds[0].revents);
+        finish(pid);
+        char byte;
+        read(pipefd[0], &byte, 1);
+        /* After the writer closes, the read end hangs up. */
+        close(pipefd[1]);
+        result("hangup", poll(fds, 1, -1));
+        result("revents", fds[0].revents);
+        /* fd 0 replaced by an empty pipe is not ready. */
+        int other[2];
+        pipe(other);
+        dup2(other[0], 0);
+        struct pollfd input = {0, POLLIN, 0};
+        result("stdin-pipe", poll(&input, 1, 0));
+        /* A signal ends a wait without a timeout. */
+        signal(SIGUSR1, interrupted);
+        int stop[2];
+        pipe(stop);
+        pid = child();
+        if (pid == 0) {
+            close(stop[1]);
+            fcntl(stop[0], F_SETFL, O_NONBLOCK);
+            char none;
+            while (read(stop[0], &none, 1) < 0) {
+                kill(getppid(), SIGUSR1);
+                sched_yield();
+            }
+            _exit(0);
+        }
+        errno = 0;
+        result("interrupted", poll(&input, 1, -1));
+        result("errno", errno);
+        write(stop[1], "x", 1);
+        finish(pid);
+        return 0;
+    }
     if (!strcmp(mode, "pipe-size")) {
         /* brush sizes the pipe of a here-doc to its text. */
         int pipefd[2];

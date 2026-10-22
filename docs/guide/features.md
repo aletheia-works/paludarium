@@ -47,6 +47,11 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
 - `socket()` always returns `EAFNOSUPPORT`: there is no network.
+- `poll` waits like `epoll_wait`: until a descriptor is ready, the timeout
+  in milliseconds passes (a negative one never does) or a signal arrives
+  (`EINTR`). The host's standard streams are always ready until a descriptor
+  replaces them. A pipe's read end is readable only with unread data, and
+  only hung up once its writers are gone, as Linux's `pipe_poll` reports.
 - A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
   `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
   at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.

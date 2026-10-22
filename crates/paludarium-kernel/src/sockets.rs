@@ -159,11 +159,19 @@ impl FileHandle for PipeEnd {
     }
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         let (mask, input, output) = self.endpoint.readiness()?;
-        Ok((
-            mask & if self.reader { IN | 0x10 } else { OUT | 8 },
-            input,
-            output,
-        ))
+        // Unlike a socket, a pipe at end of file is not readable: Linux's
+        // `pipe_poll` sets POLLIN only for unread data, and POLLHUP alone once
+        // the writers are gone.
+        let mask = if self.reader {
+            mask & if self.endpoint.unread() == 0 {
+                0x10
+            } else {
+                IN | 0x10
+            }
+        } else {
+            mask & (OUT | 8)
+        };
+        Ok((mask, input, output))
     }
     fn flags(&self) -> u32 {
         u32::from(!self.reader) | (self.endpoint.flags() & NONBLOCK)
@@ -304,6 +312,15 @@ pub(crate) struct SocketPairEnd {
     flags: AtomicU32,
 }
 impl SocketPairEnd {
+    /// The bytes waiting to be read on this side.
+    fn unread(&self) -> usize {
+        self.pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[self.side]
+            .bytes
+            .len()
+    }
     /// Only a SOCK_STREAM socket raises SIGPIPE with EPIPE, as on Linux.
     pub(crate) fn raises_sigpipe(&self) -> bool {
         self.pair.kind == SOCK_STREAM

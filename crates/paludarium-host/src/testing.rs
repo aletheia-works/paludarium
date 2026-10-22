@@ -123,6 +123,27 @@ impl Host for RecordingHost {
         s.realtime = s.realtime.saturating_add(elapsed);
         Ok(WaitOutcome::Complete)
     }
+    /// A bounded wait gives other threads 10 ms of real time to change the
+    /// token, then reaches its deadline at once on the virtual clock, as
+    /// [`Host::wait_until`] does here; an unbounded one waits in real time.
+    fn wait_on(
+        &self,
+        token: &crate::WaitToken,
+        expected: u32,
+        deadline: Option<(ClockId, u64)>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<WaitOutcome, Errno> {
+        let Some((clock, end)) = deadline else {
+            return crate::threads::wait(self, token, expected, None, cancel);
+        };
+        if token.value() == expected && !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::threads::wait_briefly(token, expected, 10_000_000);
+        }
+        if token.value() != expected {
+            return Ok(WaitOutcome::Complete);
+        }
+        self.wait_until(clock, end, cancel)
+    }
     fn read_stdin(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let mut s = self.lock();
         let start = s.stdin_pos.min(s.stdin.len());

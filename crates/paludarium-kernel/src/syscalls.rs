@@ -712,24 +712,55 @@ const POLLOUT: u16 = 0x4;
 const POLLNVAL: u16 = 0x20;
 const MAX_POLL_FDS: u64 = 1024;
 
+/// `poll(fds, nfds, timeout)`: waits until a descriptor is ready, the
+/// timeout in milliseconds passes (a negative one never does, 0 polls once)
+/// or a signal arrives (`EINTR`), as `epoll_wait` does.
 fn sys_poll(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let (fds, nfds) = (a[0], a[1]);
+    let (fds, nfds, timeout) = (a[0], a[1], a[2] as i32);
     if nfds > MAX_POLL_FDS {
         return err(Errno::EINVAL);
     }
+    let result = (|| {
+        let deadline = if timeout < 0 {
+            None
+        } else {
+            Some(
+                c.host
+                    .clock(ClockId::Monotonic)?
+                    .saturating_add(timeout as u64 * 1_000_000),
+            )
+        };
+        loop {
+            // Sample the ticket before inspecting readiness, so no change is lost.
+            let ticket = c.files.readiness.token.value();
+            let ready = poll_once(c, fds, nfds)?;
+            if ready != 0
+                || deadline
+                    .is_some_and(|end| c.host.clock(ClockId::Monotonic).is_ok_and(|now| now >= end))
+            {
+                return Ok(ready);
+            }
+            crate::events::wait(c, ticket, deadline)?;
+        }
+    })();
+    outcome(result)
+}
+
+/// One pass over the `pollfd` array, writing each `revents`; returns how
+/// many descriptors have any.
+fn poll_once(c: &mut Context<'_>, fds: u64, nfds: u64) -> Result<u64, Errno> {
     let mut ready = 0u64;
     for n in 0..nfds {
         let at = GuestAddr(fds.wrapping_add(n * 8));
         let mut entry = [0u8; 8];
-        if c.mem.read(at, &mut entry).is_err() {
-            return err(Errno::EFAULT);
-        }
+        c.mem.read(at, &mut entry).map_err(|_| Errno::EFAULT)?;
         let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
         let events = u16::from_le_bytes([entry[4], entry[5]]);
         let revents = match fd {
             fd if fd < 0 => 0,
-            0 => events & POLLIN,
-            1 | 2 => events & POLLOUT,
+            // The host's own standard streams are always ready.
+            0 if c.files.uses_original_stdio(0) => events & POLLIN,
+            1 | 2 if c.files.uses_original_stdio(fd as u64) => events & POLLOUT,
             _ => match c.files.descriptor(fd as u64) {
                 Ok(d) => match d.file.readiness() {
                     Ok((mask, _, _)) => (mask as u16) & (events | 0x18),
@@ -744,17 +775,14 @@ fn sys_poll(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 Err(_) => POLLNVAL,
             },
         };
-        if c.mem
+        c.mem
             .write(at.wrapping_add(6), &revents.to_le_bytes())
-            .is_err()
-        {
-            return err(Errno::EFAULT);
-        }
+            .map_err(|_| Errno::EFAULT)?;
         if revents != 0 {
             ready += 1;
         }
     }
-    ok(ready)
+    Ok(ready)
 }
 
 const MAP_SHARED: u64 = 0x01;

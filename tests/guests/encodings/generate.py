@@ -9,17 +9,25 @@ names = [
     "addpd",
     "addps",
     "addsd",
+    "addss",
     "andnpd",
     "andpd",
     "andps",
     "blendvps",
     "cmpeqsd",
+    "cmpeqss",
     "cmpltsd",
+    "cmpltss",
     "cmpneqsd",
+    "cmpneqss",
     "cmpunordsd",
+    "cmpunordss",
     "comisd",
+    "comiss",
     "cvtdq2ps",
+    "cvtsd2ss",
     "cvtsi2sd",
+    "cvtsi2ss",
     "cvtss2sd",
     "cvttps2dq",
     "cvttsd2si",
@@ -29,8 +37,12 @@ names = [
     "divss",
     "lddqu",
     "ldmxcsr",
+    "lfence",
     "maxsd",
+    "maxss",
+    "mfence",
     "minsd",
+    "minss",
     "movapd",
     "movaps",
     "movd",
@@ -52,6 +64,7 @@ names = [
     "movups",
     "mulpd",
     "mulsd",
+    "mulss",
     "orpd",
     "orps",
     "packssdw",
@@ -122,12 +135,15 @@ names = [
     "punpcklqdq",
     "punpcklwd",
     "pxor",
+    "sfence",
     "shufpd",
     "shufps",
     "sqrtps",
     "sqrtsd",
+    "sqrtss",
     "subpd",
     "subsd",
+    "subss",
     "ucomisd",
     "ucomiss",
     "unpckhpd",
@@ -136,7 +152,7 @@ names = [
     "xorpd",
     "xorps",
 ]
-assert len(names) == 129
+assert len(names) == 145
 cases = []
 for name in names:
     insn = f"{name} xmm0, xmm1"
@@ -152,12 +168,15 @@ for name in names:
         insn = f"{name} {'rax' if name == 'pextrq' else 'eax'}, xmm1, 3"
     elif name.startswith("pinsr"):
         insn = f"{name} xmm0, {'rax' if name == 'pinsrq' else 'eax'}, 3"
-    elif name == "cvtsi2sd":
-        insn = "cvtsi2sd xmm0, rax"
+    elif name in ("cvtsi2sd", "cvtsi2ss"):
+        insn = f"{name} xmm0, rax"
+    elif name.endswith("fence"):
+        insn = name
     elif name in ("cvttsd2si", "cvttss2si"):
         insn = f"{name} rax, xmm1"
     elif name.startswith("cmp"):
-        insn = f"cmpsd xmm0, xmm1, {dict(cmpeqsd=0, cmpltsd=1, cmpneqsd=4, cmpunordsd=3)[name]}"
+        predicate = dict(eq=0, lt=1, neq=4, unord=3)[name[3:-2]]
+        insn = f"cmp{name[-2:]} xmm0, xmm1, {predicate}"
     elif name in ("pslldq", "psrldq"):
         insn = f"{name} xmm0, 3"
     elif name in ("pshufd", "pshufhw", "pshuflw", "shufps"):

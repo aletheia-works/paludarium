@@ -198,7 +198,22 @@ impl MountedFs {
         Ok(current)
     }
 }
-impl FileSystem for MountedFs {}
+impl FileSystem for MountedFs {
+    fn mounts(&self) -> Vec<MountPoint> {
+        let mut out = Vec::new();
+        if !self.mounts.iter().any(|(root, _)| root == b"/") {
+            out.push(MountPoint {
+                path: b"/".to_vec(),
+                kind: "tmpfs",
+            });
+        }
+        out.extend(self.mounts.iter().map(|(root, _)| MountPoint {
+            path: root.clone(),
+            kind: "hostfs",
+        }));
+        out
+    }
+}
 impl HostFs for MountedFs {
     fn open(&self, p: &[u8], f: u32, m: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         if f & (64 | 65536) == 64 | 65536 {
@@ -327,6 +342,11 @@ impl HostFs for MountedFs {
         let p = self.resolve(p, follow, false)?;
         let (_, fs, relative) = self.route(&p)?;
         fs.set_times(&relative, false, atime, mtime)
+    }
+    fn statfs(&self, p: &[u8]) -> Result<FsStats, Errno> {
+        let p = self.resolve(p, true, false)?;
+        let (_, fs, relative) = self.route(&p)?;
+        fs.statfs(&relative)
     }
     fn read_dir(&self, p: &[u8]) -> Result<Vec<DirectoryEntry>, Errno> {
         let p = self.resolve(p, true, false)?;

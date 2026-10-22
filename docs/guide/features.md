@@ -36,7 +36,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait` |
 | Time | `clock_gettime`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2` |
+| Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socketpair` (AF_UNIX, `SOCK_STREAM` and `SOCK_SEQPACKET`), `sendto`, `recvfrom`, `shutdown` |
@@ -62,6 +62,13 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   file in a mounted directory. The umask is shared by threads, as `CLONE_FS` shares it on
   Linux. `fsync` and `fdatasync` succeed on files and directories and give
   `EINVAL` on pipes, sockets and terminals; `fadvise64` is accepted as a hint.
+- `statfs` reports the in-memory filesystem as a 4 GiB tmpfs whose used
+  space and inodes are what it holds, and a mounted host directory with the
+  host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
+  and `/proc/mounts` list the mounts (`tmpfs` for the root, `hostfs` for each
+  `--mount`, without host paths); they are the only `/proc` files. Each mount
+  has its own `st_dev`, as its line in `mountinfo` says, so `df` lists every
+  mount.
 - As root, `access` allows reading and writing, and executing when the file
   has an execute bit or is a directory; `getgroups` returns no groups.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without

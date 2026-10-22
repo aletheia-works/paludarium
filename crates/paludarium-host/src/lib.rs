@@ -32,7 +32,7 @@ pub use wasm_tasks::run_task;
 pub mod fs;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_fs;
-pub use fs::{DirectoryEntry, FileHandle, FileStat, HostFs};
+pub use fs::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs};
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_fs::NativeFs;
 #[cfg(target_arch = "wasm32")]

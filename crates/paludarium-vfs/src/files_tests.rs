@@ -220,3 +220,25 @@ fn set_mode_and_times_keep_the_file_type() {
         Err(Errno::ENOENT)
     );
 }
+#[test]
+fn statfs_reports_a_tmpfs_with_what_the_tree_holds() {
+    let fs = MemFs::new();
+    let empty = fs.statfs(b"/").unwrap();
+    assert_eq!((empty.kind, empty.block_size), (TMPFS_MAGIC, 4096));
+    assert_eq!(empty.blocks, MEMORY_BYTES / 4096);
+    let f = fs.open(b"/a", 66, 0o644).unwrap();
+    f.write(&[0; 5000]).unwrap();
+    let used = fs.statfs(b"/a").unwrap();
+    assert_eq!(empty.blocks_free - used.blocks_free, 2);
+    assert_eq!(used.blocks_available, used.blocks_free);
+    assert_eq!(empty.files_free - used.files_free, 1);
+    assert_eq!(used.name_max, 255);
+    assert_eq!(fs.statfs(b"/missing"), Err(Errno::ENOENT));
+    assert_eq!(
+        fs.mounts(),
+        vec![MountPoint {
+            path: b"/".to_vec(),
+            kind: "tmpfs"
+        }]
+    );
+}

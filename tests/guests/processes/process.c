@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/vfs.h>
 #include <sys/prctl.h>
 #include <time.h>
 #include <sys/socket.h>
@@ -406,6 +407,51 @@ int main(int argc, char **argv) {
         char byte = 0;
         result("report", read(report[0], &byte, 1));
         result("signalled", byte == 'y');
+        return 0;
+    }
+    if (!strcmp(mode, "statfs")) {
+        /* Native /tmp is some real filesystem and the emulated one a tmpfs:
+           only relations every filesystem keeps are compared. */
+        struct statfs by_path, by_fd;
+        result("statfs", statfs("/tmp", &by_path));
+        result("block-size", by_path.f_bsize > 0);
+        result("ordered", by_path.f_blocks >= by_path.f_bfree && by_path.f_bfree >= by_path.f_bavail);
+        result("name-max", by_path.f_namelen);
+        int fd = open("/tmp", O_RDONLY | O_DIRECTORY);
+        result("fstatfs", fstatfs(fd, &by_fd));
+        result("same-fs", by_fd.f_type == by_path.f_type && by_fd.f_bsize == by_path.f_bsize);
+        close(fd);
+        int pair[2];
+        if (pipe(pair)) return 81;
+        result("pipe", fstatfs(pair[0], &by_fd) == 0 && by_fd.f_type == 0x50495045);
+        errno = 0;
+        result("missing", statfs("/tmp/paludarium-processes-missing", &by_path));
+        result("errno", errno);
+        errno = 0;
+        result("fault", syscall(SYS_statfs, "/tmp", (void *)1));
+        result("errno", errno);
+        errno = 0;
+        result("bad-fd", fstatfs(99, &by_fd));
+        result("errno", errno);
+        /* The mount tables list the root, as regular files nobody may write. */
+        const char *tables[] = {"/proc/self/mountinfo", "/proc/self/mounts", "/proc/mounts"};
+        for (int t = 0; t < 3; t++) {
+            FILE *table = fopen(tables[t], "r");
+            char line[1024], first[256], second[256], third[256], fourth[256], fifth[256];
+            int root = 0;
+            while (table && fgets(line, sizeof line, table)) {
+                if (t == 0 && sscanf(line, "%255s %255s %255s %255s %255s", first, second, third, fourth, fifth) == 5)
+                    root |= !strcmp(fifth, "/");
+                if (t > 0 && sscanf(line, "%255s %255s", first, second) == 2)
+                    root |= !strcmp(second, "/");
+            }
+            if (table) fclose(table);
+            result("root-listed", root);
+            struct stat st;
+            /* Opening one for writing is EACCES for a user and allowed for
+               root, so it is not compared. */
+            result("regular", stat(tables[t], &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 07777) == 0444);
+        }
         return 0;
     }
     if (!strcmp(mode, "no-child")) {

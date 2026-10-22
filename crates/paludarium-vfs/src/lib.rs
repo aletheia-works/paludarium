@@ -1,6 +1,6 @@
 //! Safe in-memory filesystem and the host capability mount boundary.
 #![forbid(unsafe_code)]
-pub use paludarium_host::{DirectoryEntry, FileHandle, FileStat, HostFs};
+pub use paludarium_host::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs};
 use paludarium_types::Errno;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -72,7 +72,25 @@ pub fn normalize_path(path: &[u8]) -> Result<Vec<u8>, Errno> {
     }
     Ok(out)
 }
+/// `TMPFS_MAGIC`: what the in-memory filesystem calls itself.
+pub const TMPFS_MAGIC: u64 = 0x0102_1994;
+/// The size the in-memory filesystem reports, the memory `sysinfo` reports.
+pub const MEMORY_BYTES: u64 = 4 << 30;
+const BLOCK: u64 = 4096;
+/// One line of the mount table: where, and which filesystem type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountPoint {
+    pub path: Vec<u8>,
+    pub kind: &'static str,
+}
 pub trait FileSystem: HostFs {
+    /// The mounts, root first, for `/proc/self/mountinfo`.
+    fn mounts(&self) -> Vec<MountPoint> {
+        vec![MountPoint {
+            path: b"/".to_vec(),
+            kind: "tmpfs",
+        }]
+    }
     fn read_file(&self, path: &[u8]) -> Result<Arc<[u8]>, Errno> {
         let f = self.open(path, 0, 0)?;
         if f.stat()?.mode & 0o170000 == 0o040000 {

@@ -15,6 +15,7 @@
     {"name":"rlimit","binary":"process"},
     {"name":"pgid","binary":"process"},
     {"name":"sysinfo","binary":"process"},
+    {"name":"statfs","binary":"process"},
     {"name":"posix-timer","binary":"process"},
     {"name":"prctl","binary":"process"},
     {"name":"pdeathsig","binary":"process"},

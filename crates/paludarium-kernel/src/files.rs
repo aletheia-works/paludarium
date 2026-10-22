@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 20, 21, 22, 32, 33, 72, 73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 84, 85,
-    86, 87, 88, 89, 90, 91, 95, 162, 217, 221, 257, 258, 262, 263, 264, 265, 266, 267, 268, 269,
-    280, 292, 293, 439,
+    86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264, 265, 266, 267,
+    268, 269, 280, 292, 293, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -213,12 +213,49 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
         c.files.descriptor(dir)?.file.stat()?
     } else {
         let p = c.files.path(dir, raw)?;
-        c.files.fs.metadata(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?
+        if let Some(mountinfo) = crate::proc::mount_table(&p) {
+            crate::proc::stat(crate::proc::render(&c.files.fs.mounts(), mountinfo).len())
+        } else {
+            c.files.fs.metadata(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?
+        }
     };
     let directory = stat.mode & 0o170000 == 0o040000;
     if mode & 1 != 0 && !directory && stat.mode & 0o111 == 0 {
         return Err(Errno(13)); // EACCES
     }
+    Ok(0)
+}
+/// What `fstatfs` reports for a pipe or a socket: an empty pseudo filesystem.
+fn pseudo_fs(kind: u64) -> paludarium_host::FsStats {
+    paludarium_host::FsStats {
+        kind,
+        block_size: 4096,
+        name_max: 255,
+        ..Default::default()
+    }
+}
+/// Linux's 120-byte `struct statfs`. `f_flags` is ST_VALID and `f_fsid` 0.
+fn write_statfs(c: &Context<'_>, addr: u64, s: paludarium_host::FsStats) -> Result<u64, Errno> {
+    let mut b = [0u8; 120];
+    for (i, v) in [
+        s.kind,
+        s.block_size,
+        s.blocks,
+        s.blocks_free,
+        s.blocks_available,
+        s.files,
+        s.files_free,
+        0, // f_fsid
+        s.name_max,
+        s.block_size, // f_frsize
+        0x20,         // f_flags: ST_VALID
+    ]
+    .iter()
+    .enumerate()
+    {
+        b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    output(c, addr, &b)?;
     Ok(0)
 }
 const UTIME_NOW: u64 = (1 << 30) - 1;
@@ -277,9 +314,30 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
     c.mem.write(GuestAddr(addr), b).map_err(|_| Errno::EFAULT)
 }
-fn stat(c: &Context<'_>, addr: u64, s: FileStat) -> Result<u64, Errno> {
-    output(c, addr, &encode_stat(s)?)?;
+/// `stat` of a file at guest `path`: its `st_dev` names the mount holding
+/// it, numbered as /proc/self/mountinfo numbers mounts (0:1 is the root).
+fn stat(c: &Context<'_>, addr: u64, s: FileStat, path: &[u8]) -> Result<u64, Errno> {
+    let mut bytes = encode_stat(s)?;
+    bytes[0..8].copy_from_slice(&device(c, path).to_le_bytes());
+    output(c, addr, &bytes)?;
     Ok(0)
+}
+/// The minor number of the mount that holds `path` (the longest matching
+/// mount point), so that each mount is its own device.
+fn device(c: &Context<'_>, path: &[u8]) -> u64 {
+    let inside = |root: &[u8]| {
+        root == b"/"
+            || path == root
+            || path.starts_with(root) && path.get(root.len()) == Some(&b'/')
+    };
+    c.files
+        .fs
+        .mounts()
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| inside(&m.path))
+        .max_by_key(|(_, m)| m.path.len())
+        .map_or(1, |(i, _)| i as u64 + 1)
 }
 fn encode_stat(s: FileStat) -> Result<[u8; 144], Errno> {
     let (seconds, nanos) = linux_mtime(s.mtime_ns)?;
@@ -495,6 +553,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             }
             let f: Arc<dyn FileHandle> = if p == b"/dev/null" {
                 Arc::new(crate::null::NullFile::new(flags))
+            } else if let Some(mountinfo) = crate::proc::mount_table(&p) {
+                let content = crate::proc::render(&c.files.fs.mounts(), mountinfo);
+                Arc::new(crate::proc::GeneratedFile::open(content, flags))
             } else {
                 c.files
                     .fs
@@ -527,15 +588,23 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 }
                 let raw = path(c, a[1])?;
                 if raw.is_empty() && a[3] & 0x1000 != 0 {
-                    return stat(c, a[2], c.files.descriptor(a[0])?.file.stat()?);
+                    let d = c.files.descriptor(a[0])?;
+                    return stat(c, a[2], d.file.stat()?, &d.path);
                 }
                 (c.files.path(a[0], raw)?, a[2], a[3] & 0x100 == 0)
             } else {
                 (at(c, (-100i32) as u64, a[0])?, a[1], n == 4)
             };
-            stat(c, out, c.files.fs.metadata(&p, follow)?)
+            if let Some(mountinfo) = crate::proc::mount_table(&p) {
+                let length = crate::proc::render(&c.files.fs.mounts(), mountinfo).len();
+                return stat(c, out, crate::proc::stat(length), &p);
+            }
+            stat(c, out, c.files.fs.metadata(&p, follow)?, &p)
         }
-        5 => stat(c, a[1], c.files.descriptor(a[0])?.file.stat()?),
+        5 => {
+            let d = c.files.descriptor(a[0])?;
+            stat(c, a[1], d.file.stat()?, &d.path)
+        }
         8 => c
             .files
             .descriptor(a[0])?
@@ -810,6 +879,24 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.files.fs.set_mode(&p, a[2] as u32).map(|()| 0)
         }
         280 => utimensat(c, a),
+        // statfs, fstatfs
+        137 => {
+            let p = at(c, (-100i32) as u64, a[0])?;
+            write_statfs(c, a[1], c.files.fs.statfs(&p)?)
+        }
+        138 => {
+            let d = c.files.descriptor(a[0])?;
+            let stats = match d.file.stat()?.mode & 0o170000 {
+                0o010000 => pseudo_fs(0x5049_5045), // PIPEFS_MAGIC
+                0o140000 => pseudo_fs(0x534F_434B), // SOCKFS_MAGIC
+                _ => c
+                    .files
+                    .fs
+                    .statfs(&d.path)
+                    .or_else(|_| c.files.fs.statfs(b"/"))?,
+            };
+            write_statfs(c, a[1], stats)
+        }
         // access, faccessat, faccessat2
         21 => access(c, (-100i32) as u64, a[0], a[1], 0),
         269 => access(c, a[0], a[1], a[2], 0),

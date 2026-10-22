@@ -10,6 +10,19 @@ pub struct FileStat {
     /// Signed nanoseconds since the Unix epoch; includes the former u64 range.
     pub mtime_ns: i128,
 }
+/// What `statfs` reports about the filesystem holding a path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FsStats {
+    /// Linux's `f_type` magic number.
+    pub kind: u64,
+    pub block_size: u64,
+    pub blocks: u64,
+    pub blocks_free: u64,
+    pub blocks_available: u64,
+    pub files: u64,
+    pub files_free: u64,
+    pub name_max: u64,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryEntry {
     pub name: Vec<u8>,
@@ -65,6 +78,10 @@ pub trait HostFs: Send + Sync {
     fn readlink(&self, path: &[u8]) -> Result<Vec<u8>, Errno>;
     fn rename(&self, old: &[u8], new: &[u8]) -> Result<(), Errno>;
     fn read_dir(&self, path: &[u8]) -> Result<Vec<DirectoryEntry>, Errno>;
+    /// `statfs`: the filesystem that holds `path` (which must exist).
+    fn statfs(&self, _path: &[u8]) -> Result<FsStats, Errno> {
+        Err(Errno::ENOSYS)
+    }
     /// `chmod`: replaces the permission bits of `path` (following a final
     /// symbolic link) with the low 12 bits of `mode`.
     fn set_mode(&self, _path: &[u8], _mode: u32) -> Result<(), Errno> {

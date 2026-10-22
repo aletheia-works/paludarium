@@ -113,6 +113,32 @@ impl HostFs for MemFs {
         set_node_mtime(&mut lock(&node), mtime);
         Ok(())
     }
+    /// A tmpfs of [`MEMORY_BYTES`]: the blocks and inodes used are what the
+    /// tree holds.
+    fn statfs(&self, path: &[u8]) -> Result<FsStats, Errno> {
+        let t = lock(&self.tree);
+        t.resolve(path, true)?;
+        let used: u64 = t
+            .nodes
+            .values()
+            .map(|node| match &lock(node).kind {
+                Kind::File(b) | Kind::Symlink(b) => (b.len() as u64).div_ceil(BLOCK),
+                Kind::Dir(_) => 0,
+            })
+            .sum();
+        let blocks = MEMORY_BYTES / BLOCK;
+        let files = 1 << 20;
+        Ok(FsStats {
+            kind: TMPFS_MAGIC,
+            block_size: BLOCK,
+            blocks,
+            blocks_free: blocks.saturating_sub(used),
+            blocks_available: blocks.saturating_sub(used),
+            files,
+            files_free: files.saturating_sub(t.nodes.len() as u64),
+            name_max: NAME_MAX as u64,
+        })
+    }
     fn mkdir(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
         lock(&self.tree).insert(path, Kind::Dir(BTreeMap::new()), 0o040000 | (mode & 0o7777))?;
         Ok(())

@@ -216,3 +216,15 @@ fn macos_fs_mode_times_and_sync() {
     assert_eq!(x.fs().metadata(b"dir/link", false).unwrap().mtime_ns, -9);
     assert_eq!(x.fs().metadata(b"file", false).unwrap().mtime_ns, -3);
 }
+#[test]
+fn macos_fs_statfs_reports_the_host_filesystem() {
+    let x = Fixture::new();
+    x.fs().open(b"file", 66, 0o644).unwrap();
+    for path in [&b"."[..], b"file"] {
+        let s = x.fs().statfs(path).unwrap();
+        assert!(s.block_size > 0 && s.blocks > 0, "{s:?}");
+        assert!(s.blocks >= s.blocks_free && s.blocks_free >= s.blocks_available);
+        assert!(s.name_max >= 255);
+    }
+    assert_eq!(x.fs().statfs(b"missing"), Err(Errno::ENOENT));
+}

@@ -1,5 +1,5 @@
 //! Native filesystem operations relative to a retained directory capability.
-use crate::{DirectoryEntry, FileHandle, FileStat, HostFs};
+use crate::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs};
 #[cfg(windows)]
 use cap_fs_ext::OpenOptionsMaybeDirExt;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -187,11 +187,17 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
 /// Ambient authority is used only to acquire the explicitly configured root.
 pub struct NativeFs {
     root: Dir,
+    /// Windows has no handle-based free-space query; its statfs asks for the
+    /// mount's own directory, which the user named.
+    #[cfg(windows)]
+    root_path: PathBuf,
 }
 impl NativeFs {
     pub fn new(root: &Path) -> Result<Self, Errno> {
         Ok(Self {
             root: Dir::open_ambient_dir(root, cap_std::ambient_authority()).map_err(err)?,
+            #[cfg(windows)]
+            root_path: root.to_path_buf(),
         })
     }
 }
@@ -378,6 +384,58 @@ impl HostFs for NativeFs {
         }
         .map_err(err)?;
         cap_stat(m)
+    }
+    fn statfs(&self, p: &[u8]) -> Result<FsStats, Errno> {
+        // The path must exist, as for Linux's statfs.
+        let relative = path(p)?;
+        let metadata = self.root.metadata(&relative).map_err(err)?;
+        #[cfg(unix)]
+        {
+            // A handle opened within the mount: the directory itself, or the
+            // file's parent directory, which is on the same filesystem.
+            let dir = if metadata.is_dir() {
+                self.root.open_dir(&relative)
+            } else {
+                match relative.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    Some(parent) => self.root.open_dir(parent),
+                    None => self.root.try_clone(),
+                }
+            }
+            .map_err(err)?;
+            let s = rustix::fs::fstatvfs(&dir).map_err(|e| err(e.into()))?;
+            #[cfg(target_os = "linux")]
+            let kind = rustix::fs::fstatfs(&dir).map_err(|e| err(e.into()))?.f_type as u64;
+            // Other hosts' filesystem magic numbers are not Linux's.
+            #[cfg(not(target_os = "linux"))]
+            let kind = 0;
+            Ok(FsStats {
+                kind,
+                block_size: s.f_frsize,
+                blocks: s.f_blocks,
+                blocks_free: s.f_bfree,
+                blocks_available: s.f_bavail,
+                files: s.f_files,
+                files_free: s.f_ffree,
+                name_max: s.f_namemax,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let _ = metadata;
+            let block = fs2::allocation_granularity(&self.root_path)
+                .map_err(err)?
+                .max(1);
+            Ok(FsStats {
+                kind: 0,
+                block_size: block,
+                blocks: fs2::total_space(&self.root_path).map_err(err)? / block,
+                blocks_free: fs2::free_space(&self.root_path).map_err(err)? / block,
+                blocks_available: fs2::available_space(&self.root_path).map_err(err)? / block,
+                files: 0,
+                files_free: 0,
+                name_max: 255,
+            })
+        }
     }
     fn set_mode(&self, p: &[u8], mode: u32) -> Result<(), Errno> {
         let p = path(p)?;

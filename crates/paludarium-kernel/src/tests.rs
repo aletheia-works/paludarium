@@ -812,6 +812,50 @@ fn prctl_keeps_death_signal_dumpable_and_no_new_privs() {
     assert_eq!(f.ret(157, &[9999]), errno(Errno::EINVAL));
 }
 #[test]
+fn statfs_and_the_generated_mount_table() {
+    let mut f = fixture();
+    let (path, buf, mounts, empty) = (DATA, DATA + 0x100, DATA + 0x200, DATA + 0x240);
+    f.mem.write(GuestAddr(path), b"/tmp\0").unwrap();
+    f.mem
+        .write(GuestAddr(mounts), b"/proc/self/mountinfo\0")
+        .unwrap();
+    f.mem.write(GuestAddr(empty), b"/none\0").unwrap();
+    assert_eq!(f.ret(137, &[path, buf]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(buf)).unwrap(), 0x0102_1994); // TMPFS_MAGIC
+    assert_eq!(f.mem.read_u64(GuestAddr(buf + 8)).unwrap(), 4096);
+    assert_eq!(f.mem.read_u64(GuestAddr(buf + 64)).unwrap(), 255);
+    assert_eq!(f.ret(137, &[empty, buf]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(137, &[path, 1]), errno(Errno::EFAULT));
+    let fd = f.ret(2, &[path, 0x10000, 0]);
+    assert_eq!(f.ret(138, &[fd, buf]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(buf)).unwrap(), 0x0102_1994);
+    assert_eq!(f.ret(22, &[DATA + 0x300]), 0);
+    let pipe = u64::from(f.mem.read_u64(GuestAddr(DATA + 0x300)).unwrap() as u32);
+    assert_eq!(f.ret(138, &[pipe, buf]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(buf)).unwrap(), 0x5049_5045); // PIPEFS_MAGIC
+    assert_eq!(f.ret(138, &[99, buf]), errno(Errno::EBADF));
+    // The mount table: readable whole, a regular 0444 file, never writable.
+    let table = b"21 1 0:1 / / rw,relatime - tmpfs tmpfs rw\n";
+    let fd = f.ret(2, &[mounts, 0, 0]);
+    assert_eq!(f.ret(0, &[fd, buf, 0x100]), table.len() as u64);
+    let mut read = vec![0; table.len()];
+    f.mem.read(GuestAddr(buf), &mut read).unwrap();
+    assert_eq!(read, table);
+    assert_eq!(f.ret(4, &[mounts, buf]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(buf)).unwrap(), 1); // st_dev 0:1
+    assert_eq!(
+        f.mem.read_u64(GuestAddr(buf + 24)).unwrap() as u32,
+        0o100_444
+    );
+    assert_eq!(
+        f.mem.read_u64(GuestAddr(buf + 48)).unwrap(),
+        table.len() as u64
+    );
+    // Root may open it for writing; the write itself is EINVAL.
+    let fd = f.ret(2, &[mounts, 1, 0]);
+    assert_eq!(f.ret(1, &[fd, buf, 1]), errno(Errno::EINVAL));
+}
+#[test]
 fn syscall_bad_path() {
     let mut f = fixture();
     assert_eq!(f.ret(2, &[1, 0, 0]), errno(Errno::EFAULT));

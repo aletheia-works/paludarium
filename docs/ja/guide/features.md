@@ -32,7 +32,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait` |
 | 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2` |
+| ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
 | イベント | `eventfd2`、`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socketpair`（AF_UNIX、`SOCK_STREAM` と `SOCK_SEQPACKET`）、`sendto`、`recvfrom`、`shutdown` |
@@ -57,6 +57,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   umask は、Linux で `CLONE_FS` が共有するのと同じく、スレッドの間で共有します。
   `fsync` と `fdatasync` はファイルとディレクトリでは成功し、パイプ・ソケット・端末では
   `EINVAL` を返します。`fadvise64` はヒントとして受け付けます。
+- `statfs` は、メモリ上のファイルシステムを 4 GiB の tmpfs として返します。使用量と
+  inode の数は、実際に持っているものです。マウントしたホストのディレクトリでは、
+  ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
+  `/proc/mounts` はマウントの一覧です（ルートは `tmpfs`、`--mount` ごとに `hostfs`。
+  ホストのパスは見せません）。`/proc` にあるファイルはこれだけです。マウントごとに
+  `mountinfo` の行と同じ `st_dev` を持つので、`df` はどのマウントも表示します。
 - `access` は root として、読み書きはいつも許し、実行は実行のビットがあるか
   ディレクトリのときに許します。`getgroups` はグループを返しません。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは

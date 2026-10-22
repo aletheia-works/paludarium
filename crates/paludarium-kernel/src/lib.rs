@@ -16,6 +16,7 @@ mod events;
 mod files;
 mod futex;
 mod null;
+mod proc;
 mod processes;
 mod sockets;
 mod syscalls;

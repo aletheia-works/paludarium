@@ -112,6 +112,7 @@ mod linux {
         processes_rlimit => ("rlimit","process"),
         processes_pgid => ("pgid","process"),
         processes_sysinfo => ("sysinfo","process"),
+        processes_statfs => ("statfs","process"),
         processes_posix_timer => ("posix-timer","process"),
         processes_prctl => ("prctl","process"),
         processes_pdeathsig => ("pdeathsig","process"),

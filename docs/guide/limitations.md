@@ -17,9 +17,9 @@ verified.
   make a shared file mapping writable (`EACCES`), as nothing would write it
   back to the file. A page wholly past the end of the file reads as zeros
   instead of raising `SIGBUS`.
-- **Some system calls**: `timerfd` and `CLONE_SIGHAND` between separate
-  processes are not there yet. Unimplemented system calls return `ENOSYS`, so
-  some programs can carry on without the feature.
+- **Some system calls**: `CLONE_SIGHAND` between separate processes is not
+  there yet. Unimplemented system calls return `ENOSYS`, so some programs can
+  carry on without the feature.
 - **Some signal details**: the siginfo of `SIGCHLD` does not carry the child's
   PID, status and `CLD_*` code, and a blocking call that a stop interrupts
   returns `EINTR` after the continue instead of restarting.

@@ -30,11 +30,11 @@ missing page or a permission violation becomes a guest exception.
 
 ## Owning the waiting primitives
 
-`futex`, `epoll` and `eventfd` are implemented in paludarium's kernel instead of
-with the host's equivalents. macOS and Windows have no Linux `futex`, and in
-WebAssembly the only way to wait is `Atomics.wait` and `notify`. The host
-provides only the smallest tools: wait, wake, and sleep with a deadline. The
-price is care with races in the wait queues.
+`futex`, `epoll`, `eventfd` and `timerfd` are implemented in paludarium's
+kernel instead of with the host's equivalents. macOS and Windows have no Linux
+`futex`, and in WebAssembly the only way to wait is `Atomics.wait` and
+`notify`. The host provides only the smallest tools: wait, wake, and sleep with
+a deadline. The price is care with races in the wait queues.
 
 ## Separating the CPU and the kernel
 

@@ -39,7 +39,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
-| Events | `eventfd2`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
+| Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `shutdown` |
 | Randomness | `getrandom` |
 
@@ -113,6 +113,11 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   has an execute bit or is a directory; `getgroups` returns no groups.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's.
+- A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
+  as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
+  the expirations since the last one, and `poll` and `epoll` see it readable
+  once it has expired. `TFD_TIMER_CANCEL_ON_SET` is accepted, but the guest
+  cannot set the clock, so it never cancels; the alarm clocks give `EPERM`.
 - POSIX timers run on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` and notify with
   a signal to the process (`SIGEV_SIGNAL`, with `SI_TIMER` siginfo and
   overruns), a signal to one of its threads (`SIGEV_THREAD_ID`), or not at all

@@ -21,6 +21,7 @@ mod processes;
 mod sockets;
 mod syscalls;
 mod threads;
+mod timerfd;
 mod timers;
 pub use processes::Processes;
 pub use threads::ThreadGroup;
@@ -530,6 +531,7 @@ impl Kernel {
         };
         let mut ctx = syscalls::Context {
             host: &*self.host,
+            shared_host: &self.host,
             files: &mut self.files,
             process: &mut thread.state,
             cpu: &mut thread.cpu,

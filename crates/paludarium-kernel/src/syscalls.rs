@@ -62,11 +62,16 @@ pub mod nr {
     pub const TIMER_DELETE: u64 = 226;
     pub const RT_SIGTIMEDWAIT: u64 = 128;
     pub const RT_SIGPENDING: u64 = 127;
+    pub const TIMERFD_CREATE: u64 = 283;
+    pub const TIMERFD_SETTIME: u64 = 286;
+    pub const TIMERFD_GETTIME: u64 = 287;
 }
 
 pub(crate) struct Context<'a> {
     pub files: &'a mut crate::files::Files,
     pub host: &'a dyn Host,
+    /// The same host, for files that keep it (a timerfd reads its clock).
+    pub shared_host: &'a std::sync::Arc<dyn Host>,
     pub process: &'a mut ThreadState,
     pub cpu: &'a mut CpuState,
     pub mem: &'a AddressSpace,
@@ -94,7 +99,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 46] = [
+        let entries: [(u64, Handler); 49] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -141,6 +146,9 @@ impl SyscallTable {
             (nr::TIMER_DELETE, sys_timer_delete),
             (nr::RT_SIGTIMEDWAIT, sys_rt_sigtimedwait),
             (nr::RT_SIGPENDING, sys_rt_sigpending),
+            (nr::TIMERFD_CREATE, crate::timerfd::sys_timerfd_create),
+            (nr::TIMERFD_SETTIME, crate::timerfd::sys_timerfd_settime),
+            (nr::TIMERFD_GETTIME, crate::timerfd::sys_timerfd_gettime),
         ];
         let mut handlers: BTreeMap<u64, Handler> = entries.into_iter().collect();
         for number in crate::files::NUMBERS {
@@ -497,7 +505,7 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// `struct timespec` as nanoseconds, rejecting what Linux rejects.
-fn timespec_ns(seconds: u64, nanos: u64) -> Result<u64, Errno> {
+pub(crate) fn timespec_ns(seconds: u64, nanos: u64) -> Result<u64, Errno> {
     if (seconds as i64) < 0 || nanos >= 1_000_000_000 {
         return Err(Errno::EINVAL);
     }
@@ -1109,7 +1117,7 @@ fn unblockable() -> u64 {
     (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1))
 }
 
-fn read_words<const N: usize>(mem: &AddressSpace, at: u64) -> Result<[u64; N], Errno> {
+pub(crate) fn read_words<const N: usize>(mem: &AddressSpace, at: u64) -> Result<[u64; N], Errno> {
     let mut out = [0u64; N];
     for (i, w) in out.iter_mut().enumerate() {
         *w = mem
@@ -1119,7 +1127,7 @@ fn read_words<const N: usize>(mem: &AddressSpace, at: u64) -> Result<[u64; N], E
     Ok(out)
 }
 
-fn write_words(mem: &AddressSpace, at: u64, words: &[u64]) -> Result<(), Errno> {
+pub(crate) fn write_words(mem: &AddressSpace, at: u64, words: &[u64]) -> Result<(), Errno> {
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     mem.write(GuestAddr(at), &bytes).map_err(|_| Errno::EFAULT)
 }

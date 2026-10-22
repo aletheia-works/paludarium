@@ -20,6 +20,7 @@
     {"name":"prctl","binary":"process"},
     {"name":"pdeathsig","binary":"process"},
     {"name":"job-stop","binary":"process"},
+    {"name":"timerfd","binary":"process"},
     {"name":"cpu-clocks","binary":"process"},
     {"name":"pipe-size","binary":"process"},
     {"name":"poll","binary":"process"},

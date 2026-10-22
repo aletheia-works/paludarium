@@ -1,10 +1,12 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +22,7 @@
 #include <sys/times.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
+#include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #ifndef F_SETPIPE_SZ
@@ -827,6 +830,137 @@ int main(int argc, char **argv) {
         if (write(gate[1], "x", 1) != 1) return 82;
         result("exited", waitpid(pid, &status, 0) == pid);
         result("code", WEXITSTATUS(status));
+        return 0;
+    }
+    if (!strcmp(mode, "timerfd")) {
+        /* Values that depend on timing are printed only as conditions. */
+        errno = 0;
+        result("bad-clock", timerfd_create(99, 0));
+        result("errno", errno);
+        errno = 0;
+        result("bad-flags", timerfd_create(CLOCK_MONOTONIC, 1));
+        result("errno", errno);
+        int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        result("fd", fd >= 0);
+        result("getfl", fcntl(fd, F_GETFL));
+        result("getfd", fcntl(fd, F_GETFD));
+        struct itimerspec value, old;
+        memset(&value, 0x55, sizeof value);
+        result("gettime", timerfd_gettime(fd, &value));
+        result("disarmed", value.it_value.tv_sec == 0 && value.it_value.tv_nsec == 0
+                               && value.it_interval.tv_sec == 0 && value.it_interval.tv_nsec == 0);
+        uint64_t ticks = 0;
+        errno = 0;
+        result("empty", read(fd, &ticks, 8));
+        result("errno", errno);
+        /* Errors, in Linux's order: the value, the flags and times, the fd. */
+        struct itimerspec ten = {{0, 0}, {10, 0}};
+        errno = 0;
+        result("null", timerfd_settime(fd, 0, NULL, NULL));
+        result("errno", errno);
+        errno = 0;
+        result("bad-settime-flags", timerfd_settime(fd, 4, &ten, NULL));
+        result("errno", errno);
+        struct itimerspec bad = {{0, 0}, {0, 1000000000}};
+        errno = 0;
+        result("bad-nsec", timerfd_settime(fd, 0, &bad, NULL));
+        result("errno", errno);
+        errno = 0;
+        result("bad-fd", timerfd_settime(99, 0, &bad, NULL));
+        result("errno", errno);
+        errno = 0;
+        result("bad-fd-valid", timerfd_settime(99, 0, &ten, NULL));
+        result("errno", errno);
+        errno = 0;
+        result("not-timer", timerfd_settime(1, 0, &ten, NULL));
+        result("errno", errno);
+        errno = 0;
+        result("not-timer-get", timerfd_gettime(1, &value));
+        result("errno", errno);
+        /* Ten seconds out: armed, not yet readable. */
+        result("arm", timerfd_settime(fd, 0, &ten, NULL));
+        timerfd_gettime(fd, &value);
+        result("remaining", value.it_value.tv_sec <= 10 && (value.it_value.tv_sec > 0 || value.it_value.tv_nsec > 0));
+        errno = 0;
+        result("not-yet", read(fd, &ticks, 8));
+        result("errno", errno);
+        errno = 0;
+        result("short", read(fd, &ticks, 7));
+        result("errno", errno);
+        errno = 0;
+        result("write", write(fd, &ticks, 8));
+        result("errno", errno);
+        /* An absolute time already past fires at once; rearming clears it. */
+        struct itimerspec past = {{0, 0}, {0, 1}};
+        result("past", timerfd_settime(fd, TFD_TIMER_ABSTIME, &past, &old));
+        result("old-interval", old.it_interval.tv_sec == 0 && old.it_interval.tv_nsec == 0);
+        result("old-value", old.it_value.tv_sec <= 10);
+        struct pollfd pfd = {fd, POLLIN, 0};
+        result("poll", poll(&pfd, 1, -1));
+        result("revents", pfd.revents);
+        result("expired", timerfd_gettime(fd, &value) == 0 && value.it_value.tv_sec == 0 && value.it_value.tv_nsec == 0);
+        timerfd_settime(fd, TFD_TIMER_ABSTIME, &past, NULL);
+        timerfd_settime(fd, 0, &ten, NULL);
+        errno = 0;
+        result("cleared", read(fd, &ticks, 8));
+        result("errno", errno);
+        /* Linux's hrtimer fires a past time just after settime returns, so
+           wait for it before a nonblocking read. */
+        timerfd_settime(fd, TFD_TIMER_ABSTIME, &past, NULL);
+        poll(&pfd, 1, -1);
+        result("read", read(fd, &ticks, 8));
+        result("ticks", ticks);
+        errno = 0;
+        result("drained", read(fd, &ticks, 8));
+        result("errno", errno);
+        close(fd);
+        /* A blocking read waits for a 1 ms one-shot timer. */
+        fd = timerfd_create(CLOCK_MONOTONIC, 0);
+        struct itimerspec ms = {{0, 0}, {0, 1000000}};
+        timerfd_settime(fd, 0, &ms, NULL);
+        result("blocking", read(fd, &ticks, 8));
+        result("ticks", ticks);
+        /* A periodic timer counts every expiry; epoll sees it. */
+        struct itimerspec every = {{0, 1000000}, {0, 1000000}};
+        timerfd_settime(fd, 0, &every, NULL);
+        int ep = epoll_create1(0);
+        struct epoll_event ev = {EPOLLIN, {.u64 = 7}}, out;
+        epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
+        result("epoll", epoll_wait(ep, &out, 1, -1));
+        result("epoll-events", out.events);
+        result("epoll-data", out.data.u64);
+        result("periodic", read(fd, &ticks, 8));
+        result("at-least-one", ticks >= 1);
+        struct itimerspec off = {{0, 0}, {0, 0}};
+        result("disarm", timerfd_settime(fd, 0, &off, &old));
+        result("old-period", old.it_interval.tv_sec == 0 && old.it_interval.tv_nsec == 1000000);
+        timerfd_gettime(fd, &value);
+        result("off", value.it_value.tv_sec == 0 && value.it_value.tv_nsec == 0 && value.it_interval.tv_nsec == 0);
+        /* A zero value disarms, but the interval is kept and reported. */
+        struct itimerspec idle = {{0, 5000000}, {0, 0}};
+        timerfd_settime(fd, 0, &idle, NULL);
+        timerfd_gettime(fd, &value);
+        result("idle-interval", value.it_interval.tv_nsec);
+        result("idle-value", value.it_value.tv_sec == 0 && value.it_value.tv_nsec == 0);
+        timerfd_settime(fd, 0, &off, &old);
+        result("idle-old", old.it_interval.tv_nsec);
+        /* Any non-negative time is valid; Linux saturates a huge one. */
+        struct itimerspec huge = {{LONG_MAX, 0}, {LONG_MAX, 0}};
+        result("huge", timerfd_settime(fd, 0, &huge, NULL));
+        timerfd_gettime(fd, &value);
+        result("huge-interval", value.it_interval.tv_sec);
+        result("huge-armed", value.it_value.tv_sec > 0);
+        timerfd_settime(fd, 0, &off, NULL);
+        close(ep);
+        close(fd);
+        /* CLOCK_REALTIME, with CANCEL_ON_SET accepted. */
+        fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
+        result("realtime", timerfd_settime(fd, TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &past, NULL));
+        pfd.fd = fd;
+        result("realtime-poll", poll(&pfd, 1, -1));
+        result("realtime-read", read(fd, &ticks, 8));
+        result("ticks", ticks);
+        close(fd);
         return 0;
     }
     if (!strcmp(mode, "clone3")) {

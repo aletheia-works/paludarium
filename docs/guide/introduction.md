@@ -13,8 +13,8 @@ boots, so programs start at once.
 
 - Runs x86-64 integer and SSE instructions in software.
 - Implements, inside the guest, the Linux system calls programs commonly use:
-  files, memory, threads and futexes, signals, time, eventfd and epoll, AF_UNIX
-  sockets, and starting other programs.
+  files, memory, threads and futexes, signals, time, eventfd, timerfd and
+  epoll, AF_UNIX sockets, and starting other programs.
 - Gives every run its own in-memory filesystem, and shows a host directory
   only when you ask for it, safely.
 - In WebAssembly, runs each guest thread in its own Worker, and can translate

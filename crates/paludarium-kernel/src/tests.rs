@@ -1140,3 +1140,71 @@ fn cpu_clocks_count_the_threads_time() {
     assert!(f.mem.read_u64(GuestAddr(DATA)).unwrap() >= 200);
     assert_eq!(f.ret(100, &[0x10]), errno(Errno::EFAULT));
 }
+
+#[test]
+fn timerfd_counts_expirations() {
+    let mut f = fixture();
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, 1_000_000_000);
+    assert_eq!(f.ret(283, &[2, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(283, &[1, 1]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(283, &[8, 0]), errno(Errno::EPERM));
+    let fd = f.ret(283, &[1, 0x800]);
+    assert_eq!(f.ret(0, &[fd, DATA, 8]), errno(Errno::EAGAIN));
+    // 5 ms, then every 2 ms: by 10 ms it has expired at 5, 7 and 9 ms.
+    f.mem
+        .write(
+            GuestAddr(DATA),
+            &[0, 2_000_000, 0, 5_000_000].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+    assert_eq!(f.ret(286, &[fd, 0, DATA, 0]), 0);
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, 1_010_000_000);
+    assert_eq!(f.ret(287, &[fd, DATA + 64]), 0);
+    assert_eq!(
+        f.mem.read_u64(GuestAddr(DATA + 64 + 24)).unwrap(),
+        1_000_000
+    );
+    assert_eq!(f.ret(0, &[fd, DATA + 128, 8]), 8);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 3);
+    assert_eq!(f.ret(0, &[fd, DATA + 128, 8]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(0, &[fd, DATA + 128, 7]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(1, &[fd, DATA + 128, 8]), errno(Errno::EINVAL));
+    // Rearming clears the count and reports the old setting.
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, 1_020_000_000);
+    f.mem
+        .write(GuestAddr(DATA), &[0u64; 4].map(u64::to_le_bytes).concat())
+        .unwrap();
+    assert_eq!(f.ret(286, &[fd, 0, DATA, DATA + 64]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 64 + 8)).unwrap(), 2_000_000);
+    // A zero value disarms but keeps the interval, as Linux reports it.
+    f.mem.write_u64(GuestAddr(DATA + 8), 3_000_000).unwrap();
+    assert_eq!(f.ret(286, &[fd, 0, DATA, 0]), 0);
+    assert_eq!(f.ret(287, &[fd, DATA + 64]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 64 + 8)).unwrap(), 3_000_000);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 64 + 24)).unwrap(), 0);
+    assert_eq!(f.ret(0, &[fd, DATA + 128, 8]), errno(Errno::EAGAIN));
+    // Linux's order: the value, then flags and times, then the descriptor.
+    assert_eq!(f.ret(286, &[fd, 0, 0, 0]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(286, &[fd, 4, DATA, 0]), errno(Errno::EINVAL));
+    // A huge time saturates to KTIME_MAX instead of failing, as on Linux.
+    f.mem
+        .write(
+            GuestAddr(DATA),
+            &[i64::MAX as u64, 0, i64::MAX as u64, 0]
+                .map(u64::to_le_bytes)
+                .concat(),
+        )
+        .unwrap();
+    assert_eq!(f.ret(286, &[fd, 0, DATA, 0]), 0);
+    assert_eq!(f.ret(287, &[fd, DATA + 64]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 64)).unwrap(), 9_223_372_036);
+    f.mem
+        .write(GuestAddr(DATA), &[0u64; 4].map(u64::to_le_bytes).concat())
+        .unwrap();
+    assert_eq!(f.ret(286, &[99, 0, DATA, 0]), errno(Errno::EBADF));
+    assert_eq!(f.ret(287, &[99, DATA]), errno(Errno::EBADF));
+    assert_eq!(f.ret(286, &[fd, 0, DATA, 0x1000]), errno(Errno::EFAULT));
+}

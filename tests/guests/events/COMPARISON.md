@@ -97,7 +97,7 @@ raw Linux ABI guestは0〜81の82件、Rust target guest timer/unixの2件、計
 
 52/53/54はAF_INET/AF_INET6socket/socketpair禁止方針の専用ケース。native成功/errnoを原本へ保存し、emulatorは承認済みEAFNOSUPPORT(-97)とzero remainderをassertする。nativeとの一致ケースと分けpolicy_exceptionをmanifestへ記録する。未知flags/対応外型も観測前のerrno推定で固定しない。
 
-全process30秒watchdog/kill/reap、raw stdout/stderr/exit/timeoutとbinaryshaを保存。通常native exit0/stderr空、case60native-9/stderr空を検査する。Rustguestのassert失敗はguest成功と扱わない。CI straceはRust targetの実使用syscallを別原本として保存し、timerfd必要性を実測で決める。
+全process30秒watchdog/kill/reap、raw stdout/stderr/exit/timeoutとbinaryshaを保存。通常native exit0/stderr空、case60native-9/stderr空を検査する。Rustguestのassert失敗はguest成功と扱わない。CI straceはRust targetの実使用syscallを別原本として保存する。timerfdはKernelに実装済みで、processesの差分テスト（timerfd）で比べる。
 
 ## Boundaries
 

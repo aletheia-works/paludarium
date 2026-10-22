@@ -29,7 +29,7 @@ WebAssembly（wasm32）のメモリは 4 GB までなので、ゲストの 64-bi
 
 ## 待機の仕組みを自分で持つ
 
-`futex`・`epoll`・`eventfd` は、ホストの同じ機能を使わず、paludarium の Kernel の中で
+`futex`・`epoll`・`eventfd`・`timerfd` は、ホストの同じ機能を使わず、paludarium の Kernel の中で
 実装しています。macOS と Windows には Linux の `futex` がなく、WebAssembly で待つ手段は
 `Atomics.wait` と `notify` しかないからです。ホストからは「待つ・起こす・期限つきで眠る」
 という最小の道具だけを使います。代わりに、待ち行列の競合に気をつけて作っています。

@@ -26,6 +26,7 @@ pub struct ThreadGroup {
     process_pending: Mutex<ThreadState>,
     timer_generation: AtomicU64,
     pub(crate) futexes: Futexes,
+    pub(crate) timers: Mutex<crate::timers::Timers>,
 }
 impl Default for ThreadGroup {
     fn default() -> Self {
@@ -40,6 +41,7 @@ impl Default for ThreadGroup {
             process_pending: Mutex::new(ThreadState::default()),
             timer_generation: AtomicU64::new(0),
             futexes: Futexes::default(),
+            timers: Mutex::default(),
         }
     }
 }
@@ -110,12 +112,33 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .timer;
+        local.posix_deadline = self.posix_deadline();
+    }
+    fn posix_deadline(&self) -> Option<u64> {
+        self.timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .next_deadline()
     }
     pub(crate) fn set_timer(&self, timer: signals::RealTimer) {
         self.process_pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .timer = timer;
+        self.timers_changed();
+    }
+    /// Runs `f` on the POSIX timers, then lets waits see the new deadlines.
+    pub(crate) fn with_timers<T>(
+        &self,
+        local: &mut ThreadState,
+        f: impl FnOnce(&mut crate::timers::Timers) -> T,
+    ) -> T {
+        let result = f(&mut self.timers.lock().unwrap_or_else(PoisonError::into_inner));
+        local.posix_deadline = self.posix_deadline();
+        self.timers_changed();
+        result
+    }
+    fn timers_changed(&self) {
         self.timer_generation.fetch_add(1, Ordering::SeqCst);
         // A timer update is a deadline change, not a signal. Existing Host waits
         // must return so they can recompute the shared deadline.
@@ -138,8 +161,13 @@ impl ThreadGroup {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             signals::expire_timer(&mut pending, now);
+            self.timers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .expire(&mut pending, now);
             local.timer = pending.timer;
         }
+        local.posix_deadline = self.posix_deadline();
         self.drain_process(local);
     }
     pub(crate) fn register(&self, tid: u32, inbox: Arc<SignalInbox>) {
@@ -230,6 +258,21 @@ impl ThreadGroup {
             signals::queue(local, s);
         }
         local.stopped = self.stopped.load(Ordering::SeqCst);
+    }
+    /// Takes the lowest process-directed signal in `set`, even a blocked one
+    /// that [`Self::drain_process`] leaves for another thread
+    /// (`rt_sigtimedwait`).
+    pub(crate) fn take_process_signal(&self, set: u64) -> Option<signals::PendingSignal> {
+        let mut pending = self
+            .process_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.process_inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain_process(&mut pending);
+        let index = signals::lowest_in(&pending.pending, set)?;
+        Some(pending.pending.remove(index))
     }
     pub(crate) fn set_action(&self, n: i32, a: SignalAction) {
         self.actions

@@ -668,6 +668,150 @@ fn process_groups_start_at_the_first_process() {
     assert_eq!(f.ret(121, &[u64::MAX]), errno(Errno(3)));
 }
 #[test]
+fn posix_timer_signal_reaches_sigtimedwait() {
+    let mut f = fixture();
+    let (id, set, info, spec) = (DATA, DATA + 0x10, DATA + 0x100, DATA + 0x200);
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[1, 0, id]), 0);
+    let timer = u64::from(u32::from_le_bytes({
+        let mut b = [0; 4];
+        f.mem.read(GuestAddr(id), &mut b).unwrap();
+        b
+    }));
+    assert_eq!(timer, 0);
+    // Arm it for 20 ms, block nothing, and wait for SIGALRM.
+    for (i, v) in [0u64, 0, 0, 20_000_000].iter().enumerate() {
+        f.mem.write_u64(GuestAddr(spec + 8 * i as u64), *v).unwrap();
+    }
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[timer, 0, spec, 0]), 0);
+    f.mem.write_u64(GuestAddr(set), 1 << 13).unwrap(); // SIGALRM
+    assert_eq!(f.ret(nr::RT_SIGTIMEDWAIT, &[set, info, 0, 8]), 14);
+    let mut siginfo = [0u8; 32];
+    f.mem.read(GuestAddr(info), &mut siginfo).unwrap();
+    assert_eq!(i32::from_le_bytes(siginfo[8..12].try_into().unwrap()), -2); // SI_TIMER
+    assert_eq!(i32::from_le_bytes(siginfo[16..20].try_into().unwrap()), 0); // si_timerid
+    assert_eq!(u64::from_le_bytes(siginfo[24..32].try_into().unwrap()), 0); // si_value
+    assert_eq!(f.ret(nr::TIMER_DELETE, &[timer]), 0);
+    assert_eq!(f.ret(nr::TIMER_DELETE, &[timer]), errno(Errno::EINVAL));
+}
+fn timer_spec(f: &mut Fixture, at: u64, interval: u64, value: u64) {
+    let words = [
+        interval / 1_000_000_000,
+        interval % 1_000_000_000,
+        value / 1_000_000_000,
+        value % 1_000_000_000,
+    ];
+    for (i, v) in words.iter().enumerate() {
+        f.mem.write_u64(GuestAddr(at + 8 * i as u64), *v).unwrap();
+    }
+}
+#[test]
+fn posix_timers_check_arguments_and_report_their_state() {
+    let mut f = fixture();
+    let (id, sev, spec, old) = (DATA, DATA + 0x40, DATA + 0x100, DATA + 0x140);
+    // sigevent: value 42, SIGUSR1, SIGEV_SIGNAL
+    f.mem.write_u64(GuestAddr(sev), 42).unwrap();
+    f.mem.write_u64(GuestAddr(sev + 8), 10).unwrap();
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[0, sev, id]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(id)).unwrap() as u32, 0);
+    f.mem.write_u64(GuestAddr(sev + 8), 1 << 32).unwrap(); // SIGEV_NONE
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[1, sev, id]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(id)).unwrap() as u32, 1);
+    timer_spec(&mut f, spec, 5_000_000_000, 10_000_000_000);
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[1, 0, spec, old]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(old + 16)).unwrap(), 0); // was disarmed
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[1, old]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 5); // interval
+    assert!(f.mem.read_u64(GuestAddr(old + 16)).unwrap() >= 9); // seconds left
+    assert_eq!(f.ret(nr::TIMER_GETOVERRUN, &[1]), 0);
+    // Errors: clocks, signals and notifications that are not supported.
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[2, 0, id]), errno(Errno::EINVAL));
+    f.mem.write_u64(GuestAddr(sev + 8), 99).unwrap();
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[1, sev, id]), errno(Errno::EINVAL));
+    f.mem.write_u64(GuestAddr(sev + 8), 4 << 32 | 10).unwrap(); // SIGEV_THREAD_ID
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[1, sev, id]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[1, 1, id]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[1, 0, 1]), errno(Errno::EFAULT));
+    assert_eq!(
+        f.ret(nr::TIMER_SETTIME, &[1, 2, spec, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(nr::TIMER_SETTIME, &[1, 0, 0, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(nr::TIMER_SETTIME, &[9, 0, spec, 0]),
+        errno(Errno::EINVAL)
+    );
+    timer_spec(&mut f, spec, 0, 0);
+    f.mem
+        .write_u64(GuestAddr(spec + 24), 1_000_000_000)
+        .unwrap();
+    assert_eq!(
+        f.ret(nr::TIMER_SETTIME, &[1, 0, spec, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[9, old]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(nr::TIMER_GETOVERRUN, &[9]), errno(Errno::EINVAL));
+    // Disarming reports the old setting.
+    timer_spec(&mut f, spec, 0, 0);
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[1, 0, spec, old]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 5);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[1, old]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(old + 16)).unwrap(), 0);
+}
+#[test]
+fn sigtimedwait_takes_blocked_process_signals_and_times_out() {
+    let mut f = fixture();
+    let (set, info, spec, id) = (DATA, DATA + 0x100, DATA + 0x200, DATA + 0x300);
+    f.thread.state.signal_mask = 1 << 13; // SIGALRM blocked, as timeout does
+    f.mem.write_u64(GuestAddr(set), 1 << 13).unwrap();
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[1, 0, id]), 0);
+    timer_spec(&mut f, spec, 0, 1_000_000);
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[0, 0, spec, 0]), 0);
+    assert_eq!(f.ret(nr::RT_SIGTIMEDWAIT, &[set, info, 0, 8]), 14);
+    // Nothing pending: a zero timeout is EAGAIN at once.
+    f.mem.write_u64(GuestAddr(spec), 0).unwrap();
+    f.mem.write_u64(GuestAddr(spec + 8), 0).unwrap();
+    assert_eq!(
+        f.ret(nr::RT_SIGTIMEDWAIT, &[set, info, spec, 8]),
+        errno(Errno::EAGAIN)
+    );
+    assert_eq!(
+        f.ret(nr::RT_SIGTIMEDWAIT, &[set, info, spec, 4]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(nr::RT_SIGTIMEDWAIT, &[1, info, spec, 8]),
+        errno(Errno::EFAULT)
+    );
+    f.mem.write_u64(GuestAddr(spec + 8), 1_000_000_000).unwrap();
+    assert_eq!(
+        f.ret(nr::RT_SIGTIMEDWAIT, &[set, info, spec, 8]),
+        errno(Errno::EINVAL)
+    );
+}
+#[test]
+fn prctl_keeps_death_signal_dumpable_and_no_new_privs() {
+    let mut f = fixture();
+    assert_eq!(f.ret(157, &[2, DATA]), 0); // PR_GET_PDEATHSIG
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap() as u32, 0);
+    assert_eq!(f.ret(157, &[1, 10]), 0);
+    assert_eq!(f.ret(157, &[2, DATA]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap() as u32, 10);
+    assert_eq!(f.ret(157, &[1, 65]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(157, &[2, 1]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(157, &[3]), 1); // PR_GET_DUMPABLE
+    assert_eq!(f.ret(157, &[4, 0]), 0);
+    assert_eq!(f.ret(157, &[3]), 0);
+    assert_eq!(f.ret(157, &[4, 2]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(157, &[39, 0, 0, 0, 0]), 0); // PR_GET_NO_NEW_PRIVS
+    assert_eq!(f.ret(157, &[38, 0, 0, 0, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(157, &[38, 1, 0, 0, 0]), 0);
+    assert_eq!(f.ret(157, &[39, 0, 0, 0, 0]), 1);
+    assert_eq!(f.ret(157, &[9999]), errno(Errno::EINVAL));
+}
+#[test]
 fn syscall_bad_path() {
     let mut f = fixture();
     assert_eq!(f.ret(2, &[1, 0, 0]), errno(Errno::EFAULT));

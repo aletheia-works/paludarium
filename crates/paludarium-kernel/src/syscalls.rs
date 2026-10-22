@@ -50,6 +50,12 @@ pub mod nr {
     pub const SCHED_YIELD: u64 = 24;
     pub const SYSINFO: u64 = 99;
     pub const GETGROUPS: u64 = 115;
+    pub const TIMER_CREATE: u64 = 222;
+    pub const TIMER_SETTIME: u64 = 223;
+    pub const TIMER_GETTIME: u64 = 224;
+    pub const TIMER_GETOVERRUN: u64 = 225;
+    pub const TIMER_DELETE: u64 = 226;
+    pub const RT_SIGTIMEDWAIT: u64 = 128;
 }
 
 pub(crate) struct Context<'a> {
@@ -81,7 +87,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 34] = [
+        let entries: [(u64, Handler); 40] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -116,6 +122,12 @@ impl SyscallTable {
             (nr::SCHED_YIELD, sys_sched_yield),
             (nr::SYSINFO, sys_sysinfo),
             (nr::GETGROUPS, sys_getgroups),
+            (nr::TIMER_CREATE, sys_timer_create),
+            (nr::TIMER_SETTIME, sys_timer_settime),
+            (nr::TIMER_GETTIME, sys_timer_gettime),
+            (nr::TIMER_GETOVERRUN, sys_timer_getoverrun),
+            (nr::TIMER_DELETE, sys_timer_delete),
+            (nr::RT_SIGTIMEDWAIT, sys_rt_sigtimedwait),
         ];
         let mut handlers: BTreeMap<u64, Handler> = entries.into_iter().collect();
         for number in crate::files::NUMBERS {
@@ -247,10 +259,7 @@ fn sleep(c: &mut Context<'_>, clock: ClockId, absolute: bool, req: u64, rem: u64
             Err(e) => return err(e),
         };
         c.group.expire_timer(c.process, mono_now);
-        let timer_deadline = c
-            .process
-            .timer
-            .deadline
+        let timer_deadline = signals::next_deadline(c.process)
             .and_then(|d| clock_now.checked_add(d.saturating_sub(mono_now)));
         let next = timer_deadline.map_or(deadline, |t| deadline.min(t));
         let result = c.host.wait_until(clock, next, c.cancellation);
@@ -362,6 +371,210 @@ fn sys_setitimer(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     c.process.timer = signals::RealTimer { deadline, interval };
     ok(0)
 }
+const SIGEV_SIGNAL: u32 = 0;
+const SIGEV_NONE: u32 = 1;
+const TIMER_ABSTIME: u64 = 1;
+
+fn outcome(result: Result<u64, Errno>) -> Outcome {
+    Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
+}
+
+/// `timer_create(clock, sevp, timerid)`. CLOCK_REALTIME and CLOCK_MONOTONIC
+/// (and CLOCK_BOOTTIME, which never sleeps here) are supported, notified by
+/// a signal or not at all; CPU-time clocks and SIGEV_THREAD_ID give EINVAL.
+fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let realtime = match a[0] {
+            0 => true,
+            1 | 7 => false,
+            _ => return Err(Errno::EINVAL),
+        };
+        let (signal, value) = if a[1] == 0 {
+            (Some(14), None) // SIGALRM, with the timer ID as its value
+        } else {
+            // Linux copies the whole 64-byte struct sigevent.
+            c.mem
+                .check_read(GuestAddr(a[1]), 64)
+                .map_err(|_| Errno::EFAULT)?;
+            let [value, word] = read_words::<2>(c.mem, a[1])?;
+            let (number, notify) = (word as u32 as i32, (word >> 32) as u32);
+            match notify {
+                SIGEV_SIGNAL if (1..=64).contains(&number) => (Some(number), Some(value)),
+                SIGEV_NONE => (None, Some(value)),
+                _ => return Err(Errno::EINVAL),
+            }
+        };
+        c.mem
+            .check_write(GuestAddr(a[2]), 4)
+            .map_err(|_| Errno::EFAULT)?;
+        let id = c.group.with_timers(c.process, |timers| {
+            timers.create(crate::timers::PosixTimer {
+                realtime,
+                signal,
+                ..Default::default()
+            })
+        })?;
+        c.group.with_timers(c.process, |timers| {
+            if let Ok(timer) = timers.get_mut(id) {
+                timer.value = value.unwrap_or(id as u32 as u64);
+            }
+        });
+        c.mem
+            .write(GuestAddr(a[2]), &id.to_le_bytes())
+            .map_err(|_| Errno::EFAULT)?;
+        Ok(0)
+    })())
+}
+
+/// `struct timespec` as nanoseconds, rejecting what Linux rejects.
+fn timespec_ns(seconds: u64, nanos: u64) -> Result<u64, Errno> {
+    if (seconds as i64) < 0 || nanos >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|v| v.checked_add(nanos))
+        .ok_or(Errno::EINVAL)
+}
+
+/// `struct itimerspec` words for an interval and the time left.
+fn itimerspec(interval: u64, remaining: u64) -> [u64; 4] {
+    [
+        interval / 1_000_000_000,
+        interval % 1_000_000_000,
+        remaining / 1_000_000_000,
+        remaining % 1_000_000_000,
+    ]
+}
+
+/// What `timer_gettime` reports: the interval and the time to the next expiry.
+fn timer_state(timer: &crate::timers::PosixTimer, now: u64) -> [u64; 4] {
+    let remaining = timer.deadline.map_or(0, |d| d.saturating_sub(now).max(1));
+    itimerspec(timer.interval, remaining)
+}
+
+fn timer_id(value: u64) -> i32 {
+    value as u32 as i32
+}
+
+/// `timer_settime(id, flags, new, old)`, in Linux's order: read and check the
+/// new value, find the timer, set it, then write the old value out.
+fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        if a[2] == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let [i_sec, i_nsec, v_sec, v_nsec] = read_words::<4>(c.mem, a[2])?;
+        let (interval, value) = (timespec_ns(i_sec, i_nsec)?, timespec_ns(v_sec, v_nsec)?);
+        if a[1] & !TIMER_ABSTIME != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mono = c.host.clock(ClockId::Monotonic)?;
+        let real = c.host.clock(ClockId::Realtime)?;
+        let old = c.group.with_timers(c.process, |timers| {
+            let timer = timers.get_mut(timer_id(a[0]))?;
+            let old = timer_state(timer, mono);
+            let now = if timer.realtime { real } else { mono };
+            timer.deadline = (value != 0).then(|| {
+                let delay = if a[1] & TIMER_ABSTIME != 0 {
+                    value.saturating_sub(now)
+                } else {
+                    value
+                };
+                mono.saturating_add(delay)
+            });
+            timer.interval = if value == 0 { 0 } else { interval };
+            timer.overrun = 0;
+            Ok::<_, Errno>(old)
+        })?;
+        if a[3] != 0 {
+            write_words(c.mem, a[3], &old)?;
+        }
+        Ok(0)
+    })())
+}
+
+fn sys_timer_gettime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let mono = c.host.clock(ClockId::Monotonic)?;
+        let state = c.group.with_timers(c.process, |timers| {
+            timers.get_mut(timer_id(a[0])).map(|t| timer_state(t, mono))
+        })?;
+        write_words(c.mem, a[1], &state)?;
+        Ok(0)
+    })())
+}
+
+fn sys_timer_getoverrun(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(c.group.with_timers(c.process, |timers| {
+        timers
+            .get_mut(timer_id(a[0]))
+            .map(|t| t.overrun as u32 as u64)
+    }))
+}
+
+fn sys_timer_delete(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(
+        c.group
+            .with_timers(c.process, |timers| timers.delete(timer_id(a[0])))
+            .map(|()| 0),
+    )
+}
+
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)`: takes the lowest
+/// pending signal in `set`, blocked or not, and returns its number; EAGAIN
+/// once `timeout` passes, EINTR when another signal can be delivered.
+fn sys_rt_sigtimedwait(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        if a[3] != 8 {
+            return Err(Errno::EINVAL);
+        }
+        // SIGKILL and SIGSTOP cannot be waited for.
+        let set = c.mem.read_u64(GuestAddr(a[0])).map_err(|_| Errno::EFAULT)? & !(1 << 8 | 1 << 18);
+        let timeout = if a[2] == 0 {
+            None
+        } else {
+            let [seconds, nanos] = read_words::<2>(c.mem, a[2])?;
+            Some(timespec_ns(seconds, nanos)?)
+        };
+        let start = c.host.clock(ClockId::Monotonic)?;
+        let deadline = timeout.map(|t| start.saturating_add(t));
+        loop {
+            c.inbox.drain(c.process);
+            c.group.drain_process(c.process);
+            let now = c.host.clock(ClockId::Monotonic)?;
+            c.group.expire_timer(c.process, now);
+            // The thread's own queue first, then the process's shared one.
+            let found = signals::lowest_in(&c.process.pending, set)
+                .map(|index| c.process.pending.remove(index))
+                .or_else(|| c.group.take_process_signal(set));
+            if let Some(signal) = found {
+                if a[1] != 0 {
+                    c.mem
+                        .write(GuestAddr(a[1]), &signals::siginfo(c.process, &signal))
+                        .map_err(|_| Errno::EFAULT)?;
+                }
+                return Ok(signal.number as u64);
+            }
+            if c.group.status().is_some()
+                || signals::next_pending(c.process, true).is_some()
+                || (!c.inbox.owns_wake(c.cancellation)
+                    && c.cancellation.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                return Err(Errno(4)); // EINTR
+            }
+            if deadline.is_some_and(|d| now >= d) {
+                return Err(Errno::EAGAIN);
+            }
+            let end = deadline
+                .unwrap_or(u64::MAX)
+                .min(now.saturating_add(10_000_000))
+                .min(signals::next_deadline(c.process).unwrap_or(u64::MAX));
+            c.host.wait_until(ClockId::Monotonic, end, c.cancellation)?;
+        }
+    })())
+}
+
 fn sys_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     sleep(c, ClockId::Monotonic, false, a[0], a[1])
 }

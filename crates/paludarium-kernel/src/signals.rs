@@ -45,6 +45,34 @@ pub(crate) struct PendingSignal {
     pub trap: u64,
     pub error: u64,
     pub synchronous: bool,
+    /// The POSIX timer that queued this signal (SI_TIMER).
+    pub timer: Option<TimerSignal>,
+}
+/// `si_timerid`, `si_overrun` and `si_value` of a timer's signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TimerSignal {
+    pub id: i32,
+    pub overrun: i32,
+    pub value: u64,
+}
+/// `si_code` of a signal from a POSIX timer.
+pub(crate) const SI_TIMER: i32 = -2;
+/// The 128-byte `siginfo_t` of `signal`, as Linux fills it for the frame and
+/// for `rt_sigtimedwait`.
+pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128] {
+    let mut info = [0u8; 128];
+    info[0..4].copy_from_slice(&signal.number.to_le_bytes());
+    info[8..12].copy_from_slice(&signal.code.to_le_bytes());
+    if let Some(timer) = signal.timer {
+        info[16..20].copy_from_slice(&timer.id.to_le_bytes());
+        info[20..24].copy_from_slice(&timer.overrun.to_le_bytes());
+        info[24..32].copy_from_slice(&timer.value.to_le_bytes());
+    } else if signal.synchronous {
+        info[16..24].copy_from_slice(&signal.addr.to_le_bytes());
+    } else {
+        info[16..20].copy_from_slice(&process.pid.to_le_bytes());
+    }
+    info
 }
 impl PendingSignal {
     pub fn user(number: i32, code: i32) -> Self {
@@ -56,6 +84,7 @@ impl PendingSignal {
             trap: 0,
             error: 0,
             synchronous: false,
+            timer: None,
         }
     }
     pub fn thread(number: i32, code: i32) -> Self {
@@ -211,13 +240,7 @@ pub(crate) fn install(
     );
     put(&mut b, SC + 184, base + fp as u64);
     put(&mut b, MASK, process.signal_mask);
-    b[INFO..INFO + 4].copy_from_slice(&signal.number.to_le_bytes());
-    b[INFO + 8..INFO + 12].copy_from_slice(&signal.code.to_le_bytes());
-    if signal.synchronous {
-        put(&mut b, INFO + 16, signal.addr)
-    } else {
-        b[INFO + 16..INFO + 20].copy_from_slice(&process.pid.to_le_bytes());
-    }
+    b[INFO..INFO + 128].copy_from_slice(&siginfo(process, &signal));
     b[fp..fp + 2].copy_from_slice(&0x37fu16.to_le_bytes());
     b[fp + 24..fp + 28].copy_from_slice(&cpu.mxcsr.to_le_bytes());
     b[fp + 28..fp + 32].copy_from_slice(&0xffffu32.to_le_bytes());
@@ -342,6 +365,22 @@ pub(crate) fn restore(
 pub(crate) struct RealTimer {
     pub deadline: Option<u64>,
     pub interval: u64,
+}
+/// The index of the lowest-numbered signal in `set` (bit n-1 for signal n).
+pub(crate) fn lowest_in(pending: &[PendingSignal], set: u64) -> Option<usize> {
+    pending
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| (1..=64).contains(&s.number) && set >> (s.number - 1) & 1 != 0)
+        .min_by_key(|(index, s)| (s.number, *index))
+        .map(|(index, _)| index)
+}
+/// The earliest deadline of the interval timer and the POSIX timers.
+pub(crate) fn next_deadline(process: &ThreadState) -> Option<u64> {
+    match (process.timer.deadline, process.posix_deadline) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 pub(crate) fn expire_timer(process: &mut ThreadState, now: u64) {
     if let Some(deadline) = process.timer.deadline

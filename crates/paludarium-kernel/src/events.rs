@@ -36,7 +36,7 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
     let end = deadline
         .unwrap_or(u64::MAX)
         .min(now.saturating_add(10_000_000))
-        .min(c.process.timer.deadline.unwrap_or(u64::MAX));
+        .min(crate::signals::next_deadline(c.process).unwrap_or(u64::MAX));
     let generation = c.group.timer_generation();
     let outcome = match c.host.wait_on(
         &c.files.readiness.token,

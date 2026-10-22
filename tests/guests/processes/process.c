@@ -9,6 +9,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/prctl.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
@@ -299,6 +301,111 @@ int main(int argc, char **argv) {
         close(pair[0]);
         result("eof", read(pair[1], buf, sizeof buf));
         close(pair[1]);
+        return 0;
+    }
+    if (!strcmp(mode, "posix-timer")) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        struct sigevent event = {0};
+        event.sigev_notify = SIGEV_SIGNAL;
+        event.sigev_signo = SIGUSR1;
+        event.sigev_value.sival_int = 42;
+        timer_t timer;
+        result("create", timer_create(CLOCK_MONOTONIC, &event, &timer));
+        struct itimerspec once = {{0, 0}, {0, 20000000}}, now;
+        result("arm", timer_settime(timer, 0, &once, NULL));
+        struct timespec limit = {5, 0};
+        siginfo_t info;
+        result("signal", sigtimedwait(&set, &info, &limit));
+        result("code", info.si_code == SI_TIMER);
+        result("value", info.si_value.sival_int);
+        result("timer-id", info.si_timerid == (int)(intptr_t)timer);
+        result("disarmed", timer_gettime(timer, &now) == 0 && now.it_value.tv_sec == 0 && now.it_value.tv_nsec == 0);
+        /* An interval timer whose signal stays blocked counts overruns. */
+        struct itimerspec every = {{0, 10000000}, {0, 10000000}};
+        result("interval", timer_settime(timer, 0, &every, NULL));
+        struct timespec pause_for = {0, 80000000};
+        nanosleep(&pause_for, NULL);
+        result("repeated", sigtimedwait(&set, &info, &limit));
+        result("overrun", info.si_overrun > 0);
+        result("armed", timer_gettime(timer, &now) == 0 && now.it_interval.tv_nsec == 10000000);
+        result("delete", timer_delete(timer));
+        struct timespec zero = {0, 0};
+        errno = 0;
+        result("drained", sigtimedwait(&set, &info, &zero));
+        result("errno", errno);
+        errno = 0;
+        result("bad-clock", syscall(SYS_timer_create, 99, NULL, &timer));
+        result("errno", errno);
+        event.sigev_signo = 99;
+        errno = 0;
+        int id;
+        result("bad-signal", syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &id));
+        result("errno", errno);
+        errno = 0;
+        result("bad-timer", syscall(SYS_timer_settime, 0x3ffff, 0, &once, NULL));
+        result("errno", errno);
+        errno = 0;
+        result("bad-delete", syscall(SYS_timer_delete, (int)(intptr_t)timer));
+        result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "prctl")) {
+        int value = -1;
+        result("pdeathsig", prctl(PR_SET_PDEATHSIG, SIGUSR1));
+        prctl(PR_GET_PDEATHSIG, &value);
+        result("pdeathsig-value", value);
+        result("dumpable", prctl(PR_GET_DUMPABLE));
+        result("not-dumpable", prctl(PR_SET_DUMPABLE, 0));
+        result("dumpable-now", prctl(PR_GET_DUMPABLE));
+        errno = 0;
+        result("bad-dumpable", prctl(PR_SET_DUMPABLE, 2));
+        result("errno", errno);
+        result("no-new-privs", prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
+        result("no-new-privs-now", prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
+        errno = 0;
+        result("bad-signal", prctl(PR_SET_PDEATHSIG, 65));
+        result("errno", errno);
+        errno = 0;
+        result("unknown", prctl(9999));
+        result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "pdeathsig")) {
+        /* A grandchild asks for SIGUSR1 when its parent exits, then waits. */
+        int report[2];
+        if (pipe(report)) return 81;
+        pid_t middle = child();
+        if (middle == 0) {
+            int ready[2];
+            if (pipe(ready)) _exit(82);
+            pid_t grandchild = child();
+            if (grandchild == 0) {
+                sigset_t set;
+                sigemptyset(&set);
+                sigaddset(&set, SIGUSR1);
+                sigprocmask(SIG_BLOCK, &set, NULL);
+                prctl(PR_SET_PDEATHSIG, SIGUSR1);
+                char byte = 'r';
+                if (write(ready[1], &byte, 1) != 1) _exit(83);
+                /* No timeout: the emulated harness runs a virtual clock, so a
+                   bounded wait could end before the parent exits. The
+                   harness's own watchdog bounds the run instead. */
+                byte = sigwaitinfo(&set, NULL) == SIGUSR1 ? 'y' : 'n';
+                if (write(report[1], &byte, 1) != 1) _exit(84);
+                _exit(0);
+            }
+            char byte;
+            if (read(ready[0], &byte, 1) != 1) _exit(85);
+            _exit(0);
+        }
+        finish(middle);
+        close(report[1]);
+        char byte = 0;
+        result("report", read(report[0], &byte, 1));
+        result("signalled", byte == 'y');
         return 0;
     }
     if (!strcmp(mode, "no-child")) {

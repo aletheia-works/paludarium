@@ -31,11 +31,11 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 
 | Group | Main system calls |
 |---|---|
-| Processes and threads | `clone`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit` |
+| Processes and threads | `clone`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous), `munmap`, `mprotect`, `madvise`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups` |
-| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer` |
-| Time | `clock_gettime`, `nanosleep`, `clock_nanosleep` |
+| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait` |
+| Time | `clock_gettime`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2` |
 | I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
@@ -66,6 +66,14 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   has an execute bit or is a directory; `getgroups` returns no groups.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's.
+- POSIX timers run on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` and notify with
+  a signal (`SIGEV_SIGNAL`, with `SI_TIMER` siginfo and overruns) or not at all
+  (`SIGEV_NONE`); `SIGEV_THREAD_ID` and CPU-time clocks give `EINVAL`. They are
+  not inherited by `fork` and are deleted by `execve`. `rt_sigtimedwait` also
+  takes blocked signals pending for the whole process.
+- `prctl` supports `PR_SET_PDEATHSIG` (the signal is sent when the parent
+  exits), `PR_SET_DUMPABLE` and `PR_SET_NO_NEW_PRIVS` with their `PR_GET_*`;
+  other options give `EINVAL`.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed, but paludarium does not enforce them. Process groups are

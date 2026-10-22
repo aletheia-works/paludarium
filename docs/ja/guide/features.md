@@ -27,11 +27,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | 主なシステムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit` |
+| プロセスとスレッド | `clone`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous）、`munmap`、`mprotect`、`madvise`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups` |
-| シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer` |
-| 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep` |
+| シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait` |
+| 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2` |
 | 入出力 | `poll`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
 | イベント | `eventfd2`、`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
@@ -61,6 +61,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリのときに許します。`getgroups` はグループを返しません。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
   見せません。起動からの時間は単調時計の値です。
+- POSIX タイマーは `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き、シグナル
+  （`SIGEV_SIGNAL`。`SI_TIMER` の siginfo とオーバーランつき）で知らせるか、何も
+  知らせません（`SIGEV_NONE`）。`SIGEV_THREAD_ID` と CPU 時間の時計は `EINVAL` を
+  返します。`fork` では受け継がれず、`execve` で消えます。`rt_sigtimedwait` は、
+  プロセス全体に届いてブロックされているシグナルも受け取ります。
+- `prctl` は `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、
+  `PR_SET_DUMPABLE`、`PR_SET_NO_NEW_PRIVS` と、それぞれの `PR_GET_*` に対応します。
+  ほかの指定には `EINVAL` を返します。
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
   8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ただし
   paludarium はその上限を守らせません。プロセスグループも同じように持ちますが、

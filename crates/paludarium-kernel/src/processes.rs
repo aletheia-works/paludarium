@@ -22,6 +22,12 @@ struct Entry {
     /// Resource limits (soft, hard), inherited on fork and kept across exec.
     /// They are recorded and reported, not enforced.
     limits: [(u64, u64); RLIMITS],
+    /// PR_SET_PDEATHSIG: sent to this process when its parent exits; cleared
+    /// on fork.
+    death_signal: i32,
+    /// PR_SET_DUMPABLE and PR_SET_NO_NEW_PRIVS, recorded for PR_GET_*.
+    dumpable: bool,
+    no_new_privs: bool,
 }
 
 /// RLIMIT_CPU ... RLIMIT_RTTIME.
@@ -65,6 +71,9 @@ impl Processes {
                     status: None,
                     pgid: 1,
                     limits: DEFAULT_LIMITS,
+                    death_signal: 0,
+                    dumpable: true,
+                    no_new_privs: false,
                 },
             )])),
         }
@@ -78,9 +87,11 @@ impl Processes {
     }
     pub(crate) fn insert(&self, pid: u32, parent: u32, group: Arc<ThreadGroup>) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let (pgid, limits) = entries
+        let (pgid, limits, dumpable, no_new_privs) = entries
             .get(&parent)
-            .map_or((pid, DEFAULT_LIMITS), |p| (p.pgid, p.limits));
+            .map_or((pid, DEFAULT_LIMITS, true, false), |p| {
+                (p.pgid, p.limits, p.dumpable, p.no_new_privs)
+            });
         entries.insert(
             pid,
             Entry {
@@ -89,8 +100,43 @@ impl Processes {
                 status: None,
                 pgid,
                 limits,
+                death_signal: 0,
+                dumpable,
+                no_new_privs,
             },
         );
+    }
+    /// `prctl` options kept per process.
+    fn prctl(&self, pid: u32, option: u64, a: [u64; 6]) -> Result<Option<i32>, Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
+        match option {
+            // PR_SET_PDEATHSIG, PR_GET_PDEATHSIG (written out by the caller)
+            1 => {
+                let number = i32::try_from(a[1]).map_err(|_| Errno::EINVAL)?;
+                if !(0..=64).contains(&number) {
+                    return Err(Errno::EINVAL);
+                }
+                entry.death_signal = number;
+                Ok(None)
+            }
+            2 => Ok(Some(entry.death_signal)),
+            // PR_GET_DUMPABLE, PR_SET_DUMPABLE
+            3 => Ok(Some(i32::from(entry.dumpable))),
+            4 if a[1] <= 1 => {
+                entry.dumpable = a[1] == 1;
+                Ok(None)
+            }
+            // PR_SET_NO_NEW_PRIVS (only to 1, for good), PR_GET_NO_NEW_PRIVS
+            38 if a[1] == 1 && a[2] == 0 && a[3] == 0 && a[4] == 0 => {
+                entry.no_new_privs = true;
+                Ok(None)
+            }
+            39 if a[1] == 0 && a[2] == 0 && a[3] == 0 && a[4] == 0 => {
+                Ok(Some(i32::from(entry.no_new_privs)))
+            }
+            _ => Err(Errno::EINVAL),
+        }
     }
     fn pgid(&self, pid: u32) -> Result<u32, Errno> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
@@ -163,6 +209,12 @@ impl Processes {
         };
         if let Some(parent) = entries.get(&parent) {
             parent.group.notify_child();
+        }
+        // Children that asked for it learn that this process exited.
+        for child in entries.values() {
+            if child.parent == pid && child.status.is_none() && child.death_signal != 0 {
+                let _ = child.group.send_process(child.death_signal);
+            }
         }
     }
     pub fn active_threads(&self) -> usize {
@@ -284,6 +336,7 @@ impl Kernel {
             },
             61 => self.wait4(thread, mem, a),
             110 => Ok(u64::from(self.processes.parent(self.process.pid))),
+            157 => self.prctl(mem, a),
             // setpgid, getpgid, getpgrp
             109 => self.setpgid(a),
             121 => self
@@ -336,6 +389,20 @@ impl Kernel {
             0 => Ok(self.process.pid),
             pid if pid > 0 => Ok(pid as u32),
             _ => Err(Errno(3)),
+        }
+    }
+    /// `prctl(option, ...)`: PR_SET/GET_PDEATHSIG, PR_SET/GET_DUMPABLE and
+    /// PR_SET/GET_NO_NEW_PRIVS; any other option is EINVAL, as Linux gives
+    /// for options it does not know.
+    fn prctl(&self, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
+        match self.processes.prctl(self.process.pid, a[0], a)? {
+            Some(value) if a[0] == 2 => {
+                mem.write(GuestAddr(a[1]), &value.to_le_bytes())
+                    .map_err(|_| Errno::EFAULT)?;
+                Ok(0)
+            }
+            Some(value) => Ok(value as u32 as u64),
+            None => Ok(0),
         }
     }
     fn setpgid(&self, a: [u64; 6]) -> Result<u64, Errno> {
@@ -560,6 +627,9 @@ impl Kernel {
         }
         self.group
             .end_exec(thread.tid, self.process.pid, Arc::clone(&self.inbox));
+        // exec deletes the POSIX timers (the interval timer stays).
+        self.group
+            .with_timers(&mut thread.state, |timers| timers.clear());
         thread.tid = self.process.pid;
         self.files = self.files.for_exec();
         self.group.exec_actions();

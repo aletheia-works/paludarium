@@ -20,6 +20,7 @@ mod processes;
 mod sockets;
 mod syscalls;
 mod threads;
+mod timers;
 pub use processes::Processes;
 pub use threads::ThreadGroup;
 
@@ -113,6 +114,8 @@ pub struct ThreadState {
     pub(crate) pending: Vec<signals::PendingSignal>,
     pub(crate) frames: Vec<signals::SavedFrame>,
     pub(crate) timer: signals::RealTimer,
+    /// The earliest POSIX timer deadline, synced from the thread group.
+    pub(crate) posix_deadline: Option<u64>,
     pub stopped: bool,
 }
 
@@ -354,6 +357,7 @@ impl Kernel {
                         | u64::from(present)
                         | (u64::from(fetch) * 16),
                     synchronous: true,
+                    timer: None,
                 })
             }
             ExitReason::InvalidOpcode { rip, .. } => {
@@ -366,6 +370,7 @@ impl Kernel {
                     trap: 6,
                     error: 0,
                     synchronous: true,
+                    timer: None,
                 })
             }
             ExitReason::ArithmeticFault { rip } => {
@@ -378,6 +383,7 @@ impl Kernel {
                     trap: 0,
                     error: 0,
                     synchronous: true,
+                    timer: None,
                 })
             }
             ExitReason::FloatingPointFault { rip, code } => {
@@ -390,6 +396,7 @@ impl Kernel {
                     trap: 19,
                     error: 0,
                     synchronous: true,
+                    timer: None,
                 })
             }
             ExitReason::GeneralProtection { rip } | ExitReason::Halt { rip } => {
@@ -402,6 +409,7 @@ impl Kernel {
                     trap: 13,
                     error: 0,
                     synchronous: true,
+                    timer: None,
                 })
             }
             _ => None,

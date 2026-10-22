@@ -944,3 +944,42 @@ fn memory_file_shared_stays_read_only() {
         errno(Errno::EACCES)
     );
 }
+#[test]
+fn mremap_flags_and_msync_arguments() {
+    let mut f = fixture();
+    let (at, einval) = (0x6000_0000, errno(Errno::EINVAL));
+    assert_eq!(
+        f.ret(syscalls::nr::MMAP, &[at, 4096, 3, 0x32, u64::MAX, 0]),
+        at
+    );
+    for flags in [8, 2, 4, 6] {
+        assert_eq!(
+            f.ret(syscalls::nr::MREMAP, &[at, 4096, 4096, flags, 0]),
+            einval
+        );
+    }
+    // DONTUNMAP keeps the size, comparing the rounded lengths.
+    assert_eq!(f.ret(syscalls::nr::MREMAP, &[at, 4096, 8192, 5, 0]), einval);
+    assert_eq!(
+        f.ret(syscalls::nr::MREMAP, &[at, 4096, 4095, 5, at + 0x10_0000]),
+        at + 0x10_0000
+    );
+    assert_eq!(
+        f.ret(syscalls::nr::MREMAP, &[at + 0x10_0000, 4096, 4096, 3, at]),
+        at
+    );
+    assert_eq!(f.ret(syscalls::nr::MREMAP, &[at, 4096, 8192, 0, 0]), at);
+    assert_eq!(f.ret(syscalls::nr::MSYNC, &[at, 8192, 4]), 0);
+    assert_eq!(
+        f.ret(syscalls::nr::MSYNC, &[at, 3 * 4096, 4]),
+        errno(Errno::ENOMEM)
+    );
+    assert_eq!(f.ret(syscalls::nr::MSYNC, &[at, 4096, 5]), einval);
+    assert_eq!(f.ret(syscalls::nr::MSYNC, &[at, 4096, 8]), einval);
+    assert_eq!(f.ret(syscalls::nr::MSYNC, &[at + 1, 4096, 4]), einval);
+    assert_eq!(f.ret(syscalls::nr::MSYNC, &[at, u64::MAX, 1]), 0);
+    assert_eq!(
+        f.ret(syscalls::nr::MSYNC, &[!4095, 8192, 1]),
+        errno(Errno::ENOMEM)
+    );
+}

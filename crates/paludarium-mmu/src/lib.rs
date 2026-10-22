@@ -190,8 +190,26 @@ type Frame = Arc<OnceLock<Box<[AtomicU8]>>>;
 #[derive(Clone)]
 struct SharedMapping {
     end: u64,
+    /// Frames are keyed by `page + shift` (wrapping): 0 where the mapping
+    /// was made, and moved by `mremap`, so every process sharing the frames
+    /// still finds the same ones wherever it has the mapping now.
+    shift: u64,
     frames: Arc<Mutex<BTreeMap<u64, Frame>>>,
     generation: Arc<AtomicU64>,
+}
+
+/// Where `mremap` may put a mapping ([`AddressSpace::remap`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Remap {
+    /// `MREMAP_MAYMOVE`: move the mapping when it cannot grow in place.
+    pub may_move: bool,
+    /// `MREMAP_FIXED`: move the mapping to exactly `new_addr`.
+    pub fixed: bool,
+    /// `MREMAP_DONTUNMAP`: leave the old range mapped. A private one is
+    /// emptied, as its pages moved; a shared one keeps showing them.
+    pub keep_old: bool,
+    /// The target with `fixed`, or a hint with `keep_old` alone.
+    pub new_addr: GuestAddr,
 }
 
 static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -321,7 +339,7 @@ impl AddressSpaceData {
                 .frames
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .entry(page)
+                .entry(page.wrapping_add(mapping.shift))
                 .or_default()
                 .clone()
         });
@@ -728,6 +746,233 @@ impl AddressSpaceData {
         Ok(())
     }
 
+    /// Whether two mappings would be one Linux VMA when adjacent: the same
+    /// protection and kind, and both private or both the same shared memory.
+    fn mergeable(&self, a: &Mapping, b: &Mapping) -> bool {
+        a.prot == b.prot
+            && a.kind == b.kind
+            && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
+                (None, None) => true,
+                (Some(x), Some(y)) => Arc::ptr_eq(&x.frames, &y.frames) && x.shift == y.shift,
+                _ => false,
+            }
+    }
+
+    /// The `[start, end)` of the Linux VMA holding `addr`: the mapping there
+    /// and the adjacent ones Linux would have merged with it.
+    fn region_at(&self, addr: u64) -> Option<(u64, u64)> {
+        let mut first = *self.mapping_at(addr)?;
+        let mut last = first;
+        while let Some((_, m)) = self.mappings.range(..first.start.0).next_back() {
+            if m.end() != first.start.0 || !self.mergeable(m, &first) {
+                break;
+            }
+            first = *m;
+        }
+        while let Some(m) = self.mappings.get(&last.end()) {
+            if !self.mergeable(&last, m) {
+                break;
+            }
+            last = *m;
+        }
+        Some((first.start.0, last.end()))
+    }
+
+    /// Takes the populated page entries of `[start, end)` with their
+    /// addresses; with `keep` the entries stay and the pages are shared.
+    fn take_pages(&mut self, start: u64, end: u64, keep: bool) -> Vec<(u64, Page)> {
+        let mut pages = Vec::new();
+        if end <= start {
+            return pages;
+        }
+        let directory = self
+            .directory
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (first, last) = (
+            start / PAGE_SIZE / ENTRIES_PER_TABLE,
+            (end - 1) / PAGE_SIZE / ENTRIES_PER_TABLE,
+        );
+        for (&dir, table) in directory.range_mut(first..=last) {
+            for (slot, entry) in table.pages.iter_mut().enumerate() {
+                let page = (dir * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE;
+                if page < start || page >= end {
+                    continue;
+                }
+                let taken = if keep {
+                    entry.as_ref().map(|p| Page {
+                        prot: p.prot,
+                        frame: p.frame.clone(),
+                    })
+                } else {
+                    entry.take()
+                };
+                if let Some(taken) = taken {
+                    pages.push((page, taken));
+                }
+            }
+        }
+        directory.retain(|_, table| !table.is_empty());
+        pages
+    }
+
+    /// Moves `[old, old+old_len)` to a free `[to, to+new_len)`, carrying
+    /// its pages (and its shared memory, under a new frame key shift).
+    fn move_region(&mut self, old: u64, old_len: u64, to: u64, new_len: u64, keep_old: bool) {
+        let Some(&mapping) = self.mapping_at(old) else {
+            return;
+        };
+        let shared = self.shared_at(old).cloned();
+        let pages = self.take_pages(old, old + old_len, keep_old && shared.is_some());
+        if !keep_old && old_len > 0 {
+            let _ = self.unmap(GuestAddr(old), old_len);
+        }
+        if let Some(shared) = shared {
+            self.shared.insert(
+                to,
+                SharedMapping {
+                    end: to + new_len,
+                    shift: shared.shift.wrapping_add(old).wrapping_sub(to),
+                    ..shared
+                },
+            );
+        }
+        self.mappings.insert(
+            to,
+            Mapping {
+                start: GuestAddr(to),
+                length: new_len,
+                ..mapping
+            },
+        );
+        let directory = self
+            .directory
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (page, entry) in pages {
+            let (dir, slot) = page_index(page - old + to);
+            directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
+        }
+        self.bump_code_generation();
+    }
+
+    /// `mremap`, with Linux's checks in Linux's order: resizes the mapping
+    /// at `addr`, growing it in place when the pages after it are free, else
+    /// moving it as `how` allows. A grown or moved range must lie in one
+    /// Linux VMA (`EFAULT`). A file mapping cannot grow (`ENOMEM`), as it no
+    /// longer knows its file. Moving a range that spans several VMAs with
+    /// `MREMAP_FIXED`, which recent Linux allows, gives `EFAULT`.
+    pub fn remap(
+        &mut self,
+        addr: GuestAddr,
+        old_len: u64,
+        new_len: u64,
+        how: Remap,
+    ) -> Result<GuestAddr, Errno> {
+        // PAGE_ALIGN wraps: a length in the last page becomes 0.
+        let align = |len: u64| len.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let (old_len, new_len) = (align(old_len), align(new_len));
+        if addr.page_offset() != 0 || new_len == 0 || new_len > USER_ADDRESS_LIMIT {
+            return Err(Errno::EINVAL);
+        }
+        // MREMAP_FIXED and MREMAP_DONTUNMAP both name a new address: the
+        // target, or a hint for DONTUNMAP alone.
+        let new_addr = (how.fixed || how.keep_old).then_some(how.new_addr.0);
+        if let Some(to) = new_addr
+            && (to > USER_ADDRESS_LIMIT - new_len
+                || to % PAGE_SIZE != 0
+                || !how.may_move
+                || (how.keep_old && old_len != new_len)
+                || (to < addr.0.wrapping_add(old_len) && addr.0 < to + new_len))
+        {
+            return Err(Errno::EINVAL);
+        }
+        let mapping = *self.mapping_at(addr.0).ok_or(Errno::EFAULT)?;
+        if new_addr.is_none() && new_len <= old_len {
+            if new_len < old_len {
+                self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
+            }
+            return Ok(addr);
+        }
+        let shared = self.shared_at(addr.0).is_some();
+        if old_len == 0 && !shared {
+            return Err(Errno::EINVAL);
+        }
+        // A shrink may cross the end of the VMA: only what stays must not.
+        let kept = old_len.min(new_len);
+        let (_, region_end) = self.region_at(addr.0).ok_or(Errno::EFAULT)?;
+        if kept > region_end - addr.0 {
+            return Err(Errno::EFAULT);
+        }
+        if new_len > old_len && mapping.kind == MappingKind::File {
+            return Err(Errno::ENOMEM);
+        }
+        let old_end = addr.0 + old_len;
+        if let Some(hint) = new_addr {
+            let to = if how.fixed {
+                self.unmap(GuestAddr(hint), new_len)?;
+                hint
+            } else if hint != 0 && hint >= MMAP_MIN_ADDR && !self.overlaps(hint, hint + new_len) {
+                hint
+            } else {
+                self.find_free(new_len).ok_or(Errno::ENOMEM)?
+            };
+            if old_len > new_len {
+                self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
+            }
+            self.move_region(addr.0, kept, to, new_len, how.keep_old);
+            return Ok(GuestAddr(to));
+        }
+        let new_end = addr
+            .0
+            .checked_add(new_len)
+            .filter(|&end| end <= USER_ADDRESS_LIMIT);
+        if old_len > 0
+            && old_end == region_end
+            && let Some(new_end) = new_end
+            && !self.overlaps(old_end, new_end)
+        {
+            let last = *self.mapping_at(old_end - 1).ok_or(Errno::EFAULT)?;
+            self.mappings.insert(
+                old_end,
+                Mapping {
+                    start: GuestAddr(old_end),
+                    length: new_end - old_end,
+                    ..last
+                },
+            );
+            if let Some((_, entry)) = self.shared.range_mut(..old_end).next_back()
+                && entry.end == old_end
+            {
+                entry.end = new_end;
+            }
+            self.bump_code_generation();
+            return Ok(addr);
+        }
+        if !how.may_move {
+            return Err(Errno::ENOMEM);
+        }
+        let to = self.find_free(new_len).ok_or(Errno::ENOMEM)?;
+        self.move_region(addr.0, old_len, to, new_len, false);
+        Ok(GuestAddr(to))
+    }
+
+    /// Whether every page of `[addr, addr+len)` is mapped (`msync`).
+    pub fn covers(&self, addr: GuestAddr, len: u64) -> Result<bool, Errno> {
+        let end = checked_range(addr, len)?;
+        let mut covered = addr.0;
+        for (_, m) in self.mappings.range(..end) {
+            if m.end() <= covered {
+                continue;
+            }
+            if m.start.0 > covered {
+                return Ok(false);
+            }
+            covered = m.end();
+        }
+        Ok(covered >= end)
+    }
+
     /// Changes the protection of `[addr, addr+len)`; every page must be
     /// mapped (`ENOMEM` otherwise, as on Linux).
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
@@ -1038,6 +1283,7 @@ impl AddressSpace {
             addr.0,
             SharedMapping {
                 end,
+                shift: 0,
                 frames: Arc::new(Mutex::new(frames)),
                 generation: Arc::default(),
             },
@@ -1164,6 +1410,20 @@ impl AddressSpace {
     /// See [`AddressSpaceData::check_private_anonymous`].
     pub fn check_private_anonymous(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().check_private_anonymous(addr, len)
+    }
+    /// See [`AddressSpaceData::remap`].
+    pub fn remap_shared(
+        &self,
+        addr: GuestAddr,
+        old_len: u64,
+        new_len: u64,
+        how: Remap,
+    ) -> Result<GuestAddr, Errno> {
+        self.locked().remap(addr, old_len, new_len, how)
+    }
+    /// See [`AddressSpaceData::covers`].
+    pub fn covers(&self, addr: GuestAddr, len: u64) -> Result<bool, Errno> {
+        self.locked().covers(addr, len)
     }
     pub fn protect_shared(&self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.locked().protect(addr, len, prot)
@@ -1479,6 +1739,194 @@ mod tests {
             space.discard_shared(GuestAddr(0xf000), 2 * PAGE_SIZE),
             Err(Errno::ENOMEM)
         );
+    }
+
+    fn byte(space: &AddressSpace, addr: u64) -> u8 {
+        let mut b = [0];
+        space.read(GuestAddr(addr), &mut b).unwrap();
+        b[0]
+    }
+
+    const MOVE: Remap = Remap {
+        may_move: true,
+        fixed: false,
+        keep_old: false,
+        new_addr: GuestAddr(0),
+    };
+
+    #[test]
+    fn remap_grows_in_place_shrinks_and_moves_with_contents() {
+        let space = space_with(0x10000, PAGE_SIZE, Prot::READ_WRITE);
+        space.write(GuestAddr(0x10000), &[7]).unwrap();
+        // The pages after it are free: it grows in place.
+        assert_eq!(
+            space.remap_shared(GuestAddr(0x10000), 4096, 3 * 4096, Remap::default()),
+            Ok(GuestAddr(0x10000))
+        );
+        space.write(GuestAddr(0x12000), &[8]).unwrap();
+        space
+            .map_shared(
+                Some(GuestAddr(0x13000)),
+                4096,
+                Prot::READ,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        // Blocked by the next mapping: only a move can grow it.
+        assert_eq!(
+            space.remap_shared(GuestAddr(0x10000), 3 * 4096, 4 * 4096, Remap::default()),
+            Err(Errno::ENOMEM)
+        );
+        let moved = space
+            .remap_shared(GuestAddr(0x10000), 3 * 4096, 4 * 4096, MOVE)
+            .unwrap();
+        assert_ne!(moved, GuestAddr(0x10000));
+        assert_eq!(
+            (byte(&space, moved.0), byte(&space, moved.0 + 0x2000)),
+            (7, 8)
+        );
+        assert!(space.read(GuestAddr(0x10000), &mut [0]).is_err());
+        assert_eq!(
+            space.remap_shared(moved, 4 * 4096, 4096, Remap::default()),
+            Ok(moved)
+        );
+        assert!(space.read(GuestAddr(moved.0 + 4096), &mut [0]).is_err());
+    }
+
+    #[test]
+    fn remap_rejects_ranges_outside_one_region() {
+        let space = space_with(0x10000, 2 * PAGE_SIZE, Prot::READ_WRITE);
+        let at = GuestAddr(0x10000);
+        assert_eq!(
+            space.remap_shared(GuestAddr(0x10001), 4096, 4096, MOVE),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(space.remap_shared(at, 4096, 0, MOVE), Err(Errno::EINVAL));
+        assert_eq!(
+            space.remap_shared(GuestAddr(0x40000), 4096, 8192, MOVE),
+            Err(Errno::EFAULT)
+        );
+        // Growing or moving needs the whole old range in one VMA; a shrink
+        // may cross its end, as only what stays must not.
+        let grow = |old, new| space.remap_shared(at, old, new, Remap::default());
+        assert_eq!(grow(3 * 4096, 4 * 4096), Err(Errno::EFAULT));
+        // Old length 0 duplicates only shared memory.
+        assert_eq!(space.remap_shared(at, 0, 4096, MOVE), Err(Errno::EINVAL));
+        // A protection change splits the mapping; the parts are separate VMAs.
+        space
+            .protect_shared(GuestAddr(0x11000), 4096, Prot::READ)
+            .unwrap();
+        assert_eq!(grow(8192, 3 * 4096), Err(Errno::EFAULT));
+        // Splits Linux would have merged again stay one region.
+        space
+            .protect_shared(GuestAddr(0x11000), 4096, Prot::READ_WRITE)
+            .unwrap();
+        assert_eq!(grow(8192, 3 * 4096), Ok(at));
+        assert_eq!(space.remap_shared(at, 5 * 4096, 4096, MOVE), Ok(at));
+        assert!(space.read(GuestAddr(0x11000), &mut [0]).is_err());
+        let fixed = Remap {
+            fixed: true,
+            new_addr: GuestAddr(0x10800),
+            ..MOVE
+        };
+        assert_eq!(
+            space.remap_shared(at, 4096, 4096, fixed),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn remap_fixed_replaces_the_target_and_dontunmap_empties_the_old_range() {
+        let space = space_with(0x10000, PAGE_SIZE, Prot::READ_WRITE);
+        space.write(GuestAddr(0x10000), &[5]).unwrap();
+        space
+            .map_shared(
+                Some(GuestAddr(0x20000)),
+                2 * 4096,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.write(GuestAddr(0x21000), &[6]).unwrap();
+        let fixed = Remap {
+            fixed: true,
+            keep_old: true,
+            new_addr: GuestAddr(0x20000),
+            ..MOVE
+        };
+        assert_eq!(
+            space.remap_shared(GuestAddr(0x10000), 4096, 4096, fixed),
+            Ok(GuestAddr(0x20000))
+        );
+        // The pages moved; the old range is still mapped, but empty.
+        assert_eq!(byte(&space, 0x20000), 5);
+        assert_eq!(byte(&space, 0x10000), 0);
+        // Only the target's length was replaced.
+        assert_eq!(byte(&space, 0x21000), 6);
+    }
+
+    #[test]
+    fn remap_keeps_shared_memory_shared_after_fork_and_on_duplicates() {
+        let space = space_with(0x10000, PAGE_SIZE, Prot::READ_WRITE);
+        space.mark_shared(GuestAddr(0x10000), 4096).unwrap();
+        let child = space.fork();
+        let moved = space
+            .remap_shared(
+                GuestAddr(0x10000),
+                4096,
+                2 * 4096,
+                Remap {
+                    fixed: true,
+                    new_addr: GuestAddr(0x30000),
+                    ..MOVE
+                },
+            )
+            .unwrap();
+        // A page neither process had written yet is still the same memory.
+        child.write(GuestAddr(0x10000), &[9]).unwrap();
+        assert_eq!(byte(&space, moved.0), 9);
+        space.write(GuestAddr(moved.0), &[10]).unwrap();
+        assert_eq!(byte(&child, 0x10000), 10);
+        // Old length 0 maps the same shared memory a second time.
+        let duplicate = space.remap_shared(moved, 0, 4096, MOVE).unwrap();
+        assert_ne!(duplicate, moved);
+        space.write(duplicate, &[11]).unwrap();
+        assert_eq!(byte(&child, 0x10000), 11);
+        assert_eq!(byte(&space, moved.0), 11);
+    }
+
+    #[test]
+    fn remap_does_not_grow_a_file_copy_and_covers_finds_holes() {
+        let space = AddressSpace::new();
+        space
+            .map_shared(
+                Some(GuestAddr(0x10000)),
+                4096,
+                Prot::READ,
+                MappingKind::File,
+            )
+            .unwrap();
+        assert_eq!(
+            space.remap_shared(GuestAddr(0x10000), 4096, 8192, MOVE),
+            Err(Errno::ENOMEM)
+        );
+        assert!(
+            space
+                .remap_shared(GuestAddr(0x10000), 4096, 4096, MOVE)
+                .is_ok()
+        );
+        let space = space_with(0x10000, PAGE_SIZE, Prot::READ);
+        space
+            .map_shared(
+                Some(GuestAddr(0x12000)),
+                4096,
+                Prot::READ,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        assert_eq!(space.covers(GuestAddr(0x10000), 4096), Ok(true));
+        assert_eq!(space.covers(GuestAddr(0x10000), 3 * 4096), Ok(false));
+        assert_eq!(space.covers(GuestAddr(0x11000), 4096), Ok(false));
     }
 }
 

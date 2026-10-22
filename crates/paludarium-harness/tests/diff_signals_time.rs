@@ -53,6 +53,9 @@ cases!(
     memory_unaligned_hint => 7,
     memory_madvise_dontneed_free => 10,
     memory_madvise_errors => 11,
+    memory_mremap => 12,
+    memory_mremap_fixed_dontunmap => 13,
+    memory_mremap_shared_msync => 14,
 );
 
 macro_rules! time_cases { ($($name:ident => $case:literal),* $(,)?) => {$(

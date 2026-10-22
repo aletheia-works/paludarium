@@ -3,7 +3,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 out="${1:-$here/../../../target/guests/signals-time}"
 mkdir -p "$out"
-for case_id in {0..11}; do
+for case_id in {0..14}; do
   "${MUSL_CC:-musl-gcc}" -static -O1 -nostdlib -fno-stack-protector -fno-builtin \
     -fno-asynchronous-unwind-tables -fcf-protection=none -mno-red-zone -fno-pie -no-pie \
     -DCASE="$case_id" -o "$out/memory-$case_id" "$here/memory.c"

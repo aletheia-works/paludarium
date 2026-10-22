@@ -32,7 +32,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | Group | Main system calls |
 |---|---|
 | Processes and threads | `clone`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mprotect`, `madvise`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait` |
 | Time | `clock_gettime`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
@@ -50,6 +50,15 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 - `madvise`: `MADV_DONTNEED` empties private pages, which then read as zeros;
   `MADV_FREE` keeps their contents, as Linux does without memory pressure.
   The access-pattern hints are accepted and other advice gives `EINVAL`.
+- `mremap` grows a mapping in place when the pages after it are free, and
+  otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`
+  and `MREMAP_DONTUNMAP` work too. Shared memory stays shared with a `fork`ed
+  process when it moves. A mapping copied from a file cannot grow (`ENOMEM`),
+  as it cannot read the rest of the file, and moving a range that spans
+  several mappings with `MREMAP_FIXED`, which recent Linux allows, gives
+  `EFAULT`.
+- `msync` checks its arguments and the range and succeeds: a shared file
+  mapping is a read-only copy, so there is nothing to write back.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like

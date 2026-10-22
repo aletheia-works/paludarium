@@ -28,7 +28,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | 主なシステムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mprotect`、`madvise`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait` |
 | 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
@@ -45,6 +45,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `madvise`：`MADV_DONTNEED` を受けたプライベートなページは空になり、0 として読めます。
   `MADV_FREE` では中身を残します。メモリが足りているときの Linux と同じです。
   アクセスの仕方のヒントは受け付け、ほかの指定には `EINVAL` を返します。
+- `mremap` は、後ろが空いていればその場で広げ、空いていなければ `MREMAP_MAYMOVE` で
+  中身ごと動かします。`MREMAP_FIXED` と `MREMAP_DONTUNMAP` も使えます。共有のメモリは、
+  動かしても `fork` した相手と共有したままです。ファイルを写し取ったマッピングは、ファイルの
+  続きを読めないので広げられません（`ENOMEM`）。また、複数のマッピングにまたがる範囲を
+  `MREMAP_FIXED` で動かすと、`EFAULT` になります（最近の Linux は動かせます）。
+- `msync` は、引数と範囲を確かめて成功を返します。共有のファイルのマッピングは読むだけの
+  写しなので、書き戻すものがありません。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
 - `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、

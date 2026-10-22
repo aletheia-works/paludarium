@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use paludarium_cpu::CpuState;
 use paludarium_host::{ClockId, FileHandle, Host, WaitOutcome};
-use paludarium_mmu::{AddressSpace, MappingKind, Prot};
+use paludarium_mmu::{AddressSpace, MappingKind, Prot, Remap};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 
 use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState, signals};
@@ -40,6 +40,8 @@ pub mod nr {
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const EXIT_GROUP: u64 = 231;
+    pub const MREMAP: u64 = 25;
+    pub const MSYNC: u64 = 26;
     pub const MADVISE: u64 = 28;
     pub const UNAME: u64 = 63;
     pub const GETUID: u64 = 102;
@@ -87,7 +89,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 40] = [
+        let entries: [(u64, Handler); 42] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -112,6 +114,8 @@ impl SyscallTable {
             (nr::ARCH_PRCTL, sys_arch_prctl),
             (nr::SET_TID_ADDRESS, sys_set_tid_address),
             (nr::EXIT_GROUP, sys_exit_group),
+            (nr::MREMAP, sys_mremap),
+            (nr::MSYNC, sys_msync),
             (nr::MADVISE, sys_madvise),
             (nr::UNAME, sys_uname),
             (nr::GETUID, sys_root_id),
@@ -938,6 +942,54 @@ fn sys_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     match c.mem.protect_shared(GuestAddr(a[0]), a[1], prot) {
         Ok(()) => ok(0),
         Err(e) => err(e),
+    }
+}
+
+const MREMAP_MAYMOVE: u64 = 1;
+const MREMAP_FIXED: u64 = 2;
+const MREMAP_DONTUNMAP: u64 = 4;
+
+fn sys_mremap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (addr, old_len, new_len, flags, new_addr) = (a[0], a[1], a[2], a[3], a[4]);
+    // The other flag rules depend on the rounded lengths (see `remap`).
+    if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 {
+        return err(Errno::EINVAL);
+    }
+    let how = Remap {
+        may_move: flags & MREMAP_MAYMOVE != 0,
+        fixed: flags & MREMAP_FIXED != 0,
+        keep_old: flags & MREMAP_DONTUNMAP != 0,
+        new_addr: GuestAddr(new_addr),
+    };
+    match c.mem.remap_shared(GuestAddr(addr), old_len, new_len, how) {
+        Ok(at) => ok(at.0),
+        Err(e) => err(e),
+    }
+}
+
+const MS_ASYNC: u64 = 1;
+const MS_INVALIDATE: u64 = 2;
+const MS_SYNC: u64 = 4;
+
+/// `msync` has nothing to write: a shared file mapping is a read-only copy
+/// (see `check_mappable`). It still checks its arguments and the range.
+fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (addr, len, flags) = (a[0], a[1], a[2]);
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || addr & 4095 != 0
+        || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
+    {
+        return err(Errno::EINVAL);
+    }
+    // Linux rounds the length up with wrapping arithmetic, so a length near
+    // the top of the range becomes 0.
+    let len = len.wrapping_add(4095) & !4095;
+    if len == 0 {
+        return ok(0);
+    }
+    match c.mem.covers(GuestAddr(addr), len) {
+        Ok(true) => ok(0),
+        Ok(false) | Err(_) => err(Errno::ENOMEM),
     }
 }
 

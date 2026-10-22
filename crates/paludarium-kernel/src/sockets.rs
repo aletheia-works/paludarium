@@ -234,7 +234,14 @@ struct Side {
 struct Pair {
     sides: Mutex<[Side; 2]>,
     hub: Arc<ReadinessHub>,
+    /// SOCK_SEQPACKET: each write is one message, and each read returns one
+    /// whole message, truncated to the buffer, as on Linux.
+    seqpacket: bool,
 }
+const SOCK_STREAM: u32 = 1;
+const SOCK_SEQPACKET: u32 = 5;
+/// Linux refuses a message longer than the send buffer less 32 bytes.
+const MAX_MESSAGE: usize = SEND_WINDOW - 32;
 pub(crate) struct SocketPairEnd {
     pair: Arc<Pair>,
     side: usize,
@@ -245,10 +252,13 @@ impl SocketPairEnd {
         if kind & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
             return Err(Errno::EINVAL);
         }
-        if kind & 0xf != 1 {
-            return Err(Errno(94));
-        }
+        let seqpacket = match kind & 0xf {
+            SOCK_STREAM => false,
+            SOCK_SEQPACKET => true,
+            _ => return Err(Errno(94)), // ESOCKTNOSUPPORT
+        };
         let pair = Arc::new(Pair {
+            seqpacket,
             sides: Mutex::new(std::array::from_fn(|_| Side {
                 output_epoch: 1,
                 ..Side::default()
@@ -284,6 +294,40 @@ impl SocketPairEnd {
         Ok(())
     }
 }
+impl SocketPairEnd {
+    /// SOCK_SEQPACKET read: the next whole message, truncated to `buf`. An
+    /// empty buffer reads nothing and leaves the message, as Linux's read
+    /// does on a socket (recv with no buffer would discard it).
+    fn read_message(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut sides = self
+            .pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let eof = sides[self.side].read_shutdown
+            || sides[1 - self.side].closed
+            || sides[1 - self.side].write_shutdown;
+        let own = &mut sides[self.side];
+        if own.read_shutdown {
+            return Ok(0);
+        }
+        let Some(length) = own.writes.pop_front() else {
+            return if eof { Ok(0) } else { Err(Errno::EAGAIN) };
+        };
+        let count = buf.len().min(length);
+        for (i, byte) in own.bytes.drain(..length).enumerate() {
+            if i < count {
+                buf[i] = byte;
+            }
+        }
+        sides[1 - self.side].output_epoch = sides[1 - self.side].output_epoch.wrapping_add(1);
+        self.pair.hub.changed();
+        Ok(count)
+    }
+}
 impl Drop for SocketPairEnd {
     fn drop(&mut self) {
         let mut sides = self
@@ -309,8 +353,10 @@ impl FileHandle for SocketPairEnd {
         let own = &sides[self.side];
         let peer = &sides[1 - self.side];
         let eof = own.read_shutdown || peer.closed || peer.write_shutdown;
+        // An empty message is readable too.
+        let readable = !own.bytes.is_empty() || self.pair.seqpacket && !own.writes.is_empty();
         let mask = (u32::from(peer.bytes.len() < SEND_WINDOW || peer.closed) * OUT)
-            | (u32::from(!own.bytes.is_empty() || eof) * IN)
+            | (u32::from(readable || eof) * IN)
             | if peer.closed {
                 0x2010
             } else if peer.write_shutdown {
@@ -321,6 +367,9 @@ impl FileHandle for SocketPairEnd {
         Ok((mask, own.input_epoch, own.output_epoch))
     }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        if self.pair.seqpacket {
+            return self.read_message(buf);
+        }
         if buf.is_empty() {
             return Ok(0);
         }
@@ -375,6 +424,25 @@ impl FileHandle for SocketPairEnd {
             return Err(Errno(32));
         }
         let peer = &mut sides[1 - self.side];
+        if self.pair.seqpacket {
+            // A message goes whole or not at all; one that can never fit is
+            // EMSGSIZE, and an empty one is a message too.
+            if buf.len() > MAX_MESSAGE {
+                return Err(Errno(90));
+            }
+            if SEND_WINDOW - peer.bytes.len() < buf.len() {
+                return Err(Errno::EAGAIN);
+            }
+            peer.bytes
+                .try_reserve(buf.len())
+                .map_err(|_| Errno::ENOMEM)?;
+            peer.writes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+            peer.input_epoch = peer.input_epoch.wrapping_add(1);
+            peer.bytes.extend(buf.iter().copied());
+            peer.writes.push_back(buf.len());
+            self.pair.hub.changed();
+            return Ok(buf.len());
+        }
         let count = buf.len().min(SEND_WINDOW.saturating_sub(peer.bytes.len()));
         if count == 0 && !buf.is_empty() {
             return Err(Errno::EAGAIN);
@@ -437,6 +505,46 @@ mod events_tests {
         assert_ne!(ready.0 & OUT, 0);
         assert_eq!(ready.2, full.2 + 1);
         assert_eq!(a.write(&[1]), Ok(1));
+    }
+    fn seqpacket() -> [Arc<SocketPairEnd>; 2] {
+        SocketPairEnd::pair(SOCK_SEQPACKET, Arc::default()).unwrap()
+    }
+    #[test]
+    fn seqpacket_keeps_message_boundaries_and_truncates() {
+        let [a, b] = seqpacket();
+        assert_eq!(a.write(b"first"), Ok(5));
+        assert_eq!(a.write(b""), Ok(0));
+        assert_eq!(a.write(b"second"), Ok(6));
+        let mut bytes = [0; 3];
+        // A short buffer gets the start of one message; the rest is gone.
+        assert_eq!(b.read(&mut bytes), Ok(3));
+        assert_eq!(&bytes, b"fir");
+        // An empty read leaves the next message, an empty one, in place.
+        assert_eq!(b.read(&mut []), Ok(0));
+        assert_ne!(b.readiness().unwrap().0 & IN, 0);
+        assert_eq!(b.read(&mut [0; 8]), Ok(0));
+        let mut bytes = [0; 16];
+        assert_eq!(b.read(&mut bytes), Ok(6));
+        assert_eq!(&bytes[..6], b"second");
+        assert_eq!(b.read(&mut bytes), Err(Errno::EAGAIN));
+        assert_eq!(b.readiness().unwrap().0 & IN, 0);
+        drop(a);
+        assert_eq!(b.read(&mut bytes), Ok(0));
+    }
+    #[test]
+    fn seqpacket_writes_whole_messages_or_none() {
+        let [a, b] = seqpacket();
+        assert_eq!(a.write(&vec![0; MAX_MESSAGE + 1]), Err(Errno(90)));
+        assert_eq!(a.write(&vec![1; MAX_MESSAGE]), Ok(MAX_MESSAGE));
+        assert_eq!(a.write(&[2; 33]), Err(Errno::EAGAIN));
+        assert_eq!(a.write(&[2; 32]), Ok(32));
+        assert_eq!(b.read(&mut [0; 1]), Ok(1));
+        assert_eq!(a.write(&[3; 3]), Ok(3));
+        let mut bytes = [0; 40];
+        assert_eq!(b.read(&mut bytes), Ok(32));
+        assert_eq!(b.read(&mut bytes), Ok(3));
+        assert_eq!(&bytes[..3], &[3; 3]);
+        assert!(SocketPairEnd::pair(2, Arc::default()).is_err_and(|e| e == Errno(94)));
     }
     #[test]
     fn events_socket_empty() {

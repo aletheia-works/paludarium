@@ -39,7 +39,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2` |
 | I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
-| Sockets | `socketpair` (AF_UNIX), `sendto`, `recvfrom`, `shutdown` |
+| Sockets | `socketpair` (AF_UNIX, `SOCK_STREAM` and `SOCK_SEQPACKET`), `sendto`, `recvfrom`, `shutdown` |
 | Randomness | `getrandom` |
 
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`.
@@ -78,7 +78,8 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   Workers in WebAssembly.
 - `fork`/`vfork`-style `clone` with `execve` starts another program from the
   virtual filesystem, and `wait4` collects its exit. Rust's
-  `std::process::Command` works.
+  `std::process::Command` works, also when it forks instead of using
+  `posix_spawn` (for example with `pre_exec`).
 
 ## Signals
 

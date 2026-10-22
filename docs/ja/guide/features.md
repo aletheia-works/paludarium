@@ -35,7 +35,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2` |
 | 入出力 | `poll`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
 | イベント | `eventfd2`、`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socketpair`（AF_UNIX）、`sendto`、`recvfrom`、`shutdown` |
+| ソケット | `socketpair`（AF_UNIX、`SOCK_STREAM` と `SOCK_SEQPACKET`）、`sendto`、`recvfrom`、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET` を扱います。
@@ -73,7 +73,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Worker に割り当てます。
 - `fork`／`vfork` 相当の `clone` と `execve` で、仮想ファイルシステムの中の別の
   プログラムを起動し、`wait4` で終了を受け取れます。Rust の `std::process::Command` も
-  動きます。
+  動きます。`posix_spawn` を使わずに fork するとき（たとえば `pre_exec` を使うとき）も
+  同じです。
 
 ## シグナル
 

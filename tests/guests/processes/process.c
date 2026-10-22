@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -270,6 +271,34 @@ int main(int argc, char **argv) {
         errno = 0;
         result("negative-groups", syscall(SYS_getgroups, -1, NULL));
         result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "seqpacket")) {
+        int pair[2];
+        result("socketpair", socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair));
+        result("first", write(pair[0], "abc", 3));
+        result("empty", write(pair[0], "", 0));
+        result("second", write(pair[0], "defgh", 5));
+        char buf[8] = {0};
+        result("truncated", read(pair[1], buf, 2));
+        result("start", buf[0] == 'a' && buf[1] == 'b');
+        result("empty-read", read(pair[1], buf, 0));
+        result("empty-message", read(pair[1], buf, sizeof buf));
+        result("whole", read(pair[1], buf, sizeof buf));
+        result("bytes", !memcmp(buf, "defgh", 5));
+        fcntl(pair[1], F_SETFL, O_NONBLOCK);
+        errno = 0;
+        result("drained", read(pair[1], buf, sizeof buf));
+        result("errno", errno);
+        static char large[212961];
+        errno = 0;
+        result("too-large", write(pair[0], large, sizeof large));
+        result("errno", errno);
+        result("largest", write(pair[0], large, sizeof large - 1));
+        result("read-largest", read(pair[1], large, sizeof large));
+        close(pair[0]);
+        result("eof", read(pair[1], buf, sizeof buf));
+        close(pair[1]);
         return 0;
     }
     if (!strcmp(mode, "no-child")) {

@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -13,11 +14,25 @@ fn main() {
         println!("errno={}", error.raw_os_error().unwrap());
         return;
     }
+    if mode == "pre-exec-missing" {
+        // pre_exec keeps std off posix_spawn: it forks, and the child reports
+        // the exec error over an AF_UNIX SOCK_SEQPACKET pair.
+        let mut command = Command::new("/paludarium-not-present");
+        // SAFETY: the closure only returns; it touches no state after fork.
+        unsafe { command.pre_exec(|| Ok(())) };
+        println!("errno={}", command.spawn().err().unwrap().raw_os_error().unwrap());
+        return;
+    }
     let mut command = Command::new(executable);
     command.args(["child", "argument"]);
     match mode.as_str() {
         "spawn" => println!("status={}", command.spawn().unwrap().wait().unwrap().code().unwrap()),
         "status" => println!("status={}", command.status().unwrap().code().unwrap()),
+        "pre-exec" => {
+            // SAFETY: the closure only returns; it touches no state after fork.
+            unsafe { command.pre_exec(|| Ok(())) };
+            println!("status={}", command.status().unwrap().code().unwrap());
+        }
         "output" => {
             let output = command.output().unwrap();
             println!("status={}", output.status.code().unwrap());

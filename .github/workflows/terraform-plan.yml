@@ -13,7 +13,13 @@ permissions:
 
 jobs:
   plan:
-    if: github.repository_owner == 'aletheia-works'
+    # pull_request_target hands the plan every secret while it runs the
+    # PR's own configuration, so a fork PR runs it only when its author
+    # belongs to the repository.
+    if: >-
+      github.repository_owner == 'aletheia-works' &&
+      (github.event.pull_request.head.repo.full_name == github.repository ||
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
     uses: aletheia-works/.github/.github/workflows/terraform-plan.yml@4f9b6d6865f083952f13557c91eaf839045e55e1 # v1.0.0
     with:
       working_directory: infra/github

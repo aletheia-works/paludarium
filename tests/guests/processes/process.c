@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -302,6 +303,84 @@ int main(int argc, char **argv) {
         close(pair[0]);
         result("eof", read(pair[1], buf, sizeof buf));
         close(pair[1]);
+        return 0;
+    }
+    if (!strcmp(mode, "dgram")) {
+        /* SIGPIPE comes only from SOCK_STREAM; count it instead of dying. */
+        signal(SIGPIPE, interrupted);
+        int pair[2];
+        char buf[8] = {0};
+        result("socketpair", socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
+        result("first", write(pair[0], "abc", 3));
+        result("empty", write(pair[0], "", 0));
+        result("truncated", read(pair[1], buf, 2));
+        result("start", buf[0] == 'a' && buf[1] == 'b');
+        result("empty-message", read(pair[1], buf, sizeof buf));
+        static char large[212961];
+        errno = 0;
+        result("too-large", write(pair[0], large, sizeof large));
+        result("errno", errno);
+        struct pollfd poll_fd = {pair[1], POLLIN | POLLOUT, 0};
+        result("poll", poll(&poll_fd, 1, 0));
+        result("revents", poll_fd.revents);
+        /* A shutdown is this side's own: the peer still writes and gets no end of file. */
+        result("shut-wr", shutdown(pair[0], SHUT_WR));
+        errno = 0;
+        result("after-shut-wr", write(pair[0], "x", 1));
+        result("errno", errno);
+        result("peer-writes", write(pair[1], "y", 1));
+        result("read-own", read(pair[0], buf, sizeof buf));
+        fcntl(pair[1], F_SETFL, O_NONBLOCK);
+        errno = 0;
+        result("no-eof", read(pair[1], buf, sizeof buf));
+        result("errno", errno);
+        result("shut-rd", shutdown(pair[1], SHUT_RD));
+        poll_fd.revents = 0;
+        result("poll-shut-rd", poll(&poll_fd, 1, 0));
+        result("revents", poll_fd.revents);
+        errno = 0;
+        result("shut-rd-nonblocking", read(pair[1], buf, sizeof buf));
+        result("errno", errno);
+        fcntl(pair[1], F_SETFL, 0);
+        result("shut-rd-blocking", read(pair[1], buf, sizeof buf));
+        int closed[2];
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, closed);
+        write(closed[1], "zz", 2);
+        close(closed[1]);
+        result("queued-after-close", read(closed[0], buf, sizeof buf));
+        fcntl(closed[0], F_SETFL, O_NONBLOCK);
+        errno = 0;
+        result("no-eof-after-close", read(closed[0], buf, sizeof buf));
+        result("errno", errno);
+        struct pollfd closed_poll = {closed[0], POLLIN | POLLOUT, 0};
+        result("poll-closed", poll(&closed_poll, 1, 0));
+        result("revents", closed_poll.revents);
+        errno = 0;
+        result("refused", write(closed[0], "q", 1));
+        result("errno", errno);
+        errno = 0;
+        result("not-connected", write(closed[0], "q", 1));
+        result("errno", errno);
+        int reader_shut[2];
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, reader_shut);
+        shutdown(reader_shut[1], SHUT_RD);
+        errno = 0;
+        result("to-shut-rd", write(reader_shut[0], "a", 1));
+        result("errno", errno);
+        int packets[2];
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, packets);
+        close(packets[1]);
+        errno = 0;
+        result("seqpacket-closed", write(packets[0], "a", 1));
+        result("errno", errno);
+        result("sigpipes", received);
+        int stream[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, stream);
+        close(stream[1]);
+        errno = 0;
+        result("stream-closed", write(stream[0], "a", 1));
+        result("errno", errno);
+        result("stream-sigpipes", received);
         return 0;
     }
     if (!strcmp(mode, "posix-timer")) {

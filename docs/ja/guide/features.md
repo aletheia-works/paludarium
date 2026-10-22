@@ -35,13 +35,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
 | イベント | `eventfd2`、`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socketpair`（AF_UNIX、`SOCK_STREAM` と `SOCK_SEQPACKET`）、`sendto`、`recvfrom`、`shutdown` |
+| ソケット | `socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET` を扱います。
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
 - `socket()` はいつも `EAFNOSUPPORT` を返します。ネットワークは使えません。
+- `SOCK_DGRAM` の組は、`SOCK_SEQPACKET` と同じくメッセージの区切りを保ちますが、
+  ファイルの終わりがありません。相手が閉じると、読み込みは待ち続け、次の送信は
+  `ECONNREFUSED`、その後は `ENOTCONN` になります。`EPIPE` で `SIGPIPE` を送るのは、
+  Linux と同じく `SOCK_STREAM` だけです。
 - `madvise`：`MADV_DONTNEED` を受けたプライベートなページは空になり、0 として読めます。
   `MADV_FREE` では中身を残します。メモリが足りているときの Linux と同じです。
   アクセスの仕方のヒントは受け付け、ほかの指定には `EINVAL` を返します。

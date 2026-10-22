@@ -950,7 +950,11 @@ pub(crate) fn write_io(
                 if done != 0 {
                     return Ok(done as u64);
                 }
-                if e == Errno(32) && !nosignal {
+                let sigpipe = file
+                    .as_any()
+                    .and_then(|a| a.downcast_ref::<crate::sockets::SocketPairEnd>())
+                    .is_none_or(crate::sockets::SocketPairEnd::raises_sigpipe);
+                if e == Errno(32) && !nosignal && sigpipe {
                     crate::signals::queue(c.process, crate::signals::PendingSignal::user(13, 0));
                 }
                 return Err(e);

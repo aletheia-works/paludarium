@@ -7,8 +7,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **動的リンクのプログラム**：静的にリンクしたプログラムだけを動かせます。
 - **32-bit の x86、AVX、AVX-512、x87、MMX**：対象外です。
 - **ネットワーク**：`socket()` はいつも `EAFNOSUPPORT` を返します。使えるのは、
-  AF_UNIX で `SOCK_STREAM` か `SOCK_SEQPACKET` の `socketpair` だけです
-  （`SOCK_DGRAM` の組はまだありません）。
+  AF_UNIX の `socketpair`（`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）だけです。
 - **書き込める共有のファイルのマッピング**：`mmap` は、マッピングを作るときにファイルの
   中身を写し取ります。`MAP_PRIVATE` のマッピングは Linux と同じように動き、読むだけの
   `MAP_SHARED` も、ファイルが変わるまでは同じです（後の変更はマッピングに見えません）。

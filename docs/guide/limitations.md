@@ -8,8 +8,8 @@ verified.
 - **Dynamically linked programs**: only statically linked programs run.
 - **32-bit x86, AVX, AVX-512, x87, MMX**: out of scope.
 - **Network**: `socket()` always returns `EAFNOSUPPORT`; only AF_UNIX
-  `socketpair` of type `SOCK_STREAM` or `SOCK_SEQPACKET` is available
-  (`SOCK_DGRAM` pairs are not there yet).
+  `socketpair` (`SOCK_STREAM`, `SOCK_SEQPACKET` or `SOCK_DGRAM`) is
+  available.
 - **Writable shared file mappings**: `mmap` copies a file in when the
   mapping is made. A `MAP_PRIVATE` mapping behaves as on Linux, and so does a
   read-only `MAP_SHARED` one until the file changes, which the mapping does not

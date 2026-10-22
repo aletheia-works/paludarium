@@ -39,7 +39,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
-| Sockets | `socketpair` (AF_UNIX, `SOCK_STREAM` and `SOCK_SEQPACKET`), `sendto`, `recvfrom`, `shutdown` |
+| Sockets | `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `shutdown` |
 | Randomness | `getrandom` |
 
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`.
@@ -47,6 +47,10 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
 - `socket()` always returns `EAFNOSUPPORT`: there is no network.
+- A `SOCK_DGRAM` pair keeps message boundaries like `SOCK_SEQPACKET`, but has
+  no end of file: when the peer closes, reads wait and the next send gets
+  `ECONNREFUSED`, then `ENOTCONN`. Only `SOCK_STREAM` raises `SIGPIPE` with
+  `EPIPE`, as on Linux.
 - `madvise`: `MADV_DONTNEED` empties private pages, which then read as zeros;
   `MADV_FREE` keeps their contents, as Linux does without memory pressure.
   The access-pattern hints are accepted and other advice gives `EINVAL`.

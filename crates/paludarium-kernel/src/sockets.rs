@@ -230,15 +230,25 @@ struct Side {
     write_shutdown: bool,
     input_epoch: u64,
     output_epoch: u64,
+    /// SOCK_DGRAM: a send found the peer closed, so this side has no peer
+    /// any more (`ECONNREFUSED` once, then `ENOTCONN`).
+    disconnected: bool,
 }
 struct Pair {
     sides: Mutex<[Side; 2]>,
     hub: Arc<ReadinessHub>,
-    /// SOCK_SEQPACKET: each write is one message, and each read returns one
+    /// SOCK_STREAM, SOCK_DGRAM or SOCK_SEQPACKET. The last two keep message
+    /// boundaries: each write is one message, and each read returns one
     /// whole message, truncated to the buffer, as on Linux.
-    seqpacket: bool,
+    kind: u32,
+}
+impl Pair {
+    fn messages(&self) -> bool {
+        self.kind != SOCK_STREAM
+    }
 }
 const SOCK_STREAM: u32 = 1;
+const SOCK_DGRAM: u32 = 2;
 const SOCK_SEQPACKET: u32 = 5;
 /// Linux refuses a message longer than the send buffer less 32 bytes.
 const MAX_MESSAGE: usize = SEND_WINDOW - 32;
@@ -248,17 +258,19 @@ pub(crate) struct SocketPairEnd {
     flags: AtomicU32,
 }
 impl SocketPairEnd {
+    /// Only a SOCK_STREAM socket raises SIGPIPE with EPIPE, as on Linux.
+    pub(crate) fn raises_sigpipe(&self) -> bool {
+        self.pair.kind == SOCK_STREAM
+    }
     pub fn pair(kind: u32, hub: Arc<ReadinessHub>) -> Result<[Arc<Self>; 2], Errno> {
         if kind & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
             return Err(Errno::EINVAL);
         }
-        let seqpacket = match kind & 0xf {
-            SOCK_STREAM => false,
-            SOCK_SEQPACKET => true,
-            _ => return Err(Errno(94)), // ESOCKTNOSUPPORT
-        };
+        if !matches!(kind & 0xf, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
+            return Err(Errno(94)); // ESOCKTNOSUPPORT
+        }
         let pair = Arc::new(Pair {
-            seqpacket,
+            kind: kind & 0xf,
             sides: Mutex::new(std::array::from_fn(|_| Side {
                 output_epoch: 1,
                 ..Side::default()
@@ -295,13 +307,15 @@ impl SocketPairEnd {
     }
 }
 impl SocketPairEnd {
-    /// SOCK_SEQPACKET read: the next whole message, truncated to `buf`. An
-    /// empty buffer reads nothing and leaves the message, as Linux's read
-    /// does on a socket (recv with no buffer would discard it).
+    /// SOCK_SEQPACKET and SOCK_DGRAM read: the next whole message,
+    /// truncated to `buf`. An empty buffer reads nothing and leaves the
+    /// message, as Linux's read does on a socket (recv with no buffer would
+    /// discard it).
     fn read_message(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         if buf.is_empty() {
             return Ok(0);
         }
+        let nonblocking = self.flags() & NONBLOCK != 0;
         let mut sides = self
             .pair
             .sides
@@ -310,12 +324,26 @@ impl SocketPairEnd {
         let eof = sides[self.side].read_shutdown
             || sides[1 - self.side].closed
             || sides[1 - self.side].write_shutdown;
+        let datagram = self.pair.kind == SOCK_DGRAM;
         let own = &mut sides[self.side];
-        if own.read_shutdown {
+        if own.read_shutdown && !datagram {
             return Ok(0);
         }
         let Some(length) = own.writes.pop_front() else {
-            return if eof { Ok(0) } else { Err(Errno::EAGAIN) };
+            // A datagram socket has no end of file from its peer: only its
+            // own SHUT_RD ends a blocking read, and a nonblocking one still
+            // finds nothing.
+            return if datagram {
+                if own.read_shutdown && !nonblocking {
+                    Ok(0)
+                } else {
+                    Err(Errno::EAGAIN)
+                }
+            } else if eof {
+                Ok(0)
+            } else {
+                Err(Errno::EAGAIN)
+            };
         };
         let count = buf.len().min(length);
         for (i, byte) in own.bytes.drain(..length).enumerate() {
@@ -352,9 +380,17 @@ impl FileHandle for SocketPairEnd {
             .unwrap_or_else(PoisonError::into_inner);
         let own = &sides[self.side];
         let peer = &sides[1 - self.side];
-        let eof = own.read_shutdown || peer.closed || peer.write_shutdown;
         // An empty message is readable too.
-        let readable = !own.bytes.is_empty() || self.pair.seqpacket && !own.writes.is_empty();
+        let readable = !own.bytes.is_empty() || self.pair.messages() && !own.writes.is_empty();
+        if self.pair.kind == SOCK_DGRAM {
+            // Only this side's own shutdowns show; a closed peer does not.
+            let shut = (u32::from(own.read_shutdown) * (IN | 0x2000))
+                | (u32::from(own.read_shutdown && own.write_shutdown) * 0x10);
+            let writable = peer.bytes.len() < SEND_WINDOW || peer.closed;
+            let mask = (u32::from(writable) * OUT) | (u32::from(readable) * IN) | shut;
+            return Ok((mask, own.input_epoch, own.output_epoch));
+        }
+        let eof = own.read_shutdown || peer.closed || peer.write_shutdown;
         let mask = (u32::from(peer.bytes.len() < SEND_WINDOW || peer.closed) * OUT)
             | (u32::from(readable || eof) * IN)
             | if peer.closed {
@@ -367,7 +403,7 @@ impl FileHandle for SocketPairEnd {
         Ok((mask, own.input_epoch, own.output_epoch))
     }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        if self.pair.seqpacket {
+        if self.pair.messages() {
             return self.read_message(buf);
         }
         if buf.is_empty() {
@@ -417,6 +453,46 @@ impl FileHandle for SocketPairEnd {
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        if self.pair.kind == SOCK_DGRAM {
+            // unix_dgram_sendmsg's order: the size, this side's shutdown and
+            // send buffer, then the peer.
+            let [own, peer] = if self.side == 0 {
+                let [a, b] = &mut *sides;
+                [a, b]
+            } else {
+                let [a, b] = &mut *sides;
+                [b, a]
+            };
+            if buf.len() > MAX_MESSAGE {
+                return Err(Errno(90)); // EMSGSIZE
+            }
+            if own.write_shutdown {
+                return Err(Errno(32));
+            }
+            // A closed peer's receive queue is freed with it.
+            if !peer.closed && SEND_WINDOW - peer.bytes.len() < buf.len() {
+                return Err(Errno::EAGAIN);
+            }
+            if own.disconnected {
+                return Err(Errno(107)); // ENOTCONN
+            }
+            if peer.closed {
+                own.disconnected = true;
+                return Err(Errno(111)); // ECONNREFUSED
+            }
+            if peer.read_shutdown {
+                return Err(Errno(32));
+            }
+            peer.bytes
+                .try_reserve(buf.len())
+                .map_err(|_| Errno::ENOMEM)?;
+            peer.writes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+            peer.input_epoch = peer.input_epoch.wrapping_add(1);
+            peer.bytes.extend(buf.iter().copied());
+            peer.writes.push_back(buf.len());
+            self.pair.hub.changed();
+            return Ok(buf.len());
+        }
         if sides[self.side].write_shutdown
             || sides[1 - self.side].closed
             || sides[1 - self.side].read_shutdown
@@ -424,7 +500,7 @@ impl FileHandle for SocketPairEnd {
             return Err(Errno(32));
         }
         let peer = &mut sides[1 - self.side];
-        if self.pair.seqpacket {
+        if self.pair.messages() {
             // A message goes whole or not at all; one that can never fit is
             // EMSGSIZE, and an empty one is a message too.
             if buf.len() > MAX_MESSAGE {
@@ -544,7 +620,7 @@ mod events_tests {
         assert_eq!(b.read(&mut bytes), Ok(32));
         assert_eq!(b.read(&mut bytes), Ok(3));
         assert_eq!(&bytes[..3], &[3; 3]);
-        assert!(SocketPairEnd::pair(2, Arc::default()).is_err_and(|e| e == Errno(94)));
+        assert!(SocketPairEnd::pair(3, Arc::default()).is_err_and(|e| e == Errno(94)));
     }
     #[test]
     fn events_socket_empty() {
@@ -612,5 +688,50 @@ mod events_tests {
         a.set_flags(0).unwrap();
         assert_eq!(a.flags(), 2);
         assert!(SocketPairEnd::pair(1 | 0x4000, Arc::default()).is_err());
+    }
+    fn datagram() -> [Arc<SocketPairEnd>; 2] {
+        SocketPairEnd::pair(SOCK_DGRAM | NONBLOCK, Arc::default()).unwrap()
+    }
+    #[test]
+    fn datagram_keeps_messages_and_has_no_end_of_file() {
+        let [a, b] = datagram();
+        assert_eq!(a.write(b"abc"), Ok(3));
+        assert_eq!(a.write(b""), Ok(0));
+        assert_eq!(a.write(&vec![0; MAX_MESSAGE + 1]), Err(Errno(90)));
+        let mut bytes = [0; 8];
+        assert_eq!(b.read(&mut bytes[..2]), Ok(2));
+        assert_eq!(b.read(&mut bytes), Ok(0));
+        // Shutting down writes is this side's own; the peer sees no EOF.
+        a.shutdown(1).unwrap();
+        assert_eq!(a.write(b"x"), Err(Errno(32)));
+        assert_eq!(b.read(&mut bytes), Err(Errno::EAGAIN));
+        assert_eq!(b.readiness().unwrap().0, OUT);
+        assert_eq!(b.write(b"y"), Ok(1));
+        assert_eq!(a.read(&mut bytes), Ok(1));
+        // Its own SHUT_RD ends only a blocking read.
+        b.shutdown(0).unwrap();
+        assert_eq!(b.readiness().unwrap().0, OUT | IN | 0x2000);
+        assert_eq!(b.read(&mut bytes), Err(Errno::EAGAIN));
+        b.set_flags(0).unwrap();
+        assert_eq!(b.read(&mut bytes), Ok(0));
+        assert_eq!(a.write(b"z"), Err(Errno(32)));
+        b.shutdown(1).unwrap();
+        assert_eq!(b.readiness().unwrap().0, OUT | IN | 0x2000 | 0x10);
+    }
+    #[test]
+    fn datagram_peer_close_refuses_then_disconnects() {
+        let [a, b] = datagram();
+        assert_eq!(b.write(b"zz"), Ok(2));
+        assert_eq!(a.write(&vec![0; SEND_WINDOW - 32]), Ok(SEND_WINDOW - 32));
+        drop(b);
+        let mut bytes = [0; 8];
+        assert_eq!(a.read(&mut bytes), Ok(2));
+        assert_eq!(a.read(&mut bytes), Err(Errno::EAGAIN));
+        assert_eq!(a.readiness().unwrap().0, OUT);
+        // The full queue went with the peer, so the send reaches the peer check.
+        assert_eq!(a.write(&[1; 64]), Err(Errno(111)));
+        assert_eq!(a.write(b"q"), Err(Errno(107)));
+        assert!(!a.raises_sigpipe());
+        assert!(SocketPairEnd::pair(SOCK_STREAM, Arc::default()).unwrap()[0].raises_sigpipe());
     }
 }

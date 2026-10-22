@@ -31,6 +31,8 @@ struct Entry {
     /// A stop by this signal, and a continue, not yet reported to a wait.
     stop_report: Option<i32>,
     continue_report: bool,
+    /// CPU time of the children this process has waited for, and theirs.
+    children_cpu: u64,
 }
 
 /// RLIMIT_CPU ... RLIMIT_RTTIME.
@@ -79,6 +81,7 @@ impl Processes {
                     no_new_privs: false,
                     stop_report: None,
                     continue_report: false,
+                    children_cpu: 0,
                 },
             )])),
         }
@@ -110,6 +113,7 @@ impl Processes {
                 no_new_privs,
                 stop_report: None,
                 continue_report: false,
+                children_cpu: 0,
             },
         );
     }
@@ -190,6 +194,11 @@ impl Processes {
         }
         Ok(old)
     }
+    /// The CPU time of the children `pid` has waited for.
+    pub(crate) fn children_cpu(&self, pid: u32) -> u64 {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.get(&pid).map_or(0, |entry| entry.children_cpu)
+    }
     /// What `/proc/self/status` shows of `pid`: its parent, its
     /// RLIMIT_SIGPENDING soft limit and PR_SET_NO_NEW_PRIVS.
     pub(crate) fn status_of(&self, pid: u32) -> (u32, u64, bool) {
@@ -261,7 +270,7 @@ impl Processes {
         parent: u32,
         wanted: Wanted,
         wait: WaitFor,
-    ) -> Result<Option<(u32, ChildEvent)>, Errno> {
+    ) -> Result<Option<(u32, ChildEvent, u64)>, Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let matching = |pid: u32, entry: &Entry| {
             entry.parent == parent
@@ -280,21 +289,26 @@ impl Processes {
             if !matching(pid, entry) {
                 return None;
             }
-            match entry.status {
-                Some(status) => wait.exits.then_some((pid, ChildEvent::Exited(status))),
+            let event = match entry.status {
+                Some(status) => wait.exits.then_some(ChildEvent::Exited(status)),
                 None => match entry.stop_report {
-                    Some(signal) if wait.stops => Some((pid, ChildEvent::Stopped(signal))),
-                    _ => (wait.continues && entry.continue_report)
-                        .then_some((pid, ChildEvent::Continued)),
+                    Some(signal) if wait.stops => Some(ChildEvent::Stopped(signal)),
+                    _ => (wait.continues && entry.continue_report).then_some(ChildEvent::Continued),
                 },
-            }
+            }?;
+            let cpu = entry.group.process_cpu().saturating_add(entry.children_cpu);
+            Some((pid, event, cpu))
         });
-        if let Some((pid, event)) = ready
+        if let Some((pid, event, cpu)) = ready
             && !wait.keep
         {
             match event {
+                // A reaped child's CPU time joins its parent's children's.
                 ChildEvent::Exited(_) => {
                     entries.remove(&pid);
+                    if let Some(parent) = entries.get_mut(&parent) {
+                        parent.children_cpu = parent.children_cpu.saturating_add(cpu);
+                    }
                 }
                 ChildEvent::Stopped(_) => {
                     if let Some(entry) = entries.get_mut(&pid) {
@@ -789,7 +803,7 @@ impl Kernel {
             ..WaitFor::default()
         };
         loop {
-            if let Some((pid, event)) = self.processes.reap(self.process.pid, wanted, wait)? {
+            if let Some((pid, event, cpu)) = self.processes.reap(self.process.pid, wanted, wait)? {
                 let raw = match event {
                     ChildEvent::Exited(ExitStatus::Exited(code)) => (code & 255) << 8,
                     ChildEvent::Exited(ExitStatus::Signaled(signal)) => signal & 127,
@@ -803,7 +817,7 @@ impl Kernel {
                         .map_err(|_| Errno::EFAULT)?;
                 }
                 if a[3] != 0 {
-                    mem.write(GuestAddr(a[3]), &[0; 144])
+                    mem.write(GuestAddr(a[3]), &crate::syscalls::rusage(cpu))
                         .map_err(|_| Errno::EFAULT)?;
                 }
                 return Ok(u64::from(pid));
@@ -830,27 +844,27 @@ impl Kernel {
     /// `waitid(idtype, id, infop, options, rusage)` with Linux's checks and
     /// copy-out: the siginfo fields (`si_signo`, `si_errno`, `si_code`,
     /// `si_pid`, `si_uid`, `si_status`) are written, as zeros when no child
-    /// is reported, even on an error; the rusage (all zero here) only with a
-    /// child.
+    /// is reported, even on an error; the rusage (the child's CPU time) only
+    /// with a child.
     fn waitid(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         let found = self.waitid_child(thread, a);
-        if let Ok(Some(_)) = found
+        if let Ok(Some((_, _, cpu))) = found
             && a[4] != 0
         {
-            mem.write(GuestAddr(a[4]), &[0; 144])
+            mem.write(GuestAddr(a[4]), &crate::syscalls::rusage(cpu))
                 .map_err(|_| Errno::EFAULT)?;
         }
         if a[2] != 0 {
             let (signo, code, pid, status) = match found {
-                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Exited(code))))) => {
+                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Exited(code)), _))) => {
                     (17, 1, pid, code & 255)
                 }
-                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Signaled(signal))))) => {
+                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Signaled(signal)), _))) => {
                     (17, 2, pid, signal)
                 }
                 // CLD_STOPPED and CLD_CONTINUED.
-                Ok(Some((pid, ChildEvent::Stopped(signal)))) => (17, 5, pid, signal),
-                Ok(Some((pid, ChildEvent::Continued))) => (17, 6, pid, 18),
+                Ok(Some((pid, ChildEvent::Stopped(signal), _))) => (17, 5, pid, signal),
+                Ok(Some((pid, ChildEvent::Continued, _))) => (17, 6, pid, 18),
                 _ => (0, 0, 0, 0),
             };
             let mut info = [0; 28];
@@ -866,7 +880,7 @@ impl Kernel {
         &self,
         thread: &mut Thread,
         a: [u64; 6],
-    ) -> Result<Option<(u32, ChildEvent)>, Errno> {
+    ) -> Result<Option<(u32, ChildEvent, u64)>, Errno> {
         const KNOWN: u64 =
             WNOHANG | 2 | WEXITED | 8 | WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
         let options = u64::from(a[3] as u32);
@@ -1027,10 +1041,13 @@ impl Kernel {
             .filter(|(_, action)| action.handler == 1)
             .map(|(&number, &action)| (number, action))
             .collect();
+        // exec keeps the thread's CPU time, as it keeps the process.
+        let cpu = std::mem::take(&mut thread.state.cpu);
         thread.state = ThreadState {
             pid: self.process.pid,
             signal_mask: thread.state.signal_mask,
             signal_actions: ignored,
+            cpu,
             ..ThreadState::default()
         };
         thread.state.name_after(&path);

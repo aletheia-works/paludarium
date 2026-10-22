@@ -141,7 +141,7 @@ include!("native_encodings.rs");
 
 #[test]
 fn all_native_observer_input_encodings_connect() {
-    assert_eq!(NATIVE_ENCODINGS.len(), 577);
+    assert_eq!(NATIVE_ENCODINGS.len(), 630);
     for bytes in NATIVE_ENCODINGS {
         assert!(
             crate::decode(bytes, paludarium_types::GuestAddr(0)).is_ok(),

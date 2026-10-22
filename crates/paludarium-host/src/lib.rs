@@ -186,6 +186,11 @@ pub trait Host: Send + Sync {
     fn clock(&self, _clock: ClockId) -> Result<u64, Errno> {
         Err(Errno::ENOSYS)
     }
+    /// CPU time the calling host thread has used, in nanoseconds; `ENOSYS`
+    /// where the host cannot measure it, and the kernel then counts wall time.
+    fn thread_cpu_time(&self) -> Result<u64, Errno> {
+        Err(Errno::ENOSYS)
+    }
     /// How many CPUs the guest may run on: the host's available parallelism,
     /// or 1 where it is unknown (WebAssembly).
     fn cpu_count(&self) -> usize {
@@ -245,6 +250,9 @@ impl Host for NativeHost {
     }
     fn clock(&self, clock: ClockId) -> Result<u64, Errno> {
         clock::native_clock(clock)
+    }
+    fn thread_cpu_time(&self) -> Result<u64, Errno> {
+        clock::native_thread_cpu_time()
     }
     fn wait_until(
         &self,

@@ -1270,6 +1270,16 @@ impl Exec<'_> {
                 | M::Cvttps2dq
                 | M::Cvttsd2si
                 | M::Cvttss2si
+                | M::Addss
+                | M::Subss
+                | M::Mulss
+                | M::Minss
+                | M::Maxss
+                | M::Sqrtss
+                | M::Cmpss
+                | M::Comiss
+                | M::Cvtsi2ss
+                | M::Cvtsd2ss
         );
         if !supported {
             return Err(Stop::Invalid);
@@ -1279,9 +1289,19 @@ impl Exec<'_> {
         let single = matches!(
             m,
             M::Addps
+                | M::Addss
+                | M::Subss
+                | M::Mulss
                 | M::Divss
+                | M::Minss
+                | M::Maxss
                 | M::Sqrtps
+                | M::Sqrtss
+                | M::Cmpss
+                | M::Comiss
                 | M::Ucomiss
+                | M::Cvtsi2ss
+                | M::Cvtsd2ss
                 | M::Cvttss2si
                 | M::Cvttps2dq
                 | M::Cvtdq2ps
@@ -1299,7 +1319,7 @@ impl Exec<'_> {
                 | M::Cvtdq2ps
                 | M::Cvttps2dq
         );
-        let b = if m == M::Cvtsi2sd {
+        let b = if matches!(m, M::Cvtsi2sd | M::Cvtsi2ss) {
             u128::from(self.read(src, Self::size_of(src, None))?)
         } else {
             self.sse_operand(src)?
@@ -1312,9 +1332,16 @@ impl Exec<'_> {
             return self.write(dst, size, result);
         }
         let a = self.read128(dst, false)?;
-        if matches!(m, M::Comisd | M::Ucomisd | M::Ucomiss) {
-            let (order, status) =
-                fp::compare(format, a as u64, b as u64, self.s.mxcsr, m == M::Comisd);
+        // The low element: all of a 64-bit lane, or the low half for single precision.
+        let lane = u64::MAX >> (64 - width);
+        if matches!(m, M::Comisd | M::Comiss | M::Ucomisd | M::Ucomiss) {
+            let (order, status) = fp::compare(
+                format,
+                a as u64 & lane,
+                b as u64 & lane,
+                self.s.mxcsr,
+                matches!(m, M::Comisd | M::Comiss),
+            );
             self.fp_status(status)?;
             self.set_status(
                 flag::STATUS,
@@ -1327,15 +1354,15 @@ impl Exec<'_> {
             );
             return Ok(());
         }
-        if m == M::CmpsdSse {
+        if matches!(m, M::CmpsdSse | M::Cmpss) {
             let Operand::Immediate(predicate) = op(self.i, 2)? else {
                 return Err(Stop::Invalid);
             };
             let predicate = predicate & 7;
             let (order, status) = fp::compare(
-                F64,
-                a as u64,
-                b as u64,
+                format,
+                a as u64 & lane,
+                b as u64 & lane,
                 self.s.mxcsr,
                 matches!(predicate, 1 | 2 | 5 | 6),
             );
@@ -1352,7 +1379,7 @@ impl Exec<'_> {
             self.fp_status(status)?;
             return self.write128(
                 dst,
-                (a & !(u128::from(u64::MAX))) | if yes { u128::from(u64::MAX) } else { 0 },
+                (a & !u128::from(lane)) | if yes { u128::from(lane) } else { 0 },
                 false,
             );
         }
@@ -1368,19 +1395,26 @@ impl Exec<'_> {
                     let size = Self::size_of(src, None);
                     fp::from_integer(F64, sign_extend(b as u64, size) as i64, self.s.mxcsr)
                 }
+                M::Cvtsi2ss => {
+                    let size = Self::size_of(src, None);
+                    fp::from_integer(F32, sign_extend(b as u64, size) as i64, self.s.mxcsr)
+                }
                 M::Cvtss2sd => fp::convert(F32, F64, b as u32 as u64, self.s.mxcsr),
+                M::Cvtsd2ss => fp::convert(F64, F32, b as u64, self.s.mxcsr),
                 M::Cvtdq2ps => fp::from_integer(F32, i64::from(bv as u32 as i32), self.s.mxcsr),
                 M::Cvttps2dq => fp::to_integer(F32, bv, 32, self.s.mxcsr),
-                M::Sqrtps | M::Sqrtsd => fp::arithmetic(format, O::Sqrt, bv, 0, self.s.mxcsr),
+                M::Sqrtps | M::Sqrtsd | M::Sqrtss => {
+                    fp::arithmetic(format, O::Sqrt, bv, 0, self.s.mxcsr)
+                }
                 _ => fp::arithmetic(
                     format,
                     match m {
-                        M::Addpd | M::Addps | M::Addsd => O::Add,
-                        M::Subpd | M::Subsd => O::Sub,
-                        M::Mulpd | M::Mulsd => O::Mul,
+                        M::Addpd | M::Addps | M::Addsd | M::Addss => O::Add,
+                        M::Subpd | M::Subsd | M::Subss => O::Sub,
+                        M::Mulpd | M::Mulsd | M::Mulss => O::Mul,
                         M::Divpd | M::Divsd | M::Divss => O::Div,
-                        M::Minsd => O::Min,
-                        M::Maxsd => O::Max,
+                        M::Minsd | M::Minss => O::Min,
+                        M::Maxsd | M::Maxss => O::Max,
                         _ => return Err(Stop::Invalid),
                     },
                     av,
@@ -1598,6 +1632,11 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
             x.s.gpr[reg::RBP] = (x.s.gpr[reg::RBP] & !mask) | (v & mask);
         }
         Mnemonic::Nop | Mnemonic::Endbr64 => {}
+        // Guest threads share memory across host threads, so the fences order
+        // the emulator's own accesses as well.
+        Mnemonic::Mfence | Mnemonic::Lfence | Mnemonic::Sfence => {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        }
         Mnemonic::Syscall => {
             x.s.gpr[reg::RCX] = next.0;
             x.s.gpr[reg::R11] = x.s.rflags & !flag::RF;

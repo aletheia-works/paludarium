@@ -276,7 +276,7 @@ jobs:
           import subprocess, os, signal, json, hashlib
           out=Path('target/encodings-guests')
           rows=[]
-          for name, expected_rows in [('observe',23576),('fault-observe',1162),('cpuid-observe',12)]:
+          for name, expected_rows in [('observe',30360),('fault-observe',1263),('cpuid-observe',12)]:
               binary=out/name
               with (out/(name+'.native')).open('wb') as stdout, (out/(name+'.stderr')).open('wb') as stderr:
                   child=subprocess.Popen([str(binary.resolve())], stdout=stdout, stderr=stderr, start_new_session=True)

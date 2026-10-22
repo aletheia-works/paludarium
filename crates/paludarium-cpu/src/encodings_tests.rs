@@ -753,3 +753,83 @@ fn public_unmasked_simd_exception_keeps_destination_and_commits_status() {
     assert_eq!(state.rflags, before.rflags);
     assert_eq!(state.mxcsr, before.mxcsr | 1);
 }
+
+/// Runs one instruction with xmm0 and xmm1 set, after the native observers'
+/// default MXCSR.
+fn scalar_single(code: &[u8], xmm0: u128, xmm1: u128) -> CpuState {
+    let (mut state, memory) = public_machine(code);
+    state.xmm[0] = xmm0;
+    state.xmm[1] = xmm1;
+    super::step(&mut state, &memory).unwrap();
+    assert_eq!(state.rip, GuestAddr(0x10000 + code.len() as u64));
+    state
+}
+const UPPER: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_0000_0000;
+#[test]
+fn scalar_single_arithmetic_changes_only_the_low_element() {
+    let (a, b) = (UPPER | 0x3fc0_0000, 0x4000_0000);
+    for (code, low) in [
+        (&[0xf3, 0x0f, 0x58, 0xc1][..], 0x4060_0000), // addss: 1.5 + 2 = 3.5
+        (&[0xf3, 0x0f, 0x5c, 0xc1], 0xbf00_0000),     // subss: -0.5
+        (&[0xf3, 0x0f, 0x59, 0xc1], 0x4040_0000),     // mulss: 3
+        (&[0xf3, 0x0f, 0x5d, 0xc1], 0x3fc0_0000),     // minss: 1.5
+        (&[0xf3, 0x0f, 0x5f, 0xc1], 0x4000_0000),     // maxss: 2
+        (&[0xf3, 0x0f, 0xc2, 0xc1, 0x01], 0xffff_ffff), // cmpltss: true
+        (&[0xf3, 0x0f, 0xc2, 0xc1, 0x00], 0),         // cmpeqss: false
+    ] {
+        let state = scalar_single(code, a, b);
+        assert_eq!(state.xmm[0], UPPER | low, "{code:02x?}");
+        assert_eq!(state.mxcsr, 0x1f80, "{code:02x?}");
+    }
+    // sqrtss: sqrt(2) rounds, so precision is reported.
+    let state = scalar_single(&[0xf3, 0x0f, 0x51, 0xc1], UPPER, b);
+    assert_eq!((state.xmm[0], state.mxcsr), (UPPER | 0x3fb5_04f3, 0x1fa0));
+    // minss returns the second operand when either is NaN, as the SD form does.
+    let nan = 0x7fc0_0000;
+    let state = scalar_single(&[0xf3, 0x0f, 0x5d, 0xc1], UPPER | nan, b);
+    assert_eq!((state.xmm[0], state.mxcsr), (UPPER | 0x4000_0000, 0x1f81));
+    let state = scalar_single(&[0xf3, 0x0f, 0xc2, 0xc1, 0x03], UPPER | nan, b);
+    assert_eq!(state.xmm[0], UPPER | 0xffff_ffff);
+}
+#[test]
+fn scalar_single_conversions_and_comparisons() {
+    // cvtsi2ss xmm0, rax
+    let (mut state, memory) = public_machine(&[0xf3, 0x48, 0x0f, 0x2a, 0xc0]);
+    state.xmm[0] = UPPER;
+    state.gpr[0] = (-3i64) as u64;
+    super::step(&mut state, &memory).unwrap();
+    assert_eq!(state.xmm[0], UPPER | 0xc040_0000);
+    // cvtsd2ss xmm0, xmm1: 1.5 as a double
+    let state = scalar_single(&[0xf2, 0x0f, 0x5a, 0xc1], UPPER | 7, 0x3ff8_0000_0000_0000);
+    assert_eq!(state.xmm[0], UPPER | 0x3fc0_0000);
+    // comiss sets CF for less, and reports invalid for any NaN; ucomiss only for SNaN.
+    let flags = |state: &CpuState| state.rflags & 0x45;
+    let state = scalar_single(&[0x0f, 0x2f, 0xc1], UPPER | 0x3fc0_0000, 0x4000_0000);
+    assert_eq!((flags(&state), state.mxcsr), (1, 0x1f80));
+    let state = scalar_single(&[0x0f, 0x2f, 0xc1], 0x7fc0_0000, 0x4000_0000);
+    assert_eq!((flags(&state), state.mxcsr), (0x45, 0x1f81));
+    let state = scalar_single(&[0x0f, 0x2e, 0xc1], 0x7fc0_0000, 0x4000_0000);
+    assert_eq!((flags(&state), state.mxcsr), (0x45, 0x1f80));
+}
+#[test]
+fn scalar_single_memory_reads_four_bytes_and_fences_change_nothing() {
+    // mulss xmm0, [rdx] on the last four bytes of the page.
+    let (mut state, memory) = public_machine(&[0xf3, 0x0f, 0x59, 0x02]);
+    memory
+        .write(GuestAddr(0x10ffc), &0x4000_0000u32.to_le_bytes())
+        .unwrap();
+    state.gpr[2] = 0x10ffc;
+    state.xmm[0] = UPPER | 0x3fc0_0000;
+    super::step(&mut state, &memory).unwrap();
+    assert_eq!(state.xmm[0], UPPER | 0x4040_0000);
+    for code in [[0x0f, 0xae, 0xf0], [0x0f, 0xae, 0xe8], [0x0f, 0xae, 0xf8]] {
+        let (mut state, memory) = public_machine(&code);
+        let before = state.clone();
+        super::step(&mut state, &memory).unwrap();
+        assert_eq!(state.rip, GuestAddr(0x10003));
+        assert_eq!(
+            (state.gpr, state.xmm, state.rflags),
+            (before.gpr, before.xmm, before.rflags)
+        );
+    }
+}

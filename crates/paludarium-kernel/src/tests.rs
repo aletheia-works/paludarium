@@ -983,3 +983,11 @@ fn mremap_flags_and_msync_arguments() {
         errno(Errno::ENOMEM)
     );
 }
+#[test]
+fn thread_name_from_path() {
+    let mut state = ThreadState::default();
+    state.name_after(b"/usr/bin/a-very-long-program-name");
+    assert_eq!(&state.name, b"a-very-long-pro\0");
+    state.name_after(b"plain");
+    assert_eq!(&state.name[..6], b"plain\0");
+}

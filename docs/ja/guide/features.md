@@ -74,14 +74,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリのときに許します。`getgroups` はグループを返しません。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
   見せません。起動からの時間は単調時計の値です。
-- POSIX タイマーは `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き、シグナル
-  （`SIGEV_SIGNAL`。`SI_TIMER` の siginfo とオーバーランつき）で知らせるか、何も
-  知らせません（`SIGEV_NONE`）。`SIGEV_THREAD_ID` と CPU 時間の時計は `EINVAL` を
-  返します。`fork` では受け継がれず、`execve` で消えます。`rt_sigtimedwait` は、
-  プロセス全体に届いてブロックされているシグナルも受け取ります。
-- `prctl` は `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、
-  `PR_SET_DUMPABLE`、`PR_SET_NO_NEW_PRIVS` と、それぞれの `PR_GET_*` に対応します。
-  ほかの指定には `EINVAL` を返します。
+- POSIX タイマーは `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き、プロセスへの
+  シグナル（`SIGEV_SIGNAL`。`SI_TIMER` の siginfo とオーバーランつき）か、プロセスの
+  中の 1 つのスレッドへのシグナル（`SIGEV_THREAD_ID`）で知らせるか、何も知らせません
+  （`SIGEV_NONE`）。`SIGEV_THREAD` は、Linux と同じく `SIGEV_SIGNAL` として扱います
+  （スレッドは C ライブラリが `SIGEV_THREAD_ID` を使って作ります）。スレッドへの
+  タイマーのシグナルは、そのスレッドがまだ受け取っていない間だけオーバーランに足され、
+  スレッドが終わっていれば失われます。CPU 時間の時計は `EINVAL` を返します。タイマーは
+  `fork` では受け継がれず、`execve` で消えます。`rt_sigtimedwait` は、プロセス全体に
+  届いてブロックされているシグナルも受け取ります。
+- `prctl` は `PR_SET_NAME`／`PR_GET_NAME`（スレッドごとの 15 バイトまでの名前。
+  `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、
+  `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、`PR_SET_DUMPABLE`、
+  `PR_SET_NO_NEW_PRIVS` と、それぞれの `PR_GET_*` に対応します。ほかの指定には
+  `EINVAL` を返します。
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
   8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ただし
   paludarium はその上限を守らせません。プロセスグループも同じように持ちますが、

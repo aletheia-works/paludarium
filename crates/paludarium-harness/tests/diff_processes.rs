@@ -116,6 +116,8 @@ mod linux {
         processes_posix_timer => ("posix-timer","process"),
         processes_prctl => ("prctl","process"),
         processes_pdeathsig => ("pdeathsig","process"),
+        processes_thread_name => ("thread-name","process"),
+        processes_timer_thread => ("timer-thread","process"),
         processes_seqpacket => ("seqpacket","process"),
         command_pre_exec => ("pre-exec","command"),
         command_pre_exec_missing => ("pre-exec-missing","command"),

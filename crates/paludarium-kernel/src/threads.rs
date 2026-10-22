@@ -161,11 +161,28 @@ impl ThreadGroup {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             signals::expire_timer(&mut pending, now);
-            self.timers
+            let directed = self
+                .timers
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .expire(&mut pending, now);
             local.timer = pending.timer;
+            drop(pending);
+            // A thread that has exited loses its timer's signal, as on Linux.
+            for (tid, signal) in directed {
+                let inbox = self
+                    .members
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&tid)
+                    .cloned();
+                if let Some((id, overrun)) = inbox.and_then(|inbox| inbox.send_timer(signal)) {
+                    self.timers
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .set_overrun(id, overrun);
+                }
+            }
         }
         local.posix_deadline = self.posix_deadline();
         self.drain_process(local);

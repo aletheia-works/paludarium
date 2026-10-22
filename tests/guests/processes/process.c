@@ -34,6 +34,28 @@ static void *blocked_sibling(void *unused) {
     read(thread_block[0], &byte, 1);
     _exit(84);
 }
+static char thread_name[16];
+static void *name_reader(void *unused) {
+    (void)unused;
+    prctl(PR_GET_NAME, thread_name);
+    prctl(PR_SET_NAME, "worker");
+    return NULL;
+}
+/* The kernel's struct sigevent, with the SIGEV_THREAD_ID target. */
+struct thread_event { long value; int signo; int notify; int tid; int pad[11]; };
+static int timer_report[2];
+static void *timer_waiter(void *unused) {
+    (void)unused;
+    int tid = syscall(SYS_gettid);
+    write(timer_report[1], &tid, sizeof tid);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    siginfo_t info;
+    int got[3] = {sigwaitinfo(&set, &info), info.si_code, info.si_value.sival_int};
+    write(timer_report[1], got, sizeof got);
+    return NULL;
+}
 static void finish(pid_t pid) {
     int status = 0;
     result("wait", waitpid(pid, &status, 0) == pid);
@@ -372,6 +394,83 @@ int main(int argc, char **argv) {
         errno = 0;
         result("unknown", prctl(9999));
         result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "thread-name")) {
+        /* The first name comes from the executable's path, which differs. */
+        char name[16];
+        result("set", prctl(PR_SET_NAME, "paludarium-guest-name"));
+        memset(name, 'x', sizeof name);
+        result("get", prctl(PR_GET_NAME, name));
+        result("truncated", !strcmp(name, "paludarium-gues"));
+        result("short", prctl(PR_SET_NAME, "ab"));
+        memset(name, 'x', sizeof name);
+        prctl(PR_GET_NAME, name);
+        result("cleared", !strcmp(name, "ab") && name[3] == 0 && name[15] == 0);
+        errno = 0;
+        result("set-fault", prctl(PR_SET_NAME, (char *)1));
+        result("errno", errno);
+        errno = 0;
+        result("get-fault", prctl(PR_GET_NAME, (char *)1));
+        result("errno", errno);
+        pthread_t worker;
+        pthread_create(&worker, NULL, name_reader, NULL);
+        pthread_join(worker, NULL);
+        result("thread-inherits", !strcmp(thread_name, "ab"));
+        prctl(PR_GET_NAME, name);
+        result("own-name-kept", !strcmp(name, "ab"));
+        pid_t pid = child();
+        if (pid == 0) {
+            prctl(PR_GET_NAME, name);
+            _exit(!strcmp(name, "ab") ? 5 : 6);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        result("fork-inherits", WEXITSTATUS(status));
+        return 0;
+    }
+    if (!strcmp(mode, "timer-thread")) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        if (pipe(timer_report)) return 81;
+        pthread_t waiter;
+        pthread_create(&waiter, NULL, timer_waiter, NULL);
+        int tid = 0;
+        read(timer_report[0], &tid, sizeof tid);
+        struct thread_event event = {7, SIGUSR1, 4, tid, {0}};
+        int timer = -1;
+        result("create", syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &timer));
+        struct itimerspec once = {{0, 0}, {0, 20000000}};
+        result("arm", syscall(SYS_timer_settime, timer, 0, &once, NULL));
+        int got[3] = {0};
+        read(timer_report[0], got, sizeof got);
+        pthread_join(waiter, NULL);
+        result("signal", got[0]);
+        result("code", got[1] == SI_TIMER);
+        result("value", got[2]);
+        sigset_t pending;
+        sigpending(&pending);
+        result("not-for-main", sigismember(&pending, SIGUSR1));
+        result("delete", syscall(SYS_timer_delete, timer));
+        /* The thread must be in this thread group; a bad notify is EINVAL. */
+        struct thread_event elsewhere = {0, SIGUSR1, 4, 999999, {0}};
+        errno = 0;
+        result("other-thread", syscall(SYS_timer_create, CLOCK_MONOTONIC, &elsewhere, &timer));
+        result("errno", errno);
+        struct thread_event bad_signal = {0, 0, 4, (int)syscall(SYS_gettid), {0}};
+        errno = 0;
+        result("bad-signal", syscall(SYS_timer_create, CLOCK_MONOTONIC, &bad_signal, &timer));
+        result("errno", errno);
+        struct thread_event mixed = {0, SIGUSR1, 6, (int)syscall(SYS_gettid), {0}};
+        errno = 0;
+        result("bad-notify", syscall(SYS_timer_create, CLOCK_MONOTONIC, &mixed, &timer));
+        result("errno", errno);
+        /* The kernel takes SIGEV_THREAD as a signal to the process. */
+        struct thread_event as_signal = {0, SIGUSR1, 2, 0, {0}};
+        result("sigev-thread", syscall(SYS_timer_create, CLOCK_MONOTONIC, &as_signal, &timer));
+        result("delete-sigev-thread", syscall(SYS_timer_delete, timer));
         return 0;
     }
     if (!strcmp(mode, "pdeathsig")) {

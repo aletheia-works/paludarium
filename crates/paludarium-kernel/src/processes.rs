@@ -336,7 +336,7 @@ impl Kernel {
             },
             61 => self.wait4(thread, mem, a),
             110 => Ok(u64::from(self.processes.parent(self.process.pid))),
-            157 => self.prctl(mem, a),
+            157 => self.prctl(thread, mem, a),
             // setpgid, getpgid, getpgrp
             109 => self.setpgid(a),
             121 => self
@@ -391,10 +391,36 @@ impl Kernel {
             _ => Err(Errno(3)),
         }
     }
-    /// `prctl(option, ...)`: PR_SET/GET_PDEATHSIG, PR_SET/GET_DUMPABLE and
-    /// PR_SET/GET_NO_NEW_PRIVS; any other option is EINVAL, as Linux gives
+    /// `prctl(option, ...)`: PR_SET/GET_NAME (per thread), PR_SET/GET_PDEATHSIG,
+    /// PR_SET/GET_DUMPABLE and PR_SET/GET_NO_NEW_PRIVS; any other option is
+    /// EINVAL, as Linux gives
     /// for options it does not know.
-    fn prctl(&self, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
+    fn prctl(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
+        match a[0] {
+            // PR_SET_NAME: up to 15 bytes, ending at a NUL; the rest of the
+            // name is cleared.
+            15 => {
+                let mut name = [0; 16];
+                for (i, byte) in name.iter_mut().take(15).enumerate() {
+                    let mut b = [0];
+                    mem.read(GuestAddr(a[1].wrapping_add(i as u64)), &mut b)
+                        .map_err(|_| Errno::EFAULT)?;
+                    if b[0] == 0 {
+                        break;
+                    }
+                    *byte = b[0];
+                }
+                thread.state.name = name;
+                return Ok(0);
+            }
+            // PR_GET_NAME: all 16 bytes.
+            16 => {
+                mem.write(GuestAddr(a[1]), &thread.state.name)
+                    .map_err(|_| Errno::EFAULT)?;
+                return Ok(0);
+            }
+            _ => {}
+        }
         match self.processes.prctl(self.process.pid, a[0], a)? {
             Some(value) if a[0] == 2 => {
                 mem.write(GuestAddr(a[1]), &value.to_le_bytes())
@@ -647,6 +673,7 @@ impl Kernel {
             signal_actions: ignored,
             ..ThreadState::default()
         };
+        thread.state.name_after(&path);
         self.exec_memory = Some(Arc::new(memory));
         self.release_vfork();
         Ok(())

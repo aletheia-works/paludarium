@@ -83,13 +83,19 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's.
 - POSIX timers run on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` and notify with
-  a signal (`SIGEV_SIGNAL`, with `SI_TIMER` siginfo and overruns) or not at all
-  (`SIGEV_NONE`); `SIGEV_THREAD_ID` and CPU-time clocks give `EINVAL`. They are
+  a signal to the process (`SIGEV_SIGNAL`, with `SI_TIMER` siginfo and
+  overruns), a signal to one of its threads (`SIGEV_THREAD_ID`), or not at all
+  (`SIGEV_NONE`). The kernel takes `SIGEV_THREAD` as `SIGEV_SIGNAL`, as Linux
+  does; the C library builds the thread on `SIGEV_THREAD_ID`. A thread's timer
+  signal adds to its overrun only while the thread has not taken it yet, and
+  is lost if the thread has exited. CPU-time clocks give `EINVAL`. Timers are
   not inherited by `fork` and are deleted by `execve`. `rt_sigtimedwait` also
   takes blocked signals pending for the whole process.
-- `prctl` supports `PR_SET_PDEATHSIG` (the signal is sent when the parent
-  exits), `PR_SET_DUMPABLE` and `PR_SET_NO_NEW_PRIVS` with their `PR_GET_*`;
-  other options give `EINVAL`.
+- `prctl` supports `PR_SET_NAME`/`PR_GET_NAME` (a name of up to 15 bytes per
+  thread, taken from the program's file name at `execve` and inherited by new
+  threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the
+  parent exits), `PR_SET_DUMPABLE` and `PR_SET_NO_NEW_PRIVS` with their
+  `PR_GET_*`; other options give `EINVAL`.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed, but paludarium does not enforce them. Process groups are

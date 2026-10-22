@@ -333,7 +333,8 @@ impl Session {
                 Error::new(ErrorKind::InvalidProgram, "current directory unavailable")
             })?;
         }
-        let thread = kernel.spawn_initial(&image);
+        let mut thread = kernel.spawn_initial(&image);
+        thread.state.name_after(&self.config.program);
         let execution = Arc::new(Execution::new(
             Arc::clone(&self.host),
             Arc::new(mem),

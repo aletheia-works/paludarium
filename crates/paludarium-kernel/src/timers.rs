@@ -12,6 +12,8 @@ use crate::signals::{PendingSignal, SI_TIMER, TimerSignal};
 pub(crate) struct PosixTimer {
     pub realtime: bool,
     pub signal: Option<i32>,
+    /// SIGEV_THREAD_ID: the thread the signal goes to.
+    pub thread: Option<u32>,
     pub value: u64,
     pub deadline: Option<u64>,
     pub interval: u64,
@@ -48,8 +50,15 @@ impl Timers {
     }
     /// Queues the signal of every timer due at `now` into `pending`. An
     /// expiry while the timer's last signal is still pending counts as an
-    /// overrun of that signal instead, as on Linux.
-    pub(crate) fn expire(&mut self, pending: &mut ThreadState, now: u64) {
+    /// overrun of that signal instead, as on Linux. The signals of
+    /// SIGEV_THREAD_ID timers are returned with their thread instead, for
+    /// that thread's inbox.
+    pub(crate) fn expire(
+        &mut self,
+        pending: &mut ThreadState,
+        now: u64,
+    ) -> Vec<(u32, PendingSignal)> {
+        let mut directed = Vec::new();
         for (&id, timer) in &mut self.table {
             let Some(deadline) = timer.deadline.filter(|&d| now >= d) else {
                 continue;
@@ -72,6 +81,21 @@ impl Timers {
                 continue;
             };
             let missed = i32::try_from(expirations - 1).unwrap_or(i32::MAX);
+            if let Some(tid) = timer.thread {
+                timer.overrun = missed;
+                directed.push((
+                    tid,
+                    PendingSignal {
+                        timer: Some(TimerSignal {
+                            id,
+                            overrun: missed,
+                            value: timer.value,
+                        }),
+                        ..PendingSignal::thread(number, SI_TIMER)
+                    },
+                ));
+                continue;
+            }
             if let Some(queued) = pending
                 .pending
                 .iter_mut()
@@ -90,6 +114,13 @@ impl Timers {
                 }),
                 ..PendingSignal::user(number, SI_TIMER)
             });
+        }
+        directed
+    }
+    /// Records the overrun the signal of timer `id` ended up with.
+    pub(crate) fn set_overrun(&mut self, id: i32, overrun: i32) {
+        if let Some(timer) = self.table.get_mut(&id) {
+            timer.overrun = overrun;
         }
     }
 }

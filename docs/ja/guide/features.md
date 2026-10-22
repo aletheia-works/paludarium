@@ -32,7 +32,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | システムの情報 | `uname`、`getuid`、`geteuid`、`getgid`、`getegid` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer` |
 | 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep` |
-| ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd` |
+| ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64` |
 | 入出力 | `poll`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
 | イベント | `eventfd2`、`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socketpair`（AF_UNIX）、`sendto`、`recvfrom`、`shutdown` |
@@ -50,6 +50,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、
   ホストのことは見せません。ゲストは root（ユーザーとグループが 0）として動きます。
   `stat` がどのファイルについても返す持ち主と同じです。
+- `chmod` と `utimensat` は、メモリ上のファイルシステムでも、マウントしたホストの
+  ディレクトリでも使えます。`stat` が返すのは更新時刻だけで、アクセスと変更の時刻は
+  0 です。マウントしたディレクトリのファイルでは、渡した両方の時刻がホストに残ります。
+  umask は、Linux で `CLONE_FS` が共有するのと同じく、スレッドの間で共有します。
+  `fsync` と `fdatasync` はファイルとディレクトリでは成功し、パイプ・ソケット・端末では
+  `EINVAL` を返します。`fadvise64` はヒントとして受け付けます。
 - 不正なポインタを渡されたときは `EFAULT` を返します。
 
 ## スレッドとプロセス

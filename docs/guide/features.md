@@ -36,7 +36,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | System information | `uname`, `getuid`, `geteuid`, `getgid`, `getegid` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer` |
 | Time | `clock_gettime`, `nanosleep`, `clock_nanosleep` |
-| Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd` |
+| Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64` |
 | I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socketpair` (AF_UNIX), `sendto`, `recvfrom`, `shutdown` |
@@ -55,6 +55,12 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like
   `CPUID`, it does not reveal the host. The guest runs as root (user and group
   0), the owner `stat` reports for every file.
+- `chmod` and `utimensat` work in the in-memory filesystem and in mounted
+  host directories. `stat` reports only the modification time, with access
+  and change times of 0; the host still records both times it is given for a
+  file in a mounted directory. The umask is shared by threads, as `CLONE_FS` shares it on
+  Linux. `fsync` and `fdatasync` succeed on files and directories and give
+  `EINVAL` on pipes, sockets and terminals; `fadvise64` is accepted as a hint.
 - Invalid pointers return `EFAULT`.
 
 ## Threads and processes

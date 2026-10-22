@@ -95,6 +95,24 @@ impl HostFs for MemFs {
         let id = t.resolve(path, follow)?;
         Ok(lock(&*t.node(id)?).stat(id))
     }
+    fn set_mode(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
+        let t = lock(&self.tree);
+        let node = t.node(t.resolve(path, true)?)?;
+        set_node_mode(&mut lock(&node), mode);
+        Ok(())
+    }
+    fn set_times(
+        &self,
+        path: &[u8],
+        follow: bool,
+        _atime: Option<i128>,
+        mtime: Option<i128>,
+    ) -> Result<(), Errno> {
+        let t = lock(&self.tree);
+        let node = t.node(t.resolve(path, follow)?)?;
+        set_node_mtime(&mut lock(&node), mtime);
+        Ok(())
+    }
     fn mkdir(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
         lock(&self.tree).insert(path, Kind::Dir(BTreeMap::new()), 0o040000 | (mode & 0o7777))?;
         Ok(())

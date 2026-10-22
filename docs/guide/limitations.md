@@ -10,7 +10,7 @@ verified.
 - **Network**: `socket()` always returns `EAFNOSUPPORT`; only AF_UNIX
   `socketpair` is available.
 - **Some system calls**: `clone3`, `timerfd`, file-backed `mmap`,
-  `chmod`/`fchmod`, `CLONE_SIGHAND` between separate processes, stop and
+  `CLONE_SIGHAND` between separate processes, stop and
   continue notifications from `wait`, and `wait` by process group are not there
   yet. Unimplemented system calls return `ENOSYS`, so some programs can carry
   on without the feature.

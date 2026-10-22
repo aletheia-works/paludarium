@@ -169,3 +169,47 @@ fn macos_fs_negative_mtime() {
     );
     assert_eq!(h.stat().unwrap().mtime_ns, -1_000_000_000);
 }
+#[test]
+fn macos_fs_mode_times_and_sync() {
+    let x = Fixture::new();
+    let f = x.fs().open(b"file", 66, 0o644).unwrap();
+    x.fs().symlink(b"file", b"link").unwrap();
+    x.fs().set_mode(b"link", 0o600).unwrap();
+    assert_eq!(
+        x.fs().metadata(b"file", false).unwrap().mode & 0o7777,
+        0o600
+    );
+    f.set_mode(0o640).unwrap();
+    assert_eq!(f.stat().unwrap().mode & 0o7777, 0o640);
+    x.fs()
+        .set_times(b"link", true, Some(0), Some(1_234_567_890_123_456_789))
+        .unwrap();
+    assert_eq!(
+        x.fs().metadata(b"file", false).unwrap().mtime_ns,
+        1_234_567_890_123_456_789
+    );
+    f.set_times(None, Some(-1_000_000_000)).unwrap();
+    assert_eq!(f.stat().unwrap().mtime_ns, -1_000_000_000);
+    x.fs()
+        .set_times(b"link", false, None, Some(5_000_000_000))
+        .unwrap();
+    assert_eq!(
+        x.fs().metadata(b"link", false).unwrap().mtime_ns,
+        5_000_000_000
+    );
+    assert_eq!(f.sync(), Ok(()));
+    assert_eq!(x.fs().set_mode(b"missing", 0o600), Err(Errno::ENOENT));
+    // Times before the epoch go through the file (cap-primitives would panic).
+    x.fs().set_times(b"link", true, None, Some(-3)).unwrap();
+    assert_eq!(x.fs().metadata(b"file", false).unwrap().mtime_ns, -3);
+    x.fs().set_times(b"link", false, None, Some(-7)).unwrap();
+    assert_eq!(x.fs().metadata(b"link", false).unwrap().mtime_ns, -7);
+    assert_eq!(x.fs().metadata(b"file", false).unwrap().mtime_ns, -3);
+    x.fs().mkdir(b"dir", 0o755).unwrap();
+    x.fs().symlink(b"../file", b"dir/link").unwrap();
+    x.fs()
+        .set_times(b"dir/link", false, Some(-1), Some(-9))
+        .unwrap();
+    assert_eq!(x.fs().metadata(b"dir/link", false).unwrap().mtime_ns, -9);
+    assert_eq!(x.fs().metadata(b"file", false).unwrap().mtime_ns, -3);
+}

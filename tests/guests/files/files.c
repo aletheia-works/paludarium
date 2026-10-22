@@ -5,7 +5,7 @@ static long call(long n,long a,long b,long c,long d,long e,long f) {
 }
 #define S(n,a,b,c) call(n,(long)(a),(long)(b),(long)(c),0,0,0)
 static char p[]="/tmp/paludarium-files-fixture",q[]="/tmp/paludarium-files-link",r[]="/tmp/paludarium-files-renamed";
-static char buf[4096]; static long results[16]; static unsigned char st[144];
+static char buf[4096]; static long results[24]; static unsigned char st[144];
 void _start(void) {
  long fd,x=0;
  if(CASE==0) results[x++]=S(4,0,st,0);
@@ -44,6 +44,21 @@ void _start(void) {
  if(CASE==30){S(86,p,q,0);results[x++]=S(82,p,q,0);results[x++]=S(4,p,st,0);results[x++]=*(long*)(st+16);S(2,r,66,0600);results[x++]=S(82,p,r,0);results[x++]=S(4,r,st,0);results[x++]=*(long*)(st+16);}
  if(CASE==31){long d=S(2,p,64,0600);results[x++]=d>=0;results[x++]=S(0,d,buf,1);S(3,d,0,0);}
  if(CASE==32){S(83,r,0755,0);S(88,r,q,0);results[x++]=S(84,"/tmp/paludarium-files-link/",0,0);results[x++]=S(82,"/tmp/paludarium-files-link/",p,0);results[x++]=S(87,"/tmp/paludarium-files-link/",0,0);results[x++]=S(4,r,st,0);results[x++]=S(6,q,st,0);results[x++]=S(2,"/tmp/paludarium-files-unused",64|65536,0600);results[x++]=S(4,"/tmp/paludarium-files-unused",st,0);S(87,"/tmp/paludarium-files-unused",0,0);S(87,q,0,0);S(84,r,0,0);}
+ #define MODE() (*(unsigned*)(st+24)&07777)
+ #define MTIME() (*(long*)(st+88))
+ if(CASE==33){S(95,077,0,0);results[x++]=S(95,022,0,0);results[x++]=S(95,077,0,0);long d=S(2,q,66,0666);S(5,d,st,0);results[x++]=MODE();S(3,d,0,0);results[x++]=S(83,r,0777,0);S(4,r,st,0);results[x++]=MODE();S(84,r,0,0);S(95,022,0,0);}
+ if(CASE==34){results[x++]=S(90,p,0600,0);S(4,p,st,0);results[x++]=MODE();results[x++]=S(91,fd,0640,0);S(5,fd,st,0);results[x++]=MODE();results[x++]=call(268,-100,(long)p,0604,0,0,0);S(4,p,st,0);results[x++]=MODE();
+  S(88,p,q,0);results[x++]=S(90,q,0611,0);S(6,q,st,0);results[x++]=(*(unsigned*)(st+24)&0170000)==0120000;S(4,p,st,0);results[x++]=MODE();results[x++]=S(90,"/tmp/paludarium-files-missing",0600,0);results[x++]=S(91,99,0600,0);}
+ if(CASE==35){static long t[4];const long omit=(1L<<30)-2;
+  t[0]=1;t[1]=2;t[2]=1000;t[3]=500;results[x++]=call(280,-100,(long)p,(long)t,0,0,0);S(4,p,st,0);results[x++]=MTIME();results[x++]=*(long*)(st+96);
+  t[1]=omit;t[3]=omit;results[x++]=call(280,-100,(long)p,(long)t,0,0,0);S(4,p,st,0);results[x++]=MTIME();
+  S(88,p,q,0);t[1]=0;t[2]=-3;t[3]=7;results[x++]=call(280,-100,(long)q,(long)t,0x100,0,0);S(6,q,st,0);results[x++]=MTIME();S(4,p,st,0);results[x++]=MTIME();
+  t[2]=2000;t[3]=0;results[x++]=call(280,fd,0,(long)t,0,0,0);S(5,fd,st,0);results[x++]=MTIME();
+  t[2]=3000;results[x++]=call(280,fd,(long)"",(long)t,0x1000,0,0);S(5,fd,st,0);results[x++]=MTIME();
+  t[1]=1000000000;results[x++]=call(280,-100,(long)p,(long)t,0,0,0);t[1]=0;results[x++]=call(280,-100,(long)p,(long)t,2,0,0);results[x++]=call(280,fd,0,(long)t,0x100,0,0);
+  t[1]=omit;t[3]=omit;results[x++]=call(280,-100,(long)"/tmp/paludarium-files-missing",(long)t,0,0,0);results[x++]=call(280,-100,(long)p,8,0,0,0);}
+ if(CASE==36){int pipefd[2];S(22,pipefd,0,0);results[x++]=S(74,fd,0,0);results[x++]=S(75,fd,0,0);results[x++]=S(74,pipefd[0],0,0);results[x++]=S(75,99,0,0);results[x++]=S(162,0,0,0);
+  results[x++]=call(221,fd,0,0,2,0,0);results[x++]=call(221,pipefd[0],0,0,2,0,0);results[x++]=call(221,fd,0,0,6,0,0);results[x++]=call(221,fd,0,-1,0,0,0);results[x++]=call(221,99,0,0,0,0,0);S(3,pipefd[0],0,0);S(3,pipefd[1],0,0);}
  S(3,fd,0,0);S(87,p,0,0);S(87,q,0,0);S(87,r,0,0);
  }
  S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);

@@ -312,6 +312,22 @@ impl HostFs for MountedFs {
         }
         Ok(())
     }
+    fn set_mode(&self, p: &[u8], mode: u32) -> Result<(), Errno> {
+        let p = self.resolve(p, true, false)?;
+        let (_, fs, relative) = self.route(&p)?;
+        fs.set_mode(&relative, mode)
+    }
+    fn set_times(
+        &self,
+        p: &[u8],
+        follow: bool,
+        atime: Option<i128>,
+        mtime: Option<i128>,
+    ) -> Result<(), Errno> {
+        let p = self.resolve(p, follow, false)?;
+        let (_, fs, relative) = self.route(&p)?;
+        fs.set_times(&relative, false, atime, mtime)
+    }
     fn read_dir(&self, p: &[u8]) -> Result<Vec<DirectoryEntry>, Errno> {
         let p = self.resolve(p, true, false)?;
         let (_, fs, relative) = self.route(&p)?;

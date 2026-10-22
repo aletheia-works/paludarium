@@ -4,10 +4,12 @@ use paludarium_host::{ClockId, FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{FileSystem, HostFs, MemFs};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
-    0, 2, 3, 4, 5, 6, 8, 20, 22, 32, 33, 72, 73, 76, 77, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88,
-    89, 217, 257, 258, 262, 263, 264, 265, 266, 267, 292, 293,
+    0, 2, 3, 4, 5, 6, 8, 20, 22, 32, 33, 72, 73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 84, 85, 86,
+    87, 88, 89, 90, 91, 95, 162, 217, 221, 257, 258, 262, 263, 264, 265, 266, 267, 268, 280, 292,
+    293,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -22,7 +24,8 @@ pub struct Files {
     pub fs: Arc<dyn FileSystem>,
     fds: Arc<Mutex<BTreeMap<u32, Descriptor>>>,
     cwd: Arc<Mutex<Vec<u8>>>,
-    umask: u32,
+    /// Shared with the cwd: `CLONE_FS` shares both, as on Linux.
+    umask: Arc<AtomicU32>,
 }
 impl Default for Files {
     fn default() -> Self {
@@ -34,7 +37,7 @@ impl Default for Files {
             fs: Arc::new(fs),
             fds: Arc::new(Mutex::new(BTreeMap::new())),
             cwd: Arc::new(Mutex::new(b"/".to_vec())),
-            umask: 0o022,
+            umask: Arc::new(AtomicU32::new(0o022)),
         }
     }
 }
@@ -51,6 +54,9 @@ impl Files {
         // Detach this worker's table reference without closing a table still
         // shared by live CLONE_FILES siblings.
         self.fds = Arc::new(Mutex::new(BTreeMap::new()));
+    }
+    fn umask(&self) -> u32 {
+        self.umask.load(Ordering::SeqCst)
     }
     pub(crate) fn exec_path(&self, path: Vec<u8>) -> Result<Vec<u8>, Errno> {
         self.path((-100i32) as u64, path)
@@ -167,6 +173,7 @@ impl Files {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone(),
             ));
+            child.umask = Arc::new(AtomicU32::new(self.umask.load(Ordering::SeqCst)));
         }
         child
     }
@@ -190,6 +197,59 @@ fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
 }
 fn at(c: &Context<'_>, dir: u64, ptr: u64) -> Result<Vec<u8>, Errno> {
     c.files.path(dir, path(c, ptr)?)
+}
+const UTIME_NOW: u64 = (1 << 30) - 1;
+const UTIME_OMIT: u64 = (1 << 30) - 2;
+/// `utimensat(dirfd, path, times, flags)`, in the order Linux checks it.
+fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let now = || c.host.clock(ClockId::Realtime).map(i128::from);
+    let (atime, mtime) = if a[2] == 0 {
+        let now = now()?;
+        (Some(now), Some(now))
+    } else {
+        let mut raw = [0u8; 32];
+        c.mem
+            .read(GuestAddr(a[2]), &mut raw)
+            .map_err(|_| Errno::EFAULT)?;
+        let field =
+            |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+        let mut times = [None, None];
+        for (slot, i) in times.iter_mut().zip([0, 2]) {
+            let (seconds, nanos) = (field(i) as i64, field(i + 1));
+            *slot = match nanos {
+                UTIME_OMIT => None,
+                UTIME_NOW => Some(now()?),
+                0..1_000_000_000 => Some(i128::from(seconds) * 1_000_000_000 + i128::from(nanos)),
+                _ => return Err(Errno::EINVAL),
+            };
+        }
+        // Linux: "Nothing to do, we must not even check the path."
+        if times == [None, None] {
+            return Ok(0);
+        }
+        (times[0], times[1])
+    };
+    if a[3] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // A null path with a descriptor is futimens.
+    let descriptor = if a[1] == 0 && a[0] as i32 != -100 {
+        if a[3] != 0 {
+            return Err(Errno::EINVAL);
+        }
+        true
+    } else {
+        a[3] & AT_EMPTY_PATH != 0 && path(c, a[1])?.is_empty()
+    };
+    if descriptor {
+        let file = c.files.descriptor(a[0])?.file;
+        return file.set_times(atime, mtime).map(|()| 0);
+    }
+    let p = at(c, a[0], a[1])?;
+    let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
+    c.files.fs.set_times(&p, follow, atime, mtime).map(|()| 0)
 }
 fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
     c.mem.write(GuestAddr(addr), b).map_err(|_| Errno::EFAULT)
@@ -219,6 +279,16 @@ fn linux_mtime(ns: i128) -> Result<(i64, u64), Errno> {
 #[cfg(test)]
 mod mtime_tests {
     use super::*;
+    #[test]
+    fn umask_is_shared_exactly_with_clone_fs() {
+        let files = Files::default();
+        let shared = files.for_clone(false, true);
+        let separate = files.for_clone(true, false);
+        shared.umask.store(0o077, Ordering::SeqCst);
+        assert_eq!(files.umask(), 0o077);
+        assert_eq!(separate.umask(), 0o022);
+        assert_eq!(files.for_exec().umask(), 0o077);
+    }
     #[test]
     fn mtime_stat_codec_signed_boundaries() {
         for (ns, seconds, nanos) in [
@@ -403,7 +473,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let f: Arc<dyn FileHandle> = if p == b"/dev/null" {
                 Arc::new(crate::null::NullFile::new(flags))
             } else {
-                c.files.fs.open(&p, flags, (mode as u32) & !c.files.umask)?
+                c.files
+                    .fs
+                    .open(&p, flags, (mode as u32) & !c.files.umask())?
             };
             c.files
                 .allocate(
@@ -609,7 +681,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 (at(c, a[0], a[1])?, a[2])
             };
-            c.files.fs.mkdir(&p, (mode as u32) & !c.files.umask)?;
+            c.files.fs.mkdir(&p, (mode as u32) & !c.files.umask())?;
             Ok(0)
         }
         84 | 87 | 263 => {
@@ -694,6 +766,41 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             output(c, a[1], &bytes)?;
             d.file.seek(count, 1)?;
             Ok(bytes.len() as u64)
+        }
+        // umask
+        95 => Ok(u64::from(
+            c.files.umask.swap(a[0] as u32 & 0o777, Ordering::SeqCst),
+        )),
+        // chmod, fchmod, fchmodat (which has no flags argument)
+        90 => {
+            let p = at(c, (-100i32) as u64, a[0])?;
+            c.files.fs.set_mode(&p, a[1] as u32).map(|()| 0)
+        }
+        91 => c
+            .files
+            .descriptor(a[0])?
+            .file
+            .set_mode(a[1] as u32)
+            .map(|()| 0),
+        268 => {
+            let p = at(c, a[0], a[1])?;
+            c.files.fs.set_mode(&p, a[2] as u32).map(|()| 0)
+        }
+        280 => utimensat(c, a),
+        // fsync, fdatasync: both write everything, as nothing is cached
+        74 | 75 => c.files.descriptor(a[0])?.file.sync().map(|()| 0),
+        // sync: nothing is cached, so there is nothing to write
+        162 => Ok(0),
+        // fadvise64: a hint, checked as Linux checks it
+        221 => {
+            let file = c.files.descriptor(a[0])?.file;
+            if file.stat()?.mode & 0o170000 == 0o010000 {
+                return Err(Errno(29)); // ESPIPE
+            }
+            if (a[2] as i64) < 0 || a[3] > 5 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(0)
         }
         _ => Err(Errno::ENOSYS),
     }

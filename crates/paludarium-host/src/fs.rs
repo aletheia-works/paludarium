@@ -40,6 +40,20 @@ pub trait FileHandle: Send + Sync {
     fn flock(&self, op: u32) -> Result<(), Errno>;
     fn flags(&self) -> u32;
     fn set_flags(&self, flags: u32) -> Result<(), Errno>;
+    /// `fchmod`: replaces the permission bits with the low 12 bits of `mode`.
+    fn set_mode(&self, _mode: u32) -> Result<(), Errno> {
+        Err(Errno::EPERM)
+    }
+    /// `futimens`: sets the access and modification times in nanoseconds
+    /// since the Unix epoch; `None` leaves that time as it is.
+    fn set_times(&self, _atime: Option<i128>, _mtime: Option<i128>) -> Result<(), Errno> {
+        Err(Errno::EPERM)
+    }
+    /// `fsync` and `fdatasync`. Kinds that cannot be synchronised (pipes,
+    /// sockets, terminals, devices) give `EINVAL`, as on Linux.
+    fn sync(&self) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
 }
 pub trait HostFs: Send + Sync {
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;
@@ -51,4 +65,20 @@ pub trait HostFs: Send + Sync {
     fn readlink(&self, path: &[u8]) -> Result<Vec<u8>, Errno>;
     fn rename(&self, old: &[u8], new: &[u8]) -> Result<(), Errno>;
     fn read_dir(&self, path: &[u8]) -> Result<Vec<DirectoryEntry>, Errno>;
+    /// `chmod`: replaces the permission bits of `path` (following a final
+    /// symbolic link) with the low 12 bits of `mode`.
+    fn set_mode(&self, _path: &[u8], _mode: u32) -> Result<(), Errno> {
+        Err(Errno::EPERM)
+    }
+    /// `utimensat`: as [`FileHandle::set_times`], for `path`; with `follow`
+    /// false a final symbolic link itself is changed.
+    fn set_times(
+        &self,
+        _path: &[u8],
+        _follow: bool,
+        _atime: Option<i128>,
+        _mtime: Option<i128>,
+    ) -> Result<(), Errno> {
+        Err(Errno::EPERM)
+    }
 }

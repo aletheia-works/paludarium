@@ -127,6 +127,16 @@ impl Node {
         }
     }
 }
+/// `chmod`: the file type stays, the permission bits are replaced.
+fn set_node_mode(node: &mut Node, mode: u32) {
+    node.mode = (node.mode & 0o170000) | (mode & 0o7777);
+}
+/// `utimensat`: only the modification time is kept; the access time is not.
+fn set_node_mtime(node: &mut Node, mtime: Option<i128>) {
+    if let Some(mtime) = mtime {
+        node.mtime_ns = mtime;
+    }
+}
 struct Tree {
     nodes: BTreeMap<u64, Arc<Mutex<Node>>>,
     next: u64,

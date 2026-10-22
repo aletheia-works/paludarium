@@ -477,6 +477,119 @@ fn syscall_huge_bad_write_buffer() {
     let fd = f.ret(2, &[DATA, 66, 0o600]);
     assert_eq!(f.ret(1, &[fd, 1, u64::MAX]), errno(Errno::EFAULT));
 }
+fn stat_mode_and_mtime(f: &mut Fixture, path: u64, lstat: bool) -> (u32, i64, u64) {
+    let out = DATA + 0x100;
+    assert_eq!(f.ret(if lstat { 6 } else { 4 }, &[path, out]), 0);
+    let mut st = [0u8; 144];
+    f.mem.read(GuestAddr(out), &mut st).unwrap();
+    (
+        u32::from_le_bytes(st[24..28].try_into().unwrap()),
+        i64::from_le_bytes(st[88..96].try_into().unwrap()),
+        u64::from_le_bytes(st[96..104].try_into().unwrap()),
+    )
+}
+#[test]
+fn umask_and_the_chmod_family_set_permission_bits() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x10), b"/link\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x20), b"/none\0").unwrap();
+    assert_eq!(f.ret(95, &[0o1077]), 0o022); // umask returns the old mask
+    assert_eq!(f.ret(95, &[0o022]), 0o077); // and keeps only 0777
+    assert_eq!(f.ret(95, &[0o077]), 0o022);
+    let fd = f.ret(2, &[DATA, 66, 0o666]);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).0, 0o100_600);
+    assert_eq!(f.ret(88, &[DATA, DATA + 0x10]), 0); // symlink /link -> /file
+    assert_eq!(f.ret(90, &[DATA + 0x10, 0o4751]), 0); // chmod follows the link
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).0, 0o104_751);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA + 0x10, true).0, 0o120_777);
+    assert_eq!(f.ret(91, &[fd, 0o640]), 0); // fchmod
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).0, 0o100_640);
+    assert_eq!(f.ret(268, &[(-100i64) as u64, DATA, 0o604]), 0); // fchmodat
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).0, 0o100_604);
+    assert_eq!(f.ret(90, &[DATA + 0x20, 0o600]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(91, &[99, 0o600]), errno(Errno::EBADF));
+    assert_eq!(f.ret(90, &[0, 0o600]), errno(Errno::EFAULT));
+}
+#[test]
+fn utimensat_sets_modification_times_as_linux_checks_them() {
+    let mut f = fixture();
+    let (cwd, times) = ((-100i64) as u64, DATA + 0x300);
+    f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x10), b"/link\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x20), b"\0").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(88, &[DATA, DATA + 0x10]), 0);
+    let set = |f: &mut Fixture, a: (i64, u64), m: (i64, u64)| {
+        let mut b = Vec::new();
+        for v in [a.0 as u64, a.1, m.0 as u64, m.1] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        f.mem.write(GuestAddr(times), &b).unwrap();
+    };
+    set(&mut f, (1, 2), (1000, 500));
+    assert_eq!(f.ret(280, &[cwd, DATA + 0x10, times, 0]), 0);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).1, 1000);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).2, 500);
+    // UTIME_OMIT keeps the time; AT_SYMLINK_NOFOLLOW changes the link.
+    set(&mut f, (0, (1 << 30) - 2), (0, (1 << 30) - 2));
+    assert_eq!(f.ret(280, &[cwd, DATA, times, 0]), 0);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).1, 1000);
+    set(&mut f, (0, 0), (-3, 7));
+    assert_eq!(f.ret(280, &[cwd, DATA + 0x10, times, 0x100]), 0);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA + 0x10, true).1, -3);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).1, 1000);
+    // A null path with a descriptor, and AT_EMPTY_PATH, are futimens.
+    set(&mut f, (0, 0), (2000, 0));
+    assert_eq!(f.ret(280, &[fd, 0, times, 0]), 0);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).1, 2000);
+    set(&mut f, (0, 0), (3000, 0));
+    assert_eq!(f.ret(280, &[fd, DATA + 0x20, times, 0x1000]), 0);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA, false).1, 3000);
+    // A null times pointer means now.
+    assert_eq!(f.ret(280, &[cwd, DATA, 0, 0]), 0);
+    assert!(stat_mode_and_mtime(&mut f, DATA, false).1 > 3000);
+    // Errors.
+    set(&mut f, (0, 1_000_000_000), (0, 0));
+    assert_eq!(f.ret(280, &[cwd, DATA, times, 0]), errno(Errno::EINVAL));
+    set(&mut f, (0, 0), (0, 0));
+    assert_eq!(f.ret(280, &[cwd, DATA, times, 0x2]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(280, &[fd, 0, times, 0x100]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(280, &[cwd, 0, times, 0]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(280, &[cwd, DATA, 8, 0]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(280, &[99, 0, times, 0]), errno(Errno::EBADF));
+    // With both times omitted Linux does not even look at the path or flags.
+    set(&mut f, (0, (1 << 30) - 2), (0, (1 << 30) - 2));
+    f.mem.write(GuestAddr(DATA + 0x20), b"/none\0").unwrap();
+    assert_eq!(f.ret(280, &[cwd, DATA + 0x20, times, 0]), 0);
+    assert_eq!(f.ret(280, &[99, 0, times, 0x2]), 0);
+    set(&mut f, (0, 0), (0, 0));
+    assert_eq!(
+        f.ret(280, &[cwd, DATA + 0x20, times, 0]),
+        errno(Errno::ENOENT)
+    );
+}
+#[test]
+fn fsync_sync_and_fadvise_check_the_descriptor() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(22, &[DATA + 0x400]), 0);
+    let mut pipe = [0u8; 4];
+    f.mem.read(GuestAddr(DATA + 0x400), &mut pipe).unwrap();
+    let pipe = u64::from(u32::from_le_bytes(pipe));
+    for number in [74, 75] {
+        assert_eq!(f.ret(number, &[fd]), 0);
+        assert_eq!(f.ret(number, &[pipe]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(number, &[99]), errno(Errno::EBADF));
+    }
+    assert_eq!(f.ret(162, &[]), 0);
+    assert_eq!(f.ret(221, &[fd, 0, 0, 2]), 0);
+    assert_eq!(f.ret(221, &[pipe, 0, 0, 2]), errno(Errno(29)));
+    assert_eq!(f.ret(221, &[fd, 0, 0, 6]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(221, &[fd, 0, u64::MAX, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(221, &[99, 0, 0, 0]), errno(Errno::EBADF));
+}
 #[test]
 fn syscall_bad_path() {
     let mut f = fixture();

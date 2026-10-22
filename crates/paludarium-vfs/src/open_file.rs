@@ -135,4 +135,16 @@ impl FileHandle for MemFile {
         s.1 = (s.1 & !3072) | (f & 3072);
         Ok(())
     }
+    fn set_mode(&self, mode: u32) -> Result<(), Errno> {
+        set_node_mode(&mut lock(&self.node), mode);
+        Ok(())
+    }
+    fn set_times(&self, _atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
+        set_node_mtime(&mut lock(&self.node), mtime);
+        Ok(())
+    }
+    /// Memory needs no synchronising; files and directories both succeed.
+    fn sync(&self) -> Result<(), Errno> {
+        Ok(())
+    }
 }

@@ -9,7 +9,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **ネットワーク**：`socket()` はいつも `EAFNOSUPPORT` を返します。AF_UNIX の
   `socketpair` だけを使えます。
 - **一部のシステムコール**：`clone3`、`timerfd`、ファイルを元にした `mmap`、
-  `chmod`／`fchmod`、別のプロセスとの `CLONE_SIGHAND`、停止と再開の `wait` の通知、
+  別のプロセスとの `CLONE_SIGHAND`、停止と再開の `wait` の通知、
   プロセスグループを選ぶ `wait` などは、まだありません。実装していないシステムコールは
   `ENOSYS` を返すので、プログラムによってはその機能なしで続けられます。
 - **ネイティブの JIT**：JIT があるのは WebAssembly 版だけです。ネイティブ版は

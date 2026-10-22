@@ -193,3 +193,30 @@ fn open_shared_lock_drop() {
     drop(dup);
     b.flock(6).unwrap();
 }
+#[test]
+fn set_mode_and_times_keep_the_file_type() {
+    let fs = MemFs::new();
+    let f = fs.open(b"/a", 66, 0o644).unwrap();
+    fs.symlink(b"/a", b"/link").unwrap();
+    // chmod follows a final symbolic link and keeps the file type.
+    fs.set_mode(b"/link", 0o170_600).unwrap();
+    assert_eq!(fs.metadata(b"/a", false).unwrap().mode, 0o100_600);
+    assert_eq!(fs.metadata(b"/link", false).unwrap().mode, 0o120_777);
+    f.set_mode(0o4755).unwrap();
+    assert_eq!(f.stat().unwrap().mode, 0o104_755);
+    fs.set_times(b"/link", true, Some(1), Some(-5)).unwrap();
+    assert_eq!(fs.metadata(b"/a", false).unwrap().mtime_ns, -5);
+    fs.set_times(b"/link", false, None, Some(7)).unwrap();
+    assert_eq!(fs.metadata(b"/link", false).unwrap().mtime_ns, 7);
+    assert_eq!(fs.metadata(b"/a", false).unwrap().mtime_ns, -5);
+    f.set_times(None, None).unwrap();
+    assert_eq!(f.stat().unwrap().mtime_ns, -5);
+    f.set_times(Some(0), Some(9)).unwrap();
+    assert_eq!(f.stat().unwrap().mtime_ns, 9);
+    assert_eq!(f.sync(), Ok(()));
+    assert_eq!(fs.set_mode(b"/missing", 0o600), Err(Errno::ENOENT));
+    assert_eq!(
+        fs.set_times(b"/missing", true, None, Some(1)),
+        Err(Errno::ENOENT)
+    );
+}

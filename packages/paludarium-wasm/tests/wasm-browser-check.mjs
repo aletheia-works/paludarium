@@ -13,7 +13,7 @@ const ripgrepCases = JSON.parse(await readFile("tests/guests/programs/ripgrep-ca
 const fixtures = {};
 for (const path of ["app/package.json", "app/filedep/package.json", "outside/linked/package.json"]) fixtures[path] = encode(await readFile("tests/guests/programs/fixtures/" + path));
 const input = { oracle, config: oracle.case_config ?? JSON.parse(await readFile("tests/guests/programs/cases.json", "utf8")), probe: encode(probe), aube: encode(aube), ripgrep: encode(ripgrep), ripgrepCases, fixtures };
-const report = { schema: 1, environment: browser, module_sha256: hash(await readFile(modulePath)), oracle_sha256: hash(rawOracle), guest_hashes: oracle.binary_hashes, rows: {}, ripgrep: {}, complete: false };
+const report = { schema: 1, environment: browser, module_sha256: hash(await readFile(modulePath)), oracle_sha256: hash(rawOracle), guest_hashes: oracle.binary_hashes, rows: {}, ripgrep: {}, restored: {}, complete: false };
 await mkdir(outputDirectory, { recursive: true });
 const persist = () => writeFile(resolve(outputDirectory, "observations.json"), JSON.stringify(report, null, 2) + "\n"); await persist();
 const page = `<!doctype html><script type="module">
@@ -32,7 +32,7 @@ const server = createServer(async (request, response) => {
     else if (request.url === "/input.json") response.writeHead(200, { ...headers, "Content-Type": "application/json" }).end(JSON.stringify(input));
     else if (request.url === "/row" && request.method === "POST") {
       const chunks = []; let size = 0; for await (const chunk of request) { size += chunk.length; if (size > 16 * 1024 * 1024) throw new Error("row evidence too large"); chunks.push(chunk); }
-      const { name, row, group } = JSON.parse(Buffer.concat(chunks)); report[group === "ripgrep" ? "ripgrep" : "rows"][name] = row; await persist(); response.writeHead(200, headers).end();
+      const { name, row, group } = JSON.parse(Buffer.concat(chunks)); report[group === "ripgrep" || group === "restored" ? group : "rows"][name] = row; await persist(); response.writeHead(200, headers).end();
     } else {
       const path = request.url === "/production.wasm" ? resolve(modulePath) : resolve(root, "." + new URL(request.url, "http://localhost").pathname);
       if (request.url !== "/production.wasm" && !path.startsWith(root + sep)) throw new Error("invalid path");

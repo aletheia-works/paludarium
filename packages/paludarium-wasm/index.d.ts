@@ -5,9 +5,28 @@ export class PaludariumError extends Error {
   bytes?: Uint8Array;
   syscall?: number;
 }
+/**
+ * One path of a tree to place, in the shape `snapshot()` returns, so a
+ * snapshot can be passed back as it is. The kind comes from the type bits of
+ * `mode`: a regular file, a directory or a symlink (whose permissions are
+ * always 0o777). Paths that share an `inode` value become hard links to one
+ * file or symlink; the value itself is not kept. `links` is recalculated.
+ */
+export interface FileSystemEntryInput {
+  path: string;
+  mode: number;
+  /** Regular file bytes or symlink target bytes; empty or left out for directories. */
+  content?: Uint8Array;
+  inode?: bigint | number;
+  links?: bigint | number;
+  /** Modification time; 0 when left out. */
+  mtimeNs?: bigint | number;
+}
 export interface FileSystemOptions {
   files?: Record<string, Uint8Array>;
   fileModes?: Record<string, number>;
+  /** Placed after `files`. Not accepted by `run()` together with `filesystem`. */
+  entries?: readonly FileSystemEntryInput[];
 }
 export interface FileSystemEntry {
   path: string;

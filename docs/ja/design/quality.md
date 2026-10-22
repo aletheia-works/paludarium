@@ -52,6 +52,8 @@ LeakSanitizer を付けて、それぞれ 600 秒動かします。夜間の CI 
 - probe の 8 項目が、Linux・macOS・Windows と、Node.js・Chromium・Firefox・Safari の
   すべてで通る。
 - aube の 4 つの操作が、すべての環境で、本物の x86-64 Linux と同じ標準出力と終了コードになる。
+  4 つの WebAssembly の環境では、操作のたびにファイルシステムを snapshot から作り直しても
+  一致し、作り直したファイルシステムの snapshot は元と同じになる。
 - 4 つの WebAssembly の環境で、JIT ありとなしの両方の結果が一致する。
 - JIT ありのほうが、統計的に意味のある差で速い（下を参照）。
 

@@ -20,6 +20,10 @@ function jitDiagnostics(job) {
   };
 }
 function withBytes(bytes, callback) { const id = putBuffer(e, bytes, memory); try { return callback(id); } finally { e.buffer_drop(id); } }
+function placeEntries(config, entries) {
+  for (const entry of entries?.nodes ?? []) withBytes(encoder.encode(entry.path), pathId => withBytes(entry.content, dataId => check(e.config_entry(config, pathId, dataId, entry.mode, BigInt.asUintN(64, entry.mtimeNs), BigInt.asIntN(64, entry.mtimeNs >> 64n)), "filesystem entry")));
+  for (const link of entries?.links ?? []) withBytes(encoder.encode(link.path), pathId => withBytes(encoder.encode(link.existing), existingId => check(e.config_link(config, pathId, existingId), "filesystem entry")));
+}
 function errorFor(handle) {
   const kind = e.session_error_kind(handle);
   const names = ["internal", "unimplemented", "internal", "invalid-program", "host"];
@@ -148,6 +152,7 @@ async function launch(message) {
     for (const arg of message.options.args ?? [message.options.program]) withBytes(encoder.encode(arg), id => check(e.config_arg(config, id), "argument"));
     for (const [key, value] of Object.entries(message.options.env ?? {})) withBytes(encoder.encode(key), keyId => withBytes(encoder.encode(value), valueId => check(e.config_env(config, keyId, valueId), "environment")));
     for (const [path, bytes] of Object.entries(message.options.files ?? {})) withBytes(encoder.encode(path), pathId => withBytes(bytes, dataId => check(e.config_file_mode(config, pathId, dataId, message.options.fileModes?.[path] ?? 0o755), "file")));
+    placeEntries(config, message.options.entries);
     const handle = withBytes(new Uint8Array(), id => e.session_from_config_fs(config, id, message.options.filesystemHandle ?? 0));
     if (!handle) throw new Error("session creation failed");
     const tlsSize = Number(e.__tls_size.value), tlsAlign = Math.max(16, Number(e.__tls_align.value));
@@ -184,6 +189,7 @@ port.listen(async message => {
       const config = withBytes(encoder.encode("/"), id => e.config_new(id));
       try {
         for (const [path, bytes] of Object.entries(message.options.files ?? {})) withBytes(encoder.encode(path), pathId => withBytes(bytes, dataId => check(e.config_file_mode(config, pathId, dataId, message.options.fileModes?.[path] ?? 0o755), "file")));
+        placeEntries(config, message.options.entries);
         const handle = e.filesystem_new(config);
         if (!handle) throw new Error("filesystem creation failed");
         port.send({ type: "control", id: message.id, value: handle });

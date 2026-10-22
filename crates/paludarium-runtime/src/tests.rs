@@ -185,6 +185,45 @@ fn runtime_default_private() {
     );
 }
 #[test]
+fn runtime_entries_follow_files_and_keep_their_times() {
+    use paludarium_vfs::{EntryKind, GuestEntry};
+    let entry = |path: &[u8], kind, mode, mtime_ns| GuestEntry {
+        path: path.to_vec(),
+        kind,
+        mode,
+        mtime_ns,
+    };
+    let config = Config::new("/bin/prog", vec![])
+        .with_file("/bin/prog", tiny_exec(&HELLO, b"hi\n"))
+        .with_entry(entry(b"/bin", EntryKind::Directory, 0o700, 3))
+        .with_entry(entry(b"/tmp", EntryKind::Directory, 0o1770, 4))
+        .with_entry(entry(
+            b"/bin/run",
+            EntryKind::HardLink(b"/bin/prog".to_vec()),
+            0,
+            0,
+        ))
+        .with_entry(entry(
+            b"/w",
+            EntryKind::Symlink(b"bin/run".to_vec()),
+            0o777,
+            5,
+        ));
+    let host = Arc::new(RecordingHost::new());
+    let fs = Session::new(config, host).unwrap().file_system().unwrap();
+    let bin = fs.metadata(b"/bin", false).unwrap();
+    assert_eq!((bin.mode, bin.mtime_ns), (0o040700, 3));
+    assert_eq!(fs.metadata(b"/tmp", false).unwrap().mode, 0o041770);
+    assert_eq!(fs.metadata(b"/bin/run", false).unwrap().links, 2);
+    assert_eq!(fs.metadata(b"/w", false).unwrap().mtime_ns, 5);
+    let clash = Config::new("/a", vec![])
+        .with_file("/a", b"x".to_vec())
+        .with_entry(entry(b"/a", EntryKind::Directory, 0o755, 0));
+    let host = Arc::new(RecordingHost::new());
+    let err = Session::new(clash, host).unwrap().run().unwrap_err();
+    assert_eq!(err.message, "invalid filesystem entry");
+}
+#[test]
 fn runtime_tmp() {
     let host = Arc::new(RecordingHost::new());
     let s = session(&HELLO, host);

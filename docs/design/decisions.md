@@ -73,6 +73,15 @@ Rust translates blocks into WebAssembly bytes; the JavaScript in the guest's
 Worker compiles and runs them. Generated code keeps the MMU's permission and
 range checks, and translations of rewritten pages are discarded.
 
+## One way to create a filesystem
+
+A snapshot is passed back to `createFileSystem` as its `entries` rather than to
+a separate restore call, so it combines with `files`, and `run()` accepts it the
+same way. Modification times are kept, because programs such as aube decide
+whether their state is fresh by them. Inode numbers are not kept, only which
+paths share one. A hard link may name a symlink, as on Linux, so every state a
+guest can create can be rebuilt; a hard link to a directory is rejected.
+
 ## Three entry points
 
 A library, a command and a WebAssembly package give each kind of user a fitting

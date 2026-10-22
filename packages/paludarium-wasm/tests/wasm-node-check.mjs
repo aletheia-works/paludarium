@@ -6,6 +6,7 @@ import { createPaludarium } from "../index.mjs";
 import { validateOracle } from "./wasm-contract.mjs";
 import { compare, observeProgram, observeRipgrep, probeCases } from "./wasm-programs.mjs";
 import { compareFilesystem } from "./wasm-filesystem.mjs";
+import { observeRestoredAube } from "./wasm-entries.mjs";
 const [modulePath, oraclePath, guestDirectory = "target/guests/programs", outputDirectory = "target/wasm/node", slice] = process.argv.slice(2);
 if (!modulePath || !oraclePath) throw new Error("usage: wasm-node-check.mjs module oracle [guests] [output] [--probe-only]");
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -59,6 +60,10 @@ if (slice !== "--probe-only") {
       report.rows[item.name] = row; await persist(); console.log(JSON.stringify({ name: item.name, exit: row.exit, pass: row.pass, timed_out: row.timed_out, errors: row.errors }));
     }
   } finally { await launcher.dispose(); }
+  report.restored = await observeRestoredAube(() => createPaludarium({ wasmUrl: pathToFileURL(resolve(modulePath)) }), { files, fileModes, cwd, environment, steps: config.aube, oracle, fixtureRoot, onRow: async (name, row) => {
+    report.restored = { ...report.restored, [name]: row }; await persist(); console.log(JSON.stringify({ name: "restored-" + name, exit: row.exit, pass: row.pass, timed_out: row.timed_out, errors: row.errors, comparison_error: row.comparison_error }));
+  } });
+  failed ||= Object.values(report.restored).some(row => !row.pass) || Object.keys(report.restored).length !== config.aube.length;
 }
 report.complete = !failed && slice !== "--probe-only"; report.slice_passed = !failed; await persist();
 process.exitCode = failed ? 1 : 0;

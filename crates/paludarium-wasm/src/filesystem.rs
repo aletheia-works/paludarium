@@ -239,6 +239,85 @@ mod tests {
         fs.close().unwrap();
         assert_eq!(fs.close(), Err(Errno::EAGAIN));
     }
+    /// A snapshot as the JavaScript side passes it back: the first path of
+    /// each inode carries the node, the others are hard links to it.
+    fn entries_of(snapshot: &[Entry]) -> Vec<paludarium_vfs::GuestEntry> {
+        use paludarium_vfs::{EntryKind, GuestEntry};
+        let mut first = std::collections::BTreeMap::new();
+        snapshot
+            .iter()
+            .map(|entry| {
+                let kind = if let Some(path) = first.get(&entry.inode) {
+                    EntryKind::HardLink(Vec::clone(path))
+                } else {
+                    first.insert(entry.inode, entry.path.clone());
+                    match entry.mode & 0o170000 {
+                        0o040000 => EntryKind::Directory,
+                        0o120000 => EntryKind::Symlink(entry.content.clone()),
+                        _ => EntryKind::File(entry.content.clone()),
+                    }
+                };
+                GuestEntry {
+                    path: entry.path.clone(),
+                    kind,
+                    mode: entry.mode & 0o7777,
+                    mtime_ns: entry.mtime_ns,
+                }
+            })
+            .collect()
+    }
+    /// Path, mode, content, time, link count and the first path of the inode.
+    type Comparable = (Vec<u8>, u32, Vec<u8>, i128, u64, Vec<u8>);
+    /// Paths, kinds, modes, contents, times and link counts, with each inode
+    /// replaced by the first path that has it.
+    fn comparable(snapshot: &[Entry]) -> Vec<Comparable> {
+        let mut first = std::collections::BTreeMap::new();
+        snapshot
+            .iter()
+            .map(|entry| {
+                let group = first
+                    .entry(entry.inode)
+                    .or_insert_with(|| entry.path.clone());
+                (
+                    entry.path.clone(),
+                    entry.mode,
+                    entry.content.clone(),
+                    entry.mtime_ns,
+                    entry.links,
+                    group.clone(),
+                )
+            })
+            .collect()
+    }
+    #[test]
+    fn filesystem_snapshot_entries_round_trip() {
+        let fs = fixture();
+        let lease = fs.acquire().unwrap();
+        let guest = lease.filesystem();
+        guest.mkdir(b"/empty", 0o700).unwrap();
+        guest.symlink(b"../guest", b"/nested/up").unwrap();
+        guest.link(b"/nested/up", b"/up2").unwrap();
+        guest.link(b"/guest", b"/nested/again").unwrap();
+        guest.link(b"/guest", b"/third").unwrap();
+        guest
+            .set_times(b"/nested", false, None, Some(-1_500_000_000))
+            .unwrap();
+        guest.set_times(b"/guest", false, None, Some(42)).unwrap();
+        guest.set_mode(b"/tmp", 0o700).unwrap();
+        drop(lease);
+        let before = fs.snapshot().unwrap();
+        let mut config = Config::new(b"/guest".to_vec(), vec![]);
+        config.entries = entries_of(&before);
+        let rebuilt = PrivateFs::new(config, Arc::new(RecordingHost::default())).unwrap();
+        let after = rebuilt.snapshot().unwrap();
+        assert_eq!(comparable(&before), comparable(&after));
+        assert!(before.iter().any(|entry| entry.links == 3));
+        assert!(
+            before
+                .iter()
+                .any(|entry| entry.mode == 0o120777 && entry.links == 2)
+        );
+    }
     #[test]
     fn filesystem_modes_and_contents() {
         let fs = fixture();

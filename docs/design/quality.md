@@ -54,7 +54,9 @@ these, or nothing is published ([Release process](../release)):
 - The eight probe checks pass on Linux, macOS and Windows, and on Node.js,
   Chromium, Firefox and Safari.
 - The four aube operations give the same standard output and exit status as
-  real x86-64 Linux everywhere.
+  real x86-64 Linux everywhere. In the four WebAssembly environments they
+  also match when the filesystem is rebuilt from its snapshot before each
+  operation, and each rebuilt filesystem has the same snapshot.
 - Results with and without the JIT agree in the four WebAssembly
   environments.
 - The JIT is faster, by a statistically significant margin (below).

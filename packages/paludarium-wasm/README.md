@@ -59,7 +59,10 @@ while the lease is active. Disposed handles cannot be reused. Snapshots include
 paths, modes, inode/link identity, nanosecond modification times, regular bytes,
 and symlink target bytes. They do not follow symlinks. Initial configured files
 have epoch modification times; guest-created and modified files use the Host
-realtime clock. `cwd` defaults to `/` and must name an existing virtual
+realtime clock. `createFileSystem({ entries: await filesystem.snapshot() })`
+rebuilds a filesystem from a snapshot: directories, symlinks, hard links (entries
+sharing an `inode`), modes and modification times. See the JavaScript guide for
+its validation rules and limits. `cwd` defaults to `/` and must name an existing virtual
 directory. `tty` optionally supplies columns and rows in the range 0–65535.
 No host filesystem mount or network access is exposed by this API.
 

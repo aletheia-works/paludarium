@@ -7,6 +7,7 @@ use crate::filesystem::{Lease, PrivateFs};
 use paludarium_host::WasmHost;
 use paludarium_runtime::{Config, Session, TerminalInfo};
 use paludarium_types::{Error, ErrorKind, ExitStatus};
+use paludarium_vfs::{EntryKind, GuestEntry};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{
@@ -435,6 +436,62 @@ pub extern "C" fn config_file_mode(id: u32, path: u32, content: u32, mode: u32) 
     };
     config.files.push((path.clone(), content));
     config.file_modes.push((path, mode));
+    0
+}
+/// One entry of a tree to place: the kind comes from the type bits of
+/// `mode` (file, directory or symlink); `content` is the file bytes or the
+/// symlink target. The time is the signed nanoseconds split in two halves.
+#[unsafe(no_mangle)]
+pub extern "C" fn config_entry(
+    id: u32,
+    path: u32,
+    content: u32,
+    mode: u32,
+    mtime_low: u64,
+    mtime_high: i64,
+) -> i32 {
+    let (Some(path), Some(content)) = (bytes(path), bytes(content)) else {
+        return -1;
+    };
+    let kind = match mode & !0o7777 {
+        0o100000 => EntryKind::File(content),
+        0o040000 if content.is_empty() => EntryKind::Directory,
+        0o120000 => EntryKind::Symlink(content),
+        _ => return -1,
+    };
+    let entry = GuestEntry {
+        path,
+        kind,
+        mode: mode & 0o7777,
+        mtime_ns: (i128::from(mtime_high) << 64) | i128::from(mtime_low),
+    };
+    let mut configs = table(&CONFIGS)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(config) = configs.get_mut(&id) else {
+        return -1;
+    };
+    config.entries.push(entry);
+    0
+}
+/// Another name, `path`, for the file or symlink entry at `existing`.
+#[unsafe(no_mangle)]
+pub extern "C" fn config_link(id: u32, path: u32, existing: u32) -> i32 {
+    let (Some(path), Some(existing)) = (bytes(path), bytes(existing)) else {
+        return -1;
+    };
+    let mut configs = table(&CONFIGS)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(config) = configs.get_mut(&id) else {
+        return -1;
+    };
+    config.entries.push(GuestEntry {
+        path,
+        kind: EntryKind::HardLink(existing),
+        mode: 0,
+        mtime_ns: 0,
+    });
     0
 }
 #[unsafe(no_mangle)]

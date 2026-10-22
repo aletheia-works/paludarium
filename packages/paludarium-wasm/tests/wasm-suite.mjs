@@ -2,6 +2,7 @@ import { createPaludarium } from "../index.mjs";
 import { validateOracle } from "./wasm-contract.mjs";
 import { compare, observeProgram, observeRipgrep, probeCases } from "./wasm-programs.mjs";
 import { compareFilesystem } from "./wasm-filesystem.mjs";
+import { observeRestoredAube } from "./wasm-entries.mjs";
 export async function runSuite({ wasmUrl, oracle, config, probe, aube, ripgrep, ripgrepCases, fixtures, jit = false, onRow = () => {} }) {
   validateOracle(oracle);
   const rows = {}, launch = () => createPaludarium({ wasmUrl });
@@ -47,6 +48,7 @@ export async function runSuite({ wasmUrl, oracle, config, probe, aube, ripgrep, 
       rows[item.name] = row; await onRow(item.name, row);
     }
   } finally { await launcher.dispose(); }
-  const ripgrepPassed = Object.values(ripgrepRows ?? {}).every(row => row.pass);
-  return { rows, ripgrep: ripgrepRows, complete: Object.keys(rows).length === 14 && Object.values(rows).every(row => row.pass) && ripgrepPassed && (!ripgrep || Object.keys(ripgrepRows).length === ripgrepCases.length), passed: Object.values(rows).every(row => row.pass) && ripgrepPassed };
+  const restored = await observeRestoredAube(launch, { files, fileModes, cwd, environment, steps: config.aube, oracle, fixtureRoot, jit, onRow });
+  const ripgrepPassed = Object.values(ripgrepRows ?? {}).every(row => row.pass), restoredPassed = Object.values(restored).every(row => row.pass);
+  return { rows, ripgrep: ripgrepRows, restored, complete: Object.keys(rows).length === 14 && Object.values(rows).every(row => row.pass) && ripgrepPassed && restoredPassed && Object.keys(restored).length === config.aube.length && (!ripgrep || Object.keys(ripgrepRows).length === ripgrepCases.length), passed: Object.values(rows).every(row => row.pass) && ripgrepPassed && restoredPassed };
 }

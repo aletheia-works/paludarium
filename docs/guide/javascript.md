@@ -51,6 +51,7 @@ try {
 | `cwd` | Initial working directory (default `/`; it must exist) |
 | `files` | Files to create before the start, path → `Uint8Array` |
 | `fileModes` | Permission bits for some of `files` (default `0755`) |
+| `entries` | A tree to create after `files`, such as a snapshot (see below); not with `filesystem` |
 | `tty` | `{ columns, rows }` (0–65535) to give the guest a terminal size |
 | `filesystem` | A filesystem from `createFileSystem()` to reuse (see below) |
 | `jit` | `true` to translate hot x86-64 code to WebAssembly (default `false`) |
@@ -80,6 +81,47 @@ A running guest holds an exclusive lease on its filesystem: `snapshot()`,
 rejected while it runs. A snapshot lists every path with its mode, inode, link
 count, modification time in nanoseconds, and the bytes of regular files or
 symlink targets; it does not follow symlinks.
+
+### Rebuild a filesystem from a snapshot
+
+`createFileSystem({ entries })` creates a filesystem from a list in the shape
+`snapshot()` returns, so a snapshot can be passed back as it is. A host that
+starts a new launcher for each run can carry the filesystem across that way:
+
+```js
+const entries = await filesystem.snapshot();
+await filesystem.dispose();
+const next = await launcher.createFileSystem({ entries });
+```
+
+Each entry has a `path`, a `mode` whose type bits make it a regular file, a
+directory or a symlink, and optionally `content` (the bytes of a file or the
+target of a symlink), `mtimeNs` (default 0) and `inode`. Entries with the same
+`inode` value become hard links to one file or symlink; the value itself is not
+kept, and `links` is recalculated, so you may leave entries out of a snapshot
+before passing it back. A new filesystem always has `/` and `/tmp`: entries for
+them, or for a directory `files` created, set that directory's mode and time.
+
+Rebuilding a snapshot keeps its paths, kinds, modes, file bytes, symlink
+targets, modification times, link counts and which paths share an inode.
+Names that are not UTF-8 are already replaced in a snapshot, and access and
+change times are not kept.
+
+The list is checked before anything is created, and a `PaludariumError` of kind
+`"invalid-program"` names the first problem and its path:
+
+- each `path` is absolute and normalized (no `.`, `..`, empty or trailing part),
+  shorter than 4096 bytes with parts of at most 255 bytes, and appears once,
+  also among `files`;
+- the parent of each path is a directory entry, `/`, `/tmp` or a directory
+  created for `files`; a symlink is never a parent;
+- `mode` holds only type bits and permission bits 0o7777; a symlink's
+  permissions are 0o777, and its target is 1 to 4095 bytes without NUL; a
+  directory has no content;
+- entries that share an `inode` are files or symlinks of one kind with the same
+  mode, time and content;
+- at most 1,048,576 entries, each at most 64 MiB, and 256 MiB of content in all,
+  where a hard-link group counts once.
 
 ## Errors
 

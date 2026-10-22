@@ -351,9 +351,14 @@ impl MemFs {
 #[cfg(test)]
 mod core_tests;
 #[cfg(test)]
+mod entries_tests;
+#[cfg(test)]
 mod files_tests;
 #[cfg(test)]
 mod wasm_tests;
+
+mod entries;
+pub use entries::{EntryKind, GuestEntry, MAX_ENTRIES, MAX_ENTRY_BYTES};
 
 mod mount;
 pub use mount::MountedFs;

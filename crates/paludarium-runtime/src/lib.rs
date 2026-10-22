@@ -20,7 +20,7 @@ use paludarium_mmu::AddressSpace;
 #[cfg(test)]
 use paludarium_types::signal;
 use paludarium_types::{Error, ErrorKind, ExitReason, ExitStatus};
-use paludarium_vfs::{GuestFile, HostFs, MemFs, MountedFs};
+use paludarium_vfs::{GuestEntry, GuestFile, HostFs, MemFs, MountedFs};
 use workers::Execution;
 
 /// Instructions run between two checks of the kill request
@@ -70,6 +70,9 @@ pub struct Config {
     /// Optional initial permission overrides. Entries must name configured
     /// files once each and contain only Linux permission bits (0o7777).
     pub file_modes: Vec<(Vec<u8>, u32)>,
+    /// A tree placed after `files`: directories, symlinks and hard links with
+    /// their modes and times (`MemFs::add_entries` gives the rules).
+    pub entries: Vec<GuestEntry>,
     pub mounts: Vec<Mount>,
     pub tty: Option<TerminalInfo>,
     /// Only meaningful in wasm; the native build has no JIT.
@@ -114,6 +117,13 @@ impl Config {
         let path = path.into();
         self.files.push((path.clone(), content.into()));
         self.file_modes.push((path, mode));
+        self
+    }
+
+    /// Adds one entry of the tree to place before start.
+    #[must_use]
+    pub fn with_entry(mut self, entry: GuestEntry) -> Self {
+        self.entries.push(entry);
         self
     }
 }
@@ -272,6 +282,8 @@ impl Session {
             fs.add_file(file)
                 .map_err(|_| Error::new(ErrorKind::InvalidProgram, "invalid file placement"))?;
         }
+        fs.add_entries(&self.config.entries)
+            .map_err(|_| Error::new(ErrorKind::InvalidProgram, "invalid filesystem entry"))?;
         let mut mounted = MountedFs::new(fs);
         for (path, capability) in &self.mounts {
             mounted

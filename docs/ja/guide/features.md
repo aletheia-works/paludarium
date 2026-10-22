@@ -27,7 +27,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | 主なシステムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait` |
@@ -98,8 +98,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EINVAL` を返します。
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
   8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ただし
-  paludarium はその上限を守らせません。プロセスグループも同じように持ちますが、
-  プロセスグループを選ぶ `wait` はまだありません。
+  paludarium はその上限を守らせません。プロセスグループも同じように持ち、`wait4` と
+  `waitid` でプロセスグループを選んで待てます。
+- `waitid` は、Linux と同じ確かめ方と書き出し方をします。報告する子がないときは、
+  エラーのときも含めて siginfo の項目を 0 にします。終わった子は、`WEXITED` か
+  `WCONTINUED` がないと待てません（`ECHILD`）。停止と再開は報告しません。
+  `pidfd_open` の pidfd は、そのプロセスが終わると読めるようになり（回収されると
+  切断も示します）、`epoll` で待てます。ノンブロッキングの pidfd での
+  `waitid(P_PIDFD)` は `EAGAIN` を返します。`pidfd_send_signal` は siginfo と
+  範囲の指定を受け付けず、`PIDFD_THREAD` を付けてもプロセス全体を指します。
 - 不正なポインタを渡されたときは `EFAULT` を返します。
 
 ## スレッドとプロセス

@@ -31,7 +31,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 
 | Group | Main system calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait` |
@@ -107,7 +107,15 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed, but paludarium does not enforce them. Process groups are
-  kept the same way; `wait` cannot select by process group yet.
+  kept the same way, and `wait4` and `waitid` can wait for one.
+- `waitid` follows Linux's checks and copy-out: its siginfo fields are zero
+  when no child is reported, even on an error, and an exited child cannot be
+  waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). Stopped and
+  continued children are never reported. A pidfd from `pidfd_open` becomes
+  readable when its process exits (and hung up once it is reaped), so `epoll`
+  can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives `EAGAIN`.
+  `pidfd_send_signal` takes no siginfo and no scope flags, and `PIDFD_THREAD`
+  still names the whole process.
 - Invalid pointers return `EFAULT`.
 
 ## Threads and processes

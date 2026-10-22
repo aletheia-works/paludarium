@@ -244,8 +244,10 @@ mod process {
         let ids = std::thread::scope(|scope| {
             let a = processes.clone();
             let b = processes.clone();
-            let first = scope.spawn(move || a.reap(1, -1));
-            let second = scope.spawn(move || b.reap(1, -1));
+            let first =
+                scope.spawn(move || a.reap(1, crate::processes::Wanted::Any, false, true, false));
+            let second =
+                scope.spawn(move || b.reap(1, crate::processes::Wanted::Any, false, true, false));
             [first.join().unwrap(), second.join().unwrap()]
         });
         assert_eq!(

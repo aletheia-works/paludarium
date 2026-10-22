@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/vfs.h>
@@ -20,6 +21,18 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_send_signal
+#define SYS_pidfd_send_signal 424
+#endif
+#ifndef P_PIDFD
+#define P_PIDFD 3
+#endif
+#ifndef PIDFD_NONBLOCK
+#define PIDFD_NONBLOCK O_NONBLOCK
+#endif
 
 static void result(const char *name, long value) { printf("%s=%ld\n", name, value); }
 static pid_t child(void) { return syscall(SYS_fork); }
@@ -56,6 +69,28 @@ static void *timer_waiter(void *unused) {
     int got[3] = {sigwaitinfo(&set, &info), info.si_code, info.si_value.sival_int};
     write(timer_report[1], got, sizeof got);
     return NULL;
+}
+static int tid_report[2], tid_release[2];
+static void *parked(void *unused) {
+    (void)unused;
+    int tid = syscall(SYS_gettid);
+    write(tid_report[1], &tid, sizeof tid);
+    char byte;
+    read(tid_release[0], &byte, 1);
+    return NULL;
+}
+/* A child that exits with `code` once a byte arrives on `gate`. */
+static pid_t gated(int gate[2], int code) {
+    pipe(gate);
+    pid_t pid = child();
+    if (pid == 0) {
+        char byte;
+        close(gate[1]);
+        read(gate[0], &byte, 1);
+        _exit(code);
+    }
+    close(gate[0]);
+    return pid;
 }
 struct clone3_args { unsigned long long flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls; };
 static long clone3(void *args, unsigned long size) { return syscall(435, args, size); }
@@ -563,6 +598,144 @@ int main(int argc, char **argv) {
         struct thread_event as_signal = {0, SIGUSR1, 2, 0, {0}};
         result("sigev-thread", syscall(SYS_timer_create, CLOCK_MONOTONIC, &as_signal, &timer));
         result("delete-sigev-thread", syscall(SYS_timer_delete, timer));
+        return 0;
+    }
+    if (!strcmp(mode, "waitid")) {
+        siginfo_t info;
+        pid_t pid = child();
+        if (pid == 0) _exit(5);
+        memset(&info, 0x55, sizeof info);
+        result("nowait", waitid(P_PID, pid, &info, WEXITED | WNOWAIT));
+        result("signo", info.si_signo);
+        result("code", info.si_code);
+        result("pid", info.si_pid == pid);
+        result("status", info.si_status);
+        result("uid", info.si_uid == getuid());
+        result("again", waitid(P_PID, pid, &info, WEXITED));
+        result("status", info.si_status);
+        pid = child();
+        if (pid == 0) {
+            pause();
+            _exit(0);
+        }
+        kill(pid, SIGTERM);
+        /* Without WEXITED an exited child cannot be waited for (ECHILD), and
+           stays for a later wait (brush asks for WSTOPPED alone). */
+        siginfo_t stopped;
+        while (waitid(P_PID, pid, &stopped, WEXITED | WNOHANG | WNOWAIT) == 0 && stopped.si_pid == 0)
+            sched_yield();
+        errno = 0;
+        result("stopped-only", waitid(P_PID, pid, &stopped, WSTOPPED | WNOHANG));
+        result("errno", errno);
+        result("killed", waitid(P_ALL, 0, &info, WEXITED));
+        result("code", info.si_code);
+        result("status", info.si_status);
+        /* Nothing to report: the fields are zero, and so they are on an error. */
+        int gate[2];
+        pid = gated(gate, 6);
+        memset(&info, 0x55, sizeof info);
+        result("nohang", waitid(P_PID, pid, &info, WEXITED | WNOHANG));
+        result("nohang-cleared", info.si_signo == 0 && info.si_pid == 0 && info.si_status == 0);
+        memset(&info, 0x55, sizeof info);
+        errno = 0;
+        result("bad-pid", waitid(P_PID, 0, &info, WEXITED));
+        result("errno", errno);
+        result("error-cleared", info.si_signo == 0 && info.si_code == 0 && info.si_pid == 0);
+        errno = 0;
+        result("no-options", waitid(P_ALL, 0, &info, 0));
+        result("errno", errno);
+        errno = 0;
+        result("bad-option", waitid(P_ALL, 0, &info, WEXITED | 0x10));
+        result("errno", errno);
+        errno = 0;
+        result("bad-type", syscall(SYS_waitid, 9, 0, &info, WEXITED, NULL));
+        result("errno", errno);
+        errno = 0;
+        result("bad-pidfd", syscall(SYS_waitid, 3, 0, &info, WEXITED, NULL));
+        result("errno", errno);
+        write(gate[1], "x", 1);
+        result("gated", waitid(P_PID, pid, &info, WEXITED));
+        result("status", info.si_status);
+        errno = 0;
+        result("no-children", waitid(P_ALL, 0, &info, WEXITED));
+        result("errno", errno);
+        /* Process groups, through waitid and wait4. */
+        pid = gated(gate, 3);
+        setpgid(pid, pid);
+        write(gate[1], "x", 1);
+        result("pgid", waitid(P_PGID, pid, &info, WEXITED));
+        result("status", info.si_status);
+        pid = gated(gate, 4);
+        setpgid(pid, pid);
+        write(gate[1], "x", 1);
+        int status = 0;
+        result("wait-pgid", waitpid(-pid, &status, 0) == pid);
+        result("status", WEXITSTATUS(status));
+        pid = gated(gate, 8);
+        write(gate[1], "x", 1);
+        result("wait-own-group", waitpid(0, &status, 0) == pid);
+        result("status", WEXITSTATUS(status));
+        /* pidfds: readable after the exit, waitable, and EAGAIN when nonblocking. */
+        pid = gated(gate, 7);
+        int pidfd = syscall(SYS_pidfd_open, pid, 0);
+        result("pidfd", pidfd >= 0);
+        result("cloexec", fcntl(pidfd, F_GETFD) & FD_CLOEXEC);
+        struct pollfd ready = {pidfd, POLLIN, 0};
+        result("running", poll(&ready, 1, 0));
+        int nonblocking = syscall(SYS_pidfd_open, pid, PIDFD_NONBLOCK);
+        errno = 0;
+        result("nonblocking", syscall(SYS_waitid, P_PIDFD, nonblocking, &info, WEXITED, NULL));
+        result("errno", errno);
+        char byte;
+        errno = 0;
+        result("read", read(pidfd, &byte, 1));
+        result("errno", errno);
+        write(gate[1], "x", 1);
+        /* epoll waits for the exit (Tokio's reaper does so); no timeout, as
+           the emulated harness runs a virtual clock. */
+        int epoll = epoll_create1(EPOLL_CLOEXEC);
+        struct epoll_event watch = {.events = EPOLLIN, .data.u64 = 42}, seen = {0};
+        epoll_ctl(epoll, EPOLL_CTL_ADD, pidfd, &watch);
+        result("exited", epoll_wait(epoll, &seen, 1, -1));
+        result("readable", (seen.events & EPOLLIN) && seen.data.u64 == 42);
+        close(epoll);
+        result("by-pidfd", syscall(SYS_waitid, P_PIDFD, pidfd, &info, WEXITED, NULL));
+        result("status", info.si_status);
+        errno = 0;
+        result("signal-reaped", syscall(SYS_pidfd_send_signal, pidfd, SIGTERM, NULL, 0));
+        result("errno", errno);
+        close(nonblocking);
+        close(pidfd);
+        pid = gated(gate, 0);
+        pidfd = syscall(SYS_pidfd_open, pid, 0);
+        errno = 0;
+        result("signal-flags", syscall(SYS_pidfd_send_signal, pidfd, SIGTERM, NULL, 8));
+        result("errno", errno);
+        result("signal", syscall(SYS_pidfd_send_signal, pidfd, SIGTERM, NULL, 0));
+        result("signalled", waitid(P_PID, pid, &info, WEXITED));
+        result("status", info.si_status);
+        close(pidfd);
+        close(gate[1]);
+        errno = 0;
+        result("open-zero", syscall(SYS_pidfd_open, 0, 0));
+        result("errno", errno);
+        errno = 0;
+        result("open-flags", syscall(SYS_pidfd_open, getpid(), 1));
+        result("errno", errno);
+        errno = 0;
+        result("open-missing", syscall(SYS_pidfd_open, 999999, 0));
+        result("errno", errno);
+        pipe(tid_report);
+        pipe(tid_release);
+        pthread_t thread;
+        pthread_create(&thread, NULL, parked, NULL);
+        int tid = 0;
+        read(tid_report[0], &tid, sizeof tid);
+        errno = 0;
+        result("open-thread", syscall(SYS_pidfd_open, tid, 0));
+        result("errno", errno);
+        write(tid_release[1], "x", 1);
+        pthread_join(thread, NULL);
         return 0;
     }
     if (!strcmp(mode, "clone3")) {

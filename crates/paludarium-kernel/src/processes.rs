@@ -235,17 +235,34 @@ impl Processes {
             entry.group.stop(status);
         }
     }
+    /// The first exited child of `parent` that `wanted` selects, removed
+    /// unless `keep` (WNOWAIT). Without `exits` (WEXITED) none is reported.
+    /// `ECHILD` when no child can be waited for: as Linux's `do_wait` has
+    /// it, an exited child counts only with WEXITED or WCONTINUED.
     pub(crate) fn reap(
         &self,
         parent: u32,
-        wanted: i64,
+        wanted: Wanted,
+        keep: bool,
+        exits: bool,
+        continued: bool,
     ) -> Result<Option<(u32, ExitStatus)>, Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let matching = |pid: u32, entry: &Entry| {
-            entry.parent == parent && (wanted == -1 || wanted == 0 || wanted == i64::from(pid))
+            entry.parent == parent
+                && match wanted {
+                    Wanted::Any => true,
+                    Wanted::Pid(wanted) => pid == wanted,
+                    Wanted::Pgid(pgid) => entry.pgid == pgid,
+                }
         };
-        if !entries.iter().any(|(&pid, entry)| matching(pid, entry)) {
+        if !entries.iter().any(|(&pid, entry)| {
+            matching(pid, entry) && (entry.status.is_none() || exits || continued)
+        }) {
             return Err(Errno(10));
+        }
+        if !exits {
+            return Ok(None);
         }
         let ready = entries.iter().find_map(|(&pid, entry)| {
             (matching(pid, entry))
@@ -253,10 +270,29 @@ impl Processes {
                 .flatten()
                 .map(|status| (pid, status))
         });
-        if let Some((pid, _)) = ready {
+        if let Some((pid, _)) = ready
+            && !keep
+        {
             entries.remove(&pid);
         }
         Ok(ready)
+    }
+    /// Whether `pid` has exited: `None` once it is reaped (or never was).
+    fn exited(&self, pid: u32) -> Option<bool> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.get(&pid).map(|entry| entry.status.is_some())
+    }
+    /// What `pidfd_open` finds at `pid`: a process (`Ok`), a thread of one
+    /// (`ENOENT`) or nothing (`ESRCH`).
+    fn pidfd_target(&self, pid: u32) -> Result<(), Errno> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.contains_key(&pid) {
+            Ok(())
+        } else if entries.values().any(|entry| entry.group.has_member(pid)) {
+            Err(Errno::ENOENT)
+        } else {
+            Err(Errno(3))
+        }
     }
     fn signal(&self, pid: u32, number: i32) -> Result<(), Errno> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
@@ -266,6 +302,73 @@ impl Processes {
         } else {
             entry.group.send_process(number)
         }
+    }
+}
+
+/// Which children a wait looks at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wanted {
+    Any,
+    Pid(u32),
+    Pgid(u32),
+}
+
+const WNOHANG: u64 = 1;
+const WEXITED: u64 = 4;
+const WNOWAIT: u64 = 0x0100_0000;
+const PIDFD_NONBLOCK: u64 = 0x800;
+const PIDFD_THREAD: u64 = 0x80;
+
+/// A pidfd (`pidfd_open`): readable once its process has exited, and hung
+/// up once that process is reaped, as Linux's `pidfd_poll` reports. It is
+/// only a handle; reading or writing it is `EINVAL`.
+pub(crate) struct PidFd {
+    pid: u32,
+    processes: Arc<Processes>,
+    flags: AtomicU32,
+}
+impl paludarium_host::FileHandle for PidFd {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        // POLLIN | POLLRDNORM after the exit, with POLLHUP after the reaping.
+        Ok(match self.processes.exited(self.pid) {
+            Some(false) => (0, 0, 0),
+            Some(true) => (0x41, 1, 0),
+            None => (0x51, 2, 0),
+        })
+    }
+    fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+        Err(Errno::ESPIPE)
+    }
+    fn stat(&self) -> Result<paludarium_host::FileStat, Errno> {
+        // An anonymous inode: permissions, but no file type.
+        Ok(paludarium_host::FileStat {
+            mode: 0o600,
+            links: 1,
+            ..paludarium_host::FileStat::default()
+        })
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::SeqCst)
+    }
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.flags
+            .store(2 | flags & PIDFD_NONBLOCK as u32, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -335,6 +438,9 @@ impl Kernel {
                 Err(error) => Err(error),
             },
             61 => self.wait4(thread, mem, a),
+            247 => self.waitid(thread, mem, a),
+            434 => self.pidfd_open(a),
+            424 => self.pidfd_send_signal(a),
             110 => Ok(u64::from(self.processes.parent(self.process.pid))),
             157 => self.prctl(thread, mem, a),
             // setpgid, getpgid, getpgrp
@@ -366,7 +472,7 @@ impl Kernel {
             _ => return None,
         };
         thread.cpu.gpr[reg::RAX] = result.unwrap_or_else(Errno::to_syscall_return);
-        if n == 61
+        if (n == 61 || n == 247)
             && result == Err(Errno(4))
             && signals::next_pending(&thread.state, true)
                 .and_then(|index| {
@@ -584,8 +690,20 @@ impl Kernel {
         if a[2] & !(1 | 2 | 8 | 0xe0000000) != 0 {
             return Err(Errno::EINVAL);
         }
+        // -1 is any child, 0 this process's group, below -1 that group.
+        let wanted = match a[0] as i32 {
+            -1 => Wanted::Any,
+            0 => Wanted::Pgid(self.processes.pgid(self.process.pid)?),
+            i32::MIN => return Err(Errno(3)),
+            pgid if pgid < 0 => Wanted::Pgid(pgid.unsigned_abs()),
+            pid => Wanted::Pid(pid as u32),
+        };
         loop {
-            if let Some((pid, status)) = self.processes.reap(self.process.pid, a[0] as i64)? {
+            let continued = a[2] & 8 != 0;
+            if let Some((pid, status)) =
+                self.processes
+                    .reap(self.process.pid, wanted, false, true, continued)?
+            {
                 let raw = match status {
                     ExitStatus::Exited(code) => (code & 255) << 8,
                     ExitStatus::Signaled(signal) => signal & 127,
@@ -619,6 +737,142 @@ impl Kernel {
                 now.saturating_add(10_000_000),
                 &self.cancellation,
             )?;
+        }
+    }
+    /// `waitid(idtype, id, infop, options, rusage)` with Linux's checks and
+    /// copy-out: the siginfo fields (`si_signo`, `si_errno`, `si_code`,
+    /// `si_pid`, `si_uid`, `si_status`) are written, as zeros when no child
+    /// is reported, even on an error; the rusage (all zero here) only with a
+    /// child. Stopped and continued children are never reported.
+    fn waitid(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
+        let found = self.waitid_child(thread, a);
+        if let Ok(Some(_)) = found
+            && a[4] != 0
+        {
+            mem.write(GuestAddr(a[4]), &[0; 144])
+                .map_err(|_| Errno::EFAULT)?;
+        }
+        if a[2] != 0 {
+            let (signo, code, pid, status) = match found {
+                Ok(Some((pid, ExitStatus::Exited(code)))) => (17, 1, pid, code & 255),
+                Ok(Some((pid, ExitStatus::Signaled(signal)))) => (17, 2, pid, signal),
+                _ => (0, 0, 0, 0),
+            };
+            let mut info = [0; 28];
+            for (at, value) in [(0, signo), (8, code), (16, pid as i32), (24, status)] {
+                info[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            mem.write(GuestAddr(a[2]), &info)
+                .map_err(|_| Errno::EFAULT)?;
+        }
+        found.map(|_| 0)
+    }
+    fn waitid_child(
+        &self,
+        thread: &mut Thread,
+        a: [u64; 6],
+    ) -> Result<Option<(u32, ExitStatus)>, Errno> {
+        const KNOWN: u64 =
+            WNOHANG | 2 | WEXITED | 8 | WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+        let options = u64::from(a[3] as u32);
+        if options & !KNOWN != 0 || options & (2 | WEXITED | 8) == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let id = a[1] as i32;
+        let mut nonblocking = false;
+        let wanted = match a[0] as i32 {
+            0 => Wanted::Any,
+            1 if id > 0 => Wanted::Pid(id as u32),
+            2 if id > 0 => Wanted::Pgid(id as u32),
+            2 if id == 0 => Wanted::Pgid(self.processes.pgid(self.process.pid)?),
+            3 if id >= 0 => {
+                let d = self.files.descriptor(id as u64)?;
+                let pidfd = d
+                    .file
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<PidFd>())
+                    .ok_or(Errno::EBADF)?;
+                // A nonblocking pidfd waits as WNOHANG, but reports EAGAIN.
+                nonblocking = u64::from(d.file.flags()) & PIDFD_NONBLOCK != 0;
+                Wanted::Pid(pidfd.pid)
+            }
+            _ => return Err(Errno::EINVAL),
+        };
+        loop {
+            // Only exits are reported, so without WEXITED nothing is ready.
+            let found = self.processes.reap(
+                self.process.pid,
+                wanted,
+                options & WNOWAIT != 0,
+                options & WEXITED != 0,
+                options & 8 != 0,
+            )?;
+            if found.is_some() || options & WNOHANG != 0 {
+                return Ok(found);
+            }
+            if nonblocking {
+                return Err(Errno::EAGAIN);
+            }
+            self.group.drain_process(&mut thread.state);
+            let receipt = self.inbox.drain(&mut thread.state);
+            if receipt.interrupted
+                || self.group.status().is_some()
+                || signals::next_pending(&thread.state, true).is_some()
+            {
+                return Err(Errno(4));
+            }
+            let now = self.host.clock(ClockId::Monotonic)?;
+            self.host.wait_until(
+                ClockId::Monotonic,
+                now.saturating_add(10_000_000),
+                &self.cancellation,
+            )?;
+        }
+    }
+    /// `pidfd_open(pid, flags)`: a close-on-exec pidfd for a process.
+    /// `PIDFD_THREAD` is accepted but still names the whole process.
+    fn pidfd_open(&mut self, a: [u64; 6]) -> Result<u64, Errno> {
+        let flags = u64::from(a[1] as u32);
+        if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 || a[0] as i32 <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pid = a[0] as u32;
+        match self.processes.pidfd_target(pid) {
+            Err(e) if e == Errno::ENOENT && flags & PIDFD_THREAD != 0 => {
+                // A pidfd for one thread of another process is not supported.
+                return Err(Errno::EINVAL);
+            }
+            result => result?,
+        }
+        let pidfd = Arc::new(PidFd {
+            pid,
+            processes: Arc::clone(&self.processes),
+            flags: AtomicU32::new((2 | flags & PIDFD_NONBLOCK) as u32),
+        });
+        self.files.install(pidfd, true).map(u64::from)
+    }
+    /// `pidfd_send_signal(pidfd, sig, info, flags)`, as `kill` on the
+    /// pidfd's process; a siginfo and the scope flags are not supported
+    /// (`EINVAL`).
+    fn pidfd_send_signal(&self, a: [u64; 6]) -> Result<u64, Errno> {
+        if a[3] as u32 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let d = self.files.descriptor(u64::from(a[0] as u32))?;
+        let pidfd = d
+            .file
+            .as_any()
+            .and_then(|any| any.downcast_ref::<PidFd>())
+            .ok_or(Errno::EBADF)?;
+        let number = a[1] as i32;
+        if !(0..=64).contains(&number) || a[2] != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // A zombie takes the signal and drops it; a reaped process is gone.
+        match self.processes.exited(pidfd.pid) {
+            Some(false) => self.processes.signal(pidfd.pid, number).map(|()| 0),
+            Some(true) => Ok(0),
+            None => Err(Errno(3)),
         }
     }
     fn exec(&mut self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<(), Errno> {

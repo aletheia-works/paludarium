@@ -12,9 +12,11 @@ on:
 permissions:
   contents: read
 
+# Dispatched once per release head; a second dispatch waits instead of
+# cancelling it.
 concurrency:
   group: macos-quality-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always

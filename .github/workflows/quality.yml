@@ -13,9 +13,13 @@ on:
 permissions:
   contents: read
 
+# Nightly calls this workflow, so the group names the calling workflow:
+# a nightly run never shares a group with (and so never cancels) the run a
+# release dispatches. A release run is dispatched once per head and must not
+# be cancelled either.
 concurrency:
-  group: quality-${{ github.ref }}
-  cancel-in-progress: true
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   PALUDARIUM_TEST_NODE: node

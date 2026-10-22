@@ -6,7 +6,7 @@
 //! slices the loop checks whether [`Session::kill`] was requested.
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -131,6 +131,7 @@ pub struct Session {
     signal_inbox: Arc<SignalInbox>,
     stopped: Arc<AtomicBool>,
     last_stop: Arc<Mutex<Option<ExitReason>>>,
+    unimplemented: Arc<Mutex<BTreeSet<u64>>>,
 }
 
 impl Session {
@@ -203,6 +204,7 @@ impl Session {
             signal_inbox: Arc::new(SignalInbox::default()),
             stopped: Arc::new(AtomicBool::new(false)),
             last_stop: Arc::new(Mutex::new(None)),
+            unimplemented: Arc::default(),
         })
     }
 
@@ -238,6 +240,19 @@ impl Session {
             .last_stop
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The system-call numbers the guest called that paludarium does not
+    /// implement (they returned `ENOSYS`), in ascending order. For
+    /// diagnostics; not part of the guest-visible result.
+    #[must_use]
+    pub fn unimplemented_syscalls(&self) -> Vec<u64> {
+        self.unimplemented
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect()
     }
 
     fn file_system(&self) -> Result<MountedFs, Error> {
@@ -308,7 +323,8 @@ impl Session {
         let image = load(&*fs, &self.config.program, &start, &mut mem)?;
         let mut kernel = Kernel::new(Arc::clone(&self.host))
             .with_file_system(fs)
-            .with_signal_inbox(Arc::clone(&self.signal_inbox));
+            .with_signal_inbox(Arc::clone(&self.signal_inbox))
+            .with_unimplemented_log(Arc::clone(&self.unimplemented));
         if let Some(tty) = self.config.tty {
             kernel = kernel.with_terminal_size(tty.columns, tty.rows);
         }

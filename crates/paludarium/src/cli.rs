@@ -5,11 +5,17 @@
 //!   --env KEY=VALUE   add a guest environment variable (repeatable)
 //!   --no-jit          accepted; the native build has no JIT
 //!   --mount HOST:GUEST expose one explicit host directory (repeatable)
+//!   --report-enosys   list the unimplemented system calls the guest called
 //! ```
 //!
 //! Exit codes: the guest's exit code; 128 + signal number when the guest was
 //! killed by a signal; 2 for usage errors; 70 for errors of the emulator
 //! itself.
+//!
+//! When a CPU fault (an instruction paludarium cannot run, a bad memory
+//! access, a divide error) kills the guest, a `paludarium:` line on standard
+//! error says where, as a shell reports a crash; the guest itself sees exactly
+//! what it would see on Linux.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -18,7 +24,7 @@ use std::sync::Arc;
 
 use paludarium_host::{Host, read_program_file};
 use paludarium_runtime::{Config, Mount, Session};
-use paludarium_types::{Error, ExitStatus};
+use paludarium_types::{Error, ExitReason, ExitStatus};
 
 /// Exit code for command-line usage errors.
 pub const EXIT_USAGE: i32 = 2;
@@ -27,7 +33,7 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_EMULATOR_ERROR: i32 = 70;
 
 /// Usage text printed on errors and for `--help`.
-pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] <program> [args...]\n";
+pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] <program> [args...]\n";
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +45,8 @@ pub struct Invocation {
     pub env: Vec<(Vec<u8>, Vec<u8>)>,
     pub no_jit: bool,
     pub mounts: Vec<Mount>,
+    /// List the unimplemented system calls the guest called, after the run.
+    pub report_enosys: bool,
 }
 
 /// What the command line asked for.
@@ -99,6 +107,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
     let mut env = Vec::new();
     let mut no_jit = false;
     let mut mounts = Vec::new();
+    let mut report_enosys = false;
     let program = loop {
         let Some(arg) = args.next() else {
             return Err(UsageError("no program given"));
@@ -108,6 +117,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
             b"--" => break args.next().ok_or(UsageError("no program given"))?,
             b"-h" | b"--help" => return Ok(Command::Help),
             b"--no-jit" => no_jit = true,
+            b"--report-enosys" => report_enosys = true,
             b"--env" => {
                 let value = args.next().ok_or(UsageError("--env needs KEY=VALUE"))?;
                 env.push(parse_env(value.as_encoded_bytes())?);
@@ -132,6 +142,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
         env,
         no_jit,
         mounts,
+        report_enosys,
     }))
 }
 
@@ -143,6 +154,62 @@ pub fn guest_path(program: &Path) -> Result<Vec<u8>, UsageError> {
     let mut path = b"/".to_vec();
     path.extend_from_slice(name.as_encoded_bytes());
     Ok(path)
+}
+
+fn signal_name(number: i32) -> String {
+    match number {
+        4 => "SIGILL".into(),
+        7 => "SIGBUS".into(),
+        8 => "SIGFPE".into(),
+        11 => "SIGSEGV".into(),
+        n => format!("signal {n}"),
+    }
+}
+
+/// What a CPU stop that killed the guest was, for the `paludarium:` line.
+#[must_use]
+pub fn describe_stop(reason: &ExitReason) -> Option<String> {
+    Some(match *reason {
+        ExitReason::InvalidOpcode { rip, bytes } => format!(
+            "cannot run the instruction at {:#x} (bytes {})",
+            rip.0,
+            bytes
+                .as_slice()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        ExitReason::PageFault {
+            rip,
+            addr,
+            write,
+            fetch,
+            mapped,
+            ..
+        } => format!(
+            "{} {} address {:#x} at {:#x}",
+            if fetch {
+                "instruction fetch from"
+            } else if write {
+                "write to"
+            } else {
+                "read of"
+            },
+            if mapped { "a protected" } else { "an unmapped" },
+            addr.0,
+            rip.0
+        ),
+        ExitReason::Halt { rip } => format!("privileged instruction at {:#x}", rip.0),
+        ExitReason::GeneralProtection { rip } => {
+            format!("general-protection fault at {:#x}", rip.0)
+        }
+        ExitReason::ArithmeticFault { rip } => format!("divide error at {:#x}", rip.0),
+        ExitReason::FloatingPointFault { rip, .. } => {
+            format!("SIMD floating-point exception at {:#x}", rip.0)
+        }
+        _ => return None,
+    })
 }
 
 /// The command's exit code for a run result.
@@ -194,9 +261,39 @@ pub fn main_with(
     config.mounts = invocation.mounts;
     // --no-jit is accepted and has no effect: the native build has no JIT.
     config.jit = false;
-    let result = Session::new(config, host).and_then(|s| s.run());
-    if let Err(e) = &result {
-        let _ = writeln!(stderr, "paludarium: {e}");
+    let session = match Session::new(config, host) {
+        Ok(session) => session,
+        Err(e) => {
+            let _ = writeln!(stderr, "paludarium: {e}");
+            return EXIT_EMULATOR_ERROR;
+        }
+    };
+    let result = session.run();
+    match &result {
+        Err(e) => {
+            let _ = writeln!(stderr, "paludarium: {e}");
+        }
+        Ok(ExitStatus::Signaled(number)) => {
+            if let Some(detail) = session
+                .termination_detail()
+                .as_ref()
+                .and_then(describe_stop)
+            {
+                let _ = writeln!(stderr, "paludarium: {}: {detail}", signal_name(*number));
+            }
+        }
+        Ok(_) => {}
+    }
+    if invocation.report_enosys {
+        let numbers = session.unimplemented_syscalls();
+        if !numbers.is_empty() {
+            let list: Vec<String> = numbers.iter().map(u64::to_string).collect();
+            let _ = writeln!(
+                stderr,
+                "paludarium: unimplemented system calls (they returned ENOSYS): {}",
+                list.join(", ")
+            );
+        }
     }
     exit_code(&result)
 }
@@ -239,6 +336,7 @@ mod tests {
                 ],
                 no_jit: true,
                 mounts: vec![],
+                report_enosys: false,
             }))
         );
         assert!(matches!(parse(os(&["--", "-dash"])), Ok(Command::Run(i)) if i.program == "-dash"));
@@ -283,6 +381,104 @@ mod tests {
         assert_eq!(exit_code(&Ok(ExitStatus::Signaled(11))), 139);
         let err = Error::new(ErrorKind::Internal, "x");
         assert_eq!(exit_code(&Err(err)), EXIT_EMULATOR_ERROR);
+    }
+
+    /// Runs a tiny guest from a temporary file with `options` before it.
+    fn run_guest(name: &str, options: &[&str], code: &[u8]) -> (i32, String) {
+        let path =
+            std::env::temp_dir().join(format!("paludarium-cli-{name}-{}", std::process::id()));
+        std::fs::write(&path, paludarium_loader::testing::tiny_exec(code, b"")).unwrap();
+        let mut args = options.to_vec();
+        args.push(path.to_str().unwrap());
+        let result = run(&args);
+        std::fs::remove_file(&path).unwrap();
+        result
+    }
+
+    // mov eax, 999; syscall; mov eax, 60; xor edi, edi; syscall
+    const UNKNOWN_SYSCALL_THEN_EXIT: &[u8] = &[
+        0xb8, 0xe7, 0x03, 0, 0, 0x0f, 0x05, 0xb8, 0x3c, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05,
+    ];
+
+    #[test]
+    fn a_fatal_cpu_fault_names_the_signal_address_and_bytes() {
+        let (code, err) = run_guest("ud2", &[], &[0x0f, 0x0b]);
+        assert_eq!(code, 128 + 4);
+        assert!(
+            err.starts_with(
+                "paludarium: SIGILL: cannot run the instruction at 0x401000 (bytes 0f 0b"
+            ),
+            "{err}"
+        );
+        // mov rax, [0]
+        let (code, err) = run_guest("null", &[], &[0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+        assert_eq!(code, 128 + 11);
+        assert_eq!(
+            err,
+            "paludarium: SIGSEGV: read of an unmapped address 0x0 at 0x401000\n"
+        );
+    }
+
+    #[test]
+    fn unimplemented_system_calls_are_listed_only_on_request() {
+        let (code, err) = run_guest("enosys", &[], UNKNOWN_SYSCALL_THEN_EXIT);
+        assert_eq!((code, err.as_str()), (0, ""));
+        let (code, err) = run_guest(
+            "enosys-report",
+            &["--report-enosys"],
+            UNKNOWN_SYSCALL_THEN_EXIT,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            err,
+            "paludarium: unimplemented system calls (they returned ENOSYS): 999\n"
+        );
+    }
+
+    #[test]
+    fn describe_stop_covers_every_fatal_fault() {
+        use paludarium_types::GuestAddr;
+        let rip = GuestAddr(0x10);
+        for (reason, text) in [
+            (ExitReason::Halt { rip }, "privileged instruction at 0x10"),
+            (
+                ExitReason::GeneralProtection { rip },
+                "general-protection fault at 0x10",
+            ),
+            (ExitReason::ArithmeticFault { rip }, "divide error at 0x10"),
+            (
+                ExitReason::FloatingPointFault { rip, code: 1 },
+                "SIMD floating-point exception at 0x10",
+            ),
+            (
+                ExitReason::PageFault {
+                    rip,
+                    addr: GuestAddr(0x2000),
+                    write: true,
+                    fetch: false,
+                    mapped: true,
+                    present: true,
+                },
+                "write to a protected address 0x2000 at 0x10",
+            ),
+            (
+                ExitReason::PageFault {
+                    rip,
+                    addr: GuestAddr(0x3000),
+                    write: false,
+                    fetch: true,
+                    mapped: false,
+                    present: false,
+                },
+                "instruction fetch from an unmapped address 0x3000 at 0x10",
+            ),
+        ] {
+            assert_eq!(describe_stop(&reason).as_deref(), Some(text));
+        }
+        assert_eq!(describe_stop(&ExitReason::Syscall { rip }), None);
+        assert_eq!(signal_name(8), "SIGFPE");
+        assert_eq!(signal_name(7), "SIGBUS");
+        assert_eq!(signal_name(6), "signal 6");
     }
 
     #[test]

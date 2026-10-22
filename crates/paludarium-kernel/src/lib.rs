@@ -23,9 +23,9 @@ mod threads;
 pub use processes::Processes;
 pub use threads::ThreadGroup;
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use paludarium_cpu::{CpuState, reg};
 use paludarium_host::Host;
@@ -137,6 +137,9 @@ pub struct Kernel {
     exec_memory: Option<Arc<AddressSpace>>,
     vfork_release: Option<Arc<AtomicBool>>,
     vfork_wait: Option<Arc<AtomicBool>>,
+    /// System-call numbers the guest called that are not in the table,
+    /// shared by every thread and process (diagnostics only).
+    unimplemented: Arc<Mutex<BTreeSet<u64>>>,
 }
 
 impl Kernel {
@@ -159,7 +162,15 @@ impl Kernel {
             exec_memory: None,
             vfork_release: None,
             vfork_wait: None,
+            unimplemented: Arc::default(),
         }
+    }
+
+    /// Records the unimplemented system-call numbers the guest calls in `log`.
+    #[must_use]
+    pub fn with_unimplemented_log(mut self, log: Arc<Mutex<BTreeSet<u64>>>) -> Self {
+        self.unimplemented = log;
+        self
     }
 
     /// Explicit virtual terminal dimensions override Host dimensions on stdio.
@@ -433,6 +444,10 @@ impl Kernel {
             return next;
         }
         let Some(handler) = self.table.get(number) else {
+            self.unimplemented
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(number);
             thread.cpu.gpr[reg::RAX] = paludarium_types::Errno::ENOSYS.to_syscall_return();
             return Next::Resume;
         };

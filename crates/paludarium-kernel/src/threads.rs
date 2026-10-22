@@ -435,6 +435,7 @@ impl Kernel {
             exec_memory: None,
             vfork_release: self.vfork_release.clone(),
             vfork_wait: None,
+            unimplemented: self.unimplemented.clone(),
         };
         self.group.register(tid, inbox);
         // Linux ignores unsuccessful parent/child TID stores (native case 23).

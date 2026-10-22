@@ -68,6 +68,20 @@ fn runtime_default_and_explicit_fallback_preserve_fault_detail() {
 }
 
 #[test]
+fn unimplemented_syscalls_are_recorded_once_in_order() {
+    // mov eax, 999; syscall; mov eax, 500; syscall; mov eax, 999; syscall;
+    // mov eax, 60; xor edi, edi; syscall
+    let code = [
+        0xb8, 0xe7, 0x03, 0, 0, 0x0f, 0x05, 0xb8, 0xf4, 0x01, 0, 0, 0x0f, 0x05, 0xb8, 0xe7, 0x03,
+        0, 0, 0x0f, 0x05, 0xb8, 0x3c, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05,
+    ];
+    let s = session(&code, Arc::new(RecordingHost::new()));
+    assert_eq!(s.unimplemented_syscalls(), Vec::<u64>::new());
+    assert_eq!(s.run(), Ok(ExitStatus::Exited(0)));
+    assert_eq!(s.unimplemented_syscalls(), vec![500, 999]);
+}
+
+#[test]
 fn guest_exceptions_become_signals() {
     let host = Arc::new(RecordingHost::new());
     let s = session(&[0x0f, 0x0b], host.clone());

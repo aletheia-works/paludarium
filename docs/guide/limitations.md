@@ -35,6 +35,8 @@ verified.
 
 ## Found a problem?
 
-When paludarium stops on an error, it prints the instruction address and bytes,
-or the system call number, where it stopped. Please include them in an
+When a CPU fault kills the guest, the command prints the signal, the address
+and the instruction bytes. Run it again with `--report-enosys` to list the
+system calls that returned `ENOSYS` ([Command line](./cli#finding-what-is-missing)).
+Please include both in an
 [issue](https://github.com/aletheia-works/paludarium/issues).

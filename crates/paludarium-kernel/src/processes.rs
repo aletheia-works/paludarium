@@ -324,6 +324,7 @@ impl Kernel {
             exec_memory: None,
             vfork_release: release.clone(),
             vfork_wait: None,
+            unimplemented: self.unimplemented.clone(),
         };
         self.vfork_wait = release;
         self.pending_child = Some((

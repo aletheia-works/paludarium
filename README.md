@@ -37,7 +37,7 @@ reference; no code is copied). Its first user is
 
 ```sh
 mise run build         # cargo build --release --locked
-paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] <program> [args...]
+paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] <program> [args...]
 mise run wasm:build    # paludarium.wasm for packages/paludarium-wasm
 ```
 

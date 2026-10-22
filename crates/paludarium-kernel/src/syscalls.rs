@@ -377,6 +377,8 @@ fn sys_setitimer(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 const SIGEV_SIGNAL: u32 = 0;
 const SIGEV_NONE: u32 = 1;
+const SIGEV_THREAD: u32 = 2;
+const SIGEV_THREAD_ID: u32 = 4;
 const TIMER_ABSTIME: u64 = 1;
 
 fn outcome(result: Result<u64, Errno>) -> Outcome {
@@ -385,7 +387,9 @@ fn outcome(result: Result<u64, Errno>) -> Outcome {
 
 /// `timer_create(clock, sevp, timerid)`. CLOCK_REALTIME and CLOCK_MONOTONIC
 /// (and CLOCK_BOOTTIME, which never sleeps here) are supported, notified by
-/// a signal or not at all; CPU-time clocks and SIGEV_THREAD_ID give EINVAL.
+/// a signal to the process or (SIGEV_THREAD_ID) to one of its threads, or not
+/// at all; CPU-time clocks give EINVAL. The kernel treats SIGEV_THREAD, which
+/// the C library implements itself, as SIGEV_SIGNAL.
 fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome((|| {
         let realtime = match a[0] {
@@ -393,18 +397,29 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             1 | 7 => false,
             _ => return Err(Errno::EINVAL),
         };
-        let (signal, value) = if a[1] == 0 {
-            (Some(14), None) // SIGALRM, with the timer ID as its value
+        let (signal, value, thread) = if a[1] == 0 {
+            (Some(14), None, None) // SIGALRM, with the timer ID as its value
         } else {
             // Linux copies the whole 64-byte struct sigevent.
             c.mem
                 .check_read(GuestAddr(a[1]), 64)
                 .map_err(|_| Errno::EFAULT)?;
-            let [value, word] = read_words::<2>(c.mem, a[1])?;
+            let [value, word, tid] = read_words::<3>(c.mem, a[1])?;
             let (number, notify) = (word as u32 as i32, (word >> 32) as u32);
+            // good_sigevent: the thread must be in this thread group, then the
+            // signal must be valid.
+            let thread = (notify == SIGEV_THREAD_ID)
+                .then(|| u32::try_from(tid as u32 as i32).ok())
+                .map(|tid| {
+                    tid.filter(|&tid| c.group.has_member(tid))
+                        .ok_or(Errno::EINVAL)
+                })
+                .transpose()?;
             match notify {
-                SIGEV_SIGNAL if (1..=64).contains(&number) => (Some(number), Some(value)),
-                SIGEV_NONE => (None, Some(value)),
+                SIGEV_SIGNAL | SIGEV_THREAD | SIGEV_THREAD_ID if (1..=64).contains(&number) => {
+                    (Some(number), Some(value), thread)
+                }
+                SIGEV_NONE => (None, Some(value), None),
                 _ => return Err(Errno::EINVAL),
             }
         };
@@ -415,6 +430,7 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             timers.create(crate::timers::PosixTimer {
                 realtime,
                 signal,
+                thread,
                 ..Default::default()
             })
         })?;
@@ -544,10 +560,11 @@ fn sys_rt_sigtimedwait(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         let start = c.host.clock(ClockId::Monotonic)?;
         let deadline = timeout.map(|t| start.saturating_add(t));
         loop {
-            c.inbox.drain(c.process);
             c.group.drain_process(c.process);
             let now = c.host.clock(ClockId::Monotonic)?;
             c.group.expire_timer(c.process, now);
+            // After the timers, so a SIGEV_THREAD_ID signal to this thread is seen.
+            c.inbox.drain(c.process);
             // The thread's own queue first, then the process's shared one.
             let found = signals::lowest_in(&c.process.pending, set)
                 .map(|index| c.process.pending.remove(index))

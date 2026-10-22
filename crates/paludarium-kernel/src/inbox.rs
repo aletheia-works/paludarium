@@ -28,6 +28,29 @@ impl SignalInbox {
     pub(crate) fn send_thread(&self, number: i32) -> Result<(), Errno> {
         self.send_pending(signals::PendingSignal::thread(number, -6))
     }
+    /// Queues a timer's thread-directed signal. While the timer's previous
+    /// signal still waits here, the expiry adds to its overrun instead, as
+    /// Linux does with a timer's one pending signal. Returns the timer and
+    /// the overrun its signal now has.
+    pub(crate) fn send_timer(&self, signal: signals::PendingSignal) -> Option<(i32, i32)> {
+        let timer = signal.timer?;
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(queued) = queue
+            .iter_mut()
+            .find_map(|s| s.timer.as_mut().filter(|t| t.id == timer.id))
+        {
+            queued.overrun = queued
+                .overrun
+                .saturating_add(timer.overrun)
+                .saturating_add(1);
+            return Some((timer.id, queued.overrun));
+        }
+        queue.push(signal);
+        self.wake.store(true, Ordering::SeqCst);
+        drop(queue);
+        self.notify_listeners();
+        Some((timer.id, timer.overrun))
+    }
     fn send_pending(&self, signal: signals::PendingSignal) -> Result<(), Errno> {
         let number = signal.number;
         if !(1..=64).contains(&number) {

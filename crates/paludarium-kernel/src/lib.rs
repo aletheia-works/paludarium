@@ -118,6 +118,19 @@ pub struct ThreadState {
     /// The earliest POSIX timer deadline, synced from the thread group.
     pub(crate) posix_deadline: Option<u64>,
     pub stopped: bool,
+    /// The thread's name (`comm`), NUL-padded: PR_SET_NAME and PR_GET_NAME.
+    pub(crate) name: [u8; 16],
+}
+
+impl ThreadState {
+    /// Names the thread after the last component of `path`, cut to 15
+    /// bytes, as Linux's exec does.
+    pub fn name_after(&mut self, path: &[u8]) {
+        let base = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+        self.name = [0; 16];
+        let length = base.len().min(15);
+        self.name[..length].copy_from_slice(&base[..length]);
+    }
 }
 
 /// Process identity; shared resources are owned by ThreadGroup.

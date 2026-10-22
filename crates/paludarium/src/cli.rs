@@ -33,7 +33,7 @@ pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GU
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
-    /// The program as given on the command line (host path; also argv[0]).
+    /// The program as given on the command line (host path; also `argv[0]`).
     pub program: OsString,
     /// Arguments after the program.
     pub args: Vec<OsString>,

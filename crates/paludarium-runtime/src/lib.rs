@@ -62,7 +62,7 @@ pub struct Config {
     pub program: Vec<u8>,
     /// Optional absolute initial working directory; omitted means `/`.
     pub cwd: Option<Vec<u8>>,
-    /// argv, including argv[0].
+    /// argv, including `argv[0]`.
     pub args: Vec<Vec<u8>>,
     pub env: Vec<(Vec<u8>, Vec<u8>)>,
     /// Files placed in the virtual file system before start: (path, content).
@@ -77,7 +77,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// A configuration running `program` with `args` (argv[0] included).
+    /// A configuration running `program` with `args` (`argv[0]` included).
     #[must_use]
     pub fn new(program: impl Into<Vec<u8>>, args: Vec<Vec<u8>>) -> Self {
         Config {

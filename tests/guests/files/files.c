@@ -59,6 +59,17 @@ void _start(void) {
   t[1]=omit;t[3]=omit;results[x++]=call(280,-100,(long)"/tmp/paludarium-files-missing",(long)t,0,0,0);results[x++]=call(280,-100,(long)p,8,0,0,0);}
  if(CASE==36){int pipefd[2];S(22,pipefd,0,0);results[x++]=S(74,fd,0,0);results[x++]=S(75,fd,0,0);results[x++]=S(74,pipefd[0],0,0);results[x++]=S(75,99,0,0);results[x++]=S(162,0,0,0);
   results[x++]=call(221,fd,0,0,2,0,0);results[x++]=call(221,pipefd[0],0,0,2,0,0);results[x++]=call(221,fd,0,0,6,0,0);results[x++]=call(221,fd,0,-1,0,0,0);results[x++]=call(221,99,0,0,0,0,0);S(3,pipefd[0],0,0);S(3,pipefd[1],0,0);}
+ #define MMAP(len,prot,flags,f,off) call(9,0,len,prot,flags,f,off)
+ if(CASE==37){S(1,fd,"hello",5);char*m=(char*)MMAP(8192,1,2,fd,0);results[x++]=(long)m>0;results[x++]=m[0]+m[4];results[x++]=m[5];results[x++]=S(8,fd,0,1);
+  char*w=(char*)MMAP(4096,3,2,fd,0);w[0]='X';S(8,fd,0,0);S(0,fd,buf,1);results[x++]=buf[0];results[x++]=m[0];
+  long d=S(2,p,0,0);char*s=(char*)MMAP(4096,1,1,d,0);results[x++]=s[1];results[x++]=S(10,s,4096,3);results[x++]=MMAP(4096,3,1,d,0);
+  results[x++]=S(28,m,4096,8);results[x++]=S(28,m,4096,4);results[x++]=m[1];
+  results[x++]=S(11,m,8192,0);results[x++]=S(11,w,4096,0);results[x++]=S(11,s,4096,0);S(3,d,0,0);}
+ if(CASE==38){S(1,fd,buf,4096);S(1,fd,"Z",1);long w=S(2,p,1,0),o=S(2,p,010000000,0),d=S(2,"/tmp",65536,0);int pipefd[2];S(22,pipefd,0,0);
+  char*m=(char*)MMAP(4096,1,2,fd,4096);results[x++]=m[0];results[x++]=m[1];results[x++]=S(11,m,4096,0);
+  results[x++]=MMAP(4096,1,2,w,0);results[x++]=MMAP(4096,1,1,w,0);results[x++]=MMAP(4096,1,2,o,0);results[x++]=MMAP(4096,1,2,d,0);results[x++]=MMAP(4096,1,2,pipefd[0],0);
+  results[x++]=MMAP(4096,1,2,99,0);results[x++]=MMAP(0,1,2,99,0);results[x++]=MMAP(0,1,2,fd,0);results[x++]=MMAP(4096,1,2,fd,1);results[x++]=MMAP(4096,1,2,fd,-4096);results[x++]=MMAP(4096,1,2,fd,1L<<62)>0;
+  S(3,w,0,0);S(3,o,0,0);S(3,d,0,0);S(3,pipefd[0],0,0);S(3,pipefd[1],0,0);}
  S(3,fd,0,0);S(87,p,0,0);S(87,q,0,0);S(87,r,0,0);
  }
  S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);

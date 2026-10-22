@@ -83,6 +83,9 @@ pub enum MappingKind {
     Anonymous,
     Stack,
     Heap,
+    /// A copy of a file made by `mmap`. When it is also shared it stands
+    /// for a mapping that must stay read-only, as nothing writes it back.
+    File,
 }
 
 /// A contiguous, page-aligned region of the address space.
@@ -731,6 +734,7 @@ impl AddressSpaceData {
         let end = checked_range(addr, len)?;
         // The mappings must cover the range without holes.
         let mut covered = addr.0;
+        let mut denied = false;
         for (_, m) in self.mappings.range(..end) {
             if m.end() <= covered {
                 continue;
@@ -738,12 +742,21 @@ impl AddressSpaceData {
             if m.start.0 > covered {
                 break;
             }
+            // A shared file mapping cannot become writable (see `File`).
+            if prot.contains(Prot::WRITE)
+                && m.kind == MappingKind::File
+                && self.shared_at(m.start.0).is_some()
+            {
+                denied = true;
+                break;
+            }
             covered = m.end();
         }
         if covered == addr.0 {
-            return Err(Errno::ENOMEM);
+            return Err(if denied { Errno::EACCES } else { Errno::ENOMEM });
         }
-        // Linux applies the mapped prefix before reporting a later hole.
+        // Linux applies the mapped prefix before reporting a later hole or
+        // a mapping that refuses the protection.
         let incomplete = covered < end;
         let end = end.min(covered);
         self.split_at(addr.0);
@@ -757,7 +770,9 @@ impl AddressSpaceData {
                 page.prot = prot;
             }
         });
-        if incomplete {
+        if denied {
+            Err(Errno::EACCES)
+        } else if incomplete {
             Err(Errno::ENOMEM)
         } else {
             Ok(())
@@ -766,8 +781,8 @@ impl AddressSpaceData {
 
     /// Drops the contents of the private pages in `[addr, addr+len)`, so they
     /// read as zeros again (`MADV_DONTNEED`). Shared pages keep theirs, as
-    /// their memory outlives the mapping, and so do ELF segments, which
-    /// Linux would refill from the file. Applies the mapped parts and
+    /// their memory outlives the mapping, and so do ELF segments and file
+    /// mappings, which Linux would refill from the file. Applies the mapped parts and
     /// returns `ENOMEM` when the range has a hole, as Linux does.
     pub fn discard(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
@@ -781,7 +796,9 @@ impl AddressSpaceData {
             hole |= m.start.0 > covered;
             covered = m.end();
             let start = m.start.0.max(addr.0);
-            if m.kind != MappingKind::ElfSegment && self.shared_at(start).is_none() {
+            if !matches!(m.kind, MappingKind::ElfSegment | MappingKind::File)
+                && self.shared_at(start).is_none()
+            {
                 private.push((start, m.end().min(end)));
             }
         }
@@ -796,8 +813,8 @@ impl AddressSpaceData {
     }
 
     /// Whether `[addr, addr+len)` is all private anonymous memory, as
-    /// `MADV_FREE` requires: `EINVAL` for a shared page or an ELF segment
-    /// (file-backed on Linux), else `ENOMEM` for a hole.
+    /// `MADV_FREE` requires: `EINVAL` for a shared page, an ELF segment
+    /// or a file mapping (file-backed on Linux), else `ENOMEM` for a hole.
     pub fn check_private_anonymous(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
         let mut covered = addr.0;
@@ -808,7 +825,8 @@ impl AddressSpaceData {
             }
             hole |= m.start.0 > covered;
             covered = m.end();
-            if m.kind == MappingKind::ElfSegment || self.shared_at(m.start.0.max(addr.0)).is_some()
+            if matches!(m.kind, MappingKind::ElfSegment | MappingKind::File)
+                || self.shared_at(m.start.0.max(addr.0)).is_some()
             {
                 return Err(Errno::EINVAL);
             }

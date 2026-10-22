@@ -606,4 +606,20 @@ mod mount_tests {
         );
         assert!(!x.root.join("d").exists());
     }
+    #[test]
+    fn read_at_keeps_position() {
+        let x = Fixture::new();
+        // The mounted host directory and the in-memory root.
+        for path in [&b"/mnt/f"[..], b"/f"] {
+            let file = x.fs.open(path, 66, 0o600).unwrap();
+            file.write(b"abcdef").unwrap();
+            file.seek(1, 0).unwrap();
+            let mut buf = [0; 8];
+            assert_eq!(file.read_at(2, &mut buf).unwrap(), 4);
+            assert_eq!(&buf[..4], b"cdef");
+            assert_eq!(file.read_at(9, &mut buf).unwrap(), 0);
+            assert_eq!(file.read_at(1 << 62, &mut buf).unwrap(), 0);
+            assert_eq!(file.seek(0, 1).unwrap(), 1);
+        }
+    }
 }

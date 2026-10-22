@@ -32,7 +32,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | Group | Main system calls |
 |---|---|
 | Processes and threads | `clone`, `fork`, `vfork`, `execve`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous), `munmap`, `mprotect`, `madvise`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mprotect`, `madvise`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait` |
 | Time | `clock_gettime`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
@@ -127,8 +127,9 @@ All of them give the same results as a real x86-64 Linux on Linux, macOS and
 Windows, and on Node.js, Chromium, Firefox and Safari.
 
 - **ripgrep**: a text search tool written in Rust (15.2.0), which runs its
-  searches on several threads. Eight searches, including a regular expression
-  replacement, a parallel search and two errors, give the same output and exit
+  searches on several threads. Nine searches, including a regular expression
+  replacement, a parallel search, one through a memory-mapped file and two
+  errors, give the same output and exit
   status as on real Linux. This is checked on x86-64 Linux only so far.
   `--version` is not compared, because it reports the SIMD features `CPUID`
   shows, which paludarium limits on purpose.

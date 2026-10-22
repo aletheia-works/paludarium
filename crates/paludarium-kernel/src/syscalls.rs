@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use paludarium_cpu::CpuState;
-use paludarium_host::{ClockId, Host, WaitOutcome};
+use paludarium_host::{ClockId, FileHandle, Host, WaitOutcome};
 use paludarium_mmu::{AddressSpace, MappingKind, Prot};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 
@@ -740,24 +740,34 @@ const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 
 fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let (addr, len, prot, flags, fd) = (a[0], a[1], a[2], a[3], a[4] as i32);
+    let (addr, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4] as i32, a[5]);
     let Some(prot) = Prot::from_bits(prot) else {
         return err(Errno::EINVAL);
     };
-    if a[5] & 4095 != 0 {
+    if offset & 4095 != 0 {
         return err(Errno::EINVAL);
     }
+    let file = if flags & MAP_ANONYMOUS == 0 {
+        match u64::try_from(fd).map_or(Err(Errno::EBADF), |fd| c.files.descriptor(fd)) {
+            Ok(d) if d.file.flags() & O_PATH == 0 => Some(d.file),
+            _ => return err(Errno::EBADF),
+        }
+    } else {
+        None
+    };
     if len == 0 || !matches!(flags & (MAP_SHARED | MAP_PRIVATE), MAP_SHARED | MAP_PRIVATE) {
         return err(Errno::EINVAL);
     }
-    if flags & MAP_ANONYMOUS == 0 {
-        // No file descriptor in the core emulator can be mapped.
-        return err(if (0..=2).contains(&fd) {
-            Errno::ENODEV
-        } else {
-            Errno::EBADF
-        });
+    if let Some(file) = &file
+        && let Err(e) = check_mappable(file.as_ref(), prot, flags, offset, len)
+    {
+        return err(e);
     }
+    let kind = if file.is_some() {
+        MappingKind::File
+    } else {
+        MappingKind::Anonymous
+    };
     let at = GuestAddr(addr);
     let result = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
         if at.page_offset() != 0 {
@@ -768,25 +778,26 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         {
             return err(e);
         }
-        c.mem
-            .map_shared(Some(at), len, prot, MappingKind::Anonymous)
+        c.mem.map_shared(Some(at), len, prot, kind)
     } else {
         // Linux rounds a non-fixed hint down to its page boundary.
         let hint = GuestAddr(addr & !4095);
         let hinted = (hint.0 != 0)
-            .then(|| {
-                c.mem
-                    .map_shared(Some(hint), len, prot, MappingKind::Anonymous)
-                    .ok()
-            })
+            .then(|| c.mem.map_shared(Some(hint), len, prot, kind).ok())
             .flatten();
         match hinted {
             Some(a) => Ok(a),
-            None => c.mem.map_shared(None, len, prot, MappingKind::Anonymous),
+            None => c.mem.map_shared(None, len, prot, kind),
         }
     };
     match result {
         Ok(a) => {
+            if let Some(file) = &file
+                && let Err(error) = copy_file(c, file.as_ref(), a, len, offset)
+            {
+                let _ = c.mem.unmap_shared(a, len);
+                return err(error);
+            }
             if flags & MAP_SHARED != 0
                 && let Err(error) = c.mem.mark_shared(a, len)
             {
@@ -796,6 +807,62 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
         Err(e) => err(e),
     }
+}
+
+const O_PATH: u32 = 0o10000000;
+
+/// The `mmap` checks of a file, in Linux's order. A file mapping is a copy
+/// made when it is created, so a shared one may not be writable: that would
+/// need its writes to reach the file.
+fn check_mappable(
+    file: &dyn FileHandle,
+    prot: Prot,
+    flags: u64,
+    offset: u64,
+    len: u64,
+) -> Result<(), Errno> {
+    let regular = file.stat()?.mode & 0o170000 == 0o100000;
+    // A regular file's mapping must end within the largest file size.
+    if regular && i64::MAX as u64 - len.min(i64::MAX as u64) < offset {
+        return Err(Errno::EOVERFLOW);
+    }
+    let access = file.flags() & 3;
+    if flags & MAP_SHARED != 0 && prot.contains(Prot::WRITE) {
+        return Err(if access == 2 {
+            Errno::ENODEV
+        } else {
+            Errno::EACCES
+        });
+    }
+    if access == 1 {
+        return Err(Errno::EACCES);
+    }
+    if regular { Ok(()) } else { Err(Errno::ENODEV) }
+}
+
+/// Fills a new file mapping with the file from `offset`; the part of the
+/// mapping past the end of the file stays zero.
+fn copy_file(
+    c: &Context<'_>,
+    file: &dyn FileHandle,
+    at: GuestAddr,
+    len: u64,
+    offset: u64,
+) -> Result<(), Errno> {
+    let mut buf = vec![0; usize::try_from(len).map_or(1 << 20, |len| len.min(1 << 20))];
+    let mut done = 0;
+    while done < len {
+        let want = usize::try_from(len - done).map_or(buf.len(), |n| n.min(buf.len()));
+        let n = file.read_at(offset + done, &mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        c.mem
+            .write_initial(GuestAddr(at.0 + done), &buf[..n])
+            .map_err(|_| Errno::EFAULT)?;
+        done += n as u64;
+    }
+    Ok(())
 }
 
 const MADV_DONTNEED: u64 = 4;

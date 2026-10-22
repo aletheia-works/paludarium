@@ -28,7 +28,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | 主なシステムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`fork`、`vfork`、`execve`、`wait4`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous）、`munmap`、`mprotect`、`madvise`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mprotect`、`madvise`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait` |
 | 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
@@ -120,7 +120,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 本物の x86-64 Linux と同じ結果になることを確かめています。
 
 - **ripgrep**：Rust で書かれたテキストの検索のツール（15.2.0）。検索を複数のスレッドで
-  動かします。正規表現での置き換え、並列の検索、2 つのエラーを含む 8 つの検索が、本物の
-  Linux と同じ出力と終了コードになります。今のところ確かめているのは x86-64 Linux だけです。
+  動かします。正規表現での置き換え、並列の検索、ファイルをメモリへマップした検索、2 つの
+  エラーを含む 9 つの検索が、本物の Linux と同じ出力と終了コードになります。
+  今のところ確かめているのは x86-64 Linux だけです。
   `--version` は比べていません。`CPUID` が見せる SIMD の機能を表示するためで、
   paludarium はそれをわざと絞っています。

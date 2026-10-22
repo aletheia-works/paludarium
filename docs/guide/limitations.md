@@ -10,8 +10,14 @@ verified.
 - **Network**: `socket()` always returns `EAFNOSUPPORT`; only AF_UNIX
   `socketpair` of type `SOCK_STREAM` or `SOCK_SEQPACKET` is available
   (`SOCK_DGRAM` pairs are not there yet).
-- **Some system calls**: `clone3`, `timerfd`, file-backed `mmap`,
-  `CLONE_SIGHAND` between separate processes, stop and
+- **Writable shared file mappings**: `mmap` copies a file in when the
+  mapping is made. A `MAP_PRIVATE` mapping behaves as on Linux, and so does a
+  read-only `MAP_SHARED` one until the file changes, which the mapping does not
+  see. `MAP_SHARED` with `PROT_WRITE` returns `ENODEV`, and `mprotect` cannot
+  make a shared file mapping writable (`EACCES`), as nothing would write it
+  back to the file. A page wholly past the end of the file reads as zeros
+  instead of raising `SIGBUS`.
+- **Some system calls**: `clone3`, `timerfd`, `CLONE_SIGHAND` between separate processes, stop and
   continue notifications from `wait`, and `wait` by process group are not there
   yet. Unimplemented system calls return `ENOSYS`, so some programs can carry
   on without the feature.

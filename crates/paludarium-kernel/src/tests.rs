@@ -903,3 +903,44 @@ fn syscall_flock_cancel() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(f.ret(73, &[fd, 2]), errno(Errno(4)));
 }
+#[test]
+fn memory_file_private_copy() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0hello").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(1, &[fd, DATA + 6, 5]), 5);
+    let at = f.ret(syscalls::nr::MMAP, &[0, 8192, 3, 2, fd, 0]);
+    let mut bytes = [0; 6];
+    f.mem.read(GuestAddr(at), &mut bytes).unwrap();
+    assert_eq!(&bytes, b"hello\0");
+    // The copy leaves the file position, and its writes the file, alone.
+    assert_eq!(f.ret(8, &[fd, 0, 1]), 5);
+    f.mem.write(GuestAddr(at), b"j").unwrap();
+    assert_eq!(f.ret(8, &[fd, 0, 0]), 0);
+    assert_eq!(f.ret(0, &[fd, DATA + 0x1000, 1]), 1);
+    f.mem
+        .read(GuestAddr(DATA + 0x1000), &mut bytes[..1])
+        .unwrap();
+    assert_eq!(bytes[0], b'h');
+    assert_eq!(f.ret(28, &[at, 4096, 8]), errno(Errno::EINVAL));
+}
+#[test]
+fn memory_file_shared_stays_read_only() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    // Nothing would write a writable shared mapping back to the file.
+    assert_eq!(
+        f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 1, fd, 0]),
+        errno(Errno::ENODEV)
+    );
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 1, fd, 0]);
+    assert_eq!(f.ret(10, &[at, 4096, 3]), errno(Errno::EACCES));
+    assert_eq!(f.ret(10, &[at, 4096, 5]), 0);
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+    let fd = f.ret(2, &[DATA, 1, 0]);
+    assert_eq!(
+        f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 2, fd, 0]),
+        errno(Errno::EACCES)
+    );
+}

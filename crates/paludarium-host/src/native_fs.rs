@@ -206,6 +206,31 @@ struct NativeFile {
     flags: Mutex<u32>,
 }
 impl FileHandle for NativeFile {
+    fn read_at(&self, offset: u64, b: &mut [u8]) -> Result<usize, Errno> {
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        // A host may refuse to seek past its largest file size.
+        if offset >= file.metadata().map_err(err)?.len() {
+            return Ok(0);
+        }
+        let position = file.stream_position().map_err(err)?;
+        file.seek(SeekFrom::Start(offset)).map_err(err)?;
+        let mut done = 0;
+        let result = loop {
+            match file.read(&mut b[done..]) {
+                Ok(0) => break Ok(done),
+                Ok(n) => {
+                    done += n;
+                    if done == b.len() {
+                        break Ok(done);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(err(e)),
+            }
+        };
+        file.seek(SeekFrom::Start(position)).map_err(err)?;
+        result
+    }
     fn read(&self, b: &mut [u8]) -> Result<usize, Errno> {
         if self.flags() & 3 == 1 {
             return Err(Errno::EBADF);

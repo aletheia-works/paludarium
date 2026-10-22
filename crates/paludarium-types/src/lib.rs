@@ -118,6 +118,7 @@ impl Errno {
     pub const EBADF: Errno = Errno(9);
     pub const EAGAIN: Errno = Errno(11);
     pub const ENOMEM: Errno = Errno(12);
+    pub const EACCES: Errno = Errno(13);
     pub const EFAULT: Errno = Errno(14);
     pub const EEXIST: Errno = Errno(17);
     pub const ENODEV: Errno = Errno(19);
@@ -131,6 +132,7 @@ impl Errno {
     pub const ERANGE: Errno = Errno(34);
     pub const ENAMETOOLONG: Errno = Errno(36);
     pub const ENOSYS: Errno = Errno(38);
+    pub const EOVERFLOW: Errno = Errno(75);
 
     /// The value placed in `rax` for a failed system call (`-errno`).
     #[must_use]

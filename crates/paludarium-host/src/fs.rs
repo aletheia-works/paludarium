@@ -67,6 +67,13 @@ pub trait FileHandle: Send + Sync {
     fn sync(&self) -> Result<(), Errno> {
         Err(Errno::EINVAL)
     }
+    /// Reads from `offset` without moving the file position, filling `buf`
+    /// unless the file ends first; `mmap` copies a file in with it. Kinds
+    /// that cannot be mapped (pipes, sockets, terminals, devices, generated
+    /// files) give `ENODEV`, as on Linux.
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::ENODEV)
+    }
 }
 pub trait HostFs: Send + Sync {
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;

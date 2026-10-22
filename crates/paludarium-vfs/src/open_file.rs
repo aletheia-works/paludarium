@@ -49,6 +49,18 @@ impl FileHandle for MemFile {
         s.0 += count as u64;
         Ok(count)
     }
+    fn read_at(&self, offset: u64, b: &mut [u8]) -> Result<usize, Errno> {
+        let n = lock(&self.node);
+        let Kind::File(data) = &n.kind else {
+            return Err(Errno::ENODEV);
+        };
+        let pos = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        let count = b.len().min(data.len() - pos);
+        b[..count].copy_from_slice(&data[pos..pos + count]);
+        Ok(count)
+    }
     fn write(&self, b: &[u8]) -> Result<usize, Errno> {
         let mut s = lock(&self.state);
         if s.1 & 3 == 0 {

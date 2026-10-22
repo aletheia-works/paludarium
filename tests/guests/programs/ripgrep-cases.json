@@ -7,6 +7,7 @@
     {"name": "count", "args": ["--count", "--sort", "path", "name", "package.json", "filedep", "../outside"]},
     {"name": "replace", "args": ["--only-matching", "--sort", "path", "--replace", "<$1>", "\"([a-z]+)\":\"[0-9.]+\"", "package.json", "filedep"]},
     {"name": "parallel", "args": ["--files-with-matches", "link:\\.\\./outside", "package.json", "filedep", "../outside"]},
+    {"name": "mmap", "args": ["--mmap", "--line-number", "name", "package.json"]},
     {"name": "no-match", "args": ["no-such-text", "package.json"]},
     {"name": "bad-regex", "args": ["(", "package.json"]},
     {"name": "missing-file", "args": ["name", "missing.json"]}

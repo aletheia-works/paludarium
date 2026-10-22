@@ -42,6 +42,7 @@ checking that no guest input makes the emulator panic.
 |---|---|
 | Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux; coverage; probe and aube differential tests; acceptance tests in the four WebAssembly environments; part of the fuzzing |
 | Every night | fuzzing of the 13 targets; differential tests on macOS and Windows; the four WebAssembly environments with and without the JIT; the performance measurement |
+| Every week | the pinned nightly Rust and the aube guest move to their latest releases, each in a pull request that merges itself once its checks pass |
 | Before a release | all of the above on the exact code being released (below) |
 
 ## Acceptance before a release

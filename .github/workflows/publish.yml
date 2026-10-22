@@ -120,7 +120,7 @@ jobs:
       - name: Fixed tools for publishing verified artifacts
         run: |
           npm install --prefix target/release-evidence/tools --ignore-scripts npm@12.2.0
-          bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal
+          bash scripts/rustup-retry.sh toolchain install "$(bash scripts/rust-toolchain.sh)" --profile minimal
       - name: Publish in dependency order and verify registry digests
         env:
           GH_TOKEN: ${{ github.token }}

@@ -19,6 +19,8 @@ updates:
     directories:
       - "/"
       - "/fuzz"
+      # The probe guest; aube and the nightly Rust move with bump-pins.yml.
+      - "/tests/guests/programs/probe"
     schedule:
       interval: "weekly"
       day: "monday"

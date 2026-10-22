@@ -104,6 +104,12 @@ or run a task.
   and the full quality run (macOS, Windows, Node.js, Chromium, Firefox and the
   real Safari, with and without the JIT). A failure opens an issue; the next
   passing night closes it.
+- `bump-pins.yml` (every Monday): moves the nightly pinned in
+  `rust-toolchain.toml` and the aube guest in
+  `tests/guests/programs/source-lock.json` to their latest releases
+  (`scripts/bump-pins.py`), one pull request each from aletheia-works-bot that
+  merges itself once `ci-ok` passes. Workflows name the toolchain through
+  `$RUST_TOOLCHAIN` (`scripts/rust-toolchain.sh`), never the date.
 - `docs.yml`: builds the documentation site (`docs-build.yml`) and deploys it
   from main.
 - `release.yml`, `release-merge.yml`, `publish.yml`: releases; see

@@ -1,0 +1,156 @@
+# The same action as aletheia-works/vivarium's .github/actions/bot-pull-request.
+name: Bot pull request
+description: >-
+  Commit the working tree's changes as aletheia-works-bot with a signed
+  commit, open or update a pull request for them, and enable auto-merge.
+  Leaves the branch alone when someone else has changed it since the
+  bot's last push, or when a pull request with the same title was closed
+  unmerged.
+
+inputs:
+  token:
+    description: Installation token of aletheia-works-bot (contents and pull-requests write).
+    required: true
+  branch:
+    description: Branch the pull request comes from.
+    required: true
+  title:
+    description: Pull request title, also used as the commit message.
+    required: true
+  body-path:
+    description: File holding the pull request body.
+    required: true
+  bot-login:
+    description: Login the token commits as.
+    default: aletheia-works-bot[bot]
+
+runs:
+  using: composite
+  steps:
+    - name: Commit, open or update the pull request, and enable auto-merge
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        BRANCH: ${{ inputs.branch }}
+        TITLE: ${{ inputs.title }}
+        BODY_PATH: ${{ inputs.body-path }}
+        BOT_LOGIN: ${{ inputs.bot-login }}
+      run: |
+        set -euo pipefail
+        repo="${GITHUB_REPOSITORY}"
+
+        # shellcheck disable=SC2016
+        closed="$(gh pr list --head "${BRANCH}" --state closed --json title,mergedAt \
+          --jq '[.[] | select(.mergedAt == null and .title == $ENV.TITLE)] | length')"
+        if [ "${closed}" != 0 ]; then
+          echo "A pull request for this exact change was closed unmerged; not opening it again."
+          exit 0
+        fi
+
+        number=""
+        recorded=""
+        open="$(gh pr list --head "${BRANCH}" --state open --json number,headRefOid,body \
+          --jq '.[0] // empty | [.number, .headRefOid, ((.body // "") | capture("<!-- bot-head: (?<sha>[0-9a-f]{40}) -->").sha // "")] | @tsv')"
+        if [ -n "${open}" ]; then
+          IFS=$'\t' read -r number open_head recorded <<< "${open}"
+          if [ "${open_head}" != "${recorded}" ]; then
+            made_by="$(gh api "repos/${repo}/commits/${open_head}" \
+              --jq '[.author.login // "", .committer.login // "", (.commit.verification.verified | tostring)] | join(" ")')"
+            if [ "${made_by}" != "${BOT_LOGIN} web-flow true" ]; then
+              echo "${BRANCH} changed after the bot's last push (${recorded:-none recorded} -> ${open_head}); leaving it and #${number} alone."
+              exit 0
+            fi
+            echo "${open_head} is the bot's own commit but #${number} does not record it; carrying on."
+          fi
+        fi
+
+        base="$(git rev-parse HEAD)"
+        git add -A
+        tree="$(git write-tree)"
+
+        : > "${RUNNER_TEMP}/bot-changes"
+        while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+          read -r old_mode new_mode _ _ status <<< "${meta#:}"
+          if [ "${status}" != D ] && { [ "${new_mode}" != 100644 ] || { [ "${old_mode}" != 100644 ] && [ "${old_mode}" != 000000 ]; }; }; then
+            echo "::error::${path} changes to mode ${new_mode} (from ${old_mode}); createCommitOnBranch can only commit regular files."
+            exit 1
+          fi
+          printf '%s\0%s\0' "${status}" "${path}" >> "${RUNNER_TEMP}/bot-changes"
+        done < <(git diff --cached --no-renames --raw -z "${base}")
+
+        if gh api "repos/${repo}/git/ref/heads/${BRANCH}" --jq .object.sha > "${RUNNER_TEMP}/bot-ref" 2> "${RUNNER_TEMP}/bot-ref.err"; then
+          head="$(cat "${RUNNER_TEMP}/bot-ref")"
+        elif grep -q 'HTTP 404' "${RUNNER_TEMP}/bot-ref.err"; then
+          head=""
+        else
+          cat "${RUNNER_TEMP}/bot-ref.err" >&2
+          echo "::error::Could not look up ${BRANCH}."
+          exit 1
+        fi
+
+        committed=false
+        if [ -n "${head}" ] && [ "$(gh api "repos/${repo}/git/commits/${head}" --jq .tree.sha)" = "${tree}" ]; then
+          echo "${BRANCH} already holds this change."
+        else
+          scratch="${BRANCH}--bot-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}"
+          gh api "repos/${repo}/git/refs" -f ref="refs/heads/${scratch}" -f sha="${base}" > /dev/null
+          trap 'gh api --method DELETE "repos/${repo}/git/refs/heads/${scratch}" > /dev/null || true' EXIT
+          echo '[]' > "${RUNNER_TEMP}/bot-additions.json"
+          echo '[]' > "${RUNNER_TEMP}/bot-deletions.json"
+          while IFS= read -r -d '' status && IFS= read -r -d '' path; do
+            if [ "${status}" = D ]; then
+              jq -c --arg p "${path}" '. + [{path: $p}]' "${RUNNER_TEMP}/bot-deletions.json" > "${RUNNER_TEMP}/bot-next.json"
+              mv "${RUNNER_TEMP}/bot-next.json" "${RUNNER_TEMP}/bot-deletions.json"
+            else
+              git show ":${path}" | base64 -w0 > "${RUNNER_TEMP}/bot-blob"
+              jq -c --arg p "${path}" --rawfile c "${RUNNER_TEMP}/bot-blob" '. + [{path: $p, contents: $c}]' \
+                "${RUNNER_TEMP}/bot-additions.json" > "${RUNNER_TEMP}/bot-next.json"
+              mv "${RUNNER_TEMP}/bot-next.json" "${RUNNER_TEMP}/bot-additions.json"
+            fi
+          done < "${RUNNER_TEMP}/bot-changes"
+          # shellcheck disable=SC2016
+          jq -n --arg repo "${repo}" --arg branch "${scratch}" --arg base "${base}" --arg title "${TITLE}" \
+            --slurpfile additions "${RUNNER_TEMP}/bot-additions.json" \
+            --slurpfile deletions "${RUNNER_TEMP}/bot-deletions.json" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: {input: {
+                branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+                expectedHeadOid: $base,
+                message: {headline: $title},
+                fileChanges: {additions: $additions[0], deletions: $deletions[0]}
+              }}
+            }' > "${RUNNER_TEMP}/bot-commit.json"
+          commit="$(gh api graphql --input "${RUNNER_TEMP}/bot-commit.json" --jq .data.createCommitOnBranch.commit.oid)"
+          if [ -n "${head}" ]; then
+            gh api --method PATCH "repos/${repo}/git/refs/heads/${BRANCH}" -f sha="${commit}" -F force=true > /dev/null
+          else
+            gh api "repos/${repo}/git/refs" -f ref="refs/heads/${BRANCH}" -f sha="${commit}" > /dev/null
+          fi
+          head="${commit}"
+          committed=true
+          echo "Committed ${head} to ${BRANCH}."
+        fi
+
+        if [ -n "${number}" ] && [ "${committed}" = false ] && [ "${recorded}" = "${head}" ]; then
+          echo "#${number} is up to date."
+          exit 0
+        fi
+
+        {
+          cat "${BODY_PATH}"
+          echo
+          echo "<!-- bot-head: ${head} -->"
+        } > "${RUNNER_TEMP}/bot-pr-body.md"
+        if [ -n "${number}" ]; then
+          gh pr edit "${number}" --title "${TITLE}" --body-file "${RUNNER_TEMP}/bot-pr-body.md"
+        else
+          gh pr create --base main --head "${BRANCH}" --title "${TITLE}" --body-file "${RUNNER_TEMP}/bot-pr-body.md"
+          number="$(gh pr view "${BRANCH}" --json number --jq .number)"
+        fi
+
+        if [ "$(gh api "repos/${repo}/commits/${head}" --jq .commit.verification.verified)" != true ]; then
+          echo "::error::${head} on #${number} is not verified, so main's signed-commit rule would block the merge; auto-merge left off."
+          exit 1
+        fi
+        gh pr merge "${number}" --auto --squash

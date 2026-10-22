@@ -1,0 +1,80 @@
+name: Bump pins
+
+# Every week, moves the pinned nightly Rust (rust-toolchain.toml) and the aube
+# guest (tests/guests/programs/source-lock.json) to their latest releases with
+# scripts/bump-pins.py, and opens one pull request per pin as
+# aletheia-works-bot. Each pull request merges itself once ci-ok passes; if it
+# fails, fix the cause on its branch (or upstream, for a guest).
+
+on:
+  schedule:
+    # Monday 05:00 Asia/Tokyo, with Dependabot.
+    - cron: '0 20 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-pins
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump ${{ matrix.pin }}
+    if: github.repository_owner == 'aletheia-works' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        pin: [toolchain, aube]
+    steps:
+      - name: Get an aletheia-works-bot token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
+          check-latest: true
+
+      - name: Move the pin
+        id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PIN: ${{ matrix.pin }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/bump-pins.py --self-test
+          title="$(python3 -B scripts/bump-pins.py "${PIN}" --body "${RUNNER_TEMP}/body.md")"
+          if [ -z "${title}" ]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          cat "${RUNNER_TEMP}/body.md" >> "${GITHUB_STEP_SUMMARY}"
+          {
+            echo
+            echo "Opened by .github/workflows/bump-pins.yml; it merges itself once the required checks pass."
+            echo "Fix a failure on this branch; once the branch differs from what the bot last pushed, the weekly run leaves it alone."
+          } >> "${RUNNER_TEMP}/body.md"
+          echo "title=${title}" >> "${GITHUB_OUTPUT}"
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Open or update the pull request
+        if: steps.bump.outputs.changed == 'true'
+        uses: ./.github/actions/bot-pull-request
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: chore/bump-${{ matrix.pin }}
+          title: ${{ steps.bump.outputs.title }}
+          body-path: ${{ runner.temp }}/body.md

@@ -34,9 +34,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
       - uses: ./.github/actions/rust-toolchain
         with:
-          args: toolchain install nightly-2026-10-11 --profile minimal
+          args: toolchain install $RUST_TOOLCHAIN --profile minimal
       - shell: bash
-        run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl --toolchain nightly-2026-10-11
+        run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl --toolchain "$RUST_TOOLCHAIN"
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: cargo-deny
@@ -79,15 +79,15 @@ jobs:
       - run: chmod +x target/guests/programs/probe target/guests/programs/aube
       - uses: ./.github/actions/rust-toolchain
         with:
-          args: toolchain install nightly-2026-10-11 --profile minimal
+          args: toolchain install $RUST_TOOLCHAIN --profile minimal
       - name: Compile the harness before network isolation
         run: |
           programs_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          CARGO_HOME="$programs_cargo_home" cargo +nightly-2026-10-11 test --locked -p paludarium-harness --test diff_programs --no-run
+          CARGO_HOME="$programs_cargo_home" cargo +"$RUST_TOOLCHAIN" test --locked -p paludarium-harness --test diff_programs --no-run
       - name: Fresh native oracle then bounded differential without network
         run: |
-          programs_cargo="$(rustup which --toolchain nightly-2026-10-11 cargo)"
-          programs_rustc="$(rustup which --toolchain nightly-2026-10-11 rustc)"
+          programs_cargo="$(rustup which --toolchain "$RUST_TOOLCHAIN" cargo)"
+          programs_rustc="$(rustup which --toolchain "$RUST_TOOLCHAIN" rustc)"
           programs_bin="$(dirname "$programs_cargo")"
           programs_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           sudo unshare --net env GITHUB_SHA="$GITHUB_SHA" PATH="$programs_bin:$PATH" RUSTC="$programs_rustc" CARGO_HOME="$programs_cargo_home" "$programs_cargo" test --locked --offline -p paludarium-harness --test diff_programs -- --include-ignored --nocapture

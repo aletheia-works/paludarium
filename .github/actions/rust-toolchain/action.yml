@@ -1,23 +1,44 @@
 name: Rust toolchain
 description: >-
-  Use a job-local rustup home, then run rustup through scripts/rustup-retry.sh
-  (by default `toolchain install`: the toolchain of rust-toolchain.toml).
-  Runs after actions/checkout, which provides the script.
+  Use a job-local rustup home, export the toolchain pinned in
+  rust-toolchain.toml as RUST_TOOLCHAIN, then run rustup through
+  scripts/rustup-retry.sh (by default `toolchain install`: the toolchain of
+  rust-toolchain.toml). Runs after actions/checkout, which provides the scripts.
 
 inputs:
   args:
-    description: rustup arguments, split on whitespace.
+    description: >-
+      rustup arguments, split on whitespace. A literal $RUST_TOOLCHAIN names
+      the pinned toolchain, so workflows do not repeat the pin.
     required: false
     default: toolchain install
+  set-rustup-toolchain:
+    description: >-
+      Also export RUSTUP_TOOLCHAIN, so every later step of the job uses the
+      pinned toolchain without reading rust-toolchain.toml.
+    required: false
+    default: 'false'
 
 runs:
   using: composite
   steps:
-    - name: Use a job-local rustup home
+    - name: Use a job-local rustup home and name the pinned toolchain
       # GitHub-hosted runners sometimes ship a partially installed toolchain in
       # ~/.rustup, which makes rustup fail with "detected conflict".
       shell: bash
-      run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home" >> "$GITHUB_ENV"
+      env:
+        SET_RUSTUP_TOOLCHAIN: ${{ inputs.set-rustup-toolchain }}
+      run: |
+        set -euo pipefail
+        cd "$GITHUB_WORKSPACE"
+        toolchain=$(bash scripts/rust-toolchain.sh)
+        {
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home"
+          echo "RUST_TOOLCHAIN=$toolchain"
+          if [ "$SET_RUSTUP_TOOLCHAIN" = true ]; then
+            echo "RUSTUP_TOOLCHAIN=$toolchain"
+          fi
+        } >> "$GITHUB_ENV"
     - name: Run rustup, retried
       # static.rust-lang.org downloads sometimes fail on CI.
       shell: bash
@@ -28,5 +49,5 @@ runs:
         # $GITHUB_WORKSPACE, not github.workspace: inside a container job only the
         # environment variable names the container's path.
         cd "$GITHUB_WORKSPACE"
-        read -r -a args <<< "$RUSTUP_ARGS"
+        read -r -a args <<< "${RUSTUP_ARGS//\$RUST_TOOLCHAIN/$RUST_TOOLCHAIN}"
         bash scripts/rustup-retry.sh "${args[@]}"

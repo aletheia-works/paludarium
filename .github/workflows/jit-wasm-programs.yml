@@ -19,9 +19,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
       - uses: ./.github/actions/rust-toolchain
         with:
-          args: toolchain install nightly-2026-10-11 --profile minimal --component rust-src
+          args: toolchain install $RUST_TOOLCHAIN --profile minimal --component rust-src
       - shell: bash
-        run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl wasm32-unknown-unknown --toolchain nightly-2026-10-11
+        run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl wasm32-unknown-unknown --toolchain "$RUST_TOOLCHAIN"
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: cargo-deny
@@ -100,7 +100,7 @@ jobs:
         run: sudo safaridriver --enable
       - name: Project Rust source for strict control module
         if: matrix.environment == 'node'
-        run: bash scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal --component rust-src
+        run: bash scripts/rustup-retry.sh toolchain install "$(bash scripts/rust-toolchain.sh)" --profile minimal --component rust-src
       - name: Fresh same-source control for existing Node boundary entry
         if: matrix.environment == 'node'
         run: python3 -B scripts/build-jit-cost-profile.py --kind acceptance-control --baseline-head "${{ github.sha }}"

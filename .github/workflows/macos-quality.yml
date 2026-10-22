@@ -46,7 +46,7 @@ jobs:
         run: python3 -m coverage run --data-file=target/macos-python.coverage --include='tests/guests/macos/settings.py,tests/guests/macos/oracle.py,tests/guests/macos/host_comparison.py' -m unittest discover -s tests/guests/macos/runner-tests -p 'test_*.py'
       - uses: ./.github/actions/rust-toolchain
         with:
-          args: toolchain install nightly-2026-10-11 --profile minimal --component llvm-tools-preview
+          args: toolchain install $RUST_TOOLCHAIN --profile minimal --component llvm-tools-preview
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           install_args: aqua:taiki-e/cargo-llvm-cov

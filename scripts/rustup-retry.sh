@@ -9,9 +9,12 @@
 # retry starts clean. `rustup toolchain install` without a name installs the
 # toolchain of rust-toolchain.toml in the current directory.
 #
-#   scripts/rustup-retry.sh toolchain install nightly-2026-10-11 --profile minimal
+#   scripts/rustup-retry.sh toolchain install "$RUST_TOOLCHAIN" --profile minimal
 #   scripts/rustup-retry.sh toolchain install
-#   scripts/rustup-retry.sh target add wasm32-unknown-unknown --toolchain nightly-2026-10-11
+#   scripts/rustup-retry.sh target add wasm32-unknown-unknown --toolchain "$RUST_TOOLCHAIN"
+#
+# RUST_TOOLCHAIN is the pinned toolchain (scripts/rust-toolchain.sh), which
+# the rust-toolchain action exports.
 #
 # RUSTUP_RETRY_ATTEMPTS (default 3) and RUSTUP_RETRY_DELAY (seconds, default
 # 15, multiplied by the attempt number) tune the retries.
@@ -35,7 +38,7 @@ if [ "${1:-}" = toolchain ] && [ "${2:-}" = install ]; then
     esac
   done
   if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
-    toolchain=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)
+    toolchain=$(bash "$(dirname "${BASH_SOURCE[0]}")/rust-toolchain.sh")
   fi
 fi
 

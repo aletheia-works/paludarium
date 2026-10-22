@@ -107,7 +107,7 @@ jobs:
           node-version: 'latest'
       - uses: ./.github/actions/rust-toolchain
         with:
-          args: component add rust-src --toolchain nightly-2026-10-11
+          args: component add rust-src --toolchain $RUST_TOOLCHAIN
       - name: Generate and execute fresh native fixtures
         run: |
           mkdir -p target/production-wasm-evidence
@@ -173,6 +173,8 @@ jobs:
       - name: rustup retry script tests
         shell: bash
         run: bash scripts/rustup-retry.test.sh
+      - name: pin bump script tests
+        run: python3 -B scripts/bump-pins.py --self-test
       - name: rustfmt
         run: |
           cargo fmt --all --check

@@ -29,7 +29,9 @@ In PowerShell quote revision expressions containing `@`, such as `jj log -r '@'`
 Resolve mise-managed executables from their installation directories rather than
 using `mise exec` or shims; declared tasks still use `mise run <task>`.
 
-The Rust toolchain is the nightly pinned in `rust-toolchain.toml`. Do not copy
+The Rust toolchain is the nightly pinned in `rust-toolchain.toml`; a weekly
+pull request moves it to the latest nightly, so do not write its date into
+workflows (use `$RUST_TOOLCHAIN`). Do not copy
 code from other projects (including jart/blink); use them only as references for
 behavior and design. New dependencies must come from crates.io and have
 licenses compatible with Apache-2.0 (`cargo deny` checks this).

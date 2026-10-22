@@ -6,16 +6,24 @@ import struct
 
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 # The guest binaries every build produces.
-GUESTS = ("probe", "aube", "ripgrep")
-# Guest-only license exceptions for the fixed aube source. Each crate's full
+GUESTS = ("probe", "aube", "ripgrep", "coreutils")
+# Guest-only license exceptions, approved per guest. Each crate's full
 # license text is retained from its crates.io package: (file, required text).
 LICENSE_EXCEPTIONS = [
     {"crate": "webpki-root-certs@1.0.10", "allow": ["CDLA-Permissive-2.0"]},
     {"crate": "option-ext@0.2.0", "allow": ["MPL-2.0"]},
 ]
+COREUTILS_LICENSE_EXCEPTIONS = [
+    {"crate": "notify@8.2.0", "allow": ["CC0-1.0"]},
+    {"crate": "tiny-keccak@2.0.2", "allow": ["CC0-1.0"]},
+]
+APPROVED_EXCEPTIONS = {"aube": LICENSE_EXCEPTIONS, "coreutils": COREUTILS_LICENSE_EXCEPTIONS}
+CC0_TEXT = (b"CC0 1.0 Universal", b"Statement of Purpose")
 LICENSE_TEXTS = {
     "webpki-root-certs@1.0.10": ("LICENSE", (b"Community Data License Agreement", b"2.1.")),
     "option-ext@0.2.0": ("LICENSE.txt", (b"Mozilla Public License Version 2.0",)),
+    "notify@8.2.0": ("LICENSE-CC0", CC0_TEXT),
+    "tiny-keccak@2.0.2": ("LICENSE", CC0_TEXT),
 }
 LICENSE_SUFFIX = (
     b'\n[[licenses.exceptions]]\ncrate = "webpki-root-certs@1.0.10"\nallow = ["CDLA-Permissive-2.0"]\n'
@@ -23,10 +31,18 @@ LICENSE_SUFFIX = (
 )
 
 
-def guest_policy(root_bytes, exceptions):
-    if exceptions != LICENSE_EXCEPTIONS:
+def exception_suffix(exceptions):
+    """The cargo-deny exception tables appended to the root policy."""
+    return b"".join(
+        f'\n[[licenses.exceptions]]\ncrate = "{e["crate"]}"\nallow = ["{e["allow"][0]}"]\n'.encode()
+        for e in exceptions
+    )
+
+
+def guest_policy(root_bytes, exceptions, guest="aube"):
+    if exceptions != APPROVED_EXCEPTIONS[guest]:
         raise ValueError("unapproved guest license exception")
-    return root_bytes + LICENSE_SUFFIX
+    return root_bytes + exception_suffix(exceptions)
 
 
 def license_file_name(exception):
@@ -34,26 +50,31 @@ def license_file_name(exception):
     return f"{name}-{version}-{exception['allow'][0]}.txt"
 
 
-def policy_receipt_valid(directory, receipt, root_bytes):
-    policy = receipt["license_policy"]
-    if policy["exceptions"] != LICENSE_EXCEPTIONS:
+def guest_policy_valid(directory, policy, root_bytes, guest):
+    approved = APPROVED_EXCEPTIONS[guest]
+    if policy["exceptions"] != approved:
         raise ValueError("unapproved guest license exception")
     if hashlib.sha256(root_bytes).hexdigest() != policy["root_config_sha256"]:
         raise ValueError("root policy changed")
-    config = directory / "aube-deny.toml"
-    if config.read_bytes() != guest_policy(root_bytes, policy["exceptions"]):
+    config = directory / f"{guest}-deny.toml"
+    if config.read_bytes() != guest_policy(root_bytes, policy["exceptions"], guest):
         raise ValueError("guest config does not inherit exact root policy")
     if digest(config) != policy["guest_config_sha256"]:
         raise ValueError("guest config hash differs")
-    if set(policy["licenses"]) != {e["crate"] for e in LICENSE_EXCEPTIONS}:
+    if set(policy["licenses"]) != {e["crate"] for e in approved}:
         raise ValueError("license text set differs")
-    for exception in LICENSE_EXCEPTIONS:
+    for exception in approved:
         retained = policy["licenses"][exception["crate"]]
         if digest(directory / "licenses" / license_file_name(exception)) != retained["sha256"]:
             raise ValueError("license text hash differs")
         if retained["source"] != REGISTRY:
             raise ValueError("license exception crate is not from crates.io")
-    if receipt["audits"] != {"probe": 0, "aube": 0, "ripgrep": 0}:
+
+
+def policy_receipt_valid(directory, receipt, root_bytes):
+    guest_policy_valid(directory, receipt["license_policy"], root_bytes, "aube")
+    guest_policy_valid(directory, receipt["coreutils_license_policy"], root_bytes, "coreutils")
+    if receipt["audits"] != dict.fromkeys(GUESTS, 0):
         raise ValueError("full guest dependency audits did not pass")
 
 

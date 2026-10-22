@@ -43,10 +43,12 @@ jobs:
             target/guests/programs/probe
             target/guests/programs/aube
             target/guests/programs/ripgrep
+            target/guests/programs/coreutils
             target/guests/programs/build-receipt.json
             target/guests/programs/*-build.log
             target/guests/programs/*-dependencies.log
             target/guests/programs/aube-deny.toml
+            target/guests/programs/coreutils-deny.toml
             target/guests/programs/licenses/
             target/wasm/native/
             packages/paludarium-wasm/paludarium.wasm

@@ -4,6 +4,7 @@
   "target": "x86_64-unknown-linux-musl",
   "aube": {"repository": "https://github.com/aubepkg/aube", "tag": "v2.8.1", "revision": "963d9b8202ced528d5eb3f72254b896ecf9d10f9", "lock_sha256": "1693a9796c7dea6e720e5798e3f5b98d8bb42d4c1c2682124e84eac20c5d0e5d", "primer": "empty file, outside unmodified source tree"},
   "ripgrep": {"repository": "https://github.com/BurntSushi/ripgrep", "tag": "15.2.0", "revision": "e89fff89ac9af12e8d4ce9d5fd07beb408ca730f", "lock_sha256": "7a7d39cda8a03930e578f1dbb724e055771901842eca239e03b01e19da946a64"},
+  "coreutils": {"repository": "https://github.com/uutils/coreutils", "tag": "0.12.0", "revision": "dc1efd89948a9ca4c78c3a4b9a6ac891019a8c69", "lock_sha256": "6790c6ec1c5ad667357f7ba83e2d2bf641289adf2ea066b675b034ed37fca526", "features": ["feat_os_unix_musl"], "license_exceptions": [{"crate": "notify@8.2.0", "allow": ["CC0-1.0"]}, {"crate": "tiny-keccak@2.0.2", "allow": ["CC0-1.0"]}]},
   "guest_license_exceptions": [
     {"crate": "webpki-root-certs@1.0.10", "allow": ["CDLA-Permissive-2.0"]},
     {"crate": "option-ext@0.2.0", "allow": ["MPL-2.0"]}

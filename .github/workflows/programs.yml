@@ -59,10 +59,12 @@ jobs:
             target/guests/programs/*-build.log
             target/guests/programs/*-dependencies.log
             target/guests/programs/aube-deny.toml
+            target/guests/programs/coreutils-deny.toml
             target/guests/programs/licenses/
             target/guests/programs/probe
             target/guests/programs/aube
             target/guests/programs/ripgrep
+            target/guests/programs/coreutils
             target/programs/native/
           retention-days: 7
   differential:
@@ -77,7 +79,7 @@ jobs:
         with:
           name: programs-native-first
           path: target
-      - run: chmod +x target/guests/programs/probe target/guests/programs/aube target/guests/programs/ripgrep
+      - run: chmod +x target/guests/programs/probe target/guests/programs/aube target/guests/programs/ripgrep target/guests/programs/coreutils
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install $RUST_TOOLCHAIN --profile minimal

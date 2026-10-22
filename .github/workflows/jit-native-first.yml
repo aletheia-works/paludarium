@@ -88,10 +88,12 @@ jobs:
             target/guests/programs/*-build.log
             target/guests/programs/*-dependencies.log
             target/guests/programs/aube-deny.toml
+            target/guests/programs/coreutils-deny.toml
             target/guests/programs/licenses/
             target/guests/programs/probe
             target/guests/programs/aube
             target/guests/programs/ripgrep
+            target/guests/programs/coreutils
           retention-days: 14
 
   instruction-native:

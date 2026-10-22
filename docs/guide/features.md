@@ -116,3 +116,9 @@ Windows, and on Node.js, Chromium, Firefox and Safari.
   status as on real Linux. This is checked on x86-64 Linux only so far.
   `--version` is not compared, because it reports the SIMD features `CPUID`
   shows, which paludarium limits on purpose.
+- **coreutils** (0.12.0): [uutils coreutils](https://github.com/uutils/coreutils),
+  the Rust rewrite of the GNU core utilities. 69 commands, from `sort`,
+  `sha256sum` and `date` to `chmod`, `touch -d`, `cp -r`, `mv`, `split` and
+  `dd`, run in order on one directory and give the same output, exit status
+  and resulting files as on real Linux. Also checked on x86-64 Linux only so
+  far.

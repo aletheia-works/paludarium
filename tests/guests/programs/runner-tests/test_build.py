@@ -26,6 +26,8 @@ LICENSE_FIXTURES = {
         "Community Data License Agreement full fixture 2.1.",
     ),
     "option-ext": ("MPL-2.0", "LICENSE.txt", "Mozilla Public License Version 2.0 full fixture"),
+    "notify": ("CC0-1.0", "LICENSE-CC0", "CC0 1.0 Universal fixture Statement of Purpose"),
+    "tiny-keccak": ("CC0-1.0", "LICENSE", "CC0 1.0 Universal fixture Statement of Purpose"),
 }
 
 
@@ -57,8 +59,19 @@ class BuildIntegration(unittest.TestCase):
         self.lock["ripgrep"] = dict(
             self.lock["ripgrep"], lock_sha256=evidence.digest(self.ripgrep / "Cargo.lock")
         )
+        self.coreutils = self.directory / "source/coreutils"
+        self.coreutils.mkdir(parents=True)
+        (self.coreutils / "Cargo.lock").write_text("version = 4 # coreutils\n")
+        (self.coreutils / "Cargo.toml").write_text('[package]\nname="coreutils"\nversion="1.0.0"\n')
+        self.lock["coreutils"] = dict(
+            self.lock["coreutils"], lock_sha256=evidence.digest(self.coreutils / "Cargo.lock")
+        )
         self.metadata = {"packages": []}
-        for exception in self.lock["guest_license_exceptions"]:
+        exceptions = [
+            *self.lock["guest_license_exceptions"],
+            *self.lock["coreutils"]["license_exceptions"],
+        ]
+        for exception in exceptions:
             name, version = exception["crate"].split("@")
             license, file_name, text = LICENSE_FIXTURES[name]
             package = self.directory / "registry" / f"{name}-{version}"
@@ -84,7 +97,7 @@ class BuildIntegration(unittest.TestCase):
             if failure and failure in str(log):
                 raise subprocess.CalledProcessError(1, args)
             if "build" in args:
-                outputs = {"aube": "aube", "ripgrep": "rg"}
+                outputs = {"aube": "aube", "ripgrep": "rg", "coreutils": "coreutils"}
                 name = next((n for n in outputs if n in args), "probe")
                 output = outputs.get(name, "paludarium-probe")
                 binary = (
@@ -138,11 +151,28 @@ class BuildIntegration(unittest.TestCase):
         ripgrep_commands = [args for args in commands if str(self.ripgrep / "Cargo.toml") in args]
         self.assertEqual(len(ripgrep_commands), 2)
         self.assertIn(str(HERE.parents[2] / "deny.toml"), ripgrep_commands[0])
-        self.assertEqual(receipt["audits"], {"probe": 0, "aube": 0, "ripgrep": 0})
+        self.assertEqual(receipt["audits"], {"probe": 0, "aube": 0, "ripgrep": 0, "coreutils": 0})
         self.assertEqual(receipt["ripgrep_source_before"], evidence.snapshot(self.ripgrep))
+        coreutils_commands = [
+            args for args in commands if str(self.coreutils / "Cargo.toml") in args
+        ]
+        self.assertEqual(len(coreutils_commands), 2)
+        for args in coreutils_commands:
+            self.assertIn("--no-default-features", args)
+            self.assertEqual(args[args.index("--features") + 1], "feat_os_unix_musl")
+        self.assertIn(str(self.directory / "coreutils-deny.toml"), coreutils_commands[0])
+        self.assertEqual(
+            sorted(receipt["coreutils_license_policy"]["licenses"]),
+            ["notify@8.2.0", "tiny-keccak@2.0.2"],
+        )
+        self.assertEqual(
+            (self.directory / "coreutils-deny.toml").read_bytes(),
+            (HERE.parents[2] / "deny.toml").read_bytes()
+            + evidence.exception_suffix(evidence.COREUTILS_LICENSE_EXCEPTIONS),
+        )
         # Every audit runs before any guest is compiled.
         kinds = ["deny" if "deny" in args else "build" for args in commands[1:]]
-        self.assertEqual(kinds, ["deny"] * 3 + ["build"] * 3)
+        self.assertEqual(kinds, ["deny"] * 4 + ["build"] * 4)
 
     def test_no_advisory_exception_is_added(self):
         self.run_build()
@@ -187,7 +217,7 @@ class BuildIntegration(unittest.TestCase):
             self.run_build()
 
     def test_lock_digest_mismatch_rejected(self):
-        for name in ("aube", "ripgrep"):
+        for name in ("aube", "ripgrep", "coreutils"):
             with self.subTest(name=name):
                 self.setUp()
                 self.lock[name]["lock_sha256"] = "0" * 64

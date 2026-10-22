@@ -10,6 +10,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from evidence import (
+    COREUTILS_LICENSE_EXCEPTIONS,
     LICENSE_EXCEPTIONS,
     LICENSE_SUFFIX,
     REGISTRY,
@@ -72,13 +73,31 @@ class PolicyTests(unittest.TestCase):
                 license_file = directory / "licenses" / license_file_name(exception)
                 license_file.write_bytes(b"complete test license fixture\n")
                 licenses[exception["crate"]] = {"source": REGISTRY, "sha256": digest(license_file)}
+            coreutils_config = directory / "coreutils-deny.toml"
+            coreutils_config.write_bytes(
+                guest_policy(root, COREUTILS_LICENSE_EXCEPTIONS, "coreutils")
+            )
+            coreutils_licenses = {}
+            for exception in COREUTILS_LICENSE_EXCEPTIONS:
+                license_file = directory / "licenses" / license_file_name(exception)
+                license_file.write_bytes(b"complete test license fixture\n")
+                coreutils_licenses[exception["crate"]] = {
+                    "source": REGISTRY,
+                    "sha256": digest(license_file),
+                }
             receipt = {
-                "audits": {"probe": 0, "aube": 0, "ripgrep": 0},
+                "audits": {"probe": 0, "aube": 0, "ripgrep": 0, "coreutils": 0},
                 "license_policy": {
                     "exceptions": copy.deepcopy(LICENSE_EXCEPTIONS),
                     "root_config_sha256": hashlib.sha256(root).hexdigest(),
                     "guest_config_sha256": digest(config),
                     "licenses": licenses,
+                },
+                "coreutils_license_policy": {
+                    "exceptions": copy.deepcopy(COREUTILS_LICENSE_EXCEPTIONS),
+                    "root_config_sha256": hashlib.sha256(root).hexdigest(),
+                    "guest_config_sha256": digest(coreutils_config),
+                    "licenses": coreutils_licenses,
                 },
             }
             policy_receipt_valid(directory, receipt, root)
@@ -111,6 +130,18 @@ class PolicyTests(unittest.TestCase):
             receipt["license_policy"]["exceptions"] = copy.deepcopy(LICENSE_EXCEPTIONS)
             policy_receipt_valid(directory, receipt, root)
             receipt["audits"]["aube"] = 4
+            with self.assertRaises(ValueError):
+                policy_receipt_valid(directory, receipt, root)
+            receipt["audits"]["aube"] = 0
+            policy_receipt_valid(directory, receipt, root)
+            # The coreutils exceptions are checked on their own.
+            receipt["coreutils_license_policy"]["exceptions"] = LICENSE_EXCEPTIONS
+            with self.assertRaises(ValueError):
+                policy_receipt_valid(directory, receipt, root)
+            receipt["coreutils_license_policy"]["exceptions"] = copy.deepcopy(
+                COREUTILS_LICENSE_EXCEPTIONS
+            )
+            coreutils_config.write_bytes(guest_policy(root, LICENSE_EXCEPTIONS))
             with self.assertRaises(ValueError):
                 policy_receipt_valid(directory, receipt, root)
 

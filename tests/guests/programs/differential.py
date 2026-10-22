@@ -18,7 +18,16 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 
 
-def operation(executable, binary, args, directory, environment, fixture=None, mounted=False):
+def operation(
+    executable,
+    binary,
+    args,
+    directory,
+    environment,
+    fixture=None,
+    mounted=False,
+    aube_inputs=True,
+):
     directory.mkdir(parents=True)
     (directory / "args").write_text("\n".join(args) + ("\n" if args else ""))
     (directory / "environment").write_text(
@@ -53,7 +62,9 @@ def operation(executable, binary, args, directory, environment, fixture=None, mo
         "wall_seconds": float((directory / "seconds").read_text()),
         "stop": (directory / "stop").read_text(),
     }
-    if fixture is not None:
+    if fixture is not None and not aube_inputs:
+        row["filesystem"] = snapshot(fixture)
+    elif fixture is not None:
         row["filesystem"] = snapshot(fixture)
         recorded = (directory / "fixture-modes").read_text()
         row["fixture_input_modes"] = (
@@ -64,6 +75,59 @@ def operation(executable, binary, args, directory, environment, fixture=None, mo
         if not mounted and row["fixture_input_modes"] != fixture_inputs(fixture):
             raise ValueError("private VFS fixture metadata differs from native input")
     return row
+
+
+# What a root mount adds to the emulated app directory: the program and the
+# /tmp and /home the harness places.
+EMULATED_ONLY = ("program", "tmp/", "home/")
+
+
+def compare_coreutils(executable, guests, operations, config, native, scratch, observations):
+    """coreutils' commands in order on one mounted copy, as natively."""
+    expected = native["coreutils"]
+    if expected["binary_sha256"] != digest(guests / "coreutils"):
+        raise ValueError("native coreutils observed different bytes")
+    fixture = scratch / "coreutils-fixture"
+    shutil.copytree(HERE / "coreutils-fixture", fixture)
+    (fixture / "app/tmp").mkdir()
+    (fixture / "app/home/guest").mkdir(parents=True)
+    cases = json.loads((HERE / "coreutils-cases.json").read_text())["cases"]
+    rows = []
+    for index, (case, native_row) in enumerate(zip(cases, expected["rows"], strict=True)):
+        name = f"coreutils-{index:02d}-{case[0]}"
+        row = operation(
+            executable,
+            guests / "coreutils",
+            case,
+            operations / name,
+            config["environment"],
+            fixture,
+            mounted=True,
+            aube_inputs=False,
+        )
+        rows.append(row)
+        fields = ("exit", "timed_out", "stdout", "stderr")
+        print(
+            json.dumps(
+                {
+                    "case": name,
+                    "native": {k: native_row[k] for k in fields},
+                    "emulated": {k: row[k] for k in fields},
+                }
+            ),
+            flush=True,
+        )
+        for field in fields:
+            if native_row[field] != row[field]:
+                raise ValueError(f"{name}: {field} mismatch")
+    files = {
+        path: hash
+        for path, hash in snapshot(fixture / "app").items()
+        if not path.startswith(EMULATED_ONLY)
+    }
+    observations["coreutils"] = {"rows": rows, "filesystem": files}
+    if files != expected["filesystem"]:
+        raise ValueError("coreutils left different files")
 
 
 def differential(executable, *, original_argv=False):
@@ -163,6 +227,8 @@ def differential(executable, *, original_argv=False):
             for field in ("timed_out", "exit", "stdout", "stderr"):
                 if expected[field] != row[field]:
                     raise ValueError(f"{name}: {field} mismatch")
+        compare_coreutils(executable, guests, operations, config, native, scratch, observations)
+        (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
         for case in config["aube"][:2]:
             name = "default-" + case["name"]
             row = operation(
@@ -208,8 +274,8 @@ def differential(executable, *, original_argv=False):
         observations["differential_complete"] = True
         (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
     print(
-        "fixed guest programs differential: eight probe items, four aube commands"
-        " and the ripgrep searches passed"
+        "fixed guest programs differential: eight probe items, four aube commands,"
+        " the ripgrep searches and the coreutils commands passed"
     )
 
 

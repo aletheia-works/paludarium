@@ -28,7 +28,11 @@ SOURCE_LOCK = "tests/guests/programs/source-lock.json"
 FEATURE_PAGES = ("docs/guide/features.md", "docs/ja/guide/features.md")
 DIST = "https://static.rust-lang.org/dist"
 # The guests built from a fixed release: their GitHub repositories.
-GUESTS = {"aube": "aubepkg/aube", "ripgrep": "BurntSushi/ripgrep"}
+GUESTS = {
+    "aube": "aubepkg/aube",
+    "ripgrep": "BurntSushi/ripgrep",
+    "coreutils": "uutils/coreutils",
+}
 # The hosts CI and contributors build on; each needs the whole toolchain.
 HOSTS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc")
 # A nightly with a missing component is skipped; give up after this many days.

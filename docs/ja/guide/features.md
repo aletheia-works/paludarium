@@ -109,3 +109,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux と同じ出力と終了コードになります。今のところ確かめているのは x86-64 Linux だけです。
   `--version` は比べていません。`CPUID` が見せる SIMD の機能を表示するためで、
   paludarium はそれをわざと絞っています。
+- **coreutils**（0.12.0）：GNU の基本的なコマンドを Rust で書き直した
+  [uutils coreutils](https://github.com/uutils/coreutils)。`sort`・`sha256sum`・
+  `date` から `chmod`・`touch -d`・`cp -r`・`mv`・`split`・`dd` まで、69 のコマンドを
+  1 つのディレクトリで順に動かし、本物の Linux と同じ出力、終了コード、残るファイルに
+  なります。これも今のところ確かめているのは x86-64 Linux だけです。

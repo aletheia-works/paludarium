@@ -27,6 +27,23 @@ def observe_ripgrep(guests, app, env):
     return {"binary_sha256": digest(guests / "ripgrep"), "rows": rows}
 
 
+def observe_coreutils(guests, root, env):
+    """coreutils' commands in order in one copy of their fixture."""
+    shutil.copytree(HERE / "coreutils-fixture", root / "coreutils")
+    app = root / "coreutils/app"
+    rows = []
+    for case in json.loads((HERE / "coreutils-cases.json").read_text())["cases"]:
+        row = run([str(guests / "coreutils"), *case], cwd=app, env=env)
+        if row["timed_out"]:
+            raise ValueError("native coreutils timed out: " + " ".join(case))
+        rows.append(row)
+    return {
+        "binary_sha256": digest(guests / "coreutils"),
+        "rows": rows,
+        "filesystem": snapshot(app),
+    }
+
+
 def observe(guests, output, config, *, extra_snapshot=None, prepare_fixture=None):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise RuntimeError("native oracle requires x86-64 Linux")
@@ -68,6 +85,7 @@ def observe(guests, output, config, *, extra_snapshot=None, prepare_fixture=None
         app = root / "fixture/app"
         observations["fixture_input_modes"] = fixture_inputs(root / "fixture")
         observations["ripgrep"] = observe_ripgrep(guests, app, env)
+        observations["coreutils"] = observe_coreutils(guests, root, env)
         (output / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
         for case in config["aube"]:
             if case.get("before") == "remove-node-modules":

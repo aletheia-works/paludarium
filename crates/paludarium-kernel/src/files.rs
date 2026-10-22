@@ -22,7 +22,7 @@ pub struct Files {
     pub(crate) readiness: Arc<crate::events::ReadinessHub>,
     pub terminal_size: Option<(u16, u16)>,
     pub fs: Arc<dyn FileSystem>,
-    fds: Arc<Mutex<BTreeMap<u32, Descriptor>>>,
+    pub(crate) fds: Arc<Mutex<BTreeMap<u32, Descriptor>>>,
     cwd: Arc<Mutex<Vec<u8>>>,
     /// Shared with the cwd: `CLONE_FS` shares both, as on Linux.
     umask: Arc<AtomicU32>,
@@ -55,7 +55,7 @@ impl Files {
         // shared by live CLONE_FILES siblings.
         self.fds = Arc::new(Mutex::new(BTreeMap::new()));
     }
-    fn umask(&self) -> u32 {
+    pub(crate) fn umask(&self) -> u32 {
         self.umask.load(Ordering::SeqCst)
     }
     pub(crate) fn exec_path(&self, path: Vec<u8>) -> Result<Vec<u8>, Errno> {
@@ -213,10 +213,9 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
         c.files.descriptor(dir)?.file.stat()?
     } else {
         let p = c.files.path(dir, raw)?;
-        if let Some(mountinfo) = crate::proc::mount_table(&p) {
-            crate::proc::stat(crate::proc::render(&c.files.fs.mounts(), mountinfo).len())
-        } else {
-            c.files.fs.metadata(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?
+        match generated_stat(c, &p) {
+            Some(stat) => stat,
+            None => c.files.fs.metadata(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?,
         }
     };
     let directory = stat.mode & 0o170000 == 0o040000;
@@ -556,6 +555,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else if let Some(mountinfo) = crate::proc::mount_table(&p) {
                 let content = crate::proc::render(&c.files.fs.mounts(), mountinfo);
                 Arc::new(crate::proc::GeneratedFile::open(content, flags))
+            } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
+                match entry {
+                    crate::proc::OwnEntry::Directory => Arc::new(crate::proc::OwnDirectory),
+                    crate::proc::OwnEntry::Status => {
+                        Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
+                    }
+                }
             } else {
                 c.files
                     .fs
@@ -595,9 +601,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 (at(c, (-100i32) as u64, a[0])?, a[1], n == 4)
             };
-            if let Some(mountinfo) = crate::proc::mount_table(&p) {
-                let length = crate::proc::render(&c.files.fs.mounts(), mountinfo).len();
-                return stat(c, out, crate::proc::stat(length), &p);
+            if let Some(generated) = generated_stat(c, &p) {
+                return stat(c, out, generated, &p);
             }
             stat(c, out, c.files.fs.metadata(&p, follow)?, &p)
         }
@@ -822,7 +827,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if len == 0 {
                 return Err(Errno::EINVAL);
             }
-            let b = c.files.fs.readlink(&p)?;
+            // `/proc/self` is a link to this process's directory.
+            let b = if p == b"/proc/self" {
+                c.process.pid.to_string().into_bytes()
+            } else {
+                c.files.fs.readlink(&p)?
+            };
             let count = b
                 .len()
                 .min(usize::try_from(len).map_err(|_| Errno::EINVAL)?);
@@ -1077,4 +1087,61 @@ mod files_tests {
         x.file.read(&mut b).unwrap();
         assert_eq!(y.file.seek(0, 1), Ok(1));
     }
+}
+
+/// The `stat` of a generated /proc path, or `None` for any other path.
+fn generated_stat(c: &Context<'_>, path: &[u8]) -> Option<FileStat> {
+    if let Some(mountinfo) = crate::proc::mount_table(path) {
+        return Some(crate::proc::stat(
+            crate::proc::render(&c.files.fs.mounts(), mountinfo).len(),
+        ));
+    }
+    Some(match crate::proc::own_entry(path, c.process.pid)? {
+        crate::proc::OwnEntry::Directory => crate::proc::directory_stat(),
+        crate::proc::OwnEntry::Status => crate::proc::stat(status(c).len()),
+    })
+}
+
+/// This process's `/proc/self/status`.
+fn status(c: &Context<'_>) -> Vec<u8> {
+    let (parent, queue_limit, no_new_privs) = c.processes.status_of(c.process.pid);
+    let mask = |numbers: &mut dyn Iterator<Item = i32>| {
+        numbers
+            .filter(|n| (1..=64).contains(n))
+            .fold(0u64, |mask, n| mask | 1 << (n - 1))
+    };
+    let actions = &c.process.signal_actions;
+    let descriptors = c
+        .files
+        .fds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .keys()
+        .next_back()
+        .map_or(0, |&fd| fd as usize + 1);
+    crate::proc::render_status(&crate::proc::Status {
+        name: &c.process.name,
+        umask: c.files.umask(),
+        pid: c.process.pid,
+        parent,
+        descriptors,
+        threads: c.group.active_threads(),
+        queued: c.process.pending.len(),
+        queue_limit,
+        pending: mask(&mut c.process.pending.iter().map(|s| s.number)),
+        blocked: c.process.signal_mask,
+        ignored: mask(
+            &mut actions
+                .iter()
+                .filter(|(_, a)| a.handler == 1)
+                .map(|(&n, _)| n),
+        ),
+        caught: mask(
+            &mut actions
+                .iter()
+                .filter(|(_, a)| a.handler > 1)
+                .map(|(&n, _)| n),
+        ),
+        no_new_privs,
+    })
 }

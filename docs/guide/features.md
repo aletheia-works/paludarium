@@ -33,7 +33,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
-| System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups` |
+| System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait` |
 | Time | `clock_gettime`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`, `read`, `write`, `writev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
@@ -79,9 +79,17 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   space and inodes are what it holds, and a mounted host directory with the
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts (`tmpfs` for the root, `hostfs` for each
-  `--mount`, without host paths); they are the only `/proc` files. Each mount
-  has its own `st_dev`, as its line in `mountinfo` says, so `df` lists every
-  mount.
+  `--mount`, without host paths). Each mount has its own `st_dev`, as its
+  line in `mountinfo` says, so `df` lists every mount.
+- The only other `/proc` entries are this process's own: `/proc/self` (also
+  as `/proc/<pid>`), a directory that `readlink` resolves to the PID and that
+  its entries can be opened relative to, and `/proc/self/status`. That file
+  has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
+  capabilities and so on) without the memory and CPU ones, which nothing
+  measures.
+- `getrusage` reports all zeros for the process, its children and the
+  thread, as do the rusage of `wait4` and `waitid`: no CPU time or memory
+  use is measured yet.
 - As root, `access` allows reading and writing, and executing when the file
   has an execute bit or is a directory; `getgroups` returns no groups.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without

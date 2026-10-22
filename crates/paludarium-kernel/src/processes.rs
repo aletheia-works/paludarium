@@ -183,6 +183,14 @@ impl Processes {
         }
         Ok(old)
     }
+    /// What `/proc/self/status` shows of `pid`: its parent, its
+    /// RLIMIT_SIGPENDING soft limit and PR_SET_NO_NEW_PRIVS.
+    pub(crate) fn status_of(&self, pid: u32) -> (u32, u64, bool) {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.get(&pid).map_or((0, 4096, false), |entry| {
+            (entry.parent, entry.limits[11].0, entry.no_new_privs)
+        })
+    }
     fn parent(&self, pid: u32) -> u32 {
         self.entries
             .lock()

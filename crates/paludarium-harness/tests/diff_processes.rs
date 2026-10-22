@@ -116,6 +116,7 @@ mod linux {
         processes_posix_timer => ("posix-timer","process"),
         processes_prctl => ("prctl","process"),
         processes_pdeathsig => ("pdeathsig","process"),
+        processes_proc_status => ("proc-status","process"),
         processes_waitid => ("waitid","process"),
         processes_thread_name => ("thread-name","process"),
         processes_timer_thread => ("timer-thread","process"),

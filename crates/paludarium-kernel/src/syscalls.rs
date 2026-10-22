@@ -41,6 +41,7 @@ pub mod nr {
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const EXIT_GROUP: u64 = 231;
     pub const MREMAP: u64 = 25;
+    pub const GETRUSAGE: u64 = 98;
     pub const MSYNC: u64 = 26;
     pub const MADVISE: u64 = 28;
     pub const UNAME: u64 = 63;
@@ -69,6 +70,7 @@ pub(crate) struct Context<'a> {
     pub cancellation: &'a std::sync::atomic::AtomicBool,
     pub inbox: &'a crate::SignalInbox,
     pub group: &'a crate::ThreadGroup,
+    pub processes: &'a crate::processes::Processes,
 }
 
 pub(crate) enum Outcome {
@@ -89,7 +91,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 42] = [
+        let entries: [(u64, Handler); 43] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -125,6 +127,7 @@ impl SyscallTable {
             (nr::SCHED_GETAFFINITY, sys_sched_getaffinity),
             (nr::SCHED_YIELD, sys_sched_yield),
             (nr::SYSINFO, sys_sysinfo),
+            (nr::GETRUSAGE, sys_getrusage),
             (nr::GETGROUPS, sys_getgroups),
             (nr::TIMER_CREATE, sys_timer_create),
             (nr::TIMER_SETTIME, sys_timer_settime),
@@ -1330,6 +1333,19 @@ fn sys_getgroups(_c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 const SYSINFO_RAM: u64 = 4 << 30;
 
 /// `struct sysinfo` (112 bytes): the uptime is the monotonic clock's, the
+/// `getrusage(who, usage)`: RUSAGE_SELF, RUSAGE_CHILDREN and RUSAGE_THREAD
+/// report all zeros, as no CPU time or memory use is measured (the rusage
+/// `wait4` and `waitid` return is zero too); any other `who` is `EINVAL`.
+fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    if !matches!(a[0] as i32, -1..=1) {
+        return err(Errno::EINVAL);
+    }
+    match c.mem.write(GuestAddr(a[1]), &[0; 144]) {
+        Ok(()) => ok(0),
+        Err(_) => err(Errno::EFAULT),
+    }
+}
+
 /// memory is a fixed [`SYSINFO_RAM`] with nothing used and no swap, the load
 /// averages are 0 and `procs` counts this process's threads.
 fn sys_sysinfo(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {

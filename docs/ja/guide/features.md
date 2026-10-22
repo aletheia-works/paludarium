@@ -29,7 +29,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
-| システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups` |
+| システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups`、`getrusage` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait` |
 | 時刻 | `clock_gettime`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`、`read`、`write`、`writev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
@@ -72,8 +72,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   inode の数は、実際に持っているものです。マウントしたホストのディレクトリでは、
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
   `/proc/mounts` はマウントの一覧です（ルートは `tmpfs`、`--mount` ごとに `hostfs`。
-  ホストのパスは見せません）。`/proc` にあるファイルはこれだけです。マウントごとに
-  `mountinfo` の行と同じ `st_dev` を持つので、`df` はどのマウントも表示します。
+  ホストのパスは見せません）。マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
+  `df` はどのマウントも表示します。
+- `/proc` にあるのは、ほかには自分のプロセスのものだけです。`/proc/self`
+  （`/proc/<pid>` としても）は、`readlink` で PID になり、その中のものを相対的に
+  開けるディレクトリです。`/proc/self/status` は、Linux と同じ項目を同じ順番で持ちます
+  （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。ただし、何も
+  測っていないメモリと CPU の項目はありません。
+- `getrusage` は、プロセス、子、スレッドのどれについても 0 を返します。`wait4` と
+  `waitid` が返す rusage も同じです。CPU 時間とメモリの使用量は、まだ測っていません。
 - `access` は root として、読み書きはいつも許し、実行は実行のビットがあるか
   ディレクトリのときに許します。`getgroups` はグループを返しません。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは

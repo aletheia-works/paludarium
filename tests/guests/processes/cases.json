@@ -19,6 +19,7 @@
     {"name":"posix-timer","binary":"process"},
     {"name":"prctl","binary":"process"},
     {"name":"pdeathsig","binary":"process"},
+    {"name":"proc-status","binary":"process"},
     {"name":"waitid","binary":"process"},
     {"name":"thread-name","binary":"process"},
     {"name":"timer-thread","binary":"process"},

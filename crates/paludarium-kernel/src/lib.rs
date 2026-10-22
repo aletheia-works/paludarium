@@ -492,6 +492,7 @@ impl Kernel {
             cancellation: &self.cancellation,
             inbox: &self.inbox,
             group: &self.group,
+            processes: &self.processes,
         };
         let outcome = handler(&mut ctx, args);
         if number == syscalls::nr::SETITIMER {

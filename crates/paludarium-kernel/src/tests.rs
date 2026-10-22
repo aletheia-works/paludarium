@@ -1033,3 +1033,12 @@ fn thread_name_from_path() {
     state.name_after(b"plain");
     assert_eq!(&state.name[..6], b"plain\0");
 }
+#[test]
+fn getrusage_checks_who_and_the_pointer() {
+    let mut f = fixture();
+    for who in [0, u64::MAX, 1] {
+        assert_eq!(f.ret(98, &[who, DATA]), 0);
+    }
+    assert_eq!(f.ret(98, &[2, DATA]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(98, &[0, 0x10]), errno(Errno::EFAULT));
+}

@@ -105,6 +105,33 @@ static int reaped(long pid) {
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+/* The value of `field` in /proc/self/status, read through a /proc/self
+   descriptor as procfs readers do. */
+static int status_field(const char *field, char *value, size_t size) {
+    int dir = open("/proc/self", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int fd = openat(dir, "status", O_RDONLY | O_CLOEXEC);
+    close(dir);
+    if (fd < 0) return -1;
+    static char text[8192];
+    ssize_t n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    text[n] = 0;
+    size_t length = strlen(field);
+    for (char *line = text; *line; line = strchr(line, '\n') + 1) {
+        if (!strncmp(line, field, length) && line[length] == ':') {
+            char *start = line + length + 1;
+            while (*start == '\t') start++;
+            size_t used = strcspn(start, "\n");
+            if (used >= size) used = size - 1;
+            memcpy(value, start, used);
+            value[used] = 0;
+            return 0;
+        }
+        if (!strchr(line, '\n')) break;
+    }
+    return -1;
+}
 static void finish(pid_t pid) {
     int status = 0;
     result("wait", waitpid(pid, &status, 0) == pid);
@@ -787,6 +814,45 @@ int main(int argc, char **argv) {
         result("size-no-stack", clone3_error((struct clone3_args){0, 0, 0, 0, SIGCHLD, 0, 4096, 0}));
         result("stack-no-size", clone3_error((struct clone3_args){0, 0, 0, 0, SIGCHLD, 4096, 0, 0}));
         result("bad-signal", clone3_error((struct clone3_args){0, 0, 0, 0, 65, 0, 0, 0}));
+        return 0;
+    }
+    if (!strcmp(mode, "proc-status")) {
+        char value[128], link[32];
+        umask(027);
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        signal(SIGUSR2, SIG_IGN);
+        signal(SIGHUP, interrupted);
+        ssize_t n = readlink("/proc/self", link, sizeof link - 1);
+        link[n > 0 ? n : 0] = 0;
+        result("self-link", atoi(link) == getpid());
+        struct stat st;
+        result("self-dir", stat("/proc/self", &st) == 0 && S_ISDIR(st.st_mode));
+        result("status-file", stat("/proc/self/status", &st) == 0 && S_ISREG(st.st_mode));
+        /* Only fields that do not depend on the host user or limits. */
+        const char *fields[] = {"Umask", "State", "Threads", "SigBlk", "SigIgn", "SigCgt", "TracerPid"};
+        for (size_t i = 0; i < sizeof fields / sizeof *fields; i++) {
+            if (status_field(fields[i], value, sizeof value)) strcpy(value, "missing");
+            printf("%s=%s\n", fields[i], value);
+        }
+        status_field("Pid", value, sizeof value);
+        result("pid", atoi(value) == getpid());
+        status_field("PPid", value, sizeof value);
+        result("ppid", atoi(value) == getppid());
+        status_field("Tgid", value, sizeof value);
+        result("tgid", atoi(value) == getpid());
+        struct rusage usage;
+        result("rusage-self", getrusage(RUSAGE_SELF, &usage));
+        result("rusage-children", getrusage(RUSAGE_CHILDREN, &usage));
+        result("rusage-thread", getrusage(1, &usage));
+        errno = 0;
+        result("rusage-who", getrusage(5, &usage));
+        result("errno", errno);
+        errno = 0;
+        result("rusage-fault", syscall(SYS_getrusage, RUSAGE_SELF, (void *)1));
+        result("errno", errno);
         return 0;
     }
     if (!strcmp(mode, "pdeathsig")) {

@@ -110,6 +110,10 @@ or run a task.
   (`scripts/bump-pins.py`), one pull request each from aletheia-works-bot that
   merges itself once `ci-ok` passes. Workflows name the toolchain through
   `$RUST_TOOLCHAIN` (`scripts/rust-toolchain.sh`), never the date.
+- `schedule-watch.yml` (every day): checks that each scheduled workflow
+  started on time. A run that fails before its first job (`startup_failure`)
+  reports nothing itself, so a run that did not start, a schedule that did not
+  run and a disabled workflow open an Issue; the next clean day closes it.
 - `docs.yml`: builds the documentation site (`docs-build.yml`) and deploys it
   from main.
 - `release.yml`, `release-merge.yml`, `publish.yml`: releases; see

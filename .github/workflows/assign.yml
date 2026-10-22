@@ -10,56 +10,6 @@ permissions:
   issues: write
   pull-requests: write
 
-env:
-  GH_TOKEN: ${{ github.token }}
-  REPO: ${{ github.repository }}
-  OWNER: JamBalaya56562
-
 jobs:
   assign:
-    name: Assign to owner
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Assign issue
-        if: github.event_name == 'issues' && toJSON(github.event.issue.assignees) == '[]'
-        env:
-          NUMBER: ${{ github.event.issue.number }}
-        run: gh issue edit "$NUMBER" --repo "$REPO" --add-assignee "$OWNER"
-
-      - name: Assign pull request
-        if: github.event_name == 'pull_request_target' && toJSON(github.event.pull_request.assignees) == '[]'
-        env:
-          NUMBER: ${{ github.event.pull_request.number }}
-        run: gh pr edit "$NUMBER" --repo "$REPO" --add-assignee "$OWNER"
-
-  milestone:
-    name: Assign milestone
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Resolve the open milestone
-        id: resolve
-        run: |
-          set -euo pipefail
-          milestones="$(gh api "repos/${REPO}/milestones?state=open")"
-          count="$(jq 'length' <<<"$milestones")"
-          if [ "$count" -ne 1 ]; then
-            echo "::warning::${count} open milestones; refusing to guess."
-            exit 0
-          fi
-          jq -r '"title=" + .[0].title' <<<"$milestones" >>"$GITHUB_OUTPUT"
-
-      - name: Assign issue milestone
-        if: steps.resolve.outputs.title && github.event_name == 'issues' && github.event.issue.milestone == null
-        env:
-          NUMBER: ${{ github.event.issue.number }}
-          MILESTONE: ${{ steps.resolve.outputs.title }}
-        run: gh issue edit "$NUMBER" --repo "$REPO" --milestone "$MILESTONE"
-
-      - name: Assign pull request milestone
-        if: steps.resolve.outputs.title && github.event_name == 'pull_request_target' && github.event.pull_request.milestone == null
-        env:
-          NUMBER: ${{ github.event.pull_request.number }}
-          MILESTONE: ${{ steps.resolve.outputs.title }}
-        run: gh pr edit "$NUMBER" --repo "$REPO" --milestone "$MILESTONE"
+    uses: aletheia-works/.github/.github/workflows/assign.yml@224ce9e9c0d5ddd599e9984958b2e4dd9568ccb6 # v1.3.0

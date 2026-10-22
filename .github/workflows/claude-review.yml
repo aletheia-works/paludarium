@@ -9,89 +9,11 @@ permissions:
   pull-requests: write
   id-token: write
 
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   review:
-    if: >-
-      github.repository_owner == 'aletheia-works' &&
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.user.login == 'JamBalaya56562'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-          path: pr-head
-          allow-unsafe-pr-checkout: true
-
-      - uses: anthropics/claude-code-action@db77d4d3c98f3f6380e7cd45ffba2342a3dbde3c # v1.0.254
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          track_progress: true
-          claude_args: >-
-            --add-dir pr-head
-            --allowedTools "Glob,Grep,LS,Read,mcp__github_comment__update_claude_comment,mcp__github_inline_comment__create_inline_comment,mcp__github_ci__get_ci_status,mcp__github_ci__get_workflow_run_details,mcp__github_ci__download_job_log"
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
-
-            Review this pull request. The PR's files are under
-            `pr-head/`; the base branch is at the workspace root —
-            search there for code the PR did not touch. You have the
-            whole repository; the author only saw the files they
-            edited. Weight your effort accordingly.
-
-            1. What else should have changed. For every symbol, file,
-               path, glob, tag, env var, workflow step, task or config
-               key the diff adds, removes, renames, moves or narrows,
-               search the base tree for its other references and check
-               each one: a trigger that no longer matches its consumer,
-               a doc still describing the old behaviour, a caller left
-               pointing at something that moved, a generated artefact
-               whose generator was not rerun.
-
-            2. Contradictions with what the repository already states.
-               Hold the diff against the principles in
-               docs/guide/introduction.md, the supported features and
-               limitations in docs/guide/, the architecture, design
-               decisions and verification rules in docs/design/,
-               CONTRIBUTING.md, docs/release.md for anything touching
-               publication,
-               and the README.md nearest the changed code. Read the
-               rules; do not work from a list of the ones somebody
-               remembered. Quote the sentence the change breaks. Either
-               side may be the wrong one — say which.
-
-            3. Whether the implementation is correct. Bugs the tests
-               would not catch, edge cases, error paths, and changes
-               that do not do what the commit message or the PR
-               description says. Check the description's claims
-               against the files rather than trusting them.
-
-            Verify before you assert, in both directions. Before
-            calling something unused, removable, narrowable or covered
-            elsewhere, enumerate its consumers and name them in the
-            finding. Before proposing a fix, confirm the key, flag or
-            API you reach for does what you think here — one defined
-            under a different parent, or that behaves differently in
-            this mode, is not the one you want; if you narrow
-            something, re-run the consumer search against the narrowed
-            version. When you cannot confirm a remedy, report the
-            finding without one and say what you could not check.
-
-            Report each finding as an inline comment on the line it
-            concerns, with what breaks and the evidence. Keep the
-            summary for what has no single line — a missing update in
-            a file the diff never touched belongs there, with the
-            path. Skip nits the linters enforce. "I found nothing" is
-            a fine answer when the searches came back empty, but it
-            should mean you ran them.
+    uses: aletheia-works/.github/.github/workflows/claude-review.yml@224ce9e9c0d5ddd599e9984958b2e4dd9568ccb6 # v1.3.0
+    with:
+      rules: >-
+        the principles in docs/guide/introduction.md, the supported features and limitations in docs/guide/, the architecture, design decisions and verification rules in docs/design/, CONTRIBUTING.md, docs/release.md for anything touching publication, and the README.md nearest the changed code
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

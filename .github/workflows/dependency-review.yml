@@ -7,21 +7,6 @@ permissions:
   contents: read
   pull-requests: write
 
-concurrency:
-  group: dependency-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   dependency-review:
-    name: Review dependency changes
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Review dependencies
-        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
-        with:
-          comment-summary-in-pr: always
+    uses: aletheia-works/.github/.github/workflows/dependency-review.yml@224ce9e9c0d5ddd599e9984958b2e4dd9568ccb6 # v1.3.0

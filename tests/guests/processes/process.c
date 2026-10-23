@@ -22,6 +22,7 @@
 #include <sys/times.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
+#include <sys/select.h>
 #include <sys/uio.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
@@ -981,6 +982,114 @@ int main(int argc, char **argv) {
         result("errno", errno);
         errno = 0;
         result("bad-mask", syscall(SYS_rt_sigsuspend, (void *)16, 8));
+        result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "select")) {
+        /* select, pselect6 and ppoll: ready sets, timeouts written back with
+           the time left (none for a zero timeout), errors in Linux's order,
+           and a temporary signal mask that a handler runs with. The calls
+           with a timeout are raw syscalls: musl passes the kernel a copy of
+           the timeout, so its wrappers never show the written-back time. */
+        int p[2];
+        if (pipe(p)) return 81;
+        fd_set r, w, e;
+        FD_ZERO(&r); FD_SET(p[0], &r);
+        struct timeval zero = {0, 0};
+        result("empty", syscall(SYS_select, p[0] + 1, &r, NULL, NULL, &zero));
+        result("empty-cleared", !FD_ISSET(p[0], &r));
+        result("zero-kept", zero.tv_sec == 0 && zero.tv_usec == 0);
+        if (write(p[1], "x", 1) != 1) return 82;
+        FD_ZERO(&r); FD_ZERO(&w); FD_ZERO(&e);
+        FD_SET(p[0], &r); FD_SET(p[1], &w); FD_SET(p[0], &e);
+        struct timeval five = {5, 0};
+        result("ready", syscall(SYS_select, p[1] + 1, &r, &w, &e, &five));
+        result("read", FD_ISSET(p[0], &r));
+        result("write", FD_ISSET(p[1], &w));
+        result("except", FD_ISSET(p[0], &e));
+        long left = five.tv_sec * 1000000L + five.tv_usec;
+        result("left", left > 4000000 && left <= 5000000);
+        char byte;
+        if (read(p[0], &byte, 1) != 1) return 83;
+        FD_ZERO(&r); FD_SET(p[0], &r);
+        struct timeval short_wait = {0, 20000};
+        result("timeout", syscall(SYS_select, p[0] + 1, &r, NULL, NULL, &short_wait));
+        result("timeout-left", short_wait.tv_sec == 0 && short_wait.tv_usec == 0);
+        FD_ZERO(&r); FD_SET(60, &r);
+        errno = 0;
+        result("closed", select(61, &r, NULL, NULL, &zero));
+        result("errno", errno);
+        errno = 0;
+        result("negative", select(-1, NULL, NULL, NULL, &zero));
+        result("errno", errno);
+        /* Whole seconds of microseconds carry into the seconds; a negative
+           part is EINVAL. */
+        struct timeval carry = {0, 1000000};
+        result("carried-timeval", syscall(SYS_select, 1, NULL, NULL, NULL, &carry));
+        struct timeval bad = {0, -1};
+        errno = 0;
+        result("bad-timeval", syscall(SYS_select, 1, NULL, NULL, NULL, &bad));
+        result("errno", errno);
+        /* ppoll */
+        struct pollfd pfd = {p[0], POLLIN, 0};
+        struct timespec ts = {0, 20000000};
+        result("ppoll-timeout", syscall(SYS_ppoll, &pfd, 1, &ts, NULL, 8));
+        result("ppoll-left", ts.tv_sec == 0 && ts.tv_nsec == 0);
+        if (write(p[1], "y", 1) != 1) return 84;
+        struct timespec ten = {10, 0};
+        result("ppoll-ready", syscall(SYS_ppoll, &pfd, 1, &ten, NULL, 8));
+        result("ppoll-revents", pfd.revents);
+        long ns_left = ten.tv_sec * 1000000000L + ten.tv_nsec;
+        result("ppoll-left-ready", ns_left > 9000000000L && ns_left <= 10000000000L);
+        struct timespec bad_ts = {0, 1000000000};
+        errno = 0;
+        result("ppoll-bad-timespec", ppoll(&pfd, 1, &bad_ts, NULL));
+        result("errno", errno);
+        errno = 0;
+        result("ppoll-bad-size", syscall(SYS_ppoll, &pfd, 1, NULL, &ten, 7));
+        result("errno", errno);
+        /* A blocked SIGUSR1 is let in by the temporary mask; the handler runs
+           with it (SIGUSR2 blocked), and the old mask is back afterwards. */
+        struct sigaction act = {0};
+        act.sa_handler = note_mask;
+        sigaction(SIGUSR1, &act, NULL);
+        sigset_t usr1, temporary, now;
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &usr1, NULL);
+        sigemptyset(&temporary);
+        sigaddset(&temporary, SIGUSR2);
+        if (read(p[0], &byte, 1) != 1) return 85;
+        raise(SIGUSR1);
+        received = 0;
+        errno = 0;
+        result("ppoll-signal", ppoll(&pfd, 1, NULL, &temporary));
+        result("errno", errno);
+        result("received", received);
+        result("usr2-blocked-in-handler", usr2_blocked_in_handler);
+        sigprocmask(SIG_BLOCK, NULL, &now);
+        result("usr1-blocked-after", sigismember(&now, SIGUSR1));
+        raise(SIGUSR1);
+        received = 0;
+        usr2_blocked_in_handler = -1;
+        FD_ZERO(&r); FD_SET(p[0], &r);
+        errno = 0;
+        result("pselect-signal", pselect(p[0] + 1, &r, NULL, NULL, NULL, &temporary));
+        result("errno", errno);
+        result("received", received);
+        result("usr2-blocked-in-handler", usr2_blocked_in_handler);
+        sigprocmask(SIG_BLOCK, NULL, &now);
+        result("usr1-blocked-after", sigismember(&now, SIGUSR1));
+        struct timespec pzero = {0, 0};
+        FD_ZERO(&r); FD_SET(p[0], &r);
+        result("pselect-empty", syscall(SYS_pselect6, p[0] + 1, &r, NULL, NULL, &pzero, NULL));
+        result("pselect-zero-kept", pzero.tv_sec == 0 && pzero.tv_nsec == 0);
+        struct timespec pshort = {0, 20000000};
+        FD_ZERO(&r); FD_SET(p[0], &r);
+        result("pselect-timeout", syscall(SYS_pselect6, p[0] + 1, &r, NULL, NULL, &pshort, NULL));
+        result("pselect-left", pshort.tv_sec == 0 && pshort.tv_nsec == 0);
+        errno = 0;
+        result("pselect-bad-timespec", pselect(1, NULL, NULL, NULL, &bad_ts, NULL));
         result("errno", errno);
         return 0;
     }

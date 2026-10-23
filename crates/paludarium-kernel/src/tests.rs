@@ -1208,3 +1208,162 @@ fn timerfd_counts_expirations() {
     assert_eq!(f.ret(287, &[99, DATA]), errno(Errno::EBADF));
     assert_eq!(f.ret(286, &[fd, 0, DATA, 0x1000]), errno(Errno::EFAULT));
 }
+
+#[test]
+fn select_family_timeouts_and_errors() {
+    let mut f = fixture();
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, 1_000_000_000);
+    // An empty pipe: select times out and writes back no time left.
+    assert_eq!(f.ret(22, &[DATA]), 0);
+    let read_end = f.mem.read_u64(GuestAddr(DATA)).unwrap() & 0xffff_ffff;
+    f.mem
+        .write_u64(GuestAddr(DATA + 64), 1 << read_end)
+        .unwrap();
+    f.mem
+        .write(
+            GuestAddr(DATA + 128),
+            &[0u64, 30_000].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+    assert_eq!(f.ret(23, &[read_end + 1, DATA + 64, 0, 0, DATA + 128]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 64)).unwrap(), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 136)).unwrap(), 0);
+    // A zero timeout is not written back; a closed descriptor is EBADF.
+    f.mem.write_u64(GuestAddr(DATA + 64), 1 << 40).unwrap();
+    f.mem
+        .write(
+            GuestAddr(DATA + 128),
+            &[0u64, 0].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.ret(23, &[41, DATA + 64, 0, 0, DATA + 128]),
+        errno(Errno::EBADF)
+    );
+    assert_eq!(
+        f.ret(23, &[u64::MAX, 0, 0, 0, DATA + 128]),
+        errno(Errno::EINVAL)
+    );
+    // pselect6 reads its {ss, len} pair first: EFAULT before a bad timespec.
+    f.mem
+        .write(
+            GuestAddr(DATA + 192),
+            &[0u64, 1_000_000_000].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.ret(270, &[0, 0, 0, 0, DATA + 192, 0x10]),
+        errno(Errno::EFAULT)
+    );
+    assert_eq!(
+        f.ret(270, &[0, 0, 0, 0, DATA + 192, 0]),
+        errno(Errno::EINVAL)
+    );
+    // ppoll: the timespec before the mask size, the mask size before nfds.
+    f.mem
+        .write(
+            GuestAddr(DATA + 256),
+            &[1u64, 0].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.ret(271, &[0, 5000, DATA + 192, DATA, 8]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(271, &[0, 5000, DATA + 256, DATA, 7]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(271, &[0, 5000, DATA + 256, 0, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 256)).unwrap(), 1);
+}
+
+#[test]
+fn select_timeval_carries_microseconds() {
+    let mut f = fixture();
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, 1_000_000_000);
+    // A second of microseconds: the wait ends on the carried deadline.
+    f.mem
+        .write(
+            GuestAddr(DATA),
+            &[0u64, 1_000_000].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+    assert_eq!(f.ret(23, &[0, 0, 0, 0, DATA]), 0);
+    assert_eq!(
+        f.host.clock(paludarium_host::ClockId::Monotonic).unwrap(),
+        2_000_000_000
+    );
+    for bad in [[0u64, u64::MAX], [u64::MAX, 0]] {
+        f.mem
+            .write(GuestAddr(DATA), &bad.map(u64::to_le_bytes).concat())
+            .unwrap();
+        assert_eq!(f.ret(23, &[0, 0, 0, 0, DATA]), errno(Errno::EINVAL));
+    }
+    // A huge timespec saturates instead of failing: with a readable pipe,
+    // ppoll returns at once.
+    assert_eq!(f.ret(22, &[DATA + 192]), 0);
+    let fds = f.mem.read_u64(GuestAddr(DATA + 192)).unwrap();
+    assert_eq!(f.ret(1, &[fds >> 32, DATA + 200, 1]), 1);
+    f.mem
+        .write(
+            GuestAddr(DATA + 64),
+            &[i64::MAX as u64, 0].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+    f.mem
+        .write(
+            GuestAddr(DATA + 128),
+            &(fds & 0xffff_ffff | 1 << 32).to_le_bytes(),
+        )
+        .unwrap();
+    assert_eq!(f.ret(271, &[DATA + 128, 1, DATA + 64, 0, 0]), 1);
+}
+
+#[test]
+fn ppoll_stop_restarts_unless_the_timeout_is_read_only() {
+    for read_only in [false, true] {
+        let mut f = fixture();
+        let at = if read_only {
+            f.mem
+                .map(
+                    Some(GuestAddr(0x30_0000)),
+                    0x1000,
+                    Prot::READ_WRITE,
+                    MappingKind::Anonymous,
+                )
+                .unwrap();
+            f.mem
+                .write(
+                    GuestAddr(0x30_0000),
+                    &[10u64, 0].map(u64::to_le_bytes).concat(),
+                )
+                .unwrap();
+            f.mem
+                .protect(GuestAddr(0x30_0000), 0x1000, Prot::READ)
+                .unwrap();
+            0x30_0000
+        } else {
+            f.mem
+                .write(GuestAddr(DATA), &[10u64, 0].map(u64::to_le_bytes).concat())
+                .unwrap();
+            DATA
+        };
+        f.kernel.queue_signal(&mut f.thread, 19).unwrap();
+        f.thread.cpu.rip = GuestAddr(0x1002);
+        // Stopped in ppoll: with the time left written back it runs again;
+        // with a read-only timeout it gives EINTR, as Linux does.
+        assert_eq!(f.call(271, &[0, 0, at, 0, 0]), Next::Stopped);
+        if read_only {
+            assert_eq!(f.thread.cpu.gpr[reg::RAX], errno(Errno(4)));
+        } else {
+            assert_eq!(f.thread.cpu.gpr[reg::RAX], 271);
+            assert_eq!(f.thread.cpu.rip, GuestAddr(0x1000));
+        }
+    }
+}

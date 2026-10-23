@@ -24,6 +24,9 @@ pub mod nr {
     pub const TGKILL: u64 = 234;
     pub const WRITE: u64 = 1;
     pub const POLL: u64 = 7;
+    pub const SELECT: u64 = 23;
+    pub const PSELECT6: u64 = 270;
+    pub const PPOLL: u64 = 271;
     pub const NANOSLEEP: u64 = 35;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const CLOCK_NANOSLEEP: u64 = 230;
@@ -101,7 +104,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 51] = [
+        let entries: [(u64, Handler); 54] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -114,6 +117,9 @@ impl SyscallTable {
             (nr::CLOCK_NANOSLEEP, sys_clock_nanosleep),
             (nr::WRITE, sys_write),
             (nr::POLL, sys_poll),
+            (nr::PPOLL, sys_ppoll),
+            (nr::SELECT, sys_select),
+            (nr::PSELECT6, sys_pselect6),
             (nr::MMAP, sys_mmap),
             (nr::MPROTECT, sys_mprotect),
             (nr::MUNMAP, sys_munmap),
@@ -803,6 +809,7 @@ fn sys_write(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 const POLLIN: u16 = 0x1;
 const POLLOUT: u16 = 0x4;
 const POLLNVAL: u16 = 0x20;
+const POLLPRI: u16 = 0x2;
 const MAX_POLL_FDS: u64 = 1024;
 
 /// `poll(fds, nfds, timeout)`: waits until a descriptor is ready, the
@@ -823,20 +830,273 @@ fn sys_poll(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                     .saturating_add(timeout as u64 * 1_000_000),
             )
         };
-        loop {
-            // Sample the ticket before inspecting readiness, so no change is lost.
-            let ticket = c.files.readiness.token.value();
-            let ready = poll_once(c, fds, nfds)?;
-            if ready != 0
-                || deadline
-                    .is_some_and(|end| c.host.clock(ClockId::Monotonic).is_ok_and(|now| now >= end))
-            {
-                return Ok(ready);
-            }
-            crate::events::wait(c, ticket, deadline)?;
-        }
+        wait_ready(c, deadline, |c| poll_once(c, fds, nfds))
     })();
     outcome(result)
+}
+
+/// Runs `check` until it finds something ready or `deadline` passes, waiting
+/// for readiness changes in between; EINTR when a signal can be delivered.
+fn wait_ready(
+    c: &mut Context<'_>,
+    deadline: Option<u64>,
+    mut check: impl FnMut(&mut Context<'_>) -> Result<u64, Errno>,
+) -> Result<u64, Errno> {
+    loop {
+        // Sample the ticket before inspecting readiness, so no change is lost.
+        let ticket = c.files.readiness.token.value();
+        let ready = check(c)?;
+        if ready != 0
+            || deadline
+                .is_some_and(|end| c.host.clock(ClockId::Monotonic).is_ok_and(|now| now >= end))
+        {
+            return Ok(ready);
+        }
+        crate::events::wait(c, ticket, deadline)?;
+    }
+}
+
+/// The length of a `struct timespec` timeout at `at` (`None` without one),
+/// as Linux's `poll_select_set_timeout` takes it: a negative part is EINVAL,
+/// and a time past what nanoseconds hold saturates. With `micros` it is a
+/// `struct timeval`, whose whole seconds of microseconds carry into its
+/// seconds, as `kern_select` does.
+fn timeout_delay(c: &Context<'_>, at: u64, micros: bool) -> Result<Option<u64>, Errno> {
+    if at == 0 {
+        return Ok(None);
+    }
+    let [seconds, fraction] = read_words::<2>(c.mem, at)?;
+    if (seconds as i64) < 0 || (fraction as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (seconds, nanos) = if micros {
+        (
+            seconds
+                .checked_add(fraction / 1_000_000)
+                .filter(|&s| (s as i64) >= 0)
+                .ok_or(Errno::EINVAL)?,
+            fraction % 1_000_000 * 1000,
+        )
+    } else if fraction >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    } else {
+        (seconds, fraction)
+    };
+    Ok(Some(
+        seconds.saturating_mul(1_000_000_000).saturating_add(nanos),
+    ))
+}
+
+/// A wait's deadline: `delay` after `start`.
+fn deadline_after(start: u64, delay: Option<u64>) -> Option<u64> {
+    delay.map(|delay| start.saturating_add(delay))
+}
+
+/// Writes the time left until `deadline` back to the timeout at `at`, as
+/// Linux does for ppoll, select and pselect6 unless the timeout was zero; a
+/// stopped call then restarts with what is left. A timeout that cannot be
+/// written keeps the result but, as Linux's `poll_select_finish` does, the
+/// call is not restarted then: it gives EINTR.
+fn write_back_timeout(c: &mut Context<'_>, at: u64, delay: Option<u64>, start: u64, micros: bool) {
+    let Some(deadline) = deadline_after(start, delay.filter(|&delay| delay != 0)) else {
+        return;
+    };
+    let left = c
+        .host
+        .clock(ClockId::Monotonic)
+        .map_or(0, |now| deadline.saturating_sub(now));
+    let fraction = if micros {
+        left % 1_000_000_000 / 1000
+    } else {
+        left % 1_000_000_000
+    };
+    if write_words(c.mem, at, &[left / 1_000_000_000, fraction]).is_err() {
+        c.process.restart = None;
+    }
+}
+
+/// Puts a call's temporary signal mask in place, and on return takes it away
+/// as epoll_pwait does: after the handler when a signal interrupted it.
+fn with_wait_mask(
+    c: &mut Context<'_>,
+    mask: Option<u64>,
+    call: impl FnOnce(&mut Context<'_>) -> Result<u64, Errno>,
+) -> Result<u64, Errno> {
+    let old_mask = c.process.signal_mask;
+    if let Some(mask) = mask {
+        c.process.signal_mask = mask & !unblockable();
+    }
+    let result = call(c);
+    if mask.is_some() {
+        if result == Err(Errno(4)) && signals::next_pending(c.process, true).is_some() {
+            c.process.wait_restore_mask = Some(old_mask);
+        } else {
+            c.process.signal_mask = old_mask;
+        }
+    }
+    result
+}
+
+/// A signal mask argument: `None` for a null pointer, EINVAL unless the size
+/// is a sigset_t's, EFAULT when it cannot be read.
+fn read_sigmask(c: &Context<'_>, at: u64, size: u64) -> Result<Option<u64>, Errno> {
+    if at == 0 {
+        return Ok(None);
+    }
+    if size != SIGSET_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    c.mem
+        .read_u64(GuestAddr(at))
+        .map(Some)
+        .map_err(|_| Errno::EFAULT)
+}
+
+/// `ppoll(fds, nfds, timeout, sigmask, sigsetsize)`: poll with a `timespec`
+/// timeout, which is written back with the time left, and a temporary mask.
+fn sys_ppoll(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let delay = timeout_delay(c, a[2], false)?;
+        let mask = read_sigmask(c, a[3], a[4])?;
+        let start = c.host.clock(ClockId::Monotonic)?;
+        let deadline = deadline_after(start, delay);
+        let result = if a[1] > MAX_POLL_FDS {
+            Err(Errno::EINVAL)
+        } else {
+            with_wait_mask(c, mask, |c| {
+                wait_ready(c, deadline, |c| poll_once(c, a[0], a[1]))
+            })
+        };
+        write_back_timeout(c, a[2], delay, start, false);
+        result
+    })())
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)` with a `timeval`.
+fn sys_select(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let delay = timeout_delay(c, a[4], true)?;
+        let start = c.host.clock(ClockId::Monotonic)?;
+        let result = select(c, a[0], [a[1], a[2], a[3]], deadline_after(start, delay));
+        write_back_timeout(c, a[4], delay, start, true);
+        result
+    })())
+}
+
+/// `pselect6(nfds, readfds, writefds, exceptfds, timeout, sig)`: select with
+/// a `timespec` and `sig` pointing to `{ const sigset_t *ss; size_t len; }`.
+fn sys_pselect6(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        // Linux reads the {ss, len} pair before anything else.
+        let [ss, len] = if a[5] == 0 {
+            [0, 0]
+        } else {
+            read_words::<2>(c.mem, a[5])?
+        };
+        let delay = timeout_delay(c, a[4], false)?;
+        let mask = read_sigmask(c, ss, len)?;
+        let start = c.host.clock(ClockId::Monotonic)?;
+        let deadline = deadline_after(start, delay);
+        let result = with_wait_mask(c, mask, |c| select(c, a[0], [a[1], a[2], a[3]], deadline));
+        write_back_timeout(c, a[4], delay, start, false);
+        result
+    })())
+}
+
+/// The descriptors select looks at: `nfds` is cut to FD_SETSIZE (Linux cuts
+/// it to the descriptor table's size, which grows past 1024 only on demand).
+const FD_SETSIZE: u64 = 1024;
+
+/// The work of select and pselect6: read the three sets, fail with EBADF for
+/// a set bit of a closed descriptor, wait until one is ready, and write the
+/// sets back holding only the ready ones; returns how many bits are set.
+fn select(
+    c: &mut Context<'_>,
+    nfds: u64,
+    sets: [u64; 3],
+    deadline: Option<u64>,
+) -> Result<u64, Errno> {
+    if (nfds as i32) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let n = u64::from(nfds as u32).min(FD_SETSIZE);
+    let words = n.div_ceil(64) as usize;
+    let mut wanted = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
+    for (set, at) in wanted.iter_mut().zip(sets) {
+        if at == 0 {
+            continue;
+        }
+        for (index, word) in set.iter_mut().enumerate() {
+            *word = c
+                .mem
+                .read_u64(GuestAddr(at.wrapping_add(index as u64 * 8)))
+                .map_err(|_| Errno::EFAULT)?;
+        }
+        if n % 64 != 0
+            && let Some(last) = set.last_mut()
+        {
+            *last &= (1u64 << (n % 64)) - 1;
+        }
+    }
+    for fd in 0..n {
+        let bit = 1u64 << (fd % 64);
+        if wanted.iter().any(|set| set[(fd / 64) as usize] & bit != 0)
+            && revents(c, fd as i32, POLLIN | POLLOUT | POLLPRI) == POLLNVAL
+        {
+            return Err(Errno::EBADF);
+        }
+    }
+    let mut found = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
+    let count = wait_ready(c, deadline, |c| {
+        let mut count = 0;
+        for fd in 0..n {
+            let (word, bit) = ((fd / 64) as usize, 1u64 << (fd % 64));
+            if wanted.iter().all(|set| set[word] & bit == 0) {
+                continue;
+            }
+            let mask = revents(c, fd as i32, POLLIN | POLLOUT | POLLPRI);
+            for (kind, ready) in [POLLIN | 0x18, POLLOUT | 0x8, POLLPRI]
+                .into_iter()
+                .enumerate()
+            {
+                if wanted[kind][word] & bit != 0 && mask & ready != 0 {
+                    found[kind][word] |= bit;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    })?;
+    for (set, at) in found.iter().zip(sets) {
+        if at != 0 {
+            write_words(c.mem, at, set)?;
+        }
+    }
+    Ok(count)
+}
+
+/// The poll events of descriptor `fd` among `events` (with POLLERR and
+/// POLLHUP always), POLLNVAL for one that is not open, 0 for a negative fd.
+fn revents(c: &Context<'_>, fd: i32, events: u16) -> u16 {
+    match fd {
+        fd if fd < 0 => 0,
+        // The host's own standard streams are always ready.
+        0 if c.files.uses_original_stdio(0) => events & POLLIN,
+        1 | 2 if c.files.uses_original_stdio(fd as u64) => events & POLLOUT,
+        _ => match c.files.descriptor(fd as u64) {
+            Ok(d) => match d.file.readiness() {
+                Ok((mask, _, _)) => (mask as u16) & (events | 0x18),
+                Err(_) => d.file.stat().map_or(POLLNVAL, |stat| {
+                    if stat.mode & 0o170000 == 0o100000 {
+                        events & (POLLIN | POLLOUT)
+                    } else {
+                        0
+                    }
+                }),
+            },
+            Err(_) => POLLNVAL,
+        },
+    }
 }
 
 /// One pass over the `pollfd` array, writing each `revents`; returns how
@@ -849,25 +1109,7 @@ fn poll_once(c: &mut Context<'_>, fds: u64, nfds: u64) -> Result<u64, Errno> {
         c.mem.read(at, &mut entry).map_err(|_| Errno::EFAULT)?;
         let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
         let events = u16::from_le_bytes([entry[4], entry[5]]);
-        let revents = match fd {
-            fd if fd < 0 => 0,
-            // The host's own standard streams are always ready.
-            0 if c.files.uses_original_stdio(0) => events & POLLIN,
-            1 | 2 if c.files.uses_original_stdio(fd as u64) => events & POLLOUT,
-            _ => match c.files.descriptor(fd as u64) {
-                Ok(d) => match d.file.readiness() {
-                    Ok((mask, _, _)) => (mask as u16) & (events | 0x18),
-                    Err(_) => d.file.stat().map_or(POLLNVAL, |stat| {
-                        if stat.mode & 0o170000 == 0o100000 {
-                            events & (POLLIN | POLLOUT)
-                        } else {
-                            0
-                        }
-                    }),
-                },
-                Err(_) => POLLNVAL,
-            },
-        };
+        let revents = revents(c, fd, events);
         c.mem
             .write(at.wrapping_add(6), &revents.to_le_bytes())
             .map_err(|_| Errno::EFAULT)?;

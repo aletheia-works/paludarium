@@ -33,7 +33,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigpending`、`rt_sigsuspend`、`pause` |
 | 時刻 | `clock_gettime`、`clock_getres`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`close`、`lseek`、`stat` 系、`getdents64`、`mkdir`、`rmdir`、`unlink`、`rename`、`link`、`symlink`、`readlink`、`truncate`、`flock`、`fcntl`、`dup` 系、`pipe`／`pipe2`、`chdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
-| 入出力 | `poll`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`shutdown` |
 | 乱数 | `getrandom` |
@@ -50,6 +50,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストの標準入出力は、別の記述子に置き換えられるまで、いつも準備ができています。
   パイプの読み出し側は、読まれていないデータがあるときだけ読めるとし、書き手が
   いなくなると切断だけを示します。Linux の `pipe_poll` と同じです。
+- `ppoll`・`select`・`pselect6` も同じように待ちます。Linux と同じく、残りの時間を
+  タイムアウトの引数に書き戻し（0 のタイムアウトには書き戻しません）、`ppoll` と
+  `pselect6` は一時的なシグナルのマスクを受け取り、ハンドラはそのマスクで動きます。
+  `select` は、集合の中の閉じた記述子に `EBADF` を返し、見る記述子は 1024 個
+  （`FD_SETSIZE`）までです。Linux は `nfds` を記述子の表の大きさで切ります。
 - パイプは Linux と同じく 64 KiB を持ちます。`fcntl` の `F_SETPIPE_SZ` と
   `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。大きさは
   1 ページ以上の 2 のべき乗で、読まれていないデータより小さくすると `EBUSY`、
@@ -162,7 +167,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
-  `sendto`、`recvfrom`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `sendto`、`recvfrom`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
   `epoll_wait` と `rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。
   `rt_sigsuspend` は、シグナルのマスクを渡されたマスクに置き換えてハンドラが動くまで待ちます。
   ハンドラはそのマスクで動き、終わると元のマスクに戻ります。

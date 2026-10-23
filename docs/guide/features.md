@@ -38,7 +38,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigpending`, `rt_sigsuspend`, `pause` |
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
-| I/O | `poll`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `shutdown` |
 | Randomness | `getrandom` |
@@ -56,6 +56,12 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   (`EINTR`). The host's standard streams are always ready until a descriptor
   replaces them. A pipe's read end is readable only with unread data, and
   only hung up once its writers are gone, as Linux's `pipe_poll` reports.
+- `ppoll`, `select` and `pselect6` wait the same way. They write the time
+  left back to their timeout (not a zero one), as Linux does, and `ppoll` and
+  `pselect6` take a temporary signal mask, which a handler runs with.
+  `select` fails with `EBADF` for a closed descriptor in its sets, and looks
+  at no more than 1024 descriptors (`FD_SETSIZE`), where Linux cuts `nfds` to
+  the size of its descriptor table.
 - A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
   `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
   at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.
@@ -175,7 +181,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   continue with `SIGSTOP`. A blocking call that a stop interrupts runs again
   after the continue, as Linux restarts it when no handler runs: `read`,
   `write`, `readv`, `writev`, `pread64`, `pwrite64`, `preadv`, `pwritev`,
-  `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `sendto`, `recvfrom`, `poll` with no timeout and
+  `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `sendto`, `recvfrom`, `ppoll`, `select`, `pselect6`, `poll` with no timeout and
   a `futex` wait with none. `epoll_wait` and
   `rt_sigtimedwait` give `EINTR`, as on Linux. `rt_sigsuspend` waits with
   its mask in place of the signal mask until a handler has run, which runs

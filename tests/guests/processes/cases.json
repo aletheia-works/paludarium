@@ -20,6 +20,7 @@
     {"name":"prctl","binary":"process"},
     {"name":"pdeathsig","binary":"process"},
     {"name":"job-stop","binary":"process"},
+    {"name":"select","binary":"process"},
     {"name":"sigsuspend","binary":"process"},
     {"name":"pio","binary":"process"},
     {"name":"stop-restart","binary":"process"},

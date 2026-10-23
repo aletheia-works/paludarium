@@ -171,10 +171,10 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         // calls (sockets here have no SO_RCVTIMEO or SO_SNDTIMEO, with which
         // Linux gives EINTR instead).
         0 | 1 | 17..=20 | 295 | 296 | 61 | 247 | 34 | 130 | 73 | 43 | 288 | 44..=47 => true,
-        // poll with no timeout, ppoll, select and pselect6 with none.
+        // poll with no timeout, and ppoll, select and pselect6 always: they
+        // write the time left back to their timeout, so a restart goes on.
         7 => (args[2] as i32) < 0,
-        271 => args[2] == 0,
-        23 | 270 => args[4] == 0,
+        23 | 270 | 271 => true,
         // futex FUTEX_WAIT and FUTEX_WAIT_BITSET without a timeout.
         202 => matches!(args[1] & 127, 0 | 9) && args[3] == 0,
         _ => false,

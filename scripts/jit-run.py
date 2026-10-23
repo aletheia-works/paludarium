@@ -100,7 +100,7 @@ def validate(report):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--environment", required=True, choices=("node", "chromium", "firefox", "safari")
+        "--environment", required=True, choices=("node", "chromium", "firefox", "safari", "webkit")
     )
     for name in ("wasm", "native", "guests", "output"):
         parser.add_argument("--" + name, required=True, type=Path)

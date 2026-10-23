@@ -53,7 +53,7 @@ test("WebDriver protocol failure rejects even successful HTTP status", async () 
 test("WebDriver malformed response rejects", async () => endpoint((_, response) => response.end('not json'), async base => assert.rejects(webdriverRequest(base, "GET", "/status"))));
 test("WebDriver missing protocol envelope rejects", async () => endpoint((_, response) => response.end('{}'), async base => assert.rejects(webdriverRequest(base, "GET", "/status"))));
 test("WebDriver request honours a supplied timeout against a slow endpoint", async () => { let timer; await endpoint((_, response) => { timer = setTimeout(() => response.end('{"value":{"late":true}}'), 2000); }, async base => { try { await assert.rejects(webdriverRequest(base, "GET", "/status", undefined, 100), { name: "TimeoutError" }); } finally { clearTimeout(timer); } }); });
-test("unsupported browser does not launch a substitute", async () => assert.rejects(runBrowser("webkit", "http://127.0.0.1/"), /Unsupported actual browser/));
+test("unsupported browser does not launch a substitute", async () => assert.rejects(runBrowser("edge", "http://127.0.0.1/"), /Unsupported actual browser/));
 test("unbounded browser deadline rejected before launch", async () => assert.rejects(runBrowser("safari", "http://127.0.0.1/", 0), /Invalid external browser deadline/));
 test("Safari session creation alone waits 60000 ms while other WebDriver requests keep 10000 ms", async () => {
   // Stub safaridriver, fetch and AbortSignal.timeout only for this test; everything is restored in finally.

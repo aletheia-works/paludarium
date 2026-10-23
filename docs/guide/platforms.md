@@ -17,7 +17,7 @@
 | Node.js (`worker_threads`) | Supported (npm package) |
 | Chromium-based browsers | Supported (npm package) |
 | Firefox | Supported (npm package) |
-| Safari | Supported (npm package); CI tests the real Safari |
+| Safari | Supported (npm package); CI tests the real Safari, and WebKit on x86-64 Linux |
 
 On macOS and Windows, paludarium does not hand a Linux binary to the host to
 execute: it handles the instructions and system calls itself. The same ELF
@@ -36,6 +36,8 @@ of these ([Testing and verification](../design/quality)):
 - Linux, macOS and Windows (GitHub Actions runners)
 - Node.js (the latest release at the time of the check)
 - Chromium, Firefox, and the real Safari (on a macOS runner)
+- WebKit on x86-64 Linux (Playwright's build), whose JavaScriptCore compiles
+  WebAssembly for x86-64 rather than for the Arm Mac
 
 ## In the browser
 

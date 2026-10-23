@@ -1,6 +1,6 @@
 // Test supervision owns the operation deadline; this is not a product timeout.
 export const WASM_DEADLINE_MS = 30000;
-export const WASM_ENVIRONMENTS = Object.freeze(["node", "chromium", "firefox", "safari"]);
+export const WASM_ENVIRONMENTS = Object.freeze(["node", "chromium", "firefox", "safari", "webkit"]);
 export const WASM_PROBES = Object.freeze(["tokio-timer", "unix-stream-pair", "rayon", "mutex-condvar", "fs-basic", "fs-hardlink", "fs-symlink", "fs-flock"]);
 export function validateOracle(oracle) {
   if (oracle?.schema !== 1 || oracle.native_complete !== true) throw new Error("Incomplete fresh native oracle");

@@ -17,7 +17,7 @@
 | Node.js（`worker_threads`） | 対応（npm パッケージ） |
 | Chromium 系のブラウザ | 対応（npm パッケージ） |
 | Firefox | 対応（npm パッケージ） |
-| Safari | 対応（npm パッケージ）。CI で本物の Safari を動かして確かめています |
+| Safari | 対応（npm パッケージ）。CI で本物の Safari と、x86-64 Linux の WebKit を動かして確かめています |
 
 macOS と Windows でも、Linux のバイナリを直接 exec するのではなく、paludarium が
 命令とシステムコールを処理して動かします。そのため、同じ ELF がどのホストでも
@@ -35,6 +35,8 @@ macOS と Windows でも、Linux のバイナリを直接 exec するのでは�
 - Linux・macOS・Windows（GitHub Actions のランナー）
 - Node.js（確かめた時点の最新版）
 - Chromium、Firefox、本物の Safari（macOS のランナー）
+- x86-64 Linux の WebKit（Playwright のビルド）。その JavaScriptCore は、Arm の Mac
+  ではなく x86-64 向けに WebAssembly をコンパイルします
 
 ## ブラウザで必要なもの
 

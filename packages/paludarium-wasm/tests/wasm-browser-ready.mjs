@@ -27,7 +27,7 @@ const server = createServer((request, response) => {
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 try {
   const names = process.argv.slice(2);
-  if (!names.length) throw new Error("usage: wasm-browser-ready.mjs chromium|firefox|safari ...");
+  if (!names.length) throw new Error("usage: wasm-browser-ready.mjs chromium|firefox|safari|webkit ...");
   for (const name of names) {
     const report = await runBrowser(name, `http://127.0.0.1:${server.address().port}/`, 15000);
     console.log(JSON.stringify(report));

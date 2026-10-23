@@ -65,6 +65,10 @@ jobs:
             environment: firefox
           - os: macos-latest
             environment: safari
+          # JavaScriptCore on x86-64, which Safari on macOS (arm64) does not
+          # cover: it once miscompiled a CPU flag helper (#113).
+          - os: ubuntu-latest
+            environment: webkit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -79,10 +83,10 @@ jobs:
           name: wasm-acceptance-inputs
           path: .
       - name: Install pinned browser driver
-        if: matrix.environment == 'chromium' || matrix.environment == 'firefox'
+        if: matrix.environment == 'chromium' || matrix.environment == 'firefox' || matrix.environment == 'webkit'
         run: npm ci --prefix spikes/wasm-threads
       - name: Install Playwright browser
-        if: matrix.environment == 'chromium' || matrix.environment == 'firefox'
+        if: matrix.environment == 'chromium' || matrix.environment == 'firefox' || matrix.environment == 'webkit'
         uses: aletheia-works/.github/actions/install-playwright@237aeceec82d1ac86155fae871a80d4c1b436845 # v1.2.0
         with:
           browsers: ${{ matrix.environment }}

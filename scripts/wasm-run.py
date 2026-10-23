@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--native-only", action="store_true")
     parser.add_argument("--guest-dir", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path)
-    parser.add_argument("--browser", choices=("chromium", "firefox", "safari"))
+    parser.add_argument("--browser", choices=("chromium", "firefox", "safari", "webkit"))
     parser.add_argument("--wasm", type=pathlib.Path)
     parser.add_argument("--native", type=pathlib.Path)
     parser.add_argument("--baseline", action="store_true")

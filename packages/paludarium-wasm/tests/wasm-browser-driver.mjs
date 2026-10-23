@@ -107,7 +107,9 @@ async function safariAttempt(url, timeout) {
 export async function runBrowser(name, url, timeout = 600000) {
   if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 1200000) throw new Error("Invalid external browser deadline");
   if (name === "safari") return safari(url, timeout);
-  if (!["chromium", "firefox"].includes(name)) throw new Error("Unsupported actual browser");
+  // Playwright's WebKit on Linux: JavaScriptCore on x86-64, which macOS Safari
+  // (arm64) does not cover.
+  if (!["chromium", "firefox", "webkit"].includes(name)) throw new Error("Unsupported actual browser");
   const playwright = await import("../../../spikes/wasm-threads/node_modules/playwright/index.mjs");
   const browser = await playwright[name].launch({ timeout: 30000 });
   try {

@@ -8,7 +8,7 @@ import { runJitSuite } from "./jit-suite.mjs";
 import { createJitHandler } from "./jit-http.mjs";
 
 const [environment, modulePath, oraclePath, guestDirectory, outputDirectory] = process.argv.slice(2);
-if (!outputDirectory || !["node", "chromium", "firefox", "safari"].includes(environment)) throw new Error("usage: jit-check.mjs node|chromium|firefox|safari module oracle guests output");
+if (!outputDirectory || !["node", "chromium", "firefox", "safari", "webkit"].includes(environment)) throw new Error("usage: jit-check.mjs node|chromium|firefox|safari|webkit module oracle guests output");
 const root = resolve("."), hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const rawOracle = await readFile(oraclePath, "utf8"), oracle = JSON.parse(rawOracle.replace(/("mtime_ns"\s*:\s*)(\d+)/g, '$1"$2"'));
 const probe = await readFile(resolve(guestDirectory, "probe")), aube = await readFile(resolve(guestDirectory, "aube")), ripgrep = await readFile(resolve(guestDirectory, "ripgrep"));

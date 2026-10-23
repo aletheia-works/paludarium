@@ -74,8 +74,12 @@ fuzz_target!(|data: &[u8]| {
         }
         // A finite input budget bounds copied bytes and file growth in this
         // harness only; the product has no guest file-size quota.
-        if matches!(number, 0 | 1 | 89 | 267 | 217) {
+        if matches!(number, 0 | 1 | 17 | 18 | 89 | 267 | 217) {
             thread.cpu.gpr[reg::RDX] %= AREA_LEN;
+        }
+        // pwrite64 and pwritev grow a file to their offset in one call.
+        if matches!(number, 18 | 296) {
+            thread.cpu.gpr[reg::R10] %= AREA_LEN;
         }
         if matches!(number, 76 | 77) {
             thread.cpu.gpr[reg::RSI] %= AREA_LEN;

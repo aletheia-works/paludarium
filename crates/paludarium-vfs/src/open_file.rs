@@ -61,6 +61,33 @@ impl FileHandle for MemFile {
         b[..count].copy_from_slice(&data[pos..pos + count]);
         Ok(count)
     }
+    fn write_at(&self, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+        let s = lock(&self.state);
+        if s.1 & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        let mut n = lock(&self.node);
+        let modified = (n.clock)()?;
+        let Kind::File(data) = &mut n.kind else {
+            return Err(Errno::EISDIR);
+        };
+        let pos = if s.1 & 1024 != 0 {
+            data.len()
+        } else {
+            usize::try_from(offset).map_err(|_| Errno::EINVAL)?
+        };
+        let end = pos.checked_add(b.len()).ok_or(Errno::EINVAL)?;
+        if end > data.len() {
+            data.try_reserve(end - data.len())
+                .map_err(|_| Errno::ENOMEM)?;
+            data.resize(end, 0)
+        }
+        data[pos..end].copy_from_slice(b);
+        if !b.is_empty() {
+            n.mtime_ns = i128::from(modified);
+        }
+        Ok(b.len())
+    }
     fn write(&self, b: &[u8]) -> Result<usize, Errno> {
         let mut s = lock(&self.state);
         if s.1 & 3 == 0 {

@@ -22,6 +22,7 @@
 #include <sys/times.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -771,6 +772,112 @@ int main(int argc, char **argv) {
         result("errno", errno);
         write(tid_release[1], "x", 1);
         pthread_join(thread, NULL);
+        return 0;
+    }
+    if (!strcmp(mode, "pio")) {
+        /* pread64, pwrite64, readv, preadv and pwritev: positioned calls leave
+           the file position; errors come in Linux's order. */
+        char buf[32] = {0};
+        int fd = open("/tmp/pio", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0 || write(fd, "abcdefgh", 8) != 8) return 81;
+        lseek(fd, 2, SEEK_SET);
+        result("pread", pread(fd, buf, 3, 4));
+        result("pread-bytes", !memcmp(buf, "efg", 3));
+        result("position", lseek(fd, 0, SEEK_CUR));
+        result("pwrite", pwrite(fd, "XY", 2, 6));
+        result("position", lseek(fd, 0, SEEK_CUR));
+        memset(buf, 0, sizeof buf);
+        result("whole", pread(fd, buf, sizeof buf, 0));
+        result("whole-bytes", !memcmp(buf, "abcdefXY", 8));
+        result("gap", pwrite(fd, "Q", 1, 10));
+        memset(buf, 1, sizeof buf);
+        result("gap-read", pread(fd, buf, sizeof buf, 7));
+        result("gap-bytes", buf[0] == 'Y' && buf[1] == 0 && buf[2] == 0 && buf[3] == 'Q');
+        result("past-end", pread(fd, buf, 4, 100));
+        result("empty", pread(fd, buf, 0, 0));
+        struct iovec parts[2] = {{buf, 2}, {buf + 8, 3}};
+        memset(buf, 0, sizeof buf);
+        result("preadv", preadv(fd, parts, 2, 1));
+        result("preadv-bytes", !memcmp(buf, "bc", 2) && !memcmp(buf + 8, "def", 3));
+        struct iovec out[2] = {{"12", 2}, {"345", 3}};
+        result("pwritev", pwritev(fd, out, 2, 0));
+        result("position", lseek(fd, 0, SEEK_CUR));
+        memset(buf, 0, sizeof buf);
+        pread(fd, buf, 8, 0);
+        result("pwritev-bytes", !memcmp(buf, "12345fXY", 8));
+        errno = 0;
+        result("negative", pread(fd, buf, 1, -1));
+        result("errno", errno);
+        errno = 0;
+        result("negative-bad-fd", pread(99, buf, 1, -1));
+        result("errno", errno);
+        errno = 0;
+        result("bad-fd", pread(99, buf, 1, 0));
+        result("errno", errno);
+        errno = 0;
+        result("preadv-negative", preadv(fd, parts, 2, -5));
+        result("errno", errno);
+        errno = 0;
+        result("too-many", preadv(fd, parts, 1025, 0));
+        result("errno", errno);
+        result("none", preadv(fd, parts, 0, 0));
+        close(fd);
+        /* A read-only and a write-only file, an append-mode file, a directory. */
+        fd = open("/tmp/pio", O_RDONLY);
+        errno = 0;
+        result("pwrite-read-only", pwrite(fd, "x", 1, 0));
+        result("errno", errno);
+        close(fd);
+        fd = open("/tmp/pio", O_WRONLY);
+        errno = 0;
+        result("pread-write-only", pread(fd, buf, 1, 0));
+        result("errno", errno);
+        /* The access mode is checked before the iovec array. */
+        errno = 0;
+        result("preadv-write-only-too-many", preadv(fd, parts, 1025, 0));
+        result("errno", errno);
+        close(fd);
+        fd = open("/tmp/pio", O_RDWR | O_APPEND);
+        result("append", pwrite(fd, "Z", 1, 0));
+        result("append-position", lseek(fd, 0, SEEK_CUR));
+        memset(buf, 0, sizeof buf);
+        result("append-size", pread(fd, buf, sizeof buf, 0));
+        result("append-last", buf[11]);
+        close(fd);
+        fd = open("/tmp", O_RDONLY | O_DIRECTORY);
+        errno = 0;
+        result("directory", pread(fd, buf, 1, 0));
+        result("errno", errno);
+        close(fd);
+        /* Pipes have no position; readv gathers what one read gives. */
+        int pipefd[2];
+        if (pipe(pipefd)) return 82;
+        errno = 0;
+        result("pipe-pread", pread(pipefd[0], buf, 1, 0));
+        result("errno", errno);
+        errno = 0;
+        result("pipe-pwrite", pwrite(pipefd[1], "x", 1, 0));
+        result("errno", errno);
+        if (write(pipefd[1], "hello world", 11) != 11) return 83;
+        struct iovec two[2] = {{buf, 5}, {buf + 16, 6}};
+        memset(buf, 0, sizeof buf);
+        result("readv", readv(pipefd[0], two, 2));
+        result("readv-bytes", !memcmp(buf, "hello", 5) && !memcmp(buf + 16, " world", 6));
+        errno = 0;
+        result("readv-too-many", readv(pipefd[0], two, 1025));
+        result("errno", errno);
+        errno = 0;
+        result("readv-write-end", readv(pipefd[1], two, 2));
+        result("errno", errno);
+        errno = 0;
+        result("readv-write-end-too-many", readv(pipefd[1], two, 1025));
+        result("errno", errno);
+        /* /dev/null reads nothing and takes everything at any offset. */
+        fd = open("/dev/null", O_RDWR);
+        result("null-pread", pread(fd, buf, 4, 3));
+        result("null-pwrite", pwrite(fd, "abc", 3, 7));
+        close(fd);
+        unlink("/tmp/pio");
         return 0;
     }
     if (!strcmp(mode, "job-stop")) {

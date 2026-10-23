@@ -622,4 +622,25 @@ mod mount_tests {
             assert_eq!(file.seek(0, 1).unwrap(), 1);
         }
     }
+    #[test]
+    fn write_at_keeps_position() {
+        let x = Fixture::new();
+        for path in [&b"/mnt/w"[..], b"/w"] {
+            let file = x.fs.open(path, 66, 0o600).unwrap();
+            file.write(b"abcdef").unwrap();
+            file.seek(1, 0).unwrap();
+            assert_eq!(file.write_at(4, b"XYZ").unwrap(), 3);
+            assert_eq!(file.seek(0, 1).unwrap(), 1);
+            let mut buf = [0; 8];
+            assert_eq!(file.read_at(0, &mut buf).unwrap(), 7);
+            assert_eq!(&buf[..7], b"abcdXYZ");
+            // Read-only, and append-mode, which appends whatever the offset.
+            let read_only = x.fs.open(path, 0, 0).unwrap();
+            assert_eq!(read_only.write_at(0, b"q"), Err(Errno::EBADF));
+            let append = x.fs.open(path, 1026, 0).unwrap();
+            assert_eq!(append.write_at(0, b"!").unwrap(), 1);
+            assert_eq!(file.read_at(0, &mut buf).unwrap(), 8);
+            assert_eq!(&buf, b"abcdXYZ!");
+        }
+    }
 }

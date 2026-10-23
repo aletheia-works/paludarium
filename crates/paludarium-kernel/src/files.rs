@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
-    0, 2, 3, 4, 5, 6, 8, 20, 21, 22, 32, 33, 72, 73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 84, 85,
-    86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264, 265, 266, 267,
-    268, 269, 280, 292, 293, 439,
+    0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 72, 73, 74, 75, 76, 77, 79, 80, 81, 82,
+    83, 84, 85, 86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264, 265,
+    266, 267, 268, 269, 280, 292, 293, 295, 296, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -313,6 +313,154 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
     c.mem.write(GuestAddr(addr), b).map_err(|_| Errno::EFAULT)
 }
+/// Linux's largest single read or write (`MAX_RW_COUNT`).
+const MAX_RW_COUNT: usize = 0x7fff_f000;
+/// The file a positioned read or write uses, checked in Linux's order: a
+/// negative offset (EINVAL), the descriptor (EBADF), a file without a
+/// position such as a pipe or socket (ESPIPE), then the access mode (EBADF).
+fn positioned(
+    c: &Context<'_>,
+    fd: u64,
+    offset: u64,
+    write: bool,
+) -> Result<Arc<dyn FileHandle>, Errno> {
+    if (offset as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = c.files.descriptor(fd)?.file;
+    file.seek(0, 1).map_err(|_| Errno::ESPIPE)?;
+    if file.flags() & 3 == if write { 0 } else { 1 } {
+        return Err(Errno::EBADF);
+    }
+    Ok(file)
+}
+/// The bytes to transfer for a request of `count` at `offset`: at most
+/// `MAX_RW_COUNT`, and for a read of a regular file no more than it holds.
+/// An end past the largest offset is EINVAL, and reading a directory EISDIR.
+fn request(
+    file: &Arc<dyn FileHandle>,
+    count: u64,
+    offset: u64,
+    read: bool,
+) -> Result<usize, Errno> {
+    if (count as i64) < 0
+        || offset
+            .checked_add(count)
+            .is_none_or(|end| end > i64::MAX as u64)
+    {
+        return Err(Errno::EINVAL);
+    }
+    let len = usize::try_from(count)
+        .map_err(|_| Errno::EINVAL)?
+        .min(MAX_RW_COUNT);
+    if !read {
+        return Ok(len);
+    }
+    let metadata = file.stat()?;
+    match metadata.mode & 0o170000 {
+        0o040000 => Err(Errno::EISDIR),
+        // Saturating, so a remainder past usize (wasm32) does not wrap.
+        0o100000 => Ok(
+            len.min(usize::try_from(metadata.size.saturating_sub(offset)).unwrap_or(usize::MAX))
+        ),
+        _ => Ok(len),
+    }
+}
+fn buffer(len: usize) -> Result<Vec<u8>, Errno> {
+    let mut b = Vec::new();
+    b.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
+    b.resize(len, 0);
+    Ok(b)
+}
+/// A positioned read; a file kind without `read_at` reads through its
+/// position, which is then put back.
+fn read_at(file: &Arc<dyn FileHandle>, offset: u64, b: &mut [u8]) -> Result<usize, Errno> {
+    match file.read_at(offset, b) {
+        Err(e) if e == Errno::ENODEV => {
+            let position = file.seek(0, 1)?;
+            file.seek(offset as i64, 0)?;
+            let result = file.read(b);
+            file.seek(position as i64, 0)?;
+            result
+        }
+        result => result,
+    }
+}
+/// A positioned write, falling back like [`read_at`].
+fn write_at(file: &Arc<dyn FileHandle>, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+    match file.write_at(offset, b) {
+        Err(e) if e == Errno::ENODEV => {
+            let position = file.seek(0, 1)?;
+            file.seek(offset as i64, 0)?;
+            let result = file.write(b);
+            file.seek(position as i64, 0)?;
+            result
+        }
+        result => result,
+    }
+}
+/// The `struct iovec` array of readv, writev and their positioned forms, as
+/// Linux's `import_iovec` reads it: at most 1024 entries (EINVAL), each
+/// buffer accessible (EFAULT), and the total cut to `MAX_RW_COUNT`.
+fn iovecs(c: &Context<'_>, at: u64, count: u64, write: bool) -> Result<Vec<(u64, usize)>, Errno> {
+    if count > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    let mut segments = Vec::new();
+    let mut total = 0usize;
+    for index in 0..count {
+        let addr = at.checked_add(index * 16).ok_or(Errno::EFAULT)?;
+        let base = c.mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
+        let length = c
+            .mem
+            .read_u64(GuestAddr(addr.checked_add(8).ok_or(Errno::EFAULT)?))
+            .map_err(|_| Errno::EFAULT)?;
+        if (length as i64) < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let length = usize::try_from(length)
+            .unwrap_or(usize::MAX)
+            .min(MAX_RW_COUNT - total);
+        let checked = if write {
+            c.mem.check_write(GuestAddr(base), length)
+        } else {
+            c.mem.check_read(GuestAddr(base), length)
+        };
+        checked.map_err(|_| Errno::EFAULT)?;
+        total += length;
+        segments.push((base, length));
+    }
+    Ok(segments)
+}
+/// Copies `bytes` into the guest buffers of `segments`, in order.
+fn scatter(c: &Context<'_>, segments: &[(u64, usize)], mut bytes: &[u8]) -> Result<(), Errno> {
+    for &(base, length) in segments {
+        let (head, rest) = bytes.split_at(length.min(bytes.len()));
+        output(c, base, head)?;
+        bytes = rest;
+    }
+    Ok(())
+}
+/// A read that waits while a blocking file has nothing to give yet.
+fn read_blocking(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    b: &mut [u8],
+) -> Result<usize, Errno> {
+    loop {
+        let ticket = c.files.readiness.token.value();
+        match file.read(b) {
+            Err(e)
+                if e == Errno::EAGAIN
+                    && file.readiness().is_ok()
+                    && file.flags() & crate::events::NONBLOCK == 0 =>
+            {
+                crate::events::wait(c, ticket, None)?
+            }
+            result => return result,
+        }
+    }
+}
 /// `stat` of a file at guest `path`: its `st_dev` names the mount holding
 /// it, numbered as /proc/self/mountinfo numbers mounts (0:1 is the root).
 fn stat(c: &Context<'_>, addr: u64, s: FileStat, path: &[u8]) -> Result<u64, Errno> {
@@ -424,6 +572,71 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     match n {
+        // pread64, pwrite64, preadv, pwritev: at an offset, leaving the file
+        // position. On x86-64 the offset of preadv and pwritev is a[3] alone.
+        17 => {
+            let file = positioned(c, a[0], a[3], false)?;
+            let len = request(&file, a[2], a[3], true)?;
+            c.mem
+                .check_write(GuestAddr(a[1]), len)
+                .map_err(|_| Errno::EFAULT)?;
+            let mut b = buffer(len)?;
+            let count = read_at(&file, a[3], &mut b)?;
+            output(c, a[1], &b[..count])?;
+            Ok(count as u64)
+        }
+        18 => {
+            let file = positioned(c, a[0], a[3], true)?;
+            let len = request(&file, a[2], a[3], false)?;
+            // Check the guest buffer before allocating its copy, as write does.
+            c.mem
+                .check_read(GuestAddr(a[1]), len)
+                .map_err(|_| Errno::EFAULT)?;
+            let mut b = buffer(len)?;
+            c.mem
+                .read(GuestAddr(a[1]), &mut b)
+                .map_err(|_| Errno::EFAULT)?;
+            write_at(&file, a[3], &b).map(|count| count as u64)
+        }
+        19 => {
+            let file = c.files.descriptor(a[0])?.file;
+            if file.flags() & 3 == 1 {
+                return Err(Errno::EBADF);
+            }
+            let segments = iovecs(c, a[1], a[2], true)?;
+            let total = segments.iter().map(|(_, length)| length).sum::<usize>();
+            let position = file.seek(0, 1).ok();
+            let len = match position {
+                Some(position) => request(&file, total as u64, position, true)?,
+                None => total,
+            };
+            let mut b = buffer(len)?;
+            let count = read_blocking(c, &file, &mut b)?;
+            scatter(c, &segments, &b[..count])?;
+            Ok(count as u64)
+        }
+        295 | 296 => {
+            let file = positioned(c, a[0], a[3], n == 296)?;
+            let segments = iovecs(c, a[1], a[2], n == 295)?;
+            let total = segments.iter().map(|(_, length)| length).sum::<usize>();
+            let len = request(&file, total as u64, a[3], n == 295)?;
+            if n == 295 {
+                let mut b = buffer(len)?;
+                let count = read_at(&file, a[3], &mut b)?;
+                scatter(c, &segments, &b[..count])?;
+                return Ok(count as u64);
+            }
+            let mut b = Vec::new();
+            b.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
+            for &(base, length) in &segments {
+                let start = b.len();
+                b.resize(start + length, 0);
+                c.mem
+                    .read(GuestAddr(base), &mut b[start..])
+                    .map_err(|_| Errno::EFAULT)?;
+            }
+            write_at(&file, a[3], &b).map(|count| count as u64)
+        }
         22 | 293 => {
             let flags = if n == 22 {
                 0
@@ -492,7 +705,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     } else {
                         let size = metadata.size;
                         let pos = d.file.seek(0, 1)?;
-                        requested.min(size.saturating_sub(pos) as usize)
+                        requested
+                            .min(usize::try_from(size.saturating_sub(pos)).unwrap_or(usize::MAX))
                     }
                 } else {
                     requested
@@ -519,19 +733,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return write_io(c, &d.ok_or(Errno::EBADF)?.file, &b, false);
             }
             let count = if let Some(d) = d {
-                loop {
-                    let ticket = c.files.readiness.token.value();
-                    match d.file.read(&mut b) {
-                        Err(e)
-                            if e == Errno::EAGAIN
-                                && d.file.readiness().is_ok()
-                                && d.file.flags() & crate::events::NONBLOCK == 0 =>
-                        {
-                            crate::events::wait(c, ticket, None)?
-                        }
-                        result => break result?,
-                    }
-                }
+                read_blocking(c, &d.file, &mut b)?
             } else if a[0] == 0 {
                 c.host.read_stdin(&mut b)?
             } else {

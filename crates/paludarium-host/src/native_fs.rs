@@ -241,6 +241,19 @@ impl FileHandle for NativeFile {
             .read(b)
             .map_err(err)
     }
+    fn write_at(&self, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+        if self.flags() & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        // One lock over the seek, the write and the restore keeps the file
+        // position, as pwrite does; an append-mode file still appends.
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        let position = file.stream_position().map_err(err)?;
+        file.seek(SeekFrom::Start(offset)).map_err(err)?;
+        let result = file.write(b).map_err(err);
+        file.seek(SeekFrom::Start(position)).map_err(err)?;
+        result
+    }
     fn write(&self, b: &[u8]) -> Result<usize, Errno> {
         if self.flags() & 3 == 0 {
             return Err(Errno::EBADF);

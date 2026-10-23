@@ -74,6 +74,12 @@ pub trait FileHandle: Send + Sync {
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, Errno> {
         Err(Errno::ENODEV)
     }
+    /// Writes `buf` at `offset` without moving the file position (`pwrite`);
+    /// an `O_APPEND` file appends instead, as on Linux. Kinds without it give
+    /// `ENODEV`, and the kernel then writes through the file position.
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::ENODEV)
+    }
 }
 pub trait HostFs: Send + Sync {
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;

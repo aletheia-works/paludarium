@@ -118,6 +118,7 @@ mod linux {
         processes_pdeathsig => ("pdeathsig","process"),
         processes_job_stop => ("job-stop","process"),
         processes_pio => ("pio","process"),
+        processes_stop_restart => ("stop-restart","process"),
         processes_timerfd => ("timerfd","process"),
         processes_cpu_clocks => ("cpu-clocks","process"),
         processes_pipe_size => ("pipe-size","process"),

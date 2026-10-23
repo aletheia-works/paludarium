@@ -172,7 +172,12 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 
 - Registration, masks, delivery (the Linux x86-64 signal frame and
   `rt_sigreturn`), `sigaltstack`, queued real-time signals, and stop and
-  continue with `SIGSTOP`.
+  continue with `SIGSTOP`. A blocking call that a stop interrupts runs again
+  after the continue, as Linux restarts it when no handler runs: `read`,
+  `write`, `readv`, `writev`, `pread64`, `pwrite64`, `preadv`, `pwritev`,
+  `wait4`, `waitid`, `flock`, `sendto`, `recvfrom`, `poll` with no timeout and
+  a `futex` wait with none. `epoll_wait` and
+  `rt_sigtimedwait` give `EINTR`, as on Linux.
 
 ## Filesystem
 

@@ -160,6 +160,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 - 登録、マスク、配送（Linux の x86-64 のシグナルフレームと `rt_sigreturn`）、
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
+  停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
+  再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`wait4`、`waitid`、`flock`、
+  `sendto`、`recvfrom`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `epoll_wait` と `rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。
 
 ## ファイルシステム
 

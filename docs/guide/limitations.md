@@ -20,11 +20,13 @@ verified.
 - **Some system calls**: `CLONE_SIGHAND` between separate processes is not
   there yet. Unimplemented system calls return `ENOSYS`, so some programs can
   carry on without the feature.
-- **Some signal details**: a blocking call that a stop interrupts returns
-  `EINTR` after the continue instead of restarting. No core file is written,
-  so a child killed by `SIGSEGV`, `SIGABRT` or another core-dumping signal is
-  reported as `CLD_KILLED`, without the core flag in its `wait` status, where
-  Linux may report `CLD_DUMPED`.
+- **Some signal details**: a wait with a timeout that a stop interrupts
+  (`nanosleep`, `clock_nanosleep`, `poll` with a timeout, a timed `futex`
+  wait) returns `EINTR` after the continue, where Linux resumes it with the
+  time left. No core file is written, so a child killed by `SIGSEGV`,
+  `SIGABRT` or another core-dumping signal is reported as `CLD_KILLED`,
+  without the core flag in its `wait` status, where Linux may report
+  `CLD_DUMPED`.
 - **A native JIT**: only the WebAssembly build has a JIT; native builds use the
   interpreter.
 - **Stable Rust**: a nightly Rust is required.

@@ -292,6 +292,38 @@ mod process {
         assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [1, ct.tid, 0]));
     }
     #[test]
+    fn stop_restarts_a_blocking_read() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 293, [DATA, 0, 0, 0, 0, 0]), 0);
+        let fd = cm.read_u64(GuestAddr(DATA)).unwrap() & 0xffff_ffff;
+        let pid = u64::from(ct.tid);
+        // A read interrupted by a stop runs again after the continue: the
+        // syscall instruction is re-executed with its number in rax.
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 19, 0, 0, 0, 0]), 0);
+        ct.cpu.rip = GuestAddr(0x40_1002);
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 0, [fd, DATA + 64, 1, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ct.cpu.rip, GuestAddr(0x40_1000));
+        assert!(c.group.is_stopped());
+        // A sleep is not restarted here (Linux resumes it with the time left).
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 18, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 19, 0, 0, 0, 0]), 0);
+        cm.write(
+            GuestAddr(DATA + 128),
+            &[1u64, 0].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+        ct.cpu.rip = GuestAddr(0x40_1002);
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 35, [DATA + 128, 0, 0, 0, 0, 0]),
+            Errno(4).to_syscall_return()
+        );
+        assert_eq!(ct.cpu.rip, GuestAddr(0x40_1002));
+    }
+    #[test]
     fn stop_and_continue_reports() {
         let (mut k, mut t, m) = setup();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);

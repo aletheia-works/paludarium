@@ -158,6 +158,29 @@ pub(crate) fn queue(process: &mut ThreadState, signal: PendingSignal) {
     process.pending.push(signal);
 }
 
+/// Whether Linux runs syscall `number` again when a signal that runs no
+/// handler (a stop) interrupts it: the calls that return ERESTARTSYS or
+/// ERESTARTNOHAND, listed as Linux has them, including some not implemented
+/// here yet. Waits with a timeout restart through restart_syscall with
+/// the time left, which is not modelled, so they still give EINTR, as do
+/// epoll_wait, rt_sigtimedwait and the sleeps.
+pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
+    match number {
+        // read, write, pread64, pwrite64, readv, writev, preadv, pwritev,
+        // wait4, waitid, pause, rt_sigsuspend, flock, and the blocking socket
+        // calls (sockets here have no SO_RCVTIMEO or SO_SNDTIMEO, with which
+        // Linux gives EINTR instead).
+        0 | 1 | 17..=20 | 295 | 296 | 61 | 247 | 34 | 130 | 73 | 43 | 288 | 44..=47 => true,
+        // poll with no timeout, ppoll, select and pselect6 with none.
+        7 => (args[2] as i32) < 0,
+        271 => args[2] == 0,
+        23 | 270 => args[4] == 0,
+        // futex FUTEX_WAIT and FUTEX_WAIT_BITSET without a timeout.
+        202 => matches!(args[1] & 127, 0 | 9) && args[3] == 0,
+        _ => false,
+    }
+}
+
 /// Shared selection for delivery and syscall-restart preview. SIGKILL wins,
 /// then the thread-pending queue before the process-pending queue. Each queue
 /// selects eligible standard signals before the lowest real-time number. Queue

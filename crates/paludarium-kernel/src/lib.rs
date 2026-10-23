@@ -163,6 +163,9 @@ pub struct ThreadState {
     /// The thread's name (`comm`), NUL-padded: PR_SET_NAME and PR_GET_NAME.
     pub(crate) name: [u8; 16],
     pub(crate) cpu: CpuAccount,
+    /// The syscall now returning, when Linux would run it again (rather than
+    /// fail it with EINTR) if the signal that interrupted it runs no handler.
+    pub(crate) restart: Option<u64>,
 }
 
 impl ThreadState {
@@ -312,6 +315,8 @@ impl Kernel {
 
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
+        // Only the checkpoint right after the syscall may restart it.
+        let restart = thread.state.restart.take();
         if self.group.retired(thread.tid) {
             return Next::Exit(ExitStatus::Exited(0));
         }
@@ -352,6 +357,7 @@ impl Kernel {
                 // A group stop is reported once, by the thread that starts it.
                 self.processes
                     .job_stop(self.process.pid, &self.group, signal.number);
+                Self::rewind_restart(thread, restart);
                 return Next::Stopped;
             }
             if action.handler == 0 || signal.number == 9 {
@@ -386,9 +392,23 @@ impl Kernel {
             thread.state.signal_mask = mask;
         }
         if thread.state.stopped {
+            Self::rewind_restart(thread, restart);
             Next::Stopped
         } else {
             Next::Resume
+        }
+    }
+
+    /// A stop ran no handler, so a syscall it interrupted with EINTR runs
+    /// again after the continue, as Linux restarts ERESTARTSYS and
+    /// ERESTARTNOHAND: the syscall instruction is re-executed.
+    fn rewind_restart(thread: &mut Thread, restart: Option<u64>) {
+        if let Some(number) = restart
+            && thread.cpu.gpr[reg::RAX] == paludarium_types::Errno(4).to_syscall_return()
+            && let Some(rip) = thread.cpu.rip.0.checked_sub(2)
+        {
+            thread.cpu.rip = paludarium_types::GuestAddr(rip);
+            thread.cpu.gpr[reg::RAX] = number;
         }
     }
 
@@ -510,6 +530,7 @@ impl Kernel {
             thread.cpu.gpr[reg::R8],
             thread.cpu.gpr[reg::R9],
         ];
+        thread.state.restart = signals::restarts_without_handler(number, &args).then_some(number);
         // clone3 runs as the clone it describes.
         if number == 435 {
             match processes::clone3_args(mem, args[0], args[1]) {

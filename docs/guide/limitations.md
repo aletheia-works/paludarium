@@ -21,8 +21,10 @@ verified.
   there yet. Unimplemented system calls return `ENOSYS`, so some programs can
   carry on without the feature.
 - **Some signal details**: the siginfo of `SIGCHLD` does not carry the child's
-  PID, status and `CLD_*` code, and a blocking call that a stop interrupts
-  returns `EINTR` after the continue instead of restarting.
+  PID, status and `CLD_*` code, and a wait with a timeout that a stop
+  interrupts (`nanosleep`, `clock_nanosleep`, `poll` with a timeout, a timed
+  `futex` wait) returns `EINTR` after the continue, where Linux resumes it with
+  the time left.
 - **A native JIT**: only the WebAssembly build has a JIT; native builds use the
   interpreter.
 - **Stable Rust**: a nightly Rust is required.

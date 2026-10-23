@@ -773,6 +773,46 @@ int main(int argc, char **argv) {
         pthread_join(thread, NULL);
         return 0;
     }
+    if (!strcmp(mode, "stop-restart")) {
+        /* A child blocked in read, then in poll with no timeout, is stopped
+           and continued: each call runs again instead of failing with EINTR,
+           as no handler ran. The child says "ready" before each call; a stop
+           that lands before the call is entered changes nothing. */
+        int ready[2], data[2];
+        if (pipe(ready) || pipe(data)) return 81;
+        pid_t pid = child();
+        if (pid == 0) {
+            char byte;
+            if (write(ready[1], "r", 1) != 1) _exit(82);
+            ssize_t n = read(data[0], &byte, 1);
+            if (n != 1) _exit(n < 0 && errno == EINTR ? 83 : 84);
+            if (write(ready[1], "p", 1) != 1) _exit(85);
+            struct pollfd pfd = {data[0], POLLIN, 0};
+            int r = poll(&pfd, 1, -1);
+            if (r != 1) _exit(r < 0 && errno == EINTR ? 86 : 87);
+            _exit(0);
+        }
+        /* Only the child writes ready and reads data, so an early exit of
+           the child ends the parent's read instead of hanging it. */
+        close(ready[1]);
+        close(data[0]);
+        signal(SIGPIPE, SIG_IGN);
+        int status;
+        char byte;
+        for (int round = 0; round < 2; round++) {
+            if (read(ready[0], &byte, 1) != 1) break;
+            struct timespec nap = {0, 20000000};
+            nanosleep(&nap, NULL);
+            kill(pid, SIGSTOP);
+            result("stopped", waitpid(pid, &status, WUNTRACED) == pid && WIFSTOPPED(status));
+            kill(pid, SIGCONT);
+            result("continued", waitpid(pid, &status, WCONTINUED) == pid && WIFCONTINUED(status));
+            if (write(data[1], "x", 1) != 1) break;
+        }
+        result("exited", waitpid(pid, &status, 0) == pid);
+        result("code", WEXITSTATUS(status));
+        return 0;
+    }
     if (!strcmp(mode, "job-stop")) {
         /* A child stops itself, then is stopped and continued by kill; waits
            report each event once, and SIGCHLD follows unless SA_NOCLDSTOP.

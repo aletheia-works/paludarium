@@ -80,7 +80,12 @@ A running guest holds an exclusive lease on its filesystem: `snapshot()`,
 `remove()`, `dispose()` and a second `run()` with the same filesystem are
 rejected while it runs. A snapshot lists every path with its mode, inode, link
 count, modification time in nanoseconds, and the bytes of regular files or
-symlink targets; it does not follow symlinks.
+symlink targets; it does not follow symlinks. A snapshot holds at most
+272 MiB, and `snapshot()` rejects a larger one. That can happen to a
+filesystem that was created without error: the snapshot writes the content
+of every hard link (creation counts a link group once) and about 44 bytes
+plus the path for each entry, so many links to large files, or close to the
+1,048,576 entries allowed, can go past it.
 
 ### Rebuild a filesystem from a snapshot
 
@@ -120,7 +125,7 @@ The list is checked before anything is created, and a `PaludariumError` of kind
   directory has no content;
 - entries that share an `inode` are files or symlinks of one kind with the same
   mode, time and content;
-- at most 1,048,576 entries, each at most 64 MiB, and 256 MiB of content in all,
+- at most 1,048,576 entries, each at most 128 MiB, and 256 MiB of content in all,
   where a hard-link group counts once.
 
 ## Errors

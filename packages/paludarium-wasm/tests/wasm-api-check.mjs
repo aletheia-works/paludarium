@@ -17,9 +17,11 @@ try {
   await filesystem.remove("/file"); assert.equal((await filesystem.snapshot()).some(entry => entry.path === "/file"), false);
   await Promise.all([filesystem.dispose(), filesystem.dispose()]); await filesystem.dispose();
   await assert.rejects(filesystem.snapshot(), /disposed/);
+  // A snapshot holds at most 272 MiB; `files` themselves have no total limit.
   const large = await first.createFileSystem({ files: {
-    "/large-a": new Uint8Array(34 * 1024 * 1024),
-    "/large-b": new Uint8Array(34 * 1024 * 1024),
+    "/large-a": new Uint8Array(100 * 1024 * 1024),
+    "/large-b": new Uint8Array(100 * 1024 * 1024),
+    "/large-c": new Uint8Array(100 * 1024 * 1024),
   } });
   await assert.rejects(large.snapshot(), /snapshot/);
   await Promise.all([large.dispose(), large.dispose()]); await large.dispose();
@@ -72,7 +74,19 @@ try {
   for (const [name, entries, pattern] of rejected) await assert.rejects(first.createFileSystem({ entries }), error => error.kind === "invalid-program" && pattern.test(error.message), name);
   await assert.rejects(first.createFileSystem({ entries: Array.from({ length: 1048577 }, (_, index) => file("/" + index)) }), /1048576 entries/);
   const sixty = new Uint8Array(60 * 1024 * 1024);
-  await assert.rejects(first.createFileSystem({ entries: [file("/a", { content: new Uint8Array(64 * 1024 * 1024 + 1) })] }), /larger than 64 MiB/);
+  await assert.rejects(first.createFileSystem({ entries: [file("/a", { content: new Uint8Array(128 * 1024 * 1024 + 1) })] }), /larger than 128 MiB/);
+  // One file past the old 64 MiB limit, such as an 83.5 MB biome, goes in and
+  // comes back whole.
+  const big = new Uint8Array(100 * 1024 * 1024); big[big.length - 1] = 7;
+  const bigFs = await first.createFileSystem({ entries: [file("/big", { content: big })] });
+  const bigEntry = (await bigFs.snapshot()).find(entry => entry.path === "/big");
+  assert.equal(bigEntry.content.length, big.length); assert.equal(bigEntry.content[big.length - 1], 7);
+  await bigFs.dispose();
+  // Creation counts a hard-link group once, a snapshot writes each link: three
+  // links to 100 MiB are accepted, but their 300 MiB snapshot is refused.
+  const manyLinks = await first.createFileSystem({ entries: ["/l1", "/l2", "/l3"].map(path => file(path, { inode: 9n, content: big })) });
+  await assert.rejects(manyLinks.snapshot(), /snapshot/);
+  await manyLinks.dispose();
   await assert.rejects(first.createFileSystem({ entries: Array.from({ length: 5 }, (_, index) => file("/" + index, { content: sixty })) }), /256 MiB/);
   await assert.rejects(first.createFileSystem({ files: { "/x/./f": new Uint8Array() }, entries: [file("/x/f")] }), /duplicate/);
   await assert.rejects(first.createFileSystem({ files: { "/x/f": new Uint8Array() }, entries: [file("/x")] }), /is a directory/);

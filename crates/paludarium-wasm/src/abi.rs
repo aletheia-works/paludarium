@@ -137,11 +137,16 @@ fn run(id: u32) -> Option<Arc<Run>> {
         .cloned()
 }
 
+/// The largest buffer the launcher can pass in: one file (or other value) of
+/// up to 128 MiB. A file is copied a few times on its way into the guest
+/// filesystem, all within the module's 1 GiB of memory.
+pub(crate) const MAX_BUFFER_BYTES: u32 = 128 << 20;
+
 // SAFETY: exported entrypoints take scalars and validated handles only. They
 // neither dereference caller-provided pointers nor export guest syscall numbers.
 #[unsafe(no_mangle)]
 pub extern "C" fn buffer_new(len: u32) -> u32 {
-    if len > 64 * 1024 * 1024 {
+    if len > MAX_BUFFER_BYTES {
         return 0;
     }
     insert(&BUFFERS, vec![0; len as usize])

@@ -44,8 +44,25 @@ pub(crate) struct Entry {
     pub mtime_ns: i128,
     pub content: Vec<u8>,
 }
+/// The largest snapshot: the 256 MiB of content a filesystem can be created
+/// with, and 16 MiB for paths and the other fields. It is a cap, not a bound
+/// every filesystem stays under: a snapshot writes the content of each hard
+/// link (creation counts a link group once) and 44 bytes plus the path for
+/// each entry, so many links to large files, or about a million entries, go
+/// past it, and `snapshot()` then fails.
+const MAX_SNAPSHOT_BYTES: usize = paludarium_vfs::MAX_ENTRY_BYTES + (16 << 20);
 pub(crate) fn snapshot_bytes(entries: &[Entry]) -> Option<Vec<u8>> {
-    let mut data = u32::MAX.to_le_bytes().to_vec();
+    // The size is known up front: a snapshot past the limit is refused before
+    // anything is allocated, and one within it is allocated once (a growing
+    // buffer would reach twice its size and run out of memory first).
+    let size = entries.iter().try_fold(12usize, |size, entry| {
+        size.checked_add(44 + entry.path.len() + entry.content.len())
+    })?;
+    if size > MAX_SNAPSHOT_BYTES {
+        return None;
+    }
+    let mut data = Vec::with_capacity(size);
+    data.extend_from_slice(&u32::MAX.to_le_bytes());
     data.extend_from_slice(&2u32.to_le_bytes());
     data.extend_from_slice(&u32::try_from(entries.len()).ok()?.to_le_bytes());
     for entry in entries {
@@ -57,10 +74,8 @@ pub(crate) fn snapshot_bytes(entries: &[Entry]) -> Option<Vec<u8>> {
         data.extend_from_slice(&entry.mtime_ns.to_le_bytes());
         data.extend_from_slice(&u32::try_from(entry.content.len()).ok()?.to_le_bytes());
         data.extend_from_slice(&entry.content);
-        if data.len() > 64 * 1024 * 1024 {
-            return None;
-        }
     }
+    debug_assert_eq!(data.len(), size);
     Some(data)
 }
 impl PrivateFs {

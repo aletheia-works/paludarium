@@ -44,7 +44,7 @@ function entryPlan({ entries, files, filesystem }) {
     const kind = Number.isInteger(mode) && mode >= 0 && mode <= 0o177777 ? KINDS[mode & 0o170000] : undefined;
     if (!kind) fail("mode is not a file, directory or symlink mode", path);
     if (!(content instanceof Uint8Array)) fail("content is not a Uint8Array", path);
-    if (content.length > 64 * 1024 * 1024) fail("content is larger than 64 MiB", path);
+    if (content.length > 128 * 1024 * 1024) fail("content is larger than 128 MiB", path);
     const mtimeNs = entry.mtimeNs === undefined ? 0n : integer(entry.mtimeNs), inode = entry.inode === undefined ? undefined : integer(entry.inode);
     if (mtimeNs === undefined || mtimeNs < -(1n << 127n) || mtimeNs >= 1n << 127n) fail("invalid mtimeNs", path);
     if ((entry.inode !== undefined && inode === undefined) || (entry.links !== undefined && integer(entry.links) === undefined)) fail("invalid inode or links", path);

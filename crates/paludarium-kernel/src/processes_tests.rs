@@ -308,7 +308,8 @@ mod process {
         );
         assert_eq!(ct.cpu.rip, GuestAddr(0x40_1000));
         assert!(c.group.is_stopped());
-        // A sleep is not restarted here (Linux resumes it with the time left).
+        // A sleep resumes through restart_syscall with the deadline it had,
+        // as Linux's restart block does: rewound with 219 in rax.
         assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 18, 0, 0, 0, 0]), 0);
         assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 19, 0, 0, 0, 0]), 0);
         cm.write(
@@ -319,9 +320,22 @@ mod process {
         ct.cpu.rip = GuestAddr(0x40_1002);
         assert_eq!(
             syscall(&mut c, &mut ct, &cm, 35, [DATA + 128, 0, 0, 0, 0, 0]),
+            219
+        );
+        assert_eq!(ct.cpu.rip, GuestAddr(0x40_1000));
+        assert!(ct.state.restart_block.is_some());
+        // After the continue (whose checkpoint keeps the restart block) the
+        // restarted call sleeps out the rest and ends.
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 18, 0, 0, 0, 0]), 0);
+        assert_eq!(c.checkpoint(&mut ct, &cm), Next::Resume);
+        assert!(ct.state.restart_block.is_some());
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 219, [0; 6]), 0);
+        assert!(ct.state.restart_block.is_none());
+        // With no restart block left, restart_syscall is EINTR.
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 219, [0; 6]),
             Errno(4).to_syscall_return()
         );
-        assert_eq!(ct.cpu.rip, GuestAddr(0x40_1002));
     }
     #[test]
     fn stop_and_continue_reports() {

@@ -166,6 +166,10 @@ pub struct ThreadState {
     /// The syscall now returning, when Linux would run it again (rather than
     /// fail it with EINTR) if the signal that interrupted it runs no handler.
     pub(crate) restart: Option<u64>,
+    /// What `restart_syscall` resumes after a stop: a wait with a timeout,
+    /// which Linux restarts with the time left (ERESTART_RESTARTBLOCK). It
+    /// lasts until a handler runs, through the checkpoints of the stop.
+    pub(crate) restart_block: Option<signals::RestartBlock>,
 }
 
 impl ThreadState {
@@ -368,6 +372,9 @@ impl Kernel {
             if action.handler == 0 || signal.number == 9 {
                 return self.terminate(thread, signal.number);
             }
+            // A handler ends any restart, as Linux's signal frame setup sets
+            // restart_block to do_no_restart_syscall.
+            thread.state.restart_block = None;
             let delivery_mask = thread.state.signal_mask;
             let restore_mask = thread.state.wait_restore_mask.take();
             if let Some(mask) = restore_mask {

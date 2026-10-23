@@ -24,6 +24,7 @@ pub mod nr {
     pub const TGKILL: u64 = 234;
     pub const WRITE: u64 = 1;
     pub const POLL: u64 = 7;
+    pub const RESTART_SYSCALL: u64 = 219;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
     pub const PPOLL: u64 = 271;
@@ -104,7 +105,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 54] = [
+        let entries: [(u64, Handler); 55] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -117,6 +118,7 @@ impl SyscallTable {
             (nr::CLOCK_NANOSLEEP, sys_clock_nanosleep),
             (nr::WRITE, sys_write),
             (nr::POLL, sys_poll),
+            (nr::RESTART_SYSCALL, sys_restart_syscall),
             (nr::PPOLL, sys_ppoll),
             (nr::SELECT, sys_select),
             (nr::PSELECT6, sys_pselect6),
@@ -320,6 +322,20 @@ fn sleep(c: &mut Context<'_>, clock: ClockId, absolute: bool, req: u64, rem: u64
     } else {
         now.saturating_add(request).min(i64::MAX as u64)
     };
+    sleep_until(c, clock, absolute, deadline, rem)
+}
+
+/// Sleeps on `clock` until `deadline`. A signal ends it with EINTR, writing
+/// the time left to `rem` for a relative sleep; a stop then resumes it, as
+/// Linux does: a relative sleep through `restart_syscall` with the same
+/// deadline, an absolute one by running the call again.
+fn sleep_until(
+    c: &mut Context<'_>,
+    clock: ClockId,
+    absolute: bool,
+    deadline: u64,
+    rem: u64,
+) -> Outcome {
     loop {
         let timer_generation = c.group.timer_generation();
         let clock_now = match c.host.clock(clock) {
@@ -373,10 +389,21 @@ fn sleep(c: &mut Context<'_>, clock: ClockId, absolute: bool, req: u64, rem: u64
             }
             Ok(WaitOutcome::Complete) | Ok(WaitOutcome::Interrupted) => {
                 if !absolute && rem != 0 {
-                    let now = c.host.clock(clock).unwrap_or(now);
+                    let now = c.host.clock(clock).unwrap_or(deadline);
                     if let Err(e) = write_timespec(c.mem, rem, deadline.saturating_sub(now)) {
                         return err(e);
                     }
+                }
+                if absolute {
+                    // ERESTARTNOHAND: the same call, with the same deadline.
+                    c.process.restart = Some(nr::CLOCK_NANOSLEEP);
+                } else {
+                    c.process.restart = Some(nr::RESTART_SYSCALL);
+                    c.process.restart_block = Some(signals::RestartBlock::Sleep {
+                        clock,
+                        deadline,
+                        rem,
+                    });
                 }
                 return err(Errno(4));
             }
@@ -830,9 +857,50 @@ fn sys_poll(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                     .saturating_add(timeout as u64 * 1_000_000),
             )
         };
-        wait_ready(c, deadline, |c| poll_once(c, fds, nfds))
+        poll_until(c, fds, nfds, deadline)
     })();
     outcome(result)
+}
+
+/// poll's wait. Interrupted with a timeout, a stop resumes it through
+/// `restart_syscall` with the same deadline, as Linux's `do_restart_poll`.
+fn poll_until(
+    c: &mut Context<'_>,
+    fds: u64,
+    nfds: u64,
+    deadline: Option<u64>,
+) -> Result<u64, Errno> {
+    let result = wait_ready(c, deadline, |c| poll_once(c, fds, nfds));
+    if result == Err(Errno(4))
+        && let Some(deadline) = deadline
+    {
+        c.process.restart = Some(nr::RESTART_SYSCALL);
+        c.process.restart_block = Some(signals::RestartBlock::Poll {
+            fds,
+            nfds,
+            deadline,
+        });
+    }
+    result
+}
+
+/// `restart_syscall()`: resumes the wait a stop interrupted, with the deadline
+/// it had. Without one (a handler ran, or the guest called it) it gives
+/// EINTR, as Linux's `do_no_restart_syscall`.
+fn sys_restart_syscall(c: &mut Context<'_>, _: [u64; 6]) -> Outcome {
+    match c.process.restart_block.take() {
+        Some(signals::RestartBlock::Sleep {
+            clock,
+            deadline,
+            rem,
+        }) => sleep_until(c, clock, false, deadline, rem),
+        Some(signals::RestartBlock::Poll {
+            fds,
+            nfds,
+            deadline,
+        }) => outcome(poll_until(c, fds, nfds, Some(deadline))),
+        None => err(Errno(4)),
+    }
 }
 
 /// Runs `check` until it finds something ready or `deadline` passes, waiting

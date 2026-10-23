@@ -902,9 +902,11 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "stop-restart")) {
-        /* A child blocked in read, then in poll with no timeout, is stopped
-           and continued: each call runs again instead of failing with EINTR,
-           as no handler ran. The child says "ready" before each call; a stop
+        /* A child blocked in read, then in poll with no timeout, then in
+           nanosleep, poll with a timeout and an absolute clock_nanosleep, is
+           stopped and continued: each call runs again (the timed ones with
+           the time they had left) instead of failing with EINTR, as no
+           handler ran. The child says "ready" before each call; a stop
            that lands before the call is entered changes nothing. */
         int ready[2], data[2];
         if (pipe(ready) || pipe(data)) return 81;
@@ -918,6 +920,23 @@ int main(int argc, char **argv) {
             struct pollfd pfd = {data[0], POLLIN, 0};
             int r = poll(&pfd, 1, -1);
             if (r != 1) _exit(r < 0 && errno == EINTR ? 86 : 87);
+            /* Timed waits resume with the time they had left. */
+            if (read(data[0], &byte, 1) != 1) _exit(88);
+            if (write(ready[1], "s", 1) != 1) _exit(89);
+            struct timespec sleep = {0, 300000000};
+            if (nanosleep(&sleep, NULL)) _exit(90);
+            if (write(ready[1], "t", 1) != 1) _exit(91);
+            r = poll(&pfd, 1, 300);
+            if (r != 0) _exit(r < 0 ? (errno == EINTR ? 95 : 96) : 92);
+            if (write(ready[1], "a", 1) != 1) _exit(93);
+            struct timespec until;
+            clock_gettime(CLOCK_MONOTONIC, &until);
+            until.tv_nsec += 300000000;
+            if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+            if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, NULL)) _exit(94);
+            /* Wait for the parent, so that a sleep which ends before the stop
+               (the emulated harness's clock is virtual) cannot exit early. */
+            if (read(data[0], &byte, 1) != 1) _exit(97);
             _exit(0);
         }
         /* Only the child writes ready and reads data, so an early exit of
@@ -927,7 +946,7 @@ int main(int argc, char **argv) {
         signal(SIGPIPE, SIG_IGN);
         int status;
         char byte;
-        for (int round = 0; round < 2; round++) {
+        for (int round = 0; round < 5; round++) {
             if (read(ready[0], &byte, 1) != 1) break;
             struct timespec nap = {0, 20000000};
             nanosleep(&nap, NULL);
@@ -935,8 +954,10 @@ int main(int argc, char **argv) {
             result("stopped", waitpid(pid, &status, WUNTRACED) == pid && WIFSTOPPED(status));
             kill(pid, SIGCONT);
             result("continued", waitpid(pid, &status, WCONTINUED) == pid && WIFCONTINUED(status));
-            if (write(data[1], "x", 1) != 1) break;
+            /* A byte for the read, then one for the poll (read after it). */
+            if (round < 2 && write(data[1], "x", 1) != 1) break;
         }
+        if (write(data[1], "z", 1) != 1) return 98;
         result("exited", waitpid(pid, &status, 0) == pid);
         result("code", WEXITSTATUS(status));
         return 0;

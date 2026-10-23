@@ -1,6 +1,7 @@
 //! Checked Linux x86-64 signal frame codec. Offsets are observed by signals-14.
 use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState};
 use paludarium_cpu::{CpuState, flag, reg};
+use paludarium_host::ClockId;
 use paludarium_mmu::AddressSpace;
 use paludarium_types::{GuestAddr, USER_ADDRESS_LIMIT};
 
@@ -156,6 +157,21 @@ pub(crate) fn queue(process: &mut ThreadState, signal: PendingSignal) {
         return;
     }
     process.pending.push(signal);
+}
+
+/// A wait that `restart_syscall` resumes after a stop, with its absolute
+/// deadline, as Linux's `restart_block` keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartBlock {
+    /// nanosleep or a relative clock_nanosleep: the clock, the deadline on
+    /// it and where the time left goes (0 for nowhere).
+    Sleep {
+        clock: ClockId,
+        deadline: u64,
+        rem: u64,
+    },
+    /// poll with a timeout: its array and the monotonic deadline.
+    Poll { fds: u64, nfds: u64, deadline: u64 },
 }
 
 /// Whether Linux runs syscall `number` again when a signal that runs no

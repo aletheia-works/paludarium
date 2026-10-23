@@ -47,7 +47,22 @@ pub(crate) struct PendingSignal {
     pub synchronous: bool,
     /// The POSIX timer that queued this signal (SI_TIMER).
     pub timer: Option<TimerSignal>,
+    /// The child a SIGCHLD reports on; `code` is its `CLD_*` code.
+    pub child: Option<ChildSignal>,
 }
+/// `si_pid`, `si_status` and the CPU time (`si_utime`) of a SIGCHLD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildSignal {
+    pub pid: u32,
+    pub status: i32,
+    /// CPU time in nanoseconds, all reported as user time.
+    pub cpu: u64,
+}
+/// `si_code` values of SIGCHLD.
+pub(crate) const CLD_EXITED: i32 = 1;
+pub(crate) const CLD_KILLED: i32 = 2;
+pub(crate) const CLD_STOPPED: i32 = 5;
+pub(crate) const CLD_CONTINUED: i32 = 6;
 /// `si_timerid`, `si_overrun` and `si_value` of a timer's signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TimerSignal {
@@ -69,6 +84,11 @@ pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128
         info[24..32].copy_from_slice(&timer.value.to_le_bytes());
     } else if signal.synchronous {
         info[16..24].copy_from_slice(&signal.addr.to_le_bytes());
+    } else if let Some(child) = signal.child {
+        // si_uid stays 0: the guest runs as root. Times are in USER_HZ ticks.
+        info[16..20].copy_from_slice(&child.pid.to_le_bytes());
+        info[24..28].copy_from_slice(&child.status.to_le_bytes());
+        info[32..40].copy_from_slice(&(child.cpu / 10_000_000).to_le_bytes());
     } else {
         info[16..20].copy_from_slice(&process.pid.to_le_bytes());
     }
@@ -85,6 +105,7 @@ impl PendingSignal {
             error: 0,
             synchronous: false,
             timer: None,
+            child: None,
         }
     }
     pub fn thread(number: i32, code: i32) -> Self {

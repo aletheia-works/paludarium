@@ -19,13 +19,16 @@ for (const name of ["app/package.json", "app/filedep/package.json", "outside/lin
 const input = { oracle, config: oracle.case_config, probe: new Uint8Array(probe), aube: new Uint8Array(aube), ripgrep: new Uint8Array(ripgrep), ripgrepCases, fixtures };
 if (!input.config) throw new Error("Exact fresh native case config missing");
 const report = { schema: 1, environment, module_sha256: hash(await readFile(modulePath)), oracle_sha256: hash(rawOracle),
-                 guest_hashes: oracle.binary_hashes, rows: { interpreter: {}, jit: {} }, ripgrep: { interpreter: {}, jit: {} }, complete: false };
+                 guest_hashes: oracle.binary_hashes, rows: { interpreter: {}, jit: {} }, ripgrep: { interpreter: {}, jit: {} }, restored: { interpreter: {}, jit: {} }, complete: false };
 await mkdir(outputDirectory, { recursive: true });
 const persist = () => writeFile(resolve(outputDirectory, "observations.json"), JSON.stringify(report, null, 2) + "\n");
 await persist();
 const onRow = async (mode, name, row, group = "rows") => {
-  report[group === "ripgrep" ? "ripgrep" : "rows"][mode][name] = row; await persist();
-  console.log(JSON.stringify({ environment, mode, name: (group === "ripgrep" ? "ripgrep-" : "") + name, pass: row.pass, seconds: row.seconds, jit: row.jit, error: row.comparison_error ?? row.jit_error }));
+  // The aube steps rerun on a filesystem rebuilt from its snapshot are kept
+  // apart from the first ones, which they would otherwise overwrite.
+  const key = group === "ripgrep" || group === "restored" ? group : "rows";
+  report[key][mode][name] = row; await persist();
+  console.log(JSON.stringify({ environment, mode, name: (key === "rows" ? "" : key + "-") + name, pass: row.pass, seconds: row.seconds, jit: row.jit, error: row.comparison_error ?? row.jit_error }));
 };
 let server;
 try {

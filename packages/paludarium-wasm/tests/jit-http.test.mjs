@@ -47,6 +47,9 @@ test("valid row persists before acknowledgement", async t => {
   assert.equal(response.status, 200); assert.deepEqual(saved, ["jit", "probe", { pass: true }, "rows"]);
   const ripgrep = await fetch(url + "/row", { method: "POST", body: JSON.stringify({ mode: "interpreter", name: "mmap", row: { pass: true }, group: "ripgrep" }) });
   assert.equal(ripgrep.status, 200); assert.deepEqual(saved, ["interpreter", "mmap", { pass: true }, "ripgrep"]);
+  // A restored row reruns a case of the oracle's rows.
+  const restored = await fetch(url + "/row", { method: "POST", body: JSON.stringify({ mode: "jit", name: "probe", row: { pass: true }, group: "restored" }) });
+  assert.equal(restored.status, 200); assert.deepEqual(saved, ["jit", "probe", { pass: true }, "restored"]);
 });
 test("invalid rows and persistence failures finish with 500", async t => {
   const url = await withServer(t, { onRow: async () => { throw Error("persist failed"); } });

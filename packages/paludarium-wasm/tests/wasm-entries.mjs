@@ -67,6 +67,11 @@ export async function observeRestoredAube(launch, { files, fileModes, cwd, envir
         }
         if (item.before) await filesystem.remove(cwd + "/node_modules", { recursive: true });
         row = await observeProgram(launcher, { program: "/aube", cwd, args: ["/aube", ...item.args], env: environment, filesystem, jit });
+        // The JIT proof of the run, as the first aube steps record it.
+        if (jit) {
+          try { row.jit = (await launcher.diagnostics()).workers.filter(worker => !worker.guestThread).at(-1)?.jit; }
+          catch (cause) { row.jit_diagnostics_error = String(cause); }
+        }
         const entries = await filesystem.snapshot();
         compare(oracle.rows[item.name], row, oracle.fixture_root, oracle.fixture_root);
         row.filesystem_comparison = await compareFilesystem(oracle.rows[item.name].filesystem_metadata, entries, fixtureRoot); row.pass = true;

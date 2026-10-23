@@ -71,6 +71,17 @@ def validate(report):
             finished(row, lambda code: code == 0)
             if mode == "jit":
                 translated(row)
+    # The aube steps again, each on a filesystem rebuilt from its snapshot.
+    if set(report.get("restored", {})) != {"interpreter", "jit"}:
+        raise ValueError("JIT restored mode inventory changed")
+    for mode in ("interpreter", "jit"):
+        rows = report["restored"][mode]
+        if sorted(rows) != sorted(expected[-4:]):
+            raise ValueError("JIT restored case inventory changed")
+        for row in rows.values():
+            finished(row, lambda code: code == 0)
+            if mode == "jit":
+                translated(row)
     # The ripgrep searches, kept apart from the 28 cases; some end with 1 or 2.
     cases = json.loads((ROOT / "tests/guests/programs/ripgrep-cases.json").read_text())["cases"]
     if set(report.get("ripgrep", {})) != {"interpreter", "jit"}:

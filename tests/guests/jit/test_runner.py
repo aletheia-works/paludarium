@@ -59,6 +59,10 @@ def valid():
             }
             for mode in ("interpreter", "jit")
         },
+        restored={
+            mode: {name: copy.deepcopy(row) for name in NAMES[-4:]}
+            for mode in ("interpreter", "jit")
+        },
     )
 
 
@@ -150,6 +154,24 @@ class RunnerTests(unittest.TestCase):
             lambda r: r["ripgrep"]["interpreter"][first].update(timed_out=True),
             lambda r: r["ripgrep"]["interpreter"][first].update(seconds=31),
             lambda r: r["ripgrep"]["jit"][first]["jit"].update(executedBlocks="0"),
+        ):
+            with self.subTest():
+                self.rejected(change)
+
+    def test_restored(self):
+        # The aube steps rerun on a rebuilt filesystem, in any key order.
+        report = valid()
+        report["restored"]["jit"] = dict(reversed(list(report["restored"]["jit"].items())))
+        runner.validate(report)
+        for change in (
+            lambda r: r.pop("restored"),
+            lambda r: r["restored"].pop("jit"),
+            lambda r: r["restored"]["interpreter"].pop("list"),
+            lambda r: r["restored"]["jit"].update(extra=r["restored"]["jit"]["list"]),
+            lambda r: r["restored"]["interpreter"]["install"].update(exit=1),
+            lambda r: r["restored"]["interpreter"]["install"].update({"pass": False}),
+            lambda r: r["restored"]["jit"]["install"].pop("jit"),
+            lambda r: r["restored"]["jit"]["install"]["jit"].update(executedInstructions="0"),
         ):
             with self.subTest():
                 self.rejected(change)

@@ -135,6 +135,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `WCONTINUED` がないと待てません（`ECHILD`）。停止と再開は、`WUNTRACED`
   （`WSTOPPED`）か `WCONTINUED` を付けた待ちにそれぞれ一度だけ報告し（`WNOWAIT` なら
   残します）、親が `SA_NOCLDSTOP` を付けていなければ `SIGCHLD` で知らせます。
+  `SIGCHLD` の siginfo には、子の PID、`CLD_*` のコード（`CLD_EXITED`、`CLD_KILLED`、
+  `CLD_STOPPED`、`CLD_CONTINUED`）、状態、`si_utime` としての CPU 時間が入ります。
+  `si_uid` は 0 で、`SIGCHLD` が保留中に届いた次の `SIGCHLD` は、Linux と同じく捨てます。
   `pidfd_open` の pidfd は、そのプロセスが終わると読めるようになり（回収されると
   切断も示します）、`epoll` で待てます。ノンブロッキングの pidfd での
   `waitid(P_PIDFD)` は `EAGAIN` を返します。`pidfd_send_signal` は siginfo と

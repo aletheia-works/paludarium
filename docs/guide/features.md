@@ -146,7 +146,10 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). A stop and a
   continue are reported once each to a wait with `WUNTRACED` (`WSTOPPED`) or
   `WCONTINUED` (`WNOWAIT` leaves them), and `SIGCHLD` tells the parent unless
-  it set `SA_NOCLDSTOP`. A pidfd from `pidfd_open` becomes
+  it set `SA_NOCLDSTOP`. The siginfo of `SIGCHLD` carries the child's PID, its
+  `CLD_*` code (`CLD_EXITED`, `CLD_KILLED`, `CLD_STOPPED`, `CLD_CONTINUED`), its
+  status and its CPU time as `si_utime`; `si_uid` is 0, and a `SIGCHLD` sent
+  while one is pending is dropped, as Linux does. A pidfd from `pidfd_open` becomes
   readable when its process exits (and hung up once it is reaped), so `epoll`
   can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives `EAGAIN`.
   `pidfd_send_signal` takes no siginfo and no scope flags, and `PIDFD_THREAD`

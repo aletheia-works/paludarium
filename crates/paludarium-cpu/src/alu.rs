@@ -47,13 +47,19 @@ pub const fn sign_extend(value: u64, size: u8) -> u64 {
 }
 
 /// ZF, SF and PF of a result.
+///
+/// The operand is shifted to the top of the word rather than masked: with a
+/// mask per size, LLVM merges the masked values in one wasm local, and
+/// JavaScriptCore on x86-64 (WebKit 27.2) then tests only its low 32 bits,
+/// setting ZF for `0x8000_0000_0000_0000`.
 #[must_use]
 pub fn zf_sf_pf(result: u64, size: u8) -> u64 {
+    let top = result << (64 - bits(size));
     let mut f = 0;
-    if result & size_mask(size) == 0 {
+    if top == 0 {
         f |= flag::ZF;
     }
-    if result & sign_bit(size) != 0 {
+    if top >> 63 != 0 {
         f |= flag::SF;
     }
     // PF is set when the low byte has an even number of one bits.
@@ -205,6 +211,21 @@ pub fn condition(rflags: u64, cond: Condition) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn zf_sf_pf_looks_at_the_whole_operand() {
+        // A zero low half does not make ZF: JavaScriptCore on x86-64 once
+        // tested only the low 32 bits of the masked result.
+        for value in [1 << 63, 1 << 62, 1 << 32] {
+            assert_eq!(zf_sf_pf(value, 8) & flag::ZF, 0, "{value:#x}");
+        }
+        assert_eq!(zf_sf_pf(1 << 63, 8) & flag::SF, flag::SF);
+        assert_eq!(zf_sf_pf(1 << 62, 8) & flag::SF, 0);
+        // Bits above the operand size are ignored.
+        assert_eq!(zf_sf_pf(0x1_0000_0000, 4), flag::ZF | flag::PF);
+        assert_eq!(zf_sf_pf(0x8000_0000, 4) & flag::SF, flag::SF);
+        assert_eq!(zf_sf_pf(0x1_0000, 2), flag::ZF | flag::PF);
+        assert_eq!(zf_sf_pf(0x180, 1), flag::SF);
+    }
     #[test]
     fn add_sets_carry_overflow_and_adjust() {
         // 0x7f + 1 (8-bit): signed overflow, AF, no carry.

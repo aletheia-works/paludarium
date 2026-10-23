@@ -168,8 +168,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
   `sendto`、`recvfrom`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
-  `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll` は、`restart_syscall` で元の
-  締め切りのまま待ちを続け、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが
+  `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll`、時間制限つきの `futex` の待ちは、
+  `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
+  `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが
   動いたときはやり直さず、`EINTR` を返します。
   `epoll_wait` と `rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。
   `rt_sigsuspend` は、シグナルのマスクを渡されたマスクに置き換えてハンドラが動くまで待ちます。

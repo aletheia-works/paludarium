@@ -407,6 +407,34 @@ impl Kernel {
                 return Some(Next::Exit(status));
             }
             202 => self.futex_wait(thread, mem, a),
+            // restart_syscall resuming a timed futex wait a stop interrupted.
+            219 if matches!(
+                thread.state.restart_block,
+                Some(signals::RestartBlock::Futex { .. })
+            ) =>
+            {
+                let Some(signals::RestartBlock::Futex {
+                    uaddr,
+                    value,
+                    private,
+                    mask,
+                    clock,
+                    deadline,
+                }) = thread.state.restart_block.take()
+                else {
+                    unreachable!("matched above")
+                };
+                self.futex_wait_until(
+                    thread,
+                    mem,
+                    uaddr,
+                    value,
+                    private,
+                    mask,
+                    clock,
+                    Some(deadline),
+                )
+            }
             62 => {
                 if a[1] > 64 {
                     Err(Errno::EINVAL)
@@ -607,10 +635,65 @@ impl Kernel {
         } else {
             None
         };
+        self.futex_wait_until(
+            thread,
+            mem,
+            a[0],
+            a[2] as u32,
+            private,
+            mask,
+            clock,
+            deadline,
+        )
+    }
+    /// The wait of FUTEX_WAIT and FUTEX_WAIT_BITSET until `deadline` (on
+    /// `clock`), or without one. Interrupted with a deadline, a stop resumes
+    /// it through `restart_syscall` with the same deadline, rechecking the
+    /// value first, as Linux's `futex_wait_restart` does.
+    #[allow(clippy::too_many_arguments)]
+    fn futex_wait_until(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        uaddr: u64,
+        value: u32,
+        private: bool,
+        mask: u32,
+        clock: ClockId,
+        deadline: Option<u64>,
+    ) -> Result<u64, Errno> {
+        let result = self.futex_wait_on(thread, mem, uaddr, value, private, mask, clock, deadline);
+        if result == Err(Errno(4))
+            && let Some(deadline) = deadline
+        {
+            thread.state.restart = Some(219);
+            thread.state.restart_block = Some(signals::RestartBlock::Futex {
+                uaddr,
+                value,
+                private,
+                mask,
+                clock,
+                deadline,
+            });
+        }
+        result
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn futex_wait_on(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        uaddr: u64,
+        value: u32,
+        private: bool,
+        mask: u32,
+        clock: ClockId,
+        deadline: Option<u64>,
+    ) -> Result<u64, Errno> {
         let waiter = self
             .group
             .futexes
-            .register(mem, a[0], private, a[2] as u32, mask)?;
+            .register(mem, uaddr, private, value, mask)?;
         let mut interrupted = false;
         loop {
             let state = waiter.state.load(Ordering::SeqCst);
@@ -631,7 +714,7 @@ impl Kernel {
             let now = match self.host.clock(clock) {
                 Ok(now) => now,
                 Err(error) => {
-                    self.group.futexes.finish(mem, a[0], private, &waiter, 3);
+                    self.group.futexes.finish(mem, uaddr, private, &waiter, 3);
                     return Err(error);
                 }
             };
@@ -648,7 +731,7 @@ impl Kernel {
             if result != 0 {
                 self.group
                     .futexes
-                    .finish(mem, a[0], private, &waiter, result);
+                    .finish(mem, uaddr, private, &waiter, result);
                 continue;
             }
             let end = deadline
@@ -661,7 +744,7 @@ impl Kernel {
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        self.group.futexes.finish(mem, a[0], private, &waiter, 3);
+                        self.group.futexes.finish(mem, uaddr, private, &waiter, 3);
                         return Err(error);
                     }
                 };

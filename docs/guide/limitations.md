@@ -20,9 +20,7 @@ verified.
 - **Some system calls**: `CLONE_SIGHAND` between separate processes is not
   there yet. Unimplemented system calls return `ENOSYS`, so some programs can
   carry on without the feature.
-- **Some signal details**: a timed `futex` wait that a stop interrupts returns
-  `EINTR` after the continue, where Linux resumes it with the time left. No
-  core file is written, so a child killed by `SIGSEGV`,
+- **Some signal details**: no core file is written, so a child killed by `SIGSEGV`,
   `SIGABRT` or another core-dumping signal is reported as `CLD_KILLED`,
   without the core flag in its `wait` status, where Linux may report
   `CLD_DUMPED`.

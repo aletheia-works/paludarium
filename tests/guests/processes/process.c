@@ -903,7 +903,8 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "stop-restart")) {
         /* A child blocked in read, then in poll with no timeout, then in
-           nanosleep, poll with a timeout and an absolute clock_nanosleep, is
+           nanosleep, poll with a timeout, an absolute clock_nanosleep and a
+           timed futex wait, is
            stopped and continued: each call runs again (the timed ones with
            the time they had left) instead of failing with EINTR, as no
            handler ran. The child says "ready" before each call; a stop
@@ -934,6 +935,12 @@ int main(int argc, char **argv) {
             until.tv_nsec += 300000000;
             if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
             if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, NULL)) _exit(94);
+            /* A timed futex wait nobody wakes ends with ETIMEDOUT, not EINTR. */
+            if (write(ready[1], "f", 1) != 1) _exit(99);
+            static int word;
+            struct timespec wait = {0, 300000000};
+            long f = syscall(SYS_futex, &word, 128 /* FUTEX_WAIT_PRIVATE */, 0, &wait, NULL, 0);
+            if (f != -1 || errno != ETIMEDOUT) _exit(f == -1 && errno == EINTR ? 100 : 101);
             /* Wait for the parent, so that a sleep which ends before the stop
                (the emulated harness's clock is virtual) cannot exit early. */
             if (read(data[0], &byte, 1) != 1) _exit(97);
@@ -946,7 +953,7 @@ int main(int argc, char **argv) {
         signal(SIGPIPE, SIG_IGN);
         int status;
         char byte;
-        for (int round = 0; round < 5; round++) {
+        for (int round = 0; round < 6; round++) {
             if (read(ready[0], &byte, 1) != 1) break;
             struct timespec nap = {0, 20000000};
             nanosleep(&nap, NULL);

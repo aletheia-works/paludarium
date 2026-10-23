@@ -899,7 +899,8 @@ fn sys_restart_syscall(c: &mut Context<'_>, _: [u64; 6]) -> Outcome {
             nfds,
             deadline,
         }) => outcome(poll_until(c, fds, nfds, Some(deadline))),
-        None => err(Errno(4)),
+        // A futex wait resumes in the thread code, which takes the block first.
+        Some(signals::RestartBlock::Futex { .. }) | None => err(Errno(4)),
     }
 }
 

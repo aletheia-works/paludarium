@@ -172,14 +172,26 @@ pub(crate) enum RestartBlock {
     },
     /// poll with a timeout: its array and the monotonic deadline.
     Poll { fds: u64, nfds: u64, deadline: u64 },
+    /// A timed futex wait, as Linux's `futex_wait_restart` resumes it: the
+    /// word, the value it must still hold, the bitset, and the deadline on
+    /// the wait's clock.
+    Futex {
+        uaddr: u64,
+        value: u32,
+        private: bool,
+        mask: u32,
+        clock: ClockId,
+        deadline: u64,
+    },
 }
 
 /// Whether Linux runs syscall `number` again when a signal that runs no
 /// handler (a stop) interrupts it: the calls that return ERESTARTSYS or
 /// ERESTARTNOHAND, listed as Linux has them, including some not implemented
-/// here yet. Waits with a timeout restart through restart_syscall with
-/// the time left, which is not modelled, so they still give EINTR, as do
-/// epoll_wait, rt_sigtimedwait and the sleeps.
+/// here yet. The waits Linux resumes through restart_syscall with the time
+/// left (nanosleep, a relative clock_nanosleep, poll and a futex wait with a
+/// timeout) are not listed: they arm a [`RestartBlock`] themselves when
+/// interrupted. epoll_wait and rt_sigtimedwait give EINTR, as on Linux.
 pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
     match number {
         // read, write, pread64, pwrite64, readv, writev, preadv, pwritev,

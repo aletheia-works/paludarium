@@ -292,6 +292,87 @@ mod process {
         assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [1, ct.tid, 0]));
     }
     #[test]
+    fn stop_resumes_a_timed_futex_wait() {
+        for changed in [false, true] {
+            let (mut k, mut t, m) = setup();
+            let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+            let pid = u64::from(ct.tid);
+            cm.write_u64(GuestAddr(DATA), 7).unwrap();
+            cm.write(
+                GuestAddr(DATA + 64),
+                &[1u64, 0].map(u64::to_le_bytes).concat(),
+            )
+            .unwrap();
+            // FUTEX_WAIT_PRIVATE for 1 s, interrupted by a stop: rewound to
+            // restart_syscall with the futex's deadline kept.
+            assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 19, 0, 0, 0, 0]), 0);
+            ct.cpu.rip = GuestAddr(0x40_1002);
+            assert_eq!(
+                syscall(&mut c, &mut ct, &cm, 202, [DATA, 128, 7, DATA + 64, 0, 0]),
+                219
+            );
+            assert_eq!(ct.cpu.rip, GuestAddr(0x40_1000));
+            assert!(matches!(
+                ct.state.restart_block,
+                Some(crate::signals::RestartBlock::Futex { value: 7, .. })
+            ));
+            assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 18, 0, 0, 0, 0]), 0);
+            assert_eq!(c.checkpoint(&mut ct, &cm), Next::Resume);
+            // Resumed, it rechecks the word (EAGAIN once it changed) and then
+            // waits out the same deadline (ETIMEDOUT, nobody wakes it).
+            if changed {
+                cm.write_u64(GuestAddr(DATA), 8).unwrap();
+            }
+            let expected = if changed { Errno::EAGAIN } else { Errno(110) };
+            assert_eq!(
+                syscall(&mut c, &mut ct, &cm, 219, [0; 6]),
+                expected.to_syscall_return()
+            );
+            assert!(ct.state.restart_block.is_none());
+        }
+    }
+    #[test]
+    fn stop_resumes_a_realtime_futex_bitset_wait() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let pid = u64::from(ct.tid);
+        cm.write_u64(GuestAddr(DATA), 7).unwrap();
+        // FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME until a second from
+        // now on CLOCK_REALTIME: the block keeps that clock and deadline.
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 228, [0, DATA + 64, 0, 0, 0, 0]),
+            0
+        );
+        let now = cm.read_u64(GuestAddr(DATA + 64)).unwrap();
+        cm.write_u64(GuestAddr(DATA + 64), now + 1).unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 19, 0, 0, 0, 0]), 0);
+        ct.cpu.rip = GuestAddr(0x40_1002);
+        assert_eq!(
+            syscall(
+                &mut c,
+                &mut ct,
+                &cm,
+                202,
+                [DATA, 9 | 128 | 256, 7, DATA + 64, 0, u64::from(u32::MAX)]
+            ),
+            219
+        );
+        assert!(matches!(
+            ct.state.restart_block,
+            Some(crate::signals::RestartBlock::Futex {
+                clock: paludarium_host::ClockId::Realtime,
+                mask: u32::MAX,
+                ..
+            })
+        ));
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [pid, 18, 0, 0, 0, 0]), 0);
+        assert_eq!(c.checkpoint(&mut ct, &cm), Next::Resume);
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 219, [0; 6]),
+            Errno(110).to_syscall_return()
+        );
+    }
+    #[test]
     fn stop_restarts_a_blocking_read() {
         let (mut k, mut t, m) = setup();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);

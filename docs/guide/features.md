@@ -181,14 +181,16 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   continue with `SIGSTOP`. A blocking call that a stop interrupts runs again
   after the continue, as Linux restarts it when no handler runs: `read`,
   `write`, `readv`, `writev`, `pread64`, `pwrite64`, `preadv`, `pwritev`,
-  `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `sendto`, `recvfrom`, `ppoll`, `select`, `pselect6`, `poll` with no timeout and
-  a `futex` wait with none. `nanosleep`, a relative `clock_nanosleep` and
-  `poll` with a timeout resume through `restart_syscall` with the deadline
-  they had, and an absolute `clock_nanosleep` runs again; a handler ends the
-  restart, so they give `EINTR` then. `epoll_wait` and
-  `rt_sigtimedwait` give `EINTR`, as on Linux. `rt_sigsuspend` waits with
-  its mask in place of the signal mask until a handler has run, which runs
-  with that mask; the original mask is back after it.
+  `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `sendto`, `recvfrom`,
+  `ppoll`, `select`, `pselect6`, `poll` with no timeout and a `futex` wait with
+  none. `nanosleep`, a relative `clock_nanosleep`, `poll` with a timeout and a
+  timed `futex` wait resume through `restart_syscall` with the deadline they had
+  (the `futex` wait checks its word again first, `EAGAIN` once it changed), and
+  an absolute `clock_nanosleep` runs again; a handler ends the restart, so they
+  give `EINTR` then. `epoll_wait` and `rt_sigtimedwait` give `EINTR`, as on
+  Linux. `rt_sigsuspend` waits with its mask in place of the signal mask until a
+  handler has run, which runs with that mask; the original mask is back after
+  it.
 
 ## Filesystem
 

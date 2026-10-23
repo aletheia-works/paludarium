@@ -724,16 +724,13 @@ impl Kernel {
         if flags & !known != 0 {
             return Err(Errno::EINVAL);
         }
-        if flags & 0x800 != 0 {
-            return Err(Errno::ENOSYS);
-        } // Shared dispositions require their own ownership model.
         if a[1] >= paludarium_types::USER_ADDRESS_LIMIT
             || flags & 0x80000 != 0 && a[4] >= paludarium_types::USER_ADDRESS_LIMIT
         {
             return Err(Errno::EPERM);
         }
         let pid = self.processes.allocate()?;
-        let group = Arc::new(self.group.fork());
+        let group = Arc::new(self.group.fork(flags & 0x800 != 0));
         // CLONE_CLEAR_SIGHAND resets handled signals to their default and
         // keeps ignored ones, as execve does.
         if flags & CLONE_CLEAR_SIGHAND != 0 {

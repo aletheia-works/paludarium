@@ -21,7 +21,9 @@ pub struct ThreadGroup {
     stopped: std::sync::atomic::AtomicBool,
     members: Mutex<BTreeMap<u32, Arc<SignalInbox>>>,
     status: Mutex<Option<ExitStatus>>,
-    actions: Mutex<BTreeMap<i32, SignalAction>>,
+    /// The signal dispositions, which clone with `CLONE_SIGHAND` also shares
+    /// with another process (Linux's `sighand_struct`).
+    actions: Mutex<Arc<Mutex<BTreeMap<i32, SignalAction>>>>,
     process_inbox: Mutex<Arc<SignalInbox>>,
     process_pending: Mutex<ThreadState>,
     timer_generation: AtomicU64,
@@ -38,7 +40,7 @@ impl Default for ThreadGroup {
             stopped: std::sync::atomic::AtomicBool::new(false),
             members: Mutex::new(BTreeMap::new()),
             status: Mutex::new(None),
-            actions: Mutex::new(BTreeMap::new()),
+            actions: Mutex::default(),
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
             process_pending: Mutex::new(ThreadState::default()),
             timer_generation: AtomicU64::new(0),
@@ -79,16 +81,29 @@ impl ThreadGroup {
             .remove(&pid);
         self.exec_owner.store(0, Ordering::SeqCst);
     }
-    pub(crate) fn fork(&self) -> Self {
+    /// A new process's group: a copy of the dispositions, or with
+    /// `share_actions` (`CLONE_SIGHAND`) the same ones.
+    pub(crate) fn fork(&self, share_actions: bool) -> Self {
+        let actions = self.shared_actions();
+        let actions = if share_actions {
+            actions
+        } else {
+            let copy = actions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            Arc::new(Mutex::new(copy))
+        };
         Self {
-            actions: Mutex::new(
-                self.actions
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone(),
-            ),
+            actions: Mutex::new(actions),
             ..Self::default()
         }
+    }
+    pub(crate) fn shared_actions(&self) -> Arc<Mutex<BTreeMap<i32, SignalAction>>> {
+        self.actions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
     pub(crate) fn register_cpu(&self, used: Arc<AtomicU64>) {
         self.cpu
@@ -119,11 +134,19 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .send(number)
     }
+    /// Resets handled signals to their default and keeps ignored ones, as
+    /// execve does. The process gets its own copy, so a process sharing the
+    /// dispositions through `CLONE_SIGHAND` keeps its handlers.
     pub(crate) fn exec_actions(&self) {
-        self.actions
+        let mut slot = self.actions.lock().unwrap_or_else(PoisonError::into_inner);
+        let kept = slot
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|_, action| action.handler == 1);
+            .iter()
+            .filter(|(_, action)| action.handler == 1)
+            .map(|(&number, &action)| (number, action))
+            .collect();
+        *slot = Arc::new(Mutex::new(kept));
     }
     pub(crate) fn sync_timer(&self, local: &mut ThreadState) {
         local.timer = self
@@ -276,7 +299,7 @@ impl ThreadGroup {
     /// when it ignores SIGCHLD or set SA_NOCLDSTOP, as in Linux's
     /// `do_notify_parent_cldstop`.
     pub(crate) fn wants_stop_notices(&self) -> bool {
-        self.actions
+        self.shared_actions()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&17)
@@ -340,7 +363,7 @@ impl ThreadGroup {
             .fold(0, |set, signal| set | 1 << (signal.number - 1))
     }
     pub(crate) fn set_action(&self, n: i32, a: SignalAction) {
-        self.actions
+        self.shared_actions()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(n, a);
@@ -374,11 +397,8 @@ impl Kernel {
             .remove(&thread.tid);
     }
     pub(crate) fn sync_actions(&mut self, thread: &mut Thread) {
-        let shared = self
-            .group
-            .actions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let actions = self.group.shared_actions();
+        let shared = actions.lock().unwrap_or_else(PoisonError::into_inner);
         for (&n, &a) in shared.iter() {
             thread.state.signal_actions.insert(n, a);
         }

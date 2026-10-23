@@ -71,6 +71,21 @@ static pid_t pester(int number) {
 }
 static int vm_value;
 static int vm_child(void *unused) { (void)unused; vm_value = 23; return 4; }
+/* CLONE_SIGHAND children: one installs a SIGUSR1 handler, one execs. */
+static int sighand_child(void *unused) {
+    (void)unused;
+    struct sigaction action = {0};
+    action.sa_handler = interrupted;
+    return sigaction(SIGUSR1, &action, NULL) ? 1 : 5;
+}
+static char *sighand_self;
+static int sighand_exec(void *unused) {
+    (void)unused;
+    char *args[] = { "process", "sighand-exec-child", sighand_self, NULL };
+    char *env[] = { NULL };
+    execve(sighand_self, args, env);
+    return 92;
+}
 static void *blocked_sibling(void *unused) {
     (void)unused;
     char byte;
@@ -181,6 +196,44 @@ int main(int argc, char **argv) {
         result("parent-tid", parent_tid == pid);
         result("child-tid", child_tid == pid);
         return 0;
+    }
+    if (!strcmp(mode, "clone-sighand")) {
+        errno = 0;
+        long r = syscall(SYS_clone, CLONE_SIGHAND|SIGCHLD, 0, 0, 0, 0);
+        if (r == 0) _exit(99);
+        result("needs-vm", r == -1 && errno == EINVAL);
+        char *stack = mmap(NULL, 65536, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (stack == MAP_FAILED) return 80;
+        signal(SIGUSR2, SIG_IGN);
+        pid_t pid = clone(sighand_child, stack + 65536, CLONE_VM|CLONE_SIGHAND|SIGCHLD, NULL);
+        if (pid < 0) return 79;
+        result("child", reaped(pid));
+        struct sigaction old;
+        sigaction(SIGUSR1, NULL, &old);
+        result("shared", old.sa_handler == interrupted);
+        received = 0;
+        raise(SIGUSR1);
+        result("delivered", received);
+        /* execve gives the child its own dispositions again. */
+        sighand_self = (char *)self;
+        fflush(stdout);
+        pid = clone(sighand_exec, stack + 65536, CLONE_VM|CLONE_VFORK|CLONE_SIGHAND|SIGCHLD, NULL);
+        if (pid < 0) return 78;
+        result("exec-child", reaped(pid));
+        sigaction(SIGUSR1, NULL, &old);
+        result("kept", old.sa_handler == interrupted);
+        sigaction(SIGUSR2, NULL, &old);
+        result("unshared", old.sa_handler == SIG_IGN);
+        return 0;
+    }
+    if (!strcmp(mode, "sighand-exec-child")) {
+        struct sigaction old;
+        sigaction(SIGUSR1, NULL, &old);
+        result("exec-default", old.sa_handler == SIG_DFL);
+        sigaction(SIGUSR2, NULL, &old);
+        result("exec-ignored", old.sa_handler == SIG_IGN);
+        signal(SIGUSR2, SIG_DFL);
+        return 6;
     }
     if (!strcmp(mode, "exec-thread-child")) {
         if (argc != 5) return 77;

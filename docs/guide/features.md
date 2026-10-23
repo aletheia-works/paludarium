@@ -173,6 +173,10 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   virtual filesystem, and `wait4` collects its exit. Rust's
   `std::process::Command` works, also when it forks instead of using
   `posix_spawn` (for example with `pre_exec`).
+- A process made by `clone` with `CLONE_VM | CLONE_SIGHAND` but without
+  `CLONE_THREAD` shares its signal dispositions with its parent: a
+  `sigaction` in one is seen by the other. `execve` gives the process its own
+  copy again, as in Linux.
 
 ## Signals
 

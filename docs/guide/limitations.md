@@ -17,9 +17,8 @@ verified.
   make a shared file mapping writable (`EACCES`), as nothing would write it
   back to the file. A page wholly past the end of the file reads as zeros
   instead of raising `SIGBUS`.
-- **Some system calls**: `CLONE_SIGHAND` between separate processes is not
-  there yet. Unimplemented system calls return `ENOSYS`, so some programs can
-  carry on without the feature.
+- **Some system calls**: unimplemented system calls return `ENOSYS`, so some
+  programs can carry on without the feature.
 - **Some signal details**: no core file is written, so a child killed by `SIGSEGV`,
   `SIGABRT` or another core-dumping signal is reported as `CLD_KILLED`,
   without the core flag in its `wait` status, where Linux may report

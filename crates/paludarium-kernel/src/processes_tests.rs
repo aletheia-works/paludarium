@@ -169,6 +169,38 @@ mod process {
             0
         );
     }
+    /// Sets `sig`'s handler through rt_sigaction and returns the old one.
+    fn handler(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        sig: u64,
+        new: Option<u64>,
+    ) -> u64 {
+        let act = new.map_or(0, |handler| {
+            m.write(GuestAddr(DATA + 64), &[0; 32]).unwrap();
+            m.write_u64(GuestAddr(DATA + 64), handler).unwrap();
+            DATA + 64
+        });
+        assert_eq!(syscall(k, t, m, 13, [sig, act, DATA + 128, 8, 0, 0]), 0);
+        m.read_u64(GuestAddr(DATA + 128)).unwrap()
+    }
+    #[test]
+    fn clone_sighand_shares_dispositions() {
+        let (mut k, mut t, m) = setup();
+        // CLONE_VM | CLONE_SIGHAND | SIGCHLD, without CLONE_THREAD.
+        syscall(&mut k, &mut t, &m, 56, [0x900 | 17, 0, 0, 0, 0, 0]);
+        let (mut c, mut ct) = k.take_child().unwrap();
+        assert_ne!(c.process.pid, k.process.pid);
+        assert_eq!(handler(&mut c, &mut ct, &m, 10, Some(0x1234)), 0);
+        assert_eq!(handler(&mut k, &mut t, &m, 10, Some(0x5678)), 0x1234);
+        assert_eq!(handler(&mut c, &mut ct, &m, 10, None), 0x5678);
+        // A plain CLONE_VM child gets a copy.
+        syscall(&mut k, &mut t, &m, 56, [0x100 | 17, 0, 0, 0, 0, 0]);
+        let (mut d, mut dt) = k.take_child().unwrap();
+        assert_eq!(handler(&mut d, &mut dt, &m, 10, Some(0x9abc)), 0x5678);
+        assert_eq!(handler(&mut k, &mut t, &m, 10, None), 0x5678);
+    }
     #[test]
     fn exit_group_isolated() {
         let (mut k, mut t, m) = setup();
@@ -565,6 +597,44 @@ mod exec {
         assert_eq!(t.cpu.fs_base, 123);
         assert_eq!(t.state.alt_stack.sp, 42);
         assert!(k.files.descriptor(1).is_ok());
+    }
+    #[test]
+    fn exec_unshares_clone_sighand_dispositions() {
+        let (mut k, mut t, m) = exec_setup();
+        let act = |handler: u64| {
+            m.write(GuestAddr(DATA + 64), &[0; 32]).unwrap();
+            m.write_u64(GuestAddr(DATA + 64), handler).unwrap();
+        };
+        act(0x1234);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 13, [10, DATA + 64, 0, 8, 0, 0]),
+            0
+        );
+        act(1);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 13, [12, DATA + 64, 0, 8, 0, 0]),
+            0
+        );
+        syscall(&mut k, &mut t, &m, 56, [0x900 | 17, 0, 0, 0, 0, 0]);
+        let (mut c, mut ct) = k.take_child().unwrap();
+        assert_eq!(syscall(&mut c, &mut ct, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        // The parent keeps its handler; the new image has the default, and
+        // the ignored signal stays ignored.
+        assert_eq!(
+            k.group.shared_actions().lock().unwrap()[&10].handler,
+            0x1234
+        );
+        assert!(!ct.state.signal_actions.contains_key(&10));
+        assert_eq!(ct.state.signal_actions[&12].handler, 1);
+        // Nor does the parent's change reach it any more.
+        act(0x5678);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 13, [14, DATA + 64, 0, 8, 0, 0]),
+            0
+        );
+        c.sync_actions(&mut ct);
+        assert!(!ct.state.signal_actions.contains_key(&10));
+        assert!(!ct.state.signal_actions.contains_key(&14));
     }
     #[test]
     fn tls_signals_reset_preserves_mask() {

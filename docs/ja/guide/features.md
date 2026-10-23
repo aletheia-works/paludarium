@@ -160,6 +160,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プログラムを起動し、`wait4` で終了を受け取れます。Rust の `std::process::Command` も
   動きます。`posix_spawn` を使わずに fork するとき（たとえば `pre_exec` を使うとき）も
   同じです。
+- `CLONE_THREAD` なしで `CLONE_VM | CLONE_SIGHAND` を付けた `clone` で作ったプロセスは、
+  シグナルの処理の設定を親と共有します。片方の `sigaction` が、もう片方にも見えます。
+  `execve` すると、Linux と同じく、そのプロセスは自分だけの設定に戻ります。
 
 ## シグナル
 

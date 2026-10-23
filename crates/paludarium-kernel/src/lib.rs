@@ -357,6 +357,11 @@ impl Kernel {
                 // A group stop is reported once, by the thread that starts it.
                 self.processes
                     .job_stop(self.process.pid, &self.group, signal.number);
+                // A temporary wait mask (rt_sigsuspend, epoll_pwait) ends here
+                // too, so a restarted call sees the original mask again.
+                if let Some(mask) = thread.state.wait_restore_mask.take() {
+                    thread.state.signal_mask = mask;
+                }
                 Self::rewind_restart(thread, restart);
                 return Next::Stopped;
             }

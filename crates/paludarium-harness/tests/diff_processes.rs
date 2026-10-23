@@ -117,6 +117,7 @@ mod linux {
         processes_prctl => ("prctl","process"),
         processes_pdeathsig => ("pdeathsig","process"),
         processes_job_stop => ("job-stop","process"),
+        processes_sigsuspend => ("sigsuspend","process"),
         processes_pio => ("pio","process"),
         processes_stop_restart => ("stop-restart","process"),
         processes_timerfd => ("timerfd","process"),

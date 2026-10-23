@@ -48,6 +48,26 @@ static pid_t child(void) { return syscall(SYS_fork); }
 static int thread_ready[2], thread_block[2];
 static volatile sig_atomic_t received;
 static void interrupted(int number) { (void)number; received++; }
+static volatile sig_atomic_t usr2_blocked_in_handler = -1;
+static void note_mask(int number) {
+    (void)number;
+    sigset_t now;
+    sigprocmask(SIG_BLOCK, NULL, &now);
+    usr2_blocked_in_handler = sigismember(&now, SIGUSR2);
+    received++;
+}
+/* A child that sends `number` to its parent every 20 ms until killed. */
+static pid_t pester(int number) {
+    pid_t parent = getpid(), pid = child();
+    if (pid == 0) {
+        struct timespec nap = {0, 20000000};
+        for (;;) {
+            kill(parent, number);
+            nanosleep(&nap, NULL);
+        }
+    }
+    return pid;
+}
 static int vm_value;
 static int vm_child(void *unused) { (void)unused; vm_value = 23; return 4; }
 static void *blocked_sibling(void *unused) {
@@ -918,6 +938,50 @@ int main(int argc, char **argv) {
         }
         result("exited", waitpid(pid, &status, 0) == pid);
         result("code", WEXITSTATUS(status));
+        return 0;
+    }
+    if (!strcmp(mode, "sigsuspend")) {
+        /* rt_sigsuspend swaps in its mask until a handler has run, then the
+           old mask is back; pause waits with the mask as it is. Neither
+           ends for an ignored signal. */
+        struct sigaction act = {0};
+        act.sa_handler = note_mask;
+        sigaction(SIGUSR1, &act, NULL);
+        signal(SIGHUP, SIG_IGN);
+        sigset_t usr1, suspend, now;
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &usr1, NULL);
+        pid_t pid = pester(SIGUSR1);
+        sigemptyset(&suspend);
+        sigaddset(&suspend, SIGUSR2);
+        errno = 0;
+        result("suspend", sigsuspend(&suspend));
+        result("errno", errno);
+        result("received", received >= 1);
+        result("usr2-blocked-in-handler", usr2_blocked_in_handler);
+        sigprocmask(SIG_BLOCK, NULL, &now);
+        result("usr1-blocked-after", sigismember(&now, SIGUSR1));
+        result("usr2-blocked-after", sigismember(&now, SIGUSR2));
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        /* pause: SIGHUP (ignored) arrives first and does not end it. */
+        received = 0;
+        sigprocmask(SIG_UNBLOCK, &usr1, NULL);
+        kill(getpid(), SIGHUP);
+        pid = pester(SIGUSR1);
+        errno = 0;
+        result("pause", pause());
+        result("errno", errno);
+        result("received", received >= 1);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        errno = 0;
+        result("bad-size", syscall(SYS_rt_sigsuspend, &suspend, 7));
+        result("errno", errno);
+        errno = 0;
+        result("bad-mask", syscall(SYS_rt_sigsuspend, (void *)16, 8));
+        result("errno", errno);
         return 0;
     }
     if (!strcmp(mode, "job-stop")) {

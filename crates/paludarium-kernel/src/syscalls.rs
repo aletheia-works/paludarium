@@ -61,6 +61,8 @@ pub mod nr {
     pub const TIMER_GETOVERRUN: u64 = 225;
     pub const TIMER_DELETE: u64 = 226;
     pub const RT_SIGTIMEDWAIT: u64 = 128;
+    pub const PAUSE: u64 = 34;
+    pub const RT_SIGSUSPEND: u64 = 130;
     pub const RT_SIGPENDING: u64 = 127;
     pub const TIMERFD_CREATE: u64 = 283;
     pub const TIMERFD_SETTIME: u64 = 286;
@@ -99,7 +101,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 49] = [
+        let entries: [(u64, Handler); 51] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -145,6 +147,8 @@ impl SyscallTable {
             (nr::TIMER_GETOVERRUN, sys_timer_getoverrun),
             (nr::TIMER_DELETE, sys_timer_delete),
             (nr::RT_SIGTIMEDWAIT, sys_rt_sigtimedwait),
+            (nr::PAUSE, sys_pause),
+            (nr::RT_SIGSUSPEND, sys_rt_sigsuspend),
             (nr::RT_SIGPENDING, sys_rt_sigpending),
             (nr::TIMERFD_CREATE, crate::timerfd::sys_timerfd_create),
             (nr::TIMERFD_SETTIME, crate::timerfd::sys_timerfd_settime),
@@ -597,6 +601,40 @@ fn sys_timer_delete(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             .with_timers(c.process, |timers| timers.delete(timer_id(a[0])))
             .map(|()| 0),
     )
+}
+
+/// `pause()`: waits until a signal is delivered, then gives EINTR (once the
+/// handler has run). Ignored and blocked signals do not end it.
+fn sys_pause(c: &mut Context<'_>, _: [u64; 6]) -> Outcome {
+    outcome(wait_for_signal(c))
+}
+
+/// `rt_sigsuspend(mask, sigsetsize)`: waits as `pause` with `mask` in place of
+/// the signal mask (SIGKILL and SIGSTOP stay unblocked). The original mask
+/// comes back after the handler, which runs with `mask`, as on Linux.
+fn sys_rt_sigsuspend(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        if a[1] != SIGSET_SIZE {
+            return Err(Errno::EINVAL);
+        }
+        let mask = c.mem.read_u64(GuestAddr(a[0])).map_err(|_| Errno::EFAULT)?;
+        let old_mask = c.process.signal_mask;
+        c.process.signal_mask = mask & !unblockable();
+        let result = wait_for_signal(c);
+        // The checkpoint installs the signal's frame (saving the original
+        // mask) and then restores it, also when no handler runs.
+        c.process.wait_restore_mask = Some(old_mask);
+        result
+    })())
+}
+
+/// Waits until a signal can be delivered, the process exits, or the wait is
+/// cancelled; the result is always EINTR.
+fn wait_for_signal(c: &mut Context<'_>) -> Result<u64, Errno> {
+    loop {
+        let ticket = c.files.readiness.token.value();
+        crate::events::wait(c, ticket, None)?;
+    }
 }
 
 /// `rt_sigtimedwait(set, info, timeout, sigsetsize)`: takes the lowest

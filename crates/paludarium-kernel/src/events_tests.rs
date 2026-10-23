@@ -81,6 +81,97 @@ fn pwait_handler_uses_temporary_mask_and_returns_original() {
     }
 }
 #[test]
+fn sigsuspend_and_pause_wait_for_a_handler() {
+    for suspend in [true, false] {
+        let mut f = Fixture::new();
+        // SIGALRM is blocked; rt_sigsuspend's mask (0) lets it in, pause's does
+        // not change the mask, so pause runs with it unblocked here.
+        let original = if suspend {
+            (1 << 13) | (1 << 9)
+        } else {
+            1 << 9
+        };
+        f.thread.state.signal_mask = original;
+        f.thread.cpu.gpr[reg::RSP] = DATA + 0x4000;
+        f.thread.state.signal_actions.insert(
+            14,
+            SignalAction {
+                handler: DATA + 0x1000,
+                restorer: DATA + 0x1010,
+                flags: 0x4000000,
+                mask: 1 << 11,
+            },
+        );
+        f.kernel.group.set_timer(signals::RealTimer {
+            deadline: Some(5_000_000),
+            interval: 0,
+        });
+        f.mem.write_u64(GuestAddr(DATA + 128), 0).unwrap();
+        let result = if suspend {
+            f.ret(130, [DATA + 128, 8, 0, 0, 0, 0])
+        } else {
+            f.ret(34, [0; 6])
+        };
+        assert_eq!(result, Errno(4).to_syscall_return());
+        assert_eq!(f.thread.cpu.rip, GuestAddr(DATA + 0x1000));
+        assert_eq!(f.thread.state.wait_restore_mask, None);
+        // The handler runs with the suspend mask (or the mask), its sa_mask
+        // and the signal itself; sigreturn brings the original mask back.
+        let during = if suspend { 0 } else { original };
+        assert_eq!(f.thread.state.signal_mask, during | (1 << 11) | (1 << 13));
+        let frame = f.thread.cpu.gpr[reg::RSP];
+        assert_eq!(f.mem.read_u64(GuestAddr(frame + 304)).unwrap(), original);
+        f.thread.cpu.gpr[reg::RSP] += 8;
+        f.ret(15, [0; 6]);
+        assert_eq!(f.thread.state.signal_mask, original);
+    }
+}
+
+#[test]
+fn sigsuspend_stopped_restores_the_mask_and_restarts() {
+    let mut f = Fixture::new();
+    let original = (1 << 13) | (1 << 9);
+    f.thread.state.signal_mask = original;
+    f.mem.write_u64(GuestAddr(DATA + 128), 1 << 3).unwrap();
+    f.kernel.queue_signal(&mut f.thread, 19).unwrap();
+    f.thread.cpu.rip = GuestAddr(0x40_1002);
+    // Stopped inside rt_sigsuspend: the original mask is back, and the call
+    // is rewound to run again with its own mask after the continue.
+    f.thread.cpu.gpr[reg::RAX] = 130;
+    f.thread.cpu.gpr[reg::RDI] = DATA + 128;
+    f.thread.cpu.gpr[reg::RSI] = 8;
+    let next = f.kernel.handle(
+        &mut f.thread,
+        &f.mem,
+        ExitReason::Syscall {
+            rip: GuestAddr(0x40_1002),
+        },
+    );
+    assert_eq!(next, Next::Stopped);
+    assert_eq!(f.thread.cpu.gpr[reg::RAX], 130);
+    assert_eq!(f.thread.cpu.rip, GuestAddr(0x40_1000));
+    assert!(f.thread.state.stopped);
+    assert_eq!(f.thread.state.signal_mask, original);
+    assert_eq!(f.thread.state.wait_restore_mask, None);
+}
+
+#[test]
+fn sigsuspend_argument_errors() {
+    let mut f = Fixture::new();
+    let original = 1 << 9;
+    f.thread.state.signal_mask = original;
+    assert_eq!(
+        f.ret(130, [DATA, 7, 0, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(130, [0x10, 8, 0, 0, 0, 0]),
+        Errno::EFAULT.to_syscall_return()
+    );
+    assert_eq!(f.thread.state.signal_mask, original);
+}
+
+#[test]
 fn pwait_mask_restores_without_handler_for_masked_ignored_metadata() {
     for mode in 0..3 {
         let mut f = Fixture::new();

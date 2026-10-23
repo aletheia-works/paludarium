@@ -241,6 +241,56 @@ mod process {
         stops: false,
         continues: false,
     };
+    /// Takes a pending SIGCHLD with rt_sigtimedwait (no wait) and returns
+    /// its si_code, si_pid and si_status.
+    fn take_sigchld(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> (u64, [u32; 3]) {
+        m.write(
+            GuestAddr(DATA),
+            &[1u64 << 16, 0, 0].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+        let number = syscall(k, t, m, 128, [DATA, DATA + 64, DATA + 8, 8, 0, 0]);
+        let word = |at: u64| m.read_u64(GuestAddr(DATA + 64 + at)).unwrap() as u32;
+        (number, [word(8), word(16), word(24)])
+    }
+    #[test]
+    fn sigchld_carries_the_child() {
+        let (mut k, mut t, m) = setup();
+        // Blocked, so a syscall's return does not discard it (SIG_DFL).
+        m.write_u64(GuestAddr(DATA), 1 << 16).unwrap();
+        syscall(&mut k, &mut t, &m, 14, [0, DATA, 0, 8, 0, 0]);
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(261));
+        assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [1, ct.tid, 5]));
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        finish(&mut c, &ct, &cm, ExitStatus::Signaled(9));
+        assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [2, ct.tid, 9]));
+        // A stop and a continue, each with its CLD_* code.
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        syscall(&mut c, &mut ct, &cm, 62, [0, 19, 0, 0, 0, 0]);
+        assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [5, ct.tid, 19]));
+        syscall(&mut k, &mut t, &m, 62, [u64::from(ct.tid), 18, 0, 0, 0, 0]);
+        assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [6, ct.tid, 18]));
+        let none = Errno::EAGAIN.to_syscall_return();
+        assert_eq!(take_sigchld(&mut k, &mut t, &m).0, none);
+        // SA_NOCLDSTOP: a stop and a continue send none, an exit still does.
+        m.write(
+            GuestAddr(DATA + 256),
+            &[0u64, 1, 0, 0].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 13, [17, DATA + 256, 0, 8, 0, 0]),
+            0
+        );
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        syscall(&mut c, &mut ct, &cm, 62, [0, 19, 0, 0, 0, 0]);
+        assert_eq!(take_sigchld(&mut k, &mut t, &m).0, none);
+        syscall(&mut k, &mut t, &m, 62, [u64::from(ct.tid), 18, 0, 0, 0, 0]);
+        assert_eq!(take_sigchld(&mut k, &mut t, &m).0, none);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [1, ct.tid, 0]));
+    }
     #[test]
     fn stop_and_continue_reports() {
         let (mut k, mut t, m) = setup();

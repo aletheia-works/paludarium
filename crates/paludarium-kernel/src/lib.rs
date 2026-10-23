@@ -417,6 +417,7 @@ impl Kernel {
                         | (u64::from(fetch) * 16),
                     synchronous: true,
                     timer: None,
+                    child: None,
                 })
             }
             ExitReason::InvalidOpcode { rip, .. } => {
@@ -430,6 +431,7 @@ impl Kernel {
                     error: 0,
                     synchronous: true,
                     timer: None,
+                    child: None,
                 })
             }
             ExitReason::ArithmeticFault { rip } => {
@@ -443,6 +445,7 @@ impl Kernel {
                     error: 0,
                     synchronous: true,
                     timer: None,
+                    child: None,
                 })
             }
             ExitReason::FloatingPointFault { rip, code } => {
@@ -456,6 +459,7 @@ impl Kernel {
                     error: 0,
                     synchronous: true,
                     timer: None,
+                    child: None,
                 })
             }
             ExitReason::GeneralProtection { rip } | ExitReason::Halt { rip } => {
@@ -469,6 +473,7 @@ impl Kernel {
                     error: 0,
                     synchronous: true,
                     timer: None,
+                    child: None,
                 })
             }
             _ => None,

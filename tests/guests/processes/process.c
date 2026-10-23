@@ -801,6 +801,9 @@ int main(int argc, char **argv) {
         result("sigchld-stop", sigismember(&pending, SIGCHLD));
         siginfo_t info;
         result("sigchld", sigwaitinfo(&chld, &info));
+        result("sigchld-code", info.si_code);
+        result("sigchld-status", info.si_status);
+        result("sigchld-pid", info.si_pid == pid);
         memset(&info, 0x55, sizeof info);
         result("consumed", waitid(P_PID, pid, &info, WSTOPPED | WNOHANG));
         result("consumed-pid", info.si_pid);
@@ -814,6 +817,9 @@ int main(int argc, char **argv) {
         result("ifcontinued", WIFCONTINUED(status));
         result("raw", status);
         result("sigchld-cont", sigwaitinfo(&chld, &info));
+        result("sigchld-cont-code", info.si_code);
+        result("sigchld-cont-status", info.si_status);
+        result("sigchld-cont-pid", info.si_pid == pid);
         result("again", waitpid(pid, &status, WCONTINUED | WNOHANG));
         /* A stop by kill, now with SA_NOCLDSTOP: no SIGCHLD for it. */
         struct sigaction quiet = { .sa_handler = SIG_DFL, .sa_flags = SA_NOCLDSTOP };
@@ -830,6 +836,21 @@ int main(int argc, char **argv) {
         if (write(gate[1], "x", 1) != 1) return 82;
         result("exited", waitpid(pid, &status, 0) == pid);
         result("code", WEXITSTATUS(status));
+        /* SA_NOCLDSTOP leaves the SIGCHLD of an exit, and of a kill. */
+        result("sigchld-exit", sigwaitinfo(&chld, &info));
+        result("sigchld-exit-code", info.si_code);
+        result("sigchld-exit-status", info.si_status);
+        result("sigchld-exit-pid", info.si_pid == pid);
+        pid = child();
+        if (pid == 0) {
+            for (;;) pause();
+        }
+        kill(pid, SIGKILL);
+        result("killed", waitpid(pid, &status, 0) == pid);
+        result("sigchld-kill", sigwaitinfo(&chld, &info));
+        result("sigchld-kill-code", info.si_code);
+        result("sigchld-kill-status", info.si_status);
+        result("sigchld-kill-pid", info.si_pid == pid);
         return 0;
     }
     if (!strcmp(mode, "timerfd")) {

@@ -105,12 +105,13 @@ impl ThreadGroup {
             .map(|used| used.load(Ordering::SeqCst))
             .fold(0u64, u64::saturating_add)
     }
-    pub(crate) fn notify_child(&self) {
+    /// Sends this process SIGCHLD about `child`, with its `CLD_*` `code`.
+    pub(crate) fn notify_child(&self, code: i32, child: signals::ChildSignal) {
         let _ = self
             .process_inbox
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .send(17);
+            .send_child(code, child);
     }
     pub(crate) fn send_process(&self, number: i32) -> Result<(), Errno> {
         self.process_inbox

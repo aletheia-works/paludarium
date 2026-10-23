@@ -25,6 +25,14 @@ impl SignalInbox {
     pub fn send(&self, number: i32) -> Result<(), Errno> {
         self.send_pending(signals::PendingSignal::user(number, 0))
     }
+    /// Queues SIGCHLD with the child's siginfo. Like any standard signal it
+    /// is dropped while one is already pending, as Linux keeps the first.
+    pub(crate) fn send_child(&self, code: i32, child: signals::ChildSignal) -> Result<(), Errno> {
+        self.send_pending(signals::PendingSignal {
+            child: Some(child),
+            ..signals::PendingSignal::user(17, code)
+        })
+    }
     pub(crate) fn send_thread(&self, number: i32) -> Result<(), Errno> {
         self.send_pending(signals::PendingSignal::thread(number, -6))
     }

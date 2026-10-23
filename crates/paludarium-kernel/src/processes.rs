@@ -222,17 +222,25 @@ impl Processes {
     }
     pub(crate) fn finish(&self, pid: u32, status: ExitStatus) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let parent = if let Some(entry) = entries.get_mut(&pid) {
+        let (parent, status, cpu) = if let Some(entry) = entries.get_mut(&pid) {
             if entry.group.active_threads() != 0 {
                 return;
             }
-            entry.status = Some(entry.group.status().unwrap_or(status));
-            entry.parent
+            let status = entry.group.status().unwrap_or(status);
+            entry.status = Some(status);
+            (entry.parent, status, entry.group.process_cpu())
         } else {
             return;
         };
         if let Some(parent) = entries.get(&parent) {
-            parent.group.notify_child();
+            let (code, status) = match status {
+                ExitStatus::Signaled(signal) => (signals::CLD_KILLED, signal),
+                ExitStatus::Exited(code) => (signals::CLD_EXITED, code & 255),
+                _ => (signals::CLD_EXITED, 0),
+            };
+            parent
+                .group
+                .notify_child(code, signals::ChildSignal { pid, status, cpu });
         }
         // Children that asked for it learn that this process exited.
         for child in entries.values() {
@@ -339,10 +347,15 @@ impl Processes {
         entry.stop_report = Some(signal);
         entry.continue_report = false;
         let parent = entry.parent;
+        let child = signals::ChildSignal {
+            pid,
+            status: signal,
+            cpu: group.process_cpu(),
+        };
         if let Some(parent) = entries.get(&parent)
             && parent.group.wants_stop_notices()
         {
-            parent.group.notify_child();
+            parent.group.notify_child(signals::CLD_STOPPED, child);
         }
     }
     /// Whether `pid` has exited: `None` once it is reaped (or never was).
@@ -376,10 +389,15 @@ impl Processes {
             entry.stop_report = None;
             entry.continue_report = true;
             let parent = entry.parent;
+            let child = signals::ChildSignal {
+                pid,
+                status: 18,
+                cpu: entry.group.process_cpu(),
+            };
             if let Some(parent) = entries.get(&parent)
                 && parent.group.wants_stop_notices()
             {
-                parent.group.notify_child();
+                parent.group.notify_child(signals::CLD_CONTINUED, child);
             }
             return Ok(());
         }

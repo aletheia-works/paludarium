@@ -32,7 +32,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 
 | Group | Main system calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -175,8 +175,13 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
     starts at or past it, and a `truncate`/`ftruncate` that grows the file
     past it, raise `SIGXFSZ` and fail with `EFBIG`.
 
-  Process groups are kept the same way, and `wait4` and `waitid` can wait for
-  one.
+  Process groups and sessions are kept the same way, and `wait4` and
+  `waitid` can wait for a group. The first process's session started outside
+  the emulator, so `getsid` reports it as 0, as Linux reports an ID outside a
+  PID namespace. `setsid` fails with `EPERM` in a process whose PID names a
+  group, and makes any other process the leader of a new session and group.
+  `setpgid` checks the session as Linux does: a session leader, a child in
+  another session and a group in another session give `EPERM`.
 - `waitid` follows Linux's checks and copy-out: its siginfo fields are zero
   when no child is reported, even on an error, and an exited child cannot be
   waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). A stop and a

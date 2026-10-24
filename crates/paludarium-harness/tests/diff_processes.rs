@@ -113,6 +113,7 @@ mod linux {
         processes_nofile_limit => ("nofile-limit","process"),
         processes_fsize_limit => ("fsize-limit","process"),
         processes_pgid => ("pgid","process"),
+        processes_session => ("session","process"),
         processes_sysinfo => ("sysinfo","process"),
         processes_statfs => ("statfs","process"),
         processes_posix_timer => ("posix-timer","process"),

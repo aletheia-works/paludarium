@@ -27,7 +27,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | 主なシステムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups`、`getrusage`、`times` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -162,8 +162,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     書き込みと、ファイルを上限より大きくする `truncate`／`ftruncate` は、`SIGXFSZ` を
     起こして `EFBIG` で失敗します。
 
-  プロセスグループも同じように持ち、`wait4` と `waitid` でプロセスグループを選んで
-  待てます。
+  プロセスグループとセッションも同じように持ち、`wait4` と `waitid` でプロセス
+  グループを選んで待てます。最初のプロセスのセッションはエミュレータの外で始まった
+  ものなので、`getsid` は、Linux が PID 名前空間の外の ID を示すのと同じく 0 を
+  返します。`setsid` は、PID がグループを指すプロセスでは `EPERM` で失敗し、それ
+  以外のプロセスを新しいセッションとグループの先頭にします。`setpgid` は Linux と
+  同じくセッションを確かめ、セッションの先頭、別のセッションの子、別のセッションの
+  グループには `EPERM` を返します。
 - `waitid` は、Linux と同じ確かめ方と書き出し方をします。報告する子がないときは、
   エラーのときも含めて siginfo の項目を 0 にします。終わった子は、`WEXITED` か
   `WCONTINUED` がないと待てません（`ECHILD`）。停止と再開は、`WUNTRACED`

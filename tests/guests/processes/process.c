@@ -556,6 +556,72 @@ int main(int argc, char **argv) {
         result("errno", errno);
         return 0;
     }
+    if (!strcmp(mode, "session")) {
+        /* setsid in a child, which is not a group leader; what each check
+           gives is a bit, sent back through a pipe. */
+        int bits_pipe[2], go[2];
+        if (pipe(bits_pipe) || pipe(go)) return 81;
+        fflush(stdout);
+        pid_t pid = child();
+        if (pid == 0) {
+            int bits = 0, n = 0, status;
+            char byte;
+#define BIT(check) (bits |= (!!(check)) << n++)
+            BIT(getsid(0) == getsid(getppid()));
+            BIT(getpgrp() != getpid());
+            pid_t parent_group = getpgid(getppid());
+            BIT(setsid() == getpid());
+            BIT(getsid(0) == getpid() && getpgrp() == getpid());
+            errno = 0;
+            BIT(setsid() == -1 && errno == EPERM);
+            errno = 0;
+            BIT(setpgid(0, 0) == -1 && errno == EPERM); /* a session leader */
+            int release[2];
+            if (pipe(release)) _exit(81);
+            pid_t member = child();
+            if (member == 0) {
+                if (read(release[0], &byte, 1) != 1) _exit(1);
+                _exit(0);
+            }
+            BIT(getsid(member) == getpid() && getpgid(member) == getpid());
+            errno = 0;
+            BIT(setpgid(member, parent_group) == -1 && errno == EPERM); /* another session's group */
+            BIT(setpgid(member, member) == 0 && getpgid(member) == member);
+            BIT(setpgid(member, getpid()) == 0 && getpgid(member) == getpid());
+            if (write(release[1], "x", 1) != 1) _exit(82);
+            BIT(waitpid(member, &status, 0) == member && status == 0);
+            /* A process whose PID names a group cannot start a session. */
+            pid_t leader = child();
+            if (leader == 0) {
+                if (setpgid(0, 0)) _exit(2);
+                errno = 0;
+                _exit(setsid() == -1 && errno == EPERM ? 0 : 1);
+            }
+            BIT(waitpid(leader, &status, 0) == leader && status == 0);
+            /* A member of a session can start its own. */
+            pid_t starter = child();
+            if (starter == 0) _exit(setsid() == getpid() && getsid(getppid()) == getppid() ? 0 : 1);
+            BIT(waitpid(starter, &status, 0) == starter && status == 0);
+#undef BIT
+            if (write(bits_pipe[1], &bits, sizeof bits) != sizeof bits) _exit(83);
+            if (read(go[0], &byte, 1) != 1) _exit(84);
+            _exit(0);
+        }
+        int bits = 0;
+        if (read(bits_pipe[0], &bits, sizeof bits) != sizeof bits) return 82;
+        result("child", bits);
+        result("child-sid", getsid(pid) == pid);
+        errno = 0;
+        result("other-session", setpgid(pid, getpgrp()));
+        result("errno", errno);
+        if (write(go[1], "x", 1) != 1) return 83;
+        finish(pid);
+        errno = 0;
+        result("getsid-missing", getsid(0x3fffffff));
+        result("errno", errno);
+        result("getsid-self", getsid(0) == getsid(getpid()));
+        return 0;
+    }
     if (!strcmp(mode, "sysinfo")) {
         struct sysinfo info;
         result("sysinfo", sysinfo(&info));

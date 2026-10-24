@@ -160,6 +160,52 @@ mod process {
         assert_ne!(id, u64::from(b.tid));
     }
     #[test]
+    fn sessions_follow_setsid_and_bound_setpgid() {
+        let (mut k, mut t, m) = setup();
+        let eperm = Errno::EPERM.to_syscall_return();
+        // The first process leads its group, in a session from outside.
+        assert_eq!(syscall(&mut k, &mut t, &m, 124, [0; 6]), 0); // getsid
+        assert_eq!(syscall(&mut k, &mut t, &m, 112, [0; 6]), eperm);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let child = u64::from(ct.tid);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 124, [0; 6]), 0);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 112, [0; 6]), child);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 111, [0; 6]), child);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 124, [child, 0, 0, 0, 0, 0]),
+            child
+        );
+        // A session leader stays in its group, and a group of another
+        // session cannot be joined.
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 109, [0; 6]), eperm);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 109, [child, 1, 0, 0, 0, 0]),
+            eperm
+        );
+        let (_, gt, _) = fork(&mut c, &mut ct, &cm);
+        let member = u64::from(gt.tid);
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 124, [member, 0, 0, 0, 0, 0]),
+            child
+        );
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 109, [member, 1, 0, 0, 0, 0]),
+            eperm
+        );
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 109, [member, member, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 109, [member, child, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 124, [99, 0, 0, 0, 0, 0]),
+            Errno(3).to_syscall_return()
+        );
+    }
+    #[test]
     fn parent_registration() {
         let (mut k, mut t, m) = setup();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);

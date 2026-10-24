@@ -19,6 +19,10 @@ struct Entry {
     status: Option<ExitStatus>,
     /// Process group ID; inherited on fork and kept across exec.
     pgid: u32,
+    /// Session ID, inherited the same way. The first process's session is
+    /// outside the emulator, so its ID reads as 0, as a PID namespace reports
+    /// an ID it cannot see; a session leader is the process whose PID it is.
+    sid: u32,
     /// Resource limits (soft, hard), inherited on fork and kept across exec.
     /// They are recorded and reported; RLIMIT_FSIZE and RLIMIT_NOFILE are
     /// enforced, through the copy of their soft limits in the thread group.
@@ -76,6 +80,7 @@ impl Processes {
                     group,
                     status: None,
                     pgid: 1,
+                    sid: 0,
                     limits: DEFAULT_LIMITS,
                     death_signal: 0,
                     dumpable: true,
@@ -96,10 +101,10 @@ impl Processes {
     }
     pub(crate) fn insert(&self, pid: u32, parent: u32, group: Arc<ThreadGroup>) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let (pgid, limits, dumpable, no_new_privs) = entries
+        let (pgid, sid, limits, dumpable, no_new_privs) = entries
             .get(&parent)
-            .map_or((pid, DEFAULT_LIMITS, true, false), |p| {
-                (p.pgid, p.limits, p.dumpable, p.no_new_privs)
+            .map_or((pid, 0, DEFAULT_LIMITS, true, false), |p| {
+                (p.pgid, p.sid, p.limits, p.dumpable, p.no_new_privs)
             });
         entries.insert(
             pid,
@@ -108,6 +113,7 @@ impl Processes {
                 group,
                 status: None,
                 pgid,
+                sid,
                 limits,
                 death_signal: 0,
                 dumpable,
@@ -154,18 +160,39 @@ impl Processes {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.get(&pid).map(|e| e.pgid).ok_or(Errno(3))
     }
-    /// `setpgid` from `caller`: the target is the caller or one of its
-    /// children, and a new group either is the target's own or already exists.
+    fn sid(&self, pid: u32) -> Result<u32, Errno> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.get(&pid).map(|e| e.sid).ok_or(Errno(3))
+    }
+    /// `setsid` from `caller`, as Linux's ksys_setsid: a process group
+    /// leader (or any process whose PID names a group) gets EPERM; otherwise
+    /// the caller leads a new session and a new group, both its PID.
+    fn set_sid(&self, caller: u32) -> Result<u32, Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.values().any(|e| e.pgid == caller) {
+            return Err(Errno::EPERM);
+        }
+        let entry = entries.get_mut(&caller).ok_or(Errno(3))?;
+        (entry.sid, entry.pgid) = (caller, caller);
+        Ok(caller)
+    }
+    /// `setpgid` from `caller`, in Linux's order: the target is the caller or
+    /// one of its children in the caller's session, and not a session leader;
+    /// a new group either is the target's own or exists in that session.
     fn set_pgid(&self, caller: u32, pid: u32, pgid: u32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let session = entries.get(&caller).ok_or(Errno(3))?.sid;
         let target = entries.get(&pid).ok_or(Errno(3))?;
         if pid != caller && target.parent != caller {
             return Err(Errno(3)); // ESRCH
         }
+        if target.sid != session || target.sid == pid {
+            return Err(Errno::EPERM);
+        }
         if pgid != pid
             && !entries
                 .values()
-                .any(|e| e.status.is_none() && e.pgid == pgid)
+                .any(|e| e.status.is_none() && e.pgid == pgid && e.sid == session)
         {
             return Err(Errno::EPERM);
         }
@@ -568,6 +595,12 @@ impl Kernel {
                 .and_then(|pid| self.processes.pgid(pid))
                 .map(u64::from),
             111 => self.processes.pgid(self.process.pid).map(u64::from),
+            // setsid, getsid
+            112 => self.processes.set_sid(self.process.pid).map(u64::from),
+            124 => self
+                .target_pid(a[0])
+                .and_then(|pid| self.processes.sid(pid))
+                .map(u64::from),
             // prlimit64, getrlimit, setrlimit
             302 => self.prlimit(mem, a[0], a[1], a[2], a[3]),
             97 => self.prlimit(mem, 0, a[0], 0, a[1]),

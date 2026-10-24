@@ -37,7 +37,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Files | `open`/`openat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `lseek`, the `stat` family, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `shutdown` |
@@ -46,6 +46,12 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
   where it was, and a pipe or socket gives `ESPIPE`; in an `O_APPEND` file a
   positioned write still appends, as on Linux.
+- `copy_file_range` copies between two regular files on one mount (`EXDEV`
+  across mounts), stopping at the input's end, with Linux's checks in order
+  (`EISDIR`, `EINVAL`, `EBADF`, `EOVERFLOW`, and `EINVAL` for an overlap in
+  one file). `sendfile` reads a regular file into any writable file, a pipe
+  taking at most its capacity per call. Both update the given offsets or the
+  file positions; `sendfile` writes its offset back even after an error.
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`.
 - `futex`, `epoll` and `eventfd` are implemented inside paludarium, not with the
   host's equivalents, so they behave the same on macOS, Windows and in
@@ -154,8 +160,9 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   - `RLIMIT_NOFILE`: a new descriptor past its soft limit gives `EMFILE` (and
     `open` creates nothing), `dup2`/`dup3` onto a number past it `EBADF`, and
     `F_DUPFD` from one past it `EINVAL`.
-  - `RLIMIT_FSIZE`: a write to a regular file (`write`, `writev`, `pwrite`,
-    `pwritev`, at the end with `O_APPEND`) stops at the soft limit; one that
+  - `RLIMIT_FSIZE`: a write to a regular file (`write`, `writev`, `pwrite` and
+    `pwritev`, which with `O_APPEND` start at the end, and `copy_file_range`
+    and `sendfile`) stops at the soft limit; one that
     starts at or past it, and a `truncate`/`ftruncate` that grows the file
     past it, raise `SIGXFSZ` and fail with `EFBIG`.
 

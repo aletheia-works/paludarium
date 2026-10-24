@@ -5,7 +5,7 @@ static long call(long n,long a,long b,long c,long d,long e,long f) {
 }
 #define S(n,a,b,c) call(n,(long)(a),(long)(b),(long)(c),0,0,0)
 static char p[]="/tmp/paludarium-files-fixture",q[]="/tmp/paludarium-files-link",r[]="/tmp/paludarium-files-renamed";
-static char buf[4096]; static long results[24]; static unsigned char st[144];
+static char buf[4096]; static long results[32]; static unsigned char st[144];
 void _start(void) {
  long fd,x=0;
  if(CASE==0) results[x++]=S(4,0,st,0);
@@ -70,6 +70,28 @@ void _start(void) {
   results[x++]=MMAP(4096,1,2,w,0);results[x++]=MMAP(4096,1,1,w,0);results[x++]=MMAP(4096,1,2,o,0);results[x++]=MMAP(4096,1,2,d,0);results[x++]=MMAP(4096,1,2,pipefd[0],0);
   results[x++]=MMAP(4096,1,2,99,0);results[x++]=MMAP(0,1,2,99,0);results[x++]=MMAP(0,1,2,fd,0);results[x++]=MMAP(4096,1,2,fd,1);results[x++]=MMAP(4096,1,2,fd,-4096);results[x++]=MMAP(4096,1,2,fd,1L<<62)>0;
   S(3,w,0,0);S(3,o,0,0);S(3,d,0,0);S(3,pipefd[0],0,0);S(3,pipefd[1],0,0);}
+ if(CASE==39||CASE==40){static long a,b;int pf[2];S(1,fd,"0123456789",10);S(8,fd,0,0);
+  long o=call(257,-100,(long)q,66,0644,0,0),ro=S(2,q,0,0),ap=S(2,q,02001,0),wo=S(2,p,1,0),d=S(2,"/tmp",65536,0);S(22,pf,0,0);
+  if(CASE==39){ /* copy_file_range(fd_in, off_in, fd_out, off_out, len, flags) */
+   results[x++]=call(326,fd,0,o,0,4,0);results[x++]=S(8,fd,0,1);results[x++]=S(8,o,0,1);
+   a=2;b=0;results[x++]=call(326,fd,(long)&a,o,(long)&b,100,0);results[x++]=a;results[x++]=b;results[x++]=S(8,fd,0,1);
+   results[x++]=call(326,fd,(long)&a,o,(long)&b,100,0);results[x++]=call(326,fd,0,o,0,1,1);results[x++]=call(326,99,0,o,0,1,0);
+   results[x++]=call(326,fd,0,ro,0,1,0);results[x++]=call(326,fd,0,ap,0,1,0);results[x++]=call(326,wo,0,o,0,1,0);
+   results[x++]=call(326,d,0,o,0,1,0);results[x++]=call(326,pf[0],0,o,0,1,0);results[x++]=call(326,fd,0,pf[1],0,1,0);
+   a=0;b=2;results[x++]=call(326,fd,(long)&a,fd,(long)&b,4,0);a=0;b=10;results[x++]=call(326,fd,(long)&a,fd,(long)&b,4,0);
+   a=-1;results[x++]=call(326,fd,(long)&a,o,0,1,0);a=-100;results[x++]=call(326,fd,(long)&a,o,0,1,0);results[x++]=call(326,fd,1,o,0,1,0);
+  } else { /* sendfile(out_fd, in_fd, offset, count) */
+   results[x++]=call(40,o,fd,0,4,0,0);results[x++]=S(8,fd,0,1);results[x++]=S(8,o,0,1);
+   a=6;results[x++]=call(40,o,fd,(long)&a,100,0,0);results[x++]=a;results[x++]=S(8,fd,0,1);
+   results[x++]=call(40,o,fd,(long)&a,100,0,0);results[x++]=call(40,o,fd,0,0,0,0);
+   results[x++]=call(40,pf[1],fd,0,3,0,0);results[x++]=S(0,pf[0],buf,3);results[x++]=buf[0]+buf[1]+buf[2];
+   results[x++]=call(40,o,pf[0],0,1,0,0);a=0;results[x++]=call(40,o,pf[0],(long)&a,1,0,0);
+   results[x++]=call(40,ap,fd,0,1,0,0);results[x++]=call(40,ro,fd,0,1,0,0);results[x++]=call(40,o,wo,0,1,0,0);results[x++]=call(40,o,d,0,1,0,0);
+   a=-1;results[x++]=call(40,o,fd,(long)&a,1,0,0);results[x++]=a;results[x++]=call(40,o,fd,1,1,0,0);results[x++]=call(40,99,fd,0,1,0,0);
+  }
+  /* What the output file holds. */
+  long n=call(17,o,(long)buf,64,0,0,0);results[x++]=n;long sum=0;for(long i=0;i<n&&i<64;i++)sum=sum*31+buf[i];results[x++]=sum;
+  S(3,o,0,0);S(3,ro,0,0);S(3,ap,0,0);S(3,wo,0,0);S(3,d,0,0);S(3,pf[0],0,0);S(3,pf[1],0,0);}
  S(3,fd,0,0);S(87,p,0,0);S(87,q,0,0);S(87,r,0,0);
  }
  S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);

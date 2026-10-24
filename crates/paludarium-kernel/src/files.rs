@@ -7,9 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
-    0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 72, 73, 74, 75, 76, 77, 79, 80, 81, 82,
-    83, 84, 85, 86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264, 265,
-    266, 267, 268, 269, 280, 292, 293, 295, 296, 439,
+    0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
+    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264,
+    265, 266, 267, 268, 269, 280, 292, 293, 295, 296, 326, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -509,11 +509,242 @@ fn size_limited(
         Some(offset) => offset,
         None => file.seek(0, 1)?,
     };
+    let room = size_room(c, start)?;
+    Ok(len.min(usize::try_from(room).unwrap_or(usize::MAX)))
+}
+/// The bytes RLIMIT_FSIZE lets a regular file take from `start`, as Linux's
+/// generic_write_check_limits: from the limit on none, raising SIGXFSZ and
+/// failing with EFBIG.
+fn size_room(c: &mut Context<'_>, start: u64) -> Result<u64, Errno> {
+    let limit = c.group.fsize();
+    if limit == u64::MAX {
+        return Ok(u64::MAX);
+    }
     if start >= limit {
         crate::signals::queue(c.process, crate::signals::PendingSignal::user(25, 0));
         return Err(Errno(27));
     }
-    Ok(len.min(usize::try_from(limit - start).unwrap_or(usize::MAX)))
+    Ok(limit - start)
+}
+const REGULAR: u32 = 0o100000;
+const DIRECTORY: u32 = 0o040000;
+/// A guest `loff_t *` argument: none when null, else its value (EFAULT).
+fn offset_argument(c: &Context<'_>, at: u64) -> Result<Option<u64>, Errno> {
+    if at == 0 {
+        return Ok(None);
+    }
+    c.mem
+        .read_u64(GuestAddr(at))
+        .map(Some)
+        .map_err(|_| Errno::EFAULT)
+}
+/// Copies up to `count` bytes from `input` at `from` to `output` at `to`, in
+/// pieces, stopping early at the input's end or a short write. An error
+/// after some bytes are copied ends the copy with their count, as Linux
+/// reports it on the next call.
+fn copy_bytes(
+    input: &Arc<dyn FileHandle>,
+    from: u64,
+    output: &Arc<dyn FileHandle>,
+    to: u64,
+    count: u64,
+) -> Result<u64, Errno> {
+    let mut piece = buffer(usize::try_from(count).unwrap_or(usize::MAX).min(1 << 20))?;
+    let mut done = 0;
+    while done < count {
+        let want = usize::try_from(count - done).map_or(piece.len(), |n| n.min(piece.len()));
+        let copied = read_at(input, from + done, &mut piece[..want])
+            .and_then(|read| Ok((read, write_at(output, to + done, &piece[..read])?)));
+        let (read, written) = match copied {
+            Ok(counts) => counts,
+            Err(_) if done > 0 => break,
+            Err(error) => return Err(error),
+        };
+        done += written as u64;
+        if read == 0 || written < read {
+            break;
+        }
+    }
+    Ok(done)
+}
+/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`, with the
+/// checks of Linux's generic_copy_file_checks and rw_verify_area in order.
+fn copy_file_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    if a[5] != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let input = c.files.descriptor(a[0])?;
+    let output = c.files.descriptor(a[2])?;
+    // A file without a position (a pipe) is at 0, and fails as no regular file.
+    let from = match offset_argument(c, a[1])? {
+        Some(offset) => offset,
+        None => input.file.seek(0, 1).unwrap_or(0),
+    };
+    let to = match offset_argument(c, a[3])? {
+        Some(offset) => offset,
+        None => output.file.seek(0, 1).unwrap_or(0),
+    };
+    let (source, target) = (input.file.stat()?, output.file.stat()?);
+    if source.mode & 0o170000 == DIRECTORY || target.mode & 0o170000 == DIRECTORY {
+        return Err(Errno::EISDIR);
+    }
+    if source.mode & 0o170000 != REGULAR || target.mode & 0o170000 != REGULAR {
+        return Err(Errno::EINVAL);
+    }
+    if input.file.flags() & 3 == 1
+        || output.file.flags() & 3 == 0
+        || output.file.flags() & 0o2000 != 0
+    {
+        return Err(Errno::EBADF);
+    }
+    // Both files must be on one filesystem.
+    let same_mount = device(c, &input.path) == device(c, &output.path);
+    if !same_mount {
+        return Err(Errno(18));
+    }
+    // Offsets that wrap with the requested length, compared as unsigned (a
+    // negative one wraps with a long enough request).
+    if from.checked_add(a[4]).is_none() || to.checked_add(a[4]).is_none() {
+        return Err(Errno::EOVERFLOW);
+    }
+    // Shortened to the input's end, then to what RLIMIT_FSIZE allows.
+    let mut count = if (from as i64) >= 0 && from >= source.size {
+        0
+    } else {
+        a[4].min(source.size.wrapping_sub(from))
+    };
+    if (to as i64) >= 0 {
+        count = count.min(size_room(c, to)?);
+    }
+    if same_mount
+        && source.inode == target.inode
+        && to.wrapping_add(count) > from
+        && to < from.wrapping_add(count)
+    {
+        return Err(Errno::EINVAL);
+    }
+    for start in [from, to] {
+        if (start as i64) < 0
+            || start
+                .checked_add(count)
+                .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return Err(Errno::EINVAL);
+        }
+    }
+    let count = count.min(MAX_RW_COUNT as u64);
+    if count == 0 {
+        return Ok(0);
+    }
+    let copied = copy_bytes(&input.file, from, &output.file, to, count)?;
+    for (pointer, file, start) in [(a[1], &input.file, from), (a[3], &output.file, to)] {
+        if pointer != 0 {
+            c.mem
+                .write_u64(GuestAddr(pointer), start + copied)
+                .map_err(|_| Errno::EFAULT)?;
+        } else {
+            file.seek((start + copied) as i64, 0)?;
+        }
+    }
+    Ok(copied)
+}
+/// `sendfile(out_fd, in_fd, offset, count)`, in the order of Linux's
+/// do_sendfile: the input must be a readable regular file, and the output a
+/// writable file without O_APPEND. Given an offset, the input's position
+/// stays and the offset is written back, even after an error.
+fn sendfile(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let offset = offset_argument(c, a[2])?;
+    let result = send(c, a[0], a[1], offset, a[3]);
+    if let Some(start) = offset {
+        let sent = result.as_ref().map_or(0, |sent| *sent);
+        c.mem
+            .write_u64(GuestAddr(a[2]), start + sent)
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    result
+}
+fn send(
+    c: &mut Context<'_>,
+    out: u64,
+    fd: u64,
+    offset: Option<u64>,
+    count: u64,
+) -> Result<u64, Errno> {
+    let input = c.files.descriptor(fd)?.file;
+    if input.flags() & 3 == 1 {
+        return Err(Errno::EBADF);
+    }
+    // An offset needs a file with a position (ESPIPE); without one, a pipe
+    // input is at 0 and fails below as no regular file.
+    let position = input.seek(0, 1);
+    let from = match offset {
+        Some(offset) => position.map(|_| offset).map_err(|_| Errno::ESPIPE)?,
+        None => position.unwrap_or(0),
+    };
+    if (count as i64) < 0
+        || (from as i64) < 0
+        || from
+            .checked_add(count)
+            .is_none_or(|end| end > i64::MAX as u64)
+    {
+        return Err(Errno::EINVAL);
+    }
+    let count = count.min(MAX_RW_COUNT as u64);
+    let output = c.files.descriptor(out)?.file;
+    if output.flags() & 3 == 0 {
+        return Err(Errno::EBADF);
+    }
+    let pipe = output
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::sockets::PipeEnd>())
+        .map(crate::sockets::PipeEnd::size);
+    // do_splice_direct refuses O_APPEND; a pipe output does not use it.
+    if pipe.is_none() && output.flags() & 0o2000 != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let source = input.stat()?;
+    if source.mode & 0o170000 != REGULAR {
+        return Err(Errno::EINVAL);
+    }
+    let count = count.min(source.size.saturating_sub(from));
+    if count == 0 {
+        return Ok(0);
+    }
+    let sent = if output.stat()?.mode & 0o170000 == REGULAR {
+        let to = output.seek(0, 1)?;
+        let count = count.min(size_room(c, to)?);
+        let sent = copy_bytes(&input, from, &output, to, count)?;
+        output.seek((to + sent) as i64, 0)?;
+        sent
+    } else {
+        // A pipe takes at most what it holds, as splice_file_to_pipe does;
+        // other files take 1 MiB pieces until a short write.
+        let count = pipe.map_or(count, |size| count.min(size));
+        let mut piece = buffer(usize::try_from(count).unwrap_or(usize::MAX).min(1 << 20))?;
+        let mut sent = 0;
+        while sent < count {
+            let want = usize::try_from(count - sent).map_or(piece.len(), |n| n.min(piece.len()));
+            let written = read_at(&input, from + sent, &mut piece[..want])
+                .and_then(|read| Ok((read, write_io(c, &output, &piece[..read], false)?)));
+            let (read, written) = match written {
+                Ok(counts) => counts,
+                Err(_) if sent > 0 => break,
+                Err(error) => return Err(error),
+            };
+            sent += written;
+            if read == 0 || written < read as u64 {
+                break;
+            }
+        }
+        sent
+    };
+    if offset.is_none() {
+        input.seek((from + sent) as i64, 0)?;
+    }
+    Ok(sent)
 }
 /// The `struct iovec` array of readv, writev and their positioned forms, as
 /// Linux's `import_iovec` reads it: at most 1024 entries (EINVAL), each
@@ -688,6 +919,8 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     match n {
+        40 => sendfile(c, a),
+        326 => copy_file_range(c, a),
         // pread64, pwrite64, preadv, pwritev: at an offset, leaving the file
         // position. On x86-64 the offset of preadv and pwritev is a[3] alone.
         17 => {

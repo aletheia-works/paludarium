@@ -47,6 +47,7 @@ macro_rules! cases {($($name:ident=>$id:literal),*)=>{$(#[test]fn $name(){case(s
 cases!(trailing_operations=>32,host_trailing_operations=>32);
 cases!(files_umask=>33,host_files_umask=>33,files_chmod=>34,host_files_chmod=>34,files_utimensat=>35,host_files_utimensat=>35,files_sync_fadvise=>36,host_files_sync_fadvise=>36);
 cases!(files_mmap=>37,host_files_mmap=>37,mmap_errors=>38,host_mmap_errors=>38);
+cases!(copy_file_range=>39,host_copy_file_range=>39,sendfile=>40,host_sendfile=>40);
 cases!(null_stat=>0,null_lstat=>1,null_statat=>2,read_write=>3,files_hard_link=>4,files_symlink=>5,files_rename=>6,files_flock=>7,fstat_errors=>8,unlink_open=>9,dup_offset=>10,open_errors=>11,files_directory=>12,getdents=>13,at_operations=>14,symlinkat=>15,statat_flags=>16,files_truncate=>17,fcntl=>18,files_dangling=>19,empty_path=>20,create_dangling=>21,renamed_dirfd=>22,closed_stdio=>23,redirect_stdout=>24,dup_stdout=>25,flock_dup_close=>26,append_fcntl=>27,huge_invalid_buffer=>28,directory_link_count=>29,rename_replace=>30,files_readonly_create=>31);
 
 use paludarium_host::{ClockId, Host, WaitOutcome, testing::RecordingHost};

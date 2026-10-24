@@ -646,6 +646,62 @@ fn sysinfo_getgroups_and_sched_yield() {
     assert_eq!(f.ret(nr::SCHED_YIELD, &[]), 0);
 }
 #[test]
+fn copies_between_files_keep_the_file_size_limit() {
+    let mut f = fixture();
+    let (limit, buf, offset) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);
+    f.mem.write(GuestAddr(DATA), b"/a\0/b\0").unwrap();
+    f.mem.write(GuestAddr(buf), b"0123456789").unwrap();
+    let input = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(1, &[input, buf, 10]), 10);
+    let output = f.ret(2, &[DATA + 3, 66, 0o600]);
+    f.mem.write_u64(GuestAddr(limit), 6).unwrap();
+    f.mem.write_u64(GuestAddr(limit + 8), u64::MAX).unwrap();
+    assert_eq!(f.ret(160, &[1, limit]), 0); // setrlimit(FSIZE, 6)
+    f.mem.write_u64(GuestAddr(limit), 1 << 24).unwrap();
+    assert_eq!(f.ret(14, &[0, limit, 0, 8]), 0); // block SIGXFSZ
+    f.mem.write_u64(GuestAddr(offset), 0).unwrap();
+    // copy_file_range stops at the limit, then fails from it.
+    assert_eq!(f.ret(326, &[input, offset, output, 0, 10, 0]), 6);
+    assert_eq!(f.mem.read_u64(GuestAddr(offset)).unwrap(), 6);
+    assert_eq!(
+        f.ret(326, &[input, offset, output, 0, 10, 0]),
+        errno(Errno(27))
+    );
+    // Even with nothing left to copy, as generic_write_check_limits.
+    f.mem.write_u64(GuestAddr(offset), 10).unwrap();
+    assert_eq!(
+        f.ret(326, &[input, offset, output, 0, 10, 0]),
+        errno(Errno(27))
+    );
+    assert_eq!(
+        f.thread
+            .state
+            .pending
+            .iter()
+            .filter(|s| s.number == 25)
+            .count(),
+        1
+    );
+    // sendfile into a regular file too.
+    assert_eq!(f.ret(77, &[output, 0]), 0);
+    assert_eq!(f.ret(8, &[output, 0, 0]), 0);
+    f.mem.write_u64(GuestAddr(offset), 0).unwrap();
+    assert_eq!(f.ret(40, &[output, input, offset, 10]), 6);
+    assert_eq!(f.mem.read_u64(GuestAddr(offset)).unwrap(), 6);
+    assert_eq!(f.ret(40, &[output, input, offset, 10]), errno(Errno(27)));
+}
+#[test]
+fn sendfile_sends_a_large_file_in_pieces() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/a\0/dev/null\0").unwrap();
+    let input = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(77, &[input, 3 << 20]), 0);
+    let null = f.ret(2, &[DATA + 3, 1, 0]);
+    // More than one 1 MiB piece, all of it in one call.
+    assert_eq!(f.ret(40, &[null, input, 0, 4 << 20]), 3 << 20);
+    assert_eq!(f.ret(8, &[input, 0, 1]), 3 << 20);
+}
+#[test]
 fn file_size_limit_is_enforced_as_linux_does() {
     let mut f = fixture();
     let (limit, buf, pair) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);

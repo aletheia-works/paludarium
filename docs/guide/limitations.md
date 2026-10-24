@@ -36,8 +36,9 @@ verified.
   that every input is safe.
 - Differential references were taken on some recorded AMD and Intel CPUs. On a
   CPU profile not observed yet, the tests stop on purpose.
-- There are no limits yet on memory, threads or files. An untrusted program
-  could use up the host's resources.
+- There are no limits yet on memory or threads, and open files are bounded
+  only by the guest's own `RLIMIT_NOFILE`, which it may raise to its hard
+  limit. An untrusted program could use up the host's resources.
 - Automated Safari tests sometimes timed out while waiting for the browser to
   start. A fix passed ten times in a row, which does not guarantee it never
   happens again.

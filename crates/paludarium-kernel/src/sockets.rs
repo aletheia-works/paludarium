@@ -211,9 +211,12 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .check_write(GuestAddr(a[3]), 8)
                 .map_err(|_| Errno::EFAULT)?;
             let kind = u32::try_from(a[1]).map_err(|_| Errno::EINVAL)?;
-            let [first, second] = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
-            let fd0 = c.files.install(first, kind & CLOEXEC != 0)?;
-            let fd1 = c.files.install(second, kind & CLOEXEC != 0)?;
+            let ends = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
+            let [fd0, fd1] = c.files.install_pair(
+                ends.map(|end| end as Arc<dyn FileHandle>),
+                kind & CLOEXEC != 0,
+                c.group.nofile(),
+            )?;
             let mut bytes = [0; 8];
             bytes[..4].copy_from_slice(&fd0.to_le_bytes());
             bytes[4..].copy_from_slice(&fd1.to_le_bytes());

@@ -13,7 +13,7 @@ fn et_unread_write_during_host_wait() {
             let [a, b] =
                 crate::sockets::SocketPairEnd::pair(0x801, Arc::clone(&f.kernel.files.readiness))
                     .unwrap();
-            let fd = f.kernel.files.install(b, false).unwrap();
+            let fd = f.kernel.files.install(b, false, 1024).unwrap();
             (u64::from(fd), a as Arc<dyn paludarium_host::FileHandle>)
         } else {
             let fd = f.event(0);
@@ -236,8 +236,8 @@ fn blocking_socket_write_retries_after_host_entry_and_metadata() {
         let [a, b] =
             crate::sockets::SocketPairEnd::pair(1, Arc::clone(&f.kernel.files.readiness)).unwrap();
         a.write(&vec![0; crate::sockets::SEND_WINDOW]).unwrap();
-        let fd = f.kernel.files.install(a, false).unwrap();
-        f.kernel.files.install(b.clone(), false).unwrap();
+        let fd = f.kernel.files.install(a, false, 1024).unwrap();
+        f.kernel.files.install(b.clone(), false, 1024).unwrap();
         let entered = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&entered);
         *f.host.action.lock().unwrap() = Some(Box::new(move || {

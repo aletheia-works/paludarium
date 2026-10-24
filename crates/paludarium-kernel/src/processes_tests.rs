@@ -219,6 +219,18 @@ mod process {
         assert!(tid < 1 << 32, "{tid:#x}");
     }
     #[test]
+    fn fork_inherits_the_descriptor_limit() {
+        let (mut k, mut t, m) = setup();
+        m.write_u64(GuestAddr(DATA), 3).unwrap();
+        m.write_u64(GuestAddr(DATA + 8), 4096).unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &m, 160, [7, DATA, 0, 0, 0, 0]), 0);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 32, [0; 6]),
+            Errno::EMFILE.to_syscall_return()
+        );
+    }
+    #[test]
     fn exit_group_isolated() {
         let (mut k, mut t, m) = setup();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);

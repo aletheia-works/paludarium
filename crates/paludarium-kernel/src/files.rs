@@ -3,7 +3,7 @@ use crate::syscalls::{Context, Outcome};
 use paludarium_host::{ClockId, FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{FileSystem, HostFs, MemFs};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
@@ -23,6 +23,10 @@ pub struct Files {
     pub terminal_size: Option<(u16, u16)>,
     pub fs: Arc<dyn FileSystem>,
     pub(crate) fds: Arc<Mutex<BTreeMap<u32, Descriptor>>>,
+    /// Numbers an unfinished open has taken, as Linux's alloc_fd marks them
+    /// before the file exists: no allocation gets them and no lookup sees
+    /// them. Shared exactly as `fds` is; locked after it.
+    reserved: Arc<Mutex<BTreeSet<u32>>>,
     cwd: Arc<Mutex<Vec<u8>>>,
     /// Shared with the cwd: `CLONE_FS` shares both, as on Linux.
     umask: Arc<AtomicU32>,
@@ -36,6 +40,7 @@ impl Default for Files {
             terminal_size: None,
             fs: Arc::new(fs),
             fds: Arc::new(Mutex::new(BTreeMap::new())),
+            reserved: Arc::default(),
             cwd: Arc::new(Mutex::new(b"/".to_vec())),
             umask: Arc::new(AtomicU32::new(0o022)),
         }
@@ -54,6 +59,7 @@ impl Files {
         // Detach this worker's table reference without closing a table still
         // shared by live CLONE_FILES siblings.
         self.fds = Arc::new(Mutex::new(BTreeMap::new()));
+        self.reserved = Arc::default();
     }
     pub(crate) fn umask(&self) -> u32 {
         self.umask.load(Ordering::SeqCst)
@@ -74,6 +80,7 @@ impl Files {
         &mut self,
         file: Arc<dyn FileHandle>,
         cloexec: bool,
+        limit: u64,
     ) -> Result<u32, Errno> {
         self.allocate(
             Descriptor {
@@ -82,7 +89,66 @@ impl Files {
                 cloexec,
             },
             0,
+            limit,
         )
+    }
+    /// Installs a pair, as pipe and socketpair do: both descriptors or, with
+    /// fewer than two free below `limit`, neither (EMFILE). One lock covers
+    /// both, so no other thread sees only the first.
+    pub(crate) fn install_pair(
+        &mut self,
+        files: [Arc<dyn FileHandle>; 2],
+        cloexec: bool,
+        limit: u64,
+    ) -> Result<[u32; 2], Errno> {
+        let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
+        let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        let one = lowest_free(&fds, &reserved, 0, limit)?;
+        let two = lowest_free(&fds, &reserved, one + 1, limit)?;
+        for (n, file) in [one, two].into_iter().zip(files) {
+            let path = Vec::new();
+            fds.insert(
+                n,
+                Descriptor {
+                    file,
+                    path,
+                    cloexec,
+                },
+            );
+        }
+        Ok([one, two])
+    }
+    /// Takes the lowest free number below `limit` (EMFILE otherwise) before
+    /// a call such as open has any effect, as Linux's get_unused_fd_flags;
+    /// [`Self::fill`] or [`Self::unreserve`] ends the reservation.
+    pub(crate) fn reserve(&self, limit: u64) -> Result<u32, Errno> {
+        let fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        let n = lowest_free(&fds, &reserved, 0, limit)?;
+        reserved.insert(n);
+        Ok(n)
+    }
+    pub(crate) fn fill(&self, n: u32, d: Descriptor) {
+        let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
+        fds.insert(n, d);
+        self.unreserve(n);
+    }
+    pub(crate) fn unreserve(&self, n: u32) {
+        self.reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&n);
+    }
+    /// Puts `d` at `n`, closing what was there, as dup2 does; EBUSY when an
+    /// unfinished open of another thread has taken `n`, as in Linux.
+    pub(crate) fn replace(&self, n: u32, d: Descriptor) -> Result<(), Errno> {
+        let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
+        let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        if reserved.contains(&n) {
+            return Err(Errno(16));
+        }
+        fds.insert(n, d);
+        Ok(())
     }
     pub fn with_host(host: Arc<dyn paludarium_host::Host>) -> Self {
         let files = Self::default();
@@ -114,12 +180,12 @@ impl Files {
             .and_then(|d| d.file.stdio_channel())
             == u32::try_from(fd).ok()
     }
-    fn allocate(&mut self, d: Descriptor, min: u32) -> Result<u32, Errno> {
+    /// Gives `d` the lowest free number from `min`, which must be below the
+    /// RLIMIT_NOFILE soft limit `limit` (EMFILE).
+    fn allocate(&mut self, d: Descriptor, min: u32, limit: u64) -> Result<u32, Errno> {
         let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut n = min;
-        while fds.contains_key(&n) {
-            n = n.checked_add(1).ok_or(Errno(24))?
-        }
+        let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        let n = lowest_free(&fds, &reserved, min, limit)?;
         fds.insert(n, d);
         Ok(n)
     }
@@ -165,6 +231,7 @@ impl Files {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone(),
             ));
+            child.reserved = Arc::default();
         }
         if !share_fs {
             child.cwd = Arc::new(Mutex::new(
@@ -176,6 +243,25 @@ impl Files {
             child.umask = Arc::new(AtomicU32::new(self.umask.load(Ordering::SeqCst)));
         }
         child
+    }
+}
+/// The lowest number from `min` with no descriptor or reservation, which
+/// must be below the RLIMIT_NOFILE soft limit `limit` (EMFILE), as in Linux's
+/// alloc_fd.
+fn lowest_free(
+    fds: &BTreeMap<u32, Descriptor>,
+    reserved: &BTreeSet<u32>,
+    min: u32,
+    limit: u64,
+) -> Result<u32, Errno> {
+    let mut n = min;
+    while fds.contains_key(&n) || reserved.contains(&n) {
+        n = n.checked_add(1).ok_or(Errno::EMFILE)?;
+    }
+    if u64::from(n) < limit {
+        Ok(n)
+    } else {
+        Err(Errno::EMFILE)
     }
 }
 fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
@@ -649,14 +735,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.mem
                 .check_write(GuestAddr(a[0]), 8)
                 .map_err(|_| Errno::EFAULT)?;
-            let [reader, writer] =
-                crate::sockets::PipeEnd::pair(flags, Arc::clone(&c.files.readiness))?;
-            let first = c
-                .files
-                .install(reader, flags & crate::events::CLOEXEC != 0)?;
-            let second = c
-                .files
-                .install(writer, flags & crate::events::CLOEXEC != 0)?;
+            let ends = crate::sockets::PipeEnd::pair(flags, Arc::clone(&c.files.readiness))?;
+            let [first, second] = c.files.install_pair(
+                ends.map(|end| end as Arc<dyn FileHandle>),
+                flags & crate::events::CLOEXEC != 0,
+                c.group.nofile(),
+            )?;
             let mut bytes = [0; 8];
             bytes[..4].copy_from_slice(&first.to_le_bytes());
             bytes[4..].copy_from_slice(&second.to_le_bytes());
@@ -752,33 +836,46 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if flags & 3 == 3 {
                 return Err(Errno::EINVAL);
             }
-            let f: Arc<dyn FileHandle> = if p == b"/dev/null" {
-                Arc::new(crate::null::NullFile::new(flags))
-            } else if let Some(mountinfo) = crate::proc::mount_table(&p) {
-                let content = crate::proc::render(&c.files.fs.mounts(), mountinfo);
-                Arc::new(crate::proc::GeneratedFile::open(content, flags))
-            } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
-                match entry {
-                    crate::proc::OwnEntry::Directory => Arc::new(crate::proc::OwnDirectory),
-                    crate::proc::OwnEntry::Status => {
-                        Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
+            // Linux takes the descriptor before it opens, so with none free
+            // nothing is opened or created.
+            let fd = c.files.reserve(c.group.nofile())?;
+            let opened = (|| -> Result<Arc<dyn FileHandle>, Errno> {
+                Ok(if p == b"/dev/null" {
+                    Arc::new(crate::null::NullFile::new(flags))
+                } else if let Some(mountinfo) = crate::proc::mount_table(&p) {
+                    let content = crate::proc::render(&c.files.fs.mounts(), mountinfo);
+                    Arc::new(crate::proc::GeneratedFile::open(content, flags))
+                } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
+                    match entry {
+                        crate::proc::OwnEntry::Directory => Arc::new(crate::proc::OwnDirectory),
+                        crate::proc::OwnEntry::Status => {
+                            Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
+                        }
                     }
+                } else {
+                    c.files
+                        .fs
+                        .open(&p, flags, (mode as u32) & !c.files.umask())?
+                })
+            })();
+            match opened {
+                Ok(file) => {
+                    let cloexec = flags & 0x80000 != 0;
+                    c.files.fill(
+                        fd,
+                        Descriptor {
+                            file,
+                            path: p,
+                            cloexec,
+                        },
+                    );
+                    Ok(u64::from(fd))
                 }
-            } else {
-                c.files
-                    .fs
-                    .open(&p, flags, (mode as u32) & !c.files.umask())?
-            };
-            c.files
-                .allocate(
-                    Descriptor {
-                        file: f,
-                        path: p,
-                        cloexec: flags & 0x80000 != 0,
-                    },
-                    0,
-                )
-                .map(u64::from)
+                Err(error) => {
+                    c.files.unreserve(fd);
+                    Err(error)
+                }
+            }
         }
         3 => {
             c.files
@@ -817,30 +914,46 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             .descriptor(a[0])?
             .file
             .seek(a[1] as i64, a[2] as u32),
-        32 | 33 | 292 => {
-            let mut d = c.files.descriptor(a[0])?;
-            d.cloexec = n == 292 && a[2] & 0x80000 != 0;
-            if n == 32 {
-                return c.files.allocate(d, 0).map(u64::from);
-            }
-            if a[1] > i32::MAX as u64 || n == 292 && (a[2] & !0x80000 != 0 || a[0] == a[1]) {
+        32 => {
+            let d = Descriptor {
+                cloexec: false,
+                ..c.files.descriptor(a[0])?
+            };
+            c.files.allocate(d, 0, c.group.nofile()).map(u64::from)
+        }
+        33 | 292 => {
+            // Both take unsigned int descriptors.
+            let (old, new) = (a[0] as u32, a[1] as u32);
+            if n == 292 && (a[2] & !0x80000 != 0 || old == new) {
                 return Err(Errno::EINVAL);
             }
-            c.files
-                .fds
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(a[1] as u32, d);
-            Ok(a[1])
+            // dup2 onto itself only checks the descriptor, keeping its flags.
+            if old == new {
+                return c.files.descriptor(u64::from(old)).map(|_| u64::from(new));
+            }
+            if u64::from(new) >= c.group.nofile() {
+                return Err(Errno::EBADF);
+            }
+            let d = Descriptor {
+                cloexec: n == 292 && a[2] & 0x80000 != 0,
+                ..c.files.descriptor(u64::from(old))?
+            };
+            c.files.replace(new, d)?;
+            Ok(u64::from(new))
         }
         72 => {
             let mut d = c.files.descriptor(a[0])?;
             match a[1] {
                 0 | 1030 => {
                     d.cloexec = a[1] == 1030;
-                    c.files
-                        .allocate(d, u32::try_from(a[2]).map_err(|_| Errno::EINVAL)?)
-                        .map(u64::from)
+                    // F_DUPFD takes an int, and a start at or past the limit
+                    // is EINVAL rather than EMFILE.
+                    let from = a[2] as u32;
+                    let limit = c.group.nofile();
+                    if u64::from(from) >= limit {
+                        return Err(Errno::EINVAL);
+                    }
+                    c.files.allocate(d, from, limit).map(u64::from)
                 }
                 1 => Ok(u64::from(d.cloexec)),
                 2 => {
@@ -1248,13 +1361,56 @@ mod files_tests {
     fn fd_allocate() {
         let fs = MemFs::new();
         let mut f = Files::default();
-        assert_eq!(f.allocate(d(&fs, b"/a"), 3), Ok(3));
-        assert_eq!(f.allocate(d(&fs, b"/b"), 3), Ok(4));
+        assert_eq!(f.allocate(d(&fs, b"/a"), 3, 1024), Ok(3));
+        assert_eq!(f.allocate(d(&fs, b"/b"), 3, 1024), Ok(4));
+    }
+    #[test]
+    fn fd_limit() {
+        let fs = MemFs::new();
+        let mut f = Files::default();
+        assert_eq!(f.allocate(d(&fs, b"/a"), 3, 5), Ok(3));
+        assert_eq!(f.allocate(d(&fs, b"/b"), 3, 5), Ok(4));
+        assert_eq!(f.allocate(d(&fs, b"/c"), 3, 5), Err(Errno::EMFILE));
+        assert_eq!(f.reserve(0), Err(Errno::EMFILE));
+        // A pair needs two free descriptors; with one (0), neither is taken.
+        let [x, y] = crate::sockets::PipeEnd::pair(0, Arc::clone(&f.readiness))
+            .unwrap()
+            .map(|end| end as Arc<dyn FileHandle>);
+        assert_eq!(
+            f.install_pair([x.clone(), y.clone()], false, 1),
+            Err(Errno::EMFILE)
+        );
+        assert!(f.descriptor(0).is_err());
+        assert_eq!(f.install_pair([x, y], false, 2), Ok([0, 1]));
+    }
+    #[test]
+    fn fd_reservation() {
+        let fs = MemFs::new();
+        let mut f = Files::default();
+        // An open's number is taken but not seen until the file is there.
+        assert_eq!(f.reserve(1024), Ok(0));
+        assert_eq!(f.allocate(d(&fs, b"/a"), 0, 1024), Ok(1));
+        assert_eq!(f.reserve(2), Err(Errno::EMFILE));
+        assert!(f.descriptor(0).is_err());
+        assert_eq!(f.replace(0, d(&fs, b"/b")), Err(Errno(16)));
+        f.fill(0, d(&fs, b"/c"));
+        assert_eq!(f.descriptor(0).unwrap().path, b"/c");
+        assert_eq!(f.replace(0, d(&fs, b"/b")), Ok(()));
+        // A failed open gives its number back.
+        assert_eq!(f.reserve(1024), Ok(2));
+        f.unreserve(2);
+        assert_eq!(f.allocate(d(&fs, b"/d"), 0, 1024), Ok(2));
+        // A process of its own starts with no reservations.
+        assert_eq!(f.reserve(1024), Ok(3));
+        assert_eq!(
+            f.for_clone(false, false).allocate(d(&fs, b"/e"), 0, 1024),
+            Ok(3)
+        );
     }
     #[test]
     fn fd_minimum() {
         let fs = MemFs::new();
-        assert_eq!(Files::default().allocate(d(&fs, b"/a"), 20), Ok(20));
+        assert_eq!(Files::default().allocate(d(&fs, b"/a"), 20, 1024), Ok(20));
     }
     #[test]
     fn fd_bad() {
@@ -1288,7 +1444,7 @@ mod files_tests {
     fn fd_directory_type() {
         let fs = MemFs::new();
         let mut f = Files::default();
-        f.allocate(d(&fs, b"/a"), 3).unwrap();
+        f.allocate(d(&fs, b"/a"), 3, 1024).unwrap();
         assert_eq!(f.path(3, b"b".to_vec()), Err(Errno::ENOTDIR));
     }
     #[test]

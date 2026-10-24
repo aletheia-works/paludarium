@@ -214,6 +214,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .install(
                     Arc::new(EpollInstance::new(Arc::clone(&c.files.readiness))),
                     number == 291 && a[0] & 0x80000 != 0,
+                    c.group.nofile(),
                 )
                 .map(u64::from);
         }

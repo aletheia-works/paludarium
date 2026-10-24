@@ -646,6 +646,34 @@ fn sysinfo_getgroups_and_sched_yield() {
     assert_eq!(f.ret(nr::SCHED_YIELD, &[]), 0);
 }
 #[test]
+fn descriptor_limit_is_enforced_as_linux_does() {
+    let mut f = fixture();
+    let (limit, stat) = (DATA + 0x100, DATA + 0x200);
+    f.mem.write(GuestAddr(DATA), b"/a\0/b\0/c\0").unwrap();
+    f.mem.write_u64(GuestAddr(limit), 5).unwrap();
+    f.mem.write_u64(GuestAddr(limit + 8), 4096).unwrap();
+    assert_eq!(f.ret(160, &[7, limit]), 0); // setrlimit(NOFILE, 5)
+    assert_eq!(f.ret(2, &[DATA, 66, 0o600]), 3);
+    assert_eq!(f.ret(2, &[DATA + 3, 66, 0o600]), 4);
+    // No descriptor is free, so open creates nothing.
+    assert_eq!(f.ret(2, &[DATA + 6, 66, 0o600]), errno(Errno::EMFILE));
+    assert_eq!(f.ret(4, &[DATA + 6, stat]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(32, &[3]), errno(Errno::EMFILE)); // dup
+    assert_eq!(f.ret(22, &[stat]), errno(Errno::EMFILE)); // pipe
+    assert_eq!(f.ret(33, &[3, 5]), errno(Errno::EBADF)); // dup2 past the limit
+    assert_eq!(f.ret(72, &[3, 0, 5]), errno(Errno::EINVAL)); // F_DUPFD from it
+    assert_eq!(f.ret(72, &[3, 0, 4]), errno(Errno::EMFILE));
+    // dup2 reads an unsigned int, and onto itself keeps FD_CLOEXEC.
+    assert_eq!(f.ret(33, &[3, 1 << 32 | 4]), 4);
+    assert_eq!(f.ret(72, &[3, 2, 1]), 0); // F_SETFD
+    assert_eq!(f.ret(33, &[3, 3]), 3);
+    assert_eq!(f.ret(72, &[3, 1]), 1); // F_GETFD
+    // With one descriptor free, pipe takes neither.
+    assert_eq!(f.ret(3, &[4]), 0);
+    assert_eq!(f.ret(22, &[stat]), errno(Errno::EMFILE));
+    assert_eq!(f.ret(32, &[3]), 4);
+}
+#[test]
 fn resource_limits_are_recorded_in_linux_order() {
     let mut f = fixture();
     let (new, old) = (DATA, DATA + 0x10);

@@ -27,6 +27,10 @@ pub struct ThreadGroup {
     process_inbox: Mutex<Arc<SignalInbox>>,
     process_pending: Mutex<ThreadState>,
     timer_generation: AtomicU64,
+    /// The RLIMIT_NOFILE soft limit, which bounds the descriptor numbers this
+    /// process allocates. The process entry keeps the limit pair `prlimit`
+    /// reports.
+    nofile: AtomicU64,
     pub(crate) futexes: Futexes,
     pub(crate) timers: Mutex<crate::timers::Timers>,
     /// Every thread's CPU time, live or exited, for the process's total.
@@ -44,6 +48,7 @@ impl Default for ThreadGroup {
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
             process_pending: Mutex::new(ThreadState::default()),
             timer_generation: AtomicU64::new(0),
+            nofile: AtomicU64::new(1024),
             futexes: Futexes::default(),
             timers: Mutex::default(),
             cpu: Mutex::default(),
@@ -96,8 +101,15 @@ impl ThreadGroup {
         };
         Self {
             actions: Mutex::new(actions),
+            nofile: AtomicU64::new(self.nofile()),
             ..Self::default()
         }
+    }
+    pub(crate) fn nofile(&self) -> u64 {
+        self.nofile.load(Ordering::SeqCst)
+    }
+    pub(crate) fn set_nofile(&self, soft: u64) {
+        self.nofile.store(soft, Ordering::SeqCst);
     }
     pub(crate) fn shared_actions(&self) -> Arc<Mutex<BTreeMap<i32, SignalAction>>> {
         self.actions

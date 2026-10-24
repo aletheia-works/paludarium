@@ -58,7 +58,9 @@ fn create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         state: Mutex::new(State::default()),
         flags: AtomicU32::new(2 | flags & NONBLOCK),
     });
-    c.files.install(timer, flags & CLOEXEC != 0).map(u64::from)
+    c.files
+        .install(timer, flags & CLOEXEC != 0, c.group.nofile())
+        .map(u64::from)
 }
 
 /// The timer file `fd` names: EBADF for no descriptor, EINVAL for another file.

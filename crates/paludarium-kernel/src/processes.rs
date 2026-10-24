@@ -20,7 +20,8 @@ struct Entry {
     /// Process group ID; inherited on fork and kept across exec.
     pgid: u32,
     /// Resource limits (soft, hard), inherited on fork and kept across exec.
-    /// They are recorded and reported, not enforced.
+    /// They are recorded and reported; only RLIMIT_NOFILE is enforced, through
+    /// the copy of its soft limit in the thread group.
     limits: [(u64, u64); RLIMITS],
     /// PR_SET_PDEATHSIG: sent to this process when its parent exits; cleared
     /// on fork.
@@ -191,6 +192,9 @@ impl Processes {
                 return Err(Errno::EPERM);
             }
             entry.limits[resource] = (soft, hard);
+            if resource == 7 {
+                entry.group.set_nofile(soft);
+            }
         }
         Ok(old)
     }
@@ -975,7 +979,9 @@ impl Kernel {
             processes: Arc::clone(&self.processes),
             flags: AtomicU32::new((2 | flags & PIDFD_NONBLOCK) as u32),
         });
-        self.files.install(pidfd, true).map(u64::from)
+        self.files
+            .install(pidfd, true, self.group.nofile())
+            .map(u64::from)
     }
     /// `pidfd_send_signal(pidfd, sig, info, flags)`, as `kill` on the
     /// pidfd's process; a siginfo and the scope flags are not supported

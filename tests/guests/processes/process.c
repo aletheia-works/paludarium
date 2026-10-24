@@ -381,6 +381,47 @@ int main(int argc, char **argv) {
         unlink(path);
         return 0;
     }
+    if (!strcmp(mode, "nofile-limit")) {
+        /* The soft RLIMIT_NOFILE bounds the descriptor numbers: room for two
+           more past the lowest free one. */
+        const char *a_path = "/tmp/paludarium-nofile-a", *b_path = "/tmp/paludarium-nofile-b";
+        const char *c_path = "/tmp/paludarium-nofile-c";
+        unlink(c_path);
+        int base = dup(0);
+        close(base);
+        struct rlimit limit;
+        getrlimit(RLIMIT_NOFILE, &limit);
+        limit.rlim_cur = base + 2;
+        result("set", setrlimit(RLIMIT_NOFILE, &limit));
+        int a = open(a_path, O_CREAT|O_RDWR, 0600), b = open(b_path, O_CREAT|O_RDWR, 0600);
+        result("opened", a == base && b == base + 1);
+        int pair[2];
+        struct stat st;
+        errno = 0;
+        result("open", open(c_path, O_CREAT|O_RDWR, 0600) < 0 ? -errno : 0);
+        errno = 0;
+        result("not-created", stat(c_path, &st) < 0 ? -errno : 0);
+        errno = 0;
+        result("dup", dup(a) < 0 ? -errno : 0);
+        errno = 0;
+        result("pipe", pipe(pair) < 0 ? -errno : 0);
+        errno = 0;
+        result("dup2", dup2(a, base + 2) < 0 ? -errno : 0);
+        errno = 0;
+        result("dupfd-past", fcntl(a, F_DUPFD, base + 2) < 0 ? -errno : 0);
+        errno = 0;
+        result("dupfd-full", fcntl(a, F_DUPFD, base) < 0 ? -errno : 0);
+        fcntl(a, F_SETFD, FD_CLOEXEC);
+        result("dup2-self", dup2(a, a) == a && fcntl(a, F_GETFD) == FD_CLOEXEC);
+        /* With one descriptor free, pipe takes neither. */
+        close(b);
+        errno = 0;
+        result("pipe-one", pipe(pair) < 0 ? -errno : 0);
+        result("reused", dup(a) == base + 1);
+        unlink(a_path);
+        unlink(b_path);
+        return 0;
+    }
     if (!strcmp(mode, "rlimit")) {
         struct rlimit limit, old;
         getrlimit(RLIMIT_NOFILE, &limit);

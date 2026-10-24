@@ -13,6 +13,7 @@
     {"name":"ids","binary":"process"},
     {"name":"access","binary":"process"},
     {"name":"rlimit","binary":"process"},
+    {"name":"nofile-limit","binary":"process"},
     {"name":"pgid","binary":"process"},
     {"name":"sysinfo","binary":"process"},
     {"name":"statfs","binary":"process"},

@@ -125,6 +125,7 @@ impl Errno {
     pub const ENOTDIR: Errno = Errno(20);
     pub const EISDIR: Errno = Errno(21);
     pub const EINVAL: Errno = Errno(22);
+    pub const EMFILE: Errno = Errno(24);
     pub const ENOTTY: Errno = Errno(25);
     pub const ENOSPC: Errno = Errno(28);
     pub const ESPIPE: Errno = Errno(29);

@@ -13,7 +13,9 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             flags,
             Arc::clone(&c.files.readiness),
         )?);
-        c.files.install(event, flags & CLOEXEC != 0).map(u64::from)
+        c.files
+            .install(event, flags & CLOEXEC != 0, c.group.nofile())
+            .map(u64::from)
     })();
     Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
 }

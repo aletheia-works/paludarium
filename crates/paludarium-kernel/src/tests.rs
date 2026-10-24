@@ -832,6 +832,52 @@ fn proc_fd_links_open_again_or_refuse() {
     assert_eq!(f.ret(2, &[path, 0]), errno(Errno::ENOENT));
 }
 #[test]
+fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
+    let mut f = fixture();
+    let (name, buf) = (DATA, DATA + 0x400);
+    let put = |f: &mut Fixture, at: u64, text: &str| {
+        f.mem
+            .write(GuestAddr(at), format!("{text}\0").as_bytes())
+            .unwrap();
+    };
+    put(&mut f, name, "/t");
+    assert_eq!(f.ret(2, &[name, 0o101, 0o600]), 3);
+    assert_eq!(f.ret(3, &[3]), 0);
+    // /l1 -> /l2 -> ... -> /l40 -> /t: forty links, which open follows too.
+    for i in 1..=40 {
+        let target = if i == 40 {
+            "/t".to_owned()
+        } else {
+            format!("/l{}", i + 1)
+        };
+        put(&mut f, name, &target);
+        put(&mut f, name + 0x100, &format!("/l{i}"));
+        assert_eq!(f.ret(88, &[name, name + 0x100]), 0);
+    }
+    put(&mut f, name, "/l1");
+    let fd = f.ret(2, &[name, 0]);
+    put(&mut f, name + 0x100, &format!("/proc/self/fd/{fd}"));
+    let link = |f: &mut Fixture| {
+        let n = f.ret(89, &[name + 0x100, buf, 64]);
+        let mut b = vec![0; usize::try_from(n).unwrap()];
+        f.mem.read(GuestAddr(buf), &mut b).unwrap();
+        b
+    };
+    assert_eq!(link(&mut f), b"/t");
+    // One link more: the path no longer resolves, so it shows as deleted
+    // and cannot be opened again.
+    put(&mut f, name, "/l40");
+    assert_eq!(f.ret(87, &[name]), 0);
+    put(&mut f, name, "/l41");
+    put(&mut f, name + 0x200, "/l40");
+    assert_eq!(f.ret(88, &[name, name + 0x200]), 0);
+    put(&mut f, name, "/t");
+    put(&mut f, name + 0x200, "/l41");
+    assert_eq!(f.ret(88, &[name, name + 0x200]), 0);
+    assert_eq!(link(&mut f), b"/l1 (deleted)");
+    assert_eq!(f.ret(2, &[name + 0x100, 0]), errno(Errno(6)));
+}
+#[test]
 fn file_size_limit_is_enforced_as_linux_does() {
     let mut f = fixture();
     let (limit, buf, pair) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);

@@ -14,6 +14,9 @@ static char *numbered(const char *s,long n) {
 static char *fdpath(long n) { return numbered("/proc/self/fd/",n); }
 static long same(const char *a,long n,const char *b){long i=0;for(;b[i];i++)if(i>=n||a[i]!=b[i])return 0;return i==n;}
 static long starts(const char *a,long n,const char *b){long i=0;for(;b[i];i++)if(i>=n||a[i]!=b[i])return 0;return 1;}
+/* Whole pages of the program's own data (in the file) and bss (not). */
+static char data_pages[8192] __attribute__((aligned(4096))) = {1, 2, 3};
+static char bss_pages[8192] __attribute__((aligned(4096)));
 void _start(void) {
  long fd,x=0;
  if(CASE==0) results[x++]=S(4,0,st,0);
@@ -118,6 +121,11 @@ void _start(void) {
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
   results[x++]=SX(p,0,0);S(87,q,0,0);}
+ if(CASE==48){ /* MADV_DONTNEED on the program's own data and bss */
+  data_pages[0]=9;data_pages[4096]=9;bss_pages[0]=9;bss_pages[4096]=9;
+  results[x++]=S(28,data_pages,8192,4);results[x++]=data_pages[0];results[x++]=data_pages[1];results[x++]=data_pages[4096];
+  results[x++]=S(28,bss_pages,8192,4);results[x++]=bss_pages[0];results[x++]=bss_pages[4096];
+  results[x++]=S(28,bss_pages,4096,8);results[x++]=S(28,data_pages,4096,8);}
  if(CASE==47){ /* MADV_DONTNEED on a private file mapping: its pages read the file again */
   static char data[9000];for(int i=0;i<9000;i++)data[i]='a'+i%26;S(1,fd,data,9000);
   char*m=(char*)MMAP(12288,3,2,fd,0);results[x++]=(long)m>0;

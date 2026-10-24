@@ -101,6 +101,37 @@ fn loads_exec_segments_with_permissions_and_bss() {
 }
 
 #[test]
+fn madv_dontneed_reads_the_data_segment_again_and_zeroes_its_bss() {
+    let mut mem = AddressSpace::new();
+    load_bytes(&simple_exec(), &start(&[b"prog".to_vec()], &[]), &mut mem).unwrap();
+    // The data page (file data at 0x403010) and two bss pages after it.
+    mem.write(GuestAddr(0x403010), &[7, 7, 7, 7]).unwrap();
+    mem.write(GuestAddr(0x404000), &[8]).unwrap();
+    mem.discard_shared(GuestAddr(0x403000), 0x2000).unwrap();
+    let mut data = [9u8; 4];
+    mem.read(GuestAddr(0x403010), &mut data).unwrap();
+    assert_eq!(data, [1, 2, 3, 0]);
+    let mut bss = [9u8];
+    mem.read(GuestAddr(0x404000), &mut bss).unwrap();
+    assert_eq!(bss, [0]);
+    // The bss is anonymous memory, as on Linux, so MADV_FREE takes it; the
+    // pages that hold file data are a file mapping, which it refuses.
+    assert_eq!(
+        mem.check_private_anonymous(GuestAddr(0x404000), 0x1000),
+        Ok(())
+    );
+    assert_eq!(
+        mem.check_private_anonymous(GuestAddr(0x403000), 0x1000),
+        Err(Errno::EINVAL)
+    );
+    // A read-only segment keeps what is in it.
+    mem.discard_shared(GuestAddr(0x401000), 0x1000).unwrap();
+    let mut code = [0u8; 2];
+    mem.fetch(GuestAddr(0x401000), &mut code).unwrap();
+    assert_eq!(code, [0xf4; 2]);
+}
+
+#[test]
 fn static_pie_is_placed_at_fixed_base() {
     let bytes = build_elf(
         elf::ET_DYN,
@@ -293,4 +324,25 @@ fn loads_from_the_file_system_and_limits_arguments() {
     );
     let err: Error = LoadError::NotStaticMusl.into();
     assert_eq!(err.kind, ErrorKind::InvalidProgram);
+}
+
+/// The `load_elf` fuzz input that found an overflow in `file_pages`: a
+/// writable segment whose file offset sits in its page differently from its
+/// address, and starts before that much of the file.
+#[test]
+fn a_misplaced_writable_segment_loads_or_fails_without_overflow() {
+    let data: &[u8] = &[
+        6, 122, 129, 192, 37, 171, 64, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130,
+        130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130,
+        130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130,
+        130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 145, 145, 64, 6, 122,
+        91, 153, 129, 0, 0,
+    ];
+    let mut file = crate::testing::tiny_exec(&[0x90; 32], b"data");
+    for patch in data[1..].as_chunks::<3>().0 {
+        let at = usize::from(u16::from_le_bytes([patch[0], patch[1]])) % file.len();
+        file[at] = patch[2];
+    }
+    let mut mem = AddressSpace::new();
+    let _ = load_bytes(&file, &start(&[b"prog".to_vec()], &[]), &mut mem);
 }

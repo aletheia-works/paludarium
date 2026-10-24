@@ -10,9 +10,10 @@
 pub mod elf;
 pub mod testing;
 
-use paludarium_mmu::{AddressSpace, MappingKind, Prot};
+use paludarium_mmu::{AddressSpace, MappingKind, PageSource, Prot};
 use paludarium_types::{Errno, Error, ErrorKind, GuestAddr, PAGE_SIZE, USER_ADDRESS_LIMIT};
 use paludarium_vfs::FileSystem;
+use std::sync::Arc;
 
 pub use elf::{ElfInfo, MAX_LOAD_SIZE, ProgramHeader, parse};
 
@@ -119,7 +120,26 @@ fn prot_of(flags: u32) -> Prot {
     prot
 }
 
-/// Places the `PT_LOAD` segments. Returns the load base and the end of the
+/// The file pages of a writable segment as the executable holds them, which
+/// `MADV_DONTNEED` reads the segment's pages from again.
+struct SegmentImage(Vec<u8>);
+impl PageSource for SegmentImage {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let rest = usize::try_from(offset)
+            .ok()
+            .and_then(|at| self.0.get(at..))
+            .unwrap_or_default();
+        let n = rest.len().min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        Ok(n)
+    }
+}
+
+/// Places the `PT_LOAD` segments, as Linux's binfmt_elf does: the pages that
+/// hold file data are a private file mapping, and the rest of the segment
+/// (bss) anonymous memory. A writable segment remembers its file pages, so
+/// that `MADV_DONTNEED` reads them again; a read-only one cannot have been
+/// written, and keeps its contents. Returns the load base and the end of the
 /// highest segment.
 fn map_segments(
     bytes: &[u8],
@@ -146,19 +166,30 @@ fn map_segments(
         let page_end = GuestAddr(end)
             .page_align_up()
             .ok_or(LoadError::Malformed("segment address overflow"))?;
-        mem.map(
-            Some(page_start),
-            page_end.0 - page_start.0,
-            prot_of(h.flags),
-            MappingKind::ElfSegment,
-        )
-        .map_err(|e| {
-            if e == Errno::EEXIST {
-                LoadError::Malformed("overlapping segments")
-            } else {
-                LoadError::Errno(e)
+        // The pages holding file data; a segment without any is all bss.
+        let file_end = if h.filesz == 0 {
+            page_start
+        } else {
+            GuestAddr(start + h.filesz)
+                .page_align_up()
+                .ok_or(LoadError::Malformed("segment address overflow"))?
+        };
+        let map = |mem: &mut AddressSpace, from: GuestAddr, to: GuestAddr, kind| {
+            if to.0 <= from.0 {
+                return Ok(());
             }
-        })?;
+            mem.map(Some(from), to.0 - from.0, prot_of(h.flags), kind)
+                .map(|_| ())
+                .map_err(|e| {
+                    if e == Errno::EEXIST {
+                        LoadError::Malformed("overlapping segments")
+                    } else {
+                        LoadError::Errno(e)
+                    }
+                })
+        };
+        map(mem, page_start, file_end, MappingKind::ElfSegment)?;
+        map(mem, file_end, page_end, MappingKind::Anonymous)?;
         let from = usize::try_from(h.offset).map_err(|_| LoadError::TooLarge)?;
         let len = usize::try_from(h.filesz).map_err(|_| LoadError::TooLarge)?;
         let data = bytes
@@ -167,9 +198,52 @@ fn map_segments(
         // The rest of the segment (bss) stays zero: fresh pages read as zero.
         mem.write_initial(GuestAddr(start), data)
             .map_err(|_| LoadError::Errno(Errno::EFAULT))?;
+        if h.flags & elf::PF_W != 0 && file_end.0 > page_start.0 {
+            mem.back_with_file(
+                page_start,
+                file_end.0 - page_start.0,
+                Arc::new(SegmentImage(file_pages(
+                    bytes,
+                    h,
+                    start - page_start.0,
+                    data,
+                ))),
+                0,
+            )
+            .map_err(LoadError::Errno)?;
+        }
         highest = highest.max(end);
     }
     Ok((base, highest))
+}
+
+/// What the file pages of a segment hold, from its first page: the file's own
+/// pages when the segment starts as far into its page as into the file
+/// (as `PT_LOAD` requires, and as Linux maps them, with what lies around the
+/// data), else the data alone at its place.
+fn file_pages(bytes: &[u8], h: &ProgramHeader, head: u64, data: &[u8]) -> Vec<u8> {
+    let head = usize::try_from(head).unwrap_or(0);
+    // The file's pages, from the one the segment starts in to the one its
+    // data ends in, cut at the end of the file.
+    let own = (h.offset % PAGE_SIZE == head as u64)
+        .then(|| usize::try_from(h.offset).ok())
+        .flatten()
+        .and_then(|offset| {
+            let from = offset.checked_sub(head)?;
+            let end = offset
+                .checked_add(data.len())?
+                .checked_next_multiple_of(PAGE_SIZE as usize)?
+                .min(bytes.len());
+            bytes.get(from..end)
+        });
+    match own {
+        Some(pages) => pages.to_vec(),
+        None => {
+            let mut pages = vec![0; head + data.len()];
+            pages[head..].copy_from_slice(data);
+            pages
+        }
+    }
 }
 
 /// Address of the program headers in guest memory (`AT_PHDR`).

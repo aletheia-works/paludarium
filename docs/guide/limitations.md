@@ -17,9 +17,10 @@ verified.
   make a shared file mapping writable (`EACCES`), as nothing would write it
   back to the file. A page wholly past the end of the file reads as zeros
   instead of raising `SIGBUS`, also after `MADV_DONTNEED`.
-- **`MADV_DONTNEED` on ELF segments**: a private file mapping reads its file
-  again, as on Linux, but the program's own data segments keep their
-  contents, where Linux reads them from the executable again.
+- **`MADV_DONTNEED` on a read-only ELF segment**: the program's writable
+  segments read the executable again, as on Linux, but a read-only one (its
+  code) keeps its contents. It differs only if `mprotect` made it writable
+  and it was changed, where Linux reads it from the executable again.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
 - **Some signal details**: no core file is written, so a child killed by `SIGSEGV`,

@@ -109,9 +109,12 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 - `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
   as zeros, and those of a file mapping read the file again, as it is then
   (zeros past its end), as Linux faults them in from the file; this holds
-  after `mremap` moves the mapping and in a `fork`ed child. ELF segments keep
-  their contents, and shared memory keeps its own. `MADV_FREE` keeps the
-  contents, as Linux does without memory pressure.
+  after `mremap` moves the mapping and in a `fork`ed child. The program's own
+  segments are laid out as Linux lays them out: the pages that hold file
+  data are a file mapping, and a writable one (`.data`) reads the executable
+  again, while the rest (`.bss`) is anonymous memory and reads as zeros.
+  Shared memory keeps its own contents. `MADV_FREE` keeps the contents, as
+  Linux does without memory pressure.
   The access-pattern hints are accepted and other advice gives `EINVAL`.
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`

@@ -1145,11 +1145,12 @@ impl AddressSpaceData {
     }
 
     /// Drops the contents of the private pages in `[addr, addr+len)`
-    /// (`MADV_DONTNEED`): anonymous ones read as zeros again, and a file
-    /// mapping's pages read their file again ([`Self::back_with_file`]), as
-    /// Linux faults them in from the file. Shared pages keep theirs, as their
-    /// memory outlives the mapping, and so do ELF segments and file mappings
-    /// without a recorded file, which have nothing to read again. Applies the
+    /// (`MADV_DONTNEED`): anonymous ones read as zeros again, and those of a
+    /// file mapping or an ELF segment read their file again
+    /// ([`Self::back_with_file`]), as Linux faults them in from the file.
+    /// Shared pages keep theirs, as their memory outlives the mapping, and so
+    /// do the ones without a recorded file (a read-only ELF segment), which
+    /// have nothing to read again. Applies the
     /// mapped parts and returns `ENOMEM` when the range has a hole, as Linux
     /// does.
     pub fn discard(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
@@ -1164,9 +1165,10 @@ impl AddressSpaceData {
             hole |= m.start.0 > covered;
             covered = m.end();
             let start = m.start.0.max(addr.0);
-            // An ELF segment, and a file mapping without its file, keep
-            // their contents: there is nothing to read them from again.
-            let backed = m.kind == MappingKind::File && self.backing_at(start).is_some();
+            // An ELF segment or a file mapping without its file keeps its
+            // contents: there is nothing to read it from again.
+            let backed = matches!(m.kind, MappingKind::ElfSegment | MappingKind::File)
+                && self.backing_at(start).is_some();
             if (backed || !matches!(m.kind, MappingKind::ElfSegment | MappingKind::File))
                 && self.shared_at(start).is_none()
             {

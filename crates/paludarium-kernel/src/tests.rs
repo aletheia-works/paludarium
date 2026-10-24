@@ -803,6 +803,35 @@ fn memfd_grow_seal_stops_a_write_at_the_last_whole_page() {
     assert_eq!(f.ret(319, &[1, 0]), errno(Errno::EFAULT));
 }
 #[test]
+fn proc_fd_links_open_again_or_refuse() {
+    let mut f = fixture();
+    let (pair, path, buf) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);
+    assert_eq!(f.ret(22, &[pair]), 0);
+    let read_end = f.mem.read_u64(GuestAddr(pair)).unwrap() & 0xffff_ffff;
+    let link = format!("/proc/1/fd/{read_end}\0");
+    f.mem.write(GuestAddr(path), link.as_bytes()).unwrap();
+    // The same access gives the pipe's end again; another one cannot.
+    let again = f.ret(2, &[path, 0]);
+    assert!(again < 1 << 32, "{again:#x}");
+    assert_eq!(f.ret(2, &[path, 1]), errno(Errno(6)));
+    assert_eq!(
+        f.ret(89, &[path, buf, 64]),
+        f.ret(89, &[path, buf + 64, 64])
+    );
+    let event = f.ret(290, &[0, 0]);
+    f.mem
+        .write(
+            GuestAddr(path),
+            format!("/proc/self/fd/{event}\0").as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(f.ret(2, &[path, 2]), errno(Errno(6)));
+    // A closed descriptor's link is gone.
+    assert_eq!(f.ret(3, &[event]), 0);
+    assert_eq!(f.ret(89, &[path, buf, 64]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(2, &[path, 0]), errno(Errno::ENOENT));
+}
+#[test]
 fn file_size_limit_is_enforced_as_linux_does() {
     let mut f = fixture();
     let (limit, buf, pair) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);

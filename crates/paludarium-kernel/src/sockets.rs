@@ -17,6 +17,8 @@ pub(crate) const SEND_WINDOW: usize = 212_992;
 pub(crate) struct PipeEnd {
     endpoint: Arc<SocketPairEnd>,
     reader: bool,
+    /// One inode for both ends, as a pipe has on Linux.
+    inode: u64,
 }
 #[cfg(test)]
 mod pipe_tests {
@@ -90,14 +92,17 @@ impl PipeEnd {
         reader.pair.window.store(PIPE_DEFAULT, Ordering::SeqCst);
         reader.shutdown(1)?;
         writer.shutdown(0)?;
+        let inode = reader.inode;
         Ok([
             Arc::new(Self {
                 endpoint: reader,
                 reader: true,
+                inode,
             }),
             Arc::new(Self {
                 endpoint: writer,
                 reader: false,
+                inode,
             }),
         ])
     }
@@ -184,6 +189,7 @@ impl FileHandle for PipeEnd {
     }
     fn stat(&self) -> Result<FileStat, Errno> {
         Ok(FileStat {
+            inode: self.inode,
             mode: 0o010600,
             links: 1,
             ..FileStat::default()
@@ -313,6 +319,8 @@ pub(crate) struct SocketPairEnd {
     pair: Arc<Pair>,
     side: usize,
     flags: AtomicU32,
+    /// Each end is a socket of its own, with its own inode.
+    inode: u64,
 }
 impl SocketPairEnd {
     /// The bytes waiting to be read on this side.
@@ -349,6 +357,7 @@ impl SocketPairEnd {
                 pair: Arc::clone(&pair),
                 side,
                 flags: AtomicU32::new(2 | kind & NONBLOCK),
+                inode: crate::files::anonymous_inode(),
             })
         }))
     }
@@ -612,6 +621,7 @@ impl FileHandle for SocketPairEnd {
     }
     fn stat(&self) -> Result<FileStat, Errno> {
         Ok(FileStat {
+            inode: self.inode,
             mode: 0o140777,
             links: 1,
             ..FileStat::default()

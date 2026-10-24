@@ -6,6 +6,13 @@ static long call(long n,long a,long b,long c,long d,long e,long f) {
 #define S(n,a,b,c) call(n,(long)(a),(long)(b),(long)(c),0,0,0)
 static char p[]="/tmp/paludarium-files-fixture",q[]="/tmp/paludarium-files-link",r[]="/tmp/paludarium-files-renamed";
 static char buf[4096]; static long results[64]; static unsigned char st[144];
+/* "/proc/self/fd/<n>", and whether a read link (n bytes) is b. */
+static char *fdpath(long n) {
+ static char b[32]; char *q=b; const char *s="/proc/self/fd/"; char d[12]; int k=0;
+ while(*s)*q++=*s++; do{d[k++]='0'+n%10;n/=10;}while(n); while(k)*q++=d[--k]; *q=0; return b;
+}
+static long same(const char *a,long n,const char *b){long i=0;for(;b[i];i++)if(i>=n||a[i]!=b[i])return 0;return i==n;}
+static long starts(const char *a,long n,const char *b){long i=0;for(;b[i];i++)if(i>=n||a[i]!=b[i])return 0;return 1;}
 void _start(void) {
  long fd,x=0;
  if(CASE==0) results[x++]=S(4,0,st,0);
@@ -110,6 +117,44 @@ void _start(void) {
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
   results[x++]=SX(p,0,0);S(87,q,0,0);}
+ if(CASE==45){ /* /proc/self/fd: a link per open descriptor */
+  static char t[300],u[300],gone[300];long k,k2;
+  #define RL(n,o) call(89,(long)fdpath(n),(long)(o),300,0,0,0)
+  #define LMODE() (*(unsigned*)(st+24))
+  k=RL(fd,t);results[x++]=same(t,k,p);S(6,fdpath(fd),st,0);results[x++]=LMODE();results[x++]=*(long*)(st+48);
+  S(4,fdpath(fd),st,0);long ino=*(long*)(st+8);S(5,fd,st,0);results[x++]=ino==*(long*)(st+8);
+  long ro=S(2,p,0,0);S(6,fdpath(ro),st,0);results[x++]=LMODE();
+  S(1,fd,"abc",3);long re=S(2,fdpath(fd),0,0);results[x++]=re>=0;results[x++]=S(0,re,buf,3);results[x++]=buf[0]+buf[1]+buf[2];results[x++]=S(8,fd,0,1);
+  k=RL(re,t);results[x++]=same(t,k,p);
+  /* Through a symbolic link, ".." and ".": the resolved path. */
+  S(88,p,q,0);long viaq=S(2,q,0,0),dots2=S(2,"/tmp/./../tmp/paludarium-files-fixture",0,0);
+  k=RL(viaq,t);results[x++]=same(t,k,p);k=RL(dots2,t);results[x++]=same(t,k,p);
+  long again=S(2,fdpath(viaq),0,0);results[x++]=again>=0;k=RL(again,t);results[x++]=same(t,k,p);
+  S(3,viaq,0,0);S(3,dots2,0,0);S(3,again,0,0);S(87,q,0,0);
+  {char *q=gone;const char *r=p;while(*r)*q++=*r++;r=" (deleted)";while(*r)*q++=*r++;*q=0;}
+  S(87,p,0,0);k=RL(fd,t);results[x++]=same(t,k,gone);
+  long m=call(319,(long)"named",2,0,0,0,0);k=RL(m,t);results[x++]=same(t,k,"/memfd:named (deleted)");
+  long mr=S(2,fdpath(m),0,0);results[x++]=mr>=0;S(1,m,"xy",2);results[x++]=S(0,mr,buf,2);results[x++]=buf[0]+buf[1];
+  results[x++]=S(72,mr,1033,1);S(72,m,1033,4);results[x++]=S(72,mr,1034,0);
+  /* O_RDONLY | O_TRUNC still empties it; F_SEAL_GROW does not stop that. */
+  long tr=S(2,fdpath(m),01000,0);results[x++]=tr>=0;S(5,m,st,0);results[x++]=*(long*)(st+48);S(3,tr,0,0);S(5,mr,st,0);results[x++]=*(long*)(st+16);
+  int pf[2];S(22,pf,0,0);k=RL(pf[0],t);k2=RL(pf[1],u);u[k2]=0;results[x++]=starts(t,k,"pipe:[");results[x++]=same(t,k,u);
+  S(6,fdpath(pf[1]),st,0);results[x++]=LMODE();
+  long pw=S(2,fdpath(pf[1]),1,0);results[x++]=pw>=0;results[x++]=S(1,pw,"q",1);results[x++]=S(0,pf[0],buf,1);results[x++]=buf[0];
+  int sv[2];call(53,1,1,0,(long)sv,0,0);k=RL(sv[0],t);k2=RL(sv[1],u);u[k2]=0;results[x++]=starts(t,k,"socket:[");results[x++]=!same(t,k,u);
+  results[x++]=S(2,fdpath(sv[0]),2,0);
+  long ev=call(290,0,0,0,0,0,0);k=RL(ev,t);results[x++]=same(t,k,"anon_inode:[eventfd]");
+  long ep=call(291,0,0,0,0,0,0);k=RL(ep,t);results[x++]=same(t,k,"anon_inode:[eventpoll]");
+  long tf=call(283,1,0,0,0,0,0);k=RL(tf,t);results[x++]=same(t,k,"anon_inode:[timerfd]");
+  long dn=S(2,"/dev/null",2,0);k=RL(dn,t);results[x++]=same(t,k,"/dev/null");
+  results[x++]=call(89,(long)"/proc/self/fd/999",(long)t,300,0,0,0);results[x++]=call(89,(long)"/proc/self/fd/03",(long)t,300,0,0,0);
+  results[x++]=call(89,(long)"/proc/self/fd",(long)t,300,0,0,0);results[x++]=S(4,"/proc/self/fd/999",st,0);
+  S(4,"/proc/self/fd",st,0);results[x++]=LMODE();
+  long dd=S(2,"/proc/self/fd",65536,0),total=0,open=0,dots=0;
+  for(;;){long nb=S(217,dd,buf,4096);if(nb<=0)break;for(long o=0;o<nb;o+=*(unsigned short*)(buf+o+16)){total++;if(buf[o+19]=='.')dots++;}}
+  for(int i=0;i<1024;i++)if(S(72,i,1,0)>=0)open++;
+  results[x++]=total==open+2;results[x++]=dots;
+  long fds[]={ro,re,m,mr,pf[0],pf[1],pw,sv[0],sv[1],ev,ep,tf,dn,dd};for(unsigned i=0;i<sizeof fds/sizeof fds[0];i++)S(3,fds[i],0,0);}
  if(CASE==44){ /* memfd_create(name, flags) and its seals */
   #define MFD(n,f) call(319,(long)(n),f,0,0,0,0)
   #define SEALS(m) S(72,m,1034,0)

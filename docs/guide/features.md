@@ -76,9 +76,8 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   filesystem of their own, as Linux's internal tmpfs mount, so
   `copy_file_range` between one and a file on a mount gives `EXDEV`. Other
   files have no seals (`EINVAL`), even on the in-memory `/tmp`, where a real
-  tmpfs file reports `F_SEAL_SEAL`. A memfd's name is not shown, as there is no
-  `/proc/self/fd`, and an unsealed one cannot be mapped shared and writable
-  (`ENODEV`), like other files.
+  tmpfs file reports `F_SEAL_SEAL`. An unsealed memfd cannot be mapped shared
+  and writable (`ENODEV`), like other files.
 - `close_range` closes the open descriptors from `first` to `last`, or with
   `CLOSE_RANGE_CLOEXEC` marks them close-on-exec. `CLOSE_RANGE_UNSHARE` first
   gives the thread its own copy of a table it shares with `CLONE_FILES`
@@ -139,10 +138,26 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   line in `mountinfo` says, so `df` lists every mount.
 - The only other `/proc` entries are this process's own: `/proc/self` (also
   as `/proc/<pid>`), a directory that `readlink` resolves to the PID and that
-  its entries can be opened relative to, and `/proc/self/status`. That file
+  its entries can be opened relative to, `/proc/self/status` and
+  `/proc/self/fd`. That file
   has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
   capabilities and so on) without the memory and CPU ones, which nothing
   measures.
+- `/proc/self/fd` (mode 0500) lists `.`, `..` and a link per open
+  descriptor, named by its number as Linux reads one (no leading zero). Each
+  link's `lstat` shows the descriptor's access in its user bits and size 64,
+  and `stat` follows it to the file. `readlink` gives Linux's names: the
+  file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
+  for this process's entries), followed by a space and `(deleted)` once
+  nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
+  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]` or `[pidfd]` (which
+  Linux 6.9 and later name from pidfs instead), and
+  `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
+  own for it. Opening a link opens the file again by its path, or gives a
+  memfd a new handle on the same file and seals; a pipe and the standard
+  streams give the same handle for the access they have. A socket gives
+  `ENXIO`, as on Linux; so do, here, a removed file, the other end of a pipe
+  and the files of no type, which Linux can open again.
 - CPU time is the host thread's CPU time (user and system together) from a
   guest thread's first system call, where the host can measure it (Linux,
   macOS, Windows); elsewhere, as in WebAssembly, it is wall time instead.

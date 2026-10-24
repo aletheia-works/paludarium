@@ -4,7 +4,7 @@ use paludarium_host::{ClockId, FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{FileSystem, HostFs, MemFs};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
@@ -297,9 +297,10 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
         c.files.descriptor(dir)?.file.stat()?
     } else {
         let p = c.files.path(dir, raw)?;
-        match generated_stat(c, &p) {
-            Some(stat) => stat,
-            None => c.files.fs.metadata(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?,
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        match generated_stat(c, &p, follow) {
+            Some((stat, _)) => stat,
+            None => c.files.fs.metadata(&p, follow)?,
         }
     };
     let directory = stat.mode & 0o170000 == 0o040000;
@@ -523,6 +524,13 @@ fn size_room(c: &mut Context<'_>, start: u64) -> Result<u64, Errno> {
     Ok(limit - start)
 }
 const REGULAR: u32 = 0o100000;
+/// A new inode number for a file on no mount (a pipe, a socket or a memfd),
+/// so that no two share one, as Linux numbers its pipefs, sockfs and tmpfs
+/// inodes.
+pub(crate) fn anonymous_inode() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 const DIRECTORY: u32 = 0o040000;
 /// A guest `loff_t *` argument: none when null, else its value (EFAULT).
 fn offset_argument(c: &Context<'_>, at: u64) -> Result<Option<u64>, Errno> {
@@ -936,11 +944,11 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         }
     } else {
         let p = c.files.path(dir, raw)?;
-        let s = match generated_stat(c, &p) {
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        match generated_stat(c, &p, follow) {
             Some(generated) => generated,
-            None => c.files.fs.metadata(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?,
-        };
-        (s, device(c, &p))
+            None => (c.files.fs.metadata(&p, follow)?, device(c, &p)),
+        }
     };
     output(c, out, &encode_statx(s, device)?)?;
     Ok(0)
@@ -1284,33 +1292,15 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             // Linux takes the descriptor before it opens, so with none free
             // nothing is opened or created.
             let fd = c.files.reserve(c.group.nofile())?;
-            let opened = (|| -> Result<Arc<dyn FileHandle>, Errno> {
-                Ok(if p == b"/dev/null" {
-                    Arc::new(crate::null::NullFile::new(flags))
-                } else if let Some(mountinfo) = crate::proc::mount_table(&p) {
-                    let content = crate::proc::render(&c.files.fs.mounts(), mountinfo);
-                    Arc::new(crate::proc::GeneratedFile::open(content, flags))
-                } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
-                    match entry {
-                        crate::proc::OwnEntry::Directory => Arc::new(crate::proc::OwnDirectory),
-                        crate::proc::OwnEntry::Status => {
-                            Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
-                        }
-                    }
-                } else {
-                    c.files
-                        .fs
-                        .open(&p, flags, (mode as u32) & !c.files.umask())?
-                })
-            })();
+            let opened = open_path(c, &p, flags, mode as u32);
             match opened {
-                Ok(file) => {
+                Ok((file, path)) => {
                     let cloexec = flags & 0x80000 != 0;
                     c.files.fill(
                         fd,
                         Descriptor {
                             file,
-                            path: p,
+                            path,
                             cloexec,
                         },
                     );
@@ -1345,8 +1335,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 (at(c, (-100i32) as u64, a[0])?, a[1], n == 4)
             };
-            if let Some(generated) = generated_stat(c, &p) {
-                return stat(c, out, generated, device(c, &p));
+            if let Some((generated, device)) = generated_stat(c, &p, follow) {
+                return stat(c, out, generated, device);
             }
             stat(c, out, c.files.fs.metadata(&p, follow)?, device(c, &p))
         }
@@ -1622,9 +1612,19 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if len == 0 {
                 return Err(Errno::EINVAL);
             }
-            // `/proc/self` is a link to this process's directory.
+            // `/proc/self` is a link to this process's directory, and each
+            // entry of its `fd` to a descriptor's file.
             let b = if p == b"/proc/self" {
                 c.process.pid.to_string().into_bytes()
+            } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
+                let crate::proc::OwnEntry::Descriptor(n) = entry else {
+                    return Err(Errno::EINVAL);
+                };
+                let d = c
+                    .files
+                    .descriptor(u64::from(n))
+                    .map_err(|_| Errno::ENOENT)?;
+                link_target(c, &d)?
             } else {
                 c.files.fs.readlink(&p)?
             };
@@ -1639,7 +1639,10 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if d.file.stat()?.mode & 0o170000 != 0o040000 {
                 return Err(Errno::ENOTDIR);
             }
-            let entries = c.files.fs.read_dir(&d.path)?;
+            let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
+                Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c),
+                _ => c.files.fs.read_dir(&d.path)?,
+            };
             let position = d.file.seek(0, 1)? as usize;
             let mut bytes = Vec::new();
             let mut count = 0;
@@ -1927,17 +1930,214 @@ mod files_tests {
     }
 }
 
-/// The `stat` of a generated /proc path, or `None` for any other path.
-fn generated_stat(c: &Context<'_>, path: &[u8]) -> Option<FileStat> {
-    if let Some(mountinfo) = crate::proc::mount_table(path) {
-        return Some(crate::proc::stat(
-            crate::proc::render(&c.files.fs.mounts(), mountinfo).len(),
-        ));
+/// The file that opening guest path `p` gives, and the path its descriptor
+/// records: the generated files, a link in `/proc/self/fd` opened again,
+/// or the filesystem's file.
+fn open_path(
+    c: &mut Context<'_>,
+    p: &[u8],
+    flags: u32,
+    mode: u32,
+) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
+    let file: Arc<dyn FileHandle> = if p == b"/dev/null" {
+        Arc::new(crate::null::NullFile::new(flags))
+    } else if let Some(mountinfo) = crate::proc::mount_table(p) {
+        let content = crate::proc::render(&c.files.fs.mounts(), mountinfo);
+        Arc::new(crate::proc::GeneratedFile::open(content, flags))
+    } else if let Some(entry) = crate::proc::own_entry(p, c.process.pid) {
+        match entry {
+            crate::proc::OwnEntry::Directory => {
+                Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
+            }
+            crate::proc::OwnEntry::Descriptors => Arc::new(crate::proc::OwnDirectory::new(
+                crate::proc::descriptors_stat(),
+            )),
+            crate::proc::OwnEntry::Status => {
+                Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
+            }
+            crate::proc::OwnEntry::Descriptor(n) => return reopen(c, n, flags, mode),
+        }
+    } else {
+        c.files.fs.open(p, flags, mode & !c.files.umask())?
+    };
+    Ok((file, p.to_vec()))
+}
+/// Opening `/proc/self/fd/<n>`: a new handle on the file descriptor `n`
+/// holds, as Linux opens the link's file again. A file with a path is opened
+/// again by it while the path still names that file; a memfd gets a new
+/// handle on its file; a pipe or the standard streams give the same handle
+/// for the access it has. The rest, and a removed file, cannot be opened
+/// again: a socket gives ENXIO, as on Linux, and so do the others here.
+fn reopen(
+    c: &mut Context<'_>,
+    n: u32,
+    flags: u32,
+    mode: u32,
+) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
+    const ENXIO: Errno = Errno(6);
+    let d = c
+        .files
+        .descriptor(u64::from(n))
+        .map_err(|_| Errno::ENOENT)?;
+    if let Some(memfd) = d
+        .file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
+    {
+        return Ok((memfd.reopen(flags)?, Vec::new()));
     }
-    Some(match crate::proc::own_entry(path, c.process.pid)? {
-        crate::proc::OwnEntry::Directory => crate::proc::directory_stat(),
-        crate::proc::OwnEntry::Status => crate::proc::stat(status(c).len()),
+    let stat = d.file.stat()?;
+    match stat.mode & 0o170000 {
+        0o010000 if d.path.is_empty() => {
+            if flags & 3 == d.file.flags() & 3 {
+                Ok((d.file, Vec::new()))
+            } else {
+                Err(ENXIO)
+            }
+        }
+        _ if d.path.is_empty() => Err(ENXIO),
+        _ if generated(&d.path) => open_path(c, &d.path.clone(), flags, mode),
+        _ => match current_path(c, &d, stat.inode) {
+            Some(path) => open_path(c, &path, flags, mode),
+            None => Err(ENXIO),
+        },
+    }
+}
+/// Whether `path` is one of the generated files, which no filesystem holds.
+fn generated(path: &[u8]) -> bool {
+    path == b"/dev/null" || path.starts_with(b"/proc/")
+}
+/// `path` as `realpath` gives it: absolute, with `.`, `..` and every
+/// symbolic link resolved one component at a time (at most 40 links, as
+/// Linux follows), or `None` when a component is missing.
+fn resolved(c: &Context<'_>, path: &[u8]) -> Option<Vec<u8>> {
+    const SYMLINK: u32 = 0o120000;
+    let mut pending: Vec<Vec<u8>> = path
+        .split(|&b| b == b'/')
+        .rev()
+        .map(<[u8]>::to_vec)
+        .collect();
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let mut links = 0;
+    let join = |parts: &[Vec<u8>]| -> Vec<u8> {
+        let joined = parts
+            .iter()
+            .flat_map(|p| [&b"/"[..], p].concat())
+            .collect::<Vec<_>>();
+        if joined.is_empty() {
+            b"/".to_vec()
+        } else {
+            joined
+        }
+    };
+    while let Some(part) = pending.pop() {
+        match &part[..] {
+            b"" | b"." => continue,
+            b".." => {
+                parts.pop();
+                continue;
+            }
+            _ => {}
+        }
+        parts.push(part);
+        let candidate = join(&parts);
+        if c.files.fs.metadata(&candidate, false).ok()?.mode & 0o170000 == SYMLINK {
+            links += 1;
+            if links > 40 {
+                return None;
+            }
+            let target = c.files.fs.readlink(&candidate).ok()?;
+            parts.pop();
+            if target.first() == Some(&b'/') {
+                parts.clear();
+            }
+            pending.extend(target.split(|&b| b == b'/').rev().map(<[u8]>::to_vec));
+        }
+    }
+    Some(join(&parts))
+}
+/// The path that still names the file of `d` (its recorded path resolved),
+/// or `None` once nothing does.
+fn current_path(c: &Context<'_>, d: &Descriptor, inode: u64) -> Option<Vec<u8>> {
+    let path = resolved(c, &d.path)?;
+    c.files
+        .fs
+        .metadata(&path, false)
+        .is_ok_and(|s| s.inode == inode)
+        .then_some(path)
+}
+/// What a link in `/proc/self/fd` reads: the path of a file on a mount
+/// (marked ` (deleted)` once removed), `pipe:[<inode>]`, `socket:[<inode>]`,
+/// `anon_inode:[<kind>]` for a file of no type, or a memfd's own name.
+fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
+    let any = d.file.as_any();
+    if let Some(memfd) = any.and_then(|v| v.downcast_ref::<crate::memfd::Memfd>()) {
+        return Ok(memfd.link_target());
+    }
+    let stat = d.file.stat()?;
+    let anonymous = |kind: &str| format!("anon_inode:[{kind}]").into_bytes();
+    Ok(match stat.mode & 0o170000 {
+        0o010000 if d.path.is_empty() => format!("pipe:[{}]", stat.inode).into_bytes(),
+        0o140000 => format!("socket:[{}]", stat.inode).into_bytes(),
+        0 => anonymous(match any {
+            Some(v) if v.is::<crate::events::EventCounter>() => "eventfd",
+            Some(v) if v.is::<crate::epoll::EpollInstance>() => "eventpoll",
+            Some(v) if v.is::<crate::timerfd::TimerFile>() => "timerfd",
+            // The last kind of no type; Linux 6.9 and later name it from
+            // pidfs instead.
+            _ => "pidfd",
+        }),
+        _ if generated(&d.path) => match d.path.strip_prefix(b"/proc/self") {
+            Some(rest) => [format!("/proc/{}", c.process.pid).as_bytes(), rest].concat(),
+            None => d.path.clone(),
+        },
+        _ => current_path(c, d, stat.inode).unwrap_or_else(|| {
+            let mut path =
+                paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone());
+            path.extend_from_slice(b" (deleted)");
+            path
+        }),
     })
+}
+/// The entries of `/proc/self/fd`: `.`, `..` and a link per descriptor, in
+/// order, as Linux lists them.
+fn descriptor_entries(c: &Context<'_>) -> Vec<paludarium_host::DirectoryEntry> {
+    const DT_DIR: u8 = 4;
+    const DT_LNK: u8 = 10;
+    let fds = c.files.fds.lock().unwrap_or_else(PoisonError::into_inner);
+    [b".".to_vec(), b"..".to_vec()]
+        .into_iter()
+        .map(|name| (name, DT_DIR))
+        .chain(fds.keys().map(|n| (n.to_string().into_bytes(), DT_LNK)))
+        .enumerate()
+        .map(|(i, (name, kind))| paludarium_host::DirectoryEntry {
+            name,
+            inode: i as u64 + 1,
+            kind,
+        })
+        .collect()
+}
+/// The `stat` of a generated /proc path, and its device, or `None` for any
+/// other path (and for a link to a descriptor that is not open). A link in
+/// `/proc/self/fd` is followed to its file unless `follow` is false.
+fn generated_stat(c: &Context<'_>, path: &[u8], follow: bool) -> Option<(FileStat, u64)> {
+    if let Some(mountinfo) = crate::proc::mount_table(path) {
+        let length = crate::proc::render(&c.files.fs.mounts(), mountinfo).len();
+        return Some((crate::proc::stat(length), device(c, path)));
+    }
+    let stat = match crate::proc::own_entry(path, c.process.pid)? {
+        crate::proc::OwnEntry::Directory => crate::proc::directory_stat(),
+        crate::proc::OwnEntry::Descriptors => crate::proc::descriptors_stat(),
+        crate::proc::OwnEntry::Status => crate::proc::stat(status(c).len()),
+        crate::proc::OwnEntry::Descriptor(n) => {
+            let d = c.files.descriptor(u64::from(n)).ok()?;
+            if follow {
+                return Some((d.file.stat().ok()?, descriptor_device(c, &d)));
+            }
+            crate::proc::link_stat(d.file.flags() & 3)
+        }
+    };
+    Some((stat, device(c, path)))
 }
 
 /// This process's `/proc/self/status`.

@@ -1,12 +1,13 @@
-//! `memfd_create` and file seals. A memfd is a file of its own in-memory
-//! filesystem, unlinked as soon as it is made, wrapped so that its seals
-//! (`F_ADD_SEALS`, `F_GET_SEALS`) restrict writes, resizes and mode changes
-//! as Linux's tmpfs does.
+//! `memfd_create` and file seals. A memfd is the one file of its own
+//! in-memory filesystem, which nothing else can reach, so it shows no links;
+//! it is wrapped so that its seals (`F_ADD_SEALS`, `F_GET_SEALS`) restrict
+//! writes, resizes and mode changes as Linux's tmpfs does. Opening it again
+//! through `/proc/self/fd` gives a new handle on the same file and seals.
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat, HostFs};
 use paludarium_types::{Errno, GuestAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const MFD_CLOEXEC: u32 = 0x01;
 const MFD_ALLOW_SEALING: u32 = 0x02;
@@ -26,17 +27,40 @@ pub(crate) const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 pub(crate) const F_SEAL_EXEC: u32 = 0x20;
 const PAGE: u64 = 4096;
 /// Memfds share a device of their own, as Linux's live on its internal
-/// tmpfs mount: minor 0, which no mount here has. Their inode numbers count
-/// up across every memfd, so that two never share one.
+/// tmpfs mount: minor 0, which no mount here has.
 pub(crate) const DEVICE: u64 = 0;
-static NEXT_INODE: AtomicU64 = AtomicU64::new(1);
+/// Where a memfd's file lives in its own filesystem.
+const PATH: &[u8] = b"/memfd";
 
 pub(crate) struct Memfd {
     file: Arc<dyn FileHandle>,
+    fs: Arc<paludarium_vfs::MemFs>,
     inode: u64,
-    seals: AtomicU32,
+    seals: Arc<AtomicU32>,
+    name: Arc<[u8]>,
 }
 impl Memfd {
+    /// What `/proc/self/fd` shows for it: `/memfd:<name> (deleted)`.
+    pub(crate) fn link_target(&self) -> Vec<u8> {
+        [b"/memfd:", &self.name[..], b" (deleted)"].concat()
+    }
+    /// A new handle on the same file, as opening `/proc/self/fd/<n>` gives:
+    /// with the new access mode and flags (`O_CREAT` and `O_EXCL` do nothing
+    /// to an existing file). `O_TRUNC` empties it whatever the access mode,
+    /// as Linux's open does, unless `F_SEAL_SHRINK` keeps a non-empty file.
+    pub(crate) fn reopen(&self, flags: u32) -> Result<Arc<Self>, Errno> {
+        if flags & 0o1000 != 0 && self.seals() & F_SEAL_SHRINK != 0 && self.file.stat()?.size > 0 {
+            return Err(Errno::EPERM);
+        }
+        let file = self.fs.open(PATH, flags & !0o300 | 0o100000, 0)?;
+        Ok(Arc::new(Self {
+            file,
+            fs: Arc::clone(&self.fs),
+            inode: self.inode,
+            seals: Arc::clone(&self.seals),
+            name: Arc::clone(&self.name),
+        }))
+    }
     pub(crate) fn seals(&self) -> u32 {
         self.seals.load(Ordering::SeqCst)
     }
@@ -117,6 +141,7 @@ impl FileHandle for Memfd {
     fn stat(&self) -> Result<FileStat, Errno> {
         Ok(FileStat {
             inode: self.inode,
+            links: 0,
             ..self.file.stat()?
         })
     }
@@ -186,34 +211,32 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
     if flags & !allowed != 0 || flags & (MFD_EXEC | MFD_NOEXEC_SEAL) == MFD_EXEC | MFD_NOEXEC_SEAL {
         return Err(Errno::EINVAL);
     }
-    // The name is only checked: nothing shows it (there is no /proc/self/fd).
-    let mut length = 0;
+    let mut name = Vec::new();
     loop {
         let mut byte = [0];
         c.mem
-            .read(GuestAddr(a[0].wrapping_add(length as u64)), &mut byte)
+            .read(GuestAddr(a[0].wrapping_add(name.len() as u64)), &mut byte)
             .map_err(|_| Errno::EFAULT)?;
         if byte[0] == 0 {
             break;
         }
-        length += 1;
-        if length > NAME_MAX {
+        name.push(byte[0]);
+        if name.len() > NAME_MAX {
             return Err(Errno::EINVAL);
         }
     }
     if flags & MFD_HUGETLB != 0 {
         return Err(Errno::ENOSYS);
     }
-    let fs = paludarium_vfs::MemFs::new();
+    let fs = Arc::new(paludarium_vfs::MemFs::new());
     let mode = if flags & MFD_NOEXEC_SEAL != 0 {
         0o666
     } else {
         0o777
     };
-    drop(fs.open(b"/memfd", 0o102, mode)?);
+    drop(fs.open(PATH, 0o102, mode)?);
     // Opened again without O_CREAT, so that F_GETFL shows O_RDWR | O_LARGEFILE.
-    let file = fs.open(b"/memfd", 0o100002, 0)?;
-    fs.unlink(b"/memfd", false)?;
+    let file = fs.open(PATH, 0o100002, 0)?;
     let seals = if flags & MFD_NOEXEC_SEAL != 0 {
         F_SEAL_EXEC
     } else if flags & MFD_ALLOW_SEALING != 0 {
@@ -223,8 +246,10 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
     };
     let memfd = Arc::new(Memfd {
         file,
-        inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
-        seals: AtomicU32::new(seals),
+        fs,
+        inode: crate::files::anonymous_inode(),
+        seals: Arc::new(AtomicU32::new(seals)),
+        name: name.into(),
     });
     let fd = c
         .files

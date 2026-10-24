@@ -1,6 +1,7 @@
 //! The only /proc files paludarium has, generated when opened: the mount
 //! table (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's
-//! mounts, and this process's directory with its `status`.
+//! mounts, and this process's directory with its `status` and its `fd`
+//! directory of links to the open descriptors.
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 use paludarium_vfs::MountPoint;
@@ -31,6 +32,9 @@ pub(crate) fn mount_table(path: &[u8]) -> Option<bool> {
 pub(crate) enum OwnEntry {
     Directory,
     Status,
+    /// `fd`, and one of its links by descriptor number.
+    Descriptors,
+    Descriptor(u32),
 }
 pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
     let rest = path.strip_prefix(b"/proc/")?;
@@ -44,7 +48,44 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
     match tail {
         b"" | b"/" => Some(OwnEntry::Directory),
         b"/status" => Some(OwnEntry::Status),
-        _ => None,
+        b"/fd" | b"/fd/" => Some(OwnEntry::Descriptors),
+        _ => descriptor_number(tail.strip_prefix(b"/fd/")?).map(OwnEntry::Descriptor),
+    }
+}
+/// A descriptor's name in `fd`: decimal digits without a leading zero (but
+/// "0"), within `u32`, as Linux's name_to_int reads them; a trailing slash
+/// is allowed.
+fn descriptor_number(name: &[u8]) -> Option<u32> {
+    let name = name.strip_suffix(b"/").unwrap_or(name);
+    if name.is_empty() || name.len() > 1 && name[0] == b'0' || !name.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    std::str::from_utf8(name).ok()?.parse().ok()
+}
+/// The `fd` directory's `stat`: 0500 and owned, as Linux shows it.
+pub(crate) fn descriptors_stat() -> FileStat {
+    FileStat {
+        mode: 0o040_500,
+        links: 2,
+        ..FileStat::default()
+    }
+}
+/// The `lstat` of a link in `fd`: user permissions for the descriptor's
+/// access (read gives r-x, write -wx), and size 64, as Linux shows them.
+pub(crate) fn link_stat(access: u32) -> FileStat {
+    let mut mode = 0o120_000;
+    if access != 1 {
+        mode |= 0o500;
+    }
+    if access != 0 {
+        mode |= 0o300;
+    }
+    FileStat {
+        mode,
+        links: 1,
+        size: 64,
+        ..FileStat::default()
     }
 }
 /// The directory's `stat`: 0555, as Linux shows it.
@@ -114,9 +155,21 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
     .into_bytes()
 }
 
-/// The `/proc/self` directory: opened with O_PATH or O_DIRECTORY so its
-/// entries can be opened relative to it, as procfs readers do.
-pub(crate) struct OwnDirectory;
+/// One of this process's generated directories (`/proc/self`, whose entries
+/// procfs readers open relative to it, and its `fd`), with its `stat` and
+/// the position `getdents` has reached in it.
+pub(crate) struct OwnDirectory {
+    stat: FileStat,
+    position: Mutex<u64>,
+}
+impl OwnDirectory {
+    pub(crate) fn new(stat: FileStat) -> Self {
+        Self {
+            stat,
+            position: Mutex::new(0),
+        }
+    }
+}
 impl FileHandle for OwnDirectory {
     fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
         Err(Errno::EISDIR)
@@ -124,11 +177,20 @@ impl FileHandle for OwnDirectory {
     fn write(&self, _: &[u8]) -> Result<usize, Errno> {
         Err(Errno::EBADF)
     }
-    fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
-        Ok(0)
+    /// From the start or the current entry; a directory has no end to seek
+    /// from.
+    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
+        let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
+        let base = match whence {
+            0 => 0,
+            1 => *position,
+            _ => return Err(Errno::EINVAL),
+        };
+        *position = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
+        Ok(*position)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(directory_stat())
+        Ok(self.stat)
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EISDIR)
@@ -326,5 +388,28 @@ mod tests {
             GeneratedFile::open(Vec::new(), 1).write(b"x"),
             Err(Errno::EINVAL)
         );
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+    #[test]
+    fn descriptor_names_are_read_as_linux_reads_them() {
+        let entry = |path: &[u8]| own_entry(path, 7);
+        assert_eq!(entry(b"/proc/self/fd"), Some(OwnEntry::Descriptors));
+        assert_eq!(entry(b"/proc/7/fd/"), Some(OwnEntry::Descriptors));
+        assert_eq!(entry(b"/proc/self/fd/0"), Some(OwnEntry::Descriptor(0)));
+        assert_eq!(entry(b"/proc/7/fd/12/"), Some(OwnEntry::Descriptor(12)));
+        for bad in [
+            &b"/proc/self/fd/03"[..],
+            b"/proc/self/fd/1a",
+            b"/proc/self/fd/4294967296",
+            b"/proc/8/fd/1",
+        ] {
+            assert_eq!(entry(bad), None);
+        }
+        assert_eq!(link_stat(0).mode, 0o120_500);
+        assert_eq!(link_stat(2).mode, 0o120_700);
     }
 }

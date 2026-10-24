@@ -103,11 +103,16 @@ mod tests {
     #[test]
     fn thread_cpu_time_grows_with_work_and_not_past_wall_time() {
         let (wall, start) = (Instant::now(), native_thread_cpu_time().unwrap());
-        let mut x = 0u64;
-        while wall.elapsed() < Duration::from_millis(30) {
+        // Spin for 30 ms, and on until the clock moves (at most 2 s): Windows
+        // charges CPU time at the scheduler ticks (about 15.6 ms) that find
+        // the thread running, which a busy machine can let pass without one.
+        let (mut x, mut used) = (0u64, 0);
+        while wall.elapsed() < Duration::from_millis(30)
+            || used == 0 && wall.elapsed() < Duration::from_secs(2)
+        {
             x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(7));
+            used = native_thread_cpu_time().unwrap() - start;
         }
-        let used = native_thread_cpu_time().unwrap() - start;
         let elapsed = u64::try_from(wall.elapsed().as_nanos()).unwrap();
         assert!(used > 0, "{used}");
         // Windows counts in 100 ns ticks of a coarser scheduler clock.

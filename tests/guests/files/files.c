@@ -5,7 +5,7 @@ static long call(long n,long a,long b,long c,long d,long e,long f) {
 }
 #define S(n,a,b,c) call(n,(long)(a),(long)(b),(long)(c),0,0,0)
 static char p[]="/tmp/paludarium-files-fixture",q[]="/tmp/paludarium-files-link",r[]="/tmp/paludarium-files-renamed";
-static char buf[4096]; static long results[48]; static unsigned char st[144];
+static char buf[4096]; static long results[64]; static unsigned char st[144];
 void _start(void) {
  long fd,x=0;
  if(CASE==0) results[x++]=S(4,0,st,0);
@@ -110,6 +110,33 @@ void _start(void) {
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
   results[x++]=SX(p,0,0);S(87,q,0,0);}
+ if(CASE==44){ /* memfd_create(name, flags) and its seals */
+  #define MFD(n,f) call(319,(long)(n),f,0,0,0,0)
+  #define SEALS(m) S(72,m,1034,0)
+  #define ADD(m,v) S(72,m,1033,v)
+  static char longname[251];for(int i=0;i<250;i++)longname[i]='a';
+  long m=MFD("plain",0);results[x++]=m>=0;S(5,m,st,0);results[x++]=*(unsigned*)(st+24);results[x++]=*(long*)(st+16);
+  results[x++]=S(72,m,3,0);results[x++]=S(72,m,1,0);results[x++]=S(1,m,"hello",5);S(8,m,0,0);results[x++]=S(0,m,buf,5);
+  results[x++]=SEALS(m);results[x++]=ADD(m,2);
+  long s=MFD("sealed",3);results[x++]=S(72,s,1,0);results[x++]=SEALS(s);S(1,s,"abcdefgh",8);
+  results[x++]=ADD(s,2);results[x++]=S(77,s,4,0);results[x++]=S(77,s,16,0);
+  results[x++]=ADD(s,4);results[x++]=S(77,s,32,0);results[x++]=call(18,s,(long)"xy",2,15,0,0);results[x++]=call(18,s,(long)"xy",2,14,0,0);
+  results[x++]=call(285,s,0,0,100,0,0);results[x++]=call(285,s,1,0,100,0,0);results[x++]=call(285,s,0,0,8,0,0);
+  results[x++]=ADD(s,8);results[x++]=S(1,s,"z",1);results[x++]=S(1,s,"",0);results[x++]=call(285,s,3,0,1,0,0);
+  results[x++]=call(9,0,4096,3,1,s,0);long r=call(9,0,4096,1,1,s,0);results[x++]=r>0;if(r>0)S(11,r,4096,0);
+  results[x++]=ADD(s,1);results[x++]=ADD(s,0x20);results[x++]=ADD(s,0x40);results[x++]=SEALS(s);
+  long n=MFD("noexec",8);S(5,n,st,0);results[x++]=*(unsigned*)(st+24);results[x++]=SEALS(n);results[x++]=S(91,n,0777,0);results[x++]=S(91,n,0644,0);
+  long e=MFD("exec",0x12);results[x++]=ADD(e,0x20);results[x++]=SEALS(e);results[x++]=S(1,e,"z",1);
+  results[x++]=MFD("bad",0x100);results[x++]=MFD("both",0x18);results[x++]=MFD(longname,0);longname[249]=0;long l=MFD(longname,0);results[x++]=l>=0;results[x++]=MFD(1,0);
+  /* F_SEAL_GROW stops a write at the last page that ends within the file. */
+  static char big[7000];long g=MFD("grow",2);S(77,g,5000,0);ADD(g,4);
+  results[x++]=S(1,g,big,7000);results[x++]=S(1,g,big,1000);results[x++]=call(18,g,(long)big,900,4000,0,0);S(3,g,0,0);
+  /* Memfds share a filesystem with each other and with no mount. */
+  static long from;long c1=MFD("c1",0),c2=MFD("c2",0);S(1,c1,"abcdef",6);
+  results[x++]=call(326,c1,(long)&from,fd,0,3,0);results[x++]=call(326,c1,(long)&from,c2,0,3,0);results[x++]=from;
+  S(5,c1,st,0);long i1=*(long*)(st+8);S(5,c2,st,0);results[x++]=i1!=*(long*)(st+8);S(3,c1,0,0);S(3,c2,0,0);
+  int pf[2];S(22,pf,0,0);results[x++]=SEALS(fd);results[x++]=ADD(pf[0],1);results[x++]=ADD(pf[1],1);
+  S(3,m,0,0);S(3,s,0,0);S(3,n,0,0);S(3,e,0,0);S(3,l,0,0);S(3,pf[0],0,0);S(3,pf[1],0,0);}
  if(CASE==43){ /* fallocate(fd, mode, offset, len): the modes tmpfs and ext4 share */
   #define FA(f,m,o,l) call(285,f,m,o,l,0,0)
   #define SIZE() (S(5,fd,st,0),*(long*)(st+48))

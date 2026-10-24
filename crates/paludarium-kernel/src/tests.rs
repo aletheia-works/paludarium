@@ -779,6 +779,30 @@ fn fallocate_grows_punches_and_keeps_the_size_limit() {
     assert_eq!(size(&mut f), 12);
 }
 #[test]
+fn memfd_grow_seal_stops_a_write_at_the_last_whole_page() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"grow\0").unwrap();
+    let fd = f.ret(319, &[DATA, 2]); // MFD_ALLOW_SEALING
+    assert_eq!(f.ret(77, &[fd, 5000]), 0);
+    assert_eq!(f.ret(72, &[fd, 1033, 4]), 0); // F_SEAL_GROW
+    // From 0, 7000 bytes: the first page fits, the second would grow it.
+    assert_eq!(f.ret(1, &[fd, DATA + 0x100, 7000]), 4096);
+    // From 4096, past 5000 within the page that would grow it: nothing.
+    assert_eq!(f.ret(1, &[fd, DATA + 0x100, 1000]), errno(Errno::EPERM));
+    assert_eq!(f.ret(18, &[fd, DATA + 0x100, 900, 4000]), 900); // within
+    assert_eq!(f.ret(8, &[fd, 0, 2]), 5000);
+    // A memfd is a tmpfs file: KEEP_SIZE past RLIMIT_FSIZE still fails.
+    f.mem.write_u64(GuestAddr(DATA + 0x40), 6000).unwrap();
+    f.mem.write_u64(GuestAddr(DATA + 0x48), u64::MAX).unwrap();
+    assert_eq!(f.ret(160, &[1, DATA + 0x40]), 0);
+    f.mem.write_u64(GuestAddr(DATA + 0x40), 1 << 24).unwrap();
+    assert_eq!(f.ret(14, &[0, DATA + 0x40, 0, 8]), 0); // block SIGXFSZ
+    assert_eq!(f.ret(285, &[fd, 1, 0, 7000]), errno(Errno(27)));
+    assert_eq!(f.ret(285, &[fd, 1, 0, 5500]), errno(Errno::EPERM)); // then GROW
+    assert_eq!(f.ret(319, &[DATA, 4]), errno(Errno::ENOSYS)); // MFD_HUGETLB
+    assert_eq!(f.ret(319, &[1, 0]), errno(Errno::EFAULT));
+}
+#[test]
 fn file_size_limit_is_enforced_as_linux_does() {
     let mut f = fixture();
     let (limit, buf, pair) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);

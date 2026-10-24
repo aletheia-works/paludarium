@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
     82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264,
-    265, 266, 267, 268, 269, 280, 285, 292, 293, 295, 296, 326, 332, 436, 439,
+    265, 266, 267, 268, 269, 280, 285, 292, 293, 295, 296, 319, 326, 332, 436, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -601,17 +601,28 @@ fn fallocate(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         _ => return Err(Errno(19)), // ENODEV
     }
     let end = offset.checked_add(len).ok_or(Errno(27))? as u64; // EFBIG
+    let memfd = d
+        .file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>());
     match mode & MODE_MASK {
-        0 if mode & KEEP_SIZE == 0 && end > stat.size => {
-            // Growing past RLIMIT_FSIZE raises SIGXFSZ (inode_newsize_ok).
-            if end > c.group.fsize() {
+        0 => {
+            let grows = end > stat.size;
+            // Going past RLIMIT_FSIZE raises SIGXFSZ (inode_newsize_ok); a
+            // memfd, a tmpfs file, is checked even with KEEP_SIZE, as
+            // shmem_fallocate checks it, and then its F_SEAL_GROW.
+            if grows && (mode & KEEP_SIZE == 0 || memfd.is_some()) && end > c.group.fsize() {
                 crate::signals::queue(c.process, crate::signals::PendingSignal::user(25, 0));
                 return Err(Errno(27));
             }
-            d.file.truncate(end)?;
+            if let Some(memfd) = memfd {
+                memfd.check_allocate(end)?;
+            }
+            // Otherwise nothing shows: every byte of a file is allocated.
+            if grows && mode & KEEP_SIZE == 0 {
+                d.file.truncate(end)?;
+            }
         }
-        // Nothing to show: every byte of a file is already allocated.
-        0 => {}
         PUNCH_HOLE => d.file.zero_range(offset as u64, len as u64)?,
         _ => return Err(EOPNOTSUPP),
     }
@@ -677,7 +688,7 @@ fn copy_file_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(Errno::EBADF);
     }
     // Both files must be on one filesystem.
-    let same_mount = device(c, &input.path) == device(c, &output.path);
+    let same_mount = descriptor_device(c, &input) == descriptor_device(c, &output);
     if !same_mount {
         return Err(Errno(18));
     }
@@ -910,7 +921,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0 {
         return Err(Errno::EINVAL);
     }
-    let (s, p) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    let (s, device) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dir as i32 == -100 {
             let cwd = c
                 .files
@@ -918,10 +929,10 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
-            (c.files.fs.metadata(&cwd, true)?, cwd)
+            (c.files.fs.metadata(&cwd, true)?, device(c, &cwd))
         } else {
             let d = c.files.descriptor(dir)?;
-            (d.file.stat()?, d.path)
+            (d.file.stat()?, descriptor_device(c, &d))
         }
     } else {
         let p = c.files.path(dir, raw)?;
@@ -929,9 +940,9 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             Some(generated) => generated,
             None => c.files.fs.metadata(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?,
         };
-        (s, p)
+        (s, device(c, &p))
     };
-    output(c, out, &encode_statx(s, device(c, &p))?)?;
+    output(c, out, &encode_statx(s, device)?)?;
     Ok(0)
 }
 /// `struct statx` with what [`encode_stat`] gives a `struct stat`: the basic
@@ -959,11 +970,23 @@ fn encode_statx(s: FileStat, device: u64) -> Result<[u8; 256], Errno> {
 }
 /// `stat` of a file at guest `path`: its `st_dev` names the mount holding
 /// it, numbered as /proc/self/mountinfo numbers mounts (0:1 is the root).
-fn stat(c: &Context<'_>, addr: u64, s: FileStat, path: &[u8]) -> Result<u64, Errno> {
+fn stat(c: &Context<'_>, addr: u64, s: FileStat, device: u64) -> Result<u64, Errno> {
     let mut bytes = encode_stat(s)?;
-    bytes[0..8].copy_from_slice(&device(c, path).to_le_bytes());
+    bytes[0..8].copy_from_slice(&device.to_le_bytes());
     output(c, addr, &bytes)?;
     Ok(0)
+}
+/// The device of the file a descriptor holds: a memfd's own (it is on no
+/// mount), else that of the mount holding its path.
+fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
+    if d.file
+        .as_any()
+        .is_some_and(|v| v.is::<crate::memfd::Memfd>())
+    {
+        crate::memfd::DEVICE
+    } else {
+        device(c, &d.path)
+    }
 }
 /// The minor number of the mount that holds `path` (the longest matching
 /// mount point), so that each mount is its own device.
@@ -1073,6 +1096,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         326 => copy_file_range(c, a),
         436 => close_range(c, a),
         285 => fallocate(c, a),
+        319 => crate::memfd::memfd_create(c, a),
         // pread64, pwrite64, preadv, pwritev: at an offset, leaving the file
         // position. On x86-64 the offset of preadv and pwritev is a[3] alone.
         17 => {
@@ -1315,20 +1339,20 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 let raw = path(c, a[1])?;
                 if raw.is_empty() && a[3] & 0x1000 != 0 {
                     let d = c.files.descriptor(a[0])?;
-                    return stat(c, a[2], d.file.stat()?, &d.path);
+                    return stat(c, a[2], d.file.stat()?, descriptor_device(c, &d));
                 }
                 (c.files.path(a[0], raw)?, a[2], a[3] & 0x100 == 0)
             } else {
                 (at(c, (-100i32) as u64, a[0])?, a[1], n == 4)
             };
             if let Some(generated) = generated_stat(c, &p) {
-                return stat(c, out, generated, &p);
+                return stat(c, out, generated, device(c, &p));
             }
-            stat(c, out, c.files.fs.metadata(&p, follow)?, &p)
+            stat(c, out, c.files.fs.metadata(&p, follow)?, device(c, &p))
         }
         5 => {
             let d = c.files.descriptor(a[0])?;
-            stat(c, a[1], d.file.stat()?, &d.path)
+            stat(c, a[1], d.file.stat()?, descriptor_device(c, &d))
         }
         8 => c
             .files
@@ -1387,6 +1411,23 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     Ok(0)
                 }
                 3 => Ok(d.file.flags() as u64),
+                // F_ADD_SEALS and F_GET_SEALS, for memfds only.
+                1033 | 1034 => {
+                    let memfd = d
+                        .file
+                        .as_any()
+                        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>());
+                    match (a[1], memfd) {
+                        (1034, Some(memfd)) => Ok(u64::from(memfd.seals())),
+                        (1033, Some(memfd)) => {
+                            memfd.add_seals(d.file.flags() & 3 != 0, a[2] as u32)?;
+                            Ok(0)
+                        }
+                        // memfd_add_seals checks the access and the bits first.
+                        (1033, None) if d.file.flags() & 3 == 0 => Err(Errno::EPERM),
+                        _ => Err(Errno::EINVAL),
+                    }
+                }
                 // F_SETPIPE_SZ and F_GETPIPE_SZ, for pipes only.
                 1031 | 1032 => {
                     let pipe = d

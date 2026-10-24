@@ -1284,7 +1284,16 @@ fn check_mappable(
     }
     let access = file.flags() & 3;
     if flags & MAP_SHARED != 0 && prot.contains(Prot::WRITE) {
-        return Err(if access == 2 {
+        // A memfd sealed against writes refuses first (seal_check_write).
+        let sealed = file
+            .as_any()
+            .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
+            .is_some_and(|m| {
+                m.seals() & (crate::memfd::F_SEAL_WRITE | crate::memfd::F_SEAL_FUTURE_WRITE) != 0
+            });
+        return Err(if access == 2 && sealed {
+            Errno::EPERM
+        } else if access == 2 {
             Errno::ENODEV
         } else {
             Errno::EACCES

@@ -37,7 +37,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, the `stat` family and `statx`, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `fallocate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Files | `open`/`openat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, the `stat` family and `statx`, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `shutdown` |
@@ -63,6 +63,22 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   is given, `FALLOC_FL_PUNCH_HOLE` sets the range to zeros (also in an
   `O_APPEND` file), and the other modes give `EOPNOTSUPP`. Growing past
   `RLIMIT_FSIZE` raises `SIGXFSZ` and fails with `EFBIG`.
+- `memfd_create` makes an unlinked in-memory file (mode 0777, or 0666 with
+  `MFD_NOEXEC_SEAL`, and no links), with Linux's flag and name checks
+  (`EINVAL`, `EFAULT`); `MFD_HUGETLB` gives `ENOSYS`, as from a kernel
+  without hugetlbfs. Its seals, through `fcntl`'s `F_ADD_SEALS` and
+  `F_GET_SEALS`, start as `F_SEAL_SEAL` unless `MFD_ALLOW_SEALING` is given
+  (`F_SEAL_EXEC` with `MFD_NOEXEC_SEAL`), and restrict the file as tmpfs
+  does: `F_SEAL_WRITE` and `F_SEAL_FUTURE_WRITE` refuse writes, punch holes
+  and writable shared mappings, `F_SEAL_SHRINK` and `F_SEAL_GROW` the size
+  (a write stops at the last page that ends within the file), and
+  `F_SEAL_EXEC` the execute bits, all with `EPERM`. Memfds share a
+  filesystem of their own, as Linux's internal tmpfs mount, so
+  `copy_file_range` between one and a file on a mount gives `EXDEV`. Other
+  files have no seals (`EINVAL`), even on the in-memory `/tmp`, where a real
+  tmpfs file reports `F_SEAL_SEAL`. A memfd's name is not shown, as there is no
+  `/proc/self/fd`, and an unsealed one cannot be mapped shared and writable
+  (`ENODEV`), like other files.
 - `close_range` closes the open descriptors from `first` to `last`, or with
   `CLOSE_RANGE_CLOEXEC` marks them close-on-exec. `CLOSE_RANGE_UNSHARE` first
   gives the thread its own copy of a table it shares with `CLONE_FILES`

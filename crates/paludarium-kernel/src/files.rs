@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
     82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264,
-    265, 266, 267, 268, 269, 280, 292, 293, 295, 296, 326, 439,
+    265, 266, 267, 268, 269, 280, 292, 293, 295, 296, 326, 332, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -288,9 +288,7 @@ fn at(c: &Context<'_>, dir: u64, ptr: u64) -> Result<Vec<u8>, Errno> {
 /// writing are always allowed and executing needs an execute bit (or a
 /// directory), as Linux grants root.
 fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<u64, Errno> {
-    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     const AT_EACCESS: u64 = 0x200;
-    const AT_EMPTY_PATH: u64 = 0x1000;
     if mode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -347,8 +345,6 @@ const UTIME_NOW: u64 = (1 << 30) - 1;
 const UTIME_OMIT: u64 = (1 << 30) - 2;
 /// `utimensat(dirfd, path, times, flags)`, in the order Linux checks it.
 fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
-    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-    const AT_EMPTY_PATH: u64 = 0x1000;
     let now = || c.host.clock(ClockId::Realtime).map(i128::from);
     let (atime, mtime) = if a[2] == 0 {
         let now = now()?;
@@ -808,6 +804,76 @@ fn read_blocking(
         }
     }
 }
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_NO_AUTOMOUNT: u64 = 0x800;
+const AT_EMPTY_PATH: u64 = 0x1000;
+/// AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC; both together are invalid.
+const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+/// STATX_TYPE ... STATX_BLOCKS: the fields a `stat` also has.
+const STATX_BASIC_STATS: u32 = 0x7ff;
+/// `statx(dirfd, path, flags, mask, buffer)`, with the checks of Linux's
+/// do_statx and vfs_statx. As since Linux 6.11, a null path with
+/// AT_EMPTY_PATH names the descriptor like an empty one.
+fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let (dir, flags, mask, out) = (a[0], a[2], a[3] as u32, a[4]);
+    let raw = if a[1] == 0 && flags & AT_EMPTY_PATH != 0 {
+        Vec::new()
+    } else {
+        path(c, a[1])?
+    };
+    if mask & 0x8000_0000 != 0 || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE {
+        return Err(Errno::EINVAL);
+    }
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (s, p) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if dir as i32 == -100 {
+            let cwd = c
+                .files
+                .cwd
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            (c.files.fs.metadata(&cwd, true)?, cwd)
+        } else {
+            let d = c.files.descriptor(dir)?;
+            (d.file.stat()?, d.path)
+        }
+    } else {
+        let p = c.files.path(dir, raw)?;
+        let s = match generated_stat(c, &p) {
+            Some(generated) => generated,
+            None => c.files.fs.metadata(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?,
+        };
+        (s, p)
+    };
+    output(c, out, &encode_statx(s, device(c, &p))?)?;
+    Ok(0)
+}
+/// `struct statx` with what [`encode_stat`] gives a `struct stat`: the basic
+/// fields, no birth time, and the mount's number as the device minor.
+fn encode_statx(s: FileStat, device: u64) -> Result<[u8; 256], Errno> {
+    let (seconds, nanos) = linux_mtime(s.mtime_ns)?;
+    let mut b = [0; 256];
+    b[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
+    b[4..8].copy_from_slice(&4096u32.to_le_bytes());
+    b[16..20].copy_from_slice(&u32::try_from(s.links).unwrap_or(u32::MAX).to_le_bytes());
+    b[28..30].copy_from_slice(&(s.mode as u16).to_le_bytes());
+    b[32..40].copy_from_slice(&s.inode.to_le_bytes());
+    b[40..48].copy_from_slice(&s.size.to_le_bytes());
+    b[48..56].copy_from_slice(&s.size.div_ceil(512).to_le_bytes());
+    b[112..120].copy_from_slice(&seconds.to_le_bytes());
+    b[120..124].copy_from_slice(&(nanos as u32).to_le_bytes());
+    // Linux's encoding of a device number into its major and minor.
+    let (major, minor) = (
+        (device >> 8) & 0xfff,
+        (device & 0xff) | ((device >> 12) & !0xff),
+    );
+    b[136..140].copy_from_slice(&(major as u32).to_le_bytes());
+    b[140..144].copy_from_slice(&(minor as u32).to_le_bytes());
+    Ok(b)
+}
 /// `stat` of a file at guest `path`: its `st_dev` names the mount holding
 /// it, numbered as /proc/self/mountinfo numbers mounts (0:1 is the root).
 fn stat(c: &Context<'_>, addr: u64, s: FileStat, path: &[u8]) -> Result<u64, Errno> {
@@ -920,6 +986,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     match n {
         40 => sendfile(c, a),
+        332 => statx(c, a),
         326 => copy_file_range(c, a),
         // pread64, pwrite64, preadv, pwritev: at an offset, leaving the file
         // position. On x86-64 the offset of preadv and pwritev is a[3] alone.

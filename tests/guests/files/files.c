@@ -92,6 +92,24 @@ void _start(void) {
   /* What the output file holds. */
   long n=call(17,o,(long)buf,64,0,0,0);results[x++]=n;long sum=0;for(long i=0;i<n&&i<64;i++)sum=sum*31+buf[i];results[x++]=sum;
   S(3,o,0,0);S(3,ro,0,0);S(3,ap,0,0);S(3,wo,0,0);S(3,d,0,0);S(3,pf[0],0,0);S(3,pf[1],0,0);}
+ if(CASE==41){ /* statx(dirfd, path, flags, mask, buffer): the fields a stat has */
+  static unsigned char sx[256];static long t[4]={0,0,1234,5678};
+  #define SX(f,fl,m) call(332,-100,(long)(f),fl,m,(long)sx,0)
+  #define SXMODE() (*(unsigned short*)(sx+28))
+  #define SXTYPE() (SXMODE()&0170000)
+  S(1,fd,"abc",3);call(280,-100,(long)p,(long)t,0,0,0);
+  results[x++]=SX(p,0,0x7ff);results[x++]=*(unsigned*)sx&0x7ff;results[x++]=*(unsigned*)(sx+16);results[x++]=SXMODE();
+  results[x++]=*(long*)(sx+40);results[x++]=*(long*)(sx+112);results[x++]=*(unsigned*)(sx+120);
+  S(88,p,q,0);results[x++]=SX(q,0x100,0x7ff);results[x++]=SXTYPE()==0120000;results[x++]=SX(q,0,0x7ff);results[x++]=SXTYPE()==0100000;
+  results[x++]=call(332,fd,(long)"",0x1000,0x7ff,(long)sx,0);results[x++]=*(long*)(sx+40);results[x++]=call(332,fd,(long)"",0,0x7ff,(long)sx,0);
+  results[x++]=call(332,-100,(long)"",0x1000,0x7ff,(long)sx,0);results[x++]=SXTYPE()==0040000;
+  results[x++]=SX(p,0x6000,0x7ff);results[x++]=SX(p,1,0x7ff);results[x++]=SX(p,0,0x80000000);
+  results[x++]=SX("/tmp/paludarium-files-missing",0,0x7ff);results[x++]=call(332,-100,1,0,0x7ff,(long)sx,0);
+  results[x++]=call(332,-100,(long)p,0,0x7ff,1,0);results[x++]=call(332,99,(long)"",0x1000,0x7ff,(long)sx,0);
+  /* A mask of 0 is allowed; which fields it reports depends on the kernel
+     (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
+     result is compared. */
+  results[x++]=SX(p,0,0);S(87,q,0,0);}
  S(3,fd,0,0);S(87,p,0,0);S(87,q,0,0);S(87,r,0,0);
  }
  S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);

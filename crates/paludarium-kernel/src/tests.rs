@@ -702,6 +702,31 @@ fn sendfile_sends_a_large_file_in_pieces() {
     assert_eq!(f.ret(8, &[input, 0, 1]), 3 << 20);
 }
 #[test]
+fn statx_fills_the_stat_fields() {
+    let mut f = fixture();
+    let (out, buf) = (DATA + 0x100, DATA + 0x80);
+    f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+    f.mem.write(GuestAddr(buf), b"hello").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o640]);
+    assert_eq!(f.ret(1, &[fd, buf, 5]), 5);
+    let word = |f: &Fixture, at: u64| f.mem.read_u64(GuestAddr(out + at)).unwrap();
+    // A null path with AT_EMPTY_PATH names the descriptor (Linux 6.11).
+    assert_eq!(f.ret(332, &[fd, 0, 0x1000, 0x7ff, out]), 0);
+    assert_eq!(word(&f, 0) as u32, 0x7ff); // stx_mask
+    assert_eq!(word(&f, 0) >> 32, 4096); // stx_blksize
+    assert_eq!(word(&f, 16) as u32, 1); // stx_nlink
+    assert_eq!((word(&f, 24) >> 32) as u16, 0o100640); // stx_mode
+    assert_eq!(word(&f, 40), 5); // stx_size
+    assert_eq!(word(&f, 48), 1); // stx_blocks
+    // The same file through its path, and the root's device numbers.
+    let inode = word(&f, 32);
+    assert_eq!(f.ret(332, &[(-100i64) as u64, DATA, 0, 0x7ff, out]), 0);
+    assert_eq!(word(&f, 32), inode);
+    assert_eq!(word(&f, 136), 1 << 32); // major 0, minor 1
+    assert_eq!(f.ret(332, &[fd, 0, 0, 0x7ff, out]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(332, &[fd, 0, 0x1000, 0x7ff, 1]), errno(Errno::EFAULT));
+}
+#[test]
 fn file_size_limit_is_enforced_as_linux_does() {
     let mut f = fixture();
     let (limit, buf, pair) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);

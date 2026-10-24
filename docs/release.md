@@ -2,13 +2,16 @@
 
 ## Current status
 
-The latest release is `v0.2.0` (2026-10-22, tag on 4125399f, publish run
-39701905461). The eleven crates and `@aletheia-works/paludarium-wasm` are
-published only by Trusted Publishing (OIDC) from `publish.yml`, after the
-same-head evidence of the head (steps 5 and 6 below). Only the first release,
-`v0.1.0` (2026-10-20, tag on 0f456d07), was published by hand with one-time
-scoped tokens, because crates.io lets a Trusted Publisher be registered only
-for a crate that already exists.
+Every release is listed on the
+[releases page](https://github.com/aletheia-works/paludarium/releases); the
+workspace version in `Cargo.toml` stays that of the latest release until the
+Release Please pull request raises it. The eleven crates and
+`@aletheia-works/paludarium-wasm` are published only by Trusted Publishing
+(OIDC) from `publish.yml`, after the same-head evidence of the head (steps 5
+and 6 below). Only the first release, `v0.1.0` (2026-10-20, tag on
+0f456d07), was published by hand with one-time scoped tokens, because
+crates.io lets a Trusted Publisher be registered only for a crate that
+already exists.
 
 The eleven public crates are types, host, mmu, vfs, loader, decoder, cpu,
 jit, kernel, runtime and paludarium, in the dependency order calculated from
@@ -17,8 +20,8 @@ together with the internal dependency versions and the npm package version.
 Harness, the Rust Wasm adapter and the fuzz crate have `publish = false`.
 
 The tested toolchain is the nightly pinned in `rust-toolchain.toml`. Every
-crate declares MSRV 1.101, so the current stable release (1.99.1) cannot
-build them, and stable support is not claimed. The Wasm adapter
+crate declares MSRV 1.101, so no stable release before 1.101 can build
+them, and stable support is not claimed. The Wasm adapter
 additionally needs nightly build-std and atomic-wait support.
 
 ## Non-publishing checks

@@ -139,9 +139,21 @@ run = "rumdl check ."
 description = "rumdl — apply Markdown autofix (in-place)"
 run = "rumdl fmt ."
 
+[tasks."docs:syscalls"]
+description = "Check that the features pages list exactly the implemented system calls (read-only)"
+run = "python3 -B scripts/syscall-docs.py"
+
 [tasks."lint:all"]
-description = "Run all formatters/linters (read-only) — Rust + ShellCheck + actionlint + Ruff + Tombi + rumdl"
-depends = ["rust:check", "shell:check", "actions:check", "python:check", "toml:check", "markdown:check"]
+description = "Run all formatters/linters (read-only) — Rust + ShellCheck + actionlint + Ruff + Tombi + rumdl + system-call list"
+depends = [
+  "rust:check",
+  "shell:check",
+  "actions:check",
+  "python:check",
+  "toml:check",
+  "markdown:check",
+  "docs:syscalls",
+]
 
 [tasks."lint:all:fix"]
 description = "Apply the autofixes of lint:all (in-place)"

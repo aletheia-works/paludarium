@@ -49,6 +49,10 @@ PALUDARIUM_TEST_NODE=<absolute path to node> cargo test --locked --workspace
 
 `mise run lint:all` runs the first two and `mise run test` the unit tests;
 `mise tasks` lists the other checks (differential tests, coverage, fuzzing).
+`lint:all` also checks that the system-call tables of the features pages, in
+English and Japanese, list exactly the calls the kernel implements: a new
+system call gets its name in `scripts/syscall-docs.py` and a place in both
+tables.
 
 The emulator is correct when it matches native x86-64 Linux. Differential tests,
 line coverage (80% floor), and fuzzing only produce real evidence on x86-64

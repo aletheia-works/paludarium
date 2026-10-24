@@ -11,8 +11,10 @@ on:
 
   workflow_dispatch:
 
+# The backup renews the encrypted state artifact; nothing is published as a
+# Release.
 permissions:
-  contents: write
+  contents: read
   actions: write
 
 jobs:
@@ -21,7 +23,7 @@ jobs:
       github.repository_owner == 'aletheia-works' &&
       (github.event_name != 'workflow_run' ||
        github.event.workflow_run.conclusion == 'success')
-    uses: aletheia-works/.github/.github/workflows/terraform-state-backup.yml@4f9b6d6865f083952f13557c91eaf839045e55e1 # v1.0.0
+    uses: aletheia-works/.github/.github/workflows/terraform-state-backup.yml@b24ce77ad773bcca239d8140aeb373f295572521 # v1.3.1
     with:
       working_directory: infra/github
     secrets:

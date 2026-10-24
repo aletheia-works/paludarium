@@ -39,11 +39,12 @@ Publisher of every crate and of the npm package names this environment.
 | PR touching `infra/github/**` | `terraform-plan.yml` | Runs `tofu plan` and posts the diff as a PR comment |
 | PR touching `infra/github/**` | `tofu-fmt-autofix.yml` | Commits `tofu fmt -recursive` fixes to the PR |
 | Merge to `main` | `terraform-apply.yml` | Runs `tofu apply` |
-| Weekly + post-apply | `terraform-state-backup.yml` | Copies the state to a GitHub Release Asset |
+| Weekly + post-apply | `terraform-state-backup.yml` | Renews the state artifact before it expires |
 
 All four call the organization's reusable workflows in
 [`aletheia-works/.github`](https://github.com/aletheia-works/.github) and use
-the `TF_TOKEN_GITHUB` secret.
+the `TF_TOKEN_GITHUB` secret. Plan and apply also use the organization secret
+`TF_STATE_PASSPHRASE`, which encrypts the state.
 
 ## Running locally
 
@@ -75,10 +76,23 @@ export GITHUB_TOKEN=github_pat_xxxxxxxxxxxx
 ### 3. Fetch the latest state
 
 The canonical state lives as an artifact on the most recent successful
-`terraform-apply` run. Download it before running `plan`/`apply` locally:
+`terraform-apply` run, named by the repository variable `LATEST_APPLY_RUN_ID`.
+Download it before running `plan`/`apply` locally:
 
 ```bash
-gh run download --name terraform-state --dir .
+gh run download "$(gh variable get LATEST_APPLY_RUN_ID)" --name terraform-state --dir .
+```
+
+The state is encrypted, so set `TF_ENCRYPTION` as CI does, with the same
+passphrase as `TF_STATE_PASSPHRASE`. State encryption needs OpenTofu 1.7 or
+later, which `versions.tf` requires; CI installs the latest release.
+
+```bash
+export TF_ENCRYPTION='
+key_provider "pbkdf2" "state" { passphrase = "<TF_STATE_PASSPHRASE>" }
+method "aes_gcm" "state" { keys = key_provider.pbkdf2.state }
+state { method = method.aes_gcm.state }
+'
 ```
 
 ### 4. Run tofu
@@ -91,16 +105,21 @@ tofu apply
 
 ## State management
 
-State is stored as a GitHub Actions artifact and mirrored to Release Assets
-for long-term retention. A `concurrency` group serializes workflow runs to
-avoid concurrent writes; there is no true distributed lock, so avoid running
-`apply` locally while CI is running.
+State is stored as a GitHub Actions artifact, encrypted with the organization
+secret `TF_STATE_PASSPHRASE`, because anyone can download the artifacts of a
+public repository. The backup only downloads and uploads that artifact again
+to extend its retention; no state is put in a GitHub Release. An unencrypted
+state can still be read, so the first apply after the change encrypts it.
+Keep secrets out of the state all the same: the token is not managed as a
+resource. A `concurrency` group serializes workflow runs to avoid concurrent
+writes; there is no true distributed lock, so avoid running `apply` locally
+while CI is running.
 
 ## File layout
 
 ```text
 infra/github/
-├── versions.tf                 # OpenTofu and provider versions
+├── versions.tf                 # OpenTofu (1.7 or later) and provider versions
 ├── providers.tf                # GitHub provider config
 ├── variables.tf                # Input variables
 ├── main.tf                     # Repository settings, main ruleset, labels

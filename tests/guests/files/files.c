@@ -7,10 +7,11 @@ static long call(long n,long a,long b,long c,long d,long e,long f) {
 static char p[]="/tmp/paludarium-files-fixture",q[]="/tmp/paludarium-files-link",r[]="/tmp/paludarium-files-renamed";
 static char buf[4096]; static long results[64]; static unsigned char st[144];
 /* "/proc/self/fd/<n>", and whether a read link (n bytes) is b. */
-static char *fdpath(long n) {
- static char b[32]; char *q=b; const char *s="/proc/self/fd/"; char d[12]; int k=0;
+static char *numbered(const char *s,long n) {
+ static char b[32]; char *q=b; char d[12]; int k=0;
  while(*s)*q++=*s++; do{d[k++]='0'+n%10;n/=10;}while(n); while(k)*q++=d[--k]; *q=0; return b;
 }
+static char *fdpath(long n) { return numbered("/proc/self/fd/",n); }
 static long same(const char *a,long n,const char *b){long i=0;for(;b[i];i++)if(i>=n||a[i]!=b[i])return 0;return i==n;}
 static long starts(const char *a,long n,const char *b){long i=0;for(;b[i];i++)if(i>=n||a[i]!=b[i])return 0;return 1;}
 void _start(void) {
@@ -117,6 +118,27 @@ void _start(void) {
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
   results[x++]=SX(p,0,0);S(87,q,0,0);}
+ if(CASE==46){ /* /dev: the memory devices, and the links into /proc/self/fd */
+  static const char *devs[]={"/dev/null","/dev/zero","/dev/full","/dev/random","/dev/urandom"};
+  static char t[300];long k;
+  #define LINK(path,want) (k=call(89,(long)(path),(long)t,300,0,0,0),same(t,k,want))
+  for(int i=0;i<5;i++){S(4,devs[i],st,0);results[x++]=*(unsigned*)(st+24);results[x++]=*(long*)(st+40);}
+  long z=S(2,"/dev/zero",2,0);for(int i=0;i<8;i++)buf[i]=7;
+  results[x++]=S(0,z,buf,8);results[x++]=buf[0]+buf[7];results[x++]=S(1,z,"ab",2);results[x++]=call(17,z,(long)buf,4,100,0,0);
+  long fu=S(2,"/dev/full",2,0);results[x++]=S(1,fu,"ab",2);results[x++]=S(0,fu,buf,4);
+  long ur=S(2,"/dev/urandom",0,0),rd=S(2,"/dev/random",0,0);results[x++]=S(0,ur,buf,16);results[x++]=S(0,rd,buf,16);
+  long nl=S(2,"/dev/null",0,0);results[x++]=S(0,nl,buf,4);results[x++]=S(1,nl,"x",1);
+  S(6,"/dev/stdin",st,0);results[x++]=*(unsigned*)(st+24);results[x++]=*(long*)(st+48);
+  results[x++]=LINK("/dev/stdin","/proc/self/fd/0");results[x++]=LINK("/dev/stdout","/proc/self/fd/1");
+  results[x++]=LINK("/dev/stderr","/proc/self/fd/2");results[x++]=LINK("/dev/fd","/proc/self/fd");
+  S(4,"/dev/fd",st,0);results[x++]=*(unsigned*)(st+24);S(4,"/dev",st,0);results[x++]=*(unsigned*)(st+24);
+  results[x++]=LINK(numbered("/dev/fd/",fd),p);long re=S(2,numbered("/dev/fd/",fd),0,0);results[x++]=re>=0;results[x++]=LINK(fdpath(re),p);
+  long mp=call(9,0,4096,3,2,z,0);results[x++]=mp>0;if(mp>0){results[x++]=*(char*)mp;*(char*)mp=1;S(11,mp,4096,0);}
+  long ms=call(9,0,4096,3,1,z,0);results[x++]=ms>0;if(ms>0)S(11,ms,4096,0);
+  long zr=S(2,"/dev/zero",0,0);results[x++]=call(9,0,4096,3,1,zr,0);
+  results[x++]=S(2,"/dev/stdin",0400000,0);results[x++]=call(89,(long)"/dev/null",(long)t,300,0,0,0);
+  results[x++]=S(2,"/dev",1,0);results[x++]=S(2,"/dev",2,0);results[x++]=S(2,"/dev/null",0200000,0);
+  long fds[]={z,fu,ur,rd,nl,re,zr};for(unsigned i=0;i<sizeof fds/sizeof fds[0];i++)S(3,fds[i],0,0);}
  if(CASE==45){ /* /proc/self/fd: a link per open descriptor */
   static char t[300],u[300],gone[300];long k,k2;
   #define RL(n,o) call(89,(long)fdpath(n),(long)(o),300,0,0,0)

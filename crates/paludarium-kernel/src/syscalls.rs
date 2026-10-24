@@ -1219,6 +1219,9 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     {
         return err(e);
     }
+    // A mapping of /dev/zero is anonymous memory (shared with MAP_SHARED),
+    // as Linux's mmap_zero makes it.
+    let file = file.filter(|f| !is_zero_device(f.as_ref()));
     let kind = if file.is_some() {
         MappingKind::File
     } else {
@@ -1291,6 +1294,9 @@ fn check_mappable(
             .is_some_and(|m| {
                 m.seals() & (crate::memfd::F_SEAL_WRITE | crate::memfd::F_SEAL_FUTURE_WRITE) != 0
             });
+        if access == 2 && is_zero_device(file) {
+            return Ok(());
+        }
         return Err(if access == 2 && sealed {
             Errno::EPERM
         } else if access == 2 {
@@ -1302,7 +1308,16 @@ fn check_mappable(
     if access == 1 {
         return Err(Errno::EACCES);
     }
-    if regular { Ok(()) } else { Err(Errno::ENODEV) }
+    if regular || is_zero_device(file) {
+        Ok(())
+    } else {
+        Err(Errno::ENODEV)
+    }
+}
+fn is_zero_device(file: &dyn FileHandle) -> bool {
+    file.as_any()
+        .and_then(|v| v.downcast_ref::<crate::devices::Device>())
+        .is_some_and(|d| d.kind() == crate::devices::Kind::Zero)
 }
 
 /// Fills a new file mapping with the file from `offset`; the part of the

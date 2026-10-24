@@ -158,6 +158,21 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   streams give the same handle for the access they have. A socket gives
   `ENXIO`, as on Linux; so do, here, a removed file, the other end of a pipe
   and the files of no type, which Linux can open again.
+- `/dev` (mode 0755) holds the memory devices and the links Linux systems
+  keep there, and lists only these: a file a guest makes under `/dev` can be
+  opened and stat'ed but is not listed. Each entry has one inode number,
+  which `stat` and `getdents` both report. `/dev` opens only for reading
+  (`EISDIR`), and a device not with `O_DIRECTORY` (`ENOTDIR`). `null`, `zero`, `full`, `random` and
+  `urandom` are character devices (mode 0666) with Linux's numbers in
+  `st_rdev` (1:3, 1:5, 1:7, 1:8, 1:9): `null` reads nothing, `zero` and
+  `full` read zeros, `random` and `urandom` read the host's random bytes,
+  and `full` refuses writes with `ENOSPC` while the others take them. A
+  mapping of `zero` is anonymous memory, shared with `MAP_SHARED`. `fd`,
+  `stdin`, `stdout` and `stderr` are links (0777) to `/proc/self/fd` and its
+  first three entries, followed by `open`, `stat` and paths through them
+  (`/dev/fd/3`); `O_NOFOLLOW` on one gives `ELOOP`, also with `O_PATH`,
+  where Linux opens the link itself (not supported here). Files on host
+  mounts report no device number.
 - CPU time is the host thread's CPU time (user and system together) from a
   guest thread's first system call, where the host can measure it (Linux,
   macOS, Windows); elsewhere, as in WebAssembly, it is wall time instead.

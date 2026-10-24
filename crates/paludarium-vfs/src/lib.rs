@@ -142,6 +142,7 @@ impl Node {
             mode: self.mode,
             links: self.links,
             mtime_ns: self.mtime_ns,
+            rdev: 0,
         }
     }
 }

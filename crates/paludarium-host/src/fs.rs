@@ -9,6 +9,9 @@ pub struct FileStat {
     pub links: u64,
     /// Signed nanoseconds since the Unix epoch; includes the former u64 range.
     pub mtime_ns: i128,
+    /// A device file's number, as `stat`'s `st_rdev` encodes it (0 for any
+    /// other file).
+    pub rdev: u64,
 }
 /// What `statfs` reports about the filesystem holding a path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

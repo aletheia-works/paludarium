@@ -968,12 +968,18 @@ fn encode_statx(s: FileStat, device: u64) -> Result<[u8; 256], Errno> {
     b[112..120].copy_from_slice(&seconds.to_le_bytes());
     b[120..124].copy_from_slice(&(nanos as u32).to_le_bytes());
     // Linux's encoding of a device number into its major and minor.
-    let (major, minor) = (
-        (device >> 8) & 0xfff,
-        (device & 0xff) | ((device >> 12) & !0xff),
-    );
-    b[136..140].copy_from_slice(&(major as u32).to_le_bytes());
-    b[140..144].copy_from_slice(&(minor as u32).to_le_bytes());
+    let split = |device: u64| {
+        (
+            ((device >> 8) & 0xfff) as u32,
+            ((device & 0xff) | ((device >> 12) & !0xff)) as u32,
+        )
+    };
+    let (rdev_major, rdev_minor) = split(s.rdev);
+    b[128..132].copy_from_slice(&rdev_major.to_le_bytes());
+    b[132..136].copy_from_slice(&rdev_minor.to_le_bytes());
+    let (major, minor) = split(device);
+    b[136..140].copy_from_slice(&major.to_le_bytes());
+    b[140..144].copy_from_slice(&minor.to_le_bytes());
     Ok(b)
 }
 /// `stat` of a file at guest `path`: its `st_dev` names the mount holding
@@ -1019,6 +1025,7 @@ fn encode_stat(s: FileStat) -> Result<[u8; 144], Errno> {
     b[8..16].copy_from_slice(&s.inode.to_le_bytes());
     b[16..24].copy_from_slice(&s.links.to_le_bytes());
     b[24..28].copy_from_slice(&s.mode.to_le_bytes());
+    b[40..48].copy_from_slice(&s.rdev.to_le_bytes());
     b[48..56].copy_from_slice(&s.size.to_le_bytes());
     b[56..64].copy_from_slice(&4096u64.to_le_bytes());
     b[64..72].copy_from_slice(&s.size.div_ceil(512).to_le_bytes());
@@ -1614,8 +1621,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             }
             // `/proc/self` is a link to this process's directory, and each
             // entry of its `fd` to a descriptor's file.
+            let p = crate::devices::through_link(&p).unwrap_or(p);
             let b = if p == b"/proc/self" {
                 c.process.pid.to_string().into_bytes()
+            } else if let Some(entry) = crate::devices::entry(&p) {
+                let crate::devices::Entry::Link(target) = entry else {
+                    return Err(Errno::EINVAL);
+                };
+                target.to_vec()
             } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
                 let crate::proc::OwnEntry::Descriptor(n) = entry else {
                     return Err(Errno::EINVAL);
@@ -1641,6 +1654,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             }
             let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
                 Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c),
+                _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Directory) => {
+                    crate::devices::entries(c.files.fs.metadata(b"/", true)?.inode)
+                }
                 _ => c.files.fs.read_dir(&d.path)?,
             };
             let position = d.file.seek(0, 1)? as usize;
@@ -1802,6 +1818,7 @@ impl FileHandle for StandardFile {
             mode: 0o010666,
             links: 1,
             mtime_ns: 0,
+            rdev: 0,
         })
     }
     fn truncate(&self, _n: u64) -> Result<(), Errno> {
@@ -1939,8 +1956,31 @@ fn open_path(
     flags: u32,
     mode: u32,
 ) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
-    let file: Arc<dyn FileHandle> = if p == b"/dev/null" {
-        Arc::new(crate::null::NullFile::new(flags))
+    const O_NOFOLLOW: u32 = 0o400000;
+    if let Some(target) = crate::devices::through_link(p) {
+        return open_path(c, &target, flags, mode);
+    }
+    let file: Arc<dyn FileHandle> = if let Some(entry) = crate::devices::entry(p) {
+        const O_DIRECTORY: u32 = 0o200000;
+        match entry {
+            // A directory opens only for reading, a device not as one.
+            crate::devices::Entry::Directory if flags & 3 != 0 => return Err(Errno::EISDIR),
+            crate::devices::Entry::Directory => Arc::new(crate::proc::OwnDirectory::new(
+                crate::devices::directory_stat(),
+            )),
+            crate::devices::Entry::Device(_) if flags & O_DIRECTORY != 0 => {
+                return Err(Errno::ENOTDIR);
+            }
+            crate::devices::Entry::Device(kind) => Arc::new(crate::devices::Device::new(
+                kind,
+                flags,
+                Some(Arc::clone(c.shared_host)),
+            )),
+            crate::devices::Entry::Link(_) if flags & O_NOFOLLOW != 0 => {
+                return Err(Errno(40)); // ELOOP
+            }
+            crate::devices::Entry::Link(target) => return open_path(c, target, flags, mode),
+        }
     } else if let Some(mountinfo) = crate::proc::mount_table(p) {
         let content = crate::proc::render(&c.files.fs.mounts(), mountinfo);
         Arc::new(crate::proc::GeneratedFile::open(content, flags))
@@ -2005,7 +2045,7 @@ fn reopen(
 }
 /// Whether `path` is one of the generated files, which no filesystem holds.
 fn generated(path: &[u8]) -> bool {
-    path == b"/dev/null" || path.starts_with(b"/proc/")
+    crate::devices::entry(path).is_some() || path.starts_with(b"/proc/")
 }
 /// `path` as `realpath` gives it: absolute, with `.`, `..` and every
 /// symbolic link resolved one component at a time (at most 40 links, as
@@ -2121,6 +2161,16 @@ fn descriptor_entries(c: &Context<'_>) -> Vec<paludarium_host::DirectoryEntry> {
 /// other path (and for a link to a descriptor that is not open). A link in
 /// `/proc/self/fd` is followed to its file unless `follow` is false.
 fn generated_stat(c: &Context<'_>, path: &[u8], follow: bool) -> Option<(FileStat, u64)> {
+    if let Some(target) = crate::devices::through_link(path) {
+        return generated_stat(c, &target, follow);
+    }
+    match crate::devices::entry(path) {
+        Some(crate::devices::Entry::Link(target)) if follow => {
+            return generated_stat(c, target, follow);
+        }
+        Some(entry) => return Some((crate::devices::stat(entry), device(c, path))),
+        None => {}
+    }
     if let Some(mountinfo) = crate::proc::mount_table(path) {
         let length = crate::proc::render(&c.files.fs.mounts(), mountinfo).len();
         return Some((crate::proc::stat(length), device(c, path)));

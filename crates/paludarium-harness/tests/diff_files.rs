@@ -53,6 +53,7 @@ cases!(close_range=>42);
 cases!(files_fallocate=>43,host_files_fallocate=>43);
 cases!(memfd=>44);
 cases!(proc_fd=>45,host_proc_fd=>45);
+cases!(dev_files=>46);
 cases!(null_stat=>0,null_lstat=>1,null_statat=>2,read_write=>3,files_hard_link=>4,files_symlink=>5,files_rename=>6,files_flock=>7,fstat_errors=>8,unlink_open=>9,dup_offset=>10,open_errors=>11,files_directory=>12,getdents=>13,at_operations=>14,symlinkat=>15,statat_flags=>16,files_truncate=>17,fcntl=>18,files_dangling=>19,empty_path=>20,create_dangling=>21,renamed_dirfd=>22,closed_stdio=>23,redirect_stdout=>24,dup_stdout=>25,flock_dup_close=>26,append_fcntl=>27,huge_invalid_buffer=>28,directory_link_count=>29,rename_replace=>30,files_readonly_create=>31);
 
 use paludarium_host::{ClockId, Host, WaitOutcome, testing::RecordingHost};

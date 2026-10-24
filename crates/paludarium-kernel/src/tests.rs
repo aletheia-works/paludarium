@@ -878,6 +878,36 @@ fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
     assert_eq!(f.ret(2, &[name + 0x100, 0]), errno(Errno(6)));
 }
 #[test]
+fn dev_reports_its_devices_and_lists_them() {
+    let mut f = fixture();
+    let (name, out) = (DATA, DATA + 0x100);
+    f.mem.write(GuestAddr(name), b"/dev/urandom\0").unwrap();
+    assert_eq!(f.ret(332, &[(-100i64) as u64, name, 0, 0x7ff, out]), 0);
+    let word = |f: &Fixture, at: u64| f.mem.read_u64(GuestAddr(out + at)).unwrap();
+    assert_eq!(word(&f, 128), 9 << 32 | 1); // stx_rdev_major 1, minor 9
+    f.mem.write(GuestAddr(name), b"/dev\0").unwrap();
+    let dir = f.ret(2, &[name, 0o200000]);
+    let n = f.ret(217, &[dir, out, 0x1000]);
+    let mut b = vec![0; usize::try_from(n).unwrap()];
+    f.mem.read(GuestAddr(out), &mut b).unwrap();
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < b.len() {
+        let size = usize::from(u16::from_le_bytes([b[at + 16], b[at + 17]]));
+        let end = b[at + 19..].iter().position(|&c| c == 0).unwrap();
+        names.push(String::from_utf8(b[at + 19..at + 19 + end].to_vec()).unwrap());
+        at += size;
+    }
+    assert_eq!(
+        names,
+        [
+            ".", "..", "fd", "full", "null", "random", "stderr", "stdin", "stdout", "urandom",
+            "zero"
+        ]
+    );
+    assert_eq!(f.ret(217, &[dir, out, 0x1000]), 0); // the end
+}
+#[test]
 fn file_size_limit_is_enforced_as_linux_does() {
     let mut f = fixture();
     let (limit, buf, pair) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);

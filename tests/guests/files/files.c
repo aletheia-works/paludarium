@@ -110,6 +110,16 @@ void _start(void) {
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
   results[x++]=SX(p,0,0);S(87,q,0,0);}
+ if(CASE==42){ /* close_range(first, last, flags): 4..7 are copies of fd 3 */
+  #define CR(f,l,fl) call(436,f,l,fl,0,0,0)
+  #define OPEN(n) (S(72,n,1,0)>=0)
+  S(32,fd,0,0);S(32,fd,0,0);S(32,fd,0,0);S(32,fd,0,0);
+  results[x++]=CR(5,6,0);results[x++]=OPEN(5);results[x++]=OPEN(6);results[x++]=OPEN(7);results[x++]=S(72,5,1,0);
+  results[x++]=CR(4,5,4);results[x++]=S(72,4,1,0);results[x++]=S(72,fd,1,0);
+  results[x++]=CR(6,5,0);results[x++]=CR(4,4,1);results[x++]=CR(4,4,8);results[x++]=OPEN(4);
+  results[x++]=CR(100,~0u,0);results[x++]=CR(7,~0u,2);results[x++]=OPEN(7);results[x++]=OPEN(4);
+  results[x++]=CR(0x100000004L,4,0);results[x++]=OPEN(4);results[x++]=S(32,fd,0,0);
+  results[x++]=CR(4,4,6);results[x++]=S(72,4,1,0);S(3,4,0,0);}
  S(3,fd,0,0);S(87,p,0,0);S(87,q,0,0);S(87,r,0,0);
  }
  S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);

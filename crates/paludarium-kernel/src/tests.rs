@@ -727,6 +727,27 @@ fn statx_fills_the_stat_fields() {
     assert_eq!(f.ret(332, &[fd, 0, 0x1000, 0x7ff, 1]), errno(Errno::EFAULT));
 }
 #[test]
+fn close_range_marks_closes_and_unshares_the_table() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    let (a, b) = (f.ret(32, &[fd]), f.ret(32, &[fd]));
+    // A CLONE_FILES sibling, which sees every change to a shared table.
+    let sibling = f.kernel.files.for_clone(true, false);
+    assert_eq!(f.ret(436, &[b, b, 4]), 0); // CLOSE_RANGE_CLOEXEC
+    assert_eq!((f.ret(72, &[b, 1]), f.ret(72, &[a, 1])), (1, 0)); // F_GETFD
+    // CLOSE_RANGE_UNSHARE: the copy loses `a`, the sibling's table keeps it,
+    // and later changes no longer reach the sibling.
+    assert_eq!(f.ret(436, &[a, a, 2]), 0);
+    assert!(f.kernel.files.descriptor(a).is_err());
+    assert!(sibling.descriptor(a).is_ok());
+    assert_eq!(f.ret(436, &[fd, u64::from(u32::MAX), 0]), 0);
+    assert!(f.kernel.files.descriptor(b).is_err());
+    assert!(sibling.descriptor(fd).is_ok() && sibling.descriptor(b).is_ok());
+    assert_eq!(f.ret(436, &[1, 0, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(436, &[0, 1, 1]), errno(Errno::EINVAL));
+}
+#[test]
 fn file_size_limit_is_enforced_as_linux_does() {
     let mut f = fixture();
     let (limit, buf, pair) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);

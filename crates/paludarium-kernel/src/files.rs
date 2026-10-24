@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
     82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264,
-    265, 266, 267, 268, 269, 280, 292, 293, 295, 296, 326, 332, 439,
+    265, 266, 267, 268, 269, 280, 292, 293, 295, 296, 326, 332, 436, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -563,6 +563,35 @@ fn copy_bytes(
     }
     Ok(done)
 }
+/// `close_range(first, last, flags)`, as Linux's ksys_close_range: the
+/// arguments are `unsigned int`s, numbers with no open descriptor are skipped,
+/// `CLOSE_RANGE_CLOEXEC` marks instead of closing, and `CLOSE_RANGE_UNSHARE`
+/// first gives this thread its own copy of a shared table.
+fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    const CLOSE_RANGE_UNSHARE: u32 = 2;
+    const CLOSE_RANGE_CLOEXEC: u32 = 4;
+    let (first, last, flags) = (a[0] as u32, a[1] as u32, a[2] as u32);
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
+        return Err(Errno::EINVAL);
+    }
+    if flags & CLOSE_RANGE_UNSHARE != 0 {
+        *c.files = c.files.for_clone(false, true);
+    }
+    let mut fds = c.files.fds.lock().unwrap_or_else(PoisonError::into_inner);
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        for descriptor in fds.range_mut(first..=last).map(|(_, d)| d) {
+            descriptor.cloexec = true;
+        }
+        return Ok(0);
+    }
+    let closed = fds
+        .extract_if(first..=last, |_, _| true)
+        .collect::<Vec<_>>();
+    // The closed files are released only after the table is unlocked.
+    drop(fds);
+    drop(closed);
+    Ok(0)
+}
 /// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`, with the
 /// checks of Linux's generic_copy_file_checks and rw_verify_area in order.
 fn copy_file_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
@@ -988,6 +1017,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         40 => sendfile(c, a),
         332 => statx(c, a),
         326 => copy_file_range(c, a),
+        436 => close_range(c, a),
         // pread64, pwrite64, preadv, pwritev: at an offset, leaving the file
         // position. On x86-64 the offset of preadv and pwritev is a[3] alone.
         17 => {

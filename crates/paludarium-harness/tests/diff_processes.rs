@@ -114,6 +114,7 @@ mod linux {
         processes_fsize_limit => ("fsize-limit","process"),
         processes_pgid => ("pgid","process"),
         processes_session => ("session","process"),
+        processes_pgid_exec => ("pgid-exec","process"),
         processes_sysinfo => ("sysinfo","process"),
         processes_statfs => ("statfs","process"),
         processes_posix_timer => ("posix-timer","process"),

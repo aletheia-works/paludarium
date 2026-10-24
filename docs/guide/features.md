@@ -181,7 +181,9 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   PID namespace. `setsid` fails with `EPERM` in a process whose PID names a
   group, and makes any other process the leader of a new session and group.
   `setpgid` checks the session as Linux does: a session leader, a child in
-  another session and a group in another session give `EPERM`.
+  another session and a group in another session give `EPERM`, and a child
+  that has run `execve` gives `EACCES`. A group exists while any member is
+  left, an exited child not yet reaped included.
 - `waitid` follows Linux's checks and copy-out: its siginfo fields are zero
   when no child is reported, even on an error, and an exited child cannot be
   waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). A stop and a

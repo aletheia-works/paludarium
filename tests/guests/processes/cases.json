@@ -17,6 +17,7 @@
     {"name":"fsize-limit","binary":"process"},
     {"name":"pgid","binary":"process"},
     {"name":"session","binary":"process"},
+    {"name":"pgid-exec","binary":"process"},
     {"name":"sysinfo","binary":"process"},
     {"name":"statfs","binary":"process"},
     {"name":"posix-timer","binary":"process"},

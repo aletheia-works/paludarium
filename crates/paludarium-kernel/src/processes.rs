@@ -23,6 +23,9 @@ struct Entry {
     /// outside the emulator, so its ID reads as 0, as a PID namespace reports
     /// an ID it cannot see; a session leader is the process whose PID it is.
     sid: u32,
+    /// Whether the process has run `execve` since its fork (Linux clears
+    /// PF_FORKNOEXEC then); its parent can no longer change its group.
+    executed: bool,
     /// Resource limits (soft, hard), inherited on fork and kept across exec.
     /// They are recorded and reported; RLIMIT_FSIZE and RLIMIT_NOFILE are
     /// enforced, through the copy of their soft limits in the thread group.
@@ -81,6 +84,7 @@ impl Processes {
                     status: None,
                     pgid: 1,
                     sid: 0,
+                    executed: false,
                     limits: DEFAULT_LIMITS,
                     death_signal: 0,
                     dumpable: true,
@@ -114,6 +118,7 @@ impl Processes {
                 status: None,
                 pgid,
                 sid,
+                executed: false,
                 limits,
                 death_signal: 0,
                 dumpable,
@@ -177,8 +182,9 @@ impl Processes {
         Ok(caller)
     }
     /// `setpgid` from `caller`, in Linux's order: the target is the caller or
-    /// one of its children in the caller's session, and not a session leader;
-    /// a new group either is the target's own or exists in that session.
+    /// one of its children in the caller's session that has not run `execve`
+    /// (EACCES), and not a session leader; a new group either is the target's
+    /// own or exists in that session, where an unreaped zombie still counts.
     fn set_pgid(&self, caller: u32, pid: u32, pgid: u32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let session = entries.get(&caller).ok_or(Errno(3))?.sid;
@@ -186,20 +192,30 @@ impl Processes {
         if pid != caller && target.parent != caller {
             return Err(Errno(3)); // ESRCH
         }
-        if target.sid != session || target.sid == pid {
+        if pid != caller {
+            if target.sid != session {
+                return Err(Errno::EPERM);
+            }
+            if target.executed {
+                return Err(Errno::EACCES);
+            }
+        }
+        if target.sid == pid {
             return Err(Errno::EPERM);
         }
-        if pgid != pid
-            && !entries
-                .values()
-                .any(|e| e.status.is_none() && e.pgid == pgid && e.sid == session)
-        {
+        if pgid != pid && !entries.values().any(|e| e.pgid == pgid && e.sid == session) {
             return Err(Errno::EPERM);
         }
         if let Some(entry) = entries.get_mut(&pid) {
             entry.pgid = pgid;
         }
         Ok(())
+    }
+    pub(crate) fn mark_executed(&self, pid: u32) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = entries.get_mut(&pid) {
+            entry.executed = true;
+        }
     }
     /// `prlimit64`: returns the old limit, after setting `new` if given.
     fn limit(
@@ -1103,6 +1119,7 @@ impl Kernel {
             ..ThreadState::default()
         };
         thread.state.name_after(&path);
+        self.processes.mark_executed(self.process.pid);
         self.exec_memory = Some(Arc::new(memory));
         self.release_vfork();
         Ok(())

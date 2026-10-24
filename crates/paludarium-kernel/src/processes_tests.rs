@@ -602,6 +602,33 @@ fn exec_setup() -> (Kernel, Thread, AddressSpace) {
 mod exec {
     use super::*;
     #[test]
+    fn executed_child_keeps_its_group_and_zombies_hold_theirs() {
+        let (mut k, mut t, m) = exec_setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let child = u64::from(ct.tid);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 109, [child, child, 0, 0, 0, 0]),
+            Errno::EACCES.to_syscall_return()
+        );
+        // The exec'd process can still change its own group.
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 109, [0; 6]), 0);
+        // A group whose only member has exited, unreaped, can be joined.
+        let (mut z, zt, zm) = fork(&mut k, &mut t, &m);
+        let zombie = u64::from(zt.tid);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 109, [zombie, zombie, 0, 0, 0, 0]),
+            0
+        );
+        finish(&mut z, &zt, &zm, ExitStatus::Exited(0));
+        let (_, mt, _) = fork(&mut k, &mut t, &m);
+        let member = u64::from(mt.tid);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 109, [member, zombie, 0, 0, 0, 0]),
+            0
+        );
+    }
+    #[test]
     fn argv_env_loaded() {
         let (mut k, mut t, m) = exec_setup();
         m.write(GuestAddr(DATA + 32), b"arg\0K=V\0").unwrap();

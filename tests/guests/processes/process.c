@@ -279,6 +279,12 @@ int main(int argc, char **argv) {
         result("env", getenv("PROCESSES_VALUE") && !strcmp(getenv("PROCESSES_VALUE"), "value"));
         return 7;
     }
+    if (!strcmp(mode, "exec-wait")) {
+        /* After the exec: says so on argv[3], then waits on argv[4]. */
+        char byte = 'x';
+        if (argc != 5 || write(atoi(argv[3]), &byte, 1) != 1) return 1;
+        return read(atoi(argv[4]), &byte, 1) == 1 ? 0 : 2;
+    }
     if (!strcmp(mode, "fd-child")) {
         errno = 0;
         result("cloexec", fcntl(9, F_GETFD) == -1 && errno == EBADF);
@@ -554,6 +560,54 @@ int main(int argc, char **argv) {
         errno = 0;
         result("getpgid-missing", getpgid(0x3fffffff));
         result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "pgid-exec")) {
+        /* A child that has run execve keeps its group (EACCES). */
+        int ready[2], go[2];
+        if (pipe(ready) || pipe(go)) return 81;
+        char byte, ready_fd[16], go_fd[16];
+        snprintf(ready_fd, sizeof ready_fd, "%d", ready[1]);
+        snprintf(go_fd, sizeof go_fd, "%d", go[0]);
+        fflush(stdout);
+        pid_t pid = child();
+        if (pid == 0) {
+            char *args[] = { "process", "exec-wait", (char *)self, ready_fd, go_fd, NULL };
+            char *env[] = { NULL };
+            execve(self, args, env);
+            _exit(92);
+        }
+        if (read(ready[0], &byte, 1) != 1) return 82;
+        errno = 0;
+        result("executed-own", setpgid(pid, pid));
+        result("errno", errno);
+        errno = 0;
+        result("executed-same", setpgid(pid, getpgrp()));
+        result("errno", errno);
+        if (write(go[1], "x", 1) != 1) return 83;
+        finish(pid);
+        /* An exited child not yet reaped still holds its group. */
+        pid_t zombie = child();
+        if (zombie == 0) _exit(0);
+        result("zombie-own", setpgid(zombie, zombie));
+        siginfo_t info;
+        result("exited", waitid(P_PID, zombie, &info, WEXITED | WNOWAIT) == 0 && info.si_pid == zombie);
+        int release[2];
+        if (pipe(release)) return 84;
+        pid_t member = child();
+        if (member == 0) {
+            if (read(release[0], &byte, 1) != 1) _exit(1);
+            _exit(0);
+        }
+        result("zombie-group", setpgid(member, zombie));
+        result("joined", getpgid(member) == zombie);
+        result("back", setpgid(member, getpgrp()));
+        finish(zombie);
+        errno = 0;
+        result("reaped-group", setpgid(member, zombie));
+        result("errno", errno);
+        if (write(release[1], "x", 1) != 1) return 85;
+        finish(member);
         return 0;
     }
     if (!strcmp(mode, "session")) {

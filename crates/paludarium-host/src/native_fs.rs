@@ -970,6 +970,25 @@ mod files_tests {
             );
         }
     }
+    #[test]
+    fn zero_range_writes_in_place_and_keeps_the_position() {
+        let x = Fixture::new();
+        let f = x.fs().open(b"a", 66, 0o600).unwrap();
+        assert_eq!(f.write(b"abcdef"), Ok(6));
+        assert_eq!(f.zero_range(1, 2), Ok(()));
+        assert_eq!(f.zero_range(5, 100), Ok(())); // cut at the end
+        assert_eq!(f.zero_range(9, 1), Ok(())); // past the end: nothing
+        assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"a\0\0de\0");
+        assert_eq!((f.seek(0, 1), f.stat().unwrap().size), (Ok(6), 6));
+        let read_only = x.fs().open(b"a", 0, 0).unwrap();
+        assert_eq!(read_only.zero_range(0, 1), Err(Errno::EBADF));
+        // A host that cannot turn O_APPEND off for the writes refuses.
+        #[cfg(not(unix))]
+        assert_eq!(
+            x.fs().open(b"a", 1025, 0).unwrap().zero_range(0, 1),
+            Err(Errno(95))
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn zero_range_writes_in_place_even_when_appending() {

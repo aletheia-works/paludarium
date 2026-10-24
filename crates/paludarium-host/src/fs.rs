@@ -80,6 +80,13 @@ pub trait FileHandle: Send + Sync {
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Errno> {
         Err(Errno::ENODEV)
     }
+    /// Sets the bytes from `offset` to `offset + len` that are inside the
+    /// file to zero, at those offsets even in an `O_APPEND` file, and keeps
+    /// the size: `fallocate`'s `FALLOC_FL_PUNCH_HOLE` as a file without
+    /// holes shows it. Kinds without it give `EOPNOTSUPP`.
+    fn zero_range(&self, _offset: u64, _len: u64) -> Result<(), Errno> {
+        Err(Errno(95))
+    }
 }
 pub trait HostFs: Send + Sync {
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;

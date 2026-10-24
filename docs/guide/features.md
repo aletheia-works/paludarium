@@ -37,7 +37,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, the `stat` family and `statx`, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Files | `open`/`openat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, the `stat` family and `statx`, `getdents64`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `truncate`, `fallocate`, `flock`, `fcntl`, the `dup` family, `pipe`/`pipe2`, `chdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `shutdown` |
@@ -56,6 +56,13 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   mount's `st_dev` as its device numbers, with Linux's flag and mask checks
   (`EINVAL`). `AT_EMPTY_PATH` names the descriptor, or the working directory
   for `AT_FDCWD`, and as since Linux 6.11 a null path with it does too.
+- `fallocate` checks its arguments as Linux's `vfs_fallocate` does, in
+  order (`EINVAL`, `EOPNOTSUPP`, `EBADF`, then `ESPIPE`, `EISDIR` or
+  `ENODEV` for a file that is not regular, and `EFBIG`). Files then behave
+  as on tmpfs: plain allocation grows the file unless `FALLOC_FL_KEEP_SIZE`
+  is given, `FALLOC_FL_PUNCH_HOLE` sets the range to zeros (also in an
+  `O_APPEND` file), and the other modes give `EOPNOTSUPP`. Growing past
+  `RLIMIT_FSIZE` raises `SIGXFSZ` and fails with `EFBIG`.
 - `close_range` closes the open descriptors from `first` to `last`, or with
   `CLOSE_RANGE_CLOEXEC` marks them close-on-exec. `CLOSE_RANGE_UNSHARE` first
   gives the thread its own copy of a table it shares with `CLONE_FILES`
@@ -172,8 +179,8 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   - `RLIMIT_FSIZE`: a write to a regular file (`write`, `writev`, `pwrite` and
     `pwritev`, which with `O_APPEND` start at the end, and `copy_file_range`
     and `sendfile`) stops at the soft limit; one that
-    starts at or past it, and a `truncate`/`ftruncate` that grows the file
-    past it, raise `SIGXFSZ` and fail with `EFBIG`.
+    starts at or past it, and a `truncate`/`ftruncate` or `fallocate` that
+    grows the file past it, raise `SIGXFSZ` and fail with `EFBIG`.
 
   Process groups and sessions are kept the same way, and `wait4` and
   `waitid` can wait for a group. The first process's session started outside

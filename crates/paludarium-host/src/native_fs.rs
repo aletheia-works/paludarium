@@ -286,6 +286,57 @@ impl FileHandle for NativeFile {
             .map_err(err)?;
         stat(metadata)
     }
+    fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        if self.flags() & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        let end = offset
+            .saturating_add(len)
+            .min(file.metadata().map_err(err)?.len());
+        if offset >= end {
+            return Ok(());
+        }
+        // An append-mode file writes at its end, so append is off for these
+        // writes, under the same lock; a host that cannot turn it off refuses.
+        #[cfg(unix)]
+        let flags = rustix::fs::fcntl_getfl(&*file).map_err(|e| err(e.into()))?;
+        #[cfg(unix)]
+        if flags.contains(rustix::fs::OFlags::APPEND) {
+            rustix::fs::fcntl_setfl(&*file, flags - rustix::fs::OFlags::APPEND)
+                .map_err(|e| err(e.into()))?;
+        }
+        #[cfg(not(unix))]
+        if self.flags() & 1024 != 0 {
+            return Err(Errno(95));
+        }
+        let position = file.stream_position().map_err(err)?;
+        let zeros = vec![
+            0;
+            usize::try_from(end - offset)
+                .unwrap_or(1 << 20)
+                .min(1 << 20)
+        ];
+        let mut written = file
+            .seek(SeekFrom::Start(offset))
+            .map_err(err)
+            .map(|_| offset);
+        while let Ok(at) = written
+            && at < end
+        {
+            let piece = usize::try_from(end - at)
+                .unwrap_or(zeros.len())
+                .min(zeros.len());
+            written = file
+                .write_all(&zeros[..piece])
+                .map_err(err)
+                .map(|()| at + piece as u64);
+        }
+        let restored = file.seek(SeekFrom::Start(position)).map_err(err);
+        #[cfg(unix)]
+        rustix::fs::fcntl_setfl(&*file, flags).map_err(|e| err(e.into()))?;
+        written.and(restored).map(|_| ())
+    }
     fn truncate(&self, n: u64) -> Result<(), Errno> {
         self.file
             .lock()
@@ -910,6 +961,23 @@ mod files_tests {
                 -i128::from(ns)
             );
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn zero_range_writes_in_place_even_when_appending() {
+        let x = Fixture::new();
+        let f = x.fs().open(b"a", 66, 0o600).unwrap();
+        assert_eq!(f.write(b"abcdef"), Ok(6));
+        let appending = x.fs().open(b"a", 1025, 0).unwrap();
+        assert_eq!(appending.zero_range(1, 2), Ok(()));
+        assert_eq!(appending.zero_range(5, 100), Ok(())); // cut at the end
+        assert_eq!(appending.zero_range(9, 1), Ok(()));
+        assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"a\0\0de\0");
+        // The handle still appends afterwards.
+        assert_eq!(appending.write(b"!"), Ok(1));
+        assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"a\0\0de\0!");
+        let read_only = x.fs().open(b"a", 0, 0).unwrap();
+        assert_eq!(read_only.zero_range(0, 1), Err(Errno::EBADF));
     }
     #[test]
     fn native_links() {

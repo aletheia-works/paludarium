@@ -748,6 +748,37 @@ fn close_range_marks_closes_and_unshares_the_table() {
     assert_eq!(f.ret(436, &[0, 1, 1]), errno(Errno::EINVAL));
 }
 #[test]
+fn fallocate_grows_punches_and_keeps_the_size_limit() {
+    let mut f = fixture();
+    let (limit, buf) = (DATA + 0x100, DATA + 0x200);
+    f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+    f.mem.write(GuestAddr(buf), b"abcdef").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(1, &[fd, buf, 6]), 6);
+    let size = |f: &mut Fixture| f.ret(8, &[fd, 0, 2]);
+    assert_eq!(f.ret(285, &[fd, 0, 4, 8]), 0);
+    assert_eq!(size(&mut f), 12);
+    assert_eq!(f.ret(285, &[fd, 3, 1, 2]), 0); // PUNCH_HOLE | KEEP_SIZE
+    assert_eq!(f.ret(17, &[fd, buf, 6, 0]), 6);
+    assert_eq!(
+        f.mem.read_u64(GuestAddr(buf)).unwrap() & 0xffff_ffff_ffff,
+        0x6665_6400_0061
+    );
+    // A mode that tmpfs does not have.
+    assert_eq!(f.ret(285, &[fd, 0x10, 0, 1]), errno(Errno(95)));
+    // RLIMIT_FSIZE: growing past it raises SIGXFSZ; KEEP_SIZE does not grow.
+    f.mem.write_u64(GuestAddr(limit), 16).unwrap();
+    f.mem.write_u64(GuestAddr(limit + 8), u64::MAX).unwrap();
+    assert_eq!(f.ret(160, &[1, limit]), 0);
+    f.mem.write_u64(GuestAddr(limit), 1 << 24).unwrap();
+    assert_eq!(f.ret(14, &[0, limit, 0, 8]), 0); // block SIGXFSZ
+    assert_eq!(f.ret(285, &[fd, 1, 0, 100]), 0);
+    assert!(!f.thread.state.pending.iter().any(|s| s.number == 25));
+    assert_eq!(f.ret(285, &[fd, 0, 10, 7]), errno(Errno(27)));
+    assert!(f.thread.state.pending.iter().any(|s| s.number == 25));
+    assert_eq!(size(&mut f), 12);
+}
+#[test]
 fn file_size_limit_is_enforced_as_linux_does() {
     let mut f = fixture();
     let (limit, buf, pair) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);

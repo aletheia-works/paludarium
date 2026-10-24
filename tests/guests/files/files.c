@@ -5,7 +5,7 @@ static long call(long n,long a,long b,long c,long d,long e,long f) {
 }
 #define S(n,a,b,c) call(n,(long)(a),(long)(b),(long)(c),0,0,0)
 static char p[]="/tmp/paludarium-files-fixture",q[]="/tmp/paludarium-files-link",r[]="/tmp/paludarium-files-renamed";
-static char buf[4096]; static long results[32]; static unsigned char st[144];
+static char buf[4096]; static long results[48]; static unsigned char st[144];
 void _start(void) {
  long fd,x=0;
  if(CASE==0) results[x++]=S(4,0,st,0);
@@ -110,6 +110,22 @@ void _start(void) {
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
   results[x++]=SX(p,0,0);S(87,q,0,0);}
+ if(CASE==43){ /* fallocate(fd, mode, offset, len): the modes tmpfs and ext4 share */
+  #define FA(f,m,o,l) call(285,f,m,o,l,0,0)
+  #define SIZE() (S(5,fd,st,0),*(long*)(st+48))
+  #define BYTES() (call(17,fd,(long)buf,10,0,0,0)==10?buf[0]+buf[1]*3+buf[2]*5+buf[3]*7+buf[4]*11+buf[5]*13+buf[9]*17:-1)
+  int pf[2];S(22,pf,0,0);int sv[2];call(53,1,1,0,(long)sv,0,0);
+  long ro=S(2,p,0,0),ap=S(2,p,1025,0),d=S(2,"/tmp",65536,0);
+  S(1,fd,"abcdef",6);
+  results[x++]=FA(fd,0,0,10);results[x++]=SIZE();results[x++]=BYTES();
+  results[x++]=FA(fd,1,0,100);results[x++]=SIZE();results[x++]=FA(fd,0,2,3);results[x++]=SIZE();
+  results[x++]=FA(fd,3,1,2);results[x++]=BYTES();results[x++]=SIZE();
+  results[x++]=FA(fd,3,8,100);results[x++]=SIZE();results[x++]=FA(ap,3,3,1);results[x++]=BYTES();results[x++]=SIZE();
+  results[x++]=FA(fd,2,0,1);results[x++]=FA(fd,0x100,0,1);results[x++]=FA(fd,4,0,1);results[x++]=FA(fd,9,0,1);results[x++]=FA(fd,0x21,0,1);
+  results[x++]=FA(fd,0,-1,1);results[x++]=FA(fd,0,0,0);results[x++]=FA(fd,0,0,-1);results[x++]=FA(99,0,0,1);results[x++]=FA(99,0,-1,1);
+  results[x++]=FA(ro,0,0,1);results[x++]=FA(ro,0x100,0,1);results[x++]=FA(pf[1],0,0,1);results[x++]=FA(pf[0],0,0,1);results[x++]=FA(d,0,0,1);results[x++]=FA(sv[0],0,0,1);
+  results[x++]=FA(fd,0,0x7fffffffffffffffL,1);results[x++]=FA(fd,1,1,0x7fffffffffffffffL);results[x++]=SIZE();
+  S(3,ro,0,0);S(3,ap,0,0);S(3,d,0,0);S(3,pf[0],0,0);S(3,pf[1],0,0);S(3,sv[0],0,0);S(3,sv[1],0,0);}
  if(CASE==42){ /* close_range(first, last, flags): 4..7 are copies of fd 3 */
   #define CR(f,l,fl) call(436,f,l,fl,0,0,0)
   #define OPEN(n) (S(72,n,1,0)>=0)

@@ -133,6 +133,21 @@ impl FileHandle for MemFile {
     fn stat(&self) -> Result<FileStat, Errno> {
         Ok(lock(&self.node).stat(self.inode))
     }
+    fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        if lock(&self.state).1 & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        let mut n = lock(&self.node);
+        let modified = (n.clock)()?;
+        let Kind::File(data) = &mut n.kind else {
+            return Err(Errno::EISDIR);
+        };
+        let at = |value: u64| usize::try_from(value).unwrap_or(usize::MAX).min(data.len());
+        let (start, end) = (at(offset), at(offset.saturating_add(len)));
+        data[start..end].fill(0);
+        n.mtime_ns = i128::from(modified);
+        Ok(())
+    }
     fn truncate(&self, size: u64) -> Result<(), Errno> {
         if self.flags() & 3 == 0 {
             return Err(Errno::EINVAL);

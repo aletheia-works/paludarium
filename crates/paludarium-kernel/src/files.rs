@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
     82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264,
-    265, 266, 267, 268, 269, 280, 292, 293, 295, 296, 326, 332, 436, 439,
+    265, 266, 267, 268, 269, 280, 285, 292, 293, 295, 296, 326, 332, 436, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -563,6 +563,60 @@ fn copy_bytes(
     }
     Ok(done)
 }
+/// `fallocate(fd, mode, offset, len)`, with the checks of Linux's
+/// vfs_fallocate in order. Files behave as on tmpfs: plain allocation (which
+/// may grow the file), `FALLOC_FL_KEEP_SIZE` and `FALLOC_FL_PUNCH_HOLE` work,
+/// and the other modes give `EOPNOTSUPP`.
+fn fallocate(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    const KEEP_SIZE: u32 = 0x01;
+    const PUNCH_HOLE: u32 = 0x02;
+    // PUNCH_HOLE, COLLAPSE_RANGE, ZERO_RANGE, INSERT_RANGE, UNSHARE_RANGE
+    // and WRITE_ZEROES; plain allocation is no bit.
+    const MODE_MASK: u32 = 0xfa;
+    const EOPNOTSUPP: Errno = Errno(95);
+    let d = c.files.descriptor(a[0])?;
+    let (mode, offset, len) = (a[1] as u32, a[2] as i64, a[3] as i64);
+    if offset < 0 || len <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    if mode & !(MODE_MASK | KEEP_SIZE) != 0 {
+        return Err(EOPNOTSUPP);
+    }
+    match mode & MODE_MASK {
+        // Allocation, UNSHARE_RANGE and ZERO_RANGE take KEEP_SIZE or not.
+        0 | 0x40 | 0x10 => {}
+        PUNCH_HOLE if mode & KEEP_SIZE != 0 => {}
+        // COLLAPSE_RANGE, INSERT_RANGE and WRITE_ZEROES do not take it.
+        0x08 | 0x20 | 0x80 if mode & KEEP_SIZE == 0 => {}
+        _ => return Err(EOPNOTSUPP),
+    }
+    if d.file.flags() & 3 == 0 {
+        return Err(Errno::EBADF);
+    }
+    let stat = d.file.stat()?;
+    match stat.mode & 0o170000 {
+        0o010000 => return Err(Errno::ESPIPE),
+        DIRECTORY => return Err(Errno::EISDIR),
+        REGULAR => {}
+        _ => return Err(Errno(19)), // ENODEV
+    }
+    let end = offset.checked_add(len).ok_or(Errno(27))? as u64; // EFBIG
+    match mode & MODE_MASK {
+        0 if mode & KEEP_SIZE == 0 && end > stat.size => {
+            // Growing past RLIMIT_FSIZE raises SIGXFSZ (inode_newsize_ok).
+            if end > c.group.fsize() {
+                crate::signals::queue(c.process, crate::signals::PendingSignal::user(25, 0));
+                return Err(Errno(27));
+            }
+            d.file.truncate(end)?;
+        }
+        // Nothing to show: every byte of a file is already allocated.
+        0 => {}
+        PUNCH_HOLE => d.file.zero_range(offset as u64, len as u64)?,
+        _ => return Err(EOPNOTSUPP),
+    }
+    Ok(0)
+}
 /// `close_range(first, last, flags)`, as Linux's ksys_close_range: the
 /// arguments are `unsigned int`s, numbers with no open descriptor are skipped,
 /// `CLOSE_RANGE_CLOEXEC` marks instead of closing, and `CLOSE_RANGE_UNSHARE`
@@ -1018,6 +1072,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         332 => statx(c, a),
         326 => copy_file_range(c, a),
         436 => close_range(c, a),
+        285 => fallocate(c, a),
         // pread64, pwrite64, preadv, pwritev: at an offset, leaving the file
         // position. On x86-64 the offset of preadv and pwritev is a[3] alone.
         17 => {

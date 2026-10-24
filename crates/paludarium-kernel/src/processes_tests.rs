@@ -202,6 +202,23 @@ mod process {
         assert_eq!(handler(&mut k, &mut t, &m, 10, None), 0x5678);
     }
     #[test]
+    fn clone_ignores_the_high_flag_bits() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(handler(&mut k, &mut t, &m, 10, Some(0x1234)), 0);
+        // Bit 33 is no clone flag, and bit 32 (CLONE_CLEAR_SIGHAND) only
+        // exists for clone3.
+        for flags in [1 << 33 | 17, 1 << 32 | 17] {
+            let pid = syscall(&mut k, &mut t, &m, 56, [flags, 0, 0, 0, 0, 0]);
+            let (mut c, mut ct) = k.take_child().unwrap();
+            assert_eq!(pid, u64::from(ct.tid));
+            let cm = c.take_spawn_memory().unwrap();
+            assert_eq!(handler(&mut c, &mut ct, &cm, 10, None), 0x1234);
+        }
+        // A thread too: CLONE_VM | CLONE_SIGHAND | CLONE_THREAD.
+        let tid = syscall(&mut k, &mut t, &m, 56, [1 << 40 | 0x10900, 0, 0, 0, 0, 0]);
+        assert!(tid < 1 << 32, "{tid:#x}");
+    }
+    #[test]
     fn exit_group_isolated() {
         let (mut k, mut t, m) = setup();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);

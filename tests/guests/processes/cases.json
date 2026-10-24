@@ -39,6 +39,7 @@
     {"name":"pre-exec-missing","binary":"command"},
     {"name":"clone-vm","binary":"process"},
     {"name":"clone-sighand","binary":"process"},
+    {"name":"clone-high-bits","binary":"process"},
     {"name":"wait-interrupt","binary":"process"},
     {"name":"wait-restart","binary":"process"},
     {"name":"private","binary":"process"},

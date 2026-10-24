@@ -140,7 +140,9 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a
   longer struct whose extra part is not zero) and then runs as the `clone` it
   describes; `CLONE_CLEAR_SIGHAND` resets handled signals to their default.
-  `set_tid` and `CLONE_INTO_CGROUP` give `EINVAL`.
+  `set_tid` and `CLONE_INTO_CGROUP` give `EINVAL`. `clone` itself reads only
+  the low 32 bits of its flags, as in Linux, so `CLONE_CLEAR_SIGHAND` is
+  `clone3`'s alone.
 - `prctl` supports `PR_SET_NAME`/`PR_GET_NAME` (a name of up to 15 bytes per
   thread, taken from the program's file name at `execve` and inherited by new
   threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the

@@ -543,6 +543,11 @@ impl Kernel {
             thread.cpu.gpr[reg::R9],
         ];
         thread.state.restart = signals::restarts_without_handler(number, &args).then_some(number);
+        // clone reads only the low 32 bits of its flags, as Linux's sys_clone
+        // does (lower_32_bits); clone3's wider flags reach the code below.
+        if number == 56 {
+            args[0] &= 0xffff_ffff;
+        }
         // clone3 runs as the clone it describes.
         if number == 435 {
             match processes::clone3_args(mem, args[0], args[1]) {

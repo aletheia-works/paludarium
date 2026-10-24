@@ -143,6 +143,7 @@ mod linux {
         exec_thread => ("exec-thread","process"),
         clone_vm => ("clone-vm","process"),
         clone_sighand => ("clone-sighand","process"),
+        clone_high_bits => ("clone-high-bits","process"),
         wait_interrupt => ("wait-interrupt","process"),
         wait_restart => ("wait-restart","process"),
         processes_enoent => ("enoent","process"),

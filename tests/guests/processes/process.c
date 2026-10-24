@@ -226,6 +226,23 @@ int main(int argc, char **argv) {
         result("unshared", old.sa_handler == SIG_IGN);
         return 0;
     }
+    if (!strcmp(mode, "clone-high-bits")) {
+        /* clone reads only the low 32 bits of its flags: bit 33 is no flag,
+           and bit 32 (CLONE_CLEAR_SIGHAND) only exists for clone3. */
+        signal(SIGUSR1, interrupted);
+        const unsigned long long high[] = { 1ULL << 33, 1ULL << 32 };
+        for (int i = 0; i < 2; i++) {
+            errno = 0;
+            long pid = syscall(SYS_clone, high[i] | SIGCHLD, 0, 0, 0, 0);
+            if (pid == 0) {
+                struct sigaction old;
+                sigaction(SIGUSR1, NULL, &old);
+                _exit(old.sa_handler == interrupted ? 7 : 8);
+            }
+            result(i ? "bit32" : "bit33", pid < 0 ? -errno : reaped(pid));
+        }
+        return 0;
+    }
     if (!strcmp(mode, "sighand-exec-child")) {
         struct sigaction old;
         sigaction(SIGUSR1, NULL, &old);

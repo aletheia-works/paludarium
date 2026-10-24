@@ -128,7 +128,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が
   0 でない長い構造体には `E2BIG`）、それが表す `clone` として動きます。
   `CLONE_CLEAR_SIGHAND` は、ハンドラを設定したシグナルを既定に戻します。`set_tid` と
-  `CLONE_INTO_CGROUP` は `EINVAL` を返します。
+  `CLONE_INTO_CGROUP` は `EINVAL` を返します。`clone` そのものは、Linux と同じく flags の
+  下位 32 ビットだけを読むので、`CLONE_CLEAR_SIGHAND` は `clone3` でしか使えません。
 - `prctl` は `PR_SET_NAME`／`PR_GET_NAME`（スレッドごとの 15 バイトまでの名前。
   `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、
   `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、`PR_SET_DUMPABLE`、

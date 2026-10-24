@@ -20,6 +20,10 @@ pub struct ThreadGroup {
     retired: Mutex<BTreeSet<u32>>,
     stopped: std::sync::atomic::AtomicBool,
     members: Mutex<BTreeMap<u32, Arc<SignalInbox>>>,
+    /// Each thread's nice value, which Linux keeps per thread. The leader's
+    /// stays after it exits, as its zombie task does, until the process is
+    /// reaped.
+    nice: Mutex<BTreeMap<u32, i32>>,
     status: Mutex<Option<ExitStatus>>,
     /// The signal dispositions, which clone with `CLONE_SIGHAND` also shares
     /// with another process (Linux's `sighand_struct`).
@@ -44,6 +48,7 @@ impl Default for ThreadGroup {
             retired: Mutex::new(BTreeSet::new()),
             stopped: std::sync::atomic::AtomicBool::new(false),
             members: Mutex::new(BTreeMap::new()),
+            nice: Mutex::default(),
             status: Mutex::new(None),
             actions: Mutex::default(),
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
@@ -82,6 +87,15 @@ impl ThreadGroup {
         let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         members.remove(&old_tid);
         members.insert(pid, inbox);
+        // The thread that ran execve keeps its nice value as the leader.
+        let mut nice = self.nice.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(value) = nice.remove(&old_tid) {
+            nice.insert(pid, value);
+        }
+        // execve waited for the other threads to finish, which dropped their
+        // values, so only the PID's value is kept.
+        nice.retain(|&tid, _| tid == pid);
+        drop(nice);
         self.retired
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -266,12 +280,59 @@ impl ThreadGroup {
         }
         let new = members.insert(tid, inbox).is_none();
         drop(members);
+        self.nice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(tid)
+            .or_insert(0);
         if new {
             self.process_inbox
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .subscribe(&wake);
         }
+    }
+    /// The nice value of thread `tid`, if it has one (a live thread, or the
+    /// leader of an unreaped process).
+    pub(crate) fn nice(&self, tid: u32) -> Option<i32> {
+        self.nice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .copied()
+    }
+    pub(crate) fn set_nice(&self, tid: u32, value: i32) {
+        self.nice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, value);
+    }
+    /// `setpriority`'s change: only a thread that still has a value, so one
+    /// that exited since it was found is not given one again.
+    pub(crate) fn update_nice(&self, tid: u32, value: i32) {
+        if let Some(nice) = self
+            .nice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&tid)
+        {
+            *nice = value;
+        }
+    }
+    /// The nice values of every thread, for `PRIO_PGRP` and `PRIO_USER`.
+    pub(crate) fn nices(&self) -> Vec<(u32, i32)> {
+        self.nice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(&tid, &value)| (tid, value))
+            .collect()
+    }
+    fn forget_nice(&self, tid: u32) {
+        self.nice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tid);
     }
     pub(crate) fn has_member(&self, tid: u32) -> bool {
         self.members
@@ -407,6 +468,7 @@ impl Kernel {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
+        self.group.forget_nice(tid);
     }
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
         self.files.release_descriptors();
@@ -419,6 +481,9 @@ impl Kernel {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&thread.tid);
+        if thread.tid != self.process.pid {
+            self.group.forget_nice(thread.tid);
+        }
     }
     pub(crate) fn sync_actions(&mut self, thread: &mut Thread) {
         let actions = self.group.shared_actions();
@@ -617,6 +682,11 @@ impl Kernel {
             vfork_wait: None,
             unimplemented: self.unimplemented.clone(),
         };
+        // A new thread starts with its creator's nice value, set before it
+        // is registered so that no one sees it without one.
+        if let Some(value) = self.group.nice(parent.tid) {
+            self.group.set_nice(tid, value);
+        }
         self.group.register(tid, inbox);
         // Linux ignores unsuccessful parent/child TID stores (native case 23).
         if flags & 0x100000 != 0 {

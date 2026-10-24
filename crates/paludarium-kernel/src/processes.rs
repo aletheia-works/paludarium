@@ -211,6 +211,58 @@ impl Processes {
         }
         Ok(())
     }
+    /// The threads `getpriority` and `setpriority` act on, with their nice
+    /// values, as Linux finds them: for `PRIO_PROCESS` the thread `who` (0 is
+    /// `tid`, the caller), for `PRIO_PGRP` every thread of the group's
+    /// processes (0 is the caller's group), and for `PRIO_USER` every thread
+    /// of user `who` (0 is the caller's), where every process is root's. An
+    /// unreaped process still counts, by its leader.
+    fn priority_threads(
+        &self,
+        which: i32,
+        who: i32,
+        caller: u32,
+        tid: u32,
+    ) -> Result<Vec<(Arc<ThreadGroup>, u32, i32)>, Errno> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let all = |entry: &Entry| {
+            entry
+                .group
+                .nices()
+                .into_iter()
+                .map(|(tid, nice)| (Arc::clone(&entry.group), tid, nice))
+                .collect::<Vec<_>>()
+        };
+        Ok(match which {
+            0 => {
+                let tid = if who == 0 { tid } else { who as u32 };
+                entries
+                    .values()
+                    .filter(|_| who >= 0)
+                    .find_map(|e| {
+                        e.group
+                            .nice(tid)
+                            .map(|nice| (Arc::clone(&e.group), tid, nice))
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            1 => {
+                let pgid = match who {
+                    0 => entries.get(&caller).ok_or(Errno(3))?.pgid,
+                    who => who as u32,
+                };
+                entries
+                    .values()
+                    .filter(|e| who >= 0 && e.pgid == pgid)
+                    .flat_map(all)
+                    .collect()
+            }
+            2 if who == 0 => entries.values().flat_map(all).collect(),
+            2 => Vec::new(),
+            _ => return Err(Errno::EINVAL),
+        })
+    }
     pub(crate) fn mark_executed(&self, pid: u32) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(&pid) {
@@ -617,6 +669,9 @@ impl Kernel {
                 .target_pid(a[0])
                 .and_then(|pid| self.processes.sid(pid))
                 .map(u64::from),
+            // getpriority, setpriority
+            140 => self.getpriority(thread, a),
+            141 => self.setpriority(thread, a),
             // prlimit64, getrlimit, setrlimit
             302 => self.prlimit(mem, a[0], a[1], a[2], a[3]),
             97 => self.prlimit(mem, 0, a[0], 0, a[1]),
@@ -704,6 +759,39 @@ impl Kernel {
             None => Ok(0),
         }
     }
+    /// `getpriority(which, who)`: the highest priority among the threads,
+    /// as `20 - nice` (1 to 40), or ESRCH when there are none.
+    fn getpriority(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
+        let threads = self.processes.priority_threads(
+            a[0] as i32,
+            a[1] as i32,
+            self.process.pid,
+            thread.tid,
+        )?;
+        threads
+            .iter()
+            .map(|&(_, _, nice)| (20 - nice) as u64)
+            .max()
+            .ok_or(Errno(3))
+    }
+    /// `setpriority(which, who, nice)`: sets every thread's nice value to
+    /// `nice`, cut to -20..19. The guest is root, which may also lower it.
+    fn setpriority(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
+        let threads = self.processes.priority_threads(
+            a[0] as i32,
+            a[1] as i32,
+            self.process.pid,
+            thread.tid,
+        )?;
+        let nice = (a[2] as i32).clamp(-20, 19);
+        if threads.is_empty() {
+            return Err(Errno(3));
+        }
+        for (group, tid, _) in threads {
+            group.update_nice(tid, nice);
+        }
+        Ok(0)
+    }
     fn setpgid(&self, a: [u64; 6]) -> Result<u64, Errno> {
         let pgid = a[1] as u32 as i32;
         if pgid < 0 {
@@ -789,6 +877,9 @@ impl Kernel {
         }
         let inbox = Arc::new(SignalInbox::default());
         group.set_process_inbox(inbox.clone());
+        if let Some(value) = self.group.nice(parent.tid) {
+            group.set_nice(pid, value);
+        }
         group.register(pid, inbox.clone());
         let mut state = parent.state.clone();
         state.pid = pid;

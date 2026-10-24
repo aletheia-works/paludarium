@@ -32,7 +32,7 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
 
 | Group | Main system calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -191,6 +191,15 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   another session and a group in another session give `EPERM`, and a child
   that has run `execve` gives `EACCES`. A group exists while any member is
   left, an exited child not yet reaped included.
+- Nice values are kept per thread, as on Linux: a new thread or process
+  starts with its creator's, and `execve` keeps the caller's. `getpriority`
+  reports the highest priority among the threads it finds, as `20 - nice`,
+  and `setpriority` sets them all, cut to -20..19; the guest is root, so it
+  may lower them too. `PRIO_PROCESS` names one thread (0 is the caller),
+  `PRIO_PGRP` every thread of a process group and `PRIO_USER` every thread
+  of user 0. An exited process not yet reaped is still found. No thread
+  gives `ESRCH`, and an unknown `which` `EINVAL`. The values are reported
+  but do not change scheduling.
 - `waitid` follows Linux's checks and copy-out: its siginfo fields are zero
   when no child is reported, even on an error, and an exited child cannot be
   waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). A stop and a

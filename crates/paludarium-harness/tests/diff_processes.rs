@@ -115,6 +115,7 @@ mod linux {
         processes_pgid => ("pgid","process"),
         processes_session => ("session","process"),
         processes_pgid_exec => ("pgid-exec","process"),
+        processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),
         processes_statfs => ("statfs","process"),
         processes_posix_timer => ("posix-timer","process"),

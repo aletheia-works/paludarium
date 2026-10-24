@@ -206,6 +206,37 @@ mod process {
         );
     }
     #[test]
+    fn nice_values_are_per_thread_and_inherited() {
+        let (mut k, mut t, m) = setup();
+        let get = |k: &mut Kernel, t: &mut Thread, which: u64, who: u64| {
+            syscall(k, t, &m, 140, [which, who, 0, 0, 0, 0])
+        };
+        assert_eq!(get(&mut k, &mut t, 0, 0), 20);
+        // The guest is root, so it may also lower its nice value.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 141, [0, 0, (-5i64) as u64, 0, 0, 0]),
+            0
+        );
+        assert_eq!(get(&mut k, &mut t, 0, 0), 25);
+        let tid = syscall(&mut k, &mut t, &m, 56, [0x10900, 0, 0, 0, 0, 0]);
+        let (mut thread_kernel, thread) = k.take_child().unwrap();
+        assert_eq!(get(&mut k, &mut t, 0, tid), 25);
+        assert_eq!(syscall(&mut k, &mut t, &m, 141, [0, tid, 7, 0, 0, 0]), 0);
+        assert_eq!(
+            (get(&mut k, &mut t, 0, tid), get(&mut k, &mut t, 0, 0)),
+            (13, 25)
+        );
+        assert_eq!(get(&mut k, &mut t, 2, 0), 25); // PRIO_USER: the highest
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 140, [0; 6]), 25);
+        // The thread's own value goes with it.
+        thread_kernel.finish_thread(&thread, &m);
+        assert_eq!(get(&mut k, &mut t, 0, tid), Errno(3).to_syscall_return());
+        assert_eq!(syscall(&mut k, &mut t, &m, 141, [0, 0, 100, 0, 0, 0]), 0);
+        assert_eq!(get(&mut k, &mut t, 0, 0), 1); // cut to 19
+        assert_eq!(get(&mut k, &mut t, 3, 0), Errno::EINVAL.to_syscall_return());
+    }
+    #[test]
     fn parent_registration() {
         let (mut k, mut t, m) = setup();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);

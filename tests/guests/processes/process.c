@@ -177,6 +177,20 @@ static int status_field(const char *field, char *value, size_t size) {
     }
     return -1;
 }
+static long raw_priority(int which, int who) { return syscall(SYS_getpriority, which, who); }
+static int priority_ready[2], priority_go[2];
+static volatile long priority_thread_start, priority_thread_after;
+static volatile pid_t priority_tid;
+static void *priority_thread(void *base) {
+    long nice0 = 20 - (long)base;
+    char byte;
+    priority_tid = syscall(SYS_gettid);
+    priority_thread_start = raw_priority(PRIO_PROCESS, 0);
+    setpriority(PRIO_PROCESS, priority_tid, nice0 + 5);
+    if (write(priority_ready[1], "x", 1) != 1 || read(priority_go[0], &byte, 1) != 1) return NULL;
+    priority_thread_after = raw_priority(PRIO_PROCESS, 0);
+    return NULL;
+}
 static void finish(pid_t pid) {
     int status = 0;
     result("wait", waitpid(pid, &status, 0) == pid);
@@ -560,6 +574,70 @@ int main(int argc, char **argv) {
         errno = 0;
         result("getpgid-missing", getpgid(0x3fffffff));
         result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "priority")) {
+        /* Nice values are per thread. Each check only raises them, which
+           needs no privilege, and compares them with the starting one. */
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+            long base = raw_priority(PRIO_PROCESS, 0), nice0 = 20 - base;
+            char byte;
+            int status;
+            if (setpgid(0, 0) || pipe(priority_ready) || pipe(priority_go)) _exit(81);
+            result("raise", setpriority(PRIO_PROCESS, 0, nice0 + 3));
+            result("raised", raw_priority(PRIO_PROCESS, 0) - base);
+            pthread_t worker;
+            if (pthread_create(&worker, NULL, priority_thread, (void *)base)) _exit(82);
+            if (read(priority_ready[0], &byte, 1) != 1) _exit(83);
+            result("thread-inherits", priority_thread_start - base);
+            result("thread-own", raw_priority(PRIO_PROCESS, priority_tid) - base);
+            result("main-kept", raw_priority(PRIO_PROCESS, 0) - base);
+            result("group-highest", raw_priority(PRIO_PGRP, 0) - base);
+            result("group-set", setpriority(PRIO_PGRP, 0, nice0 + 6));
+            result("group-thread", raw_priority(PRIO_PROCESS, priority_tid) - base);
+            if (write(priority_go[1], "x", 1) != 1 || pthread_join(worker, NULL)) _exit(84);
+            result("thread-after", priority_thread_after - base);
+            pid_t inheritor = fork();
+            if (inheritor == 0) _exit(raw_priority(PRIO_PROCESS, 0) - base == -6 ? 0 : 1);
+            result("fork-inherits", waitpid(inheritor, &status, 0) == inheritor && status == 0);
+            pid_t zombie = fork();
+            if (zombie == 0) {
+                setpriority(PRIO_PROCESS, 0, 19);
+                _exit(0);
+            }
+            siginfo_t info;
+            result("exited", waitid(P_PID, zombie, &info, WEXITED | WNOWAIT) == 0);
+            result("zombie", raw_priority(PRIO_PROCESS, zombie));
+            waitpid(zombie, &status, 0);
+            errno = 0;
+            result("reaped", raw_priority(PRIO_PROCESS, zombie));
+            result("errno", errno);
+            result("clamped", setpriority(PRIO_PROCESS, 0, 1000));
+            result("lowest", raw_priority(PRIO_PROCESS, 0));
+            errno = 0;
+            result("bad-which", setpriority(3, 0, 0));
+            result("errno", errno);
+            errno = 0;
+            result("bad-which-get", raw_priority(-1, 0));
+            result("errno", errno);
+            errno = 0;
+            result("missing", raw_priority(PRIO_PROCESS, 0x3fffffff));
+            result("errno", errno);
+            errno = 0;
+            result("negative", raw_priority(PRIO_PROCESS, -1));
+            result("errno", errno);
+            errno = 0;
+            result("missing-group", raw_priority(PRIO_PGRP, 0x3fffffff));
+            result("errno", errno);
+            errno = 0;
+            result("missing-set", setpriority(PRIO_PROCESS, 0x3fffffff, 19));
+            result("errno", errno);
+            fflush(stdout);
+            _exit(0);
+        }
+        finish(pid);
         return 0;
     }
     if (!strcmp(mode, "pgid-exec")) {

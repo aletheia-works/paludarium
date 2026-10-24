@@ -27,7 +27,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | 主なシステムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups`、`getrusage`、`times` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -176,6 +176,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じくセッションを確かめ、セッションの先頭、別のセッションの子、別のセッションの
   グループには `EPERM` を、`execve` を済ませた子には `EACCES` を返します。グループは、
   まだ回収されていない終わった子も含め、メンバーが残っている間は存在します。
+- nice 値は Linux と同じくスレッドごとに持ちます。新しいスレッドやプロセスは作った
+  スレッドの値を受け継ぎ、`execve` は呼んだスレッドの値を保ちます。`getpriority` は
+  見つけたスレッドのうち最も高い優先度を `20 - nice` で返し、`setpriority` はそれらを
+  すべて -20〜19 に収めた値にします。ゲストは root なので下げることもできます。
+  `PRIO_PROCESS` は 1 つのスレッド（0 は呼んだスレッド）、`PRIO_PGRP` はプロセス
+  グループのすべてのスレッド、`PRIO_USER` はユーザー 0 のすべてのスレッドです。まだ
+  回収されていない終わったプロセスも見つかります。スレッドがなければ `ESRCH`、
+  知らない `which` は `EINVAL` です。値は報告するだけで、スケジューリングは変えません。
 - `waitid` は、Linux と同じ確かめ方と書き出し方をします。報告する子がないときは、
   エラーのときも含めて siginfo の項目を 0 にします。終わった子は、`WEXITED` か
   `WCONTINUED` がないと待てません（`ECHILD`）。停止と再開は、`WUNTRACED`

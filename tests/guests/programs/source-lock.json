@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "toolchain": "nightly-2026-10-11",
+  "toolchain": "nightly-2026-10-24",
   "target": "x86_64-unknown-linux-musl",
-  "aube": {"repository": "https://github.com/aubepkg/aube", "tag": "v2.8.1", "revision": "963d9b8202ced528d5eb3f72254b896ecf9d10f9", "lock_sha256": "1693a9796c7dea6e720e5798e3f5b98d8bb42d4c1c2682124e84eac20c5d0e5d", "primer": "empty file, outside unmodified source tree"},
+  "aube": {"repository": "https://github.com/aubepkg/aube", "tag": "v2.8.2", "revision": "a7707f083d2134e518a210e969b4cfd5870b139f", "lock_sha256": "16bf0024d80055b962aa8015e146356f0f88c0b5a91cc9447179b3c229d07837", "primer": "empty file, outside unmodified source tree"},
   "ripgrep": {"repository": "https://github.com/BurntSushi/ripgrep", "tag": "15.2.0", "revision": "e89fff89ac9af12e8d4ce9d5fd07beb408ca730f", "lock_sha256": "7a7d39cda8a03930e578f1dbb724e055771901842eca239e03b01e19da946a64"},
   "guest_license_exceptions": [
     {"crate": "webpki-root-certs@1.0.10", "allow": ["CDLA-Permissive-2.0"]},

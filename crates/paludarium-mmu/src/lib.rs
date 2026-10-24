@@ -198,6 +198,24 @@ struct SharedMapping {
     generation: Arc<AtomicU64>,
 }
 
+/// The file a private file mapping was copied from, read at an offset, so
+/// that pages given back with `MADV_DONTNEED` are read from it again, as
+/// Linux faults them in from the file once their private copies are gone.
+pub trait PageSource: Send + Sync {
+    /// Reads from `offset`, filling `buf` unless the file ends first, and
+    /// returns how much it read.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno>;
+}
+/// The file behind `[start, end)` of a private file mapping: the page at
+/// `page` holds the file from `page + shift` (wrapping), so that a move by
+/// `mremap` only changes the shift.
+#[derive(Clone)]
+struct FileBacking {
+    end: u64,
+    shift: u64,
+    source: Arc<dyn PageSource>,
+}
+
 /// Where `mremap` may put a mapping ([`AddressSpace::remap`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Remap {
@@ -230,6 +248,8 @@ struct AddressSpaceData {
     current_break: GuestAddr,
     mmap_top: u64,
     shared: BTreeMap<u64, SharedMapping>,
+    /// The files of private file mappings, by range ([`FileBacking`]).
+    backing: BTreeMap<u64, FileBacking>,
 }
 
 impl Default for AddressSpaceData {
@@ -301,6 +321,7 @@ impl AddressSpaceData {
             id: NEXT_ADDRESS_SPACE_ID.fetch_add(1, Ordering::Relaxed),
             directory: RwLock::new(BTreeMap::new()),
             shared: BTreeMap::new(),
+            backing: BTreeMap::new(),
             code_generation: AtomicU64::new(0),
             mappings: BTreeMap::new(),
             initial_break: GuestAddr(0),
@@ -333,6 +354,87 @@ impl AddressSpaceData {
             .map(|(_, mapping)| mapping)
             .filter(|mapping| page < mapping.end)
     }
+    fn backing_at(&self, page: u64) -> Option<&FileBacking> {
+        self.backing
+            .range(..=page)
+            .next_back()
+            .map(|(_, backing)| backing)
+            .filter(|backing| page < backing.end)
+    }
+    /// Records that the private file mapping `[addr, addr+len)` was copied
+    /// from `source` at `offset` ([`PageSource`]).
+    pub fn back_with_file(
+        &mut self,
+        addr: GuestAddr,
+        len: u64,
+        source: Arc<dyn PageSource>,
+        offset: u64,
+    ) -> Result<(), Errno> {
+        let end = checked_range(addr, len)?;
+        self.unback(addr.0, end);
+        self.backing.insert(
+            addr.0,
+            FileBacking {
+                end,
+                shift: offset.wrapping_sub(addr.0),
+                source,
+            },
+        );
+        Ok(())
+    }
+    /// Forgets the files of `[start, end)`, keeping the rest of each range.
+    fn unback(&mut self, start: u64, end: u64) {
+        let affected: Vec<_> = self
+            .backing
+            .range(..end)
+            .filter(|(_, backing)| backing.end > start)
+            .map(|(&at, backing)| (at, backing.clone()))
+            .collect();
+        for (at, backing) in affected {
+            self.backing.remove(&at);
+            if at < start {
+                self.backing.insert(
+                    at,
+                    FileBacking {
+                        end: start,
+                        ..backing.clone()
+                    },
+                );
+            }
+            if backing.end > end {
+                self.backing.insert(end, backing);
+            }
+        }
+    }
+    /// Reads the file of every backed page of `[start, end)` into it, from
+    /// emptied pages: what lies past the end of the file stays zero. A read
+    /// that fails leaves the rest zero too, where Linux would raise SIGBUS
+    /// on the access.
+    fn refill(&mut self, start: u64, end: u64) {
+        let ranges: Vec<_> = self
+            .backing
+            .range(..end)
+            .filter(|(_, backing)| backing.end > start)
+            .map(|(&at, backing)| (at.max(start), backing.end.min(end), backing.clone()))
+            .collect();
+        let mut buf = vec![0; PAGE_BYTES];
+        for (from, to, backing) in ranges {
+            let mut at = from;
+            while at < to {
+                let want = usize::try_from(to - at).map_or(PAGE_BYTES, |n| n.min(PAGE_BYTES));
+                let read = backing
+                    .source
+                    .read_at(at.wrapping_add(backing.shift), &mut buf[..want]);
+                let Ok(n @ 1..) = read else {
+                    break;
+                };
+                if self.write_initial(GuestAddr(at), &buf[..n]).is_err() {
+                    break;
+                }
+                at += n as u64;
+            }
+        }
+    }
     fn page(&self, page: u64, prot: Prot) -> Page {
         let frame = self.shared_at(page).map(|mapping| {
             mapping
@@ -352,6 +454,7 @@ impl AddressSpaceData {
         let mut copy = Self::new();
         copy.mappings = self.mappings.clone();
         copy.shared = self.shared.clone();
+        copy.backing = self.backing.clone();
         copy.initial_break = self.initial_break;
         copy.current_break = self.current_break;
         copy.mmap_top = self.mmap_top;
@@ -731,6 +834,7 @@ impl AddressSpaceData {
                 self.shared.insert(end, mapping);
             }
         }
+        self.unback(addr.0, end);
         self.split_at(addr.0);
         self.split_at(end);
         let doomed: Vec<u64> = self
@@ -823,9 +927,24 @@ impl AddressSpaceData {
             return;
         };
         let shared = self.shared_at(old).cloned();
+        let backing = self.backing_at(old).cloned();
         let pages = self.take_pages(old, old + old_len, keep_old && shared.is_some());
         if !keep_old && old_len > 0 {
             let _ = self.unmap(GuestAddr(old), old_len);
+        }
+        if let Some(backing) = backing {
+            self.backing.insert(
+                to,
+                FileBacking {
+                    end: to + new_len,
+                    shift: backing.shift.wrapping_add(old).wrapping_sub(to),
+                    ..backing
+                },
+            );
+            // MREMAP_DONTUNMAP left the old range empty: it reads its file.
+            if keep_old && shared.is_none() {
+                self.refill(old, old + old_len);
+            }
         }
         if let Some(shared) = shared {
             self.shared.insert(
@@ -859,9 +978,10 @@ impl AddressSpaceData {
     /// `mremap`, with Linux's checks in Linux's order: resizes the mapping
     /// at `addr`, growing it in place when the pages after it are free, else
     /// moving it as `how` allows. A grown or moved range must lie in one
-    /// Linux VMA (`EFAULT`). A file mapping cannot grow (`ENOMEM`), as it no
-    /// longer knows its file. Moving a range that spans several VMAs with
-    /// `MREMAP_FIXED`, which recent Linux allows, gives `EFAULT`.
+    /// Linux VMA (`EFAULT`). A file mapping cannot grow (`ENOMEM`), as
+    /// nothing reads the rest of its file into it. Moving a range that spans
+    /// several VMAs with `MREMAP_FIXED`, which recent Linux allows, gives
+    /// `EFAULT`.
     pub fn remap(
         &mut self,
         addr: GuestAddr,
@@ -1024,11 +1144,14 @@ impl AddressSpaceData {
         }
     }
 
-    /// Drops the contents of the private pages in `[addr, addr+len)`, so they
-    /// read as zeros again (`MADV_DONTNEED`). Shared pages keep theirs, as
-    /// their memory outlives the mapping, and so do ELF segments and file
-    /// mappings, which Linux would refill from the file. Applies the mapped parts and
-    /// returns `ENOMEM` when the range has a hole, as Linux does.
+    /// Drops the contents of the private pages in `[addr, addr+len)`
+    /// (`MADV_DONTNEED`): anonymous ones read as zeros again, and a file
+    /// mapping's pages read their file again ([`Self::back_with_file`]), as
+    /// Linux faults them in from the file. Shared pages keep theirs, as their
+    /// memory outlives the mapping, and so do ELF segments and file mappings
+    /// without a recorded file, which have nothing to read again. Applies the
+    /// mapped parts and returns `ENOMEM` when the range has a hole, as Linux
+    /// does.
     pub fn discard(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
         let mut covered = addr.0;
@@ -1041,7 +1164,10 @@ impl AddressSpaceData {
             hole |= m.start.0 > covered;
             covered = m.end();
             let start = m.start.0.max(addr.0);
-            if !matches!(m.kind, MappingKind::ElfSegment | MappingKind::File)
+            // An ELF segment, and a file mapping without its file, keep
+            // their contents: there is nothing to read them from again.
+            let backed = m.kind == MappingKind::File && self.backing_at(start).is_some();
+            if (backed || !matches!(m.kind, MappingKind::ElfSegment | MappingKind::File))
                 && self.shared_at(start).is_none()
             {
                 private.push((start, m.end().min(end)));
@@ -1053,6 +1179,7 @@ impl AddressSpaceData {
         }
         for (start, end) in private {
             self.for_populated(start, end, |entry| *entry = None);
+            self.refill(start, end);
         }
         if hole { Err(Errno::ENOMEM) } else { Ok(()) }
     }
@@ -1407,6 +1534,16 @@ impl AddressSpace {
     pub fn discard_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().discard(addr, len)
     }
+    /// See [`AddressSpaceData::back_with_file`].
+    pub fn back_with_file(
+        &self,
+        addr: GuestAddr,
+        len: u64,
+        source: Arc<dyn PageSource>,
+        offset: u64,
+    ) -> Result<(), Errno> {
+        self.locked().back_with_file(addr, len, source, offset)
+    }
     /// See [`AddressSpaceData::check_private_anonymous`].
     pub fn check_private_anonymous(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().check_private_anonymous(addr, len)
@@ -1724,6 +1861,79 @@ mod tests {
         space.discard_shared(elf, PAGE_SIZE).unwrap();
         assert_eq!(space.read_u64(shared).unwrap(), 9);
         assert_eq!(space.read_u64(elf).unwrap(), 10);
+    }
+
+    /// A file of `len` bytes, each its offset modulo 251.
+    struct Pattern(u64);
+    impl PageSource for Pattern {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+            let n = usize::try_from(self.0.saturating_sub(offset))
+                .map_or(buf.len(), |n| n.min(buf.len()));
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = ((offset + i as u64) % 251) as u8;
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn discard_reads_a_private_file_mapping_from_its_file_again() {
+        let space = AddressSpace::new();
+        let file = space
+            .map_shared(None, 3 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        // The mapping starts at file offset 4096, and the file ends 100
+        // bytes into its third page.
+        let source: Arc<dyn PageSource> = Arc::new(Pattern(3 * PAGE_SIZE + 100));
+        space
+            .back_with_file(file, 3 * PAGE_SIZE, Arc::clone(&source), PAGE_SIZE)
+            .unwrap();
+        let at = |page: u64, offset: u64| GuestAddr(file.0 + page * PAGE_SIZE + offset);
+        for (page, offset) in [(0, 0), (1, 7), (2, 99), (2, 100)] {
+            space.write(at(page, offset), &[0xee]).unwrap();
+        }
+        // Only the second page: the others keep what was written.
+        space.discard_shared(at(1, 0), PAGE_SIZE).unwrap();
+        assert_eq!(byte(&space, at(1, 7).0), ((2 * PAGE_SIZE + 7) % 251) as u8);
+        assert_eq!(byte(&space, at(0, 0).0), 0xee);
+        space.discard_shared(file, 3 * PAGE_SIZE).unwrap();
+        assert_eq!(byte(&space, at(0, 0).0), (PAGE_SIZE % 251) as u8);
+        assert_eq!(
+            byte(&space, at(2, 99).0),
+            ((3 * PAGE_SIZE + 99) % 251) as u8
+        );
+        assert_eq!(byte(&space, at(2, 100).0), 0); // past the end of the file
+        // A fork, and a move by mremap, keep the file at the same offsets.
+        let child = space.fork();
+        space.write(at(0, 1), &[0xee]).unwrap();
+        let fixed = Remap {
+            fixed: true,
+            new_addr: GuestAddr(0x4000_0000),
+            ..MOVE
+        };
+        let moved = space
+            .remap_shared(file, 3 * PAGE_SIZE, 3 * PAGE_SIZE, fixed)
+            .unwrap();
+        assert_ne!(moved, file);
+        space.discard_shared(moved, PAGE_SIZE).unwrap();
+        assert_eq!(byte(&space, moved.0 + 1), ((PAGE_SIZE + 1) % 251) as u8);
+        child.write(at(1, 3), &[0xee]).unwrap();
+        child.discard_shared(at(1, 0), PAGE_SIZE).unwrap();
+        assert_eq!(byte(&child, at(1, 3).0), ((2 * PAGE_SIZE + 3) % 251) as u8);
+        // Unmapping the middle page forgets only its file.
+        space
+            .unmap_shared(GuestAddr(moved.0 + PAGE_SIZE), PAGE_SIZE)
+            .unwrap();
+        space
+            .write(GuestAddr(moved.0 + 2 * PAGE_SIZE), &[0xee])
+            .unwrap();
+        space
+            .discard_shared(GuestAddr(moved.0 + 2 * PAGE_SIZE), PAGE_SIZE)
+            .unwrap();
+        assert_eq!(
+            byte(&space, moved.0 + 2 * PAGE_SIZE),
+            ((3 * PAGE_SIZE) % 251) as u8
+        );
     }
 
     #[test]

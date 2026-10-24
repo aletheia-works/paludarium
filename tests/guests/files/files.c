@@ -118,6 +118,22 @@ void _start(void) {
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
   results[x++]=SX(p,0,0);S(87,q,0,0);}
+ if(CASE==47){ /* MADV_DONTNEED on a private file mapping: its pages read the file again */
+  static char data[9000];for(int i=0;i<9000;i++)data[i]='a'+i%26;S(1,fd,data,9000);
+  char*m=(char*)MMAP(12288,3,2,fd,0);results[x++]=(long)m>0;
+  m[0]='X';m[4096]='Y';m[8999]='Z';m[9000]='W';
+  results[x++]=S(28,m,12288,4);results[x++]=m[0];results[x++]=m[4096];results[x++]=m[8999];results[x++]=m[9000];
+  /* The file as it is when the page is read again, written after the mapping was made. */
+  call(18,fd,(long)"Q",1,1,0,0);m[1]='R';results[x++]=S(28,m,4096,4);results[x++]=m[1];
+  /* Only the range given. */
+  m[4096]='S';m[8192]='T';results[x++]=S(28,m+8192,4096,4);results[x++]=m[4096];results[x++]=m[8192];
+  /* A mapping from an offset, and that mapping moved by mremap. */
+  char*o=(char*)MMAP(4096,3,2,fd,4096);o[0]='U';results[x++]=S(28,o,4096,4);results[x++]=o[0];
+  char*to=(char*)MMAP(4096,3,0x22,-1,0);o[1]='V';char*mv=(char*)call(25,(long)o,4096,4096,3,(long)to,0);
+  results[x++]=mv==to;results[x++]=mv[1];results[x++]=S(28,mv,4096,4);results[x++]=mv[1];
+  /* Shared anonymous memory is not a file's: it keeps its contents, as before. */
+  char*sh=(char*)MMAP(4096,3,0x21,-1,0);sh[0]=9;results[x++]=S(28,sh,4096,4);results[x++]=sh[0];
+  S(11,m,12288,0);S(11,mv,4096,0);S(11,sh,4096,0);}
  if(CASE==46){ /* /dev: the memory devices, and the links into /proc/self/fd */
   static const char *devs[]={"/dev/null","/dev/zero","/dev/full","/dev/random","/dev/urandom"};
   static char t[300];long k;

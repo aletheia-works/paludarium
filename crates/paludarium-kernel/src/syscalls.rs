@@ -1257,6 +1257,20 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 let _ = c.mem.unmap_shared(a, len);
                 return err(error);
             }
+            // A private mapping remembers its file, which MADV_DONTNEED reads
+            // its pages from again.
+            if let Some(file) = &file
+                && flags & MAP_SHARED == 0
+                && let Err(error) = c.mem.back_with_file(
+                    a,
+                    len,
+                    std::sync::Arc::new(FilePages(file.clone())),
+                    offset,
+                )
+            {
+                let _ = c.mem.unmap_shared(a, len);
+                return err(error);
+            }
             if flags & MAP_SHARED != 0
                 && let Err(error) = c.mem.mark_shared(a, len)
             {
@@ -1318,6 +1332,14 @@ fn is_zero_device(file: &dyn FileHandle) -> bool {
     file.as_any()
         .and_then(|v| v.downcast_ref::<crate::devices::Device>())
         .is_some_and(|d| d.kind() == crate::devices::Kind::Zero)
+}
+
+/// A mapped file as the MMU reads it again ([`paludarium_mmu::PageSource`]).
+struct FilePages(std::sync::Arc<dyn FileHandle>);
+impl paludarium_mmu::PageSource for FilePages {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        self.0.read_at(offset, buf)
+    }
 }
 
 /// Fills a new file mapping with the file from `offset`; the part of the

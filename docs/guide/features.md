@@ -106,8 +106,12 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   no end of file: when the peer closes, reads wait and the next send gets
   `ECONNREFUSED`, then `ENOTCONN`. Only `SOCK_STREAM` raises `SIGPIPE` with
   `EPIPE`, as on Linux.
-- `madvise`: `MADV_DONTNEED` empties private pages, which then read as zeros;
-  `MADV_FREE` keeps their contents, as Linux does without memory pressure.
+- `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
+  as zeros, and those of a file mapping read the file again, as it is then
+  (zeros past its end), as Linux faults them in from the file; this holds
+  after `mremap` moves the mapping and in a `fork`ed child. ELF segments keep
+  their contents, and shared memory keeps its own. `MADV_FREE` keeps the
+  contents, as Linux does without memory pressure.
   The access-pattern hints are accepted and other advice gives `EINVAL`.
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`

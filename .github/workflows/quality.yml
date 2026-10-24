@@ -1,9 +1,9 @@
 # Full quality, run by nightly.yml and dispatched once per release head
 # (docs/release.md): the ci.yml checks on Linux, macOS and Windows, the
 # Windows host comparison, fuzzing, the four wasm environments with the real
-# Safari, JIT on/off agreement, the frozen performance measurement and the JIT
-# and Python coverage. Actions are pinned by commit SHA and the default token
-# is read-only.
+# Safari and WebKit on x86-64 Linux, JIT on/off agreement, the frozen
+# performance measurement and the JIT and Python coverage. Actions are pinned
+# by commit SHA and the default token is read-only.
 name: Full quality
 
 on:

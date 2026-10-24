@@ -39,7 +39,7 @@ LeakSanitizer を付けて、それぞれ 600 秒動かします。夜間の CI 
 | いつ | 何を |
 |---|---|
 | プルリクエストごと | Linux・macOS・Windows の単体テスト、lint、依存の検査、WebAssembly のビルド、x86-64 Linux での差分テスト、カバレッジ、probe・aube・ripgrep の差分テスト、4 つの WebAssembly の環境と x86-64 Linux の WebKit での受け入れのテスト、ファジングの一部 |
-| 毎晩 | 13 の対象のファジング、macOS と Windows での差分テスト、4 つの WebAssembly の環境での JIT ありとなし、速さの測定 |
+| 毎晩 | 13 の対象のファジング、macOS と Windows での差分テスト、4 つの WebAssembly の環境と x86-64 Linux の WebKit での JIT ありとなし、速さの測定 |
 | 毎日 | 定期実行のワークフローが時間どおりに始まったかを確かめます。始まらなかった、動かなかった、無効になっていたときは Issue を立てます |
 | 毎週 | 固定した nightly の Rust と、aube と ripgrep のゲストを最新のリリースへ上げます。それぞれのプルリクエストは、検査が通ると自分でマージされます |
 | 公開の前 | 公開する同じコードで、上のすべて（下を参照） |

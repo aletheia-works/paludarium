@@ -310,8 +310,13 @@ mod tests {
 
     #[test]
     fn io_errors_map_to_errno() {
-        let pipe = io::Error::from(io::ErrorKind::BrokenPipe);
-        assert_eq!(errno_from_io(&pipe), Errno::EPIPE);
+        for (kind, errno) in [
+            (io::ErrorKind::BrokenPipe, Errno::EPIPE),
+            (io::ErrorKind::WouldBlock, Errno::EAGAIN),
+            (io::ErrorKind::InvalidInput, Errno::EINVAL),
+        ] {
+            assert_eq!(errno_from_io(&io::Error::from(kind)), errno);
+        }
         let other = io::Error::other("x");
         assert_eq!(errno_from_io(&other), Errno::EIO);
         struct Broken;
@@ -324,6 +329,68 @@ mod tests {
             }
         }
         assert_eq!(write_through(&mut Broken, b"x"), Err(Errno::EPIPE));
+        assert!(Broken.flush().is_ok());
+        // A write that lands but whose flush fails reports the flush.
+        struct Unflushed;
+        impl Write for Unflushed {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+        }
+        assert_eq!(write_through(&mut Unflushed, b"x"), Err(Errno::EAGAIN));
+    }
+
+    /// A host with only the methods it must have.
+    struct Bare;
+    impl Host for Bare {
+        fn read_stdin(&self, _: &mut [u8]) -> Result<usize, Errno> {
+            Ok(0)
+        }
+        fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno> {
+            Ok(buf.len())
+        }
+        fn write_stderr(&self, buf: &[u8]) -> Result<usize, Errno> {
+            Ok(buf.len())
+        }
+        fn random_bytes(&self, buf: &mut [u8]) -> Result<(), Error> {
+            buf.fill(0);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_host_without_the_optional_facilities_refuses_them() {
+        let host = Bare;
+        let mut buf = [1];
+        assert_eq!(
+            (host.read_stdin(&mut buf), host.write_stdout(b"x")),
+            (Ok(0), Ok(1))
+        );
+        assert_eq!(host.write_stderr(b"x"), Ok(1));
+        assert!(host.random_bytes(&mut buf).is_ok());
+        assert_eq!(host.terminal_info(StreamId::Stdout), Ok(None));
+        assert!(matches!(host.mount_fs(Path::new("/")), Err(Errno::ENOSYS)));
+        assert_eq!(host.clock(ClockId::Monotonic), Err(Errno::ENOSYS));
+        assert_eq!(host.thread_cpu_time(), Err(Errno::ENOSYS));
+        assert!(host.cpu_count() >= 1);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            host.wait_until(ClockId::Monotonic, 0, &cancel),
+            Err(Errno::ENOSYS)
+        );
+    }
+
+    #[test]
+    fn native_host_passes_its_facilities_through() {
+        let host = NativeHost::new();
+        // Whether a stream is a terminal depends on how the tests run.
+        assert!(host.terminal_info(StreamId::Stdout).is_ok());
+        let root = std::env::temp_dir();
+        assert!(host.mount_fs(&root).is_ok());
+        assert!(host.thread_cpu_time().is_ok());
     }
 
     #[test]

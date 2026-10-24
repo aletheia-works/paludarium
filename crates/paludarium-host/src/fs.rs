@@ -122,3 +122,111 @@ pub trait HostFs: Send + Sync {
         Err(Errno::EPERM)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file and a filesystem that have only the methods they must have.
+    struct BareFile;
+    struct BareFs;
+    impl FileHandle for BareFile {
+        fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+            Ok(0)
+        }
+        fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
+            Ok(buf.len())
+        }
+        fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+            Ok(0)
+        }
+        fn stat(&self) -> Result<FileStat, Errno> {
+            Ok(FileStat::default())
+        }
+        fn truncate(&self, _: u64) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn flock(&self, _: u32) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn flags(&self) -> u32 {
+            0
+        }
+        fn set_flags(&self, _: u32) -> Result<(), Errno> {
+            Ok(())
+        }
+    }
+    impl HostFs for BareFs {
+        fn open(&self, _: &[u8], _: u32, _: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+            Ok(Arc::new(BareFile))
+        }
+        fn metadata(&self, _: &[u8], _: bool) -> Result<FileStat, Errno> {
+            Ok(FileStat::default())
+        }
+        fn mkdir(&self, _: &[u8], _: u32) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn unlink(&self, _: &[u8], _: bool) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn link(&self, _: &[u8], _: &[u8]) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn symlink(&self, _: &[u8], _: &[u8]) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn readlink(&self, _: &[u8]) -> Result<Vec<u8>, Errno> {
+            Ok(Vec::new())
+        }
+        fn rename(&self, _: &[u8], _: &[u8]) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn read_dir(&self, _: &[u8]) -> Result<Vec<DirectoryEntry>, Errno> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_file_without_the_optional_methods_refuses_them_as_linux_does() {
+        let file = BareFile;
+        // The required methods, which the stand-in answers trivially.
+        assert_eq!(file.read(&mut [0]), Ok(0));
+        assert_eq!((file.write(b"x"), file.seek(0, 0)), (Ok(1), Ok(0)));
+        assert_eq!(file.stat(), Ok(FileStat::default()));
+        assert_eq!((file.truncate(0), file.flock(0)), (Ok(()), Ok(())));
+        assert_eq!((file.flags(), file.set_flags(0)), (0, Ok(())));
+        assert_eq!(file.readiness(), Err(Errno::EPERM));
+        assert!(file.as_any().is_none());
+        assert_eq!(file.stdio_channel(), None);
+        assert_eq!(file.guest_path_hint(), None);
+        assert_eq!(file.set_mode(0o644), Err(Errno::EPERM));
+        assert_eq!(file.set_times(Some(1), None), Err(Errno::EPERM));
+        assert_eq!(file.sync(), Err(Errno::EINVAL));
+        assert_eq!(file.read_at(0, &mut [0; 4]), Err(Errno::ENODEV));
+        assert_eq!(file.write_at(0, b"x"), Err(Errno::ENODEV));
+        assert_eq!(file.zero_range(0, 1), Err(Errno(95))); // EOPNOTSUPP
+    }
+
+    #[test]
+    fn a_filesystem_without_the_optional_methods_refuses_them() {
+        let fs = BareFs;
+        assert!(fs.open(b"/a", 0, 0).is_ok());
+        assert_eq!(fs.metadata(b"/a", true), Ok(FileStat::default()));
+        assert_eq!(
+            (fs.mkdir(b"/d", 0), fs.unlink(b"/a", false)),
+            (Ok(()), Ok(()))
+        );
+        assert_eq!(
+            (fs.link(b"/a", b"/b"), fs.symlink(b"/a", b"/c")),
+            (Ok(()), Ok(()))
+        );
+        assert_eq!(
+            (fs.readlink(b"/c"), fs.read_dir(b"/")),
+            (Ok(Vec::new()), Ok(Vec::new()))
+        );
+        assert_eq!(fs.rename(b"/a", b"/e"), Ok(()));
+        assert_eq!(fs.statfs(b"/"), Err(Errno::ENOSYS));
+        assert_eq!(fs.set_mode(b"/a", 0o644), Err(Errno::EPERM));
+        assert_eq!(fs.set_times(b"/a", true, None, Some(1)), Err(Errno::EPERM));
+    }
+}

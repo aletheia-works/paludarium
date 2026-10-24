@@ -646,6 +646,53 @@ fn sysinfo_getgroups_and_sched_yield() {
     assert_eq!(f.ret(nr::SCHED_YIELD, &[]), 0);
 }
 #[test]
+fn file_size_limit_is_enforced_as_linux_does() {
+    let mut f = fixture();
+    let (limit, buf, pair) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);
+    f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+    f.mem.write_u64(GuestAddr(limit), 10).unwrap();
+    f.mem.write_u64(GuestAddr(limit + 8), u64::MAX).unwrap();
+    assert_eq!(f.ret(160, &[1, limit]), 0); // setrlimit(FSIZE, 10)
+    // Block SIGXFSZ so that it stays pending instead of ending the process.
+    f.mem.write_u64(GuestAddr(limit), 1 << 24).unwrap();
+    assert_eq!(f.ret(14, &[0, limit, 0, 8]), 0);
+    // Takes the pending SIGXFSZ, which a standard signal has at most once.
+    let xfsz = |f: &mut Fixture| {
+        let before = f.thread.state.pending.len();
+        f.thread.state.pending.retain(|s| s.number != 25);
+        before - f.thread.state.pending.len()
+    };
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(1, &[fd, buf, 4]), 4);
+    assert_eq!(f.ret(1, &[fd, buf, 10]), 6); // cut at the limit
+    assert_eq!(f.ret(1, &[fd, buf, 0]), 0); // empty: no check
+    assert_eq!(xfsz(&mut f), 0);
+    assert_eq!(f.ret(1, &[fd, buf, 1]), errno(Errno(27)));
+    assert_eq!(xfsz(&mut f), 1);
+    assert_eq!(f.ret(18, &[fd, buf, 5, 9]), 1); // pwrite
+    assert_eq!(xfsz(&mut f), 0);
+    assert_eq!(f.ret(18, &[fd, buf, 5, 10]), errno(Errno(27)));
+    assert_eq!(xfsz(&mut f), 1);
+    // Growing past the limit fails; shrinking and growing to it do not.
+    assert_eq!(f.ret(77, &[fd, 11]), errno(Errno(27)));
+    assert_eq!(xfsz(&mut f), 1);
+    assert_eq!(f.ret(77, &[fd, 4]), 0);
+    assert_eq!(f.ret(77, &[fd, 10]), 0);
+    assert_eq!(xfsz(&mut f), 0);
+    // O_APPEND writes at the end, which is the limit.
+    let append = f.ret(2, &[DATA, 0o2001, 0]);
+    assert_eq!(f.ret(1, &[append, buf, 1]), errno(Errno(27)));
+    assert_eq!(xfsz(&mut f), 1);
+    // So does its pwrite, whatever the offset.
+    assert_eq!(f.ret(18, &[append, buf, 1, 0]), errno(Errno(27)));
+    assert_eq!(xfsz(&mut f), 1);
+    // A pipe is no regular file.
+    assert_eq!(f.ret(22, &[pair]), 0);
+    let writer = f.mem.read_u64(GuestAddr(pair)).unwrap() >> 32;
+    assert_eq!(f.ret(1, &[writer, buf, 20]), 20);
+    assert_eq!(xfsz(&mut f), 0);
+}
+#[test]
 fn descriptor_limit_is_enforced_as_linux_does() {
     let mut f = fixture();
     let (limit, stat) = (DATA + 0x100, DATA + 0x200);

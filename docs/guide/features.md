@@ -150,11 +150,17 @@ Everything else returns `ENOSYS`; nothing is passed to the host.
   `PR_GET_*`; other options give `EINVAL`.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
-  read and changed. Only `RLIMIT_NOFILE` is enforced, as in Linux: a new
-  descriptor past its soft limit gives `EMFILE` (and `open` creates nothing),
-  `dup2`/`dup3` onto a number past it `EBADF`, and `F_DUPFD` from one past it
-  `EINVAL`. Process groups are kept the same way, and `wait4` and `waitid` can
-  wait for one.
+  read and changed. Two are enforced, as in Linux:
+  - `RLIMIT_NOFILE`: a new descriptor past its soft limit gives `EMFILE` (and
+    `open` creates nothing), `dup2`/`dup3` onto a number past it `EBADF`, and
+    `F_DUPFD` from one past it `EINVAL`.
+  - `RLIMIT_FSIZE`: a write to a regular file (`write`, `writev`, `pwrite`,
+    `pwritev`, at the end with `O_APPEND`) stops at the soft limit; one that
+    starts at or past it, and a `truncate`/`ftruncate` that grows the file
+    past it, raise `SIGXFSZ` and fail with `EFBIG`.
+
+  Process groups are kept the same way, and `wait4` and `waitid` can wait for
+  one.
 - `waitid` follows Linux's checks and copy-out: its siginfo fields are zero
   when no child is reported, even on an error, and an exited child cannot be
   waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). A stop and a

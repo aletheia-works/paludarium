@@ -20,8 +20,8 @@ struct Entry {
     /// Process group ID; inherited on fork and kept across exec.
     pgid: u32,
     /// Resource limits (soft, hard), inherited on fork and kept across exec.
-    /// They are recorded and reported; only RLIMIT_NOFILE is enforced, through
-    /// the copy of its soft limit in the thread group.
+    /// They are recorded and reported; RLIMIT_FSIZE and RLIMIT_NOFILE are
+    /// enforced, through the copy of their soft limits in the thread group.
     limits: [(u64, u64); RLIMITS],
     /// PR_SET_PDEATHSIG: sent to this process when its parent exits; cleared
     /// on fork.
@@ -192,9 +192,7 @@ impl Processes {
                 return Err(Errno::EPERM);
             }
             entry.limits[resource] = (soft, hard);
-            if resource == 7 {
-                entry.group.set_nofile(soft);
-            }
+            entry.group.set_soft_limit(resource, soft);
         }
         Ok(old)
     }

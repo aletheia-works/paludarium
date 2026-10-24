@@ -28,9 +28,10 @@ pub struct ThreadGroup {
     process_pending: Mutex<ThreadState>,
     timer_generation: AtomicU64,
     /// The RLIMIT_NOFILE soft limit, which bounds the descriptor numbers this
-    /// process allocates. The process entry keeps the limit pair `prlimit`
-    /// reports.
+    /// process allocates, and the RLIMIT_FSIZE one, which bounds the files it
+    /// writes. The process entry keeps the limit pairs `prlimit` reports.
     nofile: AtomicU64,
+    fsize: AtomicU64,
     pub(crate) futexes: Futexes,
     pub(crate) timers: Mutex<crate::timers::Timers>,
     /// Every thread's CPU time, live or exited, for the process's total.
@@ -49,6 +50,7 @@ impl Default for ThreadGroup {
             process_pending: Mutex::new(ThreadState::default()),
             timer_generation: AtomicU64::new(0),
             nofile: AtomicU64::new(1024),
+            fsize: AtomicU64::new(u64::MAX),
             futexes: Futexes::default(),
             timers: Mutex::default(),
             cpu: Mutex::default(),
@@ -102,14 +104,24 @@ impl ThreadGroup {
         Self {
             actions: Mutex::new(actions),
             nofile: AtomicU64::new(self.nofile()),
+            fsize: AtomicU64::new(self.fsize()),
             ..Self::default()
         }
     }
     pub(crate) fn nofile(&self) -> u64 {
         self.nofile.load(Ordering::SeqCst)
     }
-    pub(crate) fn set_nofile(&self, soft: u64) {
-        self.nofile.store(soft, Ordering::SeqCst);
+    pub(crate) fn fsize(&self) -> u64 {
+        self.fsize.load(Ordering::SeqCst)
+    }
+    /// Takes the new soft limit of an enforced resource (RLIMIT_FSIZE or
+    /// RLIMIT_NOFILE); the others are only recorded.
+    pub(crate) fn set_soft_limit(&self, resource: usize, soft: u64) {
+        match resource {
+            1 => self.fsize.store(soft, Ordering::SeqCst),
+            7 => self.nofile.store(soft, Ordering::SeqCst),
+            _ => {}
+        }
     }
     pub(crate) fn shared_actions(&self) -> Arc<Mutex<BTreeMap<i32, SignalAction>>> {
         self.actions

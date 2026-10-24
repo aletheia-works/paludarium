@@ -136,11 +136,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PR_SET_NO_NEW_PRIVS` と、それぞれの `PR_GET_*` に対応します。ほかの指定には
   `EINVAL` を返します。
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
-  8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。守らせるのは
-  `RLIMIT_NOFILE` だけで、Linux と同じく、ソフトの上限を超える新しいディスクリプタは
-  `EMFILE`（`open` は何も作りません）、上限を超える番号への `dup2`／`dup3` は `EBADF`、
-  上限を超える番号からの `F_DUPFD` は `EINVAL` になります。プロセスグループも同じように
-  持ち、`wait4` と `waitid` でプロセスグループを選んで待てます。
+  8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。Linux と同じく
+  守らせるのは次の 2 つです。
+  - `RLIMIT_NOFILE`：ソフトの上限を超える新しいディスクリプタは `EMFILE`（`open` は
+    何も作りません）、上限を超える番号への `dup2`／`dup3` は `EBADF`、上限を超える
+    番号からの `F_DUPFD` は `EINVAL` になります。
+  - `RLIMIT_FSIZE`：通常のファイルへの書き込み（`write`、`writev`、`pwrite`、
+    `pwritev`、`O_APPEND` での末尾）はソフトの上限で止まります。上限かその先から始まる
+    書き込みと、ファイルを上限より大きくする `truncate`／`ftruncate` は、`SIGXFSZ` を
+    起こして `EFBIG` で失敗します。
+
+  プロセスグループも同じように持ち、`wait4` と `waitid` でプロセスグループを選んで
+  待てます。
 - `waitid` は、Linux と同じ確かめ方と書き出し方をします。報告する子がないときは、
   エラーのときも含めて siginfo の項目を 0 にします。終わった子は、`WEXITED` か
   `WCONTINUED` がないと待てません（`ECHILD`）。停止と再開は、`WUNTRACED`

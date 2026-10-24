@@ -485,6 +485,36 @@ fn write_at(file: &Arc<dyn FileHandle>, offset: u64, b: &[u8]) -> Result<usize, 
         result => result,
     }
 }
+/// The bytes of a `len`-byte write at `offset` (the file's position when
+/// `None`) that RLIMIT_FSIZE lets through, as Linux's generic_write_checks:
+/// an O_APPEND file starts at its size whatever the offset, as its pwrite
+/// appends; only regular files are limited, and a write starting at or past
+/// the limit raises SIGXFSZ and fails with EFBIG.
+fn size_limited(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    offset: Option<u64>,
+    len: usize,
+) -> Result<usize, Errno> {
+    let limit = c.group.fsize();
+    if limit == u64::MAX || len == 0 {
+        return Ok(len);
+    }
+    let metadata = file.stat()?;
+    if metadata.mode & 0o170000 != 0o100000 {
+        return Ok(len);
+    }
+    let start = match offset {
+        _ if file.flags() & 0o2000 != 0 => metadata.size,
+        Some(offset) => offset,
+        None => file.seek(0, 1)?,
+    };
+    if start >= limit {
+        crate::signals::queue(c.process, crate::signals::PendingSignal::user(25, 0));
+        return Err(Errno(27));
+    }
+    Ok(len.min(usize::try_from(limit - start).unwrap_or(usize::MAX)))
+}
 /// The `struct iovec` array of readv, writev and their positioned forms, as
 /// Linux's `import_iovec` reads it: at most 1024 entries (EINVAL), each
 /// buffer accessible (EFAULT), and the total cut to `MAX_RW_COUNT`.
@@ -674,6 +704,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         18 => {
             let file = positioned(c, a[0], a[3], true)?;
             let len = request(&file, a[2], a[3], false)?;
+            let len = size_limited(c, &file, Some(a[3]), len)?;
             // Check the guest buffer before allocating its copy, as write does.
             c.mem
                 .check_read(GuestAddr(a[1]), len)
@@ -712,6 +743,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 scatter(c, &segments, &b[..count])?;
                 return Ok(count as u64);
             }
+            let len = size_limited(c, &file, Some(a[3]), len)?;
             let mut b = Vec::new();
             b.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
             for &(base, length) in &segments {
@@ -721,6 +753,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     .read(GuestAddr(base), &mut b[start..])
                     .map_err(|_| Errno::EFAULT)?;
             }
+            b.truncate(len);
             write_at(&file, a[3], &b).map(|count| count as u64)
         }
         22 | 293 => {
@@ -776,7 +809,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     .read(GuestAddr(base), &mut bytes[start..])
                     .map_err(|_| Errno::EFAULT)?;
             }
-            write_io(c, &descriptor.file, &bytes, false)
+            let len = size_limited(c, &descriptor.file, None, bytes.len())?;
+            write_io(c, &descriptor.file, &bytes[..len], false)
         }
         0 | 1 => {
             let requested = usize::try_from(a[2].min(0x7fff_f000)).map_err(|_| Errno::EINVAL)?;
@@ -795,6 +829,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 } else {
                     requested
                 }
+            } else if let Some(d) = &d {
+                size_limited(c, &d.file, None, requested)?
             } else {
                 requested
             };
@@ -1038,6 +1074,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             };
             if a[1] > i64::MAX as u64 {
                 return Err(Errno::EINVAL);
+            }
+            // Growing a file past RLIMIT_FSIZE raises SIGXFSZ (inode_newsize_ok).
+            if a[1] > c.group.fsize() && f.stat()?.size < a[1] {
+                crate::signals::queue(c.process, crate::signals::PendingSignal::user(25, 0));
+                return Err(Errno(27));
             }
             f.truncate(a[1])?;
             Ok(0)

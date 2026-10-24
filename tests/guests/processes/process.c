@@ -381,6 +381,63 @@ int main(int argc, char **argv) {
         unlink(path);
         return 0;
     }
+    if (!strcmp(mode, "fsize-limit")) {
+        /* RLIMIT_FSIZE cuts a regular file's writes at the limit, and a write
+           or growing truncate past it raises SIGXFSZ and fails with EFBIG. */
+        const char *path = "/tmp/paludarium-fsize";
+        struct sigaction action = {0};
+        action.sa_handler = interrupted;
+        sigaction(SIGXFSZ, &action, NULL);
+        struct rlimit limit;
+        getrlimit(RLIMIT_FSIZE, &limit);
+        limit.rlim_cur = 10;
+        result("set", setrlimit(RLIMIT_FSIZE, &limit));
+        int fd = open(path, O_CREAT|O_RDWR|O_TRUNC, 0600);
+        char buf[32] = {0};
+        received = 0;
+        result("write", write(fd, buf, 4));
+        result("cut", write(fd, buf, 10));
+        result("empty", write(fd, buf, 0));
+        result("signals-before", received);
+        errno = 0;
+        result("past", write(fd, buf, 1) < 0 ? -errno : 0);
+        result("signals", received);
+        lseek(fd, 7, SEEK_SET);
+        struct iovec io[2] = {{buf, 2}, {buf, 2}};
+        result("writev-cut", writev(fd, io, 2));
+        errno = 0;
+        result("writev-past", writev(fd, io, 2) < 0 ? -errno : 0);
+        result("pwrite-cut", pwrite(fd, buf, 5, 8));
+        errno = 0;
+        result("pwrite-past", pwrite(fd, buf, 1, 10) < 0 ? -errno : 0);
+        errno = 0;
+        result("ftruncate-past", ftruncate(fd, 11) < 0 ? -errno : 0);
+        result("ftruncate-shrink", ftruncate(fd, 3));
+        result("ftruncate-to", ftruncate(fd, 10));
+        errno = 0;
+        result("truncate-past", truncate(path, 20) < 0 ? -errno : 0);
+        result("signals-after", received);
+        int appender = open(path, O_WRONLY|O_APPEND);
+        errno = 0;
+        result("append-past", write(appender, buf, 1) < 0 ? -errno : 0);
+        /* An O_APPEND pwrite appends, so its offset does not count. */
+        errno = 0;
+        result("append-pwrite-past", pwrite(appender, buf, 1, 0) < 0 ? -errno : 0);
+        close(appender);
+        struct stat st;
+        fstat(fd, &st);
+        result("size", st.st_size);
+        /* fork keeps the limit. */
+        pid_t pid = child();
+        if (pid == 0) {
+            errno = 0;
+            _exit(pwrite(fd, buf, 1, 10) < 0 && errno == EFBIG ? 0 : 1);
+        }
+        result("child", reaped(pid));
+        close(fd);
+        unlink(path);
+        return 0;
+    }
     if (!strcmp(mode, "nofile-limit")) {
         /* The soft RLIMIT_NOFILE bounds the descriptor numbers: room for two
            more past the lowest free one. */

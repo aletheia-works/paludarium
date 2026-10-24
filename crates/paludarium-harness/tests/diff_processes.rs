@@ -111,6 +111,7 @@ mod linux {
         processes_access => ("access","process"),
         processes_rlimit => ("rlimit","process"),
         processes_nofile_limit => ("nofile-limit","process"),
+        processes_fsize_limit => ("fsize-limit","process"),
         processes_pgid => ("pgid","process"),
         processes_sysinfo => ("sysinfo","process"),
         processes_statfs => ("statfs","process"),

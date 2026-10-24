@@ -127,6 +127,9 @@ class World:
                 passed=True,
                 caseCount=28,
                 rows={"interpreter": guest_rows(True), "jit": guest_rows(True)},
+                restored={
+                    m: {n: guest_rows(True)[n] for n in A.AUBE_ROWS} for m in ("interpreter", "jit")
+                },
                 modes={
                     m: dict(rows={}, complete=True, passed=True) for m in ("interpreter", "jit")
                 },
@@ -371,6 +374,60 @@ class AcceptanceTests(unittest.TestCase):
             lambda d: d["modes"]["jit"].update(passed=False),
         )
         self.rejected("wasm-modes not met by wasm-firefox")
+
+    def test_restored_step_failure(self):
+        self.world.edit(
+            A.FULL_QUALITY,
+            "wasm-chromium",
+            "observations.json",
+            lambda d: d["restored"]["jit"]["install"].update(**{"pass": False}),
+        )
+        self.rejected("wasm-modes not met by wasm-chromium")
+
+    def test_restored_step_differs_from_oracle(self):
+        self.world.edit(
+            A.FULL_QUALITY,
+            "wasm-node",
+            "observations.json",
+            lambda d: d["restored"]["interpreter"]["frozen"].update(exit=1),
+        )
+        self.rejected("wasm-modes not met by wasm-node")
+
+    def test_restored_steps_missing(self):
+        self.world.edit(
+            A.FULL_QUALITY,
+            "wasm-safari",
+            "observations.json",
+            lambda d: d["restored"]["jit"].pop("list"),
+        )
+        self.rejected("wasm-safari jit: restored aube steps incomplete")
+
+    def test_restored_step_timed_out(self):
+        self.world.edit(
+            A.FULL_QUALITY,
+            "wasm-firefox",
+            "observations.json",
+            lambda d: d["restored"]["interpreter"]["install"].update(timed_out=True),
+        )
+        self.rejected("wasm-firefox interpreter: restored aube steps incomplete or timed out")
+
+    def test_restored_version_differs_from_oracle(self):
+        self.world.edit(
+            A.FULL_QUALITY,
+            "wasm-node",
+            "observations.json",
+            lambda d: d["restored"]["jit"]["version"].update(stdout="2.8.0\n"),
+        )
+        self.rejected("wasm-modes not met by wasm-node")
+
+    def test_restored_group_not_an_object(self):
+        self.world.edit(
+            A.FULL_QUALITY,
+            "wasm-chromium",
+            "observations.json",
+            lambda d: d.update(restored=["version"]),
+        )
+        self.rejected("wasm-chromium interpreter: restored aube steps incomplete")
 
     def test_guest_bytes_differ_from_oracle(self):
         self.world.edit(

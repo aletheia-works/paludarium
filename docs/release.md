@@ -99,7 +99,7 @@ built guests differ by design.
 |---|---|---|
 | Probe | all native and Wasm sources (Wasm interpreter mode) | every probe row exits 0 and prints exactly its `PASS <item>` line; `probe-all` prints all eight; `probe-environment` starts with `PASS` |
 | aube | same | the four aube commands have the oracle's exit codes and the same `--version` stdout; the job's own runner compares full stdout/exit and fails the job on a difference |
-| Wasm modes | the four Wasm sources | `complete` and `passed`, 28 cases, both `interpreter` and `jit` modes complete and passed, every row `pass: true`, probe and aube checks above in both modes |
+| Wasm modes | the four Wasm sources | `complete` and `passed`, 28 cases, both `interpreter` and `jit` modes complete and passed, every row `pass: true`, probe and aube checks above in both modes; in both modes the four aube steps rerun on rebuilt filesystems (`restored`) are all there, `pass: true`, and match the oracle's exit status and `--version` output |
 | Performance | performance | `head` equals the released head, `complete`, `passed`, `warmupsPassed`, `result.pass`, `p < 0.05`, mean JIT time below mean interpreter time, 20 rows all exit 0 and passed |
 
 Shared checks: all native documents are complete (`differential_complete`,

@@ -434,12 +434,25 @@ def wasm(label, documents, digests):
     for mode in ("interpreter", "jit"):
         state = modes.get(mode) or {}
         rows = rows_of(document.get("rows", {}), mode, label + " " + mode)
+        # The aube steps again, each on a filesystem rebuilt from the
+        # previous step's snapshot.
+        restored = document.get("restored")
+        restored = restored.get(mode) if isinstance(restored, dict) else None
+        policy.require(
+            isinstance(restored, dict)
+            and set(restored) == set(AUBE_ROWS)
+            and all(row_ok(restored[n]) for n in AUBE_ROWS),
+            f"{label} {mode}: restored aube steps incomplete or timed out",
+        )
         mode_ok = (
             state.get("complete") is True
             and state.get("passed") is True
             and all(rows[n].get("pass") is True for n in ROWS)
+            and all(restored[n].get("pass") is True for n in AUBE_ROWS)
         )
-        result[mode] = dict(verdicts(rows, oracle), mode_passed=mode_ok)
+        result[mode] = dict(
+            verdicts(rows, oracle), restored=aube_matches(restored, oracle), mode_passed=mode_ok
+        )
     module = document.get("module_sha256")
     policy.require(
         isinstance(module, str) and bool(re.fullmatch("[0-9a-f]{64}", module)),
@@ -560,7 +573,8 @@ def condition_passed(condition, checked):
             ok = result["passed"]
         elif condition == "wasm-modes":
             ok = all(
-                m["mode_passed"] and m["probe"] and m["aube"] for m in result["modes"].values()
+                m["mode_passed"] and m["probe"] and m["aube"] and m["restored"]
+                for m in result["modes"].values()
             )
         elif label in WASM_SOURCES:
             ok = (

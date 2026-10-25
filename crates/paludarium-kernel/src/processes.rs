@@ -44,6 +44,9 @@ struct Entry {
     /// The signal its exit sends the parent (clone's CSIGNAL bits); only a
     /// SIGCHLD child can be reaped automatically.
     exit_signal: i32,
+    /// PR_SET_CHILD_SUBREAPER: orphaned descendants come to this process
+    /// rather than to the first one. Not inherited on fork, kept on exec.
+    subreaper: bool,
     /// The task the process counts as until it is reaped, as its leader does
     /// in Linux's pids controller even as a zombie.
     _task: TaskCharge,
@@ -123,6 +126,7 @@ impl Processes {
                     continue_report: false,
                     children_cpu: 0,
                     exit_signal: signals::SIGCHLD,
+                    subreaper: false,
                     _task: TaskCharge(Arc::clone(&tasks)),
                 },
             )])),
@@ -197,6 +201,7 @@ impl Processes {
                 continue_report: false,
                 children_cpu: 0,
                 exit_signal,
+                subreaper: false,
                 _task: task,
             },
         );
@@ -222,6 +227,13 @@ impl Processes {
                 entry.dumpable = a[1] == 1;
                 Ok(None)
             }
+            // PR_SET_CHILD_SUBREAPER, PR_GET_CHILD_SUBREAPER (written out by
+            // the caller)
+            36 => {
+                entry.subreaper = a[1] != 0;
+                Ok(None)
+            }
+            37 => Ok(Some(i32::from(entry.subreaper))),
             // PR_SET_NO_NEW_PRIVS (only to 1, for good), PR_GET_NO_NEW_PRIVS
             38 if a[1] == 1 && a[2] == 0 && a[3] == 0 && a[4] == 0 => {
                 entry.no_new_privs = true;
@@ -391,34 +403,13 @@ impl Processes {
     }
     pub(crate) fn finish(&self, pid: u32, status: ExitStatus) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let (parent, status, cpu) = if let Some(entry) = entries.get_mut(&pid) {
+        if let Some(entry) = entries.get_mut(&pid) {
             if entry.group.active_threads() != 0 {
                 return;
             }
-            let status = entry.group.status().unwrap_or(status);
-            entry.status = Some(status);
-            (entry.parent, status, entry.group.process_cpu())
+            entry.status = Some(entry.group.status().unwrap_or(status));
         } else {
             return;
-        };
-        // As Linux's do_notify_parent: a SIGCHLD child of a parent that
-        // ignores SIGCHLD or set SA_NOCLDWAIT is reaped at once, and with
-        // SIGCHLD ignored the parent gets no signal.
-        let exit_signal = entries.get(&pid).map_or(0, |entry| entry.exit_signal);
-        let mut reap = false;
-        if let Some(parent) = entries.get(&parent) {
-            let (ignored, no_wait) = parent.group.child_exit_disposition();
-            reap = exit_signal == signals::SIGCHLD && (ignored || no_wait);
-            let (code, status) = match status {
-                ExitStatus::Signaled(signal) => (signals::CLD_KILLED, signal),
-                ExitStatus::Exited(code) => (signals::CLD_EXITED, code & 255),
-                _ => (signals::CLD_EXITED, 0),
-            };
-            if !(reap && ignored) {
-                parent
-                    .group
-                    .notify_child(code, signals::ChildSignal { pid, status, cpu });
-            }
         }
         // Children that asked for it learn that this process exited.
         for child in entries.values() {
@@ -426,11 +417,78 @@ impl Processes {
                 let _ = child.group.send_process(child.death_signal);
             }
         }
-        // Its CPU time does not join the parent's children's, as in Linux,
-        // where only a wait adds it.
-        if reap {
+        // As Linux's forget_original_parent: the children go to the nearest
+        // live ancestor that is a child subreaper, else to the first
+        // process, with SIGCHLD as their exit signal, and one that has
+        // already exited is reported to its new parent.
+        if let Some(reaper) = Self::new_reaper(&entries, pid) {
+            let orphans: Vec<u32> = entries
+                .iter()
+                .filter(|(_, entry)| entry.parent == pid)
+                .map(|(&orphan, _)| orphan)
+                .collect();
+            for orphan in orphans {
+                if let Some(entry) = entries.get_mut(&orphan) {
+                    entry.parent = reaper;
+                    entry.exit_signal = signals::SIGCHLD;
+                }
+                if entries
+                    .get(&orphan)
+                    .is_some_and(|entry| entry.status.is_some())
+                    && Self::notify_parent(&entries, orphan)
+                {
+                    entries.remove(&orphan);
+                }
+            }
+        }
+        if Self::notify_parent(&entries, pid) {
             entries.remove(&pid);
         }
+    }
+    /// Who adopts the children of `pid`: the nearest ancestor that set
+    /// PR_SET_CHILD_SUBREAPER and has not exited, else the first process,
+    /// which acts as the init of a PID namespace. None when that is `pid`
+    /// itself or has exited.
+    fn new_reaper(entries: &BTreeMap<u32, Entry>, pid: u32) -> Option<u32> {
+        let mut ancestor = entries.get(&pid)?.parent;
+        while let Some(entry) = entries.get(&ancestor) {
+            if entry.subreaper && entry.status.is_none() {
+                return Some(ancestor);
+            }
+            ancestor = entry.parent;
+        }
+        entries
+            .get(&1)
+            .filter(|entry| pid != 1 && entry.status.is_none())
+            .map(|_| 1)
+    }
+    /// Tells the parent of `pid`, which has exited, as Linux's
+    /// do_notify_parent: a SIGCHLD child of a parent that ignores SIGCHLD or
+    /// set SA_NOCLDWAIT is to be reaped at once (true), and with SIGCHLD
+    /// ignored the parent gets no signal. A child reaped this way does not
+    /// add its CPU time to the parent's children's, as in Linux, where only a
+    /// wait adds it.
+    fn notify_parent(entries: &BTreeMap<u32, Entry>, pid: u32) -> bool {
+        let Some(entry) = entries.get(&pid) else {
+            return false;
+        };
+        let (Some(status), Some(parent)) = (entry.status, entries.get(&entry.parent)) else {
+            return false;
+        };
+        let (ignored, no_wait) = parent.group.child_exit_disposition();
+        let reap = entry.exit_signal == signals::SIGCHLD && (ignored || no_wait);
+        let (code, status) = match status {
+            ExitStatus::Signaled(signal) => (signals::CLD_KILLED, signal),
+            ExitStatus::Exited(code) => (signals::CLD_EXITED, code & 255),
+            _ => (signals::CLD_EXITED, 0),
+        };
+        if !(reap && ignored) {
+            let cpu = entry.group.process_cpu();
+            parent
+                .group
+                .notify_child(code, signals::ChildSignal { pid, status, cpu });
+        }
+        reap
     }
     pub fn active_threads(&self) -> usize {
         self.entries
@@ -807,10 +865,10 @@ impl Kernel {
             _ => Err(Errno(3)),
         }
     }
-    /// `prctl(option, ...)`: PR_SET/GET_NAME (per thread), PR_SET/GET_PDEATHSIG,
-    /// PR_SET/GET_DUMPABLE and PR_SET/GET_NO_NEW_PRIVS; any other option is
-    /// EINVAL, as Linux gives
-    /// for options it does not know.
+    /// `prctl(option, ...)`: PR_SET/GET_NAME (per thread),
+    /// PR_SET/GET_PDEATHSIG, PR_SET/GET_DUMPABLE, PR_SET/GET_CHILD_SUBREAPER
+    /// and PR_SET/GET_NO_NEW_PRIVS; any other option is EINVAL, as Linux
+    /// gives for options it does not know.
     fn prctl(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         match a[0] {
             // PR_SET_NAME: up to 15 bytes, ending at a NUL; the rest of the
@@ -838,7 +896,7 @@ impl Kernel {
             _ => {}
         }
         match self.processes.prctl(self.process.pid, a[0], a)? {
-            Some(value) if a[0] == 2 => {
+            Some(value) if a[0] == 2 || a[0] == 37 => {
                 mem.write(GuestAddr(a[1]), &value.to_le_bytes())
                     .map_err(|_| Errno::EFAULT)?;
                 Ok(0)

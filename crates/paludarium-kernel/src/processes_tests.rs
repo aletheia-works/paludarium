@@ -501,6 +501,93 @@ mod process {
         assert!(k.take_child().is_none());
     }
     #[test]
+    fn orphans_go_to_the_first_process_or_the_nearest_subreaper() {
+        let (mut k, mut t, m) = setup();
+        let getppid =
+            |k: &mut Kernel, t: &mut Thread, m: &AddressSpace| syscall(k, t, m, 110, [0; 6]);
+        // Without a subreaper the first process adopts a grandchild.
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let (mut g, mut gt, gm) = fork(&mut c, &mut ct, &cm);
+        assert_eq!(getppid(&mut g, &mut gt, &gm), u64::from(ct.tid));
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(getppid(&mut g, &mut gt, &gm), 1);
+        finish(&mut g, &gt, &gm, ExitStatus::Exited(7));
+        let grandchild = u64::from(gt.tid);
+        m.write_u64(GuestAddr(DATA + 8), 0).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [grandchild, DATA + 8, 0, 0, 0, 0]),
+            grandchild
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA + 8)).unwrap() >> 8 & 0xff, 7);
+        // A subreaper adopts its descendants; its children do not inherit it.
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        assert_eq!(syscall(&mut s, &mut st, &sm, 157, [36, 1, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 157, [37, DATA + 16, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(sm.read_u64(GuestAddr(DATA + 16)).unwrap() as u32, 1);
+        let (mut c, mut ct, cm) = fork(&mut s, &mut st, &sm);
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 157, [37, DATA + 16, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(cm.read_u64(GuestAddr(DATA + 16)).unwrap() as u32, 0);
+        let (mut g, mut gt, gm) = fork(&mut c, &mut ct, &cm);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(getppid(&mut g, &mut gt, &gm), u64::from(st.tid));
+        // An unset subreaper adopts nothing more.
+        assert_eq!(syscall(&mut s, &mut st, &sm, 157, [36, 0, 0, 0, 0, 0]), 0);
+        let (mut c, mut ct, cm) = fork(&mut s, &mut st, &sm);
+        let (mut h, mut ht, hm) = fork(&mut c, &mut ct, &cm);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(getppid(&mut h, &mut ht, &hm), 1);
+    }
+    #[test]
+    fn an_orphaned_zombie_is_reported_to_its_new_parent() {
+        let (mut k, mut t, m) = setup();
+        m.write_u64(GuestAddr(DATA), 1 << 16).unwrap();
+        syscall(&mut k, &mut t, &m, 14, [0, DATA, 0, 8, 0, 0]);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let (mut g, gt, gm) = fork(&mut c, &mut ct, &cm);
+        finish(&mut g, &gt, &gm, ExitStatus::Exited(9));
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        // SIGCHLD for the child, then for the zombie it left: one is kept
+        // while the other is pending, so take them as they come.
+        assert_eq!(take_sigchld(&mut k, &mut t, &m).0, 17);
+        let grandchild = u64::from(gt.tid);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [grandchild, 0, 0, 0, 0, 0]),
+            grandchild
+        );
+        // With SIGCHLD ignored the adopted zombie is reaped at once, and a
+        // child created with another exit signal gets SIGCHLD on adoption.
+        let bytes = [1u64, 0, 0, 0].map(u64::to_le_bytes).concat();
+        m.write(GuestAddr(DATA + 256), &bytes).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 13, [17, DATA + 256, 0, 8, 0, 0]),
+            0
+        );
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let (mut g, gt, gm) = fork(&mut c, &mut ct, &cm);
+        let other = syscall(&mut c, &mut ct, &cm, 56, [0; 6]);
+        let (mut o, ot) = c.take_child().unwrap();
+        let om = o.take_spawn_memory().unwrap();
+        finish(&mut g, &gt, &gm, ExitStatus::Exited(9));
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        let echild = Errno(10).to_syscall_return();
+        let grandchild = u64::from(gt.tid);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [grandchild, 0, 0, 0, 0, 0]),
+            echild
+        );
+        finish(&mut o, &ot, &om, ExitStatus::Exited(0));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [other, 0, 0x4000_0000, 0, 0, 0]),
+            echild
+        );
+    }
+    #[test]
     fn stop_resumes_a_timed_futex_wait() {
         for changed in [false, true] {
             let (mut k, mut t, m) = setup();

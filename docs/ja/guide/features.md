@@ -205,8 +205,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `prctl` は `PR_SET_NAME`／`PR_GET_NAME`（スレッドごとの 15 バイトまでの名前。
   `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、
   `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、`PR_SET_DUMPABLE`、
+  `PR_SET_CHILD_SUBREAPER`（`fork` では受け継がれず、`execve` では残ります）、
   `PR_SET_NO_NEW_PRIVS` と、それぞれの `PR_GET_*` に対応します。ほかの指定には
   `EINVAL` を返します。
+- プロセスが終わると、その子は、`PR_SET_CHILD_SUBREAPER` を設定していてまだ終わって
+  いない一番近い祖先に、いなければ PID 名前空間の init にあたる最初のプロセスに
+  引き取られます。Linux の `forget_original_parent` と同じです。その後 `getppid` は
+  新しい親を返し、新しい親はその子を待てて、子の終了シグナルは `SIGCHLD` になります。
+  すでに終わっていた子は、すぐに新しい親に知らせます（その親が `SIGCHLD` を
+  無視していれば、すぐに回収します）。
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
   8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ハードの
   `RLIMIT_NOFILE` は 1048576（Linux の `fs.nr_open`）まで、埋め込む側がそれより低い

@@ -223,8 +223,16 @@ kernel.
 - `prctl` supports `PR_SET_NAME`/`PR_GET_NAME` (a name of up to 15 bytes per
   thread, taken from the program's file name at `execve` and inherited by new
   threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the
-  parent exits), `PR_SET_DUMPABLE` and `PR_SET_NO_NEW_PRIVS` with their
+  parent exits), `PR_SET_DUMPABLE`, `PR_SET_CHILD_SUBREAPER` (not inherited
+  on `fork`, kept on `execve`) and `PR_SET_NO_NEW_PRIVS` with their
   `PR_GET_*`; other options give `EINVAL`.
+- When a process exits, its children go to the nearest ancestor that set
+  `PR_SET_CHILD_SUBREAPER` and has not exited, or else to the first process,
+  which acts as the init of a PID namespace, as Linux's
+  `forget_original_parent` does. `getppid` then reports the new parent, which
+  can wait for them, and their exit signal becomes `SIGCHLD`. A child that has
+  already exited is reported to the new parent at once (and reaped at once if
+  that parent ignores `SIGCHLD`).
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's

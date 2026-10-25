@@ -36,6 +36,7 @@
     {"name":"proc-status","binary":"process"},
     {"name":"waitid","binary":"process"},
     {"name":"autoreap","binary":"process"},
+    {"name":"reparent","binary":"process"},
     {"name":"ignore-discards","binary":"process"},
     {"name":"thread-name","binary":"process"},
     {"name":"timer-thread","binary":"process"},

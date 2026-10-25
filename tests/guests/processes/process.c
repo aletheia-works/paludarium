@@ -1119,6 +1119,53 @@ int main(int argc, char **argv) {
         result("other-status", WEXITSTATUS(status));
         return 0;
     }
+    if (!strcmp(mode, "reparent")) {
+        /* A child subreaper adopts the children of a child that exits, and
+           can wait for them; its own children do not inherit the setting. */
+        int flag = -1;
+        result("subreaper-default", prctl(PR_GET_CHILD_SUBREAPER, &flag) == 0 ? flag : -1);
+        prctl(PR_SET_CHILD_SUBREAPER, 1);
+        prctl(PR_GET_CHILD_SUBREAPER, &flag);
+        result("subreaper", flag);
+        int ready[2], go[2];
+        if (pipe(ready) || pipe(go)) return 87;
+        pid_t self = getpid(), grand = 0, zombie = 0;
+        int status = 0;
+        pid_t middle = child();
+        if (middle == 0) {
+            int inherited = -1;
+            prctl(PR_GET_CHILD_SUBREAPER, &inherited);
+            pid_t pid = child();
+            if (pid == 0) {
+                char byte;
+                if (read(go[0], &byte, 1) != 1) _exit(5);
+                _exit(getppid() == self ? 3 : 4);
+            }
+            if (write(ready[1], &pid, sizeof pid) != sizeof pid) _exit(6);
+            _exit(inherited);
+        }
+        if (read(ready[0], &grand, sizeof grand) != sizeof grand) return 88;
+        result("middle", waitpid(middle, &status, 0) == middle);
+        result("middle-inherited", WEXITSTATUS(status));
+        if (write(go[1], "x", 1) != 1) return 89;
+        result("adopted", waitpid(grand, &status, 0) == grand);
+        result("adopted-ppid", WEXITSTATUS(status));
+        /* A zombie that an exiting child leaves comes along too. */
+        middle = child();
+        if (middle == 0) {
+            pid_t pid = child();
+            if (pid == 0) _exit(5);
+            siginfo_t info;
+            waitid(P_PID, pid, &info, WEXITED | WNOWAIT);
+            if (write(ready[1], &pid, sizeof pid) != sizeof pid) _exit(6);
+            _exit(0);
+        }
+        if (read(ready[0], &zombie, sizeof zombie) != sizeof zombie) return 90;
+        waitpid(middle, &status, 0);
+        result("zombie-adopted", waitpid(zombie, &status, 0) == zombie);
+        result("zombie-status", WEXITSTATUS(status));
+        return 0;
+    }
     if (!strcmp(mode, "waitid")) {
         siginfo_t info;
         pid_t pid = child();

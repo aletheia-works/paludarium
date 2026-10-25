@@ -24,6 +24,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ひとつで、ソケットでディスクリプタを受け渡せません（`SCM_RIGHTS`）。`chown`、
   `fchown`、`lchown`、`fchownat` もそうで、すべてのファイルは root（ユーザーと
   グループが 0）のものです。
+- **名前空間**：名前空間のフラグ（`CLONE_NEWNS`、`CLONE_NEWUTS`、`CLONE_NEWIPC`、
+  `CLONE_NEWUSER`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWCGROUP`、`clone3` では
+  `CLONE_NEWTIME` も）を付けた `clone` と `clone3` は、子を作らずに `EINVAL` で失敗します。
+  Linux では、root で動くゲストは名前空間を作れます。`unshare` と `setns` は `ENOSYS` を
+  返します。
 - **穴のあるファイル**：メモリ上のファイルシステムのファイルは穴を持てないので、
   `ftruncate` や `fallocate` で大きくすると、新しい大きさの分だけホストのメモリを
   使います。

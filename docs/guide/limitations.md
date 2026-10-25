@@ -26,6 +26,12 @@ verified.
   `recvmsg`, so descriptors cannot be passed over a socket (`SCM_RIGHTS`),
   and `chown`, `fchown`, `lchown` and `fchownat`: every file belongs to root
   (user and group 0).
+- **Namespaces**: `clone` and `clone3` with a namespace flag
+  (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
+  `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for
+  `clone3`) fail with `EINVAL` and create no child, where Linux lets the
+  guest, which runs as root, create the namespace. `unshare` and `setns`
+  return `ENOSYS`.
 - **Sparse files**: a file of the in-memory filesystem has no holes, so
   growing it with `ftruncate` or `fallocate` takes as much host memory as its
   new size.

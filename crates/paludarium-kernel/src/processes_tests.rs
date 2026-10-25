@@ -966,3 +966,36 @@ mod ignored_pending {
         assert_eq!(pending(&mut k, &mut t, &em), USR1);
     }
 }
+mod namespaces {
+    use super::*;
+    #[test]
+    fn namespace_flags_and_calls_are_refused() {
+        let (mut k, mut t, m) = setup();
+        // CLONE_NEWNS, CLONE_NEWCGROUP, CLONE_NEWUTS, CLONE_NEWIPC,
+        // CLONE_NEWUSER, CLONE_NEWPID and CLONE_NEWNET, which root may use
+        // on Linux: no namespace is created, and neither is a child.
+        for flag in [
+            0x2_0000,
+            0x200_0000,
+            0x400_0000,
+            0x800_0000,
+            0x1000_0000,
+            0x2000_0000,
+            0x4000_0000,
+        ] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 56, [flag | 17, 0, 0, 0, 0, 0]),
+                Errno::EINVAL.to_syscall_return(),
+                "{flag:#x}"
+            );
+            assert!(k.take_child().is_none());
+        }
+        // unshare and setns are not implemented.
+        for number in [272, 308] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, number, [0; 6]),
+                Errno::ENOSYS.to_syscall_return()
+            );
+        }
+    }
+}

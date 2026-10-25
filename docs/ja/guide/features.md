@@ -245,8 +245,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `SIGCHLD` の siginfo には、子の PID、`CLD_*` のコード（`CLD_EXITED`、`CLD_KILLED`、
   `CLD_STOPPED`、`CLD_CONTINUED`）、状態、`si_utime` としての CPU 時間が入ります。
   `si_uid` は 0 で、`SIGCHLD` が保留中に届いた次の `SIGCHLD` は、Linux と同じく捨てます。
+  `SIGCHLD` を無視するか `SA_NOCLDWAIT` を設定したプロセスの子は、終了シグナルが
+  `SIGCHLD` なら、Linux の `do_notify_parent` と同じく終わったその場で回収します。
+  待ちはそうした子が終わるまで待ってから `ECHILD` で失敗し、その CPU 時間は親の
+  子の分に足しません。`SIGCHLD` を無視しているときは、ブロック中でも `SIGCHLD` を
+  保留しません。それより前にできたゾンビは、待ちのために残ります。
   `pidfd_open` の pidfd は、そのプロセスが終わると読めるようになり（回収されると
-  切断も示します）、`epoll` で待てます。ノンブロッキングの pidfd での
+  切断も示します。自動で回収された子では両方を同時に示します）、`epoll` で待てます。ノンブロッキングの pidfd での
   `waitid(P_PIDFD)` は `EAGAIN` を返します。`pidfd_send_signal` は siginfo と
   範囲の指定を受け付けず、`PIDFD_THREAD` を付けてもプロセス全体を指します。
 - 不正なポインタを渡されたときは `EFAULT` を返します。

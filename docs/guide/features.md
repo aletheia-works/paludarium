@@ -265,9 +265,15 @@ kernel.
   it set `SA_NOCLDSTOP`. The siginfo of `SIGCHLD` carries the child's PID, its
   `CLD_*` code (`CLD_EXITED`, `CLD_KILLED`, `CLD_STOPPED`, `CLD_CONTINUED`), its
   status and its CPU time as `si_utime`; `si_uid` is 0, and a `SIGCHLD` sent
-  while one is pending is dropped, as Linux does. A pidfd from `pidfd_open` becomes
-  readable when its process exits (and hung up once it is reaped), so `epoll`
-  can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives `EAGAIN`.
+  while one is pending is dropped, as Linux does. A child of a process that
+  ignores `SIGCHLD` or set `SA_NOCLDWAIT` is reaped as it exits, as Linux's
+  `do_notify_parent` does when its exit signal is `SIGCHLD`: a wait blocks
+  until such children have exited, then fails with `ECHILD`, their CPU time
+  does not join the parent's children's, and with `SIGCHLD` ignored no
+  `SIGCHLD` is queued, even while blocked. A zombie from before stays for a
+  wait. A pidfd from `pidfd_open` becomes
+  readable when its process exits (and hung up once it is reaped; an
+  automatically reaped child shows both at once), so `epoll` can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives `EAGAIN`.
   `pidfd_send_signal` takes no siginfo and no scope flags, and `PIDFD_THREAD`
   still names the whole process.
 - Invalid pointers return `EFAULT`.

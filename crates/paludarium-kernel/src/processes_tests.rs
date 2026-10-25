@@ -430,6 +430,77 @@ mod process {
         assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [1, ct.tid, 0]));
     }
     #[test]
+    fn ignored_sigchld_reaps_children_at_once() {
+        let (k, mut t, m) = setup();
+        let mut k = k.with_task_limit(3);
+        let none = Errno::EAGAIN.to_syscall_return();
+        let echild = Errno(10).to_syscall_return();
+        m.write_u64(GuestAddr(DATA), 1 << 16).unwrap();
+        syscall(&mut k, &mut t, &m, 14, [0, DATA, 0, 8, 0, 0]);
+        let action = |k: &mut Kernel, t: &mut Thread, handler: u64, flags: u64| {
+            let bytes = [handler, flags, 0, 0].map(u64::to_le_bytes).concat();
+            m.write(GuestAddr(DATA + 256), &bytes).unwrap();
+            assert_eq!(syscall(k, t, &m, 13, [17, DATA + 256, 0, 8, 0, 0]), 0);
+        };
+        // A zombie from before SIGCHLD is ignored stays for a wait.
+        let (mut z, zt, zm) = fork(&mut k, &mut t, &m);
+        finish(&mut z, &zt, &zm, ExitStatus::Exited(5));
+        assert_eq!(take_sigchld(&mut k, &mut t, &m).0, 17);
+        action(&mut k, &mut t, 1, 0);
+        // Ignored: the child is gone at its exit, with no SIGCHLD even while
+        // blocked, and gives its task back.
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(3));
+        assert_eq!(take_sigchld(&mut k, &mut t, &m).0, none);
+        let child = u64::from(ct.tid);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [child, 0, 0, 0, 0, 0]),
+            echild
+        );
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(3));
+        let zombie = u64::from(zt.tid);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [zombie, 0, 0, 0, 0, 0]),
+            zombie
+        );
+        // SA_NOCLDWAIT with a handler: reaped as well, but SIGCHLD comes.
+        action(&mut k, &mut t, 0x401000, 2);
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(4));
+        assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [1, ct.tid, 4]));
+        let child = u64::from(ct.tid);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [child, 0, 0, 0, 0, 0]),
+            echild
+        );
+        // A child whose exit signal is not SIGCHLD is not reaped.
+        action(&mut k, &mut t, 1, 0);
+        let pid = syscall(&mut k, &mut t, &m, 56, [0; 6]);
+        let (mut c, ct) = k.take_child().unwrap();
+        let cm = c.take_spawn_memory().unwrap();
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(6));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [pid, 0, 0x4000_0000, 0, 0, 0]),
+            pid
+        );
+    }
+    #[test]
+    fn clone3_with_clone_newtime_creates_no_child() {
+        // clone3 joins CLONE_NEWTIME (0x80) to the exit signal's bits, so
+        // the clone sees 0x91 there and refuses it: no child is left whose
+        // exit signal is not SIGCHLD. Time namespaces are not supported.
+        let (mut k, mut t, m) = setup();
+        let words = [0x80u64, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0];
+        m.write(GuestAddr(DATA + 512), &words.map(u64::to_le_bytes).concat())
+            .unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 435, [DATA + 512, 88, 0, 0, 0, 0]),
+            Errno::EINVAL.to_syscall_return()
+        );
+        assert!(k.take_child().is_none());
+    }
+    #[test]
     fn stop_resumes_a_timed_futex_wait() {
         for changed in [false, true] {
             let (mut k, mut t, m) = setup();

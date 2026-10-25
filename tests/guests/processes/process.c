@@ -1075,6 +1075,50 @@ int main(int argc, char **argv) {
         pthread_join(reader, NULL);
         return 0;
     }
+    if (!strcmp(mode, "autoreap")) {
+        /* With SIGCHLD ignored, or SA_NOCLDWAIT, an exiting child is reaped
+           at once: a wait blocks until it has exited, then fails with
+           ECHILD. Ignored, SIGCHLD is not even queued while blocked. */
+        sigset_t chld, pending;
+        sigemptyset(&chld);
+        sigaddset(&chld, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &chld, NULL);
+        int status = 0;
+        siginfo_t info;
+        /* A zombie from before SIGCHLD is ignored stays for a wait. */
+        pid_t zombie = child();
+        if (zombie == 0) _exit(5);
+        waitid(P_PID, zombie, &info, WEXITED | WNOWAIT);
+        sigwaitinfo(&chld, &info);
+        signal(SIGCHLD, SIG_IGN);
+        pid_t pid = child();
+        if (pid == 0) _exit(3);
+        errno = 0;
+        result("ignored-wait", waitpid(pid, &status, 0));
+        result("ignored-errno", errno);
+        sigpending(&pending);
+        result("ignored-pending", sigismember(&pending, SIGCHLD));
+        errno = 0;
+        result("ignored-gone", kill(pid, 0) == -1 && errno == ESRCH);
+        result("zombie-kept", reaped(zombie));
+        /* SA_NOCLDWAIT with a handler: reaped as well, but SIGCHLD comes. */
+        struct sigaction action = { .sa_handler = interrupted, .sa_flags = SA_NOCLDWAIT };
+        sigaction(SIGCHLD, &action, NULL);
+        pid = child();
+        if (pid == 0) _exit(4);
+        errno = 0;
+        result("nocldwait-wait", waitpid(pid, &status, 0));
+        result("nocldwait-errno", errno);
+        sigpending(&pending);
+        result("nocldwait-pending", sigismember(&pending, SIGCHLD));
+        /* A child whose exit signal is not SIGCHLD is not reaped. */
+        signal(SIGCHLD, SIG_IGN);
+        pid = syscall(SYS_clone, 0, 0, 0, 0, 0);
+        if (pid == 0) _exit(6);
+        result("other-signal", waitpid(pid, &status, __WALL) == pid);
+        result("other-status", WEXITSTATUS(status));
+        return 0;
+    }
     if (!strcmp(mode, "waitid")) {
         siginfo_t info;
         pid_t pid = child();

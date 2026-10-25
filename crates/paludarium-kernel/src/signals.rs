@@ -104,6 +104,11 @@ pub(crate) struct ChildSignal {
     /// CPU time in nanoseconds, all reported as user time.
     pub cpu: u64,
 }
+pub(crate) const SIGCHLD: i32 = 17;
+/// The handler value of an ignored signal, and SIGCHLD's `sa_flags`.
+pub(crate) const SIG_IGN: u64 = 1;
+pub(crate) const SA_NOCLDSTOP: u64 = 1;
+pub(crate) const SA_NOCLDWAIT: u64 = 2;
 /// `si_code` values of SIGCHLD.
 pub(crate) const CLD_EXITED: i32 = 1;
 pub(crate) const CLD_KILLED: i32 = 2;

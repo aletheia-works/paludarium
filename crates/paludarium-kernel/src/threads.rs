@@ -384,6 +384,20 @@ impl ThreadGroup {
     pub(crate) fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }
+    /// Whether this process ignores SIGCHLD and whether it set
+    /// SA_NOCLDWAIT, which decide if an exiting child is reaped at once.
+    pub(crate) fn child_exit_disposition(&self) -> (bool, bool) {
+        self.shared_actions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&signals::SIGCHLD)
+            .map_or((false, false), |action| {
+                (
+                    action.handler == signals::SIG_IGN,
+                    action.flags & signals::SA_NOCLDWAIT != 0,
+                )
+            })
+    }
     /// Whether a child's stop or continue sends this process SIGCHLD: not
     /// when it ignores SIGCHLD or set SA_NOCLDSTOP, as in Linux's
     /// `do_notify_parent_cldstop`.
@@ -391,8 +405,10 @@ impl ThreadGroup {
         self.shared_actions()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&17)
-            .is_none_or(|action| action.handler != 1 && action.flags & 1 == 0)
+            .get(&signals::SIGCHLD)
+            .is_none_or(|action| {
+                action.handler != signals::SIG_IGN && action.flags & signals::SA_NOCLDSTOP == 0
+            })
     }
     /// Starts a group stop; false when the group was already stopped.
     pub(crate) fn job_stop(&self) -> bool {

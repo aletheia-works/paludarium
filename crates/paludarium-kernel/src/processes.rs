@@ -41,6 +41,9 @@ struct Entry {
     continue_report: bool,
     /// CPU time of the children this process has waited for, and theirs.
     children_cpu: u64,
+    /// The signal its exit sends the parent (clone's CSIGNAL bits); only a
+    /// SIGCHLD child can be reaped automatically.
+    exit_signal: i32,
     /// The task the process counts as until it is reaped, as its leader does
     /// in Linux's pids controller even as a zombie.
     _task: TaskCharge,
@@ -119,6 +122,7 @@ impl Processes {
                     stop_report: None,
                     continue_report: false,
                     children_cpu: 0,
+                    exit_signal: signals::SIGCHLD,
                     _task: TaskCharge(Arc::clone(&tasks)),
                 },
             )])),
@@ -162,7 +166,14 @@ impl Processes {
             })
             .map_err(|_| Errno::EAGAIN)
     }
-    pub(crate) fn insert(&self, pid: u32, parent: u32, group: Arc<ThreadGroup>, task: TaskCharge) {
+    pub(crate) fn insert(
+        &self,
+        pid: u32,
+        parent: u32,
+        group: Arc<ThreadGroup>,
+        exit_signal: i32,
+        task: TaskCharge,
+    ) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let (pgid, sid, limits, dumpable, no_new_privs) = entries
             .get(&parent)
@@ -185,6 +196,7 @@ impl Processes {
                 stop_report: None,
                 continue_report: false,
                 children_cpu: 0,
+                exit_signal,
                 _task: task,
             },
         );
@@ -389,21 +401,35 @@ impl Processes {
         } else {
             return;
         };
+        // As Linux's do_notify_parent: a SIGCHLD child of a parent that
+        // ignores SIGCHLD or set SA_NOCLDWAIT is reaped at once, and with
+        // SIGCHLD ignored the parent gets no signal.
+        let exit_signal = entries.get(&pid).map_or(0, |entry| entry.exit_signal);
+        let mut reap = false;
         if let Some(parent) = entries.get(&parent) {
+            let (ignored, no_wait) = parent.group.child_exit_disposition();
+            reap = exit_signal == signals::SIGCHLD && (ignored || no_wait);
             let (code, status) = match status {
                 ExitStatus::Signaled(signal) => (signals::CLD_KILLED, signal),
                 ExitStatus::Exited(code) => (signals::CLD_EXITED, code & 255),
                 _ => (signals::CLD_EXITED, 0),
             };
-            parent
-                .group
-                .notify_child(code, signals::ChildSignal { pid, status, cpu });
+            if !(reap && ignored) {
+                parent
+                    .group
+                    .notify_child(code, signals::ChildSignal { pid, status, cpu });
+            }
         }
         // Children that asked for it learn that this process exited.
         for child in entries.values() {
             if child.parent == pid && child.status.is_none() && child.death_signal != 0 {
                 let _ = child.group.send_process(child.death_signal);
             }
+        }
+        // Its CPU time does not join the parent's children's, as in Linux,
+        // where only a wait adds it.
+        if reap {
+            entries.remove(&pid);
         }
     }
     pub fn active_threads(&self) -> usize {
@@ -605,7 +631,9 @@ impl paludarium_host::FileHandle for PidFd {
         Some(self)
     }
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
-        // POLLIN | POLLRDNORM after the exit, with POLLHUP after the reaping.
+        // POLLIN | POLLRDNORM after the exit, with POLLHUP after the reaping;
+        // a child reaped automatically has both from its exit, as in Linux's
+        // pidfd_poll once the task is gone.
         Ok(match self.processes.exited(self.pid) {
             Some(false) => (0, 0, 0),
             Some(true) => (0x41, 1, 0),
@@ -974,8 +1002,13 @@ impl Kernel {
                 .write(GuestAddr(a[3]), &pid.to_le_bytes());
         }
         let release = (flags & 0x4000 != 0).then(|| Arc::new(AtomicBool::new(false)));
-        self.processes
-            .insert(pid, self.process.pid, group.clone(), task);
+        self.processes.insert(
+            pid,
+            self.process.pid,
+            group.clone(),
+            (flags & 0xff) as i32,
+            task,
+        );
         let child = Kernel {
             host: self.host.clone(),
             process: crate::Process { pid },

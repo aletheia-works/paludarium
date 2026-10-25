@@ -29,9 +29,6 @@ verified.
 - **Sparse files**: a file of the in-memory filesystem has no holes, so
   growing it with `ftruncate` or `fallocate` takes as much host memory as its
   new size.
-- **Automatic reaping**: a child of a process that ignores `SIGCHLD` or sets
-  `SA_NOCLDWAIT` stays a zombie until it is waited for, where Linux reaps it
-  at once. Such zombies also count against a task limit.
 - **Some signal details**: no core file is written, so a child killed by `SIGSEGV`,
   `SIGABRT` or another core-dumping signal is reported as `CLD_KILLED`,
   without the core flag in its `wait` status, where Linux may report

@@ -12,8 +12,10 @@
 #![cfg_attr(target_arch = "wasm32", feature(stdarch_wasm_atomic_wait))]
 
 use std::io;
+#[cfg(all(not(target_arch = "wasm32"), not(unix)))]
+use std::io::Read;
 #[cfg(not(target_arch = "wasm32"))]
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 use paludarium_types::{Errno, Error, ErrorKind};
@@ -42,6 +44,17 @@ pub use wasm::WasmHost;
 pub mod testing;
 pub use clock::{ClockId, WaitOutcome};
 
+/// What reading the host's standard input would find now
+/// ([`Host::stdin_state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdinState {
+    /// Nothing yet: a read would wait.
+    Waiting,
+    /// Bytes wait to be read.
+    Readable,
+    /// The input has ended: a read returns 0.
+    Ended,
+}
 /// Standard stream identity remains attached to duplicated guest descriptors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamId {
@@ -176,6 +189,12 @@ pub trait Host: Send + Sync {
     }
     /// Reads from the host's standard input; `Ok(0)` at end of input.
     fn read_stdin(&self, buf: &mut [u8]) -> Result<usize, Errno>;
+    /// What reading the host's standard input would find now. `None` where
+    /// the host cannot tell; the guest then sees the stream as always
+    /// readable, as before.
+    fn stdin_state(&self) -> Option<StdinState> {
+        None
+    }
     /// Writes to the host's standard output; returns the bytes written.
     fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno>;
     /// Writes to the host's standard error; returns the bytes written.
@@ -262,8 +281,48 @@ impl Host for NativeHost {
     ) -> Result<WaitOutcome, Errno> {
         clock::native_wait(clock, deadline, cancel)
     }
+    /// On a Unix host the descriptor is read directly, past `std`'s buffer,
+    /// so that [`Host::stdin_state`] sees every byte not yet read. A closed
+    /// standard input (`EBADF`) reads as its end, as `std`'s `Stdin` has it.
     fn read_stdin(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        io::stdin().lock().read(buf).map_err(|e| errno_from_io(&e))
+        #[cfg(unix)]
+        {
+            match rustix::io::read(io::stdin(), buf) {
+                Err(rustix::io::Errno::BADF) => Ok(0),
+                result => result.map_err(|e| errno_from_io(&e.into())),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            io::stdin().lock().read(buf).map_err(|e| errno_from_io(&e))
+        }
+    }
+    /// A poll of the standard input that does not wait, on a Unix host:
+    /// input to read, or else a hang-up or a closed descriptor as its end.
+    fn stdin_state(&self) -> Option<StdinState> {
+        #[cfg(unix)]
+        {
+            use rustix::event::{PollFd, PollFlags, Timespec};
+            let stdin = io::stdin();
+            let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
+            let now = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            rustix::event::poll(&mut fds, Some(&now)).ok()?;
+            let revents = fds[0].revents();
+            Some(if revents.contains(PollFlags::IN) {
+                StdinState::Readable
+            } else if revents.is_empty() {
+                StdinState::Waiting
+            } else {
+                StdinState::Ended
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno> {

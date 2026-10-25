@@ -33,7 +33,10 @@ try {
 - `createPaludarium({ wasmUrl })` loads `paludarium.wasm` (shipped in the
   package) and starts the coordinator Worker.
 - `run(options)` starts one guest and returns at once. `stdin` is a
-  `WritableStream`, `stdout` and `stderr` are `ReadableStream`s of `Uint8Array`,
+  `WritableStream`: the guest's `poll`, `select` and `epoll` see it readable
+  only once bytes are written or it is closed, as a terminal is, so an
+  interactive program waits for keys. `stdout` and `stderr` are
+  `ReadableStream`s of `Uint8Array`,
   and `exited` resolves to `{ kind: "exited", code }` or
   `{ kind: "signaled", signal }`.
 - Drain both output streams and close `stdin` before awaiting `exited`.

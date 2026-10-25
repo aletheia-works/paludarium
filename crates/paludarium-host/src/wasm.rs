@@ -104,6 +104,16 @@ impl Host for WasmHost {
             unsafe { sleep_ms(10.0) };
         }
     }
+    fn stdin_state(&self) -> Option<crate::StdinState> {
+        let s = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(if s.position < s.stdin.len() {
+            crate::StdinState::Readable
+        } else if s.closed {
+            crate::StdinState::Ended
+        } else {
+            crate::StdinState::Waiting
+        })
+    }
     fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno> {
         self.streams
             .lock()

@@ -110,9 +110,14 @@ kernel.
 - `socket()` always returns `EAFNOSUPPORT`: there is no network.
 - `poll` waits like `epoll_wait`: until a descriptor is ready, the timeout
   in milliseconds passes (a negative one never does) or a signal arrives
-  (`EINTR`). The host's standard streams are always ready until a descriptor
-  replaces them. A pipe's read end is readable only with unread data, and
-  only hung up once its writers are gone, as Linux's `pipe_poll` reports.
+  (`EINTR`). The host's standard input is readable only with bytes to read
+  or once it has ended (a closed `Guest.stdin` in WebAssembly, the end of
+  the descriptor on a Unix host), as a Linux terminal or pipe is. At its end
+  it is also hung up (`POLLHUP`), and `read` returns 0. `poll`, `ppoll`,
+  `select`, `pselect6` and `epoll`, which can watch it, all see it so. A
+  host that cannot tell (Windows) keeps it always readable. The output
+  streams are always writable. A pipe's read end is readable only with unread data, and only hung up once
+  its writers are gone, as Linux's `pipe_poll` reports.
 - `ppoll`, `select` and `pselect6` wait the same way. They write the time
   left back to their timeout (not a zero one), as Linux does, and `ppoll` and
   `pselect6` take a temporary signal mask, which a handler runs with.

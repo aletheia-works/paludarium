@@ -38,6 +38,10 @@ verified.
   rounded up to 512-byte blocks, where Linux counts what the host's
   filesystem allocated; other Unix hosts give their own. On Linux and macOS
   hosts both come from the host.
+- **Standard input on Windows**: `poll`, `select` and `epoll` see the host's
+  standard input as always readable, as the Windows host cannot tell whether
+  input is waiting; on Linux and macOS hosts and in WebAssembly it is
+  readable only with input or at its end.
 - **Core files**: a core is written as with the kernel's default
   `core_pattern` (`core` in the working directory); a host that pipes cores to
   a crash handler (systemd-coredump, apport) is not modelled. The core holds

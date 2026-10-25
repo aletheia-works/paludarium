@@ -6,7 +6,7 @@ use std::sync::{Mutex, PoisonError};
 
 use paludarium_types::{Errno, Error};
 
-use crate::{ClockId, Host, StreamId, TerminalInfo, WaitOutcome};
+use crate::{ClockId, Host, StdinState, StreamId, TerminalInfo, WaitOutcome};
 
 struct Streams {
     terminals: [Option<TerminalInfo>; 3],
@@ -15,6 +15,10 @@ struct Streams {
     interrupt_wait: bool,
     stdin: Vec<u8>,
     stdin_pos: usize,
+    /// Whether more input may still come, as on a terminal, and whether it
+    /// was ever opened that way.
+    stdin_open: bool,
+    stdin_live: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -28,6 +32,8 @@ impl Default for Streams {
             interrupt_wait: false,
             stdin: Vec::new(),
             stdin_pos: 0,
+            stdin_open: false,
+            stdin_live: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
         }
@@ -72,6 +78,24 @@ impl RecordingHost {
         let host = Self::default();
         host.lock().stdin = input.to_vec();
         host
+    }
+
+    /// Keeps standard input open past its bytes, as a terminal stays open:
+    /// [`Host::stdin_state`] then reports it readable only with bytes to
+    /// read, and ended after [`Self::close_stdin`]. Reading past them still
+    /// returns 0.
+    pub fn open_stdin(&self) {
+        let mut s = self.lock();
+        s.stdin_open = true;
+        s.stdin_live = true;
+    }
+    /// Adds bytes to standard input.
+    pub fn push_stdin(&self, bytes: &[u8]) {
+        self.lock().stdin.extend_from_slice(bytes);
+    }
+    /// Ends standard input, which is then readable at its end.
+    pub fn close_stdin(&self) {
+        self.lock().stdin_open = false;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Streams> {
@@ -143,6 +167,23 @@ impl Host for RecordingHost {
             return Ok(WaitOutcome::Complete);
         }
         self.wait_until(clock, end, cancel)
+    }
+    /// Only once [`RecordingHost::open_stdin`] made it a live stream: bytes
+    /// to read, nothing yet, or its end after [`RecordingHost::close_stdin`].
+    /// A preset buffer stays always readable, as before.
+    fn stdin_state(&self) -> Option<StdinState> {
+        let s = self.lock();
+        if s.stdin_pos < s.stdin.len() {
+            Some(StdinState::Readable)
+        } else if s.stdin_live {
+            Some(if s.stdin_open {
+                StdinState::Waiting
+            } else {
+                StdinState::Ended
+            })
+        } else {
+            None
+        }
     }
     fn read_stdin(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let mut s = self.lock();

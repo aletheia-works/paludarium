@@ -824,6 +824,7 @@ fn sys_write(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 const POLLIN: u16 = 0x1;
 const POLLOUT: u16 = 0x4;
+const POLLHUP: u16 = 0x10;
 const POLLNVAL: u16 = 0x20;
 const POLLPRI: u16 = 0x2;
 const MAX_POLL_FDS: u64 = 1024;
@@ -1138,8 +1139,15 @@ fn select(
 fn revents(c: &Context<'_>, fd: i32, events: u16) -> u16 {
     match fd {
         fd if fd < 0 => 0,
-        // The host's own standard streams are always ready.
-        0 if c.files.uses_original_stdio(0) => events & POLLIN,
+        // The host's standard input is readable with bytes to read, and at
+        // its end readable and hung up, as a pipe or terminal whose other
+        // side is gone; where the host cannot tell, always readable. Its
+        // output streams always take a write.
+        0 if c.files.uses_original_stdio(0) => match c.host.stdin_state() {
+            Some(paludarium_host::StdinState::Waiting) => 0,
+            Some(paludarium_host::StdinState::Ended) => (events & POLLIN) | POLLHUP,
+            _ => events & POLLIN,
+        },
         1 | 2 if c.files.uses_original_stdio(fd as u64) => events & POLLOUT,
         _ => match c.files.descriptor(fd as u64) {
             Ok(d) => match d.file.readiness() {

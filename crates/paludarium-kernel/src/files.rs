@@ -163,6 +163,8 @@ impl Files {
                         file: Arc::new(StandardFile {
                             host: Arc::clone(&host),
                             channel,
+                            rises: AtomicU64::new(0),
+                            was_ready: std::sync::atomic::AtomicBool::new(false),
                         }),
                         path: Vec::new(),
                         cloexec: false,
@@ -1804,10 +1806,35 @@ pub(crate) fn write_io(
 struct StandardFile {
     host: Arc<dyn paludarium_host::Host>,
     channel: u32,
+    /// For edge-triggered epoll on standard input: how often it has become
+    /// ready, and whether it was ready when last asked.
+    rises: AtomicU64,
+    was_ready: std::sync::atomic::AtomicBool,
 }
 impl FileHandle for StandardFile {
     fn stdio_channel(&self) -> Option<u32> {
         Some(self.channel)
+    }
+    /// For epoll: standard input is readable as `poll` finds it, and hung
+    /// up as well at its end; the output streams are writable. A host stream
+    /// has no generation of its own, so the input's counts each time it
+    /// becomes ready, and an edge-triggered interest sees that.
+    fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        if self.channel != 0 {
+            return Ok((4, 0, 0));
+        }
+        let mask = match self.host.stdin_state() {
+            Some(paludarium_host::StdinState::Waiting) => 0,
+            Some(paludarium_host::StdinState::Ended) => 1 | 0x10,
+            _ => 1,
+        };
+        let ready = mask != 0;
+        if ready && !self.was_ready.swap(true, Ordering::SeqCst) {
+            self.rises.fetch_add(1, Ordering::SeqCst);
+        } else if !ready {
+            self.was_ready.store(false, Ordering::SeqCst);
+        }
+        Ok((mask, self.rises.load(Ordering::SeqCst), 0))
     }
     fn read(&self, b: &mut [u8]) -> Result<usize, Errno> {
         if self.channel == 0 {

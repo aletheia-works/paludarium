@@ -33,7 +33,9 @@ try {
 - `createPaludarium({ wasmUrl })` は、パッケージに入っている `paludarium.wasm` を
   読み込み、まとめ役の Worker を起動します。
 - `run(options)` はゲストを 1 つ起動して、すぐに戻ります。`stdin` は
-  `WritableStream`、`stdout` と `stderr` は `Uint8Array` の `ReadableStream` で、
+  `WritableStream` で、ゲストの `poll`・`select`・`epoll` は、端末と同じく、バイトが
+  書かれるか閉じられたときだけ読めると見ます。そのため対話的なプログラムはキーを
+  待てます。`stdout` と `stderr` は `Uint8Array` の `ReadableStream` で、
   `exited` は `{ kind: "exited", code }` か `{ kind: "signaled", signal }` になります。
 - `exited` を待つ前に、2 つの出力を読み切り、`stdin` を閉じてください。
 - `kill()` は、協調的な `SIGKILL` でゲストに止まるよう求めます。ゲストには自動の

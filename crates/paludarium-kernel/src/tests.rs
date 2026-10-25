@@ -1720,3 +1720,104 @@ fn fallocate_allocates_the_pages_of_a_memfd() {
         Errno(28).to_syscall_return()
     );
 }
+mod stdin_readiness {
+    use super::*;
+    use paludarium_host::Host;
+    const POLLIN: u64 = 1;
+    /// `poll` of standard input for POLLIN with `timeout` ms: the result,
+    /// `revents` and the virtual milliseconds it waited.
+    fn poll(f: &mut Fixture, timeout: u64) -> (u64, u16, u64) {
+        f.mem.write(GuestAddr(DATA), &0i32.to_le_bytes()).unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 4), &1u16.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 6), &0u16.to_le_bytes())
+            .unwrap();
+        let start = f.host.clock(paludarium_host::ClockId::Monotonic).unwrap();
+        let ready = f.ret(7, &[DATA, 1, timeout]);
+        let end = f.host.clock(paludarium_host::ClockId::Monotonic).unwrap();
+        let mut revents = [0u8; 2];
+        f.mem.read(GuestAddr(DATA + 6), &mut revents).unwrap();
+        (
+            ready,
+            u16::from_le_bytes(revents),
+            (end - start) / 1_000_000,
+        )
+    }
+    /// `select` of standard input for reading, without waiting.
+    fn select(f: &mut Fixture) -> u64 {
+        f.mem.write_u64(GuestAddr(DATA + 64), 1).unwrap();
+        f.mem.write(GuestAddr(DATA + 128), &[0u8; 16]).unwrap();
+        f.ret(23, &[1, DATA + 64, 0, 0, DATA + 128])
+    }
+    #[test]
+    fn standard_input_is_readable_only_with_bytes_or_at_its_end() {
+        let mut f = fixture();
+        f.host.open_stdin();
+        // Idle: nothing to read, so poll waits out its timeout.
+        assert_eq!(poll(&mut f, 0), (0, 0, 0));
+        assert_eq!(poll(&mut f, 50), (0, 0, 50));
+        assert_eq!(select(&mut f), 0);
+        // One byte pending: ready at once.
+        f.host.push_stdin(b"a");
+        assert_eq!(poll(&mut f, 0), (1, POLLIN as u16, 0));
+        assert_eq!(poll(&mut f, 50), (1, POLLIN as u16, 0));
+        assert_eq!(select(&mut f), 1);
+        assert_eq!(f.ret(0, &[0, DATA + 256, 16]), 1);
+        // Drained: idle again.
+        assert_eq!(poll(&mut f, 0), (0, 0, 0));
+        assert_eq!(poll(&mut f, 50), (0, 0, 50));
+        assert_eq!(select(&mut f), 0);
+        // Closed: readable and hung up, as a pipe whose writer is gone, and
+        // read gives its end.
+        f.host.close_stdin();
+        assert_eq!(poll(&mut f, 50), (1, (POLLIN | 0x10) as u16, 0));
+        assert_eq!(select(&mut f), 1);
+        assert_eq!(f.ret(0, &[0, DATA + 256, 16]), 0);
+    }
+    #[test]
+    fn a_host_that_cannot_tell_keeps_standard_input_ready() {
+        // A preset buffer that has ended, as before: always ready.
+        let mut f = fixture();
+        assert_eq!(poll(&mut f, 50), (1, POLLIN as u16, 0));
+    }
+    /// `epoll_wait` for one event, without waiting.
+    fn epoll_wait(f: &mut Fixture, epfd: u64) -> u64 {
+        f.ret(232, &[epfd, DATA + 512, 1, 0])
+    }
+    #[test]
+    fn epoll_watches_standard_input() {
+        let mut f = fixture();
+        f.host.open_stdin();
+        let level = f.ret(291, &[0]);
+        let edge = f.ret(291, &[0]);
+        // EPOLLIN, and EPOLLIN | EPOLLET.
+        for (epfd, events) in [(level, 1u32), (edge, 1 | 1 << 31)] {
+            f.mem
+                .write(GuestAddr(DATA + 448), &events.to_le_bytes())
+                .unwrap();
+            f.mem.write_u64(GuestAddr(DATA + 452), 7).unwrap();
+            assert_eq!(f.ret(233, &[epfd, 1, 0, DATA + 448]), 0);
+        }
+        assert_eq!(epoll_wait(&mut f, level), 0);
+        assert_eq!(epoll_wait(&mut f, edge), 0);
+        f.host.push_stdin(b"ab");
+        assert_eq!(epoll_wait(&mut f, level), 1);
+        assert_eq!(epoll_wait(&mut f, level), 1);
+        // Edge-triggered: once per time it becomes ready.
+        assert_eq!(epoll_wait(&mut f, edge), 1);
+        assert_eq!(epoll_wait(&mut f, edge), 0);
+        assert_eq!(f.ret(0, &[0, DATA + 256, 16]), 2);
+        assert_eq!(epoll_wait(&mut f, level), 0);
+        f.host.push_stdin(b"c");
+        assert_eq!(epoll_wait(&mut f, edge), 1);
+        assert_eq!(f.ret(0, &[0, DATA + 256, 16]), 1);
+        // At its end: EPOLLIN | EPOLLHUP.
+        f.host.close_stdin();
+        assert_eq!(epoll_wait(&mut f, level), 1);
+        let mut events = [0u8; 4];
+        f.mem.read(GuestAddr(DATA + 512), &mut events).unwrap();
+        assert_eq!(u32::from_le_bytes(events), 1 | 0x10);
+    }
+}

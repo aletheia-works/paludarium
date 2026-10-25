@@ -16,7 +16,7 @@ use paludarium_host::Host;
 use paludarium_jit::{CodeCache, NoopCodeCache};
 use paludarium_kernel::{Kernel, SignalInbox};
 use paludarium_loader::{StartInfo, load};
-use paludarium_mmu::AddressSpace;
+use paludarium_mmu::{AddressSpace, MemoryMeter};
 #[cfg(test)]
 use paludarium_types::signal;
 use paludarium_types::{Error, ErrorKind, ExitReason, ExitStatus};
@@ -68,6 +68,13 @@ pub struct Limits {
     /// (`EPERM`), so opening more files fails with `EMFILE`. At most
     /// 1048576, Linux's default `fs.nr_open`.
     pub open_files: Option<u64>,
+    /// The most bytes of guest memory at once, as a cgroup's `memory.max`:
+    /// a page counts from its first write until every process that has it
+    /// unmaps it or ends, and shared memory counts once. A write beyond it
+    /// ends the process that made it with `SIGKILL`, as the OOM killer
+    /// does, and a `fork` or `execve` that does not fit fails with `ENOMEM`.
+    /// File contents and pipe and socket buffers are not counted.
+    pub memory: Option<u64>,
 }
 
 impl Limits {
@@ -82,6 +89,13 @@ impl Limits {
     #[must_use]
     pub const fn with_open_files(mut self, max: u64) -> Self {
         self.open_files = Some(max);
+        self
+    }
+
+    /// Limits the guest memory (see [`Limits::memory`]).
+    #[must_use]
+    pub const fn with_memory(mut self, max: u64) -> Self {
+        self.memory = Some(max);
         self
     }
 }
@@ -374,8 +388,20 @@ impl Session {
             execfn: &self.config.program,
             random,
         };
-        let mut mem = AddressSpace::new();
-        let image = load(&*fs, &self.config.program, &start, &mut mem)?;
+        let mut mem = match self.config.limits.memory {
+            Some(max) => AddressSpace::new().with_memory_meter(Arc::new(MemoryMeter::new(max))),
+            None => AddressSpace::new(),
+        };
+        let image = load(&*fs, &self.config.program, &start, &mut mem).map_err(|error| {
+            if mem.take_out_of_memory() {
+                Error::new(
+                    ErrorKind::InvalidProgram,
+                    "program does not fit in the memory limit",
+                )
+            } else {
+                error.into()
+            }
+        })?;
         let mut kernel = Kernel::new(Arc::clone(&self.host))
             .with_file_system(fs)
             .with_signal_inbox(Arc::clone(&self.signal_inbox))

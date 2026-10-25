@@ -48,6 +48,11 @@ verified.
   the registers, the fatal signal, the auxiliary vector and the memory, but
   not every note Linux writes (`NT_FILE`, `NT_X86_XSTATE`), and it holds every
   anonymous mapping, where Linux leaves out one never written.
+- **Memory limit**: `fork` copies the private pages at once, where Linux
+  shares them until one side writes, so under a memory limit a `fork` fails
+  with `ENOMEM` when the copies do not fit, where Linux would succeed. A write
+  beyond the limit ends the process that made it, where Linux's OOM killer
+  picks the process using the most memory.
 - **A native JIT**: only the WebAssembly build has a JIT; native builds use the
   interpreter.
 - **Stable Rust**: a nightly Rust is required.
@@ -61,9 +66,11 @@ verified.
   that every input is safe.
 - Differential references were taken on some recorded AMD and Intel CPUs. On a
   CPU profile not observed yet, the tests stop on purpose.
-- Memory has no limit yet, so an untrusted program could use up the host's
-  memory. Tasks (threads and processes) and open files are unlimited unless
-  the embedder sets limits ([command line](./cli), [Rust](./rust),
+- Memory, tasks (threads and processes) and open files are unlimited unless
+  the embedder sets limits, so without them an untrusted program could use up
+  the host's memory. The memory limit counts the guest's pages, not file
+  contents, pipe and socket buffers or the emulator's own memory
+  ([command line](./cli), [Rust](./rust),
   [JavaScript](./javascript#run-options)).
 - Automated Safari tests sometimes timed out while waiting for the browser to
   start. A fix passed ten times in a row, which does not guarantee it never

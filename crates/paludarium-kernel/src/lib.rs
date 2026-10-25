@@ -372,6 +372,12 @@ impl Kernel {
         if let Some(status) = self.group.status() {
             return Next::Exit(status);
         }
+        // A write found no memory under the session's limit: the process
+        // ends by SIGKILL, as the cgroup OOM killer ends one, before it can
+        // see the failed write as a fault or EFAULT.
+        if mem.take_out_of_memory() {
+            return self.terminate(thread, signal::SIGKILL);
+        }
         self.sync_actions(thread);
         self.group.drain_process(&mut thread.state);
         self.inbox.drain(&mut thread.state);

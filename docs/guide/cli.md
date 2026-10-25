@@ -6,7 +6,8 @@ x86-64 Linux program on the host.
 ```sh
 cargo install paludarium
 paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys]
-           [--max-tasks N] [--max-open-files N] <program> [args...]
+           [--max-tasks N] [--max-open-files N] [--max-memory N]
+           <program> [args...]
 ```
 
 - `<program>` is a file on the host. Inside the guest it is placed at
@@ -25,7 +26,16 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 - `--max-open-files N` caps `RLIMIT_NOFILE` at `N` (at most 1048576), as
   Linux's `fs.nr_open`: the guest starts with both limits at most `N` and
   cannot raise them above it (`EPERM`), so opening more files fails with
-  `EMFILE`. Without these options there is no limit.
+  `EMFILE`.
+- `--max-memory N` lets the guest have at most `N` bytes of memory, as a
+  cgroup's `memory.max`; `N` may end in `K`, `M`, `G` or `T` (powers of
+  1024). A page counts from its first write until every process that has it
+  unmaps it or ends, and shared memory counts once. A write beyond the limit
+  ends the process that made it with `SIGKILL`, as the OOM killer does, and a
+  `fork` or `execve` that does not fit fails with `ENOMEM`. A program that
+  does not fit at all is not started. File contents and pipe and socket
+  buffers are not counted.
+- Without these options there is no limit.
 - `-h`, `--help` print the usage line and exit with status 0.
 - `--` ends the options, so a program name may start with `-`.
 

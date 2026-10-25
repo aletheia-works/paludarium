@@ -6,7 +6,8 @@
 ```sh
 cargo install paludarium
 paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys]
-           [--max-tasks N] [--max-open-files N] <program> [args...]
+           [--max-tasks N] [--max-open-files N] [--max-memory N]
+           <program> [args...]
 ```
 
 - `<program>` はホストのファイルです。ゲストの中では `/<ファイル名>` に置かれ、
@@ -25,7 +26,15 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 - `--max-open-files N` は、`RLIMIT_NOFILE` の天井を `N`（1048576 以下）にします。
   Linux の `fs.nr_open` と同じで、ゲストは両方の上限が `N` 以下の状態で始まり、
   それより上には上げられません（`EPERM`）。そのため、それ以上ファイルを開くと
-  `EMFILE` になります。これらを指定しなければ、上限はありません。
+  `EMFILE` になります。
+- `--max-memory N` は、ゲストが使えるメモリを `N` バイトまでにします。cgroup の
+  `memory.max` と同じで、`N` の後には `K`、`M`、`G`、`T`（1024 のべき）を付けられます。
+  ページは、初めて書き込んだときから、それを持つすべてのプロセスがマップを外すか
+  終わるまで数えます。共有メモリは 1 回だけ数えます。上限を超える書き込みをした
+  プロセスは、OOM killer と同じように `SIGKILL` で終わります。収まらない `fork` や
+  `execve` は `ENOMEM` で失敗し、そもそも収まらないプログラムは始まりません。
+  ファイルの中身と、パイプやソケットのバッファは数えません。
+- これらを指定しなければ、上限はありません。
 - `-h`、`--help` は使い方の 1 行を表示して、終了コード 0 で終わります。
 - `--` でオプションを終わりにできます。`-` で始まる名前のプログラムを動かすときに使います。
 

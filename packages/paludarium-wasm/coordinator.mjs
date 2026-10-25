@@ -151,6 +151,7 @@ async function launch(message) {
     if (message.options.jit !== undefined) check(e.config_jit(config, message.options.jit ? 1 : 0), "JIT");
     if (message.options.limits?.tasks !== undefined) check(e.config_limit(config, 0, message.options.limits.tasks), "task limit");
     if (message.options.limits?.openFiles !== undefined) check(e.config_limit(config, 1, message.options.limits.openFiles), "open file limit");
+    if (message.options.limits?.memory !== undefined) check(e.config_limit(config, 2, message.options.limits.memory), "memory limit");
     for (const arg of message.options.args ?? [message.options.program]) withBytes(encoder.encode(arg), id => check(e.config_arg(config, id), "argument"));
     for (const [key, value] of Object.entries(message.options.env ?? {})) withBytes(encoder.encode(key), keyId => withBytes(encoder.encode(value), valueId => check(e.config_env(config, keyId, valueId), "environment")));
     for (const [path, bytes] of Object.entries(message.options.files ?? {})) withBytes(encoder.encode(path), pathId => withBytes(bytes, dataId => check(e.config_file_mode(config, pathId, dataId, message.options.fileModes?.[path] ?? 0o755), "file")));

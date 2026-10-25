@@ -13,7 +13,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
@@ -143,11 +143,82 @@ impl Access {
     }
 }
 
+/// The guest memory of a session, as a cgroup's `memory.current` against
+/// its `memory.max`: a page frame counts from its first write until the last
+/// address space holding it lets it go, once however many share it.
+#[derive(Debug)]
+pub struct MemoryMeter {
+    max: u64,
+    used: AtomicU64,
+}
+
+impl MemoryMeter {
+    /// A meter allowing `max` bytes of page frames.
+    #[must_use]
+    pub const fn new(max: u64) -> Self {
+        MemoryMeter {
+            max,
+            used: AtomicU64::new(0),
+        }
+    }
+
+    /// The bytes of page frames held now.
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.used.load(Ordering::SeqCst)
+    }
+
+    fn charge(&self) -> bool {
+        self.used
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(PAGE_SIZE).filter(|&used| used <= self.max)
+            })
+            .is_ok()
+    }
+}
+
+/// The bytes of one page frame, charged to the meter while they exist.
+struct FrameBytes {
+    bytes: Box<[AtomicU8]>,
+    meter: Option<Arc<MemoryMeter>>,
+}
+
+impl FrameBytes {
+    /// A frame of `bytes`, or `None` when the meter has no room for it.
+    fn new(
+        meter: Option<&Arc<MemoryMeter>>,
+        bytes: impl FnOnce() -> Box<[AtomicU8]>,
+    ) -> Option<Self> {
+        if meter.is_some_and(|meter| !meter.charge()) {
+            return None;
+        }
+        Some(FrameBytes {
+            bytes: bytes(),
+            meter: meter.cloned(),
+        })
+    }
+}
+
+impl std::ops::Deref for FrameBytes {
+    type Target = [AtomicU8];
+    fn deref(&self) -> &[AtomicU8] {
+        &self.bytes
+    }
+}
+
+impl Drop for FrameBytes {
+    fn drop(&mut self) {
+        if let Some(meter) = &self.meter {
+            meter.used.fetch_sub(PAGE_SIZE, Ordering::SeqCst);
+        }
+    }
+}
+
 /// One populated page: its protection and its contents. The contents are
 /// allocated on the first write; until then the page reads as zeros.
 struct Page {
     prot: Prot,
-    frame: Arc<OnceLock<Box<[AtomicU8]>>>,
+    frame: Frame,
 }
 
 impl Page {
@@ -158,9 +229,18 @@ impl Page {
         }
     }
 
-    fn frame_for_write(&self) -> &[AtomicU8] {
-        self.frame
-            .get_or_init(|| (0..PAGE_BYTES).map(|_| AtomicU8::new(0)).collect())
+    /// The contents to write, allocated now if need be; `None` when the
+    /// meter has no room for them.
+    fn frame_for_write(&self, meter: Option<&Arc<MemoryMeter>>) -> Option<&[AtomicU8]> {
+        if self.frame.get().is_none() {
+            let bytes = FrameBytes::new(meter, || {
+                (0..PAGE_BYTES).map(|_| AtomicU8::new(0)).collect()
+            })?;
+            // A racing write to a shared frame may set it first: then this
+            // one is dropped, and its charge with it.
+            let _ = self.frame.set(bytes);
+        }
+        self.frame.get().map(|frame| &**frame)
     }
 }
 
@@ -186,7 +266,7 @@ impl PageTable {
 /// The upper level: a sparse map from directory index to page table.
 type Directory = BTreeMap<u64, PageTable>;
 
-type Frame = Arc<OnceLock<Box<[AtomicU8]>>>;
+type Frame = Arc<OnceLock<FrameBytes>>;
 #[derive(Clone)]
 struct SharedMapping {
     end: u64,
@@ -250,6 +330,13 @@ struct AddressSpaceData {
     shared: BTreeMap<u64, SharedMapping>,
     /// The files of private file mappings, by range ([`FileBacking`]).
     backing: BTreeMap<u64, FileBacking>,
+    /// What the frames are charged to; shared with the spaces forked from
+    /// this one and the ones its exec starts.
+    meter: Option<Arc<MemoryMeter>>,
+    /// A write found no room under the meter since the last
+    /// [`AddressSpace::take_out_of_memory`], which reads it without the
+    /// locks.
+    out_of_memory: Arc<AtomicBool>,
 }
 
 impl Default for AddressSpaceData {
@@ -327,6 +414,8 @@ impl AddressSpaceData {
             initial_break: GuestAddr(0),
             current_break: GuestAddr(0),
             mmap_top: DEFAULT_MMAP_TOP,
+            meter: None,
+            out_of_memory: Arc::default(),
         }
     }
 
@@ -450,8 +539,9 @@ impl AddressSpaceData {
             frame: frame.unwrap_or_default(),
         }
     }
-    fn fork(&self) -> Self {
+    fn fork(&self) -> Result<Self, Errno> {
         let mut copy = Self::new();
+        copy.meter = self.meter.clone();
         copy.mappings = self.mappings.clone();
         copy.shared = self.shared.clone();
         copy.backing = self.backing.clone();
@@ -472,12 +562,14 @@ impl AddressSpaceData {
                     } else {
                         let new = Page::new(page.prot);
                         if let Some(frame) = page.frame.get() {
-                            let _ = new.frame.set(
+                            let bytes = FrameBytes::new(self.meter.as_ref(), || {
                                 frame
                                     .iter()
                                     .map(|byte| AtomicU8::new(byte.load(Ordering::Relaxed)))
-                                    .collect(),
-                            );
+                                    .collect()
+                            })
+                            .ok_or(Errno::ENOMEM)?;
+                            let _ = new.frame.set(bytes);
                         }
                         new
                     };
@@ -490,7 +582,7 @@ impl AddressSpaceData {
             .directory
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner) = directory;
-        copy
+        Ok(copy)
     }
 
     fn bump_code_generation(&mut self) {
@@ -596,7 +688,10 @@ impl AddressSpaceData {
         Ok(())
     }
 
-    fn store(&self, directory: &Directory, addr: GuestAddr, buf: &[u8]) {
+    /// Writes `buf`, which [`Self::check`] allowed, into populated pages. A
+    /// page the meter has no room for faults, and marks the space out of
+    /// memory.
+    fn store(&self, directory: &Directory, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
         for (page, offset, range) in chunks(addr, buf.len()) {
             if let Some(p) = lookup(directory, page) {
                 if let Some(mapping) = self.shared_at(page) {
@@ -606,12 +701,22 @@ impl AddressSpaceData {
                     // Code may have changed: decoded instructions are stale.
                     self.code_generation.fetch_add(1, Ordering::Release);
                 }
-                let frame = p.frame_for_write();
+                let Some(frame) = p.frame_for_write(self.meter.as_ref()) else {
+                    self.out_of_memory.store(true, Ordering::SeqCst);
+                    return Err(Fault {
+                        addr: GuestAddr(page),
+                        write: true,
+                        fetch: false,
+                        mapped: true,
+                        present: false,
+                    });
+                };
                 for (s, d) in buf[range].iter().zip(&frame[offset..]) {
                     d.store(*s, Ordering::Relaxed);
                 }
             }
         }
+        Ok(())
     }
 
     fn write_with(&self, addr: GuestAddr, buf: &[u8], access: Access) -> Result<(), Fault> {
@@ -621,8 +726,7 @@ impl AddressSpaceData {
             let populated =
                 chunks(addr, buf.len()).all(|(page, _, _)| lookup(&directory, page).is_some());
             if populated {
-                self.store(&directory, addr, buf);
-                return Ok(());
+                return self.store(&directory, addr, buf);
             }
         }
         // Populate the pages this write touches for the first time.
@@ -647,8 +751,7 @@ impl AddressSpaceData {
                 *entry = Some(self.page(page, prot));
             }
         }
-        self.store(&directory, addr, buf);
-        Ok(())
+        self.store(&directory, addr, buf)
     }
 
     /// Reads guest memory (any mapped page is readable on x86).
@@ -1313,6 +1416,9 @@ pub struct AtomicResult {
 pub struct AddressSpace {
     data: Mutex<AddressSpaceData>,
     serialization: Arc<Mutex<()>>,
+    /// The data's `out_of_memory`, so that every checkpoint can read it
+    /// without taking the session-wide serialization lock.
+    out_of_memory: Arc<AtomicBool>,
 }
 
 /// Owned instruction bytes and their epoch, captured under one MMU lock.
@@ -1354,9 +1460,13 @@ impl Default for AddressSpace {
 impl AddressSpace {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_data(AddressSpaceData::new(), Arc::default())
+    }
+    fn with_data(data: AddressSpaceData, serialization: Arc<Mutex<()>>) -> Self {
         Self {
-            data: Mutex::new(AddressSpaceData::new()),
-            serialization: Arc::default(),
+            out_of_memory: Arc::clone(&data.out_of_memory),
+            data: Mutex::new(data),
+            serialization,
         }
     }
     fn locked(&self) -> AddressSpaceGuard<'_> {
@@ -1369,14 +1479,33 @@ impl AddressSpace {
             _serialization: serialization,
         }
     }
+    /// Charges this space's frames to `meter`, and the frames of the spaces
+    /// forked from it.
+    #[must_use]
+    pub fn with_memory_meter(mut self, meter: Arc<MemoryMeter>) -> Self {
+        self.data
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .meter = Some(meter);
+        self
+    }
+    /// The meter this space's frames are charged to.
+    #[must_use]
+    pub fn memory_meter(&self) -> Option<Arc<MemoryMeter>> {
+        self.locked().meter.clone()
+    }
+    /// Whether a write found no room under the meter since the last call.
+    pub fn take_out_of_memory(&self) -> bool {
+        self.out_of_memory.swap(false, Ordering::SeqCst)
+    }
     /// Private pages are copied; sparse MAP_SHARED pages retain backing. A shared
     /// serialization lock keeps cross-process memory operations indivisible.
-    #[must_use]
-    pub fn fork(&self) -> Self {
-        Self {
-            data: Mutex::new(self.locked().fork()),
-            serialization: self.serialization.clone(),
-        }
+    /// The copies fail with `ENOMEM` when the meter has no room for them.
+    pub fn fork(&self) -> Result<Self, Errno> {
+        Ok(Self::with_data(
+            self.locked().fork()?,
+            self.serialization.clone(),
+        ))
     }
     /// Marks a newly created mapping as Linux MAP_SHARED, independently of VM sharing.
     pub fn mark_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
@@ -1906,7 +2035,7 @@ mod tests {
         );
         assert_eq!(byte(&space, at(2, 100).0), 0); // past the end of the file
         // A fork, and a move by mremap, keep the file at the same offsets.
-        let child = space.fork();
+        let child = space.fork().unwrap();
         space.write(at(0, 1), &[0xee]).unwrap();
         let fixed = Remap {
             fixed: true,
@@ -2081,7 +2210,7 @@ mod tests {
     fn remap_keeps_shared_memory_shared_after_fork_and_on_duplicates() {
         let space = space_with(0x10000, PAGE_SIZE, Prot::READ_WRITE);
         space.mark_shared(GuestAddr(0x10000), 4096).unwrap();
-        let child = space.fork();
+        let child = space.fork().unwrap();
         let moved = space
             .remap_shared(
                 GuestAddr(0x10000),

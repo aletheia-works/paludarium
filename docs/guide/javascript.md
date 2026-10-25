@@ -61,7 +61,7 @@ try {
 | `tty` | `{ columns, rows }` (0–65535) to give the guest a terminal size |
 | `filesystem` | A filesystem from `createFileSystem()` to reuse (see below) |
 | `jit` | `true` to translate hot x86-64 code to WebAssembly (default `false`) |
-| `limits` | `{ tasks, openFiles }` to limit the guest (default: no limit; see below) |
+| `limits` | `{ tasks, openFiles, memory }` to limit the guest (default: no limit; see below) |
 
 The package does not expose host directories or the network to the guest.
 
@@ -70,7 +70,13 @@ threads, and processes until they are reaped, as a cgroup's `pids.max`. A
 `clone` or `fork` beyond it fails with `EAGAIN`. `limits.openFiles` (0 to
 1048576) caps `RLIMIT_NOFILE`, as Linux's `fs.nr_open`: the guest starts with
 both limits at most this and cannot raise them above it (`EPERM`), so opening
-more files fails with `EMFILE`. Memory has no limit yet.
+more files fails with `EMFILE`. `limits.memory` (0 to 4294967295) is the most
+bytes of memory the guest may have at once, as a cgroup's `memory.max`. A page
+counts from its first write until every process that has it unmaps it or ends,
+and shared memory counts once. A write beyond it ends the process that made it
+with `SIGKILL`, as the OOM killer does, and a `fork` or `execve` that does not
+fit fails with `ENOMEM`; a program that does not fit at all fails with
+`invalid-program`. File contents and pipe and socket buffers are not counted.
 
 ## Keep files between runs
 

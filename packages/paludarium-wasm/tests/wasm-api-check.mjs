@@ -30,7 +30,7 @@ try {
   assert.throws(() => first.run({ program: "/file", tty: { columns: -1, rows: 24 } }), /terminal/);
   assert.throws(() => first.run({ program: "/file", cwd: "relative" }), /current directory/);
   assert.throws(() => first.run({ program: "/file", files: { "/file": new Uint8Array() }, fileModes: { "/file": 65536 } }), /modes/);
-  for (const limits of [null, 1, { tasks: 0 }, { tasks: 1.5 }, { tasks: 2 ** 32 }, { openFiles: -1 }, { openFiles: 1048577 }])
+  for (const limits of [null, 1, { tasks: 0 }, { tasks: 1.5 }, { tasks: 2 ** 32 }, { openFiles: -1 }, { openFiles: 1048577 }, { memory: -1 }, { memory: 1.5 }, { memory: 2 ** 32 }])
     assert.throws(() => first.run({ program: "/file", limits }), /limits/, JSON.stringify(limits));
   const drainFailure = async stream => { const reader = stream.getReader(); try { while (!(await reader.read()).done) {} } catch {} finally { reader.releaseLock(); } };
   const invalid = first.run({ program: "/bad", files: { "/bad": new Uint8Array([73]) } });
@@ -59,6 +59,18 @@ try {
     const limited = first.run({ program: "/p", files: { "/p": program }, limits });
     await Promise.all([new Response(limited.stdout).text(), new Response(limited.stderr).text()]);
     assert.deepEqual(await limited.exited, { kind: "exited", code }, JSON.stringify(limits));
+  }
+  // Writing 64 pages beyond a 64 KiB memory limit ends the guest with
+  // SIGKILL, as the OOM killer does: map 1 MiB and write to each page.
+  const touch = elf([
+    0x31, 0xff, 0xbe, 0, 0, 0x10, 0, 0xba, 3, 0, 0, 0, 0x41, 0xba, 0x22, 0, 0, 0, 0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff,
+    0x45, 0x31, 0xc9, 0xb8, 9, 0, 0, 0, 0x0f, 0x05, 0xb9, 64, 0, 0, 0, 0xc6, 0, 1, 0x48, 0x05, 0, 0x10, 0, 0, 0xff, 0xc9,
+    0x75, 0xf3, 0x31, 0xff, 0xb8, 60, 0, 0, 0, 0x0f, 0x05,
+  ]);
+  for (const [limits, status] of [[{ memory: 65536 }, { kind: "signaled", signal: 9 }], [{ memory: 1 << 21 }, { kind: "exited", code: 0 }]]) {
+    const limited = first.run({ program: "/p", files: { "/p": touch }, limits });
+    await Promise.all([new Response(limited.stdout).text(), new Response(limited.stderr).text()]);
+    assert.deepEqual(await limited.exited, status, JSON.stringify(limits));
   }
   for (const cwd of ["/missing", "/hello"]) {
     const invalidCwd = first.run({ program: "/hello", files: { "/hello": hello }, cwd });

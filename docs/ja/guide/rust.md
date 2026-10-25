@@ -47,8 +47,11 @@ fn main() -> Result<(), paludarium::Error> {
   プロセスで、cgroup の `pids.max` と同じ数え方です。超える `clone` や `fork` は
   `EAGAIN` で失敗します）。`with_open_files(n)` は、Linux の `fs.nr_open` と同じように
   `RLIMIT_NOFILE` の天井を `n` にするので、それ以上ファイルを開くと `EMFILE` になります。
-  これらはフィールドの `tasks` と `open_files` を設定し、`None` は上限なしです。
-  メモリには、まだ上限がありません。
+  `with_memory(n)` は、cgroup の `memory.max` と同じように、ゲストが使えるメモリを
+  `n` バイトまでにします。超える書き込みをしたプロセスは、OOM killer と同じように
+  `SIGKILL` で終わり、収まらない `fork` や `execve` は `ENOMEM` で失敗します（何を
+  数えるかはフィールドのドキュメントにあります）。これらはフィールドの `tasks`、
+  `open_files`、`memory` を設定し、`None` は上限なしです。
 - `Session::new` は、何かを動かす前に設定を確かめます。`run()` はゲストを最後まで
   動かします。`NativeHost` は `Host` トレイトのネイティブ版の実装で、ゲストの
   標準入出力をホストのプロセスにつなぎます。

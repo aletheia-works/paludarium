@@ -48,8 +48,12 @@ fn main() -> Result<(), paludarium::Error> {
   (threads, and processes until they are reaped, as a cgroup's `pids.max`;
   `clone` and `fork` beyond it fail with `EAGAIN`). `with_open_files(n)`
   caps `RLIMIT_NOFILE` at `n`, as Linux's `fs.nr_open`, so opening more
-  files fails with `EMFILE`. They set the fields `tasks` and `open_files`, where
-  `None` is no limit. Memory has no limit yet.
+  files fails with `EMFILE`. `with_memory(n)` lets the guest have at most `n`
+  bytes of memory, as a cgroup's `memory.max`: a write beyond it ends the
+  process with `SIGKILL`, as the OOM killer does, and a `fork` or `execve`
+  that does not fit fails with `ENOMEM` (the field's documentation gives what
+  counts). They set the fields `tasks`, `open_files` and `memory`, where `None`
+  is no limit.
 - `Session::new` validates the configuration before anything runs, and
   `run()` runs the guest to the end. `NativeHost`, the native implementation
   of the `Host` trait, connects the guest's standard input and output to the

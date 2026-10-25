@@ -8,6 +8,7 @@
 //!   --report-enosys   list the unimplemented system calls the guest called
 //!   --max-tasks N     at most N threads and unreaped processes (EAGAIN)
 //!   --max-open-files N  cap RLIMIT_NOFILE at N, as fs.nr_open (EMFILE)
+//!   --max-memory N[K|M|G|T]  at most N bytes of guest memory, as memory.max
 //! ```
 //!
 //! Exit codes: the guest's exit code; 128 + signal number when the guest was
@@ -35,7 +36,7 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_EMULATOR_ERROR: i32 = 70;
 
 /// Usage text printed on errors and for `--help`.
-pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] [--max-tasks N] [--max-open-files N] <program> [args...]\n";
+pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] [--max-tasks N] [--max-open-files N] [--max-memory N] <program> [args...]\n";
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +50,8 @@ pub struct Invocation {
     pub mounts: Vec<Mount>,
     /// List the unimplemented system calls the guest called, after the run.
     pub report_enosys: bool,
-    /// `--max-tasks` and `--max-open-files`; unlimited without them.
+    /// `--max-tasks`, `--max-open-files` and `--max-memory`; unlimited
+    /// without them.
     pub limits: Limits,
 }
 
@@ -116,6 +118,25 @@ fn parse_limit(
         .ok_or(UsageError(error))
 }
 
+/// A size in bytes with an optional binary suffix (`K`, `M`, `G`, `T`), as
+/// a cgroup's `memory.max` reads it.
+fn parse_size(value: Option<OsString>, error: &'static str) -> Result<u64, UsageError> {
+    let value = value.ok_or(UsageError(error))?;
+    let value = value.to_str().ok_or(UsageError(error))?;
+    let (digits, shift) = match value.as_bytes().last() {
+        Some(b'K' | b'k') => (&value[..value.len() - 1], 10),
+        Some(b'M' | b'm') => (&value[..value.len() - 1], 20),
+        Some(b'G' | b'g') => (&value[..value.len() - 1], 30),
+        Some(b'T' | b't') => (&value[..value.len() - 1], 40),
+        _ => (value, 0),
+    };
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|number| number.checked_mul(1 << shift))
+        .ok_or(UsageError(error))
+}
+
 /// Parses the arguments after the command name.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageError> {
     let mut args = args.into_iter();
@@ -149,6 +170,10 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
                     "--max-open-files needs a number up to 1048576",
                 )?;
                 limits = limits.with_open_files(max);
+            }
+            b"--max-memory" => {
+                let max = parse_size(args.next(), "--max-memory needs a size in bytes")?;
+                limits = limits.with_memory(max);
             }
             b"--env" => {
                 let value = args.next().ok_or(UsageError("--env needs KEY=VALUE"))?;
@@ -378,6 +403,19 @@ mod tests {
             parse(os(&["--max-tasks", "8", "--max-open-files", "0", "p"])),
             Ok(Command::Run(i)) if i.limits == Limits::default().with_tasks(8).with_open_files(0)
         ));
+        for (size, bytes) in [
+            ("4096", 4096),
+            ("0", 0),
+            ("64K", 64 << 10),
+            ("3m", 3 << 20),
+            ("2G", 2 << 30),
+            ("1T", 1 << 40),
+        ] {
+            assert!(matches!(
+                parse(os(&["--max-memory", size, "p"])),
+                Ok(Command::Run(i)) if i.limits == Limits::default().with_memory(bytes)
+            ));
+        }
         assert!(matches!(parse(os(&["--", "-dash"])), Ok(Command::Run(i)) if i.program == "-dash"));
         assert_eq!(parse(os(&["--help"])), Ok(Command::Help));
     }
@@ -397,6 +435,12 @@ mod tests {
             &["--max-tasks", "many", "x"],
             &["--max-tasks"],
             &["--max-open-files", "1048577", "x"],
+            &["--max-memory", "x"],
+            &["--max-memory", "1.5G", "x"],
+            &["--max-memory", "G", "x"],
+            &["--max-memory", "-1", "x"],
+            &["--max-memory", "16777216T", "x"],
+            &["--max-memory"],
         ] {
             let (code, err) = run(args);
             assert_eq!(code, EXIT_USAGE, "{args:?}");

@@ -1222,6 +1222,11 @@ impl Kernel {
             return Err(Errno::EPERM);
         }
         let task = self.processes.charge_task()?;
+        let child_mem = if flags & 0x100 == 0 {
+            Some(Arc::new(mem.fork()?))
+        } else {
+            None
+        };
         let pid = self.processes.allocate()?;
         let group = Arc::new(self.group.fork(flags & 0x800 != 0));
         // CLONE_CLEAR_SIGHAND resets handled signals to their default and
@@ -1256,7 +1261,6 @@ impl Kernel {
         if flags & 0x80000 != 0 {
             cpu.fs_base = a[4];
         }
-        let child_mem = (flags & 0x100 == 0).then(|| Arc::new(mem.fork()));
         if flags & 0x100000 != 0 {
             let _ = mem.write(GuestAddr(a[2]), &pid.to_le_bytes());
         }
@@ -1564,9 +1568,14 @@ impl Kernel {
             execfn: &path,
             random,
         };
-        let mut memory = AddressSpace::new();
+        let mut memory = match mem.memory_meter() {
+            Some(meter) => AddressSpace::new().with_memory_meter(meter),
+            None => AddressSpace::new(),
+        };
         let image = paludarium_loader::load(&*self.files.fs, &path, &start, &mut memory).map_err(
             |error| match error {
+                // The new image did not fit under the memory limit.
+                _ if memory.take_out_of_memory() => Errno::ENOMEM,
                 LoadError::NotFound => Errno::ENOENT,
                 LoadError::TooLarge => Errno(7),
                 LoadError::Errno(error) => error,

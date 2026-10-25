@@ -190,3 +190,99 @@ fn limits_out_of_range_are_rejected() {
         assert_eq!(error.kind, paludarium_types::ErrorKind::InvalidProgram);
     }
 }
+/// Maps 1 MiB, writes a byte to each of its first `pages` pages, then runs
+/// `tail` with `rax` at the next page.
+fn touching(pages: u32, tail: &[u8]) -> Vec<u8> {
+    let mut code = vec![
+        0x31, 0xff, 0xbe, 0x00, 0x00, 0x10, 0x00, 0xba, 0x03, 0x00, 0x00, 0x00, 0x41, 0xba, 0x22,
+        0x00, 0x00, 0x00, 0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0x45, 0x31, 0xc9, 0xb8, 0x09,
+        0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x89, 0xc3, 0xb9,
+    ];
+    code.extend_from_slice(&pages.to_le_bytes());
+    code.extend_from_slice(&[
+        0x85, 0xc9, 0x74, 0x0d, 0xc6, 0x00, 0x01, 0x48, 0x05, 0x00, 0x10, 0x00, 0x00, 0xff, 0xc9,
+        0xeb, 0xef,
+    ]);
+    code.extend_from_slice(tail);
+    code
+}
+/// Exits with the negated result of the system call before it.
+const EXIT_NEGATED: &[u8] = &[0xf7, 0xd8, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05];
+fn run_with_memory(code: &[u8], memory: Option<u64>) -> Result<ExitStatus, Error> {
+    let mut config = Config::new("/p", vec![])
+        .with_file("/p", tiny_exec(code, b""))
+        .with_file("/child", tiny_exec(EXIT0, b""));
+    if let Some(max) = memory {
+        config.limits = Limits::default().with_memory(max);
+    }
+    Session::new(config, Arc::new(RecordingHost::new()))?
+        .with_budget(100)
+        .run()
+}
+/// The pages loading `/p` takes: below them the program does not start.
+fn loaded_pages(code: &[u8]) -> u64 {
+    (0..64)
+        .find(|&pages| run_with_memory(code, Some(pages * 4096)).is_ok())
+        .unwrap()
+}
+#[test]
+fn a_program_that_does_not_fit_the_memory_limit_does_not_start() {
+    let error = run_with_memory(EXIT0, Some(0)).unwrap_err();
+    assert_eq!(error.kind, paludarium_types::ErrorKind::InvalidProgram);
+}
+#[test]
+fn writes_beyond_the_memory_limit_end_the_process_with_sigkill() {
+    let exit = [0x31, 0xff, 0xb8, 60, 0, 0, 0, 0x0f, 0x05];
+    let code = touching(64, &exit);
+    let loaded = loaded_pages(&code);
+    // Exactly the pages it writes fit; one fewer does not.
+    assert_eq!(
+        run_with_memory(&code, Some((loaded + 64) * 4096)).unwrap(),
+        ExitStatus::Exited(0)
+    );
+    assert_eq!(
+        run_with_memory(&code, Some((loaded + 63) * 4096)).unwrap(),
+        ExitStatus::Signaled(signal::SIGKILL)
+    );
+    // A system call writing to a page that does not fit ends it the same
+    // way, where it would otherwise see EFAULT: getrandom into the next page.
+    let mut getrandom = vec![
+        0x48, 0x89, 0xc7, 0xbe, 0x00, 0x10, 0x00, 0x00, 0x31, 0xd2, 0xb8, 0x3e, 0x01, 0x00, 0x00,
+        0x0f, 0x05,
+    ];
+    getrandom.extend_from_slice(EXIT_NEGATED);
+    let code = touching(0, &getrandom);
+    let loaded = loaded_pages(&code);
+    assert_eq!(
+        run_with_memory(&code, Some(loaded * 4096)).unwrap(),
+        ExitStatus::Signaled(signal::SIGKILL)
+    );
+    assert_eq!(run_with_memory(&code, None).unwrap(), ExitStatus::Exited(0));
+}
+#[test]
+fn fork_and_execve_that_do_not_fit_the_memory_limit_fail_with_enomem() {
+    // fork copies the 16 written pages and the loaded ones, which do not fit
+    // in the 8 pages left: it fails with ENOMEM (12).
+    let mut fork = vec![0xb8, 57, 0, 0, 0, 0x0f, 0x05];
+    fork.extend_from_slice(EXIT_NEGATED);
+    let code = touching(16, &fork);
+    let loaded = loaded_pages(&code);
+    assert_eq!(
+        run_with_memory(&code, Some((loaded + 24) * 4096)).unwrap(),
+        ExitStatus::Exited(12)
+    );
+    // With the limit full, execve has no room for the new image.
+    let mut exec = vec![
+        0x48, 0x8d, 0x3d, 0x16, 0x00, 0x00, 0x00, 0x31, 0xf6, 0x31, 0xd2, 0xb8, 0x3b, 0x00, 0x00,
+        0x00, 0x0f, 0x05,
+    ];
+    exec.extend_from_slice(EXIT_NEGATED);
+    exec.extend_from_slice(b"/child\0");
+    let code = touching(16, &exec);
+    let loaded = loaded_pages(&code);
+    assert_eq!(
+        run_with_memory(&code, Some((loaded + 16) * 4096)).unwrap(),
+        ExitStatus::Exited(12)
+    );
+    assert_eq!(run_with_memory(&code, None).unwrap(), ExitStatus::Exited(0));
+}

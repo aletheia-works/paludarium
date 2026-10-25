@@ -4,6 +4,9 @@
 - The command-line page lists exactly the options the parser accepts.
 - The JavaScript page names everything index.d.ts declares, and its run
   options table lists exactly the run options.
+- The Rust page names everything the paludarium crate re-exports, with the
+  public fields and methods of its structs, and its `ErrorKind` table lists
+  exactly the variants.
 - Every English page has a Japanese page with the same headings structure.
 - Every link to a heading (`page#section`) names an id that page has.
 """
@@ -18,6 +21,17 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
 CLI = ROOT / "crates/paludarium/src/cli.rs"
 TYPES = ROOT / "packages/paludarium-wasm/index.d.ts"
+CRATES = ROOT / "crates"
+# The re-exported types an embedder builds or reads, whose public fields,
+# methods and variants the Rust page must name; of the others it names only
+# the type. Left out: the items that serve the wasm launcher, the tests and
+# the emulator's own crates, which take types the crate does not re-export.
+DETAILED = ("Config", "Limits", "Mount", "TerminalInfo", "Session", "Error", "ExitStatus")
+UNDOCUMENTED = {
+    "Config": {"entries", "with_entry"},
+    "Session": {"with_code_cache", "initial_file_system", "run_with_file_system", "with_budget"},
+    "Error": {"new", "with_rip", "with_bytes", "with_syscall"},
+}
 LANGUAGES = ("guide", "ja/guide")
 # The Japanese release page is a summary that links to the English one.
 SUMMARIES = {"release.md"}
@@ -82,6 +96,57 @@ def cli():
             for form in sorted(joined)
             if f"`{form}" not in text
         ]
+    return errors
+
+
+def rust_items():
+    """The names the paludarium crate re-exports, and for each re-exported
+    struct and enum its public fields and methods, and its variants."""
+    lib = (CRATES / "paludarium/src/lib.rs").read_text(encoding="utf-8")
+    uses = need("paludarium's re-exports", re.findall(r"^pub use (\w+)::\{([^}]*)\};", lib, re.M))
+    names, members, variants = set(), {}, {}
+    for crate, listed in uses:
+        source = (CRATES / crate.replace("_", "-") / "src/lib.rs").read_text(encoding="utf-8")
+        for name in re.findall(r"\w+", listed):
+            names.add(name)
+            found = set()
+            body = re.search(rf"^pub (struct|enum) {name} \{{\n(.*?)^\}}", source, re.M | re.S)
+            if body and body.group(1) == "struct":
+                found |= set(re.findall(r"^    pub (\w+):", body.group(2), re.MULTILINE))
+            elif body:
+                variants[name] = set(re.findall(r"^    ([A-Z]\w*)\b", body.group(2), re.MULTILINE))
+            impls = rf"^impl(?:<[^>]*>)? {name}\b[^{{;]*\{{\n(.*?)^\}}"
+            for block in re.findall(impls, source, re.M | re.S):
+                found |= set(
+                    re.findall(r"^    pub (?:(?:const|async|unsafe) )*fn (\w+)", block, re.M)
+                )
+            stale = UNDOCUMENTED.get(name, set()) - found
+            if stale:
+                raise ValueError(
+                    f"UNDOCUMENTED lists {name}::{sorted(stale)}, which no longer exist"
+                )
+            members[name] = found - UNDOCUMENTED.get(name, set())
+    return names, members, variants
+
+
+def rust():
+    names, members, variants = rust_items()
+    kinds = need("ErrorKind variants", variants.get("ErrorKind", set()))
+    required = set(names)
+    for name in DETAILED:
+        required |= need(f"{name} members", members[name]) | variants.get(name, set())
+    errors = []
+    for language in LANGUAGES:
+        page = DOCS / language / "rust.md"
+        where = page.relative_to(ROOT)
+        tables = re.findall(r"(?:^\|[^\n]*\n)+", page.read_text(encoding="utf-8"), re.MULTILINE)
+        table = [block for block in tables if block.startswith("| `ErrorKind` |")]
+        if len(table) != 1:
+            raise ValueError(f"{where}: no single ErrorKind table")
+        rows = set(re.findall(r"^\| `(\w+)` \|", table[0], re.MULTILINE)) - {"ErrorKind"}
+        errors += compare(f"{where} ErrorKind table", "variant", kinds, rows)
+        missing = required - code_names(page)
+        errors += [f"{where}: the paludarium crate has `{name}`" for name in sorted(missing)]
     return errors
 
 
@@ -222,7 +287,7 @@ def pages():
 
 def main():
     try:
-        errors = cli() + javascript() + links()
+        errors = cli() + javascript() + rust() + links()
         page_errors, count = pages()
     except (ValueError, KeyError) as error:
         print(f"{error}", file=sys.stderr)
@@ -233,7 +298,7 @@ def main():
     if errors:
         return 1
     print(
-        f"the CLI and JavaScript pages match the code; {count} pages have Japanese counterparts;"
+        f"the CLI, JavaScript and Rust pages match the code; {count} pages have Japanese counterparts;"
         " every link to a heading resolves"
     )
     return 0

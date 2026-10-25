@@ -34,18 +34,28 @@ fn main() -> Result<(), paludarium::Error> {
 - `with_file(path, bytes)` places a file in the guest's virtual filesystem
   before the start (mode `0755`); `with_file_mode` sets other permission bits.
   `with_env(key, value)` adds an environment variable.
-- `Config` also has public fields: `cwd` (initial working directory, default
-  `/`), `mounts` (host directories, see below), `tty` (a `TerminalInfo`
-  with the terminal size) and `limits`.
+- `Config` also has public fields: `program`, `args` and `env` (what `new`
+  and `with_env` set), `files` and `file_modes` (what `with_file` and
+  `with_file_mode` add, as path and content or mode pairs), `cwd` (the initial
+  working directory as `Some(path)`; `None`, the default, is `/`), `mounts`
+  (host directories, see below), `tty`
+  (`Some(TerminalInfo::new(columns, rows))` gives the guest's standard streams
+  a terminal of that size; `None`, the default, leaves the terminal to the
+  `Host`), `jit` (used only by the WebAssembly build; the native build has no
+  JIT) and `limits`.
 - `limits` is a `Limits`, unlimited by default.
   `Limits::default().with_tasks(n)` lets the guest have at most `n` tasks
   (threads, and processes until they are reaped, as a cgroup's `pids.max`;
   `clone` and `fork` beyond it fail with `EAGAIN`). `with_open_files(n)`
   caps `RLIMIT_NOFILE` at `n`, as Linux's `fs.nr_open`, so opening more
-  files fails with `EMFILE`. Memory has no limit yet.
+  files fails with `EMFILE`. They set the fields `tasks` and `open_files`, where
+  `None` is no limit. Memory has no limit yet.
 - `Session::new` validates the configuration before anything runs, and
-  `run()` runs the guest to the end. `NativeHost` connects the guest's
-  standard input and output to the host process.
+  `run()` runs the guest to the end. `NativeHost`, the native implementation
+  of the `Host` trait, connects the guest's standard input and output to the
+  host process.
+- `ExitStatus::command_exit_code()` is the status a command reports: the exit
+  code, or 128 + the signal number.
 
 ## Show a host directory
 
@@ -66,6 +76,12 @@ mounted directory, and neither `..` nor a symbolic link can lead outside it.
 - `kill()` asks the guest to stop. It ends with `SIGKILL` the next time the
   interpreter checks (every `DEFAULT_BUDGET` = 100,000 instructions).
 - `signal(number)` sends a Linux signal to the guest process.
+- `is_stopped()` tells whether the guest is stopped by job control, such as
+  by `SIGSTOP`.
+- After a run, `unimplemented_syscalls()` lists, in ascending order, the system
+  calls the guest called that returned `ENOSYS` (what the command's
+  `--report-enosys` prints), and `termination_detail()` gives the CPU stop
+  (an `ExitReason`) when a CPU fault ended the guest.
 
 ## Errors
 
@@ -79,6 +95,7 @@ and `Err(Error)` only for problems of the emulator. `Error::kind` is one of:
 | `InvalidProgram` | the program cannot be loaded |
 | `Host` | the host failed (I/O error, no randomness, …) |
 
-The error keeps the instruction address (`rip`), the instruction bytes and the
-system call number when they are known. System calls that paludarium does not
+The error has a `message`, and keeps the instruction address (`rip`, a
+`GuestAddr`), the instruction `bytes` and the system call number (`syscall`)
+when they are known. System calls that paludarium does not
 implement are not errors: the guest gets `ENOSYS`, as from an older kernel.

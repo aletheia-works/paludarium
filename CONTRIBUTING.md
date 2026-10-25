@@ -57,11 +57,15 @@ tables. It also checks, through `scripts/interface-docs.py`, that the
 command-line pages list exactly the options `crates/paludarium/src/cli.rs`
 parses, that the JavaScript pages name everything
 `packages/paludarium-wasm/index.d.ts` declares, with exactly its run options in
-the table, that every English page has a Japanese page with the same
-headings, and that every link to a heading (`page#section`) resolves. VitePress
-decomposes a heading's text (NFKD) into its id, so a link to a Japanese heading
-with a dakuten such as プ does not match it; give such a heading an explicit
-id, such as `## 確かめたプログラム {#programs-verified}`.
+the table, that the Rust pages name everything the `paludarium` crate
+re-exports, with the public fields and methods of the types an embedder uses
+(`DETAILED` in the script; `UNDOCUMENTED` lists the items left out, with why)
+and exactly the `ErrorKind` variants in the table, that every English page has a
+Japanese page with the same headings, and that every link to a heading
+(`page#section`) resolves. VitePress decomposes a heading's text (NFKD) into its
+id, so a link to a Japanese heading with a dakuten such as プ does not match it;
+give such a heading an explicit id, such as
+`## 確かめたプログラム {#programs-verified}`.
 
 The emulator is correct when it matches native x86-64 Linux. Differential tests,
 line coverage (80% floor), and fuzzing only produce real evidence on x86-64

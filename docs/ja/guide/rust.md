@@ -34,17 +34,26 @@ fn main() -> Result<(), paludarium::Error> {
 - `with_file(path, bytes)` は、起動の前にゲストの仮想ファイルシステムへファイルを
   置きます（権限は `0755`）。ほかの権限にするときは `with_file_mode` を使います。
   `with_env(key, value)` は環境変数を足します。
-- `Config` には、公開のフィールドもあります。`cwd`（最初の作業ディレクトリ。既定は `/`）、
-  `mounts`（ホストのディレクトリ。下を参照）、`tty`（端末の大きさを表す `TerminalInfo`）、
+- `Config` には、公開のフィールドもあります。`program`、`args`、`env`（`new` と
+  `with_env` が設定するもの）、`files` と `file_modes`（`with_file` と `with_file_mode`
+  が足すもの。パスと中身、またはパスと権限の組です）、`cwd`（最初の作業ディレクトリを
+  `Some(path)` で指定します。既定の `None` は `/` です）、`mounts`（ホストのディレクトリ。
+  下を参照）、`tty`（`Some(TerminalInfo::new(columns, rows))` にすると、ゲストの標準の
+  ストリームがその大きさの端末になります。既定の `None` では、端末は `Host` に任せます）、
+  `jit`（使うのは WebAssembly 版だけです。ネイティブ版には JIT がありません）、
   `limits` です。
 - `limits` は `Limits` で、既定では上限がありません。`Limits::default().with_tasks(n)`
   は、ゲストが持てるタスクを `n` 個までにします（タスクはスレッドと、回収されるまでの
   プロセスで、cgroup の `pids.max` と同じ数え方です。超える `clone` や `fork` は
   `EAGAIN` で失敗します）。`with_open_files(n)` は、Linux の `fs.nr_open` と同じように
   `RLIMIT_NOFILE` の天井を `n` にするので、それ以上ファイルを開くと `EMFILE` になります。
+  これらはフィールドの `tasks` と `open_files` を設定し、`None` は上限なしです。
   メモリには、まだ上限がありません。
 - `Session::new` は、何かを動かす前に設定を確かめます。`run()` はゲストを最後まで
-  動かします。`NativeHost` は、ゲストの標準入出力をホストのプロセスにつなぎます。
+  動かします。`NativeHost` は `Host` トレイトのネイティブ版の実装で、ゲストの
+  標準入出力をホストのプロセスにつなぎます。
+- `ExitStatus::command_exit_code()` は、コマンドが返す終了コードです。終了コードか、
+  128 + シグナルの番号になります。
 
 ## ホストのディレクトリを見せる
 
@@ -65,6 +74,12 @@ config.mounts.push(Mount { host: "/srv/data".into(), guest: b"/work".to_vec() })
 - `kill()` はゲストに止まるよう求めます。インタプリタが次に確かめたとき
   （`DEFAULT_BUDGET` ＝ 100,000 命令ごと）に、`SIGKILL` で終わります。
 - `signal(number)` は、ゲストのプロセスに Linux のシグナルを送ります。
+- `is_stopped()` は、ゲストが `SIGSTOP` などのジョブ制御で止まっているかどうかを
+  返します。
+- 動かした後、`unimplemented_syscalls()` は、ゲストが呼んで `ENOSYS` が返った
+  システムコールを小さい順に返します（コマンドの `--report-enosys` が表示するもの）。
+  `termination_detail()` は、CPU の例外でゲストが終わったとき、その止まり方
+  （`ExitReason`）を返します。
 
 ## エラー
 
@@ -78,6 +93,6 @@ config.mounts.push(Mount { host: "/srv/data".into(), guest: b"/work".to_vec() })
 | `InvalidProgram` | プログラムを読み込めない |
 | `Host` | ホストの失敗（I/O のエラー、乱数が得られないなど） |
 
-エラーは、わかっていれば、命令のアドレス（`rip`）、命令のバイト列、syscall の番号を
-持っています。paludarium が実装していない syscall はエラーにはなりません。古いカーネルと
+エラーは `message` を持ち、わかっていれば、命令のアドレス（`rip`。`GuestAddr` です）、
+命令のバイト列（`bytes`）、syscall の番号（`syscall`）も持っています。paludarium が実装していない syscall はエラーにはなりません。古いカーネルと
 同じように、ゲストに `ENOSYS` が返ります。

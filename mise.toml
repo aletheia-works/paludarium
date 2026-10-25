@@ -144,7 +144,7 @@ description = "Check that the features pages list exactly the implemented system
 run = "python3 -B scripts/syscall-docs.py"
 
 [tasks."docs:interfaces"]
-description = "Check the CLI and JavaScript pages against the code, the English pages against the Japanese ones, and links to headings (read-only)"
+description = "Check the CLI, JavaScript and Rust pages against the code, the English pages against the Japanese ones, and links to headings (read-only)"
 run = "python3 -B scripts/interface-docs.py"
 
 [tasks."lint:all"]

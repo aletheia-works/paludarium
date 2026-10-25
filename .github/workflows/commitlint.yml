@@ -16,4 +16,4 @@ permissions:
 
 jobs:
   check:
-    uses: aletheia-works/.github/.github/workflows/commitlint.yml@b24ce77ad773bcca239d8140aeb373f295572521 # v1.3.1
+    uses: aletheia-works/.github/.github/workflows/commitlint.yml@f5bb52fe38d6ddf151662ed6b64c0b23eeb50ec4 # v1.3.3

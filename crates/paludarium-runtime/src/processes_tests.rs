@@ -119,14 +119,23 @@ fn kill_wakes_waiting_parent_and_child() {
     handle.join().unwrap();
 }
 #[test]
-fn session_waits_for_unreaped_child() {
+fn a_waited_child_writes_before_the_run_ends() {
     let mut child = vec![
         0xb8, 1, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0xbe, 0, 0x20, 0x40, 0, 0xba, 1, 0, 0, 0, 0x0f, 0x05,
     ];
     child.extend_from_slice(EXIT3);
-    let (status, stdout) = run(&fork_code(57, EXIT0, &child), None);
+    let (status, stdout) = run(&fork_code(57, &waited(), &child), None);
     assert_eq!(status, ExitStatus::Exited(0));
     assert_eq!(stdout, b"/");
+}
+#[test]
+fn the_first_process_exit_ends_a_running_child() {
+    // The child spins forever; the first process's exit kills it, as the
+    // exit of a PID namespace's init does, and the run ends.
+    assert_eq!(
+        run(&fork_code(57, EXIT0, &[0xeb, 0xfe]), None).0,
+        ExitStatus::Exited(0)
+    );
 }
 #[test]
 fn task_limit_fails_fork_with_eagain() {

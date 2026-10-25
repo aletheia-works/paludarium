@@ -39,10 +39,6 @@ verified.
   `SIGABRT` or another core-dumping signal is reported as `CLD_KILLED`,
   without the core flag in its `wait` status, where Linux may report
   `CLD_DUMPED`.
-- **Orphaned processes**: the first process adopts orphans as the init of a
-  PID namespace does, but when it exits the other processes are not killed,
-  as they are when such an init exits on Linux. They keep running with the
-  exited process as their parent, and the run ends once they have all exited.
 - **A native JIT**: only the WebAssembly build has a JIT; native builds use the
   interpreter.
 - **Stable Rust**: a nightly Rust is required.

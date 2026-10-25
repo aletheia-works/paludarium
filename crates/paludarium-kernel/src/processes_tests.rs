@@ -1487,3 +1487,34 @@ mod signal_senders {
         assert_eq!(take(&mut c, &mut ct, &cm), (0, pt.tid));
     }
 }
+mod first_process_exit {
+    use super::*;
+    #[test]
+    fn the_exit_of_the_first_process_kills_every_other() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let (mut g, mut gt, gm) = fork(&mut c, &mut ct, &cm);
+        // One of them is stopped by job control; SIGKILL ends it all the same.
+        let own = u64::from(gt.tid);
+        assert_eq!(syscall(&mut g, &mut gt, &gm, 62, [own, 19, 0, 0, 0, 0]), 0);
+        assert!(g.group.is_stopped());
+        finish(&mut k, &t, &m, ExitStatus::Exited(0));
+        assert_eq!(
+            c.checkpoint(&mut ct, &cm),
+            Next::Exit(ExitStatus::Signaled(9))
+        );
+        assert_eq!(
+            g.checkpoint(&mut gt, &gm),
+            Next::Exit(ExitStatus::Signaled(9))
+        );
+    }
+    #[test]
+    fn the_exit_of_another_process_kills_nobody() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let (mut g, mut gt, gm) = fork(&mut c, &mut ct, &cm);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(g.checkpoint(&mut gt, &gm), Next::Resume);
+        assert_eq!(k.checkpoint(&mut t, &m), Next::Resume);
+    }
+}

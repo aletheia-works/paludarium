@@ -411,6 +411,19 @@ impl Processes {
         } else {
             return;
         }
+        // The first process is the init of the emulator's PID namespace: when
+        // it exits, every other process gets SIGKILL from the kernel, as in
+        // Linux's zap_pid_ns_processes.
+        if pid == 1 {
+            let live: Vec<u32> = entries
+                .iter()
+                .filter(|&(&other, entry)| other != 1 && entry.status.is_none())
+                .map(|(&other, _)| other)
+                .collect();
+            for other in live {
+                let _ = Self::deliver(&mut entries, other, 9, None);
+            }
+        }
         // Children that asked for it learn that this process exited.
         for child in entries.values() {
             if child.parent == pid && child.status.is_none() && child.death_signal != 0 {

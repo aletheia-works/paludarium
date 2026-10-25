@@ -233,6 +233,9 @@ kernel.
   can wait for them, and their exit signal becomes `SIGCHLD`. A child that has
   already exited is reported to the new parent at once (and reaped at once if
   that parent ignores `SIGCHLD`).
+- When the first process exits, every other process gets `SIGKILL` from the
+  kernel, as when the init of a PID namespace exits (Linux's
+  `zap_pid_ns_processes`), so the run ends with it.
 - When an exit orphans a process group, so that no member keeps a parent in
   another group of the same session, and a member of the group is stopped,
   every member gets `SIGHUP` and then `SIGCONT` from the kernel (`SI_KERNEL`),

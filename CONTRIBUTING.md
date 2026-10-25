@@ -15,7 +15,8 @@ there, not in the UI. The documentation site
 (<https://aletheia-works.github.io/paludarium/>, sources in [docs/](docs/))
 describes the supported features, the architecture, the design decisions and
 how correctness is verified; read the relevant pages before changing emulator
-behaviour, and update them with it.
+behaviour, and update them with it. When a page disagrees with the code, trust
+the code and name the mismatch in the PR.
 
 This repository uses Jujutsu (`jj`), including for fork synchronization:
 

@@ -36,6 +36,12 @@ lists what an agent needs first.
   (CI). A macOS or Windows run, or Docker on an Arm Mac, is not.
 - Back every correctness claim with the command and its output, and say what
   was not verified.
+- When the code and a document (`docs/`, README.md, CONTRIBUTING.md, this
+  file) disagree, trust the code, not the text. After the change, always tell
+  the person you work for about every mismatch you found, whether you fixed it
+  (in both languages) or left it. Agents that trusted a stale instruction file
+  over the code have broken working systems
+  ([arXiv:2605.30777](https://arxiv.org/abs/2605.30777)).
 - The Rust toolchain is the nightly pinned in `rust-toolchain.toml`.
   Dependencies come from crates.io with licenses compatible with Apache-2.0
   (`mise run deny`).

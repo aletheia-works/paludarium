@@ -4,6 +4,8 @@ pub use paludarium_host::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs}
 use paludarium_types::Errno;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+mod contents;
+use contents::Contents;
 pub const PATH_MAX: usize = 4096;
 pub const NAME_MAX: usize = 255;
 pub const DEFAULT_MODE: u32 = 0o755;
@@ -119,7 +121,7 @@ pub trait FileSystem: HostFs {
     }
 }
 enum Kind {
-    File(Vec<u8>),
+    File(Contents),
     Dir(BTreeMap<Vec<u8>, u64>),
     Symlink(Vec<u8>),
 }
@@ -136,8 +138,13 @@ impl Node {
         FileStat {
             inode: id,
             size: match &self.kind {
-                Kind::File(b) | Kind::Symlink(b) => b.len() as u64,
+                Kind::File(contents) => contents.len(),
+                Kind::Symlink(b) => b.len() as u64,
                 Kind::Dir(_) => 0,
+            },
+            blocks: match &self.kind {
+                Kind::File(contents) => Some(contents.blocks()),
+                _ => None,
             },
             mode: self.mode,
             links: self.links,
@@ -158,11 +165,27 @@ fn set_node_mtime(node: &mut Node, mtime: Option<i128>) {
 }
 struct Tree {
     nodes: BTreeMap<u64, Arc<Mutex<Node>>>,
+    /// The pages of every file, also of one unlinked but still open.
+    usage: Arc<std::sync::atomic::AtomicU64>,
     next: u64,
     owner: u64,
     clock: Arc<dyn Fn() -> Result<u64, Errno> + Send + Sync>,
 }
 impl Tree {
+    /// The 4 KiB blocks the files and symbolic links hold, as `statfs`
+    /// reports them used: every file's pages, also those of a file unlinked
+    /// but still open, as tmpfs frees them only with the file.
+    fn used_blocks(&self) -> u64 {
+        let links: u64 = self
+            .nodes
+            .values()
+            .map(|node| match &lock(node).kind {
+                Kind::Symlink(b) => (b.len() as u64).div_ceil(BLOCK),
+                _ => 0,
+            })
+            .sum();
+        self.usage.load(std::sync::atomic::Ordering::SeqCst) + links
+    }
     fn require_trailing_directory(&self, path: &[u8]) -> Result<(), Errno> {
         if path.last() == Some(&b'/') {
             let end = path.iter().rposition(|b| *b != b'/').map_or(1, |i| i + 1);
@@ -311,6 +334,7 @@ impl MemFs {
         Self {
             tree: Arc::new(Mutex::new(Tree {
                 nodes: BTreeMap::from([(1, Arc::new(Mutex::new(root)))]),
+                usage: Arc::default(),
                 next: 2,
                 owner: 1,
                 clock,
@@ -340,11 +364,8 @@ impl MemFs {
                 t.insert(&prefix, Kind::Dir(BTreeMap::new()), 0o040755)?;
             }
         }
-        let id = t.insert(
-            &path,
-            Kind::File(file.content),
-            0o100000 | (file.mode & 0o7777),
-        )?;
+        let contents = Contents::with_bytes(&t.usage, &file.content);
+        let id = t.insert(&path, Kind::File(contents), 0o100000 | (file.mode & 0o7777))?;
         lock(&*t.node(id)?).mtime_ns = 0;
         Ok(())
     }

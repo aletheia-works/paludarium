@@ -717,7 +717,7 @@ fn statx_fills_the_stat_fields() {
     assert_eq!(word(&f, 16) as u32, 1); // stx_nlink
     assert_eq!((word(&f, 24) >> 32) as u16, 0o100640); // stx_mode
     assert_eq!(word(&f, 40), 5); // stx_size
-    assert_eq!(word(&f, 48), 1); // stx_blocks
+    assert_eq!(word(&f, 48), 8); // stx_blocks: one page, as tmpfs counts it
     // The same file through its path, and the root's device numbers.
     let inode = word(&f, 32);
     assert_eq!(f.ret(332, &[(-100i64) as u64, DATA, 0, 0x7ff, out]), 0);
@@ -1703,4 +1703,20 @@ fn ppoll_stop_restarts_unless_the_timeout_is_read_only() {
             assert_eq!(f.thread.cpu.rip, GuestAddr(0x1000));
         }
     }
+}
+#[test]
+fn fallocate_allocates_the_pages_of_a_memfd() {
+    let mut f = fixture();
+    let out = DATA + 0x100;
+    f.mem.write(GuestAddr(DATA), b"m\0").unwrap();
+    let fd = f.ret(319, &[DATA, 0]);
+    assert_eq!(f.ret(285, &[fd, 0, 0, 8192]), 0);
+    assert_eq!(f.ret(5, &[fd, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 48)).unwrap(), 8192); // st_size
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 64)).unwrap(), 16); // st_blocks
+    // Past the 4 GiB the file system has, tmpfs's ENOSPC.
+    assert_eq!(
+        f.ret(285, &[fd, 1, 0, 1 << 40]),
+        Errno(28).to_syscall_return()
+    );
 }

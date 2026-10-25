@@ -1573,6 +1573,44 @@ int main(int argc, char **argv) {
         result("thread-none", syscall(SYS_rt_tgsigqueueinfo, getpid(), pid, SIGUSR1, &given) ? errno : 0);
         return 0;
     }
+    if (!strcmp(mode, "sparse")) {
+        /* A file grown by ftruncate is a hole: no blocks, zeros to read and
+           no data for SEEK_DATA. A write allocates its page, fallocate
+           allocates pages that stay a hole until written, a punched hole
+           frees its pages, and shrinking frees what is past the end. */
+        char path[] = "/tmp/sparse-XXXXXX";
+        int fd = mkstemp(path);
+        if (fd < 0) return 80;
+        unlink(path);
+        struct stat st;
+        const off_t mib = 1 << 20;
+#define BLOCKS() (fstat(fd, &st) ? -1 : (long)st.st_blocks)
+#define SEEK(off, whence) (lseek(fd, (off), (whence)) < 0 ? -errno : (long)lseek(fd, (off), (whence)))
+        result("grow", ftruncate(fd, 1L << 30));
+        result("grown-blocks", BLOCKS());
+        char b[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+        result("hole-read", pread(fd, b, 8, 512 * mib) == 8 && !memcmp(b, "\0\0\0\0\0\0\0\0", 8));
+        result("no-data", SEEK(0, SEEK_DATA));
+        result("hole-here", SEEK(5, SEEK_HOLE));
+        result("write", pwrite(fd, "x", 1, mib));
+        result("written-blocks", BLOCKS());
+        result("data-at", SEEK(0, SEEK_DATA) == mib);
+        result("hole-after", SEEK(mib, SEEK_HOLE) == mib + 4096);
+        result("allocate", fallocate(fd, 0, 2 * mib, 8192));
+        result("allocated-blocks", BLOCKS());
+        result("allocated-is-hole", SEEK(mib + 4096, SEEK_DATA));
+        result("punch", fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, mib, 4096));
+        result("punched-blocks", BLOCKS());
+        result("punched-data", SEEK(0, SEEK_DATA));
+        result("size", fstat(fd, &st) ? -1 : st.st_size == 1L << 30);
+        result("past-end", SEEK(1L << 30, SEEK_HOLE));
+        result("shrink", ftruncate(fd, 100));
+        result("shrunk-blocks", BLOCKS());
+#undef BLOCKS
+#undef SEEK
+        close(fd);
+        return 0;
+    }
     if (!strcmp(mode, "waitid")) {
         siginfo_t info;
         pid_t pid = child();

@@ -61,10 +61,23 @@ kernel.
 - `fallocate` checks its arguments as Linux's `vfs_fallocate` does, in
   order (`EINVAL`, `EOPNOTSUPP`, `EBADF`, then `ESPIPE`, `EISDIR` or
   `ENODEV` for a file that is not regular, and `EFBIG`). Files then behave
-  as on tmpfs: plain allocation grows the file unless `FALLOC_FL_KEEP_SIZE`
-  is given, `FALLOC_FL_PUNCH_HOLE` sets the range to zeros (also in an
-  `O_APPEND` file), and the other modes give `EOPNOTSUPP`. Growing past
-  `RLIMIT_FSIZE` raises `SIGXFSZ` and fails with `EFBIG`.
+  as on tmpfs: plain allocation allocates the pages of the range and grows
+  the file unless `FALLOC_FL_KEEP_SIZE` is given, `FALLOC_FL_PUNCH_HOLE`
+  frees the pages the range covers and sets the rest of it to zeros (also
+  in an `O_APPEND` file), and the other modes give `EOPNOTSUPP`. Growing
+  past `RLIMIT_FSIZE` raises `SIGXFSZ` and fails with `EFBIG`, and an
+  `fallocate` past the 4 GiB the in-memory filesystem has fails with
+  `ENOSPC` and allocates nothing (writes are not bounded this way; see
+  [Limitations](./limitations)).
+- Files of the in-memory filesystem keep their contents in 4 KiB pages, as
+  tmpfs does: a write allocates the pages it touches, and the rest of a file
+  is a hole that reads as zeros and takes no memory, so a file grown by
+  `ftruncate` costs nothing until it is written. `st_blocks` counts the
+  allocated pages, and shrinking a file frees the pages past its end.
+  `lseek` with `SEEK_DATA` and `SEEK_HOLE` finds the written pages and the
+  holes; a page `fallocate` allocated is a hole until it is written, and
+  the end of the file is one. An offset at or past the end, or a negative
+  one, gives `ENXIO`.
 - `memfd_create` makes an unlinked in-memory file (mode 0777, or 0666 with
   `MFD_NOEXEC_SEAL`, and no links), with Linux's flag and name checks
   (`EINVAL`, `EFAULT`); `MFD_HUGETLB` gives `ENOSYS`, as from a kernel

@@ -132,7 +132,8 @@ impl MemFs {
                 },
                 EntryKind::File(content) => {
                     t.place(path)?;
-                    t.insert(path, Kind::File(content.clone()), 0o100000 | entry.mode)?;
+                    let contents = Contents::with_bytes(&t.usage, content);
+                    t.insert(path, Kind::File(contents), 0o100000 | entry.mode)?;
                 }
                 EntryKind::Symlink(target) => {
                     t.place(path)?;

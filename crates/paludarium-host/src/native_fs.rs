@@ -158,6 +158,7 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
             // A host device's number is in the host's encoding; none is
             // passed on.
             rdev: 0,
+            blocks: None,
         })
     }
     #[cfg(not(unix))]
@@ -185,6 +186,7 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
             links,
             mtime_ns,
             rdev: 0,
+            blocks: None,
         })
     }
 }
@@ -747,6 +749,7 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
             // A host device's number is in the host's encoding; none is
             // passed on.
             rdev: 0,
+            blocks: None,
         })
     }
     #[cfg(not(unix))]
@@ -774,6 +777,7 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
             links,
             mtime_ns,
             rdev: 0,
+            blocks: None,
         })
     }
 }

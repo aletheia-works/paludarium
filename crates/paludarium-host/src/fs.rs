@@ -12,6 +12,9 @@ pub struct FileStat {
     /// A device file's number, as `stat`'s `st_rdev` encodes it (0 for any
     /// other file).
     pub rdev: u64,
+    /// The 512-byte blocks the file takes (`st_blocks`), when the file
+    /// system counts them; otherwise its size rounded up to them.
+    pub blocks: Option<u64>,
 }
 /// What `statfs` reports about the filesystem holding a path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -83,12 +86,17 @@ pub trait FileHandle: Send + Sync {
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Errno> {
         Err(Errno::ENODEV)
     }
-    /// Sets the bytes from `offset` to `offset + len` that are inside the
-    /// file to zero, at those offsets even in an `O_APPEND` file, and keeps
-    /// the size: `fallocate`'s `FALLOC_FL_PUNCH_HOLE` as a file without
-    /// holes shows it. Kinds without it give `EOPNOTSUPP`.
+    /// `fallocate`'s `FALLOC_FL_PUNCH_HOLE`: the bytes from `offset` to
+    /// `offset + len` read as zeros afterwards, at those offsets even in an
+    /// `O_APPEND` file, and the size stays; a file with holes frees the pages
+    /// the range covers. Kinds without it give `EOPNOTSUPP`.
     fn zero_range(&self, _offset: u64, _len: u64) -> Result<(), Errno> {
         Err(Errno(95))
+    }
+    /// `fallocate` without a mode: allocates the range without changing what
+    /// it reads. A file without holes has every byte allocated already.
+    fn allocate(&self, _offset: u64, _len: u64) -> Result<(), Errno> {
+        Ok(())
     }
 }
 pub trait HostFs: Send + Sync {

@@ -242,3 +242,124 @@ fn statfs_reports_a_tmpfs_with_what_the_tree_holds() {
         }]
     );
 }
+mod sparse {
+    use super::*;
+    const SEEK_DATA: u32 = 3;
+    const SEEK_HOLE: u32 = 4;
+    const ENXIO: Errno = Errno(6);
+    fn file() -> (MemFs, Arc<dyn FileHandle>) {
+        let fs = MemFs::new();
+        let f = fs.open(b"/a", 66, 0o644).unwrap();
+        (fs, f)
+    }
+    fn blocks(f: &Arc<dyn FileHandle>) -> u64 {
+        f.stat().unwrap().blocks.unwrap()
+    }
+    #[test]
+    fn a_grown_file_is_a_hole_that_takes_nothing() {
+        let (fs, f) = file();
+        f.truncate(1 << 40).unwrap();
+        assert_eq!(f.stat().unwrap().size, 1 << 40);
+        assert_eq!(blocks(&f), 0);
+        let mut b = [1u8; 8];
+        assert_eq!(f.read_at(1 << 39, &mut b), Ok(8));
+        assert_eq!(b, [0; 8]);
+        assert_eq!(f.seek(0, SEEK_DATA), Err(ENXIO));
+        assert_eq!(f.seek(5, SEEK_HOLE), Ok(5));
+        let empty = MemFs::new().statfs(b"/").unwrap();
+        assert_eq!(fs.statfs(b"/").unwrap().blocks_free, empty.blocks_free);
+    }
+    #[test]
+    fn a_write_allocates_the_pages_it_touches() {
+        let (fs, f) = file();
+        f.write_at(1 << 20, b"x").unwrap();
+        // One byte past the end of a page takes the next one too.
+        f.write_at(3 * 4096 - 1, b"yz").unwrap();
+        assert_eq!(f.stat().unwrap().size, (1 << 20) + 1);
+        assert_eq!(blocks(&f), 3 * 8);
+        let empty = MemFs::new().statfs(b"/").unwrap();
+        assert_eq!(fs.statfs(b"/").unwrap().blocks_free, empty.blocks_free - 3);
+        assert_eq!(f.seek(0, SEEK_DATA), Ok(2 * 4096));
+        assert_eq!(f.seek(2 * 4096 + 9, SEEK_HOLE), Ok(4 * 4096));
+        assert_eq!(f.seek(4 * 4096, SEEK_DATA), Ok(1 << 20));
+        // The end of the file is a hole.
+        assert_eq!(f.seek(1 << 20, SEEK_HOLE), Ok((1 << 20) + 1));
+        assert_eq!(f.seek((1 << 20) + 1, SEEK_DATA), Err(ENXIO));
+        assert_eq!(f.seek(-1, SEEK_HOLE), Err(ENXIO));
+        let mut b = [0u8; 4];
+        assert_eq!(f.read_at(3 * 4096 - 2, &mut b), Ok(4));
+        assert_eq!(&b, b"\0yz\0");
+    }
+    #[test]
+    fn fallocate_allocates_without_data() {
+        let (_fs, f) = file();
+        f.truncate(4 * 4096).unwrap();
+        f.allocate(4096, 4096 + 1).unwrap();
+        assert_eq!(blocks(&f), 2 * 8);
+        // Allocated pages read as zeros and are still a hole.
+        assert_eq!(f.seek(0, SEEK_DATA), Err(ENXIO));
+        f.write_at(4096 + 5, b"a").unwrap();
+        assert_eq!(blocks(&f), 2 * 8);
+        assert_eq!(f.seek(0, SEEK_DATA), Ok(4096));
+        assert_eq!(f.seek(4096, SEEK_HOLE), Ok(2 * 4096));
+    }
+    #[test]
+    fn punching_frees_whole_pages_and_clears_the_rest() {
+        let (_fs, f) = file();
+        f.write_at(0, &[b'x'; 4 * 4096]).unwrap();
+        f.zero_range(100, 2 * 4096).unwrap();
+        // Page 1 is freed; pages 0 and 2 are cleared from 100 and up to 100.
+        assert_eq!(blocks(&f), 3 * 8);
+        assert_eq!(f.stat().unwrap().size, 4 * 4096);
+        let mut b = vec![0u8; 4 * 4096];
+        f.read_at(0, &mut b).unwrap();
+        assert!(b[..100].iter().all(|&c| c == b'x'));
+        assert!(b[100..2 * 4096 + 100].iter().all(|&c| c == 0));
+        assert!(b[2 * 4096 + 100..].iter().all(|&c| c == b'x'));
+        assert_eq!(f.seek(0, SEEK_HOLE), Ok(4096));
+    }
+    #[test]
+    fn shrinking_frees_the_pages_past_the_end_and_clears_the_last() {
+        let (_fs, f) = file();
+        f.write_at(0, &[b'x'; 3 * 4096]).unwrap();
+        f.truncate(100).unwrap();
+        assert_eq!(blocks(&f), 8);
+        f.truncate(3 * 4096).unwrap();
+        let mut b = vec![1u8; 3 * 4096];
+        f.read_at(0, &mut b).unwrap();
+        assert!(b[100..].iter().all(|&c| c == 0));
+        assert_eq!(blocks(&f), 8);
+    }
+}
+mod sparse_limits {
+    use super::*;
+    #[test]
+    fn allocating_past_the_file_system_size_is_enospc_and_allocates_nothing() {
+        let fs = MemFs::new();
+        let f = fs.open(b"/a", 66, 0o644).unwrap();
+        assert_eq!(f.allocate(0, 1 << 40), Err(Errno(28)));
+        assert_eq!(f.stat().unwrap().blocks, Some(0));
+        // Up to the size it is fine, and what is held counts.
+        assert_eq!(f.allocate(0, MEMORY_BYTES), Ok(()));
+        let g = fs.open(b"/b", 66, 0o644).unwrap();
+        assert_eq!(g.allocate(0, 1), Err(Errno(28)));
+        // Allocating pages the file already has needs nothing more.
+        assert_eq!(f.allocate(4096, 4096), Ok(()));
+    }
+    #[test]
+    fn an_unlinked_open_file_keeps_its_pages_until_it_is_closed() {
+        let fs = MemFs::new();
+        let free = fs.statfs(b"/").unwrap().blocks_free;
+        let f = fs.open(b"/a", 66, 0o644).unwrap();
+        fs.unlink(b"/a", false).unwrap();
+        assert_eq!(f.allocate(0, 3 << 30), Ok(()));
+        assert_eq!(
+            fs.statfs(b"/").unwrap().blocks_free,
+            free - (3 << 30) / 4096
+        );
+        // Its pages still count: another 3 GiB would pass the 4 GiB.
+        assert_eq!(f.allocate(3 << 30, 3 << 30), Err(Errno(28)));
+        drop(f);
+        assert_eq!(fs.statfs(b"/").unwrap().blocks_free, free);
+    }
+}

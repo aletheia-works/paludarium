@@ -54,10 +54,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   からと同じく、それとともに渡した空ポインタのパスも同じ扱いです。
 - `fallocate` は、Linux の `vfs_fallocate` と同じ順に引数を確かめます（`EINVAL`、
   `EOPNOTSUPP`、`EBADF`、通常のファイルでなければ `ESPIPE`・`EISDIR`・`ENODEV`、
-  そして `EFBIG`）。そのあとは tmpfs と同じふるまいです。通常の確保は
-  `FALLOC_FL_KEEP_SIZE` がなければファイルを大きくし、`FALLOC_FL_PUNCH_HOLE` は
-  範囲を 0 にし（`O_APPEND` のファイルでも）、ほかのモードは `EOPNOTSUPP` です。
-  `RLIMIT_FSIZE` を超えて大きくすると `SIGXFSZ` を起こして `EFBIG` で失敗します。
+  そして `EFBIG`）。そのあとは tmpfs と同じふるまいです。通常の確保は範囲の
+  ページを確保し、`FALLOC_FL_KEEP_SIZE` がなければファイルを大きくします。
+  `FALLOC_FL_PUNCH_HOLE` は範囲が覆うページを解放し、残りを 0 にします
+  （`O_APPEND` のファイルでも）。ほかのモードは `EOPNOTSUPP` です。
+  `RLIMIT_FSIZE` を超えて大きくすると `SIGXFSZ` を起こして `EFBIG` で失敗し、
+  メモリ上のファイルシステムの 4 GiB を超える `fallocate` は、何も確保せずに
+  `ENOSPC` で失敗します（書き込みにはこの上限はありません。
+  [制限](./limitations) を見てください）。
+- メモリ上のファイルシステムのファイルは、tmpfs と同じく中身を 4 KiB のページで
+  持ちます。書き込みは触れたページを確保し、それ以外は 0 として読める穴で、
+  メモリを使いません。そのため `ftruncate` で大きくしたファイルは、書くまで何も
+  使いません。`st_blocks` は確保したページを数え、ファイルを小さくすると末尾より
+  後ろのページを解放します。`SEEK_DATA` と `SEEK_HOLE` の `lseek` は、書いたページと
+  穴を見つけます。`fallocate` で確保したページは書くまで穴で、ファイルの末尾も
+  穴です。末尾以降や負のオフセットは `ENXIO` です。
 - `memfd_create` は、リンクのないメモリ上のファイル（モード 0777、
   `MFD_NOEXEC_SEAL` なら 0666）を作り、flags と名前を Linux と同じく確かめます
   （`EINVAL`、`EFAULT`）。`MFD_HUGETLB` は、hugetlbfs のないカーネルと同じく

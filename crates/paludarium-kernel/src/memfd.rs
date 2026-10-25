@@ -187,6 +187,9 @@ impl FileHandle for Memfd {
         let count = self.writable(start, buf.len())?;
         self.file.write_at(offset, &buf[..count])
     }
+    fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        self.file.allocate(offset, len)
+    }
     fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
         if self.seals() & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
             return Err(Errno::EPERM);

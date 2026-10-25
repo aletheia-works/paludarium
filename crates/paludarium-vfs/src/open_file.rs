@@ -38,28 +38,19 @@ impl FileHandle for MemFile {
             return Err(Errno::EBADF);
         }
         let n = lock(&self.node);
-        let Kind::File(data) = &n.kind else {
+        let Kind::File(contents) = &n.kind else {
             return Err(Errno::EISDIR);
         };
-        let pos = usize::try_from(s.0).map_err(|_| Errno::EINVAL)?;
-        let count = b.len().min(data.len().saturating_sub(pos));
-        if count > 0 {
-            b[..count].copy_from_slice(&data[pos..pos + count]);
-        }
+        let count = contents.read(s.0, b);
         s.0 += count as u64;
         Ok(count)
     }
     fn read_at(&self, offset: u64, b: &mut [u8]) -> Result<usize, Errno> {
         let n = lock(&self.node);
-        let Kind::File(data) = &n.kind else {
+        let Kind::File(contents) = &n.kind else {
             return Err(Errno::ENODEV);
         };
-        let pos = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(data.len());
-        let count = b.len().min(data.len() - pos);
-        b[..count].copy_from_slice(&data[pos..pos + count]);
-        Ok(count)
+        Ok(contents.read(offset, b))
     }
     fn write_at(&self, offset: u64, b: &[u8]) -> Result<usize, Errno> {
         let s = lock(&self.state);
@@ -68,21 +59,18 @@ impl FileHandle for MemFile {
         }
         let mut n = lock(&self.node);
         let modified = (n.clock)()?;
-        let Kind::File(data) = &mut n.kind else {
+        let Kind::File(contents) = &mut n.kind else {
             return Err(Errno::EISDIR);
         };
         let pos = if s.1 & 1024 != 0 {
-            data.len()
+            contents.len()
         } else {
-            usize::try_from(offset).map_err(|_| Errno::EINVAL)?
+            offset
         };
-        let end = pos.checked_add(b.len()).ok_or(Errno::EINVAL)?;
-        if end > data.len() {
-            data.try_reserve(end - data.len())
-                .map_err(|_| Errno::ENOMEM)?;
-            data.resize(end, 0)
-        }
-        data[pos..end].copy_from_slice(b);
+        pos.checked_add(b.len() as u64)
+            .filter(|&end| end <= i64::MAX as u64)
+            .ok_or(Errno::EINVAL)?;
+        contents.write(pos, b);
         if !b.is_empty() {
             n.mtime_ns = i128::from(modified);
         }
@@ -95,29 +83,33 @@ impl FileHandle for MemFile {
         }
         let mut n = lock(&self.node);
         let modified = (n.clock)()?;
-        let Kind::File(data) = &mut n.kind else {
+        let Kind::File(contents) = &mut n.kind else {
             return Err(Errno::EISDIR);
         };
         if s.1 & 1024 != 0 {
-            s.0 = data.len() as u64
+            s.0 = contents.len()
         }
-        let pos = usize::try_from(s.0).map_err(|_| Errno::EINVAL)?;
-        let end = pos.checked_add(b.len()).ok_or(Errno::EINVAL)?;
-        if end > data.len() {
-            data.try_reserve(end - data.len())
-                .map_err(|_| Errno::ENOMEM)?;
-            data.resize(end, 0)
-        }
-        data[pos..end].copy_from_slice(b);
-        s.0 = end as u64;
+        let end =
+            s.0.checked_add(b.len() as u64)
+                .filter(|&end| end <= i64::MAX as u64)
+                .ok_or(Errno::EINVAL)?;
+        contents.write(s.0, b);
+        s.0 = end;
         if !b.is_empty() {
             n.mtime_ns = i128::from(modified);
         }
         Ok(b.len())
     }
+    /// `lseek`, with `SEEK_DATA` and `SEEK_HOLE` as tmpfs answers them:
+    /// `ENXIO` for a negative offset or one at or past the end.
     fn seek(&self, off: i64, w: u32) -> Result<u64, Errno> {
         let mut s = lock(&self.state);
         let n = lock(&self.node);
+        if let (3 | 4, Kind::File(contents)) = (w, &n.kind) {
+            let offset = u64::try_from(off).map_err(|_| Errno(6))?;
+            s.0 = contents.seek(offset, w == 3)?;
+            return Ok(s.0);
+        }
         let base = match w {
             0 => 0,
             1 => s.0,
@@ -139,13 +131,27 @@ impl FileHandle for MemFile {
         }
         let mut n = lock(&self.node);
         let modified = (n.clock)()?;
-        let Kind::File(data) = &mut n.kind else {
+        let Kind::File(contents) = &mut n.kind else {
             return Err(Errno::EISDIR);
         };
-        let at = |value: u64| usize::try_from(value).unwrap_or(usize::MAX).min(data.len());
-        let (start, end) = (at(offset), at(offset.saturating_add(len)));
-        data[start..end].fill(0);
+        contents.punch(offset, len);
         n.mtime_ns = i128::from(modified);
+        Ok(())
+    }
+    /// Allocates the pages of the range, or none with `ENOSPC` when they
+    /// would take the file system past its size (`MEMORY_BYTES`), as tmpfs
+    /// refuses to go past its size.
+    fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        let t = lock(&self.tree);
+        let used = t.used_blocks();
+        let mut n = lock(&self.node);
+        let Kind::File(contents) = &mut n.kind else {
+            return Err(Errno::EISDIR);
+        };
+        if used.saturating_add(contents.missing(offset, len)) > MEMORY_BYTES / BLOCK {
+            return Err(Errno(28));
+        }
+        contents.allocate(offset, len);
         Ok(())
     }
     fn truncate(&self, size: u64) -> Result<(), Errno> {
@@ -154,14 +160,10 @@ impl FileHandle for MemFile {
         }
         let mut n = lock(&self.node);
         let modified = (n.clock)()?;
-        let Kind::File(b) = &mut n.kind else {
+        let Kind::File(contents) = &mut n.kind else {
             return Err(Errno::EISDIR);
         };
-        let len = usize::try_from(size).map_err(|_| Errno::EINVAL)?;
-        if len > b.len() {
-            b.try_reserve(len - b.len()).map_err(|_| Errno::ENOMEM)?;
-        }
-        b.resize(len, 0);
+        contents.set_len(size);
         n.mtime_ns = i128::from(modified);
         Ok(())
     }

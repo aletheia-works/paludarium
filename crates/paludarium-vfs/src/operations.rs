@@ -48,9 +48,10 @@ impl HostFs for MemFs {
                             }
                         }
                         Err(e) if e == Errno::ENOENT => {
+                            let contents = Contents::new(&t.usage);
                             break t.insert(
                                 &target,
-                                Kind::File(Vec::new()),
+                                Kind::File(contents),
                                 0o100000 | (mode & 0o7777),
                             )?;
                         }
@@ -76,7 +77,7 @@ impl HostFs for MemFs {
             let Kind::File(b) = &mut n.kind else {
                 unreachable!()
             };
-            b.clear();
+            b.set_len(0);
             n.mtime_ns = i128::from(modified);
         }
         drop(n);
@@ -118,14 +119,7 @@ impl HostFs for MemFs {
     fn statfs(&self, path: &[u8]) -> Result<FsStats, Errno> {
         let t = lock(&self.tree);
         t.resolve(path, true)?;
-        let used: u64 = t
-            .nodes
-            .values()
-            .map(|node| match &lock(node).kind {
-                Kind::File(b) | Kind::Symlink(b) => (b.len() as u64).div_ceil(BLOCK),
-                Kind::Dir(_) => 0,
-            })
-            .sum();
+        let used = t.used_blocks();
         let blocks = MEMORY_BYTES / BLOCK;
         let files = 1 << 20;
         Ok(FsStats {

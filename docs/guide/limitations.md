@@ -32,9 +32,10 @@ verified.
   `clone3`) fail with `EINVAL` and create no child, where Linux lets the
   guest, which runs as root, create the namespace. `unshare` and `setns`
   return `ENOSYS`.
-- **Sparse files**: a file of the in-memory filesystem has no holes, so
-  growing it with `ftruncate` or `fallocate` takes as much host memory as its
-  new size.
+- **Files of a mounted host directory**: `lseek` with `SEEK_DATA` or
+  `SEEK_HOLE` gives `EINVAL`, and `st_blocks` is the size rounded up to
+  512-byte blocks, where Linux finds the holes and counts what the host's
+  filesystem allocated. Files of the in-memory filesystem behave as on tmpfs.
 - **Core files**: a core is written as with the kernel's default
   `core_pattern` (`core` in the working directory); a host that pipes cores to
   a crash handler (systemd-coredump, apport) is not modelled. The core holds

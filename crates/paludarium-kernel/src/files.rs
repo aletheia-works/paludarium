@@ -582,8 +582,9 @@ fn copy_bytes(
 }
 /// `fallocate(fd, mode, offset, len)`, with the checks of Linux's
 /// vfs_fallocate in order. Files behave as on tmpfs: plain allocation (which
-/// may grow the file), `FALLOC_FL_KEEP_SIZE` and `FALLOC_FL_PUNCH_HOLE` work,
-/// and the other modes give `EOPNOTSUPP`.
+/// may grow the file) allocates the pages of the range, `FALLOC_FL_KEEP_SIZE`
+/// keeps the size, `FALLOC_FL_PUNCH_HOLE` frees the pages it covers, and the
+/// other modes give `EOPNOTSUPP`.
 fn fallocate(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     const KEEP_SIZE: u32 = 0x01;
     const PUNCH_HOLE: u32 = 0x02;
@@ -635,7 +636,8 @@ fn fallocate(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             if let Some(memfd) = memfd {
                 memfd.check_allocate(end)?;
             }
-            // Otherwise nothing shows: every byte of a file is allocated.
+            // The pages of the range are allocated, and count in st_blocks.
+            d.file.allocate(offset as u64, len as u64)?;
             if grows && mode & KEEP_SIZE == 0 {
                 d.file.truncate(end)?;
             }
@@ -973,7 +975,7 @@ fn encode_statx(s: FileStat, device: u64) -> Result<[u8; 256], Errno> {
     b[28..30].copy_from_slice(&(s.mode as u16).to_le_bytes());
     b[32..40].copy_from_slice(&s.inode.to_le_bytes());
     b[40..48].copy_from_slice(&s.size.to_le_bytes());
-    b[48..56].copy_from_slice(&s.size.div_ceil(512).to_le_bytes());
+    b[48..56].copy_from_slice(&blocks(&s).to_le_bytes());
     b[112..120].copy_from_slice(&seconds.to_le_bytes());
     b[120..124].copy_from_slice(&(nanos as u32).to_le_bytes());
     // Linux's encoding of a device number into its major and minor.
@@ -1028,6 +1030,10 @@ fn device(c: &Context<'_>, path: &[u8]) -> u64 {
         .max_by_key(|(_, m)| m.path.len())
         .map_or(1, |(i, _)| i as u64 + 1)
 }
+/// `st_blocks`: what the file system counts, or the size in 512-byte blocks.
+fn blocks(s: &FileStat) -> u64 {
+    s.blocks.unwrap_or(s.size.div_ceil(512))
+}
 fn encode_stat(s: FileStat) -> Result<[u8; 144], Errno> {
     let (seconds, nanos) = linux_mtime(s.mtime_ns)?;
     let mut b = [0; 144];
@@ -1037,7 +1043,7 @@ fn encode_stat(s: FileStat) -> Result<[u8; 144], Errno> {
     b[40..48].copy_from_slice(&s.rdev.to_le_bytes());
     b[48..56].copy_from_slice(&s.size.to_le_bytes());
     b[56..64].copy_from_slice(&4096u64.to_le_bytes());
-    b[64..72].copy_from_slice(&s.size.div_ceil(512).to_le_bytes());
+    b[64..72].copy_from_slice(&blocks(&s).to_le_bytes());
     b[88..96].copy_from_slice(&seconds.to_le_bytes());
     b[96..104].copy_from_slice(&nanos.to_le_bytes());
     Ok(b)
@@ -1828,6 +1834,7 @@ impl FileHandle for StandardFile {
             links: 1,
             mtime_ns: 0,
             rdev: 0,
+            blocks: None,
         })
     }
     fn truncate(&self, _n: u64) -> Result<(), Errno> {

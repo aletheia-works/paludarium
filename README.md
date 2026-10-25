@@ -80,8 +80,10 @@ mise run linux-dev -- cargo test --locked -p paludarium-harness --test diff_core
 The working tree is copied into a named volume first, so Docker Desktop does
 not need to share the repository path (`PALUDARIUM_DEV_MOUNT=bind` mounts it
 directly). Each checkout keeps its build output in volumes of its own, so one
-checkout never reuses crates another built. Docker on an Arm Mac runs x86-64 under emulation, so its results
-are not evidence of native Linux behaviour; CI is.
+checkout never reuses crates another built; `docker volume ls` lists them, and
+the shared `paludarium-work` and `paludarium-target` volumes of earlier versions
+can be removed with `docker volume rm`. Docker on an Arm Mac runs x86-64 under
+emulation, so its results are not evidence of native Linux behaviour; CI is.
 
 ### Documentation site
 

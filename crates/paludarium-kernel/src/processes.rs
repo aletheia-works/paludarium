@@ -420,30 +420,84 @@ impl Processes {
         // As Linux's forget_original_parent: the children go to the nearest
         // live ancestor that is a child subreaper, else to the first
         // process, with SIGCHLD as their exit signal, and one that has
-        // already exited is reported to its new parent.
-        if let Some(reaper) = Self::new_reaper(&entries, pid) {
-            let orphans: Vec<u32> = entries
-                .iter()
-                .filter(|(_, entry)| entry.parent == pid)
-                .map(|(&orphan, _)| orphan)
-                .collect();
-            for orphan in orphans {
+        // already exited is reported to its new parent. Then, as
+        // kill_orphaned_pgrp, a child's group this exit orphans is told.
+        let reaper = Self::new_reaper(&entries, pid);
+        let orphans: Vec<u32> = entries
+            .iter()
+            .filter(|(_, entry)| entry.parent == pid)
+            .map(|(&orphan, _)| orphan)
+            .collect();
+        for orphan in orphans {
+            let mut reaped = false;
+            if let Some(reaper) = reaper {
                 if let Some(entry) = entries.get_mut(&orphan) {
                     entry.parent = reaper;
                     entry.exit_signal = signals::SIGCHLD;
                 }
-                if entries
+                reaped = entries
                     .get(&orphan)
                     .is_some_and(|entry| entry.status.is_some())
-                    && Self::notify_parent(&entries, orphan)
-                {
-                    entries.remove(&orphan);
-                }
+                    && Self::notify_parent(&entries, orphan);
+            }
+            // As reparent_leader, also for a zombie reaped just now.
+            Self::hang_up_orphaned(&mut entries, orphan, pid);
+            if reaped {
+                entries.remove(&orphan);
             }
         }
+        Self::hang_up_orphaned(&mut entries, pid, pid);
         if Self::notify_parent(&entries, pid) {
             entries.remove(&pid);
         }
+    }
+    /// As Linux's kill_orphaned_pgrp, after `exiting` has exited: if `pid`
+    /// (`exiting` itself or one of its children) was in a group that `exiting`
+    /// or its parent linked to its session, the exit orphans that group, and
+    /// a member of it is stopped, every member gets SIGHUP and then SIGCONT
+    /// from the kernel, so a stopped job does not stay stopped for good.
+    fn hang_up_orphaned(entries: &mut BTreeMap<u32, Entry>, pid: u32, exiting: u32) {
+        let Some(entry) = entries.get(&pid) else {
+            return;
+        };
+        let (pgid, sid) = (entry.pgid, entry.sid);
+        let link = if pid == exiting {
+            entry.parent
+        } else {
+            exiting
+        };
+        let linked = entries
+            .get(&link)
+            .is_none_or(|parent| parent.pgid != pgid && parent.sid == sid);
+        let ignored = (pid == exiting).then_some(pid);
+        let members = || entries.iter().filter(move |(_, e)| e.pgid == pgid);
+        let orphaned = members()
+            .filter(|&(&member, e)| Some(member) != ignored && e.status.is_none())
+            .all(|(_, e)| !Self::links_group(entries, e));
+        let stopped = members().any(|(_, e)| e.status.is_none() && e.group.is_stopped());
+        if !(linked && orphaned && stopped) {
+            return;
+        }
+        // A zombie member would ignore them, as on Linux.
+        let group: Vec<u32> = members()
+            .filter(|(_, e)| e.status.is_none())
+            .map(|(&member, _)| member)
+            .collect();
+        for number in [1, 18] {
+            for &member in &group {
+                let _ = Self::deliver(entries, member, number, true);
+            }
+        }
+    }
+    /// Whether the parent of `entry` keeps its group from being orphaned
+    /// (will_become_orphaned_pgrp): a live process in another group of the
+    /// same session. The first process's parent is outside the emulator and
+    /// counts as one, as the shell that started it would; an exited parent,
+    /// which only the first process can be, does not.
+    fn links_group(entries: &BTreeMap<u32, Entry>, entry: &Entry) -> bool {
+        entries.get(&entry.parent).is_none_or(|parent| {
+            parent.status.is_none() && parent.pgid != entry.pgid && parent.sid == entry.sid
+        })
     }
     /// Who adopts the children of `pid`: the nearest ancestor that set
     /// PR_SET_CHILD_SUBREAPER and has not exited, else the first process,
@@ -618,14 +672,30 @@ impl Processes {
     }
     fn signal(&self, pid: u32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::deliver(&mut entries, pid, number, false)
+    }
+    /// Sends `number` to `pid`, from the kernel itself when `kernel` is set.
+    fn deliver(
+        entries: &mut BTreeMap<u32, Entry>,
+        pid: u32,
+        number: i32,
+        kernel: bool,
+    ) -> Result<(), Errno> {
         let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
         if number == 0 {
             return Ok(());
         }
+        let send = |group: &ThreadGroup| {
+            if kernel {
+                group.send_process_kernel(number)
+            } else {
+                group.send_process(number)
+            }
+        };
         // SIGCONT resumes a stopped process at once, as Linux's
         // prepare_signal does, and its parent's wait can see that.
         if number == 18 && entry.status.is_none() && entry.group.is_stopped() {
-            entry.group.send_process(number)?;
+            send(&entry.group)?;
             entry.group.job_continue();
             entry.stop_report = None;
             entry.continue_report = true;
@@ -642,7 +712,7 @@ impl Processes {
             }
             return Ok(());
         }
-        entry.group.send_process(number)
+        send(&entry.group)
     }
 }
 

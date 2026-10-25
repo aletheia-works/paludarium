@@ -174,6 +174,13 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .send(number)
     }
+    /// Sends this process a signal from the kernel itself (`SI_KERNEL`).
+    pub(crate) fn send_process_kernel(&self, number: i32) -> Result<(), Errno> {
+        self.process_inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send_kernel(number)
+    }
     /// Resets handled signals to their default and keeps ignored ones, as
     /// execve does. The process gets its own copy, so a process sharing the
     /// dispositions through `CLONE_SIGHAND` keeps its handlers.

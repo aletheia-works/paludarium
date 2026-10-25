@@ -233,6 +233,14 @@ kernel.
   can wait for them, and their exit signal becomes `SIGCHLD`. A child that has
   already exited is reported to the new parent at once (and reaped at once if
   that parent ignores `SIGCHLD`).
+- When an exit orphans a process group, so that no member keeps a parent in
+  another group of the same session, and a member of the group is stopped,
+  every member gets `SIGHUP` and then `SIGCONT` from the kernel (`SI_KERNEL`),
+  as Linux's `kill_orphaned_pgrp` sends them. The first process's parent is
+  outside the emulator and counts as such a parent while the first process
+  runs. The first process itself links a group of its children as any parent
+  does: Linux leaves out only the children of the global init, and the first
+  process acts as the init of a PID namespace, as in a container.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's

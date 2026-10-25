@@ -43,8 +43,6 @@ verified.
   PID namespace does, but when it exits the other processes are not killed,
   as they are when such an init exits on Linux. They keep running with the
   exited process as their parent, and the run ends once they have all exited.
-  A process group that is orphaned while one of its members is stopped gets
-  no `SIGHUP` and `SIGCONT`.
 - **A native JIT**: only the WebAssembly build has a JIT; native builds use the
   interpreter.
 - **Stable Rust**: a nightly Rust is required.

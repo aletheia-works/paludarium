@@ -123,6 +123,9 @@ pub(crate) struct TimerSignal {
 }
 /// `si_code` of a signal from a POSIX timer.
 pub(crate) const SI_TIMER: i32 = -2;
+/// `si_code` of a signal the kernel sends itself (`SEND_SIG_PRIV`), which
+/// carries no sender: `si_pid` and `si_uid` stay 0.
+pub(crate) const SI_KERNEL: i32 = 0x80;
 /// The 128-byte `siginfo_t` of `signal`, as Linux fills it for the frame and
 /// for `rt_sigtimedwait`.
 pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128] {
@@ -140,7 +143,7 @@ pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128
         info[16..20].copy_from_slice(&child.pid.to_le_bytes());
         info[24..28].copy_from_slice(&child.status.to_le_bytes());
         info[32..40].copy_from_slice(&(child.cpu / 10_000_000).to_le_bytes());
-    } else {
+    } else if signal.code != SI_KERNEL {
         info[16..20].copy_from_slice(&process.pid.to_le_bytes());
     }
     info

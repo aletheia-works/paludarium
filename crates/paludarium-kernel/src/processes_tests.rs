@@ -1157,3 +1157,141 @@ mod namespaces {
         }
     }
 }
+mod orphaned_groups {
+    use super::*;
+    const SIGHUP: u64 = 1 << 0;
+    const SIGCONT: u64 = 1 << 17;
+    /// The parent makes itself a subreaper, a child `m` starts a session, and
+    /// its child `c` leads a group of that session with SIGHUP and SIGCONT
+    /// blocked, so that they stay pending where the test can see them.
+    fn session_with_group(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+    ) -> [(Box<Kernel>, Thread, Arc<AddressSpace>); 2] {
+        assert_eq!(syscall(k, t, m, 157, [36, 1, 0, 0, 0, 0]), 0);
+        let (mut s, mut st, sm) = fork(k, t, m);
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 112, [0; 6]),
+            u64::from(st.tid)
+        );
+        let (mut c, mut ct, cm) = fork(&mut s, &mut st, &sm);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 109, [0; 6]), 0);
+        cm.write_u64(GuestAddr(DATA + 512), SIGHUP | SIGCONT)
+            .unwrap();
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 14, [0, DATA + 512, 0, 8, 0, 0]),
+            0
+        );
+        [(s, st, sm), (c, ct, cm)]
+    }
+    fn pending(c: &mut Kernel, ct: &mut Thread, cm: &AddressSpace) -> u64 {
+        assert_eq!(syscall(c, ct, cm, 127, [DATA + 520, 8, 0, 0, 0, 0]), 0);
+        cm.read_u64(GuestAddr(DATA + 520)).unwrap()
+    }
+    #[test]
+    fn a_stopped_group_orphaned_by_an_exit_gets_sighup_and_sigcont() {
+        let (mut k, mut t, m) = setup();
+        let [(mut s, st, sm), (mut c, mut ct, cm)] = session_with_group(&mut k, &mut t, &m);
+        syscall(&mut c, &mut ct, &cm, 62, [0, 19, 0, 0, 0, 0]);
+        assert!(c.group.is_stopped());
+        // The session leader linked the group to its session; its exit
+        // leaves the group with a parent in another session.
+        finish(&mut s, &st, &sm, ExitStatus::Exited(0));
+        assert!(!c.group.is_stopped());
+        assert_eq!(pending(&mut c, &mut ct, &cm), SIGHUP | SIGCONT);
+        // From the kernel: si_code SI_KERNEL, and no sender.
+        cm.write(
+            GuestAddr(DATA + 528),
+            &[SIGHUP, 0, 0].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            syscall(
+                &mut c,
+                &mut ct,
+                &cm,
+                128,
+                [DATA + 528, DATA + 640, DATA + 536, 8, 0, 0]
+            ),
+            1
+        );
+        let word = |at: u64| cm.read_u64(GuestAddr(DATA + 640 + at)).unwrap() as u32;
+        assert_eq!((word(8), word(16)), (0x80, 0));
+    }
+    #[test]
+    fn a_group_without_a_stopped_member_gets_nothing() {
+        let (mut k, mut t, m) = setup();
+        let [(mut s, st, sm), (mut c, mut ct, cm)] = session_with_group(&mut k, &mut t, &m);
+        finish(&mut s, &st, &sm, ExitStatus::Exited(0));
+        assert_eq!(pending(&mut c, &mut ct, &cm), 0);
+    }
+    #[test]
+    fn a_group_still_linked_to_its_session_is_not_orphaned() {
+        // Without the new session, the subreaper that adopts the child is in
+        // another group of the same session and keeps the group linked.
+        let (mut k, mut t, m) = setup();
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [36, 1, 0, 0, 0, 0]), 0);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        let (mut c, mut ct, cm) = fork(&mut s, &mut st, &sm);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 109, [0; 6]), 0);
+        cm.write_u64(GuestAddr(DATA + 512), SIGHUP | SIGCONT)
+            .unwrap();
+        syscall(&mut c, &mut ct, &cm, 14, [0, DATA + 512, 0, 8, 0, 0]);
+        syscall(&mut c, &mut ct, &cm, 62, [0, 19, 0, 0, 0, 0]);
+        finish(&mut s, &st, &sm, ExitStatus::Exited(0));
+        assert!(c.group.is_stopped());
+        assert_eq!(pending(&mut c, &mut ct, &cm), 0);
+    }
+    #[test]
+    fn a_zombie_leader_reaped_on_adoption_still_has_its_group_told() {
+        // The leader `z` of a group exits and stays a zombie; `g`, another
+        // child of the session leader `s`, keeps the group linked and stops.
+        // When `s` exits, the subreaper, which ignores SIGCHLD, adopts and
+        // reaps `z` at once, and the group, now orphaned, is told.
+        let (mut k, mut t, m) = setup();
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [36, 1, 0, 0, 0, 0]), 0);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        syscall(&mut s, &mut st, &sm, 112, [0; 6]);
+        let (mut z, mut zt, zm) = fork(&mut s, &mut st, &sm);
+        assert_eq!(syscall(&mut z, &mut zt, &zm, 109, [0; 6]), 0);
+        let (mut g, mut gt, gm) = fork(&mut s, &mut st, &sm);
+        let (leader, member) = (u64::from(zt.tid), u64::from(gt.tid));
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 109, [member, leader, 0, 0, 0, 0]),
+            0
+        );
+        gm.write_u64(GuestAddr(DATA + 512), SIGHUP | SIGCONT)
+            .unwrap();
+        syscall(&mut g, &mut gt, &gm, 14, [0, DATA + 512, 0, 8, 0, 0]);
+        syscall(&mut g, &mut gt, &gm, 62, [0, 19, 0, 0, 0, 0]);
+        finish(&mut z, &zt, &zm, ExitStatus::Exited(0));
+        assert!(g.group.is_stopped());
+        let ignore = [1u64, 0, 0, 0].map(u64::to_le_bytes).concat();
+        m.write(GuestAddr(DATA + 256), &ignore).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 13, [17, DATA + 256, 0, 8, 0, 0]),
+            0
+        );
+        finish(&mut s, &st, &sm, ExitStatus::Exited(0));
+        let echild = Errno(10).to_syscall_return();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [leader, 0, 1, 0, 0, 0]),
+            echild
+        );
+        assert!(!g.group.is_stopped());
+        assert_eq!(pending(&mut g, &mut gt, &gm), SIGHUP | SIGCONT);
+    }
+    #[test]
+    fn the_exit_of_the_member_that_linked_its_own_group_orphans_it() {
+        // `e` leads a group of the session and links it to its parent's
+        // group; its child `g` stays in the group and stops.
+        let (mut k, mut t, m) = setup();
+        let [_, (mut e, mut et, em)] = session_with_group(&mut k, &mut t, &m);
+        let (mut g, mut gt, gm) = fork(&mut e, &mut et, &em);
+        syscall(&mut g, &mut gt, &gm, 62, [0, 19, 0, 0, 0, 0]);
+        finish(&mut e, &et, &em, ExitStatus::Exited(0));
+        assert!(!g.group.is_stopped());
+        assert_eq!(pending(&mut g, &mut gt, &gm), SIGHUP | SIGCONT);
+    }
+}

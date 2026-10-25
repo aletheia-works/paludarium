@@ -46,6 +46,30 @@
 
 static void result(const char *name, long value) { printf("%s=%ld\n", name, value); }
 static pid_t child(void) { return syscall(SYS_fork); }
+/* What a member of an orphaned process group received: bit 0 SIGHUP,
+   bit 1 SIGCONT, bit 2 SIGHUP from the kernel (SI_KERNEL, no sender). */
+static volatile sig_atomic_t hangup_flags;
+static void hangup_seen(int number, siginfo_t *info, void *context) {
+    (void)context;
+    if (number == SIGHUP) hangup_flags |= 1 | (info->si_code == SI_KERNEL && info->si_pid == 0 ? 4 : 0);
+    if (number == SIGCONT) hangup_flags |= 2;
+    if (number == SIGUSR1) _exit(hangup_flags);
+}
+/* Watches for the signals, stops itself if asked, and exits with what came. */
+static void hangup_member(int stop, int ready) {
+    struct sigaction action = {.sa_sigaction = hangup_seen, .sa_flags = SA_SIGINFO};
+    sigaction(SIGHUP, &action, NULL);
+    sigaction(SIGCONT, &action, NULL);
+    sigaction(SIGUSR1, &action, NULL);
+    if (write(ready, "x", 1) != 1) _exit(70);
+    if (stop) {
+        /* Not raise(): after a raw fork musl's cached tid is the parent's. */
+        kill(getpid(), SIGSTOP);
+        for (int tries = 0; hangup_flags != 7 && tries < 1000; tries++) sched_yield();
+        _exit(hangup_flags);
+    }
+    for (;;) pause();
+}
 static int thread_ready[2], thread_block[2];
 static int discard_go[2], discard_done[2];
 /* Reports whether SIGUSR2 is pending for this thread, before and after the
@@ -1164,6 +1188,67 @@ int main(int argc, char **argv) {
         waitpid(middle, &status, 0);
         result("zombie-adopted", waitpid(zombie, &status, 0) == zombie);
         result("zombie-status", WEXITSTATUS(status));
+        return 0;
+    }
+    if (!strcmp(mode, "orphaned-group")) {
+        /* A group orphaned by an exit while a member is stopped gets SIGHUP
+           and then SIGCONT from the kernel; a group with no stopped member
+           gets nothing. A subreaper keeps the adopted members in reach, and
+           a new session puts it outside theirs. */
+        prctl(PR_SET_CHILD_SUBREAPER, 1);
+        int pids[2], ready[2];
+        if (pipe(pids) || pipe(ready)) return 91;
+        for (int stop = 1; stop >= 0; stop--) {
+            /* The session leader links its child's group to the session. */
+            pid_t leader = child(), member = 0;
+            if (leader == 0) {
+                setsid();
+                pid_t pid = child();
+                if (pid == 0) {
+                    setpgid(0, 0);
+                    hangup_member(stop, ready[1]);
+                }
+                char byte;
+                if (read(ready[0], &byte, 1) != 1) _exit(71);
+                int status;
+                if (stop && waitpid(pid, &status, WUNTRACED) != pid) _exit(72);
+                if (write(pids[1], &pid, sizeof pid) != sizeof pid) _exit(73);
+                _exit(0);
+            }
+            if (read(pids[0], &member, sizeof member) != sizeof member) return 92;
+            int status;
+            waitpid(leader, &status, 0);
+            if (!stop) kill(member, SIGUSR1);
+            if (waitpid(member, &status, 0) != member) return 93;
+            result(stop ? "stopped-child-group" : "running-child-group",
+                   WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status));
+        }
+        /* The member that linked its own group exits: the stopped member it
+           leaves behind in that group is told. */
+        pid_t leader = child(), member = 0;
+        if (leader == 0) {
+            setsid();
+            pid_t linker = child();
+            if (linker == 0) {
+                setpgid(0, 0);
+                pid_t pid = child();
+                if (pid == 0) hangup_member(1, ready[1]);
+                char byte;
+                int status;
+                if (read(ready[0], &byte, 1) != 1) _exit(74);
+                if (waitpid(pid, &status, WUNTRACED) != pid) _exit(75);
+                if (write(pids[1], &pid, sizeof pid) != sizeof pid) _exit(76);
+                _exit(0);
+            }
+            int status;
+            waitpid(linker, &status, 0);
+            _exit(0);
+        }
+        if (read(pids[0], &member, sizeof member) != sizeof member) return 94;
+        int status;
+        waitpid(leader, &status, 0);
+        if (waitpid(member, &status, 0) != member) return 95;
+        result("stopped-own-group", WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status));
         return 0;
     }
     if (!strcmp(mode, "waitid")) {

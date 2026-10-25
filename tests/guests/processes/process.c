@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -230,6 +231,103 @@ static void *priority_thread(void *base) {
     if (write(priority_ready[1], "x", 1) != 1 || read(priority_go[0], &byte, 1) != 1) return NULL;
     priority_thread_after = raw_priority(PRIO_PROCESS, 0);
     return NULL;
+}
+/* A core dump: the child sets RLIMIT_CORE to `limit` (at most its hard
+   limit), may make itself undumpable or start a thread, and ends by a NULL
+   write (SIGSEGV) or by `signal`; the parent reports how it ended and what
+   the `core` file holds. */
+static volatile uint64_t core_magic;
+static void *core_parked(void *unused) { (void)unused; for (;;) pause(); }
+static pid_t core_child(rlim_t limit, int dumpable, int thread, int signal) {
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+    struct rlimit r;
+    getrlimit(RLIMIT_CORE, &r);
+    r.rlim_cur = limit < r.rlim_max ? limit : r.rlim_max;
+    setrlimit(RLIMIT_CORE, &r);
+    if (!dumpable) prctl(PR_SET_DUMPABLE, 0);
+    core_magic = 0x1122334455667788ULL;
+    pthread_t t;
+    if (thread && pthread_create(&t, NULL, core_parked, NULL)) _exit(71);
+    if (signal) kill(getpid(), signal);
+    else *(volatile int *)0 = 1;
+    _exit(70);
+}
+/* A little-endian field of the core, or 0 past its end. */
+static const unsigned char *core_bytes;
+static uint64_t core_size;
+static uint64_t le(uint64_t at, int size) {
+    uint64_t v = 0;
+    if (at > core_size || (uint64_t)size > core_size - at) return 0;
+    for (int i = size - 1; i >= 0; i--) v = v << 8 | core_bytes[at + i];
+    return v;
+}
+static void core_report(const char *name, pid_t pid) {
+    siginfo_t info;
+    int status = 0;
+    waitid(P_PID, pid, &info, WEXITED | WNOWAIT);
+    waitpid(pid, &status, 0);
+    printf("%s: code=%d signal=%d core=%d", name, info.si_code,
+           WIFSIGNALED(status) ? WTERMSIG(status) : -1, WCOREDUMP(status) ? 1 : 0);
+    int fd = open("core", O_RDONLY);
+    if (fd < 0) {
+        printf(" file=0\n");
+        fflush(stdout);
+        return;
+    }
+    struct stat st;
+    fstat(fd, &st);
+    unsigned char *b = calloc(st.st_size + 1, 1);
+    long size = 0, n;
+    while (b && size < st.st_size && (n = read(fd, b + size, st.st_size - size)) > 0) size += n;
+    close(fd);
+    unlink("core");
+    core_bytes = b;
+    core_size = b ? (uint64_t)size : 0;
+    printf(" file=1 mode=%o elf=%d", (unsigned)(st.st_mode & 0777), size >= 64 && !memcmp(b, "\177ELF", 4));
+    if (!WCOREDUMP(status) || size < 64) {
+        printf(" small=%d\n", st.st_size <= 4096);
+        fflush(stdout);
+        free(b);
+        return;
+    }
+    printf(" type=%d machine=%d", (int)le(16, 2), (int)le(18, 2));
+    int count = (int)le(56, 2), statuses = 0, magic = 0;
+    for (int i = 0; i < count; i++) {
+        uint64_t p = le(32, 8) + 56 * (uint64_t)i;
+        uint64_t offset = le(p + 8, 8), address = le(p + 16, 8), filesz = le(p + 32, 8);
+        uint64_t at = (uintptr_t)&core_magic;
+        if (le(p, 4) == 1 && at >= address && at + 8 <= address + filesz)
+            magic = le(offset + (at - address), 8) == 0x1122334455667788ULL;
+        if (le(p, 4) != 4) continue;
+        /* The first notes, their order, and the fatal signal. */
+        for (uint64_t q = offset, k = 0; q + 12 <= offset + filesz && q + 12 <= core_size; k++) {
+            uint64_t namesz = le(q, 4), descsz = le(q + 4, 4), type = le(q + 8, 4);
+            uint64_t desc = q + 12 + ((namesz + 3) & ~3ULL);
+            if (k < 4) printf(" note%d=%#llx", (int)k, (unsigned long long)type);
+            if (type == 1 && statuses++ == 0)
+                printf(" cursig=%d own=%d", (int)le(desc + 12, 2), (pid_t)le(desc + 32, 4) == pid);
+            if (type == 3) {
+                char fname[17] = {0};
+                for (int c = 0; c < 16; c++) fname[c] = (char)le(desc + 40 + c, 1);
+                printf(" fname=%s", fname);
+            }
+            /* A fault gives its address, a kill its sender, here the child. */
+            if (type == 0x53494749 && le(desc, 4) == SIGSEGV)
+                printf(" signo=11 sicode=%d addr=%#llx", (int)le(desc + 8, 4),
+                       (unsigned long long)le(desc + 16, 8));
+            else if (type == 0x53494749)
+                printf(" signo=%d sicode=%d sender=%d", (int)le(desc, 4), (int)le(desc + 8, 4),
+                       (pid_t)le(desc + 16, 4) == pid);
+            if (type == 6)
+                for (uint64_t a = 0; a + 16 <= descsz; a += 16)
+                    if (le(desc + a, 8) == AT_PAGESZ) printf(" pagesz=%llu", (unsigned long long)le(desc + a + 8, 8));
+            q = desc + ((descsz + 3) & ~3ULL);
+        }
+    }
+    printf(" statuses=%d magic=%d\n", statuses, magic);
+    fflush(stdout);
+    free(b);
 }
 static void finish(pid_t pid) {
     int status = 0;
@@ -1369,6 +1467,28 @@ int main(int argc, char **argv) {
         waitpid(parent, NULL, 0);
         result("death-sender", found[0]);
         result("death-code", found[1]);
+        return 0;
+    }
+    if (!strcmp(mode, "core-dump")) {
+        /* A core-dumping signal writes `core` in the working directory when
+           RLIMIT_CORE allows a page and the process is dumpable; wait then
+           reports CLD_DUMPED and WCOREDUMP. A core past the limit is cut
+           there and still reported. An old core is replaced. */
+        char dir[] = "/tmp/core-XXXXXX";
+        if (!mkdtemp(dir) || chdir(dir)) return 80;
+        umask(022);
+        core_report("full", core_child(RLIM_INFINITY, 1, 0, 0));
+        core_report("threads", core_child(RLIM_INFINITY, 1, 1, 0));
+        int old = open("core", O_CREAT | O_WRONLY, 0644);
+        if (old < 0 || write(old, "old", 3) != 3) return 81;
+        close(old);
+        core_report("replaced", core_child(RLIM_INFINITY, 1, 0, 0));
+        core_report("default", core_child(0, 1, 0, 0));
+        core_report("small", core_child(4096, 1, 0, 0));
+        core_report("undumpable", core_child(RLIM_INFINITY, 0, 0, 0));
+        core_report("abort", core_child(RLIM_INFINITY, 1, 0, SIGABRT));
+        core_report("term", core_child(RLIM_INFINITY, 1, 0, SIGTERM));
+        if (chdir("/") || rmdir(dir)) return 82;
         return 0;
     }
     if (!strcmp(mode, "waitid")) {

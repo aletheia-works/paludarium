@@ -47,6 +47,8 @@ struct Entry {
     /// PR_SET_CHILD_SUBREAPER: orphaned descendants come to this process
     /// rather than to the first one. Not inherited on fork, kept on exec.
     subreaper: bool,
+    /// Whether its fatal signal wrote a whole core (CLD_DUMPED).
+    dumped: bool,
     /// The task the process counts as until it is reaped, as its leader does
     /// in Linux's pids controller even as a zombie.
     _task: TaskCharge,
@@ -127,6 +129,7 @@ impl Processes {
                     children_cpu: 0,
                     exit_signal: signals::SIGCHLD,
                     subreaper: false,
+                    dumped: false,
                     _task: TaskCharge(Arc::clone(&tasks)),
                 },
             )])),
@@ -202,6 +205,7 @@ impl Processes {
                 children_cpu: 0,
                 exit_signal,
                 subreaper: false,
+                dumped: false,
                 _task: task,
             },
         );
@@ -545,6 +549,7 @@ impl Processes {
         let (ignored, no_wait) = parent.group.child_exit_disposition();
         let reap = entry.exit_signal == signals::SIGCHLD && (ignored || no_wait);
         let (code, status) = match status {
+            ExitStatus::Signaled(signal) if entry.dumped => (signals::CLD_DUMPED, signal),
             ExitStatus::Signaled(signal) => (signals::CLD_KILLED, signal),
             ExitStatus::Exited(code) => (signals::CLD_EXITED, code & 255),
             _ => (signals::CLD_EXITED, 0),
@@ -606,6 +611,9 @@ impl Processes {
                 return None;
             }
             let event = match entry.status {
+                Some(ExitStatus::Signaled(signal)) if entry.dumped => {
+                    wait.exits.then_some(ChildEvent::Dumped(signal))
+                }
                 Some(status) => wait.exits.then_some(ChildEvent::Exited(status)),
                 None => match entry.stop_report {
                     Some(signal) if wait.stops => Some(ChildEvent::Stopped(signal)),
@@ -620,7 +628,7 @@ impl Processes {
         {
             match event {
                 // A reaped child's CPU time joins its parent's children's.
-                ChildEvent::Exited(_) => {
+                ChildEvent::Exited(_) | ChildEvent::Dumped(_) => {
                     entries.remove(&pid);
                     if let Some(parent) = entries.get_mut(&parent) {
                         parent.children_cpu = parent.children_cpu.saturating_add(cpu);
@@ -664,6 +672,39 @@ impl Processes {
             && parent.group.wants_stop_notices()
         {
             parent.group.notify_child(signals::CLD_STOPPED, child);
+        }
+    }
+    /// The RLIMIT_CORE soft limit of `pid` when a fatal signal may dump its
+    /// core: the process is dumpable and the limit is at least one page.
+    pub(crate) fn core_limit(&self, pid: u32) -> Option<u64> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get(&pid)?;
+        let limit = entry.limits[4].0;
+        (entry.dumpable && limit >= crate::coredump::MIN_LIMIT).then_some(limit)
+    }
+    /// Who `pid` is, for its core.
+    pub(crate) fn core_identity(
+        &self,
+        pid: u32,
+        cpu: u64,
+        start_stack: u64,
+    ) -> Option<crate::coredump::Identity> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get(&pid)?;
+        Some(crate::coredump::Identity {
+            pid,
+            ppid: entry.parent,
+            pgrp: entry.pgid,
+            sid: entry.sid,
+            cpu,
+            children_cpu: entry.children_cpu,
+            start_stack,
+        })
+    }
+    pub(crate) fn set_dumped(&self, pid: u32) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = entries.get_mut(&pid) {
+            entry.dumped = true;
         }
     }
     /// Whether `pid` has exited: `None` once it is reaped (or never was).
@@ -795,6 +836,8 @@ pub(crate) struct WaitFor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChildEvent {
     Exited(ExitStatus),
+    /// Ended by this signal after writing a core.
+    Dumped(i32),
     Stopped(i32),
     Continued,
 }
@@ -1240,6 +1283,8 @@ impl Kernel {
                 let raw = match event {
                     ChildEvent::Exited(ExitStatus::Exited(code)) => (code & 255) << 8,
                     ChildEvent::Exited(ExitStatus::Signaled(signal)) => signal & 127,
+                    // WCOREDUMP.
+                    ChildEvent::Dumped(signal) => signal & 127 | 0x80,
                     ChildEvent::Exited(_) => return Err(Errno::EINVAL),
                     ChildEvent::Stopped(signal) => (signal << 8) | 0x7f,
                     ChildEvent::Continued => 0xffff,
@@ -1295,6 +1340,7 @@ impl Kernel {
                 Ok(Some((pid, ChildEvent::Exited(ExitStatus::Signaled(signal)), _))) => {
                     (17, 2, pid, signal)
                 }
+                Ok(Some((pid, ChildEvent::Dumped(signal), _))) => (17, 3, pid, signal),
                 // CLD_STOPPED and CLD_CONTINUED.
                 Ok(Some((pid, ChildEvent::Stopped(signal), _))) => (17, 5, pid, signal),
                 Ok(Some((pid, ChildEvent::Continued, _))) => (17, 6, pid, 18),
@@ -1474,6 +1520,7 @@ impl Kernel {
         self.files = self.files.for_exec();
         self.group.exec_actions();
         thread.cpu = CpuState::new(image.entry_point, image.initial_stack_pointer);
+        self.group.set_start_stack(image.initial_stack_pointer.0);
         let ignored = thread
             .state
             .signal_actions

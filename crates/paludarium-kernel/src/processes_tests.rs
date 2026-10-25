@@ -1518,3 +1518,165 @@ mod first_process_exit {
         assert_eq!(k.checkpoint(&mut t, &m), Next::Resume);
     }
 }
+mod core_dumps {
+    use super::*;
+    const MAGIC: u64 = 0x1122_3344_5566_7788;
+    /// Sets the RLIMIT_CORE soft limit, with no hard limit.
+    fn core_limit(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, soft: u64) {
+        m.write(
+            GuestAddr(DATA + 512),
+            &[soft, u64::MAX].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+        assert_eq!(syscall(k, t, m, 160, [4, DATA + 512, 0, 0, 0, 0]), 0);
+    }
+    /// The child sends itself `signal`, ends by it and finishes.
+    fn end_by(c: &mut Kernel, ct: &mut Thread, cm: &AddressSpace, signal: u64) {
+        let own = u64::from(ct.tid);
+        assert_eq!(syscall(c, ct, cm, 62, [own, signal, 0, 0, 0, 0]), 0);
+        let status = ExitStatus::Signaled(signal as i32);
+        assert_eq!(c.checkpoint(ct, cm), Next::Exit(status));
+        finish(c, ct, cm, status);
+    }
+    /// The raw wait status of `pid`, reaped by the parent.
+    fn wait_status(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, pid: u32) -> u32 {
+        let pid = u64::from(pid);
+        assert_eq!(syscall(k, t, m, 61, [pid, DATA, 0, 0, 0, 0]), pid);
+        m.read_u64(GuestAddr(DATA)).unwrap() as u32
+    }
+    fn core(k: &Kernel) -> Option<Vec<u8>> {
+        let file = k.files.fs.open(b"/core", 0, 0).ok()?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            match file.read(&mut buffer).unwrap() {
+                0 => return Some(bytes),
+                n => bytes.extend_from_slice(&buffer[..n]),
+            }
+        }
+    }
+    fn u16_at(b: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
+    }
+    fn u32_at(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+    fn u64_at(b: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+    }
+    /// The program headers of a core: (type, offset, address, file size).
+    fn segments(core: &[u8]) -> Vec<(u32, usize, u64, usize)> {
+        (0..usize::from(u16_at(core, 56)))
+            .map(|i| {
+                let p = 64 + 56 * i;
+                let size = u64_at(core, p + 32) as usize;
+                (
+                    u32_at(core, p),
+                    u64_at(core, p + 8) as usize,
+                    u64_at(core, p + 16),
+                    size,
+                )
+            })
+            .collect()
+    }
+    #[test]
+    fn a_core_signal_writes_a_core_and_wait_reports_it() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        cm.write_u64(GuestAddr(DATA + 256), MAGIC).unwrap();
+        core_limit(&mut c, &mut ct, &cm, u64::MAX);
+        end_by(&mut c, &mut ct, &cm, 11);
+        // WNOWAIT first: waitid reports CLD_DUMPED.
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                247,
+                [1, u64::from(ct.tid), DATA + 64, 4 | 0x0100_0000, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA + 72)).unwrap() as u32, 3);
+        // SIGSEGV with WCOREDUMP.
+        assert_eq!(wait_status(&mut k, &mut t, &m, ct.tid), 11 | 0x80);
+        let core = core(&k).expect("a core file");
+        assert_eq!(core[..4], *b"\x7fELF");
+        assert_eq!(u16_at(&core, 16), 4); // ET_CORE
+        assert_eq!(u16_at(&core, 18), 62); // EM_X86_64
+        assert_eq!(
+            k.files.fs.metadata(b"/core", false).unwrap().mode & 0o777,
+            0o600
+        );
+        let segments = segments(&core);
+        // The notes come first; the first is the thread's NT_PRSTATUS.
+        let (kind, notes, _, _) = segments[0];
+        assert_eq!(kind, 4);
+        assert_eq!(u32_at(&core, notes + 8), 1);
+        let status = notes + 20;
+        assert_eq!(u16_at(&core, status + 12), 11); // pr_cursig
+        assert_eq!(u32_at(&core, status + 32), ct.tid); // pr_pid
+        assert_eq!(u32_at(&core, status + 36), 1); // pr_ppid
+        // The memory holds what the child wrote.
+        let &(_, offset, _, size) = segments
+            .iter()
+            .find(|&&(kind, _, address, _)| kind == 1 && address == DATA)
+            .expect("the data mapping");
+        assert_eq!(size, PAGE_SIZE as usize);
+        assert_eq!(u64_at(&core, offset + 256), MAGIC);
+    }
+    #[test]
+    fn no_core_under_the_default_limit_a_page_or_without_dumpable() {
+        for (limit, dumpable) in [(None, true), (Some(4095), true), (Some(u64::MAX), false)] {
+            let (mut k, mut t, m) = setup();
+            let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+            if let Some(limit) = limit {
+                core_limit(&mut c, &mut ct, &cm, limit);
+            }
+            if !dumpable {
+                assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [4, 0, 0, 0, 0, 0]), 0);
+            }
+            end_by(&mut c, &mut ct, &cm, 11);
+            assert_eq!(wait_status(&mut k, &mut t, &m, ct.tid), 11);
+            assert!(core(&k).is_none(), "{limit:?} {dumpable}");
+        }
+    }
+    #[test]
+    fn a_core_past_the_limit_is_cut_and_still_reported() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        core_limit(&mut c, &mut ct, &cm, 4096);
+        end_by(&mut c, &mut ct, &cm, 6);
+        assert_eq!(wait_status(&mut k, &mut t, &m, ct.tid), 6 | 0x80);
+        let core = core(&k).expect("a cut core");
+        assert!(
+            core.len() <= 4096 && core.starts_with(b"\x7fELF"),
+            "{}",
+            core.len()
+        );
+    }
+    #[test]
+    fn a_signal_that_dumps_no_core_writes_none() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        core_limit(&mut c, &mut ct, &cm, u64::MAX);
+        end_by(&mut c, &mut ct, &cm, 15);
+        assert_eq!(wait_status(&mut k, &mut t, &m, ct.tid), 15);
+        assert!(core(&k).is_none());
+    }
+    #[test]
+    fn an_old_core_is_replaced() {
+        let (mut k, mut t, m) = setup();
+        let old = k.files.fs.open(b"/core", 0o101, 0o644).unwrap();
+        assert_eq!(old.write(b"old").unwrap(), 3);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        core_limit(&mut c, &mut ct, &cm, u64::MAX);
+        end_by(&mut c, &mut ct, &cm, 11);
+        assert_eq!(wait_status(&mut k, &mut t, &m, ct.tid), 11 | 0x80);
+        assert!(core(&k).unwrap().starts_with(b"\x7fELF"));
+        assert_eq!(
+            k.files.fs.metadata(b"/core", false).unwrap().mode & 0o777,
+            0o600
+        );
+    }
+}

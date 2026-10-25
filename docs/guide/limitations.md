@@ -35,10 +35,12 @@ verified.
 - **Sparse files**: a file of the in-memory filesystem has no holes, so
   growing it with `ftruncate` or `fallocate` takes as much host memory as its
   new size.
-- **Some signal details**: no core file is written, so a child killed by `SIGSEGV`,
-  `SIGABRT` or another core-dumping signal is reported as `CLD_KILLED`,
-  without the core flag in its `wait` status, where Linux may report
-  `CLD_DUMPED`.
+- **Core files**: a core is written as with the kernel's default
+  `core_pattern` (`core` in the working directory); a host that pipes cores to
+  a crash handler (systemd-coredump, apport) is not modelled. The core holds
+  the registers, the fatal signal, the auxiliary vector and the memory, but
+  not every note Linux writes (`NT_FILE`, `NT_X86_XSTATE`), and it holds every
+  anonymous mapping, where Linux leaves out one never written.
 - **A native JIT**: only the WebAssembly build has a JIT; native builds use the
   interpreter.
 - **Stable Rust**: a nightly Rust is required.

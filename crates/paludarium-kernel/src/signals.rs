@@ -114,6 +114,7 @@ pub(crate) const SA_NOCLDWAIT: u64 = 2;
 /// `si_code` values of SIGCHLD.
 pub(crate) const CLD_EXITED: i32 = 1;
 pub(crate) const CLD_KILLED: i32 = 2;
+pub(crate) const CLD_DUMPED: i32 = 3;
 pub(crate) const CLD_STOPPED: i32 = 5;
 pub(crate) const CLD_CONTINUED: i32 = 6;
 /// `si_timerid`, `si_overrun` and `si_value` of a timer's signal.

@@ -255,7 +255,7 @@ kernel.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's
-  `fs.nr_open`), or to a lower ceiling the embedder sets. Two are enforced,
+  `fs.nr_open`), or to a lower ceiling the embedder sets. Three are enforced,
   as in Linux:
   - `RLIMIT_NOFILE`: a new descriptor past its soft limit gives `EMFILE` (and
     `open` creates nothing), `dup2`/`dup3` onto a number past it `EBADF`, and
@@ -265,6 +265,16 @@ kernel.
     and `sendfile`) stops at the soft limit; one that
     starts at or past it, and a `truncate`/`ftruncate` or `fallocate` that
     grows the file past it, raise `SIGXFSZ` and fail with `EFBIG`.
+  - `RLIMIT_CORE`: a process that a core-dumping signal (`SIGSEGV`,
+    `SIGABRT`, ...) ends writes an ELF core named `core` in its working
+    directory (mode 0600 less the umask, replacing an old one), as Linux's
+    `do_coredump` does with the default `core_pattern`, when the soft limit
+    is at least a page and `PR_SET_DUMPABLE` has not turned dumping off. The
+    core has each thread's registers (`NT_PRSTATUS`), the process
+    (`NT_PRPSINFO`), the fatal signal (`NT_SIGINFO`), the auxiliary vector
+    and the memory. `wait` then reports `CLD_DUMPED` and the core flag. A
+    core larger than the limit is cut there and still reported as dumped, as
+    Linux reports a core once it has started to write it.
 
   Process groups and sessions are kept the same way, and `wait4` and
   `waitid` can wait for a group. The first process's session started outside

@@ -8,6 +8,7 @@
 //! records signal registrations but never delivers signals.
 #![forbid(unsafe_code)]
 
+mod coredump;
 mod inbox;
 mod signals;
 pub use inbox::SignalInbox;
@@ -307,6 +308,7 @@ impl Kernel {
     pub fn spawn_initial(&self, image: &LoadedImage) -> Thread {
         self.group
             .register(self.process.pid, Arc::clone(&self.inbox));
+        self.group.set_start_stack(image.initial_stack_pointer.0);
         Thread {
             tid: self.process.pid,
             cpu: CpuState::new(image.entry_point, image.initial_stack_pointer),
@@ -318,6 +320,25 @@ impl Kernel {
     }
 
     fn terminate(&mut self, thread: &mut Thread, signal: i32) -> Next {
+        let siginfo = coredump::kernel_siginfo(&thread.state, signal);
+        self.terminate_with(thread, signal, siginfo)
+    }
+
+    /// Ends the process by `signal`, whose siginfo is `siginfo`, and starts
+    /// its core dump when the signal dumps core and the process may.
+    fn terminate_with(&mut self, thread: &mut Thread, signal: i32, siginfo: [u8; 128]) -> Next {
+        if coredump::dumps_core(signal)
+            && let Some(limit) = self.processes.core_limit(self.process.pid)
+        {
+            self.group.begin_core(coredump::Dump {
+                signal,
+                dumper: thread.tid,
+                siginfo,
+                limit,
+                threads: Vec::new(),
+                clear_tids: Vec::new(),
+            });
+        }
         let status = ExitStatus::Signaled(signal);
         thread.state.exit_status = Some(status);
         self.group.stop(status);
@@ -372,7 +393,8 @@ impl Kernel {
                 && (action.handler <= 1
                     || thread.state.signal_mask & (1u64 << (signal.number - 1)) != 0)
             {
-                return self.terminate(thread, signal.number);
+                let siginfo = signals::siginfo(&thread.state, &signal);
+                return self.terminate_with(thread, signal.number, siginfo);
             }
             if action.handler == 1
                 || action.handler == 0 && matches!(signal.number, 17 | 18 | 23 | 28)
@@ -393,7 +415,8 @@ impl Kernel {
                 return Next::Stopped;
             }
             if action.handler == 0 || signal.number == 9 {
-                return self.terminate(thread, signal.number);
+                let siginfo = signals::siginfo(&thread.state, &signal);
+                return self.terminate_with(thread, signal.number, siginfo);
             }
             // A handler ends any restart, as Linux's signal frame setup sets
             // restart_block to do_no_restart_syscall.

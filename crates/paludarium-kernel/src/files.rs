@@ -222,6 +222,15 @@ impl Files {
         base.extend_from_slice(&p);
         Ok(base)
     }
+    /// The file a core dump goes to: `core` in the working directory, made
+    /// afresh with mode 0600 less the umask, as Linux's `do_coredump` removes
+    /// an old one and opens it with `O_CREAT | O_EXCL | O_NOFOLLOW`.
+    pub(crate) fn create_core(&self) -> Result<Arc<dyn paludarium_host::FileHandle>, Errno> {
+        let path = paludarium_vfs::normalize_path(&self.path(-100i64 as u64, b"core".to_vec())?)?;
+        let _ = self.fs.unlink(&path, false);
+        self.fs
+            .open(&path, 0o1 | 0o100 | 0o200 | 0o400000, 0o600 & !self.umask())
+    }
     pub(crate) fn for_clone(&self, share_files: bool, share_fs: bool) -> Self {
         let mut child = self.clone();
         if !share_files {

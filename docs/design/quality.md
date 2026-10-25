@@ -18,6 +18,10 @@ CI run produces them afresh on an x86-64 Linux runner.
 - New instructions and system calls get their test cases, and the result on
   real Linux, before they are implemented.
 - Each case has a 30-second timeout.
+- The core-dump case needs Linux to keep the kernel's default `core_pattern`
+  (`core`, with `core_uses_pid` 0). CI sets it with `sysctl`; elsewhere the
+  case stops and says so, rather than compare with a core sent to a crash
+  handler.
 - A test checks that `diff_processes` runs exactly the process cases that
   `tests/guests/processes/cases.json` lists, so that a case cannot be listed
   and never run.

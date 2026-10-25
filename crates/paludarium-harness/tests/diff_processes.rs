@@ -91,6 +91,18 @@ mod linux {
                 )
             });
         }
+        // Linux writes the core the case reads only with the kernel's
+        // default core_pattern, which CI sets.
+        if mode == "core-dump" {
+            for (setting, wanted) in [("core_pattern", "core\n"), ("core_uses_pid", "0\n")] {
+                let value = std::fs::read_to_string(format!("/proc/sys/kernel/{setting}"))
+                    .unwrap_or_default();
+                assert_eq!(
+                    value, wanted,
+                    "the core-dump case needs `sysctl kernel.core_pattern=core kernel.core_uses_pid=0`"
+                );
+            }
+        }
         support::bounded(test, || {
             let program = dir.join(binary);
             let self_path = program.to_str().unwrap().to_owned();
@@ -169,6 +181,7 @@ mod linux {
         processes_orphaned_group => ("orphaned-group","process"),
         processes_kill_group => ("kill-group","process"),
         processes_signal_sender => ("signal-sender","process"),
+        processes_core_dump => ("core-dump","process"),
         processes_ignore_discards => ("ignore-discards","process"),
         processes_thread_name => ("thread-name","process"),
         processes_timer_thread => ("timer-thread","process"),

@@ -357,6 +357,11 @@ jobs:
         with:
           node-version: 'latest'
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      # The core-dump differential case needs Linux to write a core to the
+      # working directory, as the kernel's default core_pattern does; the
+      # runner hands cores to its crash handler instead.
+      - name: Write cores to the working directory
+        run: sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0
       - name: Record native architectural profile
         run: |
           mkdir -p target/encodings-guests
@@ -398,6 +403,11 @@ jobs:
         with:
           node-version: 'latest'
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      # The core-dump differential case needs Linux to write a core to the
+      # working directory, as the kernel's default core_pattern does; the
+      # runner hands cores to its crash handler instead.
+      - name: Write cores to the working directory
+        run: sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0
       - name: Record native architectural profile
         run: |
           mkdir -p target/encodings-guests

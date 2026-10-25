@@ -41,6 +41,12 @@ pub struct ThreadGroup {
     pub(crate) timers: Mutex<crate::timers::Timers>,
     /// Every thread's CPU time, live or exited, for the process's total.
     cpu: Mutex<Vec<Arc<AtomicU64>>>,
+    /// The core dump a fatal signal started, which the last thread to end
+    /// writes. Locked before `members`.
+    pub(crate) core: Mutex<Option<crate::coredump::Dump>>,
+    /// The initial stack pointer of the running program (argc, argv, envp
+    /// and the auxiliary vector), for a core dump.
+    start_stack: AtomicU64,
 }
 impl Default for ThreadGroup {
     fn default() -> Self {
@@ -61,6 +67,8 @@ impl Default for ThreadGroup {
             futexes: Futexes::default(),
             timers: Mutex::default(),
             cpu: Mutex::default(),
+            core: Mutex::default(),
+            start_stack: AtomicU64::new(0),
         }
     }
 }
@@ -121,6 +129,8 @@ impl ThreadGroup {
             actions: Mutex::new(actions),
             nofile: AtomicU64::new(self.nofile()),
             fsize: AtomicU64::new(self.fsize()),
+            // A fork keeps the memory, and so the program's initial stack.
+            start_stack: AtomicU64::new(self.start_stack()),
             ..Self::default()
         }
     }
@@ -361,6 +371,20 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+    pub(crate) fn set_start_stack(&self, stack: u64) {
+        self.start_stack.store(stack, Ordering::SeqCst);
+    }
+    pub(crate) fn start_stack(&self) -> u64 {
+        self.start_stack.load(Ordering::SeqCst)
+    }
+    /// Starts a core dump for the fatal signal that ends the process, unless
+    /// the process is already ending.
+    pub(crate) fn begin_core(&self, dump: crate::coredump::Dump) {
+        let mut core = self.core.lock().unwrap_or_else(PoisonError::into_inner);
+        if core.is_none() && self.status().is_none() {
+            *core = Some(dump);
+        }
+    }
     pub fn stop(&self, status: ExitStatus) {
         let mut current = self.status.lock().unwrap_or_else(PoisonError::into_inner);
         if current.is_none() {
@@ -532,17 +556,88 @@ impl Kernel {
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
         self.files.release_descriptors();
         let addr = thread.state.clear_child_tid;
-        if addr != 0 && mem.write(GuestAddr(addr), &0u32.to_le_bytes()).is_ok() {
-            let _ = self.group.futexes.wake(mem, addr, false, 1, u32::MAX);
+        // While a core dump is under way, a thread leaves its state for it
+        // and its clear_child_tid word stays until the core is written, as
+        // Linux dumps before the threads exit.
+        let mut core = self
+            .group
+            .core
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(dump) = core.as_mut() {
+            dump.threads.push(crate::coredump::ThreadCore {
+                tid: thread.tid,
+                cpu: thread.cpu.clone(),
+                pending: thread
+                    .state
+                    .pending
+                    .iter()
+                    .fold(0, |set, s| set | 1u64 << (s.number - 1)),
+                blocked: thread.state.signal_mask,
+                name: thread.state.name,
+            });
+            if addr != 0 {
+                dump.clear_tids.push(addr);
+            }
+        } else {
+            Self::clear_child_tid(&self.group, mem, addr);
+        }
+        // The last thread writes the core while it still counts, so that no
+        // other thread's completion records the exit before it is dumped.
+        let last = {
+            let members = self
+                .group
+                .members
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            members.len() == 1 && members.contains_key(&thread.tid)
+        };
+        if last && let Some(dump) = core.take() {
+            self.write_core(&dump, mem);
+            for addr in dump.clear_tids {
+                Self::clear_child_tid(&self.group, mem, addr);
+            }
         }
         self.group
             .members
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&thread.tid);
+        drop(core);
         if thread.tid != self.process.pid {
             self.group.forget_nice(thread.tid);
         }
+    }
+    fn clear_child_tid(group: &ThreadGroup, mem: &AddressSpace, addr: u64) {
+        if addr != 0 && mem.write(GuestAddr(addr), &0u32.to_le_bytes()).is_ok() {
+            let _ = group.futexes.wake(mem, addr, false, 1, u32::MAX);
+        }
+    }
+    /// Writes the core of `dump` to `core` in the working directory. Once the
+    /// file is made the process counts as dumped, even if the core is cut at
+    /// the limit, as Linux's binfmt_elf sets `has_dumped` before it writes.
+    fn write_core(&self, dump: &crate::coredump::Dump, mem: &AddressSpace) {
+        let pid = self.process.pid;
+        let Some(identity) =
+            self.processes
+                .core_identity(pid, self.group.process_cpu(), self.group.start_stack())
+        else {
+            return;
+        };
+        let Ok(file) = self.files.create_core() else {
+            return;
+        };
+        self.processes.set_dumped(pid);
+        crate::coredump::write(dump, &identity, mem, &mut |piece| {
+            let mut at = 0;
+            while at < piece.len() {
+                match file.write(&piece[at..]) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => at += n,
+                }
+            }
+            true
+        });
     }
     pub(crate) fn sync_actions(&mut self, thread: &mut Thread) {
         let actions = self.group.shared_actions();

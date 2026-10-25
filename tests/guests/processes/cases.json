@@ -40,6 +40,7 @@
     {"name":"orphaned-group","binary":"process"},
     {"name":"kill-group","binary":"process"},
     {"name":"signal-sender","binary":"process"},
+    {"name":"core-dump","binary":"process"},
     {"name":"ignore-discards","binary":"process"},
     {"name":"thread-name","binary":"process"},
     {"name":"timer-thread","binary":"process"},

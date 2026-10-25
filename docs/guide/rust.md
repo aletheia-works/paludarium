@@ -35,8 +35,14 @@ fn main() -> Result<(), paludarium::Error> {
   before the start (mode `0755`); `with_file_mode` sets other permission bits.
   `with_env(key, value)` adds an environment variable.
 - `Config` also has public fields: `cwd` (initial working directory, default
-  `/`), `mounts` (host directories, see below) and `tty` (a `TerminalInfo`
-  with the terminal size).
+  `/`), `mounts` (host directories, see below), `tty` (a `TerminalInfo`
+  with the terminal size) and `limits`.
+- `limits` is a `Limits`, unlimited by default.
+  `Limits::default().with_tasks(n)` lets the guest have at most `n` tasks
+  (threads, and processes until they are reaped, as a cgroup's `pids.max`;
+  `clone` and `fork` beyond it fail with `EAGAIN`). `with_open_files(n)`
+  caps `RLIMIT_NOFILE` at `n`, as Linux's `fs.nr_open`, so opening more
+  files fails with `EMFILE`. Memory has no limit yet.
 - `Session::new` validates the configuration before anything runs, and
   `run()` runs the guest to the end. `NativeHost` connects the guest's
   standard input and output to the host process.

@@ -795,3 +795,94 @@ mod exec {
         assert_eq!(t.state.signal_actions[&12].handler, 1);
     }
 }
+mod limits {
+    use super::*;
+    const THREAD: u64 = 0x10900;
+    #[test]
+    fn tasks_count_threads_and_unreaped_processes() {
+        let (k, mut t, m) = setup();
+        let mut k = k.with_task_limit(3);
+        let eagain = Errno::EAGAIN.to_syscall_return();
+        // The first process, a thread and a child fill the limit.
+        let tid = syscall(&mut k, &mut t, &m, 56, [THREAD, 0, 0, 0, 0, 0]);
+        let (mut thread_kernel, thread) = k.take_child().unwrap();
+        assert_eq!(u64::from(thread.tid), tid);
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(syscall(&mut k, &mut t, &m, 57, [0; 6]), eagain);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 56, [THREAD, 0, 0, 0, 0, 0]),
+            eagain
+        );
+        assert!(k.take_child().is_none());
+        // A thread gives its task back when it ends.
+        thread_kernel.finish_thread(&thread, &m);
+        drop(thread_kernel);
+        let (_d, dt, _dm) = fork(&mut k, &mut t, &m);
+        // An exited child keeps its task until it is reaped.
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        drop(c);
+        assert_eq!(syscall(&mut k, &mut t, &m, 57, [0; 6]), eagain);
+        let child = u64::from(ct.tid);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [child, 0, 0, 0, 0, 0]),
+            child
+        );
+        let (_e, et, _em) = fork(&mut k, &mut t, &m);
+        assert_ne!(et.tid, dt.tid);
+    }
+    #[test]
+    fn exec_from_a_thread_keeps_one_task() {
+        let (k, mut t, m) = exec_setup();
+        let mut k = k.with_task_limit(2);
+        syscall(&mut k, &mut t, &m, 56, [THREAD, 0, 0, 0, 0, 0]);
+        let (mut e, mut et) = k.take_child().unwrap();
+        // The leader ends first, so execve need not wait for it.
+        k.finish_thread(&t, &m);
+        assert_eq!(syscall(&mut e, &mut et, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        drop(k);
+        // The thread now leads the process, which counts as one task.
+        let em = e.take_exec_memory().unwrap();
+        let (_c, _ct, _cm) = fork(&mut e, &mut et, &em);
+        assert_eq!(
+            syscall(&mut e, &mut et, &em, 57, [0; 6]),
+            Errno::EAGAIN.to_syscall_return()
+        );
+    }
+    #[test]
+    fn open_files_are_capped_as_by_nr_open() {
+        let (k, mut t, m) = setup();
+        let mut k = k.with_open_file_limit(4);
+        let get = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace| {
+            assert_eq!(syscall(k, t, m, 302, [0, 7, 0, DATA, 0, 0]), 0);
+            (
+                m.read_u64(GuestAddr(DATA)).unwrap(),
+                m.read_u64(GuestAddr(DATA + 8)).unwrap(),
+            )
+        };
+        assert_eq!(get(&mut k, &mut t, &m), (4, 4));
+        let set = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, soft: u64, hard: u64| {
+            m.write_u64(GuestAddr(DATA + 16), soft).unwrap();
+            m.write_u64(GuestAddr(DATA + 24), hard).unwrap();
+            syscall(k, t, m, 302, [0, 7, DATA + 16, 0, 0, 0])
+        };
+        let eperm = Errno::EPERM.to_syscall_return();
+        assert_eq!(set(&mut k, &mut t, &m, 4, 5), eperm);
+        assert_eq!(set(&mut k, &mut t, &m, 2, 4), 0);
+        assert_eq!(set(&mut k, &mut t, &m, 4, 4), 0);
+        // Descriptors beyond the soft limit cannot be opened.
+        m.write(GuestAddr(DATA + 64), b"/dev/null\0").unwrap();
+        let emfile = Errno::EMFILE.to_syscall_return();
+        let opened: Vec<u64> = (0..8)
+            .map(|_| syscall(&mut k, &mut t, &m, 2, [DATA + 64, 0, 0, 0, 0, 0]))
+            .collect();
+        assert!(opened.contains(&emfile), "{opened:?}");
+        assert!(
+            opened.iter().all(|&fd| fd < 4 || fd == emfile),
+            "{opened:?}"
+        );
+        // A child inherits the cap.
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(get(&mut c, &mut ct, &cm), (4, 4));
+        assert_eq!(set(&mut c, &mut ct, &cm, 4, 5), eperm);
+    }
+}

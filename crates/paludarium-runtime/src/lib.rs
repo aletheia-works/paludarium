@@ -54,6 +54,38 @@ impl TerminalInfo {
     }
 }
 
+/// Limits on what a guest may take from the host; `None` leaves a
+/// resource unlimited, which is the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Limits {
+    /// The most tasks at once: threads, and processes until they are
+    /// reaped, as a cgroup's `pids.max`. `clone` and `fork` beyond it fail
+    /// with `EAGAIN`. At least 1, the first process.
+    pub tasks: Option<u64>,
+    /// The ceiling of `RLIMIT_NOFILE`, as Linux's `fs.nr_open`: the guest
+    /// starts with both limits at most this and cannot raise them above it
+    /// (`EPERM`), so opening more files fails with `EMFILE`. At most
+    /// 1048576, Linux's default `fs.nr_open`.
+    pub open_files: Option<u64>,
+}
+
+impl Limits {
+    /// Limits the tasks (see [`Limits::tasks`]).
+    #[must_use]
+    pub const fn with_tasks(mut self, max: u64) -> Self {
+        self.tasks = Some(max);
+        self
+    }
+
+    /// Limits the open files (see [`Limits::open_files`]).
+    #[must_use]
+    pub const fn with_open_files(mut self, max: u64) -> Self {
+        self.open_files = Some(max);
+        self
+    }
+}
+
 /// Configuration of one run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -77,6 +109,8 @@ pub struct Config {
     pub tty: Option<TerminalInfo>,
     /// Only meaningful in wasm; the native build has no JIT.
     pub jit: bool,
+    /// What the guest may take from the host; unlimited by default.
+    pub limits: Limits,
 }
 
 impl Config {
@@ -165,6 +199,15 @@ impl Session {
         }
         if config.program.is_empty() {
             return Err(Error::new(ErrorKind::InvalidProgram, "no program given"));
+        }
+        if config.limits.tasks == Some(0) {
+            return Err(Error::new(ErrorKind::InvalidProgram, "task limit below 1"));
+        }
+        if config.limits.open_files.is_some_and(|max| max > 1 << 20) {
+            return Err(Error::new(
+                ErrorKind::InvalidProgram,
+                "open file limit above 1048576",
+            ));
         }
         let mut file_modes = BTreeMap::new();
         for (path, mode) in &config.file_modes {
@@ -339,6 +382,12 @@ impl Session {
             .with_unimplemented_log(Arc::clone(&self.unimplemented));
         if let Some(tty) = self.config.tty {
             kernel = kernel.with_terminal_size(tty.columns, tty.rows);
+        }
+        if let Some(max) = self.config.limits.tasks {
+            kernel = kernel.with_task_limit(max);
+        }
+        if let Some(max) = self.config.limits.open_files {
+            kernel = kernel.with_open_file_limit(max);
         }
         if let Some(cwd) = &self.config.cwd {
             kernel = kernel.with_current_directory(cwd).map_err(|_| {

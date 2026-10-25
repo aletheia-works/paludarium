@@ -64,6 +64,8 @@ rebuilds a filesystem from a snapshot: directories, symlinks, hard links (entrie
 sharing an `inode`), modes and modification times. See the JavaScript guide for
 its validation rules and limits. `cwd` defaults to `/` and must name an existing virtual
 directory. `tty` optionally supplies columns and rows in the range 0–65535.
+`limits: { tasks, openFiles }` optionally caps the guest's tasks (`EAGAIN`
+beyond it) and its `RLIMIT_NOFILE` (`EMFILE`); both are unlimited by default.
 No host filesystem mount or network access is exposed by this API.
 
 Build the one production Wasm module from the repository root with

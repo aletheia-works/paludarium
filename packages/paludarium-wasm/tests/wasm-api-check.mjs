@@ -30,11 +30,36 @@ try {
   assert.throws(() => first.run({ program: "/file", tty: { columns: -1, rows: 24 } }), /terminal/);
   assert.throws(() => first.run({ program: "/file", cwd: "relative" }), /current directory/);
   assert.throws(() => first.run({ program: "/file", files: { "/file": new Uint8Array() }, fileModes: { "/file": 65536 } }), /modes/);
+  for (const limits of [null, 1, { tasks: 0 }, { tasks: 1.5 }, { tasks: 2 ** 32 }, { openFiles: -1 }, { openFiles: 1048577 }])
+    assert.throws(() => first.run({ program: "/file", limits }), /limits/, JSON.stringify(limits));
   const drainFailure = async stream => { const reader = stream.getReader(); try { while (!(await reader.read()).done) {} } catch {} finally { reader.releaseLock(); } };
   const invalid = first.run({ program: "/bad", files: { "/bad": new Uint8Array([73]) } });
   const invalidStreams = Promise.all([drainFailure(invalid.stdout), drainFailure(invalid.stderr)]);
   await assert.rejects(invalid.exited, error => error.kind === "invalid-program"); await invalidStreams;
   const hello = new Uint8Array(await readFile(new URL("guests/hello", import.meta.url)));
+  // Limits reach the guest: a fork fails with EAGAIN (11) and an open with
+  // EMFILE (24); each program exits with the negated result.
+  const elf = code => {
+    const bytes = new Uint8Array(120 + code.length), view = new DataView(bytes.buffer);
+    bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]);
+    view.setUint16(16, 2, true); view.setUint16(18, 62, true); view.setUint32(20, 1, true);
+    view.setBigUint64(24, 0x400078n, true); view.setBigUint64(32, 64n, true);
+    view.setUint16(52, 64, true); view.setUint16(54, 56, true); view.setUint16(56, 1, true);
+    view.setUint32(64, 1, true); view.setUint32(68, 5, true);
+    view.setBigUint64(80, 0x400000n, true); view.setBigUint64(88, 0x400000n, true);
+    view.setBigUint64(96, BigInt(bytes.length), true); view.setBigUint64(104, BigInt(bytes.length), true);
+    view.setBigUint64(112, 0x1000n, true);
+    bytes.set(code, 120);
+    return bytes;
+  };
+  const exitNegated = [0xf7, 0xd8, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05];
+  const fork = elf([0xb8, 57, 0, 0, 0, 0x0f, 0x05, ...exitNegated]);
+  const open = elf([0x48, 0x8d, 0x3d, 20, 0, 0, 0, 0x31, 0xf6, 0xb8, 2, 0, 0, 0, 0x0f, 0x05, ...exitNegated, 0x2f, 0x70, 0]);
+  for (const [program, limits, code] of [[fork, { tasks: 1 }, 11], [open, { openFiles: 3 }, 24]]) {
+    const limited = first.run({ program: "/p", files: { "/p": program }, limits });
+    await Promise.all([new Response(limited.stdout).text(), new Response(limited.stderr).text()]);
+    assert.deepEqual(await limited.exited, { kind: "exited", code }, JSON.stringify(limits));
+  }
   for (const cwd of ["/missing", "/hello"]) {
     const invalidCwd = first.run({ program: "/hello", files: { "/hello": hello }, cwd });
     const outputs = Promise.all([drainFailure(invalidCwd.stdout), drainFailure(invalidCwd.stderr)]);

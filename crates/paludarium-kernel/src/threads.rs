@@ -646,6 +646,7 @@ impl Kernel {
         {
             return Err(Errno::EPERM);
         }
+        let task = self.processes.charge_task()?;
         let tid = self.processes.allocate()?;
         if tid > i32::MAX as u32 {
             return Err(Errno::EAGAIN);
@@ -681,6 +682,7 @@ impl Kernel {
             vfork_release: self.vfork_release.clone(),
             vfork_wait: None,
             unimplemented: self.unimplemented.clone(),
+            task: Some(task),
         };
         // A new thread starts with its creator's nice value, set before it
         // is registered so that no one sees it without one.

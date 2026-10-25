@@ -55,8 +55,16 @@ try {
 | `tty` | `{ columns, rows }` (0–65535) to give the guest a terminal size |
 | `filesystem` | A filesystem from `createFileSystem()` to reuse (see below) |
 | `jit` | `true` to translate hot x86-64 code to WebAssembly (default `false`) |
+| `limits` | `{ tasks, openFiles }` to limit the guest (default: no limit; see below) |
 
 The package does not expose host directories or the network to the guest.
+
+`limits.tasks` (1 to 4294967295) is the most tasks the guest may have at once:
+threads, and processes until they are reaped, as a cgroup's `pids.max`. A
+`clone` or `fork` beyond it fails with `EAGAIN`. `limits.openFiles` (0 to
+1048576) caps `RLIMIT_NOFILE`, as Linux's `fs.nr_open`: the guest starts with
+both limits at most this and cannot raise them above it (`EPERM`), so opening
+more files fails with `EMFILE`. Memory has no limit yet.
 
 ## Keep files between runs
 

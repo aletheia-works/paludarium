@@ -227,7 +227,9 @@ kernel.
   `PR_GET_*`; other options give `EINVAL`.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
-  read and changed. Two are enforced, as in Linux:
+  read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's
+  `fs.nr_open`), or to a lower ceiling the embedder sets. Two are enforced,
+  as in Linux:
   - `RLIMIT_NOFILE`: a new descriptor past its soft limit gives `EMFILE` (and
     `open` creates nothing), `dup2`/`dup3` onto a number past it `EBADF`, and
     `F_DUPFD` from one past it `EINVAL`.

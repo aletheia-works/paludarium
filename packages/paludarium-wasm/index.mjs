@@ -14,6 +14,10 @@ function validate(options) {
   if (!options || typeof options.program !== "string" || !options.program.startsWith("/") || options.program.includes("\0")) throw new PaludariumError("invalid-program", "program must be an absolute guest path");
   if (options.tty != null && [options.tty.columns, options.tty.rows].some(value => !Number.isInteger(value) || value < 0 || value > 65535)) throw new PaludariumError("invalid-program", "invalid guest terminal size");
   if (options.jit !== undefined && typeof options.jit !== "boolean") throw new PaludariumError("invalid-program", "jit must be a boolean");
+  if (options.limits !== undefined && (options.limits === null || typeof options.limits !== "object")) throw new PaludariumError("invalid-program", "limits must be an object");
+  const { tasks, openFiles } = options.limits ?? {};
+  if (tasks !== undefined && (!Number.isInteger(tasks) || tasks < 1 || tasks > 0xffffffff)) throw new PaludariumError("invalid-program", "limits.tasks must be an integer from 1 to 4294967295");
+  if (openFiles !== undefined && (!Number.isInteger(openFiles) || openFiles < 0 || openFiles > 1048576)) throw new PaludariumError("invalid-program", "limits.openFiles must be an integer from 0 to 1048576");
   if (options.cwd !== undefined && (typeof options.cwd !== "string" || !options.cwd.startsWith("/") || options.cwd.includes("\0"))) throw new PaludariumError("invalid-program", "invalid guest current directory");
   if (options.args && (!Array.isArray(options.args) || options.args.some(arg => typeof arg !== "string" || arg.includes("\0")))) throw new PaludariumError("invalid-program", "invalid guest arguments");
   if (Object.entries(options.env ?? {}).some(([key, value]) => !key || key.includes("=") || key.includes("\0") || typeof value !== "string" || value.includes("\0"))) throw new PaludariumError("invalid-program", "invalid guest environment");

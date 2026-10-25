@@ -208,7 +208,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PR_SET_NO_NEW_PRIVS` と、それぞれの `PR_GET_*` に対応します。ほかの指定には
   `EINVAL` を返します。
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
-  8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。Linux と同じく
+  8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ハードの
+  `RLIMIT_NOFILE` は 1048576（Linux の `fs.nr_open`）まで、埋め込む側がそれより低い
+  天井を決めたときはその値まで上げられます。Linux と同じく
   守らせるのは次の 2 つです。
   - `RLIMIT_NOFILE`：ソフトの上限を超える新しいディスクリプタは `EMFILE`（`open` は
     何も作りません）、上限を超える番号への `dup2`／`dup3` は `EBADF`、上限を超える

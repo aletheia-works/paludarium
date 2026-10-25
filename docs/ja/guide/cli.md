@@ -5,7 +5,8 @@
 
 ```sh
 cargo install paludarium
-paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] <program> [args...]
+paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys]
+           [--max-tasks N] [--max-open-files N] <program> [args...]
 ```
 
 - `<program>` はホストのファイルです。ゲストの中では `/<ファイル名>` に置かれ、
@@ -17,6 +18,13 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 - `--no-jit` は互換のために受け付けますが、ネイティブ版には JIT がないので何もしません。
 - `--report-enosys` を付けると、ゲストが呼んだのに paludarium が実装していない
   システムコール（`ENOSYS` を返したもの）の番号を、終わった後に表示します。
+- `--max-tasks N` は、ゲストが持てるタスクを `N` 個（1 以上）までにします。タスクは
+  スレッドと、回収されるまでのプロセスで、cgroup の `pids.max` と同じ数え方です。
+  それを超える `clone` や `fork` は `EAGAIN` で失敗します。
+- `--max-open-files N` は、`RLIMIT_NOFILE` の天井を `N`（1048576 以下）にします。
+  Linux の `fs.nr_open` と同じで、ゲストは両方の上限が `N` 以下の状態で始まり、
+  それより上には上げられません（`EPERM`）。そのため、それ以上ファイルを開くと
+  `EMFILE` になります。これらを指定しなければ、上限はありません。
 - `--` でオプションを終わりにできます。`-` で始まる名前のプログラムを動かすときに使います。
 
 ## 終了コード

@@ -227,6 +227,22 @@ pub extern "C" fn config_jit(id: u32, enabled: u32) -> i32 {
     config.jit = enabled == 1;
     0
 }
+/// Sets [`paludarium_runtime::Limits`]: `kind` 0 is tasks, 1 open files.
+#[unsafe(no_mangle)]
+pub extern "C" fn config_limit(id: u32, kind: u32, max: u32) -> i32 {
+    let mut configs = table(&CONFIGS)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(config) = configs.get_mut(&id) else {
+        return -1;
+    };
+    config.limits = match kind {
+        0 => config.limits.with_tasks(u64::from(max)),
+        1 => config.limits.with_open_files(u64::from(max)),
+        _ => return -1,
+    };
+    0
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn session_jit_stat(id: u32, field: u32) -> u64 {

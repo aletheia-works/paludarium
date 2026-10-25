@@ -35,7 +35,14 @@ fn main() -> Result<(), paludarium::Error> {
   置きます（権限は `0755`）。ほかの権限にするときは `with_file_mode` を使います。
   `with_env(key, value)` は環境変数を足します。
 - `Config` には、公開のフィールドもあります。`cwd`（最初の作業ディレクトリ。既定は `/`）、
-  `mounts`（ホストのディレクトリ。下を参照）、`tty`（端末の大きさを表す `TerminalInfo`）です。
+  `mounts`（ホストのディレクトリ。下を参照）、`tty`（端末の大きさを表す `TerminalInfo`）、
+  `limits` です。
+- `limits` は `Limits` で、既定では上限がありません。`Limits::default().with_tasks(n)`
+  は、ゲストが持てるタスクを `n` 個までにします（タスクはスレッドと、回収されるまでの
+  プロセスで、cgroup の `pids.max` と同じ数え方です。超える `clone` や `fork` は
+  `EAGAIN` で失敗します）。`with_open_files(n)` は、Linux の `fs.nr_open` と同じように
+  `RLIMIT_NOFILE` の天井を `n` にするので、それ以上ファイルを開くと `EMFILE` になります。
+  メモリには、まだ上限がありません。
 - `Session::new` は、何かを動かす前に設定を確かめます。`run()` はゲストを最後まで
   動かします。`NativeHost` は、ゲストの標準入出力をホストのプロセスにつなぎます。
 

@@ -42,6 +42,21 @@ export interface PrivateFileSystem {
   snapshot(): Promise<FileSystemEntry[]>;
   remove(path: string, options?: { recursive?: boolean }): Promise<void>;
 }
+/** Limits on what a guest may take from the host; a limit left out is unlimited. */
+export interface Limits {
+  /**
+   * The most tasks at once (1 to 4294967295): threads, and processes until
+   * they are reaped, as a cgroup's `pids.max`. `clone` and `fork` beyond it
+   * fail with `EAGAIN`.
+   */
+  tasks?: number;
+  /**
+   * The ceiling of `RLIMIT_NOFILE` (0 to 1048576), as Linux's `fs.nr_open`:
+   * opening more files fails with `EMFILE`, and raising the hard limit above
+   * it with `EPERM`.
+   */
+  openFiles?: number;
+}
 export interface RunOptions extends FileSystemOptions {
   program: string;
   cwd?: string;
@@ -49,6 +64,7 @@ export interface RunOptions extends FileSystemOptions {
   env?: Record<string, string>;
   tty?: { columns: number; rows: number } | null;
   jit?: boolean;
+  limits?: Limits;
   filesystem?: PrivateFileSystem;
 }
 export interface Guest {

@@ -6,6 +6,8 @@
 //!   --no-jit          accepted; the native build has no JIT
 //!   --mount HOST:GUEST expose one explicit host directory (repeatable)
 //!   --report-enosys   list the unimplemented system calls the guest called
+//!   --max-tasks N     at most N threads and unreaped processes (EAGAIN)
+//!   --max-open-files N  cap RLIMIT_NOFILE at N, as fs.nr_open (EMFILE)
 //! ```
 //!
 //! Exit codes: the guest's exit code; 128 + signal number when the guest was
@@ -23,7 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use paludarium_host::{Host, read_program_file};
-use paludarium_runtime::{Config, Mount, Session};
+use paludarium_runtime::{Config, Limits, Mount, Session};
 use paludarium_types::{Error, ExitReason, ExitStatus};
 
 /// Exit code for command-line usage errors.
@@ -33,7 +35,7 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_EMULATOR_ERROR: i32 = 70;
 
 /// Usage text printed on errors and for `--help`.
-pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] <program> [args...]\n";
+pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] [--max-tasks N] [--max-open-files N] <program> [args...]\n";
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +49,8 @@ pub struct Invocation {
     pub mounts: Vec<Mount>,
     /// List the unimplemented system calls the guest called, after the run.
     pub report_enosys: bool,
+    /// `--max-tasks` and `--max-open-files`; unlimited without them.
+    pub limits: Limits,
 }
 
 /// What the command line asked for.
@@ -101,6 +105,17 @@ fn parse_mount(value: &OsStr, prefix: usize) -> Result<Mount, UsageError> {
     })
 }
 
+fn parse_limit(
+    value: Option<OsString>,
+    range: std::ops::RangeInclusive<u64>,
+    error: &'static str,
+) -> Result<u64, UsageError> {
+    value
+        .and_then(|value| value.to_str()?.parse::<u64>().ok())
+        .filter(|max| range.contains(max))
+        .ok_or(UsageError(error))
+}
+
 /// Parses the arguments after the command name.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageError> {
     let mut args = args.into_iter();
@@ -108,6 +123,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
     let mut no_jit = false;
     let mut mounts = Vec::new();
     let mut report_enosys = false;
+    let mut limits = Limits::default();
     let program = loop {
         let Some(arg) = args.next() else {
             return Err(UsageError("no program given"));
@@ -118,6 +134,22 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
             b"-h" | b"--help" => return Ok(Command::Help),
             b"--no-jit" => no_jit = true,
             b"--report-enosys" => report_enosys = true,
+            b"--max-tasks" => {
+                let max = parse_limit(
+                    args.next(),
+                    1..=u64::MAX,
+                    "--max-tasks needs a number of at least 1",
+                )?;
+                limits = limits.with_tasks(max);
+            }
+            b"--max-open-files" => {
+                let max = parse_limit(
+                    args.next(),
+                    0..=1 << 20,
+                    "--max-open-files needs a number up to 1048576",
+                )?;
+                limits = limits.with_open_files(max);
+            }
             b"--env" => {
                 let value = args.next().ok_or(UsageError("--env needs KEY=VALUE"))?;
                 env.push(parse_env(value.as_encoded_bytes())?);
@@ -143,6 +175,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
         no_jit,
         mounts,
         report_enosys,
+        limits,
     }))
 }
 
@@ -259,6 +292,7 @@ pub fn main_with(
     let mut config = Config::new(guest.clone(), argv).with_file(guest, content);
     config.env = invocation.env;
     config.mounts = invocation.mounts;
+    config.limits = invocation.limits;
     // --no-jit is accepted and has no effect: the native build has no JIT.
     config.jit = false;
     let session = match Session::new(config, host) {
@@ -337,8 +371,13 @@ mod tests {
                 no_jit: true,
                 mounts: vec![],
                 report_enosys: false,
+                limits: Limits::default(),
             }))
         );
+        assert!(matches!(
+            parse(os(&["--max-tasks", "8", "--max-open-files", "0", "p"])),
+            Ok(Command::Run(i)) if i.limits == Limits::default().with_tasks(8).with_open_files(0)
+        ));
         assert!(matches!(parse(os(&["--", "-dash"])), Ok(Command::Run(i)) if i.program == "-dash"));
         assert_eq!(parse(os(&["--help"])), Ok(Command::Help));
     }
@@ -354,6 +393,10 @@ mod tests {
             &["--env", "=v", "x"],
             &["--env"],
             &["--"],
+            &["--max-tasks", "0", "x"],
+            &["--max-tasks", "many", "x"],
+            &["--max-tasks"],
+            &["--max-open-files", "1048577", "x"],
         ] {
             let (code, err) = run(args);
             assert_eq!(code, EXIT_USAGE, "{args:?}");

@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -41,6 +41,25 @@ struct Entry {
     continue_report: bool,
     /// CPU time of the children this process has waited for, and theirs.
     children_cpu: u64,
+    /// The task the process counts as until it is reaped, as its leader does
+    /// in Linux's pids controller even as a zombie.
+    _task: TaskCharge,
+}
+
+/// The tasks of a session and their limit, as a cgroup's `pids.current` and
+/// `pids.max`: every thread counts, and a process until it is reaped.
+struct TaskCount {
+    live: AtomicU64,
+    max: AtomicU64,
+}
+
+/// One task counted against the session's limit, released when dropped.
+pub(crate) struct TaskCharge(Arc<TaskCount>);
+
+impl Drop for TaskCharge {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// RLIMIT_CPU ... RLIMIT_RTTIME.
@@ -71,11 +90,19 @@ const NR_OPEN: u64 = 1 << 20;
 pub struct Processes {
     next: AtomicU32,
     entries: Mutex<BTreeMap<u32, Entry>>,
+    tasks: Arc<TaskCount>,
+    /// The highest RLIMIT_NOFILE hard limit a process may set, as fs.nr_open.
+    nr_open: AtomicU64,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
+        let tasks = Arc::new(TaskCount {
+            live: AtomicU64::new(1),
+            max: AtomicU64::new(u64::MAX),
+        });
         Self {
             next: AtomicU32::new(2),
+            nr_open: AtomicU64::new(NR_OPEN),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -92,8 +119,40 @@ impl Processes {
                     stop_report: None,
                     continue_report: false,
                     children_cpu: 0,
+                    _task: TaskCharge(Arc::clone(&tasks)),
                 },
             )])),
+            tasks,
+        }
+    }
+    /// Limits the session to `max` tasks: a clone or fork beyond it fails
+    /// with EAGAIN, as past a cgroup's `pids.max`.
+    pub(crate) fn set_task_limit(&self, max: u64) {
+        self.tasks.max.store(max, Ordering::SeqCst);
+    }
+    /// Counts one more task, or fails with EAGAIN at the limit.
+    pub(crate) fn charge_task(&self) -> Result<TaskCharge, Errno> {
+        let max = self.tasks.max.load(Ordering::SeqCst);
+        self.tasks
+            .live
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+                (live < max).then_some(live + 1)
+            })
+            .map_err(|_| Errno::EAGAIN)?;
+        Ok(TaskCharge(Arc::clone(&self.tasks)))
+    }
+    /// Caps RLIMIT_NOFILE at `max`, as a container started with that limit
+    /// and fs.nr_open: raising the hard limit beyond it fails with EPERM. Set
+    /// before the guest starts, when the first process is the only one; the
+    /// processes it creates inherit its limits.
+    pub(crate) fn set_open_file_limit(&self, max: u64) {
+        self.nr_open.store(max, Ordering::SeqCst);
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        debug_assert_eq!(entries.len(), 1, "set before the guest starts");
+        for entry in entries.values_mut() {
+            let (soft, hard) = entry.limits[7];
+            entry.limits[7] = (soft.min(max), hard.min(max));
+            entry.group.set_soft_limit(7, soft.min(max));
         }
     }
     pub(crate) fn allocate(&self) -> Result<u32, Errno> {
@@ -103,7 +162,7 @@ impl Processes {
             })
             .map_err(|_| Errno::EAGAIN)
     }
-    pub(crate) fn insert(&self, pid: u32, parent: u32, group: Arc<ThreadGroup>) {
+    pub(crate) fn insert(&self, pid: u32, parent: u32, group: Arc<ThreadGroup>, task: TaskCharge) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let (pgid, sid, limits, dumpable, no_new_privs) = entries
             .get(&parent)
@@ -126,6 +185,7 @@ impl Processes {
                 stop_report: None,
                 continue_report: false,
                 children_cpu: 0,
+                _task: task,
             },
         );
     }
@@ -283,7 +343,7 @@ impl Processes {
             if soft > hard {
                 return Err(Errno::EINVAL);
             }
-            if resource == 7 && hard > NR_OPEN {
+            if resource == 7 && hard > self.nr_open.load(Ordering::SeqCst) {
                 return Err(Errno::EPERM);
             }
             entry.limits[resource] = (soft, hard);
@@ -868,6 +928,7 @@ impl Kernel {
         {
             return Err(Errno::EPERM);
         }
+        let task = self.processes.charge_task()?;
         let pid = self.processes.allocate()?;
         let group = Arc::new(self.group.fork(flags & 0x800 != 0));
         // CLONE_CLEAR_SIGHAND resets handled signals to their default and
@@ -913,7 +974,8 @@ impl Kernel {
                 .write(GuestAddr(a[3]), &pid.to_le_bytes());
         }
         let release = (flags & 0x4000 != 0).then(|| Arc::new(AtomicBool::new(false)));
-        self.processes.insert(pid, self.process.pid, group.clone());
+        self.processes
+            .insert(pid, self.process.pid, group.clone(), task);
         let child = Kernel {
             host: self.host.clone(),
             process: crate::Process { pid },
@@ -929,6 +991,7 @@ impl Kernel {
             vfork_release: release.clone(),
             vfork_wait: None,
             unimplemented: self.unimplemented.clone(),
+            task: None,
         };
         self.vfork_wait = release;
         self.pending_child = Some((
@@ -1186,6 +1249,8 @@ impl Kernel {
         }
         self.group
             .end_exec(thread.tid, self.process.pid, Arc::clone(&self.inbox));
+        // The thread is now the leader, which the process entry counts.
+        self.task = None;
         // exec deletes the POSIX timers (the interval timer stays).
         self.group
             .with_timers(&mut thread.state, |timers| timers.clear());

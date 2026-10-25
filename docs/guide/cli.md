@@ -5,7 +5,8 @@ x86-64 Linux program on the host.
 
 ```sh
 cargo install paludarium
-paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] <program> [args...]
+paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys]
+           [--max-tasks N] [--max-open-files N] <program> [args...]
 ```
 
 - `<program>` is a file on the host. Inside the guest it is placed at
@@ -17,6 +18,13 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 - `--no-jit` is accepted for compatibility; the native build has no JIT.
 - `--report-enosys` lists, after the run, the system calls the guest called
   that paludarium does not implement (they returned `ENOSYS`), by number.
+- `--max-tasks N` lets the guest have at most `N` tasks (at least 1): threads,
+  and processes until they are reaped, as a cgroup's `pids.max`. A `clone` or
+  `fork` beyond it fails with `EAGAIN`.
+- `--max-open-files N` caps `RLIMIT_NOFILE` at `N` (at most 1048576), as
+  Linux's `fs.nr_open`: the guest starts with both limits at most `N` and
+  cannot raise them above it (`EPERM`), so opening more files fails with
+  `EMFILE`. Without these options there is no limit.
 - `--` ends the options, so a program name may start with `-`.
 
 ## Exit status

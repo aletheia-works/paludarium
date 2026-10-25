@@ -208,6 +208,9 @@ pub struct Kernel {
     /// System-call numbers the guest called that are not in the table,
     /// shared by every thread and process (diagnostics only).
     unimplemented: Arc<Mutex<BTreeSet<u64>>>,
+    /// The task this thread counts as, for a thread other than its process's
+    /// leader; the leader's is the process's, kept until it is reaped.
+    task: Option<processes::TaskCharge>,
 }
 
 impl Kernel {
@@ -231,7 +234,26 @@ impl Kernel {
             vfork_release: None,
             vfork_wait: None,
             unimplemented: Arc::default(),
+            task: None,
         }
+    }
+
+    /// Limits the session to `max` tasks (threads, and processes until they
+    /// are reaped), as a cgroup's `pids.max`: `clone` and `fork` beyond it
+    /// fail with `EAGAIN`. The first process counts as one.
+    #[must_use]
+    pub fn with_task_limit(self, max: u64) -> Self {
+        self.processes.set_task_limit(max);
+        self
+    }
+
+    /// Caps RLIMIT_NOFILE at `max`: the first process starts with both its
+    /// limits at most `max`, and raising the hard limit beyond it fails with
+    /// `EPERM`, as above Linux's `fs.nr_open`.
+    #[must_use]
+    pub fn with_open_file_limit(self, max: u64) -> Self {
+        self.processes.set_open_file_limit(max);
+        self
     }
 
     /// Records the unimplemented system-call numbers the guest calls in `log`.

@@ -128,3 +128,56 @@ fn session_waits_for_unreaped_child() {
     assert_eq!(status, ExitStatus::Exited(0));
     assert_eq!(stdout, b"/");
 }
+#[test]
+fn task_limit_fails_fork_with_eagain() {
+    // fork, then exit with the negated result: 11 for EAGAIN.
+    let code = [
+        0xb8, 57, 0, 0, 0, 0x0f, 0x05, 0xf7, 0xd8, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05,
+    ];
+    let host = Arc::new(RecordingHost::new());
+    let mut config = Config::new("/p", vec![]).with_file("/p", tiny_exec(&code, b""));
+    config.limits = Limits::default().with_tasks(1);
+    let session = Session::new(config, host).unwrap().with_budget(100);
+    assert_eq!(session.run().unwrap(), ExitStatus::Exited(11));
+}
+#[test]
+fn ended_threads_give_their_tasks_back() {
+    // Under two tasks, create a thread twice: each clone that fails with
+    // EAGAIN yields and retries (up to a million times) until the previous
+    // thread, which only exits, has given its task back. The process exits
+    // 0 once both threads were created and 1 if a retry runs out.
+    let code = [
+        0x41, 0xbc, 0x02, 0x00, 0x00, 0x00, 0x41, 0xbd, 0x40, 0x42, 0x0f, 0x00, 0xbf, 0x00, 0x09,
+        0x01, 0x00, 0x31, 0xf6, 0x31, 0xd2, 0x45, 0x31, 0xd2, 0x45, 0x31, 0xc0, 0xb8, 0x38, 0x00,
+        0x00, 0x00, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x74, 0x23, 0x79, 0x13, 0xb8, 0x18, 0x00, 0x00,
+        0x00, 0x0f, 0x05, 0x41, 0xff, 0xcd, 0x75, 0xd7, 0xbf, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x07,
+        0x41, 0xff, 0xcc, 0x75, 0xc5, 0x31, 0xff, 0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xb8,
+        0x3c, 0x00, 0x00, 0x00, 0x31, 0xff, 0x0f, 0x05,
+    ];
+    let host = Arc::new(RecordingHost::new());
+    let mut config = Config::new("/p", vec![]).with_file("/p", tiny_exec(&code, b""));
+    config.limits = Limits::default().with_tasks(2);
+    let session = Session::new(config, host).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || tx.send(session.run()).unwrap());
+    let status = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    h.join().unwrap();
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+#[test]
+fn limits_out_of_range_are_rejected() {
+    for limits in [
+        Limits::default().with_tasks(0),
+        Limits::default().with_open_files((1 << 20) + 1),
+    ] {
+        let mut config = Config::new("/p", vec![]);
+        config.limits = limits;
+        let error = Session::new(config, Arc::new(RecordingHost::new()))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, paludarium_types::ErrorKind::InvalidProgram);
+    }
+}

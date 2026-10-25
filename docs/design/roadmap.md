@@ -28,6 +28,6 @@ Nothing here is a promise, but these are on the table:
   under [Limitations](../guide/limitations)).
 - Considering dynamically linked programs.
 - Considering a native JIT.
-- Revisiting limits on memory and threads.
+- A limit on memory; tasks and open files can already be limited.
 - Revisiting building with stable Rust.
 - Revisiting how much checking a release needs.

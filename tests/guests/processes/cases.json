@@ -35,6 +35,7 @@
     {"name":"poll","binary":"process"},
     {"name":"proc-status","binary":"process"},
     {"name":"waitid","binary":"process"},
+    {"name":"ignore-discards","binary":"process"},
     {"name":"thread-name","binary":"process"},
     {"name":"timer-thread","binary":"process"},
     {"name":"clone3","binary":"process"},

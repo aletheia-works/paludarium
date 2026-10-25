@@ -473,6 +473,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    born: signals::generation(),
                 })
             }
             ExitReason::InvalidOpcode { rip, .. } => {
@@ -487,6 +488,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    born: signals::generation(),
                 })
             }
             ExitReason::ArithmeticFault { rip } => {
@@ -501,6 +503,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    born: signals::generation(),
                 })
             }
             ExitReason::FloatingPointFault { rip, code } => {
@@ -515,6 +518,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    born: signals::generation(),
                 })
             }
             ExitReason::GeneralProtection { rip } | ExitReason::Halt { rip } => {
@@ -529,6 +533,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    born: signals::generation(),
                 })
             }
             _ => None,
@@ -554,6 +559,9 @@ impl Kernel {
 
     fn syscall(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         self.sync_actions(thread);
+        // Before the call queues a signal itself (a fault, SIGPIPE, tgkill
+        // to itself), so that it does not merge into a discarded one.
+        self.group.apply_discards(&mut thread.state);
         self.group.sync_timer(&mut thread.state);
         account_cpu(&*self.host, &self.group, &mut thread.state);
         let mut number = thread.cpu.gpr[reg::RAX];

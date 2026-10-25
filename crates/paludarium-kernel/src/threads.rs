@@ -30,6 +30,7 @@ pub struct ThreadGroup {
     actions: Mutex<Arc<Mutex<BTreeMap<i32, SignalAction>>>>,
     process_inbox: Mutex<Arc<SignalInbox>>,
     process_pending: Mutex<ThreadState>,
+    discards: Arc<signals::Discards>,
     timer_generation: AtomicU64,
     /// The RLIMIT_NOFILE soft limit, which bounds the descriptor numbers this
     /// process allocates, and the RLIMIT_FSIZE one, which bounds the files it
@@ -53,6 +54,7 @@ impl Default for ThreadGroup {
             actions: Mutex::default(),
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
             process_pending: Mutex::new(ThreadState::default()),
+            discards: Arc::default(),
             timer_generation: AtomicU64::new(0),
             nofile: AtomicU64::new(1024),
             fsize: AtomicU64::new(u64::MAX),
@@ -235,6 +237,7 @@ impl ThreadGroup {
         self.timer_generation.load(Ordering::SeqCst)
     }
     pub(crate) fn expire_timer(&self, local: &mut ThreadState, now: u64) {
+        self.discards.apply(local);
         {
             let mut pending = self
                 .process_pending
@@ -268,6 +271,7 @@ impl ThreadGroup {
         self.drain_process(local);
     }
     pub(crate) fn register(&self, tid: u32, inbox: Arc<SignalInbox>) {
+        inbox.attach(Arc::clone(&self.discards));
         let wake = inbox.wake_token();
         let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         let owner = self.exec_owner.load(Ordering::SeqCst);
@@ -397,7 +401,38 @@ impl ThreadGroup {
     pub(crate) fn job_continue(&self) {
         self.stopped.store(false, Ordering::SeqCst);
     }
+    /// Discards the pending instances of signal `number` in the process and
+    /// in every thread of it, as `sigaction` does when it makes the signal
+    /// ignored (Linux's `flush_sigqueue_mask`). Threads drop the ones they
+    /// already took in when they next take in signals or queue one
+    /// themselves; `local`, the caller's, drops them now.
+    pub(crate) fn discard_pending(&self, number: i32, local: &mut ThreadState) {
+        self.discards.mark(number);
+        self.discards.apply(local);
+        let mut pending = self
+            .process_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        pending.pending.retain(|signal| signal.number != number);
+        self.process_inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .purge(number);
+        for inbox in self
+            .members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+        {
+            inbox.purge(number);
+        }
+    }
+    /// Drops what `local` holds of signals discarded since they were sent.
+    pub(crate) fn apply_discards(&self, local: &mut ThreadState) {
+        self.discards.apply(local);
+    }
     pub(crate) fn drain_process(&self, local: &mut ThreadState) {
+        self.discards.apply(local);
         let mut pending = self
             .process_pending
             .lock()

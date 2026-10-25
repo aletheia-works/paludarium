@@ -47,6 +47,22 @@
 static void result(const char *name, long value) { printf("%s=%ld\n", name, value); }
 static pid_t child(void) { return syscall(SYS_fork); }
 static int thread_ready[2], thread_block[2];
+static int discard_go[2], discard_done[2];
+/* Reports whether SIGUSR2 is pending for this thread, before and after the
+   main thread makes it ignored. */
+static void *discard_reader(void *unused) {
+    (void)unused;
+    char byte;
+    sigset_t pending;
+    for (int round = 0; round < 2; round++) {
+        if (read(discard_go[0], &byte, 1) != 1) return NULL;
+        sigpending(&pending);
+        result(round ? "thread-after" : "thread-before", sigismember(&pending, SIGUSR2));
+        fflush(stdout);
+        if (write(discard_done[1], "x", 1) != 1) return NULL;
+    }
+    return NULL;
+}
 static volatile sig_atomic_t received;
 static void interrupted(int number) { (void)number; received++; }
 static volatile sig_atomic_t usr2_blocked_in_handler = -1;
@@ -1021,6 +1037,42 @@ int main(int argc, char **argv) {
         struct thread_event as_signal = {0, SIGUSR1, 2, 0, {0}};
         result("sigev-thread", syscall(SYS_timer_create, CLOCK_MONOTONIC, &as_signal, &timer));
         result("delete-sigev-thread", syscall(SYS_timer_delete, timer));
+        return 0;
+    }
+    if (!strcmp(mode, "ignore-discards")) {
+        /* Making a signal ignored discards its pending instances, and only
+           those: one sent while ignored and blocked stays pending. SIG_DFL
+           discards a signal whose default is to ignore it. */
+        sigset_t set, pending;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigaddset(&set, SIGUSR2);
+        sigaddset(&set, SIGURG);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        raise(SIGUSR1);
+        signal(SIGUSR1, SIG_IGN);
+        sigpending(&pending);
+        result("ignored", sigismember(&pending, SIGUSR1));
+        raise(SIGUSR1);
+        sigpending(&pending);
+        result("sent-while-ignored", sigismember(&pending, SIGUSR1));
+        signal(SIGUSR1, SIG_DFL);
+        sigpending(&pending);
+        result("default-terminate", sigismember(&pending, SIGUSR1));
+        raise(SIGURG);
+        signal(SIGURG, SIG_DFL);
+        sigpending(&pending);
+        result("default-ignore", sigismember(&pending, SIGURG));
+        signal(SIGUSR1, SIG_IGN);
+        /* A signal another thread already has pending goes too. */
+        pthread_t reader;
+        char byte;
+        if (pipe(discard_go) || pipe(discard_done) || pthread_create(&reader, NULL, discard_reader, NULL)) return 84;
+        pthread_kill(reader, SIGUSR2);
+        if (write(discard_go[1], "x", 1) != 1 || read(discard_done[0], &byte, 1) != 1) return 85;
+        signal(SIGUSR2, SIG_IGN);
+        if (write(discard_go[1], "x", 1) != 1 || read(discard_done[0], &byte, 1) != 1) return 86;
+        pthread_join(reader, NULL);
         return 0;
     }
     if (!strcmp(mode, "waitid")) {

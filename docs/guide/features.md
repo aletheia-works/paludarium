@@ -302,6 +302,11 @@ kernel.
   Linux. `rt_sigsuspend` waits with its mask in place of the signal mask until a
   handler has run, which runs with that mask; the original mask is back after
   it.
+- A `sigaction` that makes a signal ignored (`SIG_IGN`, or `SIG_DFL` for
+  `SIGCHLD`, `SIGCONT`, `SIGURG` and `SIGWINCH`, which are ignored by
+  default) discards its pending instances in the process and in every thread,
+  as Linux's `do_sigaction` does. A blocked signal sent after that stays
+  pending.
 
 ## Filesystem
 

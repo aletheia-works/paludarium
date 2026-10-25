@@ -886,3 +886,83 @@ mod limits {
         assert_eq!(set(&mut c, &mut ct, &cm, 4, 5), eperm);
     }
 }
+mod ignored_pending {
+    use super::*;
+    const USR1: u64 = 1 << 9;
+    const CHLD: u64 = 1 << 16;
+    fn pending(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> u64 {
+        assert_eq!(syscall(k, t, m, 127, [DATA + 128, 8, 0, 0, 0, 0]), 0);
+        m.read_u64(GuestAddr(DATA + 128)).unwrap()
+    }
+    fn action(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, signal: u64, handler: u64) {
+        let bytes = [handler, 0, 0, 0].map(u64::to_le_bytes).concat();
+        m.write(GuestAddr(DATA + 256), &bytes).unwrap();
+        assert_eq!(syscall(k, t, m, 13, [signal, DATA + 256, 0, 8, 0, 0]), 0);
+    }
+    fn block(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, set: u64) {
+        m.write_u64(GuestAddr(DATA), set).unwrap();
+        assert_eq!(syscall(k, t, m, 14, [0, DATA, 0, 8, 0, 0]), 0);
+    }
+    #[test]
+    fn ignoring_discards_what_is_pending_but_not_what_comes_later() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m, USR1 | CHLD);
+        syscall(&mut k, &mut t, &m, 62, [1, 10, 0, 0, 0, 0]);
+        assert_eq!(pending(&mut k, &mut t, &m), USR1);
+        action(&mut k, &mut t, &m, 10, 1);
+        assert_eq!(pending(&mut k, &mut t, &m), 0);
+        // Blocked, a signal sent while ignored stays pending.
+        syscall(&mut k, &mut t, &m, 62, [1, 10, 0, 0, 0, 0]);
+        assert_eq!(pending(&mut k, &mut t, &m), USR1);
+        // SIG_DFL discards only a signal whose default is to ignore it.
+        action(&mut k, &mut t, &m, 10, 0);
+        assert_eq!(pending(&mut k, &mut t, &m), USR1);
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(pending(&mut k, &mut t, &m), USR1 | CHLD);
+        action(&mut k, &mut t, &m, 17, 0);
+        assert_eq!(pending(&mut k, &mut t, &m), USR1);
+    }
+    #[test]
+    fn other_threads_drop_what_they_took_in() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m, USR1);
+        let tid = syscall(&mut k, &mut t, &m, 56, [0x10900, 0, 0, 0, 0, 0]);
+        let (mut e, mut et) = k.take_child().unwrap();
+        syscall(&mut k, &mut t, &m, 234, [1, tid, 10, 0, 0, 0]);
+        // The thread takes its signal in, then another thread ignores it.
+        assert_eq!(pending(&mut e, &mut et, &m), USR1);
+        action(&mut k, &mut t, &m, 10, 1);
+        assert_eq!(pending(&mut e, &mut et, &m), 0);
+        syscall(&mut k, &mut t, &m, 234, [1, tid, 10, 0, 0, 0]);
+        assert_eq!(pending(&mut e, &mut et, &m), USR1);
+    }
+    #[test]
+    fn a_signal_sent_after_the_discard_stays_however_it_is_queued() {
+        // A thread that never took a signal in queues one to itself after
+        // another thread made it ignored.
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m, USR1);
+        let tid = syscall(&mut k, &mut t, &m, 56, [0x10900, 0, 0, 0, 0, 0]);
+        let (mut e, mut et) = k.take_child().unwrap();
+        action(&mut k, &mut t, &m, 10, 1);
+        assert_eq!(syscall(&mut e, &mut et, &m, 234, [1, tid, 10, 0, 0, 0]), 0);
+        assert_eq!(pending(&mut e, &mut et, &m), USR1);
+        // After an execve, which starts the thread's state afresh.
+        let (mut k, mut t, m) = exec_setup();
+        block(&mut k, &mut t, &m, USR1);
+        action(&mut k, &mut t, &m, 10, 1);
+        m.write(GuestAddr(DATA), b"/child\0").unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        let em = k.take_exec_memory().unwrap();
+        em.map_shared(
+            Some(GuestAddr(DATA)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &em, 234, [1, 1, 10, 0, 0, 0]), 0);
+        assert_eq!(pending(&mut k, &mut t, &em), USR1);
+    }
+}

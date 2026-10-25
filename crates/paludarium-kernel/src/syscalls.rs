@@ -1566,6 +1566,12 @@ fn sys_rt_sigaction(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
     if let Some(new) = new {
         c.process.signal_actions.insert(key, new);
+        // An ignored signal's pending instances go, as in Linux's
+        // do_sigaction: SIG_IGN, or SIG_DFL for one whose default is to
+        // ignore it (SIGCHLD, SIGCONT, SIGURG, SIGWINCH).
+        if new.handler == 1 || new.handler == 0 && matches!(key, 17 | 18 | 23 | 28) {
+            c.group.discard_pending(key, c.process);
+        }
     }
     ok(0)
 }

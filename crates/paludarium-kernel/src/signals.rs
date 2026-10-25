@@ -50,6 +50,51 @@ pub(crate) struct PendingSignal {
     pub timer: Option<TimerSignal>,
     /// The child a SIGCHLD reports on; `code` is its `CLD_*` code.
     pub child: Option<ChildSignal>,
+    /// The discard generation it was sent in ([`Discards`]).
+    pub born: u64,
+}
+/// When a `sigaction` last discarded each signal's pending instances, as
+/// Linux's `flush_sigqueue_mask` does for a signal it makes ignored. Each
+/// discard takes the next generation, and every signal records the
+/// generation it was sent in, so dropping the instances sent before a
+/// discard keeps those sent after it, whenever a thread catches up.
+pub(crate) struct Discards([std::sync::atomic::AtomicU64; 64]);
+static GENERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static LATEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The generation a signal sent now belongs to.
+pub(crate) fn generation() -> u64 {
+    LATEST.load(std::sync::atomic::Ordering::SeqCst)
+}
+impl Default for Discards {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| {
+            std::sync::atomic::AtomicU64::new(0)
+        }))
+    }
+}
+impl Discards {
+    /// Records a discard of signal `number` (1 to 64).
+    pub(crate) fn mark(&self, number: i32) {
+        use std::sync::atomic::Ordering;
+        let _serial = GENERATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = LATEST.load(Ordering::SeqCst) + 1;
+        if let Some(slot) = usize::try_from(number - 1).ok().and_then(|i| self.0.get(i)) {
+            slot.store(generation, Ordering::SeqCst);
+        }
+        LATEST.store(generation, Ordering::SeqCst);
+    }
+    /// Drops the signals in `state` sent before their latest discard.
+    pub(crate) fn apply(&self, state: &mut ThreadState) {
+        use std::sync::atomic::Ordering;
+        state.pending.retain(|signal| {
+            usize::try_from(signal.number - 1)
+                .ok()
+                .and_then(|i| self.0.get(i))
+                .is_none_or(|slot| slot.load(Ordering::SeqCst) <= signal.born)
+        });
+    }
 }
 /// `si_pid`, `si_status` and the CPU time (`si_utime`) of a SIGCHLD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +152,7 @@ impl PendingSignal {
             synchronous: false,
             timer: None,
             child: None,
+            born: generation(),
         }
     }
     pub fn thread(number: i32, code: i32) -> Self {

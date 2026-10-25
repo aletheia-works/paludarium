@@ -277,6 +277,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `epoll_wait` と `rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。
   `rt_sigsuspend` は、シグナルのマスクを渡されたマスクに置き換えてハンドラが動くまで待ちます。
   ハンドラはそのマスクで動き、終わると元のマスクに戻ります。
+- シグナルを無視にする `sigaction`（`SIG_IGN` か、既定で無視される `SIGCHLD`、`SIGCONT`、
+  `SIGURG`、`SIGWINCH` への `SIG_DFL`）は、Linux の `do_sigaction` と同じく、プロセスと
+  すべてのスレッドで保留中のそのシグナルを捨てます。その後に送られたブロック中の
+  シグナルは、保留のまま残ります。
 
 ## ファイルシステム
 

@@ -13,6 +13,8 @@ pub struct SignalInbox {
     control_wake: AtomicBool,
     timer_wake: AtomicBool,
     listeners: Mutex<Vec<Weak<AtomicBool>>>,
+    /// The discards of the thread group this inbox belongs to.
+    discards: Mutex<Option<Arc<signals::Discards>>>,
 }
 #[derive(Default)]
 pub(crate) struct WakeReceipt {
@@ -124,8 +126,22 @@ impl SignalInbox {
     pub fn wake_token(&self) -> Arc<AtomicBool> {
         self.wake.clone()
     }
+    /// Joins the thread group whose discards this inbox's thread follows.
+    pub(crate) fn attach(&self, discards: Arc<signals::Discards>) {
+        *self.discards.lock().unwrap_or_else(PoisonError::into_inner) = Some(discards);
+    }
+    /// Drops the queued instances of signal `number`.
+    pub(crate) fn purge(&self, number: i32) {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|signal| signal.number != number);
+    }
     pub(crate) fn drain(&self, process: &mut ThreadState) -> WakeReceipt {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(discards) = &*self.discards.lock().unwrap_or_else(PoisonError::into_inner) {
+            discards.apply(process);
+        }
         let received = WakeReceipt {
             signals: !queue.is_empty(),
             timer_changed: self.timer_wake.swap(false, Ordering::SeqCst),

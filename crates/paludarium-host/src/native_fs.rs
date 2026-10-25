@@ -158,7 +158,8 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
             // A host device's number is in the host's encoding; none is
             // passed on.
             rdev: 0,
-            blocks: None,
+            // st_blocks is in 512-byte blocks on every Unix host.
+            blocks: Some(m.blocks()),
         })
     }
     #[cfg(not(unix))]
@@ -210,6 +211,42 @@ impl NativeFs {
 struct NativeFile {
     file: Mutex<std::fs::File>,
     flags: Mutex<u32>,
+}
+impl NativeFile {
+    /// `lseek` with `SEEK_DATA` (`data`) or `SEEK_HOLE`, asked of the host
+    /// where it answers (Linux and macOS), as Linux asks the file system.
+    /// Elsewhere, or when the host's file system cannot tell, the whole file
+    /// is data, as Linux's `generic_file_llseek` has it for a file system
+    /// without holes: the offset itself is data and the end of the file the
+    /// next hole. `ENXIO` for a negative offset or one at or past the end.
+    fn seek_data(&self, o: i64, data: bool) -> Result<u64, Errno> {
+        const ENXIO: Errno = Errno(6);
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        let offset = u64::try_from(o).map_err(|_| ENXIO)?;
+        let size = file.metadata().map_err(err)?.len();
+        if offset >= size {
+            return Err(ENXIO);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use rustix::fs::SeekFrom as Whence;
+            let whence = if data {
+                Whence::Data(offset)
+            } else {
+                Whence::Hole(offset)
+            };
+            // The offset is checked already, so another error means the
+            // host's file system cannot tell (EINVAL, ENOTSUP or what a
+            // volume without holes gives): it falls back.
+            match rustix::fs::seek(&*file, whence) {
+                Ok(at) => return Ok(at),
+                Err(rustix::io::Errno::NXIO) => return Err(ENXIO),
+                Err(_) => {}
+            }
+        }
+        let at = if data { offset } else { size };
+        file.seek(SeekFrom::Start(at)).map_err(err)
+    }
 }
 impl FileHandle for NativeFile {
     fn read_at(&self, offset: u64, b: &mut [u8]) -> Result<usize, Errno> {
@@ -271,6 +308,9 @@ impl FileHandle for NativeFile {
             .map_err(err)
     }
     fn seek(&self, o: i64, w: u32) -> Result<u64, Errno> {
+        if let 3 | 4 = w {
+            return self.seek_data(o, w == 3);
+        }
         let s = match w {
             0 => SeekFrom::Start(u64::try_from(o).map_err(|_| Errno::EINVAL)?),
             1 => SeekFrom::Current(o),
@@ -749,7 +789,8 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
             // A host device's number is in the host's encoding; none is
             // passed on.
             rdev: 0,
-            blocks: None,
+            // st_blocks is in 512-byte blocks on every Unix host.
+            blocks: Some(m.blocks()),
         })
     }
     #[cfg(not(unix))]
@@ -917,6 +958,37 @@ mod files_tests {
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(13));
         assert_eq!(conflicts.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn seek_data_and_hole_ask_the_host() {
+        const ENXIO: Errno = Errno(6);
+        let fixture = Fixture::new();
+        let f = fixture.fs().open(b"sparse", 66, 0o644).unwrap();
+        let (size, at) = (1u64 << 20, 1u64 << 19);
+        f.truncate(size).unwrap();
+        assert_eq!(f.write_at(at, b"x"), Ok(1));
+        for (offset, whence) in [(-1, 3), (-1, 4), (size as i64, 3), (size as i64, 4)] {
+            assert_eq!(f.seek(offset, whence), Err(ENXIO), "{offset} {whence}");
+        }
+        // A host file system with holes finds the written block; one without
+        // them has only data, up to the end.
+        let found = (f.seek(0, 3).unwrap(), f.seek(0, 4).unwrap());
+        let sparse = found == (at, 0);
+        assert!(sparse || found == (0, size), "{found:?}");
+        let hole = f.seek(at as i64, 4).unwrap();
+        assert!(hole > at && hole <= size, "{hole}");
+        assert_eq!(f.seek(0, 1), Ok(hole));
+        let blocks = f.stat().unwrap().blocks;
+        if cfg!(unix) {
+            let blocks = blocks.unwrap();
+            assert!(blocks > 0);
+            if sparse {
+                assert!(blocks * 512 < size, "{blocks}");
+            }
+        } else {
+            assert_eq!(blocks, None);
+        }
     }
 
     struct Fixture {

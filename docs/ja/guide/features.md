@@ -69,6 +69,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   後ろのページを解放します。`SEEK_DATA` と `SEEK_HOLE` の `lseek` は、書いたページと
   穴を見つけます。`fallocate` で確保したページは書くまで穴で、ファイルの末尾も
   穴です。末尾以降や負のオフセットは `ENXIO` です。
+- マウントしたホストのディレクトリのファイルでは、Linux と macOS のホストなら
+  `SEEK_DATA`、`SEEK_HOLE`、`st_blocks` をホストから得ます（`st_blocks` は Unix の
+  ホストすべてで）。ホストのファイルシステムが穴の場所を答えられないときと、ほかの
+  ホストでは、Linux の `generic_file_llseek` が穴のないファイルシステムで扱うのと
+  同じく、ファイル全体をデータとします。
 - `memfd_create` は、リンクのないメモリ上のファイル（モード 0777、
   `MFD_NOEXEC_SEAL` なら 0666）を作り、flags と名前を Linux と同じく確かめます
   （`EINVAL`、`EFAULT`）。`MFD_HUGETLB` は、hugetlbfs のないカーネルと同じく

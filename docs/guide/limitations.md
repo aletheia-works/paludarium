@@ -32,10 +32,12 @@ verified.
   `clone3`) fail with `EINVAL` and create no child, where Linux lets the
   guest, which runs as root, create the namespace. `unshare` and `setns`
   return `ENOSYS`.
-- **Files of a mounted host directory**: `lseek` with `SEEK_DATA` or
-  `SEEK_HOLE` gives `EINVAL`, and `st_blocks` is the size rounded up to
-  512-byte blocks, where Linux finds the holes and counts what the host's
-  filesystem allocated. Files of the in-memory filesystem behave as on tmpfs.
+- **Files of a mounted host directory on hosts other than Linux and macOS**:
+  `lseek` with `SEEK_DATA` or `SEEK_HOLE` treats the whole file as data,
+  where Linux finds the holes. On Windows `st_blocks` is also the size
+  rounded up to 512-byte blocks, where Linux counts what the host's
+  filesystem allocated; other Unix hosts give their own. On Linux and macOS
+  hosts both come from the host.
 - **Core files**: a core is written as with the kernel's default
   `core_pattern` (`core` in the working directory); a host that pipes cores to
   a crash handler (systemd-coredump, apport) is not modelled. The core holds

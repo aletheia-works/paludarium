@@ -78,6 +78,11 @@ kernel.
   holes; a page `fallocate` allocated is a hole until it is written, and
   the end of the file is one. An offset at or past the end, or a negative
   one, gives `ENXIO`.
+- Files of a mounted host directory take `SEEK_DATA`, `SEEK_HOLE` and
+  `st_blocks` from the host on Linux and macOS (`st_blocks` on every Unix
+  host). Where the host's filesystem cannot tell where its holes are, and on
+  other hosts, the whole file is data, as Linux's `generic_file_llseek` has
+  it for a filesystem without holes.
 - `memfd_create` makes an unlinked in-memory file (mode 0777, or 0666 with
   `MFD_NOEXEC_SEAL`, and no links), with Linux's flag and name checks
   (`EINVAL`, `EFAULT`); `MFD_HUGETLB` gives `ENOSYS`, as from a kernel

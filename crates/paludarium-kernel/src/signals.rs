@@ -52,6 +52,9 @@ pub(crate) struct PendingSignal {
     pub child: Option<ChildSignal>,
     /// The process that sent it (`si_pid`), when that is not the receiver.
     pub sender: Option<u32>,
+    /// The siginfo `rt_sigqueueinfo` or `rt_tgsigqueueinfo` gave: Linux's
+    /// `kernel_siginfo`, the first 48 bytes, delivered as they are.
+    pub queued: Option<[u8; 48]>,
     /// The discard generation it was sent in ([`Discards`]).
     pub born: u64,
 }
@@ -126,6 +129,8 @@ pub(crate) struct TimerSignal {
 }
 /// `si_code` of a signal from a POSIX timer.
 pub(crate) const SI_TIMER: i32 = -2;
+/// `si_code` of a signal from `tkill` or `tgkill`.
+pub(crate) const SI_TKILL: i32 = -6;
 /// `si_code` of a signal the kernel sends itself (`SEND_SIG_PRIV`), which
 /// carries no sender: `si_pid` and `si_uid` stay 0.
 pub(crate) const SI_KERNEL: i32 = 0x80;
@@ -133,6 +138,11 @@ pub(crate) const SI_KERNEL: i32 = 0x80;
 /// for `rt_sigtimedwait`.
 pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128] {
     let mut info = [0u8; 128];
+    if let Some(queued) = signal.queued {
+        info[..48].copy_from_slice(&queued);
+        info[0..4].copy_from_slice(&signal.number.to_le_bytes());
+        return info;
+    }
     info[0..4].copy_from_slice(&signal.number.to_le_bytes());
     info[8..12].copy_from_slice(&signal.code.to_le_bytes());
     if let Some(timer) = signal.timer {
@@ -165,6 +175,7 @@ impl PendingSignal {
             timer: None,
             child: None,
             sender: None,
+            queued: None,
             born: generation(),
         }
     }

@@ -1491,6 +1491,88 @@ int main(int argc, char **argv) {
         if (chdir("/") || rmdir(dir)) return 82;
         return 0;
     }
+    if (!strcmp(mode, "sigqueue")) {
+        /* sigqueue delivers its value with SI_QUEUE, and a realtime signal
+           keeps every one. rt_sigqueueinfo takes the caller's siginfo as it
+           is, but only a thread signalling itself may give a code kill or
+           tkill would (EPERM, before ESRCH); an unknown layout needs a zero
+           tail (E2BIG). rt_tgsigqueueinfo reaches one thread. */
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigaddset(&set, SIGRTMIN);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            pid_t parent = getppid();
+            if (sigqueue(parent, SIGRTMIN, (union sigval){.sival_int = 1}) ||
+                sigqueue(parent, SIGRTMIN, (union sigval){.sival_int = 2}) ||
+                sigqueue(parent, SIGUSR1, (union sigval){.sival_int = 5}))
+                _exit(1);
+            _exit(0);
+        }
+        int status;
+        waitpid(pid, &status, 0);
+        result("child", WEXITSTATUS(status));
+        siginfo_t info;
+        for (int i = 0; i < 3; i++) {
+            int number = sigwaitinfo(&set, &info);
+            printf("%s: code=%d value=%d sender=%d\n", number == SIGUSR1 ? "usr1" : "rt",
+                   info.si_code, info.si_value.sival_int, info.si_pid == pid);
+        }
+        /* pid is reaped now, so it names no process. */
+        siginfo_t given;
+        memset(&given, 0, sizeof given);
+        given.si_code = SI_QUEUE;
+        given.si_value.sival_int = 9;
+        errno = 0;
+        result("self", syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, &given));
+        result("self-taken", sigwaitinfo(&set, &info) == SIGUSR1 && info.si_value.sival_int == 9);
+        result("none", syscall(SYS_rt_sigqueueinfo, pid, SIGUSR1, &given) ? errno : 0);
+        result("probe", syscall(SYS_rt_sigqueueinfo, getpid(), 0, &given));
+        errno = 0;
+        result("bad-signal", syscall(SYS_rt_sigqueueinfo, getpid(), 65, &given) ? errno : 0);
+        errno = 0;
+        result("fault", syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, (void *)8) ? errno : 0);
+        given.si_code = SI_USER;
+        errno = 0;
+        result("user-other", syscall(SYS_rt_sigqueueinfo, pid, SIGUSR1, &given) ? errno : 0);
+        result("user-self", syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, &given));
+        result("user-taken", sigwaitinfo(&set, &info) == SIGUSR1 && info.si_code == SI_USER);
+        given.si_code = SI_TKILL;
+        errno = 0;
+        result("tkill-other", syscall(SYS_rt_sigqueueinfo, pid, SIGUSR1, &given) ? errno : 0);
+        unsigned char raw[128] = {0};
+        int unknown = -8;
+        memcpy(raw + 8, &unknown, 4);
+        raw[100] = 1;
+        errno = 0;
+        result("unknown-tail", syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, raw) ? errno : 0);
+        raw[100] = 0;
+        result("unknown-zero", syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, raw));
+        result("unknown-code", sigwaitinfo(&set, &info) == SIGUSR1 ? info.si_code : 0);
+        /* Past SI_KERNEL, and past SIGUSR1's codes (NSIGPOLL), unknown too. */
+        int high[] = {0x81, 7};
+        for (int i = 0; i < 2; i++) {
+            memcpy(raw + 8, &high[i], 4);
+            raw[100] = 1;
+            errno = 0;
+            result(i ? "past-poll-tail" : "past-kernel-tail",
+                   syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, raw) ? errno : 0);
+        }
+        given.si_code = SI_QUEUE;
+        given.si_value.sival_int = 4;
+        pid_t tid = syscall(SYS_gettid);
+        result("thread", syscall(SYS_rt_tgsigqueueinfo, getpid(), tid, SIGUSR1, &given));
+        result("thread-taken", sigwaitinfo(&set, &info) == SIGUSR1 && info.si_value.sival_int == 4);
+        errno = 0;
+        result("thread-no-group", syscall(SYS_rt_tgsigqueueinfo, 0, tid, SIGUSR1, &given) ? errno : 0);
+        errno = 0;
+        result("thread-fault", syscall(SYS_rt_tgsigqueueinfo, 0, tid, SIGUSR1, (void *)8) ? errno : 0);
+        errno = 0;
+        result("thread-none", syscall(SYS_rt_tgsigqueueinfo, getpid(), pid, SIGUSR1, &given) ? errno : 0);
+        return 0;
+    }
     if (!strcmp(mode, "waitid")) {
         siginfo_t info;
         pid_t pid = child();

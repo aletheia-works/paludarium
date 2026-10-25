@@ -497,6 +497,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    queued: None,
                     born: signals::generation(),
                 })
             }
@@ -513,6 +514,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    queued: None,
                     born: signals::generation(),
                 })
             }
@@ -529,6 +531,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    queued: None,
                     born: signals::generation(),
                 })
             }
@@ -545,6 +548,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    queued: None,
                     born: signals::generation(),
                 })
             }
@@ -561,6 +565,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    queued: None,
                     born: signals::generation(),
                 })
             }

@@ -182,6 +182,7 @@ mod linux {
         processes_kill_group => ("kill-group","process"),
         processes_signal_sender => ("signal-sender","process"),
         processes_core_dump => ("core-dump","process"),
+        processes_sigqueue => ("sigqueue","process"),
         processes_ignore_discards => ("ignore-discards","process"),
         processes_thread_name => ("thread-name","process"),
         processes_timer_thread => ("timer-thread","process"),

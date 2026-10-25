@@ -425,7 +425,7 @@ impl Processes {
                 .map(|(&other, _)| other)
                 .collect();
             for other in live {
-                let _ = Self::deliver(&mut entries, other, 9, None);
+                let _ = Self::deliver(&mut entries, other, None, Self::from_kernel(9));
             }
         }
         // Children that asked for it learn that this process exited.
@@ -502,7 +502,7 @@ impl Processes {
             .collect();
         for number in [1, 18] {
             for &member in &group {
-                let _ = Self::deliver(entries, member, number, None);
+                let _ = Self::deliver(entries, member, None, Self::from_kernel(number));
             }
         }
     }
@@ -771,7 +771,7 @@ impl Processes {
         }
         let (mut last, mut delivered) = (Ok(()), false);
         for pid in pids {
-            last = Self::deliver(&mut entries, pid, number, Some(caller));
+            last = Self::deliver(&mut entries, pid, None, Self::from_process(number, caller));
             delivered |= last.is_ok();
         }
         if delivered && target != -1 {
@@ -782,23 +782,63 @@ impl Processes {
     }
     fn signal(&self, sender: u32, pid: u32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        Self::deliver(&mut entries, pid, number, Some(sender))
+        Self::deliver(&mut entries, pid, None, Self::from_process(number, sender))
     }
-    /// Sends `number` to `pid` from process `sender`, or from the kernel
-    /// itself without one.
+    /// `rt_sigqueueinfo` of `signal` to `pid`, which a thread's ID also
+    /// names, as `kill` finds it.
+    fn queue(&self, pid: u32, signal: signals::PendingSignal) -> Result<(), Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = entries
+            .iter()
+            .find(|&(&key, entry)| {
+                key == pid || (entry.status.is_none() && entry.group.has_member(pid))
+            })
+            .map(|(&key, _)| key)
+            .ok_or(Errno(3))?;
+        Self::deliver(&mut entries, found, None, signal)
+    }
+    /// `rt_tgsigqueueinfo` of `signal` to thread `tid` of process `tgid`.
+    fn queue_thread(
+        &self,
+        tgid: u32,
+        tid: u32,
+        signal: signals::PendingSignal,
+    ) -> Result<(), Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if !entries
+            .get(&tgid)
+            .is_some_and(|entry| entry.group.has_member(tid))
+        {
+            return Err(Errno(3));
+        }
+        Self::deliver(&mut entries, tgid, Some(tid), signal)
+    }
+    /// A signal the kernel sends itself (`SI_KERNEL`).
+    fn from_kernel(number: i32) -> signals::PendingSignal {
+        signals::PendingSignal::user(number, signals::SI_KERNEL)
+    }
+    /// A signal process `sender` sends with `kill` (`SI_USER`).
+    fn from_process(number: i32, sender: u32) -> signals::PendingSignal {
+        signals::PendingSignal {
+            sender: Some(sender),
+            ..signals::PendingSignal::user(number, 0)
+        }
+    }
+    /// Sends `signal` to `pid`, or to its thread `thread`.
     fn deliver(
         entries: &mut BTreeMap<u32, Entry>,
         pid: u32,
-        number: i32,
-        sender: Option<u32>,
+        thread: Option<u32>,
+        signal: signals::PendingSignal,
     ) -> Result<(), Errno> {
+        let number = signal.number;
         let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
         if number == 0 {
             return Ok(());
         }
-        let send = |group: &ThreadGroup| match sender {
-            Some(sender) => group.send_process_from(number, sender),
-            None => group.send_process_kernel(number),
+        let send = |group: &ThreadGroup| match thread {
+            Some(tid) => group.send_thread_signal(tid, signal),
+            None => group.send_process_signal(signal),
         };
         // SIGCONT resumes a stopped process at once, as Linux's
         // prepare_signal does, and its parent's wait can see that.
@@ -980,6 +1020,8 @@ impl Kernel {
             247 => self.waitid(thread, mem, a),
             434 => self.pidfd_open(a),
             424 => self.pidfd_send_signal(a),
+            129 => self.sigqueueinfo(thread, mem, a),
+            297 => self.tgsigqueueinfo(thread, mem, a),
             110 => Ok(u64::from(self.processes.parent(self.process.pid))),
             157 => self.prctl(thread, mem, a),
             // setpgid, getpgid, getpgrp
@@ -1443,6 +1485,42 @@ impl Kernel {
             .install(pidfd, true, self.group.nofile())
             .map(u64::from)
     }
+    /// `rt_sigqueueinfo(pid, sig, info)`, as Linux's `do_rt_sigqueueinfo`:
+    /// the caller's siginfo goes to `pid` as it is. Only a thread signalling
+    /// itself may give a `si_code` that `kill` or `tkill` would (`EPERM`).
+    fn sigqueueinfo(&self, thread: &Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
+        let (pid, number) = (a[0] as i32, a[1] as i32);
+        let signal = queued_siginfo(mem, a[2], number)?;
+        if impersonates(signal.code) && pid != thread.tid as i32 {
+            return Err(Errno(1));
+        }
+        if pid <= 0 {
+            return Err(Errno(3));
+        }
+        self.processes
+            .queue(pid.cast_unsigned(), signal)
+            .map(|()| 0)
+    }
+    /// `rt_tgsigqueueinfo(tgid, tid, sig, info)`, as `do_rt_tgsigqueueinfo`:
+    /// the same, directed at thread `tid` of process `tgid`.
+    fn tgsigqueueinfo(
+        &self,
+        thread: &Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
+        let (tgid, tid, number) = (a[0] as i32, a[1] as i32, a[2] as i32);
+        let signal = queued_siginfo(mem, a[3], number)?;
+        if tgid <= 0 || tid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        if impersonates(signal.code) && tid != thread.tid as i32 {
+            return Err(Errno(1));
+        }
+        self.processes
+            .queue_thread(tgid.cast_unsigned(), tid.cast_unsigned(), signal)
+            .map(|()| 0)
+    }
     /// `pidfd_send_signal(pidfd, sig, info, flags)`, as `kill` on the
     /// pidfd's process; a siginfo and the scope flags are not supported
     /// (`EINVAL`).
@@ -1656,4 +1734,63 @@ fn read_vector(
         strings.push(value);
     }
     Err(Errno(7))
+}
+
+/// Whether a `si_code` is one only the kernel, `kill` or `tkill` gives:
+/// zero or more (`SI_USER`, `SI_KERNEL` and the signal-specific codes) or
+/// `SI_TKILL`.
+fn impersonates(code: i32) -> bool {
+    code >= 0 || code == signals::SI_TKILL
+}
+
+/// The siginfo at `addr` for signal `number`, as Linux's
+/// `__copy_siginfo_from_user` takes it: the first 48 bytes
+/// (`kernel_siginfo`), with `si_signo` set to the signal. For a `si_code`
+/// whose layout Linux does not know, the other 80 bytes must be zero
+/// (`E2BIG`).
+fn queued_siginfo(
+    mem: &AddressSpace,
+    addr: u64,
+    number: i32,
+) -> Result<signals::PendingSignal, Errno> {
+    let mut queued = [0u8; 48];
+    mem.read(GuestAddr(addr), &mut queued)
+        .map_err(|_| Errno::EFAULT)?;
+    let code = i32::from_le_bytes([queued[8], queued[9], queued[10], queued[11]]);
+    if !known_layout(number, code) {
+        let mut rest = [0u8; 80];
+        mem.read(GuestAddr(addr.wrapping_add(48)), &mut rest)
+            .map_err(|_| Errno::EFAULT)?;
+        if rest.iter().any(|&b| b != 0) {
+            return Err(Errno(7));
+        }
+    }
+    queued[0..4].copy_from_slice(&number.to_le_bytes());
+    Ok(signals::PendingSignal {
+        queued: Some(queued),
+        ..signals::PendingSignal::user(number, code)
+    })
+}
+
+/// Linux's `known_siginfo_layout`: `SI_KERNEL`; another positive code up to
+/// the last one of its signal (`NSIGILL`, `NSIGFPE`, ...; `NSIGPOLL` for the
+/// rest); `SI_USER` down to `SI_DETHREAD`; and `SI_ASYNCNL`.
+fn known_layout(number: i32, code: i32) -> bool {
+    let last = match number {
+        4 => 11,  // SIGILL
+        5 => 6,   // SIGTRAP
+        7 => 5,   // SIGBUS
+        8 => 15,  // SIGFPE
+        11 => 10, // SIGSEGV
+        17 => 6,  // SIGCHLD
+        31 => 2,  // SIGSYS
+        _ => 6,   // NSIGPOLL
+    };
+    if code == signals::SI_KERNEL {
+        true
+    } else if code > 0 {
+        code <= last
+    } else {
+        code >= -7 || code == -60
+    }
 }

@@ -37,7 +37,7 @@ kernel.
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
-| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
+| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
@@ -252,6 +252,13 @@ kernel.
   invalid signal; otherwise an invalid signal gives `EINVAL`. A signal from
   `kill` or `pidfd_send_signal` gives its sender's PID in `si_pid`, and the
   `PR_SET_PDEATHSIG` signal the PID of the parent that exited.
+- `rt_sigqueueinfo` (behind `sigqueue`) sends a process the caller's siginfo
+  as it is, and `rt_tgsigqueueinfo` sends it to one thread, so the signal
+  carries its value; each realtime signal sent is kept. As in Linux, only a
+  thread signalling itself may give a `si_code` that the kernel, `kill` or
+  `tkill` would give (`EPERM`, checked before the target), and a `si_code`
+  whose layout Linux does not know must leave the rest of the siginfo zero
+  (`E2BIG`).
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's

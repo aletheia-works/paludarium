@@ -1680,3 +1680,151 @@ mod core_dumps {
         );
     }
 }
+mod queued_signals {
+    use super::*;
+    const USR1: u64 = 1 << 9;
+    const RT: u64 = 1 << 33; // signal 34
+    fn block(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, set: u64) {
+        m.write_u64(GuestAddr(DATA + 512), set).unwrap();
+        assert_eq!(syscall(k, t, m, 14, [0, DATA + 512, 0, 8, 0, 0]), 0);
+    }
+    /// A siginfo at DATA + 256: `code`, `si_pid` 99 and `si_value`, with
+    /// `tail` written past the first 48 bytes.
+    fn info(m: &AddressSpace, code: i32, value: u64, tail: u8) {
+        let mut b = [0u8; 128];
+        b[0..4].copy_from_slice(&77i32.to_le_bytes()); // replaced by the signal
+        b[8..12].copy_from_slice(&code.to_le_bytes());
+        b[16..20].copy_from_slice(&99u32.to_le_bytes());
+        b[24..32].copy_from_slice(&value.to_le_bytes());
+        b[100] = tail;
+        m.write(GuestAddr(DATA + 256), &b).unwrap();
+    }
+    /// Takes a pending signal of `set` with rt_sigtimedwait (no wait) and
+    /// returns its number and siginfo.
+    fn take(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, set: u64) -> (u64, [u8; 128]) {
+        m.write(GuestAddr(DATA), &[set, 0, 0].map(u64::to_le_bytes).concat())
+            .unwrap();
+        let number = syscall(k, t, m, 128, [DATA, DATA + 64, DATA + 8, 8, 0, 0]);
+        let mut info = [0u8; 128];
+        m.read(GuestAddr(DATA + 64), &mut info).unwrap();
+        (number, info)
+    }
+    fn word(info: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(info[at..at + 8].try_into().unwrap())
+    }
+    #[test]
+    fn the_siginfo_arrives_as_given() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m, USR1);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        // SI_QUEUE (-1) from the child, with its own si_pid and a value.
+        info(&cm, -1, 0x1234, 0);
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 129, [1, 10, DATA + 256, 0, 0, 0]),
+            0
+        );
+        let (number, got) = take(&mut k, &mut t, &m, USR1);
+        assert_eq!(number, 10);
+        assert_eq!(i32::from_le_bytes(got[0..4].try_into().unwrap()), 10);
+        assert_eq!(i32::from_le_bytes(got[8..12].try_into().unwrap()), -1);
+        assert_eq!(u32::from_le_bytes(got[16..20].try_into().unwrap()), 99);
+        assert_eq!(word(&got, 24), 0x1234);
+        // Only the first 48 bytes are taken.
+        assert!(got[48..].iter().all(|&b| b == 0));
+    }
+    #[test]
+    fn realtime_signals_queue_each_value() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m, RT);
+        for value in [1, 2] {
+            info(&m, -1, value, 0);
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 129, [1, 34, DATA + 256, 0, 0, 0]),
+                0
+            );
+        }
+        assert_eq!(word(&take(&mut k, &mut t, &m, RT).1, 24), 1);
+        assert_eq!(word(&take(&mut k, &mut t, &m, RT).1, 24), 2);
+    }
+    #[test]
+    fn only_the_caller_itself_may_give_a_kernel_or_kill_code() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m, USR1);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let eperm = Errno(1).to_syscall_return();
+        for code in [0, 0x80, 1, -6] {
+            info(&cm, code, 0, 0);
+            assert_eq!(
+                syscall(&mut c, &mut ct, &cm, 129, [1, 10, DATA + 256, 0, 0, 0]),
+                eperm
+            );
+            // Even to a process that does not exist.
+            assert_eq!(
+                syscall(&mut c, &mut ct, &cm, 129, [999, 10, DATA + 256, 0, 0, 0]),
+                eperm
+            );
+        }
+        info(&m, 0, 0, 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 129, [1, 10, DATA + 256, 0, 0, 0]),
+            0
+        );
+        assert_eq!(take(&mut k, &mut t, &m, USR1).0, 10);
+    }
+    #[test]
+    fn errors_come_in_linuxs_order() {
+        let (mut k, mut t, m) = setup();
+        // A layout Linux does not know must leave the tail zero: below
+        // SI_DETHREAD, or past the signal's codes, SI_KERNEL aside.
+        for code in [-8, 0x81, 7] {
+            info(&m, code, 0, 1);
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 129, [1, 10, DATA + 256, 0, 0, 0]),
+                Errno(7).to_syscall_return(),
+                "{code}"
+            );
+        }
+        info(&m, -1, 0, 1);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 129, [1, 0, DATA + 256, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 129, [1, 10, 8, 0, 0, 0]),
+            Errno::EFAULT.to_syscall_return()
+        );
+        for (pid, signal, error) in [
+            (999, 10, Errno(3)),
+            (0, 10, Errno(3)),
+            (1, 65, Errno::EINVAL),
+        ] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 129, [pid, signal, DATA + 256, 0, 0, 0]),
+                error.to_syscall_return()
+            );
+        }
+    }
+    #[test]
+    fn rt_tgsigqueueinfo_reaches_one_thread() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m, USR1);
+        info(&m, -1, 7, 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 297, [1, 1, 10, DATA + 256, 0, 0]),
+            0
+        );
+        let (number, got) = take(&mut k, &mut t, &m, USR1);
+        assert_eq!((number, word(&got, 24)), (10, 7));
+        for (tgid, tid, error) in [
+            (0, 1, Errno::EINVAL),
+            (1, 0, Errno::EINVAL),
+            (2, 1, Errno(3)),
+            (1, 2, Errno(3)),
+        ] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 297, [tgid, tid, 10, DATA + 256, 0, 0]),
+                error.to_syscall_return()
+            );
+        }
+    }
+}

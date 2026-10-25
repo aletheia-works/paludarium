@@ -185,12 +185,27 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .send_from(number, sender)
     }
-    /// Sends this process a signal from the kernel itself (`SI_KERNEL`).
-    pub(crate) fn send_process_kernel(&self, number: i32) -> Result<(), Errno> {
+    /// Sends this process `signal` as it is.
+    pub(crate) fn send_process_signal(&self, signal: signals::PendingSignal) -> Result<(), Errno> {
         self.process_inbox
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .send_kernel(number)
+            .send_pending(signal)
+    }
+    /// Sends thread `tid` of this process `signal`, directed at it.
+    pub(crate) fn send_thread_signal(
+        &self,
+        tid: u32,
+        signal: signals::PendingSignal,
+    ) -> Result<(), Errno> {
+        let members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
+        members
+            .get(&tid)
+            .ok_or(Errno(3))?
+            .send_pending(signals::PendingSignal {
+                target: signals::PendingTarget::Thread,
+                ..signal
+            })
     }
     /// Resets handled signals to their default and keeps ignored ones, as
     /// execve does. The process gets its own copy, so a process sharing the

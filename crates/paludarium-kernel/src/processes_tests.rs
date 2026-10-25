@@ -1805,6 +1805,22 @@ mod queued_signals {
         }
     }
     #[test]
+    fn process_signals_keep_their_order_across_a_checkpoint() {
+        let (k, mut t, m) = setup();
+        // As the runtime sets it up: the leader's inbox is the process's.
+        let mut k = k.with_signal_inbox(Arc::new(SignalInbox::default()));
+        block(&mut k, &mut t, &m, USR1 | RT);
+        // SIGUSR1 reaches the shared queue at a checkpoint, and a realtime
+        // signal comes before the leader drains its own inbox, which is
+        // also the process's: it must not overtake SIGUSR1.
+        k.group.send_process_from(10, 2).unwrap();
+        k.group.drain_process(&mut t.state);
+        k.group.send_process_from(34, 2).unwrap();
+        k.inbox.drain(&mut t.state);
+        assert_eq!(take(&mut k, &mut t, &m, USR1 | RT).0, 10);
+        assert_eq!(take(&mut k, &mut t, &m, USR1 | RT).0, 34);
+    }
+    #[test]
     fn rt_tgsigqueueinfo_reaches_one_thread() {
         let (mut k, mut t, m) = setup();
         block(&mut k, &mut t, &m, USR1);

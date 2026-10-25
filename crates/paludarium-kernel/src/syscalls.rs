@@ -351,6 +351,7 @@ fn sleep_until(
         let next = timer_deadline.map_or(deadline, |t| deadline.min(t));
         let result = c.host.wait_until(clock, next, c.cancellation);
         let received = c.inbox.drain(c.process);
+        c.group.drain_process(c.process);
         let interrupted = received.interrupted
             || (!c.inbox.owns_wake(c.cancellation)
                 && c.cancellation.load(std::sync::atomic::Ordering::SeqCst));

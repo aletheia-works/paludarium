@@ -146,6 +146,11 @@ impl SignalInbox {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|signal| signal.number != number);
     }
+    /// Takes the signals directed at this thread. One directed at the
+    /// process stays for [`crate::ThreadGroup::drain_process`], even in the
+    /// leader's inbox, which is also the process's: it goes to the process's
+    /// shared queue first, so that every thread sees the process's signals in
+    /// one queue and in the order they came, as Linux keeps them.
     pub(crate) fn drain(&self, process: &mut ThreadState) -> WakeReceipt {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(discards) = &*self.discards.lock().unwrap_or_else(PoisonError::into_inner) {
@@ -156,11 +161,17 @@ impl SignalInbox {
             timer_changed: self.timer_wake.swap(false, Ordering::SeqCst),
             interrupted: self.control_wake.swap(false, Ordering::SeqCst),
         };
-        for signal in queue.drain(..) {
-            signals::queue(process, signal);
-        }
+        queue.retain(|signal| {
+            if signal.target == signals::PendingTarget::Thread {
+                signals::queue(process, *signal);
+                false
+            } else {
+                true
+            }
+        });
         // Sender stores while holding this same mutex, preventing a lost wake.
-        self.wake.store(false, Ordering::SeqCst);
+        // A process signal still queued keeps it until it is dispatched.
+        self.wake.store(!queue.is_empty(), Ordering::SeqCst);
         received
     }
     /// Process dispatch must leave directed signals in their owning thread inbox.
@@ -194,7 +205,7 @@ mod signals_time_tests {
             pid: 1,
             ..ThreadState::default()
         };
-        inbox.drain(&mut process);
+        inbox.drain_process(&mut process);
         let info = signals::siginfo(&process, &process.pending[0]);
         assert_eq!(info[8..12], 0i32.to_le_bytes());
         assert_eq!(info[16..20], 0u32.to_le_bytes());
@@ -209,7 +220,7 @@ mod signals_time_tests {
         inbox.send(18).unwrap();
         inbox.send(9).unwrap();
         let mut process = ThreadState::default();
-        inbox.drain(&mut process);
+        inbox.drain_process(&mut process);
         assert!(process.pending.iter().any(|s| s.number == 9));
         assert!(!process.stopped);
         assert_eq!(
@@ -234,13 +245,35 @@ mod signals_time_tests {
                 std::time::Instant::now() < deadline,
                 "signal transport did not drain"
             );
-            inbox.drain(&mut process);
+            inbox.drain_process(&mut process);
             count += process.pending.len();
             process.pending.clear();
             std::thread::yield_now();
         }
         runner.join().unwrap();
         assert_eq!(count, 1000);
+        assert!(!inbox.wake.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn a_thread_drain_leaves_process_signals_for_the_process() {
+        let inbox = SignalInbox::default();
+        inbox.send(10).unwrap();
+        inbox.send_thread(12).unwrap();
+        let mut thread = ThreadState::default();
+        let receipt = inbox.drain(&mut thread);
+        assert!(receipt.signals);
+        assert_eq!(
+            thread.pending.iter().map(|s| s.number).collect::<Vec<_>>(),
+            [12]
+        );
+        // The process signal still wakes, until the process takes it.
+        assert!(inbox.wake.load(Ordering::SeqCst));
+        let mut process = ThreadState::default();
+        inbox.drain_process(&mut process);
+        assert_eq!(
+            process.pending.iter().map(|s| s.number).collect::<Vec<_>>(),
+            [10]
+        );
         assert!(!inbox.wake.load(Ordering::SeqCst));
     }
 }

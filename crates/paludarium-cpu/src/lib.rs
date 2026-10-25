@@ -17,6 +17,8 @@ mod encodings_tests;
 mod exec;
 #[cfg(test)]
 mod instructions_tests;
+#[cfg(test)]
+mod integer_tests;
 /// Opt-in diagnostic counters; absent from ordinary release builds.
 #[cfg(feature = "cost-profile")]
 pub mod jit_cost;

@@ -349,10 +349,13 @@ jobs:
           cargo llvm-cov report --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/'
         env:
           RUST_TEST_THREADS: "1"
+      # The CPU and decoder only: the command crate (crates/paludarium), which
+      # the harness builds and this run does not exercise, is left out of the
+      # report as it is out of the measured lines.
       - name: Encodings CPU and Decoder line coverage >= 80%
         run: |
-          cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/' --fail-under-lines 80 --lcov --output-path target/encodings-coverage.lcov
-          cargo llvm-cov report --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/'
+          cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/|crates/paludarium/' --fail-under-lines 80 --lcov --output-path target/encodings-coverage.lcov
+          cargo llvm-cov report --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/|crates/paludarium/'
         env:
           RUST_TEST_THREADS: "1"
       - name: Retain encodings coverage observations

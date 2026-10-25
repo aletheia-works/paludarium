@@ -473,6 +473,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    sender: None,
                     born: signals::generation(),
                 })
             }
@@ -488,6 +489,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    sender: None,
                     born: signals::generation(),
                 })
             }
@@ -503,6 +505,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    sender: None,
                     born: signals::generation(),
                 })
             }
@@ -518,6 +521,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    sender: None,
                     born: signals::generation(),
                 })
             }
@@ -533,6 +537,7 @@ impl Kernel {
                     synchronous: true,
                     timer: None,
                     child: None,
+                    sender: None,
                     born: signals::generation(),
                 })
             }

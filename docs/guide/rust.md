@@ -75,7 +75,9 @@ mounted directory, and neither `..` nor a symbolic link can lead outside it.
 
 - `kill()` asks the guest to stop. It ends with `SIGKILL` the next time the
   interpreter checks (every `DEFAULT_BUDGET` = 100,000 instructions).
-- `signal(number)` sends a Linux signal to the guest process.
+- `signal(number)` sends a Linux signal to the guest process. It comes from
+  outside the guest, so its `si_code` is `SI_USER` and its `si_pid` is 0, as
+  for a sender outside a PID namespace.
 - `is_stopped()` tells whether the guest is stopped by job control, such as
   by `SIGSTOP`.
 - After a run, `unimplemented_syscalls()` lists, in ascending order, the system

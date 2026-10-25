@@ -246,7 +246,9 @@ kernel.
   process but the first one and the caller with -1, as Linux's
   `kill_something_info` does. A process that has exited counts until it is
   reaped. With no process to send to, `kill` gives `ESRCH`, even for an
-  invalid signal; otherwise an invalid signal gives `EINVAL`.
+  invalid signal; otherwise an invalid signal gives `EINVAL`. A signal from
+  `kill` or `pidfd_send_signal` gives its sender's PID in `si_pid`, and the
+  `PR_SET_PDEATHSIG` signal the PID of the parent that exited.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's

@@ -23,9 +23,18 @@ pub(crate) struct WakeReceipt {
     pub interrupted: bool,
 }
 impl SignalInbox {
-    /// Queues a signal for the single guest process.
+    /// Queues a signal for the single guest process from outside the
+    /// emulator. The guest cannot see the sender, so `si_pid` is 0, as a PID
+    /// namespace reports a sender outside it.
     pub fn send(&self, number: i32) -> Result<(), Errno> {
-        self.send_pending(signals::PendingSignal::user(number, 0))
+        self.send_from(number, 0)
+    }
+    /// Queues a signal that process `sender` sent (`SI_USER`).
+    pub(crate) fn send_from(&self, number: i32, sender: u32) -> Result<(), Errno> {
+        self.send_pending(signals::PendingSignal {
+            sender: Some(sender),
+            ..signals::PendingSignal::user(number, 0)
+        })
     }
     /// Queues a signal the kernel sends itself, with `SI_KERNEL`.
     pub(crate) fn send_kernel(&self, number: i32) -> Result<(), Errno> {
@@ -181,6 +190,19 @@ impl SignalInbox {
 #[cfg(test)]
 mod signals_time_tests {
     use super::*;
+    #[test]
+    fn a_signal_from_outside_has_no_sender() {
+        let inbox = SignalInbox::default();
+        inbox.send(10).unwrap();
+        let mut process = ThreadState {
+            pid: 1,
+            ..ThreadState::default()
+        };
+        inbox.drain(&mut process);
+        let info = signals::siginfo(&process, &process.pending[0]);
+        assert_eq!(info[8..12], 0i32.to_le_bytes());
+        assert_eq!(info[16..20], 0u32.to_le_bytes());
+    }
     #[test]
     fn inbox_control_signal_survives_realtime_backlog() {
         let inbox = SignalInbox::default();

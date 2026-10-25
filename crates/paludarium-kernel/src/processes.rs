@@ -414,7 +414,7 @@ impl Processes {
         // Children that asked for it learn that this process exited.
         for child in entries.values() {
             if child.parent == pid && child.status.is_none() && child.death_signal != 0 {
-                let _ = child.group.send_process(child.death_signal);
+                let _ = child.group.send_process_from(child.death_signal, pid);
             }
         }
         // As Linux's forget_original_parent: the children go to the nearest
@@ -485,7 +485,7 @@ impl Processes {
             .collect();
         for number in [1, 18] {
             for &member in &group {
-                let _ = Self::deliver(entries, member, number, true);
+                let _ = Self::deliver(entries, member, number, None);
             }
         }
     }
@@ -717,7 +717,7 @@ impl Processes {
         }
         let (mut last, mut delivered) = (Ok(()), false);
         for pid in pids {
-            last = Self::deliver(&mut entries, pid, number, false);
+            last = Self::deliver(&mut entries, pid, number, Some(caller));
             delivered |= last.is_ok();
         }
         if delivered && target != -1 {
@@ -726,27 +726,25 @@ impl Processes {
             last
         }
     }
-    fn signal(&self, pid: u32, number: i32) -> Result<(), Errno> {
+    fn signal(&self, sender: u32, pid: u32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        Self::deliver(&mut entries, pid, number, false)
+        Self::deliver(&mut entries, pid, number, Some(sender))
     }
-    /// Sends `number` to `pid`, from the kernel itself when `kernel` is set.
+    /// Sends `number` to `pid` from process `sender`, or from the kernel
+    /// itself without one.
     fn deliver(
         entries: &mut BTreeMap<u32, Entry>,
         pid: u32,
         number: i32,
-        kernel: bool,
+        sender: Option<u32>,
     ) -> Result<(), Errno> {
         let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
         if number == 0 {
             return Ok(());
         }
-        let send = |group: &ThreadGroup| {
-            if kernel {
-                group.send_process_kernel(number)
-            } else {
-                group.send_process(number)
-            }
+        let send = |group: &ThreadGroup| match sender {
+            Some(sender) => group.send_process_from(number, sender),
+            None => group.send_process_kernel(number),
         };
         // SIGCONT resumes a stopped process at once, as Linux's
         // prepare_signal does, and its parent's wait can see that.
@@ -1405,7 +1403,10 @@ impl Kernel {
         }
         // A zombie takes the signal and drops it; a reaped process is gone.
         match self.processes.exited(pidfd.pid) {
-            Some(false) => self.processes.signal(pidfd.pid, number).map(|()| 0),
+            Some(false) => self
+                .processes
+                .signal(self.process.pid, pidfd.pid, number)
+                .map(|()| 0),
             Some(true) => Ok(0),
             None => Err(Errno(3)),
         }

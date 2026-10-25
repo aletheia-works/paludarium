@@ -168,11 +168,12 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .send_child(code, child);
     }
-    pub(crate) fn send_process(&self, number: i32) -> Result<(), Errno> {
+    /// Sends this process a signal from process `sender`, as `kill` does.
+    pub(crate) fn send_process_from(&self, number: i32, sender: u32) -> Result<(), Errno> {
         self.process_inbox
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .send(number)
+            .send_from(number, sender)
     }
     /// Sends this process a signal from the kernel itself (`SI_KERNEL`).
     pub(crate) fn send_process_kernel(&self, number: i32) -> Result<(), Errno> {

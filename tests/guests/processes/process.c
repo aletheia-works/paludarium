@@ -1318,6 +1318,59 @@ int main(int argc, char **argv) {
         if (waitpid(leader, &status, 0) != leader) return 96;
         return WIFEXITED(status) ? WEXITSTATUS(status) : 97;
     }
+    if (!strcmp(mode, "signal-sender")) {
+        /* A signal from kill or pidfd_send_signal names its sender in
+           si_pid, and the parent-death signal names the parent that exited;
+           all three are SI_USER. The first two are different signals, as a
+           second SIGUSR1 sent while the first is pending would be dropped. */
+        sigset_t usr, usr2;
+        sigemptyset(&usr);
+        sigaddset(&usr, SIGUSR1);
+        sigemptyset(&usr2);
+        sigaddset(&usr2, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &usr, NULL);
+        sigprocmask(SIG_BLOCK, &usr2, NULL);
+        siginfo_t info;
+        pid_t pid = child();
+        if (pid == 0) {
+            kill(getppid(), SIGUSR1);
+            int pidfd = syscall(SYS_pidfd_open, getppid(), 0);
+            if (pidfd < 0 || syscall(SYS_pidfd_send_signal, pidfd, SIGUSR2, NULL, 0)) _exit(81);
+            _exit(0);
+        }
+        if (sigwaitinfo(&usr, &info) != SIGUSR1) return 82;
+        result("kill-sender", info.si_pid == pid);
+        result("kill-code", info.si_code);
+        if (sigwaitinfo(&usr2, &info) != SIGUSR2) return 83;
+        result("pidfd-sender", info.si_pid == pid);
+        result("pidfd-code", info.si_code);
+        waitpid(pid, NULL, 0);
+        int ready[2], seen[2];
+        if (pipe(ready) || pipe(seen)) return 84;
+        pid_t parent = child();
+        if (parent == 0) {
+            pid_t orphan = child();
+            if (orphan == 0) {
+                prctl(PR_SET_PDEATHSIG, SIGUSR1);
+                pid_t before = getppid();
+                char byte = 0;
+                if (write(ready[1], &byte, 1) != 1) _exit(85);
+                if (sigwaitinfo(&usr, &info) != SIGUSR1) _exit(86);
+                int found[2] = {info.si_pid == before, info.si_code};
+                if (write(seen[1], found, sizeof found) != sizeof found) _exit(87);
+                _exit(0);
+            }
+            char byte;
+            if (read(ready[0], &byte, 1) != 1) _exit(88);
+            _exit(0);
+        }
+        int found[2] = {-1, -1};
+        if (read(seen[0], found, sizeof found) != sizeof found) return 89;
+        waitpid(parent, NULL, 0);
+        result("death-sender", found[0]);
+        result("death-code", found[1]);
+        return 0;
+    }
     if (!strcmp(mode, "waitid")) {
         siginfo_t info;
         pid_t pid = child();

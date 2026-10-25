@@ -1424,3 +1424,66 @@ mod kill_targets {
         assert_eq!(kill(&mut k, &mut t, &m, -1, 10), 0);
     }
 }
+mod signal_senders {
+    use super::*;
+    const USR1: u64 = 1 << 9;
+    /// Blocks SIGUSR1, so that it stays pending where the test can see it.
+    fn block(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) {
+        m.write_u64(GuestAddr(DATA + 512), USR1).unwrap();
+        assert_eq!(syscall(k, t, m, 14, [0, DATA + 512, 0, 8, 0, 0]), 0);
+    }
+    /// Takes the pending SIGUSR1 with rt_sigtimedwait (no wait) and returns
+    /// its si_code and si_pid.
+    fn take(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> (i32, u32) {
+        m.write(
+            GuestAddr(DATA),
+            &[USR1, 0, 0].map(u64::to_le_bytes).concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            syscall(k, t, m, 128, [DATA, DATA + 64, DATA + 8, 8, 0, 0]),
+            10
+        );
+        let word = |at: u64| m.read_u64(GuestAddr(DATA + 64 + at)).unwrap() as u32;
+        (word(8) as i32, word(16))
+    }
+    #[test]
+    fn kill_reports_the_sender() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 62, [1, 10, 0, 0, 0, 0]), 0);
+        assert_eq!(take(&mut k, &mut t, &m), (0, ct.tid));
+        // Sent to its own group, the parent hears from the child as well.
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 62, [0, 10, 0, 0, 0, 0]), 0);
+        assert_eq!(take(&mut k, &mut t, &m), (0, ct.tid));
+        assert_eq!(take(&mut c, &mut ct, &cm), (0, ct.tid));
+        // To itself, the sender is the receiver.
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [1, 10, 0, 0, 0, 0]), 0);
+        assert_eq!(take(&mut k, &mut t, &m), (0, 1));
+    }
+    #[test]
+    fn pidfd_send_signal_reports_the_sender() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let pidfd = syscall(&mut c, &mut ct, &cm, 434, [1, 0, 0, 0, 0, 0]);
+        assert!(pidfd < 1024, "{pidfd:#x}");
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 424, [pidfd, 10, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(take(&mut k, &mut t, &m), (0, ct.tid));
+    }
+    #[test]
+    fn the_parent_death_signal_comes_from_the_parent() {
+        let (mut k, mut t, m) = setup();
+        let (mut p, mut pt, pm) = fork(&mut k, &mut t, &m);
+        let (mut c, mut ct, cm) = fork(&mut p, &mut pt, &pm);
+        block(&mut c, &mut ct, &cm);
+        // PR_SET_PDEATHSIG, SIGUSR1.
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [1, 10, 0, 0, 0, 0]), 0);
+        finish(&mut p, &pt, &pm, ExitStatus::Exited(0));
+        assert_eq!(take(&mut c, &mut ct, &cm), (0, pt.tid));
+    }
+}

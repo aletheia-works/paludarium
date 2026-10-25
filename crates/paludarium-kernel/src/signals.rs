@@ -50,6 +50,8 @@ pub(crate) struct PendingSignal {
     pub timer: Option<TimerSignal>,
     /// The child a SIGCHLD reports on; `code` is its `CLD_*` code.
     pub child: Option<ChildSignal>,
+    /// The process that sent it (`si_pid`), when that is not the receiver.
+    pub sender: Option<u32>,
     /// The discard generation it was sent in ([`Discards`]).
     pub born: u64,
 }
@@ -144,7 +146,8 @@ pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128
         info[24..28].copy_from_slice(&child.status.to_le_bytes());
         info[32..40].copy_from_slice(&(child.cpu / 10_000_000).to_le_bytes());
     } else if signal.code != SI_KERNEL {
-        info[16..20].copy_from_slice(&process.pid.to_le_bytes());
+        let sender = signal.sender.unwrap_or(process.pid);
+        info[16..20].copy_from_slice(&sender.to_le_bytes());
     }
     info
 }
@@ -160,6 +163,7 @@ impl PendingSignal {
             synchronous: false,
             timer: None,
             child: None,
+            sender: None,
             born: generation(),
         }
     }

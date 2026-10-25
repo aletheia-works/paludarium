@@ -73,7 +73,9 @@ config.mounts.push(Mount { host: "/srv/data".into(), guest: b"/work".to_vec() })
 
 - `kill()` はゲストに止まるよう求めます。インタプリタが次に確かめたとき
   （`DEFAULT_BUDGET` ＝ 100,000 命令ごと）に、`SIGKILL` で終わります。
-- `signal(number)` は、ゲストのプロセスに Linux のシグナルを送ります。
+- `signal(number)` は、ゲストのプロセスに Linux のシグナルを送ります。ゲストの外から
+  送るので、PID 名前空間の外の送り主と同じく、`si_code` は `SI_USER`、`si_pid` は 0
+  になります。
 - `is_stopped()` は、ゲストが `SIGSTOP` などのジョブ制御で止まっているかどうかを
   返します。
 - 動かした後、`unimplemented_syscalls()` は、ゲストが呼んで `ENOSYS` が返った

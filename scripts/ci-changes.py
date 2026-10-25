@@ -70,7 +70,7 @@ RULES = (
     ),
     ({"docs"}, ("docs/", ".github/workflows/docs.yml", ".github/workflows/docs-build.yml")),
     # Run by the polyglot lint, which every pull request runs.
-    (NONE, ("scripts/syscall-docs.py",)),
+    (NONE, ("scripts/syscall-docs.py", "scripts/interface-docs.py")),
     # Guests, coverage scripts and their tests are used by the Rust jobs.
     ({"rust"}, ("tests/", "scripts/", "tools/")),
     # Documentation, infrastructure, the other workflows, lint settings and
@@ -138,6 +138,7 @@ def self_test():
         "tests/guests/encodings/observe.c": {"rust"},
         "scripts/coverage-check.py": {"rust"},
         "scripts/syscall-docs.py": NONE,
+        "scripts/interface-docs.py": NONE,
         "deny.toml": {"dependencies"},
         "clippy.toml": {"rust"},
         "mise-tasks/linux-dev.sh": NONE,

@@ -143,8 +143,12 @@ run = "rumdl fmt ."
 description = "Check that the features pages list exactly the implemented system calls (read-only)"
 run = "python3 -B scripts/syscall-docs.py"
 
+[tasks."docs:interfaces"]
+description = "Check the CLI and JavaScript pages against the code, the English pages against the Japanese ones, and links to headings (read-only)"
+run = "python3 -B scripts/interface-docs.py"
+
 [tasks."lint:all"]
-description = "Run all formatters/linters (read-only) — Rust + ShellCheck + actionlint + Ruff + Tombi + rumdl + system-call list"
+description = "Run all formatters/linters (read-only) — Rust + ShellCheck + actionlint + Ruff + Tombi + rumdl + system-call list + documented interfaces"
 depends = [
   "rust:check",
   "shell:check",
@@ -153,6 +157,7 @@ depends = [
   "toml:check",
   "markdown:check",
   "docs:syscalls",
+  "docs:interfaces",
 ]
 
 [tasks."lint:all:fix"]

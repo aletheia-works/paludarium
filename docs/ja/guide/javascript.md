@@ -39,6 +39,9 @@ try {
 - `kill()` は、協調的な `SIGKILL` でゲストに止まるよう求めます。ゲストには自動の
   時間切れがないので、必要なら自分で期限を決め、止まらないときは launcher を
   `dispose()` してください。
+- `diagnostics()` は、launcher の Worker と、共有メモリでの Worker 間の atomics の
+  確認の結果を返します。ホストの設定を確かめるためのもので、形は決めておらず、
+  変わることがあります。
 
 ### run の options
 
@@ -158,4 +161,4 @@ Worker が trap したときは、共有のランタイム全体を捨てます�
 ゲストの Worker の中で WebAssembly のモジュールに変換して、取っておきます。それ以外は
 これまでどおりインタプリタで動き、結果は同じです。測った Node.js の実行では、probe の
 プログラム全体が、JIT ありで約 21 % 速くなりました。
-[テストと検証](../design/quality#jit-とインタプリタ) を見てください。
+[テストと検証](../design/quality#jit-and-the-interpreter) を見てください。

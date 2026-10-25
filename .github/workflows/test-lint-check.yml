@@ -2,7 +2,7 @@ name: Test polyglot lint
 
 # `mise run lint:all` on every pull request, as in the other aletheia-works
 # repositories: rustfmt and clippy, ShellCheck, actionlint, Ruff, Tombi and rumdl,
-# plus the check of the documented system-call list.
+# plus the checks of the documented system-call list and interfaces.
 # ci.yml calls it, so ci-ok includes it. Actions are pinned by commit SHA and the
 # default token is read-only.
 on:

@@ -53,7 +53,15 @@ PALUDARIUM_TEST_NODE=<absolute path to node> cargo test --locked --workspace
 `lint:all` also checks that the system-call tables of the features pages, in
 English and Japanese, list exactly the calls the kernel implements: a new
 system call gets its name in `scripts/syscall-docs.py` and a place in both
-tables.
+tables. It also checks, through `scripts/interface-docs.py`, that the
+command-line pages list exactly the options `crates/paludarium/src/cli.rs`
+parses, that the JavaScript pages name everything
+`packages/paludarium-wasm/index.d.ts` declares, with exactly its run options in
+the table, that every English page has a Japanese page with the same
+headings, and that every link to a heading (`page#section`) resolves. VitePress
+decomposes a heading's text (NFKD) into its id, so a link to a Japanese heading
+with a dakuten such as プ does not match it; give such a heading an explicit
+id, such as `## 確かめたプログラム {#programs-verified}`.
 
 The emulator is correct when it matches native x86-64 Linux. Differential tests,
 line coverage (80% floor), and fuzzing only produce real evidence on x86-64

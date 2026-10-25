@@ -40,6 +40,9 @@ try {
 - `kill()` asks the guest to stop with a cooperative `SIGKILL`. Guests have no
   automatic deadline: set your own and `dispose()` the launcher if a guest does
   not stop.
+- `diagnostics()` resolves to a report on the launcher's Workers and a probe
+  of atomics between them in the shared memory, for checking a host's setup.
+  Its shape is not fixed and may change.
 
 ### Run options
 

@@ -11,10 +11,11 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 
 - `<program>` is a file on the host. Inside the guest it is placed at
   `/<file name>`, and `argv[0]` is the string you gave.
-- `--env KEY=VALUE` adds an environment variable. Repeat it for more.
-- `--mount HOST:GUEST` shows one host directory to the guest at the absolute
-  guest path `GUEST`. Repeat it for more. The guest cannot leave the directory
-  through `..` or symbolic links.
+- `--env KEY=VALUE` (or `--env=KEY=VALUE`) adds an environment variable.
+  Repeat it for more.
+- `--mount HOST:GUEST` (or `--mount=HOST:GUEST`) shows one host directory to
+  the guest at the absolute guest path `GUEST`. Repeat it for more. The guest
+  cannot leave the directory through `..` or symbolic links.
 - `--no-jit` is accepted for compatibility; the native build has no JIT.
 - `--report-enosys` lists, after the run, the system calls the guest called
   that paludarium does not implement (they returned `ENOSYS`), by number.
@@ -25,6 +26,7 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
   Linux's `fs.nr_open`: the guest starts with both limits at most `N` and
   cannot raise them above it (`EPERM`), so opening more files fails with
   `EMFILE`. Without these options there is no limit.
+- `-h`, `--help` print the usage line and exit with status 0.
 - `--` ends the options, so a program name may start with `-`.
 
 ## Exit status

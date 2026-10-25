@@ -398,7 +398,7 @@ kernel.
 - **probe**: a Rust program that checks eight thread and filesystem features
   (a tokio timer, a UNIX socket pair, rayon parallelism, Mutex and Condvar,
   file operations, hard links, symbolic links and `flock`).
-- **aube**: a Node.js package manager written in Rust (v2.8.2). `--version`,
+- **aube**: a Node.js package manager written in Rust (v2.8.3). `--version`,
   `install`, `install --frozen-lockfile` and `list` give the same output and
   exit status as on real Linux.
 - **ripgrep**: a text search tool written in Rust (15.2.0), which runs its

@@ -670,6 +670,62 @@ impl Processes {
             Err(Errno(3))
         }
     }
+    /// `kill(target, number)` from `caller`, as Linux's kill_something_info:
+    /// a positive target is that process (or the process of that thread), 0
+    /// the caller's process group, -1 every process but the first and the
+    /// caller, and any other negative target the group `-target`. Zombies
+    /// count until they are reaped. With no process to send to it is `ESRCH`,
+    /// even for an invalid signal; otherwise a group succeeds if any member
+    /// took the signal, and -1 reports the last error.
+    fn kill(&self, caller: u32, target: i32, number: i32) -> Result<(), Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let pids: Vec<u32> = match target {
+            // A thread's ID names its process, as Linux finds the task and
+            // signals its thread group.
+            pid if pid > 0 => {
+                let pid = pid.cast_unsigned();
+                entries
+                    .iter()
+                    .find(|&(&key, entry)| {
+                        key == pid || (entry.status.is_none() && entry.group.has_member(pid))
+                    })
+                    .map(|(&key, _)| key)
+                    .into_iter()
+                    .collect()
+            }
+            -1 => entries
+                .keys()
+                .copied()
+                .filter(|&pid| pid != 1 && pid != caller)
+                .collect(),
+            i32::MIN => Vec::new(),
+            group => {
+                let pgid = if group == 0 {
+                    entries.get(&caller).ok_or(Errno(3))?.pgid
+                } else {
+                    group.unsigned_abs()
+                };
+                entries
+                    .iter()
+                    .filter(|(_, entry)| entry.pgid == pgid)
+                    .map(|(&pid, _)| pid)
+                    .collect()
+            }
+        };
+        if pids.is_empty() {
+            return Err(Errno(3));
+        }
+        let (mut last, mut delivered) = (Ok(()), false);
+        for pid in pids {
+            last = Self::deliver(&mut entries, pid, number, false);
+            delivered |= last.is_ok();
+        }
+        if delivered && target != -1 {
+            Ok(())
+        } else {
+            last
+        }
+    }
     fn signal(&self, pid: u32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         Self::deliver(&mut entries, pid, number, false)
@@ -892,21 +948,10 @@ impl Kernel {
             302 => self.prlimit(mem, a[0], a[1], a[2], a[3]),
             97 => self.prlimit(mem, 0, a[0], 0, a[1]),
             160 => self.prlimit(mem, 0, a[0], a[1], 0),
-            62 => {
-                if a[1] > 64 {
-                    Err(Errno::EINVAL)
-                } else {
-                    let pid = if a[0] == 0 {
-                        self.process.pid
-                    } else {
-                        match u32::try_from(a[0]) {
-                            Ok(pid) => pid,
-                            Err(_) => return Some(self.return_process_error(thread, Errno(3))),
-                        }
-                    };
-                    self.processes.signal(pid, a[1] as i32).map(|()| 0)
-                }
-            }
+            62 => self
+                .processes
+                .kill(self.process.pid, a[0] as i32, a[1] as i32)
+                .map(|()| 0),
             _ => return None,
         };
         thread.cpu.gpr[reg::RAX] = result.unwrap_or_else(Errno::to_syscall_return);
@@ -1048,10 +1093,6 @@ impl Kernel {
                 .map_err(|_| Errno::EFAULT)?;
         }
         Ok(0)
-    }
-    fn return_process_error(&self, thread: &mut Thread, error: Errno) -> Next {
-        thread.cpu.gpr[reg::RAX] = error.to_syscall_return();
-        Next::Resume
     }
     fn clone_process(
         &mut self,

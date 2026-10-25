@@ -241,6 +241,12 @@ kernel.
   runs. The first process itself links a group of its children as any parent
   does: Linux leaves out only the children of the global init, and the first
   process acts as the init of a PID namespace, as in a container.
+- `kill` reaches a process by its PID or by the ID of one of its threads, the
+  caller's process group with 0, another group with `-pgid`, and every
+  process but the first one and the caller with -1, as Linux's
+  `kill_something_info` does. A process that has exited counts until it is
+  reaped. With no process to send to, `kill` gives `ESRCH`, even for an
+  invalid signal; otherwise an invalid signal gives `EINVAL`.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's

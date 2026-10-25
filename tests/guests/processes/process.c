@@ -1251,6 +1251,73 @@ int main(int argc, char **argv) {
         result("stopped-own-group", WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status));
         return 0;
     }
+    if (!strcmp(mode, "kill-group")) {
+        /* kill(0) signals the caller's whole group, kill(-pgid) another
+           group and kill(-1) every other process; a target with no process
+           is ESRCH, even for an invalid signal, and a zombie still counts.
+           The test runs in a group of its own, so that kill(0) reaches
+           nothing outside it. Bit 0 of a pending set is SIGUSR1, bit 1
+           SIGUSR2; both stay blocked. */
+        pid_t leader = child();
+        if (leader == 0) {
+            setpgid(0, 0);
+            sigset_t usr;
+            sigemptyset(&usr);
+            sigaddset(&usr, SIGUSR1);
+            sigaddset(&usr, SIGUSR2);
+            sigprocmask(SIG_BLOCK, &usr, NULL);
+            int ready[2], go[2][2], seen[2];
+            if (pipe(ready) || pipe(go[0]) || pipe(go[1]) || pipe(seen)) _exit(80);
+            pid_t members[2];
+            for (int i = 0; i < 2; i++) {
+                members[i] = child();
+                if (members[i] == 0) {
+                    /* The second member leads a group of its own. */
+                    if (i == 1) setpgid(0, 0);
+                    char byte = 0;
+                    if (write(ready[1], &byte, 1) != 1) _exit(81);
+                    if (read(go[i][0], &byte, 1) != 1) _exit(82);
+                    sigset_t set;
+                    sigpending(&set);
+                    int bits = sigismember(&set, SIGUSR1) | sigismember(&set, SIGUSR2) << 1;
+                    if (write(seen[1], &bits, sizeof bits) != sizeof bits) _exit(83);
+                    _exit(0);
+                }
+            }
+            char byte = 0;
+            for (int i = 0; i < 2; i++)
+                if (read(ready[0], &byte, 1) != 1) _exit(84);
+            result("own-group", kill(0, SIGUSR1));
+            result("other-group", kill(-members[1], SIGUSR2));
+            result("everyone", kill(-1, 0));
+            result("no-group", kill(-members[0], 0) == -1 ? errno : 0);
+            result("no-group-bad-signal", kill(-members[0], 65) == -1 ? errno : 0);
+            result("group-bad-signal", kill(-members[1], 65) == -1 ? errno : 0);
+            result("int-min", kill(INT_MIN, 0) == -1 ? errno : 0);
+            sigset_t set;
+            sigpending(&set);
+            result("leader-pending", sigismember(&set, SIGUSR1) | sigismember(&set, SIGUSR2) << 1);
+            for (int i = 0; i < 2; i++) {
+                int bits = -1;
+                if (write(go[i][1], &byte, 1) != 1) _exit(85);
+                if (read(seen[0], &bits, sizeof bits) != sizeof bits) _exit(86);
+                result(i ? "other-member-pending" : "member-pending", bits);
+                waitpid(members[i], NULL, 0);
+            }
+            pid_t zombie = child();
+            if (zombie == 0) _exit(0);
+            siginfo_t info;
+            waitid(P_PID, zombie, &info, WEXITED | WNOWAIT);
+            result("zombie", kill(zombie, SIGUSR1));
+            waitpid(zombie, NULL, 0);
+            result("reaped-bad-signal", kill(zombie, 65) == -1 ? errno : 0);
+            fflush(stdout);
+            _exit(0);
+        }
+        int status;
+        if (waitpid(leader, &status, 0) != leader) return 96;
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 97;
+    }
     if (!strcmp(mode, "waitid")) {
         siginfo_t info;
         pid_t pid = child();

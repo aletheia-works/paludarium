@@ -602,22 +602,6 @@ impl Kernel {
                     Some(deadline),
                 )
             }
-            62 => {
-                if a[1] > 64 {
-                    Err(Errno::EINVAL)
-                } else if a[0] != 0 && a[0] != u64::from(self.process.pid) {
-                    Err(Errno(3))
-                } else if a[1] == 0 {
-                    Ok(0)
-                } else {
-                    self.group
-                        .process_inbox
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .send(a[1] as i32)
-                        .map(|()| 0)
-                }
-            }
             200 | 234 => {
                 let (tid, number) = if n == 234 {
                     if a[0] != u64::from(self.process.pid) {

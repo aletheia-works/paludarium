@@ -18,6 +18,9 @@ CI run produces them afresh on an x86-64 Linux runner.
 - New instructions and system calls get their test cases, and the result on
   real Linux, before they are implemented.
 - Each case has a 30-second timeout.
+- A test checks that `diff_processes` runs exactly the process cases that
+  `tests/guests/processes/cases.json` lists, so that a case cannot be listed
+  and never run.
 
 ## Fuzzing
 

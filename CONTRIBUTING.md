@@ -50,6 +50,10 @@ PALUDARIUM_TEST_NODE=<absolute path to node> cargo test --locked --workspace
 
 `mise run lint:all` runs the first two and `mise run test` the unit tests;
 `mise tasks` lists the other checks (differential tests, coverage, fuzzing).
+A new process case is a mode of `tests/guests/processes/process.c`, listed in
+`tests/guests/processes/cases.json` and in the `cases!` list of
+`crates/paludarium-harness/tests/diff_processes.rs`; a test fails when the two
+lists differ.
 `lint:all` also checks that the system-call tables of the features pages, in
 English and Japanese, list exactly the calls the kernel implements: a new
 system call gets its name in `scripts/syscall-docs.py` and a place in both

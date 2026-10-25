@@ -38,7 +38,8 @@ verified.
 - **Some signal details**: no core file is written, so a child killed by `SIGSEGV`,
   `SIGABRT` or another core-dumping signal is reported as `CLD_KILLED`,
   without the core flag in its `wait` status, where Linux may report
-  `CLD_DUMPED`.
+  `CLD_DUMPED`. A signal sent with `kill` reports the receiving process's PID
+  in `si_pid`, where Linux reports the sender's.
 - **Orphaned processes**: the first process adopts orphans as the init of a
   PID namespace does, but when it exits the other processes are not killed,
   as they are when such an init exits on Linux. They keep running with the

@@ -105,12 +105,11 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 55] = [
+        let entries: [(u64, Handler); 54] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
             (nr::GETTID, sys_getpid),
-            (nr::KILL, sys_kill),
             (nr::TKILL, sys_tkill),
             (nr::TGKILL, sys_tgkill),
             (nr::CLOCK_GETTIME, sys_clock_gettime),
@@ -761,17 +760,6 @@ fn send_signal(c: &mut Context<'_>, target: u64, signal: signals::PendingSignal)
     }
     signals::queue(c.process, signal);
     ok(0)
-}
-fn sys_kill(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    send_signal(
-        c,
-        if a[0] == 0 {
-            u64::from(c.process.pid)
-        } else {
-            a[0]
-        },
-        signals::PendingSignal::user(i32::try_from(a[1]).unwrap_or(-1), 0),
-    )
 }
 fn sys_tkill(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     send_signal(

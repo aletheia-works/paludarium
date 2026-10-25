@@ -32,6 +32,38 @@ fn runner_ready() {
     support::bounded("runner_ready", || {});
 }
 
+/// The tests below run exactly the cases of `tests/guests/processes/cases.json`,
+/// so that a case cannot be listed there and never run.
+#[test]
+fn every_listed_case_runs() {
+    let listed = std::fs::read_to_string(
+        paludarium_harness::workspace_root().join("tests/guests/processes/cases.json"),
+    )
+    .unwrap();
+    let mut listed: Vec<_> = listed
+        .split("{\"name\":\"")
+        .skip(1)
+        .map(|case| {
+            let (name, rest) = case.split_once("\",\"binary\":\"").unwrap();
+            (name.to_owned(), rest.split_once('"').unwrap().0.to_owned())
+        })
+        .collect();
+    let source = include_str!("diff_processes.rs");
+    let tests = source.split_once("cases!(\n").unwrap().1;
+    let mut run: Vec<_> = tests
+        .lines()
+        .map_while(|line| line.split_once("=> (\""))
+        .map(|(_, case)| {
+            let (name, rest) = case.split_once("\",\"").unwrap();
+            (name.to_owned(), rest.split_once('"').unwrap().0.to_owned())
+        })
+        .collect();
+    assert!(!listed.is_empty());
+    listed.sort();
+    run.sort();
+    assert_eq!(listed, run);
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux {
     use super::support;
@@ -132,6 +164,11 @@ mod linux {
         processes_poll => ("poll","process"),
         processes_proc_status => ("proc-status","process"),
         processes_waitid => ("waitid","process"),
+        processes_autoreap => ("autoreap","process"),
+        processes_reparent => ("reparent","process"),
+        processes_orphaned_group => ("orphaned-group","process"),
+        processes_kill_group => ("kill-group","process"),
+        processes_ignore_discards => ("ignore-discards","process"),
         processes_thread_name => ("thread-name","process"),
         processes_timer_thread => ("timer-thread","process"),
         processes_clone3 => ("clone3","process"),

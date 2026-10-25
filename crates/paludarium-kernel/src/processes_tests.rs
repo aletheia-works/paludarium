@@ -405,7 +405,8 @@ mod process {
         assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [2, ct.tid, 9]));
         // A stop and a continue, each with its CLD_* code.
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
-        syscall(&mut c, &mut ct, &cm, 62, [0, 19, 0, 0, 0, 0]);
+        let own = u64::from(ct.tid);
+        syscall(&mut c, &mut ct, &cm, 62, [own, 19, 0, 0, 0, 0]);
         assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [5, ct.tid, 19]));
         syscall(&mut k, &mut t, &m, 62, [u64::from(ct.tid), 18, 0, 0, 0, 0]);
         assert_eq!(take_sigchld(&mut k, &mut t, &m), (17, [6, ct.tid, 18]));
@@ -422,7 +423,8 @@ mod process {
             0
         );
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
-        syscall(&mut c, &mut ct, &cm, 62, [0, 19, 0, 0, 0, 0]);
+        let own = u64::from(ct.tid);
+        syscall(&mut c, &mut ct, &cm, 62, [own, 19, 0, 0, 0, 0]);
         assert_eq!(take_sigchld(&mut k, &mut t, &m).0, none);
         syscall(&mut k, &mut t, &m, 62, [u64::from(ct.tid), 18, 0, 0, 0, 0]);
         assert_eq!(take_sigchld(&mut k, &mut t, &m).0, none);
@@ -720,7 +722,7 @@ mod process {
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         let pid = u64::from(ct.tid);
         // The child stops itself; only WUNTRACED sees it, once.
-        syscall(&mut c, &mut ct, &cm, 62, [0, 19, 0, 0, 0, 0]);
+        syscall(&mut c, &mut ct, &cm, 62, [pid, 19, 0, 0, 0, 0]);
         assert!(c.group.is_stopped());
         assert_eq!(syscall(&mut k, &mut t, &m, 61, [pid, DATA, 1, 0, 0, 0]), 0);
         assert_eq!(
@@ -1264,7 +1266,8 @@ mod orphaned_groups {
         gm.write_u64(GuestAddr(DATA + 512), SIGHUP | SIGCONT)
             .unwrap();
         syscall(&mut g, &mut gt, &gm, 14, [0, DATA + 512, 0, 8, 0, 0]);
-        syscall(&mut g, &mut gt, &gm, 62, [0, 19, 0, 0, 0, 0]);
+        let own = u64::from(gt.tid);
+        syscall(&mut g, &mut gt, &gm, 62, [own, 19, 0, 0, 0, 0]);
         finish(&mut z, &zt, &zm, ExitStatus::Exited(0));
         assert!(g.group.is_stopped());
         let ignore = [1u64, 0, 0, 0].map(u64::to_le_bytes).concat();
@@ -1289,9 +1292,135 @@ mod orphaned_groups {
         let (mut k, mut t, m) = setup();
         let [_, (mut e, mut et, em)] = session_with_group(&mut k, &mut t, &m);
         let (mut g, mut gt, gm) = fork(&mut e, &mut et, &em);
-        syscall(&mut g, &mut gt, &gm, 62, [0, 19, 0, 0, 0, 0]);
+        let own = u64::from(gt.tid);
+        syscall(&mut g, &mut gt, &gm, 62, [own, 19, 0, 0, 0, 0]);
         finish(&mut e, &et, &em, ExitStatus::Exited(0));
         assert!(!g.group.is_stopped());
         assert_eq!(pending(&mut g, &mut gt, &gm), SIGHUP | SIGCONT);
+    }
+}
+mod kill_targets {
+    use super::*;
+    const USR1: u64 = 1 << 9;
+    fn block(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) {
+        m.write_u64(GuestAddr(DATA + 512), USR1).unwrap();
+        assert_eq!(syscall(k, t, m, 14, [0, DATA + 512, 0, 8, 0, 0]), 0);
+    }
+    fn pending(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> u64 {
+        assert_eq!(syscall(k, t, m, 127, [DATA + 520, 8, 0, 0, 0, 0]), 0);
+        m.read_u64(GuestAddr(DATA + 520)).unwrap()
+    }
+    fn kill(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, target: i32, number: u64) -> u64 {
+        syscall(k, t, m, 62, [i64::from(target) as u64, number, 0, 0, 0, 0])
+    }
+    fn esrch() -> u64 {
+        Errno(3).to_syscall_return()
+    }
+    /// The first process with SIGUSR1 blocked, a child `c` in its group and
+    /// a child `o` that leads a group of its own; both inherit the mask.
+    fn family() -> [(Box<Kernel>, Thread, Arc<AddressSpace>); 3] {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m);
+        let (c, ct, cm) = fork(&mut k, &mut t, &m);
+        let (mut o, mut ot, om) = fork(&mut k, &mut t, &m);
+        assert_eq!(syscall(&mut o, &mut ot, &om, 109, [0; 6]), 0);
+        [(Box::new(k), t, Arc::new(m)), (c, ct, cm), (o, ot, om)]
+    }
+    #[test]
+    fn zero_signals_the_whole_group_of_the_caller() {
+        let [(mut k, mut t, m), (mut c, mut ct, cm), (mut o, mut ot, om)] = family();
+        assert_eq!(kill(&mut c, &mut ct, &cm, 0, 10), 0);
+        assert_eq!(pending(&mut k, &mut t, &m), USR1);
+        assert_eq!(pending(&mut c, &mut ct, &cm), USR1);
+        assert_eq!(pending(&mut o, &mut ot, &om), 0);
+    }
+    #[test]
+    fn a_negative_target_names_a_group() {
+        let [(mut k, mut t, m), (mut c, mut ct, cm), (mut o, mut ot, om)] = family();
+        let group = -(ot.tid as i32);
+        assert_eq!(kill(&mut k, &mut t, &m, group, 0), 0);
+        assert_eq!(kill(&mut k, &mut t, &m, group, 10), 0);
+        assert_eq!(pending(&mut o, &mut ot, &om), USR1);
+        assert_eq!(pending(&mut k, &mut t, &m), 0);
+        assert_eq!(pending(&mut c, &mut ct, &cm), 0);
+        // A process that leads no group names none, whatever the signal.
+        let none = -(ct.tid as i32);
+        assert_eq!(kill(&mut k, &mut t, &m, none, 10), esrch());
+        assert_eq!(kill(&mut k, &mut t, &m, none, 65), esrch());
+        assert_eq!(
+            kill(&mut k, &mut t, &m, group, 65),
+            Errno::EINVAL.to_syscall_return()
+        );
+        assert_eq!(kill(&mut k, &mut t, &m, i32::MIN, 0), esrch());
+    }
+    #[test]
+    fn minus_one_signals_all_but_the_first_process_and_the_caller() {
+        let [(mut k, mut t, m), (mut c, mut ct, cm), (mut o, mut ot, om)] = family();
+        assert_eq!(kill(&mut c, &mut ct, &cm, -1, 10), 0);
+        assert_eq!(pending(&mut o, &mut ot, &om), USR1);
+        assert_eq!(pending(&mut k, &mut t, &m), 0);
+        assert_eq!(pending(&mut c, &mut ct, &cm), 0);
+        assert_eq!(kill(&mut k, &mut t, &m, -1, 10), 0);
+        assert_eq!(pending(&mut c, &mut ct, &cm), USR1);
+        assert_eq!(pending(&mut k, &mut t, &m), 0);
+        // With nobody else, there is no process to send to.
+        let (mut k, mut t, m) = setup();
+        assert_eq!(kill(&mut k, &mut t, &m, -1, 0), esrch());
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(kill(&mut c, &mut ct, &cm, -1, 0), esrch());
+    }
+    #[test]
+    fn a_missing_process_is_esrch_before_an_invalid_signal() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(kill(&mut k, &mut t, &m, 99, 65), esrch());
+        // A signal that is negative as an int is as invalid as one past 64.
+        for number in [65, u64::from(u32::MAX), u64::MAX] {
+            assert_eq!(
+                kill(&mut k, &mut t, &m, 1, number),
+                Errno::EINVAL.to_syscall_return()
+            );
+        }
+    }
+    #[test]
+    fn the_target_and_the_signal_are_32_bit() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m);
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                62,
+                [0xffff_ffff_0000_0001, 1 << 32 | 10, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(pending(&mut k, &mut t, &m), USR1);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 62, [0xffff_fffe, 0, 0, 0, 0, 0]),
+            esrch()
+        );
+    }
+    #[test]
+    fn a_thread_id_names_its_process() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        // CLONE_VM | CLONE_SIGHAND | CLONE_THREAD.
+        let tid = syscall(&mut k, &mut t, &m, 56, [0x10900, 0, 0, 0, 0, 0]);
+        assert!(tid > u64::from(ct.tid), "{tid:#x}");
+        assert_eq!(kill(&mut c, &mut ct, &cm, tid as i32, 10), 0);
+        assert_eq!(pending(&mut k, &mut t, &m), USR1);
+    }
+    #[test]
+    fn a_zombie_still_counts() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 109, [0; 6]), 0);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        let pid = ct.tid as i32;
+        assert_eq!(kill(&mut k, &mut t, &m, pid, 10), 0);
+        assert_eq!(kill(&mut k, &mut t, &m, -pid, 10), 0);
+        assert_eq!(kill(&mut k, &mut t, &m, -1, 10), 0);
     }
 }

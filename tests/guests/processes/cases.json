@@ -38,6 +38,7 @@
     {"name":"autoreap","binary":"process"},
     {"name":"reparent","binary":"process"},
     {"name":"orphaned-group","binary":"process"},
+    {"name":"kill-group","binary":"process"},
     {"name":"ignore-discards","binary":"process"},
     {"name":"thread-name","binary":"process"},
     {"name":"timer-thread","binary":"process"},

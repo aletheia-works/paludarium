@@ -1549,11 +1549,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         (1034, Some(memfd)) => Ok(u64::from(memfd.seals())),
                         (1033, Some(memfd)) => {
                             let key = (crate::memfd::DEVICE, d.file.stat()?.inode);
-                            let mapped = c
-                                .files
-                                .caches
-                                .find(key)
-                                .is_some_and(|cache| cache.mapped_writable());
+                            let caches = &c.files.caches;
+                            let mapped = || {
+                                caches
+                                    .find(key)
+                                    .is_some_and(|cache| cache.mapped_writable())
+                            };
                             memfd.add_seals(d.file.flags() & 3 != 0, a[2] as u32, mapped)?;
                             Ok(0)
                         }

@@ -1254,7 +1254,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 && flags & MAP_SHARED != 0
             {
                 // The mapping shows the file's page cache.
-                if let Err(error) = share_file(c, d, file, a, len, offset) {
+                if let Err(error) = share_file(c, d, file, a, len, offset, prot) {
                     let _ = c.mem.unmap_shared(a, len);
                     return err(error);
                 }
@@ -1342,8 +1342,18 @@ fn share_file(
     at: GuestAddr,
     len: u64,
     offset: u64,
+    prot: Prot,
 ) -> Result<(), Errno> {
     let len = GuestAddr(len).page_align_up().ok_or(Errno::ENOMEM)?.0;
+    // A memfd's seals stay as they are until the mapping counts among the
+    // writable ones; one added since `check_mappable` refuses it now.
+    let memfd = file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>());
+    let _sealing = memfd.map(crate::memfd::Memfd::lock_seals);
+    if prot.contains(Prot::WRITE) && write_sealed(file.as_ref()) {
+        return Err(Errno::EPERM);
+    }
     let may_write = file.flags() & 3 == 2 && !write_sealed(file.as_ref());
     let key = (crate::files::descriptor_device(c, d), file.stat()?.inode);
     let cache = c.files.caches.cache(key, c.mem.memory_meter());

@@ -1431,8 +1431,10 @@ fn memfd_shared_mapping_and_the_write_seal() {
     let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 1, fd, 0]);
     f.mem.write(GuestAddr(at), b"seal").unwrap();
     assert_eq!(file_bytes(&mut f, fd, 0, 4), b"seal");
-    // F_SEAL_WRITE waits for the writable mapping to go.
+    // F_SEAL_WRITE waits for the writable mapping to go, and so does
+    // F_SEAL_EXEC, which seals writes too on an executable memfd.
     assert_eq!(f.ret(72, &[fd, 1033, 8]), errno(Errno(16)));
+    assert_eq!(f.ret(72, &[fd, 1033, 0x20]), errno(Errno(16)));
     assert_eq!(f.ret(11, &[at, 4096]), 0);
     assert_eq!(f.ret(72, &[fd, 1033, 8]), 0);
     assert_eq!(

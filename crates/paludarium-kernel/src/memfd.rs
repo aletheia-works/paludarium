@@ -65,10 +65,10 @@ impl Memfd {
         self.seals.load(Ordering::SeqCst)
     }
     /// `F_ADD_SEALS` through a descriptor open for writing or not, in the
-    /// order of Linux's memfd_add_seals. `F_SEAL_WRITE` is refused (`EBUSY`)
-    /// while a shared mapping that may write (`mapped_writable`) shows the
-    /// file. `F_SEAL_EXEC` on a file with an execute bit also seals writes
-    /// and the size, so that it stays W^X.
+    /// order of Linux's memfd_add_seals. `F_SEAL_EXEC` on a file with an
+    /// execute bit also seals writes and the size, so that it stays W^X.
+    /// Then sealing writes is refused (`EBUSY`) while a shared mapping that
+    /// may write (`mapped_writable`) shows the file.
     pub(crate) fn add_seals(
         &self,
         writable: bool,
@@ -85,12 +85,12 @@ impl Memfd {
         if current & F_SEAL_SEAL != 0 {
             return Err(Errno::EPERM);
         }
-        if seals & F_SEAL_WRITE != 0 && current & F_SEAL_WRITE == 0 && mapped_writable {
-            return Err(Errno(16)); // EBUSY
-        }
         let mut seals = seals;
         if seals & F_SEAL_EXEC != 0 && self.file.stat()?.mode & 0o111 != 0 {
             seals |= F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+        }
+        if seals & F_SEAL_WRITE != 0 && current & F_SEAL_WRITE == 0 && mapped_writable {
+            return Err(Errno(16)); // EBUSY
         }
         self.seals
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {

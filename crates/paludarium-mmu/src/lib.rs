@@ -285,7 +285,8 @@ type Frame = Arc<OnceLock<FrameBytes>>;
 #[derive(Clone)]
 pub struct SharedPages {
     frames: Arc<Mutex<BTreeMap<u64, Frame>>>,
-    /// Bumped on every store to the frames, through a mapping or not.
+    /// Bumped by every store to the frames: before and after one through a
+    /// mapping, and by those of the kernel ([`Self::store`], [`Self::zero`]).
     generation: Arc<AtomicU64>,
     /// Held only to keep the owner alive.
     _owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
@@ -897,6 +898,11 @@ impl AddressSpaceData {
                     d.store(*s, Ordering::Relaxed);
                 }
                 frame.dirty.store(true, Ordering::Release);
+                // Again once the page is dirty, so that a write-back that ran
+                // between the bumps sees the generation change after it.
+                if let Some(mapping) = self.shared_at(page) {
+                    mapping.pages.generation.fetch_add(1, Ordering::Release);
+                }
             }
         }
         Ok(())

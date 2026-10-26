@@ -736,7 +736,8 @@ int main(int argc, char **argv) {
         munmap(view, 4096);
         pread(fd, buf, 1, 0);
         printf("protected=%c\n", buf[0]);
-        /* A memfd: F_SEAL_WRITE waits for its writable mappings to go. */
+        /* A memfd: F_SEAL_WRITE waits for its writable mappings to go, and
+           so does F_SEAL_EXEC, which seals writes too on an executable one. */
         int memfd = memfd_create("shared", MFD_ALLOW_SEALING);
         ftruncate(memfd, 4096);
         char *shm = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, memfd, 0);
@@ -745,6 +746,7 @@ int main(int argc, char **argv) {
         pread(memfd, buf, 5, 0);
         printf("memfd=%s\n", buf);
         outcome("seal-mapped", fcntl(memfd, F_ADD_SEALS, F_SEAL_WRITE));
+        outcome("seal-exec-mapped", fcntl(memfd, F_ADD_SEALS, 0x20 /* F_SEAL_EXEC */));
         munmap(shm, 4096);
         outcome("seal", fcntl(memfd, F_ADD_SEALS, F_SEAL_WRITE));
         errno = 0;

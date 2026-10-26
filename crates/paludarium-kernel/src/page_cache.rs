@@ -72,7 +72,8 @@ impl PageCaches {
     fn any(&self) -> bool {
         self.live.load(Ordering::SeqCst) != 0
     }
-    /// Writes every cache back (`msync`, a process's exit).
+    /// Writes every cache back (`msync`): all of them, even after one fails,
+    /// and gives the first error.
     pub(crate) fn write_back_all(&self) -> Result<(), Errno> {
         if !self.any() {
             return Ok(());
@@ -84,9 +85,13 @@ impl PageCaches {
             .values()
             .filter_map(Weak::upgrade)
             .collect();
-        caches
-            .iter()
-            .try_for_each(|cache| cache.write_back().map(|_| ()))
+        let mut first = Ok(());
+        for cache in &caches {
+            if let Err(error) = cache.write_back() {
+                first = first.and(Err(error));
+            }
+        }
+        first
     }
 }
 
@@ -101,7 +106,9 @@ pub(crate) struct FileCache {
     extent: AtomicU64,
     /// The mappings that may write, which `F_SEAL_WRITE` refuses to seal.
     writable: AtomicUsize,
-    /// The pages' generation when they were last written back.
+    /// The pages' generation when they were last written back: a store
+    /// bumps it again after it marks its page dirty, so a store that a
+    /// write-back missed always leaves it behind.
     clean: AtomicU64,
     meter: Option<Arc<MemoryMeter>>,
     caches: Arc<PageCaches>,
@@ -109,9 +116,18 @@ pub(crate) struct FileCache {
 
 impl Drop for FileCache {
     fn drop(&mut self) {
-        // The last mapping went away: its stores reach the file now.
+        // The last mapping went away: its stores reach the file now. The
+        // table stays locked meanwhile, so that a new mapping or a read of
+        // the file, which finds no cache, waits for them. Nothing drops a
+        // cache with the table locked.
+        let files = self
+            .caches
+            .files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let _ = self.write_back();
         self.caches.live.fetch_sub(1, Ordering::SeqCst);
+        drop(files);
     }
 }
 

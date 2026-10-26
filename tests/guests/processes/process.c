@@ -1131,6 +1131,23 @@ int main(int argc, char **argv) {
         outcome("high-bad-fd", receive_from(999, high - 1, 2, 0, NULL, NULL));
         outcome("high-too-long", send_to(stream[0], high, 1, 0, &address, 129));
         outcome("unmapped-too-long", send_to(stream[0], high - 1, 1, 0, &address, 129));
+        /* A stream's address and a datagram's form and size are checked
+           before the data is copied, and a datagram's peer is looked up
+           after. */
+        char *unmapped = (char *)8;
+        outcome("unmapped-stream", send_to(stream[0], unmapped, 1, 0, &address, sizeof address));
+        outcome("unmapped-family", send_to(datagram[0], unmapped, 1, 0, &address, 2));
+        outcome("unmapped-huge", send_to(datagram[0], unmapped, 1 << 20, 0, &address, sizeof address));
+        outcome("unmapped-datagram", send_to(datagram[0], unmapped, 1, 0, &address, sizeof address));
+        struct iovec unmapped_iov = {unmapped, 1};
+        struct msghdr unmapped_message = {
+            .msg_name = &address, .msg_namelen = sizeof address,
+            .msg_iov = &unmapped_iov, .msg_iovlen = 1,
+        };
+        errno = 0;
+        outcome("unmapped-message", sendmsg(datagram[0], &unmapped_message, 0));
+        errno = 0;
+        outcome("unmapped-stream-message", sendmsg(stream[0], &unmapped_message, 0));
         return 0;
     }
     if (!strcmp(mode, "scm-rights")) {

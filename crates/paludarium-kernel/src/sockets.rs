@@ -293,7 +293,14 @@ fn message_header(c: &Context<'_>, at: u64, write: bool) -> Result<MessageHeader
     if word(24) > 1024 {
         return Err(Errno(90)); // EMSGSIZE
     }
-    let iov = crate::files::iovecs(c, word(16), word(24), write)?;
+    // recvmsg sees that its buffers can be written before it takes the data,
+    // which a failed copy would leave in place. sendmsg's are only checked as
+    // access_ok does, as they are copied after the address is checked.
+    let iov = if write {
+        crate::files::iovecs(c, word(16), word(24), true)?
+    } else {
+        crate::files::iovecs_checked(c, word(16), word(24), access_ok)?
+    };
     Ok(MessageHeader {
         name: (name != 0 && name_len != 0).then_some((name, name_len)),
         has_name: name != 0,
@@ -350,16 +357,11 @@ fn passed_descriptors(c: &Context<'_>, control: &[u8]) -> Result<Passed, Errno> 
     }
     Ok(passed)
 }
-/// The error of a datagram sent to `address`, as Linux's `unix_dgram_sendmsg`
-/// finds it: an address that is not `AF_UNIX` with a path is EINVAL, and as
-/// no socket can be bound, any other names no socket: ECONNREFUSED, or the
-/// error of looking up a path that is not there.
+/// The error of a datagram sent to a valid `address`, as Linux's
+/// `unix_find_other` finds it after the data is copied: as no socket can be
+/// bound, every address names none, so ECONNREFUSED, or the error of looking
+/// up a path that is not there.
 fn unreachable_address(c: &Context<'_>, address: &[u8]) -> Errno {
-    // unix_validate_addr: more than the family, at most sockaddr_un's 110
-    // bytes, and AF_UNIX.
-    if address.len() <= 2 || address.len() > 110 || address[..2] != [1, 0] {
-        return Errno::EINVAL;
-    }
     let path = &address[2..];
     // An abstract name starts with a NUL byte.
     if path[0] == 0 {
@@ -374,14 +376,26 @@ fn unreachable_address(c: &Context<'_>, address: &[u8]) -> Errno {
         Err(e) => e,
     }
 }
-/// A send to `address` on a pair: a connected stream socket takes none
-/// (EISCONN), `unix_seqpacket_sendmsg` ignores it, and a datagram's names no
-/// peer.
-fn check_address(c: &Context<'_>, socket: &SocketPairEnd, address: &[u8]) -> Result<(), Errno> {
+/// What a send of `len` bytes to `address` checks before the data is copied:
+/// a connected stream socket takes no address (EISCONN) and
+/// `unix_seqpacket_sendmsg` ignores it, while `unix_dgram_sendmsg` checks it
+/// with `unix_validate_addr` (EINVAL) and then the size (EMSGSIZE). Returns
+/// whether the address is still to be looked up, after the copy.
+fn check_address(socket: &SocketPairEnd, address: &[u8], len: usize) -> Result<bool, Errno> {
     match socket.pair.kind {
         SOCK_STREAM => Err(Errno(106)), // EISCONN
-        SOCK_SEQPACKET => Ok(()),
-        _ => Err(unreachable_address(c, address)),
+        SOCK_SEQPACKET => Ok(false),
+        _ => {
+            // More than the family, at most sockaddr_un's 110 bytes, and
+            // AF_UNIX.
+            if address.len() <= 2 || address.len() > 110 || address[..2] != [1, 0] {
+                return Err(Errno::EINVAL);
+            }
+            if len > MAX_MESSAGE {
+                return Err(Errno(90)); // EMSGSIZE
+            }
+            Ok(true)
+        }
     }
 }
 /// `TASK_SIZE_MAX` on x86-64: the end of the user half, less a guard page.
@@ -391,11 +405,17 @@ const TASK_SIZE_MAX: u64 = 0x7fff_ffff_f000;
 /// when it reaches past the user half (`access_ok`). A buffer there that is
 /// not mapped is EFAULT only when it is copied.
 fn user_buffer(at: u64, len: u64) -> Result<usize, Errno> {
-    let len = len.min(0x7fff_f000);
-    if at > TASK_SIZE_MAX - len {
+    let len = usize::try_from(len.min(0x7fff_f000)).map_err(|_| Errno::EFAULT)?;
+    access_ok(at, len)?;
+    Ok(len)
+}
+/// Linux's `access_ok`: EFAULT for `len` bytes at `at` that reach past the
+/// user half.
+fn access_ok(at: u64, len: usize) -> Result<(), Errno> {
+    if at > TASK_SIZE_MAX.saturating_sub(len as u64) {
         return Err(Errno::EFAULT);
     }
-    usize::try_from(len).map_err(|_| Errno::EFAULT)
+    Ok(())
 }
 /// `sendto(fd, buf, len, flags, addr, addrlen)` on a socket pair: sendmsg
 /// with one buffer and no control messages. As `move_addr_to_kernel`, an
@@ -418,6 +438,8 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .read(GuestAddr(a[4]), &mut address)
             .map_err(|_| Errno::EFAULT)?;
     }
+    let socket = as_socket(&file)?;
+    let lookup = !address.is_empty() && check_address(socket, &address, len)?;
     c.mem
         .check_read(GuestAddr(a[1]), len)
         .map_err(|_| Errno::EFAULT)?;
@@ -427,9 +449,8 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     c.mem
         .read(GuestAddr(a[1]), &mut bytes)
         .map_err(|_| Errno::EFAULT)?;
-    let socket = as_socket(&file)?;
-    if !address.is_empty() {
-        check_address(c, socket, &address)?;
+    if lookup {
+        return Err(unreachable_address(c, &address));
     }
     crate::files::write_with(
         c,
@@ -496,16 +517,6 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .read(GuestAddr(name), &mut address)
             .map_err(|_| Errno::EFAULT)?;
     }
-    let total = header.iov.iter().map(|(_, len)| len).sum::<usize>();
-    let mut bytes = Vec::new();
-    bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
-    for &(base, len) in &header.iov {
-        let start = bytes.len();
-        bytes.resize(start + len, 0);
-        c.mem
-            .read(GuestAddr(base), &mut bytes[start..])
-            .map_err(|_| Errno::EFAULT)?;
-    }
     // ____sys_sendmsg: a control buffer past INT_MAX, or one that
     // sock_kmalloc refuses, is ENOBUFS.
     if header.control_len >= MAX_CONTROL {
@@ -517,8 +528,21 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .map_err(|_| Errno::EFAULT)?;
     let mut passed = passed_descriptors(c, &control)?;
     let socket = as_socket(&file)?;
-    if header.name.is_some() {
-        check_address(c, socket, &address)?;
+    let total = header.iov.iter().map(|(_, len)| len).sum::<usize>();
+    // The address is checked, and the data then copied, in the protocol's
+    // sendmsg after __scm_send.
+    let lookup = header.name.is_some() && check_address(socket, &address, total)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
+    for &(base, len) in &header.iov {
+        let start = bytes.len();
+        bytes.resize(start + len, 0);
+        c.mem
+            .read(GuestAddr(base), &mut bytes[start..])
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    if lookup {
+        return Err(unreachable_address(c, &address));
     }
     let result = crate::files::write_with(
         c,

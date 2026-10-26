@@ -873,6 +873,22 @@ pub(crate) fn iovecs(
     count: u64,
     write: bool,
 ) -> Result<Vec<(u64, usize)>, Errno> {
+    iovecs_checked(c, at, count, |base, length| {
+        if write {
+            c.mem.check_write(GuestAddr(base), length)
+        } else {
+            c.mem.check_read(GuestAddr(base), length)
+        }
+        .map_err(|_| Errno::EFAULT)
+    })
+}
+/// [`iovecs`] with `check` for each buffer in place of the access check.
+pub(crate) fn iovecs_checked(
+    c: &Context<'_>,
+    at: u64,
+    count: u64,
+    check: impl Fn(u64, usize) -> Result<(), Errno>,
+) -> Result<Vec<(u64, usize)>, Errno> {
     if count > 1024 {
         return Err(Errno::EINVAL);
     }
@@ -891,12 +907,7 @@ pub(crate) fn iovecs(
         let length = usize::try_from(length)
             .unwrap_or(usize::MAX)
             .min(MAX_RW_COUNT - total);
-        let checked = if write {
-            c.mem.check_write(GuestAddr(base), length)
-        } else {
-            c.mem.check_read(GuestAddr(base), length)
-        };
-        checked.map_err(|_| Errno::EFAULT)?;
+        check(base, length)?;
         total += length;
         segments.push((base, length));
     }

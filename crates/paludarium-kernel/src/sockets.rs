@@ -24,13 +24,26 @@ pub(crate) struct PipeEnd {
 /// What `fchmod` and `fchown` change on the inode of a pipe or a socket, as
 /// Linux's `simple_setattr` keeps them: the mode, whose file type stays, and
 /// the owner and group.
-struct Attributes(Mutex<(u32, u32, u32)>);
+struct Attributes(Mutex<Owned>);
+#[derive(Clone, Copy)]
+struct Owned {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
 impl Attributes {
     fn new(mode: u32) -> Self {
-        Self(Mutex::new((mode, 0, 0)))
+        Self(Mutex::new(Owned {
+            mode,
+            uid: 0,
+            gid: 0,
+        }))
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, Owned> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
     fn stat(&self, inode: u64) -> FileStat {
-        let (mode, uid, gid) = *self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Owned { mode, uid, gid } = *self.lock();
         FileStat {
             inode,
             mode,
@@ -41,13 +54,13 @@ impl Attributes {
         }
     }
     fn set_mode(&self, mode: u32) {
-        let mut a = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        a.0 = (a.0 & 0o170000) | (mode & 0o7777);
+        let mut a = self.lock();
+        a.mode = (a.mode & 0o170000) | (mode & 0o7777);
     }
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) {
-        let mut a = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        a.1 = uid.unwrap_or(a.1);
-        a.2 = gid.unwrap_or(a.2);
+        let mut a = self.lock();
+        a.uid = uid.unwrap_or(a.uid);
+        a.gid = gid.unwrap_or(a.gid);
     }
 }
 #[cfg(test)]

@@ -160,8 +160,9 @@ kernel.
   bit when the group may execute it, even when the owner and group stay.
   What is made in a set-group-ID directory takes the directory's group, and a
   new directory the bit as well. `fchmod` and `fchown` also change the mode
-  and owner that `fstat` reports for a pipe, whose two ends share them, and
-  for each end of a socket pair.
+  and owner that `fstat` reports for a pipe made by `pipe` or `pipe2`, whose
+  two ends share them, and for each end of a socket pair. Standard input,
+  output and error, which the host provides, give `EPERM`.
 - `chmod` and `utimensat` work in the in-memory filesystem and in mounted
   host directories; on a Windows host, `chmod` only sets or clears the
   read-only attribute. `stat` reports only the modification time, with access

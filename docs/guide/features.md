@@ -99,6 +99,8 @@ kernel.
   tmpfs file reports `F_SEAL_SEAL`. As on Linux, `F_SEAL_WRITE` gives `EBUSY`
   while a shared mapping that may write shows the memfd, and a shared mapping
   of a memfd sealed against writes cannot become writable (`EACCES`).
+  `F_SEAL_EXEC` on an executable memfd, which seals writes too, gives `EBUSY`
+  then as well, as since Linux 7.1; earlier kernels add the seals.
 - `close_range` closes the open descriptors from `first` to `last`, or with
   `CLOSE_RANGE_CLOEXEC` marks them close-on-exec. `CLOSE_RANGE_UNSHARE` first
   gives the thread its own copy of a table it shares with `CLONE_FILES`

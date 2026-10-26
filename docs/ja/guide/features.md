@@ -89,7 +89,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `F_SEAL_SEAL` を返すところですが、メモリ上の `/tmp` のファイルも同じです。
   Linux と同じく、書き込める共有マッピングが memfd を見せている間の `F_SEAL_WRITE` は
   `EBUSY` になり、書き込みを封じた memfd の共有マッピングは書き込めるようにできません
-  （`EACCES`）。
+  （`EACCES`）。実行できる memfd への `F_SEAL_EXEC` も書き込みを封じるので、そのときは
+  Linux 7.1 以降と同じく `EBUSY` になります（それより前のカーネルはシールを加えます）。
 - `close_range` は `first` から `last` までの開いているディスクリプタを閉じ、
   `CLOSE_RANGE_CLOEXEC` なら閉じずに close-on-exec を付けます。`CLOSE_RANGE_UNSHARE`
   は先に、`CLONE_FILES` のスレッドと共有している表をそのスレッド専用の写しにします。

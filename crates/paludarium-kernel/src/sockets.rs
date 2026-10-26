@@ -534,6 +534,8 @@ fn deliver(
         c.files.fill(n, descriptor.received(cloexec));
         installed += 1;
     }
+    // As scm_detach_fds: the descriptors go in first and the header after,
+    // so a header that cannot be written leaves msg_controllen as it was.
     let mut used = 0;
     if installed != 0 {
         let len = CMSG_HEADER + 4 * installed;

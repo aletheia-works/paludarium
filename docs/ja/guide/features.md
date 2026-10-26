@@ -334,7 +334,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
-  `sendto`、`recvfrom`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
   `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll`、時間制限つきの `futex` の待ちは、
   `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
   `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが

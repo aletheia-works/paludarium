@@ -241,36 +241,8 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             socket.shutdown(a[1])?;
             Ok(0)
         }
-        45 => {
-            let d = c.files.descriptor(a[0])?;
-            if !d.file.as_any().is_some_and(|v| v.is::<SocketPairEnd>()) {
-                return Err(Errno(88));
-            }
-            if a[3] != 0 {
-                return Err(Errno(95));
-            }
-            crate::files::run(c, 0, a)
-        }
-        44 => {
-            let d = c.files.descriptor(a[0])?;
-            if !d.file.as_any().is_some_and(|v| v.is::<SocketPairEnd>()) {
-                return Err(Errno(88));
-            }
-            if a[3] & !0x4000 != 0 || a[4] != 0 || a[5] != 0 {
-                return Err(Errno(95));
-            }
-            let len = usize::try_from(a[2].min(0x7fff_f000)).map_err(|_| Errno::EINVAL)?;
-            c.mem
-                .check_read(GuestAddr(a[1]), len)
-                .map_err(|_| Errno::EFAULT)?;
-            let mut bytes = Vec::new();
-            bytes.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
-            bytes.resize(len, 0);
-            c.mem
-                .read(GuestAddr(a[1]), &mut bytes)
-                .map_err(|_| Errno::EFAULT)?;
-            crate::files::write_io(c, &d.file, &bytes, a[3] & 0x4000 != 0)
-        }
+        44 => send_to(c, a),
+        45 => receive_from(c, a),
         46 => send_message(c, a),
         47 => receive_message(c, a),
         _ => Err(Errno::ENOSYS),
@@ -402,9 +374,102 @@ fn unreachable_address(c: &Context<'_>, address: &[u8]) -> Errno {
         Err(e) => e,
     }
 }
-/// `sendmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS`. As
-/// sendto, of the flags only `MSG_NOSIGNAL` and `MSG_DONTWAIT` are taken
-/// (EOPNOTSUPP otherwise).
+/// A send to `address` on a pair: a connected stream socket takes none
+/// (EISCONN), `unix_seqpacket_sendmsg` ignores it, and a datagram's names no
+/// peer.
+fn check_address(c: &Context<'_>, socket: &SocketPairEnd, address: &[u8]) -> Result<(), Errno> {
+    match socket.pair.kind {
+        SOCK_STREAM => Err(Errno(106)), // EISCONN
+        SOCK_SEQPACKET => Ok(()),
+        _ => Err(unreachable_address(c, address)),
+    }
+}
+/// `sendto(fd, buf, len, flags, addr, addrlen)` on a socket pair: sendmsg
+/// with one buffer and no control messages. As `move_addr_to_kernel`, an
+/// address longer than `sockaddr_storage`'s 128 bytes, or negative, is EINVAL
+/// and one of no bytes is none.
+fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let file = socket(c, a[0])?;
+    if a[3] & !(MSG_NOSIGNAL | MSG_DONTWAIT) != 0 {
+        return Err(Errno(95));
+    }
+    let mut address = Vec::new();
+    if a[4] != 0 {
+        let len = usize::try_from(a[5] as u32 as i32)
+            .ok()
+            .filter(|&len| len <= 128)
+            .ok_or(Errno::EINVAL)?;
+        address.resize(len, 0);
+        c.mem
+            .read(GuestAddr(a[4]), &mut address)
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    let len = usize::try_from(a[2].min(0x7fff_f000)).map_err(|_| Errno::EINVAL)?;
+    c.mem
+        .check_read(GuestAddr(a[1]), len)
+        .map_err(|_| Errno::EFAULT)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
+    bytes.resize(len, 0);
+    c.mem
+        .read(GuestAddr(a[1]), &mut bytes)
+        .map_err(|_| Errno::EFAULT)?;
+    let socket = as_socket(&file)?;
+    if !address.is_empty() {
+        check_address(c, socket, &address)?;
+    }
+    crate::files::write_with(
+        c,
+        &file,
+        &bytes,
+        a[3] & MSG_NOSIGNAL != 0,
+        a[3] & MSG_DONTWAIT != 0,
+        |b| socket.send(b, &mut Passed::new()),
+    )
+}
+/// `recvfrom(fd, buf, len, flags, addr, addrlen)` on a socket pair: recvmsg
+/// with one buffer and no control buffer, so the descriptors a message passes
+/// close. With `addr`, the peer's address length, 0, goes to `addrlen` as
+/// `move_addr_to_user` writes it: EFAULT when it cannot be read, and a
+/// negative one is EINVAL, after the data is taken.
+fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let file = socket(c, a[0])?;
+    if a[3] & !(MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 0 {
+        return Err(Errno(95));
+    }
+    let len = usize::try_from(a[2].min(0x7fff_f000)).map_err(|_| Errno::EINVAL)?;
+    c.mem
+        .check_write(GuestAddr(a[1]), len)
+        .map_err(|_| Errno::EFAULT)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
+    bytes.resize(len, 0);
+    let socket = as_socket(&file)?;
+    let received = crate::files::wait_for_read(c, &file, a[3] & MSG_DONTWAIT != 0, || {
+        socket.receive(&mut bytes, true)
+    })?;
+    c.mem
+        .write(GuestAddr(a[1]), &bytes[..received.count])
+        .map_err(|_| Errno::EFAULT)?;
+    // Closed here, outside the socket's lock.
+    drop(received.passed);
+    if a[4] != 0 {
+        let mut raw = [0; 4];
+        c.mem
+            .read(GuestAddr(a[5]), &mut raw)
+            .map_err(|_| Errno::EFAULT)?;
+        if i32::from_le_bytes(raw) < 0 {
+            return Err(Errno::EINVAL);
+        }
+        c.mem
+            .write(GuestAddr(a[5]), &0u32.to_le_bytes())
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    Ok(received.count as u64)
+}
+/// `sendmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS`. Of the
+/// flags only `MSG_NOSIGNAL` and `MSG_DONTWAIT` are taken (EOPNOTSUPP
+/// otherwise).
 fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let file = socket(c, a[0])?;
     if a[2] & !(MSG_NOSIGNAL | MSG_DONTWAIT) != 0 {
@@ -440,13 +505,7 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let mut passed = passed_descriptors(c, &control)?;
     let socket = as_socket(&file)?;
     if header.name.is_some() {
-        match socket.pair.kind {
-            // A connected stream socket takes no address.
-            SOCK_STREAM => return Err(Errno(106)), // EISCONN
-            // unix_seqpacket_sendmsg ignores it.
-            SOCK_SEQPACKET => {}
-            _ => return Err(unreachable_address(c, &address)),
-        }
+        check_address(c, socket, &address)?;
     }
     let result = crate::files::write_with(
         c,
@@ -462,7 +521,7 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 }
 /// `recvmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS`. Of the
 /// flags only `MSG_DONTWAIT` and `MSG_CMSG_CLOEXEC` are taken (EOPNOTSUPP
-/// otherwise), as recvfrom takes none.
+/// otherwise).
 fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let file = socket(c, a[0])?;
     if a[2] & !(MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 0 {

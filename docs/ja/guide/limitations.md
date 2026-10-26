@@ -24,8 +24,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `fchownat` もそうで、すべてのファイルは root（ユーザーとグループが 0）のものです。
 - **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように
   `SCM_RIGHTS` でディスクリプタを受け渡します。違いは次のとおりです。
-  - `sendmsg` が受け付けるフラグは `MSG_NOSIGNAL` と `MSG_DONTWAIT` だけ、
-    `recvmsg` は `MSG_DONTWAIT` と `MSG_CMSG_CLOEXEC` だけです。ほかは
+  - `sendmsg` と `sendto` が受け付けるフラグは `MSG_NOSIGNAL` と `MSG_DONTWAIT` だけ、
+    `recvmsg` と `recvfrom` は `MSG_DONTWAIT` と `MSG_CMSG_CLOEXEC` だけです。ほかは
     `EOPNOTSUPP` を返します。
   - `SCM_CREDENTIALS` は `EINVAL` を返します。`SO_PASSCRED` を有効にする方法も
     ありません。

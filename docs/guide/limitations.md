@@ -27,9 +27,9 @@ verified.
   group 0).
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` as Linux does, with these differences:
-  - `sendmsg` takes only the flags `MSG_NOSIGNAL` and `MSG_DONTWAIT`, and
-    `recvmsg` only `MSG_DONTWAIT` and `MSG_CMSG_CLOEXEC`; others return
-    `EOPNOTSUPP`.
+  - `sendmsg` and `sendto` take only the flags `MSG_NOSIGNAL` and
+    `MSG_DONTWAIT`, and `recvmsg` and `recvfrom` only `MSG_DONTWAIT` and
+    `MSG_CMSG_CLOEXEC`; others return `EOPNOTSUPP`.
   - `SCM_CREDENTIALS` returns `EINVAL`, and nothing can turn on
     `SO_PASSCRED`.
   - Linux splits a stream write of more than about 32 KiB into parts and

@@ -805,3 +805,59 @@ fn scm_rights_on_messages_and_queued_descriptors_close_with_the_socket() {
     assert_eq!(f.ret(3, [b, 0, 0, 0, 0, 0]), 0);
     assert_eq!(f.ret(0, [r, IN, 8, 0, 0, 0]), 0);
 }
+#[test]
+fn sendto_and_recvfrom_take_addresses_and_flags_like_sendmsg() {
+    let mut f = Fixture::new();
+    let fail = |e: i32| Errno(e).to_syscall_return();
+    let (a, b) = pair(&mut f, 53, [1, 0x801, 0, DATA, 0, 0]);
+    let (p, q) = pair(&mut f, 53, [1, 0x805, 0, DATA, 0, 0]);
+    let (d, e) = pair(&mut f, 53, [1, 0x802, 0, DATA, 0, 0]);
+    f.mem.write(GuestAddr(BYTES), b"abcd").unwrap();
+    f.mem
+        .write(GuestAddr(NAME), &[1, 0, b'/', b't', b'm', b'p', 0])
+        .unwrap();
+    // A stream takes no address, and one of no bytes is none.
+    assert_eq!(f.ret(44, [a, BYTES, 1, 0, NAME, 16]), fail(106));
+    assert_eq!(f.ret(44, [a, BYTES, 1, 0, NAME, 0]), 1);
+    assert_eq!(f.ret(44, [a, BYTES, 1, 0, NAME, 129]), fail(22));
+    assert_eq!(f.ret(44, [a, BYTES, 1, 0, NAME, u64::MAX]), fail(22));
+    assert_eq!(f.ret(44, [a, BYTES, 1, 0, 8, 16]), fail(14));
+    assert_eq!(f.ret(44, [a, BYTES, 1, 1, 0, 0]), fail(95));
+    assert_eq!(f.ret(44, [a, BYTES + 1, 1, 0x4040, 0, 0]), 1);
+    // recvfrom writes the peer's address length, 0.
+    let len = NAME + 0x80;
+    f.mem.write(GuestAddr(len), &77u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(45, [b, IN, 16, 0, NAME, len]), 2);
+    assert_eq!(read_u32(&f, len), 0);
+    assert_eq!(f.ret(45, [b, IN, 16, 0x40, 0, 0]), fail(11));
+    assert_eq!(f.ret(45, [b, IN, 16, 2, 0, 0]), fail(95));
+    // A negative length or none is an error after the data is taken.
+    assert_eq!(f.ret(44, [a, BYTES, 2, 0, 0, 0]), 2);
+    f.mem.write(GuestAddr(len), &(-1i32).to_le_bytes()).unwrap();
+    assert_eq!(f.ret(45, [b, IN, 1, 0, NAME, len]), fail(22));
+    assert_eq!(read_u32(&f, len), u32::MAX);
+    assert_eq!(f.ret(45, [b, IN, 1, 0, NAME, 0]), fail(14));
+    assert_eq!(f.ret(45, [b, IN, 16, 0x40, 0, 0]), fail(11));
+    // A packet ignores the address, and an empty buffer takes the message.
+    assert_eq!(f.ret(44, [p, BYTES, 2, 0, NAME, 16]), 2);
+    assert_eq!(f.ret(44, [p, BYTES + 2, 2, 0, 0, 0]), 2);
+    assert_eq!(f.ret(45, [q, IN, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(45, [q, IN, 1, 0, 0, 0]), 1);
+    let mut byte = [0];
+    f.mem.read(GuestAddr(IN), &mut byte).unwrap();
+    assert_eq!(&byte, b"c");
+    assert_eq!(f.ret(45, [q, IN, 16, 0x40, 0, 0]), fail(11));
+    // A datagram's address names no socket.
+    assert_eq!(f.ret(44, [d, BYTES, 1, 0, NAME, 2]), fail(22));
+    assert_eq!(f.ret(44, [d, BYTES, 1, 0, NAME, 7]), fail(111));
+    // Descriptors that come to recvfrom close.
+    let (r, w) = pair(&mut f, 293, [DATA + 8, 0x800, 0, 0, 0, 0]);
+    let clen = control(&f, CONTROL, 1, 1, &[w as u32]);
+    message(&f, SEND, (0, 0), &[(BYTES, 1)], (CONTROL, clen));
+    assert_eq!(f.ret(46, [d, SEND, 0, 0, 0, 0]), 1);
+    assert_eq!(f.ret(3, [w, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(45, [e, IN, 16, 0, 0, 0]), 1);
+    assert_eq!(f.ret(0, [r, IN, 1, 0, 0, 0]), 0);
+    assert_eq!(f.ret(44, [r, BYTES, 1, 0, 0, 0]), fail(88));
+    assert_eq!(f.ret(45, [r, IN, 1, 0, 0, 0]), fail(88));
+}

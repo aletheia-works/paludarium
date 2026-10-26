@@ -48,6 +48,18 @@
 
 static void result(const char *name, long value) { printf("%s=%ld\n", name, value); }
 static pid_t child(void) { return syscall(SYS_fork); }
+/* The return value of a call and its errno. */
+static void outcome(const char *name, long value) {
+    printf("%s=%ld errno=%d\n", name, value, value < 0 ? errno : 0);
+}
+static long send_to(int socket, const char *data, size_t len, int flags, const void *address, long address_len) {
+    errno = 0;
+    return syscall(SYS_sendto, socket, data, len, flags, address, address_len);
+}
+static long receive_from(int socket, char *buf, size_t len, int flags, void *address, void *address_len) {
+    errno = 0;
+    return syscall(SYS_recvfrom, socket, buf, len, flags, address, address_len);
+}
 /* sendmsg of `len` bytes with `count` descriptors in one SCM_RIGHTS message. */
 static long send_fds(int socket, const char *data, size_t len, const int *fds, int count) {
     struct iovec iov = {(void *)data, len};
@@ -1066,6 +1078,52 @@ int main(int argc, char **argv) {
         result("stream-closed", write(stream[0], "a", 1));
         result("errno", errno);
         result("stream-sigpipes", received);
+        return 0;
+    }
+    if (!strcmp(mode, "socket-addresses")) {
+        int stream[2], packets[2], datagram[2], pipe_fds[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, stream);
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, packets);
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, datagram);
+        pipe(pipe_fds);
+        struct sockaddr_un address = {.sun_family = AF_UNIX};
+        char buf[16] = {0};
+        int length = 77;
+        outcome("stream-address", send_to(stream[0], "a", 1, 0, &address, sizeof address));
+        outcome("stream-no-length", send_to(stream[0], "b", 1, 0, &address, 0));
+        outcome("too-long", send_to(stream[0], "c", 1, 0, &address, 129));
+        outcome("negative", send_to(stream[0], "c", 1, 0, &address, -1));
+        outcome("bad-address", send_to(stream[0], "c", 1, 0, (void *)8, 16));
+        outcome("flags", send_to(stream[0], "d", 1, MSG_DONTWAIT | MSG_NOSIGNAL, NULL, 0));
+        outcome("received", receive_from(stream[1], buf, sizeof buf, 0, &address, &length));
+        printf("data=%s length=%d\n", buf, length);
+        outcome("empty", receive_from(stream[1], buf, sizeof buf, MSG_DONTWAIT, NULL, NULL));
+        send_to(stream[0], "ef", 2, 0, NULL, 0);
+        length = -1;
+        outcome("negative-length", receive_from(stream[1], buf, 1, 0, &address, &length));
+        printf("length=%d\n", length);
+        outcome("no-length", receive_from(stream[1], buf, 1, 0, &address, NULL));
+        outcome("drained", receive_from(stream[1], buf, sizeof buf, MSG_DONTWAIT, NULL, NULL));
+        outcome("packet-address", send_to(packets[0], "gh", 2, 0, &address, sizeof address));
+        send_to(packets[0], "ij", 2, 0, NULL, 0);
+        outcome("packet-empty-buffer", receive_from(packets[1], buf, 0, 0, NULL, NULL));
+        memset(buf, 0, sizeof buf);
+        outcome("packet-next", receive_from(packets[1], buf, 1, 0, NULL, NULL));
+        printf("data=%s\n", buf);
+        outcome("packet-drained", receive_from(packets[1], buf, sizeof buf, MSG_DONTWAIT, NULL, NULL));
+        outcome("family-only", send_to(datagram[0], "k", 1, 0, &address, 2));
+        strcpy(address.sun_path, "/missing-socket");
+        outcome("missing", send_to(datagram[0], "k", 1, 0, &address, sizeof address));
+        /* Writable by everyone, so the write check passes without root. */
+        strcpy(address.sun_path, "/tmp");
+        outcome("not-a-socket", send_to(datagram[0], "k", 1, 0, &address, sizeof address));
+        /* A descriptor that comes to recvfrom closes: the pipe loses its writer. */
+        send_fds(datagram[0], "l", 1, &pipe_fds[1], 1);
+        close(pipe_fds[1]);
+        outcome("with-fds", receive_from(datagram[1], buf, sizeof buf, 0, NULL, NULL));
+        outcome("pipe", read(pipe_fds[0], buf, 1));
+        outcome("not-a-socket-fd", send_to(pipe_fds[0], "m", 1, 0, NULL, 0));
+        outcome("recv-not-a-socket", receive_from(pipe_fds[0], buf, 1, 0, NULL, NULL));
         return 0;
     }
     if (!strcmp(mode, "scm-rights")) {

@@ -384,11 +384,25 @@ fn check_address(c: &Context<'_>, socket: &SocketPairEnd, address: &[u8]) -> Res
         _ => Err(unreachable_address(c, address)),
     }
 }
+/// `TASK_SIZE_MAX` on x86-64: the end of the user half, less a guard page.
+const TASK_SIZE_MAX: u64 = 0x7fff_ffff_f000;
+/// The length of the buffer of sendto or recvfrom, as `import_ubuf` takes it
+/// before the descriptor is looked up: at most `MAX_RW_COUNT`, and EFAULT
+/// when it reaches past the user half (`access_ok`). A buffer there that is
+/// not mapped is EFAULT only when it is copied.
+fn user_buffer(at: u64, len: u64) -> Result<usize, Errno> {
+    let len = len.min(0x7fff_f000);
+    if at > TASK_SIZE_MAX - len {
+        return Err(Errno::EFAULT);
+    }
+    usize::try_from(len).map_err(|_| Errno::EFAULT)
+}
 /// `sendto(fd, buf, len, flags, addr, addrlen)` on a socket pair: sendmsg
 /// with one buffer and no control messages. As `move_addr_to_kernel`, an
 /// address longer than `sockaddr_storage`'s 128 bytes, or negative, is EINVAL
 /// and one of no bytes is none.
 fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let len = user_buffer(a[1], a[2])?;
     let file = socket(c, a[0])?;
     if a[3] & !(MSG_NOSIGNAL | MSG_DONTWAIT) != 0 {
         return Err(Errno(95));
@@ -404,7 +418,6 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .read(GuestAddr(a[4]), &mut address)
             .map_err(|_| Errno::EFAULT)?;
     }
-    let len = usize::try_from(a[2].min(0x7fff_f000)).map_err(|_| Errno::EINVAL)?;
     c.mem
         .check_read(GuestAddr(a[1]), len)
         .map_err(|_| Errno::EFAULT)?;
@@ -433,11 +446,11 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// `move_addr_to_user` writes it: EFAULT when it cannot be read, and a
 /// negative one is EINVAL, after the data is taken.
 fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let len = user_buffer(a[1], a[2])?;
     let file = socket(c, a[0])?;
     if a[3] & !(MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 0 {
         return Err(Errno(95));
     }
-    let len = usize::try_from(a[2].min(0x7fff_f000)).map_err(|_| Errno::EINVAL)?;
     c.mem
         .check_write(GuestAddr(a[1]), len)
         .map_err(|_| Errno::EFAULT)?;
@@ -732,8 +745,9 @@ impl SocketPairEnd {
     }
 }
 impl SocketPairEnd {
-    /// Reads into `buf`; `message` is recvmsg's form, which an empty buffer
-    /// does not end at once as read's does (Linux's `sock_read_iter`).
+    /// Reads into `buf`; `message` is the form of recvmsg and recvfrom
+    /// (`sock_recvmsg`), which an empty buffer does not end at once as read's
+    /// does (Linux's `sock_read_iter`).
     pub(crate) fn receive(&self, buf: &mut [u8], message: bool) -> Result<Received, Errno> {
         if buf.is_empty() && !message {
             return Ok(Received::default());
@@ -746,7 +760,7 @@ impl SocketPairEnd {
     }
     /// SOCK_SEQPACKET and SOCK_DGRAM read: the next whole message,
     /// truncated to `buf`, with its descriptors. An empty buffer reaches
-    /// here only from recvmsg, and discards the message.
+    /// here only from recvmsg or recvfrom, and discards the message.
     fn read_message(&self, buf: &mut [u8]) -> Result<Received, Errno> {
         let nonblocking = self.flags() & NONBLOCK != 0;
         let mut sides = self

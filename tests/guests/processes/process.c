@@ -1124,6 +1124,13 @@ int main(int argc, char **argv) {
         outcome("pipe", read(pipe_fds[0], buf, 1));
         outcome("not-a-socket-fd", send_to(pipe_fds[0], "m", 1, 0, NULL, 0));
         outcome("recv-not-a-socket", receive_from(pipe_fds[0], buf, 1, 0, NULL, NULL));
+        /* A buffer past the user half fails before the descriptor and the
+           address are checked. */
+        char *high = (char *)0x7ffffffff000;
+        outcome("high-not-a-socket", send_to(pipe_fds[0], high, 1, 0, NULL, 0));
+        outcome("high-bad-fd", receive_from(999, high - 1, 2, 0, NULL, NULL));
+        outcome("high-too-long", send_to(stream[0], high, 1, 0, &address, 129));
+        outcome("unmapped-too-long", send_to(stream[0], high - 1, 1, 0, &address, 129));
         return 0;
     }
     if (!strcmp(mode, "scm-rights")) {

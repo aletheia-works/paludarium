@@ -860,4 +860,11 @@ fn sendto_and_recvfrom_take_addresses_and_flags_like_sendmsg() {
     assert_eq!(f.ret(0, [r, IN, 1, 0, 0, 0]), 0);
     assert_eq!(f.ret(44, [r, BYTES, 1, 0, 0, 0]), fail(88));
     assert_eq!(f.ret(45, [r, IN, 1, 0, 0, 0]), fail(88));
+    // A buffer past the user half is EFAULT before the descriptor and the
+    // address are checked; an unmapped one only when it is copied.
+    let high = 0x7fff_ffff_f000;
+    assert_eq!(f.ret(44, [r, high, 1, 0, 0, 0]), fail(14));
+    assert_eq!(f.ret(45, [999, high - 1, 2, 0, 0, 0]), fail(14));
+    assert_eq!(f.ret(44, [a, high, 1, 0, NAME, 129]), fail(14));
+    assert_eq!(f.ret(44, [a, high - 1, 1, 0, NAME, 129]), fail(22));
 }

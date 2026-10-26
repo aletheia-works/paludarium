@@ -37,7 +37,6 @@ fn lock_err(e: std::io::Error) -> Errno {
         err(e)
     }
 }
-/// A guest time (nanoseconds since the Unix epoch) as a host time.
 /// `chown` of a host file: the guest sees every one as root's and cannot
 /// give one to anyone else, so only an owner and a group of 0 are taken
 /// (EPERM otherwise).
@@ -47,6 +46,7 @@ fn stays_root(uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
     }
     Ok(())
 }
+/// A guest time (nanoseconds since the Unix epoch) as a host time.
 fn system_time(ns: i128) -> Result<std::time::SystemTime, Errno> {
     let magnitude = u64::try_from(ns.unsigned_abs() / 1_000_000_000).map_err(|_| Errno::EINVAL)?;
     let nanos = u32::try_from(ns.unsigned_abs() % 1_000_000_000).map_err(|_| Errno::EINVAL)?;
@@ -195,6 +195,8 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
             } else {
                 0o100644
             },
+            uid: 0,
+            gid: 0,
             links,
             mtime_ns,
             rdev: 0,
@@ -841,6 +843,8 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
             } else {
                 0o100644
             },
+            uid: 0,
+            gid: 0,
             links,
             mtime_ns,
             rdev: 0,

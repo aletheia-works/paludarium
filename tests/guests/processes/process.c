@@ -1161,7 +1161,8 @@ int main(int argc, char **argv) {
         send_raw("abstract", datagram[0], &address, sizeof address, NULL, 0);
         strcpy(address.sun_path, "/missing-socket");
         send_raw("missing", datagram[0], &address, sizeof address, NULL, 0);
-        strcpy(address.sun_path, "/");
+        // Writable by everyone, so the write check passes without root.
+        strcpy(address.sun_path, "/tmp");
         send_raw("not-a-socket", datagram[0], &address, sizeof address, NULL, 0);
         address.sun_family = AF_INET;
         send_raw("inet", datagram[0], &address, sizeof address, NULL, 0);

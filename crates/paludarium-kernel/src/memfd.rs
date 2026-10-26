@@ -65,14 +65,28 @@ impl Memfd {
         self.seals.load(Ordering::SeqCst)
     }
     /// `F_ADD_SEALS` through a descriptor open for writing or not, in the
-    /// order of Linux's memfd_add_seals. `F_SEAL_EXEC` on a file with an
-    /// execute bit also seals writes and the size, so that it stays W^X.
-    pub(crate) fn add_seals(&self, writable: bool, seals: u32) -> Result<(), Errno> {
+    /// order of Linux's memfd_add_seals. `F_SEAL_WRITE` is refused (`EBUSY`)
+    /// while a shared mapping that may write (`mapped_writable`) shows the
+    /// file. `F_SEAL_EXEC` on a file with an execute bit also seals writes
+    /// and the size, so that it stays W^X.
+    pub(crate) fn add_seals(
+        &self,
+        writable: bool,
+        seals: u32,
+        mapped_writable: bool,
+    ) -> Result<(), Errno> {
         if !writable {
             return Err(Errno::EPERM);
         }
         if seals & !0x3f != 0 {
             return Err(Errno::EINVAL);
+        }
+        let current = self.seals();
+        if current & F_SEAL_SEAL != 0 {
+            return Err(Errno::EPERM);
+        }
+        if seals & F_SEAL_WRITE != 0 && current & F_SEAL_WRITE == 0 && mapped_writable {
+            return Err(Errno(16)); // EBUSY
         }
         let mut seals = seals;
         if seals & F_SEAL_EXEC != 0 && self.file.stat()?.mode & 0o111 != 0 {
@@ -193,6 +207,11 @@ impl FileHandle for Memfd {
     fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
         self.file.allocate(offset, len)
     }
+    /// A shared mapping's pages reach the file whatever the seals, as the
+    /// mapping existed before them or was made read-only by them.
+    fn write_back(&self, offset: u64, buf: &[u8]) -> Result<(), Errno> {
+        self.file.write_back(offset, buf)
+    }
     fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
         if self.seals() & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
             return Err(Errno::EPERM);
@@ -257,8 +276,10 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
         seals: Arc::new(AtomicU32::new(seals)),
         name: name.into(),
     });
+    let file =
+        crate::page_cache::CoherentFile::with_device(memfd, Arc::clone(&c.files.caches), DEVICE);
     let fd = c
         .files
-        .install(memfd, flags & MFD_CLOEXEC != 0, c.group.nofile())?;
+        .install(Arc::new(file), flags & MFD_CLOEXEC != 0, c.group.nofile())?;
     Ok(u64::from(fd))
 }

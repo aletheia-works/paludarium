@@ -1344,25 +1344,105 @@ fn memory_file_private_copy() {
     assert_eq!(bytes[0], b'h');
     assert_eq!(f.ret(28, &[at, 4096, 8]), errno(Errno::EINVAL));
 }
+/// What the file `fd` holds from `offset`, read with `pread`.
+fn file_bytes(f: &mut Fixture, fd: u64, offset: u64, len: usize) -> Vec<u8> {
+    let n = f.ret(17, &[fd, DATA + 0x1000, len as u64, offset]);
+    let mut bytes = vec![0; n as usize];
+    f.mem.read(GuestAddr(DATA + 0x1000), &mut bytes).unwrap();
+    bytes
+}
+fn memory_bytes(f: &Fixture, at: u64, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0; len];
+    f.mem.read(GuestAddr(at), &mut bytes).unwrap();
+    bytes
+}
 #[test]
-fn memory_file_shared_stays_read_only() {
+fn memory_file_shared_mapping_shows_the_file() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0hello").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(1, &[fd, DATA + 6, 5]), 5);
+    let at = f.ret(syscalls::nr::MMAP, &[0, 8192, 3, 1, fd, 0]);
+    assert_eq!(memory_bytes(&f, at, 6), b"hello\0");
+    // A store reaches the file, and a write to the file the mapping.
+    f.mem.write(GuestAddr(at), b"J").unwrap();
+    assert_eq!(file_bytes(&mut f, fd, 0, 8), b"Jello");
+    f.mem.write(GuestAddr(DATA + 0x100), b"xy").unwrap();
+    assert_eq!(f.ret(18, &[fd, DATA + 0x100, 2, 3]), 2);
+    assert_eq!(memory_bytes(&f, at, 5), b"Jelxy");
+    // Another mapping shows the same pages; a private one copies them.
+    let other = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 1, fd, 0]);
+    f.mem.write(GuestAddr(other + 1), b"E").unwrap();
+    assert_eq!(memory_bytes(&f, at, 2), b"JE");
+    let private = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 2, fd, 0]);
+    assert_eq!(memory_bytes(&f, private, 5), b"JElxy");
+    // Truncating clears what lies past the end; a store there stays out
+    // of the file, which keeps its size.
+    assert_eq!(f.ret(77, &[fd, 2]), 0);
+    assert_eq!(memory_bytes(&f, at, 3), b"JE\0");
+    f.mem.write(GuestAddr(at + 2), b"!").unwrap();
+    assert_eq!(f.ret(5, &[fd, DATA + 0x200]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 0x200 + 48)).unwrap(), 2);
+    assert_eq!(f.ret(77, &[fd, 4]), 0);
+    assert_eq!(file_bytes(&mut f, fd, 0, 8), b"JE\0\0");
+    assert_eq!(memory_bytes(&f, at, 4), b"JE\0\0");
+    // msync writes back; after the last unmap the stores are in the file.
+    f.mem.write(GuestAddr(other + 3), b"z").unwrap();
+    assert_eq!(f.ret(syscalls::nr::MSYNC, &[other, 4096, 4]), 0);
+    f.mem.write(GuestAddr(at), b"q").unwrap();
+    assert_eq!(f.ret(11, &[at, 8192]), 0);
+    assert_eq!(f.ret(11, &[other, 4096]), 0);
+    assert_eq!(file_bytes(&mut f, fd, 0, 8), b"qE\0z");
+}
+#[test]
+fn memory_file_shared_mapping_needs_a_writable_file() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
     let fd = f.ret(2, &[DATA, 66, 0o600]);
-    // Nothing would write a writable shared mapping back to the file.
-    assert_eq!(
-        f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 1, fd, 0]),
-        errno(Errno::ENODEV)
-    );
+    // Open for writing, a read-only shared mapping may become writable.
     let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 1, fd, 0]);
+    assert_eq!(f.ret(10, &[at, 4096, 3]), 0);
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+    let read_only = f.ret(2, &[DATA, 0, 0]);
+    assert_eq!(
+        f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 1, read_only, 0]),
+        errno(Errno::EACCES)
+    );
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 1, read_only, 0]);
     assert_eq!(f.ret(10, &[at, 4096, 3]), errno(Errno::EACCES));
     assert_eq!(f.ret(10, &[at, 4096, 5]), 0);
     assert_eq!(f.ret(11, &[at, 4096]), 0);
-    let fd = f.ret(2, &[DATA, 1, 0]);
+    let write_only = f.ret(2, &[DATA, 1, 0]);
     assert_eq!(
-        f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 2, fd, 0]),
+        f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 2, write_only, 0]),
         errno(Errno::EACCES)
     );
+    assert_eq!(
+        f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 1, write_only, 0]),
+        errno(Errno::EACCES)
+    );
+}
+#[test]
+fn memfd_shared_mapping_and_the_write_seal() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"m\0").unwrap();
+    let fd = f.ret(319, &[DATA, 2]); // MFD_ALLOW_SEALING
+    assert_eq!(f.ret(77, &[fd, 4096]), 0);
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 1, fd, 0]);
+    f.mem.write(GuestAddr(at), b"seal").unwrap();
+    assert_eq!(file_bytes(&mut f, fd, 0, 4), b"seal");
+    // F_SEAL_WRITE waits for the writable mapping to go.
+    assert_eq!(f.ret(72, &[fd, 1033, 8]), errno(Errno(16)));
+    assert_eq!(f.ret(11, &[at, 4096]), 0);
+    assert_eq!(f.ret(72, &[fd, 1033, 8]), 0);
+    assert_eq!(
+        f.ret(syscalls::nr::MMAP, &[0, 4096, 3, 1, fd, 0]),
+        errno(Errno::EPERM)
+    );
+    // A read-only shared mapping of a sealed memfd stays read-only.
+    let at = f.ret(syscalls::nr::MMAP, &[0, 4096, 1, 1, fd, 0]);
+    assert_eq!(memory_bytes(&f, at, 4), b"seal");
+    assert_eq!(f.ret(10, &[at, 4096, 3]), errno(Errno::EACCES));
 }
 #[test]
 fn mremap_flags_and_msync_arguments() {

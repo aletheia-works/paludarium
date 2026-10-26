@@ -155,6 +155,7 @@ mod linux {
         processes_access => ("access","process"),
         processes_chown => ("chown","process"),
         processes_fd_attributes => ("fd-attributes","process"),
+        processes_shared_file_mapping => ("shared-file-mapping","process"),
         processes_rlimit => ("rlimit","process"),
         processes_nofile_limit => ("nofile-limit","process"),
         processes_fsize_limit => ("fsize-limit","process"),

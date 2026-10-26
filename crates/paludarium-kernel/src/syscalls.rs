@@ -1200,14 +1200,15 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if offset & 4095 != 0 {
         return err(Errno::EINVAL);
     }
-    let file = if flags & MAP_ANONYMOUS == 0 {
+    let descriptor = if flags & MAP_ANONYMOUS == 0 {
         match u64::try_from(fd).map_or(Err(Errno::EBADF), |fd| c.files.descriptor(fd)) {
-            Ok(d) if d.file.flags() & O_PATH == 0 => Some(d.file),
+            Ok(d) if d.file.flags() & O_PATH == 0 => Some(d),
             _ => return err(Errno::EBADF),
         }
     } else {
         None
     };
+    let file = descriptor.as_ref().map(|d| d.file.clone());
     if len == 0 || !matches!(flags & (MAP_SHARED | MAP_PRIVATE), MAP_SHARED | MAP_PRIVATE) {
         return err(Errno::EINVAL);
     }
@@ -1249,6 +1250,17 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     match result {
         Ok(a) => {
             if let Some(file) = &file
+                && let Some(d) = &descriptor
+                && flags & MAP_SHARED != 0
+            {
+                // The mapping shows the file's page cache.
+                if let Err(error) = share_file(c, d, file, a, len, offset) {
+                    let _ = c.mem.unmap_shared(a, len);
+                    return err(error);
+                }
+                return ok(a.0);
+            }
+            if let Some(file) = &file
                 && let Err(error) = copy_file(c, file.as_ref(), a, len, offset)
             {
                 let _ = c.mem.unmap_shared(a, len);
@@ -1281,9 +1293,10 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 const O_PATH: u32 = 0o10000000;
 
-/// The `mmap` checks of a file, in Linux's order. A file mapping is a copy
-/// made when it is created, so a shared one may not be writable: that would
-/// need its writes to reach the file.
+/// The `mmap` checks of a file, in Linux's order: a shared mapping that
+/// writes needs a file open for reading and writing, any mapping one open
+/// for reading, and a memfd sealed against writes refuses a shared mapping
+/// that writes (seal_check_write).
 fn check_mappable(
     file: &dyn FileHandle,
     prot: Prot,
@@ -1297,33 +1310,45 @@ fn check_mappable(
         return Err(Errno::EOVERFLOW);
     }
     let access = file.flags() & 3;
-    if flags & MAP_SHARED != 0 && prot.contains(Prot::WRITE) {
-        // A memfd sealed against writes refuses first (seal_check_write).
-        let sealed = file
-            .as_any()
-            .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
-            .is_some_and(|m| {
-                m.seals() & (crate::memfd::F_SEAL_WRITE | crate::memfd::F_SEAL_FUTURE_WRITE) != 0
-            });
-        if access == 2 && is_zero_device(file) {
-            return Ok(());
-        }
-        return Err(if access == 2 && sealed {
-            Errno::EPERM
-        } else if access == 2 {
-            Errno::ENODEV
-        } else {
-            Errno::EACCES
-        });
-    }
-    if access == 1 {
+    let shared_write = flags & MAP_SHARED != 0 && prot.contains(Prot::WRITE);
+    if shared_write && access != 2 || access == 1 {
         return Err(Errno::EACCES);
     }
-    if regular || is_zero_device(file) {
-        Ok(())
-    } else {
-        Err(Errno::ENODEV)
+    if !regular && !is_zero_device(file) {
+        return Err(Errno::ENODEV);
     }
+    if shared_write && write_sealed(file) {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+/// Whether `file` is a memfd sealed against writes, whose shared mappings
+/// may not write.
+fn write_sealed(file: &dyn FileHandle) -> bool {
+    file.as_any()
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
+        .is_some_and(|m| {
+            m.seals() & (crate::memfd::F_SEAL_WRITE | crate::memfd::F_SEAL_FUTURE_WRITE) != 0
+        })
+}
+/// Makes the new mapping `[at, at+len)` show the page cache of the file `d`
+/// holds from `offset`, as a Linux `MAP_SHARED` mapping of a file. It may
+/// become writable when the file is open for writing and not sealed
+/// against it (Linux's `VM_MAYWRITE`).
+fn share_file(
+    c: &Context<'_>,
+    d: &crate::files::Descriptor,
+    file: &std::sync::Arc<dyn FileHandle>,
+    at: GuestAddr,
+    len: u64,
+    offset: u64,
+) -> Result<(), Errno> {
+    let len = GuestAddr(len).page_align_up().ok_or(Errno::ENOMEM)?.0;
+    let may_write = file.flags() & 3 == 2 && !write_sealed(file.as_ref());
+    let key = (crate::files::descriptor_device(c, d), file.stat()?.inode);
+    let cache = c.files.caches.cache(key, c.mem.memory_meter());
+    let pages = cache.map(file, offset, len, may_write)?;
+    c.mem.share_pages(at, len, &pages, offset, may_write)
 }
 fn is_zero_device(file: &dyn FileHandle) -> bool {
     file.as_any()
@@ -1466,8 +1491,9 @@ const MS_ASYNC: u64 = 1;
 const MS_INVALIDATE: u64 = 2;
 const MS_SYNC: u64 = 4;
 
-/// `msync` has nothing to write: a shared file mapping is a read-only copy
-/// (see `check_mappable`). It still checks its arguments and the range.
+/// `msync`: checks its arguments and the range, then writes the stores of
+/// shared file mappings back to their files (all of them, which the next
+/// read of a file would do anyway).
 fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, flags) = (a[0], a[1], a[2]);
     if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
@@ -1483,6 +1509,10 @@ fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         return ok(0);
     }
     match c.mem.covers(GuestAddr(addr), len) {
+        Ok(true) if flags & (MS_ASYNC | MS_SYNC) != 0 => match c.files.caches.write_back_all() {
+            Ok(()) => ok(0),
+            Err(e) => err(e),
+        },
         Ok(true) => ok(0),
         Ok(false) | Err(_) => err(Errno::ENOMEM),
     }

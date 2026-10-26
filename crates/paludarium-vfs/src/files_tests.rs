@@ -72,6 +72,18 @@ fn append_truncate_and_flags() {
     assert_eq!(a.seek(-1, 0), Err(Errno::EINVAL));
 }
 #[test]
+fn write_back_stays_within_the_file_even_when_appending() {
+    let fs = MemFs::new();
+    let a = fs.open(b"/a", 66 | 1024, 0o644).unwrap();
+    a.write(b"abcd").unwrap();
+    a.write_back(1, b"XYZW").unwrap(); // cut at the end
+    a.write_back(9, b"!").unwrap(); // past the end: nothing
+    assert_eq!(&*fs.read_file(b"/a").unwrap(), b"aXYZ");
+    assert_eq!(a.seek(0, 1), Ok(4));
+    let read_only = fs.open(b"/a", 0, 0).unwrap();
+    assert_eq!(read_only.write_back(0, b"z"), Err(Errno::EBADF));
+}
+#[test]
 fn non_utf8_nofollow_and_invalid() {
     let fs = MemFs::new();
     fs.open(b"/\xff", 66, 0o644).unwrap();

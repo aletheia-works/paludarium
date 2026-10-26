@@ -22,8 +22,7 @@ Nothing here is a promise, but these are on the table:
 - Two more verified programs, uutils coreutils and the brush shell, once
   their next releases pass the guest audit (the current ones are held back
   by yanked crates and security advisories in their dependencies).
-- More system calls and instructions. Writable shared file mappings are the
-  largest gap (under [Limitations](../guide/limitations)).
+- More system calls and instructions (see [Limitations](../guide/limitations)).
 - Considering dynamically linked programs.
 - Considering a native JIT.
 - Revisiting building with stable Rust.

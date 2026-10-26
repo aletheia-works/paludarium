@@ -125,6 +125,23 @@ impl FileHandle for MemFile {
     fn stat(&self) -> Result<FileStat, Errno> {
         Ok(lock(&self.node).stat(self.inode))
     }
+    fn write_back(&self, offset: u64, b: &[u8]) -> Result<(), Errno> {
+        if lock(&self.state).1 & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        let mut n = lock(&self.node);
+        let modified = (n.clock)()?;
+        let Kind::File(contents) = &mut n.kind else {
+            return Err(Errno::EISDIR);
+        };
+        let room = usize::try_from(contents.len().saturating_sub(offset)).unwrap_or(usize::MAX);
+        let b = &b[..b.len().min(room)];
+        if !b.is_empty() {
+            contents.write(offset, b);
+            n.mtime_ns = i128::from(modified);
+        }
+        Ok(())
+    }
     fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
         if lock(&self.state).1 & 3 == 0 {
             return Err(Errno::EBADF);

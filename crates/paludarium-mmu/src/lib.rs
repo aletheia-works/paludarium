@@ -83,8 +83,8 @@ pub enum MappingKind {
     Anonymous,
     Stack,
     Heap,
-    /// A copy of a file made by `mmap`. When it is also shared it stands
-    /// for a mapping that must stay read-only, as nothing writes it back.
+    /// A file mapped by `mmap`: a private copy, or, when shared, the pages
+    /// of the file's page cache ([`SharedPages`]).
     File,
 }
 
@@ -181,6 +181,9 @@ impl MemoryMeter {
 struct FrameBytes {
     bytes: Box<[AtomicU8]>,
     meter: Option<Arc<MemoryMeter>>,
+    /// A guest store changed the bytes since [`SharedPages::write_back`]
+    /// last took them.
+    dirty: AtomicBool,
 }
 
 impl FrameBytes {
@@ -195,6 +198,7 @@ impl FrameBytes {
         Some(FrameBytes {
             bytes: bytes(),
             meter: meter.cloned(),
+            dirty: AtomicBool::new(false),
         })
     }
 }
@@ -231,17 +235,23 @@ impl Page {
 
     /// The contents to write, allocated now if need be; `None` when the
     /// meter has no room for them.
-    fn frame_for_write(&self, meter: Option<&Arc<MemoryMeter>>) -> Option<&[AtomicU8]> {
-        if self.frame.get().is_none() {
-            let bytes = FrameBytes::new(meter, || {
-                (0..PAGE_BYTES).map(|_| AtomicU8::new(0)).collect()
-            })?;
-            // A racing write to a shared frame may set it first: then this
-            // one is dropped, and its charge with it.
-            let _ = self.frame.set(bytes);
-        }
-        self.frame.get().map(|frame| &**frame)
+    fn frame_for_write(&self, meter: Option<&Arc<MemoryMeter>>) -> Option<&FrameBytes> {
+        allocated(&self.frame, meter)
     }
+}
+
+/// The contents of `frame`, allocated as zeros now if need be; `None` when
+/// the meter has no room for them.
+fn allocated<'a>(frame: &'a Frame, meter: Option<&Arc<MemoryMeter>>) -> Option<&'a FrameBytes> {
+    if frame.get().is_none() {
+        let bytes = FrameBytes::new(meter, || {
+            (0..PAGE_BYTES).map(|_| AtomicU8::new(0)).collect()
+        })?;
+        // A racing write to a shared frame may set it first: then this one
+        // is dropped, and its charge with it.
+        let _ = frame.set(bytes);
+    }
+    frame.get()
 }
 
 /// Lower level of the page table: 512 consecutive pages. Entries are populated lazily, on the first write to a page
@@ -267,15 +277,188 @@ impl PageTable {
 type Directory = BTreeMap<u64, PageTable>;
 
 type Frame = Arc<OnceLock<FrameBytes>>;
+
+/// Memory that every mapping of it shows, in every address space: shared
+/// anonymous memory, or the page cache of a file, whose frames are keyed by
+/// their offset in the file. The page cache's owner (a kernel object that
+/// writes it back) lives as long as a mapping or a clone of it does.
+#[derive(Clone)]
+pub struct SharedPages {
+    frames: Arc<Mutex<BTreeMap<u64, Frame>>>,
+    /// Bumped on every store to the frames, through a mapping or not.
+    generation: Arc<AtomicU64>,
+    /// Held only to keep the owner alive.
+    _owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl Default for SharedPages {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedPages {
+    /// Memory without frames yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_frames(BTreeMap::new())
+    }
+    fn with_frames(frames: BTreeMap<u64, Frame>) -> Self {
+        SharedPages {
+            frames: Arc::new(Mutex::new(frames)),
+            generation: Arc::default(),
+            _owner: None,
+        }
+    }
+    /// The same memory, keeping `owner` alive while the clone lives.
+    #[must_use]
+    pub fn with_owner(&self, owner: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        SharedPages {
+            _owner: Some(owner),
+            ..self.clone()
+        }
+    }
+    /// Changes whenever the contents may have changed.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<u64, Frame>> {
+        self.frames.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// The frames whose page starts in `[start, end)`, by key.
+    fn frames_in(&self, start: u64, end: u64) -> Vec<(u64, Frame)> {
+        let first = start - start % PAGE_SIZE;
+        self.lock()
+            .range(first..end)
+            .map(|(&key, frame)| (key, frame.clone()))
+            .collect()
+    }
+    /// Whether the page at `key` has contents.
+    #[must_use]
+    pub fn contains(&self, key: u64) -> bool {
+        self.lock()
+            .get(&key)
+            .is_some_and(|frame| frame.get().is_some())
+    }
+    /// Gives the page at `key` the contents `bytes` (zeros after them)
+    /// unless it has some already; `ENOMEM` when the meter has no room.
+    pub fn fill(
+        &self,
+        key: u64,
+        bytes: &[u8],
+        meter: Option<&Arc<MemoryMeter>>,
+    ) -> Result<(), Errno> {
+        let frame = self.lock().entry(key).or_default().clone();
+        if frame.get().is_some() {
+            return Ok(());
+        }
+        let contents = FrameBytes::new(meter, || {
+            let mut page: Box<[AtomicU8]> = (0..PAGE_BYTES).map(|_| AtomicU8::new(0)).collect();
+            for (d, s) in page.iter_mut().zip(bytes) {
+                *d.get_mut() = *s;
+            }
+            page
+        })
+        .ok_or(Errno::ENOMEM)?;
+        let _ = frame.set(contents);
+        Ok(())
+    }
+    /// Stores `data` at offset `at` of the memory, as a write to the file
+    /// does to its page cache. Pages without a frame get one when they start
+    /// below `create_below` (the part some mapping may show) and are skipped
+    /// otherwise. The pages do not become dirty.
+    pub fn store(
+        &self,
+        at: u64,
+        data: &[u8],
+        create_below: u64,
+        meter: Option<&Arc<MemoryMeter>>,
+    ) -> Result<(), Errno> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+        let mut done = 0;
+        while done < data.len() {
+            let offset = at + done as u64;
+            let key = offset - offset % PAGE_SIZE;
+            let within = page_offset(offset);
+            let piece = (PAGE_BYTES - within).min(data.len() - done);
+            let frame = {
+                let mut frames = self.lock();
+                if key < create_below {
+                    Some(frames.entry(key).or_default().clone())
+                } else {
+                    frames.get(&key).cloned()
+                }
+            };
+            if let Some(frame) = frame {
+                let bytes = allocated(&frame, meter).ok_or(Errno::ENOMEM)?;
+                for (d, s) in bytes[within..].iter().zip(&data[done..done + piece]) {
+                    d.store(*s, Ordering::Relaxed);
+                }
+            }
+            done += piece;
+        }
+        Ok(())
+    }
+    /// Zeros `[start, end)` of the memory, as truncating or punching a hole
+    /// in the file does to its page cache. The pages do not become dirty.
+    pub fn zero(&self, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+        for (key, frame) in self.frames_in(start, end) {
+            if let Some(bytes) = frame.get() {
+                let from = usize::try_from(start.saturating_sub(key)).unwrap_or(PAGE_BYTES);
+                let to = usize::try_from(end - key).map_or(PAGE_BYTES, |n| n.min(PAGE_BYTES));
+                for byte in bytes.get(from..to).into_iter().flatten() {
+                    byte.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    /// Hands each page a guest store changed since the last call to
+    /// `write`, with its key, and marks it clean. A page whose `write`
+    /// fails stays dirty, and the error ends the call.
+    pub fn write_back(
+        &self,
+        mut write: impl FnMut(u64, &[u8]) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        let frames = self.frames_in(0, u64::MAX);
+        let mut page = vec![0; PAGE_BYTES];
+        for (key, frame) in frames {
+            let Some(bytes) = frame.get() else {
+                continue;
+            };
+            if !bytes.dirty.swap(false, Ordering::Acquire) {
+                continue;
+            }
+            for (d, s) in page.iter_mut().zip(bytes.iter()) {
+                *d = s.load(Ordering::Relaxed);
+            }
+            if let Err(error) = write(key, &page) {
+                bytes.dirty.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct SharedMapping {
     end: u64,
-    /// Frames are keyed by `page + shift` (wrapping): 0 where the mapping
-    /// was made, and moved by `mremap`, so every process sharing the frames
-    /// still finds the same ones wherever it has the mapping now.
+    /// Frames are keyed by `page + shift` (wrapping): 0 where shared
+    /// anonymous memory was made, or the file offset less the address for a
+    /// file's page cache, and moved by `mremap`, so every process sharing the
+    /// frames still finds the same ones wherever it has the mapping now.
     shift: u64,
-    frames: Arc<Mutex<BTreeMap<u64, Frame>>>,
-    generation: Arc<AtomicU64>,
+    pages: SharedPages,
+    /// `mprotect` may make the mapping writable (Linux's `VM_MAYWRITE`).
+    may_write: bool,
 }
 
 /// The file a private file mapping was copied from, read at an offset, so
@@ -432,7 +615,7 @@ impl AddressSpaceData {
     pub fn code_generation(&self) -> u64 {
         self.shared.values().fold(
             self.code_generation.load(Ordering::Acquire),
-            |value, shared| value.wrapping_add(shared.generation.load(Ordering::Acquire)),
+            |value, shared| value.wrapping_add(shared.pages.generation()),
         )
     }
 
@@ -527,9 +710,8 @@ impl AddressSpaceData {
     fn page(&self, page: u64, prot: Prot) -> Page {
         let frame = self.shared_at(page).map(|mapping| {
             mapping
-                .frames
+                .pages
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
                 .entry(page.wrapping_add(mapping.shift))
                 .or_default()
                 .clone()
@@ -695,7 +877,7 @@ impl AddressSpaceData {
         for (page, offset, range) in chunks(addr, buf.len()) {
             if let Some(p) = lookup(directory, page) {
                 if let Some(mapping) = self.shared_at(page) {
-                    mapping.generation.fetch_add(1, Ordering::Release);
+                    mapping.pages.generation.fetch_add(1, Ordering::Release);
                 }
                 if p.prot.contains(Prot::EXEC) {
                     // Code may have changed: decoded instructions are stale.
@@ -714,6 +896,7 @@ impl AddressSpaceData {
                 for (s, d) in buf[range].iter().zip(&frame[offset..]) {
                     d.store(*s, Ordering::Relaxed);
                 }
+                frame.dirty.store(true, Ordering::Release);
             }
         }
         Ok(())
@@ -960,7 +1143,9 @@ impl AddressSpaceData {
             && a.kind == b.kind
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => true,
-                (Some(x), Some(y)) => Arc::ptr_eq(&x.frames, &y.frames) && x.shift == y.shift,
+                (Some(x), Some(y)) => {
+                    Arc::ptr_eq(&x.pages.frames, &y.pages.frames) && x.shift == y.shift
+                }
                 _ => false,
             }
     }
@@ -1210,10 +1395,13 @@ impl AddressSpaceData {
             if m.start.0 > covered {
                 break;
             }
-            // A shared file mapping cannot become writable (see `File`).
+            // A shared file mapping may become writable only when its file
+            // was open for writing.
             if prot.contains(Prot::WRITE)
                 && m.kind == MappingKind::File
-                && self.shared_at(m.start.0).is_some()
+                && self
+                    .shared_at(m.start.0)
+                    .is_some_and(|shared| !shared.may_write)
             {
                 denied = true;
                 break;
@@ -1542,8 +1730,42 @@ impl AddressSpace {
             SharedMapping {
                 end,
                 shift: 0,
-                frames: Arc::new(Mutex::new(frames)),
-                generation: Arc::default(),
+                pages: SharedPages::with_frames(frames),
+                may_write: true,
+            },
+        );
+        Ok(())
+    }
+    /// Makes the newly created mapping `[addr, addr+len)` show `pages` from
+    /// key `offset` on, a file's page cache from that file offset, as a
+    /// Linux `MAP_SHARED` mapping of the file; `may_write` says whether
+    /// `mprotect` may make it writable.
+    pub fn share_pages(
+        &self,
+        addr: GuestAddr,
+        len: u64,
+        pages: &SharedPages,
+        offset: u64,
+        may_write: bool,
+    ) -> Result<(), Errno> {
+        let end = checked_range(addr, len)?;
+        let mut data = self.locked();
+        if !data
+            .mappings
+            .values()
+            .any(|mapping| mapping.start.0 == addr.0 && mapping.end() == end)
+        {
+            return Err(Errno::EINVAL);
+        }
+        data.for_populated(addr.0, end, |entry| *entry = None);
+        data.bump_code_generation();
+        data.shared.insert(
+            addr.0,
+            SharedMapping {
+                end,
+                shift: offset.wrapping_sub(addr.0),
+                pages: pages.clone(),
+                may_write,
             },
         );
         Ok(())
@@ -2234,6 +2456,88 @@ mod tests {
         space.write(duplicate, &[11]).unwrap();
         assert_eq!(byte(&child, 0x10000), 11);
         assert_eq!(byte(&space, moved.0), 11);
+    }
+
+    #[test]
+    fn shared_pages_are_one_memory_across_mappings_and_forks() {
+        let pages = SharedPages::new();
+        pages.fill(0x3000, b"file", None).unwrap();
+        pages.fill(0x3000, b"kept", None).unwrap(); // has contents already
+        let space = AddressSpace::new();
+        let at = space
+            .map_shared(None, 2 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        // The mapping shows the pages from key 0x2000 on.
+        space
+            .share_pages(at, 2 * PAGE_SIZE, &pages, 0x2000, true)
+            .unwrap();
+        assert_eq!(byte(&space, at.0 + PAGE_SIZE), b'f');
+        let child = space.fork().unwrap();
+        child.write(GuestAddr(at.0 + PAGE_SIZE + 1), b"I").unwrap();
+        assert_eq!(byte(&space, at.0 + PAGE_SIZE + 1), b'I');
+        // Only stores make pages dirty, and taking them makes them clean.
+        let mut taken = Vec::new();
+        pages
+            .write_back(|key, page| {
+                taken.push((key, page[..4].to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(taken, [(0x3000, b"fIle".to_vec())]);
+        pages.write_back(|_, _| panic!("nothing is dirty")).unwrap();
+        // A store to the file reaches the frames, and so does a zeroing.
+        pages.store(0x3002, b"LE", u64::MAX, None).unwrap();
+        assert_eq!(byte(&child, at.0 + PAGE_SIZE + 3), b'E');
+        pages.zero(0x3003, u64::MAX);
+        assert_eq!(byte(&child, at.0 + PAGE_SIZE + 3), 0);
+        assert_eq!(byte(&child, at.0 + PAGE_SIZE + 2), b'L');
+        // Without a frame, a page is made only below the limit given.
+        pages.store(0x8000, b"x", 0x8000, None).unwrap();
+        assert!(!pages.contains(0x8000));
+        pages.store(0x2000, b"y", 0x3000, None).unwrap();
+        assert_eq!(byte(&space, at.0), b'y');
+        // A failed write-back leaves the page dirty.
+        space.write(at, b"z").unwrap();
+        assert_eq!(pages.write_back(|_, _| Err(Errno::EIO)), Err(Errno::EIO));
+        let mut keys = Vec::new();
+        pages
+            .write_back(|key, _| {
+                keys.push(key);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(keys, [0x2000]);
+    }
+
+    #[test]
+    fn a_shared_file_mapping_becomes_writable_only_when_it_may() {
+        let space = AddressSpace::new();
+        let pages = SharedPages::new();
+        for may_write in [true, false] {
+            let at = space
+                .map_shared(None, PAGE_SIZE, Prot::READ, MappingKind::File)
+                .unwrap();
+            space
+                .share_pages(at, PAGE_SIZE, &pages, 0, may_write)
+                .unwrap();
+            let result = space.protect_shared(at, PAGE_SIZE, Prot::READ_WRITE);
+            assert_eq!(
+                result,
+                if may_write {
+                    Ok(())
+                } else {
+                    Err(Errno::EACCES)
+                }
+            );
+        }
+        // Only a whole new mapping can be shared.
+        let at = space
+            .map_shared(None, 2 * PAGE_SIZE, Prot::READ, MappingKind::File)
+            .unwrap();
+        assert_eq!(
+            space.share_pages(at, PAGE_SIZE, &pages, 0, true),
+            Err(Errno::EINVAL)
+        );
     }
 
     #[test]

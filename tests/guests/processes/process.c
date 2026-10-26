@@ -669,6 +669,93 @@ int main(int argc, char **argv) {
         printf("peer=%o\n", st.st_mode);
         return 0;
     }
+    if (!strcmp(mode, "shared-file-mapping")) {
+        /* A shared mapping shows the file's page cache: stores reach reads
+           of the file and a child's mapping, writes to the file reach the
+           mapping, and whether it may write follows the file's access. */
+        const char *path = "/tmp/paludarium-processes-shared-mapping";
+        unlink(path);
+        int fd = open(path, O_CREAT|O_RDWR|O_TRUNC, 0600);
+        write(fd, "hello", 5);
+        char *map = mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+        printf("mapped=%d first=%.5s\n", map != MAP_FAILED, map);
+        char buf[16] = {0};
+        map[0] = 'J';
+        pread(fd, buf, 8, 0);
+        printf("read=%s\n", buf);
+        pwrite(fd, "xy", 2, 3);
+        printf("map=%.5s\n", map);
+        lseek(fd, 0, SEEK_END);
+        write(fd, "!", 1);
+        printf("grown=%.6s\n", map);
+        /* Truncating clears what lies past the end, and a store there
+           stays out of the file. */
+        ftruncate(fd, 2);
+        printf("cut=%d\n", map[2]);
+        map[100] = 'q';
+        struct stat st;
+        fstat(fd, &st);
+        printf("size=%ld\n", (long)st.st_size);
+        ftruncate(fd, 4);
+        memset(buf, 1, sizeof buf);
+        int n = pread(fd, buf, 8, 0);
+        printf("n=%d bytes=%d,%d,%d,%d\n", n, buf[0], buf[1], buf[2], buf[3]);
+        pid_t pid = fork();
+        if (pid == 0) {
+            map[1] = 'E';
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+        printf("child=%c\n", map[1]);
+        /* Another shared mapping shows the same pages; a private one copies
+           them and keeps its own stores. */
+        char *again = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+        again[2] = 'L';
+        char *copy = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+        printf("again=%c copy=%.3s\n", map[2], copy);
+        copy[0] = 'p';
+        printf("private=%c\n", map[0]);
+        outcome("msync", msync(map, 4096, MS_SYNC));
+        munmap(again, 4096);
+        munmap(copy, 4096);
+        map[3] = 'Z';
+        munmap(map, 8192);
+        memset(buf, 0, sizeof buf);
+        pread(fd, buf, 8, 0);
+        printf("after=%s\n", buf);
+        int read_only = open(path, O_RDONLY);
+        errno = 0;
+        void *refused = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, read_only, 0);
+        printf("read-only-write=%d errno=%d\n", refused != MAP_FAILED, errno);
+        char *view = mmap(NULL, 4096, PROT_READ, MAP_SHARED, read_only, 0);
+        outcome("read-only-protect", mprotect(view, 4096, PROT_READ|PROT_WRITE));
+        munmap(view, 4096);
+        view = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+        outcome("read-write-protect", mprotect(view, 4096, PROT_READ|PROT_WRITE));
+        view[0] = 'w';
+        munmap(view, 4096);
+        pread(fd, buf, 1, 0);
+        printf("protected=%c\n", buf[0]);
+        /* A memfd: F_SEAL_WRITE waits for its writable mappings to go. */
+        int memfd = memfd_create("shared", MFD_ALLOW_SEALING);
+        ftruncate(memfd, 4096);
+        char *shm = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, memfd, 0);
+        memcpy(shm, "memfd", 5);
+        memset(buf, 0, sizeof buf);
+        pread(memfd, buf, 5, 0);
+        printf("memfd=%s\n", buf);
+        outcome("seal-mapped", fcntl(memfd, F_ADD_SEALS, F_SEAL_WRITE));
+        munmap(shm, 4096);
+        outcome("seal", fcntl(memfd, F_ADD_SEALS, F_SEAL_WRITE));
+        errno = 0;
+        refused = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, memfd, 0);
+        printf("sealed-write=%d errno=%d\n", refused != MAP_FAILED, errno);
+        close(memfd);
+        close(read_only);
+        close(fd);
+        unlink(path);
+        return 0;
+    }
     if (!strcmp(mode, "access")) {
         /* The native side is an ordinary user and the emulated one root:
            only results both give are compared (no write without permission). */

@@ -101,6 +101,13 @@ pub trait FileHandle: Send + Sync {
     fn zero_range(&self, _offset: u64, _len: u64) -> Result<(), Errno> {
         Err(Errno(95))
     }
+    /// Writes `buf` at `offset` in place, at that offset even in an
+    /// `O_APPEND` file, without moving the file position or growing the file
+    /// (what lies past its end is left out): how the pages a shared mapping
+    /// changed reach the file. Kinds that cannot be mapped give `ENODEV`.
+    fn write_back(&self, _offset: u64, _buf: &[u8]) -> Result<(), Errno> {
+        Err(Errno::ENODEV)
+    }
     /// `fallocate` without a mode: allocates the range without changing what
     /// it reads. A file without holes has every byte allocated already.
     fn allocate(&self, _offset: u64, _len: u64) -> Result<(), Errno> {

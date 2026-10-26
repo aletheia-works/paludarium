@@ -226,6 +226,72 @@ struct NativeFile {
     flags: Mutex<u32>,
 }
 impl NativeFile {
+    /// Writes `len` bytes at `offset`, those of `data` or zeros, in place
+    /// up to the end of the file, keeping the position: `zero_range` and
+    /// `write_back`.
+    fn write_in_place(&self, offset: u64, len: u64, data: Option<&[u8]>) -> Result<(), Errno> {
+        if self.flags() & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        let end = offset
+            .saturating_add(len)
+            .min(file.metadata().map_err(err)?.len());
+        if offset >= end {
+            return Ok(());
+        }
+        // An append-mode file writes at its end, so append is off for these
+        // writes, under the same lock; a host that cannot turn it off refuses.
+        #[cfg(unix)]
+        let flags = rustix::fs::fcntl_getfl(&*file).map_err(|e| err(e.into()))?;
+        #[cfg(unix)]
+        if flags.contains(rustix::fs::OFlags::APPEND) {
+            rustix::fs::fcntl_setfl(&*file, flags - rustix::fs::OFlags::APPEND)
+                .map_err(|e| err(e.into()))?;
+        }
+        #[cfg(not(unix))]
+        if self.flags() & 1024 != 0 {
+            return Err(Errno(95));
+        }
+        let position = file.stream_position().map_err(err)?;
+        let zeros = vec![
+            0;
+            if data.is_some() {
+                0
+            } else {
+                usize::try_from(end - offset)
+                    .unwrap_or(1 << 20)
+                    .min(1 << 20)
+            }
+        ];
+        let mut written = file
+            .seek(SeekFrom::Start(offset))
+            .map_err(err)
+            .map(|_| offset);
+        while let Ok(at) = written
+            && at < end
+        {
+            // Both differences are below `len`, which came from a buffer
+            // when there is `data`.
+            let piece = match data {
+                Some(data) => &data[(at - offset) as usize..(end - offset) as usize],
+                None => {
+                    &zeros[..usize::try_from(end - at)
+                        .unwrap_or(zeros.len())
+                        .min(zeros.len())]
+                }
+            };
+            written = file
+                .write_all(piece)
+                .map_err(err)
+                .map(|()| at + piece.len() as u64);
+        }
+        let restored = file.seek(SeekFrom::Start(position)).map_err(err);
+        #[cfg(unix)]
+        rustix::fs::fcntl_setfl(&*file, flags).map_err(|e| err(e.into()))?;
+        written.and(restored).map(|_| ())
+    }
+
     /// `lseek` with `SEEK_DATA` (`data`) or `SEEK_HOLE`, asked of the host
     /// where it answers (Linux and macOS), as Linux asks the file system.
     /// Elsewhere, or when the host's file system cannot tell, the whole file
@@ -346,55 +412,10 @@ impl FileHandle for NativeFile {
         stat(metadata)
     }
     fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
-        if self.flags() & 3 == 0 {
-            return Err(Errno::EBADF);
-        }
-        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
-        let end = offset
-            .saturating_add(len)
-            .min(file.metadata().map_err(err)?.len());
-        if offset >= end {
-            return Ok(());
-        }
-        // An append-mode file writes at its end, so append is off for these
-        // writes, under the same lock; a host that cannot turn it off refuses.
-        #[cfg(unix)]
-        let flags = rustix::fs::fcntl_getfl(&*file).map_err(|e| err(e.into()))?;
-        #[cfg(unix)]
-        if flags.contains(rustix::fs::OFlags::APPEND) {
-            rustix::fs::fcntl_setfl(&*file, flags - rustix::fs::OFlags::APPEND)
-                .map_err(|e| err(e.into()))?;
-        }
-        #[cfg(not(unix))]
-        if self.flags() & 1024 != 0 {
-            return Err(Errno(95));
-        }
-        let position = file.stream_position().map_err(err)?;
-        let zeros = vec![
-            0;
-            usize::try_from(end - offset)
-                .unwrap_or(1 << 20)
-                .min(1 << 20)
-        ];
-        let mut written = file
-            .seek(SeekFrom::Start(offset))
-            .map_err(err)
-            .map(|_| offset);
-        while let Ok(at) = written
-            && at < end
-        {
-            let piece = usize::try_from(end - at)
-                .unwrap_or(zeros.len())
-                .min(zeros.len());
-            written = file
-                .write_all(&zeros[..piece])
-                .map_err(err)
-                .map(|()| at + piece as u64);
-        }
-        let restored = file.seek(SeekFrom::Start(position)).map_err(err);
-        #[cfg(unix)]
-        rustix::fs::fcntl_setfl(&*file, flags).map_err(|e| err(e.into()))?;
-        written.and(restored).map(|_| ())
+        self.write_in_place(offset, len, None)
+    }
+    fn write_back(&self, offset: u64, buf: &[u8]) -> Result<(), Errno> {
+        self.write_in_place(offset, buf.len() as u64, Some(buf))
     }
     fn truncate(&self, n: u64) -> Result<(), Errno> {
         self.file
@@ -1111,6 +1132,26 @@ mod files_tests {
         assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"a\0\0de\0!");
         let read_only = x.fs().open(b"a", 0, 0).unwrap();
         assert_eq!(read_only.zero_range(0, 1), Err(Errno::EBADF));
+    }
+    #[test]
+    fn write_back_writes_in_place_within_the_file() {
+        let x = Fixture::new();
+        let f = x.fs().open(b"a", 66, 0o600).unwrap();
+        assert_eq!(f.write(b"abcdef"), Ok(6));
+        assert_eq!(f.write_back(1, b"XY"), Ok(()));
+        assert_eq!(f.write_back(4, b"0123"), Ok(())); // cut at the end
+        assert_eq!(f.write_back(9, b"!"), Ok(())); // past the end: nothing
+        assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"aXYd01");
+        assert_eq!((f.seek(0, 1), f.stat().unwrap().size), (Ok(6), 6));
+        let read_only = x.fs().open(b"a", 0, 0).unwrap();
+        assert_eq!(read_only.write_back(0, b"z"), Err(Errno::EBADF));
+        #[cfg(unix)]
+        {
+            let appending = x.fs().open(b"a", 1025, 0).unwrap();
+            assert_eq!(appending.write_back(0, b"A"), Ok(()));
+            assert_eq!(appending.write(b"!"), Ok(1));
+            assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"AXYd01!");
+        }
     }
     #[test]
     fn native_links() {

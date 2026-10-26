@@ -37,23 +37,38 @@ pub struct Files {
     cwd: Arc<Mutex<Vec<u8>>>,
     /// Shared with the cwd: `CLONE_FS` shares both, as on Linux.
     umask: Arc<AtomicU32>,
+    /// The page caches of the files mapped shared, which `fs` keeps its
+    /// files in step with; one for the whole machine.
+    pub(crate) caches: Arc<crate::page_cache::PageCaches>,
 }
 impl Default for Files {
     fn default() -> Self {
         let fs = MemFs::new();
         let _ = fs.mkdir(b"/tmp", 0o1777);
+        let caches = Arc::default();
         Self {
             readiness: Arc::default(),
             terminal_size: None,
-            fs: Arc::new(fs),
+            fs: Arc::new(crate::page_cache::CoherentFs::new(
+                Arc::new(fs),
+                Arc::clone(&caches),
+            )),
             fds: Arc::new(Mutex::new(BTreeMap::new())),
             reserved: Arc::default(),
             cwd: Arc::new(Mutex::new(b"/".to_vec())),
             umask: Arc::new(AtomicU32::new(0o022)),
+            caches,
         }
     }
 }
 impl Files {
+    /// Uses `fs`, keeping its files in step with their page caches.
+    pub(crate) fn set_file_system(&mut self, fs: Arc<dyn FileSystem>) {
+        self.fs = Arc::new(crate::page_cache::CoherentFs::new(
+            fs,
+            Arc::clone(&self.caches),
+        ));
+    }
     pub(crate) fn set_current_directory(&mut self, path: &[u8]) -> Result<(), Errno> {
         let path = paludarium_vfs::normalize_path(path)?;
         if self.fs.metadata(&path, true)?.mode & 0o170000 != 0o040000 {
@@ -1114,7 +1129,7 @@ fn stat(c: &Context<'_>, addr: u64, s: FileStat, device: u64) -> Result<u64, Err
 }
 /// The device of the file a descriptor holds: a memfd's own (it is on no
 /// mount), else that of the mount holding its path.
-fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
+pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
     if d.file
         .as_any()
         .is_some_and(|v| v.is::<crate::memfd::Memfd>())
@@ -1127,19 +1142,7 @@ fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
 /// The minor number of the mount that holds `path` (the longest matching
 /// mount point), so that each mount is its own device.
 fn device(c: &Context<'_>, path: &[u8]) -> u64 {
-    let inside = |root: &[u8]| {
-        root == b"/"
-            || path == root
-            || path.starts_with(root) && path.get(root.len()) == Some(&b'/')
-    };
-    c.files
-        .fs
-        .mounts()
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| inside(&m.path))
-        .max_by_key(|(_, m)| m.path.len())
-        .map_or(1, |(i, _)| i as u64 + 1)
+    crate::page_cache::mount_device(&c.files.fs.mounts(), path)
 }
 /// `st_blocks`: what the file system counts, or the size in 512-byte blocks.
 fn blocks(s: &FileStat) -> u64 {
@@ -1545,7 +1548,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     match (a[1], memfd) {
                         (1034, Some(memfd)) => Ok(u64::from(memfd.seals())),
                         (1033, Some(memfd)) => {
-                            memfd.add_seals(d.file.flags() & 3 != 0, a[2] as u32)?;
+                            let key = (crate::memfd::DEVICE, d.file.stat()?.inode);
+                            let mapped = c
+                                .files
+                                .caches
+                                .find(key)
+                                .is_some_and(|cache| cache.mapped_writable());
+                            memfd.add_seals(d.file.flags() & 3 != 0, a[2] as u32, mapped)?;
                             Ok(0)
                         }
                         // memfd_add_seals checks the access and the bits first.
@@ -2199,7 +2208,12 @@ fn reopen(
         .as_any()
         .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
     {
-        return Ok((memfd.reopen(flags)?, Vec::new()));
+        let file = crate::page_cache::CoherentFile::with_device(
+            memfd.reopen(flags)?,
+            Arc::clone(&c.files.caches),
+            crate::memfd::DEVICE,
+        );
+        return Ok((Arc::new(file), Vec::new()));
     }
     let stat = d.file.stat()?;
     match stat.mode & 0o170000 {

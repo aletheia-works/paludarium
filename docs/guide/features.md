@@ -35,7 +35,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files as a copy), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
@@ -96,8 +96,9 @@ kernel.
   filesystem of their own, as Linux's internal tmpfs mount, so
   `copy_file_range` between one and a file on a mount gives `EXDEV`. Other
   files have no seals (`EINVAL`), even on the in-memory `/tmp`, where a real
-  tmpfs file reports `F_SEAL_SEAL`. An unsealed memfd cannot be mapped shared
-  and writable (`ENODEV`), like other files.
+  tmpfs file reports `F_SEAL_SEAL`. As on Linux, `F_SEAL_WRITE` gives `EBUSY`
+  while a shared mapping that may write shows the memfd, and a shared mapping
+  of a memfd sealed against writes cannot become writable (`EACCES`).
 - `close_range` closes the open descriptors from `first` to `last`, or with
   `CLOSE_RANGE_CLOEXEC` marks them close-on-exec. `CLOSE_RANGE_UNSHARE` first
   gives the thread its own copy of a table it shares with `CLONE_FILES`
@@ -131,6 +132,13 @@ kernel.
   no end of file: when the peer closes, reads wait and the next send gets
   `ECONNREFUSED`, then `ENOTCONN`. Only `SOCK_STREAM` raises `SIGPIPE` with
   `EPIPE`, as on Linux.
+- A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
+  every shared mapping of the file, in every process, has the same pages. A
+  store to them is what `read` and later mappings of the file, private ones
+  included, see, and `write`, `ftruncate` and punching a hole change what the
+  mappings show; a store past the end of the file stays out of it. Such a
+  mapping may write, and become writable with `mprotect`, only when the file
+  is open for reading and writing (`EACCES` otherwise), as Linux has it.
 - `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
   as zeros, and those of a file mapping read the file again, as it is then
   (zeros past its end), as Linux faults them in from the file; this holds
@@ -144,12 +152,12 @@ kernel.
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`
   and `MREMAP_DONTUNMAP` work too. Shared memory stays shared with a `fork`ed
-  process when it moves. A mapping copied from a file cannot grow (`ENOMEM`),
-  as it cannot read the rest of the file, and moving a range that spans
+  process when it moves. A file mapping cannot grow (`ENOMEM`), as the rest
+  of the file is not read in, and moving a range that spans
   several mappings with `MREMAP_FIXED`, which recent Linux allows, gives
   `EFAULT`.
-- `msync` checks its arguments and the range and succeeds: a shared file
-  mapping is a read-only copy, so there is nothing to write back.
+- `msync` checks its arguments and the range, and with `MS_SYNC` or
+  `MS_ASYNC` writes the stores of shared file mappings back to their files.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like

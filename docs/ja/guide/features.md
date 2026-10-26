@@ -29,7 +29,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、写し取ったファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups`、`getrusage`、`times` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
@@ -87,8 +87,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   共有するので、memfd とマウント上のファイルの間の `copy_file_range` は `EXDEV` です。
   ほかのファイルにシールはありません（`EINVAL`）。本物の tmpfs のファイルなら
   `F_SEAL_SEAL` を返すところですが、メモリ上の `/tmp` のファイルも同じです。
-  シールのない memfd も、ほかのファイルと同じく書き込める共有マッピングには
-  できません（`ENODEV`）。
+  Linux と同じく、書き込める共有マッピングが memfd を見せている間の `F_SEAL_WRITE` は
+  `EBUSY` になり、書き込みを封じた memfd の共有マッピングは書き込めるようにできません
+  （`EACCES`）。
 - `close_range` は `first` から `last` までの開いているディスクリプタを閉じ、
   `CLOSE_RANGE_CLOEXEC` なら閉じずに close-on-exec を付けます。`CLOSE_RANGE_UNSHARE`
   は先に、`CLONE_FILES` のスレッドと共有している表をそのスレッド専用の写しにします。
@@ -120,6 +121,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルの終わりがありません。相手が閉じると、読み込みは待ち続け、次の送信は
   `ECONNREFUSED`、その後は `ENOTCONN` になります。`EPIPE` で `SIGPIPE` を送るのは、
   Linux と同じく `SOCK_STREAM` だけです。
+- ファイルの `MAP_SHARED` のマッピングは、Linux と同じくファイルのページキャッシュを
+  見せます。どのプロセスのものでも、そのファイルの共有マッピングはみな同じページを
+  持ちます。そこへの書き込みは `read` にも、後から作るマッピング（プライベートなものも）
+  にも見え、`write`、`ftruncate`、穴あけはマッピングに見える中身を変えます。ファイルの
+  終わりより先への書き込みは、ファイルに入りません。このマッピングが書き込めるのも、
+  `mprotect` で書き込めるようにできるのも、Linux と同じく、ファイルを読み書きの両方で
+  開いたときだけです（ほかは `EACCES`）。
 - `madvise`：`MADV_DONTNEED` を受けたプライベートなページは空になります。無名の
   ページはそのあと 0 として読め、ファイルのマッピングのページは、Linux がファイルから
   読み込み直すのと同じく、そのときのファイルの中身を読みます（ファイルの終わりより先は
@@ -131,11 +139,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   アクセスの仕方のヒントは受け付け、ほかの指定には `EINVAL` を返します。
 - `mremap` は、後ろが空いていればその場で広げ、空いていなければ `MREMAP_MAYMOVE` で
   中身ごと動かします。`MREMAP_FIXED` と `MREMAP_DONTUNMAP` も使えます。共有のメモリは、
-  動かしても `fork` した相手と共有したままです。ファイルを写し取ったマッピングは、ファイルの
-  続きを読めないので広げられません（`ENOMEM`）。また、複数のマッピングにまたがる範囲を
+  動かしても `fork` した相手と共有したままです。ファイルのマッピングは、ファイルの続きを
+  読み込まないので広げられません（`ENOMEM`）。また、複数のマッピングにまたがる範囲を
   `MREMAP_FIXED` で動かすと、`EFAULT` になります（最近の Linux は動かせます）。
-- `msync` は、引数と範囲を確かめて成功を返します。共有のファイルのマッピングは読むだけの
-  写しなので、書き戻すものがありません。
+- `msync` は、引数と範囲を確かめ、`MS_SYNC` か `MS_ASYNC` なら共有のファイルの
+  マッピングへの書き込みをファイルに書き戻します。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
 - `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、

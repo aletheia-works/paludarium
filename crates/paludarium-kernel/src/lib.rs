@@ -18,6 +18,7 @@ mod events;
 mod files;
 mod futex;
 mod memfd;
+mod page_cache;
 mod proc;
 mod processes;
 mod sockets;
@@ -273,7 +274,7 @@ impl Kernel {
 
     /// Connects the filesystem shared with the loader.
     pub fn with_file_system(mut self, fs: Arc<dyn paludarium_vfs::FileSystem>) -> Self {
-        self.files.fs = fs;
+        self.files.set_file_system(fs);
         self
     }
     /// Sets an existing virtual directory as the initial guest cwd.

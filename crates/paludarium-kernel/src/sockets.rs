@@ -398,7 +398,10 @@ fn check_address(socket: &SocketPairEnd, address: &[u8], len: usize) -> Result<b
         }
     }
 }
-/// `TASK_SIZE_MAX` on x86-64: the end of the user half, less a guard page.
+/// `TASK_SIZE_MAX` on x86-64 with four-level page tables: the end of the user
+/// half, less a guard page. With five-level ones Linux allows up to 2^56, so
+/// a buffer between the two is EFAULT here before the descriptor is checked
+/// and there only when it is copied.
 const TASK_SIZE_MAX: u64 = 0x7fff_ffff_f000;
 /// The length of the buffer of sendto or recvfrom, as `import_ubuf` takes it
 /// before the descriptor is looked up: at most `MAX_RW_COUNT`, and EFAULT

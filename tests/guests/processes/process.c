@@ -1191,11 +1191,13 @@ int main(int argc, char **argv) {
         outcome("recv-not-a-socket", receive_from(pipe_fds[0], buf, 1, 0, NULL, NULL));
         /* A buffer past the user half fails before the descriptor and the
            address are checked. */
-        char *high = (char *)0x7ffffffff000;
+        /* In the kernel half: past the user half with four-level page tables
+           and with five-level ones, whose end the host decides. */
+        char *high = (char *)0xffff800000000000;
         outcome("high-not-a-socket", send_to(pipe_fds[0], high, 1, 0, NULL, 0));
-        outcome("high-bad-fd", receive_from(999, high - 1, 2, 0, NULL, NULL));
+        outcome("high-bad-fd", receive_from(999, high, 2, 0, NULL, NULL));
         outcome("high-too-long", send_to(stream[0], high, 1, 0, &address, 129));
-        outcome("unmapped-too-long", send_to(stream[0], high - 1, 1, 0, &address, 129));
+        outcome("unmapped-too-long", send_to(stream[0], (char *)8, 1, 0, &address, 129));
         /* A stream's address and a datagram's form and size are checked
            before the data is copied, and a datagram's peer is looked up
            after. */

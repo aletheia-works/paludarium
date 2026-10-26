@@ -867,6 +867,7 @@ fn sendto_and_recvfrom_take_addresses_and_flags_like_sendmsg() {
     assert_eq!(f.ret(45, [999, high - 1, 2, 0, 0, 0]), fail(14));
     assert_eq!(f.ret(44, [a, high, 1, 0, NAME, 129]), fail(14));
     assert_eq!(f.ret(44, [a, high - 1, 1, 0, NAME, 129]), fail(22));
+    assert_eq!(f.ret(44, [r, 0xffff_8000_0000_0000, 1, 0, 0, 0]), fail(14));
     // A stream's address and a datagram's form and size are checked before
     // the data is copied, and a datagram's peer is looked up after.
     assert_eq!(f.ret(44, [a, 8, 1, 0, NAME, 16]), fail(106));

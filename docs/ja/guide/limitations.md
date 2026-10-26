@@ -20,10 +20,21 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   中身を残します。違いが出るのは、`mprotect` で書き込めるようにして書き換えたときだけで、
   Linux では実行ファイルから読み直します。
 - **一部のシステムコール**：実装していないシステムコールは `ENOSYS` を返すので、
-  プログラムによってはその機能なしで続けられます。`sendmsg` と `recvmsg` もその
-  ひとつで、ソケットでディスクリプタを受け渡せません（`SCM_RIGHTS`）。`chown`、
-  `fchown`、`lchown`、`fchownat` もそうで、すべてのファイルは root（ユーザーと
-  グループが 0）のものです。
+  プログラムによってはその機能なしで続けられます。`chown`、`fchown`、`lchown`、
+  `fchownat` もそうで、すべてのファイルは root（ユーザーとグループが 0）のものです。
+- **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように
+  `SCM_RIGHTS` でディスクリプタを受け渡します。違いは次のとおりです。
+  - `sendmsg` が受け付けるフラグは `MSG_NOSIGNAL` と `MSG_DONTWAIT` だけ、
+    `recvmsg` は `MSG_DONTWAIT` と `MSG_CMSG_CLOEXEC` だけです。ほかは
+    `EOPNOTSUPP` を返します。
+  - `SCM_CREDENTIALS` は `EINVAL` を返します。`SO_PASSCRED` を有効にする方法も
+    ありません。
+  - Linux は、およそ 32 KiB を超えるストリームへの書き込みをいくつかに分け、
+    ディスクリプタを最初の部分と一緒に渡すので、読み込みはその部分の終わりで
+    止まります。paludarium では書き込み全体の終わりで止まります。
+  - 読まれていないディスクリプタが、そのディスクリプタしか開いたままにしていない
+    ソケット（たとえば自分自身）の中で待っていると、そのソケットは閉じられません。
+    Linux ではガベージコレクタが両方を閉じます。
 - **名前空間**：名前空間のフラグ（`CLONE_NEWNS`、`CLONE_NEWUTS`、`CLONE_NEWIPC`、
   `CLONE_NEWUSER`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWCGROUP`、`clone3` では
   `CLONE_NEWTIME` も）を付けた `clone` と `clone3` は、子を作らずに `EINVAL` で失敗します。

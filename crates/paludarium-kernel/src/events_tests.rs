@@ -582,3 +582,226 @@ fn integration_policy_and_socket_transfer() {
     f.mem.read(GuestAddr(DATA + 64), &mut received).unwrap();
     assert_eq!(&received, b"hi");
 }
+/// Writes a `msghdr` at `at`: name, iovecs `(base, len)` at `at + 0x40`,
+/// and control.
+fn message(f: &Fixture, at: u64, name: (u64, u32), iov: &[(u64, u64)], control: (u64, u64)) {
+    let mut header = [0; 56];
+    header[..8].copy_from_slice(&name.0.to_le_bytes());
+    header[8..12].copy_from_slice(&name.1.to_le_bytes());
+    header[16..24].copy_from_slice(&(at + 0x40).to_le_bytes());
+    header[24..32].copy_from_slice(&(iov.len() as u64).to_le_bytes());
+    header[32..40].copy_from_slice(&control.0.to_le_bytes());
+    header[40..48].copy_from_slice(&control.1.to_le_bytes());
+    f.mem.write(GuestAddr(at), &header).unwrap();
+    for (i, (base, len)) in iov.iter().enumerate() {
+        let entry = at + 0x40 + 16 * i as u64;
+        f.mem.write(GuestAddr(entry), &base.to_le_bytes()).unwrap();
+        f.mem
+            .write(GuestAddr(entry + 8), &len.to_le_bytes())
+            .unwrap();
+    }
+}
+/// Writes one control message at `at` and returns its length.
+fn control(f: &Fixture, at: u64, level: u32, kind: u32, fds: &[u32]) -> u64 {
+    let len = 16 + 4 * fds.len() as u64;
+    f.mem.write(GuestAddr(at), &len.to_le_bytes()).unwrap();
+    f.mem
+        .write(GuestAddr(at + 8), &level.to_le_bytes())
+        .unwrap();
+    f.mem
+        .write(GuestAddr(at + 12), &kind.to_le_bytes())
+        .unwrap();
+    for (i, fd) in fds.iter().enumerate() {
+        f.mem
+            .write(GuestAddr(at + 16 + 4 * i as u64), &fd.to_le_bytes())
+            .unwrap();
+    }
+    len
+}
+fn read_u32(f: &Fixture, at: u64) -> u32 {
+    let mut bytes = [0; 4];
+    f.mem.read(GuestAddr(at), &mut bytes).unwrap();
+    u32::from_le_bytes(bytes)
+}
+fn read_u64(f: &Fixture, at: u64) -> u64 {
+    f.mem.read_u64(GuestAddr(at)).unwrap()
+}
+/// A pair of nonblocking descriptors made by `number` (socketpair or pipe2).
+fn pair(f: &mut Fixture, number: u64, args: [u64; 6]) -> (u64, u64) {
+    assert_eq!(f.ret(number, args), 0);
+    let at = if number == 53 { args[3] } else { args[0] };
+    (u64::from(read_u32(f, at)), u64::from(read_u32(f, at + 4)))
+}
+const SEND: u64 = DATA + 0x100;
+const RECEIVE: u64 = DATA + 0x200;
+const BYTES: u64 = DATA + 0x400;
+const CONTROL: u64 = DATA + 0x500;
+const NAME: u64 = DATA + 0x600;
+const IN: u64 = DATA + 0x800;
+const RECEIVED: u64 = DATA + 0x900;
+/// recvmsg into 64 bytes at IN with `room` control bytes at RECEIVED (none
+/// when 0), and a name buffer.
+fn receive(f: &mut Fixture, fd: u64, len: u64, room: u64, flags: u64) -> u64 {
+    let control = if room == 0 { 0 } else { RECEIVED };
+    message(f, RECEIVE, (NAME, 128), &[(IN, len)], (control, room));
+    f.ret(47, [fd, RECEIVE, flags, 0, 0, 0])
+}
+#[test]
+fn scm_rights_passes_descriptors_over_a_stream() {
+    let mut f = Fixture::new();
+    let (a, b) = pair(&mut f, 53, [1, 0x801, 0, DATA, 0, 0]);
+    let (r, w) = pair(&mut f, 293, [DATA + 8, 0x800, 0, 0, 0, 0]);
+    f.mem.write(GuestAddr(BYTES), b"abcdef").unwrap();
+    assert_eq!(f.ret(1, [a, BYTES, 2, 0, 0, 0]), 2);
+    let len = control(&f, CONTROL, 1, 1, &[r as u32, w as u32]);
+    message(&f, SEND, (0, 0), &[(BYTES + 2, 2)], (CONTROL, len));
+    assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), 2);
+    assert_eq!(f.ret(1, [a, BYTES + 4, 2, 0, 0, 0]), 2);
+    // The read goes on into the write that passed them, and ends there.
+    assert_eq!(receive(&mut f, b, 64, 64, 0x4000_0000), 4);
+    let mut bytes = [0; 4];
+    f.mem.read(GuestAddr(IN), &mut bytes).unwrap();
+    assert_eq!(&bytes, b"abcd");
+    assert_eq!(read_u32(&f, RECEIVE + 8), 0);
+    assert_eq!(read_u64(&f, RECEIVE + 40), 24);
+    assert_eq!(read_u32(&f, RECEIVE + 48), 0x4000_0000);
+    assert_eq!(read_u64(&f, RECEIVED), 24);
+    assert_eq!(read_u32(&f, RECEIVED + 8), 1);
+    assert_eq!(read_u32(&f, RECEIVED + 12), 1);
+    let (x, y) = (
+        u64::from(read_u32(&f, RECEIVED + 16)),
+        u64::from(read_u32(&f, RECEIVED + 20)),
+    );
+    assert_eq!((x, y), (w + 1, w + 2));
+    assert_eq!(f.ret(72, [x, 1, 0, 0, 0, 0]), 1);
+    // The received write end is the same pipe.
+    assert_eq!(f.ret(1, [y, BYTES, 1, 0, 0, 0]), 1);
+    assert_eq!(f.ret(0, [r, IN, 8, 0, 0, 0]), 1);
+    assert_eq!(receive(&mut f, b, 64, 64, 0), 2);
+    assert_eq!(read_u64(&f, RECEIVE + 40), 0);
+    assert_eq!(read_u32(&f, RECEIVE + 48), 0);
+    // A control buffer with room for one: the other is closed, MSG_CTRUNC.
+    assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), 2);
+    assert_eq!(receive(&mut f, b, 1, 20, 0), 1);
+    assert_eq!(read_u64(&f, RECEIVE + 40), 20);
+    assert_eq!(read_u32(&f, RECEIVE + 48), 8);
+    assert_eq!(read_u64(&f, RECEIVED), 20);
+    assert_eq!(u64::from(read_u32(&f, RECEIVED + 16)), y + 1);
+    // The rest of that write comes without them.
+    assert_eq!(receive(&mut f, b, 64, 64, 0), 1);
+    assert_eq!(read_u64(&f, RECEIVE + 40), 0);
+    // No control buffer: both are closed.
+    assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), 2);
+    assert_eq!(receive(&mut f, b, 64, 0, 0), 2);
+    assert_eq!(read_u32(&f, RECEIVE + 48), 8);
+    // A stream write of no bytes passes nothing; an empty read still takes them.
+    message(&f, SEND, (0, 0), &[(BYTES, 0)], (CONTROL, len));
+    assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), 0);
+    message(&f, SEND, (0, 0), &[(BYTES, 1)], (CONTROL, len));
+    assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), 1);
+    assert_eq!(receive(&mut f, b, 0, 64, 0), 0);
+    assert_eq!(read_u64(&f, RECEIVE + 40), 24);
+    assert_eq!(receive(&mut f, b, 64, 64, 0), 1);
+    assert_eq!(read_u64(&f, RECEIVE + 40), 0);
+    assert_eq!(
+        receive(&mut f, b, 64, 64, 0x40),
+        Errno::EAGAIN.to_syscall_return()
+    );
+}
+#[test]
+fn scm_rights_checks_like_linux() {
+    let mut f = Fixture::new();
+    let (a, _b) = pair(&mut f, 53, [1, 0x801, 0, DATA, 0, 0]);
+    let (r, w) = pair(&mut f, 293, [DATA + 8, 0x800, 0, 0, 0, 0]);
+    let send = |f: &mut Fixture, name: (u64, u32), control: (u64, u64), flags: u64| {
+        message(f, SEND, name, &[(BYTES, 1)], control);
+        f.ret(46, [a, SEND, flags, 0, 0, 0])
+    };
+    let fail = |e: i32| Errno(e).to_syscall_return();
+    let len = control(&f, CONTROL, 1, 1, &[99]);
+    assert_eq!(send(&mut f, (0, 0), (CONTROL, len), 0), fail(9));
+    let len = control(&f, CONTROL, 1, 2, &[r as u32, 0, 0]);
+    assert_eq!(send(&mut f, (0, 0), (CONTROL, len), 0), fail(22));
+    // Another level is skipped.
+    let len = control(&f, CONTROL, 6, 2, &[]);
+    assert_eq!(send(&mut f, (0, 0), (CONTROL, len), 0), 1);
+    // A header longer than the buffer, or shorter than itself.
+    assert_eq!(send(&mut f, (0, 0), (CONTROL, 12), 0), 1);
+    f.mem
+        .write(GuestAddr(CONTROL), &40u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(send(&mut f, (0, 0), (CONTROL, 32), 0), fail(22));
+    f.mem
+        .write(GuestAddr(CONTROL), &8u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(send(&mut f, (0, 0), (CONTROL, 32), 0), fail(22));
+    assert_eq!(send(&mut f, (0, 0), (0, 1 << 31), 0), fail(105));
+    assert_eq!(send(&mut f, (0, 0), (0, 0), 1), fail(95));
+    assert_eq!(send(&mut f, (NAME, 4), (0, 0), 0), fail(106));
+    assert_eq!(send(&mut f, (NAME, u32::MAX), (0, 0), 0), fail(22));
+    // A name of length 0 is no name.
+    assert_eq!(send(&mut f, (NAME, 0), (0, 0), 0), 1);
+    message(&f, SEND, (0, 0), &[(BYTES, 1)], (0, 0));
+    f.mem
+        .write(GuestAddr(SEND + 24), &1025u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), fail(90));
+    assert_eq!(f.ret(46, [w, SEND, 0, 0, 0, 0]), fail(88));
+    assert_eq!(f.ret(47, [r, SEND, 0, 0, 0, 0]), fail(88));
+    assert_eq!(f.ret(46, [99, SEND, 0, 0, 0, 0]), fail(9));
+}
+#[test]
+fn scm_rights_on_messages_and_queued_descriptors_close_with_the_socket() {
+    let mut f = Fixture::new();
+    let (a, b) = pair(&mut f, 53, [1, 0x802, 0, DATA, 0, 0]);
+    let (r, w) = pair(&mut f, 293, [DATA + 8, 0x800, 0, 0, 0, 0]);
+    f.mem.write(GuestAddr(BYTES), b"hello").unwrap();
+    let len = control(&f, CONTROL, 1, 1, &[w as u32]);
+    message(&f, SEND, (0, 0), &[(BYTES, 5)], (CONTROL, len));
+    assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), 5);
+    assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), 5);
+    // A short buffer truncates the message, which keeps its descriptor.
+    assert_eq!(receive(&mut f, b, 2, 64, 0), 2);
+    assert_eq!(read_u32(&f, RECEIVE + 48), 0x20);
+    assert_eq!(read_u64(&f, RECEIVE + 40), 24);
+    let copy = u64::from(read_u32(&f, RECEIVED + 16));
+    assert_eq!(f.ret(3, [copy, 0, 0, 0, 0, 0]), 0);
+    // recvmsg with no buffer discards a whole message.
+    assert_eq!(receive(&mut f, b, 0, 64, 0), 0);
+    assert_eq!(read_u32(&f, RECEIVE + 48), 0x20);
+    let copy = u64::from(read_u32(&f, RECEIVED + 16));
+    assert_eq!(f.ret(3, [copy, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        receive(&mut f, b, 64, 64, 0),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    // Addresses: not AF_UNIX, abstract, a missing path, an existing one.
+    let fail = |e: i32| Errno(e).to_syscall_return();
+    for (address, error) in [
+        (&b"\x02\x00abc"[..], 22),
+        (b"\x01\x00\x00abc", 111),
+        (b"\x01\x00/missing\x00", 2),
+        (b"\x01\x00/tmp", 111),
+    ] {
+        f.mem.write(GuestAddr(NAME), address).unwrap();
+        message(
+            &f,
+            SEND,
+            (NAME, address.len() as u32),
+            &[(BYTES, 1)],
+            (0, 0),
+        );
+        assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), fail(error));
+    }
+    // A descriptor still queued closes with the receiving socket.
+    let len = control(&f, CONTROL, 1, 1, &[w as u32]);
+    message(&f, SEND, (0, 0), &[(BYTES, 1)], (CONTROL, len));
+    assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), 1);
+    assert_eq!(f.ret(3, [w, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(0, [r, IN, 8, 0, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    assert_eq!(f.ret(3, [b, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(0, [r, IN, 8, 0, 0, 0]), 0);
+}

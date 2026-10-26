@@ -22,10 +22,22 @@ verified.
   code) keeps its contents. It differs only if `mprotect` made it writable
   and it was changed, where Linux reads it from the executable again.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
-  programs can carry on without the feature. Among them are `sendmsg` and
-  `recvmsg`, so descriptors cannot be passed over a socket (`SCM_RIGHTS`),
-  and `chown`, `fchown`, `lchown` and `fchownat`: every file belongs to root
-  (user and group 0).
+  programs can carry on without the feature. Among them are `chown`,
+  `fchown`, `lchown` and `fchownat`: every file belongs to root (user and
+  group 0).
+- **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
+  `SCM_RIGHTS` as Linux does, with these differences:
+  - `sendmsg` takes only the flags `MSG_NOSIGNAL` and `MSG_DONTWAIT`, and
+    `recvmsg` only `MSG_DONTWAIT` and `MSG_CMSG_CLOEXEC`; others return
+    `EOPNOTSUPP`.
+  - `SCM_CREDENTIALS` returns `EINVAL`, and nothing can turn on
+    `SO_PASSCRED`.
+  - Linux splits a stream write of more than about 32 KiB into parts and
+    passes its descriptors with the first part, so a read ends at the end of
+    that part. Here it ends at the end of the whole write.
+  - A socket whose descriptor waits unread in a socket that only that
+    descriptor keeps open, such as its own, stays open: Linux's garbage
+    collector would close both.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for

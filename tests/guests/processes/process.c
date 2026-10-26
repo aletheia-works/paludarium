@@ -18,6 +18,7 @@
 #include <sys/prctl.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
 #include <sys/times.h>
@@ -47,6 +48,59 @@
 
 static void result(const char *name, long value) { printf("%s=%ld\n", name, value); }
 static pid_t child(void) { return syscall(SYS_fork); }
+/* sendmsg of `len` bytes with `count` descriptors in one SCM_RIGHTS message. */
+static long send_fds(int socket, const char *data, size_t len, const int *fds, int count) {
+    struct iovec iov = {(void *)data, len};
+    union { char bytes[CMSG_SPACE(sizeof(int) * 4)]; struct cmsghdr align; } control;
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+    if (count) {
+        message.msg_control = control.bytes;
+        message.msg_controllen = CMSG_SPACE(sizeof(int) * count);
+        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int) * count);
+        memcpy(CMSG_DATA(header), fds, sizeof(int) * count);
+    }
+    errno = 0;
+    return sendmsg(socket, &message, 0);
+}
+/* recvmsg into `len` bytes with `room` control bytes (no buffer for 0);
+   prints what came, the descriptors as offsets from `base` with their
+   close-on-exec flags, and keeps the first one in *first. */
+static void receive_fds(const char *name, int socket, size_t len, size_t room, int flags, int base, int *first) {
+    char data[16] = {0};
+    struct iovec iov = {data, len};
+    union { char bytes[64]; struct cmsghdr align; } control;
+    struct sockaddr_storage address;
+    struct msghdr message = {.msg_name = &address, .msg_namelen = sizeof address, .msg_iov = &iov, .msg_iovlen = 1,
+                             .msg_control = room ? control.bytes : NULL, .msg_controllen = room, .msg_flags = 0x1234};
+    errno = 0;
+    long got = recvmsg(socket, &message, flags);
+    printf("%s=%ld errno=%d namelen=%d flags=%#x controllen=%zu data=%.*s", name, got, errno,
+           message.msg_namelen, message.msg_flags, (size_t)message.msg_controllen, got > 0 ? (int)got : 0, data);
+    if (got >= 0)
+        for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
+            printf(" [%zu %d %d", (size_t)header->cmsg_len, header->cmsg_level, header->cmsg_type);
+            for (size_t at = 0; CMSG_LEN(at) < header->cmsg_len; at += sizeof(int)) {
+                int fd;
+                memcpy(&fd, CMSG_DATA(header) + at, sizeof fd);
+                printf(" +%d cloexec=%d", fd - base, fcntl(fd, F_GETFD));
+                if (first && at == 0) *first = fd;
+            }
+            printf("]");
+        }
+    printf("\n");
+}
+/* sendmsg with a hand-made control buffer or address; prints the result. */
+static void send_raw(const char *name, int socket, void *address, socklen_t address_len, void *control, size_t control_len) {
+    struct iovec iov = {"z", 1};
+    struct msghdr message = {.msg_name = address, .msg_namelen = address_len, .msg_iov = &iov, .msg_iovlen = 1,
+                             .msg_control = control, .msg_controllen = control_len};
+    errno = 0;
+    long sent = sendmsg(socket, &message, 0);
+    printf("%s=%ld errno=%d\n", name, sent, errno);
+}
 /* What a member of an orphaned process group received: bit 0 SIGHUP,
    bit 1 SIGCONT, bit 2 SIGHUP from the kernel (SI_KERNEL, no sender). */
 static volatile sig_atomic_t hangup_flags;
@@ -1012,6 +1066,141 @@ int main(int argc, char **argv) {
         result("stream-closed", write(stream[0], "a", 1));
         result("errno", errno);
         result("stream-sigpipes", received);
+        return 0;
+    }
+    if (!strcmp(mode, "scm-rights")) {
+        int stream[2], pipe_fds[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, stream);
+        pipe(pipe_fds);
+        /* Received descriptors take the lowest free numbers from here. */
+        int base = dup(0);
+        close(base);
+        char byte;
+        result("plain", write(stream[0], "ab", 2));
+        result("with-fds", send_fds(stream[0], "cd", 2, pipe_fds, 2));
+        result("after", write(stream[0], "ef", 2));
+        int received = -1;
+        /* The read goes on into the write that passed them, and ends there. */
+        receive_fds("first", stream[1], 16, 64, MSG_CMSG_CLOEXEC, base, &received);
+        result("same-pipe", write(received + 1, "x", 1) == 1 && read(pipe_fds[0], &byte, 1) == 1 && byte == 'x');
+        close(received);
+        close(received + 1);
+        receive_fds("rest", stream[1], 16, 64, 0, base, NULL);
+        send_fds(stream[0], "gh", 2, pipe_fds, 1);
+        receive_fds("partial", stream[1], 1, 64, 0, base, &received);
+        close(received);
+        receive_fds("partial-rest", stream[1], 16, 64, 0, base, NULL);
+        /* Room for one of two: the other is closed, with MSG_CTRUNC. */
+        send_fds(stream[0], "ij", 2, pipe_fds, 2);
+        receive_fds("small-control", stream[1], 16, CMSG_LEN(sizeof(int)), 0, base, &received);
+        close(received);
+        send_fds(stream[0], "kl", 2, pipe_fds, 2);
+        receive_fds("no-control", stream[1], 16, 0, 0, base, NULL);
+        /* A stream write of no bytes passes nothing. */
+        result("empty-with-fds", send_fds(stream[0], "", 0, pipe_fds, 1));
+        result("next", write(stream[0], "m", 1));
+        receive_fds("after-empty", stream[1], 16, 64, 0, base, NULL);
+        /* recvmsg with no buffer still takes them; read closes them. */
+        send_fds(stream[0], "no", 2, pipe_fds, 1);
+        receive_fds("empty-buffer", stream[1], 0, 64, 0, base, &received);
+        close(received);
+        receive_fds("empty-buffer-rest", stream[1], 16, 64, 0, base, NULL);
+        send_fds(stream[0], "pq", 2, pipe_fds, 1);
+        char bytes[8];
+        result("read", read(stream[1], bytes, sizeof bytes));
+        receive_fds("drained", stream[1], 16, 64, MSG_DONTWAIT, base, NULL);
+        /* RLIMIT_NOFILE leaves room for one: the other is closed. */
+        struct rlimit old_limit, one = {base + 1, 0};
+        getrlimit(RLIMIT_NOFILE, &old_limit);
+        one.rlim_max = old_limit.rlim_max;
+        send_fds(stream[0], "rs", 2, pipe_fds, 2);
+        setrlimit(RLIMIT_NOFILE, &one);
+        receive_fds("nofile", stream[1], 16, 64, 0, base, &received);
+        setrlimit(RLIMIT_NOFILE, &old_limit);
+        close(received);
+        /* Messages keep their descriptors; recvmsg with no buffer discards one. */
+        int datagram[2];
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, datagram);
+        send_fds(datagram[0], "hello", 5, pipe_fds, 1);
+        send_fds(datagram[0], "world", 5, pipe_fds, 1);
+        receive_fds("truncated", datagram[1], 2, 64, 0, base, &received);
+        close(received);
+        receive_fds("discarded", datagram[1], 0, 64, 0, base, &received);
+        close(received);
+        receive_fds("datagram-drained", datagram[1], 16, 64, MSG_DONTWAIT, base, NULL);
+        int packets[2];
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, packets);
+        result("empty-packet", send_fds(packets[0], "", 0, pipe_fds, 1));
+        receive_fds("packet", packets[1], 16, 64, 0, base, &received);
+        close(received);
+        /* What sendmsg checks. */
+        union { char bytes[64]; struct cmsghdr align; } control;
+        struct cmsghdr *header = (struct cmsghdr *)control.bytes;
+        int bad = 999;
+        result("bad-fd", send_fds(stream[0], "z", 1, &bad, 1));
+        result("errno", errno);
+        header->cmsg_len = CMSG_LEN(sizeof(int));
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS + 76;
+        send_raw("other-type", stream[0], NULL, 0, control.bytes, CMSG_SPACE(sizeof(int)));
+        header->cmsg_level = SOL_SOCKET + 5;
+        send_raw("other-level", stream[0], NULL, 0, control.bytes, CMSG_SPACE(sizeof(int)));
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = 40;
+        send_raw("too-long", stream[0], NULL, 0, control.bytes, 32);
+        header->cmsg_len = 8;
+        send_raw("too-short", stream[0], NULL, 0, control.bytes, 32);
+        send_raw("short-buffer", stream[0], NULL, 0, control.bytes, 12);
+        receive_fds("checked", stream[1], 16, 64, MSG_DONTWAIT, base, NULL);
+        struct sockaddr_un address = {.sun_family = AF_UNIX};
+        send_raw("stream-address", stream[0], &address, sizeof address, NULL, 0);
+        send_raw("packet-address", packets[0], &address, sizeof address, NULL, 0);
+        receive_fds("packet-sent", packets[1], 16, 64, MSG_DONTWAIT, base, NULL);
+        send_raw("family-only", datagram[0], &address, 2, NULL, 0);
+        send_raw("abstract", datagram[0], &address, sizeof address, NULL, 0);
+        strcpy(address.sun_path, "/missing-socket");
+        send_raw("missing", datagram[0], &address, sizeof address, NULL, 0);
+        strcpy(address.sun_path, "/");
+        send_raw("not-a-socket", datagram[0], &address, sizeof address, NULL, 0);
+        address.sun_family = AF_INET;
+        send_raw("inet", datagram[0], &address, sizeof address, NULL, 0);
+        send_raw("pipe", pipe_fds[1], NULL, 0, NULL, 0);
+        struct iovec iov = {"z", 1};
+        struct msghdr many = {.msg_iov = &iov, .msg_iovlen = 1025};
+        errno = 0;
+        result("iovecs", sendmsg(stream[0], &many, 0));
+        result("errno", errno);
+        /* A descriptor still queued closes with the receiving socket. */
+        int carrier[2], ends[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, carrier);
+        pipe(ends);
+        send_fds(carrier[0], "w", 1, &ends[1], 1);
+        close(ends[1]);
+        fcntl(ends[0], F_SETFL, O_NONBLOCK);
+        errno = 0;
+        result("writer-queued", read(ends[0], &byte, 1));
+        result("errno", errno);
+        close(carrier[1]);
+        result("writer-closed", read(ends[0], &byte, 1));
+        /* From one process to another. */
+        int link[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, link);
+        pid_t pid = child();
+        if (pid == 0) {
+            int made[2];
+            pipe(made);
+            send_fds(link[1], "c", 1, &made[0], 1);
+            if (write(made[1], "from-child", 10) != 10) _exit(1);
+            _exit(0);
+        }
+        int status;
+        waitpid(pid, &status, 0);
+        result("child", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        received = -1;
+        receive_fds("from-child", link[0], 16, 64, 0, base, &received);
+        char text[16] = {0};
+        result("child-pipe", read(received, text, sizeof text) == 10 && !memcmp(text, "from-child", 10));
         return 0;
     }
     if (!strcmp(mode, "posix-timer")) {

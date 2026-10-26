@@ -49,6 +49,7 @@
     {"name":"clone3","binary":"process"},
     {"name":"seqpacket","binary":"process"},
     {"name":"dgram","binary":"process"},
+    {"name":"scm-rights","binary":"process"},
     {"name":"pre-exec","binary":"command"},
     {"name":"pre-exec-missing","binary":"command"},
     {"name":"clone-vm","binary":"process"},

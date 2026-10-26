@@ -190,6 +190,7 @@ mod linux {
         processes_clone3 => ("clone3","process"),
         processes_seqpacket => ("seqpacket","process"),
         processes_dgram => ("dgram","process"),
+        processes_scm_rights => ("scm-rights","process"),
         command_pre_exec => ("pre-exec","command"),
         command_pre_exec_missing => ("pre-exec-missing","command"),
         processes_private => ("private","process"),

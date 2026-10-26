@@ -56,6 +56,8 @@ NAMES = {
     41: "socket",
     44: "sendto",
     45: "recvfrom",
+    46: "sendmsg",
+    47: "recvmsg",
     48: "shutdown",
     53: "socketpair",
     56: "clone",

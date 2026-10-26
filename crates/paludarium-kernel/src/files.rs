@@ -17,6 +17,13 @@ pub(crate) struct Descriptor {
     path: Vec<u8>,
     cloexec: bool,
 }
+impl Descriptor {
+    /// The descriptor a process gets for this one's open file over
+    /// `SCM_RIGHTS`: the same file and path, with its own close-on-exec flag.
+    pub(crate) fn received(self, cloexec: bool) -> Self {
+        Self { cloexec, ..self }
+    }
+}
 #[derive(Clone)]
 pub struct Files {
     pub(crate) readiness: Arc<crate::events::ReadinessHub>,
@@ -860,7 +867,12 @@ fn send(
 /// The `struct iovec` array of readv, writev and their positioned forms, as
 /// Linux's `import_iovec` reads it: at most 1024 entries (EINVAL), each
 /// buffer accessible (EFAULT), and the total cut to `MAX_RW_COUNT`.
-fn iovecs(c: &Context<'_>, at: u64, count: u64, write: bool) -> Result<Vec<(u64, usize)>, Errno> {
+pub(crate) fn iovecs(
+    c: &Context<'_>,
+    at: u64,
+    count: u64,
+    write: bool,
+) -> Result<Vec<(u64, usize)>, Errno> {
     if count > 1024 {
         return Err(Errno::EINVAL);
     }
@@ -891,7 +903,11 @@ fn iovecs(c: &Context<'_>, at: u64, count: u64, write: bool) -> Result<Vec<(u64,
     Ok(segments)
 }
 /// Copies `bytes` into the guest buffers of `segments`, in order.
-fn scatter(c: &Context<'_>, segments: &[(u64, usize)], mut bytes: &[u8]) -> Result<(), Errno> {
+pub(crate) fn scatter(
+    c: &Context<'_>,
+    segments: &[(u64, usize)],
+    mut bytes: &[u8],
+) -> Result<(), Errno> {
     for &(base, length) in segments {
         let (head, rest) = bytes.split_at(length.min(bytes.len()));
         output(c, base, head)?;
@@ -905,11 +921,22 @@ fn read_blocking(
     file: &Arc<dyn FileHandle>,
     b: &mut [u8],
 ) -> Result<usize, Errno> {
+    wait_for_read(c, file, false, || file.read(b))
+}
+/// Repeats `read` while it finds nothing yet (EAGAIN) and `file` blocks:
+/// neither `O_NONBLOCK` nor, with `dontwait`, `MSG_DONTWAIT`.
+pub(crate) fn wait_for_read<T>(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    dontwait: bool,
+    mut read: impl FnMut() -> Result<T, Errno>,
+) -> Result<T, Errno> {
     loop {
         let ticket = c.files.readiness.token.value();
-        match file.read(b) {
+        match read() {
             Err(e)
                 if e == Errno::EAGAIN
+                    && !dontwait
                     && file.readiness().is_ok()
                     && file.flags() & crate::events::NONBLOCK == 0 =>
             {
@@ -1768,14 +1795,26 @@ pub(crate) fn write_io(
     bytes: &[u8],
     nosignal: bool,
 ) -> Result<u64, Errno> {
+    write_with(c, file, bytes, nosignal, false, |b| file.write(b))
+}
+/// [`write_io`] through `write`, which writes to `file`; with `dontwait`
+/// (`MSG_DONTWAIT`) it does not wait, as if `file` were nonblocking.
+pub(crate) fn write_with(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    bytes: &[u8],
+    nosignal: bool,
+    dontwait: bool,
+    mut write: impl FnMut(&[u8]) -> Result<usize, Errno>,
+) -> Result<u64, Errno> {
     let stream = file
         .as_any()
         .is_some_and(|a| a.is::<crate::sockets::SocketPairEnd>());
     let mut done = 0;
     loop {
         let ticket = c.files.readiness.token.value();
-        let nonblocking = file.flags() & crate::events::NONBLOCK != 0;
-        match file.write(&bytes[done..]) {
+        let nonblocking = dontwait || file.flags() & crate::events::NONBLOCK != 0;
+        match write(&bytes[done..]) {
             Ok(count) => {
                 done += count;
                 if count == 0 || done == bytes.len() || nonblocking || !stream {

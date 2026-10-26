@@ -23,8 +23,7 @@ Nothing here is a promise, but these are on the table:
   their next releases pass the guest audit (the current ones are held back
   by yanked crates and security advisories in their dependencies).
 - More system calls and instructions. Writable shared file mappings are the
-  largest gap; others include passing descriptors over sockets
-  (`SCM_RIGHTS`) and file ownership (`chown`) (both under
+  largest gap; another is file ownership (`chown`) (both under
   [Limitations](../guide/limitations)).
 - Considering dynamically linked programs.
 - Considering a native JIT.

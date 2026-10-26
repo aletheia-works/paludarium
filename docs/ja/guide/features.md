@@ -33,7 +33,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | システムの情報 | `uname`、`sysinfo`、`getuid`、`geteuid`、`getgid`、`getegid`、`getgroups`、`getrusage`、`times` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
+| ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socket`（常に `EAFNOSUPPORT`）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタの受け渡し）、`shutdown` |
@@ -140,7 +140,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
 - `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、
   ホストのことは見せません。ゲストは root（ユーザーとグループが 0）として動きます。
-  `stat` がどのファイルについても返す持ち主と同じです。
+  ファイルはどれも、`chown` で別の持ち主やグループにするまでは root のもので、
+  メモリ上のファイルシステムはその持ち主を覚えています。Linux と同じく、`chown` は
+  ディレクトリ以外のファイルから set-user-ID のビットを外し、グループが実行できる
+  ときは set-group-ID のビットも外します。持ち主とグループが変わらなくても外します。
+  set-group-ID のディレクトリの中に作ったものはディレクトリのグループを継ぎ、
+  新しいディレクトリはそのビットも継ぎます。
 - `chmod` と `utimensat` は、メモリ上のファイルシステムでも、マウントしたホストの
   ディレクトリでも使えます。Windows のホストでは、`chmod` が変えるのは読み取り専用の
   属性だけです。`stat` が返すのは更新時刻だけで、アクセスと変更の時刻は

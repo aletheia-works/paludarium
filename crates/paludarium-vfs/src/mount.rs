@@ -332,6 +332,17 @@ impl HostFs for MountedFs {
         let (_, fs, relative) = self.route(&p)?;
         fs.set_mode(&relative, mode)
     }
+    fn set_owner(
+        &self,
+        p: &[u8],
+        follow: bool,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<(), Errno> {
+        let p = self.resolve(p, follow, false)?;
+        let (_, fs, relative) = self.route(&p)?;
+        fs.set_owner(&relative, false, uid, gid)
+    }
     fn set_times(
         &self,
         p: &[u8],

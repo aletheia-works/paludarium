@@ -195,6 +195,10 @@ impl FileHandle for MemFile {
         set_node_mode(&mut lock(&self.node), mode);
         Ok(())
     }
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        set_node_owner(&mut lock(&self.node), uid, gid);
+        Ok(())
+    }
     fn set_times(&self, _atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
         set_node_mtime(&mut lock(&self.node), mtime);
         Ok(())

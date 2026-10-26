@@ -194,6 +194,42 @@ fn open_shared_lock_drop() {
     b.flock(6).unwrap();
 }
 #[test]
+fn set_owner_follows_links_and_holds_for_every_name() {
+    let fs = MemFs::new();
+    let f = fs.open(b"/a", 66, 0o644).unwrap();
+    fs.symlink(b"/a", b"/link").unwrap();
+    fs.link(b"/a", b"/b").unwrap();
+    let owner = |path: &[u8], follow| {
+        let s = fs.metadata(path, follow).unwrap();
+        (s.uid, s.gid)
+    };
+    assert_eq!(owner(b"/a", true), (0, 0));
+    fs.set_owner(b"/link", true, Some(1000), Some(100)).unwrap();
+    assert_eq!(
+        (owner(b"/b", true), owner(b"/link", false)),
+        ((1000, 100), (0, 0))
+    );
+    fs.set_owner(b"/link", false, None, Some(7)).unwrap();
+    assert_eq!(owner(b"/link", false), (0, 7));
+    f.set_owner(Some(5), None).unwrap();
+    assert_eq!(f.stat().unwrap().uid, 5);
+    assert_eq!(owner(b"/a", true), (5, 100));
+    assert_eq!(fs.set_owner(b"/none", true, None, None), Err(Errno::ENOENT));
+    // A set-group-ID directory gives its group to what is made in it, and
+    // the bit to a directory.
+    fs.mkdir(b"/d", 0o755).unwrap();
+    fs.set_owner(b"/d", true, Some(1), Some(50)).unwrap();
+    fs.set_mode(b"/d", 0o2755).unwrap();
+    fs.mkdir(b"/d/e", 0o755).unwrap();
+    fs.open(b"/d/f", 66, 0o644).unwrap();
+    let e = fs.metadata(b"/d/e", true).unwrap();
+    let f = fs.metadata(b"/d/f", true).unwrap();
+    assert_eq!((e.uid, e.gid, e.mode), (0, 50, 0o042_755));
+    assert_eq!((f.uid, f.gid, f.mode), (0, 50, 0o100_644));
+    fs.mkdir(b"/g", 0o755).unwrap();
+    assert_eq!(fs.metadata(b"/g", true).unwrap().gid, 0);
+}
+#[test]
 fn set_mode_and_times_keep_the_file_type() {
     let fs = MemFs::new();
     let f = fs.open(b"/a", 66, 0o644).unwrap();

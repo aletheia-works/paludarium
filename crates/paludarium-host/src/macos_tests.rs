@@ -202,6 +202,18 @@ fn macos_fs_mode_times_and_sync() {
     );
     assert_eq!(f.sync(), Ok(()));
     assert_eq!(x.fs().set_mode(b"missing", 0o600), Err(Errno::ENOENT));
+    // A host file stays root's: only an owner and group of 0 are taken.
+    assert_eq!(x.fs().set_owner(b"link", false, Some(0), None), Ok(()));
+    assert_eq!(
+        x.fs().set_owner(b"file", true, None, Some(5)),
+        Err(Errno::EPERM)
+    );
+    assert_eq!(f.set_owner(Some(0), Some(0)), Ok(()));
+    assert_eq!(f.set_owner(Some(1000), None), Err(Errno::EPERM));
+    assert_eq!(
+        x.fs().set_owner(b"missing", true, None, None),
+        Err(Errno::ENOENT)
+    );
     // Times before the epoch go through the file (cap-primitives would panic).
     x.fs().set_times(b"link", true, None, Some(-3)).unwrap();
     assert_eq!(x.fs().metadata(b"file", false).unwrap().mtime_ns, -3);

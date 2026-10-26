@@ -153,6 +153,7 @@ mod linux {
         processes_affinity => ("affinity","process"),
         processes_ids => ("ids","process"),
         processes_access => ("access","process"),
+        processes_chown => ("chown","process"),
         processes_rlimit => ("rlimit","process"),
         processes_nofile_limit => ("nofile-limit","process"),
         processes_fsize_limit => ("fsize-limit","process"),

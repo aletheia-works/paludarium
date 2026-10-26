@@ -128,6 +128,8 @@ enum Kind {
 struct Node {
     kind: Kind,
     mode: u32,
+    /// The owner and group, root's until `chown`.
+    owner: (u32, u32),
     links: u64,
     locks: BTreeMap<u64, u32>,
     mtime_ns: i128,
@@ -147,6 +149,8 @@ impl Node {
                 _ => None,
             },
             mode: self.mode,
+            uid: self.owner.0,
+            gid: self.owner.1,
             links: self.links,
             mtime_ns: self.mtime_ns,
             rdev: 0,
@@ -156,6 +160,10 @@ impl Node {
 /// `chmod`: the file type stays, the permission bits are replaced.
 fn set_node_mode(node: &mut Node, mode: u32) {
     node.mode = (node.mode & 0o170000) | (mode & 0o7777);
+}
+/// `chown`: `None` keeps the owner or the group as it is.
+fn set_node_owner(node: &mut Node, uid: Option<u32>, gid: Option<u32>) {
+    node.owner = (uid.unwrap_or(node.owner.0), gid.unwrap_or(node.owner.1));
 }
 /// `utimensat`: only the modification time is kept; the access time is not.
 fn set_node_mtime(node: &mut Node, mtime: Option<i128>) {
@@ -209,6 +217,7 @@ impl Tree {
             Arc::new(Mutex::new(Node {
                 kind,
                 mode,
+                owner: (0, 0),
                 links,
                 locks: BTreeMap::new(),
                 mtime_ns,
@@ -296,6 +305,9 @@ impl Tree {
         let (p, name) = self.parent(path)?;
         let arc = self.node(p)?;
         let mut n = lock(&arc);
+        // inode_init_owner: in a set-group-ID directory a new file takes the
+        // directory's group, and a new directory the bit as well.
+        let group = (n.mode & 0o2000 != 0).then_some(n.owner.1);
         let Kind::Dir(children) = &mut n.kind else {
             return Err(Errno::ENOTDIR);
         };
@@ -304,6 +316,14 @@ impl Tree {
         }
         let directory = matches!(kind, Kind::Dir(_));
         let id = self.allocate(kind, mode)?;
+        if let Some(group) = group {
+            let node = self.node(id)?;
+            let mut child = lock(&node);
+            child.owner.1 = group;
+            if directory {
+                child.mode |= 0o2000;
+            }
+        }
         children.insert(name, id);
         if directory {
             n.links += 1;
@@ -326,6 +346,7 @@ impl MemFs {
         let root = Node {
             kind: Kind::Dir(BTreeMap::new()),
             mode: 0o040755,
+            owner: (0, 0),
             links: 2,
             locks: BTreeMap::new(),
             mtime_ns: 0,

@@ -102,6 +102,18 @@ impl HostFs for MemFs {
         set_node_mode(&mut lock(&node), mode);
         Ok(())
     }
+    fn set_owner(
+        &self,
+        path: &[u8],
+        follow: bool,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<(), Errno> {
+        let t = lock(&self.tree);
+        let node = t.node(t.resolve(path, follow)?)?;
+        set_node_owner(&mut lock(&node), uid, gid);
+        Ok(())
+    }
     fn set_times(
         &self,
         path: &[u8],

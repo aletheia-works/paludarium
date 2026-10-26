@@ -169,6 +169,9 @@ impl FileHandle for Memfd {
         }
         self.file.set_mode(mode)
     }
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        self.file.set_owner(uid, gid)
+    }
     fn set_times(&self, atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
         self.file.set_times(atime, mtime)
     }

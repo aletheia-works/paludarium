@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
-    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 95, 137, 138, 162, 217, 221, 257, 258, 262, 263, 264,
-    265, 266, 267, 268, 269, 280, 285, 292, 293, 295, 296, 319, 326, 332, 436, 439,
+    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 137, 138, 162, 217, 221, 257, 258, 262,
+    263, 264, 260, 265, 266, 267, 268, 269, 280, 285, 292, 293, 295, 296, 319, 326, 332, 436, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -410,6 +410,75 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let p = at(c, a[0], a[1])?;
     let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
     c.files.fs.set_times(&p, follow, atime, mtime).map(|()| 0)
+}
+/// The owner or group of a `chown` call; -1 leaves it as it is.
+fn owner_id(id: u64) -> Option<u32> {
+    let id = id as u32;
+    (id != u32::MAX).then_some(id)
+}
+/// The mode a file of `mode` has after `chown`, when it changes: as Linux's
+/// `chown_common`, a file that is not a directory loses its set-user-ID bit,
+/// and its set-group-ID bit when group execution is set (root keeps it
+/// otherwise), even when the owner and group stay.
+fn mode_after_chown(mode: u32) -> Option<u32> {
+    if mode & 0o170000 == 0o040000 {
+        return None;
+    }
+    let mut kept = mode & !0o4000;
+    if mode & 0o010 != 0 {
+        kept &= !0o2000;
+    }
+    (kept != mode).then_some(kept & 0o7777)
+}
+/// `fchown(fd, owner, group)`.
+fn chown_file(file: &Arc<dyn FileHandle>, uid: u64, gid: u64) -> Result<u64, Errno> {
+    let mode = file.stat()?.mode;
+    file.set_owner(owner_id(uid), owner_id(gid))?;
+    if let Some(mode) = mode_after_chown(mode) {
+        file.set_mode(mode)?;
+    }
+    Ok(0)
+}
+/// `chown` of `path`; with `follow` false (`lchown`) a final symbolic link
+/// itself, which has no set-user-ID bit to lose.
+fn chown_path(
+    c: &Context<'_>,
+    path: &[u8],
+    follow: bool,
+    uid: u64,
+    gid: u64,
+) -> Result<u64, Errno> {
+    let mode = c.files.fs.metadata(path, follow)?.mode;
+    c.files
+        .fs
+        .set_owner(path, follow, owner_id(uid), owner_id(gid))?;
+    if let Some(mode) = mode_after_chown(mode) {
+        c.files.fs.set_mode(path, mode)?;
+    }
+    Ok(0)
+}
+/// `fchownat(dirfd, path, owner, group, flags)`, in `do_fchownat`'s order:
+/// the flags (EINVAL), then the path; an empty one with `AT_EMPTY_PATH`
+/// names `dirfd` itself, or the working directory.
+fn fchownat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    if a[4] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let raw = path(c, a[1])?;
+    if raw.is_empty() && a[4] & AT_EMPTY_PATH != 0 {
+        if a[0] as i32 != -100 {
+            return chown_file(&c.files.descriptor(a[0])?.file, a[2], a[3]);
+        }
+        let cwd = c
+            .files
+            .cwd
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        return chown_path(c, &cwd, true, a[2], a[3]);
+    }
+    let p = c.files.path(a[0], raw)?;
+    chown_path(c, &p, a[4] & AT_SYMLINK_NOFOLLOW == 0, a[2], a[3])
 }
 fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
     c.mem.write(GuestAddr(addr), b).map_err(|_| Errno::EFAULT)
@@ -1012,6 +1081,8 @@ fn encode_statx(s: FileStat, device: u64) -> Result<[u8; 256], Errno> {
     b[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
     b[4..8].copy_from_slice(&4096u32.to_le_bytes());
     b[16..20].copy_from_slice(&u32::try_from(s.links).unwrap_or(u32::MAX).to_le_bytes());
+    b[20..24].copy_from_slice(&s.uid.to_le_bytes());
+    b[24..28].copy_from_slice(&s.gid.to_le_bytes());
     b[28..30].copy_from_slice(&(s.mode as u16).to_le_bytes());
     b[32..40].copy_from_slice(&s.inode.to_le_bytes());
     b[40..48].copy_from_slice(&s.size.to_le_bytes());
@@ -1080,6 +1151,8 @@ fn encode_stat(s: FileStat) -> Result<[u8; 144], Errno> {
     b[8..16].copy_from_slice(&s.inode.to_le_bytes());
     b[16..24].copy_from_slice(&s.links.to_le_bytes());
     b[24..28].copy_from_slice(&s.mode.to_le_bytes());
+    b[28..32].copy_from_slice(&s.uid.to_le_bytes());
+    b[32..36].copy_from_slice(&s.gid.to_le_bytes());
     b[40..48].copy_from_slice(&s.rdev.to_le_bytes());
     b[48..56].copy_from_slice(&s.size.to_le_bytes());
     b[56..64].copy_from_slice(&4096u64.to_le_bytes());
@@ -1757,6 +1830,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let p = at(c, a[0], a[1])?;
             c.files.fs.set_mode(&p, a[2] as u32).map(|()| 0)
         }
+        // chown, fchown, lchown, fchownat
+        92 | 94 => {
+            let p = at(c, (-100i32) as u64, a[0])?;
+            chown_path(c, &p, n == 92, a[1], a[2])
+        }
+        93 => chown_file(&c.files.descriptor(a[0])?.file, a[1], a[2]),
+        260 => fchownat(c, a),
         280 => utimensat(c, a),
         // statfs, fstatfs
         137 => {
@@ -1908,6 +1988,8 @@ impl FileHandle for StandardFile {
             inode: self.channel as u64,
             size: 0,
             mode: 0o010666,
+            uid: 0,
+            gid: 0,
             links: 1,
             mtime_ns: 0,
             rdev: 0,

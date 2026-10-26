@@ -577,6 +577,71 @@ int main(int argc, char **argv) {
         unlink(path);
         return 0;
     }
+    if (!strcmp(mode, "chown")) {
+        /* The native side is an ordinary user and the emulated one root, so
+           only their own IDs and -1 are given, and owners are compared with
+           them rather than printed. */
+        const char *path = "/tmp/paludarium-processes-chown";
+        const char *link = "/tmp/paludarium-processes-chown-link";
+        const char *dir = "/tmp/paludarium-processes-chown-dir";
+        unlink(path);
+        unlink(link);
+        rmdir(dir);
+        int fd = open(path, O_CREAT|O_RDWR, 0644);
+        symlink(path, link);
+        mkdir(dir, 0755);
+        uid_t uid = getuid();
+        gid_t gid = getgid();
+        struct stat st;
+        outcome("chown", chown(path, uid, gid));
+        stat(path, &st);
+        result("owner", st.st_uid == uid && st.st_gid == gid);
+        /* A file loses set-user-ID, and set-group-ID with group execution,
+           even when nothing changes; a directory keeps both. */
+        chmod(path, 06755);
+        outcome("unchanged", chown(path, -1, -1));
+        stat(path, &st);
+        printf("mode=%o\n", st.st_mode & 07777);
+        chmod(path, 06745);
+        outcome("fchown", fchown(fd, uid, -1));
+        fstat(fd, &st);
+        printf("mode=%o\n", st.st_mode & 07777);
+        chmod(dir, 06755);
+        outcome("directory", chown(dir, -1, gid));
+        stat(dir, &st);
+        printf("mode=%o\n", st.st_mode & 07777);
+        /* What is made in a set-group-ID directory takes its group, and a
+           directory the bit. */
+        mkdir("/tmp/paludarium-processes-chown-dir/sub", 0755);
+        stat("/tmp/paludarium-processes-chown-dir/sub", &st);
+        printf("sub=%o group=%d\n", st.st_mode & 07777, st.st_gid == gid);
+        rmdir("/tmp/paludarium-processes-chown-dir/sub");
+        chmod(path, 04755);
+        outcome("lchown", lchown(link, uid, gid));
+        stat(path, &st);
+        printf("mode=%o\n", st.st_mode & 07777);
+        outcome("nofollow", fchownat(AT_FDCWD, link, -1, -1, AT_SYMLINK_NOFOLLOW));
+        stat(path, &st);
+        printf("mode=%o\n", st.st_mode & 07777);
+        outcome("follow", fchownat(AT_FDCWD, link, -1, -1, 0));
+        stat(path, &st);
+        printf("mode=%o\n", st.st_mode & 07777);
+        chmod(path, 04755);
+        outcome("empty-path", fchownat(fd, "", -1, -1, AT_EMPTY_PATH));
+        fstat(fd, &st);
+        printf("mode=%o\n", st.st_mode & 07777);
+        outcome("empty-no-flag", fchownat(fd, "", -1, -1, 0));
+        outcome("bad-flag", fchownat(AT_FDCWD, path, -1, -1, 0x200));
+        outcome("missing", chown("/tmp/paludarium-processes-chown-missing", -1, -1));
+        outcome("not-a-directory", chown("/tmp/paludarium-processes-chown/x", -1, -1));
+        outcome("bad-fd", fchown(999, -1, -1));
+        outcome("bad-path", syscall(SYS_chown, (char *)8, -1, -1));
+        close(fd);
+        unlink(link);
+        unlink(path);
+        rmdir(dir);
+        return 0;
+    }
     if (!strcmp(mode, "access")) {
         /* The native side is an ordinary user and the emulated one root:
            only results both give are compared (no write without permission). */

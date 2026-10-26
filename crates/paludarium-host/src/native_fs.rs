@@ -38,6 +38,15 @@ fn lock_err(e: std::io::Error) -> Errno {
     }
 }
 /// A guest time (nanoseconds since the Unix epoch) as a host time.
+/// `chown` of a host file: the guest sees every one as root's and cannot
+/// give one to anyone else, so only an owner and a group of 0 are taken
+/// (EPERM otherwise).
+fn stays_root(uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+    if uid.is_some_and(|id| id != 0) || gid.is_some_and(|id| id != 0) {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
 fn system_time(ns: i128) -> Result<std::time::SystemTime, Errno> {
     let magnitude = u64::try_from(ns.unsigned_abs() / 1_000_000_000).map_err(|_| Errno::EINVAL)?;
     let nanos = u32::try_from(ns.unsigned_abs() % 1_000_000_000).map_err(|_| Errno::EINVAL)?;
@@ -153,6 +162,8 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
             inode: m.ino(),
             size: m.len(),
             mode: m.mode(),
+            uid: 0,
+            gid: 0,
             links: m.nlink(),
             mtime_ns,
             // A host device's number is in the host's encoding; none is
@@ -412,6 +423,9 @@ impl FileHandle for NativeFile {
         #[cfg(windows)]
         return read_only::set(&file, mode).map_err(err);
     }
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        stays_root(uid, gid)
+    }
     fn set_times(&self, atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
         let mut times = std::fs::FileTimes::new();
         if let Some(atime) = atime {
@@ -593,6 +607,16 @@ impl HostFs for NativeFs {
             let file = self.root.open_with(p, &options).map_err(err)?.into_std();
             read_only::set(&file, mode).map_err(err)
         }
+    }
+    fn set_owner(
+        &self,
+        p: &[u8],
+        follow: bool,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<(), Errno> {
+        self.metadata(p, follow)?;
+        stays_root(uid, gid)
     }
     fn set_times(
         &self,
@@ -784,6 +808,8 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
             inode: m.ino(),
             size: m.len(),
             mode: m.mode(),
+            uid: 0,
+            gid: 0,
             links: m.nlink(),
             mtime_ns,
             // A host device's number is in the host's encoding; none is

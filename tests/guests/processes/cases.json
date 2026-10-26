@@ -12,6 +12,7 @@
     {"name":"affinity","binary":"process"},
     {"name":"ids","binary":"process"},
     {"name":"access","binary":"process"},
+    {"name":"chown","binary":"process"},
     {"name":"rlimit","binary":"process"},
     {"name":"nofile-limit","binary":"process"},
     {"name":"fsize-limit","binary":"process"},

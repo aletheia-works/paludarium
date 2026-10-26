@@ -39,7 +39,7 @@ kernel.
 | System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socket` (always `EAFNOSUPPORT`), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`), `shutdown` |
@@ -154,7 +154,12 @@ kernel.
   so the guest sees as many CPUs as the host has (one in WebAssembly).
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like
   `CPUID`, it does not reveal the host. The guest runs as root (user and group
-  0), the owner `stat` reports for every file.
+  0), and every file belongs to root until `chown` gives it another owner or
+  group, which the in-memory filesystem keeps. As on Linux, `chown` takes the
+  set-user-ID bit from a file that is not a directory, and the set-group-ID
+  bit when the group may execute it, even when the owner and group stay.
+  What is made in a set-group-ID directory takes the directory's group, and a
+  new directory the bit as well.
 - `chmod` and `utimensat` work in the in-memory filesystem and in mounted
   host directories; on a Windows host, `chmod` only sets or clears the
   read-only attribute. `stat` reports only the modification time, with access

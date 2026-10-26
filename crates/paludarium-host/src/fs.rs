@@ -6,6 +6,10 @@ pub struct FileStat {
     pub inode: u64,
     pub size: u64,
     pub mode: u32,
+    /// The owner (`st_uid`) and group (`st_gid`): root, 0, unless `chown`
+    /// changed them.
+    pub uid: u32,
+    pub gid: u32,
     pub links: u64,
     /// Signed nanoseconds since the Unix epoch; includes the former u64 range.
     pub mtime_ns: i128,
@@ -63,6 +67,10 @@ pub trait FileHandle: Send + Sync {
     fn set_mode(&self, _mode: u32) -> Result<(), Errno> {
         Err(Errno::EPERM)
     }
+    /// `fchown`: sets the owner and group; `None` leaves that one as it is.
+    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), Errno> {
+        Err(Errno::EPERM)
+    }
     /// `futimens`: sets the access and modification times in nanoseconds
     /// since the Unix epoch; `None` leaves that time as it is.
     fn set_times(&self, _atime: Option<i128>, _mtime: Option<i128>) -> Result<(), Errno> {
@@ -116,6 +124,17 @@ pub trait HostFs: Send + Sync {
     /// `chmod`: replaces the permission bits of `path` (following a final
     /// symbolic link) with the low 12 bits of `mode`.
     fn set_mode(&self, _path: &[u8], _mode: u32) -> Result<(), Errno> {
+        Err(Errno::EPERM)
+    }
+    /// `fchownat`: as [`FileHandle::set_owner`], for `path`; with `follow`
+    /// false a final symbolic link itself is changed.
+    fn set_owner(
+        &self,
+        _path: &[u8],
+        _follow: bool,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+    ) -> Result<(), Errno> {
         Err(Errno::EPERM)
     }
     /// `utimensat`: as [`FileHandle::set_times`], for `path`; with `follow`
@@ -208,6 +227,7 @@ mod tests {
         assert_eq!(file.stdio_channel(), None);
         assert_eq!(file.guest_path_hint(), None);
         assert_eq!(file.set_mode(0o644), Err(Errno::EPERM));
+        assert_eq!(file.set_owner(Some(0), None), Err(Errno::EPERM));
         assert_eq!(file.set_times(Some(1), None), Err(Errno::EPERM));
         assert_eq!(file.sync(), Err(Errno::EINVAL));
         assert_eq!(file.read_at(0, &mut [0; 4]), Err(Errno::ENODEV));
@@ -235,6 +255,7 @@ mod tests {
         assert_eq!(fs.rename(b"/a", b"/e"), Ok(()));
         assert_eq!(fs.statfs(b"/"), Err(Errno::ENOSYS));
         assert_eq!(fs.set_mode(b"/a", 0o644), Err(Errno::EPERM));
+        assert_eq!(fs.set_owner(b"/a", true, None, None), Err(Errno::EPERM));
         assert_eq!(fs.set_times(b"/a", true, None, Some(1)), Err(Errno::EPERM));
     }
 }

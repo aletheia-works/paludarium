@@ -22,9 +22,11 @@ verified.
   code) keeps its contents. It differs only if `mprotect` made it writable
   and it was changed, where Linux reads it from the executable again.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
-  programs can carry on without the feature. Among them are `chown`,
-  `fchown`, `lchown` and `fchownat`: every file belongs to root (user and
-  group 0).
+  programs can carry on without the feature.
+- **File owners**: a file in a mounted host directory stays root's, so
+  `chown` to any other owner or group returns `EPERM` there. The guest stays
+  root when it runs a set-user-ID or set-group-ID program, where Linux would
+  take the file's owner or group.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` as Linux does, with these differences:
   - `sendmsg` and `sendto` take only the flags `MSG_NOSIGNAL` and

@@ -530,6 +530,70 @@ fn umask_and_the_chmod_family_set_permission_bits() {
     assert_eq!(f.ret(91, &[99, 0o600]), errno(Errno::EBADF));
     assert_eq!(f.ret(90, &[0, 0o600]), errno(Errno::EFAULT));
 }
+/// The owner, group and mode `stat` (or `lstat`) gives for the path at `at`.
+fn stat_owner(f: &mut Fixture, at: u64, nofollow: bool) -> (u32, u32, u32) {
+    assert_eq!(f.ret(if nofollow { 6 } else { 4 }, &[at, DATA + 0x200]), 0);
+    let mut st = [0; 144];
+    f.mem.read(GuestAddr(DATA + 0x200), &mut st).unwrap();
+    let field = |i: usize| u32::from_le_bytes(st[i..i + 4].try_into().unwrap());
+    (field(28), field(32), field(24))
+}
+#[test]
+fn the_chown_family_sets_owners_and_clears_set_id_bits() {
+    let mut f = fixture();
+    let cwd = (-100i64) as u64;
+    f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x10), b"/link\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x20), b"/none\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x30), b"/dir\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x40), b"\0").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(88, &[DATA, DATA + 0x10]), 0); // symlink /link -> /file
+    assert_eq!(f.ret(83, &[DATA + 0x30, 0o755]), 0);
+    assert_eq!(stat_owner(&mut f, DATA, false), (0, 0, 0o100_600));
+    // chown follows the link, lchown changes the link; -1 keeps an ID.
+    assert_eq!(f.ret(92, &[DATA + 0x10, 1000, 100]), 0);
+    assert_eq!(stat_owner(&mut f, DATA, false), (1000, 100, 0o100_600));
+    assert_eq!(f.ret(94, &[DATA + 0x10, 7, u32::MAX as u64]), 0);
+    assert_eq!(stat_owner(&mut f, DATA + 0x10, true), (7, 0, 0o120_777));
+    assert_eq!(f.ret(93, &[fd, u32::MAX as u64, 5]), 0); // fchown
+    assert_eq!(stat_owner(&mut f, DATA, false), (1000, 5, 0o100_600));
+    // A file loses set-user-ID, and set-group-ID with group execution,
+    // even when nothing changes.
+    assert_eq!(f.ret(90, &[DATA, 0o6755]), 0);
+    assert_eq!(f.ret(92, &[DATA, u32::MAX as u64, u32::MAX as u64]), 0);
+    assert_eq!(stat_owner(&mut f, DATA, false).2, 0o100_755);
+    assert_eq!(f.ret(90, &[DATA, 0o6745]), 0);
+    assert_eq!(f.ret(93, &[fd, 0, 0]), 0);
+    assert_eq!(stat_owner(&mut f, DATA, false), (0, 0, 0o102_745));
+    // A directory keeps both.
+    assert_eq!(f.ret(90, &[DATA + 0x30, 0o6755]), 0);
+    assert_eq!(f.ret(260, &[cwd, DATA + 0x30, 3, 4, 0]), 0);
+    assert_eq!(stat_owner(&mut f, DATA + 0x30, false), (3, 4, 0o046_755));
+    // fchownat: AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH on a descriptor or the
+    // working directory, and other flags.
+    assert_eq!(f.ret(260, &[cwd, DATA + 0x10, 8, 9, 0x100]), 0);
+    assert_eq!(stat_owner(&mut f, DATA + 0x10, true).0, 8);
+    assert_eq!(f.ret(260, &[fd, DATA + 0x40, 11, 12, 0x1000]), 0);
+    assert_eq!(stat_owner(&mut f, DATA, false).0, 11);
+    assert_eq!(f.ret(260, &[cwd, DATA + 0x40, 13, 14, 0x1000]), 0);
+    f.mem.write(GuestAddr(DATA + 0x50), b"/\0").unwrap();
+    assert_eq!(stat_owner(&mut f, DATA + 0x50, false).0, 13);
+    assert_eq!(
+        f.ret(260, &[cwd, DATA + 0x40, 1, 1, 0]),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(f.ret(260, &[cwd, DATA, 1, 1, 0x200]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(260, &[cwd, 0, 1, 1, 0x200]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(92, &[DATA + 0x20, 1, 1]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(93, &[99, 1, 1]), errno(Errno::EBADF));
+    assert_eq!(f.ret(92, &[0, 1, 1]), errno(Errno::EFAULT));
+    // statx reports them too.
+    assert_eq!(f.ret(332, &[cwd, DATA, 0, 0x7ff, DATA + 0x300]), 0);
+    let mut sx = [0; 8];
+    f.mem.read(GuestAddr(DATA + 0x300 + 20), &mut sx).unwrap();
+    assert_eq!(sx, [11, 0, 0, 0, 12, 0, 0, 0]);
+}
 #[test]
 fn utimensat_sets_modification_times_as_linux_checks_them() {
     let mut f = fixture();

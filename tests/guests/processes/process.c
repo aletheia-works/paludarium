@@ -642,6 +642,33 @@ int main(int argc, char **argv) {
         rmdir(dir);
         return 0;
     }
+    if (!strcmp(mode, "fd-attributes")) {
+        /* Pipes and sockets have inodes whose mode and owner fchmod and
+           fchown change; only the caller's own IDs are given. */
+        int pipe_fds[2], pair[2];
+        pipe(pipe_fds);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+        uid_t uid = getuid();
+        gid_t gid = getgid();
+        struct stat st;
+        fstat(pipe_fds[1], &st);
+        printf("pipe=%o owner=%d\n", st.st_mode, st.st_uid == uid && st.st_gid == gid);
+        outcome("pipe-fchmod", fchmod(pipe_fds[0], 04640));
+        fstat(pipe_fds[1], &st);
+        printf("pipe=%o\n", st.st_mode);
+        outcome("pipe-fchown", fchown(pipe_fds[1], uid, gid));
+        fstat(pipe_fds[0], &st);
+        printf("pipe=%o owner=%d\n", st.st_mode, st.st_uid == uid && st.st_gid == gid);
+        fstat(pair[0], &st);
+        printf("socket=%o owner=%d\n", st.st_mode, st.st_uid == uid && st.st_gid == gid);
+        outcome("socket-fchmod", fchmod(pair[0], 0600));
+        outcome("socket-fchown", fchown(pair[0], -1, gid));
+        fstat(pair[0], &st);
+        printf("socket=%o owner=%d\n", st.st_mode, st.st_uid == uid && st.st_gid == gid);
+        fstat(pair[1], &st);
+        printf("peer=%o\n", st.st_mode);
+        return 0;
+    }
     if (!strcmp(mode, "access")) {
         /* The native side is an ordinary user and the emulated one root:
            only results both give are compared (no write without permission). */

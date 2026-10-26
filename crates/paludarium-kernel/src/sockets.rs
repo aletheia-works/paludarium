@@ -19,6 +19,36 @@ pub(crate) struct PipeEnd {
     reader: bool,
     /// One inode for both ends, as a pipe has on Linux.
     inode: u64,
+    attributes: Arc<Attributes>,
+}
+/// What `fchmod` and `fchown` change on the inode of a pipe or a socket, as
+/// Linux's `simple_setattr` keeps them: the mode, whose file type stays, and
+/// the owner and group.
+struct Attributes(Mutex<(u32, u32, u32)>);
+impl Attributes {
+    fn new(mode: u32) -> Self {
+        Self(Mutex::new((mode, 0, 0)))
+    }
+    fn stat(&self, inode: u64) -> FileStat {
+        let (mode, uid, gid) = *self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        FileStat {
+            inode,
+            mode,
+            uid,
+            gid,
+            links: 1,
+            ..FileStat::default()
+        }
+    }
+    fn set_mode(&self, mode: u32) {
+        let mut a = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        a.0 = (a.0 & 0o170000) | (mode & 0o7777);
+    }
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) {
+        let mut a = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        a.1 = uid.unwrap_or(a.1);
+        a.2 = gid.unwrap_or(a.2);
+    }
 }
 #[cfg(test)]
 mod pipe_tests {
@@ -93,16 +123,19 @@ impl PipeEnd {
         reader.shutdown(1)?;
         writer.shutdown(0)?;
         let inode = reader.inode;
+        let attributes = Arc::new(Attributes::new(0o010600));
         Ok([
             Arc::new(Self {
                 endpoint: reader,
                 reader: true,
                 inode,
+                attributes: Arc::clone(&attributes),
             }),
             Arc::new(Self {
                 endpoint: writer,
                 reader: false,
                 inode,
+                attributes,
             }),
         ])
     }
@@ -188,12 +221,15 @@ impl FileHandle for PipeEnd {
         Err(Errno::ESPIPE)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(FileStat {
-            inode: self.inode,
-            mode: 0o010600,
-            links: 1,
-            ..FileStat::default()
-        })
+        Ok(self.attributes.stat(self.inode))
+    }
+    fn set_mode(&self, mode: u32) -> Result<(), Errno> {
+        self.attributes.set_mode(mode);
+        Ok(())
+    }
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        self.attributes.set_owner(uid, gid);
+        Ok(())
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)
@@ -710,6 +746,7 @@ pub(crate) struct SocketPairEnd {
     flags: AtomicU32,
     /// Each end is a socket of its own, with its own inode.
     inode: u64,
+    attributes: Attributes,
 }
 impl SocketPairEnd {
     /// The bytes waiting to be read on this side.
@@ -747,6 +784,7 @@ impl SocketPairEnd {
                 side,
                 flags: AtomicU32::new(2 | kind & NONBLOCK),
                 inode: crate::files::anonymous_inode(),
+                attributes: Attributes::new(0o140777),
             })
         }))
     }
@@ -955,12 +993,16 @@ impl FileHandle for SocketPairEnd {
         Err(Errno::ESPIPE)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(FileStat {
-            inode: self.inode,
-            mode: 0o140777,
-            links: 1,
-            ..FileStat::default()
-        })
+        Ok(self.attributes.stat(self.inode))
+    }
+    /// `sockfs_setattr`, through `simple_setattr`.
+    fn set_mode(&self, mode: u32) -> Result<(), Errno> {
+        self.attributes.set_mode(mode);
+        Ok(())
+    }
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        self.attributes.set_owner(uid, gid);
+        Ok(())
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)

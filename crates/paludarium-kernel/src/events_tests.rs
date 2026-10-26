@@ -879,3 +879,28 @@ fn sendto_and_recvfrom_take_addresses_and_flags_like_sendmsg() {
     message(&f, SEND, (NAME, 16), &[(8, 1)], (0, 0));
     assert_eq!(f.ret(46, [a, SEND, 0, 0, 0, 0]), fail(106));
 }
+#[test]
+fn fchmod_and_fchown_change_pipes_and_sockets() {
+    let mut f = Fixture::new();
+    let (r, w) = pair(&mut f, 293, [DATA + 8, 0, 0, 0, 0, 0]);
+    let (a, b) = pair(&mut f, 53, [1, 1, 0, DATA, 0, 0]);
+    let stat = |f: &mut Fixture, fd: u64| {
+        assert_eq!(f.ret(5, [fd, DATA + 0x100, 0, 0, 0, 0]), 0);
+        (
+            read_u32(f, DATA + 0x100 + 24),
+            read_u32(f, DATA + 0x100 + 28),
+            read_u32(f, DATA + 0x100 + 32),
+        )
+    };
+    assert_eq!(stat(&mut f, w), (0o010_600, 0, 0));
+    // Both ends of a pipe are one inode.
+    assert_eq!(f.ret(91, [r, 0o4640, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(93, [w, 1000, 100, 0, 0, 0]), 0);
+    assert_eq!(stat(&mut f, r), (0o010_640, 1000, 100));
+    assert_eq!(stat(&mut f, w), (0o010_640, 1000, 100));
+    // Each end of a socket pair is its own.
+    assert_eq!(f.ret(91, [a, 0o600, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(93, [a, u32::MAX as u64, 7, 0, 0, 0]), 0);
+    assert_eq!(stat(&mut f, a), (0o140_600, 0, 7));
+    assert_eq!(stat(&mut f, b), (0o140_777, 0, 0));
+}

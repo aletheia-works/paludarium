@@ -45,8 +45,13 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 |---|---|
 | the guest's exit status | the guest called `exit` or `exit_group` |
 | 128 + signal number | the guest was ended by a signal |
-| 2 | a usage error on the command line |
-| 70 | an error of the emulator itself (`EX_SOFTWARE`) |
+| 2 | a usage error on the command line, or a program file that cannot be read |
+| 70 | the guest could not be started, or an error of the emulator itself (`EX_SOFTWARE`) |
+
+The guest cannot be started when, for example, the program is not an ELF file
+paludarium can load, it does not fit in `--max-memory`, or a `--mount` host
+directory cannot be opened. A `paludarium:` line on standard error then names
+the kind of the error, such as `invalid-program` or `host`.
 
 ## Finding what is missing
 

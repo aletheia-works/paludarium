@@ -12,8 +12,8 @@
 //! ```
 //!
 //! Exit codes: the guest's exit code; 128 + signal number when the guest was
-//! killed by a signal; 2 for usage errors; 70 for errors of the emulator
-//! itself.
+//! killed by a signal; 2 for usage errors and an unreadable program file; 70
+//! for a program that cannot be started and for errors of the emulator itself.
 //!
 //! When a CPU fault (an instruction paludarium cannot run, a bad memory
 //! access, a divide error) kills the guest, a `paludarium:` line on standard
@@ -32,7 +32,8 @@ use paludarium_types::{Error, ExitReason, ExitStatus};
 /// Exit code for command-line usage errors.
 pub const EXIT_USAGE: i32 = 2;
 
-/// Exit code for errors of the emulator itself (70 = `EX_SOFTWARE`).
+/// Exit code for a program that cannot be started and for errors of the
+/// emulator itself (70 = `EX_SOFTWARE`).
 pub const EXIT_EMULATOR_ERROR: i32 = 70;
 
 /// Usage text printed on errors and for `--help`.

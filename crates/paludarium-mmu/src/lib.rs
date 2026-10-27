@@ -1360,8 +1360,8 @@ impl AddressSpaceData {
     /// `mremap`, with Linux's checks in Linux's order: resizes the mapping
     /// at `addr`, growing it in place when the pages after it are free, else
     /// moving it as `how` allows. A grown or moved range must lie in one
-    /// Linux VMA (`EFAULT`). A file mapping cannot grow (`ENOMEM`), as
-    /// nothing reads the rest of its file into it. Moving a range that spans
+    /// Linux VMA (`EFAULT`). A file mapping grows over more of its file,
+    /// whose pages it reads on first touch. Moving a range that spans
     /// several VMAs with `MREMAP_FIXED`, which recent Linux allows, gives
     /// `EFAULT`.
     pub fn remap(
@@ -2390,6 +2390,31 @@ mod tests {
             let grown = space
                 .remap_shared(at, 3 * PAGE_SIZE, 4 * PAGE_SIZE, MOVE)
                 .unwrap();
+            assert_eq!(grown, at, "grown in place");
+            // So does one it moves to grow, with a mapping in the way.
+            size.store(6 * PAGE_SIZE, Ordering::SeqCst);
+            let after = GuestAddr(grown.0 + 4 * PAGE_SIZE);
+            space
+                .map_shared(Some(after), PAGE_SIZE, Prot::READ, MappingKind::Anonymous)
+                .unwrap();
+            let moved = space
+                .remap_shared(grown, 4 * PAGE_SIZE, 6 * PAGE_SIZE, MOVE)
+                .unwrap();
+            assert_ne!(moved, grown, "moved to grow");
+            assert_eq!(byte(space, moved.0 + 7), 7);
+            assert_eq!(
+                byte(space, moved.0 + 5 * PAGE_SIZE + 3),
+                pattern(5 * PAGE_SIZE + 3)
+            );
+            size.store(5 * PAGE_SIZE, Ordering::SeqCst);
+            assert!(
+                space
+                    .read(GuestAddr(moved.0 + 5 * PAGE_SIZE), &mut b)
+                    .unwrap_err()
+                    .bus
+            );
+            size.store(4 * PAGE_SIZE, Ordering::SeqCst);
+            let grown = moved;
             assert_eq!(
                 byte(space, grown.0 + 3 * PAGE_SIZE + 2),
                 pattern(3 * PAGE_SIZE + 2)

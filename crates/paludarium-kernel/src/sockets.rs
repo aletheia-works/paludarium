@@ -479,9 +479,6 @@ fn access_ok(at: u64, len: usize) -> Result<(), Errno> {
 fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let len = user_buffer(a[1], a[2])?;
     let file = socket(c, a[0])?;
-    if a[3] & MSG_OOB != 0 {
-        return Err(Errno(95));
-    }
     let mut address = Vec::new();
     if a[4] != 0 {
         let len = usize::try_from(a[5] as u32 as i32)
@@ -494,7 +491,9 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .map_err(|_| Errno::EFAULT)?;
     }
     let socket = as_socket(&file)?;
+    socket.check_out_of_band_send(a[3], true)?;
     let lookup = !address.is_empty() && check_address(socket, &address, len)?;
+    socket.check_out_of_band_send(a[3], false)?;
     c.mem
         .check_read(GuestAddr(a[1]), len)
         .map_err(|_| Errno::EFAULT)?;
@@ -578,14 +577,12 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .map_err(|_| Errno::EFAULT)?;
     let mut passed = passed_descriptors(c, &control)?;
     let socket = as_socket(&file)?;
-    // After __scm_send, as the protocol's sendmsg checks it.
-    if a[2] & MSG_OOB != 0 {
-        return Err(Errno(95));
-    }
+    socket.check_out_of_band_send(a[2], true)?;
     let total = header.iov.iter().map(|(_, len)| len).sum::<usize>();
     // The address is checked, and the data then copied, in the protocol's
     // sendmsg after __scm_send.
     let lookup = header.name.is_some() && check_address(socket, &address, total)?;
+    socket.check_out_of_band_send(a[2], false)?;
     let mut bytes = Vec::new();
     bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
     for &(base, len) in &header.iov {
@@ -893,6 +890,17 @@ impl SocketPairEnd {
         } else {
             self.read_stream(buf, peek)
         }
+    }
+    /// sendmsg's and sendto's `MSG_OOB`, EOPNOTSUPP: a datagram or packet
+    /// socket refuses it `before` the address is checked, as Linux's
+    /// `unix_dgram_sendmsg` after `__scm_send`, and a stream after it, as
+    /// Linux sends the stream's last byte out of band there, which is not
+    /// modelled.
+    fn check_out_of_band_send(&self, flags: u64, before: bool) -> Result<(), Errno> {
+        if flags & MSG_OOB != 0 && self.pair.messages() == before {
+            return Err(Errno(95));
+        }
+        Ok(())
     }
     /// recvmsg's and recvfrom's `MSG_OOB`: a stream has no out-of-band data
     /// to read (EINVAL), and the other kinds have none at all (EOPNOTSUPP).

@@ -840,6 +840,12 @@ fn recvfrom_peeks_waits_for_all_and_gives_whole_message_lengths() {
     // A datagram socket has no out-of-band data at all.
     assert_eq!(f.ret(45, [q, IN, 2, 1, 0, 0]), fail(95));
     assert_eq!(f.ret(44, [p, BYTES, 1, 1, 0, 0]), fail(95));
+    // The address is read first; a datagram socket refuses MSG_OOB before
+    // it checks the address, and a stream after.
+    assert_eq!(f.ret(44, [p, BYTES, 1, 1, NAME, 129]), fail(22));
+    assert_eq!(f.ret(44, [p, BYTES, 1, 1, 8, 16]), fail(14));
+    assert_eq!(f.ret(44, [p, BYTES, 1, 1, NAME, 16]), fail(95));
+    assert_eq!(f.ret(44, [a, BYTES, 1, 1, NAME, 16]), fail(106));
 }
 #[test]
 fn sendto_and_recvfrom_take_addresses_and_flags_like_sendmsg() {

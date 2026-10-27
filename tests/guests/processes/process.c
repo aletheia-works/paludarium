@@ -1700,17 +1700,6 @@ int main(int argc, char **argv) {
         OOB_READ("late-rest", 0, 8);
         close(sv[0]);
         close(sv[1]);
-        /* Only a stream has a mark. */
-        const int kinds[] = {SOCK_DGRAM, SOCK_SEQPACKET};
-        for (int k = 0; k < 2; k++) {
-            socketpair(AF_UNIX, kinds[k], 0, sv);
-            int at = -1;
-            errno = 0;
-            n = ioctl(sv[1], SIOCATMARK, &at);
-            printf("  atmark-kind%d=%ld errno=%d\n", kinds[k], n, errno);
-            close(sv[0]);
-            close(sv[1]);
-        }
 #undef OOB_FRESH
 #undef OOB_READ
 #undef OOB_MARK
@@ -1720,7 +1709,8 @@ int main(int argc, char **argv) {
         /* recvmsg and recvfrom flags on socket pairs: MSG_PEEK leaves the
            data and copies the descriptors, MSG_WAITALL fills a stream's
            buffer, MSG_TRUNC gives a message's whole length, and MSG_OOB
-           finds no out-of-band data; other flags are ignored. */
+           finds no out-of-band byte where none was sent; other flags are
+           ignored. */
         int sv[2], pipe_fds[2], fd, flags;
         char buf[16];
         pipe(pipe_fds);

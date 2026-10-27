@@ -952,9 +952,9 @@ impl SocketPairEnd {
     }
     /// sendmsg's and sendto's `MSG_OOB`, EOPNOTSUPP: a datagram or packet
     /// socket refuses it `before` the address is checked, as Linux's
-    /// `unix_dgram_sendmsg` after `__scm_send`, and a stream after it, as
-    /// Linux sends the stream's last byte out of band there, which is not
-    /// modelled.
+    /// `unix_dgram_sendmsg` after `__scm_send`, and a stream after it, only
+    /// for an empty send; [`send_bytes`] sends a stream's last byte out of
+    /// band.
     fn check_out_of_band_send(&self, flags: u64, before: bool, len: usize) -> Result<(), Errno> {
         if flags & MSG_OOB != 0 && self.pair.messages() == before && (before || len == 0) {
             return Err(Errno(95));
@@ -970,20 +970,19 @@ impl SocketPairEnd {
         Ok(())
     }
     /// `SIOCATMARK`: a stream's next write is its out-of-band byte, or the
-    /// place `MSG_OOB` took it from; a datagram or packet socket has no mark
-    /// (EOPNOTSUPP), as Linux's `unix_ioctl` answers only for a stream.
-    pub(crate) fn at_mark(&self) -> Result<bool, Errno> {
-        if self.pair.messages() {
-            return Err(Errno(95));
-        }
-        Ok(self
-            .pair
-            .sides
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)[self.side]
-            .writes
-            .front()
-            .is_some_and(|write| write.piece != Piece::Data))
+    /// place `MSG_OOB` took it from; a datagram or packet socket is never at
+    /// a mark, as Linux 7.0.0 answers. (Later 7.0 releases refuse it there
+    /// with EOPNOTSUPP.)
+    pub(crate) fn at_mark(&self) -> bool {
+        !self.pair.messages()
+            && self
+                .pair
+                .sides
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)[self.side]
+                .writes
+                .front()
+                .is_some_and(|write| write.piece != Piece::Data)
     }
     /// recvmsg's and recvfrom's `MSG_OOB` on a stream, as Linux's
     /// `unix_stream_recv_urg`: the out-of-band byte, which `peek` leaves,
@@ -1504,16 +1503,16 @@ mod events_tests {
         assert_eq!(a.send(b"ab", &mut Passed::new()), Ok(2));
         assert_eq!(a.send_out_of_band(b'c', &mut Passed::new()), Ok(1));
         assert_ne!(b.readiness().unwrap().0 & PRI, 0);
-        assert_eq!(b.at_mark(), Ok(false));
+        assert!(!b.at_mark());
         // A read stops before the mark; the byte comes with MSG_OOB, once.
         let read = b.receive(&mut buf, true, None).unwrap();
         assert_eq!((read.count, read.at_mark), (2, true));
-        assert_eq!(b.at_mark(), Ok(true));
+        assert!(b.at_mark());
         let peeked = b.receive_out_of_band(&mut buf, true).unwrap();
         assert_eq!((peeked.count, buf[0]), (1, b'c'));
         assert_eq!(b.receive_out_of_band(&mut buf, false).unwrap().count, 1);
         assert_eq!(b.readiness().unwrap().0 & PRI, 0);
-        assert_eq!(b.at_mark(), Ok(true));
+        assert!(b.at_mark());
         assert_eq!(
             b.receive_out_of_band(&mut buf, false).err(),
             Some(Errno::EINVAL)

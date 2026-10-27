@@ -1,7 +1,7 @@
-//! The page caches of files with shared mappings. Linux keeps one page cache
-//! per file, which its `MAP_SHARED` mappings show and its `read` and `write`
-//! go through, so the two always agree. Here a file mapped shared gets a
-//! [`FileCache`] that every shared mapping of it shows (in every process),
+//! The page caches of mapped files. Linux keeps one page cache per file,
+//! which its mappings show (a `MAP_PRIVATE` one until it writes a page) and
+//! its `read` and `write` go through, so the two always agree. Here a mapped
+//! file gets a [`FileCache`] that every mapping of it shows (in every process),
 //! and the file's handles ([`CoherentFile`], given out by [`CoherentFs`])
 //! keep the file and the cache in step: a read, a `stat` or a sync first
 //! writes the pages a guest store changed back to the file, and a write, a
@@ -52,6 +52,8 @@ impl PageCaches {
             pages: SharedPages::new(),
             writer: Mutex::new(None),
             size: AtomicU64::new(size),
+            shrinks: Mutex::default(),
+            shrink_count: AtomicU64::new(0),
             writable: AtomicUsize::new(0),
             clean: AtomicU64::new(0),
             meter,
@@ -106,6 +108,11 @@ pub(crate) struct FileCache {
     /// The file's size, kept by its handles: a mapping cannot reach a page
     /// wholly past it (SIGBUS).
     size: AtomicU64,
+    /// The sizes the file shrank to, each after how many shrinks, kept
+    /// only while no later one is as small: the first one after a count is
+    /// the smallest since ([`paludarium_mmu::PageSource::shrunk_since`]).
+    shrinks: Mutex<Vec<(u64, u64)>>,
+    shrink_count: AtomicU64,
     /// The mappings that may write, which `F_SEAL_WRITE` refuses to seal.
     writable: AtomicUsize,
     /// The pages' generation when they were last written back: a store
@@ -181,6 +188,16 @@ impl FileCache {
         }));
         Ok(mapped.with_source(FilePages::new(file, self)))
     }
+    /// The pages for a new private mapping of `file`, which reads them from
+    /// the file on first touch.
+    pub(crate) fn map_private(self: &Arc<Self>, file: &Arc<dyn FileHandle>) -> SharedPages {
+        self.pages
+            .with_owner(Arc::new(Mapped {
+                cache: Arc::clone(self),
+                writable: false,
+            }))
+            .with_source(FilePages::new(file, self))
+    }
     /// Whether a mapping that may write shows the cache.
     pub(crate) fn mapped_writable(&self) -> bool {
         self.writable.load(Ordering::SeqCst) != 0
@@ -212,6 +229,17 @@ impl FileCache {
     /// The file went from `old` bytes to `size`: what lay past the end reads
     /// as zeros if it grows again.
     fn resized(&self, old: u64, size: u64) {
+        if size < old {
+            let mut shrinks = self.shrinks.lock().unwrap_or_else(PoisonError::into_inner);
+            let count = self.shrink_count.fetch_add(1, Ordering::SeqCst) + 1;
+            while shrinks
+                .last()
+                .is_some_and(|&(_, smallest)| smallest >= size)
+            {
+                shrinks.pop();
+            }
+            shrinks.push((count, size));
+        }
         self.size.store(size, Ordering::SeqCst);
         self.pages.zero(old.min(size), u64::MAX);
     }
@@ -243,6 +271,18 @@ impl paludarium_mmu::PageSource for FilePages {
     }
     fn size(&self) -> Option<u64> {
         Some(self.cache.size.load(Ordering::SeqCst))
+    }
+    fn shrinks(&self) -> u64 {
+        self.cache.shrink_count.load(Ordering::SeqCst)
+    }
+    fn shrunk_since(&self, count: u64) -> Option<u64> {
+        let shrinks = self
+            .cache
+            .shrinks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let first = shrinks.partition_point(|&(after, _)| after <= count);
+        shrinks.get(first).map(|&(_, size)| size)
     }
 }
 

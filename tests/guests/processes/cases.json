@@ -16,6 +16,7 @@
     {"name":"fd-attributes","binary":"process"},
     {"name":"shared-file-mapping","binary":"process"},
     {"name":"file-mapping-end","binary":"process"},
+    {"name":"private-file-mapping","binary":"process"},
     {"name":"rlimit","binary":"process"},
     {"name":"nofile-limit","binary":"process"},
     {"name":"fsize-limit","binary":"process"},

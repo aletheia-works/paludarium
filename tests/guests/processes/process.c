@@ -834,6 +834,59 @@ int main(int argc, char **argv) {
         unlink(path);
         return 0;
     }
+    if (!strcmp(mode, "private-file-mapping")) {
+        /* A private file mapping shows the file's later changes in the
+           pages it has not written, and its first write to a page copies
+           it, for this process alone. A truncation drops the copies it
+           leaves wholly past the end of the file, even when the file grows
+           again, and MADV_DONTNEED drops them too. */
+        struct sigaction action = {0};
+        action.sa_sigaction = on_bus;
+        action.sa_flags = SA_SIGINFO;
+        sigaction(SIGBUS, &action, NULL);
+        const char *path = "/tmp/paludarium-processes-private-file-mapping";
+        unlink(path);
+        int fd = open(path, O_CREAT|O_RDWR|O_TRUNC, 0600);
+        ftruncate(fd, 2 * 4096);
+        pwrite(fd, "hello", 5, 0);
+        pwrite(fd, "pages", 5, 4096);
+        char *map = mmap(NULL, 2 * 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+        printf("mapped=%d first=%.5s\n", map != MAP_FAILED, map);
+        pwrite(fd, "HELLO", 5, 0);
+        printf("unwritten=%.5s\n", map);
+        map[0] = 'j';
+        char file[6] = {0};
+        pread(fd, file, 5, 0);
+        pwrite(fd, "world", 5, 0);
+        printf("copied=%.5s file=%s other=%.5s\n", map, file, map + 4096);
+        fflush(stdout);
+        pid_t child = fork();
+        if (child == 0) {
+            /* The child shows the file in the page neither wrote, and its
+               write copies the page for itself alone. */
+            pwrite(fd, "kid", 3, 4096 + 10);
+            printf("child: shown=%.3s copy=%.5s\n", map + 4096 + 10, map);
+            map[4096] = 'C';
+            printf("child: wrote=%.5s\n", map + 4096);
+            fflush(stdout);
+            _exit(0);
+        }
+        int status;
+        waitpid(child, &status, 0);
+        printf("parent: shown=%.3s page=%.5s copy=%.5s\n", map + 4096 + 10, map + 4096, map);
+        map[4096 + 1] = 'x';
+        ftruncate(fd, 4096);
+        touch("truncated", map + 4096, 0);
+        ftruncate(fd, 2 * 4096);
+        touch("regrown", map + 4096 + 1, 0);
+        printf("kept=%.5s\n", map);
+        madvise(map, 4096, MADV_DONTNEED);
+        printf("dontneed=%.5s\n", map);
+        munmap(map, 2 * 4096);
+        close(fd);
+        unlink(path);
+        return 0;
+    }
     if (!strcmp(mode, "access")) {
         /* The native side is an ordinary user and the emulated one root:
            only results both give are compared (no write without permission). */

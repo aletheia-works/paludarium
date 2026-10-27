@@ -1260,21 +1260,13 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 }
                 return ok(a.0);
             }
-            if let Some(file) = &file
-                && let Err(error) = copy_file(c, file.as_ref(), a, len, offset)
-            {
-                let _ = c.mem.unmap_shared(a, len);
-                return err(error);
-            }
-            // A private mapping remembers its file, which MADV_DONTNEED and
-            // the pages it has not copied yet read, and whose end it cannot
-            // reach past.
+            // A private mapping shows the file's page cache until it writes
+            // a page, which copies it.
             if let Some(file) = &file
                 && let Some(d) = &descriptor
-                && flags & MAP_SHARED == 0
                 && let Err(error) = file_cache(c, d, file).and_then(|cache| {
-                    let source = crate::page_cache::FilePages::new(file, &cache);
-                    c.mem.back_with_file(a, len, source, offset)
+                    c.mem
+                        .back_with_cache(a, len, &cache.map_private(file), offset)
                 })
             {
                 let _ = c.mem.unmap_shared(a, len);
@@ -1372,31 +1364,6 @@ fn is_zero_device(file: &dyn FileHandle) -> bool {
     file.as_any()
         .and_then(|v| v.downcast_ref::<crate::devices::Device>())
         .is_some_and(|d| d.kind() == crate::devices::Kind::Zero)
-}
-
-/// Fills a new file mapping with the file from `offset`; the part of the
-/// mapping past the end of the file stays zero.
-fn copy_file(
-    c: &Context<'_>,
-    file: &dyn FileHandle,
-    at: GuestAddr,
-    len: u64,
-    offset: u64,
-) -> Result<(), Errno> {
-    let mut buf = vec![0; usize::try_from(len).map_or(1 << 20, |len| len.min(1 << 20))];
-    let mut done = 0;
-    while done < len {
-        let want = usize::try_from(len - done).map_or(buf.len(), |n| n.min(buf.len()));
-        let n = file.read_at(offset + done, &mut buf[..want])?;
-        if n == 0 {
-            break;
-        }
-        c.mem
-            .write_initial(GuestAddr(at.0 + done), &buf[..n])
-            .map_err(|_| Errno::EFAULT)?;
-        done += n as u64;
-    }
-    Ok(())
 }
 
 const MADV_DONTNEED: u64 = 4;

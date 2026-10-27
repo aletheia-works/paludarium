@@ -83,8 +83,9 @@ pub enum MappingKind {
     Anonymous,
     Stack,
     Heap,
-    /// A file mapped by `mmap`: a private copy, or, when shared, the pages
-    /// of the file's page cache ([`SharedPages`]).
+    /// A file mapped by `mmap`: the pages of the file's page cache
+    /// ([`SharedPages`]), which a private mapping copies on its first write
+    /// to each.
     File,
 }
 
@@ -228,14 +229,23 @@ struct Page {
     frame: Frame,
     /// The page belongs to a file mapping, which may end before it.
     file: bool,
+    /// The frame is the file's page-cache page, which a private mapping
+    /// shows until its first write to it copies it.
+    cow: bool,
+    /// How many times the file had shrunk ([`PageSource::shrinks`]) when
+    /// a private mapping copied the page.
+    shrinks: u64,
 }
 
 impl Page {
-    fn new(prot: Prot) -> Self {
+    /// The same entry, showing the same frame.
+    fn share(&self) -> Self {
         Page {
-            prot,
-            frame: Arc::new(OnceLock::new()),
-            file: false,
+            prot: self.prot,
+            frame: self.frame.clone(),
+            file: self.file,
+            cow: self.cow,
+            shrinks: self.shrinks,
         }
     }
 
@@ -244,6 +254,22 @@ impl Page {
     fn frame_for_write(&self, meter: Option<&Arc<MemoryMeter>>) -> Option<&FrameBytes> {
         allocated(&self.frame, meter)
     }
+}
+
+/// A frame with a copy of the contents of `frame`, which has none if `frame`
+/// has none; `None` when the meter has no room for them.
+fn copied(frame: &Frame, meter: Option<&Arc<MemoryMeter>>) -> Option<Frame> {
+    let copy = Frame::default();
+    if let Some(bytes) = frame.get() {
+        let bytes = FrameBytes::new(meter, || {
+            bytes
+                .iter()
+                .map(|byte| AtomicU8::new(byte.load(Ordering::Relaxed)))
+                .collect()
+        })?;
+        let _ = copy.set(bytes);
+    }
+    Some(copy)
 }
 
 /// The contents of `frame`, allocated as zeros now if need be; `None` when
@@ -466,9 +492,10 @@ struct SharedMapping {
     may_write: bool,
 }
 
-/// The file a private file mapping was copied from, read at an offset, so
-/// that pages given back with `MADV_DONTNEED` are read from it again, as
-/// Linux faults them in from the file once their private copies are gone.
+/// The file of a file mapping, read at an offset: a page that has no
+/// contents yet is read from it, and a private mapping without the file's
+/// page cache reads the pages given back with `MADV_DONTNEED` from it again,
+/// as Linux faults them in from the file once their private copies are gone.
 pub trait PageSource: Send + Sync {
     /// Reads from `offset`, filling `buf` unless the file ends first, and
     /// returns how much it read.
@@ -476,6 +503,16 @@ pub trait PageSource: Send + Sync {
     /// The file's size now: a page of a file mapping wholly past it raises
     /// SIGBUS. `None` puts no end to the mapping.
     fn size(&self) -> Option<u64> {
+        None
+    }
+    /// How many times the file has shrunk.
+    fn shrinks(&self) -> u64 {
+        0
+    }
+    /// The smallest size the file shrank to after it had shrunk `count`
+    /// times, or `None` if it has not shrunk since.
+    fn shrunk_since(&self, count: u64) -> Option<u64> {
+        let _ = count;
         None
     }
 }
@@ -487,6 +524,9 @@ struct FileBacking {
     end: u64,
     shift: u64,
     source: Arc<dyn PageSource>,
+    /// The file's page cache, whose pages the mapping shows until it writes
+    /// them; without it, as for an ELF segment, the mapping has its own copy.
+    cache: Option<SharedPages>,
 }
 
 /// Where `mremap` may put a mapping ([`AddressSpace::remap`]).
@@ -623,10 +663,15 @@ impl AddressSpaceData {
     /// under one value stay valid while the value is unchanged.
     #[must_use]
     pub fn code_generation(&self) -> u64 {
-        self.shared.values().fold(
-            self.code_generation.load(Ordering::Acquire),
-            |value, shared| value.wrapping_add(shared.pages.generation()),
-        )
+        let caches = self.backing.values().filter_map(|b| b.cache.as_ref());
+        self.shared
+            .values()
+            .map(|shared| &shared.pages)
+            .chain(caches)
+            .fold(
+                self.code_generation.load(Ordering::Acquire),
+                |value, pages| value.wrapping_add(pages.generation()),
+            )
     }
 
     fn shared_at(&self, page: u64) -> Option<&SharedMapping> {
@@ -652,6 +697,31 @@ impl AddressSpaceData {
         source: Arc<dyn PageSource>,
         offset: u64,
     ) -> Result<(), Errno> {
+        self.back(addr, len, source, None, offset)
+    }
+    /// Makes the private file mapping `[addr, addr+len)` show the page
+    /// cache `pages` of the file from `offset`, which must have its file
+    /// ([`SharedPages::with_source`]): a page reads the cache until the
+    /// mapping writes it, which copies it, as a Linux `MAP_PRIVATE`
+    /// mapping does.
+    pub fn back_with_cache(
+        &mut self,
+        addr: GuestAddr,
+        len: u64,
+        pages: &SharedPages,
+        offset: u64,
+    ) -> Result<(), Errno> {
+        let source = pages.source.clone().ok_or(Errno::EINVAL)?;
+        self.back(addr, len, source, Some(pages.clone()), offset)
+    }
+    fn back(
+        &mut self,
+        addr: GuestAddr,
+        len: u64,
+        source: Arc<dyn PageSource>,
+        cache: Option<SharedPages>,
+        offset: u64,
+    ) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
         self.unback(addr.0, end);
         self.backing.insert(
@@ -660,6 +730,7 @@ impl AddressSpaceData {
                 end,
                 shift: offset.wrapping_sub(addr.0),
                 source,
+                cache,
             },
         );
         Ok(())
@@ -688,15 +759,16 @@ impl AddressSpaceData {
             }
         }
     }
-    /// Reads the file of every backed page of `[start, end)` into it, from
-    /// emptied pages: what lies past the end of the file stays zero. A read
-    /// that fails leaves the rest zero too, where Linux would raise SIGBUS
-    /// on the access.
+    /// Reads the file of every page of `[start, end)` backed without a page
+    /// cache into it, from emptied pages: what lies past the end of the file
+    /// stays zero. A read that fails leaves the rest zero too, where Linux
+    /// would raise SIGBUS on the access. A page backed by a page cache shows
+    /// it again on its own.
     fn refill(&mut self, start: u64, end: u64) {
         let ranges: Vec<_> = self
             .backing
             .range(..end)
-            .filter(|(_, backing)| backing.end > start)
+            .filter(|(_, backing)| backing.end > start && backing.cache.is_none())
             .map(|(&at, backing)| (at.max(start), backing.end.min(end), backing.clone()))
             .collect();
         let mut buf = vec![0; PAGE_BYTES];
@@ -718,11 +790,17 @@ impl AddressSpaceData {
         }
     }
     fn page(&self, page: u64, prot: Prot) -> Page {
-        let frame = self.shared_at(page).map(|mapping| {
-            mapping
-                .pages
+        let shared = self
+            .shared_at(page)
+            .map(|mapping| (&mapping.pages, mapping.shift));
+        let cache = || {
+            self.backing_at(page)
+                .and_then(|backing| Some((backing.cache.as_ref()?, backing.shift)))
+        };
+        let frame = shared.or_else(cache).map(|(pages, shift)| {
+            pages
                 .lock()
-                .entry(page.wrapping_add(mapping.shift))
+                .entry(page.wrapping_add(shift))
                 .or_default()
                 .clone()
         });
@@ -732,7 +810,65 @@ impl AddressSpaceData {
             file: self
                 .mapping_at(page)
                 .is_some_and(|m| m.kind == MappingKind::File),
+            cow: shared.is_none() && cache().is_some(),
+            shrinks: 0,
         }
+    }
+    /// A new entry for `page`, with its file read into it if need be.
+    fn fresh(&self, page: u64, prot: Prot) -> Page {
+        let new = self.page(page, prot);
+        self.fill_from_file(page, &new);
+        new
+    }
+    /// Whether `entry`, a private copy of the file mapping page at `page`,
+    /// may be one that a truncation of its file since has left wholly past
+    /// the end of the file ([`Self::refresh`]).
+    fn may_be_truncated(&self, page: u64, entry: &Page) -> bool {
+        entry.file
+            && !entry.cow
+            && self
+                .file_at(page)
+                .is_some_and(|(source, _)| source.shrinks() != entry.shrinks)
+    }
+    /// Brings the entry of the mapped page at `page` up to date before an
+    /// access: a page without one gets one, and a private copy of a page
+    /// that a truncation of its file has since left wholly past the end of
+    /// the file shows the file again, as Linux drops such copies even when
+    /// the file grows again. With `write`, a page-cache page of a private
+    /// mapping becomes a copy of its own; `false` when the meter has no
+    /// room for it.
+    fn refresh(&self, entry: &mut Option<Page>, page: u64, prot: Prot, write: bool) -> bool {
+        match entry {
+            None => *entry = Some(self.fresh(page, prot)),
+            Some(p) if self.may_be_truncated(page, p) => {
+                let Some((source, offset)) = self.file_at(page) else {
+                    return true;
+                };
+                let count = source.shrinks();
+                let past = source
+                    .shrunk_since(p.shrinks)
+                    .is_some_and(|size| offset >= size.div_ceil(PAGE_SIZE) * PAGE_SIZE);
+                if past {
+                    *entry = Some(self.fresh(page, p.prot));
+                } else {
+                    p.shrinks = count;
+                }
+            }
+            Some(_) => {}
+        }
+        let Some(p) = entry.as_mut() else {
+            return true;
+        };
+        if write && p.cow {
+            let Some(frame) = copied(&p.frame, self.meter.as_ref()) else {
+                self.out_of_memory.store(true, Ordering::SeqCst);
+                return false;
+            };
+            p.frame = frame;
+            p.cow = false;
+            p.shrinks = self.file_at(page).map_or(0, |(source, _)| source.shrinks());
+        }
+        true
     }
     /// The file and the offset in it of the file mapping page at `page`.
     fn file_at(&self, page: u64) -> Option<(&Arc<dyn PageSource>, u64)> {
@@ -802,27 +938,12 @@ impl AddressSpaceData {
             for (slot, page) in table.pages.iter().enumerate() {
                 if let Some(page) = page {
                     let address = (index * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE;
-                    let new = if self.shared_at(address).is_some() {
-                        Page {
-                            prot: page.prot,
-                            frame: page.frame.clone(),
-                            file: page.file,
-                        }
-                    } else {
-                        let mut new = Page::new(page.prot);
-                        new.file = page.file;
-                        if let Some(frame) = page.frame.get() {
-                            let bytes = FrameBytes::new(self.meter.as_ref(), || {
-                                frame
-                                    .iter()
-                                    .map(|byte| AtomicU8::new(byte.load(Ordering::Relaxed)))
-                                    .collect()
-                            })
-                            .ok_or(Errno::ENOMEM)?;
-                            let _ = new.frame.set(bytes);
-                        }
-                        new
-                    };
+                    // A page-cache page stays shared, as does shared memory.
+                    let mut new = page.share();
+                    if self.shared_at(address).is_none() && !page.cow {
+                        new.frame =
+                            copied(&page.frame, self.meter.as_ref()).ok_or(Errno::ENOMEM)?;
+                    }
                     cloned.pages[slot] = Some(new);
                 }
             }
@@ -928,15 +1049,15 @@ impl AddressSpaceData {
         // A successful lazy read installs the logical zero-page entry without
         // allocating its byte frame, matching subsequent Linux fault metadata.
         for (page, _, _) in chunks(addr, buf.len()) {
-            if lookup(&directory, page).is_none()
-                && let Some(prot) = self.mapping_at(page).map(|m| m.prot)
-            {
+            let current = lookup(&directory, page);
+            if current.is_some_and(|p| !self.may_be_truncated(page, p)) {
+                continue;
+            }
+            if let Some(prot) = self.mapping_at(page).map(|m| m.prot) {
                 let (dir, slot) = page_index(page);
                 let table = directory.entry(dir).or_insert_with(PageTable::new);
                 if let Some(entry) = table.pages.get_mut(slot) {
-                    let new = self.page(page, prot);
-                    self.fill_from_file(page, &new);
-                    *entry = Some(new);
+                    self.refresh(entry, page, prot, false);
                 }
             }
         }
@@ -996,19 +1117,18 @@ impl AddressSpaceData {
         {
             let directory = self.read_directory();
             self.check(&directory, addr, buf.len(), access)?;
-            let populated =
-                chunks(addr, buf.len()).all(|(page, _, _)| lookup(&directory, page).is_some());
-            if populated {
+            let ready = |page: u64| {
+                lookup(&directory, page).is_some_and(|p| !p.cow && !self.may_be_truncated(page, p))
+            };
+            if chunks(addr, buf.len()).all(|(page, _, _)| ready(page)) {
                 return self.store(&directory, addr, buf);
             }
         }
-        // Populate the pages this write touches for the first time.
+        // Populate the pages this write touches for the first time, and copy
+        // the page-cache pages of a private mapping.
         let mut directory = self.write_directory();
         self.check(&directory, addr, buf.len(), access)?;
         for (page, _, _) in chunks(addr, buf.len()) {
-            if lookup(&directory, page).is_some() {
-                continue;
-            }
             let Some(prot) = self.mapping_at(page).map(|m| m.prot) else {
                 return Err(Fault {
                     addr: GuestAddr(page),
@@ -1021,10 +1141,17 @@ impl AddressSpaceData {
             };
             let (dir, slot) = page_index(page);
             let table = directory.entry(dir).or_insert_with(PageTable::new);
-            if let Some(entry) = table.pages.get_mut(slot) {
-                let new = self.page(page, prot);
-                self.fill_from_file(page, &new);
-                *entry = Some(new);
+            if let Some(entry) = table.pages.get_mut(slot)
+                && !self.refresh(entry, page, prot, true)
+            {
+                return Err(Fault {
+                    addr: GuestAddr(page),
+                    write: true,
+                    fetch: false,
+                    mapped: true,
+                    present: false,
+                    bus: false,
+                });
             }
         }
         self.store(&directory, addr, buf)
@@ -1285,11 +1412,7 @@ impl AddressSpaceData {
                     continue;
                 }
                 let taken = if keep {
-                    entry.as_ref().map(|p| Page {
-                        prot: p.prot,
-                        frame: p.frame.clone(),
-                        file: p.file,
-                    })
+                    entry.as_ref().map(Page::share)
                 } else {
                     entry.take()
                 };
@@ -1994,6 +2117,16 @@ impl AddressSpace {
     ) -> Result<(), Errno> {
         self.locked().back_with_file(addr, len, source, offset)
     }
+    /// See [`AddressSpaceData::back_with_cache`].
+    pub fn back_with_cache(
+        &self,
+        addr: GuestAddr,
+        len: u64,
+        pages: &SharedPages,
+        offset: u64,
+    ) -> Result<(), Errno> {
+        self.locked().back_with_cache(addr, len, pages, offset)
+    }
     /// See [`AddressSpaceData::check_private_anonymous`].
     pub fn check_private_anonymous(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().check_private_anonymous(addr, len)
@@ -2340,6 +2473,48 @@ mod tests {
     }
     fn pattern(offset: u64) -> u8 {
         (offset % 251) as u8
+    }
+
+    #[test]
+    fn a_private_file_mapping_shows_the_page_cache_until_it_writes() {
+        let file: Arc<dyn PageSource> = Arc::new(Pattern(2 * PAGE_SIZE));
+        let pages = SharedPages::new().with_source(Arc::clone(&file));
+        let parent = AddressSpace::new();
+        let at = parent
+            .map_shared(
+                None,
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE.union(Prot::EXEC),
+                MappingKind::File,
+            )
+            .unwrap();
+        parent
+            .back_with_cache(at, 2 * PAGE_SIZE, &pages, 0)
+            .unwrap();
+        assert_eq!(byte(&parent, at.0 + 3), 3);
+        let child = parent.fork().unwrap();
+        // The cache's changes show in both, and change the code.
+        let code = parent.code_generation();
+        pages.store(3, b"c");
+        assert_ne!(parent.code_generation(), code);
+        assert_eq!(byte(&parent, at.0 + 3), b'c');
+        assert_eq!(byte(&child, at.0 + 3), b'c');
+        // A write copies the page for the space that made it alone.
+        child.write(GuestAddr(at.0 + 4), b"w").unwrap();
+        pages.store(3, b"d");
+        assert_eq!(byte(&child, at.0 + 3), b'c');
+        assert_eq!(byte(&child, at.0 + 4), b'w');
+        assert_eq!(byte(&parent, at.0 + 3), b'd');
+        assert_eq!(byte(&parent, at.0 + 4), 4);
+        assert_eq!(byte(&child, at.0 + PAGE_SIZE), pattern(PAGE_SIZE));
+        let mut written = Vec::new();
+        pages
+            .write_back(|key, _| {
+                written.push(key);
+                Ok(())
+            })
+            .unwrap();
+        assert!(written.is_empty(), "the cache stays clean");
     }
 
     #[test]

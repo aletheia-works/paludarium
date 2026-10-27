@@ -136,11 +136,17 @@ kernel.
   `EPIPE`, as on Linux.
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
-  store to them is what `read` and later mappings of the file, private ones
-  included, see, and `write`, `ftruncate` and punching a hole change what the
-  mappings show; a store past the end of the file stays out of it. Such a
-  mapping may write, and become writable with `mprotect`, only when the file
-  is open for reading and writing (`EACCES` otherwise), as Linux has it.
+  store to them is what `read` and the file's private mappings see, and
+  `write`, `ftruncate` and punching a hole change what the mappings show; a
+  store past the end of the file stays out of it. Such a mapping may write,
+  and become writable with `mprotect`, only when the file is open for
+  reading and writing (`EACCES` otherwise), as Linux has it.
+- A `MAP_PRIVATE` mapping of a file shows the same page cache in the pages
+  it has not written, so it sees later changes to the file there, and its
+  first write to a page copies the page for its process alone, as on Linux;
+  a `fork`ed child shares the pages neither process has written. A
+  truncation drops the copies it leaves wholly past the end of the file, so
+  that they read the file again when it grows, as Linux drops them.
 - A page of a file mapping, private or shared, wholly past the end of the
   file raises `SIGBUS` (`BUS_ADRERR`, with the address) when it is touched,
   as on Linux; a system call given such memory fails with `EFAULT`. The end

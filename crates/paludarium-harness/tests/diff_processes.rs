@@ -157,6 +157,7 @@ mod linux {
         processes_fd_attributes => ("fd-attributes","process"),
         processes_shared_file_mapping => ("shared-file-mapping","process"),
         processes_file_mapping_end => ("file-mapping-end","process"),
+        processes_private_file_mapping => ("private-file-mapping","process"),
         processes_rlimit => ("rlimit","process"),
         processes_nofile_limit => ("nofile-limit","process"),
         processes_fsize_limit => ("fsize-limit","process"),

@@ -1429,6 +1429,41 @@ fn file_mappings_end_where_their_file_does() {
     }
 }
 #[test]
+fn private_file_mappings_show_the_file_until_they_write_it() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0hello").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(1, &[fd, DATA + 6, 5]), 5);
+    assert_eq!(f.ret(77, &[fd, 2 * 4096]), 0);
+    let at = f.ret(syscalls::nr::MMAP, &[0, 2 * 4096, 3, 2, fd, 0]);
+    assert_eq!(memory_bytes(&f, at, 5), b"hello");
+    // A page the mapping has not written shows later writes to the file.
+    f.mem.write(GuestAddr(DATA), b"HELLOworld").unwrap();
+    assert_eq!(f.ret(18, &[fd, DATA, 5, 0]), 5);
+    assert_eq!(memory_bytes(&f, at, 5), b"HELLO");
+    // Its first write copies it: the file keeps its bytes, and the copy
+    // does not show the file's later changes.
+    f.mem.write(GuestAddr(at), b"j").unwrap();
+    assert_eq!(file_bytes(&mut f, fd, 0, 5), b"HELLO");
+    assert_eq!(f.ret(18, &[fd, DATA + 5, 5, 0]), 5);
+    assert_eq!(memory_bytes(&f, at, 5), b"jELLO");
+    assert_eq!(f.ret(18, &[fd, DATA + 5, 5, 4096]), 5);
+    assert_eq!(memory_bytes(&f, at + 4096, 5), b"world");
+    // A truncation drops the copies it leaves wholly past the end of the
+    // file, even when the file grows again; the others stay.
+    f.mem.write(GuestAddr(at + 4096), b"x").unwrap();
+    assert_eq!(f.ret(77, &[fd, 4096]), 0);
+    let mut b = [0];
+    assert!(f.mem.read(GuestAddr(at + 4096), &mut b).unwrap_err().bus);
+    assert_eq!(f.ret(77, &[fd, 2 * 4096]), 0);
+    assert_eq!(memory_bytes(&f, at + 4096, 5), [0; 5]);
+    assert_eq!(memory_bytes(&f, at, 5), b"jELLO");
+    // MADV_DONTNEED gives a copy back: the page shows the file again.
+    assert_eq!(f.ret(28, &[at, 4096, 4]), 0);
+    assert_eq!(memory_bytes(&f, at, 5), b"world");
+    assert_eq!(f.ret(11, &[at, 2 * 4096]), 0);
+}
+#[test]
 fn memory_file_shared_mapping_needs_a_writable_file() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();

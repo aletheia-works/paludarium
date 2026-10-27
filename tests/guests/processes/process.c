@@ -1585,6 +1585,11 @@ int main(int argc, char **argv) {
         errno = 0;
         n = recv(sv[1], buf, 8, MSG_OOB | MSG_DONTWAIT);
         printf("stream oob=%ld errno=%d\n", n, errno);
+        /* A stream checks the address before MSG_OOB (EISCONN). */
+        struct sockaddr_un nowhere = {.sun_family = AF_UNIX, .sun_path = "/tmp/none"};
+        errno = 0;
+        n = sendto(sv[0], "z", 1, MSG_OOB, (struct sockaddr *)&nowhere, sizeof nowhere);
+        printf("stream oob-address=%ld errno=%d\n", n, errno);
         fflush(stdout);
         /* MSG_WAITALL waits for writes to come, and ends with the stream. */
         pid_t pid = fork();
@@ -1636,6 +1641,14 @@ int main(int argc, char **argv) {
             errno = 0;
             n = send(sv[0], "z", 1, MSG_OOB);
             printf("%s send-oob=%ld errno=%d\n", names[k], n, errno);
+            /* The address is read before MSG_OOB is refused. */
+            struct sockaddr_un none = {.sun_family = AF_UNIX, .sun_path = "/tmp/none"};
+            errno = 0;
+            n = sendto(sv[0], "z", 1, MSG_OOB, (struct sockaddr *)&none, 200);
+            printf("%s oob-long-address=%ld errno=%d\n", names[k], n, errno);
+            errno = 0;
+            n = sendto(sv[0], "z", 1, MSG_OOB, (struct sockaddr *)&none, sizeof none);
+            printf("%s oob-address=%ld errno=%d\n", names[k], n, errno);
             close(sv[0]);
             close(sv[1]);
         }

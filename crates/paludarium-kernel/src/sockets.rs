@@ -1,5 +1,5 @@
 //! AF_UNIX stream endpoints. Buffers and peer lifetime belong to the Kernel.
-use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
+use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, PRI, ReadinessHub};
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
@@ -491,9 +491,9 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .map_err(|_| Errno::EFAULT)?;
     }
     let socket = as_socket(&file)?;
-    socket.check_out_of_band_send(a[3], true)?;
+    socket.check_out_of_band_send(a[3], true, len)?;
     let lookup = !address.is_empty() && check_address(socket, &address, len)?;
-    socket.check_out_of_band_send(a[3], false)?;
+    socket.check_out_of_band_send(a[3], false, len)?;
     c.mem
         .check_read(GuestAddr(a[1]), len)
         .map_err(|_| Errno::EFAULT)?;
@@ -506,14 +506,7 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if lookup {
         return Err(unreachable_address(c, &address));
     }
-    crate::files::write_with(
-        c,
-        &file,
-        &bytes,
-        a[3] & MSG_NOSIGNAL != 0,
-        a[3] & MSG_DONTWAIT != 0,
-        |b| socket.send(b, &mut Passed::new()),
-    )
+    send_bytes(c, &file, socket, &bytes, a[3], &mut Passed::new())
 }
 /// `recvfrom(fd, buf, len, flags, addr, addrlen)` on a socket pair: recvmsg
 /// with one buffer and no control buffer, so the descriptors a message passes
@@ -553,9 +546,9 @@ fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     Ok(returned)
 }
 /// `sendmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS`. Of the
-/// flags `MSG_NOSIGNAL` and `MSG_DONTWAIT` act, `MSG_OOB` is EOPNOTSUPP (a
-/// stream's out-of-band data is not modelled), and the rest are ignored, as
-/// Linux's AF_UNIX sockets ignore them.
+/// flags `MSG_NOSIGNAL`, `MSG_DONTWAIT` and, on a stream, `MSG_OOB` act
+/// ([`send_bytes`]); `MSG_OOB` is EOPNOTSUPP on the other kinds, and the rest
+/// are ignored, as Linux's AF_UNIX sockets ignore them.
 fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let file = socket(c, a[0])?;
     let header = message_header(c, a[1], false)?;
@@ -577,12 +570,12 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .map_err(|_| Errno::EFAULT)?;
     let mut passed = passed_descriptors(c, &control)?;
     let socket = as_socket(&file)?;
-    socket.check_out_of_band_send(a[2], true)?;
     let total = header.iov.iter().map(|(_, len)| len).sum::<usize>();
+    socket.check_out_of_band_send(a[2], true, total)?;
     // The address is checked, and the data then copied, in the protocol's
     // sendmsg after __scm_send.
     let lookup = header.name.is_some() && check_address(socket, &address, total)?;
-    socket.check_out_of_band_send(a[2], false)?;
+    socket.check_out_of_band_send(a[2], false, total)?;
     let mut bytes = Vec::new();
     bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
     for &(base, len) in &header.iov {
@@ -595,14 +588,7 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if lookup {
         return Err(unreachable_address(c, &address));
     }
-    let result = crate::files::write_with(
-        c,
-        &file,
-        &bytes,
-        a[2] & MSG_NOSIGNAL != 0,
-        a[2] & MSG_DONTWAIT != 0,
-        |b| socket.send(b, &mut passed),
-    );
+    let result = send_bytes(c, &file, socket, &bytes, a[2], &mut passed);
     // What was not passed closes here, outside the socket's lock.
     drop(passed);
     result
@@ -621,8 +607,9 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let received = receive_with(c, &file, socket, &mut bytes, a[2])?;
     let returned = received.returned(a[2]);
     crate::files::scatter(c, &header.iov, &bytes[..received.count])?;
-    // ____sys_recvmsg starts msg_flags with MSG_CMSG_CLOEXEC.
-    let mut flags = (a[2] & MSG_CMSG_CLOEXEC) as u32;
+    // ____sys_recvmsg starts msg_flags with MSG_CMSG_CLOEXEC, and
+    // unix_stream_recv_urg adds MSG_OOB.
+    let mut flags = (a[2] & (MSG_CMSG_CLOEXEC | MSG_OOB)) as u32;
     if received.truncated {
         flags |= MSG_TRUNC;
     }
@@ -644,12 +631,46 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .map_err(|_| Errno::EFAULT)?;
     Ok(returned)
 }
+/// Sends `bytes` for sendto or sendmsg with their `flags`. With `MSG_OOB` on
+/// a stream, all but the last byte go as data and then, once they all have,
+/// the last one out of band, as Linux's `unix_stream_sendmsg` and
+/// `queue_oob`; the descriptors go with the first part sent.
+fn send_bytes(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    socket: &SocketPairEnd,
+    bytes: &[u8],
+    flags: u64,
+    passed: &mut Passed,
+) -> Result<u64, Errno> {
+    let (nosignal, dontwait) = (flags & MSG_NOSIGNAL != 0, flags & MSG_DONTWAIT != 0);
+    let Some((&last, data)) = bytes.split_last().filter(|_| flags & MSG_OOB != 0) else {
+        return crate::files::write_with(c, file, bytes, nosignal, dontwait, |b| {
+            socket.send(b, passed)
+        });
+    };
+    let sent = if data.is_empty() {
+        0
+    } else {
+        crate::files::write_with(c, file, data, nosignal, dontwait, |b| {
+            socket.send(b, passed)
+        })?
+    };
+    if sent != data.len() as u64 {
+        return Ok(sent);
+    }
+    let urgent = crate::files::write_with(c, file, &[last], nosignal, dontwait, |_| {
+        socket.send_out_of_band(last, passed)
+    })?;
+    Ok(sent + urgent)
+}
 /// Reads for recvmsg or recvfrom with their `flags`, as Linux's AF_UNIX
 /// sockets take them: `MSG_DONTWAIT` does not wait, `MSG_PEEK` leaves the
 /// data, and its descriptors, where they are, and on a stream `MSG_WAITALL`
-/// goes on until `bytes` is full, the stream ends, descriptors come, or a
-/// signal arrives after some data, which it then returns. Other flags have
-/// no effect.
+/// goes on until `bytes` is full, the stream ends or reaches its
+/// out-of-band mark, descriptors come, or a signal arrives after some data,
+/// which it then returns. `MSG_OOB` takes a stream's out-of-band byte, and
+/// never waits. Other flags have no effect.
 fn receive_with(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -659,6 +680,9 @@ fn receive_with(
 ) -> Result<Received, Errno> {
     let dontwait = flags & MSG_DONTWAIT != 0;
     let peek = flags & MSG_PEEK != 0;
+    if flags & MSG_OOB != 0 {
+        return socket.receive_out_of_band(bytes, peek);
+    }
     let mut received = crate::files::wait_for_read(c, file, dontwait, || {
         socket.receive(bytes, true, peek.then_some(0))
     })?;
@@ -666,7 +690,11 @@ fn receive_with(
         && !socket.pair.messages()
         && !dontwait
         && socket.flags() & NONBLOCK == 0;
-    while wait_all && (1..bytes.len()).contains(&received.count) && received.passed.is_empty() {
+    while wait_all
+        && (1..bytes.len()).contains(&received.count)
+        && received.passed.is_empty()
+        && !received.at_mark
+    {
         let done = received.count;
         let more = crate::files::wait_for_read(c, file, false, || {
             socket.receive(&mut bytes[done..], true, peek.then_some(done))
@@ -676,6 +704,8 @@ fn receive_with(
                 received.count += more.count;
                 received.length += more.count;
                 received.passed = more.passed;
+                received.at_mark = more.at_mark;
+                received.discarded.extend(more.discarded);
             }
             // The end of the stream, or an error such as a signal after
             // some data, which Linux's unix_stream_read_generic returns
@@ -740,6 +770,17 @@ pub(crate) type Passed = Vec<crate::files::Descriptor>;
 struct Write {
     len: usize,
     passed: Passed,
+    piece: Piece,
+}
+/// What a stream's write is: data, or its out-of-band byte, as Linux's
+/// `oob_skb`, which stays in the queue, empty, once `MSG_OOB` took it. A
+/// read stops before either, and one that reaches it with nothing read yet
+/// drops it, the byte too, and reads on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Piece {
+    Data,
+    OutOfBand,
+    Taken,
 }
 /// What one read took: the bytes copied, the descriptors that came with them,
 /// and whether a message was longer than the buffer (`MSG_TRUNC`).
@@ -750,6 +791,11 @@ pub(crate) struct Received {
     pub(crate) truncated: bool,
     /// The whole message's length, or the bytes copied from a stream.
     pub(crate) length: usize,
+    /// A stream read stopped at the out-of-band mark.
+    at_mark: bool,
+    /// The descriptors of dropped out-of-band bytes, closed with this,
+    /// outside the socket's lock.
+    discarded: Passed,
 }
 impl Received {
     /// What recvmsg or recvfrom returns: with `MSG_TRUNC`, a message's
@@ -896,20 +942,67 @@ impl SocketPairEnd {
     /// `unix_dgram_sendmsg` after `__scm_send`, and a stream after it, as
     /// Linux sends the stream's last byte out of band there, which is not
     /// modelled.
-    fn check_out_of_band_send(&self, flags: u64, before: bool) -> Result<(), Errno> {
-        if flags & MSG_OOB != 0 && self.pair.messages() == before {
+    fn check_out_of_band_send(&self, flags: u64, before: bool, len: usize) -> Result<(), Errno> {
+        if flags & MSG_OOB != 0 && self.pair.messages() == before && (before || len == 0) {
             return Err(Errno(95));
         }
         Ok(())
     }
-    /// recvmsg's and recvfrom's `MSG_OOB`: a stream has no out-of-band data
-    /// to read (EINVAL), and the other kinds have none at all (EOPNOTSUPP).
+    /// recvmsg's and recvfrom's `MSG_OOB`: only a stream has out-of-band
+    /// data (EOPNOTSUPP on the other kinds).
     fn check_out_of_band(&self, flags: u64) -> Result<(), Errno> {
-        match (flags & MSG_OOB != 0, self.pair.messages()) {
-            (false, _) => Ok(()),
-            (true, false) => Err(Errno::EINVAL),
-            (true, true) => Err(Errno(95)),
+        if flags & MSG_OOB != 0 && self.pair.messages() {
+            return Err(Errno(95));
         }
+        Ok(())
+    }
+    /// `SIOCATMARK`: a stream's next write is its out-of-band byte, or the
+    /// place `MSG_OOB` took it from.
+    pub(crate) fn at_mark(&self) -> bool {
+        !self.pair.messages()
+            && self
+                .pair
+                .sides
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)[self.side]
+                .writes
+                .front()
+                .is_some_and(|write| write.piece != Piece::Data)
+    }
+    /// recvmsg's and recvfrom's `MSG_OOB` on a stream, as Linux's
+    /// `unix_stream_recv_urg`: the out-of-band byte, which `peek` leaves,
+    /// EINVAL when there is none.
+    fn receive_out_of_band(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
+        let mut sides = self
+            .pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let own = &mut sides[self.side];
+        let index = own
+            .writes
+            .iter()
+            .position(|write| write.piece == Piece::OutOfBand)
+            .ok_or(Errno::EINVAL)?;
+        let at: usize = own.writes.iter().take(index).map(|write| write.len).sum();
+        let count = buf.len().min(1);
+        if let (Some(byte), Some(&value)) = (buf.first_mut(), own.bytes.get(at)) {
+            *byte = value;
+        }
+        if !peek {
+            own.bytes.remove(at);
+            if let Some(write) = own.writes.get_mut(index) {
+                write.piece = Piece::Taken;
+                write.len = 0;
+            }
+            sides[1 - self.side].output_epoch = sides[1 - self.side].output_epoch.wrapping_add(1);
+            self.pair.hub.changed();
+        }
+        Ok(Received {
+            count,
+            length: 1,
+            ..Received::default()
+        })
     }
     /// SOCK_SEQPACKET and SOCK_DGRAM read: the next whole message,
     /// truncated to `buf`, with its descriptors. An empty buffer reaches
@@ -941,6 +1034,7 @@ impl SocketPairEnd {
                 truncated: count < message.len,
                 passed: message.passed.clone(),
                 length: message.len,
+                ..Received::default()
             });
         }
         let Some(message) = own.writes.pop_front() else {
@@ -972,6 +1066,7 @@ impl SocketPairEnd {
             truncated: count < message.len,
             passed: message.passed,
             length: message.len,
+            ..Received::default()
         })
     }
 }
@@ -994,9 +1089,20 @@ impl SocketPairEnd {
         if own.read_shutdown {
             return Ok(Received::default());
         }
+        // The empty places out-of-band bytes were taken from go first.
+        let mut discarded = Passed::new();
+        if peek.is_none() {
+            while let Some(taken) = own.writes.pop_front_if(|write| write.piece == Piece::Taken) {
+                discarded.extend(taken.passed);
+            }
+        }
         if own.bytes.is_empty() {
+            drop(sides);
             return if eof {
-                Ok(Received::default())
+                Ok(Received {
+                    discarded,
+                    ..Received::default()
+                })
             } else {
                 Err(Errno::EAGAIN)
             };
@@ -1013,9 +1119,25 @@ impl SocketPairEnd {
                 Ok(received)
             };
         }
-        let mut received = Received::default();
+        let mut received = Received {
+            discarded,
+            ..Received::default()
+        };
         let mut consumed_write = false;
         while let Some(front) = own.writes.front_mut() {
+            // Stop before the mark; at it, drop the out-of-band byte and read
+            // on, as Linux's manage_oob.
+            if front.piece != Piece::Data {
+                if received.count != 0 {
+                    received.at_mark = true;
+                    break;
+                }
+                let dropped = own.writes.pop_front().ok_or(Errno::EIO)?;
+                own.bytes.drain(..dropped.len);
+                received.discarded.extend(dropped.passed);
+                consumed_write = true;
+                continue;
+            }
             let count = front.len.min(buf.len() - received.count);
             for byte in &mut buf[received.count..received.count + count] {
                 *byte = own.bytes.pop_front().ok_or(Errno::EIO)?;
@@ -1039,6 +1161,16 @@ impl SocketPairEnd {
         }
         self.pair.hub.changed();
         received.length = received.count;
+        // Only an out-of-band byte was there, and it is gone.
+        if received.count == 0 && received.passed.is_empty() && !buf.is_empty() {
+            drop(sides);
+            return if eof {
+                Ok(received)
+            } else {
+                drop(received);
+                Err(Errno::EAGAIN)
+            };
+        }
         Ok(received)
     }
     /// What a stream read from `skip` bytes on would take, left in `own`:
@@ -1050,6 +1182,14 @@ impl SocketPairEnd {
         for write in &own.writes {
             let at = start;
             start += write.len;
+            // A peek stops at the mark, as a read does, or passes over it.
+            if write.piece != Piece::Data {
+                if received.count != 0 {
+                    received.at_mark = true;
+                    break;
+                }
+                continue;
+            }
             if skip >= write.len {
                 skip -= write.len;
                 continue;
@@ -1110,8 +1250,13 @@ impl FileHandle for SocketPairEnd {
             .unwrap_or_else(PoisonError::into_inner);
         let own = &sides[self.side];
         let peer = &sides[1 - self.side];
-        // An empty message is readable too.
-        let readable = !own.bytes.is_empty() || self.pair.messages() && !own.writes.is_empty();
+        // An empty message is readable too, and so is the empty place a
+        // stream's out-of-band byte was taken from.
+        let readable = !own.bytes.is_empty() || !own.writes.is_empty();
+        let urgent = own
+            .writes
+            .iter()
+            .any(|write| write.piece == Piece::OutOfBand);
         if self.pair.kind == SOCK_DGRAM {
             // Only this side's own shutdowns show; a closed peer does not.
             let shut = (u32::from(own.read_shutdown) * (IN | 0x2000))
@@ -1123,6 +1268,7 @@ impl FileHandle for SocketPairEnd {
         let eof = own.read_shutdown || peer.closed || peer.write_shutdown;
         let mask = (u32::from(peer.bytes.len() < self.pair.window() || peer.closed) * OUT)
             | (u32::from(readable || eof) * IN)
+            | (u32::from(urgent) * PRI)
             | if peer.closed {
                 0x2010
             } else if peer.write_shutdown {
@@ -1218,6 +1364,7 @@ impl SocketPairEnd {
             peer.writes.push_back(Write {
                 len: buf.len(),
                 passed: std::mem::take(passed),
+                piece: Piece::Data,
             });
             self.pair.hub.changed();
             return Ok(buf.len());
@@ -1247,6 +1394,7 @@ impl SocketPairEnd {
             peer.writes.push_back(Write {
                 len: buf.len(),
                 passed: std::mem::take(passed),
+                piece: Piece::Data,
             });
             self.pair.hub.changed();
             return Ok(buf.len());
@@ -1270,10 +1418,44 @@ impl SocketPairEnd {
             peer.writes.push_back(Write {
                 len: count,
                 passed: std::mem::take(passed),
+                piece: Piece::Data,
             });
         }
         self.pair.hub.changed();
         Ok(count)
+    }
+    /// Queues `byte` as the peer's out-of-band byte, after the stream's
+    /// data, as Linux's `queue_oob`: an earlier one still unread becomes
+    /// data, and the descriptors not sent yet go with it.
+    pub(crate) fn send_out_of_band(&self, byte: u8, passed: &mut Passed) -> Result<usize, Errno> {
+        let mut sides = self
+            .pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if sides[self.side].write_shutdown
+            || sides[1 - self.side].closed
+            || sides[1 - self.side].read_shutdown
+        {
+            return Err(Errno(32));
+        }
+        let peer = &mut sides[1 - self.side];
+        peer.bytes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        peer.writes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        for write in &mut peer.writes {
+            if write.piece == Piece::OutOfBand {
+                write.piece = Piece::Data;
+            }
+        }
+        peer.input_epoch = peer.input_epoch.wrapping_add(1);
+        peer.bytes.push_back(byte);
+        peer.writes.push_back(Write {
+            len: 1,
+            passed: std::mem::take(passed),
+            piece: Piece::OutOfBand,
+        });
+        self.pair.hub.changed();
+        Ok(1)
     }
 }
 #[cfg(test)]
@@ -1281,6 +1463,42 @@ mod events_tests {
     use super::*;
     fn pair() -> [Arc<SocketPairEnd>; 2] {
         SocketPairEnd::pair(1, Arc::default()).unwrap()
+    }
+    #[test]
+    fn a_stream_keeps_its_out_of_band_byte_at_the_mark() {
+        let [a, b] = pair();
+        let mut buf = [0; 8];
+        assert_eq!(a.send(b"ab", &mut Passed::new()), Ok(2));
+        assert_eq!(a.send_out_of_band(b'c', &mut Passed::new()), Ok(1));
+        assert_ne!(b.readiness().unwrap().0 & PRI, 0);
+        assert!(!b.at_mark());
+        // A read stops before the mark; the byte comes with MSG_OOB, once.
+        let read = b.receive(&mut buf, true, None).unwrap();
+        assert_eq!((read.count, read.at_mark), (2, true));
+        assert!(b.at_mark());
+        let peeked = b.receive_out_of_band(&mut buf, true).unwrap();
+        assert_eq!((peeked.count, buf[0]), (1, b'c'));
+        assert_eq!(b.receive_out_of_band(&mut buf, false).unwrap().count, 1);
+        assert_eq!(b.readiness().unwrap().0 & PRI, 0);
+        assert!(b.at_mark());
+        assert_eq!(
+            b.receive_out_of_band(&mut buf, false).err(),
+            Some(Errno::EINVAL)
+        );
+        // A later byte makes an earlier one data; a read that reaches the
+        // mark with nothing read drops the byte and reads on.
+        assert_eq!(a.send_out_of_band(b'x', &mut Passed::new()), Ok(1));
+        assert_eq!(a.send_out_of_band(b'y', &mut Passed::new()), Ok(1));
+        assert_eq!(a.send(b"z", &mut Passed::new()), Ok(1));
+        assert_eq!(b.receive(&mut buf, true, None).unwrap().count, 1);
+        assert_eq!(buf[0], b'x');
+        assert_eq!(b.receive(&mut buf, true, None).unwrap().count, 1);
+        assert_eq!(buf[0], b'z');
+        assert_eq!(
+            b.receive_out_of_band(&mut buf, false).err(),
+            Some(Errno::EINVAL)
+        );
+        assert_eq!(b.receive(&mut buf, true, None).err(), Some(Errno::EAGAIN));
     }
     #[test]
     fn socket_backpressure_partial_write_and_out_edge() {

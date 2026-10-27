@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/vfs.h>
@@ -1544,6 +1545,143 @@ int main(int argc, char **argv) {
         outcome("unmapped-message", sendmsg(datagram[0], &unmapped_message, 0));
         errno = 0;
         outcome("unmapped-stream-message", sendmsg(stream[0], &unmapped_message, 0));
+        return 0;
+    }
+    if (!strcmp(mode, "socket-oob")) {
+        /* A stream's out-of-band byte, as Linux's AF_UNIX keeps it: the last
+           byte of a MSG_OOB send, which reads stop before, SIOCATMARK and
+           POLLPRI show, and recv(MSG_OOB) takes; a read that reaches it with
+           nothing read yet drops it. */
+        int sv[2] = {-1, -1}, fd, flags;
+        char buf[16];
+        long n;
+#define OOB_FRESH() do { close(sv[0]); close(sv[1]); socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv); } while (0)
+#define OOB_READ(what, how, len) do { memset(buf, 0, sizeof buf); errno = 0; n = recv(sv[1], buf, len, how); \
+        printf("  %s=%ld errno=%d data=%s\n", what, n, n < 0 ? errno : 0, buf); } while (0)
+#define OOB_MARK(what) do { int at = -1; int r = ioctl(sv[1], SIOCATMARK, &at); \
+        struct pollfd p = {sv[1], POLLIN | POLLPRI, 0}; poll(&p, 1, 0); \
+        printf("  %s: atmark=%d r=%d revents=%#x\n", what, at, r, p.revents); } while (0)
+        OOB_FRESH();
+        puts("basic");
+        errno = 0;
+        n = send(sv[0], "abc", 3, MSG_OOB);
+        printf("  send=%ld\n", n);
+        OOB_MARK("sent");
+        OOB_READ("read", 0, 8);
+        OOB_MARK("at mark");
+        struct iovec iov = {buf, 8};
+        struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1};
+        memset(buf, 0, sizeof buf);
+        n = recvmsg(sv[1], &m, MSG_OOB | MSG_PEEK);
+        printf("  peek-oob=%ld data=%s flags=%#x\n", n, buf, m.msg_flags);
+        memset(buf, 0, sizeof buf);
+        m.msg_flags = 0;
+        n = recvmsg(sv[1], &m, MSG_OOB);
+        printf("  recvmsg-oob=%ld data=%s flags=%#x\n", n, buf, m.msg_flags);
+        OOB_MARK("taken");
+        OOB_READ("oob-again", MSG_OOB, 8);
+        OOB_READ("read-again", 0, 8);
+        puts("data after the mark");
+        OOB_FRESH();
+        send(sv[0], "abc", 3, MSG_OOB);
+        send(sv[0], "de", 2, 0);
+        OOB_READ("read", 0, 8);
+        OOB_READ("peek-at-mark", MSG_PEEK, 8);
+        OOB_READ("read-at-mark", 0, 8);
+        OOB_READ("oob", MSG_OOB, 8);
+        puts("out of band first");
+        OOB_FRESH();
+        send(sv[0], "abc", 3, MSG_OOB);
+        send(sv[0], "de", 2, 0);
+        OOB_READ("oob", MSG_OOB, 8);
+        OOB_READ("read", 0, 8);
+        OOB_READ("read2", 0, 8);
+        puts("a later one");
+        OOB_FRESH();
+        send(sv[0], "ab", 2, MSG_OOB);
+        send(sv[0], "cd", 2, MSG_OOB);
+        OOB_READ("read", 0, 8);
+        OOB_MARK("at mark");
+        OOB_READ("oob", MSG_OOB, 8);
+        OOB_READ("read2", 0, 8);
+        puts("one byte, dropped by a read");
+        OOB_FRESH();
+        send(sv[0], "x", 1, MSG_OOB);
+        OOB_MARK("one");
+        OOB_READ("read", 0, 8);
+        OOB_MARK("dropped");
+        OOB_READ("oob", MSG_OOB, 8);
+        puts("small reads");
+        OOB_FRESH();
+        send(sv[0], "abcd", 4, MSG_OOB);
+        OOB_READ("read2", 0, 2);
+        OOB_READ("read2b", 0, 2);
+        OOB_READ("read2c", 0, 2);
+        puts("select and epoll");
+        OOB_FRESH();
+        send(sv[0], "ab", 2, MSG_OOB);
+        fd_set except;
+        FD_ZERO(&except);
+        FD_SET(sv[1], &except);
+        struct timeval zero = {0, 0};
+        n = select(sv[1] + 1, NULL, NULL, &except, &zero);
+        printf("  select=%ld except=%d\n", n, FD_ISSET(sv[1], &except));
+        int ep = epoll_create1(0);
+        struct epoll_event ev = {.events = EPOLLPRI}, out = {0};
+        epoll_ctl(ep, EPOLL_CTL_ADD, sv[1], &ev);
+        n = epoll_wait(ep, &out, 1, 0);
+        printf("  epoll=%ld events=%#x\n", n, out.events);
+        OOB_READ("oob", MSG_OOB, 8);
+        n = epoll_wait(ep, &out, 1, 0);
+        printf("  epoll-after=%ld\n", n);
+        close(ep);
+        puts("errors");
+        OOB_FRESH();
+        errno = 0;
+        n = send(sv[0], "", 0, MSG_OOB);
+        printf("  empty=%ld errno=%d\n", n, errno);
+        OOB_READ("none", MSG_OOB, 8);
+        int pipe_fds[2];
+        pipe(pipe_fds);
+        /* One byte sent out of band with a descriptor. */
+        union { char bytes[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } control;
+        struct iovec one = {"z", 1};
+        struct msghdr with = {.msg_iov = &one, .msg_iovlen = 1, .msg_control = control.bytes,
+                              .msg_controllen = sizeof control.bytes};
+        struct cmsghdr *header = CMSG_FIRSTHDR(&with);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(header), pipe_fds, sizeof(int));
+        n = sendmsg(sv[0], &with, MSG_OOB);
+        printf("  with-fds=%ld\n", n);
+        OOB_MARK("with fds");
+        n = receive_fd(sv[1], buf, 8, MSG_OOB, &fd, &flags);
+        printf("  oob-fds=%ld errno=%d fd=%d flags=%#x\n", n, n < 0 ? errno : 0, fd >= 0, flags);
+        OOB_READ("read-fds", 0, 8);
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        shutdown(sv[1], SHUT_RD);
+        errno = 0;
+        n = send(sv[0], "y", 1, MSG_OOB | MSG_NOSIGNAL);
+        printf("  shut=%ld errno=%d\n", n, errno);
+        puts("waitall stops at the mark");
+        close(sv[0]);
+        close(sv[1]);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        send(sv[0], "abc", 3, MSG_OOB);
+        send(sv[0], "de", 2, 0);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 8, MSG_WAITALL);
+        printf("  waitall=%ld data=%s\n", n, buf);
+        close(sv[0]);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 8, MSG_WAITALL);
+        printf("  waitall2=%ld data=%s\n", n, buf);
+        close(sv[1]);
+#undef OOB_FRESH
+#undef OOB_READ
+#undef OOB_MARK
         return 0;
     }
     if (!strcmp(mode, "socket-flags")) {

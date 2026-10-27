@@ -74,6 +74,8 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
 }
 
 pub(crate) const IN: u32 = 1;
+/// `POLLPRI`: a stream's out-of-band byte waits.
+pub(crate) const PRI: u32 = 2;
 pub(crate) const OUT: u32 = 4;
 pub(crate) const NONBLOCK: u32 = 0x800;
 pub(crate) const CLOEXEC: u32 = 0x80000;

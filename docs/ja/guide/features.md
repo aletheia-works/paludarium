@@ -34,7 +34,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIONBIO`、`SIOCATMARK`） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socket`（常に `EAFNOSUPPORT`）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタの受け渡し）、`shutdown` |
 | 乱数 | `getrandom` |
@@ -126,11 +126,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MSG_PEEK` はデータを残し、受け渡すディスクリプタの写しを渡します。`MSG_WAITALL` は、
   ストリームの終わりやディスクリプタが来るまで、またはデータを受け取ったあとにシグナルが
   来るまで、ストリームのバッファを満たします。`MSG_TRUNC` はメッセージの全体の長さを
-  返します。`MSG_OOB` は帯域外のデータを見つけません（ストリームでは `EINVAL`、ほかの
-  種類では `EOPNOTSUPP`）。`sendmsg` と `sendto` は `MSG_NOSIGNAL` と `MSG_DONTWAIT` を
-  扱い、データグラムとパケットのソケットへの `MSG_OOB` は `EOPNOTSUPP` です（ストリームでも
-  そうで、[制限](./limitations)に載せています）。ほかのフラグは、Linux と同じく何も
-  しません。
+  返します。`sendmsg` と `sendto` は `MSG_NOSIGNAL` と `MSG_DONTWAIT` を扱います。
+  データグラムとパケットのソケットへの `MSG_OOB` は `EOPNOTSUPP` です。ほかのフラグは、
+  Linux と同じく何もしません。
+- ストリームは、Linux 7.0 の AF_UNIX と同じく帯域外のデータを持ちます。`MSG_OOB` を
+  付けた送信では、ほかのデータのあとに、最後の 1 バイトが帯域外のバイトになります
+  （空の送信は `EOPNOTSUPP`）。まだ読まれていない前のバイトは、ふつうのデータになります。
+  読み込みは印の手前で止まり、印は `SIOCATMARK` でわかります。`poll`、`select` の例外の
+  集合、`epoll` には `POLLPRI` が出ます。`MSG_OOB` を付けた `recv` がそのバイトを取り
+  （ないときは `EINVAL`）、`MSG_PEEK` なら残します。何も読まないうちに印に着いた読み込みは、
+  そのバイトを捨てて先を読みます。1 バイトの帯域外の送信が受け渡すディスクリプタは、
+  渡されずに閉じられます。
 - ファイルの `MAP_SHARED` のマッピングは、Linux と同じくファイルのページキャッシュを
   見せます。どのプロセスのものでも、そのファイルの共有マッピングはみな同じページを
   持ちます。そこへの書き込みは `read` にも、そのファイルのプライベートなマッピングにも

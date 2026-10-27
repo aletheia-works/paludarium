@@ -26,9 +26,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルの持ち主やグループになります。
 - **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように
   `SCM_RIGHTS` でディスクリプタを受け渡します。違いは次のとおりです。
-  - ストリームには帯域外のデータがありません。`MSG_OOB` を付けた `sendmsg` と
-    `sendto` は `EOPNOTSUPP` を返します。Linux は最後の 1 バイトを帯域外で送ります。
-    そのため、`MSG_OOB` を付けた読み込みは、いつも何も見つけません（`EINVAL`）。
+  - ストリームの帯域外のバイトを、ふつうのデータとして読むことはできません。
+    `setsockopt` がないので、`SO_OOBINLINE` を設定できないためです。`fcntl` に
+    `F_SETOWN` がないので、`SIGURG` も送られません。
   - `SCM_CREDENTIALS` は `EINVAL` を返します。`SO_PASSCRED` を有効にする方法も
     ありません。
   - Linux は、およそ 32 KiB を超えるストリームへの書き込みをいくつかに分け、

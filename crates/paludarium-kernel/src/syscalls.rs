@@ -1652,6 +1652,20 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             descriptor.file.set_flags(flags)?;
             return Ok(0);
         }
+        // SIOCATMARK: whether a socket's next read is at its out-of-band mark.
+        if a[1] == 0x8905 {
+            let descriptor = c.files.descriptor(a[0])?;
+            let socket = descriptor
+                .file
+                .as_any()
+                .and_then(|v| v.downcast_ref::<crate::sockets::SocketPairEnd>())
+                .ok_or(Errno::ENOTTY)?;
+            let at_mark = i32::from(socket.at_mark());
+            c.mem
+                .write(GuestAddr(a[2]), &at_mark.to_le_bytes())
+                .map_err(|_| Errno::EFAULT)?;
+            return Ok(0);
+        }
         let stream = match c.files.stdio_channel(a[0])? {
             Some(0) => paludarium_host::StreamId::Stdin,
             Some(1) => paludarium_host::StreamId::Stdout,

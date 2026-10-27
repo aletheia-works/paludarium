@@ -28,9 +28,9 @@ verified.
   take the file's owner or group.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` as Linux does, with these differences:
-  - A stream has no out-of-band data: `sendmsg` and `sendto` with
-    `MSG_OOB` return `EOPNOTSUPP`, where Linux sends the last byte out of
-    band, so reading with `MSG_OOB` always finds none (`EINVAL`).
+  - A stream's out-of-band byte cannot be read inline: `setsockopt` is not
+    implemented, so `SO_OOBINLINE` cannot be set. No `SIGURG` is sent
+    either, as `fcntl` has no `F_SETOWN`.
   - `SCM_CREDENTIALS` returns `EINVAL`, and nothing can turn on
     `SO_PASSCRED`.
   - Linux splits a stream write of more than about 32 KiB into parts and

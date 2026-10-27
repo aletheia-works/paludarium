@@ -736,7 +736,8 @@ fn scm_rights_checks_like_linux() {
         .unwrap();
     assert_eq!(send(&mut f, (0, 0), (CONTROL, 32), 0), fail(22));
     assert_eq!(send(&mut f, (0, 0), (0, 1 << 31), 0), fail(105));
-    assert_eq!(send(&mut f, (0, 0), (0, 0), 1), fail(95));
+    // A stream sends its byte out of band.
+    assert_eq!(send(&mut f, (0, 0), (0, 0), 1), 1);
     assert_eq!(send(&mut f, (NAME, 4), (0, 0), 0), fail(106));
     assert_eq!(send(&mut f, (NAME, u32::MAX), (0, 0), 0), fail(22));
     // A name of length 0 is no name.
@@ -864,7 +865,8 @@ fn sendto_and_recvfrom_take_addresses_and_flags_like_sendmsg() {
     assert_eq!(f.ret(44, [a, BYTES, 1, 0, NAME, 129]), fail(22));
     assert_eq!(f.ret(44, [a, BYTES, 1, 0, NAME, u64::MAX]), fail(22));
     assert_eq!(f.ret(44, [a, BYTES, 1, 0, 8, 16]), fail(14));
-    assert_eq!(f.ret(44, [a, BYTES, 1, 1, 0, 0]), fail(95));
+    // Out of band, a stream sends a byte, and nothing is no byte to send.
+    assert_eq!(f.ret(44, [a, BYTES, 0, 1, 0, 0]), fail(95));
     assert_eq!(f.ret(44, [a, BYTES + 1, 1, 0x4040, 0, 0]), 1);
     // recvfrom writes the peer's address length, 0.
     let len = NAME + 0x80;

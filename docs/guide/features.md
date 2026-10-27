@@ -40,7 +40,7 @@ kernel.
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
-| I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIONBIO`, `SIOCATMARK`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socket` (always `EAFNOSUPPORT`), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`), `shutdown` |
 | Randomness | `getrandom` |
@@ -138,12 +138,18 @@ kernel.
   `MSG_PEEK` leaves the data, and gives copies of the descriptors it passes;
   `MSG_WAITALL` fills a stream's buffer, unless the stream ends, descriptors
   come or a signal arrives after some data; `MSG_TRUNC` returns a message's
-  whole length; `MSG_OOB` finds no out-of-band data (`EINVAL` on a stream,
-  `EOPNOTSUPP` on the other kinds). `sendmsg` and `sendto` take
-  `MSG_NOSIGNAL` and `MSG_DONTWAIT`, and `MSG_OOB` on a datagram or packet
-  socket is `EOPNOTSUPP` (on a stream too, which
-  [Limitations](./limitations) lists). The other flags have no effect, as
-  on Linux.
+  whole length. `sendmsg` and `sendto` take `MSG_NOSIGNAL` and
+  `MSG_DONTWAIT`. `MSG_OOB` on a datagram or packet socket is `EOPNOTSUPP`.
+  The other flags have no effect, as on Linux.
+- A stream has out-of-band data as Linux 7.0's AF_UNIX keeps it. A `MSG_OOB`
+  send makes its last byte the out-of-band byte (an empty one is
+  `EOPNOTSUPP`), after the rest of its data, and an earlier byte not yet
+  read becomes data. Reads stop before the mark, which `SIOCATMARK` reports,
+  while `poll`, `select`'s exception set and `epoll` show `POLLPRI`.
+  `recv` with `MSG_OOB` takes the byte (`EINVAL` when there is none), and
+  `MSG_PEEK` leaves it; a read that reaches the mark with nothing read yet
+  drops the byte and reads on. The descriptors a one-byte out-of-band send
+  passes are closed, not delivered.
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and

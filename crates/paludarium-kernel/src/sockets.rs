@@ -700,7 +700,9 @@ fn receive_with(
     if flags & MSG_OOB != 0 {
         return socket.receive_out_of_band(bytes, peek);
     }
-    let mut received = crate::files::wait_for_read(c, file, dontwait, || {
+    // SO_RCVTIMEO bounds the whole call, MSG_WAITALL's later waits too.
+    let wait = deadline(c, file, true)?;
+    let mut received = crate::files::wait_for_read_until(c, file, dontwait, wait, || {
         socket.receive(bytes, true, peek.then_some(0))
     })?;
     let wait_all = flags & MSG_WAITALL != 0
@@ -713,7 +715,7 @@ fn receive_with(
         && !received.at_mark
     {
         let done = received.count;
-        let more = crate::files::wait_for_read(c, file, false, || {
+        let more = crate::files::wait_for_read_until(c, file, false, wait, || {
             socket.receive_more(&mut bytes[done..], peek.then_some(done))
         });
         match more {
@@ -803,6 +805,11 @@ const SO_SNDLOWAT: u32 = 19;
 const SO_RCVTIMEO: u32 = 20;
 const SO_SNDTIMEO: u32 = 21;
 const SO_TIMESTAMP: u32 = 29;
+const SO_RCVTIMEO_NEW: u32 = 66;
+const SO_SNDTIMEO_NEW: u32 = 67;
+/// The kernel's tick rate, to which Linux rounds `SO_RCVTIMEO` and
+/// `SO_SNDTIMEO` (`CONFIG_HZ`).
+const HZ: u64 = 1000;
 const SO_ACCEPTCONN: u32 = 30;
 const SO_SNDBUFFORCE: u32 = 32;
 const SO_RCVBUFFORCE: u32 = 33;
@@ -841,6 +848,103 @@ struct Options {
     mark: i32,
     busy_poll: i32,
     incoming_cpu: i32,
+    receive_timeout: Timeout,
+    send_timeout: Timeout,
+}
+/// `SO_RCVTIMEO` or `SO_SNDTIMEO`, in ticks of [`HZ`], as Linux's
+/// `sk_rcvtimeo` keeps it: a zero `timeval` waits for ever, and a negative
+/// one not at all.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Timeout {
+    #[default]
+    Forever,
+    Never,
+    Ticks(u64),
+}
+impl Timeout {
+    /// Linux's `sock_set_timeout` of a `timeval` (EDOM for microseconds
+    /// outside a second).
+    fn from_timeval(seconds: i64, micros: i64) -> Result<Self, Errno> {
+        if !(0..1_000_000).contains(&micros) {
+            return Err(Errno(33));
+        }
+        Ok(match (seconds, micros) {
+            (..0, _) => Timeout::Never,
+            (0, 0) => Timeout::Forever,
+            _ => Timeout::Ticks(
+                seconds
+                    .cast_unsigned()
+                    .saturating_mul(HZ)
+                    .saturating_add(micros.cast_unsigned().div_ceil(1_000_000 / HZ)),
+            ),
+        })
+    }
+    /// The `timeval` getsockopt gives back, zero unless there is a limit.
+    fn timeval(self) -> [u8; 16] {
+        let (seconds, micros) = match self {
+            Timeout::Ticks(ticks) => (ticks / HZ, ticks % HZ * (1_000_000 / HZ)),
+            _ => (0, 0),
+        };
+        let mut timeval = [0; 16];
+        timeval[..8].copy_from_slice(&seconds.to_le_bytes());
+        timeval[8..].copy_from_slice(&micros.to_le_bytes());
+        timeval
+    }
+}
+/// How long a blocking socket call may wait, from when it starts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wait {
+    Forever,
+    Now,
+    Until(u64),
+}
+impl Wait {
+    /// The deadline for [`crate::events::wait`], `None` when the time is up.
+    pub(crate) fn deadline(self, c: &Context<'_>) -> Result<Option<Option<u64>>, Errno> {
+        Ok(match self {
+            Wait::Forever => Some(None),
+            Wait::Now => None,
+            Wait::Until(end) => {
+                (c.host.clock(paludarium_host::ClockId::Monotonic)? < end).then_some(Some(end))
+            }
+        })
+    }
+    pub(crate) fn forever(self) -> bool {
+        self == Wait::Forever
+    }
+}
+/// How long a blocking read (`receive`) or write of `file` may wait: a
+/// socket's `SO_RCVTIMEO` or `SO_SNDTIMEO`, any other file for ever.
+pub(crate) fn deadline(
+    c: &Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    receive: bool,
+) -> Result<Wait, Errno> {
+    let Some(socket) = file
+        .as_any()
+        .and_then(|any| any.downcast_ref::<SocketPairEnd>())
+    else {
+        return Ok(Wait::Forever);
+    };
+    let options = *socket
+        .options
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Ok(
+        match if receive {
+            options.receive_timeout
+        } else {
+            options.send_timeout
+        } {
+            Timeout::Forever => Wait::Forever,
+            Timeout::Never => Wait::Now,
+            Timeout::Ticks(ticks) => Wait::Until(
+                c.host
+                    .clock(paludarium_host::ClockId::Monotonic)?
+                    .saturating_add(ticks.saturating_mul(1_000_000_000 / HZ)),
+            ),
+        },
+    )
 }
 impl Default for Options {
     fn default() -> Self {
@@ -859,6 +963,8 @@ impl Default for Options {
             mark: 0,
             busy_poll: 0,
             incoming_cpu: -1,
+            receive_timeout: Timeout::Forever,
+            send_timeout: Timeout::Forever,
         }
     }
 }
@@ -876,9 +982,10 @@ fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// `sk_setsockopt`: a socket pair has only `SOL_SOCKET` options
 /// (EOPNOTSUPP for another level), an `int` value of fewer than 4 bytes is
 /// EINVAL, and an unknown name, or one whose effect is not modelled here
-/// (`SO_PASSCRED`, `SO_PASSSEC`, `SO_RCVLOWAT`, `SO_RCVTIMEO`,
-/// `SO_SNDTIMEO`, `SO_TIMESTAMP`, `SO_PEEK_OFF`), is ENOPROTOOPT. The guest
-/// runs as root, so the options that need `CAP_NET_ADMIN` are set.
+/// (`SO_PASSCRED`, `SO_PASSSEC`, `SO_RCVLOWAT`, `SO_TIMESTAMP`,
+/// `SO_PEEK_OFF`), is ENOPROTOOPT. `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
+/// `timeval` ([`Timeout`]). The guest runs as root, so the options that need
+/// `CAP_NET_ADMIN` are set.
 fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let file = socket(c, a[0])?;
     let socket = as_socket(&file)?;
@@ -927,7 +1034,24 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             let seconds = i32::from_le_bytes(raw[4..8].try_into().map_err(|_| Errno::EFAULT)?);
             options.linger = on.then_some(seconds);
         }
-        SO_RCVTIMEO | SO_SNDTIMEO if len < 16 => return Err(Errno::EINVAL),
+        SO_RCVTIMEO | SO_SNDTIMEO | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW => {
+            if len < 16 {
+                return Err(Errno::EINVAL);
+            }
+            let raw = read_words(c, a[3], 16)?;
+            let word = |at: usize| {
+                raw.get(at..at + 8)
+                    .and_then(|b| b.try_into().ok())
+                    .map(i64::from_le_bytes)
+                    .ok_or(Errno::EFAULT)
+            };
+            let timeout = Timeout::from_timeval(word(0)?, word(8)?)?;
+            if matches!(name, SO_RCVTIMEO | SO_RCVTIMEO_NEW) {
+                options.receive_timeout = timeout;
+            } else {
+                options.send_timeout = timeout;
+            }
+        }
         // AF_UNIX takes no SO_REUSEPORT.
         SO_REUSEPORT => return Err(Errno(95)),
         _ => return Err(Errno(92)),
@@ -988,7 +1112,8 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             credentials
         }
         SO_RCVLOWAT | SO_SNDLOWAT | SO_DOMAIN => int(1),
-        SO_RCVTIMEO | SO_SNDTIMEO => vec![0; 16],
+        SO_RCVTIMEO | SO_RCVTIMEO_NEW => options.receive_timeout.timeval().to_vec(),
+        SO_SNDTIMEO | SO_SNDTIMEO_NEW => options.send_timeout.timeval().to_vec(),
         SO_MARK => int(options.mark),
         SO_PEEK_OFF => int(-1),
         SO_BUSY_POLL => int(options.busy_poll),

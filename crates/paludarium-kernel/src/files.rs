@@ -1019,11 +1019,25 @@ fn read_blocking(
     wait_for_read(c, file, false, || file.read(b))
 }
 /// Repeats `read` while it finds nothing yet (EAGAIN) and `file` blocks:
-/// neither `O_NONBLOCK` nor, with `dontwait`, `MSG_DONTWAIT`.
+/// neither `O_NONBLOCK` nor, with `dontwait`, `MSG_DONTWAIT`; a socket waits
+/// no longer than its `SO_RCVTIMEO`.
 pub(crate) fn wait_for_read<T>(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     dontwait: bool,
+    read: impl FnMut() -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    let wait = crate::sockets::deadline(c, file, true)?;
+    wait_for_read_until(c, file, dontwait, wait, read)
+}
+/// [`wait_for_read`] that waits as `wait` allows: EAGAIN once it is over,
+/// and a signal that ends a wait with a time limit is EINTR, which no
+/// SA_RESTART restarts, as Linux's `sock_intr_errno`.
+pub(crate) fn wait_for_read_until<T>(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    dontwait: bool,
+    wait: crate::sockets::Wait,
     mut read: impl FnMut() -> Result<T, Errno>,
 ) -> Result<T, Errno> {
     loop {
@@ -1035,7 +1049,13 @@ pub(crate) fn wait_for_read<T>(
                     && file.readiness().is_ok()
                     && file.flags() & crate::events::NONBLOCK == 0 =>
             {
-                crate::events::wait(c, ticket, None)?
+                let deadline = wait.deadline(c)?.ok_or(Errno::EAGAIN)?;
+                if let Err(e) = crate::events::wait(c, ticket, deadline) {
+                    if !wait.forever() {
+                        c.process.restart = None;
+                    }
+                    return Err(e);
+                }
             }
             result => return result,
         }
@@ -1929,6 +1949,8 @@ pub(crate) fn write_with(
     let stream = file
         .as_any()
         .is_some_and(|a| a.is::<crate::sockets::SocketPairEnd>());
+    // A socket waits no longer than its SO_SNDTIMEO.
+    let wait = crate::sockets::deadline(c, file, false)?;
     let mut done = 0;
     loop {
         let ticket = c.files.readiness.token.value();
@@ -1941,7 +1963,15 @@ pub(crate) fn write_with(
                 }
             }
             Err(e) if e == Errno::EAGAIN && file.readiness().is_ok() && !nonblocking => {
-                if let Err(e) = crate::events::wait(c, ticket, None) {
+                let deadline = match wait.deadline(c)? {
+                    Some(deadline) => deadline,
+                    None if done != 0 => return Ok(done as u64),
+                    None => return Err(Errno::EAGAIN),
+                };
+                if let Err(e) = crate::events::wait(c, ticket, deadline) {
+                    if !wait.forever() {
+                        c.process.restart = None;
+                    }
                     return if done != 0 { Ok(done as u64) } else { Err(e) };
                 }
             }

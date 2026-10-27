@@ -266,8 +266,8 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
     match number {
         // read, write, pread64, pwrite64, readv, writev, preadv, pwritev,
         // wait4, waitid, pause, rt_sigsuspend, flock, and the blocking socket
-        // calls (sockets here have no SO_RCVTIMEO or SO_SNDTIMEO, with which
-        // Linux gives EINTR instead).
+        // calls (a wait that SO_RCVTIMEO or SO_SNDTIMEO limits gives EINTR
+        // instead, and clears the restart itself).
         0 | 1 | 17..=20 | 295 | 296 | 61 | 247 | 34 | 130 | 73 | 43 | 288 | 44..=47 => true,
         // poll with no timeout, and ppoll, select and pselect6 always: they
         // write the time left back to their timeout, so a restart goes on.

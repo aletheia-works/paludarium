@@ -162,6 +162,14 @@ kernel.
   `SO_ACCEPTCONN` and `SO_PEERCRED` (the process that made the pair) can only
   be read. `SO_SNDBUF` and `SO_RCVBUF` are doubled and kept at Linux's
   floors and ceiling, and `SO_LINGER` takes a `struct linger`.
+- `SO_RCVTIMEO` and `SO_SNDTIMEO` (and their `_NEW` forms) limit how long a
+  blocking `recv`, `read`, `send` or `write` on the socket waits, as on
+  Linux: past the limit it gives `EAGAIN`, or what it moved, and
+  `MSG_WAITALL` stops there too. A zero `timeval` waits for ever and a
+  negative one not at all; microseconds outside a second are `EDOM`. The
+  value is kept in ticks of a 1000 Hz clock, so it reads back rounded up to
+  a millisecond. A signal that ends such a wait gives `EINTR`, which no
+  `SA_RESTART` restarts, as Linux's `sock_intr_errno`.
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and

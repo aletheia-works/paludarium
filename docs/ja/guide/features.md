@@ -147,6 +147,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `SO_ERROR`、`SO_ACCEPTCONN`、`SO_PEERCRED`（その組を作ったプロセス）は読むだけです。
   `SO_SNDBUF` と `SO_RCVBUF` は 2 倍にして、Linux の下限と上限に収め、`SO_LINGER` は
   `struct linger` を受け取ります。
+- `SO_RCVTIMEO` と `SO_SNDTIMEO`（と `_NEW` の形）は、Linux と同じく、そのソケットでの
+  `recv`、`read`、`send`、`write` が待つ時間を限ります。限りを過ぎると `EAGAIN`、または
+  そこまでに動かした分を返し、`MSG_WAITALL` もそこで止まります。0 の `timeval` は
+  いつまでも待ち、負の値は待ちません。1 秒を超えるマイクロ秒は `EDOM` です。値は
+  1000 Hz の時計の刻みで持つので、読み出すとミリ秒に切り上がっています。そのような待ちを
+  シグナルが終わらせると `EINTR` になり、Linux の `sock_intr_errno` と同じく
+  `SA_RESTART` でもやり直しません。
 - ファイルの `MAP_SHARED` のマッピングは、Linux と同じくファイルのページキャッシュを
   見せます。どのプロセスのものでも、そのファイルの共有マッピングはみな同じページを
   持ちます。そこへの書き込みは `read` にも、そのファイルのプライベートなマッピングにも

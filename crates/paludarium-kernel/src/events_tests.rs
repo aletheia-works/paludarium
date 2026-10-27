@@ -807,6 +807,47 @@ fn scm_rights_on_messages_and_queued_descriptors_close_with_the_socket() {
     assert_eq!(f.ret(0, [r, IN, 8, 0, 0, 0]), 0);
 }
 #[test]
+fn socket_timeouts_end_blocking_calls_with_eagain() {
+    let mut f = Fixture::new();
+    let fail = |e: i32| Errno(e).to_syscall_return();
+    let (a, b) = pair(&mut f, 53, [1, 1, 0, DATA, 0, 0]);
+    let (value, len) = (NAME, NAME + 0x20);
+    let set = |f: &mut Fixture, fd: u64, name: u64, seconds: i64, micros: i64| {
+        f.mem
+            .write(GuestAddr(value), &seconds.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(value + 8), &micros.to_le_bytes())
+            .unwrap();
+        f.ret(54, [fd, 1, name, value, 16, 0])
+    };
+    let get = |f: &mut Fixture, fd: u64, name: u64| {
+        f.mem.write(GuestAddr(len), &16u32.to_le_bytes()).unwrap();
+        assert_eq!(f.ret(55, [fd, 1, name, value, len, 0]), 0);
+        let mut raw = [0; 16];
+        f.mem.read(GuestAddr(value), &mut raw).unwrap();
+        (
+            i64::from_le_bytes(raw[..8].try_into().unwrap()),
+            i64::from_le_bytes(raw[8..].try_into().unwrap()),
+        )
+    };
+    // Kept in ticks, rounded up; microseconds outside a second are EDOM.
+    assert_eq!(set(&mut f, b, 20, 1, 234_567), 0);
+    assert_eq!(get(&mut f, b, 20), (1, 235_000));
+    assert_eq!(set(&mut f, b, 20, 0, 1_000_000), fail(33));
+    // A blocking read waits no longer than the timeout, and so does a
+    // write into a full buffer, which gives what it sent.
+    assert_eq!(set(&mut f, b, 20, 0, 200_000), 0);
+    assert_eq!(f.ret(45, [b, IN, 8, 0, 0, 0]), fail(11));
+    assert_eq!(f.ret(0, [b, IN, 8, 0, 0, 0]), fail(11));
+    assert_eq!(set(&mut f, a, 21, 0, 200_000), 0);
+    assert_eq!(get(&mut f, a, 21), (0, 200_000));
+    // A negative timeout does not wait, and a zero one waits for ever.
+    assert_eq!(set(&mut f, b, 66, -1, 0), 0);
+    assert_eq!(get(&mut f, b, 66), (0, 0));
+    assert_eq!(f.ret(45, [b, IN, 8, 0, 0, 0]), fail(11));
+}
+#[test]
 fn socket_options_are_kept_as_linux_keeps_them() {
     let mut f = Fixture::new();
     let fail = |e: i32| Errno(e).to_syscall_return();

@@ -18,6 +18,7 @@
 #include <sys/resource.h>
 #include <sys/vfs.h>
 #include <sys/prctl.h>
+#include <sys/time.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -1545,6 +1546,102 @@ int main(int argc, char **argv) {
         outcome("unmapped-message", sendmsg(datagram[0], &unmapped_message, 0));
         errno = 0;
         outcome("unmapped-stream-message", sendmsg(stream[0], &unmapped_message, 0));
+        return 0;
+    }
+    if (!strcmp(mode, "socket-timeouts")) {
+        /* SO_RCVTIMEO and SO_SNDTIMEO: kept in ticks, a zero timeval waits
+           for ever and a negative one not at all; a blocking call that
+           waits past one gives EAGAIN, or what it moved, and a signal that
+           ends such a wait is EINTR even with SA_RESTART. Only values that
+           every tick rate keeps exactly are used, and times are checked
+           against the timeout rather than printed. */
+        int sv[2];
+        char buf[16];
+        long n;
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+#define TIMEO_SET(fd, opt, sec, usec, size) do { struct timeval tv = {sec, usec}; errno = 0; \
+        n = setsockopt(fd, SOL_SOCKET, opt, &tv, size); int e = n < 0 ? errno : 0; \
+        struct timeval got = {-7, -7}; socklen_t len = sizeof got; getsockopt(fd, SOL_SOCKET, opt, &got, &len); \
+        printf("  set %ld.%06ld=%ld errno=%d got=%ld.%06ld len=%u\n", (long)(sec), (long)(usec), n, e, (long)got.tv_sec, (long)got.tv_usec, len); } while (0)
+#define TIMEO_SINCE(t0) ({ struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1); \
+        (t1.tv_sec - (t0).tv_sec) * 1000 + (t1.tv_nsec - (t0).tv_nsec) / 1000000; })
+        struct timespec t0;
+        long ms;
+        puts("values");
+        TIMEO_SET(sv[0], SO_RCVTIMEO, 0, 250000, 16);
+        TIMEO_SET(sv[0], SO_RCVTIMEO, 2, 500000, 16);
+        TIMEO_SET(sv[0], SO_RCVTIMEO, 0, 1000000, 16);
+        TIMEO_SET(sv[0], SO_RCVTIMEO, 0, -1, 16);
+        TIMEO_SET(sv[0], SO_RCVTIMEO, -1, 0, 16);
+        TIMEO_SET(sv[0], SO_RCVTIMEO, 0, 0, 16);
+        TIMEO_SET(sv[0], SO_RCVTIMEO, 1, 0, 8);
+        TIMEO_SET(sv[0], SO_RCVTIMEO, 1, 0, 24);
+        TIMEO_SET(sv[0], SO_SNDTIMEO, 3, 0, 16);
+        TIMEO_SET(sv[0], 66, 0, 500000, 16);
+        TIMEO_SET(sv[0], 67, 4, 0, 16);
+        puts("receive");
+        TIMEO_SET(sv[1], SO_RCVTIMEO, 0, 200000, 16);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        errno = 0;
+        n = recv(sv[1], buf, 8, 0);
+        ms = TIMEO_SINCE(t0);
+        printf("  recv=%ld errno=%d waited=%d\n", n, n < 0 ? errno : 0, ms >= 200 && ms < 5000);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        errno = 0;
+        n = read(sv[1], buf, 8);
+        ms = TIMEO_SINCE(t0);
+        printf("  read=%ld errno=%d waited=%d\n", n, n < 0 ? errno : 0, ms >= 200 && ms < 5000);
+        send(sv[0], "ab", 2, 0);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        n = recv(sv[1], buf, 8, MSG_WAITALL);
+        ms = TIMEO_SINCE(t0);
+        printf("  waitall=%ld waited=%d\n", n, ms >= 200 && ms < 5000);
+        TIMEO_SET(sv[1], SO_RCVTIMEO, -1, 0, 16);
+        errno = 0;
+        n = recv(sv[1], buf, 8, 0);
+        printf("  no-wait=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        puts("signal");
+        struct sigaction sa = {0};
+        sa.sa_handler = interrupted;
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGALRM, &sa, NULL);
+        TIMEO_SET(sv[1], SO_RCVTIMEO, 2, 0, 16);
+        struct itimerval it = {{0, 0}, {0, 100000}};
+        setitimer(ITIMER_REAL, &it, NULL);
+        errno = 0;
+        n = recv(sv[1], buf, 8, 0);
+        printf("  recv=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        signal(SIGALRM, SIG_DFL);
+        puts("send");
+        TIMEO_SET(sv[0], SO_SNDTIMEO, 0, 200000, 16);
+        static char big[1 << 20];
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        n = send(sv[0], big, sizeof big, 0);
+        ms = TIMEO_SINCE(t0);
+        printf("  send=%d waited=%d\n", n > 0 && n < (long)sizeof big, ms >= 200 && ms < 5000);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        errno = 0;
+        n = write(sv[0], big, sizeof big);
+        ms = TIMEO_SINCE(t0);
+        printf("  write=%ld errno=%d waited=%d\n", n, n < 0 ? errno : 0, ms >= 200 && ms < 5000);
+        TIMEO_SET(sv[0], SO_SNDTIMEO, -1, 0, 16);
+        errno = 0;
+        n = send(sv[0], big, sizeof big, 0);
+        printf("  no-wait=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        close(sv[0]);
+        close(sv[1]);
+        puts("datagram");
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+        TIMEO_SET(sv[1], SO_RCVTIMEO, 0, 200000, 16);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        errno = 0;
+        n = recv(sv[1], buf, 8, 0);
+        ms = TIMEO_SINCE(t0);
+        printf("  recv=%ld errno=%d waited=%d\n", n, n < 0 ? errno : 0, ms >= 200 && ms < 5000);
+        close(sv[0]);
+        close(sv[1]);
+#undef TIMEO_SET
+#undef TIMEO_SINCE
         return 0;
     }
     if (!strcmp(mode, "socket-options")) {

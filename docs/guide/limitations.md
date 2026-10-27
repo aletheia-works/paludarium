@@ -15,11 +15,11 @@ verified.
   `MAP_SHARED` mapping reach the file on the host only when the guest reads
   the file, `stat`s it or calls `msync` or `fsync`, or the file's last
   mapping goes away (Linux writes them back in its own time), and a change
-  another host program makes to the file does not reach the mappings. On a Windows host, the stores of a shared
-  mapping made through a descriptor open with `O_APPEND` do not reach the
-  file. The end of a mapped file, past which a page raises `SIGBUS`, is the
-  size the guest's own file operations give it, so a host program changing
-  the size does not move it.
+  another host program makes to the file does not reach the mappings. On a
+  Windows host, the stores of a shared mapping made through a descriptor
+  open with `O_APPEND` do not reach the file. The end of a mapped file, past
+  which a page raises `SIGBUS`, is the size the guest's own file operations
+  give it, so a host program changing the size does not move it.
 - **`MADV_DONTNEED` on a read-only ELF segment**: the program's writable
   segments read the executable again, as on Linux, but a read-only one (its
   code) keeps its contents. It differs only if `mprotect` made it writable

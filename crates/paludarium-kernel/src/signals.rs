@@ -285,6 +285,8 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
 /// poll, ppoll, select, pselect6 and an absolute clock_nanosleep return
 /// ERESTARTNOHAND, and the waits armed to go on through restart_syscall
 /// ERESTART_RESTARTBLOCK, which a handler ends with EINTR whatever its flags.
+/// The last two are not entered here: the interrupted wait records them (as
+/// 230 or 219) in place of its own number.
 pub(crate) fn restarts_with_handler(number: u64) -> bool {
     !matches!(number, 7 | 23 | 34 | 130 | 219 | 230 | 270 | 271)
 }

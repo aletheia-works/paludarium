@@ -439,8 +439,9 @@ kernel.
   `restart_syscall` with the deadline they had (the `futex` wait checks its word
   again first, `EAGAIN` once it changed), and
   an absolute `clock_nanosleep` runs again; a handler ends the restart, so they
-  give `EINTR` then. A handler set with `SA_RESTART` runs the calls of the
-  first list again when it returns, as on Linux, except `pause`,
+  give `EINTR` then. A handler set with `SA_RESTART` runs the calls that a
+  stop runs again (from `read` to the `futex` wait with no timeout) again when
+  it returns, as on Linux, except `pause`,
   `rt_sigsuspend`, `poll`, `ppoll`, `select`, `pselect6` and a socket call
   whose wait `SO_RCVTIMEO` or `SO_SNDTIMEO` limits, which give `EINTR`.
   `epoll_wait` and `rt_sigtimedwait` give `EINTR`, as on

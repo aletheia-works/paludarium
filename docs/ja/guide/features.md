@@ -401,7 +401,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
   `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが
   動いたときはやり直さず、`EINTR` を返します。
-  `SA_RESTART` を付けたハンドラが動いたときは、Linux と同じく、ハンドラから戻った後に最初の一覧の呼び出しをやり直します。
+  `SA_RESTART` を付けたハンドラが動いたときは、Linux と同じく、ハンドラから戻った後に、停止の後にやり直す呼び出し（`read` から時間制限なしの `futex` の待ちまで）をやり直します。
   ただし `pause`、`rt_sigsuspend`、`poll`、`ppoll`、`select`、`pselect6` と、`SO_RCVTIMEO` や `SO_SNDTIMEO`
   で待ちに時間制限のあるソケットの呼び出しは、`EINTR` を返します。
   `epoll_wait` と `rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。

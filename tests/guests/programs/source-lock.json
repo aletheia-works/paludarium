@@ -7,5 +7,10 @@
   "guest_license_exceptions": [
     {"crate": "webpki-root-certs@1.0.10", "allow": ["CDLA-Permissive-2.0"]},
     {"crate": "option-ext@0.2.0", "allow": ["MPL-2.0"]}
+  ],
+  "guest_advisory_exceptions": [
+    {"id": "RUSTSEC-2026-0391", "crate": "zstd@0.13.3"},
+    {"id": "RUSTSEC-2026-0398", "crate": "zstd-safe@7.3.0"},
+    {"id": "RUSTSEC-2026-0403", "crate": "zstd-safe@7.3.0"}
   ]
 }

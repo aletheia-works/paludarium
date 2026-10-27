@@ -53,6 +53,15 @@ checking that no guest input makes the emulator panic.
 | Every week | the pinned nightly Rust and the aube and ripgrep guests move to their latest releases, each in a pull request that merges itself once its checks pass |
 | Before a release | all of the above on the exact code being released (below) |
 
+Before a guest program is built, its dependencies must pass `cargo deny`
+under the root policy. Only aube has exceptions: the licenses of two crates
+and, for now, three RustSec advisories against `zstd` 0.13.3 and `zstd-safe`
+7.3.0 (RUSTSEC-2026-0391, RUSTSEC-2026-0398 and RUSTSEC-2026-0403). aube gets
+those versions through `decmpfs`, which pins `zstd` exactly, so aube cannot
+update them. The advisory exceptions go once a `decmpfs` release takes `zstd`
+0.14 ([SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)).
+`tests/guests/programs/evidence.py` lists every exception.
+
 ## Acceptance before a release
 
 Before a version is published, the exact code to be released must meet all of

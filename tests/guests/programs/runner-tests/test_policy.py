@@ -10,9 +10,12 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from evidence import (
+    ADVISORY_EXCEPTIONS,
     LICENSE_EXCEPTIONS,
     LICENSE_SUFFIX,
     REGISTRY,
+    ROOT_IGNORE,
+    advisory_ignore,
     digest,
     guest_policy,
     json_source_lock,
@@ -22,24 +25,59 @@ from evidence import (
     snapshot,
 )
 
+# The smallest root policy a guest policy can be made from.
+EMPTY = b"[advisories]\n" + ROOT_IGNORE
+
+
+def policy(root, exceptions=LICENSE_EXCEPTIONS, advisories=ADVISORY_EXCEPTIONS):
+    return guest_policy(root, exceptions, advisories)
+
 
 class PolicyTests(unittest.TestCase):
     def test_exact_root_inheritance(self):
-        root = b'[licenses]\nallow = ["Apache-2.0"]\nconfidence-threshold = 0.93\n'
-        self.assertEqual(guest_policy(root, LICENSE_EXCEPTIONS), root + LICENSE_SUFFIX)
+        rest = b'[licenses]\nallow = ["Apache-2.0"]\nconfidence-threshold = 0.93\n'
+        root = b"[advisories]\nversion = 2\n" + ROOT_IGNORE + rest
+        self.assertEqual(
+            policy(root),
+            b"[advisories]\nversion = 2\n"
+            + advisory_ignore(ADVISORY_EXCEPTIONS)
+            + rest
+            + LICENSE_SUFFIX,
+        )
 
     def test_source_lock_uses_approved_exceptions(self):
-        self.assertEqual(json_source_lock()["guest_license_exceptions"], LICENSE_EXCEPTIONS)
+        lock = json_source_lock()
+        self.assertEqual(lock["guest_license_exceptions"], LICENSE_EXCEPTIONS)
+        self.assertEqual(lock["guest_advisory_exceptions"], ADVISORY_EXCEPTIONS)
 
     def test_suffix_is_parsed_as_the_exact_exceptions(self):
-        config = tomllib.loads(guest_policy(b"", LICENSE_EXCEPTIONS).decode())
+        config = tomllib.loads(policy(EMPTY).decode())
         self.assertEqual(config["licenses"]["exceptions"], LICENSE_EXCEPTIONS)
+        self.assertEqual(
+            [entry["id"] for entry in config["advisories"]["ignore"]],
+            [a["id"] for a in ADVISORY_EXCEPTIONS],
+        )
+
+    def test_root_policy_lacking_one_empty_ignore_list_rejected(self):
+        for root in (b"", EMPTY + EMPTY, b'[advisories]\nignore = ["RUSTSEC-0000-0000"]\n'):
+            with self.assertRaises(ValueError):
+                policy(root)
+
+    def test_other_advisory_exceptions_rejected(self):
+        extra = {"id": "RUSTSEC-0000-0000", "crate": "x@1"}
+        for advisories in (
+            ADVISORY_EXCEPTIONS[:1],
+            [*ADVISORY_EXCEPTIONS, extra],
+            [{**ADVISORY_EXCEPTIONS[0], "crate": "zstd@0.14.3"}, *ADVISORY_EXCEPTIONS[1:]],
+        ):
+            with self.assertRaises(ValueError):
+                policy(EMPTY, advisories=advisories)
 
     def changed(self, index, field, value):
         exceptions = copy.deepcopy(LICENSE_EXCEPTIONS)
         exceptions[index][field] = value
         with self.assertRaises(ValueError):
-            guest_policy(b"", exceptions)
+            policy(EMPTY, exceptions)
 
     def test_other_crate_rejected(self):
         self.changed(0, "crate", "other@1.0.10")
@@ -58,14 +96,14 @@ class PolicyTests(unittest.TestCase):
             [*LICENSE_EXCEPTIONS, {"crate": "x@1", "allow": ["MIT"]}],
         ):
             with self.assertRaises(ValueError):
-                guest_policy(b"", exceptions)
+                policy(EMPTY, exceptions)
 
     def test_receipt_detects_policy_license_and_audit_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = pathlib.Path(temporary)
-            root = b'[licenses]\nallow = ["Apache-2.0"]\n'
+            root = EMPTY + b'[licenses]\nallow = ["Apache-2.0"]\n'
             config = directory / "aube-deny.toml"
-            config.write_bytes(guest_policy(root, LICENSE_EXCEPTIONS))
+            config.write_bytes(policy(root))
             (directory / "licenses").mkdir()
             licenses = {}
             for exception in LICENSE_EXCEPTIONS:
@@ -76,6 +114,7 @@ class PolicyTests(unittest.TestCase):
                 "audits": {"probe": 0, "aube": 0, "ripgrep": 0},
                 "license_policy": {
                     "exceptions": copy.deepcopy(LICENSE_EXCEPTIONS),
+                    "advisories": copy.deepcopy(ADVISORY_EXCEPTIONS),
                     "root_config_sha256": hashlib.sha256(root).hexdigest(),
                     "guest_config_sha256": digest(config),
                     "licenses": licenses,
@@ -100,7 +139,7 @@ class PolicyTests(unittest.TestCase):
             config.write_bytes(root)
             with self.assertRaises(ValueError):
                 policy_receipt_valid(directory, receipt, root)
-            config.write_bytes(guest_policy(root, LICENSE_EXCEPTIONS))
+            config.write_bytes(policy(root))
             receipt["license_policy"]["guest_config_sha256"] = "0" * 64
             with self.assertRaises(ValueError):
                 policy_receipt_valid(directory, receipt, root)
@@ -109,6 +148,10 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 policy_receipt_valid(directory, receipt, root)
             receipt["license_policy"]["exceptions"] = copy.deepcopy(LICENSE_EXCEPTIONS)
+            receipt["license_policy"]["advisories"] = ADVISORY_EXCEPTIONS[1:]
+            with self.assertRaises(ValueError):
+                policy_receipt_valid(directory, receipt, root)
+            receipt["license_policy"]["advisories"] = copy.deepcopy(ADVISORY_EXCEPTIONS)
             policy_receipt_valid(directory, receipt, root)
             receipt["audits"]["aube"] = 4
             with self.assertRaises(ValueError):

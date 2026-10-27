@@ -144,11 +144,15 @@ class BuildIntegration(unittest.TestCase):
         kinds = ["deny" if "deny" in args else "build" for args in commands[1:]]
         self.assertEqual(kinds, ["deny"] * 3 + ["build"] * 3)
 
-    def test_no_advisory_exception_is_added(self):
-        self.run_build()
+    def test_only_the_approved_advisory_exceptions_are_added(self):
+        receipt, _ = self.run_build()
         config = (self.directory / "aube-deny.toml").read_bytes()
         root = (HERE.parents[2] / "deny.toml").read_bytes()
-        self.assertEqual(config, root + evidence.LICENSE_SUFFIX)
+        ignore = evidence.advisory_ignore(evidence.ADVISORY_EXCEPTIONS)
+        self.assertEqual(
+            config, root.replace(evidence.ROOT_IGNORE, ignore) + evidence.LICENSE_SUFFIX
+        )
+        self.assertEqual(receipt["license_policy"]["advisories"], evidence.ADVISORY_EXCEPTIONS)
 
     def test_audit_failure_propagates_before_any_build(self):
         with self.assertRaises(subprocess.CalledProcessError):

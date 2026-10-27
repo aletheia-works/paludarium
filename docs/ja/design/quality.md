@@ -50,6 +50,15 @@ LeakSanitizer を付けて、それぞれ 600 秒動かします。夜間の CI 
 | 毎週 | 固定した nightly の Rust と、aube と ripgrep のゲストを最新のリリースへ上げます。それぞれのプルリクエストは、検査が通ると自分でマージされます |
 | 公開の前 | 公開する同じコードで、上のすべて（下を参照） |
 
+ゲストのプログラムは、ビルドの前に、依存がルートの方針の `cargo deny` を通らなければ
+なりません。例外があるのは aube だけです。2 つのクレートのライセンスと、今のところ
+`zstd` 0.13.3 と `zstd-safe` 7.3.0 への 3 つの RustSec のアドバイザリ（RUSTSEC-2026-0391、
+RUSTSEC-2026-0398、RUSTSEC-2026-0403）です。aube はこの版を、`zstd` を版まで固定している
+`decmpfs` から受け取るので、自分では上げられません。アドバイザリの例外は、`decmpfs` が
+`zstd` 0.14 にしたリリースを出したら外します
+（[SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)）。例外はすべて
+`tests/guests/programs/evidence.py` に並んでいます。
+
 ## 公開の前の受け入れの確かめ
 
 新しい版を公開する前に、公開するのとまったく同じコードで、次のことがそろっていることを

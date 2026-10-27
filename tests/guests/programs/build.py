@@ -119,7 +119,13 @@ def build(directory):
         receipt["ripgrep_source_before"] = snapshot(ripgrep)
         root_policy = (ROOT / "deny.toml").read_bytes()
         guest_config = directory / "aube-deny.toml"
-        guest_config.write_bytes(guest_policy(root_policy, lock["guest_license_exceptions"]))
+        guest_config.write_bytes(
+            guest_policy(
+                root_policy,
+                lock["guest_license_exceptions"],
+                lock["guest_advisory_exceptions"],
+            )
+        )
         # Metadata fetches crates.io sources but does not compile or mutate
         # the upstream project. Retain each excepted crate's full license text.
         metadata = json.loads(
@@ -140,6 +146,7 @@ def build(directory):
         )
         receipt["license_policy"] = {
             "exceptions": lock["guest_license_exceptions"],
+            "advisories": lock["guest_advisory_exceptions"],
             "root_config_sha256": hashlib.sha256(root_policy).hexdigest(),
             "guest_config_sha256": digest(guest_config),
             "licenses": retain_licenses(metadata, lock["guest_license_exceptions"], directory),

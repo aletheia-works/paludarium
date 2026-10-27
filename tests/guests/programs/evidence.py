@@ -17,16 +17,39 @@ LICENSE_TEXTS = {
     "webpki-root-certs@1.0.10": ("LICENSE", (b"Community Data License Agreement", b"2.1.")),
     "option-ext@0.2.0": ("LICENSE.txt", (b"Mozilla Public License Version 2.0",)),
 }
+# RustSec advisories aube's audit ignores for now: the zstd 0.13 ones, which
+# aube gets through decmpfs's exact `zstd = "=0.13.3"` pin and cannot update.
+# Remove them once a decmpfs release takes zstd 0.14 (SocketDev/decmpfs#16).
+ADVISORY_EXCEPTIONS = [
+    {"id": "RUSTSEC-2026-0391", "crate": "zstd@0.13.3"},
+    {"id": "RUSTSEC-2026-0398", "crate": "zstd-safe@7.3.0"},
+    {"id": "RUSTSEC-2026-0403", "crate": "zstd-safe@7.3.0"},
+]
+# The root policy's empty advisory ignore list, which the guest policy fills.
+ROOT_IGNORE = b"ignore = []\n"
 LICENSE_SUFFIX = (
     b'\n[[licenses.exceptions]]\ncrate = "webpki-root-certs@1.0.10"\nallow = ["CDLA-Permissive-2.0"]\n'
     b'\n[[licenses.exceptions]]\ncrate = "option-ext@0.2.0"\nallow = ["MPL-2.0"]\n'
 )
 
 
-def guest_policy(root_bytes, exceptions):
+def advisory_ignore(advisories):
+    entries = "".join(
+        f'  {{ id = "{a["id"]}", reason = "{a["crate"]} through decmpfs (SocketDev/decmpfs#16)" }},\n'
+        for a in advisories
+    )
+    return f"ignore = [\n{entries}]\n".encode()
+
+
+def guest_policy(root_bytes, exceptions, advisories):
+    """The root policy with the approved guest exceptions, and nothing else."""
     if exceptions != LICENSE_EXCEPTIONS:
         raise ValueError("unapproved guest license exception")
-    return root_bytes + LICENSE_SUFFIX
+    if advisories != ADVISORY_EXCEPTIONS:
+        raise ValueError("unapproved guest advisory exception")
+    if root_bytes.count(ROOT_IGNORE) != 1:
+        raise ValueError("root policy lacks one empty advisory ignore list")
+    return root_bytes.replace(ROOT_IGNORE, advisory_ignore(advisories)) + LICENSE_SUFFIX
 
 
 def license_file_name(exception):
@@ -38,10 +61,12 @@ def policy_receipt_valid(directory, receipt, root_bytes):
     policy = receipt["license_policy"]
     if policy["exceptions"] != LICENSE_EXCEPTIONS:
         raise ValueError("unapproved guest license exception")
+    if policy["advisories"] != ADVISORY_EXCEPTIONS:
+        raise ValueError("unapproved guest advisory exception")
     if hashlib.sha256(root_bytes).hexdigest() != policy["root_config_sha256"]:
         raise ValueError("root policy changed")
     config = directory / "aube-deny.toml"
-    if config.read_bytes() != guest_policy(root_bytes, policy["exceptions"]):
+    if config.read_bytes() != guest_policy(root_bytes, policy["exceptions"], policy["advisories"]):
         raise ValueError("guest config does not inherit exact root policy")
     if digest(config) != policy["guest_config_sha256"]:
         raise ValueError("guest config hash differs")

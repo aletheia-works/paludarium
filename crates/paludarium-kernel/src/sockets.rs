@@ -1,4 +1,5 @@
-//! AF_UNIX stream endpoints. Buffers and peer lifetime belong to the Kernel.
+//! AF_UNIX socket pairs, and pipes built on them, with the signals their
+//! `O_ASYNC` sends. Buffers and peer lifetime belong to the Kernel.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, PRI, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::syscalls::{Context, Outcome};

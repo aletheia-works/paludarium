@@ -191,14 +191,16 @@ pub(crate) fn fcntl(
 }
 
 /// The owners `F_SETOWN` gives files other than pipes and sockets (which
-/// keep theirs themselves), by open file description, for `F_GETOWN`.
+/// keep theirs themselves), by open file description, for `F_GETOWN`. Each
+/// look drops the entries of the descriptions closed since.
 #[derive(Default)]
 pub(crate) struct Owners(Vec<(Weak<dyn FileHandle>, FileOwner)>);
 impl Owners {
     fn same(entry: &Weak<dyn FileHandle>, file: &Arc<dyn FileHandle>) -> bool {
         entry.strong_count() != 0 && std::ptr::addr_eq(entry.as_ptr(), Arc::as_ptr(file))
     }
-    pub(crate) fn get(&self, file: &Arc<dyn FileHandle>) -> FileOwner {
+    pub(crate) fn get(&mut self, file: &Arc<dyn FileHandle>) -> FileOwner {
+        self.0.retain(|(entry, _)| entry.strong_count() != 0);
         self.0
             .iter()
             .find(|(entry, _)| Self::same(entry, file))

@@ -141,7 +141,9 @@ kernel.
   whole length; `MSG_OOB` finds no out-of-band data (`EINVAL` on a stream,
   `EOPNOTSUPP` on the other kinds). `sendmsg` and `sendto` take
   `MSG_NOSIGNAL` and `MSG_DONTWAIT`, and `MSG_OOB` on a datagram or packet
-  socket is `EOPNOTSUPP`. The other flags have no effect, as on Linux.
+  socket is `EOPNOTSUPP` (on a stream too, which
+  [Limitations](./limitations) lists). The other flags have no effect, as
+  on Linux.
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and

@@ -680,6 +680,9 @@ fn receive_with(
                 received.length += more.count;
                 received.passed = more.passed;
             }
+            // The end of the stream, or an error such as a signal after
+            // some data, which Linux's unix_stream_read_generic returns
+            // instead (`copied ? : err`).
             _ => break,
         }
     }

@@ -806,6 +806,42 @@ fn scm_rights_on_messages_and_queued_descriptors_close_with_the_socket() {
     assert_eq!(f.ret(0, [r, IN, 8, 0, 0, 0]), 0);
 }
 #[test]
+fn recvfrom_peeks_waits_for_all_and_gives_whole_message_lengths() {
+    let mut f = Fixture::new();
+    let fail = |e: i32| Errno(e).to_syscall_return();
+    let (a, b) = pair(&mut f, 53, [1, 0x801, 0, DATA, 0, 0]);
+    let (c, d) = pair(&mut f, 53, [1, 1, 0, DATA, 0, 0]);
+    let (p, q) = pair(&mut f, 53, [1, 0x802, 0, DATA, 0, 0]);
+    let bytes = |f: &Fixture, len: usize| {
+        let mut buf = vec![0; len];
+        f.mem.read(GuestAddr(IN), &mut buf).unwrap();
+        buf
+    };
+    f.mem.write(GuestAddr(BYTES), b"abcdef").unwrap();
+    // MSG_PEEK leaves a stream's data; a read then takes it.
+    assert_eq!(f.ret(44, [a, BYTES, 4, 0, 0, 0]), 4);
+    assert_eq!(f.ret(45, [b, IN, 2, 2, 0, 0]), 2);
+    assert_eq!(bytes(&f, 2), b"ab");
+    assert_eq!(f.ret(45, [b, IN, 8, 0, 0, 0]), 4);
+    assert_eq!(bytes(&f, 4), b"abcd");
+    // MSG_WAITALL does not wait on a nonblocking socket, and ends with the
+    // stream on a blocking one.
+    assert_eq!(f.ret(44, [a, BYTES, 2, 0x80, 0, 0]), 2);
+    assert_eq!(f.ret(45, [b, IN, 8, 0x100, 0, 0]), 2);
+    assert_eq!(f.ret(44, [c, BYTES, 2, 0, 0, 0]), 2);
+    assert_eq!(f.ret(48, [c, 1, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(45, [d, IN, 8, 0x100, 0, 0]), 2);
+    // MSG_TRUNC gives a message's whole length, peeked or taken.
+    assert_eq!(f.ret(44, [p, BYTES, 6, 0x8080, 0, 0]), 6);
+    assert_eq!(f.ret(45, [q, IN, 2, 0x22, 0, 0]), 6);
+    assert_eq!(f.ret(45, [q, IN, 2, 0x20, 0, 0]), 6);
+    assert_eq!(bytes(&f, 2), b"ab");
+    assert_eq!(f.ret(45, [q, IN, 2, 0x40, 0, 0]), fail(11));
+    // A datagram socket has no out-of-band data at all.
+    assert_eq!(f.ret(45, [q, IN, 2, 1, 0, 0]), fail(95));
+    assert_eq!(f.ret(44, [p, BYTES, 1, 1, 0, 0]), fail(95));
+}
+#[test]
 fn sendto_and_recvfrom_take_addresses_and_flags_like_sendmsg() {
     let mut f = Fixture::new();
     let fail = |e: i32| Errno(e).to_syscall_return();

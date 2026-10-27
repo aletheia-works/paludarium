@@ -168,10 +168,10 @@ kernel.
     finds the pipe full, and also before it waits. Every read signals the
     writer as it ends, with data or not. The close of either end signals
     the other.
-  - **Sockets.** A send signals the peer. So does a write shutdown, and so
-    does the close of a stream or packet socket, which hangs up. A send that
-    found the buffer full signals once when a read makes room. An
-    out-of-band byte also sends a `POLL_PRI` signal.
+  - **Sockets.** A send signals the peer. On a stream or packet socket, so
+    do a write shutdown and the close, which hangs up; a datagram socket's
+    do not. A send that found the buffer full signals once when a read
+    makes room. An out-of-band byte also sends a `POLL_PRI` signal.
 - `setsockopt` and `getsockopt` take the `SOL_SOCKET` options as Linux's
   `sk_setsockopt` and `sk_getsockopt` do, with their defaults and checks: an
   `int` value of fewer than 4 bytes is `EINVAL`, a value read back is cut to

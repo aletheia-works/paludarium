@@ -60,6 +60,8 @@ NAMES = {
     47: "recvmsg",
     48: "shutdown",
     53: "socketpair",
+    54: "setsockopt",
+    55: "getsockopt",
     56: "clone",
     57: "fork",
     58: "vfork",

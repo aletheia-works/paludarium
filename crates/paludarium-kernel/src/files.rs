@@ -1580,6 +1580,24 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     d.file.set_flags(a[2] as u32)?;
                     Ok(0)
                 }
+                // F_SETOWN and F_GETOWN, for sockets only: the owner a
+                // stream's out-of-band byte sends SIGURG.
+                8 | 9 => {
+                    let socket = d
+                        .file
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<crate::sockets::SocketPairEnd>())
+                        .ok_or(Errno::EINVAL)?;
+                    if a[1] == 9 {
+                        return Ok(i64::from(socket.owner()).cast_unsigned());
+                    }
+                    let owner = a[2] as i32;
+                    if owner != 0 && !c.processes.owner_exists(owner) {
+                        return Err(Errno(3));
+                    }
+                    socket.set_owner(owner);
+                    Ok(0)
+                }
                 _ => Err(Errno::EINVAL),
             }
         }

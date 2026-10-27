@@ -267,6 +267,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .map_err(|_| Errno::EFAULT)?;
             let kind = u32::try_from(a[1]).map_err(|_| Errno::EINVAL)?;
             let ends = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
+            ends[0].pair.creator.store(c.process.pid, Ordering::SeqCst);
             let [fd0, fd1] = c.files.install_pair(
                 ends.map(|end| end as Arc<dyn FileHandle>),
                 kind & CLOEXEC != 0,
@@ -290,6 +291,8 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             socket.shutdown(a[1])?;
             Ok(0)
         }
+        54 => set_option(c, a),
+        55 => get_option(c, a),
         44 => send_to(c, a),
         45 => receive_from(c, a),
         46 => send_message(c, a),
@@ -661,15 +664,22 @@ fn send_bytes(
     }
     // With the data gone, an out-of-band byte that cannot go leaves what was
     // sent, with no SIGPIPE, as unix_stream_sendmsg returns `sent ? : err`.
-    if sent != 0 {
-        return Ok(sent
-            + socket
-                .send_out_of_band(last, passed)
-                .map_or(0, |n| n as u64));
+    let urgent = if sent == 0 {
+        crate::files::write_with(c, file, &[last], nosignal, dontwait, |_| {
+            socket.send_out_of_band(last, passed)
+        })?
+    } else {
+        socket
+            .send_out_of_band(last, passed)
+            .map_or(0, |n| n as u64)
+    };
+    // The byte sends the receiving end's owner SIGURG, as Linux's
+    // `sk_send_sigurg`.
+    let owner = socket.peer_owner();
+    if urgent != 0 && owner != 0 {
+        c.processes.send_urgent(owner);
     }
-    crate::files::write_with(c, file, &[last], nosignal, dontwait, |_| {
-        socket.send_out_of_band(last, passed)
-    })
+    Ok(sent + urgent)
 }
 /// Reads for recvmsg or recvfrom with their `flags`, as Linux's AF_UNIX
 /// sockets take them: `MSG_DONTWAIT` does not wait, `MSG_PEEK` leaves the
@@ -771,6 +781,238 @@ fn deliver(
     (used, installed < count)
 }
 
+const SO_DEBUG: u32 = 1;
+const SO_REUSEADDR: u32 = 2;
+const SO_TYPE: u32 = 3;
+const SO_ERROR: u32 = 4;
+const SO_DONTROUTE: u32 = 5;
+const SO_BROADCAST: u32 = 6;
+const SO_SNDBUF: u32 = 7;
+const SO_RCVBUF: u32 = 8;
+const SO_KEEPALIVE: u32 = 9;
+const SO_OOBINLINE: u32 = 10;
+const SO_NO_CHECK: u32 = 11;
+const SO_PRIORITY: u32 = 12;
+const SO_LINGER: u32 = 13;
+const SO_BSDCOMPAT: u32 = 14;
+const SO_REUSEPORT: u32 = 15;
+const SO_PASSCRED: u32 = 16;
+const SO_PEERCRED: u32 = 17;
+const SO_RCVLOWAT: u32 = 18;
+const SO_SNDLOWAT: u32 = 19;
+const SO_RCVTIMEO: u32 = 20;
+const SO_SNDTIMEO: u32 = 21;
+const SO_TIMESTAMP: u32 = 29;
+const SO_ACCEPTCONN: u32 = 30;
+const SO_SNDBUFFORCE: u32 = 32;
+const SO_RCVBUFFORCE: u32 = 33;
+const SO_PASSSEC: u32 = 34;
+const SO_MARK: u32 = 36;
+const SO_PROTOCOL: u32 = 38;
+const SO_DOMAIN: u32 = 39;
+const SO_PEEK_OFF: u32 = 42;
+const SO_BUSY_POLL: u32 = 46;
+const SO_INCOMING_CPU: u32 = 49;
+/// `net.core.wmem_default` and `rmem_default`, a socket's buffers at first.
+const DEFAULT_BUFFER: i32 = 212_992;
+/// `net.core.wmem_max` and `rmem_max`, the most `SO_SNDBUF` takes.
+const MAX_BUFFER: u32 = 212_992;
+/// `SOCK_MIN_SNDBUF` and `SOCK_MIN_RCVBUF`.
+const MIN_SEND_BUFFER: i32 = 4608;
+const MIN_RECEIVE_BUFFER: i32 = 2304;
+
+/// The `SOL_SOCKET` options of one end that its `setsockopt` keeps, as
+/// Linux's `sk_setsockopt` stores them. Only `SO_OOBINLINE` acts here;
+/// `SO_SNDBUF` and `SO_RCVBUF` are reported but leave the pair's buffer as it
+/// is, and the others have no effect on an AF_UNIX socket on Linux either.
+#[derive(Clone, Copy)]
+struct Options {
+    debug: bool,
+    reuse_address: bool,
+    dont_route: bool,
+    broadcast: bool,
+    keep_alive: bool,
+    out_of_band_inline: bool,
+    no_check: bool,
+    priority: i32,
+    linger: Option<i32>,
+    send_buffer: i32,
+    receive_buffer: i32,
+    mark: i32,
+    busy_poll: i32,
+    incoming_cpu: i32,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            debug: false,
+            reuse_address: false,
+            dont_route: false,
+            broadcast: false,
+            keep_alive: false,
+            out_of_band_inline: false,
+            no_check: false,
+            priority: 0,
+            linger: None,
+            send_buffer: DEFAULT_BUFFER,
+            receive_buffer: DEFAULT_BUFFER,
+            mark: 0,
+            busy_poll: 0,
+            incoming_cpu: -1,
+        }
+    }
+}
+/// A socket buffer size as `SO_SNDBUF` or `SO_RCVBUF` sets it: capped at
+/// `MAX_BUFFER` unless forced, doubled for Linux's bookkeeping, and at least
+/// `least`.
+fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
+    let value = value.cast_unsigned();
+    let value = if forced { value } else { value.min(MAX_BUFFER) };
+    i32::try_from(value.saturating_mul(2))
+        .unwrap_or(i32::MAX)
+        .max(least)
+}
+/// `setsockopt(fd, level, name, value, len)` on a socket pair, as Linux's
+/// `sk_setsockopt`: a socket pair has only `SOL_SOCKET` options
+/// (EOPNOTSUPP for another level), an `int` value of fewer than 4 bytes is
+/// EINVAL, and an unknown name, or one whose effect is not modelled here
+/// (`SO_PASSCRED`, `SO_PASSSEC`, `SO_RCVLOWAT`, `SO_RCVTIMEO`,
+/// `SO_SNDTIMEO`, `SO_TIMESTAMP`, `SO_PEEK_OFF`), is ENOPROTOOPT. The guest
+/// runs as root, so the options that need `CAP_NET_ADMIN` are set.
+fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let file = socket(c, a[0])?;
+    let socket = as_socket(&file)?;
+    if a[1] as u32 != SOL_SOCKET {
+        return Err(Errno(95));
+    }
+    let name = a[2] as u32;
+    let len = a[4] as u32 as i32;
+    if len < 4 {
+        return Err(Errno::EINVAL);
+    }
+    let value = i32::from_le_bytes(
+        read_words(c, a[3], 4)?
+            .try_into()
+            .map_err(|_| Errno::EFAULT)?,
+    );
+    let mut options = socket
+        .options
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let on = value != 0;
+    match name {
+        SO_DEBUG => options.debug = on,
+        SO_REUSEADDR => options.reuse_address = on,
+        SO_DONTROUTE => options.dont_route = on,
+        SO_BROADCAST => options.broadcast = on,
+        SO_KEEPALIVE => options.keep_alive = on,
+        SO_OOBINLINE => options.out_of_band_inline = on,
+        SO_NO_CHECK => options.no_check = on,
+        SO_PRIORITY => options.priority = value,
+        SO_MARK => options.mark = value,
+        SO_BUSY_POLL => options.busy_poll = value,
+        SO_INCOMING_CPU => options.incoming_cpu = value,
+        SO_BSDCOMPAT => {}
+        SO_SNDBUF | SO_SNDBUFFORCE => {
+            options.send_buffer = buffer_size(value, name == SO_SNDBUFFORCE, MIN_SEND_BUFFER);
+        }
+        SO_RCVBUF | SO_RCVBUFFORCE => {
+            options.receive_buffer = buffer_size(value, name == SO_RCVBUFFORCE, MIN_RECEIVE_BUFFER);
+        }
+        SO_LINGER => {
+            if len < 8 {
+                return Err(Errno::EINVAL);
+            }
+            let raw = read_words(c, a[3], 8)?;
+            let seconds = i32::from_le_bytes(raw[4..8].try_into().map_err(|_| Errno::EFAULT)?);
+            options.linger = on.then_some(seconds);
+        }
+        SO_RCVTIMEO | SO_SNDTIMEO if len < 16 => return Err(Errno::EINVAL),
+        // AF_UNIX takes no SO_REUSEPORT.
+        SO_REUSEPORT => return Err(Errno(95)),
+        _ => return Err(Errno(92)),
+    }
+    Ok(0)
+}
+/// `getsockopt(fd, level, name, value, len)` on a socket pair, as Linux's
+/// `sk_getsockopt`: the value, cut to `*len` bytes, and its length back in
+/// `*len` (EFAULT when either cannot be read or written, EINVAL for a
+/// negative length, ENOPROTOOPT for an unknown name).
+fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let file = socket(c, a[0])?;
+    let socket = as_socket(&file)?;
+    if a[1] as u32 != SOL_SOCKET {
+        return Err(Errno(95));
+    }
+    let len = i32::from_le_bytes(
+        read_words(c, a[4], 4)?
+            .try_into()
+            .map_err(|_| Errno::EFAULT)?,
+    );
+    if len < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let options = *socket
+        .options
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let int = |value: i32| value.to_le_bytes().to_vec();
+    let value = match a[2] as u32 {
+        SO_DEBUG => int(options.debug.into()),
+        SO_REUSEADDR => int(options.reuse_address.into()),
+        SO_TYPE => int(socket.pair.kind.cast_signed()),
+        SO_ERROR | SO_BSDCOMPAT | SO_REUSEPORT | SO_PASSCRED | SO_ACCEPTCONN | SO_PASSSEC
+        | SO_TIMESTAMP | SO_PROTOCOL => int(0),
+        SO_DONTROUTE => int(options.dont_route.into()),
+        SO_BROADCAST => int(options.broadcast.into()),
+        SO_SNDBUF => int(options.send_buffer),
+        SO_RCVBUF => int(options.receive_buffer),
+        SO_KEEPALIVE => int(options.keep_alive.into()),
+        SO_OOBINLINE => int(options.out_of_band_inline.into()),
+        SO_NO_CHECK => int(options.no_check.into()),
+        SO_PRIORITY => int(options.priority),
+        SO_LINGER => {
+            let mut linger = int(options.linger.is_some().into());
+            linger.extend(options.linger.unwrap_or(0).to_le_bytes());
+            linger
+        }
+        // The creator's credentials, as root (uid and gid 0).
+        SO_PEERCRED => {
+            let mut credentials = socket
+                .pair
+                .creator
+                .load(Ordering::SeqCst)
+                .to_le_bytes()
+                .to_vec();
+            credentials.extend([0; 8]);
+            credentials
+        }
+        SO_RCVLOWAT | SO_SNDLOWAT | SO_DOMAIN => int(1),
+        SO_RCVTIMEO | SO_SNDTIMEO => vec![0; 16],
+        SO_MARK => int(options.mark),
+        SO_PEEK_OFF => int(-1),
+        SO_BUSY_POLL => int(options.busy_poll),
+        SO_INCOMING_CPU => int(options.incoming_cpu),
+        _ => return Err(Errno(92)),
+    };
+    let len = value.len().min(len.cast_unsigned() as usize);
+    c.mem
+        .write(GuestAddr(a[3]), &value[..len])
+        .map_err(|_| Errno::EFAULT)?;
+    c.mem
+        .write(GuestAddr(a[4]), &(len as u32).to_le_bytes())
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(0)
+}
+/// `len` bytes of guest memory at `at` (EFAULT).
+fn read_words(c: &Context<'_>, at: u64, len: usize) -> Result<Vec<u8>, Errno> {
+    let mut bytes = vec![0; len];
+    c.mem
+        .read(GuestAddr(at), &mut bytes)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(bytes)
+}
+
 /// Descriptors passed with `SCM_RIGHTS`: what one write or message carries.
 pub(crate) type Passed = Vec<crate::files::Descriptor>;
 /// One successful write, as Linux queues an `sk_buff`.
@@ -830,9 +1072,15 @@ struct Side {
     /// SOCK_DGRAM: a send found the peer closed, so this side has no peer
     /// any more (`ECONNREFUSED` once, then `ENOTCONN`).
     disconnected: bool,
+    /// `F_SETOWN`: the process (or, negative, the process group) that a
+    /// stream's out-of-band byte for this side sends SIGURG; 0 is none.
+    owner: i32,
 }
 struct Pair {
     sides: Mutex<[Side; 2]>,
+    /// The process that made the pair, which `SO_PEERCRED` names for both
+    /// ends, as Linux's `unix_socketpair` records its credentials.
+    creator: AtomicU32,
     hub: Arc<ReadinessHub>,
     /// SOCK_STREAM, SOCK_DGRAM or SOCK_SEQPACKET. The last two keep message
     /// boundaries: each write is one message, and each read returns one
@@ -862,6 +1110,8 @@ pub(crate) struct SocketPairEnd {
     /// Each end is a socket of its own, with its own inode.
     inode: u64,
     attributes: Attributes,
+    /// The `SOL_SOCKET` options set on this end ([`Options`]).
+    options: Mutex<Options>,
 }
 impl SocketPairEnd {
     /// The bytes waiting to be read on this side.
@@ -885,6 +1135,7 @@ impl SocketPairEnd {
             return Err(Errno(94)); // ESOCKTNOSUPPORT
         }
         let pair = Arc::new(Pair {
+            creator: AtomicU32::new(0),
             kind: kind & 0xf,
             window: AtomicUsize::new(SEND_WINDOW),
             sides: Mutex::new(std::array::from_fn(|_| Side {
@@ -900,6 +1151,7 @@ impl SocketPairEnd {
                 flags: AtomicU32::new(2 | kind & NONBLOCK),
                 inode: crate::files::anonymous_inode(),
                 attributes: Attributes::new(0o140777),
+                options: Mutex::default(),
             })
         }))
     }
@@ -984,10 +1236,46 @@ impl SocketPairEnd {
                 .front()
                 .is_some_and(|write| write.piece != Piece::Data)
     }
+    /// Whether `SO_OOBINLINE` reads the out-of-band byte with the data.
+    fn out_of_band_inline(&self) -> bool {
+        self.options
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .out_of_band_inline
+    }
+    /// `F_GETOWN`: who this end's out-of-band bytes send SIGURG.
+    pub(crate) fn owner(&self) -> i32 {
+        self.pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[self.side]
+            .owner
+    }
+    /// `F_SETOWN`: the process, or (negative) process group, that this end's
+    /// out-of-band bytes send SIGURG; 0 for none.
+    pub(crate) fn set_owner(&self, owner: i32) {
+        self.pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[self.side]
+            .owner = owner;
+    }
+    /// Who this end's out-of-band bytes reach (the peer's owner).
+    fn peer_owner(&self) -> i32 {
+        self.pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[1 - self.side]
+            .owner
+    }
     /// recvmsg's and recvfrom's `MSG_OOB` on a stream, as Linux's
     /// `unix_stream_recv_urg`: the out-of-band byte, which `peek` leaves,
     /// EINVAL when there is none.
     fn receive_out_of_band(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
+        // With SO_OOBINLINE the byte comes with the data, not on its own.
+        if self.out_of_band_inline() {
+            return Err(Errno::EINVAL);
+        }
         let mut sides = self
             .pair
             .sides
@@ -1096,6 +1384,7 @@ impl SocketPairEnd {
         peek: Option<usize>,
         after: bool,
     ) -> Result<Received, Errno> {
+        let inline = self.out_of_band_inline();
         let mut sides = self
             .pair
             .sides
@@ -1136,7 +1425,7 @@ impl SocketPairEnd {
             };
         }
         if let Some(skip) = peek {
-            let received = Self::peek_stream(own, buf, skip, after);
+            let received = Self::peek_stream(own, buf, skip, after, inline);
             return if received.count == 0
                 && received.passed.is_empty()
                 && !buf.is_empty()
@@ -1159,11 +1448,15 @@ impl SocketPairEnd {
         while let Some(front) = own.writes.front_mut() {
             // Stop before the mark; at it, drop the out-of-band byte and read
             // on, as Linux's manage_oob.
+            if front.piece != Piece::Data && received.count != 0 {
+                received.at_mark = true;
+                break;
+            }
+            // SO_OOBINLINE: at the mark, the byte is read as data.
+            if front.piece == Piece::OutOfBand && inline {
+                front.piece = Piece::Data;
+            }
             if front.piece != Piece::Data {
-                if received.count != 0 {
-                    received.at_mark = true;
-                    break;
-                }
                 let dropped = own.writes.pop_front().ok_or(Errno::EIO)?;
                 own.bytes.drain(..dropped.len);
                 received.discarded.extend(dropped.passed);
@@ -1208,7 +1501,13 @@ impl SocketPairEnd {
     /// What a stream read from `skip` bytes on would take, left in `own`:
     /// it stops after a write that passed descriptors, giving copies of
     /// them.
-    fn peek_stream(own: &Side, buf: &mut [u8], mut skip: usize, after: bool) -> Received {
+    fn peek_stream(
+        own: &Side,
+        buf: &mut [u8],
+        mut skip: usize,
+        after: bool,
+        inline: bool,
+    ) -> Received {
         let mut received = Received::default();
         let mut start = 0;
         for write in &own.writes {
@@ -1220,7 +1519,9 @@ impl SocketPairEnd {
                     received.at_mark = true;
                     break;
                 }
-                continue;
+                if !(inline && write.piece == Piece::OutOfBand) {
+                    continue;
+                }
             }
             if skip >= write.len {
                 skip -= write.len;

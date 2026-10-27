@@ -36,7 +36,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIONBIO`、`SIOCATMARK`） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socket`（常に `EAFNOSUPPORT`）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタの受け渡し）、`shutdown` |
+| ソケット | `socket`（常に `EAFNOSUPPORT`）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタの受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -135,8 +135,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   読み込みは印の手前で止まり、印は `SIOCATMARK` でわかります。`poll`、`select` の例外の
   集合、`epoll` には `POLLPRI` が出ます。`MSG_OOB` を付けた `recv` がそのバイトを取り
   （ないときは `EINVAL`）、`MSG_PEEK` なら残します。何も読まないうちに印に着いた読み込みは、
-  そのバイトを捨てて先を読みます。1 バイトの帯域外の送信が受け渡すディスクリプタは、
-  渡されずに閉じられます。
+  そのバイトを捨てて先を読みます。`SO_OOBINLINE` なら、そのバイトをふつうのデータとして
+  読みます（そのとき `MSG_OOB` を付けた `recv` は `EINVAL`）。1 バイトの帯域外の送信が
+  受け渡すディスクリプタは、渡されずに閉じられます。帯域外のバイトは、受け取る側の
+  持ち主に `SIGURG` を送ります。持ち主は `fcntl` の `F_SETOWN` で、プロセス、または
+  負の値でプロセスグループに決めます（いなければ `ESRCH`）。`F_GETOWN` で返します。
+- `setsockopt` と `getsockopt` は、Linux の `sk_setsockopt` と `sk_getsockopt` と同じく、
+  既定の値やチェックも含めて `SOL_SOCKET` のオプションを扱います。4 バイトに満たない
+  `int` の値は `EINVAL`、読み出す値は渡された長さで切り、ほかのレベルは `EOPNOTSUPP`、
+  知らないオプションは `ENOPROTOOPT` です。`SO_TYPE`、`SO_DOMAIN`、`SO_PROTOCOL`、
+  `SO_ERROR`、`SO_ACCEPTCONN`、`SO_PEERCRED`（その組を作ったプロセス）は読むだけです。
+  `SO_SNDBUF` と `SO_RCVBUF` は 2 倍にして、Linux の下限と上限に収め、`SO_LINGER` は
+  `struct linger` を受け取ります。
 - ファイルの `MAP_SHARED` のマッピングは、Linux と同じくファイルのページキャッシュを
   見せます。どのプロセスのものでも、そのファイルの共有マッピングはみな同じページを
   持ちます。そこへの書き込みは `read` にも、そのファイルのプライベートなマッピングにも

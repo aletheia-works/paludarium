@@ -172,7 +172,7 @@ impl SyscallTable {
         for number in [213, 233, 232, 281, 291] {
             handlers.insert(number, crate::epoll::dispatch);
         }
-        for number in [41, 44, 45, 46, 47, 48, 53] {
+        for number in [41, 44, 45, 46, 47, 48, 53, 54, 55] {
             handlers.insert(number, crate::sockets::dispatch);
         }
         SyscallTable { handlers }

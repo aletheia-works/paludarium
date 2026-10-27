@@ -1547,6 +1547,164 @@ int main(int argc, char **argv) {
         outcome("unmapped-stream-message", sendmsg(stream[0], &unmapped_message, 0));
         return 0;
     }
+    if (!strcmp(mode, "socket-options")) {
+        /* SOL_SOCKET options on socket pairs, as Linux's sk_setsockopt and
+           sk_getsockopt keep them, SO_OOBINLINE's out-of-band byte read with
+           the data, and the SIGURG that F_SETOWN's owner gets for one. Only
+           options an unprivileged process sets the same way are tried. */
+        int sv[2];
+        char buf[16];
+        long n;
+#define OPT_GET(name, opt, size) do { int v[4] = {-7, -7, -7, -7}; socklen_t len = size; errno = 0; \
+        n = getsockopt(sv[0], SOL_SOCKET, opt, v, &len); \
+        printf("  get %s=%ld errno=%d v=%d,%d len=%u\n", name, n, n < 0 ? errno : 0, v[0], v[1], len); } while (0)
+#define OPT_SET(name, opt, value, size) do { int v[4] = {value, 0, 0, 0}; errno = 0; \
+        n = setsockopt(sv[0], SOL_SOCKET, opt, v, size); \
+        printf("  set %s=%ld errno=%d\n", name, n, n < 0 ? errno : 0); } while (0)
+        const int kinds[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int k = 0; k < 3; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            printf("kind %d\n", kinds[k]);
+            OPT_GET("type", SO_TYPE, 4);
+            OPT_GET("domain", SO_DOMAIN, 4);
+            OPT_GET("protocol", SO_PROTOCOL, 4);
+            OPT_GET("error", SO_ERROR, 4);
+            OPT_GET("acceptconn", SO_ACCEPTCONN, 4);
+            OPT_GET("rcvlowat", SO_RCVLOWAT, 4);
+            OPT_GET("sndlowat", SO_SNDLOWAT, 4);
+            OPT_GET("peek_off", SO_PEEK_OFF, 4);
+            OPT_GET("rcvtimeo", SO_RCVTIMEO, 16);
+            OPT_GET("unknown", 999, 4);
+            const struct { const char *name; int opt; } flags[] = {
+                {"reuseaddr", SO_REUSEADDR}, {"dontroute", SO_DONTROUTE}, {"broadcast", SO_BROADCAST},
+                {"keepalive", SO_KEEPALIVE}, {"oobinline", SO_OOBINLINE}, {"no_check", SO_NO_CHECK},
+            };
+            for (unsigned i = 0; i < sizeof flags / sizeof *flags; i++) {
+                OPT_GET(flags[i].name, flags[i].opt, 4);
+                OPT_SET(flags[i].name, flags[i].opt, 5, 4);
+                OPT_GET(flags[i].name, flags[i].opt, 4);
+            }
+            OPT_SET("priority", SO_PRIORITY, 3, 4);
+            OPT_GET("priority", SO_PRIORITY, 4);
+            OPT_SET("sndbuf", SO_SNDBUF, 1, 4);
+            OPT_GET("sndbuf", SO_SNDBUF, 4);
+            OPT_SET("sndbuf", SO_SNDBUF, 50000, 4);
+            OPT_GET("sndbuf", SO_SNDBUF, 4);
+            OPT_SET("rcvbuf", SO_RCVBUF, 1, 4);
+            OPT_GET("rcvbuf", SO_RCVBUF, 4);
+            OPT_SET("rcvbuf", SO_RCVBUF, 50000, 4);
+            OPT_GET("rcvbuf", SO_RCVBUF, 4);
+            OPT_SET("bsdcompat", SO_BSDCOMPAT, 1, 4);
+            OPT_GET("bsdcompat", SO_BSDCOMPAT, 4);
+            OPT_GET("linger", SO_LINGER, 8);
+            OPT_SET("linger-short", SO_LINGER, 1, 4);
+            {
+                struct linger l = {1, 3};
+                errno = 0;
+                n = setsockopt(sv[0], SOL_SOCKET, SO_LINGER, &l, sizeof l);
+                printf("  set linger=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            }
+            OPT_GET("linger", SO_LINGER, 8);
+            OPT_SET("reuseport", SO_REUSEPORT, 1, 4);
+            OPT_SET("type", SO_TYPE, 1, 4);
+            OPT_SET("peercred", SO_PEERCRED, 1, 4);
+            OPT_SET("sndlowat", SO_SNDLOWAT, 1, 4);
+            OPT_SET("rcvtimeo-short", SO_RCVTIMEO, 1, 4);
+            OPT_SET("unknown", 999, 1, 4);
+            OPT_SET("short", SO_KEEPALIVE, 1, 2);
+            close(sv[0]);
+            close(sv[1]);
+        }
+        puts("errors");
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        OPT_GET("cut", SO_TYPE, 2);
+        OPT_GET("none", SO_TYPE, 0);
+        OPT_GET("negative", SO_TYPE, -1);
+        {
+            int v = 1;
+            errno = 0;
+            n = setsockopt(sv[0], 6, 1, &v, 4);
+            printf("  other-level=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            socklen_t len = 4;
+            errno = 0;
+            n = getsockopt(sv[0], 6, 1, &v, &len);
+            printf("  get-other-level=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            errno = 0;
+            n = setsockopt(sv[0], SOL_SOCKET, SO_KEEPALIVE, (void *)8, 4);
+            printf("  bad-value=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            errno = 0;
+            n = getsockopt(sv[0], SOL_SOCKET, SO_TYPE, (void *)8, &len);
+            printf("  bad-get=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            errno = 0;
+            n = getsockopt(sv[0], SOL_SOCKET, SO_TYPE, &v, (void *)8);
+            printf("  bad-len=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            int p[2];
+            pipe(p);
+            errno = 0;
+            n = setsockopt(p[0], SOL_SOCKET, SO_KEEPALIVE, &v, 4);
+            printf("  not-socket=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            close(p[0]);
+            close(p[1]);
+            struct ucred peer;
+            len = sizeof peer;
+            n = getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &peer, &len);
+            printf("  peercred=%ld pid=%d uid=%d gid=%d len=%u\n", n, peer.pid == getpid(), peer.uid == 0 || peer.uid == getuid(), peer.gid == 0 || peer.gid == getgid(), len);
+        }
+        puts("oobinline");
+        int one = 1;
+        setsockopt(sv[1], SOL_SOCKET, SO_OOBINLINE, &one, sizeof one);
+        send(sv[0], "abc", 3, MSG_OOB);
+        send(sv[0], "de", 2, 0);
+        memset(buf, 0, sizeof buf);
+        errno = 0;
+        n = recv(sv[1], buf, 8, MSG_OOB | MSG_DONTWAIT);
+        printf("  oob=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 8, MSG_PEEK | MSG_DONTWAIT);
+        printf("  peek=%ld data=%s\n", n, buf);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 8, MSG_DONTWAIT);
+        printf("  read=%ld data=%s\n", n, buf);
+        int at = -1;
+        ioctl(sv[1], SIOCATMARK, &at);
+        printf("  atmark=%d\n", at);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 8, MSG_PEEK | MSG_DONTWAIT);
+        printf("  peek-at-mark=%ld data=%s\n", n, buf);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 8, MSG_DONTWAIT);
+        printf("  read-at-mark=%ld data=%s\n", n, buf);
+        puts("owner");
+        signal(SIGURG, interrupted);
+        received = 0;
+        printf("  getown=%d\n", fcntl(sv[1], F_GETOWN));
+        errno = 0;
+        n = fcntl(sv[1], F_SETOWN, getpid());
+        printf("  setown=%ld errno=%d getown=%d\n", n, n < 0 ? errno : 0, fcntl(sv[1], F_GETOWN) == getpid());
+        send(sv[0], "x", 1, MSG_OOB);
+        printf("  sigurg=%d\n", received);
+        send(sv[0], "y", 1, 0);
+        printf("  data-only=%d\n", received);
+        n = fcntl(sv[1], F_SETOWN, -getpgrp());
+        printf("  setown-group=%ld getown=%d\n", n, fcntl(sv[1], F_GETOWN) == -getpgrp());
+        send(sv[0], "z", 1, MSG_OOB);
+        printf("  sigurg-group=%d\n", received);
+        errno = 0;
+        n = fcntl(sv[1], F_SETOWN, 999999);
+        printf("  setown-none=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        fcntl(sv[1], F_SETOWN, 0);
+        send(sv[0], "w", 1, MSG_OOB);
+        printf("  no-owner=%d\n", received);
+        fcntl(sv[0], F_SETOWN, getpid());
+        send(sv[1], "v", 1, MSG_OOB);
+        printf("  other-way=%d\n", received);
+        signal(SIGURG, SIG_DFL);
+        close(sv[0]);
+        close(sv[1]);
+#undef OPT_GET
+#undef OPT_SET
+        return 0;
+    }
     if (!strcmp(mode, "socket-oob")) {
         /* A stream's out-of-band byte, as Linux's AF_UNIX keeps it: the last
            byte of a MSG_OOB send, which reads stop before, SIOCATMARK and

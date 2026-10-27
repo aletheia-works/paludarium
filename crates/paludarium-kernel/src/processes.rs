@@ -792,6 +792,36 @@ impl Processes {
             last
         }
     }
+    /// The processes `owner`, as `F_SETOWN` takes it, names: a process (or
+    /// the process of one of its threads) or, negative, a process group.
+    fn owned_by(entries: &BTreeMap<u32, Entry>, owner: i32) -> Vec<u32> {
+        let id = owner.unsigned_abs();
+        entries
+            .iter()
+            .filter(|&(&pid, entry)| {
+                if owner > 0 {
+                    pid == id || entry.status.is_none() && entry.group.has_member(id)
+                } else {
+                    entry.pgid == id
+                }
+            })
+            .map(|(&pid, _)| pid)
+            .collect()
+    }
+    /// Whether `owner` names any process (ESRCH otherwise, as Linux's
+    /// `f_setown` finds the pid).
+    pub(crate) fn owner_exists(&self, owner: i32) -> bool {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        !Self::owned_by(&entries, owner).is_empty()
+    }
+    /// Sends SIGURG from the kernel to `owner`, as a socket's out-of-band
+    /// byte does.
+    pub(crate) fn send_urgent(&self, owner: i32) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        for pid in Self::owned_by(&entries, owner) {
+            let _ = self.send(&mut entries, pid, None, Self::from_kernel(23));
+        }
+    }
     fn signal(&self, sender: u32, pid: u32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         self.send(&mut entries, pid, None, Self::from_process(number, sender))

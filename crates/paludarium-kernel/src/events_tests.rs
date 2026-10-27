@@ -807,6 +807,44 @@ fn scm_rights_on_messages_and_queued_descriptors_close_with_the_socket() {
     assert_eq!(f.ret(0, [r, IN, 8, 0, 0, 0]), 0);
 }
 #[test]
+fn socket_options_are_kept_as_linux_keeps_them() {
+    let mut f = Fixture::new();
+    let fail = |e: i32| Errno(e).to_syscall_return();
+    let (a, b) = pair(&mut f, 53, [1, 0x801, 0, DATA, 0, 0]);
+    let (value, len) = (NAME, NAME + 8);
+    let set = |f: &mut Fixture, name: u64, v: i32, size: u64| {
+        f.mem.write(GuestAddr(value), &v.to_le_bytes()).unwrap();
+        f.ret(54, [a, 1, name, value, size, 0])
+    };
+    let get = |f: &mut Fixture, name: u64| {
+        f.mem.write(GuestAddr(len), &4u32.to_le_bytes()).unwrap();
+        let r = f.ret(55, [a, 1, name, value, len, 0]);
+        (r, read_u32(f, value) as i32)
+    };
+    assert_eq!(get(&mut f, 3), (0, 1)); // SO_TYPE
+    // SO_OOBINLINE takes any non-zero value as on.
+    assert_eq!(set(&mut f, 10, 5, 4), 0);
+    assert_eq!(get(&mut f, 10), (0, 1));
+    // SO_SNDBUF doubles what it is given, and keeps a floor.
+    assert_eq!(set(&mut f, 7, 50_000, 4), 0);
+    assert_eq!(get(&mut f, 7), (0, 100_000));
+    assert_eq!(set(&mut f, 7, 1, 4), 0);
+    assert_eq!(get(&mut f, 7), (0, 4608));
+    // Too short a value, another level, an option whose effect is not
+    // modelled here, and an unknown one.
+    assert_eq!(set(&mut f, 9, 1, 2), fail(22));
+    assert_eq!(f.ret(54, [a, 6, 1, value, 4, 0]), fail(95));
+    assert_eq!(set(&mut f, 16, 1, 4), fail(92));
+    assert_eq!(set(&mut f, 999, 1, 4), fail(92));
+    assert_eq!(get(&mut f, 999).0, fail(92));
+    // F_SETOWN names a live process or group; F_GETOWN gives it back.
+    assert_eq!(f.ret(72, [b, 9, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(72, [b, 8, 999_999, 0, 0, 0]), fail(3));
+    let pid = u64::from(f.thread.state.pid);
+    assert_eq!(f.ret(72, [b, 8, pid, 0, 0, 0]), 0);
+    assert_eq!(f.ret(72, [b, 9, 0, 0, 0, 0]), pid);
+}
+#[test]
 fn recvfrom_peeks_waits_for_all_and_gives_whole_message_lengths() {
     let mut f = Fixture::new();
     let fail = |e: i32| Errno(e).to_syscall_return();

@@ -1679,6 +1679,38 @@ int main(int argc, char **argv) {
         n = recv(sv[1], buf, 8, MSG_WAITALL);
         printf("  waitall2=%ld data=%s\n", n, buf);
         close(sv[1]);
+        /* A byte that comes out of band while MSG_WAITALL waits ends it. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+            send(sv[0], "ab", 2, 0);
+            usleep(50000);
+            send(sv[0], "x", 1, MSG_OOB);
+            usleep(50000);
+            send(sv[0], "cd", 2, 0);
+            _exit(0);
+        }
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 8, MSG_WAITALL);
+        printf("  waitall-late=%ld data=%s\n", n, buf);
+        int status;
+        waitpid(pid, &status, 0);
+        OOB_READ("late-oob", MSG_OOB, 8);
+        OOB_READ("late-rest", 0, 8);
+        close(sv[0]);
+        close(sv[1]);
+        /* Only a stream has a mark. */
+        const int kinds[] = {SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int k = 0; k < 2; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            int at = -1;
+            errno = 0;
+            n = ioctl(sv[1], SIOCATMARK, &at);
+            printf("  atmark-kind%d=%ld errno=%d\n", kinds[k], n, errno);
+            close(sv[0]);
+            close(sv[1]);
+        }
 #undef OOB_FRESH
 #undef OOB_READ
 #undef OOB_MARK

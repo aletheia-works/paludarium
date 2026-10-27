@@ -659,10 +659,17 @@ fn send_bytes(
     if sent != data.len() as u64 {
         return Ok(sent);
     }
-    let urgent = crate::files::write_with(c, file, &[last], nosignal, dontwait, |_| {
+    // With the data gone, an out-of-band byte that cannot go leaves what was
+    // sent, with no SIGPIPE, as unix_stream_sendmsg returns `sent ? : err`.
+    if sent != 0 {
+        return Ok(sent
+            + socket
+                .send_out_of_band(last, passed)
+                .map_or(0, |n| n as u64));
+    }
+    crate::files::write_with(c, file, &[last], nosignal, dontwait, |_| {
         socket.send_out_of_band(last, passed)
-    })?;
-    Ok(sent + urgent)
+    })
 }
 /// Reads for recvmsg or recvfrom with their `flags`, as Linux's AF_UNIX
 /// sockets take them: `MSG_DONTWAIT` does not wait, `MSG_PEEK` leaves the
@@ -697,7 +704,7 @@ fn receive_with(
     {
         let done = received.count;
         let more = crate::files::wait_for_read(c, file, false, || {
-            socket.receive(&mut bytes[done..], true, peek.then_some(done))
+            socket.receive_more(&mut bytes[done..], peek.then_some(done))
         });
         match more {
             Ok(more) if more.count != 0 => {
@@ -934,8 +941,14 @@ impl SocketPairEnd {
         if self.pair.messages() {
             self.read_message(buf, peek.is_some())
         } else {
-            self.read_stream(buf, peek)
+            self.read_stream(buf, peek, false)
         }
+    }
+    /// [`Self::receive`] in recvmsg or recvfrom that already read some of
+    /// a stream (`MSG_WAITALL`): as Linux's `manage_oob` counts the whole
+    /// call, it stops at the out-of-band mark rather than drop or pass it.
+    fn receive_more(&self, buf: &mut [u8], peek: Option<usize>) -> Result<Received, Errno> {
+        self.read_stream(buf, peek, true)
     }
     /// sendmsg's and sendto's `MSG_OOB`, EOPNOTSUPP: a datagram or packet
     /// socket refuses it `before` the address is checked, as Linux's
@@ -957,17 +970,20 @@ impl SocketPairEnd {
         Ok(())
     }
     /// `SIOCATMARK`: a stream's next write is its out-of-band byte, or the
-    /// place `MSG_OOB` took it from.
-    pub(crate) fn at_mark(&self) -> bool {
-        !self.pair.messages()
-            && self
-                .pair
-                .sides
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)[self.side]
-                .writes
-                .front()
-                .is_some_and(|write| write.piece != Piece::Data)
+    /// place `MSG_OOB` took it from; a datagram or packet socket has no mark
+    /// (EOPNOTSUPP), as Linux's `unix_ioctl` answers only for a stream.
+    pub(crate) fn at_mark(&self) -> Result<bool, Errno> {
+        if self.pair.messages() {
+            return Err(Errno(95));
+        }
+        Ok(self
+            .pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[self.side]
+            .writes
+            .front()
+            .is_some_and(|write| write.piece != Piece::Data))
     }
     /// recvmsg's and recvfrom's `MSG_OOB` on a stream, as Linux's
     /// `unix_stream_recv_urg`: the out-of-band byte, which `peek` leaves,
@@ -1075,7 +1091,12 @@ impl SocketPairEnd {
     /// across writes but ends with the first one that passed descriptors,
     /// which come with its first bytes read; an empty buffer still takes
     /// them. A `peek` from `skip` bytes on leaves the data where it is.
-    fn read_stream(&self, buf: &mut [u8], peek: Option<usize>) -> Result<Received, Errno> {
+    fn read_stream(
+        &self,
+        buf: &mut [u8],
+        peek: Option<usize>,
+        after: bool,
+    ) -> Result<Received, Errno> {
         let mut sides = self
             .pair
             .sides
@@ -1088,6 +1109,14 @@ impl SocketPairEnd {
         let own = &mut sides[self.side];
         if own.read_shutdown {
             return Ok(Received::default());
+        }
+        // Past what the call read, the mark ends it.
+        let mark = |write: &Write| write.piece != Piece::Data;
+        if after && peek.is_none() && own.writes.front().is_some_and(mark) {
+            return Ok(Received {
+                at_mark: true,
+                ..Received::default()
+            });
         }
         // The empty places out-of-band bytes were taken from go first.
         let mut discarded = Passed::new();
@@ -1108,8 +1137,12 @@ impl SocketPairEnd {
             };
         }
         if let Some(skip) = peek {
-            let received = Self::peek_stream(own, buf, skip);
-            return if received.count == 0 && received.passed.is_empty() && !buf.is_empty() {
+            let received = Self::peek_stream(own, buf, skip, after);
+            return if received.count == 0
+                && received.passed.is_empty()
+                && !buf.is_empty()
+                && !received.at_mark
+            {
                 if eof {
                     Ok(Received::default())
                 } else {
@@ -1176,7 +1209,7 @@ impl SocketPairEnd {
     /// What a stream read from `skip` bytes on would take, left in `own`:
     /// it stops after a write that passed descriptors, giving copies of
     /// them.
-    fn peek_stream(own: &Side, buf: &mut [u8], mut skip: usize) -> Received {
+    fn peek_stream(own: &Side, buf: &mut [u8], mut skip: usize, after: bool) -> Received {
         let mut received = Received::default();
         let mut start = 0;
         for write in &own.writes {
@@ -1184,7 +1217,7 @@ impl SocketPairEnd {
             start += write.len;
             // A peek stops at the mark, as a read does, or passes over it.
             if write.piece != Piece::Data {
-                if received.count != 0 {
+                if received.count != 0 || after && skip == 0 {
                     received.at_mark = true;
                     break;
                 }
@@ -1471,16 +1504,16 @@ mod events_tests {
         assert_eq!(a.send(b"ab", &mut Passed::new()), Ok(2));
         assert_eq!(a.send_out_of_band(b'c', &mut Passed::new()), Ok(1));
         assert_ne!(b.readiness().unwrap().0 & PRI, 0);
-        assert!(!b.at_mark());
+        assert_eq!(b.at_mark(), Ok(false));
         // A read stops before the mark; the byte comes with MSG_OOB, once.
         let read = b.receive(&mut buf, true, None).unwrap();
         assert_eq!((read.count, read.at_mark), (2, true));
-        assert!(b.at_mark());
+        assert_eq!(b.at_mark(), Ok(true));
         let peeked = b.receive_out_of_band(&mut buf, true).unwrap();
         assert_eq!((peeked.count, buf[0]), (1, b'c'));
         assert_eq!(b.receive_out_of_band(&mut buf, false).unwrap().count, 1);
         assert_eq!(b.readiness().unwrap().0 & PRI, 0);
-        assert!(b.at_mark());
+        assert_eq!(b.at_mark(), Ok(true));
         assert_eq!(
             b.receive_out_of_band(&mut buf, false).err(),
             Some(Errno::EINVAL)

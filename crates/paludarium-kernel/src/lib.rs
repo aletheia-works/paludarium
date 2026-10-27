@@ -428,6 +428,14 @@ impl Kernel {
             // A handler ends any restart, as Linux's signal frame setup sets
             // restart_block to do_no_restart_syscall.
             thread.state.restart_block = None;
+            // With SA_RESTART the frame resumes at the syscall instruction,
+            // so the call runs again when the handler returns.
+            if action.flags & signals::SA_RESTART != 0 {
+                Self::rewind_restart(
+                    thread,
+                    restart.filter(|&number| signals::restarts_with_handler(number)),
+                );
+            }
             let delivery_mask = thread.state.signal_mask;
             let restore_mask = thread.state.wait_restore_mask.take();
             if let Some(mask) = restore_mask {
@@ -464,9 +472,10 @@ impl Kernel {
         }
     }
 
-    /// A stop ran no handler, so a syscall it interrupted with EINTR runs
-    /// again after the continue, as Linux restarts ERESTARTSYS and
-    /// ERESTARTNOHAND: the syscall instruction is re-executed.
+    /// Runs a syscall interrupted with EINTR again, as Linux restarts
+    /// ERESTARTSYS and ERESTARTNOHAND after a stop (which runs no handler)
+    /// and ERESTARTSYS after a SA_RESTART handler: the syscall instruction
+    /// is re-executed, from the handler's frame in the second case.
     fn rewind_restart(thread: &mut Thread, restart: Option<u64>) {
         if let Some(number) = restart
             && thread.cpu.gpr[reg::RAX] == paludarium_types::Errno(4).to_syscall_return()
@@ -697,26 +706,6 @@ impl Kernel {
         match outcome {
             syscalls::Outcome::Return(value) => {
                 thread.cpu.gpr[reg::RAX] = value;
-                // Linux exposes the rewound syscall in a SA_RESTART handler's
-                // context only when write was interrupted before any transfer.
-                if number == syscalls::nr::WRITE
-                    && value == paludarium_types::Errno(4).to_syscall_return()
-                {
-                    let action = signals::next_pending(&thread.state, true)
-                        .and_then(|index| {
-                            thread
-                                .state
-                                .signal_actions
-                                .get(&thread.state.pending[index].number)
-                        })
-                        .filter(|action| action.handler > 1);
-                    if action.is_some_and(|a| a.flags & 0x1000_0000 != 0)
-                        && let Some(rip) = thread.cpu.rip.0.checked_sub(2)
-                    {
-                        thread.cpu.rip = paludarium_types::GuestAddr(rip);
-                        thread.cpu.gpr[reg::RAX] = number;
-                    }
-                }
                 self.checkpoint(thread, mem)
             }
             syscalls::Outcome::Restored => self.checkpoint(thread, mem),

@@ -199,6 +199,28 @@ static void *discard_reader(void *unused) {
 }
 static volatile sig_atomic_t received;
 static void interrupted(int number) { (void)number; received++; }
+/* signal-restart: SIGALRM feeds the call it interrupts, writing a byte
+   to restart_fd or, with restart_drain, emptying it, so that a restarted
+   call ends at once. */
+static int restart_fd = -1, restart_drain;
+static void restart_feed(int number) {
+    (void)number;
+    received++;
+    static char sink[4096];
+    if (restart_drain) {
+        while (read(restart_fd, sink, sizeof sink) > 0) {}
+    } else if (restart_fd >= 0 && write(restart_fd, "x", 1) != 1) {
+        received = -100;
+    }
+}
+/* Fills `fd` until a write of one byte would block, then makes it block. */
+static void restart_fill(int fd) {
+    static char chunk[4096];
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    while (write(fd, chunk, sizeof chunk) > 0) {}
+    while (write(fd, chunk, 1) > 0) {}
+    fcntl(fd, F_SETFL, 0);
+}
 static volatile sig_atomic_t usr2_blocked_in_handler = -1;
 static void note_mask(int number) {
     (void)number;
@@ -1546,6 +1568,86 @@ int main(int argc, char **argv) {
         outcome("unmapped-message", sendmsg(datagram[0], &unmapped_message, 0));
         errno = 0;
         outcome("unmapped-stream-message", sendmsg(stream[0], &unmapped_message, 0));
+        return 0;
+    }
+    if (!strcmp(mode, "signal-restart")) {
+        /* A handler with SA_RESTART runs a blocking read, recv or write it
+           interrupted again (ERESTARTSYS); without it the call is EINTR.
+           poll, select and pause are EINTR either way (ERESTARTNOHAND), as
+           is a wait that SO_SNDTIMEO limits. */
+        char buf[8];
+        int p[2], sv[2];
+#define RESTART_CASE(name, fd, drain, call) do { \
+        restart_fd = (fd); restart_drain = (drain); received = 0; \
+        struct itimerval it = {{0, 0}, {0, 100000}}; setitimer(ITIMER_REAL, &it, NULL); \
+        errno = 0; long r = (call); int e = r < 0 ? errno : 0; \
+        printf("  %s=%ld errno=%d signal=%d\n", name, r, e, (int)received); } while (0)
+        for (int restart = 0; restart < 2; restart++) {
+            puts(restart ? "restart" : "no-restart");
+            struct sigaction sa = {0};
+            sa.sa_handler = restart_feed;
+            sa.sa_flags = restart ? SA_RESTART : 0;
+            sigaction(SIGALRM, &sa, NULL);
+            if (pipe(p)) return 79;
+            RESTART_CASE("read", p[1], 0, read(p[0], buf, sizeof buf));
+            close(p[0]); close(p[1]);
+            if (pipe(p)) return 79;
+            struct iovec iov = {buf, sizeof buf};
+            RESTART_CASE("readv", p[1], 0, readv(p[0], &iov, 1));
+            close(p[0]); close(p[1]);
+            socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+            RESTART_CASE("socket-read", sv[0], 0, read(sv[1], buf, sizeof buf));
+            close(sv[0]); close(sv[1]);
+            socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+            RESTART_CASE("recv", sv[0], 0, recv(sv[1], buf, sizeof buf, 0));
+            close(sv[0]); close(sv[1]);
+            socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+            RESTART_CASE("recvfrom", sv[0], 0, recvfrom(sv[1], buf, sizeof buf, 0, NULL, NULL));
+            close(sv[0]); close(sv[1]);
+            socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+            struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+            RESTART_CASE("recvmsg", sv[0], 0, recvmsg(sv[1], &message, 0));
+            close(sv[0]); close(sv[1]);
+            socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+            RESTART_CASE("datagram-recv", sv[0], 0, recv(sv[1], buf, sizeof buf, 0));
+            close(sv[0]); close(sv[1]);
+            if (pipe(p)) return 79;
+            struct pollfd pfd = {p[0], POLLIN, 0};
+            RESTART_CASE("poll", p[1], 0, poll(&pfd, 1, -1));
+            close(p[0]); close(p[1]);
+            if (pipe(p)) return 79;
+            fd_set set;
+            FD_ZERO(&set);
+            FD_SET(p[0], &set);
+            RESTART_CASE("select", p[1], 0, select(p[0] + 1, &set, NULL, NULL, NULL));
+            close(p[0]); close(p[1]);
+            RESTART_CASE("pause", -1, 0, pause());
+            if (pipe(p)) return 79;
+            restart_fill(p[1]);
+            fcntl(p[0], F_SETFL, O_NONBLOCK);
+            RESTART_CASE("write", p[0], 1, write(p[1], "y", 1));
+            close(p[0]); close(p[1]);
+            socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+            restart_fill(sv[0]);
+            fcntl(sv[1], F_SETFL, O_NONBLOCK);
+            RESTART_CASE("send", sv[1], 1, send(sv[0], "y", 1, 0));
+            close(sv[0]); close(sv[1]);
+            /* SO_SNDTIMEO limits the wait, so the signal is EINTR. */
+            struct timeval tv = {2, 0};
+            socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+            setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+            restart_fill(sv[0]);
+            fcntl(sv[1], F_SETFL, O_NONBLOCK);
+            RESTART_CASE("timed-write", sv[1], 1, write(sv[0], "y", 1));
+            close(sv[0]); close(sv[1]);
+            socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+            setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+            restart_fill(sv[0]);
+            fcntl(sv[1], F_SETFL, O_NONBLOCK);
+            RESTART_CASE("timed-send", sv[1], 1, send(sv[0], "y", 1, 0));
+            close(sv[0]); close(sv[1]);
+        }
+#undef RESTART_CASE
         return 0;
     }
     if (!strcmp(mode, "socket-timeouts")) {

@@ -202,6 +202,7 @@ mod linux {
         processes_socket_oob => ("socket-oob","process"),
         processes_socket_options => ("socket-options","process"),
         processes_socket_timeouts => ("socket-timeouts","process"),
+        processes_signal_restart => ("signal-restart","process"),
         processes_socket_addresses => ("socket-addresses","process"),
         command_pre_exec => ("pre-exec","command"),
         command_pre_exec_missing => ("pre-exec-missing","command"),

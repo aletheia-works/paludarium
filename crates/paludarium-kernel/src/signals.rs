@@ -8,6 +8,7 @@ use paludarium_types::{GuestAddr, USER_ADDRESS_LIMIT};
 pub(crate) const SA_ONSTACK: u64 = 0x0800_0000;
 pub(crate) const SA_NODEFER: u64 = 0x4000_0000;
 pub(crate) const SA_RESETHAND: u64 = 0x8000_0000;
+pub(crate) const SA_RESTART: u64 = 0x1000_0000;
 const FRAME_SIZE: usize = 1024;
 const UC: usize = 8;
 const SC: usize = UC + 40;
@@ -277,6 +278,15 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         202 => matches!(args[1] & 127, 0 | 9) && args[3] == 0,
         _ => false,
     }
+}
+
+/// Whether a handler set with SA_RESTART runs the interrupted syscall
+/// `number` again: the calls that return ERESTARTSYS. pause, rt_sigsuspend,
+/// poll, ppoll, select, pselect6 and an absolute clock_nanosleep return
+/// ERESTARTNOHAND, and the waits armed to go on through restart_syscall
+/// ERESTART_RESTARTBLOCK, which a handler ends with EINTR whatever its flags.
+pub(crate) fn restarts_with_handler(number: u64) -> bool {
+    !matches!(number, 7 | 23 | 34 | 130 | 219 | 230 | 270 | 271)
 }
 
 /// Shared selection for delivery and syscall-restart preview. SIGKILL wins,

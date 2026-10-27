@@ -1130,21 +1130,6 @@ impl Kernel {
             _ => return None,
         };
         thread.cpu.gpr[reg::RAX] = result.unwrap_or_else(Errno::to_syscall_return);
-        if (n == 61 || n == 247)
-            && result == Err(Errno(4))
-            && signals::next_pending(&thread.state, true)
-                .and_then(|index| {
-                    thread
-                        .state
-                        .signal_actions
-                        .get(&thread.state.pending[index].number)
-                })
-                .is_some_and(|action| action.handler > 1 && action.flags & 0x10000000 != 0)
-            && let Some(rip) = thread.cpu.rip.0.checked_sub(2)
-        {
-            thread.cpu.rip = GuestAddr(rip);
-            thread.cpu.gpr[reg::RAX] = n;
-        }
         Some(self.checkpoint(thread, mem))
     }
     /// A pid argument: 0 is the caller; anything that is not a pid is ESRCH.

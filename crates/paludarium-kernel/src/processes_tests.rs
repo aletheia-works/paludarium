@@ -717,6 +717,52 @@ mod process {
         );
     }
     #[test]
+    fn sa_restart_handler_restarts_only_errestartsys_calls() {
+        // A handler with SA_RESTART leaves a frame that runs read and recv
+        // again (rax back to the number, rip at the syscall instruction),
+        // as Linux restarts ERESTARTSYS; pause (ERESTARTNOHAND) and a call
+        // whose handler lacks SA_RESTART return EINTR.
+        for (number, restart, restarted) in [
+            (0, true, true),
+            (45, true, true),
+            (0, false, false),
+            (34, true, false),
+        ] {
+            let (mut k, mut t, m) = setup();
+            let pair = if number == 45 { 53 } else { 293 };
+            let args = if number == 45 {
+                [1, 1, 0, DATA, 0, 0]
+            } else {
+                [DATA, 0, 0, 0, 0, 0]
+            };
+            assert_eq!(syscall(&mut k, &mut t, &m, pair, args), 0);
+            let fd = m.read_u64(GuestAddr(DATA)).unwrap() & 0xffff_ffff;
+            t.state.signal_actions.insert(
+                10,
+                crate::SignalAction {
+                    handler: 0x40_2000,
+                    flags: 0x0400_0000 | if restart { 0x1000_0000 } else { 0 },
+                    restorer: 0x40_3000,
+                    mask: 0,
+                },
+            );
+            k.queue_signal(&mut t, 10).unwrap();
+            t.cpu.rip = GuestAddr(0x40_1002);
+            syscall(&mut k, &mut t, &m, number, [fd, DATA + 64, 1, 0, 0, 0]);
+            assert_eq!(t.cpu.rip, GuestAddr(0x40_2000));
+            let saved = &t.state.frames.last().unwrap().cpu;
+            assert_eq!(
+                (saved.rip, saved.gpr[reg::RAX]),
+                if restarted {
+                    (GuestAddr(0x40_1000), number)
+                } else {
+                    (GuestAddr(0x40_1002), Errno(4).to_syscall_return())
+                },
+                "{number} {restart}"
+            );
+        }
+    }
+    #[test]
     fn stop_and_continue_reports() {
         let (mut k, mut t, m) = setup();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);

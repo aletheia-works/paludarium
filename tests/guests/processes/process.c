@@ -834,6 +834,56 @@ int main(int argc, char **argv) {
         unlink(path);
         return 0;
     }
+    if (!strcmp(mode, "fork-copy-on-write")) {
+        /* After fork, each process's write to a private page leaves the
+           other's page as it was, either way round, and a page written
+           before the fork stays private. A truncation drops the copies of
+           a private file mapping in both processes. */
+        char *anon = mmap(NULL, 3 * 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        memset(anon, 'a', 3 * 4096);
+        const char *path = "/tmp/paludarium-processes-fork-copy-on-write";
+        unlink(path);
+        int fd = open(path, O_CREAT|O_RDWR|O_TRUNC, 0600);
+        ftruncate(fd, 4096);
+        char *file = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+        file[0] = 'x';
+        int to_child[2], to_parent[2];
+        pipe(to_child);
+        pipe(to_parent);
+        fflush(stdout);
+        char b = 0;
+        pid_t pid = fork();
+        if (pid == 0) {
+            anon[0] = 'c';
+            printf("child: own=%c other=%c file=%c\n", anon[0], anon[4096], file[0]);
+            fflush(stdout);
+            write(to_parent[1], "1", 1);
+            read(to_child[0], &b, 1);
+            printf("child: after-parent=%c last=%c\n", anon[4096], anon[2 * 4096]);
+            ftruncate(fd, 0);
+            ftruncate(fd, 4096);
+            printf("child: truncated=%d\n", file[0]);
+            fflush(stdout);
+            write(to_parent[1], "2", 1);
+            _exit(0);
+        }
+        read(to_parent[0], &b, 1);
+        printf("parent: after-child=%c\n", anon[0]);
+        anon[4096] = 'p';
+        printf("parent: own=%c\n", anon[4096]);
+        fflush(stdout);
+        write(to_child[1], "1", 1);
+        read(to_parent[0], &b, 1);
+        printf("parent: truncated=%d last=%c\n", file[0], anon[2 * 4096]);
+        int status;
+        waitpid(pid, &status, 0);
+        printf("status=%d\n", status);
+        munmap(file, 4096);
+        munmap(anon, 3 * 4096);
+        close(fd);
+        unlink(path);
+        return 0;
+    }
     if (!strcmp(mode, "private-file-mapping")) {
         /* A private file mapping shows the file's later changes in the
            pages it has not written, and its first write to a page copies

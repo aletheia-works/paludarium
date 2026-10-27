@@ -65,11 +65,8 @@ verified.
   the registers, the fatal signal, the auxiliary vector and the memory, but
   not every note Linux writes (`NT_FILE`, `NT_X86_XSTATE`), and it holds every
   anonymous mapping, where Linux leaves out one never written.
-- **Memory limit**: `fork` copies the private pages at once, where Linux
-  shares them until one side writes, so under a memory limit a `fork` fails
-  with `ENOMEM` when the copies do not fit, where Linux would succeed. A write
-  beyond the limit ends the process that made it, where Linux's OOM killer
-  picks the process using the most memory.
+- **Memory limit**: a write beyond the limit ends the process that made it,
+  where Linux's OOM killer picks the process using the most memory.
 - **A native JIT**: only the WebAssembly build has a JIT; native builds use the
   interpreter.
 - **Stable Rust**: a nightly Rust is required.

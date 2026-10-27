@@ -229,9 +229,12 @@ struct Page {
     frame: Frame,
     /// The page belongs to a file mapping, which may end before it.
     file: bool,
-    /// The frame is the file's page-cache page, which a private mapping
-    /// shows until its first write to it copies it.
+    /// The first write to the page copies its frame first: the frame is
+    /// the file's page-cache page, which a private mapping shows, or one
+    /// that `fork` shares between the spaces until either writes it.
     cow: bool,
+    /// The frame is the file's page-cache page.
+    cache: bool,
     /// How many times the file had shrunk ([`PageSource::shrinks`]) when
     /// a private mapping copied the page.
     shrinks: u64,
@@ -245,6 +248,7 @@ impl Page {
             frame: self.frame.clone(),
             file: self.file,
             cow: self.cow,
+            cache: self.cache,
             shrinks: self.shrinks,
         }
     }
@@ -811,6 +815,7 @@ impl AddressSpaceData {
                 .mapping_at(page)
                 .is_some_and(|m| m.kind == MappingKind::File),
             cow: shared.is_none() && cache().is_some(),
+            cache: shared.is_none() && cache().is_some(),
             shrinks: 0,
         }
     }
@@ -825,7 +830,7 @@ impl AddressSpaceData {
     /// the end of the file ([`Self::refresh`]).
     fn may_be_truncated(&self, page: u64, entry: &Page) -> bool {
         entry.file
-            && !entry.cow
+            && !entry.cache
             && self
                 .file_at(page)
                 .is_some_and(|(source, _)| source.shrinks() != entry.shrinks)
@@ -835,8 +840,8 @@ impl AddressSpaceData {
     /// that a truncation of its file has since left wholly past the end of
     /// the file shows the file again, as Linux drops such copies even when
     /// the file grows again. With `write`, a page-cache page of a private
-    /// mapping becomes a copy of its own; `false` when the meter has no
-    /// room for it.
+    /// mapping, or a frame `fork` shared, becomes a copy of its own; `false`
+    /// when the meter has no room for it.
     fn refresh(&self, entry: &mut Option<Page>, page: u64, prot: Prot, write: bool) -> bool {
         match entry {
             None => *entry = Some(self.fresh(page, prot)),
@@ -859,14 +864,21 @@ impl AddressSpaceData {
         let Some(p) = entry.as_mut() else {
             return true;
         };
-        if write && p.cow {
+        // A forked frame that no other space holds any more is this one's
+        // own: the space holds its lock, so no other can take it meanwhile.
+        if write && p.cow && (p.cache || Arc::strong_count(&p.frame) > 1) {
             let Some(frame) = copied(&p.frame, self.meter.as_ref()) else {
                 self.out_of_memory.store(true, Ordering::SeqCst);
                 return false;
             };
             p.frame = frame;
+        }
+        if write && p.cow {
             p.cow = false;
-            p.shrinks = self.file_at(page).map_or(0, |(source, _)| source.shrinks());
+            if p.cache {
+                p.cache = false;
+                p.shrinks = self.file_at(page).map_or(0, |(source, _)| source.shrinks());
+            }
         }
         true
     }
@@ -923,7 +935,9 @@ impl AddressSpaceData {
             None => self.out_of_memory.store(true, Ordering::SeqCst),
         }
     }
-    fn fork(&self) -> Result<Self, Errno> {
+    /// The space for a child `fork` makes: it shares every frame, a private
+    /// one until either space writes it, as Linux shares the pages.
+    fn fork(&mut self) -> Self {
         let mut copy = Self::new();
         copy.meter = self.meter.clone();
         copy.mappings = self.mappings.clone();
@@ -933,18 +947,30 @@ impl AddressSpaceData {
         copy.current_break = self.current_break;
         copy.mmap_top = self.mmap_top;
         let mut directory = BTreeMap::new();
-        for (&index, table) in self.read_directory().iter() {
+        let shared = &self.shared;
+        let own = self
+            .directory
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (&index, table) in own.iter_mut() {
             let mut cloned = PageTable::new();
-            for (slot, page) in table.pages.iter().enumerate() {
+            for (slot, page) in table.pages.iter_mut().enumerate() {
                 if let Some(page) = page {
                     let address = (index * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE;
-                    // A page-cache page stays shared, as does shared memory.
-                    let mut new = page.share();
-                    if self.shared_at(address).is_none() && !page.cow {
-                        new.frame =
-                            copied(&page.frame, self.meter.as_ref()).ok_or(Errno::ENOMEM)?;
+                    let is_shared = shared
+                        .range(..=address)
+                        .next_back()
+                        .is_some_and(|(_, mapping)| address < mapping.end);
+                    // Shared memory and a page-cache page stay as they are; a
+                    // private page without contents gets a frame of its own.
+                    if !is_shared && !page.cache {
+                        if page.frame.get().is_some() {
+                            page.cow = true;
+                        } else {
+                            page.frame = Frame::default();
+                        }
                     }
-                    cloned.pages[slot] = Some(new);
+                    cloned.pages[slot] = Some(page.share());
                 }
             }
             directory.insert(index, cloned);
@@ -953,7 +979,7 @@ impl AddressSpaceData {
             .directory
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner) = directory;
-        Ok(copy)
+        copy
     }
 
     fn bump_code_generation(&mut self) {
@@ -1906,14 +1932,11 @@ impl AddressSpace {
     pub fn take_out_of_memory(&self) -> bool {
         self.out_of_memory.swap(false, Ordering::SeqCst)
     }
-    /// Private pages are copied; sparse MAP_SHARED pages retain backing. A shared
-    /// serialization lock keeps cross-process memory operations indivisible.
-    /// The copies fail with `ENOMEM` when the meter has no room for them.
-    pub fn fork(&self) -> Result<Self, Errno> {
-        Ok(Self::with_data(
-            self.locked().fork()?,
-            self.serialization.clone(),
-        ))
+    /// Private pages are shared until either space writes them, which
+    /// copies them; MAP_SHARED pages stay shared. A shared serialization lock
+    /// keeps cross-process memory operations indivisible.
+    pub fn fork(&self) -> Self {
+        Self::with_data(self.locked().fork(), self.serialization.clone())
     }
     /// Marks a newly created mapping as Linux MAP_SHARED, independently of VM sharing.
     pub fn mark_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
@@ -2492,7 +2515,7 @@ mod tests {
             .back_with_cache(at, 2 * PAGE_SIZE, &pages, 0)
             .unwrap();
         assert_eq!(byte(&parent, at.0 + 3), 3);
-        let child = parent.fork().unwrap();
+        let child = parent.fork();
         // The cache's changes show in both, and change the code.
         let code = parent.code_generation();
         pages.store(3, b"c");
@@ -2630,7 +2653,7 @@ mod tests {
         );
         assert_eq!(byte(&space, at(2, 100).0), 0); // past the end of the file
         // A fork, and a move by mremap, keep the file at the same offsets.
-        let child = space.fork().unwrap();
+        let child = space.fork();
         space.write(at(0, 1), &[0xee]).unwrap();
         let fixed = Remap {
             fixed: true,
@@ -2805,7 +2828,7 @@ mod tests {
     fn remap_keeps_shared_memory_shared_after_fork_and_on_duplicates() {
         let space = space_with(0x10000, PAGE_SIZE, Prot::READ_WRITE);
         space.mark_shared(GuestAddr(0x10000), 4096).unwrap();
-        let child = space.fork().unwrap();
+        let child = space.fork();
         let moved = space
             .remap_shared(
                 GuestAddr(0x10000),
@@ -2845,7 +2868,7 @@ mod tests {
             .share_pages(at, 2 * PAGE_SIZE, &pages, 0x2000, true)
             .unwrap();
         assert_eq!(byte(&space, at.0 + PAGE_SIZE), b'f');
-        let child = space.fork().unwrap();
+        let child = space.fork();
         child.write(GuestAddr(at.0 + PAGE_SIZE + 1), b"I").unwrap();
         assert_eq!(byte(&space, at.0 + PAGE_SIZE + 1), b'I');
         // Only stores make pages dirty, and taking them makes them clean.

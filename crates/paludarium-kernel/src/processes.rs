@@ -1223,7 +1223,7 @@ impl Kernel {
         }
         let task = self.processes.charge_task()?;
         let child_mem = if flags & 0x100 == 0 {
-            Some(Arc::new(mem.fork()?))
+            Some(Arc::new(mem.fork()))
         } else {
             None
         };

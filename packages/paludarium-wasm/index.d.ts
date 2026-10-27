@@ -59,9 +59,10 @@ export interface Limits {
   /**
    * The most bytes of guest memory at once (0 to 4294967295), as a cgroup's
    * `memory.max`: a page counts from its first write until every process
-   * that has it unmaps it or ends, and shared memory counts once. A write
-   * beyond it ends the process with `SIGKILL`, as the OOM killer does, and a
-   * `fork` or `execve` that does not fit fails with `ENOMEM`. File contents
+   * that has it unmaps it or ends, and shared memory counts once, as does a
+   * page that `fork` shares until a write copies it. A write beyond it ends
+   * the process with `SIGKILL`, as the OOM killer does, and an `execve` that
+   * does not fit fails with `ENOMEM`. File contents
    * and pipe and socket buffers are not counted.
    */
   memory?: number;

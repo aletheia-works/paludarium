@@ -260,16 +260,17 @@ fn writes_beyond_the_memory_limit_end_the_process_with_sigkill() {
     assert_eq!(run_with_memory(&code, None).unwrap(), ExitStatus::Exited(0));
 }
 #[test]
-fn fork_and_execve_that_do_not_fit_the_memory_limit_fail_with_enomem() {
-    // fork copies the 16 written pages and the loaded ones, which do not fit
-    // in the 8 pages left: it fails with ENOMEM (12).
+fn a_fork_shares_its_pages_and_an_execve_that_does_not_fit_fails_with_enomem() {
+    // fork shares the 16 written pages and the loaded ones, so it succeeds
+    // although copies would not fit in the 8 pages left, as on Linux: the
+    // parent exits with its child's PID (2) negated.
     let mut fork = vec![0xb8, 57, 0, 0, 0, 0x0f, 0x05];
     fork.extend_from_slice(EXIT_NEGATED);
     let code = touching(16, &fork);
     let loaded = loaded_pages(&code);
     assert_eq!(
         run_with_memory(&code, Some((loaded + 24) * 4096)).unwrap(),
-        ExitStatus::Exited(12)
+        ExitStatus::Exited(254)
     );
     // With the limit full, execve has no room for the new image.
     let mut exec = vec![

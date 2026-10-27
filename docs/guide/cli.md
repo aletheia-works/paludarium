@@ -30,9 +30,10 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 - `--max-memory N` lets the guest have at most `N` bytes of memory, as a
   cgroup's `memory.max`; `N` may end in `K`, `M`, `G` or `T` (powers of
   1024). A page counts from its first write until every process that has it
-  unmaps it or ends, and shared memory counts once. A write beyond the limit
-  ends the process that made it with `SIGKILL`, as the OOM killer does, and a
-  `fork` or `execve` that does not fit fails with `ENOMEM`. A program that
+  unmaps it or ends, and shared memory counts once, as does a page that
+  `fork` shares until a write copies it. A write beyond the limit ends the
+  process that made it with `SIGKILL`, as the OOM killer does, and an
+  `execve` that does not fit fails with `ENOMEM`. A program that
   does not fit at all is not started. File contents and pipe and socket
   buffers are not counted.
 - Without these options there is no limit.

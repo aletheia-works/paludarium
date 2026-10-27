@@ -73,9 +73,10 @@ both limits at most this and cannot raise them above it (`EPERM`), so opening
 more files fails with `EMFILE`. `limits.memory` (0 to 4294967295) is the most
 bytes of memory the guest may have at once, as a cgroup's `memory.max`. A page
 counts from its first write until every process that has it unmaps it or ends,
-and shared memory counts once. A write beyond it ends the process that made it
-with `SIGKILL`, as the OOM killer does, and a `fork` or `execve` that does not
-fit fails with `ENOMEM`; a program that does not fit at all fails with
+and shared memory counts once, as does a page that `fork` shares until a write
+copies it. A write beyond it ends the process that made it with `SIGKILL`, as
+the OOM killer does, and an `execve` that does not fit fails with `ENOMEM`; a
+program that does not fit at all fails with
 `invalid-program`. File contents and pipe and socket buffers are not counted.
 
 ## Keep files between runs

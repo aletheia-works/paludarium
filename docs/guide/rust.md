@@ -50,8 +50,8 @@ fn main() -> Result<(), paludarium::Error> {
   caps `RLIMIT_NOFILE` at `n`, as Linux's `fs.nr_open`, so opening more
   files fails with `EMFILE`. `with_memory(n)` lets the guest have at most `n`
   bytes of memory, as a cgroup's `memory.max`: a write beyond it ends the
-  process with `SIGKILL`, as the OOM killer does, and a `fork` or `execve`
-  that does not fit fails with `ENOMEM` (the field's documentation gives what
+  process with `SIGKILL`, as the OOM killer does, and an `execve` that does
+  not fit fails with `ENOMEM` (the field's documentation gives what
   counts). They set the fields `tasks`, `open_files` and `memory`, where `None`
   is no limit.
 - `Session::new` validates the configuration before anything runs, and

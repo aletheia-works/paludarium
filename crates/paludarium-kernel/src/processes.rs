@@ -102,8 +102,9 @@ pub struct Processes {
     /// The highest RLIMIT_NOFILE hard limit a process may set, as fs.nr_open.
     nr_open: AtomicU64,
     /// Notified whenever a process exits, stops or continues, lets its vfork
-    /// parent go, or is sent a signal, so that a wait for a child wakes at
-    /// once, for the child or for a signal that interrupts it.
+    /// parent go, or is sent a signal by a process (`kill`, a queued signal),
+    /// so that a wait for a child wakes at once for these; another signal (a
+    /// timer's, a thread's own) reaches it through the 10 ms poll.
     changed: WaitToken,
 }
 impl Processes {

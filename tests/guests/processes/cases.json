@@ -57,6 +57,7 @@
     {"name":"seqpacket","binary":"process"},
     {"name":"dgram","binary":"process"},
     {"name":"scm-rights","binary":"process"},
+    {"name":"socket-flags","binary":"process"},
     {"name":"socket-addresses","binary":"process"},
     {"name":"pre-exec","binary":"command"},
     {"name":"pre-exec-missing","binary":"command"},

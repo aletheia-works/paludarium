@@ -83,6 +83,25 @@ static long receive_from(int socket, char *buf, size_t len, int flags, void *add
     return syscall(SYS_recvfrom, socket, buf, len, flags, address, address_len);
 }
 /* sendmsg of `len` bytes with `count` descriptors in one SCM_RIGHTS message. */
+/* recvmsg of at most `len` bytes with `flags`; the descriptor it passes,
+   if any, goes to `fd` (else -1), and msg_flags to `got_flags`. */
+static long receive_fd(int socket, char *data, size_t len, int flags, int *fd, int *got_flags) {
+    struct iovec iov = {data, len};
+    union { char bytes[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } control;
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control.bytes,
+                             .msg_controllen = sizeof control.bytes};
+    errno = 0;
+    long n = recvmsg(socket, &message, flags);
+    struct cmsghdr *header = n < 0 ? NULL : CMSG_FIRSTHDR(&message);
+    *fd = header && header->cmsg_type == SCM_RIGHTS ? *(int *)CMSG_DATA(header) : -1;
+    *got_flags = n < 0 ? 0 : message.msg_flags;
+    return n;
+}
+/* Whether descriptors `a` and `b` are the same file. */
+static int same_file(int a, int b) {
+    struct stat x, y;
+    return a >= 0 && b >= 0 && !fstat(a, &x) && !fstat(b, &y) && x.st_ino == y.st_ino && x.st_dev == y.st_dev;
+}
 static long send_fds(int socket, const char *data, size_t len, const int *fds, int count) {
     struct iovec iov = {(void *)data, len};
     union { char bytes[CMSG_SPACE(sizeof(int) * 4)]; struct cmsghdr align; } control;
@@ -1525,6 +1544,101 @@ int main(int argc, char **argv) {
         outcome("unmapped-message", sendmsg(datagram[0], &unmapped_message, 0));
         errno = 0;
         outcome("unmapped-stream-message", sendmsg(stream[0], &unmapped_message, 0));
+        return 0;
+    }
+    if (!strcmp(mode, "socket-flags")) {
+        /* recvmsg and recvfrom flags on socket pairs: MSG_PEEK leaves the
+           data and copies the descriptors, MSG_WAITALL fills a stream's
+           buffer, MSG_TRUNC gives a message's whole length, and MSG_OOB
+           finds no out-of-band data; other flags are ignored. */
+        int sv[2], pipe_fds[2], fd, flags;
+        char buf[16];
+        pipe(pipe_fds);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        send(sv[0], "ab", 2, 0);
+        send_fds(sv[0], "cd", 2, pipe_fds, 1);
+        send(sv[0], "ef", 2, 0);
+        memset(buf, 0, sizeof buf);
+        long n = receive_fd(sv[1], buf, 8, MSG_PEEK, &fd, &flags);
+        printf("stream peek=%ld data=%s fd=%d same=%d\n", n, buf, fd >= 0, same_file(fd, pipe_fds[0]));
+        int peeked = fd;
+        memset(buf, 0, sizeof buf);
+        n = receive_fd(sv[1], buf, 8, 0, &fd, &flags);
+        printf("stream read=%ld data=%s fd=%d same=%d other=%d\n", n, buf, fd >= 0, same_file(fd, pipe_fds[0]), fd != peeked);
+        close(fd);
+        close(peeked);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 8, MSG_PEEK | MSG_DONTWAIT);
+        printf("stream rest-peek=%ld data=%s\n", n, buf);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 8, MSG_DONTWAIT);
+        printf("stream rest=%ld data=%s\n", n, buf);
+        /* MSG_WAITALL stops at a write that passes descriptors. */
+        send(sv[0], "gh", 2, 0);
+        send_fds(sv[0], "ij", 2, pipe_fds, 1);
+        send(sv[0], "kl", 2, 0);
+        memset(buf, 0, sizeof buf);
+        n = receive_fd(sv[1], buf, 8, MSG_WAITALL, &fd, &flags);
+        printf("waitall-fds=%ld data=%s fd=%d\n", n, buf, fd >= 0);
+        close(fd);
+        recv(sv[1], buf, 8, MSG_DONTWAIT);
+        errno = 0;
+        n = recv(sv[1], buf, 8, MSG_OOB | MSG_DONTWAIT);
+        printf("stream oob=%ld errno=%d\n", n, errno);
+        fflush(stdout);
+        /* MSG_WAITALL waits for writes to come, and ends with the stream. */
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(sv[1]);
+            send(sv[0], "12", 2, 0);
+            usleep(20000);
+            send(sv[0], "34", 2, 0);
+            usleep(20000);
+            send(sv[0], "56", 2, 0);
+            usleep(20000);
+            send(sv[0], "78", 2, MSG_MORE | MSG_EOR);
+            _exit(0);
+        }
+        close(sv[0]);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 6, MSG_WAITALL);
+        printf("waitall=%ld data=%s\n", n, buf);
+        memset(buf, 0, sizeof buf);
+        n = recv(sv[1], buf, 6, MSG_WAITALL);
+        printf("waitall-end=%ld data=%s\n", n, buf);
+        int status;
+        waitpid(pid, &status, 0);
+        close(sv[1]);
+        /* A message's whole length with MSG_TRUNC, peeked or taken. */
+        const int kinds[] = {SOCK_DGRAM, SOCK_SEQPACKET};
+        const char *names[] = {"dgram", "seqpacket"};
+        for (int k = 0; k < 2; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            send(sv[0], "abcdef", 6, MSG_EOR | MSG_DONTROUTE);
+            send_fds(sv[0], "xy", 2, pipe_fds, 1);
+            memset(buf, 0, sizeof buf);
+            n = receive_fd(sv[1], buf, 2, MSG_TRUNC | MSG_PEEK, &fd, &flags);
+            printf("%s peek-trunc=%ld data=%s flags=%#x\n", names[k], n, buf, flags);
+            memset(buf, 0, sizeof buf);
+            n = recvfrom(sv[1], buf, 2, MSG_TRUNC, NULL, NULL);
+            printf("%s recvfrom-trunc=%ld data=%s\n", names[k], n, buf);
+            memset(buf, 0, sizeof buf);
+            n = receive_fd(sv[1], buf, 8, MSG_PEEK, &fd, &flags);
+            printf("%s peek-fd=%ld data=%s fd=%d same=%d\n", names[k], n, buf, fd >= 0, same_file(fd, pipe_fds[0]));
+            peeked = fd;
+            n = receive_fd(sv[1], buf, 8, MSG_WAITALL | MSG_ERRQUEUE, &fd, &flags);
+            printf("%s read-fd=%ld fd=%d other=%d\n", names[k], n, fd >= 0, fd != peeked);
+            close(fd);
+            close(peeked);
+            errno = 0;
+            n = recv(sv[1], buf, 8, MSG_OOB | MSG_DONTWAIT);
+            printf("%s oob=%ld errno=%d\n", names[k], n, errno);
+            errno = 0;
+            n = send(sv[0], "z", 1, MSG_OOB);
+            printf("%s send-oob=%ld errno=%d\n", names[k], n, errno);
+            close(sv[0]);
+            close(sv[1]);
+        }
         return 0;
     }
     if (!strcmp(mode, "scm-rights")) {

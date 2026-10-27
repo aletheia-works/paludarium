@@ -134,6 +134,14 @@ kernel.
   no end of file: when the peer closes, reads wait and the next send gets
   `ECONNREFUSED`, then `ENOTCONN`. Only `SOCK_STREAM` raises `SIGPIPE` with
   `EPIPE`, as on Linux.
+- `recvmsg` and `recvfrom` take their flags as Linux's AF_UNIX sockets do:
+  `MSG_PEEK` leaves the data, and gives copies of the descriptors it passes;
+  `MSG_WAITALL` fills a stream's buffer, unless the stream ends, descriptors
+  come or a signal arrives after some data; `MSG_TRUNC` returns a message's
+  whole length; `MSG_OOB` finds no out-of-band data (`EINVAL` on a stream,
+  `EOPNOTSUPP` on the other kinds). `sendmsg` and `sendto` take
+  `MSG_NOSIGNAL` and `MSG_DONTWAIT`, and `MSG_OOB` on a datagram or packet
+  socket is `EOPNOTSUPP`. The other flags have no effect, as on Linux.
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and

@@ -198,6 +198,7 @@ mod linux {
         processes_seqpacket => ("seqpacket","process"),
         processes_dgram => ("dgram","process"),
         processes_scm_rights => ("scm-rights","process"),
+        processes_socket_flags => ("socket-flags","process"),
         processes_socket_addresses => ("socket-addresses","process"),
         command_pre_exec => ("pre-exec","command"),
         command_pre_exec_missing => ("pre-exec-missing","command"),

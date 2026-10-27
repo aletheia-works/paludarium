@@ -830,7 +830,8 @@ fn sendto_and_recvfrom_take_addresses_and_flags_like_sendmsg() {
     assert_eq!(f.ret(45, [b, IN, 16, 0, NAME, len]), 2);
     assert_eq!(read_u32(&f, len), 0);
     assert_eq!(f.ret(45, [b, IN, 16, 0x40, 0, 0]), fail(11));
-    assert_eq!(f.ret(45, [b, IN, 16, 2, 0, 0]), fail(95));
+    // A stream has no out-of-band data to read.
+    assert_eq!(f.ret(45, [b, IN, 16, 1, 0, 0]), fail(22));
     // A negative length or none is an error after the data is taken.
     assert_eq!(f.ret(44, [a, BYTES, 2, 0, 0, 0]), 2);
     f.mem.write(GuestAddr(len), &(-1i32).to_le_bytes()).unwrap();

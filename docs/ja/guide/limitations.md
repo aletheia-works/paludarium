@@ -26,9 +26,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルの持ち主やグループになります。
 - **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように
   `SCM_RIGHTS` でディスクリプタを受け渡します。違いは次のとおりです。
-  - `sendmsg` と `sendto` が受け付けるフラグは `MSG_NOSIGNAL` と `MSG_DONTWAIT` だけ、
-    `recvmsg` と `recvfrom` は `MSG_DONTWAIT` と `MSG_CMSG_CLOEXEC` だけです。ほかは
-    `EOPNOTSUPP` を返します。
+  - ストリームには帯域外のデータがありません。`MSG_OOB` を付けた `sendmsg` と
+    `sendto` は `EOPNOTSUPP` を返します。Linux は最後の 1 バイトを帯域外で送ります。
+    そのため、`MSG_OOB` を付けた読み込みは、いつも何も見つけません（`EINVAL`）。
   - `SCM_CREDENTIALS` は `EINVAL` を返します。`SO_PASSCRED` を有効にする方法も
     ありません。
   - Linux は、およそ 32 KiB を超えるストリームへの書き込みをいくつかに分け、

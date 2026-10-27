@@ -299,9 +299,12 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
 }
 
+const MSG_OOB: u64 = 0x1;
+const MSG_PEEK: u64 = 0x2;
 const MSG_CTRUNC: u32 = 0x8;
 const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
+const MSG_WAITALL: u64 = 0x100;
 const MSG_NOSIGNAL: u64 = 0x4000;
 const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 const SOL_SOCKET: u32 = 1;
@@ -476,7 +479,7 @@ fn access_ok(at: u64, len: usize) -> Result<(), Errno> {
 fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let len = user_buffer(a[1], a[2])?;
     let file = socket(c, a[0])?;
-    if a[3] & !(MSG_NOSIGNAL | MSG_DONTWAIT) != 0 {
+    if a[3] & MSG_OOB != 0 {
         return Err(Errno(95));
     }
     let mut address = Vec::new();
@@ -521,19 +524,16 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let len = user_buffer(a[1], a[2])?;
     let file = socket(c, a[0])?;
-    if a[3] & !(MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 0 {
-        return Err(Errno(95));
-    }
+    let socket = as_socket(&file)?;
+    socket.check_out_of_band(a[3])?;
     c.mem
         .check_write(GuestAddr(a[1]), len)
         .map_err(|_| Errno::EFAULT)?;
     let mut bytes = Vec::new();
     bytes.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
     bytes.resize(len, 0);
-    let socket = as_socket(&file)?;
-    let received = crate::files::wait_for_read(c, &file, a[3] & MSG_DONTWAIT != 0, || {
-        socket.receive(&mut bytes, true)
-    })?;
+    let received = receive_with(c, &file, socket, &mut bytes, a[3])?;
+    let returned = received.returned(a[3]);
     c.mem
         .write(GuestAddr(a[1]), &bytes[..received.count])
         .map_err(|_| Errno::EFAULT)?;
@@ -551,16 +551,14 @@ fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .write(GuestAddr(a[5]), &0u32.to_le_bytes())
             .map_err(|_| Errno::EFAULT)?;
     }
-    Ok(received.count as u64)
+    Ok(returned)
 }
 /// `sendmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS`. Of the
-/// flags only `MSG_NOSIGNAL` and `MSG_DONTWAIT` are taken (EOPNOTSUPP
-/// otherwise).
+/// flags `MSG_NOSIGNAL` and `MSG_DONTWAIT` act, `MSG_OOB` is EOPNOTSUPP (a
+/// stream's out-of-band data is not modelled), and the rest are ignored, as
+/// Linux's AF_UNIX sockets ignore them.
 fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let file = socket(c, a[0])?;
-    if a[2] & !(MSG_NOSIGNAL | MSG_DONTWAIT) != 0 {
-        return Err(Errno(95));
-    }
     let header = message_header(c, a[1], false)?;
     let mut address = Vec::new();
     if let Some((name, len)) = header.name {
@@ -580,6 +578,10 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .map_err(|_| Errno::EFAULT)?;
     let mut passed = passed_descriptors(c, &control)?;
     let socket = as_socket(&file)?;
+    // After __scm_send, as the protocol's sendmsg checks it.
+    if a[2] & MSG_OOB != 0 {
+        return Err(Errno(95));
+    }
     let total = header.iov.iter().map(|(_, len)| len).sum::<usize>();
     // The address is checked, and the data then copied, in the protocol's
     // sendmsg after __scm_send.
@@ -608,23 +610,19 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     drop(passed);
     result
 }
-/// `recvmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS`. Of the
-/// flags only `MSG_DONTWAIT` and `MSG_CMSG_CLOEXEC` are taken (EOPNOTSUPP
-/// otherwise).
+/// `recvmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS` and the
+/// flags of [`receive_with`].
 fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let file = socket(c, a[0])?;
-    if a[2] & !(MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 0 {
-        return Err(Errno(95));
-    }
     let header = message_header(c, a[1], true)?;
+    let socket = as_socket(&file)?;
+    socket.check_out_of_band(a[2])?;
     let total = header.iov.iter().map(|(_, len)| len).sum::<usize>();
     let mut bytes = Vec::new();
     bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
     bytes.resize(total, 0);
-    let socket = as_socket(&file)?;
-    let received = crate::files::wait_for_read(c, &file, a[2] & MSG_DONTWAIT != 0, || {
-        socket.receive(&mut bytes, true)
-    })?;
+    let received = receive_with(c, &file, socket, &mut bytes, a[2])?;
+    let returned = received.returned(a[2]);
     crate::files::scatter(c, &header.iov, &bytes[..received.count])?;
     // ____sys_recvmsg starts msg_flags with MSG_CMSG_CLOEXEC.
     let mut flags = (a[2] & MSG_CMSG_CLOEXEC) as u32;
@@ -647,7 +645,45 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     c.mem
         .write(GuestAddr(a[1] + 40), &used.to_le_bytes())
         .map_err(|_| Errno::EFAULT)?;
-    Ok(received.count as u64)
+    Ok(returned)
+}
+/// Reads for recvmsg or recvfrom with their `flags`, as Linux's AF_UNIX
+/// sockets take them: `MSG_DONTWAIT` does not wait, `MSG_PEEK` leaves the
+/// data, and its descriptors, where they are, and on a stream `MSG_WAITALL`
+/// goes on until `bytes` is full, the stream ends, descriptors come, or a
+/// signal arrives after some data, which it then returns. Other flags have
+/// no effect.
+fn receive_with(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    socket: &SocketPairEnd,
+    bytes: &mut [u8],
+    flags: u64,
+) -> Result<Received, Errno> {
+    let dontwait = flags & MSG_DONTWAIT != 0;
+    let peek = flags & MSG_PEEK != 0;
+    let mut received = crate::files::wait_for_read(c, file, dontwait, || {
+        socket.receive(bytes, true, peek.then_some(0))
+    })?;
+    let wait_all = flags & MSG_WAITALL != 0
+        && !socket.pair.messages()
+        && !dontwait
+        && socket.flags() & NONBLOCK == 0;
+    while wait_all && (1..bytes.len()).contains(&received.count) && received.passed.is_empty() {
+        let done = received.count;
+        let more = crate::files::wait_for_read(c, file, false, || {
+            socket.receive(&mut bytes[done..], true, peek.then_some(done))
+        });
+        match more {
+            Ok(more) if more.count != 0 => {
+                received.count += more.count;
+                received.length += more.count;
+                received.passed = more.passed;
+            }
+            _ => break,
+        }
+    }
+    Ok(received)
 }
 /// Installs the received descriptors and writes their `SCM_RIGHTS` message,
 /// as Linux's `scm_detach_fds`: as many as the control buffer holds, each
@@ -712,6 +748,19 @@ pub(crate) struct Received {
     pub(crate) count: usize,
     pub(crate) passed: Passed,
     pub(crate) truncated: bool,
+    /// The whole message's length, or the bytes copied from a stream.
+    pub(crate) length: usize,
+}
+impl Received {
+    /// What recvmsg or recvfrom returns: with `MSG_TRUNC`, a message's
+    /// whole length, even past the buffer, as Linux's AF_UNIX sockets do.
+    fn returned(&self, flags: u64) -> u64 {
+        if flags & u64::from(MSG_TRUNC) != 0 {
+            self.length as u64
+        } else {
+            self.count as u64
+        }
+    }
 }
 #[derive(Default)]
 struct Side {
@@ -825,21 +874,38 @@ impl SocketPairEnd {
 impl SocketPairEnd {
     /// Reads into `buf`; `message` is the form of recvmsg and recvfrom
     /// (`sock_recvmsg`), which an empty buffer does not end at once as read's
-    /// does (Linux's `sock_read_iter`).
-    pub(crate) fn receive(&self, buf: &mut [u8], message: bool) -> Result<Received, Errno> {
+    /// does (Linux's `sock_read_iter`). With `peek` (`MSG_PEEK`) the data
+    /// stays, and a stream is read from that many bytes on.
+    pub(crate) fn receive(
+        &self,
+        buf: &mut [u8],
+        message: bool,
+        peek: Option<usize>,
+    ) -> Result<Received, Errno> {
         if buf.is_empty() && !message {
             return Ok(Received::default());
         }
         if self.pair.messages() {
-            self.read_message(buf)
+            self.read_message(buf, peek.is_some())
         } else {
-            self.read_stream(buf)
+            self.read_stream(buf, peek)
+        }
+    }
+    /// recvmsg's and recvfrom's `MSG_OOB`: a stream has no out-of-band data
+    /// to read (EINVAL), and the other kinds have none at all (EOPNOTSUPP).
+    fn check_out_of_band(&self, flags: u64) -> Result<(), Errno> {
+        match (flags & MSG_OOB != 0, self.pair.messages()) {
+            (false, _) => Ok(()),
+            (true, false) => Err(Errno::EINVAL),
+            (true, true) => Err(Errno(95)),
         }
     }
     /// SOCK_SEQPACKET and SOCK_DGRAM read: the next whole message,
     /// truncated to `buf`, with its descriptors. An empty buffer reaches
-    /// here only from recvmsg or recvfrom, and discards the message.
-    fn read_message(&self, buf: &mut [u8]) -> Result<Received, Errno> {
+    /// here only from recvmsg or recvfrom, and discards the message. A
+    /// `peek` leaves the message, and gives copies of its descriptors, as
+    /// Linux's `scm_fp_dup`.
+    fn read_message(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
         let nonblocking = self.flags() & NONBLOCK != 0;
         let mut sides = self
             .pair
@@ -853,6 +919,18 @@ impl SocketPairEnd {
         let own = &mut sides[self.side];
         if own.read_shutdown && !datagram {
             return Ok(Received::default());
+        }
+        if peek && let Some(message) = own.writes.front() {
+            let count = buf.len().min(message.len);
+            for (d, s) in buf.iter_mut().zip(own.bytes.iter().take(count)) {
+                *d = *s;
+            }
+            return Ok(Received {
+                count,
+                truncated: count < message.len,
+                passed: message.passed.clone(),
+                length: message.len,
+            });
         }
         let Some(message) = own.writes.pop_front() else {
             // A datagram socket has no end of file from its peer: only its
@@ -882,6 +960,7 @@ impl SocketPairEnd {
             count,
             truncated: count < message.len,
             passed: message.passed,
+            length: message.len,
         })
     }
 }
@@ -889,8 +968,8 @@ impl SocketPairEnd {
     /// SOCK_STREAM read. As Linux's `unix_stream_read_generic`, it goes on
     /// across writes but ends with the first one that passed descriptors,
     /// which come with its first bytes read; an empty buffer still takes
-    /// them.
-    fn read_stream(&self, buf: &mut [u8]) -> Result<Received, Errno> {
+    /// them. A `peek` from `skip` bytes on leaves the data where it is.
+    fn read_stream(&self, buf: &mut [u8], peek: Option<usize>) -> Result<Received, Errno> {
         let mut sides = self
             .pair
             .sides
@@ -909,6 +988,18 @@ impl SocketPairEnd {
                 Ok(Received::default())
             } else {
                 Err(Errno::EAGAIN)
+            };
+        }
+        if let Some(skip) = peek {
+            let received = Self::peek_stream(own, buf, skip);
+            return if received.count == 0 && received.passed.is_empty() && !buf.is_empty() {
+                if eof {
+                    Ok(Received::default())
+                } else {
+                    Err(Errno::EAGAIN)
+                }
+            } else {
+                Ok(received)
             };
         }
         let mut received = Received::default();
@@ -936,7 +1027,42 @@ impl SocketPairEnd {
             sides[1 - self.side].output_epoch = sides[1 - self.side].output_epoch.wrapping_add(1);
         }
         self.pair.hub.changed();
+        received.length = received.count;
         Ok(received)
+    }
+    /// What a stream read from `skip` bytes on would take, left in `own`:
+    /// it stops after a write that passed descriptors, giving copies of
+    /// them.
+    fn peek_stream(own: &Side, buf: &mut [u8], mut skip: usize) -> Received {
+        let mut received = Received::default();
+        let mut start = 0;
+        for write in &own.writes {
+            let at = start;
+            start += write.len;
+            if skip >= write.len {
+                skip -= write.len;
+                continue;
+            }
+            let count = (write.len - skip).min(buf.len() - received.count);
+            let from = at + skip;
+            for (d, s) in buf[received.count..received.count + count]
+                .iter_mut()
+                .zip(own.bytes.range(from..from + count))
+            {
+                *d = *s;
+            }
+            received.count += count;
+            skip = 0;
+            if !write.passed.is_empty() {
+                received.passed = write.passed.clone();
+                break;
+            }
+            if received.count == buf.len() {
+                break;
+            }
+        }
+        received.length = received.count;
+        received
     }
 }
 impl Drop for SocketPairEnd {
@@ -997,7 +1123,8 @@ impl FileHandle for SocketPairEnd {
     }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         // Descriptors that come to a plain read are closed, as Linux does.
-        self.receive(buf, false).map(|received| received.count)
+        self.receive(buf, false, None)
+            .map(|received| received.count)
     }
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
         self.send(buf, &mut Passed::new())

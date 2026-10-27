@@ -82,8 +82,10 @@ not need to share the repository path (`PALUDARIUM_DEV_MOUNT=bind` mounts it
 directly). Each checkout keeps its build output in volumes of its own, so one
 checkout never reuses crates another built; `docker volume ls` lists them, and
 the shared `paludarium-work` and `paludarium-target` volumes of earlier versions
-can be removed with `docker volume rm`. Docker on an Arm Mac runs x86-64 under
-emulation, so its results are not evidence of native Linux behaviour; CI is.
+can be removed with `docker volume rm`. Docker on an Arm Mac runs x86-64,
+native programs included, under QEMU's user-mode emulation, so its results are
+not evidence of native Linux behaviour, and its signals can differ from Linux
+even on the native side; CI is the evidence.
 
 ### Documentation site
 

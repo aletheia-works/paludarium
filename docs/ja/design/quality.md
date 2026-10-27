@@ -20,6 +20,11 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
 - コアダンプのケースでは、Linux がカーネルの既定の `core_pattern`（`core` で、
   `core_uses_pid` は 0）のままである必要があります。CI では `sysctl` で設定します。
   それ以外の環境では、クラッシュの処理系に送られたコアと比べず、そう伝えて止まります。
+- native の側は、本物の x86-64 Linux でなければなりません。Arm の Mac の Docker は、
+  x86-64 のプログラムを QEMU のユーザーモードのエミュレーションで動かします。QEMU は
+  シグナルを自分で扱うので、そこでは native の結果も Linux と違うことがあります。
+  たとえば、`SA_NOCLDSTOP` を付けた親にも、止めて再開した子の SIGCHLD が届きます。
+  Linux なら届きません。そのような実行は、どちらの向きにも証拠になりません。
 - `tests/guests/processes/cases.json` に載っているプロセスのケースと、`diff_processes`
   が動かすケースがちょうど同じかをテストで確かめます。載せたのに動かないケースは
   作れません。

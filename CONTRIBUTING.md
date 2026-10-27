@@ -77,8 +77,12 @@ give such a heading an explicit id, such as
 The emulator is correct when it matches native x86-64 Linux. Differential tests,
 line coverage (80% floor), and fuzzing only produce real evidence on x86-64
 Linux, which CI runs on every pull request that changes what they cover (and on
-every push to main); a macOS or Windows run is not a substitute. Do not lower coverage floors, add skips, or weaken comparison masks
-to make a check pass. Measure speed only with background load stopped. For
+every push to main); a macOS or Windows run is not a substitute. Nor is
+`mise run linux-dev` on an Arm Mac: Docker runs the x86-64 programs there, the
+native side included, under QEMU's user-mode emulation, which handles signals
+itself, so even the native results can differ from Linux (a stopped and
+continued child sends SIGCHLD despite `SA_NOCLDSTOP`, for one). Do not lower
+coverage floors, add skips, or weaken comparison masks to make a check pass. Measure speed only with background load stopped. For
 documentation or GitHub configuration changes, check syntax, referenced paths,
 and the final diff; a full emulator rebuild is unnecessary.
 

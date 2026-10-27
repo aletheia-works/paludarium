@@ -22,6 +22,11 @@ CI run produces them afresh on an x86-64 Linux runner.
   (`core`, with `core_uses_pid` 0). CI sets it with `sysctl`; elsewhere the
   case stops and says so, rather than compare with a core sent to a crash
   handler.
+- The native side must be a real x86-64 Linux. Docker on an Arm Mac runs
+  x86-64 programs under QEMU's user-mode emulation, which handles signals
+  itself, so there even native results can differ from Linux: a stopped and
+  continued child sends SIGCHLD to a parent that set `SA_NOCLDSTOP`, where
+  Linux sends none. Such a run is not evidence, in either direction.
 - A test checks that `diff_processes` runs exactly the process cases that
   `tests/guests/processes/cases.json` lists, so that a case cannot be listed
   and never run.

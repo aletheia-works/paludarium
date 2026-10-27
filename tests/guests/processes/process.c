@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -199,6 +200,45 @@ static void *discard_reader(void *unused) {
 }
 static volatile sig_atomic_t received;
 static void interrupted(int number) { (void)number; received++; }
+/* signal-io: takes the queued SIGIO, SIGURG and SIGRTMIN+5 that the mode
+   keeps blocked, oldest first within each, and prints them. */
+#define IO_RT (SIGRTMIN + 5)
+static void io_taken(const char *name) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGIO);
+    sigaddset(&set, SIGURG);
+    sigaddset(&set, IO_RT);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    int number;
+    printf("  %s:", name);
+    while ((number = sigtimedwait(&set, &info, &zero)) > 0)
+        printf(" [%s code=%d band=%#lx fd=%d]", number == SIGIO ? "io" : number == SIGURG ? "urg" : "rt",
+               info.si_code, (long)info.si_band, info.si_fd);
+    printf("\n");
+}
+/* Counts the queued IO_RT signals with code `code` and takes the rest. */
+static int io_count(int code) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, IO_RT);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    int count = 0;
+    while (sigtimedwait(&set, &info, &zero) > 0) count += info.si_code == code;
+    return count;
+}
+/* F_GETOWN, named rather than printed, so the output keeps no IDs. */
+static const char *io_owner(int fd) {
+    int owner = fcntl(fd, F_GETOWN);
+    return owner == 0 ? "none" : owner == getpid() ? "self" : owner == -getpgrp() ? "group" : "other";
+}
+static void io_async(int fd, int number) {
+    fcntl(fd, F_SETOWN, getpid());
+    fcntl(fd, F_SETSIG, number);
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_ASYNC);
+}
 /* signal-restart: SIGALRM feeds the call it interrupts, writing a byte
    to restart_fd or, with restart_drain, emptying it, so that a restarted
    call ends at once. */
@@ -1568,6 +1608,306 @@ int main(int argc, char **argv) {
         outcome("unmapped-message", sendmsg(datagram[0], &unmapped_message, 0));
         errno = 0;
         outcome("unmapped-stream-message", sendmsg(stream[0], &unmapped_message, 0));
+        return 0;
+    }
+    if (!strcmp(mode, "signal-io")) {
+        /* O_ASYNC: a pipe or socket signals its F_SETOWN owner as it
+           changes, with SIGIO or F_SETSIG's signal (code, band and fd);
+           F_SETOWN works on any file, O_ASYNC stays only on these. The
+           signals stay blocked and are taken with sigtimedwait. */
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGIO);
+        sigaddset(&set, SIGURG);
+        sigaddset(&set, IO_RT);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        int p[2], sv[2], status;
+        char buf[64];
+        pid_t pid = getpid(), forked;
+        puts("flags");
+        if (pipe(p)) return 79;
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        int file = open(self, O_RDONLY), event = eventfd(0, 0), null = open("/dev/null", O_RDWR);
+        int fds[] = {p[0], sv[0], file, event, null};
+        const char *names[] = {"pipe", "socket", "file", "eventfd", "null"};
+        for (int k = 0; k < 5; k++) {
+            struct f_owner_ex fresh;
+            memset(&fresh, 0x55, sizeof fresh);
+            fcntl(fds[k], F_GETOWN_EX, &fresh);
+            int fresh_sig = fcntl(fds[k], F_GETSIG), fresh_own = fcntl(fds[k], F_GETOWN);
+            long set_flags = fcntl(fds[k], F_SETFL, O_ASYNC | O_NONBLOCK);
+            int flags = fcntl(fds[k], F_GETFL) & (O_ASYNC | O_NONBLOCK);
+            long own = fcntl(fds[k], F_SETOWN, pid);
+            printf("  %s fresh=%d/%d/%d/%d setfl=%ld flags=%#x setown=%ld getown=%d\n", names[k], fresh.type, fresh.pid,
+                   fresh_sig, fresh_own, set_flags, flags, own, fcntl(fds[k], F_GETOWN) == pid);
+            fcntl(fds[k], F_SETFL, 0);
+        }
+        puts("owner");
+        struct f_owner_ex owner;
+        pid_t tid = syscall(SYS_gettid), group = getpgrp();
+#define IO_EX(name, kind, id) do { owner.type = (kind); owner.pid = (id); errno = 0; long r = fcntl(file, F_SETOWN_EX, &owner); \
+        int e = r < 0 ? errno : 0; memset(&owner, 0x55, sizeof owner); fcntl(file, F_GETOWN_EX, &owner); \
+        pid_t expected = owner.type == F_OWNER_PGRP ? group : pid; \
+        printf("  %s=%ld errno=%d type=%d id=%s getown=%s\n", name, r, e, owner.type, \
+               owner.pid == 0 ? "none" : owner.pid == expected ? "owner" : "other", io_owner(file)); } while (0)
+        IO_EX("tid", F_OWNER_TID, tid);
+        IO_EX("pid", F_OWNER_PID, pid);
+        IO_EX("pgrp", F_OWNER_PGRP, group);
+        IO_EX("type3", 3, pid);
+        IO_EX("type-1", -1, pid);
+        IO_EX("missing", F_OWNER_PID, 999999);
+        IO_EX("negative", F_OWNER_PID, -pid);
+        IO_EX("zero", F_OWNER_PID, 0);
+        IO_EX("tid-zero", F_OWNER_TID, 0);
+#undef IO_EX
+        long r;
+#define IO_OWN(name, value) do { errno = 0; r = fcntl(file, F_SETOWN, value); int e = r < 0 ? errno : 0; \
+        memset(&owner, 0x55, sizeof owner); fcntl(file, F_GETOWN_EX, &owner); \
+        printf("  setown-%s=%ld errno=%d type=%d getown=%s\n", name, r, e, owner.type, io_owner(file)); } while (0)
+        IO_OWN("self", pid);
+        IO_OWN("missing", 999999);
+        IO_OWN("min", INT_MIN);
+        IO_OWN("zero", 0);
+#undef IO_OWN
+        r = fcntl(file, F_SETOWN, -group);
+        printf("  setown-group=%ld getown=%d\n", r, fcntl(file, F_GETOWN) == -group);
+        errno = 0;
+        r = fcntl(file, F_GETOWN_EX, (void *)8);
+        printf("  getown-ex-fault=%ld errno=%d\n", r, errno);
+        errno = 0;
+        r = fcntl(file, F_SETOWN_EX, (void *)8);
+        printf("  setown-ex-fault=%ld errno=%d\n", r, errno);
+        puts("setsig");
+        long numbers[] = {29, 64, 65, -1, 9, 0};
+        for (int k = 0; k < 6; k++) {
+            errno = 0;
+            r = fcntl(file, F_SETSIG, numbers[k]);
+            printf("  %ld=%ld errno=%d get=%d\n", numbers[k], r, r < 0 ? errno : 0, fcntl(file, F_GETSIG));
+        }
+        close(p[0]); close(p[1]); close(sv[0]); close(sv[1]);
+        puts("pipe-reader");
+        if (pipe(p)) return 79;
+        io_async(p[0], 0);
+        if (write(p[1], "a", 1) != 1) return 78;
+        io_taken("write");
+        if (write(p[1], "bc", 2) != 2) return 78;
+        if (write(p[1], "d", 1) != 1) return 78;
+        io_taken("two-writes");
+        if (write(p[1], "", 0) != 0) return 78;
+        io_taken("empty-write");
+        if (read(p[0], buf, 1) != 1) return 77;
+        io_taken("read");
+        fcntl(p[0], F_SETSIG, IO_RT);
+        if (write(p[1], "e", 1) != 1) return 78;
+        if (write(p[1], "f", 1) != 1) return 78;
+        io_taken("rt-writes");
+        int copy = dup(p[0]);
+        if (write(p[1], "g", 1) != 1) return 78;
+        io_taken("dup");
+        close(copy);
+        close(p[1]);
+        io_taken("close-writer");
+        close(p[0]);
+        puts("pipe-writer");
+        if (pipe(p)) return 79;
+        io_async(p[1], IO_RT);
+        if (write(p[1], "a", 1) != 1) return 78;
+        io_taken("write");
+        if (read(p[0], buf, 1) != 1) return 77;
+        io_taken("read");
+        if (read(p[0], buf, 0) != 0) return 77;
+        io_taken("empty-read");
+        fcntl(p[0], F_SETFL, O_NONBLOCK);
+        errno = 0;
+        r = read(p[0], buf, 1);
+        printf("  nothing=%ld errno=%d\n", r, errno);
+        io_taken("nothing");
+        close(p[0]);
+        io_taken("close-reader");
+        close(p[1]);
+        puts("pipe-full");
+        if (pipe(p)) return 79;
+        io_async(p[0], IO_RT);
+        fcntl(p[1], F_SETFL, O_NONBLOCK);
+        static char chunk[4096];
+        int writes = 0;
+        while (write(p[1], chunk, sizeof chunk) > 0) writes++;
+        errno = 0;
+        r = write(p[1], "x", 1);
+        printf("  full=%ld errno=%d in=%d\n", r, errno, io_count(POLL_IN) == writes + 2);
+        close(p[0]); close(p[1]);
+        puts("pipe-blocking");
+        /* A blocking read signals the writer once, as it ends; a blocking
+           write the reader once before it waits and once as it ends. A
+           child moves the data after a while. */
+        if (pipe(p)) return 79;
+        io_async(p[1], IO_RT);
+        forked = child();
+        if (forked < 0) return 76;
+        if (!forked) {
+            usleep(200000);
+            _exit(write(p[1], "x", 1) == 1 ? 0 : 1);
+        }
+        if (read(p[0], buf, 1) != 1) return 77;
+        waitpid(forked, &status, 0);
+        printf("  read out=%d\n", io_count(POLL_OUT));
+        close(p[0]); close(p[1]);
+        if (pipe(p)) return 79;
+        io_async(p[0], IO_RT);
+        fcntl(p[1], F_SETFL, O_NONBLOCK);
+        while (write(p[1], chunk, sizeof chunk) > 0) {}
+        fcntl(p[1], F_SETFL, 0);
+        io_count(POLL_IN);
+        forked = child();
+        if (forked < 0) return 76;
+        if (!forked) {
+            usleep(200000);
+            _exit(read(p[0], chunk, sizeof chunk) == sizeof chunk ? 0 : 1);
+        }
+        if (write(p[1], chunk, sizeof chunk) != sizeof chunk) return 78;
+        waitpid(forked, &status, 0);
+        printf("  write in=%d\n", io_count(POLL_IN));
+        close(p[0]); close(p[1]);
+        puts("pipe-owners");
+        if (pipe(p)) return 79;
+        fcntl(p[0], F_SETFL, O_ASYNC);
+        if (write(p[1], "a", 1) != 1) return 78;
+        io_taken("none");
+        fcntl(p[0], F_SETFL, 0);
+        fcntl(p[0], F_SETOWN, pid);
+        if (write(p[1], "a", 1) != 1) return 78;
+        io_taken("no-async");
+        fcntl(p[0], F_SETFL, O_ASYNC);
+        io_taken("set");
+        if (write(p[1], "a", 1) != 1) return 78;
+        io_taken("async");
+        fcntl(p[0], F_SETFL, 0);
+        if (write(p[1], "a", 1) != 1) return 78;
+        io_taken("cleared");
+        fcntl(p[0], F_SETSIG, IO_RT);
+        fcntl(p[0], F_SETOWN, -group);
+        fcntl(p[0], F_SETFL, O_ASYNC);
+        if (write(p[1], "a", 1) != 1) return 78;
+        io_taken("group");
+        owner.type = F_OWNER_TID;
+        owner.pid = tid;
+        fcntl(p[0], F_SETOWN_EX, &owner);
+        if (write(p[1], "a", 1) != 1) return 78;
+        io_taken("thread");
+        forked = child();
+        if (forked < 0) return 76;
+        if (!forked) _exit(fcntl(p[0], F_SETSIG, 0) ? 1 : 0);
+        waitpid(forked, &status, 0);
+        printf("  shared-setsig=%d\n", fcntl(p[0], F_GETSIG));
+        close(p[0]); close(p[1]);
+        puts("child");
+        int ready[2];
+        if (pipe(p) || pipe(ready)) return 79;
+        forked = child();
+        if (forked < 0) return 76;
+        if (!forked) {
+            sigset_t none;
+            sigemptyset(&none);
+            sigprocmask(SIG_SETMASK, &none, NULL);
+            if (write(ready[1], "r", 1) != 1) _exit(4);
+            for (;;) pause();
+        }
+        if (read(ready[0], buf, 1) != 1) return 77;
+        fcntl(p[0], F_SETOWN, forked);
+        fcntl(p[0], F_SETFL, O_ASYNC);
+        if (write(p[1], "a", 1) != 1) return 78;
+        waitpid(forked, &status, 0);
+        printf("  killed=%d signal=%d\n", WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+        close(p[0]); close(p[1]); close(ready[0]); close(ready[1]);
+        puts("stream");
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        io_async(sv[0], IO_RT);
+        io_async(sv[1], IO_RT);
+        send(sv[0], "ab", 2, 0);
+        io_taken("send");
+        recv(sv[1], buf, 2, 0);
+        io_taken("recv");
+        send(sv[0], "", 0, 0);
+        io_taken("empty-send");
+        send(sv[0], "z", 1, MSG_OOB);
+        io_taken("oob");
+        recv(sv[1], buf, 1, MSG_OOB);
+        io_taken("oob-recv");
+        fcntl(sv[1], F_SETSIG, 0);
+        send(sv[0], "cz", 2, MSG_OOB);
+        io_taken("oob-sigio");
+        fcntl(sv[1], F_SETSIG, IO_RT);
+        recv(sv[1], buf, sizeof buf, MSG_DONTWAIT);
+        io_taken("read-rest");
+        send(sv[1], "r", 1, 0);
+        io_taken("reverse");
+        recv(sv[0], buf, 1, 0);
+        fcntl(sv[0], F_SETFL, O_NONBLOCK | O_ASYNC);
+        int sends = 0;
+        while (send(sv[0], chunk, sizeof chunk, 0) > 0) sends++;
+        while (send(sv[0], chunk, 1, 0) > 0) sends++;
+        printf("  filled in=%d\n", io_count(POLL_IN) == sends);
+        fcntl(sv[1], F_SETFL, O_NONBLOCK | O_ASYNC);
+        while (recv(sv[1], chunk, sizeof chunk, 0) > 0) {}
+        io_taken("drained");
+        errno = 0;
+        r = recv(sv[1], buf, 1, 0);
+        printf("  nothing=%ld errno=%d\n", r, errno);
+        io_taken("nothing");
+        shutdown(sv[0], SHUT_WR);
+        io_taken("shut-wr");
+        shutdown(sv[0], SHUT_RD);
+        io_taken("shut-rd");
+        close(sv[0]);
+        io_taken("close");
+        close(sv[1]);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        io_async(sv[0], IO_RT);
+        io_async(sv[1], IO_RT);
+        shutdown(sv[0], SHUT_RDWR);
+        io_taken("shut-rdwr");
+        close(sv[1]);
+        io_taken("close-after-shutdown");
+        close(sv[0]);
+        puts("datagram");
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+        io_async(sv[0], IO_RT);
+        io_async(sv[1], IO_RT);
+        send(sv[0], "a", 1, 0);
+        io_taken("send");
+        send(sv[0], "", 0, 0);
+        io_taken("empty-send");
+        recv(sv[1], buf, 1, 0);
+        recv(sv[1], buf, 1, 0);
+        io_taken("recv");
+        shutdown(sv[0], SHUT_WR);
+        io_taken("shut-wr");
+        shutdown(sv[0], SHUT_RDWR);
+        io_taken("shut-rdwr");
+        close(sv[0]);
+        io_taken("close");
+        close(sv[1]);
+        puts("seqpacket");
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv);
+        io_async(sv[0], IO_RT);
+        io_async(sv[1], IO_RT);
+        send(sv[0], "a", 1, 0);
+        io_taken("send");
+        shutdown(sv[0], SHUT_WR);
+        io_taken("shut-wr");
+        shutdown(sv[0], SHUT_RD);
+        io_taken("shut-rd");
+        close(sv[0]);
+        io_taken("close");
+        close(sv[1]);
+        puts("other-files");
+        uint64_t one = 1;
+        io_async(event, IO_RT);
+        if (write(event, &one, sizeof one) != sizeof one) return 75;
+        io_taken("eventfd");
+        io_async(null, IO_RT);
+        if (write(null, "a", 1) != 1) return 75;
+        io_taken("null");
         return 0;
     }
     if (!strcmp(mode, "signal-restart")) {

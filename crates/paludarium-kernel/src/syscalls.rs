@@ -84,7 +84,7 @@ pub(crate) struct Context<'a> {
     pub cancellation: &'a std::sync::atomic::AtomicBool,
     pub inbox: &'a crate::SignalInbox,
     pub group: &'a crate::ThreadGroup,
-    pub processes: &'a crate::processes::Processes,
+    pub processes: &'a std::sync::Arc<crate::processes::Processes>,
 }
 
 pub(crate) enum Outcome {

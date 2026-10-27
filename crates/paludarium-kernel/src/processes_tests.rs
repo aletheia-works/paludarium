@@ -1911,3 +1911,99 @@ mod queued_signals {
         }
     }
 }
+mod signal_driven_io {
+    use super::*;
+    const O_ASYNC: u64 = 0o20000;
+    fn fcntl(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        fd: u64,
+        command: u64,
+        arg: u64,
+    ) -> u64 {
+        syscall(k, t, m, 72, [fd, command, arg, 0, 0, 0])
+    }
+    /// Takes the process's pending signals `number`, which stay with the
+    /// thread group while blocked.
+    fn taken(k: &Kernel, number: i32) -> Vec<signals::PendingSignal> {
+        std::iter::from_fn(|| k.group.take_process_signal(1 << (number - 1))).collect()
+    }
+    #[test]
+    fn an_async_pipe_sends_its_owner_the_setsig_signal() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(syscall(&mut k, &mut t, &m, 293, [DATA, 0, 0, 0, 0, 0]), 0);
+        let fds = m.read_u64(GuestAddr(DATA)).unwrap();
+        let (reader, writer) = (fds & 0xffff_ffff, fds >> 32);
+        // Blocked, the signals stay pending to be looked at.
+        t.state.signal_mask = 1 << 39;
+        assert_eq!(fcntl(&mut k, &mut t, &m, reader, 8, 1), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, reader, 10, 40), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, reader, 4, O_ASYNC), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, reader, 3, 0) & O_ASYNC, O_ASYNC);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [writer, DATA + 64, 1, 0, 0, 0]),
+            1
+        );
+        let info: Vec<_> = taken(&k, 40).iter().filter_map(|s| s.queued).collect();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0][8..12], 1i32.to_le_bytes(), "POLL_IN");
+        assert_eq!(info[0][16..24], 0x41i64.to_le_bytes(), "band");
+        assert_eq!(info[0][24..28], (reader as i32).to_le_bytes(), "fd");
+        // The last writer's close tells the reader too.
+        assert_eq!(syscall(&mut k, &mut t, &m, 3, [writer, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(taken(&k, 40).len(), 1);
+        // Without O_ASYNC nothing more comes.
+        assert_eq!(fcntl(&mut k, &mut t, &m, reader, 4, 0), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 0, [reader, DATA + 64, 1, 0, 0, 0]),
+            1
+        );
+        assert!(taken(&k, 40).is_empty());
+    }
+    #[test]
+    fn any_file_keeps_an_owner_but_only_pipes_and_sockets_keep_o_async() {
+        let (mut k, mut t, m) = setup();
+        let event = syscall(&mut k, &mut t, &m, 290, [0; 6]);
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 4, O_ASYNC), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 3, 0) & O_ASYNC, 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 8, 1), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 9, 0), 1);
+        // A missing owner is ESRCH and keeps the one there was.
+        assert_eq!(
+            fcntl(&mut k, &mut t, &m, event, 8, 999_999),
+            Errno(3).to_syscall_return()
+        );
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 9, 0), 1);
+        // F_SETOWN_EX with F_OWNER_TID, read back by F_GETOWN_EX.
+        m.write(GuestAddr(DATA), &[0, 0, 0, 0, 1, 0, 0, 0]).unwrap();
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 15, DATA), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 16, DATA + 8), 0);
+        assert_eq!(m.read_u64(GuestAddr(DATA + 8)).unwrap(), 1 << 32);
+        m.write(GuestAddr(DATA), &[3, 0, 0, 0, 1, 0, 0, 0]).unwrap();
+        assert_eq!(
+            fcntl(&mut k, &mut t, &m, event, 15, DATA),
+            Errno::EINVAL.to_syscall_return()
+        );
+        assert_eq!(
+            fcntl(&mut k, &mut t, &m, event, 10, 65),
+            Errno::EINVAL.to_syscall_return()
+        );
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 10, 64), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 11, 0), 64);
+    }
+    #[test]
+    fn a_closed_stream_peer_hangs_up_with_sigio() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(syscall(&mut k, &mut t, &m, 53, [1, 1, 0, DATA, 0, 0]), 0);
+        let fds = m.read_u64(GuestAddr(DATA)).unwrap();
+        let (a, b) = (fds & 0xffff_ffff, fds >> 32);
+        t.state.signal_mask = 1 << 28;
+        assert_eq!(fcntl(&mut k, &mut t, &m, b, 8, 1), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, b, 4, O_ASYNC), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 3, [a, 0, 0, 0, 0, 0]), 0);
+        let io = taken(&k, 29);
+        assert_eq!(io.len(), 1);
+        assert_eq!(io[0].code, signals::SI_KERNEL);
+    }
+}

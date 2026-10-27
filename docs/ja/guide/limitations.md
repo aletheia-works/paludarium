@@ -40,10 +40,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   Linux は自分の `CONFIG_HZ` に丸めます。`SO_SNDBUF` と `SO_RCVBUF` は値を
   返しますが、組のバッファは変わりません。ゲストは root なので、`CAP_NET_ADMIN` の
   要るオプション（`SO_DEBUG`、`SO_SNDBUFFORCE` など）も設定でき、`SO_PEERCRED` の
-  uid と gid は 0 です。`fcntl` の `F_SETOWN` と `F_GETOWN` はソケットでだけ使え
-  （ほかのファイルでは `EINVAL`）、`SIGURG` を送るのは帯域外のバイトだけです
-  （`O_ASYNC` や `SIGIO` はありません）。`F_SETOWN_EX`、`F_GETOWN_EX`、`F_SETSIG` は
-  `EINVAL` です。
+  uid と gid は 0 です。
+- **シグナル駆動の入出力**：`O_ASYNC` が効くのはパイプとソケットだけで、標準入力や端末は
+  `SIGIO` を送りません。Linux では送ります。次の場合、送るシグナルが Linux と違います。
+  - **待っている読み手**：ソケットで読み手が待っているところにデータが来ても、シグナルを送ります。
+    Linux はそのときは送りません。
+  - **いっぱいのソケット**：バッファがいっぱいで送れなかったソケットには、読み込みで少しでも
+    空きができると送ります。Linux はバッファの 4 分の 3 が空くまで待ちます。
+  - **大きなストリームの書き込み**：ストリームへの書き込みは 1 回だけ送ります。Linux は
+    およそ 32 KiB を超える書き込みを分け、分けた部分ごとに送ります。
+  - **待つパイプの書き込み**：2 回以上待つパイプの書き込みは、最初に待つ前にだけ読む側へ送ります。
+    Linux は待つたびに、その前に送ります。
 - **名前空間**：名前空間のフラグ（`CLONE_NEWNS`、`CLONE_NEWUTS`、`CLONE_NEWIPC`、
   `CLONE_NEWUSER`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWCGROUP`、`clone3` では
   `CLONE_NEWTIME` も）を付けた `clone` と `clone3` は、子を作らずに `EINVAL` で失敗します。

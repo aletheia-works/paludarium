@@ -43,10 +43,20 @@ verified.
   `SO_SNDBUF` and `SO_RCVBUF` are reported but leave the pair's buffer as it
   is. The guest is root, so the options that need `CAP_NET_ADMIN`
   (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
-  gid 0. `fcntl`'s `F_SETOWN` and `F_GETOWN` work only on sockets (`EINVAL`
-  on other files), only the out-of-band byte sends `SIGURG` (no `O_ASYNC`
-  or `SIGIO`), and `F_SETOWN_EX`, `F_GETOWN_EX` and `F_SETSIG` are
-  `EINVAL`.
+  gid 0.
+- **Signal-driven I/O**: `O_ASYNC` works on pipes and sockets only, so
+  standard input and terminals never send `SIGIO`, where Linux's do. The
+  signals differ from Linux's in these cases:
+  - **Waiting reader.** A socket that a reader is waiting on still signals
+    when data comes; Linux holds the signal back then.
+  - **Full socket.** A socket whose send found the buffer full signals as
+    soon as a read makes any room; Linux waits until three quarters of the
+    buffer is free.
+  - **Large stream write.** A stream write signals once; Linux sends one
+    signal for each part it splits a write of more than about 32 KiB into.
+  - **Pipe write that waits.** A pipe write that waits more than once
+    signals the reader before the first wait only; Linux signals before each
+    wait.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for

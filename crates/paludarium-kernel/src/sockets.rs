@@ -1,11 +1,12 @@
 //! AF_UNIX stream endpoints. Buffers and peer lifetime belong to the Kernel.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, PRI, ReadinessHub};
+use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 use paludarium_types::GuestAddr;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 // Per-stream flow-control window, not a per-guest memory/fd quota. Native
@@ -133,6 +134,7 @@ impl PipeEnd {
     pub(crate) fn pair(flags: u32, hub: Arc<ReadinessHub>) -> Result<[Arc<Self>; 2], Errno> {
         let [reader, writer] = SocketPairEnd::pair(1 | flags, hub)?;
         reader.pair.window.store(PIPE_DEFAULT, Ordering::SeqCst);
+        reader.pair.pipe.store(true, Ordering::SeqCst);
         reader.shutdown(1)?;
         writer.shutdown(0)?;
         let inode = reader.inode;
@@ -225,7 +227,7 @@ impl FileHandle for PipeEnd {
         Ok((mask, input, output))
     }
     fn flags(&self) -> u32 {
-        u32::from(!self.reader) | (self.endpoint.flags() & NONBLOCK)
+        u32::from(!self.reader) | (self.endpoint.flags() & (NONBLOCK | O_ASYNC))
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
         self.endpoint.set_flags(flags)
@@ -371,6 +373,32 @@ fn socket(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
         return Err(Errno(88));
     }
     Ok(file)
+}
+/// The socket end of a socket or a pipe, which keeps its owner and
+/// `O_ASYNC` itself.
+pub(crate) fn endpoint(file: &Arc<dyn FileHandle>) -> Option<&SocketPairEnd> {
+    let any = file.as_any()?;
+    any.downcast_ref::<SocketPairEnd>().or_else(|| {
+        any.downcast_ref::<PipeEnd>()
+            .map(|pipe| pipe.endpoint.as_ref())
+    })
+}
+/// Signals the other end of `file`, if it is a pipe, for `reason`.
+fn pipe_notify(file: &Arc<dyn FileHandle>, reason: Reason) {
+    if let Some(pipe) = file.as_any().and_then(|any| any.downcast_ref::<PipeEnd>()) {
+        let end = &pipe.endpoint;
+        end.notify(1 - end.side, reason);
+    }
+}
+/// The end of a read of a pipe, with or without data: its writer gets
+/// `POLL_OUT`, as Linux's `pipe_read` gives it.
+pub(crate) fn pipe_read_ended(file: &Arc<dyn FileHandle>) {
+    pipe_notify(file, Reason::Out);
+}
+/// A write of a pipe that found it full, once per call: its reader gets
+/// `POLL_IN` then too, as Linux's `pipe_write` gives it before a wait.
+pub(crate) fn pipe_write_blocked(file: &Arc<dyn FileHandle>) {
+    pipe_notify(file, Reason::In);
 }
 fn as_socket(file: &Arc<dyn FileHandle>) -> Result<&SocketPairEnd, Errno> {
     file.as_any()
@@ -676,7 +704,7 @@ fn send_bytes(
     // The byte sends the receiving end's owner SIGURG, as Linux's
     // `sk_send_sigurg`.
     let owner = socket.peer_owner();
-    if urgent != 0 && owner != 0 {
+    if urgent != 0 && owner.id != 0 {
         c.processes.send_urgent(owner);
     }
     Ok(sent + urgent)
@@ -1200,9 +1228,14 @@ struct Side {
     /// SOCK_DGRAM: a send found the peer closed, so this side has no peer
     /// any more (`ECONNREFUSED` once, then `ENOTCONN`).
     disconnected: bool,
-    /// `F_SETOWN`: the process (or, negative, the process group) that a
-    /// stream's out-of-band byte for this side sends SIGURG; 0 is none.
-    owner: i32,
+    /// `F_SETOWN` and `F_SETSIG`: who this end's `O_ASYNC` signals and a
+    /// stream's out-of-band byte for it (SIGURG) go to, and with what.
+    owner: FileOwner,
+    /// `O_ASYNC`: this end signals its owner when it changes.
+    registration: Option<Registration>,
+    /// A send found the buffer full, so the space a read frees signals this
+    /// end `POLL_OUT`, once, as Linux's `SOCKWQ_ASYNC_NOSPACE`.
+    no_space: bool,
 }
 struct Pair {
     sides: Mutex<[Side; 2]>,
@@ -1217,6 +1250,8 @@ struct Pair {
     /// How many unread bytes each direction holds: the socket send buffer,
     /// or a pipe's capacity (`F_SETPIPE_SZ`).
     window: AtomicUsize,
+    /// The pair is a pipe, whose `O_ASYNC` signals differ from a socket's.
+    pipe: AtomicBool,
 }
 impl Pair {
     fn messages(&self) -> bool {
@@ -1266,6 +1301,7 @@ impl SocketPairEnd {
             creator: AtomicU32::new(0),
             kind: kind & 0xf,
             window: AtomicUsize::new(SEND_WINDOW),
+            pipe: AtomicBool::new(false),
             sides: Mutex::new(std::array::from_fn(|_| Side {
                 output_epoch: 1,
                 ..Side::default()
@@ -1300,7 +1336,22 @@ impl SocketPairEnd {
             sides[self.side].write_shutdown = true;
             sides[1 - self.side].input_epoch = sides[1 - self.side].input_epoch.wrapping_add(1);
         }
+        // A stream or packet peer hangs up when both directions shut down in
+        // one call, and has data (its end) when only writing does, as Linux's
+        // `unix_shutdown`.
+        let reason = match how {
+            2 => Some(Reason::HangUp),
+            1 => Some(Reason::In),
+            _ => None,
+        };
+        let notice = reason
+            .filter(|_| self.pair.kind != SOCK_DGRAM && !self.is_pipe())
+            .and_then(|reason| Self::notice(&sides, 1 - self.side, reason));
+        drop(sides);
         self.pair.hub.changed();
+        if let Some(notice) = notice {
+            notice.send();
+        }
         Ok(())
     }
 }
@@ -1318,17 +1369,21 @@ impl SocketPairEnd {
         if buf.is_empty() && !message {
             return Ok(Received::default());
         }
-        if self.pair.messages() {
+        let result = if self.pair.messages() {
             self.read_message(buf, peek.is_some())
         } else {
             self.read_stream(buf, peek, false)
-        }
+        };
+        self.after_read(peek.is_some(), &result);
+        result
     }
     /// [`Self::receive`] in recvmsg or recvfrom that already read some of
     /// a stream (`MSG_WAITALL`): as Linux's `manage_oob` counts the whole
     /// call, it stops at the out-of-band mark rather than drop or pass it.
     fn receive_more(&self, buf: &mut [u8], peek: Option<usize>) -> Result<Received, Errno> {
-        self.read_stream(buf, peek, true)
+        let result = self.read_stream(buf, peek, true);
+        self.after_read(peek.is_some(), &result);
+        result
     }
     /// sendmsg's and sendto's `MSG_OOB`, EOPNOTSUPP: a datagram or packet
     /// socket refuses it `before` the address is checked, as Linux's
@@ -1371,17 +1426,16 @@ impl SocketPairEnd {
             .unwrap_or_else(PoisonError::into_inner)
             .out_of_band_inline
     }
-    /// `F_GETOWN`: who this end's out-of-band bytes send SIGURG.
-    pub(crate) fn owner(&self) -> i32 {
+    /// `F_GETOWN`: who this end's signals go to.
+    pub(crate) fn file_owner(&self) -> FileOwner {
         self.pair
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner)[self.side]
             .owner
     }
-    /// `F_SETOWN`: the process, or (negative) process group, that this end's
-    /// out-of-band bytes send SIGURG; 0 for none.
-    pub(crate) fn set_owner(&self, owner: i32) {
+    /// `F_SETOWN` and `F_SETSIG`.
+    pub(crate) fn set_file_owner(&self, owner: FileOwner) {
         self.pair
             .sides
             .lock()
@@ -1389,17 +1443,81 @@ impl SocketPairEnd {
             .owner = owner;
     }
     /// Who this end's out-of-band bytes reach (the peer's owner).
-    fn peer_owner(&self) -> i32 {
+    fn peer_owner(&self) -> FileOwner {
         self.pair
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner)[1 - self.side]
             .owner
     }
+    /// `F_SETFL` turning `O_ASYNC` on, with its registration, or off.
+    pub(crate) fn set_async(&self, registration: Option<Registration>) {
+        self.pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[self.side]
+            .registration = registration;
+    }
+    fn is_pipe(&self) -> bool {
+        self.pair.pipe.load(Ordering::SeqCst)
+    }
+    /// The signal side `side` owes for `reason`, if it is open with
+    /// `O_ASYNC`.
+    fn notice(sides: &[Side; 2], side: usize, reason: Reason) -> Option<Notice> {
+        let side = &sides[side];
+        let to = side.registration.clone().filter(|_| !side.closed)?;
+        Some(Notice {
+            to,
+            owner: side.owner,
+            reason,
+        })
+    }
+    /// Signals side `side` for `reason`, if it is open with `O_ASYNC`.
+    fn notify(&self, side: usize, reason: Reason) {
+        let sides = self
+            .pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let notice = Self::notice(&sides, side, reason);
+        drop(sides);
+        if let Some(notice) = notice {
+            notice.send();
+        }
+    }
+    /// After a socket read that took data (`peeked` leaves it): a send that
+    /// found no room can go on, which signals its end `POLL_OUT`, as
+    /// `unix_write_space` (a pipe's reads signal in [`pipe_read_ended`]).
+    fn after_read<T>(&self, peeked: bool, result: &Result<T, Errno>) {
+        if peeked || result.is_err() || self.is_pipe() {
+            return;
+        }
+        let peer = 1 - self.side;
+        let mut sides = self
+            .pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let room = sides[self.side].bytes.len() < self.pair.window();
+        if !(sides[peer].no_space && room) {
+            return;
+        }
+        sides[peer].no_space = false;
+        let notice = Self::notice(&sides, peer, Reason::Out);
+        drop(sides);
+        if let Some(notice) = notice {
+            notice.send();
+        }
+    }
     /// recvmsg's and recvfrom's `MSG_OOB` on a stream, as Linux's
     /// `unix_stream_recv_urg`: the out-of-band byte, which `peek` leaves,
     /// EINVAL when there is none.
     fn receive_out_of_band(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
+        let result = self.take_out_of_band(buf, peek);
+        self.after_read(peek, &result);
+        result
+    }
+    fn take_out_of_band(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
         // With SO_OOBINLINE the byte comes with the data, not on its own.
         if self.out_of_band_inline() {
             return Err(Errno::EINVAL);
@@ -1686,6 +1804,19 @@ impl Drop for SocketPairEnd {
             .unwrap_or_else(PoisonError::into_inner);
         sides[self.side].closed = true;
         sides[1 - self.side].input_epoch = sides[1 - self.side].input_epoch.wrapping_add(1);
+        // The last writer of a pipe gives its reader `POLL_IN`, its last
+        // reader the writer `POLL_OUT` (`pipe_release`); a stream or packet
+        // socket's peer hangs up (`unix_release_sock`).
+        let reason = if self.is_pipe() {
+            Some(if sides[self.side].write_shutdown {
+                Reason::Out
+            } else {
+                Reason::In
+            })
+        } else {
+            (self.pair.kind != SOCK_DGRAM).then_some(Reason::HangUp)
+        };
+        let notice = reason.and_then(|reason| Self::notice(&sides, 1 - self.side, reason));
         // Linux frees the receive queue with the socket, and closes the
         // descriptors in it. Closing one may end another socket, even this
         // pair's other end, so it happens after the lock is released.
@@ -1696,6 +1827,9 @@ impl Drop for SocketPairEnd {
             .collect();
         drop(sides);
         self.pair.hub.changed();
+        if let Some(notice) = notice {
+            notice.send();
+        }
         drop(passed);
     }
 }
@@ -1772,7 +1906,8 @@ impl FileHandle for SocketPairEnd {
         self.flags.load(Ordering::SeqCst)
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        self.flags.store(2 | flags & NONBLOCK, Ordering::SeqCst);
+        self.flags
+            .store(2 | flags & (NONBLOCK | O_ASYNC), Ordering::SeqCst);
         Ok(())
     }
 }
@@ -1781,6 +1916,25 @@ impl SocketPairEnd {
     /// left in it went nowhere (a stream write of no bytes passes nothing,
     /// as on Linux), and the caller closes it after the lock is released.
     pub(crate) fn send(&self, buf: &[u8], passed: &mut Passed) -> Result<usize, Errno> {
+        let result = self.send_data(buf, passed);
+        match result {
+            // The peer has data (a message may be empty), as Linux's
+            // `sk_data_ready` tells it.
+            Ok(count) if count != 0 || self.pair.messages() => {
+                self.notify(1 - self.side, Reason::In);
+            }
+            Err(e) if e == Errno::EAGAIN => {
+                self.pair
+                    .sides
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)[self.side]
+                    .no_space = true;
+            }
+            _ => {}
+        }
+        result
+    }
+    fn send_data(&self, buf: &[u8], passed: &mut Passed) -> Result<usize, Errno> {
         let mut sides = self
             .pair
             .sides
@@ -1889,6 +2043,16 @@ impl SocketPairEnd {
     /// data, as Linux's `queue_oob`: an earlier one still unread becomes
     /// data, and the descriptors not sent yet go with it.
     pub(crate) fn send_out_of_band(&self, byte: u8, passed: &mut Passed) -> Result<usize, Errno> {
+        let result = self.queue_out_of_band(byte, passed);
+        // An `F_SETSIG` signal for the urgent byte (SIGURG goes besides),
+        // then one for the data, as Linux's `queue_oob`.
+        if result.is_ok() {
+            self.notify(1 - self.side, Reason::Priority);
+            self.notify(1 - self.side, Reason::In);
+        }
+        result
+    }
+    fn queue_out_of_band(&self, byte: u8, passed: &mut Passed) -> Result<usize, Errno> {
         let mut sides = self
             .pair
             .sides

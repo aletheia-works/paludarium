@@ -1,7 +1,8 @@
 //! Emulated process registry; no lock spans Host waits or guest execution.
+use crate::fasync::{FileOwner, OwnerKind, Reason};
 use crate::{Kernel, Next, SignalInbox, Thread, ThreadGroup, ThreadState, signals};
 use paludarium_cpu::{CpuState, reg};
-use paludarium_host::{ClockId, WaitToken};
+use paludarium_host::{ClockId, FileHandle, WaitToken};
 use paludarium_loader::{LoadError, StartInfo};
 use paludarium_mmu::AddressSpace;
 use paludarium_types::{Errno, ExitStatus, GuestAddr};
@@ -106,6 +107,8 @@ pub struct Processes {
     /// so that a wait for a child wakes at once for these; another signal (a
     /// timer's, a thread's own) reaches it through the 10 ms poll.
     changed: WaitToken,
+    /// The owners of the open files that are neither pipes nor sockets.
+    file_owners: Mutex<crate::fasync::Owners>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -117,6 +120,7 @@ impl Processes {
             next: AtomicU32::new(2),
             nr_open: AtomicU64::new(NR_OPEN),
             changed: WaitToken::default(),
+            file_owners: Mutex::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -792,35 +796,70 @@ impl Processes {
             last
         }
     }
-    /// The processes `owner`, as `F_SETOWN` takes it, names: a process (or
-    /// the process of one of its threads) or, negative, a process group.
-    fn owned_by(entries: &BTreeMap<u32, Entry>, owner: i32) -> Vec<u32> {
-        let id = owner.unsigned_abs();
+    /// The processes (and, for a thread owner, the thread) `owner` names:
+    /// a thread, a process (or the process of one of its threads), or a
+    /// process group.
+    fn owned_by(entries: &BTreeMap<u32, Entry>, owner: FileOwner) -> Vec<(u32, Option<u32>)> {
+        let id = owner.id;
         entries
             .iter()
-            .filter(|&(&pid, entry)| {
-                if owner > 0 {
-                    pid == id || entry.status.is_none() && entry.group.has_member(id)
-                } else {
-                    entry.pgid == id
+            .filter_map(|(&pid, entry)| {
+                let member = entry.status.is_none() && entry.group.has_member(id);
+                match owner.kind {
+                    OwnerKind::Thread => member.then_some((pid, Some(id))),
+                    OwnerKind::Process => (pid == id || member).then_some((pid, None)),
+                    OwnerKind::Group => (entry.pgid == id).then_some((pid, None)),
                 }
             })
-            .map(|(&pid, _)| pid)
             .collect()
     }
-    /// Whether `owner` names any process (ESRCH otherwise, as Linux's
+    /// Whether `owner` names anything (ESRCH otherwise, as Linux's
     /// `f_setown` finds the pid).
-    pub(crate) fn owner_exists(&self, owner: i32) -> bool {
+    pub(crate) fn owner_exists(&self, owner: FileOwner) -> bool {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         !Self::owned_by(&entries, owner).is_empty()
     }
+    fn send_owner(&self, owner: FileOwner, signal: signals::PendingSignal) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        for (pid, thread) in Self::owned_by(&entries, owner) {
+            let _ = self.send(&mut entries, pid, thread, signal);
+        }
+    }
     /// Sends SIGURG from the kernel to `owner`, as a socket's out-of-band
     /// byte does.
-    pub(crate) fn send_urgent(&self, owner: i32) {
-        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        for pid in Self::owned_by(&entries, owner) {
-            let _ = self.send(&mut entries, pid, None, Self::from_kernel(23));
+    pub(crate) fn send_urgent(&self, owner: FileOwner) {
+        self.send_owner(owner, Self::from_kernel(23));
+    }
+    /// Sends `owner` the signal of an `O_ASYNC` file, registered through
+    /// descriptor `fd`, as Linux's `send_sigio`: SIGIO from the kernel, or
+    /// with `F_SETSIG` that signal with `si_code`, `si_band` and `si_fd`. A
+    /// `Priority` change sends only the latter, SIGURG telling the rest.
+    pub(crate) fn send_io(&self, owner: FileOwner, fd: i32, reason: Reason) {
+        if owner.id == 0 {
+            return;
         }
+        let signal = match owner.signal {
+            0 if reason == Reason::Priority => return,
+            0 => Self::from_kernel(29),
+            number => signals::PendingSignal {
+                queued: Some(crate::fasync::siginfo(number, fd, reason)),
+                ..signals::PendingSignal::user(number, reason as i32)
+            },
+        };
+        self.send_owner(owner, signal);
+    }
+    /// The owner `F_SETOWN` gave `file`, which is not a pipe or a socket.
+    pub(crate) fn file_owner(&self, file: &Arc<dyn FileHandle>) -> FileOwner {
+        self.file_owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(file)
+    }
+    pub(crate) fn set_file_owner(&self, file: &Arc<dyn FileHandle>, owner: FileOwner) {
+        self.file_owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set(file, owner);
     }
     fn signal(&self, sender: u32, pid: u32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);

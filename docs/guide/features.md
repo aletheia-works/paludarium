@@ -151,9 +151,27 @@ kernel.
   drops the byte and reads on, or, with `SO_OOBINLINE`, reads it as data
   (`recv` with `MSG_OOB` is then `EINVAL`). The descriptors a one-byte
   out-of-band send passes are closed, not delivered. The byte sends `SIGURG`
-  to the receiving end's owner, which `fcntl`'s `F_SETOWN` sets to a process
-  or, negative, a process group (`ESRCH` when there is none), and
-  `F_GETOWN` gives back.
+  to the receiving end's owner (see signal-driven I/O below).
+- Signal-driven I/O, as on Linux. `fcntl`'s `F_SETOWN` gives any open file
+  an owner:
+  - a process or, negative, a process group;
+  - with `F_SETOWN_EX`, also a single thread.
+
+  `ESRCH` when the owner does not exist. `F_GETOWN` and `F_GETOWN_EX` read
+  it back, and `F_SETSIG` picks the signal. Only pipes and sockets keep
+  `O_ASYNC` (`F_SETFL` drops it on other files). With it, a pipe or socket
+  sends its owner `SIGIO` from the kernel. With `F_SETSIG`, it sends that
+  signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_PRI` or
+  `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set through as
+  `si_fd`.
+  - **Pipes.** Every write signals the reader as it ends, even one that
+    finds the pipe full, and also before it waits. Every read signals the
+    writer as it ends, with data or not. The close of either end signals
+    the other.
+  - **Sockets.** A send signals the peer. So does a write shutdown, and so
+    does the close of a stream or packet socket, which hangs up. A send that
+    found the buffer full signals once when a read makes room. An
+    out-of-band byte also sends a `POLL_PRI` signal.
 - `setsockopt` and `getsockopt` take the `SOL_SOCKET` options as Linux's
   `sk_setsockopt` and `sk_getsockopt` do, with their defaults and checks: an
   `int` value of fewer than 4 bytes is `EINVAL`, a value read back is cut to

@@ -15,6 +15,7 @@ pub use inbox::SignalInbox;
 mod devices;
 mod epoll;
 mod events;
+mod fasync;
 mod files;
 mod futex;
 mod memfd;

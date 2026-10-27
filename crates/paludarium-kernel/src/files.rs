@@ -1016,7 +1016,13 @@ fn read_blocking(
     file: &Arc<dyn FileHandle>,
     b: &mut [u8],
 ) -> Result<usize, Errno> {
-    wait_for_read(c, file, false, || file.read(b))
+    let result = wait_for_read(c, file, false, || file.read(b));
+    // A pipe read signals the writer as it ends, with data or not, unless a
+    // signal interrupts it, as Linux's `pipe_read`.
+    if !b.is_empty() && (result.is_ok() || result == Err(Errno::EAGAIN)) {
+        crate::sockets::pipe_read_ended(file);
+    }
+    result
 }
 /// Repeats `read` while it finds nothing yet (EAGAIN) and `file` blocks:
 /// neither `O_NONBLOCK` nor, with `dontwait`, `MSG_DONTWAIT`; a socket waits
@@ -1597,27 +1603,30 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     }
                 }
                 4 => {
-                    d.file.set_flags(a[2] as u32)?;
+                    // Only pipes and sockets keep O_ASYNC, and setting it
+                    // registers the descriptor, as Linux's `fasync` does.
+                    let endpoint = crate::sockets::endpoint(&d.file);
+                    let async_flag = crate::fasync::O_ASYNC;
+                    let mut flags = a[2] as u32;
+                    if endpoint.is_none() {
+                        flags &= !async_flag;
+                    }
+                    let before = d.file.flags();
+                    d.file.set_flags(flags)?;
+                    if let Some(endpoint) = endpoint
+                        && (before ^ flags) & async_flag != 0
+                    {
+                        endpoint.set_async((flags & async_flag != 0).then(|| {
+                            crate::fasync::Registration {
+                                processes: Arc::downgrade(c.processes),
+                                fd: a[0] as i32,
+                            }
+                        }));
+                    }
                     Ok(0)
                 }
-                // F_SETOWN and F_GETOWN, for sockets only: the owner a
-                // stream's out-of-band byte sends SIGURG.
-                8 | 9 => {
-                    let socket = d
-                        .file
-                        .as_any()
-                        .and_then(|any| any.downcast_ref::<crate::sockets::SocketPairEnd>())
-                        .ok_or(Errno::EINVAL)?;
-                    if a[1] == 9 {
-                        return Ok(i64::from(socket.owner()).cast_unsigned());
-                    }
-                    let owner = a[2] as i32;
-                    if owner != 0 && !c.processes.owner_exists(owner) {
-                        return Err(Errno(3));
-                    }
-                    socket.set_owner(owner);
-                    Ok(0)
-                }
+                // The owner and signal of signal-driven I/O.
+                8..=11 | 15 | 16 => crate::fasync::fcntl(c, &d.file, a[1], a[2]),
                 _ => Err(Errno::EINVAL),
             }
         }
@@ -1952,10 +1961,16 @@ pub(crate) fn write_with(
     // A socket waits no longer than its SO_SNDTIMEO.
     let wait = crate::sockets::deadline(c, file, false)?;
     let mut done = 0;
+    let mut blocked = false;
     loop {
         let ticket = c.files.readiness.token.value();
         let nonblocking = dontwait || file.flags() & crate::events::NONBLOCK != 0;
-        match write(&bytes[done..]) {
+        let result = write(&bytes[done..]);
+        if !blocked && result.is_err_and(|e| e == Errno::EAGAIN) {
+            blocked = true;
+            crate::sockets::pipe_write_blocked(file);
+        }
+        match result {
             Ok(count) => {
                 done += count;
                 if count == 0 || done == bytes.len() || nonblocking || !stream {

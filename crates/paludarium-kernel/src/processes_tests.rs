@@ -2006,4 +2006,186 @@ mod signal_driven_io {
         assert_eq!(io.len(), 1);
         assert_eq!(io[0].code, signals::SI_KERNEL);
     }
+    /// A socket pair of `kind` with end `b` owned by process 1 with signal
+    /// 40 (blocked) and O_ASYNC on both ends.
+    fn async_pair(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, kind: u64) -> (u64, u64) {
+        assert_eq!(syscall(k, t, m, 53, [1, kind, 0, DATA, 0, 0]), 0);
+        let fds = m.read_u64(GuestAddr(DATA)).unwrap();
+        let (a, b) = (fds & 0xffff_ffff, fds >> 32);
+        t.state.signal_mask = 1 << 39 | 1 << 28 | 1 << 22;
+        for fd in [a, b] {
+            assert_eq!(fcntl(k, t, m, fd, 8, 1), 0);
+            assert_eq!(fcntl(k, t, m, fd, 10, 40), 0);
+            let flags = fcntl(k, t, m, fd, 3, 0);
+            assert_eq!(fcntl(k, t, m, fd, 4, flags | O_ASYNC), 0);
+        }
+        (a, b)
+    }
+    /// The `si_code` and `si_fd` of each taken signal 40, oldest first.
+    fn codes(k: &Kernel) -> Vec<(i32, i32)> {
+        taken(k, 40)
+            .iter()
+            .filter_map(|signal| signal.queued)
+            .map(|info| {
+                let word = |at: usize| i32::from_le_bytes(info[at..at + 4].try_into().unwrap());
+                (word(8), word(24))
+            })
+            .collect()
+    }
+    #[test]
+    fn an_out_of_band_byte_sends_pollpri_then_pollin_and_sigurg() {
+        let (mut k, mut t, m) = setup();
+        let (a, b) = async_pair(&mut k, &mut t, &m, 1);
+        m.write(GuestAddr(DATA + 64), b"z").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 44, [a, DATA + 64, 1, 1, 0, 0]),
+            1
+        );
+        let b = b as i32;
+        assert_eq!(codes(&k), [(5, b), (1, b)]);
+        assert_eq!(taken(&k, 23).len(), 1);
+        // Without F_SETSIG, SIGURG stands for POLL_PRI and SIGIO for the data.
+        assert_eq!(fcntl(&mut k, &mut t, &m, b as u64, 10, 0), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 44, [a, DATA + 64, 1, 1, 0, 0]),
+            1
+        );
+        assert!(codes(&k).is_empty());
+        assert_eq!(taken(&k, 23).len(), 1);
+        assert_eq!(taken(&k, 29).len(), 1);
+    }
+    #[test]
+    fn a_full_socket_signals_its_writer_once_room_comes() {
+        let (mut k, mut t, m) = setup();
+        let (a, b) = async_pair(&mut k, &mut t, &m, 1 | 0o4000);
+        let full = loop {
+            let sent = syscall(&mut k, &mut t, &m, 1, [a, DATA, 4096, 0, 0, 0]);
+            if sent == Errno::EAGAIN.to_syscall_return() {
+                break sent;
+            }
+        };
+        assert_eq!(full, Errno::EAGAIN.to_syscall_return());
+        // Every send told the reader; the writer has had nothing yet.
+        assert!(
+            codes(&k)
+                .iter()
+                .all(|&(code, fd)| (code, fd) == (1, b as i32))
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 0, [b, DATA, 4096, 0, 0, 0]),
+            4096
+        );
+        assert_eq!(codes(&k), [(2, a as i32)]);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 0, [b, DATA, 4096, 0, 0, 0]),
+            4096
+        );
+        assert!(codes(&k).is_empty());
+    }
+    #[test]
+    fn shutdowns_signal_a_stream_peer_but_not_a_datagram_one() {
+        let (mut k, mut t, m) = setup();
+        let (a, b) = async_pair(&mut k, &mut t, &m, 1);
+        assert_eq!(syscall(&mut k, &mut t, &m, 48, [a, 0, 0, 0, 0, 0]), 0);
+        assert!(codes(&k).is_empty());
+        assert_eq!(syscall(&mut k, &mut t, &m, 48, [a, 1, 0, 0, 0, 0]), 0);
+        assert_eq!(codes(&k), [(1, b as i32)]);
+        assert_eq!(syscall(&mut k, &mut t, &m, 48, [b, 2, 0, 0, 0, 0]), 0);
+        assert_eq!(codes(&k), [(6, a as i32)]);
+        let (c, d) = async_pair(&mut k, &mut t, &m, 2);
+        assert_eq!(syscall(&mut k, &mut t, &m, 48, [c, 2, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 3, [c, 0, 0, 0, 0, 0]), 0);
+        assert!(codes(&k).is_empty());
+        // A send to the closed peer is refused and signals nothing.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 44, [d, DATA, 0, 0, 0, 0]),
+            Errno(111).to_syscall_return()
+        );
+        assert!(codes(&k).is_empty());
+    }
+    #[test]
+    fn a_pipe_that_finds_nothing_or_no_room_still_signals() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 293, [DATA, 0o4000, 0, 0, 0, 0]),
+            0
+        );
+        let fds = m.read_u64(GuestAddr(DATA)).unwrap();
+        let (reader, writer) = (fds & 0xffff_ffff, fds >> 32);
+        t.state.signal_mask = 1 << 39;
+        for fd in [reader, writer] {
+            assert_eq!(fcntl(&mut k, &mut t, &m, fd, 8, 1), 0);
+            assert_eq!(fcntl(&mut k, &mut t, &m, fd, 10, 40), 0);
+            assert_eq!(fcntl(&mut k, &mut t, &m, fd, 4, O_ASYNC | 0o4000), 0);
+        }
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 0, [reader, DATA, 1, 0, 0, 0]),
+            Errno::EAGAIN.to_syscall_return()
+        );
+        assert_eq!(codes(&k), [(2, writer as i32)]);
+        // An empty read signals nothing.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 0, [reader, DATA, 0, 0, 0, 0]),
+            0
+        );
+        assert!(codes(&k).is_empty());
+        while syscall(&mut k, &mut t, &m, 1, [writer, DATA, 4096, 0, 0, 0]) == 4096 {}
+        assert!(codes(&k).iter().all(|&code| code == (1, reader as i32)));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [writer, DATA, 1, 0, 0, 0]),
+            Errno::EAGAIN.to_syscall_return()
+        );
+        assert_eq!(codes(&k), [(1, reader as i32)]);
+        // The last reader's close tells the writer.
+        assert_eq!(syscall(&mut k, &mut t, &m, 3, [reader, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(codes(&k), [(2, writer as i32)]);
+    }
+    #[test]
+    fn a_thread_owner_gets_a_signal_directed_at_it() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(syscall(&mut k, &mut t, &m, 293, [DATA, 0, 0, 0, 0, 0]), 0);
+        let fds = m.read_u64(GuestAddr(DATA)).unwrap();
+        let (reader, writer) = (fds & 0xffff_ffff, fds >> 32);
+        t.state.signal_mask = 1 << 39;
+        m.write(GuestAddr(DATA + 16), &[0, 0, 0, 0, 1, 0, 0, 0])
+            .unwrap();
+        assert_eq!(fcntl(&mut k, &mut t, &m, reader, 15, DATA + 16), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, reader, 9, 0), 1);
+        assert_eq!(fcntl(&mut k, &mut t, &m, reader, 10, 40), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, reader, 4, O_ASYNC), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [writer, DATA, 1, 0, 0, 0]),
+            1
+        );
+        let directed: Vec<_> = t.state.pending.iter().filter(|s| s.number == 40).collect();
+        assert_eq!(directed.len(), 1);
+        assert_eq!(directed[0].target, signals::PendingTarget::Thread);
+        assert!(taken(&k, 40).is_empty());
+    }
+    #[test]
+    fn owner_errors_and_a_group_owner_read_back_as_linux_gives_them() {
+        let (mut k, mut t, m) = setup();
+        let event = syscall(&mut k, &mut t, &m, 290, [0; 6]);
+        let fault = Errno::EFAULT.to_syscall_return();
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 15, 8), fault);
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 16, 8), fault);
+        assert_eq!(
+            fcntl(&mut k, &mut t, &m, event, 8, i32::MIN as u32 as u64),
+            Errno::EINVAL.to_syscall_return()
+        );
+        m.write(GuestAddr(DATA), &[1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff])
+            .unwrap();
+        assert_eq!(
+            fcntl(&mut k, &mut t, &m, event, 15, DATA),
+            Errno(3).to_syscall_return()
+        );
+        // The first process leads group 1, which F_SETOWN names negative.
+        assert_eq!(
+            fcntl(&mut k, &mut t, &m, event, 8, (-1i32) as u32 as u64),
+            0
+        );
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 9, 0) as i64, -1);
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 16, DATA + 8), 0);
+        assert_eq!(m.read_u64(GuestAddr(DATA + 8)).unwrap(), 1 << 32 | 2);
+    }
 }

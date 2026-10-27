@@ -215,3 +215,28 @@ impl Owners {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn owners_drop_the_files_closed_since() {
+        let mut owners = Owners::default();
+        let file = || -> Arc<dyn FileHandle> {
+            let [reader, _] = crate::sockets::PipeEnd::pair(0, Arc::default()).unwrap();
+            reader
+        };
+        let first = file();
+        let owner = FileOwner {
+            kind: OwnerKind::Process,
+            id: 7,
+            signal: 0,
+        };
+        owners.set(&first, owner);
+        assert_eq!(owners.get(&first), owner);
+        drop(first);
+        let other = file();
+        assert_eq!(owners.get(&other), FileOwner::default());
+        assert!(owners.0.is_empty());
+    }
+}

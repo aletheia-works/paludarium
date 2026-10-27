@@ -3209,10 +3209,23 @@ int main(int argc, char **argv) {
         action.sa_handler = interrupted;
         action.sa_flags = !strcmp(mode, "wait-restart") ? SA_RESTART : 0;
         sigaction(SIGUSR1, &action, NULL);
+        /* The child signals only once the parent is about to wait, and
+           exits well after, so that the signal finds the parent waiting
+           however slowly either runs. */
+        int ready[2];
+        if (pipe(ready)) return 79;
         pid_t pid = child();
         if (pid < 0) return 78;
-        if (!pid) { usleep(100000); kill(parent, SIGUSR1); usleep(100000); _exit(5); }
+        if (!pid) {
+            char b;
+            if (read(ready[0], &b, 1) != 1) _exit(6);
+            usleep(100000);
+            kill(parent, SIGUSR1);
+            usleep(500000);
+            _exit(5);
+        }
         int status = 0;
+        if (write(ready[1], "r", 1) != 1) return 77;
         errno = 0;
         pid_t waited = waitpid(pid, &status, 0);
         int error = errno;

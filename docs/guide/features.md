@@ -141,9 +141,15 @@ kernel.
   mappings show; a store past the end of the file stays out of it. Such a
   mapping may write, and become writable with `mprotect`, only when the file
   is open for reading and writing (`EACCES` otherwise), as Linux has it.
+- A page of a file mapping, private or shared, wholly past the end of the
+  file raises `SIGBUS` (`BUS_ADRERR`, with the address) when it is touched,
+  as on Linux; a system call given such memory fails with `EFAULT`. The end
+  follows the file: a page past it becomes readable when the file grows, and
+  a page read before raises `SIGBUS` once the file shrinks past it. A page
+  the file only partly covers reads zeros after its end.
 - `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
-  as zeros, and those of a file mapping read the file again, as it is then
-  (zeros past its end), as Linux faults them in from the file; this holds
+  as zeros, and those of a file mapping read the file again, as it is then,
+  as Linux faults them in from the file; this holds
   after `mremap` moves the mapping and in a `fork`ed child. The program's own
   segments are laid out as Linux lays them out: the pages that hold file
   data are a file mapping, and a writable one (`.data`) reads the executable
@@ -154,8 +160,8 @@ kernel.
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`
   and `MREMAP_DONTUNMAP` work too. Shared memory stays shared with a `fork`ed
-  process when it moves. A file mapping cannot grow (`ENOMEM`), as the rest
-  of the file is not read in, and moving a range that spans
+  process when it moves. A file mapping grows over more of the file, whose
+  pages it reads when they are first touched, and moving a range that spans
   several mappings with `MREMAP_FIXED`, which recent Linux allows, gives
   `EFAULT`.
 - `msync` checks its arguments and the range, and with `MS_SYNC` or

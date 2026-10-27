@@ -270,6 +270,16 @@ fn guest_exceptions_end_the_process_with_signals() {
         Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
     );
     assert_eq!(
+        handle(ExitReason::BusError {
+            rip,
+            addr: GuestAddr(0x5000),
+            write: true,
+            fetch: false,
+            present: true
+        }),
+        Next::Exit(ExitStatus::Signaled(signal::SIGBUS))
+    );
+    assert_eq!(
         handle(ExitReason::InvalidOpcode {
             rip,
             bytes: InstructionBytes::new(&[0x0f, 0x0b])
@@ -1393,6 +1403,30 @@ fn memory_file_shared_mapping_shows_the_file() {
     assert_eq!(f.ret(11, &[at, 8192]), 0);
     assert_eq!(f.ret(11, &[other, 4096]), 0);
     assert_eq!(file_bytes(&mut f, fd, 0, 8), b"qE\0z");
+}
+#[test]
+fn file_mappings_end_where_their_file_does() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0hello").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(1, &[fd, DATA + 6, 5]), 5);
+    let mut b = [0];
+    for flags in [1, 2] {
+        // A page wholly past the end is a bus error; the size the file's
+        // handles give is the one that counts.
+        let at = f.ret(syscalls::nr::MMAP, &[0, 2 * 4096, 3, flags, fd, 0]);
+        assert_eq!(memory_bytes(&f, at, 6), b"hello\0");
+        assert!(f.mem.read(GuestAddr(at + 4096), &mut b).unwrap_err().bus);
+        assert_eq!(f.ret(77, &[fd, 4097]), 0);
+        assert_eq!(memory_bytes(&f, at + 4096, 1), [0]);
+        // Grown with mremap, the mapping reads the file further on.
+        assert_eq!(f.ret(18, &[fd, DATA + 6, 5, 2 * 4096]), 5);
+        let grown = f.ret(syscalls::nr::MREMAP, &[at, 2 * 4096, 3 * 4096, 1, 0]);
+        assert_eq!(memory_bytes(&f, grown + 2 * 4096, 5), b"hello");
+        assert_eq!(f.ret(77, &[fd, 5]), 0);
+        assert!(f.mem.read(GuestAddr(grown + 4096), &mut b).unwrap_err().bus);
+        assert_eq!(f.ret(11, &[grown, 3 * 4096]), 0);
+    }
 }
 #[test]
 fn memory_file_shared_mapping_needs_a_writable_file() {

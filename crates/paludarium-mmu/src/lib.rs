@@ -106,7 +106,7 @@ impl Mapping {
 }
 
 /// A failed guest memory access: the faulting address and whether it was a
-/// write. Becomes SIGSEGV for the guest.
+/// write. Becomes SIGSEGV for the guest, or SIGBUS when `bus` is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fault {
     pub addr: GuestAddr,
@@ -117,6 +117,9 @@ pub struct Fault {
     pub mapped: bool,
     /// The software page entry was resident and accessible in user mode.
     pub present: bool,
+    /// The page of a file mapping lies wholly past the end of its file,
+    /// where Linux raises SIGBUS.
+    pub bus: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -223,6 +226,8 @@ impl Drop for FrameBytes {
 struct Page {
     prot: Prot,
     frame: Frame,
+    /// The page belongs to a file mapping, which may end before it.
+    file: bool,
 }
 
 impl Page {
@@ -230,6 +235,7 @@ impl Page {
         Page {
             prot,
             frame: Arc::new(OnceLock::new()),
+            file: false,
         }
     }
 
@@ -290,6 +296,9 @@ pub struct SharedPages {
     generation: Arc<AtomicU64>,
     /// Held only to keep the owner alive.
     _owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// The file of a page cache, which a page without contents is read
+    /// from and whose end a mapping cannot reach past.
+    source: Option<Arc<dyn PageSource>>,
 }
 
 impl Default for SharedPages {
@@ -309,6 +318,7 @@ impl SharedPages {
             frames: Arc::new(Mutex::new(frames)),
             generation: Arc::default(),
             _owner: None,
+            source: None,
         }
     }
     /// The same memory, keeping `owner` alive while the clone lives.
@@ -316,6 +326,15 @@ impl SharedPages {
     pub fn with_owner(&self, owner: Arc<dyn std::any::Any + Send + Sync>) -> Self {
         SharedPages {
             _owner: Some(owner),
+            ..self.clone()
+        }
+    }
+    /// The same memory, read from `source` where a page has no contents and
+    /// ending where the file does.
+    #[must_use]
+    pub fn with_source(&self, source: Arc<dyn PageSource>) -> Self {
+        SharedPages {
+            source: Some(source),
             ..self.clone()
         }
     }
@@ -366,18 +385,12 @@ impl SharedPages {
         Ok(())
     }
     /// Stores `data` at offset `at` of the memory, as a write to the file
-    /// does to its page cache. Pages without a frame get one when they start
-    /// below `create_below` (the part some mapping may show) and are skipped
-    /// otherwise. The pages do not become dirty.
-    pub fn store(
-        &self,
-        at: u64,
-        data: &[u8],
-        create_below: u64,
-        meter: Option<&Arc<MemoryMeter>>,
-    ) -> Result<(), Errno> {
+    /// does to its page cache. Pages without contents are left alone: a
+    /// mapping reads them from the file when it first touches them. The pages
+    /// do not become dirty.
+    pub fn store(&self, at: u64, data: &[u8]) {
         if data.is_empty() {
-            return Ok(());
+            return;
         }
         self.generation.fetch_add(1, Ordering::Release);
         let mut done = 0;
@@ -386,23 +399,14 @@ impl SharedPages {
             let key = offset - offset % PAGE_SIZE;
             let within = page_offset(offset);
             let piece = (PAGE_BYTES - within).min(data.len() - done);
-            let frame = {
-                let mut frames = self.lock();
-                if key < create_below {
-                    Some(frames.entry(key).or_default().clone())
-                } else {
-                    frames.get(&key).cloned()
-                }
-            };
-            if let Some(frame) = frame {
-                let bytes = allocated(&frame, meter).ok_or(Errno::ENOMEM)?;
+            let frame = self.lock().get(&key).cloned();
+            if let Some(bytes) = frame.as_ref().and_then(|frame| frame.get()) {
                 for (d, s) in bytes[within..].iter().zip(&data[done..done + piece]) {
                     d.store(*s, Ordering::Relaxed);
                 }
             }
             done += piece;
         }
-        Ok(())
     }
     /// Zeros `[start, end)` of the memory, as truncating or punching a hole
     /// in the file does to its page cache. The pages do not become dirty.
@@ -469,6 +473,11 @@ pub trait PageSource: Send + Sync {
     /// Reads from `offset`, filling `buf` unless the file ends first, and
     /// returns how much it read.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno>;
+    /// The file's size now: a page of a file mapping wholly past it raises
+    /// SIGBUS. `None` puts no end to the mapping.
+    fn size(&self) -> Option<u64> {
+        None
+    }
 }
 /// The file behind `[start, end)` of a private file mapping: the page at
 /// `page` holds the file from `page + shift` (wrapping), so that a move by
@@ -720,6 +729,62 @@ impl AddressSpaceData {
         Page {
             prot,
             frame: frame.unwrap_or_default(),
+            file: self
+                .mapping_at(page)
+                .is_some_and(|m| m.kind == MappingKind::File),
+        }
+    }
+    /// The file and the offset in it of the file mapping page at `page`.
+    fn file_at(&self, page: u64) -> Option<(&Arc<dyn PageSource>, u64)> {
+        match self.shared_at(page) {
+            Some(shared) => shared
+                .pages
+                .source
+                .as_ref()
+                .map(|source| (source, page.wrapping_add(shared.shift))),
+            None => self
+                .backing_at(page)
+                .map(|backing| (&backing.source, page.wrapping_add(backing.shift))),
+        }
+    }
+    /// Whether the file mapping page at `page` lies wholly past the end of
+    /// its file.
+    fn past_file_end(&self, page: u64) -> bool {
+        self.file_at(page).is_some_and(|(source, offset)| {
+            source
+                .size()
+                .is_some_and(|size| offset >= size.div_ceil(PAGE_SIZE) * PAGE_SIZE)
+        })
+    }
+    /// Reads its file into the new file mapping page `entry` at `page`, which
+    /// has no contents yet: one past the end of the file when the mapping
+    /// was made, or one `mremap` added. What lies past the end stays zero.
+    fn fill_from_file(&self, page: u64, entry: &Page) {
+        if !entry.file || entry.frame.get().is_some() {
+            return;
+        }
+        let Some((source, offset)) = self.file_at(page) else {
+            return;
+        };
+        let mut buf = vec![0; PAGE_BYTES];
+        let Ok(n @ 1..) = source.read_at(offset, &mut buf) else {
+            return;
+        };
+        let bytes = FrameBytes::new(self.meter.as_ref(), || {
+            buf[..n.min(PAGE_BYTES)]
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(0))
+                .take(PAGE_BYTES)
+                .map(AtomicU8::new)
+                .collect()
+        });
+        match bytes {
+            // A racing fill of a shared frame may set it first.
+            Some(bytes) => {
+                let _ = entry.frame.set(bytes);
+            }
+            None => self.out_of_memory.store(true, Ordering::SeqCst),
         }
     }
     fn fork(&self) -> Result<Self, Errno> {
@@ -741,9 +806,11 @@ impl AddressSpaceData {
                         Page {
                             prot: page.prot,
                             frame: page.frame.clone(),
+                            file: page.file,
                         }
                     } else {
-                        let new = Page::new(page.prot);
+                        let mut new = Page::new(page.prot);
+                        new.file = page.file;
                         if let Some(frame) = page.frame.get() {
                             let bytes = FrameBytes::new(self.meter.as_ref(), || {
                                 frame
@@ -825,6 +892,7 @@ impl AddressSpaceData {
             mapped: self.mapping_at(at).is_some(),
             present: lookup(directory, at).is_some()
                 && self.prot_at(directory, at) != Some(Prot::NONE),
+            bus: false,
         };
         let wide = u64::try_from(len).map_err(|_| fault(addr.0))?;
         addr.0.checked_add(wide).ok_or(fault(addr.0))?;
@@ -836,6 +904,19 @@ impl AddressSpaceData {
             match self.prot_at(directory, page) {
                 Some(prot) if access.permitted(prot) => {}
                 _ => return Err(fault(at)),
+            }
+            let file = lookup(directory, page).map_or_else(
+                || {
+                    self.mapping_at(page)
+                        .is_some_and(|m| m.kind == MappingKind::File)
+                },
+                |p| p.file,
+            );
+            if file && self.past_file_end(page) {
+                return Err(Fault {
+                    bus: true,
+                    ..fault(at)
+                });
             }
         }
         Ok(())
@@ -853,7 +934,9 @@ impl AddressSpaceData {
                 let (dir, slot) = page_index(page);
                 let table = directory.entry(dir).or_insert_with(PageTable::new);
                 if let Some(entry) = table.pages.get_mut(slot) {
-                    *entry = Some(self.page(page, prot));
+                    let new = self.page(page, prot);
+                    self.fill_from_file(page, &new);
+                    *entry = Some(new);
                 }
             }
         }
@@ -892,6 +975,7 @@ impl AddressSpaceData {
                         fetch: false,
                         mapped: true,
                         present: false,
+                        bus: false,
                     });
                 };
                 for (s, d) in buf[range].iter().zip(&frame[offset..]) {
@@ -932,12 +1016,15 @@ impl AddressSpaceData {
                     fetch: false,
                     mapped: false,
                     present: false,
+                    bus: false,
                 });
             };
             let (dir, slot) = page_index(page);
             let table = directory.entry(dir).or_insert_with(PageTable::new);
             if let Some(entry) = table.pages.get_mut(slot) {
-                *entry = Some(self.page(page, prot));
+                let new = self.page(page, prot);
+                self.fill_from_file(page, &new);
+                *entry = Some(new);
             }
         }
         self.store(&directory, addr, buf)
@@ -1201,6 +1288,7 @@ impl AddressSpaceData {
                     entry.as_ref().map(|p| Page {
                         prot: p.prot,
                         frame: p.frame.clone(),
+                        file: p.file,
                     })
                 } else {
                     entry.take()
@@ -1301,7 +1389,7 @@ impl AddressSpaceData {
         {
             return Err(Errno::EINVAL);
         }
-        let mapping = *self.mapping_at(addr.0).ok_or(Errno::EFAULT)?;
+        self.mapping_at(addr.0).ok_or(Errno::EFAULT)?;
         if new_addr.is_none() && new_len <= old_len {
             if new_len < old_len {
                 self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
@@ -1317,9 +1405,6 @@ impl AddressSpaceData {
         let (_, region_end) = self.region_at(addr.0).ok_or(Errno::EFAULT)?;
         if kept > region_end - addr.0 {
             return Err(Errno::EFAULT);
-        }
-        if new_len > old_len && mapping.kind == MappingKind::File {
-            return Err(Errno::ENOMEM);
         }
         let old_end = addr.0 + old_len;
         if let Some(hint) = new_addr {
@@ -1356,6 +1441,12 @@ impl AddressSpaceData {
                 },
             );
             if let Some((_, entry)) = self.shared.range_mut(..old_end).next_back()
+                && entry.end == old_end
+            {
+                entry.end = new_end;
+            }
+            // A grown file mapping reads the file further on.
+            if let Some((_, entry)) = self.backing.range_mut(..old_end).next_back()
                 && entry.end == old_end
             {
                 entry.end = new_end;
@@ -2022,7 +2113,8 @@ mod tests {
                 write: false,
                 fetch: false,
                 mapped: false,
-                present: false
+                present: false,
+                bus: false,
             }
         );
         let err = space.write(GuestAddr(0x5000), &buf).unwrap_err();
@@ -2033,7 +2125,8 @@ mod tests {
                 write: true,
                 fetch: false,
                 mapped: false,
-                present: false
+                present: false,
+                bus: false,
             }
         );
         // Addresses beyond the user range and overflowing ranges fault too.
@@ -2233,6 +2326,80 @@ mod tests {
             }
             Ok(n)
         }
+    }
+
+    /// A file whose size can change, each byte its offset modulo 251.
+    struct Resizable(Arc<AtomicU64>);
+    impl PageSource for Resizable {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+            Pattern(self.0.load(Ordering::SeqCst)).read_at(offset, buf)
+        }
+        fn size(&self) -> Option<u64> {
+            Some(self.0.load(Ordering::SeqCst))
+        }
+    }
+    fn pattern(offset: u64) -> u8 {
+        (offset % 251) as u8
+    }
+
+    #[test]
+    fn a_file_mapping_ends_with_its_file_and_reads_it_on_first_touch() {
+        let size = Arc::new(AtomicU64::new(PAGE_SIZE + 10));
+        let file: Arc<dyn PageSource> = Arc::new(Resizable(Arc::clone(&size)));
+        let private = AddressSpace::new();
+        let at = private
+            .map_shared(None, 3 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        private
+            .back_with_file(at, 3 * PAGE_SIZE, Arc::clone(&file), 0)
+            .unwrap();
+        let shared = AddressSpace::new();
+        let pages = SharedPages::new().with_source(Arc::clone(&file));
+        let other = shared
+            .map_shared(None, 3 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        shared
+            .share_pages(other, 3 * PAGE_SIZE, &pages, 0, true)
+            .unwrap();
+        let mut b = [0];
+        for (space, at) in [(&private, at), (&shared, other)] {
+            size.store(PAGE_SIZE + 10, Ordering::SeqCst);
+            // Untouched pages are read from the file, the last one in part.
+            assert_eq!(byte(space, at.0 + 7), 7);
+            assert_eq!(byte(space, at.0 + PAGE_SIZE + 9), pattern(PAGE_SIZE + 9));
+            assert_eq!(byte(space, at.0 + PAGE_SIZE + 10), 0);
+            // A page wholly past the end is a bus error, also for a write.
+            let past = GuestAddr(at.0 + 2 * PAGE_SIZE);
+            let fault = space.read(past, &mut b).unwrap_err();
+            assert!(fault.bus && fault.mapped && !fault.write);
+            assert!(space.write(past, b"x").unwrap_err().bus);
+            // Grown, the file shows there; shrunk, even a page read before
+            // is past the end.
+            size.store(3 * PAGE_SIZE, Ordering::SeqCst);
+            assert_eq!(byte(space, past.0 + 1), pattern(2 * PAGE_SIZE + 1));
+            size.store(PAGE_SIZE, Ordering::SeqCst);
+            assert!(
+                space
+                    .read(GuestAddr(at.0 + PAGE_SIZE), &mut b)
+                    .unwrap_err()
+                    .bus
+            );
+            assert_eq!(byte(space, at.0 + 7), 7);
+            // A mapping that mremap grows reads the file further on.
+            size.store(4 * PAGE_SIZE, Ordering::SeqCst);
+            let grown = space
+                .remap_shared(at, 3 * PAGE_SIZE, 4 * PAGE_SIZE, MOVE)
+                .unwrap();
+            assert_eq!(
+                byte(space, grown.0 + 3 * PAGE_SIZE + 2),
+                pattern(3 * PAGE_SIZE + 2)
+            );
+        }
+        // Anonymous memory has no end.
+        let anonymous = private
+            .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        assert_eq!(byte(&private, anonymous.0), 0);
     }
 
     #[test]
@@ -2492,16 +2659,16 @@ mod tests {
         assert_eq!(taken, [(0x3000, b"fIle".to_vec())]);
         pages.write_back(|_, _| panic!("nothing is dirty")).unwrap();
         // A store to the file reaches the frames, and so does a zeroing.
-        pages.store(0x3002, b"LE", u64::MAX, None).unwrap();
+        pages.store(0x3002, b"LE");
         assert_eq!(byte(&child, at.0 + PAGE_SIZE + 3), b'E');
         pages.zero(0x3003, u64::MAX);
         assert_eq!(byte(&child, at.0 + PAGE_SIZE + 3), 0);
         assert_eq!(byte(&child, at.0 + PAGE_SIZE + 2), b'L');
-        // Without a frame, a page is made only below the limit given.
-        pages.store(0x8000, b"x", 0x8000, None).unwrap();
+        // A page without contents is left for the file to fill.
+        pages.store(0x8000, b"x");
         assert!(!pages.contains(0x8000));
-        pages.store(0x2000, b"y", 0x3000, None).unwrap();
-        assert_eq!(byte(&space, at.0), b'y');
+        pages.store(0x2000, b"y");
+        assert_eq!(byte(&space, at.0), 0);
         // A failed write-back leaves the page dirty.
         space.write(at, b"z").unwrap();
         assert_eq!(pages.write_back(|_, _| Err(Errno::EIO)), Err(Errno::EIO));
@@ -2547,7 +2714,7 @@ mod tests {
     }
 
     #[test]
-    fn remap_does_not_grow_a_file_copy_and_covers_finds_holes() {
+    fn remap_grows_a_file_mapping_and_covers_finds_holes() {
         let space = AddressSpace::new();
         space
             .map_shared(
@@ -2559,7 +2726,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             space.remap_shared(GuestAddr(0x10000), 4096, 8192, MOVE),
-            Err(Errno::ENOMEM)
+            Ok(GuestAddr(0x10000))
+        );
+        assert!(
+            space
+                .remap_shared(GuestAddr(0x10000), 8192, 4096, MOVE)
+                .is_ok()
         );
         assert!(
             space

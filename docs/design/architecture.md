@@ -69,7 +69,7 @@ Types keep them apart:
 | Kind | Type | Goes to |
 |---|---|---|
 | A failed system call | `Errno` | the guest, as an errno |
-| A guest exception | `ExitReason` | a signal to the guest (`SIGSEGV`, `SIGILL`, `SIGFPE`, …) |
+| A guest exception | `ExitReason` | a signal to the guest (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, …) |
 | A problem of the emulator itself | `Error` | a stop, with the instruction address, bytes and system call number |
 
 A guest's exit (`ExitStatus`) is never mixed with an emulator error.

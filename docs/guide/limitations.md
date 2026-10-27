@@ -10,17 +10,20 @@ verified.
 - **Network**: `socket()` always returns `EAFNOSUPPORT`; only AF_UNIX
   `socketpair` (`SOCK_STREAM`, `SOCK_SEQPACKET` or `SOCK_DGRAM`) is
   available.
-- **File mappings**: a `MAP_PRIVATE` mapping is a copy made when the
-  mapping is made, so it does not see later changes to the file, where Linux
-  shows them in the pages the mapping has not written yet. A `MAP_SHARED`
+- **File mappings**: a `MAP_PRIVATE` mapping copies the pages the file has
+  when the mapping is made, so they do not show later changes to the file,
+  where Linux shows them in the pages the mapping has not written yet; such a
+  copy also stays when the file shrinks past it and grows again, where Linux
+  reads the file again. A `MAP_SHARED`
   mapping shows the file's page cache as on Linux, but its stores reach the
   file on the host only when the guest reads the file, `stat`s it or calls
   `msync` or `fsync`, or the file's last mapping goes away (Linux writes them
   back in its own time), and a change another host program makes to the file
   does not reach the mapping. On a Windows host, the stores of a shared
   mapping made through a descriptor open with `O_APPEND` do not reach the
-  file. A page wholly past the end of the file reads as zeros instead of
-  raising `SIGBUS`, also after `MADV_DONTNEED`.
+  file. The end of a mapped file, past which a page raises `SIGBUS`, is the
+  size the guest's own file operations give it, so a host program changing
+  the size does not move it.
 - **`MADV_DONTNEED` on a read-only ELF segment**: the program's writable
   segments read the executable again, as on Linux, but a read-only one (its
   code) keeps its contents. It differs only if `mprotect` made it writable

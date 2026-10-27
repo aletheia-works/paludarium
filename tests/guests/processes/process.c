@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <poll.h>
+#include <setjmp.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -51,6 +52,27 @@ static pid_t child(void) { return syscall(SYS_fork); }
 /* The return value of a call and its errno. */
 static void outcome(const char *name, long value) {
     printf("%s=%ld errno=%d\n", name, value, value < 0 ? errno : 0);
+}
+/* Touching a page that may lie past the end of its mapped file. */
+static sigjmp_buf bus_return;
+static volatile int bus_code;
+static volatile uintptr_t bus_addr;
+static void on_bus(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    (void)context;
+    bus_code = info->si_code;
+    bus_addr = (uintptr_t)info->si_addr;
+    siglongjmp(bus_return, 1);
+}
+/* What touching `at` does: its byte, or the SIGBUS code and address. */
+static void touch(const char *name, volatile char *at, int write) {
+    if (sigsetjmp(bus_return, 1)) {
+        printf("%s: sigbus code=%d at=%d\n", name, bus_code, bus_addr == (uintptr_t)at);
+        return;
+    }
+    if (write)
+        *at = 'w';
+    printf("%s: byte=%d\n", name, *at);
 }
 static long send_to(int socket, const char *data, size_t len, int flags, const void *address, long address_len) {
     errno = 0;
@@ -755,6 +777,59 @@ int main(int argc, char **argv) {
         printf("sealed-write=%d errno=%d\n", refused != MAP_FAILED, errno);
         close(memfd);
         close(read_only);
+        close(fd);
+        unlink(path);
+        return 0;
+    }
+    if (!strcmp(mode, "file-mapping-end")) {
+        /* A page of a file mapping wholly past the end of the file raises
+           SIGBUS with BUS_ADRERR, for shared and private mappings alike;
+           the end moves with the file, and mremap grows a mapping over
+           more of the file. */
+        struct sigaction action = {0};
+        action.sa_sigaction = on_bus;
+        action.sa_flags = SA_SIGINFO;
+        sigaction(SIGBUS, &action, NULL);
+        const char *path = "/tmp/paludarium-processes-file-mapping-end";
+        unlink(path);
+        int fd = open(path, O_CREAT|O_RDWR|O_TRUNC, 0600);
+        int pipe_fds[2];
+        pipe(pipe_fds);
+        char data[100];
+        memset(data, 'd', sizeof data);
+        write(fd, data, sizeof data);
+        const char *kinds[] = {"shared", "private"};
+        for (int k = 0; k < 2; k++) {
+            ftruncate(fd, 100);
+            char *map = mmap(NULL, 3 * 4096, PROT_READ|PROT_WRITE, k ? MAP_PRIVATE : MAP_SHARED, fd, 0);
+            printf("%s: mapped=%d\n", kinds[k], map != MAP_FAILED);
+            touch("in-file", map + 50, 0);
+            touch("last-page", map + 200, 0);
+            touch("past-read", map + 4096, 0);
+            touch("past-write", map + 2 * 4096 + 7, 1);
+            errno = 0;
+            long wrote = write(pipe_fds[1], map + 4096, 1);
+            printf("past-syscall=%ld errno=%d\n", wrote, errno);
+            /* The file grows: the page reads it now. */
+            ftruncate(fd, 5000);
+            pwrite(fd, "grow", 4, 4200);
+            touch("grown-zero", map + 4096 + 10, 0);
+            touch("grown-data", map + 4200, 0);
+            /* It shrinks: even a page read before is past the end. */
+            ftruncate(fd, 100);
+            touch("shrunk", map + 4096 + 10, 0);
+            touch("kept", map + 50, 0);
+            /* mremap grows the mapping over more of the file. */
+            ftruncate(fd, 3 * 4096 + 1);
+            pwrite(fd, "far", 3, 3 * 4096);
+            char *grown = mremap(map, 3 * 4096, 5 * 4096, MREMAP_MAYMOVE);
+            printf("remapped=%d\n", grown != MAP_FAILED);
+            touch("remap-data", grown + 3 * 4096, 0);
+            touch("remap-past", grown + 4 * 4096, 0);
+            munmap(grown, 5 * 4096);
+        }
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
         close(fd);
         unlink(path);
         return 0;

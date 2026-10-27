@@ -44,7 +44,8 @@ fn failed_cmpxchg_requires_write_permission() {
             write: true,
             fetch: false,
             mapped: true,
-            present: true
+            present: true,
+            bus: false,
         })
     );
     assert_eq!(m.read_u64(GuestAddr(0x10000)).unwrap(), 7);
@@ -60,7 +61,8 @@ fn cross_page_fault_has_no_partial_write() {
             write: true,
             fetch: false,
             mapped: false,
-            present: false
+            present: false,
+            bus: false,
         })
     );
     let mut b = [0; 4];

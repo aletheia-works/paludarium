@@ -259,6 +259,24 @@ pub fn describe_stop(reason: &ExitReason) -> Option<String> {
             addr.0,
             rip.0
         ),
+        ExitReason::BusError {
+            rip,
+            addr,
+            write,
+            fetch,
+            ..
+        } => format!(
+            "{} address {:#x}, past the end of its mapped file, at {:#x}",
+            if fetch {
+                "instruction fetch from"
+            } else if write {
+                "write to"
+            } else {
+                "read of"
+            },
+            addr.0,
+            rip.0
+        ),
         ExitReason::Halt { rip } => format!("privileged instruction at {:#x}", rip.0),
         ExitReason::GeneralProtection { rip } => {
             format!("general-protection fault at {:#x}", rip.0)
@@ -559,6 +577,16 @@ mod tests {
                     present: false,
                 },
                 "instruction fetch from an unmapped address 0x3000 at 0x10",
+            ),
+            (
+                ExitReason::BusError {
+                    rip,
+                    addr: GuestAddr(0x4000),
+                    write: false,
+                    fetch: false,
+                    present: true,
+                },
+                "read of address 0x4000, past the end of its mapped file, at 0x10",
             ),
         ] {
             assert_eq!(describe_stop(&reason).as_deref(), Some(text));

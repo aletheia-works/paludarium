@@ -1266,16 +1266,16 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 let _ = c.mem.unmap_shared(a, len);
                 return err(error);
             }
-            // A private mapping remembers its file, which MADV_DONTNEED reads
-            // its pages from again.
+            // A private mapping remembers its file, which MADV_DONTNEED and
+            // the pages it has not copied yet read, and whose end it cannot
+            // reach past.
             if let Some(file) = &file
+                && let Some(d) = &descriptor
                 && flags & MAP_SHARED == 0
-                && let Err(error) = c.mem.back_with_file(
-                    a,
-                    len,
-                    std::sync::Arc::new(FilePages(file.clone())),
-                    offset,
-                )
+                && let Err(error) = file_cache(c, d, file).and_then(|cache| {
+                    let source = crate::page_cache::FilePages::new(file, &cache);
+                    c.mem.back_with_file(a, len, source, offset)
+                })
             {
                 let _ = c.mem.unmap_shared(a, len);
                 return err(error);
@@ -1355,23 +1355,23 @@ fn share_file(
         return Err(Errno::EPERM);
     }
     let may_write = file.flags() & 3 == 2 && !write_sealed(file.as_ref());
-    let key = (crate::files::descriptor_device(c, d), file.stat()?.inode);
-    let cache = c.files.caches.cache(key, c.mem.memory_meter());
-    let pages = cache.map(file, offset, len, may_write)?;
+    let pages = file_cache(c, d, file)?.map(file, offset, len, may_write)?;
     c.mem.share_pages(at, len, &pages, offset, may_write)
+}
+/// The page cache of the file `d` holds, which keeps its size.
+fn file_cache(
+    c: &Context<'_>,
+    d: &crate::files::Descriptor,
+    file: &std::sync::Arc<dyn FileHandle>,
+) -> Result<std::sync::Arc<crate::page_cache::FileCache>, Errno> {
+    let stat = file.stat()?;
+    let key = (crate::files::descriptor_device(c, d), stat.inode);
+    Ok(c.files.caches.cache(key, c.mem.memory_meter(), stat.size))
 }
 fn is_zero_device(file: &dyn FileHandle) -> bool {
     file.as_any()
         .and_then(|v| v.downcast_ref::<crate::devices::Device>())
         .is_some_and(|d| d.kind() == crate::devices::Kind::Zero)
-}
-
-/// A mapped file as the MMU reads it again ([`paludarium_mmu::PageSource`]).
-struct FilePages(std::sync::Arc<dyn FileHandle>);
-impl paludarium_mmu::PageSource for FilePages {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
-        self.0.read_at(offset, buf)
-    }
 }
 
 /// Fills a new file mapping with the file from `offset`; the part of the

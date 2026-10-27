@@ -62,7 +62,7 @@ paludarium は、役割ごとに分けた crate でできています。依存�
 | 種類 | 型 | 行き先 |
 |---|---|---|
 | システムコールの失敗 | `Errno` | ゲストに errno として返す |
-| ゲストの例外 | `ExitReason` | ゲストへのシグナル（`SIGSEGV`、`SIGILL`、`SIGFPE` など） |
+| ゲストの例外 | `ExitReason` | ゲストへのシグナル（`SIGSEGV`、`SIGBUS`、`SIGILL`、`SIGFPE` など） |
 | エミュレータ自身の問題 | `Error` | 命令のアドレス・バイト列・システムコールの番号を添えて止まる |
 
 ゲストの終了（`ExitStatus`）とエミュレータのエラーは混ぜません。

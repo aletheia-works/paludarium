@@ -34,11 +34,13 @@ pub(crate) struct PageCaches {
 }
 
 impl PageCaches {
-    /// The cache of `key`, made now if the file has none.
+    /// The cache of `key`, made now, with the file's `size`, if the file has
+    /// none.
     pub(crate) fn cache(
         self: &Arc<Self>,
         key: Key,
         meter: Option<Arc<MemoryMeter>>,
+        size: u64,
     ) -> Arc<FileCache> {
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(cache) = files.get(&key).and_then(Weak::upgrade) {
@@ -49,7 +51,7 @@ impl PageCaches {
         let cache = Arc::new(FileCache {
             pages: SharedPages::new(),
             writer: Mutex::new(None),
-            extent: AtomicU64::new(0),
+            size: AtomicU64::new(size),
             writable: AtomicUsize::new(0),
             clean: AtomicU64::new(0),
             meter,
@@ -101,9 +103,9 @@ pub(crate) struct FileCache {
     pages: SharedPages,
     /// A handle open for writing, from the first mapping that may write.
     writer: Mutex<Option<Arc<dyn FileHandle>>>,
-    /// The end of the furthest mapping: a write to the file below it makes
-    /// the pages it reaches, which a mapping may show.
-    extent: AtomicU64,
+    /// The file's size, kept by its handles: a mapping cannot reach a page
+    /// wholly past it (SIGBUS).
+    size: AtomicU64,
     /// The mappings that may write, which `F_SEAL_WRITE` refuses to seal.
     writable: AtomicUsize,
     /// The pages' generation when they were last written back: a store
@@ -168,16 +170,16 @@ impl FileCache {
             }
             key += PAGE_SIZE;
         }
-        self.extent.fetch_max(end, Ordering::SeqCst);
         if may_write {
             let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
             writer.get_or_insert_with(|| Arc::clone(file));
             self.writable.fetch_add(1, Ordering::SeqCst);
         }
-        Ok(self.pages.with_owner(Arc::new(Mapped {
+        let mapped = self.pages.with_owner(Arc::new(Mapped {
             cache: Arc::clone(self),
             writable: may_write,
-        })))
+        }));
+        Ok(mapped.with_source(FilePages::new(file, self)))
     }
     /// Whether a mapping that may write shows the cache.
     pub(crate) fn mapped_writable(&self) -> bool {
@@ -202,13 +204,45 @@ impl FileCache {
         Ok(wrote)
     }
     /// The file got `data` at `offset`.
-    fn wrote(&self, offset: u64, data: &[u8]) -> Result<(), Errno> {
-        let extent = self.extent.load(Ordering::SeqCst);
-        self.pages.store(offset, data, extent, self.meter.as_ref())
+    fn wrote(&self, offset: u64, data: &[u8]) {
+        self.size
+            .fetch_max(offset.saturating_add(data.len() as u64), Ordering::SeqCst);
+        self.pages.store(offset, data);
+    }
+    /// The file went from `old` bytes to `size`: what lay past the end reads
+    /// as zeros if it grows again.
+    fn resized(&self, old: u64, size: u64) {
+        self.size.store(size, Ordering::SeqCst);
+        self.pages.zero(old.min(size), u64::MAX);
     }
     /// The bytes from `start` to `end` read as zeros now.
     fn zeroed(&self, start: u64, end: u64) {
         self.pages.zero(start, end);
+    }
+}
+
+/// A mapped file as the MMU reads it ([`paludarium_mmu::PageSource`]), with
+/// the size its page cache keeps.
+pub(crate) struct FilePages {
+    file: Arc<dyn FileHandle>,
+    cache: Arc<FileCache>,
+}
+
+impl FilePages {
+    pub(crate) fn new(file: &Arc<dyn FileHandle>, cache: &Arc<FileCache>) -> Arc<Self> {
+        Arc::new(FilePages {
+            file: Arc::clone(file),
+            cache: Arc::clone(cache),
+        })
+    }
+}
+
+impl paludarium_mmu::PageSource for FilePages {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        self.file.read_at(offset, buf)
+    }
+    fn size(&self) -> Option<u64> {
+        Some(self.cache.size.load(Ordering::SeqCst))
     }
 }
 
@@ -307,7 +341,7 @@ impl FileHandle for CoherentFile {
         if let Some(cache) = self.cache() {
             // The write ended at the position, wherever it started.
             let end = self.inner.seek(0, 1)?;
-            cache.wrote(end - n as u64, &buf[..n])?;
+            cache.wrote(end - n as u64, &buf[..n]);
         }
         Ok(n)
     }
@@ -324,8 +358,7 @@ impl FileHandle for CoherentFile {
         };
         let old = self.inner.stat()?.size;
         self.inner.truncate(size)?;
-        // What lay past the end reads as zeros if the file grows again.
-        cache.zeroed(old.min(size), u64::MAX);
+        cache.resized(old, size);
         Ok(())
     }
     fn flock(&self, op: u32) -> Result<(), Errno> {
@@ -365,7 +398,7 @@ impl FileHandle for CoherentFile {
             } else {
                 offset
             };
-            cache.wrote(at, &buf[..n])?;
+            cache.wrote(at, &buf[..n]);
         }
         Ok(n)
     }
@@ -415,7 +448,7 @@ impl HostFs for CoherentFs {
         if flags & O_TRUNC != 0
             && let Some(cache) = file.cache()
         {
-            cache.zeroed(0, u64::MAX);
+            cache.resized(0, 0);
         }
         Ok(Arc::new(file))
     }

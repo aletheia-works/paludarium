@@ -151,6 +151,7 @@ impl fmt::Display for Errno {
 /// Linux signal numbers used by the core emulator.
 pub mod signal {
     pub const SIGILL: i32 = 4;
+    pub const SIGBUS: i32 = 7;
     pub const SIGFPE: i32 = 8;
     pub const SIGKILL: i32 = 9;
     pub const SIGSEGV: i32 = 11;
@@ -224,6 +225,17 @@ pub enum ExitReason {
         /// Resident user page captured by the MMU when it faulted.
         present: bool,
     },
+    /// A memory access reached a page of a file mapping wholly past the end
+    /// of its file (SIGBUS, as on Linux).
+    BusError {
+        rip: GuestAddr,
+        addr: GuestAddr,
+        write: bool,
+        /// Instruction fetch rather than operand access.
+        fetch: bool,
+        /// Resident user page captured by the MMU when it faulted.
+        present: bool,
+    },
     /// The instruction could not be decoded or is not implemented (SIGILL).
     InvalidOpcode {
         rip: GuestAddr,
@@ -249,6 +261,7 @@ impl ExitReason {
         match *self {
             ExitReason::Syscall { rip }
             | ExitReason::PageFault { rip, .. }
+            | ExitReason::BusError { rip, .. }
             | ExitReason::InvalidOpcode { rip, .. }
             | ExitReason::Halt { rip }
             | ExitReason::GeneralProtection { rip }

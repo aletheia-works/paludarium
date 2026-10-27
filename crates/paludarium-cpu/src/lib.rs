@@ -115,19 +115,35 @@ impl DecodeCache {
     }
 }
 
+/// The stop for the MMU fault `f` at `rip`: a bus error past the end of a
+/// mapped file, else a page fault.
+fn memory_fault(rip: GuestAddr, f: paludarium_mmu::Fault, write: bool, fetch: bool) -> ExitReason {
+    if f.bus {
+        ExitReason::BusError {
+            rip,
+            addr: f.addr,
+            write,
+            fetch,
+            present: f.present,
+        }
+    } else {
+        ExitReason::PageFault {
+            rip,
+            addr: f.addr,
+            write,
+            fetch,
+            mapped: f.mapped,
+            present: f.present,
+        }
+    }
+}
+
 fn fetch_and_decode(state: &CpuState, mem: &AddressSpace) -> Result<Instruction, ExitReason> {
     let rip = state.rip;
     let mut bytes = [0u8; MAX_INSTRUCTION_LEN];
     let available = mem
         .fetch_partial(rip, &mut bytes)
-        .map_err(|f| ExitReason::PageFault {
-            rip,
-            addr: f.addr,
-            write: false,
-            fetch: true,
-            mapped: f.mapped,
-            present: f.present,
-        })?;
+        .map_err(|f| memory_fault(rip, f, false, true))?;
     let fetched = &bytes[..available];
     match decode(fetched, rip) {
         Ok(insn) => Ok(insn),
@@ -138,13 +154,16 @@ fn fetch_and_decode(state: &CpuState, mem: &AddressSpace) -> Result<Instruction,
                 .and_then(|n| rip.checked_add(n))
                 .unwrap_or(rip);
             let fault = mem.fetch(addr, &mut [0]).err();
-            Err(ExitReason::PageFault {
-                rip,
-                addr,
-                write: false,
-                fetch: true,
-                mapped: fault.is_some_and(|f| f.mapped),
-                present: fault.is_some_and(|f| f.present),
+            Err(match fault {
+                Some(f) => memory_fault(rip, paludarium_mmu::Fault { addr, ..f }, false, true),
+                None => ExitReason::PageFault {
+                    rip,
+                    addr,
+                    write: false,
+                    fetch: true,
+                    mapped: false,
+                    present: false,
+                },
             })
         }
         Err(_) => Err(ExitReason::InvalidOpcode {
@@ -210,14 +229,7 @@ fn execute_decoded(
         state.repeat_continuation = None;
     }
     result.map_err(|stop| match stop {
-        Stop::Fault(f) => ExitReason::PageFault {
-            rip,
-            addr: f.addr,
-            write: f.write,
-            fetch: f.fetch,
-            mapped: f.mapped,
-            present: f.present,
-        },
+        Stop::Fault(f) => memory_fault(rip, f, f.write, f.fetch),
         Stop::Invalid => ExitReason::InvalidOpcode {
             rip,
             bytes: instruction_bytes(mem, rip, insn.len),

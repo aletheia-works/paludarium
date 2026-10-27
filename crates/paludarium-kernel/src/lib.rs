@@ -542,6 +542,34 @@ impl Kernel {
                     born: signals::generation(),
                 })
             }
+            // Past the end of a mapped file: BUS_ADRERR, with the page
+            // fault's trap and error code, as Linux's do_sigbus sends it.
+            ExitReason::BusError {
+                rip,
+                addr,
+                write,
+                fetch,
+                present,
+            } => {
+                thread.cpu.rip = rip;
+                Some(signals::PendingSignal {
+                    target: signals::PendingTarget::Thread,
+                    number: signal::SIGBUS,
+                    code: 2,
+                    addr: addr.0,
+                    trap: 14,
+                    error: 4
+                        | (u64::from(write) * 2)
+                        | u64::from(present)
+                        | (u64::from(fetch) * 16),
+                    synchronous: true,
+                    timer: None,
+                    child: None,
+                    sender: None,
+                    queued: None,
+                    born: signals::generation(),
+                })
+            }
             ExitReason::FloatingPointFault { rip, code } => {
                 thread.cpu.rip = rip;
                 Some(signals::PendingSignal {

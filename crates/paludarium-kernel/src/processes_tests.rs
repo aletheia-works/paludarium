@@ -750,6 +750,26 @@ mod process {
         assert_eq!(syscall(&mut k, &mut t, &m, 61, [pid, DATA, 9, 0, 0, 0]), 0);
     }
     #[test]
+    fn child_changes_wake_the_waits_for_a_child() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let pid = u64::from(ct.tid);
+        let processes = k.processes();
+        let mut ticket = processes.changed().value();
+        // A stop, a continue and the exit each notify the waits.
+        for signal in [19, 18] {
+            syscall(&mut c, &mut ct, &cm, 62, [pid, signal, 0, 0, 0, 0]);
+            assert_ne!(processes.changed().value(), ticket, "signal {signal}");
+            ticket = processes.changed().value();
+        }
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_ne!(processes.changed().value(), ticket);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [pid, DATA, 0, 0, 0, 0]),
+            pid
+        );
+    }
+    #[test]
     fn racing_reapers() {
         let (mut k, mut t, m) = setup();
         let (mut c, ct, cm) = fork(&mut k, &mut t, &m);

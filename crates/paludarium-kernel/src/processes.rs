@@ -101,8 +101,9 @@ pub struct Processes {
     tasks: Arc<TaskCount>,
     /// The highest RLIMIT_NOFILE hard limit a process may set, as fs.nr_open.
     nr_open: AtomicU64,
-    /// Notified whenever a process exits, stops or continues, or lets its
-    /// vfork parent go, so that a wait for a child wakes at once.
+    /// Notified whenever a process exits, stops or continues, lets its vfork
+    /// parent go, or is sent a signal, so that a wait for a child wakes at
+    /// once, for the child or for a signal that interrupts it.
     changed: WaitToken,
 }
 impl Processes {
@@ -823,8 +824,9 @@ impl Processes {
         }
         self.send(&mut entries, tgid, Some(tid), signal)
     }
-    /// [`Self::deliver`] for a process's `kill` or queued signal: a SIGCONT,
-    /// which may resume a stopped process, wakes the waits for a child.
+    /// [`Self::deliver`] for a process's `kill` or queued signal, which wakes
+    /// the waits for a child: the signal may interrupt one, or, a SIGCONT,
+    /// resume a stopped child.
     fn send(
         &self,
         entries: &mut BTreeMap<u32, Entry>,
@@ -833,9 +835,7 @@ impl Processes {
         signal: signals::PendingSignal,
     ) -> Result<(), Errno> {
         let result = Self::deliver(entries, pid, thread, signal);
-        if signal.number == 18 {
-            self.changed.notify();
-        }
+        self.changed.notify();
         result
     }
     /// A signal the kernel sends itself (`SI_KERNEL`).
@@ -1026,9 +1026,9 @@ impl Kernel {
             self.wait_for_children(ticket)?;
         }
     }
-    /// Sleeps until a process changes after `ticket` was taken from
-    /// [`Processes::changed`], the thread's wake token is set (a signal), or
-    /// at most 10 ms pass, as the cancellation is polled; a host without
+    /// Sleeps until a process changes or is sent a signal after `ticket`
+    /// was taken from [`Processes::changed`], or at most 10 ms pass, as the
+    /// thread's wake token (any other signal) is polled; a host without
     /// tickets waits out the time.
     fn wait_for_children(&self, ticket: u32) -> Result<(), Errno> {
         let end = self

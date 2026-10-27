@@ -756,8 +756,9 @@ mod process {
         let pid = u64::from(ct.tid);
         let processes = k.processes();
         let mut ticket = processes.changed().value();
-        // A stop, a continue and the exit each notify the waits.
-        for signal in [19, 18] {
+        // A stop, a continue, any other signal sent with kill (which may
+        // interrupt a wait) and the exit each notify the waits.
+        for signal in [19, 18, 17] {
             syscall(&mut c, &mut ct, &cm, 62, [pid, signal, 0, 0, 0, 0]);
             assert_ne!(processes.changed().value(), ticket, "signal {signal}");
             ticket = processes.changed().value();

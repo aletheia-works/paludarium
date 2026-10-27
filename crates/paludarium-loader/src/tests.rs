@@ -124,7 +124,15 @@ fn madv_dontneed_reads_the_data_segment_again_and_zeroes_its_bss() {
         mem.check_private_anonymous(GuestAddr(0x403000), 0x1000),
         Err(Errno::EINVAL)
     );
-    // A read-only segment keeps what is in it.
+    // A read-only segment that mprotect made writable and that was written
+    // reads the executable again too.
+    mem.protect_shared(
+        GuestAddr(0x401000),
+        0x1000,
+        Prot::READ_WRITE.union(Prot::EXEC),
+    )
+    .unwrap();
+    mem.write(GuestAddr(0x401000), &[0x90, 0x90]).unwrap();
     mem.discard_shared(GuestAddr(0x401000), 0x1000).unwrap();
     let mut code = [0u8; 2];
     mem.fetch(GuestAddr(0x401000), &mut code).unwrap();

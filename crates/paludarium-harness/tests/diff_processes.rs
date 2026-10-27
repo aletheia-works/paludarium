@@ -158,6 +158,7 @@ mod linux {
         processes_shared_file_mapping => ("shared-file-mapping","process"),
         processes_file_mapping_end => ("file-mapping-end","process"),
         processes_private_file_mapping => ("private-file-mapping","process"),
+        processes_dontneed_read_only_segment => ("dontneed-read-only-segment","process"),
         processes_fork_copy_on_write => ("fork-copy-on-write","process"),
         processes_rlimit => ("rlimit","process"),
         processes_nofile_limit => ("nofile-limit","process"),

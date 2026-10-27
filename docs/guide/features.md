@@ -158,8 +158,9 @@ kernel.
   as Linux faults them in from the file; this holds
   after `mremap` moves the mapping and in a `fork`ed child. The program's own
   segments are laid out as Linux lays them out: the pages that hold file
-  data are a file mapping, and a writable one (`.data`) reads the executable
-  again, while the rest (`.bss`) is anonymous memory and reads as zeros.
+  data are a file mapping and read the executable again, also those of a
+  read-only segment (code) that `mprotect` made writable and that was
+  written, while the rest (`.bss`) is anonymous memory and reads as zeros.
   Shared memory keeps its own contents. `MADV_FREE` keeps the contents, as
   Linux does without memory pressure.
   The access-pattern hints are accepted and other advice gives `EINVAL`.

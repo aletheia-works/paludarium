@@ -20,10 +20,6 @@ verified.
   open with `O_APPEND` do not reach the file. The end of a mapped file, past
   which a page raises `SIGBUS`, is the size the guest's own file operations
   give it, so a host program changing the size does not move it.
-- **`MADV_DONTNEED` on a read-only ELF segment**: the program's writable
-  segments read the executable again, as on Linux, but a read-only one (its
-  code) keeps its contents. It differs only if `mprotect` made it writable
-  and it was changed, where Linux reads it from the executable again.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
 - **File owners**: a file in a mounted host directory stays root's, so

@@ -884,6 +884,21 @@ int main(int argc, char **argv) {
         unlink(path);
         return 0;
     }
+    if (!strcmp(mode, "dontneed-read-only-segment")) {
+        /* A page of a read-only segment that mprotect made writable and
+           that was written reads the executable again after MADV_DONTNEED,
+           as a private file mapping does. */
+        static const char text[] = "read-only segment";
+        volatile const char *at = text;
+        char *page = (char *)((uintptr_t)text & ~(uintptr_t)4095);
+        printf("before=%c%c%c%c\n", at[0], at[1], at[2], at[3]);
+        int protect = mprotect(page, 4096, PROT_READ|PROT_WRITE);
+        ((volatile char *)at)[0] = 'R';
+        printf("protect=%d written=%c%c%c%c\n", protect, at[0], at[1], at[2], at[3]);
+        int advice = madvise(page, 4096, MADV_DONTNEED);
+        printf("dontneed=%d again=%c%c%c%c\n", advice, at[0], at[1], at[2], at[3]);
+        return 0;
+    }
     if (!strcmp(mode, "private-file-mapping")) {
         /* A private file mapping shows the file's later changes in the
            pages it has not written, and its first write to a page copies

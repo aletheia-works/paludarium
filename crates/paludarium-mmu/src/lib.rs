@@ -1686,10 +1686,9 @@ impl AddressSpaceData {
     /// file mapping or an ELF segment read their file again
     /// ([`Self::back_with_file`]), as Linux faults them in from the file.
     /// Shared pages keep theirs, as their memory outlives the mapping, and so
-    /// do the ones without a recorded file (a read-only ELF segment), which
-    /// have nothing to read again. Applies the
-    /// mapped parts and returns `ENOMEM` when the range has a hole, as Linux
-    /// does.
+    /// do the ones without a recorded file, which have nothing to read
+    /// again. Applies the mapped parts and returns `ENOMEM` when the range
+    /// has a hole, as Linux does.
     pub fn discard(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
         let mut covered = addr.0;

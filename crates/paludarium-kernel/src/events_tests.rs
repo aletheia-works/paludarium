@@ -835,6 +835,12 @@ fn socket_timeouts_end_blocking_calls_with_eagain() {
     assert_eq!(set(&mut f, b, 20, 1, 234_567), 0);
     assert_eq!(get(&mut f, b, 20), (1, 235_000));
     assert_eq!(set(&mut f, b, 20, 0, 1_000_000), fail(33));
+    // Too long a timeout waits for ever, as MAX_SCHEDULE_TIMEOUT does.
+    let most = i64::MAX / 1000 - 1;
+    assert_eq!(set(&mut f, b, 20, most - 1, 0), 0);
+    assert_eq!(get(&mut f, b, 20), (most - 1, 0));
+    assert_eq!(set(&mut f, b, 20, most, 0), 0);
+    assert_eq!(get(&mut f, b, 20), (0, 0));
     // A blocking read waits no longer than the timeout, and so does a
     // write into a full buffer, which gives what it sent.
     assert_eq!(set(&mut f, b, 20, 0, 200_000), 0);

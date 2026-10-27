@@ -868,9 +868,12 @@ impl Timeout {
         if !(0..1_000_000).contains(&micros) {
             return Err(Errno(33));
         }
+        // MAX_SCHEDULE_TIMEOUT / HZ - 1: past it, Linux waits for ever.
+        let most = i64::MAX / HZ.cast_signed() - 1;
         Ok(match (seconds, micros) {
             (..0, _) => Timeout::Never,
             (0, 0) => Timeout::Forever,
+            (seconds, _) if seconds >= most => Timeout::Forever,
             _ => Timeout::Ticks(
                 seconds
                     .cast_unsigned()

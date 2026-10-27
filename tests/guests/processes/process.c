@@ -1785,10 +1785,23 @@ int main(int argc, char **argv) {
         if (write(p[1], "a", 1) != 1) return 78;
         io_taken("cleared");
         fcntl(p[0], F_SETSIG, IO_RT);
-        fcntl(p[0], F_SETOWN, -group);
         fcntl(p[0], F_SETFL, O_ASYNC);
-        if (write(p[1], "a", 1) != 1) return 78;
-        io_taken("group");
+        /* A group owner signals every process in the group, here only a
+           child in a group of its own, whose mask keeps the signal. */
+        fflush(stdout);
+        forked = child();
+        if (forked < 0) return 76;
+        if (!forked) {
+            setpgid(0, 0);
+            fcntl(p[0], F_SETOWN, -getpid());
+            if (write(p[1], "a", 1) != 1) _exit(1);
+            io_taken("group");
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(forked, &status, 0);
+        printf("  group-child=%d\n", status);
+        fcntl(p[0], F_SETOWN, pid);
         owner.type = F_OWNER_TID;
         owner.pid = tid;
         fcntl(p[0], F_SETOWN_EX, &owner);

@@ -122,7 +122,8 @@ fn prot_of(flags: u32) -> Prot {
 
 /// The file pages of a segment as the executable holds them, which
 /// `MADV_DONTNEED` reads the segment's pages from again: a part of the
-/// executable, which its segments share, or the segment's data alone.
+/// executable's loaded span ([`loaded_span`]), which its segments share, or
+/// the segment's data alone.
 enum SegmentImage {
     File(Arc<[u8]>, std::ops::Range<usize>),
     Data(Vec<u8>),
@@ -164,7 +165,7 @@ fn map_segments(
         0
     };
     let mut highest = 0u64;
-    let file: Arc<[u8]> = Arc::from(bytes);
+    let file = loaded_span(bytes, info);
     for h in info.loads() {
         let start = base
             .checked_add(h.vaddr)
@@ -225,11 +226,41 @@ fn map_segments(
     Ok((base, highest))
 }
 
+/// The part of the executable that its segments' file pages lie in, and its
+/// offset in the file: the segments keep it to read again, without the
+/// sections that no segment loads (symbols, debug information).
+fn loaded_span(bytes: &[u8], info: &ElfInfo) -> (Arc<[u8]>, usize) {
+    let page = PAGE_SIZE as usize;
+    let (from, end) = info
+        .loads()
+        .filter(|h| h.filesz != 0)
+        .filter_map(|h| {
+            let offset = usize::try_from(h.offset).ok()?;
+            let end = offset
+                .checked_add(usize::try_from(h.filesz).ok()?)?
+                .checked_next_multiple_of(page)?
+                .min(bytes.len());
+            Some((offset - offset % page, end))
+        })
+        .fold((usize::MAX, 0), |(from, end), (f, e)| {
+            (from.min(f), end.max(e))
+        });
+    match bytes.get(from..end) {
+        Some(span) => (Arc::from(span), from),
+        None => (Arc::from(&[][..]), 0),
+    }
+}
+
 /// What the file pages of a segment hold, from its first page: the file's own
 /// pages when the segment starts as far into its page as into the file
 /// (as `PT_LOAD` requires, and as Linux maps them, with what lies around the
 /// data), else the data alone at its place.
-fn file_pages(file: &Arc<[u8]>, h: &ProgramHeader, head: u64, data: &[u8]) -> SegmentImage {
+fn file_pages(
+    (span, at): &(Arc<[u8]>, usize),
+    h: &ProgramHeader,
+    head: u64,
+    data: &[u8],
+) -> SegmentImage {
     let head = usize::try_from(head).unwrap_or(0);
     // The file's pages, from the one the segment starts in to the one its
     // data ends in, cut at the end of the file.
@@ -241,11 +272,12 @@ fn file_pages(file: &Arc<[u8]>, h: &ProgramHeader, head: u64, data: &[u8]) -> Se
             let end = offset
                 .checked_add(data.len())?
                 .checked_next_multiple_of(PAGE_SIZE as usize)?
-                .min(file.len());
-            file.get(from..end).map(|_| from..end)
+                .min(at + span.len());
+            let range = from.checked_sub(*at)?..end.checked_sub(*at)?;
+            span.get(range.clone()).map(|_| range)
         });
     match own {
-        Some(range) => SegmentImage::File(Arc::clone(file), range),
+        Some(range) => SegmentImage::File(Arc::clone(span), range),
         None => {
             let mut pages = vec![0; head + data.len()];
             pages[head..].copy_from_slice(data);

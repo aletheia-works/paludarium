@@ -140,6 +140,21 @@ fn madv_dontneed_reads_the_data_segment_again_and_zeroes_its_bss() {
 }
 
 #[test]
+fn segments_keep_only_the_part_of_the_executable_they_load() {
+    let mut file = crate::testing::tiny_exec(&[0x90; 32], b"data");
+    let loaded = file.len();
+    // Sections that no segment loads, such as debug information, follow.
+    file.extend(std::iter::repeat_n(0xdb, 3 * PAGE_SIZE as usize));
+    let info = elf::parse(&file).unwrap();
+    let (span, at) = loaded_span(&file, &info);
+    // The span ends with the page that the last data ends in, as the file
+    // pages of a mapping do: the pages after it are left out.
+    assert!(!span.is_empty());
+    assert_eq!(at + span.len(), loaded.next_multiple_of(PAGE_SIZE as usize));
+    assert!(at + span.len() < file.len());
+}
+
+#[test]
 fn static_pie_is_placed_at_fixed_base() {
     let bytes = build_elf(
         elf::ET_DYN,

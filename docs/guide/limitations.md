@@ -29,6 +29,12 @@ verified.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` as Linux does, with these differences:
   - `SCM_CREDENTIALS` returns `EINVAL`.
+  - Linux splits a stream write of more than about 32 KiB into parts and
+    passes its descriptors with the first part, so a read ends at the end of
+    that part. Here it ends at the end of the whole write.
+  - A socket whose descriptor waits unread in a socket that only that
+    descriptor keeps open, such as its own, stays open: Linux's garbage
+    collector would close both.
 - **Socket options**: `setsockopt` refuses, with `ENOPROTOOPT`, the options
   whose effect is not modelled, where Linux takes them: `SO_PASSCRED`,
   `SO_PASSSEC`, `SO_RCVLOWAT`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_TIMESTAMP`
@@ -40,12 +46,6 @@ verified.
   on other files), only the out-of-band byte sends `SIGURG` (no `O_ASYNC`
   or `SIGIO`), and `F_SETOWN_EX`, `F_GETOWN_EX` and `F_SETSIG` are
   `EINVAL`.
-  - Linux splits a stream write of more than about 32 KiB into parts and
-    passes its descriptors with the first part, so a read ends at the end of
-    that part. Here it ends at the end of the whole write.
-  - A socket whose descriptor waits unread in a socket that only that
-    descriptor keeps open, such as its own, stays open: Linux's garbage
-    collector would close both.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for

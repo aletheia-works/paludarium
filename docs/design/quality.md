@@ -59,7 +59,9 @@ and, for now, three RustSec advisories against `zstd` 0.13.3 and `zstd-safe`
 7.3.0 (RUSTSEC-2026-0391, RUSTSEC-2026-0398 and RUSTSEC-2026-0403). aube gets
 those versions through `decmpfs`, which pins `zstd` exactly, so aube cannot
 update them. The advisory exceptions go once a `decmpfs` release takes `zstd`
-0.14 ([SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)).
+0.14 ([SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)):
+an exception that no crate matches fails the audit, so the aube bump that no
+longer needs them cannot merge until they are removed.
 `tests/guests/programs/evidence.py` lists every exception.
 
 ## Acceptance before a release

@@ -56,7 +56,9 @@ LeakSanitizer を付けて、それぞれ 600 秒動かします。夜間の CI 
 RUSTSEC-2026-0398、RUSTSEC-2026-0403）です。aube はこの版を、`zstd` を版まで固定している
 `decmpfs` から受け取るので、自分では上げられません。アドバイザリの例外は、`decmpfs` が
 `zstd` 0.14 にしたリリースを出したら外します
-（[SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)）。例外はすべて
+（[SocketDev/decmpfs#16](https://github.com/SocketDev/decmpfs/issues/16)）。どのクレートにも
+当たらなくなった例外は監査を失敗させるので、例外が要らなくなった aube の更新は、例外を
+外すまでマージされません。例外はすべて
 `tests/guests/programs/evidence.py` に並んでいます。
 
 ## 公開の前の受け入れの確かめ

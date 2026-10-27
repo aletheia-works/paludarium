@@ -34,11 +34,13 @@ LICENSE_SUFFIX = (
 
 
 def advisory_ignore(advisories):
+    """The ignore list of `advisories`. One that no crate matches any more
+    fails the audit, so that a guest bump cannot leave a stale exception."""
     entries = "".join(
         f'  {{ id = "{a["id"]}", reason = "{a["crate"]} through decmpfs (SocketDev/decmpfs#16)" }},\n'
         for a in advisories
     )
-    return f"ignore = [\n{entries}]\n".encode()
+    return f'unused-ignored-advisory = "deny"\nignore = [\n{entries}]\n'.encode()
 
 
 def guest_policy(root_bytes, exceptions, advisories):

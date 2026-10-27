@@ -53,6 +53,7 @@ class PolicyTests(unittest.TestCase):
     def test_suffix_is_parsed_as_the_exact_exceptions(self):
         config = tomllib.loads(policy(EMPTY).decode())
         self.assertEqual(config["licenses"]["exceptions"], LICENSE_EXCEPTIONS)
+        self.assertEqual(config["advisories"]["unused-ignored-advisory"], "deny")
         self.assertEqual(
             [entry["id"] for entry in config["advisories"]["ignore"]],
             [a["id"] for a in ADVISORY_EXCEPTIONS],

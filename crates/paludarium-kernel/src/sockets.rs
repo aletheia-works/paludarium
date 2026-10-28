@@ -418,8 +418,9 @@ fn as_socket(file: &Arc<dyn FileHandle>) -> Result<&SocketPairEnd, Errno> {
 /// `SCM_RIGHTS` and `SCM_CREDENTIALS` (EINVAL). `SCM_RIGHTS` passes at most
 /// 253 descriptors in all (EINVAL), each open (EBADF). `SCM_CREDENTIALS` is
 /// exactly one `struct ucred` (EINVAL), the last one counting; as the guest
-/// runs as root, `scm_check_creds` lets any through, but the process ID must
-/// name a process or thread (ESRCH) and neither ID be -1 (EINVAL).
+/// runs as root, `scm_check_creds` lets any through, but neither ID may be
+/// -1 (EINVAL), and then the process ID must name a process or thread
+/// (ESRCH).
 fn control_messages(
     c: &Context<'_>,
     control: &[u8],
@@ -446,11 +447,12 @@ fn control_messages(
                 id: pid,
                 signal: 0,
             };
-            if pid.cast_signed() <= 0 || !c.processes.owner_exists(owner) {
-                return Err(Errno(3));
-            }
+            // scm_check_creds refuses an ID of -1 first.
             if uid == u32::MAX || gid == u32::MAX {
                 return Err(Errno::EINVAL);
+            }
+            if pid.cast_signed() <= 0 || !c.processes.owner_exists(owner) {
+                return Err(Errno(3));
             }
             credentials = Some(Credentials { pid, uid, gid });
         } else if field(at + 8) == SOL_SOCKET {

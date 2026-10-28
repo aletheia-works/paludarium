@@ -172,8 +172,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   資格情報なしで送ったメッセージは、プロセス 0、ユーザーとグループ 65534 として読めます。
   そのような受け手のストリームの読み込みは、`read` と `MSG_WAITALL` も含めて、資格情報の
   違う書き込みをまとめて読みません。`SCM_CREDENTIALS` は `struct ucred` をちょうど 1 つ
-  持ち（違えば `EINVAL`）、あるプロセスを指す（違えば `ESRCH`）必要があり、どちらの ID も
-  -1 にはできません（`EINVAL`）。
+  持つ必要があり（違えば `EINVAL`）、どちらの ID も -1 にはできません（`EINVAL`）。
+  そのあとでプロセスを探し、なければ `ESRCH` です。
 - `SO_RCVTIMEO` と `SO_SNDTIMEO`（と `_NEW` の形）は、Linux と同じく、そのソケットでの
   `recv`、`read`、`send`、`write` が待つ時間を限ります。限りを過ぎると `EAGAIN`、または
   そこまでに動かした分を返し、`MSG_WAITALL` もそこで止まります。0 の `timeval` は

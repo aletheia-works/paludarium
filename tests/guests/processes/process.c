@@ -2398,6 +2398,13 @@ int main(int argc, char **argv) {
             printf("  short=%ld errno=%d\n", n, n < 0 ? errno : 0);
             n = send_credentials(sv[0], "f", getpid(), getuid(), getgid(), CMSG_LEN(sizeof(struct ucred)) + 4);
             printf("  long=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            /* An ID of -1 is EINVAL before the process is looked up. */
+            n = send_credentials(sv[0], "f", getpid(), -1, getgid(), CMSG_LEN(sizeof(struct ucred)));
+            printf("  no-uid=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            n = send_credentials(sv[0], "f", getpid(), getuid(), -1, CMSG_LEN(sizeof(struct ucred)));
+            printf("  no-gid=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            n = send_credentials(sv[0], "f", 0, -1, getgid(), CMSG_LEN(sizeof(struct ucred)));
+            printf("  no-pid-no-uid=%ld errno=%d\n", n, n < 0 ? errno : 0);
             puts(" writers");
             send_from_child(sv[0], "g");
             send(sv[0], "h", 1, 0);

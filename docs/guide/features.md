@@ -187,8 +187,8 @@ kernel.
   sent without them reads as process 0 with user and group 65534. Such a
   receiver's stream reads, `read` and `MSG_WAITALL` too, do not read writes
   of other credentials together. `SCM_CREDENTIALS` must hold one
-  `struct ucred` (`EINVAL` otherwise) and name a process (`ESRCH`), and
-  neither ID may be -1 (`EINVAL`).
+  `struct ucred` (`EINVAL` otherwise), neither ID may be -1 (`EINVAL`), and
+  only then is the process looked up (`ESRCH` when there is none).
 - `SO_RCVTIMEO` and `SO_SNDTIMEO` (and their `_NEW` forms) limit how long a
   blocking `recv`, `read`, `send` or `write` on the socket waits, as on
   Linux: past the limit it gives `EAGAIN`, or what it moved, and

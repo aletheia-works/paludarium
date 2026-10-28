@@ -2251,6 +2251,8 @@ mod socket_credentials {
         let einval = Errno::EINVAL.to_syscall_return();
         assert_eq!(send(&mut k, &mut t, &m, a, [child, u32::MAX, 0]), einval);
         assert_eq!(send(&mut k, &mut t, &m, a, [child, 0, u32::MAX]), einval);
+        // The IDs are checked before the process is looked up.
+        assert_eq!(send(&mut k, &mut t, &m, a, [999_999, u32::MAX, 0]), einval);
         assert_eq!(
             receive(&mut k, &mut t, &m, b).0,
             Errno::EAGAIN.to_syscall_return()

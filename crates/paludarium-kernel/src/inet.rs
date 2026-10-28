@@ -294,13 +294,9 @@ impl Network {
         })
     }
     /// The lookup of `name`: one already made in the last
-    /// [`LOOKUP_LIFETIME`], or a new one, which wakes `hub` when it ends.
-    fn lookup(
-        &self,
-        host: &dyn paludarium_host::Host,
-        hub: &Arc<ReadinessHub>,
-        name: &str,
-    ) -> Result<Arc<Lookup>, Errno> {
+    /// [`LOOKUP_LIFETIME`], or a new one. Each socket waiting for it adds
+    /// its own waker.
+    fn lookup(&self, host: &dyn paludarium_host::Host, name: &str) -> Result<Arc<Lookup>, Errno> {
         let now = host.clock(paludarium_host::ClockId::Monotonic).unwrap_or(0);
         let mut lookups = self.lookups.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((lookup, started)) = lookups.get(name)
@@ -310,8 +306,6 @@ impl Network {
             return Ok(Arc::clone(lookup));
         }
         let lookup = host.resolve(name)?;
-        let hub = Arc::clone(hub);
-        lookup.add_waker(Arc::new(move || hub.changed()));
         lookups.insert(name.to_owned(), (Arc::clone(&lookup), now));
         Ok(lookup)
     }
@@ -836,21 +830,23 @@ impl InetSocket {
                 && !query.question.is_empty()
                 && self.network.policy.allows_name(&query.name)
             {
-                query.answer = match self
-                    .network
-                    .lookup(self.host.as_ref(), &self.hub, &query.name)
-                {
+                query.answer = match self.network.lookup(self.host.as_ref(), &query.name) {
                     Ok(lookup) => Answer::Lookup(lookup),
                     Err(_) => Answer::Now(2),
                 };
             }
-            // An answer signals POLL_IN as a datagram's arrival does: at
-            // once, or when the host's lookup ends.
+            // An answer signals POLL_IN as a datagram's arrival does, and
+            // then wakes this socket's waits, so that a poll the answer ends
+            // finds the signal pending: at once, or when the host's lookup
+            // ends.
             let ready = match &query.answer {
                 Answer::Now(_) => true,
                 Answer::Lookup(lookup) => {
-                    let signals = Arc::clone(&self.signals);
-                    !lookup.add_waker(Arc::new(move || signals.waking(Reason::In)))
+                    let (signals, hub) = (Arc::clone(&self.signals), Arc::clone(&self.hub));
+                    !lookup.add_waker(Arc::new(move || {
+                        signals.waking(Reason::In);
+                        hub.changed();
+                    }))
                 }
             };
             s.queries.push_back(query);

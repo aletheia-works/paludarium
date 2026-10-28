@@ -453,6 +453,27 @@ static void io_taken(const char *name) {
                info.si_code, (long)info.si_band, info.si_fd);
     printf("\n");
 }
+/* signal-io-wait: takes the pending signals of a stream whose peer closed
+   while its reader waited, and says only whether they are at most one
+   POLL_HUP for `fd`. Linux's unix_release_sock wakes the reader before it
+   looks at SOCKWQ_ASYNC_WAITDATA, so a reader that runs at once has
+   cleared it and is signalled, and one that does not is not: either is
+   Linux, and nothing else is. */
+static void io_hang_up(const char *name, int fd) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGIO);
+    sigaddset(&set, SIGURG);
+    sigaddset(&set, IO_RT);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    int number, count = 0, other = 0;
+    while ((number = sigtimedwait(&set, &info, &zero)) > 0) {
+        count++;
+        other |= number != IO_RT || info.si_code != POLL_HUP || info.si_band != 0x18 || info.si_fd != fd;
+    }
+    printf("  %s: at-most-one-hang-up=%d\n", name, count <= 1 && !other);
+}
 /* Counts the queued IO_RT signals with code `code` and takes the rest. */
 static int io_count(int code) {
     sigset_t set;
@@ -2170,8 +2191,9 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "signal-io-wait")) {
         /* The O_ASYNC signals around waits. A stream whose reader waits
-           gets none for the data, end or hang-up that ends the wait (Linux's
-           SOCKWQ_ASYNC_WAITDATA), where a datagram or packet socket still
+           gets none for the data or end that ends the wait (Linux's
+           SOCKWQ_ASYNC_WAITDATA), and at most one POLL_HUP for the peer's
+           close (io_hang_up), where a datagram or packet socket still
            signals. A send that found the buffer full signals POLL_OUT only
            once three quarters of it is free. A pipe write signals its
            reader before each wait. A reader's child acts after a while
@@ -2224,6 +2246,7 @@ int main(int argc, char **argv) {
                 if (a == 2) waitpid(forked, &status, 0);
                 else if (read(acted[0], buf, 1) != 1) return 72;
                 if (early && ++tries < 10) io_count(0);
+                else if (types[t] == SOCK_STREAM && a == 2) io_hang_up(name, sv[1]);
                 else io_taken(name);
                 close(sv[1]);
                 if (a != 2) {

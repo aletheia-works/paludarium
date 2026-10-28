@@ -41,7 +41,7 @@ fn main() -> Result<(), paludarium::Error> {
   下を参照）、`tty`（`Some(TerminalInfo::new(columns, rows))` にすると、ゲストの標準の
   ストリームがその大きさの端末になります。既定の `None` では、端末は `Host` に任せます）、
   `jit`（使うのは WebAssembly 版だけです。ネイティブ版には JIT がありません）、
-  `limits` です。
+  `limits`、`network` です。
 - `limits` は `Limits` で、既定では上限がありません。`Limits::default().with_tasks(n)`
   は、ゲストが持てるタスクを `n` 個までにします（タスクはスレッドと、回収されるまでの
   プロセスで、cgroup の `pids.max` と同じ数え方です。超える `clone` や `fork` は
@@ -52,6 +52,12 @@ fn main() -> Result<(), paludarium::Error> {
   `SIGKILL` で終わり、収まらない `execve` は `ENOMEM` で失敗します（何を
   数えるかはフィールドのドキュメントにあります）。これらはフィールドの `tasks`、
   `open_files`、`memory` を設定し、`None` は上限なしです。
+- `network` の既定は `None` で、ゲストはネットワークを使えません。
+  `with_network(policy)` は、これを `NetworkPolicy` にします。`NetworkPolicy` は
+  `NetworkPolicy::new()` から作り、行き先ごとに `allow(entry)` を呼びます
+  （`github.com:443`、`*.example.org`、`127.0.0.1`、`[::1]:8080`）。読めない項目には、
+  `allow` が `InvalidRule` を返します。ゲストは、方針が許す行き先へ `Host` を通して TCP で
+  接続し、許した名前を引けます（[ネットワーク](./features#network)）。
 - `Session::new` は、何かを動かす前に設定を確かめます。`run()` はゲストを最後まで
   動かします。`NativeHost` は `Host` トレイトのネイティブ版の実装で、ゲストの
   標準入出力をホストのプロセスにつなぎます。

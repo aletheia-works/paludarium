@@ -42,7 +42,7 @@ kernel.
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
-| Sockets | `socket` (always `EAFNOSUPPORT`), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind` (port 0), `listen`, `accept` and `accept4` (refused: no server side), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -473,6 +473,51 @@ kernel.
   `pidfd_send_signal` takes no siginfo and no scope flags, and `PIDFD_THREAD`
   still names the whole process.
 - Invalid pointers return `EFAULT`.
+
+## Network
+
+A guest has no network unless the embedder allows destinations
+(`Config::with_network`, or the command's `--allow-net`). An allow-list entry
+is a host name (`github.com`), every subdomain of one (`*.github.com`), an
+IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
+(`github.com:443`).
+
+- **TCP client sockets**: `socket(AF_INET` or `AF_INET6, SOCK_STREAM)`,
+  with `SOCK_NONBLOCK` and `SOCK_CLOEXEC`, connects through the host.
+  - **`connect`**: a blocking one waits for the connection; a nonblocking one
+    returns `EINPROGRESS`, the socket then becomes writable, and `SO_ERROR`
+    gives the result once. A second call is `EALREADY`, 0 once connected,
+    then `EISCONN`; a failed one gives its error, or `ECONNABORTED` once
+    `SO_ERROR` took it. An IPv6 socket reaches IPv4 addresses as
+    `::ffff:a.b.c.d`.
+  - **A destination the policy does not allow** is `ENETUNREACH`.
+  - **Data**: `read`, `write`, `send`/`recv`, `sendto`/`recvfrom` and
+    `sendmsg`/`recvmsg`, with `MSG_PEEK`, `MSG_WAITALL`, `MSG_DONTWAIT` and
+    `MSG_NOSIGNAL`. A write goes on until all is sent. A connection the peer
+    reset gives its error once, then the end of input. Sending on a socket
+    that never connected, or after `shutdown(SHUT_WR)`, is `EPIPE` with
+    `SIGPIPE`; receiving on one that never connected is `ENOTCONN`.
+  - **Readiness**: `poll`, `select` and `epoll` see what Linux's `tcp_poll`
+    reports: hung up and writable before connecting, nothing while
+    connecting, `POLLIN` with data or at the end of input (with
+    `POLLRDHUP`), `POLLOUT` while the send buffer has room, `POLLHUP` once
+    both directions are shut, and `POLLERR` while an error waits.
+  - **`shutdown`**, `getsockname` (the host's address and port once
+    connected), `getpeername`, `bind` to port 0, `FIONREAD`/`SIOCINQ` and
+    `SIOCOUTQ`.
+  - **Options**: `SO_TYPE`, `SO_DOMAIN`, `SO_PROTOCOL`, `SO_ERROR`,
+    `SO_ACCEPTCONN`, `SO_KEEPALIVE`, `SO_REUSEADDR`, `SO_REUSEPORT`,
+    `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_LINGER`,
+    `SO_PRIORITY`, `SO_BROADCAST`, `SO_OOBINLINE`, `TCP_NODELAY` (which reaches
+    the host), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_QUICKACK`,
+    `TCP_USER_TIMEOUT`, `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and
+    range checks.
+- **Name resolution**: a built-in DNS stub answers the UDP queries a guest's
+  resolver sends to port 53, at any address: the server of
+  `/etc/resolv.conf`, or its default. It answers `A` and `AAAA` questions
+  for an allowed name with the addresses the host resolves (for 60
+  seconds), and `NXDOMAIN` for any other name. A connection to an address
+  the stub gave for an allowed name is allowed as that name is.
 
 ## Threads and processes
 

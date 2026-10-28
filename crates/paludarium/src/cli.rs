@@ -9,6 +9,8 @@
 //!   --max-tasks N     at most N threads and unreaped processes (EAGAIN)
 //!   --max-open-files N  cap RLIMIT_NOFILE at N, as fs.nr_open (EMFILE)
 //!   --max-memory N[K|M|G|T]  at most N bytes of guest memory, as memory.max
+//!   --allow-net HOST[:PORT]  let the guest connect to HOST over TCP, and
+//!                     resolve it (repeatable; no network without it)
 //! ```
 //!
 //! Exit codes: the guest's exit code; 128 + signal number when the guest was
@@ -26,7 +28,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use paludarium_host::{Host, read_program_file};
-use paludarium_runtime::{Config, Limits, Mount, Session};
+use paludarium_runtime::{Config, Limits, Mount, NetworkPolicy, Session};
 use paludarium_types::{Error, ExitReason, ExitStatus};
 
 /// Exit code for command-line usage errors.
@@ -37,7 +39,7 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_EMULATOR_ERROR: i32 = 70;
 
 /// Usage text printed on errors and for `--help`.
-pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] [--max-tasks N] [--max-open-files N] [--max-memory N] <program> [args...]\n";
+pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] [--max-tasks N] [--max-open-files N] [--max-memory N] [--allow-net HOST[:PORT]]... <program> [args...]\n";
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +56,8 @@ pub struct Invocation {
     /// `--max-tasks`, `--max-open-files` and `--max-memory`; unlimited
     /// without them.
     pub limits: Limits,
+    /// What `--allow-net` allows; no network without it.
+    pub network: Option<NetworkPolicy>,
 }
 
 /// What the command line asked for.
@@ -66,6 +70,23 @@ pub enum Command {
 /// A usage error with a fixed message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UsageError(pub &'static str);
+
+const ALLOW_NET_USAGE: &str = "--allow-net needs HOST, HOST:PORT, [IPV6] or [IPV6]:PORT";
+
+/// Adds one `--allow-net` entry.
+fn allow_net(
+    network: Option<NetworkPolicy>,
+    value: Option<&OsStr>,
+) -> Result<Option<NetworkPolicy>, UsageError> {
+    let entry = value
+        .and_then(OsStr::to_str)
+        .ok_or(UsageError(ALLOW_NET_USAGE))?;
+    network
+        .unwrap_or_default()
+        .allow(entry)
+        .map(Some)
+        .map_err(|_| UsageError(ALLOW_NET_USAGE))
+}
 
 fn parse_env(value: &[u8]) -> Result<(Vec<u8>, Vec<u8>), UsageError> {
     let eq = value
@@ -146,6 +167,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
     let mut mounts = Vec::new();
     let mut report_enosys = false;
     let mut limits = Limits::default();
+    let mut network = None;
     let program = loop {
         let Some(arg) = args.next() else {
             return Err(UsageError("no program given"));
@@ -176,6 +198,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
                 let max = parse_size(args.next(), "--max-memory needs a size in bytes")?;
                 limits = limits.with_memory(max);
             }
+            b"--allow-net" => network = allow_net(network, args.next().as_deref())?,
+            _ if bytes.starts_with(b"--allow-net=") => {
+                let value = arg.to_str().and_then(|value| value.get(12..));
+                network = allow_net(network, value.map(OsStr::new))?;
+            }
             b"--env" => {
                 let value = args.next().ok_or(UsageError("--env needs KEY=VALUE"))?;
                 env.push(parse_env(value.as_encoded_bytes())?);
@@ -202,6 +229,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
         mounts,
         report_enosys,
         limits,
+        network,
     }))
 }
 
@@ -337,6 +365,7 @@ pub fn main_with(
     config.env = invocation.env;
     config.mounts = invocation.mounts;
     config.limits = invocation.limits;
+    config.network = invocation.network;
     // --no-jit is accepted and has no effect: the native build has no JIT.
     config.jit = false;
     let session = match Session::new(config, host) {
@@ -416,8 +445,24 @@ mod tests {
                 mounts: vec![],
                 report_enosys: false,
                 limits: Limits::default(),
+                network: None,
             }))
         );
+        let allowed = NetworkPolicy::new()
+            .allow("github.com:443")
+            .and_then(|policy| policy.allow("[::1]"))
+            .unwrap();
+        assert!(matches!(
+            parse(os(&["--allow-net", "github.com:443", "--allow-net=[::1]", "p"])),
+            Ok(Command::Run(i)) if i.network == Some(allowed)
+        ));
+        for bad in [
+            &["--allow-net"][..],
+            &["--allow-net", "a:0", "p"],
+            &["--allow-net=", "p"],
+        ] {
+            assert_eq!(parse(os(bad)), Err(UsageError(ALLOW_NET_USAGE)));
+        }
         assert!(matches!(
             parse(os(&["--max-tasks", "8", "--max-open-files", "0", "p"])),
             Ok(Command::Run(i)) if i.limits == Limits::default().with_tasks(8).with_open_files(0)

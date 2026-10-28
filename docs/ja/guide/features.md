@@ -36,7 +36,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socket`（常に `EAFNOSUPPORT`）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタの受け渡しと、`SCM_CREDENTIALS` での資格情報の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`（ポート 0）、`listen`、`accept`、`accept4`（サーバー側はないので断ります）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタの受け渡しと、`SCM_CREDENTIALS` での資格情報の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -436,6 +436,49 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `waitid(P_PIDFD)` は `EAGAIN` を返します。`pidfd_send_signal` は siginfo と
   範囲の指定を受け付けず、`PIDFD_THREAD` を付けてもプロセス全体を指します。
 - 不正なポインタを渡されたときは `EFAULT` を返します。
+
+## ネットワーク {#network}
+
+組み込む側が行き先を許可しない限り、ゲストはネットワークを使えません
+（`Config::with_network`、またはコマンドの `--allow-net`）。許可の一覧には、ホスト名
+（`github.com`）、そのすべてのサブドメイン（`*.github.com`）、IPv4 アドレス、IPv6
+アドレス（`[::1]`）を書きます。どれもポートを付けるか（`github.com:443`）、付けずに
+すべてのポートを許します。
+
+- **TCP のクライアントのソケット**：`socket(AF_INET` または `AF_INET6, SOCK_STREAM)`
+  （`SOCK_NONBLOCK`、`SOCK_CLOEXEC` も付けられます）は、ホストを通して接続します。
+  - **`connect`**：ブロッキングなら接続を待ちます。ノンブロッキングなら
+    `EINPROGRESS` を返し、そのあとソケットが書き込めるようになり、`SO_ERROR` が結果を
+    1 回だけ返します。2 回目の呼び出しは `EALREADY`、接続したあとは 0、その次からは
+    `EISCONN` です。失敗した接続はその誤りを返し、`SO_ERROR` が取ったあとは
+    `ECONNABORTED` です。IPv6 のソケットは、IPv4 のアドレスに `::ffff:a.b.c.d` として
+    届きます。
+  - **方針が許さない行き先**は `ENETUNREACH` です。
+  - **データ**：`read`、`write`、`send`／`recv`、`sendto`／`recvfrom`、
+    `sendmsg`／`recvmsg` を、`MSG_PEEK`、`MSG_WAITALL`、`MSG_DONTWAIT`、
+    `MSG_NOSIGNAL` とともに使えます。書き込みはすべて送るまで続きます。相手が
+    リセットした接続は、その誤りを 1 回返し、そのあとは入力の終わりです。接続したことの
+    ないソケットや、`shutdown(SHUT_WR)` のあとの送信は `EPIPE` で、`SIGPIPE` も
+    送ります。接続したことのないソケットの受信は `ENOTCONN` です。
+  - **準備状態**：`poll`、`select`、`epoll` は Linux の `tcp_poll` と同じものを
+    見ます。接続する前は切断と書き込み可能、接続している間は何もなし、データか入力の
+    終わりがあれば `POLLIN`（終わりなら `POLLRDHUP` も）、送信のバッファに空きが
+    あれば `POLLOUT`、両方向を閉じたら `POLLHUP`、誤りが残っていれば `POLLERR`
+    です。
+  - **`shutdown`**、`getsockname`（接続したあとはホストのアドレスとポート）、
+    `getpeername`、ポート 0 への `bind`、`FIONREAD`／`SIOCINQ`、`SIOCOUTQ`。
+  - **オプション**：`SO_TYPE`、`SO_DOMAIN`、`SO_PROTOCOL`、`SO_ERROR`、
+    `SO_ACCEPTCONN`、`SO_KEEPALIVE`、`SO_REUSEADDR`、`SO_REUSEPORT`、`SO_SNDBUF`、
+    `SO_RCVBUF`、`SO_RCVTIMEO`、`SO_SNDTIMEO`、`SO_LINGER`、`SO_PRIORITY`、
+    `SO_BROADCAST`、`SO_OOBINLINE`、`TCP_NODELAY`（ホストにも伝えます）、
+    `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
+    `TCP_USER_TIMEOUT`、`IP_TOS`、`IPV6_V6ONLY`。既定値と範囲の確かめ方は Linux と
+    同じです。
+- **名前解決**：組み込みの DNS の代わりが、ゲストのリゾルバが 53 番ポートへ送る UDP の
+  問い合わせに、宛先のアドレスによらず答えます。宛先は `/etc/resolv.conf` のサーバー、
+  またはその既定です。許可した名前の `A` と `AAAA` の問い合わせには、ホストが引いた
+  アドレスを（60 秒の有効期間で）返し、ほかの名前には `NXDOMAIN` を返します。許可した
+  名前について返したアドレスへの接続は、その名前と同じように許可します。
 
 ## スレッドとプロセス
 

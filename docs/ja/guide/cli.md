@@ -7,7 +7,7 @@
 cargo install paludarium
 paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys]
            [--max-tasks N] [--max-open-files N] [--max-memory N]
-           <program> [args...]
+           [--allow-net HOST[:PORT]]... <program> [args...]
 ```
 
 - `<program>` はホストのファイルです。ゲストの中では `/<ファイル名>` に置かれ、
@@ -36,6 +36,11 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
   収まらないプログラムは始まりません。
   ファイルの中身と、パイプやソケットのバッファは数えません。
 - これらを指定しなければ、上限はありません。
+- `--allow-net HOST[:PORT]`（`--allow-net=HOST[:PORT]` とも書けます）は、ゲストが
+  `HOST` の `PORT`（省けばすべてのポート）へ TCP で接続し、その名前を引けるように
+  します。`HOST` には、名前、サブドメインすべてを表す `*.` 付きの名前、IPv4 アドレス、
+  角かっこで囲んだ IPv6 アドレス（`[::1]:8080`）を書けます。何度でも指定できます。
+  指定しなければ、ゲストはネットワークを使えません（[ネットワーク](./features#network)）。
 - `-h`、`--help` は使い方の 1 行を表示して、終了コード 0 で終わります。
 - `--` でオプションを終わりにできます。`-` で始まる名前のプログラムを動かすときに使います。
 

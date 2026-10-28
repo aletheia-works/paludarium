@@ -42,7 +42,7 @@ fn main() -> Result<(), paludarium::Error> {
   (`Some(TerminalInfo::new(columns, rows))` gives the guest's standard streams
   a terminal of that size; `None`, the default, leaves the terminal to the
   `Host`), `jit` (used only by the WebAssembly build; the native build has no
-  JIT) and `limits`.
+  JIT), `limits` and `network`.
 - `limits` is a `Limits`, unlimited by default.
   `Limits::default().with_tasks(n)` lets the guest have at most `n` tasks
   (threads, and processes until they are reaped, as a cgroup's `pids.max`;
@@ -54,6 +54,13 @@ fn main() -> Result<(), paludarium::Error> {
   not fit fails with `ENOMEM` (the field's documentation gives what
   counts). They set the fields `tasks`, `open_files` and `memory`, where `None`
   is no limit.
+- `network` is `None` by default: the guest has no network.
+  `with_network(policy)` sets it to a `NetworkPolicy`, built with
+  `NetworkPolicy::new()` and `allow(entry)` for each destination
+  (`github.com:443`, `*.example.org`, `127.0.0.1`, `[::1]:8080`); `allow`
+  returns an `InvalidRule` for an entry it cannot read. The guest then
+  connects over TCP through the `Host` to what the policy allows, and
+  resolves the names it allows ([Network](./features#network)).
 - `Session::new` validates the configuration before anything runs, and
   `run()` runs the guest to the end. `NativeHost`, the native implementation
   of the `Host` trait, connects the guest's standard input and output to the

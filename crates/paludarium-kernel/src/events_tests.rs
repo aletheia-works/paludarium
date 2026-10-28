@@ -277,8 +277,30 @@ type Action = Box<dyn FnOnce() + Send>;
 struct TestHost {
     now: AtomicU64,
     action: Mutex<Option<Action>>,
+    /// The connections and lookups the guest started, for a test to drive.
+    streams: Mutex<Vec<Arc<paludarium_host::net::Stream>>>,
+    lookups: Mutex<Vec<(String, Arc<paludarium_host::net::Lookup>)>>,
 }
 impl Host for TestHost {
+    fn connect(
+        &self,
+        address: core::net::SocketAddr,
+    ) -> Result<Arc<paludarium_host::net::Stream>, Errno> {
+        let stream = paludarium_host::net::Stream::new(address);
+        self.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::clone(&stream));
+        Ok(stream)
+    }
+    fn resolve(&self, name: &str) -> Result<Arc<paludarium_host::net::Lookup>, Errno> {
+        let lookup = paludarium_host::net::Lookup::new();
+        self.lookups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((name.to_owned(), Arc::clone(&lookup)));
+        Ok(lookup)
+    }
     fn read_stdin(&self, _: &mut [u8]) -> Result<usize, Errno> {
         Ok(0)
     }
@@ -686,6 +708,307 @@ fn generic_ioctls_answer_for_every_file() {
     assert_eq!(
         f.ret(16, [path, 0x5451, 0, 0, 0, 0]),
         Errno::EBADF.to_syscall_return()
+    );
+}
+/// A `sockaddr_in` for `ip` and `port` at `at`.
+fn inet_address(f: &Fixture, at: u64, ip: [u8; 4], port: u16) {
+    let mut raw = [0; 16];
+    raw[0] = 2;
+    raw[2..4].copy_from_slice(&port.to_be_bytes());
+    raw[4..8].copy_from_slice(&ip);
+    f.mem.write(GuestAddr(at), &raw).unwrap();
+}
+fn network_fixture(allow: &[&str]) -> Fixture {
+    let mut f = Fixture::new();
+    let policy = allow
+        .iter()
+        .fold(crate::NetworkPolicy::new(), |policy, entry| {
+            policy.allow(entry).unwrap()
+        });
+    let kernel = std::mem::replace(&mut f.kernel, Kernel::new(f.host.clone()));
+    f.kernel = kernel.with_network(policy);
+    f
+}
+fn int_option(f: &mut Fixture, fd: u64, level: u64, name: u64) -> (u64, i32) {
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &4u32.to_le_bytes())
+        .unwrap();
+    let r = f.ret(55, [fd, level, name, DATA + 0x204, DATA + 0x200, 0]);
+    let mut raw = [0; 4];
+    f.mem.read(GuestAddr(DATA + 0x204), &mut raw).unwrap();
+    (r, i32::from_le_bytes(raw))
+}
+#[test]
+fn inet_sockets_need_a_network() {
+    let mut f = Fixture::new();
+    assert_eq!(f.ret(41, [2, 1, 0, 0, 0, 0]), Errno(97).to_syscall_return());
+    let mut f = network_fixture(&["127.0.0.1:80"]);
+    assert_eq!(f.ret(41, [1, 1, 0, 0, 0, 0]), Errno(97).to_syscall_return());
+    assert_eq!(
+        f.ret(41, [2, 1 | 0x100000, 0, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(41, [2, 1, 17, 0, 0, 0]),
+        Errno(93).to_syscall_return()
+    );
+    assert_eq!(f.ret(41, [2, 5, 0, 0, 0, 0]), Errno(94).to_syscall_return());
+    assert_eq!(f.ret(41, [2, 3, 1, 0, 0, 0]), Errno(1).to_syscall_return());
+    assert_eq!(
+        f.ret(41, [10, 2, 58, 0, 0, 0]),
+        Errno(13).to_syscall_return()
+    );
+}
+#[test]
+fn a_tcp_socket_connects_through_the_host() {
+    let mut f = network_fixture(&["127.0.0.1:80"]);
+    let fd = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    assert!((fd as i64) >= 0);
+    // A socket never connected.
+    assert_eq!(
+        f.ret(45, [fd, DATA, 8, 0, 0, 0]),
+        Errno(107).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(44, [fd, DATA, 1, 0x4000, 0, 0]),
+        Errno::EPIPE.to_syscall_return()
+    );
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 81);
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(101).to_syscall_return()
+    );
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 80);
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(114).to_syscall_return()
+    );
+    assert_eq!(int_option(&mut f, fd, 1, 4), (0, 0));
+    assert_eq!(
+        f.ret(44, [fd, DATA, 1, 0, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    let stream = f.host.streams.lock().unwrap()[0].clone();
+    assert_eq!(stream.peer(), "127.0.0.1:80".parse().unwrap());
+    stream.connected(Some("127.0.0.1:40000".parse().unwrap()));
+    assert_eq!(f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(106).to_syscall_return()
+    );
+    // Addresses.
+    f.mem
+        .write(GuestAddr(DATA + 0x80), &16u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(51, [fd, DATA + 0x84, DATA + 0x80, 0, 0, 0]), 0);
+    let mut name = [0; 16];
+    f.mem.read(GuestAddr(DATA + 0x84), &mut name).unwrap();
+    assert_eq!(&name[..8], &[2, 0, 0x9c, 0x40, 127, 0, 0, 1]);
+    assert_eq!(f.ret(52, [fd, DATA + 0x84, DATA + 0x80, 0, 0, 0]), 0);
+    f.mem.read(GuestAddr(DATA + 0x84), &mut name).unwrap();
+    assert_eq!(&name[..4], &[2, 0, 0, 80]);
+    // Bytes both ways.
+    f.mem.write(GuestAddr(DATA), b"hello").unwrap();
+    assert_eq!(f.ret(1, [fd, DATA, 5, 0, 0, 0]), 5);
+    assert_eq!(stream.take(10), b"hello");
+    stream.receive(b"world");
+    assert_eq!(
+        crate::sockets::queued(&f.kernel.files.descriptor(fd).unwrap().file, false),
+        Some(Ok(5))
+    );
+    assert_eq!(f.ret(45, [fd, DATA, 3, 2, 0, 0]), 3);
+    assert_eq!(f.ret(0, [fd, DATA, 16, 0, 0, 0]), 5);
+    let mut got = [0; 5];
+    f.mem.read(GuestAddr(DATA), &mut got).unwrap();
+    assert_eq!(&got, b"world");
+    assert_eq!(
+        f.ret(0, [fd, DATA, 16, 0, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    // TCP_NODELAY and the keepalive range.
+    f.mem
+        .write(GuestAddr(DATA + 0x300), &1i32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(54, [fd, 6, 1, DATA + 0x300, 4, 0]), 0);
+    assert_eq!(int_option(&mut f, fd, 6, 1), (0, 1));
+    f.mem
+        .write(GuestAddr(DATA + 0x300), &0i32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        f.ret(54, [fd, 6, 4, DATA + 0x300, 4, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    assert_eq!(int_option(&mut f, fd, 6, 4), (0, 7200));
+    assert_eq!(int_option(&mut f, fd, 1, 3), (0, 1));
+    assert_eq!(
+        int_option(&mut f, fd, 1, 9999).0,
+        Errno(92).to_syscall_return()
+    );
+    // The end of input, then shutdown.
+    stream.end();
+    assert_eq!(f.ret(0, [fd, DATA, 16, 0, 0, 0]), 0);
+    assert_eq!(f.ret(48, [fd, 1, 0, 0, 0, 0]), 0);
+    assert_eq!(stream.finished(), (true, false));
+    assert_eq!(
+        f.ret(44, [fd, DATA, 1, 0x4000, 0, 0]),
+        Errno::EPIPE.to_syscall_return()
+    );
+    assert_eq!(f.ret(3, [fd, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(stream.finished(), (true, true));
+}
+#[test]
+fn a_failed_connection_reports_its_error_once() {
+    let mut f = network_fixture(&["127.0.0.1"]);
+    let fd = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 9);
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    f.host.streams.lock().unwrap()[0].fail(Errno(111));
+    assert_eq!(int_option(&mut f, fd, 1, 4), (0, 111));
+    assert_eq!(int_option(&mut f, fd, 1, 4), (0, 0));
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(103).to_syscall_return()
+    );
+    // Linux disconnected it: as a socket never connected.
+    assert_eq!(
+        f.ret(0, [fd, DATA, 4, 0, 0, 0]),
+        Errno(107).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(44, [fd, DATA, 1, 0x4000, 0, 0]),
+        Errno::EPIPE.to_syscall_return()
+    );
+    // A blocking connect that fails gives the error itself.
+    let blocking = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    let host = f.host.clone();
+    *f.host.action.lock().unwrap() = Some(Box::new(move || {
+        host.streams.lock().unwrap()[1].fail(Errno(111));
+    }));
+    assert_eq!(
+        f.ret(42, [blocking, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(111).to_syscall_return()
+    );
+    assert_eq!(int_option(&mut f, blocking, 1, 4), (0, 0));
+}
+#[test]
+fn a_socket_pair_is_unnamed_and_never_listens() {
+    let mut f = Fixture::new();
+    let pair = |f: &mut Fixture, kind: u64| {
+        assert_eq!(f.ret(53, [1, kind, 0, DATA, 0, 0]), 0);
+        let mut raw = [0; 4];
+        f.mem.read(GuestAddr(DATA), &mut raw).unwrap();
+        u64::from(u32::from_le_bytes(raw))
+    };
+    let stream = pair(&mut f, 1);
+    f.mem
+        .write(GuestAddr(DATA + 0x80), &16u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(51, [stream, DATA + 0x84, DATA + 0x80, 0, 0, 0]), 0);
+    let mut name = [0; 6];
+    f.mem.read(GuestAddr(DATA + 0x80), &mut name).unwrap();
+    assert_eq!(name, [2, 0, 0, 0, 1, 0]);
+    assert_eq!(f.ret(52, [stream, DATA + 0x84, DATA + 0x80, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(50, [stream, 1, 0, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(43, [stream, 0, 0, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(42, [stream, DATA, 2, 0, 0, 0]),
+        Errno::ENOSYS.to_syscall_return()
+    );
+    let datagram = pair(&mut f, 2);
+    assert_eq!(
+        f.ret(288, [datagram, 0, 0, 0, 0, 0]),
+        Errno(95).to_syscall_return()
+    );
+    let event = f.event(0);
+    assert_eq!(
+        f.ret(49, [event, DATA, 2, 0, 0, 0]),
+        Errno(88).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(51, [99, DATA, DATA + 0x80, 0, 0, 0]),
+        Errno::EBADF.to_syscall_return()
+    );
+}
+/// A DNS query for `name` of type `kind` at `at`; returns its length.
+fn dns_query(f: &Fixture, at: u64, name: &str, kind: u16) -> u64 {
+    let mut bytes = vec![0xab, 0xcd, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in name.split('.') {
+        bytes.push(label.len() as u8);
+        bytes.extend_from_slice(label.as_bytes());
+    }
+    bytes.extend_from_slice(&[0]);
+    bytes.extend_from_slice(&kind.to_be_bytes());
+    bytes.extend_from_slice(&[0, 1]);
+    f.mem.write(GuestAddr(at), &bytes).unwrap();
+    bytes.len() as u64
+}
+#[test]
+fn the_dns_stub_answers_allowed_names_from_the_host() {
+    let mut f = network_fixture(&["example.com:443"]);
+    let udp = f.ret(41, [2, 2 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [0, 0, 0, 0], 0);
+    assert_eq!(f.ret(49, [udp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    inet_address(&f, DATA + 0x100, [10, 0, 0, 1], 53);
+    let len = dns_query(&f, DATA, "Example.com", 1);
+    assert_eq!(f.ret(44, [udp, DATA, len, 0, DATA + 0x100, 16]), len);
+    // The answer waits for the host.
+    assert_eq!(
+        f.ret(45, [udp, DATA + 0x400, 512, 0, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    let (name, lookup) = f.host.lookups.lock().unwrap()[0].clone();
+    assert_eq!(name, "example.com");
+    lookup.finish(Ok(vec!["192.0.2.5".parse().unwrap()]));
+    f.mem
+        .write(GuestAddr(DATA + 0x80), &16u32.to_le_bytes())
+        .unwrap();
+    let n = f.ret(45, [udp, DATA + 0x400, 512, 0, DATA + 0x84, DATA + 0x80]);
+    let mut answer = vec![0; n as usize];
+    f.mem.read(GuestAddr(DATA + 0x400), &mut answer).unwrap();
+    assert_eq!(&answer[..4], &[0xab, 0xcd, 0x81, 0x80]);
+    assert_eq!(&answer[answer.len() - 4..], &[192, 0, 2, 5]);
+    let mut from = [0; 8];
+    f.mem.read(GuestAddr(DATA + 0x84), &mut from).unwrap();
+    assert_eq!(from, [2, 0, 0, 53, 10, 0, 0, 1]);
+    // The address it gave can be reached on the allowed port only.
+    let tcp = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [192, 0, 2, 5], 80);
+    assert_eq!(
+        f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(101).to_syscall_return()
+    );
+    inet_address(&f, DATA + 0x100, [192, 0, 2, 5], 443);
+    assert_eq!(
+        f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    // Another name is NXDOMAIN at once, without the host.
+    inet_address(&f, DATA + 0x100, [10, 0, 0, 1], 53);
+    let len = dns_query(&f, DATA, "other.org", 28);
+    assert_eq!(f.ret(44, [udp, DATA, len, 0, DATA + 0x100, 16]), len);
+    let n = f.ret(45, [udp, DATA + 0x400, 512, 0, 0, 0]);
+    let mut answer = vec![0; n as usize];
+    f.mem.read(GuestAddr(DATA + 0x400), &mut answer).unwrap();
+    assert_eq!(answer[3] & 0xf, 3);
+    assert_eq!(f.host.lookups.lock().unwrap().len(), 1);
+    // Another UDP port is unreachable.
+    inet_address(&f, DATA + 0x100, [10, 0, 0, 1], 54);
+    assert_eq!(
+        f.ret(44, [udp, DATA, len, 0, DATA + 0x100, 16]),
+        Errno(101).to_syscall_return()
     );
 }
 /// Writes a `msghdr` at `at`: name, iovecs `(base, len)` at `at + 0x40`,

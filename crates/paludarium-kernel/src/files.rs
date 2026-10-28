@@ -28,6 +28,8 @@ impl Descriptor {
 pub struct Files {
     pub(crate) readiness: Arc<crate::events::ReadinessHub>,
     pub terminal_size: Option<(u16, u16)>,
+    /// The session's network, when it has one.
+    pub(crate) network: Option<Arc<crate::inet::Network>>,
     pub fs: Arc<dyn FileSystem>,
     pub(crate) fds: Arc<Mutex<BTreeMap<u32, Descriptor>>>,
     /// Numbers an unfinished open has taken, as Linux's alloc_fd marks them
@@ -49,6 +51,7 @@ impl Default for Files {
         Self {
             readiness: Arc::default(),
             terminal_size: None,
+            network: None,
             fs: Arc::new(crate::page_cache::CoherentFs::new(
                 Arc::new(fs),
                 Arc::clone(&caches),
@@ -1959,7 +1962,8 @@ pub(crate) fn write_with(
 ) -> Result<u64, Errno> {
     // A socket or pipe write goes on until all is written, as Linux's
     // `unix_stream_sendmsg` and `pipe_write` do.
-    let stream = crate::sockets::endpoint(file).is_some();
+    let stream = crate::sockets::endpoint(file).is_some()
+        || crate::inet::of(file).is_some_and(crate::inet::InetSocket::is_stream);
     // A socket waits no longer than its SO_SNDTIMEO.
     let wait = crate::sockets::deadline(c, file, false)?;
     let mut done = 0;

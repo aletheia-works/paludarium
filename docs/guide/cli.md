@@ -7,7 +7,7 @@ x86-64 Linux program on the host.
 cargo install paludarium
 paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys]
            [--max-tasks N] [--max-open-files N] [--max-memory N]
-           <program> [args...]
+           [--allow-net HOST[:PORT]]... <program> [args...]
 ```
 
 - `<program>` is a file on the host. Inside the guest it is placed at
@@ -37,6 +37,11 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
   does not fit at all is not started. File contents and pipe and socket
   buffers are not counted.
 - Without these options there is no limit.
+- `--allow-net HOST[:PORT]` (or `--allow-net=HOST[:PORT]`) lets the guest
+  connect to `HOST` over TCP, on `PORT` or every port, and resolve its name.
+  `HOST` is a name, `*.` and a name for its subdomains, an IPv4 address, or
+  an IPv6 one in brackets (`[::1]:8080`). Repeat it for more. Without it the
+  guest has no network ([Network](./features#network)).
 - `-h`, `--help` print the usage line and exit with status 0.
 - `--` ends the options, so a program name may start with `-`.
 

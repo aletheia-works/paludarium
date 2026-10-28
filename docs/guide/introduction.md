@@ -51,4 +51,6 @@ copy its code.
 - **Same results as real Linux.** Correctness means the same results as a real
   x86-64 Linux. Differential tests run each program on both and compare
   ([Testing and verification](../design/quality)).
-- **No network.** Guests cannot use the network (AF_INET and so on).
+- **No network unless allowed.** A guest reaches only the destinations the
+  embedder allows by name or address, as a TCP client, and resolves only
+  those names ([Network](./features#network)).

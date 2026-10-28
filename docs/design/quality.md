@@ -30,6 +30,11 @@ CI run produces them afresh on an x86-64 Linux runner.
 - A test checks that `diff_processes` runs exactly the process cases that
   `tests/guests/processes/cases.json` lists, so that a case cannot be listed
   and never run.
+- The network cases (`diff_network`) serve the guest from the test itself, on
+  127.0.0.1, so that native Linux and the emulator talk to the same server;
+  the emulator may reach only that server's port and one that nothing
+  listens on. Name resolution on Linux depends on the runner's own files and
+  servers, so it is checked under the emulator only, against `localhost`.
 
 ## Fuzzing
 

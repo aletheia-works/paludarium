@@ -14,7 +14,9 @@
 pub mod cli;
 
 pub use paludarium_host::{Host, NativeHost};
-pub use paludarium_runtime::{Config, DEFAULT_BUDGET, Limits, Mount, Session, TerminalInfo};
+pub use paludarium_runtime::{
+    Config, DEFAULT_BUDGET, InvalidRule, Limits, Mount, NetworkPolicy, Session, TerminalInfo,
+};
 pub use paludarium_types::{Error, ErrorKind, ExitReason, ExitStatus, GuestAddr};
 
 /// Test helpers re-exported for the differential harness and integration

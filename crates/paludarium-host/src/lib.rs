@@ -34,6 +34,9 @@ pub use wasm_tasks::run_task;
 pub mod fs;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_fs;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_net;
+pub mod net;
 pub use fs::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs};
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_fs::NativeFs;
@@ -224,6 +227,18 @@ pub trait Host: Send + Sync {
     ) -> Result<WaitOutcome, Errno> {
         Err(Errno::ENOSYS)
     }
+    /// Starts a TCP connection to `address`, which the kernel's policy
+    /// allowed; `ENETUNREACH` where the host has no network.
+    fn connect(
+        &self,
+        _address: core::net::SocketAddr,
+    ) -> Result<std::sync::Arc<net::Stream>, Errno> {
+        Err(net::UNREACHABLE)
+    }
+    /// Starts resolving `name`, which the kernel's policy allowed.
+    fn resolve(&self, _name: &str) -> Result<std::sync::Arc<net::Lookup>, Errno> {
+        Err(net::UNREACHABLE)
+    }
 }
 
 /// Maps a host I/O error to the errno the guest sees.
@@ -327,6 +342,15 @@ impl Host for NativeHost {
 
     fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno> {
         write_through(&mut io::stdout().lock(), buf)
+    }
+    fn connect(
+        &self,
+        address: core::net::SocketAddr,
+    ) -> Result<std::sync::Arc<net::Stream>, Errno> {
+        native_net::connect(address)
+    }
+    fn resolve(&self, name: &str) -> Result<std::sync::Arc<net::Lookup>, Errno> {
+        native_net::resolve(name)
     }
 
     fn write_stderr(&self, buf: &[u8]) -> Result<usize, Errno> {
@@ -439,6 +463,14 @@ mod tests {
         assert_eq!(
             host.wait_until(ClockId::Monotonic, 0, &cancel),
             Err(Errno::ENOSYS)
+        );
+        assert!(
+            host.connect("127.0.0.1:1".parse().unwrap())
+                .is_err_and(|e| e == net::UNREACHABLE)
+        );
+        assert!(
+            host.resolve("localhost")
+                .is_err_and(|e| e == net::UNREACHABLE)
         );
     }
 

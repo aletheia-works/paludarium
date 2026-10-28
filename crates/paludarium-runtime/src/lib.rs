@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 mod workers;
 use paludarium_host::Host;
 use paludarium_jit::{CodeCache, NoopCodeCache};
+pub use paludarium_kernel::{InvalidRule, NetworkPolicy};
 use paludarium_kernel::{Kernel, SignalInbox};
 use paludarium_loader::{StartInfo, load};
 use paludarium_mmu::{AddressSpace, MemoryMeter};
@@ -126,6 +127,9 @@ pub struct Config {
     pub jit: bool,
     /// What the guest may take from the host; unlimited by default.
     pub limits: Limits,
+    /// The destinations the guest may reach over TCP, and resolve; no
+    /// network without it.
+    pub network: Option<NetworkPolicy>,
 }
 
 impl Config {
@@ -173,6 +177,13 @@ impl Config {
     #[must_use]
     pub fn with_entry(mut self, entry: GuestEntry) -> Self {
         self.entries.push(entry);
+        self
+    }
+
+    /// Lets the guest reach what `policy` allows.
+    #[must_use]
+    pub fn with_network(mut self, policy: NetworkPolicy) -> Self {
+        self.network = Some(policy);
         self
     }
 }
@@ -415,6 +426,9 @@ impl Session {
         }
         if let Some(max) = self.config.limits.open_files {
             kernel = kernel.with_open_file_limit(max);
+        }
+        if let Some(policy) = &self.config.network {
+            kernel = kernel.with_network(policy.clone());
         }
         if let Some(cwd) = &self.config.cwd {
             kernel = kernel.with_current_directory(cwd).map_err(|_| {

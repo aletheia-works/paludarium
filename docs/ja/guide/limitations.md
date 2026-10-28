@@ -6,8 +6,26 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 
 - **動的リンクのプログラム**：静的にリンクしたプログラムだけを動かせます。
 - **32-bit の x86、AVX、AVX-512、x87、MMX**：対象外です。
-- **ネットワーク**：`socket()` はいつも `EAFNOSUPPORT` を返します。使えるのは、
-  AF_UNIX の `socketpair`（`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）だけです。
+- **ネットワーク**：許可の一覧（`--allow-net`、`Config::with_network`）がなければ、
+  `socket()` はどのファミリーにも `EAFNOSUPPORT` を返します。一覧があっても、使えるのは
+  TCP のクライアントと名前解決だけです（[ネットワーク](./features#network)）。
+  - `listen` は `EOPNOTSUPP`、0 以外のポートへの `bind` は `EACCES` なので、ゲストは
+    サーバーになれません。
+  - UDP のソケットが届くのは DNS の代わりだけです。ほかのポートへのデータグラムは
+    `ENETUNREACH` です。raw ソケットは `EPERM`、ICMP のソケットは `EACCES`、ほかの種類
+    （Linux がモジュールを読み込んで作る SCTP の `SOCK_SEQPACKET` など）は
+    `ESOCKTNOSUPPORT` です。
+  - `socket(AF_UNIX)` はこれまでどおり `EAFNOSUPPORT` で、ソケットのペアへの
+    `connect` と `bind` は `ENOSYS` です。
+  - DNS の代わりが答えるのは `A` と `AAAA` だけで、512 バイトまでに収め、TCP では
+    答えません。ホストが引けない名前は `SERVFAIL` です。
+  - 接続が開く前の `getsockname` は、未指定のアドレスとポート 0 を返します。Linux
+    では取ったポートを返します。`SIOCOUTQ` は、相手がまだ受け取りを確かめていない分では
+    なく、ホストがまだ送りに取っていない分を数えます。`SO_SNDBUF` と `SO_RCVBUF` は
+    `getsockopt` のために覚えますが、バッファの大きさは変えません（どちらの向きも
+    256 KiB です）。`TCP_NODELAY` 以外のオプションはホストのソケットに届きません。
+  - これらのソケットでは `O_ASYNC` と `FIOASYNC` が効かず、`MSG_OOB` は緊急データを
+    見つけません（`EINVAL`）。
 - **ファイルのマッピング**：ファイルのマッピングは Linux と同じくファイルのページ
   キャッシュを見せます（`MAP_PRIVATE` のものは、まだ書いていないページで）。ただし、
   `MAP_SHARED` のマッピングへの書き込みがホストのファイルに届くのは、ゲストが

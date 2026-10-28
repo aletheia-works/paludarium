@@ -17,6 +17,8 @@ mod epoll;
 mod events;
 mod fasync;
 mod files;
+mod inet;
+pub use inet::{InvalidRule, NetworkPolicy};
 mod futex;
 mod memfd;
 mod page_cache;
@@ -263,6 +265,15 @@ impl Kernel {
     #[must_use]
     pub fn with_unimplemented_log(mut self, log: Arc<Mutex<BTreeSet<u64>>>) -> Self {
         self.unimplemented = log;
+        self
+    }
+
+    /// Lets the guest reach the destinations `policy` allows, over TCP, and
+    /// resolve their names. Without it, `socket` refuses `AF_INET` and
+    /// `AF_INET6`.
+    #[must_use]
+    pub fn with_network(mut self, policy: NetworkPolicy) -> Self {
+        self.files.network = Some(Arc::new(inet::Network::new(policy)));
         self
     }
 

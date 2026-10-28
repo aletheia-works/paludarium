@@ -21,6 +21,7 @@ struct Streams {
     stdin_live: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    network: bool,
 }
 
 impl Default for Streams {
@@ -36,6 +37,7 @@ impl Default for Streams {
             stdin_live: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            network: false,
         }
     }
 }
@@ -92,6 +94,11 @@ impl RecordingHost {
     /// Adds bytes to standard input.
     pub fn push_stdin(&self, bytes: &[u8]) {
         self.lock().stdin.extend_from_slice(bytes);
+    }
+    /// Connects and resolves through the native host's network, for the
+    /// differential tests of guests that use one.
+    pub fn enable_network(&self) {
+        self.lock().network = true;
     }
     /// Ends standard input, which is then readable at its end.
     pub fn close_stdin(&self) {
@@ -207,5 +214,24 @@ impl Host for RecordingHost {
     fn random_bytes(&self, buf: &mut [u8]) -> Result<(), Error> {
         buf.fill(Self::RANDOM_BYTE);
         Ok(())
+    }
+    fn connect(
+        &self,
+        address: core::net::SocketAddr,
+    ) -> Result<std::sync::Arc<crate::net::Stream>, Errno> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.lock().network {
+            return crate::native_net::connect(address);
+        }
+        let _ = address;
+        Err(crate::net::UNREACHABLE)
+    }
+    fn resolve(&self, name: &str) -> Result<std::sync::Arc<crate::net::Lookup>, Errno> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.lock().network {
+            return crate::native_net::resolve(name);
+        }
+        let _ = name;
+        Err(crate::net::UNREACHABLE)
     }
 }

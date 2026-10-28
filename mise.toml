@@ -66,7 +66,7 @@ PALUDARIUM_TEST_NODE="${PALUDARIUM_TEST_NODE:-$(command -v node)}" cargo test --
 
 [tasks."test:diff"]
 description = "Differential tests against native Linux (x86-64 Linux only; elsewhere use `mise run linux-dev -- ...`)"
-run = "cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes -- --nocapture"
+run = "cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network -- --nocapture"
 
 [tasks.coverage]
 description = "Line coverage with the 80 % floor (x86-64 Linux)"

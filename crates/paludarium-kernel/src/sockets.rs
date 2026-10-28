@@ -256,8 +256,58 @@ impl FileHandle for PipeEnd {
 }
 
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let result = (|| match c.cpu.gpr[paludarium_cpu::reg::RAX] {
-        41 => Err(Errno(97)),
+    let number = c.cpu.gpr[paludarium_cpu::reg::RAX];
+    let result = (|| match number {
+        // AF_INET and AF_INET6, with a network; AF_UNIX sockets come only
+        // from socketpair.
+        41 => match c.files.network.clone() {
+            Some(network) if matches!(a[0], 2 | 10) => {
+                if a[1] as u32 & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                crate::inet::socket(c, a, &network)
+            }
+            _ => Err(Errno(97)),
+        },
+        42..=52 | 54 | 55 | 288
+            if c.files
+                .descriptor(a[0])
+                .is_ok_and(|d| crate::inet::of(&d.file).is_some()) =>
+        {
+            let file = c.files.descriptor(a[0])?.file;
+            crate::inet::dispatch(c, number, a, &file)
+        }
+        // A socket pair cannot connect or bind to a path.
+        42 | 49 => {
+            socket(c, a[0])?;
+            Err(Errno::ENOSYS)
+        }
+        // A socket pair is unbound and unnamed: never listening, and its
+        // address and its peer's are AF_UNIX with no path.
+        43 | 288 | 50 => {
+            let file = socket(c, a[0])?;
+            let socket = as_socket(&file)?;
+            Err(if socket.pair.kind == SOCK_DGRAM {
+                Errno(95)
+            } else {
+                Errno::EINVAL
+            })
+        }
+        51 | 52 => {
+            socket(c, a[0])?;
+            let mut raw = [0; 4];
+            c.mem
+                .read(GuestAddr(a[2]), &mut raw)
+                .map_err(|_| Errno::EFAULT)?;
+            let room = usize::try_from(i32::from_le_bytes(raw)).map_err(|_| Errno::EINVAL)?;
+            c.mem
+                .write(GuestAddr(a[1]), &1u16.to_le_bytes()[..room.min(2)])
+                .map_err(|_| Errno::EFAULT)?;
+            c.mem
+                .write(GuestAddr(a[2]), &2u32.to_le_bytes())
+                .map_err(|_| Errno::EFAULT)?;
+            Ok(0)
+        }
         53 => {
             if a[0] != 1 {
                 return Err(Errno(97));
@@ -331,19 +381,23 @@ const CMSG_HEADER: usize = 16;
 const MAX_CONTROL: u64 = 128 * 1024;
 
 /// A `struct user_msghdr`, as Linux's `__copy_msghdr` checks it.
-struct MessageHeader {
+pub(crate) struct MessageHeader {
     /// `msg_name` when it and `msg_namelen` are both non-zero.
-    name: Option<(u64, usize)>,
+    pub(crate) name: Option<(u64, usize)>,
     /// Whether `msg_name` is set, so recvmsg writes back its length.
-    has_name: bool,
-    iov: Vec<(u64, usize)>,
+    pub(crate) has_name: bool,
+    pub(crate) iov: Vec<(u64, usize)>,
     control: u64,
     control_len: u64,
 }
 /// Reads the `msghdr` at `at` (EFAULT): a negative `msg_namelen` with a name
 /// is EINVAL, a longer one counts as `sockaddr_storage`'s 128 bytes, and
 /// more than 1024 iovecs are EMSGSIZE.
-fn message_header(c: &Context<'_>, at: u64, write: bool) -> Result<MessageHeader, Errno> {
+pub(crate) fn message_header(
+    c: &Context<'_>,
+    at: u64,
+    write: bool,
+) -> Result<MessageHeader, Errno> {
     let mut raw = [0; 56];
     c.mem
         .read(GuestAddr(at), &mut raw)
@@ -452,6 +506,9 @@ pub(crate) fn polled_full(file: &Arc<dyn FileHandle>) {
 /// `SIOCOUTQ` what the peer has not read, where Linux's `unix_outq_len`
 /// also counts each message's overhead.
 pub(crate) fn queued(file: &Arc<dyn FileHandle>, outgoing: bool) -> Option<Result<usize, Errno>> {
+    if let Some(socket) = crate::inet::of(file) {
+        return Some(Ok(socket.queued(outgoing)));
+    }
     let any = file.as_any()?;
     if let Some(pipe) = any.downcast_ref::<PipeEnd>() {
         let end = &pipe.endpoint;
@@ -591,7 +648,7 @@ const TASK_SIZE_MAX: u64 = 0x7fff_ffff_f000;
 /// before the descriptor is looked up: at most `MAX_RW_COUNT`, and EFAULT
 /// when it reaches past the user half (`access_ok`). A buffer there that is
 /// not mapped is EFAULT only when it is copied.
-fn user_buffer(at: u64, len: u64) -> Result<usize, Errno> {
+pub(crate) fn user_buffer(at: u64, len: u64) -> Result<usize, Errno> {
     let len = usize::try_from(len.min(0x7fff_f000)).map_err(|_| Errno::EFAULT)?;
     access_ok(at, len)?;
     Ok(len)
@@ -1091,7 +1148,7 @@ pub(crate) enum Timeout {
 impl Timeout {
     /// Linux's `sock_set_timeout` of a `timeval` (EDOM for microseconds
     /// outside a second).
-    fn from_timeval(seconds: i64, micros: i64) -> Result<Self, Errno> {
+    pub(crate) fn from_timeval(seconds: i64, micros: i64) -> Result<Self, Errno> {
         if !(0..1_000_000).contains(&micros) {
             return Err(Errno(33));
         }
@@ -1110,7 +1167,7 @@ impl Timeout {
         })
     }
     /// The `timeval` getsockopt gives back, zero unless there is a limit.
-    fn timeval(self) -> [u8; 16] {
+    pub(crate) fn timeval(self) -> [u8; 16] {
         let (seconds, micros) = match self {
             Timeout::Ticks(ticks) => (ticks / HZ, ticks % HZ * (1_000_000 / HZ)),
             _ => (0, 0),
@@ -1150,6 +1207,9 @@ pub(crate) fn deadline(
     file: &Arc<dyn FileHandle>,
     receive: bool,
 ) -> Result<Wait, Errno> {
+    if let Some(socket) = crate::inet::of(file) {
+        return wait_for(c, socket.timeout(receive));
+    }
     let Some(socket) = file
         .as_any()
         .and_then(|any| any.downcast_ref::<SocketPairEnd>())
@@ -1160,21 +1220,26 @@ pub(crate) fn deadline(
         .options
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    Ok(
-        match if receive {
+    wait_for(
+        c,
+        if receive {
             options.receive_timeout
         } else {
             options.send_timeout
-        } {
-            Timeout::Forever => Wait::Forever,
-            Timeout::Never => Wait::Now,
-            Timeout::Ticks(ticks) => Wait::Until(
-                c.host
-                    .clock(paludarium_host::ClockId::Monotonic)?
-                    .saturating_add(ticks.saturating_mul(1_000_000_000 / HZ)),
-            ),
         },
     )
+}
+/// How long a blocking call with `timeout` may wait, from now.
+pub(crate) fn wait_for(c: &Context<'_>, timeout: Timeout) -> Result<Wait, Errno> {
+    Ok(match timeout {
+        Timeout::Forever => Wait::Forever,
+        Timeout::Never => Wait::Now,
+        Timeout::Ticks(ticks) => Wait::Until(
+            c.host
+                .clock(paludarium_host::ClockId::Monotonic)?
+                .saturating_add(ticks.saturating_mul(1_000_000_000 / HZ)),
+        ),
+    })
 }
 impl Default for Options {
     fn default() -> Self {

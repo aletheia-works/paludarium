@@ -7,9 +7,28 @@ verified.
 
 - **Dynamically linked programs**: only statically linked programs run.
 - **32-bit x86, AVX, AVX-512, x87, MMX**: out of scope.
-- **Network**: `socket()` always returns `EAFNOSUPPORT`; only AF_UNIX
-  `socketpair` (`SOCK_STREAM`, `SOCK_SEQPACKET` or `SOCK_DGRAM`) is
-  available.
+- **Network**: without an allow list (`--allow-net`,
+  `Config::with_network`) `socket()` returns `EAFNOSUPPORT` for every family.
+  With one, only TCP clients and name resolution work
+  ([Network](./features#network)):
+  - `listen` is `EOPNOTSUPP`, and `bind` to a port other than 0 is `EACCES`,
+    so a guest cannot serve.
+  - A UDP socket reaches only the DNS stub; a datagram to another port is
+    `ENETUNREACH`. Raw sockets are `EPERM`, ICMP sockets `EACCES`, and other
+    kinds (SCTP's `SOCK_SEQPACKET`, which Linux loads a module for)
+    `ESOCKTNOSUPPORT`.
+  - `socket(AF_UNIX)` is `EAFNOSUPPORT` as before, and `connect` and `bind`
+    on a socket pair are `ENOSYS`.
+  - The DNS stub answers only `A` and `AAAA`, in at most 512 bytes and never
+    over TCP; a name the host cannot resolve is `SERVFAIL`.
+  - Before a connection is open, `getsockname` gives the unspecified address
+    with port 0, where Linux gives the port it took. `SIOCOUTQ` counts what the
+    host has not yet taken to send, not what the peer has not acknowledged.
+    `SO_SNDBUF` and `SO_RCVBUF` are kept for `getsockopt` but do not size the
+    buffers, which hold 256 KiB each way; the other options but
+    `TCP_NODELAY` do not reach the host's socket.
+  - `O_ASYNC` and `FIOASYNC` do not work on these sockets, and `MSG_OOB` finds
+    no urgent data (`EINVAL`).
 - **File mappings**: a file mapping shows the file's page cache as on Linux
   (a `MAP_PRIVATE` one in the pages it has not written), but the stores of a
   `MAP_SHARED` mapping reach the file on the host only when the guest reads

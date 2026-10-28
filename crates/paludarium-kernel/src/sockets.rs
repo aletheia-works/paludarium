@@ -1304,7 +1304,8 @@ fn read_words(c: &Context<'_>, at: u64, len: usize) -> Result<Vec<u8>, Errno> {
 
 /// Descriptors passed with `SCM_RIGHTS`: what one write or message carries.
 pub(crate) type Passed = Vec<crate::files::Descriptor>;
-/// One successful write, as Linux queues an `sk_buff`.
+/// One successful write, or one part of a stream's, as Linux queues an
+/// `sk_buff`.
 struct Write {
     len: usize,
     passed: Passed,
@@ -1461,6 +1462,10 @@ impl Pair {
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
 const SOCK_SEQPACKET: u32 = 5;
+/// The most bytes in one part of a stream write: a page's head, less
+/// Linux's `skb_shared_info`, and 32 KiB of pages (`UNIX_SKB_FRAGS_SZ`), as
+/// x86-64 Linux sizes them.
+const MAX_PART: usize = 4096 - 320 + 32 * 1024;
 /// Linux refuses a message longer than the send buffer less 32 bytes.
 const MAX_MESSAGE: usize = SEND_WINDOW - 32;
 pub(crate) struct SocketPairEnd {
@@ -2216,12 +2221,15 @@ impl SocketPairEnd {
         passed: &mut Passed,
         sender: Sender,
     ) -> Result<usize, Errno> {
-        let result = self.send_data(buf, passed, sender);
+        let part = self.part_size();
+        let result = self.send_data(buf, passed, sender, part);
         match result {
             // The peer has data (a message may be empty), as Linux's
-            // `sk_data_ready` tells it.
+            // `sk_data_ready` tells it for each part.
             Ok(count) if count != 0 || self.pair.messages() => {
-                self.notify(1 - self.side, Reason::In);
+                for _ in 0..count.div_ceil(part).max(1) {
+                    self.notify(1 - self.side, Reason::In);
+                }
             }
             Err(e) if e == Errno::EAGAIN => {
                 self.pair
@@ -2234,7 +2242,31 @@ impl SocketPairEnd {
         }
         result
     }
-    fn send_data(&self, buf: &[u8], passed: &mut Passed, sender: Sender) -> Result<usize, Errno> {
+    /// The most bytes a stream write puts in one part, as Linux's
+    /// `unix_stream_sendmsg` sizes its buffers: half the send buffer less 64
+    /// bytes, and at most [`MAX_PART`]. A pipe's write is one part.
+    fn part_size(&self) -> usize {
+        if self.is_pipe() || self.pair.messages() {
+            return usize::MAX;
+        }
+        let send_buffer = self
+            .options
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send_buffer;
+        usize::try_from(send_buffer / 2 - 64)
+            .unwrap_or(1)
+            .clamp(1, MAX_PART)
+    }
+    /// Sends `buf`, a stream's in parts of at most `part` bytes, the
+    /// descriptors with the first, as Linux's `unix_stream_sendmsg` does.
+    fn send_data(
+        &self,
+        buf: &[u8],
+        passed: &mut Passed,
+        sender: Sender,
+        part: usize,
+    ) -> Result<usize, Errno> {
         let mut sides = self
             .pair
             .sides
@@ -2328,17 +2360,15 @@ impl SocketPairEnd {
             return Err(Errno::EAGAIN);
         }
         peer.bytes.try_reserve(count).map_err(|_| Errno::ENOMEM)?;
-        if count != 0 {
-            peer.writes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
-        }
-        // Additional bytes wake a readable peer's poll callback as well.
-        if count != 0 {
+        peer.writes
+            .try_reserve(count.div_ceil(part))
+            .map_err(|_| Errno::ENOMEM)?;
+        for chunk in buf[..count].chunks(part) {
+            // Additional bytes wake a readable peer's poll callback as well.
             peer.input_epoch = peer.input_epoch.wrapping_add(1);
-        }
-        peer.bytes.extend(buf[..count].iter().copied());
-        if count != 0 {
+            peer.bytes.extend(chunk.iter().copied());
             peer.writes.push_back(Write {
-                len: count,
+                len: chunk.len(),
                 passed: std::mem::take(passed),
                 piece: Piece::Data,
                 credentials,
@@ -2447,6 +2477,30 @@ mod events_tests {
         assert_eq!(b.receive(&mut buf, true, true).unwrap().count, 1);
         assert_eq!(b.receive(&mut buf, true, false).unwrap().count, 1);
         assert_eq!(peek_offset(&b), -2);
+    }
+    #[test]
+    fn a_stream_write_goes_in_parts() {
+        let [a, b] = pair();
+        send(&a, &[1; 100_000]);
+        let parts = |end: &SocketPairEnd| -> Vec<usize> {
+            end.lock_sides()[end.side]
+                .writes
+                .iter()
+                .map(|write| write.len)
+                .collect()
+        };
+        assert_eq!(parts(&b), [MAX_PART, MAX_PART, 100_000 - 2 * MAX_PART]);
+        // Half the send buffer, less 64 bytes, as SO_SNDBUF 10000 sets it.
+        let [c, d] = pair();
+        c.options
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send_buffer = 20_000;
+        send(&c, &[2; 20_000]);
+        assert_eq!(parts(&d), [9936, 9936, 128]);
+        // A plain read reads on across parts.
+        let mut buf = vec![0; 200_000];
+        assert_eq!(b.receive(&mut buf, true, false).unwrap().count, 100_000);
     }
     #[test]
     fn a_message_peek_passes_over_whole_messages() {

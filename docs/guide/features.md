@@ -142,6 +142,11 @@ kernel.
   whole length. `sendmsg` and `sendto` take `MSG_NOSIGNAL` and
   `MSG_DONTWAIT`. `MSG_OOB` on a datagram or packet socket is `EOPNOTSUPP`.
   The other flags have no effect, as on Linux.
+- A stream write goes in parts, as Linux's `unix_stream_sendmsg` sends it:
+  each at most 36544 bytes (a page's head and 32 KiB of pages), or half the
+  send buffer `SO_SNDBUF` sets less 64 bytes. The descriptors go with the
+  first part, so a read that takes them ends there, and each part signals
+  the `O_ASYNC` owner. Datagram and packet messages go whole.
 - A stream has out-of-band data as Linux 7.0's AF_UNIX keeps it. A `MSG_OOB`
   send makes its last byte the out-of-band byte (an empty one is
   `EOPNOTSUPP`), after the rest of its data, and an earlier byte not yet

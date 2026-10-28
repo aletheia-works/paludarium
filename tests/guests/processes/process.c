@@ -2624,6 +2624,51 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
+    if (!strcmp(mode, "socket-parts")) {
+        /* A stream write goes in parts, as Linux's unix_stream_sendmsg
+           sends it: at most a page's head and 32 KiB of pages, or half the
+           send buffer less 64 bytes, each, with the descriptors in the
+           first, where a read of them ends. Each part signals O_ASYNC's
+           owner. Messages go whole. */
+        static char data[100000], got[sizeof data + 1];
+        int sv[2], fd, flags, value;
+        long n;
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, IO_RT);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        const int kinds[] = {SOCK_STREAM, SOCK_SEQPACKET};
+        for (int k = 0; k < 2; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            printf("kind %d\n", kinds[k]);
+            io_async(sv[1], IO_RT);
+            n = send_fds(sv[0], data, sizeof data, &sv[0], 1);
+            printf("  send=%ld errno=%d in=%d\n", n, n < 0 ? errno : 0, io_count(POLL_IN));
+            n = receive_fd(sv[1], got, sizeof got, MSG_PEEK | MSG_DONTWAIT, &fd, &flags);
+            printf("  peek=%ld fd=%d\n", n, fd >= 0);
+            if (fd >= 0) close(fd);
+            n = receive_fd(sv[1], got, sizeof got, MSG_WAITALL, &fd, &flags);
+            printf("  waitall=%ld fd=%d\n", n, fd >= 0);
+            if (fd >= 0) close(fd);
+            n = receive_fd(sv[1], got, sizeof got, MSG_DONTWAIT, &fd, &flags);
+            printf("  rest=%ld errno=%d fd=%d\n", n, n < 0 ? errno : 0, fd >= 0);
+            if (fd >= 0) close(fd);
+            /* SO_SNDBUF 10000 is a send buffer of 20000: parts of 9936. */
+            value = 10000;
+            setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &value, sizeof value);
+            n = send_fds(sv[0], data, 2 * 9936, &sv[0], 1);
+            printf("  small-send=%ld errno=%d in=%d\n", n, n < 0 ? errno : 0, io_count(POLL_IN));
+            n = receive_fd(sv[1], got, sizeof got, MSG_DONTWAIT, &fd, &flags);
+            printf("  small=%ld fd=%d\n", n, fd >= 0);
+            if (fd >= 0) close(fd);
+            n = receive_fd(sv[1], got, sizeof got, MSG_DONTWAIT, &fd, &flags);
+            printf("  small-rest=%ld errno=%d fd=%d\n", n, n < 0 ? errno : 0, fd >= 0);
+            if (fd >= 0) close(fd);
+            close(sv[0]);
+            close(sv[1]);
+        }
+        return 0;
+    }
     if (!strcmp(mode, "socket-oob")) {
         /* A stream's out-of-band byte, as Linux's AF_UNIX keeps it: the last
            byte of a MSG_OOB send, which reads stop before, SIOCATMARK and

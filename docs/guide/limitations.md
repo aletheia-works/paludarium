@@ -31,9 +31,6 @@ verified.
   these differences:
   - The guest is root, so `SCM_CREDENTIALS` may name any process, user and
     group, where Linux lets an unprivileged process send only its own.
-  - Linux splits a stream write of more than about 32 KiB into parts and
-    passes its descriptors with the first part, so a read ends at the end of
-    that part. Here it ends at the end of the whole write.
   - A socket whose descriptor waits unread in a socket that only that
     descriptor keeps open, such as its own, stays open: Linux's garbage
     collector would close both.
@@ -53,8 +50,6 @@ verified.
   - **Full socket.** A socket whose send found the buffer full signals as
     soon as a read makes any room; Linux waits until three quarters of the
     buffer is free.
-  - **Large stream write.** A stream write signals once; Linux sends one
-    signal for each part it splits a write of more than about 32 KiB into.
   - **Pipe write that waits.** A pipe write that waits more than once
     signals the reader before the first wait only; Linux signals before each
     wait.

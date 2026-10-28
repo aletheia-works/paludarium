@@ -2189,3 +2189,118 @@ mod signal_driven_io {
         assert_eq!(m.read_u64(GuestAddr(DATA + 8)).unwrap(), 1 << 32 | 2);
     }
 }
+mod socket_credentials {
+    use super::*;
+    const MESSAGE: u64 = DATA + 256;
+    const CONTROL: u64 = DATA + 512;
+    /// A socket pair of `kind` whose second end passes credentials.
+    fn pair(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, kind: u64) -> (u64, u64) {
+        assert_eq!(syscall(k, t, m, 53, [1, kind, 0, DATA, 0, 0]), 0);
+        let fds = m.read_u64(GuestAddr(DATA)).unwrap();
+        let (a, b) = (fds & 0xffff_ffff, fds >> 32);
+        m.write(GuestAddr(DATA + 16), &1i32.to_le_bytes()).unwrap();
+        assert_eq!(syscall(k, t, m, 54, [b, 1, 16, DATA + 16, 4, 0]), 0);
+        (a, b)
+    }
+    /// A msghdr of one byte at DATA + 64 and `control_len` control bytes.
+    fn message(m: &AddressSpace, control_len: u64) {
+        m.write_u64(GuestAddr(DATA + 128), DATA + 64).unwrap();
+        m.write_u64(GuestAddr(DATA + 136), 1).unwrap();
+        m.write(GuestAddr(MESSAGE), &[0; 56]).unwrap();
+        m.write_u64(GuestAddr(MESSAGE + 16), DATA + 128).unwrap();
+        m.write_u64(GuestAddr(MESSAGE + 24), 1).unwrap();
+        m.write_u64(GuestAddr(MESSAGE + 32), CONTROL).unwrap();
+        m.write_u64(GuestAddr(MESSAGE + 40), control_len).unwrap();
+    }
+    fn send(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, fd: u64, ids: [u32; 3]) -> u64 {
+        m.write_u64(GuestAddr(CONTROL), 28).unwrap();
+        m.write(GuestAddr(CONTROL + 8), &1u32.to_le_bytes())
+            .unwrap();
+        m.write(GuestAddr(CONTROL + 12), &2u32.to_le_bytes())
+            .unwrap();
+        for (i, id) in ids.into_iter().enumerate() {
+            m.write(GuestAddr(CONTROL + 16 + 4 * i as u64), &id.to_le_bytes())
+                .unwrap();
+        }
+        message(m, 32);
+        syscall(k, t, m, 46, [fd, MESSAGE, 0, 0, 0, 0])
+    }
+    /// recvmsg's result and the credentials it gives.
+    fn receive(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, fd: u64) -> (u64, [u32; 3]) {
+        m.write(GuestAddr(CONTROL), &[0; 64]).unwrap();
+        message(m, 64);
+        let n = syscall(k, t, m, 47, [fd, MESSAGE, 0x40, 0, 0, 0]);
+        let mut raw = [0; 12];
+        m.read(GuestAddr(CONTROL + 16), &mut raw).unwrap();
+        let ids = [0, 4, 8].map(|i| u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()));
+        (n, ids)
+    }
+    #[test]
+    fn root_sends_the_credentials_of_any_process_and_ids() {
+        let (mut k, mut t, m) = setup();
+        let (_, child, _) = fork(&mut k, &mut t, &m);
+        let (a, b) = pair(&mut k, &mut t, &m, 2);
+        let child = child.tid;
+        assert_eq!(send(&mut k, &mut t, &m, a, [child, 1234, 5678]), 1);
+        assert_eq!(receive(&mut k, &mut t, &m, b), (1, [child, 1234, 5678]));
+        // A process ID must name one, and neither ID be -1.
+        let esrch = Errno(3).to_syscall_return();
+        assert_eq!(send(&mut k, &mut t, &m, a, [999_999, 0, 0]), esrch);
+        assert_eq!(send(&mut k, &mut t, &m, a, [0, 0, 0]), esrch);
+        assert_eq!(send(&mut k, &mut t, &m, a, [u32::MAX, 0, 0]), esrch);
+        let einval = Errno::EINVAL.to_syscall_return();
+        assert_eq!(send(&mut k, &mut t, &m, a, [child, u32::MAX, 0]), einval);
+        assert_eq!(send(&mut k, &mut t, &m, a, [child, 0, u32::MAX]), einval);
+        assert_eq!(
+            receive(&mut k, &mut t, &m, b).0,
+            Errno::EAGAIN.to_syscall_return()
+        );
+    }
+    #[test]
+    fn a_stream_does_not_read_writes_of_other_credentials_together() {
+        let (mut k, mut t, m) = setup();
+        let (_, child, _) = fork(&mut k, &mut t, &m);
+        let pid = syscall(&mut k, &mut t, &m, 39, [0; 6]) as u32;
+        let (a, b) = pair(&mut k, &mut t, &m, 1);
+        assert_eq!(send(&mut k, &mut t, &m, a, [child.tid, 0, 0]), 1);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [a, DATA + 64, 1, 0, 0, 0]),
+            1
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [a, DATA + 64, 1, 0, 0, 0]),
+            1
+        );
+        // A peek stops where a read would.
+        let peek = syscall(&mut k, &mut t, &m, 45, [b, DATA + 300, 8, 0x42, 0, 0]);
+        assert_eq!(peek, 1);
+        assert_eq!(receive(&mut k, &mut t, &m, b), (1, [child.tid, 0, 0]));
+        // MSG_WAITALL stops there too, without waiting.
+        let all = syscall(&mut k, &mut t, &m, 45, [b, DATA + 300, 2, 0x100, 0, 0]);
+        assert_eq!(all, 2);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [a, DATA + 64, 1, 0, 0, 0]),
+            1
+        );
+        assert_eq!(send(&mut k, &mut t, &m, a, [child.tid, 0, 0]), 1);
+        let all = syscall(&mut k, &mut t, &m, 45, [b, DATA + 300, 8, 0x102, 0, 0]);
+        assert_eq!(all, 1);
+        assert_eq!(receive(&mut k, &mut t, &m, b), (1, [pid, 0, 0]));
+        assert_eq!(receive(&mut k, &mut t, &m, b), (1, [child.tid, 0, 0]));
+        // Without SO_PASSCRED they are read together.
+        m.write(GuestAddr(DATA + 16), &0i32.to_le_bytes()).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 54, [b, 1, 16, DATA + 16, 4, 0]),
+            0
+        );
+        assert_eq!(send(&mut k, &mut t, &m, a, [child.tid, 0, 0]), 1);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [a, DATA + 64, 1, 0, 0, 0]),
+            1
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 0, [b, DATA + 300, 8, 0, 0, 0]),
+            2
+        );
+    }
+}

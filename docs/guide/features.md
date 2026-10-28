@@ -42,7 +42,7 @@ kernel.
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIONBIO`, `SIOCATMARK`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
-| Sockets | `socket` (always `EAFNOSUPPORT`), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (always `EAFNOSUPPORT`), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -180,6 +180,15 @@ kernel.
   `SO_ACCEPTCONN` and `SO_PEERCRED` (the process that made the pair) can only
   be read. `SO_SNDBUF` and `SO_RCVBUF` are doubled and kept at Linux's
   floors and ceiling, and `SO_LINGER` takes a `struct linger`.
+- `SO_PASSCRED` makes messages carry credentials, as Linux's AF_UNIX does.
+  A message sent while either end has it carries the sender's process ID,
+  user and group, or those `SCM_CREDENTIALS` gives. A receiver with it gets
+  them in an `SCM_CREDENTIALS` message, before any descriptors; a message
+  sent without them reads as process 0 with user and group 65534. Such a
+  receiver's stream reads, `read` and `MSG_WAITALL` too, do not read writes
+  of other credentials together. `SCM_CREDENTIALS` must hold one
+  `struct ucred` (`EINVAL` otherwise) and name a process (`ESRCH`), and
+  neither ID may be -1 (`EINVAL`).
 - `SO_RCVTIMEO` and `SO_SNDTIMEO` (and their `_NEW` forms) limit how long a
   blocking `recv`, `read`, `send` or `write` on the socket waits, as on
   Linux: past the limit it gives `EAGAIN`, or what it moved, and

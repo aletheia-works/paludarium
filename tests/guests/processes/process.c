@@ -121,6 +121,97 @@ static long send_fds(int socket, const char *data, size_t len, const int *fds, i
     errno = 0;
     return sendmsg(socket, &message, 0);
 }
+/* The child whose messages socket-credentials receives. */
+static pid_t credentials_child;
+/* A process ID as socket-credentials prints it, free of the IDs a run
+   gets: this process, its child, or the number (0 for none). */
+static void print_pid(const char *name, pid_t pid) {
+    if (pid == getpid())
+        printf(" %s=self", name);
+    else if (pid == credentials_child && pid)
+        printf(" %s=child", name);
+    else
+        printf(" %s=%d", name, pid);
+}
+/* A user or group ID: this process's own, or the number (65534 for none). */
+static void print_id(const char *name, unsigned id, unsigned own) {
+    if (id == own)
+        printf(" %s=own", name);
+    else
+        printf(" %s=%u", name, id);
+}
+/* sendmsg of `data` with one SCM_CREDENTIALS message of `pid`, `uid` and
+   `gid`, whose cmsg_len is `cmsg_len`. */
+static long send_credentials(int socket, const char *data, pid_t pid, uid_t uid, gid_t gid, size_t cmsg_len) {
+    struct iovec iov = {(void *)data, strlen(data)};
+    union { char bytes[CMSG_SPACE(sizeof(struct ucred))]; struct cmsghdr align; } control;
+    memset(&control, 0, sizeof control);
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control.bytes,
+                             .msg_controllen = sizeof control.bytes};
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_CREDENTIALS;
+    header->cmsg_len = cmsg_len;
+    struct ucred credentials = {pid, uid, gid};
+    memcpy(CMSG_DATA(header), &credentials, sizeof credentials);
+    errno = 0;
+    return sendmsg(socket, &message, 0);
+}
+/* recvmsg of at most 8 bytes with `room` control bytes (no buffer for 0)
+   and `flags`, without waiting; prints the data, msg_flags, msg_controllen
+   and each control message, as much of its credentials as it holds, and
+   whether its descriptors are open, which it then closes. */
+static void receive_credentials(int socket, size_t room, int flags) {
+    char data[8] = {0};
+    struct iovec iov = {data, sizeof data};
+    union { char bytes[128]; struct cmsghdr align; } control;
+    memset(&control, 0x55, sizeof control);
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = room ? control.bytes : NULL,
+                             .msg_controllen = room};
+    errno = 0;
+    long n = recvmsg(socket, &message, flags | MSG_DONTWAIT);
+    printf("  recv=%ld errno=%d data=%.*s flags=%#x controllen=%zu", n, n < 0 ? errno : 0, n > 0 ? (int)n : 0, data,
+           n < 0 ? 0 : message.msg_flags, n < 0 ? 0 : (size_t)message.msg_controllen);
+    size_t at = 0;
+    while (n >= 0 && at + sizeof(struct cmsghdr) <= message.msg_controllen) {
+        struct cmsghdr *header = (struct cmsghdr *)(control.bytes + at);
+        size_t len = header->cmsg_len;
+        printf(" [%d,%d,%zu", header->cmsg_level, header->cmsg_type, len);
+        if (header->cmsg_type == SCM_CREDENTIALS) {
+            struct ucred credentials;
+            memcpy(&credentials, CMSG_DATA(header), sizeof credentials);
+            if (len >= CMSG_LEN(4))
+                print_pid("pid", credentials.pid);
+            if (len >= CMSG_LEN(8))
+                print_id("uid", credentials.uid, getuid());
+            if (len >= CMSG_LEN(12))
+                print_id("gid", credentials.gid, getgid());
+        } else if (header->cmsg_type == SCM_RIGHTS) {
+            for (size_t i = 0; len >= CMSG_LEN(4 * (i + 1)); i++) {
+                int fd;
+                memcpy(&fd, CMSG_DATA(header) + 4 * i, sizeof fd);
+                printf(" open=%d", fcntl(fd, F_GETFD) >= 0);
+                close(fd);
+            }
+        }
+        printf("]");
+        if (len < sizeof(struct cmsghdr))
+            break;
+        at += CMSG_ALIGN(len);
+    }
+    putchar('\n');
+}
+/* Sends `data` from a child of this process, which then exits. */
+static void send_from_child(int socket, const char *data) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        send(socket, data, strlen(data), 0);
+        _exit(0);
+    }
+    credentials_child = pid;
+    waitpid(pid, NULL, 0);
+}
 /* recvmsg into `len` bytes with `room` control bytes (no buffer for 0);
    prints what came, the descriptors as offsets from `base` with their
    close-on-exec flags, and keeps the first one in *first. */
@@ -2255,6 +2346,125 @@ int main(int argc, char **argv) {
         close(sv[1]);
 #undef OPT_GET
 #undef OPT_SET
+        return 0;
+    }
+    if (!strcmp(mode, "socket-credentials")) {
+        /* SO_PASSCRED and SCM_CREDENTIALS on socket pairs, as Linux's
+           af_unix and scm.c have them: a message carries its sender's
+           credentials when either end passes them, or those SCM_CREDENTIALS
+           gives, and a receiver that passes them gets them before its
+           descriptors. Only credentials an unprivileged process may send are
+           tried. */
+        int sv[2], p[2];
+        long n;
+        char buf[8];
+        pipe(p);
+#define CRED_SET(fd, on) do { int v = on; errno = 0; n = setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &v, sizeof v); \
+        printf("  set passcred=%ld errno=%d\n", n, n < 0 ? errno : 0); } while (0)
+#define CRED_GET(fd) do { int v = -7; socklen_t len = sizeof v; errno = 0; \
+        n = getsockopt(fd, SOL_SOCKET, SO_PASSCRED, &v, &len); \
+        printf("  get passcred=%ld errno=%d v=%d len=%u\n", n, n < 0 ? errno : 0, v, len); } while (0)
+        const int kinds[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int k = 0; k < 3; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            printf("kind %d\n", kinds[k]);
+            CRED_GET(sv[1]);
+            puts(" none");
+            send(sv[0], "a", 1, 0);
+            CRED_SET(sv[1], 5);
+            CRED_GET(sv[1]);
+            receive_credentials(sv[1], 64, 0);
+            puts(" receiver");
+            send(sv[0], "b", 1, 0);
+            receive_credentials(sv[1], 64, MSG_PEEK);
+            receive_credentials(sv[1], 64, 0);
+            puts(" sender");
+            CRED_SET(sv[1], 0);
+            CRED_SET(sv[0], 1);
+            send(sv[0], "c", 1, 0);
+            CRED_SET(sv[1], 1);
+            receive_credentials(sv[1], 64, 0);
+            CRED_SET(sv[0], 0);
+            puts(" explicit");
+            n = send_credentials(sv[0], "d", getpid(), getuid(), getgid(), CMSG_LEN(sizeof(struct ucred)));
+            printf("  send=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            receive_credentials(sv[1], 64, 0);
+            CRED_SET(sv[1], 0);
+            n = send_credentials(sv[0], "e", getpid(), getuid(), getgid(), CMSG_LEN(sizeof(struct ucred)));
+            printf("  send=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            CRED_SET(sv[1], 1);
+            receive_credentials(sv[1], 64, 0);
+            n = send_credentials(sv[0], "f", getpid(), getuid(), getgid(), CMSG_LEN(8));
+            printf("  short=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            n = send_credentials(sv[0], "f", getpid(), getuid(), getgid(), CMSG_LEN(sizeof(struct ucred)) + 4);
+            printf("  long=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            puts(" writers");
+            send_from_child(sv[0], "g");
+            send(sv[0], "h", 1, 0);
+            memset(buf, 0, sizeof buf);
+            n = read(sv[1], buf, sizeof buf);
+            printf("  read=%ld data=%.*s\n", n, n > 0 ? (int)n : 0, buf);
+            receive_credentials(sv[1], 64, 0);
+            send_from_child(sv[0], "i");
+            send(sv[0], "j", 1, 0);
+            receive_credentials(sv[1], 64, 0);
+            receive_credentials(sv[1], 64, 0);
+            send_from_child(sv[0], "k");
+            send(sv[0], "l", 1, 0);
+            memset(buf, 0, sizeof buf);
+            n = recv(sv[1], buf, 2, MSG_WAITALL | MSG_DONTWAIT);
+            printf("  waitall=%ld data=%.*s\n", n, n > 0 ? (int)n : 0, buf);
+            receive_credentials(sv[1], 64, 0);
+            CRED_SET(sv[1], 0);
+            send_from_child(sv[0], "m");
+            send(sv[0], "n", 1, 0);
+            receive_credentials(sv[1], 64, 0);
+            receive_credentials(sv[1], 64, 0);
+            CRED_SET(sv[0], 1);
+            send_from_child(sv[0], "o");
+            send(sv[0], "p", 1, 0);
+            receive_credentials(sv[1], 64, 0);
+            receive_credentials(sv[1], 64, 0);
+            CRED_SET(sv[0], 0);
+            puts(" room");
+            CRED_SET(sv[1], 1);
+            const size_t rooms[] = {0, 8, 16, 20, 24, 28, 32};
+            for (unsigned i = 0; i < sizeof rooms / sizeof *rooms; i++) {
+                send(sv[0], "q", 1, 0);
+                receive_credentials(sv[1], rooms[i], 0);
+            }
+            puts(" descriptors");
+            const size_t fd_rooms[] = {64, 32, 40, 48, 52, 56};
+            for (unsigned i = 0; i < sizeof fd_rooms / sizeof *fd_rooms; i++) {
+                send_fds(sv[0], "r", 1, p, 2);
+                receive_credentials(sv[1], fd_rooms[i], 0);
+            }
+            CRED_SET(sv[1], 0);
+            send_fds(sv[0], "s", 1, p, 1);
+            receive_credentials(sv[1], 64, 0);
+            close(sv[0]);
+            close(sv[1]);
+        }
+        puts("errors");
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        CRED_SET(p[0], 1);
+        {
+            int v = 1;
+            errno = 0;
+            n = setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &v, 2);
+            printf("  short-set=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            socklen_t len = 2;
+            v = -7;
+            errno = 0;
+            n = getsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &v, &len);
+            printf("  short-get=%ld errno=%d v=%d len=%u\n", n, n < 0 ? errno : 0, v, len);
+        }
+        close(sv[0]);
+        close(sv[1]);
+        close(p[0]);
+        close(p[1]);
+#undef CRED_SET
+#undef CRED_GET
         return 0;
     }
     if (!strcmp(mode, "socket-oob")) {

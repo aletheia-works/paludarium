@@ -25,8 +25,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   set-group-ID のプログラムを実行しても、ゲストは root のままです。Linux なら
   ファイルの持ち主やグループになります。
 - **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように
-  `SCM_RIGHTS` でディスクリプタを受け渡します。違いは次のとおりです。
-  - `SCM_CREDENTIALS` は `EINVAL` を返します。
+  `SCM_RIGHTS` でディスクリプタを、`SCM_CREDENTIALS` で資格情報を受け渡します。
+  違いは次のとおりです。
+  - ゲストは root なので、`SCM_CREDENTIALS` にはどのプロセス、ユーザー、グループでも
+    指定できます。Linux では、特権のないプロセスが送れるのは自分のものだけです。
   - Linux は、およそ 32 KiB を超えるストリームへの書き込みをいくつかに分け、
     ディスクリプタを最初の部分と一緒に渡すので、読み込みはその部分の終わりで
     止まります。paludarium では書き込み全体の終わりで止まります。
@@ -34,7 +36,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     ソケット（たとえば自分自身）の中で待っていると、そのソケットは閉じられません。
     Linux ではガベージコレクタが両方を閉じます。
 - **ソケットのオプション**：`setsockopt` は、効き目を再現していないオプションを
-  `ENOPROTOOPT` で断ります。Linux は受け付けます。`SO_PASSCRED`、`SO_PASSSEC`、
+  `ENOPROTOOPT` で断ります。Linux は受け付けます。`SO_PASSSEC`、
   `SO_RCVLOWAT`、`SO_TIMESTAMP`、`SO_PEEK_OFF` と、フィルターなど Linux にある
   ほかのオプションです。`SO_RCVTIMEO` と `SO_SNDTIMEO` は 1000 Hz の刻みに丸めます。
   Linux は自分の `CONFIG_HZ` に丸めます。`SO_SNDBUF` と `SO_RCVBUF` は値を

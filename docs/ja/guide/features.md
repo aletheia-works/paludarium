@@ -36,7 +36,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIONBIO`、`SIOCATMARK`） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socket`（常に `EAFNOSUPPORT`）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタの受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（常に `EAFNOSUPPORT`）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタの受け渡しと、`SCM_CREDENTIALS` での資格情報の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -165,6 +165,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `SO_ERROR`、`SO_ACCEPTCONN`、`SO_PEERCRED`（その組を作ったプロセス）は読むだけです。
   `SO_SNDBUF` と `SO_RCVBUF` は 2 倍にして、Linux の下限と上限に収め、`SO_LINGER` は
   `struct linger` を受け取ります。
+- `SO_PASSCRED` を設定すると、Linux の AF_UNIX と同じく、メッセージが資格情報を運びます。
+  どちらかの端に設定があるときに送ったメッセージは、送り手のプロセス ID、ユーザー、
+  グループを運びます。`SCM_CREDENTIALS` を渡したときは、その値を運びます。設定のある
+  受け手は、それを `SCM_CREDENTIALS` のメッセージで、ディスクリプタより先に受け取ります。
+  資格情報なしで送ったメッセージは、プロセス 0、ユーザーとグループ 65534 として読めます。
+  そのような受け手のストリームの読み込みは、`read` と `MSG_WAITALL` も含めて、資格情報の
+  違う書き込みをまとめて読みません。`SCM_CREDENTIALS` は `struct ucred` をちょうど 1 つ
+  持ち（違えば `EINVAL`）、あるプロセスを指す（違えば `ESRCH`）必要があり、どちらの ID も
+  -1 にはできません（`EINVAL`）。
 - `SO_RCVTIMEO` と `SO_SNDTIMEO`（と `_NEW` の形）は、Linux と同じく、そのソケットでの
   `recv`、`read`、`send`、`write` が待つ時間を限ります。限りを過ぎると `EAGAIN`、または
   そこまでに動かした分を返し、`MSG_WAITALL` もそこで止まります。0 の `timeval` は

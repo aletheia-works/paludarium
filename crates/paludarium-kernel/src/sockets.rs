@@ -315,6 +315,12 @@ const MSG_NOSIGNAL: u64 = 0x4000;
 const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 const SOL_SOCKET: u32 = 1;
 const SCM_RIGHTS: u32 = 1;
+const SCM_CREDENTIALS: u32 = 2;
+/// `struct ucred`: a process ID, a user and a group.
+const UCRED: usize = 12;
+/// The user and group a message without credentials reads as, Linux's
+/// `overflowuid` and `overflowgid`.
+const OVERFLOW_ID: u32 = 65534;
 /// `SCM_MAX_FD`: the most descriptors one message passes.
 const MAX_PASSED: usize = 253;
 /// `struct cmsghdr`: `cmsg_len` (8 bytes), `cmsg_level` and `cmsg_type`.
@@ -406,12 +412,20 @@ fn as_socket(file: &Arc<dyn FileHandle>) -> Result<&SocketPairEnd, Errno> {
         .and_then(|v| v.downcast_ref::<SocketPairEnd>())
         .ok_or(Errno(88))
 }
-/// The descriptors the control messages pass, as Linux's `__scm_send` reads
-/// them: each header must lie in the buffer (EINVAL), levels other than
-/// `SOL_SOCKET` are skipped, and `SOL_SOCKET` takes only `SCM_RIGHTS`
-/// (EINVAL), with at most 253 descriptors in all (EINVAL), each open (EBADF).
-fn passed_descriptors(c: &Context<'_>, control: &[u8]) -> Result<Passed, Errno> {
+/// The descriptors and credentials the control messages pass, as Linux's
+/// `__scm_send` reads them: each header must lie in the buffer (EINVAL),
+/// levels other than `SOL_SOCKET` are skipped, and `SOL_SOCKET` takes only
+/// `SCM_RIGHTS` and `SCM_CREDENTIALS` (EINVAL). `SCM_RIGHTS` passes at most
+/// 253 descriptors in all (EINVAL), each open (EBADF). `SCM_CREDENTIALS` is
+/// exactly one `struct ucred` (EINVAL), the last one counting; as the guest
+/// runs as root, `scm_check_creds` lets any through, but the process ID must
+/// name a process or thread (ESRCH) and neither ID be -1 (EINVAL).
+fn control_messages(
+    c: &Context<'_>,
+    control: &[u8],
+) -> Result<(Passed, Option<Credentials>), Errno> {
     let mut passed = Passed::new();
+    let mut credentials = None;
     let mut at = 0;
     // CMSG_FIRSTHDR and CMSG_NXTHDR: a header must fit in what is left.
     while control.len().saturating_sub(at) >= CMSG_HEADER {
@@ -422,7 +436,24 @@ fn passed_descriptors(c: &Context<'_>, control: &[u8]) -> Result<Passed, Errno> 
             .ok()
             .filter(|len| (CMSG_HEADER..=control.len() - at).contains(len))
             .ok_or(Errno::EINVAL)?;
-        if field(at + 8) == SOL_SOCKET {
+        if field(at + 8) == SOL_SOCKET && field(at + 12) == SCM_CREDENTIALS {
+            if len != CMSG_HEADER + UCRED {
+                return Err(Errno::EINVAL);
+            }
+            let [pid, uid, gid] = [0, 4, 8].map(|i| field(at + CMSG_HEADER + i));
+            let owner = FileOwner {
+                kind: crate::fasync::OwnerKind::Process,
+                id: pid,
+                signal: 0,
+            };
+            if pid.cast_signed() <= 0 || !c.processes.owner_exists(owner) {
+                return Err(Errno(3));
+            }
+            if uid == u32::MAX || gid == u32::MAX {
+                return Err(Errno::EINVAL);
+            }
+            credentials = Some(Credentials { pid, uid, gid });
+        } else if field(at + 8) == SOL_SOCKET {
             if field(at + 12) != SCM_RIGHTS {
                 return Err(Errno::EINVAL);
             }
@@ -439,7 +470,7 @@ fn passed_descriptors(c: &Context<'_>, control: &[u8]) -> Result<Passed, Errno> 
         // CMSG_ALIGN.
         at = at.saturating_add(len.next_multiple_of(8));
     }
-    Ok(passed)
+    Ok((passed, credentials))
 }
 /// The error of a datagram sent to a valid `address`, as Linux's
 /// `unix_find_other` finds it after the data is copied: as no socket can be
@@ -538,7 +569,8 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if lookup {
         return Err(unreachable_address(c, &address));
     }
-    send_bytes(c, &file, socket, &bytes, a[3], &mut Passed::new())
+    let sender = Sender::process(c.process.pid);
+    send_bytes(c, &file, socket, &bytes, a[3], &mut Passed::new(), sender)
 }
 /// `recvfrom(fd, buf, len, flags, addr, addrlen)` on a socket pair: recvmsg
 /// with one buffer and no control buffer, so the descriptors a message passes
@@ -577,7 +609,8 @@ fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     Ok(returned)
 }
-/// `sendmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS`. Of the
+/// `sendmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS` and
+/// `SCM_CREDENTIALS`. Of the
 /// flags `MSG_NOSIGNAL`, `MSG_DONTWAIT` and, on a stream, `MSG_OOB` act
 /// ([`send_bytes`]); `MSG_OOB` is EOPNOTSUPP on the other kinds, and the rest
 /// are ignored, as Linux's AF_UNIX sockets ignore them.
@@ -600,7 +633,7 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     c.mem
         .read(GuestAddr(header.control), &mut control)
         .map_err(|_| Errno::EFAULT)?;
-    let mut passed = passed_descriptors(c, &control)?;
+    let (mut passed, credentials) = control_messages(c, &control)?;
     let socket = as_socket(&file)?;
     let total = header.iov.iter().map(|(_, len)| len).sum::<usize>();
     socket.check_out_of_band_send(a[2], true, total)?;
@@ -620,13 +653,17 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if lookup {
         return Err(unreachable_address(c, &address));
     }
-    let result = send_bytes(c, &file, socket, &bytes, a[2], &mut passed);
+    let sender = Sender {
+        pid: c.process.pid,
+        credentials,
+    };
+    let result = send_bytes(c, &file, socket, &bytes, a[2], &mut passed, sender);
     // What was not passed closes here, outside the socket's lock.
     drop(passed);
     result
 }
-/// `recvmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS` and the
-/// flags of [`receive_with`].
+/// `recvmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS`,
+/// `SCM_CREDENTIALS` and the flags of [`receive_with`].
 fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let file = socket(c, a[0])?;
     let header = message_header(c, a[1], true)?;
@@ -645,7 +682,14 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if received.truncated {
         flags |= MSG_TRUNC;
     }
-    let (used, cut) = deliver(c, &header, received.passed, a[2] & MSG_CMSG_CLOEXEC != 0);
+    let credentials = socket.passes_credentials().then_some(received.credentials);
+    let (used, cut) = deliver(
+        c,
+        &header,
+        received.passed,
+        credentials,
+        a[2] & MSG_CMSG_CLOEXEC != 0,
+    );
     if cut {
         flags |= MSG_CTRUNC;
     }
@@ -666,7 +710,8 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// Sends `bytes` for sendto or sendmsg with their `flags`. With `MSG_OOB` on
 /// a stream, all but the last byte go as data and then, once they all have,
 /// the last one out of band, as Linux's `unix_stream_sendmsg` and
-/// `queue_oob`; the descriptors go with the first part sent.
+/// `queue_oob`; the descriptors go with the first part sent, and every part
+/// carries `sender`'s credentials.
 fn send_bytes(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -674,18 +719,19 @@ fn send_bytes(
     bytes: &[u8],
     flags: u64,
     passed: &mut Passed,
+    sender: Sender,
 ) -> Result<u64, Errno> {
     let (nosignal, dontwait) = (flags & MSG_NOSIGNAL != 0, flags & MSG_DONTWAIT != 0);
     let Some((&last, data)) = bytes.split_last().filter(|_| flags & MSG_OOB != 0) else {
         return crate::files::write_with(c, file, bytes, nosignal, dontwait, |b| {
-            socket.send(b, passed)
+            socket.send(b, passed, sender)
         });
     };
     let sent = if data.is_empty() {
         0
     } else {
         crate::files::write_with(c, file, data, nosignal, dontwait, |b| {
-            socket.send(b, passed)
+            socket.send(b, passed, sender)
         })?
     };
     if sent != data.len() as u64 {
@@ -695,11 +741,11 @@ fn send_bytes(
     // sent, with no SIGPIPE, as unix_stream_sendmsg returns `sent ? : err`.
     let urgent = if sent == 0 {
         crate::files::write_with(c, file, &[last], nosignal, dontwait, |_| {
-            socket.send_out_of_band(last, passed)
+            socket.send_out_of_band(last, passed, sender)
         })?
     } else {
         socket
-            .send_out_of_band(last, passed)
+            .send_out_of_band(last, passed, sender)
             .map_or(0, |n| n as u64)
     };
     // The byte sends the receiving end's owner SIGURG, as Linux's
@@ -715,7 +761,8 @@ fn send_bytes(
 /// data, and its descriptors, where they are, and on a stream `MSG_WAITALL`
 /// goes on until `bytes` is full, the stream ends or reaches its
 /// out-of-band mark, descriptors come, or a signal arrives after some data,
-/// which it then returns. `MSG_OOB` takes a stream's out-of-band byte, and
+/// which it then returns, or, with `SO_PASSCRED`, data of other credentials
+/// comes. `MSG_OOB` takes a stream's out-of-band byte, and
 /// never waits. Other flags have no effect.
 fn receive_with(
     c: &mut Context<'_>,
@@ -745,7 +792,11 @@ fn receive_with(
     {
         let done = received.count;
         let more = crate::files::wait_for_read_until(c, file, false, wait, || {
-            socket.receive_more(&mut bytes[done..], peek.then_some(done))
+            socket.receive_more(
+                &mut bytes[done..],
+                peek.then_some(done),
+                received.credentials,
+            )
         });
         match more {
             Ok(more) if more.count != 0 => {
@@ -763,32 +814,80 @@ fn receive_with(
     }
     Ok(received)
 }
-/// Installs the received descriptors and writes their `SCM_RIGHTS` message,
-/// as Linux's `scm_detach_fds`: as many as the control buffer holds, each
-/// the lowest free number, until one does not fit under `RLIMIT_NOFILE` or
-/// its number cannot be written. The rest are closed. Returns the control
-/// bytes used and whether any descriptor was lost (`MSG_CTRUNC`).
+/// Writes the control messages of a received message, as Linux's
+/// `__scm_recv_common`: with no control buffer, only `MSG_CTRUNC` tells of
+/// them. Otherwise `credentials`, when the socket passes them, go first
+/// ([`put_credentials`]), then the descriptors ([`put_descriptors`]).
+/// Returns the control bytes used and whether anything was lost
+/// (`MSG_CTRUNC`).
 fn deliver(
     c: &mut Context<'_>,
     header: &MessageHeader,
     passed: Passed,
+    credentials: Option<Credentials>,
     cloexec: bool,
 ) -> (u64, bool) {
-    let count = passed.len();
-    if count == 0 {
-        return (0, false);
-    }
     if header.control == 0 {
-        return (0, true);
+        return (0, credentials.is_some() || !passed.is_empty());
     }
-    let room = header.control_len.saturating_sub(CMSG_HEADER as u64) / 4;
-    let most = usize::try_from(room).unwrap_or(usize::MAX).min(count);
+    let mut room = (header.control, header.control_len);
+    let mut cut = false;
+    if let Some(credentials) = credentials {
+        cut |= put_credentials(c, &mut room, credentials);
+    }
+    if !passed.is_empty() {
+        cut |= put_descriptors(c, &mut room, passed, cloexec);
+    }
+    (header.control_len - room.1, cut)
+}
+/// Writes the `SCM_CREDENTIALS` message at the start of `room` (the address
+/// and length of what is left of the control buffer), as Linux's `put_cmsg`:
+/// cut to what is left, nothing when not even its header fits, and `room`
+/// as it was when it cannot be written. Returns whether it was cut.
+fn put_credentials(c: &Context<'_>, room: &mut (u64, u64), credentials: Credentials) -> bool {
+    let (at, left) = *room;
+    if left < CMSG_HEADER as u64 {
+        return true;
+    }
+    let full = CMSG_HEADER + UCRED;
+    let len = usize::try_from(left).unwrap_or(usize::MAX).min(full);
+    let mut cmsg = [0; CMSG_HEADER + UCRED];
+    cmsg[..8].copy_from_slice(&(len as u64).to_le_bytes());
+    cmsg[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+    cmsg[12..16].copy_from_slice(&SCM_CREDENTIALS.to_le_bytes());
+    for (i, id) in [credentials.pid, credentials.uid, credentials.gid]
+        .into_iter()
+        .enumerate()
+    {
+        cmsg[CMSG_HEADER + 4 * i..][..4].copy_from_slice(&id.to_le_bytes());
+    }
+    if c.mem.write(GuestAddr(at), &cmsg[..len]).is_ok() {
+        let step = (full.next_multiple_of(8) as u64).min(left);
+        *room = (at + step, left - step);
+    }
+    len < full
+}
+/// Installs the received descriptors and writes their `SCM_RIGHTS` message
+/// in `room`, as Linux's `scm_detach_fds`: as many as it holds, each the
+/// lowest free number, until one does not fit under `RLIMIT_NOFILE` or its
+/// number cannot be written. The rest are closed. Returns whether any
+/// descriptor was lost.
+fn put_descriptors(
+    c: &mut Context<'_>,
+    room: &mut (u64, u64),
+    passed: Passed,
+    cloexec: bool,
+) -> bool {
+    let (control, left) = *room;
+    let count = passed.len();
+    let fit = left.saturating_sub(CMSG_HEADER as u64) / 4;
+    let most = usize::try_from(fit).unwrap_or(usize::MAX).min(count);
     let mut installed = 0;
     for descriptor in passed.into_iter().take(most) {
         let Ok(n) = c.files.reserve(c.group.nofile()) else {
             break;
         };
-        let at = header.control + (CMSG_HEADER + 4 * installed) as u64;
+        let at = control + (CMSG_HEADER + 4 * installed) as u64;
         if c.mem.write(GuestAddr(at), &n.to_le_bytes()).is_err() {
             c.files.unreserve(n);
             break;
@@ -798,18 +897,18 @@ fn deliver(
     }
     // As scm_detach_fds: the descriptors go in first and the header after,
     // so a header that cannot be written leaves msg_controllen as it was.
-    let mut used = 0;
     if installed != 0 {
         let len = CMSG_HEADER + 4 * installed;
         let mut cmsg = [0; CMSG_HEADER];
         cmsg[..8].copy_from_slice(&(len as u64).to_le_bytes());
         cmsg[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
         cmsg[12..].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
-        if c.mem.write(GuestAddr(header.control), &cmsg).is_ok() {
-            used = (len.next_multiple_of(8) as u64).min(header.control_len);
+        if c.mem.write(GuestAddr(control), &cmsg).is_ok() {
+            let step = (len.next_multiple_of(8) as u64).min(left);
+            *room = (control + step, left - step);
         }
     }
-    (used, installed < count)
+    installed < count
 }
 
 const SO_DEBUG: u32 = 1;
@@ -1014,8 +1113,9 @@ fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// `sk_setsockopt`: a socket pair has only `SOL_SOCKET` options
 /// (EOPNOTSUPP for another level), an `int` value of fewer than 4 bytes is
 /// EINVAL, and an unknown name, or one whose effect is not modelled here
-/// (`SO_PASSCRED`, `SO_PASSSEC`, `SO_RCVLOWAT`, `SO_TIMESTAMP`,
-/// `SO_PEEK_OFF`), is ENOPROTOOPT. `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
+/// (`SO_PASSSEC`, `SO_RCVLOWAT`, `SO_TIMESTAMP`, `SO_PEEK_OFF`), is
+/// ENOPROTOOPT. `SO_PASSCRED` makes messages carry credentials
+/// ([`Credentials`]). `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
 /// `timeval` ([`Timeout`]). The guest runs as root, so the options that need
 /// `CAP_NET_ADMIN` are set.
 fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
@@ -1034,11 +1134,15 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .try_into()
             .map_err(|_| Errno::EFAULT)?,
     );
+    let on = value != 0;
+    if name == SO_PASSCRED {
+        socket.lock_sides()[socket.side].pass_credentials = on;
+        return Ok(0);
+    }
     let mut options = socket
         .options
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let on = value != 0;
     match name {
         SO_DEBUG => options.debug = on,
         SO_REUSEADDR => options.reuse_address = on,
@@ -1117,8 +1221,9 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_DEBUG => int(options.debug.into()),
         SO_REUSEADDR => int(options.reuse_address.into()),
         SO_TYPE => int(socket.pair.kind.cast_signed()),
-        SO_ERROR | SO_BSDCOMPAT | SO_REUSEPORT | SO_PASSCRED | SO_ACCEPTCONN | SO_PASSSEC
-        | SO_TIMESTAMP | SO_PROTOCOL => int(0),
+        SO_ERROR | SO_BSDCOMPAT | SO_REUSEPORT | SO_ACCEPTCONN | SO_PASSSEC | SO_TIMESTAMP
+        | SO_PROTOCOL => int(0),
+        SO_PASSCRED => int(socket.passes_credentials().into()),
         SO_DONTROUTE => int(options.dont_route.into()),
         SO_BROADCAST => int(options.broadcast.into()),
         SO_SNDBUF => int(options.send_buffer),
@@ -1177,6 +1282,55 @@ struct Write {
     len: usize,
     passed: Passed,
     piece: Piece,
+    credentials: Credentials,
+}
+/// The credentials a write carries, as Linux's `UNIXCB` keeps them for
+/// `SCM_CREDENTIALS`: its sender's process ID, user and group when either
+/// end passed credentials (`SO_PASSCRED`) as it was sent, or those it gave
+/// itself, else none, which a receiver reads as process 0 and the overflow
+/// IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Credentials {
+    pid: u32,
+    uid: u32,
+    gid: u32,
+}
+impl Default for Credentials {
+    fn default() -> Self {
+        Self {
+            pid: 0,
+            uid: OVERFLOW_ID,
+            gid: OVERFLOW_ID,
+        }
+    }
+}
+/// Who sends a write: the sending process, and the credentials sendmsg's
+/// `SCM_CREDENTIALS` gave, if any.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Sender {
+    pid: u32,
+    credentials: Option<Credentials>,
+}
+impl Sender {
+    pub(crate) fn process(pid: u32) -> Self {
+        Self {
+            pid,
+            credentials: None,
+        }
+    }
+    /// What a write by this sender carries, when an end `passes` them: the
+    /// process's own as root, or as [`Credentials`] says.
+    fn credentials(self, passes: bool) -> Credentials {
+        self.credentials.unwrap_or(if passes {
+            Credentials {
+                pid: self.pid,
+                uid: 0,
+                gid: 0,
+            }
+        } else {
+            Credentials::default()
+        })
+    }
 }
 /// What a stream's write is: data, or its out-of-band byte, as Linux's
 /// `oob_skb`, which stays in the queue, empty, once `MSG_OOB` took it. A
@@ -1199,6 +1353,11 @@ pub(crate) struct Received {
     pub(crate) length: usize,
     /// A stream read stopped at the out-of-band mark.
     at_mark: bool,
+    /// The credentials of the data read.
+    pub(crate) credentials: Credentials,
+    /// A stream read with `SO_PASSCRED` stopped before data of other
+    /// credentials.
+    other_sender: bool,
     /// The descriptors of dropped out-of-band bytes, closed with this,
     /// outside the socket's lock.
     discarded: Passed,
@@ -1237,6 +1396,9 @@ struct Side {
     /// A send found the buffer full, so the space a read frees signals this
     /// end `POLL_OUT`, once, as Linux's `SOCKWQ_ASYNC_NOSPACE`.
     no_space: bool,
+    /// `SO_PASSCRED`: what this end receives carries credentials, and so
+    /// does what it sends.
+    pass_credentials: bool,
 }
 struct Pair {
     sides: Mutex<[Side; 2]>,
@@ -1278,6 +1440,16 @@ pub(crate) struct SocketPairEnd {
     options: Mutex<Options>,
 }
 impl SocketPairEnd {
+    fn lock_sides(&self) -> std::sync::MutexGuard<'_, [Side; 2]> {
+        self.pair
+            .sides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// `SO_PASSCRED` on this end.
+    fn passes_credentials(&self) -> bool {
+        self.lock_sides()[self.side].pass_credentials
+    }
     /// The bytes waiting to be read on this side.
     fn unread(&self) -> usize {
         self.pair
@@ -1373,16 +1545,23 @@ impl SocketPairEnd {
         let result = if self.pair.messages() {
             self.read_message(buf, peek.is_some())
         } else {
-            self.read_stream(buf, peek, false)
+            self.read_stream(buf, peek, None)
         };
         self.after_read(peek.is_some(), &result);
         result
     }
     /// [`Self::receive`] in recvmsg or recvfrom that already read some of
     /// a stream (`MSG_WAITALL`): as Linux's `manage_oob` counts the whole
-    /// call, it stops at the out-of-band mark rather than drop or pass it.
-    fn receive_more(&self, buf: &mut [u8], peek: Option<usize>) -> Result<Received, Errno> {
-        let result = self.read_stream(buf, peek, true);
+    /// call, it stops at the out-of-band mark rather than drop or pass it,
+    /// and with `SO_PASSCRED` before data of other `credentials` than it
+    /// read.
+    fn receive_more(
+        &self,
+        buf: &mut [u8],
+        peek: Option<usize>,
+        credentials: Credentials,
+    ) -> Result<Received, Errno> {
+        let result = self.read_stream(buf, peek, Some(credentials));
         self.after_read(peek.is_some(), &result);
         result
     }
@@ -1584,6 +1763,7 @@ impl SocketPairEnd {
                 truncated: count < message.len,
                 passed: message.passed.clone(),
                 length: message.len,
+                credentials: message.credentials,
                 ..Received::default()
             });
         }
@@ -1616,6 +1796,7 @@ impl SocketPairEnd {
             truncated: count < message.len,
             passed: message.passed,
             length: message.len,
+            credentials: message.credentials,
             ..Received::default()
         })
     }
@@ -1624,12 +1805,15 @@ impl SocketPairEnd {
     /// SOCK_STREAM read. As Linux's `unix_stream_read_generic`, it goes on
     /// across writes but ends with the first one that passed descriptors,
     /// which come with its first bytes read; an empty buffer still takes
-    /// them. A `peek` from `skip` bytes on leaves the data where it is.
+    /// them. With `SO_PASSCRED` it also ends before a write of other
+    /// credentials than the first it reads, or than `after` for a call that
+    /// already read some ([`Self::receive_more`]). A `peek` from `skip` bytes
+    /// on leaves the data where it is.
     fn read_stream(
         &self,
         buf: &mut [u8],
         peek: Option<usize>,
-        after: bool,
+        after: Option<Credentials>,
     ) -> Result<Received, Errno> {
         let inline = self.out_of_band_inline();
         let mut sides = self
@@ -1645,9 +1829,10 @@ impl SocketPairEnd {
         if own.read_shutdown {
             return Ok(Received::default());
         }
+        let glue = own.pass_credentials;
         // Past what the call read, the mark ends it.
         let mark = |write: &Write| write.piece != Piece::Data;
-        if after && peek.is_none() && own.writes.front().is_some_and(mark) {
+        if after.is_some() && peek.is_none() && own.writes.front().is_some_and(mark) {
             return Ok(Received {
                 at_mark: true,
                 ..Received::default()
@@ -1672,11 +1857,12 @@ impl SocketPairEnd {
             };
         }
         if let Some(skip) = peek {
-            let received = Self::peek_stream(own, buf, skip, after, inline);
+            let received = Self::peek_stream(own, buf, skip, after, inline, glue);
             return if received.count == 0
                 && received.passed.is_empty()
                 && !buf.is_empty()
                 && !received.at_mark
+                && !received.other_sender
             {
                 if eof {
                     Ok(Received::default())
@@ -1691,6 +1877,7 @@ impl SocketPairEnd {
             discarded,
             ..Received::default()
         };
+        let mut credentials = after;
         let mut consumed_write = false;
         while let Some(front) = own.writes.front_mut() {
             // Stop before the mark; at it, drop the out-of-band byte and read
@@ -1709,6 +1896,16 @@ impl SocketPairEnd {
                 received.discarded.extend(dropped.passed);
                 consumed_write = true;
                 continue;
+            }
+            // Writes of other credentials are not read together, as
+            // Linux's unix_skb_scm_eq.
+            match credentials {
+                Some(read) if glue && read != front.credentials => {
+                    received.other_sender = true;
+                    break;
+                }
+                Some(_) => {}
+                None => credentials = Some(front.credentials),
             }
             let count = front.len.min(buf.len() - received.count);
             for byte in &mut buf[received.count..received.count + count] {
@@ -1733,8 +1930,13 @@ impl SocketPairEnd {
         }
         self.pair.hub.changed();
         received.length = received.count;
+        received.credentials = credentials.unwrap_or_default();
         // Only an out-of-band byte was there, and it is gone.
-        if received.count == 0 && received.passed.is_empty() && !buf.is_empty() {
+        if received.count == 0
+            && received.passed.is_empty()
+            && !buf.is_empty()
+            && !received.other_sender
+        {
             drop(sides);
             return if eof {
                 Ok(received)
@@ -1747,22 +1949,24 @@ impl SocketPairEnd {
     }
     /// What a stream read from `skip` bytes on would take, left in `own`:
     /// it stops after a write that passed descriptors, giving copies of
-    /// them.
+    /// them, and, when it `glue`s, before one of other credentials.
     fn peek_stream(
         own: &Side,
         buf: &mut [u8],
         mut skip: usize,
-        after: bool,
+        after: Option<Credentials>,
         inline: bool,
+        glue: bool,
     ) -> Received {
         let mut received = Received::default();
+        let mut credentials = after;
         let mut start = 0;
         for write in &own.writes {
             let at = start;
             start += write.len;
             // A peek stops at the mark, as a read does, or passes over it.
             if write.piece != Piece::Data {
-                if received.count != 0 || after && skip == 0 {
+                if received.count != 0 || after.is_some() && skip == 0 {
                     received.at_mark = true;
                     break;
                 }
@@ -1773,6 +1977,14 @@ impl SocketPairEnd {
             if skip >= write.len {
                 skip -= write.len;
                 continue;
+            }
+            match credentials {
+                Some(read) if glue && read != write.credentials => {
+                    received.other_sender = true;
+                    break;
+                }
+                Some(_) => {}
+                None => credentials = Some(write.credentials),
             }
             let count = (write.len - skip).min(buf.len() - received.count);
             let from = at + skip;
@@ -1793,6 +2005,7 @@ impl SocketPairEnd {
             }
         }
         received.length = received.count;
+        received.credentials = credentials.unwrap_or_default();
         received
     }
 }
@@ -1879,8 +2092,10 @@ impl FileHandle for SocketPairEnd {
         self.receive(buf, false, None)
             .map(|received| received.count)
     }
+    /// A write with no sending process known, as a pipe's; the write
+    /// syscalls send through [`Self::send`] with theirs.
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
-        self.send(buf, &mut Passed::new())
+        self.send(buf, &mut Passed::new(), Sender::default())
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
         Err(Errno::ESPIPE)
@@ -1913,11 +2128,17 @@ impl FileHandle for SocketPairEnd {
     }
 }
 impl SocketPairEnd {
-    /// Writes `buf`, taking `passed` with the first bytes that go; what is
-    /// left in it went nowhere (a stream write of no bytes passes nothing,
-    /// as on Linux), and the caller closes it after the lock is released.
-    pub(crate) fn send(&self, buf: &[u8], passed: &mut Passed) -> Result<usize, Errno> {
-        let result = self.send_data(buf, passed);
+    /// Writes `buf` from `sender`, taking `passed` with the first bytes that
+    /// go; what is left in it went nowhere (a stream write of no bytes
+    /// passes nothing, as on Linux), and the caller closes it after the lock
+    /// is released.
+    pub(crate) fn send(
+        &self,
+        buf: &[u8],
+        passed: &mut Passed,
+        sender: Sender,
+    ) -> Result<usize, Errno> {
+        let result = self.send_data(buf, passed, sender);
         match result {
             // The peer has data (a message may be empty), as Linux's
             // `sk_data_ready` tells it.
@@ -1935,12 +2156,15 @@ impl SocketPairEnd {
         }
         result
     }
-    fn send_data(&self, buf: &[u8], passed: &mut Passed) -> Result<usize, Errno> {
+    fn send_data(&self, buf: &[u8], passed: &mut Passed, sender: Sender) -> Result<usize, Errno> {
         let mut sides = self
             .pair
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // As Linux's unix_maybe_add_creds, as the write is sent.
+        let credentials =
+            sender.credentials(sides[0].pass_credentials || sides[1].pass_credentials);
         if self.pair.kind == SOCK_DGRAM {
             // unix_dgram_sendmsg's order: the size, this side's shutdown and
             // send buffer, then the peer.
@@ -1981,6 +2205,7 @@ impl SocketPairEnd {
                 len: buf.len(),
                 passed: std::mem::take(passed),
                 piece: Piece::Data,
+                credentials,
             });
             self.pair.hub.changed();
             return Ok(buf.len());
@@ -2011,6 +2236,7 @@ impl SocketPairEnd {
                 len: buf.len(),
                 passed: std::mem::take(passed),
                 piece: Piece::Data,
+                credentials,
             });
             self.pair.hub.changed();
             return Ok(buf.len());
@@ -2035,6 +2261,7 @@ impl SocketPairEnd {
                 len: count,
                 passed: std::mem::take(passed),
                 piece: Piece::Data,
+                credentials,
             });
         }
         self.pair.hub.changed();
@@ -2043,8 +2270,13 @@ impl SocketPairEnd {
     /// Queues `byte` as the peer's out-of-band byte, after the stream's
     /// data, as Linux's `queue_oob`: an earlier one still unread becomes
     /// data, and the descriptors not sent yet go with it.
-    pub(crate) fn send_out_of_band(&self, byte: u8, passed: &mut Passed) -> Result<usize, Errno> {
-        let result = self.queue_out_of_band(byte, passed);
+    pub(crate) fn send_out_of_band(
+        &self,
+        byte: u8,
+        passed: &mut Passed,
+        sender: Sender,
+    ) -> Result<usize, Errno> {
+        let result = self.queue_out_of_band(byte, passed, sender);
         // An `F_SETSIG` signal for the urgent byte (SIGURG goes besides),
         // then one for the data, as Linux's `queue_oob`.
         if result.is_ok() {
@@ -2053,12 +2285,19 @@ impl SocketPairEnd {
         }
         result
     }
-    fn queue_out_of_band(&self, byte: u8, passed: &mut Passed) -> Result<usize, Errno> {
+    fn queue_out_of_band(
+        &self,
+        byte: u8,
+        passed: &mut Passed,
+        sender: Sender,
+    ) -> Result<usize, Errno> {
         let mut sides = self
             .pair
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let credentials =
+            sender.credentials(sides[0].pass_credentials || sides[1].pass_credentials);
         if sides[self.side].write_shutdown
             || sides[1 - self.side].closed
             || sides[1 - self.side].read_shutdown
@@ -2079,6 +2318,7 @@ impl SocketPairEnd {
             len: 1,
             passed: std::mem::take(passed),
             piece: Piece::OutOfBand,
+            credentials,
         });
         self.pair.hub.changed();
         Ok(1)
@@ -2094,8 +2334,11 @@ mod events_tests {
     fn a_stream_keeps_its_out_of_band_byte_at_the_mark() {
         let [a, b] = pair();
         let mut buf = [0; 8];
-        assert_eq!(a.send(b"ab", &mut Passed::new()), Ok(2));
-        assert_eq!(a.send_out_of_band(b'c', &mut Passed::new()), Ok(1));
+        assert_eq!(a.send(b"ab", &mut Passed::new(), Sender::default()), Ok(2));
+        assert_eq!(
+            a.send_out_of_band(b'c', &mut Passed::new(), Sender::default()),
+            Ok(1)
+        );
         assert_ne!(b.readiness().unwrap().0 & PRI, 0);
         assert!(!b.at_mark());
         // A read stops before the mark; the byte comes with MSG_OOB, once.
@@ -2113,9 +2356,15 @@ mod events_tests {
         );
         // A later byte makes an earlier one data; a read that reaches the
         // mark with nothing read drops the byte and reads on.
-        assert_eq!(a.send_out_of_band(b'x', &mut Passed::new()), Ok(1));
-        assert_eq!(a.send_out_of_band(b'y', &mut Passed::new()), Ok(1));
-        assert_eq!(a.send(b"z", &mut Passed::new()), Ok(1));
+        assert_eq!(
+            a.send_out_of_band(b'x', &mut Passed::new(), Sender::default()),
+            Ok(1)
+        );
+        assert_eq!(
+            a.send_out_of_band(b'y', &mut Passed::new(), Sender::default()),
+            Ok(1)
+        );
+        assert_eq!(a.send(b"z", &mut Passed::new(), Sender::default()), Ok(1));
         assert_eq!(b.receive(&mut buf, true, None).unwrap().count, 1);
         assert_eq!(buf[0], b'x');
         assert_eq!(b.receive(&mut buf, true, None).unwrap().count, 1);

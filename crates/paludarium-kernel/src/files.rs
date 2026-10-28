@@ -1943,6 +1943,16 @@ pub(crate) fn write_io(
     bytes: &[u8],
     nosignal: bool,
 ) -> Result<u64, Errno> {
+    // A socket's writes carry the credentials of their process.
+    if let Some(socket) = file
+        .as_any()
+        .and_then(|a| a.downcast_ref::<crate::sockets::SocketPairEnd>())
+    {
+        let sender = crate::sockets::Sender::process(c.process.pid);
+        return write_with(c, file, bytes, nosignal, false, |b| {
+            socket.send(b, &mut Vec::new(), sender)
+        });
+    }
     write_with(c, file, bytes, nosignal, false, |b| file.write(b))
 }
 /// [`write_io`] through `write`, which writes to `file`; with `dontwait`

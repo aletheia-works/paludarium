@@ -720,7 +720,8 @@ fn scm_rights_checks_like_linux() {
     let fail = |e: i32| Errno(e).to_syscall_return();
     let len = control(&f, CONTROL, 1, 1, &[99]);
     assert_eq!(send(&mut f, (0, 0), (CONTROL, len), 0), fail(9));
-    let len = control(&f, CONTROL, 1, 2, &[r as u32, 0, 0]);
+    // SOL_SOCKET takes SCM_RIGHTS and SCM_CREDENTIALS only.
+    let len = control(&f, CONTROL, 1, 3, &[r as u32, 0, 0]);
     assert_eq!(send(&mut f, (0, 0), (CONTROL, len), 0), fail(22));
     // Another level is skipped.
     let len = control(&f, CONTROL, 6, 2, &[]);
@@ -881,7 +882,7 @@ fn socket_options_are_kept_as_linux_keeps_them() {
     // modelled here, and an unknown one.
     assert_eq!(set(&mut f, 9, 1, 2), fail(22));
     assert_eq!(f.ret(54, [a, 6, 1, value, 4, 0]), fail(95));
-    assert_eq!(set(&mut f, 16, 1, 4), fail(92));
+    assert_eq!(set(&mut f, 18, 1, 4), fail(92));
     assert_eq!(set(&mut f, 999, 1, 4), fail(92));
     assert_eq!(get(&mut f, 999).0, fail(92));
     // F_SETOWN names a live process or group; F_GETOWN gives it back.

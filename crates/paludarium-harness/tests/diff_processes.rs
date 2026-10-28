@@ -201,6 +201,7 @@ mod linux {
         processes_socket_flags => ("socket-flags","process"),
         processes_socket_oob => ("socket-oob","process"),
         processes_socket_options => ("socket-options","process"),
+        processes_socket_credentials => ("socket-credentials","process"),
         processes_socket_timeouts => ("socket-timeouts","process"),
         processes_signal_restart => ("signal-restart","process"),
         processes_signal_io => ("signal-io","process"),

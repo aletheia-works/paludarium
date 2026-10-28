@@ -27,8 +27,10 @@ verified.
   root when it runs a set-user-ID or set-group-ID program, where Linux would
   take the file's owner or group.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
-  `SCM_RIGHTS` as Linux does, with these differences:
-  - `SCM_CREDENTIALS` returns `EINVAL`.
+  `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS` as Linux does, with
+  these differences:
+  - The guest is root, so `SCM_CREDENTIALS` may name any process, user and
+    group, where Linux lets an unprivileged process send only its own.
   - Linux splits a stream write of more than about 32 KiB into parts and
     passes its descriptors with the first part, so a read ends at the end of
     that part. Here it ends at the end of the whole write.
@@ -36,8 +38,8 @@ verified.
     descriptor keeps open, such as its own, stays open: Linux's garbage
     collector would close both.
 - **Socket options**: `setsockopt` refuses, with `ENOPROTOOPT`, the options
-  whose effect is not modelled, where Linux takes them: `SO_PASSCRED`,
-  `SO_PASSSEC`, `SO_RCVLOWAT`, `SO_TIMESTAMP` and `SO_PEEK_OFF`, as well as
+  whose effect is not modelled, where Linux takes them: `SO_PASSSEC`,
+  `SO_RCVLOWAT`, `SO_TIMESTAMP` and `SO_PEEK_OFF`, as well as
   filters and the other options Linux has. `SO_RCVTIMEO` and `SO_SNDTIMEO`
   round to a 1000 Hz tick, where Linux rounds to its own `CONFIG_HZ`.
   `SO_SNDBUF` and `SO_RCVBUF` are reported but leave the pair's buffer as it

@@ -53,6 +53,9 @@ const MSG_NOSIGNAL: u64 = 0x4000;
 const DNS: u16 = 53;
 /// How long a resolved name is reused before it is looked up again.
 const LOOKUP_LIFETIME: u64 = 30_000_000_000;
+/// How long after the stub last gave an address for a name the guest may
+/// still connect to it under that name.
+const NAME_LIFETIME: u64 = 600_000_000_000;
 
 /// One entry of the allow list: a name (`*.` for its subdomains too) or an
 /// address, and a port, or every port.
@@ -187,6 +190,42 @@ fn matches_name(allowed: &str, subdomains: bool, name: &str) -> bool {
         name == allowed
     }
 }
+/// Whether a name rule may reach `ip`, which the host resolved `name` to:
+/// only a global address, so that no allowed name (nor a subdomain under a
+/// `*.` rule, whose owner may point it anywhere) reaches the host's own
+/// machine or networks; `localhost` and its subdomains may also reach the
+/// loopback. Any address listed itself is reached without this.
+fn reachable(name: &str, ip: IpAddr) -> bool {
+    let local = name == "localhost" || name.ends_with(".localhost");
+    match plain(ip) {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            if v4.is_loopback() {
+                return local;
+            }
+            !(v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || a == 0
+                // Shared address space (RFC 6598) and the reserved 240/4.
+                || (a == 100 && (64..128).contains(&b))
+                || a >= 240)
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return local;
+            }
+            let first = v6.segments()[0];
+            !(v6.is_unspecified()
+                || v6.is_multicast()
+                // Unique local (fc00::/7) and link-local (fe80::/10).
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80)
+        }
+    }
+}
 /// An IPv4 address that an IPv6 socket names as `::ffff:a.b.c.d` is that
 /// IPv4 address.
 fn plain(ip: IpAddr) -> IpAddr {
@@ -200,9 +239,10 @@ fn plain(ip: IpAddr) -> IpAddr {
 /// and the lookups in progress.
 pub(crate) struct Network {
     policy: NetworkPolicy,
-    /// The names each address was resolved from, so that a connection to
-    /// it is allowed as the names are.
-    resolved: Mutex<BTreeMap<IpAddr, Vec<String>>>,
+    /// The names each address was resolved from, and when the stub last
+    /// gave it, so that a connection to it is allowed as the names are for
+    /// [`NAME_LIFETIME`].
+    resolved: Mutex<BTreeMap<IpAddr, Vec<(String, u64)>>>,
     lookups: Mutex<BTreeMap<String, (Arc<Lookup>, u64)>>,
 }
 impl Network {
@@ -213,11 +253,15 @@ impl Network {
             lookups: Mutex::default(),
         }
     }
-    /// Whether the guest may connect to `address`.
-    fn allows(&self, address: SocketAddr) -> bool {
+    /// Whether the guest may connect to `address` at `now`.
+    fn allows(&self, address: SocketAddr, now: u64) -> bool {
         let ip = plain(address.ip());
         let resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
         let names = resolved.get(&ip).map_or(&[][..], Vec::as_slice);
+        let names = names
+            .iter()
+            .filter(|(_, given)| now.saturating_sub(*given) < NAME_LIFETIME)
+            .map(|(name, _)| name);
         self.policy.rules.iter().any(|rule| match rule {
             Rule::Address { ip: allowed, port } => {
                 plain(*allowed) == ip && port.is_none_or(|port| port == address.port())
@@ -229,7 +273,7 @@ impl Network {
             } => {
                 port.is_none_or(|port| port == address.port())
                     && names
-                        .iter()
+                        .clone()
                         .any(|resolved| matches_name(name, *subdomains, resolved))
             }
         })
@@ -256,13 +300,18 @@ impl Network {
         lookups.insert(name.to_owned(), (Arc::clone(&lookup), now));
         Ok(lookup)
     }
-    fn note(&self, name: &str, addresses: &[IpAddr]) {
+    /// Notes that the stub gave `addresses` for `name` at `now`, and
+    /// forgets what has expired.
+    fn note(&self, name: &str, addresses: &[IpAddr], now: u64) {
         let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
+        resolved.retain(|_, names| {
+            names.retain(|(_, given)| now.saturating_sub(*given) < NAME_LIFETIME);
+            !names.is_empty()
+        });
         for ip in addresses {
             let names = resolved.entry(plain(*ip)).or_default();
-            if !names.iter().any(|known| known == name) {
-                names.push(name.to_owned());
-            }
+            names.retain(|(known, _)| known != name);
+            names.push((name.to_owned(), now));
         }
     }
 }
@@ -523,7 +572,8 @@ impl InetSocket {
                 Connection::Connected => return Err(EISCONN),
                 Connection::Connecting => EALREADY,
                 Connection::Unconnected => {
-                    if !self.network.allows(address) {
+                    let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+                    if !self.network.allows(address, now) {
                         return Err(ENETUNREACH);
                     }
                     let stream = c.host.connect(address)?;
@@ -681,11 +731,23 @@ impl InetSocket {
     fn answer(&self, query: &Query) -> Option<Vec<u8>> {
         let (code, addresses) = match &query.answer {
             Answer::Now(code) => (*code, Vec::new()),
+            // Only the addresses a name rule may reach; none is NXDOMAIN.
             Answer::Lookup(lookup) => match lookup.result()? {
-                Ok(found) if found.is_empty() => (3, found),
                 Ok(found) => {
-                    self.network.note(&query.name, &found);
-                    (0, found)
+                    let found: Vec<IpAddr> = found
+                        .into_iter()
+                        .filter(|ip| reachable(&query.name, *ip))
+                        .collect();
+                    if found.is_empty() {
+                        (3, found)
+                    } else {
+                        let now = self
+                            .host
+                            .clock(paludarium_host::ClockId::Monotonic)
+                            .unwrap_or(0);
+                        self.network.note(&query.name, &found, now);
+                        (0, found)
+                    }
                 }
                 Err(_) => (2, Vec::new()),
             },
@@ -1432,20 +1494,49 @@ mod tests {
         assert!(!policy.allows_name("example.org"));
         assert!(!policy.allows_name("evilgithub.com"));
         let network = Network::new(policy);
-        assert!(network.allows("127.0.0.1:8080".parse().unwrap()));
-        assert!(network.allows("[::ffff:127.0.0.1]:8080".parse().unwrap()));
-        assert!(!network.allows("127.0.0.1:8081".parse().unwrap()));
-        assert!(network.allows("[::1]:9000".parse().unwrap()));
-        assert!(network.allows("[2001:db8::1]:1".parse().unwrap()));
+        assert!(network.allows("127.0.0.1:8080".parse().unwrap(), 0));
+        assert!(network.allows("[::ffff:127.0.0.1]:8080".parse().unwrap(), 0));
+        assert!(!network.allows("127.0.0.1:8081".parse().unwrap(), 0));
+        assert!(network.allows("[::1]:9000".parse().unwrap(), 0));
+        assert!(network.allows("[2001:db8::1]:1".parse().unwrap(), 0));
         let github: SocketAddr = "192.0.2.7:443".parse().unwrap();
-        assert!(!network.allows(github));
-        network.note("github.com", &[github.ip()]);
-        assert!(network.allows(github));
-        assert!(!network.allows("192.0.2.7:80".parse().unwrap()));
+        assert!(!network.allows(github, 0));
+        network.note("github.com", &[github.ip()], 5);
+        assert!(network.allows(github, 5));
+        assert!(!network.allows("192.0.2.7:80".parse().unwrap(), 5));
+        // The name's address expires; another answer gives it again.
+        assert!(!network.allows(github, 5 + NAME_LIFETIME));
+        network.note("github.com", &[github.ip()], 5 + NAME_LIFETIME);
+        assert!(network.allows(github, 5 + NAME_LIFETIME));
         for bad in [
             "", "a:b", "a:0", "[::1", "[::1]x", "bad name", "a..b", "a:70000",
         ] {
             assert!(NetworkPolicy::new().allow(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn name_rules_reach_only_global_addresses() {
+        for (name, ip, ok) in [
+            ("github.com", "140.82.112.3", true),
+            ("github.com", "2606:50c0:8000::153", true),
+            ("evil.example.org", "127.0.0.1", false),
+            ("evil.example.org", "10.1.2.3", false),
+            ("evil.example.org", "172.16.0.1", false),
+            ("evil.example.org", "192.168.1.1", false),
+            ("evil.example.org", "169.254.169.254", false),
+            ("evil.example.org", "100.64.0.1", false),
+            ("evil.example.org", "0.0.0.0", false),
+            ("evil.example.org", "::1", false),
+            ("evil.example.org", "fd00::1", false),
+            ("evil.example.org", "fe80::1", false),
+            ("evil.example.org", "::ffff:10.0.0.1", false),
+            ("localhost", "127.0.0.1", true),
+            ("localhost", "::1", true),
+            ("app.localhost", "127.0.0.2", true),
+            ("localhost", "10.0.0.1", false),
+        ] {
+            assert_eq!(reachable(name, ip.parse().unwrap()), ok, "{name} {ip}");
         }
     }
 

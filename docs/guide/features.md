@@ -110,7 +110,8 @@ kernel.
 - `futex`, `epoll` and `eventfd` are implemented inside paludarium, not with the
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
-- `socket()` always returns `EAFNOSUPPORT`: there is no network.
+- Without a [network](#network), `socket()` returns `EAFNOSUPPORT` for
+  `AF_INET` and `AF_INET6`.
 - `poll` waits like `epoll_wait`: until a descriptor is ready, the timeout
   in milliseconds passes (a negative one never does) or a signal arrives
   (`EINTR`). The host's standard input is readable only with bytes to read
@@ -517,7 +518,15 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
   `/etc/resolv.conf`, or its default. It answers `A` and `AAAA` questions
   for an allowed name with the addresses the host resolves (for 60
   seconds), and `NXDOMAIN` for any other name. A connection to an address
-  the stub gave for an allowed name is allowed as that name is.
+  the stub gave for an allowed name is allowed as that name is, for 10
+  minutes after it last gave it.
+- **Only global addresses for names**: the stub leaves out, and a name
+  rule does not reach, the loopback, private (RFC 1918 and unique local),
+  link-local, shared (RFC 6598), multicast and reserved addresses, so that
+  a name whose DNS points there (DNS rebinding) cannot reach the host's own
+  machine or networks; a name left with none of its addresses is
+  `NXDOMAIN`. `localhost` and its subdomains may reach the loopback. To
+  reach another such address, allow the address itself (`127.0.0.1:8080`).
 
 ## Threads and processes
 

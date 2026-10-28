@@ -144,7 +144,8 @@ kernel.
   The other flags have no effect, as on Linux.
 - A stream write goes in parts, as Linux's `unix_stream_sendmsg` sends it:
   each at most 36544 bytes (a page's head and 32 KiB of pages), or half the
-  send buffer `SO_SNDBUF` sets less 64 bytes. The descriptors go with the
+  send buffer less 64 bytes: the doubled value `SO_SNDBUF` sets and reads
+  back, so `SO_SNDBUF` 10000 makes parts of 9936 bytes. The descriptors go with the
   first part, so a read that takes them ends there, and each part signals
   the `O_ASYNC` owner. Datagram and packet messages go whole.
 - A stream has out-of-band data as Linux 7.0's AF_UNIX keeps it. A `MSG_OOB`

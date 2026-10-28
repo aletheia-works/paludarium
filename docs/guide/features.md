@@ -137,7 +137,8 @@ kernel.
 - `recvmsg` and `recvfrom` take their flags as Linux's AF_UNIX sockets do:
   `MSG_PEEK` leaves the data, and gives copies of the descriptors it passes;
   `MSG_WAITALL` fills a stream's buffer, unless the stream ends, descriptors
-  come or a signal arrives after some data; `MSG_TRUNC` returns a message's
+  come or a signal arrives after some data, but a peek returns what it
+  finds without waiting for more; `MSG_TRUNC` returns a message's
   whole length. `sendmsg` and `sendto` take `MSG_NOSIGNAL` and
   `MSG_DONTWAIT`. `MSG_OOB` on a datagram or packet socket is `EOPNOTSUPP`.
   The other flags have no effect, as on Linux.
@@ -197,6 +198,17 @@ kernel.
   value is kept in ticks of a 1000 Hz clock, so it reads back rounded up to
   a millisecond. A signal that ends such a wait gives `EINTR`, which no
   `SA_RESTART` restarts, as Linux's `sock_intr_errno`.
+- `SO_RCVLOWAT` makes a blocking stream `recv` or `read` wait until it has
+  that many bytes or its buffer is full, as Linux's `sock_rcvlowat` does. It
+  returns less when the stream ends, its time is up, or descriptors come.
+  Peeks, nonblocking reads, `poll`, and datagram and packet sockets are not
+  held back. 0 counts as 1 and a negative value as `INT_MAX`.
+- `SO_PEEK_OFF` sets where a `MSG_PEEK` starts, as Linux's `sk_peek_off`:
+  each peek moves it on by what it read, and each read moves it back by what
+  it took, not below 0. On a datagram or packet socket it passes over whole
+  messages, and over an empty one already peeked at, and `MSG_TRUNC` gives
+  what is left of the message from there. It takes any value; a negative one
+  (by default -1) is none.
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and

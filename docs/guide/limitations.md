@@ -38,9 +38,8 @@ verified.
     descriptor keeps open, such as its own, stays open: Linux's garbage
     collector would close both.
 - **Socket options**: `setsockopt` refuses, with `ENOPROTOOPT`, the options
-  whose effect is not modelled, where Linux takes them: `SO_PASSSEC`,
-  `SO_RCVLOWAT`, `SO_TIMESTAMP` and `SO_PEEK_OFF`, as well as
-  filters and the other options Linux has. `SO_RCVTIMEO` and `SO_SNDTIMEO`
+  whose effect is not modelled, where Linux takes them: `SO_PASSSEC` and
+  `SO_TIMESTAMP`, as well as filters and the other options Linux has. `SO_RCVTIMEO` and `SO_SNDTIMEO`
   round to a 1000 Hz tick, where Linux rounds to its own `CONFIG_HZ`.
   `SO_SNDBUF` and `SO_RCVBUF` are reported but leave the pair's buffer as it
   is. The guest is root, so the options that need `CAP_NET_ADMIN`

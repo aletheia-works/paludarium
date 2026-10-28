@@ -590,7 +590,7 @@ fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let mut bytes = Vec::new();
     bytes.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
     bytes.resize(len, 0);
-    let received = receive_with(c, &file, socket, &mut bytes, a[3])?;
+    let received = receive_with(c, &file, socket, &mut bytes, a[3], true)?;
     let returned = received.returned(a[3]);
     c.mem
         .write(GuestAddr(a[1]), &bytes[..received.count])
@@ -610,6 +610,17 @@ fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .map_err(|_| Errno::EFAULT)?;
     }
     Ok(returned)
+}
+/// `read` (or `readv`) on a socket pair: recvfrom with no flags, but an empty
+/// buffer ends it at once, and the descriptors that come close.
+pub(crate) fn read(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    let socket = as_socket(file)?;
+    let received = receive_with(c, file, socket, buf, 0, false)?;
+    Ok(received.count)
 }
 /// `sendmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS` and
 /// `SCM_CREDENTIALS`. Of the
@@ -675,7 +686,7 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let mut bytes = Vec::new();
     bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
     bytes.resize(total, 0);
-    let received = receive_with(c, &file, socket, &mut bytes, a[2])?;
+    let received = receive_with(c, &file, socket, &mut bytes, a[2], true)?;
     let returned = received.returned(a[2]);
     crate::files::scatter(c, &header.iov, &bytes[..received.count])?;
     // ____sys_recvmsg starts msg_flags with MSG_CMSG_CLOEXEC, and
@@ -758,13 +769,16 @@ fn send_bytes(
     }
     Ok(sent + urgent)
 }
-/// Reads for recvmsg or recvfrom with their `flags`, as Linux's AF_UNIX
-/// sockets take them: `MSG_DONTWAIT` does not wait, `MSG_PEEK` leaves the
-/// data, and its descriptors, where they are, and on a stream `MSG_WAITALL`
-/// goes on until `bytes` is full, the stream ends or reaches its
-/// out-of-band mark, descriptors come, or a signal arrives after some data,
-/// which it then returns, or, with `SO_PASSCRED`, data of other credentials
-/// comes. `MSG_OOB` takes a stream's out-of-band byte, and
+/// Reads for recvmsg or recvfrom with their `flags`, or for read (not a
+/// `message`: an empty buffer ends it at once), as Linux's AF_UNIX sockets
+/// take them: `MSG_DONTWAIT` does not wait, and `MSG_PEEK` leaves the data,
+/// and its descriptors, where they are, from `SO_PEEK_OFF` on. A blocking
+/// stream read that is not a peek goes on until it has `SO_RCVLOWAT` bytes,
+/// or with `MSG_WAITALL` until `bytes` is full, as Linux's
+/// `sock_rcvlowat` sets its target; or until the stream ends or reaches its
+/// out-of-band mark, descriptors come, the time is up or a signal arrives
+/// after some data, which it then returns, or, with `SO_PASSCRED`, data of
+/// other credentials comes. `MSG_OOB` takes a stream's out-of-band byte, and
 /// never waits. Other flags have no effect.
 fn receive_with(
     c: &mut Context<'_>,
@@ -772,33 +786,33 @@ fn receive_with(
     socket: &SocketPairEnd,
     bytes: &mut [u8],
     flags: u64,
+    message: bool,
 ) -> Result<Received, Errno> {
     let dontwait = flags & MSG_DONTWAIT != 0;
     let peek = flags & MSG_PEEK != 0;
     if flags & MSG_OOB != 0 {
         return socket.receive_out_of_band(bytes, peek);
     }
-    // SO_RCVTIMEO bounds the whole call, MSG_WAITALL's later waits too.
+    // SO_RCVTIMEO bounds the whole call, its later waits too.
     let wait = deadline(c, file, true)?;
     let mut received = crate::files::wait_for_read_until(c, file, dontwait, wait, || {
-        socket.receive(bytes, true, peek.then_some(0))
+        socket.receive(bytes, message, peek)
     })?;
-    let wait_all = flags & MSG_WAITALL != 0
-        && !socket.pair.messages()
-        && !dontwait
-        && socket.flags() & NONBLOCK == 0;
-    while wait_all
-        && (1..bytes.len()).contains(&received.count)
+    // A peek returns what it found, as unix_stream_read_generic does.
+    let target = if flags & MSG_WAITALL != 0 {
+        bytes.len()
+    } else {
+        socket.receive_low_water().min(bytes.len())
+    };
+    let wait_more = !peek && !socket.pair.messages() && !dontwait && socket.flags() & NONBLOCK == 0;
+    while wait_more
+        && (1..target).contains(&received.count)
         && received.passed.is_empty()
         && !received.at_mark
     {
         let done = received.count;
         let more = crate::files::wait_for_read_until(c, file, false, wait, || {
-            socket.receive_more(
-                &mut bytes[done..],
-                peek.then_some(done),
-                received.credentials,
-            )
+            socket.receive_more(&mut bytes[done..], received.credentials)
         });
         match more {
             Ok(more) if more.count != 0 => {
@@ -980,6 +994,8 @@ struct Options {
     incoming_cpu: i32,
     receive_timeout: Timeout,
     send_timeout: Timeout,
+    /// `SO_RCVLOWAT`: how many bytes a blocking stream read waits for.
+    receive_low_water: i32,
 }
 /// `SO_RCVTIMEO` or `SO_SNDTIMEO`, in ticks of [`HZ`], as Linux's
 /// `sk_rcvtimeo` keeps it: a zero `timeval` waits for ever, and a negative
@@ -1098,6 +1114,7 @@ impl Default for Options {
             incoming_cpu: -1,
             receive_timeout: Timeout::Forever,
             send_timeout: Timeout::Forever,
+            receive_low_water: 1,
         }
     }
 }
@@ -1115,9 +1132,11 @@ fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// `sk_setsockopt`: a socket pair has only `SOL_SOCKET` options
 /// (EOPNOTSUPP for another level), an `int` value of fewer than 4 bytes is
 /// EINVAL, and an unknown name, or one whose effect is not modelled here
-/// (`SO_PASSSEC`, `SO_RCVLOWAT`, `SO_TIMESTAMP`, `SO_PEEK_OFF`), is
-/// ENOPROTOOPT. `SO_PASSCRED` makes messages carry credentials
-/// ([`Credentials`]). `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
+/// (`SO_PASSSEC`, `SO_TIMESTAMP`), is ENOPROTOOPT. `SO_PASSCRED` makes
+/// messages carry credentials ([`Credentials`]), `SO_RCVLOWAT` sets what a
+/// stream read waits for ([`receive_with`]; 0 is 1, and a negative value
+/// `INT_MAX`), and `SO_PEEK_OFF` where a peek starts (any value, a negative
+/// one for none). `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
 /// `timeval` ([`Timeout`]). The guest runs as root, so the options that need
 /// `CAP_NET_ADMIN` are set.
 fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
@@ -1141,6 +1160,10 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         socket.lock_sides()[socket.side].pass_credentials = on;
         return Ok(0);
     }
+    if name == SO_PEEK_OFF {
+        socket.lock_sides()[socket.side].peek_offset = value;
+        return Ok(0);
+    }
     let mut options = socket
         .options
         .lock()
@@ -1157,6 +1180,7 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_MARK => options.mark = value,
         SO_BUSY_POLL => options.busy_poll = value,
         SO_INCOMING_CPU => options.incoming_cpu = value,
+        SO_RCVLOWAT => options.receive_low_water = if value < 0 { i32::MAX } else { value.max(1) },
         SO_BSDCOMPAT => {}
         SO_SNDBUF | SO_SNDBUFFORCE => {
             options.send_buffer = buffer_size(value, name == SO_SNDBUFFORCE, MIN_SEND_BUFFER);
@@ -1250,11 +1274,12 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             credentials.extend([0; 8]);
             credentials
         }
-        SO_RCVLOWAT | SO_SNDLOWAT | SO_DOMAIN => int(1),
+        SO_SNDLOWAT | SO_DOMAIN => int(1),
+        SO_RCVLOWAT => int(options.receive_low_water),
         SO_RCVTIMEO | SO_RCVTIMEO_NEW => options.receive_timeout.timeval().to_vec(),
         SO_SNDTIMEO | SO_SNDTIMEO_NEW => options.send_timeout.timeval().to_vec(),
         SO_MARK => int(options.mark),
-        SO_PEEK_OFF => int(-1),
+        SO_PEEK_OFF => int(socket.lock_sides()[socket.side].peek_offset),
         SO_BUSY_POLL => int(options.busy_poll),
         SO_INCOMING_CPU => int(options.incoming_cpu),
         _ => return Err(Errno(92)),
@@ -1285,6 +1310,10 @@ struct Write {
     passed: Passed,
     piece: Piece,
     credentials: Credentials,
+    /// A message a peek has seen, which a peek from `SO_PEEK_OFF` passes
+    /// over once its offset reaches the message's end, empty or not, as
+    /// Linux's `skb->peeked`.
+    peeked: bool,
 }
 /// The credentials a write carries, as Linux's `UNIXCB` keeps them for
 /// `SCM_CREDENTIALS`: its sender's process ID, user and group when either
@@ -1401,6 +1430,9 @@ struct Side {
     /// `SO_PASSCRED`: what this end receives carries credentials, and so
     /// does what it sends.
     pass_credentials: bool,
+    /// `SO_PEEK_OFF`: where a peek starts, moved on by each peek and back
+    /// by each read, as Linux's `sk_peek_off`; a negative value is none.
+    peek_offset: i32,
 }
 struct Pair {
     sides: Mutex<[Side; 2]>,
@@ -1452,6 +1484,15 @@ impl SocketPairEnd {
     fn passes_credentials(&self) -> bool {
         self.lock_sides()[self.side].pass_credentials
     }
+    /// `SO_RCVLOWAT` on this end.
+    fn receive_low_water(&self) -> usize {
+        let low = self
+            .options
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .receive_low_water;
+        usize::try_from(low).unwrap_or(1)
+    }
     /// The bytes waiting to be read on this side.
     fn unread(&self) -> usize {
         self.pair
@@ -1479,6 +1520,7 @@ impl SocketPairEnd {
             pipe: AtomicBool::new(false),
             sides: Mutex::new(std::array::from_fn(|_| Side {
                 output_epoch: 1,
+                peek_offset: -1,
                 ..Side::default()
             })),
             hub,
@@ -1534,37 +1576,32 @@ impl SocketPairEnd {
     /// Reads into `buf`; `message` is the form of recvmsg and recvfrom
     /// (`sock_recvmsg`), which an empty buffer does not end at once as read's
     /// does (Linux's `sock_read_iter`). With `peek` (`MSG_PEEK`) the data
-    /// stays, and a stream is read from that many bytes on.
+    /// stays.
     pub(crate) fn receive(
         &self,
         buf: &mut [u8],
         message: bool,
-        peek: Option<usize>,
+        peek: bool,
     ) -> Result<Received, Errno> {
         if buf.is_empty() && !message {
             return Ok(Received::default());
         }
         let result = if self.pair.messages() {
-            self.read_message(buf, peek.is_some())
+            self.read_message(buf, peek)
         } else {
             self.read_stream(buf, peek, None)
         };
-        self.after_read(peek.is_some(), &result);
+        self.after_read(peek, &result);
         result
     }
-    /// [`Self::receive`] in recvmsg or recvfrom that already read some of
-    /// a stream (`MSG_WAITALL`): as Linux's `manage_oob` counts the whole
-    /// call, it stops at the out-of-band mark rather than drop or pass it,
-    /// and with `SO_PASSCRED` before data of other `credentials` than it
+    /// [`Self::receive`] in a read that already took some of a stream
+    /// (`SO_RCVLOWAT`, `MSG_WAITALL`): as Linux's `manage_oob` counts the
+    /// whole call, it stops at the out-of-band mark rather than drop or pass
+    /// it, and with `SO_PASSCRED` before data of other `credentials` than it
     /// read.
-    fn receive_more(
-        &self,
-        buf: &mut [u8],
-        peek: Option<usize>,
-        credentials: Credentials,
-    ) -> Result<Received, Errno> {
-        let result = self.read_stream(buf, peek, Some(credentials));
-        self.after_read(peek.is_some(), &result);
+    fn receive_more(&self, buf: &mut [u8], credentials: Credentials) -> Result<Received, Errno> {
+        let result = self.read_stream(buf, false, Some(credentials));
+        self.after_read(false, &result);
         result
     }
     /// sendmsg's and sendto's `MSG_OOB`, EOPNOTSUPP: a datagram or packet
@@ -1739,7 +1776,9 @@ impl SocketPairEnd {
     /// truncated to `buf`, with its descriptors. An empty buffer reaches
     /// here only from recvmsg or recvfrom, and discards the message. A
     /// `peek` leaves the message, and gives copies of its descriptors, as
-    /// Linux's `scm_fp_dup`.
+    /// Linux's `scm_fp_dup`; from `SO_PEEK_OFF` it starts that far in,
+    /// past whole messages, as `__skb_try_recv_from_queue`, and the length
+    /// it gives is what is left of the message from there.
     fn read_message(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
         let nonblocking = self.flags() & NONBLOCK != 0;
         let mut sides = self
@@ -1755,21 +1794,40 @@ impl SocketPairEnd {
         if own.read_shutdown && !datagram {
             return Ok(Received::default());
         }
-        if peek && let Some(message) = own.writes.front() {
-            let count = buf.len().min(message.len);
-            for (d, s) in buf.iter_mut().zip(own.bytes.iter().take(count)) {
+        let offset = usize::try_from(own.peek_offset).ok();
+        let mut skip = offset.unwrap_or(0);
+        let mut start = 0;
+        let found = own.writes.iter().position(|message| {
+            let past = offset.is_some() && skip >= message.len && (skip != 0 || message.peeked);
+            if past {
+                skip -= message.len;
+                start += message.len;
+            }
+            !past
+        });
+        if peek && let Some(message) = found.and_then(|index| own.writes.get_mut(index)) {
+            message.peeked = true;
+            let left = message.len - skip;
+            let count = buf.len().min(left);
+            for (d, s) in buf
+                .iter_mut()
+                .zip(own.bytes.range(start + skip..start + skip + count))
+            {
                 *d = *s;
             }
-            return Ok(Received {
+            let received = Received {
                 count,
-                truncated: count < message.len,
+                truncated: count < left,
                 passed: message.passed.clone(),
-                length: message.len,
+                length: left,
                 credentials: message.credentials,
                 ..Received::default()
-            });
+            };
+            Self::peeked(own, count);
+            return Ok(received);
         }
-        let Some(message) = own.writes.pop_front() else {
+        let message = if peek { None } else { own.writes.pop_front() };
+        let Some(message) = message else {
             // A datagram socket has no end of file from its peer: only its
             // own SHUT_RD ends a blocking read, and a nonblocking one still
             // finds nothing.
@@ -1791,6 +1849,7 @@ impl SocketPairEnd {
                 buf[i] = byte;
             }
         }
+        Self::consumed(own, message.len);
         sides[1 - self.side].output_epoch = sides[1 - self.side].output_epoch.wrapping_add(1);
         self.pair.hub.changed();
         Ok(Received {
@@ -1809,12 +1868,12 @@ impl SocketPairEnd {
     /// which come with its first bytes read; an empty buffer still takes
     /// them. With `SO_PASSCRED` it also ends before a write of other
     /// credentials than the first it reads, or than `after` for a call that
-    /// already read some ([`Self::receive_more`]). A `peek` from `skip` bytes
-    /// on leaves the data where it is.
+    /// already read some ([`Self::receive_more`]). A `peek` from
+    /// `SO_PEEK_OFF` on leaves the data where it is.
     fn read_stream(
         &self,
         buf: &mut [u8],
-        peek: Option<usize>,
+        peek: bool,
         after: Option<Credentials>,
     ) -> Result<Received, Errno> {
         let inline = self.out_of_band_inline();
@@ -1834,7 +1893,7 @@ impl SocketPairEnd {
         let glue = own.pass_credentials;
         // Past what the call read, the mark ends it.
         let mark = |write: &Write| write.piece != Piece::Data;
-        if after.is_some() && peek.is_none() && own.writes.front().is_some_and(mark) {
+        if after.is_some() && own.writes.front().is_some_and(mark) {
             return Ok(Received {
                 at_mark: true,
                 ..Received::default()
@@ -1842,7 +1901,7 @@ impl SocketPairEnd {
         }
         // The empty places out-of-band bytes were taken from go first.
         let mut discarded = Passed::new();
-        if peek.is_none() {
+        if !peek {
             while let Some(taken) = own.writes.pop_front_if(|write| write.piece == Piece::Taken) {
                 discarded.extend(taken.passed);
             }
@@ -1858,8 +1917,10 @@ impl SocketPairEnd {
                 Err(Errno::EAGAIN)
             };
         }
-        if let Some(skip) = peek {
-            let received = Self::peek_stream(own, buf, skip, after, inline, glue);
+        if peek {
+            let skip = usize::try_from(own.peek_offset).unwrap_or(0);
+            let received = Self::peek_stream(own, buf, skip, inline, glue);
+            Self::peeked(own, received.count);
             return if received.count == 0
                 && received.passed.is_empty()
                 && !buf.is_empty()
@@ -1927,6 +1988,7 @@ impl SocketPairEnd {
                 break;
             }
         }
+        Self::consumed(&mut sides[self.side], received.count);
         if full || consumed_write {
             sides[1 - self.side].output_epoch = sides[1 - self.side].output_epoch.wrapping_add(1);
         }
@@ -1956,19 +2018,18 @@ impl SocketPairEnd {
         own: &Side,
         buf: &mut [u8],
         mut skip: usize,
-        after: Option<Credentials>,
         inline: bool,
         glue: bool,
     ) -> Received {
         let mut received = Received::default();
-        let mut credentials = after;
+        let mut credentials = None;
         let mut start = 0;
         for write in &own.writes {
             let at = start;
             start += write.len;
             // A peek stops at the mark, as a read does, or passes over it.
             if write.piece != Piece::Data {
-                if received.count != 0 || after.is_some() && skip == 0 {
+                if received.count != 0 {
                     received.at_mark = true;
                     break;
                 }
@@ -2009,6 +2070,21 @@ impl SocketPairEnd {
         received.length = received.count;
         received.credentials = credentials.unwrap_or_default();
         received
+    }
+    /// A peek of `count` bytes moves `SO_PEEK_OFF` on (`sk_peek_offset_fwd`).
+    fn peeked(own: &mut Side, count: usize) {
+        if own.peek_offset >= 0 {
+            let count = i32::try_from(count).unwrap_or(i32::MAX);
+            own.peek_offset = own.peek_offset.saturating_add(count);
+        }
+    }
+    /// A read of `count` bytes, or of a message that long, moves
+    /// `SO_PEEK_OFF` back, not below 0 (`sk_peek_offset_bwd`).
+    fn consumed(own: &mut Side, count: usize) {
+        if own.peek_offset >= 0 {
+            let count = i32::try_from(count).unwrap_or(i32::MAX);
+            own.peek_offset = own.peek_offset.saturating_sub(count).max(0);
+        }
     }
 }
 impl Drop for SocketPairEnd {
@@ -2091,7 +2167,7 @@ impl FileHandle for SocketPairEnd {
     }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         // Descriptors that come to a plain read are closed, as Linux does.
-        self.receive(buf, false, None)
+        self.receive(buf, false, false)
             .map(|received| received.count)
     }
     /// A write with no sending process known, as a pipe's; the write
@@ -2208,6 +2284,7 @@ impl SocketPairEnd {
                 passed: std::mem::take(passed),
                 piece: Piece::Data,
                 credentials,
+                peeked: false,
             });
             self.pair.hub.changed();
             return Ok(buf.len());
@@ -2239,6 +2316,7 @@ impl SocketPairEnd {
                 passed: std::mem::take(passed),
                 piece: Piece::Data,
                 credentials,
+                peeked: false,
             });
             self.pair.hub.changed();
             return Ok(buf.len());
@@ -2264,6 +2342,7 @@ impl SocketPairEnd {
                 passed: std::mem::take(passed),
                 piece: Piece::Data,
                 credentials,
+                peeked: false,
             });
         }
         self.pair.hub.changed();
@@ -2321,6 +2400,7 @@ impl SocketPairEnd {
             passed: std::mem::take(passed),
             piece: Piece::OutOfBand,
             credentials,
+            peeked: false,
         });
         self.pair.hub.changed();
         Ok(1)
@@ -2331,6 +2411,64 @@ mod events_tests {
     use super::*;
     fn pair() -> [Arc<SocketPairEnd>; 2] {
         SocketPairEnd::pair(1, Arc::default()).unwrap()
+    }
+    fn send(end: &SocketPairEnd, bytes: &[u8]) {
+        assert_eq!(
+            end.send(bytes, &mut Passed::new(), Sender::default()),
+            Ok(bytes.len())
+        );
+    }
+    fn set_peek_offset(end: &SocketPairEnd, offset: i32) {
+        end.lock_sides()[end.side].peek_offset = offset;
+    }
+    fn peek_offset(end: &SocketPairEnd) -> i32 {
+        end.lock_sides()[end.side].peek_offset
+    }
+    #[test]
+    fn a_stream_peek_starts_at_the_peek_offset() {
+        let [a, b] = pair();
+        send(&a, b"abc");
+        send(&a, b"de");
+        set_peek_offset(&b, 0);
+        let mut buf = [0; 8];
+        assert_eq!(b.receive(&mut buf[..2], true, true).unwrap().count, 2);
+        let peeked = b.receive(&mut buf, true, true).unwrap();
+        assert_eq!(&buf[..peeked.count], b"cde");
+        assert_eq!(peek_offset(&b), 5);
+        assert_eq!(b.receive(&mut buf, true, true).err(), Some(Errno::EAGAIN));
+        // A read moves it back, not below 0.
+        assert_eq!(b.receive(&mut buf[..2], true, false).unwrap().count, 2);
+        assert_eq!(peek_offset(&b), 3);
+        assert_eq!(b.receive(&mut buf, true, false).unwrap().count, 3);
+        assert_eq!(peek_offset(&b), 0);
+        // A negative offset is none, and stays.
+        send(&a, b"f");
+        set_peek_offset(&b, -2);
+        assert_eq!(b.receive(&mut buf, true, true).unwrap().count, 1);
+        assert_eq!(b.receive(&mut buf, true, false).unwrap().count, 1);
+        assert_eq!(peek_offset(&b), -2);
+    }
+    #[test]
+    fn a_message_peek_passes_over_whole_messages() {
+        let [a, b] = SocketPairEnd::pair(SOCK_DGRAM, Arc::default()).unwrap();
+        send(&a, b"abc");
+        send(&a, b"");
+        send(&a, b"de");
+        set_peek_offset(&b, 1);
+        let mut buf = [0; 8];
+        let peeked = b.receive(&mut buf[..1], true, true).unwrap();
+        assert_eq!((buf[0], peeked.length, peeked.truncated), (b'b', 2, true));
+        assert_eq!(b.receive(&mut buf, true, true).unwrap().count, 1);
+        assert_eq!(peek_offset(&b), 3);
+        // The empty message is peeked once, then passed over.
+        let empty = b.receive(&mut buf, true, true).unwrap();
+        assert_eq!((empty.count, empty.length), (0, 0));
+        let peeked = b.receive(&mut buf, true, true).unwrap();
+        assert_eq!(&buf[..peeked.count], b"de");
+        assert_eq!(b.receive(&mut buf, true, true).err(), Some(Errno::EAGAIN));
+        // A read moves it back by the whole message.
+        assert_eq!(b.receive(&mut buf[..1], true, false).unwrap().length, 3);
+        assert_eq!(peek_offset(&b), 2);
     }
     #[test]
     fn a_stream_keeps_its_out_of_band_byte_at_the_mark() {
@@ -2344,7 +2482,7 @@ mod events_tests {
         assert_ne!(b.readiness().unwrap().0 & PRI, 0);
         assert!(!b.at_mark());
         // A read stops before the mark; the byte comes with MSG_OOB, once.
-        let read = b.receive(&mut buf, true, None).unwrap();
+        let read = b.receive(&mut buf, true, false).unwrap();
         assert_eq!((read.count, read.at_mark), (2, true));
         assert!(b.at_mark());
         let peeked = b.receive_out_of_band(&mut buf, true).unwrap();
@@ -2367,15 +2505,15 @@ mod events_tests {
             Ok(1)
         );
         assert_eq!(a.send(b"z", &mut Passed::new(), Sender::default()), Ok(1));
-        assert_eq!(b.receive(&mut buf, true, None).unwrap().count, 1);
+        assert_eq!(b.receive(&mut buf, true, false).unwrap().count, 1);
         assert_eq!(buf[0], b'x');
-        assert_eq!(b.receive(&mut buf, true, None).unwrap().count, 1);
+        assert_eq!(b.receive(&mut buf, true, false).unwrap().count, 1);
         assert_eq!(buf[0], b'z');
         assert_eq!(
             b.receive_out_of_band(&mut buf, false).err(),
             Some(Errno::EINVAL)
         );
-        assert_eq!(b.receive(&mut buf, true, None).err(), Some(Errno::EAGAIN));
+        assert_eq!(b.receive(&mut buf, true, false).err(), Some(Errno::EAGAIN));
     }
     #[test]
     fn socket_backpressure_partial_write_and_out_edge() {

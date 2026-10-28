@@ -121,6 +121,48 @@ static long send_fds(int socket, const char *data, size_t len, const int *fds, i
     errno = 0;
     return sendmsg(socket, &message, 0);
 }
+/* Sends `data` on `socket` from a child after `ms` milliseconds; the
+   caller reaps it. */
+static pid_t send_later(int socket, const char *data, int ms) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        usleep(ms * 1000);
+        send(socket, data, strlen(data), 0);
+        _exit(0);
+    }
+    return pid;
+}
+/* setsockopt of the int SOL_SOCKET option `opt` to `value` with `size`
+   bytes, then what getsockopt reads back. */
+static void int_option(const char *name, int fd, int opt, int value, socklen_t size) {
+    errno = 0;
+    long n = setsockopt(fd, SOL_SOCKET, opt, &value, size);
+    int e = n < 0 ? errno : 0;
+    int got = -7;
+    socklen_t len = sizeof got;
+    getsockopt(fd, SOL_SOCKET, opt, &got, &len);
+    printf("  set %s %d=%ld errno=%d got=%d\n", name, value, n, e, got);
+}
+/* recvmsg of at most `len` bytes with `flags`: what came, msg_flags, the
+   socket's SO_PEEK_OFF after it, and whether it waited 200 ms or more. */
+static void receive_waited(const char *name, int fd, size_t len, int flags) {
+    char data[16] = {0};
+    struct iovec iov = {data, len};
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    errno = 0;
+    long n = recvmsg(fd, &message, flags);
+    int e = n < 0 ? errno : 0;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    int offset = -7;
+    socklen_t size = sizeof offset;
+    getsockopt(fd, SOL_SOCKET, SO_PEEK_OFF, &offset, &size);
+    printf("  %s=%ld errno=%d data=%.*s flags=%#x off=%d waited=%d\n", name, n, e,
+           n > 0 ? (int)(n < (long)len ? n : (long)len) : 0, data, n < 0 ? 0 : message.msg_flags, offset, ms >= 200);
+}
 /* The child whose messages socket-credentials receives. */
 static pid_t credentials_child;
 /* A process ID as socket-credentials prints it, free of the IDs a run
@@ -2472,6 +2514,113 @@ int main(int argc, char **argv) {
         close(p[1]);
 #undef CRED_SET
 #undef CRED_GET
+        return 0;
+    }
+    if (!strcmp(mode, "socket-rcvlowat")) {
+        /* SO_RCVLOWAT on socket pairs, as Linux's af_unix has it: a blocking
+           stream read waits until it has that many bytes, or the buffer is
+           full, and returns what it has once a wait ends; it does not hold
+           back poll, a peek or a nonblocking read, nor datagrams and
+           packets. A child sends the later bytes; SO_RCVTIMEO bounds every
+           wait. */
+        int sv[2];
+        const int kinds[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int k = 0; k < 3; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            printf("kind %d\n", kinds[k]);
+            int_option("rcvlowat", sv[1], SO_RCVLOWAT, 5, 4);
+            int_option("rcvlowat", sv[1], SO_RCVLOWAT, 0, 4);
+            int_option("rcvlowat", sv[1], SO_RCVLOWAT, -1, 4);
+            int_option("rcvlowat", sv[1], SO_RCVLOWAT, -9, 4);
+            int_option("rcvlowat", sv[1], SO_RCVLOWAT, 3, 2);
+            int_option("rcvlowat", sv[1], SO_RCVLOWAT, 4, 4);
+            struct timeval tv = {2, 0};
+            setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            pid_t pid = send_later(sv[0], "cd", 300);
+            send(sv[0], "ab", 2, 0);
+            struct pollfd p = {sv[1], POLLIN, 0};
+            int ready = poll(&p, 1, 0);
+            printf("  poll=%d revents=%#x\n", ready, p.revents);
+            receive_waited("peek", sv[1], 8, MSG_PEEK);
+            receive_waited("peek-all", sv[1], 8, MSG_PEEK | MSG_WAITALL);
+            receive_waited("dontwait", sv[1], 1, MSG_DONTWAIT);
+            receive_waited("recv", sv[1], 8, 0);
+            waitpid(pid, NULL, 0);
+            receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
+            /* A buffer smaller than the mark ends the read when full. */
+            pid = send_later(sv[0], "gh", 300);
+            send(sv[0], "ef", 2, 0);
+            receive_waited("small", sv[1], 2, 0);
+            waitpid(pid, NULL, 0);
+            receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
+            /* read takes it too. */
+            pid = send_later(sv[0], "kl", 300);
+            send(sv[0], "ij", 2, 0);
+            char buf[8] = {0};
+            long n = read(sv[1], buf, sizeof buf);
+            printf("  read=%ld data=%.*s\n", n, n > 0 ? (int)n : 0, buf);
+            waitpid(pid, NULL, 0);
+            receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
+            /* A wait that times out returns what came. */
+            tv.tv_sec = 0;
+            tv.tv_usec = 300000;
+            setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            send(sv[0], "mn", 2, 0);
+            receive_waited("timeout", sv[1], 8, 0);
+            receive_waited("empty", sv[1], 8, 0);
+            /* The end of the stream ends it as well. */
+            send(sv[0], "op", 2, 0);
+            shutdown(sv[0], SHUT_WR);
+            receive_waited("shut", sv[1], 8, 0);
+            close(sv[0]);
+            close(sv[1]);
+        }
+        return 0;
+    }
+    if (!strcmp(mode, "socket-peek-off")) {
+        /* SO_PEEK_OFF on socket pairs, as Linux's af_unix has it: a peek
+           starts that far in and moves it on, a read moves it back, and on
+           datagrams and packets it skips whole messages. */
+        int sv[2];
+        const int kinds[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int k = 0; k < 3; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            printf("kind %d\n", kinds[k]);
+            int_option("peek_off", sv[1], SO_PEEK_OFF, 5, 4);
+            int_option("peek_off", sv[1], SO_PEEK_OFF, -1, 4);
+            int_option("peek_off", sv[1], SO_PEEK_OFF, -2, 4);
+            int_option("peek_off", sv[1], SO_PEEK_OFF, 3, 2);
+            int_option("peek_off", sv[1], SO_PEEK_OFF, -1, 4);
+            send(sv[0], "abc", 3, 0);
+            send(sv[0], "de", 2, 0);
+            receive_waited("off", sv[1], 2, MSG_PEEK | MSG_DONTWAIT);
+            int_option("peek_off", sv[1], SO_PEEK_OFF, 0, 4);
+            receive_waited("peek", sv[1], 2, MSG_PEEK | MSG_DONTWAIT);
+            receive_waited("peek", sv[1], 8, MSG_PEEK | MSG_DONTWAIT);
+            receive_waited("peek", sv[1], 1, MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT);
+            receive_waited("peek", sv[1], 8, MSG_PEEK | MSG_DONTWAIT);
+            receive_waited("peek", sv[1], 8, MSG_PEEK | MSG_DONTWAIT);
+            receive_waited("recv", sv[1], 2, MSG_DONTWAIT);
+            receive_waited("peek", sv[1], 8, MSG_PEEK | MSG_DONTWAIT);
+            receive_waited("recv", sv[1], 8, MSG_DONTWAIT);
+            receive_waited("recv", sv[1], 8, MSG_DONTWAIT);
+            /* An empty message at the offset is peeked, past it skipped. */
+            send(sv[0], "", 0, 0);
+            send(sv[0], "f", 1, 0);
+            int_option("peek_off", sv[1], SO_PEEK_OFF, 0, 4);
+            receive_waited("empty", sv[1], 8, MSG_PEEK | MSG_DONTWAIT);
+            receive_waited("empty", sv[1], 8, MSG_PEEK | MSG_DONTWAIT);
+            int_option("peek_off", sv[1], SO_PEEK_OFF, 9, 4);
+            receive_waited("past", sv[1], 8, MSG_PEEK | MSG_DONTWAIT);
+            receive_waited("recv", sv[1], 8, MSG_DONTWAIT);
+            receive_waited("recv", sv[1], 8, MSG_DONTWAIT);
+            /* A large offset comes down by what a read takes. */
+            int_option("peek_off", sv[1], SO_PEEK_OFF, 9, 4);
+            send(sv[0], "ghij", 4, 0);
+            receive_waited("recv", sv[1], 8, MSG_DONTWAIT);
+            close(sv[0]);
+            close(sv[1]);
+        }
         return 0;
     }
     if (!strcmp(mode, "socket-oob")) {

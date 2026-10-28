@@ -878,11 +878,20 @@ fn socket_options_are_kept_as_linux_keeps_them() {
     assert_eq!(get(&mut f, 7), (0, 100_000));
     assert_eq!(set(&mut f, 7, 1, 4), 0);
     assert_eq!(get(&mut f, 7), (0, 4608));
+    // SO_RCVLOWAT takes 0 as 1 and a negative value as INT_MAX, and
+    // SO_PEEK_OFF any value.
+    assert_eq!(set(&mut f, 18, 0, 4), 0);
+    assert_eq!(get(&mut f, 18), (0, 1));
+    assert_eq!(set(&mut f, 18, -5, 4), 0);
+    assert_eq!(get(&mut f, 18), (0, i32::MAX));
+    assert_eq!(get(&mut f, 42), (0, -1));
+    assert_eq!(set(&mut f, 42, -2, 4), 0);
+    assert_eq!(get(&mut f, 42), (0, -2));
     // Too short a value, another level, an option whose effect is not
     // modelled here, and an unknown one.
     assert_eq!(set(&mut f, 9, 1, 2), fail(22));
     assert_eq!(f.ret(54, [a, 6, 1, value, 4, 0]), fail(95));
-    assert_eq!(set(&mut f, 18, 1, 4), fail(92));
+    assert_eq!(set(&mut f, 34, 1, 4), fail(92));
     assert_eq!(set(&mut f, 999, 1, 4), fail(92));
     assert_eq!(get(&mut f, 999).0, fail(92));
     // F_SETOWN names a live process or group; F_GETOWN gives it back.

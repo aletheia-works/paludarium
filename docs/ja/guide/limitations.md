@@ -36,8 +36,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     ソケット（たとえば自分自身）の中で待っていると、そのソケットは閉じられません。
     Linux ではガベージコレクタが両方を閉じます。
 - **ソケットのオプション**：`setsockopt` は、効き目を再現していないオプションを
-  `ENOPROTOOPT` で断ります。Linux は受け付けます。`SO_PASSSEC`、
-  `SO_RCVLOWAT`、`SO_TIMESTAMP`、`SO_PEEK_OFF` と、フィルターなど Linux にある
+  `ENOPROTOOPT` で断ります。Linux は受け付けます。`SO_PASSSEC`、`SO_TIMESTAMP` と、
+  フィルターなど Linux にある
   ほかのオプションです。`SO_RCVTIMEO` と `SO_SNDTIMEO` は 1000 Hz の刻みに丸めます。
   Linux は自分の `CONFIG_HZ` に丸めます。`SO_SNDBUF` と `SO_RCVBUF` は値を
   返しますが、組のバッファは変わりません。ゲストは root なので、`CAP_NET_ADMIN` の

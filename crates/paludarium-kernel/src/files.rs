@@ -1016,6 +1016,13 @@ fn read_blocking(
     file: &Arc<dyn FileHandle>,
     b: &mut [u8],
 ) -> Result<usize, Errno> {
+    // A socket's read waits as its SO_RCVLOWAT says.
+    if file
+        .as_any()
+        .is_some_and(|a| a.is::<crate::sockets::SocketPairEnd>())
+    {
+        return crate::sockets::read(c, file, b);
+    }
     let result = wait_for_read(c, file, false, || file.read(b));
     // A pipe read signals the writer as it ends, with data or not, unless a
     // signal interrupts it, as Linux's `pipe_read`.

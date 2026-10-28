@@ -61,6 +61,8 @@
     {"name":"socket-oob","binary":"process"},
     {"name":"socket-options","binary":"process"},
     {"name":"socket-credentials","binary":"process"},
+    {"name":"socket-rcvlowat","binary":"process"},
+    {"name":"socket-peek-off","binary":"process"},
     {"name":"socket-timeouts","binary":"process"},
     {"name":"signal-restart","binary":"process"},
     {"name":"signal-io","binary":"process"},

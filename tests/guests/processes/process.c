@@ -2522,8 +2522,8 @@ int main(int argc, char **argv) {
            stream read waits until it has that many bytes, or the buffer is
            full, and returns what it has once a wait ends; it does not hold
            back poll, a peek or a nonblocking read, nor datagrams and
-           packets. A child sends the later bytes; SO_RCVTIMEO bounds every
-           wait. */
+           packets. A child sends the later bytes, only where the read is
+           to wait; SO_RCVTIMEO bounds every wait. */
         int sv[2];
         const int kinds[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
         for (int k = 0; k < 3; k++) {
@@ -2549,12 +2549,12 @@ int main(int argc, char **argv) {
             receive_waited("recv", sv[1], 8, 0);
             waitpid(pid, NULL, 0);
             receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
-            /* A buffer smaller than the mark ends the read when full. */
+            /* A buffer smaller than the mark ends the read when full; were
+               it to wait, SO_RCVTIMEO would end it, long after. No child
+               runs here: an emulated parent's first steps after a fork
+               copy its pages, which can take as long as a wait. */
             send(sv[0], "ef", 2, 0);
-            pid = send_later(sv[0], "gh", 1000);
             receive_waited("small", sv[1], 2, 0);
-            waitpid(pid, NULL, 0);
-            receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
             /* read takes it too. */
             send(sv[0], "ij", 2, 0);
             pid = send_later(sv[0], "kl", 1000);

@@ -394,6 +394,14 @@ static void *discard_reader(void *unused) {
 }
 static volatile sig_atomic_t received;
 static void interrupted(int number) { (void)number; received++; }
+/* wait-restart: the handler answers the child once the parent waits. */
+static volatile sig_atomic_t wait_started;
+static int wait_answer = -1;
+static void wait_signalled(int number) {
+    (void)number;
+    received++;
+    if (wait_started && write(wait_answer, "a", 1) != 1) received = -100;
+}
 /* signal-io: takes the queued SIGIO, SIGURG and SIGRTMIN+5 that the mode
    keeps blocked, oldest first within each, and prints them. */
 #define IO_RT (SIGRTMIN + 5)
@@ -4975,31 +4983,36 @@ int main(int argc, char **argv) {
     fflush(NULL);
     pid_t parent = getpid();
     if (!strcmp(mode, "wait-interrupt") || !strcmp(mode, "wait-restart")) {
+        int restart = !strcmp(mode, "wait-restart");
         struct sigaction action = {0};
-        action.sa_handler = interrupted;
-        action.sa_flags = !strcmp(mode, "wait-restart") ? SA_RESTART : 0;
+        action.sa_handler = restart ? wait_signalled : interrupted;
+        action.sa_flags = restart ? SA_RESTART : 0;
         sigaction(SIGUSR1, &action, NULL);
-        /* The child signals only once the parent is about to wait, and
-           exits well after, so that the signal finds the parent waiting
-           however slowly either runs. */
-        int ready[2];
-        if (pipe(ready)) return 79;
+        /* The child signals until the parent answers, so that a signal
+           finds the parent waiting however the two are scheduled: without
+           SA_RESTART the parent answers once waitpid fails, with it the
+           handler answers once the parent waits, and the child exits. */
+        int answer[2];
+        if (pipe(answer)) return 79;
+        fcntl(answer[0], F_SETFL, O_NONBLOCK);
+        wait_answer = answer[1];
         pid_t pid = child();
         if (pid < 0) return 78;
         if (!pid) {
             char b;
-            if (read(ready[0], &b, 1) != 1) _exit(6);
-            usleep(100000);
-            kill(parent, SIGUSR1);
-            usleep(500000);
+            while (read(answer[0], &b, 1) != 1) {
+                kill(parent, SIGUSR1);
+                usleep(10000);
+            }
             _exit(5);
         }
         int status = 0;
-        if (write(ready[1], "r", 1) != 1) return 77;
         errno = 0;
+        wait_started = 1;
         pid_t waited = waitpid(pid, &status, 0);
         int error = errno;
-        result("signal", received == 1);
+        if (!restart && write(answer[1], "a", 1) != 1) return 77;
+        result("signal", received >= 1);
         result("interrupted", waited == -1 && error == EINTR);
         if (waited == -1) waited = waitpid(pid, &status, 0);
         result("wait", waited == pid);

@@ -5014,7 +5014,9 @@ int main(int argc, char **argv) {
         if (!restart && write(answer[1], "a", 1) != 1) return 77;
         result("signal", received >= 1);
         result("interrupted", waited == -1 && error == EINTR);
-        if (waited == -1) waited = waitpid(pid, &status, 0);
+        /* A signal the child sent before it read the answer may still
+           come. */
+        while (waited == -1 && (waited = waitpid(pid, &status, 0)) == -1 && errno == EINTR) {}
         result("wait", waited == pid);
         result("status", status);
         return 0;

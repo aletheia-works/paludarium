@@ -66,15 +66,15 @@ async function netRequest(job, request) {
   // The kernel asks only for what its policy allows; a run without a network never gets here.
   if (request.op === "resolve") {
     if (!job?.network) { e.net_unresolved(request.id, 101); return; }
+    // A lookup still pending when its job ends is released then (closeSockets), and its answer dropped.
+    job.lookups.add(request.id);
     const { lookup } = await import("node:dns/promises");
-    try {
-      const found = await lookup(request.name, { all: true, verbatim: true });
-      if (!abandoned) withBytes(encoder.encode(found.map(item => item.address).join("\n")), id => e.net_resolved(request.id, id));
-    } catch (cause) {
-      if (abandoned) return;
-      if (cause?.code === "ENOTFOUND" || cause?.code === "ENODATA") withBytes(new Uint8Array(), id => e.net_resolved(request.id, id));
-      else e.net_unresolved(request.id, errnoOf(cause));
-    }
+    let found, failed;
+    try { found = await lookup(request.name, { all: true, verbatim: true }); } catch (cause) { failed = cause; }
+    if (abandoned || !job.lookups.delete(request.id)) return;
+    if (found) withBytes(encoder.encode(found.map(item => item.address).join("\n")), id => e.net_resolved(request.id, id));
+    else if (failed?.code === "ENOTFOUND" || failed?.code === "ENODATA") withBytes(new Uint8Array(), id => e.net_resolved(request.id, id));
+    else e.net_unresolved(request.id, errnoOf(failed));
     return;
   }
   if (request.op !== "open") return;
@@ -106,6 +106,8 @@ function closeSockets(job) {
   for (const entry of job.sockets) { entry.socket.destroy(); release(entry); }
   job.sockets.clear();
   for (const entry of sockets.values()) if (entry.job === job) release(entry);
+  if (!abandoned) for (const id of job.lookups) e.net_release(id);
+  job.lookups.clear();
 }
 function withBytes(bytes, callback) { const id = putBuffer(e, bytes, memory); try { return callback(id); } finally { e.buffer_drop(id); } }
 function placeEntries(config, entries) {
@@ -242,7 +244,10 @@ async function launch(message) {
     if (message.options.limits?.tasks !== undefined) check(e.config_limit(config, 0, message.options.limits.tasks), "task limit");
     if (message.options.limits?.openFiles !== undefined) check(e.config_limit(config, 1, message.options.limits.openFiles), "open file limit");
     if (message.options.limits?.memory !== undefined) check(e.config_limit(config, 2, message.options.limits.memory), "memory limit");
-    for (const entry of message.options.network?.allow ?? []) withBytes(encoder.encode(entry), id => check(e.config_network(config, id), "network rule"));
+    // NetworkPolicy::allow has the last word on an entry; one it refuses is the caller's error.
+    for (const entry of message.options.network?.allow ?? []) {
+      if (withBytes(encoder.encode(entry), id => e.config_network(config, id)) < 0) throw Object.assign(new Error(`network.allow entry ${JSON.stringify(entry)} rejected`), { kind: "invalid-program" });
+    }
     for (const arg of message.options.args ?? [message.options.program]) withBytes(encoder.encode(arg), id => check(e.config_arg(config, id), "argument"));
     for (const [key, value] of Object.entries(message.options.env ?? {})) withBytes(encoder.encode(key), keyId => withBytes(encoder.encode(value), valueId => check(e.config_env(config, keyId, valueId), "environment")));
     for (const [path, bytes] of Object.entries(message.options.files ?? {})) withBytes(encoder.encode(path), pathId => withBytes(bytes, dataId => check(e.config_file_mode(config, pathId, dataId, message.options.fileModes?.[path] ?? 0o755), "file")));
@@ -256,7 +261,7 @@ async function launch(message) {
     const tlsPointer = Math.ceil(pointer / tlsAlign) * tlsAlign;
     const stackTop = Math.ceil((tlsPointer + tlsSize) / 16) * 16 + 2 * 1024 * 1024;
     const token = putBuffer(e, new Uint8Array([73]), memory);
-    const job = { id: message.id, handle, region, token, offsets: { stdout: 0, stderr: 0 }, finished: false, diagnostics: null, tasks: new Map(), network: message.options.network !== undefined, sockets: new Set() };
+    const job = { id: message.id, handle, region, token, offsets: { stdout: 0, stderr: 0 }, finished: false, diagnostics: null, tasks: new Map(), network: message.options.network !== undefined, sockets: new Set(), lookups: new Set() };
     jobs.set(message.id, job);
     port.send({ type: "accepted", id: message.id });
     job.worker = await spawnWorker(new URL("execution.mjs", import.meta.url));
@@ -314,5 +319,5 @@ port.listen(async message => {
       while (jobs.size) await new Promise(resolve => setTimeout(resolve, 10));
       port.send({ type: "disposed" });
     }
-  } catch (cause) { port.send({ type: "failed", id: message.id, error: failure("internal", String(cause)) }); }
+  } catch (cause) { port.send({ type: "failed", id: message.id, error: failure(cause?.kind ?? "internal", cause?.kind ? cause.message : String(cause)) }); }
 });

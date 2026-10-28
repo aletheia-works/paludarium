@@ -79,6 +79,12 @@ test("a guest connects only to what network.allow names", async (t) => {
   assert.deepEqual((await run(runtime, program)).status, { kind: "exited", code: 97 });
   assert.throws(() => runtime.run({ program: "/guest", files: { "/guest": program }, network: { allow: ["bad name"] } }), { kind: "invalid-program" });
   assert.throws(() => runtime.run({ program: "/guest", files: { "/guest": program }, network: {} }), { kind: "invalid-program" });
+  // Entries of the right shape that the kernel still refuses reject the run the same way.
+  for (const entry of ["host:99999", "host:0", "a..b", "[1.2.3.4]"]) {
+    await assert.rejects(runtime.run({ program: "/guest", files: { "/guest": program }, network: { allow: [entry] } }).exited, { kind: "invalid-program" }, entry);
+  }
+  // The launcher still runs guests after them.
+  assert.deepEqual((await run(runtime, program, { allow: [`127.0.0.1:${port}`] })).status, { kind: "exited", code: 0 });
 });
 
 test("the DNS stub answers an allowed name from Node's resolver", async (t) => {

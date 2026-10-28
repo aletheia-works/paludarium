@@ -1100,7 +1100,7 @@ fn select(
     for fd in 0..n {
         let bit = 1u64 << (fd % 64);
         if wanted.iter().any(|set| set[(fd / 64) as usize] & bit != 0)
-            && revents(c, fd as i32, POLLIN | POLLOUT | POLLPRI) == POLLNVAL
+            && revents(c, fd as i32, 0) == POLLNVAL
         {
             return Err(Errno::EBADF);
         }
@@ -1113,7 +1113,14 @@ fn select(
             if wanted.iter().all(|set| set[word] & bit == 0) {
                 continue;
             }
-            let mask = revents(c, fd as i32, POLLIN | POLLOUT | POLLPRI);
+            // Only a descriptor in the write set asks whether it takes a
+            // write, which a full datagram socket notes (`polled_full`).
+            let events = [POLLIN, POLLOUT, POLLPRI]
+                .into_iter()
+                .enumerate()
+                .filter(|&(kind, _)| wanted[kind][word] & bit != 0)
+                .fold(0, |events, (_, event)| events | event);
+            let mask = revents(c, fd as i32, events);
             for (kind, ready) in [POLLIN | 0x18, POLLOUT | 0x8, POLLPRI]
                 .into_iter()
                 .enumerate()
@@ -1136,6 +1143,7 @@ fn select(
 
 /// The poll events of descriptor `fd` among `events` (with POLLERR and
 /// POLLHUP always), POLLNVAL for one that is not open, 0 for a negative fd.
+/// Asking for POLLOUT of a full datagram socket notes it (`polled_full`).
 fn revents(c: &Context<'_>, fd: i32, events: u16) -> u16 {
     match fd {
         fd if fd < 0 => 0,
@@ -1151,7 +1159,12 @@ fn revents(c: &Context<'_>, fd: i32, events: u16) -> u16 {
         1 | 2 if c.files.uses_original_stdio(fd as u64) => events & POLLOUT,
         _ => match c.files.descriptor(fd as u64) {
             Ok(d) => match d.file.readiness() {
-                Ok((mask, _, _)) => (mask as u16) & (events | 0x18),
+                Ok((mask, _, _)) => {
+                    if events & POLLOUT != 0 && mask as u16 & POLLOUT == 0 {
+                        crate::sockets::polled_full(&d.file);
+                    }
+                    (mask as u16) & (events | 0x18)
+                }
                 Err(_) => d.file.stat().map_or(POLLNVAL, |stat| {
                     if stat.mode & 0o170000 == 0o100000 {
                         events & (POLLIN | POLLOUT)

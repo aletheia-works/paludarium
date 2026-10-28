@@ -426,6 +426,24 @@ pub(crate) fn wait_data(file: &Arc<dyn FileHandle>, waits: bool) {
     let own = &mut sides[socket.side];
     own.waiting_data = waits && own.registration.is_some();
 }
+/// A poll, select or `epoll_ctl` that asked whether `file` takes a write
+/// found it full. A datagram or packet socket open with `O_ASYNC` then
+/// signals `POLL_OUT` once a read frees room, as Linux's `unix_dgram_poll`
+/// sets `SOCKWQ_ASYNC_NOSPACE` (a stream's `unix_poll` does not).
+pub(crate) fn polled_full(file: &Arc<dyn FileHandle>) {
+    let Some(socket) = file
+        .as_any()
+        .and_then(|any| any.downcast_ref::<SocketPairEnd>())
+    else {
+        return;
+    };
+    if !socket.pair.messages() {
+        return;
+    }
+    let mut sides = socket.lock_sides();
+    let own = &mut sides[socket.side];
+    own.no_space |= own.registration.is_some();
+}
 fn as_socket(file: &Arc<dyn FileHandle>) -> Result<&SocketPairEnd, Errno> {
     file.as_any()
         .and_then(|v| v.downcast_ref::<SocketPairEnd>())
@@ -2385,12 +2403,11 @@ impl SocketPairEnd {
                     self.notify(1 - self.side, Reason::In);
                 }
             }
+            // Only while `O_ASYNC` is on, as Linux's `sk_set_bit`.
             Err(e) if e == Errno::EAGAIN => {
-                self.pair
-                    .sides
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)[self.side]
-                    .no_space = true;
+                let mut sides = self.lock_sides();
+                let own = &mut sides[self.side];
+                own.no_space |= own.registration.is_some();
             }
             _ => {}
         }

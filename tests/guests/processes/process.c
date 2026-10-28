@@ -2208,6 +2208,48 @@ int main(int argc, char **argv) {
         while (taken < total && (r = recv(sv[1], chunk, 4096, 0)) > 0) taken += r;
         printf("  all=%d out=%d\n", taken == total, io_count(POLL_OUT));
         close(sv[0]); close(sv[1]);
+        /* A full datagram or packet socket that a poll, select or
+           epoll_ctl asks to write signals POLL_OUT once read, as one whose
+           send failed does; filled with no failed send and no such
+           question, or failed before O_ASYNC, it signals nothing. */
+        puts("polled-full");
+        const char *ways[] = {"poll", "select", "epoll", "sent", "no-async"};
+        for (int t = 1; t < 3; t++) {
+            int fit = 0;
+            if (socketpair(AF_UNIX, types[t], 0, sv)) return 74;
+            fcntl(sv[0], F_SETFL, O_NONBLOCK);
+            while (send(sv[0], chunk, 256, 0) == 256) fit++;
+            close(sv[0]); close(sv[1]);
+            for (int w = 0; w < 5; w++) {
+                if (socketpair(AF_UNIX, types[t], 0, sv)) return 74;
+                if (w != 4) io_async(sv[0], IO_RT);
+                fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL) | O_NONBLOCK);
+                int sent = 0;
+                while (sent < fit && send(sv[0], chunk, 256, 0) == 256) sent++;
+                struct pollfd out = {sv[0], POLLOUT, 0};
+                fd_set writes;
+                FD_ZERO(&writes);
+                FD_SET(sv[0], &writes);
+                struct timespec zero = {0, 0};
+                struct epoll_event event = {.events = EPOLLOUT};
+                int e;
+                if (w == 0) poll(&out, 1, 0);
+                if (w == 1) pselect(sv[0] + 1, NULL, &writes, NULL, &zero, NULL);
+                if (w == 2 && (e = epoll_create1(0)) >= 0) {
+                    epoll_ctl(e, EPOLL_CTL_ADD, sv[0], &event);
+                    close(e);
+                }
+                if (w == 4) {
+                    send(sv[0], chunk, 256, 0);
+                    io_async(sv[0], IO_RT);
+                }
+                io_count(POLL_OUT);
+                while (recv(sv[1], chunk, 256, MSG_DONTWAIT) > 0) {}
+                printf("  %s-%s filled=%d out=%d\n", type_names[t], ways[w], sent == fit,
+                       io_count(POLL_OUT));
+                close(sv[0]); close(sv[1]);
+            }
+        }
         puts("pipe");
         /* The write fills the pipe three times, as the child reads only
            a full pipe, so its count does not hang on which runs first. */

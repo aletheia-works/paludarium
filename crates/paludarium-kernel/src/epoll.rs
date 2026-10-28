@@ -113,6 +113,10 @@ impl EpollInstance {
             }
             3 if !state.interests.contains_key(&key) => return Err(Errno::ENOENT),
             _ => {
+                // Linux's `ep_insert` and `ep_modify` poll the file once.
+                if events & OUT != 0 && file.readiness().is_ok_and(|(mask, ..)| mask & OUT == 0) {
+                    crate::sockets::polled_full(&file);
+                }
                 state.interests.insert(
                     key,
                     Interest {

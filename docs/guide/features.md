@@ -178,7 +178,9 @@ kernel.
   - **Sockets.** A send signals the peer. On a stream or packet socket, so
     do a write shutdown and the close, which hangs up; a datagram socket's
     do not. A send that found the buffer full signals once when reads leave
-    three quarters of the buffer free. An out-of-band byte also sends a
+    three quarters of the buffer free, and so does a full datagram or packet
+    socket that `poll`, `select` or `epoll_ctl` asked to take a write. Only
+    what happens while `O_ASYNC` is on counts. An out-of-band byte also sends a
     `POLL_PRI` signal.
   - **A waiting reader.** A stream whose read waits gets no signal for the
     data, end or hang-up that ends the wait, as Linux holds it back; of a

@@ -45,7 +45,10 @@ verified.
   (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
   gid 0.
 - **Signal-driven I/O**: `O_ASYNC` works on pipes and sockets only, so
-  standard input and terminals never send `SIGIO`, where Linux's do.
+  standard input and terminals never send `SIGIO`, where Linux's do. A
+  full datagram or packet socket that `epoll_wait` finds unwritable does not
+  signal `POLL_OUT` once read, where Linux's does when it checks a socket
+  on its ready list again (`poll`, `select` and `epoll_ctl` do as Linux).
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for

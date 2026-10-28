@@ -1686,14 +1686,12 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             let file = c.files.descriptor(a[0])?.file;
             let count = match crate::sockets::queued(&file, a[1] == 0x5411) {
                 Some(count) => count? as i64,
-                None if a[1] == 0x541b
-                    && file
-                        .stat()
-                        .is_ok_and(|stat| stat.mode & 0o170000 == 0o100000) =>
-                {
-                    file.stat()?.size as i64 - file.seek(0, 1)? as i64
-                }
-                None => return Err(Errno::ENOTTY),
+                None => match file.stat() {
+                    Ok(stat) if a[1] == 0x541b && stat.mode & 0o170000 == 0o100000 => {
+                        stat.size as i64 - file.seek(0, 1)? as i64
+                    }
+                    _ => return Err(Errno::ENOTTY),
+                },
             };
             c.mem
                 .write(GuestAddr(a[2]), &(count as i32).to_le_bytes())

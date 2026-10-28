@@ -41,7 +41,8 @@ verified.
   `SO_SNDBUF` and `SO_RCVBUF` are reported but leave the pair's buffer as it
   is. The buffer counts only the bytes in it, where Linux also counts each
   message's or part's overhead, so more small messages fit before a send
-  finds it full, and `SIOCOUTQ` counts only the bytes the peer has not read. The guest is root, so the options that need `CAP_NET_ADMIN`
+  finds it full, and `SIOCOUTQ` counts only the bytes the peer has not
+  read. The guest is root, so the options that need `CAP_NET_ADMIN`
   (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
   gid 0.
 - **Signal-driven I/O**: `O_ASYNC` works on pipes and sockets only, so
@@ -65,9 +66,11 @@ verified.
   standard input as always readable, as the Windows host cannot tell whether
   input is waiting; on Linux and macOS hosts and in WebAssembly it is
   readable only with input or at its end.
-- **`FIONREAD` on the host's standard streams**: it returns `ENOTTY`, where
-  Linux counts what waits in the pipe, terminal or file behind them. A
-  guest's own pipes, sockets and regular files are counted as on Linux.
+- **`FIONREAD` and `SIOCOUTQ` on the host's standard streams**: both return
+  `ENOTTY`, where Linux answers for what is behind them: `FIONREAD` for a
+  pipe, terminal, socket or regular file, `SIOCOUTQ` for a terminal or
+  socket. A guest's own pipes, sockets and regular files are counted as on
+  Linux.
 - **Core files**: a core is written as with the kernel's default
   `core_pattern` (`core` in the working directory); a host that pipes cores to
   a crash handler (systemd-coredump, apport) is not modelled. The core holds

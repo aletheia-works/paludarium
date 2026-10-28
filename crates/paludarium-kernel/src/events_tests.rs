@@ -616,6 +616,7 @@ fn fionread_and_siocoutq_count_what_waits() {
     assert_eq!(f.ret(44, [c, DATA + 32, 3, 0, 0, 0]), 3);
     assert_eq!(f.ret(44, [c, DATA + 35, 2, 0, 0, 0]), 2);
     assert_eq!(count(&mut f, d, 0x541b), (0, 3));
+    assert_eq!(count(&mut f, c, 0x5411), (0, 5));
     // A pipe counts at either end and has no SIOCOUTQ.
     let (r, w) = pair(&mut f, 293, [DATA, 0, 0, 0, 0, 0]);
     assert_eq!(f.ret(1, [w, DATA + 32, 4, 0, 0, 0]), 4);

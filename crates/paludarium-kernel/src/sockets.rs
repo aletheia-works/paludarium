@@ -271,6 +271,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             let kind = u32::try_from(a[1]).map_err(|_| Errno::EINVAL)?;
             let ends = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
             ends[0].pair.creator.store(c.process.pid, Ordering::SeqCst);
+            let _ = ends[0].pair.clock.set(Arc::clone(c.shared_host));
             let [fd0, fd1] = c.files.install_pair(
                 ends.map(|end| end as Arc<dyn FileHandle>),
                 kind & CLOEXEC != 0,
@@ -675,8 +676,8 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     drop(passed);
     result
 }
-/// `recvmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS`,
-/// `SCM_CREDENTIALS` and the flags of [`receive_with`].
+/// `recvmsg(fd, msg, flags)` on a socket pair, with timestamps,
+/// `SCM_RIGHTS`, `SCM_CREDENTIALS` and the flags of [`receive_with`].
 fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let file = socket(c, a[0])?;
     let header = message_header(c, a[1], true)?;
@@ -699,7 +700,7 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let (used, cut) = deliver(
         c,
         &header,
-        received.passed,
+        received,
         credentials,
         a[2] & MSG_CMSG_CLOEXEC != 0,
     );
@@ -832,51 +833,62 @@ fn receive_with(
 }
 /// Writes the control messages of a received message, as Linux's
 /// `__scm_recv_common`: with no control buffer, only `MSG_CTRUNC` tells of
-/// them. Otherwise `credentials`, when the socket passes them, go first
-/// ([`put_credentials`]), then the descriptors ([`put_descriptors`]).
+/// them. Otherwise a message's timestamp, as `__sock_recv_timestamp` puts
+/// it before them, goes first, then `credentials`, when the socket passes
+/// them ([`put_control`]), then the descriptors ([`put_descriptors`]).
 /// Returns the control bytes used and whether anything was lost
 /// (`MSG_CTRUNC`).
 fn deliver(
     c: &mut Context<'_>,
     header: &MessageHeader,
-    passed: Passed,
+    received: Received,
     credentials: Option<Credentials>,
     cloexec: bool,
 ) -> (u64, bool) {
+    let passed = received.passed;
     if header.control == 0 {
-        return (0, credentials.is_some() || !passed.is_empty());
+        return (
+            0,
+            received.timestamp.is_some() || credentials.is_some() || !passed.is_empty(),
+        );
     }
     let mut room = (header.control, header.control_len);
     let mut cut = false;
+    if let Some((at, timestamps)) = received.timestamp {
+        cut |= put_control(c, &mut room, timestamps.kind(), &timestamps.data(at));
+    }
     if let Some(credentials) = credentials {
-        cut |= put_credentials(c, &mut room, credentials);
+        let mut ucred = [0; UCRED];
+        for (i, id) in [credentials.pid, credentials.uid, credentials.gid]
+            .into_iter()
+            .enumerate()
+        {
+            ucred[4 * i..][..4].copy_from_slice(&id.to_le_bytes());
+        }
+        cut |= put_control(c, &mut room, SCM_CREDENTIALS, &ucred);
     }
     if !passed.is_empty() {
         cut |= put_descriptors(c, &mut room, passed, cloexec);
     }
     (header.control_len - room.1, cut)
 }
-/// Writes the `SCM_CREDENTIALS` message at the start of `room` (the address
-/// and length of what is left of the control buffer), as Linux's `put_cmsg`:
-/// cut to what is left, nothing when not even its header fits, and `room`
-/// as it was when it cannot be written. Returns whether it was cut.
-fn put_credentials(c: &Context<'_>, room: &mut (u64, u64), credentials: Credentials) -> bool {
+/// Writes a `SOL_SOCKET` control message of `kind` holding `data` at the
+/// start of `room` (the address and length of what is left of the control
+/// buffer), as Linux's `put_cmsg`: cut to what is left, nothing when not
+/// even its header fits, and `room` as it was when it cannot be written.
+/// Returns whether it was cut.
+fn put_control(c: &Context<'_>, room: &mut (u64, u64), kind: u32, data: &[u8]) -> bool {
     let (at, left) = *room;
     if left < CMSG_HEADER as u64 {
         return true;
     }
-    let full = CMSG_HEADER + UCRED;
+    let full = CMSG_HEADER + data.len();
     let len = usize::try_from(left).unwrap_or(usize::MAX).min(full);
-    let mut cmsg = [0; CMSG_HEADER + UCRED];
-    cmsg[..8].copy_from_slice(&(len as u64).to_le_bytes());
-    cmsg[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
-    cmsg[12..16].copy_from_slice(&SCM_CREDENTIALS.to_le_bytes());
-    for (i, id) in [credentials.pid, credentials.uid, credentials.gid]
-        .into_iter()
-        .enumerate()
-    {
-        cmsg[CMSG_HEADER + 4 * i..][..4].copy_from_slice(&id.to_le_bytes());
-    }
+    let mut cmsg = Vec::with_capacity(full);
+    cmsg.extend((len as u64).to_le_bytes());
+    cmsg.extend(SOL_SOCKET.to_le_bytes());
+    cmsg.extend(kind.to_le_bytes());
+    cmsg.extend(data);
     if c.mem.write(GuestAddr(at), &cmsg[..len]).is_ok() {
         let step = (full.next_multiple_of(8) as u64).min(left);
         *room = (at + step, left - step);
@@ -949,6 +961,9 @@ const SO_SNDLOWAT: u32 = 19;
 const SO_RCVTIMEO: u32 = 20;
 const SO_SNDTIMEO: u32 = 21;
 const SO_TIMESTAMP: u32 = 29;
+const SO_TIMESTAMPNS: u32 = 35;
+const SO_TIMESTAMP_NEW: u32 = 63;
+const SO_TIMESTAMPNS_NEW: u32 = 64;
 const SO_RCVTIMEO_NEW: u32 = 66;
 const SO_SNDTIMEO_NEW: u32 = 67;
 /// The kernel's tick rate, to which Linux rounds `SO_RCVTIMEO` and
@@ -1132,8 +1147,9 @@ fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// `sk_setsockopt`: a socket pair has only `SOL_SOCKET` options
 /// (EOPNOTSUPP for another level), an `int` value of fewer than 4 bytes is
 /// EINVAL, and an unknown name, or one whose effect is not modelled here
-/// (`SO_PASSSEC`, `SO_TIMESTAMP`), is ENOPROTOOPT. `SO_PASSCRED` makes
-/// messages carry credentials ([`Credentials`]), `SO_RCVLOWAT` sets what a
+/// (`SO_PASSSEC`, `SO_TIMESTAMPING`), is ENOPROTOOPT. `SO_PASSCRED` makes
+/// messages carry credentials ([`Credentials`]), `SO_TIMESTAMP` and its kin
+/// timestamps ([`Timestamps`]), `SO_RCVLOWAT` sets what a
 /// stream read waits for ([`receive_with`]; 0 is 1, and a negative value
 /// `INT_MAX`), and `SO_PEEK_OFF` where a peek starts (any value, a negative
 /// one for none). `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
@@ -1162,6 +1178,19 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     if name == SO_PEEK_OFF {
         socket.lock_sides()[socket.side].peek_offset = value;
+        return Ok(0);
+    }
+    if matches!(
+        name,
+        SO_TIMESTAMP | SO_TIMESTAMPNS | SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW
+    ) {
+        // As Linux's `__sock_set_timestamps`.
+        let timestamps = &mut socket.lock_sides()[socket.side].timestamps;
+        timestamps.on = on;
+        timestamps.nanoseconds = on && matches!(name, SO_TIMESTAMPNS | SO_TIMESTAMPNS_NEW);
+        if on {
+            timestamps.new = matches!(name, SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW);
+        }
         return Ok(0);
     }
     let mut options = socket
@@ -1247,8 +1276,18 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_DEBUG => int(options.debug.into()),
         SO_REUSEADDR => int(options.reuse_address.into()),
         SO_TYPE => int(socket.pair.kind.cast_signed()),
-        SO_ERROR | SO_BSDCOMPAT | SO_REUSEPORT | SO_ACCEPTCONN | SO_PASSSEC | SO_TIMESTAMP
-        | SO_PROTOCOL => int(0),
+        SO_ERROR | SO_BSDCOMPAT | SO_REUSEPORT | SO_ACCEPTCONN | SO_PASSSEC | SO_PROTOCOL => int(0),
+        // As Linux's `sk_getsockopt`: each names only the form it set.
+        name @ (SO_TIMESTAMP | SO_TIMESTAMPNS | SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW) => {
+            let t = socket.lock_sides()[socket.side].timestamps;
+            int(match name {
+                SO_TIMESTAMP => t.on && !t.new && !t.nanoseconds,
+                SO_TIMESTAMPNS => t.nanoseconds && !t.new,
+                SO_TIMESTAMP_NEW => t.on && t.new,
+                _ => t.nanoseconds && t.new,
+            }
+            .into())
+        }
         SO_PASSCRED => int(socket.passes_credentials().into()),
         SO_DONTROUTE => int(options.dont_route.into()),
         SO_BROADCAST => int(options.broadcast.into()),
@@ -1315,6 +1354,10 @@ struct Write {
     /// over once its offset reaches the message's end, empty or not, as
     /// Linux's `skb->peeked`.
     peeked: bool,
+    /// When a message was sent, in nanoseconds of real time, if the
+    /// receiving end took timestamps then, or when a read first gave it
+    /// one, as Linux's `skb->tstamp`.
+    sent: Option<u64>,
 }
 /// The credentials a write carries, as Linux's `UNIXCB` keeps them for
 /// `SCM_CREDENTIALS`: its sender's process ID, user and group when either
@@ -1393,6 +1436,8 @@ pub(crate) struct Received {
     /// The descriptors of dropped out-of-band bytes, closed with this,
     /// outside the socket's lock.
     discarded: Passed,
+    /// A message's timestamp, and how the reading end takes it.
+    timestamp: Option<(u64, Timestamps)>,
 }
 impl Received {
     /// What recvmsg or recvfrom returns: with `MSG_TRUNC`, a message's
@@ -1434,6 +1479,44 @@ struct Side {
     /// `SO_PEEK_OFF`: where a peek starts, moved on by each peek and back
     /// by each read, as Linux's `sk_peek_off`; a negative value is none.
     peek_offset: i32,
+    /// `SO_TIMESTAMP` and its kin: what this end receives as messages comes
+    /// with the time it was sent.
+    timestamps: Timestamps,
+}
+/// The flags `SO_TIMESTAMP`, `SO_TIMESTAMPNS` and their `_NEW` forms set,
+/// as Linux's `SOCK_RCVTSTAMP`, `SOCK_RCVTSTAMPNS` and `SOCK_TSTAMP_NEW`;
+/// the last stays when they are turned off.
+#[derive(Clone, Copy, Default)]
+struct Timestamps {
+    on: bool,
+    nanoseconds: bool,
+    new: bool,
+}
+impl Timestamps {
+    /// The control message type a timestamp goes in.
+    fn kind(self) -> u32 {
+        match (self.nanoseconds, self.new) {
+            (false, false) => SO_TIMESTAMP,
+            (true, false) => SO_TIMESTAMPNS,
+            (false, true) => SO_TIMESTAMP_NEW,
+            (true, true) => SO_TIMESTAMPNS_NEW,
+        }
+    }
+    /// `at`, in nanoseconds since the epoch, as a `timeval` or a
+    /// `timespec`, both 16 bytes on x86-64.
+    fn data(self, at: u64) -> [u8; 16] {
+        let seconds = at / 1_000_000_000;
+        let nanoseconds = at % 1_000_000_000;
+        let fraction = if self.nanoseconds {
+            nanoseconds
+        } else {
+            nanoseconds / 1000
+        };
+        let mut data = [0; 16];
+        data[..8].copy_from_slice(&seconds.to_le_bytes());
+        data[8..].copy_from_slice(&fraction.to_le_bytes());
+        data
+    }
 }
 struct Pair {
     sides: Mutex<[Side; 2]>,
@@ -1450,6 +1533,8 @@ struct Pair {
     window: AtomicUsize,
     /// The pair is a pipe, whose `O_ASYNC` signals differ from a socket's.
     pipe: AtomicBool,
+    /// The host, whose real-time clock gives messages their timestamps.
+    clock: std::sync::OnceLock<Arc<dyn paludarium_host::Host>>,
 }
 impl Pair {
     fn messages(&self) -> bool {
@@ -1457,6 +1542,13 @@ impl Pair {
     }
     fn window(&self) -> usize {
         self.window.load(Ordering::SeqCst)
+    }
+    /// The real time, in nanoseconds, as Linux's `__net_timestamp` takes it.
+    fn now(&self) -> Option<u64> {
+        self.clock
+            .get()?
+            .clock(paludarium_host::ClockId::Realtime)
+            .ok()
     }
 }
 const SOCK_STREAM: u32 = 1;
@@ -1523,6 +1615,7 @@ impl SocketPairEnd {
             kind: kind & 0xf,
             window: AtomicUsize::new(SEND_WINDOW),
             pipe: AtomicBool::new(false),
+            clock: std::sync::OnceLock::new(),
             sides: Mutex::new(std::array::from_fn(|_| Side {
                 output_epoch: 1,
                 peek_offset: -1,
@@ -1810,8 +1903,10 @@ impl SocketPairEnd {
             }
             !past
         });
+        let timestamps = own.timestamps;
         if peek && let Some(message) = found.and_then(|index| own.writes.get_mut(index)) {
             message.peeked = true;
+            let timestamp = self.timestamp(&mut message.sent, timestamps);
             let left = message.len - skip;
             let count = buf.len().min(left);
             for (d, s) in buf
@@ -1826,6 +1921,7 @@ impl SocketPairEnd {
                 passed: message.passed.clone(),
                 length: left,
                 credentials: message.credentials,
+                timestamp,
                 ..Received::default()
             };
             Self::peeked(own, count);
@@ -1848,6 +1944,8 @@ impl SocketPairEnd {
                 Err(Errno::EAGAIN)
             };
         };
+        let mut message = message;
+        let timestamp = self.timestamp(&mut message.sent, timestamps);
         let count = buf.len().min(message.len);
         for (i, byte) in own.bytes.drain(..message.len).enumerate() {
             if i < count {
@@ -1863,8 +1961,25 @@ impl SocketPairEnd {
             passed: message.passed,
             length: message.len,
             credentials: message.credentials,
+            timestamp,
             ..Received::default()
         })
+    }
+    /// The timestamp a message read by an end that takes `timestamps`
+    /// gets: when it was `sent`, or else now, which it then keeps for a
+    /// later read, as Linux's `__sock_recv_timestamp`.
+    fn timestamp(
+        &self,
+        sent: &mut Option<u64>,
+        timestamps: Timestamps,
+    ) -> Option<(u64, Timestamps)> {
+        if !timestamps.on {
+            return None;
+        }
+        if sent.is_none() {
+            *sent = self.pair.now();
+        }
+        sent.map(|at| (at, timestamps))
     }
 }
 impl SocketPairEnd {
@@ -2317,6 +2432,13 @@ impl SocketPairEnd {
                 piece: Piece::Data,
                 credentials,
                 peeked: false,
+                // Stamped as sent, when the peer takes timestamps, as
+                // unix_dgram_sendmsg does.
+                sent: if peer.timestamps.on {
+                    self.pair.now()
+                } else {
+                    None
+                },
             });
             self.pair.hub.changed();
             return Ok(buf.len());
@@ -2349,6 +2471,13 @@ impl SocketPairEnd {
                 piece: Piece::Data,
                 credentials,
                 peeked: false,
+                // Stamped as sent, when the peer takes timestamps, as
+                // unix_dgram_sendmsg does.
+                sent: if peer.timestamps.on {
+                    self.pair.now()
+                } else {
+                    None
+                },
             });
             self.pair.hub.changed();
             return Ok(buf.len());
@@ -2373,6 +2502,7 @@ impl SocketPairEnd {
                 piece: Piece::Data,
                 credentials,
                 peeked: false,
+                sent: None,
             });
         }
         self.pair.hub.changed();
@@ -2431,6 +2561,7 @@ impl SocketPairEnd {
             piece: Piece::OutOfBand,
             credentials,
             peeked: false,
+            sent: None,
         });
         self.pair.hub.changed();
         Ok(1)
@@ -2501,6 +2632,49 @@ mod events_tests {
         // A plain read reads on across parts.
         let mut buf = vec![0; 200_000];
         assert_eq!(b.receive(&mut buf, true, false).unwrap().count, 100_000);
+    }
+    #[test]
+    fn a_message_is_stamped_as_sent_or_as_first_read() {
+        use paludarium_host::{ClockId, testing::RecordingHost};
+        let host = Arc::new(RecordingHost::new());
+        let [a, b] = SocketPairEnd::pair(SOCK_DGRAM, Arc::default()).unwrap();
+        let _ = a.pair.clock.set(host.clone());
+        let stamp = |peek| {
+            let mut buf = [0; 4];
+            b.receive(&mut buf, true, peek)
+                .unwrap()
+                .timestamp
+                .map(|(at, _)| at)
+        };
+        b.lock_sides()[b.side].timestamps = Timestamps {
+            on: true,
+            nanoseconds: true,
+            new: false,
+        };
+        host.set_clock(ClockId::Realtime, 1_500_000_000);
+        send(&a, b"a");
+        host.set_clock(ClockId::Realtime, 2_000_000_000);
+        assert_eq!(stamp(false), Some(1_500_000_000));
+        // Sent before the receiver took timestamps: the first read stamps it,
+        // and a peek's stamp stays for the read after it.
+        b.lock_sides()[b.side].timestamps.on = false;
+        send(&a, b"b");
+        b.lock_sides()[b.side].timestamps.on = true;
+        host.set_clock(ClockId::Realtime, 3_000_000_000);
+        assert_eq!(stamp(true), Some(3_000_000_000));
+        host.set_clock(ClockId::Realtime, 4_000_000_000);
+        assert_eq!(stamp(false), Some(3_000_000_000));
+        let timestamps = b.lock_sides()[b.side].timestamps;
+        assert_eq!(timestamps.kind(), SO_TIMESTAMPNS);
+        let data = timestamps.data(1_500_002_000);
+        assert_eq!(data[..8], 1u64.to_le_bytes());
+        assert_eq!(data[8..], 500_002_000u64.to_le_bytes());
+        // A timeval holds microseconds.
+        let micros = Timestamps {
+            nanoseconds: false,
+            ..timestamps
+        };
+        assert_eq!(micros.data(1_500_002_000)[8..], 500_002u64.to_le_bytes());
     }
     #[test]
     fn a_message_peek_passes_over_whole_messages() {

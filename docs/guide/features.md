@@ -215,6 +215,15 @@ kernel.
   messages, and over an empty one already peeked at, and `MSG_TRUNC` gives
   what is left of the message from there. It takes any value; a negative one
   (by default -1) is none.
+- `SO_TIMESTAMP` and `SO_TIMESTAMPNS`, and their `_NEW` forms, timestamp
+  messages as Linux's AF_UNIX does. A datagram or packet socket with one
+  gets each message's real time in a control message, before any
+  credentials and descriptors: a `timeval` for `SO_TIMESTAMP`, a `timespec`
+  for `SO_TIMESTAMPNS`, cut to the control buffer as other control messages
+  are. That time is when the message was sent, if the receiver took
+  timestamps then, or else when it is first read or peeked at. A stream gets
+  none. `getsockopt` reads each one as set only by the form that set it, and
+  turning any off keeps the `_NEW` choice until one is turned on again.
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and

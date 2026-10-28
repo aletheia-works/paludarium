@@ -205,6 +205,7 @@ mod linux {
         processes_socket_rcvlowat => ("socket-rcvlowat","process"),
         processes_socket_peek_off => ("socket-peek-off","process"),
         processes_socket_parts => ("socket-parts","process"),
+        processes_socket_timestamp => ("socket-timestamp","process"),
         processes_socket_timeouts => ("socket-timeouts","process"),
         processes_signal_restart => ("signal-restart","process"),
         processes_signal_io => ("signal-io","process"),

@@ -64,6 +64,7 @@
     {"name":"socket-rcvlowat","binary":"process"},
     {"name":"socket-peek-off","binary":"process"},
     {"name":"socket-parts","binary":"process"},
+    {"name":"socket-timestamp","binary":"process"},
     {"name":"socket-timeouts","binary":"process"},
     {"name":"signal-restart","binary":"process"},
     {"name":"signal-io","binary":"process"},

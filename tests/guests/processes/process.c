@@ -144,6 +144,66 @@ static void int_option(const char *name, int fd, int opt, int value, socklen_t s
     getsockopt(fd, SOL_SOCKET, opt, &got, &len);
     printf("  set %s %d=%ld errno=%d got=%d\n", name, value, n, e, got);
 }
+/* socket-timestamp: the option numbers, as x86-64 Linux has them. */
+#define TS_OLD 29
+#define TS_NS_OLD 35
+#define TS_NEW 63
+#define TS_NS_NEW 64
+/* The four timestamp options as getsockopt reads them. */
+static void timestamp_options(const char *name, int fd) {
+    const int names[] = {TS_OLD, TS_NS_OLD, TS_NEW, TS_NS_NEW};
+    printf("  %s:", name);
+    for (int i = 0; i < 4; i++) {
+        int got = -7;
+        socklen_t len = sizeof got;
+        getsockopt(fd, SOL_SOCKET, names[i], &got, &len);
+        printf(" %d", got);
+    }
+    printf("\n");
+}
+static long long real_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+/* recvmsg with `room` bytes of control (none at all for 0) and `flags`:
+   what came, CTRUNC, msg_controllen, and each control message's type and
+   length, and for a timestamp where it falls against the real times
+   `sent` (taken after the send) and `asked` (before this call), and
+   whether its fraction fits its unit. The last timestamp's nanoseconds go
+   to `*stamp`. */
+static void receive_stamped(const char *name, int fd, size_t room, int flags, long long sent,
+                            long long *stamp) {
+    char data[8] = {0};
+    union { char bytes[256]; struct cmsghdr align; } control;
+    memset(control.bytes, 0, sizeof control.bytes);
+    struct iovec iov = {data, sizeof data};
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1,
+                             .msg_control = room ? control.bytes : NULL, .msg_controllen = room};
+    long long asked = real_ns();
+    errno = 0;
+    long n = recvmsg(fd, &message, flags);
+    printf("  %s=%ld errno=%d ctrunc=%d controllen=%zu", name, n, n < 0 ? errno : 0,
+           n >= 0 && (message.msg_flags & MSG_CTRUNC) != 0, n >= 0 ? (size_t)message.msg_controllen : 0);
+    if (n >= 0 && room)
+        for (struct cmsghdr *h = CMSG_FIRSTHDR(&message); h; h = CMSG_NXTHDR(&message, h)) {
+            printf(" [%d len=%zu", h->cmsg_type, (size_t)h->cmsg_len);
+            int ts = h->cmsg_type == TS_OLD || h->cmsg_type == TS_NEW;
+            int ns = h->cmsg_type == TS_NS_OLD || h->cmsg_type == TS_NS_NEW;
+            if ((ts || ns) && h->cmsg_len >= CMSG_LEN(16)) {
+                long long v[2];
+                memcpy(v, CMSG_DATA(h), sizeof v);
+                long long unit = ts ? 1000 : 1, at = v[0] * 1000000000LL + v[1] * unit;
+                /* A timeval holds microseconds: compare in them. */
+                long long a = at / unit, s = sent / unit, q = asked / unit;
+                printf(" %s fits=%d", a <= s ? "sent" : a >= q ? "read" : "between",
+                       v[1] >= 0 && v[1] < 1000000000LL / unit);
+                if (stamp) *stamp = at;
+            }
+            printf("]");
+        }
+    printf("\n");
+}
 /* recvmsg of at most `len` bytes with `flags`: what came, msg_flags, the
    socket's SO_PEEK_OFF after it, and whether it waited 700 ms or more, which
    a call that does not wait never takes, even on a slow emulated run. */
@@ -2667,6 +2727,78 @@ int main(int argc, char **argv) {
             close(sv[0]);
             close(sv[1]);
         }
+        return 0;
+    }
+    if (!strcmp(mode, "socket-timestamp")) {
+        /* SO_TIMESTAMP, SO_TIMESTAMPNS and their _NEW forms on socket pairs,
+           as Linux's sock.c and af_unix have them: a datagram or packet
+           receiver that takes them gets the time a message was sent, if it
+           took them then, or else the time it is first read, before its
+           credentials and descriptors. A stream gets none. */
+        int sv[2], p[2];
+        long long sent, first = 0, again = 1;
+        pipe(p);
+        const int kinds[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int k = 0; k < 3; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            printf("kind %d\n", kinds[k]);
+            timestamp_options("none", sv[1]);
+            int_option("new", sv[1], TS_NEW, 1, 4);
+            timestamp_options("new", sv[1]);
+            /* Turning one off keeps _NEW, which the next on form sets. */
+            int_option("old-off", sv[1], TS_OLD, 0, 4);
+            timestamp_options("off", sv[1]);
+            int_option("ns-old", sv[1], TS_NS_OLD, 1, 4);
+            timestamp_options("ns-old", sv[1]);
+            int_option("ns-new", sv[1], TS_NS_NEW, 5, 4);
+            timestamp_options("ns-new", sv[1]);
+            int_option("short", sv[1], TS_OLD, 1, 2);
+            int_option("old", sv[1], TS_OLD, 1, 4);
+            timestamp_options("old", sv[1]);
+            /* Stamped as sent. */
+            send(sv[0], "a", 1, 0);
+            sent = real_ns();
+            receive_stamped("old", sv[1], 256, 0, sent, NULL);
+            /* Stamped as first read, by a peek, which the read keeps. */
+            int_option("off", sv[1], TS_OLD, 0, 4);
+            send(sv[0], "b", 1, 0);
+            sent = real_ns();
+            int_option("ns-old", sv[1], TS_NS_OLD, 1, 4);
+            receive_stamped("peek", sv[1], 256, MSG_PEEK, sent, &first);
+            receive_stamped("read", sv[1], 256, 0, sent, &again);
+            printf("  kept=%d\n", first == again);
+            int_option("new", sv[1], TS_NEW, 1, 4);
+            send(sv[0], "c", 1, 0);
+            sent = real_ns();
+            receive_stamped("new", sv[1], 256, 0, sent, NULL);
+            int_option("ns-new", sv[1], TS_NS_NEW, 1, 4);
+            send(sv[0], "d", 1, 0);
+            sent = real_ns();
+            receive_stamped("ns-new", sv[1], 256, 0, sent, NULL);
+            /* Before the credentials and descriptors. */
+            int_option("passcred", sv[1], SO_PASSCRED, 1, 4);
+            send_fds(sv[0], "e", 1, &p[0], 1);
+            sent = real_ns();
+            receive_stamped("all", sv[1], 256, 0, sent, NULL);
+            int_option("passcred", sv[1], SO_PASSCRED, 0, 4);
+            /* A control buffer that holds less cuts it. */
+            const size_t rooms[] = {0, 8, 16, 24, 40};
+            for (int r = 0; r < 5; r++) {
+                send_fds(sv[0], "f", 1, &p[0], 1);
+                sent = real_ns();
+                char label[16];
+                snprintf(label, sizeof label, "room%zu", rooms[r]);
+                receive_stamped(label, sv[1], rooms[r], 0, sent, NULL);
+            }
+            /* A plain read takes the message all the same. */
+            send(sv[0], "g", 1, 0);
+            char byte;
+            printf("  read=%ld\n", (long)read(sv[1], &byte, 1));
+            close(sv[0]);
+            close(sv[1]);
+        }
+        close(p[0]);
+        close(p[1]);
         return 0;
     }
     if (!strcmp(mode, "socket-oob")) {

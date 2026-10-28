@@ -37,7 +37,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   フィルターなど Linux にある
   ほかのオプションです。`SO_RCVTIMEO` と `SO_SNDTIMEO` は 1000 Hz の刻みに丸めます。
   Linux は自分の `CONFIG_HZ` に丸めます。`SO_SNDBUF` と `SO_RCVBUF` は値を
-  返しますが、組のバッファは変わりません。ゲストは root なので、`CAP_NET_ADMIN` の
+  返しますが、組のバッファは変わりません。バッファはデータのバイト数だけを数えます。Linux は
+  メッセージや分けた分ごとの付帯分も数えるので、小さなメッセージは Linux より多く入ってから
+  いっぱいになります。ゲストは root なので、`CAP_NET_ADMIN` の
   要るオプション（`SO_DEBUG`、`SO_SNDBUFFORCE` など）も設定でき、`SO_PEERCRED` の
   uid と gid は 0 です。
 - **シグナル駆動の入出力**：`O_ASYNC` が効くのはパイプとソケットだけで、標準入力や端末は

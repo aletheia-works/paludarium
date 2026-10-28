@@ -130,6 +130,16 @@ impl Host for WasmHost {
             .extend_from_slice(buf);
         Ok(buf.len())
     }
+    /// Through the coordinator's sockets ([`crate::wasm_net`]).
+    fn connect(
+        &self,
+        address: core::net::SocketAddr,
+    ) -> Result<std::sync::Arc<crate::net::Stream>, Errno> {
+        crate::wasm_net::connect(address)
+    }
+    fn resolve(&self, name: &str) -> Result<std::sync::Arc<crate::net::Lookup>, Errno> {
+        crate::wasm_net::resolve(name)
+    }
     fn random_bytes(&self, buf: &mut [u8]) -> Result<(), Error> {
         // SAFETY: synchronous import writes only into this live, exclusively borrowed host buffer.
         if unsafe { random_fill(buf.as_mut_ptr(), buf.len()) } == 0 {

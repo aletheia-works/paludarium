@@ -15,9 +15,12 @@ export function listen(worker, message, error) {
   else { worker.addEventListener("message", event => message(event.data)); worker.addEventListener("error", event => error(new Error(event.message))); }
 }
 export async function stopWorker(worker) { await worker.terminate(); }
-export function imports(memory, { spawnTask, cost } = {}) {
+export function imports(memory, { spawnTask, cost, net } = {}) {
   const sleepWord = new Int32Array(new SharedArrayBuffer(4));
   const jit = jitImports(memory, cost);
+  // The guest's network requests go to the coordinator, which owns the sockets; text is copied out of shared memory.
+  const text = (pointer, length) => new TextDecoder().decode(new Uint8Array(memory.buffer, pointer, length).slice());
+  const request = (message) => { try { if (!net || !Number.isInteger(message.id) || message.id <= 0) return -1; net(message); return 0; } catch { return -1; } };
   return {
     env: { memory },
     paludarium: {
@@ -40,6 +43,10 @@ export function imports(memory, { spawnTask, cost } = {}) {
           return 0;
         } catch { return -1; }
       },
+      net_open(id, pointer, length) { try { return request({ op: "open", id, address: text(pointer, length) }); } catch { return -1; } },
+      net_resolve(id, pointer, length) { try { return request({ op: "resolve", id, name: text(pointer, length) }); } catch { return -1; } },
+      net_kick(id) { request({ op: "kick", id }); },
+      net_nodelay(id, on) { request({ op: "nodelay", id, on: on !== 0 }); },
       clock_ms(kind) { return kind === 0 ? Date.now() : performance.timeOrigin + performance.now(); },
       sleep_ms(ms) { Atomics.wait(sleepWord, 0, 0, Math.max(0, Math.min(ms, 10))); },
     },

@@ -45,6 +45,8 @@ mod wasm;
 #[cfg(target_arch = "wasm32")]
 pub use wasm::WasmHost;
 pub mod testing;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_net;
 pub use clock::{ClockId, WaitOutcome};
 
 /// What reading the host's standard input would find now

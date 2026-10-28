@@ -19,6 +19,13 @@ function validate(options) {
   if (tasks !== undefined && (!Number.isInteger(tasks) || tasks < 1 || tasks > 0xffffffff)) throw new PaludariumError("invalid-program", "limits.tasks must be an integer from 1 to 4294967295");
   if (openFiles !== undefined && (!Number.isInteger(openFiles) || openFiles < 0 || openFiles > 1048576)) throw new PaludariumError("invalid-program", "limits.openFiles must be an integer from 0 to 1048576");
   if (memory !== undefined && (!Number.isInteger(memory) || memory < 0 || memory > 0xffffffff)) throw new PaludariumError("invalid-program", "limits.memory must be an integer from 0 to 4294967295");
+  if (options.network !== undefined) {
+    const allow = options.network?.allow;
+    // host, host:port, *.host, IPv4, [IPv6] or [IPv6]:port, or a bare IPv6 address; the kernel parses each in full.
+    const entry = /^(?:(?:\*\.)?[A-Za-z0-9_.-]+(?::\d{1,5})?|\[[0-9A-Fa-f:.]+\](?::\d{1,5})?|[0-9A-Fa-f:.]+)$/;
+    if (options.network === null || typeof options.network !== "object" || !Array.isArray(allow) || allow.some(item => typeof item !== "string" || !entry.test(item))) throw new PaludariumError("invalid-program", "network.allow must be an array of host, host:port, [ipv6] or [ipv6]:port entries");
+    if (!isNode) throw new PaludariumError("unimplemented", "the network is available on Node.js only");
+  }
   if (options.cwd !== undefined && (typeof options.cwd !== "string" || !options.cwd.startsWith("/") || options.cwd.includes("\0"))) throw new PaludariumError("invalid-program", "invalid guest current directory");
   if (options.args && (!Array.isArray(options.args) || options.args.some(arg => typeof arg !== "string" || arg.includes("\0")))) throw new PaludariumError("invalid-program", "invalid guest arguments");
   if (Object.entries(options.env ?? {}).some(([key, value]) => !key || key.includes("=") || key.includes("\0") || typeof value !== "string" || value.includes("\0"))) throw new PaludariumError("invalid-program", "invalid guest environment");

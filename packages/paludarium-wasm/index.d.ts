@@ -67,6 +67,18 @@ export interface Limits {
    */
   memory?: number;
 }
+/**
+ * The destinations a guest may reach over TCP, and the names it may resolve
+ * (Node.js only); without it the guest has no network.
+ */
+export interface NetworkOptions {
+  /**
+   * Allowed destinations: a host name (`github.com`), every subdomain of one
+   * (`*.github.com`), an IPv4 address or an IPv6 one (`[::1]`), each with a
+   * port (`github.com:443`) or for every port.
+   */
+  allow: readonly string[];
+}
 export interface RunOptions extends FileSystemOptions {
   program: string;
   cwd?: string;
@@ -75,6 +87,7 @@ export interface RunOptions extends FileSystemOptions {
   tty?: { columns: number; rows: number } | null;
   jit?: boolean;
   limits?: Limits;
+  network?: NetworkOptions;
   filesystem?: PrivateFileSystem;
 }
 export interface Guest {

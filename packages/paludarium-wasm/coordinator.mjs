@@ -19,6 +19,94 @@ function jitDiagnostics(job) {
     fallbacks: String(e.session_jit_stat(job.handle, 3)),
   };
 }
+// The guest's network (Node.js): a net.Socket per stream handle, each fed
+// into and drained from its Rust stream through the net_* exports.
+const sockets = new Map();
+const ERRNO = { ECONNREFUSED: 111, ECONNRESET: 104, ECONNABORTED: 103, ETIMEDOUT: 110, EHOSTUNREACH: 113, ENETUNREACH: 101, ENETDOWN: 100, EPIPE: 32, EADDRNOTAVAIL: 99, EACCES: 13, EPERM: 1 };
+const errnoOf = cause => ERRNO[cause?.code] ?? 5;
+function address(host, port) { return `${host.includes(":") ? `[${host}]` : host}:${port}`; }
+/** Passes received bytes on as the stream takes them; the peer's end follows the last of them. */
+function deliver(entry) {
+  if (!entry.pending) return;
+  const accepted = withBytes(entry.pending, id => e.net_receive(entry.id, id));
+  if (accepted < 0) { entry.socket.destroy(); return; }
+  entry.pending = accepted < entry.pending.length ? entry.pending.subarray(accepted) : null;
+  if (entry.pending) { entry.socket.pause(); return; }
+  entry.socket.resume();
+  if (entry.peerEnded) e.net_end(entry.id);
+  settle(entry);
+}
+/** Moves what the guest queued to the socket, and passes on its shutdown and close. */
+function pump(entry) {
+  if (abandoned || entry.released) return;
+  deliver(entry);
+  while (entry.open && !entry.blocked) {
+    const id = e.net_take(entry.id, 65536);
+    if (!id) break;
+    if (!entry.socket.write(takeBuffer(e, id, memory))) { entry.blocked = true; entry.socket.once("drain", () => { entry.blocked = false; pump(entry); }); }
+  }
+  const state = e.net_state(entry.id);
+  if (state < 0 || state & 2) {
+    entry.guestClosed = true; entry.pending = null;
+    if (entry.open) entry.socket.end(); else entry.socket.destroy();
+    settle(entry);
+  } else if (state & 1 && entry.open && !entry.ended) { entry.ended = true; entry.socket.end(); }
+}
+/** Releases the handle once the socket is closed and nothing received waits for a guest still using it. */
+function settle(entry) { if (entry.closed && (!entry.pending || entry.guestClosed)) release(entry); }
+function release(entry) {
+  if (entry.released) return;
+  entry.released = true; sockets.delete(entry.id);
+  if (!abandoned) e.net_release(entry.id);
+}
+async function netRequest(job, request) {
+  if (abandoned) return;
+  if (request.op === "kick") { const entry = sockets.get(request.id); if (entry) pump(entry); return; }
+  if (request.op === "nodelay") { const entry = sockets.get(request.id); if (entry) { entry.noDelay = request.on; entry.socket.setNoDelay(request.on); } return; }
+  // The kernel asks only for what its policy allows; a run without a network never gets here.
+  if (request.op === "resolve") {
+    if (!job?.network) { e.net_unresolved(request.id, 101); return; }
+    const { lookup } = await import("node:dns/promises");
+    try {
+      const found = await lookup(request.name, { all: true, verbatim: true });
+      if (!abandoned) withBytes(encoder.encode(found.map(item => item.address).join("\n")), id => e.net_resolved(request.id, id));
+    } catch (cause) {
+      if (abandoned) return;
+      if (cause?.code === "ENOTFOUND" || cause?.code === "ENODATA") withBytes(new Uint8Array(), id => e.net_resolved(request.id, id));
+      else e.net_unresolved(request.id, errnoOf(cause));
+    }
+    return;
+  }
+  if (request.op !== "open") return;
+  if (!job?.network) { e.net_failed(request.id, 101); e.net_release(request.id); return; }
+  const { connect } = await import("node:net");
+  const split = request.address.match(/^\[?([^\]]*)\]?:(\d+)$/);
+  if (abandoned) return;
+  if (!split) { e.net_failed(request.id, 22); e.net_release(request.id); return; }
+  // Half-open, as TCP: the peer's end leaves this side able to send.
+  const socket = connect({ host: split[1], port: Number(split[2]), allowHalfOpen: true });
+  const entry = { id: request.id, job, socket, pending: null, open: false, closed: false, blocked: false, ended: false, peerEnded: false, guestClosed: false, released: false };
+  sockets.set(entry.id, entry); job.sockets.add(entry);
+  socket.on("connect", () => {
+    if (abandoned || entry.released) return;
+    entry.open = true;
+    withBytes(encoder.encode(address(socket.localAddress, socket.localPort)), id => e.net_connected(entry.id, id));
+    pump(entry);
+  });
+  socket.on("data", chunk => {
+    if (abandoned || entry.released) return;
+    entry.pending = entry.pending ? Buffer.concat([entry.pending, chunk]) : chunk;
+    deliver(entry);
+  });
+  socket.on("end", () => { if (abandoned || entry.released) return; entry.peerEnded = true; if (!entry.pending) e.net_end(entry.id); });
+  socket.on("error", cause => { if (!abandoned && !entry.released && !entry.guestClosed) e.net_failed(entry.id, errnoOf(cause)); });
+  socket.on("close", () => { entry.open = false; entry.closed = true; job.sockets.delete(entry); settle(entry); });
+}
+function closeSockets(job) {
+  for (const entry of job.sockets) { entry.socket.destroy(); release(entry); }
+  job.sockets.clear();
+  for (const entry of sockets.values()) if (entry.job === job) release(entry);
+}
 function withBytes(bytes, callback) { const id = putBuffer(e, bytes, memory); try { return callback(id); } finally { e.buffer_drop(id); } }
 function placeEntries(config, entries) {
   for (const entry of entries?.nodes ?? []) withBytes(encoder.encode(entry.path), pathId => withBytes(entry.content, dataId => check(e.config_entry(config, pathId, dataId, entry.mode, BigInt.asUintN(64, entry.mtimeNs), BigInt.asIntN(64, entry.mtimeNs >> 64n)), "filesystem entry")));
@@ -106,6 +194,7 @@ async function finish(job, result, error) {
   // This path is reached only after Rust returned, including a typed guest error.
   // Traps and forced failures discard the complete runtime through fatal().
   e.region_drop(job.region); e.buffer_drop(job.token);
+  closeSockets(job);
   jitDiagnostics(job);
   e.session_drop(job.handle); jobs.delete(job.id);
   if (error) port.send({ type: "failed", id: job.id, error });
@@ -127,6 +216,7 @@ async function launchTask(job, handle) {
     task.worker = worker; childWorkers.add(worker);
     listen(worker, report => {
       if (report.type === "spawn-task") void launchTask(job, report.handle);
+      else if (report.type === "net") void netRequest(job, report.request);
       else if (report.type === "started") {
         latestDiagnostics.push({ ...report.diagnostics, taskHandle: handle, guestThread: true, regionPointer: pointer,
           coordinatorTls: e.__tls_base.value, coordinatorThreadToken: String(e.thread_token()), sharedMemory: memory.buffer instanceof SharedArrayBuffer, nestedWorker: true });
@@ -152,6 +242,7 @@ async function launch(message) {
     if (message.options.limits?.tasks !== undefined) check(e.config_limit(config, 0, message.options.limits.tasks), "task limit");
     if (message.options.limits?.openFiles !== undefined) check(e.config_limit(config, 1, message.options.limits.openFiles), "open file limit");
     if (message.options.limits?.memory !== undefined) check(e.config_limit(config, 2, message.options.limits.memory), "memory limit");
+    for (const entry of message.options.network?.allow ?? []) withBytes(encoder.encode(entry), id => check(e.config_network(config, id), "network rule"));
     for (const arg of message.options.args ?? [message.options.program]) withBytes(encoder.encode(arg), id => check(e.config_arg(config, id), "argument"));
     for (const [key, value] of Object.entries(message.options.env ?? {})) withBytes(encoder.encode(key), keyId => withBytes(encoder.encode(value), valueId => check(e.config_env(config, keyId, valueId), "environment")));
     for (const [path, bytes] of Object.entries(message.options.files ?? {})) withBytes(encoder.encode(path), pathId => withBytes(bytes, dataId => check(e.config_file_mode(config, pathId, dataId, message.options.fileModes?.[path] ?? 0o755), "file")));
@@ -165,7 +256,7 @@ async function launch(message) {
     const tlsPointer = Math.ceil(pointer / tlsAlign) * tlsAlign;
     const stackTop = Math.ceil((tlsPointer + tlsSize) / 16) * 16 + 2 * 1024 * 1024;
     const token = putBuffer(e, new Uint8Array([73]), memory);
-    const job = { id: message.id, handle, region, token, offsets: { stdout: 0, stderr: 0 }, finished: false, diagnostics: null, tasks: new Map() };
+    const job = { id: message.id, handle, region, token, offsets: { stdout: 0, stderr: 0 }, finished: false, diagnostics: null, tasks: new Map(), network: message.options.network !== undefined, sockets: new Set() };
     jobs.set(message.id, job);
     port.send({ type: "accepted", id: message.id });
     job.worker = await spawnWorker(new URL("execution.mjs", import.meta.url));
@@ -173,6 +264,7 @@ async function launch(message) {
     listen(job.worker, report => {
       if (report.type === "started") { job.diagnostics = { ...report.diagnostics, regionPointer: pointer, coordinatorTls: e.__tls_base.value, coordinatorThreadToken: String(e.thread_token()), sharedMemory: memory.buffer instanceof SharedArrayBuffer, nestedWorker: true }; latestDiagnostics.push(job.diagnostics); }
       else if (report.type === "spawn-task") void launchTask(job, report.handle);
+      else if (report.type === "net") void netRequest(job, report.request);
       else if (report.type === "finished") void finish(job, report.result, report.result < 0 ? errorFor(handle) : null);
       else if (report.type === "failed") fatal(report.error);
     }, cause => fatal(String(cause)));
@@ -185,7 +277,8 @@ port.listen(async message => {
   try {
     if (message.type === "init") {
       module = message.module; memory = message.memory;
-      e = (await WebAssembly.instantiate(module, imports(memory))).exports;
+      // Dropping a session closes its sockets from here: their kicks come back through the same path.
+      e = (await WebAssembly.instantiate(module, imports(memory, { net: request => queueMicrotask(() => void netRequest(null, request)) }))).exports;
       if (typeof e.cost_reset === "function") e.cost_reset();
       port.send({ type: "ready", exports: WebAssembly.Module.exports(module), imports: WebAssembly.Module.imports(module) });
     } else if (message.type === "filesystem-new") {

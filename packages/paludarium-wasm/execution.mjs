@@ -22,7 +22,7 @@ port.listen(async message => {
     const cost = diagnostic ? (field, value) => {
       if (!Number.isSafeInteger(value) || value < 0 || e.cost_add(field, BigInt(value)) !== 0) throw Error("Diagnostic counter rejected");
     } : undefined;
-    const instance = await WebAssembly.instantiate(message.module, imports(message.memory, { spawnTask: handle => port.send({ type: "spawn-task", handle }), cost }));
+    const instance = await WebAssembly.instantiate(message.module, imports(message.memory, { spawnTask: handle => port.send({ type: "spawn-task", handle }), cost, net: request => port.send({ type: "net", request }) }));
     e = instance.exports;
     const tlsBefore = e.__tls_base.value;
     // Child must not call Rust before it owns a stack and TLS region.

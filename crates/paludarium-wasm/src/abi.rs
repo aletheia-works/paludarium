@@ -531,6 +531,124 @@ pub extern "C" fn config_terminal(id: u32, columns: u32, rows: u32) -> i32 {
     config.tty = Some(TerminalInfo::new(columns, rows));
     0
 }
+/// Allows one network destination (`NetworkPolicy::allow`); -1 for an
+/// entry it cannot read.
+#[unsafe(no_mangle)]
+pub extern "C" fn config_network(id: u32, entry: u32) -> i32 {
+    let Some(entry) = bytes(entry).and_then(|entry| String::from_utf8(entry).ok()) else {
+        return -1;
+    };
+    let mut configs = table(&CONFIGS)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(config) = configs.get_mut(&id) else {
+        return -1;
+    };
+    match config.network.take().unwrap_or_default().allow(&entry) {
+        Ok(policy) => {
+            config.network = Some(policy);
+            0
+        }
+        Err(_) => -1,
+    }
+}
+// The coordinator's side of the guest's network (paludarium_host::wasm_net):
+// each takes the handle the stream or lookup was opened with.
+/// The connection is open, from the address in `local` (text, or 0).
+#[unsafe(no_mangle)]
+pub extern "C" fn net_connected(id: u32, local: u32) -> i32 {
+    let Some(stream) = paludarium_host::wasm_net::stream(id) else {
+        return -1;
+    };
+    let local = bytes(local)
+        .and_then(|text| String::from_utf8(text).ok())
+        .and_then(|text| text.parse().ok());
+    stream.connected(local);
+    0
+}
+/// The connection failed with Linux errno `errno`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_failed(id: u32, errno: u32) -> i32 {
+    let Some(stream) = paludarium_host::wasm_net::stream(id) else {
+        return -1;
+    };
+    stream.fail(paludarium_types::Errno(i32::try_from(errno).unwrap_or(5)));
+    0
+}
+/// Adds received bytes; returns how many fitted (the rest waits).
+#[unsafe(no_mangle)]
+pub extern "C" fn net_receive(id: u32, buffer: u32) -> i32 {
+    let (Some(stream), Some(data)) = (paludarium_host::wasm_net::stream(id), bytes(buffer)) else {
+        return -1;
+    };
+    i32::try_from(stream.receive(&data)).unwrap_or(i32::MAX)
+}
+/// The peer ended its side.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_end(id: u32) -> i32 {
+    let Some(stream) = paludarium_host::wasm_net::stream(id) else {
+        return -1;
+    };
+    stream.end();
+    0
+}
+/// Takes up to `max` bytes to send, as a buffer; 0 when none wait.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_take(id: u32, max: u32) -> u32 {
+    let Some(stream) = paludarium_host::wasm_net::stream(id) else {
+        return 0;
+    };
+    let data = stream.take(max as usize);
+    if data.is_empty() {
+        0
+    } else {
+        insert(&BUFFERS, data)
+    }
+}
+/// What the guest has done: 1 once it shut its sending down and all has
+/// been taken, 2 once it closed the stream, 4 while there is room to
+/// receive; -1 for an unknown handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_state(id: u32) -> i32 {
+    let Some(stream) = paludarium_host::wasm_net::stream(id) else {
+        return -1;
+    };
+    let (shut, closed) = stream.finished();
+    i32::from(shut) | (i32::from(closed) << 1) | (i32::from(stream.room() > 0) << 2)
+}
+/// The answer to a lookup: its addresses, one per line (none for a name
+/// that does not exist). The handle is released.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_resolved(id: u32, list: u32) -> i32 {
+    let (Some(lookup), Some(text)) = (paludarium_host::wasm_net::lookup(id), bytes(list)) else {
+        return -1;
+    };
+    let text = String::from_utf8_lossy(&text);
+    let addresses = text
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    paludarium_host::wasm_net::release(id);
+    lookup.finish(Ok(addresses));
+    0
+}
+/// A lookup the host could not answer; the handle is released.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_unresolved(id: u32, errno: u32) -> i32 {
+    let Some(lookup) = paludarium_host::wasm_net::lookup(id) else {
+        return -1;
+    };
+    paludarium_host::wasm_net::release(id);
+    lookup.finish(Err(paludarium_types::Errno(
+        i32::try_from(errno).unwrap_or(5),
+    )));
+    0
+}
+/// The coordinator closed the socket of handle `id`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_release(id: u32) {
+    paludarium_host::wasm_net::release(id);
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn config_cwd(id: u32, path: u32) -> i32 {
     let Some(path) = bytes(path) else {

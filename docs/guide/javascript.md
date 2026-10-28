@@ -62,8 +62,10 @@ try {
 | `filesystem` | A filesystem from `createFileSystem()` to reuse (see below) |
 | `jit` | `true` to translate hot x86-64 code to WebAssembly (default `false`) |
 | `limits` | `{ tasks, openFiles, memory }` to limit the guest (default: no limit; see below) |
+| `network` | `{ allow: [...] }`, the destinations the guest may reach (Node.js only; default: no network; see below) |
 
-The package does not expose host directories or the network to the guest.
+The package does not expose host directories to the guest, and gives it a
+network only with `network`.
 
 `limits.tasks` (1 to 4294967295) is the most tasks the guest may have at once:
 threads, and processes until they are reaped, as a cgroup's `pids.max`. A
@@ -78,6 +80,15 @@ copies it. A write beyond it ends the process that made it with `SIGKILL`, as
 the OOM killer does, and an `execve` that does not fit fails with `ENOMEM`; a
 program that does not fit at all fails with
 `invalid-program`. File contents and pipe and socket buffers are not counted.
+
+`network.allow` lists the destinations the guest may reach over TCP and the
+names it may resolve: `"github.com:443"`, `"*.github.com"` (every subdomain),
+`"127.0.0.1"` (every port) or `"[::1]:8080"`. The launcher's coordinator
+opens a Node.js `net.Socket` for each connection the guest makes and resolves
+names with Node's `dns.lookup`, so the guest's own resolver works; any other
+destination is `ENETUNREACH` to the guest, and any other name `NXDOMAIN`
+([Network](./features#network)). An entry the launcher cannot read is
+`invalid-program`. In a browser `network` is `unimplemented`.
 
 ## Keep files between runs
 

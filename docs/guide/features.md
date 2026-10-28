@@ -478,7 +478,8 @@ kernel.
 ## Network
 
 A guest has no network unless the embedder allows destinations
-(`Config::with_network`, or the command's `--allow-net`). An allow-list entry
+(`Config::with_network`, the command's `--allow-net`, or the JavaScript
+`network` option on Node.js). An allow-list entry
 is a host name (`github.com`), every subdomain of one (`*.github.com`), an
 IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
 (`github.com:443`).

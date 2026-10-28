@@ -582,6 +582,54 @@ fn integration_policy_and_socket_transfer() {
     f.mem.read(GuestAddr(DATA + 64), &mut received).unwrap();
     assert_eq!(&received, b"hi");
 }
+#[test]
+fn fionread_and_siocoutq_count_what_waits() {
+    let mut f = Fixture::new();
+    let pair = |f: &mut Fixture, call: u64, args: [u64; 6]| {
+        assert_eq!(f.ret(call, args), 0);
+        let mut bytes = [0; 8];
+        f.mem.read(GuestAddr(DATA), &mut bytes).unwrap();
+        (
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64,
+            u32::from_le_bytes(bytes[4..].try_into().unwrap()) as u64,
+        )
+    };
+    let count = |f: &mut Fixture, fd: u64, request: u64| {
+        f.mem
+            .write(GuestAddr(DATA + 16), &(-7i32).to_le_bytes())
+            .unwrap();
+        let r = f.ret(16, [fd, request, DATA + 16, 0, 0, 0]);
+        let mut bytes = [0; 4];
+        f.mem.read(GuestAddr(DATA + 16), &mut bytes).unwrap();
+        (r, i32::from_le_bytes(bytes))
+    };
+    f.mem.write(GuestAddr(DATA + 32), b"abcde").unwrap();
+    // A stream counts its unread bytes; SIOCOUTQ, at the sender, the same.
+    let (a, b) = pair(&mut f, 53, [1, 1, 0, DATA, 0, 0]);
+    assert_eq!(f.ret(44, [a, DATA + 32, 3, 0, 0, 0]), 3);
+    assert_eq!(f.ret(44, [a, DATA + 35, 2, 0, 0, 0]), 2);
+    assert_eq!(count(&mut f, b, 0x541b), (0, 5));
+    assert_eq!(count(&mut f, a, 0x5411), (0, 5));
+    assert_eq!(count(&mut f, a, 0x541b), (0, 0));
+    // A datagram socket counts its first datagram.
+    let (c, d) = pair(&mut f, 53, [1, 2, 0, DATA, 0, 0]);
+    assert_eq!(f.ret(44, [c, DATA + 32, 3, 0, 0, 0]), 3);
+    assert_eq!(f.ret(44, [c, DATA + 35, 2, 0, 0, 0]), 2);
+    assert_eq!(count(&mut f, d, 0x541b), (0, 3));
+    // A pipe counts at either end and has no SIOCOUTQ.
+    let (r, w) = pair(&mut f, 293, [DATA, 0, 0, 0, 0, 0]);
+    assert_eq!(f.ret(1, [w, DATA + 32, 4, 0, 0, 0]), 4);
+    assert_eq!(count(&mut f, r, 0x541b), (0, 4));
+    assert_eq!(count(&mut f, w, 0x541b), (0, 4));
+    assert_eq!(
+        count(&mut f, r, 0x5411),
+        (Errno::ENOTTY.to_syscall_return(), -7)
+    );
+    assert_eq!(
+        f.ret(16, [r, 0x541b, 8, 0, 0, 0]),
+        Errno::EFAULT.to_syscall_return()
+    );
+}
 /// Writes a `msghdr` at `at`: name, iovecs `(base, len)` at `at + 0x40`,
 /// and control.
 fn message(f: &Fixture, at: u64, name: (u64, u32), iov: &[(u64, u64)], control: (u64, u64)) {

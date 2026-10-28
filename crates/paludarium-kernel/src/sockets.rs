@@ -444,6 +444,36 @@ pub(crate) fn polled_full(file: &Arc<dyn FileHandle>) {
     let own = &mut sides[socket.side];
     own.no_space |= own.registration.is_some();
 }
+/// What `FIONREAD` (`SIOCINQ`), or `SIOCOUTQ` with `outgoing`, counts of
+/// `file`, or `None` for a file that is neither a pipe nor a socket. A pipe
+/// counts its unread bytes at either end (Linux's `pipe_ioctl`) and has no
+/// `SIOCOUTQ` (ENOTTY). A socket counts its unread bytes, out-of-band byte
+/// included, a datagram socket its first datagram's (`unix_inq_len`), and
+/// `SIOCOUTQ` what the peer has not read, where Linux's `unix_outq_len`
+/// also counts each message's overhead.
+pub(crate) fn queued(file: &Arc<dyn FileHandle>, outgoing: bool) -> Option<Result<usize, Errno>> {
+    let any = file.as_any()?;
+    if let Some(pipe) = any.downcast_ref::<PipeEnd>() {
+        let end = &pipe.endpoint;
+        let side = if pipe.reader { end.side } else { 1 - end.side };
+        return Some(if outgoing {
+            Err(Errno::ENOTTY)
+        } else {
+            Ok(end.lock_sides()[side].bytes.len())
+        });
+    }
+    let socket = any.downcast_ref::<SocketPairEnd>()?;
+    let sides = socket.lock_sides();
+    if outgoing {
+        return Some(Ok(sides[1 - socket.side].bytes.len()));
+    }
+    let own = &sides[socket.side];
+    Some(Ok(if socket.pair.kind == SOCK_DGRAM {
+        own.writes.front().map_or(0, |write| write.len)
+    } else {
+        own.bytes.len()
+    }))
+}
 fn as_socket(file: &Arc<dyn FileHandle>) -> Result<&SocketPairEnd, Errno> {
     file.as_any()
         .and_then(|v| v.downcast_ref::<SocketPairEnd>())

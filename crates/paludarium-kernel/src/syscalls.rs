@@ -1679,6 +1679,27 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .map_err(|_| Errno::EFAULT)?;
             return Ok(0);
         }
+        // FIONREAD (SIOCINQ) and SIOCOUTQ of a pipe, a socket or a regular
+        // file, which Linux's `do_vfs_ioctl` answers with the size past the
+        // offset, cut to an int. The host's standard streams are not read.
+        if matches!(a[1], 0x541b | 0x5411) && c.files.stdio_channel(a[0])?.is_none() {
+            let file = c.files.descriptor(a[0])?.file;
+            let count = match crate::sockets::queued(&file, a[1] == 0x5411) {
+                Some(count) => count? as i64,
+                None if a[1] == 0x541b
+                    && file
+                        .stat()
+                        .is_ok_and(|stat| stat.mode & 0o170000 == 0o100000) =>
+                {
+                    file.stat()?.size as i64 - file.seek(0, 1)? as i64
+                }
+                None => return Err(Errno::ENOTTY),
+            };
+            c.mem
+                .write(GuestAddr(a[2]), &(count as i32).to_le_bytes())
+                .map_err(|_| Errno::EFAULT)?;
+            return Ok(0);
+        }
         let stream = match c.files.stdio_channel(a[0])? {
             Some(0) => paludarium_host::StreamId::Stdin,
             Some(1) => paludarium_host::StreamId::Stdout,

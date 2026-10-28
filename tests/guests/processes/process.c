@@ -135,6 +135,19 @@ static pid_t send_later(int socket, const char *data, int ms) {
 }
 /* setsockopt of the int SOL_SOCKET option `opt` to `value` with `size`
    bytes, then what getsockopt reads back. */
+#ifndef SIOCINQ
+#define SIOCINQ FIONREAD
+#endif
+#ifndef SIOCOUTQ
+#define SIOCOUTQ TIOCOUTQ
+#endif
+/* fionread: ioctl `request` of `fd` with an int, and what it gave. */
+static void ioctl_int(const char *name, int fd, unsigned long request) {
+    int value = -7;
+    errno = 0;
+    int r = ioctl(fd, request, &value);
+    printf("  %s=%d errno=%d value=%d\n", name, r, errno, value);
+}
 static void int_option(const char *name, int fd, int opt, int value, socklen_t size) {
     errno = 0;
     long n = setsockopt(fd, SOL_SOCKET, opt, &value, size);
@@ -2762,6 +2775,95 @@ int main(int argc, char **argv) {
         close(p[1]);
 #undef CRED_SET
 #undef CRED_GET
+        return 0;
+    }
+    if (!strcmp(mode, "fionread")) {
+        /* FIONREAD (SIOCINQ) and SIOCOUTQ. A pipe counts its unread bytes
+           at either end; a stream socket its unread bytes, a packet socket
+           those of every packet, a datagram socket its first datagram's; a
+           regular file its size past the offset. SIOCOUTQ counts what the
+           peer has not read, which Linux counts with each message's
+           overhead, so only whether it is 0 is printed. Other files are
+           ENOTTY. */
+        int p[2], sv[2], n;
+        char buf[16];
+        if (pipe(p)) return 79;
+        write(p[1], "abcde", 5);
+        ioctl_int("pipe-read", p[0], FIONREAD);
+        ioctl_int("pipe-write", p[1], FIONREAD);
+        read(p[0], buf, 2);
+        ioctl_int("pipe-read", p[0], FIONREAD);
+        ioctl_int("pipe-outq", p[0], SIOCOUTQ);
+        errno = 0;
+        n = ioctl(p[0], FIONREAD, (int *)8);
+        printf("  pipe-fault=%d errno=%d\n", n, errno);
+        close(p[0]); close(p[1]);
+        const int kinds[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int k = 0; k < 3; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            printf("kind %d\n", kinds[k]);
+            ioctl_int("empty", sv[1], SIOCINQ);
+            send(sv[0], "abc", 3, 0);
+            send(sv[0], "de", 2, 0);
+            ioctl_int("two", sv[1], SIOCINQ);
+            ioctl_int("own", sv[0], SIOCINQ);
+            n = ioctl(sv[0], SIOCOUTQ, &(int){0}) == 0;
+            int queued = -1;
+            ioctl(sv[0], SIOCOUTQ, &queued);
+            printf("  outq ok=%d sent=%d\n", n, queued > 0);
+            recv(sv[1], buf, 1, MSG_PEEK);
+            ioctl_int("peeked", sv[1], SIOCINQ);
+            recv(sv[1], buf, 2, 0);
+            ioctl_int("read", sv[1], SIOCINQ);
+            while (recv(sv[1], buf, sizeof buf, MSG_DONTWAIT) > 0) {}
+            ioctl_int("drained", sv[1], SIOCINQ);
+            queued = -1;
+            ioctl(sv[0], SIOCOUTQ, &queued);
+            printf("  outq drained=%d\n", queued);
+            if (kinds[k] == SOCK_STREAM) {
+                /* An out-of-band byte is counted until it is taken. */
+                send(sv[0], "fg", 2, 0);
+                send(sv[0], "h", 1, MSG_OOB);
+                ioctl_int("oob", sv[1], SIOCINQ);
+                recv(sv[1], buf, 1, MSG_OOB);
+                ioctl_int("oob-taken", sv[1], SIOCINQ);
+                recv(sv[1], buf, sizeof buf, 0);
+                ioctl_int("oob-read", sv[1], SIOCINQ);
+            }
+            send(sv[0], "ij", 2, 0);
+            shutdown(sv[0], SHUT_WR);
+            ioctl_int("shut", sv[1], SIOCINQ);
+            close(sv[0]);
+            ioctl_int("closed", sv[1], SIOCINQ);
+            close(sv[1]);
+        }
+        puts("files");
+        int m = memfd_create("fionread", 0);
+        if (m < 0) return 78;
+        write(m, "0123456789", 10);
+        ioctl_int("memfd-end", m, FIONREAD);
+        lseek(m, 3, SEEK_SET);
+        ioctl_int("memfd-at-3", m, FIONREAD);
+        lseek(m, 20, SEEK_SET);
+        ioctl_int("memfd-past", m, FIONREAD);
+        ioctl_int("memfd-outq", m, SIOCOUTQ);
+        close(m);
+        int f = open("/tmp/paludarium-fionread", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (f < 0) return 77;
+        write(f, "abcdef", 6);
+        lseek(f, 1, SEEK_SET);
+        ioctl_int("file", f, FIONREAD);
+        close(f);
+        unlink("/tmp/paludarium-fionread");
+        f = open("/tmp", O_RDONLY | O_DIRECTORY);
+        ioctl_int("directory", f, FIONREAD);
+        close(f);
+        f = open("/dev/null", O_RDWR);
+        ioctl_int("null", f, FIONREAD);
+        close(f);
+        f = eventfd(1, 0);
+        ioctl_int("eventfd", f, FIONREAD);
+        close(f);
         return 0;
     }
     if (!strcmp(mode, "socket-rcvlowat")) {

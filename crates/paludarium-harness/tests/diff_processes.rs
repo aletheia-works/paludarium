@@ -202,6 +202,7 @@ mod linux {
         processes_socket_oob => ("socket-oob","process"),
         processes_socket_options => ("socket-options","process"),
         processes_socket_credentials => ("socket-credentials","process"),
+        processes_fionread => ("fionread","process"),
         processes_socket_rcvlowat => ("socket-rcvlowat","process"),
         processes_socket_peek_off => ("socket-peek-off","process"),
         processes_socket_parts => ("socket-parts","process"),

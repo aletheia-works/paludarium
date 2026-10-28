@@ -1543,6 +1543,11 @@ impl Pair {
     fn window(&self) -> usize {
         self.window.load(Ordering::SeqCst)
     }
+    /// When a message sent to `peer` is stamped as sent: now, if the peer
+    /// takes timestamps, as `unix_dgram_sendmsg` stamps it.
+    fn sent_at(&self, peer: &Side) -> Option<u64> {
+        if peer.timestamps.on { self.now() } else { None }
+    }
     /// The real time, in nanoseconds, as Linux's `__net_timestamp` takes it.
     fn now(&self) -> Option<u64> {
         self.clock
@@ -2432,13 +2437,7 @@ impl SocketPairEnd {
                 piece: Piece::Data,
                 credentials,
                 peeked: false,
-                // Stamped as sent, when the peer takes timestamps, as
-                // unix_dgram_sendmsg does.
-                sent: if peer.timestamps.on {
-                    self.pair.now()
-                } else {
-                    None
-                },
+                sent: self.pair.sent_at(peer),
             });
             self.pair.hub.changed();
             return Ok(buf.len());
@@ -2471,13 +2470,7 @@ impl SocketPairEnd {
                 piece: Piece::Data,
                 credentials,
                 peeked: false,
-                // Stamped as sent, when the peer takes timestamps, as
-                // unix_dgram_sendmsg does.
-                sent: if peer.timestamps.on {
-                    self.pair.now()
-                } else {
-                    None
-                },
+                sent: self.pair.sent_at(peer),
             });
             self.pair.hub.changed();
             return Ok(buf.len());

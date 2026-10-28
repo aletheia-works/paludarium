@@ -1064,7 +1064,10 @@ pub(crate) fn wait_for_read_until<T>(
                     && file.flags() & crate::events::NONBLOCK == 0 =>
             {
                 let deadline = wait.deadline(c)?.ok_or(Errno::EAGAIN)?;
-                if let Err(e) = crate::events::wait(c, ticket, deadline) {
+                crate::sockets::wait_data(file, true);
+                let waited = crate::events::wait(c, ticket, deadline);
+                crate::sockets::wait_data(file, false);
+                if let Err(e) = waited {
                     if !wait.forever() {
                         c.process.restart = None;
                     }
@@ -1973,9 +1976,9 @@ pub(crate) fn write_with(
     dontwait: bool,
     mut write: impl FnMut(&[u8]) -> Result<usize, Errno>,
 ) -> Result<u64, Errno> {
-    let stream = file
-        .as_any()
-        .is_some_and(|a| a.is::<crate::sockets::SocketPairEnd>());
+    // A socket or pipe write goes on until all is written, as Linux's
+    // `unix_stream_sendmsg` and `pipe_write` do.
+    let stream = crate::sockets::endpoint(file).is_some();
     // A socket waits no longer than its SO_SNDTIMEO.
     let wait = crate::sockets::deadline(c, file, false)?;
     let mut done = 0;
@@ -1984,7 +1987,10 @@ pub(crate) fn write_with(
         let ticket = c.files.readiness.token.value();
         let nonblocking = dontwait || file.flags() & crate::events::NONBLOCK != 0;
         let result = write(&bytes[done..]);
-        if !blocked && result.is_err_and(|e| e == Errno::EAGAIN) {
+        // A pipe write that finds the pipe full signals its reader before it
+        // waits, as Linux's `pipe_write`, or as it ends; after a part, which
+        // signalled itself, a wait it ends is that part's.
+        if !blocked && done == 0 && result.is_err_and(|e| e == Errno::EAGAIN) {
             blocked = true;
             crate::sockets::pipe_write_blocked(file);
         }

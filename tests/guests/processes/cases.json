@@ -68,6 +68,7 @@
     {"name":"socket-timeouts","binary":"process"},
     {"name":"signal-restart","binary":"process"},
     {"name":"signal-io","binary":"process"},
+    {"name":"signal-io-wait","binary":"process"},
     {"name":"socket-addresses","binary":"process"},
     {"name":"pre-exec","binary":"command"},
     {"name":"pre-exec-missing","binary":"command"},

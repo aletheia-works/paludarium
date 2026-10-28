@@ -43,16 +43,7 @@ verified.
   (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
   gid 0.
 - **Signal-driven I/O**: `O_ASYNC` works on pipes and sockets only, so
-  standard input and terminals never send `SIGIO`, where Linux's do. The
-  signals differ from Linux's in these cases:
-  - **Waiting reader.** A socket that a reader is waiting on still signals
-    when data comes; Linux holds the signal back then.
-  - **Full socket.** A socket whose send found the buffer full signals as
-    soon as a read makes any room; Linux waits until three quarters of the
-    buffer is free.
-  - **Pipe write that waits.** A pipe write that waits more than once
-    signals the reader before the first wait only; Linux signals before each
-    wait.
+  standard input and terminals never send `SIGIO`, where Linux's do.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for

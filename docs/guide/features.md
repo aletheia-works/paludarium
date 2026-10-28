@@ -172,13 +172,18 @@ kernel.
   `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set through as
   `si_fd`.
   - **Pipes.** Every write signals the reader as it ends, even one that
-    finds the pipe full, and also before it waits. Every read signals the
+    finds the pipe full, and also before each wait. Every read signals the
     writer as it ends, with data or not. The close of either end signals
     the other.
   - **Sockets.** A send signals the peer. On a stream or packet socket, so
     do a write shutdown and the close, which hangs up; a datagram socket's
-    do not. A send that found the buffer full signals once when a read
-    makes room. An out-of-band byte also sends a `POLL_PRI` signal.
+    do not. A send that found the buffer full signals once when reads leave
+    three quarters of the buffer free. An out-of-band byte also sends a
+    `POLL_PRI` signal.
+  - **A waiting reader.** A stream whose read waits gets no signal for the
+    data, end or hang-up that ends the wait, as Linux holds it back; of a
+    send in parts, only the first. A datagram or packet socket's reader gets
+    it.
 - `setsockopt` and `getsockopt` take the `SOL_SOCKET` options as Linux's
   `sk_setsockopt` and `sk_getsockopt` do, with their defaults and checks: an
   `int` value of fewer than 4 bytes is `EINVAL`, a value read back is cut to

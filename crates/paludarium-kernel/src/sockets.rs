@@ -408,6 +408,24 @@ pub(crate) fn pipe_read_ended(file: &Arc<dyn FileHandle>) {
 pub(crate) fn pipe_write_blocked(file: &Arc<dyn FileHandle>) {
     pipe_notify(file, Reason::In);
 }
+/// A blocking read of `file` starts (`waits`) or ends a wait. On a stream
+/// socket open with `O_ASYNC`, the data, end or hang-up that ends the wait
+/// then sends no signal, as Linux's `unix_stream_data_wait` sets
+/// `SOCKWQ_ASYNC_WAITDATA` while it sleeps.
+pub(crate) fn wait_data(file: &Arc<dyn FileHandle>, waits: bool) {
+    let Some(socket) = file
+        .as_any()
+        .and_then(|any| any.downcast_ref::<SocketPairEnd>())
+    else {
+        return;
+    };
+    if socket.pair.messages() {
+        return;
+    }
+    let mut sides = socket.lock_sides();
+    let own = &mut sides[socket.side];
+    own.waiting_data = waits && own.registration.is_some();
+}
 fn as_socket(file: &Arc<dyn FileHandle>) -> Result<&SocketPairEnd, Errno> {
     file.as_any()
         .and_then(|v| v.downcast_ref::<SocketPairEnd>())
@@ -1473,6 +1491,10 @@ struct Side {
     /// A send found the buffer full, so the space a read frees signals this
     /// end `POLL_OUT`, once, as Linux's `SOCKWQ_ASYNC_NOSPACE`.
     no_space: bool,
+    /// A blocking read of this stream end, open with `O_ASYNC`, waits for
+    /// data, so what ends the wait sends no signal, as Linux's
+    /// `SOCKWQ_ASYNC_WAITDATA`.
+    waiting_data: bool,
     /// `SO_PASSCRED`: what this end receives carries credentials, and so
     /// does what it sends.
     pass_credentials: bool,
@@ -1666,7 +1688,7 @@ impl SocketPairEnd {
         };
         let notice = reason
             .filter(|_| self.pair.kind != SOCK_DGRAM && !self.is_pipe())
-            .and_then(|reason| Self::notice(&sides, 1 - self.side, reason));
+            .and_then(|reason| Self::waking_notice(&mut sides, 1 - self.side, reason));
         drop(sides);
         self.pair.hub.changed();
         if let Some(notice) = notice {
@@ -1794,6 +1816,15 @@ impl SocketPairEnd {
             reason,
         })
     }
+    /// The signal side `side` owes for data, its end or a hang-up, which
+    /// ends a wait for data: none if a read of it waits ([`wait_data`]),
+    /// whose wait this ends, as Linux's `SOCK_WAKE_WAITD`.
+    fn waking_notice(sides: &mut [Side; 2], side: usize, reason: Reason) -> Option<Notice> {
+        if std::mem::take(&mut sides[side].waiting_data) {
+            return None;
+        }
+        Self::notice(sides, side, reason)
+    }
     /// Signals side `side` for `reason`, if it is open with `O_ASYNC`.
     fn notify(&self, side: usize, reason: Reason) {
         let sides = self
@@ -1808,8 +1839,9 @@ impl SocketPairEnd {
         }
     }
     /// After a socket read that took data (`peeked` leaves it): a send that
-    /// found no room can go on, which signals its end `POLL_OUT`, as
-    /// `unix_write_space` (a pipe's reads signal in [`pipe_read_ended`]).
+    /// found no room signals its end `POLL_OUT` once three quarters of the
+    /// buffer are free, as `unix_write_space` with `unix_writable` (a pipe's
+    /// reads signal in [`pipe_read_ended`]).
     fn after_read<T>(&self, peeked: bool, result: &Result<T, Errno>) {
         if peeked || result.is_err() || self.is_pipe() {
             return;
@@ -1820,7 +1852,7 @@ impl SocketPairEnd {
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let room = sides[self.side].bytes.len() < self.pair.window();
+        let room = sides[self.side].bytes.len() <= self.pair.window() / 4;
         if !(sides[peer].no_space && room) {
             return;
         }
@@ -2233,7 +2265,8 @@ impl Drop for SocketPairEnd {
         } else {
             (self.pair.kind != SOCK_DGRAM).then_some(Reason::HangUp)
         };
-        let notice = reason.and_then(|reason| Self::notice(&sides, 1 - self.side, reason));
+        let notice =
+            reason.and_then(|reason| Self::waking_notice(&mut sides, 1 - self.side, reason));
         // Linux frees the receive queue with the socket, and closes the
         // descriptors in it. Closing one may end another socket, even this
         // pair's other end, so it happens after the lock is released.
@@ -2345,9 +2378,10 @@ impl SocketPairEnd {
         let result = self.send_data(buf, passed, sender, part);
         match result {
             // The peer has data (a message may be empty), as Linux's
-            // `sk_data_ready` tells it for each part.
-            Ok(count) if count != 0 || self.pair.messages() => {
-                for _ in 0..count.div_ceil(part).max(1) {
+            // `sk_data_ready` tells it for each part, but not for the first
+            // when a read waited, which that part wakes.
+            Ok((count, waited)) if count != 0 || self.pair.messages() => {
+                for _ in usize::from(waited)..count.div_ceil(part).max(1) {
                     self.notify(1 - self.side, Reason::In);
                 }
             }
@@ -2360,7 +2394,7 @@ impl SocketPairEnd {
             }
             _ => {}
         }
-        result
+        result.map(|(count, _)| count)
     }
     /// The most bytes a stream write puts in one part, as Linux's
     /// `unix_stream_sendmsg` sizes its buffers: half the send buffer less 64
@@ -2379,14 +2413,16 @@ impl SocketPairEnd {
             .clamp(1, MAX_PART)
     }
     /// Sends `buf`, a stream's in parts of at most `part` bytes, the
-    /// descriptors with the first, as Linux's `unix_stream_sendmsg` does.
+    /// descriptors with the first, as Linux's `unix_stream_sendmsg` does;
+    /// with the count, whether a read of the stream waited, which the send
+    /// ends ([`wait_data`]).
     fn send_data(
         &self,
         buf: &[u8],
         passed: &mut Passed,
         sender: Sender,
         part: usize,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(usize, bool), Errno> {
         let mut sides = self
             .pair
             .sides
@@ -2440,7 +2476,7 @@ impl SocketPairEnd {
                 sent: self.pair.sent_at(peer),
             });
             self.pair.hub.changed();
-            return Ok(buf.len());
+            return Ok((buf.len(), false));
         }
         if sides[self.side].write_shutdown
             || sides[1 - self.side].closed
@@ -2473,7 +2509,7 @@ impl SocketPairEnd {
                 sent: self.pair.sent_at(peer),
             });
             self.pair.hub.changed();
-            return Ok(buf.len());
+            return Ok((buf.len(), false));
         }
         let count = buf
             .len()
@@ -2498,8 +2534,9 @@ impl SocketPairEnd {
                 sent: None,
             });
         }
+        let waited = std::mem::take(&mut peer.waiting_data);
         self.pair.hub.changed();
-        Ok(count)
+        Ok((count, waited))
     }
     /// Queues `byte` as the peer's out-of-band byte, after the stream's
     /// data, as Linux's `queue_oob`: an earlier one still unread becomes
@@ -2512,19 +2549,23 @@ impl SocketPairEnd {
     ) -> Result<usize, Errno> {
         let result = self.queue_out_of_band(byte, passed, sender);
         // An `F_SETSIG` signal for the urgent byte (SIGURG goes besides),
-        // then one for the data, as Linux's `queue_oob`.
-        if result.is_ok() {
+        // then one for the data, unless a read waited, as Linux's
+        // `queue_oob`.
+        if let Ok(waited) = result {
             self.notify(1 - self.side, Reason::Priority);
-            self.notify(1 - self.side, Reason::In);
+            if !waited {
+                self.notify(1 - self.side, Reason::In);
+            }
         }
-        result
+        result.map(|_| 1)
     }
+    /// Queues `byte`, returning whether a read of the stream waited.
     fn queue_out_of_band(
         &self,
         byte: u8,
         passed: &mut Passed,
         sender: Sender,
-    ) -> Result<usize, Errno> {
+    ) -> Result<bool, Errno> {
         let mut sides = self
             .pair
             .sides
@@ -2556,8 +2597,9 @@ impl SocketPairEnd {
             peeked: false,
             sent: None,
         });
+        let waited = std::mem::take(&mut peer.waiting_data);
         self.pair.hub.changed();
-        Ok(1)
+        Ok(waited)
     }
 }
 #[cfg(test)]

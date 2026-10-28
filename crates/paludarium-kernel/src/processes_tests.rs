@@ -2055,14 +2055,16 @@ mod signal_driven_io {
         assert_eq!(taken(&k, 29).len(), 1);
     }
     #[test]
-    fn a_full_socket_signals_its_writer_once_room_comes() {
+    fn a_full_socket_signals_its_writer_once_three_quarters_are_free() {
         let (mut k, mut t, m) = setup();
         let (a, b) = async_pair(&mut k, &mut t, &m, 1 | 0o4000);
+        let mut queued = 0;
         let full = loop {
             let sent = syscall(&mut k, &mut t, &m, 1, [a, DATA, 4096, 0, 0, 0]);
             if sent == Errno::EAGAIN.to_syscall_return() {
                 break sent;
             }
+            queued += sent;
         };
         assert_eq!(full, Errno::EAGAIN.to_syscall_return());
         // Every send told the reader; the writer has had nothing yet.
@@ -2071,16 +2073,66 @@ mod signal_driven_io {
                 .iter()
                 .all(|&(code, fd)| (code, fd) == (1, b as i32))
         );
-        assert_eq!(
-            syscall(&mut k, &mut t, &m, 0, [b, DATA, 4096, 0, 0, 0]),
-            4096
-        );
+        // Room alone does not signal, only a buffer three quarters free.
+        while queued > crate::sockets::SEND_WINDOW as u64 / 4 {
+            assert!(codes(&k).is_empty());
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 0, [b, DATA, 4096, 0, 0, 0]),
+                4096
+            );
+            queued -= 4096;
+        }
         assert_eq!(codes(&k), [(2, a as i32)]);
         assert_eq!(
             syscall(&mut k, &mut t, &m, 0, [b, DATA, 4096, 0, 0, 0]),
             4096
         );
         assert!(codes(&k).is_empty());
+    }
+    #[test]
+    fn a_waiting_stream_reader_gets_no_signal_for_what_ends_its_wait() {
+        let (mut k, mut t, m) = setup();
+        let (a, b) = async_pair(&mut k, &mut t, &m, 1);
+        let reader = k.files.descriptor(b).unwrap().file;
+        let b = b as i32;
+        m.write(GuestAddr(DATA + 64), b"xy").unwrap();
+        // Only the first part of a send ends the wait.
+        crate::sockets::wait_data(&reader, true);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [a, DATA + 64, 1, 0, 0, 0]),
+            1
+        );
+        assert!(codes(&k).is_empty());
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [a, DATA + 64, 1, 0, 0, 0]),
+            1
+        );
+        assert_eq!(codes(&k), [(1, b)]);
+        // An out-of-band byte still signals POLL_PRI, a shutdown nothing.
+        crate::sockets::wait_data(&reader, true);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 44, [a, DATA + 64, 1, 1, 0, 0]),
+            1
+        );
+        assert_eq!(codes(&k), [(5, b)]);
+        assert_eq!(taken(&k, 23).len(), 1);
+        crate::sockets::wait_data(&reader, true);
+        assert_eq!(syscall(&mut k, &mut t, &m, 48, [a, 1, 0, 0, 0, 0]), 0);
+        assert!(codes(&k).is_empty());
+        // A wait that ended otherwise holds nothing back.
+        crate::sockets::wait_data(&reader, true);
+        crate::sockets::wait_data(&reader, false);
+        assert_eq!(syscall(&mut k, &mut t, &m, 3, [a, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(codes(&k), [(6, b)]);
+    }
+    #[test]
+    fn a_datagram_reader_that_waits_still_gets_its_signal() {
+        let (mut k, mut t, m) = setup();
+        let (a, b) = async_pair(&mut k, &mut t, &m, 2);
+        let reader = k.files.descriptor(b).unwrap().file;
+        crate::sockets::wait_data(&reader, true);
+        assert_eq!(syscall(&mut k, &mut t, &m, 1, [a, DATA, 1, 0, 0, 0]), 1);
+        assert_eq!(codes(&k), [(1, b as i32)]);
     }
     #[test]
     fn shutdowns_signal_a_stream_peer_but_not_a_datagram_one() {

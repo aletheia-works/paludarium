@@ -120,8 +120,6 @@ fn take_owner(
     Ok(0)
 }
 
-/// `fcntl`'s `F_SETOWN` (8), `F_GETOWN` (9), `F_SETSIG` (10), `F_GETSIG`
-/// (11), `F_SETOWN_EX` (15) and `F_GETOWN_EX` (16), for any file.
 /// Gives `file`, open as descriptor `fd`, the status `flags` of `F_SETFL`.
 /// Only pipes and sockets keep `O_ASYNC`, and changing it registers or
 /// drops the descriptor, as Linux's `fasync` does.
@@ -150,6 +148,8 @@ pub(crate) fn set_flags(
     Ok(())
 }
 
+/// `fcntl`'s `F_SETOWN` (8), `F_GETOWN` (9), `F_SETSIG` (10), `F_GETSIG`
+/// (11), `F_SETOWN_EX` (15) and `F_GETOWN_EX` (16), for any file.
 pub(crate) fn fcntl(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,

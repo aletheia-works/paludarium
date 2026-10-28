@@ -2792,10 +2792,10 @@ int main(int argc, char **argv) {
             receive_waited("peek-all", sv[1], 8, MSG_PEEK | MSG_WAITALL);
             receive_waited("dontwait", sv[1], 1, MSG_DONTWAIT);
             /* The child sends after what this process sent. */
-            struct timespec forked;
-            clock_gettime(CLOCK_MONOTONIC, &forked);
+            struct timespec before_fork;
+            clock_gettime(CLOCK_MONOTONIC, &before_fork);
             pid_t pid = send_later(sv[0], "cd", 1000);
-            receive_waited_from("recv", sv[1], 8, 0, &forked);
+            receive_waited_from("recv", sv[1], 8, 0, &before_fork);
             waitpid(pid, NULL, 0);
             receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
             /* A buffer smaller than the mark ends the read when full; were

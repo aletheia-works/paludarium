@@ -81,6 +81,32 @@ static void call(const char *name, int r) { printf("  %s=%d errno=%d\n", name, r
 static void print_bytes(const char *name, const char *buf, long n) {
     printf("  %s=%ld \"%.*s\"\n", name, n, n > 0 ? (int)n : 0, buf);
 }
+/* async: takes the signal-driven I/O signals pending now, and prints
+   each different one as it comes (data may come in several pieces). */
+static void signals(const char *step) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, 40);
+    siginfo_t info;
+    int last_code = 0;
+    long last_band = 0;
+    struct timespec now = {0, 0};
+    printf("  %s:", step);
+    while (sigtimedwait(&set, &info, &now) == 40) {
+        if (info.si_code == last_code && info.si_band == last_band) continue;
+        last_code = info.si_code;
+        last_band = info.si_band;
+        printf(" code=%d band=%#lx fd-ok=%d", info.si_code, info.si_band, info.si_fd >= 3);
+    }
+    putchar('\n');
+}
+static int async_socket(void) {
+    int fd = tcp(SOCK_NONBLOCK);
+    fcntl(fd, F_SETOWN, getpid());
+    fcntl(fd, F_SETSIG, 40);
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_ASYNC);
+    return fd;
+}
 static volatile sig_atomic_t pipes;
 static void on_pipe(int signal) { (void)signal; pipes++; }
 
@@ -364,6 +390,37 @@ int main(int argc, char **argv) {
         socklen_t fromlen = sizeof from;
         call("recvfrom-end", recvfrom(fd, buf, sizeof buf, 0, (void *)&from, &fromlen));
         printf("  fromlen=%u\n", (unsigned)fromlen);
+        close(fd);
+        return 0;
+    }
+    if (!strcmp(mode, "async")) {
+        /* O_ASYNC with F_SETSIG: POLL_OUT once connected, POLL_IN for
+           data, POLL_HUP for the peer's end after this side's, POLL_ERR
+           for a refused connection. */
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, 40);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        int fd = async_socket();
+        printf("  async=%d\n", !!(fcntl(fd, F_GETFL) & O_ASYNC));
+        struct sockaddr_in a = to(open_port);
+        call("connect", connect(fd, (void *)&a, sizeof a));
+        polled("connected", fd, POLLOUT);
+        signals("connected");
+        send(fd, "eping", 5, 0);
+        polled("echoed", fd, POLLIN);
+        signals("echoed");
+        n = recv(fd, buf, sizeof buf, 0);
+        print_bytes("recv", buf, n);
+        shutdown(fd, SHUT_WR);
+        await_end(fd);
+        signals("ended");
+        close(fd);
+        fd = async_socket();
+        a = to(closed_port);
+        call("connect-refused", connect(fd, (void *)&a, sizeof a));
+        polled("refused", fd, POLLOUT);
+        signals("refused");
         close(fd);
         return 0;
     }

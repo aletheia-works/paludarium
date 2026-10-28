@@ -9,7 +9,7 @@ use paludarium_types::{Errno, GuestAddr};
 use std::sync::{Arc, Weak};
 
 /// `O_ASYNC` (`FASYNC`): only pipes and sockets keep it, the files that
-/// have Linux's `fasync`; on any other `F_SETFL` drops it.
+/// have Linux's `fasync` ([`has_fasync`]); on any other `F_SETFL` drops it.
 pub(crate) const O_ASYNC: u32 = 0o20000;
 
 /// Whom a file's signals go to, as `F_OWNER_TID`, `F_OWNER_PID` and
@@ -38,6 +38,7 @@ pub(crate) struct FileOwner {
 pub(crate) enum Reason {
     In = 1,
     Out = 2,
+    Error = 4,
     Priority = 5,
     HangUp = 6,
 }
@@ -47,6 +48,7 @@ impl Reason {
         match self {
             Self::In => 0x41,
             Self::Out => 0x304,
+            Self::Error => 0x8,
             Self::Priority => 0x82,
             Self::HangUp => 0x18,
         }
@@ -86,7 +88,15 @@ pub(crate) fn siginfo(signal: i32, fd: i32, reason: Reason) -> [u8; 48] {
     info
 }
 
+/// Whether `file` has Linux's `fasync`: a pipe or a socket.
+pub(crate) fn has_fasync(file: &Arc<dyn FileHandle>) -> bool {
+    crate::sockets::endpoint(file).is_some() || crate::inet::of(file).is_some()
+}
+
 fn owner(c: &Context<'_>, file: &Arc<dyn FileHandle>) -> FileOwner {
+    if let Some(socket) = crate::inet::of(file) {
+        return socket.file_owner();
+    }
     match crate::sockets::endpoint(file) {
         Some(endpoint) => endpoint.file_owner(),
         None => c.processes.file_owner(file),
@@ -94,6 +104,9 @@ fn owner(c: &Context<'_>, file: &Arc<dyn FileHandle>) -> FileOwner {
 }
 
 fn set_owner(c: &Context<'_>, file: &Arc<dyn FileHandle>, owner: FileOwner) {
+    if let Some(socket) = crate::inet::of(file) {
+        return socket.set_file_owner(owner);
+    }
     match crate::sockets::endpoint(file) {
         Some(endpoint) => endpoint.set_file_owner(owner),
         None => c.processes.set_file_owner(file, owner),
@@ -129,21 +142,23 @@ pub(crate) fn set_flags(
     fd: u64,
     flags: u32,
 ) -> Result<(), Errno> {
-    let endpoint = crate::sockets::endpoint(file);
-    let flags = if endpoint.is_some() {
+    let flags = if has_fasync(file) {
         flags
     } else {
         flags & !O_ASYNC
     };
     let before = file.flags();
     file.set_flags(flags)?;
-    if let Some(endpoint) = endpoint
-        && (before ^ flags) & O_ASYNC != 0
-    {
-        endpoint.set_async((flags & O_ASYNC != 0).then(|| Registration {
+    if (before ^ flags) & O_ASYNC != 0 {
+        let registration = (flags & O_ASYNC != 0).then(|| Registration {
             processes: Arc::downgrade(c.processes),
             fd: fd as i32,
-        }));
+        });
+        if let Some(endpoint) = crate::sockets::endpoint(file) {
+            endpoint.set_async(registration);
+        } else if let Some(socket) = crate::inet::of(file) {
+            socket.set_async(registration);
+        }
     }
     Ok(())
 }

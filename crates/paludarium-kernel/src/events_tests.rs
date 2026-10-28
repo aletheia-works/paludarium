@@ -942,6 +942,70 @@ fn a_socket_pair_is_unnamed_and_never_listens() {
         Errno::EBADF.to_syscall_return()
     );
 }
+#[test]
+fn an_async_tcp_socket_signals_its_owner() {
+    let mut f = network_fixture(&["127.0.0.1"]);
+    // Blocked, the signals stay pending to be looked at.
+    f.thread.state.signal_mask = 1 << 39;
+    let taken = |f: &Fixture| -> Vec<(i32, i64)> {
+        std::iter::from_fn(|| f.kernel.group.take_process_signal(1 << 39))
+            .filter_map(|signal| signal.queued)
+            .map(|info| {
+                (
+                    i32::from_le_bytes(info[8..12].try_into().unwrap()),
+                    i64::from_le_bytes(info[16..24].try_into().unwrap()),
+                )
+            })
+            .collect()
+    };
+    let fd = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    assert_eq!(f.ret(72, [fd, 8, 1, 0, 0, 0]), 0);
+    assert_eq!(f.ret(72, [fd, 9, 0, 0, 0, 0]), 1);
+    assert_eq!(f.ret(72, [fd, 10, 40, 0, 0, 0]), 0);
+    assert_eq!(f.ret(72, [fd, 4, 0o20000 | 0x800, 0, 0, 0]), 0);
+    assert_eq!(f.ret(72, [fd, 3, 0, 0, 0, 0]) & 0o20000, 0o20000);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 80);
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    let stream = f.host.streams.lock().unwrap()[0].clone();
+    // The connection opening is POLL_OUT, data POLL_IN, the peer's end
+    // POLL_IN, and the end once this side has shut down too POLL_HUP.
+    stream.connected(None);
+    assert_eq!(taken(&f), [(2, 0x304)]);
+    stream.receive(b"abc");
+    assert_eq!(taken(&f), [(1, 0x41)]);
+    // A full buffer found by a write makes room signal POLL_OUT, once.
+    let big = vec![0; paludarium_host::net::BUFFER];
+    f.mem.write(GuestAddr(DATA + 0x400), &big[..4096]).unwrap();
+    while f.ret(44, [fd, DATA + 0x400, 4096, 0x40, 0, 0]) == 4096 {}
+    stream.take(10);
+    stream.take(10);
+    assert_eq!(taken(&f), [(2, 0x304)]);
+    assert_eq!(f.ret(48, [fd, 1, 0, 0, 0, 0]), 0);
+    stream.end();
+    assert_eq!(taken(&f), [(6, 0x18), (1, 0x41)]);
+    // A connection that fails is POLL_ERR.
+    let other = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    assert_eq!(f.ret(72, [other, 8, 1, 0, 0, 0]), 0);
+    assert_eq!(f.ret(72, [other, 10, 40, 0, 0, 0]), 0);
+    // FIOASYNC turns it on as F_SETFL does.
+    f.mem
+        .write(GuestAddr(DATA + 0x300), &1i32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(16, [other, 0x5452, DATA + 0x300, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(42, [other, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    f.host.streams.lock().unwrap()[1].fail(Errno(111));
+    assert_eq!(taken(&f), [(4, 0x8)]);
+    // Without O_ASYNC nothing comes.
+    assert_eq!(f.ret(72, [fd, 4, 0x800, 0, 0, 0]), 0);
+    stream.receive(b"d");
+    assert!(taken(&f).is_empty());
+}
 /// A DNS query for `name` of type `kind` at `at`; returns its length.
 fn dns_query(f: &Fixture, at: u64, name: &str, kind: u16) -> u64 {
     let mut bytes = vec![0xab, 0xcd, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];

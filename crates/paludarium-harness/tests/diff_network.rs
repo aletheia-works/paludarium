@@ -155,6 +155,10 @@ mod linux {
     fn network_mapped() {
         case("mapped");
     }
+    #[test]
+    fn network_async() {
+        case("async");
+    }
 
     /// Name resolution has no native counterpart here: the guest's resolver
     /// would read the runner's own files and servers. Under the emulator,

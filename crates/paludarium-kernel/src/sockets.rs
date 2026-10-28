@@ -467,6 +467,9 @@ pub(crate) fn pipe_write_blocked(file: &Arc<dyn FileHandle>) {
 /// then sends no signal, as Linux's `unix_stream_data_wait` sets
 /// `SOCKWQ_ASYNC_WAITDATA` while it sleeps.
 pub(crate) fn wait_data(file: &Arc<dyn FileHandle>, waits: bool) {
+    if let Some(socket) = crate::inet::of(file) {
+        return socket.wait_data(waits);
+    }
     let Some(socket) = file
         .as_any()
         .and_then(|any| any.downcast_ref::<SocketPairEnd>())

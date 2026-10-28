@@ -170,8 +170,8 @@ kernel.
   `O_ASYNC` (`F_SETFL` drops it on other files, and `FIOASYNC` setting it
   there is `ENOTTY`). With it, a pipe or socket
   sends its owner `SIGIO` from the kernel. With `F_SETSIG`, it sends that
-  signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_PRI` or
-  `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set through as
+  signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_ERR`,
+  `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set through as
   `si_fd`.
   - **Pipes.** Every write signals the reader as it ends, even one that
     finds the pipe full, and also before each wait. Every read signals the
@@ -184,6 +184,12 @@ kernel.
     socket that `poll`, `select` or `epoll_ctl` asked to take a write. Only
     what happens while `O_ASYNC` is on counts. An out-of-band byte also sends a
     `POLL_PRI` signal.
+  - **TCP and UDP sockets** ([Network](#network)), as Linux's TCP signals:
+    `POLL_OUT` when a connection opens, `POLL_ERR` when it fails, `POLL_IN`
+    when data arrives, and for the peer's end `POLL_IN` (`POLL_HUP` once
+    this side has shut down too) and then `POLL_IN`. A send or `poll` that
+    found the buffer full makes room signal `POLL_OUT` once. A DNS stub's
+    answer signals `POLL_IN` when it is ready.
   - **A waiting reader.** A stream whose read waits gets no signal for the
     data, end or hang-up that ends the wait, as Linux holds it back; of a
     send in parts, only the first. A datagram or packet socket's reader gets

@@ -35,6 +35,21 @@ pub enum Phase {
     Failed(Errno),
 }
 
+/// What a driver changed in a [`Stream`], as its waker is told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The connection opened.
+    Connected,
+    /// The connection could not be made, or broke.
+    Failed,
+    /// Bytes arrived.
+    Received,
+    /// The peer ended its side.
+    Ended,
+    /// Queued bytes left for the host, freeing room.
+    Sent,
+}
+
 /// What [`Stream::readiness`] finds: what a read or write would do now and
 /// how often bytes have arrived and left, for edge-triggered waits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,12 +81,13 @@ struct State {
 }
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
+type StreamWaker = Arc<dyn Fn(Event) + Send + Sync>;
 
 /// A TCP connection the guest opened: its phase, addresses and buffers.
 pub struct Stream {
     peer: SocketAddr,
     state: Mutex<State>,
-    waker: Mutex<Option<Waker>>,
+    waker: Mutex<Option<StreamWaker>>,
     driver: Mutex<Option<Arc<dyn Driver>>>,
     /// Native drivers wait on this with the state lock.
     #[cfg(not(target_arch = "wasm32"))]
@@ -108,11 +124,11 @@ impl Stream {
     pub fn set_driver(&self, driver: Arc<dyn Driver>) {
         *self.driver.lock().unwrap_or_else(PoisonError::into_inner) = Some(driver);
     }
-    /// What the driver calls after each change it makes.
-    pub fn set_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) {
+    /// What the driver calls after each change it makes, with the change.
+    pub fn set_waker(&self, waker: Arc<dyn Fn(Event) + Send + Sync>) {
         *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(waker);
     }
-    fn wake(&self) {
+    fn wake(&self, event: Event) {
         #[cfg(not(target_arch = "wasm32"))]
         self.signal.notify_all();
         let waker = self
@@ -121,7 +137,7 @@ impl Stream {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if let Some(waker) = waker {
-            waker();
+            waker(event);
         }
     }
     fn kick(&self) {
@@ -247,26 +263,28 @@ impl Stream {
     pub fn connected(&self, local: Option<SocketAddr>) {
         {
             let mut s = self.lock();
-            if s.phase == Phase::Connecting {
-                s.phase = Phase::Open;
-                s.local = local;
-                s.departures += 1;
+            if s.phase != Phase::Connecting {
+                return;
             }
+            s.phase = Phase::Open;
+            s.local = local;
+            s.departures += 1;
         }
-        self.wake();
+        self.wake(Event::Connected);
     }
     /// The connection could not be made, or broke.
     pub fn fail(&self, error: Errno) {
         {
             let mut s = self.lock();
-            if !matches!(s.phase, Phase::Failed(_)) {
-                s.phase = Phase::Failed(error);
-                s.sending.clear();
-                s.arrivals += 1;
-                s.departures += 1;
+            if matches!(s.phase, Phase::Failed(_)) {
+                return;
             }
+            s.phase = Phase::Failed(error);
+            s.sending.clear();
+            s.arrivals += 1;
+            s.departures += 1;
         }
-        self.wake();
+        self.wake(Event::Failed);
     }
     /// How many more received bytes the stream takes now.
     #[must_use]
@@ -285,7 +303,7 @@ impl Stream {
             n
         };
         if n > 0 {
-            self.wake();
+            self.wake(Event::Received);
         }
         n
     }
@@ -296,7 +314,7 @@ impl Stream {
             s.received_end = true;
             s.arrivals += 1;
         }
-        self.wake();
+        self.wake(Event::Ended);
     }
     /// Takes up to `max` queued bytes to send.
     pub fn take(&self, max: usize) -> Vec<u8> {
@@ -310,7 +328,7 @@ impl Stream {
             taken
         };
         if !taken.is_empty() {
-            self.wake();
+            self.wake(Event::Sent);
         }
         taken
     }
@@ -337,7 +355,7 @@ impl Stream {
                 let bytes = s.sending.drain(..n).collect();
                 s.departures += 1;
                 drop(s);
-                self.wake();
+                self.wake(Event::Sent);
                 return Sending::Bytes(bytes);
             }
             if s.closed {
@@ -377,40 +395,49 @@ pub(crate) enum Sending {
 
 /// A name lookup the host answers in its own time.
 pub struct Lookup {
-    result: Mutex<Option<Result<Vec<IpAddr>, Errno>>>,
-    waker: Mutex<Option<Waker>>,
+    state: Mutex<LookupState>,
+}
+#[derive(Default)]
+struct LookupState {
+    result: Option<Result<Vec<IpAddr>, Errno>>,
+    wakers: Vec<Waker>,
 }
 impl Lookup {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            result: Mutex::new(None),
-            waker: Mutex::new(None),
+            state: Mutex::default(),
         })
     }
-    /// What the host calls once it has the answer.
-    pub fn set_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) {
-        *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(waker);
+    /// Adds what is called once the host has the answer; `false`, and
+    /// nothing added, when it has it already.
+    pub fn add_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.result.is_some() {
+            return false;
+        }
+        state.wakers.push(waker);
+        true
     }
     /// The answer: the addresses (none for a name that does not exist), or
     /// the error that kept the host from finding them.
     pub fn finish(&self, result: Result<Vec<IpAddr>, Errno>) {
-        *self.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
-        let waker = self
-            .waker
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(waker) = waker {
+        let wakers = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.result = Some(result);
+            std::mem::take(&mut state.wakers)
+        };
+        for waker in wakers {
             waker();
         }
     }
     /// The answer, once it has come.
     #[must_use]
     pub fn result(&self) -> Option<Result<Vec<IpAddr>, Errno>> {
-        self.result
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .result
             .clone()
     }
 }
@@ -444,7 +471,7 @@ mod tests {
     fn counted(stream: &Stream) -> Arc<AtomicUsize> {
         let wakes = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&wakes);
-        stream.set_waker(Arc::new(move || {
+        stream.set_waker(Arc::new(move |_| {
             seen.fetch_add(1, Ordering::SeqCst);
         }));
         wakes
@@ -515,16 +542,20 @@ mod tests {
         let lookup = Lookup::new();
         let wakes = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&wakes);
-        lookup.set_waker(Arc::new(move || {
-            seen.fetch_add(1, Ordering::SeqCst);
-        }));
+        for _ in 0..2 {
+            let seen = Arc::clone(&seen);
+            assert!(lookup.add_waker(Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })));
+        }
         assert_eq!(lookup.result(), None);
         lookup.finish(Ok(vec!["192.0.2.1".parse().unwrap()]));
+        assert!(!lookup.add_waker(Arc::new(|| {})));
         assert_eq!(
             lookup.result(),
             Some(Ok(vec!["192.0.2.1".parse().unwrap()]))
         );
-        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

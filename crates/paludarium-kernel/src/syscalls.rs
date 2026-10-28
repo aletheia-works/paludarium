@@ -1690,7 +1690,7 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 let flags =
                     (file.flags() & !async_flag) | if read_int(c)? != 0 { async_flag } else { 0 };
                 if (flags ^ file.flags()) & async_flag != 0 {
-                    if crate::sockets::endpoint(&file).is_none() {
+                    if !crate::fasync::has_fasync(&file) {
                         return Err(Errno::ENOTTY);
                     }
                     crate::fasync::set_flags(c, &file, a[0], flags)?;

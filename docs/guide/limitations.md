@@ -28,8 +28,7 @@ verified.
     `SO_SNDBUF` and `SO_RCVBUF` are kept for `getsockopt` but do not size the
     buffers, which hold 256 KiB each way; the other options but
     `TCP_NODELAY` do not reach the host's socket.
-  - `O_ASYNC` and `FIOASYNC` do not work on these sockets, and `MSG_OOB` finds
-    no urgent data (`EINVAL`).
+  - `MSG_OOB` finds no urgent data (`EINVAL`), so no `SIGURG` comes either.
 - **File mappings**: a file mapping shows the file's page cache as on Linux
   (a `MAP_PRIVATE` one in the pages it has not written), but the stores of a
   `MAP_SHARED` mapping reach the file on the host only when the guest reads

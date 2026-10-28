@@ -7,15 +7,16 @@
 //! for an allowed name and with `NXDOMAIN` for any other, so the guest's
 //! own resolver (`/etc/resolv.conf`, or its default) works unchanged.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
+use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::sockets::Timeout;
 use crate::syscalls::Context;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use paludarium_host::net::{Lookup, Phase, Stream};
+use paludarium_host::net::{Event, Lookup, Phase, Stream};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 const AF_UNSPEC: u16 = 0;
 const AF_INET: u16 = 2;
@@ -310,7 +311,7 @@ impl Network {
         }
         let lookup = host.resolve(name)?;
         let hub = Arc::clone(hub);
-        lookup.set_waker(Arc::new(move || hub.changed()));
+        lookup.add_waker(Arc::new(move || hub.changed()));
         lookups.insert(name.to_owned(), (Arc::clone(&lookup), now));
         Ok(lookup)
     }
@@ -364,6 +365,7 @@ pub(crate) fn socket(
         mode: AtomicU32::new(0o140777),
         state: Mutex::new(State::default()),
         options: Mutex::new(Options::default()),
+        signals: Arc::default(),
     });
     c.files
         .install(socket, flags & CLOEXEC != 0, c.group.nofile())
@@ -477,6 +479,96 @@ impl Default for Options {
     }
 }
 
+/// Signal-driven I/O of a socket, as Linux's `sock_wake_async` sends it:
+/// the owner and signal `F_SETOWN` and `F_SETSIG` set, the descriptor
+/// `O_ASYNC` was set through, and its `SOCKWQ_ASYNC_WAITDATA` and
+/// `SOCKWQ_ASYNC_NOSPACE` bits.
+#[derive(Default)]
+struct Signals {
+    owner: Mutex<FileOwner>,
+    registration: Mutex<Option<Registration>>,
+    /// A blocking read waits for data, which then signals nothing.
+    waiting: AtomicBool,
+    /// A write or poll found the buffer full, so room signals `POLL_OUT`.
+    no_space: AtomicBool,
+}
+impl Signals {
+    fn on(&self) -> bool {
+        self.registration
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+    /// `SOCK_WAKE_IO`: signals `reason`, if `O_ASYNC` is on.
+    fn send(&self, reason: Reason) {
+        let to = self
+            .registration
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(to) = to {
+            let owner = *self.owner.lock().unwrap_or_else(PoisonError::into_inner);
+            Notice { to, owner, reason }.send();
+        }
+    }
+    /// `SOCK_WAKE_WAITD`: none while a read waits, which the data wakes.
+    fn waking(&self, reason: Reason) {
+        if !self.waiting.load(Ordering::SeqCst) {
+            self.send(reason);
+        }
+    }
+    /// `SOCK_WAKE_SPACE`: `POLL_OUT` once, if the buffer was found full.
+    fn space(&self) {
+        if self.no_space.swap(false, Ordering::SeqCst) {
+            self.send(Reason::Out);
+        }
+    }
+    /// `sk_set_bit(SOCKWQ_ASYNC_NOSPACE)`, which acts only with `O_ASYNC`.
+    fn full(&self) {
+        if self.on() {
+            self.no_space.store(true, Ordering::SeqCst);
+        }
+    }
+}
+/// What a stream's change signals, as Linux's TCP does: `POLL_OUT` when the
+/// connection opens (`tcp_finish_connect`), `POLL_ERR` when it fails
+/// (`sk_error_report`), `POLL_IN` for data (`sk_data_ready`), for the
+/// peer's end `POLL_IN`, or `POLL_HUP` once this side has shut down too
+/// (`tcp_fin`), and then `POLL_IN` as for data (`tcp_data_queue` queues the
+/// FIN), and `POLL_OUT` for room after a full buffer
+/// (`sk_stream_write_space`).
+fn stream_waker(
+    signals: &Arc<Signals>,
+    hub: &Arc<ReadinessHub>,
+    stream: &Arc<Stream>,
+) -> Arc<dyn Fn(Event) + Send + Sync> {
+    let (signals, hub, stream) = (Arc::clone(signals), Arc::clone(hub), Arc::downgrade(stream));
+    Arc::new(move |event| {
+        let stream = Weak::upgrade(&stream);
+        match event {
+            Event::Connected => signals.send(Reason::Out),
+            Event::Failed => signals.send(Reason::Error),
+            Event::Received => signals.waking(Reason::In),
+            Event::Ended => {
+                signals.waking(
+                    if stream.as_ref().is_some_and(|s| s.readiness().write_closed) {
+                        Reason::HangUp
+                    } else {
+                        Reason::In
+                    },
+                );
+                signals.waking(Reason::In);
+            }
+            Event::Sent => {
+                if stream.as_ref().is_some_and(|s| s.readiness().writable) {
+                    signals.space();
+                }
+            }
+        }
+        hub.changed();
+    })
+}
+
 /// A TCP or UDP socket of the guest.
 pub(crate) struct InetSocket {
     family: Family,
@@ -490,9 +582,40 @@ pub(crate) struct InetSocket {
     mode: AtomicU32,
     state: Mutex<State>,
     options: Mutex<Options>,
+    signals: Arc<Signals>,
 }
 
 impl InetSocket {
+    /// `F_GETOWN` and `F_GETSIG`.
+    pub(crate) fn file_owner(&self) -> FileOwner {
+        *self
+            .signals
+            .owner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// `F_SETOWN` and `F_SETSIG`.
+    pub(crate) fn set_file_owner(&self, owner: FileOwner) {
+        *self
+            .signals
+            .owner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = owner;
+    }
+    /// `F_SETFL` turning `O_ASYNC` on, with its registration, or off.
+    pub(crate) fn set_async(&self, registration: Option<Registration>) {
+        *self
+            .signals
+            .registration
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = registration;
+    }
+    /// A blocking read of this socket starts or stops waiting for data.
+    pub(crate) fn wait_data(&self, waits: bool) {
+        self.signals
+            .waiting
+            .store(waits && self.signals.on(), Ordering::SeqCst);
+    }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -555,6 +678,10 @@ impl InetSocket {
             Err(e) if e != Errno::EAGAIN && e != Errno::EPIPE => {
                 Err(s.error.take().unwrap_or(Errno::EPIPE))
             }
+            Err(e) if e == Errno::EAGAIN && stream.phase() == Phase::Open => {
+                self.signals.full();
+                Err(e)
+            }
             result => result,
         }
     }
@@ -591,8 +718,7 @@ impl InetSocket {
                         return Err(ENETUNREACH);
                     }
                     let stream = c.host.connect(address)?;
-                    let hub = Arc::clone(&self.hub);
-                    stream.set_waker(Arc::new(move || hub.changed()));
+                    stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
                     stream.set_nodelay(self.options().no_delay);
                     if let Some(old) = s.stream.replace(Arc::clone(&stream)) {
                         old.close();
@@ -718,7 +844,20 @@ impl InetSocket {
                     Err(_) => Answer::Now(2),
                 };
             }
+            // An answer signals POLL_IN as a datagram's arrival does: at
+            // once, or when the host's lookup ends.
+            let ready = match &query.answer {
+                Answer::Now(_) => true,
+                Answer::Lookup(lookup) => {
+                    let signals = Arc::clone(&self.signals);
+                    !lookup.add_waker(Arc::new(move || signals.waking(Reason::In)))
+                }
+            };
             s.queries.push_back(query);
+            drop(s);
+            if ready {
+                self.signals.waking(Reason::In);
+            }
             self.hub.changed();
         }
         Ok(bytes.len())
@@ -850,6 +989,9 @@ impl FileHandle for InetSocket {
             Phase::Connecting => 0,
             Phase::Failed(_) => IN | OUT | POLLHUP | POLLRDHUP,
             Phase::Open => {
+                if !ready.writable {
+                    self.signals.full();
+                }
                 let read_end = ready.read_closed || s.read_shut;
                 (u32::from(ready.readable || s.read_shut) * IN)
                     | (u32::from(ready.writable) * OUT)
@@ -894,7 +1036,8 @@ impl FileHandle for InetSocket {
         self.flags.load(Ordering::SeqCst)
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        self.flags.store(2 | (flags & NONBLOCK), Ordering::SeqCst);
+        self.flags
+            .store(2 | (flags & (NONBLOCK | O_ASYNC)), Ordering::SeqCst);
         Ok(())
     }
 }

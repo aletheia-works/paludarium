@@ -2129,7 +2129,7 @@ int main(int argc, char **argv) {
            SOCKWQ_ASYNC_WAITDATA), where a datagram or packet socket still
            signals. A send that found the buffer full signals POLL_OUT only
            once three quarters of it is free. A pipe write signals its
-           reader before each wait. A child acts after a while
+           reader before each wait. A reader's child acts after a while
            (io_pause). */
         sigset_t set;
         sigemptyset(&set);
@@ -2148,7 +2148,7 @@ int main(int argc, char **argv) {
         for (int t = 0; t < 3; t++) {
             /* A datagram socket neither ends nor hangs up, so its reader
                would wait for good. */
-            for (int a = 0; a < (types[t] == SOCK_DGRAM ? 1 : 3); a++) {
+            for (int a = 0, tries = 0; a < (types[t] == SOCK_DGRAM ? 1 : 3); a++) {
                 /* The child keeps its end open until the signals are
                    taken, so that only the close case hangs up. */
                 if (socketpair(AF_UNIX, types[t], 0, sv) || pipe(go)) return 74;
@@ -2164,16 +2164,24 @@ int main(int argc, char **argv) {
                     _exit(done);
                 }
                 if (a == 2) close(sv[0]);
+                /* A busy host can keep the reader from reaching recv
+                   before the child acts. Then the reader does not wait
+                   and the signal is due, so the attempt is taken again. */
+                struct pollfd ready = {sv[1], POLLIN | POLLRDHUP, 0};
+                int early = poll(&ready, 1, 0) != 0;
                 long r = recv(sv[1], buf, sizeof buf, 0);
                 char name[32];
                 snprintf(name, sizeof name, "%s-%s=%ld", type_names[t], actions[a], r);
-                io_taken(name);
+                if (early && ++tries < 10) io_count(0);
+                else io_taken(name);
                 close(sv[1]);
                 if (write(go[1], "g", 1) != 1) return 78;
                 waitpid(forked, &status, 0);
                 if (status) return 73;
                 if (a != 2) close(sv[0]);
                 close(go[0]); close(go[1]);
+                if (early && tries < 10) a--;
+                else tries = 0;
             }
         }
         /* A reader that does not wait gets the signal. */
@@ -2201,25 +2209,29 @@ int main(int argc, char **argv) {
         printf("  all=%d out=%d\n", taken == total, io_count(POLL_OUT));
         close(sv[0]); close(sv[1]);
         puts("pipe");
+        /* The write fills the pipe three times, as the child reads only
+           a full pipe, so its count does not hang on which runs first. */
         if (pipe(p)) return 79;
         io_async(p[0], IO_RT);
-        fcntl(p[1], F_SETFL, O_NONBLOCK);
-        while (write(p[1], chunk, 4096) > 0) {}
-        fcntl(p[1], F_SETFL, 0);
-        io_count(POLL_IN);
+        int size = fcntl(p[0], F_GETPIPE_SZ);
+        char *big = calloc(1, size + 8192);
+        if (size <= 0 || !big) return 75;
         fflush(stdout);
         forked = child();
         if (forked < 0) return 76;
         if (!forked) {
             for (int k = 0; k < 2; k++) {
-                io_pause();
+                struct pollfd full = {p[1], POLLOUT, 0};
+                while (poll(&full, 1, 0) != 0)
+                    if (full.revents != POLLOUT) _exit(2);
                 if (read(p[0], chunk, 4096) != 4096) _exit(1);
             }
             _exit(0);
         }
-        r = write(p[1], chunk, 8192);
+        r = write(p[1], big, size + 8192);
+        free(big);
         waitpid(forked, &status, 0);
-        printf("  write=%ld in=%d child=%d\n", r, io_count(POLL_IN), status);
+        printf("  write=%d in=%d child=%d\n", r == size + 8192, io_count(POLL_IN), status);
         close(p[0]); close(p[1]);
         return 0;
     }

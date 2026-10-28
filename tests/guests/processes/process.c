@@ -206,13 +206,17 @@ static void receive_stamped(const char *name, int fd, size_t room, int flags, lo
 }
 /* recvmsg of at most `len` bytes with `flags`: what came, msg_flags, the
    socket's SO_PEEK_OFF after it, and whether it waited 700 ms or more, which
-   a call that does not wait never takes, even on a slow emulated run. */
-static void receive_waited(const char *name, int fd, size_t len, int flags) {
+   a call that does not wait never takes, even on a slow emulated run.
+   The time counts from `from` where given: a test host's clock moves at
+   once by a child's sleep, which may come before the call starts. */
+static void receive_waited_from(const char *name, int fd, size_t len, int flags,
+                                const struct timespec *from) {
     char data[16] = {0};
     struct iovec iov = {data, len};
     struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (from) t0 = *from;
     errno = 0;
     long n = recvmsg(fd, &message, flags);
     int e = n < 0 ? errno : 0;
@@ -223,6 +227,9 @@ static void receive_waited(const char *name, int fd, size_t len, int flags) {
     getsockopt(fd, SOL_SOCKET, SO_PEEK_OFF, &offset, &size);
     printf("  %s=%ld errno=%d data=%.*s flags=%#x off=%d waited=%d\n", name, n, e,
            n > 0 ? (int)(n < (long)len ? n : (long)len) : 0, data, n < 0 ? 0 : message.msg_flags, offset, ms >= 700);
+}
+static void receive_waited(const char *name, int fd, size_t len, int flags) {
+    receive_waited_from(name, fd, len, flags, NULL);
 }
 /* The child whose messages socket-credentials receives. */
 static pid_t credentials_child;
@@ -1947,7 +1954,7 @@ int main(int argc, char **argv) {
         puts("pipe-blocking");
         /* A blocking read signals the writer once, as it ends; a blocking
            write the reader once before it waits and once as it ends. A
-           child moves the data after a while. */
+           child moves the data, after a while for the read. */
         if (pipe(p)) return 79;
         io_async(p[1], IO_RT);
         forked = child();
@@ -1960,19 +1967,23 @@ int main(int argc, char **argv) {
         waitpid(forked, &status, 0);
         printf("  read out=%d\n", io_count(POLL_OUT));
         close(p[0]); close(p[1]);
+        /* The write fills the pipe, waits, and ends, as the child reads
+           only a full pipe, whichever process runs first. */
         if (pipe(p)) return 79;
         io_async(p[0], IO_RT);
-        fcntl(p[1], F_SETFL, O_NONBLOCK);
-        while (write(p[1], chunk, sizeof chunk) > 0) {}
-        fcntl(p[1], F_SETFL, 0);
-        io_count(POLL_IN);
+        int size = fcntl(p[0], F_GETPIPE_SZ);
+        char *big = calloc(1, size + sizeof chunk);
+        if (size <= 0 || !big) return 75;
         forked = child();
         if (forked < 0) return 76;
         if (!forked) {
-            usleep(200000);
+            struct pollfd full = {p[1], POLLOUT, 0};
+            while (poll(&full, 1, 0) != 0)
+                if (full.revents != POLLOUT) _exit(2);
             _exit(read(p[0], chunk, sizeof chunk) == sizeof chunk ? 0 : 1);
         }
-        if (write(p[1], chunk, sizeof chunk) != sizeof chunk) return 78;
+        if (write(p[1], big, size + sizeof chunk) != size + (long)sizeof chunk) return 78;
+        free(big);
         waitpid(forked, &status, 0);
         printf("  write in=%d\n", io_count(POLL_IN));
         close(p[0]); close(p[1]);
@@ -2158,8 +2169,12 @@ int main(int argc, char **argv) {
                would wait for good. */
             for (int a = 0, tries = 0; a < (types[t] == SOCK_DGRAM ? 1 : 3); a++) {
                 /* The child keeps its end open until the signals are
-                   taken, so that only the close case hangs up. */
-                if (socketpair(AF_UNIX, types[t], 0, sv) || pipe(go)) return 74;
+                   taken, so that only the close case hangs up. A read
+                   ends as soon as the data comes, before the send has
+                   signalled, so the signals are taken only once the child
+                   has acted (`acted`, or its exit for a close). */
+                int acted[2];
+                if (socketpair(AF_UNIX, types[t], 0, sv) || pipe(go) || pipe(acted)) return 74;
                 setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof limit);
                 io_async(sv[1], IO_RT);
                 fflush(stdout);
@@ -2168,7 +2183,7 @@ int main(int argc, char **argv) {
                 if (!forked) {
                     io_pause();
                     int done = a == 0 ? send(sv[0], "a", 1, 0) != 1 : a == 1 ? shutdown(sv[0], SHUT_WR) : 0;
-                    if (a != 2 && read(go[0], buf, 1) != 1) _exit(2);
+                    if (a != 2 && (write(acted[1], "a", 1) != 1 || read(go[0], buf, 1) != 1)) _exit(2);
                     _exit(done);
                 }
                 if (a == 2) close(sv[0]);
@@ -2180,14 +2195,18 @@ int main(int argc, char **argv) {
                 long r = recv(sv[1], buf, sizeof buf, 0);
                 char name[32];
                 snprintf(name, sizeof name, "%s-%s=%ld", type_names[t], actions[a], r);
+                if (a == 2) waitpid(forked, &status, 0);
+                else if (read(acted[0], buf, 1) != 1) return 72;
                 if (early && ++tries < 10) io_count(0);
                 else io_taken(name);
                 close(sv[1]);
-                if (write(go[1], "g", 1) != 1) return 78;
-                waitpid(forked, &status, 0);
+                if (a != 2) {
+                    if (write(go[1], "g", 1) != 1) return 78;
+                    waitpid(forked, &status, 0);
+                }
                 if (status) return 73;
                 if (a != 2) close(sv[0]);
-                close(go[0]); close(go[1]);
+                close(go[0]); close(go[1]); close(acted[0]); close(acted[1]);
                 if (early && tries < 10) a--;
                 else tries = 0;
             }
@@ -2773,8 +2792,10 @@ int main(int argc, char **argv) {
             receive_waited("peek-all", sv[1], 8, MSG_PEEK | MSG_WAITALL);
             receive_waited("dontwait", sv[1], 1, MSG_DONTWAIT);
             /* The child sends after what this process sent. */
+            struct timespec forked;
+            clock_gettime(CLOCK_MONOTONIC, &forked);
             pid_t pid = send_later(sv[0], "cd", 1000);
-            receive_waited("recv", sv[1], 8, 0);
+            receive_waited_from("recv", sv[1], 8, 0, &forked);
             waitpid(pid, NULL, 0);
             receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
             /* A buffer smaller than the mark ends the read when full; were

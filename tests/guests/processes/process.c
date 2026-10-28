@@ -2813,7 +2813,11 @@ int main(int argc, char **argv) {
             printf("  outq ok=%d sent=%d\n", n, queued > 0);
             recv(sv[1], buf, 1, MSG_PEEK);
             ioctl_int("peeked", sv[1], SIOCINQ);
-            recv(sv[1], buf, 2, 0);
+            /* A stream reads its first write whole: what a part read
+               leaves of one depends on the kernel, as some count only the
+               rest and others the whole write. A message's part read drops
+               the rest. */
+            recv(sv[1], buf, kinds[k] == SOCK_STREAM ? 3 : 2, 0);
             ioctl_int("read", sv[1], SIOCINQ);
             while (recv(sv[1], buf, sizeof buf, MSG_DONTWAIT) > 0) {}
             ioctl_int("drained", sv[1], SIOCINQ);

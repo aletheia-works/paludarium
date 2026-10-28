@@ -1016,7 +1016,8 @@ fn read_blocking(
     file: &Arc<dyn FileHandle>,
     b: &mut [u8],
 ) -> Result<usize, Errno> {
-    // A socket's read waits as its SO_RCVLOWAT says.
+    // A socket's read waits as its SO_RCVLOWAT says. A pipe is a PipeEnd,
+    // not a SocketPairEnd, so it reads below and still signals its writer.
     if file
         .as_any()
         .is_some_and(|a| a.is::<crate::sockets::SocketPairEnd>())

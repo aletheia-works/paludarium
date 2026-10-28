@@ -122,6 +122,34 @@ fn take_owner(
 
 /// `fcntl`'s `F_SETOWN` (8), `F_GETOWN` (9), `F_SETSIG` (10), `F_GETSIG`
 /// (11), `F_SETOWN_EX` (15) and `F_GETOWN_EX` (16), for any file.
+/// Gives `file`, open as descriptor `fd`, the status `flags` of `F_SETFL`.
+/// Only pipes and sockets keep `O_ASYNC`, and changing it registers or
+/// drops the descriptor, as Linux's `fasync` does.
+pub(crate) fn set_flags(
+    c: &Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    fd: u64,
+    flags: u32,
+) -> Result<(), Errno> {
+    let endpoint = crate::sockets::endpoint(file);
+    let flags = if endpoint.is_some() {
+        flags
+    } else {
+        flags & !O_ASYNC
+    };
+    let before = file.flags();
+    file.set_flags(flags)?;
+    if let Some(endpoint) = endpoint
+        && (before ^ flags) & O_ASYNC != 0
+    {
+        endpoint.set_async((flags & O_ASYNC != 0).then(|| Registration {
+            processes: Arc::downgrade(c.processes),
+            fd: fd as i32,
+        }));
+    }
+    Ok(())
+}
+
 pub(crate) fn fcntl(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,

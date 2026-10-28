@@ -133,8 +133,6 @@ static pid_t send_later(int socket, const char *data, int ms) {
     }
     return pid;
 }
-/* setsockopt of the int SOL_SOCKET option `opt` to `value` with `size`
-   bytes, then what getsockopt reads back. */
 #ifndef SIOCINQ
 #define SIOCINQ FIONREAD
 #endif
@@ -148,6 +146,21 @@ static void ioctl_int(const char *name, int fd, unsigned long request) {
     int r = ioctl(fd, request, &value);
     printf("  %s=%d errno=%d value=%d\n", name, r, errno, value);
 }
+#ifndef FIOQSIZE
+#define FIOQSIZE 0x5460
+#endif
+/* generic-ioctl: the descriptor flag and the status flags of `fd` after
+   ioctl `request` with the int `value`. */
+static void ioctl_flags(const char *name, int fd, unsigned long request, int value) {
+    errno = 0;
+    int r = ioctl(fd, request, &value);
+    int e = errno;
+    printf("  %s=%d errno=%d cloexec=%d nonblock=%d async=%d\n", name, r, e,
+           fcntl(fd, F_GETFD) & FD_CLOEXEC, !!(fcntl(fd, F_GETFL) & O_NONBLOCK),
+           !!(fcntl(fd, F_GETFL) & O_ASYNC));
+}
+/* setsockopt of the int SOL_SOCKET option `opt` to `value` with `size`
+   bytes, then what getsockopt reads back. */
 static void int_option(const char *name, int fd, int opt, int value, socklen_t size) {
     errno = 0;
     long n = setsockopt(fd, SOL_SOCKET, opt, &value, size);
@@ -2868,6 +2881,78 @@ int main(int argc, char **argv) {
         f = eventfd(1, 0);
         ioctl_int("eventfd", f, FIONREAD);
         close(f);
+        return 0;
+    }
+    if (!strcmp(mode, "generic-ioctl")) {
+        /* The ioctls Linux's do_vfs_ioctl answers for every file: FIOCLEX
+           and FIONCLEX, FIONBIO, FIOASYNC, which a file without fasync
+           refuses with ENOTTY only for a change, and FIOQSIZE, the size of
+           a regular file or directory. An O_PATH descriptor answers none. */
+        int p[2], sv[2];
+        if (pipe(p) || socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return 79;
+        write(p[1], "abc", 3);
+        int m = memfd_create("generic-ioctl", 0);
+        if (m < 0) return 78;
+        write(m, "0123456789", 10);
+        int f = open("/tmp/paludarium-generic-ioctl", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (f < 0) return 77;
+        write(f, "abcdef", 6);
+        const struct {
+            const char *name;
+            int fd;
+        } files[] = {
+            {"pipe", p[0]},
+            {"socket", sv[0]},
+            {"memfd", m},
+            {"file", f},
+            {"null", open("/dev/null", O_RDWR)},
+            {"eventfd", eventfd(0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof files / sizeof *files; i++) {
+            int fd = files[i].fd;
+            printf("%s\n", files[i].name);
+            ioctl_flags("clex", fd, FIOCLEX, 0);
+            ioctl_flags("nclex", fd, FIONCLEX, 0);
+            ioctl_flags("nbio-on", fd, FIONBIO, 1);
+            ioctl_flags("nbio-off", fd, FIONBIO, 0);
+            ioctl_flags("async-off", fd, FIOASYNC, 0);
+            ioctl_flags("async-on", fd, FIOASYNC, 3);
+            ioctl_flags("async-again", fd, FIOASYNC, 1);
+            ioctl_flags("async-off", fd, FIOASYNC, 0);
+            errno = 0;
+            int n = ioctl(fd, FIOASYNC, (int *)8);
+            printf("  async-fault=%d errno=%d\n", n, errno);
+            /* What a file takes is its filesystem's: stat's st_blocks
+               counts it, though for a file some (overlayfs, ext4 with
+               delayed allocation) count blocks FIOQSIZE does not yet see,
+               so only a memfd's is compared. */
+            long long size = -7;
+            errno = 0;
+            n = ioctl(fd, FIOQSIZE, &size);
+            struct stat st;
+            fstat(fd, &st);
+            printf("  qsize=%d errno=%d", n, errno);
+            if (fd == m) printf(" blocks=%d", size == (long long)st.st_blocks * 512);
+            putchar('\n');
+        }
+        int d = open("/tmp", O_RDONLY | O_DIRECTORY);
+        errno = 0;
+        int n = ioctl(d, FIOQSIZE, &(long long){0});
+        printf("directory qsize=%d errno=%d\n", n, errno);
+        errno = 0;
+        n = ioctl(f, FIOQSIZE, (long long *)8);
+        printf("qsize-fault=%d errno=%d\n", n, errno);
+        int path = open("/tmp", O_PATH);
+        errno = 0;
+        n = ioctl(path, FIOCLEX);
+        printf("path clex=%d errno=%d\n", n, errno);
+        errno = 0;
+        n = ioctl(path, FIONREAD, &(int){0});
+        printf("path fionread=%d errno=%d\n", n, errno);
+        errno = 0;
+        n = ioctl(1000, FIOCLEX);
+        printf("bad clex=%d errno=%d\n", n, errno);
+        unlink("/tmp/paludarium-generic-ioctl");
         return 0;
     }
     if (!strcmp(mode, "socket-rcvlowat")) {

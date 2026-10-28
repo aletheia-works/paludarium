@@ -631,6 +631,63 @@ fn fionread_and_siocoutq_count_what_waits() {
         Errno::EFAULT.to_syscall_return()
     );
 }
+#[test]
+fn generic_ioctls_answer_for_every_file() {
+    let mut f = Fixture::new();
+    let fcntl = |f: &mut Fixture, fd: u64, command: u64| f.ret(72, [fd, command, 0, 0, 0, 0]);
+    let ioctl_int = |f: &mut Fixture, fd: u64, request: u64, value: i32| {
+        f.mem
+            .write(GuestAddr(DATA + 16), &value.to_le_bytes())
+            .unwrap();
+        f.ret(16, [fd, request, DATA + 16, 0, 0, 0])
+    };
+    assert_eq!(f.ret(293, [DATA, 0, 0, 0, 0, 0]), 0);
+    let mut bytes = [0; 4];
+    f.mem.read(GuestAddr(DATA), &mut bytes).unwrap();
+    let r = u64::from(u32::from_le_bytes(bytes));
+    // FIOCLEX and FIONCLEX set and clear FD_CLOEXEC.
+    assert_eq!(f.ret(16, [r, 0x5451, 0, 0, 0, 0]), 0);
+    assert_eq!(fcntl(&mut f, r, 1), 1);
+    assert_eq!(f.ret(16, [r, 0x5450, 0, 0, 0, 0]), 0);
+    assert_eq!(fcntl(&mut f, r, 1), 0);
+    // FIOASYNC turns O_ASYNC of a pipe on and off.
+    assert_eq!(ioctl_int(&mut f, r, 0x5452, 2), 0);
+    assert_eq!(fcntl(&mut f, r, 3) & 0o20000, 0o20000);
+    assert_eq!(ioctl_int(&mut f, r, 0x5452, 0), 0);
+    assert_eq!(fcntl(&mut f, r, 3) & 0o20000, 0);
+    assert_eq!(
+        f.ret(16, [r, 0x5452, 8, 0, 0, 0]),
+        Errno::EFAULT.to_syscall_return()
+    );
+    // A file without `fasync` refuses only a change.
+    let event = f.ret(290, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(ioctl_int(&mut f, event, 0x5452, 0), 0);
+    assert_eq!(
+        ioctl_int(&mut f, event, 0x5452, 1),
+        Errno::ENOTTY.to_syscall_return()
+    );
+    // FIOQSIZE gives the bytes a regular file takes, as a loff_t.
+    f.mem.write(GuestAddr(DATA + 32), b"q\0abcde").unwrap();
+    let memfd = f.ret(319, [DATA + 32, 0, 0, 0, 0, 0]);
+    assert_eq!(f.ret(1, [memfd, DATA + 34, 5, 0, 0, 0]), 5);
+    f.mem.write(GuestAddr(DATA + 16), &[0xff; 8]).unwrap();
+    assert_eq!(f.ret(16, [memfd, 0x5460, DATA + 16, 0, 0, 0]), 0);
+    let mut size = [0; 8];
+    f.mem.read(GuestAddr(DATA + 16), &mut size).unwrap();
+    assert_eq!(u64::from_le_bytes(size), 4096);
+    assert_eq!(
+        f.ret(16, [r, 0x5460, DATA + 16, 0, 0, 0]),
+        Errno::ENOTTY.to_syscall_return()
+    );
+    // An O_PATH descriptor answers none.
+    f.mem.write(GuestAddr(DATA + 48), b"/\0").unwrap();
+    let path = f.ret(257, [-100i64 as u64, DATA + 48, 0o10000000, 0, 0, 0]);
+    assert!((path as i64) >= 0, "{}", path as i64);
+    assert_eq!(
+        f.ret(16, [path, 0x5451, 0, 0, 0, 0]),
+        Errno::EBADF.to_syscall_return()
+    );
+}
 /// Writes a `msghdr` at `at`: name, iovecs `(base, len)` at `at + 0x40`,
 /// and control.
 fn message(f: &Fixture, at: u64, name: (u64, u32), iov: &[(u64, u64)], control: (u64, u64)) {

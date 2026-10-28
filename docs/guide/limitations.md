@@ -46,7 +46,8 @@ verified.
   (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
   gid 0.
 - **Signal-driven I/O**: `O_ASYNC` works on pipes and sockets only, so
-  standard input and terminals never send `SIGIO`, where Linux's do. A
+  standard input and terminals never send `SIGIO`, and `FIOASYNC` setting
+  it on them is `ENOTTY`, where Linux's do. A
   full datagram or packet socket that `epoll_wait` finds unwritable does not
   signal `POLL_OUT` once read, where Linux's does when it checks a socket
   on its ready list again (`poll`, `select` and `epoll_ctl` do as Linux).
@@ -61,7 +62,10 @@ verified.
   where Linux finds the holes. On Windows `st_blocks` is also the size
   rounded up to 512-byte blocks, where Linux counts what the host's
   filesystem allocated; other Unix hosts give their own. On Linux and macOS
-  hosts both come from the host.
+  hosts both come from the host. `FIOQSIZE` gives `st_blocks` in bytes on
+  every host, where Linux gives what the filesystem has allocated so far,
+  which some (ext4 with delayed allocation, overlayfs) count later than
+  `st_blocks`.
 - **Standard input on Windows**: `poll`, `select` and `epoll` see the host's
   standard input as always readable, as the Windows host cannot tell whether
   input is waiting; on Linux and macOS hosts and in WebAssembly it is

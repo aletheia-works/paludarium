@@ -213,6 +213,17 @@ impl Files {
         fds.insert(n, d);
         Ok(n)
     }
+    /// Sets or clears `FD_CLOEXEC` of descriptor `fd`, as `F_SETFD`, `FIOCLEX`
+    /// and `FIONCLEX` do.
+    pub(crate) fn set_cloexec(&self, fd: u64, cloexec: bool) -> Result<(), Errno> {
+        self.fds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&u32::try_from(fd).map_err(|_| Errno::EBADF)?)
+            .ok_or(Errno::EBADF)?
+            .cloexec = cloexec;
+        Ok(())
+    }
     pub(crate) fn descriptor(&self, fd: u64) -> Result<Descriptor, Errno> {
         self.fds
             .lock()
@@ -1182,7 +1193,7 @@ fn device(c: &Context<'_>, path: &[u8]) -> u64 {
     crate::page_cache::mount_device(&c.files.fs.mounts(), path)
 }
 /// `st_blocks`: what the file system counts, or the size in 512-byte blocks.
-fn blocks(s: &FileStat) -> u64 {
+pub(crate) fn blocks(s: &FileStat) -> u64 {
     s.blocks.unwrap_or(s.size.div_ceil(512))
 }
 fn encode_stat(s: FileStat) -> Result<[u8; 144], Errno> {
@@ -1566,15 +1577,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     c.files.allocate(d, from, limit).map(u64::from)
                 }
                 1 => Ok(u64::from(d.cloexec)),
-                2 => {
-                    d.cloexec = a[2] & 1 != 0;
-                    c.files
-                        .fds
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(a[0] as u32, d);
-                    Ok(0)
-                }
+                2 => c.files.set_cloexec(a[0], a[2] & 1 != 0).map(|()| 0),
                 3 => Ok(d.file.flags() as u64),
                 // F_ADD_SEALS and F_GET_SEALS, for memfds only.
                 1033 | 1034 => {
@@ -1613,29 +1616,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         Ok(pipe.size())
                     }
                 }
-                4 => {
-                    // Only pipes and sockets keep O_ASYNC, and setting it
-                    // registers the descriptor, as Linux's `fasync` does.
-                    let endpoint = crate::sockets::endpoint(&d.file);
-                    let async_flag = crate::fasync::O_ASYNC;
-                    let mut flags = a[2] as u32;
-                    if endpoint.is_none() {
-                        flags &= !async_flag;
-                    }
-                    let before = d.file.flags();
-                    d.file.set_flags(flags)?;
-                    if let Some(endpoint) = endpoint
-                        && (before ^ flags) & async_flag != 0
-                    {
-                        endpoint.set_async((flags & async_flag != 0).then(|| {
-                            crate::fasync::Registration {
-                                processes: Arc::downgrade(c.processes),
-                                fd: a[0] as i32,
-                            }
-                        }));
-                    }
-                    Ok(0)
-                }
+                4 => crate::fasync::set_flags(c, &d.file, a[0], a[2] as u32).map(|()| 0),
                 // The owner and signal of signal-driven I/O.
                 8..=11 | 15 | 16 => crate::fasync::fcntl(c, &d.file, a[1], a[2]),
                 _ => Err(Errno::EINVAL),

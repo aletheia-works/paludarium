@@ -62,6 +62,7 @@
     {"name":"socket-options","binary":"process"},
     {"name":"socket-credentials","binary":"process"},
     {"name":"fionread","binary":"process"},
+    {"name":"generic-ioctl","binary":"process"},
     {"name":"socket-rcvlowat","binary":"process"},
     {"name":"socket-peek-off","binary":"process"},
     {"name":"socket-parts","binary":"process"},

@@ -44,7 +44,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   要るオプション（`SO_DEBUG`、`SO_SNDBUFFORCE` など）も設定でき、`SO_PEERCRED` の
   uid と gid は 0 です。
 - **シグナル駆動の入出力**：`O_ASYNC` が効くのはパイプとソケットだけで、標準入力や端末は
-  `SIGIO` を送りません。Linux では送ります。いっぱいのデータグラムやパケットのソケットを
+  `SIGIO` を送らず、`FIOASYNC` で付けようとすると `ENOTTY` です。Linux では送ります。いっぱいのデータグラムやパケットのソケットを
   `epoll_wait` が書き込めないと見ても、そのあと読まれたときに `POLL_OUT` を送りません。
   Linux では、準備ができた一覧のソケットを見直したときに送ります（`poll`、`select`、
   `epoll_ctl` では Linux と同じに送ります）。
@@ -58,6 +58,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   見つけます。Windows では `st_blocks` も大きさを 512 バイトのブロックに切り上げた
   値で、Linux ではホストのファイルシステムが確保した分を数えます。ほかの Unix の
   ホストは自分の値を返します。Linux と macOS のホストでは、どちらもホストから得ます。
+  `FIOQSIZE` はどのホストでも `st_blocks` をバイトにした値です。Linux ではファイルシステムが
+  その時点で確保した分で、遅延割り当ての ext4 や overlayfs では `st_blocks` より遅れて
+  数えます。
 - **Windows の標準入力**：Windows のホストは入力が届いているかを見分けられないので、
   `poll`・`select`・`epoll` はホストの標準入力をいつも読めると見ます。Linux と macOS の
   ホストと WebAssembly では、入力があるときか終わったときだけ読めます。

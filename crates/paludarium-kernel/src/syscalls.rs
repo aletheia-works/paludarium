@@ -1653,23 +1653,66 @@ fn sys_rt_sigprocmask(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// Only known terminal queries are interpreted, never forwarded to Host.
 fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let run = || -> Result<u64, Errno> {
-        if a[1] == 0x5421 {
-            let descriptor = c.files.descriptor(a[0])?;
+        // Linux's `do_vfs_ioctl` answers these for every file, and an
+        // `O_PATH` descriptor for none.
+        let descriptor = c.files.descriptor(a[0])?;
+        if descriptor.file.flags() & O_PATH != 0 {
+            return Err(Errno::EBADF);
+        }
+        let file = descriptor.file;
+        let read_int = |c: &Context<'_>| {
             let mut bytes = [0; 4];
             c.mem
                 .read(GuestAddr(a[2]), &mut bytes)
-                .map_err(|_| Errno::EFAULT)?;
-            let enabled = i32::from_le_bytes(bytes) != 0;
-            let flags = (descriptor.file.flags() & !crate::events::NONBLOCK)
-                | if enabled { crate::events::NONBLOCK } else { 0 };
-            descriptor.file.set_flags(flags)?;
-            return Ok(0);
+                .map_err(|_| Errno::EFAULT)
+                .map(|()| i32::from_le_bytes(bytes))
+        };
+        match a[1] {
+            // FIONCLEX and FIOCLEX.
+            0x5450 | 0x5451 => {
+                c.files.set_cloexec(a[0], a[1] == 0x5451)?;
+                return Ok(0);
+            }
+            // FIONBIO.
+            0x5421 => {
+                let enabled = read_int(c)? != 0;
+                let flags = (file.flags() & !crate::events::NONBLOCK)
+                    | if enabled { crate::events::NONBLOCK } else { 0 };
+                file.set_flags(flags)?;
+                return Ok(0);
+            }
+            // FIOASYNC, ENOTTY for a file without `fasync` only if it would
+            // change `O_ASYNC`.
+            0x5452 => {
+                let async_flag = crate::fasync::O_ASYNC;
+                let flags =
+                    (file.flags() & !async_flag) | if read_int(c)? != 0 { async_flag } else { 0 };
+                if (flags ^ file.flags()) & async_flag != 0 {
+                    if crate::sockets::endpoint(&file).is_none() {
+                        return Err(Errno::ENOTTY);
+                    }
+                    crate::fasync::set_flags(c, &file, a[0], flags)?;
+                }
+                return Ok(0);
+            }
+            // FIOQSIZE: the bytes a regular file or directory takes, as a
+            // loff_t (Linux's `inode_get_bytes`, `st_blocks` in bytes).
+            0x5460 => {
+                let stat = file.stat()?;
+                if !matches!(stat.mode & 0o170000, 0o100000 | 0o040000) {
+                    return Err(Errno::ENOTTY);
+                }
+                let bytes = crate::files::blocks(&stat) * 512;
+                c.mem
+                    .write(GuestAddr(a[2]), &bytes.to_le_bytes())
+                    .map_err(|_| Errno::EFAULT)?;
+                return Ok(0);
+            }
+            _ => {}
         }
         // SIOCATMARK: whether a socket's next read is at its out-of-band mark.
         if a[1] == 0x8905 {
-            let descriptor = c.files.descriptor(a[0])?;
-            let socket = descriptor
-                .file
+            let socket = file
                 .as_any()
                 .and_then(|v| v.downcast_ref::<crate::sockets::SocketPairEnd>())
                 .ok_or(Errno::ENOTTY)?;
@@ -1683,7 +1726,6 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         // file, which Linux's `do_vfs_ioctl` answers with the size past the
         // offset, cut to an int. The host's standard streams are not read.
         if matches!(a[1], 0x541b | 0x5411) && c.files.stdio_channel(a[0])?.is_none() {
-            let file = c.files.descriptor(a[0])?.file;
             let count = match crate::sockets::queued(&file, a[1] == 0x5411) {
                 Some(count) => count? as i64,
                 None => match file.stat() {

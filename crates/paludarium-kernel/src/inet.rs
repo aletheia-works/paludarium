@@ -217,7 +217,21 @@ fn reachable(name: &str, ip: IpAddr) -> bool {
             if v6.is_loopback() {
                 return local;
             }
-            let first = v6.segments()[0];
+            let segments = v6.segments();
+            let first = segments[0];
+            // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) carry an IPv4
+            // address, which must be reachable itself.
+            let embedded = |high: u16, low: u16| {
+                let [a, b] = high.to_be_bytes();
+                let [c, d] = low.to_be_bytes();
+                IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+            };
+            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return reachable(name, embedded(segments[6], segments[7]));
+            }
+            if first == 0x2002 {
+                return reachable(name, embedded(segments[1], segments[2]));
+            }
             !(v6.is_unspecified()
                 || v6.is_multicast()
                 // Unique local (fc00::/7) and link-local (fe80::/10).
@@ -1531,6 +1545,11 @@ mod tests {
             ("evil.example.org", "fd00::1", false),
             ("evil.example.org", "fe80::1", false),
             ("evil.example.org", "::ffff:10.0.0.1", false),
+            ("evil.example.org", "64:ff9b::7f00:1", false),
+            ("evil.example.org", "64:ff9b::c0a8:101", false),
+            ("github.com", "64:ff9b::8c52:7003", true),
+            ("evil.example.org", "2002:a00:1::1", false),
+            ("github.com", "2002:8c52:7003::1", true),
             ("localhost", "127.0.0.1", true),
             ("localhost", "::1", true),
             ("app.localhost", "127.0.0.2", true),

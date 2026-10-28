@@ -522,7 +522,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
   minutes after it last gave it.
 - **Only global addresses for names**: the stub leaves out, and a name
   rule does not reach, the loopback, private (RFC 1918 and unique local),
-  link-local, shared (RFC 6598), multicast and reserved addresses, so that
+  link-local, shared (RFC 6598), multicast and reserved addresses (also as
+  the IPv4 address in a NAT64 or 6to4 one), so that
   a name whose DNS points there (DNS rebinding) cannot reach the host's own
   machine or networks; a name left with none of its addresses is
   `NXDOMAIN`. `localhost` and its subdomains may reach the loopback. To

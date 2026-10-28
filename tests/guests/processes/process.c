@@ -145,7 +145,8 @@ static void int_option(const char *name, int fd, int opt, int value, socklen_t s
     printf("  set %s %d=%ld errno=%d got=%d\n", name, value, n, e, got);
 }
 /* recvmsg of at most `len` bytes with `flags`: what came, msg_flags, the
-   socket's SO_PEEK_OFF after it, and whether it waited 200 ms or more. */
+   socket's SO_PEEK_OFF after it, and whether it waited 700 ms or more, which
+   a call that does not wait never takes, even on a slow emulated run. */
 static void receive_waited(const char *name, int fd, size_t len, int flags) {
     char data[16] = {0};
     struct iovec iov = {data, len};
@@ -161,7 +162,7 @@ static void receive_waited(const char *name, int fd, size_t len, int flags) {
     socklen_t size = sizeof offset;
     getsockopt(fd, SOL_SOCKET, SO_PEEK_OFF, &offset, &size);
     printf("  %s=%ld errno=%d data=%.*s flags=%#x off=%d waited=%d\n", name, n, e,
-           n > 0 ? (int)(n < (long)len ? n : (long)len) : 0, data, n < 0 ? 0 : message.msg_flags, offset, ms >= 200);
+           n > 0 ? (int)(n < (long)len ? n : (long)len) : 0, data, n < 0 ? 0 : message.msg_flags, offset, ms >= 700);
 }
 /* The child whose messages socket-credentials receives. */
 static pid_t credentials_child;
@@ -2534,7 +2535,7 @@ int main(int argc, char **argv) {
             int_option("rcvlowat", sv[1], SO_RCVLOWAT, -9, 4);
             int_option("rcvlowat", sv[1], SO_RCVLOWAT, 3, 2);
             int_option("rcvlowat", sv[1], SO_RCVLOWAT, 4, 4);
-            struct timeval tv = {2, 0};
+            struct timeval tv = {3, 0};
             setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
             send(sv[0], "ab", 2, 0);
             struct pollfd p = {sv[1], POLLIN, 0};
@@ -2544,27 +2545,26 @@ int main(int argc, char **argv) {
             receive_waited("peek-all", sv[1], 8, MSG_PEEK | MSG_WAITALL);
             receive_waited("dontwait", sv[1], 1, MSG_DONTWAIT);
             /* The child sends after what this process sent. */
-            pid_t pid = send_later(sv[0], "cd", 300);
+            pid_t pid = send_later(sv[0], "cd", 1000);
             receive_waited("recv", sv[1], 8, 0);
             waitpid(pid, NULL, 0);
             receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
             /* A buffer smaller than the mark ends the read when full. */
             send(sv[0], "ef", 2, 0);
-            pid = send_later(sv[0], "gh", 300);
+            pid = send_later(sv[0], "gh", 1000);
             receive_waited("small", sv[1], 2, 0);
             waitpid(pid, NULL, 0);
             receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
             /* read takes it too. */
             send(sv[0], "ij", 2, 0);
-            pid = send_later(sv[0], "kl", 300);
+            pid = send_later(sv[0], "kl", 1000);
             char buf[8] = {0};
             long n = read(sv[1], buf, sizeof buf);
             printf("  read=%ld data=%.*s\n", n, n > 0 ? (int)n : 0, buf);
             waitpid(pid, NULL, 0);
             receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
             /* A wait that times out returns what came. */
-            tv.tv_sec = 0;
-            tv.tv_usec = 300000;
+            tv.tv_sec = 1;
             setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
             send(sv[0], "mn", 2, 0);
             receive_waited("timeout", sv[1], 8, 0);

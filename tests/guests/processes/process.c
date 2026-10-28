@@ -2536,7 +2536,6 @@ int main(int argc, char **argv) {
             int_option("rcvlowat", sv[1], SO_RCVLOWAT, 4, 4);
             struct timeval tv = {2, 0};
             setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-            pid_t pid = send_later(sv[0], "cd", 300);
             send(sv[0], "ab", 2, 0);
             struct pollfd p = {sv[1], POLLIN, 0};
             int ready = poll(&p, 1, 0);
@@ -2544,18 +2543,20 @@ int main(int argc, char **argv) {
             receive_waited("peek", sv[1], 8, MSG_PEEK);
             receive_waited("peek-all", sv[1], 8, MSG_PEEK | MSG_WAITALL);
             receive_waited("dontwait", sv[1], 1, MSG_DONTWAIT);
+            /* The child sends after what this process sent. */
+            pid_t pid = send_later(sv[0], "cd", 300);
             receive_waited("recv", sv[1], 8, 0);
             waitpid(pid, NULL, 0);
             receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
             /* A buffer smaller than the mark ends the read when full. */
-            pid = send_later(sv[0], "gh", 300);
             send(sv[0], "ef", 2, 0);
+            pid = send_later(sv[0], "gh", 300);
             receive_waited("small", sv[1], 2, 0);
             waitpid(pid, NULL, 0);
             receive_waited("rest", sv[1], 8, MSG_DONTWAIT);
             /* read takes it too. */
-            pid = send_later(sv[0], "kl", 300);
             send(sv[0], "ij", 2, 0);
+            pid = send_later(sv[0], "kl", 300);
             char buf[8] = {0};
             long n = read(sv[1], buf, sizeof buf);
             printf("  read=%ld data=%.*s\n", n, n > 0 ? (int)n : 0, buf);

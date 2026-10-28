@@ -2759,12 +2759,16 @@ int main(int argc, char **argv) {
             send(sv[0], "a", 1, 0);
             sent = real_ns();
             receive_stamped("old", sv[1], 256, 0, sent, NULL);
-            /* Stamped as first read, by a peek, which the read keeps. */
+            /* Stamped as first read, by a peek, which the read keeps. The
+               sleeps part the times, which a test host's clock moves only
+               by. */
             int_option("off", sv[1], TS_OLD, 0, 4);
             send(sv[0], "b", 1, 0);
             sent = real_ns();
             int_option("ns-old", sv[1], TS_NS_OLD, 1, 4);
+            usleep(2000);
             receive_stamped("peek", sv[1], 256, MSG_PEEK, sent, &first);
+            usleep(2000);
             receive_stamped("read", sv[1], 256, 0, sent, &again);
             printf("  kept=%d\n", first == again);
             int_option("new", sv[1], TS_NEW, 1, 4);

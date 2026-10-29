@@ -924,6 +924,9 @@ int main(int argc, char **argv) {
         printf("  closed source=%#x port-ok=%d\n", ntohl(bn.sin_addr.s_addr), ntohs(bn.sin_port) != 0);
         call("send-closed", send(d, "x", 1, 0));
         ready("refused", d, POLLIN | POLLOUT);
+        /* A send too big fails before it would take the error. */
+        static char huge[65508];
+        call("send-too-big-refused", send(d, huge, sizeof huge, 0));
         call("send-refused", send(d, "x", 1, 0));
         call("send-again", send(d, "x", 1, 0));
         call("recv-refused", recv(d, buf, sizeof buf, MSG_DONTWAIT));

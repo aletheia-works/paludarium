@@ -1114,6 +1114,46 @@ fn a_long_tcp_answer_comes_whole_in_small_reads() {
     }
 }
 #[test]
+fn tcp_answers_past_the_stream_buffer_come_as_reads_free_it() {
+    let mut f = network_fixture(&["example.com"]);
+    let tcp = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 53], 53);
+    assert_eq!(f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    // Five queries whose answers of 4000 records, about 64 KiB each, pass
+    // the stream's 256 KiB: the rest waits until reads free room.
+    let mut framed = Vec::new();
+    for _ in 0..5 {
+        let len = dns_query(&f, DATA + 2, "example.com", 1);
+        let mut query = vec![0; len as usize];
+        f.mem.read(GuestAddr(DATA + 2), &mut query).unwrap();
+        framed.extend_from_slice(&(len as u16).to_be_bytes());
+        framed.extend_from_slice(&query);
+    }
+    f.mem.write(GuestAddr(DATA), &framed).unwrap();
+    assert_eq!(
+        f.ret(1, [tcp, DATA, framed.len() as u64, 0, 0, 0]),
+        framed.len() as u64
+    );
+    let many: Vec<core::net::IpAddr> = (0..4000u32)
+        .map(|i| core::net::IpAddr::V4(core::net::Ipv4Addr::from(0x0808_0000 + i)))
+        .collect();
+    f.host.lookups.lock().unwrap()[0].1.finish(Ok(many));
+    let full = crate::sockets::queued(&f.kernel.files.descriptor(tcp).unwrap().file, false);
+    assert_eq!(full, Some(Ok(paludarium_host::net::BUFFER)));
+    assert_eq!(f.ret(48, [tcp, 1, 0, 0, 0, 0]), 0);
+    let mut total = 0u64;
+    loop {
+        let n = f.ret(0, [tcp, DATA + 0x400, 4096, 0, 0, 0]);
+        assert!((n as i64) >= 0, "{}", n as i64);
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    // 2 + 12 + 17 + 4000 * 16 bytes each.
+    assert_eq!(total, 5 * (2 + 12 + 17 + 4000 * 16));
+}
+#[test]
 fn the_dns_stub_answers_allowed_names_from_the_host() {
     let mut f = network_fixture(&["example.com:443"]);
     let udp = f.ret(41, [2, 2 | 0x800, 0, 0, 0, 0]);

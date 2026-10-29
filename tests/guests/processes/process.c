@@ -276,6 +276,66 @@ static void print_id(const char *name, unsigned id, unsigned own) {
     else
         printf(" %s=%u", name, id);
 }
+#ifndef SO_PASSPIDFD
+#define SO_PASSPIDFD 76
+#endif
+#ifndef SO_PEERPIDFD
+#define SO_PEERPIDFD 77
+#endif
+#ifndef SCM_PIDFD
+#define SCM_PIDFD 4
+#endif
+/* socket-pidfd: the lowest descriptor number free now. */
+static int lowest_free(void) {
+    int fd = dup(0);
+    close(fd);
+    return fd;
+}
+/* socket-pidfd: what a pidfd is: close-on-exec, signalable, and whether
+   its process has exited (readable). The rest, as numbers or kinds. */
+static void pidfd_kind(int fd) {
+    struct pollfd p = {fd, POLLIN, 0};
+    printf(" cloexec=%d signal=%ld exited=%d", fcntl(fd, F_GETFD) & FD_CLOEXEC,
+           syscall(SYS_pidfd_send_signal, fd, 0, NULL, 0), poll(&p, 1, 0) == 1);
+}
+/* socket-pidfd: receives one byte with a control buffer of `room` bytes
+   (none for 0) and prints its control messages in order: SCM_PIDFD's with
+   what the pidfd is (pidfd_kind), or the negative errno it carries. The
+   pidfds are closed after. */
+static void pidfd_received(const char *name, int fd, size_t room) {
+    char data[8];
+    union { struct cmsghdr align; char bytes[256]; } control;
+    struct iovec iov = {data, sizeof data};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = room ? control.bytes : NULL,
+                       .msg_controllen = room};
+    int before = lowest_free();
+    errno = 0;
+    long n = recvmsg(fd, &m, MSG_DONTWAIT);
+    printf("  %s=%ld errno=%d flags=%#x:", name, n, n < 0 ? errno : 0, (unsigned)m.msg_flags);
+    int opened[8], count = 0;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+        if (c->cmsg_type == SCM_PIDFD && c->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            int pidfd;
+            memcpy(&pidfd, CMSG_DATA(c), sizeof pidfd);
+            printf(" [pidfd");
+            if (pidfd >= 0) {
+                pidfd_kind(pidfd);
+                if (count < 8) opened[count++] = pidfd;
+            } else {
+                printf(" error=%d", pidfd);
+            }
+            printf("]");
+        } else {
+            printf(" [%s len=%u]", c->cmsg_type == SCM_CREDENTIALS ? "credentials" : c->cmsg_type == SCM_RIGHTS ? "rights" : "other",
+                   (unsigned)c->cmsg_len);
+            if (c->cmsg_type == SCM_RIGHTS && count < 8) memcpy(&opened[count++], CMSG_DATA(c), sizeof(int));
+        }
+    }
+    /* A pidfd whose message did not fit is still installed. */
+    printf(" installed=%d\n", lowest_free() != before);
+    for (int i = 0; i < count; i++) close(opened[i]);
+    if (lowest_free() != before) close(before);
+}
 /* sendmsg of `data` with one SCM_CREDENTIALS message of `pid`, `uid` and
    `gid`, whose cmsg_len is `cmsg_len`. */
 static long send_credentials(int socket, const char *data, pid_t pid, uid_t uid, gid_t gid, size_t cmsg_len) {
@@ -2697,6 +2757,123 @@ int main(int argc, char **argv) {
         close(sv[1]);
 #undef OPT_GET
 #undef OPT_SET
+        return 0;
+    }
+    if (!strcmp(mode, "socket-pidfd")) {
+        /* SO_PASSPIDFD, SCM_PIDFD and SO_PEERPIDFD on socket pairs, as
+           Linux's af_unix and scm_pidfd_recv: a message to an end that
+           passes pidfds carries a close-on-exec pidfd of its sender, after
+           its credentials and before its descriptors. */
+        int types[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        const char *names[] = {"stream", "dgram", "seqpacket"};
+        int sv[2], on = 1, value = -7;
+        socklen_t len = sizeof value;
+        for (int t = 0; t < 3; t++) {
+            if (socketpair(AF_UNIX, types[t], 0, sv)) return 74;
+            printf("%s\n", names[t]);
+            getsockopt(sv[1], SOL_SOCKET, SO_PASSPIDFD, &value, &len);
+            printf("  passpidfd=%d", value);
+            setsockopt(sv[1], SOL_SOCKET, SO_PASSPIDFD, &on, sizeof on);
+            len = sizeof value;
+            getsockopt(sv[1], SOL_SOCKET, SO_PASSPIDFD, &value, &len);
+            printf(" then=%d\n", value);
+            send(sv[0], "a", 1, 0);
+            pidfd_received("self", sv[1], 256);
+            send(sv[0], "b", 1, 0);
+            pidfd_received("no-control", sv[1], 0);
+            send(sv[0], "c", 1, 0);
+            pidfd_received("header-only", sv[1], CMSG_LEN(0));
+            send(sv[0], "x", 1, 0);
+            pidfd_received("exact", sv[1], CMSG_LEN(sizeof(int)));
+            send(sv[0], "y", 1, 0);
+            pidfd_received("one-short", sv[1], CMSG_LEN(sizeof(int)) - 1);
+            /* With credentials and a descriptor: credentials, pidfd, rights. */
+            setsockopt(sv[1], SOL_SOCKET, SO_PASSCRED, &on, sizeof on);
+            {
+                union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } out;
+                struct iovec iov = {"d", 1};
+                struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = out.bytes,
+                                   .msg_controllen = sizeof out.bytes};
+                struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+                c->cmsg_level = SOL_SOCKET;
+                c->cmsg_type = SCM_RIGHTS;
+                c->cmsg_len = CMSG_LEN(sizeof(int));
+                int passed = 0;
+                memcpy(CMSG_DATA(c), &passed, sizeof passed);
+                sendmsg(sv[0], &m, 0);
+            }
+            pidfd_received("all", sv[1], 256);
+            close(sv[0]); close(sv[1]);
+        }
+        /* A message sent before the receiver passed pidfds carries none. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        send(sv[0], "e", 1, 0);
+        setsockopt(sv[1], SOL_SOCKET, SO_PASSPIDFD, &on, sizeof on);
+        pidfd_received("sent-before", sv[1], 256);
+        close(sv[0]); close(sv[1]);
+        /* A child's message carries the child's pidfd, which its exit
+           makes readable. */
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+        setsockopt(sv[1], SOL_SOCKET, SO_PASSPIDFD, &on, sizeof on);
+        int go[2];
+        if (pipe(go)) return 79;
+        fflush(stdout);
+        pid_t forked = child();
+        if (forked < 0) return 76;
+        if (!forked) {
+            char b;
+            send(sv[0], "f", 1, 0);
+            _exit(read(go[0], &b, 1) == 1 ? 0 : 2);
+        }
+        {
+            struct pollfd ready = {sv[1], POLLIN, 0};
+            poll(&ready, 1, 5000);
+            char data[8];
+            union { struct cmsghdr align; char bytes[64]; } control;
+            struct iovec iov = {data, sizeof data};
+            struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control.bytes,
+                               .msg_controllen = sizeof control.bytes};
+            int pidfd = -1;
+            if (recvmsg(sv[1], &m, 0) == 1 && CMSG_FIRSTHDR(&m) && CMSG_FIRSTHDR(&m)->cmsg_type == SCM_PIDFD)
+                memcpy(&pidfd, CMSG_DATA(CMSG_FIRSTHDR(&m)), sizeof pidfd);
+            printf("child pidfd=%d:", pidfd >= 0);
+            if (pidfd >= 0) pidfd_kind(pidfd);
+            if (write(go[1], "g", 1) != 1) return 78;
+            int status;
+            siginfo_t info;
+            info.si_pid = 0;
+            waitid(P_PIDFD, pidfd, &info, WEXITED | WNOWAIT);
+            printf(" waited-child=%d", info.si_pid == forked);
+            if (pidfd >= 0) pidfd_kind(pidfd);
+            putchar('\n');
+            waitpid(forked, &status, 0);
+            close(pidfd);
+        }
+        close(go[0]); close(go[1]); close(sv[0]); close(sv[1]);
+        /* SO_PEERPIDFD: a pidfd of the process that made the pair. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        int peer = -7;
+        len = sizeof peer;
+        errno = 0;
+        int r = getsockopt(sv[0], SOL_SOCKET, SO_PEERPIDFD, &peer, &len);
+        printf("peerpidfd=%d errno=%d len=%u valid=%d:", r, errno, (unsigned)len, peer >= 0);
+        if (peer >= 0) pidfd_kind(peer);
+        putchar('\n');
+        close(peer);
+        /* A short buffer takes part of the number; the pidfd is still
+           installed. */
+        char small = 0;
+        len = 1;
+        int before = lowest_free();
+        errno = 0;
+        r = getsockopt(sv[0], SOL_SOCKET, SO_PEERPIDFD, &small, &len);
+        int installed = lowest_free() != before;
+        printf("peerpidfd-short=%d errno=%d len=%u installed=%d\n", r, errno, (unsigned)len, installed);
+        if (installed) close(before);
+        errno = 0;
+        r = setsockopt(sv[0], SOL_SOCKET, SO_PEERPIDFD, &on, sizeof on);
+        printf("set-peerpidfd=%d errno=%d\n", r, errno);
+        close(sv[0]); close(sv[1]);
         return 0;
     }
     if (!strcmp(mode, "socket-credentials")) {

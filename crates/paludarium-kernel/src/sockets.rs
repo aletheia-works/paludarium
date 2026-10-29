@@ -823,11 +823,13 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         flags |= MSG_TRUNC;
     }
     let credentials = socket.passes_credentials().then_some(received.credentials);
+    let pidfd = socket.passes_pidfd().then_some(received.credentials.pid);
     let (used, cut) = deliver(
         c,
         &header,
         received,
         credentials,
+        pidfd,
         a[2] & MSG_CMSG_CLOEXEC != 0,
     );
     if cut {
@@ -961,21 +963,26 @@ fn receive_with(
 /// `__scm_recv_common`: with no control buffer, only `MSG_CTRUNC` tells of
 /// them. Otherwise a message's timestamp, as `__sock_recv_timestamp` puts
 /// it before them, goes first, then `credentials`, when the socket passes
-/// them ([`put_control`]), then the descriptors ([`put_descriptors`]).
-/// Returns the control bytes used and whether anything was lost
-/// (`MSG_CTRUNC`).
+/// them ([`put_control`]), then the descriptors ([`put_descriptors`]),
+/// then, when the socket passes pidfds, a pidfd of the sender process
+/// `pidfd` ([`put_pidfd`]). Returns the control bytes used and whether
+/// anything was lost (`MSG_CTRUNC`).
 fn deliver(
     c: &mut Context<'_>,
     header: &MessageHeader,
     received: Received,
     credentials: Option<Credentials>,
+    pidfd: Option<u32>,
     cloexec: bool,
 ) -> (u64, bool) {
     let passed = received.passed;
     if header.control == 0 {
         return (
             0,
-            received.timestamp.is_some() || credentials.is_some() || !passed.is_empty(),
+            received.timestamp.is_some()
+                || credentials.is_some()
+                || pidfd.is_some()
+                || !passed.is_empty(),
         );
     }
     let mut room = (header.control, header.control_len);
@@ -996,7 +1003,31 @@ fn deliver(
     if !passed.is_empty() {
         cut |= put_descriptors(c, &mut room, passed, cloexec);
     }
+    if let Some(pid) = pidfd {
+        cut |= put_pidfd(c, &mut room, pid);
+    }
     (header.control_len - room.1, cut)
+}
+/// Writes the `SCM_PIDFD` message of a message from process `pid`, as
+/// Linux's `scm_pidfd_recv`: none for a message that carried no sender (one
+/// sent while neither end passed credentials). Only when the whole message
+/// fits is the close-on-exec pidfd installed; else nothing is, and the
+/// message is lost (`MSG_CTRUNC`). A sender gone carries its error,
+/// negative, in place of a number. Returns whether it was lost.
+fn put_pidfd(c: &mut Context<'_>, room: &mut (u64, u64), pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if room.1 < (CMSG_HEADER + 4) as u64 {
+        return true;
+    }
+    let number = match crate::processes::PidFd::of(c.processes, pid)
+        .and_then(|pidfd| c.files.install(pidfd, true, c.group.nofile()))
+    {
+        Ok(fd) => fd as i32,
+        Err(e) => -e.0,
+    };
+    put_control(c, room, SCM_PIDFD, &number.to_le_bytes())
 }
 /// Writes a `SOL_SOCKET` control message of `kind` holding `data` at the
 /// start of `room` (the address and length of what is left of the control
@@ -1082,6 +1113,10 @@ const SO_BSDCOMPAT: u32 = 14;
 const SO_REUSEPORT: u32 = 15;
 const SO_PASSCRED: u32 = 16;
 const SO_PEERCRED: u32 = 17;
+const SO_PASSPIDFD: u32 = 76;
+const SO_PEERPIDFD: u32 = 77;
+/// The control message of a pidfd of a message's sender.
+const SCM_PIDFD: u32 = 4;
 const SO_RCVLOWAT: u32 = 18;
 const SO_SNDLOWAT: u32 = 19;
 const SO_RCVTIMEO: u32 = 20;
@@ -1310,6 +1345,10 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         socket.lock_sides()[socket.side].pass_credentials = on;
         return Ok(0);
     }
+    if name == SO_PASSPIDFD {
+        socket.lock_sides()[socket.side].pass_pidfd = on;
+        return Ok(0);
+    }
     if name == SO_PEEK_OFF {
         socket.lock_sides()[socket.side].peek_offset = value;
         return Ok(0);
@@ -1423,6 +1462,15 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .into())
         }
         SO_PASSCRED => int(socket.passes_credentials().into()),
+        SO_PASSPIDFD => int(socket.lock_sides()[socket.side].pass_pidfd.into()),
+        // A new pidfd of the process that made the pair, installed even
+        // when `len` holds only part of its number.
+        SO_PEERPIDFD => {
+            let creator = socket.pair.creator.load(Ordering::SeqCst);
+            let pidfd = crate::processes::PidFd::of(c.processes, creator)?;
+            let fd = c.files.install(pidfd, true, c.group.nofile())?;
+            int(fd as i32)
+        }
         SO_DONTROUTE => int(options.dont_route.into()),
         SO_BROADCAST => int(options.broadcast.into()),
         SO_SNDBUF => int(options.send_buffer),
@@ -1584,6 +1632,11 @@ impl Received {
         }
     }
 }
+/// Whether a side takes credentials, as Linux's `unix_may_passcred`:
+/// `SO_PASSCRED` or `SO_PASSPIDFD`.
+fn passes(side: &Side) -> bool {
+    side.pass_credentials || side.pass_pidfd
+}
 #[derive(Default)]
 struct Side {
     bytes: VecDeque<u8>,
@@ -1614,6 +1667,9 @@ struct Side {
     /// `SO_PASSCRED`: what this end receives carries credentials, and so
     /// does what it sends.
     pass_credentials: bool,
+    /// `SO_PASSPIDFD`: what this end receives comes with a pidfd of its
+    /// sender (`SCM_PIDFD`), and carries credentials as with `SO_PASSCRED`.
+    pass_pidfd: bool,
     /// `SO_PEEK_OFF`: where a peek starts, moved on by each peek and back
     /// by each read, as Linux's `sk_peek_off`; a negative value is none.
     peek_offset: i32,
@@ -1719,6 +1775,10 @@ impl SocketPairEnd {
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// `SO_PASSPIDFD` on this end.
+    fn passes_pidfd(&self) -> bool {
+        self.lock_sides()[self.side].pass_pidfd
     }
     /// `SO_PASSCRED` on this end.
     fn passes_credentials(&self) -> bool {
@@ -2163,7 +2223,7 @@ impl SocketPairEnd {
         if own.read_shutdown {
             return Ok(Received::default());
         }
-        let glue = own.pass_credentials;
+        let glue = passes(own);
         // Past what the call read, the mark ends it.
         let mark = |write: &Write| write.piece != Piece::Data;
         if after.is_some() && own.writes.front().is_some_and(mark) {
@@ -2544,8 +2604,7 @@ impl SocketPairEnd {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         // As Linux's unix_maybe_add_creds, as the write is sent.
-        let credentials =
-            sender.credentials(sides[0].pass_credentials || sides[1].pass_credentials);
+        let credentials = sender.credentials(passes(&sides[0]) || passes(&sides[1]));
         if self.pair.kind == SOCK_DGRAM {
             // unix_dgram_sendmsg's order: the size, this side's shutdown and
             // send buffer, then the peer.
@@ -2686,8 +2745,7 @@ impl SocketPairEnd {
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let credentials =
-            sender.credentials(sides[0].pass_credentials || sides[1].pass_credentials);
+        let credentials = sender.credentials(passes(&sides[0]) || passes(&sides[1]));
         if sides[self.side].write_shutdown
             || sides[1 - self.side].closed
             || sides[1 - self.side].read_shutdown

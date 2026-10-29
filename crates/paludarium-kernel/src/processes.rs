@@ -999,6 +999,19 @@ pub(crate) struct PidFd {
     processes: Arc<Processes>,
     flags: AtomicU32,
 }
+impl PidFd {
+    /// A close-on-exec pidfd of process `pid` (ESRCH when it is gone), as
+    /// the kernel's `pidfd_prepare` makes for `SCM_PIDFD` and
+    /// `SO_PEERPIDFD`.
+    pub(crate) fn of(processes: &Arc<Processes>, pid: u32) -> Result<Arc<Self>, Errno> {
+        processes.pidfd_target(pid)?;
+        Ok(Arc::new(Self {
+            pid,
+            processes: Arc::clone(processes),
+            flags: AtomicU32::new(2),
+        }))
+    }
+}
 impl paludarium_host::FileHandle for PidFd {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)

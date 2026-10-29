@@ -85,8 +85,9 @@ program that does not fit at all fails with
 names it may resolve: `"github.com:443"`, `"*.github.com"` (every subdomain),
 `"127.0.0.1"` (every port) or `"[::1]:8080"`. The launcher's coordinator
 opens a Node.js `net.Socket` for each connection the guest makes and resolves
-names with Node's `dns.lookup`, so the guest's own resolver works; any other
-destination is `ENETUNREACH` to the guest, and any other name `NXDOMAIN`
+names with Node's `dns.lookup`, so the guest's own resolver works (port 53,
+over UDP or TCP, is the DNS stub); any other destination is `ENETUNREACH` to
+the guest, and any other name `NXDOMAIN`
 ([Network](./features#network)). An entry the launcher cannot read is
 `invalid-program`. In a browser `network` is `unimplemented`.
 

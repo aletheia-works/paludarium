@@ -463,7 +463,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `EISCONN` です。失敗した接続はその誤りを返し、`SO_ERROR` が取ったあとは
     `ECONNABORTED` です。IPv6 のソケットは、IPv4 のアドレスに `::ffff:a.b.c.d` として
     届きます。
-  - **方針が許さない行き先**は `ENETUNREACH` です。
+  - **方針が許さない行き先**は `ENETUNREACH` です。ただし 53 番ポートは DNS の代わりに
+    届きます（下を参照）。
   - **データ**：`read`、`write`、`send`／`recv`、`sendto`／`recvfrom`、
     `sendmsg`／`recvmsg` を、`MSG_PEEK`、`MSG_WAITALL`、`MSG_DONTWAIT`、
     `MSG_NOSIGNAL` とともに使えます。書き込みはすべて送るまで続きます。相手が

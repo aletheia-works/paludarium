@@ -83,7 +83,8 @@ OOM killer と同じように `SIGKILL` で終わります。収まらない `ex
 `"github.com:443"`、`"*.github.com"`（サブドメインすべて）、`"127.0.0.1"`（すべての
 ポート）、`"[::1]:8080"` のように書きます。ランチャーのコーディネーターが、ゲストの
 接続ごとに Node.js の `net.Socket` を開き、名前は Node の `dns.lookup` で引くので、
-ゲスト自身のリゾルバがそのまま動きます。ほかの行き先はゲストには `ENETUNREACH`、
+ゲスト自身のリゾルバがそのまま動きます（53 番ポートは、UDP でも TCP でも DNS の代わりに
+届きます）。ほかの行き先はゲストには `ENETUNREACH`、
 ほかの名前は `NXDOMAIN` です（[ネットワーク](./features#network)）。ランチャーが
 読めない項目は `invalid-program` です。ブラウザでは `network` は `unimplemented`
 です。

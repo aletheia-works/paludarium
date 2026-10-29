@@ -500,7 +500,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     then `EISCONN`; a failed one gives its error, or `ECONNABORTED` once
     `SO_ERROR` took it. An IPv6 socket reaches IPv4 addresses as
     `::ffff:a.b.c.d`.
-  - **A destination the policy does not allow** is `ENETUNREACH`.
+  - **A destination the policy does not allow** is `ENETUNREACH`, except
+    port 53, which is the DNS stub (see below).
   - **Data**: `read`, `write`, `send`/`recv`, `sendto`/`recvfrom` and
     `sendmsg`/`recvmsg`, with `MSG_PEEK`, `MSG_WAITALL`, `MSG_DONTWAIT` and
     `MSG_NOSIGNAL`. A write goes on until all is sent. A connection the peer

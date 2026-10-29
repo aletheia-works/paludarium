@@ -2,10 +2,11 @@
 //!
 //! A TCP socket connects through the host ([`paludarium_host::net`]) to the
 //! destinations [`NetworkPolicy`] allows, and behaves as Linux's TCP does
-//! for a client. A UDP socket only talks to the built-in DNS stub: a query
-//! sent to port 53, at any address, is answered from the host's resolver
-//! for an allowed name and with `NXDOMAIN` for any other, so the guest's
-//! own resolver (`/etc/resolv.conf`, or its default) works unchanged.
+//! for a client. Port 53, at any address, is the built-in DNS stub instead,
+//! over UDP (the only destination a UDP socket has) and over TCP: a query is
+//! answered from the host's resolver for an allowed name and with
+//! `NXDOMAIN` for any other, so the guest's own resolver
+//! (`/etc/resolv.conf`, or its default) works unchanged.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::sockets::Timeout;
@@ -1667,11 +1668,15 @@ impl DnsOverTcp {
             s.outgoing.extend((answer.len() as u16).to_be_bytes());
             s.outgoing.extend(answer);
         }
-        let (front, _) = s.outgoing.as_slices();
-        let front = front.to_vec();
-        if !front.is_empty() {
-            let given = stream.receive(&front);
+        // As much as the stream takes; a read that frees a full stream
+        // kicks for the rest.
+        while !s.outgoing.is_empty() {
+            let chunk = s.outgoing.make_contiguous().to_vec();
+            let given = stream.receive(&chunk);
             s.outgoing.drain(..given);
+            if given < chunk.len() {
+                break;
+            }
         }
         if s.queries.is_empty() && s.outgoing.is_empty() && stream.finished().0 && !s.ended {
             s.ended = true;

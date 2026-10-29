@@ -907,8 +907,8 @@ fn send_bytes(
 /// `sock_rcvlowat` sets its target; or until the stream ends or reaches its
 /// out-of-band mark, descriptors come, the time is up or a signal arrives
 /// after some data, which it then returns, or, with `SO_PASSCRED` or
-/// `SO_PASSPIDFD`, data of other credentials comes. `MSG_OOB` takes a stream's out-of-band byte, and
-/// never waits. Other flags have no effect.
+/// `SO_PASSPIDFD`, data of other credentials comes. `MSG_OOB` takes a
+/// stream's out-of-band byte, and never waits. Other flags have no effect.
 fn receive_with(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,

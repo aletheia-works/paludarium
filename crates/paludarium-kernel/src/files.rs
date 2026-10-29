@@ -1145,7 +1145,7 @@ fn encode_statx(s: FileStat, device: u64) -> Result<[u8; 256], Errno> {
     let (seconds, nanos) = linux_mtime(s.mtime_ns)?;
     let mut b = [0; 256];
     b[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
-    b[4..8].copy_from_slice(&4096u32.to_le_bytes());
+    b[4..8].copy_from_slice(&BLOCK_SIZE.to_le_bytes());
     b[16..20].copy_from_slice(&u32::try_from(s.links).unwrap_or(u32::MAX).to_le_bytes());
     b[20..24].copy_from_slice(&s.uid.to_le_bytes());
     b[24..28].copy_from_slice(&s.gid.to_le_bytes());
@@ -1195,6 +1195,9 @@ pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
 fn device(c: &Context<'_>, path: &[u8]) -> u64 {
     crate::page_cache::mount_device(&c.files.fs.mounts(), path)
 }
+/// The block size of every file system the guest sees: `st_blksize`,
+/// `stx_blksize` and `FIGETBSZ`, which Linux all take from the superblock.
+pub(crate) const BLOCK_SIZE: u32 = 4096;
 /// `st_blocks`: what the file system counts, or the size in 512-byte blocks.
 pub(crate) fn blocks(s: &FileStat) -> u64 {
     s.blocks.unwrap_or(s.size.div_ceil(512))
@@ -1209,7 +1212,7 @@ fn encode_stat(s: FileStat) -> Result<[u8; 144], Errno> {
     b[32..36].copy_from_slice(&s.gid.to_le_bytes());
     b[40..48].copy_from_slice(&s.rdev.to_le_bytes());
     b[48..56].copy_from_slice(&s.size.to_le_bytes());
-    b[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    b[56..64].copy_from_slice(&u64::from(BLOCK_SIZE).to_le_bytes());
     b[64..72].copy_from_slice(&blocks(&s).to_le_bytes());
     b[88..96].copy_from_slice(&seconds.to_le_bytes());
     b[96..104].copy_from_slice(&nanos.to_le_bytes());

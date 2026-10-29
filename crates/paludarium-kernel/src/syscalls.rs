@@ -1697,6 +1697,13 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 }
                 return Ok(0);
             }
+            // FIGETBSZ: the block size of the file's file system, as an int.
+            0x2 => {
+                c.mem
+                    .write(GuestAddr(a[2]), &crate::files::BLOCK_SIZE.to_le_bytes())
+                    .map_err(|_| Errno::EFAULT)?;
+                return Ok(0);
+            }
             // FIOQSIZE: the bytes a regular file or directory takes, as a
             // loff_t (Linux's `inode_get_bytes`, `st_blocks` in bytes).
             0x5460 => {

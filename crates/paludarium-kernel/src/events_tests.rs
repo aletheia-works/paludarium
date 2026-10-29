@@ -701,12 +701,27 @@ fn generic_ioctls_answer_for_every_file() {
         f.ret(16, [r, 0x5460, DATA + 16, 0, 0, 0]),
         Errno::ENOTTY.to_syscall_return()
     );
+    // FIGETBSZ gives the block size stat gives, of any file, as an int.
+    for fd in [r, event, memfd] {
+        f.mem.write(GuestAddr(DATA + 16), &[0xff; 8]).unwrap();
+        assert_eq!(f.ret(16, [fd, 0x2, DATA + 16, 0, 0, 0]), 0);
+        f.mem.read(GuestAddr(DATA + 16), &mut size).unwrap();
+        assert_eq!(u64::from_le_bytes(size), 0xffff_ffff_0000_1000);
+    }
+    assert_eq!(
+        f.ret(16, [r, 0x2, 8, 0, 0, 0]),
+        Errno::EFAULT.to_syscall_return()
+    );
     // An O_PATH descriptor answers none.
     f.mem.write(GuestAddr(DATA + 48), b"/\0").unwrap();
     let path = f.ret(257, [-100i64 as u64, DATA + 48, 0o10000000, 0, 0, 0]);
     assert!((path as i64) >= 0, "{}", path as i64);
     assert_eq!(
         f.ret(16, [path, 0x5451, 0, 0, 0, 0]),
+        Errno::EBADF.to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(16, [path, 0x2, DATA + 16, 0, 0, 0]),
         Errno::EBADF.to_syscall_return()
     );
 }

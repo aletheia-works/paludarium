@@ -84,6 +84,11 @@ verified.
   every host, where Linux gives what the filesystem has allocated so far,
   which some (ext4 with delayed allocation, overlayfs) count later than
   `st_blocks`.
+- **Block size**: `st_blksize`, `stx_blksize` and `FIGETBSZ` are 4096 for
+  every file, where Linux gives the block size of the file's filesystem:
+  1024 for `/proc` and terminals (devpts), and the host filesystem's for a
+  mounted directory (4096 for most). Pipes, sockets, `memfd` and other
+  in-memory files are 4096 on Linux too.
 - **Standard input on Windows**: `poll`, `select` and `epoll` see the host's
   standard input as always readable, as the Windows host cannot tell whether
   input is waiting; on Linux and macOS hosts and in WebAssembly it is

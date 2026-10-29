@@ -146,6 +146,9 @@ static void ioctl_int(const char *name, int fd, unsigned long request) {
     int r = ioctl(fd, request, &value);
     printf("  %s=%d errno=%d value=%d\n", name, r, errno, value);
 }
+#ifndef FIGETBSZ
+#define FIGETBSZ _IO(0x00, 2)
+#endif
 #ifndef FIOQSIZE
 #define FIOQSIZE 0x5460
 #endif
@@ -3101,8 +3104,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generic-ioctl")) {
         /* The ioctls Linux's do_vfs_ioctl answers for every file: FIOCLEX
            and FIONCLEX, FIONBIO, FIOASYNC, which a file without fasync
-           refuses with ENOTTY only for a change, and FIOQSIZE, the size of
-           a regular file or directory. An O_PATH descriptor answers none. */
+           refuses with ENOTTY only for a change, FIOQSIZE, the size of a
+           regular file or directory, and FIGETBSZ, the block size of the
+           file's filesystem. An O_PATH descriptor answers none. */
         int p[2], sv[2];
         if (pipe(p) || socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return 79;
         write(p[1], "abc", 3);
@@ -3149,6 +3153,14 @@ int main(int argc, char **argv) {
             printf("  qsize=%d errno=%d", n, errno);
             if (fd == m) printf(" blocks=%d", size == (long long)st.st_blocks * 512);
             putchar('\n');
+            /* The pseudo filesystems' block size is the page's; a file's and
+               /dev/null's are their filesystem's, which st_blksize gives. */
+            int block = -7;
+            errno = 0;
+            n = ioctl(fd, FIGETBSZ, &block);
+            printf("  bsize=%d errno=%d stat=%d", n, errno, block == (int)st.st_blksize);
+            if (strcmp(files[i].name, "file") && strcmp(files[i].name, "null")) printf(" block=%d", block);
+            putchar('\n');
         }
         int d = open("/tmp", O_RDONLY | O_DIRECTORY);
         errno = 0;
@@ -3157,6 +3169,12 @@ int main(int argc, char **argv) {
         errno = 0;
         n = ioctl(f, FIOQSIZE, (long long *)8);
         printf("qsize-fault=%d errno=%d\n", n, errno);
+        errno = 0;
+        n = ioctl(d, FIGETBSZ, &(int){0});
+        printf("directory bsize=%d errno=%d\n", n, errno);
+        errno = 0;
+        n = ioctl(f, FIGETBSZ, (int *)8);
+        printf("bsize-fault=%d errno=%d\n", n, errno);
         int path = open("/tmp", O_PATH);
         errno = 0;
         n = ioctl(path, FIOCLEX);
@@ -3164,6 +3182,9 @@ int main(int argc, char **argv) {
         errno = 0;
         n = ioctl(path, FIONREAD, &(int){0});
         printf("path fionread=%d errno=%d\n", n, errno);
+        errno = 0;
+        n = ioctl(path, FIGETBSZ, &(int){0});
+        printf("path bsize=%d errno=%d\n", n, errno);
         errno = 0;
         n = ioctl(1000, FIOCLEX);
         printf("bad clex=%d errno=%d\n", n, errno);

@@ -112,12 +112,12 @@ failed jobs of a run keeps the earlier attempt's artifacts, so a job run
 again leaves one artifact of the same name per attempt; the newest one (by
 `created_at`, which must be unique) is that job's latest attempt and is the
 one checked. `wasm-node` holds the performance measurement and must stay
-single: a re-run of its job measures the same binary again and is refused. The four Wasm
-environments must report one module and one oracle digest (the exact bytes of
-`wasm-acceptance-inputs`), and the measurement must name the same module,
-oracle and probe. `artifact_sha256` of each condition is the SHA-256 of the
-sorted `[source, artifact, artifact id, official digest]` list it was checked
-against; the document also keeps every member's SHA-256.
+single: a re-run of its job measures the same binary again and is refused.
+The four Wasm environments must report one module and one oracle digest (the
+exact bytes of `wasm-acceptance-inputs`), and the measurement must name the
+same module, oracle and probe. `artifact_sha256` of each condition is the
+SHA-256 of the sorted `[source, artifact, artifact id, official digest]` list
+it was checked against; the document also keeps every member's SHA-256.
 
 `release-evidence.json` records the four conditions as `probe`, `aube`,
 `wasm-modes` and `performance`.

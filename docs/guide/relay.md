@@ -68,7 +68,9 @@ the options.
   List an address itself (`127.0.0.1:8080`) to reach one.
 - **The origin check** is for browsers: it keeps other sites' pages from
   using the relay. It does not stop other clients, which can send any
-  `Origin`; the allow list does.
+  `Origin`; the allow list does. A handshake without an `Origin` is
+  refused too, so leave `--origin` out for a relay that clients outside a
+  browser use (the coordinator on Node.js sends none).
 - **Limits.** The allow list bounds where the relay connects, and
   `--max-connections` how many connections it carries at once. It has no
   rate limit for each client: put one in front of a public relay if it

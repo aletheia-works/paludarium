@@ -162,6 +162,8 @@ class Peer {
     if (this.buffer.length) this.receive(Buffer.alloc(0));
   }
   receive(chunk) {
+    // After a framing error nothing more of the client's is read: not even its close frame, which cannot be found.
+    if (this.garbled) return;
     this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : chunk;
     while (!this.socket.destroyed) {
       const bytes = this.buffer;
@@ -287,6 +289,7 @@ class Peer {
    * and not yet read, as the last messages before the close.
    */
   close(code) {
+    if (code === 1002 || code === 1009) { this.garbled = true; this.buffer = Buffer.alloc(0); }
     if (this.closed) return;
     const payload = Buffer.alloc(2); payload.writeUInt16BE(code);
     this.send(8, payload);

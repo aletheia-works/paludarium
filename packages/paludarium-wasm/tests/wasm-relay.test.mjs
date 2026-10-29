@@ -4,7 +4,7 @@
 // and window are checked with a WebSocket of its own.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:net";
+import { connect, createServer } from "node:net";
 import { request } from "node:http";
 import { createPaludarium } from "../index.mjs";
 import { PROTOCOL, WINDOW, canonicalIp } from "../relay-protocol.mjs";
@@ -212,6 +212,21 @@ test("the relay refuses connections beyond its cap", async (t) => {
   const first = await client(url);
   await assert.rejects(client(url));
   first.ws.close();
+  assert.deepEqual(await first.next(), { closed: 1000 });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  // One that the relay closed still counts while its client has not answered the close frame.
+  const { port } = new URL(url), raw = connect(Number(port), "127.0.0.1");
+  t.after(() => raw.destroy());
+  const switched = new Promise(resolve => raw.once("data", resolve));
+  raw.write("GET / HTTP/1.1\r\nHost: relay\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+  assert.match(String(await switched), /^HTTP\/1.1 101/);
+  const closed = new Promise(resolve => raw.once("data", resolve));
+  raw.write(Uint8Array.of(0x81, 0x00)); // unmasked: a protocol error
+  assert.deepEqual([...(await closed).subarray(0, 4)], [0x88, 2, 0x03, 0xea]);
+  await assert.rejects(client(url));
+  raw.destroy();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  (await client(url)).ws.close();
 });
 
 test("the relay picks a subprotocol the client offered, and checks the origin", async (t) => {

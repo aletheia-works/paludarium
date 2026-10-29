@@ -154,7 +154,10 @@ class Peer {
     socket.setNoDelay(true);
     socket.on("data", chunk => this.receive(chunk));
     socket.on("error", () => this.gone());
-    socket.on("close", () => this.gone());
+    // A WebSocket counts toward maxConnections until its socket closes, the 5 seconds after a close frame too.
+    socket.on("close", () => { peers.delete(this); this.gone(); });
+    // An HTTP server's sockets are half-open: a client that ended gets the relay's end too.
+    socket.on("end", () => socket.end());
     this.timer = setTimeout(() => this.close(1008), REQUEST_TIMEOUT);
     if (this.buffer.length) this.receive(Buffer.alloc(0));
   }
@@ -292,7 +295,7 @@ class Peer {
   }
   /** Ends the connection's TCP stream to the peer after what the client sent, and forgets the client. */
   gone() {
-    this.closed = true; clearTimeout(this.timer); clearTimeout(this.lingering); this.peers.delete(this);
+    this.closed = true; clearTimeout(this.timer); clearTimeout(this.lingering);
     const tcp = this.tcp;
     if (tcp && !tcp.destroyed) { tcp.end(); tcp.resume(); setTimeout(() => tcp.destroy(), 30_000).unref(); }
   }

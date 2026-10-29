@@ -2256,10 +2256,10 @@ int main(int argc, char **argv) {
            gets none for the data that ends the wait (Linux's
            SOCKWQ_ASYNC_WAITDATA), and at most one POLL_IN for the peer's
            shutdown and one POLL_HUP for its close (io_at_most_one), where
-           a datagram or packet socket still signals. A send that found the buffer full signals POLL_OUT only
-           once three quarters of it is free. A pipe write signals its
-           reader before each wait. A reader's child acts after a while
-           (io_pause). */
+           a datagram or packet socket still signals. A send that found
+           the buffer full signals POLL_OUT only once three quarters of it
+           is free. A pipe write signals its reader before each wait. A
+           reader's child acts after a while (io_pause). */
         sigset_t set;
         sigemptyset(&set);
         sigaddset(&set, SIGIO);

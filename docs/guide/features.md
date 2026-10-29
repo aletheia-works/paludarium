@@ -197,8 +197,8 @@ kernel.
     data, end or hang-up that ends the wait, as Linux holds it back; of a
     send in parts, only the first. For the peer's shutdown or close Linux
     holds it back only when the reader has not run yet (it wakes the
-    reader before it looks), so there it sometimes signals. A datagram or packet socket's
-    reader gets it.
+    reader before it looks), so there it sometimes signals. A datagram or
+    packet socket's reader gets it.
 - `setsockopt` and `getsockopt` take the `SOL_SOCKET` options as Linux's
   `sk_setsockopt` and `sk_getsockopt` do, with their defaults and checks: an
   `int` value of fewer than 4 bytes is `EINVAL`, a value read back is cut to

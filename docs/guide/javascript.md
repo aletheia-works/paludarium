@@ -87,8 +87,10 @@ names it may resolve: `"github.com:443"`, `"*.github.com"` (every subdomain),
 opens a Node.js `net.Socket` for each connection the guest makes and resolves
 names with Node's `dns.lookup`, so the guest's own resolver works (port 53,
 over UDP or TCP, is the DNS stub); any other destination is `ENETUNREACH` to
-the guest, and any other name `NXDOMAIN`
-([Network](./features#network)). An entry the launcher cannot read is
+the guest, and any other name `NXDOMAIN`. A loopback address where one of
+the guest's own sockets listens is reached in the kernel, and one where none
+does is refused (`ECONNREFUSED`)
+([Loopback servers](./features#loopback-servers)). An entry the launcher cannot read is
 `invalid-program`.
 
 A browser cannot connect or resolve itself, so there `network.relay` names a

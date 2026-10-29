@@ -85,7 +85,9 @@ OOM killer と同じように `SIGKILL` で終わります。収まらない `ex
 接続ごとに Node.js の `net.Socket` を開き、名前は Node の `dns.lookup` で引くので、
 ゲスト自身のリゾルバがそのまま動きます（53 番ポートは、UDP でも TCP でも DNS の代わりに
 届きます）。ほかの行き先はゲストには `ENETUNREACH`、
-ほかの名前は `NXDOMAIN` です（[ネットワーク](./features#network)）。ランチャーが
+ほかの名前は `NXDOMAIN` です。ゲスト自身のソケットが待ち受けているループバックの
+アドレスにはカーネルの中で届き、待ち受けていなければ拒まれます（`ECONNREFUSED`。
+[ループバックのサーバー](./features#loopback-servers)）。ランチャーが
 読めない項目は `invalid-program` です。
 
 ブラウザは自分で接続も名前解決もできないので、ブラウザでは `network.relay` に、

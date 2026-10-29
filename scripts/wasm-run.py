@@ -65,6 +65,7 @@ def main():
                     "crates/paludarium-wasm/src/abi.rs",
                     "packages/paludarium-wasm/index.mjs",
                     "packages/paludarium-wasm/coordinator.mjs",
+                    "packages/paludarium-wasm/relay-protocol.mjs",
                     "packages/paludarium-wasm/execution.mjs",
                     "packages/paludarium-wasm/worker-support.mjs",
                 )

@@ -18,6 +18,7 @@ mod events;
 mod fasync;
 mod files;
 mod inet;
+mod loopback;
 pub use inet::{InvalidRule, NetworkPolicy};
 mod futex;
 mod memfd;

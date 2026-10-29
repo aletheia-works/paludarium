@@ -54,7 +54,7 @@ try {
   const wrong = long.stdout.findIndex((byte, index) => byte !== ((index * 7) & 255));
   cases.long = long.status.code === 0 && long.stdout.length === length && wrong < 0;
   details.long = { status: long.status, length: long.stdout.length, wrong };
-  cases.refused = (await run(tcp('ehello'), { allow: [\`127.0.0.1:\${port + 1}\`], relay })).status.code === 101;
+  cases.refused = (await run(tcp('ehello'), { allow: [\`127.0.0.1:\${port + 1}\`], relay })).status.code === 111;
   const ask = async name => {
     const bytes = data(53), question = query(name);
     new DataView(bytes.buffer).setUint32(0x38, question.length, true);

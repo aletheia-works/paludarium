@@ -42,7 +42,7 @@ kernel.
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
-| Sockets | `socket` (`AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind` (port 0), `listen`, `accept` and `accept4` (refused: no server side), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (TCP, on the guest's own [loopback](#loopback-servers); UDP binds port 0 only), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -505,7 +505,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
 (`github.com:443`).
 
 - **TCP client sockets**: `socket(AF_INET` or `AF_INET6, SOCK_STREAM)`,
-  with `SOCK_NONBLOCK` and `SOCK_CLOEXEC`, connects through the host.
+  with `SOCK_NONBLOCK` and `SOCK_CLOEXEC`, connects through the host, or to
+  a [server of the guest's own](#loopback-servers) on its loopback.
   - **`connect`**: a blocking one waits for the connection; a nonblocking one
     returns `EINPROGRESS`, the socket then becomes writable, and `SO_ERROR`
     gives the result once. A second call is `EALREADY`, 0 once connected,
@@ -513,7 +514,9 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_ERROR` took it. An IPv6 socket reaches IPv4 addresses as
     `::ffff:a.b.c.d`.
   - **A destination the policy does not allow** is `ENETUNREACH`, except
-    port 53, which is the DNS stub (see below).
+    port 53, which is the DNS stub (see below), and a loopback address
+    where no guest socket listens, which is refused (`ECONNREFUSED`, or
+    `EINPROGRESS` and then `SO_ERROR` for a nonblocking socket).
   - **Data**: `read`, `write`, `send`/`recv`, `sendto`/`recvfrom` and
     `sendmsg`/`recvmsg`, with `MSG_PEEK`, `MSG_WAITALL`, `MSG_DONTWAIT` and
     `MSG_NOSIGNAL`. A write goes on until all is sent. A connection the peer
@@ -526,7 +529,7 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `POLLRDHUP`), `POLLOUT` while the send buffer has room, `POLLHUP` once
     both directions are shut, and `POLLERR` while an error waits.
   - **`shutdown`**, `getsockname` (the host's address and port once
-    connected), `getpeername`, `bind` to port 0, `FIONREAD`/`SIOCINQ` and
+    connected), `getpeername`, `bind`, `FIONREAD`/`SIOCINQ` and
     `SIOCOUTQ`.
   - **Options**: `SO_TYPE`, `SO_DOMAIN`, `SO_PROTOCOL`, `SO_ERROR`,
     `SO_ACCEPTCONN`, `SO_KEEPALIVE`, `SO_REUSEADDR`, `SO_REUSEPORT`,
@@ -554,6 +557,45 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
   machine or networks; a name left with none of its addresses is
   `NXDOMAIN`. `localhost` and its subdomains may reach the loopback. To
   reach another such address, allow the address itself (`127.0.0.1:8080`).
+
+### Loopback servers {#loopback-servers}
+
+A TCP socket binds, listens and accepts on the guest's own loopback as on
+Linux. A connection from a guest socket to a loopback address where one
+listens reaches it in the kernel, whatever the policy says, and never leaves
+the guest: neither the host nor another machine reaches a guest's listener.
+Where none listens, an allowed address goes to the host as before, and any
+other is refused. Any network has its loopback, even one that allows nothing
+(`allow: []` in JavaScript, `NetworkPolicy::new()` in Rust); the command makes
+one only with an `--allow-net`.
+
+- **`bind`** takes a loopback address (`127.0.0.0/8`, `::1`, or IPv4
+  ones IPv4-mapped on an IPv6 socket) or the unspecified one, with a port
+  or, for port 0, an ephemeral one from 32768–60999, with Linux's checks in
+  its order: `EADDRNOTAVAIL` for another address, `EINVAL` once bound,
+  `EADDRINUSE` for a port another socket holds on an address both cover (a
+  listener's, a connection it accepted, a client's), unless both set
+  `SO_REUSEADDR` and the other does not listen, or both set
+  `SO_REUSEPORT`. An IPv6 socket on `::` holds the port for IPv4 too,
+  unless `IPV6_V6ONLY`.
+- **`listen`** keeps up to `backlog` + 1 connections waiting (at most
+  4096, `net.core.somaxconn`); an unbound socket takes an ephemeral port on
+  every address. A listener is readable while a connection waits (for
+  `poll`, `select`, `epoll`, and `POLL_IN` with `O_ASYNC`), shows
+  `SO_ACCEPTCONN`, is `EINVAL` to `FIONREAD`, `EISCONN` to `connect`, and
+  stops listening on `shutdown(SHUT_RD)` or an `AF_UNSPEC` `connect`.
+- **`connect`** to a listener returns once its queue has the connection,
+  before any `accept`; a nonblocking one is `EINPROGRESS`, as on Linux.
+  One that finds the queue full waits until `accept` makes room.
+- **`accept`** and **`accept4`** (`SOCK_NONBLOCK`, `SOCK_CLOEXEC`) give
+  the first connection waiting and its peer's address; they wait unless
+  the listener is nonblocking, until `SO_RCVTIMEO` (`EAGAIN`). The
+  accepted socket takes the listener's options.
+- **Resets**, as on Linux: closing a socket with unread input or a zero
+  `SO_LINGER` time, disconnecting with `AF_UNSPEC`, or closing a listener
+  with connections it has not handed out resets the peer (`ECONNRESET`
+  after the bytes it holds); bytes sent to a peer that has closed are
+  answered with a reset, so the next send is `EPIPE`.
 
 ## Threads and processes
 

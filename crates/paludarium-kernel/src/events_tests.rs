@@ -788,7 +788,9 @@ fn a_tcp_socket_connects_through_the_host() {
         f.ret(44, [fd, DATA, 1, 0x4000, 0, 0]),
         Errno::EPIPE.to_syscall_return()
     );
-    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 81);
+    // An address the policy does not name; on the loopback, a port no guest
+    // socket listens on is refused instead (see `loopback_*`).
+    inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 81);
     assert_eq!(
         f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
         Errno(101).to_syscall_return()
@@ -874,6 +876,286 @@ fn a_tcp_socket_connects_through_the_host() {
     );
     assert_eq!(f.ret(3, [fd, 0, 0, 0, 0, 0]), 0);
     assert_eq!(stream.finished(), (true, true));
+}
+/// The 16 bytes of `getsockname` (51) or `getpeername` (52) of `fd`.
+fn name_of(f: &mut Fixture, call: u64, fd: u64) -> [u8; 16] {
+    f.mem
+        .write(GuestAddr(DATA + 0x80), &16u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(call, [fd, DATA + 0x84, DATA + 0x80, 0, 0, 0]), 0);
+    let mut name = [0; 16];
+    f.mem.read(GuestAddr(DATA + 0x84), &mut name).unwrap();
+    name
+}
+/// A TCP socket listening on 127.0.0.1 with `backlog`, and its port.
+fn loopback_listener(f: &mut Fixture, backlog: u64) -> (u64, u16) {
+    let fd = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    inet_address(f, DATA + 0x100, [127, 0, 0, 1], 0);
+    assert_eq!(f.ret(49, [fd, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [fd, backlog, 0, 0, 0, 0]), 0);
+    let name = name_of(f, 51, fd);
+    (fd, u16::from_be_bytes([name[2], name[3]]))
+}
+/// A TCP socket connected to `port` on 127.0.0.1, blocking.
+fn loopback_client(f: &mut Fixture, port: u16) -> u64 {
+    let fd = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    inet_address(f, DATA + 0x100, [127, 0, 0, 1], port);
+    assert_eq!(f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]), 0);
+    fd
+}
+fn readable(f: &mut Fixture, fd: u64) -> u32 {
+    paludarium_host::FileHandle::readiness(&*f.kernel.files.descriptor(fd).unwrap().file)
+        .unwrap()
+        .0
+}
+#[test]
+fn loopback_servers_listen_and_accept() {
+    // No policy entry: the guest's own loopback needs none.
+    let mut f = network_fixture(&[]);
+    let (listener, port) = loopback_listener(&mut f, 8);
+    assert!(port >= 32768);
+    assert_eq!(int_option(&mut f, listener, 1, 30), (0, 1));
+    assert_eq!(readable(&mut f, listener), 0);
+    // Nothing waits: a nonblocking listener's accept is EAGAIN (accept4's
+    // SOCK_NONBLOCK is the new socket's).
+    assert_eq!(f.ret(72, [listener, 4, 0x800, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(288, [listener, 0, 0, 0x800, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    let client = loopback_client(&mut f, port);
+    assert_eq!(readable(&mut f, listener), 1);
+    f.mem
+        .write(GuestAddr(DATA + 0x40), &16u32.to_le_bytes())
+        .unwrap();
+    let server = f.ret(288, [listener, DATA + 0x44, DATA + 0x40, 0x80000, 0, 0]);
+    assert!((server as i64) >= 0, "{}", server as i64);
+    let mut peer = [0; 16];
+    f.mem.read(GuestAddr(DATA + 0x44), &mut peer).unwrap();
+    assert_eq!(peer, name_of(&mut f, 51, client));
+    assert_eq!(name_of(&mut f, 52, server), peer);
+    assert_eq!(name_of(&mut f, 51, server), name_of(&mut f, 52, client));
+    assert_eq!(
+        &name_of(&mut f, 51, server)[..8],
+        &[2, 0, (port >> 8) as u8, port as u8, 127, 0, 0, 1]
+    );
+    assert_eq!(int_option(&mut f, server, 1, 30), (0, 0));
+    assert_eq!(readable(&mut f, listener), 0);
+    // Bytes both ways, and the end.
+    f.mem.write(GuestAddr(DATA), b"ping").unwrap();
+    assert_eq!(f.ret(1, [client, DATA, 4, 0, 0, 0]), 4);
+    assert_eq!(f.ret(0, [server, DATA + 8, 16, 0, 0, 0]), 4);
+    let mut got = [0; 4];
+    f.mem.read(GuestAddr(DATA + 8), &mut got).unwrap();
+    assert_eq!(&got, b"ping");
+    assert_eq!(f.ret(1, [server, DATA, 2, 0, 0, 0]), 2);
+    assert_eq!(f.ret(0, [client, DATA + 8, 16, 0, 0, 0]), 2);
+    assert_eq!(f.ret(48, [client, 1, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(0, [server, DATA + 8, 16, 0, 0, 0]), 0);
+    assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(0, [client, DATA + 8, 16, 0, 0, 0]), 0);
+    // Listener calls that do not apply.
+    assert_eq!(
+        f.ret(42, [listener, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(106).to_syscall_return()
+    );
+    assert_eq!(
+        crate::sockets::queued(&f.kernel.files.descriptor(listener).unwrap().file, false),
+        Some(Err(Errno::EINVAL))
+    );
+    assert_eq!(
+        f.ret(288, [listener, 0, 0, 1, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    // SHUT_RD stops it: accept is EINVAL, a connection refused.
+    assert_eq!(f.ret(48, [listener, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(43, [listener, 0, 0, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    let late = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], port);
+    assert_eq!(
+        f.ret(42, [late, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(111).to_syscall_return()
+    );
+}
+#[test]
+fn loopback_binds_check_as_linux() {
+    let mut f = network_fixture(&[]);
+    let (listener, port) = loopback_listener(&mut f, 1);
+    let tcp = |f: &mut Fixture| f.ret(41, [2, 1, 0, 0, 0, 0]);
+    let bind = |f: &mut Fixture, fd: u64, ip: [u8; 4], port: u16| {
+        inet_address(f, DATA + 0x100, ip, port);
+        f.ret(49, [fd, DATA + 0x100, 16, 0, 0, 0])
+    };
+    // Bound already, not the guest's address, in use, too short.
+    assert_eq!(
+        bind(&mut f, listener, [127, 0, 0, 1], 0),
+        Errno::EINVAL.to_syscall_return()
+    );
+    let other = tcp(&mut f);
+    assert_eq!(
+        bind(&mut f, other, [192, 0, 2, 1], 0),
+        Errno(99).to_syscall_return()
+    );
+    assert_eq!(
+        bind(&mut f, other, [127, 0, 0, 1], port),
+        Errno(98).to_syscall_return()
+    );
+    assert_eq!(
+        bind(&mut f, other, [0, 0, 0, 0], port),
+        Errno(98).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(49, [other, DATA + 0x100, 8, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    // SO_REUSEADDR does not share a listener's port...
+    f.mem
+        .write(GuestAddr(DATA + 0x300), &1i32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(54, [other, 1, 2, DATA + 0x300, 4, 0]), 0);
+    assert_eq!(
+        bind(&mut f, other, [127, 0, 0, 1], port),
+        Errno(98).to_syscall_return()
+    );
+    // ...but one of two sockets that do not listen.
+    let a = tcp(&mut f);
+    assert_eq!(f.ret(54, [a, 1, 2, DATA + 0x300, 4, 0]), 0);
+    assert_eq!(bind(&mut f, a, [127, 0, 0, 2], 4000), 0);
+    assert_eq!(bind(&mut f, other, [127, 0, 0, 2], 4000), 0);
+    assert_eq!(f.ret(50, [a, 1, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(50, [other, 1, 0, 0, 0, 0]),
+        Errno(98).to_syscall_return()
+    );
+    // Another address on the same port is free; a closed socket's port too.
+    let b = tcp(&mut f);
+    assert_eq!(bind(&mut f, b, [127, 0, 0, 3], 4000), 0);
+    assert_eq!(f.ret(3, [b, 0, 0, 0, 0, 0]), 0);
+    let c = tcp(&mut f);
+    assert_eq!(bind(&mut f, c, [127, 0, 0, 3], 4000), 0);
+    // UDP still binds only port 0, and does not listen or accept.
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    assert_eq!(
+        bind(&mut f, udp, [127, 0, 0, 1], 5000),
+        Errno(13).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(50, [udp, 1, 0, 0, 0, 0]),
+        Errno(95).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(43, [udp, 0, 0, 0, 0, 0]),
+        Errno(95).to_syscall_return()
+    );
+    // A socket never listening does not accept.
+    assert_eq!(
+        f.ret(43, [c, 0, 0, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    // listen binds an unbound socket to every address.
+    let d = tcp(&mut f);
+    assert_eq!(f.ret(50, [d, 1, 0, 0, 0, 0]), 0);
+    let name = name_of(&mut f, 51, d);
+    assert_eq!(&name[4..8], &[0, 0, 0, 0]);
+    assert!(u16::from_be_bytes([name[2], name[3]]) >= 32768);
+}
+#[test]
+fn loopback_connections_in_progress_and_refused() {
+    let mut f = network_fixture(&[]);
+    let (listener, port) = loopback_listener(&mut f, 0);
+    // A nonblocking connect is in progress even when taken at once.
+    let quick = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], port);
+    assert_eq!(
+        f.ret(42, [quick, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    assert_eq!(readable(&mut f, quick) & 4, 4);
+    assert_eq!(int_option(&mut f, quick, 1, 4), (0, 0));
+    assert_eq!(f.ret(42, [quick, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(42, [quick, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(106).to_syscall_return()
+    );
+    // The queue (backlog 0) is full: the next one waits for room.
+    let waiting = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(42, [waiting, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    assert_eq!(readable(&mut f, waiting), 0);
+    assert_eq!(
+        f.ret(42, [waiting, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(114).to_syscall_return()
+    );
+    let first = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    assert!((first as i64) >= 0);
+    assert_eq!(f.ret(42, [waiting, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(readable(&mut f, listener), 1);
+    // A port no guest socket listens on: a reset.
+    let nobody = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 9);
+    assert_eq!(
+        f.ret(42, [nobody, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    assert_eq!(readable(&mut f, nobody) & 8, 8);
+    assert_eq!(int_option(&mut f, nobody, 1, 4), (0, 111));
+    let blocking = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(42, [blocking, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(111).to_syscall_return()
+    );
+}
+#[test]
+fn loopback_closes_reset_what_is_left() {
+    let mut f = network_fixture(&[]);
+    let (listener, port) = loopback_listener(&mut f, 8);
+    // Closed with unread input: the peer reads what it had, then the reset.
+    let client = loopback_client(&mut f, port);
+    let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    f.mem.write(GuestAddr(DATA), b"abc").unwrap();
+    assert_eq!(f.ret(1, [server, DATA, 3, 0, 0, 0]), 3);
+    assert_eq!(f.ret(1, [client, DATA, 3, 0, 0, 0]), 3);
+    assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(0, [client, DATA + 8, 16, 0, 0, 0]), 3);
+    assert_eq!(
+        f.ret(0, [client, DATA + 8, 16, 0, 0, 0]),
+        Errno(104).to_syscall_return()
+    );
+    assert_eq!(f.ret(0, [client, DATA + 8, 16, 0, 0, 0]), 0);
+    // Closed cleanly: the peer's end, then a write answered with a reset.
+    let client = loopback_client(&mut f, port);
+    let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(0, [client, DATA + 8, 16, 0, 0, 0]), 0);
+    assert_eq!(f.ret(44, [client, DATA, 3, 0x4000, 0, 0]), 3);
+    assert_eq!(
+        f.ret(44, [client, DATA, 3, 0x4000, 0, 0]),
+        Errno::EPIPE.to_syscall_return()
+    );
+    // A listener that closes resets what it had not handed out.
+    let _kept_client = loopback_client(&mut f, port);
+    let kept = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    let queued = loopback_client(&mut f, port);
+    assert_eq!(f.ret(3, [listener, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(0, [queued, DATA + 8, 16, 0, 0, 0]),
+        Errno(104).to_syscall_return()
+    );
+    // The port is held while a connection it accepted lives.
+    let again = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], port);
+    assert_eq!(
+        f.ret(49, [again, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(98).to_syscall_return()
+    );
+    assert_eq!(f.ret(3, [kept, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(49, [again, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
 }
 #[test]
 fn a_failed_connection_reports_its_error_once() {

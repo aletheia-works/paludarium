@@ -36,7 +36,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socket`（[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`（ポート 0）、`listen`、`accept`、`accept4`（サーバー側はないので断ります）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（TCP はゲスト自身の[ループバック](#loopback-servers)の上で。UDP の `bind` はポート 0 だけ）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -469,7 +469,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 すべてのポートを許します。
 
 - **TCP のクライアントのソケット**：`socket(AF_INET` または `AF_INET6, SOCK_STREAM)`
-  （`SOCK_NONBLOCK`、`SOCK_CLOEXEC` も付けられます）は、ホストを通して接続します。
+  （`SOCK_NONBLOCK`、`SOCK_CLOEXEC` も付けられます）は、ホストを通して接続するか、
+  ループバックの上の[ゲスト自身のサーバー](#loopback-servers)に接続します。
   - **`connect`**：ブロッキングなら接続を待ちます。ノンブロッキングなら
     `EINPROGRESS` を返し、そのあとソケットが書き込めるようになり、`SO_ERROR` が結果を
     1 回だけ返します。2 回目の呼び出しは `EALREADY`、接続したあとは 0、その次からは
@@ -477,7 +478,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `ECONNABORTED` です。IPv6 のソケットは、IPv4 のアドレスに `::ffff:a.b.c.d` として
     届きます。
   - **方針が許さない行き先**は `ENETUNREACH` です。ただし 53 番ポートは DNS の代わりに
-    届きます（下を参照）。
+    届き（下を参照）、ゲストのソケットが待ち受けていないループバックのアドレスは
+    拒まれます（`ECONNREFUSED`。ノンブロッキングのソケットなら `EINPROGRESS` のあと
+    `SO_ERROR` で）。
   - **データ**：`read`、`write`、`send`／`recv`、`sendto`／`recvfrom`、
     `sendmsg`／`recvmsg` を、`MSG_PEEK`、`MSG_WAITALL`、`MSG_DONTWAIT`、
     `MSG_NOSIGNAL` とともに使えます。書き込みはすべて送るまで続きます。相手が
@@ -490,7 +493,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     あれば `POLLOUT`、両方向を閉じたら `POLLHUP`、誤りが残っていれば `POLLERR`
     です。
   - **`shutdown`**、`getsockname`（接続したあとはホストのアドレスとポート）、
-    `getpeername`、ポート 0 への `bind`、`FIONREAD`／`SIOCINQ`、`SIOCOUTQ`。
+    `getpeername`、`bind`、`FIONREAD`／`SIOCINQ`、`SIOCOUTQ`。
   - **オプション**：`SO_TYPE`、`SO_DOMAIN`、`SO_PROTOCOL`、`SO_ERROR`、
     `SO_ACCEPTCONN`、`SO_KEEPALIVE`、`SO_REUSEADDR`、`SO_REUSEPORT`、`SO_SNDBUF`、
     `SO_RCVBUF`、`SO_RCVTIMEO`、`SO_SNDTIMEO`、`SO_LINGER`、`SO_PRIORITY`、
@@ -515,6 +518,43 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   するためです。アドレスが 1 つも残らない名前は `NXDOMAIN` です。`localhost` と
   そのサブドメインは、ループバックにも届きます。ほかのそういうアドレスに届くには、
   アドレスそのものを許可します（`127.0.0.1:8080`）。
+
+### ループバックのサーバー {#loopback-servers}
+
+TCP のソケットは、ゲスト自身のループバックの上で Linux と同じく `bind`、`listen`、
+`accept` できます。ゲストのソケットが、待ち受けているループバックのアドレスに接続すると、
+方針によらずカーネルの中で届き、ゲストの外には出ません。ホストもほかのマシンも、
+ゲストの待ち受けには届きません。待ち受けていなければ、許可したアドレスはこれまで
+どおりホストに届き、ほかは拒まれます。何も許可しないネットワーク（JavaScript の
+`allow: []`、Rust の `NetworkPolicy::new()`）にもループバックはあります。コマンドで
+ネットワークを作るには `--allow-net` が要ります。
+
+- **`bind`** はループバックのアドレス（`127.0.0.0/8`、`::1`、IPv6 のソケットでは
+  IPv4 を IPv4-mapped にしたもの）か未指定のアドレスに、ポートを付けて、ポート 0 なら
+  32768〜60999 の一時的なポートを取ります。確かめ方とその順序は Linux と同じです。
+  ほかのアドレスは `EADDRNOTAVAIL`、`bind` 済みなら `EINVAL`、両方が覆うアドレスで
+  ほかのソケット（待ち受け、それが受け付けた接続、クライアント）がポートを持って
+  いれば `EADDRINUSE` です。ただし、両方が `SO_REUSEADDR` を付けていて相手が待ち
+  受けていないとき、両方が `SO_REUSEPORT` を付けているときは共有できます。`::` の
+  IPv6 のソケットは、`IPV6_V6ONLY` でなければ IPv4 のポートも持ちます。
+- **`listen`** は `backlog` + 1 本までの接続を待たせます（多くて 4096、
+  `net.core.somaxconn`）。`bind` していないソケットは、すべてのアドレスで一時的な
+  ポートを取ります。待ち受けているソケットは、接続が待っている間は読めます
+  （`poll`、`select`、`epoll`、`O_ASYNC` の `POLL_IN`）。`SO_ACCEPTCONN` を示し、
+  `FIONREAD` は `EINVAL`、`connect` は `EISCONN` で、`shutdown(SHUT_RD)` か
+  `AF_UNSPEC` の `connect` で待ち受けをやめます。
+- **`connect`** は、待ち受けの列が接続を受け取った時点で、`accept` の前に戻ります。
+  ノンブロッキングなら Linux と同じく `EINPROGRESS` です。列がいっぱいなら、
+  `accept` が空きを作るまで待ちます。
+- **`accept`** と **`accept4`**（`SOCK_NONBLOCK`、`SOCK_CLOEXEC`）は、最初に
+  待っている接続と相手のアドレスを返します。待ち受けているソケットがノンブロッキング
+  でなければ、`SO_RCVTIMEO` まで待ちます（`EAGAIN`）。受け付けたソケットは、待ち
+  受けているソケットのオプションを引き継ぎます。
+- **リセット**は Linux と同じです。読んでいない入力のあるソケットや `SO_LINGER` の
+  時間が 0 のソケットを閉じたとき、`AF_UNSPEC` で切断したとき、まだ渡していない
+  接続のある待ち受けを閉じたときは、相手をリセットします（相手は持っている分を
+  読んだあと `ECONNRESET`）。閉じた相手に送ったバイトにはリセットが返り、次の送信は
+  `EPIPE` です。
 
 ## スレッドとプロセス
 

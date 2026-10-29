@@ -510,7 +510,7 @@ pub(crate) fn polled_full(file: &Arc<dyn FileHandle>) {
 /// also counts each message's overhead.
 pub(crate) fn queued(file: &Arc<dyn FileHandle>, outgoing: bool) -> Option<Result<usize, Errno>> {
     if let Some(socket) = crate::inet::of(file) {
-        return Some(Ok(socket.queued(outgoing)));
+        return Some(socket.queued(outgoing));
     }
     let any = file.as_any()?;
     if let Some(pipe) = any.downcast_ref::<PipeEnd>() {

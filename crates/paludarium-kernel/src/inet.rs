@@ -7,8 +7,13 @@
 //! answered from the host's resolver for an allowed name and with
 //! `NXDOMAIN` for any other, so the guest's own resolver
 //! (`/etc/resolv.conf`, or its default) works unchanged.
+//!
+//! On the guest's own loopback a TCP socket also binds, listens and accepts
+//! ([`crate::loopback`]): a connection to a loopback address where a guest
+//! socket listens reaches it in the kernel, whatever the policy allows.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
+use crate::loopback::{Binding, Link, Ports};
 use crate::sockets::Timeout;
 use crate::syscalls::Context;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -17,7 +22,7 @@ use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 const AF_UNSPEC: u16 = 0;
 const AF_INET: u16 = 2;
@@ -36,12 +41,16 @@ const EPROTONOSUPPORT: Errno = Errno(93);
 const ESOCKTNOSUPPORT: Errno = Errno(94);
 const EOPNOTSUPP: Errno = Errno(95);
 const EAFNOSUPPORT: Errno = Errno(97);
+const EADDRNOTAVAIL: Errno = Errno(99);
 const ENETUNREACH: Errno = Errno(101);
 const ECONNABORTED: Errno = Errno(103);
 const EISCONN: Errno = Errno(106);
 const ENOTCONN: Errno = Errno(107);
 const EALREADY: Errno = Errno(114);
 const EINPROGRESS: Errno = Errno(115);
+const ECONNREFUSED: Errno = Errno(111);
+/// Linux's default `net.core.somaxconn`, the most a `listen` backlog is.
+const SOMAXCONN: u32 = 4096;
 const POLLERR: u32 = 8;
 const POLLHUP: u32 = 0x10;
 const POLLRDHUP: u32 = 0x2000;
@@ -260,6 +269,9 @@ pub(crate) struct Network {
     /// [`NAME_LIFETIME`].
     resolved: Mutex<BTreeMap<IpAddr, Vec<(String, u64)>>>,
     lookups: Mutex<BTreeMap<String, (Arc<Lookup>, u64)>>,
+    /// The local ports the guest's TCP sockets hold. Locked after a
+    /// socket's state, never before.
+    ports: Mutex<Ports>,
 }
 impl Network {
     pub(crate) fn new(policy: NetworkPolicy) -> Self {
@@ -267,7 +279,11 @@ impl Network {
             policy,
             resolved: Mutex::default(),
             lookups: Mutex::default(),
+            ports: Mutex::default(),
         }
+    }
+    fn ports(&self) -> MutexGuard<'_, Ports> {
+        self.ports.lock().unwrap_or_else(PoisonError::into_inner)
     }
     /// Whether the guest may connect to `address` at `now`.
     fn allows(&self, address: SocketAddr, now: u64) -> bool {
@@ -349,19 +365,14 @@ pub(crate) fn socket(
         (SOCK_RAW, _) => return Err(Errno(1)),
         _ => return Err(ESOCKTNOSUPPORT),
     };
-    let socket = Arc::new(InetSocket {
+    let socket = InetSocket::new(
         family,
         datagram,
-        network: Arc::clone(network),
-        host: Arc::clone(c.shared_host),
-        hub: Arc::clone(&c.files.readiness),
-        flags: AtomicU32::new(2 | (flags & NONBLOCK)),
-        inode: crate::files::anonymous_inode(),
-        mode: AtomicU32::new(0o140777),
-        state: Mutex::new(State::default()),
-        options: Mutex::new(Options::default()),
-        signals: Arc::default(),
-    });
+        network,
+        c.shared_host,
+        &c.files.readiness,
+        flags,
+    );
     c.files
         .install(socket, flags & CLOEXEC != 0, c.group.nofile())
         .map(u64::from)
@@ -408,9 +419,65 @@ struct State {
     /// `sk_err`: the pending error, which `SO_ERROR` takes.
     error: Option<Errno>,
     read_shut: bool,
+    // The guest's loopback.
+    /// The address a TCP socket holds its local port on: its `bind`'s, or
+    /// the one `listen` or a loopback connection took.
+    bound: Option<SocketAddr>,
+    /// The guest named the port itself, so that a disconnect keeps it
+    /// (Linux's `SOCK_BINDPORT_LOCK`).
+    port_locked: bool,
+    listen: Option<Listen>,
+    /// The loopback connection the stream is a side of, once its listener
+    /// has taken it.
+    link: Option<(Arc<OnceLock<Arc<Link>>>, usize)>,
     // UDP.
     peer: Option<SocketAddr>,
     queries: VecDeque<Query>,
+}
+
+/// A listening socket's connections, as Linux's accept queue.
+struct Listen {
+    /// The most connections waiting, less one (`sk_max_ack_backlog`).
+    backlog: usize,
+    ready: VecDeque<Arc<InetSocket>>,
+    /// Connections that found the queue full. Linux drops their handshake
+    /// and the client tries again; here they wait for room.
+    pending: VecDeque<Pending>,
+    arrivals: u64,
+}
+struct Pending {
+    stream: Weak<Stream>,
+    link: Arc<OnceLock<Arc<Link>>>,
+    from: SocketAddr,
+    to: SocketAddr,
+}
+impl Listen {
+    fn new(backlog: usize) -> Self {
+        Self {
+            backlog,
+            ready: VecDeque::new(),
+            pending: VecDeque::new(),
+            arrivals: 0,
+        }
+    }
+    fn has_room(&self) -> bool {
+        self.ready.len() <= self.backlog
+    }
+    /// Ends listening, as Linux's `inet_csk_listen_stop`: each connection
+    /// not yet accepted is reset, and each waiting for room refused, as its
+    /// next try would be.
+    fn stop(self) {
+        for child in self.ready {
+            child.abort();
+        }
+        for pending in self.pending {
+            if let Some(stream) = pending.stream.upgrade()
+                && stream.phase() == Phase::Connecting
+            {
+                stream.fail(ECONNREFUSED);
+            }
+        }
+    }
 }
 impl State {
     /// Notes the failure of the stream, once.
@@ -566,6 +633,8 @@ fn stream_waker(
 
 /// A TCP or UDP socket of the guest.
 pub(crate) struct InetSocket {
+    /// This socket, for the bindings that name it.
+    this: Weak<InetSocket>,
     family: Family,
     datagram: bool,
     network: Arc<Network>,
@@ -581,6 +650,29 @@ pub(crate) struct InetSocket {
 }
 
 impl InetSocket {
+    fn new(
+        family: Family,
+        datagram: bool,
+        network: &Arc<Network>,
+        host: &Arc<dyn paludarium_host::Host>,
+        hub: &Arc<ReadinessHub>,
+        flags: u32,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|this| Self {
+            this: Weak::clone(this),
+            family,
+            datagram,
+            network: Arc::clone(network),
+            host: Arc::clone(host),
+            hub: Arc::clone(hub),
+            flags: AtomicU32::new(2 | (flags & NONBLOCK)),
+            inode: crate::files::anonymous_inode(),
+            mode: AtomicU32::new(0o140777),
+            state: Mutex::new(State::default()),
+            options: Mutex::new(Options::default()),
+            signals: Arc::default(),
+        })
+    }
     /// `F_GETOWN` and `F_GETSIG`.
     pub(crate) fn file_owner(&self) -> FileOwner {
         *self
@@ -670,7 +762,12 @@ impl InetSocket {
             return Err(Errno::EPIPE);
         };
         match stream.write(bytes) {
-            Err(e) if e != Errno::EAGAIN && e != Errno::EPIPE => {
+            // A failed connection's error goes once, as `sk_stream_error`
+            // takes it.
+            Err(e)
+                if e != Errno::EAGAIN
+                    && (e != Errno::EPIPE || matches!(stream.phase(), Phase::Failed(_))) =>
+            {
                 Err(s.error.take().unwrap_or(Errno::EPIPE))
             }
             Err(e) if e == Errno::EAGAIN && stream.phase() == Phase::Open => {
@@ -683,9 +780,12 @@ impl InetSocket {
 
     /// Starts connecting to `address`, or goes on with a connection already
     /// started; waits for it unless the socket is nonblocking. As Linux's
-    /// `__inet_stream_connect`: `EISCONN` once connected, `EALREADY` while
-    /// still connecting, `EINPROGRESS` when a nonblocking one starts, and
-    /// the pending error, or `ECONNABORTED`, when it failed.
+    /// `__inet_stream_connect`: `EISCONN` once connected or listening,
+    /// `EALREADY` while still connecting, `EINPROGRESS` when a nonblocking
+    /// one starts, and the pending error, or `ECONNABORTED`, when it failed.
+    /// A loopback address where a guest socket listens is reached in the
+    /// kernel; one where none does is refused, unless the policy allows the
+    /// host's.
     fn connect(&self, c: &mut Context<'_>, address: Option<SocketAddr>) -> Result<u64, Errno> {
         if self.datagram {
             self.lock().peer = address;
@@ -693,32 +793,54 @@ impl InetSocket {
         }
         let Some(address) = address else {
             // AF_UNSPEC disconnects.
-            let mut s = self.lock();
-            if let Some(stream) = s.stream.take() {
-                stream.close();
-            }
-            *s = State::default();
+            self.renew(&mut self.lock());
             return Ok(0);
         };
+        let options = *self.options();
         let wait = crate::sockets::wait_for(c, self.timeout(false))?;
         let stream = {
             let mut s = self.lock();
             s.note();
+            if s.listen.is_some() {
+                return Err(EISCONN);
+            }
             let pending = match s.connection {
                 Connection::Connected => return Err(EISCONN),
                 Connection::Connecting => EALREADY,
                 Connection::Unconnected => {
-                    let stream = if address.port() == DNS {
-                        DnsOverTcp::open(address, &self.network, &self.host)
-                    } else {
-                        let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
-                        if !self.network.allows(address, now) {
-                            return Err(ENETUNREACH);
-                        }
-                        c.host.connect(address)?
+                    let to = crate::loopback::destination(SocketAddr::new(
+                        plain(address.ip()),
+                        address.port(),
+                    ));
+                    let opened = match to {
+                        Some(to) => self.open_loopback(&mut s, to, &options)?,
+                        None => None,
                     };
-                    stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
-                    stream.set_nodelay(self.options().no_delay);
+                    let loopback = opened.is_some();
+                    let stream = match opened {
+                        Some(stream) => stream,
+                        None if address.port() == DNS => {
+                            DnsOverTcp::open(address, &self.network, &self.host)
+                        }
+                        None => {
+                            let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+                            if self.network.allows(address, now) {
+                                let stream = c.host.connect(address)?;
+                                stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
+                                stream
+                            } else if to.is_some() {
+                                // Nothing listens there on the guest's own
+                                // loopback, which answers with a reset.
+                                return self.refused(&mut s, address);
+                            } else {
+                                return Err(ENETUNREACH);
+                            }
+                        }
+                    };
+                    if address.port() == DNS && !loopback {
+                        stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
+                    }
+                    stream.set_nodelay(options.no_delay);
                     if let Some(old) = s.stream.replace(Arc::clone(&stream)) {
                         old.close();
                     }
@@ -726,8 +848,14 @@ impl InetSocket {
                     s.read_shut = false;
                     s.connection = Connection::Connecting;
                     // The stub's own stream is open at once.
-                    if address.port() == DNS {
+                    if address.port() == DNS && !loopback {
                         stream.connected(None);
+                    }
+                    // Linux's loopback answers the handshake once connect
+                    // has returned, so a nonblocking one is in progress
+                    // even when its listener took it.
+                    if loopback && self.nonblocking() {
+                        return Err(EINPROGRESS);
                     }
                     EINPROGRESS
                 }
@@ -749,10 +877,7 @@ impl InetSocket {
                     let mut s = self.lock();
                     s.note();
                     let error = s.error.take().unwrap_or(ECONNABORTED);
-                    if let Some(stream) = s.stream.take() {
-                        stream.close();
-                    }
-                    *s = State::default();
+                    self.renew(&mut s);
                     return Err(error);
                 }
                 Phase::Connecting if self.nonblocking() => return Err(pending),
@@ -779,14 +904,21 @@ impl InetSocket {
                 Err(ENOTCONN)
             };
         }
+        // A listener stops for SHUT_RD, as Linux's `inet_shutdown`
+        // disconnects it, and ignores SHUT_WR.
+        if s.listen.is_some() {
+            if how != 1 {
+                self.renew(&mut s);
+            }
+            return Ok(0);
+        }
         s.note();
         let Some(stream) = s.stream.clone() else {
             return Err(ENOTCONN);
         };
         match stream.phase() {
             Phase::Connecting => {
-                stream.close();
-                *s = State::default();
+                self.renew(&mut s);
                 Ok(0)
             }
             Phase::Failed(_) => Err(ENOTCONN),
@@ -803,13 +935,15 @@ impl InetSocket {
             }
         }
     }
-    /// The socket's own address: the host's once connected, else the
+    /// The socket's own address: the host's once connected, or the
+    /// loopback connection's, else the one it is bound to, else the
     /// unspecified one with port 0.
     fn local(&self) -> SocketAddr {
         let s = self.lock();
         s.stream
             .as_ref()
             .and_then(|stream| stream.local())
+            .or(s.bound)
             .unwrap_or(match self.family {
                 Family::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
                 Family::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
@@ -890,16 +1024,358 @@ impl InetSocket {
             .map_or(0, |answer| answer.len())
     }
     /// The bytes waiting to be read, and to be sent, for `FIONREAD` and
-    /// `SIOCOUTQ`.
-    pub(crate) fn queued(&self, outgoing: bool) -> usize {
+    /// `SIOCOUTQ`; a listener has neither (EINVAL, as Linux's `tcp_ioctl`).
+    pub(crate) fn queued(&self, outgoing: bool) -> Result<usize, Errno> {
         if self.datagram {
-            return if outgoing { 0 } else { self.next_datagram() };
+            return Ok(if outgoing { 0 } else { self.next_datagram() });
         }
         let s = self.lock();
-        s.stream.as_ref().map_or(0, |stream| {
+        if s.listen.is_some() {
+            return Err(Errno::EINVAL);
+        }
+        Ok(s.stream.as_ref().map_or(0, |stream| {
             let (received, sending) = stream.queued();
             if outgoing { sending } else { received }
-        })
+        }))
+    }
+
+    // The guest's loopback.
+
+    fn binding(&self, address: SocketAddr, options: &Options) -> Binding {
+        Binding {
+            address,
+            v6: self.family == Family::V6,
+            v6_only: options.v6_only,
+            reuse_address: options.reuse_address,
+            reuse_port: options.reuse_port,
+            listening: false,
+            owner: Weak::clone(&self.this),
+        }
+    }
+    /// `bind` of a TCP socket, with Linux's checks in its order
+    /// (`__inet_bind`, `__inet6_bind`). The guest's own addresses are the
+    /// loopback's and the unspecified one, and the IPv4 multicast and
+    /// broadcast ones Linux takes too; any other is `EADDRNOTAVAIL`. Port 0
+    /// takes an ephemeral port.
+    fn bind(&self, raw: &[u8]) -> Result<u64, Errno> {
+        let options = *self.options();
+        let mut s = self.lock();
+        let taken = |s: &State| s.bound.is_some() || s.stream.is_some();
+        let own = |ip: Ipv4Addr| {
+            ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast()
+        };
+        let address = match self.family {
+            Family::V4 => {
+                if raw.len() < 16 {
+                    return Err(Errno::EINVAL);
+                }
+                let family = u16::from_le_bytes([raw[0], raw[1]]);
+                let ip = Ipv4Addr::new(raw[4], raw[5], raw[6], raw[7]);
+                // AF_UNSPEC passes with the unspecified address, for old
+                // programs.
+                if family != AF_INET && !(family == AF_UNSPEC && ip.is_unspecified()) {
+                    return Err(EAFNOSUPPORT);
+                }
+                if !own(ip) {
+                    return Err(EADDRNOTAVAIL);
+                }
+                if taken(&s) {
+                    return Err(Errno::EINVAL);
+                }
+                SocketAddr::from((ip, u16::from_be_bytes([raw[2], raw[3]])))
+            }
+            Family::V6 => {
+                if raw.len() < 24 {
+                    return Err(Errno::EINVAL);
+                }
+                if u16::from_le_bytes([raw[0], raw[1]]) != AF_INET6 {
+                    return Err(EAFNOSUPPORT);
+                }
+                let mut octets = [0; 16];
+                octets.copy_from_slice(&raw[8..24]);
+                let ip = Ipv6Addr::from(octets);
+                let port = u16::from_be_bytes([raw[2], raw[3]]);
+                let scope = raw
+                    .get(24..28)
+                    .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                if ip.is_multicast() || taken(&s) {
+                    return Err(Errno::EINVAL);
+                }
+                if let Some(v4) = ip.to_ipv4_mapped() {
+                    if options.v6_only {
+                        return Err(Errno::EINVAL);
+                    }
+                    if !own(v4) {
+                        return Err(EADDRNOTAVAIL);
+                    }
+                    SocketAddr::from((v4, port))
+                } else if ip.is_unspecified() || ip.is_loopback() {
+                    SocketAddr::from((ip, port))
+                } else if ip.segments()[0] & 0xffc0 == 0xfe80 && scope == 0 {
+                    // A link-local address needs its interface.
+                    return Err(Errno::EINVAL);
+                } else {
+                    return Err(EADDRNOTAVAIL);
+                }
+            }
+        };
+        s.bound = Some(self.network.ports().bind(self.binding(address, &options))?);
+        s.port_locked = address.port() != 0;
+        Ok(0)
+    }
+    /// `listen(backlog)`, as Linux's `inet_listen`: `EOPNOTSUPP` for UDP,
+    /// `EINVAL` for a socket that has connected; an unbound socket takes an
+    /// ephemeral port on every address. A listener only takes the new
+    /// backlog.
+    fn listen(&self, backlog: u64) -> Result<u64, Errno> {
+        if self.datagram {
+            return Err(EOPNOTSUPP);
+        }
+        // Linux takes the int as unsigned, so a negative one is the most.
+        let backlog = (backlog as u32).min(SOMAXCONN) as usize;
+        let options = *self.options();
+        let mut s = self.lock();
+        if s.stream.is_some() {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(listen) = s.listen.as_mut() {
+            listen.backlog = backlog;
+            let admitted = self.admit(listen, options);
+            drop(s);
+            if admitted {
+                self.arrived();
+            }
+            return Ok(0);
+        }
+        {
+            let mut ports = self.network.ports();
+            if s.bound.is_none() {
+                let every = match self.family {
+                    Family::V4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    Family::V6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                };
+                s.bound = Some(ports.bind(self.binding(SocketAddr::new(every, 0), &options))?);
+            }
+            ports.listen(&self.this, options.reuse_address, options.reuse_port)?;
+        }
+        s.listen = Some(Listen::new(backlog));
+        Ok(0)
+    }
+    /// The first connection waiting on this listener, as Linux's
+    /// `inet_csk_accept`: `EINVAL` unless listening (`EOPNOTSUPP` for UDP),
+    /// `EAGAIN` when none waits and the socket is nonblocking, or once
+    /// `SO_RCVTIMEO` has passed.
+    fn accept(&self, c: &mut Context<'_>) -> Result<Arc<InetSocket>, Errno> {
+        if self.datagram {
+            return Err(EOPNOTSUPP);
+        }
+        let wait = crate::sockets::wait_for(c, self.timeout(true))?;
+        loop {
+            let ticket = c.files.readiness.token.value();
+            let options = *self.options();
+            let (child, admitted) = {
+                let mut s = self.lock();
+                let Some(listen) = s.listen.as_mut() else {
+                    return Err(Errno::EINVAL);
+                };
+                let child = listen.ready.pop_front();
+                let admitted = child.is_some() && self.admit(listen, options);
+                (child, admitted)
+            };
+            if admitted {
+                self.arrived();
+            }
+            if let Some(child) = child {
+                return Ok(child);
+            }
+            if self.nonblocking() {
+                return Err(Errno::EAGAIN);
+            }
+            let Some(deadline) = wait.deadline(c)? else {
+                return Err(Errno::EAGAIN);
+            };
+            crate::events::wait(c, ticket, deadline)?;
+        }
+    }
+    /// Takes the connections that found the queue full into it while it
+    /// has room; whether any came.
+    fn admit(&self, listen: &mut Listen, options: Options) -> bool {
+        let mut any = false;
+        while listen.has_room() {
+            let Some(pending) = listen.pending.pop_front() else {
+                break;
+            };
+            let Some(stream) = pending.stream.upgrade() else {
+                continue;
+            };
+            if stream.phase() != Phase::Connecting || stream.finished().1 {
+                continue;
+            }
+            let child = self.child(options, &stream, &pending.link, pending.from, pending.to);
+            listen.ready.push_back(child);
+            listen.arrivals += 1;
+            any = true;
+        }
+        any
+    }
+    /// A connection came to this listener: `POLL_IN` and a wake, as
+    /// Linux's `sk_data_ready` of a listener.
+    fn arrived(&self) {
+        self.signals.waking(Reason::In);
+        self.hub.changed();
+    }
+    /// The accepted side of a connection from `stream` at `from` to this
+    /// listener at `to`, joined to it through `link`. It takes this
+    /// socket's options, as Linux's `sk_clone_lock` copies them, and holds
+    /// the listener's port on `to`.
+    fn child(
+        &self,
+        options: Options,
+        stream: &Arc<Stream>,
+        link: &OnceLock<Arc<Link>>,
+        from: SocketAddr,
+        to: SocketAddr,
+    ) -> Arc<InetSocket> {
+        let child = InetSocket::new(self.family, false, &self.network, &self.host, &self.hub, 0);
+        *child.options() = options;
+        let own = Stream::new(from);
+        own.set_waker(stream_waker(&child.signals, &child.hub, &own));
+        let joined = Link::join(stream, &own, from, to);
+        let _ = link.set(Arc::clone(&joined));
+        let own_link = Arc::new(OnceLock::new());
+        let _ = own_link.set(joined);
+        self.network.ports().hold(child.binding(to, &options));
+        let mut s = child.lock();
+        s.stream = Some(own);
+        s.connection = Connection::Connected;
+        s.link = Some((own_link, 1));
+        s.bound = Some(to);
+        drop(s);
+        child
+    }
+    /// A connection to `to` on the guest's loopback, when a guest socket
+    /// listens there: in its listener's queue, or waiting for room in it.
+    /// `None` when none listens there.
+    fn open_loopback(
+        &self,
+        s: &mut State,
+        to: SocketAddr,
+        options: &Options,
+    ) -> Result<Option<Arc<Stream>>, Errno> {
+        // An IPv6-only socket reaches no IPv4 address (`tcp_v6_connect`).
+        if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
+            return Err(ENETUNREACH);
+        }
+        let Some(listener) = self.network.ports().listener(to) else {
+            return Ok(None);
+        };
+        let theirs = *listener.options();
+        let mut state = listener.lock();
+        let Some(listen) = state.listen.as_mut() else {
+            return Ok(None);
+        };
+        let from = self.loopback_source(s, to, options)?;
+        let stream = Stream::new(to);
+        stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
+        let link = Arc::new(OnceLock::new());
+        s.link = Some((Arc::clone(&link), 0));
+        let arrived = listen.has_room();
+        if arrived {
+            let child = listener.child(theirs, &stream, &link, from, to);
+            listen.ready.push_back(child);
+            listen.arrivals += 1;
+        } else {
+            listen.pending.push_back(Pending {
+                stream: Arc::downgrade(&stream),
+                link,
+                from,
+                to,
+            });
+        }
+        drop(state);
+        if arrived {
+            listener.arrived();
+        }
+        Ok(Some(stream))
+    }
+    /// The address a connection to `to` on the loopback leaves from: the
+    /// one this socket is bound to, its port with the loopback's source
+    /// address when bound to every address, else an ephemeral port.
+    fn loopback_source(
+        &self,
+        s: &mut State,
+        to: SocketAddr,
+        options: &Options,
+    ) -> Result<SocketAddr, Errno> {
+        let source = crate::loopback::source(to);
+        let mut ports = self.network.ports();
+        let from = match s.bound {
+            Some(bound) if !bound.ip().is_unspecified() => bound,
+            Some(bound) => {
+                let from = SocketAddr::new(source, bound.port());
+                ports.rebind(&self.this, from);
+                from
+            }
+            // Linux's connect finds no free port with EADDRNOTAVAIL.
+            None => ports
+                .bind(self.binding(SocketAddr::new(source, 0), options))
+                .map_err(|_| EADDRNOTAVAIL)?,
+        };
+        s.bound = Some(from);
+        Ok(from)
+    }
+    /// A connection the loopback refuses: `ECONNREFUSED`, or for a
+    /// nonblocking socket in progress with the error waiting, as Linux's
+    /// reset comes once connect has returned.
+    fn refused(&self, s: &mut State, address: SocketAddr) -> Result<u64, Errno> {
+        if !self.nonblocking() {
+            return Err(ECONNREFUSED);
+        }
+        let stream = Stream::new(address);
+        stream.fail(ECONNREFUSED);
+        s.stream = Some(stream);
+        s.noted = false;
+        s.read_shut = false;
+        s.connection = Connection::Connecting;
+        Err(EINPROGRESS)
+    }
+    /// Makes the socket as new, as Linux's `tcp_disconnect`: a loopback
+    /// connection is reset, a listener stops, and only a port the guest
+    /// bound itself is kept.
+    fn renew(&self, s: &mut State) {
+        let old = std::mem::take(s);
+        {
+            let mut ports = self.network.ports();
+            if old.listen.is_some() {
+                ports.stop_listening(&self.this);
+            }
+            if old.port_locked {
+                s.bound = old.bound;
+                s.port_locked = true;
+            } else if old.bound.is_some() {
+                ports.unbind(&self.this);
+            }
+        }
+        if let Some(listen) = old.listen {
+            listen.stop();
+            self.hub.changed();
+        }
+        if let Some(stream) = old.stream {
+            finish(&stream, old.link.as_ref(), true);
+        }
+    }
+    /// Resets this socket's connection, as a listener that stops does to
+    /// those it has not handed out.
+    fn abort(&self) {
+        let s = std::mem::take(&mut *self.lock());
+        if let Some(stream) = s.stream {
+            finish(&stream, s.link.as_ref(), true);
+        }
+    }
+    /// The peer's address, whatever the connection's state, as `accept`
+    /// gives it (Linux's `inet_getname` with `peer` 2).
+    fn remote(&self) -> Option<SocketAddr> {
+        self.lock().stream.as_ref().map(|stream| stream.peer())
     }
 }
 
@@ -910,10 +1386,28 @@ fn closed(stream: &Stream) -> bool {
     ready.read_closed && stream.finished().0
 }
 
+/// Ends the guest's use of `stream`, as Linux's `tcp_close`: on the
+/// loopback a connection with unread input, or closed with `abort` (a zero
+/// linger time, a disconnect), is reset; any other ends after what it sent.
+fn finish(stream: &Stream, link: Option<&(Arc<OnceLock<Arc<Link>>>, usize)>, abort: bool) {
+    let joined = link.and_then(|(slot, side)| Some((slot.get()?, *side)));
+    if let Some((link, side)) = joined
+        && (abort || stream.queued().0 > 0)
+    {
+        link.reset(side);
+    }
+    stream.close();
+}
+
 impl Drop for InetSocket {
     fn drop(&mut self) {
-        if let Some(stream) = self.lock().stream.take() {
-            stream.close();
+        let abort = self.options().linger == Some(0);
+        let s = std::mem::take(&mut *self.lock());
+        if let Some(listen) = s.listen {
+            listen.stop();
+        }
+        if let Some(stream) = s.stream {
+            finish(&stream, s.link.as_ref(), abort);
         }
     }
 }
@@ -953,6 +1447,11 @@ impl FileHandle for InetSocket {
             return Ok((OUT | (u32::from(ready) * IN), epoch, 0));
         }
         let mut s = self.lock();
+        // A listener is readable while a connection waits, and no more
+        // (`inet_csk_listen_poll`).
+        if let Some(listen) = &s.listen {
+            return Ok((u32::from(!listen.ready.is_empty()) * IN, listen.arrivals, 0));
+        }
         s.note();
         let error = u32::from(s.error.is_some()) * POLLERR;
         let Some(stream) = s.stream.clone() else {
@@ -1031,6 +1530,10 @@ fn read_address(
     at: u64,
     len: u64,
 ) -> Result<Option<SocketAddr>, Errno> {
+    parse_address(socket.family, &read_raw(c, at, len)?)
+}
+/// The `len` bytes of a socket address at `at`, as `move_addr_to_kernel`.
+fn read_raw(c: &Context<'_>, at: u64, len: u64) -> Result<Vec<u8>, Errno> {
     let len = usize::try_from(len as u32 as i32)
         .ok()
         .filter(|&len| len <= 128)
@@ -1039,7 +1542,7 @@ fn read_address(
     c.mem
         .read(GuestAddr(at), &mut raw)
         .map_err(|_| Errno::EFAULT)?;
-    parse_address(socket.family, &raw)
+    Ok(raw)
 }
 fn parse_address(family: Family, raw: &[u8]) -> Result<Option<SocketAddr>, Errno> {
     if raw.len() < 2 {
@@ -1146,15 +1649,17 @@ pub(crate) fn dispatch(
             let address = read_address(c, socket, a[1], a[2])?;
             socket.connect(c, address)
         }
-        // accept and accept4: never listening.
-        43 | 288 => Err(Errno::EINVAL),
-        // bind: only to port 0, as a client may before it connects.
-        49 => match read_address(c, socket, a[1], a[2])? {
+        // accept and accept4
+        43 | 288 => accept(c, socket, a, if number == 288 { a[3] } else { 0 }),
+        // bind: a TCP socket to the guest's own addresses; a UDP one only
+        // to port 0, as a client may before it sends.
+        49 if socket.datagram => match read_address(c, socket, a[1], a[2])? {
             Some(address) if address.port() != 0 => Err(Errno(13)),
             _ => Ok(0),
         },
+        49 => socket.bind(&read_raw(c, a[1], a[2])?),
         // listen
-        50 => Err(EOPNOTSUPP),
+        50 => socket.listen(a[1]),
         // getsockname and getpeername
         51 | 52 => {
             let address = if number == 51 {
@@ -1256,6 +1761,40 @@ pub(crate) fn dispatch(
         }
         _ => Err(Errno::ENOSYS),
     }
+}
+/// `accept` and `accept4` with `flags` (`SOCK_NONBLOCK` and
+/// `SOCK_CLOEXEC`; EINVAL for any other), in Linux's order (`do_accept`):
+/// the lowest free descriptor first (EMFILE), then the connection, then its
+/// peer's address, which when it cannot be written loses the connection.
+fn accept(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6], flags: u64) -> Result<u64, Errno> {
+    if flags & !u64::from(NONBLOCK | CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fd = c.files.reserve(c.group.nofile())?;
+    let child = match socket.accept(c) {
+        Ok(child) => child,
+        Err(e) => {
+            c.files.unreserve(fd);
+            return Err(e);
+        }
+    };
+    if flags & u64::from(NONBLOCK) != 0 {
+        child.flags.store(2 | NONBLOCK, Ordering::SeqCst);
+    }
+    if a[1] != 0 {
+        let peer = child.remote().unwrap_or(match socket.family {
+            Family::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            Family::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        });
+        if let Err(e) = write_address(c, &encode_address(socket.family, peer), a[1], a[2]) {
+            c.files.unreserve(fd);
+            return Err(e);
+        }
+    }
+    let cloexec = flags & u64::from(CLOEXEC) != 0;
+    c.files
+        .fill(fd, crate::files::Descriptor::unnamed(child, cloexec));
+    Ok(u64::from(fd))
 }
 /// What a receive returns: with `MSG_TRUNC`, a datagram's whole length.
 fn returned(received: &Received, flags: u64, datagram: bool) -> usize {
@@ -1380,14 +1919,24 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         | (41, 26) => {
             let value = option_int(c, at, len)?;
             match (level, name) {
-                (1, 2) => options.reuse_address = value != 0,
+                (1, 2 | 15) => {
+                    if name == 2 {
+                        options.reuse_address = value != 0;
+                    } else {
+                        options.reuse_port = value != 0;
+                    }
+                    socket.network.ports().set_reuse(
+                        &socket.this,
+                        options.reuse_address,
+                        options.reuse_port,
+                    );
+                }
                 (1, 6) => options.broadcast = value != 0,
                 (1, 7) => options.send_buffer = (value.clamp(0, i32::MAX / 2) * 2).max(4608),
                 (1, 8) => options.receive_buffer = (value.clamp(0, i32::MAX / 2) * 2).max(2304),
                 (1, 9) => options.keep_alive = value != 0,
                 (1, 10) => options.out_of_band_inline = value != 0,
                 (1, 12) => options.priority = value,
-                (1, 15) => options.reuse_port = value != 0,
                 (6, _) if !tcp => return Err(ENOPROTOOPT),
                 (6, 1) => {
                     options.no_delay = value != 0;
@@ -1405,7 +1954,9 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (6, 18) => options.user_timeout = value,
                 (0, 1) => options.type_of_service = value & 0xfc,
                 (41, 26) if socket.family == Family::V6 => {
-                    if socket.lock().stream.is_some() {
+                    // Linux refuses it once the socket has a local port.
+                    let s = socket.lock();
+                    if s.stream.is_some() || s.bound.is_some() {
                         return Err(Errno::EINVAL);
                     }
                     options.v6_only = value != 0;
@@ -1479,7 +2030,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (1, 10) => i32::from(options.out_of_band_inline),
                 (1, 12) => options.priority,
                 (1, 15) => i32::from(options.reuse_port),
-                (1, 30) => 0,
+                (1, 30) => i32::from(socket.lock().listen.is_some()),
                 (1, 38) => {
                     if tcp {
                         6

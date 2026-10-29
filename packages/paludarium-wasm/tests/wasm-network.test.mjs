@@ -32,8 +32,9 @@ test("a guest connects only to what network.allow names", async (t) => {
   const allowed = await run(runtime, program, { allow: [`127.0.0.1:${port}`] });
   assert.deepEqual(allowed.status, { kind: "exited", code: 0 });
   assert.equal(new TextDecoder().decode(allowed.stdout), "hello");
-  // Another port is unreachable, and without network.allow there is no network.
-  assert.deepEqual((await run(runtime, program, { allow: [`127.0.0.1:${port + 1}`] })).status, { kind: "exited", code: 101 });
+  // Another loopback port, where no guest socket listens, is refused, and
+  // without network.allow there is no network.
+  assert.deepEqual((await run(runtime, program, { allow: [`127.0.0.1:${port + 1}`] })).status, { kind: "exited", code: 111 });
   assert.deepEqual((await run(runtime, program)).status, { kind: "exited", code: 97 });
   assert.throws(() => runtime.run({ program: "/guest", files: { "/guest": program }, network: { allow: ["bad name"] } }), { kind: "invalid-program" });
   assert.throws(() => runtime.run({ program: "/guest", files: { "/guest": program }, network: {} }), { kind: "invalid-program" });

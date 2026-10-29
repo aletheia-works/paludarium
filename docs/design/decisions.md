@@ -106,6 +106,18 @@ instance, must know which allowed name it came from. The kernel's allow list
 still decides first; the relay keeps its own, since anything in a page is
 public.
 
+## The guest's own loopback
+
+A guest may run its own TCP servers, but only for its own sockets: a
+connection from a guest socket to a loopback address where a guest socket
+listens is joined in the kernel, two in-memory streams like the host's, and
+never reaches the host. Serving the host or other machines would let a
+guest open ports on the user's machine, which the allow list does not
+govern, so it is left out. The allow list does not govern the guest's own
+loopback either, as nothing leaves the guest; a loopback port where no guest
+socket listens is refused, as Linux's loopback is, unless the list allows
+the host's.
+
 ## Trusted Publishing only
 
 Releases go to crates.io and npm by Trusted Publishing (OIDC) only, with no

@@ -10,10 +10,22 @@ verified.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.
-  With one, only TCP clients and name resolution work
-  ([Network](./features#network)):
-  - `listen` is `EOPNOTSUPP`, and `bind` to a port other than 0 is `EACCES`,
-    so a guest cannot serve.
+  With one, only TCP clients, TCP servers for the guest's own sockets and
+  name resolution work ([Network](./features#network)):
+  - A guest serves only its own sockets, on its loopback
+    ([Loopback servers](./features#loopback-servers)): neither the host nor
+    another machine can connect to it, and `bind` takes only the loopback's
+    addresses and the unspecified one (`EADDRNOTAVAIL` for any other, where
+    Linux takes each of the machine's own). A UDP socket binds only port 0
+    (`EACCES` for another), so it cannot serve either.
+  - On the loopback, a closed connection leaves no `TIME_WAIT`, so its port
+    is free at once, where Linux keeps it 60 seconds after the side that
+    closed first (`EADDRINUSE` without `SO_REUSEADDR`). A connection that
+    finds the listener's queue full waits until `accept` makes room, where
+    Linux's client tries again after 1, 3, 7… seconds and gives up with
+    `ETIMEDOUT`. Listeners sharing a port with `SO_REUSEPORT` do not share
+    its connections: all go to the first. A nonzero `SO_LINGER` time never
+    holds `close`, as the bytes are delivered at once.
   - A UDP socket reaches only the DNS stub; a datagram to another port is
     `ENETUNREACH`. Raw sockets are `EPERM`, ICMP sockets `EACCES`, and other
     kinds (SCTP's `SOCK_SEQPACKET`, which Linux loads a module for)
@@ -24,8 +36,10 @@ verified.
     datagram answer holds at most 512 bytes; a name the host cannot resolve
     is `SERVFAIL`. A TCP connection to port 53 always reaches the stub, never
     a real DNS server.
-  - Before a connection is open, `getsockname` gives the unspecified address
-    with port 0, where Linux gives the port it took. `SIOCOUTQ` counts what the
+  - Before a connection through the host is open, `getsockname` gives the
+    address the socket is bound to, or the unspecified one with port 0,
+    where Linux gives the port it took; a port the socket bound does not
+    reach the host, whose connection leaves from a port of its own. `SIOCOUTQ` counts what the
     host has not yet taken to send, not what the peer has not acknowledged.
     `SO_SNDBUF` and `SO_RCVBUF` are kept for `getsockopt` but do not size the
     buffers, which hold 256 KiB each way; the other options but

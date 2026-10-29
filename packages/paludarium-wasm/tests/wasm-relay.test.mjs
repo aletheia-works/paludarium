@@ -75,8 +75,10 @@ test("a guest reaches through the relay what both allow lists name", async (t) =
   const reached = await run(runtime, tcpGuest(port), { allow: [`127.0.0.1:${port}`], relay: { url } });
   assert.deepEqual(reached.status, { kind: "exited", code: 0 });
   assert.equal(new TextDecoder().decode(reached.stdout), "hello");
-  // The kernel's allow list has the last word, and the relay's its own.
-  assert.deepEqual((await run(runtime, tcpGuest(other), { allow: [`127.0.0.1:${port}`], relay: { url } })).status, { kind: "exited", code: 101 });
+  // The kernel's allow list has the last word (a loopback port it does not
+  // allow is refused, as nothing of the guest's listens there), and the
+  // relay's its own.
+  assert.deepEqual((await run(runtime, tcpGuest(other), { allow: [`127.0.0.1:${port}`], relay: { url } })).status, { kind: "exited", code: 111 });
   assert.deepEqual((await run(runtime, tcpGuest(other), { allow: [`127.0.0.1:${other}`], relay: { url } })).status, { kind: "exited", code: 101 });
   // A relay that is not there is ENETUNREACH too.
   assert.deepEqual((await run(runtime, tcpGuest(port), { allow: [`127.0.0.1:${port}`], relay: { url: "ws://127.0.0.1:1/" } })).status, { kind: "exited", code: 101 });

@@ -68,7 +68,8 @@ directory. `tty` optionally supplies columns and rows in the range 0–65535.
 (`EAGAIN` beyond it), its `RLIMIT_NOFILE` (`EMFILE`) and its memory in bytes
 (`SIGKILL` beyond it, as the OOM killer); all are unlimited by default.
 No host filesystem mount is exposed by this API. `network: { allow }` gives the
-guest TCP clients and name resolution for what `allow` names; Node.js connects
+guest TCP clients and name resolution for what `allow` names, and TCP servers
+for its own sockets on its loopback; Node.js connects
 itself, and a browser needs `relay: { url, protocols }`, a WebSocket relay that
 connects for it. `relay.mjs` in this package is one
 (`node relay.mjs --allow github.com:443`; see the documentation's Network relay

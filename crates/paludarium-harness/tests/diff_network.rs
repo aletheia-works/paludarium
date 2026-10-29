@@ -1,7 +1,8 @@
-//! TCP client sockets against native Linux. The test serves the guest on
+//! TCP sockets against native Linux. The test serves the guest on
 //! 127.0.0.1 itself (see `tests/guests/network/network.c`), and the
 //! emulator connects through the native host's network, allowed only to
-//! that port.
+//! that port. The `listen` modes serve on the guest's own loopback, which
+//! the emulator keeps in the kernel.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -159,11 +160,32 @@ mod linux {
     fn network_async() {
         case("async");
     }
+    #[test]
+    fn network_listen() {
+        case("listen");
+    }
+    #[test]
+    fn network_listen_errors() {
+        case("listen-errors");
+    }
+    #[test]
+    fn network_listen_reset() {
+        case("listen-reset");
+    }
+    #[test]
+    fn network_listen_fork() {
+        case("listen-fork");
+    }
+    #[test]
+    fn network_listen_v6() {
+        case("listen-v6");
+    }
 
     /// Name resolution has no native counterpart here: the guest's resolver
     /// would read the runner's own files and servers. Under the emulator,
     /// with only `localhost` on the server's port allowed, the stub answers
-    /// it from the host, refuses another name and the policy another port.
+    /// it from the host and refuses another name, and another loopback port,
+    /// where no guest socket listens, is refused.
     #[test]
     fn network_resolve_under_the_emulator() {
         let (open, _) = ports();
@@ -174,7 +196,7 @@ mod linux {
         let stdout = String::from_utf8_lossy(&outcome.stdout);
         assert_eq!(
             stdout,
-            "  localhost=0\n  addr=0x7f000001 port-ok=1\n  connect=0 errno=0\n  echo=2 \"ok\"\n  blocked=1\n  connect-other-port=-1 errno=101\n",
+            "  localhost=0\n  addr=0x7f000001 port-ok=1\n  connect=0 errno=0\n  echo=2 \"ok\"\n  blocked=1\n  connect-other-port=-1 errno=111\n",
             "{outcome:?}"
         );
     }

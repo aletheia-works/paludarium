@@ -1,4 +1,5 @@
-/* TCP client sockets against the differential test's local server.
+/* TCP client sockets against the differential test's local server, and
+ * the guest's own servers on the loopback (the "listen" modes).
  *
  *   network <mode> <open-port> <closed-port>
  *
@@ -9,7 +10,8 @@
  *   'b' sends 1 MiB of a pattern, then closes;
  *   'w' reads until the end of input, sends "bye", then closes.
  * Nothing listens on <closed-port>. Only what native Linux and the
- * emulator share is printed: never the client's own port. */
+ * emulator share is printed: never the client's own port, nor the ports
+ * the guest's servers take. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -26,6 +28,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int open_port, closed_port;
@@ -110,6 +113,46 @@ static int async_socket(void) {
     fcntl(fd, F_SETSIG, 40);
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_ASYNC);
     return fd;
+}
+/* The events among `events` poll reports for `fd` now. */
+static void ready(const char *name, int fd, short events) {
+    struct pollfd p = {.fd = fd, .events = events};
+    int n = poll(&p, 1, 0);
+    printf("  %s poll=%d revents=%#x\n", name, n, (unsigned)p.revents);
+}
+/* A TCP socket listening with `backlog` on 127.0.0.1, at a port it takes,
+   which `port` gets. */
+static int listener(int backlog, int *port) {
+    int fd = tcp(0);
+    struct sockaddr_in a = to(0);
+    if (bind(fd, (void *)&a, sizeof a) || listen(fd, backlog)) {
+        printf("listen failed errno=%d\n", errno);
+        exit(69);
+    }
+    socklen_t len = sizeof a;
+    getsockname(fd, (void *)&a, &len);
+    *port = ntohs(a.sin_port);
+    return fd;
+}
+/* A TCP socket connecting to `port` on 127.0.0.1; its connect's result goes
+   to `result`. */
+static int client(int port, int flags, int *result) {
+    int fd = tcp(flags);
+    struct sockaddr_in a = to(port);
+    errno = 0;
+    *result = connect(fd, (void *)&a, sizeof a) ? errno : 0;
+    return fd;
+}
+static void bind_to(const char *name, int fd, in_addr_t addr, int port) {
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
+    a.sin_addr.s_addr = addr;
+    call(name, bind(fd, (void *)&a, sizeof a));
+}
+static int port_of(int fd) {
+    struct sockaddr_in6 a;
+    socklen_t len = sizeof a;
+    getsockname(fd, (void *)&a, &len);
+    return ntohs(a.sin6_port);
 }
 static volatile sig_atomic_t pipes;
 static void on_pipe(int signal) { (void)signal; pipes++; }
@@ -455,6 +498,357 @@ int main(int argc, char **argv) {
         close(fd);
         return 0;
     }
+    if (!strcmp(mode, "listen")) {
+        /* A server on the loopback: bind, listen, a blocking connect the
+           queue takes before accept, accept's address, bytes both ways and
+           the ends, and what a listener answers. */
+        int l = tcp(0);
+        option("acceptconn", l, SOL_SOCKET, SO_ACCEPTCONN);
+        struct sockaddr_in a = to(0);
+        call("bind", bind(l, (void *)&a, sizeof a));
+        socklen_t len = sizeof a;
+        getsockname(l, (void *)&a, &len);
+        int port = ntohs(a.sin_port);
+        printf("  bound family=%d addr=%#x port-ok=%d\n", a.sin_family, ntohl(a.sin_addr.s_addr), port != 0);
+        call("listen", listen(l, 4));
+        option("acceptconn", l, SOL_SOCKET, SO_ACCEPTCONN);
+        ready("idle", l, POLLIN | POLLOUT | POLLRDHUP);
+        fcntl(l, F_SETOWN, getpid());
+        fcntl(l, F_SETSIG, 40);
+        fcntl(l, F_SETFL, fcntl(l, F_GETFL) | O_ASYNC);
+        int ep = epoll_create1(0);
+        struct epoll_event ev = {.events = EPOLLIN | EPOLLET};
+        epoll_ctl(ep, EPOLL_CTL_ADD, l, &ev);
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, 40);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        int result;
+        int c = client(port, 0, &result);
+        printf("  connect errno=%d\n", result);
+        signals("arrival");
+        printf("  epoll=%d\n", epoll_wait(ep, &ev, 1, 5000));
+        printf("  epoll-again=%d\n", epoll_wait(ep, &ev, 1, 0));
+        ready("queued", l, POLLIN | POLLOUT | POLLRDHUP);
+        struct sockaddr_in peer, mine;
+        len = sizeof peer;
+        int s = accept4(l, (void *)&peer, &len, SOCK_CLOEXEC);
+        printf("  accept-ok=%d len=%u cloexec=%d nonblock=%d\n", s >= 0, (unsigned)len,
+               fcntl(s, F_GETFD) & FD_CLOEXEC, (fcntl(s, F_GETFL) & O_NONBLOCK) != 0);
+        len = sizeof mine;
+        getsockname(c, (void *)&mine, &len);
+        printf("  peer-is-client=%d family=%d addr=%#x\n",
+               peer.sin_port == mine.sin_port && peer.sin_addr.s_addr == mine.sin_addr.s_addr,
+               peer.sin_family, ntohl(peer.sin_addr.s_addr));
+        len = sizeof mine;
+        getsockname(s, (void *)&mine, &len);
+        printf("  server port-ok=%d addr=%#x\n", ntohs(mine.sin_port) == port, ntohl(mine.sin_addr.s_addr));
+        len = sizeof peer;
+        call("client-getpeername", getpeername(c, (void *)&peer, &len));
+        printf("  client peer port-ok=%d addr=%#x\n", ntohs(peer.sin_port) == port, ntohl(peer.sin_addr.s_addr));
+        option("server-acceptconn", s, SOL_SOCKET, SO_ACCEPTCONN);
+        option("server-error", s, SOL_SOCKET, SO_ERROR);
+        ready("drained", l, POLLIN);
+        ready("server", s, POLLIN | POLLOUT | POLLRDHUP);
+        call("send", send(c, "hello", 5, 0));
+        polled("server-data", s, POLLIN | POLLOUT | POLLRDHUP);
+        int queued = -1;
+        ioctl(s, FIONREAD, &queued);
+        printf("  fionread=%d\n", queued);
+        n = recv(s, buf, sizeof buf, 0);
+        print_bytes("recv", buf, n);
+        call("send-back", send(s, "world!", 6, 0));
+        polled("client-data", c, POLLIN);
+        n = recv(c, buf, sizeof buf, 0);
+        print_bytes("client-recv", buf, n);
+        call("shutdown", shutdown(c, SHUT_WR));
+        await_end(s);
+        ready("server-end", s, POLLIN | POLLOUT | POLLRDHUP);
+        call("server-eof", recv(s, buf, sizeof buf, 0));
+        call("server-send-after", send(s, "late", 4, 0));
+        polled("client-late", c, POLLIN);
+        n = recv(c, buf, sizeof buf, 0);
+        print_bytes("client-late", buf, n);
+        close(s);
+        await_end(c);
+        call("client-eof", recv(c, buf, sizeof buf, 0));
+        ready("client-closed", c, POLLIN | POLLOUT | POLLRDHUP);
+        len = sizeof peer;
+        call("client-getpeername-closed", getpeername(c, (void *)&peer, &len));
+        close(c);
+        call("listener-fionread", ioctl(l, FIONREAD, &queued));
+        call("listener-recv", recv(l, buf, 1, MSG_DONTWAIT));
+        call("listener-send", send(l, "x", 1, MSG_NOSIGNAL));
+        call("listener-connect", connect(l, (void *)&a, sizeof a));
+        len = sizeof peer;
+        call("listener-getpeername", getpeername(l, (void *)&peer, &len));
+        call("listen-again", listen(l, 8));
+        call("shutdown-wr", shutdown(l, SHUT_WR));
+        option("still-listening", l, SOL_SOCKET, SO_ACCEPTCONN);
+        call("shutdown-rd", shutdown(l, SHUT_RD));
+        option("after-shutdown", l, SOL_SOCKET, SO_ACCEPTCONN);
+        call("accept-after", accept(l, NULL, NULL));
+        c = client(port, 0, &result);
+        printf("  connect-after errno=%d\n", result);
+        close(c);
+        call("listen-anew", listen(l, 1));
+        printf("  anew port-ok=%d\n", port_of(l) != 0);
+        close(l);
+        close(ep);
+        return 0;
+    }
+    if (!strcmp(mode, "listen-errors")) {
+        /* What bind, listen and accept refuse, as Linux checks them. */
+        int port;
+        int l = listener(1, &port);
+        int b = tcp(0);
+        bind_to("bind-in-use", b, htonl(INADDR_LOOPBACK), port);
+        bind_to("bind-any-in-use", b, htonl(INADDR_ANY), port);
+        set_option("reuseaddr", b, SOL_SOCKET, SO_REUSEADDR, 1);
+        bind_to("bind-reuse-beside-listener", b, htonl(INADDR_LOOPBACK), port);
+        bind_to("bind-foreign", b, inet_addr("192.0.2.1"), 0);
+        struct sockaddr_in a = to(0);
+        call("bind-short", bind(b, (void *)&a, 8));
+        struct sockaddr_in6 six = {.sin6_family = AF_INET6};
+        call("bind-family", bind(b, (void *)&six, sizeof six));
+        struct sockaddr_in unspec = {.sin_family = AF_UNSPEC};
+        call("bind-unspec-any", bind(b, (void *)&unspec, sizeof unspec));
+        printf("  unspec port-ok=%d\n", port_of(b) != 0);
+        call("bind-twice", bind(b, (void *)&a, sizeof a));
+        int other = tcp(0);
+        unspec.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        call("bind-unspec-address", bind(other, (void *)&unspec, sizeof unspec));
+        /* Two sockets with SO_REUSEADDR share a port until one listens. */
+        int r1 = tcp(0), r2 = tcp(0), r3 = tcp(0);
+        set_option("reuse-1", r1, SOL_SOCKET, SO_REUSEADDR, 1);
+        set_option("reuse-2", r2, SOL_SOCKET, SO_REUSEADDR, 1);
+        bind_to("reuse-bind-1", r1, htonl(INADDR_LOOPBACK), 0);
+        int shared = port_of(r1);
+        bind_to("reuse-bind-2", r2, htonl(INADDR_LOOPBACK), shared);
+        bind_to("no-reuse-bind", r3, htonl(INADDR_LOOPBACK), shared);
+        call("reuse-listen-1", listen(r1, 1));
+        call("reuse-listen-2", listen(r2, 1));
+        /* Another loopback address is another place for the same port. */
+        bind_to("other-address", r3, inet_addr("127.0.0.2"), port);
+        call("accept-not-listening", accept(r3, NULL, NULL));
+        call("accept4-flags", accept4(l, NULL, NULL, 1));
+        /* The port of a socket bound but not listening refuses. */
+        int result;
+        int refused = client(port_of(b), 0, &result);
+        printf("  connect-bound-only errno=%d\n", result);
+        close(refused);
+        refused = client(port_of(b), SOCK_NONBLOCK, &result);
+        printf("  connect-bound-only-nonblocking errno=%d\n", result);
+        polled("refused", refused, POLLIN | POLLOUT | POLLRDHUP);
+        option("refused-error", refused, SOL_SOCKET, SO_ERROR);
+        call("refused-connect-again", connect(refused, (void *)&a, sizeof a));
+        close(refused);
+        /* A connected socket does not listen; a listener's accept waits
+           for SO_RCVTIMEO, and a nonblocking one does not wait. */
+        int c = client(port, 0, &result);
+        printf("  connect errno=%d\n", result);
+        call("listen-connected", listen(c, 1));
+        int s = accept(l, NULL, NULL);
+        printf("  accept-ok=%d\n", s >= 0);
+        struct timeval tv = {0, 100000};
+        setsockopt(l, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        call("accept-timeout", accept(l, NULL, NULL));
+        fcntl(l, F_SETFL, O_NONBLOCK);
+        call("accept-nonblocking", accept(l, NULL, NULL));
+        /* A full queue (backlog 1 holds two): the next connection waits
+           until accept makes room, as Linux's client tries again. (Backlog
+           0 would leave Linux's first one to SYN cookies.) */
+        int q;
+        int full = listener(1, &q);
+        int first = client(q, SOCK_NONBLOCK, &result);
+        printf("  first errno=%d\n", result);
+        polled("first", first, POLLOUT);
+        int second = client(q, SOCK_NONBLOCK, &result);
+        printf("  second errno=%d\n", result);
+        polled("second", second, POLLOUT);
+        int third = client(q, SOCK_NONBLOCK, &result);
+        printf("  third errno=%d\n", result);
+        ready("third-waiting", third, POLLIN | POLLOUT);
+        call("third-again", connect(third, (void *)&a, sizeof a) ? -1 : 0);
+        int got = accept(full, NULL, NULL);
+        printf("  accept-first-ok=%d\n", got >= 0);
+        polled("third-after-accept", third, POLLOUT);
+        option("third-error", third, SOL_SOCKET, SO_ERROR);
+        for (int i = 0; i < 2; i++) {
+            got = accept(full, NULL, NULL);
+            printf("  accept-next-ok=%d\n", got >= 0);
+        }
+        /* UDP neither listens nor accepts. */
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        call("udp-listen", listen(u, 1));
+        call("udp-accept", accept(u, NULL, NULL));
+        return 0;
+    }
+    if (!strcmp(mode, "listen-reset")) {
+        /* What ends a loopback connection with a reset. */
+        int port, result;
+        int l = listener(8, &port);
+        /* Closed with input unread: the peer reads what it had, then the
+           reset, then the end. */
+        int c = client(port, 0, &result);
+        int s = accept(l, NULL, NULL);
+        send(s, "abc", 3, 0);
+        send(c, "xyz", 3, 0);
+        polled("unread", s, POLLIN);
+        polled("client-data", c, POLLIN);
+        close(s);
+        polled("reset", c, POLLIN | POLLOUT | POLLRDHUP);
+        n = recv(c, buf, sizeof buf, 0);
+        print_bytes("before-reset", buf, n);
+        call("recv-reset", recv(c, buf, sizeof buf, 0));
+        call("recv-after", recv(c, buf, sizeof buf, 0));
+        call("send-after", send(c, "x", 1, MSG_NOSIGNAL));
+        close(c);
+        /* Closed cleanly, then written to: the write goes, the reset comes
+           back, and the next write is EPIPE. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        close(s);
+        await_end(c);
+        call("eof", recv(c, buf, sizeof buf, 0));
+        call("send-to-closed", send(c, "x", 1, MSG_NOSIGNAL));
+        polled("answered", c, POLLERR);
+        call("send-again", send(c, "x", 1, MSG_NOSIGNAL));
+        option("error-after", c, SOL_SOCKET, SO_ERROR);
+        call("recv-closed", recv(c, buf, sizeof buf, 0));
+        close(c);
+        /* A zero linger time resets. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        struct linger linger = {1, 0};
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &linger, sizeof linger);
+        close(s);
+        polled("lingered", c, POLLIN);
+        call("recv-lingered", recv(c, buf, sizeof buf, 0));
+        close(c);
+        /* AF_UNSPEC disconnects with a reset, and the socket connects anew. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+        call("disconnect", connect(c, &unspec, sizeof unspec));
+        polled("disconnected", s, POLLIN);
+        call("recv-disconnected", recv(s, buf, sizeof buf, 0));
+        struct sockaddr_in a = to(port);
+        call("reconnect", connect(c, (void *)&a, sizeof a));
+        close(s);
+        s = accept(l, NULL, NULL);
+        printf("  accept-again-ok=%d\n", s >= 0);
+        close(s);
+        close(c);
+        /* A listener that closes resets what it has not handed out. */
+        int queued = client(port, 0, &result);
+        printf("  queued errno=%d\n", result);
+        close(l);
+        polled("listener-gone", queued, POLLIN);
+        call("recv-queued", recv(queued, buf, sizeof buf, 0));
+        close(queued);
+        return 0;
+    }
+    if (!strcmp(mode, "listen-fork")) {
+        /* A child connects to its parent's listener, which a blocking
+           accept waits on. */
+        int port;
+        int l = listener(1, &port);
+        pid_t child = fork();
+        if (child == 0) {
+            usleep(100000);
+            int result;
+            int c = client(port, 0, &result);
+            if (result) _exit(1);
+            send(c, "from child", 10, 0);
+            shutdown(c, SHUT_WR);
+            n = recv(c, buf, 5, MSG_WAITALL);
+            _exit(n == 5 && !memcmp(buf, "reply", 5) ? 0 : 2);
+        }
+        int s = accept(l, NULL, NULL);
+        printf("  accept-ok=%d\n", s >= 0);
+        n = recv(s, buf, sizeof buf, MSG_WAITALL);
+        print_bytes("recv", buf, n);
+        call("reply", send(s, "reply", 5, 0));
+        int status;
+        waitpid(child, &status, 0);
+        printf("  child exited=%d status=%d\n", WIFEXITED(status), WEXITSTATUS(status));
+        close(s);
+        close(l);
+        return 0;
+    }
+    if (!strcmp(mode, "listen-v6")) {
+        /* IPv6 listeners: one on every address takes IPv4 connections too,
+           with IPv4-mapped addresses; an IPv6-only one does not. */
+        int l = socket(AF_INET6, SOCK_STREAM, 0);
+        struct sockaddr_in6 any = {.sin6_family = AF_INET6};
+        call("bind", bind(l, (void *)&any, sizeof any));
+        call("listen", listen(l, 4));
+        int port = port_of(l);
+        int result;
+        int c4 = client(port, 0, &result);
+        printf("  v4 connect errno=%d\n", result);
+        struct sockaddr_in6 peer;
+        socklen_t len = sizeof peer;
+        int s = accept(l, (void *)&peer, &len);
+        printf("  accept family=%d len=%u mapped=%d\n", peer.sin6_family, (unsigned)len,
+               IN6_IS_ADDR_V4MAPPED(&peer.sin6_addr));
+        struct sockaddr_in6 mine;
+        len = sizeof mine;
+        getsockname(s, (void *)&mine, &len);
+        printf("  server mapped=%d last=%#x port-ok=%d\n", IN6_IS_ADDR_V4MAPPED(&mine.sin6_addr),
+               ntohl(mine.sin6_addr.s6_addr32[3]), ntohs(mine.sin6_port) == port);
+        close(s);
+        close(c4);
+        int c6 = socket(AF_INET6, SOCK_STREAM, 0);
+        struct sockaddr_in6 one = {.sin6_family = AF_INET6, .sin6_port = htons(port), .sin6_addr = in6addr_loopback};
+        call("v6 connect", connect(c6, (void *)&one, sizeof one));
+        len = sizeof peer;
+        s = accept(l, (void *)&peer, &len);
+        printf("  accept family=%d loopback=%d\n", peer.sin6_family, IN6_IS_ADDR_LOOPBACK(&peer.sin6_addr));
+        len = sizeof mine;
+        getsockname(c6, (void *)&mine, &len);
+        printf("  client loopback=%d same-port=%d\n", IN6_IS_ADDR_LOOPBACK(&mine.sin6_addr),
+               mine.sin6_port == peer.sin6_port);
+        close(s);
+        close(c6);
+        /* The port on every address covers IPv4 binds too. */
+        int b4 = tcp(0);
+        bind_to("v4-beside-dual", b4, htonl(INADDR_LOOPBACK), port);
+        close(b4);
+        close(l);
+        int only = socket(AF_INET6, SOCK_STREAM, 0);
+        set_option("v6only", only, IPPROTO_IPV6, IPV6_V6ONLY, 1);
+        call("only-bind", bind(only, (void *)&any, sizeof any));
+        set_option("v6only-bound", only, IPPROTO_IPV6, IPV6_V6ONLY, 0);
+        call("only-listen", listen(only, 4));
+        int only_port = port_of(only);
+        c4 = client(only_port, 0, &result);
+        printf("  v4 to v6-only errno=%d\n", result);
+        close(c4);
+        b4 = tcp(0);
+        bind_to("v4-beside-v6-only", b4, htonl(INADDR_LOOPBACK), only_port);
+        close(b4);
+        close(only);
+        int m = socket(AF_INET6, SOCK_STREAM, 0);
+        struct sockaddr_in6 mapped = {.sin6_family = AF_INET6};
+        mapped.sin6_addr.s6_addr[10] = 0xff;
+        mapped.sin6_addr.s6_addr[11] = 0xff;
+        mapped.sin6_addr.s6_addr32[3] = htonl(INADDR_LOOPBACK);
+        call("bind-mapped", bind(m, (void *)&mapped, sizeof mapped));
+        close(m);
+        m = socket(AF_INET6, SOCK_STREAM, 0);
+        set_option("v6only", m, IPPROTO_IPV6, IPV6_V6ONLY, 1);
+        call("bind-mapped-v6-only", bind(m, (void *)&mapped, sizeof mapped));
+        struct sockaddr_in6 foreign = {.sin6_family = AF_INET6};
+        inet_pton(AF_INET6, "2001:db8::1", &foreign.sin6_addr);
+        call("bind-foreign", bind(m, (void *)&foreign, sizeof foreign));
+        call("bind-short", bind(m, (void *)&any, 16));
+        struct sockaddr_in four = to(0);
+        call("bind-v4-family", bind(m, (void *)&four, sizeof mapped));
+        close(m);
+        return 0;
+    }
     if (!strcmp(mode, "resolve")) {
         /* Name resolution through the guest's own resolver; run under the
            emulator only, with localhost allowed and nothing else. */
@@ -475,7 +869,8 @@ int main(int argc, char **argv) {
             freeaddrinfo(found);
         }
         printf("  blocked=%d\n", getaddrinfo("blocked.example", "80", &hints, &found) == EAI_NONAME);
-        /* An address the policy does not allow cannot be reached. */
+        /* A loopback port the policy does not allow, where no guest socket
+           listens, is refused. */
         int fd = tcp(0);
         struct sockaddr_in a = to(closed_port);
         call("connect-other-port", connect(fd, (void *)&a, sizeof a));

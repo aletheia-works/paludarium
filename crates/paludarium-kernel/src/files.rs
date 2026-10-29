@@ -18,6 +18,14 @@ pub(crate) struct Descriptor {
     cloexec: bool,
 }
 impl Descriptor {
+    /// A descriptor of `file`, which has no path, as a socket's.
+    pub(crate) fn unnamed(file: Arc<dyn FileHandle>, cloexec: bool) -> Self {
+        Self {
+            file,
+            path: Vec::new(),
+            cloexec,
+        }
+    }
     /// The descriptor a process gets for this one's open file over
     /// `SCM_RIGHTS`: the same file and path, with its own close-on-exec flag.
     pub(crate) fn received(self, cloexec: bool) -> Self {

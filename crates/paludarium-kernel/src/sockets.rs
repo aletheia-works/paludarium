@@ -1316,8 +1316,10 @@ fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// `sk_setsockopt`: a socket pair has only `SOL_SOCKET` options
 /// (EOPNOTSUPP for another level), an `int` value of fewer than 4 bytes is
 /// EINVAL, and an unknown name, or one whose effect is not modelled here
-/// (`SO_PASSSEC`, `SO_TIMESTAMPING`), is ENOPROTOOPT. `SO_PASSCRED` makes
-/// messages carry credentials ([`Credentials`]), `SO_TIMESTAMP` and its kin
+/// (`SO_PASSSEC`, `SO_TIMESTAMPING`), or one only read (`SO_PEERPIDFD`), is
+/// ENOPROTOOPT. `SO_PASSCRED` makes messages carry credentials
+/// ([`Credentials`]), `SO_PASSPIDFD` them and a pidfd of their sender
+/// ([`put_pidfd`]), `SO_TIMESTAMP` and its kin
 /// timestamps ([`Timestamps`]), `SO_RCVLOWAT` sets what a
 /// stream read waits for ([`receive_with`]; 0 is 1, and a negative value
 /// `INT_MAX`), and `SO_PEEK_OFF` where a peek starts (any value, a negative

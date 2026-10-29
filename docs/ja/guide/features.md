@@ -207,7 +207,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   メッセージを失い（`MSG_CTRUNC`）、ディスクリプタも作りません。どちらの端も資格情報を
   渡していないときに送ったメッセージは、何も運びません。`SO_PEERPIDFD` は、ペアを
   作ったプロセスの新しい pidfd を読み出します。渡した長さに番号の一部しか入らなくても、
-  pidfd は作ります。
+  pidfd は作ります。読み出すだけのオプションで、`setsockopt` は `ENOPROTOOPT` です。
 - `SO_RCVTIMEO` と `SO_SNDTIMEO`（と `_NEW` の形）は、Linux と同じく、そのソケットでの
   `recv`、`read`、`send`、`write` が待つ時間を限ります。限りを過ぎると `EAGAIN`、または
   そこまでに動かした分を返し、`MSG_WAITALL` もそこで止まります。0 の `timeval` は

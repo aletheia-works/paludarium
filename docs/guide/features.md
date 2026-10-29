@@ -224,7 +224,7 @@ kernel.
   descriptor is taken. A message sent while neither end passed credentials
   carries none. `SO_PEERPIDFD` reads a new pidfd of the process that made
   the pair, installed even when the length given holds only part of its
-  number.
+  number; it can only be read (`setsockopt` is `ENOPROTOOPT`).
 - `SO_RCVTIMEO` and `SO_SNDTIMEO` (and their `_NEW` forms) limit how long a
   blocking `recv`, `read`, `send` or `write` on the socket waits, as on
   Linux: past the limit it gives `EAGAIN`, or what it moved, and

@@ -20,7 +20,7 @@ members = [
 exclude = ["fuzz", "spikes/wasm-threads", "tests/guests/hello-rs"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.101"
 readme = "README.md"
@@ -28,17 +28,17 @@ repository = "https://github.com/aletheia-works/paludarium"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-paludarium = { path = "crates/paludarium", version = "0.6.0" }
-paludarium-cpu = { path = "crates/paludarium-cpu", version = "0.6.0" }
-paludarium-decoder = { path = "crates/paludarium-decoder", version = "0.6.0" }
-paludarium-host = { path = "crates/paludarium-host", version = "0.6.0" }
-paludarium-jit = { path = "crates/paludarium-jit", version = "0.6.0" }
-paludarium-kernel = { path = "crates/paludarium-kernel", version = "0.6.0" }
-paludarium-loader = { path = "crates/paludarium-loader", version = "0.6.0" }
-paludarium-mmu = { path = "crates/paludarium-mmu", version = "0.6.0" }
-paludarium-runtime = { path = "crates/paludarium-runtime", version = "0.6.0" }
-paludarium-types = { path = "crates/paludarium-types", version = "0.6.0" }
-paludarium-vfs = { path = "crates/paludarium-vfs", version = "0.6.0" }
+paludarium = { path = "crates/paludarium", version = "0.7.0" }
+paludarium-cpu = { path = "crates/paludarium-cpu", version = "0.7.0" }
+paludarium-decoder = { path = "crates/paludarium-decoder", version = "0.7.0" }
+paludarium-host = { path = "crates/paludarium-host", version = "0.7.0" }
+paludarium-jit = { path = "crates/paludarium-jit", version = "0.7.0" }
+paludarium-kernel = { path = "crates/paludarium-kernel", version = "0.7.0" }
+paludarium-loader = { path = "crates/paludarium-loader", version = "0.7.0" }
+paludarium-mmu = { path = "crates/paludarium-mmu", version = "0.7.0" }
+paludarium-runtime = { path = "crates/paludarium-runtime", version = "0.7.0" }
+paludarium-types = { path = "crates/paludarium-types", version = "0.7.0" }
+paludarium-vfs = { path = "crates/paludarium-vfs", version = "0.7.0" }
 
 [workspace.lints.clippy]
 expect_used = "deny"

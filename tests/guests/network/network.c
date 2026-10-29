@@ -92,10 +92,11 @@ static void signals(const char *step) {
     long last_band = 0;
     /* Linux wakes a poll before it sends the signal (tcp_fin calls
        sk_state_change, then sk_wake_async), so a signal may follow the
-       poll that saw its event: they are taken until none comes for 200 ms. */
-    struct timespec settle = {0, 200000000};
+       poll that saw its event. Every step has one: the first is awaited
+       for up to 5 s, the rest until none comes for 200 ms. */
+    struct timespec first = {5, 0}, settle = {0, 200000000};
     printf("  %s:", step);
-    while (sigtimedwait(&set, &info, &settle) == 40) {
+    for (const struct timespec *wait = &first; sigtimedwait(&set, &info, wait) == 40; wait = &settle) {
         if (info.si_code == last_code && info.si_band == last_band) continue;
         last_code = info.si_code;
         last_band = info.si_band;

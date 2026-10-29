@@ -444,7 +444,8 @@ int main(int argc, char **argv) {
         n = size > 0 ? recv(fd, reply, size, MSG_WAITALL) : -1;
         printf("  answer=%d whole=%d id=%d rcode=%d answers=%d last=%d.%d.%d.%d\n", n > 0, n == size,
                n > 3 && reply[0] == 0x12 && reply[1] == 0x34, n > 3 ? reply[3] & 15 : -1, n > 7 ? reply[7] : -1,
-               reply[n - 4], reply[n - 3], reply[n - 2], reply[n - 1]);
+               n > 3 ? reply[n - 4] : -1, n > 3 ? reply[n - 3] : -1, n > 3 ? reply[n - 2] : -1,
+               n > 3 ? reply[n - 1] : -1);
         call("shutdown", shutdown(fd, SHUT_WR));
         call("end", recv(fd, reply, sizeof reply, 0));
         close(fd);

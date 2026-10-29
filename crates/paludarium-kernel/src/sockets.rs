@@ -906,8 +906,8 @@ fn send_bytes(
 /// or with `MSG_WAITALL` until `bytes` is full, as Linux's
 /// `sock_rcvlowat` sets its target; or until the stream ends or reaches its
 /// out-of-band mark, descriptors come, the time is up or a signal arrives
-/// after some data, which it then returns, or, with `SO_PASSCRED`, data of
-/// other credentials comes. `MSG_OOB` takes a stream's out-of-band byte, and
+/// after some data, which it then returns, or, with `SO_PASSCRED` or
+/// `SO_PASSPIDFD`, data of other credentials comes. `MSG_OOB` takes a stream's out-of-band byte, and
 /// never waits. Other flags have no effect.
 fn receive_with(
     c: &mut Context<'_>,
@@ -1614,8 +1614,8 @@ pub(crate) struct Received {
     at_mark: bool,
     /// The credentials of the data read.
     pub(crate) credentials: Credentials,
-    /// A stream read with `SO_PASSCRED` stopped before data of other
-    /// credentials.
+    /// A stream read with `SO_PASSCRED` or `SO_PASSPIDFD` stopped before
+    /// data of other credentials.
     other_sender: bool,
     /// The descriptors of dropped out-of-band bytes, closed with this,
     /// outside the socket's lock.

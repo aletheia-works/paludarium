@@ -204,8 +204,8 @@ kernel.
   `int` value of fewer than 4 bytes is `EINVAL`, a value read back is cut to
   the given length, another level is `EOPNOTSUPP`, and an unknown option is
   `ENOPROTOOPT`. `SO_TYPE`, `SO_DOMAIN`, `SO_PROTOCOL`, `SO_ERROR`,
-  `SO_ACCEPTCONN` and `SO_PEERCRED` (the process that made the pair) can only
-  be read. `SO_SNDBUF` and `SO_RCVBUF` are doubled and kept at Linux's
+  `SO_ACCEPTCONN`, `SO_PEERCRED` and `SO_PEERPIDFD` (the process that made
+  the pair) can only be read. `SO_SNDBUF` and `SO_RCVBUF` are doubled and kept at Linux's
   floors and ceiling, and `SO_LINGER` takes a `struct linger`.
 - `SO_PASSCRED` makes messages carry credentials, as Linux's AF_UNIX does.
   A message sent while either end has it carries the sender's process ID,

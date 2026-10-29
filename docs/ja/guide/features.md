@@ -188,7 +188,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   既定の値やチェックも含めて `SOL_SOCKET` のオプションを扱います。4 バイトに満たない
   `int` の値は `EINVAL`、読み出す値は渡された長さで切り、ほかのレベルは `EOPNOTSUPP`、
   知らないオプションは `ENOPROTOOPT` です。`SO_TYPE`、`SO_DOMAIN`、`SO_PROTOCOL`、
-  `SO_ERROR`、`SO_ACCEPTCONN`、`SO_PEERCRED`（その組を作ったプロセス）は読むだけです。
+  `SO_ERROR`、`SO_ACCEPTCONN`、`SO_PEERCRED` と `SO_PEERPIDFD`（その組を作ったプロセス）は
+  読むだけです。
   `SO_SNDBUF` と `SO_RCVBUF` は 2 倍にして、Linux の下限と上限に収め、`SO_LINGER` は
   `struct linger` を受け取ります。
 - `SO_PASSCRED` を設定すると、Linux の AF_UNIX と同じく、メッセージが資格情報を運びます。

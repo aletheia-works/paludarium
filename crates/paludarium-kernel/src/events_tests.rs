@@ -1156,6 +1156,55 @@ fn loopback_closes_reset_what_is_left() {
     assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
 }
 #[test]
+fn a_udp_shutdown_ends_reads_and_refuses_sends() {
+    let mut f = network_fixture(&[]);
+    let a = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 0);
+    assert_eq!(f.ret(49, [a, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let name = name_of(&mut f, 51, a);
+    let port = u16::from_be_bytes([name[2], name[3]]);
+    // Not connected: ENOTCONN, but the socket is shut all the same.
+    assert_eq!(
+        f.ret(48, [a, 0, 0, 0, 0, 0]),
+        Errno(107).to_syscall_return()
+    );
+    assert_eq!(readable(&mut f, a), 4 | 1 | 0x2000);
+    // A read that would wait ends with 0; one that would not is EAGAIN.
+    assert_eq!(f.ret(0, [a, DATA + 8, 16, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(45, [a, DATA + 8, 16, 0x40, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    // Datagrams still come, and are read.
+    let b = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    f.mem.write(GuestAddr(DATA), b"hi").unwrap();
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], port);
+    assert_eq!(f.ret(44, [b, DATA, 2, 0, DATA + 0x100, 16]), 2);
+    assert_eq!(f.ret(0, [a, DATA + 8, 16, 0, 0, 0]), 2);
+    // Shut for sending too: hung up, and a send is EPIPE with no SIGPIPE.
+    assert_eq!(
+        f.ret(48, [a, 1, 0, 0, 0, 0]),
+        Errno(107).to_syscall_return()
+    );
+    assert_eq!(readable(&mut f, a) & 0x10, 0x10);
+    assert_eq!(
+        f.ret(44, [a, DATA, 2, 0, DATA + 0x100, 16]),
+        Errno::EPIPE.to_syscall_return()
+    );
+    assert_eq!(f.ret(127, [DATA + 0x300, 8, 0, 0, 0, 0]), 0);
+    let mut pending = [0; 8];
+    f.mem.read(GuestAddr(DATA + 0x300), &mut pending).unwrap();
+    assert_eq!(u64::from_le_bytes(pending) & (1 << 12), 0);
+    // A connected socket's shutdown is 0.
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], port);
+    assert_eq!(f.ret(42, [b, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(f.ret(48, [b, 2, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(48, [b, 3, 0, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+}
+#[test]
 fn loopback_udp_datagrams() {
     let mut f = network_fixture(&[]);
     let udp = |f: &mut Fixture| f.ret(41, [2, 2 | 0x800, 0, 0, 0, 0]);

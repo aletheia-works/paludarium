@@ -613,6 +613,12 @@ one only with an `--allow-net`.
   its next send or receive is `ECONNREFUSED`, once, as `SO_ERROR` and
   `POLLERR` show. A datagram to port 53 that no guest socket takes goes to
   the DNS stub, as before.
+- **UDP `shutdown`** marks the socket, connected or not (one that is not is
+  `ENOTCONN` all the same, as Linux's `inet_shutdown` gives it). Shut for
+  reading, a receive that would wait ends at once with 0, while datagrams
+  still come and are read first, and a nonblocking one is `EAGAIN`; shut for
+  sending, a send is `EPIPE`, with no `SIGPIPE`. `poll` then shows `POLLIN`
+  and `POLLRDHUP`, and `POLLHUP` once both ways are shut.
 
 ## Threads and processes
 

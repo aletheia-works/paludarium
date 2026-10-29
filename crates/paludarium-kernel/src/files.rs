@@ -2015,10 +2015,13 @@ pub(crate) fn write_with(
                 if done != 0 {
                     return Ok(done as u64);
                 }
+                // A UDP socket's EPIPE raises none, as `sock_alloc_send_pskb`
+                // gives it without one.
                 let sigpipe = file
                     .as_any()
                     .and_then(|a| a.downcast_ref::<crate::sockets::SocketPairEnd>())
-                    .is_none_or(crate::sockets::SocketPairEnd::raises_sigpipe);
+                    .is_none_or(crate::sockets::SocketPairEnd::raises_sigpipe)
+                    && crate::inet::of(file).is_none_or(crate::inet::InetSocket::is_stream);
                 if e == Errno(32) && !nosignal && sigpipe {
                     crate::signals::queue(c.process, crate::signals::PendingSignal::user(13, 0));
                 }

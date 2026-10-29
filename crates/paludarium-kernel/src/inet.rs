@@ -436,6 +436,8 @@ struct State {
     /// `sk_err`: the pending error, which `SO_ERROR` takes.
     error: Option<Errno>,
     read_shut: bool,
+    /// A UDP socket's `SHUT_WR` (TCP's is its stream's).
+    write_shut: bool,
     // The guest's loopback.
     /// The address a TCP socket holds its local port on: its `bind`'s, or
     /// the one `listen` or a loopback connection took.
@@ -769,10 +771,11 @@ impl InetSocket {
 
     /// Receives into `buf`: `EAGAIN` while nothing has come. A failed
     /// connection gives its error once and then the end, as Linux's
-    /// `tcp_recvmsg`; a socket never connected is `ENOTCONN`.
-    fn receive(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
+    /// `tcp_recvmsg`; a socket never connected is `ENOTCONN`. Whether the
+    /// call `waits` matters to a UDP socket shut down for reading.
+    fn receive(&self, buf: &mut [u8], peek: bool, waits: bool) -> Result<Received, Errno> {
         if self.datagram {
-            return self.receive_datagram(buf, peek);
+            return self.receive_datagram(buf, peek, waits);
         }
         let mut s = self.lock();
         s.note();
@@ -937,12 +940,15 @@ impl InetSocket {
             return Err(Errno::EINVAL);
         }
         let mut s = self.lock();
+        // Linux's `inet_shutdown` marks a UDP socket either way, and is
+        // ENOTCONN for one not connected.
         if self.datagram {
-            return if s.peer.is_some() {
-                Ok(0)
-            } else {
-                Err(ENOTCONN)
-            };
+            s.read_shut |= how != 1;
+            s.write_shut |= how != 0;
+            let connected = s.peer.is_some();
+            drop(s);
+            self.hub.changed();
+            return if connected { Ok(0) } else { Err(ENOTCONN) };
         }
         // A listener stops for SHUT_RD, as Linux's `inet_shutdown`
         // disconnects it, and ignores SHUT_WR.
@@ -1081,15 +1087,18 @@ impl InetSocket {
     /// Sends a datagram to `to`, or the connected peer: on the loopback to
     /// the guest socket that takes it, if any, as Linux's loopback delivers
     /// it at once; else a DNS query to the stub, to port 53 at any address.
-    /// Any other destination is `ENETUNREACH`. A connected socket's pending
-    /// error goes first, as `sock_alloc_send_pskb` gives it.
+    /// Any other destination is `ENETUNREACH`. Then, as Linux's
+    /// `sock_alloc_send_pskb` checks them, a connected socket's pending
+    /// error goes first, and a socket shut down for sending is `EPIPE`.
     fn send_datagram(&self, bytes: &[u8], to: Option<SocketAddr>) -> Result<usize, Errno> {
         let options = *self.options();
         let mut s = self.lock();
         let to = to.or(s.peer).ok_or(EDESTADDRREQ)?;
-        if let Some(error) = s.error.take() {
-            return Err(error);
-        }
+        let sendable = |s: &mut State| match s.error.take() {
+            Some(error) => Err(error),
+            None if s.write_shut => Err(Errno::EPIPE),
+            None => Ok(()),
+        };
         let plain_to = SocketAddr::new(plain(to.ip()), to.port());
         if let Some(dest) = crate::loopback::destination(plain_to) {
             if self.family == Family::V6 && options.v6_only && dest.is_ipv4() {
@@ -1101,6 +1110,7 @@ impl InetSocket {
             if bytes.len() > most {
                 return Err(EMSGSIZE);
             }
+            sendable(&mut s)?;
             let from = self.datagram_source(&mut s, dest, &options)?;
             let to_peer = s.peer == Some(dest);
             drop(s);
@@ -1123,6 +1133,8 @@ impl InetSocket {
             s = self.lock();
         } else if to.port() != DNS {
             return Err(ENETUNREACH);
+        } else {
+            sendable(&mut s)?;
         }
         if let Some(mut query) = parse_query(bytes, to) {
             query.seq = s.received;
@@ -1189,14 +1201,24 @@ impl InetSocket {
         }
     }
     /// Takes the first datagram that has come, cut to `buf`; a pending
-    /// error first, as Linux's `__skb_try_recv_datagram`.
-    fn receive_datagram(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
+    /// error first, as Linux's `__skb_try_recv_datagram`. With none, a call
+    /// that `waits` on a socket shut down for reading ends at once with 0,
+    /// as `__skb_wait_for_more_packets` does; another is `EAGAIN`.
+    fn receive_datagram(&self, buf: &mut [u8], peek: bool, waits: bool) -> Result<Received, Errno> {
         let mut s = self.lock();
         if let Some(error) = s.error.take() {
             return Err(error);
         }
         let Some((from, bytes, answer)) = self.first_datagram(&s) else {
-            return Err(Errno::EAGAIN);
+            return if s.read_shut && waits {
+                Ok(Received {
+                    count: 0,
+                    length: 0,
+                    from: None,
+                })
+            } else {
+                Err(Errno::EAGAIN)
+            };
         };
         if !peek {
             if answer {
@@ -1660,9 +1682,13 @@ impl FileHandle for InetSocket {
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         if self.datagram {
             let s = self.lock();
-            let ready = self.first_datagram(&s).is_some();
+            // `datagram_poll`: shut for reading is readable and read-hung-up,
+            // and hung up once shut both ways.
+            let ready = self.first_datagram(&s).is_some() || s.read_shut;
             let error = u32::from(s.error.is_some()) * POLLERR;
-            return Ok((OUT | (u32::from(ready) * IN) | error, s.received, 0));
+            let ends = (u32::from(s.read_shut) * POLLRDHUP)
+                | (u32::from(s.read_shut && s.write_shut) * POLLHUP);
+            return Ok((OUT | (u32::from(ready) * IN) | error | ends, s.received, 0));
         }
         let mut s = self.lock();
         // A listener is readable while a connection waits, and no more
@@ -1696,7 +1722,8 @@ impl FileHandle for InetSocket {
         Some(self)
     }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        self.receive(buf, false).map(|received| received.count)
+        self.receive(buf, false, !self.nonblocking())
+            .map(|received| received.count)
     }
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
         self.send(buf, None)
@@ -2058,16 +2085,18 @@ fn receive(
     }
     let peek = flags & MSG_PEEK != 0;
     let dontwait = flags & MSG_DONTWAIT != 0;
+    let waits = !dontwait && !socket.nonblocking();
     let wait = crate::sockets::wait_for(c, socket.timeout(true))?;
-    let mut received =
-        crate::files::wait_for_read_until(c, file, dontwait, wait, || socket.receive(buf, peek))?;
+    let mut received = crate::files::wait_for_read_until(c, file, dontwait, wait, || {
+        socket.receive(buf, peek, waits)
+    })?;
     if socket.datagram || flags & MSG_WAITALL == 0 || peek {
         return Ok(received);
     }
     while received.count > 0 && received.count < buf.len() {
         let rest = &mut buf[received.count..];
         match crate::files::wait_for_read_until(c, file, dontwait, wait, || {
-            socket.receive(rest, false)
+            socket.receive(rest, false, waits)
         }) {
             Ok(more) if more.count > 0 => received.count += more.count,
             _ => break,

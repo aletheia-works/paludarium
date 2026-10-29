@@ -90,10 +90,12 @@ function expand(ip) {
  * A relay: its policy, and `upgrade(request, socket, head)` for a Node.js HTTP
  * server's `upgrade` event. `allow` is the relay's own allow list; `origins`,
  * when given, the page origins it serves; `secret` signs the tickets for
- * resolved addresses (every instance behind one URL needs the same one).
+ * resolved addresses (every instance behind one URL needs the same one);
+ * `maxConnections` caps the WebSockets open at once.
  */
-export function createRelay({ allow, origins, secret = randomBytes(32), resolve = name => lookup(name, { all: true, verbatim: true }), now = Date.now } = {}) {
+export function createRelay({ allow, origins, secret = randomBytes(32), maxConnections = 1024, resolve = name => lookup(name, { all: true, verbatim: true }), now = Date.now } = {}) {
   if (!Array.isArray(allow) || allow.length === 0) throw new TypeError("a relay needs an allow list");
+  if (!Number.isSafeInteger(maxConnections) || maxConnections < 1) throw new TypeError("maxConnections must be a positive integer");
   if (origins !== undefined && (!Array.isArray(origins) || origins.some(origin => typeof origin !== "string"))) throw new TypeError("origins must be an array of strings");
   const rules = allow.map(parseRule), peers = new Set();
   const sign = (name, ip, expires) => createHmac("sha256", secret).update(`${VERSION}\n${name}\n${ip}\n${expires}`).digest("base64url");
@@ -131,6 +133,7 @@ export function createRelay({ allow, origins, secret = randomBytes(32), resolve 
       const refuse = (status, text) => { socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); };
       if (headers.upgrade?.toLowerCase() !== "websocket" || headers["sec-websocket-version"] !== "13" || !/^[A-Za-z0-9+/]{22}==$/.test(key ?? "")) return refuse(400, "Bad Request");
       if (origins !== undefined && !origins.includes(headers.origin)) return refuse(403, "Forbidden");
+      if (peers.size >= maxConnections) return refuse(503, "Service Unavailable");
       // The client fails a handshake that selects none of the protocols it offered: the relay's own, else the first (`lambda-microvms`, for one).
       const offered = (headers["sec-websocket-protocol"] ?? "").split(",").map(item => item.trim()).filter(Boolean);
       const chosen = offered.includes(PROTOCOL) ? PROTOCOL : offered[0];
@@ -138,8 +141,8 @@ export function createRelay({ allow, origins, secret = randomBytes(32), resolve 
       socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n${chosen ? `Sec-WebSocket-Protocol: ${chosen}\r\n` : ""}\r\n`);
       peers.add(new Peer(relay, socket, head, peers));
     },
-    /** Closes every connection. */
-    close() { for (const peer of peers) peer.close(1001); },
+    /** Closes every connection, without waiting for the clients' close frames. */
+    close() { for (const peer of peers) { peer.close(1001); peer.socket.end(); } },
   };
   return relay;
 }
@@ -147,7 +150,7 @@ export function createRelay({ allow, origins, secret = randomBytes(32), resolve 
 /** One WebSocket: a lookup, or a connection. */
 class Peer {
   constructor(relay, socket, head, peers) {
-    Object.assign(this, { relay, socket, peers, buffer: Buffer.from(head ?? []), fragments: null, state: "request", tcp: null, outstanding: 0, closed: false, failed: false });
+    Object.assign(this, { relay, socket, peers, buffer: Buffer.from(head ?? []), fragments: null, state: "request", tcp: null, outstanding: 0, received: 0, written: 0, closed: false, failed: false });
     socket.setNoDelay(true);
     socket.on("data", chunk => this.receive(chunk));
     socket.on("error", () => this.gone());
@@ -157,7 +160,7 @@ class Peer {
   }
   receive(chunk) {
     this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : chunk;
-    while (!this.closed) {
+    while (!this.socket.destroyed) {
       const bytes = this.buffer;
       if (bytes.length < 2) return;
       const fin = (bytes[0] & 0x80) !== 0, opcode = bytes[0] & 15;
@@ -175,9 +178,11 @@ class Peer {
     }
   }
   frame(fin, opcode, payload) {
+    // After its close frame the relay reads only the client's.
+    if (opcode === 8) { this.close(1000); this.socket.end(); return; }
+    if (this.closed) return;
     if (opcode >= 8) {
       if (!fin || payload.length > 125) return this.close(1002);
-      if (opcode === 8) return this.close(1000);
       if (opcode === 9) this.send(10, payload);
       return;
     }
@@ -190,8 +195,8 @@ class Peer {
     } else if (this.fragments || (opcode !== 1 && opcode !== 2)) return this.close(1002);
     else if (!fin) { this.fragments = { opcode, parts: [payload], size: payload.length }; return; }
     if (opcode === 1) this.message(payload.toString());
-    else if (this.state === "open") { if (!this.tcp.write(payload)) { this.socket.pause(); this.tcp.once("drain", () => this.socket.resume()); } }
-    else this.close(1008);
+    else if (this.state === "open") this.upload(payload);
+    else if (this.state !== "done") this.close(1008);
   }
   message(text) {
     let message;
@@ -203,6 +208,8 @@ class Peer {
       if (message.op === "open") return this.open(message);
       return this.close(1008);
     }
+    // What the client sends after the connection closed, before it saw that, is dropped.
+    if (this.state === "done") return;
     if (this.state !== "open") return this.close(1008);
     if (message?.op === "end") this.tcp.end();
     else if (message?.op === "nodelay") this.tcp.setNoDelay(message.on === true);
@@ -211,18 +218,31 @@ class Peer {
       if (this.outstanding < WINDOW) this.tcp.resume();
     } else this.close(1008);
   }
+  /**
+   * Writes the client's bytes to the peer, and credits them back once
+   * written. The WebSocket is never paused, so that its credit messages are
+   * always read: a client that sends more than its window is closed instead.
+   */
+  upload(payload) {
+    this.received += payload.length;
+    if (this.received > WINDOW + MESSAGE) return this.close(1008);
+    this.tcp.write(payload, () => {
+      this.received -= payload.length; this.written += payload.length;
+      if (!this.closed && (this.written >= WINDOW / 4 || this.tcp.writableLength === 0)) { this.json({ op: "credit", bytes: this.written }); this.written = 0; }
+    });
+  }
   async resolve(name) {
     this.state = "resolving";
     let addresses, failed;
     try { addresses = await this.relay.lookup(name); } catch (cause) { failed = cause; }
     if (this.closed) return;
     this.json(addresses ? { op: "resolved", addresses } : { op: "failed", errno: errnoOf(failed) });
-    this.close(1000);
+    this.linger(10_000);
   }
   open(message) {
     this.state = "connecting";
     const target = splitAddress(message.address);
-    if (!target || !this.relay.permits(target.ip, target.port, message.tickets)) { this.json({ op: "failed", errno: ENETUNREACH }); return this.close(1000); }
+    if (!target || !this.relay.permits(target.ip, target.port, message.tickets)) { this.json({ op: "failed", errno: ENETUNREACH }); return this.linger(10_000); }
     // Half-open, as TCP: the peer's end leaves the client able to send.
     const tcp = this.tcp = connect({ host: target.ip, port: target.port, allowHalfOpen: true });
     tcp.on("connect", () => {
@@ -238,7 +258,7 @@ class Peer {
     });
     tcp.on("end", () => { if (!this.closed) this.json({ op: "end" }); });
     tcp.on("error", cause => { if (!this.closed && !this.failed) { this.failed = true; this.json({ op: "failed", errno: errnoOf(cause) }); } });
-    tcp.on("close", () => this.close(1000));
+    tcp.on("close", () => { this.state = "done"; this.linger(30_000); });
   }
   send(opcode, payload) {
     const length = payload.length, header = Buffer.alloc(length < 126 ? 2 : length < 65536 ? 4 : 10);
@@ -249,19 +269,32 @@ class Peer {
     return this.socket.write(Buffer.concat([header, payload]));
   }
   json(value) { this.send(1, Buffer.from(JSON.stringify(value))); }
+  /**
+   * Leaves the closing to the client, which does it once it has the answer
+   * or both ends, so that nothing the relay sent races its close frame; a
+   * client that does not is closed after `ms`.
+   */
+  linger(ms) {
+    if (!this.closed && !this.lingering) this.lingering = setTimeout(() => this.close(1000), ms);
+  }
+  /**
+   * Sends the close frame, and ends the TCP stream to the client only once
+   * the client's close frame came (or after 5 seconds): ending it at once
+   * would reset a client that still sends, which drops what it had received
+   * and not yet read, as the last messages before the close.
+   */
   close(code) {
     if (this.closed) return;
     const payload = Buffer.alloc(2); payload.writeUInt16BE(code);
     this.send(8, payload);
-    this.socket.end();
+    setTimeout(() => this.socket.destroy(), 5_000).unref();
     this.gone();
   }
-  /** Ends the connection's TCP stream after what the client sent, and forgets the peer. */
+  /** Ends the connection's TCP stream to the peer after what the client sent, and forgets the client. */
   gone() {
-    this.closed = true; clearTimeout(this.timer); this.peers.delete(this);
+    this.closed = true; clearTimeout(this.timer); clearTimeout(this.lingering); this.peers.delete(this);
     const tcp = this.tcp;
     if (tcp && !tcp.destroyed) { tcp.end(); tcp.resume(); setTimeout(() => tcp.destroy(), 30_000).unref(); }
-    if (!this.socket.destroyed && this.socket.writableEnded) setTimeout(() => this.socket.destroy(), 5_000).unref();
   }
 }
 
@@ -285,12 +318,13 @@ export async function startRelay({ host = "127.0.0.1", port = 8080, ...options }
   };
 }
 
-// node relay.mjs --listen HOST:PORT --allow ENTRY... [--origin ORIGIN...]; the
-// same settings from PALUDARIUM_RELAY_LISTEN, PALUDARIUM_RELAY_ALLOW and
-// PALUDARIUM_RELAY_ORIGINS (separated by commas or spaces), and the ticket
-// secret from PALUDARIUM_RELAY_SECRET.
+// node relay.mjs --listen HOST:PORT --allow ENTRY... [--origin ORIGIN...]
+// [--max-connections N]; the same settings from PALUDARIUM_RELAY_LISTEN,
+// PALUDARIUM_RELAY_ALLOW, PALUDARIUM_RELAY_ORIGINS (separated by commas or
+// spaces) and PALUDARIUM_RELAY_MAX_CONNECTIONS, and the ticket secret from
+// PALUDARIUM_RELAY_SECRET.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const { values } = parseArgs({ options: { listen: { type: "string" }, allow: { type: "string", multiple: true }, origin: { type: "string", multiple: true } } });
+  const { values } = parseArgs({ options: { listen: { type: "string" }, allow: { type: "string", multiple: true }, origin: { type: "string", multiple: true }, "max-connections": { type: "string" } } });
   const list = text => (text ?? "").split(/[\s,]+/).filter(Boolean);
   const listen = splitAddress(values.listen ?? process.env.PALUDARIUM_RELAY_LISTEN ?? "127.0.0.1:8080");
   if (!listen) throw new TypeError("--listen must be ip:port or [ipv6]:port");
@@ -300,6 +334,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     allow: [...(values.allow ?? []), ...list(process.env.PALUDARIUM_RELAY_ALLOW)],
     origins: origins.length ? origins : undefined,
     secret: process.env.PALUDARIUM_RELAY_SECRET || undefined,
+    maxConnections: Number(values["max-connections"] ?? process.env.PALUDARIUM_RELAY_MAX_CONNECTIONS ?? 1024),
   });
   console.log(JSON.stringify({ url: server.url }));
   for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => void server.close().then(() => process.exit(0)));

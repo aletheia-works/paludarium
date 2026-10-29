@@ -122,7 +122,9 @@ test("a ticket lets a client connect to what an allowed name resolved to", async
   const resolved = await resolver.next();
   // The private address is left out: only the loopback, for localhost.
   assert.deepEqual(resolved.addresses.map(item => item.address), ["127.0.0.1"]);
-  assert.deepEqual(await resolver.next(), { closed: 1000 });
+  // The relay leaves the closing to the client.
+  assert.equal(await resolver.next(100), undefined);
+  resolver.ws.close();
   const open = async tickets => {
     const connection = await client(url);
     connection.send({ v: 1, op: "open", address: `127.0.0.1:${port}`, tickets });
@@ -132,12 +134,17 @@ test("a ticket lets a client connect to what an allowed name resolved to", async
   assert.equal(reply.op, "connected");
   connection.send(new TextEncoder().encode("xping"));
   connection.send({ op: "end" });
-  assert.equal(new TextDecoder().decode(await connection.next()), "ping");
-  assert.deepEqual(await connection.next(), { op: "end" });
-  assert.deepEqual(await connection.next(), { closed: 1000 });
+  // The relay credits the bytes it wrote to the peer.
+  const skip = async () => { let item; do item = await connection.next(); while (item?.op === "credit"); return item; };
+  assert.equal(new TextDecoder().decode(await skip()), "ping");
+  assert.deepEqual(await skip(), { op: "end" });
+  connection.ws.close();
+  assert.deepEqual(await skip(), { closed: 1000 });
   const forged = resolved.addresses[0].ticket.replace(/.$/, last => last === "A" ? "B" : "A");
   for (const tickets of [undefined, [], [{ name: "localhost", ticket: forged }], [{ name: "other.localhost", ticket: resolved.addresses[0].ticket }], [{ name: "localhost", ticket: "1.x" }]]) {
-    assert.deepEqual((await open(tickets)).reply, { op: "failed", errno: 101 }, JSON.stringify(tickets));
+    const refused = await open(tickets);
+    assert.deepEqual(refused.reply, { op: "failed", errno: 101 }, JSON.stringify(tickets));
+    refused.connection.ws.close();
   }
   // A request of another version is refused.
   const old = await client(url);
@@ -166,6 +173,45 @@ test("the relay sends no more than its window ahead of the credit", async (t) =>
     await take(before + 1);
   }
   assert.equal(received, size);
+});
+
+test("a peer that writes before it reads does not stall a long upload", async (t) => {
+  // The peer reads nothing until its whole reply is written, so the upload
+  // waits on the reply's credit and the reply on the upload's; each is more
+  // than the loopback's socket buffers hold.
+  const size = 64 * WINDOW, reply = new Uint8Array(size), chunk = new Uint8Array(65536);
+  const port = await server(t, socket => {
+    socket.pause();
+    let uploaded = 0;
+    socket.write(reply, () => socket.resume());
+    socket.on("data", bytes => { uploaded += bytes.length; if (uploaded === size) socket.end(); });
+  });
+  const { url } = await relay(t, { allow: [`127.0.0.1:${port}`] });
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  const done = await new Promise((resolve, reject) => {
+    let sent = 0, unacked = 0, received = 0;
+    const upload = () => { while (sent < size && unacked < WINDOW) { ws.send(chunk); sent += chunk.length; unacked += chunk.length; } };
+    ws.addEventListener("open", () => ws.send(JSON.stringify({ v: 1, op: "open", address: `127.0.0.1:${port}` })));
+    ws.addEventListener("message", event => {
+      if (typeof event.data !== "string") { received += event.data.byteLength; ws.send(JSON.stringify({ op: "credit", bytes: event.data.byteLength })); return; }
+      const message = JSON.parse(event.data);
+      if (message.op === "connected") upload();
+      else if (message.op === "credit") { unacked -= message.bytes; upload(); }
+      else if (message.op === "end") resolve({ sent, received });
+      else reject(new Error(event.data));
+    });
+    ws.addEventListener("close", () => reject(new Error("closed")));
+  });
+  ws.close();
+  assert.deepEqual(done, { sent: size, received: size });
+});
+
+test("the relay refuses connections beyond its cap", async (t) => {
+  const { url } = await relay(t, { allow: ["localhost"], maxConnections: 1 });
+  const first = await client(url);
+  await assert.rejects(client(url));
+  first.ws.close();
 });
 
 test("the relay picks a subprotocol the client offered, and checks the origin", async (t) => {

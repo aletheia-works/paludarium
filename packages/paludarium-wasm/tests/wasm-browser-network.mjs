@@ -32,7 +32,7 @@ const page = `<!doctype html><script type="module">
 import { createPaludarium } from '/packages/paludarium-wasm/index.mjs';
 import { DNS, TCP, data, elf, hex, query } from '/packages/paludarium-wasm/tests/wasm-network-guests.mjs';
 const port = ${port}, length = ${reply.length}, relay = { url: ${JSON.stringify(relay.url)}, protocols: ['lambda-microvms', 'lambda-microvms.port.8080'] };
-const cases = {};
+const cases = {}, details = {};
 try {
   if (!crossOriginIsolated) throw new Error('Shared memory unavailable');
   const runtime = await createPaludarium({ wasmUrl: '/production.wasm' });
@@ -49,7 +49,9 @@ try {
   const echo = await run(tcp('ehello'), { allow, relay });
   cases.echo = echo.status.code === 0 && new TextDecoder().decode(echo.stdout) === 'hello';
   const long = await run(tcp('l'), { allow, relay });
-  cases.long = long.status.code === 0 && long.stdout.length === length && long.stdout.every((byte, index) => byte === ((index * 7) & 255));
+  const wrong = long.stdout.findIndex((byte, index) => byte !== ((index * 7) & 255));
+  cases.long = long.status.code === 0 && long.stdout.length === length && wrong < 0;
+  details.long = { status: long.status, length: long.stdout.length, wrong };
   cases.refused = (await run(tcp('ehello'), { allow: [\`127.0.0.1:\${port + 1}\`], relay })).status.code === 101;
   const ask = async name => {
     const bytes = data(53), question = query(name);
@@ -64,8 +66,8 @@ try {
   try { runtime.run({ program: '/guest', files: { '/guest': tcp('ehello') }, network: { allow } }); } catch (error) { unimplemented = error.kind; }
   cases.unimplemented = unimplemented === 'unimplemented';
   await runtime.dispose();
-  window.__wasmReport = { cases, passed: Object.values(cases).every(Boolean) };
-} catch (error) { window.__wasmReport = { cases, passed: false, error: String(error) }; }
+  window.__wasmReport = { cases, details, passed: Object.values(cases).every(Boolean) };
+} catch (error) { window.__wasmReport = { cases, details, passed: false, error: String(error) }; }
 </script>`;
 const server = createHttpServer(async (request, response) => {
   const headers = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp", "Cache-Control": "no-store" };

@@ -6,6 +6,8 @@ export interface RelaySettings {
   origins?: readonly string[];
   /** The key that signs the tickets for resolved addresses; every instance behind one URL needs the same one (default: random). */
   secret?: string | Uint8Array;
+  /** The most WebSockets open at once; beyond it a handshake is refused with 503 (default 1024). */
+  maxConnections?: number;
 }
 export interface Relay {
   /** For a Node.js HTTP server's `upgrade` event. */

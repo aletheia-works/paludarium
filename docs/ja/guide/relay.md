@@ -52,6 +52,7 @@ node node_modules/@aletheia-works/paludarium-wasm/relay.mjs \
 | `--listen ip:port` | `PALUDARIUM_RELAY_LISTEN` | 待ち受ける場所（既定は `127.0.0.1:8080`） |
 | `--allow entry`（複数可） | `PALUDARIUM_RELAY_ALLOW` | 中継の許可リスト。`network.allow` と同じ書き方で、必須 |
 | `--origin origin`（複数可） | `PALUDARIUM_RELAY_ORIGINS` | 指定すると、受けるページの origin をこれだけにする |
+| `--max-connections n` | `PALUDARIUM_RELAY_MAX_CONNECTIONS` | 同時に開いておく WebSocket の最大数（既定は 1024）。超えたハンドシェイクは `503` |
 | | `PALUDARIUM_RELAY_SECRET` | [チケット](#names-and-tickets) に署名する鍵。ないときは乱数 |
 
 環境変数には、カンマか空白で区切った一覧を書きます。オプションに足されます。
@@ -64,6 +65,9 @@ node node_modules/@aletheia-works/paludarium-wasm/relay.mjs \
   アドレスそのもの（`127.0.0.1:8080`）を書きます。
 - **origin の確認**はブラウザ向けで、ほかのサイトのページが中継を使うのを防ぎます。
   ほかのクライアントはどんな `Origin` でも送れるので、それを防ぐのは許可リストです。
+- **上限。** 中継が接続する先は許可リストで、同時に運ぶ接続の数は
+  `--max-connections` で限られます。クライアントごとの回数の制限はないので、公開する
+  中継に要るなら、前に置いてください。
 - **同じ URL の後ろに中継を何台も置く**ときは、`PALUDARIUM_RELAY_SECRET` を
   そろえます。名前を引いたのとは別の台に、接続が届くことがあるからです。
 
@@ -71,11 +75,13 @@ node node_modules/@aletheia-works/paludarium-wasm/relay.mjs \
 （`@aletheia-works/paludarium-wasm/relay`）。スクリプトから起動したり、自分の HTTP
 サーバーにつないだりできます。
 
-コンテナのイメージには、Node.js とパッケージだけが要ります。
+コンテナのイメージには、Node.js とパッケージだけが要ります（使う版を
+`PALUDARIUM_VERSION` に書きます）。
 
 ```dockerfile
 FROM node:latest
-RUN npm install -g @aletheia-works/paludarium-wasm
+ARG PALUDARIUM_VERSION=latest
+RUN npm install -g @aletheia-works/paludarium-wasm@${PALUDARIUM_VERSION}
 ENV PALUDARIUM_RELAY_LISTEN=0.0.0.0:8080
 EXPOSE 8080
 CMD ["sh", "-c", "exec node \"$(npm root -g)/@aletheia-works/paludarium-wasm/relay.mjs\""]
@@ -106,7 +112,7 @@ CMD ["sh", "-c", "exec node \"$(npm root -g)/@aletheia-works/paludarium-wasm/rel
 { "v": 1, "op": "resolve", "name": "github.com" }
 ```
 
-中継は 1 回だけ答えて、1000 で閉じます。
+中継は 1 回だけ答え、そのあとクライアントが 1000 で閉じます。
 
 ```json
 { "op": "resolved", "addresses": [{ "address": "140.82.112.3", "ticket": "1761700000000.q5…" }] }
@@ -140,7 +146,7 @@ HMAC-SHA256（base64url）です。クライアントは、受け取ったアド
 ```
 
 で、中継の側の端のアドレス（ゲストの `getsockname`）を返します。許さないときは
-`{ "op": "failed", "errno": 101 }` を返して、1000 で閉じます。
+`{ "op": "failed", "errno": 101 }` を返し、そのあとクライアントが閉じます。
 
 接続したあとは次のとおりです。
 
@@ -151,15 +157,25 @@ HMAC-SHA256（base64url）です。クライアントは、受け取ったアド
 | `{ "op": "end" }` | 中継 | 相手が閉じた。入力の終わり |
 | `{ "op": "nodelay", "on": true }` | クライアント | `TCP_NODELAY` |
 | `{ "op": "credit", "bytes": n }` | クライアント | ゲストがさらに n バイト受け取った |
+| `{ "op": "credit", "bytes": n }` | 中継 | 中継が相手にさらに n バイト書いた |
 | `{ "op": "failed", "errno": n }` | 中継 | 接続が失敗したか、リセットされた |
 
-- **流れの制御。** 中継は、クライアントのクレジットより先には、1 本の接続で
-  256 KiB までしか送らず、クレジットが来るまで相手から読むのを止めます。
-  クライアントは、ゲストが受け取った分を、その 4 分の 1 ずつクレジットとして返し、
-  受け取りが止まっていたときはすぐに返します。クライアントのほうも、WebSocket の
-  バッファに 1 MiB たまっている間は送りません。
-- **閉じる。** ゲストがソケットを閉じると、クライアントは WebSocket を 1000 で
-  閉じます。中継は、クライアントが送った分を送ってから TCP を閉じます。中継は、
-  TCP の接続が閉じたら（`end` や `failed` を送ったあとで）1000 で閉じます。
-  `end` の前にほかの形で閉じた WebSocket は、ゲストにはリセット（`ECONNRESET`）で、
-  `connected` の前に閉じたものは `ENETUNREACH` です。
+- **流れの制御**は両方向で同じです。どちらの側も、1 本の接続で、相手のクレジットより
+  先には 256 KiB までしか送りません。
+  - 中継は、クレジットが来るまで相手から読むのを止めます。クライアントは、ゲストが
+    受け取った分を、その 4 分の 1 ずつクレジットとして返し、受け取りが止まっていた
+    ときはすぐに返します。
+  - 中継は、相手に書いた分を、その 4 分の 1 ずつ、書く分が残っていないときはすぐに、
+    クレジットとして返します。WebSocket から読むのは止めないので、クレジットは
+    いつでも届きます。窓より多く送ってきたクライアントの WebSocket は 1008 で閉じます。
+- **閉じる。** WebSocket はクライアントが 1000 で閉じます。答えを受け取ったあと、
+  両方が `end` を送ったあと、`failed` のあと、ゲストの実行が終わったときです。
+  中継は、クライアントが送った分を送ってから TCP を閉じます。
+  - 中継は閉じるのをクライアントに任せます。中継が送ったものが、close フレームと
+    競わないようにするためです（WebKit は、そういうメッセージを落としたことがあります）。
+    中継が先に閉じるのは、通信の決まりに反したとき、時間切れ（要求のないまま、または
+    答えたあと 10 秒、TCP の接続が閉じてから 30 秒）、止めるとき（1001）だけです。
+    そのときも、クライアントの close フレームが来てから、または 5 秒たってから、
+    TCP を閉じます。
+  - クライアントが閉じる前に閉じた WebSocket は、ゲストには、`connected` の前なら
+    `ENETUNREACH`、そのあとは、相手の `end` が来ていなければリセット（`ECONNRESET`）です。

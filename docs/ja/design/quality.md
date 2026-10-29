@@ -34,6 +34,13 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   Linux での名前解決は、実行するマシンのファイルとサーバーによって変わるので、
   エミュレータの上でだけ、`localhost` を相手に確かめます。UDP は musl のリゾルバを
   通して、TCP は自前の問い合わせで確かめます。
+- WebAssembly のパッケージのネットワークは、Node.js（`wasm-network.test.mjs`）と
+  [中継](../guide/relay) を通したもの（`wasm-relay.test.mjs`）で確かめます。どちらも、
+  単独で動くゲストが、テストが 127.0.0.1 で動かすサーバーに届き、`localhost` を
+  引きます。中継のテストは、中継の許可リストとチケット、両方向の流れの制御
+  （すべて書いてからでないと読まない相手も含む）、カーネルの規則と同じであることを
+  確かめます。CI では `wasm-browser-network.mjs` が、Chromium、Firefox、WebKit、Safari で
+  ゲストに中継を通させます。
 
 ## ファジング
 

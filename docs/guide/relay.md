@@ -54,6 +54,7 @@ WebSocket on any path, and answers `GET /healthz` with `ok`.
 | `--listen ip:port` | `PALUDARIUM_RELAY_LISTEN` | Where to listen (default `127.0.0.1:8080`) |
 | `--allow entry` (repeated) | `PALUDARIUM_RELAY_ALLOW` | The relay's allow list, read as `network.allow` is; required |
 | `--origin origin` (repeated) | `PALUDARIUM_RELAY_ORIGINS` | When given, the only page origins it accepts |
+| `--max-connections n` | `PALUDARIUM_RELAY_MAX_CONNECTIONS` | The most WebSockets open at once (default 1024); beyond it a handshake is `503` |
 | | `PALUDARIUM_RELAY_SECRET` | The key that signs [tickets](#names-and-tickets); random if unset |
 
 Environment variables hold lists separated by commas or spaces, and add to
@@ -68,6 +69,10 @@ the options.
 - **The origin check** is for browsers: it keeps other sites' pages from
   using the relay. It does not stop other clients, which can send any
   `Origin`; the allow list does.
+- **Limits.** The allow list bounds where the relay connects, and
+  `--max-connections` how many connections it carries at once. It has no
+  rate limit for each client: put one in front of a public relay if it
+  needs one.
 - **Several instances** behind one URL need the same
   `PALUDARIUM_RELAY_SECRET`, since a connection may reach another instance
   than the lookup before it.
@@ -76,11 +81,13 @@ The module also exports `startRelay(settings)` and `createRelay(settings)`
 (`@aletheia-works/paludarium-wasm/relay`), to start one from a script or
 attach one to an HTTP server of one's own.
 
-A container image needs only Node.js and the package:
+A container image needs only Node.js and the package (name the version you
+deploy in `PALUDARIUM_VERSION`):
 
 ```dockerfile
 FROM node:latest
-RUN npm install -g @aletheia-works/paludarium-wasm
+ARG PALUDARIUM_VERSION=latest
+RUN npm install -g @aletheia-works/paludarium-wasm@${PALUDARIUM_VERSION}
 ENV PALUDARIUM_RELAY_LISTEN=0.0.0.0:8080
 EXPOSE 8080
 CMD ["sh", "-c", "exec node \"$(npm root -g)/@aletheia-works/paludarium-wasm/relay.mjs\""]
@@ -112,7 +119,7 @@ them, and a connection's flow control is its WebSocket's.
 { "v": 1, "op": "resolve", "name": "github.com" }
 ```
 
-The relay answers once and closes the WebSocket with 1000:
+The relay answers once, and the client then closes the WebSocket (1000):
 
 ```json
 { "op": "resolved", "addresses": [{ "address": "140.82.112.3", "ticket": "1761700000000.q5…" }] }
@@ -148,7 +155,7 @@ address is one the name may reach. It answers
 ```
 
 with the address of its own end (the guest's `getsockname`), or
-`{ "op": "failed", "errno": 101 }` and closes with 1000.
+`{ "op": "failed", "errno": 101 }`, after which the client closes it.
 
 Once connected:
 
@@ -159,16 +166,27 @@ Once connected:
 | `{ "op": "end" }` | relay | The peer did: the end of input |
 | `{ "op": "nodelay", "on": true }` | client | `TCP_NODELAY` |
 | `{ "op": "credit", "bytes": n }` | client | The guest took `n` more bytes |
+| `{ "op": "credit", "bytes": n }` | relay | The relay wrote `n` more bytes to the peer |
 | `{ "op": "failed", "errno": n }` | relay | The connection failed or was reset |
 
-- **Flow control.** The relay sends at most 256 KiB of a connection ahead
-  of the client's credit, and stops reading from the peer until more
-  credit comes. The client credits what the guest took, in quarters of
-  that, and at once when it had stopped taking. The client in turn sends
-  no more while the WebSocket's buffer holds 1 MiB.
-- **Closing.** The client closes the WebSocket (1000) when the guest closed
-  the socket; the relay then ends its TCP stream after what the client
-  sent. The relay closes it (1000) once its TCP connection closed, after
-  any `end` or `failed`. A WebSocket closed otherwise before `end` is a
-  reset (`ECONNRESET`) to the guest, and one closed before `connected` is
-  `ENETUNREACH`.
+- **Flow control**, the same in both directions: neither side sends more
+  than 256 KiB of a connection ahead of the other's credit.
+  - The relay stops reading from the peer until more credit comes. The
+    client credits what the guest took, in quarters of that, and at once
+    when it had stopped taking.
+  - The relay credits what it wrote to the peer, in quarters of that, and
+    at once when nothing is left to write. It never stops reading the
+    WebSocket, so that credit always reaches it, and closes one whose
+    client sent more than its window (1008).
+- **Closing.** The client closes the WebSocket (1000): after an answer,
+  once both sides sent `end`, after `failed`, or when the guest's run
+  ends. The relay then ends its TCP stream after what the client sent.
+  - The relay leaves the closing to the client, so that nothing it sent
+    races its close frame (WebKit has dropped such messages). It closes
+    first only for a protocol error, a timeout (10 seconds without a
+    request or after an answer, 30 seconds after its TCP connection
+    closed) or its shutdown (1001), and ends its TCP stream once the
+    client's close frame comes, or after 5 seconds.
+  - A WebSocket that closes before the client closed it is `ENETUNREACH`
+    to the guest before `connected`, and a reset (`ECONNRESET`) after it,
+    unless the peer's `end` came.

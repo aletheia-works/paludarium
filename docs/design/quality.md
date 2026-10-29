@@ -36,6 +36,14 @@ CI run produces them afresh on an x86-64 Linux runner.
   listens on. Name resolution on Linux depends on the runner's own files and
   servers, so it is checked under the emulator only, against `localhost`,
   over UDP through musl's resolver and over TCP with a query of its own.
+- The WebAssembly package's network is checked on Node.js
+  (`wasm-network.test.mjs`) and through the [relay](../guide/relay)
+  (`wasm-relay.test.mjs`): freestanding guests reach a server the test runs
+  on 127.0.0.1, and `localhost` is resolved. The relay's own tests cover its
+  allow list and tickets, its window in both directions (with a peer that
+  writes everything before it reads anything) and its parity with the
+  kernel's rules. `wasm-browser-network.mjs` runs the guests through the
+  relay in Chromium, Firefox, WebKit and Safari in CI.
 
 ## Fuzzing
 

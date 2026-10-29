@@ -62,13 +62,15 @@ function relayLookup(job, name) {
 function relaySocket(job, target) {
   const listeners = new Map(), tickets = [...(job.tickets.get(target.ip) ?? [])].map(([name, ticket]) => ({ name, ticket }));
   const ws = relayWebSocket(job.relay, { op: "open", address: joinAddress(target.ip, target.port), tickets });
-  let state = "connecting", failed = false, ended = false, paused = false, held = 0, unreported = 0, noDelay = false, draining = false;
+  let state = "connecting", failed = false, ended = false, sentEnd = false, paused = false, held = 0, unreported = 0, unacked = 0, noDelay = false, draining = false;
   const emit = (event, value) => { for (const listener of [...(listeners.get(event) ?? [])]) { if (listener.once) listeners.get(event).delete(listener); listener.callback(value); } };
   const add = (event, callback, once) => { if (!listeners.has(event)) listeners.set(event, new Set()); listeners.get(event).add({ callback, once }); return socket; };
   const send = value => { if (ws.readyState === WebSocket.OPEN) ws.send(value); };
   // The relay sends up to WINDOW bytes ahead of what the guest took: credit them back in quarters, and at once when a pause ends.
   const credit = force => { if (unreported && (force || unreported >= WINDOW / 4)) { send(JSON.stringify({ op: "credit", bytes: unreported })); unreported = 0; } };
   const fail = errno => { if (!failed) { failed = true; emit("error", { paludariumErrno: errno }); } };
+  // The client closes the WebSocket, once both sides ended or the relay reported an error: the relay leaves it to the client.
+  const finish = () => { if (state === "closed") return; state = "closed"; if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) ws.close(1000); emit("close"); };
   ws.addEventListener("message", event => {
     if (typeof event.data !== "string") {
       if (state !== "open") return;
@@ -84,31 +86,32 @@ function relaySocket(job, target) {
       state = "open"; socket.localAddress = local?.ip ?? "0.0.0.0"; socket.localPort = local?.port ?? 0;
       if (noDelay) send(JSON.stringify({ op: "nodelay", on: true }));
       emit("connect");
-    } else if (message?.op === "end") { ended = true; emit("end"); }
-    else if (message?.op === "failed") fail(message.errno);
+    } else if (message?.op === "credit" && Number.isSafeInteger(message.bytes) && message.bytes >= 0) {
+      unacked = Math.max(0, unacked - message.bytes);
+      if (draining && unacked < WINDOW) { draining = false; emit("drain"); }
+    } else if (message?.op === "end") { ended = true; emit("end"); if (sentEnd) finish(); }
+    else if (message?.op === "failed") { fail(message.errno); finish(); }
   });
-  ws.addEventListener("close", event => {
-    // A relay closes cleanly after the peer's end or an error it reported; anything else is lost.
+  // A WebSocket that closed before the client closed it is lost: unreachable before connecting, a reset after.
+  ws.addEventListener("close", () => {
+    if (state === "closed") return;
     if (state !== "open") fail(ENETUNREACH);
-    else if (!ended && event.code !== 1000) fail(ECONNRESET);
-    state = "closed"; emit("close");
+    else if (!ended) fail(ECONNRESET);
+    finish();
   });
   const socket = {
     localAddress: undefined, localPort: undefined,
     on: (event, callback) => add(event, callback, false),
     once: (event, callback) => add(event, callback, true),
+    // The relay credits what it wrote to the peer: no more than WINDOW goes ahead of that.
     write(bytes) {
-      send(bytes);
-      if (ws.bufferedAmount < 1024 * 1024) return true;
-      if (!draining) {
-        draining = true;
-        const check = () => { if (state !== "open") return; if (ws.bufferedAmount >= 256 * 1024) { setTimeout(check, 10); return; } draining = false; emit("drain"); };
-        setTimeout(check, 10);
-      }
+      send(bytes); unacked += bytes.length;
+      if (unacked < WINDOW) return true;
+      draining = true;
       return false;
     },
-    end() { send(JSON.stringify({ op: "end" })); },
-    destroy() { if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) ws.close(1000); },
+    end() { if (sentEnd) return; sentEnd = true; send(JSON.stringify({ op: "end" })); if (ended) finish(); },
+    destroy() { finish(); },
     pause() { paused = true; },
     resume() { if (!paused) return; paused = false; unreported += held; held = 0; credit(true); },
     setNoDelay(on) { noDelay = on; if (state === "open") send(JSON.stringify({ op: "nodelay", on })); },

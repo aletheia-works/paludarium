@@ -29,6 +29,8 @@ OTHER = "c" * 40
 GUESTS = {"probe": "1" * 64, "aube": "2" * 64}
 MODULE = "3" * 64
 API = "https://api.github.com/repos/" + policy.REPOSITORY + "/"
+# Upload times of the artifacts of one run, by attempt.
+EARLIER, CREATED, LATER = "2026-10-29T20:06:51Z", "2026-10-29T23:14:35Z", "2026-10-30T01:00:00Z"
 
 
 def row(stdout="", stderr="", exit=0):
@@ -213,6 +215,7 @@ class FakeApi:
                     digest="sha256:" + A.sha(raw),
                     archive_download_url=url,
                     workflow_run=dict(id=run["id"], head_sha=run["head_sha"]),
+                    created_at=CREATED,
                 )
                 item.update(world.tamper.get(name, {}))
                 items.append(item)
@@ -231,6 +234,35 @@ class FakeApi:
 
     def download(self, url):
         return self.archives[url]
+
+    def rerun(self, workflow, name, created_at, change=None):
+        """Another attempt's artifact of the same name, as a re-run of failed jobs leaves it."""
+        run = self.world.runs[workflow]
+        members = dict(self.world.members[workflow][name])
+        if change:
+            for member, data in members.items():
+                document = json.loads(data)
+                change(document)
+                members[member] = encode(document)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for member, data in members.items():
+                archive.writestr(member, data)
+        raw = buffer.getvalue()
+        items = self.listings[("artifacts", run["id"])]
+        artifact_id = run["id"] * 100 + 50 + len(items)
+        url = API + f"actions/artifacts/{artifact_id:d}/zip"
+        self.archives[url] = raw
+        item = dict(
+            next(i for i in items if i["name"] == name),
+            id=artifact_id,
+            size_in_bytes=len(raw),
+            digest="sha256:" + A.sha(raw),
+            archive_download_url=url,
+            created_at=created_at,
+        )
+        items.append(item)
+        return item
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -458,6 +490,37 @@ class AcceptanceTests(unittest.TestCase):
         api.listings["runs"] = api.listings["runs"] * 30
         with self.assertRaisesRegex(ValueError, "paginated listing refused"):
             A.produce(api, HEAD)
+
+    def test_rerun_uses_the_latest_attempt(self):
+        def failed(document):
+            document.update(complete=False, rows={})
+
+        source = "wasm-safari"
+        api = self.world.api()
+        stale = api.rerun(A.FULL_QUALITY, source, EARLIER, failed)
+        document = A.produce(api, HEAD)
+        ids = [a["id"] for a in document["evidence"][source]["artifacts"] if a["name"] == source]
+        self.assertEqual(len(ids), 1)
+        self.assertNotEqual(ids, [stale["id"]])
+        with self.subTest("latest attempt failed"):
+            api = self.world.api()
+            api.rerun(A.FULL_QUALITY, source, LATER, failed)
+            with self.assertRaisesRegex(ValueError, "wasm-safari"):
+                A.produce(api, HEAD)
+        with self.subTest("no single latest attempt"):
+            api = self.world.api()
+            api.rerun(A.FULL_QUALITY, source, CREATED)
+            with self.assertRaisesRegex(ValueError, "duplicated without one latest attempt"):
+                A.produce(api, HEAD)
+        with self.subTest("measurement taken again"):
+            api = self.world.api()
+            api.rerun(A.FULL_QUALITY, "wasm-node", LATER)
+            with self.assertRaisesRegex(ValueError, "performance is measured once per head"):
+                A.produce(api, HEAD)
+
+    def test_artifact_absent(self):
+        del self.world.members[A.FULL_QUALITY]["wasm-safari"]
+        self.rejected("quality.yml: artifact wasm-safari absent")
 
     def test_unreadable_artifact(self):
         # A ZIP whose official digest matches but whose bytes are not an archive.

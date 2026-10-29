@@ -20,6 +20,12 @@ release PR をマージするかどうかだけです。詳しい手順と、す
 5. **タグ**：すべての公開が成功した後で、最後にタグと GitHub Release を作ります。
    GitHub Release の本文には、マージした release PR の本文のリリースノートを使います。
 
+確かめの job がエミュレーターと関係のない理由（ブラウザーがページを読み込めなかった、runner が
+なかったなど）で失敗したら、同じ run の中でその job を再実行します。そのあと、release-acceptance がもう
+動いていればその失敗した job を、最後に Publish の run の失敗した job を再実行します。再実行した job の artifact は、いちばん新しい attempt のものを使います。
+ただし、速さを測る `wasm-programs / differential (ubuntu-latest, node)` の job は再実行できません。
+同じバイナリーで測り直すことになるためです。
+
 公開に失敗したら、同じ run の中で止まった job を再実行します。公開済みの版は digest を
 確かめるだけで飛ばし、残りだけを公開します。公開されていない版にタグが付くことはありません。
 

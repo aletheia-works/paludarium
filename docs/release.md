@@ -107,7 +107,12 @@ built guests differ by design.
 
 Shared checks: all native documents are complete (`differential_complete`,
 `native_complete`), each artifact is unexpired, belongs to the selected run
-and head, and its ZIP matches the official `digest` and size. The four Wasm
+and head, and its ZIP matches the official `digest` and size. Re-running the
+failed jobs of a run keeps the earlier attempt's artifacts, so a job run
+again leaves one artifact of the same name per attempt; the newest one (by
+`created_at`, which must be unique) is that job's latest attempt and is the
+one checked. `wasm-node` holds the performance measurement and must stay
+single: a re-run of its job measures the same binary again and is refused. The four Wasm
 environments must report one module and one oracle digest (the exact bytes of
 `wasm-acceptance-inputs`), and the measurement must name the same module,
 oracle and probe. `artifact_sha256` of each condition is the SHA-256 of the
@@ -234,7 +239,12 @@ itself.
    already dispatched for the head is reused, never doubled), waits for all
    of them, then dispatches `release-acceptance.yml` once and waits for it. A
    failed run is not dispatched again (performance is measured once per head);
-   the head then needs a person. When the version is already tagged or the
+   the head then needs a person. A job that failed for a reason outside the
+   emulator (a browser that did not load the page, a runner that was not
+   available) may be re-run in the same run, except the
+   `wasm-programs / differential (ubuntu-latest, node)` job that measures
+   performance; then re-run the failed jobs of `release-acceptance` if it
+   already ran, and of the `Publish` run, which reuses those same runs. When the version is already tagged or the
    head is no longer main, the run does nothing.
 
    **By hand** (only when the automatic run stopped and the cause is

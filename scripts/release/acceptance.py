@@ -121,6 +121,8 @@ for _env, _os in WASM_OS.items():
         f"wasm-programs / differential ({_os}, {_env})",
         {"wasm-" + _env: ("observations.json",), **WASM_INPUTS},
     )
+# Artifacts holding a measurement; a rerun would measure the same binary again.
+MEASURED = frozenset(SOURCES["performance"][2])
 # Emulated document -> its native oracle, per host source.
 HOST_PAIRS = {
     "macos-native": (
@@ -287,10 +289,8 @@ class Collector:
                 self.api, "actions/runs/{:d}/artifacts".format(run["id"]), "artifacts"
             )
         found = [a for a in self._artifacts[run["id"]] if a.get("name") == name]
-        policy.require(
-            len(found) == 1, "{}: artifact {} absent or duplicated".format(run["path"], name)
-        )
-        item = found[0]
+        policy.require(bool(found), "{}: artifact {} absent".format(run["path"], name))
+        item = latest(found, run["path"] + ": artifact " + name)
         policy.require(
             item.get("expired") is False
             and item["workflow_run"]["id"] == run["id"]
@@ -304,6 +304,28 @@ class Collector:
         )
         self._downloads[key] = (item, raw)
         return item, raw
+
+
+def latest(found, label):
+    """The artifact of the latest attempt among same-name artifacts of one run.
+
+    Re-running failed jobs keeps the artifacts of the earlier attempt, so a
+    name the rerun job uploads again appears once per attempt; the newest one
+    is that job's latest attempt. The performance artifact is measured once
+    per head, so a second one is refused.
+    """
+    if len(found) == 1:
+        return found[0]
+    policy.require(
+        found[0].get("name") not in MEASURED,
+        label + " duplicated; performance is measured once per head",
+    )
+    times = sorted((a.get("created_at") or "", a.get("id")) for a in found)
+    policy.require(
+        all(t for t, _ in times) and times[-1][0] > times[-2][0],
+        label + " duplicated without one latest attempt",
+    )
+    return next(a for a in found if a.get("id") == times[-1][1])
 
 
 def read_members(raw, names, label):

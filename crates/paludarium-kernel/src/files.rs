@@ -360,7 +360,7 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
 fn pseudo_fs(kind: u64) -> paludarium_host::FsStats {
     paludarium_host::FsStats {
         kind,
-        block_size: 4096,
+        block_size: u64::from(BLOCK_SIZE),
         name_max: 255,
         ..Default::default()
     }
@@ -1195,8 +1195,9 @@ pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
 fn device(c: &Context<'_>, path: &[u8]) -> u64 {
     crate::page_cache::mount_device(&c.files.fs.mounts(), path)
 }
-/// The block size of every file system the guest sees: `st_blksize`,
-/// `stx_blksize` and `FIGETBSZ`, which Linux all take from the superblock.
+/// The block size of a guest's file: `st_blksize`, `stx_blksize`,
+/// `FIGETBSZ`, and `f_bsize` of a pipe or a socket, which Linux all take from
+/// the superblock. A mounted directory's `statfs` reports the host's own.
 pub(crate) const BLOCK_SIZE: u32 = 4096;
 /// `st_blocks`: what the file system counts, or the size in 512-byte blocks.
 pub(crate) fn blocks(s: &FileStat) -> u64 {

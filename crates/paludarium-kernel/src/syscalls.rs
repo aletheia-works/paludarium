@@ -1697,7 +1697,9 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 }
                 return Ok(0);
             }
-            // FIGETBSZ: the block size of the file's file system, as an int.
+            // FIGETBSZ: the block size of the file's file system, as an int
+            // (Linux's `EINVAL` for one without, such as overlayfs, is not
+            // given).
             0x2 => {
                 c.mem
                     .write(GuestAddr(a[2]), &crate::files::BLOCK_SIZE.to_le_bytes())

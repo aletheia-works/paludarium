@@ -3154,7 +3154,9 @@ int main(int argc, char **argv) {
             if (fd == m) printf(" blocks=%d", size == (long long)st.st_blocks * 512);
             putchar('\n');
             /* The pseudo filesystems' block size is the page's; a file's and
-               /dev/null's are their filesystem's, which st_blksize gives. */
+               /dev/null's are their filesystem's, which st_blksize gives
+               (/tmp is ext4 on the CI runner; overlayfs, as in a container,
+               has none and answers EINVAL). */
             int block = -7;
             errno = 0;
             n = ioctl(fd, FIGETBSZ, &block);

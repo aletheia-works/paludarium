@@ -244,8 +244,9 @@ itself.
    available) may be re-run in the same run, except the
    `wasm-programs / differential (ubuntu-latest, node)` job that measures
    performance; then re-run the failed jobs of `release-acceptance` if it
-   already ran, and of the `Publish` run, which reuses those same runs. When the version is already tagged or the
-   head is no longer main, the run does nothing.
+   already ran, and of the `Publish` run, which reuses those same runs. When
+   the version is already tagged or the head is no longer main, the run does
+   nothing.
 
    **By hand** (only when the automatic run stopped and the cause is
    fixed). On the release head, while it is still the main head, the

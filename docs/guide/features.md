@@ -181,7 +181,10 @@ kernel.
     do a write shutdown and the close, which hangs up; a datagram socket's
     do not. A send that found the buffer full signals once when reads leave
     three quarters of the buffer free, and so does a full datagram or packet
-    socket that `poll`, `select` or `epoll_ctl` asked to take a write. Only
+    socket that `poll`, `select` or `epoll_ctl` asked to take a write, or
+    `epoll_wait` did, as Linux's asks only what is on its ready list: an
+    interest it listed when added, after a wakeup, or after a
+    level-triggered report (an edge-triggered one is not listed again). Only
     what happens while `O_ASYNC` is on counts. An out-of-band byte also sends a
     `POLL_PRI` signal.
   - **TCP and UDP sockets** ([Network](#network)), as Linux's TCP signals:

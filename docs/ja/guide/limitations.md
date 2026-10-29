@@ -63,10 +63,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   要るオプション（`SO_DEBUG`、`SO_SNDBUFFORCE` など）も設定でき、`SO_PEERCRED` の
   uid と gid は 0 です。
 - **シグナル駆動の入出力**：`O_ASYNC` が効くのはパイプとソケットだけで、標準入力や端末は
-  `SIGIO` を送らず、`FIOASYNC` で付けようとすると `ENOTTY` です。Linux では送ります。いっぱいのデータグラムやパケットのソケットを
-  `epoll_wait` が書き込めないと見ても、そのあと読まれたときに `POLL_OUT` を送りません。
-  Linux では、準備ができた一覧のソケットを見直したときに送ります（`poll`、`select`、
-  `epoll_ctl` では Linux と同じに送ります）。
+  `SIGIO` を送らず、`FIOASYNC` で付けようとすると `ENOTTY` です。Linux では送ります。
 - **名前空間**：名前空間のフラグ（`CLONE_NEWNS`、`CLONE_NEWUTS`、`CLONE_NEWIPC`、
   `CLONE_NEWUSER`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWCGROUP`、`clone3` では
   `CLONE_NEWTIME` も）を付けた `clone` と `clone3` は、子を作らずに `EINVAL` で失敗します。

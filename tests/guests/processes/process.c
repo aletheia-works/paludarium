@@ -2287,19 +2287,29 @@ int main(int argc, char **argv) {
         /* A full datagram or packet socket that a poll, select or
            epoll_ctl asks to write signals POLL_OUT once read, as one whose
            send failed does; filled with no failed send and no such
-           question, or failed before O_ASYNC, it signals nothing. */
+           question, or failed before O_ASYNC, it signals nothing. An
+           epoll_wait asks only of what is on its ready list: a level-
+           triggered interest it reported writable before the socket filled
+           is, an edge-triggered one is not. */
         puts("polled-full");
-        const char *ways[] = {"poll", "select", "epoll", "sent", "no-async"};
+        const char *ways[] = {"poll", "select", "epoll", "sent", "no-async", "epoll-wait", "epoll-wait-et"};
         for (int t = 1; t < 3; t++) {
             int fit = 0;
             if (socketpair(AF_UNIX, types[t], 0, sv)) return 74;
             fcntl(sv[0], F_SETFL, O_NONBLOCK);
             while (send(sv[0], chunk, 256, 0) == 256) fit++;
             close(sv[0]); close(sv[1]);
-            for (int w = 0; w < 5; w++) {
+            for (int w = 0; w < 7; w++) {
                 if (socketpair(AF_UNIX, types[t], 0, sv)) return 74;
                 if (w != 4) io_async(sv[0], IO_RT);
                 fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL) | O_NONBLOCK);
+                struct epoll_event got;
+                int waiting = -1;
+                if (w >= 5 && (waiting = epoll_create1(0)) >= 0) {
+                    struct epoll_event wanted = {.events = EPOLLOUT | (w == 6 ? EPOLLET : 0)};
+                    epoll_ctl(waiting, EPOLL_CTL_ADD, sv[0], &wanted);
+                    if (epoll_wait(waiting, &got, 1, 0) != 1) return 71;
+                }
                 int sent = 0;
                 while (sent < fit && send(sv[0], chunk, 256, 0) == 256) sent++;
                 struct pollfd out = {sv[0], POLLOUT, 0};
@@ -2319,10 +2329,12 @@ int main(int argc, char **argv) {
                     send(sv[0], chunk, 256, 0);
                     io_async(sv[0], IO_RT);
                 }
+                if (waiting >= 0 && epoll_wait(waiting, &got, 1, 0) != 0) return 70;
                 io_count(POLL_OUT);
                 while (recv(sv[1], chunk, 256, MSG_DONTWAIT) > 0) {}
                 printf("  %s-%s filled=%d out=%d\n", type_names[t], ways[w], sent == fit,
                        io_count(POLL_OUT));
+                if (waiting >= 0) close(waiting);
                 close(sv[0]); close(sv[1]);
             }
         }

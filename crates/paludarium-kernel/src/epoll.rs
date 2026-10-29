@@ -17,6 +17,13 @@ struct Interest {
     output_epoch: u64,
     previous: u32,
     enabled: bool,
+    /// On Linux's ready list (`rdllist`), whose items `epoll_wait` polls:
+    /// put there by `epoll_ctl` finding the file ready, by a wakeup of the
+    /// file, and again after a level-triggered report.
+    listed: bool,
+    /// The file's generations when this interest last looked, so that a
+    /// change since stands for the wakeup that would have listed it.
+    seen: (u64, u64),
 }
 impl Interest {
     fn ready(&self) -> Option<(u32, u64, u64)> {
@@ -113,10 +120,13 @@ impl EpollInstance {
             }
             3 if !state.interests.contains_key(&key) => return Err(Errno::ENOENT),
             _ => {
-                // Linux's `ep_insert` and `ep_modify` poll the file once.
-                if events & OUT != 0 && file.readiness().is_ok_and(|(mask, ..)| mask & OUT == 0) {
+                // Linux's `ep_insert` and `ep_modify` poll the file once,
+                // and list it if it is ready.
+                let (mask, input, output) = file.readiness()?;
+                if events & OUT != 0 && mask & OUT == 0 {
                     crate::sockets::polled_full(&file);
                 }
+                let listed = mask & (events | 0x18) & !(ET | ONESHOT) != 0;
                 state.interests.insert(
                     key,
                     Interest {
@@ -127,6 +137,8 @@ impl EpollInstance {
                         output_epoch: 0,
                         previous: 0,
                         enabled: true,
+                        listed,
+                        seen: (input, output),
                     },
                 );
             }
@@ -148,7 +160,22 @@ impl EpollInstance {
             let Some(i) = state.interests.get_mut(&keys[index]) else {
                 continue;
             };
+            // Linux's `ep_send_events` polls only what its ready list
+            // holds; one asked to take a write that cannot is noted as full
+            // (`polled_full`), so that a read frees room with POLL_OUT.
+            if let Some(file) = i.file.upgrade()
+                && let Ok((mask, input, output)) = file.readiness()
+            {
+                let woken = (input, output) != i.seen;
+                i.seen = (input, output);
+                if (i.listed || woken) && i.enabled && i.events & OUT != 0 && mask & OUT == 0 {
+                    crate::sockets::polled_full(&file);
+                }
+                i.listed = false;
+            }
             if let Some((mask, input, output)) = i.ready() {
+                // A level-triggered report goes back on the list.
+                i.listed = i.events & (ET | ONESHOT) == 0;
                 out.push((mask, i.data));
                 i.previous = mask;
                 i.input_epoch = input;

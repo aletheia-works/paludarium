@@ -236,7 +236,7 @@ jobs:
         run: bash mise-tasks/wasm/build.sh
       - name: Compare production wasm with native results
         run: |
-          node --test packages/paludarium-wasm/tests/import-check.mjs packages/paludarium-wasm/tests/stdin-poll.test.mjs packages/paludarium-wasm/tests/wasm-network.test.mjs
+          node --test packages/paludarium-wasm/tests/import-check.mjs packages/paludarium-wasm/tests/stdin-poll.test.mjs packages/paludarium-wasm/tests/wasm-network.test.mjs packages/paludarium-wasm/tests/wasm-relay.test.mjs
           node packages/paludarium-wasm/tests/node-check.mjs packages/paludarium-wasm/paludarium.wasm target/production-wasm-evidence/native-results.json > target/production-wasm-evidence/node-report.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()

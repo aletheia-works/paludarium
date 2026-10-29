@@ -6,8 +6,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 
 - **動的リンクのプログラム**：静的にリンクしたプログラムだけを動かせます。
 - **32-bit の x86、AVX、AVX-512、x87、MMX**：対象外です。
-- **ネットワーク**：許可の一覧（`--allow-net`、`Config::with_network`、Node.js だけで
-  使える JavaScript の `network` の指定）がなければ、
+- **ネットワーク**：許可の一覧（`--allow-net`、`Config::with_network`、ブラウザでは
+  [中継](./relay) の要る JavaScript の `network` の指定）がなければ、
   `socket()` はどのファミリーにも `EAFNOSUPPORT` を返します。一覧があっても、使えるのは
   TCP のクライアントと名前解決だけです（[ネットワーク](./features#network)）。
   - `listen` は `EOPNOTSUPP`、0 以外のポートへの `bind` は `EACCES` なので、ゲストは

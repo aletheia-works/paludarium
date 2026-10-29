@@ -22,6 +22,8 @@ REQUIRED_JS = {
     "worker-support.mjs",
     "jit-support.mjs",
     "filesystem-snapshot.mjs",
+    "relay.mjs",
+    "relay-protocol.mjs",
 }
 
 
@@ -64,6 +66,7 @@ def inspect_npm(path, expected):
     )
     required = REQUIRED_JS | {
         "index.d.ts",
+        "relay.d.ts",
         "paludarium.wasm",
         "LICENSE",
         "README.md",

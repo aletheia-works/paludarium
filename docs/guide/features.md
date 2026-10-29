@@ -499,7 +499,7 @@ kernel.
 
 A guest has no network unless the embedder allows destinations
 (`Config::with_network`, the command's `--allow-net`, or the JavaScript
-`network` option on Node.js). An allow-list entry
+`network` option, which in a browser goes through a [relay](./relay)). An allow-list entry
 is a host name (`github.com`), every subdomain of one (`*.github.com`), an
 IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
 (`github.com:443`).

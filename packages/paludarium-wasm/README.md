@@ -67,7 +67,12 @@ directory. `tty` optionally supplies columns and rows in the range 0–65535.
 `limits: { tasks, openFiles, memory }` optionally caps the guest's tasks
 (`EAGAIN` beyond it), its `RLIMIT_NOFILE` (`EMFILE`) and its memory in bytes
 (`SIGKILL` beyond it, as the OOM killer); all are unlimited by default.
-No host filesystem mount or network access is exposed by this API.
+No host filesystem mount is exposed by this API. `network: { allow }` gives the
+guest TCP clients and name resolution for what `allow` names; Node.js connects
+itself, and a browser needs `relay: { url, protocols }`, a WebSocket relay that
+connects for it. `relay.mjs` in this package is one
+(`node relay.mjs --allow github.com:443`; see the documentation's Network relay
+page).
 
 Build the one production Wasm module from the repository root with
 `mise run wasm:build`. The npm archive includes that module, the launcher

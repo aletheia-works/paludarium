@@ -24,7 +24,15 @@ function validate(options) {
     // host, host:port, *.host, IPv4, [IPv6] or [IPv6]:port, or a bare IPv6 address; the kernel parses each in full.
     const entry = /^(?:(?:\*\.)?[A-Za-z0-9_.-]+(?::\d{1,5})?|\[[0-9A-Fa-f:.]+\](?::\d{1,5})?|[0-9A-Fa-f:.]+)$/;
     if (options.network === null || typeof options.network !== "object" || !Array.isArray(allow) || allow.some(item => typeof item !== "string" || !entry.test(item))) throw new PaludariumError("invalid-program", "network.allow must be an array of host, host:port, [ipv6] or [ipv6]:port entries");
-    if (!isNode) throw new PaludariumError("unimplemented", "the network is available on Node.js only");
+    const relay = options.network.relay;
+    if (relay !== undefined) {
+      let url;
+      try { url = new URL(relay?.url); } catch { url = undefined; }
+      // A subprotocol is an HTTP token (RFC 6455), as Lambda MicroVMs' `lambda-microvms.port.8080` is.
+      const token = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+      if (relay === null || typeof relay !== "object" || typeof relay.url !== "string" || (url?.protocol !== "ws:" && url?.protocol !== "wss:")) throw new PaludariumError("invalid-program", "network.relay.url must be a ws: or wss: URL");
+      if (relay.protocols !== undefined && (!Array.isArray(relay.protocols) || relay.protocols.some(item => typeof item !== "string" || !token.test(item)) || new Set(relay.protocols).size !== relay.protocols.length)) throw new PaludariumError("invalid-program", "network.relay.protocols must be an array of distinct WebSocket subprotocol names");
+    } else if (!isNode) throw new PaludariumError("unimplemented", "outside Node.js the network needs network.relay");
   }
   if (options.cwd !== undefined && (typeof options.cwd !== "string" || !options.cwd.startsWith("/") || options.cwd.includes("\0"))) throw new PaludariumError("invalid-program", "invalid guest current directory");
   if (options.args && (!Array.isArray(options.args) || options.args.some(arg => typeof arg !== "string" || arg.includes("\0")))) throw new PaludariumError("invalid-program", "invalid guest arguments");
@@ -164,6 +172,9 @@ export async function createPaludarium({ wasmUrl }) {
       pending.set(id, job);
       const { filesystem, ...messageOptions } = options;
       messageOptions.entries = entries;
+      // Only what validate() checked goes to the coordinator.
+      const relay = options.network?.relay;
+      if (options.network !== undefined) messageOptions.network = { allow: [...options.network.allow], relay: relay && { url: relay.url, protocols: relay.protocols && [...relay.protocols] } };
       if (filesystem !== undefined) {
         const handle = filesystems.get(filesystem);
         if (!handle) { pending.delete(id); throw new PaludariumError("invalid-program", "filesystem belongs to another launcher"); }

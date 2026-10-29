@@ -115,6 +115,11 @@ jobs:
         run: |
           node --test packages/paludarium-wasm/tests/wasm-*.test.mjs
           node packages/paludarium-wasm/tests/wasm-api-check.mjs packages/paludarium-wasm/paludarium.wasm
+      - name: The guest's network through the relay in the browser
+        if: matrix.environment != 'node'
+        env:
+          WASM_ENVIRONMENT: ${{ matrix.environment }}
+        run: node packages/paludarium-wasm/tests/wasm-browser-network.mjs "$WASM_ENVIRONMENT" packages/paludarium-wasm/paludarium.wasm
       - name: Compare fourteen actual guest executions, the ripgrep searches and the aube steps on rebuilt filesystems with fresh Linux
         env:
           WASM_ENVIRONMENT: ${{ matrix.environment }}

@@ -60,7 +60,7 @@ try {
 | `filesystem` | 使い回す、`createFileSystem()` で作ったファイルシステム（下を参照） |
 | `jit` | `true` にすると、よく通る x86-64 のコードを WebAssembly に変換する（既定は `false`） |
 | `limits` | ゲストに上限を設ける `{ tasks, openFiles, memory }`（既定は上限なし。下を参照） |
-| `network` | ゲストが届いてよい行き先の `{ allow: [...] }`（Node.js のみ。既定はネットワークなし。下を参照） |
+| `network` | ゲストが届いてよい行き先と、ブラウザではそこに届かせる中継の `{ allow: [...], relay }`（既定はネットワークなし。下を参照） |
 
 このパッケージは、ホストのディレクトリをゲストに見せません。ネットワークは、`network`
 を指定したときだけ使えます。
@@ -86,8 +86,12 @@ OOM killer と同じように `SIGKILL` で終わります。収まらない `ex
 ゲスト自身のリゾルバがそのまま動きます（53 番ポートは、UDP でも TCP でも DNS の代わりに
 届きます）。ほかの行き先はゲストには `ENETUNREACH`、
 ほかの名前は `NXDOMAIN` です（[ネットワーク](./features#network)）。ランチャーが
-読めない項目は `invalid-program` です。ブラウザでは `network` は `unimplemented`
-です。
+読めない項目は `invalid-program` です。
+
+ブラウザは自分で接続も名前解決もできないので、ブラウザでは `network.relay` に、
+ゲストの代わりにそれをする WebSocket の中継を `{ url, protocols }` で指定します。
+パッケージにも 1 つ入っています（[ネットワークの中継](./relay)）。Node.js では
+`relay` は省けます。ブラウザで `relay` がないと、`network` は `unimplemented` です。
 
 ## 実行の間でファイルを残す
 

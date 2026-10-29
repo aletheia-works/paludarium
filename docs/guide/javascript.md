@@ -62,7 +62,7 @@ try {
 | `filesystem` | A filesystem from `createFileSystem()` to reuse (see below) |
 | `jit` | `true` to translate hot x86-64 code to WebAssembly (default `false`) |
 | `limits` | `{ tasks, openFiles, memory }` to limit the guest (default: no limit; see below) |
-| `network` | `{ allow: [...] }`, the destinations the guest may reach (Node.js only; default: no network; see below) |
+| `network` | `{ allow: [...], relay }`, the destinations the guest may reach, and in a browser the relay that reaches them (default: no network; see below) |
 
 The package does not expose host directories to the guest, and gives it a
 network only with `network`.
@@ -89,7 +89,12 @@ names with Node's `dns.lookup`, so the guest's own resolver works (port 53,
 over UDP or TCP, is the DNS stub); any other destination is `ENETUNREACH` to
 the guest, and any other name `NXDOMAIN`
 ([Network](./features#network)). An entry the launcher cannot read is
-`invalid-program`. In a browser `network` is `unimplemented`.
+`invalid-program`.
+
+A browser cannot connect or resolve itself, so there `network.relay` names a
+WebSocket relay that does it for the guest, `{ url, protocols }`; the package
+includes one ([Network relay](./relay)). On Node.js `relay` is optional, and
+without it in a browser `network` is `unimplemented`.
 
 ## Keep files between runs
 

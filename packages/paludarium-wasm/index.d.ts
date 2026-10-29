@@ -68,8 +68,9 @@ export interface Limits {
   memory?: number;
 }
 /**
- * The destinations a guest may reach over TCP, and the names it may resolve
- * (Node.js only); without it the guest has no network.
+ * The destinations a guest may reach over TCP, and the names it may resolve;
+ * without it the guest has no network. Node.js connects and resolves itself;
+ * a browser needs `relay`.
  */
 export interface NetworkOptions {
   /**
@@ -78,6 +79,22 @@ export interface NetworkOptions {
    * port (`github.com:443`) or for every port.
    */
   allow: readonly string[];
+  /**
+   * The WebSocket relay that connects and resolves for the guest (see the
+   * package's `relay` module); required outside Node.js, and used on Node.js
+   * too when given.
+   */
+  relay?: RelayOptions;
+}
+export interface RelayOptions {
+  /** The relay's `ws:` or `wss:` URL. */
+  url: string;
+  /**
+   * The subprotocols each WebSocket offers, as `new WebSocket(url,
+   * protocols)` takes them: for AWS Lambda MicroVMs, `lambda-microvms`,
+   * `lambda-microvms.authentication.<token>` and `lambda-microvms.port.<n>`.
+   */
+  protocols?: readonly string[];
 }
 export interface RunOptions extends FileSystemOptions {
   program: string;

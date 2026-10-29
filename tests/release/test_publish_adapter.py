@@ -78,6 +78,7 @@ class PublishAdapterTests(unittest.TestCase):
                 ).encode(),
                 "paludarium.wasm": b"\0asm\x01\0\0\0",
                 "index.d.ts": b"export {};",
+                "relay.d.ts": b"export {};",
                 "LICENSE": b"Apache",
                 "README.md": b"usage",
             }

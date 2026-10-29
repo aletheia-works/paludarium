@@ -8,8 +8,8 @@ verified.
 - **Dynamically linked programs**: only statically linked programs run.
 - **32-bit x86, AVX, AVX-512, x87, MMX**: out of scope.
 - **Network**: without an allow list (`--allow-net`,
-  `Config::with_network`, or the JavaScript `network` option, on Node.js
-  only) `socket()` returns `EAFNOSUPPORT` for every family.
+  `Config::with_network`, or the JavaScript `network` option, which a
+  browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.
   With one, only TCP clients and name resolution work
   ([Network](./features#network)):
   - `listen` is `EOPNOTSUPP`, and `bind` to a port other than 0 is `EACCES`,

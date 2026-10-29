@@ -12,7 +12,7 @@ function nav(prefix: string, labels: { guide: string; design: string; demo: stri
 }
 
 type Labels = Record<
-  | 'start' | 'introduction' | 'gettingStarted' | 'use' | 'cli' | 'rust' | 'javascript'
+  | 'start' | 'introduction' | 'gettingStarted' | 'use' | 'cli' | 'rust' | 'javascript' | 'relay'
   | 'reference' | 'platforms' | 'features' | 'limitations'
   | 'design' | 'architecture' | 'quality' | 'decisions' | 'roadmap' | 'release',
   string
@@ -28,6 +28,7 @@ function sidebar(prefix: string, t: Labels): DefaultTheme.Sidebar {
       { text: t.cli, link: `${prefix}/guide/cli` },
       { text: t.rust, link: `${prefix}/guide/rust` },
       { text: t.javascript, link: `${prefix}/guide/javascript` },
+      { text: t.relay, link: `${prefix}/guide/relay` },
     ] },
     { text: t.reference, items: [
       { text: t.platforms, link: `${prefix}/guide/platforms` },
@@ -91,7 +92,7 @@ export default defineConfig({
         nav: nav('', { guide: 'Guide', design: 'Design', demo: 'Live demo' }),
         sidebar: sidebar('', {
           start: 'Getting started', introduction: 'What is paludarium?', gettingStarted: 'Install',
-          use: 'Usage', cli: 'Command line', rust: 'Rust library', javascript: 'JavaScript and the browser',
+          use: 'Usage', cli: 'Command line', rust: 'Rust library', javascript: 'JavaScript and the browser', relay: 'Network relay',
           reference: 'Reference', platforms: 'Supported platforms', features: 'Supported features', limitations: 'Limitations',
           design: 'Design', architecture: 'Architecture', quality: 'Testing and verification', decisions: 'Design decisions',
           roadmap: 'Roadmap', release: 'Release process',
@@ -109,7 +110,7 @@ export default defineConfig({
         nav: nav('/ja', { guide: 'ガイド', design: '設計', demo: 'デモ' }),
         sidebar: sidebar('/ja', {
           start: 'はじめに', introduction: 'paludarium とは', gettingStarted: 'インストール',
-          use: '使い方', cli: 'コマンドライン', rust: 'Rust のライブラリ', javascript: 'JavaScript とブラウザ',
+          use: '使い方', cli: 'コマンドライン', rust: 'Rust のライブラリ', javascript: 'JavaScript とブラウザ', relay: 'ネットワークの中継',
           reference: 'リファレンス', platforms: '対応環境', features: '対応している機能', limitations: '制限',
           design: '設計', architecture: 'アーキテクチャ', quality: 'テストと検証', decisions: '設計の判断',
           roadmap: 'ロードマップ', release: 'リリースの流れ',

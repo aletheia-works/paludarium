@@ -94,6 +94,18 @@ When a `REP` instruction faults midway, Intel and AMD leave different flags.
 paludarium does not inspect the host CPU to choose; it models the behaviour
 explicitly, following Intel's design by default.
 
+## A relay for the browser's network
+
+A browser cannot open TCP connections or resolve names, so its guests reach
+the network through a WebSocket relay. Each connection and each lookup is a
+WebSocket of its own: nothing is multiplexed, so neither side keeps state
+between them and each connection's flow control is its own. The relay
+resolves the names, and signs each address it gives with a ticket, because
+the guest then connects to the address and the relay, perhaps another
+instance, must know which allowed name it came from. The kernel's allow list
+still decides first; the relay keeps its own, since anything in a page is
+public.
+
 ## Trusted Publishing only
 
 Releases go to crates.io and npm by Trusted Publishing (OIDC) only, with no

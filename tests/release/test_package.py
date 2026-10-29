@@ -36,6 +36,7 @@ class PackageTests(unittest.TestCase):
                     dict(name="@aletheia-works/paludarium-wasm", version="0.0.0")
                 ).encode(),
                 "index.d.ts": b"export {};",
+                "relay.d.ts": b"export {};",
                 "paludarium.wasm": b"\0asm\x01\0\0\0",
                 "LICENSE": b"Apache-2.0",
                 "README.md": b"usage",
@@ -57,7 +58,7 @@ class PackageTests(unittest.TestCase):
         return package.inspect_npm(self.path, expected)
 
     def test_valid_npm(self):
-        self.assertEqual(len(self.inspect()["files"]), 11)
+        self.assertEqual(len(self.inspect()["files"]), 14)
 
     def test_jit_support_missing(self):
         del self.files["jit-support.mjs"]

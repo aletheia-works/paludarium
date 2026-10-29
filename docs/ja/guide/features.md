@@ -462,8 +462,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 ## ネットワーク {#network}
 
 組み込む側が行き先を許可しない限り、ゲストはネットワークを使えません
-（`Config::with_network`、コマンドの `--allow-net`、Node.js での JavaScript の
-`network` の指定）。許可の一覧には、ホスト名
+（`Config::with_network`、コマンドの `--allow-net`、JavaScript の `network` の指定。
+ブラウザでは [中継](./relay) を通します）。許可の一覧には、ホスト名
 （`github.com`）、そのすべてのサブドメイン（`*.github.com`）、IPv4 アドレス、IPv6
 アドレス（`[::1]`）を書きます。どれもポートを付けるか（`github.com:443`）、付けずに
 すべてのポートを許します。

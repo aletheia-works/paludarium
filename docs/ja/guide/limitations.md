@@ -18,8 +18,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     `ESOCKTNOSUPPORT` です。
   - `socket(AF_UNIX)` はこれまでどおり `EAFNOSUPPORT` で、ソケットのペアへの
     `connect` と `bind` は `ENOSYS` です。
-  - DNS の代わりが答えるのは `A` と `AAAA` だけで、512 バイトまでに収め、TCP では
-    答えません。ホストが引けない名前は `SERVFAIL` です。
+  - DNS の代わりが答えるのは `A` と `AAAA` だけで、EDNS は読まないので、データグラムの
+    答えは 512 バイトまでです。ホストが引けない名前は `SERVFAIL` です。53 番ポートへの
+    TCP の接続は、いつも DNS の代わりに届き、本物の DNS サーバーには届きません。
   - 接続が開く前の `getsockname` は、未指定のアドレスとポート 0 を返します。Linux
     では取ったポートを返します。`SIOCOUTQ` は、相手がまだ受け取りを確かめていない分では
     なく、ホストがまだ送りに取っていない分を数えます。`SO_SNDBUF` と `SO_RCVBUF` は

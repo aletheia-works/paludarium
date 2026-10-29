@@ -179,6 +179,22 @@ mod linux {
         );
     }
 
+    /// DNS over TCP to port 53 reaches the stub too, under the emulator
+    /// only (natively it would reach the runner's own resolver, if any).
+    #[test]
+    fn network_dns_over_tcp_under_the_emulator() {
+        let (open, _) = ports();
+        let policy = NetworkPolicy::new()
+            .allow(&format!("localhost:{open}"))
+            .unwrap();
+        let outcome = emulated("dns-tcp", policy);
+        assert_eq!(
+            String::from_utf8_lossy(&outcome.stdout),
+            "  connect=0 errno=0\n  send=29 errno=0\n  answer=1 whole=1 id=1 rcode=0 answers=1 last=127.0.0.1\n  shutdown=0 errno=0\n  end=0 errno=0\n",
+            "{outcome:?}"
+        );
+    }
+
     /// Without a policy the guest has no network, as before.
     #[test]
     fn network_off_without_a_policy() {

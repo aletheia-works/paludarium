@@ -34,7 +34,8 @@ CI run produces them afresh on an x86-64 Linux runner.
   127.0.0.1, so that native Linux and the emulator talk to the same server;
   the emulator may reach only that server's port and one that nothing
   listens on. Name resolution on Linux depends on the runner's own files and
-  servers, so it is checked under the emulator only, against `localhost`.
+  servers, so it is checked under the emulator only, against `localhost`,
+  over UDP through musl's resolver and over TCP with a query of its own.
 
 ## Fuzzing
 

@@ -424,6 +424,32 @@ int main(int argc, char **argv) {
         close(fd);
         return 0;
     }
+    if (!strcmp(mode, "dns-tcp")) {
+        /* DNS over TCP, as a resolver asks after a truncated answer: a
+           query for localhost's A record, framed with its length, to port
+           53. Run under the emulator only, as resolve is. */
+        int fd = tcp(0);
+        struct sockaddr_in a = to(53);
+        call("connect", connect(fd, (void *)&a, sizeof a));
+        unsigned char q[64] = {0, 0, 0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 9};
+        memcpy(q + 15, "localhost", 9);
+        unsigned char tail[] = {0, 0, 1, 0, 1};
+        memcpy(q + 24, tail, sizeof tail);
+        int len = 24 + (int)sizeof tail;
+        q[1] = (unsigned char)(len - 2);
+        call("send", send(fd, q, len, 0));
+        unsigned char reply[512];
+        n = recv(fd, reply, 2, MSG_WAITALL);
+        int size = n == 2 ? reply[0] << 8 | reply[1] : -1;
+        n = size > 0 ? recv(fd, reply, size, MSG_WAITALL) : -1;
+        printf("  answer=%d whole=%d id=%d rcode=%d answers=%d last=%d.%d.%d.%d\n", n > 0, n == size,
+               n > 3 && reply[0] == 0x12 && reply[1] == 0x34, n > 3 ? reply[3] & 15 : -1, n > 7 ? reply[7] : -1,
+               reply[n - 4], reply[n - 3], reply[n - 2], reply[n - 1]);
+        call("shutdown", shutdown(fd, SHUT_WR));
+        call("end", recv(fd, reply, sizeof reply, 0));
+        close(fd);
+        return 0;
+    }
     if (!strcmp(mode, "resolve")) {
         /* Name resolution through the guest's own resolver; run under the
            emulator only, with localhost allowed and nothing else. */

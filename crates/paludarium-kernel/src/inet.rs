@@ -11,7 +11,7 @@ use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::sockets::Timeout;
 use crate::syscalls::Context;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use paludarium_host::net::{Event, Lookup, Phase, Stream};
+use paludarium_host::net::{Driver, Event, Lookup, Phase, Stream};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use std::collections::{BTreeMap, VecDeque};
@@ -707,11 +707,15 @@ impl InetSocket {
                 Connection::Connected => return Err(EISCONN),
                 Connection::Connecting => EALREADY,
                 Connection::Unconnected => {
-                    let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
-                    if !self.network.allows(address, now) {
-                        return Err(ENETUNREACH);
-                    }
-                    let stream = c.host.connect(address)?;
+                    let stream = if address.port() == DNS {
+                        DnsOverTcp::open(address, &self.network, &self.host)
+                    } else {
+                        let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+                        if !self.network.allows(address, now) {
+                            return Err(ENETUNREACH);
+                        }
+                        c.host.connect(address)?
+                    };
                     stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
                     stream.set_nodelay(self.options().no_delay);
                     if let Some(old) = s.stream.replace(Arc::clone(&stream)) {
@@ -720,6 +724,10 @@ impl InetSocket {
                     s.noted = false;
                     s.read_shut = false;
                     s.connection = Connection::Connecting;
+                    // The stub's own stream is open at once.
+                    if address.port() == DNS {
+                        stream.connected(None);
+                    }
                     EINPROGRESS
                 }
             };
@@ -826,15 +834,7 @@ impl InetSocket {
             return Err(ENETUNREACH);
         }
         if let Some(mut query) = parse_query(bytes, to) {
-            if matches!(query.answer, Answer::Now(3))
-                && !query.question.is_empty()
-                && self.network.policy.allows_name(&query.name)
-            {
-                query.answer = match self.network.lookup(self.host.as_ref(), &query.name) {
-                    Ok(lookup) => Answer::Lookup(lookup),
-                    Err(_) => Answer::Now(2),
-                };
-            }
+            start_lookup(&self.network, self.host.as_ref(), &mut query);
             // An answer signals POLL_IN as a datagram's arrival does, and
             // then wakes this socket's waits, so that a poll the answer ends
             // finds the signal pending: at once, or when the host's lookup
@@ -876,32 +876,9 @@ impl InetSocket {
             from,
         })
     }
-    /// The answer to `query`, once it can be given.
+    /// The answer to `query` in a datagram, once it can be given.
     fn answer(&self, query: &Query) -> Option<Vec<u8>> {
-        let (code, addresses) = match &query.answer {
-            Answer::Now(code) => (*code, Vec::new()),
-            // Only the addresses a name rule may reach; none is NXDOMAIN.
-            Answer::Lookup(lookup) => match lookup.result()? {
-                Ok(found) => {
-                    let found: Vec<IpAddr> = found
-                        .into_iter()
-                        .filter(|ip| reachable(&query.name, *ip))
-                        .collect();
-                    if found.is_empty() {
-                        (3, found)
-                    } else {
-                        let now = self
-                            .host
-                            .clock(paludarium_host::ClockId::Monotonic)
-                            .unwrap_or(0);
-                        self.network.note(&query.name, &found, now);
-                        (0, found)
-                    }
-                }
-                Err(_) => (2, Vec::new()),
-            },
-        };
-        Some(build_answer(query, code, &addresses))
+        answer(&self.network, self.host.as_ref(), query, UDP_ANSWER)
     }
     /// The first ready answer's length, for `FIONREAD`.
     fn next_datagram(&self) -> usize {
@@ -1591,11 +1568,168 @@ fn parse_query(bytes: &[u8], from: SocketAddr) -> Option<Query> {
     });
     Some(query)
 }
+/// Starts the host's lookup of an allowed name the stub cannot answer
+/// at once.
+fn start_lookup(network: &Network, host: &dyn paludarium_host::Host, query: &mut Query) {
+    if matches!(query.answer, Answer::Now(3))
+        && !query.question.is_empty()
+        && network.policy.allows_name(&query.name)
+    {
+        query.answer = match network.lookup(host, &query.name) {
+            Ok(lookup) => Answer::Lookup(lookup),
+            Err(_) => Answer::Now(2),
+        };
+    }
+}
+
+/// The stub over TCP, as a resolver asks it when a datagram answer was
+/// truncated: a connection to port 53, at any address, is the stub's own
+/// stream, which takes queries with their two-byte lengths, as RFC 1035
+/// frames them, and gives each answer, in order, framed the same way. Once
+/// the guest has shut its sending down and every answer has gone, the
+/// stream ends.
+struct DnsOverTcp {
+    /// Itself, for the wakers of the lookups it waits for.
+    me: Weak<DnsOverTcp>,
+    stream: Weak<Stream>,
+    peer: SocketAddr,
+    network: Arc<Network>,
+    host: Arc<dyn paludarium_host::Host>,
+    state: Mutex<DnsState>,
+}
+#[derive(Default)]
+struct DnsState {
+    /// What the guest sent that is not yet a whole query.
+    incoming: Vec<u8>,
+    queries: VecDeque<Query>,
+    /// Answer bytes the stream had no room for yet.
+    outgoing: VecDeque<u8>,
+    ended: bool,
+}
+impl DnsOverTcp {
+    fn open(
+        peer: SocketAddr,
+        network: &Arc<Network>,
+        host: &Arc<dyn paludarium_host::Host>,
+    ) -> Arc<Stream> {
+        let stream = Stream::new(peer);
+        let driver = Arc::new_cyclic(|me| Self {
+            me: Weak::clone(me),
+            stream: Arc::downgrade(&stream),
+            peer,
+            network: Arc::clone(network),
+            host: Arc::clone(host),
+            state: Mutex::default(),
+        });
+        stream.set_driver(driver);
+        stream
+    }
+    /// Reads the guest's queries, starts their lookups, and gives the
+    /// answers that are ready.
+    fn pump(&self) {
+        let Some(stream) = self.stream.upgrade() else {
+            return;
+        };
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let bytes = stream.take(64 * 1024);
+            if bytes.is_empty() {
+                break;
+            }
+            s.incoming.extend_from_slice(&bytes);
+        }
+        while s.incoming.len() >= 2 {
+            let len = usize::from(u16::from_be_bytes([s.incoming[0], s.incoming[1]]));
+            if s.incoming.len() < 2 + len {
+                break;
+            }
+            let message: Vec<u8> = s.incoming.drain(..2 + len).skip(2).collect();
+            let Some(mut query) = parse_query(&message, self.peer) else {
+                continue;
+            };
+            start_lookup(&self.network, self.host.as_ref(), &mut query);
+            if let Answer::Lookup(lookup) = &query.answer {
+                let me = Weak::clone(&self.me);
+                lookup.add_waker(Arc::new(move || {
+                    if let Some(driver) = me.upgrade() {
+                        driver.pump();
+                    }
+                }));
+            }
+            s.queries.push_back(query);
+        }
+        while let Some(answer) = s
+            .queries
+            .front()
+            .and_then(|query| answer(&self.network, self.host.as_ref(), query, TCP_ANSWER))
+        {
+            s.queries.pop_front();
+            s.outgoing.extend((answer.len() as u16).to_be_bytes());
+            s.outgoing.extend(answer);
+        }
+        let (front, _) = s.outgoing.as_slices();
+        let front = front.to_vec();
+        if !front.is_empty() {
+            let given = stream.receive(&front);
+            s.outgoing.drain(..given);
+        }
+        if s.queries.is_empty() && s.outgoing.is_empty() && stream.finished().0 && !s.ended {
+            s.ended = true;
+            drop(s);
+            stream.end();
+        }
+    }
+}
+impl Driver for DnsOverTcp {
+    /// The guest wrote, read or shut down: the stub answers at once, in the
+    /// caller's thread, as the stream is unlocked then.
+    fn kick(&self) {
+        self.pump();
+    }
+}
+
+/// The answer to `query`, once it can be given, in at most `limit` bytes:
+/// only the addresses a name rule may reach, and NXDOMAIN when none is
+/// left.
+fn answer(
+    network: &Network,
+    host: &dyn paludarium_host::Host,
+    query: &Query,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    let (code, addresses) = match &query.answer {
+        Answer::Now(code) => (*code, Vec::new()),
+        // Only the addresses a name rule may reach; none is NXDOMAIN.
+        Answer::Lookup(lookup) => match lookup.result()? {
+            Ok(found) => {
+                let found: Vec<IpAddr> = found
+                    .into_iter()
+                    .filter(|ip| reachable(&query.name, *ip))
+                    .collect();
+                if found.is_empty() {
+                    (3, found)
+                } else {
+                    let now = host.clock(paludarium_host::ClockId::Monotonic).unwrap_or(0);
+                    network.note(&query.name, &found, now);
+                    (0, found)
+                }
+            }
+            Err(_) => (2, Vec::new()),
+        },
+    };
+    Some(build_answer(query, code, &addresses, limit))
+}
+
+/// The most a datagram answer holds, without EDNS.
+const UDP_ANSWER: usize = 512;
+/// The most a TCP answer holds, as its two-byte length allows.
+const TCP_ANSWER: usize = 65535;
 /// The answer to `query` with response code `code` and, for an `A` or
-/// `AAAA` question, the addresses of that family, as many as fit in 512
-/// bytes, each for 60 seconds.
-fn build_answer(query: &Query, code: u8, addresses: &[IpAddr]) -> Vec<u8> {
-    let mut answer = Vec::with_capacity(512);
+/// `AAAA` question, the addresses of that family, each for 60 seconds, as
+/// many as fit in `limit` bytes: when some do not, the answer is marked
+/// truncated (TC), so that the resolver asks again over TCP.
+fn build_answer(query: &Query, code: u8, addresses: &[IpAddr], limit: usize) -> Vec<u8> {
+    let mut answer = Vec::with_capacity(limit.min(4096));
     answer.extend_from_slice(&query.id);
     // QR, the opcode and RD as asked, RA, and the code.
     let flags = 0x8080 | (query.flags & 0x7900) | u16::from(code);
@@ -1611,7 +1745,8 @@ fn build_answer(query: &Query, code: u8, addresses: &[IpAddr]) -> Vec<u8> {
             (28, IpAddr::V6(v6)) => v6.octets().to_vec(),
             _ => continue,
         };
-        if answer.len() + 12 + data.len() > 512 {
+        if answer.len() + 12 + data.len() > limit {
+            answer[2] |= 0x02;
             break;
         }
         answer.extend_from_slice(&[0xc0, 0x0c]);
@@ -1718,22 +1853,28 @@ mod tests {
         assert_eq!(q.kind, 1);
         let addresses: Vec<IpAddr> =
             vec!["192.0.2.1".parse().unwrap(), "2001:db8::2".parse().unwrap()];
-        let answer = build_answer(&q, 0, &addresses);
+        let answer = build_answer(&q, 0, &addresses, UDP_ANSWER);
         assert_eq!(&answer[..4], &[0x12, 0x34, 0x81, 0x80]);
         assert_eq!(&answer[4..12], &[0, 1, 0, 1, 0, 0, 0, 0]);
         assert_eq!(&answer[answer.len() - 4..], &[192, 0, 2, 1]);
         let q6 = parse_query(&query("github.com", 28), from).unwrap();
-        let answer = build_answer(&q6, 0, &addresses);
+        let answer = build_answer(&q6, 0, &addresses, UDP_ANSWER);
         assert_eq!(&answer[6..8], &[0, 1]);
         assert_eq!(answer[answer.len() - 1], 2);
-        let missing = build_answer(&q, 3, &[]);
+        let missing = build_answer(&q, 3, &[], UDP_ANSWER);
         assert_eq!(missing[3] & 0xf, 3);
         assert_eq!(&missing[6..8], &[0, 0]);
         // Too many to fit are cut at 512 bytes.
         let many: Vec<IpAddr> = (0..100)
             .map(|i| IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)))
             .collect();
-        assert!(build_answer(&q, 0, &many).len() <= 512);
+        let cut = build_answer(&q, 0, &many, UDP_ANSWER);
+        assert!(cut.len() <= 512);
+        assert_eq!(cut[2] & 0x02, 0x02, "TC");
+        assert_eq!(build_answer(&q, 0, &addresses, UDP_ANSWER)[2] & 0x02, 0);
+        // Over TCP they all fit.
+        let whole = build_answer(&q, 0, &many, TCP_ANSWER);
+        assert_eq!((whole[2] & 0x02, &whole[6..8]), (0, &[0, 100][..]));
         // Another opcode is not implemented; two questions are a format error.
         let mut status = query("a.b", 1);
         status[2] = 0x10;

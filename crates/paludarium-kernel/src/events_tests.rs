@@ -1020,6 +1020,50 @@ fn dns_query(f: &Fixture, at: u64, name: &str, kind: u16) -> u64 {
     bytes.len() as u64
 }
 #[test]
+fn the_dns_stub_answers_over_tcp_too() {
+    let mut f = network_fixture(&["example.com:443"]);
+    let tcp = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    // Port 53 is the stub at any address, whatever the policy allows.
+    inet_address(&f, DATA + 0x100, [10, 0, 0, 1], 53);
+    assert_eq!(f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert!(f.host.streams.lock().unwrap().is_empty());
+    // A query framed with its length, split across two writes.
+    let len = dns_query(&f, DATA + 2, "example.com", 1);
+    f.mem
+        .write(GuestAddr(DATA), &(len as u16).to_be_bytes())
+        .unwrap();
+    assert_eq!(f.ret(1, [tcp, DATA, 5, 0, 0, 0]), 5);
+    assert_eq!(f.ret(1, [tcp, DATA + 5, len - 3, 0, 0, 0]), len - 3);
+    assert_eq!(
+        f.ret(0, [tcp, DATA + 0x400, 512, 0, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    let (name, lookup) = f.host.lookups.lock().unwrap()[0].clone();
+    assert_eq!(name, "example.com");
+    lookup.finish(Ok(vec!["192.0.2.5".parse().unwrap()]));
+    let n = f.ret(0, [tcp, DATA + 0x400, 512, 0, 0, 0]);
+    let mut answer = vec![0; n as usize];
+    f.mem.read(GuestAddr(DATA + 0x400), &mut answer).unwrap();
+    assert_eq!(
+        usize::from(u16::from_be_bytes([answer[0], answer[1]])),
+        answer.len() - 2
+    );
+    assert_eq!(&answer[2..6], &[0xab, 0xcd, 0x81, 0x80]);
+    assert_eq!(&answer[answer.len() - 4..], &[192, 0, 2, 5]);
+    // Another name, answered at once; then the end once this side shuts down.
+    let len = dns_query(&f, DATA + 2, "other.org", 1);
+    f.mem
+        .write(GuestAddr(DATA), &(len as u16).to_be_bytes())
+        .unwrap();
+    assert_eq!(f.ret(1, [tcp, DATA, len + 2, 0, 0, 0]), len + 2);
+    assert_eq!(f.ret(48, [tcp, 1, 0, 0, 0, 0]), 0);
+    let n = f.ret(0, [tcp, DATA + 0x400, 512, 0, 0, 0]);
+    let mut answer = vec![0; n as usize];
+    f.mem.read(GuestAddr(DATA + 0x400), &mut answer).unwrap();
+    assert_eq!(answer[5] & 0xf, 3, "NXDOMAIN");
+    assert_eq!(f.ret(0, [tcp, DATA + 0x400, 512, 0, 0, 0]), 0);
+}
+#[test]
 fn the_dns_stub_answers_allowed_names_from_the_host() {
     let mut f = network_fixture(&["example.com:443"]);
     let udp = f.ret(41, [2, 2 | 0x800, 0, 0, 0, 0]);

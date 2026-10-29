@@ -20,8 +20,10 @@ verified.
     `ESOCKTNOSUPPORT`.
   - `socket(AF_UNIX)` is `EAFNOSUPPORT` as before, and `connect` and `bind`
     on a socket pair are `ENOSYS`.
-  - The DNS stub answers only `A` and `AAAA`, in at most 512 bytes and never
-    over TCP; a name the host cannot resolve is `SERVFAIL`.
+  - The DNS stub answers only `A` and `AAAA`, and ignores EDNS, so a
+    datagram answer holds at most 512 bytes; a name the host cannot resolve
+    is `SERVFAIL`. A TCP connection to port 53 always reaches the stub, never
+    a real DNS server.
   - Before a connection is open, `getsockname` gives the unspecified address
     with port 0, where Linux gives the port it took. `SIOCOUTQ` counts what the
     host has not yet taken to send, not what the peer has not acknowledged.

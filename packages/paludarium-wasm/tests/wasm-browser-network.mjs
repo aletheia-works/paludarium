@@ -39,7 +39,9 @@ try {
   const run = async (program, network) => {
     const guest = runtime.run({ program: '/guest', files: { '/guest': program }, network });
     const chunks = []; let size = 0;
-    for await (const chunk of guest.stdout) { chunks.push(chunk); size += chunk.length; }
+    // Safari's ReadableStream is not async iterable.
+    const reader = guest.stdout.getReader();
+    for (let read = await reader.read(); !read.done; read = await reader.read()) { chunks.push(read.value); size += read.value.length; }
     const stdout = new Uint8Array(size); let at = 0;
     for (const chunk of chunks) { stdout.set(chunk, at); at += chunk.length; }
     return { status: await guest.exited, stdout };

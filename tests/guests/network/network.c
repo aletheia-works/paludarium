@@ -81,8 +81,8 @@ static void call(const char *name, int r) { printf("  %s=%d errno=%d\n", name, r
 static void print_bytes(const char *name, const char *buf, long n) {
     printf("  %s=%ld \"%.*s\"\n", name, n, n > 0 ? (int)n : 0, buf);
 }
-/* async: takes the signal-driven I/O signals pending now, and prints
-   each different one as it comes (data may come in several pieces). */
+/* async: takes the signal-driven I/O signals of a step, and prints each
+   different one as it comes (data may come in several pieces). */
 static void signals(const char *step) {
     sigset_t set;
     sigemptyset(&set);
@@ -90,9 +90,13 @@ static void signals(const char *step) {
     siginfo_t info;
     int last_code = 0;
     long last_band = 0;
-    struct timespec now = {0, 0};
+    /* Linux wakes a poll before it sends the signal (tcp_fin calls
+       sk_state_change, then sk_wake_async), so a signal may follow the
+       poll that saw its event. Every step has one: the first is awaited
+       for up to 5 s, the rest until none comes for 200 ms. */
+    struct timespec first = {5, 0}, settle = {0, 200000000};
     printf("  %s:", step);
-    while (sigtimedwait(&set, &info, &now) == 40) {
+    for (const struct timespec *wait = &first; sigtimedwait(&set, &info, wait) == 40; wait = &settle) {
         if (info.si_code == last_code && info.si_band == last_band) continue;
         last_code = info.si_code;
         last_band = info.si_band;

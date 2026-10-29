@@ -49,6 +49,7 @@ const ENOTCONN: Errno = Errno(107);
 const EALREADY: Errno = Errno(114);
 const EINPROGRESS: Errno = Errno(115);
 const ECONNREFUSED: Errno = Errno(111);
+const EMSGSIZE: Errno = Errno(90);
 /// Linux's default `net.core.somaxconn`, the most a `listen` backlog is.
 const SOMAXCONN: u32 = 4096;
 const POLLERR: u32 = 8;
@@ -269,9 +270,10 @@ pub(crate) struct Network {
     /// [`NAME_LIFETIME`].
     resolved: Mutex<BTreeMap<IpAddr, Vec<(String, u64)>>>,
     lookups: Mutex<BTreeMap<String, (Arc<Lookup>, u64)>>,
-    /// The local ports the guest's TCP sockets hold. Locked after a
-    /// socket's state, never before.
-    ports: Mutex<Ports>,
+    /// The local ports the guest's TCP sockets hold, and its UDP ones.
+    /// Locked after a socket's state, never before.
+    tcp_ports: Mutex<Ports>,
+    udp_ports: Mutex<Ports>,
 }
 impl Network {
     pub(crate) fn new(policy: NetworkPolicy) -> Self {
@@ -279,11 +281,18 @@ impl Network {
             policy,
             resolved: Mutex::default(),
             lookups: Mutex::default(),
-            ports: Mutex::default(),
+            tcp_ports: Mutex::default(),
+            udp_ports: Mutex::default(),
         }
     }
-    fn ports(&self) -> MutexGuard<'_, Ports> {
-        self.ports.lock().unwrap_or_else(PoisonError::into_inner)
+    fn ports(&self, datagram: bool) -> MutexGuard<'_, Ports> {
+        if datagram {
+            &self.udp_ports
+        } else {
+            &self.tcp_ports
+        }
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
     }
     /// Whether the guest may connect to `address` at `now`.
     fn allows(&self, address: SocketAddr, now: u64) -> bool {
@@ -373,6 +382,12 @@ pub(crate) fn socket(
         &c.files.readiness,
         flags,
     );
+    if datagram {
+        // `net.core.rmem_default` and `wmem_default`.
+        let mut options = socket.options();
+        options.send_buffer = 212_992;
+        options.receive_buffer = 212_992;
+    }
     c.files
         .install(socket, flags & CLOEXEC != 0, c.group.nofile())
         .map(u64::from)
@@ -396,6 +411,8 @@ enum Connection {
 /// A DNS query the stub owes an answer, as one datagram from `from`.
 struct Query {
     from: SocketAddr,
+    /// Its place among what the socket has received (`State::received`).
+    seq: u64,
     id: [u8; 2],
     /// The header's flags word, the question as sent, and its name.
     flags: u16,
@@ -424,8 +441,12 @@ struct State {
     /// the one `listen` or a loopback connection took.
     bound: Option<SocketAddr>,
     /// The guest named the port itself, so that a disconnect keeps it
-    /// (Linux's `SOCK_BINDPORT_LOCK`).
+    /// (Linux's `SOCK_BINDPORT_LOCK`), or the address (`SOCK_BINDADDR_LOCK`).
     port_locked: bool,
+    address_locked: bool,
+    /// The address a disconnect kept without its port, which the next
+    /// automatic bind takes.
+    address: Option<IpAddr>,
     listen: Option<Listen>,
     /// The loopback connection the stream is a side of, once its listener
     /// has taken it.
@@ -433,7 +454,23 @@ struct State {
     // UDP.
     peer: Option<SocketAddr>,
     queries: VecDeque<Query>,
+    /// Datagrams other guest sockets sent this one on the loopback.
+    inbox: VecDeque<Datagram>,
+    /// What the inbox takes of `SO_RCVBUF`, as Linux's `sk_rmem_alloc`.
+    inbox_size: usize,
+    /// How many datagrams and queries have come, which orders them.
+    received: u64,
 }
+
+/// A datagram from another guest socket.
+struct Datagram {
+    from: SocketAddr,
+    seq: u64,
+    bytes: Vec<u8>,
+}
+/// What a datagram takes of the receive buffer besides its bytes: about a
+/// small `sk_buff`'s `truesize`.
+const DATAGRAM_OVERHEAD: usize = 768;
 
 /// A listening socket's connections, as Linux's accept queue.
 struct Listen {
@@ -706,6 +743,10 @@ impl InetSocket {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// The ports of this socket's protocol.
+    fn ports(&self) -> MutexGuard<'_, Ports> {
+        self.network.ports(self.datagram)
+    }
     fn options(&self) -> MutexGuard<'_, Options> {
         self.options.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -788,8 +829,7 @@ impl InetSocket {
     /// host's.
     fn connect(&self, c: &mut Context<'_>, address: Option<SocketAddr>) -> Result<u64, Errno> {
         if self.datagram {
-            self.lock().peer = address;
-            return Ok(0);
+            return self.connect_datagram(address);
         }
         let Some(address) = address else {
             // AF_UNSPEC disconnects.
@@ -944,6 +984,7 @@ impl InetSocket {
             .as_ref()
             .and_then(|stream| stream.local())
             .or(s.bound)
+            .or(s.address.map(|ip| SocketAddr::new(ip, 0)))
             .unwrap_or(match self.family {
                 Family::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
                 Family::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
@@ -961,14 +1002,131 @@ impl InetSocket {
         }
     }
 
-    /// Takes a DNS query sent to `to`, or the connected peer.
+    /// `connect` of a UDP socket: it then sends to `address`, and on the
+    /// loopback takes datagrams only from it, from its port, bound now to
+    /// every address if it had none, on the loopback's source address
+    /// (`inet_dgram_connect`, `ip4_datagram_connect`). AF_UNSPEC disconnects
+    /// (`__udp_disconnect`), keeping only what the guest bound itself.
+    fn connect_datagram(&self, address: Option<SocketAddr>) -> Result<u64, Errno> {
+        let options = *self.options();
+        let mut s = self.lock();
+        let Some(address) = address else {
+            s.peer = None;
+            let bindings = State {
+                bound: s.bound.take(),
+                port_locked: s.port_locked,
+                address_locked: s.address_locked,
+                address: s.address.take(),
+                ..State::default()
+            };
+            self.keep_locked(&mut s, &bindings);
+            return Ok(0);
+        };
+        let to = SocketAddr::new(plain(address.ip()), address.port());
+        match crate::loopback::destination(to) {
+            Some(to) => {
+                if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
+                    return Err(ENETUNREACH);
+                }
+                let from = self.datagram_source(&mut s, to, &options)?;
+                self.ports().connect(&self.this, from, Some(to));
+                s.bound = Some(from);
+                s.peer = Some(to);
+            }
+            None => {
+                if let Some(bound) = s.bound {
+                    self.ports().connect(&self.this, bound, None);
+                }
+                s.peer = Some(address);
+            }
+        }
+        Ok(0)
+    }
+    fn unspecified(&self) -> IpAddr {
+        match self.family {
+            Family::V4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            Family::V6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        }
+    }
+    /// The address a datagram to `to` on the loopback leaves from: this
+    /// socket's port, bound now to every address if it had none (Linux's
+    /// `inet_autobind`), on the address it is bound to, or else the
+    /// loopback's source address.
+    fn datagram_source(
+        &self,
+        s: &mut State,
+        to: SocketAddr,
+        options: &Options,
+    ) -> Result<SocketAddr, Errno> {
+        let bound = match s.bound {
+            Some(bound) => bound,
+            None => {
+                let every = SocketAddr::new(s.address.take().unwrap_or(self.unspecified()), 0);
+                // Linux's autobind finds no free port with EAGAIN.
+                let bound = self
+                    .ports()
+                    .bind(self.binding(every, options))
+                    .map_err(|_| Errno::EAGAIN)?;
+                s.bound = Some(bound);
+                bound
+            }
+        };
+        let ip = if bound.ip().is_unspecified() {
+            crate::loopback::source(to)
+        } else {
+            bound.ip()
+        };
+        Ok(SocketAddr::new(ip, bound.port()))
+    }
+    /// Sends a datagram to `to`, or the connected peer: on the loopback to
+    /// the guest socket that takes it, if any, as Linux's loopback delivers
+    /// it at once; else a DNS query to the stub, to port 53 at any address.
+    /// Any other destination is `ENETUNREACH`. A connected socket's pending
+    /// error goes first, as `sock_alloc_send_pskb` gives it.
     fn send_datagram(&self, bytes: &[u8], to: Option<SocketAddr>) -> Result<usize, Errno> {
+        let options = *self.options();
         let mut s = self.lock();
         let to = to.or(s.peer).ok_or(EDESTADDRREQ)?;
-        if to.port() != DNS {
+        if let Some(error) = s.error.take() {
+            return Err(error);
+        }
+        let plain_to = SocketAddr::new(plain(to.ip()), to.port());
+        if let Some(dest) = crate::loopback::destination(plain_to) {
+            if self.family == Family::V6 && options.v6_only && dest.is_ipv4() {
+                return Err(ENETUNREACH);
+            }
+            // The most a datagram holds: 65535 bytes less the UDP header,
+            // and IPv4's.
+            let most = if dest.is_ipv4() { 65_507 } else { 65_527 };
+            if bytes.len() > most {
+                return Err(EMSGSIZE);
+            }
+            let from = self.datagram_source(&mut s, dest, &options)?;
+            let to_peer = s.peer == Some(dest);
+            drop(s);
+            let receiver = self.ports().receiver(dest, from);
+            if let Some(receiver) = receiver {
+                receiver.deliver(from, bytes);
+                return Ok(bytes.len());
+            }
+            if dest.port() != DNS {
+                // The loopback answers with ICMP's port unreachable, which
+                // only a socket connected there learns of
+                // (`__udp4_lib_err`).
+                if to_peer {
+                    self.lock().error = Some(ECONNREFUSED);
+                    self.signals.send(Reason::Error);
+                    self.hub.changed();
+                }
+                return Ok(bytes.len());
+            }
+            s = self.lock();
+        } else if to.port() != DNS {
             return Err(ENETUNREACH);
         }
         if let Some(mut query) = parse_query(bytes, to) {
+            query.seq = s.received;
+            s.received += 1;
             start_lookup(&self.network, self.host.as_ref(), &mut query);
             // An answer signals POLL_IN as a datagram's arrival does, and
             // then wakes this socket's waits, so that a poll the answer ends
@@ -993,35 +1151,78 @@ impl InetSocket {
         }
         Ok(bytes.len())
     }
-    /// Gives the first answer the stub has ready, cut to `buf`.
+    /// A datagram from `from` arrives, unless the receive buffer is already
+    /// over `SO_RCVBUF`, when Linux's `__udp_enqueue_schedule_skb` drops it.
+    fn deliver(&self, from: SocketAddr, bytes: &[u8]) {
+        let limit = usize::try_from(self.options().receive_buffer).unwrap_or(0);
+        let mut s = self.lock();
+        if s.inbox_size > limit {
+            return;
+        }
+        let seq = s.received;
+        s.received += 1;
+        s.inbox_size += bytes.len() + DATAGRAM_OVERHEAD;
+        s.inbox.push_back(Datagram {
+            from,
+            seq,
+            bytes: bytes.to_vec(),
+        });
+        drop(s);
+        self.signals.waking(Reason::In);
+        self.hub.changed();
+    }
+    /// The first datagram that has come, a guest socket's or the stub's
+    /// ready answer, in the order they came: its sender and bytes.
+    fn first_datagram(&self, s: &State) -> Option<(SocketAddr, Vec<u8>, bool)> {
+        let answer = s
+            .queries
+            .front()
+            .and_then(|query| Some((query.seq, query.from, self.answer(query)?)));
+        match (answer, s.inbox.front()) {
+            (Some((seq, from, answer)), datagram)
+                if datagram.is_none_or(|datagram| seq < datagram.seq) =>
+            {
+                Some((from, answer, true))
+            }
+            (_, Some(datagram)) => Some((datagram.from, datagram.bytes.clone(), false)),
+            _ => None,
+        }
+    }
+    /// Takes the first datagram that has come, cut to `buf`; a pending
+    /// error first, as Linux's `__skb_try_recv_datagram`.
     fn receive_datagram(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
         let mut s = self.lock();
-        let Some(answer) = s.queries.front().and_then(|query| self.answer(query)) else {
+        if let Some(error) = s.error.take() {
+            return Err(error);
+        }
+        let Some((from, bytes, answer)) = self.first_datagram(&s) else {
             return Err(Errno::EAGAIN);
         };
-        let from = s.queries.front().map(|query| query.from);
         if !peek {
-            s.queries.pop_front();
+            if answer {
+                s.queries.pop_front();
+            } else {
+                s.inbox.pop_front();
+                s.inbox_size -= bytes.len() + DATAGRAM_OVERHEAD;
+            }
         }
-        let n = buf.len().min(answer.len());
-        buf[..n].copy_from_slice(&answer[..n]);
+        let n = buf.len().min(bytes.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
         Ok(Received {
             count: n,
-            length: answer.len(),
-            from,
+            length: bytes.len(),
+            from: Some(from),
         })
     }
     /// The answer to `query` in a datagram, once it can be given.
     fn answer(&self, query: &Query) -> Option<Vec<u8>> {
         answer(&self.network, self.host.as_ref(), query, UDP_ANSWER)
     }
-    /// The first ready answer's length, for `FIONREAD`.
+    /// The first datagram's length, for `FIONREAD` (`first_packet_length`).
     fn next_datagram(&self) -> usize {
         let s = self.lock();
-        s.queries
-            .front()
-            .and_then(|query| self.answer(query))
-            .map_or(0, |answer| answer.len())
+        self.first_datagram(&s)
+            .map_or(0, |(_, bytes, _)| bytes.len())
     }
     /// The bytes waiting to be read, and to be sent, for `FIONREAD` and
     /// `SIOCOUTQ`; a listener has neither (EINVAL, as Linux's `tcp_ioctl`).
@@ -1049,10 +1250,11 @@ impl InetSocket {
             reuse_address: options.reuse_address,
             reuse_port: options.reuse_port,
             listening: false,
+            peer: None,
             owner: Weak::clone(&self.this),
         }
     }
-    /// `bind` of a TCP socket, with Linux's checks in its order
+    /// `bind` of a TCP or UDP socket, with Linux's checks in its order
     /// (`__inet_bind`, `__inet6_bind`). The guest's own addresses are the
     /// loopback's and the unspecified one, and the IPv4 multicast and
     /// broadcast ones Linux takes too; any other is `EADDRNOTAVAIL`. Port 0
@@ -1098,7 +1300,7 @@ impl InetSocket {
                 let scope = raw
                     .get(24..28)
                     .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-                if ip.is_multicast() || taken(&s) {
+                if (ip.is_multicast() && !self.datagram) || taken(&s) {
                     return Err(Errno::EINVAL);
                 }
                 if let Some(v4) = ip.to_ipv4_mapped() {
@@ -1119,8 +1321,10 @@ impl InetSocket {
                 }
             }
         };
-        s.bound = Some(self.network.ports().bind(self.binding(address, &options))?);
+        s.bound = Some(self.ports().bind(self.binding(address, &options))?);
         s.port_locked = address.port() != 0;
+        s.address_locked = !address.ip().is_unspecified();
+        s.address = None;
         Ok(0)
     }
     /// `listen(backlog)`, as Linux's `inet_listen`: `EOPNOTSUPP` for UDP,
@@ -1148,13 +1352,10 @@ impl InetSocket {
             return Ok(0);
         }
         {
-            let mut ports = self.network.ports();
+            let mut ports = self.ports();
             if s.bound.is_none() {
-                let every = match self.family {
-                    Family::V4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    Family::V6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                };
-                s.bound = Some(ports.bind(self.binding(SocketAddr::new(every, 0), &options))?);
+                let ip = s.address.take().unwrap_or(self.unspecified());
+                s.bound = Some(ports.bind(self.binding(SocketAddr::new(ip, 0), &options))?);
             }
             ports.listen(&self.this, options.reuse_address, options.reuse_port)?;
         }
@@ -1244,7 +1445,7 @@ impl InetSocket {
         let _ = link.set(Arc::clone(&joined));
         let own_link = Arc::new(OnceLock::new());
         let _ = own_link.set(joined);
-        self.network.ports().hold(child.binding(to, &options));
+        self.ports().hold(child.binding(to, &options));
         let mut s = child.lock();
         s.stream = Some(own);
         s.connection = Connection::Connected;
@@ -1266,7 +1467,7 @@ impl InetSocket {
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
         }
-        let Some(listener) = self.network.ports().listener(to) else {
+        let Some(listener) = self.ports().listener(to) else {
             return Ok(None);
         };
         let theirs = *listener.options();
@@ -1308,7 +1509,7 @@ impl InetSocket {
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
         let source = crate::loopback::source(to);
-        let mut ports = self.network.ports();
+        let mut ports = self.ports();
         let from = match s.bound {
             Some(bound) if !bound.ip().is_unspecified() => bound,
             Some(bound) => {
@@ -1317,9 +1518,12 @@ impl InetSocket {
                 from
             }
             // Linux's connect finds no free port with EADDRNOTAVAIL.
-            None => ports
-                .bind(self.binding(SocketAddr::new(source, 0), options))
-                .map_err(|_| EADDRNOTAVAIL)?,
+            None => {
+                let ip = s.address.take().unwrap_or(source);
+                ports
+                    .bind(self.binding(SocketAddr::new(ip, 0), options))
+                    .map_err(|_| EADDRNOTAVAIL)?
+            }
         };
         s.bound = Some(from);
         Ok(from)
@@ -1344,18 +1548,10 @@ impl InetSocket {
     /// bound itself is kept.
     fn renew(&self, s: &mut State) {
         let old = std::mem::take(s);
-        {
-            let mut ports = self.network.ports();
-            if old.listen.is_some() {
-                ports.stop_listening(&self.this);
-            }
-            if old.port_locked {
-                s.bound = old.bound;
-                s.port_locked = true;
-            } else if old.bound.is_some() {
-                ports.unbind(&self.this);
-            }
+        if old.listen.is_some() {
+            self.ports().stop_listening(&self.this);
         }
+        self.keep_locked(s, &old);
         if let Some(listen) = old.listen {
             listen.stop();
             self.hub.changed();
@@ -1363,6 +1559,31 @@ impl InetSocket {
         if let Some(stream) = old.stream {
             finish(&stream, old.link.as_ref(), true);
         }
+    }
+    /// What a disconnect leaves `s` of the binding `old` had, as Linux's
+    /// `tcp_disconnect` and `__udp_disconnect` do: its port only if the guest
+    /// bound that itself, and its address only if the guest named one.
+    fn keep_locked(&self, s: &mut State, old: &State) {
+        let Some(bound) = old.bound else {
+            s.address = old.address;
+            return;
+        };
+        let ip = if old.address_locked {
+            bound.ip()
+        } else {
+            self.unspecified()
+        };
+        let mut ports = self.ports();
+        if old.port_locked {
+            let kept = SocketAddr::new(ip, bound.port());
+            ports.connect(&self.this, kept, None);
+            s.bound = Some(kept);
+        } else {
+            ports.unbind(&self.this);
+            s.address = old.address_locked.then_some(ip);
+        }
+        s.port_locked = old.port_locked;
+        s.address_locked = old.address_locked;
     }
     /// Resets this socket's connection, as a listener that stops does to
     /// those it has not handed out.
@@ -1439,12 +1660,9 @@ impl FileHandle for InetSocket {
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         if self.datagram {
             let s = self.lock();
-            let ready = s
-                .queries
-                .front()
-                .is_some_and(|query| self.answer(query).is_some());
-            let epoch = s.queries.len() as u64;
-            return Ok((OUT | (u32::from(ready) * IN), epoch, 0));
+            let ready = self.first_datagram(&s).is_some();
+            let error = u32::from(s.error.is_some()) * POLLERR;
+            return Ok((OUT | (u32::from(ready) * IN) | error, s.received, 0));
         }
         let mut s = self.lock();
         // A listener is readable while a connection waits, and no more
@@ -1651,12 +1869,7 @@ pub(crate) fn dispatch(
         }
         // accept and accept4
         43 | 288 => accept(c, socket, a, if number == 288 { a[3] } else { 0 }),
-        // bind: a TCP socket to the guest's own addresses; a UDP one only
-        // to port 0, as a client may before it sends.
-        49 if socket.datagram => match read_address(c, socket, a[1], a[2])? {
-            Some(address) if address.port() != 0 => Err(Errno(13)),
-            _ => Ok(0),
-        },
+        // bind, to the guest's own addresses
         49 => socket.bind(&read_raw(c, a[1], a[2])?),
         // listen
         50 => socket.listen(a[1]),
@@ -1925,7 +2138,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     } else {
                         options.reuse_port = value != 0;
                     }
-                    socket.network.ports().set_reuse(
+                    socket.ports().set_reuse(
                         &socket.this,
                         options.reuse_address,
                         options.reuse_port,
@@ -2078,6 +2291,7 @@ fn parse_query(bytes: &[u8], from: SocketAddr) -> Option<Query> {
     let flags = u16::from_be_bytes([bytes[2], bytes[3]]);
     let mut query = Query {
         from,
+        seq: 0,
         id,
         flags,
         question: Vec::new(),

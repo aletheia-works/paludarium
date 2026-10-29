@@ -36,7 +36,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socket`（[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（TCP はゲスト自身の[ループバック](#loopback-servers)の上で。UDP の `bind` はポート 0 だけ）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（ゲスト自身の[ループバック](#loopback-servers)の上で。`listen` と `accept` は TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -178,7 +178,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `POLL_IN` です。相手の終わりが届くと `POLL_IN`（こちらも閉じていれば `POLL_HUP`）を
     送り、続けて `POLL_IN` を送ります。送信や `poll` がバッファをいっぱいと見たあとは、
     空きができたときに `POLL_OUT` を 1 回送ります。DNS の代わりの答えは、用意できた
-    ときに `POLL_IN` を送ります。
+    ときに `POLL_IN` を送り、ゲストのソケットからのデータグラムも、届いたときに
+    `POLL_IN` を送ります。接続した UDP のソケットへのループバックの ICMP の答えは
+    `POLL_ERR` を送ります。
   - **待っている読み手**：ストリームで読み込みが待っているときは、その待ちを終わらせるデータ、
     終わり、切断のシグナルを送りません。Linux もそのときは送りません。分けて送る送信では、
     送らないのは最初の分だけです。ただし相手が `shutdown` したときや閉じたときは、
@@ -522,7 +524,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 ### ループバックのサーバー {#loopback-servers}
 
 TCP のソケットは、ゲスト自身のループバックの上で Linux と同じく `bind`、`listen`、
-`accept` できます。ゲストのソケットが、待ち受けているループバックのアドレスに接続すると、
+`accept` できます。UDP のソケットも、そこで `bind` してデータグラムをやり取りできます。ゲストのソケットが、待ち受けているループバックのアドレスに接続すると、
 方針によらずカーネルの中で届き、ゲストの外には出ません。ホストもほかのマシンも、
 ゲストの待ち受けには届きません。待ち受けていなければ、許可したアドレスはこれまで
 どおりホストに届き、ほかは拒まれます。何も許可しないネットワーク（JavaScript の
@@ -555,6 +557,21 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   接続のある待ち受けを閉じたときは、相手をリセットします（相手は持っている分を
   読んだあと `ECONNRESET`）。閉じた相手に送ったバイトにはリセットが返り、次の送信は
   `EPIPE` です。
+- **UDP** の `bind` は TCP と同じですが、ポートは UDP 自身のもので、両方が
+  `SO_REUSEADDR` を付けていればポートを共有できます。ループバックのアドレスへの
+  データグラムは、そこに `bind` したゲストのソケットに、Linux の `compute_score` と
+  同じ選び方で届きます。接続したソケットは相手からだけ受け取り、そのアドレスに
+  `bind` したもの、接続したもの、IPv4 のものが先で、同じなら最後に `bind` したものです。
+  `bind` せずに送るソケットは、すべてのアドレスで一時的なポートを取ります。接続する
+  ソケットは、ループバックの送り元のアドレスでポートを取り、相手からだけ受け取ります。
+  `AF_UNSPEC` で切断すると、ゲストが自分で `bind` したポートとアドレスだけが残ります。
+  データグラムは IPv4 で 65507 バイト、IPv6 で 65527 バイトまでで（超えると
+  `EMSGSIZE`）、空でもよく、読み手のバッファに切り詰められます（`MSG_TRUNC`）。
+  `FIONREAD` は最初のものの長さです。受け取るソケットがないときは、そこに接続した
+  ソケットにループバックの ICMP の答えが届き、次の送信か受信が 1 回だけ
+  `ECONNREFUSED` になります（`SO_ERROR` と `POLLERR` にも出ます）。53 番ポートへの
+  データグラムで、受け取るゲストのソケットがないものは、これまでどおり DNS の代わりに
+  届きます。
 
 ## スレッドとプロセス
 

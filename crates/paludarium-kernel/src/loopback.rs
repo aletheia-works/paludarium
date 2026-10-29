@@ -1,14 +1,15 @@
 //! The guest's own loopback: the TCP servers a guest binds, listens and
-//! accepts on, and the connections its other sockets open to them, which
-//! the kernel joins itself. Only the guest reaches a guest's listener;
-//! neither the host nor another machine does.
+//! accepts on, the connections its other sockets open to them, which the
+//! kernel joins itself, and the UDP datagrams its sockets send each other.
+//! Only the guest reaches a guest's socket; neither the host nor another
+//! machine does.
 //!
 //! A connection is two [`Stream`]s, one for each socket, that a [`Link`]
 //! moves bytes between in the caller's thread whenever either changes, so
 //! that a loopback socket reads, writes and polls as one the host connected.
-//! [`Ports`] keeps what each TCP socket holds a local port with, as Linux's
-//! bind buckets do, for `bind`'s conflicts and to find a connection's
-//! listener.
+//! [`Ports`] keeps what each TCP or UDP socket holds a local port with, as
+//! Linux's bind buckets and UDP hash do, for `bind`'s conflicts and to find
+//! a connection's listener or a datagram's receiver.
 use crate::inet::InetSocket;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use paludarium_host::net::{Driver, Phase, Stream};
@@ -138,6 +139,8 @@ pub(crate) struct Binding {
     pub(crate) reuse_address: bool,
     pub(crate) reuse_port: bool,
     pub(crate) listening: bool,
+    /// A connected UDP socket's peer, the only sender it receives from.
+    pub(crate) peer: Option<SocketAddr>,
     pub(crate) owner: Weak<InetSocket>,
 }
 impl Binding {
@@ -178,8 +181,8 @@ impl Binding {
     }
 }
 
-/// The local ports TCP sockets hold, and where the next ephemeral one is
-/// looked for.
+/// The local ports the TCP sockets, or the UDP ones, hold, and where the
+/// next ephemeral one is looked for.
 pub(crate) struct Ports {
     bindings: Vec<Binding>,
     next: u16,
@@ -286,6 +289,21 @@ impl Ports {
             }
         }
     }
+    /// `owner`, a UDP socket, connected from `address` to `peer`, or with
+    /// `None` disconnected.
+    pub(crate) fn connect(
+        &mut self,
+        owner: &Weak<InetSocket>,
+        address: SocketAddr,
+        peer: Option<SocketAddr>,
+    ) {
+        for binding in &mut self.bindings {
+            if binding.is(owner) {
+                binding.address = address;
+                binding.peer = peer;
+            }
+        }
+    }
     /// `owner` gave its port up.
     pub(crate) fn unbind(&mut self, owner: &Weak<InetSocket>) {
         self.bindings.retain(|binding| !binding.is(owner));
@@ -313,6 +331,43 @@ impl Ports {
         };
         let mut best: Option<((bool, bool), &Binding)> = None;
         for binding in &self.bindings {
+            if let Some(found) = score(binding)
+                && best.is_none_or(|(score, _)| found > score)
+            {
+                best = Some((found, binding));
+            }
+        }
+        best.and_then(|(_, binding)| binding.owner.upgrade())
+    }
+    /// The UDP socket a datagram from `from` to `to` reaches, as Linux's
+    /// `compute_score` ranks them: a connected one only from its peer, and
+    /// one bound to that address, connected, or IPv4, before others; among
+    /// equals the last to bind, which Linux's hash holds first.
+    pub(crate) fn receiver(&mut self, to: SocketAddr, from: SocketAddr) -> Option<Arc<InetSocket>> {
+        self.live();
+        let ip = to.ip();
+        let score = |binding: &Binding| {
+            if binding.address.port() != to.port() || !binding.carries(ip) {
+                return None;
+            }
+            let mut score = if binding.v6 { 1 } else { 2 };
+            let bound = binding.address.ip();
+            if !bound.is_unspecified() {
+                if bound != ip {
+                    return None;
+                }
+                score += 4;
+            }
+            if let Some(peer) = binding.peer {
+                if peer != from {
+                    return None;
+                }
+                score += 8;
+            }
+            Some(score)
+        };
+        let mut best: Option<(u8, &Binding)> = None;
+        for binding in self.bindings.iter().rev() {
             if let Some(found) = score(binding)
                 && best.is_none_or(|(score, _)| found > score)
             {
@@ -361,6 +416,7 @@ mod tests {
             reuse_address: false,
             reuse_port: false,
             listening: false,
+            peer: None,
             owner: Weak::new(),
         }
     }

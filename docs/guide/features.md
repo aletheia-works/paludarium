@@ -42,7 +42,7 @@ kernel.
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
-| Sockets | `socket` (`AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (TCP, on the guest's own [loopback](#loopback-servers); UDP binds port 0 only), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (on the guest's own [loopback](#loopback-servers); `listen` and `accept` for TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -192,7 +192,9 @@ kernel.
     when data arrives, and for the peer's end `POLL_IN` (`POLL_HUP` once
     this side has shut down too) and then `POLL_IN`. A send or `poll` that
     found the buffer full makes room signal `POLL_OUT` once. A DNS stub's
-    answer signals `POLL_IN` when it is ready.
+    answer signals `POLL_IN` when it is ready, and so does a datagram from a
+    guest socket when it arrives; the loopback's ICMP answer to a connected
+    UDP socket signals `POLL_ERR`.
   - **A waiting reader.** A stream whose read waits gets no signal for the
     data, end or hang-up that ends the wait, as Linux holds it back; of a
     send in parts, only the first. For the peer's shutdown or close Linux
@@ -561,7 +563,7 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
 ### Loopback servers {#loopback-servers}
 
 A TCP socket binds, listens and accepts on the guest's own loopback as on
-Linux. A connection from a guest socket to a loopback address where one
+Linux, and a UDP socket binds and exchanges datagrams there. A connection from a guest socket to a loopback address where one
 listens reaches it in the kernel, whatever the policy says, and never leaves
 the guest: neither the host nor another machine reaches a guest's listener.
 Where none listens, an allowed address goes to the host as before, and any
@@ -596,6 +598,21 @@ one only with an `--allow-net`.
   with connections it has not handed out resets the peer (`ECONNRESET`
   after the bytes it holds); bytes sent to a peer that has closed are
   answered with a reset, so the next send is `EPIPE`.
+- **UDP** binds as TCP does, on ports of its own, where `SO_REUSEADDR` on
+  both shares a port. A datagram to a loopback address reaches the guest
+  socket bound there, as Linux's `compute_score` picks it: a connected one
+  only from its peer, one bound to that address or connected, or of IPv4,
+  first, and among equals the last to bind. A socket that sends unbound
+  takes an ephemeral port on every address; one that connects takes one on
+  the loopback's source address and receives only from its peer, and
+  `AF_UNSPEC` disconnects it, keeping only the port and address the guest
+  bound itself. A datagram holds up to 65507 bytes over IPv4 and 65527 over
+  IPv6 (`EMSGSIZE`), may be empty, and is cut to the reader's buffer
+  (`MSG_TRUNC`); `FIONREAD` gives the first one's length. Where no socket
+  takes it, the loopback's ICMP answer reaches a socket connected there:
+  its next send or receive is `ECONNREFUSED`, once, as `SO_ERROR` and
+  `POLLERR` show. A datagram to port 53 that no guest socket takes goes to
+  the DNS stub, as before.
 
 ## Threads and processes
 

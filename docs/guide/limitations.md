@@ -10,14 +10,13 @@ verified.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.
-  With one, only TCP clients, TCP servers for the guest's own sockets and
-  name resolution work ([Network](./features#network)):
+  With one, only TCP clients, TCP and UDP servers for the guest's own
+  sockets and name resolution work ([Network](./features#network)):
   - A guest serves only its own sockets, on its loopback
     ([Loopback servers](./features#loopback-servers)): neither the host nor
     another machine can connect to it, and `bind` takes only the loopback's
     addresses and the unspecified one (`EADDRNOTAVAIL` for any other, where
-    Linux takes each of the machine's own). A UDP socket binds only port 0
-    (`EACCES` for another), so it cannot serve either.
+    Linux takes each of the machine's own).
   - On the loopback, a closed connection leaves no `TIME_WAIT`, so its port
     is free at once, where Linux keeps it 60 seconds after the side that
     closed first (`EADDRINUSE` without `SO_REUSEADDR`). A connection that
@@ -26,8 +25,13 @@ verified.
     `ETIMEDOUT`. Listeners sharing a port with `SO_REUSEPORT` do not share
     its connections: all go to the first. A nonzero `SO_LINGER` time never
     holds `close`, as the bytes are delivered at once.
-  - A UDP socket reaches only the DNS stub; a datagram to another port is
-    `ENETUNREACH`. Raw sockets are `EPERM`, ICMP sockets `EACCES`, and other
+  - A UDP socket reaches the DNS stub and the guest's own sockets on the
+    loopback; a datagram to any other address is `ENETUNREACH`, and one
+    connected elsewhere takes no port (Linux binds one). `shutdown` of a UDP
+    socket does nothing, where Linux's then ends reads and refuses sends
+    (`EPIPE`). A datagram counts its bytes and 768 more against
+    `SO_RCVBUF`, where Linux counts its `sk_buff`, so a full buffer drops at
+    another point; multicast and broadcast datagrams reach no one. Raw sockets are `EPERM`, ICMP sockets `EACCES`, and other
     kinds (SCTP's `SOCK_SEQPACKET`, which Linux loads a module for)
     `ESOCKTNOSUPPORT`.
   - `socket(AF_UNIX)` is `EAFNOSUPPORT` as before, and `connect` and `bind`

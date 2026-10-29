@@ -33,7 +33,7 @@ CI run produces them afresh on an x86-64 Linux runner.
 - The network cases (`diff_network`) serve the guest from the test itself, on
   127.0.0.1, so that native Linux and the emulator talk to the same server;
   the emulator may reach only that server's port and one that nothing
-  listens on. The `listen` cases serve on the guest's own loopback, which
+  listens on. The `listen` and `udp` cases serve on the guest's own loopback, which
   both run in their own way: Linux's network stack, and the emulator's
   kernel. Name resolution on Linux depends on the runner's own files and
   servers, so it is checked under the emulator only, against `localhost`,

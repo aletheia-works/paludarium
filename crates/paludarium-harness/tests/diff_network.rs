@@ -180,6 +180,10 @@ mod linux {
     fn network_listen_v6() {
         case("listen-v6");
     }
+    #[test]
+    fn network_udp() {
+        case("udp");
+    }
 
     /// Name resolution has no native counterpart here: the guest's resolver
     /// would read the runner's own files and servers. Under the emulator,

@@ -53,5 +53,5 @@ copy its code.
   ([Testing and verification](../design/quality)).
 - **No network unless allowed.** A guest reaches only the destinations the
   embedder allows by name or address, as a TCP client, and resolves only
-  those names; its own TCP servers serve only its own sockets, on its
-  loopback ([Network](./features#network)).
+  those names; its own TCP and UDP servers serve only its own sockets, on
+  its loopback ([Network](./features#network)).

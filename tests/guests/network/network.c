@@ -849,6 +849,140 @@ int main(int argc, char **argv) {
         close(m);
         return 0;
     }
+    if (!strcmp(mode, "udp")) {
+        /* UDP on the loopback: datagrams and their senders, truncation and
+           peeking, a connected socket's filter and the loopback's ICMP
+           answer to it, the size limit, SO_REUSEADDR and a dual-stack
+           receiver. */
+        int a = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in addr = to(0);
+        call("bind", bind(a, (void *)&addr, sizeof addr));
+        int port = port_of(a);
+        printf("  port-ok=%d\n", port != 0);
+        ready("idle", a, POLLIN | POLLOUT);
+        int b = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in dst = to(port);
+        call("sendto", sendto(b, "hello", 5, 0, (void *)&dst, sizeof dst));
+        struct sockaddr_in bn;
+        socklen_t len = sizeof bn;
+        getsockname(b, (void *)&bn, &len);
+        printf("  sender family=%d addr=%#x port-ok=%d\n", bn.sin_family, ntohl(bn.sin_addr.s_addr),
+               ntohs(bn.sin_port) != 0);
+        ready("arrived", a, POLLIN | POLLOUT);
+        call("send-empty", sendto(b, "", 0, 0, (void *)&dst, sizeof dst));
+        call("send-ten", sendto(b, "0123456789", 10, 0, (void *)&dst, sizeof dst));
+        int queued = -1;
+        ioctl(a, FIONREAD, &queued);
+        printf("  fionread=%d\n", queued);
+        struct sockaddr_in from;
+        len = sizeof from;
+        n = recvfrom(a, buf, sizeof buf, 0, (void *)&from, &len);
+        print_bytes("recvfrom", buf, n);
+        printf("  from-is-sender=%d len=%u addr=%#x\n", from.sin_port == bn.sin_port, (unsigned)len,
+               ntohl(from.sin_addr.s_addr));
+        call("recv-empty", recv(a, buf, sizeof buf, 0));
+        call("recv-trunc", recv(a, buf, 4, MSG_TRUNC));
+        call("recv-dontwait", recv(a, buf, 1, MSG_DONTWAIT));
+        sendto(b, "abcdef", 6, 0, (void *)&dst, sizeof dst);
+        struct iovec iov = {buf, 3};
+        struct msghdr mh = {.msg_iov = &iov, .msg_iovlen = 1};
+        n = recvmsg(a, &mh, 0);
+        printf("  recvmsg=%ld trunc=%d\n", n, (mh.msg_flags & MSG_TRUNC) != 0);
+        sendto(b, "peek", 4, 0, (void *)&dst, sizeof dst);
+        n = recv(a, buf, sizeof buf, MSG_PEEK);
+        print_bytes("peeked", buf, n);
+        n = recv(a, buf, sizeof buf, 0);
+        print_bytes("taken", buf, n);
+        /* Connected, a socket takes datagrams only from its peer, and sends
+           to it without an address. */
+        struct sockaddr_in peer = to(ntohs(bn.sin_port));
+        call("connect", connect(a, (void *)&peer, sizeof peer));
+        len = sizeof peer;
+        call("getpeername", getpeername(a, (void *)&peer, &len));
+        printf("  peer-is-sender=%d addr=%#x\n", peer.sin_port == bn.sin_port, ntohl(peer.sin_addr.s_addr));
+        int c = socket(AF_INET, SOCK_DGRAM, 0);
+        call("stranger", sendto(c, "stranger", 8, 0, (void *)&dst, sizeof dst));
+        call("friend", sendto(b, "friend", 6, 0, (void *)&dst, sizeof dst));
+        n = recv(a, buf, sizeof buf, 0);
+        print_bytes("connected-recv", buf, n);
+        call("recv-none", recv(a, buf, sizeof buf, MSG_DONTWAIT));
+        call("send-to-peer", send(a, "back", 4, 0));
+        n = recv(b, buf, sizeof buf, 0);
+        print_bytes("sender-recv", buf, n);
+        call("send-unconnected", send(c, "x", 1, 0));
+        /* A port nothing takes: the loopback answers a connected socket's
+           datagram with ICMP, which its next call gives, once. */
+        int gone = socket(AF_INET, SOCK_DGRAM, 0);
+        bind(gone, (void *)&addr, sizeof addr);
+        int gone_port = port_of(gone);
+        close(gone);
+        int d = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in closed = to(gone_port);
+        call("connect-closed", connect(d, (void *)&closed, sizeof closed));
+        len = sizeof bn;
+        getsockname(d, (void *)&bn, &len);
+        printf("  closed source=%#x port-ok=%d\n", ntohl(bn.sin_addr.s_addr), ntohs(bn.sin_port) != 0);
+        call("send-closed", send(d, "x", 1, 0));
+        ready("refused", d, POLLIN | POLLOUT);
+        call("send-refused", send(d, "x", 1, 0));
+        call("send-again", send(d, "x", 1, 0));
+        call("recv-refused", recv(d, buf, sizeof buf, MSG_DONTWAIT));
+        call("recv-after", recv(d, buf, sizeof buf, MSG_DONTWAIT));
+        call("unconnected-closed", sendto(c, "x", 1, 0, (void *)&closed, sizeof closed));
+        option("unconnected-error", c, SOL_SOCKET, SO_ERROR);
+        /* The most a datagram holds over IPv4. */
+        static char big[65508];
+        call("send-most", sendto(b, big, 65507, 0, (void *)&dst, sizeof dst));
+        call("send-too-big", sendto(b, big, 65508, 0, (void *)&dst, sizeof dst));
+        call("recv-most", recv(a, big, sizeof big, 0));
+        /* AF_UNSPEC disconnects: the address the guest named stays, but
+           the port it let bind choose goes, so nothing reaches it there. */
+        struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+        call("disconnect", connect(a, &unspec, sizeof unspec));
+        len = sizeof peer;
+        call("getpeername-after", getpeername(a, (void *)&peer, &len));
+        len = sizeof bn;
+        getsockname(a, (void *)&bn, &len);
+        printf("  after-disconnect addr=%#x port=%d\n", ntohl(bn.sin_addr.s_addr), ntohs(bn.sin_port));
+        call("stranger-again", sendto(c, "now", 3, 0, (void *)&dst, sizeof dst));
+        call("recv-unbound", recv(a, buf, sizeof buf, MSG_DONTWAIT));
+        /* Its next send binds a port on that address. */
+        call("send-rebinds", sendto(a, "re", 2, 0, (void *)&dst, sizeof dst));
+        len = sizeof bn;
+        getsockname(a, (void *)&bn, &len);
+        printf("  rebound addr=%#x port-ok=%d\n", ntohl(bn.sin_addr.s_addr), ntohs(bn.sin_port) != 0);
+        /* SO_REUSEADDR shares a port; the last to bind takes the datagram. */
+        int r1 = socket(AF_INET, SOCK_DGRAM, 0), r2 = socket(AF_INET, SOCK_DGRAM, 0),
+            r3 = socket(AF_INET, SOCK_DGRAM, 0);
+        set_option("reuse-1", r1, SOL_SOCKET, SO_REUSEADDR, 1);
+        set_option("reuse-2", r2, SOL_SOCKET, SO_REUSEADDR, 1);
+        bind_to("reuse-bind-1", r1, htonl(INADDR_LOOPBACK), 0);
+        int shared = port_of(r1);
+        bind_to("reuse-bind-2", r2, htonl(INADDR_LOOPBACK), shared);
+        bind_to("no-reuse-bind", r3, htonl(INADDR_LOOPBACK), shared);
+        struct sockaddr_in to_shared = to(shared);
+        sendto(c, "who", 3, 0, (void *)&to_shared, sizeof to_shared);
+        ready("first-bound", r1, POLLIN);
+        ready("last-bound", r2, POLLIN);
+        /* A TCP port is not a UDP one. */
+        int t;
+        int l = listener(1, &t);
+        bind_to("udp-on-tcp-port", r3, htonl(INADDR_LOOPBACK), t);
+        close(l);
+        /* An IPv6 socket on every address takes IPv4 datagrams, with the
+           sender IPv4-mapped. */
+        int s6 = socket(AF_INET6, SOCK_DGRAM, 0);
+        struct sockaddr_in6 any6 = {.sin6_family = AF_INET6};
+        call("bind-v6", bind(s6, (void *)&any6, sizeof any6));
+        struct sockaddr_in to6 = to(port_of(s6));
+        call("send-v6", sendto(c, "v4", 2, 0, (void *)&to6, sizeof to6));
+        struct sockaddr_in6 f6;
+        len = sizeof f6;
+        n = recvfrom(s6, buf, sizeof buf, 0, (void *)&f6, &len);
+        printf("  v6 recv=%ld family=%d len=%u mapped=%d\n", n, f6.sin6_family, (unsigned)len,
+               IN6_IS_ADDR_V4MAPPED(&f6.sin6_addr));
+        return 0;
+    }
     if (!strcmp(mode, "resolve")) {
         /* Name resolution through the guest's own resolver; run under the
            emulator only, with localhost allowed and nothing else. */

@@ -1036,12 +1036,10 @@ fn loopback_binds_check_as_linux() {
     assert_eq!(f.ret(3, [b, 0, 0, 0, 0, 0]), 0);
     let c = tcp(&mut f);
     assert_eq!(bind(&mut f, c, [127, 0, 0, 3], 4000), 0);
-    // UDP still binds only port 0, and does not listen or accept.
+    // UDP has ports of its own (TCP's 4000 is free to it), and does not
+    // listen or accept.
     let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
-    assert_eq!(
-        bind(&mut f, udp, [127, 0, 0, 1], 5000),
-        Errno(13).to_syscall_return()
-    );
+    assert_eq!(bind(&mut f, udp, [127, 0, 0, 3], 4000), 0);
     assert_eq!(
         f.ret(50, [udp, 1, 0, 0, 0, 0]),
         Errno(95).to_syscall_return()
@@ -1156,6 +1154,104 @@ fn loopback_closes_reset_what_is_left() {
     assert_eq!(f.ret(3, [kept, 0, 0, 0, 0, 0]), 0);
     assert_eq!(f.ret(49, [again, DATA + 0x100, 16, 0, 0, 0]), 0);
     assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+}
+#[test]
+fn loopback_udp_datagrams() {
+    let mut f = network_fixture(&[]);
+    let udp = |f: &mut Fixture| f.ret(41, [2, 2 | 0x800, 0, 0, 0, 0]);
+    let port_of = |f: &mut Fixture, fd: u64| {
+        let name = name_of(f, 51, fd);
+        u16::from_be_bytes([name[2], name[3]])
+    };
+    let send_to = |f: &mut Fixture, fd: u64, bytes: &[u8], port: u16| {
+        f.mem.write(GuestAddr(DATA), bytes).unwrap();
+        inet_address(f, DATA + 0x100, [127, 0, 0, 1], port);
+        f.ret(44, [fd, DATA, bytes.len() as u64, 0, DATA + 0x100, 16])
+    };
+    let a = udp(&mut f);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 0);
+    assert_eq!(f.ret(49, [a, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let port = port_of(&mut f, a);
+    assert_eq!(readable(&mut f, a) & 1, 0);
+    // An unbound sender takes a port on every address.
+    let b = udp(&mut f);
+    assert_eq!(send_to(&mut f, b, b"one", port), 3);
+    let name = name_of(&mut f, 51, b);
+    assert_eq!(&name[4..8], &[0, 0, 0, 0]);
+    let b_port = u16::from_be_bytes([name[2], name[3]]);
+    assert!(b_port >= 32768);
+    assert_eq!(readable(&mut f, a) & 1, 1);
+    assert_eq!(send_to(&mut f, b, b"three", port), 5);
+    assert_eq!(
+        crate::sockets::queued(&f.kernel.files.descriptor(a).unwrap().file, false),
+        Some(Ok(3))
+    );
+    // recvfrom gives each datagram, cut to the buffer, and its sender.
+    f.mem
+        .write(GuestAddr(DATA + 0x40), &16u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(45, [a, DATA + 8, 16, 0, DATA + 0x44, DATA + 0x40]), 3);
+    let mut from = [0; 8];
+    f.mem.read(GuestAddr(DATA + 0x44), &mut from).unwrap();
+    assert_eq!(
+        from,
+        [2, 0, (b_port >> 8) as u8, b_port as u8, 127, 0, 0, 1]
+    );
+    assert_eq!(f.ret(45, [a, DATA + 8, 2, 0x20, 0, 0]), 5);
+    assert_eq!(
+        f.ret(45, [a, DATA + 8, 16, 0, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    // A connected socket takes datagrams only from its peer.
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], b_port);
+    assert_eq!(f.ret(42, [a, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let c = udp(&mut f);
+    assert_eq!(send_to(&mut f, c, b"x", port), 1);
+    assert_eq!(readable(&mut f, a) & 1, 0);
+    assert_eq!(send_to(&mut f, b, b"y", port), 1);
+    assert_eq!(f.ret(0, [a, DATA + 8, 16, 0, 0, 0]), 1);
+    // A send without an address goes to the peer; an unconnected one has
+    // no peer.
+    f.mem.write(GuestAddr(DATA), b"back").unwrap();
+    assert_eq!(f.ret(1, [a, DATA, 4, 0, 0, 0]), 4);
+    assert_eq!(f.ret(0, [b, DATA + 8, 16, 0, 0, 0]), 4);
+    assert_eq!(
+        f.ret(1, [c, DATA, 4, 0, 0, 0]),
+        Errno(89).to_syscall_return()
+    );
+    // Connected to a port nothing takes: the next call gives the
+    // loopback's ICMP answer once.
+    let d = udp(&mut f);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 9);
+    assert_eq!(f.ret(42, [d, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(&name_of(&mut f, 51, d)[4..8], &[127, 0, 0, 1]);
+    assert_eq!(f.ret(1, [d, DATA, 4, 0, 0, 0]), 4);
+    assert_eq!(readable(&mut f, d) & 8, 8);
+    assert_eq!(
+        f.ret(1, [d, DATA, 4, 0, 0, 0]),
+        Errno(111).to_syscall_return()
+    );
+    assert_eq!(f.ret(1, [d, DATA, 4, 0, 0, 0]), 4);
+    assert_eq!(int_option(&mut f, d, 1, 4), (0, 111));
+    assert_eq!(int_option(&mut f, d, 1, 4), (0, 0));
+    // Unconnected, nothing is told.
+    assert_eq!(send_to(&mut f, c, b"x", 9), 1);
+    assert_eq!(int_option(&mut f, c, 1, 4), (0, 0));
+    // A port another UDP socket holds; Linux's buffer defaults.
+    let e = udp(&mut f);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], port);
+    assert_eq!(
+        f.ret(49, [e, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(98).to_syscall_return()
+    );
+    assert_eq!(int_option(&mut f, e, 1, 8), (0, 212_992));
+    // A non-loopback address is outside the guest.
+    f.mem.write(GuestAddr(DATA), b"z").unwrap();
+    inet_address(&f, DATA + 0x100, [192, 0, 2, 1], port);
+    assert_eq!(
+        f.ret(44, [e, DATA, 1, 0, DATA + 0x100, 16]),
+        Errno(101).to_syscall_return()
+    );
 }
 #[test]
 fn a_failed_connection_reports_its_error_once() {

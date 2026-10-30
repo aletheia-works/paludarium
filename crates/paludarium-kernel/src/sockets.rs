@@ -1503,15 +1503,15 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         }
         SO_PASSCRED => int(socket.passes_credentials().into()),
         SO_PASSPIDFD => int(socket.lock_sides()[socket.side].pass_pidfd.into()),
-        // A new pidfd of the process that made the pair, installed even
-        // when `len` holds only part of its number.
+        // A new pidfd of the peer process, installed even when `len` holds
+        // only part of its number.
         SO_PEERPIDFD => {
-            let creator = socket.peer_process();
+            let peer = socket.peer_process();
             // A socket with no peer process: ENODATA.
-            if creator == 0 {
+            if peer == 0 {
                 return Err(Errno(61));
             }
-            let pidfd = crate::processes::PidFd::of(c.processes, creator)?;
+            let pidfd = crate::processes::PidFd::of(c.processes, peer)?;
             let fd = c.files.install(pidfd, true, c.group.nofile())?;
             int(fd as i32)
         }
@@ -1532,9 +1532,9 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         // none process 0, and -1 for the IDs, as Linux's `cred_to_ucred`
         // gives them.
         SO_PEERCRED => {
-            let creator = socket.peer_process();
-            let mut credentials = creator.to_le_bytes().to_vec();
-            credentials.extend(if creator == 0 { [0xff; 8] } else { [0; 8] });
+            let peer = socket.peer_process();
+            let mut credentials = peer.to_le_bytes().to_vec();
+            credentials.extend(if peer == 0 { [0xff; 8] } else { [0; 8] });
             credentials
         }
         SO_SNDLOWAT | SO_DOMAIN => int(1),

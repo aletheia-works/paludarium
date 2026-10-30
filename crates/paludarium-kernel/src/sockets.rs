@@ -2508,7 +2508,7 @@ fn collect_garbage() {
     if COLLECTING.get() {
         return;
     }
-    let _one = COLLECTION.lock().unwrap_or_else(PoisonError::into_inner);
+    let one = COLLECTION.lock().unwrap_or_else(PoisonError::into_inner);
     let _collecting = Collecting::start();
     let pairs: Vec<Arc<Pair>> = {
         let mut known = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2566,6 +2566,9 @@ fn collect_garbage() {
         .unwrap_or_else(PoisonError::into_inner)
         .retain(|known| known.upgrade().is_some_and(|pair| holds_sockets(&pair)));
     drop(pairs);
+    // The descriptors close outside the collection, whose lock a release on
+    // another thread waits for while it may hold locks they take.
+    drop(one);
     drop(purged);
 }
 /// Whether a queue of `pair` holds a socket's descriptor.

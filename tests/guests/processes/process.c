@@ -107,13 +107,19 @@ static void gc_state(const char *name, int fd) {
     printf("%s revents=%#x\n", name, (unsigned)p.revents);
 }
 /* An AF_UNIX socket goes, which runs Linux's garbage collector, and a wait
-   for it to finish. */
-static void gc_trigger(void) {
+   for it to finish: until `fd` hangs up, for at most 2 seconds, or 200 ms
+   with no `fd`. */
+static void gc_trigger(int fd) {
     int t[2];
     socketpair(AF_UNIX, SOCK_STREAM, 0, t);
     close(t[0]);
     close(t[1]);
-    usleep(200000);
+    for (int waited = 0; fd >= 0 && waited < 2000; waited += 10) {
+        struct pollfd p = {.fd = fd, .events = POLLIN};
+        if (poll(&p, 1, 0) == 1 && p.revents & POLLHUP) return;
+        usleep(10000);
+    }
+    if (fd < 0) usleep(200000);
 }
 /* Whether descriptors `a` and `b` are the same file. */
 static int same_file(int a, int b) {
@@ -3711,7 +3717,7 @@ int main(int argc, char **argv) {
            whose descriptor waits in its own queue, two that hold each
            other, and what was passed with them. One a held socket's queue
            holds stays. The collection may run a little later, hence the
-           waits. */
+           waits for the hang-up. */
         signal(SIGPIPE, SIG_IGN);
         int s[2], u[2], pipe_fds[2];
         char byte;
@@ -3720,7 +3726,7 @@ int main(int argc, char **argv) {
         close(s[1]);
         usleep(200000);
         gc_state("self-closed", s[0]);
-        gc_trigger();
+        gc_trigger(s[0]);
         gc_state("self-collected", s[0]);
         printf("read=%zd\n", read(s[0], &byte, 1));
         errno = 0;
@@ -3736,7 +3742,7 @@ int main(int argc, char **argv) {
         close(pipe_fds[1]);
         gc_state("cycle-a", s[0]);
         gc_state("cycle-pipe", pipe_fds[0]);
-        gc_trigger();
+        gc_trigger(s[0]);
         gc_state("cycle-a-collected", s[0]);
         gc_state("cycle-c-collected", u[0]);
         gc_state("cycle-pipe-collected", pipe_fds[0]);
@@ -3748,7 +3754,7 @@ int main(int argc, char **argv) {
         socketpair(AF_UNIX, SOCK_STREAM, 0, u);
         printf("send-held=%ld\n", send_fds(u[0], "x", 1, &s[1], 1));
         close(s[1]);
-        gc_trigger();
+        gc_trigger(-1);
         gc_state("held", s[0]);
         int got, flags;
         long n = receive_fd(u[1], &byte, 1, 0, &got, &flags);

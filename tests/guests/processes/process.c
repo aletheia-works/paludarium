@@ -100,6 +100,21 @@ static long receive_fd(int socket, char *data, size_t len, int flags, int *fd, i
     *got_flags = n < 0 ? 0 : message.msg_flags;
     return n;
 }
+/* What `fd` polls as, for the garbage collector's case. */
+static void gc_state(const char *name, int fd) {
+    struct pollfd p = {.fd = fd, .events = POLLIN | POLLOUT};
+    poll(&p, 1, 0);
+    printf("%s revents=%#x\n", name, (unsigned)p.revents);
+}
+/* An AF_UNIX socket goes, which runs Linux's garbage collector, and a wait
+   for it to finish. */
+static void gc_trigger(void) {
+    int t[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, t);
+    close(t[0]);
+    close(t[1]);
+    usleep(200000);
+}
 /* Whether descriptors `a` and `b` are the same file. */
 static int same_file(int a, int b) {
     struct stat x, y;
@@ -3688,6 +3703,60 @@ int main(int argc, char **argv) {
             close(sv[0]);
             close(sv[1]);
         }
+        return 0;
+    }
+    if (!strcmp(mode, "scm-garbage")) {
+        /* Linux's garbage collector (unix_gc), which runs when an AF_UNIX
+           socket goes, closes the sockets only unread messages hold: one
+           whose descriptor waits in its own queue, two that hold each
+           other, and what was passed with them. One a held socket's queue
+           holds stays. The collection may run a little later, hence the
+           waits. */
+        signal(SIGPIPE, SIG_IGN);
+        int s[2], u[2], pipe_fds[2];
+        char byte;
+        socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+        printf("send-self=%ld\n", send_fds(s[0], "x", 1, &s[1], 1));
+        close(s[1]);
+        usleep(200000);
+        gc_state("self-closed", s[0]);
+        gc_trigger();
+        gc_state("self-collected", s[0]);
+        printf("read=%zd\n", read(s[0], &byte, 1));
+        errno = 0;
+        long w = write(s[0], "y", 1);
+        printf("write=%ld errno=%d\n", w, w < 0 ? errno : 0);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, u);
+        pipe(pipe_fds);
+        int with[2] = {u[1], pipe_fds[1]};
+        printf("send-cycle=%ld %ld\n", send_fds(s[0], "x", 1, with, 2), send_fds(u[0], "x", 1, &s[1], 1));
+        close(s[1]);
+        close(u[1]);
+        close(pipe_fds[1]);
+        gc_state("cycle-a", s[0]);
+        gc_state("cycle-pipe", pipe_fds[0]);
+        gc_trigger();
+        gc_state("cycle-a-collected", s[0]);
+        gc_state("cycle-c-collected", u[0]);
+        gc_state("cycle-pipe-collected", pipe_fds[0]);
+        printf("pipe-read=%zd\n", read(pipe_fds[0], &byte, 1));
+        close(s[0]);
+        close(u[0]);
+        close(pipe_fds[0]);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, u);
+        printf("send-held=%ld\n", send_fds(u[0], "x", 1, &s[1], 1));
+        close(s[1]);
+        gc_trigger();
+        gc_state("held", s[0]);
+        int got, flags;
+        long n = receive_fd(u[1], &byte, 1, 0, &got, &flags);
+        printf("received=%ld fd-ok=%d\n", n, got >= 0);
+        printf("back=%zd\n", write(got, "z", 1));
+        printf("read-back=%zd byte=%c\n", read(s[0], &byte, 1), byte);
+        close(got);
+        gc_state("held-closed", s[0]);
         return 0;
     }
     if (!strcmp(mode, "scm-rights")) {

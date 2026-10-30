@@ -71,9 +71,9 @@ verified.
   these differences:
   - The guest is root, so `SCM_CREDENTIALS` may name any process, user and
     group, where Linux lets an unprivileged process send only its own.
-  - A socket whose descriptor waits unread in a socket that only that
-    descriptor keeps open, such as its own, stays open: Linux's garbage
-    collector would close both.
+  - The sockets only unread messages hold are closed at once when another
+    socket goes, where Linux's garbage collector closes them a little
+    later, from a work queue.
 - **Socket options**: `setsockopt` refuses, with `ENOPROTOOPT`, the options
   whose effect is not modelled, where Linux takes them: `SO_PASSSEC` and
   `SO_TIMESTAMPING`, as well as filters and the other options Linux has. `SO_RCVTIMEO` and `SO_SNDTIMEO`

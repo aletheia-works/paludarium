@@ -6,9 +6,9 @@ use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 use paludarium_types::GuestAddr;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 // Per-stream flow-control window, not a per-guest memory/fd quota. Native
 // queue capacity and packet accounting depend on the host; the oracle compares
@@ -2459,7 +2459,108 @@ impl Drop for SocketPairEnd {
             notice.send();
         }
         drop(passed);
+        // Linux looks for garbage as a socket goes (`unix_release_sock`).
+        if !self.is_pipe() {
+            collect_garbage();
+        }
     }
+}
+
+/// The pairs whose queues have held sockets passed with `SCM_RIGHTS`,
+/// where [`collect_garbage`] looks, as Linux's garbage collector keeps the
+/// sockets in flight (`unix_inflight`).
+static IN_FLIGHT: Mutex<Vec<Weak<Pair>>> = Mutex::new(Vec::new());
+/// One collection at a time.
+static COLLECTION: Mutex<()> = Mutex::new(());
+thread_local! {
+    /// This thread is collecting: the sockets it closes start none.
+    static COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// `file` as a socket's end, not a pipe's.
+fn socket_end(file: &Arc<dyn FileHandle>) -> Option<&SocketPairEnd> {
+    file.as_any()?
+        .downcast_ref::<SocketPairEnd>()
+        .filter(|end| !end.is_pipe())
+}
+/// A socket end, by its pair and side.
+type EndId = (usize, usize);
+impl SocketPairEnd {
+    fn id(&self) -> EndId {
+        (Arc::as_ptr(&self.pair) as usize, self.side)
+    }
+}
+/// `pair` now holds a socket passed to one of its ends.
+fn in_flight(pair: &Arc<Pair>) {
+    let mut pairs = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
+    if !pairs
+        .iter()
+        .any(|known| std::ptr::eq(known.as_ptr(), Arc::as_ptr(pair)))
+    {
+        pairs.push(Arc::downgrade(pair));
+    }
+}
+/// Closes the sockets only unread messages hold, as Linux's `unix_gc`: a
+/// socket in flight that no descriptor, nor anything else, holds but the
+/// queues of sockets that are themselves such garbage. Their queues go,
+/// with every descriptor in them, which closes the garbage and what else
+/// only those messages held.
+fn collect_garbage() {
+    if COLLECTING.get() {
+        return;
+    }
+    let _one = COLLECTION.lock().unwrap_or_else(PoisonError::into_inner);
+    COLLECTING.set(true);
+    let pairs: Vec<Arc<Pair>> = {
+        let mut known = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
+        known.retain(|pair| pair.strong_count() > 0);
+        known.iter().filter_map(Weak::upgrade).collect()
+    };
+    // Each socket in flight, with its holds and how many of them are in
+    // queues, and the sockets each end's queue holds.
+    let mut held: BTreeMap<EndId, (usize, usize)> = BTreeMap::new();
+    let mut queues: BTreeMap<EndId, Vec<EndId>> = BTreeMap::new();
+    for pair in &pairs {
+        let sides = pair.sides.lock().unwrap_or_else(PoisonError::into_inner);
+        for (side, own) in sides.iter().enumerate() {
+            let queue = (Arc::as_ptr(pair) as usize, side);
+            for descriptor in own.writes.iter().flat_map(|write| &write.passed) {
+                if let Some(end) = socket_end(&descriptor.file) {
+                    let entry = held
+                        .entry(end.id())
+                        .or_insert((Arc::strong_count(&descriptor.file), 0));
+                    entry.1 += 1;
+                    queues.entry(queue).or_default().push(end.id());
+                }
+            }
+        }
+    }
+    // What a descriptor, or an end that is not garbage, reaches is alive.
+    let candidate = |id: &EndId| held.get(id).is_some_and(|(all, queued)| all == queued);
+    let mut alive: BTreeSet<EndId> = BTreeSet::new();
+    let mut reached: Vec<EndId> = queues.keys().copied().filter(|id| !candidate(id)).collect();
+    while let Some(id) = reached.pop() {
+        for &child in queues.get(&id).into_iter().flatten() {
+            if candidate(&child) && alive.insert(child) {
+                reached.push(child);
+            }
+        }
+    }
+    let mut purged: Vec<Passed> = Vec::new();
+    for pair in &pairs {
+        let mut sides = pair.sides.lock().unwrap_or_else(PoisonError::into_inner);
+        for (side, own) in sides.iter_mut().enumerate() {
+            let id = (Arc::as_ptr(pair) as usize, side);
+            if candidate(&id) && !alive.contains(&id) {
+                purged.extend(
+                    own.writes
+                        .iter_mut()
+                        .map(|write| std::mem::take(&mut write.passed)),
+                );
+            }
+        }
+    }
+    drop(purged);
+    COLLECTING.set(false);
 }
 impl FileHandle for SocketPairEnd {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -2553,7 +2654,12 @@ impl SocketPairEnd {
         sender: Sender,
     ) -> Result<usize, Errno> {
         let part = self.part_size();
+        let sockets = passed.iter().any(|d| socket_end(&d.file).is_some());
+        let before = passed.len();
         let result = self.send_data(buf, passed, sender, part);
+        if sockets && passed.len() < before {
+            in_flight(&self.pair);
+        }
         match result {
             // The peer has data (a message may be empty), as Linux's
             // `sk_data_ready` tells it for each part, but not for the first
@@ -2885,6 +2991,56 @@ mod events_tests {
             ..timestamps
         };
         assert_eq!(micros.data(1_500_002_000)[8..], 500_002u64.to_le_bytes());
+    }
+    /// Passes `files` with one byte from `end`.
+    fn pass(end: &SocketPairEnd, files: &[Arc<dyn FileHandle>]) {
+        let mut passed: Passed = files
+            .iter()
+            .map(|file| crate::files::Descriptor::unnamed(Arc::clone(file), false))
+            .collect();
+        assert_eq!(end.send(b"x", &mut passed, Sender::default()), Ok(1));
+        assert!(passed.is_empty());
+    }
+    /// Another socket goes, which looks for garbage.
+    fn release_another() {
+        drop(pair());
+    }
+    #[test]
+    fn sockets_only_their_own_messages_hold_are_closed() {
+        // A socket whose only hold waits in its own queue goes, and its
+        // peer hangs up.
+        let [a, b] = pair();
+        pass(&a, &[b.clone() as Arc<dyn FileHandle>]);
+        let gone = Arc::downgrade(&b);
+        drop(b);
+        release_another();
+        assert!(gone.upgrade().is_none());
+        assert!(a.lock_sides()[1].closed);
+        // So do two that hold each other, with a pipe end passed with them.
+        let ([a, b], [c, d]) = (pair(), pair());
+        let [reader, writer] = PipeEnd::pair(0, Arc::default()).unwrap();
+        pass(&a, &[d.clone(), writer.clone()]);
+        pass(&c, &[b.clone() as Arc<dyn FileHandle>]);
+        let gone = [Arc::downgrade(&b), Arc::downgrade(&d)];
+        let written = Arc::downgrade(&writer);
+        drop((b, d, writer));
+        release_another();
+        assert!(gone.iter().all(|end| end.upgrade().is_none()));
+        assert!(written.upgrade().is_none());
+        assert!(a.lock_sides()[1].closed && c.lock_sides()[1].closed);
+        drop(reader);
+        // One a socket with a descriptor still holds stays, until that one
+        // goes.
+        let ([a, b], [c, d]) = (pair(), pair());
+        pass(&c, &[b.clone() as Arc<dyn FileHandle>]);
+        let kept = Arc::downgrade(&b);
+        drop(b);
+        release_another();
+        assert!(kept.upgrade().is_some());
+        assert!(!a.lock_sides()[1].closed);
+        drop(d);
+        assert!(kept.upgrade().is_none());
+        drop(c);
     }
     #[test]
     fn a_message_peek_passes_over_whole_messages() {

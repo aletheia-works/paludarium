@@ -361,16 +361,16 @@ impl UnixSocket {
         if theirs.listen.is_some() {
             return Err(Errno::EINVAL);
         }
-        let spare = client
-            .spare
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .ok_or(Errno::EINVAL)?;
+        let spare = {
+            let mut slot = client.spare.lock().unwrap_or_else(PoisonError::into_inner);
+            let spare = slot.as_ref().ok_or(Errno::EINVAL)?;
+            // The accepted socket is blocking until `accept4` says
+            // otherwise, whatever the client's flags gave its pair; the end
+            // leaves the client only once that is done.
+            spare.set_flags(spare.flags() & !NONBLOCK)?;
+            slot.take().ok_or(Errno::EINVAL)?
+        };
         client.end.made_by(c.process.pid, c.shared_host);
-        // The accepted socket is blocking until `accept4` says otherwise,
-        // whatever the client's flags gave its pair.
-        spare.set_flags(spare.flags() & !NONBLOCK)?;
         let child = Arc::new_cyclic(|this: &Weak<Self>| {
             spare.attach(Weak::clone(this));
             Self {

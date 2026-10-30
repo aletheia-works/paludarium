@@ -1490,8 +1490,10 @@ int main(int argc, char **argv) {
             printf("  rcvbuf %d -> %d\n", asked[i], got);
             close(u);
         }
-        int buffers[] = {1024, 2048, 4096, 10000};
-        int sizes[] = {0, 100, 261, 262, 645, 646, 1000, 3000, 9000, 16004, 16005, 30000};
+        /* 100000 is 200000 doubled: three 65500-byte datagrams over IPv4,
+           two over IPv6, which sends them as two fragments. */
+        int buffers[] = {1024, 2048, 4096, 10000, 100000};
+        int sizes[] = {0, 100, 261, 262, 645, 646, 1000, 3000, 9000, 16004, 16005, 30000, 65500};
         for (int v6 = 0; v6 < 2; v6++)
             for (unsigned b = 0; b < sizeof buffers / sizeof *buffers; b++)
                 for (unsigned k = 0; k < sizeof sizes / sizeof *sizes; k++) {

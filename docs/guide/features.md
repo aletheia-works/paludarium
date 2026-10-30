@@ -664,8 +664,8 @@ one only with an `--allow-net`.
   receive buffer what x86-64 Linux 7.0 counts as its `sk_buff`'s
   `truesize`, and one that would take it past `SO_RCVBUF` while another
   waits is dropped, as `__udp_enqueue_schedule_skb` drops it; an empty
-  buffer takes one of any size. Where no socket
-  takes it, the loopback's ICMP answer reaches a socket connected there:
+  buffer takes one of any size. Where no socket takes it, the loopback's
+  ICMP answer reaches a socket connected there:
   its next send or receive is `ECONNREFUSED`, once, as `SO_ERROR` and
   `POLLERR` show. A datagram to port 53 that no guest socket takes goes to
   the DNS stub, as before.

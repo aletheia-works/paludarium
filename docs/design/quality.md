@@ -28,6 +28,10 @@ CI run produces them afresh on an x86-64 Linux runner.
   itself, so there even native results can differ from Linux: a stopped and
   continued child sends SIGCHLD to a parent that set `SA_NOCLDSTOP`, where
   Linux sends none. Such a run is not evidence, in either direction.
+- The native results are those of the CI runner's kernel (Linux 7.0 on
+  `ubuntu-24.04`). Where Linux changed between versions, as in what a UDP
+  datagram takes of the receive buffer, the emulator follows that kernel,
+  and a runner with another kernel can fail those cases.
 - A test checks that `diff_processes` runs exactly the process cases that
   `tests/guests/processes/cases.json` lists, so that a case cannot be listed
   and never run.

@@ -1341,8 +1341,13 @@ impl InetSocket {
     /// any size, unless `SO_RCVBUF` is over half of `INT_MAX`.
     fn deliver(&self, from: SocketAddr, bytes: &[u8]) {
         let limit = usize::try_from(self.options().receive_buffer).unwrap_or(0);
-        let size = truesize(bytes.len(), from.is_ipv4());
+        // A datagram from an IPv4 address goes as IPv4, to a dual-stack
+        // socket too.
+        let size = truesize(bytes.len(), plain(from.ip()).is_ipv4());
         let mut s = self.lock();
+        // `SO_RCVBUF` stays under half of `INT_MAX` without
+        // `SO_RCVBUFFORCE`, which is not taken here, so only the first
+        // clause drops for now.
         if s.inbox_size + size > limit && (s.inbox_size > 0 || limit > (i32::MAX >> 1) as usize) {
             return;
         }

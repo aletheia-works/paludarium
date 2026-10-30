@@ -1311,6 +1311,31 @@ fn loopback_time_wait_holds_the_port_closed_first() {
         assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
         at(&mut f, 150);
     }
+    // A socket that shut its side down first and stays open gives the port
+    // it took up 60 seconds after the peer's end, as its own hold goes to
+    // `TIME_WAIT`; one the guest bound stays its own until it closes.
+    for bound in [false, true] {
+        let client = f.ret(41, [2, 1, 0, 0, 0, 0]);
+        if bound {
+            inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 45000);
+            assert_eq!(f.ret(49, [client, DATA + 0x100, 16, 0, 0, 0]), 0);
+        }
+        inet_address(&f, DATA + 0x100, [127, 0, 0, 1], port);
+        assert_eq!(f.ret(42, [client, DATA + 0x100, 16, 0, 0, 0]), 0);
+        let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+        let open_port = port_of(&mut f, client);
+        assert_eq!(f.ret(48, [client, 1, 0, 0, 0, 0]), 0);
+        at(&mut f, 160);
+        assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+        at(&mut f, 219);
+        assert_eq!(bind_on(&mut f, open_port, false), in_use);
+        at(&mut f, 220);
+        let expected = if bound { in_use } else { 0 };
+        assert_eq!(bind_on(&mut f, open_port, false), expected);
+        assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(bind_on(&mut f, open_port, false), 0);
+        at(&mut f, 150);
+    }
     // Held while its peer stays open too; a send to the closed side is
     // answered with a reset, which ends it.
     let client = loopback_client(&mut f, port);

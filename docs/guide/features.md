@@ -614,7 +614,11 @@ one only with an `--allow-net`.
   (`TCP_TIMEWAIT_LEN`). A `bind` there is `EADDRINUSE`, also with
   `SO_REUSEADDR` unless the closed socket had it too (an accepted one has
   its listener's). The side that closes second holds nothing, and a reset
-  (below), also one answering a send to the closed side, ends the hold.
+  (below), also one answering a send to the closed side, ends the hold. A
+  socket that ended first by `shutdown` and stays open gives up a port it
+  took itself 60 seconds after the other side's end, as Linux's `tcp_done`
+  does, and keeps one the guest bound (`SOCK_BINDPORT_LOCK`; an accepted
+  one has its listener's) until it closes.
 - **Resets**, as on Linux: closing a socket with unread input or a zero
   `SO_LINGER` time, disconnecting with `AF_UNSPEC`, or closing a listener
   with connections it has not handed out resets the peer (`ECONNRESET`

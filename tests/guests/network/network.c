@@ -927,27 +927,47 @@ int main(int argc, char **argv) {
            seconds from its close (FIN_WAIT2, tcp_fin_timeout), then keeps
            its port in TIME_WAIT for 60 seconds from that end. The checks
            sit 10 seconds or more from each change, as Linux's timers run a
-           few seconds late. */
+           few seconds late. A socket that stays open gives the port it took
+           up with that TIME_WAIT (tcp_done), but keeps one it bound itself
+           (SOCK_BINDPORT_LOCK) until it closes. */
         int port, result;
         int l = listener(8, &port);
-        int c[3], s[3], at[3];
-        for (int i = 0; i < 3; i++) {
-            c[i] = client(port, 0, &result);
+        int c[5], s[5], at[5];
+        for (int i = 0; i < 5; i++) {
+            if (i == 4) {
+                /* A port free now, which the client binds itself. */
+                int t = tcp(0);
+                bind_to("bind-free", t, htonl(INADDR_LOOPBACK), 0);
+                int own = port_of(t);
+                close(t);
+                c[i] = tcp(0);
+                bind_to("bind-own", c[i], htonl(INADDR_LOOPBACK), own);
+                struct sockaddr_in a = to(port);
+                call("connect-own", connect(c[i], (void *)&a, sizeof a));
+            } else {
+                c[i] = client(port, 0, &result);
+            }
             s[i] = accept(l, NULL, NULL);
             at[i] = port_of(c[i]);
         }
         long start = now_ms();
         /* 0: the peer stays open. 1: the peer closes at 30 seconds. 2: shut
-           down at once, closed at 30 seconds, the peer staying open. */
+           down at once, closed at 30 seconds, the peer staying open. 3 and
+           4: shut down at once, the peer closing at once, and kept open. */
         close(c[0]);
         close(c[1]);
         shutdown(c[2], SHUT_WR);
+        for (int i = 3; i < 5; i++) {
+            shutdown(c[i], SHUT_WR);
+            close(s[i]);
+        }
         static const struct {
             int second, which;
             const char *name;
-        } checks[] = {{50, 0, "open-50"}, {70, 0, "open-70"},  {70, 1, "late-70"},
-                      {80, 1, "late-80"}, {80, 2, "shut-80"}, {100, 1, "late-100"},
-                      {100, 2, "shut-100"}};
+        } checks[] = {{50, 0, "open-50"},  {50, 3, "kept-50"},   {50, 4, "own-50"},
+                      {70, 0, "open-70"},  {70, 1, "late-70"},   {70, 3, "kept-70"},
+                      {70, 4, "own-70"},   {80, 1, "late-80"},   {80, 2, "shut-80"},
+                      {100, 1, "late-100"}, {100, 2, "shut-100"}};
         int closed = 0;
         for (unsigned i = 0; i < sizeof checks / sizeof *checks; i++) {
             if (!closed && checks[i].second > 30) {
@@ -963,6 +983,9 @@ int main(int argc, char **argv) {
             bind_to(checks[i].name, t, htonl(INADDR_LOOPBACK), at[checks[i].which]);
             close(t);
         }
+        close(c[4]);
+        int t = tcp(0);
+        bind_to("own-closed", t, htonl(INADDR_LOOPBACK), at[4]);
         return 0;
     }
     if (!strcmp(mode, "listen-reset")) {

@@ -17,11 +17,8 @@ verified.
     another machine can connect to it, and `bind` takes only the loopback's
     addresses and the unspecified one (`EADDRNOTAVAIL` for any other, where
     Linux takes each of the machine's own).
-  - On the loopback, a socket that ended its connection first and stays
-    open keeps its port while open, where Linux gives an ephemeral port it
-    took back 60 seconds after the peer's end (`TIME_WAIT`), keeping only a
-    port the socket bound itself. A nonzero `SO_LINGER` time never holds
-    `close`, as the bytes are delivered at once.
+  - On the loopback, a nonzero `SO_LINGER` time never holds `close`, as the
+    bytes are delivered at once.
   - A UDP socket reaches the DNS stub and the guest's own sockets on the
     loopback; a datagram to any other address is `ENETUNREACH`. One
     connected elsewhere takes its port on every address, as the guest has

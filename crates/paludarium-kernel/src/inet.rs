@@ -1326,6 +1326,8 @@ impl InetSocket {
             v6_only: options.v6_only,
             reuse_address: options.reuse_address,
             reuse_port: options.reuse_port,
+            locked: false,
+            link: None,
             pooled: self.datagram && options.reuse_port,
             listening: false,
             peer: None,
@@ -1400,7 +1402,10 @@ impl InetSocket {
                 }
             }
         };
-        s.bound = Some(self.ports().bind(self.binding(address, &options))?);
+        s.bound = Some(self.ports().bind(Binding {
+            locked: address.port() != 0,
+            ..self.binding(address, &options)
+        })?);
         s.port_locked = address.port() != 0;
         s.address_locked = !address.ip().is_unspecified();
         s.address = None;
@@ -1541,13 +1546,14 @@ impl InetSocket {
         };
         let theirs = *listener.options();
         let mut state = listener.lock();
+        let locked = state.port_locked;
         let Some(listen) = state.listen.as_mut() else {
             return Knock::Refused;
         };
         if !listen.has_room() {
             return Knock::Full;
         }
-        let child = listener.child(theirs, stream, link, from, to);
+        let child = listener.child((theirs, locked), stream, link, from, to);
         listen.ready.push_back(child);
         listen.arrivals += 1;
         drop(state);
@@ -1564,9 +1570,12 @@ impl InetSocket {
     /// listener at `to`, joined to it through `link`. It takes this
     /// socket's options, as Linux's `sk_clone_lock` copies them, and holds
     /// the listener's port on `to`.
+    /// The accepted socket of a connection from `from` to `to`, with the
+    /// listener's options, and whether the guest bound the listener's port,
+    /// which it keeps too (`sk_clone_lock` copies `sk_userlocks`).
     fn child(
         &self,
-        options: Options,
+        (options, locked): (Options, bool),
         stream: &Arc<Stream>,
         link: &OnceLock<Arc<Link>>,
         from: SocketAddr,
@@ -1580,12 +1589,17 @@ impl InetSocket {
         let _ = link.set(Arc::clone(&joined));
         let own_link = Arc::new(OnceLock::new());
         let _ = own_link.set(joined);
-        self.ports().hold(child.binding(to, &options));
+        self.ports().hold(Binding {
+            locked,
+            link: Some((Arc::clone(&own_link), 1)),
+            ..child.binding(to, &options)
+        });
         let mut s = child.lock();
         s.stream = Some(own);
         s.connection = Connection::Connected;
         s.link = Some((own_link, 1));
         s.bound = Some(to);
+        s.port_locked = locked;
         drop(s);
         child
     }
@@ -1622,6 +1636,7 @@ impl InetSocket {
         };
         let theirs = *listener.options();
         let mut state = listener.lock();
+        let locked = state.port_locked;
         let Some(listen) = state.listen.as_mut() else {
             return Ok(None);
         };
@@ -1629,9 +1644,10 @@ impl InetSocket {
         stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
         let link = Arc::new(OnceLock::new());
         s.link = Some((Arc::clone(&link), 0));
+        self.ports().attach(&self.this, (&link, 0));
         let arrived = listen.has_room();
         if arrived {
-            let child = listener.child(theirs, &stream, &link, from, to);
+            let child = listener.child((theirs, locked), &stream, &link, from, to);
             listen.ready.push_back(child);
             listen.arrivals += 1;
         }

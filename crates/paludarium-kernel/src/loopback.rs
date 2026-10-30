@@ -17,7 +17,7 @@ use paludarium_host::net::{Driver, Phase, Stream};
 use paludarium_types::Errno;
 use std::hash::DefaultHasher;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 const EADDRINUSE: Errno = Errno(98);
 const ECONNRESET: Errno = Errno(104);
@@ -124,6 +124,17 @@ impl Link {
             waits
         })
     }
+    /// When an open socket on `side`, which ended the connection first,
+    /// gives its port up: 60 seconds after the other side's end reached it,
+    /// as Linux's `tcp_fin` in `FIN_WAIT2` hands the port to a `TIME_WAIT`
+    /// socket and closes the socket's own (`tcp_done`). `None` until then.
+    fn released(&self, side: usize) -> Option<u64> {
+        if usize::from(self.first.load(Ordering::SeqCst)) != side {
+            return None;
+        }
+        let peer = self.ended[1 - side].load(Ordering::SeqCst);
+        (peer != NOT_ENDED).then(|| peer.saturating_add(TIME_WAIT))
+    }
     /// Moves what each side sends to the other, as far as the other's
     /// buffer takes it, and each side's end once its bytes have gone. A
     /// side that sends to a closed peer gets a reset, as Linux's peer
@@ -213,6 +224,11 @@ pub(crate) struct Binding {
     pub(crate) v6_only: bool,
     pub(crate) reuse_address: bool,
     pub(crate) reuse_port: bool,
+    /// Whether the guest bound the port itself, which Linux's
+    /// `SOCK_BINDPORT_LOCK` keeps when the connection ends.
+    pub(crate) locked: bool,
+    /// A TCP socket's loopback connection, once it opens, and its side.
+    pub(crate) link: Option<(Arc<OnceLock<Arc<Link>>>, usize)>,
     /// In a group of sockets sharing the port with `SO_REUSEPORT`, which
     /// a TCP listener joins when it listens, and a UDP socket when it
     /// binds (`inet_reuseport_add_sock`, `udp_reuseport_add_sock`).
@@ -313,9 +329,17 @@ impl Ports {
             .retain(|binding| binding.owner.strong_count() > 0 || binding.time_wait.is_some());
     }
     /// Forgets the holds in `TIME_WAIT` that have ended by `now`, or whose
-    /// side no longer ends its connection first.
+    /// side no longer ends its connection first, and the ports open sockets
+    /// whose connection has ended gave up by then, but those the guest bound.
     pub(crate) fn expire(&mut self, now: u64) {
         self.bindings.retain(|binding| {
+            if !binding.locked
+                && let Some((slot, side)) = &binding.link
+                && let Some(link) = slot.get()
+                && link.released(*side).is_some_and(|until| until <= now)
+            {
+                return false;
+            }
             binding.time_wait.as_ref().is_none_or(|wait| {
                 wait.link.closes_first(wait.side)
                     && wait
@@ -438,9 +462,21 @@ impl Ports {
             }
         }
     }
+    /// `owner`'s TCP connection on the loopback, `link` from `side`.
+    pub(crate) fn attach(
+        &mut self,
+        owner: &Weak<InetSocket>,
+        (link, side): (&Arc<OnceLock<Arc<Link>>>, usize),
+    ) {
+        for binding in &mut self.bindings {
+            if binding.is(owner) {
+                binding.link = Some((Arc::clone(link), side));
+            }
+        }
+    }
     /// `owner`, a UDP socket, connected from `address` to `peer`, or with
-    /// `None` disconnected; on another address it leaves its group, as
-    /// Linux's `udp_lib_rehash`.
+    /// `None` disconnected, as a TCP socket is that disconnects; on another
+    /// address it leaves its group, as Linux's `udp_lib_rehash`.
     pub(crate) fn connect(
         &mut self,
         owner: &Weak<InetSocket>,
@@ -452,6 +488,7 @@ impl Ports {
                 binding.pooled &= binding.address == address;
                 binding.address = address;
                 binding.peer = peer;
+                binding.link = None;
             }
         }
     }
@@ -611,6 +648,8 @@ mod tests {
             v6_only: false,
             reuse_address: false,
             reuse_port: false,
+            locked: false,
+            link: None,
             pooled: false,
             listening: false,
             peer: None,

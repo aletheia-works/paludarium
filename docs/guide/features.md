@@ -603,8 +603,11 @@ one only with an `--allow-net`.
   socket bound there, as Linux's `compute_score` picks it: a connected one
   only from its peer, one bound to that address or connected, or of IPv4,
   first, and among equals the last to bind. A socket that sends unbound
-  takes an ephemeral port on every address; one that connects takes one on
-  the loopback's source address and receives only from its peer, and
+  takes an ephemeral port on every address; one that connects takes one
+  first, even when the connect then fails (`ENETUNREACH` for an IPv4 peer
+  of an `IPV6_V6ONLY` socket), on the loopback's source address for a
+  loopback peer, on every address for another, and receives only from its
+  peer, and
   `AF_UNSPEC` disconnects it, keeping only the port and address the guest
   bound itself. A datagram holds up to 65507 bytes over IPv4 and 65527 over
   IPv6 (`EMSGSIZE`), may be empty, and is cut to the reader's buffer

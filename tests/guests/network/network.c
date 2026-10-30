@@ -986,6 +986,43 @@ int main(int argc, char **argv) {
                IN6_IS_ADDR_V4MAPPED(&f6.sin6_addr));
         return 0;
     }
+    if (!strcmp(mode, "udp-elsewhere")) {
+        /* connect of a UDP socket to an address off the loopback binds a
+           port first (inet_autobind), which then takes no datagram from the
+           loopback and is held until AF_UNSPEC gives it back. The source
+           address is not printed: Linux's is the route's, while the
+           emulator's guest has no address of its own off the loopback. */
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in far = {.sin_family = AF_INET, .sin_port = htons(9)};
+        far.sin_addr.s_addr = htonl(0xc0000201);
+        call("connect", connect(u, (void *)&far, sizeof far));
+        int port = port_of(u);
+        printf("  port-ok=%d\n", port != 0);
+        struct sockaddr_in peer;
+        socklen_t len = sizeof peer;
+        call("getpeername", getpeername(u, (void *)&peer, &len));
+        printf("  peer addr=%#x port=%d\n", ntohl(peer.sin_addr.s_addr), ntohs(peer.sin_port));
+        int other = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in here = to(port);
+        call("send-loopback", sendto(other, "x", 1, 0, (void *)&here, sizeof here));
+        call("recv-none", recv(u, buf, sizeof buf, MSG_DONTWAIT));
+        int taker = socket(AF_INET, SOCK_DGRAM, 0);
+        bind_to("bind-held", taker, htonl(INADDR_ANY), port);
+        struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+        call("disconnect", connect(u, &unspec, sizeof unspec));
+        printf("  after-disconnect port=%d\n", port_of(u));
+        bind_to("bind-freed", taker, htonl(INADDR_ANY), port);
+        /* An IPv6-only socket has no route to an IPv4-mapped address, but
+           took its port first. */
+        int v6 = socket(AF_INET6, SOCK_DGRAM, 0);
+        set_option("v6only", v6, IPPROTO_IPV6, IPV6_V6ONLY, 1);
+        struct sockaddr_in6 mapped = {.sin6_family = AF_INET6, .sin6_port = htons(9)};
+        mapped.sin6_addr.s6_addr[10] = mapped.sin6_addr.s6_addr[11] = 0xff;
+        memcpy(&mapped.sin6_addr.s6_addr[12], "\xc0\x00\x02\x01", 4);
+        call("connect-mapped", connect(v6, (void *)&mapped, sizeof mapped));
+        printf("  mapped port-ok=%d\n", port_of(v6) != 0);
+        return 0;
+    }
     if (!strcmp(mode, "udp-shutdown")) {
         /* shutdown of a UDP socket: ENOTCONN unless it is connected, but
            shut all the same. A receive that would wait then ends with 0,

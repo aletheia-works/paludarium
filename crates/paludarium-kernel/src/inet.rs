@@ -1008,9 +1008,10 @@ impl InetSocket {
         }
     }
 
-    /// `connect` of a UDP socket: it then sends to `address`, and on the
-    /// loopback takes datagrams only from it, from its port, bound now to
-    /// every address if it had none, on the loopback's source address
+    /// `connect` of a UDP socket: it binds a port on every address if it had
+    /// none, even when the connect then fails, and then sends to `address`
+    /// and takes datagrams only from it, on the loopback from that port on
+    /// the loopback's source address
     /// (`inet_dgram_connect`, `ip4_datagram_connect`). AF_UNSPEC disconnects
     /// (`__udp_disconnect`), keeping only what the guest bound itself.
     fn connect_datagram(&self, address: Option<SocketAddr>) -> Result<u64, Errno> {
@@ -1028,25 +1029,43 @@ impl InetSocket {
             self.keep_locked(&mut s, &bindings);
             return Ok(0);
         };
+        // Linux binds the port first, before it looks the route up.
+        let bound = self.autobind(&mut s, &options)?;
         let to = SocketAddr::new(plain(address.ip()), address.port());
+        if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
+            return Err(ENETUNREACH);
+        }
         match crate::loopback::destination(to) {
             Some(to) => {
-                if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
-                    return Err(ENETUNREACH);
-                }
                 let from = self.datagram_source(&mut s, to, &options)?;
                 self.ports().connect(&self.this, from, Some(to));
                 s.bound = Some(from);
                 s.peer = Some(to);
             }
             None => {
-                if let Some(bound) = s.bound {
-                    self.ports().connect(&self.this, bound, None);
-                }
+                // Off the loopback the port stays on every address, as the
+                // guest has no address of its own there; connected there,
+                // the socket takes no datagram from the loopback.
+                self.ports().connect(&self.this, bound, Some(to));
                 s.peer = Some(address);
             }
         }
         Ok(0)
+    }
+    /// This socket's address, with a port bound now on every address, or
+    /// on the one the guest kept, if it had none (Linux's `inet_autobind`).
+    fn autobind(&self, s: &mut State, options: &Options) -> Result<SocketAddr, Errno> {
+        if let Some(bound) = s.bound {
+            return Ok(bound);
+        }
+        let every = SocketAddr::new(s.address.take().unwrap_or(self.unspecified()), 0);
+        // Linux's autobind finds no free port with EAGAIN.
+        let bound = self
+            .ports()
+            .bind(self.binding(every, options))
+            .map_err(|_| Errno::EAGAIN)?;
+        s.bound = Some(bound);
+        Ok(bound)
     }
     fn unspecified(&self) -> IpAddr {
         match self.family {
@@ -1055,28 +1074,15 @@ impl InetSocket {
         }
     }
     /// The address a datagram to `to` on the loopback leaves from: this
-    /// socket's port, bound now to every address if it had none (Linux's
-    /// `inet_autobind`), on the address it is bound to, or else the
-    /// loopback's source address.
+    /// socket's port, on the address it is bound to, or else the loopback's
+    /// source address.
     fn datagram_source(
         &self,
         s: &mut State,
         to: SocketAddr,
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
-        let bound = match s.bound {
-            Some(bound) => bound,
-            None => {
-                let every = SocketAddr::new(s.address.take().unwrap_or(self.unspecified()), 0);
-                // Linux's autobind finds no free port with EAGAIN.
-                let bound = self
-                    .ports()
-                    .bind(self.binding(every, options))
-                    .map_err(|_| Errno::EAGAIN)?;
-                s.bound = Some(bound);
-                bound
-            }
-        };
+        let bound = self.autobind(s, options)?;
         let ip = if bound.ip().is_unspecified() {
             crate::loopback::source(to)
         } else {

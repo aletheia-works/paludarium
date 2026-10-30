@@ -188,6 +188,10 @@ mod linux {
     fn network_udp_shutdown() {
         case("udp-shutdown");
     }
+    #[test]
+    fn network_udp_elsewhere() {
+        case("udp-elsewhere");
+    }
 
     /// Name resolution has no native counterpart here: the guest's resolver
     /// would read the runner's own files and servers. Under the emulator,

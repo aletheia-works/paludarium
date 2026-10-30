@@ -1303,6 +1303,64 @@ fn loopback_udp_datagrams() {
     );
 }
 #[test]
+fn a_udp_connect_off_the_loopback_takes_a_port() {
+    let mut f = network_fixture(&[]);
+    let udp = |f: &mut Fixture, family: u64| f.ret(41, [family, 2 | 0x800, 0, 0, 0, 0]);
+    // Connected elsewhere, the socket takes a port on every address, as
+    // the guest has no address of its own there.
+    let u = udp(&mut f, 2);
+    inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 9);
+    assert_eq!(f.ret(42, [u, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let name = name_of(&mut f, 51, u);
+    assert_eq!(&name[..2], &[2, 0]);
+    assert_eq!(&name[4..8], &[0, 0, 0, 0]);
+    let port = u16::from_be_bytes([name[2], name[3]]);
+    assert!(port >= 32768);
+    assert_eq!(&name_of(&mut f, 52, u)[..8], &[2, 0, 0, 9, 192, 0, 2, 1]);
+    // It takes no datagram from the loopback, and holds its port.
+    let other = udp(&mut f, 2);
+    f.mem.write(GuestAddr(DATA), b"x").unwrap();
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], port);
+    assert_eq!(f.ret(44, [other, DATA, 1, 0, DATA + 0x100, 16]), 1);
+    assert_eq!(readable(&mut f, u) & 1, 0);
+    let taker = udp(&mut f, 2);
+    inet_address(&f, DATA + 0x100, [0, 0, 0, 0], port);
+    assert_eq!(
+        f.ret(49, [taker, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(98).to_syscall_return()
+    );
+    // AF_UNSPEC gives the port back, as the guest did not name it.
+    f.mem.write(GuestAddr(DATA + 0x100), &[0u8; 16]).unwrap();
+    assert_eq!(f.ret(42, [u, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(name_of(&mut f, 51, u)[..8], [2, 0, 0, 0, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [0, 0, 0, 0], port);
+    assert_eq!(f.ret(49, [taker, DATA + 0x100, 16, 0, 0, 0]), 0);
+    // An IPv6-only socket has no route to an IPv4-mapped address.
+    let v6 = udp(&mut f, 10);
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &1u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(54, [v6, 41, 26, DATA + 0x200, 4, 0]), 0);
+    let mut mapped = [0u8; 28];
+    mapped[0] = 10;
+    mapped[3] = 9;
+    mapped[18..20].copy_from_slice(&[0xff, 0xff]);
+    mapped[20..24].copy_from_slice(&[192, 0, 2, 1]);
+    f.mem.write(GuestAddr(DATA + 0x100), &mapped).unwrap();
+    assert_eq!(
+        f.ret(42, [v6, DATA + 0x100, 28, 0, 0, 0]),
+        Errno(101).to_syscall_return()
+    );
+    // It took its port all the same, as Linux binds one first.
+    f.mem
+        .write(GuestAddr(DATA + 0x80), &28u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(51, [v6, DATA + 0x84, DATA + 0x80, 0, 0, 0]), 0);
+    let mut name = [0u8; 4];
+    f.mem.read(GuestAddr(DATA + 0x84), &mut name).unwrap();
+    assert!(u16::from_be_bytes([name[2], name[3]]) >= 32768);
+}
+#[test]
 fn a_failed_connection_reports_its_error_once() {
     let mut f = network_fixture(&["127.0.0.1"]);
     let fd = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);

@@ -26,8 +26,12 @@ verified.
     its connections: all go to the first. A nonzero `SO_LINGER` time never
     holds `close`, as the bytes are delivered at once.
   - A UDP socket reaches the DNS stub and the guest's own sockets on the
-    loopback; a datagram to any other address is `ENETUNREACH`, and one
-    connected elsewhere takes no port (Linux binds one). A datagram counts
+    loopback; a datagram to any other address is `ENETUNREACH`. One
+    connected elsewhere takes its port on every address, as the guest has
+    no address of its own there, where Linux takes it on the route's source
+    address: `getsockname` gives the unspecified address, and a `bind` of
+    that port on a loopback address is `EADDRINUSE`, where Linux allows it.
+    A datagram counts
     its bytes and 768 more against `SO_RCVBUF`, where Linux counts its
     `sk_buff`, so a full buffer drops at another point; multicast and
     broadcast datagrams reach no one. Raw sockets are `EPERM`, ICMP sockets

@@ -3991,6 +3991,100 @@ int main(int argc, char **argv) {
         unix_call("rmdir", rmdir(dir));
         return 0;
     }
+    if (!strcmp(mode, "unix-dgram-disconnect")) {
+        /* A datagram socket that disconnects (af_unix.c's
+           unix_dgram_disconnected), by connecting elsewhere, to AF_UNSPEC
+           or by finding its peer gone: what it has not read goes, with the
+           descriptors in it, and a peer connected back to it gets
+           ECONNRESET once, from a read, a send or SO_ERROR, and POLLERR
+           until then. */
+        signal(SIGPIPE, SIG_IGN);
+        struct sockaddr_un an, bn, cn;
+        socklen_t al = unix_abstract(&an, "dc-a"), bl = unix_abstract(&bn, "dc-b"), cl = unix_abstract(&cn, "dc-c");
+        struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+        char buf[16];
+        int err;
+        socklen_t err_len = sizeof err;
+        int a = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        int b = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        int c = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        bind(a, (void *)&an, al);
+        bind(b, (void *)&bn, bl);
+        bind(c, (void *)&cn, cl);
+        /* a and b connected to each other; a reconnects with data unread. */
+        connect(a, (void *)&bn, bl);
+        connect(b, (void *)&an, al);
+        unix_call("send-to-a", send(b, "x", 1, 0));
+        unix_call("send-to-b", send(a, "y", 1, 0));
+        unix_call("reconnect", connect(a, (void *)&cn, cl));
+        unix_call("recv-purged", recv(a, buf, sizeof buf, 0));
+        unix_poll("old-peer", b);
+        err = -1;
+        getsockopt(b, SOL_SOCKET, SO_ERROR, &err, &err_len);
+        printf("so-error=%d\n", err);
+        getsockopt(b, SOL_SOCKET, SO_ERROR, &err, &err_len);
+        printf("so-error-again=%d\n", err);
+        unix_poll("old-peer-after", b);
+        unix_call("old-peer-kept", recv(b, buf, sizeof buf, 0));
+        /* The error comes before a queued datagram, once. */
+        connect(a, (void *)&bn, bl);
+        unix_call("send-to-a-2", send(b, "x", 1, 0));
+        unix_call("send-to-b-2", send(a, "z", 1, 0));
+        unix_call("disconnect", connect(a, &unspec, sizeof unspec));
+        unix_call("recv-error", recv(b, buf, sizeof buf, 0));
+        unix_call("recv-after-error", recv(b, buf, sizeof buf, 0));
+        /* And before a send. */
+        connect(a, (void *)&bn, bl);
+        unix_call("send-to-a-3", send(b, "x", 1, 0));
+        connect(a, (void *)&cn, cl);
+        unix_call("send-error", send(b, "w", 1, 0));
+        unix_call("send-after-error", send(b, "w", 1, 0));
+        /* With nothing unread nothing is reset; nor is a peer that is not
+           connected back. */
+        connect(a, (void *)&bn, bl);
+        unix_call("reconnect-empty", connect(a, (void *)&cn, cl));
+        unix_poll("peer-of-empty", b);
+        connect(b, &unspec, sizeof unspec);
+        connect(a, (void *)&bn, bl);
+        unix_call("sendto-a", sendto(b, "v", 1, 0, (void *)&an, al));
+        unix_call("reconnect-one-way", connect(a, (void *)&cn, cl));
+        unix_call("recv-one-way", recv(a, buf, sizeof buf, 0));
+        unix_poll("one-way-peer", b);
+        /* Connecting again to the same socket keeps the queue. */
+        unix_call("sendto-a-2", sendto(c, "u", 1, 0, (void *)&an, al));
+        unix_call("connect-same", connect(a, (void *)&cn, cl));
+        unix_call("recv-kept", recv(a, buf, sizeof buf, 0));
+        /* The peer goes: the refused send drops the queue, and the
+           descriptors in it close. */
+        int pipe_fds[2];
+        pipe(pipe_fds);
+        int d = socket(AF_UNIX, SOCK_DGRAM, 0);
+        connect(a, &unspec, sizeof unspec);
+        connect(d, (void *)&an, al);
+        unix_call("pass", send_fds(d, "p", 1, &pipe_fds[1], 1));
+        close(pipe_fds[1]);
+        close(d);
+        connect(a, (void *)&cn, cl);
+        close(c);
+        unix_call("send-gone", send(a, "x", 1, 0));
+        unix_call("recv-gone", recv(a, buf, sizeof buf, 0));
+        unix_call("pipe-closed", read(pipe_fds[0], buf, 1));
+        unix_call("send-after-gone", send(a, "x", 1, 0));
+        /* A socket pair's end does the same. */
+        int sp[2];
+        socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, sp);
+        send(sp[1], "1", 1, 0);
+        send(sp[1], "2", 1, 0);
+        close(sp[1]);
+        unix_call("pair-read", recv(sp[0], buf, sizeof buf, 0));
+        unix_call("pair-send", send(sp[0], "x", 1, 0));
+        unix_call("pair-purged", recv(sp[0], buf, sizeof buf, 0));
+        close(sp[0]);
+        close(a);
+        close(b);
+        close(pipe_fds[0]);
+        return 0;
+    }
     if (!strcmp(mode, "unix-datagram")) {
         /* AF_UNIX datagram sockets from socket() (af_unix.c's
            unix_dgram_*): names in the abstract namespace, which each type

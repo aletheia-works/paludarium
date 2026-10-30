@@ -121,7 +121,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   2³¹ を超えると `EINVAL` です。
 - `SOCK_DGRAM` の組は、`SOCK_SEQPACKET` と同じくメッセージの区切りを保ちますが、
   ファイルの終わりがありません。相手が閉じると、読み込みは待ち続け、次の送信は
-  `ECONNREFUSED`、その後は `ENOTCONN` になります。`EPIPE` で `SIGPIPE` を送るのは、
+  `ECONNREFUSED`、その後は `ENOTCONN` になります。その送信は、下と同じく、その端が
+  読んでいないものを捨てます。`EPIPE` で `SIGPIPE` を送るのは、
   Linux と同じく `SOCK_STREAM` だけです。
 - `socket(AF_UNIX)` は、Linux の `af_unix.c` と同じく、`SOCK_STREAM` か
   `SOCK_SEQPACKET` のソケットを作ります。抽象名前空間の名前（0 で始まる `sun_path`）に
@@ -157,7 +158,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   いっぱいです。そのときノンブロッキングの送信は `EAGAIN`、ブロッキングの送信は
   `SO_SNDTIMEO` まで待ち、接続している送り手は `poll` に書けないように見えます。
   `AF_UNSPEC` のアドレスへの `connect` は接続を切り、何度でも接続し直せます。接続している
-  ソケットがなくなると、次の送信は `ECONNREFUSED`、その後は `ENOTCONN` です。資格情報を
+  ソケットがなくなると、次の送信は `ECONNREFUSED`、その後は `ENOTCONN` です。ほかの
+  ソケットか `AF_UNSPEC` への接続や、その拒まれた送信で接続が切れると、Linux の
+  `unix_dgram_disconnected` と同じく、そのソケットが読んでいないデータグラムを捨て、
+  それが渡すディスクリプタを閉じます。捨てたものがあり、前の相手が接続し返していれば、
+  前の相手は `ECONNRESET` を受けます。それは次の読み込み（キューにあるものより先）か
+  送信か `SO_ERROR` が 1 度だけ返し、それまでは `poll` に `POLLERR` として見えます。資格情報を
   受け渡すソケットは、接続するときか送るときに自動で `bind` されます。`listen` と
   `accept` は `EOPNOTSUPP` で、`SO_PEERCRED` はどのプロセスも示さず（プロセス 0、ID は
   -1）、`SO_PEERPIDFD` は `ENODATA` です。ソケットのペアのデータグラムの端も名前へ

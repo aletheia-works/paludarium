@@ -25,6 +25,7 @@ const EADDRINUSE: Errno = Errno(98);
 const EISCONN: Errno = Errno(106);
 const ENOTCONN: Errno = Errno(107);
 const ECONNREFUSED: Errno = Errno(111);
+const ECONNRESET: Errno = Errno(104);
 const EOPNOTSUPP: Errno = Errno(95);
 const EPERM: Errno = Errno(1);
 const EPROTOTYPE: Errno = Errno(91);
@@ -535,10 +536,30 @@ impl UnixSocket {
             }
             Some((Arc::downgrade(&other), other.address()))
         };
-        self.lock().to = to;
+        let new = to.as_ref().map_or(std::ptr::null(), |(to, _)| to.as_ptr());
+        let old = std::mem::replace(&mut self.lock().to, to);
+        if let Some((old, _)) = old
+            && !std::ptr::eq(old.as_ptr(), new)
+        {
+            self.disconnected(&old);
+        }
         // What waits to send to the old peer may now send elsewhere.
         self.hub.changed();
         Ok(())
+    }
+    /// This datagram socket is no longer connected to `old`, as Linux's
+    /// `unix_dgram_disconnected`: the datagrams it has not read go, and
+    /// then, if `old` is connected back to it, `old` gets `ECONNRESET`.
+    fn disconnected(&self, old: &Weak<UnixSocket>) {
+        let Some(purged) = self.end.purge() else {
+            return;
+        };
+        if let Some(old) = old.upgrade()
+            && old.connected_to(self)
+        {
+            old.end.set_error(ECONNRESET);
+        }
+        drop(purged);
     }
     /// Whether this datagram socket takes what `sender` sends, as Linux's
     /// `unix_may_send`: unless it is connected to another socket, even one
@@ -565,7 +586,11 @@ impl UnixSocket {
         if let Some(to) = to.upgrade() {
             return Ok(to);
         }
-        s.to = None;
+        let old = s.to.take();
+        drop(s);
+        if let Some((old, _)) = old {
+            self.disconnected(&old);
+        }
         Err(ECONNREFUSED)
     }
     /// A datagram from `sender`'s end, a socket's or a socket pair's, joins

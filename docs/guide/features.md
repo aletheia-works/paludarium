@@ -133,7 +133,8 @@ kernel.
   at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.
 - A `SOCK_DGRAM` pair keeps message boundaries like `SOCK_SEQPACKET`, but has
   no end of file: when the peer closes, reads wait and the next send gets
-  `ECONNREFUSED`, then `ENOTCONN`. Only `SOCK_STREAM` raises `SIGPIPE` with
+  `ECONNREFUSED`, then `ENOTCONN`; that send drops what the end has not
+  read, as below. Only `SOCK_STREAM` raises `SIGPIPE` with
   `EPIPE`, as on Linux.
 - `socket(AF_UNIX)` makes a `SOCK_STREAM` or `SOCK_SEQPACKET` socket that
   binds to a name in the abstract namespace (a `sun_path` starting with 0),
@@ -172,7 +173,13 @@ kernel.
   `SO_SNDTIMEO`, and the connected sender is not writable to `poll`.
   `connect` to an `AF_UNSPEC` address disconnects; a socket connects again
   at will. When the socket it is connected to goes, its next send is
-  `ECONNREFUSED`, then `ENOTCONN`. A socket that passes credentials is
+  `ECONNREFUSED`, then `ENOTCONN`. Disconnecting, by connecting to another
+  socket or `AF_UNSPEC` or by that refused send, drops the datagrams the
+  socket has not read, closing the descriptors they pass, as Linux's
+  `unix_dgram_disconnected`; if there were any and the old peer is
+  connected back, the old peer gets `ECONNRESET`, which its next read
+  (before what it has queued), send or `SO_ERROR` returns once, and
+  `poll` shows as `POLLERR` until then. A socket that passes credentials is
   autobound as it connects or sends. `listen` and `accept` are
   `EOPNOTSUPP`, and `SO_PEERCRED` names no process (process 0, IDs -1),
   `SO_PEERPIDFD` `ENODATA`. A socket pair's datagram end sends to names too.

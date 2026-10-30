@@ -900,6 +900,36 @@ fn unix_datagram_sockets_send_to_names() {
     );
 }
 #[test]
+fn a_disconnected_datagram_socket_drops_its_queue_and_resets_its_peer() {
+    let mut f = Fixture::new();
+    let address = |f: &Fixture, at: u64, name: &[u8]| {
+        let mut raw = vec![1, 0, 0];
+        raw.extend_from_slice(name);
+        f.mem.write(GuestAddr(at), &raw).unwrap();
+        raw.len() as u64
+    };
+    let unix = |f: &mut Fixture| f.ret(41, [1, 2 | 0x800, 0, 0, 0, 0]);
+    let [a, b, c] = [unix(&mut f), unix(&mut f), unix(&mut f)];
+    let la = address(&f, DATA + 0x100, b"a");
+    let lb = address(&f, DATA + 0x180, b"b");
+    let lc = address(&f, DATA + 0x280, b"c");
+    for (fd, at, len) in [(a, 0x100, la), (b, 0x180, lb), (c, 0x280, lc)] {
+        assert_eq!(f.ret(49, [fd, DATA + at, len, 0, 0, 0]), 0);
+    }
+    assert_eq!(f.ret(42, [a, DATA + 0x180, lb, 0, 0, 0]), 0);
+    assert_eq!(f.ret(42, [b, DATA + 0x100, la, 0, 0, 0]), 0);
+    f.mem.write(GuestAddr(DATA), b"x").unwrap();
+    assert_eq!(f.ret(1, [b, DATA, 1, 0, 0, 0]), 1);
+    // a goes elsewhere with a datagram unread: it goes, and b is reset.
+    assert_eq!(f.ret(42, [a, DATA + 0x280, lc, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(0, [a, DATA + 8, 8, 0, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    assert_eq!(int_option(&mut f, b, 1, 4), (0, 104));
+    assert_eq!(int_option(&mut f, b, 1, 4), (0, 0));
+}
+#[test]
 fn inet_sockets_need_a_network() {
     let mut f = Fixture::new();
     assert_eq!(f.ret(41, [2, 1, 0, 0, 0, 0]), Errno(97).to_syscall_return());

@@ -1486,7 +1486,8 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_REUSEADDR => int(options.reuse_address.into()),
         SO_TYPE => int(socket.pair.kind.cast_signed()),
         SO_ACCEPTCONN => int(i32::from(socket.unix().is_some_and(|u| u.listening()))),
-        SO_ERROR | SO_BSDCOMPAT | SO_REUSEPORT | SO_PASSSEC | SO_PROTOCOL => int(0),
+        SO_ERROR => int(socket.take_error().map_or(0, |error| error.0)),
+        SO_BSDCOMPAT | SO_REUSEPORT | SO_PASSSEC | SO_PROTOCOL => int(0),
         // As Linux's `sk_getsockopt`: each names only the form it set.
         name @ (SO_TIMESTAMP | SO_TIMESTAMPNS | SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW) => {
             let t = socket.lock_sides()[socket.side].timestamps;
@@ -1700,6 +1701,9 @@ struct Side {
     /// SOCK_DGRAM: a send found the peer closed, so this side has no peer
     /// any more (`ECONNREFUSED` once, then `ENOTCONN`).
     disconnected: bool,
+    /// A datagram socket's pending error, as Linux's `sk_err`: what its
+    /// next read, send or `SO_ERROR` gives, once; `POLLERR` until then.
+    error: Option<Errno>,
     /// `F_SETOWN` and `F_SETSIG`: who this end's `O_ASYNC` signals and a
     /// stream's out-of-band byte for it (SIGURG) go to, and with what.
     owner: FileOwner,
@@ -2009,6 +2013,11 @@ impl SocketPairEnd {
         {
             let mut sides = self.lock_sides();
             let own = &mut sides[self.side];
+            // A datagram socket's error comes before its queue, as
+            // `__skb_try_recv_datagram` takes it.
+            if let Some(error) = own.error.take() {
+                return Err(error);
+            }
             if own.reset && own.bytes.is_empty() && own.writes.is_empty() {
                 own.reset = false;
                 return Err(Errno(104));
@@ -2755,7 +2764,10 @@ impl FileHandle for SocketPairEnd {
             let shut = (u32::from(own.read_shutdown) * (IN | 0x2000))
                 | (u32::from(own.read_shutdown && own.write_shutdown) * 0x10);
             let writable = peer.bytes.len() < self.pair.window() || peer.closed;
-            let mask = (u32::from(writable) * OUT) | (u32::from(readable) * IN) | shut;
+            let mask = (u32::from(writable) * OUT)
+                | (u32::from(readable) * IN)
+                | (u32::from(own.error.is_some()) * 0x8)
+                | shut;
             return Ok((mask, own.input_epoch, own.output_epoch));
         }
         let eof = own.read_shutdown || peer.closed || peer.write_shutdown;
@@ -2909,10 +2921,54 @@ impl SocketPairEnd {
         if len > MAX_MESSAGE {
             return Err(Errno(90)); // EMSGSIZE
         }
+        if let Some(error) = self.take_error() {
+            return Err(error);
+        }
         if self.lock_sides()[self.side].write_shutdown {
             return Err(Errno(32));
         }
         Ok(())
+    }
+    /// The pending error, which goes with this (`sock_error`).
+    pub(crate) fn take_error(&self) -> Option<Errno> {
+        self.lock_sides()[self.side].error.take()
+    }
+    /// Gives this end the pending `error`, as Linux's `sk_error_report`:
+    /// `POLLERR`, and `POLL_ERR` with `O_ASYNC`.
+    pub(crate) fn set_error(&self, error: Errno) {
+        let notice = {
+            let mut sides = self.lock_sides();
+            let own = &mut sides[self.side];
+            own.error = Some(error);
+            own.input_epoch = own.input_epoch.wrapping_add(1);
+            Self::notice(&sides, self.side, Reason::Error)
+        };
+        self.pair.hub.changed();
+        if let Some(notice) = notice {
+            notice.send();
+        }
+    }
+    /// Drops what waits on this end, as `skb_queue_purge` does when Linux's
+    /// `unix_dgram_disconnected` disconnects a datagram socket; the
+    /// descriptors it held, for the caller to close outside the lock, or
+    /// `None` when nothing waited.
+    pub(crate) fn purge(&self) -> Option<Vec<Passed>> {
+        let mut sides = self.lock_sides();
+        let purged = Self::take_queue(&mut sides[self.side])?;
+        drop(sides);
+        // A send that waits for room may now find it.
+        self.pair.hub.changed();
+        Some(purged)
+    }
+    /// Empties `own`'s queue, if anything waits there.
+    fn take_queue(own: &mut Side) -> Option<Vec<Passed>> {
+        if own.writes.is_empty() {
+            return None;
+        }
+        own.bytes.clear();
+        own.input_epoch = own.input_epoch.wrapping_add(1);
+        own.output_epoch = own.output_epoch.wrapping_add(1);
+        Some(own.writes.drain(..).map(|write| write.passed).collect())
     }
     /// A datagram `sender` sent joins this end's queue, unless reading is
     /// shut down (`EPIPE`), more than `limit` messages wait, or the bytes
@@ -3023,6 +3079,12 @@ impl SocketPairEnd {
             }
             if peer.closed {
                 own.disconnected = true;
+                // unix_dgram_disconnected: what this end has not read goes,
+                // closed outside the lock.
+                let purged = Self::take_queue(own);
+                drop(sides);
+                self.pair.hub.changed();
+                drop(purged);
                 return Err(Errno(111)); // ECONNREFUSED
             }
             if peer.read_shutdown {

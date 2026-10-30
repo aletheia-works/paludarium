@@ -60,6 +60,7 @@
     {"name":"scm-rights","binary":"process"},
     {"name":"unix-abstract","binary":"process"},
     {"name":"unix-datagram","binary":"process"},
+    {"name":"unix-dgram-disconnect","binary":"process"},
     {"name":"unix-path","binary":"process"},
     {"name":"socket-flags","binary":"process"},
     {"name":"socket-oob","binary":"process"},

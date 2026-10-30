@@ -36,10 +36,7 @@ verified.
     `SO_PEERCRED` of a connection names the connecting process
     on both sides, where Linux names the listener's to the client. The
     garbage collector does not look at a listener's connections not yet
-    accepted. A datagram socket that connects elsewhere, or finds the
-    socket it was connected to gone, keeps its unread datagrams, which
-    Linux's `unix_dgram_disconnected` drops, giving that socket, if it was
-    connected back, `ECONNRESET`. A sender's datagrams are bounded by the
+    accepted. A sender's datagrams are bounded by the
     bytes the receiver has not read, not by the sender's `SO_SNDBUF`, and
     `SIOCOUTQ` on a datagram socket is 0.
   - The DNS stub answers only `A` and `AAAA`, and ignores EDNS, so a

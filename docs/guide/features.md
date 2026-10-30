@@ -147,7 +147,7 @@ kernel.
   collector (`unix_gc`) closes them when a socket goes: a socket whose
   descriptor waits in its own queue, or sockets that hold each other so,
   once no descriptor holds them, with the descriptors in their queues.
-  One a socket still open holds in its queue stays.
+  A socket held in the queue of one still open stays.
 - A stream write goes in parts, as Linux's `unix_stream_sendmsg` sends it:
   each at most 36544 bytes (a page's head and 32 KiB of pages), or half the
   send buffer less 64 bytes: the doubled value `SO_SNDBUF` sets and reads

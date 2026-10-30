@@ -2516,7 +2516,10 @@ fn collect_garbage() {
         known.iter().filter_map(Weak::upgrade).collect()
     };
     // Each socket in flight, with its holds and how many of them are in
-    // queues, and the sockets each end's queue holds.
+    // queues, and the sockets each end's queue holds. The pairs are read
+    // one at a time, so a socket's holds are the most seen at any of its
+    // copies: a send that adds a copy while a descriptor holds the socket
+    // adds a hold with it, which that copy's count sees.
     let mut held: BTreeMap<EndId, (usize, usize)> = BTreeMap::new();
     let mut queues: BTreeMap<EndId, Vec<EndId>> = BTreeMap::new();
     for pair in &pairs {
@@ -2525,9 +2528,8 @@ fn collect_garbage() {
             let queue = (Arc::as_ptr(pair) as usize, side);
             for descriptor in own.writes.iter().flat_map(|write| &write.passed) {
                 if let Some(end) = socket_end(&descriptor.file) {
-                    let entry = held
-                        .entry(end.id())
-                        .or_insert((Arc::strong_count(&descriptor.file), 0));
+                    let entry = held.entry(end.id()).or_default();
+                    entry.0 = entry.0.max(Arc::strong_count(&descriptor.file));
                     entry.1 += 1;
                     queues.entry(queue).or_default().push(end.id());
                 }

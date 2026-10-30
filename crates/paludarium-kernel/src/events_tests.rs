@@ -888,6 +888,7 @@ fn name_of(f: &mut Fixture, call: u64, fd: u64) -> [u8; 16] {
     name
 }
 /// A TCP socket listening on 127.0.0.1 with `backlog`, and its port.
+const SECOND: u64 = 1_000_000_000;
 fn loopback_listener(f: &mut Fixture, backlog: u64) -> (u64, u16) {
     let fd = f.ret(41, [2, 1, 0, 0, 0, 0]);
     inet_address(f, DATA + 0x100, [127, 0, 0, 1], 0);
@@ -1078,7 +1079,8 @@ fn loopback_connections_in_progress_and_refused() {
         f.ret(42, [quick, DATA + 0x100, 16, 0, 0, 0]),
         Errno(106).to_syscall_return()
     );
-    // The queue (backlog 0) is full: the next one waits for room.
+    // The queue (backlog 0) is full: the handshake is dropped, and the
+    // client tries again 1 second later, once accept has made room.
     let waiting = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
     assert_eq!(
         f.ret(42, [waiting, DATA + 0x100, 16, 0, 0, 0]),
@@ -1091,6 +1093,10 @@ fn loopback_connections_in_progress_and_refused() {
     );
     let first = f.ret(43, [listener, 0, 0, 0, 0, 0]);
     assert!((first as i64) >= 0);
+    assert_eq!(readable(&mut f, waiting), 0);
+    f.host.now.store(SECOND - 1, Ordering::SeqCst);
+    assert_eq!(readable(&mut f, waiting), 0);
+    f.host.now.store(SECOND, Ordering::SeqCst);
     assert_eq!(f.ret(42, [waiting, DATA + 0x100, 16, 0, 0, 0]), 0);
     assert_eq!(readable(&mut f, listener), 1);
     // A port no guest socket listens on: a reset.
@@ -1107,6 +1113,64 @@ fn loopback_connections_in_progress_and_refused() {
         f.ret(42, [blocking, DATA + 0x100, 16, 0, 0, 0]),
         Errno(111).to_syscall_return()
     );
+}
+#[test]
+fn a_dropped_handshake_is_tried_again_until_it_times_out() {
+    let mut f = network_fixture(&[]);
+    let at = |f: &mut Fixture, seconds: u64| f.host.now.store(seconds * SECOND, Ordering::SeqCst);
+    let nonblocking = |f: &mut Fixture, port: u16| {
+        let fd = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+        inet_address(f, DATA + 0x100, [127, 0, 0, 1], port);
+        assert_eq!(
+            f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+            Errno(115).to_syscall_return()
+        );
+        fd
+    };
+    // Backlog 0 holds one: the next is dropped and tried again at 1, 2, 3,
+    // 4, 5, 7, 11… seconds; room made at 5.5 seconds takes it at 7.
+    let (listener, port) = loopback_listener(&mut f, 0);
+    let _held = loopback_client(&mut f, port);
+    let late = nonblocking(&mut f, port);
+    at(&mut f, 5);
+    assert_eq!(readable(&mut f, late), 0);
+    f.host.now.store(5 * SECOND + SECOND / 2, Ordering::SeqCst);
+    let taken = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    assert!((taken as i64) >= 0);
+    assert_eq!(readable(&mut f, late) & 4, 0);
+    at(&mut f, 7);
+    assert_eq!(readable(&mut f, late) & 4, 4);
+    assert_eq!(int_option(&mut f, late, 1, 4), (0, 0));
+    // Never given room, it gives up at 131 seconds with ETIMEDOUT.
+    let given_up = nonblocking(&mut f, port);
+    at(&mut f, 7 + 130);
+    assert_eq!(readable(&mut f, given_up) & 8, 0);
+    at(&mut f, 7 + 131);
+    assert_eq!(readable(&mut f, given_up) & 8, 8);
+    assert_eq!(int_option(&mut f, given_up, 1, 4), (0, 110));
+    // Its listener gone, the next try is refused; another listening on the
+    // port by then takes it instead.
+    let refused = nonblocking(&mut f, port);
+    let moved = {
+        let (other, other_port) = loopback_listener(&mut f, 0);
+        let _filler = loopback_client(&mut f, other_port);
+        (other, other_port, nonblocking(&mut f, other_port))
+    };
+    assert_eq!(f.ret(3, [listener, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(readable(&mut f, refused) & 8, 0);
+    at(&mut f, 7 + 132);
+    assert_eq!(readable(&mut f, refused) & 8, 8);
+    assert_eq!(int_option(&mut f, refused, 1, 4), (0, 111));
+    let (other, other_port, waiting) = moved;
+    assert_eq!(f.ret(3, [other, 0, 0, 0, 0, 0]), 0);
+    // Another socket listens on that port before the next try.
+    let again = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], other_port);
+    assert_eq!(f.ret(49, [again, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [again, 4, 0, 0, 0, 0]), 0);
+    at(&mut f, 7 + 133);
+    assert_eq!(readable(&mut f, waiting) & 4, 4);
+    assert_eq!(int_option(&mut f, waiting, 1, 4), (0, 0));
 }
 #[test]
 fn loopback_closes_reset_what_is_left() {

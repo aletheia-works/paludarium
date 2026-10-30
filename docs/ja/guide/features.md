@@ -546,8 +546,13 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `FIONREAD` は `EINVAL`、`connect` は `EISCONN` で、`shutdown(SHUT_RD)` か
   `AF_UNSPEC` の `connect` で待ち受けをやめます。
 - **`connect`** は、待ち受けの列が接続を受け取った時点で、`accept` の前に戻ります。
-  ノンブロッキングなら Linux と同じく `EINPROGRESS` です。列がいっぱいなら、
-  `accept` が空きを作るまで待ちます。
+  ノンブロッキングなら Linux と同じく `EINPROGRESS` です。列がいっぱいなら接続は
+  捨てられ、クライアントは、Linux が既定の `tcp_syn_linear_timeouts`（4）で
+  するのと同じく、始めてから 1、2、3、4、5、7、11、19、35、67 秒後に試し直します。
+  試し直しは、そのときそこで待ち受けているものに届き、列がまだいっぱいならまた
+  捨てられ、待ち受けがなければ拒まれ（`ECONNREFUSED`）、131 秒でクライアントは
+  `ETIMEDOUT` であきらめます。ブロッキングの `connect` が待つのは `SO_SNDTIMEO`
+  までで、そのあとは `EINPROGRESS`、すでに進んでいたなら `EALREADY` です。
 - **`accept`** と **`accept4`**（`SOCK_NONBLOCK`、`SOCK_CLOEXEC`）は、最初に
   待っている接続と相手のアドレスを返します。待ち受けているソケットがノンブロッキング
   でなければ、`SO_RCVTIMEO` まで待ちます（`EAGAIN`）。受け付けたソケットは、待ち

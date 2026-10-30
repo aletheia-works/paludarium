@@ -20,13 +20,10 @@ verified.
   - On the loopback, the side that closed a connection first holds its
     port in `TIME_WAIT` for 60 seconds from its `close`, where Linux counts
     them from when the peer's end comes, if later, and holds the port until
-    then too (`FIN_WAIT1` while its own bytes still go, `FIN_WAIT2`). A
-    connection that finds the listener's queue full waits until `accept`
-    makes room, where Linux's client tries again after 1, 3, 7… seconds and
-    gives up with `ETIMEDOUT`. Listeners sharing a port with `SO_REUSEPORT`
-    do not share its connections: all go to the first. A nonzero
-    `SO_LINGER` time never holds `close`, as the bytes are delivered at
-    once.
+    then too (`FIN_WAIT1` while its own bytes still go, `FIN_WAIT2`).
+    Listeners sharing a port with `SO_REUSEPORT` do not share its
+    connections: all go to the first. A nonzero `SO_LINGER` time never holds
+    `close`, as the bytes are delivered at once.
   - A UDP socket reaches the DNS stub and the guest's own sockets on the
     loopback; a datagram to any other address is `ENETUNREACH`. One
     connected elsewhere takes its port on every address, as the guest has

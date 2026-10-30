@@ -173,6 +173,10 @@ mod linux {
         case("listen-reset");
     }
     #[test]
+    fn network_listen_full() {
+        case("listen-full");
+    }
+    #[test]
     fn network_listen_time_wait() {
         case("listen-time-wait");
     }

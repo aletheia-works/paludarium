@@ -29,6 +29,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int open_port, closed_port;
@@ -153,6 +154,24 @@ static int port_of(int fd) {
     socklen_t len = sizeof a;
     getsockname(fd, (void *)&a, &len);
     return ntohs(a.sin6_port);
+}
+/* Milliseconds on the monotonic clock. */
+static long now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+/* Waits up to `limit` ms for `fd` to finish connecting, and prints how it
+   ended and the nearest whole second after `start` (Linux's timers run a
+   little late). */
+static void finished(const char *name, int fd, long start, int limit) {
+    struct pollfd p = {.fd = fd, .events = POLLOUT};
+    int n = poll(&p, 1, limit);
+    int error = 0;
+    socklen_t len = sizeof error;
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len);
+    printf("  %s poll=%d revents=%#x error=%d second=%ld\n", name, n, (unsigned)p.revents, error,
+           (now_ms() - start + 500) / 1000);
 }
 static volatile sig_atomic_t pipes;
 static void on_pipe(int signal) { (void)signal; pipes++; }
@@ -655,8 +674,8 @@ int main(int argc, char **argv) {
         call("accept-timeout", accept(l, NULL, NULL));
         fcntl(l, F_SETFL, O_NONBLOCK);
         call("accept-nonblocking", accept(l, NULL, NULL));
-        /* A full queue (backlog 1 holds two): the next connection waits
-           until accept makes room, as Linux's client tries again. (Backlog
+        /* A full queue (backlog 1 holds two): the next connection is
+           dropped and tried again, after accept makes room. (Backlog
            0 would leave Linux's first one to SYN cookies.) */
         int q;
         int full = listener(1, &q);
@@ -682,6 +701,70 @@ int main(int argc, char **argv) {
         int u = socket(AF_INET, SOCK_DGRAM, 0);
         call("udp-listen", listen(u, 1));
         call("udp-accept", accept(u, NULL, NULL));
+        return 0;
+    }
+    if (!strcmp(mode, "listen-full")) {
+        /* A full queue (backlog 1 holds two) drops the handshake, and the
+           client sends it again 1, 2, 3, 4, 5, 7… seconds later
+           (tcp_syn_linear_timeouts): room made in between takes it only at
+           the next try, a listener gone by then refuses it, and another
+           listening there by then takes it. */
+        int port, result;
+        int l = listener(1, &port);
+        client(port, SOCK_NONBLOCK, &result);
+        client(port, SOCK_NONBLOCK, &result);
+        long start = now_ms();
+        int c = client(port, SOCK_NONBLOCK, &result);
+        printf("  dropped errno=%d\n", result);
+        ready("dropped", c, POLLOUT);
+        poll(NULL, 0, 300);
+        printf("  accept-ok=%d\n", accept(l, NULL, NULL) >= 0);
+        ready("room-made", c, POLLOUT);
+        finished("first-try", c, start, 3000);
+        ready("listener", l, POLLIN);
+        close(l);
+        l = listener(1, &port);
+        client(port, SOCK_NONBLOCK, &result);
+        client(port, SOCK_NONBLOCK, &result);
+        start = now_ms();
+        c = client(port, SOCK_NONBLOCK, &result);
+        poll(NULL, 0, 1500);
+        accept(l, NULL, NULL);
+        finished("second-try", c, start, 3000);
+        close(l);
+        l = listener(1, &port);
+        client(port, SOCK_NONBLOCK, &result);
+        client(port, SOCK_NONBLOCK, &result);
+        start = now_ms();
+        c = client(port, SOCK_NONBLOCK, &result);
+        poll(NULL, 0, 200);
+        close(l);
+        ready("listener-gone", c, POLLOUT);
+        finished("refused", c, start, 3000);
+        l = listener(1, &port);
+        client(port, SOCK_NONBLOCK, &result);
+        client(port, SOCK_NONBLOCK, &result);
+        start = now_ms();
+        c = client(port, SOCK_NONBLOCK, &result);
+        poll(NULL, 0, 200);
+        close(l);
+        int again = tcp(0), one = 1;
+        setsockopt(again, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        bind_to("listen-again", again, htonl(INADDR_LOOPBACK), port);
+        call("listen-again", listen(again, 4));
+        finished("taken-by-another", c, start, 3000);
+        /* A blocking connect waits only as long as SO_SNDTIMEO, then is in
+           progress. */
+        close(again);
+        l = listener(1, &port);
+        client(port, SOCK_NONBLOCK, &result);
+        client(port, SOCK_NONBLOCK, &result);
+        c = tcp(0);
+        struct timeval tv = {0, 300000};
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        struct sockaddr_in a = to(port);
+        call("blocking", connect(c, (void *)&a, sizeof a));
+        call("blocking-again", connect(c, (void *)&a, sizeof a));
         return 0;
     }
     if (!strcmp(mode, "listen-time-wait")) {

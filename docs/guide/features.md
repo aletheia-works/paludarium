@@ -588,7 +588,14 @@ one only with an `--allow-net`.
   stops listening on `shutdown(SHUT_RD)` or an `AF_UNSPEC` `connect`.
 - **`connect`** to a listener returns once its queue has the connection,
   before any `accept`; a nonblocking one is `EINPROGRESS`, as on Linux.
-  One that finds the queue full waits until `accept` makes room.
+  One that finds the queue full is dropped, and the client tries again 1,
+  2, 3, 4, 5, 7, 11, 19, 35 and 67 seconds after it began, as Linux with
+  its default `tcp_syn_linear_timeouts` (4) does: the try finds whatever
+  listens there then, is dropped again while the queue is still full, is
+  refused (`ECONNREFUSED`) where none listens, and at 131 seconds the
+  client gives up with `ETIMEDOUT`. A blocking `connect` waits at most
+  `SO_SNDTIMEO`, and is then `EINPROGRESS`, or `EALREADY` once one was in
+  progress.
 - **`accept`** and **`accept4`** (`SOCK_NONBLOCK`, `SOCK_CLOEXEC`) give
   the first connection waiting and its peer's address; they wait unless
   the listener is nonblocking, until `SO_RCVTIMEO` (`EAGAIN`). The

@@ -49,6 +49,15 @@ const ENOTCONN: Errno = Errno(107);
 const EALREADY: Errno = Errno(114);
 const EINPROGRESS: Errno = Errno(115);
 const ECONNREFUSED: Errno = Errno(111);
+const ETIMEDOUT: Errno = Errno(110);
+/// When a client sends a dropped handshake again, in seconds after its
+/// first: Linux's 1-second `TCP_TIMEOUT_INIT`, the first four times as it
+/// is (`tcp_syn_linear_timeouts`), then doubled each time.
+const SYN_RETRIES: [u64; 10] = [1, 2, 3, 4, 5, 7, 11, 19, 35, 67];
+/// When the client gives up with `ETIMEDOUT`, in seconds after its first:
+/// the next try's time, past the 127 seconds that `tcp_syn_retries` (6)
+/// allows (`retransmits_timed_out`).
+const SYN_TIMEOUT: u64 = 131;
 const EMSGSIZE: Errno = Errno(90);
 /// Linux's default `net.core.somaxconn`, the most a `listen` backlog is.
 const SOMAXCONN: u32 = 4096;
@@ -274,6 +283,9 @@ pub(crate) struct Network {
     /// Locked after a socket's state, never before.
     tcp_ports: Mutex<Ports>,
     udp_ports: Mutex<Ports>,
+    /// The loopback connections whose handshake a full queue dropped, to be
+    /// tried again. Taken out before any socket's state is locked.
+    syns: Mutex<Vec<Syn>>,
 }
 impl Network {
     pub(crate) fn new(policy: NetworkPolicy) -> Self {
@@ -283,6 +295,7 @@ impl Network {
             lookups: Mutex::default(),
             tcp_ports: Mutex::default(),
             udp_ports: Mutex::default(),
+            syns: Mutex::default(),
         }
     }
     fn ports(&self, datagram: bool) -> MutexGuard<'_, Ports> {
@@ -479,23 +492,38 @@ struct Listen {
     /// The most connections waiting, less one (`sk_max_ack_backlog`).
     backlog: usize,
     ready: VecDeque<Arc<InetSocket>>,
-    /// Connections that found the queue full. Linux drops their handshake
-    /// and the client tries again; here they wait for room.
-    pending: VecDeque<Pending>,
     arrivals: u64,
 }
-struct Pending {
+/// A loopback connection whose handshake found the listener's queue full,
+/// which Linux drops (`tcp_conn_request`): the client sends it again at
+/// [`SYN_RETRIES`] after `start`, to whatever listens at `to` then.
+struct Syn {
     stream: Weak<Stream>,
     link: Arc<OnceLock<Arc<Link>>>,
     from: SocketAddr,
     to: SocketAddr,
+    start: u64,
+    /// How many of [`SYN_RETRIES`] it has made.
+    tries: usize,
+}
+impl Syn {
+    /// When it is next tried, or after the last try given up.
+    fn next(&self) -> u64 {
+        let seconds = SYN_RETRIES.get(self.tries).copied().unwrap_or(SYN_TIMEOUT);
+        self.start.saturating_add(seconds * 1_000_000_000)
+    }
+}
+/// What a handshake found.
+enum Knock {
+    Taken,
+    Full,
+    Refused,
 }
 impl Listen {
     fn new(backlog: usize) -> Self {
         Self {
             backlog,
             ready: VecDeque::new(),
-            pending: VecDeque::new(),
             arrivals: 0,
         }
     }
@@ -503,18 +531,11 @@ impl Listen {
         self.ready.len() <= self.backlog
     }
     /// Ends listening, as Linux's `inet_csk_listen_stop`: each connection
-    /// not yet accepted is reset, and each waiting for room refused, as its
-    /// next try would be.
+    /// not yet accepted is reset. One whose handshake was dropped learns at
+    /// its next try.
     fn stop(self) {
         for child in self.ready {
             child.abort();
-        }
-        for pending in self.pending {
-            if let Some(stream) = pending.stream.upgrade()
-                && stream.phase() == Phase::Connecting
-            {
-                stream.fail(ECONNREFUSED);
-            }
         }
     }
 }
@@ -850,6 +871,7 @@ impl InetSocket {
         };
         let options = *self.options();
         let wait = crate::sockets::wait_for(c, self.timeout(false))?;
+        self.retry_syns();
         let stream = {
             let mut s = self.lock();
             s.note();
@@ -919,6 +941,7 @@ impl InetSocket {
         };
         loop {
             let ticket = c.files.readiness.token.value();
+            self.retry_syns();
             match stream.phase() {
                 Phase::Open => {
                     self.lock().connection = Connection::Connected;
@@ -933,9 +956,12 @@ impl InetSocket {
                     return Err(error);
                 }
                 Phase::Connecting if self.nonblocking() => return Err(pending),
+                // Past `SO_SNDTIMEO`, Linux's `__inet_stream_connect` gives
+                // the error of the state it found: `EALREADY` once one was
+                // in progress.
                 Phase::Connecting => {
                     let Some(deadline) = wait.deadline(c)? else {
-                        return Err(EINPROGRESS);
+                        return Err(pending);
                     };
                     crate::events::wait(c, ticket, deadline)?;
                 }
@@ -1376,17 +1402,15 @@ impl InetSocket {
         // Linux takes the int as unsigned, so a negative one is the most.
         let backlog = (backlog as u32).min(SOMAXCONN) as usize;
         let options = *self.options();
+        // Tries due before this listener began meet what was there.
+        self.retry_syns();
         let mut s = self.lock();
         if s.stream.is_some() {
             return Err(Errno::EINVAL);
         }
+        // A dropped handshake still waits for its next try.
         if let Some(listen) = s.listen.as_mut() {
             listen.backlog = backlog;
-            let admitted = self.admit(listen, options);
-            drop(s);
-            if admitted {
-                self.arrived();
-            }
             return Ok(0);
         }
         {
@@ -1411,19 +1435,14 @@ impl InetSocket {
         let wait = crate::sockets::wait_for(c, self.timeout(true))?;
         loop {
             let ticket = c.files.readiness.token.value();
-            let options = *self.options();
-            let (child, admitted) = {
+            self.retry_syns();
+            let child = {
                 let mut s = self.lock();
                 let Some(listen) = s.listen.as_mut() else {
                     return Err(Errno::EINVAL);
                 };
-                let child = listen.ready.pop_front();
-                let admitted = child.is_some() && self.admit(listen, options);
-                (child, admitted)
+                listen.ready.pop_front()
             };
-            if admitted {
-                self.arrived();
-            }
             if let Some(child) = child {
                 return Ok(child);
             }
@@ -1436,26 +1455,91 @@ impl InetSocket {
             crate::events::wait(c, ticket, deadline)?;
         }
     }
-    /// Takes the connections that found the queue full into it while it
-    /// has room; whether any came.
-    fn admit(&self, listen: &mut Listen, options: Options) -> bool {
-        let mut any = false;
-        while listen.has_room() {
-            let Some(pending) = listen.pending.pop_front() else {
-                break;
-            };
-            let Some(stream) = pending.stream.upgrade() else {
+    /// Sends again the dropped handshakes whose time has come, in the
+    /// order of their tries: each reaches the listener at its address then,
+    /// is dropped again while its queue is full, and is refused where none
+    /// listens; after the last try the client gives up with `ETIMEDOUT`.
+    /// Called with no socket's state locked.
+    fn retry_syns(&self) {
+        let Some(now) = self.now() else { return };
+        let due = |syn: &Syn| syn.next() <= now;
+        let mut syns: Vec<Syn> = {
+            let mut syns = self
+                .network
+                .syns
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            syns.extract_if(.., |syn| due(syn)).collect()
+        };
+        while !syns.is_empty() {
+            let next = syns
+                .iter()
+                .enumerate()
+                .filter(|(_, syn)| due(syn))
+                .min_by_key(|(_, syn)| syn.next())
+                .map(|(i, _)| i);
+            let Some(i) = next else { break };
+            let syn = &mut syns[i];
+            let Some(stream) = syn
+                .stream
+                .upgrade()
+                .filter(|stream| stream.phase() == Phase::Connecting && !stream.finished().1)
+            else {
+                syns.swap_remove(i);
                 continue;
             };
-            if stream.phase() != Phase::Connecting || stream.finished().1 {
+            if syn.tries == SYN_RETRIES.len() {
+                stream.fail(ETIMEDOUT);
+                syns.swap_remove(i);
                 continue;
             }
-            let child = self.child(options, &stream, &pending.link, pending.from, pending.to);
-            listen.ready.push_back(child);
-            listen.arrivals += 1;
-            any = true;
+            syn.tries += 1;
+            match self.knock(&stream, &syn.link, syn.from, syn.to) {
+                Knock::Full => {}
+                Knock::Taken => {
+                    syns.swap_remove(i);
+                }
+                Knock::Refused => {
+                    stream.fail(ECONNREFUSED);
+                    syns.swap_remove(i);
+                }
+            }
         }
-        any
+        if !syns.is_empty() {
+            let mut kept = self
+                .network
+                .syns
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            kept.extend(syns);
+        }
+    }
+    /// A handshake from `stream` at `from` to `to` on the loopback: the
+    /// listener there takes it into its queue when it has room.
+    fn knock(
+        &self,
+        stream: &Arc<Stream>,
+        link: &OnceLock<Arc<Link>>,
+        from: SocketAddr,
+        to: SocketAddr,
+    ) -> Knock {
+        let Some(listener) = self.ports().listener(to) else {
+            return Knock::Refused;
+        };
+        let theirs = *listener.options();
+        let mut state = listener.lock();
+        let Some(listen) = state.listen.as_mut() else {
+            return Knock::Refused;
+        };
+        if !listen.has_room() {
+            return Knock::Full;
+        }
+        let child = listener.child(theirs, stream, link, from, to);
+        listen.ready.push_back(child);
+        listen.arrivals += 1;
+        drop(state);
+        listener.arrived();
+        Knock::Taken
     }
     /// A connection came to this listener: `POLL_IN` and a wake, as
     /// Linux's `sk_data_ready` of a listener.
@@ -1493,7 +1577,8 @@ impl InetSocket {
         child
     }
     /// A connection to `to` on the guest's loopback, when a guest socket
-    /// listens there: in its listener's queue, or waiting for room in it.
+    /// listens there: in its listener's queue, or, when that is full, to be
+    /// tried again ([`InetSocket::retry_syns`]).
     /// `None` when none listens there.
     fn open_loopback(
         &self,
@@ -1523,17 +1608,24 @@ impl InetSocket {
             let child = listener.child(theirs, &stream, &link, from, to);
             listen.ready.push_back(child);
             listen.arrivals += 1;
-        } else {
-            listen.pending.push_back(Pending {
-                stream: Arc::downgrade(&stream),
-                link,
-                from,
-                to,
-            });
         }
         drop(state);
         if arrived {
             listener.arrived();
+        } else if let Some(start) = self.now() {
+            let mut syns = self
+                .network
+                .syns
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            syns.push(Syn {
+                stream: Arc::downgrade(&stream),
+                link,
+                from,
+                to,
+                start,
+                tries: 0,
+            });
         }
         Ok(Some(stream))
     }
@@ -1722,6 +1814,7 @@ impl FileHandle for InetSocket {
                 | (u32::from(s.read_shut && s.write_shut) * POLLHUP);
             return Ok((OUT | (u32::from(ready) * IN) | error | ends, s.received, 0));
         }
+        self.retry_syns();
         let mut s = self.lock();
         // A listener is readable while a connection waits, and no more
         // (`inet_csk_listen_poll`).

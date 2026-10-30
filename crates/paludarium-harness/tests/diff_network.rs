@@ -173,6 +173,10 @@ mod linux {
         case("listen-reset");
     }
     #[test]
+    fn network_listen_time_wait() {
+        case("listen-time-wait");
+    }
+    #[test]
     fn network_listen_fork() {
         case("listen-fork");
     }

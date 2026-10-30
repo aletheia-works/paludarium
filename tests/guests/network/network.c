@@ -684,6 +684,80 @@ int main(int argc, char **argv) {
         call("udp-accept", accept(u, NULL, NULL));
         return 0;
     }
+    if (!strcmp(mode, "listen-time-wait")) {
+        /* The side that closes a loopback connection first keeps its port in
+           TIME_WAIT: a bind there is EADDRINUSE, with SO_REUSEADDR too
+           unless the closed socket had it, while the side that closed
+           second keeps nothing. A reset leaves nothing held. */
+        int port, result, one = 1;
+        int l = listener(8, &port);
+        int c = client(port, 0, &result);
+        int s = accept(l, NULL, NULL);
+        int client_port = port_of(c);
+        close(c);
+        await_end(s);
+        close(s);
+        int t = tcp(0);
+        bind_to("client-first", t, htonl(INADDR_LOOPBACK), client_port);
+        close(t);
+        t = tcp(0);
+        setsockopt(t, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        bind_to("client-first-reuse", t, htonl(INADDR_LOOPBACK), client_port);
+        close(t);
+        t = tcp(0);
+        bind_to("client-first-any", t, htonl(INADDR_ANY), client_port);
+        close(t);
+        /* The client closes first while the server stays open: held too,
+           until the server's send is answered with a reset. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        int open_port = port_of(c);
+        close(c);
+        await_end(s);
+        t = tcp(0);
+        bind_to("peer-open", t, htonl(INADDR_LOOPBACK), open_port);
+        call("send-to-closed", send(s, "x", 1, MSG_NOSIGNAL));
+        polled("answered", s, POLLERR);
+        bind_to("after-reset", t, htonl(INADDR_LOOPBACK), open_port);
+        close(t);
+        close(s);
+        /* Closed with input unread: a reset, and nothing held. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        int unread_port = port_of(c);
+        send(s, "x", 1, 0);
+        polled("unread", c, POLLIN);
+        close(c);
+        polled("reset", s, POLLERR);
+        close(s);
+        t = tcp(0);
+        bind_to("after-unread", t, htonl(INADDR_LOOPBACK), unread_port);
+        close(t);
+        close(l);
+        /* The server closes first: the listener's port is held, and only a
+           socket with SO_REUSEADDR shares it, as the closed one had it. */
+        l = tcp(0);
+        setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        struct sockaddr_in any = to(0);
+        bind(l, (void *)&any, sizeof any);
+        listen(l, 8);
+        port = port_of(l);
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        close(s);
+        await_end(c);
+        close(c);
+        close(l);
+        t = tcp(0);
+        bind_to("server-first", t, htonl(INADDR_LOOPBACK), port);
+        close(t);
+        t = tcp(0);
+        setsockopt(t, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        bind_to("server-first-reuse", t, htonl(INADDR_LOOPBACK), port);
+        call("server-first-listen", listen(t, 1));
+        close(t);
+        return 0;
+    }
     if (!strcmp(mode, "listen-reset")) {
         /* What ends a loopback connection with a reset. */
         int port, result;

@@ -593,6 +593,12 @@ one only with an `--allow-net`.
   the first connection waiting and its peer's address; they wait unless
   the listener is nonblocking, until `SO_RCVTIMEO` (`EAGAIN`). The
   accepted socket takes the listener's options.
+- **`TIME_WAIT`**: the side that closes a connection first, a client or
+  an accepted connection, holds its port for 60 seconds, as Linux's
+  `TCP_TIMEWAIT_LEN`: a `bind` there is `EADDRINUSE`, also with
+  `SO_REUSEADDR` unless the closed socket had it too (an accepted one has
+  its listener's). The side that closes second holds nothing, and a reset
+  (below), also one answering a send to the closed side, ends the hold.
 - **Resets**, as on Linux: closing a socket with unread input or a zero
   `SO_LINGER` time, disconnecting with `AF_UNSPEC`, or closing a listener
   with connections it has not handed out resets the peer (`ECONNRESET`

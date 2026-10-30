@@ -14,18 +14,28 @@ use crate::inet::InetSocket;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use paludarium_host::net::{Driver, Phase, Stream};
 use paludarium_types::Errno;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 const EADDRINUSE: Errno = Errno(98);
 const ECONNRESET: Errno = Errno(104);
 /// Linux's default `net.ipv4.ip_local_port_range`.
 const EPHEMERAL: core::ops::RangeInclusive<u16> = 32768..=60999;
+/// How long the side that closed a connection first keeps its port, in
+/// nanoseconds: Linux's `TCP_TIMEWAIT_LEN`.
+pub(crate) const TIME_WAIT: u64 = 60_000_000_000;
+/// [`Link::first`] before either side has ended, and once one was reset.
+const NO_SIDE: u8 = 2;
+const RESET: u8 = 3;
 
 /// The two streams of a connection between guest sockets.
 pub(crate) struct Link {
     /// `None` once both sides have closed, or one was reset, so that the
     /// streams, which hold the link as their driver, are freed.
     ends: Mutex<Option<Ends>>,
+    /// The side whose end reached the other first, kept after `ends` goes;
+    /// [`NO_SIDE`] before, [`RESET`] once either side was reset.
+    first: AtomicU8,
 }
 struct Ends {
     streams: [Arc<Stream>; 2],
@@ -48,6 +58,7 @@ impl Link {
                 streams: [Arc::clone(client), Arc::clone(server)],
                 ended: [false; 2],
             })),
+            first: AtomicU8::new(NO_SIDE),
         });
         client.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
         server.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
@@ -66,6 +77,7 @@ impl Link {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        self.first.store(RESET, Ordering::SeqCst);
         let Some(ends) = ends else { return };
         let (own, peer) = (&ends.streams[side], &ends.streams[1 - side]);
         if !gone(peer) {
@@ -73,6 +85,14 @@ impl Link {
             peer.fail(if waiting { Errno::EPIPE } else { ECONNRESET });
         }
         own.close();
+    }
+    /// Whether `side` ended the connection first, with neither side reset:
+    /// the side Linux keeps in `TIME_WAIT` once it closes.
+    pub(crate) fn closed_first(&self, side: usize) -> bool {
+        usize::from(self.first.load(Ordering::SeqCst)) == side
+    }
+    fn was_reset(&self) -> bool {
+        self.first.load(Ordering::SeqCst) == RESET
     }
     /// Moves what each side sends to the other, as far as the other's
     /// buffer takes it, and each side's end once its bytes have gone. A
@@ -88,6 +108,9 @@ impl Link {
             }
             if gone(peer) {
                 if own.queued().1 > 0 {
+                    // The closed side answers with a reset, which ends its
+                    // `TIME_WAIT` too.
+                    self.first.store(RESET, Ordering::SeqCst);
                     own.take(usize::MAX);
                     own.fail(if ends.ended[1 - from] {
                         Errno::EPIPE
@@ -107,6 +130,12 @@ impl Link {
             let (shut, closed) = own.finished();
             if (shut || (closed && own.queued().1 == 0)) && !ends.ended[from] {
                 ends.ended[from] = true;
+                let _ = self.first.compare_exchange(
+                    NO_SIDE,
+                    from as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
                 peer.end();
             }
         }
@@ -142,6 +171,16 @@ pub(crate) struct Binding {
     /// A connected UDP socket's peer, the only sender it receives from.
     pub(crate) peer: Option<SocketAddr>,
     pub(crate) owner: Weak<InetSocket>,
+    /// A closed connection's hold in `TIME_WAIT`, after its socket has
+    /// gone.
+    pub(crate) time_wait: Option<TimeWait>,
+}
+/// When a hold in `TIME_WAIT` ends, and its connection, whose reset ends it
+/// sooner.
+#[derive(Clone)]
+pub(crate) struct TimeWait {
+    until: u64,
+    link: Arc<Link>,
 }
 impl Binding {
     fn carries(&self, ip: IpAddr) -> bool {
@@ -177,7 +216,7 @@ impl Binding {
             && !(self.reuse_port && other.reuse_port)
     }
     fn is(&self, owner: &Weak<InetSocket>) -> bool {
-        Weak::ptr_eq(&self.owner, owner)
+        self.time_wait.is_none() && Weak::ptr_eq(&self.owner, owner)
     }
 }
 
@@ -196,10 +235,34 @@ impl Default for Ports {
     }
 }
 impl Ports {
-    /// Forgets the sockets that have gone.
+    /// Forgets the sockets that have gone, but for those in `TIME_WAIT`.
     fn live(&mut self) {
         self.bindings
-            .retain(|binding| binding.owner.strong_count() > 0);
+            .retain(|binding| binding.owner.strong_count() > 0 || binding.time_wait.is_some());
+    }
+    /// Forgets the holds in `TIME_WAIT` that have ended by `now`, or whose
+    /// connection was reset.
+    pub(crate) fn expire(&mut self, now: u64) {
+        self.bindings.retain(|binding| {
+            binding
+                .time_wait
+                .as_ref()
+                .is_none_or(|wait| wait.until > now && !wait.link.was_reset())
+        });
+    }
+    /// `owner`, which closed `link` first, keeps its port in `TIME_WAIT`
+    /// until `until`, as it was, with its `SO_REUSEADDR`: Linux's
+    /// `inet_twsk_hashdance` puts a `TIME_WAIT` socket in its bind bucket.
+    pub(crate) fn linger(&mut self, owner: &Weak<InetSocket>, link: &Arc<Link>, until: u64) {
+        for binding in &mut self.bindings {
+            if binding.is(owner) {
+                binding.owner = Weak::new();
+                binding.time_wait = Some(TimeWait {
+                    until,
+                    link: Arc::clone(link),
+                });
+            }
+        }
     }
     /// Takes `binding`'s port, or with port 0 the next free ephemeral one;
     /// `EADDRINUSE` when it conflicts, or no ephemeral port is free.
@@ -418,6 +481,7 @@ mod tests {
             listening: false,
             peer: None,
             owner: Weak::new(),
+            time_wait: None,
         }
     }
 

@@ -495,7 +495,7 @@ struct Datagram {
 }
 /// What a datagram of `len` bytes on the loopback takes of the receive
 /// buffer, as x86-64 Linux 7.0 counts its `skb->truesize`: the `sk_buff`
-/// (256 bytes) and its head, from the 640-byte small head cache or the
+/// (256 bytes) and its head, from the small head cache or the
 /// smallest power of two that holds the headers, the bytes, the room
 /// `__ip_append_data` (or `__ip6_append_data`) reserves and the
 /// `skb_shared_info`, or past `SKB_MAX_ALLOC` a small head and the bytes in
@@ -503,7 +503,9 @@ struct Datagram {
 /// as two fragments, reassembled.
 fn truesize(len: usize, ipv4: bool) -> usize {
     const SKB: usize = 256;
-    const SMALL_HEAD: usize = 640;
+    // `SKB_SMALL_HEAD_SIZE`, which `MAX_HEADER` sizes: 704 bytes on the CI
+    // runner's kernel, built with Hyper-V's networking (640 on Docker's).
+    const SMALL_HEAD: usize = 704;
     const SHARED_INFO: usize = 320;
     const MAX_ALLOC: usize = 16_384 - SHARED_INFO;
     const MTU: usize = 65_536;
@@ -3047,16 +3049,18 @@ mod tests {
 
     #[test]
     fn datagrams_take_what_linux_counts() {
-        // `rx_queue` in /proc/net/udp and udp6 after one datagram of each
-        // length on x86-64 Linux 7.0's loopback.
+        // What the CI runner's x86-64 Linux 7.0 (`7.0.0-1017-azure`) takes
+        // for one datagram of each length: the heads and their buckets as
+        // `rx_queue` in /proc/net/udp and udp6 showed them on Linux 7.0, with
+        // the runner's 704-byte small head cache, which its fit counts in
+        // `udp-rcvbuf` give.
         let measured: &[(usize, usize, usize)] = &[
-            (0, 896, 896),
-            (241, 896, 896),
-            (242, 896, 896),
-            (260, 896, 1280),
-            (261, 896, 1280),
-            (262, 1280, 1280),
-            (625, 1280, 1280),
+            (0, 960, 960),
+            (241, 960, 960),
+            (312, 960, 960),
+            (313, 960, 1280),
+            (325, 960, 1280),
+            (326, 1280, 1280),
             (645, 1280, 2304),
             (646, 2304, 2304),
             (1500, 2304, 2304),
@@ -3067,18 +3071,18 @@ mod tests {
             (7808, 8448, 16640),
             (7833, 16640, 16640),
             (15985, 16640, 16640),
-            (16000, 16640, 16896),
-            (16004, 16640, 16900),
-            (16005, 16901, 16901),
-            (32000, 32896, 32896),
-            (65488, 66384, 66384),
-            (65489, 66385, 67272),
-            (65507, 66403, 67272),
+            (16000, 16640, 16960),
+            (16004, 16640, 16964),
+            (16005, 16965, 16965),
+            (32000, 32960, 32960),
+            (65488, 66448, 66448),
+            (65489, 66449, 67400),
+            (65507, 66467, 67400),
         ];
         for &(len, ipv4, ipv6) in measured {
             assert_eq!(truesize(len, true), ipv4, "IPv4, {len} bytes");
             assert_eq!(truesize(len, false), ipv6, "IPv6, {len} bytes");
         }
-        assert_eq!(truesize(65527, false), 67272);
+        assert_eq!(truesize(65527, false), 67400);
     }
 }

@@ -9,7 +9,7 @@
     "preview": "bun --bun vitepress preview"
   },
   "devDependencies": {
-    "@aletheia-works/paludarium-wasm": "0.4.0",
+    "@aletheia-works/paludarium-wasm": "0.5.0",
     "coi-serviceworker": "0.1.7",
     "vitepress": "1.6.4"
   }

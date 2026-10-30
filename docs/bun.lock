@@ -5,14 +5,14 @@
     "": {
       "name": "paludarium-docs",
       "devDependencies": {
-        "@aletheia-works/paludarium-wasm": "0.4.0",
+        "@aletheia-works/paludarium-wasm": "0.5.0",
         "coi-serviceworker": "0.1.7",
         "vitepress": "1.6.4",
       },
     },
   },
   "packages": {
-    "@aletheia-works/paludarium-wasm": ["@aletheia-works/paludarium-wasm@0.4.0", "", {}, "sha512-YTzGa5Nr1/Ge1KllZirPmGyMsOzwc50RcoI5q3vDFfkrHdENFrL6tzQn7zriW6ibYKprTBdIgmfPWBzchQshRA=="],
+    "@aletheia-works/paludarium-wasm": ["@aletheia-works/paludarium-wasm@0.5.0", "", {}, "sha512-yM7wP5nIpwSKO5/bezDnWCHUKga+C7D9s8q0jIxi0QC9k2BgDsNWcDccRC51E99ZrNS2gv/Qm5owMueLgLxWCg=="],
 
     "@algolia/abtesting": ["@algolia/abtesting@1.26.0", "", { "dependencies": { "@algolia/client-common": "5.60.0", "@algolia/requester-browser-xhr": "5.60.0", "@algolia/requester-fetch": "5.60.0", "@algolia/requester-node-http": "5.60.0" } }, "sha512-h6ff/as504npvSqhLlh1qw3B8lFktXgr6AOL5vkP4WCLU1oH+VCBh2K4x4Kvewnwr7kchH6HgLm3CcS8ZAYi8A=="],
 

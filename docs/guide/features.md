@@ -545,7 +545,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_PRIORITY`, `SO_BROADCAST`, `SO_OOBINLINE`, `TCP_NODELAY` (which reaches
     the host), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_QUICKACK`,
     `TCP_USER_TIMEOUT`, `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and
-    range checks.
+    range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
+    `wmem_max` and `rmem_max` (212992), doubled.
 - **Name resolution**: a built-in DNS stub answers the UDP queries a guest's
   resolver sends to port 53, at any address: the server of
   `/etc/resolv.conf`, or its default. It answers `A` and `AAAA` questions
@@ -659,7 +660,11 @@ one only with an `--allow-net`.
   `AF_UNSPEC` disconnects it, keeping only the port and address the guest
   bound itself. A datagram holds up to 65507 bytes over IPv4 and 65527 over
   IPv6 (`EMSGSIZE`), may be empty, and is cut to the reader's buffer
-  (`MSG_TRUNC`); `FIONREAD` gives the first one's length. Where no socket
+  (`MSG_TRUNC`); `FIONREAD` gives the first one's length. Each takes of the
+  receive buffer what x86-64 Linux 7.0 counts as its `sk_buff`'s
+  `truesize`, and one that would take it past `SO_RCVBUF` while another
+  waits is dropped, as `__udp_enqueue_schedule_skb` drops it; an empty
+  buffer takes one of any size. Where no socket
   takes it, the loopback's ICMP answer reaches a socket connected there:
   its next send or receive is `ECONNREFUSED`, once, as `SO_ERROR` and
   `POLLERR` show. A datagram to port 53 that no guest socket takes goes to

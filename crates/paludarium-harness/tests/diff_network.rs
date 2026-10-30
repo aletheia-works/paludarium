@@ -198,6 +198,10 @@ mod linux {
         case("listen-urgent");
     }
     #[test]
+    fn network_udp_rcvbuf() {
+        case("udp-rcvbuf");
+    }
+    #[test]
     fn network_listen_fork() {
         case("listen-fork");
     }

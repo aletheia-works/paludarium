@@ -23,9 +23,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     持たないためで、Linux は経路の送り元のアドレスで取ります。そのため
     `getsockname` は未指定のアドレスを返し、そのポートをループバックのアドレスで
     `bind` すると `EADDRINUSE` になります（Linux では `bind` できます）。
-    データグラムは、そのバイトと 768 バイトを `SO_RCVBUF` から取ります。Linux は `sk_buff` の分を数えるので、
-    いっぱいになって捨てる点が違います。マルチキャストとブロードキャストの
-    データグラムは、どこにも届きません。raw ソケットは `EPERM`、ICMP のソケットは
+    マルチキャストとブロードキャストのデータグラムは、どこにも届きません。raw ソケットは `EPERM`、ICMP のソケットは
     `EACCES`、ほかの種類（Linux がモジュールを読み込んで作る SCTP の
     `SOCK_SEQPACKET` など）は `ESOCKTNOSUPPORT` です。
   - `socket(AF_UNIX)` はこれまでどおり `EAFNOSUPPORT` で、ソケットのペアへの

@@ -1305,7 +1305,7 @@ impl Default for Options {
 /// A socket buffer size as `SO_SNDBUF` or `SO_RCVBUF` sets it: capped at
 /// `MAX_BUFFER` unless forced, doubled for Linux's bookkeeping, and at least
 /// `least`.
-fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
+pub(crate) fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
     let value = value.cast_unsigned();
     let value = if forced { value } else { value.min(MAX_BUFFER) };
     i32::try_from(value.saturating_mul(2))

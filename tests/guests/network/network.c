@@ -1474,6 +1474,56 @@ int main(int argc, char **argv) {
         printf("  mapped port-ok=%d\n", port_of(v6) != 0);
         return 0;
     }
+    if (!strcmp(mode, "udp-rcvbuf")) {
+        /* How many datagrams a UDP socket's receive buffer takes: each
+           counts its sk_buff's truesize, and one that would take the buffer
+           past SO_RCVBUF while another waits is dropped
+           (__udp_enqueue_schedule_skb). SO_RCVBUF is doubled, and at least
+           2304; past rmem_max, which a machine may raise, it is not tried. */
+        static char data[65536];
+        int asked[] = {0, 1024, 4096, 10000, 100000};
+        for (unsigned i = 0; i < sizeof asked / sizeof *asked; i++) {
+            int u = socket(AF_INET, SOCK_DGRAM, 0), got;
+            socklen_t len = sizeof got;
+            setsockopt(u, SOL_SOCKET, SO_RCVBUF, &asked[i], sizeof asked[i]);
+            getsockopt(u, SOL_SOCKET, SO_RCVBUF, &got, &len);
+            printf("  rcvbuf %d -> %d\n", asked[i], got);
+            close(u);
+        }
+        int buffers[] = {1024, 2048, 4096, 10000};
+        int sizes[] = {0, 100, 261, 262, 645, 646, 1000, 3000, 9000, 16004, 16005, 30000};
+        for (int v6 = 0; v6 < 2; v6++)
+            for (unsigned b = 0; b < sizeof buffers / sizeof *buffers; b++)
+                for (unsigned k = 0; k < sizeof sizes / sizeof *sizes; k++) {
+                    int family = v6 ? AF_INET6 : AF_INET;
+                    int r = socket(family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+                    int s = socket(family, SOCK_DGRAM, 0);
+                    setsockopt(r, SOL_SOCKET, SO_RCVBUF, &buffers[b], sizeof buffers[b]);
+                    struct sockaddr_storage at = {0};
+                    socklen_t len;
+                    if (v6) {
+                        struct sockaddr_in6 *a = (void *)&at;
+                        a->sin6_family = AF_INET6;
+                        a->sin6_addr = in6addr_loopback;
+                        len = sizeof *a;
+                    } else {
+                        struct sockaddr_in *a = (void *)&at;
+                        a->sin_family = AF_INET;
+                        a->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                        len = sizeof *a;
+                    }
+                    bind(r, (void *)&at, len);
+                    getsockname(r, (void *)&at, &len);
+                    for (int n = 0; n < 64; n++) sendto(s, data, sizes[k], 0, (void *)&at, len);
+                    usleep(2000);
+                    int fit = 0;
+                    while (recv(r, data, sizeof data, 0) >= 0) fit++;
+                    printf("  v6=%d rcvbuf=%d size=%d fit=%d\n", v6, buffers[b], sizes[k], fit);
+                    close(r);
+                    close(s);
+                }
+        return 0;
+    }
     if (!strcmp(mode, "udp-shutdown")) {
         /* shutdown of a UDP socket: ENOTCONN unless it is connected, but
            shut all the same. A receive that would wait then ends with 0,

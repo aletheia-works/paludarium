@@ -508,7 +508,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `SO_BROADCAST`、`SO_OOBINLINE`、`TCP_NODELAY`（ホストにも伝えます）、
     `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
     `TCP_USER_TIMEOUT`、`IP_TOS`、`IPV6_V6ONLY`。既定値と範囲の確かめ方は Linux と
-    同じです。
+    同じで、`SO_SNDBUF` と `SO_RCVBUF` は既定の `wmem_max` と `rmem_max`（212992）までを
+    2 倍にします。
 - **名前解決**：組み込みの DNS の代わりが、ゲストのリゾルバが 53 番ポートへ送る UDP の
   問い合わせに、宛先のアドレスによらず答えます。宛先は `/etc/resolv.conf` のサーバー、
   またはその既定です。許可した名前の `A` と `AAAA` の問い合わせには、ホストが引いた
@@ -612,7 +613,10 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `AF_UNSPEC` で切断すると、ゲストが自分で `bind` したポートとアドレスだけが残ります。
   データグラムは IPv4 で 65507 バイト、IPv6 で 65527 バイトまでで（超えると
   `EMSGSIZE`）、空でもよく、読み手のバッファに切り詰められます（`MSG_TRUNC`）。
-  `FIONREAD` は最初のものの長さです。受け取るソケットがないときは、そこに接続した
+  `FIONREAD` は最初のものの長さです。それぞれは、x86-64 の Linux 7.0 が `sk_buff` の
+  `truesize` として数える分を受信バッファから取り、ほかのものが待っている間に
+  `SO_RCVBUF` を超えさせるものは、`__udp_enqueue_schedule_skb` と同じく捨てられます。
+  空のバッファは、どの大きさのものでも 1 つ取ります。受け取るソケットがないときは、そこに接続した
   ソケットにループバックの ICMP の答えが届き、次の送信か受信が 1 回だけ
   `ECONNREFUSED` になります（`SO_ERROR` と `POLLERR` にも出ます）。53 番ポートへの
   データグラムで、受け取るゲストのソケットがないものは、これまでどおり DNS の代わりに

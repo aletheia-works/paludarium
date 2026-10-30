@@ -490,10 +490,42 @@ struct Datagram {
     from: SocketAddr,
     seq: u64,
     bytes: Vec<u8>,
+    /// What it takes of the receive buffer ([`truesize`]).
+    size: usize,
 }
-/// What a datagram takes of the receive buffer besides its bytes: about a
-/// small `sk_buff`'s `truesize`.
-const DATAGRAM_OVERHEAD: usize = 768;
+/// What a datagram of `len` bytes on the loopback takes of the receive
+/// buffer, as x86-64 Linux 7.0 counts its `skb->truesize`: the `sk_buff`
+/// (256 bytes) and its head, from the 640-byte small head cache or the
+/// smallest power of two that holds the headers, the bytes, the room
+/// `__ip_append_data` (or `__ip6_append_data`) reserves and the
+/// `skb_shared_info`, or past `SKB_MAX_ALLOC` a small head and the bytes in
+/// page fragments. An IPv6 datagram too long for the loopback's MTU comes
+/// as two fragments, reassembled.
+fn truesize(len: usize, ipv4: bool) -> usize {
+    const SKB: usize = 256;
+    const SMALL_HEAD: usize = 640;
+    const SHARED_INFO: usize = 320;
+    const MAX_ALLOC: usize = 16_384 - SHARED_INFO;
+    const MTU: usize = 65_536;
+    // The IP and UDP headers, and the link header's room and the tail's
+    // (IPv4) or the fragment header's (IPv6).
+    let (headers, reserved) = if ipv4 { (28, 31) } else { (48, 24) };
+    if !ipv4 && len + headers > MTU {
+        // The first fragment holds what fits in eights; the rest is small.
+        let first = (MTU - headers - 8) & !7;
+        return 2 * (SKB + SMALL_HEAD) + first;
+    }
+    let head = len + headers + reserved;
+    if head >= MAX_ALLOC {
+        return SKB + SMALL_HEAD + len;
+    }
+    let data = head.next_multiple_of(64) + SHARED_INFO;
+    SKB + if data <= SMALL_HEAD {
+        SMALL_HEAD
+    } else {
+        data.next_power_of_two()
+    }
+}
 
 /// A listening socket's connections, as Linux's accept queue.
 struct Listen {
@@ -1303,21 +1335,25 @@ impl InetSocket {
         }
         Ok(bytes.len())
     }
-    /// A datagram from `from` arrives, unless the receive buffer is already
-    /// over `SO_RCVBUF`, when Linux's `__udp_enqueue_schedule_skb` drops it.
+    /// A datagram from `from` arrives, unless it would take the receive
+    /// buffer past `SO_RCVBUF` while another waits, when Linux's
+    /// `__udp_enqueue_schedule_skb` drops it: an empty buffer takes one of
+    /// any size, unless `SO_RCVBUF` is over half of `INT_MAX`.
     fn deliver(&self, from: SocketAddr, bytes: &[u8]) {
         let limit = usize::try_from(self.options().receive_buffer).unwrap_or(0);
+        let size = truesize(bytes.len(), from.is_ipv4());
         let mut s = self.lock();
-        if s.inbox_size > limit {
+        if s.inbox_size + size > limit && (s.inbox_size > 0 || limit > (i32::MAX >> 1) as usize) {
             return;
         }
         let seq = s.received;
         s.received += 1;
-        s.inbox_size += bytes.len() + DATAGRAM_OVERHEAD;
+        s.inbox_size += size;
         s.inbox.push_back(Datagram {
             from,
             seq,
             bytes: bytes.to_vec(),
+            size,
         });
         drop(s);
         self.signals.waking(Reason::In);
@@ -1360,8 +1396,9 @@ impl InetSocket {
             if answer {
                 s.queries.pop_front();
             } else {
-                s.inbox.pop_front();
-                s.inbox_size -= bytes.len() + DATAGRAM_OVERHEAD;
+                if let Some(datagram) = s.inbox.pop_front() {
+                    s.inbox_size -= datagram.size;
+                }
             }
         }
         let n = buf.len().min(bytes.len());
@@ -2466,8 +2503,10 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                     );
                 }
                 (1, 6) => options.broadcast = value != 0,
-                (1, 7) => options.send_buffer = (value.clamp(0, i32::MAX / 2) * 2).max(4608),
-                (1, 8) => options.receive_buffer = (value.clamp(0, i32::MAX / 2) * 2).max(2304),
+                // At most `wmem_max` and `rmem_max`, doubled for Linux's
+                // bookkeeping (`sk_setsockopt`).
+                (1, 7) => options.send_buffer = crate::sockets::buffer_size(value, false, 4608),
+                (1, 8) => options.receive_buffer = crate::sockets::buffer_size(value, false, 2304),
                 (1, 9) => options.keep_alive = value != 0,
                 (1, 10) => options.out_of_band_inline = value != 0,
                 (1, 12) => options.priority = value,
@@ -2999,5 +3038,42 @@ mod tests {
         assert_eq!(parse_address(Family::V6, &mapped[..20]), Err(Errno::EINVAL));
         assert_eq!(parse_address(Family::V6, &[0, 0]), Ok(None));
         assert_eq!(parse_address(Family::V6, &[0]), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn datagrams_take_what_linux_counts() {
+        // `rx_queue` in /proc/net/udp and udp6 after one datagram of each
+        // length on x86-64 Linux 7.0's loopback.
+        let measured: &[(usize, usize, usize)] = &[
+            (0, 896, 896),
+            (241, 896, 896),
+            (242, 896, 896),
+            (260, 896, 1280),
+            (261, 896, 1280),
+            (262, 1280, 1280),
+            (625, 1280, 1280),
+            (645, 1280, 2304),
+            (646, 2304, 2304),
+            (1500, 2304, 2304),
+            (1664, 2304, 4352),
+            (1689, 4352, 4352),
+            (3712, 4352, 8448),
+            (3737, 8448, 8448),
+            (7808, 8448, 16640),
+            (7833, 16640, 16640),
+            (15985, 16640, 16640),
+            (16000, 16640, 16896),
+            (16004, 16640, 16900),
+            (16005, 16901, 16901),
+            (32000, 32896, 32896),
+            (65488, 66384, 66384),
+            (65489, 66385, 67272),
+            (65507, 66403, 67272),
+        ];
+        for &(len, ipv4, ipv6) in measured {
+            assert_eq!(truesize(len, true), ipv4, "IPv4, {len} bytes");
+            assert_eq!(truesize(len, false), ipv6, "IPv6, {len} bytes");
+        }
+        assert_eq!(truesize(65527, false), 67272);
     }
 }

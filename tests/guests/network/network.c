@@ -721,6 +721,25 @@ int main(int argc, char **argv) {
         bind_to("after-reset", t, htonl(INADDR_LOOPBACK), open_port);
         close(t);
         close(s);
+        /* Closed with bytes the server has no room for yet: held while they
+           go, then in TIME_WAIT once read to the end; or freed by the reset
+           of a server that closes with them unread. */
+        static char lots[4096];
+        for (int drained = 1; drained >= 0; drained--) {
+            c = client(port, 0, &result);
+            s = accept(l, NULL, NULL);
+            int full_port = port_of(c);
+            while (send(c, lots, sizeof lots, MSG_DONTWAIT) > 0) {}
+            close(c);
+            t = tcp(0);
+            bind_to(drained ? "pending" : "pending-again", t, htonl(INADDR_LOOPBACK), full_port);
+            if (drained)
+                while (recv(s, lots, sizeof lots, 0) > 0) {}
+            close(s);
+            poll(NULL, 0, 100);
+            bind_to(drained ? "drained" : "unread-reset", t, htonl(INADDR_LOOPBACK), full_port);
+            close(t);
+        }
         /* Closed with input unread: a reset, and nothing held. */
         c = client(port, 0, &result);
         s = accept(l, NULL, NULL);

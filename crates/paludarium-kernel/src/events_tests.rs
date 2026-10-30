@@ -1215,6 +1215,23 @@ fn loopback_time_wait_holds_the_port_closed_first() {
     assert_eq!(f.ret(1, [server, DATA, 1, 0, 0, 0]), 1);
     assert_eq!(bind_on(&mut f, open_port, false), 0);
     assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    // Closed with bytes the peer has no room for yet: held while they go
+    // (Linux's `FIN_WAIT1`), then in `TIME_WAIT` once its end has reached
+    // the peer first; a reset, as the peer closes with them unread, ends it.
+    for drained in [true, false] {
+        let client = loopback_client(&mut f, port);
+        let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+        let full_port = port_of(&mut f, client);
+        while f.ret(44, [client, DATA + 0x400, 0x1000, 0x40, 0, 0]) == 0x1000 {}
+        assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(bind_on(&mut f, full_port, false), in_use);
+        if drained {
+            while f.ret(0, [server, DATA + 0x400, 0x1000, 0, 0, 0]) > 0 {}
+        }
+        assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+        let expected = if drained { in_use } else { 0 };
+        assert_eq!(bind_on(&mut f, full_port, false), expected);
+    }
     // A close with unread input resets: nothing is held.
     let client = loopback_client(&mut f, port);
     let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);

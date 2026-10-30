@@ -86,13 +86,13 @@ impl Link {
         }
         own.close();
     }
-    /// Whether `side` ended the connection first, with neither side reset:
-    /// the side Linux keeps in `TIME_WAIT` once it closes.
-    pub(crate) fn closed_first(&self, side: usize) -> bool {
-        usize::from(self.first.load(Ordering::SeqCst)) == side
-    }
-    fn was_reset(&self) -> bool {
-        self.first.load(Ordering::SeqCst) == RESET
+    /// Whether `side` ends the connection first, with neither side reset:
+    /// its end reached the other before the other's did, or neither has yet,
+    /// as when it closed with bytes still to send (Linux's `FIN_WAIT1` holds
+    /// the port too). Linux keeps that side in `TIME_WAIT` once it closes.
+    pub(crate) fn closes_first(&self, side: usize) -> bool {
+        let first = self.first.load(Ordering::SeqCst);
+        usize::from(first) == side || first == NO_SIDE
     }
     /// Moves what each side sends to the other, as far as the other's
     /// buffer takes it, and each side's end once its bytes have gone. A
@@ -175,12 +175,13 @@ pub(crate) struct Binding {
     /// gone.
     pub(crate) time_wait: Option<TimeWait>,
 }
-/// When a hold in `TIME_WAIT` ends, and its connection, whose reset ends it
-/// sooner.
+/// When a hold in `TIME_WAIT` ends, and its connection and side: a reset,
+/// or the other side's end reaching it first, ends it sooner.
 #[derive(Clone)]
 pub(crate) struct TimeWait {
     until: u64,
     link: Arc<Link>,
+    side: usize,
 }
 impl Binding {
     fn carries(&self, ip: IpAddr) -> bool {
@@ -241,25 +242,32 @@ impl Ports {
             .retain(|binding| binding.owner.strong_count() > 0 || binding.time_wait.is_some());
     }
     /// Forgets the holds in `TIME_WAIT` that have ended by `now`, or whose
-    /// connection was reset.
+    /// side no longer ends its connection first.
     pub(crate) fn expire(&mut self, now: u64) {
         self.bindings.retain(|binding| {
             binding
                 .time_wait
                 .as_ref()
-                .is_none_or(|wait| wait.until > now && !wait.link.was_reset())
+                .is_none_or(|wait| wait.until > now && wait.link.closes_first(wait.side))
         });
     }
-    /// `owner`, which closed `link` first, keeps its port in `TIME_WAIT`
-    /// until `until`, as it was, with its `SO_REUSEADDR`: Linux's
-    /// `inet_twsk_hashdance` puts a `TIME_WAIT` socket in its bind bucket.
-    pub(crate) fn linger(&mut self, owner: &Weak<InetSocket>, link: &Arc<Link>, until: u64) {
+    /// `owner`, which ends `link` first from `side`, keeps its port in
+    /// `TIME_WAIT` until `until`, as it was, with its `SO_REUSEADDR`:
+    /// Linux's `inet_twsk_hashdance` puts a `TIME_WAIT` socket in its bind
+    /// bucket.
+    pub(crate) fn linger(
+        &mut self,
+        owner: &Weak<InetSocket>,
+        (link, side): (&Arc<Link>, usize),
+        until: u64,
+    ) {
         for binding in &mut self.bindings {
             if binding.is(owner) {
                 binding.owner = Weak::new();
                 binding.time_wait = Some(TimeWait {
                     until,
                     link: Arc::clone(link),
+                    side,
                 });
             }
         }

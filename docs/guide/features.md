@@ -594,7 +594,8 @@ one only with an `--allow-net`.
   the listener is nonblocking, until `SO_RCVTIMEO` (`EAGAIN`). The
   accepted socket takes the listener's options.
 - **`TIME_WAIT`**: the side that closes a connection first, a client or
-  an accepted connection, holds its port for 60 seconds, as Linux's
+  an accepted connection, holds its port for 60 seconds from its `close`,
+  also while the bytes it sent are still on their way, as Linux's
   `TCP_TIMEWAIT_LEN`: a `bind` there is `EADDRINUSE`, also with
   `SO_REUSEADDR` unless the closed socket had it too (an accepted one has
   its listener's). The side that closes second holds nothing, and a reset

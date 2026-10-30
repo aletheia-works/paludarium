@@ -362,7 +362,9 @@ impl Ports {
         self.bindings.push(binding);
     }
     /// `owner`'s `SO_REUSEADDR` and `SO_REUSEPORT` now, which Linux reads
-    /// as they are when it checks a conflict.
+    /// as they are when it checks a conflict. A socket stays in the group it
+    /// joined, as `sock_setsockopt` only sets `sk_reuseport`; while it is
+    /// clear, the socket picks no other ([`Ports::shared`]).
     pub(crate) fn set_reuse(&mut self, owner: &Weak<InetSocket>, address: bool, port: bool) {
         for binding in &mut self.bindings {
             if binding.is(owner) {
@@ -415,6 +417,16 @@ impl Ports {
     /// the first to bind, or one of its group ([`pick`]).
     pub(crate) fn listener(&mut self, from: SocketAddr, to: SocketAddr) -> Option<Arc<InetSocket>> {
         self.live();
+        let best = self.best_listener(to)?;
+        self.shared(best, from, to, |_| true).owner.upgrade()
+    }
+    /// Whether a socket listens where a connection to `to` reaches.
+    pub(crate) fn listens(&mut self, to: SocketAddr) -> bool {
+        self.live();
+        self.best_listener(to).is_some()
+    }
+    /// The listener that ranks first for `to`, before its group.
+    fn best_listener(&self, to: SocketAddr) -> Option<&Binding> {
         let ip = to.ip();
         let score = |binding: &Binding| {
             if !binding.listening || binding.address.port() != to.port() || !binding.carries(ip) {
@@ -438,8 +450,7 @@ impl Ports {
                 best = Some((found, binding));
             }
         }
-        let (_, best) = best?;
-        self.shared(best, from, to, |_| true).owner.upgrade()
+        best.map(|(_, binding)| binding)
     }
     /// `best`, or when it shares its port with `SO_REUSEPORT` one of its
     /// group that `takes` from `from` to `to`.

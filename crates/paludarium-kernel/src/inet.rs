@@ -1603,13 +1603,21 @@ impl InetSocket {
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
         }
-        if self.ports().listener(to, to).is_none() {
+        if !self.ports().listens(to) {
             return Ok(None);
         }
         // Which of the sockets sharing the port takes it hangs on the port
         // the connection leaves from.
+        let bound = s.bound;
         let from = self.loopback_source(s, to, options)?;
         let Some(listener) = self.ports().listener(from, to) else {
+            // The listener closed meanwhile: the refused connect gives back
+            // the port it took, as Linux's `tcp_done` (`inet_put_port`).
+            match bound {
+                None => self.ports().unbind(&self.this),
+                Some(bound) => self.ports().rebind(&self.this, bound),
+            }
+            s.bound = bound;
             return Ok(None);
         };
         let theirs = *listener.options();

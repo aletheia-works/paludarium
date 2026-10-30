@@ -2509,7 +2509,7 @@ fn collect_garbage() {
         return;
     }
     let _one = COLLECTION.lock().unwrap_or_else(PoisonError::into_inner);
-    COLLECTING.set(true);
+    let _collecting = Collecting::start();
     let pairs: Vec<Arc<Pair>> = {
         let mut known = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
         known.retain(|pair| pair.strong_count() > 0);
@@ -2559,8 +2559,36 @@ fn collect_garbage() {
             }
         }
     }
+    // A pair whose queues no longer hold a socket leaves the registry, so
+    // that what each release looks through stays what is in flight.
+    IN_FLIGHT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|known| known.upgrade().is_some_and(|pair| holds_sockets(&pair)));
+    drop(pairs);
     drop(purged);
-    COLLECTING.set(false);
+}
+/// Whether a queue of `pair` holds a socket's descriptor.
+fn holds_sockets(pair: &Pair) -> bool {
+    let sides = pair.sides.lock().unwrap_or_else(PoisonError::into_inner);
+    sides
+        .iter()
+        .flat_map(|own| &own.writes)
+        .flat_map(|write| &write.passed)
+        .any(|descriptor| socket_end(&descriptor.file).is_some())
+}
+/// This thread's collection, which ends, even by a panic, with this.
+struct Collecting;
+impl Collecting {
+    fn start() -> Self {
+        COLLECTING.set(true);
+        Self
+    }
+}
+impl Drop for Collecting {
+    fn drop(&mut self) {
+        COLLECTING.set(false);
+    }
 }
 impl FileHandle for SocketPairEnd {
     fn as_any(&self) -> Option<&dyn std::any::Any> {

@@ -28,14 +28,19 @@ verified.
     Multicast and broadcast datagrams reach no one. Raw sockets are `EPERM`,
     ICMP sockets `EACCES`, and other kinds (SCTP's `SOCK_SEQPACKET`, which
     Linux loads a module for) `ESOCKTNOSUPPORT`.
-  - `socket(AF_UNIX, SOCK_DGRAM)` is `EAFNOSUPPORT`, and an AF_UNIX socket
+  - An AF_UNIX socket
     binds only to a name in the abstract namespace: `bind` to a path is
     `ENOSYS`, as `connect` and `bind` on a socket pair are, so a `connect`
     to a path finds no socket (`ENOENT`, or `ECONNREFUSED` for another
     file there). `SO_PEERCRED` of a connection names the connecting process
     on both sides, where Linux names the listener's to the client. The
     garbage collector does not look at a listener's connections not yet
-    accepted.
+    accepted. A datagram socket that connects elsewhere, or finds the
+    socket it was connected to gone, keeps its unread datagrams, which
+    Linux's `unix_dgram_disconnected` drops, giving that socket, if it was
+    connected back, `ECONNRESET`. A sender's datagrams are bounded by the
+    bytes the receiver has not read, not by the sender's `SO_SNDBUF`, and
+    `SIOCOUTQ` on a datagram socket is 0.
   - The DNS stub answers only `A` and `AAAA`, and ignores EDNS, so a
     datagram answer holds at most 512 bytes; a name the host cannot resolve
     is `SERVFAIL`. A TCP connection to port 53 always reaches the stub, never

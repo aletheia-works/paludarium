@@ -152,6 +152,22 @@ static void unix_poll(const char *name, int fd) {
     poll(&p, 1, 0);
     printf("%s revents=%#x\n", name, (unsigned)p.revents);
 }
+/* Receives a datagram on `fd` with recvfrom, `room` bytes for the address:
+   its length and data, and whether the address is `want`'s, or the length
+   of an unnamed one. */
+static void unix_from(const char *name, int fd, socklen_t room, const struct sockaddr_un *want, socklen_t want_len) {
+    struct sockaddr_un from;
+    char buf[16];
+    memset(&from, 0x55, sizeof from);
+    socklen_t len = room;
+    long n = recvfrom(fd, buf, sizeof buf, MSG_DONTWAIT, (void *)&from, &len);
+    printf("%s=%ld errno=%d data=%.*s", name, n, n < 0 ? errno : 0, n > 0 ? (int)n : 0, buf);
+    if (n >= 0 && want)
+        printf(" same=%d", len == want_len && !memcmp(&from, want, room < want_len ? room : want_len));
+    else if (n >= 0) printf(" len=%u", (unsigned)len);
+    printf(" untouched=%d\n", room < sizeof from && ((unsigned char *)&from)[room] == 0x55);
+    errno = 0;
+}
 /* Whether descriptors `a` and `b` are the same file. */
 static int same_file(int a, int b) {
     struct stat x, y;
@@ -3858,6 +3874,215 @@ int main(int argc, char **argv) {
         unlink(p.sun_path);
         unix_call("socket-protocol", socket(AF_UNIX, SOCK_STREAM, 2));
         unix_call("socket-type", socket(AF_UNIX, 4, 0));
+        return 0;
+    }
+    if (!strcmp(mode, "unix-datagram")) {
+        /* AF_UNIX datagram sockets from socket() (af_unix.c's
+           unix_dgram_*): names in the abstract namespace, which each type
+           has its own of, sendto and connect, who may send to a connected
+           socket, a queue full past net.unix.max_dgram_qlen (10), a peer
+           that goes, and the sender's address recvfrom and recvmsg give,
+           for streams and packet sockets too. */
+        signal(SIGPIPE, SIG_IGN);
+        struct sockaddr_un a, b, c;
+        socklen_t alen = unix_abstract(&a, "dgram-a"), blen = unix_abstract(&b, "dgram-b");
+        socklen_t clen = unix_abstract(&c, "dgram-c");
+        struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+        char buf[16];
+        int on = 1;
+        socklen_t on_len = sizeof on;
+        int u = socket(AF_UNIX, SOCK_DGRAM, 0);
+        unix_call("socket-ok", u >= 0 ? 0 : -1);
+        getsockopt(u, SOL_SOCKET, SO_TYPE, &on, &on_len);
+        printf("type=%d\n", on);
+        int raw = socket(AF_UNIX, SOCK_RAW, 0);
+        getsockopt(raw, SOL_SOCKET, SO_TYPE, &on, &on_len);
+        printf("raw-type=%d\n", on);
+        close(raw);
+        unix_name("name-unbound", u, 0, NULL, 0);
+        unix_name("peer-unbound", u, 1, NULL, 0);
+        unix_poll("unbound", u);
+        unix_call("send-unconnected", send(u, "x", 1, 0));
+        unix_call("write-unconnected", write(u, "x", 1));
+        unix_call("recv-empty", recv(u, buf, 1, MSG_DONTWAIT));
+        unix_call("listen", listen(u, 1));
+        unix_call("accept", accept(u, NULL, NULL));
+        unix_call("accept4-flags", syscall(SYS_accept4, u, NULL, NULL, 1));
+        unix_call("sendto-missing", sendto(u, "x", 1, 0, (void *)&a, alen));
+        unix_call("sendto-short", sendto(u, "x", 1, 0, (void *)&a, sizeof(sa_family_t)));
+        unix_call("connect-missing", connect(u, (void *)&a, alen));
+        unix_call("connect-short", connect(u, (void *)&a, 1));
+        unix_call("disconnect-unconnected", connect(u, &unspec, sizeof unspec));
+        struct ucred peer;
+        socklen_t peer_len = sizeof peer;
+        getsockopt(u, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len);
+        printf("peercred pid=%d uid=%d gid=%d\n", (int)peer.pid, (int)peer.uid, (int)peer.gid);
+        int pidfd;
+        socklen_t pidfd_len = sizeof pidfd;
+        unix_call("peerpidfd", getsockopt(u, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len));
+
+        int r = socket(AF_UNIX, SOCK_DGRAM, 0);
+        unix_call("bind", bind(r, (void *)&a, alen));
+        unix_name("name-bound", r, 0, &a, alen);
+        int stream = socket(AF_UNIX, SOCK_STREAM, 0);
+        unix_call("bind-other-type", bind(stream, (void *)&a, alen));
+        close(stream);
+        int o = socket(AF_UNIX, SOCK_DGRAM, 0);
+        unix_call("bind-in-use", bind(o, (void *)&a, alen));
+        unix_call("sendto-unbound", sendto(u, "one", 3, 0, (void *)&a, alen));
+        unix_poll("receiver", r);
+        unix_from("from-unbound", r, sizeof(struct sockaddr_un), NULL, 0);
+        unix_poll("receiver-empty", r);
+        unix_call("bind-b", bind(o, (void *)&b, blen));
+        unix_call("sendto-bound", sendto(o, "two", 3, 0, (void *)&a, alen));
+        unix_call("sendto-again", sendto(o, "2b", 2, 0, (void *)&a, alen));
+        unix_from("from-bound", r, sizeof(struct sockaddr_un), &b, blen);
+        unix_from("from-short", r, 4, &b, blen);
+        unix_call("sendto-message", sendto(o, "msg", 3, 0, (void *)&a, alen));
+        {
+            struct sockaddr_un from;
+            memset(&from, 0x55, sizeof from);
+            struct iovec iov = {buf, sizeof buf};
+            struct msghdr m = {.msg_name = &from, .msg_namelen = sizeof from, .msg_iov = &iov, .msg_iovlen = 1};
+            long n = recvmsg(r, &m, 0);
+            printf("recvmsg=%ld same=%d\n", n, m.msg_namelen == blen && !memcmp(&from, &b, blen));
+        }
+
+        unix_call("connect", connect(u, (void *)&a, alen));
+        unix_name("peer-connected", u, 1, &a, alen);
+        unix_poll("connected", u);
+        unix_call("send-connected", send(u, "three", 5, 0));
+        unix_call("write-connected", write(u, "3b", 2));
+        unix_from("from-connected", r, sizeof(struct sockaddr_un), NULL, 0);
+        unix_from("from-write", r, sizeof(struct sockaddr_un), NULL, 0);
+        unix_call("connect-r-to-b", connect(r, (void *)&b, blen));
+        unix_call("send-not-peer", send(u, "x", 1, 0));
+        unix_call("sendto-not-peer", sendto(u, "x", 1, 0, (void *)&a, alen));
+        int fresh = socket(AF_UNIX, SOCK_DGRAM, 0);
+        unix_call("connect-not-peer", connect(fresh, (void *)&a, alen));
+        unix_call("sendto-peer", sendto(o, "four", 4, 0, (void *)&a, alen));
+        unix_from("from-peer", r, sizeof(struct sockaddr_un), &b, blen);
+        unix_call("disconnect", connect(r, &unspec, sizeof unspec));
+        unix_name("peer-disconnected", r, 1, NULL, 0);
+        unix_call("send-after-disconnect", send(u, "five", 4, 0));
+        unix_from("from-after-disconnect", r, sizeof(struct sockaddr_un), NULL, 0);
+
+        /* The queue: ten wait, and the eleventh too, then it is full. */
+        int sent = 0;
+        long w = 0;
+        for (int i = 0; i < 12 && (w = send(u, "q", 1, MSG_DONTWAIT)) == 1; i++) sent++;
+        printf("queued=%d last=%ld errno=%d\n", sent, w, w < 0 ? errno : 0);
+        errno = 0;
+        unix_poll("sender-full", u);
+        unix_poll("receiver-full", r);
+        unix_call("sendto-full", sendto(o, "x", 1, MSG_DONTWAIT, (void *)&a, alen));
+        struct timeval brief = {0, 50000};
+        setsockopt(u, SOL_SOCKET, SO_SNDTIMEO, &brief, sizeof brief);
+        unix_call("send-timeout", send(u, "x", 1, 0));
+        unix_call("recv-one", recv(r, buf, sizeof buf, 0));
+        unix_poll("sender-room", u);
+        unix_call("send-room", send(u, "x", 1, MSG_DONTWAIT));
+        while (recv(r, buf, sizeof buf, MSG_DONTWAIT) >= 0) {}
+        errno = 0;
+        /* A socket's own queue, and one connected to the sender, are not
+           limited so. */
+        sent = 0;
+        for (int i = 0; i < 20; i++) sent += sendto(r, "s", 1, MSG_DONTWAIT, (void *)&a, alen) == 1;
+        printf("self-queued=%d\n", sent);
+        while (recv(r, buf, sizeof buf, MSG_DONTWAIT) >= 0) {}
+        connect(r, (void *)&b, blen);
+        sent = 0;
+        for (int i = 0; i < 20; i++) sent += sendto(o, "p", 1, MSG_DONTWAIT, (void *)&a, alen) == 1;
+        printf("peer-queued=%d\n", sent);
+        while (recv(r, buf, sizeof buf, MSG_DONTWAIT) >= 0) {}
+        errno = 0;
+        connect(r, &unspec, sizeof unspec);
+
+        /* Shutdowns. */
+        int s2 = socket(AF_UNIX, SOCK_DGRAM, 0);
+        unix_call("shutdown-unconnected", shutdown(s2, SHUT_WR));
+        unix_call("sendto-shut-missing", sendto(s2, "x", 1, 0, (void *)&c, clen));
+        unix_call("send-shut-unconnected", send(s2, "x", 1, 0));
+        close(s2);
+        int shut = socket(AF_UNIX, SOCK_DGRAM, 0);
+        bind(shut, (void *)&c, clen);
+        shutdown(shut, SHUT_RD);
+        unix_poll("read-shut", shut);
+        unix_call("sendto-read-shut", sendto(o, "x", 1, 0, (void *)&c, clen));
+        close(shut);
+
+        /* SO_PASSCRED autobinds a sender, and the receiver reads its
+           credentials. */
+        int p = socket(AF_UNIX, SOCK_DGRAM, 0);
+        on = 1;
+        setsockopt(p, SOL_SOCKET, SO_PASSCRED, &on, sizeof on);
+        unix_call("sendto-passcred", sendto(p, "cred", 4, 0, (void *)&a, alen));
+        unix_name("passcred-name", p, 0, NULL, 0);
+        setsockopt(r, SOL_SOCKET, SO_PASSCRED, &on, sizeof on);
+        unix_call("sendto-to-passcred", sendto(u, "c2", 2, 0, (void *)&a, alen));
+        for (int i = 0; i < 2; i++) {
+            struct sockaddr_un from;
+            union { char bytes[CMSG_SPACE(sizeof(struct ucred))]; struct cmsghdr align; } control;
+            struct iovec iov = {buf, sizeof buf};
+            struct msghdr m = {.msg_name = &from, .msg_namelen = sizeof from, .msg_iov = &iov, .msg_iovlen = 1,
+                               .msg_control = control.bytes, .msg_controllen = sizeof control.bytes};
+            long n = recvmsg(r, &m, MSG_DONTWAIT);
+            struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+            struct ucred cred = {0};
+            if (h && h->cmsg_type == SCM_CREDENTIALS) memcpy(&cred, CMSG_DATA(h), sizeof cred);
+            printf("passcred-recv=%ld namelen=%u pid-ok=%d uid-ok=%d\n", n, (unsigned)m.msg_namelen,
+                   cred.pid == getpid(), cred.uid == getuid());
+        }
+        on = 0;
+        setsockopt(r, SOL_SOCKET, SO_PASSCRED, &on, sizeof on);
+        close(p);
+
+        /* A message keeps its sender's name once the sender goes; a
+           socket pair's end may send to a name too. */
+        int gone = socket(AF_UNIX, SOCK_DGRAM, 0);
+        bind(gone, (void *)&c, clen);
+        sendto(gone, "bye", 3, 0, (void *)&a, alen);
+        close(gone);
+        unix_from("from-closed", r, sizeof(struct sockaddr_un), &c, clen);
+        int sp[2];
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, sp);
+        unix_call("sendto-from-pair", sendto(sp[0], "pair", 4, 0, (void *)&a, alen));
+        unix_from("from-pair", r, sizeof(struct sockaddr_un), NULL, 0);
+        unix_call("sendto-pair-missing", sendto(sp[0], "x", 1, 0, (void *)&c, clen));
+        close(sp[0]);
+        close(sp[1]);
+
+        /* The receiver goes: the next send is refused, the one after has
+           no peer. */
+        unix_name("peer-before-close", u, 1, &a, alen);
+        close(r);
+        unix_name("peer-after-close", u, 1, &a, alen);
+        unix_call("send-closed", send(u, "x", 1, 0));
+        unix_call("send-after-closed", send(u, "x", 1, 0));
+        unix_name("peer-after-refused", u, 1, NULL, 0);
+        unix_call("connect-closed", connect(fresh, (void *)&a, alen));
+        close(u);
+        close(o);
+        close(fresh);
+
+        /* A stream's and a packet socket's sender address. */
+        int types[] = {SOCK_STREAM, SOCK_SEQPACKET};
+        for (int t = 0; t < 2; t++) {
+            printf("type=%d\n", types[t]);
+            int l = socket(AF_UNIX, types[t], 0);
+            bind(l, (void *)&c, clen);
+            listen(l, 1);
+            int client = socket(AF_UNIX, types[t], 0);
+            connect(client, (void *)&c, clen);
+            int server = accept(l, NULL, NULL);
+            send(server, "srv", 3, 0);
+            send(client, "cli", 3, 0);
+            unix_from("from-server", client, sizeof(struct sockaddr_un), &c, clen);
+            unix_from("from-client", server, sizeof(struct sockaddr_un), NULL, 0);
+            close(server);
+            close(client);
+            close(l);
+        }
         return 0;
     }
     if (!strcmp(mode, "scm-garbage")) {

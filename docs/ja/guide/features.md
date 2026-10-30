@@ -36,7 +36,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socket`（AF_UNIX のストリームとパケットのソケット。[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -135,7 +135,24 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `getpeername` は名前を返し、受け付けたソケットは待ち受けの名前を持ちます。まだ受け
   付けていない接続も、もうデータを運びます。待ち受けを閉じるとその接続はリセットされ、
   クライアントの次の読み込みは `ECONNRESET` です。接続したあとは、ほかのすべてで
-  ソケットのペアの端と同じです。
+  ソケットのペアの端と同じです。Linux が種類と一緒にハッシュするのと同じく、名前は
+  ソケットの種類ごとに持つので、ストリームとデータグラムのソケットは同じ名前に
+  `bind` できます。
+- `socket(AF_UNIX, SOCK_DGRAM)`（と、Linux が同じものを作る `SOCK_RAW`）は、
+  Linux の `unix_dgram_*` と同じく、上と同じように `bind` し、名前のソケットへ
+  `sendto` で、または接続したソケットへ送るデータグラムのソケットを作ります。その名前の
+  ソケットがなければ `ECONNREFUSED`、接続していないのにアドレスがなければ `ENOTCONN`、
+  ほかのソケットに接続している（なくなったソケットでも）ソケットへは `EPERM`、自分の書き
+  込みか受け手の読み込みを止めたあとは `EPIPE` です。受け手のキューは、送り手自身のもの
+  か送り手に接続しているものでなければ、`net.unix.max_dgram_qlen` の 10 個を超えると
+  いっぱいです。そのときノンブロッキングの送信は `EAGAIN`、ブロッキングの送信は
+  `SO_SNDTIMEO` まで待ち、接続している送り手は `poll` に書けないように見えます。
+  `AF_UNSPEC` のアドレスへの `connect` は接続を切り、何度でも接続し直せます。接続している
+  ソケットがなくなると、次の送信は `ECONNREFUSED`、その後は `ENOTCONN` です。資格情報を
+  受け渡すソケットは、接続するときか送るときに自動で `bind` されます。`listen` と
+  `accept` は `EOPNOTSUPP` で、`SO_PEERCRED` はどのプロセスも示さず（プロセス 0、ID は
+  -1）、`SO_PEERPIDFD` は `ENODATA` です。ソケットのペアのデータグラムの端も名前へ
+  送れます。
 - `recvmsg` と `recvfrom` は、Linux の AF_UNIX のソケットと同じくフラグを扱います。
   `MSG_PEEK` はデータを残し、受け渡すディスクリプタの写しを渡します。`MSG_WAITALL` は、
   ストリームの終わりやディスクリプタが来るまで、またはデータを受け取ったあとにシグナルが
@@ -143,7 +160,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   返し、続きを待ちません。`MSG_TRUNC` はメッセージの全体の長さを
   返します。`sendmsg` と `sendto` は `MSG_NOSIGNAL` と `MSG_DONTWAIT` を扱います。
   データグラムとパケットのソケットへの `MSG_OOB` は `EOPNOTSUPP` です。ほかのフラグは、
-  Linux と同じく何もしません。
+  Linux と同じく何もしません。これらが返すアドレスは、Linux の `unix_copy_addr` と
+  同じく、読んだときに送ったソケットが持っている名前で、そのソケットがなくなったあとも
+  同じです。渡された場所に収まる分だけ書き、長さは全体の長さです。名前のないソケットと
+  ソケットのペアのアドレスの長さは 0 です。
 - 読まれていないメッセージだけが持っているソケットは、Linux のガベージコレクタ
   （`unix_gc`）がソケットのなくなるときに閉じるのと同じく閉じられます。自分のキューで
   ディスクリプタが待っているソケットや、そうして互いを持ち合うソケットは、ディスクリプタが

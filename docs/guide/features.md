@@ -42,7 +42,7 @@ kernel.
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
-| Sockets | `socket` (`AF_UNIX` streams and packet sockets; `AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -148,7 +148,25 @@ kernel.
   `SO_ACCEPTCONN`. `getsockname` and `getpeername` give the names, and an
   accepted socket has the listener's. A connection not yet accepted already
   carries data; closing the listener resets it, so the client's next read
-  is `ECONNRESET`. Connected, it is a socket pair end in all else.
+  is `ECONNRESET`. Connected, it is a socket pair end in all else. Names
+  are kept per socket type, as Linux hashes them with the type, so a stream
+  and a datagram socket may bind the same one.
+- `socket(AF_UNIX, SOCK_DGRAM)` (and `SOCK_RAW`, which Linux makes one)
+  makes a datagram socket that binds as above, and sends with `sendto` to
+  the socket of a name, or to the one it connected to, as Linux's
+  `unix_dgram_*` do: `ECONNREFUSED` where none has the name, `ENOTCONN`
+  with no address unconnected, `EPERM` to a socket connected to another
+  (even one gone), `EPIPE` once its writing or the receiver's reading is
+  shut down. A receiver's queue is full past `net.unix.max_dgram_qlen`'s
+  10 messages, unless it is the sender's own or connected to the sender:
+  a nonblocking send is then `EAGAIN`, a blocking one waits, at most
+  `SO_SNDTIMEO`, and the connected sender is not writable to `poll`.
+  `connect` to an `AF_UNSPEC` address disconnects; a socket connects again
+  at will. When the socket it is connected to goes, its next send is
+  `ECONNREFUSED`, then `ENOTCONN`. A socket that passes credentials is
+  autobound as it connects or sends. `listen` and `accept` are
+  `EOPNOTSUPP`, and `SO_PEERCRED` names no process (process 0, IDs -1),
+  `SO_PEERPIDFD` `ENODATA`. A socket pair's datagram end sends to names too.
 - `recvmsg` and `recvfrom` take their flags as Linux's AF_UNIX sockets do:
   `MSG_PEEK` leaves the data, and gives copies of the descriptors it passes;
   `MSG_WAITALL` fills a stream's buffer, unless the stream ends, descriptors
@@ -156,7 +174,10 @@ kernel.
   finds without waiting for more; `MSG_TRUNC` returns a message's
   whole length. `sendmsg` and `sendto` take `MSG_NOSIGNAL` and
   `MSG_DONTWAIT`. `MSG_OOB` on a datagram or packet socket is `EOPNOTSUPP`.
-  The other flags have no effect, as on Linux.
+  The other flags have no effect, as on Linux. Their address is the name
+  the sending socket has as it is read, even once that socket has gone, as
+  Linux's `unix_copy_addr`, cut to the room given but with its whole
+  length; an unnamed socket's, and a socket pair's, has length 0.
 - Sockets that only unread messages hold are closed, as Linux's garbage
   collector (`unix_gc`) closes them when a socket goes: a socket whose
   descriptor waits in its own queue, or sockets that hold each other so,

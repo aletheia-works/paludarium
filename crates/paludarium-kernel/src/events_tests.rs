@@ -824,13 +824,89 @@ fn unix_sockets_bind_listen_accept_and_connect() {
     assert_eq!(f.ret(49, [other, DATA + 0x100, len, 0, 0, 0]), 0);
 }
 #[test]
+fn unix_datagram_sockets_send_to_names() {
+    let mut f = Fixture::new();
+    let address = |f: &Fixture, at: u64, name: &[u8]| {
+        let mut raw = vec![1, 0, 0];
+        raw.extend_from_slice(name);
+        f.mem.write(GuestAddr(at), &raw).unwrap();
+        raw.len() as u64
+    };
+    let unix = |f: &mut Fixture| f.ret(41, [1, 2 | 0x800, 0, 0, 0, 0]);
+    let receiver = unix(&mut f);
+    let sender = unix(&mut f);
+    // accept4's flags are checked before the socket refuses it.
+    assert_eq!(
+        f.ret(288, [receiver, 0, 0, 1, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(288, [receiver, 0, 0, 0, 0, 0]),
+        Errno(95).to_syscall_return()
+    );
+    let a = address(&f, DATA + 0x100, b"a");
+    let b = address(&f, DATA + 0x180, b"b");
+    f.mem.write(GuestAddr(DATA), b"hi").unwrap();
+    // No name, no peer.
+    assert_eq!(
+        f.ret(44, [sender, DATA, 2, 0, DATA + 0x100, a]),
+        Errno(111).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(1, [sender, DATA, 2, 0, 0, 0]),
+        Errno(107).to_syscall_return()
+    );
+    assert_eq!(f.ret(49, [receiver, DATA + 0x100, a, 0, 0, 0]), 0);
+    assert_eq!(f.ret(49, [sender, DATA + 0x180, b, 0, 0, 0]), 0);
+    assert_eq!(f.ret(44, [sender, DATA, 2, 0, DATA + 0x100, a]), 2);
+    // recvfrom gives the sender's name.
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &110u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        f.ret(45, [receiver, DATA + 8, 8, 0, DATA + 0x208, DATA + 0x200]),
+        2
+    );
+    let mut raw = [0; 4];
+    f.mem.read(GuestAddr(DATA + 0x200), &mut raw).unwrap();
+    assert_eq!(u32::from_le_bytes(raw) as u64, b);
+    let mut name = [0; 4];
+    f.mem.read(GuestAddr(DATA + 0x208), &mut name).unwrap();
+    assert_eq!(name, [1, 0, 0, b'b']);
+    // Connected to another socket, the receiver refuses the sender.
+    let third = unix(&mut f);
+    let c = address(&f, DATA + 0x280, b"c");
+    assert_eq!(f.ret(49, [third, DATA + 0x280, c, 0, 0, 0]), 0);
+    assert_eq!(f.ret(42, [receiver, DATA + 0x280, c, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(44, [sender, DATA, 2, 0, DATA + 0x100, a]),
+        Errno(1).to_syscall_return()
+    );
+    assert_eq!(f.ret(44, [third, DATA, 2, 0, DATA + 0x100, a]), 2);
+    // The sender connects; once the receiver goes, a send is refused,
+    // then finds no peer.
+    f.mem.write(GuestAddr(DATA + 0x300), &[0, 0]).unwrap();
+    assert_eq!(f.ret(42, [receiver, DATA + 0x300, 2, 0, 0, 0]), 0);
+    assert_eq!(f.ret(42, [sender, DATA + 0x100, a, 0, 0, 0]), 0);
+    assert_eq!(f.ret(1, [sender, DATA, 2, 0, 0, 0]), 2);
+    assert_eq!(f.ret(3, [receiver, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(1, [sender, DATA, 2, 0, 0, 0]),
+        Errno(111).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(1, [sender, DATA, 2, 0, 0, 0]),
+        Errno(107).to_syscall_return()
+    );
+}
+#[test]
 fn inet_sockets_need_a_network() {
     let mut f = Fixture::new();
     assert_eq!(f.ret(41, [2, 1, 0, 0, 0, 0]), Errno(97).to_syscall_return());
     let mut f = network_fixture(&["127.0.0.1:80"]);
-    // AF_UNIX makes streams and packet sockets, not yet datagram ones.
+    // AF_UNIX makes streams, packet and datagram sockets without one.
     assert!((f.ret(41, [1, 1, 0, 0, 0, 0]) as i64) >= 0);
-    assert_eq!(f.ret(41, [1, 2, 0, 0, 0, 0]), Errno(97).to_syscall_return());
+    assert!((f.ret(41, [1, 2, 0, 0, 0, 0]) as i64) >= 0);
     assert_eq!(
         f.ret(41, [2, 1 | 0x100000, 0, 0, 0, 0]),
         Errno::EINVAL.to_syscall_return()

@@ -395,6 +395,8 @@ pub(crate) struct MessageHeader {
     pub(crate) name: Option<(u64, usize)>,
     /// Whether `msg_name` is set, so recvmsg writes back its length.
     pub(crate) has_name: bool,
+    /// `msg_name` itself.
+    name_at: u64,
     pub(crate) iov: Vec<(u64, usize)>,
     control: u64,
     control_len: u64,
@@ -432,6 +434,7 @@ pub(crate) fn message_header(
     Ok(MessageHeader {
         name: (name != 0 && name_len != 0).then_some((name, name_len)),
         has_name: name != 0,
+        name_at: name,
         iov,
         control: word(32),
         control_len: word(40),
@@ -610,24 +613,35 @@ fn control_messages(
     }
     Ok((passed, credentials))
 }
-/// The error of a datagram sent to a valid `address`, as Linux's
-/// `unix_find_other` finds it after the data is copied: as no socket can be
-/// bound, every address names none, so ECONNREFUSED, or the error of looking
-/// up a path that is not there.
-fn unreachable_address(c: &Context<'_>, address: &[u8]) -> Errno {
-    let path = &address[2..];
-    // An abstract name starts with a NUL byte.
-    if path[0] == 0 {
-        return Errno(111);
+/// Writes the address of the socket that sent what was read to `at`, as
+/// `move_addr_to_user` does: as much of it as the length at `len_at` says
+/// there is room for (a negative one is EINVAL), then its whole length
+/// there, 0 for an unnamed socket's or a socket pair's.
+fn put_address(
+    c: &Context<'_>,
+    from: Option<&crate::unix::Address>,
+    at: u64,
+    len_at: u64,
+) -> Result<(), Errno> {
+    let mut address = Vec::new();
+    if let Some(name) = from.and_then(|from| from.get()) {
+        address.extend(1u16.to_le_bytes());
+        address.extend(name);
     }
-    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
-    match c.files.exec_path(path[..end].to_vec()) {
-        Ok(path) => match c.files.fs.metadata(&path, true) {
-            Ok(_) => Errno(111),
-            Err(e) => e,
-        },
-        Err(e) => e,
+    let mut raw = [0; 4];
+    c.mem
+        .read(GuestAddr(len_at), &mut raw)
+        .map_err(|_| Errno::EFAULT)?;
+    let room = usize::try_from(i32::from_le_bytes(raw)).map_err(|_| Errno::EINVAL)?;
+    let room = room.min(address.len());
+    if room != 0 {
+        c.mem
+            .write(GuestAddr(at), &address[..room])
+            .map_err(|_| Errno::EFAULT)?;
     }
+    c.mem
+        .write(GuestAddr(len_at), &(address.len() as u32).to_le_bytes())
+        .map_err(|_| Errno::EFAULT)
 }
 /// What a send of `len` bytes to `address` checks before the data is copied:
 /// a connected stream socket takes no address (EISCONN) and
@@ -639,11 +653,7 @@ fn check_address(socket: &SocketPairEnd, address: &[u8], len: usize) -> Result<b
         SOCK_STREAM => Err(Errno(106)), // EISCONN
         SOCK_SEQPACKET => Ok(false),
         _ => {
-            // More than the family, at most sockaddr_un's 110 bytes, and
-            // AF_UNIX.
-            if address.len() <= 2 || address.len() > 110 || address[..2] != [1, 0] {
-                return Err(Errno::EINVAL);
-            }
+            crate::unix::validate(address)?;
             if len > MAX_MESSAGE {
                 return Err(Errno(90)); // EMSGSIZE
             }
@@ -695,6 +705,7 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     socket.check_out_of_band_send(a[3], true, len)?;
     let lookup = !address.is_empty() && check_address(socket, &address, len)?;
     socket.check_out_of_band_send(a[3], false, len)?;
+    socket.check_datagram_send(len)?;
     c.mem
         .check_read(GuestAddr(a[1]), len)
         .map_err(|_| Errno::EFAULT)?;
@@ -704,17 +715,27 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     c.mem
         .read(GuestAddr(a[1]), &mut bytes)
         .map_err(|_| Errno::EFAULT)?;
-    if lookup {
-        return Err(unreachable_address(c, &address));
-    }
+    let to = if lookup {
+        Some(crate::unix::find(c, &address, SOCK_DGRAM)?)
+    } else {
+        None
+    };
     let sender = Sender::process(c.process.pid);
-    send_bytes(c, &file, socket, &bytes, a[3], &mut Passed::new(), sender)
+    send_bytes(
+        c,
+        &file,
+        socket,
+        to.as_ref(),
+        &bytes,
+        a[3],
+        &mut Passed::new(),
+        sender,
+    )
 }
 /// `recvfrom(fd, buf, len, flags, addr, addrlen)` on a socket pair: recvmsg
 /// with one buffer and no control buffer, so the descriptors a message passes
-/// close. With `addr`, the peer's address length, 0, goes to `addrlen` as
-/// `move_addr_to_user` writes it: EFAULT when it cannot be read, and a
-/// negative one is EINVAL, after the data is taken.
+/// close. With `addr`, the sender's address goes there ([`put_address`]),
+/// after the data is taken.
 fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let len = user_buffer(a[1], a[2])?;
     let file = socket(c, a[0])?;
@@ -734,16 +755,7 @@ fn receive_from(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // Closed here, outside the socket's lock.
     drop(received.passed);
     if a[4] != 0 {
-        let mut raw = [0; 4];
-        c.mem
-            .read(GuestAddr(a[5]), &mut raw)
-            .map_err(|_| Errno::EFAULT)?;
-        if i32::from_le_bytes(raw) < 0 {
-            return Err(Errno::EINVAL);
-        }
-        c.mem
-            .write(GuestAddr(a[5]), &0u32.to_le_bytes())
-            .map_err(|_| Errno::EFAULT)?;
+        put_address(c, received.from.as_ref(), a[4], a[5])?;
     }
     Ok(returned)
 }
@@ -790,6 +802,7 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // sendmsg after __scm_send.
     let lookup = header.name.is_some() && check_address(socket, &address, total)?;
     socket.check_out_of_band_send(a[2], false, total)?;
+    socket.check_datagram_send(total)?;
     let mut bytes = Vec::new();
     bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
     for &(base, len) in &header.iov {
@@ -799,14 +812,25 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .read(GuestAddr(base), &mut bytes[start..])
             .map_err(|_| Errno::EFAULT)?;
     }
-    if lookup {
-        return Err(unreachable_address(c, &address));
-    }
+    let to = if lookup {
+        Some(crate::unix::find(c, &address, SOCK_DGRAM)?)
+    } else {
+        None
+    };
     let sender = Sender {
         pid: c.process.pid,
         credentials,
     };
-    let result = send_bytes(c, &file, socket, &bytes, a[2], &mut passed, sender);
+    let result = send_bytes(
+        c,
+        &file,
+        socket,
+        to.as_ref(),
+        &bytes,
+        a[2],
+        &mut passed,
+        sender,
+    );
     // What was not passed closes here, outside the socket's lock.
     drop(passed);
     result
@@ -833,6 +857,7 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     let credentials = socket.passes_credentials().then_some(received.credentials);
     let pidfd = socket.passes_pidfd().then_some(received.credentials.pid);
+    let from = received.from.clone();
     let (used, cut) = deliver(
         c,
         &header,
@@ -844,11 +869,8 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if cut {
         flags |= MSG_CTRUNC;
     }
-    // A pair's peer has no address, so its length is 0.
-    if header.has_name {
-        c.mem
-            .write(GuestAddr(a[1] + 8), &0u32.to_le_bytes())
-            .map_err(|_| Errno::EFAULT)?;
+    if let Some(at) = header.has_name.then_some(header.name_at) {
+        put_address(c, from.as_ref(), at, a[1] + 8)?;
     }
     c.mem
         .write(GuestAddr(a[1] + 48), &flags.to_le_bytes())
@@ -862,11 +884,14 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// a stream, all but the last byte go as data and then, once they all have,
 /// the last one out of band, as Linux's `unix_stream_sendmsg` and
 /// `queue_oob`; the descriptors go with the first part sent, and every part
-/// carries `sender`'s credentials.
+/// carries `sender`'s credentials. A datagram goes `to` the socket an
+/// address named, if any.
+#[expect(clippy::too_many_arguments, reason = "sendmsg's own parts")]
 fn send_bytes(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     socket: &SocketPairEnd,
+    to: Option<&Arc<crate::unix::UnixSocket>>,
     bytes: &[u8],
     flags: u64,
     passed: &mut Passed,
@@ -875,7 +900,7 @@ fn send_bytes(
     let (nosignal, dontwait) = (flags & MSG_NOSIGNAL != 0, flags & MSG_DONTWAIT != 0);
     let Some((&last, data)) = bytes.split_last().filter(|_| flags & MSG_OOB != 0) else {
         return crate::files::write_with(c, file, bytes, nosignal, dontwait, |b| {
-            socket.send(b, passed, sender)
+            socket.send_to(to, b, passed, sender)
         });
     };
     let sent = if data.is_empty() {
@@ -1479,6 +1504,10 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         // when `len` holds only part of its number.
         SO_PEERPIDFD => {
             let creator = socket.pair.creator.load(Ordering::SeqCst);
+            // A datagram socket has no peer process (ENODATA).
+            if creator == 0 {
+                return Err(Errno(61));
+            }
             let pidfd = crate::processes::PidFd::of(c.processes, creator)?;
             let fd = c.files.install(pidfd, true, c.group.nofile())?;
             int(fd as i32)
@@ -1496,15 +1525,13 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             linger.extend(options.linger.unwrap_or(0).to_le_bytes());
             linger
         }
-        // The creator's credentials, as root (uid and gid 0).
+        // The creator's credentials, as root (uid and gid 0), or for a
+        // datagram socket none: process 0, and -1 for the IDs, as Linux's
+        // `cred_to_ucred` gives them with no peer.
         SO_PEERCRED => {
-            let mut credentials = socket
-                .pair
-                .creator
-                .load(Ordering::SeqCst)
-                .to_le_bytes()
-                .to_vec();
-            credentials.extend([0; 8]);
+            let creator = socket.pair.creator.load(Ordering::SeqCst);
+            let mut credentials = creator.to_le_bytes().to_vec();
+            credentials.extend(if creator == 0 { [0xff; 8] } else { [0; 8] });
             credentials
         }
         SO_SNDLOWAT | SO_DOMAIN => int(1),
@@ -1552,6 +1579,9 @@ struct Write {
     /// receiving end took timestamps then, or when a read first gave it
     /// one, as Linux's `skb->tstamp`.
     sent: Option<u64>,
+    /// The name of the AF_UNIX socket that sent it, as Linux's `skb->sk`
+    /// gives it to recvmsg's `msg_name`; none from a socket pair's end.
+    from: Option<crate::unix::Address>,
 }
 /// The credentials a write carries, as Linux's `UNIXCB` keeps them for
 /// `SCM_CREDENTIALS`: its sender's process ID, user and group when either
@@ -1632,6 +1662,8 @@ pub(crate) struct Received {
     discarded: Passed,
     /// A message's timestamp, and how the reading end takes it.
     timestamp: Option<(u64, Timestamps)>,
+    /// The name of the socket that sent the data read.
+    from: Option<crate::unix::Address>,
 }
 impl Received {
     /// What recvmsg or recvfrom returns: with `MSG_TRUNC`, a message's
@@ -1796,10 +1828,12 @@ impl SocketPairEnd {
     pub(crate) fn unix(&self) -> Option<Arc<crate::unix::UnixSocket>> {
         self.unix.get().and_then(Weak::upgrade)
     }
-    /// This end is `socket`'s, unconnected until [`Self::connected`].
+    /// This end is `socket`'s, a stream or packet socket's unconnected until
+    /// [`Self::connected`].
     pub(crate) fn attach(&self, socket: Weak<crate::unix::UnixSocket>) {
         let _ = self.unix.set(socket);
-        self.unconnected.store(true, Ordering::SeqCst);
+        self.unconnected
+            .store(self.pair.kind != SOCK_DGRAM, Ordering::SeqCst);
     }
     /// Its socket has connected.
     pub(crate) fn connected(&self) {
@@ -1842,6 +1876,15 @@ impl SocketPairEnd {
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// `SO_PASSCRED` or `SO_PASSPIDFD` on this end.
+    pub(crate) fn passes_any(&self) -> bool {
+        passes(&self.lock_sides()[self.side])
+    }
+    /// Whether more than `limit` messages wait on this end, as Linux's
+    /// `unix_recvq_full`.
+    pub(crate) fn queue_full(&self, limit: usize) -> bool {
+        self.lock_sides()[self.side].writes.len() > limit
     }
     /// `SO_PASSPIDFD` on this end.
     fn passes_pidfd(&self) -> bool {
@@ -2222,6 +2265,7 @@ impl SocketPairEnd {
                 length: left,
                 credentials: message.credentials,
                 timestamp,
+                from: message.from.clone(),
                 ..Received::default()
             };
             Self::peeked(own, count);
@@ -2262,6 +2306,7 @@ impl SocketPairEnd {
             length: message.len,
             credentials: message.credentials,
             timestamp,
+            from: message.from,
             ..Received::default()
         })
     }
@@ -2388,7 +2433,10 @@ impl SocketPairEnd {
                     break;
                 }
                 Some(_) => {}
-                None => credentials = Some(front.credentials),
+                None => {
+                    credentials = Some(front.credentials);
+                    received.from.clone_from(&front.from);
+                }
             }
             let count = front.len.min(buf.len() - received.count);
             for byte in &mut buf[received.count..received.count + count] {
@@ -2467,7 +2515,10 @@ impl SocketPairEnd {
                     break;
                 }
                 Some(_) => {}
-                None => credentials = Some(write.credentials),
+                None => {
+                    credentials = Some(write.credentials);
+                    received.from.clone_from(&write.from);
+                }
             }
             let count = (write.len - skip).min(buf.len() - received.count);
             let from = at + skip;
@@ -2772,8 +2823,29 @@ impl SocketPairEnd {
         passed: &mut Passed,
         sender: Sender,
     ) -> Result<usize, Errno> {
+        self.send_to(None, buf, passed, sender)
+    }
+    /// [`Self::send`], to the AF_UNIX datagram socket `to` an address named.
+    /// A datagram socket that `socket` made sends there or to the socket it
+    /// is connected to ([`Self::send_datagram`]).
+    pub(crate) fn send_to(
+        &self,
+        to: Option<&Arc<crate::unix::UnixSocket>>,
+        buf: &[u8],
+        passed: &mut Passed,
+        sender: Sender,
+    ) -> Result<usize, Errno> {
         if self.unconnected.load(Ordering::SeqCst) {
             return Err(Errno(107));
+        }
+        if self.pair.kind == SOCK_DGRAM && (to.is_some() || self.unix().is_some()) {
+            let result = self.send_datagram(to, buf, passed, sender);
+            if result == Err(Errno::EAGAIN) {
+                let mut sides = self.lock_sides();
+                let own = &mut sides[self.side];
+                own.no_space |= own.registration.is_some();
+            }
+            return result;
         }
         let part = self.part_size();
         let sockets = passed.iter().any(|d| socket_end(&d.file).is_some());
@@ -2800,6 +2872,96 @@ impl SocketPairEnd {
             _ => {}
         }
         result.map(|(count, _)| count)
+    }
+    /// A datagram to `to`, or else to the socket this end's is connected to,
+    /// as Linux's `unix_dgram_sendmsg`: its first checks
+    /// ([`Self::check_datagram_send`]); then, with no address, the peer
+    /// ([`crate::unix::UnixSocket::peer`]), and that socket's checks
+    /// ([`crate::unix::UnixSocket::receive_datagram`]).
+    fn send_datagram(
+        &self,
+        to: Option<&Arc<crate::unix::UnixSocket>>,
+        buf: &[u8],
+        passed: &mut Passed,
+        sender: Sender,
+    ) -> Result<usize, Errno> {
+        self.check_datagram_send(buf.len())?;
+        let to = match (to, self.unix()) {
+            (Some(to), _) => Arc::clone(to),
+            (None, Some(own)) => own.peer()?,
+            (None, None) => return Err(Errno(107)),
+        };
+        to.receive_datagram(self, buf, passed, sender)
+    }
+    /// What a datagram of `len` bytes checks before its data is copied and
+    /// where it goes is looked up, as Linux's `unix_dgram_sendmsg`: a socket
+    /// that passes credentials is autobound, then the size (`EMSGSIZE`) and
+    /// this end's shutdown (`EPIPE`, as `sock_alloc_send_pskb` finds it).
+    fn check_datagram_send(&self, len: usize) -> Result<(), Errno> {
+        if self.pair.kind != SOCK_DGRAM {
+            return Ok(());
+        }
+        if let Some(own) = self.unix()
+            && self.passes_any()
+        {
+            own.autobind()?;
+        }
+        if len > MAX_MESSAGE {
+            return Err(Errno(90)); // EMSGSIZE
+        }
+        if self.lock_sides()[self.side].write_shutdown {
+            return Err(Errno(32));
+        }
+        Ok(())
+    }
+    /// A datagram `sender` sent joins this end's queue, unless reading is
+    /// shut down (`EPIPE`), more than `limit` messages wait, or the bytes
+    /// waiting leave no room for it (`EAGAIN`).
+    pub(crate) fn enqueue(
+        &self,
+        sender: &SocketPairEnd,
+        buf: &[u8],
+        passed: &mut Passed,
+        from: Sender,
+        limit: Option<usize>,
+    ) -> Result<usize, Errno> {
+        let address = sender.unix().map(|socket| socket.address());
+        // As Linux's unix_maybe_add_creds: either socket passing them.
+        let sender_passes = sender.passes_any();
+        let sockets = passed.iter().any(|d| socket_end(&d.file).is_some());
+        let mut sides = self.lock_sides();
+        let own = &mut sides[self.side];
+        if own.read_shutdown {
+            return Err(Errno(32));
+        }
+        if limit.is_some_and(|limit| own.writes.len() > limit)
+            || self.pair.window().saturating_sub(own.bytes.len()) < buf.len()
+        {
+            return Err(Errno::EAGAIN);
+        }
+        let credentials = from.credentials(sender_passes || passes(own));
+        own.bytes
+            .try_reserve(buf.len())
+            .map_err(|_| Errno::ENOMEM)?;
+        own.writes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        own.input_epoch = own.input_epoch.wrapping_add(1);
+        own.bytes.extend(buf.iter().copied());
+        own.writes.push_back(Write {
+            len: buf.len(),
+            passed: std::mem::take(passed),
+            piece: Piece::Data,
+            credentials,
+            peeked: false,
+            sent: self.pair.sent_at(own),
+            from: address,
+        });
+        drop(sides);
+        if sockets {
+            in_flight(&self.pair);
+        }
+        self.pair.hub.changed();
+        self.notify(self.side, Reason::In);
+        Ok(buf.len())
     }
     /// The most bytes a stream write puts in one part, as Linux's
     /// `unix_stream_sendmsg` sizes its buffers: half the send buffer less 64
@@ -2828,6 +2990,7 @@ impl SocketPairEnd {
         sender: Sender,
         part: usize,
     ) -> Result<(usize, bool), Errno> {
+        let from = self.unix().map(|socket| socket.address());
         let mut sides = self
             .pair
             .sides
@@ -2878,6 +3041,7 @@ impl SocketPairEnd {
                 credentials,
                 peeked: false,
                 sent: self.pair.sent_at(peer),
+                from: from.clone(),
             });
             self.pair.hub.changed();
             return Ok((buf.len(), false));
@@ -2911,6 +3075,7 @@ impl SocketPairEnd {
                 credentials,
                 peeked: false,
                 sent: self.pair.sent_at(peer),
+                from: from.clone(),
             });
             self.pair.hub.changed();
             return Ok((buf.len(), false));
@@ -2936,6 +3101,7 @@ impl SocketPairEnd {
                 credentials,
                 peeked: false,
                 sent: None,
+                from: from.clone(),
             });
         }
         let waited = std::mem::take(&mut peer.waiting_data);
@@ -2973,6 +3139,7 @@ impl SocketPairEnd {
         passed: &mut Passed,
         sender: Sender,
     ) -> Result<bool, Errno> {
+        let from = self.unix().map(|socket| socket.address());
         let mut sides = self
             .pair
             .sides
@@ -3002,6 +3169,7 @@ impl SocketPairEnd {
             credentials,
             peeked: false,
             sent: None,
+            from,
         });
         let waited = std::mem::take(&mut peer.waiting_data);
         self.pair.hub.changed();

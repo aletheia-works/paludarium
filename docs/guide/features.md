@@ -194,7 +194,8 @@ kernel.
     found the buffer full makes room signal `POLL_OUT` once. A DNS stub's
     answer signals `POLL_IN` when it is ready, and so does a datagram from a
     guest socket when it arrives; the loopback's ICMP answer to a connected
-    UDP socket signals `POLL_ERR`.
+    UDP socket signals `POLL_ERR`. An urgent byte on the loopback signals
+    `POLL_PRI` after its `SIGURG`.
   - **A waiting reader.** A stream whose read waits gets no signal for the
     data, end or hang-up that ends the wait, as Linux holds it back; of a
     send in parts, only the first. For the peer's shutdown or close Linux
@@ -624,6 +625,20 @@ one only with an `--allow-net`.
   with connections it has not handed out resets the peer (`ECONNRESET`
   after the bytes it holds); bytes sent to a peer that has closed are
   answered with a reset, so the next send is `EPIPE`.
+- **Urgent data**, as Linux's TCP keeps it: the last byte of a `MSG_OOB`
+  send is urgent and reaches the peer with the bytes before it. Reads
+  stop before its mark, which `SIOCATMARK` reports and `FIONREAD` counts
+  up to, and `MSG_WAITALL` stops there too; `poll`, `select`'s
+  exceptional set and `epoll` show `POLLPRI` while the byte waits, and a
+  reader at the mark is readable only with a byte past it. `recv` with
+  `MSG_OOB` takes the byte once (`EINVAL` when none waits, `MSG_TRUNC`
+  with no room, `ENOTCONN` on a listener). A read that starts at the mark
+  passes over the byte, which is then gone if `MSG_OOB` had not taken it,
+  and a later urgent byte makes an earlier one ordinary data. With
+  `SO_OOBINLINE` the byte is read as data, reads still stopping before it,
+  and `MSG_OOB` is `EINVAL`. Each urgent byte sends the receiving socket's
+  owner `SIGURG`. UDP ignores `MSG_OOB` on a receive, and a send with it is
+  `EOPNOTSUPP`.
 - **UDP** binds as TCP does, on ports of its own, where `SO_REUSEADDR` on
   both shares a port. A datagram to a loopback address reaches the guest
   socket bound there, as Linux's `compute_score` picks it: a connected one

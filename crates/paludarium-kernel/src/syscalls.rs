@@ -1723,11 +1723,15 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
         // SIOCATMARK: whether a socket's next read is at its out-of-band mark.
         if a[1] == 0x8905 {
-            let socket = file
-                .as_any()
-                .and_then(|v| v.downcast_ref::<crate::sockets::SocketPairEnd>())
-                .ok_or(Errno::ENOTTY)?;
-            let at_mark = i32::from(socket.at_mark());
+            let at_mark = match crate::inet::of(&file) {
+                Some(socket) => socket.at_mark(),
+                None => file
+                    .as_any()
+                    .and_then(|v| v.downcast_ref::<crate::sockets::SocketPairEnd>())
+                    .ok_or(Errno::ENOTTY)?
+                    .at_mark(),
+            };
+            let at_mark = i32::from(at_mark);
             c.mem
                 .write(GuestAddr(a[2]), &at_mark.to_le_bytes())
                 .map_err(|_| Errno::EFAULT)?;

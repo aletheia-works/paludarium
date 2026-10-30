@@ -17,7 +17,7 @@ use paludarium_host::net::{Driver, Phase, Stream};
 use paludarium_types::Errno;
 use std::hash::DefaultHasher;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 const EADDRINUSE: Errno = Errno(98);
 const ECONNRESET: Errno = Errno(104);
@@ -33,6 +33,28 @@ const NOT_ENDED: u64 = u64::MAX;
 const NO_SIDE: u8 = 2;
 const RESET: u8 = 3;
 
+/// What tells a socket that an urgent byte has reached it, for `SIGURG`.
+pub(crate) type Notify = Arc<dyn Fn() + Send + Sync>;
+
+/// A connection's urgent byte one way, as Linux's `urg_data` and
+/// `urg_seq` keep it, by bytes counted from the connection's start.
+#[derive(Default)]
+struct Urgent {
+    /// The bytes the sender has queued, those that have reached the
+    /// receiver, and those the receiver has read or passed over.
+    written: u64,
+    delivered: u64,
+    copied: u64,
+    /// The last urgent byte sent, and where, until it reaches the receiver.
+    sending: Option<(u64, u8)>,
+    /// The receiver's mark: where its urgent byte is, and the byte until
+    /// `MSG_OOB` takes it (`TCP_URG_VALID`, then `TCP_URG_READ`).
+    mark: Option<(u64, Option<u8>)>,
+    /// An earlier urgent byte the reader had reached when a new one came,
+    /// which it passes over (`tcp_check_urg` moves `copied_seq` past it).
+    stale: Option<u64>,
+}
+
 /// The two streams of a connection between guest sockets.
 pub(crate) struct Link {
     /// `None` once both sides have closed, or one was reset, so that the
@@ -45,6 +67,9 @@ pub(crate) struct Link {
     /// clock, or [`NOT_ENDED`].
     ended: [AtomicU64; 2],
     host: Arc<dyn paludarium_host::Host>,
+    /// The urgent byte toward each side, and what tells each of its arrival.
+    urgent: Mutex<[Urgent; 2]>,
+    notify: [Notify; 2],
 }
 struct Ends {
     streams: [Arc<Stream>; 2],
@@ -55,12 +80,14 @@ struct Ends {
 impl Link {
     /// Joins a connecting `client` stream to a new `server` one and opens
     /// both, the server's first: `client` from `client_local`, `server` from
-    /// `server_local`. `host`'s clock times each side's end.
+    /// `server_local`. `host`'s clock times each side's end, and `notify`
+    /// tells each side of an urgent byte.
     pub(crate) fn join(
         client: &Arc<Stream>,
         server: &Arc<Stream>,
         (client_local, server_local): (SocketAddr, SocketAddr),
         host: &Arc<dyn paludarium_host::Host>,
+        notify: [Notify; 2],
     ) -> Arc<Self> {
         let link = Arc::new(Self {
             ends: Mutex::new(Some(Ends {
@@ -70,6 +97,8 @@ impl Link {
             first: AtomicU8::new(NO_SIDE),
             ended: [AtomicU64::new(NOT_ENDED), AtomicU64::new(NOT_ENDED)],
             host: Arc::clone(host),
+            urgent: Mutex::default(),
+            notify,
         });
         client.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
         server.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
@@ -169,6 +198,7 @@ impl Link {
                 let bytes = own.take(room);
                 if !bytes.is_empty() {
                     peer.receive(&bytes);
+                    self.delivered(1 - from, bytes.len());
                 }
             }
             let (shut, closed) = own.finished();
@@ -183,6 +213,140 @@ impl Link {
     }
 }
 impl Link {
+    fn urgent(&self) -> MutexGuard<'_, [Urgent; 2]> {
+        self.urgent.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// `side` queued `count` bytes to send, the last of them urgent with
+    /// `MSG_OOB` (`tcp_mark_urg`).
+    pub(crate) fn wrote(&self, side: usize, count: usize, urgent: Option<u8>) {
+        let to = 1 - side;
+        let arrived = {
+            let mut all = self.urgent();
+            let way = &mut all[to];
+            way.written += count as u64;
+            match urgent {
+                Some(byte) if count > 0 => {
+                    way.sending = Some((way.written - 1, byte));
+                    way.arrive()
+                }
+                _ => false,
+            }
+        };
+        if arrived {
+            (self.notify[to])();
+        }
+    }
+    /// `count` more bytes reached `to`.
+    fn delivered(&self, to: usize, count: usize) {
+        let arrived = {
+            let mut all = self.urgent();
+            all[to].delivered += count as u64;
+            all[to].arrive()
+        };
+        if arrived {
+            (self.notify[to])();
+        }
+    }
+    /// Reads what reached `side` from `stream` into `buf`, as Linux's
+    /// `tcp_recvmsg` meets an urgent mark: a read stops before it, and one
+    /// that starts there passes over the urgent byte unless it is read
+    /// `inline` (`SO_OOBINLINE`), losing it if `MSG_OOB` has not taken it.
+    /// Returns the count, and whether the read ends at the mark.
+    pub(crate) fn read(
+        &self,
+        side: usize,
+        stream: &Stream,
+        buf: &mut [u8],
+        (peek, inline): (bool, bool),
+    ) -> Result<(usize, bool), Errno> {
+        if buf.is_empty() {
+            return stream.read(buf, peek).map(|n| (n, false));
+        }
+        let (copied, mark, stale) = {
+            let all = self.urgent();
+            (all[side].copied, all[side].mark, all[side].stale)
+        };
+        let mut skip = usize::from(!inline && stale == Some(copied));
+        let mut limit = buf.len();
+        if let Some((at, _)) = mark {
+            let ahead = (at.saturating_sub(copied) as usize).saturating_sub(skip);
+            if ahead == 0 {
+                skip += usize::from(!inline);
+            } else {
+                limit = limit.min(ahead);
+            }
+        }
+        let n = if peek {
+            let mut seen = vec![0; skip + limit];
+            let n = stream.read(&mut seen, true)?;
+            if n > 0 && n <= skip {
+                // Only the urgent byte waits, which a read passes over.
+                return if stream.readiness().read_closed {
+                    Ok((0, false))
+                } else {
+                    Err(Errno::EAGAIN)
+                };
+            }
+            let n = n.saturating_sub(skip);
+            buf[..n].copy_from_slice(&seen[skip..skip + n]);
+            n
+        } else {
+            let mut passed = 0;
+            if skip > 0 {
+                passed = stream.read(&mut [0; 2][..skip], false)?;
+            }
+            let result = stream.read(&mut buf[..limit], false);
+            let n = *result.as_ref().unwrap_or(&0);
+            self.consumed(side, passed + n);
+            if passed > 0 && result.is_err() {
+                // The urgent byte went; nothing else waits yet.
+                return result.map(|n| (n, false));
+            }
+            result?
+        };
+        let at = mark.is_some_and(|(at, _)| at == copied + (skip + n) as u64);
+        Ok((n, at && n > 0))
+    }
+    /// `side` read or passed over `count` more bytes; past its mark the
+    /// urgent byte is gone (`urg_data` cleared).
+    fn consumed(&self, side: usize, count: usize) {
+        let mut all = self.urgent();
+        let way = &mut all[side];
+        way.copied += count as u64;
+        if way.mark.is_some_and(|(at, _)| at < way.copied) {
+            way.mark = None;
+        }
+        if way.stale.is_some_and(|at| at < way.copied) {
+            way.stale = None;
+        }
+    }
+    /// The urgent byte waiting for `side`'s `MSG_OOB`, which a read without
+    /// `peek` takes (`tcp_recv_urg`).
+    pub(crate) fn take_urgent(&self, side: usize, peek: bool) -> Option<u8> {
+        let mut all = self.urgent();
+        let (_, byte) = all[side].mark.as_mut()?;
+        let found = *byte;
+        if !peek {
+            *byte = None;
+        }
+        found
+    }
+    /// What `side`'s urgent byte shows: whether one waits for `MSG_OOB`
+    /// (`POLLPRI`), whether the next read is at the mark (`SIOCATMARK`),
+    /// and the bytes before the mark, which `FIONREAD` counts when the byte
+    /// is not read inline (`tcp_inq`).
+    pub(crate) fn urgent_state(&self, side: usize) -> (bool, bool, Option<usize>) {
+        let all = self.urgent();
+        let way = &all[side];
+        match way.mark {
+            Some((at, byte)) => (
+                byte.is_some(),
+                at == way.copied,
+                Some((at - way.copied) as usize),
+            ),
+            None => (false, false, None),
+        }
+    }
     /// `from`'s end has reached the other side now.
     fn end(&self, ended: &mut [bool; 2], from: usize) {
         if ended[from] {
@@ -199,6 +363,27 @@ impl Link {
         let _ =
             self.first
                 .compare_exchange(NO_SIDE, from as u8, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+impl Urgent {
+    /// Moves the urgent byte sent to the receiver's mark once it has
+    /// reached it, as Linux's `tcp_check_urg` and `tcp_urg` do; whether it
+    /// did, to signal the receiver.
+    fn arrive(&mut self) -> bool {
+        let Some((at, byte)) = self.sending else {
+            return false;
+        };
+        if at >= self.delivered {
+            return false;
+        }
+        self.sending = None;
+        if let Some((old, _)) = self.mark
+            && old == self.copied
+        {
+            self.stale = Some(old);
+        }
+        self.mark = Some((at, Some(byte)));
+        true
     }
 }
 impl Driver for Link {

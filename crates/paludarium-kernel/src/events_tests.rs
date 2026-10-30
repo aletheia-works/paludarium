@@ -1393,6 +1393,121 @@ fn loopback_time_wait_holds_the_port_closed_first() {
     assert_eq!(bind_on(&mut f, shared, true), 0);
 }
 #[test]
+fn loopback_urgent_bytes_mark_the_stream_as_linux() {
+    let mut f = network_fixture(&[]);
+    let (listener, port) = loopback_listener(&mut f, 16);
+    let pair = |f: &mut Fixture| {
+        let client = loopback_client(f, port);
+        let server = f.ret(288, [listener, 0, 0, 0x800, 0, 0]);
+        (client, server)
+    };
+    let send = |f: &mut Fixture, fd: u64, bytes: &[u8], flags: u64| {
+        f.mem.write(GuestAddr(DATA), bytes).unwrap();
+        f.ret(44, [fd, DATA, bytes.len() as u64, flags, 0, 0])
+    };
+    let recv = |f: &mut Fixture, fd: u64, len: u64, flags: u64| {
+        let r = f.ret(45, [fd, DATA + 8, len, flags, 0, 0]);
+        let mut got = vec![0; if (r as i64) > 0 { r as usize } else { 0 }];
+        f.mem.read(GuestAddr(DATA + 8), &mut got).unwrap();
+        (r as i64, got)
+    };
+    let ioctl = |f: &mut Fixture, fd: u64, request: u64| {
+        assert_eq!(f.ret(16, [fd, request, DATA + 0x300, 0, 0, 0]), 0);
+        let mut raw = [0; 4];
+        f.mem.read(GuestAddr(DATA + 0x300), &mut raw).unwrap();
+        i32::from_le_bytes(raw)
+    };
+    // (POLLIN | POLLPRI, SIOCATMARK, FIONREAD)
+    let state = |f: &mut Fixture, fd: u64| {
+        (
+            readable(f, fd) & 3,
+            ioctl(f, fd, 0x8905),
+            ioctl(f, fd, 0x541b),
+        )
+    };
+    let again = -(Errno::EAGAIN.0 as i64);
+    let invalid = -(Errno::EINVAL.0 as i64);
+
+    // The last byte is urgent: reads stop before it, MSG_OOB takes it once.
+    let (client, server) = pair(&mut f);
+    assert_eq!(send(&mut f, client, b"abc", 1), 3);
+    assert_eq!(state(&mut f, server), (3, 0, 2));
+    assert_eq!(recv(&mut f, server, 16, 0), (2, b"ab".to_vec()));
+    assert_eq!(state(&mut f, server), (2, 1, 0));
+    assert_eq!(recv(&mut f, server, 16, 1 | 2), (1, b"c".to_vec()));
+    assert_eq!(recv(&mut f, server, 16, 1), (1, b"c".to_vec()));
+    assert_eq!(state(&mut f, server), (0, 1, 0));
+    assert_eq!(recv(&mut f, server, 16, 0).0, again);
+    assert_eq!(recv(&mut f, server, 16, 1).0, invalid);
+    // A read that starts at the mark passes over the byte, which is then
+    // gone; a peek passes over it and leaves it.
+    let (client, server) = pair(&mut f);
+    assert_eq!(send(&mut f, client, b"abc", 1), 3);
+    assert_eq!(send(&mut f, client, b"de", 0), 2);
+    assert_eq!(recv(&mut f, server, 16, 0), (2, b"ab".to_vec()));
+    assert_eq!(state(&mut f, server), (3, 1, 0));
+    assert_eq!(recv(&mut f, server, 16, 2), (2, b"de".to_vec()));
+    assert_eq!(recv(&mut f, server, 16, 1 | 2), (1, b"c".to_vec()));
+    assert_eq!(recv(&mut f, server, 16, 0), (2, b"de".to_vec()));
+    assert_eq!(state(&mut f, server), (0, 0, 0));
+    assert_eq!(recv(&mut f, server, 16, 1).0, invalid);
+    // A later urgent byte makes the earlier one ordinary.
+    let (client, server) = pair(&mut f);
+    assert_eq!(send(&mut f, client, b"ab", 1), 2);
+    assert_eq!(send(&mut f, client, b"cd", 1), 2);
+    assert_eq!(state(&mut f, server), (3, 0, 3));
+    assert_eq!(recv(&mut f, server, 16, 0), (3, b"abc".to_vec()));
+    assert_eq!(recv(&mut f, server, 16, 0).0, again);
+    assert_eq!(recv(&mut f, server, 16, 1).0, invalid);
+    // Only the urgent byte: no POLLIN, and a read loses it.
+    let (client, server) = pair(&mut f);
+    assert_eq!(send(&mut f, client, b"x", 1), 1);
+    assert_eq!(state(&mut f, server), (2, 1, 0));
+    assert_eq!(recv(&mut f, server, 16, 2).0, again);
+    assert_eq!(recv(&mut f, server, 16, 0).0, again);
+    assert_eq!(recv(&mut f, server, 16, 1).0, invalid);
+    assert_eq!(state(&mut f, server), (0, 0, 0));
+    // MSG_WAITALL stops at the mark; the peer's end follows a lost byte.
+    let (client, server) = pair(&mut f);
+    assert_eq!(send(&mut f, client, b"ab", 1), 2);
+    assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(recv(&mut f, server, 16, 0x100), (1, b"a".to_vec()));
+    assert_eq!(recv(&mut f, server, 16, 0), (0, Vec::new()));
+    assert_eq!(recv(&mut f, server, 16, 1).0, invalid);
+    // SO_OOBINLINE reads it as data: still stopping before the mark, but
+    // MSG_OOB is EINVAL and FIONREAD counts it.
+    let (client, server) = pair(&mut f);
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &1u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(54, [server, 1, 10, DATA + 0x200, 4, 0]), 0);
+    assert_eq!(send(&mut f, client, b"abc", 1), 3);
+    assert_eq!(send(&mut f, client, b"de", 0), 2);
+    assert_eq!(state(&mut f, server), (3, 0, 5));
+    assert_eq!(recv(&mut f, server, 16, 1).0, invalid);
+    assert_eq!(recv(&mut f, server, 16, 0), (2, b"ab".to_vec()));
+    assert_eq!(state(&mut f, server), (3, 1, 3));
+    assert_eq!(recv(&mut f, server, 16, 0), (3, b"cde".to_vec()));
+    assert_eq!(state(&mut f, server), (0, 0, 0));
+    // An empty MSG_OOB send marks nothing; a listener is ENOTCONN, a
+    // socket never connected EINVAL; UDP refuses it on send and ignores it
+    // on receive.
+    let (client, server) = pair(&mut f);
+    assert_eq!(send(&mut f, client, b"", 1), 0);
+    assert_eq!(state(&mut f, server), (0, 0, 0));
+    assert_eq!(recv(&mut f, listener, 16, 1).0, -107);
+    let fresh = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(recv(&mut f, fresh, 16, 1).0, invalid);
+    let udp = f.ret(41, [2, 2 | 0x800, 0, 0, 0, 0]);
+    assert_eq!(recv(&mut f, udp, 16, 1).0, again);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 9);
+    f.mem.write(GuestAddr(DATA), b"u").unwrap();
+    assert_eq!(
+        f.ret(44, [udp, DATA, 1, 1, DATA + 0x100, 16]),
+        -95i64 as u64
+    );
+}
+#[test]
 fn sockets_sharing_a_port_share_its_connections_and_datagrams() {
     let mut f = network_fixture(&[]);
     f.mem

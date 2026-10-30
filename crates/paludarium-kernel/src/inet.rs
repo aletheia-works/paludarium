@@ -508,6 +508,8 @@ struct Listen {
 struct Syn {
     stream: Weak<Stream>,
     link: Arc<OnceLock<Arc<Link>>>,
+    /// What tells the client of an urgent byte.
+    notify: crate::loopback::Notify,
     from: SocketAddr,
     to: SocketAddr,
     start: u64,
@@ -627,8 +629,27 @@ struct Signals {
     waiting: AtomicBool,
     /// A write or poll found the buffer full, so room signals `POLL_OUT`.
     no_space: AtomicBool,
+    /// Where `F_SETOWN`'s owner lives, for an urgent byte's `SIGURG`.
+    processes: Mutex<Weak<crate::processes::Processes>>,
 }
 impl Signals {
+    /// An urgent byte came, as Linux's `sk_send_sigurg`: `SIGURG` to the
+    /// owner, if any, and then `POLL_PRI` with `O_ASYNC`.
+    fn urgent(&self) {
+        let owner = *self.owner.lock().unwrap_or_else(PoisonError::into_inner);
+        if owner.id == 0 {
+            return;
+        }
+        let processes = self
+            .processes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .upgrade();
+        if let Some(processes) = processes {
+            processes.send_urgent(owner);
+        }
+        self.send(Reason::Priority);
+    }
     fn on(&self) -> bool {
         self.registration
             .lock()
@@ -755,13 +776,35 @@ impl InetSocket {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
-    /// `F_SETOWN` and `F_SETSIG`.
-    pub(crate) fn set_file_owner(&self, owner: FileOwner) {
+    /// `F_SETOWN` and `F_SETSIG`, with where the owner lives.
+    pub(crate) fn set_file_owner(
+        &self,
+        owner: FileOwner,
+        processes: &Arc<crate::processes::Processes>,
+    ) {
         *self
             .signals
             .owner
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = owner;
+        *self
+            .signals
+            .processes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(processes);
+    }
+    /// What tells this socket that an urgent byte reached it.
+    fn urgent_notify(&self) -> crate::loopback::Notify {
+        let (signals, hub) = (Arc::clone(&self.signals), Arc::clone(&self.hub));
+        Arc::new(move || {
+            signals.urgent();
+            hub.changed();
+        })
+    }
+    /// This socket's loopback connection and side, once it has opened.
+    fn joined(s: &State) -> Option<(Arc<Link>, usize)> {
+        let (slot, side) = s.link.as_ref()?;
+        Some((Arc::clone(slot.get()?), *side))
     }
     /// `F_SETFL` turning `O_ASYNC` on, with its registration, or off.
     pub(crate) fn set_async(&self, registration: Option<Registration>) {
@@ -821,6 +864,7 @@ impl InetSocket {
         if self.datagram {
             return self.receive_datagram(buf, peek, waits);
         }
+        let inline = self.options().out_of_band_inline;
         let mut s = self.lock();
         s.note();
         let Some(stream) = s.stream.clone() else {
@@ -829,8 +873,15 @@ impl InetSocket {
         if s.read_shut && stream.queued().0 == 0 {
             return Ok(Received::bytes(0));
         }
-        match stream.read(buf, peek) {
-            Ok(n) => Ok(Received::bytes(n)),
+        let read = match Self::joined(&s) {
+            Some((link, side)) => link.read(side, &stream, buf, (peek, inline)),
+            None => stream.read(buf, peek).map(|n| (n, false)),
+        };
+        match read {
+            Ok((n, at_mark)) => Ok(Received {
+                at_mark,
+                ..Received::bytes(n)
+            }),
             Err(e) if e == Errno::EAGAIN => Err(e),
             Err(_) => match s.error.take() {
                 Some(error) => Err(error),
@@ -838,9 +889,38 @@ impl InetSocket {
             },
         }
     }
-    /// Sends `bytes`: a TCP socket never connected, or shut down for
-    /// sending, is `EPIPE`; a failed one gives its pending error first.
-    fn send(&self, bytes: &[u8], to: Option<SocketAddr>) -> Result<usize, Errno> {
+    /// Receives the urgent byte, for `MSG_OOB`, as Linux's `tcp_recv_urg`:
+    /// `ENOTCONN` for a listener, `EINVAL` with `SO_OOBINLINE` or none
+    /// waiting; `peek` leaves it. Only the guest's own loopback carries one.
+    fn receive_urgent(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
+        let inline = self.options().out_of_band_inline;
+        let s = self.lock();
+        if s.listen.is_some() {
+            return Err(ENOTCONN);
+        }
+        if inline {
+            return Err(Errno::EINVAL);
+        }
+        let (link, side) = Self::joined(&s).ok_or(Errno::EINVAL)?;
+        let byte = link.take_urgent(side, peek).ok_or(Errno::EINVAL)?;
+        let count = usize::from(!buf.is_empty());
+        if let Some(first) = buf.first_mut() {
+            *first = byte;
+        }
+        Ok(Received {
+            urgent: true,
+            ..Received::bytes(count)
+        })
+    }
+    /// Whether the next read is at the urgent mark, for `SIOCATMARK`.
+    pub(crate) fn at_mark(&self) -> bool {
+        Self::joined(&self.lock()).is_some_and(|(link, side)| link.urgent_state(side).1)
+    }
+    /// Sends `bytes`, the last of them `urgent` (`MSG_OOB`): a TCP socket
+    /// never connected, or shut down for sending, is `EPIPE`; a failed one
+    /// gives its pending error first. Only the guest's own loopback carries
+    /// the urgent byte as such.
+    fn send(&self, bytes: &[u8], to: Option<SocketAddr>, urgent: bool) -> Result<usize, Errno> {
         if self.datagram {
             return self.send_datagram(bytes, to);
         }
@@ -849,7 +929,12 @@ impl InetSocket {
         let Some(stream) = s.stream.clone() else {
             return Err(Errno::EPIPE);
         };
-        match stream.write(bytes) {
+        let written = stream.write(bytes);
+        if let (Ok(n), Some((link, side))) = (&written, Self::joined(&s)) {
+            let last = bytes[..*n].last().copied().filter(|_| urgent);
+            link.wrote(side, *n, last);
+        }
+        match written {
             // A failed connection's error goes once, as `sk_stream_error`
             // takes it.
             Err(e)
@@ -1266,11 +1351,7 @@ impl InetSocket {
         }
         let Some((from, bytes, answer)) = self.first_datagram(&s) else {
             return if s.read_shut && waits {
-                Ok(Received {
-                    count: 0,
-                    length: 0,
-                    from: None,
-                })
+                Ok(Received::bytes(0))
             } else {
                 Err(Errno::EAGAIN)
             };
@@ -1286,9 +1367,9 @@ impl InetSocket {
         let n = buf.len().min(bytes.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(Received {
-            count: n,
             length: bytes.len(),
             from: Some(from),
+            ..Received::bytes(n)
         })
     }
     /// The answer to `query` in a datagram, once it can be given.
@@ -1307,13 +1388,23 @@ impl InetSocket {
         if self.datagram {
             return Ok(if outgoing { 0 } else { self.next_datagram() });
         }
+        let inline = self.options().out_of_band_inline;
         let s = self.lock();
         if s.listen.is_some() {
             return Err(Errno::EINVAL);
         }
+        // Not inline, the urgent byte and what follows it wait past the
+        // mark (`tcp_inq`).
+        let before_mark = Self::joined(&s)
+            .and_then(|(link, side)| link.urgent_state(side).2)
+            .filter(|_| !inline);
         Ok(s.stream.as_ref().map_or(0, |stream| {
             let (received, sending) = stream.queued();
-            if outgoing { sending } else { received }
+            if outgoing {
+                sending
+            } else {
+                before_mark.unwrap_or(received)
+            }
         }))
     }
 
@@ -1512,7 +1603,7 @@ impl InetSocket {
                 continue;
             }
             syn.tries += 1;
-            match self.knock(&stream, &syn.link, syn.from, syn.to) {
+            match self.knock(&stream, (&syn.link, &syn.notify), syn.from, syn.to) {
                 Knock::Full => {}
                 Knock::Taken => {
                     syns.swap_remove(i);
@@ -1537,7 +1628,7 @@ impl InetSocket {
     fn knock(
         &self,
         stream: &Arc<Stream>,
-        link: &OnceLock<Arc<Link>>,
+        link: (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
         from: SocketAddr,
         to: SocketAddr,
     ) -> Knock {
@@ -1575,7 +1666,7 @@ impl InetSocket {
         &self,
         (options, locked): (Options, bool),
         stream: &Arc<Stream>,
-        link: &OnceLock<Arc<Link>>,
+        (link, notify): (&OnceLock<Arc<Link>>, &crate::loopback::Notify),
         from: SocketAddr,
         to: SocketAddr,
     ) -> Arc<InetSocket> {
@@ -1583,7 +1674,13 @@ impl InetSocket {
         *child.options() = options;
         let own = Stream::new(from);
         own.set_waker(stream_waker(&child.signals, &child.hub, &own));
-        let joined = Link::join(stream, &own, (from, to), &self.host);
+        let joined = Link::join(
+            stream,
+            &own,
+            (from, to),
+            &self.host,
+            [Arc::clone(notify), child.urgent_notify()],
+        );
         let _ = link.set(Arc::clone(&joined));
         let own_link = Arc::new(OnceLock::new());
         let _ = own_link.set(joined);
@@ -1645,7 +1742,8 @@ impl InetSocket {
         self.ports().attach(&self.this, (&link, 0));
         let arrived = listen.has_room();
         if arrived {
-            let child = listener.child((theirs, locked), &stream, &link, from, to);
+            let notify = self.urgent_notify();
+            let child = listener.child((theirs, locked), &stream, (&link, &notify), from, to);
             listen.ready.push_back(child);
             listen.arrivals += 1;
         }
@@ -1661,6 +1759,7 @@ impl InetSocket {
             syns.push(Syn {
                 stream: Arc::downgrade(&stream),
                 link,
+                notify: self.urgent_notify(),
                 from,
                 to,
                 start,
@@ -1828,6 +1927,10 @@ struct Received {
     count: usize,
     length: usize,
     from: Option<SocketAddr>,
+    /// A stream's read stopped at its urgent mark.
+    at_mark: bool,
+    /// It was the urgent byte, for `MSG_OOB`.
+    urgent: bool,
 }
 impl Received {
     fn bytes(count: usize) -> Self {
@@ -1835,6 +1938,8 @@ impl Received {
             count,
             length: count,
             from: None,
+            at_mark: false,
+            urgent: false,
         }
     }
 }
@@ -1858,6 +1963,7 @@ impl FileHandle for InetSocket {
             return Ok((OUT | (u32::from(ready) * IN) | error | ends, s.received, 0));
         }
         self.retry_syns();
+        let inline = self.options().out_of_band_inline;
         let mut s = self.lock();
         // A listener is readable while a connection waits, and no more
         // (`inet_csk_listen_poll`).
@@ -1870,6 +1976,16 @@ impl FileHandle for InetSocket {
             return Ok((OUT | POLLHUP | error, 0, 0));
         };
         let ready = stream.readiness();
+        // An urgent byte waiting is `POLLPRI`; not inline, a read at its mark
+        // needs a byte past it (`tcp_poll`).
+        let (urgent, at_mark) = Self::joined(&s).map_or((false, false), |(link, side)| {
+            let (urgent, at_mark, _) = link.urgent_state(side);
+            (urgent, at_mark && !inline)
+        });
+        let mut readable = ready.readable;
+        if at_mark && !ready.read_closed {
+            readable = stream.queued().0 > 1;
+        }
         let mask = match stream.phase() {
             Phase::Connecting => 0,
             Phase::Failed(_) => IN | OUT | POLLHUP | POLLRDHUP,
@@ -1878,7 +1994,8 @@ impl FileHandle for InetSocket {
                     self.signals.full();
                 }
                 let read_end = ready.read_closed || s.read_shut;
-                (u32::from(ready.readable || s.read_shut) * IN)
+                (u32::from(urgent) * crate::events::PRI)
+                    | (u32::from(readable || s.read_shut) * IN)
                     | (u32::from(ready.writable) * OUT)
                     | (u32::from(read_end) * POLLRDHUP)
                     | (u32::from(read_end && ready.write_closed) * POLLHUP)
@@ -1894,7 +2011,7 @@ impl FileHandle for InetSocket {
             .map(|received| received.count)
     }
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
-        self.send(buf, None)
+        self.send(buf, None, false)
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
         Err(Errno::ESPIPE)
@@ -2144,6 +2261,13 @@ pub(crate) fn dispatch(
             if socket.datagram && received.length > received.count {
                 flags |= MSG_TRUNC as u32;
             }
+            // `tcp_recv_urg` marks the urgent byte, cut when no room took it.
+            if received.urgent {
+                flags |= MSG_OOB as u32;
+                if total == 0 {
+                    flags |= MSG_TRUNC as u32;
+                }
+            }
             if header.has_name {
                 let address = received
                     .from
@@ -2231,12 +2355,13 @@ fn send(
         bytes,
         flags & MSG_NOSIGNAL != 0,
         flags & MSG_DONTWAIT != 0,
-        |part| socket.send(part, to),
+        |part| socket.send(part, to, flags & MSG_OOB != 0),
     )
 }
 /// Receives for recvfrom or recvmsg: `MSG_PEEK` keeps the bytes, and on
-/// TCP `MSG_WAITALL` waits until the buffer is full or the input ends;
-/// `MSG_OOB` finds no urgent byte (EINVAL).
+/// TCP `MSG_WAITALL` waits until the buffer is full, the input ends or the
+/// read reaches the urgent mark, and `MSG_OOB` takes the urgent byte (UDP
+/// ignores it, as Linux's `udp_recvmsg`).
 fn receive(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -2244,12 +2369,8 @@ fn receive(
     buf: &mut [u8],
     flags: u64,
 ) -> Result<Received, Errno> {
-    if flags & MSG_OOB != 0 {
-        return Err(if socket.datagram {
-            EOPNOTSUPP
-        } else {
-            Errno::EINVAL
-        });
+    if flags & MSG_OOB != 0 && !socket.datagram {
+        return socket.receive_urgent(buf, flags & MSG_PEEK != 0);
     }
     let peek = flags & MSG_PEEK != 0;
     let dontwait = flags & MSG_DONTWAIT != 0;
@@ -2261,12 +2382,15 @@ fn receive(
     if socket.datagram || flags & MSG_WAITALL == 0 || peek {
         return Ok(received);
     }
-    while received.count > 0 && received.count < buf.len() {
+    while received.count > 0 && received.count < buf.len() && !received.at_mark {
         let rest = &mut buf[received.count..];
         match crate::files::wait_for_read_until(c, file, dontwait, wait, || {
             socket.receive(rest, false, waits)
         }) {
-            Ok(more) if more.count > 0 => received.count += more.count,
+            Ok(more) if more.count > 0 => {
+                received.count += more.count;
+                received.at_mark = more.at_mark;
+            }
             _ => break,
         }
     }

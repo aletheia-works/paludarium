@@ -175,6 +175,34 @@ static void finished(const char *name, int fd, long start, int limit) {
 }
 static volatile sig_atomic_t pipes;
 static void on_pipe(int signal) { (void)signal; pipes++; }
+static volatile sig_atomic_t urgs;
+static void on_urg(int signal) { (void)signal; urgs++; }
+/* A loopback connection to `port`, accepted from `l`: the server's side is
+   nonblocking and owned by this process, for SIGURG. */
+static void urgent_pair(int l, int port, int *c, int *s) {
+    int result;
+    *c = client(port, 0, &result);
+    *s = accept(l, NULL, NULL);
+    fcntl(*s, F_SETFL, O_NONBLOCK);
+    fcntl(*s, F_SETOWN, getpid());
+}
+/* What an urgent byte shows: POLLIN and POLLPRI, SIOCATMARK, FIONREAD and
+   the SIGURGs so far. */
+static void urgent_state(const char *name, int fd) {
+    struct pollfd p = {.fd = fd, .events = POLLIN | POLLPRI};
+    poll(&p, 1, 0);
+    int mark = -1, inq = -1;
+    ioctl(fd, SIOCATMARK, &mark);
+    ioctl(fd, FIONREAD, &inq);
+    printf("  %s revents=%#x atmark=%d inq=%d urgs=%d\n", name, (unsigned)p.revents, mark, inq,
+           (int)urgs);
+}
+static void urgent_read(const char *name, int fd, int len, int flags) {
+    char b[64];
+    errno = 0;
+    long r = recv(fd, b, len, flags);
+    printf("  %s r=%ld errno=%d data=%.*s\n", name, r, r < 0 ? errno : 0, r > 0 ? (int)r : 0, b);
+}
 
 int main(int argc, char **argv) {
     if (argc < 4) return 99;
@@ -986,6 +1014,125 @@ int main(int argc, char **argv) {
         close(c[4]);
         int t = tcp(0);
         bind_to("own-closed", t, htonl(INADDR_LOOPBACK), at[4]);
+        return 0;
+    }
+    if (!strcmp(mode, "listen-urgent")) {
+        /* MSG_OOB's urgent byte on the loopback (tcp_check_urg, tcp_urg,
+           tcp_recvmsg, tcp_recv_urg): reads stop before its mark, one that
+           starts there passes over it, losing it unless MSG_OOB took it,
+           a later one makes it ordinary, and SO_OOBINLINE reads it as data.
+           Each one sends the owner SIGURG. The waits after each send let
+           Linux's loopback deliver it. */
+        signal(SIGURG, on_urg);
+        int port, c, s, one = 1;
+        int l = listener(8, &port);
+        puts("urgent");
+        urgent_pair(l, port, &c, &s);
+        urgent_state("before", s);
+        call("send", send(c, "abc", 3, MSG_OOB));
+        usleep(10000);
+        urgent_state("sent", s);
+        urgent_read("read", s, 16, 0);
+        urgent_state("at-mark", s);
+        urgent_read("peek-oob", s, 16, MSG_OOB | MSG_PEEK);
+        urgent_read("oob", s, 16, MSG_OOB);
+        urgent_state("taken", s);
+        urgent_read("read-past", s, 16, 0);
+        urgent_read("oob-again", s, 16, MSG_OOB);
+        puts("passed");
+        urgent_pair(l, port, &c, &s);
+        send(c, "abc", 3, MSG_OOB);
+        send(c, "de", 2, 0);
+        usleep(10000);
+        urgent_read("read", s, 16, 0);
+        urgent_state("at-mark", s);
+        urgent_read("peek", s, 16, MSG_PEEK);
+        urgent_read("peek-oob", s, 16, MSG_OOB | MSG_PEEK);
+        urgent_read("read", s, 16, 0);
+        urgent_state("past", s);
+        urgent_read("oob", s, 16, MSG_OOB);
+        puts("two");
+        urgent_pair(l, port, &c, &s);
+        send(c, "ab", 2, MSG_OOB);
+        send(c, "cd", 2, MSG_OOB);
+        usleep(10000);
+        urgent_state("two", s);
+        urgent_read("read", s, 16, 0);
+        urgent_read("read", s, 16, 0);
+        urgent_read("oob", s, 16, MSG_OOB);
+        puts("single");
+        urgent_pair(l, port, &c, &s);
+        send(c, "abc", 3, MSG_OOB);
+        usleep(10000);
+        urgent_read("read1", s, 1, 0);
+        urgent_read("read1", s, 1, 0);
+        urgent_read("read1", s, 1, 0);
+        urgent_read("oob0", s, 0, MSG_OOB);
+        puts("only");
+        urgent_pair(l, port, &c, &s);
+        send(c, "x", 1, MSG_OOB);
+        usleep(10000);
+        urgent_state("only", s);
+        urgent_read("read", s, 16, 0);
+        urgent_read("oob", s, 16, MSG_OOB);
+        urgent_state("lost", s);
+        puts("truncated");
+        urgent_pair(l, port, &c, &s);
+        send(c, "ab", 2, MSG_OOB);
+        usleep(10000);
+        {
+            char b[1];
+            struct iovec v = {.iov_base = b, .iov_len = 0};
+            struct msghdr m = {.msg_iov = &v, .msg_iovlen = 1};
+            long r = recvmsg(s, &m, MSG_OOB);
+            printf("  recvmsg0 r=%ld flags=%#x\n", r, (unsigned)m.msg_flags);
+            v.iov_len = 1;
+            m.msg_flags = 0;
+            r = recvmsg(s, &m, MSG_OOB);
+            printf("  recvmsg1 r=%ld flags=%#x byte=%c\n", r, (unsigned)m.msg_flags, b[0]);
+        }
+        puts("waitall");
+        urgent_pair(l, port, &c, &s);
+        send(c, "ab", 2, MSG_OOB);
+        close(c);
+        usleep(10000);
+        urgent_state("closed", s);
+        urgent_read("read", s, 16, MSG_WAITALL);
+        urgent_read("read", s, 16, 0);
+        urgent_read("oob", s, 16, MSG_OOB);
+        puts("inline");
+        urgent_pair(l, port, &c, &s);
+        setsockopt(s, SOL_SOCKET, SO_OOBINLINE, &one, sizeof one);
+        send(c, "abc", 3, MSG_OOB);
+        send(c, "de", 2, 0);
+        usleep(10000);
+        urgent_state("inline", s);
+        urgent_read("oob", s, 16, MSG_OOB);
+        urgent_read("read", s, 16, 0);
+        urgent_state("at-mark", s);
+        urgent_read("read", s, 16, 0);
+        urgent_state("past", s);
+        puts("inline-later");
+        urgent_pair(l, port, &c, &s);
+        send(c, "abc", 3, MSG_OOB);
+        usleep(10000);
+        setsockopt(s, SOL_SOCKET, SO_OOBINLINE, &one, sizeof one);
+        urgent_read("read", s, 16, 0);
+        urgent_read("read", s, 16, 0);
+        urgent_read("oob", s, 16, MSG_OOB);
+        puts("others");
+        urgent_pair(l, port, &c, &s);
+        call("send-empty", send(c, "", 0, MSG_OOB));
+        usleep(10000);
+        urgent_state("empty", s);
+        urgent_read("oob-none", s, 16, MSG_OOB);
+        urgent_read("oob-listener", l, 16, MSG_OOB);
+        int fresh = tcp(0);
+        urgent_read("oob-unconnected", fresh, 16, MSG_OOB);
+        int u = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        urgent_read("udp-oob", u, 16, MSG_OOB);
+        struct sockaddr_in to_u = to(9);
+        call("udp-send-oob", sendto(u, "x", 1, MSG_OOB, (void *)&to_u, sizeof to_u));
         return 0;
     }
     if (!strcmp(mode, "listen-reset")) {

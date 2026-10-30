@@ -105,7 +105,7 @@ fn owner(c: &Context<'_>, file: &Arc<dyn FileHandle>) -> FileOwner {
 
 fn set_owner(c: &Context<'_>, file: &Arc<dyn FileHandle>, owner: FileOwner) {
     if let Some(socket) = crate::inet::of(file) {
-        return socket.set_file_owner(owner);
+        return socket.set_file_owner(owner, c.processes);
     }
     match crate::sockets::endpoint(file) {
         Some(endpoint) => endpoint.set_file_owner(owner),

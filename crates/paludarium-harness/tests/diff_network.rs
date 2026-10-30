@@ -194,6 +194,10 @@ mod linux {
         case_within("listen-fin-wait", Duration::from_secs(150));
     }
     #[test]
+    fn network_listen_urgent() {
+        case("listen-urgent");
+    }
+    #[test]
     fn network_listen_fork() {
         case("listen-fork");
     }

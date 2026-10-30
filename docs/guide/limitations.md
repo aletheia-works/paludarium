@@ -44,7 +44,12 @@ verified.
     `SO_SNDBUF` and `SO_RCVBUF` are kept for `getsockopt` but do not size the
     buffers, which hold 256 KiB each way; the other options but
     `TCP_NODELAY` do not reach the host's socket.
-  - `MSG_OOB` finds no urgent data (`EINVAL`), so no `SIGURG` comes either.
+  - Through the host, `MSG_OOB` sends its byte as an ordinary one and finds
+    no urgent data (`EINVAL`), so no `SIGURG` comes either.
+  - On the loopback, an urgent byte sent while the peer's buffer is full
+    sends `SIGURG` once, when it reaches the peer; Linux can send more, as
+    a later segment that carries the urgent pointer signals again once the
+    byte has been read or passed over.
 - **File mappings**: a file mapping shows the file's page cache as on Linux
   (a `MAP_PRIVATE` one in the pages it has not written), but the stores of a
   `MAP_SHARED` mapping reach the file on the host only when the guest reads

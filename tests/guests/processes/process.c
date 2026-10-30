@@ -3850,8 +3850,12 @@ int main(int argc, char **argv) {
         strcpy(p.sun_path, "/nonexistent-socket");
         int c = socket(AF_UNIX, SOCK_STREAM, 0);
         unix_call("connect-missing-path", connect(c, (void *)&p, sizeof p));
-        strcpy(p.sun_path, "/");
+        /* A file of this process's own, as connect needs write permission
+           there, which an unprivileged native run lacks on "/". */
+        strcpy(p.sun_path, "unix-not-a-socket");
+        close(open(p.sun_path, O_CREAT | O_WRONLY, 0600));
         unix_call("connect-not-a-socket", connect(c, (void *)&p, sizeof p));
+        unlink(p.sun_path);
         unix_call("socket-protocol", socket(AF_UNIX, SOCK_STREAM, 2));
         unix_call("socket-type", socket(AF_UNIX, 4, 0));
         return 0;

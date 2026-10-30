@@ -115,7 +115,7 @@ pub(crate) fn dispatch(
             }
             let child = socket.accept(c)?;
             if flags & u64::from(NONBLOCK) != 0 {
-                let _ = child.set_flags(child.flags() | NONBLOCK);
+                child.set_flags(child.flags() | NONBLOCK)?;
             }
             let peer = child.lock().peer.clone().flatten();
             if a[1] != 0 {
@@ -328,7 +328,26 @@ impl UnixSocket {
     /// other end goes to a new socket with this one's name, waiting to be
     /// accepted.
     fn take(&self, client: &UnixSocket, c: &Context<'_>) -> Result<(), Errno> {
-        let mut own = self.lock();
+        // A listener connecting to itself is refused as listening, once it
+        // has room.
+        if std::ptr::eq(self, client) {
+            let s = self.lock();
+            let listen = s.listen.as_ref().ok_or(ECONNREFUSED)?;
+            return Err(if listen.queue.len() > listen.backlog {
+                Errno::EAGAIN
+            } else {
+                Errno::EINVAL
+            });
+        }
+        // Both states, locked in the order of their addresses, so that two
+        // sockets connecting to each other cannot wait on each other.
+        let (mut own, mut theirs) = if std::ptr::from_ref(self) < std::ptr::from_ref(client) {
+            let own = self.lock();
+            (own, client.lock())
+        } else {
+            let theirs = client.lock();
+            (self.lock(), theirs)
+        };
         let name = own.name.clone();
         let Some(listen) = own.listen.as_mut() else {
             return Err(ECONNREFUSED);
@@ -336,11 +355,6 @@ impl UnixSocket {
         if listen.queue.len() > listen.backlog {
             return Err(Errno::EAGAIN);
         }
-        // A listener connecting to itself.
-        if std::ptr::eq(self, client) {
-            return Err(Errno::EINVAL);
-        }
-        let mut theirs = client.lock();
         if theirs.peer.is_some() {
             return Err(EISCONN);
         }

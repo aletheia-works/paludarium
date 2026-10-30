@@ -1276,6 +1276,41 @@ fn loopback_time_wait_holds_the_port_closed_first() {
         .now
         .store(crate::loopback::TIME_WAIT, Ordering::SeqCst);
     assert_eq!(bind_on(&mut f, client_port, false), 0);
+    // The 60 seconds count from the peer's end when it comes later, within
+    // 60 seconds of the close (`FIN_WAIT2`, then `TIME_WAIT`).
+    let at = |f: &mut Fixture, seconds: u64| f.host.now.store(seconds * SECOND, Ordering::SeqCst);
+    let client = loopback_client(&mut f, port);
+    let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    let late_port = port_of(&mut f, client);
+    assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+    at(&mut f, 90);
+    assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    at(&mut f, 149);
+    assert_eq!(bind_on(&mut f, late_port, false), in_use);
+    at(&mut f, 150);
+    assert_eq!(bind_on(&mut f, late_port, false), 0);
+    // A peer that stays open: the wait for its end gives up 60 seconds
+    // after the close (`tcp_fin_timeout`), counted from the close when the
+    // socket had shut its side down before.
+    for shut in [false, true] {
+        let client = loopback_client(&mut f, port);
+        let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+        let open_port = port_of(&mut f, client);
+        let closed = if shut {
+            assert_eq!(f.ret(48, [client, 1, 0, 0, 0, 0]), 0);
+            at(&mut f, 180);
+            180
+        } else {
+            150
+        };
+        assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+        at(&mut f, closed + 59);
+        assert_eq!(bind_on(&mut f, open_port, false), in_use);
+        at(&mut f, closed + 60);
+        assert_eq!(bind_on(&mut f, open_port, false), 0);
+        assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+        at(&mut f, 150);
+    }
     // Held while its peer stays open too; a send to the closed side is
     // answered with a reset, which ends it.
     let client = loopback_client(&mut f, port);

@@ -17,7 +17,8 @@ CI run produces them afresh on an x86-64 Linux runner.
   addresses, are normalised or excluded before the comparison.
 - New instructions and system calls get their test cases, and the result on
   real Linux, before they are implemented.
-- Each case has a 30-second timeout.
+- Each case has a 30-second timeout, or a longer one for a case that waits
+  out a timer of Linux's own, such as `TIME_WAIT`.
 - The core-dump case needs Linux to keep the kernel's default `core_pattern`
   (`core`, with `core_uses_pid` 0). CI sets it with `sysctl`; elsewhere the
   case stops and says so, rather than compare with a core sent to a crash

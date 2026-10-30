@@ -8,12 +8,12 @@
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux {
     use paludarium::{Config, NetworkPolicy, Session, testing::RecordingHost};
-    use paludarium_harness::{Outcome, compare, run_native, workspace_root};
+    use paludarium_harness::{Outcome, TIMEOUT, compare, run_native_within, workspace_root};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// Serves one connection as its first byte says.
     fn serve(mut peer: TcpStream) {
@@ -103,6 +103,10 @@ mod linux {
     }
 
     fn case(mode: &str) {
+        case_within(mode, TIMEOUT);
+    }
+    /// [`case`] with a native time limit of `limit`.
+    fn case_within(mode: &str, limit: Duration) {
         // One case at a time: each uses the same server.
         static ONE: Mutex<()> = Mutex::new(());
         let _one = ONE
@@ -110,7 +114,7 @@ mod linux {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (open, closed) = ports();
         let args = [mode.to_owned(), open.to_string(), closed.to_string()];
-        let native = run_native(&guest(), "network", &args).unwrap();
+        let native = run_native_within(&guest(), "network", &args, limit).unwrap();
         // The server's port, and the one nothing listens on, which the
         // refused cases need to try.
         let policy = NetworkPolicy::new()
@@ -183,6 +187,11 @@ mod linux {
     #[test]
     fn network_listen_reuseport() {
         case("listen-reuseport");
+    }
+    #[test]
+    fn network_listen_fin_wait() {
+        // Linux's FIN_WAIT2 and TIME_WAIT run 60 seconds each.
+        case_within("listen-fin-wait", Duration::from_secs(150));
     }
     #[test]
     fn network_listen_fork() {

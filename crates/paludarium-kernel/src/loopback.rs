@@ -16,7 +16,7 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use paludarium_host::net::{Driver, Phase, Stream};
 use paludarium_types::Errno;
 use std::hash::DefaultHasher;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 const EADDRINUSE: Errno = Errno(98);
@@ -24,8 +24,11 @@ const ECONNRESET: Errno = Errno(104);
 /// Linux's default `net.ipv4.ip_local_port_range`.
 const EPHEMERAL: core::ops::RangeInclusive<u16> = 32768..=60999;
 /// How long the side that closed a connection first keeps its port, in
-/// nanoseconds: Linux's `TCP_TIMEWAIT_LEN`.
+/// nanoseconds: Linux's `TCP_TIMEWAIT_LEN`, and its default
+/// `tcp_fin_timeout` for `FIN_WAIT2` too.
 pub(crate) const TIME_WAIT: u64 = 60_000_000_000;
+/// [`Link::ended`] for a side whose end has not reached the other.
+const NOT_ENDED: u64 = u64::MAX;
 /// [`Link::first`] before either side has ended, and once one was reset.
 const NO_SIDE: u8 = 2;
 const RESET: u8 = 3;
@@ -38,6 +41,10 @@ pub(crate) struct Link {
     /// The side whose end reached the other first, kept after `ends` goes;
     /// [`NO_SIDE`] before, [`RESET`] once either side was reset.
     first: AtomicU8,
+    /// When each side's end reached the other, on the host's monotonic
+    /// clock, or [`NOT_ENDED`].
+    ended: [AtomicU64; 2],
+    host: Arc<dyn paludarium_host::Host>,
 }
 struct Ends {
     streams: [Arc<Stream>; 2],
@@ -48,12 +55,12 @@ struct Ends {
 impl Link {
     /// Joins a connecting `client` stream to a new `server` one and opens
     /// both, the server's first: `client` from `client_local`, `server` from
-    /// `server_local`.
+    /// `server_local`. `host`'s clock times each side's end.
     pub(crate) fn join(
         client: &Arc<Stream>,
         server: &Arc<Stream>,
-        client_local: SocketAddr,
-        server_local: SocketAddr,
+        (client_local, server_local): (SocketAddr, SocketAddr),
+        host: &Arc<dyn paludarium_host::Host>,
     ) -> Arc<Self> {
         let link = Arc::new(Self {
             ends: Mutex::new(Some(Ends {
@@ -61,6 +68,8 @@ impl Link {
                 ended: [false; 2],
             })),
             first: AtomicU8::new(NO_SIDE),
+            ended: [AtomicU64::new(NOT_ENDED), AtomicU64::new(NOT_ENDED)],
+            host: Arc::clone(host),
         });
         client.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
         server.set_driver(Arc::clone(&link) as Arc<dyn Driver>);
@@ -96,6 +105,25 @@ impl Link {
         let first = self.first.load(Ordering::SeqCst);
         usize::from(first) == side || first == NO_SIDE
     }
+    /// When the hold of `side`, which ends the connection first and closed
+    /// at `closed`, ends: `None` while its bytes still go (`FIN_WAIT1`).
+    /// From its end, or its close if later, it waits up to
+    /// `tcp_fin_timeout` for the other side's end (`FIN_WAIT2`), and is in
+    /// `TIME_WAIT` for `TCP_TIMEWAIT_LEN` from that end, as Linux's
+    /// `tcp_time_wait` and `tcp_timewait_state_process` move it on.
+    fn holds_until(&self, side: usize, closed: u64) -> Option<u64> {
+        let own = self.ended[side].load(Ordering::SeqCst);
+        if own == NOT_ENDED {
+            return None;
+        }
+        let waits = own.max(closed).saturating_add(TIME_WAIT);
+        let peer = self.ended[1 - side].load(Ordering::SeqCst);
+        Some(if peer < waits {
+            peer.saturating_add(TIME_WAIT)
+        } else {
+            waits
+        })
+    }
     /// Moves what each side sends to the other, as far as the other's
     /// buffer takes it, and each side's end once its bytes have gone. A
     /// side that sends to a closed peer gets a reset, as Linux's peer
@@ -119,6 +147,9 @@ impl Link {
                     } else {
                         ECONNRESET
                     });
+                } else if own.finished().0 || own.finished().1 {
+                    // The end still reaches the closed side's hold.
+                    self.end(&mut ends.ended, from);
                 }
                 continue;
             }
@@ -131,19 +162,32 @@ impl Link {
             }
             let (shut, closed) = own.finished();
             if (shut || (closed && own.queued().1 == 0)) && !ends.ended[from] {
-                ends.ended[from] = true;
-                let _ = self.first.compare_exchange(
-                    NO_SIDE,
-                    from as u8,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
+                self.end(&mut ends.ended, from);
                 peer.end();
             }
         }
         if ends.streams.iter().all(|stream| stream.finished().1) {
             *guard = None;
         }
+    }
+}
+impl Link {
+    /// `from`'s end has reached the other side now.
+    fn end(&self, ended: &mut [bool; 2], from: usize) {
+        if ended[from] {
+            return;
+        }
+        ended[from] = true;
+        // Without the host's clock the end counts as long past, so that no
+        // hold waits on it.
+        let now = self
+            .host
+            .clock(paludarium_host::ClockId::Monotonic)
+            .unwrap_or(0);
+        self.ended[from].store(now, Ordering::SeqCst);
+        let _ =
+            self.first
+                .compare_exchange(NO_SIDE, from as u8, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 impl Driver for Link {
@@ -181,11 +225,12 @@ pub(crate) struct Binding {
     /// gone.
     pub(crate) time_wait: Option<TimeWait>,
 }
-/// When a hold in `TIME_WAIT` ends, and its connection and side: a reset,
-/// or the other side's end reaching it first, ends it sooner.
+/// A hold in `TIME_WAIT`: when its socket closed, and its connection and
+/// side, whose ends time it ([`Link::holds_until`]); a reset, or the other
+/// side's end reaching it first, ends it at once.
 #[derive(Clone)]
 pub(crate) struct TimeWait {
-    until: u64,
+    closed: u64,
     link: Arc<Link>,
     side: usize,
 }
@@ -271,27 +316,30 @@ impl Ports {
     /// side no longer ends its connection first.
     pub(crate) fn expire(&mut self, now: u64) {
         self.bindings.retain(|binding| {
-            binding
-                .time_wait
-                .as_ref()
-                .is_none_or(|wait| wait.until > now && wait.link.closes_first(wait.side))
+            binding.time_wait.as_ref().is_none_or(|wait| {
+                wait.link.closes_first(wait.side)
+                    && wait
+                        .link
+                        .holds_until(wait.side, wait.closed)
+                        .is_none_or(|until| until > now)
+            })
         });
     }
-    /// `owner`, which ends `link` first from `side`, keeps its port in
-    /// `TIME_WAIT` until `until`, as it was, with its `SO_REUSEADDR`:
+    /// `owner`, which ends `link` first from `side`, closed at `closed` and
+    /// keeps its port in `TIME_WAIT`, as it was, with its `SO_REUSEADDR`:
     /// Linux's `inet_twsk_hashdance` puts a `TIME_WAIT` socket in its bind
     /// bucket.
     pub(crate) fn linger(
         &mut self,
         owner: &Weak<InetSocket>,
         (link, side): (&Arc<Link>, usize),
-        until: u64,
+        closed: u64,
     ) {
         for binding in &mut self.bindings {
             if binding.is(owner) {
                 binding.owner = Weak::new();
                 binding.time_wait = Some(TimeWait {
-                    until,
+                    closed,
                     link: Arc::clone(link),
                     side,
                 });

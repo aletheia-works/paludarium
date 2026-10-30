@@ -607,9 +607,11 @@ one only with an `--allow-net`.
   secret changes at each boot). A listener that stops or closes takes no
   more. UDP sockets sharing a port likewise share its datagrams.
 - **`TIME_WAIT`**: the side that closes a connection first, a client or
-  an accepted connection, holds its port for 60 seconds from its `close`,
-  also while the bytes it sent are still on their way, as Linux's
-  `TCP_TIMEWAIT_LEN`: a `bind` there is `EADDRINUSE`, also with
+  an accepted connection, holds its port as Linux does: while the bytes it
+  sent are still on their way (`FIN_WAIT1`), then up to 60 seconds from its
+  `close`, or from when those bytes have gone if later, for the other
+  side's end (`FIN_WAIT2`, `tcp_fin_timeout`), and 60 seconds from that end
+  (`TCP_TIMEWAIT_LEN`). A `bind` there is `EADDRINUSE`, also with
   `SO_REUSEADDR` unless the closed socket had it too (an accepted one has
   its listener's). The side that closes second holds nothing, and a reset
   (below), also one answering a send to the closed side, ends the hold.

@@ -125,6 +125,17 @@ fn native_status(status: std::process::ExitStatus) -> Result<ExitStatus, String>
 
 /// Runs `program` directly on the host with `argv0` and `args`.
 pub fn run_native(program: &Path, argv0: &str, args: &[String]) -> Result<Outcome, String> {
+    run_native_within(program, argv0, args, TIMEOUT)
+}
+
+/// [`run_native`] with a time limit of `limit` instead of [`TIMEOUT`], for
+/// a case that waits out a timer of Linux's own.
+pub fn run_native_within(
+    program: &Path,
+    argv0: &str,
+    args: &[String],
+    limit: Duration,
+) -> Result<Outcome, String> {
     let started = Instant::now();
     let mut command = Command::new(program);
     #[cfg(unix)]
@@ -148,7 +159,7 @@ pub fn run_native(program: &Path, argv0: &str, args: &[String]) -> Result<Outcom
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             break status;
         }
-        if started.elapsed() > TIMEOUT {
+        if started.elapsed() > limit {
             let _ = child.kill();
             return Err(format!("native run of {} timed out", program.display()));
         }

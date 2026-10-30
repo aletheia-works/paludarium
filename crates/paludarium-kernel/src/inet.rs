@@ -1576,7 +1576,7 @@ impl InetSocket {
         *child.options() = options;
         let own = Stream::new(from);
         own.set_waker(stream_waker(&child.signals, &child.hub, &own));
-        let joined = Link::join(stream, &own, from, to);
+        let joined = Link::join(stream, &own, (from, to), &self.host);
         let _ = link.set(Arc::clone(&joined));
         let own_link = Arc::new(OnceLock::new());
         let _ = own_link.set(joined);
@@ -1803,8 +1803,7 @@ impl Drop for InetSocket {
             && let Some((link, side)) = finish(&stream, s.link.as_ref(), abort)
             && let Some(now) = self.now()
         {
-            let until = now.saturating_add(crate::loopback::TIME_WAIT);
-            self.ports().linger(&self.this, (&link, side), until);
+            self.ports().linger(&self.this, (&link, side), now);
         }
     }
 }

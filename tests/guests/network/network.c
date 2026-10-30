@@ -922,6 +922,49 @@ int main(int argc, char **argv) {
         printf("  udp connected=%d other=%d\n", counts[0], counts[1]);
         return 0;
     }
+    if (!strcmp(mode, "listen-fin-wait")) {
+        /* The side that closes first waits for the peer's end up to 60
+           seconds from its close (FIN_WAIT2, tcp_fin_timeout), then keeps
+           its port in TIME_WAIT for 60 seconds from that end. The checks
+           sit 10 seconds or more from each change, as Linux's timers run a
+           few seconds late. */
+        int port, result;
+        int l = listener(8, &port);
+        int c[3], s[3], at[3];
+        for (int i = 0; i < 3; i++) {
+            c[i] = client(port, 0, &result);
+            s[i] = accept(l, NULL, NULL);
+            at[i] = port_of(c[i]);
+        }
+        long start = now_ms();
+        /* 0: the peer stays open. 1: the peer closes at 30 seconds. 2: shut
+           down at once, closed at 30 seconds, the peer staying open. */
+        close(c[0]);
+        close(c[1]);
+        shutdown(c[2], SHUT_WR);
+        static const struct {
+            int second, which;
+            const char *name;
+        } checks[] = {{50, 0, "open-50"}, {70, 0, "open-70"},  {70, 1, "late-70"},
+                      {80, 1, "late-80"}, {80, 2, "shut-80"}, {100, 1, "late-100"},
+                      {100, 2, "shut-100"}};
+        int closed = 0;
+        for (unsigned i = 0; i < sizeof checks / sizeof *checks; i++) {
+            if (!closed && checks[i].second > 30) {
+                long wait = start + 30000 - now_ms();
+                if (wait > 0) usleep(wait * 1000);
+                close(s[1]);
+                close(c[2]);
+                closed = 1;
+            }
+            long wait = start + checks[i].second * 1000L - now_ms();
+            if (wait > 0) usleep(wait * 1000);
+            int t = tcp(0);
+            bind_to(checks[i].name, t, htonl(INADDR_LOOPBACK), at[checks[i].which]);
+            close(t);
+        }
+        return 0;
+    }
     if (!strcmp(mode, "listen-reset")) {
         /* What ends a loopback connection with a reset. */
         int port, result;

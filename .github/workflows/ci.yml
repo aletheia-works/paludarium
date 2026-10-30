@@ -227,6 +227,10 @@ jobs:
       # runner hands cores to its crash handler instead.
       - name: Write cores to the working directory
         run: sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0
+      # The AF_UNIX datagram case fills a queue to the kernel's default
+      # net.unix.max_dgram_qlen, which the runner's systemd raises.
+      - name: Keep the default AF_UNIX datagram queue length
+        run: sudo sysctl -w net.unix.max_dgram_qlen=10
       - name: Record native architectural profile
         run: |
           mkdir -p target/encodings-guests
@@ -272,6 +276,10 @@ jobs:
       # runner hands cores to its crash handler instead.
       - name: Write cores to the working directory
         run: sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0
+      # The AF_UNIX datagram case fills a queue to the kernel's default
+      # net.unix.max_dgram_qlen, which the runner's systemd raises.
+      - name: Keep the default AF_UNIX datagram queue length
+        run: sudo sysctl -w net.unix.max_dgram_qlen=10
       - name: Record native architectural profile
         run: |
           mkdir -p target/encodings-guests

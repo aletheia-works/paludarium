@@ -52,7 +52,8 @@ PALUDARIUM_TEST_NODE=<absolute path to node> cargo test --locked --workspace
 `mise tasks` lists the other checks (differential tests, coverage, fuzzing).
 On x86-64 Linux, `mise run test:diff` needs
 `sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0` for the
-core-dump case, as CI sets.
+core-dump case and `sudo sysctl -w net.unix.max_dgram_qlen=10` for the
+unix-datagram case, as CI sets.
 A new process case is a mode of `tests/guests/processes/process.c`, listed in
 `tests/guests/processes/cases.json` and in the `cases!` list of
 `crates/paludarium-harness/tests/diff_processes.rs`; a test fails when the two

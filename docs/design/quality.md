@@ -23,6 +23,10 @@ CI run produces them afresh on an x86-64 Linux runner.
   (`core`, with `core_uses_pid` 0). CI sets it with `sysctl`; elsewhere the
   case stops and says so, rather than compare with a core sent to a crash
   handler.
+- The AF_UNIX datagram case needs the kernel's default
+  `net.unix.max_dgram_qlen` of 10, which systemd raises on many hosts. CI
+  sets it with `sysctl` (a container's own network namespace has it);
+  elsewhere the case stops and says so.
 - The native side must be a real x86-64 Linux. Docker on an Arm Mac runs
   x86-64 programs under QEMU's user-mode emulation, which handles signals
   itself, so there even native results can differ from Linux: a stopped and

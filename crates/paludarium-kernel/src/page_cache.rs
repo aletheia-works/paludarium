@@ -506,6 +506,9 @@ impl HostFs for CoherentFs {
     fn mkdir(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
         self.inner.mkdir(path, mode)
     }
+    fn make_socket(&self, path: &[u8], mode: u32) -> Result<FileStat, Errno> {
+        self.inner.make_socket(path, mode)
+    }
     fn unlink(&self, path: &[u8], directory: bool) -> Result<(), Errno> {
         self.inner.unlink(path, directory)
     }

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -3874,6 +3875,120 @@ int main(int argc, char **argv) {
         unlink(p.sun_path);
         unix_call("socket-protocol", socket(AF_UNIX, SOCK_STREAM, 2));
         unix_call("socket-type", socket(AF_UNIX, 4, 0));
+        return 0;
+    }
+    if (!strcmp(mode, "unix-path")) {
+        /* AF_UNIX sockets bound to paths in the file system (af_unix.c's
+           unix_bind_bsd and unix_find_bsd): the socket file bind makes, what
+           finds it (its inode, so a rename keeps it and an unlink loses it),
+           and the errors of each. It works in a directory of its own. */
+        signal(SIGPIPE, SIG_IGN);
+        char dir[64];
+        snprintf(dir, sizeof dir, "unix-path-%d", getpid());
+        mkdir(dir, 0700);
+        if (chdir(dir)) return 98;
+        umask(022);
+        struct sockaddr_un a = {.sun_family = AF_UNIX};
+        socklen_t len;
+#define UNIX_PATH(p) (strcpy(a.sun_path, p), len = (socklen_t)(sizeof(sa_family_t) + strlen(p)), (void *)&a)
+        char buf[16];
+        struct stat st;
+        int l = socket(AF_UNIX, SOCK_STREAM, 0);
+        unix_call("bind", bind(l, UNIX_PATH("sock"), len));
+        {
+            struct sockaddr_un n;
+            socklen_t n_len = sizeof n;
+            memset(&n, 0x55, sizeof n);
+            getsockname(l, (void *)&n, &n_len);
+            printf("name len=%u path=%s\n", (unsigned)n_len, n.sun_path);
+        }
+        unix_call("stat", stat("sock", &st));
+        printf("socket=%d mode=%o size=%lld\n", S_ISSOCK(st.st_mode), (unsigned)(st.st_mode & 07777), (long long)st.st_size);
+        unix_call("bind-again", bind(l, UNIX_PATH("sock2"), len));
+        unix_call("again-left", access("sock2", F_OK));
+        int o = socket(AF_UNIX, SOCK_STREAM, 0);
+        unix_call("bind-in-use", bind(o, UNIX_PATH("sock"), len));
+        unix_call("bind-missing-dir", bind(o, UNIX_PATH("missing/sock"), len));
+        close(open("file", O_CREAT | O_WRONLY, 0600));
+        unix_call("bind-file", bind(o, UNIX_PATH("file"), len));
+        unix_call("bind-under-file", bind(o, UNIX_PATH("file/sock"), len));
+        symlink("nowhere", "dangling");
+        unix_call("bind-dangling", bind(o, UNIX_PATH("dangling"), len));
+        unix_call("dangling-left", access("nowhere", F_OK));
+        unix_call("connect-not-listening", connect(o, UNIX_PATH("sock"), len));
+        unix_call("open", open("sock", O_RDONLY));
+        {
+            DIR *d = opendir(".");
+            struct dirent *e;
+            while ((e = readdir(d)))
+                if (!strcmp(e->d_name, "sock")) printf("dirent-sock=%d\n", e->d_type == DT_SOCK);
+            closedir(d);
+        }
+        unix_call("listen", listen(l, 4));
+        int client = socket(AF_UNIX, SOCK_STREAM, 0);
+        unix_call("connect", connect(client, UNIX_PATH("sock"), len));
+        int server = accept(l, NULL, NULL);
+        {
+            struct sockaddr_un n;
+            socklen_t n_len = sizeof n;
+            getpeername(client, (void *)&n, &n_len);
+            printf("peer len=%u path=%s\n", (unsigned)n_len, n.sun_path);
+            send(server, "hi", 2, 0);
+            n_len = sizeof n;
+            memset(&n, 0x55, sizeof n);
+            long r = recvfrom(client, buf, sizeof buf, 0, (void *)&n, &n_len);
+            printf("from=%ld len=%u path=%s\n", r, (unsigned)n_len, n.sun_path);
+        }
+        int dg = socket(AF_UNIX, SOCK_DGRAM, 0);
+        unix_call("connect-other-type", connect(dg, UNIX_PATH("sock"), len));
+        int sp = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        unix_call("connect-packet-to-stream", connect(sp, UNIX_PATH("sock"), len));
+        unix_call("connect-file", connect(o, UNIX_PATH("file"), len));
+        unix_call("connect-missing", connect(o, UNIX_PATH("missing"), len));
+        unix_call("connect-under-file", connect(o, UNIX_PATH("file/x"), len));
+        /* The path ends at its first 0. */
+        memcpy(a.sun_path, "sock\0junk", 9);
+        unix_call("connect-nul", connect(socket(AF_UNIX, SOCK_STREAM, 0), (void *)&a, sizeof(sa_family_t) + 9));
+        unix_call("rename", rename("sock", "moved"));
+        unix_call("connect-renamed", connect(socket(AF_UNIX, SOCK_STREAM, 0), UNIX_PATH("moved"), len));
+        unix_call("connect-old-name", connect(o, UNIX_PATH("sock"), len));
+        symlink("moved", "link");
+        unix_call("connect-symlink", connect(socket(AF_UNIX, SOCK_STREAM, 0), UNIX_PATH("link"), len));
+        unix_call("unlink", unlink("moved"));
+        unix_call("connect-unlinked", connect(o, UNIX_PATH("link"), len));
+        {
+            struct sockaddr_un n;
+            socklen_t n_len = sizeof n;
+            getsockname(l, (void *)&n, &n_len);
+            printf("name-after-unlink len=%u path=%s\n", (unsigned)n_len, n.sun_path);
+        }
+        unix_call("bind-unlinked-name", bind(o, UNIX_PATH("sock"), len));
+        unix_call("connect-new-socket", connect(client = socket(AF_UNIX, SOCK_STREAM, 0), UNIX_PATH("sock"), len));
+        close(o);
+        unix_call("connect-closed", connect(socket(AF_UNIX, SOCK_STREAM, 0), UNIX_PATH("sock"), len));
+        unix_call("closed-left", stat("sock", &st));
+        printf("closed-socket=%d\n", S_ISSOCK(st.st_mode));
+        /* Datagrams to a path, and the sender's path. */
+        int r = socket(AF_UNIX, SOCK_DGRAM, 0);
+        unix_call("bind-dgram", bind(r, UNIX_PATH("dgram"), len));
+        unix_call("sendto-unbound", sendto(dg, "one", 3, 0, UNIX_PATH("dgram"), len));
+        int named = socket(AF_UNIX, SOCK_DGRAM, 0);
+        bind(named, UNIX_PATH("dgram-b"), len);
+        unix_call("sendto-named", sendto(named, "two", 3, 0, UNIX_PATH("dgram"), len));
+        unix_call("sendto-stream-path", sendto(named, "x", 1, 0, UNIX_PATH("sock"), len));
+        unix_call("sendto-missing", sendto(named, "x", 1, 0, UNIX_PATH("missing"), len));
+        for (int i = 0; i < 2; i++) {
+            struct sockaddr_un n;
+            socklen_t n_len = sizeof n;
+            memset(&n, 0, sizeof n);
+            long got = recvfrom(r, buf, sizeof buf, MSG_DONTWAIT, (void *)&n, &n_len);
+            printf("dgram-from=%ld len=%u path=%s\n", got, (unsigned)n_len, n.sun_path);
+        }
+#undef UNIX_PATH
+        const char *made[] = {"sock", "file", "dangling", "link", "dgram", "dgram-b"};
+        for (unsigned i = 0; i < sizeof made / sizeof *made; i++) unlink(made[i]);
+        if (chdir("..")) return 97;
+        unix_call("rmdir", rmdir(dir));
         return 0;
     }
     if (!strcmp(mode, "unix-datagram")) {

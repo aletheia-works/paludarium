@@ -128,6 +128,12 @@ pub trait HostFs: Send + Sync {
     fn statfs(&self, _path: &[u8]) -> Result<FsStats, Errno> {
         Err(Errno::ENOSYS)
     }
+    /// `mknod` of a socket (`S_IFSOCK`) at `path`, which must not exist, with
+    /// the permission bits of `mode`, as `bind` of an AF_UNIX socket to a
+    /// path makes one; its status, whose inode the socket is found by.
+    fn make_socket(&self, _path: &[u8], _mode: u32) -> Result<FileStat, Errno> {
+        Err(Errno::EPERM)
+    }
     /// `chmod`: replaces the permission bits of `path` (following a final
     /// symbolic link) with the low 12 bits of `mode`.
     fn set_mode(&self, _path: &[u8], _mode: u32) -> Result<(), Errno> {

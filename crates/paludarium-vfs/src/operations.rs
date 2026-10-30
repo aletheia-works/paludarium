@@ -66,6 +66,10 @@ impl HostFs for MemFs {
         if matches!(n.kind, Kind::Symlink(_)) {
             return Err(Errno(40));
         }
+        // A socket file opens no file, as Linux's `no_open` (ENXIO).
+        if matches!(n.kind, Kind::Socket) {
+            return Err(Errno(6));
+        }
         if flags & 65536 != 0 && !matches!(n.kind, Kind::Dir(_)) {
             return Err(Errno::ENOTDIR);
         }
@@ -148,6 +152,11 @@ impl HostFs for MemFs {
     fn mkdir(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
         lock(&self.tree).insert(path, Kind::Dir(BTreeMap::new()), 0o040000 | (mode & 0o7777))?;
         Ok(())
+    }
+    fn make_socket(&self, path: &[u8], mode: u32) -> Result<FileStat, Errno> {
+        let mut t = lock(&self.tree);
+        let id = t.insert(path, Kind::Socket, 0o140000 | (mode & 0o7777))?;
+        Ok(lock(&*t.node(id)?).stat(id))
     }
     fn unlink(&self, path: &[u8], directory: bool) -> Result<(), Errno> {
         let mut t = lock(&self.tree);

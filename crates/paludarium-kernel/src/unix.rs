@@ -27,6 +27,7 @@ const ENOTCONN: Errno = Errno(107);
 const ECONNREFUSED: Errno = Errno(111);
 const EOPNOTSUPP: Errno = Errno(95);
 const EPERM: Errno = Errno(1);
+const EPROTOTYPE: Errno = Errno(91);
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
 const SOCK_SEQPACKET: u32 = 5;
@@ -42,16 +43,23 @@ const SOCKADDR_UN: usize = 110;
 /// The abstract names bound on the machine, by socket type and name, as
 /// Linux's `unix_socket_table` hashes them with the type, so that sockets of
 /// different types can share one; and where an autobind looks for the next
-/// free one.
+/// free one. A socket bound to a path is found by its socket file instead,
+/// by the file's mount and inode, as Linux's `unix_find_socket_byinode`.
 #[derive(Default)]
 pub(crate) struct Names {
     bound: Mutex<Bound>,
+    files: Mutex<BTreeMap<Inode, Weak<UnixSocket>>>,
     next: AtomicU32,
 }
 type Bound = BTreeMap<(u32, Vec<u8>), Weak<UnixSocket>>;
+/// A socket file: its mount's device number, and its inode there.
+type Inode = (u64, u64);
 impl Names {
     fn lock(&self) -> MutexGuard<'_, Bound> {
         self.bound.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn files(&self) -> MutexGuard<'_, BTreeMap<Inode, Weak<UnixSocket>>> {
+        self.files.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 /// A socket's name, once it is bound: the whole `sun_path` it gave,
@@ -82,6 +90,8 @@ struct State {
     /// which alone may send to it, and that socket's name; it stays when
     /// that socket goes, until a send finds it gone.
     to: Option<(Weak<UnixSocket>, Address)>,
+    /// The socket file a socket bound to a path made, which finds it.
+    file: Option<Inode>,
 }
 /// A listening socket's connections that wait for `accept`.
 struct Listen {
@@ -149,7 +159,7 @@ pub(crate) fn dispatch(
         }
         49 => {
             let address = read_address(c, a[1], a[2])?;
-            socket.bind(&address).map(|()| 0)
+            socket.bind(c, &address).map(|()| 0)
         }
         // sock_no_listen.
         50 if socket.datagram() => Err(EOPNOTSUPP),
@@ -219,17 +229,29 @@ pub(crate) fn validate(address: &[u8]) -> Result<(), Errno> {
 }
 /// The socket of `kind` a valid `address` names, as Linux's
 /// `unix_find_other`: one bound to that abstract name (`ECONNREFUSED` where
-/// none is). A path in the file system has no socket here: `ENOENT`, or
-/// `ECONNREFUSED` for another file there.
+/// none is), or to the socket file a path leads to, as `unix_find_bsd`
+/// looks it up: the path's error, `ECONNREFUSED` for a file that is no
+/// socket's or one whose socket has gone, `EPROTOTYPE` for a socket of
+/// another type.
 pub(crate) fn find(c: &Context<'_>, address: &[u8], kind: u32) -> Result<Arc<UnixSocket>, Errno> {
     let name = &address[SUN_PATH..];
     if name[0] != 0 {
-        let path: Vec<u8> = name.iter().copied().take_while(|&b| b != 0).collect();
-        let path = c.files.exec_path(path)?;
-        return Err(match c.files.fs.metadata(&path, true) {
-            Ok(_) => ECONNREFUSED,
-            Err(e) => e,
-        });
+        let path = c.files.exec_path(path_of(name))?;
+        let stat = c.files.fs.metadata(&path, true)?;
+        if stat.mode & 0o170000 != 0o140000 {
+            return Err(ECONNREFUSED);
+        }
+        let socket = c
+            .files
+            .unix
+            .files()
+            .get(&inode(c, &path, stat.inode))
+            .and_then(Weak::upgrade)
+            .ok_or(ECONNREFUSED)?;
+        if socket.end.kind() != kind {
+            return Err(EPROTOTYPE);
+        }
+        return Ok(socket);
     }
     c.files
         .unix
@@ -237,6 +259,16 @@ pub(crate) fn find(c: &Context<'_>, address: &[u8], kind: u32) -> Result<Arc<Uni
         .get(&(kind, name.to_vec()))
         .and_then(Weak::upgrade)
         .ok_or(ECONNREFUSED)
+}
+/// The path a `sun_path` that does not start with 0 names: up to its first
+/// 0, as Linux's `unix_mkname_bsd` ends it.
+fn path_of(name: &[u8]) -> Vec<u8> {
+    name.iter().copied().take_while(|&b| b != 0).collect()
+}
+/// The socket file at `path` with inode `inode`, as [`Names`] keys it.
+fn inode(c: &Context<'_>, path: &[u8], inode: u64) -> Inode {
+    let mounts = c.files.fs.mounts();
+    (crate::page_cache::mount_device(&mounts, path), inode)
 }
 
 impl UnixSocket {
@@ -278,15 +310,15 @@ impl UnixSocket {
     /// which takes a free name of five hex digits (and keeps one the socket
     /// has); a name in the abstract namespace is taken unless another
     /// socket has it (`EADDRINUSE`), and once bound a socket binds no more
-    /// (`EINVAL`). A path in the file system is not bound here (`ENOSYS`).
-    fn bind(&self, address: &[u8]) -> Result<(), Errno> {
+    /// (`EINVAL`). A path is bound as [`Self::bind_path`].
+    fn bind(&self, c: &Context<'_>, address: &[u8]) -> Result<(), Errno> {
         if address.len() == SUN_PATH && address[..2] == 1u16.to_le_bytes() {
             return self.autobind();
         }
         validate(address)?;
         let name = &address[SUN_PATH..];
         if name[0] != 0 {
-            return Err(Errno::ENOSYS);
+            return self.bind_path(c, &path_of(name));
         }
         let _s = self.lock();
         if self.name.get().is_some() {
@@ -302,6 +334,32 @@ impl UnixSocket {
         }
         bound.insert(key, Weak::clone(&self.this));
         let _ = self.name.set(name.to_vec());
+        Ok(())
+    }
+    /// `bind` to a path, as Linux's `unix_bind_bsd`: the socket file is made
+    /// first, with mode 0777 less the umask, so a path that exists, even a
+    /// dangling symbolic link, is `EADDRINUSE`, and one whose directory does
+    /// not is that error; a socket already bound then takes the file away
+    /// again and is `EINVAL`. Its name is the path, ended with a 0.
+    fn bind_path(&self, c: &Context<'_>, path: &[u8]) -> Result<(), Errno> {
+        let full = c.files.exec_path(path.to_vec())?;
+        let stat = c
+            .files
+            .fs
+            .make_socket(&full, 0o777 & !c.files.umask())
+            .map_err(|e| if e == Errno::EEXIST { EADDRINUSE } else { e })?;
+        let key = inode(c, &full, stat.inode);
+        let mut s = self.lock();
+        if self.name.get().is_some() {
+            drop(s);
+            let _ = c.files.fs.unlink(&full, false);
+            return Err(Errno::EINVAL);
+        }
+        self.names.files().insert(key, Weak::clone(&self.this));
+        let mut name = path.to_vec();
+        name.push(0);
+        let _ = self.name.set(name);
+        s.file = Some(key);
         Ok(())
     }
     pub(crate) fn autobind(&self) -> Result<(), Errno> {
@@ -578,6 +636,16 @@ impl Drop for UnixSocket {
                 .is_some_and(|socket| std::ptr::eq(socket.as_ptr(), self))
             {
                 bound.remove(&key);
+            }
+        }
+        // The file stays, but finds no socket any more.
+        if let Some(file) = &s.file {
+            let mut files = self.names.files();
+            if files
+                .get(file)
+                .is_some_and(|socket| std::ptr::eq(socket.as_ptr(), self))
+            {
+                files.remove(file);
             }
         }
         if let Some(listen) = s.listen {

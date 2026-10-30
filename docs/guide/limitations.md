@@ -28,11 +28,12 @@ verified.
     Multicast and broadcast datagrams reach no one. Raw sockets are `EPERM`,
     ICMP sockets `EACCES`, and other kinds (SCTP's `SOCK_SEQPACKET`, which
     Linux loads a module for) `ESOCKTNOSUPPORT`.
-  - An AF_UNIX socket
-    binds only to a name in the abstract namespace: `bind` to a path is
-    `ENOSYS`, as `connect` and `bind` on a socket pair are, so a `connect`
-    to a path finds no socket (`ENOENT`, or `ECONNREFUSED` for another
-    file there). `SO_PEERCRED` of a connection names the connecting process
+  - An AF_UNIX socket binds to a path only in the guest's own file
+    system: under a directory mounted from the host, `bind` to a path is
+    `EPERM`, and a host's socket file there finds no socket
+    (`ECONNREFUSED`). `connect` and `bind` on a socket pair are `ENOSYS`,
+    and a socket file's write permission is not checked, as for root.
+    `SO_PEERCRED` of a connection names the connecting process
     on both sides, where Linux names the listener's to the client. The
     garbage collector does not look at a listener's connections not yet
     accepted. A datagram socket that connects elsewhere, or finds the

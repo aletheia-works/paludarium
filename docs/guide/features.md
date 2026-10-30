@@ -151,6 +151,15 @@ kernel.
   is `ECONNRESET`. Connected, it is a socket pair end in all else. Names
   are kept per socket type, as Linux hashes them with the type, so a stream
   and a datagram socket may bind the same one.
+- An AF_UNIX socket also binds to a path, as Linux's `unix_bind_bsd`: `bind`
+  makes a socket file there (`S_IFSOCK`, mode 0777 less the umask), so a
+  path that exists, a dangling symbolic link too, is `EADDRINUSE`, and
+  `getsockname` gives the path ended with a 0. A connect or send to a path
+  finds the socket by its file's inode, as `unix_find_bsd`: through
+  symbolic links and after a `rename`, not once the file is unlinked;
+  `ECONNREFUSED` for a file that is no socket or whose socket has closed
+  (the file stays), `EPROTOTYPE` for a socket of another type. A socket
+  file opens nothing (`ENXIO`), and `readdir` gives it `DT_SOCK`.
 - `socket(AF_UNIX, SOCK_DGRAM)` (and `SOCK_RAW`, which Linux makes one)
   makes a datagram socket that binds as above, and sends with `sendto` to
   the socket of a name, or to the one it connected to, as Linux's

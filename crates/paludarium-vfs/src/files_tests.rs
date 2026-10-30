@@ -411,3 +411,21 @@ mod sparse_limits {
         assert_eq!(fs.statfs(b"/").unwrap().blocks_free, free);
     }
 }
+#[test]
+fn a_socket_file_is_made_once_and_opens_nothing() {
+    let fs = MemFs::new();
+    let made = fs.make_socket(b"/s", 0o755).unwrap();
+    let stat = fs.metadata(b"/s", true).unwrap();
+    assert_eq!(stat, made);
+    assert_eq!(stat.mode, 0o140755);
+    assert_eq!(stat.size, 0);
+    assert_eq!(fs.make_socket(b"/s", 0o755), Err(Errno::EEXIST));
+    assert_eq!(fs.make_socket(b"/missing/s", 0o755), Err(Errno::ENOENT));
+    assert_eq!(fs.open(b"/s", 0, 0).err(), Some(Errno(6)));
+    let entry = fs.read_dir(b"/").unwrap();
+    assert!(entry.iter().any(|e| e.name == b"s" && e.kind == 12));
+    // A rename keeps the inode that finds the socket.
+    fs.rename(b"/s", b"/t").unwrap();
+    assert_eq!(fs.metadata(b"/t", true).unwrap().inode, made.inode);
+    fs.unlink(b"/t", false).unwrap();
+}

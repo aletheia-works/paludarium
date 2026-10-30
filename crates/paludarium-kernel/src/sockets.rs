@@ -3377,7 +3377,13 @@ mod events_tests {
         let [a, b] = pair();
         pass(&a, &[b.clone() as Arc<dyn FileHandle>]);
         let gone = Arc::downgrade(&b);
+        // Nothing is collected until a socket goes: no other test's
+        // collection runs while this one looks.
+        let other = COLLECTION.lock().unwrap_or_else(PoisonError::into_inner);
         drop(b);
+        assert!(gone.upgrade().is_some());
+        assert!(!a.lock_sides()[1].closed);
+        drop(other);
         release_another();
         assert!(gone.upgrade().is_none());
         assert!(a.lock_sides()[1].closed);
@@ -3388,7 +3394,12 @@ mod events_tests {
         pass(&c, &[b.clone() as Arc<dyn FileHandle>]);
         let gone = [Arc::downgrade(&b), Arc::downgrade(&d)];
         let written = Arc::downgrade(&writer);
+        let other = COLLECTION.lock().unwrap_or_else(PoisonError::into_inner);
         drop((b, d, writer));
+        assert!(gone.iter().all(|end| end.upgrade().is_some()));
+        assert!(written.upgrade().is_some());
+        assert!(!a.lock_sides()[1].closed && !c.lock_sides()[1].closed);
+        drop(other);
         release_another();
         assert!(gone.iter().all(|end| end.upgrade().is_none()));
         assert!(written.upgrade().is_none());

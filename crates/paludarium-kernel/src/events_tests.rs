@@ -754,11 +754,83 @@ fn int_option(f: &mut Fixture, fd: u64, level: u64, name: u64) -> (u64, i32) {
     (r, i32::from_le_bytes(raw))
 }
 #[test]
+fn unix_sockets_bind_listen_accept_and_connect() {
+    let mut f = Fixture::new();
+    // An abstract `sockaddr_un` for `name` at `at`; its length.
+    let address = |f: &Fixture, at: u64, name: &[u8]| {
+        let mut raw = vec![1, 0, 0];
+        raw.extend_from_slice(name);
+        f.mem.write(GuestAddr(at), &raw).unwrap();
+        raw.len() as u64
+    };
+    let unix = |f: &mut Fixture, flags: u64| f.ret(41, [1, 1 | flags, 0, 0, 0, 0]);
+    let listener = unix(&mut f, 0);
+    let len = address(&f, DATA + 0x100, b"test");
+    assert_eq!(
+        f.ret(50, [listener, 1, 0, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
+    assert_eq!(f.ret(49, [listener, DATA + 0x100, len, 0, 0, 0]), 0);
+    let other = unix(&mut f, 0);
+    assert_eq!(
+        f.ret(49, [other, DATA + 0x100, len, 0, 0, 0]),
+        Errno(98).to_syscall_return()
+    );
+    assert_eq!(
+        f.ret(42, [other, DATA + 0x100, len, 0, 0, 0]),
+        Errno(111).to_syscall_return()
+    );
+    assert_eq!(f.ret(50, [listener, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(readable(&mut f, listener) & 1, 0);
+    // Backlog 0 takes one connection; a nonblocking one finds it full.
+    let client = unix(&mut f, 0x800);
+    assert_eq!(f.ret(42, [client, DATA + 0x100, len, 0, 0, 0]), 0);
+    let late = unix(&mut f, 0x800);
+    assert_eq!(
+        f.ret(42, [late, DATA + 0x100, len, 0, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    assert_eq!(readable(&mut f, listener) & 1, 1);
+    // Data goes before the accept.
+    f.mem.write(GuestAddr(DATA), b"hi").unwrap();
+    assert_eq!(f.ret(1, [client, DATA, 2, 0, 0, 0]), 2);
+    let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    assert!((server as i64) >= 0);
+    assert_eq!(f.ret(0, [server, DATA + 8, 8, 0, 0, 0]), 2);
+    // The accepted socket has the listener's name; the client has none.
+    f.mem
+        .write(GuestAddr(DATA + 0x80), &16u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(51, [server, DATA + 0x84, DATA + 0x80, 0, 0, 0]), 0);
+    let mut raw = [0; 4];
+    f.mem.read(GuestAddr(DATA + 0x80), &mut raw).unwrap();
+    assert_eq!(u32::from_le_bytes(raw), len as u32);
+    f.mem
+        .write(GuestAddr(DATA + 0x80), &16u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(52, [server, DATA + 0x84, DATA + 0x80, 0, 0, 0]), 0);
+    f.mem.read(GuestAddr(DATA + 0x80), &mut raw).unwrap();
+    assert_eq!(u32::from_le_bytes(raw), 2);
+    // A connection the listener closes before accepting it is reset.
+    let pending = unix(&mut f, 0x800);
+    assert_eq!(f.ret(42, [pending, DATA + 0x100, len, 0, 0, 0]), 0);
+    assert_eq!(f.ret(3, [listener, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(0, [pending, DATA + 8, 8, 0, 0, 0]),
+        Errno(104).to_syscall_return()
+    );
+    assert_eq!(f.ret(0, [pending, DATA + 8, 8, 0, 0, 0]), 0);
+    // The name is free again.
+    assert_eq!(f.ret(49, [other, DATA + 0x100, len, 0, 0, 0]), 0);
+}
+#[test]
 fn inet_sockets_need_a_network() {
     let mut f = Fixture::new();
     assert_eq!(f.ret(41, [2, 1, 0, 0, 0, 0]), Errno(97).to_syscall_return());
     let mut f = network_fixture(&["127.0.0.1:80"]);
-    assert_eq!(f.ret(41, [1, 1, 0, 0, 0, 0]), Errno(97).to_syscall_return());
+    // AF_UNIX makes streams and packet sockets, not yet datagram ones.
+    assert!((f.ret(41, [1, 1, 0, 0, 0, 0]) as i64) >= 0);
+    assert_eq!(f.ret(41, [1, 2, 0, 0, 0, 0]), Errno(97).to_syscall_return());
     assert_eq!(
         f.ret(41, [2, 1 | 0x100000, 0, 0, 0, 0]),
         Errno::EINVAL.to_syscall_return()

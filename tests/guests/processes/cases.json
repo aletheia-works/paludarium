@@ -58,6 +58,7 @@
     {"name":"dgram","binary":"process"},
     {"name":"scm-garbage","binary":"process"},
     {"name":"scm-rights","binary":"process"},
+    {"name":"unix-abstract","binary":"process"},
     {"name":"socket-flags","binary":"process"},
     {"name":"socket-oob","binary":"process"},
     {"name":"socket-options","binary":"process"},

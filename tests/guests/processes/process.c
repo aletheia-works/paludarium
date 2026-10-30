@@ -121,6 +121,37 @@ static void gc_trigger(int fd) {
     }
     if (fd < 0) usleep(200000);
 }
+/* An abstract AF_UNIX address for `name`, this process's own, into `a`;
+   its length. */
+static socklen_t unix_abstract(struct sockaddr_un *a, const char *name) {
+    memset(a, 0, sizeof *a);
+    a->sun_family = AF_UNIX;
+    int n = snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "paludarium-%d-%s", getpid(), name);
+    return (socklen_t)(sizeof(sa_family_t) + 1 + n);
+}
+static void unix_call(const char *name, long r) {
+    printf("%s=%ld errno=%d\n", name, r, r < 0 ? errno : 0);
+    errno = 0;
+}
+/* A socket's name or its peer's: whether it is `want`'s, or its length. */
+static void unix_name(const char *name, int fd, int peer, const struct sockaddr_un *want, socklen_t want_len) {
+    struct sockaddr_un a;
+    memset(&a, 0x55, sizeof a);
+    socklen_t len = sizeof a;
+    long r = peer ? getpeername(fd, (void *)&a, &len) : getsockname(fd, (void *)&a, &len);
+    /* A name holds this process's ID, so only an unnamed one's length is
+       printed. */
+    printf("%s=%ld errno=%d family=%d", name, r, r < 0 ? errno : 0, a.sun_family);
+    if (r == 0 && want) printf(" same=%d", len == want_len && !memcmp(&a, want, len));
+    else if (r == 0) printf(" len=%u", (unsigned)len);
+    printf("\n");
+    errno = 0;
+}
+static void unix_poll(const char *name, int fd) {
+    struct pollfd p = {.fd = fd, .events = POLLIN | POLLOUT | POLLRDHUP};
+    poll(&p, 1, 0);
+    printf("%s revents=%#x\n", name, (unsigned)p.revents);
+}
 /* Whether descriptors `a` and `b` are the same file. */
 static int same_file(int a, int b) {
     struct stat x, y;
@@ -3709,6 +3740,120 @@ int main(int argc, char **argv) {
             close(sv[0]);
             close(sv[1]);
         }
+        return 0;
+    }
+    if (!strcmp(mode, "unix-abstract")) {
+        /* AF_UNIX sockets from socket(), named in the abstract namespace
+           (af_unix.c): bind, listen, connect, accept and the names, the
+           errors of each state, and a listener's close resetting what it
+           had not accepted. An autobound name is random: only its length is
+           printed. */
+        signal(SIGPIPE, SIG_IGN);
+        int types[] = {SOCK_STREAM, SOCK_SEQPACKET};
+        for (int t = 0; t < 2; t++) {
+            int type = types[t];
+            struct sockaddr_un a;
+            char buf[16];
+            printf("type=%d\n", type);
+            int u = socket(AF_UNIX, type, 0);
+            unix_call("socket-ok", u >= 0 ? 0 : -1);
+            unix_name("name-unbound", u, 0, NULL, 0);
+            unix_name("peer-unbound", u, 1, NULL, 0);
+            unix_poll("unbound", u);
+            unix_call("send-unbound", send(u, "x", 1, 0));
+            unix_call("recv-unbound", recv(u, buf, 1, MSG_DONTWAIT));
+            unix_call("listen-unbound", listen(u, 1));
+            unix_call("accept-unbound", accept(u, NULL, NULL));
+            close(u);
+            int l = socket(AF_UNIX, type, 0);
+            socklen_t len = unix_abstract(&a, "listener");
+            unix_call("bind-short", bind(l, (void *)&a, 1));
+            a.sun_family = AF_INET;
+            unix_call("bind-family", bind(l, (void *)&a, len));
+            a.sun_family = AF_UNIX;
+            unix_call("bind", bind(l, (void *)&a, len));
+            unix_name("name-bound", l, 0, &a, len);
+            unix_call("bind-again", bind(l, (void *)&a, len));
+            int o = socket(AF_UNIX, type, 0);
+            unix_call("bind-in-use", bind(o, (void *)&a, len));
+            unix_call("connect-not-listening", connect(o, (void *)&a, len));
+            unix_call("listen", listen(l, 1));
+            unix_poll("listen-empty", l);
+            unix_call("listen-again", listen(l, 5));
+            int pending[3];
+            for (int i = 0; i < 3; i++) {
+                pending[i] = socket(AF_UNIX, type | SOCK_NONBLOCK, 0);
+                unix_call("connect", connect(pending[i], (void *)&a, len));
+            }
+            unix_poll("listen-pending", l);
+            unix_poll("client-pending", pending[0]);
+            unix_name("client-peer", pending[0], 1, &a, len);
+            unix_name("client-name", pending[0], 0, NULL, 0);
+            unix_call("connect-again", connect(pending[0], (void *)&a, len));
+            unix_call("connect-listener", connect(l, (void *)&a, len));
+            unix_call("send-pending", send(pending[0], "hi", 2, 0));
+            struct sockaddr_un peer;
+            socklen_t peer_len = sizeof peer;
+            memset(&peer, 0x55, sizeof peer);
+            int s = accept4(l, (void *)&peer, &peer_len, SOCK_CLOEXEC);
+            unix_call("accept-ok", s >= 0 ? 0 : -1);
+            printf("accept-address len=%u family=%d\n", (unsigned)peer_len, peer.sun_family);
+            printf("cloexec=%d nonblock=%d\n", !!(fcntl(s, F_GETFD) & FD_CLOEXEC),
+                   !!(fcntl(s, F_GETFL) & O_NONBLOCK));
+            unix_name("server-name", s, 0, &a, len);
+            unix_name("server-peer", s, 1, NULL, 0);
+            unix_poll("server", s);
+            unix_call("recv-server", recv(s, buf, sizeof buf, 0));
+            unix_call("send-server", send(s, "yo", 2, 0));
+            unix_call("recv-client", recv(pending[0], buf, sizeof buf, 0));
+            int on;
+            socklen_t on_len = sizeof on;
+            getsockopt(l, SOL_SOCKET, SO_ACCEPTCONN, &on, &on_len);
+            printf("acceptconn-listener=%d\n", on);
+            getsockopt(s, SOL_SOCKET, SO_ACCEPTCONN, &on, &on_len);
+            printf("acceptconn-server=%d\n", on);
+            unix_call("listen-connected", listen(s, 1));
+            unix_call("accept-connected", accept(s, NULL, NULL));
+            close(l);
+            usleep(10000);
+            unix_poll("pending-after-close", pending[1]);
+            unix_call("recv-reset", recv(pending[1], buf, sizeof buf, MSG_DONTWAIT));
+            unix_call("recv-after-reset", recv(pending[1], buf, sizeof buf, MSG_DONTWAIT));
+            unix_call("send-after-reset", send(pending[1], "x", 1, 0));
+            int late = socket(AF_UNIX, type, 0);
+            unix_call("connect-closed-name", connect(late, (void *)&a, len));
+            int again = socket(AF_UNIX, type, 0);
+            unix_call("bind-freed-name", bind(again, (void *)&a, len));
+            int autobound = socket(AF_UNIX, type, 0);
+            unix_call("autobind", bind(autobound, (void *)&a, sizeof(sa_family_t)));
+            unix_name("autobind-name", autobound, 0, NULL, 0);
+            unix_call("autobind-again", bind(autobound, (void *)&a, sizeof(sa_family_t)));
+            close(s);
+            for (int i = 0; i < 3; i++) close(pending[i]);
+            close(o);
+            close(late);
+            close(again);
+            close(autobound);
+        }
+        /* A full queue: backlog 0 takes one connection. */
+        struct sockaddr_un a;
+        socklen_t len = unix_abstract(&a, "full");
+        int full = socket(AF_UNIX, SOCK_STREAM, 0);
+        bind(full, (void *)&a, len);
+        listen(full, 0);
+        for (int i = 0; i < 3; i++) {
+            int c = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            unix_call("connect-full", connect(c, (void *)&a, len));
+        }
+        /* A path that no socket has. */
+        struct sockaddr_un p = {.sun_family = AF_UNIX};
+        strcpy(p.sun_path, "/nonexistent-socket");
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        unix_call("connect-missing-path", connect(c, (void *)&p, sizeof p));
+        strcpy(p.sun_path, "/");
+        unix_call("connect-not-a-socket", connect(c, (void *)&p, sizeof p));
+        unix_call("socket-protocol", socket(AF_UNIX, SOCK_STREAM, 2));
+        unix_call("socket-type", socket(AF_UNIX, 4, 0));
         return 0;
     }
     if (!strcmp(mode, "scm-garbage")) {

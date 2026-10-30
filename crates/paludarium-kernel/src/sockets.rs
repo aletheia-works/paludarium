@@ -258,8 +258,8 @@ impl FileHandle for PipeEnd {
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let number = c.cpu.gpr[paludarium_cpu::reg::RAX];
     let result = (|| match number {
-        // AF_INET and AF_INET6, with a network; AF_UNIX sockets come only
-        // from socketpair.
+        // AF_INET and AF_INET6, with a network, and AF_UNIX.
+        41 if a[0] == 1 => crate::unix::socket(c, a),
         41 => match c.files.network.clone() {
             Some(network) if matches!(a[0], 2 | 10) => {
                 if a[1] as u32 & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
@@ -276,6 +276,15 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         {
             let file = c.files.descriptor(a[0])?.file;
             crate::inet::dispatch(c, number, a, &file)
+        }
+        42 | 43 | 49 | 50 | 51 | 52 | 288
+            if let Some(socket) = c
+                .files
+                .descriptor(a[0])
+                .ok()
+                .and_then(|d| endpoint(&d.file).and_then(SocketPairEnd::unix)) =>
+        {
+            crate::unix::dispatch(c, number, a, &socket)
         }
         // A socket pair cannot connect or bind to a path.
         42 | 49 => {
@@ -1451,7 +1460,8 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_DEBUG => int(options.debug.into()),
         SO_REUSEADDR => int(options.reuse_address.into()),
         SO_TYPE => int(socket.pair.kind.cast_signed()),
-        SO_ERROR | SO_BSDCOMPAT | SO_REUSEPORT | SO_ACCEPTCONN | SO_PASSSEC | SO_PROTOCOL => int(0),
+        SO_ACCEPTCONN => int(i32::from(socket.unix().is_some_and(|u| u.listening()))),
+        SO_ERROR | SO_BSDCOMPAT | SO_REUSEPORT | SO_PASSSEC | SO_PROTOCOL => int(0),
         // As Linux's `sk_getsockopt`: each names only the form it set.
         name @ (SO_TIMESTAMP | SO_TIMESTAMPNS | SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW) => {
             let t = socket.lock_sides()[socket.side].timestamps;
@@ -1642,6 +1652,10 @@ fn passes(side: &Side) -> bool {
 #[derive(Default)]
 struct Side {
     bytes: VecDeque<u8>,
+    /// An AF_UNIX client whose connection a listener closed before it was
+    /// accepted: its next read is `ECONNRESET` (`unix_release_sock` sets
+    /// `sk_err`), once.
+    reset: bool,
     /// Remaining bytes per successful write, to retain poll callbacks when
     /// a peer consumes one write while later writes remain unread, and the
     /// descriptors the write passed.
@@ -1770,8 +1784,59 @@ pub(crate) struct SocketPairEnd {
     attributes: Attributes,
     /// The `SOL_SOCKET` options set on this end ([`Options`]).
     options: Mutex<Options>,
+    /// The AF_UNIX socket `socket` made, whose end this is
+    /// ([`crate::unix`]).
+    unix: std::sync::OnceLock<Weak<crate::unix::UnixSocket>>,
+    /// That socket has not connected yet: it sends nothing and reads
+    /// nothing.
+    unconnected: AtomicBool,
 }
 impl SocketPairEnd {
+    /// The AF_UNIX socket `socket` made, whose end this is.
+    pub(crate) fn unix(&self) -> Option<Arc<crate::unix::UnixSocket>> {
+        self.unix.get().and_then(Weak::upgrade)
+    }
+    /// This end is `socket`'s, unconnected until [`Self::connected`].
+    pub(crate) fn attach(&self, socket: Weak<crate::unix::UnixSocket>) {
+        let _ = self.unix.set(socket);
+        self.unconnected.store(true, Ordering::SeqCst);
+    }
+    /// Its socket has connected.
+    pub(crate) fn connected(&self) {
+        self.unconnected.store(false, Ordering::SeqCst);
+        self.pair.hub.changed();
+    }
+    /// SOCK_STREAM or SOCK_SEQPACKET.
+    pub(crate) fn kind(&self) -> u32 {
+        self.pair.kind
+    }
+    /// The process `SO_PEERCRED` names, and the host whose clock stamps
+    /// messages.
+    pub(crate) fn made_by(&self, pid: u32, host: &Arc<dyn paludarium_host::Host>) {
+        self.pair.creator.store(pid, Ordering::SeqCst);
+        let _ = self.pair.clock.set(Arc::clone(host));
+    }
+    /// A connection waits on this listening end's socket: `POLL_IN` with
+    /// `O_ASYNC`, and a wake for `poll` and `accept`.
+    pub(crate) fn arrived(&self) {
+        self.notify(self.side, Reason::In);
+        self.pair.hub.changed();
+    }
+    /// The peer's next read is `ECONNRESET`, as a listener's close leaves
+    /// a connection it did not accept.
+    pub(crate) fn reset_peer(&self) {
+        let notice = {
+            let mut sides = self.lock_sides();
+            let peer = &mut sides[1 - self.side];
+            peer.reset = true;
+            peer.input_epoch = peer.input_epoch.wrapping_add(1);
+            Self::notice(&sides, 1 - self.side, Reason::Error)
+        };
+        self.pair.hub.changed();
+        if let Some(notice) = notice {
+            notice.send();
+        }
+    }
     fn lock_sides(&self) -> std::sync::MutexGuard<'_, [Side; 2]> {
         self.pair
             .sides
@@ -1836,6 +1901,8 @@ impl SocketPairEnd {
                 inode: crate::files::anonymous_inode(),
                 attributes: Attributes::new(0o140777),
                 options: Mutex::default(),
+                unix: std::sync::OnceLock::new(),
+                unconnected: AtomicBool::new(false),
             })
         }))
     }
@@ -1886,6 +1953,24 @@ impl SocketPairEnd {
         message: bool,
         peek: bool,
     ) -> Result<Received, Errno> {
+        // An unconnected AF_UNIX socket reads nothing: a stream's
+        // `unix_stream_read_generic` is EINVAL, a packet socket's
+        // `unix_seqpacket_recvmsg` ENOTCONN.
+        if self.unconnected.load(Ordering::SeqCst) {
+            return Err(if self.pair.messages() {
+                Errno(107)
+            } else {
+                Errno::EINVAL
+            });
+        }
+        {
+            let mut sides = self.lock_sides();
+            let own = &mut sides[self.side];
+            if own.reset && own.bytes.is_empty() && own.writes.is_empty() {
+                own.reset = false;
+                return Err(Errno(104));
+            }
+        }
         if buf.is_empty() && !message {
             return Ok(Received::default());
         }
@@ -2623,7 +2708,8 @@ impl FileHandle for SocketPairEnd {
             return Ok((mask, own.input_epoch, own.output_epoch));
         }
         let eof = own.read_shutdown || peer.closed || peer.write_shutdown;
-        let mask = (u32::from(peer.bytes.len() < self.pair.window() || peer.closed) * OUT)
+        let mask = (u32::from(own.reset) * 0x8)
+            | (u32::from(peer.bytes.len() < self.pair.window() || peer.closed) * OUT)
             | (u32::from(readable || eof) * IN)
             | (u32::from(urgent) * PRI)
             | if peer.closed {
@@ -2686,6 +2772,9 @@ impl SocketPairEnd {
         passed: &mut Passed,
         sender: Sender,
     ) -> Result<usize, Errno> {
+        if self.unconnected.load(Ordering::SeqCst) {
+            return Err(Errno(107));
+        }
         let part = self.part_size();
         let sockets = passed.iter().any(|d| socket_end(&d.file).is_some());
         let before = passed.len();
@@ -2862,6 +2951,9 @@ impl SocketPairEnd {
         passed: &mut Passed,
         sender: Sender,
     ) -> Result<usize, Errno> {
+        if self.unconnected.load(Ordering::SeqCst) {
+            return Err(Errno(107));
+        }
         let result = self.queue_out_of_band(byte, passed, sender);
         // An `F_SETSIG` signal for the urgent byte (SIGURG goes besides),
         // then one for the data, unless a read waited, as Linux's

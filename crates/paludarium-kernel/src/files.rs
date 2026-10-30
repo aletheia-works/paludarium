@@ -38,6 +38,8 @@ pub struct Files {
     pub terminal_size: Option<(u16, u16)>,
     /// The session's network, when it has one.
     pub(crate) network: Option<Arc<crate::inet::Network>>,
+    /// The machine's AF_UNIX abstract names.
+    pub(crate) unix: Arc<crate::unix::Names>,
     pub fs: Arc<dyn FileSystem>,
     pub(crate) fds: Arc<Mutex<BTreeMap<u32, Descriptor>>>,
     /// Numbers an unfinished open has taken, as Linux's alloc_fd marks them
@@ -60,6 +62,7 @@ impl Default for Files {
             readiness: Arc::default(),
             terminal_size: None,
             network: None,
+            unix: Arc::default(),
             fs: Arc::new(crate::page_cache::CoherentFs::new(
                 Arc::new(fs),
                 Arc::clone(&caches),

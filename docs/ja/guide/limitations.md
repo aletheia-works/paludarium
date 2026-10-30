@@ -26,8 +26,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     マルチキャストとブロードキャストのデータグラムは、どこにも届きません。raw ソケットは `EPERM`、ICMP のソケットは
     `EACCES`、ほかの種類（Linux がモジュールを読み込んで作る SCTP の
     `SOCK_SEQPACKET` など）は `ESOCKTNOSUPPORT` です。
-  - `socket(AF_UNIX)` はこれまでどおり `EAFNOSUPPORT` で、ソケットのペアへの
-    `connect` と `bind` は `ENOSYS` です。
+  - `socket(AF_UNIX, SOCK_DGRAM)` は `EAFNOSUPPORT` で、AF_UNIX のソケットが
+    `bind` するのは抽象名前空間の名前だけです。パスへの `bind` は、ソケットのペアへの
+    `connect` と `bind` と同じく `ENOSYS` なので、パスへの `connect` はソケットを
+    見つけません（`ENOENT`、そこがほかのファイルなら `ECONNREFUSED`）。接続の
+    `SO_PEERCRED` は、どちらの側でも接続したプロセスを示します。Linux では、
+    クライアントには待ち受けのプロセスを示します。ガベージコレクタは、待ち受けの
+    まだ受け付けていない接続を見ません。
   - DNS の代わりが答えるのは `A` と `AAAA` だけで、EDNS は読まないので、データグラムの
     答えは 512 バイトまでです。ホストが引けない名前は `SERVFAIL` です。53 番ポートへの
     TCP の接続は、いつも DNS の代わりに届き、本物の DNS サーバーには届きません。

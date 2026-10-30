@@ -1490,7 +1490,7 @@ int main(int argc, char **argv) {
             printf("  rcvbuf %d -> %d\n", asked[i], got);
             close(u);
         }
-        /* 100000 is 200000 doubled: three 65500-byte datagrams over IPv4,
+        /* 100000, doubled to 200000: three 65500-byte datagrams over IPv4,
            two over IPv6, which sends them as two fragments. */
         int buffers[] = {1024, 2048, 4096, 10000, 100000};
         int sizes[] = {0, 100, 261, 262, 645, 646, 1000, 3000, 9000, 16004, 16005, 30000, 65500};

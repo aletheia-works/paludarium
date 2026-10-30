@@ -665,10 +665,9 @@ one only with an `--allow-net`.
   `truesize`, and one that would take it past `SO_RCVBUF` while another
   waits is dropped, as `__udp_enqueue_schedule_skb` drops it; an empty
   buffer takes one of any size. Where no socket takes it, the loopback's
-  ICMP answer reaches a socket connected there:
-  its next send or receive is `ECONNREFUSED`, once, as `SO_ERROR` and
-  `POLLERR` show. A datagram to port 53 that no guest socket takes goes to
-  the DNS stub, as before.
+  ICMP answer reaches a socket connected there: its next send or receive
+  is `ECONNREFUSED`, once, as `SO_ERROR` and `POLLERR` show. A datagram to
+  port 53 that no guest socket takes goes to the DNS stub, as before.
 - **UDP `shutdown`** marks the socket, connected or not (one that is not is
   `ENOTCONN` all the same, as Linux's `inet_shutdown` gives it). Shut for
   reading, a receive that would wait ends at once with 0, while datagrams

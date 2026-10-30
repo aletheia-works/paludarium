@@ -286,36 +286,10 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         {
             crate::unix::dispatch(c, number, a, &socket)
         }
-        // A socket pair cannot connect or bind to a path.
-        42 | 49 => {
-            socket(c, a[0])?;
-            Err(Errno::ENOSYS)
-        }
-        // A socket pair is unbound and unnamed: never listening, and its
-        // address and its peer's are AF_UNIX with no path.
-        43 | 288 | 50 => {
-            let file = socket(c, a[0])?;
-            let socket = as_socket(&file)?;
-            Err(if socket.pair.kind == SOCK_DGRAM {
-                Errno(95)
-            } else {
-                Errno::EINVAL
-            })
-        }
-        51 | 52 => {
-            socket(c, a[0])?;
-            let mut raw = [0; 4];
-            c.mem
-                .read(GuestAddr(a[2]), &mut raw)
-                .map_err(|_| Errno::EFAULT)?;
-            let room = usize::try_from(i32::from_le_bytes(raw)).map_err(|_| Errno::EINVAL)?;
-            c.mem
-                .write(GuestAddr(a[1]), &1u16.to_le_bytes()[..room.min(2)])
-                .map_err(|_| Errno::EFAULT)?;
-            c.mem
-                .write(GuestAddr(a[2]), &2u32.to_le_bytes())
-                .map_err(|_| Errno::EFAULT)?;
-            Ok(0)
+        // Every AF_UNIX socket is one of those: anything else is no socket.
+        42 | 43 | 49 | 50 | 51 | 52 | 288 => {
+            c.files.descriptor(a[0])?;
+            Err(Errno(88))
         }
         53 => {
             if a[0] != 1 {
@@ -328,11 +302,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .check_write(GuestAddr(a[3]), 8)
                 .map_err(|_| Errno::EFAULT)?;
             let kind = u32::try_from(a[1]).map_err(|_| Errno::EINVAL)?;
-            let ends = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
-            for end in &ends {
-                end.set_peer_process(c.process.pid);
-            }
-            let _ = ends[0].pair.clock.set(Arc::clone(c.shared_host));
+            let ends = crate::unix::pair(c, kind)?;
             let [fd0, fd1] = c.files.install_pair(
                 ends.map(|end| end as Arc<dyn FileHandle>),
                 kind & CLOEXEC != 0,

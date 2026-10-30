@@ -186,6 +186,13 @@ kernel.
   `SO_PEERPIDFD` is `ENODATA`; a datagram socket pair's ends name their
   maker, as every pair's do. A socket pair's datagram end sends to names
   too.
+- `socketpair(AF_UNIX)` makes two sockets as Linux's `unix_socketpair` does:
+  unnamed and connected to each other, so each is a socket of its type in
+  all else. Either may `bind`, as above, and its peer's `getpeername` and
+  what it sends then give that name. A stream or packet socket of a pair
+  connects no more (`EISCONN` once a listener has the name), and a
+  datagram one connects elsewhere or to `AF_UNSPEC` as any datagram socket
+  does, disconnecting from the other end as above.
 - `recvmsg` and `recvfrom` take their flags as Linux's AF_UNIX sockets do:
   `MSG_PEEK` leaves the data, and gives copies of the descriptors it passes;
   `MSG_WAITALL` fills a stream's buffer, unless the stream ends, descriptors
@@ -196,7 +203,7 @@ kernel.
   The other flags have no effect, as on Linux. Their address is the name
   the sending socket has as it is read, even once that socket has gone, as
   Linux's `unix_copy_addr`, cut to the room given but with its whole
-  length; an unnamed socket's, and a socket pair's, has length 0.
+  length; an unnamed socket's has length 0.
 - Sockets that only unread messages hold are closed, as Linux's garbage
   collector (`unix_gc`) closes them when a socket goes: a socket whose
   descriptor waits in its own queue, or sockets that hold each other so,

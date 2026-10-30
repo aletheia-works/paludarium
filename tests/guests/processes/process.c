@@ -4163,6 +4163,82 @@ int main(int argc, char **argv) {
         printf("pair self=%d %d\n", first, cred.pid == getpid());
         return 0;
     }
+    if (!strcmp(mode, "unix-socketpair")) {
+        /* The sockets of an AF_UNIX socketpair (unix_socketpair) are
+           unnamed and connected to each other: each may bind, which its
+           peer's getpeername and the sender's address then show; a stream
+           or packet socket connects no more (EISCONN), and a datagram
+           socket connects elsewhere, which drops what it had not read and
+           resets its old peer. */
+        signal(SIGPIPE, SIG_IGN);
+        int types[] = {SOCK_STREAM, SOCK_SEQPACKET, SOCK_DGRAM};
+        for (int t = 0; t < 3; t++) {
+            int type = types[t];
+            int sv[2];
+            struct sockaddr_un a, l, none, from;
+            char buf[16];
+            printf("type=%d\n", type);
+            unix_call("socketpair", socketpair(AF_UNIX, type, 0, sv));
+            unix_name("name", sv[0], 0, NULL, 0);
+            unix_name("peer", sv[0], 1, NULL, 0);
+            socklen_t nlen = unix_abstract(&none, "pair-none");
+            unix_call("connect-missing", connect(sv[0], (void *)&none, nlen));
+            unix_call("connect-short", connect(sv[0], (void *)&none, 1));
+            unix_call("listen-unbound", listen(sv[0], 1));
+            unix_call("accept", accept(sv[0], NULL, NULL));
+            socklen_t alen = unix_abstract(&a, "pair-a");
+            unix_call("bind", bind(sv[0], (void *)&a, alen));
+            unix_name("name-bound", sv[0], 0, &a, alen);
+            unix_name("other-peer", sv[1], 1, &a, alen);
+            unix_call("bind-again", bind(sv[0], (void *)&a, alen));
+            int o = socket(AF_UNIX, type, 0);
+            unix_call("bind-taken", bind(o, (void *)&a, alen));
+            close(o);
+            unix_call("send-named", send(sv[0], "ab", 2, 0));
+            unix_from("from-named", sv[1], sizeof from, &a, alen);
+            unix_call("autobind", bind(sv[1], (void *)&a, sizeof(sa_family_t)));
+            unix_name("autobind-name", sv[1], 0, NULL, 0);
+            unix_name("autobind-peer", sv[0], 1, NULL, 0);
+            unix_call("send-autobound", send(sv[1], "cd", 2, 0));
+            unix_from("from-autobound", sv[0], sizeof from, NULL, 0);
+            socklen_t llen = unix_abstract(&l, "pair-listener");
+            int listener = socket(AF_UNIX, type, 0);
+            bind(listener, (void *)&l, llen);
+            if (type != SOCK_DGRAM) {
+                unix_call("listen-bound", listen(sv[0], 1));
+                listen(listener, 1);
+                unix_call("connect-listener", connect(sv[1], (void *)&l, llen));
+                unix_call("send-still", send(sv[1], "ef", 2, 0));
+                unix_call("recv-still", recv(sv[0], buf, sizeof buf, MSG_DONTWAIT));
+                unix_poll("pair", sv[0]);
+            } else {
+                /* sv[0] connects to the listener's socket: what it had not
+                   read goes, sv[1], connected to it, is reset, and may no
+                   longer send to it. */
+                send(sv[1], "gh", 2, 0);
+                unix_call("connect-other", connect(sv[0], (void *)&l, llen));
+                unix_name("peer-other", sv[0], 1, &l, llen);
+                unix_call("recv-dropped", recv(sv[0], buf, sizeof buf, MSG_DONTWAIT));
+                int err = 0;
+                socklen_t err_len = sizeof err;
+                getsockopt(sv[1], SOL_SOCKET, SO_ERROR, &err, &err_len);
+                printf("old-peer-error=%d\n", err);
+                unix_call("send-refused", send(sv[1], "ij", 2, 0));
+                unix_call("send-other", send(sv[0], "kl", 2, 0));
+                unix_from("from-pair", listener, sizeof from, &a, alen);
+                struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+                unix_call("disconnect", connect(sv[0], &unspec, sizeof unspec));
+                unix_name("peer-disconnected", sv[0], 1, NULL, 0);
+                unix_call("send-disconnected", send(sv[0], "mn", 2, 0));
+                unix_call("send-to-free", send(sv[1], "op", 2, 0));
+                unix_from("from-free", sv[0], sizeof from, NULL, 0);
+            }
+            close(listener);
+            close(sv[0]);
+            close(sv[1]);
+        }
+        return 0;
+    }
     if (!strcmp(mode, "unix-datagram")) {
         /* AF_UNIX datagram sockets from socket() (af_unix.c's
            unix_dgram_*): names in the abstract namespace, which each type

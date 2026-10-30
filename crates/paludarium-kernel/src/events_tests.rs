@@ -2038,7 +2038,7 @@ fn a_failed_connection_reports_its_error_once() {
     assert_eq!(int_option(&mut f, blocking, 1, 4), (0, 0));
 }
 #[test]
-fn a_socket_pair_is_unnamed_and_never_listens() {
+fn a_socket_pair_is_unnamed_until_it_binds() {
     let mut f = Fixture::new();
     let pair = |f: &mut Fixture, kind: u64| {
         assert_eq!(f.ret(53, [1, kind, 0, DATA, 0, 0]), 0);
@@ -2065,8 +2065,25 @@ fn a_socket_pair_is_unnamed_and_never_listens() {
     );
     assert_eq!(
         f.ret(42, [stream, DATA, 2, 0, 0, 0]),
-        Errno::ENOSYS.to_syscall_return()
+        Errno::EINVAL.to_syscall_return()
     );
+    // An autobind names this end, which its peer's getpeername then gives.
+    f.mem
+        .write(GuestAddr(DATA + 0x40), &1u16.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(49, [stream, DATA + 0x40, 2, 0, 0, 0]), 0);
+    let name = |f: &mut Fixture, number: u64, fd: u64| {
+        f.mem
+            .write(GuestAddr(DATA + 0x80), &16u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(number, [fd, DATA + 0x84, DATA + 0x80, 0, 0, 0]), 0);
+        let mut name = [0; 12];
+        f.mem.read(GuestAddr(DATA + 0x80), &mut name).unwrap();
+        name
+    };
+    let own = name(&mut f, 51, stream);
+    assert_eq!(own[..6], [8, 0, 0, 0, 1, 0]);
+    assert_eq!(name(&mut f, 52, stream + 1), own);
     let datagram = pair(&mut f, 2);
     assert_eq!(
         f.ret(288, [datagram, 0, 0, 0, 0, 0]),

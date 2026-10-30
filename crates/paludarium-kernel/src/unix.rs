@@ -1,7 +1,8 @@
-//! AF_UNIX sockets made with `socket`: `SOCK_STREAM` and `SOCK_SEQPACKET`
-//! sockets that bind to a name in the abstract namespace, listen, accept and
-//! connect, and `SOCK_DGRAM` sockets that bind, connect and send to such
-//! names, as Linux's `af_unix.c` does.
+//! AF_UNIX sockets made with `socket` or `socketpair`: `SOCK_STREAM` and
+//! `SOCK_SEQPACKET` sockets that bind to a name, listen, accept and connect,
+//! and `SOCK_DGRAM` sockets that bind, connect and send to such names, as
+//! Linux's `af_unix.c` does. A `socketpair`'s two sockets start connected to
+//! each other, unnamed ([`pair`]).
 //!
 //! Each socket holds one end of a socket pair ([`SocketPairEnd`]) from the
 //! start, unconnected, and a stream or packet socket keeps the other: a
@@ -83,9 +84,9 @@ pub(crate) struct UnixSocket {
 }
 #[derive(Default)]
 struct State {
-    /// Once a stream or packet socket is connected, the peer's name, if it
-    /// had one.
-    peer: Option<Option<Vec<u8>>>,
+    /// Once a stream or packet socket is connected, the peer's name, which
+    /// it may take later, as `unix_getname` reads the peer's at the time.
+    peer: Option<Address>,
     listen: Option<Listen>,
     /// The socket a datagram socket is connected to, which it sends to and
     /// which alone may send to it, and that socket's name; it stays when
@@ -124,7 +125,46 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .map(u64::from)
 }
 
-/// The socket calls on an AF_UNIX socket `socket` made: `connect`,
+/// `socketpair(AF_UNIX, type)`'s two sockets, as Linux's `unix_socketpair`:
+/// unnamed and connected to each other, a stream or packet socket's peer
+/// the other, a datagram socket sending to the other and taking only what
+/// it sends; either may then bind, and a datagram socket connect elsewhere.
+pub(crate) fn pair(c: &Context<'_>, kind: u32) -> Result<[Arc<UnixSocket>; 2], Errno> {
+    let ends = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
+    ends[0].clock_from(c.shared_host);
+    let names = [Address::default(), Address::default()];
+    let sockets: [Arc<UnixSocket>; 2] = std::array::from_fn(|side| {
+        let end = Arc::clone(&ends[side]);
+        // SO_PEERCRED names the process that made the pair, at both ends.
+        end.set_peer_process(c.process.pid);
+        let name = Arc::clone(&names[side]);
+        Arc::new_cyclic(|this: &Weak<UnixSocket>| {
+            end.attach(Weak::clone(this));
+            end.connected();
+            UnixSocket {
+                this: Weak::clone(this),
+                end,
+                spare: Mutex::new(None),
+                name,
+                names: Arc::clone(&c.files.unix),
+                hub: Arc::clone(&c.files.readiness),
+                state: Mutex::default(),
+            }
+        })
+    });
+    for side in 0..2 {
+        let other = &sockets[1 - side];
+        let mut s = sockets[side].lock();
+        if sockets[side].datagram() {
+            s.to = Some((Arc::downgrade(other), other.address()));
+        } else {
+            s.peer = Some(other.address());
+        }
+    }
+    Ok(sockets)
+}
+
+/// The socket calls on an AF_UNIX socket: `connect`,
 /// `accept`, `bind`, `listen`, `getsockname`, `getpeername` and `accept4`.
 pub(crate) fn dispatch(
     c: &mut Context<'_>,
@@ -150,7 +190,7 @@ pub(crate) fn dispatch(
             if flags & u64::from(NONBLOCK) != 0 {
                 child.set_flags(child.flags() | NONBLOCK)?;
             }
-            let peer = child.lock().peer.clone().flatten();
+            let peer = child.lock().peer.as_ref().and_then(|p| p.get().cloned());
             if a[1] != 0 {
                 write_address(c, peer.as_deref(), a[1], a[2])?;
             }
@@ -176,7 +216,7 @@ pub(crate) fn dispatch(
                     let (_, name) = s.to.as_ref().ok_or(ENOTCONN)?;
                     name.get().cloned()
                 } else {
-                    s.peer.clone().ok_or(ENOTCONN)?
+                    s.peer.as_ref().ok_or(ENOTCONN)?.get().cloned()
                 }
             };
             write_address(c, peer.as_deref(), a[1], a[2]).map(|()| 0)
@@ -469,7 +509,6 @@ impl UnixSocket {
             let theirs = client.lock();
             (self.lock(), theirs)
         };
-        let name = self.name.get().cloned();
         let Some(listen) = own.listen.as_mut() else {
             return Err(ECONNREFUSED);
         };
@@ -505,12 +544,12 @@ impl UnixSocket {
                 names: Arc::clone(&self.names),
                 hub: Arc::clone(&self.hub),
                 state: Mutex::new(State {
-                    peer: Some(client.name.get().cloned()),
+                    peer: Some(Arc::clone(&client.name)),
                     ..State::default()
                 }),
             }
         });
-        theirs.peer = Some(name);
+        theirs.peer = Some(Arc::clone(&self.name));
         drop(theirs);
         client.end.connected();
         spare.connected();

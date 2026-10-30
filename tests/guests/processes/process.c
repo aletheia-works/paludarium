@@ -4381,15 +4381,16 @@ int main(int argc, char **argv) {
            whose descriptor waits in its own queue, two that hold each
            other, and what was passed with them. One a held socket's queue
            holds stays. The collection may run a little later, hence the
-           waits for the hang-up. */
+           waits for the hang-up. Nothing is printed between a close and
+           the collection this mode starts: Linux's collector is the whole
+           machine's, so another process's socket going may have run it
+           already (run 41040442998). */
         signal(SIGPIPE, SIG_IGN);
         int s[2], u[2], pipe_fds[2];
         char byte;
         socketpair(AF_UNIX, SOCK_STREAM, 0, s);
         printf("send-self=%ld\n", send_fds(s[0], "x", 1, &s[1], 1));
         close(s[1]);
-        usleep(200000);
-        gc_state("self-closed", s[0]);
         gc_trigger(s[0]);
         gc_state("self-collected", s[0]);
         printf("read=%zd\n", read(s[0], &byte, 1));
@@ -4404,8 +4405,6 @@ int main(int argc, char **argv) {
         close(s[1]);
         close(u[1]);
         close(pipe_fds[1]);
-        gc_state("cycle-a", s[0]);
-        gc_state("cycle-pipe", pipe_fds[0]);
         gc_trigger(s[0]);
         gc_state("cycle-a-collected", s[0]);
         gc_state("cycle-c-collected", u[0]);

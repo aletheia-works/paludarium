@@ -10,4 +10,4 @@ permissions:
 
 jobs:
   labeler:
-    uses: aletheia-works/.github/.github/workflows/labeler.yml@224ce9e9c0d5ddd599e9984958b2e4dd9568ccb6 # v1.3.0
+    uses: aletheia-works/.github/.github/workflows/labeler.yml@f5bb52fe38d6ddf151662ed6b64c0b23eeb50ec4 # v1.3.3

@@ -20,7 +20,7 @@ jobs:
       github.repository_owner == 'aletheia-works' &&
       (github.event.pull_request.head.repo.full_name == github.repository ||
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
-    uses: aletheia-works/.github/.github/workflows/terraform-plan.yml@b24ce77ad773bcca239d8140aeb373f295572521 # v1.3.1
+    uses: aletheia-works/.github/.github/workflows/terraform-plan.yml@f5bb52fe38d6ddf151662ed6b64c0b23eeb50ec4 # v1.3.3
     with:
       working_directory: infra/github
     secrets: inherit

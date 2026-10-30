@@ -22,7 +22,7 @@ jobs:
           args: toolchain install $RUST_TOOLCHAIN --profile minimal --component rust-src
       - shell: bash
         run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl wasm32-unknown-unknown --toolchain "$RUST_TOOLCHAIN"
-      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
         with:
           install_args: cargo-deny
           cache: false
@@ -87,7 +87,7 @@ jobs:
         run: npm ci --prefix spikes/wasm-threads
       - name: Install Playwright browser
         if: matrix.environment == 'chromium' || matrix.environment == 'firefox' || matrix.environment == 'webkit'
-        uses: aletheia-works/.github/actions/install-playwright@237aeceec82d1ac86155fae871a80d4c1b436845 # v1.2.0
+        uses: aletheia-works/.github/actions/install-playwright@f5bb52fe38d6ddf151662ed6b64c0b23eeb50ec4 # v1.3.3
         with:
           browsers: ${{ matrix.environment }}
           command: node spikes/wasm-threads/node_modules/playwright/cli.js

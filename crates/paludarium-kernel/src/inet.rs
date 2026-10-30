@@ -1568,11 +1568,9 @@ impl InetSocket {
     }
     /// The accepted side of a connection from `stream` at `from` to this
     /// listener at `to`, joined to it through `link`. It takes this
-    /// socket's options, as Linux's `sk_clone_lock` copies them, and holds
+    /// socket's options and whether the guest bound its port (`locked`), as
+    /// Linux's `sk_clone_lock` copies them with `sk_userlocks`, and holds
     /// the listener's port on `to`.
-    /// The accepted socket of a connection from `from` to `to`, with the
-    /// listener's options, and whether the guest bound the listener's port,
-    /// which it keeps too (`sk_clone_lock` copies `sk_userlocks`).
     fn child(
         &self,
         (options, locked): (Options, bool),

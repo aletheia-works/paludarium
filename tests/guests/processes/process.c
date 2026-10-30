@@ -4085,6 +4085,84 @@ int main(int argc, char **argv) {
         close(pipe_fds[0]);
         return 0;
     }
+    if (!strcmp(mode, "unix-peercred")) {
+        /* SO_PEERCRED and SO_PEERPIDFD of AF_UNIX sockets from socket()
+           (af_unix.c): none before listen or connect, the listen()er's own
+           on a listener (init_peercred), the connecting process's on the
+           accepted socket, and the listener's on the client
+           (copy_peercred). A child connects, so the two differ; IDs are
+           compared with this process's own, as the native run need not be
+           root. */
+        signal(SIGPIPE, SIG_IGN);
+        int types[] = {SOCK_STREAM, SOCK_SEQPACKET};
+        for (int t = 0; t < 2; t++) {
+            printf("type=%d\n", types[t]);
+            struct sockaddr_un a;
+            socklen_t len = unix_abstract(&a, t ? "peercred-packet" : "peercred-stream");
+            struct ucred cred;
+            socklen_t cred_len = sizeof cred;
+            int pidfd;
+            socklen_t pidfd_len = sizeof pidfd;
+            int l = socket(AF_UNIX, types[t], 0);
+            getsockopt(l, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len);
+            printf("unconnected pid=%d uid=%d gid=%d\n", (int)cred.pid, (int)cred.uid, (int)cred.gid);
+            unix_call("unconnected-pidfd", getsockopt(l, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len));
+            bind(l, (void *)&a, len);
+            getsockopt(l, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len);
+            printf("bound pid=%d\n", (int)cred.pid);
+            listen(l, 1);
+            getsockopt(l, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len);
+            printf("listener self=%d uid-own=%d gid-own=%d\n", cred.pid == getpid(), cred.uid == geteuid(),
+                   cred.gid == getegid());
+            int report[2];
+            pipe(report);
+            pid_t child = fork();
+            if (!child) {
+                int c = socket(AF_UNIX, types[t], 0);
+                struct ucred mine;
+                socklen_t mine_len = sizeof mine;
+                getsockopt(c, SOL_SOCKET, SO_PEERCRED, &mine, &mine_len);
+                int before = mine.pid;
+                int r = connect(c, (void *)&a, len);
+                getsockopt(c, SOL_SOCKET, SO_PEERCRED, &mine, &mine_len);
+                int pidfd_ok = getsockopt(c, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len) == 0;
+                int answer[4] = {before, r, (int)mine.pid, pidfd_ok};
+                if (write(report[1], answer, sizeof answer) != sizeof answer) _exit(2);
+                char b;
+                read(c, &b, 1);
+                _exit(0);
+            }
+            int answer[4];
+            if (read(report[0], answer, sizeof answer) != sizeof answer) return 96;
+            printf("client before=%d connect=%d peer-is-listener=%d pidfd=%d\n", answer[0], answer[1],
+                   answer[2] == getpid(), answer[3]);
+            int s = accept(l, NULL, NULL);
+            getsockopt(s, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len);
+            printf("accepted peer-is-child=%d uid-own=%d\n", cred.pid == child, cred.uid == geteuid());
+            unix_call("accepted-pidfd", getsockopt(s, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len));
+            close(pidfd);
+            getsockopt(l, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len);
+            printf("listener-after self=%d\n", cred.pid == getpid());
+            send(s, "x", 1, 0);
+            int status;
+            waitpid(child, &status, 0);
+            printf("child status=%d\n", status);
+            close(s);
+            close(l);
+            close(report[0]);
+            close(report[1]);
+        }
+        /* A socket pair names its maker on both ends. */
+        int sp[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+        struct ucred cred;
+        socklen_t cred_len = sizeof cred;
+        getsockopt(sp[0], SOL_SOCKET, SO_PEERCRED, &cred, &cred_len);
+        int first = cred.pid == getpid();
+        getsockopt(sp[1], SOL_SOCKET, SO_PEERCRED, &cred, &cred_len);
+        printf("pair self=%d %d\n", first, cred.pid == getpid());
+        return 0;
+    }
     if (!strcmp(mode, "unix-datagram")) {
         /* AF_UNIX datagram sockets from socket() (af_unix.c's
            unix_dgram_*): names in the abstract namespace, which each type

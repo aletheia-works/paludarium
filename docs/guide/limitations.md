@@ -32,9 +32,7 @@ verified.
     system: under a directory mounted from the host, `bind` to a path is
     `EPERM`, and a host's socket file there finds no socket
     (`ECONNREFUSED`). `connect` and `bind` on a socket pair are `ENOSYS`,
-    and a socket file's write permission is not checked, as for root.
-    `SO_PEERCRED` of a connection names the connecting process
-    on both sides, where Linux names the listener's to the client. The
+    and a socket file's write permission is not checked, as for root. The
     garbage collector does not look at a listener's connections not yet
     accepted. A sender's datagrams are bounded by the
     bytes the receiver has not read, not by the sender's `SO_SNDBUF`, and

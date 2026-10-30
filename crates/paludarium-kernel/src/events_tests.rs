@@ -930,6 +930,37 @@ fn a_disconnected_datagram_socket_drops_its_queue_and_resets_its_peer() {
     assert_eq!(int_option(&mut f, b, 1, 4), (0, 0));
 }
 #[test]
+fn a_unix_socket_names_its_peer_process_once_it_listens() {
+    let mut f = Fixture::new();
+    let peer = |f: &mut Fixture, fd: u64| {
+        f.mem
+            .write(GuestAddr(DATA + 0x200), &12u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(55, [fd, 1, 17, DATA + 0x204, DATA + 0x200, 0]), 0);
+        let mut raw = [0; 12];
+        f.mem.read(GuestAddr(DATA + 0x204), &mut raw).unwrap();
+        raw.chunks(4)
+            .map(|id| i32::from_le_bytes(id.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let socket = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    // None before it listens or connects.
+    assert_eq!(peer(&mut f, socket), [0, -1, -1]);
+    assert_eq!(
+        f.ret(55, [socket, 1, 77, DATA + 0x204, DATA + 0x200, 0]),
+        Errno(61).to_syscall_return()
+    );
+    f.mem
+        .write(GuestAddr(DATA + 0x100), &[1, 0, 0, b'p'])
+        .unwrap();
+    assert_eq!(f.ret(49, [socket, DATA + 0x100, 4, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [socket, 1, 0, 0, 0, 0]), 0);
+    // A listener names the process that called listen, as root.
+    let listener = peer(&mut f, socket);
+    assert_ne!(listener[0], 0);
+    assert_eq!(listener[1..], [0, 0]);
+}
+#[test]
 fn inet_sockets_need_a_network() {
     let mut f = Fixture::new();
     assert_eq!(f.ret(41, [2, 1, 0, 0, 0, 0]), Errno(97).to_syscall_return());

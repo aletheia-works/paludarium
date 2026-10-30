@@ -164,7 +164,7 @@ pub(crate) fn dispatch(
         }
         // sock_no_listen.
         50 if socket.datagram() => Err(EOPNOTSUPP),
-        50 => socket.listen(a[1] as u32 as i32).map(|()| 0),
+        50 => socket.listen(c, a[1] as u32 as i32).map(|()| 0),
         51 => {
             let name = socket.name.get().cloned();
             write_address(c, name.as_deref(), a[1], a[2]).map(|()| 0)
@@ -275,11 +275,10 @@ fn inode(c: &Context<'_>, path: &[u8], inode: u64) -> Inode {
 impl UnixSocket {
     fn new(c: &Context<'_>, kind: u32) -> Result<Arc<Self>, Errno> {
         let [end, spare] = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
-        // A datagram socket has no peer whose credentials SO_PEERCRED
-        // gives, and no use for the other end.
+        // SO_PEERCRED names no process until the socket listens or
+        // connects; a datagram socket has no use for the other end.
         let datagram = kind & 0xf == SOCK_DGRAM;
-        let creator = if datagram { 0 } else { c.process.pid };
-        end.made_by(creator, c.shared_host);
+        end.clock_from(c.shared_host);
         let spare = (!datagram).then_some(spare);
         Ok(Arc::new_cyclic(|this: &Weak<Self>| {
             end.attach(Weak::clone(this));
@@ -387,8 +386,10 @@ impl UnixSocket {
     }
     /// `listen(backlog)`, as Linux's `unix_listen`: a socket with no name
     /// is `EINVAL`, a connected one is left as it is, and a listener takes
-    /// the new backlog, at most `somaxconn` (a negative one too).
-    fn listen(&self, backlog: i32) -> Result<(), Errno> {
+    /// the new backlog, at most `somaxconn` (a negative one too), and the
+    /// caller's credentials, which its clients' `SO_PEERCRED` then names
+    /// (`init_peercred`).
+    fn listen(&self, c: &Context<'_>, backlog: i32) -> Result<(), Errno> {
         let mut s = self.lock();
         if self.name.get().is_none() {
             return Err(Errno::EINVAL);
@@ -406,6 +407,7 @@ impl UnixSocket {
                 });
             }
         }
+        self.end.set_peer_process(c.process.pid);
         drop(s);
         // A connect waiting for room may now find it.
         self.hub.changed();
@@ -489,7 +491,10 @@ impl UnixSocket {
             spare.set_flags(spare.flags() & !NONBLOCK)?;
             slot.take().ok_or(Errno::EINVAL)?
         };
-        client.end.made_by(c.process.pid, c.shared_host);
+        // As unix_stream_connect: the accepted socket names the connecting
+        // process, the client the listener's (copy_peercred).
+        client.end.set_peer_process(self.end.peer_process());
+        spare.set_peer_process(c.process.pid);
         let child = Arc::new_cyclic(|this: &Weak<Self>| {
             spare.attach(Weak::clone(this));
             Self {

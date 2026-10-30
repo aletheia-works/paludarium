@@ -329,7 +329,9 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .map_err(|_| Errno::EFAULT)?;
             let kind = u32::try_from(a[1]).map_err(|_| Errno::EINVAL)?;
             let ends = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
-            ends[0].pair.creator.store(c.process.pid, Ordering::SeqCst);
+            for end in &ends {
+                end.set_peer_process(c.process.pid);
+            }
             let _ = ends[0].pair.clock.set(Arc::clone(c.shared_host));
             let [fd0, fd1] = c.files.install_pair(
                 ends.map(|end| end as Arc<dyn FileHandle>),
@@ -1504,8 +1506,8 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         // A new pidfd of the process that made the pair, installed even
         // when `len` holds only part of its number.
         SO_PEERPIDFD => {
-            let creator = socket.pair.creator.load(Ordering::SeqCst);
-            // A datagram socket has no peer process (ENODATA).
+            let creator = socket.peer_process();
+            // A socket with no peer process: ENODATA.
             if creator == 0 {
                 return Err(Errno(61));
             }
@@ -1526,11 +1528,11 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             linger.extend(options.linger.unwrap_or(0).to_le_bytes());
             linger
         }
-        // The creator's credentials, as root (uid and gid 0), or for a
-        // datagram socket none: process 0, and -1 for the IDs, as Linux's
-        // `cred_to_ucred` gives them with no peer.
+        // The peer process's credentials, as root (uid and gid 0), or with
+        // none process 0, and -1 for the IDs, as Linux's `cred_to_ucred`
+        // gives them.
         SO_PEERCRED => {
-            let creator = socket.pair.creator.load(Ordering::SeqCst);
+            let creator = socket.peer_process();
             let mut credentials = creator.to_le_bytes().to_vec();
             credentials.extend(if creator == 0 { [0xff; 8] } else { [0; 8] });
             credentials
@@ -1766,9 +1768,10 @@ impl Timestamps {
 }
 struct Pair {
     sides: Mutex<[Side; 2]>,
-    /// The process that made the pair, which `SO_PEERCRED` names for both
-    /// ends, as Linux's `unix_socketpair` records its credentials.
-    creator: AtomicU32,
+    /// The process each end's `SO_PEERCRED` names, as Linux's
+    /// `sk_peer_pid`: for a pair, the one that made it, as
+    /// `unix_socketpair` records its credentials; 0 for none.
+    peers: [AtomicU32; 2],
     hub: Arc<ReadinessHub>,
     /// SOCK_STREAM, SOCK_DGRAM or SOCK_SEQPACKET. The last two keep message
     /// boundaries: each write is one message, and each read returns one
@@ -1848,11 +1851,18 @@ impl SocketPairEnd {
     pub(crate) fn kind(&self) -> u32 {
         self.pair.kind
     }
-    /// The process `SO_PEERCRED` names, and the host whose clock stamps
-    /// messages.
-    pub(crate) fn made_by(&self, pid: u32, host: &Arc<dyn paludarium_host::Host>) {
-        self.pair.creator.store(pid, Ordering::SeqCst);
+    /// The host whose clock stamps messages.
+    pub(crate) fn clock_from(&self, host: &Arc<dyn paludarium_host::Host>) {
         let _ = self.pair.clock.set(Arc::clone(host));
+    }
+    /// The process this end's `SO_PEERCRED` names, 0 for none.
+    pub(crate) fn peer_process(&self) -> u32 {
+        self.pair.peers[self.side].load(Ordering::SeqCst)
+    }
+    /// This end's `SO_PEERCRED` names process `pid`, as Linux's
+    /// `init_peercred` and `copy_peercred` set it.
+    pub(crate) fn set_peer_process(&self, pid: u32) {
+        self.pair.peers[self.side].store(pid, Ordering::SeqCst);
     }
     /// A connection waits on this listening end's socket: `POLL_IN` with
     /// `O_ASYNC`, and a wake for `poll` and `accept`.
@@ -1928,7 +1938,7 @@ impl SocketPairEnd {
             return Err(Errno(94)); // ESOCKTNOSUPPORT
         }
         let pair = Arc::new(Pair {
-            creator: AtomicU32::new(0),
+            peers: [AtomicU32::new(0), AtomicU32::new(0)],
             kind: kind & 0xf,
             window: AtomicUsize::new(SEND_WINDOW),
             pipe: AtomicBool::new(false),

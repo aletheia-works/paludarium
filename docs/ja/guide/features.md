@@ -165,9 +165,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   前の相手は `ECONNRESET` を受けます。それは次の読み込み（キューにあるものより先）か
   送信か `SO_ERROR` が 1 度だけ返し、それまでは `poll` に `POLLERR` として見えます。資格情報を
   受け渡すソケットは、接続するときか送るときに自動で `bind` されます。`listen` と
-  `accept` は `EOPNOTSUPP` で、`SO_PEERCRED` はどのプロセスも示さず（プロセス 0、ID は
-  -1）、`SO_PEERPIDFD` は `ENODATA` です。ソケットのペアのデータグラムの端も名前へ
-  送れます。
+  `accept` は `EOPNOTSUPP` で、`unix_dgram_connect` は何も記録しないので、接続していても
+  いなくても `SO_PEERCRED` はどのプロセスも示さず（プロセス 0、ID は -1）、`SO_PEERPIDFD`
+  は `ENODATA` です。データグラムのソケットのペアの端は、ほかのペアと同じく組を作った
+  プロセスを示します。ソケットのペアのデータグラムの端も名前へ送れます。
 - `recvmsg` と `recvfrom` は、Linux の AF_UNIX のソケットと同じくフラグを扱います。
   `MSG_PEEK` はデータを残し、受け渡すディスクリプタの写しを渡します。`MSG_WAITALL` は、
   ストリームの終わりやディスクリプタが来るまで、またはデータを受け取ったあとにシグナルが

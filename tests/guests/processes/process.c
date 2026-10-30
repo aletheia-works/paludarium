@@ -4237,6 +4237,9 @@ int main(int argc, char **argv) {
 
         unix_call("connect", connect(u, (void *)&a, alen));
         unix_name("peer-connected", u, 1, &a, alen);
+        /* Connecting records no peer process (unix_dgram_connect). */
+        getsockopt(u, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len);
+        printf("peercred-connected pid=%d uid=%d gid=%d\n", (int)peer.pid, (int)peer.uid, (int)peer.gid);
         unix_poll("connected", u);
         unix_call("send-connected", send(u, "three", 5, 0));
         unix_call("write-connected", write(u, "3b", 2));

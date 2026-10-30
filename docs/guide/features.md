@@ -182,7 +182,10 @@ kernel.
   `poll` shows as `POLLERR` until then. A socket that passes credentials is
   autobound as it connects or sends. `listen` and `accept` are
   `EOPNOTSUPP`, and `SO_PEERCRED` names no process (process 0, IDs -1),
-  `SO_PEERPIDFD` `ENODATA`. A socket pair's datagram end sends to names too.
+  connected or not, as `unix_dgram_connect` records none, and
+  `SO_PEERPIDFD` is `ENODATA`; a datagram socket pair's ends name their
+  maker, as every pair's do. A socket pair's datagram end sends to names
+  too.
 - `recvmsg` and `recvfrom` take their flags as Linux's AF_UNIX sockets do:
   `MSG_PEEK` leaves the data, and gives copies of the descriptors it passes;
   `MSG_WAITALL` fills a stream's buffer, unless the stream ends, descriptors

@@ -298,6 +298,14 @@ impl Network {
             syns: Mutex::default(),
         }
     }
+    /// How many dropped handshakes wait to be tried again.
+    #[cfg(test)]
+    pub(crate) fn syns(&self) -> usize {
+        self.syns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
     fn ports(&self, datagram: bool) -> MutexGuard<'_, Ports> {
         if datagram {
             &self.udp_ports
@@ -507,6 +515,12 @@ struct Syn {
     tries: usize,
 }
 impl Syn {
+    /// Its client's stream, while it still waits to connect.
+    fn waiting(&self) -> Option<Arc<Stream>> {
+        self.stream
+            .upgrade()
+            .filter(|stream| stream.phase() == Phase::Connecting && !stream.finished().1)
+    }
     /// When it is next tried, or after the last try given up.
     fn next(&self) -> u64 {
         let seconds = SYN_RETRIES.get(self.tries).copied().unwrap_or(SYN_TIMEOUT);
@@ -1469,6 +1483,8 @@ impl InetSocket {
                 .syns
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            // Those whose client has gone or stopped connecting are forgotten.
+            syns.retain(|syn| syn.waiting().is_some());
             syns.extract_if(.., |syn| due(syn)).collect()
         };
         while !syns.is_empty() {
@@ -1480,11 +1496,7 @@ impl InetSocket {
                 .map(|(i, _)| i);
             let Some(i) = next else { break };
             let syn = &mut syns[i];
-            let Some(stream) = syn
-                .stream
-                .upgrade()
-                .filter(|stream| stream.phase() == Phase::Connecting && !stream.finished().1)
-            else {
+            let Some(stream) = syn.waiting() else {
                 syns.swap_remove(i);
                 continue;
             };
@@ -1626,6 +1638,10 @@ impl InetSocket {
                 start,
                 tries: 0,
             });
+        } else {
+            // Without the host's clock no try can come: the client gives up
+            // at once, rather than wait for ever.
+            stream.fail(ETIMEDOUT);
         }
         Ok(Some(stream))
     }

@@ -1141,6 +1141,14 @@ fn a_dropped_handshake_is_tried_again_until_it_times_out() {
     at(&mut f, 7);
     assert_eq!(readable(&mut f, late) & 4, 4);
     assert_eq!(int_option(&mut f, late, 1, 4), (0, 0));
+    // One whose client closes is forgotten at the next look, not kept to
+    // its next try.
+    let syns = |f: &Fixture| f.kernel.files.network.as_ref().unwrap().syns();
+    let closed = nonblocking(&mut f, port);
+    assert_eq!(syns(&f), 1);
+    assert_eq!(f.ret(3, [closed, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(readable(&mut f, listener), 1);
+    assert_eq!(syns(&f), 0);
     // Never given room, it gives up at 131 seconds with ETIMEDOUT.
     let given_up = nonblocking(&mut f, port);
     at(&mut f, 7 + 130);

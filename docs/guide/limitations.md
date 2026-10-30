@@ -21,8 +21,7 @@ verified.
     port in `TIME_WAIT` for 60 seconds from its `close`, where Linux counts
     them from when the peer's end comes, if later, and holds the port until
     then too (`FIN_WAIT1` while its own bytes still go, `FIN_WAIT2`).
-    Listeners sharing a port with `SO_REUSEPORT` do not share its
-    connections: all go to the first. A nonzero `SO_LINGER` time never holds
+    A nonzero `SO_LINGER` time never holds
     `close`, as the bytes are delivered at once.
   - A UDP socket reaches the DNS stub and the guest's own sockets on the
     loopback; a datagram to any other address is `ENETUNREACH`. One

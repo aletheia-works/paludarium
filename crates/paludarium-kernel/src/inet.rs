@@ -1326,6 +1326,7 @@ impl InetSocket {
             v6_only: options.v6_only,
             reuse_address: options.reuse_address,
             reuse_port: options.reuse_port,
+            pooled: self.datagram && options.reuse_port,
             listening: false,
             peer: None,
             owner: Weak::clone(&self.this),
@@ -1535,7 +1536,7 @@ impl InetSocket {
         from: SocketAddr,
         to: SocketAddr,
     ) -> Knock {
-        let Some(listener) = self.ports().listener(to) else {
+        let Some(listener) = self.ports().listener(from, to) else {
             return Knock::Refused;
         };
         let theirs = *listener.options();
@@ -1602,7 +1603,13 @@ impl InetSocket {
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
         }
-        let Some(listener) = self.ports().listener(to) else {
+        if self.ports().listener(to, to).is_none() {
+            return Ok(None);
+        }
+        // Which of the sockets sharing the port takes it hangs on the port
+        // the connection leaves from.
+        let from = self.loopback_source(s, to, options)?;
+        let Some(listener) = self.ports().listener(from, to) else {
             return Ok(None);
         };
         let theirs = *listener.options();
@@ -1610,7 +1617,6 @@ impl InetSocket {
         let Some(listen) = state.listen.as_mut() else {
             return Ok(None);
         };
-        let from = self.loopback_source(s, to, options)?;
         let stream = Stream::new(to);
         stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
         let link = Arc::new(OnceLock::new());

@@ -600,6 +600,12 @@ one only with an `--allow-net`.
   the first connection waiting and its peer's address; they wait unless
   the listener is nonblocking, until `SO_RCVTIMEO` (`EAGAIN`). The
   accepted socket takes the listener's options.
+- **`SO_REUSEPORT`**: listeners that share a port with it, of one family
+  and on one address, share its connections, as Linux's
+  `reuseport_select_sock`: a hash of both ends' addresses and ports picks
+  the one each connection reaches, though the hash is not Linux's (whose
+  secret changes at each boot). A listener that stops or closes takes no
+  more. UDP sockets sharing a port likewise share its datagrams.
 - **`TIME_WAIT`**: the side that closes a connection first, a client or
   an accepted connection, holds its port for 60 seconds from its `close`,
   also while the bytes it sent are still on their way, as Linux's
@@ -616,7 +622,9 @@ one only with an `--allow-net`.
   both shares a port. A datagram to a loopback address reaches the guest
   socket bound there, as Linux's `compute_score` picks it: a connected one
   only from its peer, one bound to that address or connected, or of IPv4,
-  first, and among equals the last to bind. A socket that sends unbound
+  first, and among equals the last to bind, or of those sharing the port
+  with `SO_REUSEPORT` the one the same hash picks, past those connected; one
+  that connects from another address leaves them. A socket that sends unbound
   takes an ephemeral port on every address; one that connects takes one
   first, even when the connect then fails (`ENETUNREACH` for an IPv4 peer
   of an `IPV6_V6ONLY` socket), on the loopback's source address for a

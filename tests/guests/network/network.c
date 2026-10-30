@@ -860,6 +860,68 @@ int main(int argc, char **argv) {
         close(t);
         return 0;
     }
+    if (!strcmp(mode, "listen-reuseport")) {
+        /* Sockets sharing a port with SO_REUSEPORT share its connections
+           and datagrams by a hash of the addresses (reuseport_select_sock).
+           Which one gets each hangs on Linux's secret, so only the counts
+           are printed: each takes some of 64, and none once it leaves. */
+        int one = 1, result, port = 0;
+        int l[2], u[2];
+        for (int i = 0; i < 2; i++) {
+            l[i] = tcp(SOCK_NONBLOCK);
+            setsockopt(l[i], SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+            bind_to("bind", l[i], htonl(INADDR_LOOPBACK), port);
+            call("listen", listen(l[i], 128));
+            port = port_of(l[i]);
+        }
+        int counts[2] = {0, 0};
+        for (int i = 0; i < 64; i++) {
+            close(client(port, 0, &result));
+            if (result) printf("  connect errno=%d\n", result);
+        }
+        for (int i = 0; i < 2; i++) {
+            int s;
+            while ((s = accept(l[i], NULL, NULL)) >= 0) {
+                counts[i]++;
+                close(s);
+            }
+        }
+        printf("  tcp total=%d shared=%d\n", counts[0] + counts[1], counts[0] > 0 && counts[1] > 0);
+        close(l[0]);
+        counts[1] = 0;
+        for (int i = 0; i < 16; i++) close(client(port, 0, &result));
+        for (int s; (s = accept(l[1], NULL, NULL)) >= 0; counts[1]++) close(s);
+        printf("  tcp after-close=%d\n", counts[1]);
+        close(l[1]);
+
+        port = 0;
+        for (int i = 0; i < 2; i++) {
+            u[i] = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+            setsockopt(u[i], SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+            bind_to("bind-udp", u[i], htonl(INADDR_LOOPBACK), port);
+            port = port_of(u[i]);
+        }
+        struct sockaddr_in at = to(port);
+        int senders[64];
+        for (int i = 0; i < 64; i++) {
+            senders[i] = socket(AF_INET, SOCK_DGRAM, 0);
+            sendto(senders[i], "x", 1, 0, (void *)&at, sizeof at);
+        }
+        counts[0] = counts[1] = 0;
+        for (int i = 0; i < 2; i++)
+            while (recv(u[i], buf, sizeof buf, 0) >= 0) counts[i]++;
+        printf("  udp total=%d shared=%d\n", counts[0] + counts[1], counts[0] > 0 && counts[1] > 0);
+        /* A connected one takes only its peer's: the rest go to the other. */
+        struct sockaddr_in peer = to(port_of(senders[0]));
+        call("connect-udp", connect(u[0], (void *)&peer, sizeof peer));
+        for (int i = 1; i < 64; i++) sendto(senders[i], "x", 1, 0, (void *)&at, sizeof at);
+        sendto(senders[0], "x", 1, 0, (void *)&at, sizeof at);
+        counts[0] = counts[1] = 0;
+        for (int i = 0; i < 2; i++)
+            while (recv(u[i], buf, sizeof buf, 0) >= 0) counts[i]++;
+        printf("  udp connected=%d other=%d\n", counts[0], counts[1]);
+        return 0;
+    }
     if (!strcmp(mode, "listen-reset")) {
         /* What ends a loopback connection with a reset. */
         int port, result;

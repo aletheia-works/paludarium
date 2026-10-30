@@ -1333,6 +1333,85 @@ fn loopback_time_wait_holds_the_port_closed_first() {
     assert_eq!(bind_on(&mut f, shared, true), 0);
 }
 #[test]
+fn sockets_sharing_a_port_share_its_connections_and_datagrams() {
+    let mut f = network_fixture(&[]);
+    f.mem
+        .write(GuestAddr(DATA + 0x300), &1i32.to_le_bytes())
+        .unwrap();
+    // Two of a group, bound to 127.0.0.1 on one port with SO_REUSEPORT.
+    let shared = |f: &mut Fixture, kind: u64, port: u16| {
+        let fd = f.ret(41, [2, kind | 0x800, 0, 0, 0, 0]);
+        assert_eq!(f.ret(54, [fd, 1, 15, DATA + 0x300, 4, 0]), 0);
+        inet_address(f, DATA + 0x100, [127, 0, 0, 1], port);
+        assert_eq!(f.ret(49, [fd, DATA + 0x100, 16, 0, 0, 0]), 0);
+        let name = name_of(f, 51, fd);
+        (fd, u16::from_be_bytes([name[2], name[3]]))
+    };
+    let accepted = |f: &mut Fixture, fd: u64| {
+        let mut count = 0;
+        while (f.ret(288, [fd, 0, 0, 0, 0, 0]) as i64) >= 0 {
+            count += 1;
+        }
+        count
+    };
+    let (a, port) = shared(&mut f, 1, 0);
+    let (b, _) = shared(&mut f, 1, port);
+    assert_eq!(f.ret(50, [a, 64, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [b, 64, 0, 0, 0, 0]), 0);
+    for _ in 0..32 {
+        loopback_client(&mut f, port);
+    }
+    let (to_a, to_b) = (accepted(&mut f, a), accepted(&mut f, b));
+    assert_eq!(to_a + to_b, 32);
+    assert!(to_a > 0 && to_b > 0, "{to_a} {to_b}");
+    // A listener that leaves the group takes no more.
+    assert_eq!(f.ret(3, [a, 0, 0, 0, 0, 0]), 0);
+    for _ in 0..8 {
+        loopback_client(&mut f, port);
+    }
+    assert_eq!(accepted(&mut f, b), 8);
+
+    let (c, port) = shared(&mut f, 2, 0);
+    let (d, _) = shared(&mut f, 2, port);
+    let received = |f: &mut Fixture, fd: u64| {
+        let mut count = 0;
+        while (f.ret(45, [fd, DATA + 8, 16, 0, 0, 0]) as i64) >= 0 {
+            count += 1;
+        }
+        count
+    };
+    let send = |f: &mut Fixture| {
+        let sender = f.ret(41, [2, 2, 0, 0, 0, 0]);
+        inet_address(f, DATA + 0x100, [127, 0, 0, 1], port);
+        assert_eq!(f.ret(44, [sender, DATA, 1, 0, DATA + 0x100, 16]), 1);
+        sender
+    };
+    for _ in 0..32 {
+        send(&mut f);
+    }
+    let (to_c, to_d) = (received(&mut f, c), received(&mut f, d));
+    assert_eq!(to_c + to_d, 32);
+    assert!(to_c > 0 && to_d > 0, "{to_c} {to_d}");
+    // A connected one takes only its peer's; the rest go to the other.
+    let peer = send(&mut f);
+    assert_eq!(received(&mut f, c) + received(&mut f, d), 1);
+    let name = name_of(&mut f, 51, peer);
+    inet_address(
+        &f,
+        DATA + 0x100,
+        [127, 0, 0, 1],
+        u16::from_be_bytes([name[2], name[3]]),
+    );
+    assert_eq!(f.ret(42, [c, DATA + 0x100, 16, 0, 0, 0]), 0);
+    for _ in 0..8 {
+        send(&mut f);
+    }
+    assert_eq!(received(&mut f, d), 8);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], port);
+    assert_eq!(f.ret(44, [peer, DATA, 1, 0, DATA + 0x100, 16]), 1);
+    assert_eq!(received(&mut f, c), 1);
+}
+#[test]
 fn a_udp_shutdown_ends_reads_and_refuses_sends() {
     let mut f = network_fixture(&[]);
     let a = f.ret(41, [2, 2, 0, 0, 0, 0]);

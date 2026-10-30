@@ -181,6 +181,10 @@ mod linux {
         case("listen-time-wait");
     }
     #[test]
+    fn network_listen_reuseport() {
+        case("listen-reuseport");
+    }
+    #[test]
     fn network_listen_fork() {
         case("listen-fork");
     }

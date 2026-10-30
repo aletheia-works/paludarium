@@ -11,9 +11,11 @@
 //! Linux's bind buckets and UDP hash do, for `bind`'s conflicts and to find
 //! a connection's listener or a datagram's receiver.
 use crate::inet::InetSocket;
+use core::hash::{Hash, Hasher};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use paludarium_host::net::{Driver, Phase, Stream};
 use paludarium_types::Errno;
+use std::hash::DefaultHasher;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
@@ -167,6 +169,10 @@ pub(crate) struct Binding {
     pub(crate) v6_only: bool,
     pub(crate) reuse_address: bool,
     pub(crate) reuse_port: bool,
+    /// In a group of sockets sharing the port with `SO_REUSEPORT`, which
+    /// a TCP listener joins when it listens, and a UDP socket when it
+    /// binds (`inet_reuseport_add_sock`, `udp_reuseport_add_sock`).
+    pub(crate) pooled: bool,
     pub(crate) listening: bool,
     /// A connected UDP socket's peer, the only sender it receives from.
     pub(crate) peer: Option<SocketAddr>,
@@ -219,6 +225,26 @@ impl Binding {
     fn is(&self, owner: &Weak<InetSocket>) -> bool {
         self.time_wait.is_none() && Weak::ptr_eq(&self.owner, owner)
     }
+    /// Whether `other` is in `self`'s group: of the same family, on the
+    /// same address and port.
+    fn pools_with(&self, other: &Binding) -> bool {
+        self.pooled
+            && other.pooled
+            && self.address == other.address
+            && self.v6 == other.v6
+            && self.v6_only == other.v6_only
+            && self.listening == other.listening
+    }
+}
+
+/// Which of `count` sockets sharing a port a connection or datagram from
+/// `from` to `to` reaches, as Linux's `reuseport_select_sock` scales a hash
+/// of the four, though not with Linux's own hash and secret.
+fn pick(from: SocketAddr, to: SocketAddr, count: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    (from, to).hash(&mut hasher);
+    let hash = hasher.finish() as u32;
+    ((u64::from(hash) * count as u64) >> 32) as usize
 }
 
 /// The local ports the TCP sockets, or the UDP ones, hold, and where the
@@ -316,6 +342,7 @@ impl Ports {
         let mut own = self.bindings[index].clone();
         own.reuse_address = reuse_address;
         own.reuse_port = reuse_port;
+        own.pooled = reuse_port;
         let blocked = self
             .bindings
             .iter()
@@ -349,6 +376,7 @@ impl Ports {
         for binding in &mut self.bindings {
             if binding.is(owner) {
                 binding.listening = false;
+                binding.pooled = false;
             }
         }
     }
@@ -361,7 +389,8 @@ impl Ports {
         }
     }
     /// `owner`, a UDP socket, connected from `address` to `peer`, or with
-    /// `None` disconnected.
+    /// `None` disconnected; on another address it leaves its group, as
+    /// Linux's `udp_lib_rehash`.
     pub(crate) fn connect(
         &mut self,
         owner: &Weak<InetSocket>,
@@ -370,6 +399,7 @@ impl Ports {
     ) {
         for binding in &mut self.bindings {
             if binding.is(owner) {
+                binding.pooled &= binding.address == address;
                 binding.address = address;
                 binding.peer = peer;
             }
@@ -379,11 +409,11 @@ impl Ports {
     pub(crate) fn unbind(&mut self, owner: &Weak<InetSocket>) {
         self.bindings.retain(|binding| !binding.is(owner));
     }
-    /// The listener a connection to `to` reaches, as Linux's
+    /// The listener a connection from `from` to `to` reaches, as Linux's
     /// `__inet_lookup_listener`: one bound to that address before one bound
     /// to every address, and an IPv4 socket before an IPv6 one; among equals
-    /// the first to bind.
-    pub(crate) fn listener(&mut self, to: SocketAddr) -> Option<Arc<InetSocket>> {
+    /// the first to bind, or one of its group ([`pick`]).
+    pub(crate) fn listener(&mut self, from: SocketAddr, to: SocketAddr) -> Option<Arc<InetSocket>> {
         self.live();
         let ip = to.ip();
         let score = |binding: &Binding| {
@@ -408,12 +438,42 @@ impl Ports {
                 best = Some((found, binding));
             }
         }
-        best.and_then(|(_, binding)| binding.owner.upgrade())
+        let (_, best) = best?;
+        self.shared(best, from, to, |_| true).owner.upgrade()
+    }
+    /// `best`, or when it shares its port with `SO_REUSEPORT` one of its
+    /// group that `takes` from `from` to `to`.
+    fn shared<'a>(
+        &'a self,
+        best: &'a Binding,
+        from: SocketAddr,
+        to: SocketAddr,
+        takes: impl Fn(&Binding) -> bool,
+    ) -> &'a Binding {
+        if !best.reuse_port {
+            return best;
+        }
+        let group: Vec<&Binding> = self
+            .bindings
+            .iter()
+            .filter(|other| best.pools_with(other))
+            .collect();
+        if group.is_empty() {
+            return best;
+        }
+        // Linux goes on from the one the hash picks past those that do not
+        // take it (`reuseport_select_sock_by_hash`).
+        let start = pick(from, to, group.len());
+        (0..group.len())
+            .map(|i| group[(start + i) % group.len()])
+            .find(|binding| takes(binding))
+            .unwrap_or(best)
     }
     /// The UDP socket a datagram from `from` to `to` reaches, as Linux's
     /// `compute_score` ranks them: a connected one only from its peer, and
     /// one bound to that address, connected, or IPv4, before others; among
-    /// equals the last to bind, which Linux's hash holds first.
+    /// equals the last to bind, which Linux's hash holds first, or one of its
+    /// group that is not connected ([`pick`]).
     pub(crate) fn receiver(&mut self, to: SocketAddr, from: SocketAddr) -> Option<Arc<InetSocket>> {
         self.live();
         let ip = to.ip();
@@ -445,7 +505,13 @@ impl Ports {
                 best = Some((found, binding));
             }
         }
-        best.and_then(|(_, binding)| binding.owner.upgrade())
+        let (_, best) = best?;
+        if best.peer.is_some() {
+            return best.owner.upgrade();
+        }
+        self.shared(best, from, to, |binding| binding.peer.is_none())
+            .owner
+            .upgrade()
     }
 }
 
@@ -486,6 +552,7 @@ mod tests {
             v6_only: false,
             reuse_address: false,
             reuse_port: false,
+            pooled: false,
             listening: false,
             peer: None,
             owner: Weak::new(),

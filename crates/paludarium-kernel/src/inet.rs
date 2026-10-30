@@ -3050,11 +3050,12 @@ mod tests {
     #[test]
     fn datagrams_take_what_linux_counts() {
         // What the CI runner's x86-64 Linux 7.0 (`7.0.0-1017-azure`) takes
-        // for one datagram of each length: the heads and their buckets as
-        // `rx_queue` in /proc/net/udp and udp6 showed them on Linux 7.0, with
-        // the runner's 704-byte small head cache, which its fit counts in
-        // `udp-rcvbuf` give.
-        let measured: &[(usize, usize, usize)] = &[
+        // for one datagram of each length. The buckets and their boundaries
+        // are those `rx_queue` in /proc/net/udp and udp6 showed under
+        // Docker's Linux 7.0; the small head is the runner's 704 bytes, the
+        // only size its counts in `udp-rcvbuf` allow. Docker's kernel, whose
+        // small head is 640 bytes, gives less for the smallest datagrams.
+        let expected: &[(usize, usize, usize)] = &[
             (0, 960, 960),
             (241, 960, 960),
             (312, 960, 960),
@@ -3079,7 +3080,7 @@ mod tests {
             (65489, 66449, 67400),
             (65507, 66467, 67400),
         ];
-        for &(len, ipv4, ipv6) in measured {
+        for &(len, ipv4, ipv6) in expected {
             assert_eq!(truesize(len, true), ipv4, "IPv4, {len} bytes");
             assert_eq!(truesize(len, false), ipv6, "IPv6, {len} bytes");
         }

@@ -19,6 +19,14 @@ CI run produces them afresh on an x86-64 Linux runner.
   real Linux, before they are implemented.
 - Each case has a 30-second timeout, or a longer one for a case that waits
   out a timer of Linux's own, such as `TIME_WAIT`.
+- The emulated side of the program cases runs on a virtual clock
+  (`RecordingHost`): a sleep jumps it to its deadline at once, and a timed
+  wait does so after up to 10 ms of real time for a wake-up. The clock is
+  shared by every process and thread of the guest, so one that sleeps moves
+  the time another one sees. A case therefore prints no times, and compares
+  how long a wait took only when no other process or thread sleeps
+  meanwhile. To wait for another process, it uses a pipe or a descriptor
+  to wait on without a timeout, not a sleep.
 - The core-dump case needs Linux to keep the kernel's default `core_pattern`
   (`core`, with `core_uses_pid` 0). CI sets it with `sysctl`; elsewhere the
   case stops and says so, rather than compare with a core sent to a crash

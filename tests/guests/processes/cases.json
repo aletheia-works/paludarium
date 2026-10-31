@@ -60,6 +60,7 @@
     {"name":"scm-rights","binary":"process"},
     {"name":"unix-abstract","binary":"process"},
     {"name":"unix-datagram","binary":"process"},
+    {"name":"unix-dgram-sndbuf","binary":"process"},
     {"name":"unix-peercred","binary":"process"},
     {"name":"unix-socketpair","binary":"process"},
     {"name":"unix-dgram-disconnect","binary":"process"},

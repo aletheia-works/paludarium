@@ -171,6 +171,14 @@ kernel.
   10 messages, unless it is the sender's own or connected to the sender:
   a nonblocking send is then `EAGAIN`, a blocking one waits, at most
   `SO_SNDTIMEO`, and the connected sender is not writable to `poll`.
+  Each datagram that waits takes of its sender's send buffer what x86-64
+  Linux 7.0 counts as its `sk_buff`'s `truesize` (`sk_wmem_alloc`), until
+  it is read, dropped or its receiver goes; `SIOCOUTQ` gives that. While
+  it takes the whole of `SO_SNDBUF`, a send is `EAGAIN` or waits. The
+  sender is writable to `poll`, and a waiting send wakes, only once a
+  quarter of it is free (`unix_writable`), or the wait's `SO_SNDTIMEO`
+  is up, when the send looks once more; a datagram longer than `SO_SNDBUF`
+  less 32 bytes is `EMSGSIZE`. The receiver's unread bytes bound nothing.
   `connect` to an `AF_UNSPEC` address disconnects; a socket connects again
   at will. When the socket it is connected to goes, its next send is
   `ECONNREFUSED`, then `ENOTCONN`. Disconnecting, by connecting to another

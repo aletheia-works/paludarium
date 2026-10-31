@@ -633,12 +633,16 @@ fn fionread_and_siocoutq_count_what_waits() {
     assert_eq!(count(&mut f, b, 0x541b), (0, 5));
     assert_eq!(count(&mut f, a, 0x5411), (0, 5));
     assert_eq!(count(&mut f, a, 0x541b), (0, 0));
-    // A datagram socket counts its first datagram.
+    // A datagram socket counts its first datagram; SIOCOUTQ, at the
+    // sender, what the datagrams that wait take of its send buffer, each a
+    // small head and its sk_buff, until they are read.
     let (c, d) = pair(&mut f, 53, [1, 2, 0, DATA, 0, 0]);
     assert_eq!(f.ret(44, [c, DATA + 32, 3, 0, 0, 0]), 3);
     assert_eq!(f.ret(44, [c, DATA + 35, 2, 0, 0, 0]), 2);
     assert_eq!(count(&mut f, d, 0x541b), (0, 3));
-    assert_eq!(count(&mut f, c, 0x5411), (0, 5));
+    assert_eq!(count(&mut f, c, 0x5411), (0, 2 * 960));
+    assert_eq!(f.ret(45, [d, DATA + 64, 8, 0, 0, 0]), 3);
+    assert_eq!(count(&mut f, c, 0x5411), (0, 960));
     // A pipe counts at either end and has no SIOCOUTQ.
     let (r, w) = pair(&mut f, 293, [DATA, 0, 0, 0, 0, 0]);
     assert_eq!(f.ret(1, [w, DATA + 32, 4, 0, 0, 0]), 4);

@@ -493,6 +493,10 @@ struct Datagram {
     /// What it takes of the receive buffer ([`truesize`]).
     size: usize,
 }
+/// `SKB_SMALL_HEAD_SIZE`, which `MAX_HEADER` sizes: 704 bytes on the CI
+/// runner's kernel, built with Hyper-V's networking (640 on Docker's; an
+/// AF_UNIX datagram there, on an Arm kernel, takes a 512-byte one).
+pub(crate) const SMALL_HEAD: usize = 704;
 /// What a datagram of `len` bytes on the loopback takes of the receive
 /// buffer, as x86-64 Linux 7.0 counts its `skb->truesize`: the `sk_buff`
 /// (256 bytes) and its head, from the small head cache or the
@@ -503,9 +507,6 @@ struct Datagram {
 /// as two fragments, reassembled.
 fn truesize(len: usize, ipv4: bool) -> usize {
     const SKB: usize = 256;
-    // `SKB_SMALL_HEAD_SIZE`, which `MAX_HEADER` sizes: 704 bytes on the CI
-    // runner's kernel, built with Hyper-V's networking (640 on Docker's).
-    const SMALL_HEAD: usize = 704;
     const SHARED_INFO: usize = 320;
     const MAX_ALLOC: usize = 16_384 - SHARED_INFO;
     const MTU: usize = 65_536;

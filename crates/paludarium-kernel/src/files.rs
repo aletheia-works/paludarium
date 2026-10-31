@@ -2013,6 +2013,24 @@ pub(crate) fn write_with(
                     }
                     return if done != 0 { Ok(done as u64) } else { Err(e) };
                 }
+                // A datagram sender with no room sleeps on until a quarter
+                // of its send buffer is free, or its time is up, when it
+                // looks once more, as Linux's `sock_alloc_send_pskb` does.
+                loop {
+                    let ticket = c.files.readiness.token.value();
+                    if !crate::sockets::sleeps_for_room(file) {
+                        break;
+                    }
+                    let Some(deadline) = wait.deadline(c)? else {
+                        break;
+                    };
+                    if let Err(e) = crate::events::wait(c, ticket, deadline) {
+                        if !wait.forever() {
+                            c.process.restart = None;
+                        }
+                        return Err(e);
+                    }
+                }
             }
             Err(e) => {
                 if done != 0 {

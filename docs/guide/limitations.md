@@ -32,9 +32,7 @@ verified.
     system: under a directory mounted from the host, `bind` to a path is
     `EPERM`, and a host's socket file there finds no socket
     (`ECONNREFUSED`). A socket file's write permission is not checked, as
-    for root. A sender's datagrams are bounded by the bytes the receiver
-    has not read, not by the sender's `SO_SNDBUF`, and `SIOCOUTQ` on a
-    datagram socket is 0.
+    for root.
   - The DNS stub answers only `A` and `AAAA`, and ignores EDNS, so a
     datagram answer holds at most 512 bytes; a name the host cannot resolve
     is `SERVFAIL`. A TCP connection to port 53 always reaches the stub, never
@@ -81,8 +79,9 @@ verified.
   whose effect is not modelled, where Linux takes them: `SO_PASSSEC` and
   `SO_TIMESTAMPING`, as well as filters and the other options Linux has. `SO_RCVTIMEO` and `SO_SNDTIMEO`
   round to a 1000 Hz tick, where Linux rounds to its own `CONFIG_HZ`.
-  `SO_SNDBUF` and `SO_RCVBUF` are reported but leave the pair's buffer as it
-  is. The buffer counts only the bytes in it, where Linux also counts each
+  `SO_SNDBUF` and `SO_RCVBUF` are reported but leave a stream or packet
+  socket's buffer as it is (a datagram socket's `SO_SNDBUF` bounds
+  what it sends, with each datagram's overhead). That buffer counts only the bytes in it, where Linux also counts each
   message's or part's overhead, so more small messages fit before a send
   finds it full, and `SIOCOUTQ` counts only the bytes the peer has not
   read. The guest is root, so the options that need `CAP_NET_ADMIN`

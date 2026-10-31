@@ -4239,6 +4239,95 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
+    if (!strcmp(mode, "unix-dgram-sndbuf")) {
+        /* What an AF_UNIX datagram takes of its sender's send buffer, as
+           unix_dgram_sendmsg allocates it (skb->truesize, charged to
+           sk_wmem_alloc): SIOCOUTQ counts it until the datagram is read or
+           its receiver goes. A sender with no room left is EAGAIN, or
+           waits, and is not writable to poll until a quarter of the buffer
+           is free; SO_SNDBUF less 32 bytes bounds a datagram. */
+        static char big[212992];
+        int sv[2], q;
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+        const int lens[] = {0, 1, 384, 385, 1000, 3776, 3777, 7872, 7873, 16064,
+                            16065, 20000, 50000, 85696, 85697, 100000, 212960, 212961};
+        for (unsigned i = 0; i < sizeof lens / sizeof lens[0]; i++) {
+            errno = 0;
+            long n = send(sv[0], big, lens[i], 0);
+            int e = n < 0 ? errno : 0;
+            ioctl(sv[0], SIOCOUTQ, &q);
+            printf("len=%d send=%ld errno=%d outq=%d", lens[i], n, e, q);
+            if (n >= 0) recv(sv[1], big, sizeof big, 0);
+            ioctl(sv[0], SIOCOUTQ, &q);
+            printf(" read=%d\n", q);
+        }
+        int value = 8192;
+        socklen_t value_len = sizeof value;
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &value, sizeof value);
+        getsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &value, &value_len);
+        printf("sndbuf=%d\n", value);
+        int sent = 0;
+        errno = 0;
+        while (send(sv[0], big, 1000, MSG_DONTWAIT) == 1000) sent++;
+        ioctl(sv[0], SIOCOUTQ, &q);
+        printf("filled=%d errno=%d outq=%d\n", sent, errno, q);
+        unix_poll("full", sv[0]);
+        for (int i = 0; i < sent; i++) {
+            recv(sv[1], big, sizeof big, 0);
+            ioctl(sv[0], SIOCOUTQ, &q);
+            struct pollfd p = {.fd = sv[0], .events = POLLOUT};
+            poll(&p, 1, 0);
+            printf("read %d outq=%d writable=%d\n", i + 1, q, !!(p.revents & POLLOUT));
+        }
+        unix_call("send-too-long", send(sv[0], big, 16353, 0));
+        unix_call("send-longest", send(sv[0], big, 16352, 0));
+        recv(sv[1], big, sizeof big, 0);
+        send(sv[0], big, 1, 0);
+        send(sv[0], big, 2, 0);
+        ioctl(sv[0], SIOCOUTQ, &q);
+        printf("before-close outq=%d\n", q);
+        close(sv[1]);
+        ioctl(sv[0], SIOCOUTQ, &q);
+        printf("receiver-closed outq=%d\n", q);
+        close(sv[0]);
+        /* A blocking sender waits for room: a read that leaves less than a
+           quarter of the buffer free does not wake it, so it waits out
+           SO_SNDTIMEO and then looks once more; reads that leave it
+           writable wake it. */
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+        value = 2048;
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &value, sizeof value);
+        struct timeval half = {.tv_usec = 500000};
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &half, sizeof half);
+        sent = 0;
+        while (send(sv[0], big, 1000, MSG_DONTWAIT) == 1000) sent++;
+        printf("small-filled=%d\n", sent);
+        for (int reads = 1; reads <= 2; reads++) {
+            pid_t child = fork();
+            if (child == 0) {
+                usleep(100000);
+                for (int i = 0; i < reads; i++) recv(sv[1], big, sizeof big, 0);
+                _exit(0);
+            }
+            struct timespec start, end;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            long n = send(sv[0], big, 1000, 0);
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            long ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+            int status;
+            waitpid(child, &status, 0);
+            /* Only the timed-out wait is timed: it lasts at least the
+               timeout however slow the machine. */
+            printf("blocked-send reads=%d send=%ld", reads, n);
+            if (reads == 1) printf(" waited-out=%d", ms >= 450);
+            printf("\n");
+            while (recv(sv[1], big, sizeof big, MSG_DONTWAIT) >= 0) {}
+            while (send(sv[0], big, 1000, MSG_DONTWAIT) == 1000) {}
+        }
+        close(sv[0]);
+        close(sv[1]);
+        return 0;
+    }
     if (!strcmp(mode, "unix-datagram")) {
         /* AF_UNIX datagram sockets from socket() (af_unix.c's
            unix_dgram_*): names in the abstract namespace, which each type

@@ -2647,6 +2647,9 @@ fn collect_garbage() {
     // adds a hold with it, which that copy's count sees.
     let mut held: BTreeMap<EndId, (usize, usize)> = BTreeMap::new();
     let mut queues: BTreeMap<EndId, Vec<EndId>> = BTreeMap::new();
+    // The sockets in flight, looked at once their holds are all counted,
+    // which a strong reference taken here would add to.
+    let mut sockets: BTreeMap<EndId, Weak<dyn FileHandle>> = BTreeMap::new();
     for pair in &pairs {
         let sides = pair.sides.lock().unwrap_or_else(PoisonError::into_inner);
         for (side, own) in sides.iter().enumerate() {
@@ -2657,9 +2660,31 @@ fn collect_garbage() {
                     entry.0 = entry.0.max(Arc::strong_count(&descriptor.file));
                     entry.1 += 1;
                     queues.entry(queue).or_default().push(end.id());
+                    sockets
+                        .entry(end.id())
+                        .or_insert_with(|| Arc::downgrade(&descriptor.file));
                 }
             }
         }
+    }
+    // A listener in flight holds what its connections not yet accepted
+    // hold, as Linux's `unix_edge_successor` counts an embryo's
+    // descriptors as its listener's: their queues are the listener's, and
+    // go with it.
+    let mut pending: BTreeMap<EndId, Vec<Arc<SocketPairEnd>>> = BTreeMap::new();
+    for (id, file) in sockets {
+        let Some(listener) = file
+            .upgrade()
+            .and_then(|file| socket_end(&file).and_then(SocketPairEnd::unix))
+        else {
+            continue;
+        };
+        let children = listener.pending();
+        for child in &children {
+            let held = queues.remove(&child.id()).unwrap_or_default();
+            queues.entry(id).or_default().extend(held);
+        }
+        pending.insert(id, children);
     }
     // What a descriptor, or an end that is not garbage, reaches is alive.
     let candidate = |id: &EndId| held.get(id).is_some_and(|(all, queued)| all == queued);
@@ -2672,14 +2697,28 @@ fn collect_garbage() {
             }
         }
     }
+    let garbage = |id: &EndId| candidate(id) && !alive.contains(id);
     let mut purged: Vec<Passed> = Vec::new();
     for pair in &pairs {
         let mut sides = pair.sides.lock().unwrap_or_else(PoisonError::into_inner);
         for (side, own) in sides.iter_mut().enumerate() {
             let id = (Arc::as_ptr(pair) as usize, side);
-            if candidate(&id) && !alive.contains(&id) {
+            if garbage(&id) {
                 purged.extend(
                     own.writes
+                        .iter_mut()
+                        .map(|write| std::mem::take(&mut write.passed)),
+                );
+            }
+        }
+    }
+    for (id, children) in &pending {
+        if garbage(id) {
+            for child in children {
+                let mut sides = child.lock_sides();
+                purged.extend(
+                    sides[child.side]
+                        .writes
                         .iter_mut()
                         .map(|write| std::mem::take(&mut write.passed)),
                 );

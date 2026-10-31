@@ -339,6 +339,16 @@ impl UnixSocket {
     pub(crate) fn listening(&self) -> bool {
         self.lock().listen.is_some()
     }
+    /// The ends of the connections that wait for `accept`.
+    pub(crate) fn pending(&self) -> Vec<Arc<SocketPairEnd>> {
+        self.lock().listen.as_ref().map_or_else(Vec::new, |listen| {
+            listen
+                .queue
+                .iter()
+                .map(|child| Arc::clone(&child.end))
+                .collect()
+        })
+    }
     fn datagram(&self) -> bool {
         self.end.kind() == SOCK_DGRAM
     }

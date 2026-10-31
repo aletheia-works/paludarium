@@ -2493,6 +2493,34 @@ fn scm_rights_passes_descriptors_over_a_stream() {
     );
 }
 #[test]
+fn a_listener_only_its_connections_not_accepted_hold_is_collected() {
+    let mut f = Fixture::new();
+    let listener = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    f.mem
+        .write(GuestAddr(DATA + 0x700), &[1, 0, 0, b'g'])
+        .unwrap();
+    assert_eq!(f.ret(49, [listener, DATA + 0x700, 4, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [listener, 1, 0, 0, 0, 0]), 0);
+    let client = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    assert_eq!(f.ret(42, [client, DATA + 0x700, 4, 0, 0, 0]), 0);
+    // The client passes the listener to the connection it has not
+    // accepted, which alone then holds it.
+    let len = control(&f, CONTROL, 1, 1, &[listener as u32]);
+    message(&f, SEND, (0, 0), &[(BYTES, 1)], (CONTROL, len));
+    assert_eq!(f.ret(46, [client, SEND, 0, 0, 0, 0]), 1);
+    assert_eq!(f.ret(3, [listener, 0, 0, 0, 0, 0]), 0);
+    // Another socket goes: the listener is garbage, and its close resets
+    // the connection. (Another test's socket may have gone first, so what
+    // the client reads before this is not looked at.)
+    let (x, y) = pair(&mut f, 53, [1, 1, 0, DATA + 0x780, 0, 0]);
+    assert_eq!(f.ret(3, [x, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(3, [y, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(45, [client, DATA + 0x300, 1, 0x40, 0, 0]),
+        Errno(104).to_syscall_return()
+    );
+}
+#[test]
 fn scm_rights_checks_like_linux() {
     let mut f = Fixture::new();
     let (a, _b) = pair(&mut f, 53, [1, 0x801, 0, DATA, 0, 0]);

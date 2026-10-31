@@ -4502,6 +4502,24 @@ int main(int argc, char **argv) {
         printf("read-back=%zd byte=%c\n", read(s[0], &byte, 1), byte);
         close(got);
         gc_state("held-closed", s[0]);
+        /* A listener that only the queue of a connection it has not
+           accepted holds is garbage too, as Linux counts what an embryo
+           holds as its listener's: it goes, and resets the client. */
+        struct sockaddr_un a;
+        socklen_t len = unix_abstract(&a, "gc-listener");
+        int l = socket(AF_UNIX, SOCK_STREAM, 0);
+        bind(l, (void *)&a, len);
+        listen(l, 1);
+        int client = socket(AF_UNIX, SOCK_STREAM, 0);
+        printf("connect=%d\n", connect(client, (void *)&a, len));
+        printf("send-listener=%ld\n", send_fds(client, "x", 1, &l, 1));
+        close(l);
+        gc_trigger(client);
+        gc_state("listener-collected", client);
+        errno = 0;
+        n = recv(client, &byte, 1, MSG_DONTWAIT);
+        printf("recv-reset=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        close(client);
         return 0;
     }
     if (!strcmp(mode, "scm-rights")) {

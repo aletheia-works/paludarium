@@ -32,9 +32,7 @@ verified.
     system: under a directory mounted from the host, `bind` to a path is
     `EPERM`, and a host's socket file there finds no socket
     (`ECONNREFUSED`). A socket file's write permission is not checked, as
-    for root. The
-    garbage collector does not look at a listener's connections not yet
-    accepted. A sender's datagrams are bounded by the
+    for root. A sender's datagrams are bounded by the
     bytes the receiver has not read, not by the sender's `SO_SNDBUF`, and
     `SIOCOUTQ` on a datagram socket is 0.
   - The DNS stub answers only `A` and `AAAA`, and ignores EDNS, so a

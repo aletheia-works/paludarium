@@ -90,8 +90,9 @@ verified.
     later, from a work queue.
 - **Socket options**: `setsockopt` refuses, with `ENOPROTOOPT`, the options
   whose effect is not modelled, where Linux takes them: `SO_PASSSEC`, as
-  well as filters and the other options Linux has. `SO_RCVTIMEO` and `SO_SNDTIMEO`
-  round to a 1000 Hz tick, where Linux rounds to its own `CONFIG_HZ`.
+  well as filters and the other options Linux has. `SO_RCVTIMEO` and
+  `SO_SNDTIMEO` round to a 1000 Hz tick, where Linux rounds to its own
+  `CONFIG_HZ`.
   The guest is root, so the options that need `CAP_NET_ADMIN`
   (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
   gid 0.

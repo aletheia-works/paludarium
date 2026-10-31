@@ -40,6 +40,22 @@ CI run produces them afresh on an x86-64 Linux runner.
   itself, so there even native results can differ from Linux: a stopped and
   continued child sends SIGCHLD to a parent that set `SA_NOCLDSTOP`, where
   Linux sends none. Such a run is not evidence, in either direction.
+  On main, 24 of the process cases and 3 of the network cases fail there
+  for such reasons. QEMU:
+  - refuses socket options it does not know (`SO_PEEK_OFF`,
+    `SO_TIMESTAMP_NEW`, `SO_RCVTIMEO_NEW`, …);
+  - leaves `MSG_CTRUNC` out of `recvmsg`'s flags;
+  - handles `SA_NOCLDSTOP`, `SA_NOCLDWAIT`, `F_SETSIG`, core dumps and
+    `sigqueue` itself;
+  - shows its own threads and timer numbers;
+  - does not pass `FIOQSIZE` on.
+
+  Docker's own kernel counts a datagram's buffer differently, and the
+  slower native side can time out. `mise run linux-dev-compare` runs the
+  tests there for a checkout and for main, and lists only the cases whose
+  result differs. A case that fails only on the checkout runs once more: if
+  it passes then, it is listed as flaky, as some cases' timing is under
+  QEMU; else it fails the task.
 - The native results are those of the CI runner's kernel (Linux 7.0 on
   `ubuntu-24.04`). Where Linux changed between versions or builds, as in
   what a UDP datagram takes of the receive buffer, whose small head cache

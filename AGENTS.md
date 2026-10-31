@@ -26,6 +26,7 @@ lists what an agent needs first.
 | `mise run test` | Unit tests of every crate |
 | `mise run build`, `mise run wasm:build` | The command, and the npm package's `paludarium.wasm` |
 | `mise run test:diff`, `coverage`, `fuzz <target>` | x86-64 Linux only; elsewhere `mise run linux-dev -- <command>` |
+| `mise run linux-dev-compare` | The differential tests in that container, listing only results that differ from main's (reference, not evidence) |
 | `mise run deny`, `mise run release:check` | Dependency policy and release configuration |
 
 ## Rules

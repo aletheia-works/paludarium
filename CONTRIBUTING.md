@@ -82,7 +82,9 @@ every push to main); a macOS or Windows run is not a substitute. Nor is
 `mise run linux-dev` on an Arm Mac: Docker runs the x86-64 programs there, the
 native side included, under QEMU's user-mode emulation, which handles signals
 itself, so even the native results can differ from Linux (a stopped and
-continued child sends SIGCHLD despite `SA_NOCLDSTOP`, for one). Do not lower
+continued child sends SIGCHLD despite `SA_NOCLDSTOP`, for one).
+`mise run linux-dev-compare` lists only the cases whose result there differs
+from main's ([Testing and verification](docs/design/quality.md)). Do not lower
 coverage floors, add skips, or weaken comparison masks to make a check pass. Measure speed only with background load stopped. For
 documentation or GitHub configuration changes, check syntax, referenced paths,
 and the final diff; a full emulator rebuild is unnecessary.

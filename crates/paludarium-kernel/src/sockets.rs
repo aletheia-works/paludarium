@@ -2698,9 +2698,9 @@ thread_local! {
 pub(crate) fn out_of_room(file: &Arc<dyn FileHandle>) -> bool {
     NO_ROOM.replace(false) && socket_end(file).is_some_and(|end| end.pair.messages())
 }
-/// Whether a datagram or packet socket `file` still has too little room to wake a
-/// sender that found none: Linux's `unix_write_space` wakes a sender in
-/// `sock_alloc_send_pskb` only once it is writable.
+/// Whether a datagram or packet socket `file` still has too little room
+/// to wake a sender that found none: Linux's `unix_write_space` wakes a
+/// sender in `sock_alloc_send_pskb` only once it is writable.
 pub(crate) fn sleeps_for_room(file: &Arc<dyn FileHandle>) -> bool {
     socket_end(file).is_some_and(|end| !end.writable())
 }

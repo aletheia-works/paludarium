@@ -663,8 +663,9 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection (`EINVAL`
     while it is closed or listening).
   - **Timestamps**: `recvmsg` gives a UDP datagram the time it came, as
-    Linux's `udp_recvmsg` does (`sock_recv_timestamp`), whenever the
-    receiver took the options: that of `SO_TIMESTAMP` or its kin, then,
+    Linux's `udp_recvmsg` does (`sock_recv_timestamp`), whether the
+    receiver took the options before it came or after: that of
+    `SO_TIMESTAMP` or its kin, then,
     when `SO_TIMESTAMPING`'s flags report software stamps and do not
     filter received ones out, a `SCM_TIMESTAMPING`, which UDP gives alone
     too. Both are cut to the control buffer as on AF_UNIX.

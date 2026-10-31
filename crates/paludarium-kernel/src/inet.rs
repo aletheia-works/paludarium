@@ -1394,7 +1394,8 @@ impl InetSocket {
     }
     /// The first datagram that has come, a guest socket's or the stub's
     /// ready answer, in the order they came: its sender and bytes, whether
-    /// it is the answer, and when it came (an answer comes as it is read).
+    /// it is the answer, and when it came (an answer, none: it comes as it
+    /// is read).
     fn first_datagram(&self, s: &State) -> Option<(SocketAddr, Vec<u8>, bool, Option<u64>)> {
         let answer = s
             .queries
@@ -1404,8 +1405,7 @@ impl InetSocket {
             (Some((seq, from, answer)), datagram)
                 if datagram.is_none_or(|datagram| seq < datagram.seq) =>
             {
-                let now = self.host.clock(paludarium_host::ClockId::Realtime).ok();
-                Some((from, answer, true, now))
+                Some((from, answer, true, None))
             }
             (_, Some(datagram)) => {
                 Some((datagram.from, datagram.bytes.clone(), false, datagram.came))
@@ -1440,6 +1440,11 @@ impl InetSocket {
         }
         let n = buf.len().min(bytes.len());
         buf[..n].copy_from_slice(&bytes[..n]);
+        let came = if answer {
+            self.host.clock(paludarium_host::ClockId::Realtime).ok()
+        } else {
+            came
+        };
         Ok(Received {
             length: bytes.len(),
             from: Some(from),

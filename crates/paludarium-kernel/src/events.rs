@@ -28,6 +28,7 @@ pub(crate) fn signalled(c: &Context<'_>) -> bool {
         || crate::signals::next_pending(c.process, true).is_some()
         || (!c.inbox.owns_wake(c.cancellation) && c.cancellation.load(Ordering::SeqCst))
 }
+
 /// Sample the ticket before readiness inspection to prevent lost writes.
 pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> Result<(), Errno> {
     let receipt = c.inbox.drain(c.process);

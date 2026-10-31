@@ -792,7 +792,7 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // The closed files are released only after the table is unlocked.
     drop(fds);
     for descriptor in closed.into_iter().map(|(_, d)| d) {
-        crate::inet::linger(c, &descriptor.file)?;
+        crate::inet::linger(c, &descriptor.file);
     }
     Ok(0)
 }
@@ -1526,7 +1526,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&(a[0] as u32))
                 .ok_or(Errno::EBADF)?;
-            crate::inet::linger(c, &closed.file)?;
+            crate::inet::linger(c, &closed.file);
             Ok(0)
         }
         4 | 6 | 262 => {
@@ -1582,7 +1582,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 ..c.files.descriptor(u64::from(old))?
             };
             if let Some(closed) = c.files.replace(new, d)? {
-                crate::inet::linger(c, &closed.file)?;
+                crate::inet::linger(c, &closed.file);
             }
             Ok(u64::from(new))
         }

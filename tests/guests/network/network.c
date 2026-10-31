@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -229,6 +230,14 @@ static long drain(int fd) {
 }
 /* The whole seconds since `start`, to the nearest. */
 static long seconds_since(long start) { return (now_ms() - start + 500) / 1000; }
+/* The peer a thread drains after 300 ms, with the bytes it is to get. */
+static int drained_fd;
+static long drained_expected;
+static void *drain_later(void *arg) {
+    (void)arg;
+    usleep(300000);
+    return (void *)(long)(drain(drained_fd) == drained_expected);
+}
 static volatile sig_atomic_t alarms;
 static void on_alarm(int signal) { (void)signal; alarms++; }
 
@@ -1263,28 +1272,23 @@ int main(int argc, char **argv) {
         printf("  held-last=%ld\n", seconds_since(start));
         printf("  all-received-last=%d\n", drain(c) == sent);
         close(c);
-        /* The peer reads it all in another process after 300 ms: the close
+        /* The peer reads it all in another thread after 300 ms: the close
            ends then, well before its five seconds. */
         c = client(port, 0, &result);
         s = accept(l, NULL, NULL);
         sent = fill(s);
         setsockopt(s, SOL_SOCKET, SO_LINGER, &five, sizeof five);
-        int sync[2];
-        if (pipe(sync)) return 70;
-        pid_t child = fork();
-        if (!child) {
-            close(s);
-            if (write(sync[1], "x", 1) != 1) _exit(2);
-            usleep(300000);
-            _exit(drain(c) == sent ? 0 : 1);
-        }
-        if (read(sync[0], buf, 1) != 1) return 71;
+        drained_fd = c;
+        drained_expected = sent;
+        pthread_t reader;
+        if (pthread_create(&reader, NULL, drain_later, NULL)) return 70;
         start = now_ms();
         call("close-read", close(s));
         long held = now_ms() - start;
         printf("  held-until-read=%d\n", held >= 200 && held < 2000);
-        waitpid(child, &status, 0);
-        printf("  child-received-all=%d\n", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        void *all;
+        pthread_join(reader, &all);
+        printf("  reader-received-all=%d\n", all != NULL);
         close(c);
         /* A signal ends the wait, and the close still succeeds. */
         struct sigaction sa = {.sa_handler = on_alarm};
@@ -1336,11 +1340,13 @@ int main(int argc, char **argv) {
         close(s);
         close(c);
         /* A process that exits does not wait (PF_EXITING). */
+        int sync[2];
+        if (pipe(sync)) return 71;
         c = client(port, 0, &result);
         s = accept(l, NULL, NULL);
         sent = fill(s);
         setsockopt(s, SOL_SOCKET, SO_LINGER, &five, sizeof five);
-        child = fork();
+        pid_t child = fork();
         if (!child) {
             if (read(sync[0], buf, 1) != 1) _exit(2);
             _exit(0);

@@ -2111,30 +2111,34 @@ impl InetSocket {
 /// Holds the close of `file`'s last descriptor, as Linux's `tcp_close` holds
 /// a socket with a nonzero linger time in `sk_stream_wait_close`: on the
 /// loopback, until the bytes it sent have all reached the peer and its end
-/// has gone, the time is up, or a signal comes. It closes all the same.
-pub(crate) fn linger(c: &mut Context<'_>, file: &Arc<dyn FileHandle>) -> Result<(), Errno> {
+/// has gone, the time is up, or a signal comes. It closes all the same, so
+/// nothing here fails the close: a clock that fails ends the wait.
+pub(crate) fn linger(c: &mut Context<'_>, file: &Arc<dyn FileHandle>) {
     if Arc::strong_count(file) != 1 {
-        return Ok(());
+        return;
     }
-    let Some(socket) = of(file) else {
-        return Ok(());
-    };
+    let Some(socket) = of(file) else { return };
     let Some(seconds) = socket.lingers() else {
-        return Ok(());
+        return;
     };
     // Linux's `sock_setsockopt` takes the time as unsigned seconds.
-    let wait =
-        crate::sockets::wait_for(c, Timeout::Ticks(u64::from(seconds) * crate::sockets::HZ))?;
+    let ticks = Timeout::Ticks(u64::from(seconds) * crate::sockets::HZ);
+    let Ok(wait) = crate::sockets::wait_for(c, ticks) else {
+        return;
+    };
     loop {
         let ticket = c.files.readiness.token.value();
         if socket.lingers().is_none() {
-            return Ok(());
+            return;
         }
-        let Some(deadline) = wait.deadline(c)? else {
-            return Ok(());
+        let Ok(Some(deadline)) = wait.deadline(c) else {
+            return;
         };
-        if crate::events::wait(c, ticket, deadline).is_err() && crate::events::signalled(c) {
-            return Ok(());
+        // Only a signal ends the wait early; any other error is the
+        // clock's, which would fail again.
+        match crate::events::wait(c, ticket, deadline) {
+            Err(e) if e != Errno(4) || crate::events::signalled(c) => return,
+            _ => {}
         }
     }
 }

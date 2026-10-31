@@ -1,15 +1,16 @@
 //! Signal-driven I/O, as Linux's `fcntl.c` and `kill_fasync` have it: the
 //! owner (`F_SETOWN`, `F_SETOWN_EX`) and signal (`F_SETSIG`) of an open file,
-//! and the signal a pipe or socket with `O_ASYNC` sends its owner when it
-//! changes.
+//! and the signal a pipe, socket or the host's standard input with
+//! `O_ASYNC` sends its owner when it changes.
 use crate::processes::Processes;
 use crate::syscalls::Context;
 use paludarium_host::FileHandle;
 use paludarium_types::{Errno, GuestAddr};
 use std::sync::{Arc, Weak};
 
-/// `O_ASYNC` (`FASYNC`): only pipes and sockets keep it, the files that
-/// have Linux's `fasync` ([`has_fasync`]); on any other `F_SETFL` drops it.
+/// `O_ASYNC` (`FASYNC`): only pipes, sockets and a standard input that is
+/// one or a terminal keep it, the files that have Linux's `fasync`
+/// ([`has_fasync`]); on any other `F_SETFL` drops it.
 pub(crate) const O_ASYNC: u32 = 0o20000;
 
 /// Whom a file's signals go to, as `F_OWNER_TID`, `F_OWNER_PID` and
@@ -137,8 +138,8 @@ fn take_owner(
 }
 
 /// Gives `file`, open as descriptor `fd`, the status `flags` of `F_SETFL`.
-/// Only pipes and sockets keep `O_ASYNC`, and changing it registers or
-/// drops the descriptor, as Linux's `fasync` does.
+/// Only the files with `fasync` ([`has_fasync`]) keep `O_ASYNC`, and
+/// changing it registers or drops the descriptor, as Linux's `fasync` does.
 pub(crate) fn set_flags(
     c: &Context<'_>,
     file: &Arc<dyn FileHandle>,

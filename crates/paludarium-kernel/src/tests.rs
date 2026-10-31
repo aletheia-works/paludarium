@@ -2055,6 +2055,25 @@ mod stdin_readiness {
         assert_eq!(f.ret(72, &[0, 3]), 0);
     }
     #[test]
+    fn a_read_of_standard_input_waits_in_the_kernel() {
+        // Nothing to read: the read waits in the kernel, not on the host, so
+        // what ends a kernel wait ends it (EINTR), as a signal does on Linux.
+        let mut f = fixture();
+        f.host.open_stdin();
+        f.kernel
+            .cancellation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(f.ret(0, &[0, DATA + 256, 16]), errno(Errno(4)));
+        f.kernel
+            .cancellation
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // With input, it reads at once; at the end, it reads the end.
+        f.host.push_stdin(b"ok");
+        assert_eq!(f.ret(0, &[0, DATA + 256, 16]), 2);
+        f.host.close_stdin();
+        assert_eq!(f.ret(0, &[0, DATA + 256, 16]), 0);
+    }
+    #[test]
     fn a_nonblocking_write_with_no_room_on_the_host_is_eagain() {
         let mut f = fixture();
         f.mem.write(GuestAddr(DATA + 256), b"hi").unwrap();

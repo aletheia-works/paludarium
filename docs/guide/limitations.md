@@ -126,9 +126,10 @@ verified.
   `memfd` and other in-memory files are 4096 on Linux too.
 - **Standard input on Windows**: `poll`, `select` and `epoll` see the host's
   standard input as always readable, as the Windows host cannot tell whether
-  input is waiting, and a read of it with `O_NONBLOCK` waits for input
-  rather than being `EAGAIN`; on Linux and macOS hosts and in WebAssembly
-  it is readable only with input or at its end.
+  input is waiting, and a read of it waits on the host: with `O_NONBLOCK`
+  it waits for input rather than being `EAGAIN`, and a signal does not end
+  the wait (no `EINTR`); on Linux and macOS hosts and in WebAssembly it is
+  readable only with input or at its end.
 - **Nonblocking standard output**: with `O_NONBLOCK`, a write to standard
   output or standard error is `EAGAIN` only when the host has no room at
   all; with some room it goes whole, waiting on the host for the rest, where

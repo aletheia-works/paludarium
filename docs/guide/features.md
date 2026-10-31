@@ -117,7 +117,9 @@ kernel.
   (`EINTR`). The host's standard input is readable only with bytes to read
   or once it has ended (a closed `Guest.stdin` in WebAssembly, the end of
   the descriptor on a Unix host), as a Linux terminal or pipe is. At its end
-  it is also hung up (`POLLHUP`), and `read` returns 0. `poll`, `ppoll`,
+  it is also hung up (`POLLHUP`), and `read` returns 0. A `read` with
+  nothing to read waits in the kernel, so a signal ends it with `EINTR`,
+  or restarts it with `SA_RESTART`, as on Linux. `poll`, `ppoll`,
   `select`, `pselect6` and `epoll`, which can watch it, all see it so. A
   host that cannot tell (Windows) keeps it always readable. The output
   streams are always writable. A pipe's read end is readable only with unread data, and only hung up once

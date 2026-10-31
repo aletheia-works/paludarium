@@ -107,7 +107,10 @@ impl RecordingHost {
     /// Makes standard output (`channel` 1) or standard error (2) full, or
     /// gives it room again, for [`Host::output_writable`]; writes still go.
     pub fn set_output_full(&self, channel: u32, full: bool) {
-        if let Some(full_now) = self.lock().output_full.get_mut(channel as usize - 1) {
+        let Some(index) = (channel as usize).checked_sub(1) else {
+            return;
+        };
+        if let Some(full_now) = self.lock().output_full.get_mut(index) {
             *full_now = full;
         }
     }

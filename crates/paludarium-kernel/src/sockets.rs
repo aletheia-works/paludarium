@@ -1135,7 +1135,7 @@ const SO_RCVTIMEO_NEW: u32 = 66;
 const SO_SNDTIMEO_NEW: u32 = 67;
 /// The kernel's tick rate, to which Linux rounds `SO_RCVTIMEO` and
 /// `SO_SNDTIMEO` (`CONFIG_HZ`).
-const HZ: u64 = 1000;
+pub(crate) const HZ: u64 = 1000;
 const SO_ACCEPTCONN: u32 = 30;
 const SO_SNDBUFFORCE: u32 = 32;
 const SO_RCVBUFFORCE: u32 = 33;

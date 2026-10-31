@@ -28,6 +28,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -203,6 +204,33 @@ static void urgent_read(const char *name, int fd, int len, int flags) {
     long r = recv(fd, b, len, flags);
     printf("  %s r=%ld errno=%d data=%.*s\n", name, r, r < 0 ? errno : 0, r > 0 ? (int)r : 0, b);
 }
+/* Sends from `fd` until neither its buffer nor the peer's takes more, looking
+   again after a pause, as the loopback's acknowledgments can trail the send
+   that found no room. Returns how many bytes went. */
+static long fill(int fd) {
+    static char chunk[65536];
+    long total = 0, n;
+    for (;;) {
+        long sent = 0;
+        while ((n = send(fd, chunk, sizeof chunk, MSG_DONTWAIT)) > 0) sent += n;
+        if (!sent && total) return total;
+        total += sent;
+        usleep(50000);
+    }
+}
+/* Reads `fd` to its end, waiting up to 5 seconds for each part. Returns how
+   many bytes came. */
+static long drain(int fd) {
+    static char chunk[65536];
+    struct pollfd p = {.fd = fd, .events = POLLIN};
+    long total = 0, n;
+    while (poll(&p, 1, 5000) > 0 && (n = recv(fd, chunk, sizeof chunk, 0)) > 0) total += n;
+    return total;
+}
+/* The whole seconds since `start`, to the nearest. */
+static long seconds_since(long start) { return (now_ms() - start + 500) / 1000; }
+static volatile sig_atomic_t alarms;
+static void on_alarm(int signal) { (void)signal; alarms++; }
 
 int main(int argc, char **argv) {
     if (argc < 4) return 99;
@@ -1198,6 +1226,132 @@ int main(int argc, char **argv) {
         polled("listener-gone", queued, POLLIN);
         call("recv-queued", recv(queued, buf, sizeof buf, 0));
         close(queued);
+        return 0;
+    }
+    if (!strcmp(mode, "listen-linger")) {
+        /* A nonzero linger time holds the close of a socket's last
+           descriptor while what it sent waits for room in the peer, up to
+           that time (tcp_close's sk_stream_wait_close); the bytes still go
+           after it. */
+        int port, result, status;
+        int l = listener(8, &port);
+        struct linger one = {1, 1}, five = {1, 5};
+        /* The peer never reads: the close waits out the second, nonblocking
+           as it is, and the peer has every byte after it. */
+        int c = client(port, 0, &result);
+        int s = accept(l, NULL, NULL);
+        fcntl(s, F_SETFL, O_NONBLOCK);
+        long sent = fill(s);
+        call("linger", setsockopt(s, SOL_SOCKET, SO_LINGER, &one, sizeof one));
+        long start = now_ms();
+        call("close-full", close(s));
+        printf("  held=%ld\n", seconds_since(start));
+        printf("  all-received=%d\n", drain(c) == sent);
+        close(c);
+        /* Another descriptor keeps the socket open: only the last close
+           waits. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        sent = fill(s);
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &one, sizeof one);
+        int d = dup(s);
+        start = now_ms();
+        close(s);
+        printf("  held-dup=%ld\n", seconds_since(start));
+        start = now_ms();
+        close(d);
+        printf("  held-last=%ld\n", seconds_since(start));
+        printf("  all-received-last=%d\n", drain(c) == sent);
+        close(c);
+        /* The peer reads it all in another process after 300 ms: the close
+           ends then, well before its five seconds. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        sent = fill(s);
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &five, sizeof five);
+        int sync[2];
+        if (pipe(sync)) return 70;
+        pid_t child = fork();
+        if (!child) {
+            close(s);
+            if (write(sync[1], "x", 1) != 1) _exit(2);
+            usleep(300000);
+            _exit(drain(c) == sent ? 0 : 1);
+        }
+        if (read(sync[0], buf, 1) != 1) return 71;
+        start = now_ms();
+        call("close-read", close(s));
+        long held = now_ms() - start;
+        printf("  held-until-read=%d\n", held >= 200 && held < 2000);
+        waitpid(child, &status, 0);
+        printf("  child-received-all=%d\n", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        close(c);
+        /* A signal ends the wait, and the close still succeeds. */
+        struct sigaction sa = {.sa_handler = on_alarm};
+        sigaction(SIGALRM, &sa, NULL);
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        sent = fill(s);
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &five, sizeof five);
+        struct itimerval timer = {.it_value = {0, 300000}};
+        setitimer(ITIMER_REAL, &timer, NULL);
+        start = now_ms();
+        call("close-signal", close(s));
+        held = now_ms() - start;
+        printf("  held-until-signal=%d alarms=%d\n", held >= 200 && held < 2000, (int)alarms);
+        printf("  all-received-signal=%d\n", drain(c) == sent);
+        close(c);
+        /* Unread input resets the connection instead, with no wait. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        sent = fill(s);
+        send(c, "x", 1, 0);
+        polled("unread", s, POLLIN);
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &five, sizeof five);
+        start = now_ms();
+        call("close-unread", close(s));
+        printf("  held-unread=%ld\n", seconds_since(start));
+        close(c);
+        /* Nothing left to send: no wait. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        send(s, "abc", 3, 0);
+        polled("sent", c, POLLIN);
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &five, sizeof five);
+        start = now_ms();
+        call("close-sent", close(s));
+        printf("  held-sent=%ld\n", seconds_since(start));
+        close(c);
+        /* dup2 over the last descriptor closes it with the same wait. */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        sent = fill(s);
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &one, sizeof one);
+        int other = tcp(0);
+        start = now_ms();
+        call("dup2", dup2(other, s) == s ? 0 : -1);
+        printf("  held-dup2=%ld\n", seconds_since(start));
+        printf("  all-received-dup2=%d\n", drain(c) == sent);
+        close(other);
+        close(s);
+        close(c);
+        /* A process that exits does not wait (PF_EXITING). */
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        sent = fill(s);
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &five, sizeof five);
+        child = fork();
+        if (!child) {
+            if (read(sync[0], buf, 1) != 1) _exit(2);
+            _exit(0);
+        }
+        close(s);
+        start = now_ms();
+        if (write(sync[1], "x", 1) != 1) return 72;
+        waitpid(child, &status, 0);
+        printf("  held-exit=%ld\n", seconds_since(start));
+        printf("  all-received-exit=%d\n", drain(c) == sent);
+        close(c);
         return 0;
     }
     if (!strcmp(mode, "listen-fork")) {

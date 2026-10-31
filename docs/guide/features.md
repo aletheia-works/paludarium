@@ -719,6 +719,13 @@ one only with an `--allow-net`.
   with connections it has not handed out resets the peer (`ECONNRESET`
   after the bytes it holds); bytes sent to a peer that has closed are
   answered with a reset, so the next send is `EPIPE`.
+- **Lingering**, as Linux's `tcp_close`: with a nonzero `SO_LINGER` time,
+  closing a socket's last descriptor (`close`, `close_range`, or `dup2`
+  over it) waits while the bytes it sent wait for room in the peer, until
+  they have all gone, the time is up or a signal comes, nonblocking or
+  not. The close succeeds all the same, and the bytes still go after it.
+  A socket with unread input is reset instead, and a process that exits
+  does not wait.
 - **Urgent data**, as Linux's TCP keeps it: the last byte of a `MSG_OOB`
   send is urgent and reaches the peer with the bytes before it. Reads
   stop before its mark, which `SIOCATMARK` reports and `FIONREAD` counts

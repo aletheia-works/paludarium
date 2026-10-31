@@ -175,16 +175,16 @@ impl Files {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&n);
     }
-    /// Puts `d` at `n`, closing what was there, as dup2 does; EBUSY when an
-    /// unfinished open of another thread has taken `n`, as in Linux.
-    pub(crate) fn replace(&self, n: u32, d: Descriptor) -> Result<(), Errno> {
+    /// Puts `d` at `n`, as dup2 does, and returns what was there for the
+    /// caller to close; EBUSY when an unfinished open of another thread has
+    /// taken `n`, as in Linux.
+    pub(crate) fn replace(&self, n: u32, d: Descriptor) -> Result<Option<Descriptor>, Errno> {
         let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
         let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         if reserved.contains(&n) {
             return Err(Errno(16));
         }
-        fds.insert(n, d);
-        Ok(())
+        Ok(fds.insert(n, d))
     }
     pub fn with_host(host: Arc<dyn paludarium_host::Host>) -> Self {
         let files = Self::default();
@@ -791,7 +791,9 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .collect::<Vec<_>>();
     // The closed files are released only after the table is unlocked.
     drop(fds);
-    drop(closed);
+    for descriptor in closed.into_iter().map(|(_, d)| d) {
+        crate::inet::linger(c, &descriptor.file)?;
+    }
     Ok(0)
 }
 /// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`, with the
@@ -1517,12 +1519,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             }
         }
         3 => {
-            c.files
+            let closed = c
+                .files
                 .fds
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&(a[0] as u32))
                 .ok_or(Errno::EBADF)?;
+            crate::inet::linger(c, &closed.file)?;
             Ok(0)
         }
         4 | 6 | 262 => {
@@ -1577,7 +1581,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 cloexec: n == 292 && a[2] & 0x80000 != 0,
                 ..c.files.descriptor(u64::from(old))?
             };
-            c.files.replace(new, d)?;
+            if let Some(closed) = c.files.replace(new, d)? {
+                crate::inet::linger(c, &closed.file)?;
+            }
             Ok(u64::from(new))
         }
         72 => {
@@ -2177,10 +2183,11 @@ mod files_tests {
         assert_eq!(f.allocate(d(&fs, b"/a"), 0, 1024), Ok(1));
         assert_eq!(f.reserve(2), Err(Errno::EMFILE));
         assert!(f.descriptor(0).is_err());
-        assert_eq!(f.replace(0, d(&fs, b"/b")), Err(Errno(16)));
+        assert_eq!(f.replace(0, d(&fs, b"/b")).err(), Some(Errno(16)));
         f.fill(0, d(&fs, b"/c"));
         assert_eq!(f.descriptor(0).unwrap().path, b"/c");
-        assert_eq!(f.replace(0, d(&fs, b"/b")), Ok(()));
+        // What was there is handed back to be closed.
+        assert_eq!(f.replace(0, d(&fs, b"/b")).unwrap().unwrap().path, b"/c");
         // A failed open gives its number back.
         assert_eq!(f.reserve(1024), Ok(2));
         f.unreserve(2);

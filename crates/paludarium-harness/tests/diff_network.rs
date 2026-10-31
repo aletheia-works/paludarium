@@ -177,6 +177,10 @@ mod linux {
         case("listen-reset");
     }
     #[test]
+    fn network_listen_linger() {
+        case("listen-linger");
+    }
+    #[test]
     fn network_listen_full() {
         case("listen-full");
     }

@@ -2094,6 +2094,51 @@ pub(crate) fn of(file: &Arc<dyn FileHandle>) -> Option<&InetSocket> {
     file.as_any()?.downcast_ref::<InetSocket>()
 }
 
+impl InetSocket {
+    /// Whether closing this socket now waits: a connection on the loopback
+    /// with a nonzero linger time, whose bytes still wait for room in the
+    /// peer. Unread input, which resets it, does not wait.
+    fn lingers(&self) -> Option<u32> {
+        let seconds = self.options().linger.filter(|&seconds| seconds != 0)?;
+        let s = self.lock();
+        let stream = s.stream.as_ref()?;
+        Self::joined(&s)?;
+        let (unread, unsent) = stream.queued();
+        (unread == 0 && unsent > 0).then_some(seconds as u32)
+    }
+}
+
+/// Holds the close of `file`'s last descriptor, as Linux's `tcp_close` holds
+/// a socket with a nonzero linger time in `sk_stream_wait_close`: on the
+/// loopback, until the bytes it sent have all reached the peer and its end
+/// has gone, the time is up, or a signal comes. It closes all the same.
+pub(crate) fn linger(c: &mut Context<'_>, file: &Arc<dyn FileHandle>) -> Result<(), Errno> {
+    if Arc::strong_count(file) != 1 {
+        return Ok(());
+    }
+    let Some(socket) = of(file) else {
+        return Ok(());
+    };
+    let Some(seconds) = socket.lingers() else {
+        return Ok(());
+    };
+    // Linux's `sock_setsockopt` takes the time as unsigned seconds.
+    let wait =
+        crate::sockets::wait_for(c, Timeout::Ticks(u64::from(seconds) * crate::sockets::HZ))?;
+    loop {
+        let ticket = c.files.readiness.token.value();
+        if socket.lingers().is_none() {
+            return Ok(());
+        }
+        let Some(deadline) = wait.deadline(c)? else {
+            return Ok(());
+        };
+        if crate::events::wait(c, ticket, deadline).is_err() && crate::events::signalled(c) {
+            return Ok(());
+        }
+    }
+}
+
 /// Reads a socket address of `len` bytes at `at` for `socket`, as
 /// `move_addr_to_kernel` (EINVAL past 128 bytes, EFAULT) and the protocol's
 /// checks: `None` for `AF_UNSPEC`, EINVAL when too short, EAFNOSUPPORT for

@@ -1452,6 +1452,90 @@ fn loopback_closes_reset_what_is_left() {
     assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
 }
 #[test]
+fn a_loopback_close_lingers_while_its_bytes_wait() {
+    let mut f = network_fixture(&[]);
+    let (listener, port) = loopback_listener(&mut f, 8);
+    // Writes from `fd` until neither buffer takes more; returns the bytes.
+    let fill = |f: &mut Fixture, fd: u64| {
+        let mut sent = 0;
+        loop {
+            let r = f.ret(44, [fd, DATA, 0x1000, 0x40, 0, 0]);
+            if r == Errno::EAGAIN.to_syscall_return() {
+                return sent;
+            }
+            sent += r;
+        }
+    };
+    let linger = |f: &mut Fixture, fd: u64, seconds: u32| {
+        let mut raw = 1u32.to_le_bytes().to_vec();
+        raw.extend(seconds.to_le_bytes());
+        f.mem.write(GuestAddr(DATA + 0x200), &raw).unwrap();
+        assert_eq!(f.ret(54, [fd, 1, 13, DATA + 0x200, 8, 0]), 0);
+    };
+    let now = |f: &Fixture| f.host.now.load(Ordering::SeqCst);
+    // The peer never reads: the close waits out its second, and the bytes
+    // still reach the peer after it.
+    let client = loopback_client(&mut f, port);
+    let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    let sent = fill(&mut f, server);
+    linger(&mut f, server, 1);
+    assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(now(&f), SECOND);
+    let mut received = 0;
+    loop {
+        let r = f.ret(0, [client, DATA + 0x1000, 0x1000, 0, 0, 0]);
+        if r == 0 {
+            break;
+        }
+        received += r;
+    }
+    assert_eq!(received, sent);
+    assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+    // Another descriptor keeps it open: only the last close waits.
+    let start = now(&f);
+    let client = loopback_client(&mut f, port);
+    let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    fill(&mut f, server);
+    linger(&mut f, server, 1);
+    let other = f.ret(32, [server, 0, 0, 0, 0, 0]);
+    assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(now(&f), start);
+    assert_eq!(f.ret(3, [other, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(now(&f), start + SECOND);
+    assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+    // The peer reading it all ends the wait at once.
+    let start = now(&f);
+    let client = loopback_client(&mut f, port);
+    let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    fill(&mut f, server);
+    linger(&mut f, server, 5);
+    let peer = Arc::clone(&f.kernel.files.descriptor(client).unwrap().file);
+    *f.host.action.lock().unwrap() = Some(Box::new(move || {
+        let mut chunk = [0; 0x1000];
+        while peer.read(&mut chunk).is_ok_and(|n| n > 0) {}
+    }));
+    assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    assert!(now(&f) < start + SECOND);
+    assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+    // Unread input resets the connection instead, and nothing left to send
+    // has nothing to wait for.
+    for unread in [true, false] {
+        let start = now(&f);
+        let client = loopback_client(&mut f, port);
+        let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+        if unread {
+            fill(&mut f, server);
+            assert_eq!(f.ret(1, [client, DATA, 1, 0, 0, 0]), 1);
+        } else {
+            assert_eq!(f.ret(1, [server, DATA, 3, 0, 0, 0]), 3);
+        }
+        linger(&mut f, server, 5);
+        assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(now(&f), start);
+        assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+    }
+}
+#[test]
 fn loopback_time_wait_holds_the_port_closed_first() {
     let mut f = network_fixture(&[]);
     let bind_on = |f: &mut Fixture, port: u16, reuse: bool| {

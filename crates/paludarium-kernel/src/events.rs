@@ -20,17 +20,21 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
 }
 
+/// Whether the thread has to leave a wait: its group is ending, a signal is
+/// pending, or the emulator cancels it. [`wait`]'s other interruptions are
+/// only wake-ups, which a wait that cannot restart sleeps on through.
+pub(crate) fn signalled(c: &Context<'_>) -> bool {
+    c.group.status().is_some()
+        || crate::signals::next_pending(c.process, true).is_some()
+        || (!c.inbox.owns_wake(c.cancellation) && c.cancellation.load(Ordering::SeqCst))
+}
 /// Sample the ticket before readiness inspection to prevent lost writes.
 pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> Result<(), Errno> {
     let receipt = c.inbox.drain(c.process);
     c.group.drain_process(c.process);
     let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
     c.group.expire_timer(c.process, now);
-    if c.group.status().is_some()
-        || crate::signals::next_pending(c.process, true).is_some()
-        || receipt.interrupted
-        || (!c.inbox.owns_wake(c.cancellation) && c.cancellation.load(Ordering::SeqCst))
-    {
+    if signalled(c) || receipt.interrupted {
         return Err(Errno(4));
     }
     // Owner receipts distinguish metadata from actual interruption, including
@@ -58,10 +62,8 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
         c.process,
         c.host.clock(paludarium_host::ClockId::Monotonic)?,
     );
-    if c.group.status().is_some()
-        || crate::signals::next_pending(c.process, true).is_some()
+    if signalled(c)
         || receipt.interrupted
-        || (!c.inbox.owns_wake(c.cancellation) && c.cancellation.load(Ordering::SeqCst))
         || (outcome == paludarium_host::WaitOutcome::Interrupted
             && !receipt.timer_changed
             && !receipt.signals

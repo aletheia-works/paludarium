@@ -362,6 +362,17 @@ kernel.
   timestamps then, or else when it is first read or peeked at. A stream gets
   none. `getsockopt` reads each one as set only by the form that set it, and
   turning any off keeps the `_NEW` choice until one is turned on again.
+- `SO_TIMESTAMPING` and its `_NEW` form take the flags Linux knows, refusing
+  as Linux's `sock_set_timestamping` does (`EINVAL` for an unknown flag,
+  `SOF_TIMESTAMPING_OPT_ID_TCP` without `OPT_ID` or `OPT_STATS` without
+  `OPT_TSONLY`, `EOPNOTSUPP` for a PTP clock, which binds only to a socket
+  bound to a device), and `getsockopt` gives them back with no clock, the
+  `_NEW` form only when set through it. Setting either chooses the `_NEW`
+  form or not for `SO_TIMESTAMP` too. As on Linux's AF_UNIX, they add to
+  what `SO_TIMESTAMP` or its kin stamp and stamp nothing alone: a
+  `SCM_TIMESTAMPING` after that control message, whose first `timespec` is
+  the same time when the flags report software stamps and do not filter
+  received ones out; no hardware stamps a message between local sockets.
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and

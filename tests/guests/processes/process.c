@@ -247,6 +247,30 @@ static void int_option(const char *name, int fd, int opt, int value, socklen_t s
 #define TS_NS_OLD 35
 #define TS_NEW 63
 #define TS_NS_NEW 64
+/* socket-timestamping: SO_TIMESTAMPING and its _NEW form. */
+#define TSG_OLD 37
+#define TSG_NEW 65
+/* Both forms of SO_TIMESTAMPING as getsockopt reads them: the flags, the
+   PTP clock and the length. */
+static void stamping_options(const char *name, int fd) {
+    const int names[] = {TSG_OLD, TSG_NEW};
+    printf("  %s:", name);
+    for (int i = 0; i < 2; i++) {
+        int got[2] = {-7, -7};
+        socklen_t len = sizeof got;
+        errno = 0;
+        int r = getsockopt(fd, SOL_SOCKET, names[i], got, &len);
+        printf(" [%d errno=%d %#x %d len=%u]", r, r ? errno : 0, got[0], got[1], (unsigned)len);
+    }
+    printf("\n");
+}
+/* setsockopt(SO_TIMESTAMPING or its _NEW form) with `flags`, as an int of
+   `size` bytes. */
+static void stamping_option(const char *name, int fd, int opt, int flags, socklen_t size) {
+    errno = 0;
+    int r = setsockopt(fd, SOL_SOCKET, opt, &flags, size);
+    printf("  set %s %#x=%d errno=%d\n", name, flags, r, r ? errno : 0);
+}
 /* The four timestamp options as getsockopt reads them. */
 static void timestamp_options(const char *name, int fd) {
     const int names[] = {TS_OLD, TS_NS_OLD, TS_NEW, TS_NS_NEW};
@@ -297,6 +321,13 @@ static void receive_stamped(const char *name, int fd, size_t room, int flags, lo
                 printf(" %s fits=%d", a <= s ? "sent" : a >= q ? "read" : "between",
                        v[1] >= 0 && v[1] < 1000000000LL / unit);
                 if (stamp) *stamp = at;
+            }
+            if ((h->cmsg_type == TSG_OLD || h->cmsg_type == TSG_NEW) && h->cmsg_len >= CMSG_LEN(48)) {
+                long long v[6];
+                memcpy(v, CMSG_DATA(h), sizeof v);
+                long long at = v[0] * 1000000000LL + v[1];
+                printf(" %s fits=%d rest=%d", at <= sent ? "sent" : at >= asked ? "read" : "between",
+                       v[1] >= 0 && v[1] < 1000000000LL, !(v[2] | v[3] | v[4] | v[5]));
             }
             printf("]");
         }
@@ -3490,6 +3521,93 @@ int main(int argc, char **argv) {
         }
         close(p[0]);
         close(p[1]);
+        return 0;
+    }
+    if (!strcmp(mode, "socket-timestamping")) {
+        /* SO_TIMESTAMPING on socket pairs, as Linux's sock.c and af_unix
+           have it: the flags it takes, which getsockopt gives back with no
+           PTP clock (the _NEW form only when set through it), and the
+           SCM_TIMESTAMPING after the SO_TIMESTAMP one that a datagram or
+           packet receiver taking both gets, its first stamp the software
+           one when the flags report it. Alone it stamps nothing, and a
+           stream gets none. Flags past SOF_TIMESTAMPING_OPT_RX_FILTER are
+           left out: older kernels refuse them. */
+        int sv[2];
+        long long sent;
+        const int kinds[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int k = 0; k < 3; k++) {
+            socketpair(AF_UNIX, kinds[k], 0, sv);
+            printf("kind %d\n", kinds[k]);
+            stamping_options("none", sv[1]);
+            /* Refused: unknown flags, OPT_ID_TCP without OPT_ID, OPT_STATS
+               without OPT_TSONLY, a PTP clock with no device, a short
+               value. */
+            stamping_option("unknown", sv[1], TSG_OLD, 1 << 19, 4);
+            stamping_option("negative", sv[1], TSG_OLD, -1, 4);
+            stamping_option("id-tcp", sv[1], TSG_OLD, 1 << 16, 4);
+            stamping_option("stats", sv[1], TSG_OLD, 1 << 12, 4);
+            stamping_option("bind-phc", sv[1], TSG_OLD, 1 << 15, 4);
+            stamping_option("short", sv[1], TSG_OLD, 0x18, 2);
+            stamping_options("refused", sv[1]);
+            stamping_option("ids", sv[1], TSG_OLD, (1 << 7) | (1 << 16), 4);
+            stamping_option("stats-tsonly", sv[1], TSG_OLD, (1 << 12) | (1 << 11), 4);
+            stamping_options("taken", sv[1]);
+            /* A struct so_timestamping, whose clock needs BIND_PHC, and a
+               length of neither 4 nor 8, read as an int. */
+            int both[2] = {0x18, 3};
+            errno = 0;
+            int r = setsockopt(sv[1], SOL_SOCKET, TSG_OLD, both, sizeof both);
+            printf("  set struct=%d errno=%d\n", r, r ? errno : 0);
+            stamping_options("struct", sv[1]);
+            stamping_option("six", sv[1], TSG_OLD, 0x10, 6);
+            stamping_options("six", sv[1]);
+            /* _NEW shares SO_TIMESTAMP's _NEW flag. */
+            int_option("ts-old", sv[1], TS_OLD, 1, 4);
+            stamping_option("new", sv[1], TSG_NEW, 0x18, 4);
+            stamping_options("new", sv[1]);
+            timestamp_options("new", sv[1]);
+            stamping_option("old", sv[1], TSG_OLD, 0x18, 4);
+            stamping_options("old", sv[1]);
+            timestamp_options("old", sv[1]);
+            /* With SO_TIMESTAMP, each message gets both. */
+            send(sv[0], "a", 1, 0);
+            sent = real_ns();
+            receive_stamped("both", sv[1], 256, MSG_DONTWAIT, sent, NULL);
+            int_option("ts-ns", sv[1], TS_NS_OLD, 1, 4);
+            send(sv[0], "b", 1, 0);
+            sent = real_ns();
+            receive_stamped("both-ns", sv[1], 256, MSG_DONTWAIT, sent, NULL);
+            stamping_option("new", sv[1], TSG_NEW, 0x18, 4);
+            send(sv[0], "c", 1, 0);
+            sent = real_ns();
+            receive_stamped("both-new", sv[1], 256, MSG_DONTWAIT, sent, NULL);
+            /* The software stamp is reported unless filtered out. */
+            const int reports[] = {0x10, 0x08, 0x10 | (1 << 17), 0x18 | (1 << 17), 0};
+            for (int i = 0; i < 5; i++) {
+                stamping_option("report", sv[1], TSG_OLD, reports[i], 4);
+                send(sv[0], "d", 1, 0);
+                sent = real_ns();
+                receive_stamped("report", sv[1], 256, MSG_DONTWAIT, sent, NULL);
+            }
+            /* Without SO_TIMESTAMP, none. */
+            stamping_option("alone", sv[1], TSG_OLD, 0x18, 4);
+            int_option("ts-off", sv[1], TS_OLD, 0, 4);
+            send(sv[0], "e", 1, 0);
+            sent = real_ns();
+            receive_stamped("alone", sv[1], 256, MSG_DONTWAIT, sent, NULL);
+            /* A control buffer that holds less cuts it. */
+            int_option("ts-old", sv[1], TS_OLD, 1, 4);
+            const size_t rooms[] = {32, 40, 64, 88};
+            for (int i = 0; i < 4; i++) {
+                send(sv[0], "f", 1, 0);
+                sent = real_ns();
+                char label[16];
+                snprintf(label, sizeof label, "room%zu", rooms[i]);
+                receive_stamped(label, sv[1], rooms[i], MSG_DONTWAIT, sent, NULL);
+            }
+            close(sv[0]);
+            close(sv[1]);
+        }
         return 0;
     }
     if (!strcmp(mode, "socket-oob")) {

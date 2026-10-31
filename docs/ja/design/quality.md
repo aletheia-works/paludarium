@@ -37,10 +37,10 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   シグナルを自分で扱うので、そこでは native の結果も Linux と違うことがあります。
   たとえば、`SA_NOCLDSTOP` を付けた親にも、止めて再開した子の SIGCHLD が届きます。
   Linux なら届きません。そのような実行は、どちらの向きにも証拠になりません。
-  main でも、そこではプロセスのケースの 24 件とネットワークのケースの 3 件がこうした
+  main でも、そこではプロセスのケースの 25 件とネットワークのケースの 3 件がこうした
   理由で失敗します。QEMU は次のように振る舞います。
   - 知らないソケットのオプション（`SO_PEEK_OFF`、`SO_TIMESTAMP_NEW`、
-    `SO_RCVTIMEO_NEW` など）を断ります。
+    `SO_RCVTIMEO_NEW` など）を断り、`SO_TIMESTAMPING` を `int` として返します。
   - `recvmsg` のフラグに `MSG_CTRUNC` を入れません。
   - `SA_NOCLDSTOP`、`SA_NOCLDWAIT`、`F_SETSIG`、コアダンプ、`sigqueue` を自分で
     扱います。

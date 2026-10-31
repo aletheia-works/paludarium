@@ -758,8 +758,9 @@ one only with an `--allow-net`.
   first, even when the connect then fails (`ENETUNREACH` for an IPv4 peer
   of an `IPV6_V6ONLY` socket, or the host's error when it has no route
   there), on the source address of the route to its peer: the loopback's
-  for a loopback peer, else the host's, as the host's routes pick it
-  without sending anything. It receives only from its
+  for a loopback peer, else, for a peer the policy allows, the host's, as
+  the host's routes pick it without sending anything (for any other, the
+  port stays on every address). It receives only from its
   peer, and
   `AF_UNSPEC` disconnects it, keeping only the port and address the guest
   bound itself. A datagram holds up to 65507 bytes over IPv4 and 65527 over

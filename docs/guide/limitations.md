@@ -18,9 +18,10 @@ verified.
     addresses and the unspecified one (`EADDRNOTAVAIL` for any other, where
     Linux takes each of the machine's own).
   - A UDP socket reaches the DNS stub and the guest's own sockets on the
-    loopback; a datagram to any other address is `ENETUNREACH`. In
-    WebAssembly, which cannot see the host's routes, one connected
-    elsewhere keeps its port on every address, where Linux takes it on the
+    loopback; a datagram to any other address is `ENETUNREACH`. One
+    connected elsewhere to a peer the policy does not allow, or in
+    WebAssembly, which cannot see the host's routes, keeps its port on every
+    address, where Linux takes it on the
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.

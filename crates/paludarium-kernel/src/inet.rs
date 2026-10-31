@@ -1219,15 +1219,18 @@ impl InetSocket {
             None => {
                 // Off the loopback the port moves to the host's address the
                 // route leaves from (`ip_route_connect`), unless the guest
-                // bound an address; a host that cannot tell keeps it on every
-                // address. Connected there, the socket takes no datagram from
-                // the loopback.
-                let from = match self.host.route_source(to)? {
-                    Some(ip) if bound.ip().is_unspecified() => {
-                        SocketAddr::new(plain(ip), bound.port())
-                    }
-                    _ => bound,
+                // bound an address. Only for a peer the policy allows, so
+                // that a guest without one learns nothing of the host's
+                // addresses; then, and on a host that cannot tell, the port
+                // stays on every address. Connected there, the socket takes
+                // no datagram from the loopback.
+                let now = self.host.clock(paludarium_host::ClockId::Monotonic)?;
+                let route = if bound.ip().is_unspecified() && self.network.allows(to, now) {
+                    self.host.route_source(to)?
+                } else {
+                    None
                 };
+                let from = route.map_or(bound, |ip| SocketAddr::new(plain(ip), bound.port()));
                 self.ports().connect(&self.this, from, Some(to));
                 s.bound = Some(from);
                 s.peer = Some(address);

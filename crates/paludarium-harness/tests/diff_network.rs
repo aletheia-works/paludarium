@@ -131,6 +131,9 @@ mod linux {
         let policy = NetworkPolicy::new()
             .allow(&format!("127.0.0.1:{open}"))
             .and_then(|policy| policy.allow(&format!("127.0.0.1:{closed}")))
+            // The peer off the loopback a connected UDP socket takes its
+            // route's source address for (udp-elsewhere).
+            .and_then(|policy| policy.allow("192.0.2.1:9"))
             .unwrap();
         let emulated = emulated(mode, policy);
         println!(

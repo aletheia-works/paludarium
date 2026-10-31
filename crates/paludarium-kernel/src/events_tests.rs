@@ -2106,7 +2106,7 @@ fn loopback_udp_datagrams() {
 }
 #[test]
 fn a_udp_connect_off_the_loopback_takes_the_route_source() {
-    let mut f = network_fixture(&[]);
+    let mut f = network_fixture(&["192.0.2.1"]);
     *f.host.route.lock().unwrap() = Some(Ok(core::net::IpAddr::from([10, 0, 2, 15])));
     let u = f.ret(41, [2, 2 | 0x800, 0, 0, 0, 0]);
     inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 9);
@@ -2133,7 +2133,14 @@ fn a_udp_connect_off_the_loopback_takes_the_route_source() {
     inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 9);
     assert_eq!(f.ret(42, [mine, DATA + 0x100, 16, 0, 0, 0]), 0);
     assert_eq!(&name_of(&mut f, 51, mine)[4..8], &[127, 0, 0, 1]);
+    // A peer the policy does not allow learns nothing of the host's
+    // addresses: the port stays on every address.
+    let denied = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [198, 51, 100, 1], 9);
+    assert_eq!(f.ret(42, [denied, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(&name_of(&mut f, 51, denied)[4..8], &[0, 0, 0, 0]);
     // No route: the connect fails, with its port taken first.
+    inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 9);
     *f.host.route.lock().unwrap() = Some(Err(Errno(101)));
     let lost = f.ret(41, [2, 2, 0, 0, 0, 0]);
     assert_eq!(

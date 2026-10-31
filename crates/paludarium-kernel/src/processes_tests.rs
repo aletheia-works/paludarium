@@ -2058,13 +2058,11 @@ mod signal_driven_io {
     fn a_full_socket_signals_its_writer_once_three_quarters_are_free() {
         let (mut k, mut t, m) = setup();
         let (a, b) = async_pair(&mut k, &mut t, &m, 1 | 0o4000);
-        let mut queued = 0;
         let full = loop {
             let sent = syscall(&mut k, &mut t, &m, 1, [a, DATA, 4096, 0, 0, 0]);
             if sent == Errno::EAGAIN.to_syscall_return() {
                 break sent;
             }
-            queued += sent;
         };
         assert_eq!(full, Errno::EAGAIN.to_syscall_return());
         // Every send told the reader; the writer has had nothing yet.
@@ -2073,14 +2071,19 @@ mod signal_driven_io {
                 .iter()
                 .all(|&(code, fd)| (code, fd) == (1, b as i32))
         );
-        // Room alone does not signal, only a buffer three quarters free.
-        while queued > crate::sockets::SEND_WINDOW as u64 / 4 {
+        // Room alone does not signal: only once the writer is writable to
+        // poll, a quarter of its send buffer holding what waits, as
+        // unix_write_space checks unix_writable.
+        let writer = k.files.descriptor(a).unwrap().file;
+        let writable = |writer: &Arc<dyn paludarium_host::FileHandle>| {
+            writer.readiness().unwrap().0 & crate::events::OUT != 0
+        };
+        while !writable(&writer) {
             assert!(codes(&k).is_empty());
             assert_eq!(
                 syscall(&mut k, &mut t, &m, 0, [b, DATA, 4096, 0, 0, 0]),
                 4096
             );
-            queued -= 4096;
         }
         assert_eq!(codes(&k), [(2, a as i32)]);
         assert_eq!(

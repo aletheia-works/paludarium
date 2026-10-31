@@ -1396,6 +1396,10 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_BSDCOMPAT => {}
         SO_SNDBUF | SO_SNDBUFFORCE => {
             options.send_buffer = buffer_size(value, name == SO_SNDBUFFORCE, MIN_SEND_BUFFER);
+            socket.pair.send_buffers[socket.side].store(
+                usize::try_from(options.send_buffer).unwrap_or(0),
+                Ordering::SeqCst,
+            );
             // A sender waiting for room may now find it (`sk_write_space`).
             socket.pair.hub.changed();
         }
@@ -1799,6 +1803,12 @@ struct Pair {
     /// `sk_peer_pid`: for a pair, the one that made it, as
     /// `unix_socketpair` records its credentials; 0 for none.
     peers: [AtomicU32; 2],
+    /// What each end has sent and that waits takes of its send buffer
+    /// ([`Charge`]), and that buffer (`SO_SNDBUF`, doubled), which a read
+    /// at the other end looks at to wake it, as Linux's `sock_wfree` calls
+    /// the sender's `unix_write_space`.
+    sent: [Arc<AtomicUsize>; 2],
+    send_buffers: [AtomicUsize; 2],
     hub: Arc<ReadinessHub>,
     /// SOCK_STREAM, SOCK_DGRAM or SOCK_SEQPACKET. The last two keep message
     /// boundaries: each write is one message, and each read returns one
@@ -1814,6 +1824,11 @@ struct Pair {
     clock: std::sync::OnceLock<Arc<dyn paludarium_host::Host>>,
 }
 impl Pair {
+    /// Whether end `side` may send as Linux's `unix_writable` sees it.
+    fn writable(&self, side: usize) -> bool {
+        (self.sent[side].load(Ordering::SeqCst) + 1) * 4
+            <= self.send_buffers[side].load(Ordering::SeqCst)
+    }
     fn messages(&self) -> bool {
         self.kind != SOCK_STREAM
     }
@@ -1864,12 +1879,17 @@ pub(crate) struct SocketPairEnd {
 impl SocketPairEnd {
     /// `SO_SNDBUF` on this end, as Linux keeps it, doubled.
     fn send_buffer(&self) -> usize {
-        let send_buffer = self
-            .options
+        self.pair.send_buffers[self.side].load(Ordering::SeqCst)
+    }
+    /// Sets `SO_SNDBUF`, already doubled, as Linux keeps it.
+    #[cfg(test)]
+    fn set_send_buffer(&self, size: i32) {
+        self.options
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .send_buffer;
-        usize::try_from(send_buffer).unwrap_or(0)
+            .send_buffer = size;
+        self.pair.send_buffers[self.side]
+            .store(usize::try_from(size).unwrap_or(0), Ordering::SeqCst);
     }
     /// Charges this end's send buffer `size` bytes for a message or part
     /// it sends, until that goes.
@@ -1885,7 +1905,7 @@ impl SocketPairEnd {
     /// `unix_writable`: a quarter of its send buffer holds what it has sent
     /// and that waits, and one more.
     fn writable(&self) -> bool {
-        (self.sent.load(Ordering::SeqCst) + 1) * 4 <= self.send_buffer()
+        self.pair.writable(self.side)
     }
     /// The longest datagram or packet this end sends: its send buffer less
     /// 32 bytes, as `unix_dgram_sendmsg` checks it (`EMSGSIZE` past it).
@@ -2000,6 +2020,8 @@ impl SocketPairEnd {
         }
         let pair = Arc::new(Pair {
             peers: [AtomicU32::new(0), AtomicU32::new(0)],
+            sent: [Arc::default(), Arc::default()],
+            send_buffers: [AtomicUsize::new(SEND_WINDOW), AtomicUsize::new(SEND_WINDOW)],
             kind: kind & 0xf,
             window: AtomicUsize::new(SEND_WINDOW),
             pipe: AtomicBool::new(false),
@@ -2021,7 +2043,7 @@ impl SocketPairEnd {
                 options: Mutex::default(),
                 unix: std::sync::OnceLock::new(),
                 unconnected: AtomicBool::new(false),
-                sent: Arc::default(),
+                sent: Arc::clone(&pair.sent[side]),
             })
         }))
     }
@@ -2226,9 +2248,9 @@ impl SocketPairEnd {
         }
     }
     /// After a socket read that took data (`peeked` leaves it): a send that
-    /// found no room signals its end `POLL_OUT` once three quarters of the
-    /// buffer are free, as `unix_write_space` with `unix_writable` (a pipe's
-    /// reads signal in [`pipe_read_ended`]).
+    /// found no room signals its end `POLL_OUT` once that end is writable,
+    /// as `unix_write_space` with `unix_writable` (a pipe's reads signal in
+    /// [`pipe_read_ended`]).
     fn after_read<T>(&self, peeked: bool, result: &Result<T, Errno>) {
         if peeked || result.is_err() || self.is_pipe() {
             return;
@@ -2239,7 +2261,7 @@ impl SocketPairEnd {
             .sides
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let room = sides[self.side].bytes.len() <= self.pair.window() / 4;
+        let room = self.pair.writable(peer);
         if !(sides[peer].no_space && room) {
             return;
         }
@@ -3484,10 +3506,7 @@ mod events_tests {
         // each part takes its truesize of the buffer, which the third finds
         // full.
         let [c, d] = pair();
-        c.options
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .send_buffer = 20_000;
+        c.set_send_buffer(20_000);
         assert_eq!(
             c.send(&[2; 20_000], &mut Passed::new(), Sender::default()),
             Ok(2 * 9936)

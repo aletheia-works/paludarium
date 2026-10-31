@@ -1418,6 +1418,8 @@ impl InetSocket {
     /// that `waits` on a socket shut down for reading ends at once with 0,
     /// as `__skb_wait_for_more_packets` does; another is `EAGAIN`.
     fn receive_datagram(&self, buf: &mut [u8], peek: bool, waits: bool) -> Result<Received, Errno> {
+        // The options' lock comes before the state's.
+        let stamped = self.options().timestamps.wanted();
         let mut s = self.lock();
         if let Some(error) = s.error.take() {
             return Err(error);
@@ -1440,7 +1442,7 @@ impl InetSocket {
         }
         let n = buf.len().min(bytes.len());
         buf[..n].copy_from_slice(&bytes[..n]);
-        let came = if answer {
+        let came = if answer && stamped {
             self.host.clock(paludarium_host::ClockId::Realtime).ok()
         } else {
             came

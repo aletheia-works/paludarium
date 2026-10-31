@@ -489,9 +489,11 @@ pub(crate) fn polled_full(file: &Arc<dyn FileHandle>) {
 /// `file`, or `None` for a file that is neither a pipe nor a socket. A pipe
 /// counts its unread bytes at either end (Linux's `pipe_ioctl`) and has no
 /// `SIOCOUTQ` (ENOTTY). A socket counts its unread bytes, out-of-band byte
-/// included, a datagram socket its first datagram's (`unix_inq_len`), and
-/// `SIOCOUTQ` what the peer has not read, where Linux's `unix_outq_len`
-/// also counts each message's overhead.
+/// included, a datagram socket its first datagram's (`unix_inq_len`).
+/// `SIOCOUTQ` gives what a datagram socket's datagrams that wait take of
+/// its send buffer (`unix_outq_len`), and for a stream or packet socket
+/// what the peer has not read, where Linux also counts each message's
+/// overhead.
 pub(crate) fn queued(file: &Arc<dyn FileHandle>, outgoing: bool) -> Option<Result<usize, Errno>> {
     if let Some(socket) = crate::inet::of(file) {
         return Some(socket.queued(outgoing));
@@ -1580,9 +1582,10 @@ impl Drop for Charge {
 }
 /// What a datagram of `len` bytes takes of its sender's send buffer, as
 /// x86-64 Linux 7.0 counts the `skb->truesize` `unix_dgram_sendmsg`
-/// allocates: the `sk_buff` (256 bytes) and its head, from the small head
-/// cache or the smallest power of two that holds the bytes and the
-/// `skb_shared_info`; past `SKB_MAX_ALLOC` the head keeps what that leaves,
+/// allocates: the `sk_buff` (256 bytes) and its head, the smallest power
+/// of two that holds the bytes and the `skb_shared_info` (an AF_UNIX
+/// socket allocates with `GFP_KERNEL_ACCOUNT`, which the small head cache
+/// does not serve); past `SKB_MAX_ALLOC` the head keeps what that leaves,
 /// and the rest, in whole pages and at most `MAX_SKB_FRAGS` (17) of them,
 /// goes in page fragments.
 fn truesize(len: usize) -> usize {
@@ -1596,12 +1599,7 @@ fn truesize(len: usize) -> usize {
         0
     };
     let head = (len - pages).next_multiple_of(64) + SHARED_INFO;
-    SKB + pages
-        + if head <= crate::inet::SMALL_HEAD {
-            crate::inet::SMALL_HEAD
-        } else {
-            head.next_power_of_two()
-        }
+    SKB + pages + head.next_power_of_two()
 }
 /// The credentials a write carries, as Linux's `UNIXCB` keeps them for
 /// `SCM_CREDENTIALS`: its sender's process ID, user and group when either
@@ -2694,13 +2692,17 @@ thread_local! {
     /// This thread is collecting: the sockets it closes start none.
     static COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-/// Whether `file` is a datagram socket whose blocking send found no room
-/// and still has too little to wake it: Linux's `unix_write_space` wakes
-/// a sender in `sock_alloc_send_pskb` only once it is writable.
+/// Whether `file` is a datagram socket whose send just found no room in
+/// its send buffer, rather than a full queue at the receiver.
+pub(crate) fn out_of_room(file: &Arc<dyn FileHandle>) -> bool {
+    socket_end(file)
+        .is_some_and(|end| end.pair.kind == SOCK_DGRAM && end.no_room.load(Ordering::SeqCst))
+}
+/// Whether a datagram socket `file` still has too little room to wake a
+/// sender that found none: Linux's `unix_write_space` wakes a sender in
+/// `sock_alloc_send_pskb` only once it is writable.
 pub(crate) fn sleeps_for_room(file: &Arc<dyn FileHandle>) -> bool {
-    socket_end(file).is_some_and(|end| {
-        end.pair.kind == SOCK_DGRAM && end.no_room.load(Ordering::SeqCst) && !end.writable()
-    })
+    socket_end(file).is_some_and(|end| !end.writable())
 }
 /// `file` as a socket's end, not a pipe's.
 fn socket_end(file: &Arc<dyn FileHandle>) -> Option<&SocketPairEnd> {
@@ -3020,7 +3022,8 @@ impl SocketPairEnd {
         self.check_datagram_send(buf.len())?;
         // sock_alloc_send_pskb: no room while what this end has sent and
         // that waits takes the whole send buffer, which a blocking send
-        // waits for.
+        // waits for. Linux looks for room before it looks for the peer,
+        // so an unconnected socket with none is EAGAIN, not ENOTCONN.
         let full = self.sent.load(Ordering::SeqCst) >= self.send_buffer();
         self.no_room.store(full, Ordering::SeqCst);
         if full {
@@ -3495,13 +3498,12 @@ mod events_tests {
     }
     #[test]
     fn datagrams_take_what_linux_counts() {
-        // The head's power of two, the small head below it, and past
-        // SKB_MAX_ALLOC page fragments, at most 17 pages of them; the
-        // shape is native Linux's, the small head x86-64's.
+        // The head's power of two, and past SKB_MAX_ALLOC page
+        // fragments, at most 17 pages of them, as native Linux counts them.
         let expected = [
-            (0, 960),
-            (384, 960),
-            (385, 1280),
+            (0, 768),
+            (192, 768),
+            (193, 1280),
             (1000, 2304),
             (3776, 4352),
             (3777, 8448),

@@ -83,8 +83,8 @@ verified.
   socket's buffer as it is (a datagram socket's `SO_SNDBUF` bounds
   what it sends, with each datagram's overhead). That buffer counts only the bytes in it, where Linux also counts each
   message's or part's overhead, so more small messages fit before a send
-  finds it full, and `SIOCOUTQ` counts only the bytes the peer has not
-  read. The guest is root, so the options that need `CAP_NET_ADMIN`
+  finds it full, and `SIOCOUTQ` on such a socket counts only the bytes the
+  peer has not read. The guest is root, so the options that need `CAP_NET_ADMIN`
   (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
   gid 0.
 - **Signal-driven I/O**: `O_ASYNC` works on pipes and sockets only, so

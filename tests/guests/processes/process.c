@@ -4249,7 +4249,7 @@ int main(int argc, char **argv) {
         static char big[212992];
         int sv[2], q;
         socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
-        const int lens[] = {0, 1, 384, 385, 1000, 3776, 3777, 7872, 7873, 16064,
+        const int lens[] = {0, 1, 192, 193, 384, 385, 1000, 3776, 3777, 7872, 7873, 16064,
                             16065, 20000, 50000, 85696, 85697, 100000, 212960, 212961};
         for (unsigned i = 0; i < sizeof lens / sizeof lens[0]; i++) {
             errno = 0;
@@ -4326,6 +4326,22 @@ int main(int argc, char **argv) {
         }
         close(sv[0]);
         close(sv[1]);
+        /* With no room left, an unconnected socket sending with no address
+           is EAGAIN: Linux looks for room (sock_alloc_send_pskb) before it
+           looks for the peer. */
+        struct sockaddr_un to;
+        socklen_t to_len = unix_abstract(&to, "sndbuf-to");
+        int receiver = socket(AF_UNIX, SOCK_DGRAM, 0);
+        bind(receiver, (void *)&to, to_len);
+        int u = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        value = 2048;
+        setsockopt(u, SOL_SOCKET, SO_SNDBUF, &value, sizeof value);
+        sent = 0;
+        while (sendto(u, big, 1000, 0, (void *)&to, to_len) == 1000) sent++;
+        printf("named-filled=%d errno=%d\n", sent, errno);
+        unix_call("send-unconnected-full", send(u, big, 1000, 0));
+        close(u);
+        close(receiver);
         return 0;
     }
     if (!strcmp(mode, "unix-datagram")) {

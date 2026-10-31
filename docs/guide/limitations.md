@@ -25,7 +25,11 @@ verified.
     route's source address: `getsockname` gives the unspecified address,
     and a `bind` of that port on a loopback address is `EADDRINUSE`, where
     Linux allows it.
-    Multicast and broadcast datagrams reach no one. Raw sockets are `EPERM`,
+    Multicast and broadcast datagrams reach no one. A datagram is always
+    stamped as it comes, as Linux stamps it while some socket on the
+    machine takes timestamps; with none, Linux stamps it only when
+    `SO_TIMESTAMP` or its kin read it, at that time. A DNS stub's answer
+    is stamped when it is read. Raw sockets are `EPERM`,
     ICMP sockets `EACCES`, and other kinds (SCTP's `SOCK_SEQPACKET`, which
     Linux loads a module for) `ESOCKTNOSUPPORT`.
   - Under a directory mounted from the host, an AF_UNIX socket binds to a
@@ -48,6 +52,9 @@ verified.
     Through the host, `SO_SNDBUF` and `SO_RCVBUF` are kept for `getsockopt`
     but do not size the buffers, which hold 256 KiB each way; the other options but
     `TCP_NODELAY` do not reach the host's socket.
+  - A TCP socket takes `SO_TIMESTAMP`, its kin and `SO_TIMESTAMPING`, but
+    `recvmsg` gives it no timestamps, where Linux gives the time the last
+    segment read came.
   - Through the host, `MSG_OOB` sends its byte as an ordinary one and finds
     no urgent data (`EINVAL`), so no `SIGURG` comes either.
   - On the loopback, an urgent byte sends `SIGURG` once, when it reaches

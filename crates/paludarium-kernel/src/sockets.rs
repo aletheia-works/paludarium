@@ -370,8 +370,9 @@ pub(crate) struct MessageHeader {
     /// `msg_name` itself.
     name_at: u64,
     pub(crate) iov: Vec<(u64, usize)>,
-    control: u64,
-    control_len: u64,
+    /// `msg_control` and `msg_controllen`.
+    pub(crate) control: u64,
+    pub(crate) control_len: u64,
 }
 /// Reads the `msghdr` at `at` (EFAULT): a negative `msg_namelen` with a name
 /// is EINVAL, a longer one counts as `sockaddr_storage`'s 128 bytes, and
@@ -994,15 +995,7 @@ fn deliver(
     let mut room = (header.control, header.control_len);
     let mut cut = false;
     if let Some((at, timestamps)) = received.timestamp {
-        cut |= put_control(c, &mut room, timestamps.kind(), &timestamps.data(at));
-        if let Some(data) = timestamps.timestamping(at) {
-            let kind = if timestamps.new {
-                SO_TIMESTAMPING_NEW
-            } else {
-                SO_TIMESTAMPING
-            };
-            cut |= put_control(c, &mut room, kind, &data);
-        }
+        cut |= timestamps.put(c, &mut room, at);
     }
     if let Some(credentials) = credentials {
         let mut ucred = [0; UCRED];
@@ -1048,7 +1041,7 @@ fn put_pidfd(c: &mut Context<'_>, room: &mut (u64, u64), pid: u32) -> bool {
 /// buffer), as Linux's `put_cmsg`: cut to what is left, nothing when not
 /// even its header fits, and `room` as it was when it cannot be written.
 /// Returns whether it was cut.
-fn put_control(c: &Context<'_>, room: &mut (u64, u64), kind: u32, data: &[u8]) -> bool {
+pub(crate) fn put_control(c: &Context<'_>, room: &mut (u64, u64), kind: u32, data: &[u8]) -> bool {
     let (at, left) = *room;
     if left < CMSG_HEADER as u64 {
         return true;
@@ -1383,40 +1376,14 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         socket.lock_sides()[socket.side].peek_offset = value;
         return Ok(0);
     }
-    if matches!(
-        name,
-        SO_TIMESTAMP | SO_TIMESTAMPNS | SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW
-    ) {
-        // As Linux's `__sock_set_timestamps`.
-        let timestamps = &mut socket.lock_sides()[socket.side].timestamps;
-        timestamps.on = on;
-        timestamps.nanoseconds = on && matches!(name, SO_TIMESTAMPNS | SO_TIMESTAMPNS_NEW);
-        if on {
-            timestamps.new = matches!(name, SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW);
-        }
-        return Ok(0);
-    }
-    if matches!(name, SO_TIMESTAMPING | SO_TIMESTAMPING_NEW) {
-        // As Linux's `sock_set_timestamping`: the flags, alone or at the
-        // head of a `struct so_timestamping` of 8 bytes.
-        if len == 8 {
+    if Timestamps::is_option(name) {
+        if len == 8 && Timestamps::is_struct(name) {
             read_words(c, a[3], 8)?;
         }
-        let flags = value.cast_unsigned();
-        if flags & !SOF_MASK != 0
-            || flags & SOF_OPT_ID_TCP != 0 && flags & SOF_OPT_ID == 0
-            || flags & SOF_OPT_STATS != 0 && flags & SOF_OPT_TSONLY == 0
-        {
-            return Err(Errno::EINVAL);
-        }
-        // A PTP clock binds only to a socket bound to a device.
-        if flags & SOF_BIND_PHC != 0 {
-            return Err(Errno(95));
-        }
-        let timestamps = &mut socket.lock_sides()[socket.side].timestamps;
-        timestamps.flags = flags;
-        timestamps.new = name == SO_TIMESTAMPING_NEW;
-        return Ok(0);
+        return socket.lock_sides()[socket.side]
+            .timestamps
+            .set(name, value, false)
+            .map(|()| 0);
     }
     let mut options = socket
         .options
@@ -1511,28 +1478,8 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_ERROR => int(socket.take_error().map_or(0, |error| error.0)),
         SO_BSDCOMPAT | SO_REUSEPORT | SO_PASSSEC | SO_PROTOCOL => int(0),
         // As Linux's `sk_getsockopt`: each names only the form it set.
-        name @ (SO_TIMESTAMP | SO_TIMESTAMPNS | SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW) => {
-            let t = socket.lock_sides()[socket.side].timestamps;
-            int(match name {
-                SO_TIMESTAMP => t.on && !t.new && !t.nanoseconds,
-                SO_TIMESTAMPNS => t.nanoseconds && !t.new,
-                SO_TIMESTAMP_NEW => t.on && t.new,
-                _ => t.nanoseconds && t.new,
-            }
-            .into())
-        }
-        // The flags and the PTP clock, which no socket binds here; `_NEW`
-        // gives them only when they were set through it.
-        name @ (SO_TIMESTAMPING | SO_TIMESTAMPING_NEW) => {
-            let t = socket.lock_sides()[socket.side].timestamps;
-            let flags = if name == SO_TIMESTAMPING || t.new {
-                t.flags
-            } else {
-                0
-            };
-            let mut value = int(flags.cast_signed());
-            value.extend(0i32.to_le_bytes());
-            value
+        name if Timestamps::is_option(name) => {
+            socket.lock_sides()[socket.side].timestamps.get(name)
         }
         SO_PASSCRED => int(socket.passes_credentials().into()),
         SO_PASSPIDFD => int(socket.lock_sides()[socket.side].pass_pidfd.into()),
@@ -1823,13 +1770,114 @@ struct Side {
 /// too. `flags` are `SO_TIMESTAMPING`'s (`sk_tsflags`), which add a
 /// `SCM_TIMESTAMPING` to what `on` stamps, as AF_UNIX stamps nothing else.
 #[derive(Clone, Copy, Default)]
-struct Timestamps {
+pub(crate) struct Timestamps {
     on: bool,
     nanoseconds: bool,
     new: bool,
     flags: u32,
 }
 impl Timestamps {
+    /// Whether `name` is a `SOL_SOCKET` option [`Self::set`] takes.
+    pub(crate) fn is_option(name: u32) -> bool {
+        matches!(
+            name,
+            SO_TIMESTAMP
+                | SO_TIMESTAMPNS
+                | SO_TIMESTAMP_NEW
+                | SO_TIMESTAMPNS_NEW
+                | SO_TIMESTAMPING
+                | SO_TIMESTAMPING_NEW
+        )
+    }
+    /// Whether option `name` takes a `struct so_timestamping` of 8 bytes,
+    /// which Linux reads whole (EFAULT when it cannot).
+    pub(crate) fn is_struct(name: u32) -> bool {
+        matches!(name, SO_TIMESTAMPING | SO_TIMESTAMPING_NEW)
+    }
+    /// Sets option `name` to `value`: `SO_TIMESTAMP` and its kin as Linux's
+    /// `__sock_set_timestamps`, `SO_TIMESTAMPING` (its flags, alone or at
+    /// the head of a `struct so_timestamping`) as `sock_set_timestamping`,
+    /// where `SOF_TIMESTAMPING_OPT_ID` newly set on a TCP socket that is
+    /// closed or listening (`unconnected_tcp`) is EINVAL.
+    pub(crate) fn set(
+        &mut self,
+        name: u32,
+        value: i32,
+        unconnected_tcp: bool,
+    ) -> Result<(), Errno> {
+        if !Self::is_struct(name) {
+            let on = value != 0;
+            self.on = on;
+            self.nanoseconds = on && matches!(name, SO_TIMESTAMPNS | SO_TIMESTAMPNS_NEW);
+            if on {
+                self.new = matches!(name, SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW);
+            }
+            return Ok(());
+        }
+        let flags = value.cast_unsigned();
+        if flags & !SOF_MASK != 0
+            || flags & SOF_OPT_ID_TCP != 0 && flags & SOF_OPT_ID == 0
+            || flags & SOF_OPT_ID != 0 && self.flags & SOF_OPT_ID == 0 && unconnected_tcp
+            || flags & SOF_OPT_STATS != 0 && flags & SOF_OPT_TSONLY == 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        // A PTP clock binds only to a socket bound to a device.
+        if flags & SOF_BIND_PHC != 0 {
+            return Err(Errno(95));
+        }
+        self.flags = flags;
+        self.new = name == SO_TIMESTAMPING_NEW;
+        Ok(())
+    }
+    /// Option `name` as Linux's `sk_getsockopt` gives it: each form of
+    /// `SO_TIMESTAMP` only as set by that form, and `SO_TIMESTAMPING`'s
+    /// flags with no PTP clock, through `_NEW` only when set through it.
+    pub(crate) fn get(self, name: u32) -> Vec<u8> {
+        if Self::is_struct(name) {
+            let flags = if name == SO_TIMESTAMPING || self.new {
+                self.flags
+            } else {
+                0
+            };
+            let mut value = flags.to_le_bytes().to_vec();
+            value.extend(0i32.to_le_bytes());
+            return value;
+        }
+        i32::from(match name {
+            SO_TIMESTAMP => self.on && !self.new && !self.nanoseconds,
+            SO_TIMESTAMPNS => self.nanoseconds && !self.new,
+            SO_TIMESTAMP_NEW => self.on && self.new,
+            _ => self.nanoseconds && self.new,
+        })
+        .to_le_bytes()
+        .to_vec()
+    }
+    /// Whether a message received now would carry a timestamp, given one:
+    /// as Linux's `__sock_recv_timestamp`, `SO_TIMESTAMP` or its kin, or
+    /// `SO_TIMESTAMPING`'s software report.
+    pub(crate) fn wanted(self) -> bool {
+        self.on || self.timestamping(0).is_some()
+    }
+    /// Writes the timestamps of a message stamped `at` in `room`, as
+    /// Linux's `__sock_recv_timestamp`: that of `SO_TIMESTAMP` or its kin,
+    /// when on, then a `SCM_TIMESTAMPING` ([`Self::timestamping`]).
+    /// Returns whether either was cut ([`put_control`]).
+    pub(crate) fn put(self, c: &Context<'_>, room: &mut (u64, u64), at: u64) -> bool {
+        let mut cut = false;
+        if self.on {
+            cut |= put_control(c, room, self.kind(), &self.data(at));
+        }
+        if let Some(data) = self.timestamping(at) {
+            let kind = if self.new {
+                SO_TIMESTAMPING_NEW
+            } else {
+                SO_TIMESTAMPING
+            };
+            cut |= put_control(c, room, kind, &data);
+        }
+        cut
+    }
     /// The control message type a timestamp goes in.
     fn kind(self) -> u32 {
         match (self.nanoseconds, self.new) {
@@ -3653,6 +3701,40 @@ mod events_tests {
             assert_eq!(data[..16], timestamps.data(1_500_002_000));
             assert_eq!(data[16..], [0; 32]);
         }
+    }
+    #[test]
+    fn timestamp_options_set_and_read_back_as_linux_has_them() {
+        let mut t = Timestamps::default();
+        // OPT_ID newly set needs a TCP socket's connection; set already, it
+        // stays.
+        assert_eq!(t.set(SO_TIMESTAMPING, 0x98, true), Err(Errno::EINVAL));
+        assert_eq!(t.set(SO_TIMESTAMPING, 0x98, false), Ok(()));
+        assert_eq!(t.set(SO_TIMESTAMPING, 0x98, true), Ok(()));
+        assert_eq!(t.set(SO_TIMESTAMPING, 1 << 19, false), Err(Errno::EINVAL));
+        assert_eq!(t.set(SO_TIMESTAMPING, -1, false), Err(Errno::EINVAL));
+        assert_eq!(t.set(SO_TIMESTAMPING, 1 << 15, false), Err(Errno(95)));
+        assert_eq!(t.get(SO_TIMESTAMPING), [0x98, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(t.get(SO_TIMESTAMPING_NEW), [0; 8]);
+        // SO_TIMESTAMPNS_NEW on: each form reads only as it was set.
+        assert_eq!(t.set(SO_TIMESTAMPNS_NEW, 1, false), Ok(()));
+        let ints: Vec<_> = [
+            SO_TIMESTAMP,
+            SO_TIMESTAMPNS,
+            SO_TIMESTAMP_NEW,
+            SO_TIMESTAMPNS_NEW,
+        ]
+        .map(|name| t.get(name)[0])
+        .into();
+        assert_eq!(ints, [0, 0, 1, 1]);
+        assert_eq!(t.get(SO_TIMESTAMPING_NEW)[0], 0x98);
+        // SO_TIMESTAMPING's old form takes the _NEW choice back.
+        assert_eq!(t.set(SO_TIMESTAMPING, 0x10, false), Ok(()));
+        assert_eq!(t.get(SO_TIMESTAMPNS)[0], 1);
+        assert!(t.wanted());
+        assert_eq!(t.set(SO_TIMESTAMP, 0, false), Ok(()));
+        assert!(t.wanted());
+        assert_eq!(t.set(SO_TIMESTAMPING, 0x08, false), Ok(()));
+        assert!(!t.wanted());
     }
     /// Passes `files` with one byte from `end`.
     fn pass(end: &SocketPairEnd, files: &[Arc<dyn FileHandle>]) {

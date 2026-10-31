@@ -4239,6 +4239,35 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
+    if (!strcmp(mode, "stdio-flags")) {
+        /* F_SETFL on the standard streams, as setfl keeps their status
+           flags. Standard input is /dev/null natively, which has no
+           fasync: O_ASYNC is dropped and FIOASYNC is ENOTTY. */
+        errno = 0;
+        result("nonblock", fcntl(0, F_SETFL, O_NONBLOCK));
+        result("errno", errno);
+        result("getfl", fcntl(0, F_GETFL) & (O_NONBLOCK | O_ASYNC | O_APPEND));
+        char byte;
+        result("read-nonblocking", read(0, &byte, 1));
+        result("async", fcntl(0, F_SETFL, O_ASYNC));
+        result("getfl-async", fcntl(0, F_GETFL) & (O_NONBLOCK | O_ASYNC | O_APPEND));
+        int on = 1;
+        errno = 0;
+        result("fioasync", ioctl(0, FIOASYNC, &on));
+        result("errno", errno);
+        on = 1;
+        result("fionbio", ioctl(0, FIONBIO, &on));
+        result("getfl-fionbio", fcntl(0, F_GETFL) & (O_NONBLOCK | O_ASYNC | O_APPEND));
+        result("append", fcntl(1, F_SETFL, O_APPEND));
+        result("getfl-out", fcntl(1, F_GETFL) & (O_ACCMODE | O_NONBLOCK | O_APPEND));
+        result("getfl-err", fcntl(2, F_GETFL) & (O_ACCMODE | O_NONBLOCK | O_APPEND));
+        /* A duplicate shares the open file description's flags. */
+        int copy = dup(1);
+        result("getfl-copy", fcntl(copy, F_GETFL) & (O_ACCMODE | O_NONBLOCK | O_APPEND));
+        fcntl(1, F_SETFL, 0);
+        result("getfl-copy-after", fcntl(copy, F_GETFL) & (O_ACCMODE | O_NONBLOCK | O_APPEND));
+        return 0;
+    }
     if (!strcmp(mode, "unix-dgram-sndbuf")) {
         /* What an AF_UNIX datagram takes of its sender's send buffer, as
            unix_dgram_sendmsg allocates it (skb->truesize, charged to

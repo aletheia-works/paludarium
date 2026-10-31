@@ -210,12 +210,7 @@ impl Files {
                 .insert(
                     channel,
                     Descriptor {
-                        file: Arc::new(StandardFile {
-                            host: Arc::clone(&host),
-                            channel,
-                            rises: AtomicU64::new(0),
-                            was_ready: std::sync::atomic::AtomicBool::new(false),
-                        }),
+                        file: Arc::new(StandardFile::new(&host, channel)),
                         path: Vec::new(),
                         cloexec: false,
                     },
@@ -2076,17 +2071,114 @@ pub(crate) fn write_with(
         }
     }
 }
-struct StandardFile {
+pub(crate) struct StandardFile {
     host: Arc<dyn paludarium_host::Host>,
     channel: u32,
     /// For edge-triggered epoll on standard input: how often it has become
     /// ready, and whether it was ready when last asked.
     rises: AtomicU64,
     was_ready: std::sync::atomic::AtomicBool,
+    /// The status flags, as `F_SETFL` leaves them: the guest's own, which
+    /// never reach the host's descriptor.
+    flags: AtomicU32,
+    /// Standard input's `O_ASYNC` registration, and whether a thread
+    /// watches the host's input for it.
+    registration: Mutex<Option<crate::fasync::Registration>>,
+    watching: std::sync::atomic::AtomicBool,
+}
+/// The flags `F_SETFL` changes (Linux's `SETFL_MASK` but `O_ASYNC`, which
+/// only a file with `fasync` keeps): `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`
+/// and `O_NOATIME`.
+const SETFL_FLAGS: u32 = 0o2000 | 0o4000 | 0o40000 | 0o1000000;
+/// How often a thread looks at the host's standard input for `O_ASYNC`.
+const STDIN_WATCH: std::time::Duration = std::time::Duration::from_millis(10);
+impl StandardFile {
+    fn new(host: &Arc<dyn paludarium_host::Host>, channel: u32) -> Self {
+        Self {
+            host: Arc::clone(host),
+            channel,
+            rises: AtomicU64::new(0),
+            was_ready: std::sync::atomic::AtomicBool::new(false),
+            flags: AtomicU32::new(u32::from(channel != 0)),
+            registration: Mutex::new(None),
+            watching: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    /// Whether the host's standard input has something for a read: bytes,
+    /// or its end; where the host cannot tell, always.
+    fn stdin_ready(&self) -> bool {
+        self.host.stdin_state() != Some(paludarium_host::StdinState::Waiting)
+    }
+    /// Whether this is the host's standard input, which signals with
+    /// `O_ASYNC` as a pipe, socket or terminal does.
+    pub(crate) fn signals(&self) -> bool {
+        self.channel == 0 && self.host.stdin_signals()
+    }
+    /// `F_SETFL` turning `O_ASYNC` on, with its registration, or off. The
+    /// host's input changes outside the emulator, so a thread looks at it
+    /// every [`STDIN_WATCH`] while `O_ASYNC` is on, and sends `SIGIO`
+    /// (`POLL_IN`) each time it has something where it had nothing, as
+    /// Linux's pipe and terminal do when input comes. A host without
+    /// threads (WebAssembly) sends none.
+    pub(crate) fn set_async(
+        &self,
+        file: &Arc<dyn FileHandle>,
+        registration: Option<crate::fasync::Registration>,
+    ) {
+        let mut kept = self
+            .registration
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *kept = registration;
+        if kept.is_none() || self.watching.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let file = Arc::downgrade(file);
+        let started = self.host.spawn_thread(Box::new(move || {
+            let mut was = file
+                .upgrade()
+                .and_then(|f| standard(&f).map(StandardFile::stdin_ready));
+            loop {
+                std::thread::sleep(STDIN_WATCH);
+                let Some(file) = file.upgrade() else { return };
+                let Some(stdin) = standard(&file) else { return };
+                let to = {
+                    let kept = stdin
+                        .registration
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let Some(to) = kept.clone() else {
+                        stdin.watching.store(false, Ordering::SeqCst);
+                        return;
+                    };
+                    to
+                };
+                let ready = stdin.stdin_ready();
+                if ready
+                    && was == Some(false)
+                    && let Some(processes) = to.processes.upgrade()
+                {
+                    let owner = processes.file_owner(&file);
+                    processes.send_io(owner, to.fd, crate::fasync::Reason::In);
+                }
+                was = Some(ready);
+            }
+        }));
+        if started.is_err() {
+            self.watching.store(false, Ordering::SeqCst);
+        }
+    }
+}
+/// The host's standard stream behind `file`, if it is one.
+pub(crate) fn standard(file: &Arc<dyn FileHandle>) -> Option<&StandardFile> {
+    file.as_any()?.downcast_ref::<StandardFile>()
 }
 impl FileHandle for StandardFile {
     fn stdio_channel(&self) -> Option<u32> {
         Some(self.channel)
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
     /// For epoll: standard input is readable as `poll` finds it, and hung
     /// up as well at its end; the output streams are writable. A host stream
@@ -2109,8 +2201,13 @@ impl FileHandle for StandardFile {
         }
         Ok((mask, self.rises.load(Ordering::SeqCst), 0))
     }
+    /// With `O_NONBLOCK`, a read finding nothing yet is `EAGAIN` rather
+    /// than a wait on the host.
     fn read(&self, b: &mut [u8]) -> Result<usize, Errno> {
         if self.channel == 0 {
+            if self.flags() & crate::events::NONBLOCK != 0 && !self.stdin_ready() {
+                return Err(Errno::EAGAIN);
+            }
             self.host.read_stdin(b)
         } else {
             Err(Errno::EBADF)
@@ -2146,10 +2243,19 @@ impl FileHandle for StandardFile {
         Err(Errno::ENOSYS)
     }
     fn flags(&self) -> u32 {
-        u32::from(self.channel != 0)
+        self.flags.load(Ordering::SeqCst)
     }
-    fn set_flags(&self, _f: u32) -> Result<(), Errno> {
-        Err(Errno::ENOSYS)
+    /// `F_SETFL`, as Linux's `setfl`: the access mode stays, and `O_ASYNC`
+    /// only with [`StandardFile::signals`].
+    fn set_flags(&self, f: u32) -> Result<(), Errno> {
+        let kept = if self.signals() {
+            SETFL_FLAGS | crate::fasync::O_ASYNC
+        } else {
+            SETFL_FLAGS
+        };
+        let access = u32::from(self.channel != 0);
+        self.flags.store(access | (f & kept), Ordering::SeqCst);
+        Ok(())
     }
 }
 #[cfg(test)]

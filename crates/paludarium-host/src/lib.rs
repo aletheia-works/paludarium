@@ -200,6 +200,12 @@ pub trait Host: Send + Sync {
     fn stdin_state(&self) -> Option<StdinState> {
         None
     }
+    /// Whether the host's standard input is a pipe, a socket or a terminal,
+    /// the files Linux signals with `O_ASYNC` (those with `fasync`); not one
+    /// where the host cannot tell.
+    fn stdin_signals(&self) -> bool {
+        false
+    }
     /// Writes to the host's standard output; returns the bytes written.
     fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno>;
     /// Writes to the host's standard error; returns the bytes written.
@@ -348,6 +354,24 @@ impl Host for NativeHost {
         #[cfg(not(unix))]
         {
             None
+        }
+    }
+    fn stdin_signals(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::io::IsTerminal;
+            let stdin = io::stdin();
+            stdin.is_terminal()
+                || rustix::fs::fstat(&stdin).is_ok_and(|stat| {
+                    matches!(
+                        rustix::fs::FileType::from_raw_mode(stat.st_mode),
+                        rustix::fs::FileType::Fifo | rustix::fs::FileType::Socket
+                    )
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            false
         }
     }
 

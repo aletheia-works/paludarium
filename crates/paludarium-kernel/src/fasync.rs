@@ -88,9 +88,12 @@ pub(crate) fn siginfo(signal: i32, fd: i32, reason: Reason) -> [u8; 48] {
     info
 }
 
-/// Whether `file` has Linux's `fasync`: a pipe or a socket.
+/// Whether `file` has Linux's `fasync`: a pipe or a socket, or the host's
+/// standard input when that is one, or a terminal.
 pub(crate) fn has_fasync(file: &Arc<dyn FileHandle>) -> bool {
-    crate::sockets::endpoint(file).is_some() || crate::inet::of(file).is_some()
+    crate::sockets::endpoint(file).is_some()
+        || crate::inet::of(file).is_some()
+        || crate::files::standard(file).is_some_and(crate::files::StandardFile::signals)
 }
 
 fn owner(c: &Context<'_>, file: &Arc<dyn FileHandle>) -> FileOwner {
@@ -158,6 +161,8 @@ pub(crate) fn set_flags(
             endpoint.set_async(registration);
         } else if let Some(socket) = crate::inet::of(file) {
             socket.set_async(registration);
+        } else if let Some(stdin) = crate::files::standard(file) {
+            stdin.set_async(file, registration);
         }
     }
     Ok(())

@@ -1992,6 +1992,69 @@ mod stdin_readiness {
         assert_eq!(f.ret(0, &[0, DATA + 256, 16]), 0);
     }
     #[test]
+    fn f_setfl_keeps_the_standard_streams_flags() {
+        let mut f = fixture();
+        f.host.open_stdin();
+        // O_NONBLOCK: a read finding nothing is EAGAIN, not a wait.
+        assert_eq!(f.ret(72, &[0, 4, 0x800]), 0);
+        assert_eq!(f.ret(72, &[0, 3]), 0x800);
+        assert_eq!(
+            f.ret(0, &[0, DATA + 256, 16]),
+            Errno::EAGAIN.to_syscall_return()
+        );
+        f.host.push_stdin(b"a");
+        assert_eq!(f.ret(0, &[0, DATA + 256, 16]), 1);
+        // FIONBIO clears it again; the output keeps its access mode.
+        f.mem
+            .write(GuestAddr(DATA + 64), &0u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(16, &[0, 0x5421, DATA + 64]), 0);
+        assert_eq!(f.ret(72, &[0, 3]), 0);
+        assert_eq!(f.ret(72, &[1, 4, 0o2000]), 0);
+        assert_eq!(f.ret(72, &[1, 3]), 0o2001);
+    }
+    #[test]
+    fn standard_input_signals_its_owner_with_o_async() {
+        // A preset input stands for a file without fasync, as /dev/null:
+        // O_ASYNC is dropped, and FIOASYNC is ENOTTY.
+        let mut f = fixture();
+        assert_eq!(f.ret(72, &[0, 4, 0o20000]), 0);
+        assert_eq!(f.ret(72, &[0, 3]), 0);
+        f.mem
+            .write(GuestAddr(DATA + 64), &1u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            f.ret(16, &[0, 0x5452, DATA + 64]),
+            Errno::ENOTTY.to_syscall_return()
+        );
+        // A live one, as a pipe or terminal, keeps it, and input coming
+        // where there was none sends SIGIO to the owner.
+        let mut f = fixture();
+        f.host.open_stdin();
+        let pid = f.ret(39, &[]);
+        assert_eq!(f.ret(72, &[0, 8, pid]), 0);
+        // SIGIO blocked, so that it stays pending.
+        f.mem.write_u64(GuestAddr(DATA + 64), 1 << 28).unwrap();
+        assert_eq!(f.ret(14, &[0, DATA + 64, 0, 8]), 0);
+        assert_eq!(f.ret(72, &[0, 4, 0o20000]), 0);
+        assert_eq!(f.ret(72, &[0, 3]), 0o20000);
+        let pending = |f: &mut Fixture| {
+            assert_eq!(f.ret(127, &[DATA + 72, 8]), 0);
+            f.mem.read_u64(GuestAddr(DATA + 72)).unwrap() & 1 << 28 != 0
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!pending(&mut f));
+        f.host.push_stdin(b"x");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pending(&mut f) {
+            assert!(std::time::Instant::now() < deadline, "no SIGIO");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Off again: the watcher stops.
+        assert_eq!(f.ret(72, &[0, 4, 0]), 0);
+        assert_eq!(f.ret(72, &[0, 3]), 0);
+    }
+    #[test]
     fn a_host_that_cannot_tell_keeps_standard_input_ready() {
         // A preset buffer that has ended, as before: always ready.
         let mut f = fixture();

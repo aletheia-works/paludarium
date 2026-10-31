@@ -212,6 +212,7 @@ mod linux {
         processes_unix_abstract => ("unix-abstract","process"),
         processes_unix_datagram => ("unix-datagram","process"),
         processes_unix_dgram_sndbuf => ("unix-dgram-sndbuf","process"),
+        processes_stdio_flags => ("stdio-flags","process"),
         processes_unix_peercred => ("unix-peercred","process"),
         processes_unix_socketpair => ("unix-socketpair","process"),
         processes_unix_dgram_disconnect => ("unix-dgram-disconnect","process"),

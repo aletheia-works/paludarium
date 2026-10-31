@@ -192,6 +192,11 @@ impl Host for RecordingHost {
             None
         }
     }
+    /// A live standard input ([`RecordingHost::open_stdin`]) stands for a
+    /// pipe or terminal, which Linux signals with `O_ASYNC`.
+    fn stdin_signals(&self) -> bool {
+        self.lock().stdin_live
+    }
     fn read_stdin(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let mut s = self.lock();
         let start = s.stdin_pos.min(s.stdin.len());

@@ -95,9 +95,12 @@ verified.
   The guest is root, so the options that need `CAP_NET_ADMIN`
   (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
   gid 0.
-- **Signal-driven I/O**: `O_ASYNC` works on pipes and sockets only, so
-  standard input and terminals never send `SIGIO`, and `FIOASYNC` setting
-  it on them is `ENOTTY`, where Linux's do.
+- **Signal-driven I/O**: the host's standard input, looked at every 10 ms,
+  sends `SIGIO` once each time input comes where there was none, where
+  Linux's pipe or terminal sends one for every piece of input; in
+  WebAssembly, which has no thread to look, it sends none. Standard output
+  and standard error drop `O_ASYNC`, where Linux's pipe, socket or terminal
+  keeps it.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for

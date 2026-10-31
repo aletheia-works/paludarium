@@ -254,7 +254,8 @@ kernel.
   - with `F_SETOWN_EX`, also a single thread.
 
   `ESRCH` when the owner does not exist. `F_GETOWN` and `F_GETOWN_EX` read
-  it back, and `F_SETSIG` picks the signal. Only pipes and sockets keep
+  it back, and `F_SETSIG` picks the signal. Only pipes and sockets, and the
+  host's standard input when it is a pipe, a socket or a terminal, keep
   `O_ASYNC` (`F_SETFL` drops it on other files, and `FIOASYNC` setting it
   there is `ENOTTY`). With it, a pipe or socket
   sends its owner `SIGIO` from the kernel. With `F_SETSIG`, it sends that
@@ -275,6 +276,13 @@ kernel.
     level-triggered report (an edge-triggered one is not listed again). Only
     what happens while `O_ASYNC` is on counts. An out-of-band byte also sends a
     `POLL_PRI` signal.
+  - **The host's standard input**, whose input comes from outside the
+    emulator: while `O_ASYNC` is on, a thread looks at it every 10 ms and
+    signals `POLL_IN` each time it finds input, or its end, where there
+    was none. `F_SETFL` keeps the standard streams' own status flags
+    (`O_NONBLOCK`, `O_APPEND`, …), which never reach the host's descriptor;
+    with `O_NONBLOCK`, a read of standard input that finds nothing is
+    `EAGAIN`.
   - **TCP and UDP sockets** ([Network](#network)), as Linux's TCP signals:
     `POLL_OUT` when a connection opens, `POLL_ERR` when it fails, `POLL_IN`
     when data arrives, and for the peer's end `POLL_IN` (`POLL_HUP` once

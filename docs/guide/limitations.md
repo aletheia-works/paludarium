@@ -129,6 +129,13 @@ verified.
   input is waiting, and a read of it with `O_NONBLOCK` waits for input
   rather than being `EAGAIN`; on Linux and macOS hosts and in WebAssembly
   it is readable only with input or at its end.
+- **Nonblocking standard output**: with `O_NONBLOCK`, a write to standard
+  output or standard error is `EAGAIN` only when the host has no room at
+  all; with some room it goes whole, waiting on the host for the rest, where
+  Linux writes what fits and returns that count. Only the host descriptor's
+  own `O_NONBLOCK` could stop it short, and the host's other processes
+  share that flag. A Windows host cannot tell, so there it is never
+  `EAGAIN`.
 - **`FIONREAD` and `SIOCOUTQ` on the host's standard streams**: both return
   `ENOTTY`, where Linux answers for what is behind them: `FIONREAD` for a
   pipe, terminal, socket or regular file, `SIOCOUTQ` for a terminal or

@@ -797,6 +797,15 @@ fn sys_write(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         2 => |h, b| h.write_stderr(b),
         _ => return err(Errno::EBADF),
     };
+    // With O_NONBLOCK, no room on the host is EAGAIN (an empty write still
+    // writes nothing, as Linux's pipe_write).
+    if count > 0
+        && c.files.descriptor(fd).is_ok_and(|d| {
+            crate::files::standard(&d.file).is_some_and(crate::files::StandardFile::would_block)
+        })
+    {
+        return err(Errno::EAGAIN);
+    }
     let mut done: u64 = 0;
     let mut chunk = vec![0u8; WRITE_CHUNK.min(usize::try_from(count).unwrap_or(WRITE_CHUNK))];
     while done < count {

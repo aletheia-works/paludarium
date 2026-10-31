@@ -283,7 +283,8 @@ kernel.
     error `POLL_OUT` for room after being full. `F_SETFL` keeps the standard streams' own status flags
     (`O_NONBLOCK`, `O_APPEND`, …), which never reach the host's descriptor;
     with `O_NONBLOCK`, a read of standard input that finds nothing is
-    `EAGAIN`.
+    `EAGAIN`, and so is a write to standard output or standard error that
+    the host has no room for.
   - **TCP and UDP sockets** ([Network](#network)), as Linux's TCP signals:
     `POLL_OUT` when a connection opens, `POLL_ERR` when it fails, `POLL_IN`
     when data arrives, and for the peer's end `POLL_IN` (`POLL_HUP` once

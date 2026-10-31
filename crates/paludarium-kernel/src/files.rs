@@ -2118,6 +2118,16 @@ impl StandardFile {
             self.host.output_writable(self.channel) != Some(false)
         }
     }
+    /// Whether a write of output with `O_NONBLOCK` is `EAGAIN`: the host
+    /// has no room for it now. One with some room goes whole, waiting on
+    /// the host for the rest, where Linux writes what fits: only the host's
+    /// descriptor's own `O_NONBLOCK` could stop it short, and that flag is
+    /// shared with the host's other processes.
+    pub(crate) fn would_block(&self) -> bool {
+        self.channel != 0
+            && self.flags() & crate::events::NONBLOCK != 0
+            && self.host.output_writable(self.channel) == Some(false)
+    }
     /// Whether the host's stream behind this one is a pipe, socket or
     /// terminal, which signals with `O_ASYNC`.
     pub(crate) fn signals(&self) -> bool {
@@ -2235,6 +2245,9 @@ impl FileHandle for StandardFile {
         }
     }
     fn write(&self, b: &[u8]) -> Result<usize, Errno> {
+        if !b.is_empty() && self.would_block() {
+            return Err(Errno::EAGAIN);
+        }
         match self.channel {
             1 => self.host.write_stdout(b),
             2 => self.host.write_stderr(b),

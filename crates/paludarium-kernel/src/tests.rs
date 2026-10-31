@@ -2055,6 +2055,34 @@ mod stdin_readiness {
         assert_eq!(f.ret(72, &[0, 3]), 0);
     }
     #[test]
+    fn a_nonblocking_write_with_no_room_on_the_host_is_eagain() {
+        let mut f = fixture();
+        f.mem.write(GuestAddr(DATA + 256), b"hi").unwrap();
+        // writev's iovec: the two bytes at DATA + 256.
+        f.mem.write_u64(GuestAddr(DATA + 300), DATA + 256).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 308), 2).unwrap();
+        f.host.set_output_full(1, true);
+        // Blocking, a write goes as before.
+        assert_eq!(f.ret(1, &[1, DATA + 256, 2]), 2);
+        assert_eq!(f.ret(72, &[1, 4, 0x800]), 0);
+        assert_eq!(
+            f.ret(1, &[1, DATA + 256, 2]),
+            Errno::EAGAIN.to_syscall_return()
+        );
+        assert_eq!(
+            f.ret(20, &[1, DATA + 300, 1]),
+            Errno::EAGAIN.to_syscall_return()
+        );
+        // An empty write writes nothing, full or not.
+        assert_eq!(f.ret(1, &[1, DATA + 256, 0]), 0);
+        // Standard error is a stream of its own.
+        assert_eq!(f.ret(1, &[2, DATA + 256, 2]), 2);
+        f.host.set_output_full(1, false);
+        assert_eq!(f.ret(1, &[1, DATA + 256, 2]), 2);
+        assert_eq!(f.ret(20, &[1, DATA + 300, 1]), 2);
+        assert_eq!(f.host.stdout(), b"hihihi");
+    }
+    #[test]
     fn standard_output_signals_its_owner_when_it_has_room_again() {
         // The recorded output stands for a pipe: it keeps O_ASYNC, and
         // FIOASYNC takes it, as on Linux.

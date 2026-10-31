@@ -2232,11 +2232,16 @@ impl FileHandle for StandardFile {
         }
         Ok((mask, self.rises.load(Ordering::SeqCst), 0))
     }
-    /// With `O_NONBLOCK`, a read finding nothing yet is `EAGAIN` rather
-    /// than a wait on the host.
+    /// A read finding nothing yet is `EAGAIN` rather than a wait on the
+    /// host: with `O_NONBLOCK` that is the answer, and without it the
+    /// caller ([`wait_for_read`]) waits in the kernel, where a signal ends
+    /// the wait (`EINTR`, or a restart with `SA_RESTART`) as on Linux. A
+    /// host that cannot tell whether input waits reads at once, waiting on
+    /// the host as before. An empty read reads nothing at once, as Linux's
+    /// `pipe_read`.
     fn read(&self, b: &mut [u8]) -> Result<usize, Errno> {
         if self.channel == 0 {
-            if self.flags() & crate::events::NONBLOCK != 0 && !self.stdin_ready() {
+            if !b.is_empty() && !self.stdin_ready() {
                 return Err(Errno::EAGAIN);
             }
             self.host.read_stdin(b)

@@ -2134,10 +2134,10 @@ impl StandardFile {
             return;
         }
         let file = Arc::downgrade(file);
+        // Taken now, so that input coming before the thread first looks
+        // still counts.
+        let mut was = self.stdin_ready();
         let started = self.host.spawn_thread(Box::new(move || {
-            let mut was = file
-                .upgrade()
-                .and_then(|f| standard(&f).map(StandardFile::stdin_ready));
             loop {
                 std::thread::sleep(STDIN_WATCH);
                 let Some(file) = file.upgrade() else { return };
@@ -2155,13 +2155,13 @@ impl StandardFile {
                 };
                 let ready = stdin.stdin_ready();
                 if ready
-                    && was == Some(false)
+                    && !was
                     && let Some(processes) = to.processes.upgrade()
                 {
                     let owner = processes.file_owner(&file);
                     processes.send_io(owner, to.fd, crate::fasync::Reason::In);
                 }
-                was = Some(ready);
+                was = ready;
             }
         }));
         if started.is_err() {

@@ -1338,7 +1338,10 @@ int main(int argc, char **argv) {
         printf("  all-received-last=%d\n", drain(c) == sent);
         close(c);
         /* The peer reads it all in another thread after 300 ms: the close
-           ends then, well before its five seconds. */
+           ends then, well before its five seconds. How long it waited is not
+           compared with the 300 ms: the emulated side runs on a virtual
+           clock, which the reader's sleep moves for the closing thread too,
+           maybe before the close looks at it (docs/design/quality.md). */
         c = client(port, 0, &result);
         s = accept(l, NULL, NULL);
         sent = fill(s);
@@ -1350,7 +1353,7 @@ int main(int argc, char **argv) {
         start = now_ms();
         call("close-read", close(s));
         long held = now_ms() - start;
-        printf("  held-until-read=%d\n", held >= 200 && held < 2000);
+        printf("  ended-before-time=%d\n", held < 2000);
         void *all;
         pthread_join(reader, &all);
         printf("  reader-received-all=%d\n", all != NULL);

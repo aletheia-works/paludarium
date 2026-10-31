@@ -890,7 +890,18 @@ int main(int argc, char **argv) {
                 while (recv(s, lots, sizeof lots, 0) > 0) {}
             close(s);
             poll(NULL, 0, 100);
-            bind_to(drained ? "drained" : "unread-reset", t, htonl(INADDR_LOOPBACK), full_port);
+            if (drained) {
+                bind_to("drained", t, htonl(INADDR_LOOPBACK), full_port);
+            } else {
+                /* Linux's loopback hands the reset to the client in its own
+                   time, which a busy machine can put off past 100 ms: look
+                   again for up to 5 seconds before the port counts as held. */
+                struct sockaddr_in a = to(full_port);
+                int r;
+                for (int tries = 0; (r = bind(t, (void *)&a, sizeof a)) && tries < 50; tries++)
+                    poll(NULL, 0, 100);
+                call("unread-reset", r);
+            }
             close(t);
         }
         /* Closed with input unread: a reset, and nothing held. */

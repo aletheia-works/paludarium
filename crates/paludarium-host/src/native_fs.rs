@@ -725,6 +725,25 @@ impl HostFs for NativeFs {
         }
         .map_err(err)
     }
+    /// On a Linux host, a socket node made with `mknodat` in the mounted
+    /// directory, with exactly the permission bits of `m` (the host's umask
+    /// does not apply). Other hosts cannot make one inside the mount
+    /// without root (macOS) or at all, so it stays `EPERM` there.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn make_socket(&self, p: &[u8], m: u32) -> Result<FileStat, Errno> {
+        use rustix::fs::{AtFlags, FileType, Mode};
+        let relative = path(p)?;
+        let name = relative.file_name().ok_or(Errno::EEXIST)?;
+        let dir = match relative.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => self.root.open_dir(parent),
+            None => self.root.try_clone(),
+        }
+        .map_err(err)?;
+        let mode = Mode::from_raw_mode(m & 0o7777);
+        rustix::fs::mknodat(&dir, name, FileType::Socket, mode, 0).map_err(|e| err(e.into()))?;
+        rustix::fs::chmodat(&dir, name, mode, AtFlags::empty()).map_err(|e| err(e.into()))?;
+        self.metadata(p, false)
+    }
     fn mkdir(&self, p: &[u8], m: u32) -> Result<(), Errno> {
         let builder = cap_std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -895,6 +914,27 @@ mod files_tests {
                 Ok(i128::from(represented_ns))
             );
         }
+    }
+    #[test]
+    fn make_socket_makes_a_socket_node_on_linux_hosts() {
+        let base =
+            std::env::temp_dir().join(format!("paludarium-socket-node-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("root/dir")).unwrap();
+        let fs = NativeFs::new(&base.join("root")).unwrap();
+        let made = fs.make_socket(b"dir/s", 0o751);
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            // The bits as given, whatever the host's umask.
+            assert_eq!(made.unwrap().mode, 0o140751);
+            assert_eq!(fs.metadata(b"dir/s", false).unwrap().mode, 0o140751);
+            assert_eq!(fs.make_socket(b"dir/s", 0o751), Err(Errno::EEXIST));
+            assert_eq!(fs.make_socket(b"missing/s", 0o751), Err(Errno::ENOENT));
+            // A path out of the mount stays out of reach.
+            assert!(fs.make_socket(b"../outside", 0o751).is_err());
+            assert!(!base.join("outside").exists());
+        } else {
+            assert_eq!(made, Err(Errno::EPERM));
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);

@@ -26,11 +26,13 @@ verified.
     Multicast and broadcast datagrams reach no one. Raw sockets are `EPERM`,
     ICMP sockets `EACCES`, and other kinds (SCTP's `SOCK_SEQPACKET`, which
     Linux loads a module for) `ESOCKTNOSUPPORT`.
-  - An AF_UNIX socket binds to a path only in the guest's own file
-    system: under a directory mounted from the host, `bind` to a path is
-    `EPERM`, and a host's socket file there finds no socket
-    (`ECONNREFUSED`). A socket file's write permission is not checked, as
-    for root.
+  - Under a directory mounted from the host, an AF_UNIX socket binds to a
+    path only on a Linux host, which makes the socket file there; on macOS,
+    which lets only root make one, and on Windows, `bind` to a path there
+    is `EPERM`. Guest sockets reach one another through such a file, but a
+    host program's socket file finds no socket (`ECONNREFUSED`), and a
+    host program cannot reach a guest's. A socket file's write permission
+    is not checked, as for root.
   - The DNS stub answers only `A` and `AAAA`, and ignores EDNS, so a
     datagram answer holds at most 512 bytes; a name the host cannot resolve
     is `SERVFAIL`. A TCP connection to port 53 always reaches the stub, never

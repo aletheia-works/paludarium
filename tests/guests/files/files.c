@@ -121,6 +121,19 @@ void _start(void) {
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
   results[x++]=SX(p,0,0);S(87,q,0,0);}
+ if(CASE==49){ /* AF_UNIX bind makes a socket file, which connect finds */
+  static char sa[110]="\1\0/tmp/paludarium-files-socket"; long len=2+sizeof("/tmp/paludarium-files-socket");
+  char *path=sa+2; S(87,path,0,0); S(95,022,0,0);
+  long l=S(41,1,1,0),o=S(41,1,1,0),c=S(41,1,1,0),c2=S(41,1,1,0);
+  results[x++]=S(49,l,sa,len);results[x++]=S(4,path,st,0);
+  results[x++]=*(unsigned*)(st+24)&0177777;
+  results[x++]=S(49,o,sa,len);results[x++]=S(50,l,1,0);
+  results[x++]=S(42,c,sa,len);long a=S(43,l,0,0);results[x++]=a>=0;
+  results[x++]=S(1,c,"s",1);results[x++]=S(0,a,buf,1);results[x++]=buf[0];
+  results[x++]=S(87,path,0,0);results[x++]=S(42,c2,sa,len);
+  char *b=sa+2; const char *f=p; while((*b++=*f++)){} /* a path that is a regular file */
+  results[x++]=S(49,o,sa,2+sizeof(p));
+  S(3,a,0,0);S(3,l,0,0);S(3,o,0,0);S(3,c,0,0);S(3,c2,0,0);}
  if(CASE==48){ /* MADV_DONTNEED on the program's own data and bss */
   data_pages[0]=9;data_pages[4096]=9;bss_pages[0]=9;bss_pages[4096]=9;
   results[x++]=S(28,data_pages,8192,4);results[x++]=data_pages[0];results[x++]=data_pages[1];results[x++]=data_pages[4096];

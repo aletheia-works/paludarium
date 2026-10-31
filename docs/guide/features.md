@@ -153,7 +153,8 @@ kernel.
   are kept per socket type, as Linux hashes them with the type, so a stream
   and a datagram socket may bind the same one.
 - An AF_UNIX socket also binds to a path, as Linux's `unix_bind_bsd`: `bind`
-  makes a socket file there (`S_IFSOCK`, mode 0777 less the umask), so a
+  makes a socket file there (`S_IFSOCK`, mode 0777 less the umask), also
+  in a directory mounted from a Linux host ([Limitations](./limitations)), so a
   path that exists, a dangling symbolic link too, is `EADDRINUSE`, and
   `getsockname` gives the path ended with a 0. A connect or send to a path
   finds the socket by its file's inode, as `unix_find_bsd`: through

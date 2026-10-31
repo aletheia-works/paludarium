@@ -31,8 +31,9 @@ verified.
     which lets only root make one, and on Windows, `bind` to a path there
     is `EPERM`. Guest sockets reach one another through such a file, but a
     host program's socket file finds no socket (`ECONNREFUSED`), and a
-    host program cannot reach a guest's. A socket file's write permission
-    is not checked, as for root.
+    host program cannot reach a guest's. A host without `/proc` (a chroot,
+    a minimal container) also takes its own umask's bits from the file's
+    mode. A socket file's write permission is not checked, as for root.
   - The DNS stub answers only `A` and `AAAA`, and ignores EDNS, so a
     datagram answer holds at most 512 bytes; a name the host cannot resolve
     is `SERVFAIL`. A TCP connection to port 53 always reaches the stub, never

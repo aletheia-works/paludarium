@@ -727,8 +727,9 @@ impl HostFs for NativeFs {
     }
     /// On a Linux host, a socket node made with `mknodat` in the mounted
     /// directory, with exactly the permission bits of `m` where `/proc` is
-    /// mounted (otherwise the host's umask takes some away). Other hosts cannot make one inside the mount
-    /// without root (macOS) or at all, so it stays `EPERM` there.
+    /// mounted (otherwise the host's umask takes some away). Other hosts
+    /// cannot make one inside the mount without root (macOS) or at all, so
+    /// it stays `EPERM` there.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn make_socket(&self, p: &[u8], m: u32) -> Result<FileStat, Errno> {
         use rustix::fs::{FileType, Mode, OFlags};

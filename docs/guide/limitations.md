@@ -48,10 +48,14 @@ verified.
     `TCP_NODELAY` do not reach the host's socket.
   - Through the host, `MSG_OOB` sends its byte as an ordinary one and finds
     no urgent data (`EINVAL`), so no `SIGURG` comes either.
-  - On the loopback, an urgent byte sent while the peer's buffer is full
-    sends `SIGURG` once, when it reaches the peer; Linux can send more, as
-    a later segment that carries the urgent pointer signals again once the
-    byte has been read or passed over.
+  - On the loopback, an urgent byte sends `SIGURG` once, when it reaches
+    the peer. Linux sends one more for each segment that arrives while the
+    byte is more than 64 KiB further on, as when it waits behind a full
+    buffer: the sender's `__tcp_transmit_skb` then gives each segment a
+    stand-in urgent pointer 65535 bytes past its start, which the
+    receiver's `tcp_check_urg` takes for a new one. How many segments that
+    is hangs on Linux's own segmenting and window updates: with the default
+    buffers, a few tens.
   - On the loopback, the `SO_SNDBUF` and `SO_RCVBUF` a guest sets bound a
     connection's buffers only roughly ([Loopback servers](./features#loopback-servers)):
     Linux also counts each segment's overhead and sizes its window in steps

@@ -236,6 +236,10 @@ mod linux {
         case("udp");
     }
     #[test]
+    fn network_udp_timestamp() {
+        case("udp-timestamp");
+    }
+    #[test]
     fn network_udp_shutdown() {
         case("udp-shutdown");
     }

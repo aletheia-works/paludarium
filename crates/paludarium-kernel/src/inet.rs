@@ -14,7 +14,7 @@
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::loopback::{Binding, Link, Ports};
-use crate::sockets::Timeout;
+use crate::sockets::{Timeout, Timestamps};
 use crate::syscalls::Context;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use paludarium_host::net::{Driver, Event, Lookup, Phase, Stream};
@@ -67,6 +67,7 @@ const POLLRDHUP: u32 = 0x2000;
 const MSG_OOB: u64 = 0x1;
 const MSG_PEEK: u64 = 0x2;
 const MSG_TRUNC: u64 = 0x20;
+const MSG_CTRUNC: u32 = 0x8;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_WAITALL: u64 = 0x100;
 const MSG_NOSIGNAL: u64 = 0x4000;
@@ -489,6 +490,8 @@ struct State {
 struct Datagram {
     from: SocketAddr,
     seq: u64,
+    /// The real time it came, which a timestamp gives.
+    came: Option<u64>,
     bytes: Vec<u8>,
     /// What it takes of the receive buffer ([`truesize`]).
     size: usize,
@@ -628,6 +631,8 @@ struct Options {
     user_timeout: i32,
     type_of_service: i32,
     v6_only: bool,
+    /// `SO_TIMESTAMP`, its kin and `SO_TIMESTAMPING`.
+    timestamps: Timestamps,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -653,6 +658,7 @@ impl Default for Options {
             user_timeout: 0,
             type_of_service: 0,
             v6_only: false,
+            timestamps: Timestamps::default(),
         }
     }
 }
@@ -1378,6 +1384,7 @@ impl InetSocket {
         s.inbox.push_back(Datagram {
             from,
             seq,
+            came: self.host.clock(paludarium_host::ClockId::Realtime).ok(),
             bytes: bytes.to_vec(),
             size,
         });
@@ -1386,8 +1393,10 @@ impl InetSocket {
         self.hub.changed();
     }
     /// The first datagram that has come, a guest socket's or the stub's
-    /// ready answer, in the order they came: its sender and bytes.
-    fn first_datagram(&self, s: &State) -> Option<(SocketAddr, Vec<u8>, bool)> {
+    /// ready answer, in the order they came: its sender and bytes, whether
+    /// it is the answer, and when it came (an answer, none: it comes as it
+    /// is read).
+    fn first_datagram(&self, s: &State) -> Option<(SocketAddr, Vec<u8>, bool, Option<u64>)> {
         let answer = s
             .queries
             .front()
@@ -1396,9 +1405,11 @@ impl InetSocket {
             (Some((seq, from, answer)), datagram)
                 if datagram.is_none_or(|datagram| seq < datagram.seq) =>
             {
-                Some((from, answer, true))
+                Some((from, answer, true, None))
             }
-            (_, Some(datagram)) => Some((datagram.from, datagram.bytes.clone(), false)),
+            (_, Some(datagram)) => {
+                Some((datagram.from, datagram.bytes.clone(), false, datagram.came))
+            }
             _ => None,
         }
     }
@@ -1407,11 +1418,13 @@ impl InetSocket {
     /// that `waits` on a socket shut down for reading ends at once with 0,
     /// as `__skb_wait_for_more_packets` does; another is `EAGAIN`.
     fn receive_datagram(&self, buf: &mut [u8], peek: bool, waits: bool) -> Result<Received, Errno> {
+        // The options' lock comes before the state's.
+        let stamped = self.options().timestamps.wanted();
         let mut s = self.lock();
         if let Some(error) = s.error.take() {
             return Err(error);
         }
-        let Some((from, bytes, answer)) = self.first_datagram(&s) else {
+        let Some((from, bytes, answer, came)) = self.first_datagram(&s) else {
             return if s.read_shut && waits {
                 Ok(Received::bytes(0))
             } else {
@@ -1429,9 +1442,15 @@ impl InetSocket {
         }
         let n = buf.len().min(bytes.len());
         buf[..n].copy_from_slice(&bytes[..n]);
+        let came = if answer && stamped {
+            self.host.clock(paludarium_host::ClockId::Realtime).ok()
+        } else {
+            came
+        };
         Ok(Received {
             length: bytes.len(),
             from: Some(from),
+            came,
             ..Received::bytes(n)
         })
     }
@@ -1443,7 +1462,7 @@ impl InetSocket {
     fn next_datagram(&self) -> usize {
         let s = self.lock();
         self.first_datagram(&s)
-            .map_or(0, |(_, bytes, _)| bytes.len())
+            .map_or(0, |(_, bytes, ..)| bytes.len())
     }
     /// The bytes waiting to be read, and to be sent, for `FIONREAD` and
     /// `SIOCOUTQ`; a listener has neither (EINVAL, as Linux's `tcp_ioctl`).
@@ -1996,6 +2015,8 @@ struct Received {
     at_mark: bool,
     /// It was the urgent byte, for `MSG_OOB`.
     urgent: bool,
+    /// When a datagram came, which a timestamp gives.
+    came: Option<u64>,
 }
 impl Received {
     fn bytes(count: usize) -> Self {
@@ -2005,6 +2026,7 @@ impl Received {
             from: None,
             at_mark: false,
             urgent: false,
+            came: None,
         }
     }
 }
@@ -2397,8 +2419,20 @@ pub(crate) fn dispatch(
                     .write(GuestAddr(a[1] + 8), &(address.len() as u32).to_le_bytes())
                     .map_err(|_| Errno::EFAULT)?;
             }
+            // A datagram's timestamps, as `udp_recvmsg` gives them
+            // (`sock_recv_timestamp`); with no control buffer, only
+            // MSG_CTRUNC tells of them.
+            let timestamps = socket.options().timestamps;
+            let mut used = 0u64;
+            if let Some(came) = received.came.filter(|_| timestamps.wanted()) {
+                let mut room = (header.control, header.control_len);
+                if header.control == 0 || timestamps.put(c, &mut room, came) {
+                    flags |= MSG_CTRUNC;
+                }
+                used = header.control_len - room.1;
+            }
             c.mem
-                .write(GuestAddr(a[1] + 40), &0u64.to_le_bytes())
+                .write(GuestAddr(a[1] + 40), &used.to_le_bytes())
                 .map_err(|_| Errno::EFAULT)?;
             c.mem
                 .write(GuestAddr(a[1] + 48), &flags.to_le_bytes())
@@ -2533,6 +2567,18 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
     let mut options = socket.options();
     let tcp = !socket.datagram;
     match (level, name) {
+        (1, _) if Timestamps::is_option(name as u32) => {
+            let value = option_int(c, at, len)?;
+            if len == 8 && Timestamps::is_struct(name as u32) {
+                read_raw(c, at, 8)?;
+            }
+            // `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection.
+            let unconnected = tcp && {
+                let s = socket.lock();
+                s.listen.is_some() || matches!(s.connection, Connection::Unconnected)
+            };
+            options.timestamps.set(name as u32, value, unconnected)?;
+        }
         (1, 20 | 21 | 66 | 67) => {
             if (len as u32 as i32) < 16 {
                 return Err(Errno::EINVAL);
@@ -2680,6 +2726,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         return Err(EOPNOTSUPP);
     }
     let value: Vec<u8> = match (level, name) {
+        (1, _) if Timestamps::is_option(name as u32) => options.timestamps.get(name as u32),
         (1, 20 | 21 | 66 | 67) => {
             let timeout = if matches!(name, 20 | 66) {
                 options.receive_timeout

@@ -609,7 +609,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
     `TCP_USER_TIMEOUT`、`IP_TOS`、`IPV6_V6ONLY`。既定値と範囲の確かめ方は Linux と
     同じで、`SO_SNDBUF` と `SO_RCVBUF` は既定の `wmem_max` と `rmem_max`（212992）までを
-    2 倍にします。
+    2 倍にします。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
+    設定して読み出せ、`SOF_TIMESTAMPING_OPT_ID` には TCP のソケットの接続が要ります
+    （閉じているか待ち受けている間は `EINVAL`）。
+  - **タイムスタンプ**：`recvmsg` は、Linux の `udp_recvmsg`（`sock_recv_timestamp`）と同じく、
+    UDP のデータグラムに届いた時刻を付けます。受け手がいつオプションを設定したかによりません。
+    `SO_TIMESTAMP` などの制御メッセージを付け、`SO_TIMESTAMPING` のフラグがソフトウェアの
+    タイムスタンプを報告し、受信したものを除いていなければ `SCM_TIMESTAMPING` も続けます。
+    UDP では `SCM_TIMESTAMPING` だけでも付きます。どちらも AF_UNIX と同じく、制御バッファに
+    収まる分に切ります。DNS の代わりの答えには、読んだ時刻を付けます。
 - **名前解決**：組み込みの DNS の代わりが、ゲストのリゾルバが 53 番ポートへ送る UDP の
   問い合わせに、宛先のアドレスによらず答えます。宛先は `/etc/resolv.conf` のサーバー、
   またはその既定です。許可した名前の `A` と `AAAA` の問い合わせには、ホストが引いた

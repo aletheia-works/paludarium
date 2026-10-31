@@ -244,6 +244,76 @@ static void *drain_later(void *arg) {
     return (void *)(long)(drain(drained_fd) == drained_expected);
 }
 static volatile sig_atomic_t alarms;
+/* udp-timestamp: the option numbers, as x86-64 Linux has them. */
+#define TS_OLD 29
+#define TS_NS_OLD 35
+#define TS_NEW 63
+#define TS_NS_NEW 64
+#define TSG_OLD 37
+#define TSG_NEW 65
+static long long real_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+/* The six timestamp options as getsockopt reads them: an int each for
+   SO_TIMESTAMP's four forms, the flags and PTP clock for SO_TIMESTAMPING's
+   two. */
+static void stamp_options(const char *name, int fd) {
+    const int names[] = {TS_OLD, TS_NS_OLD, TS_NEW, TS_NS_NEW, TSG_OLD, TSG_NEW};
+    printf("  %s:", name);
+    for (int i = 0; i < 6; i++) {
+        int got[2] = {-7, -7};
+        socklen_t len = sizeof got;
+        int r = getsockopt(fd, SOL_SOCKET, names[i], got, &len);
+        if (i < 4)
+            printf(" %d/%d", r ? -errno : got[0], (int)len);
+        else
+            printf(" %#x,%d/%d", r ? -errno : got[0], got[1], (int)len);
+    }
+    printf("\n");
+}
+static void stamp_option(const char *name, int fd, int opt, int value) {
+    errno = 0;
+    int r = setsockopt(fd, SOL_SOCKET, opt, &value, sizeof value);
+    printf("  set %s %#x=%d errno=%d\n", name, value, r, r ? errno : 0);
+}
+/* recvmsg with `room` bytes of control (none at all for 0) and `flags`:
+   what came, MSG_CTRUNC, msg_controllen, and each control message's type
+   and length, and for a timestamp where it falls against the real times
+   `sent` (taken after the send) and `asked` (before this call). */
+static void receive_stamped(const char *name, int fd, size_t room, int flags, long long sent) {
+    char data[8] = {0};
+    union { char bytes[256]; struct cmsghdr align; } control;
+    memset(control.bytes, 0, sizeof control.bytes);
+    struct iovec iov = {data, sizeof data};
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1,
+                             .msg_control = room ? control.bytes : NULL, .msg_controllen = room};
+    long long asked = real_ns();
+    errno = 0;
+    long n = recvmsg(fd, &message, flags);
+    printf("  %s=%ld errno=%d ctrunc=%d controllen=%zu", name, n, n < 0 ? errno : 0,
+           n >= 0 && (message.msg_flags & MSG_CTRUNC) != 0, n >= 0 ? (size_t)message.msg_controllen : 0);
+    if (n >= 0 && room)
+        for (struct cmsghdr *h = CMSG_FIRSTHDR(&message); h; h = CMSG_NXTHDR(&message, h)) {
+            printf(" [%d len=%zu", h->cmsg_type, (size_t)h->cmsg_len);
+            int ts = h->cmsg_type == TS_OLD || h->cmsg_type == TS_NEW;
+            int any = ts || h->cmsg_type == TS_NS_OLD || h->cmsg_type == TS_NS_NEW ||
+                      h->cmsg_type == TSG_OLD || h->cmsg_type == TSG_NEW;
+            if (any && h->cmsg_len >= CMSG_LEN(16)) {
+                long long v[6] = {0};
+                memcpy(v, CMSG_DATA(h), h->cmsg_len >= CMSG_LEN(48) ? 48 : 16);
+                /* A timeval holds microseconds: compare in them. */
+                long long unit = ts ? 1000 : 1, at = v[0] * 1000000000LL + v[1] * unit;
+                long long a = at / unit, s = sent / unit, q = asked / unit;
+                printf(" %s fits=%d", a <= s ? "sent" : a >= q ? "read" : "between",
+                       v[1] >= 0 && v[1] < 1000000000LL / unit);
+                if (h->cmsg_len >= CMSG_LEN(48)) printf(" rest=%d", !(v[2] | v[3] | v[4] | v[5]));
+            }
+            printf("]");
+        }
+    printf("\n");
+}
 static void on_alarm(int signal) { (void)signal; alarms++; }
 
 int main(int argc, char **argv) {
@@ -1791,6 +1861,111 @@ int main(int argc, char **argv) {
                     close(r);
                     close(s);
                 }
+        return 0;
+    }
+    if (!strcmp(mode, "udp-timestamp")) {
+        /* SO_TIMESTAMP, its kin and SO_TIMESTAMPING on inet sockets, as
+           Linux's sock.c and udp_recvmsg (sock_recv_timestamp) have them: a
+           UDP datagram carries the time it came, whatever the receiver took
+           then, given as each option asks. Linux stamps a datagram as it
+           comes only while some socket on the machine takes timestamps
+           (netstamp_needed), which the keeper here makes sure of, waiting
+           for the kernel to turn that on; the emulator always does. TCP's
+           options are set and read back only. */
+        int keeper = socket(AF_INET, SOCK_DGRAM, 0), one = 1;
+        setsockopt(keeper, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof one);
+        usleep(200000);
+        int r = socket(AF_INET, SOCK_DGRAM, 0), s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in at = to(0);
+        socklen_t len = sizeof at;
+        bind(r, (void *)&at, len);
+        getsockname(r, (void *)&at, &len);
+        connect(s, (void *)&at, len);
+        long long sent;
+#define STAMP_SEND() do { send(s, "u", 1, 0); sent = real_ns(); } while (0)
+        puts("udp");
+        stamp_options("none", r);
+        STAMP_SEND();
+        receive_stamped("none", r, 256, 0, sent);
+        /* Taken after the datagram came: the time it came all the same. */
+        STAMP_SEND();
+        stamp_option("old", r, TS_OLD, 1);
+        stamp_options("old", r);
+        receive_stamped("old", r, 256, 0, sent);
+        stamp_option("ns-old", r, TS_NS_OLD, 1);
+        STAMP_SEND();
+        receive_stamped("peek", r, 256, MSG_PEEK, sent);
+        usleep(2000);
+        receive_stamped("ns-old", r, 256, 0, sent);
+        stamp_option("new", r, TS_NEW, 1);
+        STAMP_SEND();
+        receive_stamped("new", r, 256, 0, sent);
+        stamp_option("ns-new", r, TS_NS_NEW, 1);
+        stamp_options("ns-new", r);
+        STAMP_SEND();
+        receive_stamped("ns-new", r, 256, 0, sent);
+        /* With SO_TIMESTAMPING too, its SCM_TIMESTAMPING follows. */
+        stamp_option("tsg-old", r, TSG_OLD, 0x18);
+        stamp_options("tsg-old", r);
+        STAMP_SEND();
+        receive_stamped("both", r, 256, 0, sent);
+        stamp_option("tsg-new", r, TSG_NEW, 0x18);
+        STAMP_SEND();
+        receive_stamped("both-new", r, 256, 0, sent);
+        /* SO_TIMESTAMPING alone, which UDP gives unlike AF_UNIX: the
+           software stamp unless filtered out. */
+        stamp_option("ts-off", r, TS_OLD, 0);
+        stamp_options("ts-off", r);
+        const int reports[] = {0x18, 0x10, 0x08, 0x10 | (1 << 17), 0x18 | (1 << 17), 0};
+        for (int i = 0; i < 6; i++) {
+            stamp_option("report", r, TSG_OLD, reports[i]);
+            STAMP_SEND();
+            receive_stamped("report", r, 256, 0, sent);
+        }
+        /* A control buffer that holds less cuts it; none at all only says so. */
+        stamp_option("ts-old", r, TS_OLD, 1);
+        stamp_option("tsg-old", r, TSG_OLD, 0x10);
+        const size_t rooms[] = {0, 8, 32, 40, 64, 88};
+        for (int i = 0; i < 6; i++) {
+            STAMP_SEND();
+            char label[16];
+            snprintf(label, sizeof label, "room%zu", rooms[i]);
+            receive_stamped(label, r, rooms[i], 0, sent);
+        }
+        /* A plain read takes the datagram all the same. */
+        STAMP_SEND();
+        printf("  read=%ld\n", (long)read(r, buf, 1));
+        close(r);
+        close(s);
+        /* TCP: OPT_ID needs a connection, which a socket closed or
+           listening lacks; the rest is taken anywhere. */
+        puts("tcp");
+        int t = tcp(0);
+        stamp_options("none", t);
+        stamp_option("id", t, TSG_OLD, 0x18 | (1 << 7));
+        stamp_option("plain", t, TSG_NEW, 0x18);
+        stamp_option("ts-ns", t, TS_NS_OLD, 1);
+        stamp_options("set", t);
+        stamp_option("unknown", t, TSG_OLD, 1 << 19);
+        stamp_option("stats", t, TSG_OLD, 1 << 12);
+        stamp_option("bind-phc", t, TSG_OLD, 1 << 15);
+        int l = tcp(0);
+        struct sockaddr_in la = to(0);
+        socklen_t ll = sizeof la;
+        bind(l, (void *)&la, ll);
+        listen(l, 1);
+        stamp_option("listening-id", l, TSG_OLD, 1 << 7);
+        getsockname(l, (void *)&la, &ll);
+        connect(t, (void *)&la, ll);
+        stamp_option("connected-id", t, TSG_OLD, (1 << 7) | (1 << 16));
+        stamp_options("connected", t);
+        int a = accept(l, NULL, NULL);
+        stamp_options("accepted", a);
+        stamp_option("accepted-id", a, TSG_OLD, 1 << 7);
+        close(a);
+        close(l);
+        close(t);
+        close(keeper);
         return 0;
     }
     if (!strcmp(mode, "udp-shutdown")) {

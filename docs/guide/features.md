@@ -658,7 +658,18 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     the host), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_QUICKACK`,
     `TCP_USER_TIMEOUT`, `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and
     range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
-    `wmem_max` and `rmem_max` (212992), doubled.
+    `wmem_max` and `rmem_max` (212992), doubled. `SO_TIMESTAMP`, its kin
+    and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and
+    `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection (`EINVAL`
+    while it is closed or listening).
+  - **Timestamps**: every UDP datagram is stamped as it comes, and
+    `recvmsg` gives that time as Linux's `udp_recvmsg` does
+    (`sock_recv_timestamp`), however late the receiver took the options:
+    the control message of `SO_TIMESTAMP` or its kin, then, when
+    `SO_TIMESTAMPING`'s flags report software stamps and do not filter
+    received ones out, a `SCM_TIMESTAMPING`, which UDP gives alone too.
+    Both are cut to the control buffer as on AF_UNIX. A DNS stub's answer
+    is stamped when it is read.
 - **Name resolution**: a built-in DNS stub answers the UDP queries a guest's
   resolver sends to port 53, at any address: the server of
   `/etc/resolv.conf`, or its default. It answers `A` and `AAAA` questions

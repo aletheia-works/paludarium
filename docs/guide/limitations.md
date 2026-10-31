@@ -97,10 +97,11 @@ verified.
   gid 0.
 - **Signal-driven I/O**: the host's standard input, looked at every 10 ms,
   sends `SIGIO` once each time input comes where there was none, where
-  Linux's pipe or terminal sends one for every piece of input; in
-  WebAssembly, which has no thread to look, it sends none. Standard output
-  and standard error drop `O_ASYNC`, where Linux's pipe, socket or terminal
-  keeps it.
+  Linux's pipe or terminal sends one for every piece of input. Standard
+  output and standard error, looked at the same way, send it once each
+  time they have room again after being full, where Linux's pipe signals
+  its writer at every read of its reader. In WebAssembly, which has no
+  thread to look, they send none.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for

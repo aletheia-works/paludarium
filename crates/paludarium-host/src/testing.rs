@@ -21,6 +21,9 @@ struct Streams {
     stdin_live: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// Whether standard output and standard error are full, as a pipe whose
+    /// reader is slow ([`RecordingHost::set_output_full`]).
+    output_full: [bool; 2],
     network: bool,
 }
 
@@ -37,6 +40,7 @@ impl Default for Streams {
             stdin_live: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            output_full: [false; 2],
             network: false,
         }
     }
@@ -99,6 +103,13 @@ impl RecordingHost {
     /// differential tests of guests that use one.
     pub fn enable_network(&self) {
         self.lock().network = true;
+    }
+    /// Makes standard output (`channel` 1) or standard error (2) full, or
+    /// gives it room again, for [`Host::output_writable`]; writes still go.
+    pub fn set_output_full(&self, channel: u32, full: bool) {
+        if let Some(full_now) = self.lock().output_full.get_mut(channel as usize - 1) {
+            *full_now = full;
+        }
     }
     /// Ends standard input, which is then readable at its end.
     pub fn close_stdin(&self) {
@@ -196,6 +207,15 @@ impl Host for RecordingHost {
     /// pipe or terminal, which Linux signals with `O_ASYNC`.
     fn stdin_signals(&self) -> bool {
         self.lock().stdin_live
+    }
+    /// The recorded output streams stand for the pipes a test reads them
+    /// through.
+    fn output_signals(&self, channel: u32) -> bool {
+        matches!(channel, 1 | 2)
+    }
+    fn output_writable(&self, channel: u32) -> Option<bool> {
+        let index = (channel as usize).checked_sub(1)?;
+        self.lock().output_full.get(index).map(|full| !full)
     }
     fn read_stdin(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let mut s = self.lock();

@@ -4258,6 +4258,14 @@ int main(int argc, char **argv) {
         on = 1;
         result("fionbio", ioctl(0, FIONBIO, &on));
         result("getfl-fionbio", fcntl(0, F_GETFL) & (O_NONBLOCK | O_ASYNC | O_APPEND));
+        /* Standard output is a pipe natively, which has fasync. */
+        result("async-out", fcntl(1, F_SETFL, O_ASYNC));
+        result("getfl-async-out", fcntl(1, F_GETFL) & (O_ACCMODE | O_ASYNC));
+        on = 0;
+        result("fioasync-out-off", ioctl(1, FIOASYNC, &on));
+        on = 1;
+        result("fioasync-out", ioctl(1, FIOASYNC, &on));
+        result("getfl-fioasync-out", fcntl(1, F_GETFL) & (O_ACCMODE | O_ASYNC));
         result("append", fcntl(1, F_SETFL, O_APPEND));
         result("getfl-out", fcntl(1, F_GETFL) & (O_ACCMODE | O_NONBLOCK | O_APPEND));
         result("getfl-err", fcntl(2, F_GETFL) & (O_ACCMODE | O_NONBLOCK | O_APPEND));

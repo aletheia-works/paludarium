@@ -2090,8 +2090,8 @@ pub(crate) struct StandardFile {
 /// only a file with `fasync` keeps): `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`
 /// and `O_NOATIME`.
 const SETFL_FLAGS: u32 = 0o2000 | 0o4000 | 0o40000 | 0o1000000;
-/// How often a thread looks at the host's standard input for `O_ASYNC`.
-const STDIN_WATCH: std::time::Duration = std::time::Duration::from_millis(10);
+/// How often a thread looks at a host's standard stream for `O_ASYNC`.
+const STREAM_WATCH: std::time::Duration = std::time::Duration::from_millis(10);
 impl StandardFile {
     fn new(host: &Arc<dyn paludarium_host::Host>, channel: u32) -> Self {
         Self {
@@ -2109,16 +2109,30 @@ impl StandardFile {
     fn stdin_ready(&self) -> bool {
         self.host.stdin_state() != Some(paludarium_host::StdinState::Waiting)
     }
-    /// Whether this is the host's standard input, which signals with
-    /// `O_ASYNC` as a pipe, socket or terminal does.
+    /// Whether this stream is ready for what its `O_ASYNC` signals: input
+    /// to read, or output with room; where the host cannot tell, always.
+    fn ready(&self) -> bool {
+        if self.channel == 0 {
+            self.stdin_ready()
+        } else {
+            self.host.output_writable(self.channel) != Some(false)
+        }
+    }
+    /// Whether the host's stream behind this one is a pipe, socket or
+    /// terminal, which signals with `O_ASYNC`.
     pub(crate) fn signals(&self) -> bool {
-        self.channel == 0 && self.host.stdin_signals()
+        if self.channel == 0 {
+            self.host.stdin_signals()
+        } else {
+            self.host.output_signals(self.channel)
+        }
     }
     /// `F_SETFL` turning `O_ASYNC` on, with its registration, or off. The
-    /// host's input changes outside the emulator, so a thread looks at it
-    /// every [`STDIN_WATCH`] while `O_ASYNC` is on, and sends `SIGIO`
-    /// (`POLL_IN`) each time it has something where it had nothing, as
-    /// Linux's pipe and terminal do when input comes. A host without
+    /// host's streams change outside the emulator, so a thread looks at the
+    /// stream every [`STREAM_WATCH`] while `O_ASYNC` is on, and sends `SIGIO`
+    /// each time it becomes ready ([`StandardFile::ready`]) after it was
+    /// not: `POLL_IN` for input that comes, as Linux's pipe and terminal do,
+    /// and `POLL_OUT` for output that has room again. A host without
     /// threads (WebAssembly) sends none.
     pub(crate) fn set_async(
         &self,
@@ -2134,32 +2148,39 @@ impl StandardFile {
             return;
         }
         let file = Arc::downgrade(file);
-        // Taken now, so that input coming before the thread first looks
-        // still counts.
-        let mut was = self.stdin_ready();
+        // Taken now, so that a change before the thread first looks still
+        // counts.
+        let mut was = self.ready();
+        let reason = if self.channel == 0 {
+            crate::fasync::Reason::In
+        } else {
+            crate::fasync::Reason::Out
+        };
         let started = self.host.spawn_thread(Box::new(move || {
             loop {
-                std::thread::sleep(STDIN_WATCH);
+                std::thread::sleep(STREAM_WATCH);
                 let Some(file) = file.upgrade() else { return };
-                let Some(stdin) = standard(&file) else { return };
+                let Some(stream) = standard(&file) else {
+                    return;
+                };
                 let to = {
-                    let kept = stdin
+                    let kept = stream
                         .registration
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     let Some(to) = kept.clone() else {
-                        stdin.watching.store(false, Ordering::SeqCst);
+                        stream.watching.store(false, Ordering::SeqCst);
                         return;
                     };
                     to
                 };
-                let ready = stdin.stdin_ready();
+                let ready = stream.ready();
                 if ready
                     && !was
                     && let Some(processes) = to.processes.upgrade()
                 {
                     let owner = processes.file_owner(&file);
-                    processes.send_io(owner, to.fd, crate::fasync::Reason::In);
+                    processes.send_io(owner, to.fd, reason);
                 }
                 was = ready;
             }

@@ -206,6 +206,18 @@ pub trait Host: Send + Sync {
     fn stdin_signals(&self) -> bool {
         false
     }
+    /// Whether the host's standard output (`channel` 1) or standard error
+    /// (2) is a pipe, a socket or a terminal, which Linux signals with
+    /// `O_ASYNC`; not one where the host cannot tell.
+    fn output_signals(&self, _channel: u32) -> bool {
+        false
+    }
+    /// Whether a write to the host's standard output (`channel` 1) or
+    /// standard error (2) would find room now; `None` where the host cannot
+    /// tell.
+    fn output_writable(&self, _channel: u32) -> Option<bool> {
+        None
+    }
     /// Writes to the host's standard output; returns the bytes written.
     fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno>;
     /// Writes to the host's standard error; returns the bytes written.
@@ -256,6 +268,19 @@ pub trait Host: Send + Sync {
     ) -> Result<Option<core::net::IpAddr>, Errno> {
         Ok(None)
     }
+}
+
+/// Whether `stream` is a pipe, a socket or a terminal: the files Linux has
+/// `fasync` for.
+#[cfg(unix)]
+fn signals(stream: &(impl rustix::fd::AsFd + std::io::IsTerminal)) -> bool {
+    stream.is_terminal()
+        || rustix::fs::fstat(stream).is_ok_and(|stat| {
+            matches!(
+                rustix::fs::FileType::from_raw_mode(stat.st_mode),
+                rustix::fs::FileType::Fifo | rustix::fs::FileType::Socket
+            )
+        })
 }
 
 /// Maps a host I/O error to the errno the guest sees.
@@ -359,19 +384,52 @@ impl Host for NativeHost {
     fn stdin_signals(&self) -> bool {
         #[cfg(unix)]
         {
-            use std::io::IsTerminal;
-            let stdin = io::stdin();
-            stdin.is_terminal()
-                || rustix::fs::fstat(&stdin).is_ok_and(|stat| {
-                    matches!(
-                        rustix::fs::FileType::from_raw_mode(stat.st_mode),
-                        rustix::fs::FileType::Fifo | rustix::fs::FileType::Socket
-                    )
-                })
+            signals(&io::stdin())
         }
         #[cfg(not(unix))]
         {
             false
+        }
+    }
+    fn output_signals(&self, channel: u32) -> bool {
+        #[cfg(unix)]
+        {
+            match channel {
+                1 => signals(&io::stdout()),
+                2 => signals(&io::stderr()),
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = channel;
+            false
+        }
+    }
+    /// A poll for `POLLOUT` that does not wait, on a Unix host.
+    fn output_writable(&self, channel: u32) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            use rustix::event::{PollFd, PollFlags, Timespec};
+            let now = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let writable = |fd: &dyn rustix::fd::AsFd| {
+                let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+                rustix::event::poll(&mut fds, Some(&now)).ok()?;
+                Some(fds[0].revents().contains(PollFlags::OUT))
+            };
+            match channel {
+                1 => writable(&io::stdout()),
+                2 => writable(&io::stderr()),
+                _ => None,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = channel;
+            None
         }
     }
 

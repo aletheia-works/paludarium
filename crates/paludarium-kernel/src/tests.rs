@@ -2055,6 +2055,39 @@ mod stdin_readiness {
         assert_eq!(f.ret(72, &[0, 3]), 0);
     }
     #[test]
+    fn standard_output_signals_its_owner_when_it_has_room_again() {
+        // The recorded output stands for a pipe: it keeps O_ASYNC, and
+        // FIOASYNC takes it, as on Linux.
+        let mut f = fixture();
+        let pid = f.ret(39, &[]);
+        assert_eq!(f.ret(72, &[1, 8, pid]), 0);
+        f.mem.write_u64(GuestAddr(DATA + 64), 1 << 28).unwrap();
+        assert_eq!(f.ret(14, &[0, DATA + 64, 0, 8]), 0);
+        f.mem
+            .write(GuestAddr(DATA + 80), &1u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(16, &[1, 0x5452, DATA + 80]), 0);
+        assert_eq!(f.ret(72, &[1, 3]), 0o20001);
+        let pending = |f: &mut Fixture| {
+            assert_eq!(f.ret(127, &[DATA + 72, 8]), 0);
+            f.mem.read_u64(GuestAddr(DATA + 72)).unwrap() & 1 << 28 != 0
+        };
+        // Room all along: nothing. Full, then room again: SIGIO.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!pending(&mut f));
+        f.host.set_output_full(1, true);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!pending(&mut f));
+        f.host.set_output_full(1, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pending(&mut f) {
+            assert!(std::time::Instant::now() < deadline, "no SIGIO");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(f.ret(72, &[1, 4, 0]), 0);
+        assert_eq!(f.ret(72, &[1, 3]), 1);
+    }
+    #[test]
     fn a_host_that_cannot_tell_keeps_standard_input_ready() {
         // A preset buffer that has ended, as before: always ready.
         let mut f = fixture();

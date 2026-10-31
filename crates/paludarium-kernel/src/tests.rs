@@ -2060,6 +2060,11 @@ mod stdin_readiness {
         // what ends a kernel wait ends it (EINTR), as a signal does on Linux.
         let mut f = fixture();
         f.host.open_stdin();
+        // An empty read reads nothing at once, blocking or not.
+        assert_eq!(f.ret(0, &[0, DATA + 256, 0]), 0);
+        assert_eq!(f.ret(72, &[0, 4, 0x800]), 0);
+        assert_eq!(f.ret(0, &[0, DATA + 256, 0]), 0);
+        assert_eq!(f.ret(72, &[0, 4, 0]), 0);
         f.kernel
             .cancellation
             .store(true, std::sync::atomic::Ordering::SeqCst);

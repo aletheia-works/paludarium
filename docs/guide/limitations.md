@@ -125,8 +125,9 @@ verified.
   `memfd` and other in-memory files are 4096 on Linux too.
 - **Standard input on Windows**: `poll`, `select` and `epoll` see the host's
   standard input as always readable, as the Windows host cannot tell whether
-  input is waiting; on Linux and macOS hosts and in WebAssembly it is
-  readable only with input or at its end.
+  input is waiting, and a read of it with `O_NONBLOCK` waits for input
+  rather than being `EAGAIN`; on Linux and macOS hosts and in WebAssembly
+  it is readable only with input or at its end.
 - **`FIONREAD` and `SIOCOUTQ` on the host's standard streams**: both return
   `ENOTTY`, where Linux answers for what is behind them: `FIONREAD` for a
   pipe, terminal, socket or regular file, `SIOCOUTQ` for a terminal or

@@ -111,7 +111,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   では、Linux の `FIGETBSZ` は `EINVAL` です。パイプ、ソケット、`memfd` などのメモリの
   上のファイルは、Linux でも 4096 です。
 - **Windows の標準入力**：Windows のホストは入力が届いているかを見分けられないので、
-  `poll`・`select`・`epoll` はホストの標準入力をいつも読めると見ます。Linux と macOS の
+  `poll`・`select`・`epoll` はホストの標準入力をいつも読めると見ます。`O_NONBLOCK` を
+  付けた読み込みも、`EAGAIN` にならずに入力を待ちます。Linux と macOS の
   ホストと WebAssembly では、入力があるときか終わったときだけ読めます。
 - **ホストの標準入出力への `FIONREAD` と `SIOCOUTQ`**：どちらも `ENOTTY` を返します。
   Linux では、その先にあるものについて答えます。`FIONREAD` はパイプ、端末、ソケット、

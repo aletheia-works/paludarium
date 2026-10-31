@@ -731,7 +731,7 @@ impl HostFs for NativeFs {
     /// without root (macOS) or at all, so it stays `EPERM` there.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn make_socket(&self, p: &[u8], m: u32) -> Result<FileStat, Errno> {
-        use rustix::fs::{AtFlags, FileType, Mode};
+        use rustix::fs::{FileType, Mode, OFlags};
         let relative = path(p)?;
         let name = relative.file_name().ok_or(Errno::EEXIST)?;
         let dir = match relative.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -740,8 +740,25 @@ impl HostFs for NativeFs {
         }
         .map_err(err)?;
         let mode = Mode::from_raw_mode(m & 0o7777);
-        rustix::fs::mknodat(&dir, name, FileType::Socket, mode, 0).map_err(|e| err(e.into()))?;
-        rustix::fs::chmodat(&dir, name, mode, AtFlags::empty()).map_err(|e| err(e.into()))?;
+        let fail = |e: rustix::io::Errno| err(e.into());
+        rustix::fs::mknodat(&dir, name, FileType::Socket, mode, 0).map_err(fail)?;
+        // The umask took bits away. The node itself, not whatever its name
+        // may meanwhile lead to, gets them back: `fchmodat` cannot refuse
+        // to follow a symbolic link, so through a descriptor of the node.
+        let node = rustix::fs::openat(
+            &dir,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(fail)?;
+        if FileType::from_raw_mode(rustix::fs::fstat(&node).map_err(fail)?.st_mode)
+            != FileType::Socket
+        {
+            return Err(Errno::EEXIST);
+        }
+        let own = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&node));
+        rustix::fs::chmod(own.as_str(), mode).map_err(fail)?;
         self.metadata(p, false)
     }
     fn mkdir(&self, p: &[u8], m: u32) -> Result<(), Errno> {
@@ -934,6 +951,8 @@ mod files_tests {
         } else {
             assert_eq!(made, Err(Errno::EPERM));
         }
+        // Windows keeps the mounted directory open while its handle lives.
+        drop(fs);
         std::fs::remove_dir_all(base).unwrap();
     }
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -726,8 +726,8 @@ impl HostFs for NativeFs {
         .map_err(err)
     }
     /// On a Linux host, a socket node made with `mknodat` in the mounted
-    /// directory, with exactly the permission bits of `m` (the host's umask
-    /// does not apply). Other hosts cannot make one inside the mount
+    /// directory, with exactly the permission bits of `m` where `/proc` is
+    /// mounted (otherwise the host's umask takes some away). Other hosts cannot make one inside the mount
     /// without root (macOS) or at all, so it stays `EPERM` there.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn make_socket(&self, p: &[u8], m: u32) -> Result<FileStat, Errno> {
@@ -755,10 +755,13 @@ impl HostFs for NativeFs {
         if FileType::from_raw_mode(rustix::fs::fstat(&node).map_err(fail)?.st_mode)
             != FileType::Socket
         {
+            // Something else took the name since: not ours to remove.
             return Err(Errno::EEXIST);
         }
+        // Without `/proc` (a chroot, a minimal container) the node keeps
+        // the bits the host's umask left it, still a socket file that works.
         let own = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&node));
-        rustix::fs::chmod(own.as_str(), mode).map_err(fail)?;
+        let _ = rustix::fs::chmod(own.as_str(), mode);
         self.metadata(p, false)
     }
     fn mkdir(&self, p: &[u8], m: u32) -> Result<(), Errno> {
@@ -934,8 +937,11 @@ mod files_tests {
     }
     #[test]
     fn make_socket_makes_a_socket_node_on_linux_hosts() {
-        let base =
-            std::env::temp_dir().join(format!("paludarium-socket-node-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!(
+            "paludarium-socket-node-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(base.join("root/dir")).unwrap();
         let fs = NativeFs::new(&base.join("root")).unwrap();
         let made = fs.make_socket(b"dir/s", 0o751);

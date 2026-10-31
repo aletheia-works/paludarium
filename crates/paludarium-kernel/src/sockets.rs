@@ -1847,8 +1847,6 @@ pub(crate) struct SocketPairEnd {
     /// What the datagrams this end sent and that wait take of its send
     /// buffer ([`Charge`]), as Linux's `sk_wmem_alloc`.
     sent: Arc<AtomicUsize>,
-    /// Its last datagram found no room in the send buffer.
-    no_room: AtomicBool,
 }
 impl SocketPairEnd {
     /// `SO_SNDBUF` on this end, as Linux keeps it, doubled.
@@ -2012,7 +2010,6 @@ impl SocketPairEnd {
                 unix: std::sync::OnceLock::new(),
                 unconnected: AtomicBool::new(false),
                 sent: Arc::default(),
-                no_room: AtomicBool::new(false),
             })
         }))
     }
@@ -2691,12 +2688,15 @@ static COLLECTION: Mutex<()> = Mutex::new(());
 thread_local! {
     /// This thread is collecting: the sockets it closes start none.
     static COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread's last datagram found no room in its sender's send
+    /// buffer: the send's own answer, which no other thread's send on the
+    /// socket changes.
+    static NO_ROOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-/// Whether `file` is a datagram socket whose send just found no room in
-/// its send buffer, rather than a full queue at the receiver.
+/// Whether this thread's datagram send on `file` just found no room in its
+/// send buffer, rather than a full queue at the receiver.
 pub(crate) fn out_of_room(file: &Arc<dyn FileHandle>) -> bool {
-    socket_end(file)
-        .is_some_and(|end| end.pair.kind == SOCK_DGRAM && end.no_room.load(Ordering::SeqCst))
+    NO_ROOM.replace(false) && socket_end(file).is_some_and(|end| end.pair.kind == SOCK_DGRAM)
 }
 /// Whether a datagram socket `file` still has too little room to wake a
 /// sender that found none: Linux's `unix_write_space` wakes a sender in
@@ -3025,7 +3025,7 @@ impl SocketPairEnd {
         // waits for. Linux looks for room before it looks for the peer,
         // so an unconnected socket with none is EAGAIN, not ENOTCONN.
         let full = self.sent.load(Ordering::SeqCst) >= self.send_buffer();
-        self.no_room.store(full, Ordering::SeqCst);
+        NO_ROOM.set(full);
         if full {
             return Err(Errno::EAGAIN);
         }
@@ -3186,6 +3186,9 @@ impl SocketPairEnd {
             .unwrap_or_else(PoisonError::into_inner);
         // As Linux's unix_maybe_add_creds, as the write is sent.
         let credentials = sender.credentials(passes(&sides[0]) || passes(&sides[1]));
+        // Every guest datagram socket is an AF_UNIX socket's, which sends
+        // through `send_datagram`: only the bare pairs of unit tests come
+        // here with a datagram.
         if self.pair.kind == SOCK_DGRAM {
             // unix_dgram_sendmsg's order: the size, this side's shutdown and
             // send buffer, then the peer.

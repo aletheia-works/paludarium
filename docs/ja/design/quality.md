@@ -46,6 +46,7 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
     扱います。
   - 自分のスレッドとタイマーの番号が見えます。
   - `FIOQSIZE` を通しません。
+  - Linux が `EINVAL` で断る `socket` の種類のフラグを受け付けます。
 
   Docker 自身のカーネルはデータグラムのバッファの数え方が違い、遅い native の側は
   時間切れになることがあります。`mise run linux-dev-compare` は、そこでテストを

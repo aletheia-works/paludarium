@@ -48,7 +48,8 @@ CI run produces them afresh on an x86-64 Linux runner.
   - handles `SA_NOCLDSTOP`, `SA_NOCLDWAIT`, `F_SETSIG`, core dumps and
     `sigqueue` itself;
   - shows its own threads and timer numbers;
-  - does not pass `FIOQSIZE` on.
+  - does not pass `FIOQSIZE` on;
+  - takes `socket` type flags Linux refuses with `EINVAL`.
 
   Docker's own kernel counts a datagram's buffer differently, and the
   slower native side can time out. `mise run linux-dev-compare` runs the

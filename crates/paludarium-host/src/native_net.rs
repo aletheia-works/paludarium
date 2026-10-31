@@ -108,6 +108,21 @@ fn send(stream: &Stream, mut socket: TcpStream) {
     }
 }
 
+/// The host's address a datagram to `address` leaves from: a UDP socket
+/// connected there takes it from the host's routes, sending nothing.
+pub(crate) fn route_source(address: SocketAddr) -> Result<IpAddr, Errno> {
+    let any: SocketAddr = if address.is_ipv4() {
+        (core::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (core::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    // The port plays no part in the route, and some hosts refuse port 0.
+    let to = SocketAddr::new(address.ip(), address.port().max(1));
+    let socket = std::net::UdpSocket::bind(any).map_err(|e| errno_from_net(&e))?;
+    socket.connect(to).map_err(|e| errno_from_net(&e))?;
+    Ok(socket.local_addr().map_err(|e| errno_from_net(&e))?.ip())
+}
+
 /// Starts resolving `name` with the host's resolver.
 pub(crate) fn resolve(name: &str) -> Result<Arc<Lookup>, Errno> {
     let lookup = Lookup::new();

@@ -1184,8 +1184,8 @@ impl InetSocket {
 
     /// `connect` of a UDP socket: it binds a port on every address if it had
     /// none, even when the connect then fails, and then sends to `address`
-    /// and takes datagrams only from it, on the loopback from that port on
-    /// the loopback's source address
+    /// and takes datagrams only from it, from that port on the source
+    /// address of the route: the loopback's, or elsewhere the host's
     /// (`inet_dgram_connect`, `ip4_datagram_connect`). AF_UNSPEC disconnects
     /// (`__udp_disconnect`), keeping only what the guest bound itself.
     fn connect_datagram(&self, address: Option<SocketAddr>) -> Result<u64, Errno> {
@@ -1217,10 +1217,19 @@ impl InetSocket {
                 s.peer = Some(to);
             }
             None => {
-                // Off the loopback the port stays on every address, as the
-                // guest has no address of its own there; connected there,
-                // the socket takes no datagram from the loopback.
-                self.ports().connect(&self.this, bound, Some(to));
+                // Off the loopback the port moves to the host's address the
+                // route leaves from (`ip_route_connect`), unless the guest
+                // bound an address; a host that cannot tell keeps it on every
+                // address. Connected there, the socket takes no datagram from
+                // the loopback.
+                let from = match self.host.route_source(to)? {
+                    Some(ip) if bound.ip().is_unspecified() => {
+                        SocketAddr::new(plain(ip), bound.port())
+                    }
+                    _ => bound,
+                };
+                self.ports().connect(&self.this, from, Some(to));
+                s.bound = Some(from);
                 s.peer = Some(address);
             }
         }

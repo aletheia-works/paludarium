@@ -234,4 +234,15 @@ impl Host for RecordingHost {
         let _ = name;
         Err(crate::net::UNREACHABLE)
     }
+    fn route_source(
+        &self,
+        address: core::net::SocketAddr,
+    ) -> Result<Option<core::net::IpAddr>, Errno> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.lock().network {
+            return crate::native_net::route_source(address).map(Some);
+        }
+        let _ = address;
+        Ok(None)
+    }
 }

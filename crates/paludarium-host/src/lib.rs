@@ -241,6 +241,15 @@ pub trait Host: Send + Sync {
     fn resolve(&self, _name: &str) -> Result<std::sync::Arc<net::Lookup>, Errno> {
         Err(net::UNREACHABLE)
     }
+    /// The host's address a datagram to `address` would leave from, as its
+    /// routes pick it, without sending anything; `None` where the host
+    /// cannot tell, and the error of an address it has no route to.
+    fn route_source(
+        &self,
+        _address: core::net::SocketAddr,
+    ) -> Result<Option<core::net::IpAddr>, Errno> {
+        Ok(None)
+    }
 }
 
 /// Maps a host I/O error to the errno the guest sees.
@@ -353,6 +362,12 @@ impl Host for NativeHost {
     }
     fn resolve(&self, name: &str) -> Result<std::sync::Arc<net::Lookup>, Errno> {
         native_net::resolve(name)
+    }
+    fn route_source(
+        &self,
+        address: core::net::SocketAddr,
+    ) -> Result<Option<core::net::IpAddr>, Errno> {
+        native_net::route_source(address).map(Some)
     }
 
     fn write_stderr(&self, buf: &[u8]) -> Result<usize, Errno> {

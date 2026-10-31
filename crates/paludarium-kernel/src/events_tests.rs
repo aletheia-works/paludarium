@@ -282,6 +282,9 @@ struct TestHost {
     /// The connections and lookups the guest started, for a test to drive.
     streams: Mutex<Vec<Arc<paludarium_host::net::Stream>>>,
     lookups: Mutex<Vec<(String, Arc<paludarium_host::net::Lookup>)>>,
+    /// What the host's routes give as the source address, once a test sets
+    /// it; unset, the host cannot tell.
+    route: Mutex<Option<Result<core::net::IpAddr, Errno>>>,
 }
 impl Host for TestHost {
     fn connect(
@@ -302,6 +305,12 @@ impl Host for TestHost {
             .unwrap_or_else(PoisonError::into_inner)
             .push((name.to_owned(), Arc::clone(&lookup)));
         Ok(lookup)
+    }
+    fn route_source(&self, _: core::net::SocketAddr) -> Result<Option<core::net::IpAddr>, Errno> {
+        self.route
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map_or(Ok(None), |route| route.map(Some))
     }
     fn read_stdin(&self, _: &mut [u8]) -> Result<usize, Errno> {
         Ok(0)
@@ -2096,11 +2105,49 @@ fn loopback_udp_datagrams() {
     );
 }
 #[test]
+fn a_udp_connect_off_the_loopback_takes_the_route_source() {
+    let mut f = network_fixture(&[]);
+    *f.host.route.lock().unwrap() = Some(Ok(core::net::IpAddr::from([10, 0, 2, 15])));
+    let u = f.ret(41, [2, 2 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 9);
+    assert_eq!(f.ret(42, [u, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let name = name_of(&mut f, 51, u);
+    assert_eq!(&name[4..8], &[10, 0, 2, 15]);
+    let port = u16::from_be_bytes([name[2], name[3]]);
+    // The port is held on that address only: the loopback's is free, every
+    // address is not.
+    let bind_on = |f: &mut Fixture, ip: [u8; 4]| {
+        let fd = f.ret(41, [2, 2, 0, 0, 0, 0]);
+        inet_address(f, DATA + 0x100, ip, port);
+        f.ret(49, [fd, DATA + 0x100, 16, 0, 0, 0])
+    };
+    assert_eq!(bind_on(&mut f, [127, 0, 0, 1]), 0);
+    assert_eq!(bind_on(&mut f, [0, 0, 0, 0]), Errno(98).to_syscall_return());
+    // A bound address stays, and AF_UNSPEC gives the rest back.
+    f.mem.write(GuestAddr(DATA + 0x100), &[0u8; 16]).unwrap();
+    assert_eq!(f.ret(42, [u, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(name_of(&mut f, 51, u)[..8], [2, 0, 0, 0, 0, 0, 0, 0]);
+    let mine = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 0);
+    assert_eq!(f.ret(49, [mine, DATA + 0x100, 16, 0, 0, 0]), 0);
+    inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 9);
+    assert_eq!(f.ret(42, [mine, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(&name_of(&mut f, 51, mine)[4..8], &[127, 0, 0, 1]);
+    // No route: the connect fails, with its port taken first.
+    *f.host.route.lock().unwrap() = Some(Err(Errno(101)));
+    let lost = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(42, [lost, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(101).to_syscall_return()
+    );
+    assert_ne!(&name_of(&mut f, 51, lost)[2..4], &[0, 0]);
+}
+#[test]
 fn a_udp_connect_off_the_loopback_takes_a_port() {
     let mut f = network_fixture(&[]);
     let udp = |f: &mut Fixture, family: u64| f.ret(41, [family, 2 | 0x800, 0, 0, 0, 0]);
-    // Connected elsewhere, the socket takes a port on every address, as
-    // the guest has no address of its own there.
+    // Connected elsewhere on a host that cannot tell the route's source,
+    // the socket keeps its port on every address.
     let u = udp(&mut f, 2);
     inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 9);
     assert_eq!(f.ret(42, [u, DATA + 0x100, 16, 0, 0, 0]), 0);

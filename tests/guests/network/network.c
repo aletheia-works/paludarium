@@ -1688,16 +1688,31 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "udp-elsewhere")) {
         /* connect of a UDP socket to an address off the loopback binds a
-           port first (inet_autobind), which then takes no datagram from the
-           loopback and is held until AF_UNSPEC gives it back. The source
-           address is not printed: Linux's is the route's, while the
-           emulator's guest has no address of its own off the loopback. */
+           port first (inet_autobind), which then moves to the route's source
+           address (ip_route_connect), takes no datagram from the loopback,
+           and is held until AF_UNSPEC gives it back. The address itself is
+           the machine's, so only how it compares is printed. */
         int u = socket(AF_INET, SOCK_DGRAM, 0);
         struct sockaddr_in far = {.sin_family = AF_INET, .sin_port = htons(9)};
         far.sin_addr.s_addr = htonl(0xc0000201);
         call("connect", connect(u, (void *)&far, sizeof far));
         int port = port_of(u);
         printf("  port-ok=%d\n", port != 0);
+        struct sockaddr_in source, again;
+        socklen_t source_len = sizeof source;
+        getsockname(u, (void *)&source, &source_len);
+        in_addr_t ip = ntohl(source.sin_addr.s_addr);
+        printf("  source-specific=%d\n", ip != 0 && ip >> 24 != 127);
+        int probe = socket(AF_INET, SOCK_DGRAM, 0);
+        connect(probe, (void *)&far, sizeof far);
+        source_len = sizeof again;
+        getsockname(probe, (void *)&again, &source_len);
+        printf("  same-source=%d\n", again.sin_addr.s_addr == source.sin_addr.s_addr);
+        close(probe);
+        /* The port is held on that address only. */
+        int beside = socket(AF_INET, SOCK_DGRAM, 0);
+        bind_to("bind-loopback", beside, htonl(INADDR_LOOPBACK), port);
+        close(beside);
         struct sockaddr_in peer;
         socklen_t len = sizeof peer;
         call("getpeername", getpeername(u, (void *)&peer, &len));

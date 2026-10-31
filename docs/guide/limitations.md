@@ -18,11 +18,12 @@ verified.
     addresses and the unspecified one (`EADDRNOTAVAIL` for any other, where
     Linux takes each of the machine's own).
   - A UDP socket reaches the DNS stub and the guest's own sockets on the
-    loopback; a datagram to any other address is `ENETUNREACH`. One
-    connected elsewhere takes its port on every address, as the guest has
-    no address of its own there, where Linux takes it on the route's source
-    address: `getsockname` gives the unspecified address, and a `bind` of
-    that port on a loopback address is `EADDRINUSE`, where Linux allows it.
+    loopback; a datagram to any other address is `ENETUNREACH`. In
+    WebAssembly, which cannot see the host's routes, one connected
+    elsewhere keeps its port on every address, where Linux takes it on the
+    route's source address: `getsockname` gives the unspecified address,
+    and a `bind` of that port on a loopback address is `EADDRINUSE`, where
+    Linux allows it.
     Multicast and broadcast datagrams reach no one. Raw sockets are `EPERM`,
     ICMP sockets `EACCES`, and other kinds (SCTP's `SOCK_SEQPACKET`, which
     Linux loads a module for) `ESOCKTNOSUPPORT`.

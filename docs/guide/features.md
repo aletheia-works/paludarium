@@ -726,6 +726,12 @@ one only with an `--allow-net`.
   not. The close succeeds all the same, and the bytes still go after it.
   A socket with unread input is reset instead, and a process that exits
   does not wait.
+- **Buffers**: the `SO_SNDBUF` a sender set, and the `SO_RCVBUF` a
+  receiver set (an accepted connection takes its listener's), bound a
+  connection as Linux's do, roughly: what waits to be sent holds up to the
+  doubled `SO_SNDBUF`, and what has arrived up to half of the doubled
+  `SO_RCVBUF`, so a small one makes a sender wait or `EAGAIN` early. One
+  not set holds 256 KiB. `SIOCOUTQ` and `FIONREAD` count the two.
 - **Urgent data**, as Linux's TCP keeps it: the last byte of a `MSG_OOB`
   send is urgent and reaches the peer with the bytes before it. Reads
   stop before its mark, which `SIOCATMARK` reports and `FIONREAD` counts

@@ -1536,6 +1536,68 @@ fn a_loopback_close_lingers_while_its_bytes_wait() {
     }
 }
 #[test]
+fn loopback_buffers_follow_the_sizes_the_guest_sets() {
+    let mut f = network_fixture(&[]);
+    let set = |f: &mut Fixture, fd: u64, name: u64, bytes: u32| {
+        f.mem
+            .write(GuestAddr(DATA + 0x200), &bytes.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(54, [fd, 1, name, DATA + 0x200, 4, 0]), 0);
+    };
+    // Writes 4 KiB at a time without waiting until nothing more fits.
+    let fill = |f: &mut Fixture, fd: u64| {
+        let mut sent = 0;
+        loop {
+            let r = f.ret(44, [fd, DATA, 0x1000, 0x40, 0, 0]);
+            if r == Errno::EAGAIN.to_syscall_return() {
+                return sent;
+            }
+            sent += r;
+        }
+    };
+    let drain = |f: &mut Fixture, fd: u64| {
+        let mut got = 0;
+        loop {
+            let r = f.ret(45, [fd, DATA + 0x1000, 0x1000, 0x40, 0, 0]);
+            if r == Errno::EAGAIN.to_syscall_return() {
+                return got;
+            }
+            got += r;
+        }
+    };
+    // Unset, each way holds 256 KiB.
+    let (listener, port) = loopback_listener(&mut f, 8);
+    let client = loopback_client(&mut f, port);
+    let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
+    let whole = 2 * paludarium_host::net::BUFFER as u64;
+    assert_eq!(fill(&mut f, client), whole);
+    assert_eq!(drain(&mut f, server), whole);
+    // SO_SNDBUF 4096 (8192 doubled) on the client, SO_RCVBUF 4096 on the
+    // listener, which its connections take: 8192 waiting, 4096 arrived.
+    let small = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    set(&mut f, small, 8, 4096);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 0);
+    assert_eq!(f.ret(49, [small, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [small, 8, 0, 0, 0, 0]), 0);
+    let name = name_of(&mut f, 51, small);
+    let client = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    set(&mut f, client, 7, 4096);
+    inet_address(
+        &f,
+        DATA + 0x100,
+        [127, 0, 0, 1],
+        u16::from_be_bytes([name[2], name[3]]),
+    );
+    assert_eq!(f.ret(42, [client, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let server = f.ret(43, [small, 0, 0, 0, 0, 0]);
+    assert_eq!(fill(&mut f, client), 12288);
+    // Reading moves more along, and a larger SO_SNDBUF set later takes
+    // more at once.
+    assert_eq!(drain(&mut f, server), 12288);
+    set(&mut f, client, 7, 16384);
+    assert_eq!(fill(&mut f, client), 32768 + 4096);
+}
+#[test]
 fn loopback_time_wait_holds_the_port_closed_first() {
     let mut f = network_fixture(&[]);
     let bind_on = |f: &mut Fixture, port: u16, reuse: bool| {

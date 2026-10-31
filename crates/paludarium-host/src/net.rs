@@ -11,7 +11,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// The most bytes a stream holds in each direction before reads wait for
-/// the guest (receiving) or writes wait for the host (sending).
+/// the guest (receiving) or writes wait for the host (sending), unless the
+/// kernel sets other limits ([`Stream::set_limits`]).
 pub const BUFFER: usize = 256 * 1024;
 
 /// `ENETUNREACH`: what a host without a network answers.
@@ -74,6 +75,9 @@ struct State {
     received: VecDeque<u8>,
     received_end: bool,
     sending: VecDeque<u8>,
+    /// The most bytes `received` and `sending` hold.
+    receive_limit: usize,
+    send_limit: usize,
     send_shut: bool,
     closed: bool,
     arrivals: u64,
@@ -106,6 +110,8 @@ impl Stream {
                 received: VecDeque::new(),
                 received_end: false,
                 sending: VecDeque::new(),
+                receive_limit: BUFFER,
+                send_limit: BUFFER,
                 send_shut: false,
                 closed: false,
                 arrivals: 0,
@@ -119,6 +125,17 @@ impl Stream {
     }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// The most bytes the stream holds to send and received, [`BUFFER`]
+    /// each until set. A larger limit lets the guest write or the driver
+    /// deliver more at once.
+    pub fn set_limits(&self, send: usize, receive: usize) {
+        {
+            let mut s = self.lock();
+            s.send_limit = send;
+            s.receive_limit = receive;
+        }
+        self.kick();
     }
     /// The driver the kernel tells of its changes.
     pub fn set_driver(&self, driver: Arc<dyn Driver>) {
@@ -178,7 +195,7 @@ impl Stream {
                 *to = *from;
             }
             if !peek {
-                let was_full = s.received.len() >= BUFFER;
+                let was_full = s.received.len() >= s.receive_limit;
                 s.received.drain(..n);
                 drop(s);
                 if was_full {
@@ -203,7 +220,7 @@ impl Stream {
         if s.send_shut || s.closed {
             return Err(Errno::EPIPE);
         }
-        let room = BUFFER.saturating_sub(s.sending.len());
+        let room = s.send_limit.saturating_sub(s.sending.len());
         if s.phase == Phase::Connecting || room == 0 {
             return Err(Errno::EAGAIN);
         }
@@ -231,7 +248,7 @@ impl Stream {
         let open = s.phase == Phase::Open;
         Readiness {
             readable: !s.received.is_empty() || s.received_end || failed,
-            writable: failed || (open && (s.send_shut || s.sending.len() < BUFFER)),
+            writable: failed || (open && (s.send_shut || s.sending.len() < s.send_limit)),
             read_closed: s.received_end || failed,
             write_closed: s.send_shut || s.closed,
             failed,
@@ -289,13 +306,16 @@ impl Stream {
     /// How many more received bytes the stream takes now.
     #[must_use]
     pub fn room(&self) -> usize {
-        BUFFER.saturating_sub(self.lock().received.len())
+        let s = self.lock();
+        s.receive_limit.saturating_sub(s.received.len())
     }
     /// Adds received bytes; returns how many fitted.
     pub fn receive(&self, bytes: &[u8]) -> usize {
         let n = {
             let mut s = self.lock();
-            let n = bytes.len().min(BUFFER.saturating_sub(s.received.len()));
+            let n = bytes
+                .len()
+                .min(s.receive_limit.saturating_sub(s.received.len()));
             s.received.extend(&bytes[..n]);
             if n > 0 {
                 s.arrivals += 1;
@@ -376,7 +396,7 @@ impl Stream {
             if s.closed || matches!(s.phase, Phase::Failed(_)) {
                 return None;
             }
-            let room = BUFFER.saturating_sub(s.received.len());
+            let room = s.receive_limit.saturating_sub(s.received.len());
             if room > 0 {
                 return Some(room);
             }

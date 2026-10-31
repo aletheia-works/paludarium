@@ -35,6 +35,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef SIOCOUTQ
+#define SIOCOUTQ TIOCOUTQ
+#endif
+
 static int open_port, closed_port;
 
 static struct sockaddr_in to(int port) {
@@ -1236,6 +1240,55 @@ int main(int argc, char **argv) {
         polled("listener-gone", queued, POLLIN);
         call("recv-queued", recv(queued, buf, sizeof buf, 0));
         close(queued);
+        return 0;
+    }
+    if (!strcmp(mode, "listen-buffers")) {
+        /* SO_SNDBUF on the sender and SO_RCVBUF on the listener, set
+           before the connection, bound what a sender that nobody reads
+           fits in. Linux's exact counts hang on its window and per-segment
+           accounting, so only their range shows, and that the two queues
+           (SIOCOUTQ, FIONREAD) hold all that was sent. */
+        static const struct {
+            int bytes;
+            long above, at_most;
+        } sizes[] = {{4096, 0, 16384}, {16384, 16384, 65536}, {65536, 65536, 300000}, {0, 400000, 1L << 30}};
+        for (unsigned i = 0; i < sizeof sizes / sizeof *sizes; i++) {
+            int bytes = sizes[i].bytes, port, result;
+            int l = tcp(0);
+            if (bytes) setsockopt(l, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof bytes);
+            struct sockaddr_in a = to(0);
+            bind(l, (void *)&a, sizeof a);
+            listen(l, 1);
+            port = port_of(l);
+            int c = tcp(0);
+            if (bytes) setsockopt(c, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof bytes);
+            a = to(port);
+            result = connect(c, (void *)&a, sizeof a);
+            int s = accept(l, NULL, NULL);
+            long sent = fill(c);
+            int outq = -1, inq = -1;
+            ioctl(c, SIOCOUTQ, &outq);
+            ioctl(s, FIONREAD, &inq);
+            printf("  buffers=%d connect=%d in-range=%d queues-hold-all=%d\n", bytes, result,
+                   sent > sizes[i].above && sent <= sizes[i].at_most, outq + inq == sent);
+            /* A reader moves it all along: a blocking 1 MiB send through
+               the smallest buffers ends once a thread has read it. */
+            if (bytes == 4096) {
+                static char big[1 << 20];
+                drained_fd = s;
+                drained_expected = sent + (long)sizeof big;
+                pthread_t reader;
+                if (pthread_create(&reader, NULL, drain_later, NULL)) return 70;
+                long wrote = send(c, big, sizeof big, 0);
+                shutdown(c, SHUT_WR);
+                void *all;
+                pthread_join(reader, &all);
+                printf("  wrote-all=%d read-all=%d\n", wrote == (long)sizeof big, all != NULL);
+            }
+            close(s);
+            close(c);
+            close(l);
+        }
         return 0;
     }
     if (!strcmp(mode, "listen-linger")) {

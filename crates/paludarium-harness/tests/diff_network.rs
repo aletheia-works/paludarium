@@ -188,6 +188,10 @@ mod linux {
         case("listen-reset");
     }
     #[test]
+    fn network_listen_buffers() {
+        case("listen-buffers");
+    }
+    #[test]
     fn network_listen_linger() {
         case("listen-linger");
     }

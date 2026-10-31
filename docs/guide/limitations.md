@@ -40,8 +40,8 @@ verified.
     where Linux gives the port it took; a port the socket bound does not
     reach the host, whose connection leaves from a port of its own. `SIOCOUTQ` counts what the
     host has not yet taken to send, not what the peer has not acknowledged.
-    `SO_SNDBUF` and `SO_RCVBUF` are kept for `getsockopt` but do not size the
-    buffers, which hold 256 KiB each way; the other options but
+    Through the host, `SO_SNDBUF` and `SO_RCVBUF` are kept for `getsockopt`
+    but do not size the buffers, which hold 256 KiB each way; the other options but
     `TCP_NODELAY` do not reach the host's socket.
   - Through the host, `MSG_OOB` sends its byte as an ordinary one and finds
     no urgent data (`EINVAL`), so no `SIGURG` comes either.
@@ -49,6 +49,12 @@ verified.
     sends `SIGURG` once, when it reaches the peer; Linux can send more, as
     a later segment that carries the urgent pointer signals again once the
     byte has been read or passed over.
+  - On the loopback, the `SO_SNDBUF` and `SO_RCVBUF` a guest sets bound a
+    connection's buffers only roughly ([Loopback servers](./features#loopback-servers)):
+    Linux also counts each segment's overhead and sizes its window in steps
+    of its own, so a sender that nobody reads fits a different number of
+    bytes before it waits. One the guest does not set holds 256 KiB, where
+    Linux grows it as it tunes the connection (to megabytes).
 - **File mappings**: a file mapping shows the file's page cache as on Linux
   (a `MAP_PRIVATE` one in the pages it has not written), but the stores of a
   `MAP_SHARED` mapping reach the file on the host only when the guest reads

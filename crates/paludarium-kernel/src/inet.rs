@@ -614,6 +614,10 @@ struct Options {
     linger: Option<i32>,
     send_buffer: i32,
     receive_buffer: i32,
+    /// The guest set `SO_SNDBUF` or `SO_RCVBUF`, which Linux's
+    /// `SOCK_SNDBUF_LOCK` and `SOCK_RCVBUF_LOCK` keep from autotuning.
+    send_buffer_set: bool,
+    receive_buffer_set: bool,
     receive_timeout: Timeout,
     send_timeout: Timeout,
     no_delay: bool,
@@ -637,6 +641,8 @@ impl Default for Options {
             linger: None,
             send_buffer: 16384,
             receive_buffer: 131_072,
+            send_buffer_set: false,
+            receive_buffer_set: false,
             receive_timeout: Timeout::Forever,
             send_timeout: Timeout::Forever,
             no_delay: false,
@@ -1718,6 +1724,7 @@ impl InetSocket {
         *child.options() = options;
         let own = Stream::new(from);
         own.set_waker(stream_waker(&child.signals, &child.hub, &own));
+        size_buffers(&own, &options);
         let joined = Link::join(
             stream,
             &own,
@@ -1781,6 +1788,7 @@ impl InetSocket {
         };
         let stream = Stream::new(to);
         stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
+        size_buffers(&stream, options);
         let link = Arc::new(OnceLock::new());
         s.link = Some((Arc::clone(&link), 0));
         self.ports().attach(&self.this, (&link, 0));
@@ -2561,8 +2569,14 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (1, 6) => options.broadcast = value != 0,
                 // At most `wmem_max` and `rmem_max`, doubled for Linux's
                 // bookkeeping (`sk_setsockopt`).
-                (1, 7) => options.send_buffer = crate::sockets::buffer_size(value, false, 4608),
-                (1, 8) => options.receive_buffer = crate::sockets::buffer_size(value, false, 2304),
+                (1, 7) => {
+                    options.send_buffer = crate::sockets::buffer_size(value, false, 4608);
+                    options.send_buffer_set = true;
+                }
+                (1, 8) => {
+                    options.receive_buffer = crate::sockets::buffer_size(value, false, 2304);
+                    options.receive_buffer_set = true;
+                }
                 (1, 9) => options.keep_alive = value != 0,
                 (1, 10) => options.out_of_band_inline = value != 0,
                 (1, 12) => options.priority = value,
@@ -2595,7 +2609,37 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         }
         _ => return Err(ENOPROTOOPT),
     }
+    if tcp && level == 1 && matches!(name, 7 | 8) {
+        let now = *options;
+        drop(options);
+        let stream = {
+            let s = socket.lock();
+            s.link.as_ref().and(s.stream.clone())
+        };
+        if let Some(stream) = stream {
+            size_buffers(&stream, &now);
+        }
+    }
     Ok(0)
+}
+/// Sizes a loopback connection's buffers by the `SO_SNDBUF` and `SO_RCVBUF`
+/// the guest set, roughly as Linux bounds them: what waits to be sent by
+/// the doubled `SO_SNDBUF` (`sk_wmem_queued`), and what has arrived by half
+/// of the doubled `SO_RCVBUF` (the window `tcp_adv_win_scale` 1 leaves).
+/// One the guest did not set stays [`paludarium_host::net::BUFFER`], where
+/// Linux grows it as it tunes the connection.
+fn size_buffers(stream: &Stream, options: &Options) {
+    let set = |set: bool, bytes: i32| {
+        if set {
+            usize::try_from(bytes).unwrap_or(0)
+        } else {
+            paludarium_host::net::BUFFER
+        }
+    };
+    stream.set_limits(
+        set(options.send_buffer_set, options.send_buffer),
+        set(options.receive_buffer_set, options.receive_buffer / 2),
+    );
 }
 /// `getsockopt` of an inet socket: the options [`set_option`] keeps, and
 /// `SO_TYPE`, `SO_ERROR` (which takes the pending error), `SO_ACCEPTCONN`,

@@ -179,6 +179,9 @@ kernel.
   quarter of it is free (`unix_writable`), or the wait's `SO_SNDTIMEO`
   is up, when the send looks once more; a datagram longer than `SO_SNDBUF`
   less 32 bytes is `EMSGSIZE`. The receiver's unread bytes bound nothing.
+  A packet socket's messages (`SOCK_SEQPACKET`) take and wait the same,
+  as Linux's `unix_seqpacket_sendmsg` sends them through
+  `unix_dgram_sendmsg`: the size is checked before a shutdown (`EPIPE`).
   `connect` to an `AF_UNSPEC` address disconnects; a socket connects again
   at will. When the socket it is connected to goes, its next send is
   `ECONNREFUSED`, then `ENOTCONN`. Disconnecting, by connecting to another

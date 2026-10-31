@@ -164,7 +164,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   見え、待っている送信が起きるのは、その 4 分の 1 が空いてから（`unix_writable`）か、
   待ちの `SO_SNDTIMEO` が過ぎたときで、そのとき送信はもう 1 度確かめます。`SO_SNDBUF` から
   32 バイト引いた長さを超えるデータグラムは `EMSGSIZE` です。受け手が読んでいない
-  バイト数では抑えません。
+  バイト数では抑えません。パケットのソケット（`SOCK_SEQPACKET`）のメッセージも、
+  Linux の `unix_seqpacket_sendmsg` が `unix_dgram_sendmsg` で送るのと同じく、同じ分を
+  取り、同じく待ちます。長さは送信の停止（`EPIPE`）より先に確かめます。
   `AF_UNSPEC` のアドレスへの `connect` は接続を切り、何度でも接続し直せます。接続している
   ソケットがなくなると、次の送信は `ECONNREFUSED`、その後は `ENOTCONN` です。ほかの
   ソケットか `AF_UNSPEC` への接続や、その拒まれた送信で接続が切れると、Linux の

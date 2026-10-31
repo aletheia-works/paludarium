@@ -4342,6 +4342,59 @@ int main(int argc, char **argv) {
         unix_call("send-unconnected-full", send(u, big, 1000, 0));
         close(u);
         close(receiver);
+        /* A packet socket's messages take the same: unix_seqpacket_sendmsg
+           sends through unix_dgram_sendmsg, which checks the size before a
+           shutdown. */
+        signal(SIGPIPE, SIG_IGN);
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv);
+        const int packet_lens[] = {0, 193, 1000, 16065, 100000, 212960, 212961};
+        for (unsigned i = 0; i < sizeof packet_lens / sizeof packet_lens[0]; i++) {
+            errno = 0;
+            long n = send(sv[0], big, packet_lens[i], 0);
+            int e = n < 0 ? errno : 0;
+            ioctl(sv[0], SIOCOUTQ, &q);
+            printf("packet len=%d send=%ld errno=%d outq=%d", packet_lens[i], n, e, q);
+            if (n >= 0) recv(sv[1], big, sizeof big, 0);
+            ioctl(sv[0], SIOCOUTQ, &q);
+            printf(" read=%d\n", q);
+        }
+        value = 8192;
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &value, sizeof value);
+        sent = 0;
+        errno = 0;
+        while (send(sv[0], big, 1000, MSG_DONTWAIT) == 1000) sent++;
+        ioctl(sv[0], SIOCOUTQ, &q);
+        printf("packet filled=%d errno=%d outq=%d\n", sent, errno, q);
+        for (int i = 0; i < sent; i++) {
+            recv(sv[1], big, sizeof big, 0);
+            struct pollfd p = {.fd = sv[0], .events = POLLOUT};
+            poll(&p, 1, 0);
+            printf("packet read %d writable=%d\n", i + 1, !!(p.revents & POLLOUT));
+        }
+        value = 2048;
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &value, sizeof value);
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &half, sizeof half);
+        sent = 0;
+        while (send(sv[0], big, 1000, MSG_DONTWAIT) == 1000) sent++;
+        pid_t reader = fork();
+        if (reader == 0) {
+            usleep(100000);
+            recv(sv[1], big, sizeof big, 0);
+            _exit(0);
+        }
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        long n = send(sv[0], big, 1000, 0);
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        long ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+        int status;
+        waitpid(reader, &status, 0);
+        printf("packet small-filled=%d blocked-send=%ld waited-out=%d\n", sent, n, ms >= 450);
+        shutdown(sv[0], SHUT_WR);
+        unix_call("packet-too-long-shut", send(sv[0], big, 4065, MSG_NOSIGNAL));
+        unix_call("packet-shut", send(sv[0], big, 1, MSG_NOSIGNAL));
+        close(sv[0]);
+        close(sv[1]);
         return 0;
     }
     if (!strcmp(mode, "unix-datagram")) {

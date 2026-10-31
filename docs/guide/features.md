@@ -228,7 +228,14 @@ kernel.
   send buffer less 64 bytes: the doubled value `SO_SNDBUF` sets and reads
   back, so `SO_SNDBUF` 10000 makes parts of 9936 bytes. The descriptors go with the
   first part, so a read that takes them ends there, and each part signals
-  the `O_ASYNC` owner. Datagram and packet messages go whole.
+  the `O_ASYNC` owner. Datagram and packet messages go whole. Each part,
+  and an out-of-band byte, takes of the sender's send buffer what x86-64
+  Linux 7.0 counts as its `truesize` (a head of up to 3776 bytes, the rest
+  in whole pages) until it is read whole, as a datagram does: parts go
+  while the buffer has room, so a nonblocking send may send only some of
+  them, and a full sender waits, is writable to `poll` and gives
+  `SIOCOUTQ` as a datagram socket does. The peer's unread bytes bound
+  nothing.
 - A stream has out-of-band data as Linux 7.0's AF_UNIX keeps it. A `MSG_OOB`
   send makes its last byte the out-of-band byte (an empty one is
   `EOPNOTSUPP`), after the rest of its data, and an earlier byte not yet

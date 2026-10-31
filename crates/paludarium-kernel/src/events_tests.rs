@@ -245,7 +245,9 @@ fn blocking_socket_write_retries_after_host_entry_and_metadata() {
             if metadata {
                 inbox.timer_changed();
             }
-            assert_eq!(b.read(&mut [0; 128]), Ok(128));
+            // Reading it all frees the parts' room in the send buffer.
+            let mut all = vec![0; crate::sockets::SEND_WINDOW];
+            assert_eq!(b.read(&mut all), Ok(crate::sockets::SEND_WINDOW));
         }));
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
@@ -626,12 +628,13 @@ fn fionread_and_siocoutq_count_what_waits() {
         (r, i32::from_le_bytes(bytes))
     };
     f.mem.write(GuestAddr(DATA + 32), b"abcde").unwrap();
-    // A stream counts its unread bytes; SIOCOUTQ, at the sender, the same.
+    // A stream counts its unread bytes; SIOCOUTQ, at the sender, what its
+    // parts take of its send buffer, a 512-byte head and the sk_buff each.
     let (a, b) = pair(&mut f, 53, [1, 1, 0, DATA, 0, 0]);
     assert_eq!(f.ret(44, [a, DATA + 32, 3, 0, 0, 0]), 3);
     assert_eq!(f.ret(44, [a, DATA + 35, 2, 0, 0, 0]), 2);
     assert_eq!(count(&mut f, b, 0x541b), (0, 5));
-    assert_eq!(count(&mut f, a, 0x5411), (0, 5));
+    assert_eq!(count(&mut f, a, 0x5411), (0, 2 * 768));
     assert_eq!(count(&mut f, a, 0x541b), (0, 0));
     // A datagram socket counts its first datagram; SIOCOUTQ, at the
     // sender, what the datagrams that wait take of its send buffer, each a

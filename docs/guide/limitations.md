@@ -79,12 +79,7 @@ verified.
   whose effect is not modelled, where Linux takes them: `SO_PASSSEC` and
   `SO_TIMESTAMPING`, as well as filters and the other options Linux has. `SO_RCVTIMEO` and `SO_SNDTIMEO`
   round to a 1000 Hz tick, where Linux rounds to its own `CONFIG_HZ`.
-  `SO_SNDBUF` and `SO_RCVBUF` are reported but leave a stream's buffer as
-  it is (a datagram or packet socket's `SO_SNDBUF` bounds what it sends,
-  with each message's overhead). That buffer counts only the bytes in it,
-  where Linux also counts each part's overhead, so more small writes fit
-  before a send finds it full, and `SIOCOUTQ` on a stream counts only the
-  bytes the peer has not read. The guest is root, so the options that need `CAP_NET_ADMIN`
+  The guest is root, so the options that need `CAP_NET_ADMIN`
   (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
   gid 0.
 - **Signal-driven I/O**: `O_ASYNC` works on pipes and sockets only, so

@@ -72,12 +72,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `ENOPROTOOPT` で断ります。Linux は受け付けます。`SO_PASSSEC`、`SO_TIMESTAMPING` と、
   フィルターなど Linux にある
   ほかのオプションです。`SO_RCVTIMEO` と `SO_SNDTIMEO` は 1000 Hz の刻みに丸めます。
-  Linux は自分の `CONFIG_HZ` に丸めます。`SO_SNDBUF` と `SO_RCVBUF` は値を
-  返しますが、ストリームのバッファは変わりません（データグラムとパケットのソケットの
-  `SO_SNDBUF` は、メッセージごとの付帯分も含めて送る量を抑えます）。そのバッファは
-  データのバイト数だけを数えます。Linux は分けた分ごとの付帯分も数えるので、小さな
-  書き込みは Linux より多く入ってからいっぱいになります。ストリームの `SIOCOUTQ` も、
-  相手がまだ読んでいないバイト数だけを数えます。
+  Linux は自分の `CONFIG_HZ` に丸めます。
   ゲストは root なので、`CAP_NET_ADMIN` の
   要るオプション（`SO_DEBUG`、`SO_SNDBUFFORCE` など）も設定でき、`SO_PEERCRED` の
   uid と gid は 0 です。

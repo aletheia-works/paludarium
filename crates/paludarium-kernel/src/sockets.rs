@@ -509,11 +509,8 @@ pub(crate) fn queued(file: &Arc<dyn FileHandle>, outgoing: bool) -> Option<Resul
     }
     let socket = any.downcast_ref::<SocketPairEnd>()?;
     let sides = socket.lock_sides();
-    if outgoing && socket.pair.messages() {
-        return Some(Ok(socket.sent.load(Ordering::SeqCst)));
-    }
     if outgoing {
-        return Some(Ok(sides[1 - socket.side].bytes.len()));
+        return Some(Ok(socket.sent.load(Ordering::SeqCst)));
     }
     let own = &sides[socket.side];
     Some(Ok(if socket.pair.kind == SOCK_DGRAM {
@@ -1159,9 +1156,10 @@ const MIN_SEND_BUFFER: i32 = 4608;
 const MIN_RECEIVE_BUFFER: i32 = 2304;
 
 /// The `SOL_SOCKET` options of one end that its `setsockopt` keeps, as
-/// Linux's `sk_setsockopt` stores them. Only `SO_OOBINLINE` acts here;
-/// `SO_SNDBUF` and `SO_RCVBUF` are reported but leave the pair's buffer as it
-/// is, and the others have no effect on an AF_UNIX socket on Linux either.
+/// Linux's `sk_setsockopt` stores them. `SO_OOBINLINE` acts here, and
+/// `SO_SNDBUF` bounds what the end sends ([`Charge`]); the others,
+/// `SO_RCVBUF` among them, have no effect on an AF_UNIX socket on Linux
+/// either.
 #[derive(Clone, Copy)]
 struct Options {
     debug: bool,
@@ -1601,6 +1599,20 @@ fn truesize(len: usize) -> usize {
     let head = (len - pages).next_multiple_of(64) + SHARED_INFO;
     SKB + pages + head.next_power_of_two()
 }
+/// What a stream part of `len` bytes takes of its sender's send buffer, as
+/// x86-64 Linux 7.0 counts the `skb->truesize` `unix_stream_sendmsg`
+/// allocates: a head of at most `SKB_MAX_HEAD(0)` (3776) bytes, the
+/// smallest power of two that holds it and the `skb_shared_info`, and the
+/// rest in page fragments, whole pages of them.
+fn stream_truesize(len: usize) -> usize {
+    const SKB: usize = 256;
+    const SHARED_INFO: usize = 320;
+    const PAGE: usize = 4096;
+    const MAX_HEAD: usize = PAGE - SHARED_INFO;
+    let pages = len.min(len.saturating_sub(MAX_HEAD).next_multiple_of(PAGE));
+    let head = (len - pages).next_multiple_of(64) + SHARED_INFO;
+    SKB + head.next_power_of_two() + pages.next_multiple_of(PAGE)
+}
 /// The credentials a write carries, as Linux's `UNIXCB` keeps them for
 /// `SCM_CREDENTIALS`: its sender's process ID, user and group when either
 /// end passed credentials (`SO_PASSCRED`) as it was sent, or those it gave
@@ -1792,8 +1804,9 @@ struct Pair {
     /// boundaries: each write is one message, and each read returns one
     /// whole message, truncated to the buffer, as on Linux.
     kind: u32,
-    /// How many unread bytes each direction holds: the socket send buffer,
-    /// or a pipe's capacity (`F_SETPIPE_SZ`).
+    /// How many unread bytes each direction of a pipe holds, its capacity
+    /// (`F_SETPIPE_SZ`); a socket's sender is bounded by its own send
+    /// buffer instead ([`Charge`]).
     window: AtomicUsize,
     /// The pair is a pipe, whose `O_ASYNC` signals differ from a socket's.
     pipe: AtomicBool,
@@ -1858,10 +1871,9 @@ impl SocketPairEnd {
             .send_buffer;
         usize::try_from(send_buffer).unwrap_or(0)
     }
-    /// What a datagram or packet of `len` bytes this end sends takes of its
-    /// send buffer until it goes.
-    fn charge(&self, len: usize) -> Charge {
-        let size = truesize(len);
+    /// Charges this end's send buffer `size` bytes for a message or part
+    /// it sends, until that goes.
+    fn charge(&self, size: usize) -> Charge {
         self.sent.fetch_add(size, Ordering::SeqCst);
         Charge {
             sent: Arc::clone(&self.sent),
@@ -1869,9 +1881,9 @@ impl SocketPairEnd {
             hub: Arc::clone(&self.pair.hub),
         }
     }
-    /// Whether this datagram or packet end may send as `poll` sees it, as
-    /// Linux's `unix_writable`: a quarter of its send buffer holds what it
-    /// has sent and that waits, and one more.
+    /// Whether this socket end may send as `poll` sees it, as Linux's
+    /// `unix_writable`: a quarter of its send buffer holds what it has sent
+    /// and that waits, and one more.
     fn writable(&self) -> bool {
         (self.sent.load(Ordering::SeqCst) + 1) * 4 <= self.send_buffer()
     }
@@ -2696,7 +2708,7 @@ thread_local! {
 /// Whether this thread's datagram or packet send on `file` just found no
 /// room in its send buffer, rather than a full queue at the receiver.
 pub(crate) fn out_of_room(file: &Arc<dyn FileHandle>) -> bool {
-    NO_ROOM.replace(false) && socket_end(file).is_some_and(|end| end.pair.messages())
+    NO_ROOM.replace(false) && socket_end(file).is_some()
 }
 /// Whether a datagram or packet socket `file` still has too little room
 /// to wake a sender that found none: Linux's `unix_write_space` wakes a
@@ -2893,11 +2905,12 @@ impl FileHandle for SocketPairEnd {
             return Ok((mask, own.input_epoch, own.output_epoch));
         }
         let eof = own.read_shutdown || peer.closed || peer.write_shutdown;
-        // A packet socket is writable as a datagram one is (unix_writable).
-        let writable = if self.pair.messages() {
-            self.writable()
-        } else {
+        // A socket is writable as a datagram one is (unix_writable); a
+        // pipe while its capacity has room.
+        let writable = if self.is_pipe() {
             peer.bytes.len() < self.pair.window() || peer.closed
+        } else {
+            self.writable()
         };
         let mask = (u32::from(own.reset) * 0x8)
             | (u32::from(writable) * OUT)
@@ -3147,7 +3160,7 @@ impl SocketPairEnd {
             peeked: false,
             sent: self.pair.sent_at(own),
             from: address,
-            charge: Some(sender.charge(buf.len())),
+            charge: Some(sender.charge(truesize(buf.len()))),
         });
         drop(sides);
         if sockets {
@@ -3286,14 +3299,31 @@ impl SocketPairEnd {
                 peeked: false,
                 sent: self.pair.sent_at(peer),
                 from: from.clone(),
-                charge: Some(self.charge(buf.len())),
+                charge: Some(self.charge(truesize(buf.len()))),
             });
             self.pair.hub.changed();
             return Ok((buf.len(), false));
         }
-        let count = buf
-            .len()
-            .min(self.pair.window().saturating_sub(peer.bytes.len()));
+        // A pipe takes what its capacity has room for. A stream socket
+        // sends part by part while its send buffer has room, as Linux's
+        // unix_stream_sendmsg, each part charged to it; the peer's unread
+        // bytes bound nothing.
+        let pipe = self.is_pipe();
+        let count = if pipe {
+            buf.len()
+                .min(self.pair.window().saturating_sub(peer.bytes.len()))
+        } else {
+            let (mut count, mut charged) = (0, self.sent.load(Ordering::SeqCst));
+            for chunk in buf.chunks(part) {
+                if charged >= self.send_buffer() {
+                    break;
+                }
+                charged += stream_truesize(chunk.len());
+                count += chunk.len();
+            }
+            count
+        };
+        NO_ROOM.set(!pipe && count == 0 && !buf.is_empty());
         if count == 0 && !buf.is_empty() {
             return Err(Errno::EAGAIN);
         }
@@ -3313,7 +3343,7 @@ impl SocketPairEnd {
                 peeked: false,
                 sent: None,
                 from: from.clone(),
-                charge: None,
+                charge: (!pipe).then(|| self.charge(stream_truesize(chunk.len()))),
             });
         }
         let waited = std::mem::take(&mut peer.waiting_data);
@@ -3364,6 +3394,13 @@ impl SocketPairEnd {
         {
             return Err(Errno(32));
         }
+        // queue_oob allocates the byte's own skb, which needs room in the
+        // send buffer as a part does.
+        let full = self.sent.load(Ordering::SeqCst) >= self.send_buffer();
+        NO_ROOM.set(full);
+        if full {
+            return Err(Errno::EAGAIN);
+        }
         let peer = &mut sides[1 - self.side];
         peer.bytes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
         peer.writes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
@@ -3382,7 +3419,7 @@ impl SocketPairEnd {
             peeked: false,
             sent: None,
             from,
-            charge: None,
+            charge: Some(self.charge(truesize(1))),
         });
         let waited = std::mem::take(&mut peer.waiting_data);
         self.pair.hub.changed();
@@ -3443,14 +3480,20 @@ mod events_tests {
                 .collect()
         };
         assert_eq!(parts(&b), [MAX_PART, MAX_PART, 100_000 - 2 * MAX_PART]);
-        // Half the send buffer, less 64 bytes, as SO_SNDBUF 10000 sets it.
+        // Half the send buffer, less 64 bytes, as SO_SNDBUF 10000 sets it;
+        // each part takes its truesize of the buffer, which the third finds
+        // full.
         let [c, d] = pair();
         c.options
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .send_buffer = 20_000;
-        send(&c, &[2; 20_000]);
-        assert_eq!(parts(&d), [9936, 9936, 128]);
+        assert_eq!(
+            c.send(&[2; 20_000], &mut Passed::new(), Sender::default()),
+            Ok(2 * 9936)
+        );
+        assert_eq!(parts(&d), [9936, 9936]);
+        assert_eq!(c.sent.load(Ordering::SeqCst), 2 * stream_truesize(9936));
         // A plain read reads on across parts.
         let mut buf = vec![0; 200_000];
         assert_eq!(b.receive(&mut buf, true, false).unwrap().count, 100_000);
@@ -3656,15 +3699,21 @@ mod events_tests {
     #[test]
     fn socket_backpressure_partial_write_and_out_edge() {
         let [a, b] = pair();
+        // Parts go while the send buffer has room, however much the peer
+        // has not read; the last one takes it past full.
         let bytes = vec![7; SEND_WINDOW + 1];
-        assert_eq!(a.write(&bytes), Ok(SEND_WINDOW));
+        assert_eq!(a.write(&bytes), Ok(SEND_WINDOW + 1));
         assert_eq!(a.write(&[1]), Err(Errno::EAGAIN));
         let full = a.readiness().unwrap();
         assert_eq!(full.0 & OUT, 0);
+        // A part read only in part keeps its room.
         assert_eq!(b.read(&mut [0; 1]), Ok(1));
+        assert_eq!(a.write(&[1]), Err(Errno::EAGAIN));
+        let mut rest = vec![0; SEND_WINDOW];
+        assert_eq!(b.read(&mut rest), Ok(SEND_WINDOW));
         let ready = a.readiness().unwrap();
         assert_ne!(ready.0 & OUT, 0);
-        assert_eq!(ready.2, full.2 + 1);
+        assert!(ready.2 > full.2);
         assert_eq!(a.write(&[1]), Ok(1));
     }
     fn seqpacket() -> [Arc<SocketPairEnd>; 2] {

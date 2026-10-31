@@ -4395,6 +4395,46 @@ int main(int argc, char **argv) {
         unix_call("packet-shut", send(sv[0], big, 1, MSG_NOSIGNAL));
         close(sv[0]);
         close(sv[1]);
+        /* A stream charges each part unix_stream_sendmsg sends, of half the
+           send buffer less 64 bytes at most, and the out-of-band byte its
+           own; SIOCOUTQ counts them until they are read whole. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        const int stream_lens[] = {1, 3776, 3777, 4000, 36544, 36545, 100000};
+        for (unsigned i = 0; i < sizeof stream_lens / sizeof stream_lens[0]; i++) {
+            long n = send(sv[0], big, stream_lens[i], 0);
+            ioctl(sv[0], SIOCOUTQ, &q);
+            printf("stream len=%d send=%ld outq=%d", stream_lens[i], n, q);
+            recv(sv[1], big, 1, 0);
+            ioctl(sv[0], SIOCOUTQ, &q);
+            printf(" read-one=%d", q);
+            recv(sv[1], big, sizeof big, MSG_WAITALL | MSG_DONTWAIT);
+            ioctl(sv[0], SIOCOUTQ, &q);
+            printf(" read=%d\n", q);
+        }
+        unix_call("stream-oob", send(sv[0], "!", 1, MSG_OOB));
+        ioctl(sv[0], SIOCOUTQ, &q);
+        printf("stream oob outq=%d\n", q);
+        recv(sv[1], big, 1, MSG_OOB);
+        ioctl(sv[0], SIOCOUTQ, &q);
+        printf("stream oob-read outq=%d\n", q);
+        value = 8192;
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &value, sizeof value);
+        errno = 0;
+        n = send(sv[0], big, 100000, MSG_DONTWAIT);
+        ioctl(sv[0], SIOCOUTQ, &q);
+        printf("stream filled=%ld errno=%d outq=%d\n", n, errno, q);
+        unix_call("stream-full", send(sv[0], big, 1, MSG_DONTWAIT));
+        /* Each read takes one whole part of 8128 bytes, so its room goes
+           back. */
+        for (int i = 0; i < 3; i++) {
+            long r = recv(sv[1], big, 8128, MSG_DONTWAIT);
+            struct pollfd p = {.fd = sv[0], .events = POLLOUT};
+            poll(&p, 1, 0);
+            ioctl(sv[0], SIOCOUTQ, &q);
+            printf("stream read %d got=%ld outq=%d writable=%d\n", i + 1, r, q, !!(p.revents & POLLOUT));
+        }
+        close(sv[0]);
+        close(sv[1]);
         return 0;
     }
     if (!strcmp(mode, "unix-datagram")) {

@@ -1869,9 +1869,9 @@ impl SocketPairEnd {
             hub: Arc::clone(&self.pair.hub),
         }
     }
-    /// Whether this datagram or packet end may send as `poll` sees it, as Linux's
-    /// `unix_writable`: a quarter of its send buffer holds what it has sent
-    /// and that waits, and one more.
+    /// Whether this datagram or packet end may send as `poll` sees it, as
+    /// Linux's `unix_writable`: a quarter of its send buffer holds what it
+    /// has sent and that waits, and one more.
     fn writable(&self) -> bool {
         (self.sent.load(Ordering::SeqCst) + 1) * 4 <= self.send_buffer()
     }

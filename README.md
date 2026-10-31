@@ -77,6 +77,10 @@ differential tests, coverage and fuzzing need:
 mise run linux-dev -- cargo test --locked -p paludarium-harness --test diff_core -- --nocapture
 ```
 
+On an Arm Mac some cases fail there on main too, as QEMU runs the native
+side; `mise run linux-dev-compare` lists only the results that differ from
+main's ([Testing and verification](docs/design/quality.md)).
+
 The working tree is copied into a named volume first, so Docker Desktop does
 not need to share the repository path (`PALUDARIUM_DEV_MOUNT=bind` mounts it
 directly). Each checkout keeps its build output in volumes of its own, so one

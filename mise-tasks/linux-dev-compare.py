@@ -8,7 +8,9 @@ On an Arm Mac the container runs the native side under QEMU's user-mode
 emulation, so some cases fail there on main too (docs/design/quality.md).
 Those stay listed as known. A case that fails here and passes on the base is
 run once more here: if it passes, it is listed as flaky, else it is new and
-fails this task. Neither run is evidence: only x86-64 Linux CI is.
+fails this task, as does a case that fails here and is not on the base, or
+one the base ran that did not run here. Neither run is evidence: only
+x86-64 Linux CI is.
 
     mise run linux-dev-compare
     mise run linux-dev-compare -- --test diff_network
@@ -26,20 +28,17 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / "target" / "linux-dev-compare"
-# The suites `mise run test:diff` runs.
-SUITES = (
-    "diff_core",
-    "diff_instructions",
-    "parallel_instructions",
-    "diff_signals_time",
-    "diff_terminal",
-    "diff_encodings",
-    "diff_processes",
-    "diff_network",
+# The suites `mise run test:diff` runs, read from its command.
+SUITES = tuple(
+    re.findall(
+        r"--test (\S+)",
+        tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["test:diff"]["run"],
+    )
 )
 RUNNING = re.compile(r"^\s*Running (?:unittests )?(\S+)")
 RESULT = re.compile(r"^test (\S+) \.\.\. (?:.*?)(ok|FAILED|ignored)\s*$")
@@ -68,12 +67,15 @@ def results(log):
 
 
 def compare(base, head):
-    """New failures, fixes, known failures, and cases only one side ran."""
-    new = sorted(k for k, v in head.items() if v == "FAILED" and base.get(k) == "ok")
+    """New failures (also of cases the base does not have), fixes, known
+    failures, cases the base ran that did not run here (a suite that
+    stopped), and cases only this checkout has that did not fail."""
+    new = sorted(k for k, v in head.items() if v == "FAILED" and base.get(k) != "FAILED")
     fixed = sorted(k for k, v in head.items() if v == "ok" and base.get(k) == "FAILED")
     known = sorted(k for k, v in head.items() if v == "FAILED" and base.get(k) == "FAILED")
-    only = sorted(set(head).symmetric_difference(base))
-    return new, fixed, known, only
+    missing = sorted(set(base) - set(head))
+    added = sorted(k for k in set(head) - set(base) if head[k] != "FAILED")
+    return new, fixed, known, missing, added
 
 
 def run(checkout, tests, names=()):
@@ -128,7 +130,8 @@ def default_base():
 
 def base_results(commit, tests):
     """The base's outcomes, from the cache or a run in its worktree."""
-    key = hashlib.sha256(" ".join(tests).encode()).hexdigest()[:12]
+    # The commit pins the toolchain and the container's Dockerfile too.
+    key = hashlib.sha256(" ".join(sorted(set(tests))).encode()).hexdigest()[:12]
     cache = WORK / f"{commit}-{key}.json"
     if cache.exists():
         return json.loads(cache.read_text())
@@ -158,13 +161,14 @@ def rerun(new):
     return sorted(flaky)
 
 
-def report(new, flaky, fixed, known, only):
+def report(new, flaky, missing, fixed, known, added):
     for title, keys in (
-        ("New failures (pass on the base, and failed again here)", new),
+        ("New failures (do not fail on the base, and failed again here)", new),
         ("Flaky (failed here, then passed when run again)", flaky),
+        ("Missing here (ran on the base; did a suite stop?)", missing),
         ("Fixed (fail on the base)", fixed),
         ("Known failures (fail on the base too)", known),
-        ("Run on one side only", only),
+        ("Only here, not failing", added),
     ):
         print(f"{title}: {len(keys)}")
         for key in keys:
@@ -192,8 +196,9 @@ def self_test():
         "diff_processes::linux::clone_vm": "ignored",
     }, found
     base = {"a": "ok", "b": "FAILED", "c": "FAILED", "d": "ok"}
-    head = {"a": "FAILED", "b": "ok", "c": "FAILED", "e": "ok"}
-    assert compare(base, head) == (["a"], ["b"], ["c"], ["d", "e"])
+    head = {"a": "FAILED", "b": "ok", "c": "FAILED", "e": "ok", "f": "FAILED"}
+    assert compare(base, head) == (["a", "f"], ["b"], ["c"], ["d"], ["e"])
+    assert "diff_network" in SUITES and "diff_processes" in SUITES, SUITES
     print("self-test passed")
 
 
@@ -215,12 +220,12 @@ def main():
     head = results(log)
     if not head:
         sys.exit(f"this checkout ran no tests; see {WORK / 'head.log'}")
-    new, fixed, known, only = compare(base, head)
+    new, fixed, known, missing, added = compare(base, head)
     flaky = rerun(new) if new else []
     new = [key for key in new if key not in flaky]
     print(f"base {commit[:12]}, {len(head)} cases here; logs in {WORK}")
-    report(new, flaky, fixed, known, only)
-    return 1 if new else 0
+    report(new, flaky, missing, fixed, known, added)
+    return 1 if new or missing else 0
 
 
 if __name__ == "__main__":

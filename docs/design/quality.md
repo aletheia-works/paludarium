@@ -55,7 +55,8 @@ CI run produces them afresh on an x86-64 Linux runner.
   tests there for a checkout and for main, and lists only the cases whose
   result differs. A case that fails only on the checkout runs once more: if
   it passes then, it is listed as flaky, as some cases' timing is under
-  QEMU; else it fails the task.
+  QEMU; else it fails the task, as does a case that main ran and the
+  checkout did not (a suite that stopped).
 - The native results are those of the CI runner's kernel (Linux 7.0 on
   `ubuntu-24.04`). Where Linux changed between versions or builds, as in
   what a UDP datagram takes of the receive buffer, whose small head cache

@@ -1064,10 +1064,11 @@ impl InetSocket {
                     if address.port() == DNS && !loopback {
                         stream.connected(None);
                     }
-                    // Linux's loopback answers the handshake once connect
-                    // has returned, so a nonblocking one is in progress
-                    // even when its listener took it.
-                    if loopback && self.nonblocking() {
+                    // Linux sends the handshake's first segment and takes
+                    // the answer only once connect has returned, even on its
+                    // loopback, so a nonblocking one is in progress however
+                    // soon its listener, or the host, opens the connection.
+                    if self.nonblocking() {
                         return Err(EINPROGRESS);
                     }
                     EINPROGRESS

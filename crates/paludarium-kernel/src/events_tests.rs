@@ -282,6 +282,9 @@ struct TestHost {
     /// The connections and lookups the guest started, for a test to drive.
     streams: Mutex<Vec<Arc<paludarium_host::net::Stream>>>,
     lookups: Mutex<Vec<(String, Arc<paludarium_host::net::Lookup>)>>,
+    /// Whether a connection the guest starts is open at once, as the host's
+    /// own can be before the guest's connect returns.
+    open_at_once: std::sync::atomic::AtomicBool,
     /// What the host's routes give as the source address, once a test sets
     /// it; unset, the host cannot tell.
     route: Mutex<Option<Result<core::net::IpAddr, Errno>>>,
@@ -292,6 +295,9 @@ impl Host for TestHost {
         address: core::net::SocketAddr,
     ) -> Result<Arc<paludarium_host::net::Stream>, Errno> {
         let stream = paludarium_host::net::Stream::new(address);
+        if self.open_at_once.load(Ordering::SeqCst) {
+            stream.connected(Some("127.0.0.1:40001".parse().unwrap()));
+        }
         self.streams
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -998,6 +1004,27 @@ fn inet_sockets_need_a_network() {
         f.ret(41, [10, 2, 58, 0, 0, 0]),
         Errno(13).to_syscall_return()
     );
+}
+#[test]
+fn a_nonblocking_connect_through_the_host_is_in_progress_however_soon_it_opens() {
+    let mut f = network_fixture(&["127.0.0.1:80"]);
+    f.host.open_at_once.store(true, Ordering::SeqCst);
+    let fd = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 80);
+    // In progress, as Linux takes the handshake's answer after connect
+    // returns; the next connect finds it open, and the one after connected.
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
+    assert_eq!(f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(106).to_syscall_return()
+    );
+    // A blocking connect returns once it is open.
+    let blocking = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(f.ret(42, [blocking, DATA + 0x100, 16, 0, 0, 0]), 0);
 }
 #[test]
 fn a_tcp_socket_connects_through_the_host() {
@@ -2389,7 +2416,12 @@ fn the_dns_stub_answers_over_tcp_too() {
     let tcp = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
     // Port 53 is the stub at any address, whatever the policy allows.
     inet_address(&f, DATA + 0x100, [10, 0, 0, 1], 53);
-    assert_eq!(f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    // Nonblocking, in progress first, as with a real server; the stub is
+    // open by the time the guest looks again.
+    assert_eq!(
+        f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
     assert!(f.host.streams.lock().unwrap().is_empty());
     // A query framed with its length, split across two writes.
     let len = dns_query(&f, DATA + 2, "example.com", 1);
@@ -2432,7 +2464,10 @@ fn a_long_tcp_answer_comes_whole_in_small_reads() {
     let mut f = network_fixture(&["example.com"]);
     let tcp = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
     inet_address(&f, DATA + 0x100, [127, 0, 0, 53], 53);
-    assert_eq!(f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
     // Two queries, the first answered after the second is queued, so that
     // their answers go out together.
     let mut framed = Vec::new();
@@ -2482,7 +2517,10 @@ fn tcp_answers_past_the_stream_buffer_come_as_reads_free_it() {
     let mut f = network_fixture(&["example.com"]);
     let tcp = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
     inet_address(&f, DATA + 0x100, [127, 0, 0, 53], 53);
-    assert_eq!(f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(115).to_syscall_return()
+    );
     // Five queries whose answers of 4000 records, about 64 KiB each, pass
     // the stream's 256 KiB: the rest waits until reads free room.
     let mut framed = Vec::new();

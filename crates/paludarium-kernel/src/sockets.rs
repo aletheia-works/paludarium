@@ -490,9 +490,8 @@ pub(crate) fn polled_full(file: &Arc<dyn FileHandle>) {
 /// counts its unread bytes at either end (Linux's `pipe_ioctl`) and has no
 /// `SIOCOUTQ` (ENOTTY). A socket counts its unread bytes, out-of-band byte
 /// included, a datagram socket its first datagram's (`unix_inq_len`).
-/// `SIOCOUTQ` gives what a datagram or packet socket's messages that wait
-/// take of its send buffer (`unix_outq_len`), and for a stream what the
-/// peer has not read, where Linux also counts each part's overhead.
+/// `SIOCOUTQ` gives what a socket's messages or parts that wait take of
+/// its send buffer (`unix_outq_len`).
 pub(crate) fn queued(file: &Arc<dyn FileHandle>, outgoing: bool) -> Option<Result<usize, Errno>> {
     if let Some(socket) = crate::inet::of(file) {
         return Some(socket.queued(outgoing));

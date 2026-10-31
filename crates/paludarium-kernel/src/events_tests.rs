@@ -1017,6 +1017,16 @@ fn a_nonblocking_connect_through_the_host_is_in_progress_however_soon_it_opens()
         f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),
         Errno(115).to_syscall_return()
     );
+    // poll sees it writable at once, though it opened before the socket
+    // set the stream's waker.
+    let mut pollfd = (fd as i32).to_le_bytes().to_vec();
+    pollfd.extend(4u16.to_le_bytes());
+    pollfd.extend(0u16.to_le_bytes());
+    f.mem.write(GuestAddr(DATA + 0x300), &pollfd).unwrap();
+    assert_eq!(f.ret(7, [DATA + 0x300, 1, 0, 0, 0, 0]), 1);
+    let mut revents = [0; 2];
+    f.mem.read(GuestAddr(DATA + 0x306), &mut revents).unwrap();
+    assert_eq!(u16::from_le_bytes(revents), 4);
     assert_eq!(f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]), 0);
     assert_eq!(
         f.ret(42, [fd, DATA + 0x100, 16, 0, 0, 0]),

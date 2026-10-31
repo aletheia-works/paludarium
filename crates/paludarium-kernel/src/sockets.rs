@@ -1561,11 +1561,12 @@ struct Write {
     /// The name of the AF_UNIX socket that sent it, as Linux's `skb->sk`
     /// gives it to recvmsg's `msg_name`; none from a socket pair's end.
     from: Option<crate::unix::Address>,
-    /// What a datagram takes of its sender's send buffer while it waits.
+    /// What a datagram or packet takes of its sender's send buffer while
+    /// it waits.
     charge: Option<Charge>,
 }
-/// What a datagram takes of its sender's send buffer, as Linux's
-/// `skb_set_owner_w` charges `sk_wmem_alloc`, until the datagram goes:
+/// What a datagram or packet takes of its sender's send buffer, as Linux's
+/// `skb_set_owner_w` charges `sk_wmem_alloc`, until the message goes:
 /// read, dropped, or freed with its receiver.
 struct Charge {
     sent: Arc<AtomicUsize>,
@@ -1843,8 +1844,8 @@ pub(crate) struct SocketPairEnd {
     /// That socket has not connected yet: it sends nothing and reads
     /// nothing.
     unconnected: AtomicBool,
-    /// What the datagrams this end sent and that wait take of its send
-    /// buffer ([`Charge`]), as Linux's `sk_wmem_alloc`.
+    /// What the datagrams or packets this end sent and that wait take of
+    /// its send buffer ([`Charge`]), as Linux's `sk_wmem_alloc`.
     sent: Arc<AtomicUsize>,
 }
 impl SocketPairEnd {
@@ -1857,8 +1858,8 @@ impl SocketPairEnd {
             .send_buffer;
         usize::try_from(send_buffer).unwrap_or(0)
     }
-    /// What a datagram of `len` bytes this end sends takes of its send
-    /// buffer until it goes.
+    /// What a datagram or packet of `len` bytes this end sends takes of its
+    /// send buffer until it goes.
     fn charge(&self, len: usize) -> Charge {
         let size = truesize(len);
         self.sent.fetch_add(size, Ordering::SeqCst);
@@ -1868,14 +1869,14 @@ impl SocketPairEnd {
             hub: Arc::clone(&self.pair.hub),
         }
     }
-    /// Whether this datagram end may send as `poll` sees it, as Linux's
+    /// Whether this datagram or packet end may send as `poll` sees it, as Linux's
     /// `unix_writable`: a quarter of its send buffer holds what it has sent
     /// and that waits, and one more.
     fn writable(&self) -> bool {
         (self.sent.load(Ordering::SeqCst) + 1) * 4 <= self.send_buffer()
     }
-    /// The longest datagram this end sends: its send buffer less 32 bytes,
-    /// as `unix_dgram_sendmsg` checks it (`EMSGSIZE` past it).
+    /// The longest datagram or packet this end sends: its send buffer less
+    /// 32 bytes, as `unix_dgram_sendmsg` checks it (`EMSGSIZE` past it).
     fn max_datagram(&self) -> usize {
         self.send_buffer().saturating_sub(32)
     }

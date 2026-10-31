@@ -995,6 +995,14 @@ fn deliver(
     let mut cut = false;
     if let Some((at, timestamps)) = received.timestamp {
         cut |= put_control(c, &mut room, timestamps.kind(), &timestamps.data(at));
+        if let Some(data) = timestamps.timestamping(at) {
+            let kind = if timestamps.new {
+                SO_TIMESTAMPING_NEW
+            } else {
+                SO_TIMESTAMPING
+            };
+            cut |= put_control(c, &mut room, kind, &data);
+        }
     }
     if let Some(credentials) = credentials {
         let mut ucred = [0; UCRED];
@@ -1131,6 +1139,19 @@ const SO_TIMESTAMP: u32 = 29;
 const SO_TIMESTAMPNS: u32 = 35;
 const SO_TIMESTAMP_NEW: u32 = 63;
 const SO_TIMESTAMPNS_NEW: u32 = 64;
+const SO_TIMESTAMPING: u32 = 37;
+const SO_TIMESTAMPING_NEW: u32 = 65;
+/// `SO_TIMESTAMPING`'s flags, as Linux's `SOF_TIMESTAMPING_*`.
+const SOF_RX_SOFTWARE: u32 = 1 << 3;
+const SOF_SOFTWARE: u32 = 1 << 4;
+const SOF_OPT_ID: u32 = 1 << 7;
+const SOF_OPT_TSONLY: u32 = 1 << 11;
+const SOF_OPT_STATS: u32 = 1 << 12;
+const SOF_BIND_PHC: u32 = 1 << 15;
+const SOF_OPT_ID_TCP: u32 = 1 << 16;
+const SOF_OPT_RX_FILTER: u32 = 1 << 17;
+/// Every flag Linux knows, up to `SOF_TIMESTAMPING_TX_COMPLETION`.
+const SOF_MASK: u32 = (1 << 19) - 1;
 const SO_RCVTIMEO_NEW: u32 = 66;
 const SO_SNDTIMEO_NEW: u32 = 67;
 /// The kernel's tick rate, to which Linux rounds `SO_RCVTIMEO` and
@@ -1323,10 +1344,10 @@ pub(crate) fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// `sk_setsockopt`: a socket pair has only `SOL_SOCKET` options
 /// (EOPNOTSUPP for another level), an `int` value of fewer than 4 bytes is
 /// EINVAL, and an unknown name, or one whose effect is not modelled here
-/// (`SO_PASSSEC`, `SO_TIMESTAMPING`), or one only read (`SO_PEERPIDFD`), is
+/// (`SO_PASSSEC`), or one only read (`SO_PEERPIDFD`), is
 /// ENOPROTOOPT. `SO_PASSCRED` makes messages carry credentials
 /// ([`Credentials`]), `SO_PASSPIDFD` them and a pidfd of their sender
-/// ([`put_pidfd`]), `SO_TIMESTAMP` and its kin
+/// ([`put_pidfd`]), `SO_TIMESTAMP` and its kin, and `SO_TIMESTAMPING`,
 /// timestamps ([`Timestamps`]), `SO_RCVLOWAT` sets what a
 /// stream read waits for ([`receive_with`]; 0 is 1, and a negative value
 /// `INT_MAX`), and `SO_PEEK_OFF` where a peek starts (any value, a negative
@@ -1373,6 +1394,28 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         if on {
             timestamps.new = matches!(name, SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW);
         }
+        return Ok(0);
+    }
+    if matches!(name, SO_TIMESTAMPING | SO_TIMESTAMPING_NEW) {
+        // As Linux's `sock_set_timestamping`: the flags, alone or at the
+        // head of a `struct so_timestamping` of 8 bytes.
+        if len == 8 {
+            read_words(c, a[3], 8)?;
+        }
+        let flags = value.cast_unsigned();
+        if flags & !SOF_MASK != 0
+            || flags & SOF_OPT_ID_TCP != 0 && flags & SOF_OPT_ID == 0
+            || flags & SOF_OPT_STATS != 0 && flags & SOF_OPT_TSONLY == 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        // A PTP clock binds only to a socket bound to a device.
+        if flags & SOF_BIND_PHC != 0 {
+            return Err(Errno(95));
+        }
+        let timestamps = &mut socket.lock_sides()[socket.side].timestamps;
+        timestamps.flags = flags;
+        timestamps.new = name == SO_TIMESTAMPING_NEW;
         return Ok(0);
     }
     let mut options = socket
@@ -1477,6 +1520,19 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 _ => t.nanoseconds && t.new,
             }
             .into())
+        }
+        // The flags and the PTP clock, which no socket binds here; `_NEW`
+        // gives them only when they were set through it.
+        name @ (SO_TIMESTAMPING | SO_TIMESTAMPING_NEW) => {
+            let t = socket.lock_sides()[socket.side].timestamps;
+            let flags = if name == SO_TIMESTAMPING || t.new {
+                t.flags
+            } else {
+                0
+            };
+            let mut value = int(flags.cast_signed());
+            value.extend(0i32.to_le_bytes());
+            value
         }
         SO_PASSCRED => int(socket.passes_credentials().into()),
         SO_PASSPIDFD => int(socket.lock_sides()[socket.side].pass_pidfd.into()),
@@ -1763,12 +1819,15 @@ struct Side {
 }
 /// The flags `SO_TIMESTAMP`, `SO_TIMESTAMPNS` and their `_NEW` forms set,
 /// as Linux's `SOCK_RCVTSTAMP`, `SOCK_RCVTSTAMPNS` and `SOCK_TSTAMP_NEW`;
-/// the last stays when they are turned off.
+/// the last stays when they are turned off, and `SO_TIMESTAMPING` sets it
+/// too. `flags` are `SO_TIMESTAMPING`'s (`sk_tsflags`), which add a
+/// `SCM_TIMESTAMPING` to what `on` stamps, as AF_UNIX stamps nothing else.
 #[derive(Clone, Copy, Default)]
 struct Timestamps {
     on: bool,
     nanoseconds: bool,
     new: bool,
+    flags: u32,
 }
 impl Timestamps {
     /// The control message type a timestamp goes in.
@@ -1794,6 +1853,28 @@ impl Timestamps {
         data[..8].copy_from_slice(&seconds.to_le_bytes());
         data[8..].copy_from_slice(&fraction.to_le_bytes());
         data
+    }
+    /// The `struct scm_timestamping` for `at`, as Linux's
+    /// `__sock_recv_timestamp`: three `timespec`s, the first the software
+    /// one, when the flags report it (`SOF_TIMESTAMPING_SOFTWARE`) and take
+    /// it on receipt or filter nothing out; no hardware stamps a message
+    /// between local sockets.
+    fn timestamping(self, at: u64) -> Option<[u8; 48]> {
+        let flags = self.flags;
+        if flags & SOF_SOFTWARE == 0
+            || flags & SOF_RX_SOFTWARE == 0 && flags & SOF_OPT_RX_FILTER != 0
+        {
+            return None;
+        }
+        let mut data = [0; 48];
+        data[..16].copy_from_slice(
+            &Timestamps {
+                nanoseconds: true,
+                ..self
+            }
+            .data(at),
+        );
+        Some(data)
     }
 }
 struct Pair {
@@ -3532,7 +3613,7 @@ mod events_tests {
         b.lock_sides()[b.side].timestamps = Timestamps {
             on: true,
             nanoseconds: true,
-            new: false,
+            ..Timestamps::default()
         };
         host.set_clock(ClockId::Realtime, 1_500_000_000);
         send(&a, b"a");
@@ -3558,6 +3639,20 @@ mod events_tests {
             ..timestamps
         };
         assert_eq!(micros.data(1_500_002_000)[8..], 500_002u64.to_le_bytes());
+        // SO_TIMESTAMPING's software stamp, in nanoseconds whatever the
+        // other form, when its flags report it and do not filter it out.
+        let stamping = |flags| Timestamps { flags, ..micros }.timestamping(1_500_002_000);
+        assert_eq!(stamping(0), None);
+        assert_eq!(stamping(SOF_RX_SOFTWARE), None);
+        assert_eq!(stamping(SOF_SOFTWARE | SOF_OPT_RX_FILTER), None);
+        for flags in [
+            SOF_SOFTWARE,
+            SOF_SOFTWARE | SOF_RX_SOFTWARE | SOF_OPT_RX_FILTER,
+        ] {
+            let data = stamping(flags).unwrap();
+            assert_eq!(data[..16], timestamps.data(1_500_002_000));
+            assert_eq!(data[16..], [0; 32]);
+        }
     }
     /// Passes `files` with one byte from `end`.
     fn pass(end: &SocketPairEnd, files: &[Arc<dyn FileHandle>]) {

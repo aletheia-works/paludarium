@@ -79,7 +79,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     すぐに閉じられます。Linux のガベージコレクタは、ワークキューから少しあとに
     閉じます。
 - **ソケットのオプション**：`setsockopt` は、効き目を再現していないオプションを
-  `ENOPROTOOPT` で断ります。Linux は受け付けます。`SO_PASSSEC`、`SO_TIMESTAMPING` と、
+  `ENOPROTOOPT` で断ります。Linux は受け付けます。`SO_PASSSEC` と、
   フィルターなど Linux にある
   ほかのオプションです。`SO_RCVTIMEO` と `SO_SNDTIMEO` は 1000 Hz の刻みに丸めます。
   Linux は自分の `CONFIG_HZ` に丸めます。

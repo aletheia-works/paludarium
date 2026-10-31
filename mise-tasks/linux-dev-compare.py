@@ -17,9 +17,11 @@ x86-64 Linux CI is.
     mise run linux-dev-compare -- --base upstream/main --test diff_processes
 
 The base is checked out with `git worktree` under
-target/linux-dev-compare/base, which keeps its own container volume, and its
-results are kept per commit and test selection in that directory, so a later
-run against the same base only runs this checkout.
+target/linux-dev-compare/base, which keeps its own container volume. Its
+failing cases run once more, and those that pass then count as passing; its
+results are then kept per commit and test selection in that directory, so a
+later run against the same base only runs this checkout. Delete
+target/linux-dev-compare/<commit>-*.json to run the base again.
 """
 
 import argparse
@@ -130,7 +132,9 @@ def default_base():
 
 def base_results(commit, tests):
     """The base's outcomes, from the cache or a run in its worktree."""
-    # The commit pins the toolchain and the container's Dockerfile too.
+    # The commit pins the toolchain, which names the container's image; the
+    # image itself is whichever linux-dev built first for that toolchain, the
+    # same for both sides.
     key = hashlib.sha256(" ".join(sorted(set(tests))).encode()).hexdigest()[:12]
     cache = WORK / f"{commit}-{key}.json"
     if cache.exists():
@@ -146,17 +150,21 @@ def base_results(commit, tests):
     found = results(log)
     if not found:
         sys.exit(f"the base ran no tests; see {WORK / f'{commit}-{key}.log'}")
+    # A case that failed only by chance would hide a real failure here as a
+    # known one for as long as the cache lasts.
+    for flake in rerun([k for k, v in found.items() if v == "FAILED"], tree):
+        found[flake] = "ok"
     cache.write_text(json.dumps(found, indent=1, sort_keys=True))
     return found
 
 
-def rerun(new):
-    """The new failures that pass when run once more here: Docker's timing
-    makes some cases flaky (docs/design/quality.md)."""
+def rerun(failed, checkout=ROOT):
+    """The failed cases that pass when run once more in `checkout`: Docker's
+    timing makes some cases flaky (docs/design/quality.md)."""
     flaky = []
-    for suite in sorted({key.split("::", 1)[0] for key in new}):
-        names = [key.split("::", 1)[1] for key in new if key.startswith(f"{suite}::")]
-        again = results(run(ROOT, [suite], names))
+    for suite in sorted({key.split("::", 1)[0] for key in failed}):
+        names = [key.split("::", 1)[1] for key in failed if key.startswith(f"{suite}::")]
+        again = results(run(checkout, [suite], names))
         flaky += [f"{suite}::{name}" for name in names if again.get(f"{suite}::{name}") == "ok"]
     return sorted(flaky)
 

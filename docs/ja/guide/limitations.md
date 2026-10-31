@@ -71,8 +71,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   フィルターなど Linux にある
   ほかのオプションです。`SO_RCVTIMEO` と `SO_SNDTIMEO` は 1000 Hz の刻みに丸めます。
   Linux は自分の `CONFIG_HZ` に丸めます。
-  `execve` が閉じる（`FD_CLOEXEC`）ソケットの最後のディスクリプタは `SO_LINGER` の
-  時間を待ちません。Linux では待ちます。
   ゲストは root なので、`CAP_NET_ADMIN` の
   要るオプション（`SO_DEBUG`、`SO_SNDBUFFORCE` など）も設定でき、`SO_PEERCRED` の
   uid と gid は 0 です。

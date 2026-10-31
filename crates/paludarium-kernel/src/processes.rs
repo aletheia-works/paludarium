@@ -1144,7 +1144,10 @@ impl Kernel {
             57 => self.clone_process(thread, mem, [17, 0, 0, 0, 0, 0]),
             58 => self.clone_process(thread, mem, [0x4111, 0, 0, 0, 0, 0]),
             59 => match self.exec(thread, mem, a) {
-                Ok(()) => return Some(Next::Resume),
+                Ok(closed) => {
+                    self.close_on_exec(thread, mem, closed);
+                    return Some(Next::Resume);
+                }
                 Err(error) => Err(error),
             },
             61 => self.wait4(thread, mem, a),
@@ -1660,7 +1663,39 @@ impl Kernel {
             None => Err(Errno(3)),
         }
     }
-    fn exec(&mut self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<(), Errno> {
+    /// Closes what exec closed, as Linux's `__fput` does on the way back to
+    /// the new program: a socket's last descriptor waits for its linger
+    /// time ([`crate::inet::linger`]).
+    fn close_on_exec(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        closed: Vec<crate::files::Descriptor>,
+    ) {
+        let mut c = crate::syscalls::Context {
+            host: &*self.host,
+            shared_host: &self.host,
+            files: &mut self.files,
+            process: &mut thread.state,
+            cpu: &mut thread.cpu,
+            mem,
+            cancellation: &self.cancellation,
+            inbox: &self.inbox,
+            group: &self.group,
+            processes: &self.processes,
+        };
+        for descriptor in closed {
+            crate::inet::linger(&mut c, &descriptor.file);
+        }
+    }
+    /// Replaces the program; returns the descriptors it closed
+    /// (`FD_CLOEXEC`), for the caller to close.
+    fn exec(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         let path = read_string(mem, a[0], 4096, Errno::ENAMETOOLONG)?;
         let path = self.files.exec_path(path)?;
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;
@@ -1712,6 +1747,7 @@ impl Kernel {
         self.group
             .with_timers(&mut thread.state, |timers| timers.clear());
         thread.tid = self.process.pid;
+        let closed = self.files.take_close_on_exec();
         self.files = self.files.for_exec();
         self.group.exec_actions();
         thread.cpu = CpuState::new(image.entry_point, image.initial_stack_pointer);
@@ -1736,7 +1772,7 @@ impl Kernel {
         self.processes.mark_executed(self.process.pid);
         self.exec_memory = Some(Arc::new(memory));
         self.release_vfork();
-        Ok(())
+        Ok(closed)
     }
 }
 /// `clone3`'s own flag: reset the signal handlers in the child.

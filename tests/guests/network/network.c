@@ -1,7 +1,7 @@
 /* TCP client sockets against the differential test's local server, and
  * the guest's own servers on the loopback (the "listen" modes).
  *
- *   network <mode> <open-port> <closed-port>
+ *   network <mode> <open-port> <closed-port> [<own-path>]
  *
  * The server (crates/paludarium-harness/tests/diff_network.rs) listens on
  * 127.0.0.1:<open-port> and reads one command byte per connection:
@@ -9,7 +9,8 @@
  *   'c' closes at once;
  *   'b' sends 1 MiB of a pattern, then closes;
  *   'w' reads until the end of input, sends "bye", then closes.
- * Nothing listens on <closed-port>. Only what native Linux and the
+ * Nothing listens on <closed-port>; <own-path> is where the program is, for
+ * the modes that run it again. Only what native Linux and the
  * emulator share is printed: never the client's own port, nor the ports
  * the guest's servers take. */
 #define _GNU_SOURCE
@@ -1358,6 +1359,30 @@ int main(int argc, char **argv) {
         printf("  held-exit=%ld\n", seconds_since(start));
         printf("  all-received-exit=%d\n", drain(c) == sent);
         close(c);
+        /* execve closes a close-on-exec socket as close does, waiting
+           before the new program starts, which drains the peer. */
+        if (argc < 5) return 98;
+        c = client(port, 0, &result);
+        s = accept(l, NULL, NULL);
+        sent = fill(s);
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &one, sizeof one);
+        fcntl(s, F_SETFD, FD_CLOEXEC);
+        char peer[16], bytes[32], since[32];
+        snprintf(peer, sizeof peer, "%d", c);
+        snprintf(bytes, sizeof bytes, "%ld", sent);
+        snprintf(since, sizeof since, "%ld", now_ms());
+        char *again[] = {"network", "linger-exec", argv[2], argv[3], argv[4], peer, bytes, since, NULL};
+        execv(argv[4], again);
+        printf("  exec errno=%d\n", errno);
+        return 1;
+    }
+    if (!strcmp(mode, "linger-exec")) {
+        /* After listen-linger's execve: the peer, the bytes sent and when. */
+        if (argc < 8) return 98;
+        int c = atoi(argv[5]);
+        long sent = atol(argv[6]);
+        printf("  held-exec=%ld\n", seconds_since(atol(argv[7])));
+        printf("  all-received-exec=%d\n", drain(c) == sent);
         return 0;
     }
     if (!strcmp(mode, "listen-fork")) {

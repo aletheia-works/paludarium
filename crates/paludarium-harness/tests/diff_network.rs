@@ -82,7 +82,13 @@ mod linux {
     fn emulated(mode: &str, policy: NetworkPolicy) -> Outcome {
         let (open, closed) = ports();
         let bytes = std::fs::read(guest()).unwrap();
-        let args = ["network", mode, &open.to_string(), &closed.to_string()];
+        let args = [
+            "network",
+            mode,
+            &open.to_string(),
+            &closed.to_string(),
+            "/network",
+        ];
         let config = Config::new(
             "/network",
             args.iter().map(|a| a.as_bytes().to_vec()).collect(),
@@ -113,7 +119,12 @@ mod linux {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (open, closed) = ports();
-        let args = [mode.to_owned(), open.to_string(), closed.to_string()];
+        let args = [
+            mode.to_owned(),
+            open.to_string(),
+            closed.to_string(),
+            guest().display().to_string(),
+        ];
         let native = run_native_within(&guest(), "network", &args, limit).unwrap();
         // The server's port, and the one nothing listens on, which the
         // refused cases need to try.

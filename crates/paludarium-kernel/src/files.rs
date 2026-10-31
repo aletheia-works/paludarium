@@ -103,6 +103,20 @@ impl Files {
     pub(crate) fn exec_path(&self, path: Vec<u8>) -> Result<Vec<u8>, Errno> {
         self.path((-100i32) as u64, path)
     }
+    /// Takes out the descriptors marked close-on-exec, for exec to close,
+    /// when no other task shares this table; one that does keeps the files
+    /// open in it, as Linux's `unshare_files` gives exec a copy first.
+    pub(crate) fn take_close_on_exec(&self) -> Vec<Descriptor> {
+        if Arc::strong_count(&self.fds) != 1 {
+            return Vec::new();
+        }
+        self.fds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extract_if(.., |_, descriptor| descriptor.cloexec)
+            .map(|(_, descriptor)| descriptor)
+            .collect()
+    }
     pub(crate) fn for_exec(&self) -> Self {
         let child = self.for_clone(false, false);
         child
@@ -2173,6 +2187,28 @@ mod files_tests {
         );
         assert!(f.descriptor(0).is_err());
         assert_eq!(f.install_pair([x, y], false, 2), Ok([0, 1]));
+    }
+    #[test]
+    fn exec_takes_the_close_on_exec_descriptors_of_a_table_of_its_own() {
+        let fs = MemFs::new();
+        let f = Files::default();
+        f.fill(0, d(&fs, b"/kept"));
+        f.fill(
+            1,
+            Descriptor {
+                cloexec: true,
+                ..d(&fs, b"/closed")
+            },
+        );
+        // Shared with another task, the table keeps them open there.
+        let shared = f.for_clone(true, true);
+        assert!(f.take_close_on_exec().is_empty());
+        drop(shared);
+        let closed = f.take_close_on_exec();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].path, b"/closed");
+        assert!(f.descriptor(1).is_err());
+        assert_eq!(f.descriptor(0).unwrap().path, b"/kept");
     }
     #[test]
     fn fd_reservation() {

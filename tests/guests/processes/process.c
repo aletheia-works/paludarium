@@ -3707,7 +3707,10 @@ int main(int argc, char **argv) {
         char to[64];
         errno = 0;
         long n = readlinkat(path, "", to, sizeof to);
-        printf("file: readlinkat=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        printf("file: readlinkat=%ld errno=%d", n, n < 0 ? errno : 0);
+        errno = 0;
+        n = readlinkat(AT_FDCWD, "", to, sizeof to);
+        printf(" cwd=%ld errno=%d\n", n, n < 0 ? errno : 0);
         close(path);
         errno = 0;
         int r = open("/proc/self/fd/900", O_PATH | O_NOFOLLOW);

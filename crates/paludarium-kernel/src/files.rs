@@ -1934,10 +1934,15 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         89 | 267 => {
             // An empty path reads the link an `O_PATH | O_NOFOLLOW`
-            // descriptor holds (ENOENT for any other descriptor).
+            // descriptor holds; any other descriptor, and the working
+            // directory (AT_FDCWD), is no link (ENOENT), as Linux's
+            // `do_readlinkat` finds.
             if n == 267 && path(c, a[1])?.is_empty() {
                 if a[3] == 0 {
                     return Err(Errno::EINVAL);
+                }
+                if a[0] as i32 == -100 {
+                    return Err(Errno::ENOENT);
                 }
                 let d = c.files.descriptor(a[0])?;
                 let link = d
@@ -2338,7 +2343,6 @@ fn status_flags(d: &Descriptor) -> u32 {
     const O_DIRECTORY: u32 = 0o200000;
     const O_NOFOLLOW: u32 = 0o400000;
     const O_CLOEXEC: u32 = 0o2000000;
-    const O_PATH: u32 = 0o10000000;
     const OPEN_ONLY: u32 = 0o100 | 0o200 | 0o400 | 0o1000 | O_CLOEXEC;
     let flags = d.file.flags();
     if flags & O_PATH != 0 {

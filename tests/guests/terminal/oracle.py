@@ -16,7 +16,7 @@ from pathlib import Path
 def run(directory, case):
     master = slave = None
     try:
-        if case in (6, 7, 8, 9, 10, 13):
+        if case in (6, 7, 8, 9, 10, 13, 14):
             master, slave = pty.openpty()
             cc = [b"\0"] * termios.NCCS
             cc[termios.VMIN] = 1
@@ -61,5 +61,5 @@ def run(directory, case):
 
 if __name__ == "__main__":
     directory = sys.argv[1]
-    for case in [int(sys.argv[2])] if len(sys.argv) > 2 else range(14):
+    for case in [int(sys.argv[2])] if len(sys.argv) > 2 else range(15):
         run(directory, case)

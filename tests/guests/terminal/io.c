@@ -13,6 +13,11 @@ void test_main(u64 *stack){
  char b[8]={0};long n=sc(0,0,(u64)b,8);value(n);if(n>0)bytes(b,n);value(sc(0,0,(u64)b,8));
 #elif CASE == 2
  sc(1,1,(u64)"out",3);sc(1,2,(u64)"err",3);
+#elif CASE == 14
+ /* A terminal's block size is devpts's: fstat's st_blksize, FIGETBSZ, and fstatfs's f_type and f_bsize. */
+ u64 st[18]={0};value(sc(5,0,(u64)st,0));value(st[7]);
+ int size=0;value(sc(16,0,2,(u64)&size));value(size);
+ u64 fs[15]={0};value(sc(138,0,(u64)fs,0));value(fs[0]);value(fs[1]);
 #else
  char b[36]={0};long fd=0;u64 request=0x5401;u64 ptr=(u64)b;u64 n=36;
 #if CASE == 4 || CASE == 7 || CASE == 13

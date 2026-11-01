@@ -242,6 +242,50 @@ static void int_option(const char *name, int fd, int opt, int value, socklen_t s
     getsockopt(fd, SOL_SOCKET, opt, &got, &len);
     printf("  set %s %d=%ld errno=%d got=%d\n", name, value, n, e, got);
 }
+/* proc-block-size: what a path's stat, lstat, statx and statfs give for
+   its block size, and statfs its type. */
+static void path_block_size(const char *name, const char *path) {
+    struct stat st = {0}, link = {0};
+    /* statx itself, which musl before 1.2.5 has no wrapper for:
+       stx_blksize is the u32 at 4. */
+    unsigned char sx[256] = {0};
+    struct statfs fs = {0};
+    errno = 0;
+    int s = stat(path, &st);
+    int se = errno;
+    errno = 0;
+    int l = lstat(path, &link);
+    int le = errno;
+    errno = 0;
+    int x = (int)syscall(SYS_statx, AT_FDCWD, path, 0, 0x7ff, sx);
+    unsigned blksize;
+    memcpy(&blksize, sx + 4, sizeof blksize);
+    int xe = errno;
+    errno = 0;
+    int f = statfs(path, &fs);
+    int fe = errno;
+    printf("  %s: stat=%d/%d %ld lstat=%d/%d %ld statx=%d/%d %u statfs=%d/%d %#lx %ld\n", name, s, se,
+           (long)st.st_blksize, l, le, (long)link.st_blksize, x, xe, blksize, f, fe,
+           (unsigned long)fs.f_type, (long)fs.f_bsize);
+}
+/* proc-block-size: the same through a descriptor: fstat, FIGETBSZ and
+   fstatfs. */
+static void descriptor_block_size(const char *name, int fd) {
+    struct stat st = {0};
+    struct statfs fs = {0};
+    int block = -7;
+    errno = 0;
+    int s = fstat(fd, &st);
+    int se = errno;
+    errno = 0;
+    int b = ioctl(fd, FIGETBSZ, &block);
+    int be = errno;
+    errno = 0;
+    int f = fstatfs(fd, &fs);
+    int fe = errno;
+    printf("  %s: fstat=%d/%d %ld figetbsz=%d/%d %d fstatfs=%d/%d %#lx %ld\n", name, s, se, (long)st.st_blksize, b,
+           be, block, f, fe, (unsigned long)fs.f_type, (long)fs.f_bsize);
+}
 /* socket-timestamp: the option numbers, as x86-64 Linux has them. */
 #define TS_OLD 29
 #define TS_NS_OLD 35
@@ -3600,6 +3644,56 @@ int main(int argc, char **argv) {
         }
         close(p[0]);
         close(p[1]);
+        return 0;
+    }
+    if (!strcmp(mode, "proc-block-size")) {
+        /* /proc is procfs, whose superblock Linux gives a block size of
+           1024 (proc_fill_super): stat, statx, FIGETBSZ and statfs all
+           give it, with procfs's type. A link in /proc/self/fd is procfs's
+           itself, but leads to its file, which is the file's own. */
+        path_block_size("status", "/proc/self/status");
+        path_block_size("mountinfo", "/proc/self/mountinfo");
+        path_block_size("self", "/proc/self");
+        path_block_size("fd", "/proc/self/fd");
+        path_block_size("missing", "/proc/self/missing");
+        int status = open("/proc/self/status", O_RDONLY);
+        descriptor_block_size("status-fd", status);
+        int dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+        descriptor_block_size("fd-dir", dir);
+        char tmp[] = "/tmp/paludarium-blockXXXXXX";
+        int file = mkstemp(tmp);
+        char link[64];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", file);
+        struct stat target = {0}, through = {0}, link_stat = {0};
+        struct statfs target_fs = {0}, through_fs = {0};
+        fstat(file, &target);
+        fstatfs(file, &target_fs);
+        stat(link, &through);
+        lstat(link, &link_stat);
+        statfs(link, &through_fs);
+        printf("  link: lstat=%ld stat-same=%d statfs-same=%d\n", (long)link_stat.st_blksize,
+               through.st_blksize == target.st_blksize,
+               through_fs.f_type == target_fs.f_type && through_fs.f_bsize == target_fs.f_bsize);
+        int opened = open(link, O_RDONLY);
+        struct stat reopened = {0};
+        fstat(opened, &reopened);
+        printf("  reopened-same=%d\n", reopened.st_blksize == target.st_blksize);
+        /* The pseudo filesystems', devtmpfs's and a pipe's are the page's. */
+        int null = open("/dev/null", O_RDONLY);
+        struct stat null_stat = {0};
+        fstat(null, &null_stat);
+        printf("  null=%ld\n", (long)null_stat.st_blksize);
+        int p[2];
+        pipe(p);
+        descriptor_block_size("pipe", p[0]);
+        close(p[0]);
+        close(p[1]);
+        close(null);
+        close(opened);
+        close(file);
+        unlink(tmp);
+        close(dir);
+        close(status);
         return 0;
     }
     if (!strcmp(mode, "socket-passrights")) {

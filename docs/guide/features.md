@@ -337,10 +337,16 @@ kernel.
 - `SO_PASSSEC` is set and read back as on Linux, and with it a receiver
   with no control buffer finds `MSG_CTRUNC`; it gets no `SCM_SECURITY`
   message, as on a Linux whose security module gives AF_UNIX no sender's
-  context (none, or AppArmor). A socket a listener accepts takes the
-  listener's `SO_PASSCRED`, `SO_PASSPIDFD` and `SO_PASSSEC` as they were
-  when the client connected. An inet socket refuses these three options
-  both ways with `EOPNOTSUPP`, as Linux takes them only on AF_UNIX.
+  context (none, or AppArmor).
+- `SO_PASSRIGHTS` is on for a new AF_UNIX socket, as on Linux 6.16 and
+  later. Set to 0, the socket takes no descriptors: a send that passes some
+  to it is `EPERM`, after a shutdown's `EPIPE` and before a full queue's
+  `EAGAIN`, while a stream send of no bytes passes nothing and gives 0.
+  Descriptors already waiting are still read.
+- A socket a listener accepts takes the listener's `SO_PASSCRED`,
+  `SO_PASSPIDFD`, `SO_PASSSEC` and `SO_PASSRIGHTS` as they were when the
+  client connected. An inet socket refuses these four options both ways
+  with `EOPNOTSUPP`, as Linux takes them only on AF_UNIX.
 - `SO_RCVTIMEO` and `SO_SNDTIMEO` (and their `_NEW` forms) limit how long a
   blocking `recv`, `read`, `send` or `write` on the socket waits, as on
   Linux: past the limit it gives `EAGAIN`, or what it moved, and

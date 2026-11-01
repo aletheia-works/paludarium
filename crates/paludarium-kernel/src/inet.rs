@@ -2573,9 +2573,10 @@ fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
 /// `setsockopt` of an inet socket: the `SOL_SOCKET` options a client sets,
 /// `IPPROTO_TCP`'s `TCP_NODELAY`, keepalive timing (1 to 32767 seconds, at
 /// most 127 probes), `TCP_QUICKACK` and `TCP_USER_TIMEOUT`, `IP_TOS` and
-/// `IPV6_V6ONLY`. `SO_PASSCRED`, `SO_PASSSEC` and `SO_PASSPIDFD` are
-/// EOPNOTSUPP, as Linux's `sk_may_scm_recv` takes them only on AF_UNIX
-/// (and netlink and Bluetooth). Any other option is ENOPROTOOPT. Only
+/// `IPV6_V6ONLY`. `SO_PASSCRED`, `SO_PASSSEC`, `SO_PASSPIDFD` and
+/// `SO_PASSRIGHTS` are EOPNOTSUPP, as Linux takes them only on AF_UNIX
+/// (`sk_may_scm_recv` adds netlink and Bluetooth for the first two). Any
+/// other option is ENOPROTOOPT. Only
 /// `TCP_NODELAY` reaches the host; the rest are kept for getsockopt.
 fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u64, Errno> {
     let (level, name, at, len) = (a[1], a[2], a[3], a[4]);
@@ -2594,7 +2595,7 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
             };
             options.timestamps.set(name as u32, value, unconnected)?;
         }
-        (1, 16 | 34 | 76) => {
+        (1, 16 | 34 | 76 | 83) => {
             option_int(c, at, len)?;
             return Err(EOPNOTSUPP);
         }
@@ -2723,7 +2724,8 @@ fn size_buffers(stream: &Stream, options: &Options) {
 /// `SO_TYPE`, `SO_ERROR` (which takes the pending error), `SO_ACCEPTCONN`,
 /// `SO_PROTOCOL` and `SO_DOMAIN`. A level the socket does not have is
 /// EOPNOTSUPP (setsockopt's is ENOPROTOOPT), as are `SO_PASSCRED`,
-/// `SO_PASSSEC` and `SO_PASSPIDFD`; an unknown name is ENOPROTOOPT.
+/// `SO_PASSSEC`, `SO_PASSPIDFD` and `SO_PASSRIGHTS`; an unknown name is
+/// ENOPROTOOPT.
 fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u64, Errno> {
     let (level, name, at, len_at) = (a[1], a[2], a[3], a[4]);
     let mut raw = [0; 4];
@@ -2746,7 +2748,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         return Err(EOPNOTSUPP);
     }
     let value: Vec<u8> = match (level, name) {
-        (1, 16 | 34 | 76) => return Err(EOPNOTSUPP),
+        (1, 16 | 34 | 76 | 83) => return Err(EOPNOTSUPP),
         (1, _) if Timestamps::is_option(name as u32) => options.timestamps.get(name as u32),
         (1, 20 | 21 | 66 | 67) => {
             let timeout = if matches!(name, 20 | 66) {

@@ -311,10 +311,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `SO_PASSSEC` は Linux と同じく設定でき、読み出せます。設定のある受け手が制御の
   バッファなしで受け取ると `MSG_CTRUNC` になります。`SCM_SECURITY` のメッセージは
   来ません。AF_UNIX に送り手のコンテキストを渡すセキュリティモジュールのない Linux
-  （モジュールなし、または AppArmor）と同じです。待ち受けが受け付けたソケットは、
-  クライアントが接続したときの待ち受けの `SO_PASSCRED`、`SO_PASSPIDFD`、
-  `SO_PASSSEC` を引き継ぎます。inet のソケットでは、Linux が AF_UNIX でしか
-  受け付けないので、この 3 つは設定も読み出しも `EOPNOTSUPP` です。
+  （モジュールなし、または AppArmor）と同じです。
+- `SO_PASSRIGHTS` は、Linux 6.16 以降と同じく、新しい AF_UNIX のソケットでは
+  有効です。0 にするとソケットはディスクリプタを受け取らず、それを渡す送信は
+  `EPERM` になります。シャットダウンの `EPIPE` よりあと、キューが満杯の `EAGAIN`
+  より先です。ストリームで 0 バイトを送るときは何も渡さないので、0 を返します。
+  すでに待っているディスクリプタは読めます。
+- 待ち受けが受け付けたソケットは、クライアントが接続したときの待ち受けの
+  `SO_PASSCRED`、`SO_PASSPIDFD`、`SO_PASSSEC`、`SO_PASSRIGHTS` を引き継ぎます。
+  inet のソケットでは、Linux が AF_UNIX でしか受け付けないので、この 4 つは
+  設定も読み出しも `EOPNOTSUPP` です。
 - `SO_RCVTIMEO` と `SO_SNDTIMEO`（と `_NEW` の形）は、Linux と同じく、そのソケットでの
   `recv`、`read`、`send`、`write` が待つ時間を限ります。限りを過ぎると `EAGAIN`、または
   そこまでに動かした分を返し、`MSG_WAITALL` もそこで止まります。0 の `timeval` は

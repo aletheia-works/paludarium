@@ -79,6 +79,7 @@
     {"name":"socket-timestamp","binary":"process"},
     {"name":"socket-timestamping","binary":"process"},
     {"name":"socket-passsec","binary":"process"},
+    {"name":"socket-passrights","binary":"process"},
     {"name":"socket-timeouts","binary":"process"},
     {"name":"signal-restart","binary":"process"},
     {"name":"signal-io","binary":"process"},

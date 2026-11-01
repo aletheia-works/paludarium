@@ -2100,10 +2100,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "scm-options")) {
-        /* SO_PASSCRED, SO_PASSSEC and SO_PASSPIDFD on inet sockets, which
-           Linux's sock.c takes only on AF_UNIX (sk_may_scm_recv): EOPNOTSUPP
+        /* SO_PASSCRED, SO_PASSSEC, SO_PASSPIDFD and SO_PASSRIGHTS on inet
+           sockets, which Linux's sock.c takes only on AF_UNIX: EOPNOTSUPP
            both ways, after the int setsockopt needs (EINVAL). */
-        const int names[] = {16, 34, 76};
+        const int names[] = {16, 34, 76, 83};
         const int kinds[][2] = {{AF_INET, SOCK_STREAM}, {AF_INET, SOCK_DGRAM},
                                 {AF_INET6, SOCK_STREAM}, {AF_INET6, SOCK_DGRAM}};
         for (int k = 0; k < 4; k++) {
@@ -2112,7 +2112,7 @@ int main(int argc, char **argv) {
                 perror("socket");
                 return 1;
             }
-            for (int i = 0; i < 3; i++) {
+            for (int i = 0; i < 4; i++) {
                 int one = 1, got = -7;
                 socklen_t len = sizeof got;
                 errno = 0;

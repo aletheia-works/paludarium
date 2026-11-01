@@ -113,6 +113,27 @@ mod pipe_tests {
         assert_eq!(r.seek(0, 0), Err(Errno::ESPIPE));
     }
     #[test]
+    fn a_reopened_end_is_a_description_of_its_own() {
+        let [r, w] = pair();
+        // Only the access the end has opens it again.
+        assert!(w.reopen(0).is_err());
+        assert!(w.reopen(2).is_err());
+        let again = w.reopen(1 | NONBLOCK).unwrap();
+        assert_eq!(again.flags(), 1 | NONBLOCK);
+        assert_eq!(w.flags(), 1);
+        w.set_flags(NONBLOCK).unwrap();
+        again.set_flags(0).unwrap();
+        assert_eq!((w.flags(), again.flags()), (1 | NONBLOCK, 1));
+        // The same pipe, whose write end stays open while either does.
+        assert_eq!(again.write(b"x"), Ok(1));
+        drop(w);
+        let mut byte = [0];
+        assert_eq!(r.read(&mut byte), Ok(1));
+        assert_eq!(r.read(&mut byte), Err(Errno::EAGAIN));
+        drop(again);
+        assert_eq!(r.read(&mut byte), Ok(0));
+    }
+    #[test]
     fn readiness_transition() {
         let [r, w] = pair();
         assert_eq!(r.readiness().unwrap().0, 0);

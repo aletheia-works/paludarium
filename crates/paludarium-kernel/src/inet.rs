@@ -733,6 +733,11 @@ impl Signals {
         }
     }
 }
+/// The host's real time, which stamps what a stream receives.
+fn realtime(host: &Arc<dyn paludarium_host::Host>) -> paludarium_host::net::Clock {
+    let host = Arc::clone(host);
+    Arc::new(move || host.clock(paludarium_host::ClockId::Realtime).ok())
+}
 /// What a stream's change signals, as Linux's TCP does: `POLL_OUT` when the
 /// connection opens (`tcp_finish_connect`), `POLL_ERR` when it fails
 /// (`sk_error_report`), `POLL_IN` for data (`sk_data_ready`), for the
@@ -740,11 +745,6 @@ impl Signals {
 /// (`tcp_fin`), and then `POLL_IN` as for data (`tcp_data_queue` queues the
 /// FIN), and `POLL_OUT` for room after a full buffer
 /// (`sk_stream_write_space`).
-/// The host's real time, which stamps what a stream receives.
-fn realtime(host: &Arc<dyn paludarium_host::Host>) -> paludarium_host::net::Clock {
-    let host = Arc::clone(host);
-    Arc::new(move || host.clock(paludarium_host::ClockId::Realtime).ok())
-}
 fn stream_waker(
     signals: &Arc<Signals>,
     hub: &Arc<ReadinessHub>,

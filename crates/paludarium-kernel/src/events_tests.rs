@@ -2958,6 +2958,10 @@ fn socket_options_are_kept_as_linux_keeps_them() {
     assert_eq!(get(&mut f, 34), (0, 0));
     assert_eq!(set(&mut f, 34, 5, 4), 0);
     assert_eq!(get(&mut f, 34), (0, 1));
+    // SO_PASSRIGHTS is on until set to 0.
+    assert_eq!(get(&mut f, 83), (0, 1));
+    assert_eq!(set(&mut f, 83, 0, 4), 0);
+    assert_eq!(get(&mut f, 83), (0, 0));
     // Too short a value, another level, and an unknown option.
     assert_eq!(set(&mut f, 9, 1, 2), fail(22));
     assert_eq!(f.ret(54, [a, 6, 1, value, 4, 0]), fail(95));

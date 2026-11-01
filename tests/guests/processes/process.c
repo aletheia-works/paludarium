@@ -382,6 +382,51 @@ static void print_id(const char *name, unsigned id, unsigned own) {
 #ifndef SO_PASSPIDFD
 #define SO_PASSPIDFD 76
 #endif
+#ifndef SO_PASSRIGHTS
+#define SO_PASSRIGHTS 83
+#endif
+/* socket-passrights: a sendmsg of `len` bytes of `data` with `flags`,
+   passing `fd` unless it is negative; prints what it returns. */
+static void rights_send(const char *name, int socket, const char *data, size_t len, int flags, int fd) {
+    struct iovec iov = {(void *)data, len};
+    union { char bytes[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } control;
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+    if (fd >= 0) {
+        message.msg_control = control.bytes;
+        message.msg_controllen = sizeof control.bytes;
+        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(header), &fd, sizeof fd);
+    }
+    errno = 0;
+    long n = sendmsg(socket, &message, flags | MSG_NOSIGNAL | MSG_DONTWAIT);
+    printf("  %s: sent=%ld errno=%d\n", name, n, n < 0 ? errno : 0);
+}
+/* socket-passrights: a recvmsg of up to 8 bytes with `flags`; prints the
+   bytes and how many descriptors came, which it closes. */
+static void rights_receive(const char *name, int socket, int flags) {
+    char data[8];
+    struct iovec iov = {data, sizeof data};
+    union { char bytes[CMSG_SPACE(sizeof(int) * 4)]; struct cmsghdr align; } control;
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control.bytes,
+                             .msg_controllen = sizeof control.bytes};
+    errno = 0;
+    long n = recvmsg(socket, &message, flags | MSG_DONTWAIT);
+    int fds = 0;
+    if (n >= 0)
+        for (struct cmsghdr *h = CMSG_FIRSTHDR(&message); h; h = CMSG_NXTHDR(&message, h))
+            if (h->cmsg_level == SOL_SOCKET && h->cmsg_type == SCM_RIGHTS)
+                for (size_t at = 0; CMSG_LEN(at) < h->cmsg_len; at += sizeof(int)) {
+                    int fd;
+                    memcpy(&fd, CMSG_DATA(h) + at, sizeof fd);
+                    close(fd);
+                    fds++;
+                }
+    printf("  %s: n=%ld errno=%d data=%.*s fds=%d flags=%#x\n", name, n, n < 0 ? errno : 0,
+           n > 0 ? (int)n : 0, data, fds, message.msg_flags);
+}
 /* socket-passsec: the flags that a socket a listener accepts takes from
    it, as getsockopt reads them: SO_PASSCRED, SO_PASSSEC, SO_PASSPIDFD. */
 static void passing(const char *name, int fd) {
@@ -3552,6 +3597,132 @@ int main(int argc, char **argv) {
             printf("  read=%ld\n", (long)read(sv[1], &byte, 1));
             close(sv[0]);
             close(sv[1]);
+        }
+        close(p[0]);
+        close(p[1]);
+        return 0;
+    }
+    if (!strcmp(mode, "socket-passrights")) {
+        /* SO_PASSRIGHTS on AF_UNIX sockets, as Linux's sock.c and af_unix
+           have it: on for a new socket, and set to 0 a socket takes no
+           descriptors, so a send that passes some to it is EPERM, past the
+           receiver's shutdown (EPIPE) and before a full queue (EAGAIN),
+           and a stream send of no bytes passes nothing to refuse. What
+           waits is still read whole. A socket a listener accepts takes the
+           listener's as it was when the client connected. */
+        int p[2];
+        if (pipe(p) != 0) {
+            perror("pipe");
+            return 1;
+        }
+        const int types[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int t = 0; t < 3; t++) {
+            int sv[2];
+            if (socketpair(AF_UNIX, types[t], 0, sv) != 0) {
+                perror("socketpair");
+                return 1;
+            }
+            printf("type %d\n", types[t]);
+            int got = -7;
+            socklen_t len = sizeof got;
+            getsockopt(sv[1], SOL_SOCKET, SO_PASSRIGHTS, &got, &len);
+            printf("  default=%d\n", got);
+            int_option("short", sv[1], SO_PASSRIGHTS, 0, 2);
+            /* Sent while it took them, and read after. */
+            rights_send("before", sv[0], "a", 1, 0, p[0]);
+            int_option("off", sv[1], SO_PASSRIGHTS, 0, 4);
+            rights_receive("waiting", sv[1], 0);
+            rights_send("refused", sv[0], "b", 1, 0, p[0]);
+            rights_send("plain", sv[0], "c", 1, 0, -1);
+            rights_receive("plain", sv[1], 0);
+            rights_send("empty", sv[0], "", 0, 0, p[0]);
+            if (types[t] == SOCK_STREAM) {
+                rights_send("oob", sv[0], "de", 2, MSG_OOB, p[0]);
+                rights_send("oob-alone", sv[0], "f", 1, MSG_OOB, p[0]);
+            }
+            /* The other way it still takes them. */
+            rights_send("back", sv[1], "g", 1, 0, p[0]);
+            rights_receive("back", sv[0], 0);
+            int_option("on", sv[1], SO_PASSRIGHTS, 7, 4);
+            rights_send("again", sv[0], "h", 1, 0, p[0]);
+            rights_receive("again", sv[1], 0);
+            /* Shut down for reading: EPIPE comes first. */
+            int_option("off", sv[1], SO_PASSRIGHTS, 0, 4);
+            shutdown(sv[1], SHUT_RD);
+            rights_send("shut", sv[0], "i", 1, 0, p[0]);
+            close(sv[0]);
+            close(sv[1]);
+        }
+        /* A datagram to a socket's name, which refuses them. */
+        {
+            struct sockaddr_un a;
+            socklen_t alen = unix_abstract(&a, "passrights-dgram");
+            int r = socket(AF_UNIX, SOCK_DGRAM, 0), w = socket(AF_UNIX, SOCK_DGRAM, 0);
+            if (r < 0 || w < 0 || bind(r, (struct sockaddr *)&a, alen) != 0) {
+                perror("dgram");
+                return 1;
+            }
+            printf("named\n");
+            int_option("off", r, SO_PASSRIGHTS, 0, 4);
+            struct iovec iov = {"j", 1};
+            union { char bytes[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } control;
+            struct msghdr message = {.msg_name = &a, .msg_namelen = alen, .msg_iov = &iov, .msg_iovlen = 1,
+                                     .msg_control = control.bytes, .msg_controllen = sizeof control.bytes};
+            struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+            header->cmsg_level = SOL_SOCKET;
+            header->cmsg_type = SCM_RIGHTS;
+            header->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(header), &p[0], sizeof p[0]);
+            errno = 0;
+            long n = sendmsg(w, &message, MSG_DONTWAIT);
+            printf("  sendto: sent=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            message.msg_control = NULL;
+            message.msg_controllen = 0;
+            errno = 0;
+            n = sendmsg(w, &message, MSG_DONTWAIT);
+            printf("  sendto-plain: sent=%ld errno=%d\n", n, n < 0 ? errno : 0);
+            rights_receive("named", r, 0);
+            close(r);
+            close(w);
+        }
+        const int listening[] = {SOCK_STREAM, SOCK_SEQPACKET};
+        for (int t = 0; t < 2; t++) {
+            struct sockaddr_un a;
+            socklen_t alen = unix_abstract(&a, "passrights");
+            int l = socket(AF_UNIX, listening[t], 0);
+            if (l < 0 || bind(l, (struct sockaddr *)&a, alen) != 0 || listen(l, 4) != 0) {
+                perror("listener");
+                return 1;
+            }
+            printf("listener %d\n", listening[t]);
+            int_option("listener", l, SO_PASSRIGHTS, 0, 4);
+            int first = socket(AF_UNIX, listening[t], 0);
+            if (connect(first, (struct sockaddr *)&a, alen) != 0) {
+                perror("connect");
+                return 1;
+            }
+            int_option("listener", l, SO_PASSRIGHTS, 1, 4);
+            int second = socket(AF_UNIX, listening[t], 0);
+            if (connect(second, (struct sockaddr *)&a, alen) != 0) {
+                perror("connect");
+                return 1;
+            }
+            int got = accept(l, NULL, NULL), value = -7;
+            socklen_t len = sizeof value;
+            getsockopt(got, SOL_SOCKET, SO_PASSRIGHTS, &value, &len);
+            printf("  first-accepted=%d\n", value);
+            rights_send("first", first, "k", 1, 0, p[0]);
+            close(got);
+            got = accept(l, NULL, NULL);
+            value = -7;
+            getsockopt(got, SOL_SOCKET, SO_PASSRIGHTS, &value, &len);
+            printf("  second-accepted=%d\n", value);
+            rights_send("second", second, "l", 1, 0, p[0]);
+            rights_receive("second", got, 0);
+            close(got);
+            close(first);
+            close(second);
+            close(l);
         }
         close(p[0]);
         close(p[1]);

@@ -1124,6 +1124,7 @@ const SO_PASSCRED: u32 = 16;
 const SO_PEERCRED: u32 = 17;
 const SO_PASSPIDFD: u32 = 76;
 const SO_PEERPIDFD: u32 = 77;
+const SO_PASSRIGHTS: u32 = 83;
 /// The control message of a pidfd of a message's sender.
 const SCM_PIDFD: u32 = 4;
 const SO_RCVLOWAT: u32 = 18;
@@ -1342,7 +1343,8 @@ pub(crate) fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// ENOPROTOOPT. `SO_PASSCRED` makes messages carry credentials
 /// ([`Credentials`]), `SO_PASSPIDFD` them and a pidfd of their sender
 /// ([`put_pidfd`]), `SO_PASSSEC` their sender's security context, which
-/// there is none of ([`deliver`]), `SO_TIMESTAMP` and its kin, and
+/// there is none of ([`deliver`]), `SO_PASSRIGHTS` 0 refuses descriptors
+/// (`EPERM` for a send that passes some), `SO_TIMESTAMP` and its kin, and
 /// `SO_TIMESTAMPING`, timestamps ([`Timestamps`]), `SO_RCVLOWAT` sets what a
 /// stream read waits for ([`receive_with`]; 0 is 1, and a negative value
 /// `INT_MAX`), and `SO_PEEK_OFF` where a peek starts (any value, a negative
@@ -1376,6 +1378,10 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     if name == SO_PASSSEC {
         socket.lock_sides()[socket.side].pass_security = on;
+        return Ok(0);
+    }
+    if name == SO_PASSRIGHTS {
+        socket.lock_sides()[socket.side].refuses_rights = !on;
         return Ok(0);
     }
     if name == SO_PEEK_OFF {
@@ -1484,6 +1490,7 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_ERROR => int(socket.take_error().map_or(0, |error| error.0)),
         SO_BSDCOMPAT | SO_REUSEPORT | SO_PROTOCOL => int(0),
         SO_PASSSEC => int(socket.lock_sides()[socket.side].pass_security.into()),
+        SO_PASSRIGHTS => int((!socket.lock_sides()[socket.side].refuses_rights).into()),
         // As Linux's `sk_getsockopt`: each names only the form it set.
         name if Timestamps::is_option(name) => {
             socket.lock_sides()[socket.side].timestamps.get(name)
@@ -1769,6 +1776,10 @@ struct Side {
     /// here, as on a Linux whose module has none for AF_UNIX (AppArmor's
     /// `socket_getpeersec_dgram` is `ENOPROTOOPT`).
     pass_security: bool,
+    /// `SO_PASSRIGHTS` 0: this end takes no descriptors, so a send that
+    /// passes some to it is `EPERM`, as Linux's `sk_scm_rights`, which a
+    /// new AF_UNIX socket has set.
+    refuses_rights: bool,
     /// `SO_PEEK_OFF`: where a peek starts, moved on by each peek and back
     /// by each read, as Linux's `sk_peek_off`; a negative value is none.
     peek_offset: i32,
@@ -2133,20 +2144,26 @@ impl SocketPairEnd {
     fn passes_security(&self) -> bool {
         self.lock_sides()[self.side].pass_security
     }
-    /// Takes `from`'s `SO_PASSCRED`, `SO_PASSPIDFD` and `SO_PASSSEC`, as
-    /// Linux's `unix_stream_connect` gives the socket a listener will accept
-    /// the listener's `sk_scm_recv_flags`.
+    /// Takes `from`'s `SO_PASSCRED`, `SO_PASSPIDFD`, `SO_PASSSEC` and
+    /// `SO_PASSRIGHTS`, as Linux's `unix_stream_connect` gives the socket a
+    /// listener will accept the listener's `sk_scm_recv_flags`.
     pub(crate) fn take_passing(&self, from: &Self) {
-        let (credentials, pidfd, security) = {
+        let (credentials, pidfd, security, refuses_rights) = {
             let sides = from.lock_sides();
             let side = &sides[from.side];
-            (side.pass_credentials, side.pass_pidfd, side.pass_security)
+            (
+                side.pass_credentials,
+                side.pass_pidfd,
+                side.pass_security,
+                side.refuses_rights,
+            )
         };
         let mut sides = self.lock_sides();
         let side = &mut sides[self.side];
         side.pass_credentials = credentials;
         side.pass_pidfd = pidfd;
         side.pass_security = security;
+        side.refuses_rights = refuses_rights;
     }
     /// `SO_RCVLOWAT` on this end.
     fn receive_low_water(&self) -> usize {
@@ -3302,8 +3319,9 @@ impl SocketPairEnd {
         Some(own.writes.drain(..).map(|write| write.passed).collect())
     }
     /// A datagram `sender` sent joins this end's queue, unless reading is
-    /// shut down (`EPIPE`), more than `limit` messages wait, or the bytes
-    /// waiting leave no room for it (`EAGAIN`).
+    /// shut down (`EPIPE`), it passes descriptors this end refuses
+    /// (`SO_PASSRIGHTS`, `EPERM`), more than `limit` messages wait, or the
+    /// bytes waiting leave no room for it (`EAGAIN`).
     pub(crate) fn enqueue(
         &self,
         sender: &SocketPairEnd,
@@ -3320,6 +3338,9 @@ impl SocketPairEnd {
         let own = &mut sides[self.side];
         if own.read_shutdown {
             return Err(Errno(32));
+        }
+        if !passed.is_empty() && own.refuses_rights {
+            return Err(Errno::EPERM);
         }
         // Only the queue's length bounds it, not its bytes: the sender's
         // send buffer does (`check_datagram_send`).
@@ -3466,6 +3487,10 @@ impl SocketPairEnd {
             if full {
                 return Err(Errno::EAGAIN);
             }
+            // As unix_dgram_sendmsg, past the peer's shutdown.
+            if !passed.is_empty() && peer.refuses_rights {
+                return Err(Errno::EPERM);
+            }
             peer.bytes
                 .try_reserve(buf.len())
                 .map_err(|_| Errno::ENOMEM)?;
@@ -3507,6 +3532,11 @@ impl SocketPairEnd {
         NO_ROOM.set(!pipe && count == 0 && !buf.is_empty());
         if count == 0 && !buf.is_empty() {
             return Err(Errno::EAGAIN);
+        }
+        // The first part, which takes the descriptors, finds the peer
+        // refusing them (unix_stream_sendmsg); no bytes, no part.
+        if count > 0 && !passed.is_empty() && peer.refuses_rights {
+            return Err(Errno::EPERM);
         }
         peer.bytes.try_reserve(count).map_err(|_| Errno::ENOMEM)?;
         peer.writes
@@ -3583,6 +3613,9 @@ impl SocketPairEnd {
             return Err(Errno::EAGAIN);
         }
         let peer = &mut sides[1 - self.side];
+        if !passed.is_empty() && peer.refuses_rights {
+            return Err(Errno::EPERM);
+        }
         peer.bytes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
         peer.writes.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
         for write in &mut peer.writes {

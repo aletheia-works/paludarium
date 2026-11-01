@@ -3674,6 +3674,10 @@ int main(int argc, char **argv) {
         printf("  link: lstat=%ld stat-same=%d statfs-same=%d\n", (long)link_stat.st_blksize,
                through.st_blksize == target.st_blksize,
                through_fs.f_type == target_fs.f_type && through_fs.f_bsize == target_fs.f_bsize);
+        /* A link for a descriptor that is not open is not there. */
+        char closed[64];
+        snprintf(closed, sizeof closed, "/proc/self/fd/%d", 900);
+        path_block_size("closed-link", closed);
         int opened = open(link, O_RDONLY);
         struct stat reopened = {0};
         fstat(opened, &reopened);

@@ -2027,11 +2027,16 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         137 => {
             let p = at(c, (-100i32) as u64, a[0])?;
             let stats = if in_proc(&p) {
-                // A link in `fd` leads to its descriptor's file.
+                // A link in `fd` leads to its descriptor's file; one for a
+                // descriptor not open is not there (`ENOENT`).
                 if let Some(crate::proc::OwnEntry::Descriptor(n)) =
                     crate::proc::own_entry(&p, c.process.pid)
                 {
-                    descriptor_statfs(c, &c.files.descriptor(u64::from(n))?)?
+                    let d = c
+                        .files
+                        .descriptor(u64::from(n))
+                        .map_err(|_| Errno::ENOENT)?;
+                    descriptor_statfs(c, &d)?
                 } else {
                     if generated_stat(c, &p, true).is_none() {
                         c.files.fs.metadata(&p, true)?;
@@ -2758,12 +2763,11 @@ fn descriptor_entries(c: &Context<'_>) -> Vec<paludarium_host::DirectoryEntry> {
         })
         .collect()
 }
-/// The `stat` of a generated /proc path, and its device, or `None` for any
-/// other path (and for a link to a descriptor that is not open). A link in
-/// `/proc/self/fd` is followed to its file unless `follow` is false.
 /// The `stat` of a file paludarium makes itself (`/dev`, `/proc`), with its
-/// device and block size: devtmpfs's for `/dev`, procfs's for `/proc`, and
-/// for a link in `fd` followed, its descriptor's file's.
+/// device and block size (devtmpfs's for `/dev`, procfs's for `/proc`), or
+/// `None` for any other path and for a link to a descriptor that is not
+/// open. A link in `/proc/self/fd` is followed to its file, whose block size
+/// it takes, unless `follow` is false.
 fn generated_stat(c: &Context<'_>, path: &[u8], follow: bool) -> Option<(FileStat, u64, u32)> {
     if let Some(target) = crate::devices::through_link(path) {
         return generated_stat(c, &target, follow);

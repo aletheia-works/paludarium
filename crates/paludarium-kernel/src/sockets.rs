@@ -7,7 +7,7 @@ use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 use paludarium_types::GuestAddr;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 // Per-stream flow-control window, not a per-guest memory/fd quota. Native
@@ -15,6 +15,20 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 // saturation, partial success and readiness transitions instead of byte counts.
 pub(crate) const SEND_WINDOW: usize = 212_992;
 
+/// The owner (`F_SETOWN`, `F_SETSIG`) and `O_ASYNC` registration of one
+/// open file description of a pipe, as Linux keeps `f_owner` and the
+/// `fasync` entry for each file.
+#[derive(Default)]
+pub(crate) struct Signalling {
+    owner: FileOwner,
+    registration: Option<Registration>,
+    /// When `O_ASYNC` was turned on, by [`REGISTRATIONS`]: Linux's
+    /// `fasync_insert_entry` puts a new entry first, so `kill_fasync`
+    /// signals the latest first.
+    since: u64,
+}
+/// Counts `O_ASYNC` registrations of pipe descriptions, to order them.
+static REGISTRATIONS: AtomicU64 = AtomicU64::new(0);
 /// Unidirectional anonymous pipe using the same buffered readiness transport.
 pub(crate) struct PipeEnd {
     endpoint: Arc<SocketPairEnd>,
@@ -31,6 +45,9 @@ pub(crate) struct PipeEnd {
     /// The write end too, for a description of both opened `O_RDWR`, whose
     /// `endpoint` is the read end.
     writer: Option<Arc<SocketPairEnd>>,
+    /// This description's owner and `O_ASYNC`, which the sides it reads or
+    /// writes signal ([`Side`]'s `descriptions`).
+    signalling: Arc<Mutex<Signalling>>,
 }
 /// What `fchmod` and `fchown` change on the inode of a pipe or a socket, as
 /// Linux's `simple_setattr` keeps them: the mode, whose file type stays, and
@@ -137,6 +154,40 @@ mod pipe_tests {
         assert_eq!(r.read(&mut byte), Ok(0));
     }
     #[test]
+    fn each_description_has_its_own_owner_and_o_async() {
+        let [r, _w] = pair();
+        let again = r.reopen(0).unwrap();
+        let again = again
+            .as_any()
+            .and_then(|v| v.downcast_ref::<PipeEnd>())
+            .unwrap();
+        let owner = FileOwner {
+            id: 7,
+            ..FileOwner::default()
+        };
+        r.set_file_owner(owner);
+        r.set_async(Some(Registration {
+            processes: Weak::new(),
+            fd: 3,
+        }));
+        assert_eq!(r.file_owner(), owner);
+        assert_eq!(r.flags() & O_ASYNC, O_ASYNC);
+        assert_eq!(again.file_owner(), FileOwner::default());
+        assert_eq!(again.flags() & O_ASYNC, 0);
+        // The read side signals each description open with O_ASYNC, the
+        // latest registered first.
+        again.set_async(Some(Registration {
+            processes: Weak::new(),
+            fd: 4,
+        }));
+        let sides = r.endpoint.lock_sides();
+        let fds: Vec<i32> = SocketPairEnd::notice(&sides, r.endpoint.side, Reason::In)
+            .iter()
+            .map(|notice| notice.to.fd)
+            .collect();
+        assert_eq!(fds, [4, 3]);
+    }
+    #[test]
     fn a_pipe_opened_read_write_is_both_ends() {
         let [r, w] = pair();
         let both = w.reopen(2 | NONBLOCK).unwrap();
@@ -233,8 +284,8 @@ impl PipeEnd {
             Arc::downgrade(&reader),
             Arc::downgrade(&writer),
         ]));
-        Ok([
-            Arc::new(Self {
+        let ends = [
+            Self {
                 endpoint: reader,
                 reader: true,
                 inode,
@@ -242,8 +293,9 @@ impl PipeEnd {
                 nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
                 ends: Arc::clone(&ends),
                 writer: None,
-            }),
-            Arc::new(Self {
+                signalling: Arc::default(),
+            },
+            Self {
                 endpoint: writer,
                 reader: false,
                 inode,
@@ -251,11 +303,57 @@ impl PipeEnd {
                 nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
                 ends,
                 writer: None,
-            }),
-        ])
+                signalling: Arc::default(),
+            },
+        ];
+        Ok(ends.map(|end| {
+            end.listen();
+            Arc::new(end)
+        }))
     }
 }
 impl PipeEnd {
+    /// Puts this description on the sides it reads or writes, which signal
+    /// it, dropping those of descriptions since closed.
+    fn listen(&self) {
+        let read_side = if self.reader {
+            self.endpoint.side
+        } else {
+            1 - self.endpoint.side
+        };
+        let mut sides = self.endpoint.lock_sides();
+        let mut join = |side: usize| {
+            let descriptions = &mut sides[side].descriptions;
+            descriptions.retain(|description| description.strong_count() != 0);
+            descriptions.push(Arc::downgrade(&self.signalling));
+        };
+        if self.reader {
+            join(read_side);
+        }
+        if !self.reader || self.writer.is_some() {
+            join(1 - read_side);
+        }
+    }
+    fn signalling(&self) -> std::sync::MutexGuard<'_, Signalling> {
+        self.signalling
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// `F_GETOWN`: who this description's signals go to.
+    pub(crate) fn file_owner(&self) -> FileOwner {
+        self.signalling().owner
+    }
+    /// `F_SETOWN` and `F_SETSIG`, for this description.
+    pub(crate) fn set_file_owner(&self, owner: FileOwner) {
+        self.signalling().owner = owner;
+    }
+    /// `F_SETFL` turning `O_ASYNC` on, with its registration, or off, for
+    /// this description.
+    pub(crate) fn set_async(&self, registration: Option<Registration>) {
+        let mut signalling = self.signalling();
+        signalling.registration = registration;
+        signalling.since = REGISTRATIONS.fetch_add(1, Ordering::SeqCst);
+    }
     /// The pipe's read end, or with `reader` false its write end: the one
     /// some description holds, or, when all of them closed, the end opened
     /// again ([`SocketPairEnd::reopened`]).
@@ -363,10 +461,16 @@ impl FileHandle for PipeEnd {
         } else {
             u32::from(!self.reader)
         };
-        access | nonblocking | (self.endpoint.flags() & O_ASYNC)
+        let signals = if self.signalling().registration.is_some() {
+            O_ASYNC
+        } else {
+            0
+        };
+        access | nonblocking | signals
     }
+    /// `O_NONBLOCK`; `O_ASYNC` is this description's registration, which
+    /// [`crate::fasync::set_flags`] makes.
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        self.endpoint.set_flags(flags)?;
         self.nonblocking
             .store(flags & NONBLOCK != 0, Ordering::SeqCst);
         Ok(())
@@ -387,7 +491,7 @@ impl FileHandle for PipeEnd {
             2 => (self.end(true), true, Some(self.end(false))),
             _ => return Err(ENXIO),
         };
-        Ok(Arc::new(Self {
+        let description = Self {
             endpoint,
             reader,
             inode: self.inode,
@@ -395,7 +499,10 @@ impl FileHandle for PipeEnd {
             nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
             ends: Arc::clone(&self.ends),
             writer,
-        }))
+            signalling: Arc::default(),
+        };
+        description.listen();
+        Ok(Arc::new(description))
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
         Err(Errno::ESPIPE)
@@ -584,6 +691,10 @@ fn socket(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
         return Err(Errno(88));
     }
     Ok(file)
+}
+/// The pipe description `file` is, which keeps its own owner and `O_ASYNC`.
+pub(crate) fn pipe(file: &Arc<dyn FileHandle>) -> Option<&PipeEnd> {
+    file.as_any()?.downcast_ref::<PipeEnd>()
 }
 /// The socket end of a socket or a pipe, which keeps its owner and
 /// `O_ASYNC` itself.
@@ -1929,6 +2040,10 @@ struct Side {
     owner: FileOwner,
     /// `O_ASYNC`: this end signals its owner when it changes.
     registration: Option<Registration>,
+    /// A pipe's open file descriptions that read (or, on the write side,
+    /// write) it, each with its own owner and `O_ASYNC`, as Linux's
+    /// `fasync_readers` and `fasync_writers` hold them.
+    descriptions: Vec<Weak<Mutex<Signalling>>>,
     /// A send found the buffer full, so the space a read frees signals this
     /// end `POLL_OUT`, once, as Linux's `SOCKWQ_ASYNC_NOSPACE`.
     no_space: bool,
@@ -2284,7 +2399,7 @@ impl SocketPairEnd {
             Self::notice(&sides, 1 - self.side, Reason::Error)
         };
         self.pair.hub.changed();
-        if let Some(notice) = notice {
+        for notice in notice {
             notice.send();
         }
     }
@@ -2453,10 +2568,11 @@ impl SocketPairEnd {
         };
         let notice = reason
             .filter(|_| self.pair.kind != SOCK_DGRAM && !self.is_pipe())
-            .and_then(|reason| Self::waking_notice(&mut sides, 1 - self.side, reason));
+            .map(|reason| Self::waking_notice(&mut sides, 1 - self.side, reason))
+            .unwrap_or_default();
         drop(sides);
         self.pair.hub.changed();
-        if let Some(notice) = notice {
+        for notice in notice {
             notice.send();
         }
         Ok(())
@@ -2593,23 +2709,41 @@ impl SocketPairEnd {
     fn is_pipe(&self) -> bool {
         self.pair.pipe.load(Ordering::SeqCst)
     }
-    /// The signal side `side` owes for `reason`, if it is open with
-    /// `O_ASYNC`.
-    fn notice(sides: &[Side; 2], side: usize, reason: Reason) -> Option<Notice> {
+    /// The signals side `side` owes for `reason`: to its owner if it is
+    /// open with `O_ASYNC`, and for a pipe to the owner of each description
+    /// of it that is.
+    fn notice(sides: &[Side; 2], side: usize, reason: Reason) -> Vec<Notice> {
         let side = &sides[side];
-        let to = side.registration.clone().filter(|_| !side.closed)?;
-        Some(Notice {
-            to,
-            owner: side.owner,
-            reason,
-        })
+        if side.closed {
+            return Vec::new();
+        }
+        let own = side.registration.clone().map(|to| (to, side.owner));
+        // The descriptions' latest registration first, as `kill_fasync`.
+        let mut descriptions: Vec<_> = side
+            .descriptions
+            .iter()
+            .filter_map(|description| {
+                let description = description.upgrade()?;
+                let description = description.lock().unwrap_or_else(PoisonError::into_inner);
+                Some((
+                    description.since,
+                    description.registration.clone()?,
+                    description.owner,
+                ))
+            })
+            .collect();
+        descriptions.sort_by_key(|&(since, ..)| std::cmp::Reverse(since));
+        own.into_iter()
+            .chain(descriptions.into_iter().map(|(_, to, owner)| (to, owner)))
+            .map(|(to, owner)| Notice { to, owner, reason })
+            .collect()
     }
     /// The signal side `side` owes for data, its end or a hang-up, which
     /// ends a wait for data: none if a read of it waits ([`wait_data`]),
     /// whose wait this ends, as Linux's `SOCK_WAKE_WAITD`.
-    fn waking_notice(sides: &mut [Side; 2], side: usize, reason: Reason) -> Option<Notice> {
+    fn waking_notice(sides: &mut [Side; 2], side: usize, reason: Reason) -> Vec<Notice> {
         if std::mem::take(&mut sides[side].waiting_data) {
-            return None;
+            return Vec::new();
         }
         Self::notice(sides, side, reason)
     }
@@ -2622,7 +2756,7 @@ impl SocketPairEnd {
             .unwrap_or_else(PoisonError::into_inner);
         let notice = Self::notice(&sides, side, reason);
         drop(sides);
-        if let Some(notice) = notice {
+        for notice in notice {
             notice.send();
         }
     }
@@ -2647,7 +2781,7 @@ impl SocketPairEnd {
         sides[peer].no_space = false;
         let notice = Self::notice(&sides, peer, Reason::Out);
         drop(sides);
-        if let Some(notice) = notice {
+        for notice in notice {
             notice.send();
         }
     }
@@ -3061,8 +3195,9 @@ impl Drop for SocketPairEnd {
         } else {
             (self.pair.kind != SOCK_DGRAM).then_some(Reason::HangUp)
         };
-        let notice =
-            reason.and_then(|reason| Self::waking_notice(&mut sides, 1 - self.side, reason));
+        let notice = reason
+            .map(|reason| Self::waking_notice(&mut sides, 1 - self.side, reason))
+            .unwrap_or_default();
         // Linux frees the receive queue with the socket, and closes the
         // descriptors in it. Closing one may end another socket, even this
         // pair's other end, so it happens after the lock is released.
@@ -3080,7 +3215,7 @@ impl Drop for SocketPairEnd {
             .collect();
         drop(sides);
         self.pair.hub.changed();
-        if let Some(notice) = notice {
+        for notice in notice {
             notice.send();
         }
         drop(passed);
@@ -3495,7 +3630,7 @@ impl SocketPairEnd {
             Self::notice(&sides, self.side, Reason::Error)
         };
         self.pair.hub.changed();
-        if let Some(notice) = notice {
+        for notice in notice {
             notice.send();
         }
     }

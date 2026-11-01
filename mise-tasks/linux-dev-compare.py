@@ -44,13 +44,19 @@ SUITES = tuple(
 )
 RUNNING = re.compile(r"^\s*Running (?:unittests )?(\S+)")
 RESULT = re.compile(r"^test (\S+) \.\.\. (?:.*?)(ok|FAILED|ignored)\s*$")
+# libtest's own line for a case, wherever it stands: a suite whose children
+# write to the same stream can leave a line of theirs unended, so that the
+# parent's "test x ... ok" follows on it ("... filtered outtest x ... ok").
+GLUED = re.compile(r"test (\S+) \.\.\. (ok|FAILED|ignored)\b")
 
 
 def results(log):
     """Each test's outcome by `suite::name`, from cargo test's output.
 
-    A suite that runs its cases in child processes prints their lines too;
-    a case counts as failed when any line for it says so."""
+    A suite that runs its cases in child processes prints their lines too,
+    which can run into the parent's: a result counts at the start of a line
+    (with whatever the case printed before its outcome) and within one. A
+    case counts as failed when any line for it says so."""
     suite = "?"
     seen = {}
     for line in log.splitlines():
@@ -58,13 +64,14 @@ def results(log):
         if running:
             suite = Path(running.group(1)).stem.split("-")[0]
             continue
-        found = RESULT.match(line)
-        if not found:
-            continue
-        key = f"{suite}::{found.group(1)}"
-        outcome = found.group(2)
-        if seen.get(key) != "FAILED":
-            seen[key] = outcome
+        found = [(m.group(1), m.group(2)) for m in GLUED.finditer(line)]
+        start = RESULT.match(line)
+        if start:
+            found.append((start.group(1), start.group(2)))
+        for name, outcome in found:
+            key = f"{suite}::{name}"
+            if seen.get(key) != "FAILED":
+                seen[key] = outcome
     return seen
 
 

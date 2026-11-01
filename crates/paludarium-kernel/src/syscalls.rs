@@ -1710,8 +1710,9 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             // (Linux's `EINVAL` for one without, such as overlayfs, is not
             // given).
             0x2 => {
+                let block_size = crate::files::descriptor_block_size(c, &c.files.descriptor(a[0])?);
                 c.mem
-                    .write(GuestAddr(a[2]), &crate::files::BLOCK_SIZE.to_le_bytes())
+                    .write(GuestAddr(a[2]), &block_size.to_le_bytes())
                     .map_err(|_| Errno::EFAULT)?;
                 return Ok(0);
             }

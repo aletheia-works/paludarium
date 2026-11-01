@@ -451,6 +451,13 @@ kernel.
   and `/proc/mounts` list the mounts (`tmpfs` for the root, `hostfs` for each
   `--mount`, without host paths). Each mount has its own `st_dev`, as its
   line in `mountinfo` says, so `df` lists every mount.
+- A file's block size (`st_blksize`, `stx_blksize`, `FIGETBSZ`) is its
+  filesystem's, as on Linux: 1024 for `/proc` (procfs) and for a terminal
+  on standard input, output or error (devpts), and 4096 for the rest,
+  pipes, sockets, `memfd` and `/dev` included. `statfs` there gives
+  procfs's or devpts's type with a 4096 `f_bsize`, as Linux's
+  `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but `stat`,
+  `statfs` and `open` through it reach its file.
 - The only other `/proc` entries are this process's own: `/proc/self` (also
   as `/proc/<pid>`), a directory that `readlink` resolves to the PID and that
   its entries can be opened relative to, `/proc/self/status` and

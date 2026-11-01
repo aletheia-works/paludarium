@@ -231,6 +231,7 @@ mod linux {
         processes_socket_timestamping => ("socket-timestamping","process"),
         processes_socket_passsec => ("socket-passsec","process"),
         processes_socket_passrights => ("socket-passrights","process"),
+        processes_proc_block_size => ("proc-block-size","process"),
         processes_socket_timeouts => ("socket-timeouts","process"),
         processes_signal_restart => ("signal-restart","process"),
         processes_signal_io => ("signal-io","process"),

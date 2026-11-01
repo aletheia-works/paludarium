@@ -366,7 +366,7 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
         let p = c.files.path(dir, raw)?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         match generated_stat(c, &p, follow) {
-            Some((stat, _)) => stat,
+            Some((stat, ..)) => stat,
             None => c.files.fs.metadata(&p, follow)?,
         }
     };
@@ -376,7 +376,9 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
     }
     Ok(0)
 }
-/// What `fstatfs` reports for a pipe or a socket: an empty pseudo filesystem.
+/// What `statfs` reports for a pipe, a socket, /proc or a terminal: an
+/// empty pseudo filesystem of type `kind`, with the page as its block, as
+/// Linux's `simple_statfs` gives whatever the superblock's block size.
 fn pseudo_fs(kind: u64) -> paludarium_host::FsStats {
     paludarium_host::FsStats {
         kind,
@@ -384,6 +386,26 @@ fn pseudo_fs(kind: u64) -> paludarium_host::FsStats {
         name_max: 255,
         ..Default::default()
     }
+}
+/// What `fstatfs` reports for the file `d` holds: an empty pseudo
+/// filesystem for a /proc file (procfs), a terminal (devpts), a pipe or a
+/// socket, else the statistics of the filesystem holding its path.
+fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host::FsStats, Errno> {
+    if in_proc(&d.path) {
+        return Ok(pseudo_fs(PROC_SUPER_MAGIC));
+    }
+    if is_terminal(c, d) {
+        return Ok(pseudo_fs(DEVPTS_SUPER_MAGIC));
+    }
+    Ok(match d.file.stat()?.mode & 0o170000 {
+        0o010000 => pseudo_fs(0x5049_5045), // PIPEFS_MAGIC
+        0o140000 => pseudo_fs(0x534F_434B), // SOCKFS_MAGIC
+        _ => c
+            .files
+            .fs
+            .statfs(&d.path)
+            .or_else(|_| c.files.fs.statfs(b"/"))?,
+    })
 }
 /// Linux's 120-byte `struct statfs`. `f_flags` is ST_VALID and `f_fsid` 0.
 fn write_statfs(c: &Context<'_>, addr: u64, s: paludarium_host::FsStats) -> Result<u64, Errno> {
@@ -1137,7 +1159,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0 {
         return Err(Errno::EINVAL);
     }
-    let (s, device) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    let (s, device, block_size) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dir as i32 == -100 {
             let cwd = c
                 .files
@@ -1145,29 +1167,41 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
-            (c.files.fs.metadata(&cwd, true)?, device(c, &cwd))
+            (
+                c.files.fs.metadata(&cwd, true)?,
+                device(c, &cwd),
+                path_block_size(&cwd),
+            )
         } else {
             let d = c.files.descriptor(dir)?;
-            (d.file.stat()?, descriptor_device(c, &d))
+            (
+                d.file.stat()?,
+                descriptor_device(c, &d),
+                descriptor_block_size(c, &d),
+            )
         }
     } else {
         let p = c.files.path(dir, raw)?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         match generated_stat(c, &p, follow) {
             Some(generated) => generated,
-            None => (c.files.fs.metadata(&p, follow)?, device(c, &p)),
+            None => (
+                c.files.fs.metadata(&p, follow)?,
+                device(c, &p),
+                path_block_size(&p),
+            ),
         }
     };
-    output(c, out, &encode_statx(s, device)?)?;
+    output(c, out, &encode_statx(s, device, block_size)?)?;
     Ok(0)
 }
 /// `struct statx` with what [`encode_stat`] gives a `struct stat`: the basic
 /// fields, no birth time, and the mount's number as the device minor.
-fn encode_statx(s: FileStat, device: u64) -> Result<[u8; 256], Errno> {
+fn encode_statx(s: FileStat, device: u64, block_size: u32) -> Result<[u8; 256], Errno> {
     let (seconds, nanos) = linux_mtime(s.mtime_ns)?;
     let mut b = [0; 256];
     b[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
-    b[4..8].copy_from_slice(&BLOCK_SIZE.to_le_bytes());
+    b[4..8].copy_from_slice(&block_size.to_le_bytes());
     b[16..20].copy_from_slice(&u32::try_from(s.links).unwrap_or(u32::MAX).to_le_bytes());
     b[20..24].copy_from_slice(&s.uid.to_le_bytes());
     b[24..28].copy_from_slice(&s.gid.to_le_bytes());
@@ -1194,8 +1228,14 @@ fn encode_statx(s: FileStat, device: u64) -> Result<[u8; 256], Errno> {
 }
 /// `stat` of a file at guest `path`: its `st_dev` names the mount holding
 /// it, numbered as /proc/self/mountinfo numbers mounts (0:1 is the root).
-fn stat(c: &Context<'_>, addr: u64, s: FileStat, device: u64) -> Result<u64, Errno> {
-    let mut bytes = encode_stat(s)?;
+fn stat(
+    c: &Context<'_>,
+    addr: u64,
+    s: FileStat,
+    device: u64,
+    block_size: u32,
+) -> Result<u64, Errno> {
+    let mut bytes = encode_stat(s, block_size)?;
     bytes[0..8].copy_from_slice(&device.to_le_bytes());
     output(c, addr, &bytes)?;
     Ok(0)
@@ -1221,11 +1261,50 @@ fn device(c: &Context<'_>, path: &[u8]) -> u64 {
 /// `FIGETBSZ`, and `f_bsize` of a pipe or a socket, which Linux all take from
 /// the superblock. A mounted directory's `statfs` reports the host's own.
 pub(crate) const BLOCK_SIZE: u32 = 4096;
+/// The block size of procfs and devpts, whose superblocks Linux's
+/// `proc_fill_super` and `devpts_fill_super` give an `s_blocksize` of 1024.
+const SMALL_BLOCK_SIZE: u32 = 1024;
+/// procfs's and devpts's `s_magic`, which their `statfs` gives as `f_type`.
+const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
+/// Whether `path` is in `/proc`, which is procfs on Linux.
+fn in_proc(path: &[u8]) -> bool {
+    path == b"/proc" || path.starts_with(b"/proc/")
+}
+/// The block size of the file at guest `path`, which is not one of
+/// [`generated_stat`]'s: procfs's in `/proc`, else [`BLOCK_SIZE`].
+fn path_block_size(path: &[u8]) -> u32 {
+    if in_proc(path) {
+        SMALL_BLOCK_SIZE
+    } else {
+        BLOCK_SIZE
+    }
+}
+/// Whether `d` is one of the host's standard streams and a terminal, as
+/// `TCGETS` finds it, which on Linux is a pseudo-terminal's devpts file.
+fn is_terminal(c: &Context<'_>, d: &Descriptor) -> bool {
+    let stream = match d.file.stdio_channel() {
+        Some(0) => paludarium_host::StreamId::Stdin,
+        Some(1) => paludarium_host::StreamId::Stdout,
+        Some(2) => paludarium_host::StreamId::Stderr,
+        _ => return false,
+    };
+    c.files.terminal_size.is_some() || matches!(c.host.terminal_info(stream), Ok(Some(_)))
+}
+/// The block size of the file a descriptor holds: procfs's for one opened
+/// in `/proc`, devpts's for a terminal, else [`BLOCK_SIZE`].
+pub(crate) fn descriptor_block_size(c: &Context<'_>, d: &Descriptor) -> u32 {
+    if in_proc(&d.path) || is_terminal(c, d) {
+        SMALL_BLOCK_SIZE
+    } else {
+        BLOCK_SIZE
+    }
+}
 /// `st_blocks`: what the file system counts, or the size in 512-byte blocks.
 pub(crate) fn blocks(s: &FileStat) -> u64 {
     s.blocks.unwrap_or(s.size.div_ceil(512))
 }
-fn encode_stat(s: FileStat) -> Result<[u8; 144], Errno> {
+fn encode_stat(s: FileStat, block_size: u32) -> Result<[u8; 144], Errno> {
     let (seconds, nanos) = linux_mtime(s.mtime_ns)?;
     let mut b = [0; 144];
     b[8..16].copy_from_slice(&s.inode.to_le_bytes());
@@ -1235,7 +1314,7 @@ fn encode_stat(s: FileStat) -> Result<[u8; 144], Errno> {
     b[32..36].copy_from_slice(&s.gid.to_le_bytes());
     b[40..48].copy_from_slice(&s.rdev.to_le_bytes());
     b[48..56].copy_from_slice(&s.size.to_le_bytes());
-    b[56..64].copy_from_slice(&u64::from(BLOCK_SIZE).to_le_bytes());
+    b[56..64].copy_from_slice(&u64::from(block_size).to_le_bytes());
     b[64..72].copy_from_slice(&blocks(&s).to_le_bytes());
     b[88..96].copy_from_slice(&seconds.to_le_bytes());
     b[96..104].copy_from_slice(&nanos.to_le_bytes());
@@ -1270,10 +1349,13 @@ mod mtime_tests {
             (1_500_000_000, 1, 500_000_000),
             (i128::from(u64::MAX), 18_446_744_073, 709_551_615),
         ] {
-            let bytes = encode_stat(FileStat {
-                mtime_ns: ns,
-                ..FileStat::default()
-            })
+            let bytes = encode_stat(
+                FileStat {
+                    mtime_ns: ns,
+                    ..FileStat::default()
+                },
+                BLOCK_SIZE,
+            )
             .unwrap();
             assert_eq!(&bytes[88..96], &seconds.to_le_bytes());
             assert_eq!(&bytes[96..104], &nanos.to_le_bytes());
@@ -1288,10 +1370,13 @@ mod mtime_tests {
             i128::from(i64::MIN) * 1_000_000_000 - 1,
         ] {
             assert_eq!(
-                encode_stat(FileStat {
-                    mtime_ns: ns,
-                    ..FileStat::default()
-                }),
+                encode_stat(
+                    FileStat {
+                        mtime_ns: ns,
+                        ..FileStat::default()
+                    },
+                    BLOCK_SIZE
+                ),
                 Err(Errno(75))
             );
         }
@@ -1546,20 +1631,38 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 let raw = path(c, a[1])?;
                 if raw.is_empty() && a[3] & 0x1000 != 0 {
                     let d = c.files.descriptor(a[0])?;
-                    return stat(c, a[2], d.file.stat()?, descriptor_device(c, &d));
+                    return stat(
+                        c,
+                        a[2],
+                        d.file.stat()?,
+                        descriptor_device(c, &d),
+                        descriptor_block_size(c, &d),
+                    );
                 }
                 (c.files.path(a[0], raw)?, a[2], a[3] & 0x100 == 0)
             } else {
                 (at(c, (-100i32) as u64, a[0])?, a[1], n == 4)
             };
-            if let Some((generated, device)) = generated_stat(c, &p, follow) {
-                return stat(c, out, generated, device);
+            if let Some((generated, device, block_size)) = generated_stat(c, &p, follow) {
+                return stat(c, out, generated, device, block_size);
             }
-            stat(c, out, c.files.fs.metadata(&p, follow)?, device(c, &p))
+            stat(
+                c,
+                out,
+                c.files.fs.metadata(&p, follow)?,
+                device(c, &p),
+                path_block_size(&p),
+            )
         }
         5 => {
             let d = c.files.descriptor(a[0])?;
-            stat(c, a[1], d.file.stat()?, descriptor_device(c, &d))
+            stat(
+                c,
+                a[1],
+                d.file.stat()?,
+                descriptor_device(c, &d),
+                descriptor_block_size(c, &d),
+            )
         }
         8 => c
             .files
@@ -1923,19 +2026,31 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         // statfs, fstatfs
         137 => {
             let p = at(c, (-100i32) as u64, a[0])?;
-            write_statfs(c, a[1], c.files.fs.statfs(&p)?)
+            let stats = if in_proc(&p) {
+                // A link in `fd` leads to its descriptor's file; one for a
+                // descriptor not open is not there (`ENOENT`).
+                if let Some(crate::proc::OwnEntry::Descriptor(n)) =
+                    crate::proc::own_entry(&p, c.process.pid)
+                {
+                    let d = c
+                        .files
+                        .descriptor(u64::from(n))
+                        .map_err(|_| Errno::ENOENT)?;
+                    descriptor_statfs(c, &d)?
+                } else {
+                    if generated_stat(c, &p, true).is_none() {
+                        c.files.fs.metadata(&p, true)?;
+                    }
+                    pseudo_fs(PROC_SUPER_MAGIC)
+                }
+            } else {
+                c.files.fs.statfs(&p)?
+            };
+            write_statfs(c, a[1], stats)
         }
         138 => {
             let d = c.files.descriptor(a[0])?;
-            let stats = match d.file.stat()?.mode & 0o170000 {
-                0o010000 => pseudo_fs(0x5049_5045), // PIPEFS_MAGIC
-                0o140000 => pseudo_fs(0x534F_434B), // SOCKFS_MAGIC
-                _ => c
-                    .files
-                    .fs
-                    .statfs(&d.path)
-                    .or_else(|_| c.files.fs.statfs(b"/"))?,
-            };
+            let stats = descriptor_statfs(c, &d)?;
             write_statfs(c, a[1], stats)
         }
         // access, faccessat, faccessat2
@@ -2648,10 +2763,12 @@ fn descriptor_entries(c: &Context<'_>) -> Vec<paludarium_host::DirectoryEntry> {
         })
         .collect()
 }
-/// The `stat` of a generated /proc path, and its device, or `None` for any
-/// other path (and for a link to a descriptor that is not open). A link in
-/// `/proc/self/fd` is followed to its file unless `follow` is false.
-fn generated_stat(c: &Context<'_>, path: &[u8], follow: bool) -> Option<(FileStat, u64)> {
+/// The `stat` of a file paludarium makes itself (`/dev`, `/proc`), with its
+/// device and block size (devtmpfs's for `/dev`, procfs's for `/proc`), or
+/// `None` for any other path and for a link to a descriptor that is not
+/// open. A link in `/proc/self/fd` is followed to its file, whose block size
+/// it takes, unless `follow` is false.
+fn generated_stat(c: &Context<'_>, path: &[u8], follow: bool) -> Option<(FileStat, u64, u32)> {
     if let Some(target) = crate::devices::through_link(path) {
         return generated_stat(c, &target, follow);
     }
@@ -2659,12 +2776,12 @@ fn generated_stat(c: &Context<'_>, path: &[u8], follow: bool) -> Option<(FileSta
         Some(crate::devices::Entry::Link(target)) if follow => {
             return generated_stat(c, target, follow);
         }
-        Some(entry) => return Some((crate::devices::stat(entry), device(c, path))),
+        Some(entry) => return Some((crate::devices::stat(entry), device(c, path), BLOCK_SIZE)),
         None => {}
     }
     if let Some(mountinfo) = crate::proc::mount_table(path) {
         let length = crate::proc::render(&c.files.fs.mounts(), mountinfo).len();
-        return Some((crate::proc::stat(length), device(c, path)));
+        return Some((crate::proc::stat(length), device(c, path), SMALL_BLOCK_SIZE));
     }
     let stat = match crate::proc::own_entry(path, c.process.pid)? {
         crate::proc::OwnEntry::Directory => crate::proc::directory_stat(),
@@ -2673,12 +2790,16 @@ fn generated_stat(c: &Context<'_>, path: &[u8], follow: bool) -> Option<(FileSta
         crate::proc::OwnEntry::Descriptor(n) => {
             let d = c.files.descriptor(u64::from(n)).ok()?;
             if follow {
-                return Some((d.file.stat().ok()?, descriptor_device(c, &d)));
+                return Some((
+                    d.file.stat().ok()?,
+                    descriptor_device(c, &d),
+                    descriptor_block_size(c, &d),
+                ));
             }
             crate::proc::link_stat(d.file.flags() & 3)
         }
     };
-    Some((stat, device(c, path)))
+    Some((stat, device(c, path), SMALL_BLOCK_SIZE))
 }
 
 /// This process's `/proc/self/status`.

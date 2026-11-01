@@ -20,7 +20,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 ゲストが実行できない命令に当たったときは、本物の Linux と同じようにゲストに
 `SIGILL` を送ります。ページフォールトは `SIGSEGV`、整数の 0 除算は `SIGFPE` になります。
 
-## システムコール
+## システムコール {#system-calls}
 
 実装したシステムコールだけを、明示した表で扱います。それ以外はすべて `ENOSYS` を返し、
 ホストに渡すことはありません。次の表には実装したシステムコールをすべて載せていて、
@@ -418,6 +418,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/mounts` はマウントの一覧です（ルートは `tmpfs`、`--mount` ごとに `hostfs`。
   ホストのパスは見せません）。マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
   `df` はどのマウントも表示します。
+- ファイルのブロックの大きさ（`st_blksize`、`stx_blksize`、`FIGETBSZ`）は、Linux と
+  同じくそのファイルシステムのものです。`/proc`（procfs）と、標準入力・出力・エラーの
+  端末（devpts）は 1024 で、ほかは、パイプ、ソケット、`memfd`、`/dev` も含めて 4096
+  です。そこでの `statfs` は、Linux の `simple_statfs` と同じく、procfs や devpts の
+  種類と 4096 の `f_bsize` を返します。
+  `/proc/self/fd` のリンクは procfs のものですが、それを通した `stat`、`statfs`、`open`
+  はリンク先のファイルに届きます。
 - `/proc` にあるのは、ほかには自分のプロセスのものだけです。`/proc/self`
   （`/proc/<pid>` としても）は、`readlink` で PID になり、その中のものを相対的に
   開けるディレクトリです。ほかに `/proc/self/status` と `/proc/self/fd` があります。

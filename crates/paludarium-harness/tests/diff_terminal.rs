@@ -49,7 +49,7 @@ fn case(name: &'static str, id: usize) {
         } else {
             b""
         }));
-        if matches!(id, 6 | 7 | 8 | 9 | 10 | 13) {
+        if matches!(id, 6 | 7 | 8 | 9 | 10 | 13 | 14) {
             // The PTY setup in oracle.py defines these inputs; expected output
             // is still obtained anew from its native guest on every run.
             let mut control_chars = [0; 19];
@@ -94,4 +94,4 @@ fn case(name: &'static str, id: usize) {
 }
 
 macro_rules! cases {($($name:ident=>$id:literal),* $(,)?)=>{$(#[test] fn $name(){case(stringify!($name),$id);})*};}
-cases!(args_env=>0,stdin_short_eof=>1,terminal_streams=>2,pipe_tcgets=>3,pipe_winsize=>4,bad_fd=>5,tty_tcgets=>6,tty_winsize=>7,tty_bad_pointer=>8,tty_unknown=>9,tty_dup=>10,regular_file=>11,closed_fd=>12,stream_identity=>13);
+cases!(args_env=>0,stdin_short_eof=>1,terminal_streams=>2,pipe_tcgets=>3,pipe_winsize=>4,bad_fd=>5,tty_tcgets=>6,tty_winsize=>7,tty_bad_pointer=>8,tty_unknown=>9,tty_dup=>10,regular_file=>11,closed_fd=>12,stream_identity=>13,tty_block_size=>14);

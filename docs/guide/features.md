@@ -499,7 +499,13 @@ kernel.
   `kill_fasync` goes through them. A standard stream opens, for the access
   it has, as a new description of it.
   `O_CREAT | O_EXCL` finds the link there (`EEXIST`), and `O_NOFOLLOW` does
-  not follow it (`ELOOP`) but with `O_PATH`. A socket gives `ENXIO`, as on
+  not follow it (`ELOOP`); with `O_PATH` too it opens the link itself, as on
+  any symbolic link (`/dev`'s, or a filesystem's): a descriptor whose
+  `fstat` (and `fstatat` with `AT_EMPTY_PATH`) and `fstatfs` are the
+  link's, whose `readlinkat(fd, "")` reads where it points (`ENOENT` for an
+  `O_PATH` descriptor of anything else), whose own link names the link, and
+  that nothing reads through (`EBADF`); an open that follows its own link
+  reaches the link (`ELOOP`). A socket gives `ENXIO`, as on
   Linux; so do, here, the files of no type and a removed file of a directory
   mounted from a host other than Linux, which Linux can open.
 - `/dev` (mode 0755) holds the memory devices and the links Linux systems
@@ -514,9 +520,9 @@ kernel.
   mapping of `zero` is anonymous memory, shared with `MAP_SHARED`. `fd`,
   `stdin`, `stdout` and `stderr` are links (0777) to `/proc/self/fd` and its
   first three entries, followed by `open`, `stat` and paths through them
-  (`/dev/fd/3`); `O_NOFOLLOW` on one gives `ELOOP`, also with `O_PATH`,
-  where Linux opens the link itself (not supported here). Files on host
-  mounts report no device number.
+  (`/dev/fd/3`); `O_NOFOLLOW` on one gives `ELOOP`, and with `O_PATH` opens
+  the link itself, as in `/proc/self/fd`. Files on host mounts report no
+  device number.
 - CPU time is the host thread's CPU time (user and system together) from a
   guest thread's first system call, where the host can measure it (Linux,
   macOS, Windows); elsewhere, as in WebAssembly, it is wall time instead.

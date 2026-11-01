@@ -1933,6 +1933,25 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             Ok(0)
         }
         89 | 267 => {
+            // An empty path reads the link an `O_PATH | O_NOFOLLOW`
+            // descriptor holds (ENOENT for any other descriptor).
+            if n == 267 && path(c, a[1])?.is_empty() {
+                if a[3] == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let d = c.files.descriptor(a[0])?;
+                let link = d
+                    .file
+                    .as_any()
+                    .and_then(|v| v.downcast_ref::<LinkPath>())
+                    .ok_or(Errno::ENOENT)?;
+                let b = link.target(c)?;
+                let count = b
+                    .len()
+                    .min(usize::try_from(a[3]).map_err(|_| Errno::EINVAL)?);
+                output(c, a[2], &b[..count])?;
+                return Ok(count as u64);
+            }
             let (p, buf, len) = if n == 89 {
                 (at(c, (-100i32) as u64, a[0])?, a[1], a[2])
             } else {
@@ -2193,6 +2212,98 @@ pub(crate) fn write_with(
                 return Err(e);
             }
         }
+    }
+}
+/// `O_PATH`: only a path, not an open file.
+const O_PATH: u32 = 0o10000000;
+/// The descriptor `O_PATH | O_NOFOLLOW` gives for a symbolic link: the link
+/// itself, as Linux opens it, whose `fstat` is the link's and whose
+/// `readlinkat(fd, "")` reads where it points; nothing reads or writes
+/// through it.
+pub(crate) struct LinkPath {
+    stat: FileStat,
+    target: LinkTarget,
+}
+/// Where a [`LinkPath`] points.
+enum LinkTarget {
+    /// A symbolic link of the filesystem or `/dev`, whose target stays.
+    Fixed(Vec<u8>),
+    /// A link in `/proc/self/fd`, which names the descriptor's file as it
+    /// is when read.
+    Descriptor(u32),
+}
+impl LinkPath {
+    /// The symbolic link `p` names itself, or `None` when it is no link.
+    fn of(c: &Context<'_>, p: &[u8]) -> Result<Option<Self>, Errno> {
+        if let Some(crate::devices::Entry::Link(target)) = crate::devices::entry(p) {
+            return Ok(Some(Self {
+                stat: crate::devices::stat(crate::devices::Entry::Link(target)),
+                target: LinkTarget::Fixed(target.to_vec()),
+            }));
+        }
+        if let Some(crate::proc::OwnEntry::Descriptor(n)) = crate::proc::own_entry(p, c.process.pid)
+        {
+            let d = c
+                .files
+                .descriptor(u64::from(n))
+                .map_err(|_| Errno::ENOENT)?;
+            return Ok(Some(Self {
+                stat: crate::proc::link_stat(d.file.flags() & 3),
+                target: LinkTarget::Descriptor(n),
+            }));
+        }
+        if generated(p) {
+            return Ok(None);
+        }
+        match c.files.fs.metadata(p, false) {
+            Ok(stat) if stat.mode & 0o170000 == 0o120000 => Ok(Some(Self {
+                stat,
+                target: LinkTarget::Fixed(c.files.fs.readlink(p)?),
+            })),
+            _ => Ok(None),
+        }
+    }
+    /// What `readlink` of the link gives.
+    fn target(&self, c: &Context<'_>) -> Result<Vec<u8>, Errno> {
+        match &self.target {
+            LinkTarget::Fixed(target) => Ok(target.clone()),
+            LinkTarget::Descriptor(n) => {
+                let d = c
+                    .files
+                    .descriptor(u64::from(*n))
+                    .map_err(|_| Errno::ENOENT)?;
+                link_target(c, &d)
+            }
+        }
+    }
+}
+impl FileHandle for LinkPath {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+        Err(Errno::EBADF)
+    }
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(self.stat)
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EBADF)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Err(Errno::EBADF)
+    }
+    fn flags(&self) -> u32 {
+        O_PATH | 0o400000
+    }
+    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+        Err(Errno::EBADF)
     }
 }
 pub(crate) struct StandardFile {
@@ -2611,6 +2722,11 @@ fn open_path(
     if let Some(target) = crate::devices::through_link(p) {
         return open_path(c, &target, flags, mode);
     }
+    if flags & (O_PATH | O_NOFOLLOW) == O_PATH | O_NOFOLLOW
+        && let Some(link) = LinkPath::of(c, p)?
+    {
+        return Ok((Arc::new(link), p.to_vec()));
+    }
     let file: Arc<dyn FileHandle> = if let Some(entry) = crate::devices::entry(p) {
         const O_DIRECTORY: u32 = 0o200000;
         match entry {
@@ -2652,7 +2768,6 @@ fn open_path(
                 // link that names a file there is: O_NOFOLLOW does not follow
                 // it (ELOOP) but with O_PATH, and O_CREAT | O_EXCL finds it
                 // there (EEXIST).
-                const O_PATH: u32 = 0o10000000;
                 c.files
                     .descriptor(u64::from(n))
                     .map_err(|_| Errno::ENOENT)?;
@@ -2688,6 +2803,11 @@ fn reopen(
         .files
         .descriptor(u64::from(n))
         .map_err(|_| Errno::ENOENT)?;
+    // The descriptor of a symbolic link itself: following its link reaches
+    // that symbolic link, which an open does not follow again (ELOOP).
+    if d.file.as_any().is_some_and(|v| v.is::<LinkPath>()) {
+        return Err(Errno(40));
+    }
     if let Some(memfd) = d
         .file
         .as_any()
@@ -2801,6 +2921,10 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
             Some(rest) => [format!("/proc/{}", c.process.pid).as_bytes(), rest].concat(),
             None => d.path.clone(),
         },
+        // The descriptor of a symbolic link itself names the link.
+        _ if any.is_some_and(|v| v.is::<LinkPath>()) => {
+            paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())
+        }
         _ => current_path(c, d, stat.inode).unwrap_or_else(|| {
             let mut path =
                 paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone());

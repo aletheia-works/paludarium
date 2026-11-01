@@ -2597,10 +2597,15 @@ fn open_path(
                 Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
             }
             crate::proc::OwnEntry::Descriptor(n) => {
-                // The link is a symbolic link that names a file there is:
-                // O_NOFOLLOW does not follow it (ELOOP) but with O_PATH, and
-                // O_CREAT | O_EXCL finds it there (EEXIST).
+                // A link for a descriptor that is not open is not there
+                // (ENOENT), whatever the flags. One that is, is a symbolic
+                // link that names a file there is: O_NOFOLLOW does not follow
+                // it (ELOOP) but with O_PATH, and O_CREAT | O_EXCL finds it
+                // there (EEXIST).
                 const O_PATH: u32 = 0o10000000;
+                c.files
+                    .descriptor(u64::from(n))
+                    .map_err(|_| Errno::ENOENT)?;
                 if flags & 0o300 == 0o300 {
                     return Err(Errno::EEXIST);
                 }

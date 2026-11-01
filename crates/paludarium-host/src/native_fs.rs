@@ -334,15 +334,31 @@ impl FileHandle for NativeFile {
     #[cfg(target_os = "linux")]
     fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
         let link = {
             let file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
             format!("/proc/self/fd/{}", file.as_raw_fd())
         };
+        // O_TRUNC empties the file even for a read-only open, which then
+        // stays read-only: the truncation goes through a handle of its own.
+        if flags & 512 != 0 && flags & 3 == 0 {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&link)
+                .map_err(err)?;
+        }
+        // The access mode and O_APPEND as asked: std's `append` would make
+        // the host file writable.
         let file = std::fs::OpenOptions::new()
             .read(flags & 3 != 1)
-            .write(flags & 3 != 0 || flags & 512 != 0)
-            .truncate(flags & 512 != 0)
-            .append(flags & 1024 != 0)
+            .write(flags & 3 != 0)
+            .truncate(flags & 512 != 0 && flags & 3 != 0)
+            .custom_flags(if flags & 1024 != 0 {
+                rustix::fs::OFlags::APPEND.bits() as i32
+            } else {
+                0
+            })
             .open(link)
             .map_err(err)?;
         if flags & 65536 != 0 && !file.metadata().map_err(err)?.is_dir() {

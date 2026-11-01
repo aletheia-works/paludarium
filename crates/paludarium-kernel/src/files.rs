@@ -2596,7 +2596,24 @@ fn open_path(
             crate::proc::OwnEntry::Status => {
                 Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
             }
-            crate::proc::OwnEntry::Descriptor(n) => return reopen(c, n, flags, mode),
+            crate::proc::OwnEntry::Descriptor(n) => {
+                // A link for a descriptor that is not open is not there
+                // (ENOENT), whatever the flags. One that is, is a symbolic
+                // link that names a file there is: O_NOFOLLOW does not follow
+                // it (ELOOP) but with O_PATH, and O_CREAT | O_EXCL finds it
+                // there (EEXIST).
+                const O_PATH: u32 = 0o10000000;
+                c.files
+                    .descriptor(u64::from(n))
+                    .map_err(|_| Errno::ENOENT)?;
+                if flags & 0o300 == 0o300 {
+                    return Err(Errno::EEXIST);
+                }
+                if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 {
+                    return Err(Errno(40)); // ELOOP
+                }
+                return reopen(c, n, flags, mode);
+            }
         }
     } else {
         c.files.fs.open(p, flags, mode & !c.files.umask())?
@@ -2605,10 +2622,11 @@ fn open_path(
 }
 /// Opening `/proc/self/fd/<n>`: a new handle on the file descriptor `n`
 /// holds, as Linux opens the link's file again. A file with a path is opened
-/// again by it while the path still names that file; a memfd gets a new
-/// handle on its file; a pipe or the standard streams give the same handle
-/// for the access it has. The rest, and a removed file, cannot be opened
-/// again: a socket gives ENXIO, as on Linux, and so do the others here.
+/// again by it while the path still names that file, and a removed one of
+/// the guest's own filesystem through its handle ([`FileHandle::reopen`]); a
+/// memfd gets a new handle on its file; a pipe or the standard streams give
+/// the same handle for the access it has. The rest cannot be opened again: a
+/// socket gives ENXIO, as on Linux, and so do the others here.
 fn reopen(
     c: &mut Context<'_>,
     n: u32,
@@ -2645,7 +2663,7 @@ fn reopen(
         _ if generated(&d.path) => open_path(c, &d.path.clone(), flags, mode),
         _ => match current_path(c, &d, stat.inode) {
             Some(path) => open_path(c, &path, flags, mode),
-            None => Err(ENXIO),
+            None => Ok((d.file.reopen(flags)?, d.path.clone())),
         },
     }
 }

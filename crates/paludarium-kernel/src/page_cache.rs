@@ -363,6 +363,29 @@ impl FileHandle for CoherentFile {
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         self.inner.readiness()
     }
+    /// The file opened again, in step with the same page cache, which
+    /// `O_TRUNC` empties as an open by path does.
+    fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        let file = CoherentFile {
+            inner: self.inner.reopen(flags)?,
+            caches: Arc::clone(&self.caches),
+            device: match &self.device {
+                Device::Mount(fs, path) => Device::Mount(Arc::clone(fs), path.clone()),
+                Device::Fixed(device) => Device::Fixed(*device),
+            },
+            key: self
+                .key
+                .get()
+                .copied()
+                .map_or_else(OnceLock::new, OnceLock::from),
+        };
+        if flags & O_TRUNC != 0
+            && let Some(cache) = file.cache()
+        {
+            cache.resized(0, 0);
+        }
+        Ok(Arc::new(file))
+    }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         self.inner.as_any()
     }

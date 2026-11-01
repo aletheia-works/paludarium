@@ -938,8 +938,8 @@ fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
         b
     };
     assert_eq!(link(&mut f), b"/t");
-    // One link more: the path no longer resolves, so it shows as deleted
-    // and cannot be opened again.
+    // One link more: the path no longer resolves, so it shows as deleted,
+    // but the link still opens its file again, as Linux's does.
     put(&mut f, name, "/l40");
     assert_eq!(f.ret(87, &[name]), 0);
     put(&mut f, name, "/l41");
@@ -949,7 +949,7 @@ fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
     put(&mut f, name + 0x200, "/l41");
     assert_eq!(f.ret(88, &[name, name + 0x200]), 0);
     assert_eq!(link(&mut f), b"/l1 (deleted)");
-    assert_eq!(f.ret(2, &[name + 0x100, 0]), errno(Errno(6)));
+    assert!(f.ret(2, &[name + 0x100, 0]) < 1 << 31);
 }
 #[test]
 fn dev_reports_its_devices_and_lists_them() {

@@ -192,6 +192,18 @@ void _start(void) {
   S(3,viaq,0,0);S(3,dots2,0,0);S(3,again,0,0);S(87,q,0,0);
   {char *q=gone;const char *r=p;while(*r)*q++=*r++;r=" (deleted)";while(*r)*q++=*r++;*q=0;}
   S(87,p,0,0);k=RL(fd,t);results[x++]=same(t,k,gone);
+  /* The removed file opens again through its link, as Linux opens it: the
+     same file, with an offset of its own. O_CREAT | O_EXCL finds the link
+     there, O_NOFOLLOW does not follow it, and O_TRUNC empties the file. */
+  long dl=S(2,fdpath(fd),2,0);results[x++]=dl>=0;results[x++]=S(8,dl,0,1);results[x++]=S(0,dl,buf,3);
+  results[x++]=buf[0]+buf[1]+buf[2];S(1,dl,"Z",1);S(8,fd,0,0);results[x++]=S(0,fd,buf,4);results[x++]=buf[3];
+  S(5,dl,st,0);long dino=*(long*)(st+8);S(5,fd,st,0);results[x++]=dino==*(long*)(st+8);results[x++]=*(long*)(st+16);
+  results[x++]=S(2,fdpath(fd),0302,0);results[x++]=S(2,fdpath(fd),0400000,0);results[x++]=S(2,fdpath(fd),0200000,0);
+  long dt=S(2,fdpath(fd),01000,0);results[x++]=dt>=0;S(5,fd,st,0);results[x++]=*(long*)(st+48);S(3,dt,0,0);S(3,dl,0,0);
+  /* Read-only with O_APPEND stays read-only; a closed descriptor's link is
+     not there, whatever the flags. */
+  long ra=S(2,fdpath(fd),02000,0);results[x++]=S(1,ra,"q",1);S(3,ra,0,0);
+  results[x++]=S(2,fdpath(900),0302,0);results[x++]=S(2,fdpath(900),0400000,0);
   long m=call(319,(long)"named",2,0,0,0,0);k=RL(m,t);results[x++]=same(t,k,"/memfd:named (deleted)");
   long mr=S(2,fdpath(m),0,0);results[x++]=mr>=0;S(1,m,"xy",2);results[x++]=S(0,mr,buf,2);results[x++]=buf[0]+buf[1];
   results[x++]=S(72,mr,1033,1);S(72,m,1033,4);results[x++]=S(72,mr,1034,0);

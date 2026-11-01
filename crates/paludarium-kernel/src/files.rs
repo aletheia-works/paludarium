@@ -2356,7 +2356,12 @@ pub(crate) fn standard(file: &Arc<dyn FileHandle>) -> Option<&StandardFile> {
 impl FileHandle for StandardFile {
     /// The same stream as a new open file description: its own status
     /// flags, from this open's `O_NONBLOCK`, and no `O_ASYNC` yet.
+    /// Only the access the stream has opens it (`ENXIO`).
     fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        const ENXIO: Errno = Errno(6);
+        if flags & 3 != u32::from(self.channel != 0) {
+            return Err(ENXIO);
+        }
         let file = Self::new(&self.host, self.channel);
         file.flags.store(
             u32::from(self.channel != 0) | flags & crate::events::NONBLOCK,
@@ -2697,14 +2702,9 @@ fn reopen(
     }
     let stat = d.file.stat()?;
     match stat.mode & 0o170000 {
-        // A pipe or a standard stream: a description of its own.
-        0o010000 if d.path.is_empty() => {
-            if flags & 3 == d.file.flags() & 3 {
-                Ok((d.file.reopen(flags)?, Vec::new()))
-            } else {
-                Err(ENXIO)
-            }
-        }
+        // A pipe or a standard stream: a description of its own, which
+        // checks the access it is opened with.
+        0o010000 if d.path.is_empty() => Ok((d.file.reopen(flags)?, Vec::new())),
         _ if d.path.is_empty() => Err(ENXIO),
         _ if generated(&d.path) => open_path(c, &d.path.clone(), flags, mode),
         _ => match current_path(c, &d, stat.inode) {

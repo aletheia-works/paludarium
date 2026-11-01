@@ -25,6 +25,9 @@ pub(crate) struct PipeEnd {
     /// `O_NONBLOCK` of this open file description, which a pipe opened
     /// again through `/proc/self/fd` has of its own ([`FileHandle::reopen`]).
     nonblocking: AtomicBool,
+    /// The pipe's read and write ends, while some description holds each,
+    /// which an open of the other end through a link takes.
+    ends: Arc<Mutex<[Weak<SocketPairEnd>; 2]>>,
 }
 /// What `fchmod` and `fchown` change on the inode of a pipe or a socket, as
 /// Linux's `simple_setattr` keeps them: the mode, whose file type stays, and
@@ -115,8 +118,7 @@ mod pipe_tests {
     #[test]
     fn a_reopened_end_is_a_description_of_its_own() {
         let [r, w] = pair();
-        // Only the access the end has opens it again.
-        assert!(w.reopen(0).is_err());
+        // O_RDWR does not open here.
         assert!(w.reopen(2).is_err());
         let again = w.reopen(1 | NONBLOCK).unwrap();
         assert_eq!(again.flags(), 1 | NONBLOCK);
@@ -132,6 +134,36 @@ mod pipe_tests {
         assert_eq!(r.read(&mut byte), Err(Errno::EAGAIN));
         drop(again);
         assert_eq!(r.read(&mut byte), Ok(0));
+    }
+    #[test]
+    fn either_link_opens_either_end_even_after_it_closed() {
+        let [r, w] = pair();
+        // A writer through the read end, and a reader through the write end.
+        let writer = r.reopen(1).unwrap();
+        assert_eq!(writer.flags(), 1);
+        let reader = w.reopen(0).unwrap();
+        assert_eq!(writer.write(b"ab"), Ok(2));
+        let mut byte = [0];
+        assert_eq!(reader.read(&mut byte), Ok(1));
+        assert_eq!(r.read(&mut byte), Ok(1));
+        // Every writer gone: the end of the pipe, until a new one opens.
+        drop((w, writer));
+        assert_eq!(r.read(&mut byte), Ok(0));
+        let writer = r.reopen(1 | NONBLOCK).unwrap();
+        assert_eq!(r.read(&mut byte), Err(Errno::EAGAIN));
+        assert_eq!(writer.write(b"c"), Ok(1));
+        assert_eq!(reader.read(&mut byte), Ok(1));
+        assert_eq!(byte, *b"c");
+        // Every reader gone: a write is EPIPE, until a new reader opens,
+        // which reads what was left unread, as Linux keeps the buffers.
+        assert_eq!(writer.write(b"z"), Ok(1));
+        drop((r, reader));
+        assert_eq!(writer.write(b"d"), Err(Errno(32)));
+        let reader = writer.reopen(0).unwrap();
+        assert_eq!(writer.write(b"e"), Ok(1));
+        let mut bytes = [0; 2];
+        assert_eq!(reader.read(&mut bytes), Ok(2));
+        assert_eq!(bytes, *b"ze");
     }
     #[test]
     fn readiness_transition() {
@@ -164,6 +196,10 @@ impl PipeEnd {
         writer.shutdown(0)?;
         let inode = reader.inode;
         let attributes = Arc::new(Attributes::new(0o010600));
+        let ends = Arc::new(Mutex::new([
+            Arc::downgrade(&reader),
+            Arc::downgrade(&writer),
+        ]));
         Ok([
             Arc::new(Self {
                 endpoint: reader,
@@ -171,6 +207,7 @@ impl PipeEnd {
                 inode,
                 attributes: Arc::clone(&attributes),
                 nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
+                ends: Arc::clone(&ends),
             }),
             Arc::new(Self {
                 endpoint: writer,
@@ -178,6 +215,7 @@ impl PipeEnd {
                 inode,
                 attributes,
                 nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
+                ends,
             }),
         ])
     }
@@ -267,22 +305,43 @@ impl FileHandle for PipeEnd {
             .store(flags & NONBLOCK != 0, Ordering::SeqCst);
         Ok(())
     }
-    /// A new open file description of the same end, as Linux's `fifo_open`
-    /// makes for the link of a pipe: its own `O_NONBLOCK`, while the end,
-    /// its buffer and its `O_ASYNC` stay shared, and the end closes when the
-    /// last description does. Only the access mode the end has opens
-    /// (`ENXIO` for the other end, which Linux opens too).
+    /// A new open file description of the pipe, as Linux's `fifo_open`
+    /// makes for the link of a pipe: a reader for `O_RDONLY` and a writer for
+    /// `O_WRONLY`, whichever end the link is, with its own `O_NONBLOCK`. The
+    /// end and its buffer and `O_ASYNC` are shared with the other
+    /// descriptions of it, and it closes when the last of them does; an end
+    /// all of whose descriptions closed opens again, as a pipe, unlike a
+    /// FIFO, neither waits for the other end nor refuses a writer without a
+    /// reader. `O_RDWR`, which Linux opens as both, gives `ENXIO` here.
     fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         const ENXIO: Errno = Errno(6);
-        if flags & 3 != u32::from(!self.reader) {
-            return Err(ENXIO);
-        }
+        let reader = match flags & 3 {
+            0 => true,
+            1 => false,
+            _ => return Err(ENXIO),
+        };
+        let endpoint = if reader == self.reader {
+            Arc::clone(&self.endpoint)
+        } else {
+            let mut ends = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
+            let end = &mut ends[usize::from(!reader)];
+            match end.upgrade() {
+                Some(endpoint) => endpoint,
+                None => {
+                    let endpoint =
+                        SocketPairEnd::reopened(&self.endpoint.pair, 1 - self.endpoint.side);
+                    *end = Arc::downgrade(&endpoint);
+                    endpoint
+                }
+            }
+        };
         Ok(Arc::new(Self {
-            endpoint: Arc::clone(&self.endpoint),
-            reader: self.reader,
+            endpoint,
+            reader,
             inode: self.inode,
             attributes: Arc::clone(&self.attributes),
             nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
+            ends: Arc::clone(&self.ends),
         }))
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
@@ -2274,6 +2333,38 @@ impl SocketPairEnd {
                 sent: Arc::clone(&pair.sent[side]),
             })
         }))
+    }
+    /// The end on `side` of a pipe, all of whose descriptions had closed,
+    /// open again, as Linux's `fifo_open` counts a reader or writer back.
+    /// The old end has closed by the time its last reference is gone, but
+    /// its `Drop` may still be on the way: this waits for that.
+    fn reopened(pair: &Arc<Pair>, side: usize) -> Arc<Self> {
+        let end = Arc::new(Self {
+            pair: Arc::clone(pair),
+            side,
+            flags: AtomicU32::new(2),
+            inode: crate::files::anonymous_inode(),
+            attributes: Attributes::new(0o140777),
+            options: Mutex::default(),
+            unix: std::sync::OnceLock::new(),
+            unconnected: AtomicBool::new(false),
+            sent: Arc::clone(&pair.sent[side]),
+        });
+        loop {
+            let mut sides = pair.sides.lock().unwrap_or_else(PoisonError::into_inner);
+            if sides[side].closed {
+                sides[side].closed = false;
+                for side in sides.iter_mut() {
+                    side.input_epoch = side.input_epoch.wrapping_add(1);
+                    side.output_epoch = side.output_epoch.wrapping_add(1);
+                }
+                break;
+            }
+            drop(sides);
+            std::thread::yield_now();
+        }
+        pair.hub.changed();
+        end
     }
     pub fn shutdown(&self, how: u64) -> Result<(), Errno> {
         if how > 2 {

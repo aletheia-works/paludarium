@@ -431,9 +431,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   種類と 4096 の `f_bsize` を返します。
   `/proc/self/fd` のリンクは procfs のものですが、それを通した `stat`、`statfs`、`open`
   はリンク先のファイルに届きます。
-- `/proc` にあるのは、ほかには自分のプロセスのものだけです。`/proc/self`
-  （`/proc/<pid>` としても）は、`readlink` で PID になり、その中のものを相対的に
-  開けるディレクトリです。ほかに `/proc/self/status` と `/proc/self/fd` があります。
+- `/proc` にあるのは、ほかには自分のプロセスのものだけです。`/proc/<pid>` は、
+  その中のものを相対的に開けるディレクトリです。`/proc/self` はそこへの
+  シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
+  `AT_SYMLINK_NOFOLLOW` の `fstatat` や `statx` はリンクを返し、`stat` と末尾の `/` は
+  リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
+  リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
+  名乗ります。ほかに `/proc/self/status` と `/proc/self/fd` があります。
   `/proc/self/status` は、Linux と同じ項目を同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。ただし、何も
   測っていないメモリと CPU の項目はありません。

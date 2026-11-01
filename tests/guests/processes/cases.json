@@ -85,6 +85,7 @@
     {"name":"pipe-reopen","binary":"process"},
     {"name":"pipe-async","binary":"process"},
     {"name":"link-path","binary":"process"},
+    {"name":"proc-self-link","binary":"process"},
     {"name":"socket-timeouts","binary":"process"},
     {"name":"signal-restart","binary":"process"},
     {"name":"signal-io","binary":"process"},

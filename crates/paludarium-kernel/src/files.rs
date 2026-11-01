@@ -2236,6 +2236,8 @@ enum LinkTarget {
     /// A link in `/proc/self/fd`, which names the descriptor's file as it
     /// is when read.
     Descriptor(u32),
+    /// `/proc/self`, which names the directory of the process that reads it.
+    OwnProcess,
 }
 impl LinkPath {
     /// The symbolic link `p` names itself, or `None` when it is no link.
@@ -2257,6 +2259,12 @@ impl LinkPath {
                 target: LinkTarget::Descriptor(n),
             }));
         }
+        if p == b"/proc/self" {
+            return Ok(Some(Self {
+                stat: crate::proc::self_link_stat(),
+                target: LinkTarget::OwnProcess,
+            }));
+        }
         if generated(p) {
             return Ok(None);
         }
@@ -2272,6 +2280,7 @@ impl LinkPath {
     fn target(&self, c: &Context<'_>) -> Result<Vec<u8>, Errno> {
         match &self.target {
             LinkTarget::Fixed(target) => Ok(target.clone()),
+            LinkTarget::OwnProcess => Ok(c.process.pid.to_string().into_bytes()),
             LinkTarget::Descriptor(n) => {
                 let d = c
                     .files
@@ -2757,6 +2766,10 @@ fn open_path(
         Arc::new(crate::proc::GeneratedFile::open(content, flags))
     } else if let Some(entry) = crate::proc::own_entry(p, c.process.pid) {
         match entry {
+            // `/proc/self` is a link, which O_NOFOLLOW does not follow.
+            crate::proc::OwnEntry::Directory if p == b"/proc/self" && flags & O_NOFOLLOW != 0 => {
+                return Err(Errno(40)); // ELOOP
+            }
             crate::proc::OwnEntry::Directory => {
                 Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
             }
@@ -2921,6 +2934,10 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
             // pidfs instead.
             _ => "pidfd",
         }),
+        // `/proc/self` opened itself names itself, as Linux's link does.
+        _ if d.path == b"/proc/self" && any.is_some_and(|v| v.is::<LinkPath>()) => {
+            b"/proc/self".to_vec()
+        }
         _ if generated(&d.path) => match d.path.strip_prefix(b"/proc/self") {
             Some(rest) => [format!("/proc/{}", c.process.pid).as_bytes(), rest].concat(),
             None => d.path.clone(),
@@ -2974,6 +2991,15 @@ fn generated_stat(c: &Context<'_>, path: &[u8], follow: bool) -> Option<(FileSta
     if let Some(mountinfo) = crate::proc::mount_table(path) {
         let length = crate::proc::render(&c.files.fs.mounts(), mountinfo).len();
         return Some((crate::proc::stat(length), device(c, path), SMALL_BLOCK_SIZE));
+    }
+    // `/proc/self` itself, not followed, is the link to this process's
+    // directory; `/proc/self/` follows it.
+    if path == b"/proc/self" && !follow {
+        return Some((
+            crate::proc::self_link_stat(),
+            device(c, path),
+            SMALL_BLOCK_SIZE,
+        ));
     }
     let stat = match crate::proc::own_entry(path, c.process.pid)? {
         crate::proc::OwnEntry::Directory => crate::proc::directory_stat(),

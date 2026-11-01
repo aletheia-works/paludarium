@@ -93,7 +93,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ほかのオプションです。セキュリティモジュールは再現していないので、`SO_PASSSEC` は
   `SCM_SECURITY` を運ばず、`SO_PEERSEC` は `ENOPROTOOPT` です。モジュールのない
   Linux と同じです。SELinux のある Linux は送り手や相手のコンテキストを渡し、
-  AppArmor のある Linux は `SO_PEERSEC` で相手のラベルを渡します。`SO_RCVTIMEO` と `SO_SNDTIMEO` は 1000 Hz の刻みに丸めます。
+  AppArmor のある Linux は `SO_PEERSEC` で相手のラベルを渡します。
+  `SO_RCVTIMEO` と `SO_SNDTIMEO` は 1000 Hz の刻みに丸めます。
   Linux は自分の `CONFIG_HZ` に丸めます。
   ゲストは root なので、`CAP_NET_ADMIN` の
   要るオプション（`SO_DEBUG`、`SO_SNDBUFFORCE` など）も設定でき、`SO_PEERCRED` の

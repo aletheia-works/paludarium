@@ -43,8 +43,8 @@ CI run produces them afresh on an x86-64 Linux runner.
   On main, 26 of the process cases and 6 of the network cases fail there
   for such reasons. QEMU:
   - refuses socket options it does not know (`SO_PEEK_OFF`,
-    `SO_PASSPIDFD`, `SO_TIMESTAMP_NEW`, `SO_RCVTIMEO_NEW`, …), and gives `SO_TIMESTAMPING`
-    back as an `int`;
+    `SO_PASSPIDFD`, `SO_TIMESTAMP_NEW`, `SO_RCVTIMEO_NEW`, …), and gives
+    `SO_TIMESTAMPING` back as an `int`;
   - leaves `MSG_CTRUNC` out of `recvmsg`'s flags;
   - handles `SA_NOCLDSTOP`, `SA_NOCLDWAIT`, `F_SETSIG`, core dumps and
     `sigqueue` itself;

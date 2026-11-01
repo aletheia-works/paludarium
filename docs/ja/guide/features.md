@@ -312,9 +312,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   バッファなしで受け取ると `MSG_CTRUNC` になります。`SCM_SECURITY` のメッセージは
   来ません。AF_UNIX に送り手のコンテキストを渡すセキュリティモジュールのない Linux
   （モジュールなし、または AppArmor）と同じです。待ち受けが受け付けたソケットは、
-  クライアントが接続したときの待ち受けの `SO_PASSCRED`、`SO_PASSPIDFD`、`SO_PASSSEC` を
-  引き継ぎます。inet のソケットでは、Linux が AF_UNIX でしか受け付けないので、この 3 つは
-  設定も読み出しも `EOPNOTSUPP` です。
+  クライアントが接続したときの待ち受けの `SO_PASSCRED`、`SO_PASSPIDFD`、
+  `SO_PASSSEC` を引き継ぎます。inet のソケットでは、Linux が AF_UNIX でしか
+  受け付けないので、この 3 つは設定も読み出しも `EOPNOTSUPP` です。
 - `SO_RCVTIMEO` と `SO_SNDTIMEO`（と `_NEW` の形）は、Linux と同じく、そのソケットでの
   `recv`、`read`、`send`、`write` が待つ時間を限ります。限りを過ぎると `EAGAIN`、または
   そこまでに動かした分を返し、`MSG_WAITALL` もそこで止まります。0 の `timeval` は

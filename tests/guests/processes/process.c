@@ -3733,6 +3733,8 @@ int main(int argc, char **argv) {
         printf(" after=%ld\n", (long)read(e[0], sink, 1));
         close(e[0]);
         pipe(e);
+        /* What the readers left unread stays for the next one. */
+        write(e[1], "z", 1);
         close(e[0]);
         signal(SIGPIPE, SIG_IGN);
         errno = 0;
@@ -3741,8 +3743,8 @@ int main(int argc, char **argv) {
         snprintf(link, sizeof link, "/proc/self/fd/%d", e[1]);
         other = open(link, O_RDONLY);
         wrote = write(e[1], "e", 1);
-        n = read(other, sink, 1);
-        printf("reader-again: open=%d wrote=%ld read=%ld\n", other >= 0, wrote, n);
+        n = read(other, sink, 2);
+        printf("reader-again: open=%d wrote=%ld read=%ld %.*s\n", other >= 0, wrote, n, n > 0 ? (int)n : 0, sink);
         close(other);
         close(e[1]);
         /* Standard output, opened again without blocking. */

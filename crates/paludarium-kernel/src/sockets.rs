@@ -154,13 +154,16 @@ mod pipe_tests {
         assert_eq!(writer.write(b"c"), Ok(1));
         assert_eq!(reader.read(&mut byte), Ok(1));
         assert_eq!(byte, *b"c");
-        // Every reader gone: a write is EPIPE, until a new reader opens.
+        // Every reader gone: a write is EPIPE, until a new reader opens,
+        // which reads what was left unread, as Linux keeps the buffers.
+        assert_eq!(writer.write(b"z"), Ok(1));
         drop((r, reader));
         assert_eq!(writer.write(b"d"), Err(Errno(32)));
         let reader = writer.reopen(0).unwrap();
         assert_eq!(writer.write(b"e"), Ok(1));
-        assert_eq!(reader.read(&mut byte), Ok(1));
-        assert_eq!(byte, *b"e");
+        let mut bytes = [0; 2];
+        assert_eq!(reader.read(&mut bytes), Ok(2));
+        assert_eq!(bytes, *b"ze");
     }
     #[test]
     fn readiness_transition() {

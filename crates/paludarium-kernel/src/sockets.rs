@@ -696,8 +696,8 @@ fn socket(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
 pub(crate) fn pipe(file: &Arc<dyn FileHandle>) -> Option<&PipeEnd> {
     file.as_any()?.downcast_ref::<PipeEnd>()
 }
-/// The socket end of a socket or a pipe, which keeps its owner and
-/// `O_ASYNC` itself.
+/// The socket end of a socket or a pipe. A socket's end keeps its owner and
+/// `O_ASYNC`; a pipe's are each description's own ([`pipe`]).
 pub(crate) fn endpoint(file: &Arc<dyn FileHandle>) -> Option<&SocketPairEnd> {
     let any = file.as_any()?;
     any.downcast_ref::<SocketPairEnd>().or_else(|| {

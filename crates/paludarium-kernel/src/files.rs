@@ -2354,6 +2354,16 @@ pub(crate) fn standard(file: &Arc<dyn FileHandle>) -> Option<&StandardFile> {
     file.as_any()?.downcast_ref::<StandardFile>()
 }
 impl FileHandle for StandardFile {
+    /// The same stream as a new open file description: its own status
+    /// flags, from this open's `O_NONBLOCK`, and no `O_ASYNC` yet.
+    fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        let file = Self::new(&self.host, self.channel);
+        file.flags.store(
+            u32::from(self.channel != 0) | flags & crate::events::NONBLOCK,
+            Ordering::SeqCst,
+        );
+        Ok(Arc::new(file))
+    }
     fn stdio_channel(&self) -> Option<u32> {
         Some(self.channel)
     }
@@ -2687,9 +2697,10 @@ fn reopen(
     }
     let stat = d.file.stat()?;
     match stat.mode & 0o170000 {
+        // A pipe or a standard stream: a description of its own.
         0o010000 if d.path.is_empty() => {
             if flags & 3 == d.file.flags() & 3 {
-                Ok((d.file, Vec::new()))
+                Ok((d.file.reopen(flags)?, Vec::new()))
             } else {
                 Err(ENXIO)
             }

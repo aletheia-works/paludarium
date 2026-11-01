@@ -82,6 +82,7 @@
     {"name":"socket-passrights","binary":"process"},
     {"name":"proc-block-size","binary":"process"},
     {"name":"open-flags","binary":"process"},
+    {"name":"pipe-reopen","binary":"process"},
     {"name":"socket-timeouts","binary":"process"},
     {"name":"signal-restart","binary":"process"},
     {"name":"signal-io","binary":"process"},

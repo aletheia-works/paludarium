@@ -3646,6 +3646,66 @@ int main(int argc, char **argv) {
         close(p[1]);
         return 0;
     }
+    if (!strcmp(mode, "pipe-reopen")) {
+        /* A pipe or standard output opened again through its link is a
+           new open file description, as Linux's fifo_open makes: status
+           flags of its own, the same pipe, and an end that closes when
+           its last description does. */
+        int p[2];
+        pipe(p);
+        char link[64];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", p[1]);
+        int writer = open(link, O_WRONLY | O_NONBLOCK);
+        printf("writer: %#o first: %#o\n", fcntl(writer, F_GETFL), fcntl(p[1], F_GETFL));
+        fcntl(writer, F_SETFL, 0);
+        fcntl(p[1], F_SETFL, O_NONBLOCK);
+        printf("setfl: writer %#o first %#o\n", fcntl(writer, F_GETFL), fcntl(p[1], F_GETFL));
+        /* The same pipe, which fills at its size through either. */
+        long filled = 0;
+        char block[4096] = {0};
+        for (;;) {
+            long n = write(p[1], block, sizeof block);
+            if (n <= 0) break;
+            filled += n;
+        }
+        printf("filled=%ld errno=%d\n", filled, errno);
+        fcntl(writer, F_SETFL, O_NONBLOCK);
+        errno = 0;
+        long full = write(writer, block, 1);
+        printf("writer-full=%ld errno=%d\n", full, full < 0 ? errno : 0);
+        char sink[4096];
+        while (filled > 0) filled -= read(p[0], sink, sizeof sink);
+        printf("through=%ld\n", (long)write(writer, "x", 1));
+        printf("read=%ld\n", (long)read(p[0], sink, sizeof sink));
+        /* The write end stays open while a description of it does. */
+        fcntl(p[0], F_SETFL, O_NONBLOCK);
+        close(p[1]);
+        errno = 0;
+        long n = read(p[0], sink, 1);
+        printf("one-writer: read=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        close(writer);
+        printf("no-writer: read=%ld\n", (long)read(p[0], sink, 1));
+        /* The read end, opened again without blocking. */
+        int q[2];
+        pipe(q);
+        snprintf(link, sizeof link, "/proc/self/fd/%d", q[0]);
+        int reader = open(link, O_RDONLY | O_NONBLOCK);
+        errno = 0;
+        n = read(reader, sink, 1);
+        printf("reader: %#o first: %#o read=%ld errno=%d\n", fcntl(reader, F_GETFL), fcntl(q[0], F_GETFL), n,
+               n < 0 ? errno : 0);
+        write(q[1], "y", 1);
+        printf("reader-read=%ld\n", (long)read(reader, sink, 1));
+        close(reader);
+        close(q[0]);
+        close(q[1]);
+        close(p[0]);
+        /* Standard output, opened again without blocking. */
+        int out = open("/dev/stdout", O_WRONLY | O_NONBLOCK);
+        printf("stdout: %#o first: %#o\n", fcntl(out, F_GETFL), fcntl(1, F_GETFL));
+        close(out);
+        return 0;
+    }
     if (!strcmp(mode, "open-flags")) {
         /* What F_GETFL gives, as Linux keeps f_flags: the open flags less
            O_CLOEXEC (build_open_flags) and O_CREAT, O_EXCL, O_NOCTTY and

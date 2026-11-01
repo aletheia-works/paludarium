@@ -22,6 +22,9 @@ pub(crate) struct PipeEnd {
     /// One inode for both ends, as a pipe has on Linux.
     inode: u64,
     attributes: Arc<Attributes>,
+    /// `O_NONBLOCK` of this open file description, which a pipe opened
+    /// again through `/proc/self/fd` has of its own ([`FileHandle::reopen`]).
+    nonblocking: AtomicBool,
 }
 /// What `fchmod` and `fchown` change on the inode of a pipe or a socket, as
 /// Linux's `simple_setattr` keeps them: the mode, whose file type stays, and
@@ -146,12 +149,14 @@ impl PipeEnd {
                 reader: true,
                 inode,
                 attributes: Arc::clone(&attributes),
+                nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
             }),
             Arc::new(Self {
                 endpoint: writer,
                 reader: false,
                 inode,
                 attributes,
+                nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
             }),
         ])
     }
@@ -228,10 +233,35 @@ impl FileHandle for PipeEnd {
         Ok((mask, input, output))
     }
     fn flags(&self) -> u32 {
-        u32::from(!self.reader) | (self.endpoint.flags() & (NONBLOCK | O_ASYNC))
+        let nonblocking = if self.nonblocking.load(Ordering::SeqCst) {
+            NONBLOCK
+        } else {
+            0
+        };
+        u32::from(!self.reader) | nonblocking | (self.endpoint.flags() & O_ASYNC)
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        self.endpoint.set_flags(flags)
+        self.endpoint.set_flags(flags)?;
+        self.nonblocking
+            .store(flags & NONBLOCK != 0, Ordering::SeqCst);
+        Ok(())
+    }
+    /// A new open file description of the same end, as Linux's `fifo_open`
+    /// makes for the link of a pipe: its own `O_NONBLOCK`, while the end,
+    /// its buffer and its `O_ASYNC` stay shared, and the end closes when the
+    /// last description does. Only the access mode the end has opens
+    /// (`ENXIO` for the other end, which Linux opens too).
+    fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        if flags & 3 != u32::from(!self.reader) {
+            return Err(Errno(6));
+        }
+        Ok(Arc::new(Self {
+            endpoint: Arc::clone(&self.endpoint),
+            reader: self.reader,
+            inode: self.inode,
+            attributes: Arc::clone(&self.attributes),
+            nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
+        }))
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
         Err(Errno::ESPIPE)

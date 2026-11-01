@@ -135,10 +135,7 @@ kernel.
   with `O_LARGEFILE` for a file opened by a path or a memfd; an `O_PATH`
   file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
-  (a link in `/proc/self/fd`, `/dev/stdout`). Such an open of a pipe or a
-  standard stream shares its handle, and so its other status flags, with
-  the descriptor it was opened through, where Linux gives it a description
-  of its own.
+  (a link in `/proc/self/fd`, `/dev/stdout`).
 - A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
   `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
   at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.
@@ -487,8 +484,12 @@ kernel.
   own for it. Opening a link opens the file again by its path, or, for a
   file no path names any more (removed, or renamed away), the same file
   through its handle, with an offset of its own; a memfd gets a new handle
-  on the same file and seals; a pipe and the standard streams give the same
-  handle for the access they have. `O_CREAT | O_EXCL` finds the link there
+  on the same file and seals; a pipe end or a standard stream, for the
+  access it has, opens as a new open file description of it, as Linux's
+  `fifo_open` makes: with its own status flags (`O_NONBLOCK`), on the same
+  pipe, whose end closes when its last description does. `O_ASYNC` and the
+  signal owner stay shared with the first description, where Linux keeps
+  them for each. `O_CREAT | O_EXCL` finds the link there
   (`EEXIST`), and `O_NOFOLLOW` does not follow it (`ELOOP`) but with
   `O_PATH`. A socket gives `ENXIO`, as on Linux; so do, here, the other end
   of a pipe, the files of no type, and a removed file of a directory

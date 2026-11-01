@@ -3700,6 +3700,51 @@ int main(int argc, char **argv) {
         close(q[0]);
         close(q[1]);
         close(p[0]);
+        /* Either end's link opens either end, as a pipe (unlike a FIFO)
+           neither waits for the other end nor refuses a writer without a
+           reader: a writer through the read end, a reader through the
+           write end, and an end all of whose descriptions closed. */
+        int e[2];
+        pipe(e);
+        snprintf(link, sizeof link, "/proc/self/fd/%d", e[0]);
+        int other = open(link, O_WRONLY);
+        long wrote = write(other, "a", 1);
+        n = read(e[0], sink, 1);
+        printf("writer-through-reader: %#o wrote=%ld read=%ld\n", fcntl(other, F_GETFL), wrote, n);
+        close(other);
+        snprintf(link, sizeof link, "/proc/self/fd/%d", e[1]);
+        other = open(link, O_RDONLY);
+        wrote = write(e[1], "b", 1);
+        n = read(other, sink, 1);
+        printf("reader-through-writer: %#o wrote=%ld read=%ld\n", fcntl(other, F_GETFL), wrote, n);
+        close(other);
+        close(e[1]);
+        fcntl(e[0], F_SETFL, O_NONBLOCK);
+        printf("writers-gone: read=%ld\n", (long)read(e[0], sink, 1));
+        snprintf(link, sizeof link, "/proc/self/fd/%d", e[0]);
+        other = open(link, O_WRONLY | O_NONBLOCK);
+        errno = 0;
+        n = read(e[0], sink, 1);
+        printf("writer-again: open=%d read=%ld errno=%d", other >= 0, n, n < 0 ? errno : 0);
+        wrote = write(other, "c", 1);
+        n = read(e[0], sink, 1);
+        printf(" wrote=%ld read=%ld", wrote, n);
+        close(other);
+        printf(" after=%ld\n", (long)read(e[0], sink, 1));
+        close(e[0]);
+        pipe(e);
+        close(e[0]);
+        signal(SIGPIPE, SIG_IGN);
+        errno = 0;
+        n = write(e[1], "d", 1);
+        printf("readers-gone: wrote=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        snprintf(link, sizeof link, "/proc/self/fd/%d", e[1]);
+        other = open(link, O_RDONLY);
+        wrote = write(e[1], "e", 1);
+        n = read(other, sink, 1);
+        printf("reader-again: open=%d wrote=%ld read=%ld\n", other >= 0, wrote, n);
+        close(other);
+        close(e[1]);
         /* Standard output, opened again without blocking. */
         int out = open("/dev/stdout", O_WRONLY | O_NONBLOCK);
         printf("stdout: %#o first: %#o\n", fcntl(out, F_GETFL), fcntl(1, F_GETFL));

@@ -884,10 +884,13 @@ fn proc_fd_links_open_again_or_refuse() {
     let read_end = f.mem.read_u64(GuestAddr(pair)).unwrap() & 0xffff_ffff;
     let link = format!("/proc/1/fd/{read_end}\0");
     f.mem.write(GuestAddr(path), link.as_bytes()).unwrap();
-    // The same access gives the pipe's end again; another one cannot.
+    // Either access opens the pipe through its read end: a reader, or a
+    // writer; both at once (O_RDWR) cannot here.
     let again = f.ret(2, &[path, 0]);
     assert!(again < 1 << 32, "{again:#x}");
-    assert_eq!(f.ret(2, &[path, 1]), errno(Errno(6)));
+    let writer = f.ret(2, &[path, 1]);
+    assert!(writer < 1 << 32, "{writer:#x}");
+    assert_eq!(f.ret(2, &[path, 2]), errno(Errno(6)));
     assert_eq!(
         f.ret(89, &[path, buf, 64]),
         f.ret(89, &[path, buf + 64, 64])

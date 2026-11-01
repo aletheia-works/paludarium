@@ -121,7 +121,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フラグから `O_CLOEXEC`、`O_CREAT`、`O_EXCL`、`O_NOCTTY`、`O_TRUNC` を除き、パスで
   開いたファイルと memfd には `O_LARGEFILE` を加えます。`O_PATH` のファイルは
   `O_DIRECTORY`、`O_NOFOLLOW`、`O_PATH` だけを持ちます。パイプ、ソケット、カーネル
-  自身のファイルには `O_LARGEFILE` がありません。
+  自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
+  除いて `O_LARGEFILE` がありません。そのように開いたパイプや標準のストリームは、
+  元のディスクリプタとハンドルを共有するので、ほかの状態フラグも共有します。Linux では
+  別の記述になります。
 - パイプは Linux と同じく 64 KiB を持ちます。`fcntl` の `F_SETPIPE_SZ` と
   `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。大きさは
   1 ページ以上の 2 のべき乗で、読まれていないデータより小さくすると `EBUSY`、

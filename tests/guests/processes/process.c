@@ -3692,6 +3692,20 @@ int main(int argc, char **argv) {
         int p[2];
         pipe2(p, O_CLOEXEC | O_NONBLOCK);
         printf("pipe: %#o %#o\n", fcntl(p[0], F_GETFL), fcntl(p[1], F_GETFL));
+        /* A pipe or standard output opened by path, through a link to it,
+           is an open by path all the same. */
+        int q[2];
+        pipe(q);
+        char link[64];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", q[1]);
+        int writer = open(link, O_WRONLY | O_CLOEXEC);
+        printf("pipe-by-path: %#o first: %#o\n", fcntl(writer, F_GETFL), fcntl(q[1], F_GETFL));
+        int out = open("/dev/stdout", O_WRONLY);
+        printf("stdout-by-path: %#o\n", fcntl(out, F_GETFL));
+        close(writer);
+        close(out);
+        close(q[0]);
+        close(q[1]);
         int sv[2];
         socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
         printf("socketpair: %#o\n", fcntl(sv[0], F_GETFL));

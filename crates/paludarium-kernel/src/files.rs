@@ -16,6 +16,10 @@ pub(crate) struct Descriptor {
     pub(crate) file: Arc<dyn FileHandle>,
     path: Vec<u8>,
     cloexec: bool,
+    /// Its open file description came from an open by path, which gives
+    /// it `O_LARGEFILE` ([`status_flags`]); a `dup` or `SCM_RIGHTS` copy
+    /// shares that, as it shares Linux's description.
+    opened: bool,
 }
 impl Descriptor {
     /// A descriptor of `file`, which has no path, as a socket's.
@@ -24,6 +28,7 @@ impl Descriptor {
             file,
             path: Vec::new(),
             cloexec,
+            opened: false,
         }
     }
     /// The descriptor a process gets for this one's open file over
@@ -137,6 +142,7 @@ impl Files {
                 file,
                 path: Vec::new(),
                 cloexec,
+                opened: false,
             },
             0,
             limit,
@@ -163,6 +169,7 @@ impl Files {
                     file,
                     path,
                     cloexec,
+                    opened: false,
                 },
             );
         }
@@ -213,6 +220,7 @@ impl Files {
                         file: Arc::new(StandardFile::new(&host, channel)),
                         path: Vec::new(),
                         cloexec: false,
+                        opened: false,
                     },
                 );
         }
@@ -1602,6 +1610,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                             file,
                             path,
                             cloexec,
+                            opened: true,
                         },
                     );
                     Ok(u64::from(fd))
@@ -2207,11 +2216,12 @@ pub(crate) struct StandardFile {
 const SETFL_FLAGS: u32 = 0o2000 | 0o4000 | 0o40000 | 0o1000000;
 /// What `F_GETFL` gives for `d`, as Linux keeps a file's `f_flags`: the open
 /// flags less `O_CLOEXEC` (`build_open_flags`) and `O_CREAT`, `O_EXCL`,
-/// `O_NOCTTY` and `O_TRUNC` (`do_dentry_open`), and `O_LARGEFILE` for a file
-/// opened by a path or a memfd, which x86-64's `force_o_largefile` adds; an
-/// `O_PATH` file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes,
-/// sockets and the kernel's own files, made with no open by path, have no
-/// `O_LARGEFILE`, nor have the host's standard streams here.
+/// `O_NOCTTY` and `O_TRUNC` (`do_dentry_open`), and `O_LARGEFILE` for a
+/// description opened by a path ([`Descriptor`]'s `opened`) or a memfd,
+/// which x86-64's `force_o_largefile` adds; an `O_PATH` file keeps only
+/// `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets, the kernel's
+/// own files and the host's standard streams, made with no open by path,
+/// have no `O_LARGEFILE`.
 fn status_flags(d: &Descriptor) -> u32 {
     const O_LARGEFILE: u32 = 0o100000;
     const O_DIRECTORY: u32 = 0o200000;
@@ -2223,11 +2233,10 @@ fn status_flags(d: &Descriptor) -> u32 {
     if flags & O_PATH != 0 {
         return flags & (O_DIRECTORY | O_NOFOLLOW | O_PATH);
     }
-    let opened = d.file.stdio_channel().is_none()
-        && (!d.path.is_empty()
-            || d.file
-                .as_any()
-                .is_some_and(|v| v.is::<crate::memfd::Memfd>()));
+    let opened = d.opened
+        || d.file
+            .as_any()
+            .is_some_and(|v| v.is::<crate::memfd::Memfd>());
     flags & !OPEN_ONLY | if opened { O_LARGEFILE } else { 0 }
 }
 /// How often a thread looks at a host's standard stream for `O_ASYNC`.
@@ -2445,6 +2454,7 @@ mod files_tests {
             file: fs.open(p, 66, 0o600).unwrap(),
             path: p.to_vec(),
             cloexec: false,
+            opened: true,
         }
     }
     #[test]

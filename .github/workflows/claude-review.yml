@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   review:
-    uses: aletheia-works/.github/.github/workflows/claude-review.yml@f5bb52fe38d6ddf151662ed6b64c0b23eeb50ec4 # v1.3.3
+    uses: aletheia-works/.github/.github/workflows/claude-review.yml@0ab4b956b12760b3926ac8f768e04432404a5182 # v1.3.4
     with:
       rules: >-
         the principles in docs/guide/introduction.md, the supported features and limitations in docs/guide/, the architecture, design decisions and verification rules in docs/design/, CONTRIBUTING.md, docs/release.md for anything touching publication, and the README.md nearest the changed code

@@ -252,8 +252,9 @@ impl FileHandle for PipeEnd {
     /// last description does. Only the access mode the end has opens
     /// (`ENXIO` for the other end, which Linux opens too).
     fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        const ENXIO: Errno = Errno(6);
         if flags & 3 != u32::from(!self.reader) {
-            return Err(Errno(6));
+            return Err(ENXIO);
         }
         Ok(Arc::new(Self {
             endpoint: Arc::clone(&self.endpoint),

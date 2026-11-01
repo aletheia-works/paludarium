@@ -740,6 +740,11 @@ impl Signals {
 /// (`tcp_fin`), and then `POLL_IN` as for data (`tcp_data_queue` queues the
 /// FIN), and `POLL_OUT` for room after a full buffer
 /// (`sk_stream_write_space`).
+/// The host's real time, which stamps what a stream receives.
+fn realtime(host: &Arc<dyn paludarium_host::Host>) -> paludarium_host::net::Clock {
+    let host = Arc::clone(host);
+    Arc::new(move || host.clock(paludarium_host::ClockId::Realtime).ok())
+}
 fn stream_waker(
     signals: &Arc<Signals>,
     hub: &Arc<ReadinessHub>,
@@ -921,11 +926,14 @@ impl InetSocket {
         }
         let read = match Self::joined(&s) {
             Some((link, side)) => link.read(side, &stream, buf, (peek, inline)),
-            None => stream.read(buf, peek).map(|n| (n, false)),
+            None => stream
+                .read_stamped(buf, peek)
+                .map(|(n, stamp)| (n, false, stamp)),
         };
         match read {
-            Ok((n, at_mark)) => Ok(Received {
+            Ok((n, at_mark, came)) => Ok(Received {
                 at_mark,
+                came,
                 ..Received::bytes(n)
             }),
             Err(e) if e == Errno::EAGAIN => Err(e),
@@ -1046,6 +1054,7 @@ impl InetSocket {
                             if self.network.allows(address, now) {
                                 let stream = c.host.connect(address)?;
                                 stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
+                                stream.set_clock(realtime(&self.host));
                                 stream
                             } else if to.is_some() {
                                 // Nothing listens there on the guest's own
@@ -1058,6 +1067,7 @@ impl InetSocket {
                     };
                     if address.port() == DNS && !loopback {
                         stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
+                        stream.set_clock(realtime(&self.host));
                     }
                     stream.set_nodelay(options.no_delay);
                     if let Some(old) = s.stream.replace(Arc::clone(&stream)) {
@@ -1756,6 +1766,7 @@ impl InetSocket {
         *child.options() = options;
         let own = Stream::new(from);
         own.set_waker(stream_waker(&child.signals, &child.hub, &own));
+        own.set_clock(realtime(&child.host));
         size_buffers(&own, &options);
         let joined = Link::join(
             stream,
@@ -1820,6 +1831,7 @@ impl InetSocket {
         };
         let stream = Stream::new(to);
         stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
+        stream.set_clock(realtime(&self.host));
         size_buffers(&stream, options);
         let link = Arc::new(OnceLock::new());
         s.link = Some((Arc::clone(&link), 0));
@@ -2538,6 +2550,7 @@ fn receive(
             Ok(more) if more.count > 0 => {
                 received.count += more.count;
                 received.at_mark = more.at_mark;
+                received.came = more.came.or(received.came);
             }
             _ => break,
         }

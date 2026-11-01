@@ -52,9 +52,13 @@ verified.
     Through the host, `SO_SNDBUF` and `SO_RCVBUF` are kept for `getsockopt`
     but do not size the buffers, which hold 256 KiB each way; the other options but
     `TCP_NODELAY` do not reach the host's socket.
-  - A TCP socket takes `SO_TIMESTAMP`, its kin and `SO_TIMESTAMPING`, but
-    `recvmsg` gives it no timestamps, where Linux gives the time the last
-    segment read came.
+  - TCP bytes are always stamped as they come, as Linux stamps a segment
+    while some socket on the machine takes timestamps; with none, Linux
+    gives a segment that came then no timestamp. All the bytes waiting
+    unread take the time the last came, where Linux joins a segment to
+    the one before it only while that holds fewer than its limit of
+    fragments (`MAX_SKB_FRAGS`), so a read of an earlier one can get an
+    earlier time.
   - Through the host, `MSG_OOB` sends its byte as an ordinary one and finds
     no urgent data (`EINVAL`), so no `SIGURG` comes either.
   - On the loopback, an urgent byte sends `SIGURG` once, when it reaches

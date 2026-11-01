@@ -669,7 +669,13 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_TIMESTAMPING`'s flags report software stamps and do not filter
     received ones out, a `SCM_TIMESTAMPING`, which UDP gives alone too.
     Both are cut to the control buffer as on AF_UNIX. A DNS stub's answer
-    is stamped when it is read.
+    is stamped when it is read. TCP bytes are stamped as they come too,
+    on the loopback and through the host, and a read, a peek, or an empty
+    read with bytes waiting gets the time of those it read, as Linux's
+    `tcp_recvmsg` gives the segment's (`tcp_recv_timestamp`); the end of
+    input gets none. Bytes that come while others wait unread give those
+    their time, as Linux's `tcp_try_coalesce` gives a segment it joins to
+    the one before it.
 - **Name resolution**: a built-in DNS stub answers the UDP queries a guest's
   resolver sends to port 53, at any address: the server of
   `/etc/resolv.conf`, or its default. It answers `A` and `AAAA` questions

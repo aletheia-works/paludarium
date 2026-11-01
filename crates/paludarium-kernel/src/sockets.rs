@@ -22,6 +22,9 @@ pub(crate) struct PipeEnd {
     /// One inode for both ends, as a pipe has on Linux.
     inode: u64,
     attributes: Arc<Attributes>,
+    /// `O_NONBLOCK` of this open file description, which a pipe opened
+    /// again through `/proc/self/fd` has of its own ([`FileHandle::reopen`]).
+    nonblocking: AtomicBool,
 }
 /// What `fchmod` and `fchown` change on the inode of a pipe or a socket, as
 /// Linux's `simple_setattr` keeps them: the mode, whose file type stays, and
@@ -110,6 +113,27 @@ mod pipe_tests {
         assert_eq!(r.seek(0, 0), Err(Errno::ESPIPE));
     }
     #[test]
+    fn a_reopened_end_is_a_description_of_its_own() {
+        let [r, w] = pair();
+        // Only the access the end has opens it again.
+        assert!(w.reopen(0).is_err());
+        assert!(w.reopen(2).is_err());
+        let again = w.reopen(1 | NONBLOCK).unwrap();
+        assert_eq!(again.flags(), 1 | NONBLOCK);
+        assert_eq!(w.flags(), 1);
+        w.set_flags(NONBLOCK).unwrap();
+        again.set_flags(0).unwrap();
+        assert_eq!((w.flags(), again.flags()), (1 | NONBLOCK, 1));
+        // The same pipe, whose write end stays open while either does.
+        assert_eq!(again.write(b"x"), Ok(1));
+        drop(w);
+        let mut byte = [0];
+        assert_eq!(r.read(&mut byte), Ok(1));
+        assert_eq!(r.read(&mut byte), Err(Errno::EAGAIN));
+        drop(again);
+        assert_eq!(r.read(&mut byte), Ok(0));
+    }
+    #[test]
     fn readiness_transition() {
         let [r, w] = pair();
         assert_eq!(r.readiness().unwrap().0, 0);
@@ -146,12 +170,14 @@ impl PipeEnd {
                 reader: true,
                 inode,
                 attributes: Arc::clone(&attributes),
+                nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
             }),
             Arc::new(Self {
                 endpoint: writer,
                 reader: false,
                 inode,
                 attributes,
+                nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
             }),
         ])
     }
@@ -228,10 +254,36 @@ impl FileHandle for PipeEnd {
         Ok((mask, input, output))
     }
     fn flags(&self) -> u32 {
-        u32::from(!self.reader) | (self.endpoint.flags() & (NONBLOCK | O_ASYNC))
+        let nonblocking = if self.nonblocking.load(Ordering::SeqCst) {
+            NONBLOCK
+        } else {
+            0
+        };
+        u32::from(!self.reader) | nonblocking | (self.endpoint.flags() & O_ASYNC)
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        self.endpoint.set_flags(flags)
+        self.endpoint.set_flags(flags)?;
+        self.nonblocking
+            .store(flags & NONBLOCK != 0, Ordering::SeqCst);
+        Ok(())
+    }
+    /// A new open file description of the same end, as Linux's `fifo_open`
+    /// makes for the link of a pipe: its own `O_NONBLOCK`, while the end,
+    /// its buffer and its `O_ASYNC` stay shared, and the end closes when the
+    /// last description does. Only the access mode the end has opens
+    /// (`ENXIO` for the other end, which Linux opens too).
+    fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        const ENXIO: Errno = Errno(6);
+        if flags & 3 != u32::from(!self.reader) {
+            return Err(ENXIO);
+        }
+        Ok(Arc::new(Self {
+            endpoint: Arc::clone(&self.endpoint),
+            reader: self.reader,
+            inode: self.inode,
+            attributes: Arc::clone(&self.attributes),
+            nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
+        }))
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
         Err(Errno::ESPIPE)

@@ -3646,6 +3646,80 @@ int main(int argc, char **argv) {
         close(p[1]);
         return 0;
     }
+    if (!strcmp(mode, "link-path")) {
+        /* O_PATH | O_NOFOLLOW on a symbolic link opens the link itself, as
+           Linux does: its own fstat (fstatat with AT_EMPTY_PATH too) and
+           fstatfs, readlinkat(fd, "") reads where it points, its own link
+           in /proc/self/fd names the link, nothing reads through it, and
+           an open that follows that link reaches the link (ELOOP). Shown
+           for a link in /proc/self/fd, a symbolic link of a filesystem and
+           /dev/stdin. */
+        char tmp[] = "/tmp/paludarium-linkpathXXXXXX";
+        int file = mkstemp(tmp);
+        struct stat target;
+        fstat(file, &target);
+        char fd_link[64];
+        snprintf(fd_link, sizeof fd_link, "/proc/self/fd/%d", file);
+        char symbolic[] = "/tmp/paludarium-linkpath-link";
+        unlink(symbolic);
+        symlink(tmp, symbolic);
+        const char *links[] = {fd_link, symbolic, "/dev/stdin"};
+        const char *names[] = {"fd-link", "symlink", "dev-stdin"};
+        for (int i = 0; i < 3; i++) {
+            errno = 0;
+            int fd = open(links[i], O_PATH | O_NOFOLLOW);
+            printf("%s: open=%d errno=%d flags=%#o\n", names[i], fd >= 0, fd < 0 ? errno : 0, fcntl(fd, F_GETFL));
+            if (fd < 0) continue;
+            struct stat st = {0}, at = {0};
+            fstat(fd, &st);
+            fstatat(fd, "", &at, AT_EMPTY_PATH);
+            printf("  fstat mode=%#o size=%s blksize=%ld not-target=%d fstatat-same=%d\n", st.st_mode,
+                   i == 1 ? (st.st_size == (off_t)strlen(tmp) ? "target-length" : "other") : st.st_size == 64 ? "64" : "other",
+                   (long)st.st_blksize, st.st_ino != target.st_ino || st.st_dev != target.st_dev,
+                   at.st_mode == st.st_mode && at.st_ino == st.st_ino);
+            char to[256] = {0};
+            errno = 0;
+            long n = readlinkat(fd, "", to, sizeof to - 1);
+            printf("  readlinkat=%ld errno=%d target=%s\n", n > 0 ? 1L : n, n < 0 ? errno : 0,
+                   n <= 0 ? "-" : !strcmp(to, tmp) ? "file" : to);
+            char own[64], named[256] = {0};
+            snprintf(own, sizeof own, "/proc/self/fd/%d", fd);
+            readlink(own, named, sizeof named - 1);
+            char expected[64];
+            snprintf(expected, sizeof expected, "/proc/%d/fd/%d", getpid(), file);
+            printf("  own-link=%s\n", !strcmp(named, expected) ? "proc-link" : !strcmp(named, symbolic) ? "symlink" : named);
+            struct statfs fs = {0};
+            errno = 0;
+            int r = fstatfs(fd, &fs);
+            printf("  fstatfs=%d errno=%d proc=%d\n", r, r < 0 ? errno : 0, fs.f_type == 0x9fa0);
+            char byte;
+            errno = 0;
+            n = read(fd, &byte, 1);
+            printf("  read=%ld errno=%d", n, n < 0 ? errno : 0);
+            errno = 0;
+            r = open(own, O_RDONLY);
+            printf(" follow-again=%d errno=%d\n", r >= 0, r < 0 ? errno : 0);
+            close(fd);
+        }
+        /* A file is no link: readlinkat(fd, "") of its O_PATH descriptor is
+           ENOENT; a closed descriptor's link is not there. */
+        int path = open(tmp, O_PATH);
+        char to[64];
+        errno = 0;
+        long n = readlinkat(path, "", to, sizeof to);
+        printf("file: readlinkat=%ld errno=%d", n, n < 0 ? errno : 0);
+        errno = 0;
+        n = readlinkat(AT_FDCWD, "", to, sizeof to);
+        printf(" cwd=%ld errno=%d\n", n, n < 0 ? errno : 0);
+        close(path);
+        errno = 0;
+        int r = open("/proc/self/fd/900", O_PATH | O_NOFOLLOW);
+        printf("closed: open=%d errno=%d\n", r >= 0, r < 0 ? errno : 0);
+        unlink(symbolic);
+        unlink(tmp);
+        close(file);
+        return 0;
+    }
     if (!strcmp(mode, "pipe-async")) {
         /* Each open file description of a pipe has its own owner and
            O_ASYNC, as Linux keeps f_owner and the fasync entry for each

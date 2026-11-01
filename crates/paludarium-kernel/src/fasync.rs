@@ -101,6 +101,9 @@ fn owner(c: &Context<'_>, file: &Arc<dyn FileHandle>) -> FileOwner {
     if let Some(socket) = crate::inet::of(file) {
         return socket.file_owner();
     }
+    if let Some(pipe) = crate::sockets::pipe(file) {
+        return pipe.file_owner();
+    }
     match crate::sockets::endpoint(file) {
         Some(endpoint) => endpoint.file_owner(),
         None => c.processes.file_owner(file),
@@ -110,6 +113,9 @@ fn owner(c: &Context<'_>, file: &Arc<dyn FileHandle>) -> FileOwner {
 fn set_owner(c: &Context<'_>, file: &Arc<dyn FileHandle>, owner: FileOwner) {
     if let Some(socket) = crate::inet::of(file) {
         return socket.set_file_owner(owner, c.processes);
+    }
+    if let Some(pipe) = crate::sockets::pipe(file) {
+        return pipe.set_file_owner(owner);
     }
     match crate::sockets::endpoint(file) {
         Some(endpoint) => endpoint.set_file_owner(owner),
@@ -158,7 +164,9 @@ pub(crate) fn set_flags(
             processes: Arc::downgrade(c.processes),
             fd: fd as i32,
         });
-        if let Some(endpoint) = crate::sockets::endpoint(file) {
+        if let Some(pipe) = crate::sockets::pipe(file) {
+            pipe.set_async(registration);
+        } else if let Some(endpoint) = crate::sockets::endpoint(file) {
             endpoint.set_async(registration);
         } else if let Some(socket) = crate::inet::of(file) {
             socket.set_async(registration);

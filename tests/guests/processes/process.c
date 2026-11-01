@@ -3646,6 +3646,61 @@ int main(int argc, char **argv) {
         close(p[1]);
         return 0;
     }
+    if (!strcmp(mode, "pipe-async")) {
+        /* Each open file description of a pipe has its own owner and
+           O_ASYNC, as Linux keeps f_owner and the fasync entry for each
+           file: a write signals every reader description open with it
+           (fasync_readers), a read every writer one (fasync_writers), and
+           an O_RDWR description is both. */
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGIO);
+        sigaddset(&set, SIGURG);
+        sigaddset(&set, IO_RT);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        pid_t pid = getpid();
+        int p[2];
+        char sink[64];
+        if (pipe(p)) return 79;
+        char link[64];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", p[0]);
+        int again = open(link, O_RDONLY | O_NONBLOCK);
+        fcntl(p[0], F_SETOWN, pid);
+        fcntl(p[0], F_SETSIG, IO_RT);
+        fcntl(p[0], F_SETFL, O_ASYNC | O_NONBLOCK);
+        printf("own: first=%d/%d/%d again=%d/%d/%d\n", fcntl(p[0], F_GETOWN) == pid, fcntl(p[0], F_GETSIG) == IO_RT,
+               !!(fcntl(p[0], F_GETFL) & O_ASYNC), fcntl(again, F_GETOWN) == pid, fcntl(again, F_GETSIG) == IO_RT,
+               !!(fcntl(again, F_GETFL) & O_ASYNC));
+        write(p[1], "a", 1);
+        io_taken("one-reader");
+        fcntl(again, F_SETOWN, pid);
+        fcntl(again, F_SETSIG, IO_RT);
+        fcntl(again, F_SETFL, O_ASYNC | O_NONBLOCK);
+        write(p[1], "b", 1);
+        io_taken("two-readers");
+        fcntl(p[0], F_SETFL, O_NONBLOCK);
+        write(p[1], "c", 1);
+        io_taken("second-reader");
+        while (read(p[0], sink, sizeof sink) > 0) {}
+        io_taken("drained");
+        fcntl(again, F_SETFL, O_NONBLOCK);
+        /* O_RDWR: a reader and a writer at once. */
+        int both = open(link, O_RDWR | O_NONBLOCK);
+        fcntl(both, F_SETOWN, pid);
+        fcntl(both, F_SETSIG, IO_RT);
+        fcntl(both, F_SETFL, O_ASYNC | O_NONBLOCK);
+        write(p[1], "d", 1);
+        io_taken("read-write-data");
+        read(p[0], sink, 1);
+        io_taken("read-write-room");
+        close(both);
+        write(p[1], "e", 1);
+        io_taken("closed");
+        close(again);
+        close(p[0]);
+        close(p[1]);
+        return 0;
+    }
     if (!strcmp(mode, "pipe-reopen")) {
         /* A pipe or standard output opened again through its link is a
            new open file description, as Linux's fifo_open makes: status

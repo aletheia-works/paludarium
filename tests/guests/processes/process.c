@@ -3646,6 +3646,54 @@ int main(int argc, char **argv) {
         close(p[1]);
         return 0;
     }
+    if (!strcmp(mode, "proc-self-link")) {
+        /* /proc/self is a symbolic link to this process's /proc directory,
+           as Linux's proc_self_get_link makes it: lstat (fstatat and statx
+           with AT_SYMLINK_NOFOLLOW too) gives the link, stat and a
+           trailing slash follow it, O_NOFOLLOW does not (ELOOP), and
+           O_PATH | O_NOFOLLOW opens the link itself, which reads as the
+           pid and names itself /proc/self. */
+        struct stat st = {0}, dir = {0};
+        char own_dir[32];
+        snprintf(own_dir, sizeof own_dir, "/proc/%d", getpid());
+        stat(own_dir, &dir);
+#define SELF_STAT(name, call) do { memset(&st, 0, sizeof st); errno = 0; int r = (call); \
+        printf("%s: r=%d errno=%d mode=%#o size=%ld blksize=%ld%s\n", name, r, r < 0 ? errno : 0, st.st_mode, \
+               (long)st.st_size, (long)st.st_blksize, S_ISDIR(st.st_mode) ? (st.st_ino == dir.st_ino ? " own-dir" : " other-dir") : \
+               S_ISLNK(st.st_mode) ? (st.st_nlink == 1 ? " one-link" : " links") : ""); } while (0)
+        SELF_STAT("lstat", lstat("/proc/self", &st));
+        SELF_STAT("lstat-slash", lstat("/proc/self/", &st));
+        SELF_STAT("stat", stat("/proc/self", &st));
+        SELF_STAT("fstatat-nofollow", fstatat(AT_FDCWD, "/proc/self", &st, AT_SYMLINK_NOFOLLOW));
+        unsigned char sx[256] = {0};
+        errno = 0;
+        int r = (int)syscall(SYS_statx, AT_FDCWD, "/proc/self", AT_SYMLINK_NOFOLLOW, 0x7ff, sx);
+        unsigned short statx_mode;
+        memcpy(&statx_mode, sx + 28, sizeof statx_mode);
+        printf("statx: r=%d errno=%d mode=%#o\n", r, r < 0 ? errno : 0, statx_mode);
+        char to[64] = {0};
+        long n = readlink("/proc/self", to, sizeof to - 1);
+        printf("readlink=%ld pid=%d\n", n > 0 ? 1L : n, atoi(to) == getpid());
+        errno = 0;
+        int fd = open("/proc/self", O_RDONLY | O_NOFOLLOW);
+        printf("nofollow: open=%d errno=%d\n", fd >= 0, fd < 0 ? errno : 0);
+        errno = 0;
+        fd = open("/proc/self", O_RDONLY | O_DIRECTORY);
+        printf("directory: open=%d errno=%d\n", fd >= 0, fd < 0 ? errno : 0);
+        close(fd);
+        int link = open("/proc/self", O_PATH | O_NOFOLLOW);
+        SELF_STAT("path-nofollow", fstat(link, &st));
+        memset(to, 0, sizeof to);
+        n = readlinkat(link, "", to, sizeof to - 1);
+        printf("readlinkat=%ld pid=%d\n", n > 0 ? 1L : n, atoi(to) == getpid());
+        char own[64], named[64] = {0};
+        snprintf(own, sizeof own, "/proc/self/fd/%d", link);
+        readlink(own, named, sizeof named - 1);
+        printf("own-link=%s\n", named);
+        close(link);
+#undef SELF_STAT
+        return 0;
+    }
     if (!strcmp(mode, "link-path")) {
         /* O_PATH | O_NOFOLLOW on a symbolic link opens the link itself, as
            Linux does: its own fstat (fstatat with AT_EMPTY_PATH too) and

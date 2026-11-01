@@ -464,10 +464,14 @@ kernel.
   procfs's or devpts's type with a 4096 `f_bsize`, as Linux's
   `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but `stat`,
   `statfs` and `open` through it reach its file.
-- The only other `/proc` entries are this process's own: `/proc/self` (also
-  as `/proc/<pid>`), a directory that `readlink` resolves to the PID and that
-  its entries can be opened relative to, `/proc/self/status` and
-  `/proc/self/fd`. That file
+- The only other `/proc` entries are this process's own: `/proc/<pid>`, a
+  directory its entries can be opened relative to, and `/proc/self`, a
+  symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
+  `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
+  link, `stat` and a trailing slash follow it, `O_NOFOLLOW` does not
+  (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
+  as the PID of the process reading it and names itself `/proc/self`; then
+  `/proc/self/status` and `/proc/self/fd`. That file
   has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
   capabilities and so on) without the memory and CPU ones, which nothing
   measures.

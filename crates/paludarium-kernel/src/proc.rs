@@ -89,6 +89,15 @@ pub(crate) fn link_stat(access: u32) -> FileStat {
     }
 }
 /// The directory's `stat`: 0555, as Linux shows it.
+/// `/proc/self` not followed: a symbolic link (0777) to this process's
+/// directory, as Linux's `proc_self_get_link` makes it, of size 0.
+pub(crate) fn self_link_stat() -> FileStat {
+    FileStat {
+        mode: 0o120_777,
+        links: 1,
+        ..FileStat::default()
+    }
+}
 pub(crate) fn directory_stat() -> FileStat {
     FileStat {
         mode: 0o040_555,

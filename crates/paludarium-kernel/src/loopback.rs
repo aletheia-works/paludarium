@@ -252,7 +252,8 @@ impl Link {
     /// that starts there passes over the urgent byte unless it is read
     /// `inline` (`SO_OOBINLINE`), losing it if `MSG_OOB` has not taken it.
     /// Returns the count, whether the read ends at the mark, and when the
-    /// last byte it read or passed over came ([`Stream::read_stamped`]).
+    /// stream's last bytes came, the time all its unread bytes take
+    /// ([`Stream::read_stamped`]).
     pub(crate) fn read(
         &self,
         side: usize,

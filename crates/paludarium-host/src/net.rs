@@ -151,9 +151,14 @@ impl Stream {
         *self.driver.lock().unwrap_or_else(PoisonError::into_inner) = Some(driver);
     }
     /// What stamps the bytes as they come, which [`Self::read_stamped`]
-    /// gives back.
+    /// gives back. Bytes that came before it are stamped now, as the
+    /// driver may deliver them as soon as the stream opens.
     pub fn set_clock(&self, clock: Clock) {
-        *self.clock.lock().unwrap_or_else(PoisonError::into_inner) = Some(clock);
+        *self.clock.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&clock));
+        let mut s = self.lock();
+        if s.stamp.is_none() && !s.received.is_empty() {
+            s.stamp = clock();
+        }
     }
     /// What the driver calls after each change it makes, with the change.
     pub fn set_waker(&self, waker: Arc<dyn Fn(Event) + Send + Sync>) {
@@ -338,7 +343,6 @@ impl Stream {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let now = clock.and_then(|clock| clock());
         let n = {
             let mut s = self.lock();
             let n = bytes
@@ -347,7 +351,9 @@ impl Stream {
             s.received.extend(&bytes[..n]);
             if n > 0 {
                 s.arrivals += 1;
-                s.stamp = now;
+                // Read under the lock, so a later delivery's time is the
+                // one kept; a failed clock keeps the stamp there was.
+                s.stamp = clock.and_then(|clock| clock()).or(s.stamp);
             }
             n
         };
@@ -641,5 +647,21 @@ mod tests {
         assert_eq!(&buf[..4], b"cdef");
         stream.end();
         assert_eq!(stream.read_stamped(&mut buf, false), Ok((0, None)));
+    }
+    #[test]
+    fn bytes_before_the_clock_take_its_time_and_a_failed_clock_keeps_a_stamp() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let stream = Stream::new(SocketAddr::from(([127, 0, 0, 1], 1)));
+        stream.receive(b"ab");
+        let now = Arc::new(AtomicU64::new(5));
+        let time = Arc::clone(&now);
+        stream.set_clock(Arc::new(move || {
+            Some(time.load(Ordering::SeqCst)).filter(|&t| t != 0)
+        }));
+        let mut buf = [0; 8];
+        assert_eq!(stream.read_stamped(&mut buf[..1], false), Ok((1, Some(5))));
+        now.store(0, Ordering::SeqCst);
+        stream.receive(b"c");
+        assert_eq!(stream.read_stamped(&mut buf, false), Ok((2, Some(5))));
     }
 }

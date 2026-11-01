@@ -30,6 +30,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -821,7 +822,10 @@ int main(int argc, char **argv) {
         /* Another loopback address is another place for the same port. */
         bind_to("other-address", r3, inet_addr("127.0.0.2"), port);
         call("accept-not-listening", accept(r3, NULL, NULL));
-        call("accept4-flags", accept4(l, NULL, NULL, 1));
+        /* The system call itself: musl before 1.2.4 takes accept4's
+           EINVAL for a kernel without accept4 and calls accept instead,
+           which waits for a connection. */
+        call("accept4-flags", (int)syscall(SYS_accept4, l, NULL, NULL, 1));
         /* The port of a socket bound but not listening refuses. */
         int result;
         int refused = client(port_of(b), 0, &result);

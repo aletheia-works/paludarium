@@ -40,7 +40,7 @@ CI run produces them afresh on an x86-64 Linux runner.
   itself, so there even native results can differ from Linux: a stopped and
   continued child sends SIGCHLD to a parent that set `SA_NOCLDSTOP`, where
   Linux sends none. Such a run is not evidence, in either direction.
-  On main, 27 of the process cases and 6 of the network cases fail there
+  On main, 27 of the process cases and 5 of the network cases fail there
   for such reasons. QEMU:
   - refuses socket options it does not know (`SO_PEEK_OFF`,
     `SO_PASSPIDFD`, `SO_PASSRIGHTS`, `SO_TIMESTAMP_NEW`, …), and gives
@@ -53,7 +53,9 @@ CI run produces them afresh on an x86-64 Linux runner.
   - takes `socket` type flags Linux refuses with `EINVAL`.
 
   Docker's own kernel counts a datagram's buffer differently, and the
-  slower native side can time out. `mise run linux-dev-compare` runs the
+  slower native side can time out. The container's musl (Debian's) may be
+  older than the runner's, so a guest checks the kernel through the system
+  call itself where musl's wrapper changed (`accept4`). `mise run linux-dev-compare` runs the
   tests there for a checkout and for main, and lists only the cases whose
   result differs. A case that fails only on the checkout runs once more: if
   it passes then, it is listed as flaky, as some cases' timing is under

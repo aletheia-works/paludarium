@@ -328,6 +328,31 @@ impl NativeFile {
     }
 }
 impl FileHandle for NativeFile {
+    /// On a Linux host, the same host file opened again through the host's
+    /// own `/proc/self/fd`, which reaches it with no path that names it.
+    /// Other hosts have none (`ENXIO`).
+    #[cfg(target_os = "linux")]
+    fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        use std::os::fd::AsRawFd;
+        let link = {
+            let file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+            format!("/proc/self/fd/{}", file.as_raw_fd())
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(flags & 3 != 1)
+            .write(flags & 3 != 0 || flags & 512 != 0)
+            .truncate(flags & 512 != 0)
+            .append(flags & 1024 != 0)
+            .open(link)
+            .map_err(err)?;
+        if flags & 65536 != 0 && !file.metadata().map_err(err)?.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        Ok(Arc::new(NativeFile {
+            file: Mutex::new(file),
+            flags: Mutex::new(flags),
+        }))
+    }
     fn read_at(&self, offset: u64, b: &mut [u8]) -> Result<usize, Errno> {
         let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
         // A host may refuse to seek past its largest file size.

@@ -475,11 +475,15 @@ kernel.
   `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]` or `[pidfd]` (which
   Linux 6.9 and later name from pidfs instead), and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
-  own for it. Opening a link opens the file again by its path, or gives a
-  memfd a new handle on the same file and seals; a pipe and the standard
-  streams give the same handle for the access they have. A socket gives
-  `ENXIO`, as on Linux; so do, here, a removed file, the other end of a pipe
-  and the files of no type, which Linux can open again.
+  own for it. Opening a link opens the file again by its path, or, for a
+  file no path names any more (removed, or renamed away), the same file
+  through its handle, with an offset of its own; a memfd gets a new handle
+  on the same file and seals; a pipe and the standard streams give the same
+  handle for the access they have. `O_CREAT | O_EXCL` finds the link there
+  (`EEXIST`), and `O_NOFOLLOW` does not follow it (`ELOOP`) but with
+  `O_PATH`. A socket gives `ENXIO`, as on Linux; so do, here, the other end
+  of a pipe, the files of no type, and a removed file of a directory
+  mounted from a host other than Linux, which Linux can open again.
 - `/dev` (mode 0755) holds the memory devices and the links Linux systems
   keep there, and lists only these: a file a guest makes under `/dev` can be
   opened and stat'ed but is not listed. Each entry has one inode number,

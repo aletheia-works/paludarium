@@ -12,6 +12,36 @@ impl Drop for MemFile {
     }
 }
 impl FileHandle for MemFile {
+    /// A new handle on the same node, checked as [`HostFs::open`] checks an
+    /// existing file.
+    fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        let mut t = lock(&self.tree);
+        let mut n = lock(&self.node);
+        let directory = matches!(n.kind, Kind::Dir(_));
+        if flags & 65536 != 0 && !directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if directory && (flags & 3 != 0 || flags & 512 != 0) {
+            return Err(Errno::EISDIR);
+        }
+        if flags & 512 != 0 {
+            let modified = (n.clock)()?;
+            if let Kind::File(contents) = &mut n.kind {
+                contents.set_len(0);
+                n.mtime_ns = i128::from(modified);
+            }
+        }
+        drop(n);
+        let owner = t.owner;
+        t.owner += 1;
+        Ok(Arc::new(MemFile {
+            tree: Arc::clone(&self.tree),
+            node: Arc::clone(&self.node),
+            inode: self.inode,
+            owner,
+            state: Mutex::new((0, flags)),
+        }))
+    }
     fn guest_path_hint(&self) -> Option<Vec<u8>> {
         let t = lock(&self.tree);
         let mut q = VecDeque::from([(1, b"/".to_vec())]);

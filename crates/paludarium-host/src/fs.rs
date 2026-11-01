@@ -113,6 +113,13 @@ pub trait FileHandle: Send + Sync {
     fn allocate(&self, _offset: u64, _len: u64) -> Result<(), Errno> {
         Ok(())
     }
+    /// Opens the same file again with `flags` (an access mode, `O_TRUNC`,
+    /// `O_APPEND`, `O_DIRECTORY`), as a new open file description with an
+    /// offset of its own: how a link in `/proc/self/fd` opens a file no
+    /// path names any more. Kinds without it give `ENXIO`.
+    fn reopen(&self, _flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        Err(Errno(6))
+    }
 }
 pub trait HostFs: Send + Sync {
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;

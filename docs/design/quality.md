@@ -55,9 +55,9 @@ CI run produces them afresh on an x86-64 Linux runner.
   Docker's own kernel counts a datagram's buffer differently, and the
   slower native side can time out. The container's musl (Debian's) may be
   older than the runner's, so a guest checks the kernel through the system
-  call itself where musl's wrapper changed (`accept4`). `mise run linux-dev-compare` runs the
-  tests there for a checkout and for main, and lists only the cases whose
-  result differs. A case that fails only on the checkout runs once more: if
+  call itself where musl's wrapper changed (`accept4`).
+  `mise run linux-dev-compare` runs the tests there for a checkout and for
+  main, and lists only the cases whose result differs. A case that fails only on the checkout runs once more: if
   it passes then, it is listed as flaky, as some cases' timing is under
   QEMU; else it fails the task, as does a case that main ran and the
   checkout did not (a suite that stopped).

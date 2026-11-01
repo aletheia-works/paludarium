@@ -244,6 +244,10 @@ mod linux {
         case("udp-timestamp");
     }
     #[test]
+    fn network_scm_options() {
+        case("scm-options");
+    }
+    #[test]
     fn network_udp_shutdown() {
         case("udp-shutdown");
     }

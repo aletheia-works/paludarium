@@ -830,13 +830,13 @@ fn receive_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     let credentials = socket.passes_credentials().then_some(received.credentials);
     let pidfd = socket.passes_pidfd().then_some(received.credentials.pid);
+    let security = socket.passes_security();
     let from = received.from.clone();
     let (used, cut) = deliver(
         c,
         &header,
         received,
-        credentials,
-        pidfd,
+        (credentials, pidfd, security),
         a[2] & MSG_CMSG_CLOEXEC != 0,
     );
     if cut {
@@ -968,7 +968,8 @@ fn receive_with(
 }
 /// Writes the control messages of a received message, as Linux's
 /// `__scm_recv_common`: with no control buffer, only `MSG_CTRUNC` tells of
-/// them. Otherwise a message's timestamp, as `__sock_recv_timestamp` puts
+/// them, and of `SO_PASSSEC`'s security context (`scm_has_secdata`), though
+/// there is none. Otherwise a message's timestamp, as `__sock_recv_timestamp` puts
 /// it before them, goes first, then `credentials`, when the socket passes
 /// them ([`put_control`]), then the descriptors ([`put_descriptors`]),
 /// then, when the socket passes pidfds, a pidfd of the sender process
@@ -978,8 +979,7 @@ fn deliver(
     c: &mut Context<'_>,
     header: &MessageHeader,
     received: Received,
-    credentials: Option<Credentials>,
-    pidfd: Option<u32>,
+    (credentials, pidfd, security): (Option<Credentials>, Option<u32>, bool),
     cloexec: bool,
 ) -> (u64, bool) {
     let passed = received.passed;
@@ -989,6 +989,7 @@ fn deliver(
             received.timestamp.is_some()
                 || credentials.is_some()
                 || pidfd.is_some()
+                || security
                 || !passed.is_empty(),
         );
     }
@@ -1336,11 +1337,11 @@ pub(crate) fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// `setsockopt(fd, level, name, value, len)` on a socket pair, as Linux's
 /// `sk_setsockopt`: a socket pair has only `SOL_SOCKET` options
 /// (EOPNOTSUPP for another level), an `int` value of fewer than 4 bytes is
-/// EINVAL, and an unknown name, or one whose effect is not modelled here
-/// (`SO_PASSSEC`), or one only read (`SO_PEERPIDFD`), is
+/// EINVAL, and an unknown name, or one only read (`SO_PEERPIDFD`), is
 /// ENOPROTOOPT. `SO_PASSCRED` makes messages carry credentials
 /// ([`Credentials`]), `SO_PASSPIDFD` them and a pidfd of their sender
-/// ([`put_pidfd`]), `SO_TIMESTAMP` and its kin, and `SO_TIMESTAMPING`,
+/// ([`put_pidfd`]), `SO_PASSSEC` their sender's security context, which
+/// there is none of ([`deliver`]), `SO_TIMESTAMP` and its kin, and `SO_TIMESTAMPING`,
 /// timestamps ([`Timestamps`]), `SO_RCVLOWAT` sets what a
 /// stream read waits for ([`receive_with`]; 0 is 1, and a negative value
 /// `INT_MAX`), and `SO_PEEK_OFF` where a peek starts (any value, a negative
@@ -1370,6 +1371,10 @@ fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     if name == SO_PASSPIDFD {
         socket.lock_sides()[socket.side].pass_pidfd = on;
+        return Ok(0);
+    }
+    if name == SO_PASSSEC {
+        socket.lock_sides()[socket.side].pass_security = on;
         return Ok(0);
     }
     if name == SO_PEEK_OFF {
@@ -1476,7 +1481,8 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         SO_TYPE => int(socket.pair.kind.cast_signed()),
         SO_ACCEPTCONN => int(i32::from(socket.unix().is_some_and(|u| u.listening()))),
         SO_ERROR => int(socket.take_error().map_or(0, |error| error.0)),
-        SO_BSDCOMPAT | SO_REUSEPORT | SO_PASSSEC | SO_PROTOCOL => int(0),
+        SO_BSDCOMPAT | SO_REUSEPORT | SO_PROTOCOL => int(0),
+        SO_PASSSEC => int(socket.lock_sides()[socket.side].pass_security.into()),
         // As Linux's `sk_getsockopt`: each names only the form it set.
         name if Timestamps::is_option(name) => {
             socket.lock_sides()[socket.side].timestamps.get(name)
@@ -1757,6 +1763,11 @@ struct Side {
     /// `SO_PASSPIDFD`: what this end receives comes with a pidfd of its
     /// sender (`SCM_PIDFD`), and carries credentials as with `SO_PASSCRED`.
     pass_pidfd: bool,
+    /// `SO_PASSSEC`: what this end receives would come with its sender's
+    /// security context (`SCM_SECURITY`), which no security module gives
+    /// here, as on a Linux whose module has none for AF_UNIX (AppArmor's
+    /// `socket_getpeersec_dgram` is `ENOPROTOOPT`).
+    pass_security: bool,
     /// `SO_PEEK_OFF`: where a peek starts, moved on by each peek and back
     /// by each read, as Linux's `sk_peek_off`; a negative value is none.
     peek_offset: i32,
@@ -2116,6 +2127,25 @@ impl SocketPairEnd {
     /// `SO_PASSCRED` on this end.
     fn passes_credentials(&self) -> bool {
         self.lock_sides()[self.side].pass_credentials
+    }
+    /// `SO_PASSSEC` on this end.
+    fn passes_security(&self) -> bool {
+        self.lock_sides()[self.side].pass_security
+    }
+    /// Takes `from`'s `SO_PASSCRED`, `SO_PASSPIDFD` and `SO_PASSSEC`, as
+    /// Linux's `unix_stream_connect` gives the socket a listener will accept
+    /// the listener's `sk_scm_recv_flags`.
+    pub(crate) fn take_passing(&self, from: &Self) {
+        let (credentials, pidfd, security) = {
+            let sides = from.lock_sides();
+            let side = &sides[from.side];
+            (side.pass_credentials, side.pass_pidfd, side.pass_security)
+        };
+        let mut sides = self.lock_sides();
+        let side = &mut sides[self.side];
+        side.pass_credentials = credentials;
+        side.pass_pidfd = pidfd;
+        side.pass_security = security;
     }
     /// `SO_RCVLOWAT` on this end.
     fn receive_low_water(&self) -> usize {

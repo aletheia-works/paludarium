@@ -2954,11 +2954,13 @@ fn socket_options_are_kept_as_linux_keeps_them() {
     assert_eq!(get(&mut f, 42), (0, -1));
     assert_eq!(set(&mut f, 42, -2, 4), 0);
     assert_eq!(get(&mut f, 42), (0, -2));
-    // Too short a value, another level, an option whose effect is not
-    // modelled here, and an unknown one.
+    // SO_PASSSEC is kept, as any value but 0 is on.
+    assert_eq!(get(&mut f, 34), (0, 0));
+    assert_eq!(set(&mut f, 34, 5, 4), 0);
+    assert_eq!(get(&mut f, 34), (0, 1));
+    // Too short a value, another level, and an unknown option.
     assert_eq!(set(&mut f, 9, 1, 2), fail(22));
     assert_eq!(f.ret(54, [a, 6, 1, value, 4, 0]), fail(95));
-    assert_eq!(set(&mut f, 34, 1, 4), fail(92));
     assert_eq!(set(&mut f, 999, 1, 4), fail(92));
     assert_eq!(get(&mut f, 999).0, fail(92));
     // F_SETOWN names a live process or group; F_GETOWN gives it back.

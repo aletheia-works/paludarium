@@ -229,6 +229,7 @@ mod linux {
         processes_socket_parts => ("socket-parts","process"),
         processes_socket_timestamp => ("socket-timestamp","process"),
         processes_socket_timestamping => ("socket-timestamping","process"),
+        processes_socket_passsec => ("socket-passsec","process"),
         processes_socket_timeouts => ("socket-timeouts","process"),
         processes_signal_restart => ("signal-restart","process"),
         processes_signal_io => ("signal-io","process"),

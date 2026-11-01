@@ -544,6 +544,9 @@ impl UnixSocket {
         // process, the client the listener's (copy_peercred).
         client.end.set_peer_process(self.end.peer_process());
         spare.set_peer_process(c.process.pid);
+        // It also takes the listener's SO_PASSCRED, SO_PASSPIDFD and
+        // SO_PASSSEC as they are now (sk_scm_recv_flags).
+        spare.take_passing(&self.end);
         let child = Arc::new_cyclic(|this: &Weak<Self>| {
             spare.attach(Weak::clone(this));
             Self {

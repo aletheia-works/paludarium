@@ -46,8 +46,10 @@ RUNNING = re.compile(r"^\s*Running (?:unittests )?(\S+)")
 RESULT = re.compile(r"^test (\S+) \.\.\. (?:.*?)(ok|FAILED|ignored)\s*$")
 # libtest's own line for a case, wherever it stands: a suite whose children
 # write to the same stream can leave a line of theirs unended, so that the
-# parent's "test x ... ok" follows on it ("... filtered outtest x ... ok").
-GLUED = re.compile(r"test (\S+) \.\.\. (ok|FAILED|ignored)\b")
+# parent's "test x ... ok" follows on it ("... filtered outtest x ... ok"),
+# or the next line runs on after it ("test x ... oktest y ... "). The
+# outcome follows "... " at once, so it needs no word boundary after it.
+GLUED = re.compile(r"test (\S+) \.\.\. (ok|FAILED|ignored)")
 
 
 def results(log):

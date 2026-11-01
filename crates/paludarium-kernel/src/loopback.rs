@@ -251,16 +251,20 @@ impl Link {
     /// `tcp_recvmsg` meets an urgent mark: a read stops before it, and one
     /// that starts there passes over the urgent byte unless it is read
     /// `inline` (`SO_OOBINLINE`), losing it if `MSG_OOB` has not taken it.
-    /// Returns the count, and whether the read ends at the mark.
+    /// Returns the count, whether the read ends at the mark, and when the
+    /// stream's last bytes came, the time all its unread bytes take
+    /// ([`Stream::read_stamped`]).
     pub(crate) fn read(
         &self,
         side: usize,
         stream: &Stream,
         buf: &mut [u8],
         (peek, inline): (bool, bool),
-    ) -> Result<(usize, bool), Errno> {
+    ) -> Result<(usize, bool, Option<u64>), Errno> {
         if buf.is_empty() {
-            return stream.read(buf, peek).map(|n| (n, false));
+            return stream
+                .read_stamped(buf, peek)
+                .map(|(n, stamp)| (n, false, stamp));
         }
         let (copied, mark, stale) = {
             let all = self.urgent();
@@ -276,36 +280,36 @@ impl Link {
                 limit = limit.min(ahead);
             }
         }
-        let n = if peek {
+        let (n, stamp) = if peek {
             let mut seen = vec![0; skip + limit];
-            let n = stream.read(&mut seen, true)?;
+            let (n, stamp) = stream.read_stamped(&mut seen, true)?;
             if n > 0 && n <= skip {
                 // Only the urgent byte waits, which a read passes over.
                 return if stream.readiness().read_closed {
-                    Ok((0, false))
+                    Ok((0, false, None))
                 } else {
                     Err(Errno::EAGAIN)
                 };
             }
             let n = n.saturating_sub(skip);
             buf[..n].copy_from_slice(&seen[skip..skip + n]);
-            n
+            (n, stamp)
         } else {
             let mut passed = 0;
             if skip > 0 {
                 passed = stream.read(&mut [0; 2][..skip], false)?;
             }
-            let result = stream.read(&mut buf[..limit], false);
-            let n = *result.as_ref().unwrap_or(&0);
+            let result = stream.read_stamped(&mut buf[..limit], false);
+            let n = result.as_ref().map_or(0, |&(n, _)| n);
             self.consumed(side, passed + n);
             if passed > 0 && result.is_err() {
                 // The urgent byte went; nothing else waits yet.
-                return result.map(|n| (n, false));
+                return result.map(|(n, stamp)| (n, false, stamp));
             }
             result?
         };
         let at = mark.is_some_and(|(at, _)| at == copied + (skip + n) as u64);
-        Ok((n, at && n > 0))
+        Ok((n, at && n > 0, stamp))
     }
     /// `side` read or passed over `count` more bytes; past its mark the
     /// urgent byte is gone (`urg_data` cleared).

@@ -236,6 +236,10 @@ mod linux {
         case("udp");
     }
     #[test]
+    fn network_tcp_timestamp() {
+        case("tcp-timestamp");
+    }
+    #[test]
     fn network_udp_timestamp() {
         case("udp-timestamp");
     }

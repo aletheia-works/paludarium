@@ -40,7 +40,7 @@ CI run produces them afresh on an x86-64 Linux runner.
   itself, so there even native results can differ from Linux: a stopped and
   continued child sends SIGCHLD to a parent that set `SA_NOCLDSTOP`, where
   Linux sends none. Such a run is not evidence, in either direction.
-  On main, 25 of the process cases and 4 of the network cases fail there
+  On main, 25 of the process cases and 5 of the network cases fail there
   for such reasons. QEMU:
   - refuses socket options it does not know (`SO_PEEK_OFF`,
     `SO_TIMESTAMP_NEW`, `SO_RCVTIMEO_NEW`, …), and gives `SO_TIMESTAMPING`

@@ -278,6 +278,37 @@ static void stamp_option(const char *name, int fd, int opt, int value) {
     int r = setsockopt(fd, SOL_SOCKET, opt, &value, sizeof value);
     printf("  set %s %#x=%d errno=%d\n", name, value, r, r ? errno : 0);
 }
+/* tcp-timestamp: recvmsg of at most `len` bytes with `room` bytes of
+   control and `flags`: what came, MSG_CTRUNC, msg_controllen, and each
+   control message's type and length, and for a timestamp whether it is
+   from `from` on and from before this call. */
+static void tcp_stamped(const char *name, int fd, size_t len, size_t room, int flags, long long from) {
+    char data[8] = {0};
+    union { char bytes[256]; struct cmsghdr align; } control;
+    memset(control.bytes, 0, sizeof control.bytes);
+    struct iovec iov = {data, len};
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1,
+                             .msg_control = room ? control.bytes : NULL, .msg_controllen = room};
+    long long asked = real_ns();
+    errno = 0;
+    long n = recvmsg(fd, &message, flags);
+    printf("  %s=%ld errno=%d data=%.*s ctrunc=%d controllen=%zu", name, n, n < 0 ? errno : 0,
+           n > 0 ? (int)n : 0, data, n >= 0 && (message.msg_flags & MSG_CTRUNC) != 0,
+           n >= 0 ? (size_t)message.msg_controllen : 0);
+    if (n >= 0 && room)
+        for (struct cmsghdr *h = CMSG_FIRSTHDR(&message); h; h = CMSG_NXTHDR(&message, h)) {
+            printf(" [%d len=%zu", h->cmsg_type, (size_t)h->cmsg_len);
+            int ts = h->cmsg_type == TS_OLD || h->cmsg_type == TS_NEW;
+            if (h->cmsg_len >= CMSG_LEN(16)) {
+                long long v[2];
+                memcpy(v, CMSG_DATA(h), sizeof v);
+                long long unit = ts ? 1000 : 1, at = (v[0] * 1000000000LL + v[1] * unit) / unit;
+                printf(" late=%d early=%d", at >= from / unit, at < asked / unit);
+            }
+            printf("]");
+        }
+    printf("\n");
+}
 /* recvmsg with `room` bytes of control (none at all for 0) and `flags`:
    what came, MSG_CTRUNC, msg_controllen, and each control message's type
    and length, and for a timestamp where it falls against the real times
@@ -1861,6 +1892,106 @@ int main(int argc, char **argv) {
                     close(r);
                     close(s);
                 }
+        return 0;
+    }
+    if (!strcmp(mode, "tcp-timestamp")) {
+        /* TCP's timestamps, as Linux's tcp_recvmsg gives them
+           (tcp_recv_timestamp): a read, a peek or an empty one with bytes
+           waiting gets the time the segment it read came, and a segment
+           joined to the unread one before it (tcp_try_coalesce) gives that
+           its own time; the end of input gets none. On the guest's own
+           loopback, where a segment comes as it is sent, and through the
+           host's (the echo server), where it comes between the send and
+           the read. The keeper makes Linux stamp every segment, as in
+           udp-timestamp. */
+        int keeper = socket(AF_INET, SOCK_DGRAM, 0), one = 1;
+        setsockopt(keeper, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof one);
+        usleep(200000);
+        int l = tcp(0);
+        struct sockaddr_in la = to(0);
+        socklen_t ll = sizeof la;
+        bind(l, (void *)&la, ll);
+        listen(l, 1);
+        getsockname(l, (void *)&la, &ll);
+        int c = tcp(0);
+        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        connect(c, (void *)&la, ll);
+        int a = accept(l, NULL, NULL);
+        long long from;
+        puts("loopback");
+        from = real_ns();
+        send(c, "ab", 2, 0);
+        tcp_stamped("none", a, 8, 256, 0, from);
+        stamp_option("ns-old", a, TS_NS_OLD, 1);
+        from = real_ns();
+        send(c, "ab", 2, 0);
+        usleep(2000);
+        tcp_stamped("ns-old", a, 8, 256, 0, from);
+        /* Two sends, the second joined to the first while it is unread. */
+        send(c, "cd", 2, 0);
+        usleep(2000);
+        from = real_ns();
+        send(c, "ef", 2, 0);
+        usleep(2000);
+        tcp_stamped("peek", a, 1, 256, MSG_PEEK, from);
+        tcp_stamped("empty", a, 0, 256, 0, from);
+        tcp_stamped("first", a, 1, 256, 0, from);
+        tcp_stamped("rest", a, 8, 256, 0, from);
+        /* Taken after the bytes came: the time they came all the same. */
+        stamp_option("off", a, TS_NS_OLD, 0);
+        from = real_ns();
+        send(c, "g", 1, 0);
+        usleep(2000);
+        stamp_option("old", a, TS_OLD, 1);
+        tcp_stamped("old", a, 8, 256, 0, from);
+        stamp_option("new", a, TS_NEW, 1);
+        send(c, "h", 1, 0);
+        usleep(2000);
+        tcp_stamped("new", a, 8, 256, 0, from);
+        /* SO_TIMESTAMPING with it, and alone. */
+        stamp_option("tsg-old", a, TSG_OLD, 0x18);
+        send(c, "i", 1, 0);
+        usleep(2000);
+        tcp_stamped("both", a, 8, 256, 0, from);
+        stamp_option("ts-off", a, TS_NEW, 0);
+        const int reports[] = {0x18, 0x10, 0x08, 0x10 | (1 << 17), 0};
+        for (int i = 0; i < 5; i++) {
+            stamp_option("report", a, TSG_OLD, reports[i]);
+            send(c, "j", 1, 0);
+            usleep(2000);
+            tcp_stamped("report", a, 8, 256, 0, from);
+        }
+        /* A control buffer that holds less cuts it; none at all only says so. */
+        stamp_option("ns-old", a, TS_NS_OLD, 1);
+        const size_t rooms[] = {0, 8, 16, 32};
+        for (int i = 0; i < 4; i++) {
+            send(c, "k", 1, 0);
+            usleep(2000);
+            char label[16];
+            snprintf(label, sizeof label, "room%zu", rooms[i]);
+            tcp_stamped(label, a, 8, rooms[i], 0, from);
+        }
+        /* The end of input. */
+        shutdown(c, SHUT_WR);
+        usleep(2000);
+        tcp_stamped("end", a, 8, 256, 0, from);
+        close(a);
+        close(c);
+        close(l);
+        puts("host");
+        c = connected('e');
+        stamp_option("ns-old", c, TS_NS_OLD, 1);
+        from = real_ns();
+        send(c, "hi", 2, 0);
+        struct pollfd p = {c, POLLIN, 0};
+        poll(&p, 1, 5000);
+        usleep(2000);
+        tcp_stamped("echo", c, 8, 256, 0, from);
+        shutdown(c, SHUT_WR);
+        poll(&p, 1, 5000);
+        tcp_stamped("end", c, 8, 256, 0, from);
+        close(c);
+        close(keeper);
         return 0;
     }
     if (!strcmp(mode, "udp-timestamp")) {

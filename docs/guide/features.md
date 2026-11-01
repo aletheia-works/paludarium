@@ -484,20 +484,22 @@ kernel.
   own for it. Opening a link opens the file again by its path, or, for a
   file no path names any more (removed, or renamed away), the same file
   through its handle, with an offset of its own; a memfd gets a new handle
-  on the same file and seals. Either end of a pipe opens through the link
-  of either, as Linux's `fifo_open` opens it: `O_RDONLY` a reader and
-  `O_WRONLY` a writer, as a new open file description with its own status
-  flags (`O_NONBLOCK`). An end all of whose descriptions closed opens again,
-  so a pipe whose writers were gone has one again, and no open waits for
-  the other end or refuses a writer without a reader, as a FIFO would. An
-  end closes when its last description does. `O_ASYNC` and the signal owner
-  of an end stay shared by its descriptions, where Linux keeps them for
-  each. A standard stream opens, for the access it has, as a new
-  description of it. `O_CREAT | O_EXCL` finds the link there (`EEXIST`),
-  and `O_NOFOLLOW` does not follow it (`ELOOP`) but with `O_PATH`. A socket
-  gives `ENXIO`, as on Linux; so do, here, a pipe opened `O_RDWR`, the files
-  of no type, and a removed file of a directory mounted from a host other
-  than Linux, which Linux can open.
+  on the same file and seals. Either end of a pipe opens through the link of
+  either, as Linux's `fifo_open` opens it: `O_RDONLY` a reader, `O_WRONLY` a
+  writer and `O_RDWR` both, which reads what it writes and, being both,
+  never sees the end of the pipe or `EPIPE`, each as a new open file
+  description with its own status flags (`O_NONBLOCK`). An end all of whose
+  descriptions closed opens again, so a pipe whose writers were gone has one
+  again, and no open waits for the other end or refuses a writer without a
+  reader, as a FIFO would. An end closes when its last description does.
+  `O_ASYNC` and the signal owner of an end stay shared by its descriptions,
+  an `O_RDWR` one's being its read end's, so that it signals data
+  (`POLL_IN`) but not room (`POLL_OUT`), where Linux keeps them for each. A
+  standard stream opens, for the access it has, as a new description of it.
+  `O_CREAT | O_EXCL` finds the link there (`EEXIST`), and `O_NOFOLLOW` does
+  not follow it (`ELOOP`) but with `O_PATH`. A socket gives `ENXIO`, as on
+  Linux; so do, here, the files of no type and a removed file of a directory
+  mounted from a host other than Linux, which Linux can open.
 - `/dev` (mode 0755) holds the memory devices and the links Linux systems
   keep there, and lists only these: a file a guest makes under `/dev` can be
   opened and stat'ed but is not listed. Each entry has one inode number,

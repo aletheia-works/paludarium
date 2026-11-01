@@ -334,6 +334,13 @@ kernel.
   (`copy_peercred`). `SO_PEERPIDFD` reads a new pidfd of that process,
   installed even when the length given holds only part of its number; it
   can only be read (`setsockopt` is `ENOPROTOOPT`).
+- `SO_PASSSEC` is set and read back as on Linux, and with it a receiver
+  with no control buffer finds `MSG_CTRUNC`; it gets no `SCM_SECURITY`
+  message, as on a Linux whose security module gives AF_UNIX no sender's
+  context (none, or AppArmor). A socket a listener accepts takes the
+  listener's `SO_PASSCRED`, `SO_PASSPIDFD` and `SO_PASSSEC` as they were
+  when the client connected. An inet socket refuses these three options
+  both ways with `EOPNOTSUPP`, as Linux takes them only on AF_UNIX.
 - `SO_RCVTIMEO` and `SO_SNDTIMEO` (and their `_NEW` forms) limit how long a
   blocking `recv`, `read`, `send` or `write` on the socket waits, as on
   Linux: past the limit it gives `EAGAIN`, or what it moved, and

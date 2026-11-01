@@ -2099,6 +2099,38 @@ int main(int argc, char **argv) {
         close(keeper);
         return 0;
     }
+    if (!strcmp(mode, "scm-options")) {
+        /* SO_PASSCRED, SO_PASSSEC and SO_PASSPIDFD on inet sockets, which
+           Linux's sock.c takes only on AF_UNIX (sk_may_scm_recv): EOPNOTSUPP
+           both ways, after the int setsockopt needs (EINVAL). */
+        const int names[] = {16, 34, 76};
+        const int kinds[][2] = {{AF_INET, SOCK_STREAM}, {AF_INET, SOCK_DGRAM},
+                                {AF_INET6, SOCK_STREAM}, {AF_INET6, SOCK_DGRAM}};
+        for (int k = 0; k < 4; k++) {
+            int fd = socket(kinds[k][0], kinds[k][1], 0);
+            if (fd < 0) {
+                perror("socket");
+                return 1;
+            }
+            for (int i = 0; i < 3; i++) {
+                int one = 1, got = -7;
+                socklen_t len = sizeof got;
+                errno = 0;
+                long set = setsockopt(fd, SOL_SOCKET, names[i], &one, sizeof one);
+                int set_errno = set < 0 ? errno : 0;
+                errno = 0;
+                long shorter = setsockopt(fd, SOL_SOCKET, names[i], &one, 2);
+                int shorter_errno = shorter < 0 ? errno : 0;
+                errno = 0;
+                long get = getsockopt(fd, SOL_SOCKET, names[i], &got, &len);
+                printf("family=%d type=%d option=%d set=%ld/%d short=%ld/%d get=%ld/%d got=%d\n",
+                       kinds[k][0], kinds[k][1], names[i], set, set_errno, shorter, shorter_errno,
+                       get, get < 0 ? errno : 0, got);
+            }
+            close(fd);
+        }
+        return 0;
+    }
     if (!strcmp(mode, "udp-shutdown")) {
         /* shutdown of a UDP socket: ENOTCONN unless it is connected, but
            shut all the same. A receive that would wait then ends with 0,

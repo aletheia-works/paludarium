@@ -382,6 +382,40 @@ static void print_id(const char *name, unsigned id, unsigned own) {
 #ifndef SO_PASSPIDFD
 #define SO_PASSPIDFD 76
 #endif
+/* socket-passsec: the flags that a socket a listener accepts takes from
+   it, as getsockopt reads them: SO_PASSCRED, SO_PASSSEC, SO_PASSPIDFD. */
+static void passing(const char *name, int fd) {
+    const int names[] = {SO_PASSCRED, SO_PASSSEC, SO_PASSPIDFD};
+    printf("  %s:", name);
+    for (int i = 0; i < 3; i++) {
+        int got = -7;
+        socklen_t len = sizeof got;
+        errno = 0;
+        long n = getsockopt(fd, SOL_SOCKET, names[i], &got, &len);
+        printf(" %ld/%d/%d", n, n < 0 ? errno : 0, got);
+    }
+    printf("\n");
+}
+/* socket-passsec: a recvmsg of one byte with `room` bytes of control
+   buffer (none for 0): what it returns, its flags, how much control it
+   used and the control messages' types. */
+static void passsec_receive(const char *name, int fd, size_t room) {
+    char byte, control[256];
+    struct iovec iov = {&byte, 1};
+    struct msghdr m = {0};
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = room ? control : NULL;
+    m.msg_controllen = room;
+    errno = 0;
+    long n = recvmsg(fd, &m, MSG_DONTWAIT);
+    printf("  %s: n=%ld errno=%d flags=%#x controllen=%zu", name, n, n < 0 ? errno : 0,
+           m.msg_flags, (size_t)m.msg_controllen);
+    if (room)
+        for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h))
+            printf(" [%d %d len=%zu]", h->cmsg_level, h->cmsg_type, (size_t)h->cmsg_len);
+    printf("\n");
+}
 #ifndef SO_PEERPIDFD
 #define SO_PEERPIDFD 77
 #endif
@@ -3521,6 +3555,88 @@ int main(int argc, char **argv) {
         }
         close(p[0]);
         close(p[1]);
+        return 0;
+    }
+    if (!strcmp(mode, "socket-passsec")) {
+        /* SO_PASSSEC on AF_UNIX sockets, as Linux's sock.c and scm.c have
+           it: the flag it sets, which getsockopt gives back, and, with no
+           security module that gives a sender's context (AppArmor's
+           socket_getpeersec_dgram is ENOPROTOOPT), no SCM_SECURITY, but a
+           MSG_CTRUNC with no control buffer (scm_has_secdata). A socket a
+           listener accepts takes its SO_PASSCRED, SO_PASSSEC and
+           SO_PASSPIDFD as they were when the client connected
+           (unix_stream_connect copies sk_scm_recv_flags). */
+        const int types[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        for (int t = 0; t < 3; t++) {
+            int sv[2];
+            if (socketpair(AF_UNIX, types[t], 0, sv) != 0) {
+                perror("socketpair");
+                return 1;
+            }
+            printf("type %d\n", types[t]);
+            passing("none", sv[1]);
+            int_option("short", sv[1], SO_PASSSEC, 1, 2);
+            int_option("on", sv[1], SO_PASSSEC, 5, 4);
+            passing("on", sv[1]);
+            passing("peer", sv[0]);
+            send(sv[0], "a", 1, 0);
+            passsec_receive("no-control", sv[1], 0);
+            send(sv[0], "b", 1, 0);
+            passsec_receive("control", sv[1], 256);
+            int_option("passcred", sv[1], SO_PASSCRED, 1, 4);
+            send(sv[0], "c", 1, 0);
+            passsec_receive("credentials", sv[1], 256);
+            int_option("passcred", sv[1], SO_PASSCRED, 0, 4);
+            int_option("off", sv[1], SO_PASSSEC, 0, 4);
+            send(sv[0], "d", 1, 0);
+            passsec_receive("off", sv[1], 0);
+            close(sv[0]);
+            close(sv[1]);
+        }
+        const int listening[] = {SOCK_STREAM, SOCK_SEQPACKET};
+        for (int t = 0; t < 2; t++) {
+            struct sockaddr_un a;
+            socklen_t alen = unix_abstract(&a, "passsec");
+            int l = socket(AF_UNIX, listening[t], 0);
+            if (l < 0 || bind(l, (struct sockaddr *)&a, alen) != 0 || listen(l, 4) != 0) {
+                perror("listener");
+                return 1;
+            }
+            printf("listener %d\n", listening[t]);
+            const int names[] = {SO_PASSCRED, SO_PASSSEC, SO_PASSPIDFD};
+            int one = 1, zero = 0;
+            for (int i = 0; i < 3; i++)
+                setsockopt(l, SOL_SOCKET, names[i], &one, sizeof one);
+            passing("listener", l);
+            int first = socket(AF_UNIX, listening[t], 0);
+            if (connect(first, (struct sockaddr *)&a, alen) != 0) {
+                perror("connect");
+                return 1;
+            }
+            /* What the listener sets after the connect does not reach the
+               socket waiting to be accepted. */
+            for (int i = 0; i < 3; i++)
+                setsockopt(l, SOL_SOCKET, names[i], &zero, sizeof zero);
+            int second = socket(AF_UNIX, listening[t], 0);
+            if (connect(second, (struct sockaddr *)&a, alen) != 0) {
+                perror("connect");
+                return 1;
+            }
+            int got = accept(l, NULL, NULL);
+            passing("first-accepted", got);
+            passing("first-client", first);
+            /* The accepted socket passes credentials, so what the client
+               sends carries them. */
+            send(first, "e", 1, 0);
+            passsec_receive("first-message", got, 256);
+            close(got);
+            got = accept(l, NULL, NULL);
+            passing("second-accepted", got);
+            close(got);
+            close(first);
+            close(second);
+            close(l);
+        }
         return 0;
     }
     if (!strcmp(mode, "socket-timestamping")) {

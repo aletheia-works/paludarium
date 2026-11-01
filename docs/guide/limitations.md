@@ -100,8 +100,11 @@ verified.
     socket goes, where Linux's garbage collector closes them a little
     later, from a work queue.
 - **Socket options**: `setsockopt` refuses, with `ENOPROTOOPT`, the options
-  whose effect is not modelled, where Linux takes them: `SO_PASSSEC`, as
-  well as filters and the other options Linux has. `SO_RCVTIMEO` and
+  whose effect is not modelled, where Linux takes them: filters and the
+  other options Linux has. No security module is modelled, so `SO_PASSSEC`
+  brings no `SCM_SECURITY` and `SO_PEERSEC` is `ENOPROTOOPT`, as on a Linux
+  without one; with SELinux, Linux gives the sender's or peer's context, and
+  with AppArmor `SO_PEERSEC` gives the peer's label. `SO_RCVTIMEO` and
   `SO_SNDTIMEO` round to a 1000 Hz tick, where Linux rounds to its own
   `CONFIG_HZ`.
   The guest is root, so the options that need `CAP_NET_ADMIN`

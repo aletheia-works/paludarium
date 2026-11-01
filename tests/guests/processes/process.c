@@ -3646,6 +3646,71 @@ int main(int argc, char **argv) {
         close(p[1]);
         return 0;
     }
+    if (!strcmp(mode, "open-flags")) {
+        /* What F_GETFL gives, as Linux keeps f_flags: the open flags less
+           O_CLOEXEC (build_open_flags) and O_CREAT, O_EXCL, O_NOCTTY and
+           O_TRUNC (do_dentry_open), with O_LARGEFILE for a file opened by
+           path or a memfd (force_o_largefile), but only O_DIRECTORY,
+           O_NOFOLLOW and O_PATH for an O_PATH one. Pipes, sockets and the
+           kernel's own files have no O_LARGEFILE. */
+        char tmp[] = "/tmp/paludarium-flagsXXXXXX";
+        close(mkstemp(tmp));
+        struct {
+            const char *name;
+            const char *path;
+            int flags;
+        } opens[] = {
+            {"rdonly", tmp, O_RDONLY},
+            {"creat-trunc", tmp, O_WRONLY | O_CREAT | O_TRUNC},
+            {"append-cloexec-noctty", tmp, O_RDWR | O_APPEND | O_CLOEXEC | O_NOCTTY},
+            {"nonblock-sync", tmp, O_RDONLY | O_NONBLOCK | O_SYNC},
+            {"dsync-noatime-nofollow", tmp, O_WRONLY | O_DSYNC | O_NOATIME | O_NOFOLLOW},
+            {"directory", "/tmp", O_RDONLY | O_DIRECTORY},
+            {"path", tmp, O_PATH},
+            {"path-all", "/tmp", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK},
+            {"null", "/dev/null", O_RDWR | O_CREAT},
+            {"proc", "/proc/self/status", O_RDONLY | O_CLOEXEC},
+        };
+        for (size_t i = 0; i < sizeof opens / sizeof opens[0]; i++) {
+            errno = 0;
+            int fd = open(opens[i].path, opens[i].flags, 0600);
+            printf("%s: fd=%d errno=%d", opens[i].name, fd >= 0, fd < 0 ? errno : 0);
+            if (fd >= 0) {
+                printf(" flags=%#o", fcntl(fd, F_GETFL));
+                int dup = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+                printf(" dup=%#o", fcntl(dup, F_GETFL));
+                close(dup);
+                close(fd);
+            }
+            putchar('\n');
+        }
+        /* F_SETFL changes only what it may, and the rest stays. */
+        int fd = open(tmp, O_RDWR | O_TRUNC | O_CLOEXEC);
+        fcntl(fd, F_SETFL, O_APPEND | O_NONBLOCK | O_CREAT | O_TRUNC);
+        printf("setfl: flags=%#o\n", fcntl(fd, F_GETFL));
+        close(fd);
+        int p[2];
+        pipe2(p, O_CLOEXEC | O_NONBLOCK);
+        printf("pipe: %#o %#o\n", fcntl(p[0], F_GETFL), fcntl(p[1], F_GETFL));
+        int sv[2];
+        socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
+        printf("socketpair: %#o\n", fcntl(sv[0], F_GETFL));
+        int memfd = memfd_create("flags", MFD_CLOEXEC);
+        printf("memfd: %#o\n", fcntl(memfd, F_GETFL));
+        int event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        printf("eventfd: %#o\n", fcntl(event, F_GETFL));
+        int poll = epoll_create1(EPOLL_CLOEXEC);
+        printf("epoll: %#o\n", fcntl(poll, F_GETFL));
+        close(p[0]);
+        close(p[1]);
+        close(sv[0]);
+        close(sv[1]);
+        close(memfd);
+        close(event);
+        close(poll);
+        unlink(tmp);
+        return 0;
+    }
     if (!strcmp(mode, "proc-block-size")) {
         /* /proc is procfs, whose superblock Linux gives a block size of
            1024 (proc_fill_super): stat, statx, FIGETBSZ and statfs all

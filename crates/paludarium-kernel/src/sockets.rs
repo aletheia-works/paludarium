@@ -28,6 +28,9 @@ pub(crate) struct PipeEnd {
     /// The pipe's read and write ends, while some description holds each,
     /// which an open of the other end through a link takes.
     ends: Arc<Mutex<[Weak<SocketPairEnd>; 2]>>,
+    /// The write end too, for a description of both opened `O_RDWR`, whose
+    /// `endpoint` is the read end.
+    writer: Option<Arc<SocketPairEnd>>,
 }
 /// What `fchmod` and `fchown` change on the inode of a pipe or a socket, as
 /// Linux's `simple_setattr` keeps them: the mode, whose file type stays, and
@@ -118,8 +121,6 @@ mod pipe_tests {
     #[test]
     fn a_reopened_end_is_a_description_of_its_own() {
         let [r, w] = pair();
-        // O_RDWR does not open here.
-        assert!(w.reopen(2).is_err());
         let again = w.reopen(1 | NONBLOCK).unwrap();
         assert_eq!(again.flags(), 1 | NONBLOCK);
         assert_eq!(w.flags(), 1);
@@ -134,6 +135,33 @@ mod pipe_tests {
         assert_eq!(r.read(&mut byte), Err(Errno::EAGAIN));
         drop(again);
         assert_eq!(r.read(&mut byte), Ok(0));
+    }
+    #[test]
+    fn a_pipe_opened_read_write_is_both_ends() {
+        let [r, w] = pair();
+        let both = w.reopen(2 | NONBLOCK).unwrap();
+        assert_eq!(both.flags(), 2 | NONBLOCK);
+        // Writable with room, readable once it holds data, never hung up.
+        assert_eq!(both.readiness().unwrap().0, OUT);
+        assert_eq!(both.write(b"ab"), Ok(2));
+        assert_eq!(both.readiness().unwrap().0, IN | OUT);
+        let mut byte = [0];
+        assert_eq!(both.read(&mut byte), Ok(1));
+        assert_eq!(r.read(&mut byte), Ok(1));
+        assert_eq!(byte, *b"b");
+        // With every other description gone it is still both: no end of
+        // the pipe, and no EPIPE.
+        drop((r, w));
+        assert_eq!(both.read(&mut byte), Err(Errno::EAGAIN));
+        assert_eq!(both.readiness().unwrap().0, OUT);
+        assert_eq!(both.write(b"c"), Ok(1));
+        assert_eq!(both.read(&mut byte), Ok(1));
+        assert_eq!(byte, *b"c");
+        // Through its link, each end opens as before.
+        let reader = both.reopen(0).unwrap();
+        assert_eq!(both.write(b"d"), Ok(1));
+        assert_eq!(reader.read(&mut byte), Ok(1));
+        assert_eq!(byte, *b"d");
     }
     #[test]
     fn either_link_opens_either_end_even_after_it_closed() {
@@ -208,6 +236,7 @@ impl PipeEnd {
                 attributes: Arc::clone(&attributes),
                 nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
                 ends: Arc::clone(&ends),
+                writer: None,
             }),
             Arc::new(Self {
                 endpoint: writer,
@@ -216,11 +245,31 @@ impl PipeEnd {
                 attributes,
                 nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
                 ends,
+                writer: None,
             }),
         ])
     }
 }
 impl PipeEnd {
+    /// The pipe's read end, or with `reader` false its write end: the one
+    /// some description holds, or, when all of them closed, the end opened
+    /// again ([`SocketPairEnd::reopened`]).
+    fn end(&self, reader: bool) -> Arc<SocketPairEnd> {
+        if reader == self.reader {
+            return Arc::clone(&self.endpoint);
+        }
+        if let Some(writer) = self.writer.as_ref().filter(|_| !reader) {
+            return Arc::clone(writer);
+        }
+        let mut ends = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
+        let end = &mut ends[usize::from(!reader)];
+        if let Some(endpoint) = end.upgrade() {
+            return endpoint;
+        }
+        let endpoint = SocketPairEnd::reopened(&self.endpoint.pair, 1 - self.endpoint.side);
+        *end = Arc::downgrade(&endpoint);
+        endpoint
+    }
     /// `F_GETPIPE_SZ`.
     pub(crate) fn size(&self) -> u64 {
         self.endpoint.pair.window() as u64
@@ -269,14 +318,21 @@ impl FileHandle for PipeEnd {
         }
     }
     fn write(&self, bytes: &[u8]) -> Result<usize, Errno> {
-        if self.reader {
-            Err(Errno::EBADF)
-        } else {
-            self.endpoint.write(bytes)
+        match &self.writer {
+            Some(writer) => writer.write(bytes),
+            None if self.reader => Err(Errno::EBADF),
+            None => self.endpoint.write(bytes),
         }
     }
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         let (mask, input, output) = self.endpoint.readiness()?;
+        // Both a reader and a writer: readable with unread data, writable
+        // with room, and never hung up, as it is itself the other end.
+        if let Some(writer) = &self.writer {
+            let (room, _, output) = writer.readiness()?;
+            let unread = if self.endpoint.unread() == 0 { 0 } else { IN };
+            return Ok((mask & unread | room & OUT, input, output));
+        }
         // Unlike a socket, a pipe at end of file is not readable: Linux's
         // `pipe_poll` sets POLLIN only for unread data, and POLLHUP alone once
         // the writers are gone.
@@ -297,7 +353,12 @@ impl FileHandle for PipeEnd {
         } else {
             0
         };
-        u32::from(!self.reader) | nonblocking | (self.endpoint.flags() & O_ASYNC)
+        let access = if self.writer.is_some() {
+            2
+        } else {
+            u32::from(!self.reader)
+        };
+        access | nonblocking | (self.endpoint.flags() & O_ASYNC)
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
         self.endpoint.set_flags(flags)?;
@@ -306,34 +367,20 @@ impl FileHandle for PipeEnd {
         Ok(())
     }
     /// A new open file description of the pipe, as Linux's `fifo_open`
-    /// makes for the link of a pipe: a reader for `O_RDONLY` and a writer for
-    /// `O_WRONLY`, whichever end the link is, with its own `O_NONBLOCK`. The
-    /// end and its buffer and `O_ASYNC` are shared with the other
-    /// descriptions of it, and it closes when the last of them does; an end
-    /// all of whose descriptions closed opens again, as a pipe, unlike a
-    /// FIFO, neither waits for the other end nor refuses a writer without a
-    /// reader. `O_RDWR`, which Linux opens as both, gives `ENXIO` here.
+    /// makes for the link of a pipe: a reader for `O_RDONLY`, a writer for
+    /// `O_WRONLY` and both for `O_RDWR`, whichever end the link is, with its
+    /// own `O_NONBLOCK`. Each end and its buffer and `O_ASYNC` are shared
+    /// with the other descriptions of it, and it closes when the last of
+    /// them does; an end all of whose descriptions closed opens again, as a
+    /// pipe, unlike a FIFO, neither waits for the other end nor refuses a
+    /// writer without a reader.
     fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         const ENXIO: Errno = Errno(6);
-        let reader = match flags & 3 {
-            0 => true,
-            1 => false,
+        let (endpoint, reader, writer) = match flags & 3 {
+            0 => (self.end(true), true, None),
+            1 => (self.end(false), false, None),
+            2 => (self.end(true), true, Some(self.end(false))),
             _ => return Err(ENXIO),
-        };
-        let endpoint = if reader == self.reader {
-            Arc::clone(&self.endpoint)
-        } else {
-            let mut ends = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
-            let end = &mut ends[usize::from(!reader)];
-            match end.upgrade() {
-                Some(endpoint) => endpoint,
-                None => {
-                    let endpoint =
-                        SocketPairEnd::reopened(&self.endpoint.pair, 1 - self.endpoint.side);
-                    *end = Arc::downgrade(&endpoint);
-                    endpoint
-                }
-            }
         };
         Ok(Arc::new(Self {
             endpoint,
@@ -342,6 +389,7 @@ impl FileHandle for PipeEnd {
             attributes: Arc::clone(&self.attributes),
             nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
             ends: Arc::clone(&self.ends),
+            writer,
         }))
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
@@ -541,11 +589,18 @@ pub(crate) fn endpoint(file: &Arc<dyn FileHandle>) -> Option<&SocketPairEnd> {
             .map(|pipe| pipe.endpoint.as_ref())
     })
 }
-/// Signals the other end of `file`, if it is a pipe, for `reason`.
+/// Signals the other end of `file`, if it is a pipe, for `reason`: its
+/// read end for data (`POLL_IN`), its write end for room (`POLL_OUT`).
 fn pipe_notify(file: &Arc<dyn FileHandle>, reason: Reason) {
     if let Some(pipe) = file.as_any().and_then(|any| any.downcast_ref::<PipeEnd>()) {
         let end = &pipe.endpoint;
-        end.notify(1 - end.side, reason);
+        let read_side = if pipe.reader { end.side } else { 1 - end.side };
+        let side = if reason == Reason::In {
+            read_side
+        } else {
+            1 - read_side
+        };
+        end.notify(side, reason);
     }
 }
 /// The end of a read of a pipe, with or without data: its writer gets

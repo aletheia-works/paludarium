@@ -3747,6 +3747,31 @@ int main(int argc, char **argv) {
         printf("reader-again: open=%d wrote=%ld read=%ld %.*s\n", other >= 0, wrote, n, n > 0 ? (int)n : 0, sink);
         close(other);
         close(e[1]);
+        /* O_RDWR opens both ends at once: it reads what it writes, is
+           readable and writable, and with every other description gone
+           sees neither the end of the pipe nor EPIPE. */
+        pipe(e);
+        snprintf(link, sizeof link, "/proc/self/fd/%d", e[0]);
+        int both = open(link, O_RDWR | O_NONBLOCK);
+        struct pollfd ready = {.fd = both, .events = POLLIN | POLLOUT};
+        poll(&ready, 1, 0);
+        printf("read-write: %#o revents=%#x", fcntl(both, F_GETFL), ready.revents);
+        wrote = write(both, "fg", 2);
+        n = read(both, sink, 1);
+        printf(" wrote=%ld read=%ld", wrote, n);
+        n = read(e[0], sink, 1);
+        poll(&ready, 1, 0);
+        printf(" other-read=%ld %c revents=%#x\n", n, sink[0], ready.revents);
+        close(e[0]);
+        close(e[1]);
+        errno = 0;
+        n = read(both, sink, 1);
+        printf("read-write-alone: read=%ld errno=%d", n, n < 0 ? errno : 0);
+        poll(&ready, 1, 0);
+        wrote = write(both, "h", 1);
+        n = read(both, sink, 1);
+        printf(" revents=%#x wrote=%ld read=%ld\n", ready.revents, wrote, n);
+        close(both);
         /* Standard output, opened again without blocking. */
         int out = open("/dev/stdout", O_WRONLY | O_NONBLOCK);
         printf("stdout: %#o first: %#o\n", fcntl(out, F_GETFL), fcntl(1, F_GETFL));

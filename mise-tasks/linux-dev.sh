@@ -22,10 +22,12 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-# The image is tagged with the toolchain pinned in rust-toolchain.toml, so a
-# toolchain bump builds a new image rather than reusing one with the old nightly.
+# The image is tagged with the toolchain pinned in rust-toolchain.toml and a
+# checksum of the Dockerfile, so a toolchain bump or a change to the image
+# (a newer Debian, say) builds a new image rather than reusing the old one.
 toolchain="$(cd "$root" && bash scripts/rust-toolchain.sh)"
-image="${PALUDARIUM_DEV_IMAGE:-paludarium-dev:$toolchain}"
+dockerfile="$(cksum < "$root/ci/linux-dev/Dockerfile" | cut -d ' ' -f 1)"
+image="${PALUDARIUM_DEV_IMAGE:-paludarium-dev:$toolchain-$dockerfile}"
 docker_bin="${DOCKER:-docker}"
 mode="${PALUDARIUM_DEV_MOUNT:-sync}"
 name="$(basename "$root" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/-*$//')"

@@ -132,9 +132,9 @@ def default_base():
 
 def base_results(commit, tests):
     """The base's outcomes, from the cache or a run in its worktree."""
-    # The commit pins the toolchain, which names the container's image; the
-    # image itself is whichever linux-dev built first for that toolchain, the
-    # same for both sides.
+    # The commit pins the toolchain and the image's Dockerfile, which name
+    # the container's image: the same for both sides, unless the checkout
+    # changes the Dockerfile, when the results show that change too.
     key = hashlib.sha256(" ".join(sorted(set(tests))).encode()).hexdigest()[:12]
     cache = WORK / f"{commit}-{key}.json"
     if cache.exists():

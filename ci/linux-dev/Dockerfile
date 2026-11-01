@@ -2,8 +2,8 @@
 # runs them natively (differential tests), strace/objdump, coverage, fuzzing.
 # Build it with `mise run linux-dev`, which passes the pinned toolchain:
 #   docker build --platform linux/amd64 --build-arg TOOLCHAIN="$(bash scripts/rust-toolchain.sh)" \
-#     -t paludarium-dev:<toolchain> ci/linux-dev
-FROM rust:1-bookworm
+#     -t paludarium-dev:<toolchain>-<Dockerfile checksum> ci/linux-dev
+FROM rust:1-trixie
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends musl-tools binutils strace gdb \

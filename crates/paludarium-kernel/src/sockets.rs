@@ -969,8 +969,9 @@ fn receive_with(
 /// Writes the control messages of a received message, as Linux's
 /// `__scm_recv_common`: with no control buffer, only `MSG_CTRUNC` tells of
 /// them, and of `SO_PASSSEC`'s security context (`scm_has_secdata`), though
-/// there is none. Otherwise a message's timestamp, as `__sock_recv_timestamp` puts
-/// it before them, goes first, then `credentials`, when the socket passes
+/// there is none. Otherwise a message's timestamp, as
+/// `__sock_recv_timestamp` puts it before them, goes first, then
+/// `credentials`, when the socket passes
 /// them ([`put_control`]), then the descriptors ([`put_descriptors`]),
 /// then, when the socket passes pidfds, a pidfd of the sender process
 /// `pidfd` ([`put_pidfd`]). Returns the control bytes used and whether
@@ -1341,8 +1342,8 @@ pub(crate) fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// ENOPROTOOPT. `SO_PASSCRED` makes messages carry credentials
 /// ([`Credentials`]), `SO_PASSPIDFD` them and a pidfd of their sender
 /// ([`put_pidfd`]), `SO_PASSSEC` their sender's security context, which
-/// there is none of ([`deliver`]), `SO_TIMESTAMP` and its kin, and `SO_TIMESTAMPING`,
-/// timestamps ([`Timestamps`]), `SO_RCVLOWAT` sets what a
+/// there is none of ([`deliver`]), `SO_TIMESTAMP` and its kin, and
+/// `SO_TIMESTAMPING`, timestamps ([`Timestamps`]), `SO_RCVLOWAT` sets what a
 /// stream read waits for ([`receive_with`]; 0 is 1, and a negative value
 /// `INT_MAX`), and `SO_PEEK_OFF` where a peek starts (any value, a negative
 /// one for none). `SO_RCVTIMEO` and `SO_SNDTIMEO` take a

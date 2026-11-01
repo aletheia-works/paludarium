@@ -162,6 +162,11 @@ mod pipe_tests {
         assert_eq!(both.write(b"d"), Ok(1));
         assert_eq!(reader.read(&mut byte), Ok(1));
         assert_eq!(byte, *b"d");
+        // Full, it is readable and not writable, as Linux's `pipe_poll`.
+        let block = vec![0; 4096];
+        while both.write(&block).is_ok() {}
+        assert_eq!(both.readiness().unwrap().0, IN);
+        assert_eq!(both.write(b"e"), Err(Errno::EAGAIN));
     }
     #[test]
     fn either_link_opens_either_end_even_after_it_closed() {

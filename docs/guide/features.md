@@ -493,7 +493,8 @@ kernel.
   again, and no open waits for the other end or refuses a writer without a
   reader, as a FIFO would. An end closes when its last description does.
   `O_ASYNC` and the signal owner of an end stay shared by its descriptions,
-  an `O_RDWR` one's being its read end's, where Linux keeps them for each. A
+  an `O_RDWR` one's being its read end's, so that it signals data
+  (`POLL_IN`) but not room (`POLL_OUT`), where Linux keeps them for each. A
   standard stream opens, for the access it has, as a new description of it.
   `O_CREAT | O_EXCL` finds the link there (`EEXIST`), and `O_NOFOLLOW` does
   not follow it (`ELOOP`) but with `O_PATH`. A socket gives `ENXIO`, as on

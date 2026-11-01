@@ -13,7 +13,7 @@ jobs:
       matrix:
         target: [cpu_instructions, mmu_instructions, decode, load_elf, mmu_ops, syscall_args, vfs_paths, kernel_threads, kernel_futex, kernel_events, kernel_sockets, jit_compile, jit_cache]
     container:
-      image: rust:1-bookworm
+      image: rust:1-trixie
       options: --cap-add=SYS_PTRACE --security-opt=seccomp=unconfined --ulimit=stack=-1
     env:
       ASAN_OPTIONS: detect_leaks=1
@@ -36,7 +36,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl
           curl --fail --location https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          printf '%s\n' 'deb https://apt.llvm.org/bookworm/ llvm-toolchain-bookworm main' > /etc/apt/sources.list.d/llvm-symbolizer.list
+          printf '%s\n' 'deb https://apt.llvm.org/trixie/ llvm-toolchain-trixie main' > /etc/apt/sources.list.d/llvm-symbolizer.list
           apt-get update
           apt-cache policy llvm-24
           apt-get install -y --no-install-recommends llvm-24

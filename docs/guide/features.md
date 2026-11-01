@@ -130,6 +130,15 @@ kernel.
   `select` fails with `EBADF` for a closed descriptor in its sets, and looks
   at no more than 1024 descriptors (`FD_SETSIZE`), where Linux cuts `nfds` to
   the size of its descriptor table.
+- `fcntl`'s `F_GETFL` gives the status flags as Linux keeps them: the open
+  flags less `O_CLOEXEC`, `O_CREAT`, `O_EXCL`, `O_NOCTTY` and `O_TRUNC`,
+  with `O_LARGEFILE` for a file opened by a path or a memfd; an `O_PATH`
+  file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
+  and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
+  (a link in `/proc/self/fd`, `/dev/stdout`). Such an open of a pipe or a
+  standard stream shares its handle, and so its other status flags, with
+  the descriptor it was opened through, where Linux gives it a description
+  of its own.
 - A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
   `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
   at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.

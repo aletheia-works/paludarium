@@ -152,6 +152,20 @@ static int client(int port, int flags, int *result) {
     *result = connect(fd, (void *)&a, sizeof a) ? errno : 0;
     return fd;
 }
+/* A client on a port of its own: bound to port 0 before it connects, it
+   takes a port no other socket holds, where connect alone may share one
+   with sockets still in TIME_WAIT towards other addresses (Linux's
+   __inet_hash_connect), so that a bind there fails whatever this one left.
+   No other connect takes the port while it is held. */
+static int own_port_client(int port, int *result) {
+    int fd = tcp(0);
+    struct sockaddr_in any = to(0);
+    bind(fd, (void *)&any, sizeof any);
+    struct sockaddr_in a = to(port);
+    errno = 0;
+    *result = connect(fd, (void *)&a, sizeof a) ? errno : 0;
+    return fd;
+}
 static void bind_to(const char *name, int fd, in_addr_t addr, int port) {
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
     a.sin_addr.s_addr = addr;
@@ -949,7 +963,7 @@ int main(int argc, char **argv) {
            second keeps nothing. A reset leaves nothing held. */
         int port, result, one = 1;
         int l = listener(8, &port);
-        int c = client(port, 0, &result);
+        int c = own_port_client(port, &result);
         int s = accept(l, NULL, NULL);
         int client_port = port_of(c);
         close(c);
@@ -967,7 +981,7 @@ int main(int argc, char **argv) {
         close(t);
         /* The client closes first while the server stays open: held too,
            until the server's send is answered with a reset. */
-        c = client(port, 0, &result);
+        c = own_port_client(port, &result);
         s = accept(l, NULL, NULL);
         int open_port = port_of(c);
         close(c);
@@ -984,7 +998,7 @@ int main(int argc, char **argv) {
            of a server that closes with them unread. */
         static char lots[4096];
         for (int drained = 1; drained >= 0; drained--) {
-            c = client(port, 0, &result);
+            c = own_port_client(port, &result);
             s = accept(l, NULL, NULL);
             int full_port = port_of(c);
             while (send(c, lots, sizeof lots, MSG_DONTWAIT) > 0) {}
@@ -1010,7 +1024,7 @@ int main(int argc, char **argv) {
             close(t);
         }
         /* Closed with input unread: a reset, and nothing held. */
-        c = client(port, 0, &result);
+        c = own_port_client(port, &result);
         s = accept(l, NULL, NULL);
         int unread_port = port_of(c);
         send(s, "x", 1, 0);
@@ -1030,7 +1044,7 @@ int main(int argc, char **argv) {
         bind(l, (void *)&any, sizeof any);
         listen(l, 8);
         port = port_of(l);
-        c = client(port, 0, &result);
+        c = own_port_client(port, &result);
         s = accept(l, NULL, NULL);
         close(s);
         await_end(c);

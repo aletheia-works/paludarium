@@ -2434,6 +2434,21 @@ mod tests {
     }
 
     #[test]
+    fn a_core_dump_reads_an_unreadable_file_page_from_the_file() {
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(None, PAGE_SIZE, Prot::NONE, MappingKind::File)
+            .unwrap();
+        let pages = SharedPages::new().with_source(Arc::new(Pattern(PAGE_SIZE)));
+        space.back_with_cache(at, PAGE_SIZE, &pages, 0).unwrap();
+        let mut buf = [0u8; 4];
+        space
+            .read_for_dump(GuestAddr(at.0 + 300), &mut buf)
+            .unwrap();
+        assert_eq!(buf, [300, 301, 302, 303].map(pattern));
+    }
+
+    #[test]
     fn fetch_partial_stops_at_non_executable_page() {
         let mut space = space_with(0x30000, PAGE_SIZE, Prot::READ_EXEC);
         let mut buf = [0u8; 15];

@@ -1238,9 +1238,9 @@ impl AddressSpaceData {
 
     /// The core dump's view of the Linux VMA at `addr`: written when any
     /// mapping of it is, as Linux gives a merged VMA the `anon_vma` of the
-    /// one that had it.
-    /// The core state at `addr` but [`CoreState::linked`], and the file of
-    /// a shared mapping there, which tells that.
+    /// one that had it. [`CoreState::linked`] is left false: the file of a
+    /// shared mapping there, returned with it, tells that once the lock is
+    /// released.
     fn core_state(&self, addr: u64) -> (CoreState, Option<Arc<dyn PageSource>>) {
         let written = self
             .region_at(addr)

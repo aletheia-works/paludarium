@@ -149,6 +149,9 @@ enum Access {
     Fetch,
     /// Loader writes into read-only segments while preparing the image.
     Setup,
+    /// A core dump reads any mapped page, as Linux's `get_dump_page` does
+    /// with `FOLL_FORCE`.
+    Dump,
 }
 
 impl Access {
@@ -157,7 +160,7 @@ impl Access {
             Access::Read => prot.allows_read(),
             Access::Write => prot.contains(Prot::WRITE),
             Access::Fetch => prot.contains(Prot::EXEC),
-            Access::Setup => true,
+            Access::Setup | Access::Dump => true,
         }
     }
 
@@ -1265,6 +1268,11 @@ impl AddressSpaceData {
         self.read_with(addr, buf, Access::Read)
     }
 
+    /// Reads guest memory whatever its protection, for a core dump.
+    pub fn read_for_dump(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
+        self.read_with(addr, buf, Access::Dump)
+    }
+
     /// Writes guest memory; requires `PROT_WRITE`.
     pub fn write(&mut self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
         if self.write_with(addr, buf, Access::Write)? {
@@ -2170,6 +2178,11 @@ impl AddressSpace {
     pub fn read(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.locked().read(addr, buf)
     }
+    /// Reads guest memory whatever its protection, as Linux's core dump
+    /// does: a page that is mapped at all reads.
+    pub fn read_for_dump(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
+        self.locked().read_for_dump(addr, buf)
+    }
     pub fn write(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
         self.locked().write(addr, buf)
     }
@@ -2403,6 +2416,21 @@ mod tests {
             .unwrap();
         space.read(GuestAddr(0x20000), &mut buf).unwrap();
         assert_eq!(buf, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_core_dump_reads_a_page_whatever_its_protection() {
+        let mut space = space_with(0x20000, PAGE_SIZE, Prot::READ_WRITE);
+        space.write(GuestAddr(0x20000), &[1, 2, 3, 4]).unwrap();
+        space
+            .protect(GuestAddr(0x20000), PAGE_SIZE, Prot::NONE)
+            .unwrap();
+        let mut buf = [0u8; 4];
+        assert!(space.read(GuestAddr(0x20000), &mut buf).is_err());
+        space.read_for_dump(GuestAddr(0x20000), &mut buf).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+        // An address mapped not at all still faults.
+        assert!(space.read_for_dump(GuestAddr(0x30000), &mut buf).is_err());
     }
 
     #[test]

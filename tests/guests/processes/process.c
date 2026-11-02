@@ -6336,6 +6336,8 @@ int main(int argc, char **argv) {
            an ELF file only that first page. A shared mapping it holds whole
            when its file has no name (an anonymous one, a memfd, a file
            unlinked since), and nothing of it otherwise, written or not.
+           None of this asks whether the mapping can be read, as Linux reads
+           it with FOLL_FORCE; only an ELF header's page does.
            Each mapping lies between
            PROT_NONE pages, so that none merges with another but the one
            placed to. */
@@ -6357,14 +6359,22 @@ int main(int argc, char **argv) {
         const char *names[] = {"untouched", "read", "written", "read-only", "split", "populated",
                                "file-untouched", "file-written", "elf", "dontneed", "merged",
                                "child-written", "shared-anonymous", "shared-file",
-                               "shared-unlinked", "shared-memfd"};
-        enum { COUNT = 16 };
+                               "shared-unlinked", "shared-memfd", "unreadable-written",
+                               "unreadable-shared", "unreadable-elf"};
+        enum { COUNT = 19 };
         char *at[COUNT];
         for (int i = 0; i < COUNT; i++) {
             char *where = base + (1 + 5 * i) * page;
-            int prot = i == 3 || i == 8 || i == 14 || i == 15 ? PROT_READ : PROT_READ | PROT_WRITE;
-            int file = i == 6 || i == 7 || i == 13 ? fd : i == 8 ? exe : i == 14 ? gone : i == 15 ? memfd : -1;
-            int flags = (i >= 12 ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED |
+            int prot = i == 17 || i == 18                       ? PROT_NONE
+                       : i == 3 || i == 8 || i == 14 || i == 15 ? PROT_READ
+                                                                : PROT_READ | PROT_WRITE;
+            int file = i == 6 || i == 7 || i == 13 ? fd
+                       : i == 8 || i == 18         ? exe
+                       : i == 14                   ? gone
+                       : i == 15                   ? memfd
+                                                   : -1;
+            int shared = (i >= 12 && i <= 15) || i == 17;
+            int flags = (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED |
                         (file < 0 ? MAP_ANONYMOUS : 0) | (i == 5 ? MAP_POPULATE : 0);
             /* The one to merge sits right after the written one, which it
                merges with, still before the next one's PROT_NONE page. */
@@ -6382,6 +6392,8 @@ int main(int argc, char **argv) {
         if (madvise(at[9], 2 * page, MADV_DONTNEED)) return 86;
         at[13][0] = 1;
         if (unlink("gone")) return 86;
+        at[16][page] = 0x5a;
+        if (mprotect(at[16], 2 * page, PROT_NONE)) return 85;
         (void)sink;
         pid_t pid = fork();
         if (pid == 0) {
@@ -6419,6 +6431,14 @@ int main(int argc, char **argv) {
             CORE_HOLDS(at[i] + page, second, unused);
             printf("%s: first=%d second=%d covered=%d\n", names[i], first, second, covered);
         }
+        /* The byte written before the mapping became unreadable. */
+        int byte = -1;
+        for (int k = 0; k < (int)le(56, 2); k++) {
+            uint64_t h = le(32, 8) + 56 * (uint64_t)k, x = (uintptr_t)(at[16] + page);
+            uint64_t v = le(h + 16, 8), f = le(h + 32, 8);
+            if (le(h, 4) == 1 && x >= v && x < v + f) byte = core_bytes[le(h + 8, 8) + (x - v)];
+        }
+        printf("unreadable-written: byte=%#x\n", byte);
 #undef CORE_HOLDS
         free(b);
         unlink("core");

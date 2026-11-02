@@ -132,10 +132,11 @@ pub(crate) fn write(
         let mut at = 0;
         while at < *length {
             let size = (*length - at).min(PAGE) as usize;
-            // A page that cannot be read is written as zeros, as Linux
+            // Read whatever the protection, as Linux reads with FOLL_FORCE;
+            // a page that still cannot be read is written as zeros, as Linux
             // skips it in the file.
             page[..size].fill(0);
-            let _ = mem.read(GuestAddr(mapping.start.0 + at), &mut page[..size]);
+            let _ = mem.read_for_dump(GuestAddr(mapping.start.0 + at), &mut page[..size]);
             if !put(&page[..size]) {
                 return false;
             }
@@ -151,17 +152,16 @@ pub(crate) fn write(
 /// of a file mapping from the start of an ELF file (its header); a shared
 /// mapping whole when no name links its file (an anonymous one, a memfd, a
 /// file unlinked since), else nothing of it; the stack, a writable ELF
-/// segment and the first page of the ELF image; nothing of a mapping that
-/// cannot be read.
+/// segment and the first page of the ELF image. Only the ELF headers ask
+/// for a mapping that can be read (`VM_READ`): Linux reads the rest whatever
+/// its protection.
 fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
-    if !mapping.prot.contains(Prot::READ) {
-        return 0;
-    }
+    let readable = mapping.prot.contains(Prot::READ);
     let writable = mapping.prot.contains(Prot::WRITE);
     match mapping.kind {
         MappingKind::Stack => mapping.length,
         MappingKind::ElfSegment if writable => mapping.length,
-        MappingKind::ElfSegment if first_elf => mapping.length.min(PAGE),
+        MappingKind::ElfSegment if first_elf && readable => mapping.length.min(PAGE),
         MappingKind::ElfSegment => 0,
         _ => {
             let state = mem.core_state(mapping.start);
@@ -170,6 +170,7 @@ fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
             } else if state.written {
                 mapping.length
             } else if mapping.kind == MappingKind::File
+                && readable
                 && state.file_offset == Some(0)
                 && elf_header(mem, mapping.start)
             {

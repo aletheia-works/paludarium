@@ -75,7 +75,7 @@ pub(crate) fn write(
         .find(|m| m.kind == MappingKind::ElfSegment)
         .map(|m| m.start);
     // One segment for each Linux VMA, which may hold adjacent mappings
-    // merged, as Linux writes one for each.
+    // merged.
     let mut segments: Vec<(Mapping, u64)> = Vec::new();
     for &m in &mappings {
         if segments

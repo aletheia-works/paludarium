@@ -2807,8 +2807,10 @@ fn open_path(
 /// again by it while the path still names that file, and a removed one of
 /// the guest's own filesystem through its handle ([`FileHandle::reopen`]); a
 /// memfd gets a new handle on its file; a pipe or the standard streams give
-/// the same handle for the access it has. The rest cannot be opened again: a
-/// socket gives ENXIO, as on Linux, and so do the others here.
+/// the same handle for the access it has, and a pidfd another description
+/// of its process, as root opens it. The rest cannot be opened again: a
+/// socket gives ENXIO, as on Linux, and so do the anonymous inodes
+/// (eventfd, epoll, timerfd), whose `open` is Linux's `no_open`.
 fn reopen(
     c: &mut Context<'_>,
     n: u32,
@@ -2837,11 +2839,17 @@ fn reopen(
         );
         return Ok((Arc::new(file), Vec::new()));
     }
+    let is_pidfd = d
+        .file
+        .as_any()
+        .is_some_and(|v| v.is::<crate::processes::PidFd>());
     let stat = d.file.stat()?;
     match stat.mode & 0o170000 {
         // A pipe or a standard stream: a description of its own, which
         // checks the access it is opened with.
         0o010000 if d.path.is_empty() => Ok((d.file.reopen(flags)?, Vec::new())),
+        // A pidfd: another description of the same process.
+        _ if d.path.is_empty() && is_pidfd => Ok((d.file.reopen(flags)?, Vec::new())),
         _ if d.path.is_empty() => Err(ENXIO),
         _ if generated(&d.path) => open_path(c, &d.path.clone(), flags, mode),
         _ => match current_path(c, &d, stat.inode) {

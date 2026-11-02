@@ -482,8 +482,8 @@ kernel.
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
   for this process's entries), followed by a space and `(deleted)` once
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
-  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]` or `[pidfd]` (which
-  Linux 6.9 and later name from pidfs instead), and
+  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]` or `[pidfd]` (the
+  name pidfs keeps since Linux 6.9), and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
   own for it. Opening a link opens the file again by its path, or, for a
   file no path names any more (removed, or renamed away), the same file
@@ -509,9 +509,15 @@ kernel.
   link's, whose `readlinkat(fd, "")` reads where it points (`ENOENT` for an
   `O_PATH` descriptor of anything else), whose own link names the link, and
   that nothing reads through (`EBADF`); an open that follows its own link
-  reaches the link (`ELOOP`). A socket gives `ENXIO`, as on
-  Linux; so do, here, the files of no type and a removed file of a directory
-  mounted from a host other than Linux, which Linux can open.
+  reaches the link (`ELOOP`). A socket gives `ENXIO`, as on Linux, and so
+  do an eventfd, an epoll and a timerfd, whose anonymous inode Linux opens
+  with `no_open`. A pidfd opens as another description of its process, as
+  root opens it (pidfs has no `open` of its own): with the access it is
+  opened with and `O_NONBLOCK` of its own, even after the process is
+  reaped. Linux checks the inode's mode first, root's 0600 (0700 for a
+  pidfd), so another user gets `EACCES`; the guest is root. A removed file
+  of a directory mounted from a host other than Linux, which Linux can
+  open, gives `ENXIO` here.
 - `/dev` (mode 0755) holds the memory devices and the links Linux systems
   keep there, and lists only these: a file a guest makes under `/dev` can be
   opened and stat'ed but is not listed. Each entry has one inode number,
@@ -660,8 +666,8 @@ kernel.
   until such children have exited, then fails with `ECHILD`, their CPU time
   does not join the parent's children's, and with `SIGCHLD` ignored no
   `SIGCHLD` is queued, even while blocked. A zombie from before stays for a
-  wait. A pidfd from `pidfd_open` becomes
-  readable when its process exits (and hung up once it is reaped; an
+  wait. A pidfd from `pidfd_open` has pidfs's mode 0700 in `fstat`, with
+  no file type, and becomes readable when its process exits (and hung up once it is reaped; an
   automatically reaped child shows both at once), so `epoll` can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives `EAGAIN`.
   `pidfd_send_signal` takes no siginfo and no scope flags, and `PIDFD_THREAD`
   still names the whole process.

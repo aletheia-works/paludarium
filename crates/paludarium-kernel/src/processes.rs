@@ -1013,6 +1013,17 @@ impl PidFd {
     }
 }
 impl paludarium_host::FileHandle for PidFd {
+    /// The same process's pidfd as a new open file description, as root
+    /// opens one through `/proc/self/fd` (Linux's pidfs gives it no `open`
+    /// of its own): the access it is opened with and `O_NONBLOCK` of its
+    /// own, even once the process is gone.
+    fn reopen(&self, flags: u32) -> Result<Arc<dyn paludarium_host::FileHandle>, Errno> {
+        Ok(Arc::new(Self {
+            pid: self.pid,
+            processes: Arc::clone(&self.processes),
+            flags: AtomicU32::new(flags & (3 | PIDFD_NONBLOCK as u32)),
+        }))
+    }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
@@ -1036,9 +1047,10 @@ impl paludarium_host::FileHandle for PidFd {
         Err(Errno::ESPIPE)
     }
     fn stat(&self) -> Result<paludarium_host::FileStat, Errno> {
-        // An anonymous inode: permissions, but no file type.
+        // pidfs's inode: root's 0700, with its file type hidden as Linux's
+        // anon_inode_getattr hides it.
         Ok(paludarium_host::FileStat {
-            mode: 0o600,
+            mode: 0o700,
             links: 1,
             ..paludarium_host::FileStat::default()
         })
@@ -1053,8 +1065,10 @@ impl paludarium_host::FileHandle for PidFd {
         self.flags.load(Ordering::SeqCst)
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        // The access stays what it was opened with.
+        let access = self.flags.load(Ordering::SeqCst) & 3;
         self.flags
-            .store(2 | flags & PIDFD_NONBLOCK as u32, Ordering::SeqCst);
+            .store(access | flags & PIDFD_NONBLOCK as u32, Ordering::SeqCst);
         Ok(())
     }
 }

@@ -237,6 +237,7 @@ mod linux {
         processes_pipe_async => ("pipe-async","process"),
         processes_link_path => ("link-path","process"),
         processes_proc_self_link => ("proc-self-link","process"),
+        processes_anon_reopen => ("anon-reopen","process"),
         processes_socket_timeouts => ("socket-timeouts","process"),
         processes_signal_restart => ("signal-restart","process"),
         processes_signal_io => ("signal-io","process"),

@@ -3646,6 +3646,71 @@ int main(int argc, char **argv) {
         close(p[1]);
         return 0;
     }
+    if (!strcmp(mode, "anon-reopen")) {
+        /* Opening the /proc/self/fd link of a file of no type. Linux first
+           checks the inode's permission, root's with mode 0600 (a pidfd's
+           0700), so another user gets EACCES. Root then reaches the
+           anonymous inodes' no_open (ENXIO), while pidfs has no open of its
+           own, so a pidfd opens as another description of its process: the
+           access it is opened with and its own O_NONBLOCK, polled as the
+           process exits and is reaped. Each line is whether the outcome is
+           the one for this process's user. */
+        int root = geteuid() == 0;
+        char link[64];
+        int anon[3] = {eventfd(0, 0), epoll_create1(0), timerfd_create(CLOCK_MONOTONIC, 0)};
+        const char *names[3] = {"eventfd", "epoll", "timerfd"};
+        for (int i = 0; i < 3; i++) {
+            snprintf(link, sizeof link, "/proc/self/fd/%d", anon[i]);
+            errno = 0;
+            int n = open(link, O_RDWR);
+            int refused = n < 0 && errno == (root ? ENXIO : EACCES);
+            struct stat st = {0};
+            fstat(anon[i], &st);
+            printf("%s=%d mode=%#o\n", names[i], refused, st.st_mode);
+            close(anon[i]);
+        }
+        int gate[2];
+        if (pipe(gate) < 0)
+            return 1;
+        pid_t pid = child();
+        if (pid == 0) {
+            char byte;
+            read(gate[0], &byte, 1);
+            _exit(0);
+        }
+        int pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
+        struct stat st = {0};
+        fstat(pidfd, &st);
+        printf("pidfd-mode=%#o\n", st.st_mode);
+        snprintf(link, sizeof link, "/proc/self/fd/%d", pidfd);
+        errno = 0;
+        int again = open(link, O_RDONLY | O_NONBLOCK);
+        int refused = again < 0 && errno == EACCES;
+        struct pollfd q = {again, POLLIN, 0};
+        int running = poll(&q, 1, 0) == 0;
+        result("open", root ? again >= 0 : refused);
+        result("flags", root ? fcntl(again, F_GETFL) == (O_RDONLY | O_NONBLOCK | O_LARGEFILE) : refused);
+        result("signal", root ? syscall(SYS_pidfd_send_signal, again, 0, NULL, 0) == 0 : refused);
+        result("running", root ? running : refused);
+        fcntl(again, F_SETFL, 0);
+        result("set-flags", root ? fcntl(again, F_GETFL) == (O_RDONLY | O_LARGEFILE) : refused);
+        result("first-flags", fcntl(pidfd, F_GETFL) == O_RDWR);
+        close(again);
+        write(gate[1], "x", 1);
+        siginfo_t info;
+        waitid(P_PID, pid, &info, WEXITED | WNOWAIT);
+        again = open(link, O_WRONLY);
+        q = (struct pollfd){again, POLLIN, 0};
+        result("exited", root ? poll(&q, 1, 0) == 1 && q.revents == POLLIN : again < 0 && errno == EACCES);
+        close(again);
+        waitpid(pid, NULL, 0);
+        again = open(link, O_RDWR);
+        q = (struct pollfd){again, POLLIN, 0};
+        result("reaped", root ? poll(&q, 1, 0) == 1 && q.revents == (POLLIN | POLLHUP) : again < 0 && errno == EACCES);
+        close(again);
+        close(pidfd);
+        return 0;
+    }
     if (!strcmp(mode, "proc-self-link")) {
         /* /proc/self is a symbolic link to this process's /proc directory,
            as Linux's proc_self_get_link makes it: lstat (fstatat and statx

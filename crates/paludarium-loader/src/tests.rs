@@ -144,7 +144,7 @@ fn segments_map_the_executable_by_its_path_at_their_file_offsets() {
     let mut fs = MemFs::new();
     fs.add_file(GuestFile::new("/prog", simple_exec())).unwrap();
     let mut mem = AddressSpace::new();
-    load(&fs, b"/prog", &start(&[], &[]), &mut mem).unwrap();
+    load(&fs, b"/./prog", &start(&[], &[]), &mut mem).unwrap();
     let file = |at: u64| mem.mapped_file(GuestAddr(at));
     let code = file(0x401000).unwrap();
     assert_eq!(code.name.as_deref(), Some(&b"/prog"[..]));

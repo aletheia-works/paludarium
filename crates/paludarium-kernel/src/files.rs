@@ -2924,7 +2924,7 @@ fn current_path(c: &Context<'_>, d: &Descriptor, inode: u64) -> Option<Vec<u8>> 
 /// What a link in `/proc/self/fd` reads: the path of a file on a mount
 /// (marked ` (deleted)` once removed), `pipe:[<inode>]`, `socket:[<inode>]`,
 /// `anon_inode:[<kind>]` for a file of no type, or a memfd's own name.
-pub(crate) fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
+fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     let any = d.file.as_any();
     if let Some(memfd) = any.and_then(|v| v.downcast_ref::<crate::memfd::Memfd>()) {
         return Ok(memfd.link_target());
@@ -2955,12 +2955,30 @@ pub(crate) fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Er
             paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())
         }
         _ => current_path(c, d, stat.inode).unwrap_or_else(|| {
-            let mut path =
-                paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone());
+            let mut path = opened_path(d);
             path.extend_from_slice(b" (deleted)");
             path
         }),
     })
+}
+/// The path `d` was opened by, made plain.
+fn opened_path(d: &Descriptor) -> Vec<u8> {
+    paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())
+}
+/// The path of the file `d` holds, for a mapping of it to name: where the
+/// file is now, or where it was opened if no name reaches it there (the
+/// mapping marks that itself), or a memfd's own path. `None` if the file
+/// cannot tell.
+pub(crate) fn mapped_path(c: &Context<'_>, d: &Descriptor) -> Option<Vec<u8>> {
+    if let Some(memfd) = d
+        .file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
+    {
+        return Some(memfd.path());
+    }
+    let stat = d.file.stat().ok()?;
+    Some(current_path(c, d, stat.inode).unwrap_or_else(|| opened_path(d)))
 }
 /// The entries of `/proc/self/fd`: `.`, `..` and a link per descriptor, in
 /// order, as Linux lists them.

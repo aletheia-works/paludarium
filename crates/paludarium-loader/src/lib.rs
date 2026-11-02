@@ -438,7 +438,9 @@ pub fn load(
             LoadError::Errno(e)
         }
     })?;
-    load_image(&bytes, Some(path), start, mem)
+    // Linux names the file by its plain absolute path.
+    let name = paludarium_vfs::normalize_path(path).unwrap_or_else(|_| path.to_vec());
+    load_image(&bytes, Some(&name), start, mem)
 }
 
 /// Loads an ELF image from memory.

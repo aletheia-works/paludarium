@@ -163,7 +163,7 @@ impl FileCache {
     pub(crate) fn map(
         self: &Arc<Self>,
         file: &Arc<dyn FileHandle>,
-        name: Vec<u8>,
+        name: Option<Vec<u8>>,
         offset: u64,
         len: u64,
         may_write: bool,
@@ -195,7 +195,7 @@ impl FileCache {
     pub(crate) fn map_private(
         self: &Arc<Self>,
         file: &Arc<dyn FileHandle>,
-        name: Vec<u8>,
+        name: Option<Vec<u8>>,
     ) -> SharedPages {
         self.pages
             .with_owner(Arc::new(Mapped {
@@ -260,13 +260,13 @@ impl FileCache {
 pub(crate) struct FilePages {
     file: Arc<dyn FileHandle>,
     cache: Arc<FileCache>,
-    name: Vec<u8>,
+    name: Option<Vec<u8>>,
 }
 
 impl FilePages {
     pub(crate) fn new(
         file: &Arc<dyn FileHandle>,
-        name: Vec<u8>,
+        name: Option<Vec<u8>>,
         cache: &Arc<FileCache>,
     ) -> Arc<Self> {
         Arc::new(FilePages {
@@ -302,7 +302,7 @@ impl paludarium_mmu::PageSource for FilePages {
     /// Its path, marked ` (deleted)` once no name links it, as Linux's
     /// `d_path` marks it.
     fn name(&self) -> Option<Vec<u8>> {
-        let mut name = self.name.clone();
+        let mut name = self.name.clone()?;
         if !self.linked() {
             name.extend_from_slice(b" (deleted)");
         }

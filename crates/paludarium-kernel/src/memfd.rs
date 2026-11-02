@@ -46,7 +46,11 @@ pub(crate) struct Memfd {
 impl Memfd {
     /// What `/proc/self/fd` shows for it: `/memfd:<name> (deleted)`.
     pub(crate) fn link_target(&self) -> Vec<u8> {
-        [b"/memfd:", &self.name[..], b" (deleted)"].concat()
+        [&self.path()[..], b" (deleted)"].concat()
+    }
+    /// Its path, `/memfd:<name>`, which no name links.
+    pub(crate) fn path(&self) -> Vec<u8> {
+        [b"/memfd:", &self.name[..]].concat()
     }
     /// A new handle on the same file, as opening `/proc/self/fd/<n>` gives:
     /// with the new access mode and flags (`O_CREAT` and `O_EXCL` do nothing

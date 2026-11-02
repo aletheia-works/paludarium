@@ -1294,7 +1294,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                     c.mem.back_with_cache(
                         a,
                         len,
-                        &cache.map_private(file, mapped_name(c, d)),
+                        &cache.map_private(file, crate::files::mapped_path(c, d)),
                         offset,
                     )
                 })
@@ -1385,18 +1385,14 @@ fn share_file(
         return Err(Errno::EPERM);
     }
     let may_write = file.flags() & 3 == 2 && !write_sealed(file.as_ref());
-    let pages = file_cache(c, d, file)?.map(file, mapped_name(c, d), offset, len, may_write)?;
+    let pages = file_cache(c, d, file)?.map(
+        file,
+        crate::files::mapped_path(c, d),
+        offset,
+        len,
+        may_write,
+    )?;
     c.mem.share_pages(at, len, &pages, offset, may_write)
-}
-/// The path that names the file `d` holds in a mapping of it: the one
-/// `/proc/self/fd` shows, without the ` (deleted)` that the mapping adds
-/// itself while no name links the file.
-fn mapped_name(c: &Context<'_>, d: &crate::files::Descriptor) -> Vec<u8> {
-    let mut name = crate::files::link_target(c, d).unwrap_or_default();
-    if name.ends_with(b" (deleted)") {
-        name.truncate(name.len() - b" (deleted)".len());
-    }
-    name
 }
 /// The page cache of the file `d` holds, which keeps its size.
 fn file_cache(

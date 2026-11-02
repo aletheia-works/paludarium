@@ -517,4 +517,27 @@ mod coredump_tests {
         assert_eq!((word(5), word(6), word(7)), (file.0, file.0 + 2 * PAGE, 2));
         assert_eq!(&note[64..], b"/dev/zero (deleted)\0/data\0");
     }
+
+    #[test]
+    fn each_part_of_a_split_file_mapping_names_its_own_page() {
+        let mut mem = AddressSpace::new();
+        let file = mem
+            .map(None, 2 * PAGE, Prot::READ, MappingKind::File)
+            .unwrap();
+        let pages = SharedPages::new().with_source(Arc::new(Named));
+        mem.back_with_cache(file, 2 * PAGE, &pages, 2 * PAGE)
+            .unwrap();
+        mem.protect_shared(GuestAddr(file.0 + PAGE), PAGE, Prot::READ_WRITE)
+            .unwrap();
+        let vmas: Vec<Mapping> = mem.mappings().collect();
+        assert_eq!(vmas.len(), 2);
+        let note = files(&mem, &vmas);
+        let word = |i: usize| u64::from_le_bytes(note[8 * i..8 * i + 8].try_into().unwrap());
+        assert_eq!(word(0), 2);
+        assert_eq!((word(2), word(3), word(4)), (file.0, file.0 + PAGE, 2));
+        assert_eq!(
+            (word(5), word(6), word(7)),
+            (file.0 + PAGE, file.0 + 2 * PAGE, 3)
+        );
+    }
 }

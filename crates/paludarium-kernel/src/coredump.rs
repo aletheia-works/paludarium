@@ -540,4 +540,34 @@ mod coredump_tests {
             (file.0 + PAGE, file.0 + 2 * PAGE, 3)
         );
     }
+
+    #[test]
+    fn a_merged_file_mapping_names_the_page_it_starts_at() {
+        let mut mem = AddressSpace::new();
+        let high = mem.map(None, PAGE, Prot::READ, MappingKind::File).unwrap();
+        let low = mem
+            .map(
+                Some(GuestAddr(high.0 - PAGE)),
+                PAGE,
+                Prot::READ,
+                MappingKind::File,
+            )
+            .unwrap();
+        // The same file at the next page: Linux merges the two VMAs.
+        let pages = SharedPages::new().with_source(Arc::new(Named));
+        mem.back_with_cache(low, PAGE, &pages, PAGE).unwrap();
+        mem.back_with_cache(high, PAGE, &pages, 2 * PAGE).unwrap();
+        let (start, length) = mem.vma_at(high).unwrap();
+        assert_eq!((start, length), (low, 2 * PAGE));
+        let first = mem.mappings().next().unwrap();
+        let vma = Mapping {
+            start,
+            length,
+            ..first
+        };
+        let note = files(&mem, &[vma]);
+        let word = |i: usize| u64::from_le_bytes(note[8 * i..8 * i + 8].try_into().unwrap());
+        assert_eq!(word(0), 1);
+        assert_eq!((word(2), word(3), word(4)), (low.0, low.0 + 2 * PAGE, 1));
+    }
 }

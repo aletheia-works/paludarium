@@ -2,6 +2,8 @@ const decoder = new TextDecoder();
 const bytes = encoded => Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
 const hex = array => Array.from(new Uint8Array(array), value => value.toString(16).padStart(2, "0")).join("");
 const sha256 = async data => hex(await crypto.subtle.digest("SHA-256", data));
+// An absolute path with its "." and ".." components resolved.
+const normalize = path => path.split("/").reduce((parts, part) => part === ".." ? parts.slice(0, -1) : part === "." || part === "" ? parts : [...parts, part], []).reduce((joined, part) => joined + "/" + part, "");
 function canonicalState(content, entries, appPrefix) {
   const state = JSON.parse(decoder.decode(content));
   const checkMeta = (meta, path) => {
@@ -9,7 +11,9 @@ function canonicalState(content, entries, appPrefix) {
     if (!entry || meta.size !== entry.content.length || BigInt(meta.mtime_secs) * 1000000000n + BigInt(meta.mtime_nanos) !== BigInt(entry.mtimeNs)) throw new Error(`state mtime/size does not match actual filesystem: ${path}`);
   };
   checkMeta(state.lockfile_meta, appPrefix + "/" + state.lockfile_snapshot_name);
-  for (const [path, meta] of Object.entries(state.package_json_meta)) checkMeta(meta, appPrefix + (path === "." ? "" : "/" + path) + "/package.json");
+  // aube names the project's package.json ".", and any other (a link:
+  // target's, which may lie outside the project) by its path from there.
+  for (const [path, meta] of Object.entries(state.package_json_meta)) checkMeta(meta, normalize(appPrefix + "/" + (path === "." ? "package.json" : path)));
   // Only the independently observed generated lockfile timestamp varies. Its
   // value was checked against the same run's real filesystem before mapping.
   state.lockfile_meta.mtime_secs = "<GENERATED_MTIME>";

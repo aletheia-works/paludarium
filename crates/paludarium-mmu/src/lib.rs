@@ -117,6 +117,18 @@ pub struct CoreState {
     pub file_offset: Option<u64>,
 }
 
+/// The file a mapping maps ([`AddressSpace::mapped_file`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MappedFile {
+    /// Its path ([`PageSource::name`]).
+    pub name: Option<Vec<u8>>,
+    /// Whether it has a file of its own: shared anonymous memory has none,
+    /// where Linux gives it one of no name.
+    pub source: bool,
+    /// Where the mapping's address lies in it.
+    pub offset: u64,
+}
+
 impl Mapping {
     /// Exclusive end address.
     #[must_use]
@@ -508,10 +520,11 @@ impl SharedPages {
 #[derive(Clone)]
 struct SharedMapping {
     end: u64,
-    /// Frames are keyed by `page + shift` (wrapping): 0 where shared
-    /// anonymous memory was made, or the file offset less the address for a
-    /// file's page cache, and moved by `mremap`, so every process sharing the
-    /// frames still finds the same ones wherever it has the mapping now.
+    /// Frames are keyed by `page + shift` (wrapping): the offset from where
+    /// shared anonymous memory was made (as in the file Linux gives it), or
+    /// the file offset for a file's page cache, and moved by `mremap`, so
+    /// every process sharing the frames still finds the same ones wherever
+    /// it has the mapping now.
     shift: u64,
     pages: SharedPages,
     /// `mprotect` may make the mapping writable (Linux's `VM_MAYWRITE`).
@@ -545,6 +558,11 @@ pub trait PageSource: Send + Sync {
     /// that none does (Linux's `i_nlink`), as of a memfd.
     fn linked(&self) -> bool {
         true
+    }
+    /// The file's path, as a core's `NT_FILE` note names it (Linux's
+    /// `file_path`), or `None` if it has none to give.
+    fn name(&self) -> Option<Vec<u8>> {
+        None
     }
 }
 /// The file behind `[start, end)` of a private file mapping: the page at
@@ -1261,6 +1279,17 @@ impl AddressSpaceData {
             file.filter(|_| shared)
                 .map(|(source, _)| Arc::clone(source)),
         )
+    }
+
+    /// The file of the mapping at `addr` and the offset of `addr` in it:
+    /// a file mapping's own, or none ([`MappedFile::source`]) for shared
+    /// anonymous memory, whose offset counts from where it was made.
+    fn mapped_file(&self, addr: u64) -> Option<(Option<Arc<dyn PageSource>>, u64)> {
+        if let Some((source, offset)) = self.file_at(addr) {
+            return Some((Some(Arc::clone(source)), offset));
+        }
+        self.shared_at(addr)
+            .map(|shared| (None, addr.wrapping_add(shared.shift)))
     }
 
     /// Reads guest memory (any mapped page is readable on x86).
@@ -2061,12 +2090,13 @@ impl AddressSpace {
                     })
             })
             .filter(|(page, _)| *page >= addr.0 && *page < end)
+            .map(|(page, frame)| (page - addr.0, frame))
             .collect();
         data.shared.insert(
             addr.0,
             SharedMapping {
                 end,
-                shift: 0,
+                shift: 0u64.wrapping_sub(addr.0),
                 pages: SharedPages::with_frames(frames),
                 may_write: true,
             },
@@ -2170,6 +2200,16 @@ impl AddressSpace {
             linked: file.is_some_and(|source| source.linked()),
             ..state
         }
+    }
+    /// The file the mapping at `addr` maps, for a core's `NT_FILE` note.
+    pub fn mapped_file(&self, addr: GuestAddr) -> Option<MappedFile> {
+        let (source, offset) = self.locked().mapped_file(addr.0)?;
+        // Named with the lock released: the file's own state may take time.
+        Some(MappedFile {
+            name: source.as_ref().and_then(|source| source.name()),
+            source: source.is_some(),
+            offset,
+        })
     }
     /// A consistent mapping snapshot; borrowed entries cannot outlive the lock.
     pub fn mappings(&self) -> impl Iterator<Item = Mapping> {
@@ -3283,6 +3323,69 @@ mod tests {
             .back_with_cache(private, PAGE_SIZE, &pages, 0)
             .unwrap();
         assert!(!space.core_state(private).linked);
+    }
+
+    #[test]
+    fn a_mapping_names_its_file_and_where_it_lies_in_it() {
+        struct Named;
+        impl PageSource for Named {
+            fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+                Ok(buf.len())
+            }
+            fn name(&self) -> Option<Vec<u8>> {
+                Some(b"/data".to_vec())
+            }
+        }
+        let mut space = AddressSpace::new();
+        let file = space
+            .map(None, 2 * PAGE_SIZE, Prot::READ, MappingKind::File)
+            .unwrap();
+        space
+            .back_with_file(file, 2 * PAGE_SIZE, Arc::new(Named), 3 * PAGE_SIZE)
+            .unwrap();
+        let found = space.mapped_file(GuestAddr(file.0 + PAGE_SIZE)).unwrap();
+        assert_eq!(found.name.as_deref(), Some(&b"/data"[..]));
+        assert!(found.source);
+        assert_eq!(found.offset, 4 * PAGE_SIZE);
+        // Shared anonymous memory counts from where it was made, through a
+        // move, and keeps its contents.
+        let shared = space
+            .map_shared(
+                None,
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.mark_shared(shared, 2 * PAGE_SIZE).unwrap();
+        space.write(GuestAddr(shared.0 + PAGE_SIZE), &[7]).unwrap();
+        let moved = space
+            .remap_shared(
+                shared,
+                2 * PAGE_SIZE,
+                2 * PAGE_SIZE,
+                Remap {
+                    may_move: true,
+                    fixed: true,
+                    new_addr: GuestAddr(shared.0 - 16 * PAGE_SIZE),
+                    ..Remap::default()
+                },
+            )
+            .unwrap();
+        let found = space.mapped_file(GuestAddr(moved.0 + PAGE_SIZE)).unwrap();
+        assert_eq!(
+            (found.name, found.source, found.offset),
+            (None, false, PAGE_SIZE)
+        );
+        let mut byte = [0];
+        space
+            .read(GuestAddr(moved.0 + PAGE_SIZE), &mut byte)
+            .unwrap();
+        assert_eq!(byte, [7]);
+        let private = space
+            .map(None, PAGE_SIZE, Prot::READ, MappingKind::Anonymous)
+            .unwrap();
+        assert_eq!(space.mapped_file(private), None);
     }
 }
 

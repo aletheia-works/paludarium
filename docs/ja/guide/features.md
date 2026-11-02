@@ -583,8 +583,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     作業ディレクトリに `core` という名前の ELF のコアを書きます（モードは 0600 から
     umask を除いたもので、前のコアは置き換えます）。コアには、各スレッドのレジスタ
     （`NT_PRSTATUS`）、プロセス（`NT_PRPSINFO`）、致命的なシグナル（`NT_SIGINFO`）、
-    補助ベクトル、メモリが入ります。メモリは、Linux の `vma_dump_size` が既定の
-    `coredump_filter` で選ぶのと同じように選びます。private なマッピングは、その VMA の
+    補助ベクトル、マップしたファイル（`NT_FILE`）、メモリが入ります。`NT_FILE` は
+    ファイルをマップした VMA ごとにそのパスを示し、unlink されたファイルには
+    パスの後に `(deleted)` を付けます。共有の無名メモリは、Linux と同じく
+    `/dev/zero (deleted)` と示します。`NT_X86_XSTATE` ノートはありません。Linux は
+    XSAVE のない CPU では書かず、仮想 CPU には XSAVE がないからです。メモリは、
+    Linux の `vma_dump_size` が既定の `coredump_filter` で選ぶのと同じように
+    選びます。private なマッピングは、その VMA の
     ページが一度でも書かれていれば（Linux の `anon_vma`。分割、`MADV_DONTNEED`、`fork`
     の後も残り、VMA に併合されたマッピングも共有し、書き込める `MAP_POPULATE` や
     `MAP_LOCKED` のマッピングにも付きます）丸ごと入り、そうでなければ入りません。

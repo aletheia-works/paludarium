@@ -140,6 +140,26 @@ fn madv_dontneed_reads_the_data_segment_again_and_zeroes_its_bss() {
 }
 
 #[test]
+fn segments_map_the_executable_by_its_path_at_their_file_offsets() {
+    let mut fs = MemFs::new();
+    fs.add_file(GuestFile::new("/prog", simple_exec())).unwrap();
+    let mut mem = AddressSpace::new();
+    load(&fs, b"/prog", &start(&[], &[]), &mut mem).unwrap();
+    let file = |at: u64| mem.mapped_file(GuestAddr(at));
+    let code = file(0x401000).unwrap();
+    assert_eq!(code.name.as_deref(), Some(&b"/prog"[..]));
+    assert_eq!(code.offset, 0x1000);
+    // The data's page starts its page of the file, and the bss past it is
+    // anonymous memory.
+    assert_eq!(file(0x403000).unwrap().offset, 0x3000);
+    assert_eq!(file(0x404000), None);
+    // An image from memory has no path.
+    let mut mem = AddressSpace::new();
+    load_bytes(&simple_exec(), &start(&[], &[]), &mut mem).unwrap();
+    assert_eq!(mem.mapped_file(GuestAddr(0x401000)).unwrap().name, None);
+}
+
+#[test]
 fn segments_keep_only_the_part_of_the_executable_they_load() {
     let mut file = crate::testing::tiny_exec(&[0x90; 32], b"data");
     let loaded = file.len();

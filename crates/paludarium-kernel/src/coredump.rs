@@ -3,8 +3,10 @@
 //! directory of a process that a core-dumping signal ends, when the process
 //! is dumpable and its RLIMIT_CORE soft limit is at least one page. The core
 //! has one `PT_NOTE` segment (each thread's registers, the process, the
-//! fatal signal and the auxiliary vector) and one `PT_LOAD` segment per
-//! mapping, whose contents follow the default `coredump_filter`. A core
+//! fatal signal, the auxiliary vector and the mapped files) and one
+//! `PT_LOAD` segment per VMA, whose contents follow the default
+//! `coredump_filter`. It has no `NT_X86_XSTATE` note, as Linux writes none
+//! on a CPU without XSAVE, which the virtual CPU is. A core
 //! larger than the limit is cut there; it still counts as dumped, as Linux's
 //! binfmt_elf reports a core once it has started to write it.
 use crate::signals;
@@ -88,7 +90,8 @@ pub(crate) fn write(
         let vma = Mapping { start, length, ..m };
         segments.push((vma, dump_length(mem, &vma, first_elf == Some(start))));
     }
-    let notes = notes(dump, who, mem);
+    let vmas: Vec<Mapping> = segments.iter().map(|&(vma, _)| vma).collect();
+    let notes = notes(dump, who, mem, &files(mem, &vmas));
     let count = segments.len() + 1;
     let notes_offset = 64 + 56 * count as u64;
     let notes_size: u64 = notes.iter().map(|n| n.len() as u64).sum();
@@ -234,8 +237,9 @@ fn program_header(
 
 /// The notes, as Linux orders them: for each thread, the one that took the
 /// signal first, its `NT_PRSTATUS`; after the first thread's, `NT_PRPSINFO`,
-/// `NT_SIGINFO` and `NT_AUXV`; then the thread's `NT_FPREGSET`.
-fn notes(dump: &Dump, who: &Identity, mem: &AddressSpace) -> Vec<Vec<u8>> {
+/// `NT_SIGINFO`, `NT_AUXV` and `NT_FILE` (`files`); then the thread's
+/// `NT_FPREGSET`.
+fn notes(dump: &Dump, who: &Identity, mem: &AddressSpace, files: &[u8]) -> Vec<Vec<u8>> {
     let mut threads: Vec<&ThreadCore> = dump.threads.iter().collect();
     threads.sort_by_key(|t| (t.tid != dump.dumper, t.tid));
     let mut notes = Vec::new();
@@ -245,6 +249,7 @@ fn notes(dump: &Dump, who: &Identity, mem: &AddressSpace) -> Vec<Vec<u8>> {
             notes.push(note(b"CORE", 3, &prpsinfo(who, thread, mem)));
             notes.push(note(b"CORE", 0x5349_4749, &dump.siginfo));
             notes.push(note(b"CORE", 6, &auxv(who, mem)));
+            notes.push(note(b"CORE", 0x4649_4c45, files));
         }
         notes.push(note(b"CORE", 2, &fpregset(&thread.cpu)));
     }
@@ -373,6 +378,39 @@ fn arguments(who: &Identity, mem: &AddressSpace) -> Vec<u8> {
     args
 }
 
+/// The `NT_FILE` note of the VMAs that map a file, as Linux's
+/// `fill_files_note` lists them: their count, the page size, the start,
+/// end and page offset in its file of each, then their paths. Shared
+/// anonymous memory maps the file Linux names `/dev/zero (deleted)`.
+fn files(mem: &AddressSpace, vmas: &[Mapping]) -> Vec<u8> {
+    let mut count = 0u64;
+    let mut ranges = Vec::new();
+    let mut names = Vec::new();
+    for vma in vmas {
+        let Some(file) = mem.mapped_file(vma.start) else {
+            continue;
+        };
+        let name = match file.name {
+            Some(name) => name,
+            None if !file.source => b"/dev/zero (deleted)".to_vec(),
+            None => continue,
+        };
+        for value in [vma.start.0, vma.end(), file.offset / PAGE] {
+            ranges.extend_from_slice(&value.to_le_bytes());
+        }
+        names.extend_from_slice(&name);
+        names.push(0);
+        count += 1;
+    }
+    [
+        &count.to_le_bytes()[..],
+        &PAGE.to_le_bytes(),
+        &ranges,
+        &names,
+    ]
+    .concat()
+}
+
 /// The auxiliary vector from the initial stack, up to and with `AT_NULL`.
 fn auxv(who: &Identity, mem: &AddressSpace) -> Vec<u8> {
     let read = |at: u64| mem.read_u64(GuestAddr(at)).ok();
@@ -434,4 +472,49 @@ pub(crate) fn kernel_siginfo(state: &crate::ThreadState, signal: i32) -> [u8; 12
         state,
         &signals::PendingSignal::user(signal, signals::SI_KERNEL),
     )
+}
+
+#[cfg(test)]
+mod coredump_tests {
+    use super::*;
+    use paludarium_mmu::{PageSource, SharedPages};
+    use paludarium_types::Errno;
+    use std::sync::Arc;
+
+    struct Named;
+    impl PageSource for Named {
+        fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+            Ok(buf.len())
+        }
+        fn name(&self) -> Option<Vec<u8>> {
+            Some(b"/data".to_vec())
+        }
+    }
+
+    #[test]
+    fn the_files_note_lists_the_mappings_of_a_file() {
+        let mut mem = AddressSpace::new();
+        // Private anonymous memory maps no file.
+        mem.map(None, PAGE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        let file = mem
+            .map(None, 2 * PAGE, Prot::READ, MappingKind::File)
+            .unwrap();
+        let pages = SharedPages::new().with_source(Arc::new(Named));
+        mem.back_with_cache(file, 2 * PAGE, &pages, 2 * PAGE)
+            .unwrap();
+        let shared = mem
+            .map_shared(None, PAGE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        mem.mark_shared(shared, PAGE).unwrap();
+        let vmas: Vec<Mapping> = mem.mappings().collect();
+        assert_eq!(vmas.len(), 3);
+        let note = files(&mem, &vmas);
+        let word = |i: usize| u64::from_le_bytes(note[8 * i..8 * i + 8].try_into().unwrap());
+        assert_eq!((word(0), word(1)), (2, PAGE));
+        // Lowest first: the shared memory was placed last, below the rest.
+        assert_eq!((word(2), word(3), word(4)), (shared.0, shared.0 + PAGE, 0));
+        assert_eq!((word(5), word(6), word(7)), (file.0, file.0 + 2 * PAGE, 2));
+        assert_eq!(&note[64..], b"/dev/zero (deleted)\0/data\0");
+    }
 }

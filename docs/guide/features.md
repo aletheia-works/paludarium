@@ -623,27 +623,30 @@ kernel.
     and `sendfile`) stops at the soft limit; one that
     starts at or past it, and a `truncate`/`ftruncate` or `fallocate` that
     grows the file past it, raise `SIGXFSZ` and fail with `EFBIG`.
-  - `RLIMIT_CORE`: a process that a core-dumping signal (`SIGSEGV`,
-    `SIGABRT`, ...) ends writes an ELF core named `core` in its working
-    directory (mode 0600 less the umask, replacing an old one), as Linux's
-    `do_coredump` does with the default `core_pattern`, when the soft limit
-    is at least a page and `PR_SET_DUMPABLE` has not turned dumping off. The
-    core has each thread's registers (`NT_PRSTATUS`), the process
-    (`NT_PRPSINFO`), the fatal signal (`NT_SIGINFO`), the auxiliary vector
-    and the memory, chosen as Linux's `vma_dump_size` chooses it with the
-    default `coredump_filter`: a private mapping is there whole once a page
-    of its VMA was written (Linux's `anon_vma`, which a split,
-    `MADV_DONTNEED` and `fork` keep, a mapping merging with the VMA shares,
-    and `MAP_POPULATE` or `MAP_LOCKED` gives a writable one), and nothing of
-    it otherwise, but the first page of a file mapping from the start of an
-    ELF file; a shared mapping is there whole when no name links its file
-    (an anonymous one, a memfd, a file unlinked since), and nothing of it
-    otherwise. Whether a mapping can be read matters only for that ELF
-    header's page: Linux reads the others whatever their protection.
-    Each VMA is one segment, with the adjacent mappings merged into it.
-    `wait` then reports `CLD_DUMPED` and the core flag. A core larger than
-    the limit is cut there and still reported as dumped, as Linux reports a
-    core once it has started to write it.
+  - `RLIMIT_CORE`: a process that a core-dumping signal (`SIGSEGV`, `SIGABRT`,
+    ...) ends writes an ELF core named `core` in its working directory (mode
+    0600 less the umask, replacing an old one), as Linux's `do_coredump` does
+    with the default `core_pattern`, when the soft limit is at least a page
+    and `PR_SET_DUMPABLE` has not turned dumping off. The core has each
+    thread's registers (`NT_PRSTATUS`), the process (`NT_PRPSINFO`), the fatal
+    signal (`NT_SIGINFO`), the auxiliary vector, the mapped files (`NT_FILE`:
+    each VMA that maps a file, by its path, followed by `(deleted)` once
+    unlinked, and shared anonymous memory as `/dev/zero (deleted)`, as Linux
+    names it) and the memory. It has no `NT_X86_XSTATE` note, as Linux writes
+    none on a CPU without XSAVE, which the virtual CPU is. The memory is
+    chosen as Linux's `vma_dump_size` chooses it with the default
+    `coredump_filter`: a private mapping is there whole once a page of its VMA
+    was written (Linux's `anon_vma`, which a split, `MADV_DONTNEED` and `fork`
+    keep, a mapping merging with the VMA shares, and `MAP_POPULATE` or
+    `MAP_LOCKED` gives a writable one), and nothing of it otherwise, but the
+    first page of a file mapping from the start of an ELF file; a shared
+    mapping is there whole when no name links its file (an anonymous one, a
+    memfd, a file unlinked since), and nothing of it otherwise. Whether a
+    mapping can be read matters only for that ELF header's page: Linux reads
+    the others whatever their protection. Each VMA is one segment, with the
+    adjacent mappings merged into it. `wait` then reports `CLD_DUMPED` and the
+    core flag. A core larger than the limit is cut there and still reported as
+    dumped, as Linux reports a core once it has started to write it.
 
   Process groups and sessions are kept the same way, and `wait4` and
   `waitid` can wait for a group. The first process's session started outside

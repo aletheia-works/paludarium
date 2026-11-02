@@ -158,10 +158,12 @@ impl FileCache {
     /// The pages for a new mapping of `[offset, offset+len)` of `file`, with
     /// the pages of the file's first `size` bytes filled from it where the
     /// cache has none. A mapping that `may_write` keeps `file` to write the
-    /// pages back through, unless the cache has a handle already.
+    /// pages back through, unless the cache has a handle already. `name` is
+    /// the file's path ([`FilePages`]).
     pub(crate) fn map(
         self: &Arc<Self>,
         file: &Arc<dyn FileHandle>,
+        name: Vec<u8>,
         offset: u64,
         len: u64,
         may_write: bool,
@@ -186,17 +188,21 @@ impl FileCache {
             cache: Arc::clone(self),
             writable: may_write,
         }));
-        Ok(mapped.with_source(FilePages::new(file, self)))
+        Ok(mapped.with_source(FilePages::new(file, name, self)))
     }
-    /// The pages for a new private mapping of `file`, which reads them from
-    /// the file on first touch.
-    pub(crate) fn map_private(self: &Arc<Self>, file: &Arc<dyn FileHandle>) -> SharedPages {
+    /// The pages for a new private mapping of `file`, named `name`, which
+    /// reads them from the file on first touch.
+    pub(crate) fn map_private(
+        self: &Arc<Self>,
+        file: &Arc<dyn FileHandle>,
+        name: Vec<u8>,
+    ) -> SharedPages {
         self.pages
             .with_owner(Arc::new(Mapped {
                 cache: Arc::clone(self),
                 writable: false,
             }))
-            .with_source(FilePages::new(file, self))
+            .with_source(FilePages::new(file, name, self))
     }
     /// Whether a mapping that may write shows the cache.
     pub(crate) fn mapped_writable(&self) -> bool {
@@ -250,17 +256,23 @@ impl FileCache {
 }
 
 /// A mapped file as the MMU reads it ([`paludarium_mmu::PageSource`]), with
-/// the size its page cache keeps.
+/// the size its page cache keeps and the path it was mapped by.
 pub(crate) struct FilePages {
     file: Arc<dyn FileHandle>,
     cache: Arc<FileCache>,
+    name: Vec<u8>,
 }
 
 impl FilePages {
-    pub(crate) fn new(file: &Arc<dyn FileHandle>, cache: &Arc<FileCache>) -> Arc<Self> {
+    pub(crate) fn new(
+        file: &Arc<dyn FileHandle>,
+        name: Vec<u8>,
+        cache: &Arc<FileCache>,
+    ) -> Arc<Self> {
         Arc::new(FilePages {
             file: Arc::clone(file),
             cache: Arc::clone(cache),
+            name,
         })
     }
 }
@@ -286,6 +298,15 @@ impl paludarium_mmu::PageSource for FilePages {
     }
     fn linked(&self) -> bool {
         self.file.stat().map_or(true, |stat| stat.links > 0)
+    }
+    /// Its path, marked ` (deleted)` once no name links it, as Linux's
+    /// `d_path` marks it.
+    fn name(&self) -> Option<Vec<u8>> {
+        let mut name = self.name.clone();
+        if !self.linked() {
+            name.extend_from_slice(b" (deleted)");
+        }
+        Some(name)
     }
 }
 

@@ -2924,7 +2924,7 @@ fn current_path(c: &Context<'_>, d: &Descriptor, inode: u64) -> Option<Vec<u8>> 
 /// What a link in `/proc/self/fd` reads: the path of a file on a mount
 /// (marked ` (deleted)` once removed), `pipe:[<inode>]`, `socket:[<inode>]`,
 /// `anon_inode:[<kind>]` for a file of no type, or a memfd's own name.
-fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
+pub(crate) fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     let any = d.file.as_any();
     if let Some(memfd) = any.and_then(|v| v.downcast_ref::<crate::memfd::Memfd>()) {
         return Ok(memfd.link_target());

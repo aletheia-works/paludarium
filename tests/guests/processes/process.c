@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
+#include <cpuid.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <link.h>
 #include <signal.h>
 #include <poll.h>
 #include <setjmp.h>
@@ -1049,6 +1051,41 @@ static void core_report(const char *name, pid_t pid) {
     printf(" statuses=%d magic=%d\n", statuses, magic);
     fflush(stdout);
     free(b);
+}
+/* The entry of the NT_FILE note at `files` that maps `x`: its name, with
+   its range and page offset, or NULL. */
+static const char *file_entry(uint64_t files, uint64_t x, uint64_t *start, uint64_t *end,
+                              uint64_t *pgoff) {
+    if (!files) return NULL;
+    uint64_t count = le(files, 8);
+    const char *name = (const char *)core_bytes + files + 16 + 24 * count;
+    for (uint64_t k = 0; k < count && (const unsigned char *)name < core_bytes + core_size; k++) {
+        uint64_t e = files + 16 + 24 * k;
+        if (x >= le(e, 8) && x < le(e + 8, 8)) {
+            *start = le(e, 8), *end = le(e + 8, 8), *pgoff = le(e + 16, 8);
+            return name;
+        }
+        name += strlen(name) + 1;
+    }
+    return NULL;
+}
+static int same_path(const char *a, const char *b) {
+    struct stat x, y;
+    return stat(a, &x) == 0 && stat(b, &y) == 0 && x.st_dev == y.st_dev && x.st_ino == y.st_ino;
+}
+/* Where the program's segment that holds its code starts, and its page in
+   the program's file. */
+static uint64_t text_start, text_pgoff;
+static int text_segment(struct dl_phdr_info *info, size_t size, void *unused) {
+    (void)size, (void)unused;
+    uint64_t at = (uintptr_t)&text_segment;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *h = &info->dlpi_phdr[i];
+        uint64_t v = info->dlpi_addr + h->p_vaddr;
+        if (h->p_type == PT_LOAD && at >= v && at < v + h->p_memsz)
+            text_start = v & ~4095ULL, text_pgoff = h->p_offset / 4096;
+    }
+    return 1;
 }
 static void finish(pid_t pid) {
     int status = 0;
@@ -6338,8 +6375,14 @@ int main(int argc, char **argv) {
            unlinked since), and nothing of it otherwise, written or not.
            None of this asks whether the mapping can be read, as Linux reads
            it with FOLL_FORCE; only an ELF header's page does. Each VMA is
-           one segment, mappings merged into it too.
-           Each mapping lies between
+           one segment, mappings merged into it too. The NT_FILE note, right
+           after NT_AUXV, names the file of each VMA that maps one and its
+           page there: a file by its path, marked " (deleted)" once
+           unlinked, a memfd by its name, shared anonymous memory as
+           /dev/zero (deleted), and the program's own segments the program.
+           NT_X86_XSTATE follows NT_PRFPREG when the CPU has XSAVE, enabled
+           (OSXSAVE), as large as CPUID leaf 0xd gives, and is left out
+           otherwise. Each mapping lies between
            PROT_NONE pages, so that none merges with another but the one
            placed to. */
         char dir[] = "/tmp/core-XXXXXX";
@@ -6450,6 +6493,52 @@ int main(int argc, char **argv) {
             if (v == (uintptr_t)at[4] && m == 2 * (uint64_t)page) split = 1;
         }
         printf("segments: merged-whole=%d split-whole=%d\n", merged, split);
+        unsigned eax, ebx, ecx, edx, xsave_size = 0;
+        __cpuid(1, eax, ebx, ecx, edx);
+        int osxsave = ecx >> 27 & 1;
+        if (osxsave) __cpuid_count(0xd, 0, eax, xsave_size, ecx, edx);
+        uint64_t files = 0;
+        int after_auxv = 0, xstate = 0, xstate_whole = 0;
+        for (int k = 0; k < (int)le(56, 2); k++) {
+            uint64_t h = le(32, 8) + 56 * (uint64_t)k, offset = le(h + 8, 8), filesz = le(h + 32, 8);
+            if (le(h, 4) != 4) continue;
+            uint64_t previous = 0;
+            for (uint64_t q = offset; q + 12 <= offset + filesz && q + 12 <= core_size;) {
+                uint64_t namesz = le(q, 4), descsz = le(q + 4, 4), type = le(q + 8, 4);
+                uint64_t desc = q + 12 + ((namesz + 3) & ~3ULL);
+                if (type == 0x46494c45 && !files) files = desc, after_auxv = previous == 6;
+                if (type == 0x202 && !xstate++)
+                    xstate_whole = previous == 2 && descsz == xsave_size && namesz == 6 &&
+                                   !memcmp(core_bytes + q + 12, "LINUX", 6);
+                previous = type;
+                q = desc + ((descsz + 3) & ~3ULL);
+            }
+        }
+        printf("files: page=%llu after-auxv=%d\n", (unsigned long long)le(files + 8, 8), after_auxv);
+        char cwd[PATH_MAX], data_path[PATH_MAX + 8], gone_path[PATH_MAX + 24];
+        if (!getcwd(cwd, sizeof cwd)) return 88;
+        snprintf(data_path, sizeof data_path, "%s/data", cwd);
+        snprintf(gone_path, sizeof gone_path, "%s/gone (deleted)", cwd);
+        for (int i = 0; i < COUNT; i++) {
+            const char *want = i == 6 || i == 7 || i == 13 ? data_path
+                               : i == 14                   ? gone_path
+                               : i == 15                   ? "/memfd:core (deleted)"
+                               : i == 12 || i == 17        ? "/dev/zero (deleted)"
+                               : i == 8 || i == 18         ? self
+                                                           : NULL;
+            uint64_t start = 0, end = 0, pgoff = 0;
+            const char *name = file_entry(files, (uintptr_t)at[i], &start, &end, &pgoff);
+            int same = name && want && start == (uintptr_t)at[i] &&
+                       end == (uintptr_t)at[i] + 2 * page && pgoff == 0 &&
+                       (want == self ? same_path(name, self) : !strcmp(name, want));
+            printf("%s: file=%d\n", names[i], !name ? 0 : same ? 1 : 2);
+        }
+        dl_iterate_phdr(text_segment, NULL);
+        uint64_t start = 0, end = 0, pgoff = 0;
+        const char *name = file_entry(files, (uintptr_t)&text_segment, &start, &end, &pgoff);
+        printf("program: file=%d\n", name && start == text_start && pgoff == text_pgoff &&
+                                          same_path(name, (const char *)getauxval(AT_EXECFN)));
+        printf("xstate: as-cpu=%d\n", osxsave ? xstate == 1 && xstate_whole : !xstate);
 #undef CORE_HOLDS
         free(b);
         unlink("core");

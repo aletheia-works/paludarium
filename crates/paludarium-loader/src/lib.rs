@@ -136,15 +136,27 @@ impl SegmentImage {
         }
     }
 }
-impl PageSource for SegmentImage {
+/// A segment's file pages where they lie in the executable, which a core's
+/// `NT_FILE` note names by its path.
+struct SegmentFile {
+    image: SegmentImage,
+    /// The file offset of the segment's first page.
+    offset: u64,
+    name: Option<Arc<[u8]>>,
+}
+impl PageSource for SegmentFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
-        let rest = usize::try_from(offset)
-            .ok()
-            .and_then(|at| self.bytes().get(at..))
+        let rest = offset
+            .checked_sub(self.offset)
+            .and_then(|at| usize::try_from(at).ok())
+            .and_then(|at| self.image.bytes().get(at..))
             .unwrap_or_default();
         let n = rest.len().min(buf.len());
         buf[..n].copy_from_slice(&rest[..n]);
         Ok(n)
+    }
+    fn name(&self) -> Option<Vec<u8>> {
+        self.name.as_deref().map(<[u8]>::to_vec)
     }
 }
 
@@ -152,10 +164,11 @@ impl PageSource for SegmentImage {
 /// hold file data are a private file mapping, and the rest of the segment
 /// (bss) anonymous memory. A segment remembers its file pages, so that
 /// `MADV_DONTNEED` reads them again, also a read-only one that `mprotect`
-/// made writable and that was written. Returns the load base and the end of
-/// the highest segment.
+/// made writable and that was written, at its offset in the file `name`.
+/// Returns the load base and the end of the highest segment.
 fn map_segments(
     bytes: &[u8],
+    name: Option<&[u8]>,
     info: &ElfInfo,
     mem: &mut AddressSpace,
 ) -> Result<(u64, u64), LoadError> {
@@ -166,6 +179,7 @@ fn map_segments(
     };
     let mut highest = 0u64;
     let file = loaded_span(bytes, info);
+    let name: Option<Arc<[u8]>> = name.map(Arc::from);
     for h in info.loads() {
         let start = base
             .checked_add(h.vaddr)
@@ -213,11 +227,19 @@ fn map_segments(
         mem.write_initial(GuestAddr(start), data)
             .map_err(|_| LoadError::Errno(Errno::EFAULT))?;
         if file_end.0 > page_start.0 {
+            let head = start - page_start.0;
+            // Where Linux maps the segment's first page from.
+            let offset = h.offset.saturating_sub(head) & !(PAGE_SIZE - 1);
+            let source = SegmentFile {
+                image: file_pages(&file, h, head, data),
+                offset,
+                name: name.clone(),
+            };
             mem.back_with_file(
                 page_start,
                 file_end.0 - page_start.0,
-                Arc::new(file_pages(&file, h, start - page_start.0, data)),
-                0,
+                Arc::new(source),
+                offset,
             )
             .map_err(LoadError::Errno)?;
         }
@@ -416,7 +438,7 @@ pub fn load(
             LoadError::Errno(e)
         }
     })?;
-    load_bytes(&bytes, start, mem)
+    load_image(&bytes, Some(path), start, mem)
 }
 
 /// Loads an ELF image from memory.
@@ -425,8 +447,18 @@ pub fn load_bytes(
     start: &StartInfo<'_>,
     mem: &mut AddressSpace,
 ) -> Result<LoadedImage, LoadError> {
+    load_image(bytes, None, start, mem)
+}
+
+/// Loads an ELF image, read from the file `name` if it has one.
+fn load_image(
+    bytes: &[u8],
+    name: Option<&[u8]>,
+    start: &StartInfo<'_>,
+    mem: &mut AddressSpace,
+) -> Result<LoadedImage, LoadError> {
     let info = elf::parse(bytes)?;
-    let (base, highest) = map_segments(bytes, &info, mem)?;
+    let (base, highest) = map_segments(bytes, name, &info, mem)?;
     let initial_break = GuestAddr(highest)
         .page_align_up()
         .ok_or(LoadError::Malformed("segment address overflow"))?;

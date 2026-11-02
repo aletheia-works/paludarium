@@ -162,9 +162,7 @@ verified.
   `core_pattern` (`core` in the working directory); a host that pipes cores to
   a crash handler (systemd-coredump, apport) is not modelled. The core holds
   the registers, the fatal signal, the auxiliary vector and the memory, but
-  not every note Linux writes (`NT_FILE`, `NT_X86_XSTATE`). Each mapping
-  is a segment of its own, where Linux writes one for each VMA, which may
-  hold adjacent mappings merged.
+  not every note Linux writes (`NT_FILE`, `NT_X86_XSTATE`).
 - **Memory limit**: a write beyond the limit ends the process that made it,
   where Linux's OOM killer picks the process using the most memory.
 - **A native JIT**: only the WebAssembly build has a JIT; native builds use the

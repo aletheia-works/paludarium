@@ -74,10 +74,20 @@ pub(crate) fn write(
         .iter()
         .find(|m| m.kind == MappingKind::ElfSegment)
         .map(|m| m.start);
-    let segments: Vec<(Mapping, u64)> = mappings
-        .iter()
-        .map(|&m| (m, dump_length(mem, &m, first_elf == Some(m.start))))
-        .collect();
+    // One segment for each Linux VMA, which may hold adjacent mappings
+    // merged, as Linux writes one for each.
+    let mut segments: Vec<(Mapping, u64)> = Vec::new();
+    for &m in &mappings {
+        if segments
+            .last()
+            .is_some_and(|(vma, _)| m.start.0 < vma.end())
+        {
+            continue;
+        }
+        let (start, length) = mem.vma_at(m.start).unwrap_or((m.start, m.length));
+        let vma = Mapping { start, length, ..m };
+        segments.push((vma, dump_length(mem, &vma, first_elf == Some(start))));
+    }
     let notes = notes(dump, who, mem);
     let count = segments.len() + 1;
     let notes_offset = 64 + 56 * count as u64;

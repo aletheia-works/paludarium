@@ -6337,7 +6337,8 @@ int main(int argc, char **argv) {
            when its file has no name (an anonymous one, a memfd, a file
            unlinked since), and nothing of it otherwise, written or not.
            None of this asks whether the mapping can be read, as Linux reads
-           it with FOLL_FORCE; only an ELF header's page does.
+           it with FOLL_FORCE; only an ELF header's page does. Each VMA is
+           one segment, mappings merged into it too.
            Each mapping lies between
            PROT_NONE pages, so that none merges with another but the one
            placed to. */
@@ -6439,6 +6440,16 @@ int main(int argc, char **argv) {
             if (le(h, 4) == 1 && x >= v && x < v + f) byte = core_bytes[le(h + 8, 8) + (x - v)];
         }
         printf("unreadable-written: byte=%#x\n", byte);
+        /* One segment for each VMA: the merged mapping shares the written
+           one's, and the split one, two VMAs, has two. */
+        int merged = 0, split = 0;
+        for (int k = 0; k < (int)le(56, 2); k++) {
+            uint64_t h = le(32, 8) + 56 * (uint64_t)k, v = le(h + 16, 8), m = le(h + 40, 8);
+            if (le(h, 4) != 1) continue;
+            if (v == (uintptr_t)at[2] && m == 4 * (uint64_t)page) merged = 1;
+            if (v == (uintptr_t)at[4] && m == 2 * (uint64_t)page) split = 1;
+        }
+        printf("segments: merged-whole=%d split-whole=%d\n", merged, split);
 #undef CORE_HOLDS
         free(b);
         unlink("core");

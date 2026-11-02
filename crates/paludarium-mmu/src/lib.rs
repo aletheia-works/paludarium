@@ -2155,6 +2155,13 @@ impl AddressSpace {
     pub fn mark_written(&self, addr: GuestAddr, len: u64) {
         self.locked().mark_written(addr, len);
     }
+    /// The start and length of the Linux VMA holding `addr`: the mapping
+    /// there and the adjacent ones Linux would have merged with it.
+    pub fn vma_at(&self, addr: GuestAddr) -> Option<(GuestAddr, u64)> {
+        self.locked()
+            .region_at(addr.0)
+            .map(|(start, end)| (GuestAddr(start), end - start))
+    }
     /// The core dump's view of the Linux VMA at `addr` ([`CoreState`]).
     pub fn core_state(&self, addr: GuestAddr) -> CoreState {
         let (state, file) = self.locked().core_state(addr.0);
@@ -3173,6 +3180,29 @@ mod tests {
         assert!(!written(&space, 0x20000) && space.core_state(GuestAddr(0x20000)).shared);
         space.mark_written(GuestAddr(0x16000), PAGE_SIZE);
         assert!(written(&space, 0x16000));
+    }
+
+    #[test]
+    fn a_vma_spans_the_adjacent_mappings_linux_merges() {
+        let mut space = AddressSpace::new();
+        for (at, prot) in [
+            (0x10000, Prot::READ_WRITE),
+            (0x11000, Prot::READ_WRITE),
+            (0x12000, Prot::READ),
+        ] {
+            space
+                .map(Some(GuestAddr(at)), PAGE_SIZE, prot, MappingKind::Anonymous)
+                .unwrap();
+        }
+        let whole = Some((GuestAddr(0x10000), 2 * PAGE_SIZE));
+        assert_eq!(space.vma_at(GuestAddr(0x10000)), whole);
+        assert_eq!(space.vma_at(GuestAddr(0x11000)), whole);
+        // Another protection is another VMA.
+        assert_eq!(
+            space.vma_at(GuestAddr(0x12000)),
+            Some((GuestAddr(0x12000), PAGE_SIZE))
+        );
+        assert_eq!(space.vma_at(GuestAddr(0x13000)), None);
     }
 
     #[test]

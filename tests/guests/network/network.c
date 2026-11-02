@@ -160,7 +160,10 @@ static int client(int port, int flags, int *result) {
 static int own_port_client(int port, int *result) {
     int fd = tcp(0);
     struct sockaddr_in any = to(0);
-    bind(fd, (void *)&any, sizeof any);
+    if (bind(fd, (void *)&any, sizeof any)) {
+        printf("bind failed errno=%d\n", errno);
+        exit(72);
+    }
     struct sockaddr_in a = to(port);
     errno = 0;
     *result = connect(fd, (void *)&a, sizeof a) ? errno : 0;

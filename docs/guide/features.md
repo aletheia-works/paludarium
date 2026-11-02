@@ -482,8 +482,8 @@ kernel.
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
   for this process's entries), followed by a space and `(deleted)` once
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
-  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]` or `[pidfd]` (the
-  name pidfs keeps since Linux 6.9), and
+  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]` or `[pidfd]` (an
+  anonymous inode's name, which pidfs, from Linux 6.9, still gives), and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
   own for it. Opening a link opens the file again by its path, or, for a
   file no path names any more (removed, or renamed away), the same file
@@ -667,8 +667,10 @@ kernel.
   does not join the parent's children's, and with `SIGCHLD` ignored no
   `SIGCHLD` is queued, even while blocked. A zombie from before stays for a
   wait. A pidfd from `pidfd_open` has pidfs's mode 0700 in `fstat`, with
-  no file type, and becomes readable when its process exits (and hung up once it is reaped; an
-  automatically reaped child shows both at once), so `epoll` can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives `EAGAIN`.
+  no file type, and becomes readable when its process exits (and hung up
+  once it is reaped; an automatically reaped child shows both at once), so
+  `epoll` can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives
+  `EAGAIN`.
   `pidfd_send_signal` takes no siginfo and no scope flags, and `PIDFD_THREAD`
   still names the whole process.
 - Invalid pointers return `EFAULT`.

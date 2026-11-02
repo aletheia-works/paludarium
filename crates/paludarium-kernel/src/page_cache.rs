@@ -284,6 +284,9 @@ impl paludarium_mmu::PageSource for FilePages {
         let first = shrinks.partition_point(|&(after, _)| after <= count);
         shrinks.get(first).map(|&(_, size)| size)
     }
+    fn linked(&self) -> bool {
+        self.file.stat().map_or(true, |stat| stat.links > 0)
+    }
 }
 
 /// Where a file handle's device comes from.

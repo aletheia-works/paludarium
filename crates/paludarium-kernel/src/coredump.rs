@@ -149,10 +149,10 @@ pub(crate) fn write(
 /// (0x33): a private mapping whole once a page of its VMA was written (its
 /// `anon_vma`, as Linux's `vma_dump_size` asks), else only the first page
 /// of a file mapping from the start of an ELF file (its header); a shared
-/// anonymous mapping whole, and here a writable shared file mapping too
-/// (Linux, only of a file no name links); the stack, a writable ELF segment
-/// and the first page of the ELF image; nothing of a mapping that cannot be
-/// read.
+/// mapping whole when no name links its file (an anonymous one, a memfd, a
+/// file unlinked since), else nothing of it; the stack, a writable ELF
+/// segment and the first page of the ELF image; nothing of a mapping that
+/// cannot be read.
 fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
     if !mapping.prot.contains(Prot::READ) {
         return 0;
@@ -166,11 +166,7 @@ fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
         _ => {
             let state = mem.core_state(mapping.start);
             if state.shared {
-                if mapping.kind == MappingKind::Anonymous || writable {
-                    mapping.length
-                } else {
-                    0
-                }
+                if state.linked { 0 } else { mapping.length }
             } else if state.written {
                 mapping.length
             } else if mapping.kind == MappingKind::File

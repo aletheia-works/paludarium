@@ -110,6 +110,9 @@ pub struct CoreState {
     pub written: bool,
     /// The VMA is a shared mapping.
     pub shared: bool,
+    /// The VMA is a shared mapping of a file that a name links
+    /// ([`PageSource::linked`]); a shared anonymous one maps none.
+    pub linked: bool,
     /// Where in its file a file mapping starts.
     pub file_offset: Option<u64>,
 }
@@ -534,6 +537,11 @@ pub trait PageSource: Send + Sync {
     fn shrunk_since(&self, count: u64) -> Option<u64> {
         let _ = count;
         None
+    }
+    /// Whether a name links the file: a core holds a shared mapping of one
+    /// that none does (Linux's `i_nlink`), as of a memfd.
+    fn linked(&self) -> bool {
+        true
     }
 }
 /// The file behind `[start, end)` of a private file mapping: the page at
@@ -1231,15 +1239,25 @@ impl AddressSpaceData {
     /// The core dump's view of the Linux VMA at `addr`: written when any
     /// mapping of it is, as Linux gives a merged VMA the `anon_vma` of the
     /// one that had it.
-    fn core_state(&self, addr: u64) -> CoreState {
+    /// The core state at `addr` but [`CoreState::linked`], and the file of
+    /// a shared mapping there, which tells that.
+    fn core_state(&self, addr: u64) -> (CoreState, Option<Arc<dyn PageSource>>) {
         let written = self
             .region_at(addr)
             .is_some_and(|(first, last)| self.mappings.range(first..last).any(|(_, m)| m.written));
-        CoreState {
+        let shared = self.shared_at(addr).is_some();
+        let file = self.file_at(addr);
+        let state = CoreState {
             written,
-            shared: self.shared_at(addr).is_some(),
-            file_offset: self.file_at(addr).map(|(_, offset)| offset),
-        }
+            shared,
+            linked: false,
+            file_offset: file.map(|(_, offset)| offset),
+        };
+        (
+            state,
+            file.filter(|_| shared)
+                .map(|(source, _)| Arc::clone(source)),
+        )
     }
 
     /// Reads guest memory (any mapped page is readable on x86).
@@ -2131,7 +2149,12 @@ impl AddressSpace {
     }
     /// The core dump's view of the Linux VMA at `addr` ([`CoreState`]).
     pub fn core_state(&self, addr: GuestAddr) -> CoreState {
-        self.locked().core_state(addr.0)
+        let (state, file) = self.locked().core_state(addr.0);
+        // Asked with the lock released: the file's own state may take time.
+        CoreState {
+            linked: file.is_some_and(|source| source.linked()),
+            ..state
+        }
     }
     /// A consistent mapping snapshot; borrowed entries cannot outlive the lock.
     pub fn mappings(&self) -> impl Iterator<Item = Mapping> {
@@ -3140,6 +3163,53 @@ mod tests {
         assert!(!written(&space, 0x12000) && !written(&space, 0x13000));
         space.write(GuestAddr(0x12000), &[1]).unwrap();
         assert!(!written(&space, 0x13000));
+    }
+
+    /// A file that no name links, as a memfd or one unlinked since.
+    struct Unlinked;
+    impl PageSource for Unlinked {
+        fn read_at(&self, _: u64, _: &mut [u8]) -> Result<usize, Errno> {
+            Ok(0)
+        }
+        fn linked(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_shared_mapping_is_linked_only_by_a_file_with_a_name() {
+        let mut space = AddressSpace::new();
+        let map = |space: &mut AddressSpace, source: Option<Arc<dyn PageSource>>| {
+            let kind = if source.is_some() {
+                MappingKind::File
+            } else {
+                MappingKind::Anonymous
+            };
+            let at = space.map_shared(None, PAGE_SIZE, Prot::READ, kind).unwrap();
+            match source {
+                Some(source) => {
+                    let pages = SharedPages::new().with_source(source);
+                    space.share_pages(at, PAGE_SIZE, &pages, 0, false).unwrap();
+                }
+                None => space.mark_shared(at, PAGE_SIZE).unwrap(),
+            }
+            space.core_state(at)
+        };
+        let named = map(&mut space, Some(Arc::new(Pattern(PAGE_SIZE))));
+        assert!(named.shared && named.linked);
+        let unlinked = map(&mut space, Some(Arc::new(Unlinked)));
+        assert!(unlinked.shared && !unlinked.linked);
+        let anonymous = map(&mut space, None);
+        assert!(anonymous.shared && !anonymous.linked);
+        // A private file mapping is not shared, and so not linked either.
+        let private = space
+            .map(None, PAGE_SIZE, Prot::READ, MappingKind::File)
+            .unwrap();
+        let pages = SharedPages::new().with_source(Arc::new(Pattern(PAGE_SIZE)));
+        space
+            .back_with_cache(private, PAGE_SIZE, &pages, 0)
+            .unwrap();
+        assert!(!space.core_state(private).linked);
     }
 }
 

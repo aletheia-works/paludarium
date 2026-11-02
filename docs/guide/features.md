@@ -636,7 +636,9 @@ kernel.
     `MADV_DONTNEED` and `fork` keep, a mapping merging with the VMA shares,
     and `MAP_POPULATE` or `MAP_LOCKED` gives a writable one), and nothing of
     it otherwise, but the first page of a file mapping from the start of an
-    ELF file. `wait` then reports `CLD_DUMPED` and the core flag. A
+    ELF file; a shared mapping is there whole when no name links its file
+    (an anonymous one, a memfd, a file unlinked since), and nothing of it
+    otherwise. `wait` then reports `CLD_DUMPED` and the core flag. A
     core larger than the limit is cut there and still reported as dumped, as
     Linux reports a core once it has started to write it.
 

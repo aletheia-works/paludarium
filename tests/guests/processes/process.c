@@ -6333,34 +6333,43 @@ int main(int argc, char **argv) {
            MADV_DONTNEED and fork, given to a mapping that merges with it,
            and made by populating a writable one), nothing of one only read
            or never touched, and of a private file mapping from the start of
-           an ELF file only that first page. Each mapping lies between
+           an ELF file only that first page. A shared mapping it holds whole
+           when its file has no name (an anonymous one, a memfd, a file
+           unlinked since), and nothing of it otherwise, written or not.
+           Each mapping lies between
            PROT_NONE pages, so that none merges with another but the one
            placed to. */
         char dir[] = "/tmp/core-XXXXXX";
         if (!mkdtemp(dir) || chdir(dir)) return 80;
         long page = 4096;
-        char *base = mmap(NULL, 64 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        char *base = mmap(NULL, 96 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (base == MAP_FAILED) return 81;
         int fd = open("data", O_CREAT | O_RDWR, 0644);
         char fill[3 * 4096];
         memset(fill, 'x', sizeof fill);
         if (fd < 0 || write(fd, fill, sizeof fill) != (long)sizeof fill) return 82;
         int exe = open(self, O_RDONLY);
-        if (exe < 0) return 83;
+        int gone = open("gone", O_CREAT | O_RDWR, 0644);
+        int memfd = memfd_create("core", 0);
+        if (exe < 0 || gone < 0 || write(gone, fill, sizeof fill) != (long)sizeof fill || memfd < 0 ||
+            ftruncate(memfd, 2 * page))
+            return 83;
         const char *names[] = {"untouched", "read", "written", "read-only", "split", "populated",
                                "file-untouched", "file-written", "elf", "dontneed", "merged",
-                               "child-written"};
-        enum { COUNT = 12 };
+                               "child-written", "shared-anonymous", "shared-file",
+                               "shared-unlinked", "shared-memfd"};
+        enum { COUNT = 16 };
         char *at[COUNT];
         for (int i = 0; i < COUNT; i++) {
             char *where = base + (1 + 5 * i) * page;
-            int prot = i == 3 || i == 8 ? PROT_READ : PROT_READ | PROT_WRITE;
-            int flags = MAP_PRIVATE | MAP_FIXED | (i == 6 || i == 7 || i == 8 ? 0 : MAP_ANONYMOUS) |
-                        (i == 5 ? MAP_POPULATE : 0);
+            int prot = i == 3 || i == 8 || i == 14 || i == 15 ? PROT_READ : PROT_READ | PROT_WRITE;
+            int file = i == 6 || i == 7 || i == 13 ? fd : i == 8 ? exe : i == 14 ? gone : i == 15 ? memfd : -1;
+            int flags = (i >= 12 ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED |
+                        (file < 0 ? MAP_ANONYMOUS : 0) | (i == 5 ? MAP_POPULATE : 0);
             /* The one to merge sits right after the written one, which it
                merges with, still before the next one's PROT_NONE page. */
             if (i == 10) where = at[2] + 2 * page;
-            at[i] = mmap(where, 2 * page, prot, flags, i == 8 ? exe : i == 6 || i == 7 ? fd : -1, 0);
+            at[i] = mmap(where, 2 * page, prot, flags, file, 0);
             if (at[i] != where) return 84;
         }
         volatile char sink = 0;
@@ -6371,6 +6380,8 @@ int main(int argc, char **argv) {
         at[7][0] = 1;
         at[9][0] = 1;
         if (madvise(at[9], 2 * page, MADV_DONTNEED)) return 86;
+        at[13][0] = 1;
+        if (unlink("gone")) return 86;
         (void)sink;
         pid_t pid = fork();
         if (pid == 0) {

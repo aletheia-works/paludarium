@@ -1215,6 +1215,8 @@ const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+const MAP_LOCKED: u64 = 0x2000;
+const MAP_POPULATE: u64 = 0x8000;
 
 fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4] as i32, a[5]);
@@ -1300,6 +1302,14 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 && let Err(error) = c.mem.mark_shared(a, len)
             {
                 return err(error);
+            }
+            // Linux populates a writable private mapping by writing it, which
+            // gives it an anon_vma (a core then writes it whole).
+            if flags & (MAP_POPULATE | MAP_LOCKED) != 0
+                && flags & MAP_SHARED == 0
+                && prot.contains(Prot::WRITE)
+            {
+                c.mem.mark_written(a, len);
             }
             ok(a.0)
         }

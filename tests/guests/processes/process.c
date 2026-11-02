@@ -6326,6 +6326,95 @@ int main(int argc, char **argv) {
         if (chdir("/") || rmdir(dir)) return 82;
         return 0;
     }
+    if (!strcmp(mode, "core-mappings")) {
+        /* Which mappings a core holds, by the default coredump_filter as
+           Linux's vma_dump_size applies it: a private mapping whole once a
+           page of its VMA was written (its anon_vma: kept through a split,
+           MADV_DONTNEED and fork, given to a mapping that merges with it,
+           and made by populating a writable one), nothing of one only read
+           or never touched, and of a private file mapping from the start of
+           an ELF file only that first page. Each mapping lies between
+           PROT_NONE pages, so that none merges with another but the one
+           placed to. */
+        char dir[] = "/tmp/core-XXXXXX";
+        if (!mkdtemp(dir) || chdir(dir)) return 80;
+        long page = 4096;
+        char *base = mmap(NULL, 64 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) return 81;
+        int fd = open("data", O_CREAT | O_RDWR, 0644);
+        char fill[3 * 4096];
+        memset(fill, 'x', sizeof fill);
+        if (fd < 0 || write(fd, fill, sizeof fill) != (long)sizeof fill) return 82;
+        int exe = open(self, O_RDONLY);
+        if (exe < 0) return 83;
+        const char *names[] = {"untouched", "read", "written", "read-only", "split", "populated",
+                               "file-untouched", "file-written", "elf", "dontneed", "merged",
+                               "child-written"};
+        enum { COUNT = 12 };
+        char *at[COUNT];
+        for (int i = 0; i < COUNT; i++) {
+            char *where = base + (1 + 5 * i) * page;
+            int prot = i == 3 || i == 8 ? PROT_READ : PROT_READ | PROT_WRITE;
+            int flags = MAP_PRIVATE | MAP_FIXED | (i == 6 || i == 7 || i == 8 ? 0 : MAP_ANONYMOUS) |
+                        (i == 5 ? MAP_POPULATE : 0);
+            /* The one to merge sits right after the written one, which it
+               merges with, still before the next one's PROT_NONE page. */
+            if (i == 10) where = at[2] + 2 * page;
+            at[i] = mmap(where, 2 * page, prot, flags, i == 8 ? exe : i == 6 || i == 7 ? fd : -1, 0);
+            if (at[i] != where) return 84;
+        }
+        volatile char sink = 0;
+        sink += at[1][page];
+        at[2][page] = 1;
+        at[4][page] = 1;
+        if (mprotect(at[4], page, PROT_READ)) return 85;
+        at[7][0] = 1;
+        at[9][0] = 1;
+        if (madvise(at[9], 2 * page, MADV_DONTNEED)) return 86;
+        (void)sink;
+        pid_t pid = fork();
+        if (pid == 0) {
+            struct rlimit r;
+            getrlimit(RLIMIT_CORE, &r);
+            r.rlim_cur = r.rlim_max;
+            setrlimit(RLIMIT_CORE, &r);
+            at[11][0] = 1;
+            *(volatile int *)0 = 1;
+            _exit(70);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        int core = open("core", O_RDONLY);
+        struct stat st;
+        if (core < 0 || fstat(core, &st)) {
+            printf("core=0 dumped=%d\n", WCOREDUMP(status) ? 1 : 0);
+            return 0;
+        }
+        unsigned char *b = calloc(st.st_size + 1, 1);
+        long size = 0, n;
+        while (b && size < st.st_size && (n = read(core, b + size, st.st_size - size)) > 0) size += n;
+        close(core);
+        core_bytes = b;
+        core_size = b ? (uint64_t)size : 0;
+        /* Whether the core holds the bytes at `p`, and whether a segment
+           covers it at all. */
+#define CORE_HOLDS(p, held, covered) do { held = covered = 0; \
+        for (int k = 0; k < (int)le(56, 2); k++) { uint64_t h = le(32, 8) + 56 * (uint64_t)k; \
+            uint64_t v = le(h + 16, 8), f = le(h + 32, 8), m = le(h + 40, 8), x = (uintptr_t)(p); \
+            if (le(h, 4) != 1 || x < v) continue; if (x < v + f) held = 1; if (x < v + m) covered = 1; } } while (0)
+        for (int i = 0; i < COUNT; i++) {
+            int first, second, covered, unused;
+            CORE_HOLDS(at[i], first, covered);
+            CORE_HOLDS(at[i] + page, second, unused);
+            printf("%s: first=%d second=%d covered=%d\n", names[i], first, second, covered);
+        }
+#undef CORE_HOLDS
+        free(b);
+        unlink("core");
+        unlink("data");
+        if (chdir("/") || rmdir(dir)) return 87;
+        return 0;
+    }
     if (!strcmp(mode, "sigqueue")) {
         /* sigqueue delivers its value with SI_QUEUE, and a realtime signal
            keeps every one. rt_sigqueueinfo takes the caller's siginfo as it

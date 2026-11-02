@@ -76,7 +76,7 @@ pub(crate) fn write(
         .map(|m| m.start);
     let segments: Vec<(Mapping, u64)> = mappings
         .iter()
-        .map(|&m| (m, dump_length(&m, first_elf == Some(m.start))))
+        .map(|&m| (m, dump_length(mem, &m, first_elf == Some(m.start))))
         .collect();
     let notes = notes(dump, who, mem);
     let count = segments.len() + 1;
@@ -146,21 +146,49 @@ pub(crate) fn write(
 }
 
 /// How much of a mapping the core holds, by the default `coredump_filter`
-/// (0x33): every anonymous mapping, a file mapping or ELF segment that is
-/// writable (whose pages the process may have copied), and the first page
-/// of the ELF image (its header); nothing of a mapping that cannot be read.
-fn dump_length(mapping: &Mapping, first_elf: bool) -> u64 {
+/// (0x33): a private mapping whole once a page of its VMA was written (its
+/// `anon_vma`, as Linux's `vma_dump_size` asks), else only the first page
+/// of a file mapping from the start of an ELF file (its header); a shared
+/// anonymous mapping whole, and here a writable shared file mapping too
+/// (Linux, only of a file no name links); the stack, a writable ELF segment
+/// and the first page of the ELF image; nothing of a mapping that cannot be
+/// read.
+fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
     if !mapping.prot.contains(Prot::READ) {
         return 0;
     }
+    let writable = mapping.prot.contains(Prot::WRITE);
     match mapping.kind {
-        MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap => mapping.length,
-        MappingKind::ElfSegment | MappingKind::File if mapping.prot.contains(Prot::WRITE) => {
-            mapping.length
-        }
+        MappingKind::Stack => mapping.length,
+        MappingKind::ElfSegment if writable => mapping.length,
         MappingKind::ElfSegment if first_elf => mapping.length.min(PAGE),
-        _ => 0,
+        MappingKind::ElfSegment => 0,
+        _ => {
+            let state = mem.core_state(mapping.start);
+            if state.shared {
+                if mapping.kind == MappingKind::Anonymous || writable {
+                    mapping.length
+                } else {
+                    0
+                }
+            } else if state.written {
+                mapping.length
+            } else if mapping.kind == MappingKind::File
+                && state.file_offset == Some(0)
+                && elf_header(mem, mapping.start)
+            {
+                mapping.length.min(PAGE)
+            } else {
+                0
+            }
+        }
     }
+}
+/// Whether the mapping at `at` starts with the ELF magic, as Linux's
+/// `dump_vma_snapshot` checks a file mapping that may be a library's.
+fn elf_header(mem: &AddressSpace, at: GuestAddr) -> bool {
+    let mut magic = [0u8; 4];
+    mem.read(at, &mut magic).is_ok() && magic == *b"\x7fELF"
 }
 
 fn header(count: usize) -> [u8; 64] {

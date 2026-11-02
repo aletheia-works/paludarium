@@ -96,6 +96,22 @@ pub struct Mapping {
     pub length: u64,
     pub prot: Prot,
     pub kind: MappingKind,
+    /// A page of it was written, or of the Linux VMA it was part of then:
+    /// Linux's `anon_vma`, which the VMA keeps through splits, `fork` and
+    /// `mremap`, and which a core dump writes a private mapping whole for.
+    pub written: bool,
+}
+
+/// What a core dump needs to know of the Linux VMA at an address
+/// ([`AddressSpace::core_state`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoreState {
+    /// A page of the VMA was written ([`Mapping::written`]).
+    pub written: bool,
+    /// The VMA is a shared mapping.
+    pub shared: bool,
+    /// Where in its file a file mapping starts.
+    pub file_offset: Option<u64>,
 }
 
 impl Mapping {
@@ -1139,15 +1155,19 @@ impl AddressSpaceData {
         Ok(())
     }
 
-    fn write_with(&self, addr: GuestAddr, buf: &[u8], access: Access) -> Result<(), Fault> {
+    /// Writes `buf` at `addr`; `true` when a page took its first write,
+    /// or the copy of a frame it shared.
+    fn write_with(&self, addr: GuestAddr, buf: &[u8], access: Access) -> Result<bool, Fault> {
         {
             let directory = self.read_directory();
             self.check(&directory, addr, buf.len(), access)?;
             let ready = |page: u64| {
-                lookup(&directory, page).is_some_and(|p| !p.cow && !self.may_be_truncated(page, p))
+                lookup(&directory, page).is_some_and(|p| {
+                    !p.cow && p.frame.get().is_some() && !self.may_be_truncated(page, p)
+                })
             };
             if chunks(addr, buf.len()).all(|(page, _, _)| ready(page)) {
-                return self.store(&directory, addr, buf);
+                return self.store(&directory, addr, buf).map(|()| false);
             }
         }
         // Populate the pages this write touches for the first time, and copy
@@ -1180,7 +1200,46 @@ impl AddressSpaceData {
                 });
             }
         }
-        self.store(&directory, addr, buf)
+        self.store(&directory, addr, buf).map(|()| true)
+    }
+
+    /// Marks the private mappings `[addr, addr+len)` touches written, each
+    /// with the whole Linux VMA it is part of ([`Mapping::written`]).
+    pub fn mark_written(&mut self, addr: GuestAddr, len: u64) {
+        let end = addr.0.saturating_add(len);
+        let mut at = addr.0;
+        while at < end {
+            let Some(m) = self.mapping_at(at).copied() else {
+                at = self
+                    .mappings
+                    .range(at..end)
+                    .next()
+                    .map_or(end, |(&start, _)| start);
+                continue;
+            };
+            if self.shared_at(m.start.0).is_none()
+                && let Some((first, last)) = self.region_at(m.start.0)
+            {
+                for (_, mapping) in self.mappings.range_mut(first..last) {
+                    mapping.written = true;
+                }
+            }
+            at = m.end();
+        }
+    }
+
+    /// The core dump's view of the Linux VMA at `addr`: written when any
+    /// mapping of it is, as Linux gives a merged VMA the `anon_vma` of the
+    /// one that had it.
+    fn core_state(&self, addr: u64) -> CoreState {
+        let written = self
+            .region_at(addr)
+            .is_some_and(|(first, last)| self.mappings.range(first..last).any(|(_, m)| m.written));
+        CoreState {
+            written,
+            shared: self.shared_at(addr).is_some(),
+            file_offset: self.file_at(addr).map(|(_, offset)| offset),
+        }
     }
 
     /// Reads guest memory (any mapped page is readable on x86).
@@ -1189,8 +1248,11 @@ impl AddressSpaceData {
     }
 
     /// Writes guest memory; requires `PROT_WRITE`.
-    pub fn write(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
-        self.write_with(addr, buf, Access::Write)
+    pub fn write(&mut self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
+        if self.write_with(addr, buf, Access::Write)? {
+            self.mark_written(addr, buf.len() as u64);
+        }
+        Ok(())
     }
 
     /// Fetches instruction bytes; requires `PROT_EXEC`.
@@ -1218,7 +1280,7 @@ impl AddressSpaceData {
     /// Writes ignoring page protection (pages must be mapped). Used by the
     /// loader to fill read-only segments and the initial stack.
     pub fn write_initial(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
-        self.write_with(addr, buf, Access::Setup)
+        self.write_with(addr, buf, Access::Setup).map(|_| ())
     }
 
     /// Reads a little-endian `u64`.
@@ -1229,7 +1291,7 @@ impl AddressSpaceData {
     }
 
     /// Writes a little-endian `u64`.
-    pub fn write_u64(&self, addr: GuestAddr, value: u64) -> Result<(), Fault> {
+    pub fn write_u64(&mut self, addr: GuestAddr, value: u64) -> Result<(), Fault> {
         self.write(addr, &value.to_le_bytes())
     }
 
@@ -1316,6 +1378,7 @@ impl AddressSpaceData {
                 length: end - start,
                 prot,
                 kind,
+                written: false,
             },
         );
         Ok(GuestAddr(start))
@@ -2055,6 +2118,15 @@ impl AddressSpace {
         }
         Some(execute())
     }
+    /// Marks `[addr, addr+len)` written, as Linux's write faults do when it
+    /// populates a writable private mapping ([`Mapping::written`]).
+    pub fn mark_written(&self, addr: GuestAddr, len: u64) {
+        self.locked().mark_written(addr, len);
+    }
+    /// The core dump's view of the Linux VMA at `addr` ([`CoreState`]).
+    pub fn core_state(&self, addr: GuestAddr) -> CoreState {
+        self.locked().core_state(addr.0)
+    }
     /// A consistent mapping snapshot; borrowed entries cannot outlive the lock.
     pub fn mappings(&self) -> impl Iterator<Item = Mapping> {
         self.locked()
@@ -2196,7 +2268,7 @@ impl AddressSpace {
         width: AtomicWidth,
         operation: AtomicOp,
     ) -> Result<AtomicResult, Fault> {
-        let data = self.locked();
+        let mut data = self.locked();
         let len = width.bytes();
         data.check(&data.read_directory(), addr, len, Access::Write)?;
         let mut bytes = [0u8; 16];
@@ -2972,6 +3044,63 @@ mod tests {
         assert_eq!(space.covers(GuestAddr(0x10000), 4096), Ok(true));
         assert_eq!(space.covers(GuestAddr(0x10000), 3 * 4096), Ok(false));
         assert_eq!(space.covers(GuestAddr(0x11000), 4096), Ok(false));
+    }
+
+    #[test]
+    fn a_vma_is_written_once_a_page_of_it_is() {
+        let written = |space: &AddressSpace, at: u64| space.core_state(GuestAddr(at)).written;
+        let space = space_with(0x10000, 4 * PAGE_SIZE, Prot::READ_WRITE);
+        let mut byte = [0u8];
+        space.read(GuestAddr(0x11000), &mut byte).unwrap();
+        assert!(!written(&space, 0x10000), "reading writes nothing");
+        space.write_initial(GuestAddr(0x10000), &[1]).unwrap();
+        assert!(
+            !written(&space, 0x10000),
+            "the loader's writes are not the process's"
+        );
+        space.write(GuestAddr(0x13000), &[1]).unwrap();
+        assert!(written(&space, 0x10000), "the whole VMA");
+        // A split keeps it in both parts, as Linux keeps the anon_vma.
+        space
+            .protect_shared(GuestAddr(0x10000), PAGE_SIZE, Prot::READ)
+            .unwrap();
+        assert!(written(&space, 0x10000) && written(&space, 0x13000));
+        // So does fork.
+        assert!(written(&space.fork(), 0x10000));
+        // A new mapping that merges with a written VMA is part of it; one
+        // that does not stays unwritten.
+        space
+            .map_shared(
+                Some(GuestAddr(0x14000)),
+                PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        assert!(written(&space, 0x14000));
+        space
+            .map_shared(
+                Some(GuestAddr(0x16000)),
+                PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        assert!(!written(&space, 0x16000));
+        // A shared mapping is not marked.
+        space
+            .map_shared(
+                Some(GuestAddr(0x20000)),
+                PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.mark_shared(GuestAddr(0x20000), PAGE_SIZE).unwrap();
+        space.write(GuestAddr(0x20000), &[1]).unwrap();
+        assert!(!written(&space, 0x20000) && space.core_state(GuestAddr(0x20000)).shared);
+        space.mark_written(GuestAddr(0x16000), PAGE_SIZE);
+        assert!(written(&space, 0x16000));
     }
 }
 

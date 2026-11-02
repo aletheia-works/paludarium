@@ -630,7 +630,13 @@ kernel.
     is at least a page and `PR_SET_DUMPABLE` has not turned dumping off. The
     core has each thread's registers (`NT_PRSTATUS`), the process
     (`NT_PRPSINFO`), the fatal signal (`NT_SIGINFO`), the auxiliary vector
-    and the memory. `wait` then reports `CLD_DUMPED` and the core flag. A
+    and the memory, chosen as Linux's `vma_dump_size` chooses it with the
+    default `coredump_filter`: a private mapping is there whole once a page
+    of its VMA was written (Linux's `anon_vma`, which a split,
+    `MADV_DONTNEED` and `fork` keep, a mapping merging with the VMA shares,
+    and `MAP_POPULATE` or `MAP_LOCKED` gives a writable one), and nothing of
+    it otherwise, but the first page of a file mapping from the start of an
+    ELF file. `wait` then reports `CLD_DUMPED` and the core flag. A
     core larger than the limit is cut there and still reported as dumped, as
     Linux reports a core once it has started to write it.
 

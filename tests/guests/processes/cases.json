@@ -48,6 +48,7 @@
     {"name":"kill-group","binary":"process"},
     {"name":"signal-sender","binary":"process"},
     {"name":"core-dump","binary":"process"},
+    {"name":"core-mappings","binary":"process"},
     {"name":"sigqueue","binary":"process"},
     {"name":"sparse","binary":"process"},
     {"name":"ignore-discards","binary":"process"},

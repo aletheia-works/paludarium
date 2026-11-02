@@ -1446,12 +1446,18 @@ impl AddressSpaceData {
     }
 
     /// Whether two mappings would be one Linux VMA when adjacent: the same
-    /// protection and kind, and both private or both the same shared memory.
+    /// protection and kind, and both the same shared memory, or both private
+    /// and of no file or of the same file at contiguous offsets, as Linux's
+    /// `vma_merge` asks for the same `vm_file` and following `vm_pgoff`.
     fn mergeable(&self, a: &Mapping, b: &Mapping) -> bool {
         a.prot == b.prot
             && a.kind == b.kind
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
-                (None, None) => true,
+                (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => Arc::ptr_eq(&x.source, &y.source) && x.shift == y.shift,
+                    _ => false,
+                },
                 (Some(x), Some(y)) => {
                     Arc::ptr_eq(&x.pages.frames, &y.pages.frames) && x.shift == y.shift
                 }
@@ -3101,6 +3107,39 @@ mod tests {
         assert!(!written(&space, 0x20000) && space.core_state(GuestAddr(0x20000)).shared);
         space.mark_written(GuestAddr(0x16000), PAGE_SIZE);
         assert!(written(&space, 0x16000));
+    }
+
+    #[test]
+    fn adjacent_private_file_mappings_are_one_vma_only_of_one_file_in_order() {
+        let written = |space: &AddressSpace, at: u64| space.core_state(GuestAddr(at)).written;
+        let one: Arc<dyn PageSource> = Arc::new(Pattern(8 * PAGE_SIZE));
+        let other: Arc<dyn PageSource> = Arc::new(Pattern(8 * PAGE_SIZE));
+        let space = AddressSpace::new();
+        // At 0x10000 page 0 of `one`; after it page 1 of `one` (the same
+        // VMA), page 3 of `one` (not in order) and page 4 of `other`.
+        for (at, source, offset) in [
+            (0x10000, &one, 0),
+            (0x11000, &one, PAGE_SIZE),
+            (0x12000, &one, 3 * PAGE_SIZE),
+            (0x13000, &other, 4 * PAGE_SIZE),
+        ] {
+            space
+                .map_shared(
+                    Some(GuestAddr(at)),
+                    PAGE_SIZE,
+                    Prot::READ_WRITE,
+                    MappingKind::File,
+                )
+                .unwrap();
+            space
+                .back_with_file(GuestAddr(at), PAGE_SIZE, Arc::clone(source), offset)
+                .unwrap();
+        }
+        space.write(GuestAddr(0x10000), &[1]).unwrap();
+        assert!(written(&space, 0x10000) && written(&space, 0x11000));
+        assert!(!written(&space, 0x12000) && !written(&space, 0x13000));
+        space.write(GuestAddr(0x12000), &[1]).unwrap();
+        assert!(!written(&space, 0x13000));
     }
 }
 

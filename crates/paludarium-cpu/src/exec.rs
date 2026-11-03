@@ -60,6 +60,79 @@ pub(crate) fn is_comparison_string(m: Mnemonic) -> bool {
             | Mnemonic::Scasq
     )
 }
+/// Whether `i` leaves the vector state (`xmm` and `mxcsr`) alone: a
+/// general-purpose instruction, whose handler below never reaches the
+/// vector code, without an `xmm` operand, which is the only way it could
+/// write one. Anything else may change it.
+pub(crate) fn keeps_vector_state(i: &Instruction) -> bool {
+    let general = matches!(
+        i.mnemonic,
+        Mnemonic::Add
+            | Mnemonic::Adc
+            | Mnemonic::Sub
+            | Mnemonic::Sbb
+            | Mnemonic::And
+            | Mnemonic::Or
+            | Mnemonic::Xor
+            | Mnemonic::Cmp
+            | Mnemonic::Test
+            | Mnemonic::Inc
+            | Mnemonic::Dec
+            | Mnemonic::Neg
+            | Mnemonic::Not
+            | Mnemonic::Shl
+            | Mnemonic::Shr
+            | Mnemonic::Sar
+            | Mnemonic::Shld
+            | Mnemonic::Shrd
+            | Mnemonic::Imul
+            | Mnemonic::Mul
+            | Mnemonic::Div
+            | Mnemonic::Idiv
+            | Mnemonic::Bt
+            | Mnemonic::Bts
+            | Mnemonic::Btr
+            | Mnemonic::Btc
+            | Mnemonic::Rol
+            | Mnemonic::Ror
+            | Mnemonic::Rcl
+            | Mnemonic::Rcr
+            | Mnemonic::Bsf
+            | Mnemonic::Bsr
+            | Mnemonic::Tzcnt
+            | Mnemonic::Lzcnt
+            | Mnemonic::Popcnt
+            | Mnemonic::Movbe
+            | Mnemonic::Bswap
+            | Mnemonic::Mov
+            | Mnemonic::Movsx
+            | Mnemonic::Movsxd
+            | Mnemonic::Movzx
+            | Mnemonic::Cdqe
+            | Mnemonic::Cdq
+            | Mnemonic::Cqo
+            | Mnemonic::Lea
+            | Mnemonic::Xchg
+            | Mnemonic::Cmpxchg
+            | Mnemonic::Xadd
+            | Mnemonic::Push
+            | Mnemonic::Pop
+            | Mnemonic::Call
+            | Mnemonic::Ret
+            | Mnemonic::Jmp
+            | Mnemonic::Jcc(_)
+            | Mnemonic::Setcc(_)
+            | Mnemonic::Cmovcc(_)
+            | Mnemonic::Leave
+            | Mnemonic::Nop
+            | Mnemonic::Endbr64
+    );
+    general
+        && !i
+            .operands()
+            .any(|o| matches!(o, Operand::Register(Register::Xmm(_))))
+}
+
 pub(crate) fn is_string(m: Mnemonic) -> bool {
     is_comparison_string(m)
         || matches!(

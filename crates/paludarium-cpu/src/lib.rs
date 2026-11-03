@@ -24,12 +24,14 @@ mod integer_tests;
 pub mod jit_cost;
 #[cfg(feature = "cost-profile")]
 mod jit_cost_sites;
+#[cfg(test)]
+mod snapshot_tests;
 mod softfloat;
 mod sse;
 mod state;
 
 use paludarium_decoder::{DecodeError, Instruction, decode};
-use paludarium_mmu::AddressSpace;
+use paludarium_mmu::{AddressSpace, CodeSources};
 use paludarium_types::{ExitReason, GuestAddr, InstructionBytes, MAX_INSTRUCTION_LEN};
 
 pub use alu::{condition, sign_extend, size_mask};
@@ -48,12 +50,16 @@ const CACHE_ENTRIES: usize = 4096;
 /// `mprotect`, `munmap`) are always seen.
 pub struct DecodeCache {
     entries: Vec<Option<(u64, u64, Instruction, bool)>>,
+    /// What reading the generation without the locks needs
+    /// ([`AddressSpace::code_generation_cached`]).
+    sources: CodeSources,
 }
 
 impl Default for DecodeCache {
     fn default() -> Self {
         DecodeCache {
             entries: vec![None; CACHE_ENTRIES],
+            sources: CodeSources::default(),
         }
     }
 }
@@ -180,6 +186,57 @@ fn instruction_bytes(mem: &AddressSpace, rip: GuestAddr, len: u8) -> Instruction
     InstructionBytes::new(&bytes[..got])
 }
 
+/// What a failed instruction puts back: the registers, and the vector
+/// state unless the instruction leaves it alone
+/// ([`exec::keeps_vector_state`]). Copying the whole state before every
+/// instruction cost more than most instructions themselves. The repeated
+/// comparison's continuation is not kept: a failure clears it.
+struct Snapshot {
+    gpr: [u64; 16],
+    rip: GuestAddr,
+    rflags: u64,
+    fs_base: u64,
+    gs_base: u64,
+    vector: Option<([u128; 16], u32)>,
+}
+
+impl Snapshot {
+    fn of(state: &CpuState, insn: &Instruction) -> Self {
+        // Every field is named, so that a new one has to be placed here.
+        let CpuState {
+            gpr,
+            rip,
+            rflags,
+            fs_base,
+            gs_base,
+            xmm,
+            mxcsr,
+            rep_fault_flags: _,
+            repeat_continuation: _,
+        } = *state;
+        Snapshot {
+            gpr,
+            rip,
+            rflags,
+            fs_base,
+            gs_base,
+            vector: (!exec::keeps_vector_state(insn)).then_some((xmm, mxcsr)),
+        }
+    }
+
+    fn restore(self, state: &mut CpuState) {
+        state.gpr = self.gpr;
+        state.rip = self.rip;
+        state.rflags = self.rflags;
+        state.fs_base = self.fs_base;
+        state.gs_base = self.gs_base;
+        if let Some((xmm, mxcsr)) = self.vector {
+            state.xmm = xmm;
+            state.mxcsr = mxcsr;
+        }
+    }
+}
+
 fn execute_decoded(
     state: &mut CpuState,
     mem: &AddressSpace,
@@ -210,7 +267,7 @@ fn execute_decoded(
     } else {
         state.repeat_continuation = None;
     }
-    let snapshot = state.clone();
+    let snapshot = Snapshot::of(state, insn);
     let result = exec::execute(state, mem, insn);
     if result.is_ok() {
         if state.rip != rip {
@@ -227,10 +284,10 @@ fn execute_decoded(
             // Unmasked SIMD exceptions preserve destinations but commit the
             // exception status bits which Linux exposes in the signal frame.
             let mxcsr = state.mxcsr;
-            *state = snapshot;
+            snapshot.restore(state);
             state.mxcsr = mxcsr;
         } else if stop != Stop::Syscall {
-            *state = snapshot;
+            snapshot.restore(state);
         }
         state.repeat_continuation = None;
     }
@@ -262,7 +319,7 @@ pub fn step_cached(
 ) -> Result<(), ExitReason> {
     #[cfg(feature = "cost-profile")]
     jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
-    let generation = mem.code_generation();
+    let generation = mem.code_generation_cached(&mut cache.sources);
     let insn = match cache.get(state.rip.0, generation) {
         Some(insn) => insn,
         None => {
@@ -412,7 +469,7 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
     #[cfg(feature = "cost-profile")]
     let observed_space = mem.code_epoch().0;
     while consumed < budget {
-        let generation = mem.code_generation();
+        let generation = mem.code_generation_cached(&mut cache.sources);
         #[cfg(feature = "cost-profile")]
         let observed_rip = state.rip.0;
         #[cfg(feature = "cost-profile")]

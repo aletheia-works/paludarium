@@ -654,6 +654,29 @@ impl Tlb {
 
 static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The counters of a space that [`AddressSpace::code_generation_cached`]
+/// reads without the locks.
+#[derive(Default)]
+struct CodeCounters {
+    /// Bumped whenever executable memory or the mappings change; lets the
+    /// CPU cache decoded instructions safely (see
+    /// [`AddressSpaceData::code_generation`]).
+    generation: AtomicU64,
+    /// Bumped whenever the space is borrowed mutably, which may change its
+    /// shared mappings and page caches, whose generations count too.
+    layout: AtomicU64,
+}
+
+/// What [`AddressSpace::code_generation_cached`] keeps between calls: the
+/// counters of the space it last read and the generations of that space's
+/// shared mappings and page caches, as they were at `layout`.
+#[derive(Default)]
+pub struct CodeSources {
+    counters: Option<Arc<CodeCounters>>,
+    layout: u64,
+    pages: Vec<Arc<AtomicU64>>,
+}
+
 /// One process's guest address space.
 ///
 /// `mappings` is the source of truth for what is mapped and with which
@@ -662,9 +685,9 @@ static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
 struct AddressSpaceData {
     id: u64,
     directory: RwLock<Directory>,
-    /// Bumped whenever executable memory or the mappings change; lets the
-    /// CPU cache decoded instructions safely (see [`Self::code_generation`]).
-    code_generation: AtomicU64,
+    /// The code generation and the layout ([`CodeCounters`]), shared with
+    /// the [`AddressSpace`] so that it can read them without the locks.
+    code: Arc<CodeCounters>,
     mappings: BTreeMap<u64, Mapping>,
     initial_break: GuestAddr,
     current_break: GuestAddr,
@@ -755,7 +778,7 @@ impl AddressSpaceData {
             directory: RwLock::new(BTreeMap::new()),
             shared: BTreeMap::new(),
             backing: BTreeMap::new(),
-            code_generation: AtomicU64::new(0),
+            code: Arc::default(),
             mappings: BTreeMap::new(),
             initial_break: GuestAddr(0),
             current_break: GuestAddr(0),
@@ -777,15 +800,21 @@ impl AddressSpaceData {
     /// under one value stay valid while the value is unchanged.
     #[must_use]
     pub fn code_generation(&self) -> u64 {
+        self.code_sources().fold(
+            self.code.generation.load(Ordering::Acquire),
+            |value, generation| value.wrapping_add(generation.load(Ordering::Acquire)),
+        )
+    }
+
+    /// The generations of the shared mappings and page caches, which
+    /// [`Self::code_generation`] adds to the space's own.
+    fn code_sources(&self) -> impl Iterator<Item = &Arc<AtomicU64>> {
         let caches = self.backing.values().filter_map(|b| b.cache.as_ref());
         self.shared
             .values()
             .map(|shared| &shared.pages)
             .chain(caches)
-            .fold(
-                self.code_generation.load(Ordering::Acquire),
-                |value, pages| value.wrapping_add(pages.generation()),
-            )
+            .map(|pages| &pages.generation)
     }
 
     fn shared_at(&self, page: u64) -> Option<&SharedMapping> {
@@ -1093,7 +1122,7 @@ impl AddressSpaceData {
     }
 
     fn bump_code_generation(&mut self) {
-        *self.code_generation.get_mut() += 1;
+        self.code.generation.fetch_add(1, Ordering::Release);
     }
 
     /// The mappings in address order.
@@ -1245,7 +1274,7 @@ impl AddressSpaceData {
         };
         if entry.prot.contains(Prot::EXEC) {
             // Code may have changed: decoded instructions are stale.
-            self.code_generation.fetch_add(1, Ordering::Release);
+            self.code.generation.fetch_add(1, Ordering::Release);
         }
         for (s, d) in buf.iter().zip(&frame[page_offset(addr.0)..]) {
             d.store(*s, Ordering::Relaxed);
@@ -1322,7 +1351,7 @@ impl AddressSpaceData {
                 }
                 if p.prot.contains(Prot::EXEC) {
                     // Code may have changed: decoded instructions are stale.
-                    self.code_generation.fetch_add(1, Ordering::Release);
+                    self.code.generation.fetch_add(1, Ordering::Release);
                 }
                 let Some(frame) = p.frame_for_write(self.meter.as_ref()) else {
                     self.out_of_memory.store(true, Ordering::SeqCst);
@@ -2135,6 +2164,8 @@ pub struct AtomicResult {
 /// implementation never calls back through this public wrapper (no reentry).
 pub struct AddressSpace {
     data: Mutex<AddressSpaceData>,
+    /// The data's `code`, for [`Self::code_generation_cached`].
+    code: Arc<CodeCounters>,
     serialization: Arc<Mutex<()>>,
     /// The data's `out_of_memory`, so that every checkpoint can read it
     /// without taking the session-wide serialization lock.
@@ -2160,14 +2191,18 @@ impl std::ops::Deref for AddressSpaceGuard<'_> {
     }
 }
 impl std::ops::DerefMut for AddressSpaceGuard<'_> {
-    /// Empties the [`Tlb`] first: a mutable borrow may change the mappings
-    /// or the page entries it copies.
+    /// Empties the [`Tlb`] first, and moves the layout on
+    /// ([`CodeCounters`]): a mutable borrow may change the mappings, the
+    /// page entries the TLB copies, and the shared mappings and page caches.
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.data.tlb.get_mut().flush();
+        self.data.code.layout.fetch_add(1, Ordering::Release);
         &mut self.data
     }
 }
 
+#[cfg(test)]
+mod code_generation_tests;
 #[cfg(test)]
 mod processes_tests;
 
@@ -2190,6 +2225,7 @@ impl AddressSpace {
     fn with_data(data: AddressSpaceData, serialization: Arc<Mutex<()>>) -> Self {
         Self {
             out_of_memory: Arc::clone(&data.out_of_memory),
+            code: Arc::clone(&data.code),
             data: Mutex::new(data),
             serialization,
         }
@@ -2312,6 +2348,29 @@ impl AddressSpace {
     #[must_use]
     pub fn code_generation(&self) -> u64 {
         self.locked().code_generation()
+    }
+    /// [`Self::code_generation`], taking the locks only when `sources`
+    /// holds another space's or the space has been borrowed mutably since:
+    /// the shared mappings and page caches whose generations count change
+    /// only then. Reading the generation before fetching the instruction
+    /// under the locks keeps a decoded instruction from outliving a change,
+    /// as every write bumps the generation while it holds them.
+    pub fn code_generation_cached(&self, sources: &mut CodeSources) -> u64 {
+        let layout = self.code.layout.load(Ordering::Acquire);
+        let current = sources
+            .counters
+            .as_ref()
+            .is_some_and(|counters| Arc::ptr_eq(counters, &self.code));
+        if !current || sources.layout != layout {
+            let data = self.locked();
+            sources.layout = self.code.layout.load(Ordering::Acquire);
+            sources.pages = data.code_sources().cloned().collect();
+            sources.counters = Some(Arc::clone(&self.code));
+        }
+        sources.pages.iter().fold(
+            self.code.generation.load(Ordering::Acquire),
+            |value, generation| value.wrapping_add(generation.load(Ordering::Acquire)),
+        )
     }
     /// Reads cache identity and generation under the same serialization guard.
     #[must_use]

@@ -36,7 +36,8 @@ kernel.
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
-| System information | `uname`, `sysinfo`, `getuid`, `geteuid`, `getgid`, `getegid`, `getgroups`, `getrusage`, `times` |
+| System information | `uname`, `sysinfo`, `getrusage`, `times` |
+| Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
@@ -434,8 +435,25 @@ kernel.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like
-  `CPUID`, it does not reveal the host. The guest runs as root (user and group
-  0), and every file belongs to root until `chown` gives it another owner or
+  `CPUID`, it does not reveal the host. The guest starts as root (user and
+  group 0, with every capability). Each thread has its own credentials, as
+  on Linux: the real, effective, saved and filesystem user and group IDs,
+  the supplementary groups and the permitted and effective capabilities.
+  The `set*id` calls and `setgroups` change them by Linux's rules: an ID
+  goes to one of the thread's own, or anywhere with `CAP_SETUID` or
+  `CAP_SETGID`; leaving root in every user ID drops the capabilities (but
+  for the permitted ones with `PR_SET_KEEPCAPS`), the effective ID leaving
+  root drops the effective ones and coming back raises them, and the
+  filesystem ID does the same for the filesystem capabilities. A change of
+  an effective or filesystem ID makes the process undumpable
+  (`fs.suid_dumpable` is 0) and clears its parent-death signal. `execve`
+  makes the saved and filesystem IDs the effective ones, gives root every
+  capability and anyone else none, clears `PR_SET_KEEPCAPS`, sets
+  `AT_SECURE` when the effective IDs differ from the real ones and then
+  leaves the process undumpable and clears its parent-death signal, and
+  otherwise makes it dumpable again. The auxiliary vector and
+  `/proc/self/status` show the IDs and capabilities. Every file belongs to
+  root until `chown` gives it another owner or
   group, which the in-memory filesystem keeps. As on Linux, `chown` takes the
   set-user-ID bit from a file that is not a directory, and the set-group-ID
   bit when the group may execute it, even when the owner and group stay.

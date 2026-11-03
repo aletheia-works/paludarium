@@ -3087,5 +3087,6 @@ fn status(c: &Context<'_>) -> Vec<u8> {
                 .map(|(&n, _)| n),
         ),
         no_new_privs,
+        credentials: &c.process.credentials,
     })
 }

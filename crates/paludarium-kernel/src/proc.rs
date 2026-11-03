@@ -121,9 +121,8 @@ pub(crate) struct Status<'a> {
     pub ignored: u64,
     pub caught: u64,
     pub no_new_privs: bool,
+    pub credentials: &'a crate::credentials::Credentials,
 }
-/// The guest is root with every capability (CAP_LAST_CAP is 40).
-const CAPABILITIES: u64 = (1 << 41) - 1;
 /// `/proc/<pid>/status` in Linux's field order. The memory and CPU fields
 /// are left out, as nothing measures them; parsers treat them as optional.
 pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
@@ -138,17 +137,30 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
     // Linux sizes the descriptor table in powers of two from 64.
     let fd_size = s.descriptors.next_power_of_two().max(64);
     let pid = s.pid;
+    let c = s.credentials;
+    // Each group, then a space Linux has always written after them.
+    let groups: Vec<String> = c.groups.iter().map(u32::to_string).collect();
+    let groups = groups.join(" ");
+    let bounding = crate::credentials::ALL_CAPABILITIES;
     format!(
         "Name:\t{name}\nUmask:\t{:04o}\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\n\
-         Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n\
-         FDSize:\t{fd_size}\nGroups:\t\nThreads:\t{}\nSigQ:\t{}/{}\n\
+         Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
+         FDSize:\t{fd_size}\nGroups:\t{groups} \nThreads:\t{}\nSigQ:\t{}/{}\n\
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
-         SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{CAPABILITIES:016x}\n\
-         CapEff:\t{CAPABILITIES:016x}\nCapBnd:\t{CAPABILITIES:016x}\nCapAmb:\t{:016x}\n\
+         SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\n\
+         CapEff:\t{:016x}\nCapBnd:\t{bounding:016x}\nCapAmb:\t{:016x}\n\
          NoNewPrivs:\t{}\nSeccomp:\t0\nSeccomp_filters:\t0\n\
          voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         s.umask & 0o777,
         s.parent,
+        c.uid,
+        c.euid,
+        c.suid,
+        c.fsuid,
+        c.gid,
+        c.egid,
+        c.sgid,
+        c.fsgid,
         s.threads,
         s.queued,
         s.queue_limit,
@@ -158,6 +170,8 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         s.ignored,
         s.caught,
         0,
+        c.permitted,
+        c.effective,
         0,
         u8::from(s.no_new_privs),
     )
@@ -346,6 +360,15 @@ mod tests {
             ignored: 1 << 12,
             caught: 1,
             no_new_privs: true,
+            credentials: &crate::credentials::Credentials {
+                uid: 1,
+                euid: 2,
+                suid: 3,
+                fsuid: 4,
+                groups: vec![5, 6],
+                effective: 0,
+                ..crate::credentials::Credentials::default()
+            },
         }))
         .unwrap();
         for line in [
@@ -358,7 +381,12 @@ mod tests {
             "SigQ:\t1/4096\n",
             "SigPnd:\t0000000000000200\n",
             "SigIgn:\t0000000000001000\n",
-            "CapEff:\t000001ffffffffff\n",
+            "Uid:\t1\t2\t3\t4\n",
+            "Gid:\t0\t0\t0\t0\n",
+            "Groups:\t5 6 \n",
+            "CapPrm:\t000001ffffffffff\n",
+            "CapEff:\t0000000000000000\n",
+            "CapBnd:\t000001ffffffffff\n",
             "NoNewPrivs:\t1\n",
         ] {
             assert!(text.contains(line), "{line:?} in {text}");

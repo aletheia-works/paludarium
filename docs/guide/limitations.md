@@ -88,9 +88,16 @@ verified.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
 - **File owners**: a file in a mounted host directory stays root's, so
-  `chown` to any other owner or group returns `EPERM` there. The guest stays
-  root when it runs a set-user-ID or set-group-ID program, where Linux would
-  take the file's owner or group.
+  `chown` to any other owner or group returns `EPERM` there.
+- **Credentials**: the IDs and capabilities a thread takes are not yet
+  checked anywhere else. A guest that leaves root still opens, executes,
+  changes and signals everything as root, a file it makes still belongs to
+  root, and `si_uid`, `SCM_CREDENTIALS`, `SO_PEERCRED` and a core's
+  `pr_uid` and `pr_gid` still give root's IDs. A set-user-ID or set-group-ID
+  program runs with the caller's IDs, where Linux would take the file's
+  owner or group. `/proc/self/status` shows the calling thread's
+  credentials, where Linux shows the thread group leader's, and `capget`
+  and `capset` are not implemented.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS` as Linux does, with
   these differences:

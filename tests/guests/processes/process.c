@@ -1087,6 +1087,50 @@ static int text_segment(struct dl_phdr_info *info, size_t size, void *unused) {
     }
     return 1;
 }
+/* The calling thread's IDs and capabilities: getresuid and getresgid,
+   the filesystem IDs (setfsuid(-1) changes nothing and returns them), the
+   Uid, Gid and Groups lines of /proc/self/status, and the permitted and
+   effective capabilities as all (the bounding set), none, or all but the
+   filesystem ones. Dumpability is 1, or the fs.suid_dumpable setting
+   (0 when it cannot be read). */
+static const char *capabilities(const char *field) {
+    char value[64], bounding[64];
+    if (status_field(field, value, sizeof value) || status_field("CapBnd", bounding, sizeof bounding))
+        return "missing";
+    unsigned long long caps = strtoull(value, NULL, 16), all = strtoull(bounding, NULL, 16);
+    unsigned long long fs = 0x1fULL | 1ULL << 9 | 1ULL << 27 | 1ULL << 32;
+    return caps == all ? "all" : caps == 0 ? "none" : caps == (all & ~fs) ? "all-but-fs" : "other";
+}
+static void credentials_line(const char *name) {
+    unsigned r = 0, e = 0, sv = 0, gr = 0, ge = 0, gs = 0;
+    syscall(SYS_getresuid, &r, &e, &sv);
+    syscall(SYS_getresgid, &gr, &ge, &gs);
+    long fsuid = syscall(SYS_setfsuid, -1), fsgid = syscall(SYS_setfsgid, -1);
+    char uid[64], gid[64], groups[128];
+    if (status_field("Uid", uid, sizeof uid)) strcpy(uid, "missing");
+    if (status_field("Gid", gid, sizeof gid)) strcpy(gid, "missing");
+    if (status_field("Groups", groups, sizeof groups)) strcpy(groups, "missing");
+    for (char *t = uid; *t; t++) if (*t == '\t') *t = '/';
+    for (char *t = gid; *t; t++) if (*t == '\t') *t = '/';
+    int suid_dumpable = 0;
+    FILE *f = fopen("/proc/sys/fs/suid_dumpable", "r");
+    if (f) {
+        if (fscanf(f, "%d", &suid_dumpable) != 1) suid_dumpable = 0;
+        fclose(f);
+    }
+    int dumpable = prctl(PR_GET_DUMPABLE);
+    printf("%s: uid=%u/%u/%u/%ld gid=%u/%u/%u/%ld status-uid=%s status-gid=%s groups=[%s] "
+           "prm=%s eff=%s dumpable=%s\n",
+           name, r, e, sv, fsuid, gr, ge, gs, fsgid, uid, gid, groups, capabilities("CapPrm"),
+           capabilities("CapEff"), dumpable == 1 ? "1" : dumpable == suid_dumpable ? "suid" : "other");
+}
+static unsigned thread_uid;
+static void *credentials_thread(void *unused) {
+    (void)unused;
+    syscall(SYS_setresuid, 7, 7, 7);
+    thread_uid = syscall(SYS_getuid);
+    return NULL;
+}
 static void finish(pid_t pid) {
     int status = 0;
     result("wait", waitpid(pid, &status, 0) == pid);
@@ -7390,6 +7434,128 @@ int main(int argc, char **argv) {
         result("size-no-stack", clone3_error((struct clone3_args){0, 0, 0, 0, SIGCHLD, 0, 4096, 0}));
         result("stack-no-size", clone3_error((struct clone3_args){0, 0, 0, 0, SIGCHLD, 4096, 0, 0}));
         result("bad-signal", clone3_error((struct clone3_args){0, 0, 0, 0, 65, 0, 0, 0}));
+        return 0;
+    }
+    if (!strcmp(mode, "credentials")) {
+        /* The set*id calls as root and after leaving it (the native side
+           runs as root): which IDs each may set, the saved ID following the
+           effective one, the capabilities lost on leaving root (kept by
+           PR_SET_KEEPCAPS), dropped and raised with the effective ID and,
+           for the filesystem ones, the filesystem ID; supplementary groups;
+           a change of an effective or filesystem ID making the process
+           undumpable and clearing its parent-death signal; raw calls
+           changing only the calling thread; and exec taking the effective
+           IDs as saved ones, recomputing the capabilities, clearing
+           PR_SET_KEEPCAPS, giving AT_SECURE and resetting dumpability. */
+        static const char *const steps[] = {"root", "drop", "keepcaps", "effective", "fsuid",
+                                            "gids", "pdeath", "thread", "exec", "exec-root"};
+        for (size_t step = 0; step < sizeof steps / sizeof *steps; step++) {
+            fflush(stdout);
+            pid_t pid = child();
+            if (pid == 0) {
+                const char *name = steps[step];
+                if (syscall(SYS_setgroups, 0, NULL)) _exit(70);
+                if (!strcmp(name, "root")) {
+                    unsigned list[2] = {5, 3}, got[4] = {0}, bad = (unsigned)-1;
+                    outcome("setgroups", syscall(SYS_setgroups, 2, list));
+                    long n = syscall(SYS_getgroups, 4, got);
+                    printf("getgroups=%ld list=%u,%u\n", n, got[0], got[1]);
+                    outcome("getgroups-small", syscall(SYS_getgroups, 1, got));
+                    outcome("getgroups-count", syscall(SYS_getgroups, 0, NULL));
+                    outcome("getgroups-negative", syscall(SYS_getgroups, -1, got));
+                    outcome("setgroups-invalid", syscall(SYS_setgroups, 1, &bad));
+                    outcome("setgroups-huge", syscall(SYS_setgroups, 65537, list));
+                    credentials_line(name);
+                } else if (!strcmp(name, "drop")) {
+                    outcome("setresuid", syscall(SYS_setresuid, 1000, 1001, 1002));
+                    credentials_line(name);
+                    outcome("setuid-root", syscall(SYS_setuid, 0));
+                    outcome("setuid-saved", syscall(SYS_setuid, 1002));
+                    credentials_line("drop-saved");
+                    outcome("setresuid-other", syscall(SYS_setresuid, 1003, -1, -1));
+                    outcome("setuid-invalid", syscall(SYS_setuid, -1));
+                    outcome("setgroups", syscall(SYS_setgroups, 0, NULL));
+                    outcome("setgid", syscall(SYS_setgid, 5));
+                    outcome("setreuid-real", syscall(SYS_setreuid, 1002, -1));
+                    credentials_line("drop-real");
+                } else if (!strcmp(name, "keepcaps")) {
+                    outcome("set-keepcaps", prctl(PR_SET_KEEPCAPS, 1));
+                    outcome("get-keepcaps", prctl(PR_GET_KEEPCAPS));
+                    outcome("set-keepcaps-two", prctl(PR_SET_KEEPCAPS, 2));
+                    outcome("setresuid", syscall(SYS_setresuid, 1000, 1000, 1000));
+                    credentials_line(name);
+                    outcome("setuid-root", syscall(SYS_setuid, 0));
+                } else if (!strcmp(name, "effective")) {
+                    outcome("seteuid", syscall(SYS_setresuid, -1, 1000, -1));
+                    credentials_line(name);
+                    outcome("setreuid-back", syscall(SYS_setreuid, -1, 0));
+                    credentials_line("effective-back");
+                    outcome("setreuid-other", syscall(SYS_setreuid, -1, 5));
+                    credentials_line("effective-other");
+                } else if (!strcmp(name, "fsuid")) {
+                    printf("setfsuid=%ld\n", syscall(SYS_setfsuid, 1000));
+                    credentials_line(name);
+                    printf("setfsuid-back=%ld\n", syscall(SYS_setfsuid, 0));
+                    credentials_line("fsuid-back");
+                    outcome("setresuid", syscall(SYS_setresuid, 1, 1, 1));
+                    printf("setfsuid-other=%ld\n", syscall(SYS_setfsuid, 2));
+                    printf("setfsgid=%ld\n", syscall(SYS_setfsgid, 9));
+                    credentials_line("fsuid-user");
+                } else if (!strcmp(name, "gids")) {
+                    outcome("setresgid", syscall(SYS_setresgid, 100, 101, 102));
+                    outcome("setregid", syscall(SYS_setregid, -1, 103));
+                    credentials_line(name);
+                    outcome("setresuid", syscall(SYS_setresuid, 1, 1, 1));
+                    outcome("setgid-saved", syscall(SYS_setgid, 103));
+                    outcome("setgid-other", syscall(SYS_setgid, 5));
+                    outcome("setresgid-other", syscall(SYS_setresgid, -1, -1, 5));
+                    credentials_line("gids-user");
+                } else if (!strcmp(name, "pdeath")) {
+                    int signal = 0;
+                    prctl(PR_SET_PDEATHSIG, SIGUSR1);
+                    outcome("setresuid-same", syscall(SYS_setresuid, -1, -1, -1));
+                    prctl(PR_GET_PDEATHSIG, &signal);
+                    printf("pdeath-same=%d\n", signal);
+                    credentials_line(name);
+                    outcome("seteuid", syscall(SYS_setresuid, -1, 1000, -1));
+                    prctl(PR_GET_PDEATHSIG, &signal);
+                    printf("pdeath-changed=%d\n", signal);
+                    credentials_line("pdeath-changed");
+                } else if (!strcmp(name, "thread")) {
+                    pthread_t t;
+                    if (pthread_create(&t, NULL, credentials_thread, NULL) || pthread_join(t, NULL)) _exit(71);
+                    printf("thread-uid=%u own-uid=%ld\n", thread_uid, syscall(SYS_getuid));
+                } else {
+                    if (!strcmp(name, "exec")) {
+                        prctl(PR_SET_KEEPCAPS, 1);
+                        prctl(PR_SET_PDEATHSIG, SIGUSR1);
+                        if (syscall(SYS_setresgid, 100, 101, 102) || syscall(SYS_setresuid, 1000, 1001, 1002))
+                            _exit(72);
+                    } else {
+                        prctl(PR_SET_DUMPABLE, 0);
+                        prctl(PR_SET_PDEATHSIG, SIGUSR1);
+                    }
+                    char *args[] = {"process", "credentials-exec", (char *)self, (char *)name, NULL};
+                    char *env[] = {NULL};
+                    execve(self, args, env);
+                    _exit(73);
+                }
+                fflush(stdout);
+                _exit(0);
+            }
+            int status = 0;
+            waitpid(pid, &status, 0);
+            printf("%s: status=%d\n", steps[step], status);
+        }
+        return 0;
+    }
+    if (!strcmp(mode, "credentials-exec")) {
+        int signal = -1;
+        prctl(PR_GET_PDEATHSIG, &signal);
+        printf("auxv: uid=%lu euid=%lu gid=%lu egid=%lu secure=%lu keepcaps=%d pdeath=%d\n",
+               getauxval(AT_UID), getauxval(AT_EUID), getauxval(AT_GID), getauxval(AT_EGID),
+               getauxval(AT_SECURE), prctl(PR_GET_KEEPCAPS), signal);
+        credentials_line(argc > 3 ? argv[3] : "exec");
         return 0;
     }
     if (!strcmp(mode, "proc-status")) {

@@ -11,7 +11,7 @@ use paludarium_host::{ClockId, FileHandle, Host, WaitOutcome};
 use paludarium_mmu::{AddressSpace, MappingKind, Prot, Remap};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 
-use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState, signals};
+use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState, credentials, signals};
 
 /// Linux x86-64 system-call numbers used by the core emulator.
 pub mod nr {
@@ -52,6 +52,17 @@ pub mod nr {
     pub const MADVISE: u64 = 28;
     pub const UNAME: u64 = 63;
     pub const GETUID: u64 = 102;
+    pub const SETUID: u64 = 105;
+    pub const SETGID: u64 = 106;
+    pub const SETREUID: u64 = 113;
+    pub const SETREGID: u64 = 114;
+    pub const SETGROUPS: u64 = 116;
+    pub const SETRESUID: u64 = 117;
+    pub const GETRESUID: u64 = 118;
+    pub const SETRESGID: u64 = 119;
+    pub const GETRESGID: u64 = 120;
+    pub const SETFSUID: u64 = 122;
+    pub const SETFSGID: u64 = 123;
     pub const GETGID: u64 = 104;
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
@@ -137,17 +148,17 @@ impl SyscallTable {
             (nr::MSYNC, sys_msync),
             (nr::MADVISE, sys_madvise),
             (nr::UNAME, sys_uname),
-            (nr::GETUID, sys_root_id),
-            (nr::GETGID, sys_root_id),
-            (nr::GETEUID, sys_root_id),
-            (nr::GETEGID, sys_root_id),
+            (nr::GETUID, credentials::sys_getuid),
+            (nr::GETGID, credentials::sys_getgid),
+            (nr::GETEUID, credentials::sys_geteuid),
+            (nr::GETEGID, credentials::sys_getegid),
             (nr::SCHED_GETAFFINITY, sys_sched_getaffinity),
             (nr::SCHED_YIELD, sys_sched_yield),
             (nr::SYSINFO, sys_sysinfo),
             (nr::GETRUSAGE, sys_getrusage),
             (nr::TIMES, sys_times),
             (nr::CLOCK_GETRES, sys_clock_getres),
-            (nr::GETGROUPS, sys_getgroups),
+            (nr::GETGROUPS, credentials::sys_getgroups),
             (nr::TIMER_CREATE, sys_timer_create),
             (nr::TIMER_SETTIME, sys_timer_settime),
             (nr::TIMER_GETTIME, sys_timer_gettime),
@@ -165,6 +176,20 @@ impl SyscallTable {
         for number in crate::files::NUMBERS {
             handlers.insert(*number, crate::files::dispatch);
         }
+        let ids: [(u64, Handler); 11] = [
+            (nr::SETUID, credentials::sys_setuid),
+            (nr::SETGID, credentials::sys_setgid),
+            (nr::SETREUID, credentials::sys_setreuid),
+            (nr::SETREGID, credentials::sys_setregid),
+            (nr::SETGROUPS, credentials::sys_setgroups),
+            (nr::SETRESUID, credentials::sys_setresuid),
+            (nr::GETRESUID, credentials::sys_getresuid),
+            (nr::SETRESGID, credentials::sys_setresgid),
+            (nr::GETRESGID, credentials::sys_getresgid),
+            (nr::SETFSUID, credentials::sys_setfsuid),
+            (nr::SETFSGID, credentials::sys_setfsgid),
+        ];
+        handlers.extend(ids);
         handlers.insert(290, crate::events::dispatch);
         // Tokio's current Linux std uses GRND_INSECURE to seed its scheduler;
         // the Host random boundary supplies secure bytes without OS passthrough.
@@ -196,7 +221,7 @@ impl SyscallTable {
     }
 }
 
-fn ok(value: u64) -> Outcome {
+pub(crate) fn ok(value: u64) -> Outcome {
     Outcome::Return(value)
 }
 
@@ -229,7 +254,7 @@ fn sys_getrandom(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
 }
 
-fn err(e: Errno) -> Outcome {
+pub(crate) fn err(e: Errno) -> Outcome {
     Outcome::Return(e.to_syscall_return())
 }
 
@@ -1933,11 +1958,6 @@ fn sys_arch_prctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
 }
 
-/// The guest runs as root, the owner `stat` reports for every file.
-fn sys_root_id(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
-    ok(0)
-}
-
 /// Linux's `struct utsname`: six NUL-terminated fields of 65 bytes. The host's
 /// name and kernel are not revealed, as with `CPUID`.
 fn sys_uname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
@@ -1962,14 +1982,6 @@ fn sys_uname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 fn sys_sched_yield(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
     std::thread::yield_now();
-    ok(0)
-}
-
-/// Root has no supplementary groups, so the list is always empty.
-fn sys_getgroups(_c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    if (a[0] as u32 as i32) < 0 {
-        return err(Errno::EINVAL);
-    }
     ok(0)
 }
 

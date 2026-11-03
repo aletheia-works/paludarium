@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod coredump;
+mod credentials;
 mod inbox;
 mod signals;
 pub use inbox::SignalInbox;
@@ -178,6 +179,8 @@ pub struct ThreadState {
     /// which Linux restarts with the time left (ERESTART_RESTARTBLOCK). It
     /// lasts until a handler runs, through the checkpoints of the stop.
     pub(crate) restart_block: Option<signals::RestartBlock>,
+    /// The thread's user and group IDs and capabilities.
+    pub credentials: credentials::Credentials,
 }
 
 impl ThreadState {

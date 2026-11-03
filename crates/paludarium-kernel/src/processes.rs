@@ -361,6 +361,28 @@ impl Processes {
             _ => return Err(Errno::EINVAL),
         })
     }
+    /// An effective or filesystem ID of the process changed: it becomes
+    /// undumpable (`fs.suid_dumpable`, 0 by default) and forgets its
+    /// parent-death signal, as Linux's `commit_creds` does.
+    pub(crate) fn credentials_changed(&self, pid: u32) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = entries.get_mut(&pid) {
+            entry.dumpable = false;
+            entry.death_signal = 0;
+        }
+    }
+    /// After exec, the process is dumpable unless it runs with effective
+    /// IDs other than its real ones, and a secure exec forgets its
+    /// parent-death signal, as Linux's `begin_new_exec` does.
+    pub(crate) fn executed_as(&self, pid: u32, dumpable: bool, secure: bool) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = entries.get_mut(&pid) {
+            entry.dumpable = dumpable;
+            if secure {
+                entry.death_signal = 0;
+            }
+        }
+    }
     pub(crate) fn mark_executed(&self, pid: u32) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(&pid) {
@@ -1209,7 +1231,7 @@ impl Kernel {
             _ => Err(Errno(3)),
         }
     }
-    /// `prctl(option, ...)`: PR_SET/GET_NAME (per thread),
+    /// `prctl(option, ...)`: PR_SET/GET_NAME and PR_SET/GET_KEEPCAPS (per thread),
     /// PR_SET/GET_PDEATHSIG, PR_SET/GET_DUMPABLE, PR_SET/GET_CHILD_SUBREAPER
     /// and PR_SET/GET_NO_NEW_PRIVS; any other option is EINVAL, as Linux
     /// gives for options it does not know.
@@ -1237,6 +1259,14 @@ impl Kernel {
                     .map_err(|_| Errno::EFAULT)?;
                 return Ok(0);
             }
+            // PR_GET_KEEPCAPS, PR_SET_KEEPCAPS (0 or 1), kept per thread with
+            // its credentials.
+            7 => return Ok(u64::from(thread.state.credentials.keep_caps)),
+            8 if a[1] <= 1 => {
+                thread.state.credentials.keep_caps = a[1] == 1;
+                return Ok(0);
+            }
+            8 => return Err(Errno::EINVAL),
             _ => {}
         }
         match self.processes.prctl(self.process.pid, a[0], a)? {
@@ -1719,11 +1749,19 @@ impl Kernel {
         self.host
             .random_bytes(&mut random)
             .map_err(|_| Errno::EIO)?;
+        let (credentials, secure) = thread.state.credentials.after_exec();
         let start = StartInfo {
             argv: &argv,
             envp: &envp,
             execfn: &path,
             random,
+            ids: [
+                credentials.uid,
+                credentials.euid,
+                credentials.gid,
+                credentials.egid,
+            ],
+            secure,
         };
         let mut memory = match mem.memory_meter() {
             Some(meter) => AddressSpace::new().with_memory_meter(meter),
@@ -1783,6 +1821,10 @@ impl Kernel {
             ..ThreadState::default()
         };
         thread.state.name_after(&path);
+        let dumpable = credentials.euid == credentials.uid && credentials.egid == credentials.gid;
+        self.processes
+            .executed_as(self.process.pid, dumpable, secure);
+        thread.state.credentials = credentials;
         self.processes.mark_executed(self.process.pid);
         self.exec_memory = Some(Arc::new(memory));
         self.release_vfork();

@@ -52,8 +52,6 @@ pub mod auxv {
     pub const AT_SECURE: u64 = 23;
     pub const AT_RANDOM: u64 = 25;
     pub const AT_EXECFN: u64 = 31;
-    /// The user and group id reported to the guest.
-    pub const GUEST_ID: u64 = 1000;
 }
 
 /// Why a program could not be loaded.
@@ -104,6 +102,12 @@ pub struct StartInfo<'a> {
     pub execfn: &'a [u8],
     /// 16 bytes from the host's random source (`AT_RANDOM`).
     pub random: [u8; 16],
+    /// The real and effective user and group IDs the program runs with
+    /// (`AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`).
+    pub ids: [u32; 4],
+    /// Whether the exec is secure (`AT_SECURE`): the program runs with
+    /// other effective IDs than its real ones.
+    pub secure: bool,
 }
 
 fn prot_of(flags: u32) -> Prot {
@@ -395,11 +399,11 @@ fn build_stack(
         (AT_BASE, 0),
         (AT_FLAGS, 0),
         (AT_ENTRY, image.entry_point.0),
-        (AT_UID, GUEST_ID),
-        (AT_EUID, GUEST_ID),
-        (AT_GID, GUEST_ID),
-        (AT_EGID, GUEST_ID),
-        (AT_SECURE, 0),
+        (AT_UID, u64::from(start.ids[0])),
+        (AT_EUID, u64::from(start.ids[1])),
+        (AT_GID, u64::from(start.ids[2])),
+        (AT_EGID, u64::from(start.ids[3])),
+        (AT_SECURE, u64::from(start.secure)),
         (AT_CLKTCK, 100),
         (AT_HWCAP, 0),
         (AT_RANDOM, random),

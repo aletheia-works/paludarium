@@ -399,6 +399,9 @@ impl Session {
             envp: &envp,
             execfn: &self.config.program,
             random,
+            // The first process runs as root.
+            ids: [0; 4],
+            secure: false,
         };
         let mut mem = match self.config.limits.memory {
             Some(max) => AddressSpace::new().with_memory_meter(Arc::new(MemoryMeter::new(max))),

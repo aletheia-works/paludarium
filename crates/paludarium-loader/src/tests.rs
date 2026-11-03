@@ -68,6 +68,8 @@ fn start<'a>(argv: &'a [Vec<u8>], envp: &'a [Vec<u8>]) -> StartInfo<'a> {
         envp,
         execfn: b"/prog",
         random: [7; 16],
+        ids: [1, 2, 3, 4],
+        secure: true,
     }
 }
 
@@ -238,7 +240,16 @@ fn initial_stack_has_linux_layout() {
     assert_eq!(aux_value(&mem, aux, auxv::AT_PAGESZ), Some(4096));
     assert_eq!(aux_value(&mem, aux, auxv::AT_ENTRY), Some(0x401000));
     assert_eq!(aux_value(&mem, aux, auxv::AT_PHNUM), Some(2));
-    assert_eq!(aux_value(&mem, aux, auxv::AT_UID), Some(1000));
+    // The IDs and the secure flag are those the exec gives.
+    for (key, value) in [
+        (auxv::AT_UID, 1),
+        (auxv::AT_EUID, 2),
+        (auxv::AT_GID, 3),
+        (auxv::AT_EGID, 4),
+        (auxv::AT_SECURE, 1),
+    ] {
+        assert_eq!(aux_value(&mem, aux, key), Some(value));
+    }
     let random = aux_value(&mem, aux, auxv::AT_RANDOM).unwrap();
     let mut r = [0u8; 16];
     mem.read(GuestAddr(random), &mut r).unwrap();

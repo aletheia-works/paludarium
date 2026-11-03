@@ -72,6 +72,11 @@ mod linux {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Instant;
 
+    fn running_as_root() -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
+    }
+
     fn case(test: &str, mode: &str, binary: &str) {
         static FIXTURE: Mutex<()> = Mutex::new(());
         let _fixture = FIXTURE
@@ -117,7 +122,15 @@ mod linux {
             let program = dir.join(binary);
             let self_path = program.to_str().unwrap().to_owned();
             let args = [mode.to_owned(), self_path.clone()];
-            let native = run_native(&program, binary, &args).unwrap();
+            // The credentials case changes IDs as root, so Linux runs it as
+            // root, through sudo when the tests do not run as root.
+            let native = if mode == "credentials" && !running_as_root() {
+                let mut sudo = vec!["-n".to_owned(), self_path.clone()];
+                sudo.extend(args.iter().cloned());
+                run_native(std::path::Path::new("/usr/bin/sudo"), "sudo", &sudo).unwrap()
+            } else {
+                run_native(&program, binary, &args).unwrap()
+            };
             let bytes = std::fs::read(&program).unwrap();
             let config = Config::new(
                 format!("/{binary}"),
@@ -192,6 +205,7 @@ mod linux {
         processes_pipe_size => ("pipe-size","process"),
         processes_poll => ("poll","process"),
         processes_proc_status => ("proc-status","process"),
+        processes_credentials => ("credentials","process"),
         processes_waitid => ("waitid","process"),
         processes_autoreap => ("autoreap","process"),
         processes_reparent => ("reparent","process"),

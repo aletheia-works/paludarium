@@ -592,9 +592,11 @@ kernel.
 - `prctl` supports `PR_SET_NAME`/`PR_GET_NAME` (a name of up to 15 bytes per
   thread, taken from the program's file name at `execve` and inherited by new
   threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the
-  parent exits), `PR_SET_DUMPABLE`, `PR_SET_CHILD_SUBREAPER` (not inherited
-  on `fork`, kept on `execve`) and `PR_SET_NO_NEW_PRIVS` with their
-  `PR_GET_*`; other options give `EINVAL`.
+  parent exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
+  again unless it is a secure exec), `PR_SET_KEEPCAPS` (per thread, cleared
+  by `execve`), `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
+  `execve`) and `PR_SET_NO_NEW_PRIVS` with their `PR_GET_*`; other options
+  give `EINVAL`.
 - When a process exits, its children go to the nearest ancestor that set
   `PR_SET_CHILD_SUBREAPER` and has not exited, or else to the first process,
   which acts as the init of a PID namespace, as Linux's

@@ -413,8 +413,9 @@ pub(crate) fn sys_setgroups(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if size > MAX_GROUPS {
         return err(Errno::EINVAL);
     }
+    // No groups read nothing, as Linux leaves the list alone then.
     let mut bytes = vec![0u8; size as usize * 4];
-    if c.mem.read(GuestAddr(a[1]), &mut bytes).is_err() {
+    if size != 0 && c.mem.read(GuestAddr(a[1]), &mut bytes).is_err() {
         return err(Errno::EFAULT);
     }
     let mut groups: Vec<u32> = bytes

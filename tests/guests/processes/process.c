@@ -7497,6 +7497,14 @@ int main(int argc, char **argv) {
                     credentials_line(name);
                     printf("setfsuid-back=%ld\n", syscall(SYS_setfsuid, 0));
                     credentials_line("fsuid-back");
+                    /* setresuid changing nothing leaves the filesystem ID,
+                       which it resets to the effective one otherwise. */
+                    syscall(SYS_setfsuid, 1000);
+                    outcome("setresuid-same", syscall(SYS_setresuid, -1, -1, -1));
+                    credentials_line("fsuid-same");
+                    outcome("setresuid-euid", syscall(SYS_setresuid, -1, 0, -1));
+                    credentials_line("fsuid-reset");
+                    outcome("setgroups-none", syscall(SYS_setgroups, 0, (void *)1));
                     outcome("setresuid", syscall(SYS_setresuid, 1, 1, 1));
                     printf("setfsuid-other=%ld\n", syscall(SYS_setfsuid, 2));
                     printf("setfsgid=%ld\n", syscall(SYS_setfsgid, 9));

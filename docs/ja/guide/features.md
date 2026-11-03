@@ -547,7 +547,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   下位 32 ビットだけを読むので、`CLONE_CLEAR_SIGHAND` は `clone3` でしか使えません。
 - `prctl` は `PR_SET_NAME`／`PR_GET_NAME`（スレッドごとの 15 バイトまでの名前。
   `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、
-  `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、`PR_SET_DUMPABLE`、
+  `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、`PR_SET_DUMPABLE`
+  （`execve` は、安全な exec でなければ、またダンプできるようにします）、
+  `PR_SET_KEEPCAPS`（スレッドごとで、`execve` で消えます）、
   `PR_SET_CHILD_SUBREAPER`（`fork` では受け継がれず、`execve` では残ります）、
   `PR_SET_NO_NEW_PRIVS` と、それぞれの `PR_GET_*` に対応します。ほかの指定には
   `EINVAL` を返します。

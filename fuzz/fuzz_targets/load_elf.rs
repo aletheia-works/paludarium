@@ -35,6 +35,8 @@ fuzz_target!(|data: &[u8]| {
         envp: &envp,
         execfn: b"/prog",
         random: [0; 16],
+        ids: [0; 4],
+        secure: false,
     };
     let mut mem = AddressSpace::new();
     if load_bytes(&file, &start, &mut mem).is_ok() {

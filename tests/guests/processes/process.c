@@ -1101,6 +1101,18 @@ static const char *capabilities(const char *field) {
     unsigned long long fs = 0x1fULL | 1ULL << 9 | 1ULL << 27 | 1ULL << 32;
     return caps == all ? "all" : caps == 0 ? "none" : caps == (all & ~fs) ? "all-but-fs" : "other";
 }
+/* `fs.suid_dumpable`, which an undumpable process reads as its dumpable
+   value: 0 (the emulator's, and the kernel's default) unless the system
+   raised it. */
+static int suid_dumpable(void) {
+    int value = 0;
+    FILE *f = fopen("/proc/sys/fs/suid_dumpable", "r");
+    if (f) {
+        if (fscanf(f, "%d", &value) != 1) value = 0;
+        fclose(f);
+    }
+    return value;
+}
 static void credentials_line(const char *name) {
     unsigned r = 0, e = 0, sv = 0, gr = 0, ge = 0, gs = 0;
     syscall(SYS_getresuid, &r, &e, &sv);
@@ -1112,17 +1124,11 @@ static void credentials_line(const char *name) {
     if (status_field("Groups", groups, sizeof groups)) strcpy(groups, "missing");
     for (char *t = uid; *t; t++) if (*t == '\t') *t = '/';
     for (char *t = gid; *t; t++) if (*t == '\t') *t = '/';
-    int suid_dumpable = 0;
-    FILE *f = fopen("/proc/sys/fs/suid_dumpable", "r");
-    if (f) {
-        if (fscanf(f, "%d", &suid_dumpable) != 1) suid_dumpable = 0;
-        fclose(f);
-    }
     int dumpable = prctl(PR_GET_DUMPABLE);
     printf("%s: uid=%u/%u/%u/%ld gid=%u/%u/%u/%ld status-uid=%s status-gid=%s groups=[%s] "
            "prm=%s eff=%s dumpable=%s\n",
            name, r, e, sv, fsuid, gr, ge, gs, fsgid, uid, gid, groups, capabilities("CapPrm"),
-           capabilities("CapEff"), dumpable == 1 ? "1" : dumpable == suid_dumpable ? "suid" : "other");
+           capabilities("CapEff"), dumpable == 1 ? "1" : dumpable == suid_dumpable() ? "suid" : "other");
 }
 static unsigned thread_uid;
 static void *credentials_thread(void *unused) {
@@ -7809,7 +7815,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "permissions-exec")) {
-        printf("exec-only: uid=%u dumpable=%d\n", getuid(), prctl(PR_GET_DUMPABLE));
+        int dumpable = prctl(PR_GET_DUMPABLE);
+        printf("exec-only: uid=%u dumpable=%s\n", getuid(),
+               dumpable == 1 ? "1" : dumpable == suid_dumpable() ? "suid" : "other");
         return 0;
     }
     if (!strcmp(mode, "proc-status")) {

@@ -53,6 +53,8 @@ pub(crate) struct PendingSignal {
     pub child: Option<ChildSignal>,
     /// The process that sent it (`si_pid`), when that is not the receiver.
     pub sender: Option<u32>,
+    /// The sender's real user ID (`si_uid`), when it is not the receiver's.
+    pub sender_uid: Option<u32>,
     /// The siginfo `rt_sigqueueinfo` or `rt_tgsigqueueinfo` gave: Linux's
     /// `kernel_siginfo`, the first 48 bytes, delivered as they are.
     pub queued: Option<[u8; 48]>,
@@ -106,6 +108,8 @@ impl Discards {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChildSignal {
     pub pid: u32,
+    /// The child's real user ID.
+    pub uid: u32,
     pub status: i32,
     /// CPU time in nanoseconds, all reported as user time.
     pub cpu: u64,
@@ -153,13 +157,16 @@ pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128
     } else if signal.synchronous {
         info[16..24].copy_from_slice(&signal.addr.to_le_bytes());
     } else if let Some(child) = signal.child {
-        // si_uid stays 0: the guest runs as root. Times are in USER_HZ ticks.
+        // Times are in USER_HZ ticks.
         info[16..20].copy_from_slice(&child.pid.to_le_bytes());
+        info[20..24].copy_from_slice(&child.uid.to_le_bytes());
         info[24..28].copy_from_slice(&child.status.to_le_bytes());
         info[32..40].copy_from_slice(&(child.cpu / 10_000_000).to_le_bytes());
     } else if signal.code != SI_KERNEL {
         let sender = signal.sender.unwrap_or(process.pid);
         info[16..20].copy_from_slice(&sender.to_le_bytes());
+        let uid = signal.sender_uid.unwrap_or(process.credentials.uid);
+        info[20..24].copy_from_slice(&uid.to_le_bytes());
     }
     info
 }
@@ -176,6 +183,7 @@ impl PendingSignal {
             timer: None,
             child: None,
             sender: None,
+            sender_uid: None,
             queued: None,
             born: generation(),
         }

@@ -27,12 +27,14 @@ impl SignalInbox {
     /// emulator. The guest cannot see the sender, so `si_pid` is 0, as a PID
     /// namespace reports a sender outside it.
     pub fn send(&self, number: i32) -> Result<(), Errno> {
-        self.send_from(number, 0)
+        self.send_from(number, 0, 0)
     }
-    /// Queues a signal that process `sender` sent (`SI_USER`).
-    pub(crate) fn send_from(&self, number: i32, sender: u32) -> Result<(), Errno> {
+    /// Queues a signal that process `sender`, of real user ID `uid`, sent
+    /// (`SI_USER`).
+    pub(crate) fn send_from(&self, number: i32, sender: u32, uid: u32) -> Result<(), Errno> {
         self.send_pending(signals::PendingSignal {
             sender: Some(sender),
+            sender_uid: Some(uid),
             ..signals::PendingSignal::user(number, 0)
         })
     }
@@ -44,8 +46,11 @@ impl SignalInbox {
             ..signals::PendingSignal::user(17, code)
         })
     }
-    pub(crate) fn send_thread(&self, number: i32) -> Result<(), Errno> {
-        self.send_pending(signals::PendingSignal::thread(number, -6))
+    pub(crate) fn send_thread(&self, number: i32, uid: u32) -> Result<(), Errno> {
+        self.send_pending(signals::PendingSignal {
+            sender_uid: Some(uid),
+            ..signals::PendingSignal::thread(number, -6)
+        })
     }
     /// Queues a timer's thread-directed signal. While the timer's previous
     /// signal still waits here, the expiry adds to its overrun instead, as
@@ -258,7 +263,7 @@ mod signals_time_tests {
     fn a_thread_drain_leaves_process_signals_for_the_process() {
         let inbox = SignalInbox::default();
         inbox.send(10).unwrap();
-        inbox.send_thread(12).unwrap();
+        inbox.send_thread(12, 0).unwrap();
         let mut thread = ThreadState::default();
         let receipt = inbox.drain(&mut thread);
         assert!(receipt.signals);

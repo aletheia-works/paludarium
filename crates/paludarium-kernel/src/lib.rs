@@ -531,6 +531,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    sender_uid: None,
                     queued: None,
                     born: signals::generation(),
                 })
@@ -548,6 +549,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    sender_uid: None,
                     queued: None,
                     born: signals::generation(),
                 })
@@ -565,6 +567,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    sender_uid: None,
                     queued: None,
                     born: signals::generation(),
                 })
@@ -593,6 +596,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    sender_uid: None,
                     queued: None,
                     born: signals::generation(),
                 })
@@ -610,6 +614,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    sender_uid: None,
                     queued: None,
                     born: signals::generation(),
                 })
@@ -627,6 +632,7 @@ impl Kernel {
                     timer: None,
                     child: None,
                     sender: None,
+                    sender_uid: None,
                     queued: None,
                     born: signals::generation(),
                 })
@@ -699,6 +705,7 @@ impl Kernel {
             return Next::Resume;
         };
         let mut ctx = syscalls::Context {
+            tid: thread.tid,
             host: &*self.host,
             shared_host: &self.host,
             files: &mut self.files,

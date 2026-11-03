@@ -1,4 +1,5 @@
 //! Emulated process registry; no lock spans Host waits or guest execution.
+use crate::credentials::SignalIds;
 use crate::fasync::{FileOwner, OwnerKind, Reason};
 use crate::{Kernel, Next, SignalInbox, Thread, ThreadGroup, ThreadState, signals};
 use paludarium_cpu::{CpuState, reg};
@@ -71,6 +72,7 @@ impl Drop for TaskCharge {
     }
 }
 
+const SIGCONT: i32 = 18;
 /// RLIMIT_CPU ... RLIMIT_RTTIME.
 pub(crate) const RLIMITS: usize = 16;
 const INFINITY: u64 = u64::MAX;
@@ -474,9 +476,20 @@ impl Processes {
             }
         }
         // Children that asked for it learn that this process exited.
-        for child in entries.values() {
+        let parent_ids = entries.get(&pid).map(|p| p.group.signal_ids(pid, pid));
+        let parent_session = entries.get(&pid).map(|p| p.sid);
+        let same_session = |child: &Entry| Some(child.sid) == parent_session;
+        for (&child_pid, child) in entries.iter() {
             if child.parent == pid && child.status.is_none() && child.death_signal != 0 {
-                let _ = child.group.send_process_from(child.death_signal, pid);
+                // Linux sends it as the exiting parent, as with `kill`.
+                let sender = parent_ids.unwrap_or_default();
+                if sender.may_signal(child.group.signal_ids(child_pid, child_pid))
+                    || (child.death_signal == SIGCONT && same_session(child))
+                {
+                    let _ = child
+                        .group
+                        .send_process_from(child.death_signal, pid, sender.uid);
+                }
             }
         }
         // As Linux's forget_original_parent: the children go to the nearest
@@ -602,9 +615,15 @@ impl Processes {
         };
         if !(reap && ignored) {
             let cpu = entry.group.process_cpu();
-            parent
-                .group
-                .notify_child(code, signals::ChildSignal { pid, status, cpu });
+            parent.group.notify_child(
+                code,
+                signals::ChildSignal {
+                    pid,
+                    uid: entry.group.signal_ids(pid, pid).uid,
+                    status,
+                    cpu,
+                },
+            );
         }
         reap
     }
@@ -637,7 +656,7 @@ impl Processes {
         parent: u32,
         wanted: Wanted,
         wait: WaitFor,
-    ) -> Result<Option<(u32, ChildEvent, u64)>, Errno> {
+    ) -> Result<Option<(u32, ChildEvent, u64, u32)>, Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let matching = |pid: u32, entry: &Entry| {
             entry.parent == parent
@@ -667,9 +686,9 @@ impl Processes {
                 },
             }?;
             let cpu = entry.group.process_cpu().saturating_add(entry.children_cpu);
-            Some((pid, event, cpu))
+            Some((pid, event, cpu, entry.group.signal_ids(pid, pid).uid))
         });
-        if let Some((pid, event, cpu)) = ready
+        if let Some((pid, event, cpu, _)) = ready
             && !wait.keep
         {
             match event {
@@ -712,6 +731,7 @@ impl Processes {
         let parent = entry.parent;
         let child = signals::ChildSignal {
             pid,
+            uid: group.signal_ids(pid, pid).uid,
             status: signal,
             cpu: group.process_cpu(),
         };
@@ -778,9 +798,11 @@ impl Processes {
     /// count until they are reaped. With no process to send to it is `ESRCH`,
     /// even for an invalid signal; otherwise a group succeeds if any member
     /// took the signal, and -1 reports the last error.
-    fn kill(&self, caller: u32, target: i32, number: i32) -> Result<(), Errno> {
+    fn kill(&self, caller: u32, sender: SignalIds, target: i32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let pids: Vec<u32> = match target {
+        // The processes, with the thread each is named by, whose credentials
+        // decide: Linux signals a thread group through the task it finds.
+        let pids: Vec<(u32, u32)> = match target {
             // A thread's ID names its process, as Linux finds the task and
             // signals its thread group.
             pid if pid > 0 => {
@@ -790,7 +812,7 @@ impl Processes {
                     .find(|&(&key, entry)| {
                         key == pid || (entry.status.is_none() && entry.group.has_member(pid))
                     })
-                    .map(|(&key, _)| key)
+                    .map(|(&key, _)| (key, pid))
                     .into_iter()
                     .collect()
             }
@@ -798,6 +820,7 @@ impl Processes {
                 .keys()
                 .copied()
                 .filter(|&pid| pid != 1 && pid != caller)
+                .map(|pid| (pid, pid))
                 .collect(),
             i32::MIN => Vec::new(),
             group => {
@@ -809,22 +832,54 @@ impl Processes {
                 entries
                     .iter()
                     .filter(|(_, entry)| entry.pgid == pgid)
-                    .map(|(&pid, _)| pid)
+                    .map(|(&pid, _)| (pid, pid))
                     .collect()
             }
         };
         if pids.is_empty() {
             return Err(Errno(3));
         }
+        let signal = Self::from_process(number, caller, sender.uid);
         let (mut last, mut delivered) = (Ok(()), false);
-        for pid in pids {
-            last = self.send(&mut entries, pid, None, Self::from_process(number, caller));
-            delivered |= last.is_ok();
+        for (pid, named) in pids {
+            let result = Self::check_kill(&entries, caller, sender, pid, named, number)
+                .and_then(|()| self.send(&mut entries, pid, None, signal));
+            delivered |= result.is_ok();
+            // -1 does not report a process it may not signal, so with only
+            // those it succeeds, as Linux's `kill_something_info`.
+            if target != -1 || result != Err(Errno::EPERM) {
+                last = result;
+            }
         }
         if delivered && target != -1 {
             Ok(())
         } else {
             last
+        }
+    }
+    /// Linux's `check_kill_permission` of `number` from a thread of `caller`
+    /// to process `pid` through its thread `named`: an invalid signal is left
+    /// for delivery to refuse (EINVAL first), its own process may always be
+    /// signalled, and SIGCONT may also be sent within the session.
+    fn check_kill(
+        entries: &BTreeMap<u32, Entry>,
+        caller: u32,
+        sender: SignalIds,
+        pid: u32,
+        named: u32,
+        number: i32,
+    ) -> Result<(), Errno> {
+        if !(0..=64).contains(&number) || pid == caller {
+            return Ok(());
+        }
+        let entry = entries.get(&pid).ok_or(Errno(3))?;
+        let session = entries.get(&caller).map(|c| c.sid);
+        if sender.may_signal(entry.group.signal_ids(pid, named))
+            || (number == SIGCONT && session == Some(entry.sid))
+        {
+            Ok(())
+        } else {
+            Err(Errno::EPERM)
         }
     }
     /// The processes (and, for a thread owner, the thread) `owner` names:
@@ -892,13 +947,35 @@ impl Processes {
             .unwrap_or_else(PoisonError::into_inner)
             .set(file, owner);
     }
-    fn signal(&self, sender: u32, pid: u32, number: i32) -> Result<(), Errno> {
+    /// Whether `pidfd_send_signal` from `caller` may signal process `pid`.
+    fn may_signal(
+        &self,
+        caller: u32,
+        sender: SignalIds,
+        pid: u32,
+        number: i32,
+    ) -> Result<(), Errno> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::check_kill(&entries, caller, sender, pid, pid, number)
+    }
+    fn signal(&self, caller: u32, uid: u32, pid: u32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        self.send(&mut entries, pid, None, Self::from_process(number, sender))
+        self.send(
+            &mut entries,
+            pid,
+            None,
+            Self::from_process(number, caller, uid),
+        )
     }
     /// `rt_sigqueueinfo` of `signal` to `pid`, which a thread's ID also
     /// names, as `kill` finds it.
-    fn queue(&self, pid: u32, signal: signals::PendingSignal) -> Result<(), Errno> {
+    fn queue(
+        &self,
+        caller: u32,
+        sender: SignalIds,
+        pid: u32,
+        signal: signals::PendingSignal,
+    ) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let found = entries
             .iter()
@@ -907,11 +984,14 @@ impl Processes {
             })
             .map(|(&key, _)| key)
             .ok_or(Errno(3))?;
+        Self::check_kill(&entries, caller, sender, found, pid, signal.number)?;
         self.send(&mut entries, found, None, signal)
     }
     /// `rt_tgsigqueueinfo` of `signal` to thread `tid` of process `tgid`.
     fn queue_thread(
         &self,
+        caller: u32,
+        sender: SignalIds,
         tgid: u32,
         tid: u32,
         signal: signals::PendingSignal,
@@ -923,6 +1003,7 @@ impl Processes {
         {
             return Err(Errno(3));
         }
+        Self::check_kill(&entries, caller, sender, tgid, tid, signal.number)?;
         self.send(&mut entries, tgid, Some(tid), signal)
     }
     /// [`Self::deliver`] for a process's `kill` or queued signal, which wakes
@@ -943,10 +1024,12 @@ impl Processes {
     fn from_kernel(number: i32) -> signals::PendingSignal {
         signals::PendingSignal::user(number, signals::SI_KERNEL)
     }
-    /// A signal process `sender` sends with `kill` (`SI_USER`).
-    fn from_process(number: i32, sender: u32) -> signals::PendingSignal {
+    /// A signal process `sender`, of real user ID `uid`, sends with `kill`
+    /// (`SI_USER`).
+    fn from_process(number: i32, sender: u32, uid: u32) -> signals::PendingSignal {
         signals::PendingSignal {
             sender: Some(sender),
+            sender_uid: Some(uid),
             ..signals::PendingSignal::user(number, 0)
         }
     }
@@ -976,6 +1059,7 @@ impl Processes {
             let parent = entry.parent;
             let child = signals::ChildSignal {
                 pid,
+                uid: entry.group.signal_ids(pid, pid).uid,
                 status: 18,
                 cpu: entry.group.process_cpu(),
             };
@@ -1198,7 +1282,7 @@ impl Kernel {
             61 => self.wait4(thread, mem, a),
             247 => self.waitid(thread, mem, a),
             434 => self.pidfd_open(a),
-            424 => self.pidfd_send_signal(a),
+            424 => self.pidfd_send_signal(thread, a),
             129 => self.sigqueueinfo(thread, mem, a),
             297 => self.tgsigqueueinfo(thread, mem, a),
             110 => Ok(u64::from(self.processes.parent(self.process.pid))),
@@ -1225,7 +1309,12 @@ impl Kernel {
             160 => self.prlimit(mem, 0, a[0], a[1], 0),
             62 => self
                 .processes
-                .kill(self.process.pid, a[0] as i32, a[1] as i32)
+                .kill(
+                    self.process.pid,
+                    thread.state.credentials.signal_ids(),
+                    a[0] as i32,
+                    a[1] as i32,
+                )
                 .map(|()| 0),
             _ => return None,
         };
@@ -1443,6 +1532,7 @@ impl Kernel {
                 .write(GuestAddr(a[3]), &pid.to_le_bytes());
         }
         let release = (flags & 0x4000 != 0).then(|| Arc::new(AtomicBool::new(false)));
+        group.set_signal_ids(pid, parent.state.credentials.signal_ids());
         self.processes.insert(
             pid,
             self.process.pid,
@@ -1498,7 +1588,9 @@ impl Kernel {
         };
         loop {
             let ticket = self.processes.changed().value();
-            if let Some((pid, event, cpu)) = self.processes.reap(self.process.pid, wanted, wait)? {
+            if let Some((pid, event, cpu, _)) =
+                self.processes.reap(self.process.pid, wanted, wait)?
+            {
                 let raw = match event {
                     ChildEvent::Exited(ExitStatus::Exited(code)) => (code & 255) << 8,
                     ChildEvent::Exited(ExitStatus::Signaled(signal)) => signal & 127,
@@ -1540,28 +1632,34 @@ impl Kernel {
     /// with a child.
     fn waitid(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         let found = self.waitid_child(thread, a);
-        if let Ok(Some((_, _, cpu))) = found
+        if let Ok(Some((_, _, cpu, _))) = found
             && a[4] != 0
         {
             mem.write(GuestAddr(a[4]), &crate::syscalls::rusage(cpu))
                 .map_err(|_| Errno::EFAULT)?;
         }
         if a[2] != 0 {
-            let (signo, code, pid, status) = match found {
-                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Exited(code)), _))) => {
-                    (17, 1, pid, code & 255)
+            let (signo, code, pid, uid, status) = match found {
+                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Exited(code)), _, uid))) => {
+                    (17, 1, pid, uid, code & 255)
                 }
-                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Signaled(signal)), _))) => {
-                    (17, 2, pid, signal)
+                Ok(Some((pid, ChildEvent::Exited(ExitStatus::Signaled(signal)), _, uid))) => {
+                    (17, 2, pid, uid, signal)
                 }
-                Ok(Some((pid, ChildEvent::Dumped(signal), _))) => (17, 3, pid, signal),
+                Ok(Some((pid, ChildEvent::Dumped(signal), _, uid))) => (17, 3, pid, uid, signal),
                 // CLD_STOPPED and CLD_CONTINUED.
-                Ok(Some((pid, ChildEvent::Stopped(signal), _))) => (17, 5, pid, signal),
-                Ok(Some((pid, ChildEvent::Continued, _))) => (17, 6, pid, 18),
-                _ => (0, 0, 0, 0),
+                Ok(Some((pid, ChildEvent::Stopped(signal), _, uid))) => (17, 5, pid, uid, signal),
+                Ok(Some((pid, ChildEvent::Continued, _, uid))) => (17, 6, pid, uid, 18),
+                _ => (0, 0, 0, 0, 0),
             };
             let mut info = [0; 28];
-            for (at, value) in [(0, signo), (8, code), (16, pid as i32), (24, status)] {
+            for (at, value) in [
+                (0, signo),
+                (8, code),
+                (16, pid as i32),
+                (20, uid as i32),
+                (24, status),
+            ] {
                 info[at..at + 4].copy_from_slice(&value.to_le_bytes());
             }
             mem.write(GuestAddr(a[2]), &info)
@@ -1573,7 +1671,7 @@ impl Kernel {
         &self,
         thread: &mut Thread,
         a: [u64; 6],
-    ) -> Result<Option<(u32, ChildEvent, u64)>, Errno> {
+    ) -> Result<Option<(u32, ChildEvent, u64, u32)>, Errno> {
         const KNOWN: u64 =
             WNOHANG | 2 | WEXITED | 8 | WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
         let options = u64::from(a[3] as u32);
@@ -1666,7 +1764,12 @@ impl Kernel {
             return Err(Errno(3));
         }
         self.processes
-            .queue(pid.cast_unsigned(), signal)
+            .queue(
+                self.process.pid,
+                thread.state.credentials.signal_ids(),
+                pid.cast_unsigned(),
+                signal,
+            )
             .map(|()| 0)
     }
     /// `rt_tgsigqueueinfo(tgid, tid, sig, info)`, as `do_rt_tgsigqueueinfo`:
@@ -1686,13 +1789,19 @@ impl Kernel {
             return Err(Errno(1));
         }
         self.processes
-            .queue_thread(tgid.cast_unsigned(), tid.cast_unsigned(), signal)
+            .queue_thread(
+                self.process.pid,
+                thread.state.credentials.signal_ids(),
+                tgid.cast_unsigned(),
+                tid.cast_unsigned(),
+                signal,
+            )
             .map(|()| 0)
     }
     /// `pidfd_send_signal(pidfd, sig, info, flags)`, as `kill` on the
     /// pidfd's process; a siginfo and the scope flags are not supported
     /// (`EINVAL`).
-    fn pidfd_send_signal(&self, a: [u64; 6]) -> Result<u64, Errno> {
+    fn pidfd_send_signal(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
         if a[3] as u32 != 0 {
             return Err(Errno::EINVAL);
         }
@@ -1707,14 +1816,16 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         // A zombie takes the signal and drops it; a reaped process is gone.
-        match self.processes.exited(pidfd.pid) {
-            Some(false) => self
-                .processes
-                .signal(self.process.pid, pidfd.pid, number)
-                .map(|()| 0),
-            Some(true) => Ok(0),
-            None => Err(Errno(3)),
+        let exited = self.processes.exited(pidfd.pid).ok_or(Errno(3))?;
+        let sender = thread.state.credentials.signal_ids();
+        self.processes
+            .may_signal(self.process.pid, sender, pidfd.pid, number)?;
+        if exited {
+            return Ok(0);
         }
+        self.processes
+            .signal(self.process.pid, sender.uid, pidfd.pid, number)
+            .map(|()| 0)
     }
     /// Closes what exec closed, as Linux's `__fput` does on the way back to
     /// the new program: a socket's last descriptor waits for its linger
@@ -1725,7 +1836,9 @@ impl Kernel {
         mem: &AddressSpace,
         closed: Vec<crate::files::Descriptor>,
     ) {
+        let tid = thread.tid;
         let mut c = crate::syscalls::Context {
+            tid,
             host: &*self.host,
             shared_host: &self.host,
             files: &mut self.files,
@@ -1845,6 +1958,8 @@ impl Kernel {
         let dumpable = old.euid == old.uid && old.egid == old.gid && readable && !changed;
         self.processes
             .executed_as(self.process.pid, dumpable, secure || changed, secure);
+        self.group
+            .reset_signal_ids(self.process.pid, credentials.signal_ids());
         thread.state.credentials = credentials;
         self.processes.mark_executed(self.process.pid);
         self.exec_memory = Some(Arc::new(memory));

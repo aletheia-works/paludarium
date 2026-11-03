@@ -843,6 +843,77 @@ mod process {
         );
     }
 }
+mod signal_permissions {
+    use super::*;
+    /// `setresuid` for thread `t`.
+    fn become_user(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, uid: u64) {
+        assert_eq!(syscall(k, t, m, 117, [uid, uid, uid, 0, 0, 0]), 0);
+    }
+    #[test]
+    fn a_process_of_another_user_refuses_its_signal() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let child = u64::from(ct.tid);
+        become_user(&mut c, &mut ct, &cm, 3000);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        become_user(&mut s, &mut st, &sm, 2000);
+        let eperm = Errno::EPERM.to_syscall_return();
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 62, [child, 0, 0, 0, 0, 0]),
+            eperm
+        );
+        // An invalid signal is refused for that first.
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 62, [child, 65, 0, 0, 0, 0]),
+            Errno::EINVAL.to_syscall_return()
+        );
+        // Its session lets SIGCONT through, and root may send anything.
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 62, [child, 18, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [child, 0, 0, 0, 0, 0]), 0);
+        // A process of the same user may, through an ID `setresuid` recorded
+        // and a `fork` passed on.
+        let (mut o, mut ot, om) = fork(&mut c, &mut ct, &cm);
+        assert_eq!(syscall(&mut o, &mut ot, &om, 62, [child, 0, 0, 0, 0, 0]), 0);
+        let forked = u64::from(ot.tid);
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 62, [forked, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 62, [forked, 0, 0, 0, 0, 0]),
+            eperm
+        );
+        // Its own process, whoever that is.
+        let own = u64::from(st.tid);
+        assert_eq!(syscall(&mut s, &mut st, &sm, 62, [own, 0, 0, 0, 0, 0]), 0);
+    }
+    #[test]
+    fn exec_records_the_ids_it_gives() {
+        let (mut k, mut t, m) = exec_setup();
+        k.files
+            .fs
+            .set_owner(b"/child", true, Some(3000), None)
+            .unwrap();
+        k.files.fs.set_mode(b"/child", 0o4755).unwrap();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let child = u64::from(ct.tid);
+        become_user(&mut c, &mut ct, &cm, 2000);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        become_user(&mut s, &mut st, &sm, 3000);
+        let eperm = Errno::EPERM.to_syscall_return();
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 62, [child, 0, 0, 0, 0, 0]),
+            eperm
+        );
+        // The set-user-ID program's owner is now the saved ID.
+        cm.write(GuestAddr(DATA), b"/child\0").unwrap();
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(&mut s, &mut st, &sm, 62, [child, 0, 0, 0, 0, 0]), 0);
+    }
+}
 fn exec_setup() -> (Kernel, Thread, AddressSpace) {
     let (mut k, t, m) = setup();
     let mut fs = paludarium_vfs::MemFs::new();
@@ -1906,9 +1977,9 @@ mod queued_signals {
         // SIGUSR1 reaches the shared queue at a checkpoint, and a realtime
         // signal comes before the leader drains its own inbox, which is
         // also the process's: it must not overtake SIGUSR1.
-        k.group.send_process_from(10, 2).unwrap();
+        k.group.send_process_from(10, 2, 0).unwrap();
         k.group.drain_process(&mut t.state);
-        k.group.send_process_from(34, 2).unwrap();
+        k.group.send_process_from(34, 2, 0).unwrap();
         k.inbox.drain(&mut t.state);
         assert_eq!(take(&mut k, &mut t, &m, USR1 | RT).0, 10);
         assert_eq!(take(&mut k, &mut t, &m, USR1 | RT).0, 34);

@@ -608,9 +608,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   でそのプロセスに、0 で呼び出し元のプロセスグループに、`-pgid` でほかのグループに、
   -1 で最初のプロセスと呼び出し元以外のすべてのプロセスに届きます。終わったプロセスも、
   回収されるまでは数えます。送る相手のプロセスがなければ、無効なシグナルでも `ESRCH`
-  を返し、相手がいれば無効なシグナルは `EINVAL` を返します。`kill` や
-  `pidfd_send_signal` で送ったシグナルの `si_pid` は送り主の PID に、
-  `PR_SET_PDEATHSIG` のシグナルの `si_pid` は終わった親の PID になります。
+  を返し、相手がいれば無効なシグナルは `EINVAL` を返します。Linux の
+  `check_kill_permission` と同じく、スレッドがほかのプロセスに送れるのは、実ユーザー ID か
+  実効ユーザー ID が相手の実 ID か保存 ID と同じか、`CAP_KILL` があるときで、`SIGCONT` は
+  同じセッションの中でも送れます。そうでなければ `kill`、`rt_sigqueueinfo`、
+  `rt_tgsigqueueinfo`、`pidfd_send_signal` は、シグナル 0 やゾンビでも `EPERM` を返します。
+  確かめる資格情報は ID が指すスレッドのものです。グループはどれかのメンバーに届けば
+  成功とし、-1 は送れない相手を報告しません。`kill` や `pidfd_send_signal` で送った
+  シグナルの `si_pid` と `si_uid` は送り主の PID と実ユーザー ID に（`tkill` と `tgkill`
+  も同じです）、`PR_SET_PDEATHSIG` のシグナルでは終わった親の PID と実ユーザー ID に
+  なります。このシグナルにも同じ許可が要ります。
 - `rt_sigqueueinfo`（`sigqueue` の中身）は、呼び出し元の siginfo をそのままプロセスに
   送り、`rt_tgsigqueueinfo` は 1 つのスレッドに送ります。そのためシグナルは値を運び、
   リアルタイムシグナルは送った数だけ届きます。Linux と同じく、カーネルや `kill`、
@@ -679,7 +686,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   残します）、親が `SA_NOCLDSTOP` を付けていなければ `SIGCHLD` で知らせます。
   `SIGCHLD` の siginfo には、子の PID、`CLD_*` のコード（`CLD_EXITED`、`CLD_KILLED`、
   `CLD_STOPPED`、`CLD_CONTINUED`）、状態、`si_utime` としての CPU 時間が入ります。
-  `si_uid` は 0 で、`SIGCHLD` が保留中に届いた次の `SIGCHLD` は、Linux と同じく捨てます。
+  `si_uid` と `waitid` の `si_uid` は子の実ユーザー ID で、`SIGCHLD` が保留中に届いた次の
+  `SIGCHLD` は、Linux と同じく捨てます。
   `SIGCHLD` を無視するか `SA_NOCLDWAIT` を設定したプロセスの子は、終了シグナルが
   `SIGCHLD` なら、Linux の `do_notify_parent` と同じく終わったその場で回収します。
   待ちはそうした子が終わるまで待ってから `ECHILD` で失敗し、その CPU 時間は親の

@@ -1187,6 +1187,80 @@ static void permissions_owner(const char *name, const char *path) {
     }
     printf("%s: uid=%u gid=%u mode=%o\n", name, st.st_uid, st.st_gid, st.st_mode & 07777);
 }
+/* The signal-permissions case: a process that waits with the given IDs. */
+static pid_t signal_target(unsigned real, unsigned effective, unsigned saved, int own_group) {
+    int ready[2];
+    if (pipe(ready)) _exit(90);
+    fflush(stdout);
+    pid_t pid = child();
+    if (pid == 0) {
+        close(ready[0]);
+        if (own_group) setpgid(0, 0);
+        if (syscall(SYS_setresuid, real, effective, saved)) _exit(91);
+        char byte = 1;
+        if (write(ready[1], &byte, 1) != 1) _exit(92);
+        for (;;) pause();
+    }
+    close(ready[1]);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) _exit(93);
+    close(ready[0]);
+    return pid;
+}
+static void signal_kill_reap(pid_t pid) {
+    kill(pid, SIGKILL);
+    int status = 0;
+    waitpid(pid, &status, 0);
+}
+/* Sends with these IDs, in a child of their own. */
+#define AS_SENDER(real, effective, saved, body) do { \
+        fflush(stdout); \
+        pid_t sender_pid = child(); \
+        if (sender_pid == 0) { \
+            if (syscall(SYS_setresuid, real, effective, saved)) _exit(94); \
+            body; \
+            fflush(stdout); \
+            _exit(0); \
+        } \
+        int sender_status = 0; \
+        waitpid(sender_pid, &sender_status, 0); \
+        printf("sender: status=%d\n", sender_status); \
+    } while (0)
+static void signal_queue_info(siginfo_t *info) {
+    memset(info, 0, sizeof *info);
+    info->si_code = SI_QUEUE;
+}
+/* What a signal waited for shows of its sender. */
+static void signal_seen(const char *name, int number, pid_t sender) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, number);
+    siginfo_t info;
+    struct timespec patience = {5, 0};
+    int got = sigtimedwait(&set, &info, &patience);
+    if (got < 0) {
+        printf("%s: %s\n", name, strerror(errno));
+        return;
+    }
+    printf("%s: signal=%d code=%d uid=%u sender=%d\n", name, got, info.si_code, info.si_uid,
+           info.si_pid == sender);
+}
+static int signal_thread_pipe[2];
+static void *signal_thread_with_ids(void *unused) {
+    (void)unused;
+    pid_t tid = syscall(SYS_gettid);
+    if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(95);
+    if (write(signal_thread_pipe[1], &tid, sizeof tid) != sizeof tid) _exit(96);
+    for (;;) pause();
+    return NULL;
+}
+static pid_t signal_main_thread;
+static void *signal_thread_tkills(void *unused) {
+    (void)unused;
+    if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(97);
+    syscall(SYS_tgkill, getpid(), signal_main_thread, SIGUSR1);
+    return NULL;
+}
 static void finish(pid_t pid) {
     int status = 0;
     result("wait", waitpid(pid, &status, 0) == pid);
@@ -7935,6 +8009,229 @@ int main(int argc, char **argv) {
                getauxval(AT_SECURE), signal,
                stack.rlim_cur == RLIM_INFINITY ? "unlimited" : stack.rlim_cur == 8 << 20 ? "8M" : "other");
         credentials_line(argc > 3 ? argv[3] : "exec");
+        return 0;
+    }
+    if (!strcmp(mode, "signal-permissions")) {
+        /* Who may signal whom (the native side runs as root), as Linux's
+           check_kill_permission: the sender's real or effective user ID
+           against the target's real or saved one, or CAP_KILL, within a
+           process always, and SIGCONT within a session; an invalid signal
+           and a missing process before that; groups and -1; the queued and
+           pidfd calls; a zombie; each thread's own credentials; and si_uid. */
+        prctl(PR_SET_CHILD_SUBREAPER, 1);
+        pid_t other = signal_target(3000, 3000, 3000, 0);
+        pid_t real = signal_target(2000, 3000, 3000, 0);
+        pid_t saved = signal_target(3000, 3000, 2000, 0);
+        pid_t effective = signal_target(3000, 2000, 3000, 0);
+        pid_t far = signal_target(4000, 4000, 4000, 0);
+        pid_t alone = signal_target(3000, 3000, 3000, 1);
+        pid_t mixed_other = signal_target(3000, 3000, 3000, 1);
+        pid_t mixed_real = signal_target(2000, 2000, 2000, 0);
+        setpgid(mixed_real, mixed_other);
+        fflush(stdout);
+        pid_t zombie = child();
+        if (zombie == 0) {
+            if (syscall(SYS_setresuid, 3000, 3000, 3000)) _exit(70);
+            _exit(0);
+        }
+        siginfo_t seen;
+        waitid(P_PID, zombie, &seen, WEXITED|WNOWAIT);
+        pid_t gone = child();
+        if (gone == 0) _exit(0);
+        int status = 0;
+        waitpid(gone, &status, 0);
+        int other_fd = syscall(SYS_pidfd_open, other, 0);
+        int real_fd = syscall(SYS_pidfd_open, real, 0);
+        int zombie_fd = syscall(SYS_pidfd_open, zombie, 0);
+        AS_SENDER(2000, 2000, 2000, {
+            permitted("uid-other", kill(other, 0));
+            permitted("uid-real", kill(real, 0));
+            permitted("uid-saved", kill(saved, 0));
+            permitted("uid-effective", kill(effective, 0));
+            permitted("uid-term-other", kill(other, SIGTERM));
+            permitted("invalid-other", kill(other, 65));
+            permitted("missing", kill(gone, 0));
+            permitted("zombie", kill(zombie, 0));
+            permitted("cont-same-session", kill(other, SIGCONT));
+            permitted("group-other", kill(-alone, 0));
+            permitted("group-mixed", kill(-mixed_other, 0));
+            permitted("everyone", kill(-1, 0));
+            siginfo_t info;
+            signal_queue_info(&info);
+            permitted("queue-other", syscall(SYS_rt_sigqueueinfo, other, 0, &info));
+            permitted("queue-real", syscall(SYS_rt_sigqueueinfo, real, 0, &info));
+            permitted("queue-thread-other", syscall(SYS_rt_tgsigqueueinfo, other, other, 0, &info));
+            permitted("queue-thread-real", syscall(SYS_rt_tgsigqueueinfo, real, real, 0, &info));
+            permitted("pidfd-other", syscall(SYS_pidfd_send_signal, other_fd, 0, NULL, 0));
+            permitted("pidfd-real", syscall(SYS_pidfd_send_signal, real_fd, 0, NULL, 0));
+            permitted("pidfd-zombie", syscall(SYS_pidfd_send_signal, zombie_fd, 0, NULL, 0));
+            permitted("self", kill(getpid(), 0));
+        });
+        AS_SENDER(2001, 3000, 2001, {
+            permitted("effective-other", kill(other, 0));
+            permitted("effective-far", kill(far, 0));
+        });
+        AS_SENDER(2001, 2001, 3000, {
+            permitted("saved-sender-other", kill(other, 0));
+        });
+        AS_SENDER(0, 3000, 0, {
+            permitted("real-root-far", kill(far, 0));
+            permitted("real-root-other", kill(other, 0));
+        });
+        AS_SENDER(2000, 2000, 2000, {
+            if (setsid() < 0) _exit(71);
+            permitted("cont-other-session", kill(other, SIGCONT));
+            permitted("zero-other-session", kill(other, 0));
+            permitted("cont-real-other-session", kill(real, SIGCONT));
+        });
+        permitted("root-far", kill(far, 0));
+        /* Refused signals did nothing. */
+        permitted("still-there", waitpid(other, &status, WNOHANG) == 0 ? 0 : -1);
+        waitpid(zombie, &status, 0);
+        pid_t targets[] = {other, real, saved, effective, far, alone, mixed_other, mixed_real};
+        for (size_t i = 0; i < sizeof targets / sizeof *targets; i++) signal_kill_reap(targets[i]);
+        /* Each thread has its own credentials: a thread's ID is checked
+           against that thread, its process's against the leader. */
+        if (pipe(signal_thread_pipe)) return 72;
+        fflush(stdout);
+        pid_t threaded = child();
+        if (threaded == 0) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, signal_thread_with_ids, NULL)) _exit(73);
+            pid_t tid;
+            if (read(signal_thread_pipe[0], &tid, sizeof tid) != sizeof tid) _exit(74);
+            if (syscall(SYS_setresuid, 3000, 3000, 3000)) _exit(75);
+            if (write(signal_thread_pipe[1], &tid, sizeof tid) != sizeof tid) _exit(76);
+            for (;;) pause();
+        }
+        pid_t thread_id;
+        if (read(signal_thread_pipe[0], &thread_id, sizeof thread_id) != sizeof thread_id) return 77;
+        AS_SENDER(2000, 2000, 2000, {
+            permitted("thread-id", kill(thread_id, 0));
+            permitted("thread-leader", kill(threaded, 0));
+            siginfo_t info;
+            signal_queue_info(&info);
+            permitted("thread-queue", syscall(SYS_rt_tgsigqueueinfo, threaded, thread_id, 0, &info));
+            permitted("thread-queue-leader", syscall(SYS_rt_tgsigqueueinfo, threaded, threaded, 0, &info));
+        });
+        signal_kill_reap(threaded);
+        /* si_uid: the sender's real user ID, not its effective one. */
+        sigset_t usr1;
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        sigaddset(&usr1, SIGCHLD);
+        fflush(stdout);
+        pid_t receiver = child();
+        if (receiver == 0) {
+            sigprocmask(SIG_BLOCK, &usr1, NULL);
+            if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(78);
+            fflush(stdout);
+            pid_t sender = child();
+            if (sender == 0) {
+                kill(getppid(), SIGUSR1);
+                _exit(0);
+            }
+            signal_seen("kill-uid", SIGUSR1, sender);
+            int sender_status = 0;
+            waitpid(sender, &sender_status, 0);
+            /* A signal to itself, from the raw call. */
+            syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR1);
+            signal_seen("tgkill-self-uid", SIGUSR1, getpid());
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(receiver, &status, 0);
+        printf("receiver: status=%d\n", status);
+        /* A thread that left root signals its leader, which has not. */
+        fflush(stdout);
+        pid_t sibling = child();
+        if (sibling == 0) {
+            sigprocmask(SIG_BLOCK, &usr1, NULL);
+            signal_main_thread = syscall(SYS_gettid);
+            pthread_t t;
+            if (pthread_create(&t, NULL, signal_thread_tkills, NULL)) _exit(80);
+            signal_seen("tgkill-sibling-uid", SIGUSR1, getpid());
+            pthread_join(t, NULL);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(sibling, &status, 0);
+        printf("sibling: status=%d\n", status);
+        /* A child reports its real user ID, to SIGCHLD and to waitid. */
+        sigprocmask(SIG_BLOCK, &usr1, NULL);
+        fflush(stdout);
+        pid_t leaving = child();
+        if (leaving == 0) {
+            if (syscall(SYS_setresuid, 2000, 3000, 3000)) _exit(81);
+            _exit(0);
+        }
+        signal_seen("chld-uid", SIGCHLD, leaving);
+        siginfo_t wait_info;
+        memset(&wait_info, 0, sizeof wait_info);
+        waitid(P_PID, leaving, &wait_info, WEXITED);
+        printf("waitid-uid: uid=%u code=%d\n", wait_info.si_uid, wait_info.si_code);
+        fflush(stdout);
+        pid_t stopping = child();
+        if (stopping == 0) {
+            if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(82);
+            raise(SIGSTOP);
+            _exit(0);
+        }
+        signal_seen("chld-stop-uid", SIGCHLD, stopping);
+        memset(&wait_info, 0, sizeof wait_info);
+        waitid(P_PID, stopping, &wait_info, WSTOPPED);
+        printf("waitid-stop-uid: uid=%u code=%d\n", wait_info.si_uid, wait_info.si_code);
+        kill(stopping, SIGCONT);
+        signal_seen("chld-cont-uid", SIGCHLD, stopping);
+        waitpid(stopping, &status, 0);
+        signal_seen("chld-after-cont-uid", SIGCHLD, stopping);
+        sigprocmask(SIG_UNBLOCK, &usr1, NULL);
+        /* The parent-death signal is sent as the exiting parent, so it needs
+           the same permission. */
+        for (unsigned parent_uid = 2000; parent_uid <= 3000; parent_uid += 1000) {
+            int up[2];
+            if (pipe(up)) return 83;
+            fflush(stdout);
+            pid_t dying = child();
+            if (dying == 0) {
+                sigset_t mask;
+                sigemptyset(&mask);
+                sigaddset(&mask, SIGUSR1);
+                sigprocmask(SIG_BLOCK, &mask, NULL);
+                fflush(stdout);
+                pid_t orphan = child();
+                if (orphan == 0) {
+                    pid_t parent = getppid();
+                    if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(84);
+                    prctl(PR_SET_PDEATHSIG, SIGUSR1);
+                    char byte = 1;
+                    if (write(up[1], &byte, 1) != 1) _exit(85);
+                    close(up[1]);
+                    sigset_t wanted;
+                    sigemptyset(&wanted);
+                    sigaddset(&wanted, SIGUSR1);
+                    siginfo_t info;
+                    struct timespec patience = {1, 0};
+                    int got = sigtimedwait(&wanted, &info, &patience);
+                    if (got < 0) printf("pdeath-%u: %s\n", parent_uid, strerror(errno));
+                    else printf("pdeath-%u: signal=%d code=%d uid=%u sender=%d\n", parent_uid,
+                                got, info.si_code, info.si_uid, info.si_pid == parent);
+                    fflush(stdout);
+                    _exit(0);
+                }
+                char byte;
+                if (read(up[0], &byte, 1) != 1) _exit(86);
+                if (syscall(SYS_setresuid, parent_uid, parent_uid, parent_uid)) _exit(87);
+                _exit(0);
+            }
+            close(up[0]);
+            close(up[1]);
+            /* The parent, then the orphan, which comes to this subreaper. */
+            waitpid(dying, &status, 0);
+            printf("dying: status=%d\n", status);
+            pid_t last = wait(&status);
+            printf("orphan: reaped=%d status=%d\n", last > 0, status);
+        }
         return 0;
     }
     if (!strcmp(mode, "proc-status")) {

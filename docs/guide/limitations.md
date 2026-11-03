@@ -94,10 +94,11 @@ verified.
   guest that is not root makes there is root's too, which that guest may
   then not be allowed to open again.
 - **Credentials**: the IDs and capabilities a thread takes are checked on
-  files but nowhere else yet. A guest that leaves root still signals any
-  process and changes any limit and priority as root, and `si_uid`,
-  `SCM_CREDENTIALS`, `SO_PEERCRED` and a core's `pr_uid` and `pr_gid` still
-  give root's IDs. Of the files, those under `/proc` and `/dev` are not
+  files and on signals but nowhere else yet. A guest that leaves root still
+  changes any limit and priority as root, and `SCM_CREDENTIALS`, `SO_PEERCRED`
+  and a core's `pr_uid` and `pr_gid` still give root's IDs. `F_SETOWN` records
+  no sender's credentials, so `SIGIO` and `SIGURG` reach their owner whoever
+  set it, where Linux's `sigio_perm` checks. Of the files, those under `/proc` and `/dev` are not
   checked; an AF_UNIX socket file is made root's, and connecting to one
   does not check writing it; pipes and socket pairs belong to root; writing
   a file does not take away its set-user-ID and set-group-ID bits, as Linux

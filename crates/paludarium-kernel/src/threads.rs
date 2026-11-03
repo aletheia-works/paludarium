@@ -1,5 +1,6 @@
 //! Shared process termination, signal dispositions, registry and futex queues.
 //! Each worker owns its Kernel thread context; no process lock spans CPU/I/O/wait.
+use crate::credentials::SignalIds;
 use crate::{
     AltStack, Kernel, Next, SignalAction, SignalInbox, Thread, ThreadState, futex::Futexes, signals,
 };
@@ -24,6 +25,9 @@ pub struct ThreadGroup {
     /// stays after it exits, as its zombie task does, until the process is
     /// reaped.
     nice: Mutex<BTreeMap<u32, i32>>,
+    /// What signalling each thread looks at, for other processes to read;
+    /// a thread without one is root's ([`SignalIds`]).
+    signal_ids: Mutex<BTreeMap<u32, SignalIds>>,
     status: Mutex<Option<ExitStatus>>,
     /// The signal dispositions, which clone with `CLONE_SIGHAND` also shares
     /// with another process (Linux's `sighand_struct`).
@@ -56,6 +60,7 @@ impl Default for ThreadGroup {
             stopped: std::sync::atomic::AtomicBool::new(false),
             members: Mutex::new(BTreeMap::new()),
             nice: Mutex::default(),
+            signal_ids: Mutex::default(),
             status: Mutex::new(None),
             actions: Mutex::default(),
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
@@ -178,12 +183,18 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .send_child(code, child);
     }
-    /// Sends this process a signal from process `sender`, as `kill` does.
-    pub(crate) fn send_process_from(&self, number: i32, sender: u32) -> Result<(), Errno> {
+    /// Sends this process a signal from process `sender`, whose real user
+    /// ID is `uid`, as `kill` does.
+    pub(crate) fn send_process_from(
+        &self,
+        number: i32,
+        sender: u32,
+        uid: u32,
+    ) -> Result<(), Errno> {
         self.process_inbox
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .send_from(number, sender)
+            .send_from(number, sender, uid)
     }
     /// Sends this process `signal` as it is.
     pub(crate) fn send_process_signal(&self, signal: signals::PendingSignal) -> Result<(), Errno> {
@@ -365,6 +376,44 @@ impl ThreadGroup {
             .map(|(&tid, &value)| (tid, value))
             .collect()
     }
+    /// Records what signalling thread `tid` looks at, when its credentials
+    /// change or it starts.
+    pub(crate) fn set_signal_ids(&self, tid: u32, ids: SignalIds) {
+        self.signal_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, ids);
+    }
+    /// What signalling thread `tid` of process `pid` looks at: a thread no
+    /// longer here counts as the leader, whose credentials a zombie keeps.
+    pub(crate) fn signal_ids(&self, pid: u32, tid: u32) -> SignalIds {
+        let ids = self
+            .signal_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ids.get(&tid)
+            .or_else(|| ids.get(&pid))
+            .copied()
+            .unwrap_or_default()
+    }
+    /// Thread `tid` is gone, unless it led process `pid`.
+    fn forget_signal_ids(&self, pid: u32, tid: u32) {
+        if tid != pid {
+            self.signal_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&tid);
+        }
+    }
+    /// After exec, thread `pid` is all there is.
+    pub(crate) fn reset_signal_ids(&self, pid: u32, ids: SignalIds) {
+        let mut all = self
+            .signal_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        all.clear();
+        all.insert(pid, ids);
+    }
     fn forget_nice(&self, tid: u32) {
         self.nice
             .lock()
@@ -414,13 +463,13 @@ impl ThreadGroup {
             inbox.interrupt();
         }
     }
-    fn send(&self, tid: u32, number: i32) -> Result<(), Errno> {
+    fn send(&self, tid: u32, number: i32, uid: u32) -> Result<(), Errno> {
         let members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         let inbox = members.get(&tid).ok_or(Errno(3))?;
         if number == 0 {
             return Ok(());
         }
-        inbox.send_thread(number)
+        inbox.send_thread(number, uid)
     }
     pub(crate) fn set_process_inbox(&self, inbox: Arc<SignalInbox>) {
         *self
@@ -567,6 +616,7 @@ impl Kernel {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
         self.group.forget_nice(tid);
+        self.group.forget_signal_ids(self.process.pid, tid);
     }
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
         self.files.release_descriptors();
@@ -727,7 +777,10 @@ impl Kernel {
                 } else {
                     u32::try_from(tid)
                         .map_err(|_| Errno(3))
-                        .and_then(|tid| self.group.send(tid, number as i32))
+                        .and_then(|tid| {
+                            self.group
+                                .send(tid, number as i32, thread.state.credentials.uid)
+                        })
                         .map(|()| 0)
                 }
             }
@@ -791,6 +844,8 @@ impl Kernel {
             cpu.fs_base = a[4];
         }
         let mut state = parent.state.clone();
+        self.group
+            .set_signal_ids(tid, parent.state.credentials.signal_ids());
         state.timer = signals::RealTimer::default();
         state.pending.clear();
         state.frames.clear();

@@ -90,6 +90,8 @@ pub(crate) struct Context<'a> {
     /// The same host, for files that keep it (a timerfd reads its clock).
     pub shared_host: &'a std::sync::Arc<dyn Host>,
     pub process: &'a mut ThreadState,
+    /// The calling thread's ID.
+    pub tid: u32,
     pub cpu: &'a mut CpuState,
     pub mem: &'a AddressSpace,
     pub cancellation: &'a std::sync::atomic::AtomicBool,

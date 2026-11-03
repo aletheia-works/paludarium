@@ -658,9 +658,18 @@ kernel.
   process but the first one and the caller with -1, as Linux's
   `kill_something_info` does. A process that has exited counts until it is
   reaped. With no process to send to, `kill` gives `ESRCH`, even for an
-  invalid signal; otherwise an invalid signal gives `EINVAL`. A signal from
-  `kill` or `pidfd_send_signal` gives its sender's PID in `si_pid`, and the
-  `PR_SET_PDEATHSIG` signal the PID of the parent that exited.
+  invalid signal; otherwise an invalid signal gives `EINVAL`. A thread may
+  signal another process, as Linux's `check_kill_permission` decides, when its
+  real or effective user ID is the target's real or saved one or it has
+  `CAP_KILL`, and may send `SIGCONT` within its session; otherwise `kill`,
+  `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and `pidfd_send_signal` give `EPERM`,
+  also for signal 0 and for a zombie. The credentials checked are those of the
+  thread the ID names, and a group succeeds if any member took the signal,
+  while -1 does not report those it may not signal. A signal from `kill` or
+  `pidfd_send_signal` gives its sender's PID in `si_pid` and real user ID in
+  `si_uid`, as `tkill` and `tgkill` do, and the `PR_SET_PDEATHSIG` signal the
+  PID and real user ID of the parent that exited, which needs the same
+  permission.
 - `rt_sigqueueinfo` (behind `sigqueue`) sends a process the caller's siginfo
   as it is, and `rt_tgsigqueueinfo` sends it to one thread, so the signal
   carries its value; each realtime signal sent is kept. As in Linux, only a
@@ -731,7 +740,8 @@ kernel.
   `WCONTINUED` (`WNOWAIT` leaves them), and `SIGCHLD` tells the parent unless
   it set `SA_NOCLDSTOP`. The siginfo of `SIGCHLD` carries the child's PID, its
   `CLD_*` code (`CLD_EXITED`, `CLD_KILLED`, `CLD_STOPPED`, `CLD_CONTINUED`), its
-  status and its CPU time as `si_utime`; `si_uid` is 0, and a `SIGCHLD` sent
+  status and its CPU time as `si_utime`; `si_uid` and that of `waitid` are the
+  child's real user ID, and a `SIGCHLD` sent
   while one is pending is dropped, as Linux does. A child of a process that
   ignores `SIGCHLD` or set `SA_NOCLDWAIT` is reaped as it exits, as Linux's
   `do_notify_parent` does when its exit signal is `SIGCHLD`: a wait blocks

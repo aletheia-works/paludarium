@@ -16,7 +16,7 @@ fn timer_receipt_survives_process_dispatch_and_owner_acknowledges_kind() {
     assert!(!inbox.wake_token().load(Ordering::SeqCst));
     inbox.timer_changed();
     inbox.interrupt();
-    inbox.send_thread(10).unwrap();
+    inbox.send_thread(10, 0).unwrap();
     inbox.drain_process(&mut other);
     let receipt = inbox.drain(&mut other);
     assert!(receipt.timer_changed && receipt.interrupted && receipt.signals);
@@ -28,7 +28,7 @@ fn timer_receipt_survives_process_dispatch_and_owner_acknowledges_kind() {
         scope.spawn(move || {
             ack_rx.recv().unwrap();
             inbox.timer_changed();
-            inbox.send_thread(12).unwrap();
+            inbox.send_thread(12, 0).unwrap();
         });
         ack_tx.send(()).unwrap();
     });
@@ -63,7 +63,7 @@ fn preentry_timer_metadata_keeps_sleep_deadline_but_real_interrupt_wins() {
         match mode {
             2 => {
                 t.state.signal_mask = 1 << 9;
-                inbox.send_thread(10).unwrap();
+                inbox.send_thread(10, 0).unwrap();
             }
             3 => {
                 t.state.signal_actions.insert(
@@ -73,7 +73,7 @@ fn preentry_timer_metadata_keeps_sleep_deadline_but_real_interrupt_wins() {
                         ..SignalAction::default()
                     },
                 );
-                inbox.send_thread(10).unwrap();
+                inbox.send_thread(10, 0).unwrap();
             }
             4 => k.group.stop(ExitStatus::Signaled(9)),
             _ => {}
@@ -318,7 +318,7 @@ fn process_dispatch_does_not_steal_initial_thread_signal() {
     let inbox = Arc::new(SignalInbox::default());
     let k = kernel().with_signal_inbox(inbox.clone());
     let mut child = ThreadState::default();
-    inbox.send_thread(36).unwrap();
+    inbox.send_thread(36, 0).unwrap();
     inbox.send(35).unwrap();
     k.group.drain_process(&mut child);
     assert_eq!(child.pending.len(), 1);

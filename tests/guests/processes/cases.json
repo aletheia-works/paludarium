@@ -44,6 +44,7 @@
     {"name":"credentials","binary":"process"},
     {"name":"permissions","binary":"process"},
     {"name":"setuid","binary":"process"},
+    {"name":"signal-permissions","binary":"process"},
     {"name":"waitid","binary":"process"},
     {"name":"autoreap","binary":"process"},
     {"name":"reparent","binary":"process"},

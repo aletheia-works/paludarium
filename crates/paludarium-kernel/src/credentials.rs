@@ -11,6 +11,7 @@ use paludarium_types::{Errno, GuestAddr};
 
 /// Every capability, up to `CAP_LAST_CAP` (40): root's.
 pub(crate) const ALL_CAPABILITIES: u64 = (1 << 41) - 1;
+const CAP_KILL: u64 = 1 << 5;
 const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
 /// The capabilities a filesystem ID of root brings (`CAP_FS_MASK`):
@@ -24,6 +25,35 @@ const GROUP_EXECUTE: u32 = 0o010;
 const MAX_GROUPS: u64 = 65536;
 /// The ID that means "unchanged", and that names no user or group.
 const UNCHANGED: u32 = u32::MAX;
+
+/// What sending a signal looks at in a thread's credentials, which another
+/// process can read ([`crate::ThreadGroup::signal_ids`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SignalIds {
+    pub uid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub cap_kill: bool,
+}
+
+impl SignalIds {
+    /// Linux's `kill_ok_by_cred`: the sender's real or effective user ID is
+    /// the target's real or saved one, or the sender has CAP_KILL.
+    pub(crate) fn may_signal(self, target: Self) -> bool {
+        self.cap_kill
+            || self.euid == target.suid
+            || self.euid == target.uid
+            || self.uid == target.suid
+            || self.uid == target.uid
+    }
+}
+
+/// Root's, as a thread has until its credentials change.
+impl Default for SignalIds {
+    fn default() -> Self {
+        Credentials::default().signal_ids()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credentials {
@@ -65,6 +95,14 @@ impl Default for Credentials {
 }
 
 impl Credentials {
+    pub(crate) fn signal_ids(&self) -> SignalIds {
+        SignalIds {
+            uid: self.uid,
+            euid: self.euid,
+            suid: self.suid,
+            cap_kill: self.effective & CAP_KILL != 0,
+        }
+    }
     fn may_setuid(&self) -> bool {
         self.effective & CAP_SETUID != 0
     }
@@ -340,6 +378,7 @@ fn commit(c: &mut Context<'_>, new: Credentials) {
     if c.process.credentials.resets_dumpable(&new) {
         c.processes.credentials_changed(c.process.pid);
     }
+    c.group.set_signal_ids(c.tid, new.signal_ids());
     c.process.credentials = new;
 }
 
@@ -486,6 +525,30 @@ mod credentials_tests {
 
     fn ids(c: &Credentials) -> [u32; 4] {
         [c.uid, c.euid, c.suid, c.fsuid]
+    }
+
+    #[test]
+    fn a_signal_needs_a_shared_real_or_saved_id_or_cap_kill() {
+        let root = Credentials::default();
+        let ids = |r, e, s| root.setresuid(r, e, s).unwrap().signal_ids();
+        let sender = ids(2000, 2000, 2000);
+        assert!(sender.may_signal(ids(2000, 3000, 3000)), "the real ID");
+        assert!(sender.may_signal(ids(3000, 3000, 2000)), "the saved ID");
+        assert!(
+            !sender.may_signal(ids(3000, 2000, 3000)),
+            "the effective ID"
+        );
+        assert!(
+            ids(2001, 2000, 2001).may_signal(ids(2000, 3000, 3000)),
+            "by euid"
+        );
+        assert!(
+            !ids(2001, 2001, 2000).may_signal(ids(2000, 3000, 2000)),
+            "by suid"
+        );
+        // The effective capability decides: a real ID of root gives none.
+        assert!(root.signal_ids().may_signal(ids(3000, 3000, 3000)));
+        assert!(!ids(0, 3000, 0).may_signal(ids(4000, 4000, 4000)));
     }
 
     #[test]

@@ -41,15 +41,17 @@ pub use state::{
 
 use exec::Stop;
 
-/// Number of entries of a [`DecodeCache`].
-const CACHE_ENTRIES: usize = 4096;
+/// Number of entries of a [`DecodeCache`]: 2 MiB of 128-byte entries
+/// per guest thread. At 4096, programs as large as jj missed it on one
+/// instruction in nine, each miss decoding again.
+const CACHE_ENTRIES: usize = 16384;
 
 /// Decoded instructions by address. An entry is used only while the
 /// address space's [`AddressSpace::code_generation`] is unchanged, so
 /// writes to executable memory and mapping changes (self-modifying code,
 /// `mprotect`, `munmap`) are always seen.
 pub struct DecodeCache {
-    entries: Vec<Option<(u64, u64, Instruction, bool)>>,
+    entries: Vec<Option<Entry>>,
     /// What reading the generation without the locks needs
     /// ([`AddressSpace::code_generation_cached`]).
     sources: CodeSources,
@@ -64,6 +66,34 @@ impl Default for DecodeCache {
     }
 }
 
+/// A decoded instruction, with what [`execute_decoded`] needs to know of
+/// it beforehand, worked out once when it is decoded.
+#[derive(Clone, Copy)]
+struct Decoded {
+    instruction: Instruction,
+    /// [`exec::keeps_vector_state`].
+    keeps_vector_state: bool,
+}
+
+impl Decoded {
+    fn new(instruction: Instruction) -> Self {
+        Decoded {
+            keeps_vector_state: exec::keeps_vector_state(&instruction),
+            instruction,
+        }
+    }
+}
+
+/// An instruction decoded at `rip` under `generation`; `rejected` when the
+/// accelerator has turned it down.
+#[derive(Clone, Copy)]
+struct Entry {
+    rip: u64,
+    generation: u64,
+    decoded: Decoded,
+    rejected: bool,
+}
+
 impl DecodeCache {
     /// An empty cache.
     #[must_use]
@@ -76,34 +106,55 @@ impl DecodeCache {
         usize::try_from((rip ^ (rip >> 12)) & (CACHE_ENTRIES as u64 - 1)).unwrap_or(0)
     }
 
-    fn get(&self, rip: u64, generation: u64) -> Option<Instruction> {
-        match self.entries.get(Self::slot(rip)) {
-            Some(Some((r, g, insn, _))) if *r == rip && *g == generation => Some(*insn),
-            _ => None,
-        }
-    }
-
-    fn put(&mut self, rip: u64, generation: u64, insn: Instruction) {
-        if let Some(entry) = self.entries.get_mut(Self::slot(rip)) {
-            *entry = Some((rip, generation, insn, false));
-        }
-    }
-
-    fn get_with_hint(&self, rip: u64, generation: u64) -> Option<(Instruction, bool)> {
-        match self.entries.get(Self::slot(rip)) {
-            Some(Some((r, g, instruction, rejected))) if *r == rip && *g == generation => {
-                Some((*instruction, *rejected))
+    /// The instruction at `rip` under `generation`, decoded by `decode`
+    /// unless the cache holds it; returned by reference, as copying it
+    /// cost as much as a short instruction.
+    fn decoded(
+        &mut self,
+        rip: u64,
+        generation: u64,
+        decode: impl FnOnce() -> Result<Instruction, ExitReason>,
+    ) -> Result<&Decoded, ExitReason> {
+        let entry = &mut self.entries[Self::slot(rip)];
+        match entry {
+            Some(e) if e.rip == rip && e.generation == generation => Ok(&e.decoded),
+            _ => {
+                let decoded = Decoded::new(decode()?);
+                let e = entry.insert(Entry {
+                    rip,
+                    generation,
+                    decoded,
+                    rejected: false,
+                });
+                Ok(&e.decoded)
             }
+        }
+    }
+
+    fn put(&mut self, rip: u64, generation: u64, instruction: Instruction) -> Decoded {
+        let decoded = Decoded::new(instruction);
+        self.entries[Self::slot(rip)] = Some(Entry {
+            rip,
+            generation,
+            decoded,
+            rejected: false,
+        });
+        decoded
+    }
+
+    fn get_with_hint(&self, rip: u64, generation: u64) -> Option<(Decoded, bool)> {
+        match &self.entries[Self::slot(rip)] {
+            Some(e) if e.rip == rip && e.generation == generation => Some((e.decoded, e.rejected)),
             _ => None,
         }
     }
 
     fn reject_acceleration(&mut self, rip: u64, generation: u64) {
-        if let Some(Some((r, g, _, rejected))) = self.entries.get_mut(Self::slot(rip))
-            && *r == rip
-            && *g == generation
+        if let Some(e) = &mut self.entries[Self::slot(rip)]
+            && e.rip == rip
+            && e.generation == generation
         {
-            *rejected = true;
+            e.rejected = true;
         }
     }
 
@@ -112,9 +163,9 @@ impl DecodeCache {
         use jit_cost::{Counter, add};
         let counter = match &self.entries[Self::slot(rip)] {
             None => Counter::DecodeSlotEmpty,
-            Some((r, _, _, _)) if *r != rip => Counter::DecodeSlotRipCollision,
-            Some((_, g, _, _)) if *g != generation => Counter::DecodeSlotEpochStale,
-            Some((_, _, _, true)) => Counter::DecodeHintHit,
+            Some(e) if e.rip != rip => Counter::DecodeSlotRipCollision,
+            Some(e) if e.generation != generation => Counter::DecodeSlotEpochStale,
+            Some(e) if e.rejected => Counter::DecodeHintHit,
             Some(_) => Counter::DecodedHit,
         };
         add(counter, 1);
@@ -201,7 +252,7 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn of(state: &CpuState, insn: &Instruction) -> Self {
+    fn of(state: &CpuState, keeps_vector_state: bool) -> Self {
         // Every field is named, so that a new one has to be placed here.
         let CpuState {
             gpr,
@@ -220,7 +271,7 @@ impl Snapshot {
             rflags,
             fs_base,
             gs_base,
-            vector: (!exec::keeps_vector_state(insn)).then_some((xmm, mxcsr)),
+            vector: (!keeps_vector_state).then_some((xmm, mxcsr)),
         }
     }
 
@@ -240,8 +291,9 @@ impl Snapshot {
 fn execute_decoded(
     state: &mut CpuState,
     mem: &AddressSpace,
-    insn: &Instruction,
+    decoded: &Decoded,
 ) -> Result<(), ExitReason> {
+    let insn = &decoded.instruction;
     let rip = state.rip;
     let repeating =
         insn.rep != paludarium_decoder::RepPrefix::None && exec::is_string(insn.mnemonic);
@@ -267,7 +319,7 @@ fn execute_decoded(
     } else {
         state.repeat_continuation = None;
     }
-    let snapshot = Snapshot::of(state, insn);
+    let snapshot = Snapshot::of(state, decoded.keeps_vector_state);
     let result = exec::execute(state, mem, insn);
     if result.is_ok() {
         if state.rip != rip {
@@ -308,7 +360,7 @@ fn execute_decoded(
 /// Executes one instruction. `Ok(())` means the guest can continue.
 pub fn step(state: &mut CpuState, mem: &AddressSpace) -> Result<(), ExitReason> {
     let insn = fetch_for_state(state, mem)?;
-    execute_decoded(state, mem, &insn)
+    execute_decoded(state, mem, &Decoded::new(insn))
 }
 
 /// Executes one instruction, reusing decoded instructions from `cache`.
@@ -320,15 +372,8 @@ pub fn step_cached(
     #[cfg(feature = "cost-profile")]
     jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
     let generation = mem.code_generation_cached(&mut cache.sources);
-    let insn = match cache.get(state.rip.0, generation) {
-        Some(insn) => insn,
-        None => {
-            let insn = fetch_for_state(state, mem)?;
-            cache.put(state.rip.0, generation, insn);
-            insn
-        }
-    };
-    execute_decoded(state, mem, &insn)
+    let decoded = cache.decoded(state.rip.0, generation, || fetch_for_state(state, mem))?;
+    execute_decoded(state, mem, decoded)
 }
 
 fn fetch_for_state(state: &mut CpuState, mem: &AddressSpace) -> Result<Instruction, ExitReason> {
@@ -476,13 +521,10 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
         if CACHE_REJECTIONS {
             cache.observe_slot(state.rip.0, generation);
         }
-        let (instruction, rejected) = match cache.get_with_hint(state.rip.0, generation) {
+        let (decoded, rejected) = match cache.get_with_hint(state.rip.0, generation) {
             Some(entry) => entry,
             None => match fetch_for_state(state, mem) {
-                Ok(instruction) => {
-                    cache.put(state.rip.0, generation, instruction);
-                    (instruction, false)
-                }
+                Ok(instruction) => (cache.put(state.rip.0, generation, instruction), false),
                 Err(reason) => {
                     #[cfg(feature = "cost-profile")]
                     observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
@@ -490,6 +532,7 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
                 }
             },
         };
+        let instruction = decoded.instruction;
         let mut deterministic_rejection = false;
         if !(CACHE_REJECTIONS && rejected)
             && maximum_block > 0
@@ -554,7 +597,7 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
         }
         #[cfg(feature = "cost-profile")]
         jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
-        if let Err(reason) = execute_decoded(state, mem, &instruction) {
+        if let Err(reason) = execute_decoded(state, mem, &decoded) {
             #[cfg(feature = "cost-profile")]
             observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
             return reason;

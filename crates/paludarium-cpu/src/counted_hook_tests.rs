@@ -151,6 +151,18 @@ fn negative_dispatch_memory_fault() {
     hinted_dispatch_matches_interpreter(&[0x48, 0x8b, 0x00], 64, 64);
 }
 
+/// The cached instruction and its rejection, as [`DecodeCache::get_with_hint`]
+/// gives them.
+fn hinted(
+    cache: &DecodeCache,
+    rip: u64,
+    generation: u64,
+) -> Option<(paludarium_decoder::Instruction, bool)> {
+    cache
+        .get_with_hint(rip, generation)
+        .map(|(decoded, rejected)| (decoded.instruction, rejected))
+}
+
 fn cached_boundary() -> (DecodeCache, paludarium_decoder::Instruction) {
     let instruction = paludarium_decoder::decode(&[0x90], GuestAddr(4096)).unwrap();
     let mut cache = DecodeCache::new();
@@ -166,8 +178,8 @@ fn decode_hint_empty_boundary_requires_fetch() {
 #[test]
 fn decode_hint_hit_preserves_exact_decoded_instruction() {
     let (cache, expected) = cached_boundary();
-    let (instruction, rejected) = cache.get_with_hint(4096, 1).unwrap();
-    assert_eq!(instruction, expected);
+    let (decoded, rejected) = cache.get_with_hint(4096, 1).unwrap();
+    assert_eq!(decoded.instruction, expected);
     assert!(!rejected);
 }
 
@@ -175,7 +187,7 @@ fn decode_hint_hit_preserves_exact_decoded_instruction() {
 fn decode_hint_deterministic_rejection_is_returned_with_same_entry() {
     let (mut cache, expected) = cached_boundary();
     cache.reject_acceleration(4096, 1);
-    assert_eq!(cache.get_with_hint(4096, 1), Some((expected, true)));
+    assert_eq!(hinted(&cache, 4096, 1), Some((expected, true)));
 }
 
 #[test]
@@ -189,16 +201,13 @@ fn decode_hint_wrong_generation_cannot_reuse_instruction_or_rejection() {
 fn decode_hint_slot_collision_cannot_transfer_rejection() {
     let (mut cache, _) = cached_boundary();
     cache.reject_acceleration(4096, 1);
-    let collision = (0..4096)
-        .find(|&rip| DecodeCache::slot(rip) == DecodeCache::slot(4096))
+    let collision = (0..1 << 32)
+        .find(|&rip| rip != 4096 && DecodeCache::slot(rip) == DecodeCache::slot(4096))
         .unwrap();
     let instruction = paludarium_decoder::decode(&[0x90], GuestAddr(collision)).unwrap();
     cache.put(collision, 1, instruction);
     assert!(cache.get_with_hint(4096, 1).is_none());
-    assert_eq!(
-        cache.get_with_hint(collision, 1),
-        Some((instruction, false))
-    );
+    assert_eq!(hinted(&cache, collision, 1), Some((instruction, false)));
 }
 
 #[test]
@@ -206,15 +215,20 @@ fn decode_hint_new_decode_clears_stale_rejection() {
     let (mut cache, instruction) = cached_boundary();
     cache.reject_acceleration(4096, 1);
     cache.put(4096, 2, instruction);
-    assert_eq!(cache.get_with_hint(4096, 2), Some((instruction, false)));
+    assert_eq!(hinted(&cache, 4096, 2), Some((instruction, false)));
 }
 
 #[test]
 fn decode_hint_does_not_change_ordinary_interpreter_cache_contract() {
     let (mut cache, instruction) = cached_boundary();
     cache.reject_acceleration(4096, 1);
-    assert_eq!(cache.get(4096, 1), Some(instruction));
-    assert!(cache.get(4096, 2).is_none());
+    // A decode that would stop shows whether the cache held the entry.
+    let stop = || Err(ExitReason::Halt { rip: GuestAddr(0) });
+    assert_eq!(
+        cache.decoded(4096, 1, stop).map(|d| d.instruction),
+        Ok(instruction)
+    );
+    assert!(cache.decoded(4096, 2, stop).is_err());
 }
 
 fn hint_attempt(

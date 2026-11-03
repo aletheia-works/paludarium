@@ -133,6 +133,45 @@ pub(crate) fn keeps_vector_state(i: &Instruction) -> bool {
             .any(|o| matches!(o, Operand::Register(Register::Xmm(_))))
 }
 
+/// Whether `i` changes no register before the last thing that can make it
+/// fail, so that a failure leaves nothing to put back: its handler below
+/// reads, then writes its one destination, and sets the flags, the stack
+/// pointer or the instruction pointer only after that. A `pop` to memory
+/// moves the stack pointer first, so only one to a register qualifies.
+pub(crate) fn fails_cleanly(i: &Instruction) -> bool {
+    match i.mnemonic {
+        Mnemonic::Add
+        | Mnemonic::Adc
+        | Mnemonic::Sub
+        | Mnemonic::Sbb
+        | Mnemonic::And
+        | Mnemonic::Or
+        | Mnemonic::Xor
+        | Mnemonic::Cmp
+        | Mnemonic::Test
+        | Mnemonic::Inc
+        | Mnemonic::Dec
+        | Mnemonic::Neg
+        | Mnemonic::Not
+        | Mnemonic::Mov
+        | Mnemonic::Movsx
+        | Mnemonic::Movsxd
+        | Mnemonic::Movzx
+        | Mnemonic::Lea
+        | Mnemonic::Push
+        | Mnemonic::Call
+        | Mnemonic::Ret
+        | Mnemonic::Jmp
+        | Mnemonic::Jcc(_)
+        | Mnemonic::Setcc(_)
+        | Mnemonic::Cmovcc(_)
+        | Mnemonic::Nop
+        | Mnemonic::Endbr64 => true,
+        Mnemonic::Pop => matches!(i.operand(0), Some(Operand::Register(_))),
+        _ => false,
+    }
+}
+
 pub(crate) fn is_string(m: Mnemonic) -> bool {
     is_comparison_string(m)
         || matches!(

@@ -73,12 +73,15 @@ struct Decoded {
     instruction: Instruction,
     /// [`exec::keeps_vector_state`].
     keeps_vector_state: bool,
+    /// [`exec::fails_cleanly`]: no [`Snapshot`] is needed.
+    fails_cleanly: bool,
 }
 
 impl Decoded {
     fn new(instruction: Instruction) -> Self {
         Decoded {
             keeps_vector_state: exec::keeps_vector_state(&instruction),
+            fails_cleanly: exec::fails_cleanly(&instruction),
             instruction,
         }
     }
@@ -319,7 +322,8 @@ fn execute_decoded(
     } else {
         state.repeat_continuation = None;
     }
-    let snapshot = Snapshot::of(state, decoded.keeps_vector_state);
+    let snapshot =
+        (!decoded.fails_cleanly).then(|| Snapshot::of(state, decoded.keeps_vector_state));
     let result = exec::execute(state, mem, insn);
     if result.is_ok() {
         if state.rip != rip {
@@ -336,9 +340,13 @@ fn execute_decoded(
             // Unmasked SIMD exceptions preserve destinations but commit the
             // exception status bits which Linux exposes in the signal frame.
             let mxcsr = state.mxcsr;
-            snapshot.restore(state);
+            if let Some(snapshot) = snapshot {
+                snapshot.restore(state);
+            }
             state.mxcsr = mxcsr;
-        } else if stop != Stop::Syscall {
+        } else if stop != Stop::Syscall
+            && let Some(snapshot) = snapshot
+        {
             snapshot.restore(state);
         }
         state.repeat_continuation = None;

@@ -189,20 +189,26 @@ fn execute_decoded(
     let repeating =
         insn.rep != paludarium_decoder::RepPrefix::None && exec::is_string(insn.mnemonic);
     let comparison = repeating && exec::is_comparison_string(insn.mnemonic);
-    let bytes = instruction_bytes(mem, rip, insn.len);
-    if !comparison
-        || state
+    // Only a repeated comparison keeps its bytes, to tell its continuation
+    // from another instruction at the same address: fetching them for every
+    // instruction would double the memory lookups of the common case.
+    if comparison {
+        let bytes = instruction_bytes(mem, rip, insn.len);
+        if state
             .repeat_continuation
             .is_some_and(|c| c.instruction != *insn || c.bytes != bytes)
-    {
+        {
+            state.repeat_continuation = None;
+        }
+        if state.repeat_continuation.is_none() {
+            state.repeat_continuation = Some(RepeatContinuation {
+                instruction: *insn,
+                bytes,
+                initial_flags: state.rflags,
+            });
+        }
+    } else {
         state.repeat_continuation = None;
-    }
-    if comparison && state.repeat_continuation.is_none() {
-        state.repeat_continuation = Some(RepeatContinuation {
-            instruction: *insn,
-            bytes,
-            initial_flags: state.rflags,
-        });
     }
     let snapshot = state.clone();
     let result = exec::execute(state, mem, insn);

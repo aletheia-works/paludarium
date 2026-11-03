@@ -12,6 +12,7 @@
 //! depend on its size.
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{
@@ -592,6 +593,65 @@ pub struct Remap {
     pub new_addr: GuestAddr,
 }
 
+/// How many pages the [`Tlb`] remembers.
+const TLB_ENTRIES: usize = 64;
+
+/// A populated page that is neither shared nor of a file mapping, as the
+/// page table held it: an access that stays inside it needs only its
+/// protection checked, as [`AddressSpaceData::check`] would.
+struct TlbEntry {
+    page: u64,
+    prot: Prot,
+    frame: Frame,
+    cow: bool,
+}
+
+/// The pages the latest accesses used, so that the next ones skip the page
+/// table, the mappings and the locks of the directory. It is emptied before
+/// anything can change a page entry or a mapping: when the directory is
+/// locked for writing, and whenever the space is borrowed mutably.
+struct Tlb {
+    entries: [Option<TlbEntry>; TLB_ENTRIES],
+    /// Which entries are set, so that emptying touches only those.
+    used: u64,
+}
+
+impl Default for Tlb {
+    fn default() -> Self {
+        Tlb {
+            entries: std::array::from_fn(|_| None),
+            used: 0,
+        }
+    }
+}
+
+impl Tlb {
+    fn slot(page: u64) -> usize {
+        // The remainder is below 64, so it always fits in usize.
+        usize::try_from((page / PAGE_SIZE) % TLB_ENTRIES as u64).unwrap_or(0)
+    }
+
+    fn get(&self, page: u64) -> Option<&TlbEntry> {
+        self.entries[Self::slot(page)]
+            .as_ref()
+            .filter(|entry| entry.page == page)
+    }
+
+    fn insert(&mut self, entry: TlbEntry) {
+        let slot = Self::slot(entry.page);
+        self.entries[slot] = Some(entry);
+        self.used |= 1 << slot;
+    }
+
+    fn flush(&mut self) {
+        while self.used != 0 {
+            let slot = self.used.trailing_zeros() as usize;
+            self.entries[slot] = None;
+            self.used &= self.used - 1;
+        }
+    }
+}
+
 static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One process's guest address space.
@@ -619,6 +679,10 @@ struct AddressSpaceData {
     /// [`AddressSpace::take_out_of_memory`], which reads it without the
     /// locks.
     out_of_memory: Arc<AtomicBool>,
+    /// Recently used pages ([`Tlb`]). It holds the frames it shows, so an
+    /// entry never outlives the page entry it copies: the frame's count
+    /// is what decides whether a write after `fork` copies it.
+    tlb: RefCell<Tlb>,
 }
 
 impl Default for AddressSpaceData {
@@ -698,6 +762,7 @@ impl AddressSpaceData {
             mmap_top: DEFAULT_MMAP_TOP,
             meter: None,
             out_of_memory: Arc::default(),
+            tlb: RefCell::default(),
         }
     }
 
@@ -1047,7 +1112,10 @@ impl AddressSpaceData {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The directory, locked for writing: the [`Tlb`] is emptied first, as
+    /// the entries it copies may change.
     fn write_directory(&self) -> RwLockWriteGuard<'_, Directory> {
+        self.tlb.borrow_mut().flush();
         self.directory
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1087,7 +1155,7 @@ impl AddressSpaceData {
             bus: false,
         };
         let wide = u64::try_from(len).map_err(|_| fault(addr.0))?;
-        addr.0.checked_add(wide).ok_or(fault(addr.0))?;
+        addr.0.checked_add(wide).ok_or_else(|| fault(addr.0))?;
         for (page, offset, _) in chunks(addr, len) {
             let at = page + offset as u64;
             if at >= USER_ADDRESS_LIMIT {
@@ -1114,14 +1182,118 @@ impl AddressSpaceData {
         Ok(())
     }
 
+    /// Remembers the page at `page` in the [`Tlb`] when an access to it
+    /// needs only its protection checked: it is populated, and neither
+    /// shared nor of a file mapping, whose file may end before it.
+    fn remember(&self, directory: &Directory, page: u64) {
+        let Some(p) = lookup(directory, page) else {
+            return;
+        };
+        if p.file || p.cache || self.shared_at(page).is_some() {
+            return;
+        }
+        self.tlb.borrow_mut().insert(TlbEntry {
+            page,
+            prot: p.prot,
+            frame: p.frame.clone(),
+            cow: p.cow,
+        });
+    }
+
+    /// The page of `[addr, addr+len)` when the access lies inside one page;
+    /// `None` for an empty access or one that crosses pages.
+    fn single_page(addr: GuestAddr, len: usize) -> Option<u64> {
+        let offset = page_offset(addr.0);
+        (len > 0 && offset + len <= PAGE_BYTES).then(|| addr.0 - offset as u64)
+    }
+
+    /// Reads `buf` through the [`Tlb`]; `false` when it does not hold the
+    /// page or the access is not permitted there, which then takes the
+    /// page table's path, with its faults.
+    fn read_cached(&self, addr: GuestAddr, buf: &mut [u8], access: Access) -> bool {
+        let Some(page) = Self::single_page(addr, buf.len()) else {
+            return false;
+        };
+        let tlb = self.tlb.borrow();
+        let Some(entry) = tlb.get(page).filter(|e| access.permitted(e.prot)) else {
+            return false;
+        };
+        match entry.frame.get() {
+            Some(frame) => {
+                for (d, s) in buf.iter_mut().zip(&frame[page_offset(addr.0)..]) {
+                    *d = s.load(Ordering::Relaxed);
+                }
+            }
+            None => buf.fill(0),
+        }
+        true
+    }
+
+    /// Writes `buf` through the [`Tlb`] into a page that has had its first
+    /// write and has no frame `fork` shares; `false` otherwise, which then
+    /// takes the page table's path.
+    fn write_cached(&self, addr: GuestAddr, buf: &[u8], access: Access) -> bool {
+        let Some(page) = Self::single_page(addr, buf.len()) else {
+            return false;
+        };
+        let tlb = self.tlb.borrow();
+        let Some(entry) = tlb.get(page).filter(|e| access.permitted(e.prot) && !e.cow) else {
+            return false;
+        };
+        let Some(frame) = entry.frame.get() else {
+            return false;
+        };
+        if entry.prot.contains(Prot::EXEC) {
+            // Code may have changed: decoded instructions are stale.
+            self.code_generation.fetch_add(1, Ordering::Release);
+        }
+        for (s, d) in buf.iter().zip(&frame[page_offset(addr.0)..]) {
+            d.store(*s, Ordering::Relaxed);
+        }
+        frame.dirty.store(true, Ordering::Release);
+        true
+    }
+
+    /// Copies `[addr, addr+buf.len())` out of its populated pages; a page
+    /// without contents reads as zeros.
+    fn copy_out(directory: &Directory, addr: GuestAddr, buf: &mut [u8]) {
+        for (page, offset, range) in chunks(addr, buf.len()) {
+            let dst = &mut buf[range];
+            match lookup(directory, page).and_then(|p| p.frame.get()) {
+                Some(frame) => {
+                    for (d, s) in dst.iter_mut().zip(&frame[offset..]) {
+                        *d = s.load(Ordering::Relaxed);
+                    }
+                }
+                None => dst.fill(0),
+            }
+        }
+    }
+
     fn read_with(&self, addr: GuestAddr, buf: &mut [u8], access: Access) -> Result<(), Fault> {
+        if access != Access::Dump && self.read_cached(addr, buf, access) {
+            return Ok(());
+        }
+        let ready = |directory: &Directory, page: u64| {
+            lookup(directory, page).is_some_and(|p| !self.may_be_truncated(page, p))
+        };
+        {
+            let directory = self.read_directory();
+            self.check(&directory, addr, buf.len(), access)?;
+            if chunks(addr, buf.len()).all(|(page, _, _)| ready(&directory, page)) {
+                Self::copy_out(&directory, addr, buf);
+                if let Some(page) = Self::single_page(addr, buf.len()) {
+                    self.remember(&directory, page);
+                }
+                return Ok(());
+            }
+        }
         let mut directory = self.write_directory();
         self.check(&directory, addr, buf.len(), access)?;
         // A successful lazy read installs the logical zero-page entry without
         // allocating its byte frame, matching subsequent Linux fault metadata.
         for (page, _, _) in chunks(addr, buf.len()) {
-            let current = lookup(&directory, page);
-            if current.is_some_and(|p| !self.may_be_truncated(page, p)) {
+            if ready(&directory, page) {
                 continue;
             }
             if let Some(prot) = self.mapping_at(page).map(|m| m.prot) {
@@ -1132,16 +1304,9 @@ impl AddressSpaceData {
                 }
             }
         }
-        for (page, offset, range) in chunks(addr, buf.len()) {
-            let dst = &mut buf[range];
-            match lookup(&directory, page).and_then(|p| p.frame.get()) {
-                Some(frame) => {
-                    for (d, s) in dst.iter_mut().zip(&frame[offset..]) {
-                        *d = s.load(Ordering::Relaxed);
-                    }
-                }
-                None => dst.fill(0),
-            }
+        Self::copy_out(&directory, addr, buf);
+        if let Some(page) = Self::single_page(addr, buf.len()) {
+            self.remember(&directory, page);
         }
         Ok(())
     }
@@ -1187,6 +1352,9 @@ impl AddressSpaceData {
     /// Writes `buf` at `addr`; `true` when a page took its first write,
     /// or the copy of a frame it shared.
     fn write_with(&self, addr: GuestAddr, buf: &[u8], access: Access) -> Result<bool, Fault> {
+        if access == Access::Write && self.write_cached(addr, buf, access) {
+            return Ok(false);
+        }
         {
             let directory = self.read_directory();
             self.check(&directory, addr, buf.len(), access)?;
@@ -1196,7 +1364,11 @@ impl AddressSpaceData {
                 })
             };
             if chunks(addr, buf.len()).all(|(page, _, _)| ready(page)) {
-                return self.store(&directory, addr, buf).map(|()| false);
+                self.store(&directory, addr, buf)?;
+                if let Some(page) = Self::single_page(addr, buf.len()) {
+                    self.remember(&directory, page);
+                }
+                return Ok(false);
             }
         }
         // Populate the pages this write touches for the first time, and copy
@@ -1229,7 +1401,11 @@ impl AddressSpaceData {
                 });
             }
         }
-        self.store(&directory, addr, buf).map(|()| true)
+        self.store(&directory, addr, buf)?;
+        if let Some(page) = Self::single_page(addr, buf.len()) {
+            self.remember(&directory, page);
+        }
+        Ok(true)
     }
 
     /// Marks the private mappings `[addr, addr+len)` touches written, each
@@ -1302,14 +1478,6 @@ impl AddressSpaceData {
         self.read_with(addr, buf, Access::Dump)
     }
 
-    /// Writes guest memory; requires `PROT_WRITE`.
-    pub fn write(&mut self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
-        if self.write_with(addr, buf, Access::Write)? {
-            self.mark_written(addr, buf.len() as u64);
-        }
-        Ok(())
-    }
-
     /// Fetches instruction bytes; requires `PROT_EXEC`.
     pub fn fetch(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.read_with(addr, buf, Access::Fetch)
@@ -1343,11 +1511,6 @@ impl AddressSpaceData {
         let mut b = [0u8; 8];
         self.read(addr, &mut b)?;
         Ok(u64::from_le_bytes(b))
-    }
-
-    /// Writes a little-endian `u64`.
-    pub fn write_u64(&mut self, addr: GuestAddr, value: u64) -> Result<(), Fault> {
-        self.write(addr, &value.to_le_bytes())
     }
 
     fn overlaps(&self, start: u64, end: u64) -> bool {
@@ -1997,7 +2160,10 @@ impl std::ops::Deref for AddressSpaceGuard<'_> {
     }
 }
 impl std::ops::DerefMut for AddressSpaceGuard<'_> {
+    /// Empties the [`Tlb`] first: a mutable borrow may change the mappings
+    /// or the page entries it copies.
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.data.tlb.get_mut().flush();
         &mut self.data
     }
 }
@@ -2009,6 +2175,8 @@ mod processes_tests;
 mod jit_tests;
 #[cfg(test)]
 mod threads_tests;
+#[cfg(test)]
+mod tlb_tests;
 impl Default for AddressSpace {
     fn default() -> Self {
         Self::new()
@@ -2231,7 +2399,20 @@ impl AddressSpace {
         self.locked().read_for_dump(addr, buf)
     }
     pub fn write(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
-        self.locked().write(addr, buf)
+        Self::write_locked(self.locked(), addr, buf)
+    }
+    /// Writes guest memory, which requires `PROT_WRITE`, through a shared
+    /// borrow, so that the [`Tlb`] survives, unless a page took its first
+    /// write, which marks its mapping written.
+    fn write_locked(
+        mut data: AddressSpaceGuard<'_>,
+        addr: GuestAddr,
+        buf: &[u8],
+    ) -> Result<(), Fault> {
+        if data.write_with(addr, buf, Access::Write)? {
+            data.mark_written(addr, buf.len() as u64);
+        }
+        Ok(())
     }
     /// Checks a syscall buffer's read permission before allocating a copy.
     pub fn check_read(&self, addr: GuestAddr, len: usize) -> Result<(), Fault> {
@@ -2256,7 +2437,7 @@ impl AddressSpace {
         self.locked().read_u64(addr)
     }
     pub fn write_u64(&self, addr: GuestAddr, value: u64) -> Result<(), Fault> {
-        self.locked().write_u64(addr, value)
+        Self::write_locked(self.locked(), addr, &value.to_le_bytes())
     }
     pub fn map(
         &mut self,
@@ -2357,7 +2538,7 @@ impl AddressSpace {
         width: AtomicWidth,
         operation: AtomicOp,
     ) -> Result<AtomicResult, Fault> {
-        let mut data = self.locked();
+        let data = self.locked();
         let len = width.bytes();
         data.check(&data.read_directory(), addr, len, Access::Write)?;
         let mut bytes = [0u8; 16];
@@ -2388,7 +2569,7 @@ impl AddressSpace {
             AtomicOp::Not => (!old, true),
             AtomicOp::Neg => (old.wrapping_neg(), true),
         };
-        data.write(addr, &(new & mask).to_le_bytes()[..len])?;
+        Self::write_locked(data, addr, &(new & mask).to_le_bytes()[..len])?;
         Ok(AtomicResult { old, exchanged })
     }
 }

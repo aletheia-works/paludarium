@@ -26,7 +26,10 @@ rewritten, without touching anything else.
 WebAssembly (wasm32) memory stops at 4 GB, so a guest's 64-bit address space
 cannot be placed in it directly. paludarium therefore uses a software MMU with
 two-level page tables of 4 KiB pages on every host. Every access is checked; a
-missing page or a permission violation becomes a guest exception.
+missing page or a permission violation becomes a guest exception. A small
+cache of the private pages used last (a software TLB of 64 entries) lets the
+next access to one of them skip the page table, still checking its
+protection; it is emptied whenever a mapping or a page entry may change.
 
 ## Owning the waiting primitives
 

@@ -277,6 +277,10 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
     drop(fs.open(PATH, 0o102, mode)?);
     // Opened again without O_CREAT, so that F_GETFL shows O_RDWR | O_LARGEFILE.
     let file = fs.open(PATH, 0o100002, 0)?;
+    // Its inode belongs to the thread's filesystem IDs, as `shmem_get_inode`
+    // gives it.
+    let credentials = &c.process.credentials;
+    file.set_owner(Some(credentials.fsuid), Some(credentials.fsgid))?;
     let seals = if flags & MFD_NOEXEC_SEAL != 0 {
         F_SEAL_EXEC
     } else if flags & MFD_ALLOW_SEALING != 0 {

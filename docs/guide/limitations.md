@@ -88,21 +88,29 @@ verified.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
 - **File owners**: a file in a mounted host directory stays root's, so
-  `chown` to any other owner or group returns `EPERM` there.
-- **Credentials**: the IDs and capabilities a thread takes are not yet
-  checked anywhere else. A guest that leaves root still opens, executes,
-  changes and signals everything as root, a file it makes still belongs to
-  root, and `si_uid`, `SCM_CREDENTIALS`, `SO_PEERCRED` and a core's
-  `pr_uid` and `pr_gid` still give root's IDs. A set-user-ID or set-group-ID
-  program runs with the caller's IDs, where Linux would take the file's
-  owner or group. `/proc/self/status` shows the calling thread's
+  `chown` to any other owner or group returns `EPERM` there, and a file a
+  guest that is not root makes there is root's too, which that guest may
+  then not be allowed to open again.
+- **Credentials**: the IDs and capabilities a thread takes are checked on
+  files but nowhere else yet. A guest that leaves root still signals any
+  process and changes any limit and priority as root, and `si_uid`,
+  `SCM_CREDENTIALS`, `SO_PEERCRED` and a core's `pr_uid` and `pr_gid` still
+  give root's IDs. Of the files, those under `/proc` and `/dev` are not
+  checked; an AF_UNIX socket file is made root's, and connecting to one
+  does not check writing it; pipes and socket pairs belong to root; writing
+  a file does not take away its set-user-ID and set-group-ID bits, as Linux
+  does for a writer without `CAP_FSETID`; and `fs.protected_hardlinks`,
+  `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
+  act as 0, the kernel's defaults, which many distributions raise. A
+  set-user-ID or set-group-ID program runs with the caller's IDs, where
+  Linux would take the file's owner or group. `/proc/self/status` shows the calling thread's
   credentials, where Linux shows the thread group leader's, and `capget`
   and `capset` are not implemented.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS` as Linux does, with
   these differences:
-  - The guest is root, so `SCM_CREDENTIALS` may name any process, user and
-    group, where Linux lets an unprivileged process send only its own.
+  - `SCM_CREDENTIALS` may name any process, user and group, as root may,
+    where Linux lets an unprivileged process send only its own.
   - The sockets only unread messages hold are closed at once when another
     socket goes, where Linux's garbage collector closes them a little
     later, from a work queue.
@@ -114,9 +122,9 @@ verified.
   with AppArmor `SO_PEERSEC` gives the peer's label. `SO_RCVTIMEO` and
   `SO_SNDTIMEO` round to a 1000 Hz tick, where Linux rounds to its own
   `CONFIG_HZ`.
-  The guest is root, so the options that need `CAP_NET_ADMIN`
-  (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set, and `SO_PEERCRED` names uid and
-  gid 0.
+  Capabilities are not checked here, so the options that need
+  `CAP_NET_ADMIN` (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set as for root, and
+  `SO_PEERCRED` names uid and gid 0.
 - **Signal-driven I/O**: the host's standard input, looked at every 10 ms,
   sends `SIGIO` once each time input comes where there was none, where
   Linux's pipe or terminal sends one for every piece of input. Standard

@@ -263,7 +263,7 @@ impl Files {
             .cloned()
             .ok_or(Errno::EBADF)
     }
-    fn path(&self, dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
+    pub(crate) fn path(&self, dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
         if p.is_empty() {
             return Err(Errno::ENOENT);
         }
@@ -356,32 +356,55 @@ fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     }
     Err(Errno::ENAMETOOLONG)
 }
-fn at(c: &Context<'_>, dir: u64, ptr: u64) -> Result<Vec<u8>, Errno> {
-    c.files.path(dir, path(c, ptr)?)
+/// The path `raw` names from `dir`, and what Linux's walk to it found with
+/// the thread's credentials, after its search permission checks
+/// ([`crate::permissions::search`]).
+fn lookup(
+    c: &Context<'_>,
+    dir: u64,
+    raw: Vec<u8>,
+    follow: bool,
+) -> Result<(Vec<u8>, crate::permissions::Found), Errno> {
+    let p = c.files.path(dir, raw.clone())?;
+    let found = crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
+    Ok((p, found))
 }
-/// `faccessat2(dirfd, path, mode, flags)`. The guest is root, so reading and
-/// writing are always allowed and executing needs an execute bit (or a
-/// directory), as Linux grants root.
+/// [`lookup`] of the path at `ptr`.
+fn looked_up(
+    c: &Context<'_>,
+    dir: u64,
+    ptr: u64,
+    follow: bool,
+) -> Result<(Vec<u8>, crate::permissions::Found), Errno> {
+    lookup(c, dir, path(c, ptr)?, follow)
+}
+/// `faccessat2(dirfd, path, mode, flags)`: with the real IDs, as Linux's
+/// `access_override_creds` gives them, or the filesystem ones with
+/// `AT_EACCESS`; root may read and write anything, and execute a directory
+/// or a file with an execute bit.
 fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<u64, Errno> {
     const AT_EACCESS: u64 = 0x200;
     if mode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL);
     }
+    let creds = if flags & AT_EACCESS != 0 {
+        c.process.credentials.clone()
+    } else {
+        c.process.credentials.for_access()
+    };
     let raw = path(c, ptr)?;
     let stat = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
         c.files.descriptor(dir)?.file.stat()?
     } else {
-        let p = c.files.path(dir, raw)?;
+        let p = c.files.path(dir, raw.clone())?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        crate::permissions::search(c.files, &creds, dir, &raw, follow)?;
         match generated_stat(c, &p, follow) {
             Some((stat, ..)) => stat,
             None => c.files.fs.metadata(&p, follow)?,
         }
     };
-    let directory = stat.mode & 0o170000 == 0o040000;
-    if mode & 1 != 0 && !directory && stat.mode & 0o111 == 0 {
-        return Err(Errno(13)); // EACCES
-    }
+    crate::permissions::permission(&creds, &stat, mode as u32)?;
     Ok(0)
 }
 /// What `statfs` reports for a pipe, a socket, /proc or a terminal: an
@@ -444,6 +467,8 @@ const UTIME_OMIT: u64 = (1 << 30) - 2;
 /// `utimensat(dirfd, path, times, flags)`, in the order Linux checks it.
 fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let now = || c.host.clock(ClockId::Realtime).map(i128::from);
+    // Setting both times to now (`ATTR_TOUCH`) needs less than setting them.
+    let mut touch = true;
     let (atime, mtime) = if a[2] == 0 {
         let now = now()?;
         (Some(now), Some(now))
@@ -457,6 +482,7 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         let mut times = [None, None];
         for (slot, i) in times.iter_mut().zip([0, 2]) {
             let (seconds, nanos) = (field(i) as i64, field(i + 1));
+            touch &= nanos == UTIME_NOW;
             *slot = match nanos {
                 UTIME_OMIT => None,
                 UTIME_NOW => Some(now()?),
@@ -484,10 +510,14 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     };
     if descriptor {
         let file = c.files.descriptor(a[0])?.file;
+        crate::permissions::times(&c.process.credentials, &file.stat()?, touch)?;
         return file.set_times(atime, mtime).map(|()| 0);
     }
-    let p = at(c, a[0], a[1])?;
     let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
+    let (p, found) = looked_up(c, a[0], a[1], follow)?;
+    if let Some(stat) = found.file {
+        crate::permissions::times(&c.process.credentials, &stat, touch)?;
+    }
     c.files.fs.set_times(&p, follow, atime, mtime).map(|()| 0)
 }
 /// The owner or group of a `chown` call; -1 leaves it as it is.
@@ -497,23 +527,31 @@ fn owner_id(id: u64) -> Option<u32> {
 }
 /// The mode a file of `mode` has after `chown`, when it changes: as Linux's
 /// `chown_common`, a file that is not a directory loses its set-user-ID bit,
-/// and its set-group-ID bit when group execution is set (root keeps it
-/// otherwise), even when the owner and group stay.
-fn mode_after_chown(mode: u32) -> Option<u32> {
+/// and its set-group-ID bit when group execution is set or the caller may
+/// not keep it (`keeps_sgid`, [`crate::permissions::chown`]), even when the
+/// owner and group stay.
+fn mode_after_chown(mode: u32, keeps_sgid: bool) -> Option<u32> {
     if mode & 0o170000 == 0o040000 {
         return None;
     }
     let mut kept = mode & !0o4000;
-    if mode & 0o010 != 0 {
+    if mode & 0o010 != 0 || !keeps_sgid {
         kept &= !0o2000;
     }
     (kept != mode).then_some(kept & 0o7777)
 }
 /// `fchown(fd, owner, group)`.
-fn chown_file(file: &Arc<dyn FileHandle>, uid: u64, gid: u64) -> Result<u64, Errno> {
-    let mode = file.stat()?.mode;
-    file.set_owner(owner_id(uid), owner_id(gid))?;
-    if let Some(mode) = mode_after_chown(mode) {
+fn chown_file(
+    c: &Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    uid: u64,
+    gid: u64,
+) -> Result<u64, Errno> {
+    let stat = file.stat()?;
+    let (uid, gid) = (owner_id(uid), owner_id(gid));
+    let keeps_sgid = crate::permissions::chown(&c.process.credentials, &stat, uid, gid)?;
+    file.set_owner(uid, gid)?;
+    if let Some(mode) = mode_after_chown(stat.mode, keeps_sgid) {
         file.set_mode(mode)?;
     }
     Ok(0)
@@ -527,11 +565,11 @@ fn chown_path(
     uid: u64,
     gid: u64,
 ) -> Result<u64, Errno> {
-    let mode = c.files.fs.metadata(path, follow)?.mode;
-    c.files
-        .fs
-        .set_owner(path, follow, owner_id(uid), owner_id(gid))?;
-    if let Some(mode) = mode_after_chown(mode) {
+    let stat = c.files.fs.metadata(path, follow)?;
+    let (uid, gid) = (owner_id(uid), owner_id(gid));
+    let keeps_sgid = crate::permissions::chown(&c.process.credentials, &stat, uid, gid)?;
+    c.files.fs.set_owner(path, follow, uid, gid)?;
+    if let Some(mode) = mode_after_chown(stat.mode, keeps_sgid) {
         c.files.fs.set_mode(path, mode)?;
     }
     Ok(0)
@@ -546,7 +584,7 @@ fn fchownat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let raw = path(c, a[1])?;
     if raw.is_empty() && a[4] & AT_EMPTY_PATH != 0 {
         if a[0] as i32 != -100 {
-            return chown_file(&c.files.descriptor(a[0])?.file, a[2], a[3]);
+            return chown_file(c, &c.files.descriptor(a[0])?.file, a[2], a[3]);
         }
         let cwd = c
             .files
@@ -556,8 +594,9 @@ fn fchownat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .clone();
         return chown_path(c, &cwd, true, a[2], a[3]);
     }
-    let p = c.files.path(a[0], raw)?;
-    chown_path(c, &p, a[4] & AT_SYMLINK_NOFOLLOW == 0, a[2], a[3])
+    let follow = a[4] & AT_SYMLINK_NOFOLLOW == 0;
+    let (p, _) = lookup(c, a[0], raw, follow)?;
+    chown_path(c, &p, follow, a[2], a[3])
 }
 fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
     c.mem.write(GuestAddr(addr), b).map_err(|_| Errno::EFAULT)
@@ -1189,8 +1228,8 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             )
         }
     } else {
-        let p = c.files.path(dir, raw)?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let (p, _) = lookup(c, dir, raw, follow)?;
         match generated_stat(c, &p, follow) {
             Some(generated) => generated,
             None => (
@@ -1588,11 +1627,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             Ok(count as u64)
         }
         2 | 85 | 257 => {
-            let (p, flags, mode) = match n {
-                2 => (at(c, (-100i32) as u64, a[0])?, a[1], a[2]),
-                85 => (at(c, (-100i32) as u64, a[0])?, 577, a[1]),
-                _ => (at(c, a[0], a[1])?, a[2], a[3]),
+            let (dir, raw, flags, mode) = match n {
+                2 => ((-100i32) as u64, path(c, a[0])?, a[1], a[2]),
+                85 => ((-100i32) as u64, path(c, a[0])?, 577, a[1]),
+                _ => (a[0], path(c, a[1])?, a[2], a[3]),
             };
+            let p = c.files.path(dir, raw.clone())?;
             let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
             if flags & 3 == 3 {
                 return Err(Errno::EINVAL);
@@ -1600,7 +1640,15 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             // Linux takes the descriptor before it opens, so with none free
             // nothing is opened or created.
             let fd = c.files.reserve(c.group.nofile())?;
-            let opened = open_path(c, &p, flags, mode as u32);
+            let credentials = &c.process.credentials;
+            let opened = match crate::permissions::open(c.files, credentials, dir, &raw, flags) {
+                Ok(created) => open_path(c, &p, flags, mode as u32).inspect(|_| {
+                    if let Some(parent) = created {
+                        crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
+                    }
+                }),
+                Err(error) => Err(error),
+            };
             match opened {
                 Ok((file, path)) => {
                     let cloexec = flags & 0x80000 != 0;
@@ -1648,9 +1696,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         descriptor_block_size(c, &d),
                     );
                 }
-                (c.files.path(a[0], raw)?, a[2], a[3] & 0x100 == 0)
+                let follow = a[3] & 0x100 == 0;
+                (lookup(c, a[0], raw, follow)?.0, a[2], follow)
             } else {
-                (at(c, (-100i32) as u64, a[0])?, a[1], n == 4)
+                (
+                    looked_up(c, (-100i32) as u64, a[0], n == 4)?.0,
+                    a[1],
+                    n == 4,
+                )
             };
             if let Some((generated, device, block_size)) = generated_stat(c, &p, follow) {
                 return stat(c, out, generated, device, block_size);
@@ -1815,7 +1868,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let f = if n == 77 {
                 c.files.descriptor(a[0])?.file
             } else {
-                c.files.fs.open(&at(c, (-100i32) as u64, a[0])?, 1, 0)?
+                let (p, found) = looked_up(c, (-100i32) as u64, a[0], true)?;
+                if let Some(stat) = found.file {
+                    crate::permissions::truncate(&c.process.credentials, &stat)?;
+                }
+                c.files.fs.open(&p, 1, 0)?
             };
             if a[1] > i64::MAX as u64 {
                 return Err(Errno::EINVAL);
@@ -1844,25 +1901,42 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         80 | 81 => {
             let p = if n == 80 {
-                at(c, (-100i32) as u64, a[0])?
+                looked_up(c, (-100i32) as u64, a[0], true)?.0
             } else {
                 c.files.descriptor(a[0])?.path
             };
-            if c.files.fs.metadata(&p, true)?.mode & 0o170000 != 0o040000 {
+            let stat = c.files.fs.metadata(&p, true)?;
+            if stat.mode & 0o170000 != 0o040000 {
                 return Err(Errno::ENOTDIR);
+            }
+            if !crate::permissions::unchecked(&c.process.credentials) {
+                crate::permissions::permission(
+                    &c.process.credentials,
+                    &stat,
+                    crate::permissions::MAY_EXEC,
+                )?;
             }
             *c.files.cwd.lock().unwrap_or_else(PoisonError::into_inner) = p;
             Ok(0)
         }
         82 | 264 => {
-            let (old, new) = if n == 82 {
+            let ((old_dir, old_raw), (new_dir, new_raw)) = if n == 82 {
                 (
-                    at(c, (-100i32) as u64, a[0])?,
-                    at(c, (-100i32) as u64, a[1])?,
+                    ((-100i32) as u64, path(c, a[0])?),
+                    ((-100i32) as u64, path(c, a[1])?),
                 )
             } else {
-                (at(c, a[0], a[1])?, at(c, a[2], a[3])?)
+                ((a[0], path(c, a[1])?), (a[2], path(c, a[3])?))
             };
+            let old = c.files.path(old_dir, old_raw.clone())?;
+            let new = c.files.path(new_dir, new_raw.clone())?;
+            crate::permissions::rename(
+                c.files,
+                &c.process.credentials,
+                (old_dir, &old_raw),
+                (new_dir, &new_raw),
+                || device(c, &old) == device(c, &new),
+            )?;
             c.files.fs.rename(&old, &new)?;
             for d in c
                 .files
@@ -1887,49 +1961,67 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             Ok(0)
         }
         83 | 258 => {
-            let (p, mode) = if n == 83 {
-                (at(c, (-100i32) as u64, a[0])?, a[1])
+            let (dir, raw, mode) = if n == 83 {
+                ((-100i32) as u64, path(c, a[0])?, a[1])
             } else {
-                (at(c, a[0], a[1])?, a[2])
+                (a[0], path(c, a[1])?, a[2])
             };
+            let p = c.files.path(dir, raw.clone())?;
+            let created = crate::permissions::create(c.files, &c.process.credentials, dir, &raw)?;
             c.files.fs.mkdir(&p, (mode as u32) & !c.files.umask())?;
+            if let Some(parent) = created {
+                crate::permissions::own(c.files, &c.process.credentials, &p, false, &parent);
+            }
             Ok(0)
         }
         84 | 87 | 263 => {
-            let (p, dir) = if n == 263 {
+            let (at_dir, raw, dir) = if n == 263 {
                 if a[2] & !512 != 0 {
                     return Err(Errno::EINVAL);
                 }
-                (at(c, a[0], a[1])?, a[2] & 512 != 0)
+                (a[0], path(c, a[1])?, a[2] & 512 != 0)
             } else {
-                (at(c, (-100i32) as u64, a[0])?, n == 84)
+                ((-100i32) as u64, path(c, a[0])?, n == 84)
             };
+            let p = c.files.path(at_dir, raw.clone())?;
+            crate::permissions::delete(c.files, &c.process.credentials, at_dir, &raw)?;
             c.files.fs.unlink(&p, dir)?;
             Ok(0)
         }
         86 | 265 => {
-            let (old, new) = if n == 86 {
-                (
-                    at(c, (-100i32) as u64, a[0])?,
-                    at(c, (-100i32) as u64, a[1])?,
-                )
+            let ((old_dir, old_ptr), (new_dir, new_ptr)) = if n == 86 {
+                (((-100i32) as u64, a[0]), ((-100i32) as u64, a[1]))
             } else {
                 if a[4] != 0 {
                     return Err(Errno::EINVAL);
                 }
-                (at(c, a[0], a[1])?, at(c, a[2], a[3])?)
+                ((a[0], a[1]), (a[2], a[3]))
             };
+            // `do_linkat`: the old name is looked up, the new one must not
+            // be there (EEXIST) and be on the same filesystem (EXDEV), which
+            // the link finds, before `may_create`.
+            let (old, source) = looked_up(c, old_dir, old_ptr, false)?;
+            let new_raw = path(c, new_ptr)?;
+            let new = c.files.path(new_dir, new_raw.clone())?;
+            if source.file.is_some() && device(c, &old) == device(c, &new) {
+                crate::permissions::create(c.files, &c.process.credentials, new_dir, &new_raw)?;
+            }
             c.files.fs.link(&old, &new)?;
             Ok(0)
         }
         88 | 266 => {
             let target = path(c, a[0])?;
-            let p = if n == 88 {
-                at(c, (-100i32) as u64, a[1])?
+            let (dir, raw) = if n == 88 {
+                ((-100i32) as u64, path(c, a[1])?)
             } else {
-                at(c, a[1], a[2])?
+                (a[1], path(c, a[2])?)
             };
+            let p = c.files.path(dir, raw.clone())?;
+            let created = crate::permissions::create(c.files, &c.process.credentials, dir, &raw)?;
             c.files.fs.symlink(&target, &p)?;
+            if let Some(parent) = created {
+                crate::permissions::own(c.files, &c.process.credentials, &p, false, &parent);
+            }
             Ok(0)
         }
         89 | 267 => {
@@ -1958,9 +2050,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return Ok(count as u64);
             }
             let (p, buf, len) = if n == 89 {
-                (at(c, (-100i32) as u64, a[0])?, a[1], a[2])
+                (looked_up(c, (-100i32) as u64, a[0], false)?.0, a[1], a[2])
             } else {
-                (at(c, a[0], a[1])?, a[2], a[3])
+                (looked_up(c, a[0], a[1], false)?.0, a[2], a[3])
             };
             if len == 0 {
                 return Err(Errno::EINVAL);
@@ -2034,31 +2126,38 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.files.umask.swap(a[0] as u32 & 0o777, Ordering::SeqCst),
         )),
         // chmod, fchmod, fchmodat (which has no flags argument)
-        90 => {
-            let p = at(c, (-100i32) as u64, a[0])?;
-            c.files.fs.set_mode(&p, a[1] as u32).map(|()| 0)
+        90 | 268 => {
+            let (p, mode) = if n == 90 {
+                (looked_up(c, (-100i32) as u64, a[0], true)?, a[1])
+            } else {
+                (looked_up(c, a[0], a[1], true)?, a[2])
+            };
+            let (p, found) = p;
+            let mode = match found.file {
+                Some(stat) => {
+                    crate::permissions::chmod(&c.process.credentials, &stat, mode as u32)?
+                }
+                None => mode as u32,
+            };
+            c.files.fs.set_mode(&p, mode).map(|()| 0)
         }
-        91 => c
-            .files
-            .descriptor(a[0])?
-            .file
-            .set_mode(a[1] as u32)
-            .map(|()| 0),
-        268 => {
-            let p = at(c, a[0], a[1])?;
-            c.files.fs.set_mode(&p, a[2] as u32).map(|()| 0)
+        91 => {
+            let file = c.files.descriptor(a[0])?.file;
+            let mode =
+                crate::permissions::chmod(&c.process.credentials, &file.stat()?, a[1] as u32)?;
+            file.set_mode(mode).map(|()| 0)
         }
         // chown, fchown, lchown, fchownat
         92 | 94 => {
-            let p = at(c, (-100i32) as u64, a[0])?;
+            let (p, _) = looked_up(c, (-100i32) as u64, a[0], n == 92)?;
             chown_path(c, &p, n == 92, a[1], a[2])
         }
-        93 => chown_file(&c.files.descriptor(a[0])?.file, a[1], a[2]),
+        93 => chown_file(c, &c.files.descriptor(a[0])?.file, a[1], a[2]),
         260 => fchownat(c, a),
         280 => utimensat(c, a),
         // statfs, fstatfs
         137 => {
-            let p = at(c, (-100i32) as u64, a[0])?;
+            let (p, _) = looked_up(c, (-100i32) as u64, a[0], true)?;
             let stats = if in_proc(&p) {
                 // A link in `fd` leads to its descriptor's file; one for a
                 // descriptor not open is not there (`ENOENT`).
@@ -2859,13 +2958,13 @@ fn reopen(
     }
 }
 /// Whether `path` is one of the generated files, which no filesystem holds.
-fn generated(path: &[u8]) -> bool {
+pub(crate) fn generated(path: &[u8]) -> bool {
     crate::devices::entry(path).is_some() || path.starts_with(b"/proc/")
 }
 /// `path` as `realpath` gives it: absolute, with `.`, `..` and every
 /// symbolic link resolved one component at a time (at most 40 links, as
 /// Linux follows), or `None` when a component is missing.
-fn resolved(c: &Context<'_>, path: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn resolved(files: &Files, path: &[u8]) -> Option<Vec<u8>> {
     const SYMLINK: u32 = 0o120000;
     let mut pending: Vec<Vec<u8>> = path
         .split(|&b| b == b'/')
@@ -2896,12 +2995,12 @@ fn resolved(c: &Context<'_>, path: &[u8]) -> Option<Vec<u8>> {
         }
         parts.push(part);
         let candidate = join(&parts);
-        if c.files.fs.metadata(&candidate, false).ok()?.mode & 0o170000 == SYMLINK {
+        if files.fs.metadata(&candidate, false).ok()?.mode & 0o170000 == SYMLINK {
             links += 1;
             if links > 40 {
                 return None;
             }
-            let target = c.files.fs.readlink(&candidate).ok()?;
+            let target = files.fs.readlink(&candidate).ok()?;
             parts.pop();
             if target.first() == Some(&b'/') {
                 parts.clear();
@@ -2914,7 +3013,7 @@ fn resolved(c: &Context<'_>, path: &[u8]) -> Option<Vec<u8>> {
 /// The path that still names the file of `d` (its recorded path resolved),
 /// or `None` once nothing does.
 fn current_path(c: &Context<'_>, d: &Descriptor, inode: u64) -> Option<Vec<u8>> {
-    let path = resolved(c, &d.path)?;
+    let path = resolved(c.files, &d.path)?;
     c.files
         .fs
         .metadata(&path, false)

@@ -259,6 +259,17 @@ impl Credentials {
             || self.fsgid != new.fsgid
     }
 
+    /// The credentials `access` checks with (`access_override_creds`): the
+    /// real IDs as the filesystem ones, and for root every permitted
+    /// capability as effective, for anyone else none.
+    pub(crate) fn for_access(&self) -> Self {
+        let mut new = self.clone();
+        new.fsuid = new.uid;
+        new.fsgid = new.gid;
+        new.effective = if new.uid == 0 { new.permitted } else { 0 };
+        new
+    }
+
     /// The credentials a program runs with after exec, as Linux's
     /// `cap_bprm_creds_from_file` gives them without file capabilities:
     /// the saved and filesystem IDs take the effective ones, root (by its

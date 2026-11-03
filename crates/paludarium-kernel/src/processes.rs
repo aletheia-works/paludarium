@@ -372,7 +372,8 @@ impl Processes {
         }
     }
     /// After exec, the process is dumpable unless it runs with effective
-    /// IDs other than its real ones, and a secure exec forgets its
+    /// IDs other than its real ones or from a program it may not read, and
+    /// a secure exec forgets its
     /// parent-death signal, as Linux's `begin_new_exec` does.
     pub(crate) fn executed_as(&self, pid: u32, dumpable: bool, secure: bool) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1742,6 +1743,7 @@ impl Kernel {
     ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         let path = read_string(mem, a[0], 4096, Errno::ENAMETOOLONG)?;
         let path = self.files.exec_path(path)?;
+        let readable = crate::permissions::exec(&self.files, &thread.state.credentials, &path)?;
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;
         let argv = read_vector(mem, a[1], &mut budget)?;
         let envp = read_vector(mem, a[2], &mut budget)?;
@@ -1821,7 +1823,9 @@ impl Kernel {
             ..ThreadState::default()
         };
         thread.state.name_after(&path);
-        let dumpable = credentials.euid == credentials.uid && credentials.egid == credentials.gid;
+        // A program the thread may not read runs undumpable (`would_dump`).
+        let dumpable =
+            credentials.euid == credentials.uid && credentials.egid == credentials.gid && readable;
         self.processes
             .executed_as(self.process.pid, dumpable, secure);
         thread.state.credentials = credentials;

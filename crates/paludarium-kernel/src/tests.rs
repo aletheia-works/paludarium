@@ -2186,3 +2186,52 @@ mod stdin_readiness {
         assert_eq!(u32::from_le_bytes(events), 1 | 0x10);
     }
 }
+
+/// A thread that leaves root meets Linux's permission checks on the files
+/// root laid out, and owns what it makes.
+#[test]
+fn a_thread_that_is_not_root_is_checked_on_files() {
+    let mut f = fixture();
+    let put = |f: &mut Fixture, at: u64, path: &[u8]| {
+        f.mem.write(GuestAddr(DATA + at), path).unwrap();
+        f.mem
+            .write(GuestAddr(DATA + at + path.len() as u64), b"\0")
+            .unwrap();
+        DATA + at
+    };
+    let closed = put(&mut f, 0, b"/closed");
+    let inside = put(&mut f, 0x100, b"/closed/f");
+    let link = put(&mut f, 0x200, b"/link");
+    let target = put(&mut f, 0x300, b"closed/f");
+    let mine = put(&mut f, 0x400, b"/tmp/mine");
+    let stat = DATA + 0x1000;
+    // As root: a closed directory with a file, and a link into it.
+    assert_eq!(f.ret(83, &[closed, 0o700]), 0);
+    let fd = f.ret(2, &[inside, 0o101, 0o644]);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(88, &[target, link]), 0);
+    // Executing a file with no execute bit is EACCES even for root.
+    assert_eq!(f.ret(59, &[inside, 0, 0]), errno(Errno::EACCES));
+    f.thread.state.credentials = f
+        .thread
+        .state
+        .credentials
+        .setresuid(1000, 1000, 1000)
+        .unwrap();
+    assert_eq!(f.ret(4, &[inside, stat]), errno(Errno::EACCES));
+    assert_eq!(f.ret(4, &[link, stat]), errno(Errno::EACCES));
+    assert_eq!(f.ret(6, &[link, stat]), 0);
+    assert_eq!(f.ret(2, &[closed, 0, 0]), errno(Errno::EACCES));
+    assert_eq!(f.ret(80, &[closed]), errno(Errno::EACCES));
+    assert_eq!(f.ret(87, &[link]), errno(Errno::EACCES));
+    assert_eq!(f.ret(90, &[closed, 0o777]), errno(Errno::EPERM));
+    assert_eq!(f.ret(21, &[closed, 4]), errno(Errno::EACCES));
+    // /tmp is sticky and open to all: a file made there is the thread's,
+    // and root's closed directory is not its to remove.
+    let fd = f.ret(2, &[mine, 0o101, 0o600]);
+    assert_eq!(f.ret(5, &[fd, stat]), 0);
+    let mut owner = [0; 8];
+    f.mem.read(GuestAddr(stat + 28), &mut owner).unwrap();
+    assert_eq!(owner, [0xe8, 3, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(f.ret(84, &[closed]), errno(Errno::EACCES));
+}

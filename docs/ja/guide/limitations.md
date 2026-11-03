@@ -77,19 +77,28 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **一部のシステムコール**：実装していないシステムコールは `ENOSYS` を返すので、
   プログラムによってはその機能なしで続けられます。
 - **ファイルの持ち主**：マウントしたホストのディレクトリのファイルは root のままなので、
-  そこで別の持ち主やグループに `chown` すると `EPERM` を返します。
-- **資格情報**：スレッドが変えた ID とケーパビリティは、まだほかのところでは
-  確かめていません。root でなくなったゲストも、root として何でも開き、実行し、
-  変え、シグナルを送れます。作ったファイルは root のもので、`si_uid`、
+  そこで別の持ち主やグループに `chown` すると `EPERM` を返します。root でない
+  ゲストがそこに作ったファイルも root のものになり、そのゲストはもう一度開けない
+  ことがあります。
+- **資格情報**：スレッドが変えた ID とケーパビリティは、ファイルでは確かめますが、
+  ほかのところではまだ確かめていません。root でなくなったゲストも、root として
+  どのプロセスにもシグナルを送れ、どの制限も優先度も変えられます。`si_uid`、
   `SCM_CREDENTIALS`、`SO_PEERCRED`、コアの `pr_uid` と `pr_gid` も root の ID の
-  ままです。set-user-ID や set-group-ID のプログラムは呼んだ側の ID で動きます。
+  ままです。ファイルのうち、`/proc` と `/dev` の下は確かめません。AF_UNIX の
+  ソケットファイルは root のものとして作り、つなぐときに書き込みの許可を
+  確かめません。パイプとソケットペアは root のものです。ファイルに書いても、
+  Linux が `CAP_FSETID` のない書き手についてするようには set-user-ID と
+  set-group-ID のビットを外しません。`fs.protected_hardlinks`、
+  `fs.protected_symlinks`、`fs.protected_fifos`、`fs.protected_regular` は、
+  カーネルの既定値の 0 として振る舞います。多くのディストリビューションは
+  これらを上げています。set-user-ID や set-group-ID のプログラムは呼んだ側の ID で動きます。
   Linux ならファイルの持ち主やグループになります。`/proc/self/status` は呼んだ
   スレッドの資格情報を示しますが、Linux はスレッドグループのリーダーのものを
   示します。`capget` と `capset` は実装していません。
 - **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように
   `SCM_RIGHTS` でディスクリプタを、`SCM_CREDENTIALS` で資格情報を受け渡します。
   違いは次のとおりです。
-  - ゲストは root なので、`SCM_CREDENTIALS` にはどのプロセス、ユーザー、グループでも
+  - root と同じく、`SCM_CREDENTIALS` にはどのプロセス、ユーザー、グループでも
     指定できます。Linux では、特権のないプロセスが送れるのは自分のものだけです。
   - 読まれていないメッセージだけが持っているソケットは、ほかのソケットがなくなると
     すぐに閉じられます。Linux のガベージコレクタは、ワークキューから少しあとに
@@ -102,8 +111,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   AppArmor のある Linux は `SO_PEERSEC` で相手のラベルを渡します。
   `SO_RCVTIMEO` と `SO_SNDTIMEO` は 1000 Hz の刻みに丸めます。
   Linux は自分の `CONFIG_HZ` に丸めます。
-  ゲストは root なので、`CAP_NET_ADMIN` の
-  要るオプション（`SO_DEBUG`、`SO_SNDBUFFORCE` など）も設定でき、`SO_PEERCRED` の
+  ここではケーパビリティを確かめないので、`CAP_NET_ADMIN` の要るオプション
+  （`SO_DEBUG`、`SO_SNDBUFFORCE` など）も root と同じく設定でき、`SO_PEERCRED` の
   uid と gid は 0 です。
 - **シグナル駆動の入出力**：ホストの標準入力は 10 ms ごとに見るので、何もなかったところに
   入力が来るたびに `SIGIO` を 1 回送ります。Linux のパイプや端末は、入力のひとまとまりごとに

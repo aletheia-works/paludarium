@@ -452,11 +452,38 @@ kernel.
   `AT_SECURE` when the effective IDs differ from the real ones and then
   leaves the process undumpable and clears its parent-death signal, and
   otherwise makes it dumpable again. The auxiliary vector and
-  `/proc/self/status` show the IDs and capabilities. Every file belongs to
-  root until `chown` gives it another owner or
-  group, which the in-memory filesystem keeps. As on Linux, `chown` takes the
+  `/proc/self/status` show the IDs and capabilities. The files given at the
+  start belong to root, and a file, directory, symbolic link or memfd a
+  thread makes belongs to its filesystem user and group IDs, until `chown`
+  gives it another owner or group, which the in-memory filesystem keeps.
+- Files are checked as Linux checks them (`generic_permission`): the
+  owner's permission bits apply to the owner, the group's to a member of the
+  file's group (by the filesystem group ID or a supplementary group) and
+  the others' to anyone else; `CAP_DAC_READ_SEARCH` reads any file and
+  searches any directory, and `CAP_DAC_OVERRIDE` allows everything else
+  but executing a file no one may execute. A path needs search permission
+  on each directory a name is looked up in, from where the walk starts
+  (the root, the working directory or `dirfd`, whose own ancestors are not
+  checked) and through each symbolic link it follows. `open` needs reading
+  or writing as its access mode and `O_TRUNC` ask, and a new file writing
+  and searching its directory, as `mkdir`, `symlink` and the new name of
+  `link` and `rename` do; removing a name (`unlink`, `rmdir`, `rename`)
+  needs the same and, in a sticky directory, owning the file or the
+  directory or `CAP_FOWNER` (`EPERM`), and a directory that moves to
+  another one needs writing itself. `chmod` and setting a time need the
+  owner or `CAP_FOWNER` (`EPERM`), and `chmod` drops the set-group-ID bit
+  for a thread outside the file's group without `CAP_FSETID`; setting both
+  times to now is also allowed to a thread that may write the file
+  (`EACCES`). `chown` gives another owner only with `CAP_CHOWN`, and the
+  owner may give a group it is a member of. `truncate` needs writing and
+  `chdir` searching. `access` checks with the real IDs (root's with its
+  permitted capabilities), and with `AT_EACCESS` the filesystem ones.
+  `execve` needs a regular file the thread may execute (else `EACCES`, also
+  for a directory and for root when no execute bit is set), and a program
+  it may not read runs undumpable. As on Linux, `chown` takes the
   set-user-ID bit from a file that is not a directory, and the set-group-ID
-  bit when the group may execute it, even when the owner and group stay.
+  bit when the group may execute it or the caller is neither in its group
+  nor holds `CAP_FSETID`, even when the owner and group stay.
   What is made in a set-group-ID directory takes the directory's group, and a
   new directory the bit as well. `fchmod` and `fchown` also change the mode
   and owner that `fstat` reports for a pipe made by `pipe` or `pipe2`, whose
@@ -533,7 +560,8 @@ kernel.
   root opens it (pidfs has no `open` of its own): with the access it is
   opened with and `O_NONBLOCK` of its own, even after the process is
   reaped. Linux checks the inode's mode first, root's 0600 (0700 for a
-  pidfd), so another user gets `EACCES`; the guest is root. A removed file
+  pidfd), so another user gets `EACCES`; paludarium opens it as for root.
+  A removed file
   of a directory mounted from a host other than Linux, which Linux can
   open, gives `ENXIO` here.
 - `/dev` (mode 0755) holds the memory devices and the links Linux systems
@@ -564,8 +592,6 @@ kernel.
   `CLOCK_BOOTTIME` (the host never suspends), the alarm clocks and
   `CLOCK_TAI` (with a TAI offset of 0). `clock_getres` gives 1 ns, and 4 ms
   for the coarse clocks.
-- As root, `access` allows reading and writing, and executing when the file
-  has an execute bit or is a directory; `getgroups` returns no groups.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
@@ -680,8 +706,8 @@ kernel.
 - Nice values are kept per thread, as on Linux: a new thread or process
   starts with its creator's, and `execve` keeps the caller's. `getpriority`
   reports the highest priority among the threads it finds, as `20 - nice`,
-  and `setpriority` sets them all, cut to -20..19; the guest is root, so it
-  may lower them too. `PRIO_PROCESS` names one thread (0 is the caller),
+  and `setpriority` sets them all, cut to -20..19; any thread may lower
+  them too, as root may. `PRIO_PROCESS` names one thread (0 is the caller),
   `PRIO_PGRP` every thread of a process group and `PRIO_USER` every thread
   of user 0. An exited process not yet reaped is still found. No thread
   gives `ESRCH`, and an unknown `which` `EINVAL`. The values are reported

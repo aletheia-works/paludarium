@@ -1131,6 +1131,56 @@ static void *credentials_thread(void *unused) {
     thread_uid = syscall(SYS_getuid);
     return NULL;
 }
+/* The permissions case: a tree under PERMISSIONS that root lays out and a
+   thread of other IDs then works in. */
+#define PERMISSIONS "/tmp/paludarium-permissions"
+static void remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st)) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *dir = opendir(path);
+        struct dirent *entry;
+        while (dir && (entry = readdir(dir))) {
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+            char inner[512];
+            snprintf(inner, sizeof inner, "%s/%s", path, entry->d_name);
+            remove_tree(inner);
+        }
+        if (dir) closedir(dir);
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+/* A file of `mode` belonging to `uid` and `gid`, holding `size` bytes of
+   `content`. */
+static int permissions_file(const char *name, mode_t mode, uid_t uid, gid_t gid,
+                            const void *content, size_t size) {
+    char path[256];
+    snprintf(path, sizeof path, PERMISSIONS "/%s", name);
+    int fd = open(path, O_CREAT|O_WRONLY|O_TRUNC, 0600);
+    if (fd < 0 || write(fd, content, size) != (ssize_t)size || close(fd)) return -1;
+    if (chown(path, uid, gid) || chmod(path, mode)) return -1;
+    return 0;
+}
+static int permissions_directory(const char *name, mode_t mode, uid_t uid, gid_t gid) {
+    char path[256];
+    snprintf(path, sizeof path, PERMISSIONS "/%s", name);
+    if (mkdir(path, 0700) || chown(path, uid, gid) || chmod(path, mode)) return -1;
+    return 0;
+}
+/* A call's outcome: ok, or its error. */
+static void permitted(const char *name, long value) {
+    printf("%s: %s\n", name, value < 0 ? strerror(errno) : "ok");
+}
+static void permissions_owner(const char *name, const char *path) {
+    struct stat st;
+    if (lstat(path, &st)) {
+        printf("%s: %s\n", name, strerror(errno));
+        return;
+    }
+    printf("%s: uid=%u gid=%u mode=%o\n", name, st.st_uid, st.st_gid, st.st_mode & 07777);
+}
 static void finish(pid_t pid) {
     int status = 0;
     result("wait", waitpid(pid, &status, 0) == pid);
@@ -7564,6 +7614,202 @@ int main(int argc, char **argv) {
                getauxval(AT_UID), getauxval(AT_EUID), getauxval(AT_GID), getauxval(AT_EGID),
                getauxval(AT_SECURE), prctl(PR_GET_KEEPCAPS), signal);
         credentials_line(argc > 3 ? argv[3] : "exec");
+        return 0;
+    }
+    if (!strcmp(mode, "permissions")) {
+        /* Linux's permission checks on files for a thread that is not root
+           (the native side runs as root): searching each directory of a
+           path from where the walk starts, reading, writing and executing
+           by the owner's, group's (also a supplementary one's) or others'
+           bits, creating and removing names in a directory (the sticky bit
+           keeping others' files), the owner of what the thread makes,
+           chmod, chown, utimensat and truncate by the owner, access by the
+           real IDs, and exec. */
+        static const char hello[] = "hello\n";
+        remove_tree(PERMISSIONS);
+        if (mkdir(PERMISSIONS, 0755) || chmod(PERMISSIONS, 0755)) return 70;
+        int image = open(self, O_RDONLY);
+        struct stat image_stat;
+        if (image < 0 || fstat(image, &image_stat)) return 71;
+        char *program = malloc(image_stat.st_size);
+        if (!program || read(image, program, image_stat.st_size) != image_stat.st_size) return 72;
+        close(image);
+        if (permissions_file("secret", 0600, 0, 0, hello, 6) ||
+            permissions_file("public", 0644, 0, 0, hello, 6) ||
+            permissions_file("group", 0640, 0, 2000, hello, 6) ||
+            permissions_file("supplementary", 0640, 0, 4000, hello, 6) ||
+            permissions_file("owned", 0644, 1000, 2000, hello, 6) ||
+            permissions_file("noexec", 0644, 0, 0, hello, 6) ||
+            permissions_file("rootonly", 0700, 0, 0, hello, 6) ||
+            permissions_file("execonly", 0711, 0, 0, program, image_stat.st_size) ||
+            permissions_directory("closed", 0700, 0, 0) ||
+            permissions_file("closed/inside", 0644, 0, 0, hello, 6) ||
+            permissions_directory("closed/open", 0755, 0, 0) ||
+            permissions_file("closed/open/f", 0644, 0, 0, hello, 6) ||
+            permissions_directory("searchonly", 0711, 0, 0) ||
+            permissions_file("searchonly/f", 0644, 0, 0, hello, 6) ||
+            permissions_directory("open", 0777, 0, 0) ||
+            permissions_file("open/rootfile", 0666, 0, 0, hello, 6) ||
+            permissions_file("open/foreign", 0640, 1000, 3000, hello, 6) ||
+            permissions_file("open/foreign-sgid", 02640, 1000, 3000, hello, 6) ||
+            permissions_directory("open/sub", 0755, 0, 0) ||
+            permissions_directory("sticky", 01777, 0, 0) ||
+            permissions_file("sticky/rootfile", 0666, 0, 0, hello, 6) ||
+            permissions_file("sticky/mine", 0644, 1000, 2000, hello, 6) ||
+            symlink("closed/inside", PERMISSIONS "/link-closed"))
+            return 73;
+        free(program);
+        int below_closed = open(PERMISSIONS "/closed/open", O_RDONLY|O_DIRECTORY);
+        int closed = open(PERMISSIONS "/closed", O_RDONLY|O_DIRECTORY);
+        if (below_closed < 0 || closed < 0) return 74;
+        fflush(stdout);
+        pid_t pid = child();
+        if (pid == 0) {
+            gid_t groups[] = {4000};
+            if (chdir(PERMISSIONS "/closed/open") || syscall(SYS_setgroups, 1, groups) ||
+                syscall(SYS_setresgid, 2000, 2000, 2000) || syscall(SYS_setresuid, 1000, 1000, 1000))
+                _exit(75);
+            /* Reading and writing by the bits that apply. */
+            permitted("open-secret", open(PERMISSIONS "/secret", O_RDONLY));
+            permitted("open-public-read", open(PERMISSIONS "/public", O_RDONLY));
+            permitted("open-public-write", open(PERMISSIONS "/public", O_WRONLY));
+            permitted("open-public-truncate", open(PERMISSIONS "/public", O_RDONLY|O_TRUNC));
+            permitted("open-owned", open(PERMISSIONS "/owned", O_RDWR));
+            permitted("open-group-read", open(PERMISSIONS "/group", O_RDONLY));
+            permitted("open-group-write", open(PERMISSIONS "/group", O_WRONLY));
+            permitted("open-supplementary", open(PERMISSIONS "/supplementary", O_RDONLY));
+            /* Searching the directories on the way. */
+            struct stat st;
+            permitted("stat-closed-inside", stat(PERMISSIONS "/closed/inside", &st));
+            permitted("open-closed", open(PERMISSIONS "/closed", O_RDONLY|O_DIRECTORY));
+            permitted("stat-link-closed", stat(PERMISSIONS "/link-closed", &st));
+            permitted("lstat-link-closed", lstat(PERMISSIONS "/link-closed", &st));
+            permitted("stat-searchonly", stat(PERMISSIONS "/searchonly/f", &st));
+            permitted("open-searchonly", open(PERMISSIONS "/searchonly", O_RDONLY|O_DIRECTORY));
+            permitted("openat-below-closed", openat(below_closed, "f", O_RDONLY));
+            permitted("open-cwd-below-closed", open("f", O_RDONLY));
+            permitted("stat-dotdot", stat("..", &st));
+            permitted("stat-dotdot-inside", stat("../inside", &st));
+            permitted("access-closed-inside", access(PERMISSIONS "/closed/inside", F_OK));
+            /* Names in a directory the thread may not write. */
+            permitted("create-in-base", open(PERMISSIONS "/new", O_CREAT|O_WRONLY, 0644));
+            permitted("create-existing", open(PERMISSIONS "/public", O_CREAT|O_RDONLY, 0644));
+            permitted("create-exclusive", open(PERMISSIONS "/public", O_CREAT|O_EXCL|O_RDONLY, 0644));
+            permitted("mkdir-in-base", mkdir(PERMISSIONS "/d", 0755));
+            permitted("mkdir-existing", mkdir(PERMISSIONS "/closed", 0755));
+            permitted("unlink-public", unlink(PERMISSIONS "/public"));
+            permitted("unlink-missing", unlink(PERMISSIONS "/missing"));
+            permitted("rmdir-closed", rmdir(PERMISSIONS "/closed"));
+            permitted("rename-public", rename(PERMISSIONS "/public", PERMISSIONS "/open/public"));
+            permitted("rename-same", rename(PERMISSIONS "/public", PERMISSIONS "/public"));
+            /* Its own file, which fs.protected_hardlinks lets it link. */
+            permitted("link-owned", link(PERMISSIONS "/owned", PERMISSIONS "/link"));
+            permitted("symlink-in-base", symlink("public", PERMISSIONS "/symlink"));
+            /* What the thread makes is its own. */
+            int mine = open(PERMISSIONS "/open/mine", O_CREAT|O_RDWR, 0640);
+            permitted("create-mine", mine);
+            permissions_owner("mine", PERMISSIONS "/open/mine");
+            permitted("mkdir-mine", mkdir(PERMISSIONS "/open/mydir", 0750));
+            permissions_owner("mydir", PERMISSIONS "/open/mydir");
+            permitted("symlink-mine", symlink("mine", PERMISSIONS "/open/mylink"));
+            permissions_owner("mylink", PERMISSIONS "/open/mylink");
+            /* chmod and chown by the owner. */
+            int public = open(PERMISSIONS "/public", O_RDONLY);
+            permitted("chmod-public", chmod(PERMISSIONS "/public", 0600));
+            permitted("fchmod-public", fchmod(public, 0600));
+            permitted("chmod-mine", chmod(PERMISSIONS "/open/mine", 02640));
+            permissions_owner("chmod-mine", PERMISSIONS "/open/mine");
+            permitted("chmod-foreign", chmod(PERMISSIONS "/open/foreign", 02750));
+            permissions_owner("chmod-foreign", PERMISSIONS "/open/foreign");
+            permitted("chown-public-unchanged", chown(PERMISSIONS "/public", -1, -1));
+            permitted("chown-mine-root", chown(PERMISSIONS "/open/mine", 0, -1));
+            permitted("chown-mine-self", chown(PERMISSIONS "/open/mine", 1000, -1));
+            permitted("chown-mine-other-group", chown(PERMISSIONS "/open/mine", -1, 3000));
+            permitted("chown-mine-supplementary", chown(PERMISSIONS "/open/mine", -1, 4000));
+            permissions_owner("chown-mine", PERMISSIONS "/open/mine");
+            permitted("fchown-mine", fchown(mine, -1, 2000));
+            permitted("chown-foreign-sgid", chown(PERMISSIONS "/open/foreign-sgid", -1, 2000));
+            permissions_owner("chown-foreign-sgid", PERMISSIONS "/open/foreign-sgid");
+            /* utimensat: setting times by the owner, touching them by a
+               writer. */
+            struct timespec set[2] = {{1, 0}, {2, 0}};
+            struct timespec now_now[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
+            struct timespec now_omit[2] = {{0, UTIME_NOW}, {0, UTIME_OMIT}};
+            permitted("touch-public", utimensat(AT_FDCWD, PERMISSIONS "/public", NULL, 0));
+            permitted("set-public", utimensat(AT_FDCWD, PERMISSIONS "/public", set, 0));
+            permitted("futimens-public", futimens(public, NULL));
+            permitted("touch-rootfile", utimensat(AT_FDCWD, PERMISSIONS "/open/rootfile", NULL, 0));
+            permitted("now-rootfile", utimensat(AT_FDCWD, PERMISSIONS "/open/rootfile", now_now, 0));
+            permitted("now-omit-rootfile", utimensat(AT_FDCWD, PERMISSIONS "/open/rootfile", now_omit, 0));
+            permitted("set-rootfile", utimensat(AT_FDCWD, PERMISSIONS "/open/rootfile", set, 0));
+            permitted("set-mine", utimensat(AT_FDCWD, PERMISSIONS "/open/mine", set, 0));
+            /* truncate needs write permission. */
+            permitted("truncate-public", truncate(PERMISSIONS "/public", 0));
+            permitted("truncate-rootfile", truncate(PERMISSIONS "/open/rootfile", 0));
+            permitted("truncate-directory", truncate(PERMISSIONS "/open", 0));
+            /* The sticky bit keeps others' files, and moving a directory
+               to another needs writing it. */
+            permitted("unlink-sticky-rootfile", unlink(PERMISSIONS "/sticky/rootfile"));
+            permitted("rename-sticky-rootfile", rename(PERMISSIONS "/sticky/rootfile", PERMISSIONS "/sticky/moved"));
+            permitted("unlink-sticky-mine", unlink(PERMISSIONS "/sticky/mine"));
+            permitted("rename-sub", rename(PERMISSIONS "/open/sub", PERMISSIONS "/sticky/sub"));
+            permitted("rename-mydir", rename(PERMISSIONS "/open/mydir", PERMISSIONS "/sticky/mydir"));
+            /* access by the real IDs. */
+            permitted("access-secret", access(PERMISSIONS "/secret", R_OK));
+            permitted("access-public-read", access(PERMISSIONS "/public", R_OK));
+            permitted("access-public-write", access(PERMISSIONS "/public", W_OK));
+            permitted("access-noexec", access(PERMISSIONS "/noexec", X_OK));
+            /* chdir needs searching. */
+            permitted("chdir-closed", chdir(PERMISSIONS "/closed"));
+            permitted("fchdir-closed", fchdir(closed));
+            permitted("chdir-searchonly", chdir(PERMISSIONS "/searchonly"));
+            /* exec needs executing a regular file; one the thread may not
+               read runs undumpable. */
+            char *args[] = {"process", "permissions-exec", (char *)self, NULL};
+            char *env[] = {NULL};
+            permitted("exec-noexec", execve(PERMISSIONS "/noexec", args, env));
+            permitted("exec-rootonly", execve(PERMISSIONS "/rootonly", args, env));
+            permitted("exec-directory", execve(PERMISSIONS "/open", args, env));
+            fflush(stdout);
+            pid_t exec_pid = child();
+            if (exec_pid == 0) {
+                execve(PERMISSIONS "/execonly", args, env);
+                _exit(76);
+            }
+            int status = 0;
+            waitpid(exec_pid, &status, 0);
+            printf("exec-only: status=%d\n", status);
+            fflush(stdout);
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        printf("unprivileged: status=%d\n", status);
+        /* access takes the real IDs, AT_EACCESS the effective ones. */
+        for (int real = 0; real < 2; real++) {
+            fflush(stdout);
+            pid = child();
+            if (pid == 0) {
+                if (real ? syscall(SYS_setresuid, 1000, 0, 0) : syscall(SYS_setresuid, 0, 1000, 0)) _exit(77);
+                const char *who = real ? "real-user" : "effective-user";
+                char name[64];
+                snprintf(name, sizeof name, "%s-access", who);
+                permitted(name, access(PERMISSIONS "/secret", R_OK));
+                snprintf(name, sizeof name, "%s-eaccess", who);
+                permitted(name, syscall(SYS_faccessat2, AT_FDCWD, PERMISSIONS "/secret", R_OK, AT_EACCESS));
+                snprintf(name, sizeof name, "%s-open", who);
+                permitted(name, open(PERMISSIONS "/secret", O_RDONLY));
+                fflush(stdout);
+                _exit(0);
+            }
+            waitpid(pid, &status, 0);
+            printf("access-ids: status=%d\n", status);
+        }
+        remove_tree(PERMISSIONS);
+        return 0;
+    }
+    if (!strcmp(mode, "permissions-exec")) {
+        printf("exec-only: uid=%u dumpable=%d\n", getuid(), prctl(PR_GET_DUMPABLE));
         return 0;
     }
     if (!strcmp(mode, "proc-status")) {

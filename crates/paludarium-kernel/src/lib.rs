@@ -11,6 +11,7 @@
 mod coredump;
 mod credentials;
 mod inbox;
+mod permissions;
 mod signals;
 pub use inbox::SignalInbox;
 mod devices;

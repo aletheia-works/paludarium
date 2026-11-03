@@ -1535,13 +1535,6 @@ impl AddressSpaceData {
         self.write_with(addr, buf, Access::Setup).map(|_| ())
     }
 
-    /// Reads a little-endian `u64`.
-    pub fn read_u64(&self, addr: GuestAddr) -> Result<u64, Fault> {
-        let mut b = [0u8; 8];
-        self.read(addr, &mut b)?;
-        Ok(u64::from_le_bytes(b))
-    }
-
     fn overlaps(&self, start: u64, end: u64) -> bool {
         // The mapping that starts last before `end` is the only candidate,
         // because mappings never overlap each other.
@@ -2230,6 +2223,15 @@ impl AddressSpace {
             serialization,
         }
     }
+    /// The space's data alone, without the session's serialization, for an
+    /// access through the [`Tlb`]. It holds only pages no other space can
+    /// write: neither shared nor of a file, and a frame `fork` shares stays
+    /// as it is while the entry's own reference keeps its count above one.
+    /// So only the threads of this space can be at them, which this lock
+    /// excludes, as it does [`Self::with_code_epoch`].
+    fn data_locked(&self) -> MutexGuard<'_, AddressSpaceData> {
+        self.data.lock().unwrap_or_else(PoisonError::into_inner)
+    }
     fn locked(&self) -> AddressSpaceGuard<'_> {
         let serialization = self
             .serialization
@@ -2450,6 +2452,9 @@ impl AddressSpace {
         self.locked().set_mmap_top(top);
     }
     pub fn read(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
+        if self.data_locked().read_cached(addr, buf, Access::Read) {
+            return Ok(());
+        }
         self.locked().read(addr, buf)
     }
     /// Reads guest memory whatever its protection, as Linux's core dump
@@ -2458,6 +2463,9 @@ impl AddressSpace {
         self.locked().read_for_dump(addr, buf)
     }
     pub fn write(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
+        if self.data_locked().write_cached(addr, buf, Access::Write) {
+            return Ok(());
+        }
         Self::write_locked(self.locked(), addr, buf)
     }
     /// Writes guest memory, which requires `PROT_WRITE`, through a shared
@@ -2493,10 +2501,12 @@ impl AddressSpace {
         self.locked().write_initial(addr, buf)
     }
     pub fn read_u64(&self, addr: GuestAddr) -> Result<u64, Fault> {
-        self.locked().read_u64(addr)
+        let mut b = [0u8; 8];
+        self.read(addr, &mut b)?;
+        Ok(u64::from_le_bytes(b))
     }
     pub fn write_u64(&self, addr: GuestAddr, value: u64) -> Result<(), Fault> {
-        Self::write_locked(self.locked(), addr, &value.to_le_bytes())
+        self.write(addr, &value.to_le_bytes())
     }
     pub fn map(
         &mut self,

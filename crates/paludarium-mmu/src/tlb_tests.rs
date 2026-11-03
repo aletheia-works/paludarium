@@ -240,3 +240,58 @@ fn the_page_cache_of_a_file_mapping_shows_through() {
     pages.store(3, b"f");
     assert_eq!(byte(&space, at.0 + 3), b'f');
 }
+
+/// Whether `access` finishes while another thread holds the session's
+/// serialization lock.
+fn finishes_under_serialization(
+    space: &Arc<AddressSpace>,
+    access: impl FnOnce(&AddressSpace) + Send + 'static,
+) -> bool {
+    let held = space.serialization.lock().unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let accessing = Arc::clone(space);
+    let thread = std::thread::spawn(move || {
+        access(&accessing);
+        sent.send(()).unwrap();
+    });
+    let finished = received
+        .recv_timeout(std::time::Duration::from_millis(200))
+        .is_ok();
+    drop(held);
+    thread.join().unwrap();
+    finished
+}
+
+#[test]
+fn an_access_it_holds_needs_no_serialization() {
+    let space = Arc::new(space(1, Prot::READ_WRITE));
+    space.write(GuestAddr(AT), &[1]).unwrap();
+    assert_eq!(used(&space, AT), 1);
+    assert!(finishes_under_serialization(&space, |space| {
+        assert_eq!(byte(space, AT), 1);
+    }));
+    assert!(finishes_under_serialization(&space, |space| {
+        space.write(GuestAddr(AT), &[2]).unwrap();
+    }));
+    assert_eq!(byte(&space, AT), 2);
+}
+
+#[test]
+fn an_access_it_does_not_hold_waits_for_serialization() {
+    let space = Arc::new(space(1, Prot::READ_WRITE));
+    // A first read, and a first write, go through the page table.
+    assert!(!finishes_under_serialization(&space, |space| {
+        assert_eq!(byte(space, AT), 0);
+    }));
+    let shared = Arc::new(self::space(1, Prot::READ_WRITE));
+    shared.mark_shared(GuestAddr(AT), PAGE_SIZE).unwrap();
+    assert!(!finishes_under_serialization(&shared, |shared| {
+        shared.write(GuestAddr(AT), &[1]).unwrap();
+    }));
+    assert_eq!(byte(&shared, AT), 1);
+    // Nor does shared memory ever get in, however much it is used.
+    assert_eq!(used(&shared, AT), 1);
+    assert!(!finishes_under_serialization(&shared, |shared| {
+        assert_eq!(byte(shared, AT), 1);
+    }));
+}

@@ -60,3 +60,6 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# A guest runs about 5% faster in the wasm build with these two together.
+lto = "fat"
+codegen-units = 1

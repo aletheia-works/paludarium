@@ -7652,6 +7652,7 @@ int main(int argc, char **argv) {
             permissions_file("closed/inside", 0644, 0, 0, hello, 6) ||
             permissions_directory("closed/open", 0755, 0, 0) ||
             permissions_file("closed/open/f", 0644, 0, 0, hello, 6) ||
+            permissions_file("closed/open/prog", 0755, 0, 0, program, image_stat.st_size) ||
             permissions_directory("searchonly", 0711, 0, 0) ||
             permissions_file("searchonly/f", 0644, 0, 0, hello, 6) ||
             permissions_directory("open", 0777, 0, 0) ||
@@ -7694,6 +7695,19 @@ int main(int argc, char **argv) {
             permitted("open-searchonly", open(PERMISSIONS "/searchonly", O_RDONLY|O_DIRECTORY));
             permitted("openat-below-closed", openat(below_closed, "f", O_RDONLY));
             permitted("open-cwd-below-closed", open("f", O_RDONLY));
+            /* So does a program run from there. */
+            fflush(stdout);
+            pid_t relative = child();
+            if (relative == 0) {
+                char *relative_args[] = {"process", "permissions-exec", (char *)self, "exec-below-closed", NULL};
+                char *no_env[] = {NULL};
+                execve("./prog", relative_args, no_env);
+                printf("exec-below-closed: %s\n", strerror(errno));
+                fflush(stdout);
+                _exit(78);
+            }
+            int relative_status = 0;
+            waitpid(relative, &relative_status, 0);
             permitted("stat-dotdot", stat("..", &st));
             permitted("stat-dotdot-inside", stat("../inside", &st));
             permitted("access-closed-inside", access(PERMISSIONS "/closed/inside", F_OK));
@@ -7816,7 +7830,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "permissions-exec")) {
         int dumpable = prctl(PR_GET_DUMPABLE);
-        printf("exec-only: uid=%u dumpable=%s\n", getuid(),
+        printf("%s: uid=%u dumpable=%s\n", argc > 3 ? argv[3] : "exec-only", getuid(),
                dumpable == 1 ? "1" : dumpable == suid_dumpable() ? "suid" : "other");
         return 0;
     }

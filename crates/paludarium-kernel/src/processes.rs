@@ -1742,8 +1742,10 @@ impl Kernel {
         a: [u64; 6],
     ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         let path = read_string(mem, a[0], 4096, Errno::ENAMETOOLONG)?;
+        let raw = path.clone();
         let path = self.files.exec_path(path)?;
-        let readable = crate::permissions::exec(&self.files, &thread.state.credentials, &path)?;
+        let readable =
+            crate::permissions::exec(&self.files, &thread.state.credentials, &raw, &path)?;
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;
         let argv = read_vector(mem, a[1], &mut budget)?;
         let envp = read_vector(mem, a[2], &mut budget)?;

@@ -241,10 +241,17 @@ fn the_page_cache_of_a_file_mapping_shows_through() {
     assert_eq!(byte(&space, at.0 + 3), b'f');
 }
 
-/// Whether `access` finishes while another thread holds the session's
-/// serialization lock.
+/// Waiting for an access that should finish: it returns as soon as the access
+/// does, so only a failure waits this long, however loaded the machine.
+const SHOULD_FINISH: std::time::Duration = std::time::Duration::from_secs(60);
+/// Waiting for an access that should not: a late finish still passes.
+const SHOULD_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Whether `access` finishes within `patience` while another thread holds the
+/// session's serialization lock.
 fn finishes_under_serialization(
     space: &Arc<AddressSpace>,
+    patience: std::time::Duration,
     access: impl FnOnce(&AddressSpace) + Send + 'static,
 ) -> bool {
     let held = space.serialization.lock().unwrap();
@@ -254,9 +261,7 @@ fn finishes_under_serialization(
         access(&accessing);
         sent.send(()).unwrap();
     });
-    let finished = received
-        .recv_timeout(std::time::Duration::from_millis(200))
-        .is_ok();
+    let finished = received.recv_timeout(patience).is_ok();
     drop(held);
     thread.join().unwrap();
     finished
@@ -267,12 +272,20 @@ fn an_access_it_holds_needs_no_serialization() {
     let space = Arc::new(space(1, Prot::READ_WRITE));
     space.write(GuestAddr(AT), &[1]).unwrap();
     assert_eq!(used(&space, AT), 1);
-    assert!(finishes_under_serialization(&space, |space| {
-        assert_eq!(byte(space, AT), 1);
-    }));
-    assert!(finishes_under_serialization(&space, |space| {
-        space.write(GuestAddr(AT), &[2]).unwrap();
-    }));
+    assert!(finishes_under_serialization(
+        &space,
+        SHOULD_FINISH,
+        |space| {
+            assert_eq!(byte(space, AT), 1);
+        }
+    ));
+    assert!(finishes_under_serialization(
+        &space,
+        SHOULD_FINISH,
+        |space| {
+            space.write(GuestAddr(AT), &[2]).unwrap();
+        }
+    ));
     assert_eq!(byte(&space, AT), 2);
 }
 
@@ -280,18 +293,30 @@ fn an_access_it_holds_needs_no_serialization() {
 fn an_access_it_does_not_hold_waits_for_serialization() {
     let space = Arc::new(space(1, Prot::READ_WRITE));
     // A first read, and a first write, go through the page table.
-    assert!(!finishes_under_serialization(&space, |space| {
-        assert_eq!(byte(space, AT), 0);
-    }));
+    assert!(!finishes_under_serialization(
+        &space,
+        SHOULD_WAIT,
+        |space| {
+            assert_eq!(byte(space, AT), 0);
+        }
+    ));
     let shared = Arc::new(self::space(1, Prot::READ_WRITE));
     shared.mark_shared(GuestAddr(AT), PAGE_SIZE).unwrap();
-    assert!(!finishes_under_serialization(&shared, |shared| {
-        shared.write(GuestAddr(AT), &[1]).unwrap();
-    }));
+    assert!(!finishes_under_serialization(
+        &shared,
+        SHOULD_WAIT,
+        |shared| {
+            shared.write(GuestAddr(AT), &[1]).unwrap();
+        }
+    ));
     assert_eq!(byte(&shared, AT), 1);
     // Nor does shared memory ever get in, however much it is used.
     assert_eq!(used(&shared, AT), 1);
-    assert!(!finishes_under_serialization(&shared, |shared| {
-        assert_eq!(byte(shared, AT), 1);
-    }));
+    assert!(!finishes_under_serialization(
+        &shared,
+        SHOULD_WAIT,
+        |shared| {
+            assert_eq!(byte(shared, AT), 1);
+        }
+    ));
 }

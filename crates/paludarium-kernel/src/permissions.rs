@@ -412,23 +412,25 @@ pub(crate) fn truncate(creds: &Credentials, stat: &FileStat) -> Result<(), Errno
 
 /// exec's checks (`do_open_execat`, `would_dump`) of the program `raw`
 /// names from the working directory, at `path`: a file it finds must be a
-/// regular file the thread may execute (EACCES). Returns whether the thread
-/// may also read it; a program it may not read runs undumpable.
+/// regular file the thread may execute (EACCES). Returns the file, whose
+/// set-user-ID and set-group-ID bits exec takes, and whether the thread may
+/// also read it; a program it may not read runs undumpable.
 pub(crate) fn exec(
     files: &Files,
     creds: &Credentials,
     raw: &[u8],
     path: &[u8],
-) -> Result<bool, Errno> {
+) -> Result<(Option<FileStat>, bool), Errno> {
     search(files, creds, (-100i32) as u64, raw, true)?;
     let Ok(stat) = files.fs.metadata(path, true) else {
-        return Ok(true);
+        return Ok((None, true));
     };
     if stat.mode & TYPE != REGULAR {
         return Err(Errno::EACCES);
     }
     permission(creds, &stat, MAY_EXEC)?;
-    Ok(permission(creds, &stat, MAY_READ).is_ok())
+    let readable = permission(creds, &stat, MAY_READ).is_ok();
+    Ok((Some(stat), readable))
 }
 
 #[cfg(test)]

@@ -371,16 +371,24 @@ impl Processes {
             entry.death_signal = 0;
         }
     }
-    /// After exec, the process is dumpable unless it runs with effective
-    /// IDs other than its real ones or from a program it may not read, and
-    /// a secure exec forgets its
-    /// parent-death signal, as Linux's `begin_new_exec` does.
-    pub(crate) fn executed_as(&self, pid: u32, dumpable: bool, secure: bool) {
+    /// After exec, the process is dumpable or not, may forget its
+    /// parent-death signal, and a secure exec lowers its RLIMIT_STACK soft
+    /// limit to 8 MiB (`_STK_LIM`), as Linux's `begin_new_exec` does.
+    pub(crate) fn executed_as(
+        &self,
+        pid: u32,
+        dumpable: bool,
+        forget_death_signal: bool,
+        secure: bool,
+    ) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(&pid) {
             entry.dumpable = dumpable;
-            if secure {
+            if forget_death_signal {
                 entry.death_signal = 0;
+            }
+            if secure {
+                entry.limits[3].0 = entry.limits[3].0.min(8 << 20);
             }
         }
     }
@@ -1744,7 +1752,7 @@ impl Kernel {
         let path = read_string(mem, a[0], 4096, Errno::ENAMETOOLONG)?;
         let raw = path.clone();
         let path = self.files.exec_path(path)?;
-        let readable =
+        let (program, readable) =
             crate::permissions::exec(&self.files, &thread.state.credentials, &raw, &path)?;
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;
         let argv = read_vector(mem, a[1], &mut budget)?;
@@ -1753,7 +1761,11 @@ impl Kernel {
         self.host
             .random_bytes(&mut random)
             .map_err(|_| Errno::EIO)?;
-        let (credentials, secure) = thread.state.credentials.after_exec();
+        let (_, _, no_new_privs) = self.processes.status_of(self.process.pid);
+        let (credentials, secure) = thread
+            .state
+            .credentials
+            .after_exec(program.as_ref(), no_new_privs);
         let start = StartInfo {
             argv: &argv,
             envp: &envp,
@@ -1817,6 +1829,7 @@ impl Kernel {
             .collect();
         // exec keeps the thread's CPU time, as it keeps the process.
         let cpu = std::mem::take(&mut thread.state.cpu);
+        let old = std::mem::take(&mut thread.state.credentials);
         thread.state = ThreadState {
             pid: self.process.pid,
             signal_mask: thread.state.signal_mask,
@@ -1825,11 +1838,13 @@ impl Kernel {
             ..ThreadState::default()
         };
         thread.state.name_after(&path);
-        // A program the thread may not read runs undumpable (`would_dump`).
-        let dumpable =
-            credentials.euid == credentials.uid && credentials.egid == credentials.gid && readable;
+        // Linux decides from the IDs before exec, then installs the new ones
+        // as a change of credentials (`commit_creds`). A program the thread
+        // may not read runs undumpable (`would_dump`).
+        let changed = old.resets_dumpable(&credentials);
+        let dumpable = old.euid == old.uid && old.egid == old.gid && readable && !changed;
         self.processes
-            .executed_as(self.process.pid, dumpable, secure);
+            .executed_as(self.process.pid, dumpable, secure || changed, secure);
         thread.state.credentials = credentials;
         self.processes.mark_executed(self.process.pid);
         self.exec_memory = Some(Arc::new(memory));

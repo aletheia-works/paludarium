@@ -6,6 +6,7 @@
 //! system call changes only the calling thread's, and the C library applies
 //! it to every thread.
 use crate::syscalls::{Context, Outcome, err, ok};
+use paludarium_host::FileStat;
 use paludarium_types::{Errno, GuestAddr};
 
 /// Every capability, up to `CAP_LAST_CAP` (40): root's.
@@ -16,6 +17,9 @@ const CAP_SETUID: u64 = 1 << 7;
 /// CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER,
 /// CAP_FSETID, CAP_LINUX_IMMUTABLE, CAP_MKNOD and CAP_MAC_OVERRIDE.
 const FS_CAPABILITIES: u64 = 0x1f | 1 << 9 | 1 << 27 | 1 << 32;
+const SET_USER_ID: u32 = 0o4000;
+const SET_GROUP_ID: u32 = 0o2000;
+const GROUP_EXECUTE: u32 = 0o010;
 /// `NGROUPS_MAX`.
 const MAX_GROUPS: u64 = 65536;
 /// The ID that means "unchanged", and that names no user or group.
@@ -270,27 +274,58 @@ impl Credentials {
         new
     }
 
-    /// The credentials a program runs with after exec, as Linux's
-    /// `cap_bprm_creds_from_file` gives them without file capabilities:
-    /// the saved and filesystem IDs take the effective ones, root (by its
-    /// real or effective ID) gets every permitted capability and, by its
-    /// effective ID, every effective one, anyone else none, and
-    /// `keep_caps` is cleared. Also returns whether the exec is secure
-    /// (`AT_SECURE`): the effective IDs differ from the real ones.
-    pub(crate) fn after_exec(&self) -> (Self, bool) {
+    /// The credentials a program runs with after exec from `program`, as
+    /// Linux's `bprm_fill_uid` and `cap_bprm_creds_from_file` give them
+    /// without file capabilities: a set-user-ID program's owner becomes the
+    /// effective user ID, and a set-group-ID one's group (when the group
+    /// may execute it) the effective group ID, unless `no_new_privs`; root
+    /// (by its real or effective ID) gets every permitted capability and,
+    /// by its effective ID, every effective one, anyone else none. With
+    /// `no_new_privs`, an exec that would change the effective user ID, give
+    /// an effective group ID the thread is not in (by its filesystem or a
+    /// supplementary group) or gain capabilities instead takes the real IDs
+    /// as effective and keeps no more capabilities than it had. The saved
+    /// and filesystem IDs take the effective ones, and `keep_caps` is
+    /// cleared. Also returns whether the exec is secure (`AT_SECURE`): it
+    /// changes the effective IDs, they differ from the real ones before it,
+    /// or a user other than root keeps capabilities.
+    pub(crate) fn after_exec(
+        &self,
+        program: Option<&FileStat>,
+        no_new_privs: bool,
+    ) -> (Self, bool) {
         let mut new = self.clone();
-        new.suid = new.euid;
-        new.fsuid = new.euid;
-        new.sgid = new.egid;
-        new.fsgid = new.egid;
+        if let Some(program) = program.filter(|_| !no_new_privs) {
+            if program.mode & SET_USER_ID != 0 {
+                new.euid = program.uid;
+            }
+            if program.mode & (SET_GROUP_ID | GROUP_EXECUTE) == SET_GROUP_ID | GROUP_EXECUTE {
+                new.egid = program.gid;
+            }
+        }
         new.keep_caps = false;
         new.permitted = if new.uid == 0 || new.euid == 0 {
             ALL_CAPABILITIES
         } else {
             0
         };
-        new.effective = if new.euid == 0 { new.permitted } else { 0 };
-        let secure = new.euid != new.uid || new.egid != new.gid;
+        let effective = new.euid == 0;
+        let changed =
+            new.euid != self.euid || (new.egid != self.fsgid && !self.groups.contains(&new.egid));
+        if no_new_privs && (changed || new.permitted & !self.permitted != 0) {
+            new.euid = new.uid;
+            new.egid = new.gid;
+            new.permitted &= self.permitted;
+        }
+        new.effective = if effective { new.permitted } else { 0 };
+        new.suid = new.euid;
+        new.fsuid = new.euid;
+        new.sgid = new.egid;
+        new.fsgid = new.egid;
+        let secure = changed
+            || new.euid != self.uid
+            || new.egid != self.gid
+            || (new.uid != 0 && (effective || new.permitted != 0));
         (new, secure)
     }
 }
@@ -492,7 +527,7 @@ mod credentials_tests {
         };
         let user = root.setresuid(1000, 1000, 1000).unwrap();
         assert_eq!((user.permitted, user.effective), (ALL_CAPABILITIES, 0));
-        let (exec, secure) = user.after_exec();
+        let (exec, secure) = user.after_exec(None, false);
         assert_eq!((exec.permitted, exec.keep_caps, secure), (0, false, false));
     }
 
@@ -511,13 +546,88 @@ mod credentials_tests {
     fn exec_takes_the_effective_ids_as_saved_and_reports_a_secure_exec() {
         let root = Credentials::default();
         let user = root.setresuid(1000, 1001, 1002).unwrap();
-        let (exec, secure) = user.after_exec();
+        let (exec, secure) = user.after_exec(None, false);
         assert_eq!(ids(&exec), [1000, 1001, 1001, 1001]);
         assert!(secure);
-        let (exec, secure) = root.setresuid(1000, 0, 0).unwrap().after_exec();
+        let (exec, secure) = root.setresuid(1000, 0, 0).unwrap().after_exec(None, false);
         assert_eq!(
             (exec.permitted, exec.effective, secure),
             (ALL_CAPABILITIES, ALL_CAPABILITIES, true)
+        );
+    }
+
+    fn program(mode: u32, uid: u32, gid: u32) -> FileStat {
+        FileStat {
+            mode: 0o100000 | mode,
+            uid,
+            gid,
+            ..FileStat::default()
+        }
+    }
+
+    #[test]
+    fn a_set_user_id_or_set_group_id_program_gives_its_owner_as_effective() {
+        let user = Credentials::default()
+            .setresgid(2000, 2000, 2000)
+            .and_then(|c| c.setresuid(1000, 1000, 1000))
+            .unwrap();
+        let (exec, secure) = user.after_exec(Some(&program(0o4755, 1001, 0)), false);
+        assert_eq!(ids(&exec), [1000, 1001, 1001, 1001]);
+        assert_eq!((exec.permitted, secure), (0, true));
+        let (exec, secure) = user.after_exec(Some(&program(0o2755, 0, 3000)), false);
+        assert_eq!(
+            [exec.gid, exec.egid, exec.sgid, exec.fsgid],
+            [2000, 3000, 3000, 3000]
+        );
+        assert!(secure);
+        // Without the group's execute bit, set-group-ID means locking.
+        let (exec, secure) = user.after_exec(Some(&program(0o2745, 0, 3000)), false);
+        assert_eq!((exec.egid, secure), (2000, false));
+        // A set-user-ID root program gives every capability.
+        let (exec, secure) = user.after_exec(Some(&program(0o4755, 0, 0)), false);
+        assert_eq!(ids(&exec), [1000, 0, 0, 0]);
+        assert_eq!(
+            (exec.permitted, exec.effective, secure),
+            (ALL_CAPABILITIES, ALL_CAPABILITIES, true)
+        );
+        // The program's own owner gains nothing.
+        let (exec, secure) = user.after_exec(Some(&program(0o4755, 1000, 0)), false);
+        assert_eq!((ids(&exec), secure), ([1000; 4], false));
+        // Going back to the real ID changes the effective one: secure.
+        let away = Credentials::default().setresuid(1000, 1001, 1001).unwrap();
+        let (exec, secure) = away.after_exec(Some(&program(0o4755, 1000, 0)), false);
+        assert_eq!((ids(&exec), secure), ([1000; 4], true));
+    }
+
+    #[test]
+    fn no_new_privs_ignores_set_id_bits_and_keeps_the_effective_ids() {
+        let user = Credentials::default().setresuid(1000, 1000, 1000).unwrap();
+        let (exec, secure) = user.after_exec(Some(&program(0o6755, 0, 3000)), true);
+        assert_eq!((ids(&exec), exec.egid, secure), ([1000; 4], 0, false));
+        // Effective IDs other than the real ones stay, and the exec counts
+        // as secure.
+        let root = Credentials::default();
+        let away = root.setresuid(1000, 1001, 1001).unwrap();
+        let (exec, secure) = away.after_exec(None, true);
+        assert_eq!((ids(&exec), secure), ([1000, 1001, 1001, 1001], true));
+        // Root by its effective ID keeps its capabilities.
+        let (exec, secure) = root.setresuid(1000, 0, 0).unwrap().after_exec(None, true);
+        assert_eq!(ids(&exec), [1000, 0, 0, 0]);
+        assert_eq!(
+            (exec.permitted, exec.effective, secure),
+            (ALL_CAPABILITIES, ALL_CAPABILITIES, true)
+        );
+        // An effective group the thread is not in (its filesystem group
+        // being another) changes, so the real IDs become effective.
+        let elsewhere = root
+            .setfsgid(5)
+            .unwrap()
+            .setresuid(1000, 1001, 1001)
+            .unwrap();
+        let (exec, secure) = elsewhere.after_exec(None, true);
+        assert_eq!(
+            (ids(&exec), exec.egid, exec.fsgid, secure),
+            ([1000; 4], 0, 0, true)
         );
     }
 

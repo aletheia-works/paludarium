@@ -93,8 +93,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   set-group-ID のビットを外しません。`fs.protected_hardlinks`、
   `fs.protected_symlinks`、`fs.protected_fifos`、`fs.protected_regular` は、
   カーネルの既定値の 0 として振る舞います。多くのディストリビューションは
-  これらを上げています。set-user-ID や set-group-ID のプログラムは呼んだ側の ID で動きます。
-  Linux ならファイルの持ち主やグループになります。`/proc/self/status` は呼んだ
+  これらを上げています。`execve` はファイルのケーパビリティ
+  （`security.capability`）を読まず、`nosuid` のマウントもありません。
+  set-user-ID や set-group-ID のプログラムは、ほかのプロセスが呼んだ側と作業
+  ディレクトリを共有していても（`CLONE_FS`）持ち主やグループになります。Linux なら
+  `CAP_SETUID` がなければ実 ID を実効 ID にします。`/proc/self/status` は呼んだ
   スレッドの資格情報を示しますが、Linux はスレッドグループのリーダーのものを
   示します。`capget` と `capset` は実装していません。
 - **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように

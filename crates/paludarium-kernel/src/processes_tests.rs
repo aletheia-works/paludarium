@@ -948,6 +948,32 @@ mod exec {
         assert!(k.files.descriptor(2).is_ok());
     }
     #[test]
+    fn a_set_user_id_program_runs_as_its_owner_undumpable_on_a_lower_stack_limit() {
+        let (mut k, mut t, m) = exec_setup();
+        k.files
+            .fs
+            .set_owner(b"/child", true, Some(1001), None)
+            .unwrap();
+        k.files.fs.set_mode(b"/child", 0o4755).unwrap();
+        // RLIMIT_STACK up to infinity, then a user other than root.
+        m.write_u64(GuestAddr(DATA + 64), u64::MAX).unwrap();
+        m.write_u64(GuestAddr(DATA + 72), u64::MAX).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 160, [3, DATA + 64, 0, 0, 0, 0]),
+            0
+        );
+        t.state.credentials = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        let c = &t.state.credentials;
+        assert_eq!([c.uid, c.euid, c.suid, c.fsuid], [1000, 1001, 1001, 1001]);
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [3, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 97, [3, DATA + 64, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA + 64)), Ok(8 << 20));
+    }
+    #[test]
     fn failed_exec_preserves_state_and_fds() {
         let (mut k, mut t, m) = exec_setup();
         t.cpu.fs_base = 123;

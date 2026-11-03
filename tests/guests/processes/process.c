@@ -7834,6 +7834,109 @@ int main(int argc, char **argv) {
                dumpable == 1 ? "1" : dumpable == suid_dumpable() ? "suid" : "other");
         return 0;
     }
+    if (!strcmp(mode, "setuid")) {
+        /* exec of set-user-ID and set-group-ID programs (the native side
+           runs as root): the owner's user ID, or the group (when the group
+           may execute the program), becoming the effective, saved and
+           filesystem one; root's capabilities by a root program; AT_SECURE;
+           dumpability decided from the IDs before exec and lost when exec
+           changes an effective or filesystem ID, which also clears the
+           parent-death signal; a secure exec lowering the RLIMIT_STACK soft
+           limit to 8 MiB; and PR_SET_NO_NEW_PRIVS ignoring the bits, and
+           taking the real IDs as effective when the exec would still change
+           the effective ones (an effective group the thread is not in). */
+        static const struct {
+            const char *name, *program;
+            unsigned uid, euid, gid, egid;
+            int fsuid, fsgid, no_new_privs;
+        } steps[] = {
+            {"user-suid", "suid-user", 1000, 1000, 2000, 2000, -1, -1, 0},
+            {"user-sgid", "sgid", 1000, 1000, 2000, 2000, -1, -1, 0},
+            {"user-sgid-locking", "sgid-locking", 1000, 1000, 2000, 2000, -1, -1, 0},
+            {"user-both", "both", 1000, 1000, 2000, 2000, -1, -1, 0},
+            {"user-suid-root", "suid-root", 1000, 1000, 2000, 2000, -1, -1, 0},
+            {"user-suid-self", "suid-self", 1000, 1000, 2000, 2000, -1, -1, 0},
+            {"user-unreadable", "unreadable", 1000, 1000, 2000, 2000, -1, -1, 0},
+            {"user-plain", "plain", 1000, 1000, 2000, 2000, -1, -1, 0},
+            {"root-suid", "suid-user", 0, 0, 0, 0, -1, -1, 0},
+            {"root-plain", "plain", 0, 0, 0, 0, -1, -1, 0},
+            {"back-to-real", "suid-self", 1000, 1001, 2000, 2000, -1, -1, 0},
+            {"fsuid-plain", "plain", 0, 0, 0, 0, 1000, -1, 0},
+            {"nnp-both", "both", 1000, 1000, 2000, 2000, -1, -1, 1},
+            {"nnp-effective", "plain", 1000, 1001, 2000, 2000, -1, -1, 1},
+            {"nnp-root-effective", "plain", 1000, 0, 2000, 2000, -1, -1, 1},
+            {"nnp-fsgid", "plain", 1000, 1001, 2000, 2000, -1, 3000, 1},
+        };
+        const char *dir = "/tmp/paludarium-setuid";
+        remove_tree(dir);
+        if (mkdir(dir, 0755) || chmod(dir, 0755)) return 70;
+        int image = open(self, O_RDONLY);
+        struct stat image_stat;
+        if (image < 0 || fstat(image, &image_stat)) return 71;
+        char *program = malloc(image_stat.st_size);
+        if (!program || read(image, program, image_stat.st_size) != image_stat.st_size) return 72;
+        close(image);
+        static const struct {
+            const char *name;
+            mode_t mode;
+            uid_t uid;
+            gid_t gid;
+        } files[] = {
+            {"suid-user", 04755, 1001, 0}, {"suid-root", 04755, 0, 0},
+            {"suid-self", 04755, 1000, 0}, {"sgid", 02755, 0, 3000},
+            {"sgid-locking", 02745, 0, 3000}, {"both", 06755, 1001, 3000},
+            {"unreadable", 04711, 1001, 0}, {"plain", 0755, 0, 0},
+        };
+        for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+            char path[256];
+            snprintf(path, sizeof path, "%s/%s", dir, files[i].name);
+            int fd = open(path, O_CREAT|O_WRONLY|O_TRUNC, 0600);
+            if (fd < 0 || write(fd, program, image_stat.st_size) != image_stat.st_size || close(fd) ||
+                chown(path, files[i].uid, files[i].gid) || chmod(path, files[i].mode))
+                return 73;
+        }
+        free(program);
+        for (size_t step = 0; step < sizeof steps / sizeof *steps; step++) {
+            fflush(stdout);
+            pid_t pid = child();
+            if (pid == 0) {
+                struct rlimit stack = {RLIM_INFINITY, RLIM_INFINITY};
+                if (syscall(SYS_setgroups, 0, NULL) || setrlimit(RLIMIT_STACK, &stack) ||
+                    syscall(SYS_setresgid, steps[step].gid, steps[step].egid, steps[step].egid))
+                    _exit(74);
+                if (steps[step].fsgid >= 0) syscall(SYS_setfsgid, steps[step].fsgid);
+                if (syscall(SYS_setresuid, steps[step].uid, steps[step].euid, steps[step].euid)) _exit(74);
+                if (steps[step].fsuid >= 0) syscall(SYS_setfsuid, steps[step].fsuid);
+                if (steps[step].no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) _exit(75);
+                prctl(PR_SET_PDEATHSIG, SIGUSR1);
+                char path[256];
+                snprintf(path, sizeof path, "%s/%s", dir, steps[step].program);
+                char *args[] = {"process", "setuid-exec", path, (char *)steps[step].name, NULL};
+                char *env[] = {NULL};
+                execve(path, args, env);
+                printf("%s: %s\n", steps[step].name, strerror(errno));
+                fflush(stdout);
+                _exit(76);
+            }
+            int status = 0;
+            waitpid(pid, &status, 0);
+            printf("%s: status=%d\n", steps[step].name, status);
+        }
+        remove_tree(dir);
+        return 0;
+    }
+    if (!strcmp(mode, "setuid-exec")) {
+        int signal = -1;
+        prctl(PR_GET_PDEATHSIG, &signal);
+        struct rlimit stack;
+        getrlimit(RLIMIT_STACK, &stack);
+        printf("auxv: uid=%lu euid=%lu gid=%lu egid=%lu secure=%lu pdeath=%d stack=%s\n",
+               getauxval(AT_UID), getauxval(AT_EUID), getauxval(AT_GID), getauxval(AT_EGID),
+               getauxval(AT_SECURE), signal,
+               stack.rlim_cur == RLIM_INFINITY ? "unlimited" : stack.rlim_cur == 8 << 20 ? "8M" : "other");
+        credentials_line(argc > 3 ? argv[3] : "exec");
+        return 0;
+    }
     if (!strcmp(mode, "proc-status")) {
         char value[128], link[32];
         umask(027);

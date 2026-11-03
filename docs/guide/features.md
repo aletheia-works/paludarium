@@ -447,11 +447,23 @@ kernel.
   filesystem ID does the same for the filesystem capabilities. A change of
   an effective or filesystem ID makes the process undumpable
   (`fs.suid_dumpable` is 0) and clears its parent-death signal. `execve`
-  makes the saved and filesystem IDs the effective ones, gives root every
-  capability and anyone else none, clears `PR_SET_KEEPCAPS`, sets
-  `AT_SECURE` when the effective IDs differ from the real ones and then
-  leaves the process undumpable and clears its parent-death signal, and
-  otherwise makes it dumpable again. The auxiliary vector and
+  of a set-user-ID program makes its owner the effective user ID, and of a
+  set-group-ID program its group the effective group ID when the group may
+  execute it. With `PR_SET_NO_NEW_PRIVS` it ignores those bits, and an exec
+  that would still change the effective IDs (to an effective group the
+  thread is not in by its filesystem or a supplementary group) or gain
+  capabilities takes the real IDs as effective and keeps no more
+  capabilities than the thread had. `execve` then makes the saved and
+  filesystem IDs the effective ones, gives root (by its real or effective
+  ID) every capability and anyone else none, and clears `PR_SET_KEEPCAPS`.
+  It sets `AT_SECURE` when it changes the effective IDs, when they differ
+  from the real ones before it, or when a user other than root keeps
+  capabilities, and such a secure exec
+  clears the parent-death signal and lowers the `RLIMIT_STACK` soft limit
+  to 8 MiB. The process is dumpable again after `execve` unless its
+  effective IDs differed from its real ones before it, it may not read the
+  program, or the exec changed an effective or filesystem ID, which also
+  clears its parent-death signal. The auxiliary vector and
   `/proc/self/status` show the IDs and capabilities. The files given at the
   start belong to root, and a file, directory, symbolic link or memfd a
   thread makes belongs to its filesystem user and group IDs, until `chown`
@@ -619,7 +631,7 @@ kernel.
   thread, taken from the program's file name at `execve` and inherited by new
   threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the
   parent exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
-  again unless it is a secure exec), `PR_SET_KEEPCAPS` (per thread, cleared
+  again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
   by `execve`), `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
   `execve`) and `PR_SET_NO_NEW_PRIVS` with their `PR_GET_*`; other options
   give `EINVAL`.

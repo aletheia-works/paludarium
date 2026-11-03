@@ -122,10 +122,10 @@ mod linux {
             let program = dir.join(binary);
             let self_path = program.to_str().unwrap().to_owned();
             let args = [mode.to_owned(), self_path.clone()];
-            // The credentials and permissions cases change IDs as root, so
+            // The credentials, permissions and setuid cases change IDs as root, so
             // Linux runs them as root, through sudo when the tests do not run
             // as root.
-            let as_root = matches!(mode, "credentials" | "permissions");
+            let as_root = matches!(mode, "credentials" | "permissions" | "setuid");
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
                 sudo.extend(args.iter().cloned());
@@ -209,6 +209,7 @@ mod linux {
         processes_proc_status => ("proc-status","process"),
         processes_credentials => ("credentials","process"),
         processes_permissions => ("permissions","process"),
+        processes_setuid => ("setuid","process"),
         processes_waitid => ("waitid","process"),
         processes_autoreap => ("autoreap","process"),
         processes_reparent => ("reparent","process"),

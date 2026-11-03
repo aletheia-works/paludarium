@@ -43,6 +43,7 @@
     {"name":"proc-status","binary":"process"},
     {"name":"credentials","binary":"process"},
     {"name":"permissions","binary":"process"},
+    {"name":"setuid","binary":"process"},
     {"name":"waitid","binary":"process"},
     {"name":"autoreap","binary":"process"},
     {"name":"reparent","binary":"process"},

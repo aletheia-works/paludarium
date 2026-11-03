@@ -103,9 +103,12 @@ verified.
   a file does not take away its set-user-ID and set-group-ID bits, as Linux
   does for a writer without `CAP_FSETID`; and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
-  act as 0, the kernel's defaults, which many distributions raise. A
-  set-user-ID or set-group-ID program runs with the caller's IDs, where
-  Linux would take the file's owner or group. `/proc/self/status` shows the calling thread's
+  act as 0, the kernel's defaults, which many distributions raise. `execve`
+  reads no file capabilities (`security.capability`), no mount is
+  `nosuid`, and a set-user-ID or set-group-ID program takes its owner or
+  group even when another process shares the caller's working directory
+  (`CLONE_FS`), where Linux takes the real IDs as effective unless the
+  caller has `CAP_SETUID`. `/proc/self/status` shows the calling thread's
   credentials, where Linux shows the thread group leader's, and `capget`
   and `capset` are not implemented.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with

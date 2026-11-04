@@ -1929,11 +1929,43 @@ impl Kernel {
         let path = read_string(mem, a[0], 4096, Errno::ENAMETOOLONG)?;
         let raw = path.clone();
         let path = self.files.exec_path(path)?;
-        let (program, readable) =
+        let (mut program, mut readable) =
             crate::permissions::exec(&self.files, &thread.state.credentials, &raw, &path)?;
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;
-        let argv = read_vector(mem, a[1], &mut budget)?;
+        let mut argv = read_vector(mem, a[1], &mut budget)?;
         let envp = read_vector(mem, a[2], &mut budget)?;
+        // A script runs its interpreter, which may be a script too, on the
+        // way to a program: its set-ID bits are the ones exec takes.
+        let mut loaded = path.clone();
+        let mut named = raw.clone();
+        for depth in 0.. {
+            let Some(head) = program
+                .as_ref()
+                .and_then(|_| read_head(&self.files, &loaded))
+            else {
+                break;
+            };
+            let Some((interpreter, argument)) = script_interpreter(&head)? else {
+                break;
+            };
+            splice_script(&mut argv, &mut budget, &interpreter, argument, named)?;
+            // `open_exec` of an empty name finds the working directory.
+            if interpreter.is_empty() {
+                return Err(Errno::EACCES);
+            }
+            loaded = self.files.exec_path(interpreter.clone())?;
+            (program, readable) = crate::permissions::exec(
+                &self.files,
+                &thread.state.credentials,
+                &interpreter,
+                &loaded,
+            )?;
+            named = interpreter;
+            // `exec_binprm` takes six handlers at most.
+            if depth == MAX_SCRIPT_DEPTH && program.is_some() {
+                return Err(Errno(40));
+            }
+        }
         let mut random = [0; 16];
         self.host
             .random_bytes(&mut random)
@@ -1946,7 +1978,7 @@ impl Kernel {
         let start = StartInfo {
             argv: &argv,
             envp: &envp,
-            execfn: &path,
+            execfn: &raw,
             random,
             ids: [
                 credentials.uid,
@@ -1960,16 +1992,15 @@ impl Kernel {
             Some(meter) => AddressSpace::new().with_memory_meter(meter),
             None => AddressSpace::new(),
         };
-        let image = paludarium_loader::load(&*self.files.fs, &path, &start, &mut memory).map_err(
-            |error| match error {
+        let image = paludarium_loader::load(&*self.files.fs, &loaded, &start, &mut memory)
+            .map_err(|error| match error {
                 // The new image did not fit under the memory limit.
                 _ if memory.take_out_of_memory() => Errno::ENOMEM,
                 LoadError::NotFound => Errno::ENOENT,
                 LoadError::TooLarge => Errno(7),
                 LoadError::Errno(error) => error,
                 _ => Errno(8),
-            },
-        )?;
+            })?;
         // All validation precedes retirement. Old siblings must stop touching
         // their image and shared descriptors before the replacement is visible.
         self.group.begin_exec(thread.tid)?;
@@ -2119,6 +2150,106 @@ fn read_string(
         bytes.push(byte[0]);
     }
     Err(long)
+}
+/// A script's interpreter, and its argument if any.
+pub(crate) type Script = (Vec<u8>, Option<Vec<u8>>);
+/// How many scripts deep the last one may be counted from 0.
+const MAX_SCRIPT_DEPTH: usize = 5;
+/// `BINPRM_BUF_SIZE`: how much of a file exec looks at.
+const SCRIPT_HEAD: usize = 256;
+/// The first [`SCRIPT_HEAD`] bytes of the file at `path`, zero after its end,
+/// or `None` when it cannot be read, which loading it then reports.
+fn read_head(files: &crate::files::Files, path: &[u8]) -> Option<[u8; SCRIPT_HEAD]> {
+    let file = files.fs.open(path, 0, 0).ok()?;
+    let mut head = [0; SCRIPT_HEAD];
+    let mut at = 0;
+    while at < SCRIPT_HEAD {
+        match file.read(&mut head[at..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => at += n,
+        }
+    }
+    Some(head)
+}
+/// A script's interpreter and its one optional argument, as Linux's
+/// `load_script` parses them from the first line of `head`, or `None` for a
+/// file that does not start with `#!`. The line is cut at the buffer's end,
+/// which is `ENOEXEC` when the interpreter's name may be cut, or when there is
+/// no name. Spaces and tabs separate them, and the argument runs on to the end
+/// of the line, without the spaces and tabs that end it.
+pub(crate) fn script_interpreter(head: &[u8; SCRIPT_HEAD]) -> Result<Option<Script>, Errno> {
+    const ENOEXEC: Errno = Errno(8);
+    let blank = |b: u8| b == b' ' || b == b'\t';
+    let terminator = |b: u8| blank(b) || b == 0;
+    if &head[..2] != b"#!" {
+        return Ok(None);
+    }
+    // The last byte of the buffer does not count.
+    let last = SCRIPT_HEAD - 1;
+    // `strnchr` stops at a zero byte.
+    let line = head[..last]
+        .iter()
+        .take_while(|&&b| b != 0)
+        .position(|&b| b == b'\n');
+    let next_non_blank = |from: usize, to: usize| (from..to).find(|&at| !blank(head[at]));
+    let next_terminator = |from: usize, to: usize| (from..to).find(|&at| terminator(head[at]));
+    let mut end = match line {
+        Some(line) => line,
+        None => {
+            let first = next_non_blank(2, last).ok_or(ENOEXEC)?;
+            next_terminator(first, last).ok_or(ENOEXEC)?;
+            last
+        }
+    };
+    while blank(head[end - 1]) {
+        end -= 1;
+    }
+    let name = next_non_blank(2, end)
+        .filter(|&name| name != end)
+        .ok_or(ENOEXEC)?;
+    let separator = next_terminator(name, end);
+    let argument = separator
+        .filter(|&at| head[at] != 0)
+        .and_then(|at| next_non_blank(at, end));
+    let string = |from: usize, to: usize| {
+        let bytes = &head[from..to];
+        let length = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        bytes[..length].to_vec()
+    };
+    Ok(Some((
+        string(name, separator.unwrap_or(end)),
+        argument.map(|argument| string(argument, end)),
+    )))
+}
+/// The arguments of a script's interpreter, as Linux's `load_script` splices
+/// them: its name, its argument if any, and then the script's path in place of
+/// the first of `argv`, which takes their room (`E2BIG`).
+fn splice_script(
+    argv: &mut Vec<Vec<u8>>,
+    budget: &mut usize,
+    interpreter: &[u8],
+    argument: Option<Vec<u8>>,
+    script: Vec<u8>,
+) -> Result<(), Errno> {
+    let mut take = |length: usize| {
+        *budget = budget.checked_sub(length + 1 + 8).ok_or(Errno(7))?;
+        Ok::<(), Errno>(())
+    };
+    take(interpreter.len())?;
+    take(script.len())?;
+    if let Some(argument) = &argument {
+        take(argument.len())?;
+    }
+    if !argv.is_empty() {
+        let first = argv.remove(0);
+        *budget += first.len() + 1 + 8;
+    }
+    argv.insert(0, script);
+    if let Some(argument) = argument {
+        argv.insert(0, argument);
+    }
+    argv.insert(0, interpreter.to_vec());
+    Ok(())
 }
 fn read_vector(
     mem: &AddressSpace,

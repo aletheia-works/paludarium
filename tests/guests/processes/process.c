@@ -1641,7 +1641,48 @@ static void finish(pid_t pid) {
     result("wait", waitpid(pid, &status, 0) == pid);
     result("status", status);
 }
+/* The interpreter of the script-exec case: what exec gave it. */
+static int script_show(int argc, char **argv) {
+    char name[17] = {0};
+    prctl(PR_GET_NAME, name);
+    printf("  ran: argc=%d", argc);
+    for (int i = 0; i < argc; i++) printf(" [%s]", argv[i]);
+    printf(" execfn=%s name=%s uid=%d euid=%d secure=%lu dumpable=%d\n", (const char *)getauxval(AT_EXECFN),
+           name, (int)getuid(), (int)geteuid(), getauxval(AT_SECURE), prctl(PR_GET_DUMPABLE));
+    return 0;
+}
+/* A file `path` of `length` bytes with the mode `mode`. */
+static void script_file(const char *path, const char *bytes, size_t length, unsigned mode) {
+    unlink(path);
+    int fd = open(path, O_CREAT | O_WRONLY, 0600);
+    if (fd < 0 || write(fd, bytes, length) != (long)length || fchmod(fd, mode)) _exit(70);
+    close(fd);
+}
+/* Exec `path` in a child with `args`, as user `uid` if not 0, and how it ended. */
+static void script_run(const char *name, const char *path, char *const *args, unsigned uid) {
+    char *env[] = {NULL};
+    printf("%s:\n", name);
+    fflush(stdout);
+    pid_t pid = syscall(SYS_fork);
+    if (pid == 0) {
+        if (uid && (syscall(SYS_setresgid, uid, uid, uid) || syscall(SYS_setresuid, uid, uid, uid))) _exit(71);
+        execve(path, args, env);
+        printf("  exec: %s\n", strerror(errno));
+        fflush(stdout);
+        _exit(72);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    printf("  status=%d\n", status);
+}
+static void script_line(const char *name, const char *line, size_t length) {
+    char *args[] = {"./s", "a", "b", NULL};
+    script_file("s", line, length, 0755);
+    script_run(name, "./s", args, 0);
+}
+#define SCRIPT_LINE(name, literal) script_line(name, literal, sizeof literal - 1)
 int main(int argc, char **argv) {
+    if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
     const char *mode = argv[1], *self = argv[2];
     if (!strcmp(mode, "clone-vm")) {
@@ -9225,6 +9266,127 @@ int main(int argc, char **argv) {
         unlink("theirs");
         unlink("prog");
         if (chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "script-exec")) {
+        /* load_script: what the first line says, and what exec does with it. */
+        char dir[] = "/tmp/script-exec-XXXXXX";
+        if (!mkdtemp(dir) || chdir(dir)) return 80;
+        umask(022);
+        if (chmod(".", 0777)) return 80;
+        /* The interpreter is a copy any user may reach, named so it shows. */
+        char buffer[65536];
+        long n;
+        int from = open(self, O_RDONLY), to = open("interp", O_CREAT | O_WRONLY, 0755);
+        if (from < 0 || to < 0 || fchmod(to, 0755)) return 80;
+        while ((n = read(from, buffer, sizeof buffer)) > 0)
+            if (write(to, buffer, n) != n) return 80;
+        close(from);
+        close(to);
+        SCRIPT_LINE("plain", "#!./interp\necho no\n");
+        SCRIPT_LINE("argument", "#!./interp one\n");
+        SCRIPT_LINE("argument-spaces", "#!./interp one two  three  \t \n");
+        SCRIPT_LINE("leading-blanks", "#!  \t./interp\t  one\n");
+        SCRIPT_LINE("no-newline", "#!./interp");
+        SCRIPT_LINE("no-newline-argument", "#!./interp one");
+        SCRIPT_LINE("no-newline-blanks", "#!./interp  ");
+        SCRIPT_LINE("carriage-return", "#!./interp\r\n");
+        SCRIPT_LINE("nul-after-name", "#!./interp\0 one\n");
+        SCRIPT_LINE("nul-in-argument", "#!./interp on\0e\n");
+        SCRIPT_LINE("only-bang", "#!\n");
+        SCRIPT_LINE("only-blanks", "#!   \t\n");
+        SCRIPT_LINE("bang-end", "#!");
+        SCRIPT_LINE("bang-nul", "#!\0./interp\n");
+        SCRIPT_LINE("one-byte", "#");
+        SCRIPT_LINE("empty", "");
+        SCRIPT_LINE("not-a-script", "echo no\n");
+        char long_line[400];
+        memset(long_line, ' ', sizeof long_line);
+        memcpy(long_line, "#!", 2);
+        script_line("all-blanks", long_line, sizeof long_line);
+        memset(long_line, 'x', sizeof long_line);
+        memcpy(long_line, "#!", 2);
+        script_line("name-too-long", long_line, sizeof long_line);
+        memcpy(long_line, "#!./interp ", 11);
+        script_line("argument-cut", long_line, sizeof long_line);
+        memset(long_line, 'x', sizeof long_line);
+        memcpy(long_line, "#!./interp ", 11);
+        long_line[254] = '\n';
+        script_line("line-at-254", long_line, sizeof long_line);
+        long_line[254] = 'x';
+        long_line[255] = '\n';
+        script_line("line-at-255", long_line, sizeof long_line);
+        /* The interpreter. */
+        script_file("noexec", "#!./interp\n", 11, 0644);
+        script_file("text", "just text\n", 10, 0755);
+        script_file("blank", "", 0, 0755);
+        if (symlink("interp", "interp-link") || mkdir("dir", 0755)) return 80;
+        SCRIPT_LINE("missing", "#!./missing\n");
+        SCRIPT_LINE("directory", "#!./dir\n");
+        SCRIPT_LINE("interpreter-not-executable", "#!./noexec\n");
+        SCRIPT_LINE("interpreter-text", "#!./text\n");
+        SCRIPT_LINE("interpreter-empty", "#!./blank\n");
+        SCRIPT_LINE("interpreter-link", "#!./interp-link\n");
+        SCRIPT_LINE("interpreter-below-file", "#!./interp/x\n");
+        /* A script of scripts, how deep it goes and what each adds. */
+        script_file("s1", "#!./interp one\n", 15, 0755);
+        for (int i = 2; i <= 8; i++) {
+            char name[8], line[32], run[8];
+            snprintf(name, sizeof name, "s%d", i);
+            int len = snprintf(line, sizeof line, "#!./s%d\n", i - 1);
+            script_file(name, line, len, 0755);
+            snprintf(run, sizeof run, "./s%d", i);
+            char *args[] = {run, "a", NULL};
+            script_run(name, run, args, 0);
+        }
+        /* Its arguments. */
+        script_file("s", "#!./interp one\n", 15, 0755);
+        char *no_args[] = {NULL};
+        script_run("no-arguments", "./s", no_args, 0);
+        char *only_zero[] = {"zero", NULL};
+        script_run("only-zero", "./s", only_zero, 0);
+        char *empty_zero[] = {"", "a", NULL};
+        script_run("empty-zero", "./s", empty_zero, 0);
+        /* The path: as named, and the interpreter's from the working directory. */
+        if (mkdir("sub", 0777)) return 80;
+        script_file("sub/script-with-a-long-name", "#!./interp\n", 11, 0755);
+        char *sub_args[] = {"x", NULL};
+        script_run("below", "sub/script-with-a-long-name", sub_args, 0);
+        if (symlink("s", "script-link")) return 80;
+        script_run("script-link", "./script-link", sub_args, 0);
+        script_run("no-such-script", "./nothing", sub_args, 0);
+        /* Its permissions and set-ID bits, and the interpreter's. */
+        script_file("s", "#!./interp\n", 11, 0644);
+        script_run("script-not-executable", "./s", sub_args, 2000);
+        script_file("s", "#!./interp\n", 11, 0111);
+        script_run("script-only-executable", "./s", sub_args, 2000);
+        script_file("s", "#!./interp\n", 11, 0755);
+        if (chown("s", 3000, 3000) || chmod("s", 06755)) return 80;
+        script_run("script-set-id", "./s", sub_args, 2000);
+        unlink("s");
+        int copy = open("set-id", O_CREAT | O_WRONLY, 0755);
+        from = open(self, O_RDONLY);
+        if (copy < 0 || from < 0) return 80;
+        while ((n = read(from, buffer, sizeof buffer)) > 0)
+            if (write(copy, buffer, n) != n) return 80;
+        close(copy);
+        close(from);
+        if (chown("set-id", 3000, 3000) || chmod("set-id", 06755)) return 80;
+        script_file("s", "#!./set-id script-exec-set-id\n", 30, 0755);
+        script_run("interpreter-set-id", "./s", sub_args, 2000);
+        fflush(stdout);
+        static const char *const files[] = {
+            "s", "noexec", "text", "blank", "interp-link", "script-link", "set-id",
+            "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "sub/script-with-a-long-name", "interp",
+        };
+        for (size_t i = 0; i < sizeof files / sizeof *files; i++) unlink(files[i]);
+        if (rmdir("sub") || rmdir("dir")) return 88;
+        if (chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "script-exec-set-id")) {
+        printf("  ran: uid=%d euid=%d secure=%lu dumpable=%d\n", (int)getuid(), (int)geteuid(),
+               getauxval(AT_SECURE), prctl(PR_GET_DUMPABLE));
         return 0;
     }
     if (!strcmp(mode, "limit-permissions")) {

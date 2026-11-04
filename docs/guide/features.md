@@ -499,7 +499,12 @@ kernel.
   permitted capabilities), and with `AT_EACCESS` the filesystem ones.
   `execve` needs a regular file the thread may execute (else `EACCES`, also
   for a directory and for root when no execute bit is set), and a program
-  it may not read runs undumpable. As on Linux, `chown` takes the
+  it may not read runs undumpable. A file that starts with `#!` runs its
+  interpreter as Linux's `load_script` does: the first line, within 255 bytes,
+  names it and may give it one argument, its arguments are that name, that
+  argument and the script's path in place of `argv[0]`, and the interpreter's
+  set-ID bits count, not the script's. An interpreter may be a script too, up
+  to 5 levels below the first script (`ELOOP` past that). As on Linux, `chown` takes the
   set-user-ID bit from a file that is not a directory, and the set-group-ID
   bit when the group may execute it or the caller is neither in its group
   nor holds `CAP_FSETID`, even when the owner and group stay. A write or a

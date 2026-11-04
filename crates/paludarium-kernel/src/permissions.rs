@@ -456,8 +456,10 @@ pub(crate) fn exec(
     path: &[u8],
 ) -> Result<(Option<FileStat>, bool), Errno> {
     search(files, creds, (-100i32) as u64, raw, true)?;
-    let Ok(stat) = files.fs.metadata(path, true) else {
-        return Ok((None, true));
+    let stat = match files.fs.metadata(path, true) {
+        Ok(stat) => stat,
+        Err(e) if e == Errno::ENOTDIR => return Err(e),
+        Err(_) => return Ok((None, true)),
     };
     if stat.mode & TYPE != REGULAR {
         return Err(Errno::EACCES);

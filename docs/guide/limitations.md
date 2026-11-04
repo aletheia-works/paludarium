@@ -6,8 +6,6 @@ verified.
 ## Not supported
 
 - **Dynamically linked programs**: only statically linked programs run.
-- **Scripts**: `execve` runs ELF programs only; a `#!` script gives
-  `ENOEXEC`, where Linux runs its interpreter.
 - **32-bit x86, AVX, AVX-512, x87, MMX**: out of scope.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a

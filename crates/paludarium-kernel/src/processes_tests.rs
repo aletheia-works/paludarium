@@ -1100,6 +1100,178 @@ fn exec_setup() -> (Kernel, Thread, AddressSpace) {
 }
 mod exec {
     use super::*;
+    /// `load_script`'s view of a first line.
+    fn parsed(line: &[u8]) -> Result<Option<crate::processes::Script>, Errno> {
+        let mut head = [0; 256];
+        head[..line.len()].copy_from_slice(line);
+        crate::processes::script_interpreter(&head)
+    }
+    #[test]
+    fn a_first_line_names_an_interpreter_and_one_argument() {
+        const ENOEXEC: Errno = Errno(8);
+        let some = |name: &[u8], argument: Option<&[u8]>| {
+            Ok(Some((name.to_vec(), argument.map(<[u8]>::to_vec))))
+        };
+        assert_eq!(parsed(b"#!/i\nrest"), some(b"/i", None));
+        assert_eq!(parsed(b"#! \t/i\t a  b \t\n"), some(b"/i", Some(b"a  b")));
+        assert_eq!(parsed(b"#!/i"), some(b"/i", None));
+        assert_eq!(parsed(b"#!/i a"), some(b"/i", Some(b"a")));
+        // Past the blanks a line with no newline has the rest of the buffer.
+        assert_eq!(parsed(b"#!/i  "), some(b"/i", Some(b"")));
+        assert_eq!(parsed(b"#!/i\0 a\n"), some(b"/i", None));
+        assert_eq!(parsed(b"#!/i a\0b\n"), some(b"/i", Some(b"a")));
+        assert_eq!(parsed(b"#!/i\r\n"), some(b"/i\r", None));
+        // No name, or none it can tell is whole.
+        assert_eq!(parsed(b"#!\n"), Err(ENOEXEC));
+        assert_eq!(parsed(b"#!  \t\n"), Err(ENOEXEC));
+        assert_eq!(parsed(b"#!"), some(b"", None));
+        assert_eq!(parsed(&[b' '; 256][..]), Ok(None));
+        let mut blanks = [b' '; 256];
+        blanks[..2].copy_from_slice(b"#!");
+        assert_eq!(parsed(&blanks), Err(ENOEXEC));
+        let mut name = [b'x'; 256];
+        name[..2].copy_from_slice(b"#!");
+        assert_eq!(parsed(&name), Err(ENOEXEC));
+        // The last byte of the buffer does not count, even a newline there.
+        let mut cut = [b'x'; 256];
+        cut[..5].copy_from_slice(b"#!/i ");
+        cut[255] = b'\n';
+        let (_, argument) = parsed(&cut).unwrap().unwrap();
+        assert_eq!(argument.unwrap().len(), 250);
+        // ... nor a terminator there.
+        let mut last = [b'x'; 256];
+        last[..2].copy_from_slice(b"#!");
+        last[255] = b' ';
+        assert_eq!(parsed(&last), Err(ENOEXEC));
+        // Anything else is no script.
+        assert_eq!(parsed(b"#"), Ok(None));
+        assert_eq!(parsed(b""), Ok(None));
+        assert_eq!(parsed(b"!#/i\n"), Ok(None));
+    }
+    /// `exec_setup` with these files, executable.
+    fn with_scripts(files: &[(&str, &[u8])]) -> (Kernel, Thread, AddressSpace) {
+        let (mut k, t, m) = setup();
+        let mut fs = paludarium_vfs::MemFs::new();
+        fs.add_file(paludarium_vfs::GuestFile::new(
+            "/child",
+            paludarium_loader::testing::tiny_exec(&[0x90], b""),
+        ))
+        .unwrap();
+        for (name, bytes) in files {
+            fs.add_file(paludarium_vfs::GuestFile::new(*name, bytes.to_vec()))
+                .unwrap();
+        }
+        k = k.with_file_system(Arc::new(fs));
+        (k, t, m)
+    }
+    fn run(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, path: &[u8]) -> u64 {
+        let mut name = path.to_vec();
+        name.push(0);
+        m.write(GuestAddr(DATA), &name).unwrap();
+        syscall(k, t, m, 59, [DATA, 0, 0, 0, 0, 0])
+    }
+    /// Reads the strings of the new image's stack: argc, then argv.
+    fn arguments(k: &mut Kernel) -> Vec<Vec<u8>> {
+        let memory = k.take_exec_memory().expect("an image");
+        let sp = k.group.start_stack();
+        let argc = memory.read_u64(GuestAddr(sp)).unwrap();
+        (0..argc)
+            .map(|i| {
+                let mut at = memory.read_u64(GuestAddr(sp + 8 + 8 * i)).unwrap();
+                let mut string = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    memory.read(GuestAddr(at), &mut byte).unwrap();
+                    if byte[0] == 0 {
+                        return string;
+                    }
+                    string.push(byte[0]);
+                    at += 1;
+                }
+            })
+            .collect()
+    }
+    #[test]
+    fn a_script_runs_its_interpreter_with_its_path_in_place_of_argv_0() {
+        let (mut k, mut t, m) = with_scripts(&[("/s", b"#!/child one two\n")]);
+        m.write(GuestAddr(DATA), b"/s\0").unwrap();
+        m.write(GuestAddr(DATA + 0x10), b"zero\0a\0").unwrap();
+        let pointers = [DATA + 0x10, DATA + 0x15, 0].map(u64::to_le_bytes).concat();
+        m.write(GuestAddr(DATA + 0x20), &pointers).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 59, [DATA, DATA + 0x20, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(arguments(&mut k), [&b"/child"[..], b"one two", b"/s", b"a"]);
+    }
+    #[test]
+    fn a_script_of_scripts_goes_five_levels_down() {
+        let files: Vec<(String, Vec<u8>)> = (1..=7)
+            .map(|i| {
+                let target = if i == 1 {
+                    "/child".to_owned()
+                } else {
+                    format!("/s{}", i - 1)
+                };
+                (format!("/s{i}"), format!("#!{target}\n").into_bytes())
+            })
+            .collect();
+        let refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let (mut k, mut t, m) = with_scripts(&refs);
+        assert_eq!(
+            run(&mut k, &mut t, &m, b"/s6"),
+            Errno(40).to_syscall_return()
+        );
+        assert_eq!(
+            run(&mut k, &mut t, &m, b"/s7"),
+            Errno(40).to_syscall_return()
+        );
+        assert_eq!(run(&mut k, &mut t, &m, b"/s5"), 0);
+        assert_eq!(arguments(&mut k).len(), 6);
+    }
+    #[test]
+    fn an_interpreter_must_be_there_and_runnable() {
+        let (mut k, mut t, m) = with_scripts(&[
+            ("/none", b"#!/absent\n"),
+            ("/empty", b"#!"),
+            ("/text", b"#!/bad\n"),
+            ("/bad", b"bad"),
+            ("/line", b"#!\n"),
+            ("/below", b"#!/child/x\n"),
+        ]);
+        let fail = |e: i32| Errno(e).to_syscall_return();
+        assert_eq!(run(&mut k, &mut t, &m, b"/none"), fail(2));
+        assert_eq!(run(&mut k, &mut t, &m, b"/empty"), fail(13));
+        assert_eq!(run(&mut k, &mut t, &m, b"/text"), fail(8));
+        assert_eq!(run(&mut k, &mut t, &m, b"/line"), fail(8));
+        assert_eq!(run(&mut k, &mut t, &m, b"/below"), fail(20));
+        assert_eq!(run(&mut k, &mut t, &m, b"/child/x"), fail(20));
+        assert!(k.take_exec_memory().is_none());
+    }
+    #[test]
+    fn the_interpreters_set_id_bits_count_not_the_scripts() {
+        let (mut k, mut t, m) = with_scripts(&[("/s", b"#!/child\n")]);
+        k.files.fs.set_owner(b"/s", true, Some(3000), None).unwrap();
+        k.files.fs.set_mode(b"/s", 0o4755).unwrap();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let user = [2000, 2000, 2000, 0, 0, 0];
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 117, user), 0);
+        assert_eq!(run(&mut c, &mut ct, &cm, b"/s"), 0);
+        assert_eq!(ct.state.credentials.euid, 2000);
+        k.files
+            .fs
+            .set_owner(b"/child", true, Some(3000), None)
+            .unwrap();
+        k.files.fs.set_mode(b"/child", 0o4755).unwrap();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let user = [2000, 2000, 2000, 0, 0, 0];
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 117, user), 0);
+        assert_eq!(run(&mut c, &mut ct, &cm, b"/s"), 0);
+        assert_eq!(ct.state.credentials.euid, 3000);
+    }
     #[test]
     fn executed_child_keeps_its_group_and_zombies_hold_theirs() {
         let (mut k, mut t, m) = exec_setup();

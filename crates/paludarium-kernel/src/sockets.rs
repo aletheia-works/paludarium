@@ -811,10 +811,9 @@ fn as_socket(file: &Arc<dyn FileHandle>) -> Result<&SocketPairEnd, Errno> {
 /// levels other than `SOL_SOCKET` are skipped, and `SOL_SOCKET` takes only
 /// `SCM_RIGHTS` and `SCM_CREDENTIALS` (EINVAL). `SCM_RIGHTS` passes at most
 /// 253 descriptors in all (EINVAL), each open (EBADF). `SCM_CREDENTIALS` is
-/// exactly one `struct ucred` (EINVAL), the last one counting; as the guest
-/// runs as root, `scm_check_creds` lets any through, but neither ID may be
-/// -1 (EINVAL), and then the process ID must name a process or thread
-/// (ESRCH).
+/// exactly one `struct ucred` (EINVAL), the last one counting: neither ID
+/// may be -1 (EINVAL), `scm_check_creds` must allow it (EPERM), and then the
+/// process ID must name a process or thread (ESRCH).
 fn control_messages(
     c: &Context<'_>,
     control: &[u8],
@@ -844,6 +843,13 @@ fn control_messages(
             // scm_check_creds refuses an ID of -1 first.
             if uid == u32::MAX || gid == u32::MAX {
                 return Err(Errno::EINVAL);
+            }
+            if !c
+                .process
+                .credentials
+                .may_send_credentials(pid == c.process.pid, uid, gid)
+            {
+                return Err(Errno::EPERM);
             }
             if pid.cast_signed() <= 0 || !c.processes.owner_exists(owner) {
                 return Err(Errno(3));
@@ -975,7 +981,7 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     } else {
         None
     };
-    let sender = Sender::process(c.process.pid);
+    let sender = Sender::process(c.process.pid, &c.process.credentials);
     send_bytes(
         c,
         &file,
@@ -1073,8 +1079,8 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         None
     };
     let sender = Sender {
-        pid: c.process.pid,
         credentials,
+        ..Sender::process(c.process.pid, &c.process.credentials)
     };
     let result = send_bytes(
         c,
@@ -1804,14 +1810,19 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             linger.extend(options.linger.unwrap_or(0).to_le_bytes());
             linger
         }
-        // The peer process's credentials, as root (uid and gid 0), or with
+        // The peer's process and effective IDs when it was recorded, or with
         // none process 0, and -1 for the IDs, as Linux's `cred_to_ucred`
         // gives them.
         SO_PEERCRED => {
-            let peer = socket.peer_process();
-            let mut credentials = peer.to_le_bytes().to_vec();
-            credentials.extend(if peer == 0 { [0xff; 8] } else { [0; 8] });
-            credentials
+            let peer = socket.peer().unwrap_or(Credentials {
+                pid: 0,
+                uid: u32::MAX,
+                gid: u32::MAX,
+            });
+            [peer.pid, peer.uid, peer.gid]
+                .iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect()
         }
         SO_SNDLOWAT | SO_DOMAIN => int(1),
         SO_RCVLOWAT => int(options.receive_low_water),
@@ -1935,28 +1946,44 @@ impl Default for Credentials {
         }
     }
 }
-/// Who sends a write: the sending process, and the credentials sendmsg's
-/// `SCM_CREDENTIALS` gave, if any.
+impl Credentials {
+    /// What `SO_PEERCRED` records of the thread with `credentials` in
+    /// process `pid`: its effective IDs, as Linux's `cred_to_ucred` reads.
+    pub(crate) fn of_peer(pid: u32, credentials: &crate::credentials::Credentials) -> Self {
+        Self {
+            pid,
+            uid: credentials.euid,
+            gid: credentials.egid,
+        }
+    }
+}
+/// Who sends a write: the sending process and thread's real IDs, and the
+/// credentials sendmsg's `SCM_CREDENTIALS` gave, if any.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Sender {
     pid: u32,
+    uid: u32,
+    gid: u32,
     credentials: Option<Credentials>,
 }
 impl Sender {
-    pub(crate) fn process(pid: u32) -> Self {
+    pub(crate) fn process(pid: u32, credentials: &crate::credentials::Credentials) -> Self {
         Self {
             pid,
+            uid: credentials.uid,
+            gid: credentials.gid,
             credentials: None,
         }
     }
-    /// What a write by this sender carries, when an end `passes` them: the
-    /// process's own as root, or as [`Credentials`] says.
+    /// What a write by this sender carries, when an end `passes` them: its
+    /// process and real IDs, as Linux's `maybe_add_creds`, or as
+    /// [`Credentials`] says.
     fn credentials(self, passes: bool) -> Credentials {
         self.credentials.unwrap_or(if passes {
             Credentials {
                 pid: self.pid,
-                uid: 0,
-                gid: 0,
+                uid: self.uid,
+                gid: self.gid,
             }
         } else {
             Credentials::default()
@@ -2236,10 +2263,10 @@ impl Timestamps {
 }
 struct Pair {
     sides: Mutex<[Side; 2]>,
-    /// The process each end's `SO_PEERCRED` names, as Linux's
-    /// `sk_peer_pid`: for a pair, the one that made it, as
-    /// `unix_socketpair` records its credentials; 0 for none.
-    peers: [AtomicU32; 2],
+    /// What each end's `SO_PEERCRED` names, as Linux's `sk_peer_pid` and
+    /// `sk_peer_cred`: for a pair, the thread that made it, as
+    /// `unix_socketpair` records its credentials.
+    peers: Mutex<[Option<Credentials>; 2]>,
     /// What each end has sent and that waits takes of its send buffer
     /// ([`Charge`]), and that buffer (`SO_SNDBUF`, doubled), which a read
     /// at the other end looks at to wake it, as Linux's `sock_wfree` calls
@@ -2373,14 +2400,24 @@ impl SocketPairEnd {
     pub(crate) fn clock_from(&self, host: &Arc<dyn paludarium_host::Host>) {
         let _ = self.pair.clock.set(Arc::clone(host));
     }
+    /// What this end's `SO_PEERCRED` names, if anything.
+    pub(crate) fn peer(&self) -> Option<Credentials> {
+        self.pair
+            .peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[self.side]
+    }
     /// The process this end's `SO_PEERCRED` names, 0 for none.
     pub(crate) fn peer_process(&self) -> u32 {
-        self.pair.peers[self.side].load(Ordering::SeqCst)
+        self.peer().map_or(0, |peer| peer.pid)
     }
-    /// This end's `SO_PEERCRED` names process `pid`, as Linux's
-    /// `init_peercred` and `copy_peercred` set it.
-    pub(crate) fn set_peer_process(&self, pid: u32) {
-        self.pair.peers[self.side].store(pid, Ordering::SeqCst);
+    /// This end's `SO_PEERCRED` names `peer`, as Linux's `init_peercred`
+    /// and `copy_peercred` set it.
+    pub(crate) fn set_peer(&self, peer: Option<Credentials>) {
+        self.pair
+            .peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[self.side] = peer;
     }
     /// A connection waits on this listening end's socket: `POLL_IN` with
     /// `O_ASYNC`, and a wake for `poll` and `accept`.
@@ -2481,7 +2518,7 @@ impl SocketPairEnd {
             return Err(Errno(94)); // ESOCKTNOSUPPORT
         }
         let pair = Arc::new(Pair {
-            peers: [AtomicU32::new(0), AtomicU32::new(0)],
+            peers: Mutex::new([None; 2]),
             sent: [Arc::default(), Arc::default()],
             send_buffers: [AtomicUsize::new(SEND_WINDOW), AtomicUsize::new(SEND_WINDOW)],
             kind: kind & 0xf,

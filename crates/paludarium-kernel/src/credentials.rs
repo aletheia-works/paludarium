@@ -14,6 +14,7 @@ pub(crate) const ALL_CAPABILITIES: u64 = (1 << 41) - 1;
 const CAP_KILL: u64 = 1 << 5;
 const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
+const CAP_SYS_ADMIN: u64 = 1 << 21;
 const CAP_SYS_NICE: u64 = 1 << 23;
 const CAP_SYS_RESOURCE: u64 = 1 << 24;
 /// The capabilities a filesystem ID of root brings (`CAP_FS_MASK`):
@@ -131,6 +132,15 @@ impl Credentials {
             cap_sys_nice: self.effective & CAP_SYS_NICE != 0,
             cap_sys_resource: self.effective & CAP_SYS_RESOURCE != 0,
         }
+    }
+    /// Linux's `scm_check_creds`, for what `SCM_CREDENTIALS` may say: the
+    /// caller's own process, or CAP_SYS_ADMIN; one of its real, effective
+    /// and saved user IDs, or CAP_SETUID; and one of its group IDs, or
+    /// CAP_SETGID.
+    pub(crate) fn may_send_credentials(&self, own_process: bool, uid: u32, gid: u32) -> bool {
+        (own_process || self.effective & CAP_SYS_ADMIN != 0)
+            && (uid == self.uid || uid == self.euid || uid == self.suid || self.may_setuid())
+            && (gid == self.gid || gid == self.egid || gid == self.sgid || self.may_setgid())
     }
     fn may_setuid(&self) -> bool {
         self.effective & CAP_SETUID != 0
@@ -583,6 +593,36 @@ mod credentials_tests {
             .unwrap()
             .task_ids();
         assert_eq!([groups.gid, groups.egid, groups.sgid], [1, 2, 3]);
+    }
+    #[test]
+    fn scm_credentials_name_the_callers_own_ids_without_capabilities() {
+        let root = Credentials::default();
+        assert!(root.may_send_credentials(false, 4000, 4100));
+        let user = root
+            .setresgid(1100, 2100, 3100)
+            .unwrap()
+            .setresuid(1000, 2000, 3000)
+            .unwrap();
+        for uid in [1000, 2000, 3000] {
+            assert!(user.may_send_credentials(true, uid, 1100), "{uid}");
+        }
+        for gid in [1100, 2100, 3100] {
+            assert!(user.may_send_credentials(true, 1000, gid), "{gid}");
+        }
+        assert!(!user.may_send_credentials(false, 1000, 1100), "a process");
+        assert!(!user.may_send_credentials(true, 4000, 1100), "a user");
+        assert!(!user.may_send_credentials(true, 1000, 4100), "a group");
+        // Each capability allows its own part alone.
+        let with = |capability| Credentials {
+            effective: capability,
+            ..user.clone()
+        };
+        assert!(with(CAP_SYS_ADMIN).may_send_credentials(false, 1000, 1100));
+        assert!(!with(CAP_SYS_ADMIN).may_send_credentials(true, 4000, 4100));
+        assert!(with(CAP_SETUID).may_send_credentials(true, 4000, 1100));
+        assert!(!with(CAP_SETUID).may_send_credentials(false, 4000, 4100));
+        assert!(with(CAP_SETGID).may_send_credentials(true, 1000, 4100));
+        assert!(!with(CAP_SETGID).may_send_credentials(true, 4000, 4100));
     }
     #[test]
     fn another_threads_priority_needs_the_effective_id_or_cap_sys_nice() {

@@ -43,6 +43,8 @@ pub(crate) struct Dump {
     pub siginfo: [u8; 128],
     pub limit: u64,
     pub threads: Vec<ThreadCore>,
+    /// The credentials of the thread the signal ended, which make the file.
+    pub credentials: crate::credentials::Credentials,
     /// The `clear_child_tid` words of the threads that have ended, which
     /// Linux clears only after the dump.
     pub clear_tids: Vec<u64>,
@@ -54,6 +56,9 @@ pub(crate) struct Identity {
     pub ppid: u32,
     pub pgrp: u32,
     pub sid: u32,
+    /// The real IDs of the process's leader, as Linux's `fill_psinfo` reads.
+    pub uid: u32,
+    pub gid: u32,
     /// CPU time of the process and of its waited-for children, in ns.
     pub cpu: u64,
     pub children_cpu: u64,
@@ -323,11 +328,13 @@ fn prstatus(dump: &Dump, who: &Identity, thread: &ThreadCore) -> [u8; 336] {
     s
 }
 
-/// `struct elf_prpsinfo` (136 bytes): the process running, as root, with
+/// `struct elf_prpsinfo` (136 bytes): the process running, with its IDs,
 /// its name and up to 79 bytes of its arguments, separated by spaces.
 fn prpsinfo(who: &Identity, thread: &ThreadCore, mem: &AddressSpace) -> [u8; 136] {
     let mut s = [0u8; 136];
     s[1] = b'R';
+    put32(&mut s, 16, who.uid);
+    put32(&mut s, 20, who.gid);
     put32(&mut s, 24, who.pid);
     put32(&mut s, 28, who.ppid);
     put32(&mut s, 32, who.pgrp);

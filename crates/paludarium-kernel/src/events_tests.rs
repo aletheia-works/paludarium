@@ -2775,6 +2775,88 @@ fn a_listener_only_its_connections_not_accepted_hold_is_collected() {
         Errno(104).to_syscall_return()
     );
 }
+/// Takes the IDs real 1000, effective 2000, saved 3000 and the groups 1100,
+/// 2100 and 3100.
+fn leave_root(f: &mut Fixture) {
+    assert_eq!(f.ret(119, [1100, 2100, 3100, 0, 0, 0]), 0);
+    assert_eq!(f.ret(117, [1000, 2000, 3000, 0, 0, 0]), 0);
+}
+/// What `SO_PEERCRED` of `fd` gives: its process, user and group.
+fn peer_credentials(f: &mut Fixture, fd: u64) -> [u32; 3] {
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &12u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(55, [fd, 1, 17, DATA + 0x204, DATA + 0x200, 0]), 0);
+    let mut raw = [0; 12];
+    f.mem.read(GuestAddr(DATA + 0x204), &mut raw).unwrap();
+    [0, 4, 8].map(|i| u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()))
+}
+#[test]
+fn so_peercred_keeps_the_effective_ids_a_socket_was_made_with() {
+    let mut f = Fixture::new();
+    let pid = f.ret(39, [0; 6]) as u32;
+    let (a, b) = pair(&mut f, 53, [1, 1, 0, DATA, 0, 0]);
+    leave_root(&mut f);
+    assert_eq!(peer_credentials(&mut f, a), [pid, 0, 0]);
+    let (c, d) = pair(&mut f, 53, [1, 1, 0, DATA, 0, 0]);
+    for end in [c, d] {
+        assert_eq!(peer_credentials(&mut f, end), [pid, 2000, 2100]);
+    }
+    assert_eq!(peer_credentials(&mut f, b), [pid, 0, 0]);
+}
+#[test]
+fn messages_carry_the_real_ids_and_scm_credentials_only_the_callers_own() {
+    let mut f = Fixture::new();
+    let pid = f.ret(39, [0; 6]) as u32;
+    let (a, b) = pair(&mut f, 53, [1, 2, 0, DATA, 0, 0]);
+    f.mem
+        .write(GuestAddr(DATA + 0x10), &1u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(54, [b, 1, 16, DATA + 0x10, 4, 0]), 0);
+    leave_root(&mut f);
+    let received = |f: &mut Fixture| {
+        message(f, SEND, (0, 0), &[(BYTES, 1)], (CONTROL, 64));
+        assert_eq!(f.ret(47, [b, SEND, 0x40, 0, 0, 0]), 1);
+        let mut raw = [0; 12];
+        f.mem.read(GuestAddr(CONTROL + 16), &mut raw).unwrap();
+        [0, 4, 8].map(|i| u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()))
+    };
+    // A plain write carries the real IDs.
+    assert_eq!(f.ret(1, [a, BYTES, 1, 0, 0, 0]), 1);
+    assert_eq!(received(&mut f), [pid, 1000, 1100]);
+    let send = |f: &mut Fixture, ids: [u32; 3]| {
+        let len = control(f, CONTROL, 1, 2, &ids);
+        message(f, SEND, (0, 0), &[(BYTES, 1)], (CONTROL, len));
+        f.ret(46, [a, SEND, 0, 0, 0, 0])
+    };
+    // Any of its own IDs goes through.
+    assert_eq!(send(&mut f, [pid, 3000, 2100]), 1);
+    assert_eq!(received(&mut f), [pid, 3000, 2100]);
+    let fail = |e: i32| Errno(e).to_syscall_return();
+    assert_eq!(send(&mut f, [pid, 4000, 1100]), fail(1));
+    assert_eq!(send(&mut f, [pid, 1000, 4100]), fail(1));
+    // Another process is refused before it is looked up.
+    assert_eq!(send(&mut f, [pid + 1000, 1000, 1100]), fail(1));
+    assert_eq!(send(&mut f, [0, 1000, 1100]), fail(1));
+    // An ID of -1 comes first of all.
+    assert_eq!(send(&mut f, [0, u32::MAX, 1100]), fail(22));
+    assert_eq!(send(&mut f, [0, 1000, u32::MAX]), fail(22));
+}
+#[test]
+fn a_stream_reader_stops_where_the_real_ids_change() {
+    let mut f = Fixture::new();
+    let (a, b) = pair(&mut f, 53, [1, 1, 0, DATA, 0, 0]);
+    f.mem
+        .write(GuestAddr(DATA + 0x10), &1u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(54, [b, 1, 16, DATA + 0x10, 4, 0]), 0);
+    f.mem.write(GuestAddr(BYTES), b"ab").unwrap();
+    assert_eq!(f.ret(1, [a, BYTES, 1, 0, 0, 0]), 1);
+    leave_root(&mut f);
+    assert_eq!(f.ret(1, [a, BYTES + 1, 1, 0, 0, 0]), 1);
+    assert_eq!(f.ret(0, [b, BYTES, 2, 0, 0, 0]), 1);
+    assert_eq!(f.ret(0, [b, BYTES, 2, 0, 0, 0]), 1);
+}
 #[test]
 fn scm_rights_checks_like_linux() {
     let mut f = Fixture::new();

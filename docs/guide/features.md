@@ -318,14 +318,17 @@ kernel.
   below) can only be read. `SO_SNDBUF` and `SO_RCVBUF` are doubled and kept at Linux's
   floors and ceiling, and `SO_LINGER` takes a `struct linger`.
 - `SO_PASSCRED` makes messages carry credentials, as Linux's AF_UNIX does.
-  A message sent while either end has it carries the sender's process ID,
-  user and group, or those `SCM_CREDENTIALS` gives. A receiver with it gets
+  A message sent while either end has it carries the sender's process ID and
+  real user and group, or those `SCM_CREDENTIALS` gives. A receiver with it gets
   them in an `SCM_CREDENTIALS` message, before any descriptors; a message
   sent without them reads as process 0 with user and group 65534. Such a
   receiver's stream reads, `read` and `MSG_WAITALL` too, do not read writes
   of other credentials together. `SCM_CREDENTIALS` must hold one
-  `struct ucred` (`EINVAL` otherwise), neither ID may be -1 (`EINVAL`), and
-  only then is the process looked up (`ESRCH` when there is none).
+  `struct ucred` (`EINVAL` otherwise), neither ID may be -1 (`EINVAL`). It
+  names the caller's own process unless the caller has `CAP_SYS_ADMIN`, one of
+  its real, effective and saved user IDs unless it has `CAP_SETUID`, and one of
+  its group IDs unless it has `CAP_SETGID` (`EPERM`), and only then is the
+  process looked up (`ESRCH` when there is none).
 - `SO_PASSPIDFD` makes messages carry credentials as `SO_PASSCRED` does,
   and a receiver with it gets a close-on-exec pidfd of the sending process
   in an `SCM_PIDFD` message, after any descriptors, as Linux 7.0 orders
@@ -333,7 +336,8 @@ kernel.
   control buffer; otherwise the message is lost (`MSG_CTRUNC`) and no
   descriptor is taken. A message sent while neither end passed credentials
   carries none. `SO_PEERCRED` and `SO_PEERPIDFD` name the peer process as
-  Linux records it: for a pair, the process that made it, on both ends;
+  Linux records it, and `SO_PEERCRED` the effective IDs it had then: for a
+  pair, the process that made it, on both ends;
   for a socket from `socket()`, none (process 0, IDs -1, and
   `SO_PEERPIDFD` `ENODATA`) until it listens or connects; on a listener,
   the process that called `listen` (`init_peercred`); on an accepted
@@ -698,8 +702,11 @@ kernel.
     ...) ends writes an ELF core named `core` in its working directory (mode
     0600 less the umask, replacing an old one), as Linux's `do_coredump` does
     with the default `core_pattern`, when the soft limit is at least a page
-    and `PR_SET_DUMPABLE` has not turned dumping off. The core has each
-    thread's registers (`NT_PRSTATUS`), the process (`NT_PRPSINFO`), the fatal
+    and `PR_SET_DUMPABLE` has not turned dumping off. The thread the signal
+    ended makes it with its own permissions and filesystem IDs, so nothing is
+    written where it may not write or replace the file. The core has each
+    thread's registers (`NT_PRSTATUS`), the process with its leader's real
+    user and group (`NT_PRPSINFO`), the fatal
     signal (`NT_SIGINFO`), the auxiliary vector, the mapped files (`NT_FILE`:
     each VMA that maps a file, by its path, followed by `(deleted)` once
     unlinked, and shared anonymous memory as `/dev/zero (deleted)`, as Linux

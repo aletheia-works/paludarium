@@ -1959,6 +1959,61 @@ mod core_dumps {
         assert_eq!(size, PAGE_SIZE as usize);
         assert_eq!(u64_at(&core, offset + 256), MAGIC);
     }
+    /// The child takes other IDs, stays dumpable and ends by SIGSEGV.
+    fn end_as_user(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> u32 {
+        let (mut c, mut ct, cm) = fork(k, t, m);
+        core_limit(&mut c, &mut ct, &cm, u64::MAX);
+        let (groups, users) = ([1100, 2100, 3100, 0, 0, 0], [1000, 2000, 3000, 0, 0, 0]);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 119, groups), 0);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 117, users), 0);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [4, 1, 0, 0, 0, 0]), 0);
+        end_by(&mut c, &mut ct, &cm, 11);
+        ct.tid
+    }
+    #[test]
+    fn a_core_belongs_to_the_filesystem_ids_and_names_the_real_ones() {
+        let (mut k, mut t, m) = setup();
+        k.files.fs.set_mode(b"/", 0o777).unwrap();
+        let pid = end_as_user(&mut k, &mut t, &m);
+        assert_eq!(wait_status(&mut k, &mut t, &m, pid), 11 | 0x80);
+        let stat = k.files.fs.metadata(b"/core", false).unwrap();
+        assert_eq!([stat.uid, stat.gid], [2000, 2100]);
+        let core = core(&k).expect("a core");
+        let (_, offset, _, size) = segments(&core)
+            .into_iter()
+            .find(|segment| segment.0 == 4)
+            .expect("notes");
+        let mut at = offset;
+        let info = loop {
+            assert!(at < offset + size, "no NT_PRPSINFO");
+            let name = (u32_at(&core, at) as usize).next_multiple_of(4);
+            let description = u32_at(&core, at + 4) as usize;
+            if u32_at(&core, at + 8) == 3 {
+                break at + 12 + name;
+            }
+            at += 12 + name + description.next_multiple_of(4);
+        };
+        assert_eq!(
+            [u32_at(&core, info + 16), u32_at(&core, info + 20)],
+            [1000, 1100]
+        );
+    }
+    #[test]
+    fn no_core_where_its_user_may_not_write_or_replace_it() {
+        // A directory it may not write.
+        let (mut k, mut t, m) = setup();
+        k.files.fs.set_mode(b"/", 0o755).unwrap();
+        let pid = end_as_user(&mut k, &mut t, &m);
+        assert_eq!(wait_status(&mut k, &mut t, &m, pid), 11);
+        assert!(core(&k).is_none());
+        // Root's old core in a sticky directory stays.
+        let (mut k, mut t, m) = setup();
+        k.files.fs.set_mode(b"/", 0o1777).unwrap();
+        k.files.fs.open(b"/core", 0o101, 0o644).unwrap();
+        let pid = end_as_user(&mut k, &mut t, &m);
+        assert_eq!(wait_status(&mut k, &mut t, &m, pid), 11);
+        assert_eq!(core(&k).as_deref(), Some(&[][..]));
+    }
     #[test]
     fn no_core_under_the_default_limit_a_page_or_without_dumpable() {
         for (limit, dumpable) in [(None, true), (Some(4095), true), (Some(u64::MAX), false)] {

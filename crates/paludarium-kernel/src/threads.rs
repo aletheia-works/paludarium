@@ -678,13 +678,15 @@ impl Kernel {
     /// the limit, as Linux's binfmt_elf sets `has_dumped` before it writes.
     fn write_core(&self, dump: &crate::coredump::Dump, mem: &AddressSpace) {
         let pid = self.process.pid;
-        let Some(identity) =
-            self.processes
-                .core_identity(pid, self.group.process_cpu(), self.group.start_stack())
-        else {
+        let Some(identity) = self.processes.core_identity(
+            pid,
+            self.group.task_ids(pid, pid),
+            self.group.process_cpu(),
+            self.group.start_stack(),
+        ) else {
             return;
         };
-        let Ok(file) = self.files.create_core() else {
+        let Ok(file) = self.files.create_core(&dump.credentials) else {
             return;
         };
         self.processes.set_dumped(pid);

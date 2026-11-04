@@ -1213,12 +1213,12 @@ static void signal_kill_reap(pid_t pid) {
     waitpid(pid, &status, 0);
 }
 /* Sends with these IDs, in a child of their own. */
-#define AS_SENDER(real, effective, saved, body) do { \
+#define AS_SENDER(real, effective, saved, ...) do { \
         fflush(stdout); \
         pid_t sender_pid = child(); \
         if (sender_pid == 0) { \
             if (syscall(SYS_setresuid, real, effective, saved)) _exit(94); \
-            body; \
+            __VA_ARGS__; \
             fflush(stdout); \
             _exit(0); \
         } \
@@ -1260,6 +1260,131 @@ static void *signal_thread_tkills(void *unused) {
     if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(97);
     syscall(SYS_tgkill, getpid(), signal_main_thread, SIGUSR1);
     return NULL;
+}
+/* The peer-credentials and core-credentials cases: IDs that all differ. */
+static void peer_ids_leave_root(void) {
+    if (syscall(SYS_setresgid, 1100, 2100, 3100)) _exit(95);
+    if (syscall(SYS_setresuid, 1000, 2000, 3000)) _exit(96);
+}
+static void peer_ids_peer(const char *name, int socket) {
+    struct ucred peer;
+    socklen_t len = sizeof peer;
+    if (getsockopt(socket, SOL_SOCKET, SO_PEERCRED, &peer, &len)) {
+        printf("%s: %s\n", name, strerror(errno));
+        return;
+    }
+    printf("%s: own=%d uid=%d gid=%d\n", name, peer.pid == getpid(), (int)peer.uid, (int)peer.gid);
+}
+/* What the next message on `socket` carries: its bytes and credentials. */
+static void peer_ids_received(const char *name, int socket) {
+    char data[8] = {0};
+    struct iovec iov = {data, sizeof data};
+    union { char bytes[CMSG_SPACE(sizeof(struct ucred))]; struct cmsghdr align; } control;
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control.bytes,
+                             .msg_controllen = sizeof control.bytes};
+    long n = recvmsg(socket, &message, MSG_DONTWAIT);
+    if (n < 0) {
+        printf("%s: %s\n", name, strerror(errno));
+        return;
+    }
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    struct ucred from = {0, 0, 0};
+    if (header && header->cmsg_type == SCM_CREDENTIALS) memcpy(&from, CMSG_DATA(header), sizeof from);
+    printf("%s: data=%.*s own=%d parent=%d uid=%d gid=%d\n", name, (int)n, data, from.pid == getpid(),
+           from.pid == getppid(), (int)from.uid, (int)from.gid);
+}
+/* sendmsg with these credentials; what it did, and what arrived. */
+static void peer_ids_send(const char *name, int from, int to, pid_t pid, uid_t uid, gid_t gid) {
+    long sent = send_credentials(from, "m", pid, uid, gid, CMSG_LEN(sizeof(struct ucred)));
+    permitted(name, sent);
+    if (sent >= 0) peer_ids_received(name, to);
+}
+static volatile pid_t peer_ids_thread_id;
+static void *peer_ids_thread(void *unused) {
+    (void)unused;
+    peer_ids_thread_id = syscall(SYS_gettid);
+    for (;;) pause();
+}
+static pid_t peer_ids_thread_start(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, peer_ids_thread, NULL)) _exit(97);
+    while (!peer_ids_thread_id) sched_yield();
+    return peer_ids_thread_id;
+}
+/* A child that faults with other IDs, in a thread of its own, with the
+   filesystem IDs `fs` when it is not -1; the leader of `thread` stays root. */
+static int core_credentials_fs = -1;
+static void core_credentials_fault(void) {
+    peer_ids_leave_root();
+    if (core_credentials_fs >= 0) {
+        syscall(SYS_setfsuid, core_credentials_fs);
+        syscall(SYS_setfsgid, core_credentials_fs + 100);
+    }
+    if (prctl(PR_SET_DUMPABLE, 1)) _exit(98);
+    *(volatile int *)0 = 1;
+    _exit(70);
+}
+static void *core_credentials_thread(void *unused) {
+    (void)unused;
+    core_credentials_fault();
+    return NULL;
+}
+static pid_t core_credentials_child(int thread, int fs) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+    struct rlimit r;
+    getrlimit(RLIMIT_CORE, &r);
+    r.rlim_cur = r.rlim_max;
+    setrlimit(RLIMIT_CORE, &r);
+    core_credentials_fs = fs;
+    if (thread) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, core_credentials_thread, NULL)) _exit(99);
+        for (;;) pause();
+    }
+    core_credentials_fault();
+    return 0;
+}
+/* How `pid` ended, the owner and mode of `core`, and the IDs it names. */
+static void core_credentials_report(const char *name, pid_t pid) {
+    int status = 0;
+    waitpid(pid, &status, 0);
+    printf("%s: signal=%d core=%d", name, WIFSIGNALED(status) ? WTERMSIG(status) : -1,
+           WCOREDUMP(status) ? 1 : 0);
+    int fd = open("core", O_RDONLY);
+    if (fd < 0) {
+        printf(" file=0\n");
+        fflush(stdout);
+        return;
+    }
+    struct stat st;
+    fstat(fd, &st);
+    printf(" file=1 uid=%u gid=%u mode=%o", (unsigned)st.st_uid, (unsigned)st.st_gid,
+           (unsigned)(st.st_mode & 0777));
+    unsigned char *b = calloc(st.st_size + 1, 1);
+    long size = 0, n;
+    while (b && size < st.st_size && (n = read(fd, b + size, st.st_size - size)) > 0) size += n;
+    close(fd);
+    unlink("core");
+    core_bytes = b;
+    core_size = b ? (uint64_t)size : 0;
+    int count = WCOREDUMP(status) ? (int)le(56, 2) : 0;
+    for (int i = 0; i < count; i++) {
+        uint64_t p = le(32, 8) + 56 * (uint64_t)i;
+        uint64_t offset = le(p + 8, 8), filesz = le(p + 32, 8);
+        if (le(p, 4) != 4) continue;
+        for (uint64_t q = offset; q + 12 <= offset + filesz && q + 12 <= core_size;) {
+            uint64_t namesz = le(q, 4), descsz = le(q + 4, 4), type = le(q + 8, 4);
+            uint64_t desc = q + 12 + ((namesz + 3) & ~3ULL);
+            if (type == 3)
+                printf(" pr_uid=%u pr_gid=%u", (unsigned)le(desc + 16, 4), (unsigned)le(desc + 20, 4));
+            q = desc + ((descsz + 3) & ~3ULL);
+        }
+    }
+    printf("\n");
+    fflush(stdout);
+    free(b);
 }
 /* The limit-permissions case: a process that waits with the given IDs. */
 static pid_t limit_target(unsigned real, unsigned effective, unsigned saved, unsigned gid,
@@ -8305,6 +8430,179 @@ int main(int argc, char **argv) {
             pid_t last = wait(&status);
             printf("orphan: reaped=%d status=%d\n", last > 0, status);
         }
+        return 0;
+    }
+    if (!strcmp(mode, "peer-credentials")) {
+        /* SO_PEERCRED: the effective IDs when the socket was made, listened
+           or connected (init_peercred, copy_peercred, cred_to_ucred). */
+        AS_SENDER(0, 0, 0, {
+            int sv[2];
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) _exit(90);
+            peer_ids_leave_root();
+            peer_ids_peer("pair-made-as-root", sv[0]);
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) _exit(90);
+            peer_ids_peer("pair-made-as-user", sv[0]);
+            peer_ids_peer("pair-made-as-user-other-end", sv[1]);
+        });
+        AS_SENDER(0, 0, 0, {
+            struct sockaddr_un a;
+            socklen_t len = unix_abstract(&a, "peer-credentials");
+            int ready[2];
+            if (pipe(ready)) _exit(90);
+            fflush(stdout);
+            pid_t client = child();
+            if (client == 0) {
+                if (syscall(SYS_setresgid, 5100, 5200, 5300)) _exit(91);
+                if (syscall(SYS_setresuid, 5000, 5001, 5002)) _exit(91);
+                char byte;
+                if (read(ready[0], &byte, 1) != 1) _exit(91);
+                int c = socket(AF_UNIX, SOCK_STREAM, 0);
+                peer_ids_peer("client-before", c);
+                if (connect(c, (void *)&a, len)) _exit(91);
+                peer_ids_peer("client", c);
+                /* A later change does not show on the other end. */
+                if (syscall(SYS_setresuid, 5000, 5000, 5002)) _exit(91);
+                fflush(stdout);
+                if (write(c, "x", 1) != 1) _exit(91);
+                _exit(0);
+            }
+            int l = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (l < 0 || bind(l, (void *)&a, len)) _exit(92);
+            peer_ids_leave_root();
+            if (listen(l, 1)) _exit(92);
+            peer_ids_peer("listener", l);
+            /* A later change does not show on clients. */
+            if (syscall(SYS_setresuid, 1000, 1000, 3000)) _exit(92);
+            peer_ids_peer("listener-after-change", l);
+            fflush(stdout);
+            if (write(ready[1], "x", 1) != 1) _exit(92);
+            int accepted = accept(l, NULL, NULL);
+            char byte;
+            if (accepted < 0 || read(accepted, &byte, 1) != 1) _exit(92);
+            peer_ids_peer("accepted", accepted);
+            int status = 0;
+            waitpid(client, &status, 0);
+            printf("client: status=%d\n", status);
+        });
+        /* A message carries the real IDs when an end passes credentials. */
+        AS_SENDER(0, 0, 0, {
+            int sv[2], on = 1;
+            if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) _exit(90);
+            if (setsockopt(sv[1], SOL_SOCKET, SO_PASSCRED, &on, sizeof on)) _exit(90);
+            peer_ids_leave_root();
+            if (write(sv[0], "w", 1) != 1) _exit(90);
+            peer_ids_received("write", sv[1]);
+            if (send(sv[0], "s", 1, 0) != 1) _exit(90);
+            peer_ids_received("send", sv[1]);
+            if (sendto(sv[0], "t", 1, 0, NULL, 0) != 1) _exit(90);
+            peer_ids_received("sendto", sv[1]);
+            struct iovec iov = {"m", 1};
+            struct msghdr plain = {.msg_iov = &iov, .msg_iovlen = 1};
+            if (sendmsg(sv[0], &plain, 0) != 1) _exit(90);
+            peer_ids_received("sendmsg", sv[1]);
+        });
+        /* A stream read does not join writes of other real IDs. */
+        AS_SENDER(0, 0, 0, {
+            int sv[2], on = 1;
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) _exit(90);
+            if (setsockopt(sv[1], SOL_SOCKET, SO_PASSCRED, &on, sizeof on)) _exit(90);
+            if (write(sv[0], "a", 1) != 1) _exit(90);
+            if (write(sv[0], "b", 1) != 1) _exit(90);
+            if (syscall(SYS_setresuid, 0, 2000, 0)) _exit(90);
+            if (write(sv[0], "c", 1) != 1) _exit(90);
+            if (syscall(SYS_setresuid, -1, 0, -1)) _exit(90);
+            if (syscall(SYS_setresuid, 1000, 2000, 0)) _exit(90);
+            if (write(sv[0], "d", 1) != 1) _exit(90);
+            peer_ids_received("stream-root", sv[1]);
+            peer_ids_received("stream-user", sv[1]);
+        });
+        /* SCM_CREDENTIALS without capabilities: the caller's own process
+           and any of its real, effective and saved IDs (scm_check_creds). */
+        AS_SENDER(0, 0, 0, {
+            int sv[2], on = 1;
+            if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) _exit(90);
+            if (setsockopt(sv[1], SOL_SOCKET, SO_PASSCRED, &on, sizeof on)) _exit(90);
+            pid_t thread = peer_ids_thread_start();
+            peer_ids_leave_root();
+            pid_t own = getpid();
+            peer_ids_send("real", sv[0], sv[1], own, 1000, 1100);
+            peer_ids_send("effective", sv[0], sv[1], own, 2000, 2100);
+            peer_ids_send("saved", sv[0], sv[1], own, 3000, 3100);
+            peer_ids_send("mixed", sv[0], sv[1], own, 3000, 1100);
+            peer_ids_send("other-user", sv[0], sv[1], own, 4000, 1100);
+            peer_ids_send("other-group", sv[0], sv[1], own, 1000, 4100);
+            peer_ids_send("root-user", sv[0], sv[1], own, 0, 1100);
+            peer_ids_send("root-group", sv[0], sv[1], own, 1000, 0);
+            peer_ids_send("parent", sv[0], sv[1], getppid(), 1000, 1100);
+            peer_ids_send("thread", sv[0], sv[1], thread, 1000, 1100);
+            /* Refused before the process is looked up. */
+            peer_ids_send("no-process", sv[0], sv[1], 0x3fffff, 1000, 1100);
+            peer_ids_send("process-0", sv[0], sv[1], 0, 1000, 1100);
+            /* But an ID of -1 comes first. */
+            peer_ids_send("user-minus-1", sv[0], sv[1], 0, -1, 1100);
+            peer_ids_send("group-minus-1", sv[0], sv[1], 0, 1000, -1);
+        });
+        /* Root may name any of them, of any process there is. */
+        AS_SENDER(0, 0, 0, {
+            int sv[2], on = 1;
+            if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) _exit(90);
+            if (setsockopt(sv[1], SOL_SOCKET, SO_PASSCRED, &on, sizeof on)) _exit(90);
+            pid_t thread = peer_ids_thread_start();
+            peer_ids_send("root-any-ids", sv[0], sv[1], getpid(), 4000, 4100);
+            peer_ids_send("root-parent", sv[0], sv[1], getppid(), 0, 0);
+            peer_ids_send("root-thread", sv[0], sv[1], thread, 0, 0);
+            peer_ids_send("root-no-process", sv[0], sv[1], 0x3fffff, 0, 0);
+            peer_ids_send("root-process-0", sv[0], sv[1], 0, 0, 0);
+            peer_ids_send("root-minus-1", sv[0], sv[1], getpid(), -1, 0);
+        });
+        return 0;
+    }
+    if (!strcmp(mode, "core-credentials")) {
+        /* A core is made with the permissions and the filesystem IDs of the
+           thread that faulted (do_coredump), and names the real IDs of its
+           process's leader (fill_psinfo). */
+        char dir[] = "/tmp/core-credentials-XXXXXX";
+        if (!mkdtemp(dir) || chdir(dir)) return 80;
+        umask(022);
+        if (chmod(".", 0777)) return 81;
+        core_credentials_report("user", core_credentials_child(0, -1));
+        core_credentials_report("fsuid", core_credentials_child(0, 3000));
+        core_credentials_report("thread", core_credentials_child(1, -1));
+        /* Root's old core in a directory all may write is replaced. */
+        int old = open("core", O_CREAT | O_WRONLY, 0644);
+        if (old < 0 || write(old, "old", 3) != 3) return 82;
+        close(old);
+        core_credentials_report("replaced", core_credentials_child(0, -1));
+        /* A directory's set-group-ID bit gives the core its group. */
+        if (chown(".", 0, 4100) || chmod(".", 02777)) return 83;
+        core_credentials_report("set-group-id", core_credentials_child(0, -1));
+        if (chown(".", 0, 0)) return 83;
+        /* A sticky directory keeps root's old core; a new one goes in. */
+        if (chmod(".", 01777)) return 84;
+        core_credentials_report("sticky-new", core_credentials_child(0, -1));
+        old = open("core", O_CREAT | O_WRONLY, 0644);
+        if (old < 0 || write(old, "old", 3) != 3) return 85;
+        close(old);
+        core_credentials_report("sticky-old", core_credentials_child(0, -1));
+        /* No core where the user may not write, or search. */
+        if (chmod(".", 0755)) return 86;
+        core_credentials_report("no-write", core_credentials_child(0, -1));
+        if (chmod(".", 0776)) return 87;
+        core_credentials_report("no-search", core_credentials_child(0, -1));
+        /* Root writes anywhere, as itself. */
+        if (chmod(".", 0)) return 88;
+        fflush(stdout);
+        pid_t root = fork();
+        if (root == 0) {
+            struct rlimit r;
+            getrlimit(RLIMIT_CORE, &r);
+            r.rlim_cur = r.rlim_max;
+            setrlimit(RLIMIT_CORE, &r);
+            *(volatile int *)0 = 1;
+            _exit(70);
+        }
+        core_credentials_report("root", root);
+        if (chdir("/") || rmdir(dir)) return 89;
         return 0;
     }
     if (!strcmp(mode, "limit-permissions")) {

@@ -98,7 +98,7 @@ mod linux {
         }
         // Linux writes the core the cases read only with the kernel's
         // default core_pattern, which CI sets.
-        if mode == "core-dump" || mode == "core-mappings" {
+        if mode == "core-dump" || mode == "core-mappings" || mode == "core-credentials" {
             for (setting, wanted) in [("core_pattern", "core\n"), ("core_uses_pid", "0\n")] {
                 let value = std::fs::read_to_string(format!("/proc/sys/kernel/{setting}"))
                     .unwrap_or_default();
@@ -122,9 +122,10 @@ mod linux {
             let program = dir.join(binary);
             let self_path = program.to_str().unwrap().to_owned();
             let args = [mode.to_owned(), self_path.clone()];
-            // The credentials, permissions, setuid, signal-permissions and
-            // limit-permissions cases change IDs as root, so Linux runs them as
-            // root, through sudo when the tests do not run as root.
+            // The credentials, permissions, setuid, signal-permissions,
+            // limit-permissions, peer-credentials and core-credentials cases
+            // change IDs as root, so Linux runs them as root, through sudo when
+            // the tests do not run as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -132,6 +133,8 @@ mod linux {
                     | "setuid"
                     | "signal-permissions"
                     | "limit-permissions"
+                    | "peer-credentials"
+                    | "core-credentials"
             );
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
@@ -219,6 +222,8 @@ mod linux {
         processes_setuid => ("setuid","process"),
         processes_signal_permissions => ("signal-permissions","process"),
         processes_limit_permissions => ("limit-permissions","process"),
+        processes_peer_credentials => ("peer-credentials","process"),
+        processes_core_credentials => ("core-credentials","process"),
         processes_waitid => ("waitid","process"),
         processes_autoreap => ("autoreap","process"),
         processes_reparent => ("reparent","process"),

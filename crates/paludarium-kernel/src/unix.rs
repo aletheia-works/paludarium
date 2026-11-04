@@ -135,8 +135,11 @@ pub(crate) fn pair(c: &Context<'_>, kind: u32) -> Result<[Arc<UnixSocket>; 2], E
     let names = [Address::default(), Address::default()];
     let sockets: [Arc<UnixSocket>; 2] = std::array::from_fn(|side| {
         let end = Arc::clone(&ends[side]);
-        // SO_PEERCRED names the process that made the pair, at both ends.
-        end.set_peer_process(c.process.pid);
+        // SO_PEERCRED names the thread that made the pair, at both ends.
+        end.set_peer(Some(crate::sockets::Credentials::of_peer(
+            c.process.pid,
+            &c.process.credentials,
+        )));
         let name = Arc::clone(&names[side]);
         Arc::new_cyclic(|this: &Weak<UnixSocket>| {
             end.attach(Weak::clone(this));
@@ -457,7 +460,10 @@ impl UnixSocket {
                 });
             }
         }
-        self.end.set_peer_process(c.process.pid);
+        self.end.set_peer(Some(crate::sockets::Credentials::of_peer(
+            c.process.pid,
+            &c.process.credentials,
+        )));
         drop(s);
         // A connect waiting for room may now find it.
         self.hub.changed();
@@ -542,8 +548,11 @@ impl UnixSocket {
         };
         // As unix_stream_connect: the accepted socket names the connecting
         // process, the client the listener's (copy_peercred).
-        client.end.set_peer_process(self.end.peer_process());
-        spare.set_peer_process(c.process.pid);
+        client.end.set_peer(self.end.peer());
+        spare.set_peer(Some(crate::sockets::Credentials::of_peer(
+            c.process.pid,
+            &c.process.credentials,
+        )));
         // It also takes the listener's SO_PASSCRED, SO_PASSPIDFD and
         // SO_PASSSEC as they are now (sk_scm_recv_flags).
         spare.take_passing(&self.end);

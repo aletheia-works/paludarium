@@ -788,10 +788,11 @@ impl Processes {
         let limit = entry.limits[4].0;
         (entry.dumpable && limit >= crate::coredump::MIN_LIMIT).then_some(limit)
     }
-    /// Who `pid` is, for its core.
+    /// Who `pid` is, for its core, whose leader has the IDs `leader`.
     pub(crate) fn core_identity(
         &self,
         pid: u32,
+        leader: crate::credentials::TaskIds,
         cpu: u64,
         start_stack: u64,
     ) -> Option<crate::coredump::Identity> {
@@ -802,6 +803,8 @@ impl Processes {
             ppid: entry.parent,
             pgrp: entry.pgid,
             sid: entry.sid,
+            uid: leader.uid,
+            gid: leader.gid,
             cpu,
             children_cpu: entry.children_cpu,
             start_stack,

@@ -94,10 +94,9 @@ verified.
   guest that is not root makes there is root's too, which that guest may
   then not be allowed to open again.
 - **Credentials**: the IDs and capabilities a thread takes are checked on
-  files, signals, resource limits and priorities but nowhere else yet.
-  `SCM_CREDENTIALS`, `SO_PEERCRED` and a core's `pr_uid` and `pr_gid` still
-  give root's IDs. `F_SETOWN` records no sender's credentials, so `SIGIO` and
-  `SIGURG` reach their owner whoever set it, where Linux's `sigio_perm` checks.
+  files, signals, resource limits, priorities, socket credentials and core
+  files but nowhere else yet. `F_SETOWN` records no sender's credentials, so
+  `SIGIO` and `SIGURG` reach their owner whoever set it, where Linux's `sigio_perm` checks.
   The `PR_SET_PDEATHSIG` signal is sent when the parent process ends, with the
   IDs of its leader, where Linux sends it when the thread that made the child
   ends, with that thread's. Of the files, those under `/proc` and `/dev` are
@@ -117,8 +116,6 @@ verified.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS` as Linux does, with
   these differences:
-  - `SCM_CREDENTIALS` may name any process, user and group, as root may,
-    where Linux lets an unprivileged process send only its own.
   - The sockets only unread messages hold are closed at once when another
     socket goes, where Linux's garbage collector closes them a little
     later, from a work queue.
@@ -131,8 +128,7 @@ verified.
   `SO_SNDTIMEO` round to a 1000 Hz tick, where Linux rounds to its own
   `CONFIG_HZ`.
   Capabilities are not checked here, so the options that need
-  `CAP_NET_ADMIN` (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set as for root, and
-  `SO_PEERCRED` names uid and gid 0.
+  `CAP_NET_ADMIN` (`SO_DEBUG`, `SO_SNDBUFFORCE`, …) are set as for root.
 - **Signal-driven I/O**: the host's standard input, looked at every 10 ms,
   sends `SIGIO` once each time input comes where there was none, where
   Linux's pipe or terminal sends one for every piece of input. Standard

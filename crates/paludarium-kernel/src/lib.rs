@@ -355,6 +355,7 @@ impl Kernel {
                 siginfo,
                 limit,
                 threads: Vec::new(),
+                credentials: thread.state.credentials.clone(),
                 clear_tids: Vec::new(),
             });
         }

@@ -290,12 +290,24 @@ impl Files {
     }
     /// The file a core dump goes to: `core` in the working directory, made
     /// afresh with mode 0600 less the umask, as Linux's `do_coredump` removes
-    /// an old one and opens it with `O_CREAT | O_EXCL | O_NOFOLLOW`.
-    pub(crate) fn create_core(&self) -> Result<Arc<dyn paludarium_host::FileHandle>, Errno> {
-        let path = paludarium_vfs::normalize_path(&self.path(-100i64 as u64, b"core".to_vec())?)?;
-        let _ = self.fs.unlink(&path, false);
-        self.fs
-            .open(&path, 0o1 | 0o100 | 0o200 | 0o400000, 0o600 & !self.umask())
+    /// an old one and opens it with `O_CREAT | O_EXCL | O_NOFOLLOW`, each
+    /// with the permissions of `creds`, whose filesystem IDs then own it.
+    pub(crate) fn create_core(
+        &self,
+        creds: &crate::credentials::Credentials,
+    ) -> Result<Arc<dyn paludarium_host::FileHandle>, Errno> {
+        const AT_FDCWD: u64 = -100i64 as u64;
+        const FLAGS: u32 = 0o1 | 0o100 | 0o200 | 0o400000;
+        let path = paludarium_vfs::normalize_path(&self.path(AT_FDCWD, b"core".to_vec())?)?;
+        if crate::permissions::delete(self, creds, AT_FDCWD, b"core").is_ok() {
+            let _ = self.fs.unlink(&path, false);
+        }
+        let parent = crate::permissions::open(self, creds, AT_FDCWD, b"core", FLAGS)?;
+        let file = self.fs.open(&path, FLAGS, 0o600 & !self.umask())?;
+        if let Some(parent) = parent {
+            crate::permissions::own(self, creds, &path, false, &parent);
+        }
+        Ok(file)
     }
     pub(crate) fn for_clone(&self, share_files: bool, share_fs: bool) -> Self {
         let mut child = self.clone();
@@ -2220,7 +2232,7 @@ pub(crate) fn write_io(
         .as_any()
         .and_then(|a| a.downcast_ref::<crate::sockets::SocketPairEnd>())
     {
-        let sender = crate::sockets::Sender::process(c.process.pid);
+        let sender = crate::sockets::Sender::process(c.process.pid, &c.process.credentials);
         return write_with(c, file, bytes, nosignal, false, |b| {
             socket.send(b, &mut Vec::new(), sender)
         });

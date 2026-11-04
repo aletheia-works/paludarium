@@ -1647,8 +1647,9 @@ static int script_show(int argc, char **argv) {
     prctl(PR_GET_NAME, name);
     printf("  ran: argc=%d", argc);
     for (int i = 0; i < argc; i++) printf(" [%s]", argv[i]);
+    /* Dumpable or not: how it is not depends on fs.suid_dumpable. */
     printf(" execfn=%s name=%s uid=%d euid=%d secure=%lu dumpable=%d\n", (const char *)getauxval(AT_EXECFN),
-           name, (int)getuid(), (int)geteuid(), getauxval(AT_SECURE), prctl(PR_GET_DUMPABLE));
+           name, (int)getuid(), (int)geteuid(), getauxval(AT_SECURE), prctl(PR_GET_DUMPABLE) == 1);
     return 0;
 }
 /* A file `path` of `length` bytes with the mode `mode`. */
@@ -9396,7 +9397,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "script-exec-set-id")) {
         printf("  ran: uid=%d euid=%d secure=%lu dumpable=%d\n", (int)getuid(), (int)geteuid(),
-               getauxval(AT_SECURE), prctl(PR_GET_DUMPABLE));
+               getauxval(AT_SECURE), prctl(PR_GET_DUMPABLE) == 1);
         return 0;
     }
     if (!strcmp(mode, "limit-permissions")) {

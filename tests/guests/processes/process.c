@@ -9360,6 +9360,16 @@ int main(int argc, char **argv) {
         script_run("script-not-executable", "./s", sub_args, 2000);
         script_file("s", "#!./interp\n", 11, 0111);
         script_run("script-only-executable", "./s", sub_args, 2000);
+        /* One unreadable file on the way: a script in the middle of the chain,
+           and the interpreter at its end, which needs a mode of its own. */
+        script_file("inner", "#!./interp\n", 11, 0111);
+        script_file("s", "#!./inner\n", 10, 0755);
+        script_run("unreadable-in-the-middle", "./s", sub_args, 2000);
+        if (chmod("interp", 0111)) return 80;
+        script_file("s", "#!./interp\n", 11, 0755);
+        script_run("interpreter-not-readable", "./s", sub_args, 2000);
+        if (chmod("interp", 0755)) return 80;
+        unlink("inner");
         script_file("s", "#!./interp\n", 11, 0755);
         if (chown("s", 3000, 3000) || chmod("s", 06755)) return 80;
         script_run("script-set-id", "./s", sub_args, 2000);

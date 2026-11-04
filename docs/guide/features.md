@@ -504,8 +504,8 @@ kernel.
   names it and may give it one argument, its arguments are that name, that
   argument and the script's path in place of `argv[0]`, and the interpreter's
   set-ID bits count, not the script's. An interpreter may be a script too, up
-  to 5 levels below the first script (`ELOOP` past that). As on Linux, `chown` takes the
-  set-user-ID bit from a file that is not a directory, and the set-group-ID
+  to 5 levels below the first script (`ELOOP` past that). As on Linux, `chown`
+  takes the set-user-ID bit from a file that is not a directory, and the set-group-ID
   bit when the group may execute it or the caller is neither in its group
   nor holds `CAP_FSETID`, even when the owner and group stay. A write or a
   truncation by a thread without `CAP_FSETID` takes the same from a regular

@@ -1641,6 +1641,30 @@ static void finish(pid_t pid) {
     result("wait", waitpid(pid, &status, 0) == pid);
     result("status", status);
 }
+/* The cpu-state case: the 16 XMM registers from `in`, `fxsave` into `area`. */
+static void fx_save_from(const unsigned char *in, unsigned char *area, int wide) {
+    __asm__ volatile(
+        "movdqu 0(%0),%%xmm0\n movdqu 16(%0),%%xmm1\n movdqu 32(%0),%%xmm2\n movdqu 48(%0),%%xmm3\n"
+        "movdqu 64(%0),%%xmm4\n movdqu 80(%0),%%xmm5\n movdqu 96(%0),%%xmm6\n movdqu 112(%0),%%xmm7\n"
+        "movdqu 128(%0),%%xmm8\n movdqu 144(%0),%%xmm9\n movdqu 160(%0),%%xmm10\n movdqu 176(%0),%%xmm11\n"
+        "movdqu 192(%0),%%xmm12\n movdqu 208(%0),%%xmm13\n movdqu 224(%0),%%xmm14\n movdqu 240(%0),%%xmm15\n"
+        "test %2,%2\n jnz 1f\n fxsave (%1)\n jmp 2f\n 1: fxsave64 (%1)\n 2:\n"
+        : : "r"(in), "r"(area), "r"(wide)
+        : "memory", "cc", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
+          "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+}
+/* `fxrstor` from `area`, and the 16 XMM registers into `out`. */
+static void fx_restore_to(const unsigned char *area, unsigned char *out, int wide) {
+    __asm__ volatile(
+        "test %2,%2\n jnz 1f\n fxrstor (%0)\n jmp 2f\n 1: fxrstor64 (%0)\n 2:\n"
+        "movdqu %%xmm0,0(%1)\n movdqu %%xmm1,16(%1)\n movdqu %%xmm2,32(%1)\n movdqu %%xmm3,48(%1)\n"
+        "movdqu %%xmm4,64(%1)\n movdqu %%xmm5,80(%1)\n movdqu %%xmm6,96(%1)\n movdqu %%xmm7,112(%1)\n"
+        "movdqu %%xmm8,128(%1)\n movdqu %%xmm9,144(%1)\n movdqu %%xmm10,160(%1)\n movdqu %%xmm11,176(%1)\n"
+        "movdqu %%xmm12,192(%1)\n movdqu %%xmm13,208(%1)\n movdqu %%xmm14,224(%1)\n movdqu %%xmm15,240(%1)\n"
+        : : "r"(area), "r"(out), "r"(wide)
+        : "memory", "cc", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
+          "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+}
 /* The interpreter of the script-exec case: what exec gave it. */
 static int script_show(int argc, char **argv) {
     char name[17] = {0};
@@ -9508,6 +9532,97 @@ int main(int argc, char **argv) {
         };
         for (size_t i = 0; i < sizeof files / sizeof *files; i++) unlink(files[i]);
         if (rmdir("d") || chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "cpu-state")) {
+        /* rdtsc and rdtscp: only 32 bits in each register, and it moves on. */
+        uint64_t a1 = ~0ULL, d1 = ~0ULL, a2 = ~0ULL, d2 = ~0ULL, c2 = ~0ULL;
+        __asm__ volatile("rdtsc" : "=a"(a1), "=d"(d1));
+        __asm__ volatile("rdtsc" : "=a"(a2), "=d"(d2));
+        printf("rdtsc: clean=%d %d moves=%d\n", a1 >> 32 == 0, d1 >> 32 == 0, (d2 << 32 | a2) > (d1 << 32 | a1));
+        __asm__ volatile("rdtscp" : "=a"(a1), "=d"(d1), "=c"(c2));
+        printf("rdtscp: clean=%d %d %d moves=%d\n", a1 >> 32 == 0, d1 >> 32 == 0, c2 >> 32 == 0,
+               (d1 << 32 | a1) > (d2 << 32 | a2));
+        /* rdssp without shadow stacks leaves its register. */
+        uint64_t ssp = 0x1234567890abcdefULL;
+        __asm__ volatile(".byte 0xf3, 0x48, 0x0f, 0x1e, 0xc8" : "+a"(ssp));
+        printf("rdsspq: %llx\n", (unsigned long long)ssp);
+        ssp = 0x1234567890abcdefULL;
+        __asm__ volatile(".byte 0xf3, 0x0f, 0x1e, 0xc8" : "+a"(ssp));
+        printf("rdsspd: %llx\n", (unsigned long long)ssp);
+        /* fxsave: the x87 state as nothing has touched it, MXCSR and its mask,
+           the XMM registers, and the rest of the area left alone. */
+        static unsigned char in[256], out[256];
+        static _Alignas(16) unsigned char area[1024];
+        for (size_t i = 0; i < sizeof in; i++) in[i] = (unsigned char)(i * 7 + 1);
+        for (int wide = 0; wide < 2; wide++) {
+            memset(area, 0x55, sizeof area);
+            uint32_t mxcsr = 0x1f80 | 0x20 | 0x8000, given = 0;
+            __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
+            fx_save_from(in, area, wide);
+            memcpy(&given, area + 24, 4);
+            printf("fxsave %d: head", wide);
+            for (int i = 0; i < 32; i++) printf(" %02x", area[i]);
+            int x87 = 0, reserved = 0;
+            for (int i = 32; i < 160; i++) x87 += area[i] != 0;
+            for (int i = 464; i < 512; i++) reserved += area[i] != 0x55;
+            printf("\n  mxcsr=%x x87-set=%d xmm-same=%d available-kept=%d beyond-kept=%d\n", given, x87,
+                   !memcmp(area + 160, in, 256), reserved == 0, area[512] == 0x55);
+            /* fxrstor: other registers and another MXCSR. */
+            uint32_t other = 0x1f80 | 0x2000;
+            memcpy(area + 24, &other, 4);
+            for (int i = 0; i < 256; i++) area[160 + i] = (unsigned char)(i * 3 + 2);
+            fx_restore_to(area, out, wide);
+            uint32_t now = 0;
+            __asm__ volatile("stmxcsr %0" : "=m"(now));
+            int same = 1;
+            for (int i = 0; i < 256; i++) same &= out[i] == (unsigned char)(i * 3 + 2);
+            printf("fxrstor %d: mxcsr=%x xmm-same=%d\n", wide, now, same);
+            mxcsr = 0x1f80;
+            __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
+        }
+        /* What it refuses. */
+        for (int which = 0; which < 5; which++) {
+            fflush(stdout);
+            pid_t pid = child();
+            if (pid == 0) {
+                static _Alignas(16) unsigned char bad[1024];
+                uint32_t reserved = 0x10000;
+                switch (which) {
+                case 0: __asm__ volatile("fxsave (%0)" : : "r"(bad + 8) : "memory"); break;
+                case 1: __asm__ volatile("fxrstor (%0)" : : "r"(bad + 8)); break;
+                case 2:
+                    memcpy(bad + 24, &reserved, 4);
+                    __asm__ volatile("fxrstor (%0)" : : "r"(bad));
+                    break;
+                case 3: __asm__ volatile("fxsave (%0)" : : "r"(16L) : "memory"); break;
+                default: __asm__ volatile("fxrstor (%0)" : : "r"(16L)); break;
+                }
+                _exit(9);
+            }
+            int status = 0;
+            waitpid(pid, &status, 0);
+            printf("refused %d: status=%d\n", which, status);
+        }
+        return 0;
+    }
+    if (!strcmp(mode, "time-calls")) {
+        /* The raw calls, which a C library would answer from its vDSO. */
+        struct timespec before;
+        struct { long seconds, micros; } tv = {-1, -1};
+        struct { int minutes, dst; } tz = {-1, -1};
+        clock_gettime(CLOCK_REALTIME, &before);
+        long r = syscall(SYS_gettimeofday, &tv, &tz);
+        printf("gettimeofday: %ld close=%d micros-ok=%d tz=%d,%d\n", r, tv.seconds - before.tv_sec <= 1 && tv.seconds >= before.tv_sec,
+               tv.micros >= 0 && tv.micros < 1000000, tz.minutes, tz.dst);
+        outcome("both-null", syscall(SYS_gettimeofday, NULL, NULL));
+        outcome("tv-fault", syscall(SYS_gettimeofday, (void *)8, NULL));
+        outcome("tz-fault", syscall(SYS_gettimeofday, NULL, (void *)8));
+        long at = -1;
+        long now = syscall(SYS_time, &at);
+        printf("time: same=%d close=%d\n", now == at, now - before.tv_sec <= 1 && now >= before.tv_sec);
+        printf("time-null: close=%d\n", syscall(SYS_time, NULL) - before.tv_sec <= 1);
+        outcome("time-fault", syscall(SYS_time, (void *)8));
         return 0;
     }
     if (!strcmp(mode, "limit-permissions")) {

@@ -326,6 +326,12 @@ mnemonics!(
     Aesenclast,
     Pclmulqdq,
     Cpuid,
+    Rdtsc,
+    Rdtscp,
+    Fxsave,
+    Fxsave64,
+    Fxrstor,
+    Fxrstor64,
     Stmxcsr,
     Mfence,
     Lfence,
@@ -368,10 +374,17 @@ fn map_mnemonic(insn: &iced::Instruction) -> Option<Mnemonic> {
         return Some(Mnemonic::CmpsdSse);
     }
     // Spin-loop and cache hints change no architectural state, and a
-    // prefetch never faults, not even for an unmapped address.
+    // prefetch never faults, not even for an unmapped address. Without
+    // shadow stacks `rdssp` leaves its register as it is.
     if matches!(
         m,
-        M::Pause | M::Prefetchnta | M::Prefetcht0 | M::Prefetcht1 | M::Prefetcht2
+        M::Pause
+            | M::Prefetchnta
+            | M::Prefetcht0
+            | M::Prefetcht1
+            | M::Prefetcht2
+            | M::Rdsspd
+            | M::Rdsspq
     ) {
         return Some(Mnemonic::Nop);
     }
@@ -604,7 +617,22 @@ fn map_memory(insn: &iced::Instruction) -> Option<MemoryOperand> {
         iced::Register::None => None,
         r => Some(map_register(r)?),
     };
-    let size = u8::try_from(insn.memory_size().size()).ok()?;
+    // The 512-byte area of `fxsave` and `fxrstor` is no size an operand reads
+    // at once, which they do not ask for.
+    let size = u8::try_from(insn.memory_size().size()).or(
+        if matches!(
+            insn.mnemonic(),
+            iced::Mnemonic::Fxsave
+                | iced::Mnemonic::Fxsave64
+                | iced::Mnemonic::Fxrstor
+                | iced::Mnemonic::Fxrstor64
+        ) {
+            Ok(0)
+        } else {
+            Err(())
+        },
+    );
+    let size = size.ok()?;
     Some(MemoryOperand {
         segment,
         base,
@@ -826,6 +854,40 @@ mod tests {
         assert_eq!(decode(&nop, rip), decode(&nop[..15], rip));
     }
 
+    #[test]
+    fn rdssp_does_nothing_and_fxsave_has_no_operand_size() {
+        // rdsspq rax and rdsspd eax.
+        for bytes in [
+            &[0xf3, 0x48, 0x0f, 0x1e, 0xc8][..],
+            &[0xf3, 0x0f, 0x1e, 0xc8],
+        ] {
+            assert_eq!(decode(bytes, RIP).unwrap().mnemonic, Mnemonic::Nop);
+        }
+        // fxsave [rax]; another 512-byte operand stays out.
+        let i = decode(&[0x0f, 0xae, 0x00], RIP).unwrap();
+        assert_eq!(i.mnemonic, Mnemonic::Fxsave);
+        let Some(Operand::Memory(m)) = i.operands[0] else {
+            panic!("no memory operand");
+        };
+        assert_eq!(m.size, 0);
+        assert_eq!(
+            decode(&[0x48, 0x0f, 0xae, 0x00], RIP).unwrap().mnemonic,
+            Mnemonic::Fxsave64
+        );
+        assert_eq!(
+            decode(&[0x0f, 0xae, 0x08], RIP).unwrap().mnemonic,
+            Mnemonic::Fxrstor
+        );
+        assert_eq!(
+            decode(&[0x48, 0x0f, 0xae, 0x08], RIP).unwrap().mnemonic,
+            Mnemonic::Fxrstor64
+        );
+        // xsave [rax] stays out.
+        assert_eq!(
+            decode(&[0x0f, 0xae, 0x20], RIP),
+            Err(DecodeError::Unsupported)
+        );
+    }
     #[test]
     fn cmps_repe_keeps_implicit_width() {
         let i = decode(&[0xf3, 0xa6], GuestAddr(0x1000)).unwrap();

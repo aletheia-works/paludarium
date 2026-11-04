@@ -29,6 +29,14 @@ impl From<Fault> for Stop {
     }
 }
 
+/// The x87 control word after a reset, the first bytes of `fxsave`'s area.
+const FX_CONTROL_WORD: u16 = 0x37f;
+/// The MXCSR bits that may be set, as `fxsave` reports them.
+const FX_MXCSR_MASK: u32 = 0xffff;
+/// Where the XMM registers are in `fxsave`'s area, and where what it writes
+/// ends: the 16 registers take it to 416 bytes.
+const FX_XMM: usize = 160;
+const FX_WRITTEN: usize = 416;
 type Result<T> = core::result::Result<T, Stop>;
 
 fn atomic_width(size: u8) -> Result<AtomicWidth> {
@@ -1197,6 +1205,59 @@ impl Exec<'_> {
         Ok(())
     }
 
+    /// Where `fxsave` and `fxrstor` work: 16-byte aligned, or a general
+    /// protection fault.
+    fn fx_area(&self) -> Result<GuestAddr> {
+        let Operand::Memory(m) = op(self.i, 0)? else {
+            return Err(Stop::Invalid);
+        };
+        let at = self.linear(&m);
+        if !at.0.is_multiple_of(16) {
+            return Err(Stop::GeneralProtection);
+        }
+        Ok(at)
+    }
+    /// `fxsave`: the x87 state as it is after a reset, as there is no x87,
+    /// then MXCSR and its mask and the XMM registers. The area past them is
+    /// not written.
+    fn fxsave(&mut self) -> Result<()> {
+        let at = self.fx_area()?;
+        let mut area = [0u8; FX_WRITTEN];
+        area[..2].copy_from_slice(&FX_CONTROL_WORD.to_le_bytes());
+        area[24..28].copy_from_slice(&self.s.mxcsr.to_le_bytes());
+        area[28..32].copy_from_slice(&FX_MXCSR_MASK.to_le_bytes());
+        for (register, bytes) in self
+            .s
+            .xmm
+            .iter()
+            .zip(area[FX_XMM..].as_chunks_mut::<16>().0)
+        {
+            *bytes = register.to_le_bytes();
+        }
+        self.mem.write(at, &area)?;
+        Ok(())
+    }
+    /// `fxrstor`: MXCSR, whose reserved bits are a general protection fault,
+    /// and the XMM registers. There is no x87 for the rest to go to.
+    fn fxrstor(&mut self) -> Result<()> {
+        let at = self.fx_area()?;
+        let mut area = [0u8; FX_WRITTEN];
+        self.mem.read(at, &mut area)?;
+        let mxcsr = u32::from_le_bytes([area[24], area[25], area[26], area[27]]);
+        if mxcsr & !FX_MXCSR_MASK != 0 {
+            return Err(Stop::GeneralProtection);
+        }
+        self.s.mxcsr = mxcsr;
+        for (register, bytes) in self
+            .s
+            .xmm
+            .iter_mut()
+            .zip(area[FX_XMM..].as_chunks::<16>().0)
+        {
+            *register = u128::from_le_bytes(*bytes);
+        }
+        Ok(())
+    }
     fn sse_misc(&mut self) -> Result<()> {
         use Mnemonic as M;
         let m = self.i.mnemonic;
@@ -1779,6 +1840,17 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
         Mnemonic::Pxor | Mnemonic::Xorps => x.sse_xor()?,
         Mnemonic::Movq => x.sse_movq()?,
         Mnemonic::Punpcklqdq => x.sse_unpack_low_qwords()?,
+        Mnemonic::Rdtsc | Mnemonic::Rdtscp => {
+            let [low, high] = crate::cpuid::time_stamp();
+            x.s.gpr[reg::RAX] = u64::from(low);
+            x.s.gpr[reg::RDX] = u64::from(high);
+            // `IA32_TSC_AUX`: the only CPU there is.
+            if x.i.mnemonic == Mnemonic::Rdtscp {
+                x.s.gpr[reg::RCX] = 0;
+            }
+        }
+        Mnemonic::Fxsave | Mnemonic::Fxsave64 => x.fxsave()?,
+        Mnemonic::Fxrstor | Mnemonic::Fxrstor64 => x.fxrstor()?,
         Mnemonic::Cpuid => {
             let values = crate::cpuid::values(x.s.gpr[reg::RAX] as u32, x.s.gpr[reg::RCX] as u32);
             for (index, value) in [reg::RAX, reg::RBX, reg::RCX, reg::RDX]

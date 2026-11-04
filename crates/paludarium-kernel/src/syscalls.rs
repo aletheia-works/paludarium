@@ -30,6 +30,8 @@ pub mod nr {
     pub const PPOLL: u64 = 271;
     pub const NANOSLEEP: u64 = 35;
     pub const CLOCK_GETTIME: u64 = 228;
+    pub const GETTIMEOFDAY: u64 = 96;
+    pub const TIME: u64 = 201;
     pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
@@ -120,7 +122,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 54] = [
+        let entries: [(u64, Handler); 56] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -128,6 +130,8 @@ impl SyscallTable {
             (nr::TKILL, sys_tkill),
             (nr::TGKILL, sys_tgkill),
             (nr::CLOCK_GETTIME, sys_clock_gettime),
+            (nr::GETTIMEOFDAY, sys_gettimeofday),
+            (nr::TIME, sys_time),
             (nr::NANOSLEEP, sys_nanosleep),
             (nr::CLOCK_NANOSLEEP, sys_clock_nanosleep),
             (nr::WRITE, sys_write),
@@ -322,6 +326,46 @@ fn sys_clock_gettime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         .and_then(|value| write_timespec(c.mem, a[1], value));
     match result {
         Ok(()) => ok(0),
+        Err(e) => err(e),
+    }
+}
+/// `gettimeofday(tv, tz)`: the real time clock in microseconds, and a time zone
+/// of UTC, as nothing sets another; either may be null.
+fn sys_gettimeofday(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let result = read_clock(c, GuestClock::Host(ClockId::Realtime)).and_then(|now| {
+        if a[0] != 0 {
+            let seconds = now / 1_000_000_000;
+            let micros = now % 1_000_000_000 / 1000;
+            let bytes = [seconds.to_le_bytes(), micros.to_le_bytes()].concat();
+            c.mem
+                .write(GuestAddr(a[0]), &bytes)
+                .map_err(|_| Errno::EFAULT)?;
+        }
+        if a[1] != 0 {
+            c.mem
+                .write(GuestAddr(a[1]), &[0; 8])
+                .map_err(|_| Errno::EFAULT)?;
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => ok(0),
+        Err(e) => err(e),
+    }
+}
+/// `time(t)`: the real time clock in seconds, also at `t` if it is not null.
+fn sys_time(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let result = read_clock(c, GuestClock::Host(ClockId::Realtime)).and_then(|now| {
+        let seconds = now / 1_000_000_000;
+        if a[0] != 0 {
+            c.mem
+                .write(GuestAddr(a[0]), &seconds.to_le_bytes())
+                .map_err(|_| Errno::EFAULT)?;
+        }
+        Ok(seconds)
+    });
+    match result {
+        Ok(seconds) => ok(seconds),
         Err(e) => err(e),
     }
 }

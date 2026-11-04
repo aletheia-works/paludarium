@@ -89,6 +89,26 @@ fn timespec(f: &mut Fixture, sec: i64, nsec: i64) {
         .unwrap();
 }
 #[test]
+fn gettimeofday_and_time_read_the_real_time_clock() {
+    let mut f = fixture();
+    f.host
+        .set_clock(paludarium_host::ClockId::Realtime, 5_000_123_456);
+    f.host.set_clock(paludarium_host::ClockId::Monotonic, 7);
+    f.mem.write(GuestAddr(DATA + 16), &[0xff; 8]).unwrap();
+    assert_eq!(f.ret(syscalls::nr::GETTIMEOFDAY, &[DATA, DATA + 16]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 5);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 123);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 16)).unwrap(), 0);
+    assert_eq!(f.ret(syscalls::nr::GETTIMEOFDAY, &[0, 0]), 0);
+    let fault = Errno::EFAULT.to_syscall_return();
+    assert_eq!(f.ret(syscalls::nr::GETTIMEOFDAY, &[8, 0]), fault);
+    assert_eq!(f.ret(syscalls::nr::GETTIMEOFDAY, &[0, 8]), fault);
+    assert_eq!(f.ret(syscalls::nr::TIME, &[DATA + 32]), 5);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 32)).unwrap(), 5);
+    assert_eq!(f.ret(syscalls::nr::TIME, &[0]), 5);
+    assert_eq!(f.ret(syscalls::nr::TIME, &[8]), fault);
+}
+#[test]
 fn time_clock_serialization() {
     let mut f = fixture();
     f.host

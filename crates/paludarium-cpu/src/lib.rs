@@ -903,6 +903,99 @@ mod tests {
         ));
     }
 
+    /// Runs `code` once, with `rax` pointing into the stack at `offset`.
+    fn fx_run(
+        code: &[u8],
+        area: &[u8],
+        offset: u64,
+        s_mem: Option<(CpuState, AddressSpace)>,
+    ) -> (CpuState, AddressSpace, ExitReason) {
+        let (mut s, mem) = s_mem.unwrap_or_else(|| machine(code));
+        let at = STACK_TOP - 0x1000 + offset;
+        mem.write(GuestAddr(at), area).unwrap();
+        s.gpr[0] = at;
+        let reason = run(&mut s, &mem, 1);
+        (s, mem, reason)
+    }
+    #[test]
+    fn fxsave_gives_mxcsr_and_the_registers_and_leaves_the_rest() {
+        let (mut s, mem) = machine(&[0x0f, 0xae, 0x00]);
+        s.mxcsr = 0x1fa0;
+        for (n, register) in s.xmm.iter_mut().enumerate() {
+            *register = (n as u128 + 1) * 0x0101_0101_0101_0101_0101;
+        }
+        let xmm = s.xmm;
+        let (_, mem, _) = fx_run(&[], &[0x55; 512], 0, Some((s, mem)));
+        let mut area = [0; 512];
+        mem.read(GuestAddr(STACK_TOP - 0x1000), &mut area).unwrap();
+        assert_eq!(&area[..2], &[0x7f, 0x03], "the control word after a reset");
+        assert_eq!(&area[2..24], &[0; 22]);
+        assert_eq!(&area[24..28], &0x1fa0u32.to_le_bytes());
+        assert_eq!(&area[28..32], &0xffffu32.to_le_bytes());
+        assert_eq!(&area[32..160], &[0; 128]);
+        for (n, value) in xmm.iter().enumerate() {
+            assert_eq!(
+                &area[160 + 16 * n..176 + 16 * n],
+                &value.to_le_bytes(),
+                "{n}"
+            );
+        }
+        assert_eq!(&area[416..], &[0x55; 96], "not written");
+    }
+    #[test]
+    fn fxrstor_takes_mxcsr_and_the_registers() {
+        let mut area = [0u8; 512];
+        area[24..28].copy_from_slice(&0x3f80u32.to_le_bytes());
+        for n in 0..16 {
+            area[160 + 16 * n..176 + 16 * n].copy_from_slice(&[n as u8 + 1; 16]);
+        }
+        let (s, _, _) = fx_run(&[0x0f, 0xae, 0x08], &area, 0, None);
+        assert_eq!(s.mxcsr, 0x3f80);
+        for (n, value) in s.xmm.iter().enumerate() {
+            assert_eq!(*value, u128::from_le_bytes([n as u8 + 1; 16]), "{n}");
+        }
+    }
+    #[test]
+    fn fxsave_and_fxrstor_refuse_what_linux_faults_on() {
+        for code in [&[0x0f, 0xae, 0x00][..], &[0x0f, 0xae, 0x08]] {
+            let (_, _, reason) = fx_run(code, &[0; 512], 8, None);
+            assert!(
+                matches!(reason, ExitReason::GeneralProtection { .. }),
+                "misaligned: {reason:?}"
+            );
+        }
+        let mut area = [0u8; 512];
+        area[24..28].copy_from_slice(&0x1_0000u32.to_le_bytes());
+        let (s, _, reason) = fx_run(&[0x0f, 0xae, 0x08], &area, 0, None);
+        assert!(
+            matches!(reason, ExitReason::GeneralProtection { .. }),
+            "{reason:?}"
+        );
+        assert_eq!(
+            s.mxcsr,
+            CpuState::new(GuestAddr(0), GuestAddr(0)).mxcsr,
+            "unchanged"
+        );
+    }
+    #[test]
+    fn rdtsc_splits_a_counter_that_moves_on() {
+        let read = |code: &[u8]| {
+            let (mut s, mem) = machine(code);
+            s.gpr[0] = u64::MAX;
+            s.gpr[1] = u64::MAX;
+            s.gpr[2] = u64::MAX;
+            run(&mut s, &mem, 1);
+            s
+        };
+        let first = read(&[0x0f, 0x31]);
+        assert_eq!(first.gpr[0] >> 32, 0);
+        assert_eq!(first.gpr[2] >> 32, 0);
+        assert_eq!(first.gpr[1], u64::MAX, "rdtsc leaves rcx");
+        assert_ne!(first.gpr[2], 0, "the counter is past 32 bits");
+        let second = read(&[0x0f, 0x01, 0xf9]);
+        assert_eq!(second.gpr[1], 0, "rdtscp sets rcx");
+        assert!(second.gpr[2] << 32 | second.gpr[0] > first.gpr[2] << 32 | first.gpr[0]);
+    }
     #[test]
     fn memory_faults_report_address_and_direction() {
         // mov [0x1000], eax  (89 04 25 00 10 00 00)

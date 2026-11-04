@@ -1554,12 +1554,25 @@ static void caps_status(void) {
             printf("  %s", line);
     if (f) fclose(f);
 }
-static void caps_exec(const char *self) {
-    char *args[] = {(char *)self, "capabilities-show", (char *)self, NULL};
+static void caps_exec(void) {
+    char *args[] = {"./prog", "capabilities-show", "./prog", NULL};
     char *env[] = {NULL};
     fflush(stdout);
-    execve(self, args, env);
+    execve("./prog", args, env);
     _exit(96);
+}
+/* A copy of this program where any thread may reach it, whatever it holds: the
+   tests' own program may be in a directory only its user may search. */
+static int caps_copy(const char *self) {
+    char buffer[65536];
+    long n;
+    int from = open(self, O_RDONLY), to = open("prog", O_CREAT | O_WRONLY, 0755);
+    if (from < 0 || to < 0 || fchmod(to, 0755)) return -1;
+    while ((n = read(from, buffer, sizeof buffer)) > 0)
+        if (write(to, buffer, n) != n) return -1;
+    close(from);
+    close(to);
+    return n;
 }
 static volatile int caps_thread_id;
 static volatile int caps_thread_done;
@@ -8963,6 +8976,7 @@ int main(int argc, char **argv) {
         /* sudo leaves root's group among the supplementary ones. */
         if (setgroups(0, NULL)) return 80;
         if (chmod(".", 0777)) return 80;
+        if (caps_copy(self)) return 80;
         caps_show("start", 0);
         caps_status();
         /* The header: an unknown version is written back, and without data
@@ -9195,20 +9209,21 @@ int main(int argc, char **argv) {
            inheritable set stays; a user other than root has none. */
         AS_SENDER(0, 0, 0, {
             if (caps_set(0xf0, 0xff, 0x3)) _exit(90);
-            caps_exec(self);
+            caps_exec();
         });
         AS_SENDER(0, 0, 0, {
             if (caps_set(CAPS_ALL, CAPS_ALL, 0x3)) _exit(90);
             if (prctl(PR_SET_KEEPCAPS, 1)) _exit(90);
             if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(90);
-            caps_exec(self);
+            caps_exec();
         });
         AS_SENDER(0, 0, 0, {
             if (caps_set(0, 0, 0)) _exit(90);
-            caps_exec(self);
+            caps_exec();
         });
         fflush(stdout);
         unlink("theirs");
+        unlink("prog");
         if (chdir("/") || rmdir(dir)) return 89;
         return 0;
     }

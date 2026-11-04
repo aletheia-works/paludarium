@@ -125,6 +125,8 @@ NAMES = {
     122: "setfsuid",
     123: "setfsgid",
     124: "getsid",
+    125: "capget",
+    126: "capset",
     127: "rt_sigpending",
     128: "rt_sigtimedwait",
     129: "rt_sigqueueinfo",

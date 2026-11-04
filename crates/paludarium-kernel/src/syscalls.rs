@@ -57,6 +57,8 @@ pub mod nr {
     pub const SETREUID: u64 = 113;
     pub const SETREGID: u64 = 114;
     pub const SETGROUPS: u64 = 116;
+    pub const CAPGET: u64 = 125;
+    pub const CAPSET: u64 = 126;
     pub const SETRESUID: u64 = 117;
     pub const GETRESUID: u64 = 118;
     pub const SETRESGID: u64 = 119;
@@ -178,12 +180,14 @@ impl SyscallTable {
         for number in crate::files::NUMBERS {
             handlers.insert(*number, crate::files::dispatch);
         }
-        let ids: [(u64, Handler); 11] = [
+        let ids: [(u64, Handler); 13] = [
             (nr::SETUID, credentials::sys_setuid),
             (nr::SETGID, credentials::sys_setgid),
             (nr::SETREUID, credentials::sys_setreuid),
             (nr::SETREGID, credentials::sys_setregid),
             (nr::SETGROUPS, credentials::sys_setgroups),
+            (nr::CAPGET, credentials::sys_capget),
+            (nr::CAPSET, credentials::sys_capset),
             (nr::SETRESUID, credentials::sys_setresuid),
             (nr::GETRESUID, credentials::sys_getresuid),
             (nr::SETRESGID, credentials::sys_setresgid),

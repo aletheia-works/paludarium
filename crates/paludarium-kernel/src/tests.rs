@@ -705,6 +705,81 @@ fn access_grants_root_reading_and_writing_but_execution_needs_a_bit() {
     assert_eq!(f.ret(21, &[0, 0]), errno(Errno::EFAULT));
 }
 #[test]
+fn capget_and_capset_check_their_header() {
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
+    const V3: u32 = 0x2008_0522;
+    const DATA_AT: u64 = DATA + 0x100;
+    let mut f = fixture();
+    let header = |f: &mut _, version: u32, pid: i32| {
+        let f: &mut Fixture = f;
+        let bytes = [version.to_le_bytes(), pid.to_le_bytes()].concat();
+        f.mem.write(GuestAddr(DATA), &bytes).unwrap();
+    };
+    let version = |f: &Fixture| f.mem.read_u64(GuestAddr(DATA)).unwrap() as u32;
+    let words = |f: &Fixture| {
+        let mut raw = [0; 24];
+        f.mem.read(GuestAddr(DATA_AT), &mut raw).unwrap();
+        raw.chunks(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    // An unknown version is written back; with no data it only asks.
+    header(&mut f, 1, 0);
+    assert_eq!(f.ret(nr::CAPGET, &[DATA, 0]), 0);
+    assert_eq!(version(&f), V3);
+    header(&mut f, 1, 0);
+    assert_eq!(f.ret(nr::CAPGET, &[DATA, DATA_AT]), errno(Errno::EINVAL));
+    assert_eq!(version(&f), V3);
+    header(&mut f, 1, 0);
+    assert_eq!(f.ret(nr::CAPSET, &[DATA, DATA_AT]), errno(Errno::EINVAL));
+    assert_eq!(version(&f), V3);
+    assert_eq!(f.ret(nr::CAPGET, &[8, DATA_AT]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(nr::CAPGET, &[8, 0]), errno(Errno::EFAULT));
+    // The first version has one word of each set, the others two.
+    f.mem.write(GuestAddr(DATA_AT), &[0x55; 24]).unwrap();
+    header(&mut f, V1, 0);
+    assert_eq!(f.ret(nr::CAPGET, &[DATA, DATA_AT]), 0);
+    let filler = 0x5555_5555;
+    assert_eq!(words(&f), [u32::MAX, u32::MAX, 0, filler, filler, filler]);
+    for v in [V2, V3] {
+        header(&mut f, v, 0);
+        assert_eq!(f.ret(nr::CAPGET, &[DATA, DATA_AT]), 0);
+        assert_eq!(words(&f), [u32::MAX, u32::MAX, 0, 0x1ff, 0x1ff, 0]);
+    }
+    // Whom it names.
+    header(&mut f, V3, -1);
+    assert_eq!(f.ret(nr::CAPGET, &[DATA, DATA_AT]), errno(Errno::EINVAL));
+    header(&mut f, V3, 0x3f_ffff);
+    assert_eq!(f.ret(nr::CAPGET, &[DATA, DATA_AT]), errno(Errno(3)));
+    assert_eq!(f.ret(nr::CAPSET, &[DATA, DATA_AT]), errno(Errno::EPERM));
+    header(&mut f, V3, -1);
+    assert_eq!(f.ret(nr::CAPSET, &[DATA, DATA_AT]), errno(Errno::EPERM));
+    header(&mut f, V3, 0);
+    assert_eq!(f.ret(nr::CAPGET, &[DATA, 8]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(nr::CAPSET, &[DATA, 8]), errno(Errno::EFAULT));
+    // Bits past the last capability do not count, and dropping counts.
+    let high = [0x7u32, 0xf, 0x1, u32::MAX, u32::MAX, 0]
+        .map(u32::to_le_bytes)
+        .concat();
+    f.mem.write(GuestAddr(DATA_AT), &high).unwrap();
+    assert_eq!(f.ret(nr::CAPSET, &[DATA, DATA_AT]), 0);
+    assert_eq!(f.ret(nr::CAPGET, &[DATA, DATA_AT]), 0);
+    assert_eq!(words(&f), [0x7, 0xf, 0x1, 0x1ff, 0x1ff, 0]);
+    // The first version clears the high words.
+    header(&mut f, V1, 0);
+    let low = [0x3u32, 0x7, 0x1].map(u32::to_le_bytes).concat();
+    f.mem.write(GuestAddr(DATA_AT), &low).unwrap();
+    assert_eq!(f.ret(nr::CAPSET, &[DATA, DATA_AT]), 0);
+    header(&mut f, V3, 0);
+    assert_eq!(f.ret(nr::CAPGET, &[DATA, DATA_AT]), 0);
+    assert_eq!(words(&f), [0x3, 0x7, 0x1, 0, 0, 0]);
+    // Growing is refused.
+    let more = [0x3u32, 0xf, 0x1, 0, 0, 0].map(u32::to_le_bytes).concat();
+    f.mem.write(GuestAddr(DATA_AT), &more).unwrap();
+    assert_eq!(f.ret(nr::CAPSET, &[DATA, DATA_AT]), errno(Errno::EPERM));
+}
+#[test]
 fn sysinfo_getgroups_and_sched_yield() {
     let mut f = fixture();
     assert_eq!(f.ret(nr::SYSINFO, &[DATA]), 0);

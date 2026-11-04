@@ -14,6 +14,7 @@ pub(crate) const ALL_CAPABILITIES: u64 = (1 << 41) - 1;
 const CAP_KILL: u64 = 1 << 5;
 const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
+const CAP_SETPCAP: u64 = 1 << 8;
 const CAP_SYS_ADMIN: u64 = 1 << 21;
 const CAP_SYS_NICE: u64 = 1 << 23;
 const CAP_SYS_RESOURCE: u64 = 1 << 24;
@@ -28,6 +29,11 @@ const GROUP_EXECUTE: u32 = 0o010;
 const MAX_GROUPS: u64 = 65536;
 /// The ID that means "unchanged", and that names no user or group.
 const UNCHANGED: u32 = u32::MAX;
+/// `capget` and `capset`'s header versions: one 32-bit set of each kind, then
+/// two.
+const CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
 /// What acting on another thread looks at in credentials, which another
 /// process can read ([`crate::ThreadGroup::task_ids`]).
@@ -42,6 +48,10 @@ pub(crate) struct TaskIds {
     pub cap_kill: bool,
     pub cap_sys_nice: bool,
     pub cap_sys_resource: bool,
+    /// The sets `capget` reads of another thread.
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
 }
 
 impl TaskIds {
@@ -94,6 +104,9 @@ pub struct Credentials {
     pub groups: Vec<u32>,
     pub permitted: u64,
     pub effective: u64,
+    /// What a program may take from a file's inheritable capabilities. Set
+    /// only by `capset`, and kept by `set*id` and exec.
+    pub inheritable: u64,
     /// `PR_SET_KEEPCAPS` (`SECBIT_KEEP_CAPS`): leaving root keeps the
     /// permitted capabilities. Cleared by exec.
     pub keep_caps: bool,
@@ -114,6 +127,7 @@ impl Default for Credentials {
             groups: Vec::new(),
             permitted: ALL_CAPABILITIES,
             effective: ALL_CAPABILITIES,
+            inheritable: 0,
             keep_caps: false,
         }
     }
@@ -131,7 +145,35 @@ impl Credentials {
             cap_kill: self.effective & CAP_KILL != 0,
             cap_sys_nice: self.effective & CAP_SYS_NICE != 0,
             cap_sys_resource: self.effective & CAP_SYS_RESOURCE != 0,
+            effective: self.effective,
+            permitted: self.permitted,
+            inheritable: self.inheritable,
         }
+    }
+    /// `capset`, as Linux's `cap_capset`: a new inheritable set within the
+    /// old inheritable and permitted ones unless the thread has CAP_SETPCAP,
+    /// permitted within the old permitted, and effective within the new
+    /// permitted (EPERM). The bounding set holds every capability, so it
+    /// refuses nothing.
+    pub(crate) fn capset(
+        &self,
+        effective: u64,
+        permitted: u64,
+        inheritable: u64,
+    ) -> Result<Self, Errno> {
+        let capped = self.effective & CAP_SETPCAP == 0;
+        if (capped && inheritable & !(self.inheritable | self.permitted) != 0)
+            || permitted & !self.permitted != 0
+            || effective & !permitted != 0
+        {
+            return Err(Errno::EPERM);
+        }
+        Ok(Self {
+            effective,
+            permitted,
+            inheritable,
+            ..self.clone()
+        })
     }
     /// Linux's `scm_check_creds`, for what `SCM_CREDENTIALS` may say: the
     /// caller's own process, or CAP_SYS_ADMIN; one of its real, effective
@@ -529,6 +571,105 @@ pub(crate) fn sys_getgroups(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 /// `setgroups(size, list)`: with CAP_SETGID, at most `NGROUPS_MAX` groups,
 /// none the ID that names no group; kept sorted.
+/// Linux's `cap_validate_magic`: how many 32-bit sets the header's version
+/// has, or for another version writes back the newest and is EINVAL.
+fn capability_sets(c: &Context<'_>, header: u64) -> Result<usize, Errno> {
+    let mut version = [0; 4];
+    c.mem
+        .read(GuestAddr(header), &mut version)
+        .map_err(|_| Errno::EFAULT)?;
+    match u32::from_le_bytes(version) {
+        CAPABILITY_VERSION_1 => Ok(1),
+        CAPABILITY_VERSION_2 | CAPABILITY_VERSION_3 => Ok(2),
+        _ => {
+            c.mem
+                .write(GuestAddr(header), &CAPABILITY_VERSION_3.to_le_bytes())
+                .map_err(|_| Errno::EFAULT)?;
+            Err(Errno::EINVAL)
+        }
+    }
+}
+/// The process ID of a `capget` or `capset` header.
+fn capability_pid(c: &Context<'_>, header: u64) -> Result<i32, Errno> {
+    let mut pid = [0; 4];
+    c.mem
+        .read(GuestAddr(header + 4), &mut pid)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(i32::from_le_bytes(pid))
+}
+/// `capget(header, data)`, as Linux's: no `data` only asks for the version,
+/// so a version it does not know then succeeds. Each set's low 32 bits come
+/// in the first `struct __user_cap_data_struct`, its high ones in the second;
+/// the first version has no second. Any thread may be read.
+pub(crate) fn sys_capget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let [header, data, ..] = a;
+    let sets = match capability_sets(c, header) {
+        Ok(_) if data == 0 => return ok(0),
+        Err(e) if data == 0 && e == Errno::EINVAL => return ok(0),
+        Err(e) => return err(e),
+        Ok(sets) => sets,
+    };
+    let pid = match capability_pid(c, header) {
+        Ok(pid) if pid < 0 => return err(Errno::EINVAL),
+        Ok(pid) => pid.cast_unsigned(),
+        Err(e) => return err(e),
+    };
+    let ids = if pid == 0 || pid == c.tid {
+        c.process.credentials.task_ids()
+    } else {
+        match c.processes.task_ids(pid) {
+            Some(ids) => ids,
+            None => return err(Errno(3)),
+        }
+    };
+    let mut bytes = Vec::with_capacity(sets * 12);
+    for shift in [0, 32].into_iter().take(sets) {
+        for set in [ids.effective, ids.permitted, ids.inheritable] {
+            bytes.extend(((set >> shift) as u32).to_le_bytes());
+        }
+    }
+    match c.mem.write(GuestAddr(data), &bytes) {
+        Ok(()) => ok(0),
+        Err(_) => err(Errno::EFAULT),
+    }
+}
+/// `capset(header, data)`, as Linux's: only the calling thread (EPERM), and
+/// bits past the last capability do not count. The first version says
+/// nothing of the high bits, which it clears.
+pub(crate) fn sys_capset(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let [header, data, ..] = a;
+    let sets = match capability_sets(c, header) {
+        Ok(sets) => sets,
+        Err(e) => return err(e),
+    };
+    match capability_pid(c, header) {
+        Ok(pid) if pid != 0 && pid.cast_unsigned() != c.tid => return err(Errno::EPERM),
+        Ok(_) => {}
+        Err(e) => return err(e),
+    }
+    let mut bytes = [0; 24];
+    if c.mem
+        .read(GuestAddr(data), &mut bytes[..sets * 12])
+        .is_err()
+    {
+        return err(Errno::EFAULT);
+    }
+    let word = |at: usize| {
+        u64::from(u32::from_le_bytes([
+            bytes[at],
+            bytes[at + 1],
+            bytes[at + 2],
+            bytes[at + 3],
+        ]))
+    };
+    let [effective, permitted, inheritable] =
+        [0, 4, 8].map(|at| (word(at) | word(at + 12) << 32) & ALL_CAPABILITIES);
+    let change = c
+        .process
+        .credentials
+        .capset(effective, permitted, inheritable);
+    set(c, change)
+}
 pub(crate) fn sys_setgroups(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if !c.process.credentials.may_setgid() {
         return err(Errno::EPERM);
@@ -593,6 +734,42 @@ mod credentials_tests {
             .unwrap()
             .task_ids();
         assert_eq!([groups.gid, groups.egid, groups.sgid], [1, 2, 3]);
+    }
+    #[test]
+    fn capset_keeps_within_what_the_thread_holds() {
+        const SOME: u64 = 0xf0;
+        let root = Credentials::default();
+        // Effective within the new permitted, permitted within the old one.
+        let less = root.capset(0x30, SOME, 0).unwrap();
+        assert_eq!(
+            [less.effective, less.permitted, less.inheritable],
+            [0x30, SOME, 0]
+        );
+        assert_eq!(less.capset(SOME | 1, SOME, 0), Err(Errno::EPERM));
+        assert_eq!(less.capset(0, SOME | 1, 0), Err(Errno::EPERM));
+        // Effective counts against the new permitted set, not the old one.
+        assert_eq!(less.capset(0x80, 0x70, 0), Err(Errno::EPERM));
+        assert!(less.capset(SOME, SOME, 0).is_ok());
+        // Without CAP_SETPCAP, inheritable within old inheritable and permitted.
+        assert_eq!(less.capset(0, SOME, 0x100), Err(Errno::EPERM));
+        let inherits = less.capset(0, SOME, 0x10).unwrap();
+        // ... where the old inheritable counts even when no longer permitted.
+        let lost = inherits.capset(0, 0x20, 0x10).unwrap();
+        assert!(lost.capset(0, 0x20, 0x30).is_ok());
+        assert_eq!(lost.capset(0, 0x20, 0x40), Err(Errno::EPERM));
+        // With it, any.
+        let with = root.capset(CAP_SETPCAP, CAP_SETPCAP, 0).unwrap();
+        assert!(with.capset(CAP_SETPCAP, CAP_SETPCAP, 1 << 20).is_ok());
+    }
+    #[test]
+    fn set_id_calls_and_exec_keep_the_inheritable_set() {
+        let root = Credentials::default()
+            .capset(ALL_CAPABILITIES, ALL_CAPABILITIES, 0x42)
+            .unwrap();
+        let user = root.setresuid(2000, 2000, 2000).unwrap();
+        assert_eq!((user.inheritable, user.permitted), (0x42, 0));
+        assert_eq!(root.after_exec(None, false).0.inheritable, 0x42);
+        assert_eq!(user.after_exec(None, false).0.permitted, 0);
     }
     #[test]
     fn scm_credentials_name_the_callers_own_ids_without_capabilities() {

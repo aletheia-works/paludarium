@@ -1852,6 +1852,47 @@ mod first_process_exit {
         assert_eq!(k.checkpoint(&mut t, &m), Next::Resume);
     }
 }
+#[test]
+fn capget_reads_another_process_and_capabilities_decide() {
+    let (mut k, mut t, m) = setup();
+    let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+    // The child keeps CAP_KILL out of its effective set.
+    let v3 = [0x2008_0522u32.to_le_bytes(), 0u32.to_le_bytes()].concat();
+    cm.write(GuestAddr(DATA), &v3).unwrap();
+    let sets = [0xffff_ffdfu32, u32::MAX, 0x3, 0x1ff, 0x1ff, 0]
+        .map(u32::to_le_bytes)
+        .concat();
+    cm.write(GuestAddr(DATA + 0x100), &sets).unwrap();
+    let args = [DATA, DATA + 0x100, 0, 0, 0, 0];
+    assert_eq!(syscall(&mut c, &mut ct, &cm, 126, args), 0);
+    // Its parent reads them by its ID.
+    let named = [0x2008_0522u32.to_le_bytes(), ct.tid.to_le_bytes()].concat();
+    m.write(GuestAddr(DATA), &named).unwrap();
+    assert_eq!(syscall(&mut k, &mut t, &m, 125, args), 0);
+    let mut raw = [0; 12];
+    m.read(GuestAddr(DATA + 0x100), &mut raw).unwrap();
+    assert_eq!(&raw[..4], &0xffff_ffdfu32.to_le_bytes());
+    assert_eq!(&raw[8..12], &0x3u32.to_le_bytes());
+    // Without CAP_KILL root cannot signal another user's process.
+    let other = crate::credentials::Credentials::default()
+        .setresuid(2000, 2000, 2000)
+        .unwrap()
+        .task_ids();
+    let without = crate::credentials::Credentials::default()
+        .capset(
+            !(1 << 5) & crate::credentials::ALL_CAPABILITIES,
+            crate::credentials::ALL_CAPABILITIES,
+            0,
+        )
+        .unwrap()
+        .task_ids();
+    assert!(!without.may_signal(other));
+    assert!(
+        crate::credentials::Credentials::default()
+            .task_ids()
+            .may_signal(other)
+    );
+}
 mod core_dumps {
     use super::*;
     const MAGIC: u64 = 0x1122_3344_5566_7788;

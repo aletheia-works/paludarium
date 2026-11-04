@@ -51,10 +51,9 @@ common=(--rm --platform linux/amd64
   # Apply the same stack setting during both image builds and test runs.
   --ulimit stack=-1
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined
-  # The limit-permissions and peer-credentials cases raise limits and nice
-  # values and name other processes as root, which Docker's root cannot do
-  # without these.
-  --cap-add SYS_RESOURCE --cap-add SYS_NICE --cap-add SYS_ADMIN
+  # The limit-permissions, peer-credentials and capabilities cases use and
+  # print root's capabilities, which Docker's root lacks otherwise.
+  --cap-add ALL
   -v paludarium-cargo-registry:/usr/local/cargo/registry
   -e CARGO_TERM_COLOR=never -w /work)
 

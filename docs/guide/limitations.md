@@ -109,8 +109,9 @@ verified.
   group even when another process shares the caller's working directory
   (`CLONE_FS`), where Linux takes the real IDs as effective unless the
   caller has `CAP_SETUID`. `/proc/self/status` shows the calling thread's
-  credentials, where Linux shows the thread group leader's, and `capget`
-  and `capset` are not implemented.
+  credentials, where Linux shows the thread group leader's. Every thread's
+  bounding set holds every capability and its ambient set none, as there is
+  no `PR_CAPBSET_DROP` or `PR_CAP_AMBIENT`.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS` as Linux does, with
   these differences:

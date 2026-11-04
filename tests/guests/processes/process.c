@@ -1505,6 +1505,71 @@ static long socket_sendto(const char *path) {
     errno = saved;
     return result;
 }
+/* The capabilities case: raw capget and capset, with no library's help. */
+#define CAPS_V1 0x19980330u
+#define CAPS_V2 0x20071026u
+#define CAPS_V3 0x20080522u
+#define CAPS_ALL ((1ULL << 41) - 1)
+#define CAP_BIT(n) (1ULL << (n))
+struct caps_header {
+    uint32_t version;
+    int pid;
+};
+struct caps_word {
+    uint32_t effective, permitted, inheritable;
+};
+static long caps_get(uint32_t version, int pid, struct caps_word *data) {
+    struct caps_header header = {version, pid};
+    return syscall(SYS_capget, &header, data);
+}
+static long caps_set(uint64_t effective, uint64_t permitted, uint64_t inheritable) {
+    struct caps_header header = {CAPS_V3, 0};
+    struct caps_word data[2] = {
+        {(uint32_t)effective, (uint32_t)permitted, (uint32_t)inheritable},
+        {(uint32_t)(effective >> 32), (uint32_t)(permitted >> 32), (uint32_t)(inheritable >> 32)},
+    };
+    return syscall(SYS_capset, &header, data);
+}
+/* Only these effective capabilities, keeping every permitted one. */
+static void caps_only(uint64_t effective) {
+    if (caps_set(effective, CAPS_ALL, 0)) _exit(95);
+}
+static void caps_show(const char *name, int pid) {
+    struct caps_word data[2];
+    if (caps_get(CAPS_V3, pid, data)) {
+        printf("%s: %s\n", name, strerror(errno));
+        return;
+    }
+    printf("%s: e=%llx p=%llx i=%llx\n", name,
+           (unsigned long long)data[0].effective | (unsigned long long)data[1].effective << 32,
+           (unsigned long long)data[0].permitted | (unsigned long long)data[1].permitted << 32,
+           (unsigned long long)data[0].inheritable | (unsigned long long)data[1].inheritable << 32);
+}
+/* What `/proc/self/status` says of the sets. */
+static void caps_status(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "CapInh", 6) || !strncmp(line, "CapPrm", 6) || !strncmp(line, "CapEff", 6))
+            printf("  %s", line);
+    if (f) fclose(f);
+}
+static void caps_exec(const char *self) {
+    char *args[] = {(char *)self, "capabilities-show", (char *)self, NULL};
+    char *env[] = {NULL};
+    fflush(stdout);
+    execve(self, args, env);
+    _exit(96);
+}
+static volatile int caps_thread_id;
+static volatile int caps_thread_done;
+static void *caps_thread(void *unused) {
+    (void)unused;
+    if (caps_set(CAP_BIT(0), CAP_BIT(0) | CAP_BIT(1), 0)) _exit(97);
+    caps_thread_id = syscall(SYS_gettid);
+    while (!caps_thread_done) sched_yield();
+    return NULL;
+}
 /* The limit-permissions case: a process that waits with the given IDs. */
 static pid_t limit_target(unsigned real, unsigned effective, unsigned saved, unsigned gid,
                           unsigned egid, unsigned sgid) {
@@ -8883,6 +8948,252 @@ int main(int argc, char **argv) {
             _exit(0);
         }
         wait(NULL);
+        if (chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "capabilities-show")) {
+        caps_show("after-exec", 0);
+        caps_status();
+        return 0;
+    }
+    if (!strcmp(mode, "capabilities")) {
+        char dir[] = "/tmp/capabilities-XXXXXX";
+        if (!mkdtemp(dir) || chdir(dir)) return 80;
+        umask(022);
+        /* sudo leaves root's group among the supplementary ones. */
+        if (setgroups(0, NULL)) return 80;
+        if (chmod(".", 0777)) return 80;
+        caps_show("start", 0);
+        caps_status();
+        /* The header: an unknown version is written back, and without data
+           only asks for that. */
+        AS_SENDER(0, 0, 0, {
+            struct caps_header h = {0x1234, 0};
+            struct caps_word d[2];
+            permitted("version-probe", syscall(SYS_capget, &h, NULL));
+            printf("  version=%x\n", h.version);
+            h.version = 0x1234;
+            permitted("version-with-data", syscall(SYS_capget, &h, d));
+            printf("  version=%x\n", h.version);
+            h.version = 0x1234;
+            permitted("version-capset", syscall(SYS_capset, &h, d));
+            printf("  version=%x\n", h.version);
+            permitted("header-fault", syscall(SYS_capget, (void *)8, d));
+            permitted("header-fault-probe", syscall(SYS_capget, (void *)8, NULL));
+            permitted("capset-header-fault", syscall(SYS_capset, (void *)8, d));
+            h.version = CAPS_V3;
+            permitted("data-fault", syscall(SYS_capget, &h, (void *)8));
+            permitted("no-data", syscall(SYS_capget, &h, NULL));
+            permitted("capset-data-fault", syscall(SYS_capset, &h, (void *)8));
+            /* Each version's size. */
+            static const uint32_t versions[] = {CAPS_V1, CAPS_V2, CAPS_V3};
+            for (int i = 0; i < 3; i++) {
+                memset(d, 0x55, sizeof d);
+                permitted("sized", caps_get(versions[i], 0, d));
+                printf("  %x %x %x %x\n", d[0].effective, d[0].permitted, d[1].effective, d[1].permitted);
+            }
+            /* Whom it reads. */
+            permitted("pid-negative", caps_get(CAPS_V3, -1, d));
+            permitted("pid-none", caps_get(CAPS_V3, 0x3fffff, d));
+            caps_show("pid-own", getpid());
+            caps_show("pid-parent", getppid());
+            /* capset only for the calling thread. */
+            h.version = CAPS_V3;
+            caps_get(CAPS_V3, 0, d);
+            h.pid = getppid();
+            permitted("capset-parent", syscall(SYS_capset, &h, d));
+            h.pid = -1;
+            permitted("capset-negative", syscall(SYS_capset, &h, d));
+            h.pid = syscall(SYS_gettid);
+            permitted("capset-own", syscall(SYS_capset, &h, d));
+            /* Another thread's own sets. */
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, caps_thread, NULL)) _exit(90);
+            while (!caps_thread_id) sched_yield();
+            caps_show("thread", caps_thread_id);
+            caps_show("leader-after-thread", 0);
+            caps_thread_done = 1;
+            pthread_join(thread, NULL);
+        });
+        /* What capset allows. */
+        AS_SENDER(0, 0, 0, {
+            permitted("all-again", caps_set(CAPS_ALL, CAPS_ALL, 0));
+            permitted("past-the-last", caps_set(~0ULL, ~0ULL, 0));
+            caps_show("past-the-last", 0);
+            permitted("drop", caps_set(0xf0, 0xff, 0));
+            caps_show("dropped", 0);
+            permitted("effective-beyond", caps_set(0x1f0, 0xff, 0));
+            permitted("effective-beyond-new", caps_set(0xf0, 0x70, 0));
+            permitted("permitted-grows", caps_set(0, 0x1ff, 0));
+            /* No CAP_SETPCAP: within the old inheritable and permitted. */
+            permitted("inherit-within", caps_set(0x10, 0xff, 0x0f));
+            caps_show("inherit-within", 0);
+            permitted("inherit-beyond", caps_set(0x10, 0xff, 0x100));
+            permitted("permitted-less", caps_set(0, 0x1, 0x0f));
+            permitted("inherit-kept", caps_set(0, 0x1, 0x0f));
+            permitted("inherit-beyond-less", caps_set(0, 0x1, 0x1f));
+            caps_show("less", 0);
+            caps_status();
+        });
+        AS_SENDER(0, 0, 0, {
+            /* With CAP_SETPCAP, any inheritable capability. */
+            permitted("setpcap", caps_set(CAP_BIT(8), CAP_BIT(8), CAP_BIT(21)));
+            caps_show("setpcap", 0);
+            /* The first version clears the high bits. */
+            struct caps_header h = {CAPS_V1, 0};
+            struct caps_word one = {CAP_BIT(8), CAP_BIT(8), 0};
+            permitted("v1", syscall(SYS_capset, &h, &one));
+            caps_show("v1", 0);
+        });
+        AS_SENDER(0, 0, 0, {
+            struct caps_header h = {CAPS_V3, 0};
+            struct caps_word d[2];
+            caps_get(CAPS_V3, 0, d);
+            d[1].effective = 0xffffffff;
+            d[1].permitted = 0xffffffff;
+            permitted("high-past-the-last", syscall(SYS_capset, &h, d));
+            caps_show("high-past-the-last", 0);
+            /* A set the first version cannot show is cut, not refused. */
+            struct caps_word one;
+            permitted("v1-read", caps_get(CAPS_V1, 0, &one));
+            printf("  %x\n", one.effective);
+        });
+        /* What each capability allows. */
+        pid_t target = limit_target(2000, 2000, 2000, 2000, 2000, 2000);
+        int made = open("theirs", O_CREAT | O_WRONLY, 0666);
+        if (made < 0 || fchown(made, 3000, 3100) || fchmod(made, 0)) return 81;
+        close(made);
+        AS_SENDER(0, 0, 0, {
+            caps_only(CAPS_ALL & ~CAP_BIT(5));
+            permitted("kill-without", kill(target, 0));
+            caps_only(CAP_BIT(5));
+            permitted("kill-with", kill(target, 0));
+        });
+        AS_SENDER(0, 0, 0, {
+            if (limit_set(0, RLIMIT_NOFILE, 1024, 4096)) _exit(90);
+            caps_only(CAPS_ALL & ~CAP_BIT(24));
+            permitted("hard-up-without", limit_set(0, RLIMIT_NOFILE, 1024, 8192));
+            caps_only(CAP_BIT(24));
+            permitted("hard-up-with", limit_set(0, RLIMIT_NOFILE, 1024, 8192));
+        });
+        AS_SENDER(0, 0, 0, {
+            if (limit_set(0, RLIMIT_NICE, 0, 0)) _exit(90);
+            if (setpriority(PRIO_PROCESS, 0, 5)) _exit(90);
+            caps_only(CAPS_ALL & ~CAP_BIT(23));
+            errno = 0;
+            permitted("nice-down-without", setpriority(PRIO_PROCESS, 0, -1));
+            permitted("other-nice-without", setpriority(PRIO_PROCESS, target, 5));
+            caps_only(CAP_BIT(23));
+            permitted("nice-down-with", setpriority(PRIO_PROCESS, 0, -1));
+            permitted("other-nice-with", setpriority(PRIO_PROCESS, target, 5));
+        });
+        AS_SENDER(0, 0, 0, {
+            caps_only(CAPS_ALL & ~(CAP_BIT(1) | CAP_BIT(2)));
+            permitted("read-without", open("theirs", O_RDONLY));
+            permitted("write-without", open("theirs", O_WRONLY));
+            caps_only(CAP_BIT(2));
+            permitted("read-search", open("theirs", O_RDONLY));
+            permitted("write-search", open("theirs", O_WRONLY));
+            caps_only(CAP_BIT(1));
+            permitted("read-override", open("theirs", O_RDONLY));
+            permitted("write-override", open("theirs", O_WRONLY));
+        });
+        AS_SENDER(0, 0, 0, {
+            caps_only(CAPS_ALL & ~CAP_BIT(3));
+            permitted("chmod-without", chmod("theirs", 0));
+            caps_only(CAP_BIT(3));
+            permitted("chmod-with", chmod("theirs", 0));
+            caps_only(CAPS_ALL & ~CAP_BIT(0));
+            permitted("chown-without", chown("theirs", 3000, 3100));
+            caps_only(CAP_BIT(0));
+            permitted("chown-with", chown("theirs", 3000, 3100));
+        });
+        AS_SENDER(0, 0, 0, {
+            int fd = open("set-ids", O_CREAT | O_WRONLY, 0666);
+            if (fd < 0 || fchown(fd, 3000, 3100) || fchmod(fd, 06755)) _exit(90);
+            caps_only(CAPS_ALL & ~CAP_BIT(4));
+            permitted("write-without-fsetid", write(fd, "x", 1));
+            struct stat st;
+            fstat(fd, &st);
+            printf("  mode=%o\n", (unsigned)(st.st_mode & 07777));
+            caps_only(CAPS_ALL);
+            if (fchmod(fd, 06755)) _exit(90);
+            permitted("write-with-fsetid", write(fd, "x", 1));
+            fstat(fd, &st);
+            printf("  mode=%o\n", (unsigned)(st.st_mode & 07777));
+            close(fd);
+            unlink("set-ids");
+        });
+        AS_SENDER(0, 0, 0, {
+            caps_only(CAPS_ALL & ~CAP_BIT(7));
+            permitted("setuid-without", syscall(SYS_setresuid, 2000, 2000, 2000));
+            caps_only(CAPS_ALL & ~CAP_BIT(6));
+            permitted("setgid-without", syscall(SYS_setresgid, 2000, 2000, 2000));
+            gid_t group = 5;
+            permitted("setgroups-without", syscall(SYS_setgroups, 1, &group));
+        });
+        AS_SENDER(0, 0, 0, {
+            int sv[2];
+            if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) _exit(90);
+            caps_only(CAPS_ALL & ~CAP_BIT(21));
+            permitted("scm-process-without", send_credentials(sv[0], "m", getppid(), 0, 0, CMSG_LEN(sizeof(struct ucred))));
+            permitted("scm-ids-still", send_credentials(sv[0], "m", getpid(), 4000, 4100, CMSG_LEN(sizeof(struct ucred))));
+            caps_only(CAPS_ALL & ~CAP_BIT(7));
+            permitted("scm-user-without", send_credentials(sv[0], "m", getpid(), 4000, 0, CMSG_LEN(sizeof(struct ucred))));
+            caps_only(CAPS_ALL & ~CAP_BIT(6));
+            permitted("scm-group-without", send_credentials(sv[0], "m", getpid(), 0, 4100, CMSG_LEN(sizeof(struct ucred))));
+        });
+        kill(target, SIGKILL);
+        waitpid(target, NULL, 0);
+        /* What leaving root and coming back does to the sets. */
+        AS_SENDER(0, 0, 0, {
+            if (caps_set(0x3ff, 0x3fff, 0xf)) _exit(90);
+            if (syscall(SYS_setresuid, 0, 2000, 0)) _exit(90);
+            caps_show("effective-leaves-root", 0);
+            permitted("no-effective-setuid", syscall(SYS_setresuid, -1, 0, -1));
+            caps_show("effective-back", 0);
+        });
+        AS_SENDER(0, 0, 0, {
+            if (caps_set(0x3ff, 0x3fff, 0xf)) _exit(90);
+            permitted("fsuid-away", syscall(SYS_setfsuid, 2000) < 0 ? -1 : 0);
+            caps_show("fsuid-away", 0);
+            permitted("fsuid-back", syscall(SYS_setfsuid, 0) < 0 ? -1 : 0);
+            caps_show("fsuid-back", 0);
+        });
+        AS_SENDER(0, 0, 0, {
+            /* PR_SET_KEEPCAPS keeps permitted, and capset then makes them
+               effective for a user other than root. */
+            if (caps_set(CAPS_ALL, CAPS_ALL, 0xf)) _exit(90);
+            if (prctl(PR_SET_KEEPCAPS, 1)) _exit(90);
+            if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(90);
+            caps_show("kept", 0);
+            permitted("kept-effective", caps_set(CAP_BIT(0) | CAP_BIT(1), CAP_BIT(0) | CAP_BIT(1) | CAP_BIT(7), 0xf));
+            caps_show("kept-effective", 0);
+            permitted("kept-opens", open("theirs", O_RDONLY));
+            permitted("kept-chown", chown("theirs", 3000, 3100));
+            permitted("kept-chmod", chmod("theirs", 0));
+            permitted("kept-gains-setuid", caps_set(CAP_BIT(7), CAP_BIT(7), 0xf));
+            permitted("kept-setuid", syscall(SYS_setresuid, 3000, 3000, 3000));
+            caps_show("kept-after-setuid", 0);
+        });
+        /* exec: root takes every capability again, whatever it dropped; the
+           inheritable set stays; a user other than root has none. */
+        AS_SENDER(0, 0, 0, {
+            if (caps_set(0xf0, 0xff, 0x3)) _exit(90);
+            caps_exec(self);
+        });
+        AS_SENDER(0, 0, 0, {
+            if (caps_set(CAPS_ALL, CAPS_ALL, 0x3)) _exit(90);
+            if (prctl(PR_SET_KEEPCAPS, 1)) _exit(90);
+            if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(90);
+            caps_exec(self);
+        });
+        AS_SENDER(0, 0, 0, {
+            if (caps_set(0, 0, 0)) _exit(90);
+            caps_exec(self);
+        });
+        fflush(stdout);
+        unlink("theirs");
         if (chdir("/") || rmdir(dir)) return 89;
         return 0;
     }

@@ -220,6 +220,8 @@ fn a_finished_thread_leaves_no_task_ids_behind() {
     };
     k.group.set_task_ids(ct.tid, other);
     assert_eq!(k.group.task_ids(pid, ct.tid), other);
+    // A thread's ID names that thread, as `capget` finds it.
+    assert_eq!(k.processes.task_ids(ct.tid), Some(other));
     child.finish_thread(&ct, &m);
     assert_eq!(k.group.task_ids(pid, ct.tid), leader);
 }

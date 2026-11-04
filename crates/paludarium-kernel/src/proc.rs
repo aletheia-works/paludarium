@@ -169,7 +169,7 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         s.blocked,
         s.ignored,
         s.caught,
-        0,
+        c.inheritable,
         c.permitted,
         c.effective,
         0,
@@ -367,6 +367,7 @@ mod tests {
                 fsuid: 4,
                 groups: vec![5, 6],
                 effective: 0,
+                inheritable: 0x42,
                 ..crate::credentials::Credentials::default()
             },
         }))
@@ -384,6 +385,7 @@ mod tests {
             "Uid:\t1\t2\t3\t4\n",
             "Gid:\t0\t0\t0\t0\n",
             "Groups:\t5 6 \n",
+            "CapInh:\t0000000000000042\n",
             "CapPrm:\t000001ffffffffff\n",
             "CapEff:\t0000000000000000\n",
             "CapBnd:\t000001ffffffffff\n",

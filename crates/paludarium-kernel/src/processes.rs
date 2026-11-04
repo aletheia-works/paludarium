@@ -782,6 +782,15 @@ impl Processes {
     }
     /// The RLIMIT_CORE soft limit of `pid` when a fatal signal may dump its
     /// core: the process is dumpable and the limit is at least one page.
+    /// What another thread named by its ID looks like to the thread acting
+    /// on it, as `kill` finds it.
+    pub(crate) fn task_ids(&self, named: u32) -> Option<TaskIds> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let (&pid, entry) = entries.iter().find(|&(&key, entry)| {
+            key == named || (entry.status.is_none() && entry.group.has_member(named))
+        })?;
+        Some(entry.group.task_ids(pid, named))
+    }
     pub(crate) fn core_limit(&self, pid: u32) -> Option<u64> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = entries.get(&pid)?;

@@ -98,7 +98,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ディレクトリを共有していても（`CLONE_FS`）持ち主やグループになります。Linux なら
   `CAP_SETUID` がなければ実 ID を実効 ID にします。`/proc/self/status` は呼んだ
   スレッドの資格情報を示しますが、Linux はスレッドグループのリーダーのものを
-  示します。`capget` と `capset` は実装していません。
+  示します。`PR_CAPBSET_DROP` と `PR_CAP_AMBIENT` がないので、どのスレッドも
+  バウンディングセットにすべてのケーパビリティを持ち、アンビエントセットには持ちません。
 - **ソケットのメッセージ**：`sendmsg` と `recvmsg` は、Linux と同じように
   `SCM_RIGHTS` でディスクリプタを、`SCM_CREDENTIALS` で資格情報を受け渡します。
   違いは次のとおりです。

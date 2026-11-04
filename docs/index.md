@@ -16,7 +16,7 @@ hero:
       link: https://github.com/aletheia-works/paludarium
 features:
   - title: Unchanged Linux binaries
-    details: Runs statically linked x86-64 Linux programs, such as static-musl builds of C and Rust programs, without changing them.
+    details: Runs statically linked x86-64 Linux programs, such as static-musl builds of C and Rust programs, and those on musl's dynamic linker, without changing them.
     link: /guide/introduction
   - title: Linux, macOS, Windows and the browser
     details: The same ELF runs on three native hosts, in Node.js, and in Chromium, Firefox and Safari through WebAssembly.

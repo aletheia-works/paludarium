@@ -672,6 +672,7 @@ impl Kernel {
         if thread.tid != self.process.pid {
             self.group.forget_nice(thread.tid);
         }
+        self.group.forget_signal_ids(self.process.pid, thread.tid);
     }
     fn clear_child_tid(group: &ThreadGroup, mem: &AddressSpace, addr: u64) {
         if addr != 0 && mem.write(GuestAddr(addr), &0u32.to_le_bytes()).is_ok() {

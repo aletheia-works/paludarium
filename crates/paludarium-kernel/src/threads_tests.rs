@@ -1,4 +1,5 @@
 use super::*;
+use crate::credentials::SignalIds;
 use paludarium_mmu::{MappingKind, Prot};
 use paludarium_types::{Errno, GuestAddr};
 use std::sync::atomic::Ordering;
@@ -201,6 +202,26 @@ fn clear_child_tid_on_finish() {
     m.read(GuestAddr(DATA + 4), &mut b).unwrap();
     assert_eq!(b, [0; 4]);
     assert_eq!(k.group.active_threads(), 1);
+}
+#[test]
+fn a_finished_thread_leaves_no_signal_ids_behind() {
+    let mut k = kernel();
+    let mut t = thread();
+    let m = memory();
+    clone(&mut k, &mut t, &m, 0x10900);
+    let (mut child, ct) = k.take_child().unwrap();
+    let pid = k.process.pid;
+    let leader = k.group.signal_ids(pid, pid);
+    let other = SignalIds {
+        uid: 2000,
+        euid: 2000,
+        suid: 2000,
+        cap_kill: false,
+    };
+    k.group.set_signal_ids(ct.tid, other);
+    assert_eq!(k.group.signal_ids(pid, ct.tid), other);
+    child.finish_thread(&ct, &m);
+    assert_eq!(k.group.signal_ids(pid, ct.tid), leader);
 }
 #[test]
 fn individual_exit_does_not_stop_group() {

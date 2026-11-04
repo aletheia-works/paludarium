@@ -8115,7 +8115,9 @@ int main(int argc, char **argv) {
             permitted("thread-queue-leader", syscall(SYS_rt_tgsigqueueinfo, threaded, threaded, 0, &info));
         });
         signal_kill_reap(threaded);
-        /* si_uid: the sender's real user ID, not its effective one. */
+        /* si_uid: the sender's real user ID, not its effective one. Each signal
+           has been sent before it is looked for, since a wait's timeout does not
+           wait for another process on the emulator's virtual clock. */
         sigset_t usr1;
         sigemptyset(&usr1);
         sigaddset(&usr1, SIGUSR1);
@@ -8131,9 +8133,9 @@ int main(int argc, char **argv) {
                 kill(getppid(), SIGUSR1);
                 _exit(0);
             }
-            signal_seen("kill-uid", SIGUSR1, sender);
             int sender_status = 0;
             waitpid(sender, &sender_status, 0);
+            signal_seen("kill-uid", SIGUSR1, sender);
             /* A signal to itself, from the raw call. */
             syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR1);
             signal_seen("tgkill-self-uid", SIGUSR1, getpid());
@@ -8150,8 +8152,8 @@ int main(int argc, char **argv) {
             signal_main_thread = syscall(SYS_gettid);
             pthread_t t;
             if (pthread_create(&t, NULL, signal_thread_tkills, NULL)) _exit(80);
-            signal_seen("tgkill-sibling-uid", SIGUSR1, getpid());
             pthread_join(t, NULL);
+            signal_seen("tgkill-sibling-uid", SIGUSR1, getpid());
             fflush(stdout);
             _exit(0);
         }
@@ -8165,24 +8167,40 @@ int main(int argc, char **argv) {
             if (syscall(SYS_setresuid, 2000, 3000, 3000)) _exit(81);
             _exit(0);
         }
-        signal_seen("chld-uid", SIGCHLD, leaving);
         siginfo_t wait_info;
+        waitid(P_PID, leaving, &wait_info, WEXITED | WNOWAIT);
+        signal_seen("chld-uid", SIGCHLD, leaving);
         memset(&wait_info, 0, sizeof wait_info);
         waitid(P_PID, leaving, &wait_info, WEXITED);
         printf("waitid-uid: uid=%u code=%d\n", wait_info.si_uid, wait_info.si_code);
+        /* The child leaves only when told, so that SIGCHLD of its exit does not
+           merge with the pending one of its continuing. */
+        int leave[2];
+        if (pipe(leave)) return 88;
         fflush(stdout);
         pid_t stopping = child();
         if (stopping == 0) {
+            close(leave[1]);
             if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(82);
-            raise(SIGSTOP);
+            /* Not raise: after the raw fork glibc still has the parent's thread ID. */
+            kill(getpid(), SIGSTOP);
+            char byte;
+            if (read(leave[0], &byte, 1) < 0) _exit(89);
             _exit(0);
         }
+        close(leave[0]);
+        waitid(P_PID, stopping, &wait_info, WSTOPPED | WNOWAIT);
         signal_seen("chld-stop-uid", SIGCHLD, stopping);
         memset(&wait_info, 0, sizeof wait_info);
         waitid(P_PID, stopping, &wait_info, WSTOPPED);
         printf("waitid-stop-uid: uid=%u code=%d\n", wait_info.si_uid, wait_info.si_code);
         kill(stopping, SIGCONT);
+        waitid(P_PID, stopping, &wait_info, WCONTINUED | WNOWAIT);
         signal_seen("chld-cont-uid", SIGCHLD, stopping);
+        memset(&wait_info, 0, sizeof wait_info);
+        waitid(P_PID, stopping, &wait_info, WCONTINUED);
+        printf("waitid-cont-uid: uid=%u code=%d\n", wait_info.si_uid, wait_info.si_code);
+        close(leave[1]);
         waitpid(stopping, &status, 0);
         signal_seen("chld-after-cont-uid", SIGCHLD, stopping);
         sigprocmask(SIG_UNBLOCK, &usr1, NULL);
@@ -8210,6 +8228,8 @@ int main(int argc, char **argv) {
                     sigset_t wanted;
                     sigemptyset(&wanted);
                     sigaddset(&wanted, SIGUSR1);
+                    /* Its parent has gone before the signal is looked for. */
+                    while (getppid() == parent) sched_yield();
                     siginfo_t info;
                     struct timespec patience = {1, 0};
                     int got = sigtimedwait(&wanted, &info, &patience);

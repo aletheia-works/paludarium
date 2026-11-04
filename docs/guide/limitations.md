@@ -8,8 +8,8 @@ verified.
 - **Dynamically linked programs**: a program runs with its interpreter as on
   Linux, which musl's dynamic linker can do. glibc's cannot yet: it refuses to
   load `libc.so.6` on the virtual CPU, because it does not read the features
-  `CPUID` reports for a vendor it does not know, and it also needs instructions
-  that are not implemented. A session reads the interpreter and the libraries
+  `CPUID` reports for a vendor it does not know, and it also uses instructions
+  that are not implemented, such as `RDTSC`, `FXSAVE` and x87's. A session reads the interpreter and the libraries
   from its own files, so they must be mounted or given to it.
 - **32-bit x86, AVX, AVX-512, x87, MMX**: out of scope.
 - **Network**: without an allow list (`--allow-net`,

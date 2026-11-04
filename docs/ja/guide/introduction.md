@@ -1,8 +1,8 @@
 # paludarium とは
 
 paludarium は、Rust で書いた、ユーザーモードの x86-64 Linux エミュレータです。
-静的にリンクした x86-64 Linux のプログラム（static-musl のバイナリなど）を、
-変更せずに、Linux・macOS・Windows の上と、WebAssembly（Node.js とブラウザ）の上で動かします。
+静的にリンクした x86-64 Linux のプログラム（static-musl のバイナリなど）と、musl の
+動的リンカーを使うプログラムを、変更せずに、Linux・macOS・Windows の上と、WebAssembly（Node.js とブラウザ）の上で動かします。
 
 「ユーザーモード」とは、OS（カーネル）全体ではなく、プログラムが OS に頼む機能
 （システムコール）だけをまねる方式のことです。カーネルを起動しないので、軽く、

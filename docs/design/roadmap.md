@@ -23,7 +23,7 @@ Nothing here is a promise, but these are on the table:
   their next releases pass the guest audit (the current ones are held back
   by yanked crates and security advisories in their dependencies).
 - More system calls and instructions (see [Limitations](../guide/limitations)).
-- Considering dynamically linked programs.
+- Dynamically linked programs on glibc; musl's dynamic linker already runs.
 - Considering a native JIT.
 - Revisiting building with stable Rust.
 - Revisiting how much checking a release needs.

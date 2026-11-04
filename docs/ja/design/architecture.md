@@ -23,7 +23,7 @@ paludarium は、役割ごとに分けた crate でできています。依存�
 | `paludarium-mmu` | ソフトウェア MMU。4 KiB のページの 2 段のページテーブル |
 | `paludarium-host` | ホストとの境界（`Host` trait）と、Linux・macOS・Windows・WebAssembly の実装 |
 | `paludarium-vfs` | メモリ上の安全なファイルシステムと、ホストのディレクトリのマウント |
-| `paludarium-loader` | 静的な ELF の読み込みと、最初のスタック（argv・envp・補助ベクタ） |
+| `paludarium-loader` | ELF と、それが求めるインタプリタの読み込みと、最初のスタック（argv・envp・補助ベクタ） |
 | `paludarium-cpu` | x86-64 のインタプリタ |
 | `paludarium-jit` | コードキャッシュの口と、WebAssembly 向けの JIT |
 | `paludarium-kernel` | Linux のシステムコール。プロセスとスレッドの状態を持つ |

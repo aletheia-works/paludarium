@@ -1,8 +1,8 @@
 # What is paludarium?
 
 paludarium is a user-mode x86-64 Linux emulator written in Rust. It runs
-statically linked x86-64 Linux programs (such as static-musl binaries)
-unchanged on Linux, macOS and Windows, and in WebAssembly (Node.js and
+statically linked x86-64 Linux programs (such as static-musl binaries), and
+those on musl's dynamic linker, unchanged on Linux, macOS and Windows, and in WebAssembly (Node.js and
 browsers).
 
 *User mode* means that paludarium does not emulate a whole operating system.

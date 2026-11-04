@@ -853,6 +853,7 @@ fn fallocate(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         PUNCH_HOLE => d.file.zero_range(offset as u64, len as u64)?,
         _ => return Err(EOPNOTSUPP),
     }
+    crate::permissions::remove_set_ids(&c.process.credentials, &*d.file);
     Ok(0)
 }
 /// `close_range(first, last, flags)`, as Linux's ksys_close_range: the
@@ -956,6 +957,9 @@ fn copy_file_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Ok(0);
     }
     let copied = copy_bytes(&input.file, from, &output.file, to, count)?;
+    if copied > 0 {
+        crate::permissions::remove_set_ids(&c.process.credentials, &*output.file);
+    }
     for (pointer, file, start) in [(a[1], &input.file, from), (a[3], &output.file, to)] {
         if pointer != 0 {
             c.mem
@@ -1036,6 +1040,9 @@ fn send(
         let to = output.seek(0, 1)?;
         let count = count.min(size_room(c, to)?);
         let sent = copy_bytes(&input, from, &output, to, count)?;
+        if sent > 0 {
+            crate::permissions::remove_set_ids(&c.process.credentials, &*output);
+        }
         output.seek((to + sent) as i64, 0)?;
         sent
     } else {
@@ -1489,7 +1496,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.mem
                 .read(GuestAddr(a[1]), &mut b)
                 .map_err(|_| Errno::EFAULT)?;
-            write_at(&file, a[3], &b).map(|count| count as u64)
+            let written = write_at(&file, a[3], &b)?;
+            if written > 0 {
+                crate::permissions::remove_set_ids(&c.process.credentials, &*file);
+            }
+            Ok(written as u64)
         }
         19 => {
             let file = c.files.descriptor(a[0])?.file;
@@ -1530,7 +1541,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     .map_err(|_| Errno::EFAULT)?;
             }
             b.truncate(len);
-            write_at(&file, a[3], &b).map(|count| count as u64)
+            let written = write_at(&file, a[3], &b)?;
+            if written > 0 {
+                crate::permissions::remove_set_ids(&c.process.credentials, &*file);
+            }
+            Ok(written as u64)
         }
         22 | 293 => {
             let flags = if n == 22 {
@@ -1545,6 +1560,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 .check_write(GuestAddr(a[0]), 8)
                 .map_err(|_| Errno::EFAULT)?;
             let ends = crate::sockets::PipeEnd::pair(flags, Arc::clone(&c.files.readiness))?;
+            let creds = &c.process.credentials;
+            ends[0].set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
             let [first, second] = c.files.install_pair(
                 ends.map(|end| end as Arc<dyn FileHandle>),
                 flags & crate::events::CLOEXEC != 0,
@@ -1895,6 +1912,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return Err(Errno(27));
             }
             f.truncate(a[1])?;
+            crate::permissions::remove_set_ids(&c.process.credentials, &*f);
             Ok(0)
         }
         79 => {
@@ -2237,7 +2255,11 @@ pub(crate) fn write_io(
             socket.send(b, &mut Vec::new(), sender)
         });
     }
-    write_with(c, file, bytes, nosignal, false, |b| file.write(b))
+    let written = write_with(c, file, bytes, nosignal, false, |b| file.write(b))?;
+    if written > 0 {
+        crate::permissions::remove_set_ids(&c.process.credentials, &**file);
+    }
+    Ok(written)
 }
 /// [`write_io`] through `write`, which writes to `file`; with `dontwait`
 /// (`MSG_DONTWAIT`) it does not wait, as if `file` were nonblocking.
@@ -2909,7 +2931,12 @@ fn open_path(
             }
         }
     } else {
-        c.files.fs.open(p, flags, mode & !c.files.umask())?
+        let file = c.files.fs.open(p, flags, mode & !c.files.umask())?;
+        const O_TRUNC: u32 = 0o1000;
+        if flags & O_TRUNC != 0 && flags & O_PATH == 0 {
+            crate::permissions::remove_set_ids(&c.process.credentials, &*file);
+        }
+        file
     };
     Ok((file, p.to_vec()))
 }

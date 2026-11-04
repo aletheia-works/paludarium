@@ -404,6 +404,7 @@ pub(crate) fn socket(
         &c.files.readiness,
         flags,
     );
+    socket.own(c);
     if datagram {
         // `net.core.rmem_default` and `wmem_default`.
         let mut options = socket.options();
@@ -790,12 +791,21 @@ pub(crate) struct InetSocket {
     flags: AtomicU32,
     inode: u64,
     mode: AtomicU32,
+    /// `fchown`, and whose thread made it (`sock_alloc`).
+    uid: AtomicU32,
+    gid: AtomicU32,
     state: Mutex<State>,
     options: Mutex<Options>,
     signals: Arc<Signals>,
 }
 
 impl InetSocket {
+    /// The socket is the calling thread's.
+    fn own(&self, c: &Context<'_>) {
+        let creds = &c.process.credentials;
+        self.uid.store(creds.fsuid, Ordering::SeqCst);
+        self.gid.store(creds.fsgid, Ordering::SeqCst);
+    }
     fn new(
         family: Family,
         datagram: bool,
@@ -814,6 +824,8 @@ impl InetSocket {
             flags: AtomicU32::new(2 | (flags & NONBLOCK)),
             inode: crate::files::anonymous_inode(),
             mode: AtomicU32::new(0o140777),
+            uid: AtomicU32::new(0),
+            gid: AtomicU32::new(0),
             state: Mutex::new(State::default()),
             options: Mutex::new(Options::default()),
             signals: Arc::default(),
@@ -2119,6 +2131,8 @@ impl FileHandle for InetSocket {
         Ok(FileStat {
             inode: self.inode,
             mode: self.mode.load(Ordering::SeqCst),
+            uid: self.uid.load(Ordering::SeqCst),
+            gid: self.gid.load(Ordering::SeqCst),
             links: 1,
             ..FileStat::default()
         })
@@ -2126,6 +2140,15 @@ impl FileHandle for InetSocket {
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         self.mode
             .store(0o140000 | (mode & 0o7777), Ordering::SeqCst);
+        Ok(())
+    }
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        if let Some(uid) = uid {
+            self.uid.store(uid, Ordering::SeqCst);
+        }
+        if let Some(gid) = gid {
+            self.gid.store(gid, Ordering::SeqCst);
+        }
         Ok(())
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
@@ -2470,6 +2493,7 @@ fn accept(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6], flags: u64) -> 
             return Err(e);
         }
     };
+    child.own(c);
     if flags & u64::from(NONBLOCK) != 0 {
         child.flags.store(2 | NONBLOCK, Ordering::SeqCst);
     }

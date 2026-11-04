@@ -499,11 +499,17 @@ kernel.
   it may not read runs undumpable. As on Linux, `chown` takes the
   set-user-ID bit from a file that is not a directory, and the set-group-ID
   bit when the group may execute it or the caller is neither in its group
-  nor holds `CAP_FSETID`, even when the owner and group stay.
+  nor holds `CAP_FSETID`, even when the owner and group stay. A write or a
+  truncation by a thread without `CAP_FSETID` takes the same from a regular
+  file, but a set-group-ID bit without group execution stays for a member of
+  its group. An `AF_UNIX` socket file needs what any new file needs and takes
+  the caller's filesystem IDs, and `connect` or `sendto` to one needs permission
+  to write the file the path names, before it looks at the file's type.
   What is made in a set-group-ID directory takes the directory's group, and a
   new directory the bit as well. `fchmod` and `fchown` also change the mode
   and owner that `fstat` reports for a pipe made by `pipe` or `pipe2`, whose
-  two ends share them, and for each end of a socket pair. Standard input,
+  two ends share them, and for each socket, which start as the filesystem IDs
+  of the thread that made them, or that accepted a connection. Standard input,
   output and error, which the host provides, give `EPERM`.
 - `chmod` and `utimensat` work in the in-memory filesystem and in mounted
   host directories; on a Windows host, `chmod` only sets or clears the

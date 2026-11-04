@@ -18,7 +18,9 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <stddef.h>
 #include <sys/mman.h>
+#include <sys/sendfile.h>
 #include <sys/resource.h>
 #include <sys/vfs.h>
 #include <sys/prctl.h>
@@ -1388,6 +1390,120 @@ static void core_credentials_report(const char *name, pid_t pid) {
     printf("\n");
     fflush(stdout);
     free(b);
+}
+/* The set-id-writes case: what `change` does to a file of user 2000, whose
+   group is `gid` and whose mode is `mode`, done with the IDs of user 2000 and
+   group 2100 in a child; and the file's mode then, read as root. */
+static long set_id_change(const char *way, int fd) {
+    char buffer[1] = {'x'};
+    struct iovec iov = {buffer, 1};
+    if (!strcmp(way, "write")) return write(fd, buffer, 1);
+    if (!strcmp(way, "write-empty")) return write(fd, buffer, 0);
+    if (!strcmp(way, "pwrite")) return pwrite(fd, buffer, 1, 0);
+    if (!strcmp(way, "pwrite-empty")) return pwrite(fd, buffer, 0, 0);
+    if (!strcmp(way, "writev")) return writev(fd, &iov, 1);
+    if (!strcmp(way, "pwritev")) return pwritev(fd, &iov, 1, 0);
+    if (!strcmp(way, "ftruncate")) return ftruncate(fd, 0);
+    if (!strcmp(way, "ftruncate-same")) return ftruncate(fd, 4);
+    if (!strcmp(way, "truncate")) return truncate("f", 0);
+    if (!strcmp(way, "open-trunc")) return open("f", O_WRONLY | O_TRUNC);
+    if (!strcmp(way, "open-read")) return open("f", O_RDONLY);
+    if (!strcmp(way, "fallocate")) return fallocate(fd, 0, 0, 16);
+    if (!strcmp(way, "sendfile") || !strcmp(way, "copy_file_range")) {
+        int from = open("from", O_RDONLY);
+        if (from < 0) return -1;
+        return !strcmp(way, "sendfile") ? sendfile(fd, from, NULL, 1)
+                                        : copy_file_range(from, NULL, fd, NULL, 1, 0);
+    }
+    if (!strcmp(way, "chown-self")) return fchown(fd, -1, -1);
+    if (!strcmp(way, "mmap")) {
+        char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED) return -1;
+        *p = 'y';
+        return msync(p, 4096, MS_SYNC);
+    }
+    return -2;
+}
+static void set_id_case(const char *way, unsigned mode, unsigned gid, unsigned uid) {
+    unlink("f");
+    int made = open("f", O_CREAT | O_WRONLY, 0666);
+    if (made < 0 || write(made, "data", 4) != 4 || fchown(made, 2000, gid) || fchmod(made, mode)) _exit(80);
+    close(made);
+    fflush(stdout);
+    pid_t pid = child();
+    if (pid == 0) {
+        int fd = open("f", O_RDWR);
+        if (fd < 0) _exit(81);
+        if (uid != 0) {
+            if (syscall(SYS_setresgid, 2100, 2100, 2100)) _exit(82);
+            if (syscall(SYS_setresuid, uid, uid, uid)) _exit(83);
+        }
+        long result = set_id_change(way, fd);
+        _exit(result < 0 ? 1 : 0);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    struct stat st;
+    if (stat("f", &st)) _exit(84);
+    printf("%s %o gid=%u uid=%u: exit=%d mode=%o\n", way, mode, gid, uid, WEXITSTATUS(status),
+           (unsigned)(st.st_mode & 07777));
+}
+/* The socket-owners case: the owner and mode of what `fd` is. */
+static void owner_show(const char *name, int fd) {
+    struct stat st;
+    if (fd < 0) {
+        printf("%s: %s\n", name, strerror(errno));
+        return;
+    }
+    if (fstat(fd, &st)) {
+        printf("%s: stat %s\n", name, strerror(errno));
+        return;
+    }
+    printf("%s: uid=%u gid=%u mode=%o\n", name, (unsigned)st.st_uid, (unsigned)st.st_gid, (unsigned)st.st_mode);
+}
+static void path_show(const char *name, const char *path) {
+    struct stat st;
+    if (lstat(path, &st)) {
+        printf("%s: %s\n", name, strerror(errno));
+        return;
+    }
+    printf("%s: uid=%u gid=%u mode=%o\n", name, (unsigned)st.st_uid, (unsigned)st.st_gid, (unsigned)st.st_mode);
+}
+static socklen_t socket_path(struct sockaddr_un *a, const char *path) {
+    memset(a, 0, sizeof *a);
+    a->sun_family = AF_UNIX;
+    strcpy(a->sun_path, path);
+    return offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1;
+}
+static long socket_bind(int type, const char *path) {
+    struct sockaddr_un a;
+    socklen_t len = socket_path(&a, path);
+    int s = socket(AF_UNIX, type, 0);
+    if (s < 0) return -1;
+    if (bind(s, (void *)&a, len)) return -1;
+    return s;
+}
+static long socket_connect(const char *path) {
+    struct sockaddr_un a;
+    socklen_t len = socket_path(&a, path);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    long result = connect(s, (void *)&a, len);
+    int saved = errno;
+    close(s);
+    errno = saved;
+    return result;
+}
+static long socket_sendto(const char *path) {
+    struct sockaddr_un a;
+    socklen_t len = socket_path(&a, path);
+    int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    long result = sendto(s, "x", 1, MSG_DONTWAIT, (void *)&a, len);
+    int saved = errno;
+    close(s);
+    errno = saved;
+    return result;
 }
 /* The limit-permissions case: a process that waits with the given IDs. */
 static pid_t limit_target(unsigned real, unsigned effective, unsigned saved, unsigned gid,
@@ -8605,6 +8721,168 @@ int main(int argc, char **argv) {
             _exit(70);
         }
         core_credentials_report("root", root);
+        if (chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "set-id-writes")) {
+        /* A change to a regular file takes its set-user-ID bit, and its
+           set-group-ID bit with group execution or outside its group, from a
+           writer without CAP_FSETID (file_remove_privs, do_truncate). */
+        char dir[] = "/tmp/set-id-writes-XXXXXX";
+        if (!mkdtemp(dir) || chdir(dir)) return 80;
+        umask(022);
+        /* sudo leaves root's group among the supplementary ones. */
+        if (setgroups(0, NULL)) return 80;
+        if (chmod(".", 0777)) return 80;
+        int from = open("from", O_CREAT | O_WRONLY, 0666);
+        if (from < 0 || write(from, "x", 1) != 1) return 80;
+        close(from);
+        static const char *const ways[] = {
+            "write", "write-empty", "pwrite", "pwrite-empty", "writev", "pwritev", "ftruncate",
+            "ftruncate-same", "truncate", "open-trunc", "open-read", "fallocate", "sendfile",
+            "copy_file_range", "chown-self", "mmap",
+        };
+        for (size_t i = 0; i < sizeof ways / sizeof *ways; i++) {
+            set_id_case(ways[i], 06755, 2100, 2000);
+        }
+        set_id_case("write", 04644, 2100, 2000);
+        set_id_case("write", 02755, 2100, 2000);
+        /* Without group execution the bit stays for a member of the group. */
+        set_id_case("write", 02645, 2100, 2000);
+        set_id_case("write", 02645, 4100, 2000);
+        set_id_case("ftruncate", 02645, 2100, 2000);
+        set_id_case("ftruncate", 02645, 4100, 2000);
+        set_id_case("write", 0644, 2100, 2000);
+        /* Another writer, by the others' bits. */
+        set_id_case("write", 06777, 4100, 3000);
+        /* Root has CAP_FSETID. */
+        set_id_case("write", 06755, 2100, 0);
+        set_id_case("ftruncate", 06755, 2100, 0);
+        set_id_case("open-trunc", 06755, 2100, 0);
+        unlink("f");
+        unlink("from");
+        if (chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "socket-owners")) {
+        /* A pipe or socket belongs to the thread that made it, by its
+           filesystem IDs (get_pipe_inode, sock_alloc); a socket file too, with
+           the permissions of mknod, and connecting needs to write what the
+           path names (unix_find_bsd). */
+        char dir[] = "/tmp/socket-owners-XXXXXX";
+        if (!mkdtemp(dir) || chdir(dir)) return 80;
+        umask(022);
+        /* sudo leaves root's group among the supplementary ones. */
+        if (setgroups(0, NULL)) return 80;
+        if (chmod(".", 0777)) return 80;
+        int fds[2];
+        if (pipe(fds)) return 80;
+        owner_show("pipe-root", fds[0]);
+        if (mkdir("closed", 0700) || mkdir("nosearch", 0776) || chmod("nosearch", 0776)) return 80;
+        if (socket_bind(SOCK_STREAM, "closed/s") < 0) return 80;
+        struct sockaddr_un a;
+        socklen_t len = socket_path(&a, "listening");
+        int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (listener < 0 || bind(listener, (void *)&a, len) || listen(listener, 8)) return 80;
+        path_show("listening", "listening");
+        long dgram = socket_bind(SOCK_DGRAM, "dgram");
+        if (dgram < 0 || chmod("dgram", 0777)) return 80;
+        int plain = open("plain", O_CREAT | O_WRONLY, 0644);
+        if (plain < 0) return 80;
+        close(plain);
+        int writable = open("writable", O_CREAT | O_WRONLY, 0666);
+        if (writable < 0 || fchmod(writable, 0666)) return 80;
+        close(writable);
+        if (mkdir("group-dir", 0777) || chown("group-dir", 0, 4100) || chmod("group-dir", 02777)) return 80;
+        if (mkdir("no-write", 0755)) return 80;
+        AS_SENDER(0, 0, 0, {
+            peer_ids_leave_root();
+            int p[2], sv[2];
+            if (pipe(p) || socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) _exit(90);
+            owner_show("pipe-read", p[0]);
+            owner_show("pipe-write", p[1]);
+            owner_show("pair", sv[0]);
+            owner_show("pair-other", sv[1]);
+            owner_show("unix", socket(AF_UNIX, SOCK_DGRAM, 0));
+            /* A write takes nothing from what is not a regular file. */
+            permitted("pipe-chmod", fchmod(p[1], 04600));
+            permitted("pipe-write-set-id", write(p[1], "x", 1));
+            owner_show("pipe-set-id", p[0]);
+            /* A socket file: the filesystem IDs, the umask, and the rules of
+               making a file there. */
+            permitted("bind-own", socket_bind(SOCK_STREAM, "own"));
+            path_show("own", "own");
+            permitted("bind-group-dir", socket_bind(SOCK_STREAM, "group-dir/s"));
+            path_show("group-dir/s", "group-dir/s");
+            permitted("bind-no-write", socket_bind(SOCK_STREAM, "no-write/s"));
+            permitted("bind-no-search", socket_bind(SOCK_STREAM, "closed/other"));
+            permitted("bind-nosearch-write", socket_bind(SOCK_STREAM, "nosearch/s"));
+            permitted("bind-exists", socket_bind(SOCK_STREAM, "own"));
+            permitted("bind-missing-dir", socket_bind(SOCK_STREAM, "missing/s"));
+            if (syscall(SYS_setfsuid, 3000) < 0 || syscall(SYS_setfsgid, 3100) < 0) _exit(90);
+            if (pipe(p)) _exit(90);
+            owner_show("pipe-fsuid", p[0]);
+            permitted("bind-fsuid", socket_bind(SOCK_STREAM, "fs"));
+            path_show("fs", "fs");
+        });
+        /* Connecting as another user: the file's bits, before its type. */
+        AS_SENDER(0, 0, 0, {
+            if (syscall(SYS_setresgid, 5100, 5100, 5100)) _exit(90);
+            if (syscall(SYS_setresuid, 5000, 5000, 5000)) _exit(90);
+            permitted("connect-not-writable", socket_connect("listening"));
+            permitted("connect-plain-not-writable", socket_connect("plain"));
+            permitted("connect-plain-writable", socket_connect("writable"));
+            permitted("connect-dir", socket_connect("no-write"));
+            permitted("connect-no-search", socket_connect("closed/s"));
+            permitted("connect-missing", socket_connect("missing"));
+            permitted("sendto-writable", socket_sendto("dgram"));
+            permitted("sendto-plain", socket_sendto("plain"));
+        });
+        if (chmod("listening", 0777)) return 80;
+        AS_SENDER(0, 0, 0, {
+            if (syscall(SYS_setresgid, 5100, 5100, 5100)) _exit(90);
+            if (syscall(SYS_setresuid, 5000, 5000, 5000)) _exit(90);
+            permitted("connect-writable", socket_connect("listening"));
+        });
+        /* The owner by the owner's bits; root whatever the bits. */
+        if (chmod("listening", 0200) || chown("listening", 5000, 5100)) return 80;
+        AS_SENDER(0, 0, 0, {
+            if (syscall(SYS_setresgid, 5100, 5100, 5100)) _exit(90);
+            if (syscall(SYS_setresuid, 5000, 5000, 5000)) _exit(90);
+            permitted("connect-owner", socket_connect("listening"));
+        });
+        if (chmod("listening", 0)) return 80;
+        permitted("connect-root", socket_connect("listening"));
+        /* What accept gives belongs to the one who accepts, not who connected. */
+        int waiting = accept(listener, NULL, NULL);
+        owner_show("accepted-root", waiting);
+        if (chmod("listening", 0777)) return 80;
+        fflush(stdout);
+        pid_t client = child();
+        if (client == 0) {
+            if (socket_connect("listening")) _exit(91);
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(client, &status, 0);
+        AS_SENDER(0, 0, 0, {
+            peer_ids_leave_root();
+            int accepted = accept(listener, NULL, NULL);
+            owner_show("accepted-user", accepted);
+        });
+        fflush(stdout);
+        if (!fork()) {
+            /* Clean what the cases left, as root, whatever their modes. */
+            static const char *const files[] = {
+                "closed/s", "closed/other", "listening", "dgram", "plain", "writable", "own", "fs",
+                "group-dir/s", "no-write/s", "nosearch/s", "from",
+            };
+            for (size_t i = 0; i < sizeof files / sizeof *files; i++) unlink(files[i]);
+            static const char *const dirs[] = {"closed", "nosearch", "group-dir", "no-write"};
+            for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) rmdir(dirs[i]);
+            _exit(0);
+        }
+        wait(NULL);
         if (chdir("/") || rmdir(dir)) return 89;
         return 0;
     }

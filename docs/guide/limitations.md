@@ -101,10 +101,7 @@ verified.
   The `PR_SET_PDEATHSIG` signal is sent when the parent process ends, with the
   IDs of its leader, where Linux sends it when the thread that made the child
   ends, with that thread's. Of the files, those under `/proc` and `/dev` are
-  not checked; an AF_UNIX socket file is made root's, and connecting to one
-  does not check writing it; pipes and socket pairs belong to root; writing
-  a file does not take away its set-user-ID and set-group-ID bits, as Linux
-  does for a writer without `CAP_FSETID`; and `fs.protected_hardlinks`,
+  not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
   act as 0, the kernel's defaults, which many distributions raise. `execve`
   reads no file capabilities (`security.capability`), no mount is

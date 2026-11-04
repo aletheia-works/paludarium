@@ -132,6 +132,10 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 pub(crate) fn pair(c: &Context<'_>, kind: u32) -> Result<[Arc<UnixSocket>; 2], Errno> {
     let ends = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
     ends[0].clock_from(c.shared_host);
+    let creds = &c.process.credentials;
+    for end in &ends {
+        end.set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
+    }
     let names = [Address::default(), Address::default()];
     let sockets: [Arc<UnixSocket>; 2] = std::array::from_fn(|side| {
         let end = Arc::clone(&ends[side]);
@@ -280,6 +284,7 @@ pub(crate) fn validate(address: &[u8]) -> Result<(), Errno> {
 pub(crate) fn find(c: &Context<'_>, address: &[u8], kind: u32) -> Result<Arc<UnixSocket>, Errno> {
     let name = &address[SUN_PATH..];
     if name[0] != 0 {
+        crate::permissions::connect(c.files, &c.process.credentials, &path_of(name))?;
         let path = c.files.exec_path(path_of(name))?;
         let stat = c.files.fs.metadata(&path, true)?;
         if stat.mode & 0o170000 != 0o140000 {
@@ -318,6 +323,8 @@ fn inode(c: &Context<'_>, path: &[u8], inode: u64) -> Inode {
 impl UnixSocket {
     fn new(c: &Context<'_>, kind: u32) -> Result<Arc<Self>, Errno> {
         let [end, spare] = SocketPairEnd::pair(kind, Arc::clone(&c.files.readiness))?;
+        let creds = &c.process.credentials;
+        end.set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
         // SO_PEERCRED names no process until the socket listens or
         // connects; a datagram socket has no use for the other end.
         let datagram = kind & 0xf == SOCK_DGRAM;
@@ -395,12 +402,18 @@ impl UnixSocket {
     /// not is that error; a socket already bound then takes the file away
     /// again and is `EINVAL`. Its name is the path, ended with a 0.
     fn bind_path(&self, c: &Context<'_>, path: &[u8]) -> Result<(), Errno> {
+        const AT_FDCWD: u64 = -100i64 as u64;
+        let creds = &c.process.credentials;
+        let parent = crate::permissions::create(c.files, creds, AT_FDCWD, path)?;
         let full = c.files.exec_path(path.to_vec())?;
         let stat = c
             .files
             .fs
             .make_socket(&full, 0o777 & !c.files.umask())
             .map_err(|e| if e == Errno::EEXIST { EADDRINUSE } else { e })?;
+        if let Some(parent) = parent {
+            crate::permissions::own(c.files, creds, &full, false, &parent);
+        }
         let key = inode(c, &full, stat.inode);
         let mut s = self.lock();
         if self.name.get().is_some() {
@@ -702,6 +715,9 @@ impl UnixSocket {
             if let Some(child) = child {
                 // A connect waiting for room may now find it.
                 self.hub.changed();
+                // The socket accept makes is the caller's (`sock_alloc`).
+                let creds = &c.process.credentials;
+                child.end.set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
                 return Ok(child);
             }
             if self.flags() & NONBLOCK != 0 {

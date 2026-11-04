@@ -89,11 +89,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `SIGIO` と `SIGURG` は、Linux の `sigio_perm` と違い、だれが設定しても持ち主に届きます。
   `PR_SET_PDEATHSIG` のシグナルは、親プロセスが終わったときにそのリーダーの ID で送りますが、
   Linux は子を作ったスレッドが終わったときにそのスレッドの ID で送ります。
-  ファイルのうち、`/proc` と `/dev` の下は確かめません。AF_UNIX の
-  ソケットファイルは root のものとして作り、つなぐときに書き込みの許可を
-  確かめません。パイプとソケットペアは root のものです。ファイルに書いても、
-  Linux が `CAP_FSETID` のない書き手についてするようには set-user-ID と
-  set-group-ID のビットを外しません。`fs.protected_hardlinks`、
+  ファイルのうち、`/proc` と `/dev` の下は確かめません。`fs.protected_hardlinks`、
   `fs.protected_symlinks`、`fs.protected_fifos`、`fs.protected_regular` は、
   カーネルの既定値の 0 として振る舞います。多くのディストリビューションは
   これらを上げています。`execve` はファイルのケーパビリティ

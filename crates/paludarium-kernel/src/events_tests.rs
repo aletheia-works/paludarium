@@ -2857,6 +2857,205 @@ fn a_stream_reader_stops_where_the_real_ids_change() {
     assert_eq!(f.ret(0, [b, BYTES, 2, 0, 0, 0]), 1);
     assert_eq!(f.ret(0, [b, BYTES, 2, 0, 0, 0]), 1);
 }
+/// `fstat` of `fd`: its mode, user and group.
+fn mode_and_owner(f: &mut Fixture, fd: u64) -> [u32; 3] {
+    assert_eq!(f.ret(5, [fd, DATA + 0x400, 0, 0, 0, 0]), 0);
+    [24, 28, 32].map(|at| {
+        let mut raw = [0; 4];
+        f.mem.read(GuestAddr(DATA + 0x400 + at), &mut raw).unwrap();
+        u32::from_le_bytes(raw)
+    })
+}
+#[test]
+fn pipes_and_sockets_belong_to_the_thread_that_made_them() {
+    let mut f = Fixture::new();
+    let (r, _) = pair(&mut f, 293, [DATA + 8, 0, 0, 0, 0, 0]);
+    assert_eq!(mode_and_owner(&mut f, r)[1..], [0, 0]);
+    leave_root(&mut f);
+    let (r, w) = pair(&mut f, 293, [DATA + 8, 0, 0, 0, 0, 0]);
+    assert_eq!(mode_and_owner(&mut f, r), [0o010600, 2000, 2100]);
+    assert_eq!(mode_and_owner(&mut f, w), [0o010600, 2000, 2100]);
+    let (a, b) = pair(&mut f, 53, [1, 1, 0, DATA, 0, 0]);
+    assert_eq!(mode_and_owner(&mut f, a)[1..], [2000, 2100]);
+    assert_eq!(mode_and_owner(&mut f, b)[1..], [2000, 2100]);
+    let unix = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    assert_eq!(mode_and_owner(&mut f, unix)[1..], [2000, 2100]);
+    // The filesystem IDs count, not the effective ones.
+    assert_eq!(f.ret(122, [3000, 0, 0, 0, 0, 0]), 2000);
+    assert_eq!(f.ret(123, [3100, 0, 0, 0, 0, 0]), 2100);
+    let (r, _) = pair(&mut f, 293, [DATA + 8, 0, 0, 0, 0, 0]);
+    assert_eq!(mode_and_owner(&mut f, r)[1..], [3000, 3100]);
+}
+#[test]
+fn an_inet_socket_belongs_to_the_thread_that_made_it_and_changes_owner() {
+    let mut f = network_fixture(&["127.0.0.1:80"]);
+    leave_root(&mut f);
+    let socket = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(mode_and_owner(&mut f, socket), [0o140777, 2000, 2100]);
+    // Its owner keeps its user and takes a group it is in.
+    assert_eq!(f.ret(93, [socket, 2000, 2100, 0, 0, 0]), 0);
+    assert_eq!(
+        f.ret(93, [socket, 4000, u64::MAX, 0, 0, 0]),
+        Errno(1).to_syscall_return()
+    );
+    assert_eq!(mode_and_owner(&mut f, socket)[1..], [2000, 2100]);
+}
+#[test]
+fn a_socket_file_belongs_to_its_binder_who_needs_the_directory() {
+    let mut f = Fixture::new();
+    let address = |f: &mut Fixture, name: &[u8]| {
+        let mut raw = vec![1, 0];
+        raw.extend_from_slice(name);
+        raw.push(0);
+        f.mem.write(GuestAddr(DATA + 0x100), &raw).unwrap();
+        raw.len() as u64
+    };
+    let fs = std::sync::Arc::clone(&f.kernel.files.fs);
+    fs.set_mode(b"/", 0o777).unwrap();
+    leave_root(&mut f);
+    let socket = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    let len = address(&mut f, b"/mine");
+    assert_eq!(f.ret(49, [socket, DATA + 0x100, len, 0, 0, 0]), 0);
+    let stat = fs.metadata(b"/mine", false).unwrap();
+    assert_eq!([stat.uid, stat.gid], [2000, 2100]);
+    // No write permission on the directory, and none to search it.
+    let other = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    let len = address(&mut f, b"/refused");
+    fs.set_mode(b"/", 0o755).unwrap();
+    assert_eq!(
+        f.ret(49, [other, DATA + 0x100, len, 0, 0, 0]),
+        Errno::EACCES.to_syscall_return()
+    );
+    assert!(fs.metadata(b"/refused", false).is_err());
+    // It exists, whatever the directory.
+    let len = address(&mut f, b"/mine");
+    assert_eq!(
+        f.ret(49, [other, DATA + 0x100, len, 0, 0, 0]),
+        Errno(98).to_syscall_return()
+    );
+}
+#[test]
+fn connecting_needs_permission_to_write_what_the_path_names() {
+    let mut f = Fixture::new();
+    let fs = std::sync::Arc::clone(&f.kernel.files.fs);
+    let address = |f: &mut Fixture, name: &[u8]| {
+        let mut raw = vec![1, 0];
+        raw.extend_from_slice(name);
+        raw.push(0);
+        f.mem.write(GuestAddr(DATA + 0x100), &raw).unwrap();
+        raw.len() as u64
+    };
+    let listener = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    let len = address(&mut f, b"/s");
+    assert_eq!(f.ret(49, [listener, DATA + 0x100, len, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [listener, 1, 0, 0, 0, 0]), 0);
+    fs.set_mode(b"/s", 0o755).unwrap();
+    fs.open(b"/r", 0o101, 0o644).unwrap();
+    leave_root(&mut f);
+    let client = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    let fail = |e: i32| Errno(e).to_syscall_return();
+    assert_eq!(f.ret(42, [client, DATA + 0x100, len, 0, 0, 0]), fail(13));
+    // The file's permission comes before whether it is a socket.
+    let other = address(&mut f, b"/r");
+    assert_eq!(f.ret(42, [client, DATA + 0x100, other, 0, 0, 0]), fail(13));
+    fs.set_mode(b"/r", 0o666).unwrap();
+    assert_eq!(f.ret(42, [client, DATA + 0x100, other, 0, 0, 0]), fail(111));
+    let len = address(&mut f, b"/s");
+    fs.set_mode(b"/s", 0o777).unwrap();
+    assert_eq!(f.ret(42, [client, DATA + 0x100, len, 0, 0, 0]), 0);
+}
+/// A file `/f` with `mode` and the group `gid`, belonging to user 2000, open
+/// to read and write once the thread has left root.
+fn set_id_file(f: &mut Fixture, mode: u32, gid: u32) -> u64 {
+    f.mem.write(GuestAddr(DATA + 0x300), b"/f\0").unwrap();
+    let fd = f.ret(2, [DATA + 0x300, 0o102, 0o777, 0, 0, 0]);
+    let fs = &f.kernel.files.fs;
+    fs.set_mode(b"/f", mode).unwrap();
+    fs.set_owner(b"/f", true, Some(2000), Some(gid)).unwrap();
+    fd
+}
+fn file_mode(f: &Fixture) -> u32 {
+    f.kernel.files.fs.metadata(b"/f", false).unwrap().mode & 0o7777
+}
+#[test]
+fn what_a_write_takes_from_a_file_depends_on_its_bits_and_group() {
+    for (mode, gid, left) in [
+        (0o6755, 2100, 0o0755),
+        (0o4644, 2100, 0o0644),
+        (0o2755, 2100, 0o0755),
+        // Without group execution, the set-group-ID bit stays for a member.
+        (0o2645, 2100, 0o2645),
+        (0o2645, 4100, 0o0645),
+        (0o0644, 2100, 0o0644),
+    ] {
+        let mut f = Fixture::new();
+        let fd = set_id_file(&mut f, mode, gid);
+        leave_root(&mut f);
+        assert_eq!(f.ret(1, [fd, BYTES, 0, 0, 0, 0]), 0);
+        assert_eq!(file_mode(&f), mode, "an empty write takes nothing");
+        assert_eq!(f.ret(1, [fd, BYTES, 1, 0, 0, 0]), 1);
+        assert_eq!(file_mode(&f), left, "{mode:o} {gid}");
+    }
+}
+#[test]
+fn a_write_takes_nothing_from_what_is_not_a_regular_file() {
+    let mut f = Fixture::new();
+    leave_root(&mut f);
+    let (r, w) = pair(&mut f, 293, [DATA + 8, 0, 0, 0, 0, 0]);
+    assert_eq!(f.ret(91, [w, 0o4600, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(1, [w, BYTES, 1, 0, 0, 0]), 1);
+    assert_eq!(mode_and_owner(&mut f, r)[0], 0o014600);
+}
+#[test]
+fn every_way_of_changing_a_file_takes_its_set_id_bits() {
+    type Way = fn(&mut Fixture, u64) -> u64;
+    let ways: [(&str, Way); 8] = [
+        ("pwrite", |f, fd| f.ret(18, [fd, BYTES, 1, 0, 0, 0])),
+        ("ftruncate", |f, fd| f.ret(77, [fd, 0, 0, 0, 0, 0])),
+        ("truncate", |f, _| f.ret(76, [DATA + 0x300, 0, 0, 0, 0, 0])),
+        ("O_TRUNC", |f, _| {
+            let fd = f.ret(2, [DATA + 0x300, 0o1001, 0, 0, 0, 0]);
+            assert!((fd as i64) >= 0);
+            0
+        }),
+        ("fallocate", |f, fd| f.ret(285, [fd, 0, 0, 10, 0, 0])),
+        ("writev", |f, fd| {
+            let iov = [BYTES.to_le_bytes(), 1u64.to_le_bytes()].concat();
+            f.mem.write(GuestAddr(DATA + 0x500), &iov).unwrap();
+            f.ret(20, [fd, DATA + 0x500, 1, 0, 0, 0])
+        }),
+        ("sendfile", |f, fd| {
+            f.mem.write(GuestAddr(DATA + 0x340), b"/g\0").unwrap();
+            let from = f.ret(2, [DATA + 0x340, 0o102, 0o666, 0, 0, 0]);
+            assert_eq!(f.ret(1, [from, BYTES, 1, 0, 0, 0]), 1);
+            f.ret(40, [fd, from, DATA + 0x348, 1, 0, 0])
+        }),
+        ("copy_file_range", |f, fd| {
+            f.mem.write(GuestAddr(DATA + 0x340), b"/g\0").unwrap();
+            let from = f.ret(2, [DATA + 0x340, 0o102, 0o666, 0, 0, 0]);
+            assert_eq!(f.ret(1, [from, BYTES, 1, 0, 0, 0]), 1);
+            f.mem
+                .write(GuestAddr(DATA + 0x348), &0u64.to_le_bytes())
+                .unwrap();
+            f.ret(326, [from, DATA + 0x348, fd, 0, 1, 0]);
+            0
+        }),
+    ];
+    for (name, way) in ways {
+        let mut f = Fixture::new();
+        f.kernel.files.fs.set_mode(b"/", 0o777).unwrap();
+        let fd = set_id_file(&mut f, 0o6755, 2100);
+        leave_root(&mut f);
+        way(&mut f, fd);
+        assert_eq!(file_mode(&f), 0o0755, "{name}");
+    }
+    // CAP_FSETID keeps them.
+    let mut f = Fixture::new();
+    let fd = set_id_file(&mut f, 0o6755, 2100);
+    assert_eq!(f.ret(1, [fd, BYTES, 1, 0, 0, 0]), 1);
+    assert_eq!(f.ret(77, [fd, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(file_mode(&f), 0o6755);
+}
 #[test]
 fn scm_rights_checks_like_linux() {
     let mut f = Fixture::new();

@@ -46,6 +46,8 @@
     {"name":"setuid","binary":"process"},
     {"name":"signal-permissions","binary":"process"},
     {"name":"limit-permissions","binary":"process"},
+    {"name":"set-id-writes","binary":"process"},
+    {"name":"socket-owners","binary":"process"},
     {"name":"peer-credentials","binary":"process"},
     {"name":"core-credentials","binary":"process"},
     {"name":"waitid","binary":"process"},

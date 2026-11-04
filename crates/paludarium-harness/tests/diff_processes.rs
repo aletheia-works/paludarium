@@ -123,8 +123,8 @@ mod linux {
             let self_path = program.to_str().unwrap().to_owned();
             let args = [mode.to_owned(), self_path.clone()];
             // The credentials, permissions, setuid, signal-permissions,
-            // limit-permissions, peer-credentials and core-credentials cases
-            // change IDs as root, so Linux runs them as root, through sudo when
+            // limit-permissions, peer-credentials, core-credentials, set-id-writes
+            // and socket-owners cases change IDs as root, so Linux runs them as root, through sudo when
             // the tests do not run as root.
             let as_root = matches!(
                 mode,
@@ -135,6 +135,8 @@ mod linux {
                     | "limit-permissions"
                     | "peer-credentials"
                     | "core-credentials"
+                    | "set-id-writes"
+                    | "socket-owners"
             );
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
@@ -222,6 +224,8 @@ mod linux {
         processes_setuid => ("setuid","process"),
         processes_signal_permissions => ("signal-permissions","process"),
         processes_limit_permissions => ("limit-permissions","process"),
+        processes_set_id_writes => ("set-id-writes","process"),
+        processes_socket_owners => ("socket-owners","process"),
         processes_peer_credentials => ("peer-credentials","process"),
         processes_core_credentials => ("core-credentials","process"),
         processes_waitid => ("waitid","process"),

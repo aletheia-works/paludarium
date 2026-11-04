@@ -5,7 +5,7 @@
 //! file that no one may execute, so its calls skip them.
 use crate::credentials::Credentials;
 use crate::files::Files;
-use paludarium_host::FileStat;
+use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 
 pub(crate) const MAY_EXEC: u32 = 1;
@@ -384,6 +384,40 @@ pub(crate) fn chown(
         return Err(Errno::EPERM);
     }
     Ok(in_group(creds, stat.gid) || capable(creds, CAP_FSETID))
+}
+
+/// What a write or a truncation takes from a regular file without
+/// `CAP_FSETID` (`setattr_should_drop_suidgid`): its set-user-ID bit, and its
+/// set-group-ID bit with group execution or when the thread is not in its
+/// group. Linux's `file_remove_privs` and `do_truncate`.
+pub(crate) fn remove_set_ids(creds: &Credentials, file: &dyn FileHandle) {
+    if capable(creds, CAP_FSETID) {
+        return;
+    }
+    let Ok(stat) = file.stat() else {
+        return;
+    };
+    if stat.mode & TYPE != REGULAR {
+        return;
+    }
+    let mut kill = stat.mode & 0o4000;
+    if stat.mode & 0o2000 != 0 && (stat.mode & 0o010 != 0 || !in_group(creds, stat.gid)) {
+        kill |= 0o2000;
+    }
+    if kill != 0 {
+        let _ = file.set_mode(stat.mode & 0o7777 & !kill);
+    }
+}
+
+/// `connect` and `sendto` to the socket file `raw` names, as Linux's
+/// `unix_find_bsd`: searching on the way there, and writing the file it finds,
+/// whatever it is.
+pub(crate) fn connect(files: &Files, creds: &Credentials, raw: &[u8]) -> Result<(), Errno> {
+    const AT_FDCWD: u64 = -100i64 as u64;
+    match search(files, creds, AT_FDCWD, raw, true)?.file {
+        Some(file) => permission(creds, &file, MAY_WRITE),
+        None => Ok(()),
+    }
 }
 
 /// `utimensat`'s check (`may_setattr`, `setattr_prepare`): the owner or

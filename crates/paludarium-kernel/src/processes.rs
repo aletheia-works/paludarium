@@ -1,5 +1,5 @@
 //! Emulated process registry; no lock spans Host waits or guest execution.
-use crate::credentials::SignalIds;
+use crate::credentials::TaskIds;
 use crate::fasync::{FileOwner, OwnerKind, Reason};
 use crate::{Kernel, Next, SignalInbox, Thread, ThreadGroup, ThreadState, signals};
 use paludarium_cpu::{CpuState, reg};
@@ -96,6 +96,16 @@ const DEFAULT_LIMITS: [(u64, u64); RLIMITS] = [
     (0, 0),               // RTPRIO
     (INFINITY, INFINITY), // RTTIME
 ];
+const RLIMIT_NICE: usize = 13;
+/// A thread `getpriority` or `setpriority` found.
+struct PriorityThread {
+    group: Arc<ThreadGroup>,
+    tid: u32,
+    nice: i32,
+    ids: TaskIds,
+    /// The RLIMIT_NICE soft limit of its process.
+    nice_limit: u64,
+}
 /// fs.nr_open: the highest RLIMIT_NOFILE Linux accepts by default.
 const NR_OPEN: u64 = 1 << 20;
 pub struct Processes {
@@ -315,35 +325,39 @@ impl Processes {
     /// values, as Linux finds them: for `PRIO_PROCESS` the thread `who` (0 is
     /// `tid`, the caller), for `PRIO_PGRP` every thread of the group's
     /// processes (0 is the caller's group), and for `PRIO_USER` every thread
-    /// of user `who` (0 is the caller's), where every process is root's. An
-    /// unreaped process still counts, by its leader.
+    /// of real user ID `who` (0 is `uid`, the caller's). An unreaped process
+    /// still counts, by its leader.
     fn priority_threads(
         &self,
         which: i32,
         who: i32,
         caller: u32,
         tid: u32,
-    ) -> Result<Vec<(Arc<ThreadGroup>, u32, i32)>, Errno> {
+        uid: u32,
+    ) -> Result<Vec<PriorityThread>, Errno> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let all = |entry: &Entry| {
+        let thread = |pid: u32, entry: &Entry, tid: u32, nice: i32| PriorityThread {
+            group: Arc::clone(&entry.group),
+            tid,
+            nice,
+            ids: entry.group.task_ids(pid, tid),
+            nice_limit: entry.limits[RLIMIT_NICE].0,
+        };
+        let all = |(&pid, entry): (&u32, &Entry)| {
             entry
                 .group
                 .nices()
                 .into_iter()
-                .map(|(tid, nice)| (Arc::clone(&entry.group), tid, nice))
+                .map(|(tid, nice)| thread(pid, entry, tid, nice))
                 .collect::<Vec<_>>()
         };
         Ok(match which {
             0 => {
                 let tid = if who == 0 { tid } else { who as u32 };
                 entries
-                    .values()
+                    .iter()
                     .filter(|_| who >= 0)
-                    .find_map(|e| {
-                        e.group
-                            .nice(tid)
-                            .map(|nice| (Arc::clone(&e.group), tid, nice))
-                    })
+                    .find_map(|(&pid, e)| e.group.nice(tid).map(|nice| thread(pid, e, tid, nice)))
                     .into_iter()
                     .collect()
             }
@@ -353,13 +367,19 @@ impl Processes {
                     who => who as u32,
                 };
                 entries
-                    .values()
-                    .filter(|e| who >= 0 && e.pgid == pgid)
+                    .iter()
+                    .filter(|(_, e)| who >= 0 && e.pgid == pgid)
                     .flat_map(all)
                     .collect()
             }
-            2 if who == 0 => entries.values().flat_map(all).collect(),
-            2 => Vec::new(),
+            2 => {
+                let uid = if who == 0 { uid } else { who as u32 };
+                entries
+                    .iter()
+                    .flat_map(all)
+                    .filter(|thread| thread.ids.uid == uid)
+                    .collect()
+            }
             _ => return Err(Errno::EINVAL),
         })
     }
@@ -400,21 +420,40 @@ impl Processes {
             entry.executed = true;
         }
     }
-    /// `prlimit64`: returns the old limit, after setting `new` if given.
+    /// `prlimit64` from `sender`: returns the old limit of the process of
+    /// thread `named`, after setting `new` if given. As Linux's
+    /// `check_prlimit_permission`, a thread may always use its own, by its own
+    /// ID (`own`), and raising a hard limit needs CAP_SYS_RESOURCE.
     fn limit(
         &self,
-        pid: u32,
+        sender: TaskIds,
+        own: bool,
+        named: u32,
         resource: usize,
         new: Option<(u64, u64)>,
     ) -> Result<(u64, u64), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        // A thread's ID names its process, as `kill` finds it.
+        let pid = entries
+            .iter()
+            .find(|&(&key, entry)| {
+                key == named || (entry.status.is_none() && entry.group.has_member(named))
+            })
+            .map(|(&key, _)| key)
+            .ok_or(Errno(3))?;
         let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
+        if !own && !sender.may_prlimit(entry.group.task_ids(pid, named)) {
+            return Err(Errno::EPERM);
+        }
         let old = *entry.limits.get(resource).ok_or(Errno::EINVAL)?;
         if let Some((soft, hard)) = new {
             if soft > hard {
                 return Err(Errno::EINVAL);
             }
             if resource == 7 && hard > self.nr_open.load(Ordering::SeqCst) {
+                return Err(Errno::EPERM);
+            }
+            if hard > old.1 && !sender.cap_sys_resource {
                 return Err(Errno::EPERM);
             }
             entry.limits[resource] = (soft, hard);
@@ -476,14 +515,14 @@ impl Processes {
             }
         }
         // Children that asked for it learn that this process exited.
-        let parent_ids = entries.get(&pid).map(|p| p.group.signal_ids(pid, pid));
+        let parent_ids = entries.get(&pid).map(|p| p.group.task_ids(pid, pid));
         let parent_session = entries.get(&pid).map(|p| p.sid);
         let same_session = |child: &Entry| Some(child.sid) == parent_session;
         for (&child_pid, child) in entries.iter() {
             if child.parent == pid && child.status.is_none() && child.death_signal != 0 {
                 // Linux sends it as the exiting parent, as with `kill`.
                 let sender = parent_ids.unwrap_or_default();
-                if sender.may_signal(child.group.signal_ids(child_pid, child_pid))
+                if sender.may_signal(child.group.task_ids(child_pid, child_pid))
                     || (child.death_signal == SIGCONT && same_session(child))
                 {
                     let _ = child
@@ -619,7 +658,7 @@ impl Processes {
                 code,
                 signals::ChildSignal {
                     pid,
-                    uid: entry.group.signal_ids(pid, pid).uid,
+                    uid: entry.group.task_ids(pid, pid).uid,
                     status,
                     cpu,
                 },
@@ -686,7 +725,7 @@ impl Processes {
                 },
             }?;
             let cpu = entry.group.process_cpu().saturating_add(entry.children_cpu);
-            Some((pid, event, cpu, entry.group.signal_ids(pid, pid).uid))
+            Some((pid, event, cpu, entry.group.task_ids(pid, pid).uid))
         });
         if let Some((pid, event, cpu, _)) = ready
             && !wait.keep
@@ -731,7 +770,7 @@ impl Processes {
         let parent = entry.parent;
         let child = signals::ChildSignal {
             pid,
-            uid: group.signal_ids(pid, pid).uid,
+            uid: group.task_ids(pid, pid).uid,
             status: signal,
             cpu: group.process_cpu(),
         };
@@ -798,7 +837,7 @@ impl Processes {
     /// count until they are reaped. With no process to send to it is `ESRCH`,
     /// even for an invalid signal; otherwise a group succeeds if any member
     /// took the signal, and -1 reports the last error.
-    fn kill(&self, caller: u32, sender: SignalIds, target: i32, number: i32) -> Result<(), Errno> {
+    fn kill(&self, caller: u32, sender: TaskIds, target: i32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         // The processes, with the thread each is named by, whose credentials
         // decide: Linux signals a thread group through the task it finds.
@@ -864,7 +903,7 @@ impl Processes {
     fn check_kill(
         entries: &BTreeMap<u32, Entry>,
         caller: u32,
-        sender: SignalIds,
+        sender: TaskIds,
         pid: u32,
         named: u32,
         number: i32,
@@ -874,7 +913,7 @@ impl Processes {
         }
         let entry = entries.get(&pid).ok_or(Errno(3))?;
         let session = entries.get(&caller).map(|c| c.sid);
-        if sender.may_signal(entry.group.signal_ids(pid, named))
+        if sender.may_signal(entry.group.task_ids(pid, named))
             || (number == SIGCONT && session == Some(entry.sid))
         {
             Ok(())
@@ -948,13 +987,7 @@ impl Processes {
             .set(file, owner);
     }
     /// Whether `pidfd_send_signal` from `caller` may signal process `pid`.
-    fn may_signal(
-        &self,
-        caller: u32,
-        sender: SignalIds,
-        pid: u32,
-        number: i32,
-    ) -> Result<(), Errno> {
+    fn may_signal(&self, caller: u32, sender: TaskIds, pid: u32, number: i32) -> Result<(), Errno> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         Self::check_kill(&entries, caller, sender, pid, pid, number)
     }
@@ -972,7 +1005,7 @@ impl Processes {
     fn queue(
         &self,
         caller: u32,
-        sender: SignalIds,
+        sender: TaskIds,
         pid: u32,
         signal: signals::PendingSignal,
     ) -> Result<(), Errno> {
@@ -991,7 +1024,7 @@ impl Processes {
     fn queue_thread(
         &self,
         caller: u32,
-        sender: SignalIds,
+        sender: TaskIds,
         tgid: u32,
         tid: u32,
         signal: signals::PendingSignal,
@@ -1059,7 +1092,7 @@ impl Processes {
             let parent = entry.parent;
             let child = signals::ChildSignal {
                 pid,
-                uid: entry.group.signal_ids(pid, pid).uid,
+                uid: entry.group.task_ids(pid, pid).uid,
                 status: 18,
                 cpu: entry.group.process_cpu(),
             };
@@ -1304,14 +1337,14 @@ impl Kernel {
             140 => self.getpriority(thread, a),
             141 => self.setpriority(thread, a),
             // prlimit64, getrlimit, setrlimit
-            302 => self.prlimit(mem, a[0], a[1], a[2], a[3]),
-            97 => self.prlimit(mem, 0, a[0], 0, a[1]),
-            160 => self.prlimit(mem, 0, a[0], a[1], 0),
+            302 => self.prlimit(thread, mem, a[0], a[1], a[2], a[3]),
+            97 => self.prlimit(thread, mem, 0, a[0], 0, a[1]),
+            160 => self.prlimit(thread, mem, 0, a[0], a[1], 0),
             62 => self
                 .processes
                 .kill(
                     self.process.pid,
-                    thread.state.credentials.signal_ids(),
+                    thread.state.credentials.task_ids(),
                     a[0] as i32,
                     a[1] as i32,
                 )
@@ -1385,30 +1418,46 @@ impl Kernel {
             a[1] as i32,
             self.process.pid,
             thread.tid,
+            thread.state.credentials.uid,
         )?;
         threads
             .iter()
-            .map(|&(_, _, nice)| (20 - nice) as u64)
+            .map(|found| (20 - found.nice) as u64)
             .max()
             .ok_or(Errno(3))
     }
-    /// `setpriority(which, who, nice)`: sets every thread's nice value to
-    /// `nice`, cut to -20..19. The guest is root, which may also lower it.
+    /// `setpriority(which, who, nice)`: sets the nice value of every thread
+    /// the caller may change to `nice`, cut to -20..19, as Linux's
+    /// `set_one_prio`. Going lower needs CAP_SYS_NICE or room in the thread's
+    /// RLIMIT_NICE. A refusal is reported though other threads changed, the
+    /// last one when there are several.
     fn setpriority(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
+        let sender = thread.state.credentials.task_ids();
         let threads = self.processes.priority_threads(
             a[0] as i32,
             a[1] as i32,
             self.process.pid,
             thread.tid,
+            sender.uid,
         )?;
         let nice = (a[2] as i32).clamp(-20, 19);
-        if threads.is_empty() {
-            return Err(Errno(3));
+        let mut result = Err(Errno(3));
+        for found in threads {
+            if !sender.may_set_priority(found.ids) {
+                result = Err(Errno::EPERM);
+            } else if nice < found.nice
+                && (20 - nice) as u64 > found.nice_limit
+                && !sender.cap_sys_nice
+            {
+                result = Err(Errno::EACCES);
+            } else {
+                found.group.update_nice(found.tid, nice);
+                if result == Err(Errno(3)) {
+                    result = Ok(0);
+                }
+            }
         }
-        for (group, tid, _) in threads {
-            group.update_nice(tid, nice);
-        }
-        Ok(0)
+        result
     }
     fn setpgid(&self, a: [u64; 6]) -> Result<u64, Errno> {
         let pgid = a[1] as u32 as i32;
@@ -1423,6 +1472,7 @@ impl Kernel {
     }
     fn prlimit(
         &self,
+        thread: &Thread,
         mem: &AddressSpace,
         pid: u64,
         resource: u64,
@@ -1440,9 +1490,11 @@ impl Kernel {
                 .map_err(|_| Errno::EFAULT)?;
             Some((soft, hard))
         };
-        let pid = self.target_pid(pid)?;
+        let own = pid as u32 == 0 || pid as u32 == thread.tid;
+        let named = self.target_pid(pid)?;
         let resource = usize::try_from(resource as u32).map_err(|_| Errno::EINVAL)?;
-        let (soft, hard) = self.processes.limit(pid, resource, new)?;
+        let sender = thread.state.credentials.task_ids();
+        let (soft, hard) = self.processes.limit(sender, own, named, resource, new)?;
         if old != 0 {
             mem.write_u64(GuestAddr(old), soft)
                 .map_err(|_| Errno::EFAULT)?;
@@ -1532,7 +1584,7 @@ impl Kernel {
                 .write(GuestAddr(a[3]), &pid.to_le_bytes());
         }
         let release = (flags & 0x4000 != 0).then(|| Arc::new(AtomicBool::new(false)));
-        group.set_signal_ids(pid, parent.state.credentials.signal_ids());
+        group.set_task_ids(pid, parent.state.credentials.task_ids());
         self.processes.insert(
             pid,
             self.process.pid,
@@ -1766,7 +1818,7 @@ impl Kernel {
         self.processes
             .queue(
                 self.process.pid,
-                thread.state.credentials.signal_ids(),
+                thread.state.credentials.task_ids(),
                 pid.cast_unsigned(),
                 signal,
             )
@@ -1791,7 +1843,7 @@ impl Kernel {
         self.processes
             .queue_thread(
                 self.process.pid,
-                thread.state.credentials.signal_ids(),
+                thread.state.credentials.task_ids(),
                 tgid.cast_unsigned(),
                 tid.cast_unsigned(),
                 signal,
@@ -1817,7 +1869,7 @@ impl Kernel {
         }
         // A zombie takes the signal and drops it; a reaped process is gone.
         let exited = self.processes.exited(pidfd.pid).ok_or(Errno(3))?;
-        let sender = thread.state.credentials.signal_ids();
+        let sender = thread.state.credentials.task_ids();
         self.processes
             .may_signal(self.process.pid, sender, pidfd.pid, number)?;
         if exited {
@@ -1959,7 +2011,7 @@ impl Kernel {
         self.processes
             .executed_as(self.process.pid, dumpable, secure || changed, secure);
         self.group
-            .reset_signal_ids(self.process.pid, credentials.signal_ids());
+            .reset_task_ids(self.process.pid, credentials.task_ids());
         thread.state.credentials = credentials;
         self.processes.mark_executed(self.process.pid);
         self.exec_memory = Some(Arc::new(memory));

@@ -680,8 +680,12 @@ kernel.
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's
-  `fs.nr_open`), or to a lower ceiling the embedder sets. Three are enforced,
-  as in Linux:
+  `fs.nr_open`), or to a lower ceiling the embedder sets. Raising a hard limit
+  needs `CAP_SYS_RESOURCE` (`EPERM`). `prlimit64` on another thread, to read
+  or to set, needs `CAP_SYS_RESOURCE`, or the caller's real user and group IDs
+  to be all of that thread's real, effective and saved ones (`EPERM`, before
+  an unknown resource is noticed); a thread's ID names its process. Three are
+  enforced, as in Linux:
   - `RLIMIT_NOFILE`: a new descriptor past its soft limit gives `EMFILE` (and
     `open` creates nothing), `dup2`/`dup3` onto a number past it `EBADF`, and
     `F_DUPFD` from one past it `EINVAL`.
@@ -727,12 +731,18 @@ kernel.
 - Nice values are kept per thread, as on Linux: a new thread or process
   starts with its creator's, and `execve` keeps the caller's. `getpriority`
   reports the highest priority among the threads it finds, as `20 - nice`,
-  and `setpriority` sets them all, cut to -20..19; any thread may lower
-  them too, as root may. `PRIO_PROCESS` names one thread (0 is the caller),
-  `PRIO_PGRP` every thread of a process group and `PRIO_USER` every thread
-  of user 0. An exited process not yet reaped is still found. No thread
-  gives `ESRCH`, and an unknown `which` `EINVAL`. The values are reported
-  but do not change scheduling.
+  and `setpriority` sets them all, cut to -20..19. `PRIO_PROCESS` names one
+  thread (0 is the caller), `PRIO_PGRP` every thread of a process group and
+  `PRIO_USER` every thread of a real user ID (0 is the caller's). An exited
+  process not yet reaped is still found. No thread gives `ESRCH`, and an
+  unknown `which` `EINVAL`. The values are reported but do not change
+  scheduling.
+- `setpriority` checks each thread as Linux's `set_one_prio` does. The
+  caller's effective user ID must be the thread's real or effective one, or
+  the caller must have `CAP_SYS_NICE`; otherwise it is `EPERM`. Lowering a
+  nice value needs `CAP_SYS_NICE` or `20 - nice` within the thread's
+  `RLIMIT_NICE` soft limit; otherwise it is `EACCES`. The threads it may
+  change do change, and the call then reports the last refusal.
 - `waitid` follows Linux's checks and copy-out: its siginfo fields are zero
   when no child is reported, even on an error, and an exited child cannot be
   waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). A stop and a

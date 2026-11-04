@@ -1,6 +1,6 @@
 //! Shared process termination, signal dispositions, registry and futex queues.
 //! Each worker owns its Kernel thread context; no process lock spans CPU/I/O/wait.
-use crate::credentials::SignalIds;
+use crate::credentials::TaskIds;
 use crate::{
     AltStack, Kernel, Next, SignalAction, SignalInbox, Thread, ThreadState, futex::Futexes, signals,
 };
@@ -26,8 +26,8 @@ pub struct ThreadGroup {
     /// reaped.
     nice: Mutex<BTreeMap<u32, i32>>,
     /// What signalling each thread looks at, for other processes to read;
-    /// a thread without one is root's ([`SignalIds`]).
-    signal_ids: Mutex<BTreeMap<u32, SignalIds>>,
+    /// a thread without one is root's ([`TaskIds`]).
+    task_ids: Mutex<BTreeMap<u32, TaskIds>>,
     status: Mutex<Option<ExitStatus>>,
     /// The signal dispositions, which clone with `CLONE_SIGHAND` also shares
     /// with another process (Linux's `sighand_struct`).
@@ -60,7 +60,7 @@ impl Default for ThreadGroup {
             stopped: std::sync::atomic::AtomicBool::new(false),
             members: Mutex::new(BTreeMap::new()),
             nice: Mutex::default(),
-            signal_ids: Mutex::default(),
+            task_ids: Mutex::default(),
             status: Mutex::new(None),
             actions: Mutex::default(),
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
@@ -376,41 +376,35 @@ impl ThreadGroup {
             .map(|(&tid, &value)| (tid, value))
             .collect()
     }
-    /// Records what signalling thread `tid` looks at, when its credentials
+    /// Records what acting on thread `tid` looks at, when its credentials
     /// change or it starts.
-    pub(crate) fn set_signal_ids(&self, tid: u32, ids: SignalIds) {
-        self.signal_ids
+    pub(crate) fn set_task_ids(&self, tid: u32, ids: TaskIds) {
+        self.task_ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(tid, ids);
     }
-    /// What signalling thread `tid` of process `pid` looks at: a thread no
+    /// What acting on thread `tid` of process `pid` looks at: a thread no
     /// longer here counts as the leader, whose credentials a zombie keeps.
-    pub(crate) fn signal_ids(&self, pid: u32, tid: u32) -> SignalIds {
-        let ids = self
-            .signal_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+    pub(crate) fn task_ids(&self, pid: u32, tid: u32) -> TaskIds {
+        let ids = self.task_ids.lock().unwrap_or_else(PoisonError::into_inner);
         ids.get(&tid)
             .or_else(|| ids.get(&pid))
             .copied()
             .unwrap_or_default()
     }
     /// Thread `tid` is gone, unless it led process `pid`.
-    fn forget_signal_ids(&self, pid: u32, tid: u32) {
+    fn forget_task_ids(&self, pid: u32, tid: u32) {
         if tid != pid {
-            self.signal_ids
+            self.task_ids
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&tid);
         }
     }
     /// After exec, thread `pid` is all there is.
-    pub(crate) fn reset_signal_ids(&self, pid: u32, ids: SignalIds) {
-        let mut all = self
-            .signal_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+    pub(crate) fn reset_task_ids(&self, pid: u32, ids: TaskIds) {
+        let mut all = self.task_ids.lock().unwrap_or_else(PoisonError::into_inner);
         all.clear();
         all.insert(pid, ids);
     }
@@ -616,7 +610,7 @@ impl Kernel {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
         self.group.forget_nice(tid);
-        self.group.forget_signal_ids(self.process.pid, tid);
+        self.group.forget_task_ids(self.process.pid, tid);
     }
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
         self.files.release_descriptors();
@@ -672,7 +666,7 @@ impl Kernel {
         if thread.tid != self.process.pid {
             self.group.forget_nice(thread.tid);
         }
-        self.group.forget_signal_ids(self.process.pid, thread.tid);
+        self.group.forget_task_ids(self.process.pid, thread.tid);
     }
     fn clear_child_tid(group: &ThreadGroup, mem: &AddressSpace, addr: u64) {
         if addr != 0 && mem.write(GuestAddr(addr), &0u32.to_le_bytes()).is_ok() {
@@ -846,7 +840,7 @@ impl Kernel {
         }
         let mut state = parent.state.clone();
         self.group
-            .set_signal_ids(tid, parent.state.credentials.signal_ids());
+            .set_task_ids(tid, parent.state.credentials.task_ids());
         state.timer = signals::RealTimer::default();
         state.pending.clear();
         state.frames.clear();

@@ -14,6 +14,8 @@ pub(crate) const ALL_CAPABILITIES: u64 = (1 << 41) - 1;
 const CAP_KILL: u64 = 1 << 5;
 const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
+const CAP_SYS_NICE: u64 = 1 << 23;
+const CAP_SYS_RESOURCE: u64 = 1 << 24;
 /// The capabilities a filesystem ID of root brings (`CAP_FS_MASK`):
 /// CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER,
 /// CAP_FSETID, CAP_LINUX_IMMUTABLE, CAP_MKNOD and CAP_MAC_OVERRIDE.
@@ -26,17 +28,22 @@ const MAX_GROUPS: u64 = 65536;
 /// The ID that means "unchanged", and that names no user or group.
 const UNCHANGED: u32 = u32::MAX;
 
-/// What sending a signal looks at in a thread's credentials, which another
-/// process can read ([`crate::ThreadGroup::signal_ids`]).
+/// What acting on another thread looks at in credentials, which another
+/// process can read ([`crate::ThreadGroup::task_ids`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SignalIds {
+pub(crate) struct TaskIds {
     pub uid: u32,
     pub euid: u32,
     pub suid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub sgid: u32,
     pub cap_kill: bool,
+    pub cap_sys_nice: bool,
+    pub cap_sys_resource: bool,
 }
 
-impl SignalIds {
+impl TaskIds {
     /// Linux's `kill_ok_by_cred`: the sender's real or effective user ID is
     /// the target's real or saved one, or the sender has CAP_KILL.
     pub(crate) fn may_signal(self, target: Self) -> bool {
@@ -46,12 +53,29 @@ impl SignalIds {
             || self.uid == target.suid
             || self.uid == target.uid
     }
+    /// Linux's `check_prlimit_permission`, to read or set another thread's
+    /// limits: the sender's real IDs are all of the target's IDs, or the
+    /// sender has CAP_SYS_RESOURCE.
+    pub(crate) fn may_prlimit(self, target: Self) -> bool {
+        self.cap_sys_resource
+            || (self.uid == target.uid
+                && self.uid == target.euid
+                && self.uid == target.suid
+                && self.gid == target.gid
+                && self.gid == target.egid
+                && self.gid == target.sgid)
+    }
+    /// Linux's `set_one_prio_perm`: the sender's effective user ID is the
+    /// target's real or effective one, or the sender has CAP_SYS_NICE.
+    pub(crate) fn may_set_priority(self, target: Self) -> bool {
+        self.cap_sys_nice || self.euid == target.uid || self.euid == target.euid
+    }
 }
 
 /// Root's, as a thread has until its credentials change.
-impl Default for SignalIds {
+impl Default for TaskIds {
     fn default() -> Self {
-        Credentials::default().signal_ids()
+        Credentials::default().task_ids()
     }
 }
 
@@ -95,12 +119,17 @@ impl Default for Credentials {
 }
 
 impl Credentials {
-    pub(crate) fn signal_ids(&self) -> SignalIds {
-        SignalIds {
+    pub(crate) fn task_ids(&self) -> TaskIds {
+        TaskIds {
             uid: self.uid,
             euid: self.euid,
             suid: self.suid,
+            gid: self.gid,
+            egid: self.egid,
+            sgid: self.sgid,
             cap_kill: self.effective & CAP_KILL != 0,
+            cap_sys_nice: self.effective & CAP_SYS_NICE != 0,
+            cap_sys_resource: self.effective & CAP_SYS_RESOURCE != 0,
         }
     }
     fn may_setuid(&self) -> bool {
@@ -378,7 +407,7 @@ fn commit(c: &mut Context<'_>, new: Credentials) {
     if c.process.credentials.resets_dumpable(&new) {
         c.processes.credentials_changed(c.process.pid);
     }
-    c.group.set_signal_ids(c.tid, new.signal_ids());
+    c.group.set_task_ids(c.tid, new.task_ids());
     c.process.credentials = new;
 }
 
@@ -528,9 +557,58 @@ mod credentials_tests {
     }
 
     #[test]
+    fn another_threads_limits_need_all_its_ids_or_cap_sys_resource() {
+        let ids = |r, e, s| {
+            Credentials::default()
+                .setresuid(r, e, s)
+                .unwrap()
+                .task_ids()
+        };
+        let sender = ids(2000, 3000, 3000);
+        assert!(sender.may_prlimit(ids(2000, 2000, 2000)), "the real ID");
+        assert!(!sender.may_prlimit(ids(2000, 3000, 2000)), "its effective");
+        assert!(!sender.may_prlimit(ids(2000, 2000, 3000)), "its saved");
+        assert!(!sender.may_prlimit(ids(3000, 2000, 2000)), "its real");
+        let group = |change: fn(&mut TaskIds)| {
+            let mut target = ids(2000, 2000, 2000);
+            change(&mut target);
+            target
+        };
+        assert!(!sender.may_prlimit(group(|t| t.gid = 1)));
+        assert!(!sender.may_prlimit(group(|t| t.egid = 1)));
+        assert!(!sender.may_prlimit(group(|t| t.sgid = 1)));
+        assert!(Credentials::default().task_ids().may_prlimit(sender));
+        let groups = Credentials::default()
+            .setresgid(1, 2, 3)
+            .unwrap()
+            .task_ids();
+        assert_eq!([groups.gid, groups.egid, groups.sgid], [1, 2, 3]);
+    }
+    #[test]
+    fn another_threads_priority_needs_the_effective_id_or_cap_sys_nice() {
+        let ids = |r, e, s| {
+            Credentials::default()
+                .setresuid(r, e, s)
+                .unwrap()
+                .task_ids()
+        };
+        let sender = ids(3000, 2000, 2000);
+        assert!(sender.may_set_priority(ids(2000, 3000, 3000)), "its real");
+        assert!(
+            sender.may_set_priority(ids(3000, 2000, 3000)),
+            "its effective"
+        );
+        assert!(!sender.may_set_priority(ids(3000, 3000, 2000)), "its saved");
+        assert!(
+            !ids(2000, 3000, 3000).may_set_priority(ids(2000, 2000, 2000)),
+            "the sender's real ID does not count"
+        );
+        assert!(Credentials::default().task_ids().may_set_priority(sender));
+    }
+    #[test]
     fn a_signal_needs_a_shared_real_or_saved_id_or_cap_kill() {
         let root = Credentials::default();
-        let ids = |r, e, s| root.setresuid(r, e, s).unwrap().signal_ids();
+        let ids = |r, e, s| root.setresuid(r, e, s).unwrap().task_ids();
         let sender = ids(2000, 2000, 2000);
         assert!(sender.may_signal(ids(2000, 3000, 3000)), "the real ID");
         assert!(sender.may_signal(ids(3000, 3000, 2000)), "the saved ID");
@@ -547,7 +625,7 @@ mod credentials_tests {
             "by suid"
         );
         // The effective capability decides: a real ID of root gives none.
-        assert!(root.signal_ids().may_signal(ids(3000, 3000, 3000)));
+        assert!(root.task_ids().may_signal(ids(3000, 3000, 3000)));
         assert!(!ids(0, 3000, 0).may_signal(ids(4000, 4000, 4000)));
     }
 

@@ -1261,6 +1261,59 @@ static void *signal_thread_tkills(void *unused) {
     syscall(SYS_tgkill, getpid(), signal_main_thread, SIGUSR1);
     return NULL;
 }
+/* The limit-permissions case: a process that waits with the given IDs. */
+static pid_t limit_target(unsigned real, unsigned effective, unsigned saved, unsigned gid,
+                          unsigned egid, unsigned sgid) {
+    int ready[2];
+    if (pipe(ready)) _exit(100);
+    fflush(stdout);
+    pid_t pid = child();
+    if (pid == 0) {
+        close(ready[0]);
+        if (syscall(SYS_setresgid, gid, egid, sgid)) _exit(101);
+        if (syscall(SYS_setresuid, real, effective, saved)) _exit(102);
+        char byte = 1;
+        if (write(ready[1], &byte, 1) != 1) _exit(103);
+        for (;;) pause();
+    }
+    close(ready[1]);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) _exit(104);
+    close(ready[0]);
+    return pid;
+}
+static long limit_set(pid_t pid, int resource, unsigned long soft, unsigned long hard) {
+    struct rlimit limit = {soft, hard};
+    return syscall(SYS_prlimit64, pid, resource, &limit, NULL);
+}
+static long limit_read(pid_t pid, int resource) {
+    struct rlimit limit;
+    return syscall(SYS_prlimit64, pid, resource, NULL, &limit);
+}
+static void limit_show(const char *name, pid_t pid) {
+    struct rlimit limit;
+    if (syscall(SYS_prlimit64, pid, RLIMIT_NOFILE, NULL, &limit)) {
+        printf("%s: %s\n", name, strerror(errno));
+        return;
+    }
+    printf("%s: soft=%lu hard=%lu\n", name, (unsigned long)limit.rlim_cur,
+           (unsigned long)limit.rlim_max);
+}
+static void nice_show(const char *name, int which, int who) {
+    long priority = raw_priority(which, who);
+    if (priority < 0) printf("%s: %s\n", name, strerror(errno));
+    else printf("%s: nice=%ld\n", name, 20 - priority);
+}
+/* A thread of a process led by root takes other IDs and acts by the leader's ID. */
+static void *limit_thread(void *unused) {
+    (void)unused;
+    if (syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(105);
+    permitted("thread-limit-own", limit_read(syscall(SYS_gettid), RLIMIT_NOFILE));
+    permitted("thread-limit-leader", limit_read(getpid(), RLIMIT_NOFILE));
+    permitted("thread-nice-own", setpriority(PRIO_PROCESS, 0, 15));
+    permitted("thread-nice-leader", setpriority(PRIO_PROCESS, getpid(), 15));
+    return NULL;
+}
 static void finish(pid_t pid) {
     int status = 0;
     result("wait", waitpid(pid, &status, 0) == pid);
@@ -8252,6 +8305,189 @@ int main(int argc, char **argv) {
             pid_t last = wait(&status);
             printf("orphan: reaped=%d status=%d\n", last > 0, status);
         }
+        return 0;
+    }
+    if (!strcmp(mode, "limit-permissions")) {
+        int status = 0;
+        /* A known start: the caller's limits and nice value are not. */
+        if (limit_set(0, RLIMIT_NOFILE, 1024, 4096)) return 70;
+        if (limit_set(0, RLIMIT_NICE, 0, 40)) return 71;
+        if (setpriority(PRIO_PROCESS, 0, 10)) return 72;
+        /* A process's own hard limit goes up only with CAP_SYS_RESOURCE. */
+        AS_SENDER(2000, 2000, 2000, {
+            permitted("hard-lower", limit_set(0, RLIMIT_NOFILE, 512, 2048));
+            limit_show("after-lower", 0);
+            permitted("soft-to-hard", limit_set(0, RLIMIT_NOFILE, 2048, 2048));
+            permitted("hard-same", limit_set(0, RLIMIT_NOFILE, 1024, 2048));
+            permitted("hard-raise", limit_set(0, RLIMIT_NOFILE, 1024, 2049));
+            permitted("soft-above-hard-first", limit_set(0, RLIMIT_NOFILE, 2050, 2049));
+            permitted("nr-open", limit_set(0, RLIMIT_NOFILE, 1024, 1UL << 40));
+            limit_show("after-refused", 0);
+            permitted("own-bad-resource", limit_read(0, 99));
+            permitted("own-pid", limit_read(getpid(), RLIMIT_NOFILE));
+        });
+        AS_SENDER(0, 0, 0, {
+            permitted("root-raise", limit_set(0, RLIMIT_NOFILE, 1024, 8192));
+            limit_show("root-raised", 0);
+        });
+        AS_SENDER(0, 3000, 0, {
+            permitted("no-capability-raise", limit_set(0, RLIMIT_NOFILE, 1024, 8192));
+        });
+        AS_SENDER(3000, 0, 3000, {
+            permitted("effective-root-raise", limit_set(0, RLIMIT_NOFILE, 1024, 8192));
+        });
+        /* Another process's limits, to read or set, need all its IDs. */
+        pid_t same = limit_target(2000, 2000, 2000, 0, 0, 0);
+        pid_t euid = limit_target(2000, 3000, 2000, 0, 0, 0);
+        pid_t suid = limit_target(2000, 2000, 3000, 0, 0, 0);
+        pid_t ruid = limit_target(3000, 2000, 2000, 0, 0, 0);
+        pid_t rgid = limit_target(2000, 2000, 2000, 3000, 0, 0);
+        pid_t egid = limit_target(2000, 2000, 2000, 0, 3000, 0);
+        pid_t sgid = limit_target(2000, 2000, 2000, 0, 0, 3000);
+        pid_t gone = limit_target(3000, 3000, 3000, 0, 0, 0);
+        kill(gone, SIGKILL);
+        siginfo_t gone_info;
+        waitid(P_PID, gone, &gone_info, WEXITED | WNOWAIT);
+        AS_SENDER(2000, 2000, 2000, {
+            permitted("read-same", limit_read(same, RLIMIT_NOFILE));
+            permitted("read-euid", limit_read(euid, RLIMIT_NOFILE));
+            permitted("read-suid", limit_read(suid, RLIMIT_NOFILE));
+            permitted("read-ruid", limit_read(ruid, RLIMIT_NOFILE));
+            permitted("read-rgid", limit_read(rgid, RLIMIT_NOFILE));
+            permitted("read-egid", limit_read(egid, RLIMIT_NOFILE));
+            permitted("read-sgid", limit_read(sgid, RLIMIT_NOFILE));
+            permitted("read-zombie", limit_read(gone, RLIMIT_NOFILE));
+            permitted("set-same", limit_set(same, RLIMIT_NOFILE, 256, 1024));
+            permitted("set-same-raise", limit_set(same, RLIMIT_NOFILE, 256, 2048));
+            permitted("set-euid", limit_set(euid, RLIMIT_NOFILE, 256, 1024));
+            permitted("other-bad-resource", limit_read(euid, 99));
+            permitted("same-bad-resource", limit_read(same, 99));
+            permitted("missing", limit_read(0x3fffffff, RLIMIT_NOFILE));
+            permitted("other-bad-new", syscall(SYS_prlimit64, euid, RLIMIT_NOFILE, (void *)1, NULL));
+        });
+        limit_show("same-after", same);
+        limit_show("euid-after", euid);
+        /* The sender's real IDs count, not its effective ones. */
+        AS_SENDER(2000, 3000, 3000, {
+            permitted("real-matches", limit_read(same, RLIMIT_NOFILE));
+        });
+        AS_SENDER(3000, 2000, 2000, {
+            permitted("effective-matches", limit_read(same, RLIMIT_NOFILE));
+        });
+        AS_SENDER(0, 3000, 0, {
+            permitted("no-capability-read", limit_read(same, RLIMIT_NOFILE));
+        });
+        permitted("root-zombie", limit_read(gone, RLIMIT_NOFILE));
+        permitted("root-other", limit_set(euid, RLIMIT_NOFILE, 128, 8192));
+        limit_show("root-set", euid);
+        /* A process's own nice value: up freely, down within RLIMIT_NICE. */
+        AS_SENDER(2000, 2000, 2000, {
+            permitted("raise-own", setpriority(PRIO_PROCESS, 0, 12));
+            permitted("same-own", setpriority(PRIO_PROCESS, 0, 12));
+            permitted("lower-own", setpriority(PRIO_PROCESS, 0, 11));
+            permitted("lower-clamped", setpriority(PRIO_PROCESS, 0, -1000));
+            nice_show("own-nice", PRIO_PROCESS, 0);
+            permitted("nice-limit", limit_set(0, RLIMIT_NICE, 25, 40));
+            permitted("lower-in-limit", setpriority(PRIO_PROCESS, 0, -5));
+            permitted("lower-past-limit", setpriority(PRIO_PROCESS, 0, -6));
+            nice_show("own-nice-limited", PRIO_PROCESS, 0);
+        });
+        AS_SENDER(0, 0, 0, {
+            permitted("root-lower", setpriority(PRIO_PROCESS, 0, -15));
+            nice_show("root-nice", PRIO_PROCESS, 0);
+        });
+        AS_SENDER(0, 3000, 0, {
+            permitted("no-capability-lower", setpriority(PRIO_PROCESS, 0, -15));
+        });
+        /* Another's: the effective ID against its real or effective one, and
+           the limit is the target's. */
+        pid_t only_saved = limit_target(3000, 3000, 2000, 0, 0, 0);
+        permitted("target-limit", limit_set(same, RLIMIT_NICE, 30, 40));
+        AS_SENDER(2000, 2000, 2000, {
+            permitted("nice-same", setpriority(PRIO_PROCESS, same, 11));
+            nice_show("same-nice", PRIO_PROCESS, same);
+            permitted("nice-same-lower", setpriority(PRIO_PROCESS, same, -10));
+            permitted("nice-same-past", setpriority(PRIO_PROCESS, same, -11));
+            nice_show("same-lowered", PRIO_PROCESS, same);
+            permitted("nice-target-real", setpriority(PRIO_PROCESS, euid, 11));
+            permitted("nice-target-effective", setpriority(PRIO_PROCESS, ruid, 11));
+            permitted("nice-target-saved", setpriority(PRIO_PROCESS, only_saved, 11));
+            permitted("nice-refused-first", setpriority(PRIO_PROCESS, only_saved, 5));
+            permitted("nice-zombie", setpriority(PRIO_PROCESS, gone, 11));
+            nice_show("read-any", PRIO_PROCESS, only_saved);
+        });
+        AS_SENDER(2000, 3000, 3000, {
+            permitted("nice-sender-real", setpriority(PRIO_PROCESS, same, 12));
+            permitted("nice-sender-effective", setpriority(PRIO_PROCESS, only_saved, 12));
+        });
+        permitted("root-nice-other", setpriority(PRIO_PROCESS, only_saved, -5));
+        nice_show("root-nice-set", PRIO_PROCESS, only_saved);
+        /* PRIO_USER finds the real user ID. */
+        pid_t user_a = limit_target(2100, 2100, 2100, 0, 0, 0);
+        pid_t user_b = limit_target(2100, 3100, 2100, 0, 0, 0);
+        pid_t user_c = limit_target(2200, 2100, 2200, 0, 0, 0);
+        permitted("user-set", setpriority(PRIO_USER, 2100, 14));
+        nice_show("user-a", PRIO_PROCESS, user_a);
+        nice_show("user-b", PRIO_PROCESS, user_b);
+        nice_show("user-c", PRIO_PROCESS, user_c);
+        permitted("user-b-higher", setpriority(PRIO_PROCESS, user_b, 16));
+        nice_show("user-highest", PRIO_USER, 2100);
+        nice_show("user-effective-only", PRIO_USER, 3100);
+        permitted("user-missing", setpriority(PRIO_USER, 3100, 14));
+        AS_SENDER(2100, 2100, 2100, {
+            permitted("user-own", setpriority(PRIO_USER, 0, 17));
+            nice_show("user-own-nice", PRIO_USER, 0);
+            nice_show("user-own-a", PRIO_PROCESS, user_a);
+        });
+        AS_SENDER(2300, 2300, 2300, {
+            permitted("user-other", setpriority(PRIO_USER, 2100, 18));
+        });
+        /* A group: those it may change change, and the refusal is reported. */
+        pid_t member_own = limit_target(2400, 2400, 2400, 0, 0, 0);
+        pid_t member_other = limit_target(2500, 2500, 2500, 0, 0, 0);
+        if (setpgid(member_own, member_own) || setpgid(member_other, member_own)) return 73;
+        AS_SENDER(2400, 2400, 2400, {
+            permitted("group-mixed", setpriority(PRIO_PGRP, member_own, 18));
+        });
+        nice_show("group-own", PRIO_PROCESS, member_own);
+        nice_show("group-other", PRIO_PROCESS, member_other);
+        AS_SENDER(2600, 2600, 2600, {
+            permitted("group-none", setpriority(PRIO_PGRP, member_own, 17));
+        });
+        /* A thread's ID names its IDs, and the leader's are its own. */
+        if (pipe(signal_thread_pipe)) return 74;
+        fflush(stdout);
+        pid_t threaded = child();
+        if (threaded == 0) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, signal_thread_with_ids, NULL)) _exit(75);
+            for (;;) pause();
+        }
+        pid_t thread_id;
+        if (read(signal_thread_pipe[0], &thread_id, sizeof thread_id) != sizeof thread_id) return 78;
+        AS_SENDER(2000, 2000, 2000, {
+            permitted("thread-id-limit", limit_read(thread_id, RLIMIT_NOFILE));
+            permitted("thread-leader-limit", limit_read(threaded, RLIMIT_NOFILE));
+            permitted("thread-id-nice", setpriority(PRIO_PROCESS, thread_id, 15));
+            permitted("thread-leader-nice", setpriority(PRIO_PROCESS, threaded, 15));
+        });
+        signal_kill_reap(threaded);
+        fflush(stdout);
+        pid_t own_thread = child();
+        if (own_thread == 0) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, limit_thread, NULL)) _exit(79);
+            pthread_join(t, NULL);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(own_thread, &status, 0);
+        printf("own-thread: status=%d\n", status);
+        pid_t others[] = {same, euid, suid, ruid, rgid, egid, sgid, only_saved, user_a,
+                          user_b, user_c, member_own, member_other};
+        for (unsigned i = 0; i < sizeof others / sizeof *others; i++) signal_kill_reap(others[i]);
+        int gone_status = 0;
+        waitpid(gone, &gone_status, 0);
         return 0;
     }
     if (!strcmp(mode, "proc-status")) {

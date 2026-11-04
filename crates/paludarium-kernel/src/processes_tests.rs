@@ -843,6 +843,176 @@ mod process {
         );
     }
 }
+mod limit_permissions {
+    use super::*;
+    fn become_user(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, uid: u64) {
+        assert_eq!(syscall(k, t, m, 117, [uid, uid, uid, 0, 0, 0]), 0);
+    }
+    /// `prlimit64(pid, RLIMIT_NOFILE, {soft, hard}, NULL)`.
+    fn set_limit(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        pid: u64,
+        limit: [u64; 2],
+    ) -> u64 {
+        m.write_u64(GuestAddr(DATA), limit[0]).unwrap();
+        m.write_u64(GuestAddr(DATA + 8), limit[1]).unwrap();
+        syscall(k, t, m, 302, [pid, 7, DATA, 0, 0, 0])
+    }
+    fn set_nice(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        which: u64,
+        who: u64,
+        nice: i64,
+    ) -> u64 {
+        syscall(k, t, m, 141, [which, who, nice as u64, 0, 0, 0])
+    }
+    #[test]
+    fn a_hard_limit_goes_up_only_with_cap_sys_resource() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        become_user(&mut c, &mut ct, &cm, 2000);
+        let eperm = Errno::EPERM.to_syscall_return();
+        assert_eq!(set_limit(&mut c, &mut ct, &cm, 0, [512, 2048]), 0);
+        assert_eq!(set_limit(&mut c, &mut ct, &cm, 0, [2048, 2048]), 0);
+        assert_eq!(set_limit(&mut c, &mut ct, &cm, 0, [1024, 2049]), eperm);
+        // A soft limit above the hard one is refused for that first.
+        assert_eq!(
+            set_limit(&mut c, &mut ct, &cm, 0, [2050, 2049]),
+            Errno::EINVAL.to_syscall_return()
+        );
+        assert_eq!(set_limit(&mut k, &mut t, &m, 0, [1024, 8192]), 0);
+    }
+    #[test]
+    fn another_process_limits_need_its_ids_before_anything_else() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let target = u64::from(ct.tid);
+        become_user(&mut c, &mut ct, &cm, 3000);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        become_user(&mut s, &mut st, &sm, 2000);
+        let eperm = Errno::EPERM.to_syscall_return();
+        assert_eq!(set_limit(&mut s, &mut st, &sm, target, [256, 1024]), eperm);
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 302, [target, 7, 0, DATA, 0, 0]),
+            eperm
+        );
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 302, [target, 99, 0, DATA, 0, 0]),
+            eperm
+        );
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 302, [0, 99, 0, DATA, 0, 0]),
+            Errno::EINVAL.to_syscall_return()
+        );
+        assert_eq!(set_limit(&mut k, &mut t, &m, target, [256, 1024]), 0);
+    }
+    #[test]
+    fn a_thread_id_names_its_process_and_its_own_ids() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let leader = u64::from(ct.tid);
+        let tid = syscall(&mut c, &mut ct, &cm, 56, [0x10900, 0, 0, 0, 0, 0]);
+        let (mut w, mut wt) = c.take_child().unwrap();
+        become_user(&mut w, &mut wt, &cm, 2000);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        become_user(&mut s, &mut st, &sm, 2000);
+        let eperm = Errno::EPERM.to_syscall_return();
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 302, [tid, 7, 0, DATA, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut s, &mut st, &sm, 302, [leader, 7, 0, DATA, 0, 0]),
+            eperm
+        );
+        // The thread by its own ID is itself; by the leader's it is not.
+        assert_eq!(
+            syscall(&mut w, &mut wt, &cm, 302, [tid, 7, 0, DATA, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut w, &mut wt, &cm, 302, [leader, 7, 0, DATA, 0, 0]),
+            eperm
+        );
+        assert_eq!(set_nice(&mut s, &mut st, &sm, 0, tid, 3), 0);
+        assert_eq!(set_nice(&mut s, &mut st, &sm, 0, leader, 3), eperm);
+    }
+    #[test]
+    fn lowering_nice_needs_room_in_the_targets_limit_or_cap_sys_nice() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let target = u64::from(ct.tid);
+        become_user(&mut c, &mut ct, &cm, 2000);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        become_user(&mut s, &mut st, &sm, 2000);
+        let eacces = Errno::EACCES.to_syscall_return();
+        assert_eq!(set_nice(&mut s, &mut st, &sm, 0, target, 5), 0);
+        assert_eq!(set_nice(&mut s, &mut st, &sm, 0, target, 5), 0);
+        assert_eq!(set_nice(&mut s, &mut st, &sm, 0, target, 4), eacces);
+        // RLIMIT_NICE 30 of the target allows nice -10, whatever the sender's.
+        m.write_u64(GuestAddr(DATA), 30).unwrap();
+        m.write_u64(GuestAddr(DATA + 8), 30).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 302, [target, 13, DATA, 0, 0, 0]),
+            0
+        );
+        assert_eq!(set_nice(&mut s, &mut st, &sm, 0, target, -10), 0);
+        assert_eq!(set_nice(&mut s, &mut st, &sm, 0, target, -11), eacces);
+        assert_eq!(set_nice(&mut k, &mut t, &m, 0, target, -20), 0);
+    }
+    #[test]
+    fn prio_user_finds_the_real_user_id_and_a_refusal_wins() {
+        let (mut k, mut t, m) = setup();
+        let (mut a, mut at, am) = fork(&mut k, &mut t, &m);
+        become_user(&mut a, &mut at, &am, 2000);
+        let (mut b, mut bt, bm) = fork(&mut k, &mut t, &m);
+        // Effective 2000, real 3000: not user 2000.
+        assert_eq!(
+            syscall(&mut b, &mut bt, &bm, 117, [3000, 2000, 3000, 0, 0, 0]),
+            0
+        );
+        let (a_id, b_id) = (u64::from(at.tid), u64::from(bt.tid));
+        assert_eq!(set_nice(&mut k, &mut t, &m, 2, 2000, 5), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 140, [0, a_id, 0, 0, 0, 0]), 15);
+        assert_eq!(syscall(&mut k, &mut t, &m, 140, [0, b_id, 0, 0, 0, 0]), 20);
+        assert_eq!(
+            set_nice(&mut k, &mut t, &m, 2, 4000, 5),
+            Errno(3).to_syscall_return()
+        );
+        // Who 0 is the caller's real user ID.
+        assert_eq!(syscall(&mut a, &mut at, &am, 140, [2, 0, 0, 0, 0, 0]), 15);
+        // In one group, the thread it may change changes though another refuses.
+        let (mut o, mut ot, om) = fork(&mut k, &mut t, &m);
+        become_user(&mut o, &mut ot, &om, 4000);
+        let other = u64::from(ot.tid);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 109, [a_id, a_id, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 109, [other, a_id, 0, 0, 0, 0]),
+            0
+        );
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        become_user(&mut s, &mut st, &sm, 2000);
+        assert_eq!(
+            set_nice(&mut s, &mut st, &sm, 1, a_id, 7),
+            Errno::EPERM.to_syscall_return()
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 140, [0, a_id, 0, 0, 0, 0]), 13);
+        assert_eq!(syscall(&mut k, &mut t, &m, 140, [0, other, 0, 0, 0, 0]), 20);
+        // The refusal stands though a later thread changes.
+        assert_eq!(
+            set_nice(&mut o, &mut ot, &om, 1, a_id, 9),
+            Errno::EPERM.to_syscall_return()
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 140, [0, other, 0, 0, 0, 0]), 11);
+    }
+}
 mod signal_permissions {
     use super::*;
     /// `setresuid` for thread `t`.

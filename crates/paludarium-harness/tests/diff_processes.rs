@@ -122,12 +122,16 @@ mod linux {
             let program = dir.join(binary);
             let self_path = program.to_str().unwrap().to_owned();
             let args = [mode.to_owned(), self_path.clone()];
-            // The credentials, permissions, setuid and signal-permissions cases
-            // change IDs as root, so Linux runs them as root, through sudo when
-            // the tests do not run as root.
+            // The credentials, permissions, setuid, signal-permissions and
+            // limit-permissions cases change IDs as root, so Linux runs them as
+            // root, through sudo when the tests do not run as root.
             let as_root = matches!(
                 mode,
-                "credentials" | "permissions" | "setuid" | "signal-permissions"
+                "credentials"
+                    | "permissions"
+                    | "setuid"
+                    | "signal-permissions"
+                    | "limit-permissions"
             );
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
@@ -214,6 +218,7 @@ mod linux {
         processes_permissions => ("permissions","process"),
         processes_setuid => ("setuid","process"),
         processes_signal_permissions => ("signal-permissions","process"),
+        processes_limit_permissions => ("limit-permissions","process"),
         processes_waitid => ("waitid","process"),
         processes_autoreap => ("autoreap","process"),
         processes_reparent => ("reparent","process"),

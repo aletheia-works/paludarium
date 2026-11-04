@@ -123,9 +123,9 @@ mod linux {
             let self_path = program.to_str().unwrap().to_owned();
             let args = [mode.to_owned(), self_path.clone()];
             // The credentials, permissions, setuid, signal-permissions,
-            // limit-permissions, peer-credentials, core-credentials, set-id-writes
-            // and socket-owners cases change IDs as root, so Linux runs them as root, through sudo when
-            // the tests do not run as root.
+            // limit-permissions, peer-credentials, core-credentials,
+            // set-id-writes and socket-owners cases change IDs as root, so Linux
+            // runs them as root, through sudo when the tests do not run as root.
             let as_root = matches!(
                 mode,
                 "credentials"

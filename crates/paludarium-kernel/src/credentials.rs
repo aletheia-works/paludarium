@@ -569,8 +569,6 @@ pub(crate) fn sys_getgroups(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Err(_) => err(Errno::EFAULT),
     }
 }
-/// `setgroups(size, list)`: with CAP_SETGID, at most `NGROUPS_MAX` groups,
-/// none the ID that names no group; kept sorted.
 /// Linux's `cap_validate_magic`: how many 32-bit sets the header's version
 /// has, or for another version writes back the newest and is EINVAL.
 fn capability_sets(c: &Context<'_>, header: u64) -> Result<usize, Errno> {
@@ -619,7 +617,7 @@ pub(crate) fn sys_capget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     } else {
         match c.processes.task_ids(pid) {
             Some(ids) => ids,
-            None => return err(Errno(3)),
+            None => return err(Errno(3)), // ESRCH
         }
     };
     let mut bytes = Vec::with_capacity(sets * 12);
@@ -670,6 +668,8 @@ pub(crate) fn sys_capset(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         .capset(effective, permitted, inheritable);
     set(c, change)
 }
+/// `setgroups(size, list)`: with CAP_SETGID, at most `NGROUPS_MAX` groups,
+/// none the ID that names no group; kept sorted.
 pub(crate) fn sys_setgroups(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if !c.process.credentials.may_setgid() {
         return err(Errno::EPERM);

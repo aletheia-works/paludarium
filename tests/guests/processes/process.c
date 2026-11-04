@@ -9014,6 +9014,21 @@ int main(int argc, char **argv) {
             caps_show("leader-after-thread", 0);
             caps_thread_done = 1;
             pthread_join(thread, NULL);
+            /* A thread that has ended is gone, once it is joined. */
+            while (kill(getpid(), 0) == 0 && syscall(SYS_tgkill, getpid(), caps_thread_id, 0) == 0) sched_yield();
+            caps_show("thread-ended", caps_thread_id);
+            /* A zombie keeps its sets until it is reaped. */
+            fflush(stdout);
+            pid_t zombie = child();
+            if (zombie == 0) {
+                if (caps_set(0x3, 0x7, 0x1)) _exit(1);
+                _exit(0);
+            }
+            siginfo_t info;
+            waitid(P_PID, zombie, &info, WEXITED | WNOWAIT);
+            caps_show("zombie", zombie);
+            waitpid(zombie, NULL, 0);
+            caps_show("reaped", zombie);
         });
         /* What capset allows. */
         AS_SENDER(0, 0, 0, {

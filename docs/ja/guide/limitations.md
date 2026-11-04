@@ -84,7 +84,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ことがあります。
 - **資格情報**：スレッドが変えた ID とケーパビリティは、ファイル、シグナル、資源の上限、
   優先度では確かめますが、ほかのところではまだ確かめていません。`SCM_CREDENTIALS`、
-  `SO_PEERCRED`、コアの `pr_uid` と `pr_gid` は root の ID のままです。`F_SETOWN` は設定した側の資格情報を記録しないので、
+  `SO_PEERCRED`、コアの `pr_uid` と `pr_gid` は root の ID のままです。
+  `F_SETOWN` は設定した側の資格情報を記録しないので、
   `SIGIO` と `SIGURG` は、Linux の `sigio_perm` と違い、だれが設定しても持ち主に届きます。
   `PR_SET_PDEATHSIG` のシグナルは、親プロセスが終わったときにそのリーダーの ID で送りますが、
   Linux は子を作ったスレッドが終わったときにそのスレッドの ID で送ります。

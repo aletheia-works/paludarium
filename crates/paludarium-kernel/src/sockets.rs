@@ -814,10 +814,7 @@ fn as_socket(file: &Arc<dyn FileHandle>) -> Result<&SocketPairEnd, Errno> {
 /// exactly one `struct ucred` (EINVAL), the last one counting: neither ID
 /// may be -1 (EINVAL), `scm_check_creds` must allow it (EPERM), and then the
 /// process ID must name a process or thread (ESRCH).
-fn control_messages(
-    c: &Context<'_>,
-    control: &[u8],
-) -> Result<(Passed, Option<Credentials>), Errno> {
+fn control_messages(c: &Context<'_>, control: &[u8]) -> Result<(Passed, Option<Ucred>), Errno> {
     let mut passed = Passed::new();
     let mut credentials = None;
     let mut at = 0;
@@ -854,7 +851,7 @@ fn control_messages(
             if pid.cast_signed() <= 0 || !c.processes.owner_exists(owner) {
                 return Err(Errno(3));
             }
-            credentials = Some(Credentials { pid, uid, gid });
+            credentials = Some(Ucred { pid, uid, gid });
         } else if field(at + 8) == SOL_SOCKET {
             if field(at + 12) != SCM_RIGHTS {
                 return Err(Errno::EINVAL);
@@ -1268,7 +1265,7 @@ fn deliver(
     c: &mut Context<'_>,
     header: &MessageHeader,
     received: Received,
-    (credentials, pidfd, security): (Option<Credentials>, Option<u32>, bool),
+    (credentials, pidfd, security): (Option<Ucred>, Option<u32>, bool),
     cloexec: bool,
 ) -> (u64, bool) {
     let passed = received.passed;
@@ -1629,7 +1626,7 @@ pub(crate) fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// (EOPNOTSUPP for another level), an `int` value of fewer than 4 bytes is
 /// EINVAL, and an unknown name, or one only read (`SO_PEERPIDFD`), is
 /// ENOPROTOOPT. `SO_PASSCRED` makes messages carry credentials
-/// ([`Credentials`]), `SO_PASSPIDFD` them and a pidfd of their sender
+/// ([`Ucred`]), `SO_PASSPIDFD` them and a pidfd of their sender
 /// ([`put_pidfd`]), `SO_PASSSEC` their sender's security context, which
 /// there is none of ([`deliver`]), `SO_PASSRIGHTS` 0 refuses descriptors
 /// (`EPERM` for a send that passes some), `SO_TIMESTAMP` and its kin, and
@@ -1637,8 +1634,8 @@ pub(crate) fn buffer_size(value: i32, forced: bool, least: i32) -> i32 {
 /// stream read waits for ([`receive_with`]; 0 is 1, and a negative value
 /// `INT_MAX`), and `SO_PEEK_OFF` where a peek starts (any value, a negative
 /// one for none). `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
-/// `timeval` ([`Timeout`]). The guest runs as root, so the options that need
-/// `CAP_NET_ADMIN` are set.
+/// `timeval` ([`Timeout`]). Capabilities are not checked here, so the options
+/// that need `CAP_NET_ADMIN` are set as for root.
 fn set_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let file = socket(c, a[0])?;
     let socket = as_socket(&file)?;
@@ -1814,7 +1811,7 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         // none process 0, and -1 for the IDs, as Linux's `cred_to_ucred`
         // gives them.
         SO_PEERCRED => {
-            let peer = socket.peer().unwrap_or(Credentials {
+            let peer = socket.peer().unwrap_or(Ucred {
                 pid: 0,
                 uid: u32::MAX,
                 gid: u32::MAX,
@@ -1860,7 +1857,7 @@ struct Write {
     len: usize,
     passed: Passed,
     piece: Piece,
-    credentials: Credentials,
+    credentials: Ucred,
     /// A message a peek has seen, which a peek from `SO_PEEK_OFF` passes
     /// over once its offset reaches the message's end, empty or not, as
     /// Linux's `skb->peeked`.
@@ -1932,12 +1929,12 @@ fn stream_truesize(len: usize) -> usize {
 /// itself, else none, which a receiver reads as process 0 and the overflow
 /// IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Credentials {
+pub(crate) struct Ucred {
     pid: u32,
     uid: u32,
     gid: u32,
 }
-impl Default for Credentials {
+impl Default for Ucred {
     fn default() -> Self {
         Self {
             pid: 0,
@@ -1946,7 +1943,7 @@ impl Default for Credentials {
         }
     }
 }
-impl Credentials {
+impl Ucred {
     /// What `SO_PEERCRED` records of the thread with `credentials` in
     /// process `pid`: its effective IDs, as Linux's `cred_to_ucred` reads.
     pub(crate) fn of_peer(pid: u32, credentials: &crate::credentials::Credentials) -> Self {
@@ -1964,7 +1961,7 @@ pub(crate) struct Sender {
     pid: u32,
     uid: u32,
     gid: u32,
-    credentials: Option<Credentials>,
+    credentials: Option<Ucred>,
 }
 impl Sender {
     pub(crate) fn process(pid: u32, credentials: &crate::credentials::Credentials) -> Self {
@@ -1977,16 +1974,16 @@ impl Sender {
     }
     /// What a write by this sender carries, when an end `passes` them: its
     /// process and real IDs, as Linux's `maybe_add_creds`, or as
-    /// [`Credentials`] says.
-    fn credentials(self, passes: bool) -> Credentials {
+    /// [`Ucred`] says.
+    fn credentials(self, passes: bool) -> Ucred {
         self.credentials.unwrap_or(if passes {
-            Credentials {
+            Ucred {
                 pid: self.pid,
                 uid: self.uid,
                 gid: self.gid,
             }
         } else {
-            Credentials::default()
+            Ucred::default()
         })
     }
 }
@@ -2012,7 +2009,7 @@ pub(crate) struct Received {
     /// A stream read stopped at the out-of-band mark.
     at_mark: bool,
     /// The credentials of the data read.
-    pub(crate) credentials: Credentials,
+    pub(crate) credentials: Ucred,
     /// A stream read with `SO_PASSCRED` or `SO_PASSPIDFD` stopped before
     /// data of other credentials.
     other_sender: bool,
@@ -2266,7 +2263,7 @@ struct Pair {
     /// What each end's `SO_PEERCRED` names, as Linux's `sk_peer_pid` and
     /// `sk_peer_cred`: for a pair, the thread that made it, as
     /// `unix_socketpair` records its credentials.
-    peers: Mutex<[Option<Credentials>; 2]>,
+    peers: Mutex<[Option<Ucred>; 2]>,
     /// What each end has sent and that waits takes of its send buffer
     /// ([`Charge`]), and that buffer (`SO_SNDBUF`, doubled), which a read
     /// at the other end looks at to wake it, as Linux's `sock_wfree` calls
@@ -2401,7 +2398,7 @@ impl SocketPairEnd {
         let _ = self.pair.clock.set(Arc::clone(host));
     }
     /// What this end's `SO_PEERCRED` names, if anything.
-    pub(crate) fn peer(&self) -> Option<Credentials> {
+    pub(crate) fn peer(&self) -> Option<Ucred> {
         self.pair
             .peers
             .lock()
@@ -2413,7 +2410,7 @@ impl SocketPairEnd {
     }
     /// This end's `SO_PEERCRED` names `peer`, as Linux's `init_peercred`
     /// and `copy_peercred` set it.
-    pub(crate) fn set_peer(&self, peer: Option<Credentials>) {
+    pub(crate) fn set_peer(&self, peer: Option<Ucred>) {
         self.pair
             .peers
             .lock()
@@ -2665,7 +2662,7 @@ impl SocketPairEnd {
     /// whole call, it stops at the out-of-band mark rather than drop or pass
     /// it, and with `SO_PASSCRED` before data of other `credentials` than it
     /// read.
-    fn receive_more(&self, buf: &mut [u8], credentials: Credentials) -> Result<Received, Errno> {
+    fn receive_more(&self, buf: &mut [u8], credentials: Ucred) -> Result<Received, Errno> {
         let result = self.read_stream(buf, false, Some(credentials));
         self.after_read(false, &result);
         result
@@ -2992,7 +2989,7 @@ impl SocketPairEnd {
         &self,
         buf: &mut [u8],
         peek: bool,
-        after: Option<Credentials>,
+        after: Option<Ucred>,
     ) -> Result<Received, Errno> {
         let inline = self.out_of_band_inline();
         let mut sides = self

@@ -136,7 +136,7 @@ pub(crate) fn pair(c: &Context<'_>, kind: u32) -> Result<[Arc<UnixSocket>; 2], E
     let sockets: [Arc<UnixSocket>; 2] = std::array::from_fn(|side| {
         let end = Arc::clone(&ends[side]);
         // SO_PEERCRED names the thread that made the pair, at both ends.
-        end.set_peer(Some(crate::sockets::Credentials::of_peer(
+        end.set_peer(Some(crate::sockets::Ucred::of_peer(
             c.process.pid,
             &c.process.credentials,
         )));
@@ -460,7 +460,7 @@ impl UnixSocket {
                 });
             }
         }
-        self.end.set_peer(Some(crate::sockets::Credentials::of_peer(
+        self.end.set_peer(Some(crate::sockets::Ucred::of_peer(
             c.process.pid,
             &c.process.credentials,
         )));
@@ -549,7 +549,7 @@ impl UnixSocket {
         // As unix_stream_connect: the accepted socket names the connecting
         // process, the client the listener's (copy_peercred).
         client.end.set_peer(self.end.peer());
-        spare.set_peer(Some(crate::sockets::Credentials::of_peer(
+        spare.set_peer(Some(crate::sockets::Ucred::of_peer(
             c.process.pid,
             &c.process.credentials,
         )));

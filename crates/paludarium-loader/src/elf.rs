@@ -32,6 +32,7 @@ pub struct ProgramHeader {
     pub vaddr: u64,
     pub filesz: u64,
     pub memsz: u64,
+    pub align: u64,
 }
 
 /// The parts of an ELF file the loader needs.
@@ -45,6 +46,28 @@ pub struct ElfInfo {
 }
 
 impl ElfInfo {
+    /// The path of the interpreter the program asks for, as Linux's
+    /// `load_elf_binary` reads its first `PT_INTERP`: of 2 to `PATH_MAX` bytes
+    /// ending in a zero (else not a program), which must be in the file (EIO).
+    pub fn interpreter<'a>(&self, bytes: &'a [u8]) -> Result<Option<&'a [u8]>, LoadError> {
+        const PATH_MAX: u64 = 4096;
+        let Some(h) = self.headers.iter().find(|h| h.kind == PT_INTERP) else {
+            return Ok(None);
+        };
+        if !(2..=PATH_MAX).contains(&h.filesz) {
+            return Err(LoadError::Malformed("interpreter path of a bad length"));
+        }
+        let path = usize::try_from(h.offset)
+            .ok()
+            .and_then(|from| Some(from..from.checked_add(usize::try_from(h.filesz).ok()?)?))
+            .and_then(|range| bytes.get(range))
+            .ok_or(LoadError::Interpreter(paludarium_types::Errno(5)))?;
+        if path.last() != Some(&0) {
+            return Err(LoadError::Malformed("interpreter path not terminated"));
+        }
+        let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+        Ok(Some(&path[..end]))
+    }
     /// The `PT_LOAD` segments that occupy memory.
     pub fn loads(&self) -> impl Iterator<Item = &ProgramHeader> {
         self.headers
@@ -123,10 +146,8 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
             vaddr: u64_at(bytes, at + 16)?,
             filesz: u64_at(bytes, at + 32)?,
             memsz: u64_at(bytes, at + 40)?,
+            align: u64_at(bytes, at + 48)?,
         };
-        if h.kind == PT_INTERP {
-            return Err(LoadError::NotStaticMusl);
-        }
         if h.kind == PT_LOAD {
             let file_end = h
                 .offset

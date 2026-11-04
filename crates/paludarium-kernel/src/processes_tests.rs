@@ -1191,6 +1191,65 @@ mod exec {
             })
             .collect()
     }
+    /// A program that asks for the interpreter `path`.
+    fn asks_for(path: &[u8]) -> Vec<u8> {
+        let mut image = paludarium_loader::testing::tiny_exec(&[0x90], b"");
+        // Turn its data segment's header into a PT_INTERP that names `path`,
+        // at the end of the file.
+        let offset = image.len() as u64;
+        image.extend_from_slice(path);
+        let header = 64 + 56;
+        image[header..header + 4].copy_from_slice(&3u32.to_le_bytes());
+        image[header + 8..header + 16].copy_from_slice(&offset.to_le_bytes());
+        let size = (path.len() as u64).to_le_bytes();
+        image[header + 32..header + 40].copy_from_slice(&size);
+        image[header + 40..header + 48].copy_from_slice(&size);
+        image
+    }
+    #[test]
+    fn exec_checks_the_interpreter_with_the_callers_permissions() {
+        // Position independent, so it does not collide with the program.
+        let mut linker = paludarium_loader::testing::tiny_exec(&[0x90], b"");
+        linker[16] = 3;
+        let (via_child, via_none, via_empty, via_dir) = (
+            asks_for(b"/ld\0"),
+            asks_for(b"/absent\0"),
+            asks_for(b"\0\0"),
+            asks_for(b"/\0"),
+        );
+        let (mut k, mut t, m) = with_scripts(&[
+            ("/ok", &via_child),
+            ("/none", &via_none),
+            ("/empty", &via_empty),
+            ("/dir", &via_dir),
+            ("/ld", &linker),
+        ]);
+        let fail = |e: i32| Errno(e).to_syscall_return();
+        assert_eq!(run(&mut k, &mut t, &m, b"/none"), fail(2));
+        assert_eq!(run(&mut k, &mut t, &m, b"/empty"), fail(13));
+        assert_eq!(run(&mut k, &mut t, &m, b"/dir"), fail(13));
+        // Not executable, even for root.
+        k.files.fs.set_mode(b"/ld", 0o644).unwrap();
+        assert_eq!(run(&mut k, &mut t, &m, b"/ok"), fail(13));
+        // Executable but not readable: it runs, undumpable.
+        k.files.fs.set_mode(b"/ld", 0o111).unwrap();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let user = [2000, 2000, 2000, 0, 0, 0];
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 117, user), 0);
+        assert_eq!(run(&mut c, &mut ct, &cm, b"/ok"), 0);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [3, 0, 0, 0, 0, 0]), 0);
+        // Readable: dumpable, and its set-ID bits do not count.
+        k.files
+            .fs
+            .set_owner(b"/ld", true, Some(3000), None)
+            .unwrap();
+        k.files.fs.set_mode(b"/ld", 0o4755).unwrap();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 117, user), 0);
+        assert_eq!(run(&mut c, &mut ct, &cm, b"/ok"), 0);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [3, 0, 0, 0, 0, 0]), 1);
+        assert_eq!(ct.state.credentials.euid, 2000);
+    }
     #[test]
     fn a_script_runs_its_interpreter_with_its_path_in_place_of_argv_0() {
         let (mut k, mut t, m) = with_scripts(&[("/s", b"#!/child one two\n")]);

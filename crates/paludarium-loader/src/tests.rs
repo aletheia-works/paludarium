@@ -286,6 +286,122 @@ fn rejects_invalid_headers() {
     ));
 }
 
+/// A program of `kind` that asks for the interpreter `path`, bytes and all.
+fn asks_for(kind: u16, entry: u64, path: &[u8]) -> Vec<u8> {
+    build_elf(
+        kind,
+        entry,
+        &[
+            Seg {
+                kind: elf::PT_INTERP,
+                flags: 4,
+                vaddr: 0x400000,
+                data: path.to_vec(),
+                memsz: path.len() as u64,
+            },
+            load_seg(elf::PF_R | elf::PF_X, 0x401000, &[0xf4; 16], 16),
+        ],
+    )
+}
+fn linker() -> Vec<u8> {
+    build_elf(
+        elf::ET_DYN,
+        0x1000,
+        &[load_seg(elf::PF_R | elf::PF_X, 0x1000, &[0x90; 16], 16)],
+    )
+}
+fn files(entries: &[(&str, Vec<u8>)]) -> MemFs {
+    let mut fs = MemFs::new();
+    for (name, bytes) in entries {
+        fs.add_file(GuestFile::new(*name, bytes.clone())).unwrap();
+    }
+    fs
+}
+#[test]
+fn a_program_starts_in_its_interpreter_and_the_auxiliary_vector_says_so() {
+    let fs = files(&[
+        ("/prog", asks_for(elf::ET_EXEC, 0x401000, b"/ld\0")),
+        ("/ld", linker()),
+    ]);
+    let mut mem = AddressSpace::new();
+    let image = load(&fs, b"/prog", &start(&[], &[]), &mut mem).unwrap();
+    let at = image.interpreter_base;
+    assert_ne!(at, 0);
+    assert!(at.is_multiple_of(PAGE_SIZE));
+    assert!(at < paludarium_mmu::DEFAULT_MMAP_TOP);
+    assert_eq!(image.entry_point, GuestAddr(at + 0x1000));
+    assert_eq!(image.program_entry, GuestAddr(0x401000));
+    // Its bytes are there, and the program's too.
+    let mut byte = [0];
+    mem.read(GuestAddr(at + 0x1000), &mut byte).unwrap();
+    assert_eq!(byte, [0x90]);
+    mem.read(GuestAddr(0x401000), &mut byte).unwrap();
+    assert_eq!(byte, [0xf4]);
+    // The break follows the program.
+    assert_eq!(image.initial_break, GuestAddr(0x402000));
+    // After argc and the two empty lists.
+    let aux = image.initial_stack_pointer.0 + 24;
+    assert_eq!(aux_value(&mem, aux, auxv::AT_BASE), Some(at));
+    assert_eq!(aux_value(&mem, aux, auxv::AT_ENTRY), Some(0x401000));
+}
+#[test]
+fn a_program_with_no_interpreter_has_no_base_and_starts_at_its_entry() {
+    let fs = files(&[("/prog", simple_exec())]);
+    let mut mem = AddressSpace::new();
+    let image = load(&fs, b"/prog", &start(&[], &[]), &mut mem).unwrap();
+    assert_eq!(image.interpreter_base, 0);
+    assert_eq!(image.entry_point, image.program_entry);
+}
+#[test]
+fn an_interpreter_path_and_file_are_checked_as_linux_does() {
+    let try_load = |program: Vec<u8>, ld: &[u8]| {
+        let fs = files(&[("/prog", program), ("/ld", ld.to_vec())]);
+        load(&fs, b"/prog", &start(&[], &[]), &mut AddressSpace::new()).err()
+    };
+    let exec = |path: &[u8]| asks_for(elf::ET_EXEC, 0x401000, path);
+    let linker = linker();
+    let refused = |error| Some(LoadError::Interpreter(error));
+    // The path: at least 2 bytes, ending in a zero; an inner zero ends it.
+    assert!(matches!(
+        try_load(exec(b"\0"), &linker),
+        Some(LoadError::Malformed(_))
+    ));
+    assert!(matches!(
+        try_load(exec(b"/ld"), &linker),
+        Some(LoadError::Malformed(_))
+    ));
+    assert_eq!(try_load(exec(b"/ld\0xx\0"), &linker), None);
+    assert_eq!(try_load(exec(b"/none\0"), &linker), refused(Errno::ENOENT));
+    // The file: too short to read, or no x86-64 program.
+    assert_eq!(try_load(exec(b"/ld\0"), b"short"), refused(Errno(5)));
+    assert_eq!(try_load(exec(b"/ld\0"), &[b'#'; 200]), refused(Errno(80)));
+    // A check that refuses comes before the file is read.
+    let fs = files(&[("/prog", exec(b"/ld\0")), ("/ld", linker.clone())]);
+    let mut mem = AddressSpace::new();
+    assert_eq!(
+        load_with(&fs, b"/prog", &start(&[], &[]), &mut mem, &mut |name| {
+            assert_eq!(name, b"/ld");
+            Err(Errno::EACCES)
+        }),
+        Err(LoadError::Interpreter(Errno::EACCES))
+    );
+    assert_eq!(mem.mappings().count(), 0, "nothing was mapped");
+}
+#[test]
+fn a_position_dependent_interpreter_stays_where_it_says() {
+    let ld = build_elf(
+        elf::ET_EXEC,
+        0x70_0000,
+        &[load_seg(elf::PF_R | elf::PF_X, 0x70_0000, &[0x90; 16], 16)],
+    );
+    let fs = files(&[
+        ("/prog", asks_for(elf::ET_EXEC, 0x401000, b"/ld\0")),
+        ("/ld", ld),
+    ]);
+    let mut mem = AddressSpace::new();
+    let image = load(&fs, b"/prog", &start(&[], &[]), &mut mem).unwrap();
+    assert_eq!(image.entry_point, GuestAddr(0x70_0000));
+}
 #[test]
 fn rejects_interpreter_and_bad_segments() {
     let mut mem = AddressSpace::new();
@@ -298,15 +414,16 @@ fn rejects_interpreter_and_bad_segments() {
                 kind: elf::PT_INTERP,
                 flags: 4,
                 vaddr: 0x400000,
-                data: b"/lib/ld".to_vec(),
-                memsz: 7,
+                data: b"/lib/ld\0".to_vec(),
+                memsz: 8,
             },
             load_seg(elf::PF_R, 0x401000, &[0], 1),
         ],
     );
+    // Bytes in memory have no file system to find an interpreter in.
     assert_eq!(
         load_bytes(&interp, &s, &mut mem),
-        Err(LoadError::NotStaticMusl)
+        Err(LoadError::Interpreter(Errno::ENOENT))
     );
     let bad_size = build_elf(
         elf::ET_EXEC,
@@ -376,7 +493,7 @@ fn loads_from_the_file_system_and_limits_arguments() {
         load(&fs, b"/prog", &start(&big, &[]), &mut AddressSpace::new()),
         Err(LoadError::TooLarge)
     );
-    let err: Error = LoadError::NotStaticMusl.into();
+    let err: Error = LoadError::Interpreter(Errno::ENOENT).into();
     assert_eq!(err.kind, ErrorKind::InvalidProgram);
 }
 

@@ -499,7 +499,11 @@ kernel.
   permitted capabilities), and with `AT_EACCESS` the filesystem ones.
   `execve` needs a regular file the thread may execute (else `EACCES`, also
   for a directory and for root when no execute bit is set), and a program
-  it may not read runs undumpable. A file that starts with `#!` runs its
+  it may not read runs undumpable. A program with a `PT_INTERP` starts in that
+  interpreter, as Linux's `load_elf_binary` does, with `AT_BASE` and `AT_ENTRY`
+  to find the program. The interpreter needs the same permissions and counts the
+  same for dumping, its set-ID bits do not count, and a file that is no x86-64
+  program is `ELIBBAD`. A file that starts with `#!` runs its
   interpreter as Linux's `load_script` does: the first line, within 255 bytes,
   names it and may give it one argument, its arguments are that name, that
   argument and the script's path in place of `argv[0]`, and the interpreter's

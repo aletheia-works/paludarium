@@ -9400,6 +9400,116 @@ int main(int argc, char **argv) {
                getauxval(AT_SECURE), prctl(PR_GET_DUMPABLE) == 1);
         return 0;
     }
+    if (!strcmp(mode, "dynamic-exec")) {
+        /* load_elf_binary: the interpreter a program names. A copy of the
+           dynamic program is patched in the bytes of its PT_INTERP. */
+        char dir[] = "/tmp/dynamic-exec-XXXXXX";
+        if (!mkdtemp(dir)) return 80;
+        char path[PATH_MAX];
+        snprintf(path, sizeof path, "%s", self);
+        char *slash = strrchr(path, '/');
+        if (!slash) return 80;
+        strcpy(slash + 1, "dynamic");
+        static unsigned char image[1 << 20];
+        int fd = open(path, O_RDONLY);
+        long size = fd < 0 ? -1 : read(fd, image, sizeof image);
+        if (size <= 0) return 81;
+        close(fd);
+        static unsigned char linker[1 << 22];
+        fd = open("/lib/ld-musl-x86_64.so.1", O_RDONLY);
+        long linker_size = fd < 0 ? -1 : read(fd, linker, sizeof linker);
+        if (linker_size <= 0) return 82;
+        close(fd);
+        if (chdir(dir) || chmod(".", 0777)) return 83;
+        umask(022);
+        script_file("ld", (char *)linker, linker_size, 0755);
+        /* The program headers, and its PT_INTERP. */
+        uint64_t phoff;
+        uint16_t phnum;
+        memcpy(&phoff, image + 32, 8);
+        memcpy(&phnum, image + 56, 2);
+        unsigned char *interp = NULL;
+        for (int i = 0; i < phnum; i++) {
+            uint32_t kind;
+            memcpy(&kind, image + phoff + 56 * i, 4);
+            if (kind == 3) interp = image + phoff + 56 * i;
+        }
+        if (!interp) return 84;
+        uint64_t path_offset, path_size;
+        memcpy(&path_offset, interp + 8, 8);
+        memcpy(&path_size, interp + 32, 8);
+        char *show[] = {"./p", "dynamic-ids", NULL};
+#define DYNAMIC_AS(label, name, size_given, offset_given, mode_given, uid) do { \
+            static unsigned char patched[1 << 20]; \
+            memcpy(patched, image, size); \
+            memset(patched + path_offset, 0, path_size); \
+            memcpy(patched + path_offset, name, strlen(name)); \
+            uint64_t given_size = (size_given), given_offset = (offset_given); \
+            memcpy(patched + (interp - image) + 32, &given_size, 8); \
+            memcpy(patched + (interp - image) + 40, &given_size, 8); \
+            memcpy(patched + (interp - image) + 8, &given_offset, 8); \
+            script_file("p", (char *)patched, size, mode_given); \
+            script_run(label, "./p", show, uid); \
+        } while (0)
+#define DYNAMIC(label, name) DYNAMIC_AS(label, name, path_size, path_offset, 0755, 0)
+        DYNAMIC("relative", "./ld");
+        DYNAMIC("absolute", "/lib/ld-musl-x86_64.so.1");
+        /* The path. */
+        DYNAMIC("missing", "./none");
+        DYNAMIC_AS("too-short", "./ld", 1, path_offset, 0755, 0);
+        DYNAMIC_AS("empty-path", "", 2, path_offset, 0755, 0);
+        DYNAMIC_AS("too-long", "./ld", 4097, path_offset, 0755, 0);
+        DYNAMIC_AS("not-terminated", "./ld", 4, path_offset, 0755, 0);
+        DYNAMIC_AS("past-the-file", "./ld", 5, (uint64_t)size + 1000, 0755, 0);
+        /* What it names. */
+        if (mkdir("d", 0755)) return 85;
+        DYNAMIC("directory", "./d");
+        script_file("noexec", (char *)linker, linker_size, 0644);
+        DYNAMIC_AS("not-executable-user", "./noexec", path_size, path_offset, 0755, 2000);
+        DYNAMIC("not-executable-root", "./noexec");
+        char text[256];
+        memset(text, '#', sizeof text);
+        script_file("text", text, sizeof text, 0755);
+        DYNAMIC("text", "./text");
+        script_file("short", "ab", 2, 0755);
+        DYNAMIC("short", "./short");
+        script_file("blank", "", 0, 0755);
+        DYNAMIC("empty", "./blank");
+        script_file("script", "#!./ld\n", 7, 0755);
+        DYNAMIC("script", "./script");
+        /* A program with an interpreter of its own, which does not count. */
+        DYNAMIC("itself", "./p");
+        /* Its permissions count, not its set-ID bits. */
+        DYNAMIC_AS("user", "./ld", path_size, path_offset, 0755, 2000);
+        script_file("no-read", (char *)linker, linker_size, 0111);
+        DYNAMIC_AS("not-readable", "./no-read", path_size, path_offset, 0755, 2000);
+        script_file("set-id", (char *)linker, linker_size, 0755);
+        if (chown("set-id", 3000, 3000) || chmod("set-id", 06755)) return 86;
+        DYNAMIC_AS("linker-set-id", "./set-id", path_size, path_offset, 0755, 2000);
+        /* The program's do. */
+        memcpy(image + path_offset, "./ld", 5);
+        for (uint64_t i = 5; i < path_size; i++) image[path_offset + i] = 0;
+        script_file("set", (char *)image, size, 0755);
+        if (chown("set", 3000, 3000) || chmod("set", 06755)) return 87;
+        char *set_args[] = {"./set", "dynamic-ids", NULL};
+        script_run("program-set-id", "./set", set_args, 2000);
+        script_file("set", (char *)image, size, 0111);
+        script_run("program-not-readable", "./set", set_args, 2000);
+        /* A script of it, and the linker run as a program. */
+        script_file("set", (char *)image, size, 0755);
+        script_file("s", "#!./set dynamic-ids\n", 20, 0755);
+        char *script_args[] = {"./s", NULL};
+        script_run("from-a-script", "./s", script_args, 0);
+        char *direct[] = {"./ld", "./set", "dynamic-ids", NULL};
+        script_run("linker-directly", "./ld", direct, 0);
+        fflush(stdout);
+        static const char *const files[] = {
+            "ld", "p", "noexec", "text", "short", "blank", "script", "no-read", "set-id", "set", "s",
+        };
+        for (size_t i = 0; i < sizeof files / sizeof *files; i++) unlink(files[i]);
+        if (rmdir("d") || chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
     if (!strcmp(mode, "limit-permissions")) {
         int status = 0;
         /* A known start: the caller's limits and nice value are not. */

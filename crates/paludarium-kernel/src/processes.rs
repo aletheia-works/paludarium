@@ -1992,15 +1992,35 @@ impl Kernel {
             Some(meter) => AddressSpace::new().with_memory_meter(meter),
             None => AddressSpace::new(),
         };
-        let image = paludarium_loader::load(&*self.files.fs, &loaded, &start, &mut memory)
-            .map_err(|error| match error {
-                // The new image did not fit under the memory limit.
-                _ if memory.take_out_of_memory() => Errno::ENOMEM,
-                LoadError::NotFound => Errno::ENOENT,
-                LoadError::TooLarge => Errno(7),
-                LoadError::Errno(error) => error,
-                _ => Errno(8),
-            })?;
+        let image = paludarium_loader::load_with(
+            &*self.files.fs,
+            &loaded,
+            &start,
+            &mut memory,
+            // As Linux's `open_exec` of it: it needs execute permission
+            // (EACCES), and an unreadable one makes the program undumpable
+            // (`would_dump`). Its set-ID bits do not count.
+            &mut |name| {
+                // An empty name finds the working directory.
+                if name.is_empty() {
+                    return Err(Errno::EACCES);
+                }
+                let path = self.files.exec_path(name.to_vec())?;
+                let (_, may_read) =
+                    crate::permissions::exec(&self.files, &thread.state.credentials, name, &path)?;
+                readable &= may_read;
+                Ok(path)
+            },
+        )
+        .map_err(|error| match error {
+            // The new image did not fit under the memory limit.
+            _ if memory.take_out_of_memory() => Errno::ENOMEM,
+            LoadError::NotFound => Errno::ENOENT,
+            LoadError::Interpreter(error) => error,
+            LoadError::TooLarge => Errno(7),
+            LoadError::Errno(error) => error,
+            _ => Errno(8),
+        })?;
         // All validation precedes retirement. Old siblings must stop touching
         // their image and shared descriptors before the replacement is visible.
         self.group.begin_exec(thread.tid)?;

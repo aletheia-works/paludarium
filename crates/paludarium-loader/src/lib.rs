@@ -1,7 +1,7 @@
-//! Static ELF loader for paludarium.
+//! ELF loader for paludarium.
 //!
-//! Loads static x86-64 executables (`ET_EXEC`, and `ET_DYN` static-pie
-//! without an interpreter) into a guest address space and builds the initial
+//! Loads x86-64 executables (`ET_EXEC` and `ET_DYN`), and the interpreter one
+//! asks for with `PT_INTERP`, into a guest address space and builds the initial
 //! stack with argc, argv, envp and the auxiliary vector exactly as Linux lays
 //! them out. Static-pie images relocate themselves (musl's start code), so
 //! the loader does not apply relocations.
@@ -59,8 +59,8 @@ pub mod auxv {
 pub enum LoadError {
     /// The path does not name a file.
     NotFound,
-    /// The program needs a dynamic linker (`PT_INTERP`).
-    NotStaticMusl,
+    /// The program's interpreter (`PT_INTERP`) cannot be run, for this reason.
+    Interpreter(Errno),
     /// The file is not a valid x86-64 ELF executable; the reason is fixed text.
     Malformed(&'static str),
     /// The image or the arguments are too large.
@@ -73,7 +73,7 @@ impl From<LoadError> for Error {
     fn from(e: LoadError) -> Self {
         let message = match e {
             LoadError::NotFound => "program not found",
-            LoadError::NotStaticMusl => "dynamically linked programs are not supported",
+            LoadError::Interpreter(_) => "the program's interpreter cannot be run",
             LoadError::Malformed(reason) => reason,
             LoadError::TooLarge => "program or arguments too large",
             LoadError::Errno(_) => "program segments cannot be mapped",
@@ -85,13 +85,22 @@ impl From<LoadError> for Error {
 /// The result of loading a program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadedImage {
+    /// Where execution starts: the interpreter's entry if it has one.
     pub entry_point: GuestAddr,
+    /// The program's own entry (`AT_ENTRY`).
+    pub program_entry: GuestAddr,
+    /// Where the interpreter is loaded (`AT_BASE`), or 0 with none.
+    pub interpreter_base: u64,
     pub program_header_address: GuestAddr,
     pub program_header_count: u16,
     pub initial_stack_pointer: GuestAddr,
     pub initial_break: GuestAddr,
     pub load_base: GuestAddr,
 }
+
+/// Decides about the interpreter a program asks for by name: returns the path
+/// to read it from, or why it cannot run.
+pub type InterpreterCheck<'a> = &'a mut dyn FnMut(&[u8]) -> Result<Vec<u8>, Errno>;
 
 /// Inputs of the initial stack.
 #[derive(Clone, Copy, Debug)]
@@ -175,9 +184,10 @@ fn map_segments(
     name: Option<&[u8]>,
     info: &ElfInfo,
     mem: &mut AddressSpace,
+    dynamic_base: u64,
 ) -> Result<(u64, u64), LoadError> {
     let base = if info.kind == elf::ET_DYN {
-        STATIC_PIE_BASE
+        dynamic_base
     } else {
         0
     };
@@ -396,9 +406,9 @@ fn build_stack(
         (AT_PHENT, elf::PHDR_SIZE),
         (AT_PHNUM, u64::from(image.program_header_count)),
         (AT_PAGESZ, PAGE_SIZE),
-        (AT_BASE, 0),
+        (AT_BASE, image.interpreter_base),
         (AT_FLAGS, 0),
-        (AT_ENTRY, image.entry_point.0),
+        (AT_ENTRY, image.program_entry.0),
         (AT_UID, u64::from(start.ids[0])),
         (AT_EUID, u64::from(start.ids[1])),
         (AT_GID, u64::from(start.ids[2])),
@@ -435,6 +445,21 @@ pub fn load(
     start: &StartInfo<'_>,
     mem: &mut AddressSpace,
 ) -> Result<LoadedImage, LoadError> {
+    load_with(fs, path, start, mem, &mut |name| {
+        paludarium_vfs::normalize_path(name)
+    })
+}
+
+/// Loads the program at `path`, as [`load`], with `interpreter` deciding about
+/// an interpreter it asks for by name: what may run it, and the path to read
+/// it from, as Linux's `open_exec` of it from the caller's directory.
+pub fn load_with(
+    fs: &dyn FileSystem,
+    path: &[u8],
+    start: &StartInfo<'_>,
+    mem: &mut AddressSpace,
+    interpreter: InterpreterCheck<'_>,
+) -> Result<LoadedImage, LoadError> {
     let bytes = fs.read_file(path).map_err(|e| {
         if e == Errno::ENOENT || e == Errno::EISDIR || e == Errno::ENOTDIR {
             LoadError::NotFound
@@ -444,7 +469,7 @@ pub fn load(
     })?;
     // Linux names the file by its plain absolute path.
     let name = paludarium_vfs::normalize_path(path).unwrap_or_else(|_| path.to_vec());
-    load_image(&bytes, Some(&name), start, mem)
+    load_image(&bytes, Some(&name), start, mem, Some((fs, interpreter)))
 }
 
 /// Loads an ELF image from memory.
@@ -453,7 +478,40 @@ pub fn load_bytes(
     start: &StartInfo<'_>,
     mem: &mut AddressSpace,
 ) -> Result<LoadedImage, LoadError> {
-    load_image(bytes, None, start, mem)
+    load_image(bytes, None, start, mem, None)
+}
+
+/// The file of an interpreter, as Linux's `load_elf_interp` takes it: a read
+/// that fails is that error, one too short for an ELF header is EIO, and
+/// anything but an x86-64 ELF program is `ELIBBAD`. Its own `PT_INTERP`, if
+/// any, does not count.
+fn read_interpreter(fs: &dyn FileSystem, path: &[u8]) -> Result<(Arc<[u8]>, ElfInfo), LoadError> {
+    const EIO: Errno = Errno(5);
+    const ELIBBAD: Errno = Errno(80);
+    const ELF_HEADER: usize = 64;
+    let bytes = fs.read_file(path).map_err(LoadError::Interpreter)?;
+    if bytes.len() < ELF_HEADER {
+        return Err(LoadError::Interpreter(EIO));
+    }
+    let info = elf::parse(&bytes).map_err(|_| LoadError::Interpreter(ELIBBAD))?;
+    Ok((bytes, info))
+}
+
+/// Where a position-independent interpreter goes: right under `top`, at its
+/// alignment.
+fn interpreter_base(info: &ElfInfo, top: u64) -> Result<u64, LoadError> {
+    let too_large = LoadError::Interpreter(Errno(12));
+    let span = info
+        .loads()
+        .try_fold(0u64, |end, h| Some(end.max(h.vaddr.checked_add(h.memsz)?)))
+        .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
+        .ok_or(too_large)?;
+    let align = info
+        .loads()
+        .map(|h| h.align)
+        .fold(PAGE_SIZE, u64::max)
+        .next_power_of_two();
+    Ok(top.checked_sub(span).ok_or(too_large)? & !(align - 1))
 }
 
 /// Loads an ELF image, read from the file `name` if it has one.
@@ -462,16 +520,39 @@ fn load_image(
     name: Option<&[u8]>,
     start: &StartInfo<'_>,
     mem: &mut AddressSpace,
+    files: Option<(&dyn FileSystem, InterpreterCheck<'_>)>,
 ) -> Result<LoadedImage, LoadError> {
     let info = elf::parse(bytes)?;
-    let (base, highest) = map_segments(bytes, name, &info, mem)?;
+    // All an interpreter can refuse comes before anything is mapped.
+    let interpreter = match info.interpreter(bytes)? {
+        Some(asked) => {
+            let (fs, check) = files.ok_or(LoadError::Interpreter(Errno::ENOENT))?;
+            let path = check(asked).map_err(LoadError::Interpreter)?;
+            let (image, parsed) = read_interpreter(fs, &path)?;
+            Some((path, image, parsed))
+        }
+        None => None,
+    };
+    let (base, highest) = map_segments(bytes, name, &info, mem, STATIC_PIE_BASE)?;
     let initial_break = GuestAddr(highest)
         .page_align_up()
         .ok_or(LoadError::Malformed("segment address overflow"))?;
     mem.set_initial_break(initial_break);
     mem.set_mmap_top(GuestAddr(paludarium_mmu::DEFAULT_MMAP_TOP));
+    let program_entry = GuestAddr(base.wrapping_add(info.entry));
+    let mut entry_point = program_entry;
+    let mut interpreter_at = 0;
+    if let Some((path, file, parsed)) = interpreter {
+        let top = paludarium_mmu::DEFAULT_MMAP_TOP;
+        let wanted = interpreter_base(&parsed, top)?;
+        let (at, _) = map_segments(&file, Some(&path), &parsed, mem, wanted)?;
+        entry_point = GuestAddr(at.wrapping_add(parsed.entry));
+        interpreter_at = at;
+    }
     let mut image = LoadedImage {
-        entry_point: GuestAddr(base.wrapping_add(info.entry)),
+        entry_point,
+        program_entry,
+        interpreter_base: interpreter_at,
         program_header_address: GuestAddr(phdr_address(&info, base)),
         program_header_count: info.phnum,
         initial_stack_pointer: GuestAddr(0),

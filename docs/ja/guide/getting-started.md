@@ -19,8 +19,9 @@ rustup toolchain install nightly
 cargo +nightly install paludarium
 ```
 
-動かせるのは、静的にリンクした x86-64 Linux の実行ファイル（`ET_EXEC` と static-pie）です。
-musl で静的にリンクすると作れます。
+動かせるのは、静的にリンクした x86-64 Linux の実行ファイル（`ET_EXEC` と static-pie）と、
+musl の動的リンカーとライブラリをマウントしたときの、それを使うプログラムです。
+前者は musl で静的にリンクすると作れます。
 
 ```sh
 rustup target add x86_64-unknown-linux-musl

@@ -20,7 +20,8 @@ cargo +nightly install paludarium
 ```
 
 paludarium runs statically linked x86-64 Linux executables (`ET_EXEC` and
-static-pie). Linking statically with musl produces them:
+static-pie), and programs that use musl's dynamic linker when it and their
+libraries are mounted. Linking statically with musl produces the first kind:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl

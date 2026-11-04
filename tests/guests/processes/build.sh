@@ -4,4 +4,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 out="${1:-$here/../../../target/guests/processes}"
 mkdir -p "$out"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/process" "$here/process.c"
+# The dynamic case: its linker is the one musl-gcc names, on the host and in the
+# emulator.
+musl-gcc -shared -fPIC -O1 -fno-stack-protector -o "$out/dynamic-plugin.so" "$here/dynamic-plugin.c"
+musl-gcc -pthread -O1 -fno-stack-protector -fcf-protection=none -pie -fPIE -o "$out/dynamic" "$here/dynamic.c"
+musl-gcc -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/dynamic-no-pie" "$here/dynamic.c"
 rustc --target x86_64-unknown-linux-musl -C opt-level=1 -C target-feature=+crt-static -o "$out/command" "$here/command.rs"

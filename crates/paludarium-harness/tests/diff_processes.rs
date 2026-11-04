@@ -140,6 +140,7 @@ mod linux {
                     | "socket-owners"
                     | "capabilities"
                     | "script-exec"
+                    | "dynamic-exec"
             );
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
@@ -159,6 +160,30 @@ mod linux {
             )
             .with_file(format!("/{binary}"), bytes.clone())
             .with_file(self_path, bytes);
+            // The dynamic cases find these where Linux does.
+            let config = if mode == "dynamic-exec" {
+                let path = dir.join("dynamic");
+                config.with_file(
+                    path.to_str().unwrap().to_owned(),
+                    std::fs::read(&path).unwrap(),
+                )
+            } else {
+                config
+            };
+            let config = if mode.starts_with("dynamic") {
+                let beside = |name: &str| std::fs::read(dir.join(name)).unwrap();
+                config
+                    .with_file(
+                        "/lib/ld-musl-x86_64.so.1",
+                        std::fs::read("/lib/ld-musl-x86_64.so.1").unwrap(),
+                    )
+                    .with_file(
+                        dir.join("dynamic-plugin.so").to_str().unwrap().to_owned(),
+                        beside("dynamic-plugin.so"),
+                    )
+            } else {
+                config
+            };
             let host = Arc::new(RecordingHost::new());
             let session = Session::new(config, host.clone()).unwrap();
             let start = Instant::now();
@@ -227,6 +252,9 @@ mod linux {
         processes_setuid => ("setuid","process"),
         processes_signal_permissions => ("signal-permissions","process"),
         processes_limit_permissions => ("limit-permissions","process"),
+        processes_dynamic => ("dynamic","dynamic"),
+        processes_dynamic_no_pie => ("dynamic-no-pie","dynamic-no-pie"),
+        processes_dynamic_exec => ("dynamic-exec","process"),
         processes_script_exec => ("script-exec","process"),
         processes_capabilities => ("capabilities","process"),
         processes_set_id_writes => ("set-id-writes","process"),

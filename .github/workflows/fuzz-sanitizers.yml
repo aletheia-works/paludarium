@@ -33,13 +33,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Within one process apt does not reconnect to an address it could not reach, so
+          # Acquire::Retries does not outlast an outage: run the whole command again instead.
+          retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "Attempt $attempt of 6 failed, trying again in 30 seconds: $*" >&2
+              sleep 30
+            done
+            "$@"
+          }
+          # apt-get update exits 0 when a source is unreachable, so look for the package as well.
+          update_llvm_lists() { apt-get update && apt-cache show llvm-24 > /dev/null; }
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl
-          curl --fail --location https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          curl --fail --location --retry 5 --retry-delay 30 --retry-all-errors https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc
           printf '%s\n' 'deb https://apt.llvm.org/trixie/ llvm-toolchain-trixie main' > /etc/apt/sources.list.d/llvm-symbolizer.list
-          apt-get update
+          retry update_llvm_lists
           apt-cache policy llvm-24
-          apt-get install -y --no-install-recommends llvm-24
+          retry apt-get install -y --no-install-recommends llvm-24
       - name: Fresh 600 second ASan and LSan observation
         shell: bash
         run: |

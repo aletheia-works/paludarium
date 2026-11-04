@@ -8566,6 +8566,9 @@ int main(int argc, char **argv) {
            process's leader (fill_psinfo). */
         char dir[] = "/tmp/core-credentials-XXXXXX";
         if (!mkdtemp(dir) || chdir(dir)) return 80;
+        /* sudo leaves root's group among the supplementary ones, which would
+           let the group's bits below apply. */
+        if (setgroups(0, NULL)) return 80;
         umask(022);
         if (chmod(".", 0777)) return 81;
         core_credentials_report("user", core_credentials_child(0, -1));

@@ -96,7 +96,8 @@ verified.
 - **Credentials**: the IDs and capabilities a thread takes are checked on
   files, signals, resource limits, priorities, socket credentials and core
   files but nowhere else yet. `F_SETOWN` records no sender's credentials, so
-  `SIGIO` and `SIGURG` reach their owner whoever set it, where Linux's `sigio_perm` checks.
+  `SIGIO` and `SIGURG` reach their owner whoever set it, where Linux's
+  `sigio_perm` checks.
   The `PR_SET_PDEATHSIG` signal is sent when the parent process ends, with the
   IDs of its leader, where Linux sends it when the thread that made the child
   ends, with that thread's. Of the files, those under `/proc` and `/dev` are

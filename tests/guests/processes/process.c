@@ -1329,14 +1329,17 @@ static void *core_credentials_thread(void *unused) {
     core_credentials_fault();
     return NULL;
 }
+/* No limit on a core: sudo runs its command with a hard limit of 0 (sudoers'
+   `rlimit_core`), which root may raise. */
+static void core_credentials_limit(void) {
+    struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
+    if (setrlimit(RLIMIT_CORE, &r)) _exit(93);
+}
 static pid_t core_credentials_child(int thread, int fs) {
     fflush(stdout);
     pid_t pid = fork();
     if (pid != 0) return pid;
-    struct rlimit r;
-    getrlimit(RLIMIT_CORE, &r);
-    r.rlim_cur = r.rlim_max;
-    setrlimit(RLIMIT_CORE, &r);
+    core_credentials_limit();
     core_credentials_fs = fs;
     if (thread) {
         pthread_t t;
@@ -8594,10 +8597,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
         pid_t root = fork();
         if (root == 0) {
-            struct rlimit r;
-            getrlimit(RLIMIT_CORE, &r);
-            r.rlim_cur = r.rlim_max;
-            setrlimit(RLIMIT_CORE, &r);
+            core_credentials_limit();
             *(volatile int *)0 = 1;
             _exit(70);
         }

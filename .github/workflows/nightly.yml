@@ -16,9 +16,13 @@ permissions:
   contents: read
 
 jobs:
+  # Only the organization's repository runs these: a fork has Issues turned off, so
+  # its report could only fail, and a fork should not spend the hours every night.
   fuzz:
+    if: github.repository_owner == 'aletheia-works'
     uses: ./.github/workflows/fuzz-nightly.yml
   quality:
+    if: github.repository_owner == 'aletheia-works'
     uses: ./.github/workflows/quality.yml
 
   report:
@@ -26,6 +30,7 @@ jobs:
     # A cancelled night neither opens nor closes anything.
     if: >-
       always() &&
+      github.repository_owner == 'aletheia-works' &&
       (contains(needs.*.result, 'failure') ||
        (needs.fuzz.result == 'success' && needs.quality.result == 'success'))
     runs-on: ubuntu-latest

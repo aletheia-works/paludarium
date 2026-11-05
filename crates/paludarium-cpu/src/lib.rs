@@ -29,6 +29,7 @@ mod snapshot_tests;
 mod softfloat;
 mod sse;
 mod state;
+mod x87;
 
 use paludarium_decoder::{DecodeError, Instruction, decode};
 use paludarium_mmu::{AddressSpace, CodeSources};
@@ -36,8 +37,10 @@ use paludarium_types::{ExitReason, GuestAddr, InstructionBytes, MAX_INSTRUCTION_
 
 pub use alu::{condition, sign_extend, size_mask};
 pub use state::{
-    CpuState, INITIAL_MXCSR, INITIAL_RFLAGS, RepFaultFlags, RepeatContinuation, flag, reg,
+    CpuState, FX_WRITTEN, INITIAL_MXCSR, INITIAL_RFLAGS, RepFaultFlags, RepeatContinuation, flag,
+    reg,
 };
+pub use x87::X87;
 
 use exec::Stop;
 
@@ -265,6 +268,8 @@ impl Snapshot {
             gs_base,
             xmm,
             mxcsr,
+            // Its instructions change it after the last thing that can fail.
+            x87: _,
             rep_fault_flags: _,
             repeat_continuation: _,
         } = *state;
@@ -994,6 +999,206 @@ mod tests {
             CpuState::new(GuestAddr(0), GuestAddr(0)).mxcsr,
             "nothing was read"
         );
+    }
+    /// Runs `code` with rax at the start of the stack's first page.
+    fn x87_run(code: &[u8], steps: u64) -> (CpuState, AddressSpace, ExitReason) {
+        let (mut s, mem) = machine(code);
+        s.gpr[0] = STACK_TOP - 0x2000;
+        let reason = run(&mut s, &mem, steps);
+        (s, mem, reason)
+    }
+    #[test]
+    fn x87_loads_converts_and_stores_through_memory() {
+        // fld1; fstp qword [rax]; fldz; fstp dword [rax+8]; fld1; fistp word [rax+16]
+        let code = [
+            0xd9, 0xe8, 0xdd, 0x18, 0xd9, 0xee, 0xd9, 0x58, 0x08, 0xd9, 0xe8, 0xdf, 0x58, 0x10,
+        ];
+        let (s, mem, _) = x87_run(&code, 6);
+        let mut out = [0; 18];
+        mem.read(GuestAddr(STACK_TOP - 0x2000), &mut out).unwrap();
+        assert_eq!(&out[..8], &0x3ff0_0000_0000_0000u64.to_le_bytes());
+        assert_eq!(&out[8..12], &[0; 4]);
+        assert_eq!(&out[16..18], &[1, 0]);
+        assert_eq!(s.x87.status_word() >> 11 & 7, 0, "all popped");
+    }
+    #[test]
+    fn x87_stores_and_loads_each_memory_form() {
+        let at = GuestAddr(STACK_TOP - 0x2000);
+        let run_with = |code: &[u8], memory: &[u8]| {
+            let (mut s, mem) = machine(code);
+            mem.write(at, memory).unwrap();
+            s.gpr[0] = at.0;
+            run(&mut s, &mem, 3);
+            (s, mem)
+        };
+        let load_status = |code: [u8; 2], memory: &[u8]| {
+            // fld or fild [rax]; fstp tbyte [rax+0x20]
+            let (_, mem) = run_with(&[code[0], code[1], 0xdb, 0x78, 0x20], memory);
+            let mut out = [0; 10];
+            mem.read(GuestAddr(at.0 + 0x20), &mut out).unwrap();
+            out
+        };
+        let one = [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f];
+        assert_eq!(
+            load_status([0xd9, 0x00], &0x3f80_0000u32.to_le_bytes()),
+            one
+        );
+        assert_eq!(
+            load_status([0xdd, 0x00], &0x3ff0_0000_0000_0000u64.to_le_bytes()),
+            one
+        );
+        assert_eq!(load_status([0xdb, 0x28], &one), one);
+        assert_eq!(load_status([0xdf, 0x00], &1u16.to_le_bytes()), one);
+        assert_eq!(load_status([0xdb, 0x00], &1u32.to_le_bytes()), one);
+        assert_eq!(load_status([0xdf, 0x28], &1u64.to_le_bytes()), one);
+        // A negative integer is sign-extended from its own size.
+        let minus = [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0xbf];
+        assert_eq!(load_status([0xdf, 0x00], &0xffffu16.to_le_bytes()), minus);
+        assert_eq!(load_status([0xdb, 0x00], &u32::MAX.to_le_bytes()), minus);
+        assert_eq!(load_status([0xdf, 0x28], &u64::MAX.to_le_bytes()), minus);
+        let store_keeps = |code: [u8; 2], size: usize| {
+            // fld1; fst or fist [rax]; fxam-free check that it is still there.
+            let (s, mem) = run_with(&[0xd9, 0xe8, code[0], code[1]], &[0x55; 16]);
+            let mut out = [0; 16];
+            mem.read(at, &mut out).unwrap();
+            assert!(out[size..].iter().all(|b| *b == 0x55), "{code:02x?}");
+            (s.x87.status_word() >> 11 & 7, out)
+        };
+        let (top, out) = store_keeps([0xd9, 0x10], 4);
+        assert_eq!((top, &out[..4]), (7, &0x3f80_0000u32.to_le_bytes()[..]));
+        let (top, out) = store_keeps([0xdd, 0x10], 8);
+        assert_eq!((top, &out[..2]), (7, &[0, 0][..]));
+        assert_eq!(&out[..8], &0x3ff0_0000_0000_0000u64.to_le_bytes());
+        let (top, out) = store_keeps([0xdf, 0x10], 2);
+        assert_eq!((top, &out[..2]), (7, &[1, 0][..]));
+        let (top, out) = store_keeps([0xdb, 0x10], 4);
+        assert_eq!((top, &out[..4]), (7, &[1, 0, 0, 0][..]));
+    }
+    #[test]
+    fn x87_compares_into_the_flags_and_pops_for_its_p_forms() {
+        // fld1; fldz; fcomi st(1)
+        let flags = |code: &[u8], steps: u64| {
+            let (mut s, mem) = machine(code);
+            s.rflags |= flag::SF | flag::OF | flag::AF;
+            run(&mut s, &mem, steps);
+            (s.rflags & flag::STATUS, s.x87.status_word() >> 11 & 7)
+        };
+        let code = [0xd9, 0xe8, 0xd9, 0xee, 0xdb, 0xf1];
+        assert_eq!(flags(&code, 3), (flag::CF, 6), "0 is below 1");
+        // The same, the other way round.
+        let code = [0xd9, 0xee, 0xd9, 0xe8, 0xdb, 0xe9];
+        assert_eq!(flags(&code, 3), (0, 6), "fucomi: 1 is above 0");
+        let code = [0xd9, 0xe8, 0xd9, 0xe8, 0xdf, 0xf1];
+        assert_eq!(flags(&code, 3), (flag::ZF, 7), "fcomip: equal, popped");
+        let code = [0xd9, 0xe8, 0xd9, 0xe8, 0xdf, 0xe9];
+        assert_eq!(flags(&code, 3), (flag::ZF, 7), "fucomip: equal, popped");
+        let code = [0xdb, 0xf1];
+        assert_eq!(
+            flags(&code, 1),
+            (flag::ZF | flag::PF | flag::CF, 0),
+            "empty: unordered"
+        );
+    }
+    #[test]
+    fn x87_status_and_control_words_reach_their_destinations() {
+        // fldcw [rax]; fnstcw [rax+2]; fld1; fnstsw ax
+        let code = [0xd9, 0x28, 0xd9, 0x78, 0x02, 0xd9, 0xe8, 0xdf, 0xe0];
+        let (mut s, mem) = machine(&code);
+        let at = GuestAddr(STACK_TOP - 0x2000);
+        mem.write(at, &0x27fu16.to_le_bytes()).unwrap();
+        s.gpr[0] = at.0;
+        run(&mut s, &mem, 4);
+        let mut out = [0; 2];
+        mem.read(GuestAddr(at.0 + 2), &mut out).unwrap();
+        assert_eq!(u16::from_le_bytes(out), 0x27f);
+        assert_eq!(s.gpr[0] & 0xffff, 7 << 11, "ax has the top");
+        assert_eq!(s.gpr[0] >> 16, (at.0) >> 16, "only ax");
+        // fnstsw [rax]
+        let (_, mem, _) = x87_run(&[0xd9, 0xe8, 0xdd, 0x38], 2);
+        mem.read(at, &mut out).unwrap();
+        assert_eq!(u16::from_le_bytes(out), 7 << 11);
+        // fnstenv [rax], then fldenv [rax] after fninit.
+        let code = [0xd9, 0xe8, 0xd9, 0x30, 0xdb, 0xe3, 0xd9, 0x20];
+        let (s, _, _) = x87_run(&code, 4);
+        assert_eq!(s.x87.status_word() >> 11 & 7, 7);
+        // fnclex and fninit.
+        let (s, _, _) = x87_run(&[0xdb, 0xf1, 0xdb, 0xe2], 2);
+        assert_eq!(s.x87.status_word() & 0xff, 0);
+        let (s, _, _) = x87_run(&[0xd9, 0xe8, 0xdb, 0xe3], 2);
+        assert_eq!(s.x87.status_word(), 0);
+        assert_eq!(s.x87.control_word(), 0x37f);
+    }
+    #[test]
+    fn x87_moves_the_stack() {
+        let status = |code: &[u8], steps| x87_run(code, steps).0.x87.status_word();
+        // fld1; fld st(0)
+        assert_eq!(status(&[0xd9, 0xe8, 0xd9, 0xc0], 2) & 0x7f, 0);
+        // fld st(1) of nothing is invalid.
+        assert_eq!(status(&[0xd9, 0xc1], 1) & 0x41, 0x41);
+        // fld1; fst st(1); fstp st(1); fincstp; fdecstp; ffree st(0); wait; fnop
+        let top = |code: &[u8], steps| status(code, steps) >> 11 & 7;
+        assert_eq!(top(&[0xd9, 0xe8, 0xdd, 0xd1], 2), 7);
+        assert_eq!(top(&[0xd9, 0xe8, 0xdd, 0xd9], 2), 0);
+        assert_eq!(top(&[0xd9, 0xf7], 1), 1);
+        assert_eq!(top(&[0xd9, 0xf6], 1), 7);
+        assert_eq!(top(&[0xd9, 0xe8, 0xdd, 0xc0], 2), 7);
+        assert_eq!(status(&[0x9b, 0xd9, 0xd0], 2), 0);
+        // fld1; fxch st(1); fchs; fabs; fxam.
+        assert_eq!(status(&[0xd9, 0xe8, 0xd9, 0xc9], 2) & 0x41, 0x41);
+        let (s, _, _) = x87_run(&[0xd9, 0xe8, 0xd9, 0xe0, 0xd9, 0xe5], 3);
+        assert_ne!(s.x87.status_word() & 1 << 9, 0, "fxam: negative");
+        let (s, _, _) = x87_run(&[0xd9, 0xe8, 0xd9, 0xe0, 0xd9, 0xe1, 0xd9, 0xe5], 4);
+        assert_eq!(s.x87.status_word() & 1 << 9, 0, "fxam: positive");
+    }
+    #[test]
+    fn x87_faults_change_nothing() {
+        // fld1, then a store past the stack's first page's end of mapping.
+        for store in [[0xdd, 0x18], [0xdb, 0x38], [0xdf, 0x18], [0xdd, 0x10]] {
+            let (mut s, mem) = machine(&[0xd9, 0xe8, store[0], store[1]]);
+            s.gpr[0] = 0x1000;
+            let reason = run(&mut s, &mem, 2);
+            assert!(matches!(reason, ExitReason::PageFault { .. }), "{reason:?}");
+            assert_eq!(s.x87.status_word() >> 11 & 7, 7, "{store:02x?}: not popped");
+            assert_eq!(s.rip, GuestAddr(CODE + 2));
+        }
+        // A 10-byte store half in a mapped page leaves that page alone.
+        let (mut s, mem) = machine(&[0xd9, 0xe8, 0xdb, 0x38]);
+        let last = STACK_TOP - 5;
+        s.gpr[0] = last;
+        mem.write(GuestAddr(last), &[0x55; 5]).unwrap();
+        let reason = run(&mut s, &mem, 2);
+        assert!(matches!(reason, ExitReason::PageFault { .. }), "{reason:?}");
+        let mut out = [0; 5];
+        mem.read(GuestAddr(last), &mut out).unwrap();
+        assert_eq!(out, [0x55; 5]);
+        // fnstenv too, and it masks nothing then.
+        let (mut s, mem) = machine(&[0xd9, 0x30]);
+        s.gpr[0] = STACK_TOP - 5;
+        let reason = run(&mut s, &mem, 1);
+        assert!(matches!(reason, ExitReason::PageFault { .. }), "{reason:?}");
+        assert_eq!(s.x87.control_word(), 0x37f);
+    }
+    #[test]
+    fn x87_environment_of_another_size_is_not_run() {
+        // 66 fnstenv and 66 fldenv have the 14-byte layout.
+        for code in [[0x66, 0xd9, 0x30], [0x66, 0xd9, 0x20]] {
+            let (_, _, reason) = x87_run(&code, 1);
+            assert!(
+                matches!(reason, ExitReason::InvalidOpcode { .. }),
+                "{reason:?}"
+            );
+        }
+    }
+    #[test]
+    fn fxsave_and_fxrstor_keep_the_x87_state() {
+        // fld1; fxsave [rax]; fninit; fxrstor [rax]
+        let code = [0xd9, 0xe8, 0x0f, 0xae, 0x00, 0xdb, 0xe3, 0x0f, 0xae, 0x08];
+        let (s, mem, _) = x87_run(&code, 4);
+        let mut area = [0; 42];
+        mem.read(GuestAddr(STACK_TOP - 0x2000), &mut area).unwrap();
+        assert_eq!(area[4], 0x80, "R7 is in use");
+        assert_eq!(&area[32..42], &[0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f]);
+        assert_eq!(s.x87.status_word() >> 11 & 7, 7, "restored");
     }
     #[test]
     fn rdtsc_splits_a_counter_that_moves_on() {

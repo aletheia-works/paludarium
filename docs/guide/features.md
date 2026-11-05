@@ -27,10 +27,14 @@ Linux.
 - `RDTSC` and `RDTSCP` read a counter of the virtual CPU, which moves on with
   each read rather than with time. Every guest in the host process shares that
   counter, so its values depend on what else has read it. `RDSSP` does nothing,
-  as there are no shadow stacks. `FXSAVE` and `FXRSTOR` keep MXCSR and the XMM registers, and give the
-  x87 state as it is after a reset.
-- x87 is not implemented yet. AVX, AVX-512 and MMX are out of scope: `CPUID`
-  reports MMX because glibc requires it, but its instructions stop with `SIGILL`.
+  as there are no shadow stacks. `FXSAVE` and `FXRSTOR` keep the x87 state, MXCSR and the XMM
+  registers.
+- x87 instructions move values, convert them, compare them and keep the unit's
+  control and status words, environment and stack, in every rounding mode. x87
+  arithmetic is not implemented yet ([Limitations](./limitations)). A signal
+  handler starts with the x87 and SSE state as after a reset, as on Linux.
+- AVX, AVX-512 and MMX are out of scope: `CPUID` reports MMX because glibc
+  requires it, but its instructions stop with `SIGILL`.
 
 When a guest reaches an instruction it cannot run, it gets `SIGILL`, as on real
 Linux. Page faults raise `SIGSEGV`, and integer division by zero `SIGFPE`.

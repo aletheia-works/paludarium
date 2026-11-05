@@ -273,6 +273,7 @@ mod linux {
         processes_signal_permissions => ("signal-permissions","process"),
         processes_limit_permissions => ("limit-permissions","process"),
         processes_cpu_state => ("cpu-state","process"),
+        processes_x87 => ("x87","process"),
         processes_time_calls => ("time-calls","process"),
         processes_dynamic => ("dynamic","dynamic"),
         processes_dynamic_no_pie => ("dynamic-no-pie","dynamic-no-pie"),

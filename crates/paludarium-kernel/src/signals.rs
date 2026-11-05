@@ -1,6 +1,6 @@
 //! Checked Linux x86-64 signal frame codec. Offsets are observed by signals-14.
 use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState};
-use paludarium_cpu::{CpuState, flag, reg};
+use paludarium_cpu::{CpuState, FX_WRITTEN, INITIAL_MXCSR, X87, flag, reg};
 use paludarium_host::ClockId;
 use paludarium_mmu::AddressSpace;
 use paludarium_types::{GuestAddr, USER_ADDRESS_LIMIT};
@@ -403,12 +403,7 @@ pub(crate) fn install(
     put(&mut b, SC + 184, base + fp as u64);
     put(&mut b, MASK, process.signal_mask);
     b[INFO..INFO + 128].copy_from_slice(&siginfo(process, &signal));
-    b[fp..fp + 2].copy_from_slice(&0x37fu16.to_le_bytes());
-    b[fp + 24..fp + 28].copy_from_slice(&cpu.mxcsr.to_le_bytes());
-    b[fp + 28..fp + 32].copy_from_slice(&0xffffu32.to_le_bytes());
-    for (i, xmm) in cpu.xmm.iter().enumerate() {
-        b[fp + 160 + i * 16..fp + 176 + i * 16].copy_from_slice(&xmm.to_le_bytes());
-    }
+    b[fp..fp + FX_WRITTEN].copy_from_slice(&cpu.fx_image());
     mem.write(GuestAddr(base), &b).map_err(|_| ())?;
     process.frames.push(SavedFrame {
         base,
@@ -440,6 +435,9 @@ pub(crate) fn install(
     {
         process.alt_stack = AltStack::default();
     }
+    // A handler starts with the x87 and SSE state as after a reset.
+    cpu.x87 = X87::default();
+    cpu.mxcsr = INITIAL_MXCSR;
     cpu.rip = GuestAddr(action.handler);
     cpu.gpr[reg::RSP] = base;
     cpu.gpr[reg::RDI] = signal.number as u64;
@@ -486,12 +484,9 @@ pub(crate) fn restore(
         }
         let mut f = [0u8; 512];
         mem.read(GuestAddr(fp), &mut f).map_err(|_| ())?;
-        restored.mxcsr = u32::from_le_bytes(f[24..28].try_into().map_err(|_| ())?);
-        if restored.mxcsr & !0xffff != 0 {
+        let written = f[..FX_WRITTEN].try_into().map_err(|_| ())?;
+        if !restored.restore_fx_image(written) {
             return Err(());
-        }
-        for (i, xmm) in restored.xmm.iter_mut().enumerate() {
-            *xmm = u128::from_le_bytes(f[160 + i * 16..176 + i * 16].try_into().map_err(|_| ())?);
         }
     }
     if saved.as_ref().is_none_or(|saved| {

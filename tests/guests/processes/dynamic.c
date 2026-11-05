@@ -58,6 +58,10 @@ int main(int argc, char **argv) {
     printf("break-after-program=%d\n", (unsigned long)sbrk(0) > (unsigned long)&__executable_start);
     /* What the linker did. */
     printf("relocated: %s %d\n", getenv("NOTHING_HERE") ? "set" : "unset", (int)strlen("twelve bytes"));
+#ifdef __GLIBC__
+    /* Through the x87: glibc's printf takes these as long doubles. */
+    printf("floats: %.3f %Lf\n", 1.5, (long double)2.25);
+#endif
     char *block = malloc(1 << 20);
     printf("malloc=%d\n", block != NULL);
     /* Large enough for libc's own way of copying much, whatever its size is

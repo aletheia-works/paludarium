@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <cpuid.h>
+#include <ucontext.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1664,6 +1665,318 @@ static void fx_restore_to(const unsigned char *area, unsigned char *out, int wid
         : : "r"(area), "r"(out), "r"(wide)
         : "memory", "cc", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
           "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+}
+/* The x87 case. Each value goes in as its 80-bit image. The status word leaves
+   out what the manuals leave undefined after these instructions: C0, C2, C3. */
+struct x87_value {
+    uint64_t mantissa;
+    uint16_t high;
+};
+static const struct x87_value x87_values[] = {
+    {0, 0},                                  /* +0 */
+    {0, 0x8000},                             /* -0 */
+    {1ULL << 63, 0x3fff},                    /* 1 */
+    {3ULL << 62, 0xbfff},                    /* -1.5 */
+    {(1ULL << 63) | 1, 0x3fff},              /* just above 1 */
+    {(1ULL << 63) | 1, 0xbfff},              /* just below -1 */
+    {5ULL << 61, 0x4000},                    /* 2.5 */
+    {7ULL << 61, 0x4000},                    /* 3.5 */
+    {5ULL << 61, 0xc000},                    /* -2.5 */
+    {1ULL << 63, 0x4000 + 14},               /* 32768 */
+    {1ULL << 63, 0xc000 + 14},               /* -32768 */
+    {0xc000000000000000ULL, 0xc000 + 14},    /* -49152 */
+    {1ULL << 63, 0x4000 + 30},               /* 2^31 */
+    {1ULL << 63, 0xc000 + 30},               /* -2^31 */
+    {1ULL << 63, 0x4000 + 62},               /* 2^63 */
+    {1ULL << 63, 0xc000 + 62},               /* -2^63 */
+    {~0ULL, 0x4000 + 61},                    /* just under 2^63 */
+    {1ULL << 63, 0x7000},                    /* too large for a double */
+    {1ULL << 63, 0xf000},
+    {~0ULL, 0x47fe},                         /* rounds up to a double's overflow */
+    {1ULL << 63, 0x0100},                    /* too small for a double */
+    {1ULL << 63, 0x8100},
+    {1ULL << 63, 0x3c01},                    /* a double's smallest normal */
+    {1ULL << 63, 0x3bcd},                    /* a double's smallest denormal */
+    {3ULL << 62, 0x3bcc},                    /* rounds to it */
+    {~0ULL, 0x3c00},                         /* rounds up to the smallest normal */
+    {1ULL << 63, 0x3f81},                    /* a float's smallest normal */
+    {1ULL << 63, 0x3f6a},                    /* a float's smallest denormal */
+    {1, 0},                                  /* a denormal */
+    {1ULL << 63, 0},                         /* a pseudo-denormal */
+    {1ULL << 63, 0x7fff},                    /* infinity */
+    {1ULL << 63, 0xffff},
+    {3ULL << 62, 0x7fff},                    /* a quiet NaN */
+    {0xc000000000000123ULL, 0xffff},
+    {0x8000000000000800ULL, 0x7fff},         /* a signaling NaN */
+    {1, 0x3fff},                             /* no integer bit: not supported */
+    {0, 0x7fff},
+    {1, 0x7fff},
+};
+static uint16_t x87_status(void) {
+    uint16_t status;
+    __asm__ volatile("fnstsw %0" : "=m"(status));
+    return status & 0xbaff;
+}
+static void x87_control(uint16_t control) {
+    __asm__ volatile("fldcw %0" : : "m"(control));
+}
+static void x87_load(const struct x87_value *v) {
+    __asm__ volatile("fldt %0" : : "m"(*v));
+}
+static void x87_show(const char *name, const void *bytes, int size, int shown) {
+    const unsigned char *p = bytes;
+    printf("%s ", name);
+    for (int i = size; i-- > 0;) printf("%02x", p[i]);
+    printf(" sw=%04x\n", shown);
+}
+/* The FP state a signal frame has: its words, tags, MXCSR and the top. */
+static void x87_frame(const char *name, void *context) {
+    const unsigned char *f = (const unsigned char *)((ucontext_t *)context)->uc_mcontext.fpregs;
+    uint16_t control, status;
+    uint32_t mxcsr;
+    memcpy(&control, f, 2);
+    memcpy(&status, f + 2, 2);
+    memcpy(&mxcsr, f + 24, 4);
+    printf("%s: frame cw=%04x sw=%04x tags=%02x mxcsr=%x st0=", name, control, status & 0xbaff, f[4], mxcsr);
+    for (int i = 9; i >= 0; i--) printf("%02x", f[32 + i]);
+    printf("\n");
+}
+static void x87_signal(int number, siginfo_t *info, void *context) {
+    (void)number;
+    (void)info;
+    uint16_t control, status;
+    uint32_t mxcsr;
+    __asm__ volatile("fnstcw %0\n fnstsw %1\n stmxcsr %2" : "=m"(control), "=m"(status), "=m"(mxcsr));
+    printf("handler: cw=%04x sw=%04x mxcsr=%x\n", control, status, mxcsr);
+    x87_frame("handler", context);
+    /* What it does here is gone when it returns. */
+    __asm__ volatile("fldz\n fldz");
+    x87_control(0xc7f);
+}
+static void x87_fault(int number, siginfo_t *info, void *context) {
+    (void)number;
+    printf("fault: code=%d\n", info->si_code);
+    x87_frame("fault", context);
+    fflush(stdout);
+    _exit(0);
+}
+static void x87_cases(void) {
+    uint16_t control, status;
+    __asm__ volatile("fnstcw %0\n fnstsw %1" : "=m"(control), "=m"(status));
+    printf("start: cw=%04x sw=%04x\n", control, status);
+    static const uint16_t controls[] = {0xffff, 0, 0x1000, 0x37f};
+    for (int i = 0; i < 4; i++) {
+        uint16_t written = controls[i], read;
+        __asm__ volatile("fldcw %1\n fnstcw %0\n fninit" : "=m"(read) : "m"(written));
+        printf("control %04x: %04x\n", written, read);
+    }
+    int count = (int)(sizeof x87_values / sizeof x87_values[0]);
+    /* Into each smaller format and integer, in each rounding mode. */
+    for (int mode = 0; mode < 4; mode++) {
+        x87_control((uint16_t)(0x37f | mode << 10));
+        for (int i = 0; i < count; i++) {
+            uint64_t d = 0x5555555555555555ULL, q = d;
+            uint32_t s = 0x55555555, l = s;
+            uint16_t w = 0x5555;
+            char name[32];
+            int shown;
+            __asm__ volatile("fnclex");
+            x87_load(&x87_values[i]);
+            __asm__ volatile("fstl %0" : "=m"(d));
+            shown = x87_status();
+            sprintf(name, "%d %d double", mode, i);
+            x87_show(name, &d, 8, shown);
+            __asm__ volatile("fnclex\n fsts %0" : "=m"(s));
+            shown = x87_status();
+            sprintf(name, "%d %d float", mode, i);
+            x87_show(name, &s, 4, shown);
+            __asm__ volatile("fnclex\n fists %0" : "=m"(w));
+            shown = x87_status();
+            sprintf(name, "%d %d int16", mode, i);
+            x87_show(name, &w, 2, shown);
+            __asm__ volatile("fnclex\n fistl %0" : "=m"(l));
+            shown = x87_status();
+            sprintf(name, "%d %d int32", mode, i);
+            x87_show(name, &l, 4, shown);
+            __asm__ volatile("fnclex\n fistpll %0" : "=m"(q));
+            shown = x87_status();
+            sprintf(name, "%d %d int64", mode, i);
+            x87_show(name, &q, 8, shown);
+        }
+    }
+    __asm__ volatile("fninit");
+    /* Each kind of value, by fxam, which is defined on C0, C1, C2 and C3. */
+    for (int i = 0; i < count; i++) {
+        uint16_t kind;
+        x87_load(&x87_values[i]);
+        __asm__ volatile("fxam\n fnstsw %0\n fstp %%st(0)" : "=m"(kind));
+        printf("kind %d: %04x\n", i, kind);
+    }
+    /* Each kind of value compared with some, both ways: the flags, and only
+       the invalid and denormal exceptions and the stack move as they should. */
+    for (int i = 0; i < count; i++) {
+        static const int partners[] = {0, 2, 3, 6, 28, 30, 31, 32, 34, 35};
+        for (int k = 0; k < 10; k++) {
+            uint64_t flags[4];
+            uint16_t status[4];
+            x87_load(&x87_values[partners[k]]);
+            x87_load(&x87_values[i]);
+            __asm__ volatile("fnclex\n fcomi %%st(1), %%st\n pushfq\n popq %0\n fnstsw %1" : "=r"(flags[0]), "=m"(status[0]) : : "cc");
+            __asm__ volatile("fnclex\n fucomi %%st(1), %%st\n pushfq\n popq %0\n fnstsw %1" : "=r"(flags[1]), "=m"(status[1]) : : "cc");
+            __asm__ volatile("fnclex\n fcomip %%st(1), %%st\n pushfq\n popq %0\n fnstsw %1" : "=r"(flags[2]), "=m"(status[2]) : : "cc");
+            x87_load(&x87_values[i]);
+            __asm__ volatile("fnclex\n fucomip %%st(1), %%st\n pushfq\n popq %0\n fnstsw %1" : "=r"(flags[3]), "=m"(status[3]) : : "cc");
+            __asm__ volatile("fstp %st(0)");
+            printf("compare %d %d:", i, partners[k]);
+            for (int m = 0; m < 4; m++) printf(" %03llx/%04x", (unsigned long long)flags[m] & 0x8d5, status[m] & 0xbaff);
+            printf("\n");
+        }
+    }
+    __asm__ volatile("fnclex\n fninit");
+    /* Back and forth through the 80-bit format, and with the sign changed. */
+    for (int i = 0; i < count; i++) {
+        unsigned char out[10], negated[10], absolute[10];
+        x87_load(&x87_values[i]);
+        __asm__ volatile("fstpt %0" : "=m"(out));
+        x87_load(&x87_values[i]);
+        __asm__ volatile("fchs\n fstpt %0" : "=m"(negated));
+        x87_load(&x87_values[i]);
+        __asm__ volatile("fabs\n fstpt %0" : "=m"(absolute));
+        printf("extended %d: ", i);
+        for (int k = 9; k >= 0; k--) printf("%02x", out[k]);
+        printf(" ");
+        for (int k = 9; k >= 0; k--) printf("%02x", negated[k]);
+        printf(" ");
+        for (int k = 9; k >= 0; k--) printf("%02x", absolute[k]);
+        printf(" sw=%04x\n", x87_status());
+    }
+    /* From the smaller formats and integers. */
+    static const uint64_t doubles[] = {0, 1ULL << 63, 0x3ff8000000000000ULL, 0xc008000000000000ULL, 1, 0x800fffffffffffffULL,
+                                       0x7ff0000000000000ULL, 0xfff0000000000000ULL, 0x7ff8000000000123ULL,
+                                       0x7ff0000000000123ULL, 0xfff0000000000001ULL};
+    for (int i = 0; i < 11; i++) {
+        unsigned char out[10];
+        __asm__ volatile("fnclex\n fldl %1\n fnstsw %%ax\n fstpt %0" : "=m"(out) : "m"(doubles[i]) : "ax");
+        int shown = x87_status();
+        x87_show("from double", out, 10, shown);
+    }
+    static const uint32_t floats[] = {0, 1u << 31, 0x3fc00000, 1, 0x807fffff, 0x7f800000, 0xff800000, 0x7fc00123, 0x7f800123};
+    for (int i = 0; i < 9; i++) {
+        unsigned char out[10];
+        __asm__ volatile("fnclex\n flds %1\n fstpt %0" : "=m"(out) : "m"(floats[i]));
+        int shown = x87_status();
+        x87_show("from float", out, 10, shown);
+    }
+    static const int64_t integers[] = {0, 1, -1, 32767, -32768, 2147483647, -2147483647 - 1, INT64_MAX, INT64_MIN};
+    for (int i = 0; i < 9; i++) {
+        unsigned char q[10], l[10], w[10];
+        int32_t l_in = (int32_t)integers[i];
+        int16_t w_in = (int16_t)integers[i];
+        __asm__ volatile("fildll %3\n fstpt %0\n fildl %4\n fstpt %1\n filds %5\n fstpt %2"
+                         : "=m"(q), "=m"(l), "=m"(w) : "m"(integers[i]), "m"(l_in), "m"(w_in));
+        x87_show("from int64", q, 10, x87_status());
+        x87_show("from int32", l, 10, x87_status());
+        x87_show("from int16", w, 10, x87_status());
+    }
+    /* The stack: a ninth value overflows, and C1 says so. */
+    __asm__ volatile("fninit");
+    for (int i = 0; i < 9; i++) {
+        __asm__ volatile("fld1");
+        printf("push %d: sw=%04x\n", i, x87_status());
+    }
+    __asm__ volatile("fnclex\n fninit");
+    /* Reading what is empty: C1 clear, and the invalid result. */
+    {
+        uint64_t d = 0;
+        uint32_t s = 0;
+        uint16_t w = 0;
+        unsigned char e[10];
+        __asm__ volatile("fld1\n fstp %%st(0)\n fstl %0" : "=m"(d));
+        x87_show("empty double", &d, 8, x87_status());
+        __asm__ volatile("fnclex\n fsts %0" : "=m"(s));
+        x87_show("empty float", &s, 4, x87_status());
+        __asm__ volatile("fnclex\n fists %0" : "=m"(w));
+        x87_show("empty int16", &w, 2, x87_status());
+        __asm__ volatile("fnclex\n fstpt %0" : "=m"(e));
+        x87_show("empty extended", e, 10, x87_status());
+        __asm__ volatile("fninit\n fld %%st(2)\n fstpt %0" : "=m"(e));
+        x87_show("empty register", e, 10, x87_status());
+        __asm__ volatile("fninit\n fchs\n fstpt %0" : "=m"(e));
+        x87_show("empty fchs", e, 10, x87_status());
+        __asm__ volatile("fninit\n fabs\n fstpt %0" : "=m"(e));
+        x87_show("empty fabs", e, 10, x87_status());
+        __asm__ volatile("fninit\n fld1\n fxch %%st(2)\n fstpt %0" : "=m"(e));
+        x87_show("empty fxch", e, 10, x87_status());
+        __asm__ volatile("fstpt %0" : "=m"(e));
+        x87_show("empty fxch st1", e, 10, x87_status());
+        __asm__ volatile("fstpt %0" : "=m"(e));
+        x87_show("empty fxch st2", e, 10, x87_status());
+        __asm__ volatile("fninit\n fstp %st(1)");
+        printf("empty fstp: sw=%04x\n", x87_status());
+    }
+    /* Moving between registers, and freeing. */
+    {
+        unsigned char a[10], b[10], c[10];
+        __asm__ volatile("fninit\n fld1\n fldz\n fxch\n fstpt %0\n fstpt %1" : "=m"(a), "=m"(b));
+        x87_show("fxch st0", a, 10, x87_status());
+        x87_show("fxch st1", b, 10, x87_status());
+        __asm__ volatile("fninit\n fld1\n fldz\n fst %%st(1)\n fstpt %0\n fstpt %1" : "=m"(a), "=m"(b));
+        x87_show("fst st0", a, 10, x87_status());
+        x87_show("fst st1", b, 10, x87_status());
+        __asm__ volatile("fninit\n fld1\n fld %%st(0)\n fstp %%st(1)\n fstpt %0" : "=m"(c));
+        x87_show("fstp st1", c, 10, x87_status());
+        uint16_t kind;
+        __asm__ volatile("fninit\n fld1\n ffree %%st(0)\n fxam\n fnstsw %0" : "=m"(kind));
+        printf("freed: %04x\n", kind);
+        __asm__ volatile("fninit\n fincstp");
+        printf("fincstp: sw=%04x\n", x87_status());
+        __asm__ volatile("fdecstp\n fdecstp");
+        printf("fdecstp: sw=%04x\n", x87_status());
+        __asm__ volatile("fninit\n fnop\n wait");
+        printf("fnop: sw=%04x\n", x87_status());
+    }
+    /* fstcw, fstsw, finit and fclex have a wait in front. */
+    {
+        uint16_t c, s;
+        short ax;
+        __asm__ volatile("finit\n fldz\n fstcw %0\n fstsw %1\n fstsw %%ax\n mov %%ax, %2\n fclex"
+                         : "=m"(c), "=m"(s), "=m"(ax) : : "ax");
+        printf("waiting: cw=%04x sw=%04x ax=%04x\n", c, s, (unsigned short)ax);
+    }
+    /* The environment: its words, and every exception masked after it. */
+    {
+        uint16_t env[14];
+        uint16_t after;
+        __asm__ volatile("fninit\n fld1\n fldz\n flds %2\n fldcw %3\n fnstenv %0\n fnstcw %1"
+                         : "=m"(env), "=m"(after)
+                         : "m"(floats[5]), "m"(*(const uint16_t[]){0x27f}));
+        printf("environment: cw=%04x sw=%04x tags=%04x then cw=%04x\n", env[0], env[2] & 0xbaff, env[4], after);
+        __asm__ volatile("fninit\n fldenv %0\n fnstcw %1" : "=m"(after) : "m"(env));
+        printf("loaded: cw=%04x sw=%04x\n", after, x87_status());
+        unsigned char e[10];
+        __asm__ volatile("fstpt %0" : "=m"(e));
+        x87_show("loaded st0", e, 10, x87_status());
+        __asm__ volatile("fstpt %0" : "=m"(e));
+        x87_show("loaded st1", e, 10, x87_status());
+    }
+    /* fxsave and fxrstor keep it all. Where the last instruction was is left
+       out: CPUs differ. */
+    {
+        static _Alignas(16) unsigned char area[512];
+        __asm__ volatile("fninit\n fld1\n fldz\n fxsave %0" : "=m"(area));
+        printf("fxsave: cw=%02x%02x sw=%04x tags=%02x\n", area[1], area[0], (area[2] | area[3] << 8) & 0xbaff, area[4]);
+        for (int r = 0; r < 8; r++) {
+            printf("  st%d ", r);
+            for (int k = 9; k >= 0; k--) printf("%02x", r < 2 ? area[32 + r * 16 + k] : 0);
+            printf("\n");
+        }
+        __asm__ volatile("fninit\n fxrstor %0" : : "m"(area));
+        unsigned char a[10], b[10];
+        x87_show("fxrstor status", area, 0, x87_status());
+        __asm__ volatile("fstpt %0\n fstpt %1" : "=m"(a), "=m"(b));
+        x87_show("fxrstor st0", a, 10, x87_status());
+        x87_show("fxrstor st1", b, 10, x87_status());
+    }
 }
 /* The interpreter of the script-exec case: what exec gave it. */
 static int script_show(int argc, char **argv) {
@@ -9532,6 +9845,59 @@ int main(int argc, char **argv) {
         };
         for (size_t i = 0; i < sizeof files / sizeof *files; i++) unlink(files[i]);
         if (rmdir("d") || chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "x87")) {
+        x87_cases();
+        /* A handler starts as after a reset, and returning brings it all back. */
+        struct sigaction action = {0};
+        action.sa_sigaction = x87_signal;
+        action.sa_flags = SA_SIGINFO;
+        sigaction(SIGUSR1, &action, NULL);
+        uint32_t mxcsr = 0x3f80, seen = 0;
+        unsigned char value[10];
+        uint16_t control = 0x27f, seen_control = 0;
+        __asm__ volatile("fninit\n fldcw %0\n ldmxcsr %1\n fld1" : : "m"(control), "m"(mxcsr));
+        raise(SIGUSR1);
+        __asm__ volatile("fnstcw %0\n stmxcsr %1\n fstpt %2" : "=m"(seen_control), "=m"(seen), "=m"(value));
+        printf("returned: cw=%04x mxcsr=%x", seen_control, seen);
+        x87_show(" st0", value, 10, x87_status());
+        mxcsr = 0x1f80;
+        __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
+        /* A child has it too. */
+        __asm__ volatile("fninit\n fld1\n fldz");
+        pid_t child = fork();
+        if (!child) {
+            __asm__ volatile("fstpt %0" : "=m"(value));
+            x87_show("child st0", value, 10, x87_status());
+            __asm__ volatile("fstpt %0" : "=m"(value));
+            x87_show("child st1", value, 10, x87_status());
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(child, NULL, 0);
+        /* A fault changes nothing: the stack still has what could not go. */
+        fflush(stdout);
+        char *pages = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        struct sigaction faulting = {0};
+        faulting.sa_sigaction = x87_fault;
+        faulting.sa_flags = SA_SIGINFO;
+        sigaction(SIGSEGV, &faulting, NULL);
+        for (int k = 0; k < 4; k++) {
+            child = fork();
+            if (!child) {
+                __asm__ volatile("fninit\n fld1\n fldz");
+                if (k == 0) __asm__ volatile("fstpl %0" : "=m"(*(double *)pages));
+                if (k == 1) __asm__ volatile("fstpt %0" : "=m"(*(unsigned char(*)[10])pages));
+                if (k == 2) __asm__ volatile("fistpl %0" : "=m"(*(int *)pages));
+                if (k == 3) __asm__ volatile("fldt %0" : : "m"(*(unsigned char(*)[10])(pages - 4096 * 4096)));
+                _exit(70);
+            }
+            int fault_status = 0;
+            waitpid(child, &fault_status, 0);
+            printf("faulting %d: status=%d\n", k, fault_status);
+            fflush(stdout);
+        }
         return 0;
     }
     if (!strcmp(mode, "cpu-state")) {

@@ -7,7 +7,10 @@ use paludarium_mmu::{AddressSpace, AtomicOp, AtomicWidth, Fault};
 use paludarium_types::GuestAddr;
 
 use crate::alu::{self, ShiftKind, sign_extend, size_mask};
-use crate::state::{CpuState, flag, reg};
+use crate::softfloat::{F32, F64};
+use crate::state::{CpuState, FX_WRITTEN, flag, reg};
+use crate::x87::ENVIRONMENT;
+use core::cmp::Ordering;
 
 /// Why executing an instruction did not simply continue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,15 +32,6 @@ impl From<Fault> for Stop {
     }
 }
 
-/// The x87 control word after a reset, the first bytes of `fxsave`'s area.
-const FX_CONTROL_WORD: u16 = 0x37f;
-/// The MXCSR bits that may be set, as `fxsave` reports them. AMD's CPUs add bit
-/// 17 for misaligned SSE, which `CPUID` does not offer here.
-const FX_MXCSR_MASK: u32 = 0xffff;
-/// Where the XMM registers are in `fxsave`'s area, and where what it writes
-/// ends: the 16 registers take it to 416 bytes.
-const FX_XMM: usize = 160;
-const FX_WRITTEN: usize = 416;
 /// The whole area, all of which must be there for either instruction.
 const FX_AREA: usize = 512;
 type Result<T> = core::result::Result<T, Stop>;
@@ -218,6 +212,8 @@ impl Exec<'_> {
             Register::Gpr { index, size } => self.s.gpr[usize::from(index & 15)] & size_mask(size),
             Register::GprHigh8 { index } => (self.s.gpr[usize::from(index & 3)] >> 8) & 0xff,
             Register::Xmm(n) => self.s.xmm[usize::from(n & 15)] as u64,
+            // Only `Exec::x87` has these, and it reads them itself.
+            Register::St(_) => 0,
         }
     }
 
@@ -237,6 +233,7 @@ impl Exec<'_> {
                 *slot = (*slot & !0xff00) | ((value & 0xff) << 8);
             }
             Register::Xmm(n) => self.s.xmm[usize::from(n & 15)] = u128::from(value),
+            Register::St(_) => {}
         }
     }
 
@@ -1220,48 +1217,149 @@ impl Exec<'_> {
         }
         Ok(at)
     }
-    /// `fxsave`: the x87 state as it is after a reset, as there is no x87,
-    /// then MXCSR and its mask and the XMM registers. The area past them is
-    /// not written, but faults like the rest if it cannot be.
+    /// `fxsave`: the x87 state, MXCSR and its mask, and the XMM registers. The
+    /// area past them is not written, but faults like the rest if it cannot be.
     fn fxsave(&mut self) -> Result<()> {
         let at = self.fx_area()?;
         self.mem.check_write(at, FX_AREA)?;
-        let mut area = [0u8; FX_WRITTEN];
-        area[..2].copy_from_slice(&FX_CONTROL_WORD.to_le_bytes());
-        area[24..28].copy_from_slice(&self.s.mxcsr.to_le_bytes());
-        area[28..32].copy_from_slice(&FX_MXCSR_MASK.to_le_bytes());
-        for (register, bytes) in self
-            .s
-            .xmm
-            .iter()
-            .zip(area[FX_XMM..].as_chunks_mut::<16>().0)
-        {
-            *bytes = register.to_le_bytes();
-        }
-        self.mem.write(at, &area)?;
+        self.mem.write(at, &self.s.fx_image())?;
         Ok(())
     }
-    /// `fxrstor`: MXCSR, whose reserved bits are a general protection fault,
-    /// and the XMM registers. There is no x87 for the rest to go to.
+    /// `fxrstor`: what `fxsave` writes. MXCSR's reserved bits are a general
+    /// protection fault.
     fn fxrstor(&mut self) -> Result<()> {
         let at = self.fx_area()?;
         self.mem.check_read(at, FX_AREA)?;
         let mut area = [0u8; FX_WRITTEN];
         self.mem.read(at, &mut area)?;
-        let mxcsr = u32::from_le_bytes([area[24], area[25], area[26], area[27]]);
-        if mxcsr & !FX_MXCSR_MASK != 0 {
+        if !self.s.restore_fx_image(&area) {
             return Err(Stop::GeneralProtection);
         }
-        self.s.mxcsr = mxcsr;
-        for (register, bytes) in self
-            .s
-            .xmm
-            .iter_mut()
-            .zip(area[FX_XMM..].as_chunks::<16>().0)
-        {
-            *register = u128::from_le_bytes(*bytes);
-        }
         Ok(())
+    }
+    /// An x87 instruction. What it writes to memory is written first, so a
+    /// fault leaves the unit as it was.
+    fn x87(&mut self) -> Result<()> {
+        use Mnemonic as M;
+        let m = self.i.mnemonic;
+        let memory = match self.i.operand(0) {
+            Some(Operand::Memory(memory)) => Some(memory),
+            _ => None,
+        };
+        // Where two are named, the first is st(0).
+        let register = self.i.operands().find_map(|o| match o {
+            Operand::Register(Register::St(n)) if n != 0 => Some(n),
+            _ => None,
+        });
+        let register = register.unwrap_or(0);
+        let mut unit = self.s.x87;
+        match (m, memory) {
+            (M::Fld, Some(memory)) => match memory.size {
+                4 => unit.load_float(F32, self.load(self.linear(&memory), 4)?),
+                8 => unit.load_float(F64, self.load(self.linear(&memory), 8)?),
+                10 => unit.load_extended(self.load_extended(&memory)?),
+                _ => return Err(Stop::Invalid),
+            },
+            (M::Fld, None) => unit.load_register(register),
+            (M::Fild, Some(memory)) => {
+                let bits = self.load(self.linear(&memory), memory.size)?;
+                unit.load_integer(sign_extend(bits, memory.size) as i64);
+            }
+            (M::Fst | M::Fstp, Some(memory)) => {
+                match memory.size {
+                    4 => {
+                        let bits = unit.store_float(F32);
+                        self.store(self.linear(&memory), 4, bits)?;
+                    }
+                    8 => {
+                        let bits = unit.store_float(F64);
+                        self.store(self.linear(&memory), 8, bits)?;
+                    }
+                    10 => {
+                        let value = unit.store_extended();
+                        let at = self.linear(&memory);
+                        self.mem.check_write(at, 10)?;
+                        self.mem.write(at, &value.to_le_bytes()[..10])?;
+                    }
+                    _ => return Err(Stop::Invalid),
+                }
+                if m == M::Fstp {
+                    unit.pop();
+                }
+            }
+            (M::Fst | M::Fstp, None) => {
+                unit.store_register(register);
+                if m == M::Fstp {
+                    unit.pop();
+                }
+            }
+            (M::Fist | M::Fistp, Some(memory)) => {
+                let bits = unit.store_integer(u32::from(memory.size) * 8);
+                self.store(self.linear(&memory), memory.size, bits)?;
+                if m == M::Fistp {
+                    unit.pop();
+                }
+            }
+            (M::Fcomi | M::Fcomip | M::Fucomi | M::Fucomip, None) => {
+                let order = unit.compare(register, matches!(m, M::Fucomi | M::Fucomip));
+                let value = match order {
+                    Some(Ordering::Greater) => 0,
+                    Some(Ordering::Less) => flag::CF,
+                    Some(Ordering::Equal) => flag::ZF,
+                    None => flag::ZF | flag::PF | flag::CF,
+                };
+                self.set_status(flag::STATUS, value);
+                if matches!(m, M::Fcomip | M::Fucomip) {
+                    unit.pop();
+                }
+            }
+            (M::Fxch, None) => unit.exchange(register),
+            (M::Fchs, None) => unit.negate(),
+            (M::Fabs, None) => unit.absolute(),
+            (M::Fxam, None) => unit.examine(),
+            (M::Fldz, None) => unit.load_zero(),
+            (M::Fld1, None) => unit.load_one(),
+            (M::Ffree, None) => unit.free(register),
+            (M::Fincstp, None) => unit.increment_top(),
+            (M::Fdecstp, None) => unit.decrement_top(),
+            (M::Fnop | M::Wait, None) => {}
+            (M::Fnclex, None) => unit.clear_exceptions(),
+            (M::Fninit, None) => unit.initialize(),
+            (M::Fnstcw, Some(memory)) => {
+                let word = u64::from(unit.control_word());
+                self.store(self.linear(&memory), 2, word)?;
+            }
+            (M::Fldcw, Some(memory)) => {
+                unit.set_control(self.load(self.linear(&memory), 2)? as u16);
+            }
+            (M::Fnstsw, Some(memory)) => {
+                let word = u64::from(unit.status_word());
+                self.store(self.linear(&memory), 2, word)?;
+            }
+            (M::Fnstsw, None) => {
+                self.write(op(self.i, 0)?, 2, u64::from(unit.status_word()))?;
+            }
+            (M::Fnstenv, Some(memory)) if usize::from(memory.size) == ENVIRONMENT => {
+                let image = unit.store_environment();
+                let at = self.linear(&memory);
+                self.mem.check_write(at, ENVIRONMENT)?;
+                self.mem.write(at, &image)?;
+            }
+            (M::Fldenv, Some(memory)) if usize::from(memory.size) == ENVIRONMENT => {
+                let mut image = [0; ENVIRONMENT];
+                self.mem.read(self.linear(&memory), &mut image)?;
+                unit.load_environment(&image);
+            }
+            _ => return Err(Stop::Invalid),
+        }
+        self.s.x87 = unit;
+        Ok(())
+    }
+    /// The 80-bit format in memory.
+    fn load_extended(&self, memory: &MemoryOperand) -> Result<u128> {
+        let mut bytes = [0; 16];
+        self.mem.read(self.linear(memory), &mut bytes[..10])?;
+        Ok(u128::from_le_bytes(bytes))
     }
     fn sse_misc(&mut self) -> Result<()> {
         use Mnemonic as M;
@@ -1856,6 +1954,34 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
         }
         Mnemonic::Fxsave | Mnemonic::Fxsave64 => x.fxsave()?,
         Mnemonic::Fxrstor | Mnemonic::Fxrstor64 => x.fxrstor()?,
+        Mnemonic::Fld
+        | Mnemonic::Fild
+        | Mnemonic::Fst
+        | Mnemonic::Fstp
+        | Mnemonic::Fist
+        | Mnemonic::Fistp
+        | Mnemonic::Fcomi
+        | Mnemonic::Fcomip
+        | Mnemonic::Fucomi
+        | Mnemonic::Fucomip
+        | Mnemonic::Fxch
+        | Mnemonic::Fchs
+        | Mnemonic::Fabs
+        | Mnemonic::Fxam
+        | Mnemonic::Fldz
+        | Mnemonic::Fld1
+        | Mnemonic::Fnop
+        | Mnemonic::Ffree
+        | Mnemonic::Fincstp
+        | Mnemonic::Fdecstp
+        | Mnemonic::Fnstcw
+        | Mnemonic::Fldcw
+        | Mnemonic::Fnstsw
+        | Mnemonic::Fnclex
+        | Mnemonic::Fninit
+        | Mnemonic::Fnstenv
+        | Mnemonic::Fldenv
+        | Mnemonic::Wait => x.x87()?,
         Mnemonic::Cpuid => {
             let values = crate::cpuid::values(x.s.gpr[reg::RAX] as u32, x.s.gpr[reg::RCX] as u32);
             for (index, value) in [reg::RAX, reg::RBX, reg::RCX, reg::RDX]

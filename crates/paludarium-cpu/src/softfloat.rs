@@ -17,13 +17,16 @@ pub(crate) const F64: Format = Format {
     bias: 1023,
 };
 impl Format {
-    fn sign(self) -> u64 {
+    pub(crate) fn bias(self) -> i32 {
+        self.bias
+    }
+    pub(crate) fn sign(self) -> u64 {
         1 << (self.fraction + self.exponent)
     }
-    fn mantissa(self) -> u64 {
+    pub(crate) fn mantissa(self) -> u64 {
         (1 << self.fraction) - 1
     }
-    fn infinity(self) -> u64 {
+    pub(crate) fn infinity(self) -> u64 {
         ((1 << self.exponent) - 1) << self.fraction
     }
     fn nan(self, x: u64) -> bool {
@@ -35,7 +38,7 @@ impl Format {
     fn quiet(self, x: u64) -> u64 {
         x | (1 << (self.fraction - 1))
     }
-    fn indefinite(self) -> u64 {
+    pub(crate) fn indefinite(self) -> u64 {
         self.sign() | self.infinity() | (1 << (self.fraction - 1))
     }
     fn finite(self, x: u64) -> (bool, u128, i32) {
@@ -69,7 +72,13 @@ fn sticky(value: u128, count: u32) -> u128 {
         (value >> count) | u128::from(value & ((1u128 << count) - 1) != 0)
     }
 }
-fn round(f: Format, negative: bool, magnitude: u128, power: i32, mxcsr: u32) -> (u64, u32) {
+pub(crate) fn round(
+    f: Format,
+    negative: bool,
+    magnitude: u128,
+    power: i32,
+    mxcsr: u32,
+) -> (u64, u32) {
     let sign = if negative { f.sign() } else { 0 };
     if magnitude == 0 {
         return (sign, 0);

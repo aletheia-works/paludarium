@@ -10,7 +10,7 @@
 //! larger than the limit is cut there; it still counts as dumped, as Linux's
 //! binfmt_elf reports a core once it has started to write it.
 use crate::signals;
-use paludarium_cpu::{CpuState, reg};
+use paludarium_cpu::{CpuState, FX_WRITTEN, reg};
 use paludarium_mmu::{AddressSpace, Mapping, MappingKind, Prot};
 use paludarium_types::GuestAddr;
 
@@ -445,16 +445,10 @@ fn auxv(who: &Identity, mem: &AddressSpace) -> Vec<u8> {
     vector
 }
 
-/// `struct user_i387_struct` (512 bytes, the `fxsave` layout): the x87
-/// unit at its initial state, as paludarium has none, and the SSE state.
+/// `struct user_i387_struct` (512 bytes, the `fxsave` layout).
 fn fpregset(cpu: &CpuState) -> [u8; 512] {
     let mut f = [0u8; 512];
-    put16(&mut f, 0, 0x037f); // control word
-    put32(&mut f, 24, cpu.mxcsr);
-    put32(&mut f, 28, 0xffff); // mxcsr_mask
-    for (i, xmm) in cpu.xmm.iter().enumerate() {
-        f[160 + 16 * i..176 + 16 * i].copy_from_slice(&xmm.to_le_bytes());
-    }
+    f[..FX_WRITTEN].copy_from_slice(&cpu.fx_image());
     f
 }
 

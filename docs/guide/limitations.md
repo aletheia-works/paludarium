@@ -5,10 +5,12 @@ verified.
 
 ## Not supported
 
-- **x87, for now**: its instructions are not implemented yet, so a program stops
-  with `SIGILL` where it reaches one. Many programs on glibc do, for example to
-  print or compute floating point numbers (bash's `printf`, awk, perl and
-  python3 do).
+- **x87 arithmetic, for now**: `FADD`, `FMUL`, `FPREM`, `FCOM` and the other
+  x87 instructions that compute are not implemented yet, so a program stops
+  with `SIGILL` where it reaches one, as mawk does. An x87 exception always
+  takes its masked response: an unmasked one sets the status word's summary and
+  does not raise `SIGFPE`. The 16-bit forms of `FNSTENV` and `FLDENV`
+  (with a `0x66` prefix) are not implemented either.
 - **A dynamically linked program's files, unless given**: a program runs with
   its interpreter as on Linux, on musl's dynamic linker or glibc's. A session
   reads the interpreter and the libraries from its own files, so they must be

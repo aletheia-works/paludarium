@@ -332,6 +332,34 @@ mnemonics!(
     Fxsave64,
     Fxrstor,
     Fxrstor64,
+    Fld,
+    Fild,
+    Fst,
+    Fstp,
+    Fist,
+    Fistp,
+    Fcomi,
+    Fcomip,
+    Fucomi,
+    Fucomip,
+    Fxch,
+    Fchs,
+    Fabs,
+    Fxam,
+    Fldz,
+    Fld1,
+    Fnop,
+    Ffree,
+    Fincstp,
+    Fdecstp,
+    Fnstcw,
+    Fldcw,
+    Fnstsw,
+    Fnclex,
+    Fninit,
+    Fnstenv,
+    Fldenv,
+    Wait,
     Stmxcsr,
     Mfence,
     Lfence,
@@ -453,6 +481,8 @@ pub enum Register {
     GprHigh8 { index: u8 },
     /// xmm0 ..= xmm15.
     Xmm(u8),
+    /// st(0) ..= st(7), from the top of the x87 stack.
+    St(u8),
 }
 
 impl Register {
@@ -463,6 +493,7 @@ impl Register {
             Register::Gpr { size, .. } => size,
             Register::GprHigh8 { .. } => 1,
             Register::Xmm(_) => 16,
+            Register::St(_) => 10,
         }
     }
 }
@@ -595,6 +626,10 @@ fn map_register(r: iced::Register) -> Option<Register> {
         }
     } else if r.is_xmm() && number < 16 {
         Some(Register::Xmm(number))
+    } else if r.is_st() {
+        Some(Register::St(
+            (r as u8).wrapping_sub(iced::Register::ST0 as u8),
+        ))
     } else {
         None
     }
@@ -852,6 +887,46 @@ mod tests {
         }
         let nop = [0x90; 16];
         assert_eq!(decode(&nop, rip), decode(&nop[..15], rip));
+    }
+
+    #[test]
+    fn x87_operands_are_their_stack_registers_and_memory_sizes() {
+        let rip = GuestAddr(0);
+        let at = |bytes: &[u8]| decode(bytes, rip).unwrap();
+        // fld st(3), fxch st(5), fstp st(1)
+        assert_eq!(
+            at(&[0xd9, 0xc3]).operand(0),
+            Some(Operand::Register(Register::St(3)))
+        );
+        assert_eq!(at(&[0xd9, 0xcd]).mnemonic, Mnemonic::Fxch);
+        assert!(
+            at(&[0xd9, 0xcd])
+                .operands()
+                .any(|o| o == Operand::Register(Register::St(5)))
+        );
+        assert_eq!(
+            at(&[0xdd, 0xd9]).operand(0),
+            Some(Operand::Register(Register::St(1)))
+        );
+        assert_eq!(Register::St(1).size(), 10);
+        // fld dword, qword and tbyte [rax], then fnstenv [rax]
+        let size = |bytes: &[u8]| match at(bytes).operand(0) {
+            Some(Operand::Memory(m)) => m.size,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(size(&[0xd9, 0x00]), 4);
+        assert_eq!(size(&[0xdd, 0x00]), 8);
+        assert_eq!(size(&[0xdb, 0x28]), 10);
+        assert_eq!(size(&[0xd9, 0x30]), 28);
+        // The waiting forms are a `wait` and the rest.
+        let waiting = at(&[0x9b, 0xd9, 0x38]);
+        assert_eq!((waiting.mnemonic, waiting.len), (Mnemonic::Wait, 1));
+        assert_eq!(at(&[0xd9, 0x38]).mnemonic, Mnemonic::Fnstcw);
+        // MMX has no stack register, and is still not run.
+        assert_eq!(
+            decode(&[0x0f, 0xfc, 0xc1], rip),
+            Err(DecodeError::Unsupported)
+        );
     }
 
     #[test]

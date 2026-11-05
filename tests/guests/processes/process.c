@@ -9582,7 +9582,11 @@ int main(int argc, char **argv) {
             __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
         }
         /* What it refuses. */
-        for (int which = 0; which < 5; which++) {
+        /* The whole area must be there, though the end of it is not used. */
+        char *pages = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pages == MAP_FAILED || mprotect(pages + 4096, 4096, PROT_NONE)) return 80;
+        char *near_end = pages + 4096 - 416;
+        for (int which = 0; which < 7; which++) {
             fflush(stdout);
             pid_t pid = child();
             if (pid == 0) {
@@ -9596,6 +9600,8 @@ int main(int argc, char **argv) {
                     __asm__ volatile("fxrstor (%0)" : : "r"(bad));
                     break;
                 case 3: __asm__ volatile("fxsave (%0)" : : "r"(16L) : "memory"); break;
+                case 4: __asm__ volatile("fxsave (%0)" : : "r"(near_end) : "memory"); break;
+                case 5: __asm__ volatile("fxrstor (%0)" : : "r"(near_end)); break;
                 default: __asm__ volatile("fxrstor (%0)" : : "r"(16L)); break;
                 }
                 _exit(9);

@@ -37,6 +37,8 @@ const FX_MXCSR_MASK: u32 = 0xffff;
 /// ends: the 16 registers take it to 416 bytes.
 const FX_XMM: usize = 160;
 const FX_WRITTEN: usize = 416;
+/// The whole area, all of which must be there for either instruction.
+const FX_AREA: usize = 512;
 type Result<T> = core::result::Result<T, Stop>;
 
 fn atomic_width(size: u8) -> Result<AtomicWidth> {
@@ -1219,9 +1221,10 @@ impl Exec<'_> {
     }
     /// `fxsave`: the x87 state as it is after a reset, as there is no x87,
     /// then MXCSR and its mask and the XMM registers. The area past them is
-    /// not written.
+    /// not written, but faults like the rest if it cannot be.
     fn fxsave(&mut self) -> Result<()> {
         let at = self.fx_area()?;
+        self.mem.check_write(at, FX_AREA)?;
         let mut area = [0u8; FX_WRITTEN];
         area[..2].copy_from_slice(&FX_CONTROL_WORD.to_le_bytes());
         area[24..28].copy_from_slice(&self.s.mxcsr.to_le_bytes());
@@ -1241,6 +1244,7 @@ impl Exec<'_> {
     /// and the XMM registers. There is no x87 for the rest to go to.
     fn fxrstor(&mut self) -> Result<()> {
         let at = self.fx_area()?;
+        self.mem.check_read(at, FX_AREA)?;
         let mut area = [0u8; FX_WRITTEN];
         self.mem.read(at, &mut area)?;
         let mxcsr = u32::from_le_bytes([area[24], area[25], area[26], area[27]]);

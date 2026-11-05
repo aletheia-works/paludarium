@@ -978,6 +978,24 @@ mod tests {
         );
     }
     #[test]
+    fn fxsave_and_fxrstor_need_the_whole_area_though_they_use_less() {
+        // Its last 96 bytes are past the end of the stack.
+        let near_the_end = 0x1000 - 416;
+        let (_, mem, reason) = fx_run(&[0x0f, 0xae, 0x00], &[0x55; 416], near_the_end, None);
+        assert!(matches!(reason, ExitReason::PageFault { .. }), "{reason:?}");
+        let mut area = [0; 416];
+        let at = STACK_TOP - 416;
+        mem.read(GuestAddr(at), &mut area).unwrap();
+        assert_eq!(area, [0x55; 416], "nothing was written");
+        let (s, _, reason) = fx_run(&[0x0f, 0xae, 0x08], &[0; 416], near_the_end, None);
+        assert!(matches!(reason, ExitReason::PageFault { .. }), "{reason:?}");
+        assert_eq!(
+            s.mxcsr,
+            CpuState::new(GuestAddr(0), GuestAddr(0)).mxcsr,
+            "nothing was read"
+        );
+    }
+    #[test]
     fn rdtsc_splits_a_counter_that_moves_on() {
         let read = |code: &[u8]| {
             let (mut s, mem) = machine(code);

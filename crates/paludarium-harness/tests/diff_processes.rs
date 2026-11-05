@@ -140,6 +140,7 @@ mod linux {
                     | "socket-owners"
                     | "capabilities"
                     | "script-exec"
+                    | "proc-maps"
                     | "dynamic-exec"
             );
             let native = if as_root && !running_as_root() {

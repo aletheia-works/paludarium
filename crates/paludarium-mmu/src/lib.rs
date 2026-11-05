@@ -593,6 +593,11 @@ pub trait PageSource: Send + Sync {
     fn identity(&self) -> (u64, u64) {
         (0, 0)
     }
+    /// What tells the open file behind this mapping from another (Linux's
+    /// `vm_file`), which mappings must share to merge, or 0 if nothing does.
+    fn open_file(&self) -> usize {
+        0
+    }
 }
 /// The file behind `[start, end)` of a private file mapping: the page at
 /// `page` holds the file from `page + shift` (wrapping), so that a move by
@@ -1753,7 +1758,12 @@ impl AddressSpaceData {
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
-                    (Some(x), Some(y)) => Arc::ptr_eq(&x.source, &y.source) && x.shift == y.shift,
+                    (Some(x), Some(y)) => {
+                        let opened = x.source.open_file();
+                        x.shift == y.shift
+                            && (Arc::ptr_eq(&x.source, &y.source)
+                                || opened != 0 && opened == y.source.open_file())
+                    }
                     _ => false,
                 },
                 (Some(x), Some(y)) => {

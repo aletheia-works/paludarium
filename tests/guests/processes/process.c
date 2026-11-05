@@ -2666,7 +2666,8 @@ static int maps_cases(const char *self) {
     printf("seek-within=%ld\n", (long)lseek(reader, 45, SEEK_SET));
     long within = read(reader, again, 20);
     printf("read-within=%ld same=%d\n", within, !memcmp(again, big + 45, 20));
-    printf("pread=%ld same=%d\n", (long)pread(reader, again, 20, 3), !memcmp(again, big + 3, 20));
+    long positioned = pread(reader, again, 20, 3);
+    printf("pread=%ld same=%d\n", positioned, !memcmp(again, big + 3, 20));
     printf("after-pread=%ld\n", (long)lseek(reader, 0, SEEK_CUR));
     printf("seek-far=%ld\n", (long)lseek(reader, 1 << 28, SEEK_SET));
     printf("read-far=%ld\n", (long)read(reader, again, 20));
@@ -2675,10 +2676,17 @@ static int maps_cases(const char *self) {
     char *later = f + 40 * page;
     if (mmap(later, page, PROT_READ | PROT_WRITE, flags, -1, 0) == MAP_FAILED) return 113;
     struct maps_line seen;
-    printf("sees-a-later-mapping=%d\n", maps_find(maps_text(reader), (unsigned long)later, &seen));
+    printf("sees-a-later-mapping=%d\n", maps_find(maps_text(reader), (unsigned long)later, &seen) &&
+                                              !strcmp(seen.perms, "rw-p"));
     munmap(later, page);
     lseek(reader, 0, SEEK_SET);
     printf("sees-it-gone=%d\n", !maps_find(maps_text(reader), (unsigned long)later, &seen));
+    /* /proc's generated files have no mapping operation. */
+    int status_file = open("/proc/self/status", O_RDONLY);
+    errno = 0;
+    int status_unmapped = mmap(NULL, page, PROT_READ, MAP_PRIVATE, status_file, 0) == MAP_FAILED;
+    printf("mmap-status-failed=%d errno=%d\n", status_unmapped, errno);
+    close(status_file);
     /* Neither written nor mapped, nor truncated. */
     errno = 0;
     long written = write(reader, "x", 1);
@@ -2686,8 +2694,8 @@ static int maps_cases(const char *self) {
     errno = 0;
     int unmapped = mmap(NULL, page, PROT_READ, MAP_PRIVATE, reader, 0) == MAP_FAILED;
     printf("mmap-failed=%d errno=%d\n", unmapped, errno);
-    int writer = open("/proc/self/maps", O_RDWR);
     errno = 0;
+    int writer = open("/proc/self/maps", O_RDWR);
     if (writer >= 0) {
         written = write(writer, "x", 1);
         printf("write-opened=%ld errno=%d\n", written, errno);
@@ -2711,8 +2719,10 @@ static int maps_cases(const char *self) {
         if (write(ready[1], &byte, 1) != 1 || read(go[0], &byte, 1) != 1) _exit(1);
         const char *text = maps_text(reader);
         struct maps_line line;
-        printf("child-sees-its-own=%d\n", maps_find(text, (unsigned long)mine, &line));
-        printf("child-sees-the-parents=%d\n", maps_find(text, (unsigned long)(f + 46 * page), &line));
+        int own = maps_find(text, (unsigned long)mine, &line) && !strcmp(line.perms, "rw-p");
+        printf("child-sees-its-own=%d\n", own);
+        int parents = maps_find(text, (unsigned long)(f + 46 * page), &line) && !strcmp(line.perms, "rw-p");
+        printf("child-sees-the-parents=%d\n", parents);
         fflush(stdout);
         _exit(0);
     }

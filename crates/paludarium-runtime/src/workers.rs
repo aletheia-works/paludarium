@@ -12,7 +12,6 @@ use std::sync::{
 
 pub(crate) struct Execution {
     host: Arc<dyn Host>,
-    mem: Arc<AddressSpace>,
     group: Arc<ThreadGroup>,
     processes: Arc<Processes>,
     kill: Arc<AtomicBool>,
@@ -29,7 +28,6 @@ impl Execution {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: Arc<dyn Host>,
-        mem: Arc<AddressSpace>,
         group: Arc<ThreadGroup>,
         processes: Arc<Processes>,
         kill: Arc<AtomicBool>,
@@ -42,7 +40,6 @@ impl Execution {
     ) -> Self {
         Self {
             host,
-            mem,
             group,
             processes,
             kill,
@@ -56,8 +53,14 @@ impl Execution {
             results: Mutex::new(Vec::new()),
         }
     }
-    pub fn execute(self: &Arc<Self>, mut kernel: Kernel, mut thread: Thread) {
-        let memory = self.mem.clone();
+    /// Runs `thread`, which alone holds `memory`, so that an address space
+    /// no thread uses any more goes away.
+    pub fn execute(
+        self: &Arc<Self>,
+        mut kernel: Kernel,
+        mut thread: Thread,
+        memory: Arc<AddressSpace>,
+    ) {
         self.execute_memory(&mut kernel, &mut thread, memory);
     }
     fn execute_memory(

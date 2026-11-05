@@ -1419,7 +1419,10 @@ fn check_mappable(
     if shared_write && access != 2 || access == 1 {
         return Err(Errno::EACCES);
     }
-    if !regular && !is_zero_device(file) {
+    // Neither a file that is not regular nor one that /proc generates can
+    // be read at an offset, which a mapping needs.
+    let readable = regular && file.read_at(0, &mut []) != Err(Errno::ENODEV);
+    if !readable && !is_zero_device(file) {
         return Err(Errno::ENODEV);
     }
     if shared_write && write_sealed(file) {

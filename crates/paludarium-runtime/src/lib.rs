@@ -442,7 +442,6 @@ impl Session {
         thread.state.name_after(&self.config.program);
         let execution = Arc::new(Execution::new(
             Arc::clone(&self.host),
-            Arc::new(mem),
             kernel.thread_group(),
             kernel.processes(),
             Arc::clone(&self.kill_requested),
@@ -453,7 +452,7 @@ impl Session {
             self.accelerated,
             self.budget,
         ));
-        execution.execute(kernel, thread);
+        execution.execute(kernel, thread, Arc::new(mem));
         execution.finish()
     }
 }

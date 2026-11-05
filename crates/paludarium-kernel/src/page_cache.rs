@@ -314,6 +314,9 @@ impl paludarium_mmu::PageSource for FilePages {
     fn identity(&self) -> (u64, u64) {
         self.cache.key
     }
+    fn open_file(&self) -> usize {
+        Arc::as_ptr(&self.file).cast::<()>() as usize
+    }
 }
 
 /// Where a file handle's device comes from.

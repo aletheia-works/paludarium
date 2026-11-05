@@ -21,8 +21,9 @@ Linux.
 - `CPUID` does not reveal the host's values and does not advertise features
   that are not implemented.
 - `RDTSC` and `RDTSCP` read a counter of the virtual CPU, which moves on with
-  each read rather than with time. `RDSSP` does nothing, as there are no shadow
-  stacks. `FXSAVE` and `FXRSTOR` keep MXCSR and the XMM registers, and give the
+  each read rather than with time. Every guest in the host process shares that
+  counter, so its values depend on what else has read it. `RDSSP` does nothing,
+  as there are no shadow stacks. `FXSAVE` and `FXRSTOR` keep MXCSR and the XMM registers, and give the
   x87 state as it is after a reset.
 - AVX, AVX-512, x87 and MMX are out of scope.
 

@@ -31,7 +31,8 @@ impl From<Fault> for Stop {
 
 /// The x87 control word after a reset, the first bytes of `fxsave`'s area.
 const FX_CONTROL_WORD: u16 = 0x37f;
-/// The MXCSR bits that may be set, as `fxsave` reports them.
+/// The MXCSR bits that may be set, as `fxsave` reports them. AMD's CPUs add bit
+/// 17 for misaligned SSE, which `CPUID` does not offer here.
 const FX_MXCSR_MASK: u32 = 0xffff;
 /// Where the XMM registers are in `fxsave`'s area, and where what it writes
 /// ends: the 16 registers take it to 416 bytes.

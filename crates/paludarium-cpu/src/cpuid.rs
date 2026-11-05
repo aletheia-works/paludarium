@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The time stamp counter of the virtual CPU, as `rdtsc` splits it into its low
 /// and high 32 bits: it never forwards the host's either. It moves on by each
 /// read, so a program that waits for it to change does not wait forever, and it
-/// is shared by every thread, as a synchronized counter is.
+/// is shared by every thread, as a synchronized counter is, and by every guest
+/// in the host process, so its values are not the same from run to run.
 pub(crate) fn time_stamp() -> [u32; 2] {
     /// Far from 0, as a counter that has run for a while, and past 32 bits.
     static COUNTER: AtomicU64 = AtomicU64::new(1 << 32);

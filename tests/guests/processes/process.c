@@ -9560,6 +9560,10 @@ int main(int argc, char **argv) {
             uint32_t mxcsr = 0x1f80 | 0x20 | 0x8000, given = 0;
             __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
             fx_save_from(in, area, wide);
+            /* MXCSR's mask has bit 17 only where misaligned SSE can be turned
+               on (AMD's), which is for CPUID to say; any other bit is compared. */
+            unsigned leaf_a, leaf_b, leaf_c = 0, leaf_d;
+            if (__get_cpuid(0x80000001, &leaf_a, &leaf_b, &leaf_c, &leaf_d) && (leaf_c & 1 << 7)) area[30] &= ~2;
             memcpy(&given, area + 24, 4);
             printf("fxsave %d: head", wide);
             for (int i = 0; i < 32; i++) printf(" %02x", area[i]);

@@ -170,6 +170,8 @@ mod linux {
             } else {
                 config
             };
+            // glibc's files where Debian and Ubuntu have them, which CI is; on
+            // another layout this case cannot find them.
             let config = if mode == "dynamic-glibc" {
                 let beside = |name: &str| std::fs::read(dir.join(name)).unwrap();
                 config

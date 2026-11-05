@@ -95,7 +95,8 @@ interfaces to keep compatible.
 
 When a `REP` instruction faults midway, Intel and AMD leave different flags.
 paludarium does not inspect the host CPU to choose; it models the behaviour
-explicitly, following Intel's design by default.
+explicitly, following Intel's design by default. `CPUID` names AMD for glibc's
+sake ([Features](../guide/features)), and that name does not change this.
 
 ## A relay for the browser's network
 

@@ -37,6 +37,23 @@ static void *in_thread(void *unused) {
     local += 1;
     return (void *)(intptr_t)local;
 }
+/* Whether the VMA at `address` in /proc/self/maps is named by a path. */
+static int in_maps(unsigned long address) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[PATH_MAX + 128];
+    int named = 0;
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && start <= address && address < end) {
+            named = strchr(line, '/') != NULL;
+            break;
+        }
+    }
+    fclose(maps);
+    return named;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     /* What the exec cases look at. */
@@ -56,6 +73,8 @@ int main(int argc, char **argv) {
            phdr >= (unsigned long)&__executable_start && phdr < (unsigned long)&__executable_start + 4096,
            getauxval(AT_PHENT));
     printf("break-after-program=%d\n", (unsigned long)sbrk(0) > (unsigned long)&__executable_start);
+    printf("linker-in-maps=%d\n", in_maps(getauxval(AT_BASE)));
+    printf("program-in-maps=%d\n", in_maps((unsigned long)&__executable_start));
     /* What the linker did. */
     printf("relocated: %s %d\n", getenv("NOTHING_HERE") ? "set" : "unset", (int)strlen("twelve bytes"));
 #ifdef __GLIBC__
@@ -83,6 +102,17 @@ int main(int argc, char **argv) {
     void *from_thread = NULL;
     if (pthread_create(&thread, NULL, in_thread, NULL) || pthread_join(thread, &from_thread)) return 80;
     printf("thread-local=%d main-local=%d\n", (int)(intptr_t)from_thread, local);
+#ifdef __GLIBC__
+    /* glibc finds the main thread's stack in /proc/self/maps. */
+    pthread_attr_t attributes;
+    void *stack = NULL;
+    size_t stack_size = 0;
+    int found = pthread_getattr_np(pthread_self(), &attributes);
+    if (!found) found = pthread_attr_getstack(&attributes, &stack, &stack_size);
+    char *here = (char *)&attributes;
+    printf("main-stack: found=%d holds-this=%d\n", found == 0,
+           here >= (char *)stack && here < (char *)stack + stack_size);
+#endif
     /* Loading more. */
     printf("own-symbol=%d\n", dlsym(RTLD_DEFAULT, "strlen") != NULL);
     printf("missing-symbol=%d\n", dlsym(RTLD_DEFAULT, "no_such_symbol") != NULL);

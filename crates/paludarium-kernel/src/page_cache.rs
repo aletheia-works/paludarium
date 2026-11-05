@@ -49,6 +49,7 @@ impl PageCaches {
         files.retain(|_, cache| cache.strong_count() > 0);
         self.live.fetch_add(1, Ordering::SeqCst);
         let cache = Arc::new(FileCache {
+            key,
             pages: SharedPages::new(),
             writer: Mutex::new(None),
             size: AtomicU64::new(size),
@@ -102,6 +103,8 @@ impl PageCaches {
 /// The page cache of one file: its pages, keyed by file offset, and the
 /// handle they are written back through.
 pub(crate) struct FileCache {
+    /// The device and inode of the file.
+    key: Key,
     pages: SharedPages,
     /// A handle open for writing, from the first mapping that may write.
     writer: Mutex<Option<Arc<dyn FileHandle>>>,
@@ -308,6 +311,9 @@ impl paludarium_mmu::PageSource for FilePages {
         }
         Some(name)
     }
+    fn identity(&self) -> (u64, u64) {
+        self.cache.key
+    }
 }
 
 /// Where a file handle's device comes from.
@@ -318,21 +324,7 @@ enum Device {
     Fixed(u64),
 }
 
-/// The number of the mount holding `path` (the longest matching mount
-/// point, counting from 1), which `stat` gives as the device minor.
-pub(crate) fn mount_device(mounts: &[MountPoint], path: &[u8]) -> u64 {
-    let inside = |root: &[u8]| {
-        root == b"/"
-            || path == root
-            || path.starts_with(root) && path.get(root.len()) == Some(&b'/')
-    };
-    mounts
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| inside(&m.path))
-        .max_by_key(|(_, m)| m.path.len())
-        .map_or(1, |(i, _)| i as u64 + 1)
-}
+pub(crate) use paludarium_vfs::mount_device;
 
 /// A file handle that keeps its file and the file's page cache in step
 /// (see the module). Every other method is passed on unchanged.

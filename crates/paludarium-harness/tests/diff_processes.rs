@@ -275,6 +275,7 @@ mod linux {
         processes_cpu_state => ("cpu-state","process"),
         processes_x87 => ("x87","process"),
         processes_x87_arithmetic => ("x87-arithmetic","process"),
+        processes_proc_maps => ("proc-maps","process"),
         processes_time_calls => ("time-calls","process"),
         processes_dynamic => ("dynamic","dynamic"),
         processes_dynamic_no_pie => ("dynamic-no-pie","dynamic-no-pie"),

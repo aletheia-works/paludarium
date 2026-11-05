@@ -17,7 +17,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   セッション自身のファイルから読むので、マウントするか渡す必要があります。
 - **32-bit の x86、AVX、AVX-512、MMX**：対象外です。glibc が必須とするので `CPUID` は
   MMX を示しますが、その命令は `SIGILL` で止まります。
-- **`/proc/self/maps`**：このファイルはありません。
+- **`/proc/self/maps` の一部**：エミュレーターには vDSO も `vsyscall` のページも
+  ないので、`[vvar]`、`[vdso]`、`[vsyscall]` の行はありません。スタックの VMA は
+  初めから全体の大きさで、Linux のように使うにつれて伸びません。プログラムと
+  インタープリターのセグメントの名前は起動時のパスで、`(deleted)` も付きません。
+  Linux は名前の変更を追い、シンボリックリンクを解決します。ほかのプロセスの
+  `/proc/<pid>/maps`、`smaps`、`[anon:<名前>]` の名前（`PR_SET_VMA`）はありません。
 - **ネットワーク**：許可の一覧（`--allow-net`、`Config::with_network`、ブラウザでは
   [中継](./relay) の要る JavaScript の `network` の指定）がなければ、
   `socket()` はどのファミリーにも `EAFNOSUPPORT` を返します。一覧があっても、使えるのは

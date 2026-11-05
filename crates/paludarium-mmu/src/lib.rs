@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{
-    Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
 
 use paludarium_types::{Errno, GuestAddr, PAGE_SIZE, USER_ADDRESS_LIMIT};
@@ -128,6 +128,25 @@ pub struct MappedFile {
     pub source: bool,
     /// Where the mapping's address lies in it.
     pub offset: u64,
+}
+
+/// A Linux VMA as `/proc/<pid>/maps` shows it ([`MemoryView::vma_from`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Vma {
+    pub start: u64,
+    pub end: u64,
+    pub prot: Prot,
+    /// The mapping is shared (Linux's `VM_MAYSHARE`).
+    pub shared: bool,
+    /// Where in its file the VMA starts, or 0 without a file.
+    pub offset: u64,
+    /// Its file, if it has one: shared anonymous memory has one with no
+    /// [`MappedFile::source`], as Linux gives it a file of no name.
+    pub file: Option<MappedFile>,
+    /// The device and inode of its file.
+    pub identity: (u64, u64),
+    /// It lies across the break's range (Linux's `vma_is_initial_heap`).
+    pub heap: bool,
 }
 
 impl Mapping {
@@ -355,6 +374,9 @@ type Frame = Arc<OnceLock<FrameBytes>>;
 /// writes it back) lives as long as a mapping or a clone of it does.
 #[derive(Clone)]
 pub struct SharedPages {
+    /// Tells this memory from any other, as the inode of the file Linux
+    /// gives shared anonymous memory does.
+    id: u64,
     frames: Arc<Mutex<BTreeMap<u64, Frame>>>,
     /// Bumped by every store to the frames: before and after one through a
     /// mapping, and by those of the kernel ([`Self::store`], [`Self::zero`]).
@@ -380,6 +402,7 @@ impl SharedPages {
     }
     fn with_frames(frames: BTreeMap<u64, Frame>) -> Self {
         SharedPages {
+            id: NEXT_SHARED_PAGES_ID.fetch_add(1, Ordering::Relaxed),
             frames: Arc::new(Mutex::new(frames)),
             generation: Arc::default(),
             _owner: None,
@@ -565,6 +588,11 @@ pub trait PageSource: Send + Sync {
     fn name(&self) -> Option<Vec<u8>> {
         None
     }
+    /// The device and inode `stat` gives the file, which
+    /// `/proc/<pid>/maps` shows.
+    fn identity(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 /// The file behind `[start, end)` of a private file mapping: the page at
 /// `page` holds the file from `page + shift` (wrapping), so that a move by
@@ -653,6 +681,7 @@ impl Tlb {
 }
 
 static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SHARED_PAGES_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The counters of a space that [`AddressSpace::code_generation_cached`]
 /// reads without the locks.
@@ -1497,6 +1526,35 @@ impl AddressSpaceData {
             .map(|shared| (None, addr.wrapping_add(shared.shift)))
     }
 
+    /// The first VMA that ends after `addr`, and the file to ask about it
+    /// with no lock held.
+    fn vma_from(&self, addr: u64) -> Option<(Vma, Option<Arc<dyn PageSource>>)> {
+        let mapping = self
+            .mapping_at(addr)
+            .or_else(|| self.mappings.range(addr..).next().map(|(_, m)| m))?;
+        let (start, end) = self.region_at(mapping.start.0)?;
+        let found = self.mapped_file(start);
+        let (offset, source) = match found.as_ref() {
+            Some((source, offset)) => (*offset, source.clone()),
+            None => (0, None),
+        };
+        let vma = Vma {
+            start,
+            end,
+            prot: mapping.prot,
+            shared: self.shared_at(start).is_some(),
+            offset,
+            file: found.map(|(source, offset)| MappedFile {
+                name: None,
+                source: source.is_some(),
+                offset,
+            }),
+            identity: (0, self.shared_at(start).map_or(0, |shared| shared.pages.id)),
+            heap: start < self.current_break.0 && end > self.initial_break.0,
+        };
+        Some((vma, source))
+    }
+
     /// Reads guest memory (any mapped page is readable on x86).
     pub fn read(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         self.read_with(addr, buf, Access::Read)
@@ -2156,13 +2214,46 @@ pub struct AtomicResult {
 /// this one lock, including ordinary reads/writes/fetches. The private data
 /// implementation never calls back through this public wrapper (no reentry).
 pub struct AddressSpace {
-    data: Mutex<AddressSpaceData>,
+    data: Arc<Mutex<AddressSpaceData>>,
     /// The data's `code`, for [`Self::code_generation_cached`].
     code: Arc<CodeCounters>,
     serialization: Arc<Mutex<()>>,
     /// The data's `out_of_memory`, so that every checkpoint can read it
     /// without taking the session-wide serialization lock.
     out_of_memory: Arc<AtomicBool>,
+}
+
+/// An address space's VMAs for as long as a thread uses it, as Linux's
+/// `/proc/<pid>/maps` holds the `mm` it was opened on: it keeps no memory
+/// alive, and shows nothing once the space is gone.
+#[derive(Clone)]
+pub struct MemoryView {
+    data: Weak<Mutex<AddressSpaceData>>,
+    serialization: Arc<Mutex<()>>,
+}
+
+impl MemoryView {
+    /// The first VMA that ends after `addr`, if the space still lives and
+    /// has one.
+    #[must_use]
+    pub fn vma_from(&self, addr: u64) -> Option<Vma> {
+        let data = self.data.upgrade()?;
+        let (mut vma, source) = {
+            let _serialization = self
+                .serialization
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            data.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .vma_from(addr)?
+        };
+        // Asked with the lock released: the file's own state may take time.
+        if let (Some(file), Some(source)) = (vma.file.as_mut(), source) {
+            file.name = source.name();
+            vma.identity = source.identity();
+        }
+        Some(vma)
+    }
 }
 
 /// Owned instruction bytes and their epoch, captured under one MMU lock.
@@ -2219,7 +2310,7 @@ impl AddressSpace {
         Self {
             out_of_memory: Arc::clone(&data.out_of_memory),
             code: Arc::clone(&data.code),
-            data: Mutex::new(data),
+            data: Arc::new(Mutex::new(data)),
             serialization,
         }
     }
@@ -2245,9 +2336,9 @@ impl AddressSpace {
     /// Charges this space's frames to `meter`, and the frames of the spaces
     /// forked from it.
     #[must_use]
-    pub fn with_memory_meter(mut self, meter: Arc<MemoryMeter>) -> Self {
+    pub fn with_memory_meter(self, meter: Arc<MemoryMeter>) -> Self {
         self.data
-            .get_mut()
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .meter = Some(meter);
         self
@@ -2439,6 +2530,14 @@ impl AddressSpace {
             source: source.is_some(),
             offset,
         })
+    }
+    /// This space's VMAs as `/proc/<pid>/maps` reads them ([`MemoryView`]).
+    #[must_use]
+    pub fn view(&self) -> MemoryView {
+        MemoryView {
+            data: Arc::downgrade(&self.data),
+            serialization: Arc::clone(&self.serialization),
+        }
     }
     /// A consistent mapping snapshot; borrowed entries cannot outlive the lock.
     pub fn mappings(&self) -> impl Iterator<Item = Mapping> {

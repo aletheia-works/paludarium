@@ -85,6 +85,22 @@ pub struct MountPoint {
     pub path: Vec<u8>,
     pub kind: &'static str,
 }
+/// The number of the mount holding `path` (the longest matching mount
+/// point, counting from 1), which `stat` gives as the device minor.
+#[must_use]
+pub fn mount_device(mounts: &[MountPoint], path: &[u8]) -> u64 {
+    let inside = |root: &[u8]| {
+        root == b"/"
+            || path == root
+            || path.starts_with(root) && path.get(root.len()) == Some(&b'/')
+    };
+    mounts
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| inside(&m.path))
+        .max_by_key(|(_, m)| m.path.len())
+        .map_or(1, |(i, _)| i as u64 + 1)
+}
 pub trait FileSystem: HostFs {
     /// The mounts, root first, for `/proc/self/mountinfo`.
     fn mounts(&self) -> Vec<MountPoint> {

@@ -20,7 +20,13 @@ verified.
   mounted or given to it.
 - **32-bit x86, AVX, AVX-512, MMX**: out of scope. `CPUID` reports MMX because
   glibc requires it, but its instructions stop with `SIGILL`.
-- **`/proc/self/maps`**: this file does not exist.
+- **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
+  so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
+  VMA has its full size from the start, where Linux's grows as it is used. A
+  program's own segments and its interpreter's are named by the path it was
+  started by, never marked `(deleted)`, where Linux follows a rename and resolves
+  symbolic links. `/proc/<pid>/maps` of another process, `smaps` and
+  `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.

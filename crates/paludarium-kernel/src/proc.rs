@@ -1,8 +1,10 @@
 //! The only /proc files paludarium has, generated when opened: the mount
 //! table (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's
-//! mounts, and this process's directory with its `status` and its `fd`
-//! directory of links to the open descriptors.
+//! mounts, and this process's directory with its `status`, its `fd`
+//! directory of links to the open descriptors, and its `maps`, which alone
+//! is generated as it is read.
 use paludarium_host::{FileHandle, FileStat};
+use paludarium_mmu::{MemoryView, Prot, Vma};
 use paludarium_types::Errno;
 use paludarium_vfs::MountPoint;
 use std::sync::{Mutex, PoisonError};
@@ -32,6 +34,7 @@ pub(crate) fn mount_table(path: &[u8]) -> Option<bool> {
 pub(crate) enum OwnEntry {
     Directory,
     Status,
+    Maps,
     /// `fd`, and one of its links by descriptor number.
     Descriptors,
     Descriptor(u32),
@@ -48,6 +51,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
     match tail {
         b"" | b"/" => Some(OwnEntry::Directory),
         b"/status" => Some(OwnEntry::Status),
+        b"/maps" => Some(OwnEntry::Maps),
         b"/fd" | b"/fd/" => Some(OwnEntry::Descriptors),
         _ => descriptor_number(tail.strip_prefix(b"/fd/")?).map(OwnEntry::Descriptor),
     }
@@ -331,15 +335,406 @@ impl FileHandle for GeneratedFile {
     }
 }
 
+/// One line of `maps`, as Linux's `show_map_vma` writes it: the header with
+/// a space after the inode, then, for a VMA with a name, spaces up to column
+/// 72 and one more before it. A newline in a path is octal.
+fn map_line(vma: &Vma, start_stack: u64) -> Vec<u8> {
+    let flag = |prot: Prot, letter: char| {
+        if vma.prot.contains(prot) { letter } else { '-' }
+    };
+    let (device, inode) = vma.identity;
+    let (major, minor) = (
+        (device >> 8) & 0xfff,
+        (device & 0xff) | ((device >> 12) & !0xff),
+    );
+    // Shared anonymous memory's file lies on Linux's first device.
+    let minor = match &vma.file {
+        Some(file) if !file.source => 1,
+        _ => minor,
+    };
+    let mut line = format!(
+        "{:08x}-{:08x} {}{}{}{} {:08x} {major:02x}:{minor:02x} {inode} ",
+        vma.start,
+        vma.end,
+        flag(Prot::READ, 'r'),
+        flag(Prot::WRITE, 'w'),
+        flag(Prot::EXEC, 'x'),
+        if vma.shared { 's' } else { 'p' },
+        vma.offset,
+    )
+    .into_bytes();
+    let name: &[u8] = match &vma.file {
+        Some(file) if file.source => file.name.as_deref().unwrap_or_default(),
+        Some(_) => b"/dev/zero (deleted)",
+        None if vma.heap => b"[heap]",
+        None if vma.start <= start_stack && vma.end >= start_stack => b"[stack]",
+        None => b"",
+    };
+    if !name.is_empty() {
+        line.resize(line.len().max(MAPS_NAME_COLUMN), b' ');
+        line.push(b' ');
+        for &b in name {
+            if b == b'\n' {
+                line.extend_from_slice(b"\\012");
+            } else {
+                line.push(b);
+            }
+        }
+    }
+    line.push(b'\n');
+    line
+}
+/// Where `maps` pads a line to before its name (Linux's width of
+/// `25 + sizeof(void *) * 6 - 1`).
+const MAPS_NAME_COLUMN: usize = 72;
+/// How much a `read` of `maps` gathers: Linux's `seq_file` buffer, one page
+/// until a single line needs more.
+const MAPS_BUFFER: usize = 4096;
+/// Past the last VMA, as Linux's `m_start` is told by its sentinel.
+const MAPS_END: u64 = u64::MAX;
+
+/// Where a reader of `maps` has got to, as Linux's `seq_file` keeps it.
+struct MapsPosition {
+    /// The bytes gathered but not yet read.
+    pending: Vec<u8>,
+    /// How far into `pending` the reader is.
+    from: usize,
+    /// The start of the next VMA to gather.
+    next: u64,
+    /// The file position.
+    position: u64,
+    /// The size of the buffer, which a long line doubles.
+    buffer: usize,
+}
+
+/// `/proc/<pid>/maps`, generated as it is read from the VMAs of the address
+/// space it was opened on: a read sees the mappings of that moment, from the
+/// address it had reached, whatever they were when it was opened.
+pub(crate) struct MapsFile {
+    memory: MemoryView,
+    start_stack: u64,
+    writable: bool,
+    position: Mutex<MapsPosition>,
+}
+impl MapsFile {
+    pub(crate) fn open(memory: MemoryView, start_stack: u64, flags: u32) -> Self {
+        Self {
+            memory,
+            start_stack,
+            writable: flags & 3 != 0,
+            position: Mutex::new(MapsPosition {
+                pending: Vec::new(),
+                from: 0,
+                next: 0,
+                position: 0,
+                buffer: MAPS_BUFFER,
+            }),
+        }
+    }
+    /// The line of the VMA at `next` or after it, and where the next starts.
+    fn take_line(&self, next: u64) -> Option<(Vec<u8>, u64)> {
+        if next == MAPS_END {
+            return None;
+        }
+        let vma = self.memory.vma_from(next)?;
+        let after = self.memory.vma_from(vma.end).map_or(MAPS_END, |v| v.start);
+        Some((map_line(&vma, self.start_stack), after))
+    }
+    /// Gathers whole lines until `wanted` bytes are there or one more would
+    /// fill the buffer, as `seq_read` does; the first always goes in.
+    fn gather(&self, state: &mut MapsPosition, wanted: usize) {
+        state.pending.clear();
+        state.from = 0;
+        while let Some((line, after)) = self.take_line(state.next) {
+            if state.pending.is_empty() {
+                while line.len() >= state.buffer {
+                    state.buffer *= 2;
+                }
+            } else if state.pending.len() + line.len() >= state.buffer {
+                break;
+            }
+            state.pending.extend_from_slice(&line);
+            state.next = after;
+            if state.pending.len() >= wanted {
+                break;
+            }
+        }
+    }
+    /// Starts over and walks to `offset`, as Linux's `traverse`: one past
+    /// the end only reads nothing.
+    fn walk_to(&self, state: &mut MapsPosition, offset: u64) {
+        state.pending.clear();
+        state.from = 0;
+        state.next = 0;
+        if offset == 0 {
+            return;
+        }
+        let mut reached = 0;
+        while let Some((line, after)) = self.take_line(state.next) {
+            state.next = after;
+            let length = line.len() as u64;
+            if reached + length > offset {
+                state.from = (offset - reached) as usize;
+                state.pending = line;
+                return;
+            }
+            reached += length;
+            if reached == offset {
+                return;
+            }
+        }
+    }
+}
+impl FileHandle for MapsFile {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let mut state = self.position.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state;
+        let mut copied = 0;
+        let waiting = &state.pending[state.from..];
+        if !waiting.is_empty() {
+            copied = buf.len().min(waiting.len());
+            buf[..copied].copy_from_slice(&waiting[..copied]);
+            state.from += copied;
+            if state.from < state.pending.len() {
+                state.position += copied as u64;
+                return Ok(copied);
+            }
+        }
+        if copied < buf.len() {
+            self.gather(state, buf.len() - copied);
+            let count = (buf.len() - copied).min(state.pending.len());
+            buf[copied..copied + count].copy_from_slice(&state.pending[..count]);
+            state.from = count;
+            copied += count;
+        }
+        state.position += copied as u64;
+        Ok(copied)
+    }
+    /// It has no write operation: EINVAL, or EBADF on a descriptor opened
+    /// read-only.
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(if self.writable {
+            Errno::EINVAL
+        } else {
+            Errno::EBADF
+        })
+    }
+    /// As Linux's `seq_lseek`: from the start or the current position, never
+    /// the end, which it does not know.
+    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
+        let mut state = self.position.lock().unwrap_or_else(PoisonError::into_inner);
+        let base = match whence {
+            0 => 0,
+            1 => state.position,
+            _ => return Err(Errno::EINVAL),
+        };
+        let target = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
+        if i64::try_from(target).is_err() {
+            return Err(Errno::EINVAL);
+        }
+        if target != state.position {
+            self.walk_to(&mut state, target);
+            state.position = target;
+        }
+        Ok(target)
+    }
+    /// Size 0, as Linux's /proc: a reader goes by what `read` gives.
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(stat(0))
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn flags(&self) -> u32 {
+        0
+    }
+    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paludarium_mmu::{AddressSpace, MappingKind};
+    use paludarium_types::GuestAddr;
+
+    fn read_all(file: &MapsFile, piece: usize) -> Vec<u8> {
+        let mut all = Vec::new();
+        let mut buf = vec![0; piece];
+        loop {
+            let count = file.read(&mut buf).unwrap();
+            if count == 0 {
+                return all;
+            }
+            all.extend_from_slice(&buf[..count]);
+        }
+    }
+
+    #[test]
+    fn maps_lines_read_as_linux_writes_them() {
+        let mut mem = AddressSpace::new();
+        let at = |a: u64| Some(GuestAddr(a));
+        mem.map(at(0x1000), 0x1000, Prot::READ, MappingKind::ElfSegment)
+            .unwrap();
+        mem.map(at(0x5000), 0x2000, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        mem.map(at(0x7fff0000), 0x1000, Prot::READ_WRITE, MappingKind::Stack)
+            .unwrap();
+        let file = MapsFile::open(mem.view(), 0x7fff0800, 0);
+        assert_eq!(
+            String::from_utf8(read_all(&file, 4096)).unwrap(),
+            format!(
+                "00001000-00002000 r--p 00000000 00:00 0 \n\
+                 00005000-00007000 rw-p 00000000 00:00 0 \n\
+                 7fff0000-7fff1000 rw-p 00000000 00:00 0 {}[stack]\n",
+                " ".repeat(MAPS_NAME_COLUMN - 40 + 1)
+            )
+        );
+    }
+
+    #[test]
+    fn maps_shows_the_break_as_the_heap_once_it_has_grown() {
+        let mut mem = AddressSpace::new();
+        mem.set_initial_break(GuestAddr(0x10000));
+        let view = mem.view();
+        assert_eq!(view.vma_from(0), None);
+        mem.set_break(GuestAddr(0x11000));
+        let vma = view.vma_from(0).unwrap();
+        assert!(vma.heap);
+        assert!(map_line(&vma, 0).ends_with(b" [heap]\n"));
+    }
+
+    #[test]
+    fn maps_escapes_only_a_newline_in_a_name() {
+        let vma = Vma {
+            start: 0x1000,
+            end: 0x2000,
+            prot: Prot::READ,
+            shared: false,
+            offset: 0x3000,
+            file: Some(paludarium_mmu::MappedFile {
+                name: Some(b"/a b\\c\nd".to_vec()),
+                source: true,
+                offset: 0x3000,
+            }),
+            identity: (0x0812, 9),
+            heap: false,
+        };
+        let line = map_line(&vma, 0);
+        let text = std::str::from_utf8(&line).unwrap();
+        assert!(text.starts_with("00001000-00002000 r--p 00003000 08:12 9 "));
+        assert_eq!(text.find('/'), Some(MAPS_NAME_COLUMN + 1));
+        assert!(text.ends_with("/a b\\c\\012d\n"));
+    }
+
+    #[test]
+    fn maps_names_shared_anonymous_memory_as_linux_does() {
+        let mem = AddressSpace::new();
+        let at = mem
+            .map_shared(None, 0x1000, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        mem.mark_shared(at, 0x1000).unwrap();
+        let vma = mem.view().vma_from(0).unwrap();
+        let line = String::from_utf8(map_line(&vma, 0)).unwrap();
+        assert!(line.contains(" rw-s 00000000 00:01 "), "{line}");
+        assert!(line.ends_with(" /dev/zero (deleted)\n"), "{line}");
+        assert_ne!(vma.identity.1, 0);
+    }
+
+    #[test]
+    fn maps_is_generated_as_it_is_read() {
+        let mem = AddressSpace::new();
+        let map = |at: u64| {
+            mem.map_shared(
+                Some(GuestAddr(at)),
+                0x1000,
+                Prot::READ,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        };
+        map(0x10000);
+        map(0x30000);
+        let file = MapsFile::open(mem.view(), 0, 0);
+        let mut buf = [0; 10];
+        assert_eq!(file.read(&mut buf).unwrap(), 10);
+        // The reader goes on from the VMA it found next, as Linux's does:
+        // one made before that is passed by, and one after it is seen.
+        map(0x20000);
+        map(0x40000);
+        let lines = String::from_utf8(read_all(&file, 7)).unwrap();
+        let starts: Vec<&str> = lines.lines().map(|line| &line[..8]).collect();
+        assert_eq!(starts[1..], ["00030000", "00040000"], "{lines}");
+        // Going back reads them all.
+        assert_eq!(file.seek(0, 0).unwrap(), 0);
+        let all = read_all(&file, 4096);
+        assert_eq!(String::from_utf8_lossy(&all).lines().count(), 4);
+        assert_eq!(&all[..10], &buf);
+    }
+
+    #[test]
+    fn maps_reads_whole_lines_up_to_a_page_and_seeks_within_them() {
+        let mem = AddressSpace::new();
+        for i in 0..200u64 {
+            mem.map_shared(
+                Some(GuestAddr(0x100000 + i * 0x2000)),
+                0x1000,
+                Prot::READ,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        }
+        let file = MapsFile::open(mem.view(), 0, 0);
+        let whole = read_all(&file, 1 << 16);
+        assert_eq!(whole.len(), 200 * 41);
+        file.seek(0, 0).unwrap();
+        let mut big = vec![0; 1 << 16];
+        let first = file.read(&mut big).unwrap();
+        assert!((MAPS_BUFFER - 41..MAPS_BUFFER).contains(&first), "{first}");
+        assert_eq!(big[first - 1], b'\n');
+        // Going forward lands within a line, and past the end reads nothing.
+        assert_eq!(file.seek(45, 0).unwrap(), 45);
+        assert_eq!(read_all(&file, 100), &whole[45..]);
+        assert_eq!(file.seek(-5, 1).unwrap(), whole.len() as u64 - 5);
+        assert_eq!(read_all(&file, 100), &whole[whole.len() - 5..]);
+        assert_eq!(file.seek(1 << 20, 0).unwrap(), 1 << 20);
+        assert_eq!(file.read(&mut big).unwrap(), 0);
+        assert_eq!(file.seek(0, 2), Err(Errno::EINVAL));
+        assert_eq!(file.seek(-1, 0), Err(Errno::EINVAL));
+        assert_eq!(file.stat().unwrap().size, 0);
+        assert_eq!(file.write(b"x"), Err(Errno::EBADF));
+        assert_eq!(
+            MapsFile::open(mem.view(), 0, 2).write(b"x"),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn maps_reads_nothing_once_its_space_is_gone() {
+        let mem = AddressSpace::new();
+        mem.map_shared(None, 0x1000, Prot::READ, MappingKind::Anonymous)
+            .unwrap();
+        let file = MapsFile::open(mem.view(), 0, 0);
+        drop(mem);
+        assert_eq!(file.read(&mut [0; 16]).unwrap(), 0);
+    }
+
     #[test]
     fn own_entries_are_this_process_only() {
         assert_eq!(own_entry(b"/proc/self", 7), Some(OwnEntry::Directory));
         assert_eq!(own_entry(b"/proc/7/", 7), Some(OwnEntry::Directory));
         assert_eq!(own_entry(b"/proc/self/status", 7), Some(OwnEntry::Status));
         assert_eq!(own_entry(b"/proc/7/status", 7), Some(OwnEntry::Status));
+        assert_eq!(own_entry(b"/proc/self/maps", 7), Some(OwnEntry::Maps));
+        assert_eq!(own_entry(b"/proc/7/maps", 7), Some(OwnEntry::Maps));
+        assert_eq!(own_entry(b"/proc/8/maps", 7), None);
         assert_eq!(own_entry(b"/proc/8/status", 7), None);
         assert_eq!(own_entry(b"/proc/self/stat", 7), None);
         assert_eq!(own_entry(b"/proc/selfish", 7), None);

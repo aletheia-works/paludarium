@@ -637,6 +637,18 @@ fn positioned(
 /// The bytes to transfer for a request of `count` at `offset`: at most
 /// `MAX_RW_COUNT`, and for a read of a regular file no more than it holds.
 /// An end past the largest offset is EINVAL, and reading a directory EISDIR.
+/// Where reads of a regular file stop: at its size, but for `maps`, which
+/// says 0 as Linux's /proc does and ends where its `read` does.
+fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
+    if file
+        .as_any()
+        .is_some_and(|file| file.is::<crate::proc::MapsFile>())
+    {
+        u64::MAX
+    } else {
+        metadata.size
+    }
+}
 fn request(
     file: &Arc<dyn FileHandle>,
     count: u64,
@@ -660,9 +672,10 @@ fn request(
     match metadata.mode & 0o170000 {
         0o040000 => Err(Errno::EISDIR),
         // Saturating, so a remainder past usize (wasm32) does not wrap.
-        0o100000 => Ok(
-            len.min(usize::try_from(metadata.size.saturating_sub(offset)).unwrap_or(usize::MAX))
-        ),
+        0o100000 => Ok(len.min(
+            usize::try_from(read_limit(file, &metadata).saturating_sub(offset))
+                .unwrap_or(usize::MAX),
+        )),
         _ => Ok(len),
     }
 }
@@ -1032,7 +1045,7 @@ fn send(
     if source.mode & 0o170000 != REGULAR {
         return Err(Errno::EINVAL);
     }
-    let count = count.min(source.size.saturating_sub(from));
+    let count = count.min(read_limit(&input, &source).saturating_sub(from));
     if count == 0 {
         return Ok(0);
     }
@@ -1614,7 +1627,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     if metadata.mode & 0o170000 != 0o100000 {
                         requested
                     } else {
-                        let size = metadata.size;
+                        let size = read_limit(&d.file, &metadata);
                         let pos = d.file.seek(0, 1)?;
                         requested
                             .min(usize::try_from(size.saturating_sub(pos)).unwrap_or(usize::MAX))
@@ -2912,6 +2925,11 @@ fn open_path(
             crate::proc::OwnEntry::Status => {
                 Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
             }
+            crate::proc::OwnEntry::Maps => Arc::new(crate::proc::MapsFile::open(
+                c.mem.view(),
+                c.group.start_stack(),
+                flags,
+            )),
             crate::proc::OwnEntry::Descriptor(n) => {
                 // A link for a descriptor that is not open is not there
                 // (ENOENT), whatever the flags. One that is, is a symbolic
@@ -3169,6 +3187,7 @@ fn generated_stat(c: &Context<'_>, path: &[u8], follow: bool) -> Option<(FileSta
         crate::proc::OwnEntry::Directory => crate::proc::directory_stat(),
         crate::proc::OwnEntry::Descriptors => crate::proc::descriptors_stat(),
         crate::proc::OwnEntry::Status => crate::proc::stat(status(c).len()),
+        crate::proc::OwnEntry::Maps => crate::proc::stat(0),
         crate::proc::OwnEntry::Descriptor(n) => {
             let d = c.files.descriptor(u64::from(n)).ok()?;
             if follow {

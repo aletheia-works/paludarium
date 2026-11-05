@@ -983,6 +983,33 @@ fn proc_fd_links_open_again_or_refuse() {
     assert_eq!(f.ret(2, &[path, 0]), errno(Errno::ENOENT));
 }
 #[test]
+fn proc_maps_reads_through_the_system_calls_though_its_size_is_zero() {
+    let mut f = fixture();
+    let (path, buf, stat) = (DATA, DATA + 0x400, DATA + 0xe00);
+    f.mem.write(GuestAddr(path), b"/proc/self/maps\0").unwrap();
+    let fd = f.ret(2, &[path, 0]);
+    assert_eq!(f.ret(5, &[fd, stat]), 0);
+    let mut size = [0; 8];
+    f.mem.read(GuestAddr(stat + 48), &mut size).unwrap();
+    assert_eq!(u64::from_le_bytes(size), 0);
+    // read, then pread and sendfile from the start, each past the size.
+    let count = f.ret(0, &[fd, buf, 512]);
+    assert!(count > 0 && count <= 512, "{count:#x}");
+    let mut line = vec![0; count as usize];
+    f.mem.read(GuestAddr(buf), &mut line).unwrap();
+    assert!(line.contains(&b'-') && line.contains(&b'\n'));
+    assert_eq!(f.ret(17, &[fd, buf + 0x800, 8, 0]), 8);
+    let mut again = [0; 8];
+    f.mem.read(GuestAddr(buf + 0x800), &mut again).unwrap();
+    assert_eq!(again, line[..8]);
+    let memfd_name = DATA + 0x300;
+    f.mem.write(GuestAddr(memfd_name), b"out\0").unwrap();
+    let out = f.ret(319, &[memfd_name, 0]);
+    assert_eq!(f.ret(8, &[fd, 0, 0]), 0);
+    assert_eq!(f.ret(40, &[out, fd, 0, 16]), 16);
+    assert_eq!(f.ret(3, &[fd]), 0);
+}
+#[test]
 fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
     let mut f = fixture();
     let (name, buf) = (DATA, DATA + 0x400);

@@ -568,10 +568,23 @@ kernel.
   link, `stat` and a trailing slash follow it, `O_NOFOLLOW` does not
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
-  `/proc/self/status` and `/proc/self/fd`. That file
+  `/proc/self/status`, `/proc/self/maps` and `/proc/self/fd`. `status`
   has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
   capabilities and so on) without the memory and CPU ones, which nothing
   measures.
+- `/proc/self/maps` lists the VMAs in Linux's format, with adjacent mappings
+  merged and split as Linux does: the range, the protection, `s` or `p`, the
+  offset in the file, the file's device and inode as `stat` gives them, and
+  the name in Linux's column: the file's path, with a newline in it as
+  `\012`, followed by a space and `(deleted)` once nothing names it, `/memfd:<name> (deleted)`,
+  `/dev/zero (deleted)` for shared anonymous memory, `[heap]` or `[stack]`.
+  It is made as it is read, as Linux's `seq_file` makes it: a read gathers
+  whole lines up to a page, goes on from the VMA it found next, and sees the
+  mappings of that moment, `lseek` goes from the start or the current
+  position only (`EINVAL` from the end), and its size is 0. A descriptor
+  shows the address space it was opened on, which a forked child reading it
+  sees too, and nothing once no thread uses that space, as after an `execve`.
+  It cannot be mapped (`ENODEV`).
 - `/proc/self/fd` (mode 0500) lists `.`, `..` and a link per open
   descriptor, named by its number as Linux reads one (no leading zero). Each
   link's `lstat` shows the descriptor's access in its user bits and size 64,

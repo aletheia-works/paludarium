@@ -2406,6 +2406,338 @@ static void script_line(const char *name, const char *line, size_t length) {
     script_run(name, "./s", args, 0);
 }
 #define SCRIPT_LINE(name, literal) script_line(name, literal, sizeof literal - 1)
+/* The lines of /proc/self/maps as they are now, one read at a time. */
+static char *maps_text(int fd) {
+    static char text[1 << 20];
+    size_t length = 0;
+    for (;;) {
+        ssize_t got = read(fd, text + length, sizeof text - 1 - length);
+        if (got <= 0) break;
+        length += (size_t)got;
+    }
+    text[length] = 0;
+    return text;
+}
+
+struct maps_line {
+    unsigned long start, end, offset, inode;
+    unsigned major, minor;
+    char perms[5];
+    int column;
+    const char *name;
+    int name_length;
+    int trailing_space;
+};
+
+/* The line of `text` at `line`, whose end it gives back. */
+static const char *maps_parse(const char *line, struct maps_line *out) {
+    const char *end = strchr(line, '\n');
+    if (!end) return NULL;
+    int column = 0;
+    if (sscanf(line, "%lx-%lx %4s %lx %x:%x %lu%n", &out->start, &out->end, out->perms, &out->offset,
+               &out->major, &out->minor, &out->inode, &column) != 7)
+        return NULL;
+    out->trailing_space = line[column] == ' ';
+    while (line[column] == ' ') column++;
+    out->column = column;
+    out->name = line + column;
+    out->name_length = (int)(end - out->name);
+    return end + 1;
+}
+
+/* The line holding `address`, if a VMA does. */
+static int maps_find(const char *text, unsigned long address, struct maps_line *out) {
+    while ((text = maps_parse(text, out))) {
+        if (out->start <= address && address < out->end) return 1;
+    }
+    return 0;
+}
+
+/* The line holding `at`, without its addresses or inode, its name after
+   `prefix` when it starts so. */
+static void maps_show(const char *label, const void *at, const char *prefix) {
+    struct maps_line line;
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0 || !maps_find(maps_text(fd), (unsigned long)at, &line)) {
+        printf("%s: none\n", label);
+    } else {
+        const char *name = line.name;
+        int length = line.name_length;
+        size_t skip = prefix ? strlen(prefix) : 0;
+        if (skip && (size_t)length >= skip && !strncmp(name, prefix, skip)) {
+            name += skip;
+            length -= (int)skip;
+        }
+        printf("%s: from-here=%d pages=%lu %s offset=%lx space=%d column=%d name=[%.*s]\n", label,
+               line.start == (unsigned long)at, (line.end - line.start) / 4096, line.perms,
+               line.offset, line.trailing_space, length ? line.column : 0, length, name);
+    }
+    if (fd >= 0) close(fd);
+}
+
+/* Native Linux's gate and vDSO lines are left out, and so are the addresses;
+   the stack's size is Linux's to grow. */
+static void maps_listing(void) {
+    int fd = open("/proc/self/maps", O_RDONLY);
+    const char *text = maps_text(fd);
+    struct maps_line line;
+    unsigned long previous = 0;
+    int ordered = 1, aligned = 1;
+    while ((text = maps_parse(text, &line))) {
+        ordered &= line.start >= previous && line.start < line.end;
+        aligned &= !(line.start & 4095) && !(line.end & 4095);
+        previous = line.end;
+        if (line.name_length > 0 && line.name[0] == '[' && line.name[1] == 'v') continue;
+        const char *base = memrchr(line.name, '/', (size_t)line.name_length);
+        base = base ? base + 1 : line.name;
+        int length = line.name_length - (int)(base - line.name);
+        if (length == 7 && !strncmp(base, "[stack]", 7)) {
+            printf("  %s stack\n", line.perms);
+        } else {
+            printf("  %s pages=%lu offset=%lx name=[%.*s]\n", line.perms,
+                   (line.end - line.start) / 4096, line.offset, length, base);
+        }
+    }
+    printf("ordered=%d aligned=%d\n", ordered, aligned);
+    close(fd);
+}
+
+/* After an exec, a descriptor still open reads the old image's lines, of
+   which nothing is left once no thread uses it. */
+static int maps_after_exec(const char *number) {
+    int fd = atoi(number);
+    char byte;
+    long got = read(fd, &byte, 1);
+    printf("after-exec read=%ld\n", got);
+    printf("after-exec rewound=%ld\n", (long)lseek(fd, 0, SEEK_SET));
+    printf("after-exec read=%ld\n", (long)read(fd, &byte, 1));
+    return 0;
+}
+
+static int maps_cases(const char *self) {
+    long page = 4096;
+    maps_listing();
+
+    /* What it is: a regular file of size 0, 0444. */
+    struct stat st;
+    if (stat("/proc/self/maps", &st)) return 90;
+    printf("stat mode=%o size=%ld\n", (unsigned)st.st_mode, (long)st.st_size);
+    char pid_path[64];
+    snprintf(pid_path, sizeof pid_path, "/proc/%d/maps", (int)getpid());
+    int by_pid = open(pid_path, O_RDONLY);
+    printf("by-pid=%d\n", by_pid >= 0);
+    if (by_pid >= 0) close(by_pid);
+
+    /* Each mapping lies between PROT_NONE pages, so that nothing merges but
+       what is placed to. */
+    char *base = mmap(NULL, 128 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 91;
+    int flags = MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS;
+    char *a = mmap(base + 2 * page, 3 * page, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (a == MAP_FAILED) return 92;
+    maps_show("anonymous", a, NULL);
+    maps_show("no-access", base, NULL);
+    mprotect(a + page, page, PROT_READ);
+    maps_show("split-low", a, NULL);
+    maps_show("split-middle", a + page, NULL);
+    maps_show("split-high", a + 2 * page, NULL);
+    mprotect(a + page, page, PROT_READ | PROT_WRITE);
+    maps_show("split-rejoined", a, NULL);
+    mmap(a + 3 * page, page, PROT_READ | PROT_WRITE, flags, -1, 0);
+    maps_show("merged", a, NULL);
+    munmap(a + page, page);
+    maps_show("hole-low", a, NULL);
+    maps_show("hole", a + page, NULL);
+    maps_show("hole-high", a + 2 * page, NULL);
+    mprotect(base + 12 * page, page, PROT_READ | PROT_EXEC);
+    maps_show("execute", base + 12 * page, NULL);
+
+    /* Files, named by their paths. */
+    char dir[] = "/tmp/maps-XXXXXX";
+    if (!mkdtemp(dir)) return 93;
+    char prefix[64];
+    snprintf(prefix, sizeof prefix, "%s/", dir);
+    if (chdir(dir)) return 94;
+    char fill[4 * 4096];
+    memset(fill, 'x', sizeof fill);
+    int fd = open("data", O_CREAT | O_RDWR, 0644);
+    if (fd < 0 || write(fd, fill, sizeof fill) != (long)sizeof fill) return 95;
+    char *f = base + 20 * page;
+    if (mmap(f, 2 * page, PROT_READ, MAP_FIXED | MAP_PRIVATE, fd, page) == MAP_FAILED) return 96;
+    maps_show("file-private", f, prefix);
+    {
+        struct maps_line line;
+        int maps = open("/proc/self/maps", O_RDONLY);
+        struct stat file;
+        if (maps < 0 || fstat(fd, &file) || !maps_find(maps_text(maps), (unsigned long)f, &line))
+            return 97;
+        printf("file-inode-matches=%d\n", line.inode == (unsigned long)file.st_ino);
+        close(maps);
+    }
+    if (mmap(f + 4 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, fd, 2 * page) == MAP_FAILED)
+        return 98;
+    maps_show("file-shared", f + 4 * page, prefix);
+    if (mmap(f + 8 * page, page, PROT_READ, MAP_FIXED | MAP_SHARED, fd, 0) == MAP_FAILED) return 99;
+    maps_show("file-shared-read-only", f + 8 * page, prefix);
+    /* The same file at the next page merges; a written private page stays. */
+    if (mmap(f + 12 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, fd, 0) == MAP_FAILED ||
+        mmap(f + 13 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, fd, page) == MAP_FAILED)
+        return 100;
+    f[12 * page] = 1;
+    maps_show("file-merged", f + 12 * page, prefix);
+    mprotect(f + 13 * page, page, PROT_READ);
+    maps_show("file-split", f + 13 * page, prefix);
+
+    /* A space and a backslash stay; a newline is octal. */
+    int odd = open("a b\\c\nd", O_CREAT | O_RDWR, 0644);
+    if (odd < 0 || write(odd, fill, (size_t)page) != page) return 101;
+    if (mmap(f + 16 * page, page, PROT_READ, MAP_FIXED | MAP_PRIVATE, odd, 0) == MAP_FAILED) return 102;
+    maps_show("file-odd-name", f + 16 * page, prefix);
+
+    int gone = open("gone", O_CREAT | O_RDWR, 0644);
+    if (gone < 0 || write(gone, fill, (size_t)page) != page) return 103;
+    if (mmap(f + 18 * page, page, PROT_READ, MAP_FIXED | MAP_PRIVATE, gone, 0) == MAP_FAILED) return 104;
+    maps_show("file-before-unlink", f + 18 * page, prefix);
+    unlink("gone");
+    maps_show("file-unlinked", f + 18 * page, prefix);
+
+    int memfd = memfd_create("maps", 0);
+    if (memfd < 0 || ftruncate(memfd, 2 * page)) return 105;
+    if (mmap(f + 20 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, memfd, page) == MAP_FAILED)
+        return 106;
+    maps_show("memfd", f + 20 * page, NULL);
+
+    char *s = mmap(f + 24 * page, 2 * page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (s == MAP_FAILED) return 107;
+    maps_show("shared-anonymous", s, NULL);
+    char *t = mmap(f + 28 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (t == MAP_FAILED) return 108;
+    {
+        struct maps_line one, other;
+        int maps = open("/proc/self/maps", O_RDONLY);
+        const char *text = maps_text(maps);
+        if (!maps_find(text, (unsigned long)s, &one) || !maps_find(text, (unsigned long)t, &other)) return 109;
+        printf("shared-anonymous inodes differ=%d nonzero=%d\n", one.inode != other.inode, one.inode != 0);
+        close(maps);
+    }
+
+    /* The stack and the break. */
+    char local;
+    {
+        struct maps_line line;
+        int maps = open("/proc/self/maps", O_RDONLY);
+        if (!maps_find(maps_text(maps), (unsigned long)&local, &line)) return 110;
+        printf("stack %s %.*s offset=%lx inode=%lu\n", line.perms, line.name_length, line.name,
+               line.offset, line.inode);
+        close(maps);
+    }
+    unsigned long top = (unsigned long)syscall(SYS_brk, 0);
+    unsigned long grown = (unsigned long)syscall(SYS_brk, top + 3 * (unsigned long)page);
+    {
+        struct maps_line line;
+        int maps = open("/proc/self/maps", O_RDONLY);
+        if (!maps_find(maps_text(maps), grown - 1, &line)) return 111;
+        printf("break %s %.*s offset=%lx inode=%lu\n", line.perms, line.name_length, line.name,
+               line.offset, line.inode);
+        close(maps);
+    }
+    syscall(SYS_brk, top);
+
+    /* How it reads: at most about a page of whole lines at once, however much
+       is asked for, and a piece of a line when little is. */
+    int reader = open("/proc/self/maps", O_RDONLY);
+    if (reader < 0) return 112;
+    static char big[1 << 18], again[1 << 18];
+    long first = read(reader, big, sizeof big);
+    printf("read-first within-page=%d whole-lines=%d\n", first > 0 && first <= 4096, first > 0 && big[first - 1] == '\n');
+    errno = 0;
+    long sought = lseek(reader, 0, SEEK_END);
+    printf("seek-end=%ld errno=%d\n", sought, errno);
+    errno = 0;
+    sought = lseek(reader, -1, SEEK_SET);
+    printf("seek-negative=%ld errno=%d\n", sought, errno);
+    long position = lseek(reader, 0, SEEK_CUR);
+    printf("seek-current-is-read=%d\n", position == first);
+    printf("seek-start=%ld\n", (long)lseek(reader, 0, SEEK_SET));
+    char small[10];
+    printf("read-small=%ld\n", (long)read(reader, small, sizeof small));
+    printf("read-small-is-start=%d\n", !memcmp(small, big, sizeof small));
+    /* A position within a line reads the rest of it; pread keeps the place. */
+    printf("seek-within=%ld\n", (long)lseek(reader, 45, SEEK_SET));
+    long within = read(reader, again, 20);
+    printf("read-within=%ld same=%d\n", within, !memcmp(again, big + 45, 20));
+    printf("pread=%ld same=%d\n", (long)pread(reader, again, 20, 3), !memcmp(again, big + 3, 20));
+    printf("after-pread=%ld\n", (long)lseek(reader, 0, SEEK_CUR));
+    printf("seek-far=%ld\n", (long)lseek(reader, 1 << 28, SEEK_SET));
+    printf("read-far=%ld\n", (long)read(reader, again, 20));
+    /* It is made as it is read: what changed since it was opened shows. */
+    lseek(reader, 0, SEEK_SET);
+    char *later = f + 40 * page;
+    if (mmap(later, page, PROT_READ | PROT_WRITE, flags, -1, 0) == MAP_FAILED) return 113;
+    struct maps_line seen;
+    printf("sees-a-later-mapping=%d\n", maps_find(maps_text(reader), (unsigned long)later, &seen));
+    munmap(later, page);
+    lseek(reader, 0, SEEK_SET);
+    printf("sees-it-gone=%d\n", !maps_find(maps_text(reader), (unsigned long)later, &seen));
+    /* Neither written nor mapped, nor truncated. */
+    errno = 0;
+    long written = write(reader, "x", 1);
+    printf("write=%ld errno=%d\n", written, errno);
+    errno = 0;
+    int unmapped = mmap(NULL, page, PROT_READ, MAP_PRIVATE, reader, 0) == MAP_FAILED;
+    printf("mmap-failed=%d errno=%d\n", unmapped, errno);
+    int writer = open("/proc/self/maps", O_RDWR);
+    errno = 0;
+    if (writer >= 0) {
+        written = write(writer, "x", 1);
+        printf("write-opened=%ld errno=%d\n", written, errno);
+        close(writer);
+    } else {
+        printf("write-open errno=%d\n", errno);
+    }
+
+    /* A descriptor keeps the address space it was opened on: a child reading
+       an inherited one sees its parent's mappings, not its own. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 114;
+    lseek(reader, 0, SEEK_SET);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 115;
+    if (!child) {
+        char *mine = f + 44 * page;
+        char byte = 0;
+        mmap(mine, page, PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (write(ready[1], &byte, 1) != 1 || read(go[0], &byte, 1) != 1) _exit(1);
+        const char *text = maps_text(reader);
+        struct maps_line line;
+        printf("child-sees-its-own=%d\n", maps_find(text, (unsigned long)mine, &line));
+        printf("child-sees-the-parents=%d\n", maps_find(text, (unsigned long)(f + 46 * page), &line));
+        fflush(stdout);
+        _exit(0);
+    }
+    char byte = 0;
+    if (read(ready[0], &byte, 1) != 1) return 116;
+    if (mmap(f + 46 * page, page, PROT_READ | PROT_WRITE, flags, -1, 0) == MAP_FAILED) return 117;
+    if (write(go[1], &byte, 1) != 1) return 118;
+    int status;
+    waitpid(child, &status, 0);
+    printf("child status=%d\n", status);
+
+    unlink("data");
+    unlink("a b\\c\nd");
+    if (chdir("/") || rmdir(dir)) return 119;
+
+    /* Through an exec, a descriptor stays open and shows no more. */
+    lseek(reader, 0, SEEK_SET);
+    fflush(stdout);
+    char number[16];
+    snprintf(number, sizeof number, "%d", reader);
+    char *arguments[] = {(char *)self, "proc-maps-after-exec", number, NULL};
+    execv(self, arguments);
+    return 120;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
@@ -10234,6 +10566,8 @@ int main(int argc, char **argv) {
         if (rmdir("d") || chdir("/") || rmdir(dir)) return 89;
         return 0;
     }
+    if (!strcmp(mode, "proc-maps")) return maps_cases(argv[2]);
+    if (!strcmp(mode, "proc-maps-after-exec")) return maps_after_exec(argv[2]);
     if (!strcmp(mode, "x87-arithmetic")) {
         x87_arithmetic_cases();
         return 0;

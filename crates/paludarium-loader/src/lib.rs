@@ -156,6 +156,8 @@ struct SegmentFile {
     /// The file offset of the segment's first page.
     offset: u64,
     name: Option<Arc<[u8]>>,
+    /// The device and inode of the file.
+    identity: (u64, u64),
 }
 impl PageSource for SegmentFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -171,6 +173,9 @@ impl PageSource for SegmentFile {
     fn name(&self) -> Option<Vec<u8>> {
         self.name.as_deref().map(<[u8]>::to_vec)
     }
+    fn identity(&self) -> (u64, u64) {
+        self.identity
+    }
 }
 
 /// Places the `PT_LOAD` segments, as Linux's binfmt_elf does: the pages that
@@ -182,6 +187,7 @@ impl PageSource for SegmentFile {
 fn map_segments(
     bytes: &[u8],
     name: Option<&[u8]>,
+    identity: (u64, u64),
     info: &ElfInfo,
     mem: &mut AddressSpace,
     dynamic_base: u64,
@@ -248,6 +254,7 @@ fn map_segments(
                 image: file_pages(&file, h, head, data),
                 offset,
                 name: name.clone(),
+                identity,
             };
             mem.back_with_file(
                 page_start,
@@ -520,20 +527,29 @@ fn load_image(
     name: Option<&[u8]>,
     start: &StartInfo<'_>,
     mem: &mut AddressSpace,
-    files: Option<(&dyn FileSystem, InterpreterCheck<'_>)>,
+    mut files: Option<(&dyn FileSystem, InterpreterCheck<'_>)>,
 ) -> Result<LoadedImage, LoadError> {
     let info = elf::parse(bytes)?;
     // All an interpreter can refuse comes before anything is mapped.
     let interpreter = match info.interpreter(bytes)? {
         Some(asked) => {
-            let (fs, check) = files.ok_or(LoadError::Interpreter(Errno::ENOENT))?;
+            let (fs, check) = files
+                .as_mut()
+                .ok_or(LoadError::Interpreter(Errno::ENOENT))?;
             let path = check(asked).map_err(LoadError::Interpreter)?;
-            let (image, parsed) = read_interpreter(fs, &path)?;
+            let (image, parsed) = read_interpreter(*fs, &path)?;
             Some((path, image, parsed))
         }
         None => None,
     };
-    let (base, highest) = map_segments(bytes, name, &info, mem, STATIC_PIE_BASE)?;
+    let identity = |path: &[u8]| {
+        files.as_ref().map_or((0, 0), |(fs, _)| {
+            let inode = fs.metadata(path, true).map_or(0, |stat| stat.inode);
+            (paludarium_vfs::mount_device(&fs.mounts(), path), inode)
+        })
+    };
+    let own = name.map_or((0, 0), identity);
+    let (base, highest) = map_segments(bytes, name, own, &info, mem, STATIC_PIE_BASE)?;
     let initial_break = GuestAddr(highest)
         .page_align_up()
         .ok_or(LoadError::Malformed("segment address overflow"))?;
@@ -545,7 +561,7 @@ fn load_image(
     if let Some((path, file, parsed)) = interpreter {
         let top = paludarium_mmu::DEFAULT_MMAP_TOP;
         let wanted = interpreter_base(&parsed, top)?;
-        let (at, _) = map_segments(&file, Some(&path), &parsed, mem, wanted)?;
+        let (at, _) = map_segments(&file, Some(&path), identity(&path), &parsed, mem, wanted)?;
         entry_point = GuestAddr(at.wrapping_add(parsed.entry));
         interpreter_at = at;
     }

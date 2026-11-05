@@ -29,7 +29,7 @@ Linux.
   counter, so its values depend on what else has read it. `RDSSP` does nothing,
   as there are no shadow stacks. `FXSAVE` and `FXRSTOR` keep MXCSR and the XMM registers, and give the
   x87 state as it is after a reset.
-- AVX, AVX-512, x87 and MMX are out of scope.
+- x87 is not implemented yet. AVX, AVX-512 and MMX are out of scope.
 
 When a guest reaches an instruction it cannot run, it gets `SIGILL`, as on real
 Linux. Page faults raise `SIGSEGV`, and integer division by zero `SIGFPE`.

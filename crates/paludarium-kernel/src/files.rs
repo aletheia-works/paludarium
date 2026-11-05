@@ -634,9 +634,6 @@ fn positioned(
     }
     Ok(file)
 }
-/// The bytes to transfer for a request of `count` at `offset`: at most
-/// `MAX_RW_COUNT`, and for a read of a regular file no more than it holds.
-/// An end past the largest offset is EINVAL, and reading a directory EISDIR.
 /// Where reads of a regular file stop: at its size, but for `maps`, which
 /// says 0 as Linux's /proc does and ends where its `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
@@ -649,6 +646,9 @@ fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
         metadata.size
     }
 }
+/// The bytes to transfer for a request of `count` at `offset`: at most
+/// `MAX_RW_COUNT`, and for a read of a regular file no more than it holds.
+/// An end past the largest offset is EINVAL, and reading a directory EISDIR.
 fn request(
     file: &Arc<dyn FileHandle>,
     count: u64,

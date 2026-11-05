@@ -5,12 +5,15 @@ verified.
 
 ## Not supported
 
-- **x87 arithmetic, for now**: `FADD`, `FMUL`, `FPREM`, `FCOM` and the other
-  x87 instructions that compute are not implemented yet, so a program stops
-  with `SIGILL` where it reaches one, as mawk does. An x87 exception always
-  takes its masked response: an unmasked one sets the status word's summary and
-  does not raise `SIGFPE`. The 16-bit forms of `FNSTENV` and `FLDENV`
-  (with a `0x66` prefix) are not implemented either.
+- **Part of x87, for now**: the transcendental instructions (`FSIN`, `FCOS`,
+  `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`, `FYL2XP1`) and packed decimals
+  (`FBLD`, `FBSTP`) are not implemented yet, so a program stops with `SIGILL`
+  where it reaches one. An x87 exception always takes its masked response: an
+  unmasked one sets the status word's summary and does not raise `SIGFPE`. The
+  16-bit forms of `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not
+  implemented either. `FISTTP` belongs to SSE3, which `CPUID` does not report,
+  and is not implemented. Where `FPREM` and `FPREM1` stop on the way when their
+  operands are far apart is each CPU's choice: the final remainder is the same.
 - **A dynamically linked program's files, unless given**: a program runs with
   its interpreter as on Linux, on musl's dynamic linker or glibc's. A session
   reads the interpreter and the libraries from its own files, so they must be

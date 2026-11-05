@@ -5,7 +5,8 @@
 - x86-64 Linux programs only; 32-bit x86 is out of scope.
 - Statically linked executables (`ET_EXEC` and static-pie), and programs that
   use musl's or glibc's dynamic linker, whose files the session must be given.
-  Programs that reach x87 arithmetic stop there ([Limitations](./limitations)).
+  Programs that reach x87's transcendental instructions, as `long double` math
+  does, stop there ([Limitations](./limitations)).
 
 ## Hosts
 

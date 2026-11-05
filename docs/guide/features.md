@@ -30,9 +30,13 @@ Linux.
   as there are no shadow stacks. `FXSAVE` and `FXRSTOR` keep the x87 state,
   MXCSR and the XMM registers.
 - x87 instructions move values, convert them, compare them and keep the unit's
-  control and status words, environment and stack, in every rounding mode. x87
-  arithmetic is not implemented yet ([Limitations](./limitations)). A signal
-  handler starts with the x87 and SSE state as after a reset, as on Linux.
+  control and status words, environment and stack, in every rounding mode. They
+  add, subtract, multiply, divide and take square roots in every rounding mode
+  and precision, and do `FPREM`, `FPREM1`, `FSCALE`, `FRNDINT`, `FXTRACT`, the
+  `FCOM` family, the `FLD` constants and `FCMOV`. The transcendental
+  instructions and packed decimals are not implemented yet
+  ([Limitations](./limitations)). A signal handler starts with the x87 and SSE
+  state as after a reset, as on Linux.
 - AVX, AVX-512 and MMX are out of scope: `CPUID` reports MMX because glibc
   requires it, but its instructions stop with `SIGILL`.
 

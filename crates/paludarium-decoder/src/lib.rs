@@ -348,6 +348,52 @@ mnemonics!(
     Fxam,
     Fldz,
     Fld1,
+    Fldpi,
+    Fldln2,
+    Fldlg2,
+    Fldl2e,
+    Fldl2t,
+    Fadd,
+    Faddp,
+    Fiadd,
+    Fsub,
+    Fsubp,
+    Fisub,
+    Fsubr,
+    Fsubrp,
+    Fisubr,
+    Fmul,
+    Fmulp,
+    Fimul,
+    Fdiv,
+    Fdivp,
+    Fidiv,
+    Fdivr,
+    Fdivrp,
+    Fidivr,
+    Fsqrt,
+    Fprem,
+    Fprem1,
+    Frndint,
+    Fscale,
+    Fxtract,
+    Fcom,
+    Fcomp,
+    Fcompp,
+    Fucom,
+    Fucomp,
+    Fucompp,
+    Ficom,
+    Ficomp,
+    Ftst,
+    Fcmovb,
+    Fcmove,
+    Fcmovbe,
+    Fcmovu,
+    Fcmovnb,
+    Fcmovne,
+    Fcmovnbe,
+    Fcmovnu,
     Fnop,
     Ffree,
     Fincstp,
@@ -922,6 +968,24 @@ mod tests {
         let waiting = at(&[0x9b, 0xd9, 0x38]);
         assert_eq!((waiting.mnemonic, waiting.len), (Mnemonic::Wait, 1));
         assert_eq!(at(&[0xd9, 0x38]).mnemonic, Mnemonic::Fnstcw);
+        // Register forms name both, in the order they are used: fadd st(0),
+        // st(3), then faddp st(2), st(0).
+        let pair = |bytes: &[u8]| {
+            let insn = at(bytes);
+            (insn.operand(0), insn.operand(1))
+        };
+        let st = |n| Some(Operand::Register(Register::St(n)));
+        assert_eq!(pair(&[0xd8, 0xc3]), (st(0), st(3)));
+        assert_eq!(pair(&[0xde, 0xc2]), (st(2), st(0)));
+        // fiadd word and dword [rax], fadd dword and qword [rax]
+        assert_eq!(size(&[0xde, 0x00]), 2);
+        assert_eq!(size(&[0xda, 0x00]), 4);
+        assert_eq!(size(&[0xd8, 0x00]), 4);
+        assert_eq!(size(&[0xdc, 0x00]), 8);
+        // Intel's names: dc f0+i is fdivr st(i), st(0).
+        assert_eq!(at(&[0xdc, 0xf1]).mnemonic, Mnemonic::Fdivr);
+        assert_eq!(at(&[0xde, 0xf1]).mnemonic, Mnemonic::Fdivrp);
+        assert_eq!(at(&[0xdc, 0xf9]).mnemonic, Mnemonic::Fdiv);
         // MMX has no stack register, and is still not run.
         assert_eq!(
             decode(&[0x0f, 0xfc, 0xc1], rip),

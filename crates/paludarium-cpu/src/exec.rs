@@ -9,7 +9,9 @@ use paludarium_types::GuestAddr;
 use crate::alu::{self, ShiftKind, sign_extend, size_mask};
 use crate::softfloat::{F32, F64};
 use crate::state::{CpuState, FX_WRITTEN, flag, reg};
-use crate::x87::ENVIRONMENT;
+use crate::x87::{
+    Arithmetic, ENVIRONMENT, LN_2, LOG2_10, LOG2_E, LOG10_2, PI, float_operand, integer_value,
+};
 use core::cmp::Ordering;
 
 /// Why executing an instruction did not simply continue.
@@ -200,6 +202,20 @@ struct Exec<'a> {
     s: &'a mut CpuState,
     mem: &'a AddressSpace,
     i: &'a Instruction,
+}
+
+/// An x87 instruction's operation, and whether it takes its operands the other
+/// way around.
+fn x87_arithmetic(m: Mnemonic) -> (Arithmetic, bool) {
+    use Mnemonic as M;
+    match m {
+        M::Fadd | M::Faddp | M::Fiadd => (Arithmetic::Add, false),
+        M::Fsub | M::Fsubp | M::Fisub => (Arithmetic::Subtract, false),
+        M::Fsubr | M::Fsubrp | M::Fisubr => (Arithmetic::Subtract, true),
+        M::Fmul | M::Fmulp | M::Fimul => (Arithmetic::Multiply, false),
+        M::Fdiv | M::Fdivp | M::Fidiv => (Arithmetic::Divide, false),
+        _ => (Arithmetic::Divide, true),
+    }
 }
 
 fn op(i: &Instruction, n: usize) -> Result<Operand> {
@@ -1313,12 +1329,123 @@ impl Exec<'_> {
                     unit.pop();
                 }
             }
+            (M::Fcom | M::Fcomp, Some(memory)) => {
+                let format = match memory.size {
+                    4 => F32,
+                    8 => F64,
+                    _ => return Err(Stop::Invalid),
+                };
+                let bits = self.load(self.linear(&memory), memory.size)?;
+                let (value, denormal) = float_operand(format, bits);
+                unit.compare_value(value, denormal);
+                if m == M::Fcomp {
+                    unit.pop();
+                }
+            }
+            (M::Ficom | M::Ficomp, Some(memory)) => {
+                let bits = self.load(self.linear(&memory), memory.size)?;
+                let value = integer_value(sign_extend(bits, memory.size) as i64);
+                unit.compare_value(value, false);
+                if m == M::Ficomp {
+                    unit.pop();
+                }
+            }
+            (M::Fcom | M::Fcomp | M::Fucom | M::Fucomp, None) => {
+                unit.compare_register(register, matches!(m, M::Fucom | M::Fucomp));
+                if matches!(m, M::Fcomp | M::Fucomp) {
+                    unit.pop();
+                }
+            }
+            (M::Fcompp | M::Fucompp, None) => {
+                unit.compare_register(1, m == M::Fucompp);
+                unit.pop();
+                unit.pop();
+            }
+            (M::Ftst, None) => unit.compare_value(0, false),
+            (M::Fadd | M::Fsub | M::Fsubr | M::Fmul | M::Fdiv | M::Fdivr, Some(memory)) => {
+                let format = match memory.size {
+                    4 => F32,
+                    8 => F64,
+                    _ => return Err(Stop::Invalid),
+                };
+                let bits = self.load(self.linear(&memory), memory.size)?;
+                let (value, denormal) = float_operand(format, bits);
+                unit.calculate_memory(x87_arithmetic(m), value, denormal);
+            }
+            (M::Fiadd | M::Fisub | M::Fisubr | M::Fimul | M::Fidiv | M::Fidivr, Some(memory)) => {
+                let bits = self.load(self.linear(&memory), memory.size)?;
+                let value = integer_value(sign_extend(bits, memory.size) as i64);
+                unit.calculate_memory(x87_arithmetic(m), value, false);
+            }
+            (
+                M::Fadd
+                | M::Faddp
+                | M::Fsub
+                | M::Fsubp
+                | M::Fsubr
+                | M::Fsubrp
+                | M::Fmul
+                | M::Fmulp
+                | M::Fdiv
+                | M::Fdivp
+                | M::Fdivr
+                | M::Fdivrp,
+                None,
+            ) => {
+                let stack = |n| match self.i.operand(n) {
+                    Some(Operand::Register(Register::St(index))) => Ok(index),
+                    _ => Err(Stop::Invalid),
+                };
+                unit.calculate_registers(x87_arithmetic(m), stack(0)?, stack(1)?);
+                if matches!(
+                    m,
+                    M::Faddp | M::Fsubp | M::Fsubrp | M::Fmulp | M::Fdivp | M::Fdivrp
+                ) {
+                    unit.pop();
+                }
+            }
+            (M::Fsqrt, None) => unit.square_root(),
+            (M::Frndint, None) => unit.round_to_whole(),
+            (M::Fscale, None) => unit.scale(),
+            (M::Fprem, None) => unit.remainder(false),
+            (M::Fprem1, None) => unit.remainder(true),
+            (M::Fxtract, None) => unit.extract(),
+            (
+                M::Fcmovb
+                | M::Fcmove
+                | M::Fcmovbe
+                | M::Fcmovu
+                | M::Fcmovnb
+                | M::Fcmovne
+                | M::Fcmovnbe
+                | M::Fcmovnu,
+                None,
+            ) => {
+                let flags = self.s.rflags;
+                let on = |bit: u64| flags & bit != 0;
+                let taken = match m {
+                    M::Fcmovb => on(flag::CF),
+                    M::Fcmove => on(flag::ZF),
+                    M::Fcmovbe => on(flag::CF) || on(flag::ZF),
+                    M::Fcmovu => on(flag::PF),
+                    M::Fcmovnb => !on(flag::CF),
+                    M::Fcmovne => !on(flag::ZF),
+                    M::Fcmovnbe => !on(flag::CF) && !on(flag::ZF),
+                    _ => !on(flag::PF),
+                };
+                unit.conditional_move(register, taken);
+            }
             (M::Fxch, None) => unit.exchange(register),
             (M::Fchs, None) => unit.negate(),
             (M::Fabs, None) => unit.absolute(),
             (M::Fxam, None) => unit.examine(),
             (M::Fldz, None) => unit.load_zero(),
             (M::Fld1, None) => unit.load_one(),
+            (M::Fldpi, None) => unit.load_constant(PI),
+            (M::Fldln2, None) => unit.load_constant(LN_2),
+            (M::Fldlg2, None) => unit.load_constant(LOG10_2),
+            (M::Fldl2e, None) => unit.load_constant(LOG2_E),
+            (M::Fldl2t, None) => unit.load_constant(LOG2_10),
             (M::Ffree, None) => unit.free(register),
             (M::Fincstp, None) => unit.increment_top(),
             (M::Fdecstp, None) => unit.decrement_top(),
@@ -1970,6 +2097,52 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
         | Mnemonic::Fxam
         | Mnemonic::Fldz
         | Mnemonic::Fld1
+        | Mnemonic::Fldpi
+        | Mnemonic::Fldln2
+        | Mnemonic::Fldlg2
+        | Mnemonic::Fldl2e
+        | Mnemonic::Fldl2t
+        | Mnemonic::Fadd
+        | Mnemonic::Faddp
+        | Mnemonic::Fiadd
+        | Mnemonic::Fsub
+        | Mnemonic::Fsubp
+        | Mnemonic::Fisub
+        | Mnemonic::Fsubr
+        | Mnemonic::Fsubrp
+        | Mnemonic::Fisubr
+        | Mnemonic::Fmul
+        | Mnemonic::Fmulp
+        | Mnemonic::Fimul
+        | Mnemonic::Fdiv
+        | Mnemonic::Fdivp
+        | Mnemonic::Fidiv
+        | Mnemonic::Fdivr
+        | Mnemonic::Fdivrp
+        | Mnemonic::Fidivr
+        | Mnemonic::Fsqrt
+        | Mnemonic::Fprem
+        | Mnemonic::Fprem1
+        | Mnemonic::Frndint
+        | Mnemonic::Fscale
+        | Mnemonic::Fxtract
+        | Mnemonic::Fcom
+        | Mnemonic::Fcomp
+        | Mnemonic::Fcompp
+        | Mnemonic::Fucom
+        | Mnemonic::Fucomp
+        | Mnemonic::Fucompp
+        | Mnemonic::Ficom
+        | Mnemonic::Ficomp
+        | Mnemonic::Ftst
+        | Mnemonic::Fcmovb
+        | Mnemonic::Fcmove
+        | Mnemonic::Fcmovbe
+        | Mnemonic::Fcmovu
+        | Mnemonic::Fcmovnb
+        | Mnemonic::Fcmovne
+        | Mnemonic::Fcmovnbe
+        | Mnemonic::Fcmovnu
         | Mnemonic::Fnop
         | Mnemonic::Ffree
         | Mnemonic::Fincstp

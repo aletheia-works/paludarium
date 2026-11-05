@@ -63,7 +63,7 @@ impl Format {
     }
 }
 
-fn sticky(value: u128, count: u32) -> u128 {
+pub(crate) fn sticky(value: u128, count: u32) -> u128 {
     if count == 0 {
         value
     } else if count >= 128 {

@@ -1128,6 +1128,150 @@ mod tests {
         assert_eq!(s.x87.status_word(), 0);
         assert_eq!(s.x87.control_word(), 0x37f);
     }
+    /// The value st(0) holds after `code`, with what it needs of memory at rax.
+    fn x87_top(code: &[u8], memory: &[u8], steps: u64) -> (u128, u16) {
+        let (mut s, mem) = machine(code);
+        s.gpr[0] = STACK_TOP - 0x2000;
+        mem.write(GuestAddr(s.gpr[0]), memory).unwrap();
+        let reason = run(&mut s, &mem, steps);
+        assert!(
+            !matches!(reason, ExitReason::InvalidOpcode { .. }),
+            "{code:02x?}: {reason:?}"
+        );
+        // fstp tbyte [rax]
+        let (mut after, later) = machine(&[0xdb, 0x38]);
+        after.x87 = s.x87;
+        after.gpr[0] = STACK_TOP - 0x2000;
+        run(&mut after, &later, 1);
+        let mut bytes = [0; 16];
+        later
+            .read(GuestAddr(after.gpr[0]), &mut bytes[..10])
+            .unwrap();
+        (u128::from_le_bytes(bytes), s.x87.status_word())
+    }
+    #[test]
+    fn x87_arithmetic_takes_each_operand_form() {
+        const THREE: u128 = 0x4000_c000_0000_0000_0000;
+        const TWO: u128 = 0x4000_8000_0000_0000_0000;
+        const FOUR: u128 = 0x4001_8000_0000_0000_0000;
+        const ONE: u128 = 0x3fff_8000_0000_0000_0000;
+        // fld1 twice, then the rest, in st(0) = 1 and st(1) = 1.
+        let of = |rest: &[u8], memory: &[u8]| {
+            let code = [&[0xd9, 0xe8, 0xd9, 0xe8][..], rest].concat();
+            x87_top(&code, memory, 3).0
+        };
+        // fadd st(0), st(1); fsub; fmul; fdiv
+        assert_eq!(of(&[0xd8, 0xc1], &[]), TWO);
+        assert_eq!(of(&[0xd8, 0xe1], &[]), 0);
+        assert_eq!(of(&[0xd8, 0xc9], &[]), ONE);
+        assert_eq!(of(&[0xd8, 0xf1], &[]), ONE);
+        // faddp st(1), st(0) pops.
+        let (value, status) = x87_top(&[0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc1], &[], 3);
+        assert_eq!((value, status >> 11 & 7), (TWO, 7));
+        // fadd st(1), st(0) leaves st(0).
+        let (value, status) = x87_top(&[0xd9, 0xe8, 0xd9, 0xe8, 0xdc, 0xc1], &[], 3);
+        assert_eq!((value, status >> 11 & 7), (ONE, 6));
+        // fadd dword, fadd qword, fiadd word and dword, from rax: 1 + 2.
+        let double = 2f64.to_bits().to_le_bytes();
+        let single = 2f32.to_bits().to_le_bytes();
+        let top =
+            |rest: &[u8], memory: &[u8]| x87_top(&[&[0xd9, 0xe8][..], rest].concat(), memory, 2).0;
+        assert_eq!(top(&[0xdc, 0x00], &double), THREE);
+        assert_eq!(top(&[0xd8, 0x00], &single), THREE);
+        assert_eq!(top(&[0xde, 0x00], &[2, 0]), THREE);
+        assert_eq!(top(&[0xda, 0x00], &[2, 0, 0, 0]), THREE);
+        // fisub word is 1 - 2; fisubr word is 2 - 1, and -1 reads as signed.
+        assert_eq!(top(&[0xde, 0x20], &[2, 0]), ONE | 1 << 79);
+        assert_eq!(top(&[0xde, 0x28], &[2, 0]), ONE);
+        assert_eq!(top(&[0xde, 0x00], &[0xff, 0xff]), 0);
+        // fild word; fmul word: 2 * 2, fdiv and fdivr
+        let two = [2, 0];
+        let twos = |rest: &[u8]| x87_top(&[&[0xdf, 0x00][..], rest].concat(), &two, 2).0;
+        assert_eq!(twos(&[0xde, 0x08]), FOUR);
+        assert_eq!(twos(&[0xde, 0x30]), ONE);
+        assert_eq!(twos(&[0xde, 0x38]), ONE);
+        // fld1; fsqrt, frndint, and constants: all without a stop.
+        assert_eq!(top(&[0xd9, 0xfa], &[]), ONE);
+        assert_eq!(top(&[0xd9, 0xfc], &[]), ONE);
+        let (value, _) = x87_top(&[0xd9, 0xeb], &[], 1);
+        assert_eq!(value, 0x4000_c90f_daa2_2168_c235);
+    }
+    #[test]
+    fn x87_compares_into_the_condition_bits_and_pops_for_each_form() {
+        const C: u16 = 1 << 8 | 1 << 10 | 1 << 14;
+        let status = |code: &[u8], memory: &[u8], steps| x87_top(code, memory, steps).1;
+        // fld1; fldz; fcom st(1): 0 < 1.
+        let code = [0xd9, 0xe8, 0xd9, 0xee, 0xd8, 0xd1];
+        assert_eq!(status(&code, &[], 3) & (C | 7 << 11), 1 << 8 | 6 << 11);
+        // fcomp pops one and fcompp both.
+        let code = [0xd9, 0xe8, 0xd9, 0xee, 0xd8, 0xd9];
+        assert_eq!(status(&code, &[], 3) & (C | 7 << 11), 1 << 8 | 7 << 11);
+        let code = [0xd9, 0xe8, 0xd9, 0xee, 0xde, 0xd9];
+        assert_eq!(status(&code, &[], 3) & (C | 7 << 11), 1 << 8);
+        let code = [0xd9, 0xe8, 0xd9, 0xee, 0xda, 0xe9];
+        assert_eq!(status(&code, &[], 3) & (C | 7 << 11), 1 << 8);
+        // fucom and fucomp.
+        let code = [0xd9, 0xe8, 0xd9, 0xee, 0xdd, 0xe1];
+        assert_eq!(status(&code, &[], 3) & C, 1 << 8);
+        let code = [0xd9, 0xe8, 0xd9, 0xee, 0xdd, 0xe9];
+        assert_eq!(status(&code, &[], 3) & (C | 7 << 11), 1 << 8 | 7 << 11);
+        // fld1; fcom qword [rax] against 1, fcomp dword, ficom word, ficomp dword, ftst
+        let equal = 1 << 14;
+        let double = 1f64.to_bits().to_le_bytes();
+        let single = 1f32.to_bits().to_le_bytes();
+        let with =
+            |rest: &[u8], memory: &[u8]| status(&[&[0xd9, 0xe8][..], rest].concat(), memory, 2);
+        assert_eq!(
+            with(&[0xdc, 0x10], &double) & (C | 7 << 11),
+            equal | 7 << 11
+        );
+        assert_eq!(with(&[0xd8, 0x18], &single) & (C | 7 << 11), equal);
+        assert_eq!(
+            with(&[0xde, 0x10], &[1, 0]) & (C | 7 << 11),
+            equal | 7 << 11
+        );
+        assert_eq!(with(&[0xda, 0x18], &[1, 0, 0, 0]) & (C | 7 << 11), equal);
+        assert_eq!(with(&[0xd9, 0xe4], &[]) & C, 0);
+    }
+    #[test]
+    fn x87_conditional_moves_read_the_flags() {
+        // fld1; fldz; fcmov st(0), st(1), by what it reads of each flag.
+        let moved = |second: u8, third: u8, flags: u64| {
+            let code = [0xd9, 0xe8, 0xd9, 0xee, second, third];
+            let (mut s, mem) = machine(&code);
+            s.rflags |= flags;
+            run(&mut s, &mem, 3);
+            let mut after = s.x87;
+            after.compare_value(0, false);
+            after.status_word() & 1 << 14 == 0
+        };
+        let (cf, zf, pf) = (flag::CF, flag::ZF, flag::PF);
+        for (second, third, on, off) in [
+            (0xda, 0xc1, cf, 0),
+            (0xda, 0xc9, zf, 0),
+            (0xda, 0xd1, cf, 0),
+            (0xda, 0xd1, zf, 0),
+            (0xda, 0xd9, pf, 0),
+            (0xdb, 0xc1, 0, cf),
+            (0xdb, 0xc9, 0, zf),
+            (0xdb, 0xd1, 0, cf),
+            (0xdb, 0xd1, 0, zf),
+            (0xdb, 0xd9, 0, pf),
+        ] {
+            assert!(moved(second, third, on), "{second:x} {third:x} {on:x}");
+            assert!(!moved(second, third, off), "{second:x} {third:x} {off:x}");
+        }
+    }
+    #[test]
+    fn x87_arithmetic_from_memory_that_faults_changes_nothing() {
+        // fld1, then fadd qword [rax] of what is not mapped.
+        let (mut s, mem) = machine(&[0xd9, 0xe8, 0xdc, 0x00]);
+        s.gpr[0] = 0x1000;
+        let reason = run(&mut s, &mem, 2);
+        assert!(matches!(reason, ExitReason::PageFault { .. }), "{reason:?}");
+        assert_eq!(s.rip, GuestAddr(CODE + 2));
+        assert_eq!(s.x87.status_word() >> 11 & 7, 7);
+    }
     #[test]
     fn x87_moves_the_stack() {
         let status = |code: &[u8], steps| x87_run(code, steps).0.x87.status_word();

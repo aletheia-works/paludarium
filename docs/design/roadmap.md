@@ -23,7 +23,8 @@ Nothing here is a promise, but these are on the table:
   their next releases pass the guest audit (the current ones are held back
   by yanked crates and security advisories in their dependencies).
 - More system calls and instructions (see [Limitations](../guide/limitations)).
-- x87 arithmetic for the programs on glibc that reach it.
+- x87's transcendental instructions for the `long double` math of programs on
+  glibc that reach them.
 - Considering a native JIT.
 - Revisiting building with stable Rust.
 - Revisiting how much checking a release needs.

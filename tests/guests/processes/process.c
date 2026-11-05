@@ -1981,6 +1981,377 @@ static void x87_cases(void) {
         x87_show("fxrstor st1", b, 10, x87_status());
     }
 }
+/* The x87 arithmetic case. C0, C2 and C3 are left out where the manuals leave
+   them undefined. x87_clear keeps the control word. */
+static void x87_clear(void) {
+    uint16_t control;
+    __asm__ volatile("fnstcw %0\n fninit\n fldcw %0" : "+m"(control));
+}
+static uint64_t x87_random_state = 0x123456789abcdefULL;
+static uint64_t x87_random(void) {
+    x87_random_state ^= x87_random_state << 13;
+    x87_random_state ^= x87_random_state >> 7;
+    x87_random_state ^= x87_random_state << 17;
+    return x87_random_state;
+}
+/* Near each other often, so that subtracting cancels; and near the ends of the
+   range, so that results overflow and go denormal. */
+static struct x87_value x87_random_value(uint16_t near) {
+    static const uint16_t exponents[] = {0x3fff, 0x4000, 0x3fff + 20, 0x3fff - 20, 0x3fff + 63, 0x3fff - 70,
+                                         0x7ffe, 0x7f00, 0x0001, 0x0040, 0x2000, 0};
+    uint64_t pick = x87_random();
+    uint16_t exponent = exponents[pick % 12];
+    if (near != 0xffff && pick >> 8 & 1) {
+        exponent = (uint16_t)((near & 0x7fff) + (pick >> 16 & 3) - 1);
+        if (exponent > 0x7ffe) exponent = 0x7ffe;
+    }
+    uint64_t mantissa = x87_random();
+    /* Long runs of bits, which carry. */
+    if (pick >> 24 & 1) mantissa = pick >> 25 & 1 ? mantissa | ~0ULL << (pick >> 32 & 63) : mantissa & ~0ULL << (pick >> 32 & 63);
+    mantissa = exponent ? mantissa | 1ULL << 63 : mantissa & ~(1ULL << 63);
+    struct x87_value v = {mantissa, (uint16_t)(exponent | (pick >> 40 & 1) << 15)};
+    return v;
+}
+#define X87_PAIR(label, form, a, b, i, j) do { \
+        unsigned char out_[10]; \
+        uint16_t sw_; \
+        char name_[48]; \
+        x87_load(b); \
+        x87_load(a); \
+        __asm__ volatile("fnclex\n " form "\n fnstsw %1\n fstpt %0" : "=m"(out_), "=m"(sw_)); \
+        x87_clear(); \
+        sprintf(name_, "%s %d %d", label, i, j); \
+        x87_show(name_, out_, 10, sw_ & 0xbaff); \
+    } while (0)
+#define X87_SINGLE(label, form, a, i) do { \
+        unsigned char out_[10]; \
+        uint16_t sw_; \
+        char name_[48]; \
+        x87_load(a); \
+        __asm__ volatile("fnclex\n " form "\n fnstsw %1\n fstpt %0" : "=m"(out_), "=m"(sw_)); \
+        x87_clear(); \
+        sprintf(name_, "%s %d", label, i); \
+        x87_show(name_, out_, 10, sw_ & 0xbaff); \
+    } while (0)
+/* What is left and how it is said, once it is done. Going part of the way, how
+   far it goes and so the quotient's bits are the CPU's choice. */
+static void x87_remainder(const char *label, int nearest, const struct x87_value *a, const struct x87_value *b, int i, int j) {
+    unsigned char out[10];
+    uint16_t sw;
+    int rounds = 0;
+    char name[48];
+    x87_load(b);
+    x87_load(a);
+    __asm__ volatile("fnclex");
+    do {
+        if (nearest) __asm__ volatile("fprem1\n fnstsw %0" : "=m"(sw));
+        else __asm__ volatile("fprem\n fnstsw %0" : "=m"(sw));
+        rounds++;
+    } while (sw & 0x400 && rounds < 100000);
+    __asm__ volatile("fstpt %0" : "=m"(out));
+    x87_clear();
+    sprintf(name, "%s %d %d %d", label, rounds > 1, i, j);
+    x87_show(name, out, 10, rounds > 1 ? sw & 0xbaff & ~0x200 : sw);
+}
+static void x87_arithmetic_cases(void) {
+    __asm__ volatile("fninit");
+    int count = (int)(sizeof x87_values / sizeof x87_values[0]);
+    /* Each kind of value with each, in each of the operations. */
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < count; j++) {
+            const struct x87_value *a = &x87_values[i], *b = &x87_values[j];
+            X87_PAIR("add", "fadd %%st(1), %%st", a, b, i, j);
+            X87_PAIR("sub", "fsub %%st(1), %%st", a, b, i, j);
+            X87_PAIR("mul", "fmul %%st(1), %%st", a, b, i, j);
+            X87_PAIR("div", "fdiv %%st(1), %%st", a, b, i, j);
+            X87_PAIR("scale", "fscale", a, b, i, j);
+            x87_remainder("prem", 0, a, b, i, j);
+            x87_remainder("prem1", 1, a, b, i, j);
+        }
+    }
+    /* Each rounding and precision, on the values that show them. */
+    static const int some[] = {0, 2, 3, 4, 5, 6, 16, 17, 19, 20, 22, 25, 28, 29};
+    int several = (int)(sizeof some / sizeof some[0]);
+    static const uint16_t precisions[] = {0, 2 << 8, 3 << 8};
+    for (int mode = 0; mode < 4; mode++) {
+        for (int p = 0; p < 3; p++) {
+            x87_control((uint16_t)(0x7f | mode << 10 | precisions[p]));
+            for (int i = 0; i < several; i++) {
+                const struct x87_value *a = &x87_values[some[i]];
+                char name[32];
+                sprintf(name, "sqrt %d %d", mode, p);
+                X87_SINGLE(name, "fsqrt", a, i);
+                sprintf(name, "rndint %d %d", mode, p);
+                X87_SINGLE(name, "frndint", a, i);
+                for (int j = 0; j < several; j++) {
+                    const struct x87_value *b = &x87_values[some[j]];
+                    sprintf(name, "add %d %d", mode, p);
+                    X87_PAIR(name, "fadd %%st(1), %%st", a, b, i, j);
+                    sprintf(name, "sub %d %d", mode, p);
+                    X87_PAIR(name, "fsub %%st(1), %%st", a, b, i, j);
+                    sprintf(name, "mul %d %d", mode, p);
+                    X87_PAIR(name, "fmul %%st(1), %%st", a, b, i, j);
+                    sprintf(name, "div %d %d", mode, p);
+                    X87_PAIR(name, "fdiv %%st(1), %%st", a, b, i, j);
+                    sprintf(name, "scale %d %d", mode, p);
+                    X87_PAIR(name, "fscale", a, b, i, j);
+                }
+            }
+            /* Long values, in the same way. */
+            for (int n = 0; n < 60; n++) {
+                struct x87_value a = x87_random_value(0xffff), b = x87_random_value(a.high);
+                char name[32];
+                sprintf(name, "long add %d %d", mode, p);
+                X87_PAIR(name, "fadd %%st(1), %%st", &a, &b, n, 0);
+                sprintf(name, "long sub %d %d", mode, p);
+                X87_PAIR(name, "fsub %%st(1), %%st", &a, &b, n, 0);
+                sprintf(name, "long mul %d %d", mode, p);
+                X87_PAIR(name, "fmul %%st(1), %%st", &a, &b, n, 0);
+                sprintf(name, "long div %d %d", mode, p);
+                X87_PAIR(name, "fdiv %%st(1), %%st", &a, &b, n, 0);
+                sprintf(name, "long sqrt %d %d", mode, p);
+                X87_SINGLE(name, "fsqrt", &a, n);
+                sprintf(name, "long rndint %d %d", mode, p);
+                X87_SINGLE(name, "frndint", &a, n);
+            }
+        }
+    }
+    x87_control(0x37f);
+    /* Long remainders. */
+    for (int n = 0; n < 150; n++) {
+        struct x87_value a = x87_random_value(0xffff), b = x87_random_value(a.high);
+        if (n & 1) b = x87_random_value(0xffff);
+        x87_remainder("long prem", 0, &a, &b, n, 0);
+        x87_remainder("long prem1", 1, &a, &b, n, 0);
+    }
+    /* The other operand forms: the reversed ones, into st(1), and popping. */
+    {
+        const struct x87_value *a = &x87_values[6], *b = &x87_values[3];
+        X87_PAIR("form", "fsubr %%st(1), %%st", a, b, 0, 0);
+        X87_PAIR("form", "fdivr %%st(1), %%st", a, b, 0, 1);
+        X87_PAIR("form", "fadd %%st, %%st(1)\n fxch", a, b, 0, 2);
+        X87_PAIR("form", "fsub %%st, %%st(1)\n fxch", a, b, 0, 3);
+        X87_PAIR("form", "fsubr %%st, %%st(1)\n fxch", a, b, 0, 4);
+        X87_PAIR("form", "fmul %%st, %%st(1)\n fxch", a, b, 0, 5);
+        X87_PAIR("form", "fdiv %%st, %%st(1)\n fxch", a, b, 0, 6);
+        X87_PAIR("form", "fdivr %%st, %%st(1)\n fxch", a, b, 0, 7);
+        X87_PAIR("form", "faddp", a, b, 0, 8);
+        X87_PAIR("form", "fsubp", a, b, 0, 9);
+        X87_PAIR("form", "fsubrp", a, b, 0, 10);
+        X87_PAIR("form", "fmulp", a, b, 0, 11);
+        X87_PAIR("form", "fdivp", a, b, 0, 12);
+        X87_PAIR("form", "fdivrp", a, b, 0, 13);
+    }
+    /* From memory: each value of the smaller formats, into each of some. */
+    static const uint64_t doubles[] = {0, 1ULL << 63, 0x3ff8000000000000ULL, 0xc008000000000000ULL, 1, 0x800fffffffffffffULL,
+                                       0x7ff0000000000000ULL, 0xfff0000000000000ULL, 0x7ff8000000000123ULL,
+                                       0x7ff0000000000123ULL, 0xfff0000000000001ULL};
+    static const uint32_t floats[] = {0, 1u << 31, 0x3fc00000, 1, 0x807fffff, 0x7f800000, 0xff800000, 0x7fc00123, 0x7f800123};
+    static const int16_t shorts[] = {0, 1, -1, 3, 32767, -32768};
+    static const int32_t longs[] = {0, 1, -1, 3, 2147483647, -2147483647 - 1};
+    static const int partners[] = {0, 1, 2, 3, 6, 28, 30, 31, 32, 34, 35};
+    for (int k = 0; k < 11; k++) {
+        const struct x87_value *a = &x87_values[partners[k]];
+        for (int i = 0; i < 11; i++) {
+            const uint64_t *m = &doubles[i];
+#define X87_MEMORY(label, form) do { \
+                unsigned char out_[10]; \
+                uint16_t sw_; \
+                char name_[48]; \
+                x87_load(a); \
+                __asm__ volatile("fnclex\n " form " %2\n fnstsw %1\n fstpt %0" : "=m"(out_), "=m"(sw_) : "m"(*m)); \
+                x87_clear(); \
+                sprintf(name_, "%s %d %d", label, k, i); \
+                x87_show(name_, out_, 10, sw_ & 0xbaff); \
+            } while (0)
+#define X87_ORDER(label, form) do { \
+                uint16_t sw_; \
+                char name_[48]; \
+                x87_load(a); \
+                __asm__ volatile("fnclex\n " form " %1\n fnstsw %0" : "=m"(sw_) : "m"(*m)); \
+                x87_clear(); \
+                sprintf(name_, "%s %d %d", label, k, i); \
+                printf("%s %04x\n", name_, sw_); \
+            } while (0)
+            X87_MEMORY("faddl", "faddl");
+            X87_MEMORY("fsubl", "fsubl");
+            X87_MEMORY("fsubrl", "fsubrl");
+            X87_MEMORY("fmull", "fmull");
+            X87_MEMORY("fdivl", "fdivl");
+            X87_MEMORY("fdivrl", "fdivrl");
+            X87_ORDER("fcoml", "fcoml");
+            X87_ORDER("fcompl", "fcompl");
+        }
+        for (int i = 0; i < 9; i++) {
+            const uint32_t *m = &floats[i];
+            X87_MEMORY("fadds", "fadds");
+            X87_MEMORY("fsubs", "fsubs");
+            X87_MEMORY("fsubrs", "fsubrs");
+            X87_MEMORY("fmuls", "fmuls");
+            X87_MEMORY("fdivs", "fdivs");
+            X87_MEMORY("fdivrs", "fdivrs");
+            X87_ORDER("fcoms", "fcoms");
+            X87_ORDER("fcomps", "fcomps");
+        }
+        for (int i = 0; i < 6; i++) {
+            {
+                const int16_t *m = &shorts[i];
+                X87_MEMORY("fiadds", "fiadds");
+                X87_MEMORY("fisubs", "fisubs");
+                X87_MEMORY("fisubrs", "fisubrs");
+                X87_MEMORY("fimuls", "fimuls");
+                X87_MEMORY("fidivs", "fidivs");
+                X87_MEMORY("fidivrs", "fidivrs");
+                X87_ORDER("ficoms", "ficoms");
+                X87_ORDER("ficomps", "ficomps");
+            }
+            {
+                const int32_t *m = &longs[i];
+                X87_MEMORY("fiaddl", "fiaddl");
+                X87_MEMORY("fisubl", "fisubl");
+                X87_MEMORY("fisubrl", "fisubrl");
+                X87_MEMORY("fimull", "fimull");
+                X87_MEMORY("fidivl", "fidivl");
+                X87_MEMORY("fidivrl", "fidivrl");
+                X87_ORDER("ficoml", "ficoml");
+                X87_ORDER("ficompl", "ficompl");
+            }
+        }
+    }
+    /* One operand, of each kind of value. */
+    for (int i = 0; i < count; i++) {
+        const struct x87_value *a = &x87_values[i];
+        unsigned char m[10], e[10];
+        uint16_t sw;
+        X87_SINGLE("sqrt", "fsqrt", a, i);
+        X87_SINGLE("rndint", "frndint", a, i);
+        x87_load(a);
+        __asm__ volatile("fnclex\n fxtract\n fnstsw %2\n fstpt %0\n fstpt %1" : "=m"(m), "=m"(e), "=m"(sw));
+        x87_clear();
+        printf("extract %d ", i);
+        x87_show("mantissa", m, 10, sw & 0xbaff);
+        x87_show("exponent", e, 10, 0);
+        x87_load(a);
+        __asm__ volatile("fnclex\n ftst\n fnstsw %0" : "=m"(sw));
+        x87_clear();
+        printf("ftst %d %04x\n", i, sw);
+    }
+    /* Each kind of value compared with each, in the condition bits. */
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < count; j++) {
+            uint16_t sw[6];
+            x87_load(&x87_values[j]);
+            x87_load(&x87_values[i]);
+            __asm__ volatile("fnclex\n fcom %%st(1)\n fnstsw %0\n fnclex\n fucom %%st(1)\n fnstsw %1" : "=m"(sw[0]), "=m"(sw[1]));
+            __asm__ volatile("fnclex\n fcomp %%st(1)\n fnstsw %0" : "=m"(sw[2]));
+            x87_load(&x87_values[i]);
+            __asm__ volatile("fnclex\n fucomp %%st(1)\n fnstsw %0" : "=m"(sw[3]));
+            x87_load(&x87_values[i]);
+            __asm__ volatile("fnclex\n fcompp\n fnstsw %0" : "=m"(sw[4]));
+            x87_load(&x87_values[j]);
+            x87_load(&x87_values[i]);
+            __asm__ volatile("fnclex\n fucompp\n fnstsw %0" : "=m"(sw[5]));
+            x87_clear();
+            printf("order %d %d:", i, j);
+            for (int k = 0; k < 6; k++) printf(" %04x", sw[k]);
+            printf("\n");
+        }
+    }
+    /* The constants, in each rounding. */
+    for (int mode = 0; mode < 4; mode++) {
+        unsigned char out[10];
+        char name[32];
+        x87_control((uint16_t)(0x37f | mode << 10));
+#define X87_CONSTANT(form) do { \
+            __asm__ volatile("fnclex\n " form "\n fstpt %0" : "=m"(out)); \
+            sprintf(name, "%s %d", form, mode); \
+            x87_show(name, out, 10, x87_status()); \
+        } while (0)
+        X87_CONSTANT("fldpi");
+        X87_CONSTANT("fldln2");
+        X87_CONSTANT("fldlg2");
+        X87_CONSTANT("fldl2e");
+        X87_CONSTANT("fldl2t");
+    }
+    x87_control(0x37f);
+    /* Conditional moves, on each of the flags they read: 0, CF, ZF, PF, and CF
+       with ZF. */
+    {
+        static const uint64_t flags[] = {0x202, 0x203, 0x242, 0x206, 0x243};
+        for (int k = 0; k < 5; k++) {
+            unsigned char out[8][10];
+#define X87_MOVE(n, form) do { \
+                __asm__ volatile("fnclex\n fld1\n fldz\n pushq %1\n popfq\n " form " %%st(1), %%st\n fstpt %0\n fstp %%st(0)" \
+                                 : "=m"(out[n]) : "m"(flags[k]) : "cc"); \
+            } while (0)
+            X87_MOVE(0, "fcmovb");
+            X87_MOVE(1, "fcmove");
+            X87_MOVE(2, "fcmovbe");
+            X87_MOVE(3, "fcmovu");
+            X87_MOVE(4, "fcmovnb");
+            X87_MOVE(5, "fcmovne");
+            X87_MOVE(6, "fcmovnbe");
+            X87_MOVE(7, "fcmovnu");
+            printf("fcmov %d:", k);
+            for (int n = 0; n < 8; n++) printf(" %d", out[n][9]);
+            printf(" sw=%04x\n", x87_status());
+        }
+    }
+    /* What is empty: the invalid result, and C1 clear. */
+    {
+        unsigned char out[10];
+        uint16_t sw;
+        char name[32];
+#define X87_EMPTY(form) do { \
+            __asm__ volatile("fninit\n " form "\n fnstsw %0" : "=m"(sw)); \
+            __asm__ volatile("fstpt %0" : "=m"(out)); \
+            sprintf(name, "empty %s", form); \
+            x87_show(name, out, 10, sw & 0xbaff); \
+        } while (0)
+        X87_EMPTY("fsqrt");
+        X87_EMPTY("frndint");
+        X87_EMPTY("fscale");
+        X87_EMPTY("fxtract");
+        X87_EMPTY("fprem");
+        X87_EMPTY("fprem1");
+        X87_EMPTY("fadd %%st(1), %%st");
+        X87_EMPTY("fld1\n fadd %%st(1), %%st");
+        X87_EMPTY("fld1\n fadd %%st, %%st(1)\n fxch");
+        X87_EMPTY("fld1\n faddp\n fldz");
+        X87_EMPTY("fld1\n fscale");
+        X87_EMPTY("fld1\n fprem");
+        X87_EMPTY("fcmovb %%st(1), %%st");
+        X87_EMPTY("fld1\n fcmovb %%st(1), %%st");
+        X87_EMPTY("fld1\n fcmovnb %%st(1), %%st");
+#define X87_EMPTY_ORDER(form) do { \
+            __asm__ volatile("fninit\n " form "\n fnstsw %0" : "=m"(sw)); \
+            sprintf(name, "empty %s", form); \
+            printf("%s %04x\n", name, sw); \
+        } while (0)
+        X87_EMPTY_ORDER("fcom %%st(1)");
+        X87_EMPTY_ORDER("fcomp %%st(1)");
+        X87_EMPTY_ORDER("fcompp");
+        X87_EMPTY_ORDER("fucom %%st(1)");
+        X87_EMPTY_ORDER("fucomp %%st(1)");
+        X87_EMPTY_ORDER("fucompp");
+        X87_EMPTY_ORDER("ftst");
+        X87_EMPTY_ORDER("fld1\n fcom %%st(1)");
+        __asm__ volatile("fninit\n fcoml %1\n fnstsw %0" : "=m"(sw) : "m"(doubles[2]));
+        printf("empty fcoml %04x\n", sw);
+        __asm__ volatile("fninit\n faddl %1\n fnstsw %0\n fstpt %2" : "=m"(sw) : "m"(doubles[2]), "m"(out));
+        x87_show("empty faddl", out, 10, sw & 0xbaff);
+        /* A full stack, which only fxtract could push onto. */
+        __asm__ volatile("fninit\n fld1\n fld1\n fld1\n fld1\n fld1\n fld1\n fld1\n fldz\n fxtract\n fnstsw %0" : "=m"(sw));
+        printf("full fxtract: %04x", sw & 0xbaff);
+        for (int r = 0; r < 8; r++) {
+            __asm__ volatile("fstpt %0" : "=m"(out));
+            printf(" ");
+            for (int k = 9; k >= 0; k--) printf("%02x", out[k]);
+        }
+        printf("\n");
+        __asm__ volatile("fnclex\n fninit");
+    }
+}
 /* The interpreter of the script-exec case: what exec gave it. */
 static int script_show(int argc, char **argv) {
     char name[17] = {0};
@@ -9848,6 +10219,10 @@ int main(int argc, char **argv) {
         };
         for (size_t i = 0; i < sizeof files / sizeof *files; i++) unlink(files[i]);
         if (rmdir("d") || chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "x87-arithmetic")) {
+        x87_arithmetic_cases();
         return 0;
     }
     if (!strcmp(mode, "x87")) {

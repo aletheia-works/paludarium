@@ -28,7 +28,7 @@ jobs:
         # Retried: static.rust-lang.org downloads sometimes fail on CI. mise then
         # finds the toolchain of rust-toolchain.toml already installed.
         uses: ./.github/actions/rust-toolchain
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
           install: true
           cache: false

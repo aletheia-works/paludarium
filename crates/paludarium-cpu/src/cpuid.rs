@@ -21,9 +21,8 @@ pub(crate) fn time_stamp() -> [u32; 2] {
 const SIGNATURE: u32 = 0xf00;
 /// What every x86-64 CPU has, as leaf 1's EDX says it: FPU, CX8, CMOV, MMX,
 /// FXSR, SSE and SSE2. glibc refuses to load `libc.so.6` without all of them.
-/// x87 arithmetic and MMX are not implemented, but a program of this
-/// architecture may use them without asking, so saying so changes nothing for
-/// it.
+/// MMX is not implemented, but a program of this architecture may use it
+/// without asking, so saying so changes nothing for it.
 const BASELINE: u32 = 1 | 1 << 8 | 1 << 15 | 1 << 23 | 1 << 24 | 1 << 25 | 1 << 26;
 
 pub(crate) fn values(leaf: u32, _subleaf: u32) -> [u32; 4] {

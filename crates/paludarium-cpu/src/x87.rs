@@ -480,6 +480,10 @@ fn calculate(
     let negative = a.negative != b.negative;
     let infinity = |negative: bool| join(negative, EXPONENT_MAX, INTEGER_BIT);
     let (value, more, up) = match operation {
+        // A CPU notes no denormal where it divides by zero.
+        Arithmetic::Divide if b.zero() && !a.zero() && !a.infinity() => {
+            return (infinity(negative), ZERO_DIVIDE, false);
+        }
         Arithmetic::Add | Arithmetic::Subtract => {
             let negative_b = b.negative != (operation == Arithmetic::Subtract);
             match (a.infinity(), b.infinity()) {
@@ -507,8 +511,6 @@ fn calculate(
             }
             if a.infinity() {
                 (infinity(negative), 0, false)
-            } else if b.zero() {
-                (infinity(negative), ZERO_DIVIDE, false)
             } else if b.infinity() || a.zero() {
                 (join(negative, 0, 0), 0, false)
             } else {
@@ -593,14 +595,17 @@ fn remainder(first: u128, second: u128, nearest: bool) -> Remainder {
     } else {
         0
     };
-    if a.zero() || b.infinity() {
+    if a.zero() {
         return whole(first, flags);
     }
-    let (mantissa_a, power_a) = normalized(a);
-    let (mantissa_b, power_b) = normalized(b);
-    let difference = power_a - power_b;
     let exact =
         |size, power, negative| round_extended(negative, size, power, INITIAL_CONTROL, 64).0;
+    let (mantissa_a, power_a) = normalized(a);
+    if b.infinity() {
+        return whole(exact(u128::from(mantissa_a), power_a, a.negative), flags);
+    }
+    let (mantissa_b, power_b) = normalized(b);
+    let difference = power_a - power_b;
     if difference < -1 || (difference == -1 && !nearest) {
         return whole(exact(u128::from(mantissa_a), power_a, a.negative), flags);
     }
@@ -1051,20 +1056,16 @@ impl X87 {
             self.condition(C1, result.quotient & 1 != 0);
         }
     }
-    /// `fxtract`: the exponent stays below what the mantissa pushes. A full
-    /// stack keeps what it had, under the invalid result.
+    /// `fxtract`: the exponent stays below what the mantissa pushes. Where the
+    /// stack is empty or full, both are the invalid result.
     pub(crate) fn extract(&mut self) {
         self.condition(C1, false);
-        let Some(value) = self.get(0) else {
+        let (Some(value), None) = (self.get(0), self.get(7)) else {
             self.raise(INVALID | STACK_FAULT);
             self.put(0, INDEFINITE);
             self.push(INDEFINITE);
             return;
         };
-        if self.get(7).is_some() {
-            self.push(INDEFINITE);
-            return;
-        }
         let v = parts(value);
         let infinity = |negative| join(negative, EXPONENT_MAX, INTEGER_BIT);
         let (exponent, mantissa, flags) = if let Some((value, flags)) = not_numbers(value, value) {
@@ -1711,7 +1712,7 @@ mod tests {
         );
         assert_eq!(
             calc(Arithmetic::Divide, 1, 0),
-            (INFINITY, DENORMAL | ZERO_DIVIDE, false)
+            (INFINITY, ZERO_DIVIDE, false)
         );
         assert_eq!(
             calc(Arithmetic::Multiply, 1, INFINITY),
@@ -1839,6 +1840,9 @@ mod tests {
         assert_eq!(chopped(number(-6, 0), number(3, 0)), (1 << 79, 2, false));
         assert_eq!(chopped(ONE, number(3, 0)), (ONE, 0, false));
         assert_eq!(chopped(ONE, INFINITY), (ONE, 0, false));
+        // A pseudo-denormal comes out as the normal it is, and a denormal stays.
+        assert_eq!(chopped(1 << 63, INFINITY), (SMALLEST_NORMAL, 0, false));
+        assert_eq!(chopped(1, INFINITY), (1, 0, false));
         let nearest = |a, b| {
             let r = remainder(a, b, true);
             (r.value, r.quotient, r.partial)
@@ -2022,7 +2026,8 @@ mod tests {
             x.load_one();
         }
         x.extract();
-        assert_eq!((x.get(0), x.get(1)), (Some(INDEFINITE), Some(ONE)));
+        assert_eq!((x.get(0), x.get(1)), (Some(INDEFINITE), Some(INDEFINITE)));
+        assert_eq!(x.get(2), Some(ONE));
         assert_ne!(x.status_word() & C1, 0);
     }
 

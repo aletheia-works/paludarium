@@ -103,6 +103,36 @@ fn loads_exec_segments_with_permissions_and_bss() {
 }
 
 #[test]
+fn a_segment_of_bss_alone_may_name_an_offset_past_the_end_of_the_file() {
+    let mut elf = build_elf(
+        elf::ET_EXEC,
+        0x401000,
+        &[
+            load_seg(elf::PF_R | elf::PF_X, 0x401000, &[0xf4; 16], 16),
+            load_seg(elf::PF_R | elf::PF_W, 0x410000, &[], 0x2000),
+        ],
+    );
+    // The second program header's p_offset, as GNU ld 2.46 aligns it.
+    let past = elf.len() as u64 + 0x10000;
+    elf[64 + 56 + 8..64 + 56 + 16].copy_from_slice(&past.to_le_bytes());
+    let mut mem = AddressSpace::new();
+    load_bytes(&elf, &start(&[b"prog".to_vec()], &[]), &mut mem).unwrap();
+    let mut bss = [9u8; 4];
+    mem.read(GuestAddr(0x410000), &mut bss).unwrap();
+    assert_eq!(bss, [0; 4]);
+    // A segment that does take file bytes from there stays refused.
+    elf[64 + 56 + 32..64 + 56 + 40].copy_from_slice(&1u64.to_le_bytes());
+    assert!(matches!(
+        load_bytes(
+            &elf,
+            &start(&[b"prog".to_vec()], &[]),
+            &mut AddressSpace::new()
+        ),
+        Err(LoadError::Malformed("segment out of range"))
+    ));
+}
+
+#[test]
 fn madv_dontneed_reads_the_data_segment_again_and_zeroes_its_bss() {
     let mut mem = AddressSpace::new();
     load_bytes(&simple_exec(), &start(&[b"prog".to_vec()], &[]), &mut mem).unwrap();

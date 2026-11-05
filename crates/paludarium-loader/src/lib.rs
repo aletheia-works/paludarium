@@ -238,11 +238,15 @@ fn map_segments(
         };
         map(mem, page_start, file_end, MappingKind::ElfSegment)?;
         map(mem, file_end, page_end, MappingKind::Anonymous)?;
-        let from = usize::try_from(h.offset).map_err(|_| LoadError::TooLarge)?;
-        let len = usize::try_from(h.filesz).map_err(|_| LoadError::TooLarge)?;
-        let data = bytes
-            .get(from..from + len)
-            .ok_or(LoadError::Malformed("segment out of range"))?;
+        let data = if h.filesz == 0 {
+            &[]
+        } else {
+            let from = usize::try_from(h.offset).map_err(|_| LoadError::TooLarge)?;
+            let len = usize::try_from(h.filesz).map_err(|_| LoadError::TooLarge)?;
+            bytes
+                .get(from..from + len)
+                .ok_or(LoadError::Malformed("segment out of range"))?
+        };
         // The rest of the segment (bss) stays zero: fresh pages read as zero.
         mem.write_initial(GuestAddr(start), data)
             .map_err(|_| LoadError::Errno(Errno::EFAULT))?;

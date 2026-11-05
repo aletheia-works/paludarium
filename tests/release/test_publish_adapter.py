@@ -80,6 +80,7 @@ class PublishAdapterTests(unittest.TestCase):
                 "index.d.ts": b"export {};",
                 "relay.d.ts": b"export {};",
                 "LICENSE": b"Apache",
+                "THIRD-PARTY-NOTICES.txt": b"notices",
                 "README.md": b"usage",
             }
         )

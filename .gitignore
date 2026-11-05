@@ -39,5 +39,6 @@ dist-ssr
 /spikes/wasm-threads/target/
 /spikes/wasm-threads/pkg/
 /packages/paludarium-wasm/paludarium.wasm
+/packages/paludarium-wasm/THIRD-PARTY-NOTICES.txt
 *.profraw
 

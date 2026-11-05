@@ -39,6 +39,7 @@ class PackageTests(unittest.TestCase):
                 "relay.d.ts": b"export {};",
                 "paludarium.wasm": b"\0asm\x01\0\0\0",
                 "LICENSE": b"Apache-2.0",
+                "THIRD-PARTY-NOTICES.txt": b"notices",
                 "README.md": b"usage",
             }
         )
@@ -58,7 +59,7 @@ class PackageTests(unittest.TestCase):
         return package.inspect_npm(self.path, expected)
 
     def test_valid_npm(self):
-        self.assertEqual(len(self.inspect()["files"]), 14)
+        self.assertEqual(len(self.inspect()["files"]), 15)
 
     def test_jit_support_missing(self):
         del self.files["jit-support.mjs"]

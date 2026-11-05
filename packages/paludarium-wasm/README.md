@@ -77,7 +77,9 @@ page).
 
 Build the one production Wasm module from the repository root with
 `mise run wasm:build`. The npm archive includes that module, the launcher
-and its required Workers, TypeScript declarations, and Apache-2.0 license.
+and its required Workers, TypeScript declarations, Apache-2.0 license, and
+`THIRD-PARTY-NOTICES.txt`, the notices of the crates and the Rust standard
+library built into the wasm.
 Publishing is a separate lifecycle step. Verification uses fixed probe/aube
 binaries and a fresh Linux oracle for Node, Chromium, Firefox, and real Safari;
 results apply to the versions and fixtures recorded in the wasm evidence.

@@ -69,6 +69,7 @@ def inspect_npm(path, expected):
         "relay.d.ts",
         "paludarium.wasm",
         "LICENSE",
+        "THIRD-PARTY-NOTICES.txt",
         "README.md",
         "package.json",
     }
@@ -157,6 +158,7 @@ def package_check(root):
     """Build/check actual distributions in an exclusive project-local copy."""
     import os
     import shutil
+    import sys
     import time
     import traceback
     import zipfile
@@ -316,6 +318,15 @@ def package_check(root):
         )
         wasm = copy / "target/wasm32-unknown-unknown/release/paludarium_wasm.wasm"
         shutil.copyfile(wasm, copy / "packages/paludarium-wasm/paludarium.wasm")
+        check.require_success(
+            check.run_command(
+                [sys.executable, "-B", "scripts/third-party-notices.py"],
+                copy,
+                out / "third-party-notices",
+                300,
+                dict(env, CARGO=str(cargo)),
+            )
+        )
         for name in ("README.md", "LICENSE"):
             shutil.copyfile(root / name, copy / "packages/paludarium-wasm" / name)
         stage = "npm"

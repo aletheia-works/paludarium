@@ -10468,7 +10468,13 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "dynamic-exec")) {
         /* load_elf_binary: the interpreter a program names. A copy of the
-           dynamic program is patched in the bytes of its PT_INTERP. */
+           dynamic program is patched in the bytes of its PT_INTERP. Some of
+           them crash, which writes no core at Linux's default limit, whatever
+           sudo gave the native run. */
+        struct rlimit no_core;
+        if (getrlimit(RLIMIT_CORE, &no_core)) return 80;
+        no_core.rlim_cur = 0;
+        if (setrlimit(RLIMIT_CORE, &no_core)) return 80;
         char dir[] = "/tmp/dynamic-exec-XXXXXX";
         if (!mkdtemp(dir)) return 80;
         char path[PATH_MAX];

@@ -1947,11 +1947,14 @@ static void x87_cases(void) {
     {
         uint16_t env[14];
         uint16_t after;
+        memset(env, 0x55, sizeof env);
+        /* With exceptions unmasked, none being pending, to see them masked after. */
         __asm__ volatile("fninit\n fld1\n fldz\n flds %2\n fldcw %3\n fnstenv %0\n fnstcw %1"
-                         : "=m"(env), "=m"(after)
-                         : "m"(floats[5]), "m"(*(const uint16_t[]){0x27f}));
-        printf("environment: cw=%04x sw=%04x tags=%04x then cw=%04x\n", env[0], env[2] & 0xbaff, env[4], after);
-        __asm__ volatile("fninit\n fldenv %0\n fnstcw %1" : "=m"(after) : "m"(env));
+                         : "+m"(env), "=m"(after)
+                         : "m"(floats[5]), "m"(*(const uint16_t[]){0x260}));
+        printf("environment: cw=%04x sw=%04x tags=%04x then cw=%04x reserved=%04x %04x %04x %04x\n", env[0],
+               env[2] & 0xbaff, env[4], after, env[1], env[3], env[5], env[13]);
+        __asm__ volatile("fninit\n fldenv %1\n fnstcw %0" : "=m"(after) : "m"(env));
         printf("loaded: cw=%04x sw=%04x\n", after, x87_status());
         unsigned char e[10];
         __asm__ volatile("fstpt %0" : "=m"(e));

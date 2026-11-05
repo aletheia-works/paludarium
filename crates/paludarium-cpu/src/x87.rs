@@ -499,18 +499,27 @@ impl X87 {
             tags | tag << (at * 2)
         })
     }
-    /// `fnstenv`'s image in 64-bit mode, which has no use for where the last
-    /// instruction was. It then masks every exception.
+    /// `fnstenv`'s image in 64-bit mode: three words, each followed by a
+    /// reserved one of all ones, as the x87 case compares with a real CPU;
+    /// where the last instruction and operand were, which nothing here keeps;
+    /// and one more reserved word. It then masks every exception.
     pub(crate) fn store_environment(&mut self) -> [u8; ENVIRONMENT] {
-        let mut image = [0xff; ENVIRONMENT];
-        image[..2].copy_from_slice(&self.control.to_le_bytes());
-        image[4..6].copy_from_slice(&self.status_word().to_le_bytes());
-        image[8..10].copy_from_slice(&self.full_tags().to_le_bytes());
-        image[12..24].fill(0);
+        let mut image = [0; ENVIRONMENT];
+        for (at, word) in [
+            (0, self.control),
+            (4, self.status_word()),
+            (8, self.full_tags()),
+        ] {
+            image[at..at + 2].copy_from_slice(&word.to_le_bytes());
+            image[at + 2..at + 4].fill(0xff);
+        }
+        image[26..28].fill(0xff);
         self.control |= EXCEPTIONS;
         self.summarize();
         image
     }
+    /// `fldenv`, which takes the status word as it is, with its summary, as a
+    /// CPU does.
     pub(crate) fn load_environment(&mut self, image: &[u8; ENVIRONMENT]) {
         let word = |at: usize| u16::from_le_bytes([image[at], image[at + 1]]);
         self.control = word(0) & CONTROL_BITS | CONTROL_SET;
@@ -534,7 +543,8 @@ impl X87 {
             area[at..at + 16].copy_from_slice(&value.to_le_bytes());
         }
     }
-    /// What `fxrstor` takes from the area [`X87::write_image`] writes.
+    /// What `fxrstor` takes from the area [`X87::write_image`] writes, with the
+    /// status word's summary as it is, as a CPU does.
     pub(crate) fn read_image(&mut self, area: &[u8]) {
         let word = |at: usize| u16::from_le_bytes([area[at], area[at + 1]]);
         self.control = word(0) & CONTROL_BITS | CONTROL_SET;
@@ -874,7 +884,14 @@ mod tests {
         // R7 valid, R6 zero, R5 special, the rest empty.
         let expected = 0b00_01_10_11_11_11_11_11;
         assert_eq!(u16::from_le_bytes([image[8], image[9]]), expected);
+        for at in [2, 6, 10, 26] {
+            assert_eq!(&image[at..at + 2], &[0xff, 0xff], "reserved at {at}");
+        }
+        assert_eq!(&image[12..26], &[0; 14], "nothing kept of where it was");
         assert_eq!(x.control_word(), 0x27f | 0x3f);
+        x.set_control(0x260);
+        x.store_environment();
+        assert_eq!(x.control_word(), 0x27f, "every exception masked");
         let mut other = X87::default();
         other.load_environment(&image);
         assert_eq!(other.control_word(), 0x27f);

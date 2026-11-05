@@ -1,4 +1,5 @@
-//! Deterministic virtual CPU identity; never forwards host CPUID.
+//! What the virtual CPU says of itself, never forwarding the host's: its
+//! identity, which is deterministic, and its time stamp counter, which is not.
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The time stamp counter of the virtual CPU, as `rdtsc` splits it into its low

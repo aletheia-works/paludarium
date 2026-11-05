@@ -221,7 +221,9 @@ jobs:
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
         uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: ./.github/actions/guest-toolchain
+        with:
+          packages: musl-tools
       # The core-dump differential case needs Linux to write a core to the
       # working directory, as the kernel's default core_pattern does; the
       # runner hands cores to its crash handler instead.
@@ -270,7 +272,9 @@ jobs:
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
         uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: ./.github/actions/guest-toolchain
+        with:
+          packages: musl-tools
       # The core-dump differential case needs Linux to write a core to the
       # working directory, as the kernel's default core_pattern does; the
       # runner hands cores to its crash handler instead.

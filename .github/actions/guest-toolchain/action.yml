@@ -1,0 +1,39 @@
+name: Guest toolchain
+description: >-
+  Installs packages from apt, with a C toolchain for the x86-64 baseline.
+  Guests are compared on an emulator without AVX, but Ubuntu's public cloud
+  images from 26.04 on take amd64v3 packages: gcc then defaults to
+  -march=x86-64-v3, and musl's libc.a and glibc are built for it too.
+
+inputs:
+  packages:
+    description: The apt packages to install, separated by spaces
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        DEBIAN_FRONTEND: noninteractive
+        NEEDRESTART_SUSPEND: "1"
+      run: |
+        variant=/etc/apt/apt.conf.d/90arch-variant
+        if [ -f "$variant" ]; then
+          sudo rm -f "$variant"
+          sudo apt-get update
+          version="$(gcc -dumpversion)"
+          sudo -E apt-get install -y --no-install-recommends --reinstall --allow-downgrades \
+            libc-bin libc6 libc6-dev libgcc-s1 "libgcc-$version-dev" "libstdc++-$version-dev" \
+            "cpp-$version" "cpp-$version-x86-64-linux-gnu" \
+            "gcc-$version" "gcc-$version-x86-64-linux-gnu" \
+            "g++-$version" "g++-$version-x86-64-linux-gnu"
+        fi
+        sudo apt-get update
+        # shellcheck disable=SC2086 # the packages are separate words
+        sudo -E apt-get install -y --no-install-recommends $PACKAGES
+        if gcc -dM -E - < /dev/null | grep -q __AVX__; then
+          echo "gcc still targets AVX: $(gcc -Q --help=target | grep -E '^ +-march=' | head -1)" >&2
+          exit 1
+        fi

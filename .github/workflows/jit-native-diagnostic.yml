@@ -27,7 +27,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
+      - uses: ./.github/actions/guest-toolchain
+        with:
+          packages: musl-tools cmake perl make pkg-config
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install $RUST_TOOLCHAIN --profile minimal

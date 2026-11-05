@@ -16,7 +16,9 @@ jobs:
         with:
           python-version: '3.x'
           check-latest: true
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake perl make pkg-config
+      - uses: ./.github/actions/guest-toolchain
+        with:
+          packages: musl-tools cmake perl make pkg-config
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install $RUST_TOOLCHAIN --profile minimal --component rust-src

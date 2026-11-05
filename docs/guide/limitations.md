@@ -13,7 +13,8 @@ verified.
   its interpreter as on Linux, on musl's dynamic linker or glibc's. A session
   reads the interpreter and the libraries from its own files, so they must be
   mounted or given to it.
-- **32-bit x86, AVX, AVX-512, MMX**: out of scope.
+- **32-bit x86, AVX, AVX-512, MMX**: out of scope. `CPUID` reports MMX because
+  glibc requires it, but its instructions stop with `SIGILL`.
 - **`/proc/self/maps`**: this file does not exist.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a

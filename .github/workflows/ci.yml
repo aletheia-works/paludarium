@@ -234,6 +234,8 @@ jobs:
         run: |
           sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0
           sudo prlimit --pid "$PPID" --core=0:
+      - name: Check that this step took the core limit
+        run: test "$(ulimit -Sc)" = 0
       # The AF_UNIX datagram case fills a queue to the kernel's default
       # net.unix.max_dgram_qlen, which the runner's systemd raises.
       - name: Keep the default AF_UNIX datagram queue length
@@ -290,6 +292,8 @@ jobs:
         run: |
           sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0
           sudo prlimit --pid "$PPID" --core=0:
+      - name: Check that this step took the core limit
+        run: test "$(ulimit -Sc)" = 0
       # The AF_UNIX datagram case fills a queue to the kernel's default
       # net.unix.max_dgram_qlen, which the runner's systemd raises.
       - name: Keep the default AF_UNIX datagram queue length

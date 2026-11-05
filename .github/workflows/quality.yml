@@ -363,7 +363,8 @@ jobs:
       # working directory, as the kernel's default core_pattern does; the
       # runner hands cores to its crash handler instead.
       # Linux's default soft limit on them is 0, as a guest's is, but the runner
-      # of Ubuntu 26.04 raises it for the steps it starts.
+      # of Ubuntu 26.04 raises it for the steps it starts. Later steps are children
+      # of this step's parent, the runner's worker, and take the limit from it.
       - name: Write cores to the working directory
         run: |
           sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0
@@ -419,7 +420,8 @@ jobs:
       # working directory, as the kernel's default core_pattern does; the
       # runner hands cores to its crash handler instead.
       # Linux's default soft limit on them is 0, as a guest's is, but the runner
-      # of Ubuntu 26.04 raises it for the steps it starts.
+      # of Ubuntu 26.04 raises it for the steps it starts. Later steps are children
+      # of this step's parent, the runner's worker, and take the limit from it.
       - name: Write cores to the working directory
         run: |
           sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0

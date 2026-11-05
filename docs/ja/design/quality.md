@@ -65,6 +65,10 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   変わるところでは、エミュレータはそのカーネルに合わせます（そのカーネルは Hyper-V の
   ネットワークのため小さなヘッドのキャッシュが 704 バイトで、Docker では 640 です）。ほかのカーネルの
   ランナーでは、そのケースが失敗することがあります。
+  `ubuntu-26.04` もその一つで、当時のカーネルは `ubuntu-24.04` の 7.0.0-1017-azure に対して
+  7.0.0-1019-azure でした。受け付けたソケットや `socketpair` のソケットへの `listen` は、
+  そこでは `EINVAL` で、エミュレータでは成功します。そのため
+  `processes_unix_abstract` と `processes_unix_socketpair` が失敗します。
 - `tests/guests/processes/cases.json` に載っているプロセスのケースと、`diff_processes`
   が動かすケースがちょうど同じかをテストで確かめます。載せたのに動かないケースは
   作れません。

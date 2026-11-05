@@ -37,3 +37,14 @@ runs:
           echo "gcc still targets AVX: $(gcc -Q --help=target | grep -E '^ +-march=' | head -1)" >&2
           exit 1
         fi
+        # What a guest links has to be free of it too.
+        if command -v musl-gcc > /dev/null; then
+          scratch="$(mktemp -d)"
+          echo 'int main(void) { return 0; }' > "$scratch/guest.c"
+          musl-gcc -static -O2 -o "$scratch/guest" "$scratch/guest.c"
+          if objdump -d "$scratch/guest" | grep -qE '[[:space:]]v[a-z0-9]+[[:space:]]+.*%[xy]mm'; then
+            echo "a musl program still holds AVX instructions" >&2
+            exit 1
+          fi
+          rm -rf "$scratch"
+        fi

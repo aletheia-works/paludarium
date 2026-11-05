@@ -69,7 +69,10 @@ CI run produces them afresh on an x86-64 Linux runner.
   what a UDP datagram takes of the receive buffer, whose small head cache
   that kernel's Hyper-V networking makes 704 bytes (640 under Docker), the
   emulator follows that kernel, and a runner with another kernel can fail
-  those cases.
+  those cases. `ubuntu-26.04`, whose kernel was then 7.0.0-1019-azure where
+  `ubuntu-24.04`'s was 7.0.0-1017-azure, is one: `listen` on an accepted or
+  `socketpair` socket is `EINVAL` there, where the emulator succeeds, so
+  `processes_unix_abstract` and `processes_unix_socketpair` fail.
 - A test checks that `diff_processes` runs exactly the process cases that
   `tests/guests/processes/cases.json` lists, so that a case cannot be listed
   and never run.

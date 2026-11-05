@@ -1,8 +1,8 @@
 # paludarium
 
 A user-mode x86-64 Linux emulator in Rust. It runs statically linked x86-64
-Linux programs, and those on musl's dynamic linker, unchanged on Linux, macOS
-and Windows, and in WebAssembly (Node.js and browsers), with a JIT for
+Linux programs, and those on musl's or glibc's dynamic linker, unchanged on
+Linux, macOS and Windows, and in WebAssembly (Node.js and browsers), with a JIT for
 WebAssembly.
 
 **Documentation: <https://aletheia-works.github.io/paludarium/>**

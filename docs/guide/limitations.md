@@ -5,14 +5,14 @@ verified.
 
 ## Not supported
 
-- **Dynamically linked programs**: a program runs with its interpreter as on
-  Linux, which musl's dynamic linker can do. glibc's cannot yet: it refuses to
-  load `libc.so.6` on the virtual CPU, because it does not read the features
-  `CPUID` reports for a vendor it does not know, and past that it also uses x87
-  instructions, which are not implemented. A session reads
+- **Dynamically linked programs that use x87**: a program runs with its
+  interpreter as on Linux, on musl's dynamic linker or glibc's. A session reads
   the interpreter and the libraries from its own files, so they must be mounted
-  or given to it.
+  or given to it. x87 instructions are not implemented, and many programs on
+  glibc reach them, for example to print or compute floating point numbers
+  (bash's `printf`, awk, perl and python3 do): they stop with `SIGILL` there.
 - **32-bit x86, AVX, AVX-512, x87, MMX**: out of scope.
+- **`/proc/self/maps`**: this file does not exist.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.

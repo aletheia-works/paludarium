@@ -16,14 +16,27 @@ pub(crate) fn time_stamp() -> [u32; 2] {
     [value as u32, (value >> 32) as u32]
 }
 
+/// Family 15, the first with long mode, and no model: nothing here is a real
+/// CPU's, and no code should tune itself for it.
+const SIGNATURE: u32 = 0xf00;
+/// What every x86-64 CPU has, as leaf 1's EDX says it: FPU, CX8, CMOV, MMX,
+/// FXSR, SSE and SSE2. glibc refuses to load `libc.so.6` without all of them.
+/// FPU and MMX are not implemented, but a program of this architecture may use
+/// them without asking, so saying so changes nothing for it.
+const BASELINE: u32 = 1 | 1 << 8 | 1 << 15 | 1 << 23 | 1 << 24 | 1 << 25 | 1 << 26;
+
 pub(crate) fn values(leaf: u32, _subleaf: u32) -> [u32; 4] {
     match leaf {
+        // glibc reads leaf 1 only for a vendor it knows, so this names one
+        // rather than the emulator. Where vendors differ, the CPU has its own
+        // contract and does not follow this name.
         0 => [
             7,
-            u32::from_le_bytes(*b"Palu"),
-            u32::from_le_bytes(*b"umVM"),
-            u32::from_le_bytes(*b"dari"),
+            u32::from_le_bytes(*b"Auth"),
+            u32::from_le_bytes(*b"cAMD"),
+            u32::from_le_bytes(*b"enti"),
         ],
+        1 => [SIGNATURE, 0, 0, BASELINE],
         0x8000_0000 => [0x8000_0001, 0, 0, 0],
         0x8000_0001 => [0, 0, 0, 1 << 29],
         // Partial target subsets never advertise a complete feature family.

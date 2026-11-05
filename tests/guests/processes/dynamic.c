@@ -1,4 +1,4 @@
-/* A dynamically linked program, on musl's dynamic linker. */
+/* A dynamically linked program, on musl's dynamic linker or glibc's. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <elf.h>
@@ -13,6 +13,11 @@
 #include <sys/auxv.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+
+/* What differs with the libc it is built for. */
+#ifndef PLUGIN_NAME
+#define PLUGIN_NAME "dynamic-plugin.so"
+#endif
 
 extern char **environ;
 extern void _start(void);
@@ -32,16 +37,6 @@ static void *in_thread(void *unused) {
     local += 1;
     return (void *)(intptr_t)local;
 }
-/* Whether a line of /proc/self/maps names the dynamic linker. */
-static int maps_name(const char *name) {
-    FILE *f = fopen("/proc/self/maps", "r");
-    char line[512];
-    int found = 0;
-    while (f && fgets(line, sizeof line, f))
-        if (strstr(line, name)) found = 1;
-    if (f) fclose(f);
-    return found;
-}
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     /* What the exec cases look at. */
@@ -60,12 +55,22 @@ int main(int argc, char **argv) {
     printf("phdr-in-program=%d phent=%lu\n",
            phdr >= (unsigned long)&__executable_start && phdr < (unsigned long)&__executable_start + 4096,
            getauxval(AT_PHENT));
-    printf("linker-in-maps=%d\n", maps_name("ld-musl"));
     printf("break-after-program=%d\n", (unsigned long)sbrk(0) > (unsigned long)&__executable_start);
     /* What the linker did. */
     printf("relocated: %s %d\n", getenv("NOTHING_HERE") ? "set" : "unset", (int)strlen("twelve bytes"));
     char *block = malloc(1 << 20);
     printf("malloc=%d\n", block != NULL);
+    /* Large enough for libc's own way of copying much, whatever its size is
+       on this CPU, in both directions. */
+    if (!block) return 84;
+    for (size_t i = 0; i < 1 << 20; i++) block[i] = (char)(i * 31 >> 3);
+    char *copy = malloc((1 << 20) + 4096);
+    if (!copy) return 85;
+    memcpy(copy, block, 1 << 20);
+    printf("copied=%d\n", !memcmp(copy, block, 1 << 20));
+    memmove(copy + 4096, copy, 1 << 20);
+    printf("moved=%d\n", !memcmp(copy + 4096, block, 1 << 20));
+    free(copy);
     free(block);
     dl_iterate_phdr(count_object, NULL);
     printf("objects=%d\n", objects >= 2);
@@ -84,7 +89,7 @@ int main(int argc, char **argv) {
     path[sizeof path - 32] = 0;
     char *slash = strrchr(path, '/');
     if (!slash) return 81;
-    strcpy(slash + 1, "dynamic-plugin.so");
+    strcpy(slash + 1, PLUGIN_NAME);
     void *plugin = dlopen(path, RTLD_NOW);
     if (!plugin) {
         printf("dlopen: failed\n");

@@ -170,7 +170,25 @@ mod linux {
             } else {
                 config
             };
-            let config = if mode.starts_with("dynamic") {
+            let config = if mode == "dynamic-glibc" {
+                let beside = |name: &str| std::fs::read(dir.join(name)).unwrap();
+                config
+                    .with_file(
+                        "/lib64/ld-linux-x86-64.so.2",
+                        std::fs::read("/lib64/ld-linux-x86-64.so.2").unwrap(),
+                    )
+                    .with_file(
+                        "/lib/x86_64-linux-gnu/libc.so.6",
+                        std::fs::read("/lib/x86_64-linux-gnu/libc.so.6").unwrap(),
+                    )
+                    .with_file(
+                        dir.join("dynamic-glibc-plugin.so")
+                            .to_str()
+                            .unwrap()
+                            .to_owned(),
+                        beside("dynamic-glibc-plugin.so"),
+                    )
+            } else if mode.starts_with("dynamic") {
                 let beside = |name: &str| std::fs::read(dir.join(name)).unwrap();
                 config
                     .with_file(
@@ -256,6 +274,7 @@ mod linux {
         processes_time_calls => ("time-calls","process"),
         processes_dynamic => ("dynamic","dynamic"),
         processes_dynamic_no_pie => ("dynamic-no-pie","dynamic-no-pie"),
+        processes_dynamic_glibc => ("dynamic-glibc","dynamic-glibc"),
         processes_dynamic_exec => ("dynamic-exec","process"),
         processes_script_exec => ("script-exec","process"),
         processes_capabilities => ("capabilities","process"),

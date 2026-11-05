@@ -16,7 +16,7 @@ hero:
       link: https://github.com/aletheia-works/paludarium
 features:
   - title: Linux のバイナリをそのまま
-    details: C や Rust のプログラムを static-musl でビルドしたものなど、静的にリンクした x86-64 Linux のプログラムと、musl の動的リンカーを使うプログラムを、変更せずに動かします。
+    details: C や Rust のプログラムを static-musl でビルドしたものなど、静的にリンクした x86-64 Linux のプログラムと、musl か glibc の動的リンカーを使うプログラムを、変更せずに動かします。
     link: /ja/guide/introduction
   - title: Linux・macOS・Windows とブラウザ
     details: 同じ ELF が、3 つのネイティブのホストと、WebAssembly を通して Node.js、Chromium、Firefox、Safari で動きます。

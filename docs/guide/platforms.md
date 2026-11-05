@@ -4,8 +4,9 @@
 
 - x86-64 Linux programs only; 32-bit x86 is out of scope.
 - Statically linked executables (`ET_EXEC` and static-pie), and programs that
-  use musl's dynamic linker, whose files the session must be given. Programs
-  that use glibc's shared libraries are not supported yet.
+  use musl's or glibc's dynamic linker, whose files the session must be given.
+  Programs that reach x87 instructions stop there, which many on glibc do
+  ([Limitations](./limitations)).
 
 ## Hosts
 

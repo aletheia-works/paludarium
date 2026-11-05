@@ -20,7 +20,7 @@ cargo +nightly install paludarium
 ```
 
 動かせるのは、静的にリンクした x86-64 Linux の実行ファイル（`ET_EXEC` と static-pie）と、
-musl の動的リンカーとライブラリをマウントしたときの、それを使うプログラムです。
+musl か glibc の動的リンカーとライブラリをマウントしたときの、それを使うプログラムです。
 前者は musl で静的にリンクすると作れます。
 
 ```sh

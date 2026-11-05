@@ -9,4 +9,7 @@ musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie
 musl-gcc -shared -fPIC -O1 -fno-stack-protector -o "$out/dynamic-plugin.so" "$here/dynamic-plugin.c"
 musl-gcc -pthread -O1 -fno-stack-protector -fcf-protection=none -pie -fPIE -o "$out/dynamic" "$here/dynamic.c"
 musl-gcc -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/dynamic-no-pie" "$here/dynamic.c"
+# And on glibc's, which is the host's.
+gcc -shared -fPIC -O1 -fno-stack-protector -o "$out/dynamic-glibc-plugin.so" "$here/dynamic-plugin.c"
+gcc -pthread -O1 -fno-stack-protector -fcf-protection=none -pie -fPIE -DPLUGIN_NAME='"dynamic-glibc-plugin.so"' -o "$out/dynamic-glibc" "$here/dynamic.c" -ldl
 rustc --target x86_64-unknown-linux-musl -C opt-level=1 -C target-feature=+crt-static -o "$out/command" "$here/command.rs"

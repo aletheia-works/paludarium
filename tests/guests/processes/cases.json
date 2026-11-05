@@ -50,6 +50,7 @@
     {"name":"time-calls","binary":"process"},
     {"name":"dynamic","binary":"dynamic"},
     {"name":"dynamic-no-pie","binary":"dynamic-no-pie"},
+    {"name":"dynamic-glibc","binary":"dynamic-glibc"},
     {"name":"dynamic-exec","binary":"process"},
     {"name":"script-exec","binary":"process"},
     {"name":"capabilities","binary":"process"},

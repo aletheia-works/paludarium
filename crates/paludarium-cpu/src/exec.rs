@@ -281,15 +281,12 @@ impl Exec<'_> {
     }
 
     fn load(&self, addr: GuestAddr, size: u8) -> Result<u64> {
-        let mut b = [0u8; 8];
-        let n = usize::from(size.min(8));
-        self.mem.read(addr, &mut b[..n])?;
-        Ok(u64::from_le_bytes(b))
+        Ok(self.mem.read_value(addr, usize::from(size.min(8)))?)
     }
 
     fn store(&self, addr: GuestAddr, size: u8, value: u64) -> Result<()> {
-        let n = usize::from(size.min(8));
-        self.mem.write(addr, &value.to_le_bytes()[..n])?;
+        self.mem
+            .write_value(addr, usize::from(size.min(8)), value)?;
         Ok(())
     }
 

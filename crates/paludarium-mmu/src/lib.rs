@@ -5,7 +5,7 @@
 //! entries. Every access goes through checked guest addresses; a missing
 //! page or a protection violation returns a [`Fault`] and never panics.
 //!
-//! Page contents are byte-wise atomics so that `read`/`write` work through a
+//! Page contents are atomic words so that `read`/`write` work through a
 //! shared reference without `unsafe` (the CPU writes guest memory while the
 //! address space is shared, and later units add threads). Page entries are
 //! created lazily on the first write, so the cost of a mapping does not
@@ -14,7 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
@@ -237,7 +237,9 @@ impl MemoryMeter {
 
 /// The bytes of one page frame, charged to the meter while they exist.
 struct FrameBytes {
-    bytes: Box<[AtomicU8]>,
+    /// The bytes as little-endian words, so that an aligned word of a guest
+    /// takes one atomic access, where each byte would take its own.
+    words: Box<[AtomicU64]>,
     meter: Option<Arc<MemoryMeter>>,
     /// A guest store changed the bytes since [`SharedPages::write_back`]
     /// last took them.
@@ -248,23 +250,108 @@ impl FrameBytes {
     /// A frame of `bytes`, or `None` when the meter has no room for it.
     fn new(
         meter: Option<&Arc<MemoryMeter>>,
-        bytes: impl FnOnce() -> Box<[AtomicU8]>,
+        words: impl FnOnce() -> Box<[AtomicU64]>,
     ) -> Option<Self> {
         if meter.is_some_and(|meter| !meter.charge()) {
             return None;
         }
         Some(FrameBytes {
-            bytes: bytes(),
+            words: words(),
             meter: meter.cloned(),
             dirty: AtomicBool::new(false),
         })
     }
 }
 
-impl std::ops::Deref for FrameBytes {
-    type Target = [AtomicU8];
-    fn deref(&self) -> &[AtomicU8] {
-        &self.bytes
+/// The bytes in one word of a frame.
+const WORD_BYTES: usize = 8;
+
+/// The bits of a value of `size` bytes, 1 to 8.
+#[inline]
+const fn value_mask(size: usize) -> u64 {
+    u64::MAX >> (64 - 8 * size)
+}
+
+/// The words of a page that starts with `bytes` and is otherwise zero.
+fn page_words(bytes: &[u8]) -> Box<[AtomicU64]> {
+    (0..PAGE_BYTES / WORD_BYTES)
+        .map(|word| {
+            let mut value = [0; WORD_BYTES];
+            if let Some(piece) = bytes.get(word * WORD_BYTES..) {
+                let n = piece.len().min(WORD_BYTES);
+                value[..n].copy_from_slice(&piece[..n]);
+            }
+            AtomicU64::new(u64::from_le_bytes(value))
+        })
+        .collect()
+}
+
+impl FrameBytes {
+    /// Copies the bytes from `offset`, which must stay inside the page, to
+    /// `buf`.
+    #[inline]
+    fn read(&self, offset: usize, buf: &mut [u8]) {
+        let mut at = offset;
+        let mut left = buf;
+        while !left.is_empty() {
+            let within = at % WORD_BYTES;
+            let n = left.len().min(WORD_BYTES - within);
+            let mut word = self.words[at / WORD_BYTES].load(Ordering::Relaxed) >> (8 * within);
+            let (now, rest) = left.split_at_mut(n);
+            for byte in now {
+                *byte = word as u8;
+                word >>= 8;
+            }
+            left = rest;
+            at += n;
+        }
+    }
+
+    /// Copies `data` to the bytes from `offset`, which must stay inside the
+    /// page. A piece of a word leaves the other bytes as another thread may
+    /// be writing them.
+    fn write(&self, offset: usize, data: &[u8]) {
+        self.write_with(offset, data, |word, kept, value| {
+            let _ = word.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(old & kept | value)
+            });
+        });
+    }
+
+    /// [`Self::write`] when nothing else can be at this frame now, so that a
+    /// piece of a word needs no atomic read-modify-write.
+    #[inline]
+    fn write_exclusive(&self, offset: usize, data: &[u8]) {
+        self.write_with(offset, data, |word, kept, value| {
+            word.store(
+                word.load(Ordering::Relaxed) & kept | value,
+                Ordering::Relaxed,
+            );
+        });
+    }
+
+    #[inline]
+    fn write_with(&self, offset: usize, data: &[u8], piece: impl Fn(&AtomicU64, u64, u64)) {
+        let mut at = offset;
+        let mut left = data;
+        while !left.is_empty() {
+            let within = at % WORD_BYTES;
+            let n = left.len().min(WORD_BYTES - within);
+            let (now, rest) = left.split_at(n);
+            let word = &self.words[at / WORD_BYTES];
+            let value = now
+                .iter()
+                .rev()
+                .fold(0, |value, byte| value << 8 | u64::from(*byte))
+                << (8 * within);
+            if n == WORD_BYTES {
+                word.store(value, Ordering::Relaxed);
+            } else {
+                piece(word, !((u64::MAX >> (64 - 8 * n)) << (8 * within)), value);
+            }
+            left = rest;
+            at += n;
+        }
     }
 }
 
@@ -321,8 +408,9 @@ fn copied(frame: &Frame, meter: Option<&Arc<MemoryMeter>>) -> Option<Frame> {
     if let Some(bytes) = frame.get() {
         let bytes = FrameBytes::new(meter, || {
             bytes
+                .words
                 .iter()
-                .map(|byte| AtomicU8::new(byte.load(Ordering::Relaxed)))
+                .map(|word| AtomicU64::new(word.load(Ordering::Relaxed)))
                 .collect()
         })?;
         let _ = copy.set(bytes);
@@ -334,9 +422,7 @@ fn copied(frame: &Frame, meter: Option<&Arc<MemoryMeter>>) -> Option<Frame> {
 /// the meter has no room for them.
 fn allocated<'a>(frame: &'a Frame, meter: Option<&Arc<MemoryMeter>>) -> Option<&'a FrameBytes> {
     if frame.get().is_none() {
-        let bytes = FrameBytes::new(meter, || {
-            (0..PAGE_BYTES).map(|_| AtomicU8::new(0)).collect()
-        })?;
+        let bytes = FrameBytes::new(meter, || page_words(&[]))?;
         // A racing write to a shared frame may set it first: then this one
         // is dropped, and its charge with it.
         let _ = frame.set(bytes);
@@ -461,14 +547,7 @@ impl SharedPages {
         if frame.get().is_some() {
             return Ok(());
         }
-        let contents = FrameBytes::new(meter, || {
-            let mut page: Box<[AtomicU8]> = (0..PAGE_BYTES).map(|_| AtomicU8::new(0)).collect();
-            for (d, s) in page.iter_mut().zip(bytes) {
-                *d.get_mut() = *s;
-            }
-            page
-        })
-        .ok_or(Errno::ENOMEM)?;
+        let contents = FrameBytes::new(meter, || page_words(bytes)).ok_or(Errno::ENOMEM)?;
         let _ = frame.set(contents);
         Ok(())
     }
@@ -489,9 +568,7 @@ impl SharedPages {
             let piece = (PAGE_BYTES - within).min(data.len() - done);
             let frame = self.lock().get(&key).cloned();
             if let Some(bytes) = frame.as_ref().and_then(|frame| frame.get()) {
-                for (d, s) in bytes[within..].iter().zip(&data[done..done + piece]) {
-                    d.store(*s, Ordering::Relaxed);
-                }
+                bytes.write(within, &data[done..done + piece]);
             }
             done += piece;
         }
@@ -507,8 +584,9 @@ impl SharedPages {
             if let Some(bytes) = frame.get() {
                 let from = usize::try_from(start.saturating_sub(key)).unwrap_or(PAGE_BYTES);
                 let to = usize::try_from(end - key).map_or(PAGE_BYTES, |n| n.min(PAGE_BYTES));
-                for byte in bytes.get(from..to).into_iter().flatten() {
-                    byte.store(0, Ordering::Relaxed);
+                let zeros = [0; PAGE_BYTES];
+                if let Some(zeros) = zeros.get(..to.saturating_sub(from)) {
+                    bytes.write(from, zeros);
                 }
             }
         }
@@ -529,9 +607,7 @@ impl SharedPages {
             if !bytes.dirty.swap(false, Ordering::Acquire) {
                 continue;
             }
-            for (d, s) in page.iter_mut().zip(bytes.iter()) {
-                *d = s.load(Ordering::Relaxed);
-            }
+            bytes.read(0, &mut page);
             if let Err(error) = write(key, &page) {
                 bytes.dirty.store(true, Ordering::Release);
                 return Err(error);
@@ -1092,13 +1168,7 @@ impl AddressSpaceData {
             return;
         };
         let bytes = FrameBytes::new(self.meter.as_ref(), || {
-            buf[..n.min(PAGE_BYTES)]
-                .iter()
-                .copied()
-                .chain(std::iter::repeat(0))
-                .take(PAGE_BYTES)
-                .map(AtomicU8::new)
-                .collect()
+            page_words(&buf[..n.min(PAGE_BYTES)])
         });
         match bytes {
             // A racing fill of a shared frame may set it first.
@@ -1282,11 +1352,7 @@ impl AddressSpaceData {
             return false;
         };
         match entry.frame.get() {
-            Some(frame) => {
-                for (d, s) in buf.iter_mut().zip(&frame[page_offset(addr.0)..]) {
-                    *d = s.load(Ordering::Relaxed);
-                }
-            }
+            Some(frame) => frame.read(page_offset(addr.0), buf),
             None => buf.fill(0),
         }
         true
@@ -1310,10 +1376,66 @@ impl AddressSpaceData {
             // Code may have changed: decoded instructions are stale.
             self.code.generation.fetch_add(1, Ordering::Release);
         }
-        for (s, d) in buf.iter().zip(&frame[page_offset(addr.0)..]) {
-            d.store(*s, Ordering::Relaxed);
+        // The page is neither shared nor of a file, and the caller holds the
+        // space's lock: no other thread can be at this frame.
+        // Nor does anything write such a page back, so it need not be marked.
+        frame.write_exclusive(page_offset(addr.0), buf);
+        true
+    }
+
+    /// [`Self::read_cached`] of `size` bytes, 1 to 8, that lie in one word.
+    #[inline]
+    fn read_value_cached(&self, addr: GuestAddr, size: usize) -> Option<u64> {
+        let offset = page_offset(addr.0);
+        let within = offset % WORD_BYTES;
+        if size == 0 || within + size > WORD_BYTES {
+            return None;
         }
-        frame.dirty.store(true, Ordering::Release);
+        let tlb = self.tlb.borrow();
+        let entry = tlb
+            .get(addr.0 - offset as u64)
+            .filter(|e| e.prot.allows_read())?;
+        let Some(frame) = entry.frame.get() else {
+            return Some(0);
+        };
+        let word = frame.words[offset / WORD_BYTES].load(Ordering::Relaxed);
+        Some(word >> (8 * within) & value_mask(size))
+    }
+
+    /// [`Self::write_cached`] of `size` bytes, 1 to 8, that lie in one word.
+    #[inline]
+    fn write_value_cached(&self, addr: GuestAddr, size: usize, value: u64) -> bool {
+        let offset = page_offset(addr.0);
+        let within = offset % WORD_BYTES;
+        if size == 0 || within + size > WORD_BYTES {
+            return false;
+        }
+        let tlb = self.tlb.borrow();
+        let Some(entry) = tlb
+            .get(addr.0 - offset as u64)
+            .filter(|e| e.prot.contains(Prot::WRITE) && !e.cow)
+        else {
+            return false;
+        };
+        let Some(frame) = entry.frame.get() else {
+            return false;
+        };
+        if entry.prot.contains(Prot::EXEC) {
+            // Code may have changed: decoded instructions are stale.
+            self.code.generation.fetch_add(1, Ordering::Release);
+        }
+        let word = &frame.words[offset / WORD_BYTES];
+        if size == WORD_BYTES {
+            word.store(value, Ordering::Relaxed);
+        } else {
+            // As in `write_cached`, nothing else can be at this frame.
+            let mask = value_mask(size) << (8 * within);
+            let old = word.load(Ordering::Relaxed);
+            word.store(
+                old & !mask | value << (8 * within) & mask,
+                Ordering::Relaxed,
+            );
+        }
         true
     }
 
@@ -1323,11 +1445,7 @@ impl AddressSpaceData {
         for (page, offset, range) in chunks(addr, buf.len()) {
             let dst = &mut buf[range];
             match lookup(directory, page).and_then(|p| p.frame.get()) {
-                Some(frame) => {
-                    for (d, s) in dst.iter_mut().zip(&frame[offset..]) {
-                        *d = s.load(Ordering::Relaxed);
-                    }
-                }
+                Some(frame) => frame.read(offset, dst),
                 None => dst.fill(0),
             }
         }
@@ -1398,9 +1516,7 @@ impl AddressSpaceData {
                         bus: false,
                     });
                 };
-                for (s, d) in buf[range].iter().zip(&frame[offset..]) {
-                    d.store(*s, Ordering::Relaxed);
-                }
+                frame.write(offset, &buf[range]);
                 frame.dirty.store(true, Ordering::Release);
                 // Again once the page is dirty, so that a write-back that ran
                 // between the bumps sees the generation change after it.
@@ -2610,12 +2726,30 @@ impl AddressSpace {
         self.locked().write_initial(addr, buf)
     }
     pub fn read_u64(&self, addr: GuestAddr) -> Result<u64, Fault> {
-        let mut b = [0u8; 8];
-        self.read(addr, &mut b)?;
-        Ok(u64::from_le_bytes(b))
+        self.read_value(addr, 8)
     }
     pub fn write_u64(&self, addr: GuestAddr, value: u64) -> Result<(), Fault> {
-        self.write(addr, &value.to_le_bytes())
+        self.write_value(addr, 8, value)
+    }
+    /// The little-endian value of `size` bytes, at most 8, as [`Self::read`]
+    /// gives them, taking one atomic access where they lie in one word.
+    #[inline]
+    pub fn read_value(&self, addr: GuestAddr, size: usize) -> Result<u64, Fault> {
+        if let Some(value) = self.data_locked().read_value_cached(addr, size) {
+            return Ok(value);
+        }
+        let mut bytes = [0; WORD_BYTES];
+        self.read(addr, &mut bytes[..size])?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+    /// Writes the low `size` bytes of `value`, at most 8, as [`Self::write`]
+    /// does.
+    #[inline]
+    pub fn write_value(&self, addr: GuestAddr, size: usize, value: u64) -> Result<(), Fault> {
+        if self.data_locked().write_value_cached(addr, size, value) {
+            return Ok(());
+        }
+        self.write(addr, &value.to_le_bytes()[..size])
     }
     pub fn map(
         &mut self,
@@ -2755,6 +2889,149 @@ impl AddressSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame_of(bytes: &[u8]) -> FrameBytes {
+        FrameBytes::new(None, || page_words(bytes)).unwrap()
+    }
+
+    #[test]
+    fn a_frame_reads_and_writes_any_bytes_of_its_words() {
+        let start: Vec<u8> = (0..=255).cycle().take(PAGE_BYTES).collect();
+        let frame = frame_of(&start);
+        for offset in 0..20 {
+            for len in 0..20 {
+                let mut buf = vec![0; len];
+                frame.read(offset, &mut buf);
+                assert_eq!(buf, start[offset..offset + len], "{offset}+{len}");
+            }
+        }
+        let write: fn(&FrameBytes, usize, &[u8]) = FrameBytes::write;
+        let exclusive: fn(&FrameBytes, usize, &[u8]) = FrameBytes::write_exclusive;
+        for store in [write, exclusive] {
+            for offset in 0..20 {
+                for len in 0..20 {
+                    let frame = frame_of(&start);
+                    let data = vec![0xee; len];
+                    store(&frame, offset, &data);
+                    let mut expected = start.clone();
+                    expected[offset..offset + len].fill(0xee);
+                    let mut page = vec![0; PAGE_BYTES];
+                    frame.read(0, &mut page);
+                    assert_eq!(page, expected, "{offset}+{len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_reaches_the_end_of_its_page_and_starts_short_of_it() {
+        let frame = frame_of(&[1, 2, 3]);
+        let mut buf = [9; 5];
+        frame.read(0, &mut buf);
+        assert_eq!(buf, [1, 2, 3, 0, 0]);
+        frame.write(PAGE_BYTES - 3, &[7, 8, 9]);
+        frame.read(PAGE_BYTES - 5, &mut buf);
+        assert_eq!(buf, [0, 0, 7, 8, 9]);
+    }
+
+    #[test]
+    fn threads_writing_bytes_of_one_word_keep_each_others() {
+        let frame = Arc::new(frame_of(&[]));
+        std::thread::scope(|scope| {
+            for byte in 0..WORD_BYTES {
+                let frame = Arc::clone(&frame);
+                scope.spawn(move || {
+                    for round in 0..20_000u32 {
+                        frame.write(byte, &[(round % 251) as u8 + 1]);
+                    }
+                    frame.write(byte, &[byte as u8 + 1]);
+                });
+            }
+        });
+        let mut word = [0; WORD_BYTES];
+        frame.read(0, &mut word);
+        assert_eq!(word, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn an_aligned_word_is_written_whole_though_another_thread_reads_it() {
+        let frame = Arc::new(frame_of(&[]));
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    let mut word = [0; WORD_BYTES];
+                    frame.read(8, &mut word);
+                    assert!(
+                        word == [0; WORD_BYTES] || word == [0xff; WORD_BYTES],
+                        "{word:?}"
+                    );
+                }
+            });
+            for round in 0..200_000 {
+                frame.write(8, &[if round % 2 == 0 { 0xff } else { 0 }; WORD_BYTES]);
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn values_read_and_write_as_their_bytes_do_at_any_offset() {
+        let space = space_with(0x10000, 2 * PAGE_SIZE, Prot::READ_WRITE);
+        let start: Vec<u8> = (1..=255).cycle().take(2 * PAGE_BYTES).collect();
+        space.write(GuestAddr(0x10000), &start).unwrap();
+        // Twice each: the first takes the page table's path, the next the Tlb's.
+        for at in (0..24).chain(PAGE_BYTES - 12..PAGE_BYTES + 4) {
+            let addr = GuestAddr(0x10000 + at as u64);
+            for size in 1..=8 {
+                let mut bytes = [0; 8];
+                bytes[..size].copy_from_slice(&start[at..at + size]);
+                let expected = u64::from_le_bytes(bytes);
+                assert_eq!(space.read_value(addr, size), Ok(expected), "{at}+{size}");
+                assert_eq!(space.read_value(addr, size), Ok(expected), "{at}+{size}");
+                space.write_value(addr, size, !0).unwrap();
+                space.write_value(addr, size, !0).unwrap();
+                let mut after = vec![0; 2 * PAGE_BYTES];
+                space.read(GuestAddr(0x10000), &mut after).unwrap();
+                let mut wanted = start.clone();
+                wanted[at..at + size].fill(0xff);
+                assert_eq!(after, wanted, "{at}+{size}");
+                // Only the low bytes of the value count.
+                space
+                    .write_value(addr, size, expected | !value_mask(size))
+                    .unwrap();
+                space.read(GuestAddr(0x10000), &mut after).unwrap();
+                assert_eq!(after, start, "{at}+{size}");
+            }
+        }
+        assert_eq!(space.read_value(GuestAddr(0x10000), 0), Ok(0));
+        space.write_value(GuestAddr(0x10000), 0, !0).unwrap();
+        assert_eq!(space.read_value(GuestAddr(0x10000), 1), Ok(1));
+    }
+
+    #[test]
+    fn values_fault_as_their_bytes_do() {
+        let space = space_with(0x10000, PAGE_SIZE, Prot::READ);
+        // Past the mapping, whichever way the word lies.
+        let past = space.read_value(GuestAddr(0x10ffc), 8).unwrap_err();
+        assert_eq!(past.addr, GuestAddr(0x11000));
+        assert_eq!(space.read_value(GuestAddr(0x10000), 8), Ok(0));
+        // Reading put the page in the Tlb, which still refuses a write.
+        let refused = space.write_value(GuestAddr(0x10000), 8, 1).unwrap_err();
+        assert!(refused.write);
+        assert_eq!(space.read_value(GuestAddr(0x10000), 8), Ok(0));
+    }
+
+    #[test]
+    fn a_value_written_to_code_makes_decoded_instructions_stale() {
+        let space = space_with(0x10000, PAGE_SIZE, Prot::READ_WRITE.union(Prot::EXEC));
+        space.write_u64(GuestAddr(0x10000), 1).unwrap();
+        // Twice, so that the second goes through the Tlb.
+        space.write_value(GuestAddr(0x10000), 8, 2).unwrap();
+        let before = space.code_generation();
+        space.write_value(GuestAddr(0x10000), 4, 3).unwrap();
+        assert_ne!(space.code_generation(), before);
+    }
 
     fn space_with(addr: u64, len: u64, prot: Prot) -> AddressSpace {
         let mut space = AddressSpace::new();

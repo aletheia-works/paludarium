@@ -50,7 +50,7 @@ fn pack(a: u128, b: u128, source: u32, destination: u32, unsigned: bool) -> u128
 pub(crate) fn packed(m: M, a: u128, b: u128, imm: u8, implicit: u128) -> Option<u128> {
     Some(match m {
         M::Pand | M::Andps | M::Andpd => a & b,
-        M::Pandn | M::Andnpd => (!a) & b,
+        M::Pandn | M::Andnpd | M::Andnps => (!a) & b,
         M::Por | M::Orps | M::Orpd => a | b,
         M::Pxor | M::Xorps | M::Xorpd => a ^ b,
         M::Paddb => lanes(a, b, 8, u128::wrapping_add),
@@ -61,7 +61,16 @@ pub(crate) fn packed(m: M, a: u128, b: u128, imm: u8, implicit: u128) -> Option<
         M::Psubw => lanes(a, b, 16, u128::wrapping_sub),
         M::Psubd => lanes(a, b, 32, u128::wrapping_sub),
         M::Psubq => lanes(a, b, 64, u128::wrapping_sub),
+        M::Paddusb => lanes(a, b, 8, |x, y| (x + y).min(255)),
         M::Paddusw => lanes(a, b, 16, |x, y| (x + y).min(65535)),
+        M::Paddsb => lanes(a, b, 8, |x, y| saturate(signed(x, 8) + signed(y, 8), 8)),
+        M::Paddsw => lanes(a, b, 16, |x, y| saturate(signed(x, 16) + signed(y, 16), 16)),
+        M::Psubsb => lanes(a, b, 8, |x, y| saturate(signed(x, 8) - signed(y, 8), 8)),
+        M::Psubsw => lanes(a, b, 16, |x, y| saturate(signed(x, 16) - signed(y, 16), 16)),
+        M::Pavgb => lanes(a, b, 8, |x, y| (x + y + 1) >> 1),
+        M::Pavgw => lanes(a, b, 16, |x, y| (x + y + 1) >> 1),
+        M::Pminsw => lanes(a, b, 16, |x, y| signed(x, 16).min(signed(y, 16)) as u128),
+        M::Pmaxsw => lanes(a, b, 16, |x, y| signed(x, 16).max(signed(y, 16)) as u128),
         M::Psubusb => lanes(a, b, 8, u128::saturating_sub),
         M::Psubusw => lanes(a, b, 16, u128::saturating_sub),
         M::Pcmpeqb => lanes(a, b, 8, |x, y| if x == y { 255 } else { 0 }),
@@ -101,6 +110,7 @@ pub(crate) fn packed(m: M, a: u128, b: u128, imm: u8, implicit: u128) -> Option<
         M::Punpcklqdq | M::Unpcklpd => unpack(a, b, 64, false),
         M::Punpckhqdq | M::Unpckhpd => unpack(a, b, 64, true),
         M::Unpcklps => unpack(a, b, 32, false),
+        M::Unpckhps => unpack(a, b, 32, true),
         M::Pslldq => {
             if imm < 16 {
                 a << (u32::from(imm) * 8)

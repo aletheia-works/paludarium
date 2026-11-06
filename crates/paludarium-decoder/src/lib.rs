@@ -319,6 +319,44 @@ mnemonics!(
     Unpcklpd,
     Unpcklps,
     Xorpd,
+    Andnps,
+    Cmppd,
+    Cmpps,
+    Cvtdq2pd,
+    Cvtpd2dq,
+    Cvtpd2ps,
+    Cvtps2dq,
+    Cvtps2pd,
+    Cvtsd2si,
+    Cvtss2si,
+    Cvttpd2dq,
+    Divps,
+    Maskmovdqu,
+    Maxpd,
+    Maxps,
+    Minpd,
+    Minps,
+    Movntdq,
+    Movntpd,
+    Movntps,
+    Mulps,
+    Paddsb,
+    Paddsw,
+    Paddusb,
+    Pavgb,
+    Pavgw,
+    Pmaxsw,
+    Pminsw,
+    Psubsb,
+    Psubsw,
+    Rcpps,
+    Rcpss,
+    Rsqrtps,
+    Rsqrtss,
+    Sqrtpd,
+    Subps,
+    Unpckhps,
+    Clflush,
     Sha256rnds2,
     Sha256msg1,
     Sha256msg2,
@@ -446,6 +484,10 @@ fn map_mnemonic(insn: &iced::Instruction) -> Option<Mnemonic> {
     }
     if insn.code() == iced::Code::Cmpsd_xmm_xmmm64_imm8 {
         return Some(Mnemonic::CmpsdSse);
+    }
+    // Non-temporal is only a hint about the cache.
+    if m == M::Movnti {
+        return Some(Mnemonic::Mov);
     }
     // Spin-loop and cache hints change no architectural state, and a
     // prefetch never faults, not even for an unmapped address. Without
@@ -742,6 +784,24 @@ fn map_operand(insn: &iced::Instruction, n: u32) -> Option<Operand> {
         | K::Immediate32to64
         | K::Immediate8_2nd => Operand::Immediate(insn.immediate(n)),
         K::Memory => Operand::Memory(map_memory(insn)?),
+        // The target of `maskmovdqu`, which iced gives no base of.
+        K::MemorySegRDI | K::MemorySegEDI => Operand::Memory(MemoryOperand {
+            segment: match insn.memory_segment() {
+                iced::Register::FS => Segment::Fs,
+                iced::Register::GS => Segment::Gs,
+                _ => Segment::None,
+            },
+            base: Some(map_register(if insn.op_kind(n) == K::MemorySegRDI {
+                iced::Register::RDI
+            } else {
+                iced::Register::EDI
+            })?),
+            index: None,
+            scale: 1,
+            displacement: 0,
+            size: 16,
+            address_size_32: insn.op_kind(n) == K::MemorySegEDI,
+        }),
         _ => return None,
     })
 }

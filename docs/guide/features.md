@@ -13,10 +13,11 @@ Linux.
   `MOVBE`, `ENTER`/`LEAVE` and more.
 - **Hints**: `PAUSE` and the `PREFETCHNTA`/`PREFETCHT0`/`T1`/`T2` prefetches,
   which change nothing and never fault.
-- **SSE**: the 145 SSE-family instructions real programs (probe, aube and
-  pitchfork) use, the `MFENCE`/`LFENCE`/`SFENCE` fences among them, and
-  cryptographic instructions such as AES, PCLMUL and SHA. Floating point is
-  computed in software.
+- **SSE**: every SSE and SSE2 instruction, except those that use MMX registers
+  (a test runs each encoding), the `MFENCE`/`LFENCE`/`SFENCE` fences among them.
+  Of the later sets, the instructions real programs (probe, aube and pitchfork)
+  use, and cryptographic instructions such as AES, PCLMUL and SHA. Floating
+  point is computed in software.
 - Instructions are decoded with [iced-x86](https://github.com/icedland/iced).
 - `CPUID` does not reveal the host's values. It names AMD as the vendor, because
   glibc reads the features only for a vendor it knows, and reports the features

@@ -1145,6 +1145,24 @@ impl Exec<'_> {
         self.write128(dst, v, aligned)
     }
 
+    /// MASKMOVDQU: the bytes whose mask byte has its top bit set go to the
+    /// implicit `[rdi]`, in order. No mask bit, no access at all.
+    fn sse_masked_store(&mut self) -> Result<()> {
+        let Operand::Memory(target) = op(self.i, 0)? else {
+            return Err(Stop::Invalid);
+        };
+        let address = self.linear(&target).0;
+        let data = self.read128(op(self.i, 1)?, false)?.to_le_bytes();
+        let mask = self.read128(op(self.i, 2)?, false)?.to_le_bytes();
+        for n in 0..16 {
+            if mask[n] & 0x80 != 0 {
+                self.mem
+                    .write(GuestAddr(address.wrapping_add(n as u64)), &data[n..=n])?;
+            }
+        }
+        Ok(())
+    }
+
     fn sse_xor(&mut self) -> Result<()> {
         let dst = op(self.i, 0)?;
         // Legacy-SSE memory operands must be 16-byte aligned.
@@ -1649,6 +1667,28 @@ impl Exec<'_> {
             M::Addpd
                 | M::Addps
                 | M::Addsd
+                | M::Subps
+                | M::Mulps
+                | M::Divps
+                | M::Minps
+                | M::Maxps
+                | M::Minpd
+                | M::Maxpd
+                | M::Sqrtpd
+                | M::Cmpps
+                | M::Cmppd
+                | M::Cvtps2pd
+                | M::Cvtpd2ps
+                | M::Cvtps2dq
+                | M::Cvtpd2dq
+                | M::Cvttpd2dq
+                | M::Cvtdq2pd
+                | M::Cvtsd2si
+                | M::Cvtss2si
+                | M::Rcpps
+                | M::Rcpss
+                | M::Rsqrtps
+                | M::Rsqrtss
                 | M::Subpd
                 | M::Subsd
                 | M::Mulpd
@@ -1689,6 +1729,18 @@ impl Exec<'_> {
         let single = matches!(
             m,
             M::Addps
+                | M::Subps
+                | M::Mulps
+                | M::Divps
+                | M::Minps
+                | M::Maxps
+                | M::Cmpps
+                | M::Cvtps2dq
+                | M::Cvtss2si
+                | M::Rcpps
+                | M::Rcpss
+                | M::Rsqrtps
+                | M::Rsqrtss
                 | M::Addss
                 | M::Subss
                 | M::Mulss
@@ -1712,6 +1764,17 @@ impl Exec<'_> {
             m,
             M::Addpd
                 | M::Addps
+                | M::Subps
+                | M::Mulps
+                | M::Divps
+                | M::Minps
+                | M::Maxps
+                | M::Minpd
+                | M::Maxpd
+                | M::Sqrtpd
+                | M::Cvtps2dq
+                | M::Rcpps
+                | M::Rsqrtps
                 | M::Subpd
                 | M::Mulpd
                 | M::Divpd
@@ -1724,12 +1787,56 @@ impl Exec<'_> {
         } else {
             self.sse_operand(src)?
         };
-        if matches!(m, M::Cvttsd2si | M::Cvttss2si) {
+        if matches!(m, M::Cvttsd2si | M::Cvttss2si | M::Cvtsd2si | M::Cvtss2si) {
             let size = Self::size_of(dst, None);
-            let (result, flags) =
-                fp::to_integer(format, b as u64, u32::from(size) * 8, self.s.mxcsr);
+            let convert = if matches!(m, M::Cvttsd2si | M::Cvttss2si) {
+                fp::to_integer
+            } else {
+                fp::to_rounded_integer
+            };
+            let (result, flags) = convert(format, b as u64, u32::from(size) * 8, self.s.mxcsr);
             self.fp_status(flags)?;
             return self.write(dst, size, result);
+        }
+        // Two lanes of one width to two of another; what is left is zero.
+        if matches!(
+            m,
+            M::Cvtps2pd | M::Cvtdq2pd | M::Cvtpd2ps | M::Cvtpd2dq | M::Cvttpd2dq
+        ) {
+            let mxcsr = self.s.mxcsr;
+            let mut result = 0;
+            let mut flags = 0;
+            for lane in 0..2 {
+                let narrow = (b >> (lane * 32)) as u32;
+                let wide = (b >> (lane * 64)) as u64;
+                let (value, status, to) = match m {
+                    M::Cvtps2pd => {
+                        let (value, status) = fp::convert(F32, F64, u64::from(narrow), mxcsr);
+                        (value, status, 64)
+                    }
+                    M::Cvtdq2pd => {
+                        let (value, status) =
+                            fp::from_integer(F64, i64::from(narrow as i32), mxcsr);
+                        (value, status, 64)
+                    }
+                    M::Cvtpd2ps => {
+                        let (value, status) = fp::convert(F64, F32, wide, mxcsr);
+                        (value, status, 32)
+                    }
+                    M::Cvtpd2dq => {
+                        let (value, status) = fp::to_rounded_integer(F64, wide, 32, mxcsr);
+                        (value, status, 32)
+                    }
+                    _ => {
+                        let (value, status) = fp::to_integer(F64, wide, 32, mxcsr);
+                        (value, status, 32)
+                    }
+                };
+                flags |= status;
+                result |= u128::from(value & (u64::MAX >> (64 - to))) << (lane * to);
+            }
+            self.fp_status(flags)?;
+            return self.write128(dst, result, false);
         }
         let a = self.read128(dst, false)?;
         // The low element: all of a 64-bit lane, or the low half for single precision.
@@ -1754,34 +1861,45 @@ impl Exec<'_> {
             );
             return Ok(());
         }
-        if matches!(m, M::CmpsdSse | M::Cmpss) {
+        if matches!(m, M::CmpsdSse | M::Cmpss | M::Cmpps | M::Cmppd) {
             let Operand::Immediate(predicate) = op(self.i, 2)? else {
                 return Err(Stop::Invalid);
             };
             let predicate = predicate & 7;
-            let (order, status) = fp::compare(
-                format,
-                a as u64 & lane,
-                b as u64 & lane,
-                self.s.mxcsr,
-                matches!(predicate, 1 | 2 | 5 | 6),
-            );
-            let yes = match predicate {
-                0 => order == Some(0),
-                1 => order == Some(-1),
-                2 => matches!(order, Some(-1 | 0)),
-                3 => order.is_none(),
-                4 => order != Some(0),
-                5 => order != Some(-1),
-                6 => !matches!(order, Some(-1 | 0)),
-                _ => order.is_some(),
+            let count = if matches!(m, M::Cmpps | M::Cmppd) {
+                128 / width
+            } else {
+                1
             };
-            self.fp_status(status)?;
-            return self.write128(
-                dst,
-                (a & !u128::from(lane)) | if yes { u128::from(lane) } else { 0 },
-                false,
-            );
+            let mut result = a;
+            let mut flags = 0;
+            for n in 0..count {
+                let shift = n * width;
+                let (order, status) = fp::compare(
+                    format,
+                    (a >> shift) as u64 & lane,
+                    (b >> shift) as u64 & lane,
+                    self.s.mxcsr,
+                    matches!(predicate, 1 | 2 | 5 | 6),
+                );
+                let yes = match predicate {
+                    0 => order == Some(0),
+                    1 => order == Some(-1),
+                    2 => matches!(order, Some(-1 | 0)),
+                    3 => order.is_none(),
+                    4 => order != Some(0),
+                    5 => order != Some(-1),
+                    6 => !matches!(order, Some(-1 | 0)),
+                    _ => order.is_some(),
+                };
+                flags |= status;
+                result &= !(u128::from(lane) << shift);
+                if yes {
+                    result |= u128::from(lane) << shift;
+                }
+            }
+            self.fp_status(flags)?;
+            return self.write128(dst, result, false);
         }
         let count = if scalar { 1 } else { 128 / width };
         let mut result = if scalar { a } else { 0 };
@@ -1803,18 +1921,21 @@ impl Exec<'_> {
                 M::Cvtsd2ss => fp::convert(F64, F32, b as u64, self.s.mxcsr),
                 M::Cvtdq2ps => fp::from_integer(F32, i64::from(bv as u32 as i32), self.s.mxcsr),
                 M::Cvttps2dq => fp::to_integer(F32, bv, 32, self.s.mxcsr),
-                M::Sqrtps | M::Sqrtsd | M::Sqrtss => {
+                M::Cvtps2dq => fp::to_rounded_integer(F32, bv, 32, self.s.mxcsr),
+                M::Rcpps | M::Rcpss => (u64::from(fp::approximate(bv as u32, false)), 0),
+                M::Rsqrtps | M::Rsqrtss => (u64::from(fp::approximate(bv as u32, true)), 0),
+                M::Sqrtps | M::Sqrtpd | M::Sqrtsd | M::Sqrtss => {
                     fp::arithmetic(format, O::Sqrt, bv, 0, self.s.mxcsr)
                 }
                 _ => fp::arithmetic(
                     format,
                     match m {
                         M::Addpd | M::Addps | M::Addsd | M::Addss => O::Add,
-                        M::Subpd | M::Subsd | M::Subss => O::Sub,
-                        M::Mulpd | M::Mulsd | M::Mulss => O::Mul,
-                        M::Divpd | M::Divsd | M::Divss => O::Div,
-                        M::Minsd | M::Minss => O::Min,
-                        M::Maxsd | M::Maxss => O::Max,
+                        M::Subpd | M::Subps | M::Subsd | M::Subss => O::Sub,
+                        M::Mulpd | M::Mulps | M::Mulsd | M::Mulss => O::Mul,
+                        M::Divpd | M::Divps | M::Divsd | M::Divss => O::Div,
+                        M::Minpd | M::Minps | M::Minsd | M::Minss => O::Min,
+                        M::Maxpd | M::Maxps | M::Maxsd | M::Maxss => O::Max,
                         _ => return Err(Stop::Invalid),
                     },
                     av,
@@ -2066,7 +2187,19 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
                 return Ok(());
             }
         }
-        Mnemonic::Movaps | Mnemonic::Movdqa => x.sse_move(true)?,
+        Mnemonic::Movaps
+        | Mnemonic::Movdqa
+        | Mnemonic::Movntps
+        | Mnemonic::Movntpd
+        | Mnemonic::Movntdq => x.sse_move(true)?,
+        Mnemonic::Maskmovdqu => x.sse_masked_store()?,
+        // There is no cache to flush. It faults as a read of its byte does.
+        Mnemonic::Clflush => {
+            let Operand::Memory(m) = op(i, 0)? else {
+                return Err(Stop::Invalid);
+            };
+            x.mem.read(x.linear(&m), &mut [0])?;
+        }
         Mnemonic::Movups | Mnemonic::Movdqu => x.sse_move(false)?,
         Mnemonic::Pxor | Mnemonic::Xorps => x.sse_xor()?,
         Mnemonic::Movq => x.sse_movq()?,

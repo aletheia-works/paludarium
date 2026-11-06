@@ -72,6 +72,35 @@ fn fresh_native_differential() {
     });
 }
 
+/// RCP, RSQRT and MASKMOVDQU, which registers and fixed memory do not show:
+/// x86 bounds what RCP and RSQRT return and does not define it, so the guest
+/// prints that bound and their special values, not the values themselves.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn approximations_and_masked_store() {
+    support::bounded("approximations_and_masked_store", || {
+        let root = paludarium_harness::workspace_root();
+        let output = root.join("target/encodings-guests");
+        assert!(
+            std::process::Command::new("bash")
+                .arg(root.join("tests/guests/encodings/build.sh"))
+                .arg(&output)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let program = output.join("approximate");
+        let native = paludarium_harness::run_native(&program, "approximate", &[]).unwrap();
+        assert_eq!(native.status, paludarium::ExitStatus::Exited(0));
+        let (emulated, _) = paludarium_harness::run_emulated(&program, "approximate", &[]).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&emulated.stdout),
+            String::from_utf8_lossy(&native.stdout)
+        );
+        assert_eq!(emulated.status, native.status);
+    });
+}
+
 #[test]
 fn runner_bootstrap() {
     assert!(

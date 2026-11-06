@@ -1,5 +1,6 @@
 //! Integer IEEE-754 arithmetic with explicit SSE rounding and status bits.
 //! No host floating-point environment participates in guest execution.
+use std::cmp::Ordering;
 #[derive(Clone, Copy)]
 pub(crate) struct Format {
     pub fraction: u32,
@@ -327,6 +328,39 @@ fn compare_bits(f: Format, a: u64, b: u64) -> i8 {
     }
 }
 
+/// RCP and RSQRT: `reciprocal` or `root` of a single, as x86 defines them
+/// without saying which approximation. These are exact, so within its bound.
+/// A denormal counts as zero, nothing rounds by MXCSR, and no flag is set.
+pub(crate) fn approximate(value: u32, root: bool) -> u32 {
+    const SIGN: u32 = 1 << 31;
+    const INFINITY: u32 = 0x7f80_0000;
+    const ONE: u64 = 0x3f80_0000;
+    // Exceptions masked, to nearest, and neither DAZ nor FTZ.
+    const MXCSR: u32 = 0x1f80;
+    let sign = value & SIGN;
+    let magnitude = value & !SIGN;
+    if magnitude > INFINITY {
+        return value | (1 << 22);
+    }
+    if magnitude & INFINITY == 0 {
+        return sign | INFINITY;
+    }
+    if root && sign != 0 {
+        return F32.indefinite() as u32;
+    }
+    if magnitude == INFINITY {
+        return sign;
+    }
+    let input = u64::from(value);
+    let divisor = if root {
+        arithmetic(F32, Operation::Sqrt, input, 0, MXCSR).0
+    } else {
+        input
+    };
+    let result = arithmetic(F32, Operation::Div, ONE, divisor, MXCSR).0 as u32;
+    // A result too small to be normal is a zero of the input's sign.
+    if result & INFINITY == 0 { sign } else { result }
+}
 pub(crate) fn compare(f: Format, a: u64, b: u64, mxcsr: u32, signaling: bool) -> (Option<i8>, u32) {
     let (a, af) = f.input(a, mxcsr);
     let (b, bf) = f.input(b, mxcsr);
@@ -374,28 +408,45 @@ pub(crate) fn convert(from: Format, to: Format, value: u64, mxcsr: u32) -> (u64,
     let (value, rounding) = round(to, negative, magnitude, power, mxcsr);
     (value, flags | rounding)
 }
+/// CVTT: towards zero, whatever MXCSR's rounding control says.
 pub(crate) fn to_integer(f: Format, value: u64, width: u32, mxcsr: u32) -> (u64, u32) {
+    to_rounded_integer(f, value, width, mxcsr | (3 << 13))
+}
+/// CVT: by MXCSR's rounding control.
+pub(crate) fn to_rounded_integer(f: Format, value: u64, width: u32, mxcsr: u32) -> (u64, u32) {
     let (value, flags) = f.input(value, mxcsr);
-    // CVTT conversions signal precision for tiny fractions, not DE.
+    // CVT and CVTT conversions signal precision for tiny fractions, not DE.
     let flags = flags & !2;
     let indefinite = 1u64 << (width - 1);
     if f.nan(value) || value & !f.sign() == f.infinity() {
         return (indefinite, flags | 1);
     }
     let (negative, magnitude, power) = f.finite(value);
+    // What is left below the integer: its comparison with a half, if any.
     let (integer, fraction) = if power >= 0 {
         if power >= 128 || magnitude > (u128::MAX >> power) {
             return (indefinite, flags | 1);
         }
-        (magnitude << power, false)
+        (magnitude << power, None)
     } else {
         let shift = (-power) as u32;
         if shift >= 128 {
-            (0, magnitude != 0)
+            (0, (magnitude != 0).then_some(Ordering::Less))
         } else {
-            (magnitude >> shift, magnitude & ((1u128 << shift) - 1) != 0)
+            let rest = magnitude & ((1u128 << shift) - 1);
+            (
+                magnitude >> shift,
+                (rest != 0).then(|| rest.cmp(&(1u128 << (shift - 1)))),
+            )
         }
     };
+    let up = fraction.is_some_and(|half| match (mxcsr >> 13) & 3 {
+        0 => half == Ordering::Greater || (half == Ordering::Equal && integer & 1 != 0),
+        1 => negative,
+        2 => !negative,
+        _ => false,
+    });
+    let integer = integer + u128::from(up);
     let limit = 1u128 << (width - 1);
     if integer > limit || integer == limit && !negative {
         return (indefinite, flags | 1);
@@ -407,6 +458,6 @@ pub(crate) fn to_integer(f: Format, value: u64, width: u32, mxcsr: u32) -> (u64,
         } else {
             result
         },
-        flags | if fraction { 32 } else { 0 },
+        flags | if fraction.is_some() { 32 } else { 0 },
     )
 }

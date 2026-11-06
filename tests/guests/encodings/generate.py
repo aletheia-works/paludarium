@@ -151,8 +151,51 @@ names = [
     "unpcklps",
     "xorpd",
     "xorps",
+    "andnps",
+    "cmpeqpd",
+    "cmpeqps",
+    "cmplepd",
+    "cmpleps",
+    "cmpltpd",
+    "cmpltps",
+    "cmpneqpd",
+    "cmpneqps",
+    "cmpnlepd",
+    "cmpnleps",
+    "cmpnltpd",
+    "cmpnltps",
+    "cmpordpd",
+    "cmpordps",
+    "cmpunordpd",
+    "cmpunordps",
+    "cvtdq2pd",
+    "cvtpd2dq",
+    "cvtpd2ps",
+    "cvtps2dq",
+    "cvtps2pd",
+    "cvtsd2si",
+    "cvtss2si",
+    "cvttpd2dq",
+    "divps",
+    "maxpd",
+    "maxps",
+    "minpd",
+    "minps",
+    "mulps",
+    "paddsb",
+    "paddsw",
+    "paddusb",
+    "pavgb",
+    "pavgw",
+    "pmaxsw",
+    "pminsw",
+    "psubsb",
+    "psubsw",
+    "sqrtpd",
+    "subps",
+    "unpckhps",
 ]
-assert len(names) == 145
+assert len(names) == 188
 cases = []
 for name in names:
     insn = f"{name} xmm0, xmm1"
@@ -172,10 +215,10 @@ for name in names:
         insn = f"{name} xmm0, rax"
     elif name.endswith("fence"):
         insn = name
-    elif name in ("cvttsd2si", "cvttss2si"):
+    elif name in ("cvttsd2si", "cvttss2si", "cvtsd2si", "cvtss2si"):
         insn = f"{name} rax, xmm1"
     elif name.startswith("cmp"):
-        predicate = dict(eq=0, lt=1, neq=4, unord=3)[name[3:-2]]
+        predicate = dict(eq=0, lt=1, le=2, unord=3, neq=4, nlt=5, nle=6, ord=7)[name[3:-2]]
         insn = f"cmp{name[-2:]} xmm0, xmm1, {predicate}"
     elif name in ("pslldq", "psrldq"):
         insn = f"{name} xmm0, 3"
@@ -228,6 +271,14 @@ for name, insn in base_cases:
         for amount in [0, 15, 16, 31, 32, 63, 64, 255]:
             cases.append((name + f"_imm{amount}", f"{name} xmm0, {amount}"))
 cases.append(("stmxcsr", "stmxcsr [rdx+256]"))
+# Stores only, and the 32-bit forms of the conversions to integers.
+cases.extend((n + "_store", f"{n} [rdx+16], xmm0") for n in ["movntps", "movntpd", "movntdq"])
+cases.append(("movnti_store", "movnti [rdx+16], rax"))
+cases.append(("movnti_store_32", "movnti [rdx+16], eax"))
+cases.append(("clflush", "clflush [rdx+16]"))
+cases.extend(
+    (n + "_32", f"{n} eax, xmm1") for n in ["cvtsd2si", "cvtss2si", "cvttsd2si", "cvttss2si"]
+)
 assembly = [".intel_syntax noprefix", ".text"]
 declarations = []
 for i, (_name, insn) in enumerate(cases):

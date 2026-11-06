@@ -19,7 +19,12 @@ verified.
   reads the interpreter and the libraries from its own files, so they must be
   mounted or given to it.
 - **32-bit x86, AVX, AVX-512, MMX**: out of scope. `CPUID` reports MMX because
-  glibc requires it, but its instructions stop with `SIGILL`.
+  glibc requires it, but its instructions stop with `SIGILL`, as do the SSE and
+  SSE2 ones that use MMX registers (`CVTPI2PS`, `MOVQ2DQ`, `PSHUFW` and the like).
+- **The exact results of `RCPPS`, `RCPSS`, `RSQRTPS` and `RSQRTSS`**: x86 only
+  bounds their error (1.5 × 2⁻¹²), and each CPU answers from its own table. The
+  emulator returns the correctly rounded value, so the low bits can differ from
+  a real CPU's. The tests check that bound and the special values, not the bits.
 - **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
   so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used. A

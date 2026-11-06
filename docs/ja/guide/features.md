@@ -11,8 +11,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MOVBE`、`ENTER`／`LEAVE` など。
 - **ヒントの命令**：`PAUSE` と、プリフェッチの `PREFETCHNTA`／`PREFETCHT0`／`T1`／`T2`。
   状態を何も変えず、フォールトも起こしません。
-- **SSE 系**：実際のプログラム（probe、aube、pitchfork）が使う SSE 系の 145 の命令
-  （フェンスの `MFENCE`／`LFENCE`／`SFENCE` を含む）と、AES・PCLMUL・SHA などの暗号の命令。浮動小数点はソフトウェアで計算します。
+- **SSE 系**：MMX レジスタを使うものを除く SSE と SSE2 のすべての命令（エンコーディング
+  ごとにテストで動かしています。フェンスの `MFENCE`／`LFENCE`／`SFENCE` を含みます）。
+  それより後の命令セットは、実際のプログラム（probe、aube、pitchfork）が使う命令と、
+  AES・PCLMUL・SHA などの暗号の命令です。浮動小数点はソフトウェアで計算します。
 - 命令のデコードには [iced-x86](https://github.com/icedland/iced) を使っています。
 - `CPUID` はホストの値を見せません。glibc は知っているベンダーの機能しか読まないので、
   ベンダーには AMD を名乗ります。glibc が必須とするので、すべての x86-64 の CPU にある機能も

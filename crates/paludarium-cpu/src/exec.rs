@@ -1836,6 +1836,10 @@ impl Exec<'_> {
 
 /// Executes `i` on `s`. On success `s.rip` points at the next instruction to
 /// run. On any [`Stop`] other than `Syscall`, `s.rip` is left at `i`.
+// Every instruction comes through here from `execute_decoded`, its only caller
+// outside the tests. It has grown past what the compiler inlines by itself, and
+// the call costs a guest about 4% in the wasm build.
+#[inline(always)]
 pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> Result<()> {
     let next = i.next_rip();
     let mut x = Exec { s, mem, i };

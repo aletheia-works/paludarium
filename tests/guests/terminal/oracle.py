@@ -20,13 +20,15 @@ def run(directory, case):
             master, slave = pty.openpty()
             cc = [b"\0"] * termios.NCCS
             cc[termios.VMIN] = 1
+            # c_cflag is CS8 | CREAD | the code of 38400 baud. Spelled out because
+            # termios.B38400 is the speed itself on Ubuntu 26.04, not that code.
             termios.tcsetattr(
                 slave,
                 termios.TCSANOW,
                 [
                     0,
                     0,
-                    termios.CS8 | termios.CREAD | termios.B38400,
+                    0xBF,
                     0,
                     termios.B38400,
                     termios.B38400,

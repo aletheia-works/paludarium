@@ -320,7 +320,16 @@ fn compare_bits(f: Format, a: u64, b: u64) -> i8 {
     if a & !f.sign() == 0 && b & !f.sign() == 0 {
         return 0;
     }
-    let key = |v: u64| if v & f.sign() != 0 { !v } else { v | f.sign() };
+    // Within the format's own width: a single's negatives must not get the
+    // upper half of `!v`.
+    let width = f.sign() | (f.sign() - 1);
+    let key = |v: u64| {
+        if v & f.sign() != 0 {
+            !v & width
+        } else {
+            v | f.sign()
+        }
+    };
     match key(a).cmp(&key(b)) {
         core::cmp::Ordering::Less => -1,
         core::cmp::Ordering::Equal => 0,

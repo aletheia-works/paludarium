@@ -993,3 +993,19 @@ fn masked_store_wraps_in_its_address_size() {
         .unwrap();
     assert_eq!(first, [0x11]);
 }
+
+#[test]
+fn singles_of_either_sign_compare_by_value() {
+    use crate::softfloat::{F32, F64, compare};
+    const MXCSR: u32 = 0x1f80;
+    let one = 0x3f80_0000;
+    let minus_one = 0xbf80_0000;
+    let minus_two = 0xc000_0000;
+    assert_eq!(compare(F32, minus_one, one, MXCSR, false).0, Some(-1));
+    assert_eq!(compare(F32, one, minus_one, MXCSR, false).0, Some(1));
+    assert_eq!(compare(F32, minus_two, minus_one, MXCSR, false).0, Some(-1));
+    assert_eq!(compare(F32, 0x8000_0000, 0, MXCSR, false).0, Some(0));
+    let one = 0x3ff0_0000_0000_0000;
+    let minus_one = 0xbff0_0000_0000_0000;
+    assert_eq!(compare(F64, minus_one, one, MXCSR, false).0, Some(-1));
+}

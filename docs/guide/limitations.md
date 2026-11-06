@@ -26,6 +26,10 @@ verified.
   emulator computes them by floating-point division (after a square root for
   `RSQRT`), so the low bits can differ from a real CPU's. The tests check that
   bound and the special values, not the bits.
+- **`MASKMOVDQU` with an empty mask on memory it cannot reach**: the emulator
+  makes no access, and a real CPU may fault (an AMD EPYC does, and exits with
+  `SIGSEGV`). A fault on a later byte also leaves the earlier ones written, which
+  has not been compared with a real CPU.
 - **`/proc/self/maps`, in part**: the emulator has no vDSO or `vsyscall` page,
   so the `[vvar]`, `[vdso]` and `[vsyscall]` lines are not there. The stack's
   VMA has its full size from the start, where Linux's grows as it is used. A

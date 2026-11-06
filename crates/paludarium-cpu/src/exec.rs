@@ -1146,7 +1146,8 @@ impl Exec<'_> {
     }
 
     /// MASKMOVDQU: the bytes whose mask byte has its top bit set go to the
-    /// implicit `[rdi]`, in order. No mask bit, no access at all.
+    /// implicit `[rdi]`, in order. With no mask bit this makes no access, where
+    /// a CPU may still fault: AMD EPYC does on a page it cannot reach.
     fn sse_masked_store(&mut self) -> Result<()> {
         let Operand::Memory(target) = op(self.i, 0)? else {
             return Err(Stop::Invalid);

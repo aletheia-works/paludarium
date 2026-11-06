@@ -2,7 +2,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <emmintrin.h>
 #include <xmmintrin.h>
 
@@ -74,7 +73,9 @@ int main(void) {
     _mm_storeu_ps(out, kept);
     printf("rcpss memory %08x %08x %08x %08x\n", bits(out[0]), bits(out[1]), bits(out[2]), bits(out[3]));
 
-    /* MASKMOVDQU writes the selected bytes, and with no mask reaches nothing. */
+    /* MASKMOVDQU writes the selected bytes, and with no mask none. Whether no
+       mask can still fault on memory it cannot reach is each CPU's choice: this
+       AMD's does. */
     unsigned char target[32];
     memset(target, 0xee, sizeof target);
     __m128i data = _mm_set_epi8(16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1);
@@ -82,8 +83,8 @@ int main(void) {
     _mm_maskmoveu_si128(data, mask, (char *)target + 5);
     for (unsigned i = 0; i < sizeof target; i++) printf("%02x", target[i]);
     putchar('\n');
-    char *none = mmap(0, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    _mm_maskmoveu_si128(data, _mm_setzero_si128(), none);
-    puts("no mask, no fault");
+    _mm_maskmoveu_si128(data, _mm_setzero_si128(), (char *)target);
+    for (unsigned i = 0; i < sizeof target; i++) printf("%02x", target[i]);
+    putchar('\n');
     return 0;
 }

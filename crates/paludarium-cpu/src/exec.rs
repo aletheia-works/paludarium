@@ -1152,12 +1152,20 @@ impl Exec<'_> {
             return Err(Stop::Invalid);
         };
         let address = self.linear(&target).0;
+        // With `0x67` the offsets wrap in 32 bits, as the effective address does.
+        let wrap = if target.address_size_32 {
+            u64::from(u32::MAX)
+        } else {
+            u64::MAX
+        };
         let data = self.read128(op(self.i, 1)?, false)?.to_le_bytes();
         let mask = self.read128(op(self.i, 2)?, false)?.to_le_bytes();
         for n in 0..16 {
             if mask[n] & 0x80 != 0 {
-                self.mem
-                    .write(GuestAddr(address.wrapping_add(n as u64)), &data[n..=n])?;
+                self.mem.write(
+                    GuestAddr(address.wrapping_add(n as u64) & wrap),
+                    &data[n..=n],
+                )?;
             }
         }
         Ok(())

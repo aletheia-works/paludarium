@@ -965,3 +965,31 @@ fn approximations_are_within_their_bound() {
         }
     }
 }
+
+#[test]
+fn masked_store_wraps_in_its_address_size() {
+    // addr32 maskmovdqu xmm0, xmm1, with edi at the last byte of 4 GiB.
+    let (mut state, mut memory) = public_machine(&[0x67, 0x66, 0x0f, 0xf7, 0xc1]);
+    let high = paludarium_types::GuestAddr(0xffff_f000);
+    memory
+        .map(
+            Some(high),
+            4096,
+            paludarium_mmu::Prot::from_bits(7).unwrap(),
+            paludarium_mmu::MappingKind::Anonymous,
+        )
+        .unwrap();
+    state.gpr[crate::state::reg::RDI] = 0xffff_ffff;
+    state.xmm[0] = 0x2211;
+    state.xmm[1] = 0x8080;
+    // The second byte wraps to address 0, unmapped: not to the page at 4 GiB.
+    assert!(matches!(
+        super::step(&mut state, &memory),
+        Err(paludarium_types::ExitReason::PageFault { addr, .. }) if addr.0 == 0
+    ));
+    let mut first = [0];
+    memory
+        .read(paludarium_types::GuestAddr(0xffff_ffff), &mut first)
+        .unwrap();
+    assert_eq!(first, [0x11]);
+}

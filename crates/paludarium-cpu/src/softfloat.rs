@@ -328,9 +328,10 @@ fn compare_bits(f: Format, a: u64, b: u64) -> i8 {
     }
 }
 
-/// RCP and RSQRT: `reciprocal` or `root` of a single, as x86 defines them
-/// without saying which approximation. These are exact, so within its bound.
-/// A denormal counts as zero, nothing rounds by MXCSR, and no flag is set.
+/// RCP and RSQRT of a single, as x86 defines them without saying which
+/// approximation: computed by this module's division, and for RSQRT its root
+/// first, so far within x86's bound. A denormal counts as zero, nothing rounds
+/// by MXCSR, and no flag is set.
 pub(crate) fn approximate(value: u32, root: bool) -> u32 {
     const SIGN: u32 = 1 << 31;
     const INFINITY: u32 = 0x7f80_0000;

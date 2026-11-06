@@ -49,8 +49,6 @@ int main(void) {
         0, 0x80000000u, 0x7f800000u, 0xff800000u, /* zeros, infinities */
         1, 0x80000001u, 0x007fffffu, 0x807fffffu, /* denormals */
         0x7fc00042u, 0xffc00042u, 0x7f800042u, 0xff800042u, /* NaNs */
-        0x7f7fffffu, 0xff7fffffu, /* too large to have a normal reciprocal */
-        0xbf800000u, /* a root of a negative */
     };
     unsigned before = _mm_getcsr();
     for (unsigned i = 0; i < sizeof special / sizeof special[0]; i++) {
@@ -58,6 +56,15 @@ int main(void) {
         printf("%08x rcp %08x rsqrt %08x\n", special[i], bits(_mm_cvtss_f32(_mm_rcp_ps(x))),
                bits(_mm_cvtss_f32(_mm_rsqrt_ps(x))));
     }
+    /* Where only one of the two is defined: the other is an ordinary value. */
+    float largest = value(0x7f7fffffu), other[4];
+    _mm_storeu_ps(other, _mm_rsqrt_ps(_mm_set1_ps(largest)));
+    printf("largest rcp %08x -largest rcp %08x rsqrt in bound %d\n",
+           bits(_mm_cvtss_f32(_mm_rcp_ps(_mm_set1_ps(largest)))),
+           bits(_mm_cvtss_f32(_mm_rcp_ps(_mm_set1_ps(-largest)))),
+           close_enough(other[0], 1.0 / root_of(largest)));
+    printf("-largest rsqrt %08x -1 rsqrt %08x\n", bits(_mm_cvtss_f32(_mm_rsqrt_ps(_mm_set1_ps(-largest)))),
+           bits(_mm_cvtss_f32(_mm_rsqrt_ps(_mm_set1_ps(-1.0f)))));
     printf("mxcsr unchanged %d\n", _mm_getcsr() == before);
 
     /* The scalar forms keep the upper lanes, from registers and from memory. */

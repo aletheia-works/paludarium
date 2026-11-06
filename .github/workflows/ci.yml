@@ -209,7 +209,8 @@ jobs:
     name: differential tests (x86-64 Linux)
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    # The native results are this kernel's (docs/design/quality.md).
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -260,7 +261,8 @@ jobs:
     name: line coverage >= 80%
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    # The native results are this kernel's (docs/design/quality.md).
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       PALUDARIUM_ENCODINGS_FULL_REPLAY: '1'

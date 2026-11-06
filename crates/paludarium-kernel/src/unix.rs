@@ -451,7 +451,7 @@ impl UnixSocket {
         Err(Errno::ENOSPC)
     }
     /// `listen(backlog)`, as Linux's `unix_listen`: a socket with no name
-    /// is `EINVAL`, a connected one is left as it is, and a listener takes
+    /// or a connected one is `EINVAL`, and a listener takes
     /// the new backlog, at most `somaxconn` (a negative one too), and the
     /// caller's credentials, which its clients' `SO_PEERCRED` then names
     /// (`init_peercred`).
@@ -461,7 +461,7 @@ impl UnixSocket {
             return Err(Errno::EINVAL);
         }
         if s.peer.is_some() {
-            return Ok(());
+            return Err(Errno::EINVAL);
         }
         let backlog = usize::try_from(backlog).map_or(SOMAXCONN, |b| b.min(SOMAXCONN));
         match s.listen.as_mut() {

@@ -169,8 +169,8 @@ kernel.
   accepts, or connects to a listener of its type, as Linux's `af_unix.c`
   does: `EADDRINUSE` for a name in use, `ECONNREFUSED` where none listens,
   `EAGAIN` for a nonblocking connect to a full queue (a blocking one waits,
-  at most `SO_SNDTIMEO`), `EINVAL` to `listen` with no name and to
-  `accept` unless listening, `EISCONN` to connect again. Unconnected, it
+  at most `SO_SNDTIMEO`), `EINVAL` to `listen` with no name or once
+  connected and to `accept` unless listening, `EISCONN` to connect again. Unconnected, it
   is writable and hung up to `poll` and sends nothing (`ENOTCONN`); a
   listener is readable while a connection waits, and shows
   `SO_ACCEPTCONN`. `getsockname` and `getpeername` give the names, and an

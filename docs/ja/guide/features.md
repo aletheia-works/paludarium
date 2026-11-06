@@ -153,7 +153,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `bind` し、ファミリーだけなら空いている 5 桁の 16 進の名前に `bind` し、待ち受けて
   受け付け、または同じ種類の待ち受けへ接続します。使われている名前は `EADDRINUSE`、
   待ち受けがなければ `ECONNREFUSED`、いっぱいの列へのノンブロッキングの接続は
-  `EAGAIN`（ブロッキングなら `SO_SNDTIMEO` まで待ちます）、名前のない `listen` と、
+  `EAGAIN`（ブロッキングなら `SO_SNDTIMEO` まで待ちます）、名前のない、または接続済みのソケットの `listen` と、
   待ち受けていない `accept` は `EINVAL`、もう一度の接続は `EISCONN` です。接続する前は、
   `poll` には書けて切れているように見え、何も送りません（`ENOTCONN`）。待ち受けは、
   接続が待っている間は読めて、`SO_ACCEPTCONN` を示します。`getsockname` と

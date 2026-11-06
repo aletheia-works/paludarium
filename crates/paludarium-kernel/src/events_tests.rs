@@ -819,6 +819,11 @@ fn unix_sockets_bind_listen_accept_and_connect() {
     let server = f.ret(43, [listener, 0, 0, 0, 0, 0]);
     assert!((server as i64) >= 0);
     assert_eq!(f.ret(0, [server, DATA + 8, 8, 0, 0, 0]), 2);
+    // Connected, the accepted socket cannot listen, though it has a name.
+    assert_eq!(
+        f.ret(50, [server, 1, 0, 0, 0, 0]),
+        Errno::EINVAL.to_syscall_return()
+    );
     // The accepted socket has the listener's name; the client has none.
     f.mem
         .write(GuestAddr(DATA + 0x80), &16u32.to_le_bytes())

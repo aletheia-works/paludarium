@@ -6856,6 +6856,15 @@ int main(int argc, char **argv) {
             bind(listener, (void *)&l, llen);
             if (type != SOCK_DGRAM) {
                 unix_call("listen-bound", listen(sv[0], 1));
+                /* It stays connected in Linux's eyes once its peer has gone. */
+                int gone[2];
+                if (socketpair(AF_UNIX, type, 0, gone)) return 80;
+                struct sockaddr_un named;
+                socklen_t named_len = unix_abstract(&named, "pair-gone");
+                bind(gone[0], (void *)&named, named_len);
+                close(gone[1]);
+                unix_call("listen-peer-gone", listen(gone[0], 1));
+                close(gone[0]);
                 listen(listener, 1);
                 unix_call("connect-listener", connect(sv[1], (void *)&l, llen));
                 unix_call("send-still", send(sv[1], "ef", 2, 0));

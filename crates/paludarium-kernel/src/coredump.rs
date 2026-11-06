@@ -48,6 +48,9 @@ pub(crate) struct Dump {
     /// The `clear_child_tid` words of the threads that have ended, which
     /// Linux clears only after the dump.
     pub clear_tids: Vec<u64>,
+    /// The robust lists of those threads, with their IDs, which Linux walks
+    /// only after the dump too.
+    pub robust_lists: Vec<(u32, u64)>,
 }
 
 /// The process's identity and times, in `NT_PRSTATUS` and `NT_PRPSINFO`.

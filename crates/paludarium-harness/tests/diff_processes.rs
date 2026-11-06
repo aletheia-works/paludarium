@@ -276,6 +276,8 @@ mod linux {
         processes_cpu_state => ("cpu-state","process"),
         processes_x87 => ("x87","process"),
         processes_x87_arithmetic => ("x87-arithmetic","process"),
+        processes_robust_list => ("robust-list","process"),
+        processes_mincore => ("mincore","process"),
         processes_proc_maps => ("proc-maps","process"),
         processes_time_calls => ("time-calls","process"),
         processes_dynamic => ("dynamic","dynamic"),

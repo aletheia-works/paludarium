@@ -54,6 +54,8 @@
     {"name":"dynamic-exec","binary":"process"},
     {"name":"x87","binary":"process"},
     {"name":"x87-arithmetic","binary":"process"},
+    {"name":"robust-list","binary":"process"},
+    {"name":"mincore","binary":"process"},
     {"name":"proc-maps","binary":"process"},
     {"name":"script-exec","binary":"process"},
     {"name":"capabilities","binary":"process"},

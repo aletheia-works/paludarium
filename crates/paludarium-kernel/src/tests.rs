@@ -983,6 +983,71 @@ fn proc_fd_links_open_again_or_refuse() {
     assert_eq!(f.ret(2, &[path, 0]), errno(Errno::ENOENT));
 }
 #[test]
+fn set_and_get_robust_list_check_their_arguments() {
+    let mut f = fixture();
+    let (head, length) = (DATA, DATA + 8);
+    assert_eq!(
+        f.ret(nr::SET_ROBUST_LIST, &[DATA + 0x100, 23]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(nr::SET_ROBUST_LIST, &[DATA + 0x100, 24]), 0);
+    assert_eq!(f.ret(nr::GET_ROBUST_LIST, &[0, head, length]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(head)), Ok(DATA + 0x100));
+    assert_eq!(f.mem.read_u64(GuestAddr(length)), Ok(24));
+    assert_eq!(
+        f.ret(nr::GET_ROBUST_LIST, &[99_999, head, length]),
+        errno(Errno(3))
+    );
+    assert_eq!(
+        f.ret(nr::GET_ROBUST_LIST, &[0, 0, length]),
+        errno(Errno::EFAULT)
+    );
+    assert_eq!(
+        f.ret(nr::GET_ROBUST_LIST, &[0, head, 0]),
+        errno(Errno::EFAULT)
+    );
+}
+#[test]
+fn mincore_reports_what_was_touched_up_to_what_is_not_mapped() {
+    let mut f = fixture();
+    let (vec, page) = (DATA + 0x800, 4096);
+    let base = f.ret(nr::MMAP, &[0, 3 * page, 3, 0x22, u64::MAX, 0]);
+    f.mem.write_u64(GuestAddr(base + page), 1).unwrap();
+    f.mem.write(GuestAddr(vec), &[9; 4]).unwrap();
+    assert_eq!(f.ret(nr::MINCORE, &[base, 3 * page, vec]), 0);
+    let mut seen = [9; 4];
+    f.mem.read(GuestAddr(vec), &mut seen).unwrap();
+    assert_eq!(seen, [0, 1, 0, 9]);
+    // Reading a page brings it in too, and a length rounds up.
+    f.mem.read_u64(GuestAddr(base)).unwrap();
+    assert_eq!(f.ret(nr::MINCORE, &[base, 1, vec]), 0);
+    f.mem.read(GuestAddr(vec), &mut seen).unwrap();
+    assert_eq!(seen[0], 1);
+    assert_eq!(f.ret(nr::MADVISE, &[base, page, 4]), 0);
+    assert_eq!(f.ret(nr::MINCORE, &[base, page, vec]), 0);
+    f.mem.read(GuestAddr(vec), &mut seen).unwrap();
+    assert_eq!(seen[0], 0);
+    assert_eq!(
+        f.ret(nr::MINCORE, &[base + 1, page, vec]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(nr::MINCORE, &[base, 0, 0]), 0);
+    assert_eq!(f.ret(nr::MINCORE, &[base, page, 0]), errno(Errno::EFAULT));
+    assert_eq!(
+        f.ret(nr::MINCORE, &[base, u64::MAX, vec]),
+        errno(Errno::ENOMEM)
+    );
+    // What is before the gap is written, then the gap is ENOMEM.
+    assert_eq!(f.ret(nr::MUNMAP, &[base + 2 * page, page]), 0);
+    f.mem.write(GuestAddr(vec), &[9; 4]).unwrap();
+    assert_eq!(
+        f.ret(nr::MINCORE, &[base, 3 * page, vec]),
+        errno(Errno::ENOMEM)
+    );
+    f.mem.read(GuestAddr(vec), &mut seen).unwrap();
+    assert_eq!(seen, [0, 1, 9, 9]);
+}
+#[test]
 fn proc_maps_reads_through_the_system_calls_though_its_size_is_zero() {
     let mut f = fixture();
     let (path, buf, stat) = (DATA, DATA + 0x400, DATA + 0xe00);

@@ -2035,6 +2035,11 @@ impl Kernel {
                 &self.cancellation,
             )?;
         }
+        // Linux walks the robust list on the old image's memory
+        // (`futex_exec_release`), and the new program has none.
+        if let Some(head) = self.group.take_robust_list(thread.tid) {
+            crate::futex::exit_robust_list(&self.group.futexes, mem, thread.tid, head);
+        }
         self.group
             .end_exec(thread.tid, self.process.pid, Arc::clone(&self.inbox));
         // The thread is now the leader, which the process entry counts.

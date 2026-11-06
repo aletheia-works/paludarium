@@ -2748,6 +2748,282 @@ static int maps_cases(const char *self) {
     return 120;
 }
 
+/* Robust futexes (kernel/futex/core.c): a list in guest memory, which Linux
+   walks when its thread ends or calls execve. */
+struct robust_list_for_test {
+    void *next;
+    long futex_offset;
+    void *pending;
+};
+#define ROBUST_DIED 0x40000000u
+#define ROBUST_WAITERS 0x80000000u
+#define ROBUST_TID 0x3fffffffu
+
+/* The list of `count` entries from `base`, each 16 bytes with its word at 8. */
+static struct robust_list_for_test *robust_build(char *base, int count, void *pending) {
+    struct robust_list_for_test *head = (void *)base;
+    head->futex_offset = 8;
+    head->pending = pending;
+    void **link = &head->next;
+    for (int i = 0; i < count; i++) {
+        char *entry = base + 64 + 16 * i;
+        *link = entry;
+        link = (void **)entry;
+    }
+    *link = head;
+    return head;
+}
+static unsigned *robust_word(char *base, int i) { return (unsigned *)(base + 64 + 16 * i + 8); }
+static void robust_show(const char *label, unsigned word, unsigned tid) {
+    printf("%s: died=%d waiters=%d tid-kept=%d low-zero=%d\n", label, !!(word & ROBUST_DIED),
+           !!(word & ROBUST_WAITERS), (word & ROBUST_TID) == tid, (word & ROBUST_TID) == 0);
+}
+
+struct robust_thread {
+    char *base;
+    int ready, go;
+    unsigned tid;
+};
+static void *robust_thread(void *argument) {
+    struct robust_thread *t = argument;
+    t->tid = (unsigned)syscall(SYS_gettid);
+    char *base = t->base;
+    *robust_word(base, 0) = t->tid;
+    *robust_word(base, 1) = t->tid | ROBUST_WAITERS;
+    *robust_word(base, 2) = t->tid + 1;
+    *robust_word(base, 3) = t->tid;
+    *robust_word(base, 4) = 0;
+    void *head = robust_build(base, 3, base + 64 + 16 * 3);
+    syscall(SYS_set_robust_list, head, sizeof(struct robust_list_for_test));
+    char byte = 0;
+    if (write(t->ready, &byte, 1) != 1 || read(t->go, &byte, 1) != 1) return NULL;
+    return NULL;
+}
+
+static int robust_list_cases(const char *self) {
+    long page = 4096;
+    char *base = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 80;
+
+    /* The calls. */
+    errno = 0;
+    long r = syscall(SYS_set_robust_list, base, 23L);
+    printf("set-short=%ld errno=%d\n", r, errno);
+    void *got = base;
+    size_t length = 0;
+    r = syscall(SYS_get_robust_list, 0, &got, &length);
+    printf("get-first=%ld head-is-null-or-libcs=%d length=%zu\n", r, got != base, length);
+    void *saved = got;
+    r = syscall(SYS_set_robust_list, base + 64, 24L);
+    printf("set=%ld\n", r);
+    r = syscall(SYS_get_robust_list, 0, &got, &length);
+    printf("get=%ld same=%d length=%zu\n", r, got == base + 64, length);
+    r = syscall(SYS_get_robust_list, (long)getpid(), &got, &length);
+    printf("get-by-tid=%ld same=%d\n", r, got == base + 64);
+    errno = 0;
+    r = syscall(SYS_get_robust_list, 0x3ffffff0L, &got, &length);
+    printf("get-missing=%ld errno=%d\n", r, errno);
+    errno = 0;
+    r = syscall(SYS_get_robust_list, 0, NULL, &length);
+    printf("get-bad-head=%ld errno=%d\n", r, errno);
+    errno = 0;
+    r = syscall(SYS_get_robust_list, 0, &got, NULL);
+    printf("get-bad-length=%ld errno=%d\n", r, errno);
+
+    /* A thread starts with none, whatever its creator has. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 81;
+    if (!child) {
+        r = syscall(SYS_get_robust_list, 0, &got, &length);
+        printf("forked=%ld none=%d\n", r, got == NULL);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    syscall(SYS_set_robust_list, saved, 24L);
+
+    /* A thread that ends: its own words are marked, also with waiters and the
+       pending one, and not another's or one at zero. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 82;
+    struct robust_thread t = {base, ready[1], go[0], 0};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, robust_thread, &t)) return 83;
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 84;
+    r = syscall(SYS_get_robust_list, (long)t.tid, &got, &length);
+    printf("get-of-sibling=%ld same=%d\n", r, got == base);
+    /* It wakes a shared waiter on a word with FUTEX_WAITERS. */
+    if (write(go[1], &byte, 1) != 1) return 85;
+    struct timespec limit = {10, 0};
+    unsigned expected = t.tid | ROBUST_WAITERS;
+    errno = 0;
+    r = syscall(SYS_futex, robust_word(base, 1), 0 /* FUTEX_WAIT */, expected, &limit);
+    printf("woken=%d\n", r == 0 || errno == EAGAIN);
+    if (pthread_join(thread, NULL)) return 86;
+    robust_show("owned", *robust_word(base, 0), t.tid);
+    robust_show("waiters", *robust_word(base, 1), t.tid);
+    printf("other-untouched=%d\n", *robust_word(base, 2) == t.tid + 1);
+    robust_show("pending", *robust_word(base, 3), t.tid);
+    printf("zero-untouched=%d\n", *robust_word(base, 4) == 0);
+
+    /* A process: its list goes when it ends, by exit or by a signal. */
+    for (int how = 0; how < 2; how++) {
+        memset(base, 0, (size_t)page);
+        fflush(stdout);
+        child = fork();
+        if (child < 0) return 87;
+        if (!child) {
+            unsigned tid = (unsigned)getpid();
+            *robust_word(base, 0) = tid;
+            syscall(SYS_set_robust_list, robust_build(base, 1, NULL), 24L);
+            if (how) raise(SIGKILL);
+            _exit(0);
+        }
+        waitpid(child, &status, 0);
+        robust_show(how ? "killed" : "exited", *robust_word(base, 0), (unsigned)child);
+    }
+
+    /* A misaligned word ends the walk, and so does an entry not mapped. */
+    memset(base, 0, (size_t)page);
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 88;
+    if (!child) {
+        unsigned tid = (unsigned)getpid();
+        *robust_word(base, 1) = tid;
+        struct robust_list_for_test *head = robust_build(base, 2, NULL);
+        head->futex_offset = 9;
+        syscall(SYS_set_robust_list, head, 24L);
+        _exit(0);
+    }
+    waitpid(child, &status, 0);
+    robust_show("after-misaligned", *robust_word(base, 1), (unsigned)child);
+    memset(base, 0, (size_t)page);
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 89;
+    if (!child) {
+        unsigned tid = (unsigned)getpid();
+        *robust_word(base, 0) = tid;
+        *(void **)(base + 64) = (void *)16;
+        struct robust_list_for_test *head = (void *)base;
+        head->next = base + 64;
+        head->futex_offset = 8;
+        syscall(SYS_set_robust_list, head, 24L);
+        _exit(0);
+    }
+    waitpid(child, &status, 0);
+    robust_show("before-unmapped", *robust_word(base, 0), (unsigned)child);
+
+    /* execve walks it on the old image, and the new program has none. */
+    memset(base, 0, (size_t)page);
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 90;
+    if (!child) {
+        unsigned tid = (unsigned)getpid();
+        *robust_word(base, 0) = tid;
+        syscall(SYS_set_robust_list, robust_build(base, 1, NULL), 24L);
+        char *arguments[] = {(char *)self, "robust-list-after-exec", (char *)self, NULL};
+        execv(self, arguments);
+        _exit(91);
+    }
+    waitpid(child, &status, 0);
+    printf("exec status=%d\n", status);
+    robust_show("exec", *robust_word(base, 0), (unsigned)child);
+    munmap(base, (size_t)page);
+    return 0;
+}
+
+static int mincore_show(const char *label, void *at, size_t length, size_t pages) {
+    unsigned char vec[16];
+    memset(vec, 7, sizeof vec);
+    errno = 0;
+    int r = mincore(at, length, vec);
+    printf("%s: r=%d errno=%d", label, r, errno);
+    for (size_t i = 0; i < pages; i++) printf(" %d", vec[i]);
+    printf("\n");
+    return r;
+}
+
+static int mincore_cases(void) {
+    long page = 4096;
+    /* Each mapping lies between PROT_NONE pages, not to merge or grow into a
+       huge page. */
+    char *base = mmap(NULL, 64 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 80;
+    int flags = MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS;
+    char *a = mmap(base + 2 * page, 4 * page, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (a == MAP_FAILED) return 81;
+    mincore_show("untouched", a, (size_t)(4 * page), 5);
+    a[page] = 1;
+    mincore_show("written", a, (size_t)(4 * page), 5);
+    volatile char seen = a[2 * page];
+    (void)seen;
+    mincore_show("read", a, (size_t)(4 * page), 5);
+    mincore_show("short-length", a + page, 1, 2);
+    mincore_show("no-length", a, 0, 1);
+    mincore_show("no-access", base, (size_t)page, 1);
+    madvise(a + page, (size_t)page, MADV_DONTNEED);
+    mincore_show("dontneed", a, (size_t)(4 * page), 5);
+    mprotect(a + 2 * page, (size_t)page, PROT_READ);
+    mincore_show("protected", a, (size_t)(4 * page), 5);
+
+    /* Errors. */
+    mincore_show("misaligned", a + 1, (size_t)page, 1);
+    errno = 0;
+    int bad = mincore(a, (size_t)page, (unsigned char *)16);
+    printf("bad-vec=%d errno=%d\n", bad, errno);
+    errno = 0;
+    bad = mincore(a, 0, (unsigned char *)16);
+    printf("no-length-bad-vec=%d errno=%d\n", bad, errno);
+    mincore_show("huge", a, (size_t)-4096, 1);
+    /* A gap: what is before it is written. */
+    a[0] = 1;
+    munmap(a + 2 * page, (size_t)page);
+    mincore_show("gap", a, (size_t)(4 * page), 5);
+    mincore_show("unmapped", a + 2 * page, (size_t)page, 1);
+
+    /* A fork keeps what is in memory. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 82;
+    if (!child) {
+        mincore_show("forked", a, (size_t)(2 * page), 3);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+
+    /* Shared anonymous memory. */
+    char *s = mmap(base + 10 * page, 3 * page, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (s == MAP_FAILED) return 83;
+    mincore_show("shared-untouched", s, (size_t)(3 * page), 4);
+    s[page] = 1;
+    mincore_show("shared-written", s, (size_t)(3 * page), 4);
+
+    /* A file that was written, whose pages are in the page cache, and past its
+       end, where there are none. */
+    char dir[] = "/tmp/mincore-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 84;
+    int fd = open("data", O_CREAT | O_RDWR, 0644);
+    char fill[2 * 4096];
+    memset(fill, 'x', sizeof fill);
+    if (fd < 0 || write(fd, fill, sizeof fill) != (long)sizeof fill) return 85;
+    char *f = mmap(base + 20 * page, 3 * page, PROT_READ, MAP_FIXED | MAP_PRIVATE, fd, 0);
+    if (f == MAP_FAILED) return 86;
+    mincore_show("file", f, (size_t)(3 * page), 4);
+    close(fd);
+    unlink("data");
+    if (chdir("/") || rmdir(dir)) return 87;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
@@ -10584,6 +10860,15 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "proc-maps")) return maps_cases(argv[2]);
     if (!strcmp(mode, "proc-maps-after-exec")) return maps_after_exec(argv[2]);
+    if (!strcmp(mode, "robust-list")) return robust_list_cases(self);
+    if (!strcmp(mode, "robust-list-after-exec")) {
+        void *head = (void *)1;
+        size_t length = 0;
+        long r = syscall(SYS_get_robust_list, 0, &head, &length);
+        /* Its libc may have set one up; the case's own is gone either way. */
+        return r == 0 && length == 24 ? 0 : 1;
+    }
+    if (!strcmp(mode, "mincore")) return mincore_cases();
     if (!strcmp(mode, "x87-arithmetic")) {
         x87_arithmetic_cases();
         return 0;

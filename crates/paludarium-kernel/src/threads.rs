@@ -51,6 +51,8 @@ pub struct ThreadGroup {
     /// The initial stack pointer of the running program (argc, argv, envp
     /// and the auxiliary vector), for a core dump.
     start_stack: AtomicU64,
+    /// The head `set_robust_list` gave each thread that called it.
+    robust_lists: Mutex<BTreeMap<u32, u64>>,
 }
 impl Default for ThreadGroup {
     fn default() -> Self {
@@ -74,10 +76,45 @@ impl Default for ThreadGroup {
             cpu: Mutex::default(),
             core: Mutex::default(),
             start_stack: AtomicU64::new(0),
+            robust_lists: Mutex::default(),
         }
     }
 }
 impl ThreadGroup {
+    /// Keeps the robust list head of `tid`.
+    pub(crate) fn set_robust_list(&self, tid: u32, head: u64) {
+        self.robust_lists
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, head);
+    }
+    /// The robust list head of `tid`, 0 if it has none, or `None` if no such
+    /// thread is in this group.
+    pub(crate) fn robust_list(&self, tid: u32) -> Option<u64> {
+        if !self
+            .members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&tid)
+        {
+            return None;
+        }
+        Some(
+            self.robust_lists
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&tid)
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+    /// Takes the robust list head of `tid`, as it ends or calls `execve`.
+    pub(crate) fn take_robust_list(&self, tid: u32) -> Option<u64> {
+        self.robust_lists
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tid)
+    }
     pub(crate) fn retired(&self, tid: u32) -> bool {
         self.retired
             .lock()
@@ -615,6 +652,7 @@ impl Kernel {
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
         self.files.release_descriptors();
         let addr = thread.state.clear_child_tid;
+        let robust = self.group.take_robust_list(thread.tid);
         // While a core dump is under way, a thread leaves its state for it
         // and its clear_child_tid word stays until the core is written, as
         // Linux dumps before the threads exit.
@@ -635,10 +673,16 @@ impl Kernel {
                 blocked: thread.state.signal_mask,
                 name: thread.state.name,
             });
+            if let Some(head) = robust {
+                dump.robust_lists.push((thread.tid, head));
+            }
             if addr != 0 {
                 dump.clear_tids.push(addr);
             }
         } else {
+            if let Some(head) = robust {
+                crate::futex::exit_robust_list(&self.group.futexes, mem, thread.tid, head);
+            }
             Self::clear_child_tid(&self.group, mem, addr);
         }
         // The last thread writes the core while it still counts, so that no
@@ -653,6 +697,9 @@ impl Kernel {
         };
         if last && let Some(dump) = core.take() {
             self.write_core(&dump, mem);
+            for (tid, head) in dump.robust_lists {
+                crate::futex::exit_robust_list(&self.group.futexes, mem, tid, head);
+            }
             for addr in dump.clear_tids {
                 Self::clear_child_tid(&self.group, mem, addr);
             }

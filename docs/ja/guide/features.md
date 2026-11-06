@@ -43,8 +43,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`msync`、`brk`、`arch_prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -113,6 +113,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   共有していたスレッドのディスクリプタはそのまま残ります。未知のフラグや `last` より
   大きい `first` は `EINVAL` です。
 - `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET` を扱います。
+- `set_robust_list` と `get_robust_list` は、スレッドごとの robust futex のリストを
+  持ちます。glibc と musl の robust mutex に必要です。スレッドが終わるときと `execve`
+  のときに、Linux の `exit_robust_list` と同じようにリストをたどります。スレッドが
+  持っていたワードに `FUTEX_OWNER_DIED` を付け、`FUTEX_WAITERS` があれば shared の
+  wake をします。使えないものに当たるか 2048 個たどると止まり、コアダンプはその前に
+  書きます。新しいスレッドとプロセスのリストは空です。
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
 - [ネットワーク](#network)がなければ、`socket()` は `AF_INET` と `AF_INET6` に
@@ -400,6 +406,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルに合わせて動きます。ファイルが伸びれば先のページも読めるようになり、縮めば
   前に読んだページでも `SIGBUS` になります。ファイルが一部だけを覆うページは、
   ファイルの終わりより先が 0 として読めます。
+- `mincore` は、どのページがメモリにあるかを返します。プライベートなページと共有の
+  無名メモリは読むか書いたあとから、ファイルのページはファイルの範囲内ならメモリに
+  あるとします。Linux と同じく、マップされていない最初のページの手前まで書いて
+  `ENOMEM` を返します。
 - `madvise`：`MADV_DONTNEED` を受けたプライベートなページは空になります。無名の
   ページはそのあと 0 として読め、ファイルのマッピングのページは、Linux がファイルから
   読み込み直すのと同じく、そのときのファイルの中身を読みます。`mremap` で動かしたあとも、`fork` した子でも同じです。プログラム自身の

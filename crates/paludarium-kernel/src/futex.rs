@@ -1,6 +1,6 @@
 //! Compare/register and wake share a queue lock; MMU is always acquired second.
 use paludarium_host::WaitToken;
-use paludarium_mmu::AddressSpace;
+use paludarium_mmu::{AddressSpace, AtomicOp, AtomicWidth};
 use paludarium_types::{Errno, GuestAddr};
 use std::{
     collections::BTreeMap,
@@ -103,5 +103,106 @@ impl Futexes {
             }
         }
         Ok(u64::from(woke))
+    }
+}
+
+/// `struct robust_list_head`'s size, the only length `set_robust_list` takes.
+pub(crate) const ROBUST_LIST_HEAD: u64 = 24;
+/// How many entries Linux follows, so that a list made into a ring ends.
+const ROBUST_LIST_LIMIT: u32 = 2048;
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+
+/// An entry of a robust list and whether its low bit marks a PI futex.
+fn robust_entry(mem: &AddressSpace, at: u64) -> Option<(u64, bool)> {
+    let value = mem.read_u64(GuestAddr(at)).ok()?;
+    Some((value & !1, value & 1 != 0))
+}
+
+/// Marks the robust futex at `addr` as Linux's `handle_futex_death` does when
+/// its owner `tid` ends: `None` when the word cannot be used, which ends the
+/// walk. The wake is shared, as Linux's, so a private waiter is not woken.
+fn futex_death(
+    futexes: &Futexes,
+    mem: &AddressSpace,
+    addr: u64,
+    tid: u32,
+    pi: bool,
+    pending: bool,
+) -> Option<()> {
+    if addr & 3 != 0 {
+        return None;
+    }
+    loop {
+        let mut word = [0; 4];
+        mem.read(GuestAddr(addr), &mut word).ok()?;
+        let value = u32::from_le_bytes(word);
+        // The owner had released it and died before it woke the next.
+        if pending && !pi && value == 0 {
+            let _ = futexes.wake(mem, addr, false, 1, u32::MAX);
+            return Some(());
+        }
+        if value & FUTEX_TID_MASK != tid {
+            return Some(());
+        }
+        let result = mem
+            .atomic(
+                GuestAddr(addr),
+                AtomicWidth::W32,
+                AtomicOp::CompareExchange {
+                    expected: u128::from(value),
+                    replacement: u128::from(value & FUTEX_WAITERS | FUTEX_OWNER_DIED),
+                },
+            )
+            .ok()?;
+        if result.exchanged {
+            if !pi && value & FUTEX_WAITERS != 0 {
+                let _ = futexes.wake(mem, addr, false, 1, u32::MAX);
+            }
+            return Some(());
+        }
+    }
+}
+
+/// Walks the robust list at `head` of the ending thread `tid`, as Linux's
+/// `exit_robust_list`: anything unreadable ends the walk where it is.
+pub(crate) fn exit_robust_list(futexes: &Futexes, mem: &AddressSpace, tid: u32, head: u64) {
+    let Some((mut entry, mut pi)) = robust_entry(mem, head) else {
+        return;
+    };
+    let Ok(offset) = mem.read_u64(GuestAddr(head.wrapping_add(8))) else {
+        return;
+    };
+    let Some((pending, pending_pi)) = robust_entry(mem, head.wrapping_add(16)) else {
+        return;
+    };
+    let mut limit = ROBUST_LIST_LIMIT;
+    while entry != head {
+        let next = robust_entry(mem, entry);
+        if entry != pending
+            && futex_death(futexes, mem, entry.wrapping_add(offset), tid, pi, false).is_none()
+        {
+            return;
+        }
+        let Some((following, following_pi)) = next else {
+            return;
+        };
+        entry = following;
+        pi = following_pi;
+        limit -= 1;
+        if limit == 0 {
+            break;
+        }
+    }
+    if pending != 0 {
+        let _ = futex_death(
+            futexes,
+            mem,
+            pending.wrapping_add(offset),
+            tid,
+            pending_pi,
+            true,
+        );
     }
 }

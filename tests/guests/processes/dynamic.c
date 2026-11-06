@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <elf.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <link.h>
@@ -54,6 +55,13 @@ static int in_maps(unsigned long address) {
     return named;
 }
 
+static pthread_mutex_t robust_mutex;
+static void *robust_owner(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&robust_mutex);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     /* What the exec cases look at. */
@@ -102,6 +110,17 @@ int main(int argc, char **argv) {
     void *from_thread = NULL;
     if (pthread_create(&thread, NULL, in_thread, NULL) || pthread_join(thread, &from_thread)) return 80;
     printf("thread-local=%d main-local=%d\n", (int)(intptr_t)from_thread, local);
+    /* A robust mutex, whose owner ends holding it. */
+    pthread_mutexattr_t attributes_robust;
+    pthread_mutexattr_init(&attributes_robust);
+    printf("robust-attribute=%d\n", pthread_mutexattr_setrobust(&attributes_robust, PTHREAD_MUTEX_ROBUST));
+    if (pthread_mutex_init(&robust_mutex, &attributes_robust)) return 86;
+    pthread_t owner;
+    if (pthread_create(&owner, NULL, robust_owner, NULL) || pthread_join(owner, NULL)) return 87;
+    int locked = pthread_mutex_lock(&robust_mutex);
+    printf("owner-dead=%d\n", locked == EOWNERDEAD);
+    printf("consistent=%d\n", pthread_mutex_consistent(&robust_mutex));
+    printf("unlocked=%d relocked=%d\n", pthread_mutex_unlock(&robust_mutex), pthread_mutex_lock(&robust_mutex));
 #ifdef __GLIBC__
     /* glibc finds the main thread's stack in /proc/self/maps. */
     pthread_attr_t attributes;

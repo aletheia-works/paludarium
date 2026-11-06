@@ -52,6 +52,9 @@ pub mod nr {
     pub const CLOCK_GETRES: u64 = 229;
     pub const MSYNC: u64 = 26;
     pub const MADVISE: u64 = 28;
+    pub const MINCORE: u64 = 27;
+    pub const SET_ROBUST_LIST: u64 = 273;
+    pub const GET_ROBUST_LIST: u64 = 274;
     pub const UNAME: u64 = 63;
     pub const GETUID: u64 = 102;
     pub const SETUID: u64 = 105;
@@ -122,7 +125,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 56] = [
+        let entries: [(u64, Handler); 59] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -155,6 +158,9 @@ impl SyscallTable {
             (nr::MREMAP, sys_mremap),
             (nr::MSYNC, sys_msync),
             (nr::MADVISE, sys_madvise),
+            (nr::MINCORE, sys_mincore),
+            (nr::SET_ROBUST_LIST, sys_set_robust_list),
+            (nr::GET_ROBUST_LIST, sys_get_robust_list),
             (nr::UNAME, sys_uname),
             (nr::GETUID, credentials::sys_getuid),
             (nr::GETGID, credentials::sys_getgid),
@@ -1490,6 +1496,76 @@ fn is_zero_device(file: &dyn FileHandle) -> bool {
 
 const MADV_DONTNEED: u64 = 4;
 const MADV_FREE: u64 = 8;
+
+/// `mincore(addr, length, vec)`, as Linux's: each byte of `vec` says whether
+/// its page is in memory, up to the first page that is not mapped, which is
+/// `ENOMEM` after the bytes before it are written.
+fn sys_mincore(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (addr, length, vec) = (a[0], a[1], a[2]);
+    if addr & 4095 != 0 {
+        return err(Errno::EINVAL);
+    }
+    if addr
+        .checked_add(length)
+        .is_none_or(|end| end > USER_ADDRESS_LIMIT)
+    {
+        return err(Errno::ENOMEM);
+    }
+    let pages = length.div_ceil(4096);
+    if vec
+        .checked_add(pages)
+        .is_none_or(|end| end > USER_ADDRESS_LIMIT)
+    {
+        return err(Errno::EFAULT);
+    }
+    let mut done = 0;
+    while done < pages {
+        let mut piece = Vec::with_capacity(4096);
+        let mut mapped = true;
+        while mapped && piece.len() < 4096 && done + (piece.len() as u64) < pages {
+            let page = addr + (done + piece.len() as u64) * 4096;
+            match c.mem.resident(GuestAddr(page)) {
+                Some(resident) => piece.push(u8::from(resident)),
+                None => mapped = false,
+            }
+        }
+        if c.mem.write(GuestAddr(vec + done), &piece).is_err() {
+            return err(Errno::EFAULT);
+        }
+        if !mapped {
+            return err(Errno::ENOMEM);
+        }
+        done += piece.len() as u64;
+    }
+    ok(0)
+}
+
+/// `set_robust_list(head, length)`: the list Linux walks when the thread ends.
+fn sys_set_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    if a[1] != crate::futex::ROBUST_LIST_HEAD {
+        return err(Errno::EINVAL);
+    }
+    c.group.set_robust_list(c.tid, a[0]);
+    ok(0)
+}
+
+/// `get_robust_list(tid, head, length)` of a thread of this process, or
+/// `ESRCH` for any other (Linux gives another process's if it may trace it).
+fn sys_get_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let tid = a[0] as u32;
+    let tid = if tid == 0 { c.tid } else { tid };
+    let Some(head) = c.group.robust_list(tid) else {
+        return err(Errno(3));
+    };
+    if c.mem
+        .write_u64(GuestAddr(a[2]), crate::futex::ROBUST_LIST_HEAD)
+        .is_err()
+        || c.mem.write_u64(GuestAddr(a[1]), head).is_err()
+    {
+        return err(Errno::EFAULT);
+    }
+    ok(0)
+}
 
 fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, advice) = (a[0], a[1], a[2]);

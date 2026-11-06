@@ -357,6 +357,7 @@ impl Kernel {
                 threads: Vec::new(),
                 credentials: thread.state.credentials.clone(),
                 clear_tids: Vec::new(),
+                robust_lists: Vec::new(),
             });
         }
         let status = ExitStatus::Signaled(signal);

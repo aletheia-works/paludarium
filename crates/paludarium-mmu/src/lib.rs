@@ -1144,6 +1144,24 @@ impl AddressSpaceData {
                 .map(|backing| (&backing.source, page.wrapping_add(backing.shift))),
         }
     }
+    /// What `mincore` says of the page at `page`: `None` if it is not mapped,
+    /// or whether it is in memory. A private page is once something touched
+    /// it, shared anonymous memory once anything of it was, and a file's page
+    /// when it is within the file, as what a guest reads or writes stays in
+    /// Linux's page cache.
+    fn resident(&self, page: u64) -> Option<bool> {
+        self.mapping_at(page)?;
+        if let Some((source, offset)) = self.file_at(page) {
+            return Some(source.size().is_none_or(|size| offset < size));
+        }
+        if lookup(&self.read_directory(), page).is_some() {
+            return Some(true);
+        }
+        Some(
+            self.shared_at(page)
+                .is_some_and(|shared| shared.pages.contains(page.wrapping_add(shared.shift))),
+        )
+    }
     /// Whether the file mapping page at `page` lies wholly past the end of
     /// its file.
     fn past_file_end(&self, page: u64) -> bool {
@@ -2646,6 +2664,12 @@ impl AddressSpace {
             linked: file.is_some_and(|source| source.linked()),
             ..state
         }
+    }
+    /// What `mincore` says of the page at `addr`: `None` if it is not mapped,
+    /// or whether it is in memory.
+    #[must_use]
+    pub fn resident(&self, addr: GuestAddr) -> Option<bool> {
+        self.locked().resident(addr.page_align_down().0)
     }
     /// The file the mapping at `addr` maps, for a core's `NT_FILE` note.
     pub fn mapped_file(&self, addr: GuestAddr) -> Option<MappedFile> {

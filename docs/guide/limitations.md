@@ -107,6 +107,16 @@ verified.
   give it, so a host program changing the size does not move it.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
+  - `rseq` is one of them, as on a Linux built without `CONFIG_RSEQ`, and glibc
+    carries on without it. Its promise is that a thread's critical section is
+    abandoned if it is preempted, which emulated threads running truly in
+    parallel cannot keep, so registering would let per-CPU data break.
+  - `get_robust_list` of another process is `ESRCH`, where Linux gives it to a
+    caller that may trace that process. The wake of a robust futex reaches only
+    waiters of the same process, as `futex` does here.
+  - `mincore` counts a page of a file as in memory whenever it lies within the
+    file, where Linux asks its page cache, and does not count a page that
+    `MAP_POPULATE` or `MAP_LOCKED` brought in until it is touched.
 - **File owners**: a file in a mounted host directory stays root's, so
   `chown` to any other owner or group returns `EPERM` there, and a file a
   guest that is not root makes there is root's too, which that guest may

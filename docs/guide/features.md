@@ -52,8 +52,8 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `msync`, `brk`, `arch_prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -126,6 +126,12 @@ kernel.
   threads, which keep their descriptors. Unknown flags and `first` above
   `last` give `EINVAL`.
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`.
+- `set_robust_list` and `get_robust_list` keep each thread's list of robust
+  futexes, which glibc's and musl's robust mutexes need. When a thread ends or
+  calls `execve`, the list is walked as Linux's `exit_robust_list` walks it:
+  a word the thread owned is marked `FUTEX_OWNER_DIED`, with a shared wake if
+  it has `FUTEX_WAITERS`, the walk stops at what it cannot use and after 2048
+  entries, and a core dump comes first. A new thread or process has no list.
 - `futex`, `epoll` and `eventfd` are implemented inside paludarium, not with the
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
@@ -434,6 +440,10 @@ kernel.
   follows the file: a page past it becomes readable when the file grows, and
   a page read before raises `SIGBUS` once the file shrinks past it. A page
   the file only partly covers reads zeros after its end.
+- `mincore` says which pages are in memory: a private page once it was read or
+  written, shared anonymous memory once it was, and a file's page when it lies
+  within the file. It writes the bytes up to the first page that is not mapped,
+  which is `ENOMEM`, as Linux does.
 - `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
   as zeros, and those of a file mapping read the file again, as it is then,
   as Linux faults them in from the file; this holds

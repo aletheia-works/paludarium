@@ -203,6 +203,96 @@ fn clear_child_tid_on_finish() {
     assert_eq!(b, [0; 4]);
     assert_eq!(k.group.active_threads(), 1);
 }
+/// A robust list at `DATA + 0x100` with `entries` at the given addresses, each
+/// followed 8 bytes on by its futex word.
+fn robust_list(m: &AddressSpace, entries: &[u64], pending: u64) -> u64 {
+    let head = DATA + 0x100;
+    let mut at = head;
+    for entry in entries {
+        m.write_u64(GuestAddr(at), *entry).unwrap();
+        at = *entry & !1;
+    }
+    m.write_u64(GuestAddr(at), head).unwrap();
+    m.write_u64(GuestAddr(head + 8), 8).unwrap();
+    m.write_u64(GuestAddr(head + 16), pending).unwrap();
+    head
+}
+fn word(m: &AddressSpace, addr: u64) -> u32 {
+    let mut bytes = [0; 4];
+    m.read(GuestAddr(addr), &mut bytes).unwrap();
+    u32::from_le_bytes(bytes)
+}
+fn set_word(m: &AddressSpace, addr: u64, value: u32) {
+    m.write(GuestAddr(addr), &value.to_le_bytes()).unwrap();
+}
+#[test]
+fn an_ending_thread_marks_the_robust_futexes_it_owned() {
+    const DIED: u32 = 0x4000_0000;
+    const WAITERS: u32 = 0x8000_0000;
+    let mut k = kernel();
+    let mut t = thread();
+    let m = memory();
+    clone(&mut k, &mut t, &m, 0x1310900);
+    let (mut child, ct) = k.take_child().unwrap();
+    let (a, b, c, d) = (DATA + 0x200, DATA + 0x300, DATA + 0x400, DATA + 0x500);
+    set_word(&m, a + 8, ct.tid);
+    set_word(&m, b + 8, ct.tid | WAITERS | DIED);
+    set_word(&m, c + 8, ct.tid + 1);
+    set_word(&m, d + 8, ct.tid);
+    let head = robust_list(&m, &[a, b, c], d);
+    child.group.set_robust_list(ct.tid, head);
+    assert_eq!(child.group.robust_list(ct.tid), Some(head));
+    child.finish_thread(&ct, &m);
+    assert_eq!(word(&m, a + 8), DIED);
+    assert_eq!(word(&m, b + 8), DIED | WAITERS);
+    assert_eq!(word(&m, c + 8), ct.tid + 1, "another's");
+    assert_eq!(word(&m, d + 8), DIED, "pending");
+    assert_eq!(k.group.robust_list(ct.tid), None);
+}
+#[test]
+fn a_robust_list_stops_where_it_cannot_be_read() {
+    let mut k = kernel();
+    let mut t = thread();
+    let m = memory();
+    clone(&mut k, &mut t, &m, 0x1310900);
+    let (mut child, ct) = k.take_child().unwrap();
+    let (a, b) = (DATA + 0x200, DATA + 0x300);
+    set_word(&m, b + 8, ct.tid);
+    // A misaligned futex word ends the walk, so nothing after it is marked.
+    let head = robust_list(&m, &[a, b], 0);
+    m.write_u64(GuestAddr(head + 8), 9).unwrap();
+    child.group.set_robust_list(ct.tid, head);
+    child.finish_thread(&ct, &m);
+    assert_eq!(word(&m, b + 8), ct.tid);
+}
+#[test]
+fn a_robust_list_made_into_a_ring_ends_at_the_limit() {
+    let mut k = kernel();
+    let mut t = thread();
+    let m = memory();
+    clone(&mut k, &mut t, &m, 0x1310900);
+    let (mut child, ct) = k.take_child().unwrap();
+    let a = DATA + 0x200;
+    let head = robust_list(&m, &[a], 0);
+    m.write_u64(GuestAddr(a), a).unwrap();
+    set_word(&m, a + 8, ct.tid);
+    child.group.set_robust_list(ct.tid, head);
+    child.finish_thread(&ct, &m);
+    assert_eq!(word(&m, a + 8), 0x4000_0000);
+}
+#[test]
+fn a_released_pending_robust_futex_is_left_at_zero() {
+    let mut k = kernel();
+    let mut t = thread();
+    let m = memory();
+    clone(&mut k, &mut t, &m, 0x1310900);
+    let (mut child, ct) = k.take_child().unwrap();
+    let a = DATA + 0x200;
+    let head = robust_list(&m, &[], a);
+    child.group.set_robust_list(ct.tid, head);
+    child.finish_thread(&ct, &m);
+    assert_eq!(word(&m, a + 8), 0);
+}
 #[test]
 fn a_finished_thread_leaves_no_task_ids_behind() {
     let mut k = kernel();

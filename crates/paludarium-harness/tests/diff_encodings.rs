@@ -79,17 +79,23 @@ fn fresh_native_differential() {
 #[test]
 fn approximations_and_masked_store() {
     support::bounded("approximations_and_masked_store", || {
+        // Not in `target/encodings-guests`, which `build.sh` writes over while
+        // the tests beside this one run.
         let root = paludarium_harness::workspace_root();
-        let output = root.join("target/encodings-guests");
+        let output = root.join("target/encodings-approximate");
+        std::fs::create_dir_all(&output).unwrap();
+        let program = output.join("approximate");
+        let compiler = std::env::var("MUSL_CC").unwrap_or_else(|_| "musl-gcc".to_string());
         assert!(
-            std::process::Command::new("bash")
-                .arg(root.join("tests/guests/encodings/build.sh"))
-                .arg(&output)
+            std::process::Command::new(compiler)
+                .args(["-static", "-O2", "-Wall", "-Wextra", "-Werror"])
+                .arg(root.join("tests/guests/encodings/approximate.c"))
+                .arg("-o")
+                .arg(&program)
                 .status()
                 .unwrap()
                 .success()
         );
-        let program = output.join("approximate");
         let native = paludarium_harness::run_native(&program, "approximate", &[]).unwrap();
         assert_eq!(native.status, paludarium::ExitStatus::Exited(0));
         let (emulated, _) = paludarium_harness::run_emulated(&program, "approximate", &[]).unwrap();

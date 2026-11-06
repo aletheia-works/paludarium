@@ -2824,6 +2824,9 @@ static int robust_list_cases(const char *self) {
     r = syscall(SYS_get_robust_list, 0x3ffffff0L, &got, &length);
     printf("get-missing=%ld errno=%d\n", r, errno);
     errno = 0;
+    r = syscall(SYS_get_robust_list, -1L, &got, &length);
+    printf("get-negative=%ld errno=%d\n", r, errno);
+    errno = 0;
     r = syscall(SYS_get_robust_list, 0, NULL, &length);
     printf("get-bad-head=%ld errno=%d\n", r, errno);
     errno = 0;

@@ -120,7 +120,8 @@ int main(int argc, char **argv) {
     int locked = pthread_mutex_lock(&robust_mutex);
     printf("owner-dead=%d\n", locked == EOWNERDEAD);
     printf("consistent=%d\n", pthread_mutex_consistent(&robust_mutex));
-    printf("unlocked=%d relocked=%d\n", pthread_mutex_unlock(&robust_mutex), pthread_mutex_lock(&robust_mutex));
+    printf("unlocked=%d\n", pthread_mutex_unlock(&robust_mutex));
+    printf("relocked=%d\n", pthread_mutex_lock(&robust_mutex));
 #ifdef __GLIBC__
     /* glibc finds the main thread's stack in /proc/self/maps. */
     pthread_attr_t attributes;

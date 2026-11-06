@@ -22,22 +22,33 @@ runs:
         # The Azure mirror sometimes serves one job at 40 kB/s while another job of the same run
         # gets 45 MB/s from it, and apt stays on it until the job times out. So bound the download
         # (not the install: stopping dpkg would leave packages half installed) and fall back to
-        # the other mirrors. Each attempt goes on from the files the previous one left.
+        # the other mirrors. Each attempt goes on from the files the previous one left, and all
+        # downloads share one deadline, which leaves line coverage the time it needs.
         mirrors=/etc/apt/apt-mirrors.txt
+        deadline=$((SECONDS + 720))
         download() {
-          local attempt
-          for attempt in 1 2 3 4; do
-            if sudo timeout --kill-after=10 180 \
+          local limit
+          while true; do
+            limit=$((deadline - SECONDS))
+            if [ "$limit" -le 0 ]; then
+              echo "apt downloads did not finish within 12 minutes" >&2
+              return 1
+            fi
+            if [ "$limit" -gt 180 ]; then
+              limit=180
+            fi
+            if sudo timeout --kill-after=10 "$limit" \
               apt-get install -y --no-install-recommends --download-only "$@"; then
               return 0
             fi
-            echo "apt download attempt $attempt of 4 failed or took over 3 minutes" >&2
-            if [ -f "$mirrors" ]; then
+            echo "apt download failed or hit its limit of $limit seconds" >&2
+            if [ -f "$mirrors" ] && grep -q 'azure\.archive\.ubuntu\.com' "$mirrors"; then
               sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
+              # The lists came from the mirror just dropped, and the others may differ from it.
+              sudo timeout --kill-after=10 120 apt-get update || echo "apt-get update failed" >&2
             fi
             sleep 15
           done
-          return 1
         }
         variant=/etc/apt/apt.conf.d/90arch-variant
         if [ -f "$variant" ]; then

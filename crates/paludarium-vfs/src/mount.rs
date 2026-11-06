@@ -384,7 +384,28 @@ impl HostFs for MountedFs {
                 }
             }
         }
-        Ok(entries.into_values().collect())
+        // A host's directory listing leaves out `.` and `..`. Both come from
+        // the mounted view, so their inodes are those `stat` reports.
+        entries.remove(b".".as_slice());
+        entries.remove(b"..".as_slice());
+        let parent = match p.iter().rposition(|&b| b == b'/') {
+            Some(0) | None => b"/".as_slice(),
+            Some(i) => &p[..i],
+        };
+        let mut out = vec![
+            DirectoryEntry {
+                name: b".".to_vec(),
+                inode: self.metadata(&p, true)?.inode,
+                kind: 4,
+            },
+            DirectoryEntry {
+                name: b"..".to_vec(),
+                inode: self.metadata(parent, true)?.inode,
+                kind: 4,
+            },
+        ];
+        out.extend(entries.into_values());
+        Ok(out)
     }
 }
 #[cfg(test)]
@@ -451,6 +472,28 @@ mod mount_tests {
         );
         x.fs.unlink(b"/mnt/d/a", false).unwrap();
         x.fs.unlink(b"/mnt/d", true).unwrap();
+    }
+    #[test]
+    fn mount_directory_lists_itself_and_its_parent() {
+        let x = Fixture::new();
+        x.fs.mkdir(b"/mnt/d", 0o700).unwrap();
+        x.fs.mkdir(b"/mnt/d/e", 0o700).unwrap();
+        let inode = |p: &[u8]| x.fs.metadata(p, true).unwrap().inode;
+        for (path, parent) in [
+            (&b"/mnt/d/e"[..], &b"/mnt/d"[..]),
+            (b"/mnt/d", b"/mnt"),
+            (b"/mnt", b"/"),
+            (b"/", b"/"),
+        ] {
+            let list = x.fs.read_dir(path).unwrap();
+            assert_eq!(list[0].name, b".");
+            assert_eq!(list[0].inode, inode(path));
+            assert_eq!(list[0].kind, 4);
+            assert_eq!(list[1].name, b"..");
+            assert_eq!(list[1].inode, inode(parent));
+            assert_eq!(list[1].kind, 4);
+            assert_eq!(list.iter().filter(|e| e.name[0] == b'.').count(), 2);
+        }
     }
     #[test]
     fn mount_link_unlink() {

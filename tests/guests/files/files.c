@@ -121,6 +121,28 @@ void _start(void) {
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
   results[x++]=SX(p,0,0);S(87,q,0,0);}
+ if(CASE==50){ /* getdents64 of a new directory: itself, its parent, and one file */
+  static char d[]="/tmp/paludarium-files-dents",f[]="/tmp/paludarium-files-dents/a",e[]="/tmp/paludarium-files-dents/.";
+  static char up[]="/tmp/paludarium-files-dents/..";
+  S(87,f,0,0);S(84,d,0,0);results[x++]=S(83,d,0755,0);long c=S(2,f,66,0644);S(3,c,0,0);
+  S(4,e,st,0);long self=*(long*)(st+8);S(4,up,st,0);long parent=*(long*)(st+8);
+  long l=S(2,d,0200000,0);
+  /* A buffer too small for two entries: one entry a call, in a stable count. */
+  for(long round=0;round<2;round++){
+   long dots=0,dotdot=0,a=0,calls=0,n;
+   while((n=S(217,l,buf,32))>0){
+    calls++;
+    for(long o=0;o<n;o+=*(unsigned short*)(buf+o+16)){
+     char *name=buf+o+19;long ino=*(long*)(buf+o);long type=(unsigned char)buf[o+18];
+     if(name[0]=='.'&&!name[1])dots+=ino==self&&type==4;
+     else if(name[0]=='.'&&name[1]=='.'&&!name[2])dotdot+=ino==parent&&type==4;
+     else if(name[0]=='a'&&!name[1])a+=type==8;
+    }
+   }
+   results[x++]=dots;results[x++]=dotdot;results[x++]=a;results[x++]=calls;results[x++]=n;
+   results[x++]=S(8,l,0,0);
+  }
+  S(3,l,0,0);S(87,f,0,0);S(84,d,0,0);}
  if(CASE==49){ /* AF_UNIX bind makes a socket file, which connect finds */
   static char sa[110]="\1\0/tmp/paludarium-files-socket"; long len=2+sizeof("/tmp/paludarium-files-socket");
   char *path=sa+2; S(87,path,0,0); S(95,022,0,0);

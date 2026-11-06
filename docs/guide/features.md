@@ -1089,7 +1089,8 @@ one only with an `--allow-net`.
 - Files can be placed before the start.
 - A host directory can be mounted when you ask for it (`--mount` on the
   command line, `Config::mounts` in Rust). Every operation stays inside that
-  directory; `..` and symbolic links cannot lead outside.
+  directory; `..` and symbolic links cannot lead outside. `getdents64` lists
+  `.` and `..` in it too, with the inodes `stat` reports for them.
 
 ## Programs verified
 

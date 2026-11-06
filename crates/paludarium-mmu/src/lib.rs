@@ -2731,25 +2731,26 @@ impl AddressSpace {
     pub fn write_u64(&self, addr: GuestAddr, value: u64) -> Result<(), Fault> {
         self.write_value(addr, 8, value)
     }
-    /// The little-endian value of `size` bytes, at most 8, as [`Self::read`]
-    /// gives them, taking one atomic access where they lie in one word.
+    /// The little-endian value of `size` bytes, of which 8 are the most it
+    /// takes, as [`Self::read`] gives them, with one atomic access where they
+    /// lie in one word.
     #[inline]
     pub fn read_value(&self, addr: GuestAddr, size: usize) -> Result<u64, Fault> {
         if let Some(value) = self.data_locked().read_value_cached(addr, size) {
             return Ok(value);
         }
         let mut bytes = [0; WORD_BYTES];
-        self.read(addr, &mut bytes[..size])?;
+        self.read(addr, &mut bytes[..size.min(WORD_BYTES)])?;
         Ok(u64::from_le_bytes(bytes))
     }
-    /// Writes the low `size` bytes of `value`, at most 8, as [`Self::write`]
-    /// does.
+    /// Writes the low `size` bytes of `value`, of which 8 are the most it
+    /// takes, as [`Self::write`] does.
     #[inline]
     pub fn write_value(&self, addr: GuestAddr, size: usize, value: u64) -> Result<(), Fault> {
         if self.data_locked().write_value_cached(addr, size, value) {
             return Ok(());
         }
-        self.write(addr, &value.to_le_bytes()[..size])
+        self.write(addr, &value.to_le_bytes()[..size.min(WORD_BYTES)])
     }
     pub fn map(
         &mut self,
@@ -3007,6 +3008,12 @@ mod tests {
         assert_eq!(space.read_value(GuestAddr(0x10000), 0), Ok(0));
         space.write_value(GuestAddr(0x10000), 0, !0).unwrap();
         assert_eq!(space.read_value(GuestAddr(0x10000), 1), Ok(1));
+        // More than a value holds takes the 8 bytes it can.
+        let eight = space.read_value(GuestAddr(0x10000), 8);
+        assert_eq!(space.read_value(GuestAddr(0x10000), 9), eight);
+        space.write_value(GuestAddr(0x10000), 9, 5).unwrap();
+        assert_eq!(space.read_value(GuestAddr(0x10000), 8), Ok(5));
+        assert_eq!(space.read_value(GuestAddr(0x10008), 1), Ok(9));
     }
 
     #[test]

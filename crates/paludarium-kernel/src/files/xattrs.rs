@@ -15,6 +15,7 @@ const XATTR_CREATE: u64 = 1;
 const XATTR_REPLACE: u64 = 2;
 const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: u64 = 65536;
+const XATTR_LIST_MAX: u64 = 65536;
 const NAMESPACES: [&[u8]; 3] = [b"user.", b"trusted.", b"security."];
 const MAY_READ: u32 = 4;
 const MAY_WRITE: u32 = 2;
@@ -167,6 +168,10 @@ fn list(c: &Context<'_>, target: &Target, addr: u64, size: u64) -> Result<u64, E
     if size != 0 {
         if length > size {
             return Err(ERANGE);
+        }
+        // What `listxattr` says of a list longer than it would ever copy.
+        if length > XATTR_LIST_MAX {
+            return Err(E2BIG);
         }
         output(c, addr, &names)?;
     }

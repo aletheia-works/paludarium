@@ -1045,6 +1045,26 @@ fn xattrs_ask_for_permission_and_capabilities() {
 }
 
 #[test]
+fn an_xattr_list_longer_than_linux_copies_is_too_big() {
+    let mut f = fixture();
+    let (path, wanted) = (DATA + 0x100, DATA + 0x200);
+    f.mem.write(GuestAddr(path), b"/xattr-list\0").unwrap();
+    assert!(f.ret(2, &[path, 0o102, 0o644]) < 1024);
+    // 300 names of 240 bytes and a terminator each.
+    for i in 0..300 {
+        let name = format!("user.{i:0>235}\0");
+        f.mem.write(GuestAddr(wanted), name.as_bytes()).unwrap();
+        assert_eq!(f.ret(188, &[path, wanted, wanted, 1, 0]), 0);
+    }
+    let length = 300 * 241;
+    let start = f.ret(nr::MMAP, &[0, 1 << 20, 3, 0x22, u64::MAX, 0]);
+    assert_eq!(f.ret(194, &[path, 0, 0]), length);
+    assert_eq!(f.ret(194, &[path, start, 65536]), errno(Errno(34)));
+    assert_eq!(f.ret(194, &[path, start, length]), errno(Errno(7)));
+    assert_eq!(f.ret(194, &[path, start, 1 << 20]), errno(Errno(7)));
+}
+
+#[test]
 fn mincore_reports_what_was_touched_up_to_what_is_not_mapped() {
     let mut f = fixture();
     let (vec, page) = (DATA + 0x800, 4096);

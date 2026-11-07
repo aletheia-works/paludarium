@@ -127,6 +127,11 @@ verified.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE` or `MAP_LOCKED` brought in until it is touched.
+- **Extended attributes**: a mounted host directory behaves as a file system
+  without them, so reading finds none (`ENODATA`) and writing gives `EOPNOTSUPP`.
+  In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), a value
+  of `security.capability` is not checked, and a sticky directory does not limit
+  `user.*` to its owner.
 - **File owners**: a file in a mounted host directory stays root's, so
   `chown` to any other owner or group returns `EPERM` there, and a file a
   guest that is not root makes there is root's too, which that guest may

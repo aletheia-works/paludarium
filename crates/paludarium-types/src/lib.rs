@@ -128,6 +128,7 @@ impl Errno {
     pub const EMFILE: Errno = Errno(24);
     pub const ENOTTY: Errno = Errno(25);
     pub const ENOSPC: Errno = Errno(28);
+    pub const EOPNOTSUPP: Errno = Errno(95);
     pub const ESPIPE: Errno = Errno(29);
     pub const EPIPE: Errno = Errno(32);
     pub const ERANGE: Errno = Errno(34);

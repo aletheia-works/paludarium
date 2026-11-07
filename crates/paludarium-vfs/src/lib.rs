@@ -148,6 +148,7 @@ struct Node {
     mode: u32,
     /// The owner and group, root's until `chown`.
     owner: (u32, u32),
+    xattrs: paludarium_host::Xattrs,
     links: u64,
     locks: BTreeMap<u64, u32>,
     mtime_ns: i128,
@@ -236,6 +237,7 @@ impl Tree {
                 kind,
                 mode,
                 owner: (0, 0),
+                xattrs: Default::default(),
                 links,
                 locks: BTreeMap::new(),
                 mtime_ns,
@@ -365,6 +367,7 @@ impl MemFs {
             kind: Kind::Dir(BTreeMap::new()),
             mode: 0o040755,
             owner: (0, 0),
+            xattrs: Default::default(),
             links: 2,
             locks: BTreeMap::new(),
             mtime_ns: 0,

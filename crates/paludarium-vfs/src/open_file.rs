@@ -238,6 +238,10 @@ impl FileHandle for MemFile {
         s.1 = (s.1 & !3072) | (f & 3072);
         Ok(())
     }
+    fn with_xattrs(&self, f: &mut dyn FnMut(&mut paludarium_host::Xattrs)) -> Result<(), Errno> {
+        f(&mut lock(&self.node).xattrs);
+        Ok(())
+    }
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         set_node_mode(&mut lock(&self.node), mode);
         Ok(())

@@ -1008,6 +1008,43 @@ fn set_and_get_robust_list_check_their_arguments() {
     );
 }
 #[test]
+fn xattrs_ask_for_permission_and_capabilities() {
+    let mut f = fixture();
+    let (path, buffer) = (DATA + 0x100, DATA + 0x800);
+    let name = |f: &mut Fixture, n: &[u8]| {
+        f.mem.write(GuestAddr(DATA + 0x200), n).unwrap();
+        DATA + 0x200
+    };
+    f.mem.write(GuestAddr(path), b"/xattr-file\0").unwrap();
+    let fd = f.ret(2, &[path, 0o102, 0o644]);
+    assert!(fd < 1024, "{fd}");
+    let (eperm, eacces, enodata) = (errno(Errno::EPERM), errno(Errno::EACCES), errno(Errno(61)));
+
+    // Root has them all, and a name of the trusted namespace shows in the list.
+    for n in [&b"user.a\0"[..], b"trusted.a\0", b"security.a\0"] {
+        let a = name(&mut f, n);
+        assert_eq!(f.ret(188, &[path, a, buffer, 1, 0]), 0);
+    }
+    assert_eq!(f.ret(194, &[path, 0, 0]), 28);
+
+    // Group and others have read access only.
+    assert_eq!(f.ret(nr::SETUID, &[1000]), 0);
+    let user = name(&mut f, b"user.a\0");
+    assert_eq!(f.ret(191, &[path, user, 0, 0]), 1);
+    assert_eq!(f.ret(188, &[path, user, buffer, 1, 0]), eacces);
+    assert_eq!(f.ret(197, &[path, user]), eacces);
+    let trusted = name(&mut f, b"trusted.a\0");
+    assert_eq!(f.ret(191, &[path, trusted, 0, 0]), enodata);
+    assert_eq!(f.ret(188, &[path, trusted, buffer, 1, 0]), eperm);
+    assert_eq!(f.ret(197, &[path, trusted]), eperm);
+    let security = name(&mut f, b"security.a\0");
+    assert_eq!(f.ret(191, &[path, security, 0, 0]), 1);
+    assert_eq!(f.ret(188, &[path, security, buffer, 1, 0]), eacces);
+    // The list hides what cannot be read.
+    assert_eq!(f.ret(194, &[path, 0, 0]), 18);
+}
+
+#[test]
 fn mincore_reports_what_was_touched_up_to_what_is_not_mapped() {
     let mut f = fixture();
     let (vec, page) = (DATA + 0x800, 4096);

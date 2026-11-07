@@ -332,6 +332,16 @@ impl HostFs for MountedFs {
         }
         Ok(())
     }
+    fn with_xattrs(
+        &self,
+        p: &[u8],
+        follow: bool,
+        f: &mut dyn FnMut(&mut paludarium_host::Xattrs),
+    ) -> Result<(), Errno> {
+        let p = self.resolve(p, follow, false)?;
+        let (_, fs, relative) = self.route(&p)?;
+        fs.with_xattrs(&relative, false, f)
+    }
     fn set_mode(&self, p: &[u8], mode: u32) -> Result<(), Errno> {
         let p = self.resolve(p, true, false)?;
         let (_, fs, relative) = self.route(&p)?;

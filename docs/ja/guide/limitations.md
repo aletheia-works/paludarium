@@ -168,7 +168,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   入力が来るたびに `SIGIO` を 1 回送ります。Linux のパイプや端末は、入力のひとまとまりごとに
   送ります。標準出力と標準エラーも同じように見て、いっぱいだったところに空きができる
   たびに 1 回送ります。Linux のパイプは、読み手が読むたびに書き手へ送ります。見るための
-  スレッドがない WebAssembly では送りません。
+  10 ms より短い間だけ満杯や空だったストリームは見逃され、送らないことがあります。ただし、
+  読み書きがゲストに `EAGAIN` を返したあとは必ず送ります。スレッドがない WebAssembly では
+  送りません。
 - **名前空間**：名前空間のフラグ（`CLONE_NEWNS`、`CLONE_NEWUTS`、`CLONE_NEWIPC`、
   `CLONE_NEWUSER`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWCGROUP`、`clone3` では
   `CLONE_NEWTIME` も）を付けた `clone` と `clone3` は、子を作らずに `EINVAL` で失敗します。

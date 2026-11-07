@@ -325,7 +325,8 @@ kernel.
     write told the guest `EAGAIN`, however soon: standard input `POLL_IN` for
     input, or its end, and standard output and standard error `POLL_OUT` for
     room after being full. Otherwise a stream full or empty for less time than
-    that can go unseen, and no signal comes. `F_SETFL` keeps the standard streams' own status flags
+    that can go unseen, and no signal comes. `F_SETFL` keeps the standard
+    streams' own status flags
     (`O_NONBLOCK`, `O_APPEND`, …), which never reach the host's descriptor;
     with `O_NONBLOCK`, a read of standard input that finds nothing is
     `EAGAIN`, and so is a write to standard output or standard error that

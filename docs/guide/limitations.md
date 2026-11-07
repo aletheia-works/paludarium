@@ -185,8 +185,10 @@ verified.
   Linux's pipe or terminal sends one for every piece of input. Standard
   output and standard error, looked at the same way, send it once each
   time they have room again after being full, where Linux's pipe signals
-  its writer at every read of its reader. In WebAssembly, which has no
-  thread to look, they send none.
+  its writer at every read of its reader. A stream full or empty for less
+  than those 10 ms can go unseen and send none, unless a read or write told
+  the guest `EAGAIN`, which always gets its signal. In WebAssembly, which has
+  no thread to look, they send none.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for

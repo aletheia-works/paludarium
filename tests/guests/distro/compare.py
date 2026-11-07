@@ -23,9 +23,12 @@ import subprocess
 import sys
 import time
 
-# Even if every case ran out its time, the run would end within the workflow's
-# 130 minutes: 83 cases on 4 workers, 330 s each. The slowest case, g++, took
-# 75 to 150 s under the emulator on CI, and under a second natively.
+# Even if every case ran out its time, the cases would end in about 116
+# minutes (83 cases on 4 workers, 330 s each), within the workflow's 150 with
+# room for the checkout, the build and the image. results.json is written
+# after each case, so a job stopped at its limit still keeps the ones that
+# ended. The slowest case, g++, took 75 to 150 s under the emulator on CI, and
+# under a second natively.
 SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 NATIVE_TIMEOUT = 30
 EMULATED_TIMEOUT = 300

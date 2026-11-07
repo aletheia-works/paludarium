@@ -126,8 +126,7 @@ verified.
     yes would be wrong without the rest: Landlock's rules would not be enforced,
     and protection keys need the CPU feature, which `CPUID` does not report.
   - `get_robust_list` of another process is `ESRCH`, where Linux gives it to a
-    caller that may trace that process. The wake of a robust futex reaches only
-    waiters of the same process, as `futex` does here.
+    caller that may trace that process.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.

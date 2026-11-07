@@ -1,4 +1,5 @@
-"""Processes: shared memory between handles, and asyncio subprocesses, timeouts and threads."""
+"""Processes: shared memory between handles, a queue and a pool shared by processes, and asyncio
+subprocesses, timeouts and threads."""
 
 import asyncio
 import multiprocessing
@@ -9,6 +10,10 @@ def square(value):
     return value * value
 
 
+def put_square(queue, value):
+    queue.put(square(value))
+
+
 if __name__ == "__main__":
     shared = multiprocessing.shared_memory.SharedMemory(create=True, size=4096)
     shared.buf[:5] = b"hello"
@@ -17,6 +22,18 @@ if __name__ == "__main__":
     other.close()
     shared.close()
     shared.unlink()
+
+    # The queue's lock is a semaphore in shared memory that the writers contend for.
+    queue = multiprocessing.Queue()
+    writers = [multiprocessing.Process(target=put_square, args=(queue, n)) for n in range(4)]
+    for writer in writers:
+        writer.start()
+    squares = sorted(queue.get() for _ in writers)
+    for writer in writers:
+        writer.join()
+    print("queue", squares, [writer.exitcode for writer in writers])
+    with multiprocessing.Pool(4) as pool:
+        print("pool", pool.map(square, range(8)))
 
     async def main():
         process = await asyncio.create_subprocess_exec(

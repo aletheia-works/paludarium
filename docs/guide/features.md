@@ -135,7 +135,15 @@ kernel.
   gives the thread its own copy of a table it shares with `CLONE_FILES`
   threads, which keep their descriptors. Unknown flags and `first` above
   `last` give `EINVAL`.
-- `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`.
+- `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`. A word is
+  told apart as Linux's `get_futex_key` does: in a shared mapping (shared
+  anonymous memory or a file's), a shared operation names the memory and the
+  offset in it, so a wake reaches a waiter in any process that maps it,
+  wherever it maps it. Any other word, and a private operation, names this
+  process's address space and the address, so a private wake never reaches
+  another process. Process-shared mutexes and semaphores (Python's
+  `multiprocessing`) work this way, as does the wake of a robust futex whose
+  owner ends.
 - `set_robust_list` and `get_robust_list` keep each thread's list of robust
   futexes, which glibc's and musl's robust mutexes need. When a thread ends or
   calls `execve`, the list is walked as Linux's `exit_robust_list` walks it:

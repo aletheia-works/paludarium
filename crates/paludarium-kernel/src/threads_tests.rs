@@ -381,22 +381,53 @@ fn futex_private_shared_keys() {
     assert_eq!(f.wake(&m, DATA, true, 1, 1), Ok(1));
 }
 #[test]
+fn futex_shared_memory_keys_reach_other_spaces() {
+    // One page of shared memory, at different addresses in two spaces.
+    let pages = paludarium_mmu::SharedPages::new();
+    let spaces = [(0x600000, 0), (0x700000, 0)].map(|(at, offset)| {
+        let mem = AddressSpace::new();
+        mem.map_shared(
+            Some(GuestAddr(at)),
+            4096,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        mem.share_pages(GuestAddr(at), 4096, &pages, offset, true)
+            .unwrap();
+        mem
+    });
+    let f = futex::Futexes::default();
+    let a = f
+        .register(&spaces[0], 0x600008, false, 0, u32::MAX)
+        .unwrap();
+    // A private wake names the waker's own space, as Linux's does.
+    assert_eq!(f.wake(&spaces[1], 0x700008, true, 1, u32::MAX), Ok(0));
+    assert_eq!(f.wake(&spaces[1], 0x700004, false, 1, u32::MAX), Ok(0));
+    assert_eq!(f.wake(&spaces[1], 0x700008, false, 1, u32::MAX), Ok(1));
+    assert_eq!(a.state.load(Ordering::SeqCst), 1);
+    // Private memory keeps its words apart per space.
+    let b = f.register(&memory(), DATA, false, 0, u32::MAX).unwrap();
+    assert_eq!(f.wake(&memory(), DATA, false, 1, u32::MAX), Ok(0));
+    assert_eq!(f.finish(&b, 2), 2);
+}
+#[test]
 fn futex_wake_before_host_wait_retained() {
     let m = memory();
     let f = futex::Futexes::default();
     let a = f.register(&m, DATA, true, 0, 1).unwrap();
     f.wake(&m, DATA, true, 1, 1).unwrap();
     assert_eq!(a.token.value(), 1);
-    assert_eq!(f.finish(&m, DATA, true, &a, 2), 1);
+    assert_eq!(f.finish(&a, 2), 1);
 }
 #[test]
 fn futex_timeout_wins_once() {
     let m = memory();
     let f = futex::Futexes::default();
     let a = f.register(&m, DATA, true, 0, 1).unwrap();
-    assert_eq!(f.finish(&m, DATA, true, &a, 2), 2);
+    assert_eq!(f.finish(&a, 2), 2);
     assert_eq!(f.wake(&m, DATA, true, 1, 1), Ok(0));
-    assert_eq!(f.finish(&m, DATA, true, &a, 3), 2);
+    assert_eq!(f.finish(&a, 3), 2);
 }
 
 #[test]

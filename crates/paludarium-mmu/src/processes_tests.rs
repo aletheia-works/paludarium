@@ -172,3 +172,35 @@ fn a_fork_shares_private_frames_until_either_space_writes() {
     assert_eq!(meter.used(), PAGE_SIZE * 2);
     assert_eq!(p.read_u64(GuestAddr(0x10000)), Ok(4));
 }
+#[test]
+fn shared_offset_names_the_memory_not_the_address() {
+    let p = space();
+    assert_eq!(p.shared_offset(GuestAddr(0x10008)), None);
+    p.mark_shared(GuestAddr(0x10000), PAGE_SIZE * 2).unwrap();
+    let c = p.fork();
+    let inherited = p.shared_offset(GuestAddr(0x11008));
+    assert!(inherited.is_some());
+    assert_eq!(c.shared_offset(GuestAddr(0x11008)), inherited);
+    // The same pages mapped at other addresses, from other offsets.
+    let pages = SharedPages::new();
+    for (space, at, offset) in [(&p, 0x40000, 0), (&c, 0x80000, PAGE_SIZE)] {
+        space
+            .map_shared(
+                Some(GuestAddr(at)),
+                PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        space
+            .share_pages(GuestAddr(at), PAGE_SIZE, &pages, offset, true)
+            .unwrap();
+    }
+    let (memory, offset) = p.shared_offset(GuestAddr(0x40008)).unwrap();
+    assert_eq!(offset, 8);
+    assert_eq!(
+        c.shared_offset(GuestAddr(0x80008)),
+        Some((memory, PAGE_SIZE + 8))
+    );
+    assert_ne!(Some(memory), inherited.map(|(memory, _)| memory));
+}

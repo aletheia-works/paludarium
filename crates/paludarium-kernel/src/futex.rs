@@ -5,21 +5,55 @@ use paludarium_types::{Errno, GuestAddr};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, LazyLock, Mutex, PoisonError,
         atomic::{AtomicU32, Ordering},
     },
 };
-type Key = (u64, u64, bool);
+/// What a futex word is told apart by, as Linux's `futex_key`: a word in
+/// shared memory by that memory and its offset in it, so that every process
+/// mapping it finds the same queue; any other by the address space and the
+/// address, with private and shared operations apart.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Key {
+    Space {
+        space: u64,
+        addr: u64,
+        private: bool,
+    },
+    Memory {
+        memory: u64,
+        offset: u64,
+    },
+}
+fn key(mem: &AddressSpace, addr: u64, private: bool) -> Key {
+    if !private && let Some((memory, offset)) = mem.shared_offset(GuestAddr(addr)) {
+        return Key::Memory { memory, offset };
+    }
+    Key::Space {
+        space: mem.id(),
+        addr,
+        private,
+    }
+}
+/// The queues every process waits in: the keys of words in shared memory
+/// are the same in every process, and the others name their address space.
+static MACHINE: LazyLock<Futexes> = LazyLock::new(Futexes::default);
 pub(crate) struct Waiter {
     pub token: WaitToken,
     pub state: AtomicU32,
     mask: u32,
+    /// The queue it waits in.
+    key: Key,
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Futexes {
-    queues: Mutex<BTreeMap<Key, Vec<Arc<Waiter>>>>,
+    queues: Arc<Mutex<BTreeMap<Key, Vec<Arc<Waiter>>>>>,
 }
 impl Futexes {
+    /// The queues shared by every process ([`MACHINE`]).
+    pub fn machine() -> Self {
+        MACHINE.clone()
+    }
     pub fn register(
         &self,
         mem: &AddressSpace,
@@ -32,6 +66,7 @@ impl Futexes {
             return Err(Errno::EINVAL);
         }
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = key(mem, addr, private);
         let mut bytes = [0; 4];
         mem.read(GuestAddr(addr), &mut bytes)
             .map_err(|_| Errno::EFAULT)?;
@@ -42,29 +77,19 @@ impl Futexes {
             token: WaitToken::default(),
             state: AtomicU32::new(0),
             mask,
+            key,
         });
-        queues
-            .entry((mem.id(), addr, private))
-            .or_default()
-            .push(waiter.clone());
+        queues.entry(key).or_default().push(waiter.clone());
         Ok(waiter)
     }
-    pub fn finish(
-        &self,
-        mem: &AddressSpace,
-        addr: u64,
-        private: bool,
-        waiter: &Arc<Waiter>,
-        result: u32,
-    ) -> u32 {
+    pub fn finish(&self, waiter: &Arc<Waiter>, result: u32) -> u32 {
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
         if waiter.state.load(Ordering::SeqCst) == 0 {
             waiter.state.store(result, Ordering::SeqCst);
-            let key = (mem.id(), addr, private);
-            if let Some(queue) = queues.get_mut(&key) {
+            if let Some(queue) = queues.get_mut(&waiter.key) {
                 queue.retain(|w| !Arc::ptr_eq(w, waiter));
                 if queue.is_empty() {
-                    queues.remove(&key);
+                    queues.remove(&waiter.key);
                 }
             }
         }
@@ -85,7 +110,7 @@ impl Futexes {
         // Validate before consulting queues, including when no waiter exists.
         mem.check_read(GuestAddr(addr), 4)
             .map_err(|_| Errno::EFAULT)?;
-        let key = (mem.id(), addr, private);
+        let key = key(mem, addr, private);
         let mut woke = 0;
         if let Some(queue) = queues.get_mut(&key) {
             queue.retain(|waiter| {

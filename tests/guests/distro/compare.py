@@ -194,9 +194,8 @@ def cases(fx):
         "dpkg-query": ["/usr/bin/dpkg-query", "-W", "-f=${Version}\\n", "bash"],
         # Signals, processes, sockets, locks and /proc. Left out until paludarium has
         # them: pseudo-terminals (python's pty, script), mkfifo, /proc/self/stat
-        # (ps), /proc/self/exe and cmdline, /proc/loadavg and meminfo, and two
-        # hangs: multiprocessing's processes joined while several write to a
-        # queue, and Node.js's child processes connected by pipes (execFile,
+        # (ps), /proc/self/exe and cmdline, /proc/loadavg and meminfo, and a
+        # hang of Node.js's child processes connected by pipes (execFile,
         # spawnSync).
         "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
         "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],

@@ -71,7 +71,7 @@ impl Default for ThreadGroup {
             timer_generation: AtomicU64::new(0),
             nofile: AtomicU64::new(1024),
             fsize: AtomicU64::new(u64::MAX),
-            futexes: Futexes::default(),
+            futexes: Futexes::machine(),
             timers: Mutex::default(),
             cpu: Mutex::default(),
             core: Mutex::default(),
@@ -1060,7 +1060,7 @@ impl Kernel {
             let now = match self.host.clock(clock) {
                 Ok(now) => now,
                 Err(error) => {
-                    self.group.futexes.finish(mem, uaddr, private, &waiter, 3);
+                    self.group.futexes.finish(&waiter, 3);
                     return Err(error);
                 }
             };
@@ -1075,9 +1075,7 @@ impl Kernel {
                 0
             };
             if result != 0 {
-                self.group
-                    .futexes
-                    .finish(mem, uaddr, private, &waiter, result);
+                self.group.futexes.finish(&waiter, result);
                 continue;
             }
             let end = deadline
@@ -1090,7 +1088,7 @@ impl Kernel {
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        self.group.futexes.finish(mem, uaddr, private, &waiter, 3);
+                        self.group.futexes.finish(&waiter, 3);
                         return Err(error);
                     }
                 };

@@ -2671,6 +2671,16 @@ impl AddressSpace {
     pub fn resident(&self, addr: GuestAddr) -> Option<bool> {
         self.locked().resident(addr.page_align_down().0)
     }
+    /// Where `addr` lies in shared memory, if a shared mapping holds it: the
+    /// memory's id and the offset in it. Every mapping of that memory, in
+    /// any address space, gives the same pair, as the inode and page index of
+    /// Linux's `get_futex_key` do.
+    #[must_use]
+    pub fn shared_offset(&self, addr: GuestAddr) -> Option<(u64, u64)> {
+        self.locked()
+            .shared_at(addr.0)
+            .map(|shared| (shared.pages.id, addr.0.wrapping_add(shared.shift)))
+    }
     /// The file the mapping at `addr` maps, for a core's `NT_FILE` note.
     pub fn mapped_file(&self, addr: GuestAddr) -> Option<MappedFile> {
         let (source, offset) = self.locked().mapped_file(addr.0)?;

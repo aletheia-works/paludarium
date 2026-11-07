@@ -2941,6 +2941,87 @@ static int robust_list_cases(const char *self) {
     return 0;
 }
 
+/* A futex word in shared memory is the same word in every process that maps
+   it (kernel/futex/core.c's get_futex_key), however each maps it. The parent
+   wakes until a wake reaches the waiting child, so no sleep sets the order. */
+static long futex_call(volatile unsigned *word, long op, unsigned value) {
+    return syscall(SYS_futex, word, op, value, NULL, NULL, 0);
+}
+
+/* The child waits on `wait_at` until woken; the parent wakes at `wake_at`.
+   A private wake names the parent's own memory, so it never reaches it. */
+static void futex_shared_show(const char *label, volatile unsigned *wait_at,
+                              volatile unsigned *wake_at, int remap_fd) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) {
+        printf("%s: fork failed\n", label);
+        return;
+    }
+    if (!child) {
+        volatile unsigned *at = wait_at;
+        if (remap_fd >= 0) {
+            /* The second page of the file, wherever this mapping lands. */
+            char *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, remap_fd, 4096);
+            if (page == MAP_FAILED) _exit(2);
+            at = (volatile unsigned *)(page + 8);
+        }
+        long r = futex_call(at, 0 /* FUTEX_WAIT */, 0);
+        _exit(r == 0 ? 0 : 1);
+    }
+    long private = futex_call(wake_at, 1 | 128 /* FUTEX_WAKE_PRIVATE */, 1);
+    long woke;
+    while ((woke = futex_call(wake_at, 1 /* FUTEX_WAKE */, 1)) == 0) sched_yield();
+    int status;
+    waitpid(child, &status, 0);
+    printf("%s: private wake=%ld shared wake=%ld child status=%d\n", label, private, woke, status);
+}
+
+static int futex_shared_cases(void) {
+    char *anonymous = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (anonymous == MAP_FAILED) return 80;
+    volatile unsigned *word = (volatile unsigned *)(anonymous + 8);
+    futex_shared_show("anonymous", word, word, -1);
+
+    int fd = (int)syscall(SYS_memfd_create, "futex", 0);
+    if (fd < 0 || ftruncate(fd, 2 * 4096)) return 81;
+    char *file = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (file == MAP_FAILED) return 82;
+    volatile unsigned *second = (volatile unsigned *)(file + 4096 + 8);
+    futex_shared_show("file-other-mapping", second, second, fd);
+
+    /* A process-shared robust mutex whose owner ends while the parent waits:
+       the end's wake reaches the parent, which gets EOWNERDEAD. */
+    pthread_mutex_t *mutex = (pthread_mutex_t *)(anonymous + 64);
+    pthread_mutexattr_t attributes;
+    pthread_mutexattr_init(&attributes);
+    pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED);
+    pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST);
+    pthread_mutex_init(mutex, &attributes);
+    volatile int *held = (volatile int *)(anonymous + 32);
+    *held = 0;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 83;
+    if (!child) {
+        if (pthread_mutex_lock(mutex)) _exit(2);
+        *held = 1;
+        /* Ends once the parent waits: musl marks the lock word (the
+           mutex's second int) waited on, its top bit, before its futex wait. */
+        while (!(((volatile unsigned *)mutex)[1] & 0x80000000u)) sched_yield();
+        _exit(0);
+    }
+    while (!*held) sched_yield();
+    int r = pthread_mutex_lock(mutex);
+    printf("robust-owner-ended: lock=%s\n", r == EOWNERDEAD ? "EOWNERDEAD" : r == 0 ? "0" : "other");
+    if (r == EOWNERDEAD) pthread_mutex_consistent(mutex);
+    pthread_mutex_unlock(mutex);
+    int status;
+    waitpid(child, &status, 0);
+    printf("robust-owner-ended: child status=%d\n", status);
+    return 0;
+}
+
 static void lock_show(const char *label, long number, void *at, size_t length, long flags) {
     errno = 0;
     long r = syscall(number, at, length, flags);
@@ -10957,6 +11038,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-maps")) return maps_cases(argv[2]);
     if (!strcmp(mode, "proc-maps-after-exec")) return maps_after_exec(argv[2]);
     if (!strcmp(mode, "robust-list")) return robust_list_cases(self);
+    if (!strcmp(mode, "futex-shared")) return futex_shared_cases();
     if (!strcmp(mode, "robust-list-after-exec")) {
         void *head = (void *)1;
         size_t length = 0;

@@ -123,7 +123,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   は先に、`CLONE_FILES` のスレッドと共有している表をそのスレッド専用の写しにします。
   共有していたスレッドのディスクリプタはそのまま残ります。未知のフラグや `last` より
   大きい `first` は `EINVAL` です。
-- `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET` を扱います。
+- `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET` を扱います。ワードは Linux の
+  `get_futex_key` と同じように見分けます。共有マッピング（共有の無名メモリかファイルのもの）では、
+  shared の操作はそのメモリとその中のオフセットを指すので、wake はそのメモリをマップしている
+  どのプロセスの待ち手にも、どこにマップしていても届きます。それ以外のワードと private の操作は、
+  このプロセスのアドレス空間とアドレスを指すので、private の wake はほかのプロセスに届きません。
+  プロセス間で共有する mutex とセマフォ（Python の `multiprocessing`）も、持ち主が終わった
+  robust futex の wake も、こうして動きます。
 - `set_robust_list` と `get_robust_list` は、スレッドごとの robust futex のリストを
   持ちます。glibc と musl の robust mutex に必要です。スレッドが終わるときと `execve`
   のときに、Linux の `exit_robust_list` と同じようにリストをたどります。スレッドが

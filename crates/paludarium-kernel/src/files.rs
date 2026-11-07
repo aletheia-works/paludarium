@@ -1,5 +1,6 @@
 //! Linux x86-64 file ABI and descriptor table. All guest memory is checked.
 use crate::syscalls::{Context, Outcome};
+mod xattrs;
 use paludarium_host::{ClockId, FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{FileSystem, HostFs, MemFs};
@@ -8,8 +9,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
-    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 137, 138, 162, 217, 221, 257, 258, 260,
-    262, 263, 264, 265, 266, 267, 268, 269, 280, 285, 292, 293, 295, 296, 319, 326, 332, 436, 439,
+    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 137, 138, 162, 188, 189, 190, 191, 192,
+    193, 194, 195, 196, 197, 198, 199, 217, 221, 257, 258, 260, 262, 263, 264, 265, 266, 267, 268,
+    269, 280, 285, 292, 293, 295, 296, 319, 326, 332, 436, 439,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -2245,6 +2247,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 crate::permissions::chmod(&c.process.credentials, &file.stat()?, a[1] as u32)?;
             file.set_mode(mode).map(|()| 0)
         }
+        // Extended attributes.
+        188..=199 => xattrs::call(c, n, a),
         // chown, fchown, lchown, fchownat
         92 | 94 => {
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], n == 92)?;

@@ -175,6 +175,10 @@ impl Credentials {
             ..self.clone()
         })
     }
+    /// CAP_SYS_ADMIN, which `trusted.*` and `security.*` attributes ask for.
+    pub(crate) fn may_administer(&self) -> bool {
+        self.effective & CAP_SYS_ADMIN != 0
+    }
     /// Linux's `scm_check_creds`, for what `SCM_CREDENTIALS` may say: the
     /// caller's own process, or CAP_SYS_ADMIN; one of its real, effective
     /// and saved user IDs, or CAP_SETUID; and one of its group IDs, or

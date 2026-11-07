@@ -452,6 +452,9 @@ impl FileHandle for CoherentFile {
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
         self.inner.set_flags(flags)
     }
+    fn with_xattrs(&self, f: &mut dyn FnMut(&mut paludarium_host::Xattrs)) -> Result<(), Errno> {
+        self.inner.with_xattrs(f)
+    }
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         self.inner.set_mode(mode)
     }
@@ -571,6 +574,14 @@ impl HostFs for CoherentFs {
     }
     fn statfs(&self, path: &[u8]) -> Result<FsStats, Errno> {
         self.inner.statfs(path)
+    }
+    fn with_xattrs(
+        &self,
+        path: &[u8],
+        follow: bool,
+        f: &mut dyn FnMut(&mut paludarium_host::Xattrs),
+    ) -> Result<(), Errno> {
+        self.inner.with_xattrs(path, follow, f)
     }
     fn set_mode(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
         self.inner.set_mode(path, mode)

@@ -136,6 +136,11 @@ verified.
     locked memory where Linux gives `EINVAL`, `mlock` succeeds on the pages of a
     file mapping past the end of the file where Linux gives `ENOMEM`, and
     `/proc` shows no locked memory.
+- **Extended attributes**: a mounted host directory behaves as a file system
+  without them, so reading finds none (`ENODATA`) and writing gives `EOPNOTSUPP`.
+  In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), a value
+  of `security.capability` is not checked, and a sticky directory does not limit
+  `user.*` to its owner.
 - **File owners**: a file in a mounted host directory stays root's, so
   `chown` to any other owner or group returns `EPERM` there, and a file a
   guest that is not root makes there is root's too, which that guest may

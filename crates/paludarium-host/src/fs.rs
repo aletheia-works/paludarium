@@ -39,6 +39,8 @@ pub struct DirectoryEntry {
     pub inode: u64,
     pub kind: u8,
 }
+/// A file's extended attributes, by full name (`user.a`).
+pub type Xattrs = std::collections::BTreeMap<Vec<u8>, Vec<u8>>;
 pub trait FileHandle: Send + Sync {
     /// Guest poll mask and separate rising-edge generations for input/output.
     /// Kernel-owned descriptions override this; ordinary files cannot join epoll.
@@ -63,6 +65,10 @@ pub trait FileHandle: Send + Sync {
     fn flock(&self, op: u32) -> Result<(), Errno>;
     fn flags(&self) -> u32;
     fn set_flags(&self, flags: u32) -> Result<(), Errno>;
+    /// Runs `f` on the file's extended attributes; `EOPNOTSUPP` if it has none.
+    fn with_xattrs(&self, _f: &mut dyn FnMut(&mut Xattrs)) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
     /// `fchmod`: replaces the permission bits with the low 12 bits of `mode`.
     fn set_mode(&self, _mode: u32) -> Result<(), Errno> {
         Err(Errno::EPERM)
@@ -140,6 +146,16 @@ pub trait HostFs: Send + Sync {
     /// path makes one; its status, whose inode the socket is found by.
     fn make_socket(&self, _path: &[u8], _mode: u32) -> Result<FileStat, Errno> {
         Err(Errno::EPERM)
+    }
+    /// As [`FileHandle::with_xattrs`], for `path`; with `follow` false a final
+    /// symbolic link itself is meant.
+    fn with_xattrs(
+        &self,
+        _path: &[u8],
+        _follow: bool,
+        _f: &mut dyn FnMut(&mut Xattrs),
+    ) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
     }
     /// `chmod`: replaces the permission bits of `path` (following a final
     /// symbolic link) with the low 12 bits of `mode`.

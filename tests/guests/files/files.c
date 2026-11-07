@@ -5,7 +5,7 @@ static long call(long n,long a,long b,long c,long d,long e,long f) {
 }
 #define S(n,a,b,c) call(n,(long)(a),(long)(b),(long)(c),0,0,0)
 static char p[]="/tmp/paludarium-files-fixture",q[]="/tmp/paludarium-files-link",r[]="/tmp/paludarium-files-renamed";
-static char buf[4096]; static long results[64]; static unsigned char st[144];
+static char buf[4096]; static long results[96]; static unsigned char st[144];
 /* "/proc/self/fd/<n>", and whether a read link (n bytes) is b. */
 static char *numbered(const char *s,long n) {
  static char b[32]; char *q=b; char d[12]; int k=0;
@@ -182,6 +182,92 @@ void _start(void) {
   while((n=S(217,l,buf,32))>0)if(buf[19]=='f')seen++;
   results[x++]=seen;results[x++]=S(84,d,0,0);
   S(3,l,0,0);}
+ if(CASE==53){ /* extended attributes in user.*, as any owner of the file may use them */
+  static char f[]="/tmp/paludarium-files-xattr",l[]="/tmp/paludarium-files-xattr-link",h[]="/tmp/paludarium-files-xattr-hard";
+  static char d[]="/tmp/paludarium-files-xattr-dir",n[]="/tmp/paludarium-files-xattr-none";
+  static char a[]="user.a",b[]="user.b",none[]="user.none",other[]="unknown.a",empty[]="";
+  static char longest[256],toolong[257],big[65537];
+  S(87,l,0,0);S(87,h,0,0);S(87,f,0,0);S(84,d,0,0);
+  long c=S(2,f,66,0644);results[x++]=c>=0;
+  /* A set, then a get of the size, of the value, and with too small a buffer. */
+  results[x++]=call(188,(long)f,(long)a,(long)"one",3,0,0);
+  results[x++]=call(191,(long)f,(long)a,0,0,0,0);
+  results[x++]=call(191,(long)f,(long)a,(long)buf,8,0,0);results[x++]=buf[0];results[x++]=buf[2];
+  results[x++]=call(191,(long)f,(long)a,(long)buf,2,0,0);
+  results[x++]=call(191,(long)f,(long)none,(long)buf,8,0,0);
+  /* Flags. */
+  results[x++]=call(188,(long)f,(long)a,(long)"x",1,1,0);
+  results[x++]=call(188,(long)f,(long)b,(long)"x",1,2,0);
+  results[x++]=call(188,(long)f,(long)a,(long)"two!",4,2,0);
+  results[x++]=call(188,(long)f,(long)b,(long)"bb",2,1,0);
+  results[x++]=call(188,(long)f,(long)a,(long)"x",1,4,0);
+  results[x++]=call(191,(long)f,(long)a,0,0,0,0);
+  /* An empty value is a value. */
+  results[x++]=call(188,(long)f,(long)"user.e",(long)"",0,0,0);
+  results[x++]=call(191,(long)f,(long)"user.e",(long)buf,8,0,0);
+  results[x++]=call(197,(long)f,(long)"user.e",0,0,0,0);
+  /* The list: its size, too small a buffer, and the names in any order. */
+  long size=call(194,(long)f,0,0,0,0,0);results[x++]=size;
+  results[x++]=call(194,(long)f,(long)buf,1,0,0,0);
+  long listed=call(194,(long)f,(long)buf,sizeof(buf),0,0,0);results[x++]=listed;
+  long sum=0,names=0;for(long i=0;i<listed;i++){sum+=buf[i];names+=!buf[i];}
+  results[x++]=sum;results[x++]=names;
+  /* Names. */
+  for(int i=0;i<255;i++){longest[i]='x';toolong[i]='x';}toolong[255]='x';
+  char *prefix="user.";for(int i=0;i<5;i++){longest[i]=prefix[i];toolong[i]=prefix[i];}
+  results[x++]=call(191,(long)f,(long)longest,(long)buf,8,0,0);
+  results[x++]=call(191,(long)f,(long)toolong,(long)buf,8,0,0);
+  results[x++]=call(188,(long)f,(long)toolong,(long)"x",1,0,0);
+  results[x++]=call(191,(long)f,(long)empty,(long)buf,8,0,0);
+  results[x++]=call(188,(long)f,(long)empty,(long)"x",1,0,0);
+  results[x++]=call(191,(long)f,(long)"user.",(long)buf,8,0,0);
+  results[x++]=call(188,(long)f,(long)"user.",(long)"x",1,0,0);
+  results[x++]=call(191,(long)f,(long)other,(long)buf,8,0,0);
+  results[x++]=call(188,(long)f,(long)other,(long)"x",1,0,0);
+  results[x++]=call(197,(long)f,(long)other,0,0,0,0);
+  results[x++]=call(191,(long)f,16,(long)buf,8,0,0);
+  results[x++]=call(188,(long)f,16,(long)"x",1,0,0);
+  /* Values. */
+  results[x++]=call(188,(long)f,(long)a,(long)big,65537,0,0);
+  results[x++]=call(188,(long)f,(long)a,16,1,0,0);
+  results[x++]=call(191,(long)f,(long)a,16,8,0,0);
+  results[x++]=call(194,(long)f,16,64,0,0,0);
+  /* A symbolic link: user.* is for files and directories. */
+  S(88,f,l,0);
+  results[x++]=call(191,(long)l,(long)a,0,0,0,0);
+  results[x++]=call(192,(long)l,(long)a,0,0,0,0);
+  results[x++]=call(189,(long)l,(long)a,(long)"x",1,0,0);
+  results[x++]=call(198,(long)l,(long)a,0,0,0,0);
+  results[x++]=call(195,(long)l,0,0,0,0,0);
+  results[x++]=call(194,(long)l,0,0,0,0,0);
+  /* A hard link and a rename keep them. */
+  S(86,f,h,0);results[x++]=call(191,(long)h,(long)a,0,0,0,0);
+  /* A directory has them too. */
+  results[x++]=S(83,d,0755,0);
+  results[x++]=call(188,(long)d,(long)a,(long)"d",1,0,0);
+  results[x++]=call(191,(long)d,(long)a,0,0,0,0);
+  /* Paths and descriptors. */
+  results[x++]=call(191,(long)n,(long)a,(long)buf,8,0,0);
+  results[x++]=call(188,(long)n,(long)a,(long)"x",1,0,0);
+  results[x++]=call(194,(long)n,0,0,0,0,0);
+  results[x++]=call(197,(long)n,(long)a,0,0,0,0);
+  results[x++]=call(193,c,(long)a,0,0,0,0);
+  results[x++]=call(190,c,(long)"user.c",(long)"cc",2,0,0);
+  results[x++]=call(196,c,0,0,0,0,0);
+  results[x++]=call(199,c,(long)"user.c",0,0,0,0);
+  results[x++]=call(199,c,(long)"user.c",0,0,0,0);
+  results[x++]=call(193,-1,(long)a,0,0,0,0);
+  results[x++]=call(190,-1,(long)a,(long)"x",1,0,0);
+  results[x++]=call(196,-1,0,0,0,0,0);
+  results[x++]=call(199,-1,(long)a,0,0,0,0);
+  /* Removing, and an open file with no name left. */
+  results[x++]=call(197,(long)f,(long)b,0,0,0,0);
+  results[x++]=call(197,(long)f,(long)b,0,0,0,0);
+  results[x++]=call(191,(long)f,(long)b,0,0,0,0);
+  S(87,l,0,0);S(87,h,0,0);S(87,f,0,0);
+  results[x++]=call(193,c,(long)a,0,0,0,0);
+  results[x++]=call(190,c,(long)b,(long)"x",1,0,0);
+  S(3,c,0,0);S(84,d,0,0);}
  if(CASE==51){ /* getdents64 lists in the file system's order, the same on every read */
   static char d[]="/tmp/paludarium-files-order",f[]="/tmp/paludarium-files-order/f00";
   char *tens=f+sizeof(f)-3,*ones=f+sizeof(f)-2;

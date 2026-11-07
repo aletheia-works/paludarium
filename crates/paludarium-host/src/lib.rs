@@ -37,7 +37,7 @@ mod native_fs;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_net;
 pub mod net;
-pub use fs::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs};
+pub use fs::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs, Xattrs};
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_fs::NativeFs;
 #[cfg(target_arch = "wasm32")]

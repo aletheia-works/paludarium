@@ -2950,10 +2950,13 @@ static void lock_show(const char *label, long number, void *at, size_t length, l
 static void lock_all_show(long flags) {
     errno = 0;
     long r = syscall(SYS_mlockall, flags);
-    int e = errno;
+    /* Whether the flags are valid: MCL_CURRENT then asks RLIMIT_MEMLOCK for all
+       that is mapped, which is ENOMEM for a user without CAP_IPC_LOCK and not
+       for root, as the guest. A unit test holds the result for root. */
+    int invalid = r == -1 && errno == EINVAL;
     errno = 0;
     long undone = syscall(SYS_munlockall);
-    printf("mlockall %ld: r=%ld errno=%d, munlockall r=%ld errno=%d\n", flags, r, e, undone, errno);
+    printf("mlockall %ld: invalid=%d, munlockall r=%ld errno=%d\n", flags, invalid, undone, errno);
 }
 
 static int lock_cases(void) {
@@ -2964,6 +2967,9 @@ static int lock_cases(void) {
     char *a = mmap(base + 2 * page, 4 * page, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (a == MAP_FAILED) return 81;
     a[page] = 42;
+    /* A hole of our own, not to depend on what mmap put after the mapping. */
+    char *before_hole = mmap(base + 11 * page, (size_t)page, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (before_hole == MAP_FAILED || munmap(base + 12 * page, (size_t)page)) return 84;
     long numbers[] = {SYS_mlock, SYS_munlock, SYS_mlock2};
     const char *names[] = {"mlock", "munlock", "mlock2"};
     for (int i = 0; i < 3; i++) {
@@ -2978,7 +2984,7 @@ static int lock_cases(void) {
         lock_show("no-access", n, base, (size_t)page, 0);
         lock_show("across-protections", n, base, (size_t)(4 * page), 0);
         lock_show("unmapped", n, (void *)(uintptr_t)page, (size_t)page, 0);
-        lock_show("runs-past-mapping", n, base + 15 * page, (size_t)(4 * page), 0);
+        lock_show("runs-past-mapping", n, before_hole, (size_t)(2 * page), 0);
         /* A lock looks at RLIMIT_MEMLOCK first, which only a user without
            CAP_IPC_LOCK meets: ENOMEM there and EINVAL for root, as the guest. */
         if (n == SYS_munlock) lock_show("huge", n, a, (size_t)-4096, 0);

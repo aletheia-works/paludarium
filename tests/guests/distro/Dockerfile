@@ -6,7 +6,8 @@
 FROM debian:trixie
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    bc binutils bzip2 ca-certificates cmake coreutils curl dc file findutils g++ gawk gcc gdb git \
-    gnupg jq less libc6-dev lua5.4 make mawk nodejs openssh-client openssl perl php-cli python3 \
-    rsync ruby sqlite3 tar tcl vim-tiny xxd xz-utils zstd \
+    bc binutils bsdutils bzip2 ca-certificates cmake coreutils curl dc diffutils file findutils \
+    g++ gawk gcc gdb git gnupg jq less libc6-dev lua5.4 make mawk nodejs openssh-client openssl \
+    patch perl php-cli procps python3 rsync ruby sqlite3 tar tcl tzdata unzip util-linux \
+    vim-tiny xxd xz-utils zip zstd \
  && rm -rf /var/lib/apt/lists/*

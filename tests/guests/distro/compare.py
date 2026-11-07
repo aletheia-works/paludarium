@@ -23,10 +23,14 @@ import subprocess
 import sys
 import time
 
-# Even if every case ran out its time, the run would end within the workflow's
-# 90 minutes: 53 cases on 4 workers, 360 s each. The slowest case takes about
-# 75 s under the emulator on CI, and under a second natively.
-NATIVE_TIMEOUT = 60
+# Even if every case ran out its time, the cases would end in about 116
+# minutes (83 cases on 4 workers, 330 s each), within the workflow's 150 with
+# room for the checkout, the build and the image. results.json is written
+# after each case, so a job stopped at its limit still keeps the ones that
+# ended. The slowest case, g++, took 75 to 150 s under the emulator on CI, and
+# under a second natively.
+SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+NATIVE_TIMEOUT = 30
 EMULATED_TIMEOUT = 300
 
 
@@ -61,6 +65,10 @@ def fixtures(work):
         "n.json": "[1,2,3.5]",
         "b.bc": "scale=20\ns(1)\ne(1)\nsqrt(2)\nquit\n",
         "x.tcl": 'puts [expr {sin(1)}]\nputs [format "%.4f" [expr {2.0/3}]]\nputs [exec echo sub]\n',
+        "Makefile.j": "all: "
+        + " ".join(f"t{i}" for i in range(8))
+        + "\n\t@cat $(O)/t* | sort -n | tr '\\n' ' '; echo\n"
+        + "".join(f"t{i}:\n\t@echo {i} > $(O)/t{i}\n" for i in range(8)),
     }
     for name, text in files.items():
         with open(os.path.join(fx, name), "w") as file:
@@ -184,6 +192,114 @@ def cases(fx):
         "xxd": ["/usr/bin/xxd", "-l", "32", f"{fx}/words"],
         "less": shell("less -F /etc/os-release | wc -l"),
         "dpkg-query": ["/usr/bin/dpkg-query", "-W", "-f=${Version}\\n", "bash"],
+        # Signals, processes, sockets, locks and /proc. Left out until paludarium has
+        # them: pseudo-terminals (python's pty, script), mkfifo, /proc/self/stat
+        # (ps), fcntl's byte-range locks (sqlite's WAL), /proc/self/exe and
+        # cmdline, /proc/loadavg and meminfo, and two hangs: multiprocessing's
+        # processes joined while several write to a queue, and Node.js's child
+        # processes connected by pipes (execFile, spawnSync).
+        "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
+        "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],
+        "python-processes": ["/usr/bin/python3", f"{SCRIPTS}/processes.py"],
+        "python-proc": ["/usr/bin/python3", f"{SCRIPTS}/proc.py"],
+        "timeout": shell("timeout 0.2 sleep 5; echo $?; timeout -s KILL 0.2 sleep 5; echo $?"),
+        "bash-trap": shell(
+            "trap 'echo got USR1' USR1; kill -USR1 $$; echo after; "
+            "trap 'echo exit trap' EXIT; (exit 4); echo sub $?"
+        ),
+        "bash-jobs": shell(
+            "for i in $(seq 20); do (echo $i) & done | sort -n | tr '\\n' ' '; echo; "
+            "sleep 5 & kill %1; wait %1; echo status $?"
+        ),
+        "xargs": shell("seq 100 | xargs -P4 -n10 echo | wc -l"),
+        "text": shell(
+            "printf 'b\\na\\nc\\na\\n' | sort | uniq -c; echo abc | tr a-c x-z; seq 10 | paste -sd+ | bc; "
+            "printf 'x\\ty\\n' | expand -t4; seq 5 | tac | nl; echo hello | base64 | base64 -d; "
+            f"cut -d' ' -f2 {fx}/words | head -3; join <(seq 3) <(seq 2 4); comm -12 <(seq 4) <(seq 3 6)"
+        ),
+        "files": shell(
+            "cd {O} && mkdir -p a/b && echo x > a/b/f && cp -a a c && ln -s c/b/f l && readlink l && "
+            "mv c d && du -sb a/b/f | cut -f1 && chmod 640 a/b/f && stat -c %a a/b/f && "
+            "touch -d @0 a/b/f && stat -c %Y a/b/f && ls -R a d && install -m 700 a/b/f e && stat -c %a e && "
+            "realpath -s --relative-to=. d/b/f && rm -r a && ls"
+        ),
+        "split": shell(
+            "cd {O} && seq 1000 > n && split -l 300 n p && wc -l p* && cat p* | cmp - n && echo same"
+        ),
+        "flock": shell(
+            "flock {O}/l -c 'echo locked'; flock {O}/l -c 'flock -n {O}/l true; echo inner $?'"
+        ),
+        "perl-fork": [
+            "/usr/bin/perl",
+            "-e",
+            'pipe(R,W); if (my $p = fork) { close W; print <R>; waitpid($p, 0); print $? >> 8, "\\n" } '
+            'else { close R; print W "child\\n"; exit 3 }',
+        ],
+        "ruby-io": [
+            "/usr/bin/ruby",
+            "-e",
+            'r, w = IO.pipe; pid = fork { r.close; w.puts "kid"; exit 4 }; w.close; puts r.read; '
+            "Process.wait(pid); puts $?.exitstatus; q = Queue.new; "
+            "4.times.map { |i| Thread.new { q << i * i } }.each(&:join); puts 4.times.map { q.pop }.sort.inspect",
+        ],
+        "node-worker": [
+            "/usr/bin/node",
+            "-e",
+            'const { Worker } = require("worker_threads"); '
+            "new Worker(\"require('worker_threads').parentPort.postMessage(6 * 7)\", { eval: true })"
+            '.on("message", (m) => console.log("worker", m));',
+        ],
+        "php-proc": [
+            "/usr/bin/php",
+            "-n",
+            "-r",
+            '$p = proc_open(["/bin/cat"], [["pipe", "r"], ["pipe", "w"]], $io); fwrite($io[0], "via cat\\n"); '
+            'fclose($io[0]); echo stream_get_contents($io[1]); echo proc_close($p), "\\n";',
+        ],
+        "lua-popen": [
+            "/usr/bin/lua5.4",
+            "-e",
+            'local f = io.popen("echo popen"); io.write(f:read("a")); print(f:close())',
+        ],
+        "gawk-coprocess": [
+            "/usr/bin/gawk",
+            'BEGIN { while (("seq 3" | getline x) > 0) s += x; print s; '
+            'print "z\\ny" |& "sort"; close("sort", "to"); while (("sort" |& getline l) > 0) print l }',
+        ],
+        "git-clone": shell(
+            "cd {O} && git init -q -b main a && cd a && git config user.email a@b && git config user.name a && "
+            "for i in 1 2 3; do echo $i > f$i; git add f$i; "
+            "GIT_AUTHOR_DATE=2001-01-01T00:00:00Z GIT_COMMITTER_DATE=2001-01-01T00:00:00Z git commit -qm c$i; done && "
+            "git gc -q && cd .. && git clone -q a b && cd b && git rev-parse HEAD && git log --oneline | wc -l && "
+            "git fsck --no-progress && echo fsck ok"
+        ),
+        "zip": shell(
+            "cd {O} && zip -qr z.zip /usr/share/doc/bash -x '*.gz' && unzip -l z.zip | tail -1 | awk '{print $2}' && "
+            "mkdir x && unzip -q z.zip -d x && find x -type f | wc -l"
+        ),
+        "diff-patch": shell(
+            "cd {O} && seq 10 > a && seq 10 | sed 5d > b && diff -u a b > d; echo $?; "
+            "cp a c && patch -s c d && cmp b c && echo patched"
+        ),
+        "make-j": ["/usr/bin/make", "-j4", "-s", "-f", f"{fx}/Makefile.j", "O={O}"],
+        "nproc": shell(
+            'test "$(nproc)" = "$(getconf _NPROCESSORS_ONLN)" && echo agree; getconf PAGESIZE'
+        ),
+        "env": shell("env -i /usr/bin/env; env -i A=1 /usr/bin/env"),
+        "iconv": shell("printf 'caf\\303\\251\\n' | iconv -f UTF-8 -t ISO-8859-1 | od -An -tx1"),
+        "dd": shell(
+            "dd if=/dev/zero bs=1k count=100 status=none | wc -c; "
+            "dd if=/dev/urandom bs=1 count=16 status=none | wc -c"
+        ),
+        "tz": shell(
+            "TZ=Asia/Tokyo date -d @0 '+%F %T %Z'; TZ=America/New_York date -d @1700000000 '+%F %T %Z'"
+        ),
+        "sort-parallel": shell(f"sort --parallel=4 -S 1M -n -T {{O}} {fx}/words | sha256sum"),
+        "find-exec": shell("find /usr/share/doc/bash -type f -exec wc -c {} + | tail -1"),
+        "tar-gz": shell(
+            "cd {O} && mkdir t && echo a > t/f && chmod 751 t/f && ln -s f t/l && tar czf t.tgz t && "
+            "mkdir x && tar xzf t.tgz -C x && stat -c '%a %F' x/t/f x/t/l"
+        ),
     }
 
 
@@ -198,12 +314,17 @@ def environment(work):
     }
 
 
-def command(argv, directory, emulator, env):
+# The emulator's own options for a case. Without --allow-net a guest has no
+# network, not even a loopback (docs/guide/features.md#network).
+OPTIONS = {"python-sockets": ["--allow-net", "127.0.0.1"]}
+
+
+def command(argv, directory, emulator, env, options=()):
     """The argv with {O} replaced, run directly or through the emulator."""
     argv = [part.replace("{O}", directory) for part in argv]
     if emulator is None:
         return argv
-    options = [emulator, "--report-enosys", "--mount", "/:/"]
+    options = [emulator, "--report-enosys", "--mount", "/:/", *options]
     for key, value in env.items():
         options += ["--env", f"{key}={value}"]
     return options + argv
@@ -216,7 +337,7 @@ def run(name, argv, work, emulator, env):
     started = time.monotonic()
     try:
         process = subprocess.run(
-            command(argv, directory, emulator, env),
+            command(argv, directory, emulator, env, OPTIONS.get(name, ())),
             env=env,
             capture_output=True,
             stdin=subprocess.DEVNULL,

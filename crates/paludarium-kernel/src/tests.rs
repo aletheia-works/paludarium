@@ -1007,6 +1007,7 @@ fn set_and_get_robust_list_check_their_arguments() {
         errno(Errno::EFAULT)
     );
 }
+
 #[test]
 fn memory_locks_check_their_range_and_flags() {
     let mut f = fixture();

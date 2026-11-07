@@ -74,6 +74,9 @@ kernel.
   one file). `sendfile` reads a regular file into any writable file, a pipe
   taking at most its capacity per call. Both update the given offsets or the
   file positions; `sendfile` writes its offset back even after an error.
+- `getdents64` goes on from what it has returned, so unlinking those entries
+  skips nothing. `lseek` to a `d_off` leads to the same entry while the
+  directory is unchanged, and `dup` and `fork` share the place.
 - `statx` reports the fields a `stat` has (`STATX_BASIC_STATS`) and the
   mount's `st_dev` as its device numbers, with Linux's flag and mask checks
   (`EINVAL`). `AT_EMPTY_PATH` names the descriptor, or the working directory

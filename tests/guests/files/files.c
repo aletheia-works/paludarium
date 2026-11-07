@@ -143,6 +143,45 @@ void _start(void) {
    results[x++]=S(8,l,0,0);
   }
   S(3,l,0,0);S(87,f,0,0);S(84,d,0,0);}
+ if(CASE==52){ /* getdents64 goes on by what it returned: unlinks, seeks, dup and fork */
+  static char d[]="/tmp/paludarium-files-unlinks",f[]="/tmp/paludarium-files-unlinks/f00";
+  char *tens=f+sizeof(f)-3,*ones=f+sizeof(f)-2;
+  for(long i=0;i<30;i++){*tens='0'+i/10;*ones='0'+i%10;S(87,f,0,0);}
+  S(84,d,0,0);results[x++]=S(83,d,0755,0);
+  for(long i=0;i<30;i++){*tens='0'+i/10;*ones='0'+i%10;S(3,S(2,f,66,0644),0,0);}
+  long l=S(2,d,0200000,0),n;
+  /* What a file entry's name was at each step: an entry a call. */
+  static char first[8],again[8];
+  long off=0,seen=0;
+  for(long i=0;i<5&&(n=S(217,l,buf,32))>0;i++)if(i==4)off=*(long*)(buf+8);
+  n=S(217,l,buf,32);for(int i=0;i<8;i++)first[i]=buf[19+i];
+  /* A saved offset leads to the same entry, also on a new description. */
+  results[x++]=S(8,l,off,0)==off;
+  S(217,l,buf,32);for(int i=0;i<8;i++)again[i]=buf[19+i];
+  long same=1;for(int i=0;i<8;i++)same&=first[i]==again[i];results[x++]=same;
+  long other=S(2,d,0200000,0);S(8,other,off,0);S(217,other,buf,32);
+  same=1;for(int i=0;i<8;i++)same&=first[i]==buf[19+i];results[x++]=same;S(3,other,0,0);
+  /* dup and fork share the position: every entry comes once. */
+  S(8,l,0,0);long copy=S(32,l,0,0);seen=0;
+  for(long i=0;i<4;i++)if(S(217,i&1?copy:l,buf,32)>0)seen++;
+  long pid=S(57,0,0,0);
+  if(!pid){S(217,l,buf,32);S(60,0,0,0);}
+  call(61,pid,0,0,0,0,0);seen++;
+  while(S(217,copy,buf,32)>0)seen++;
+  results[x++]=seen;S(3,copy,0,0);
+  /* Unlinking each entry as it comes leaves none behind. */
+  S(8,l,0,0);seen=0;
+  while((n=S(217,l,buf,32))>0)
+   for(long o=0;o<n;o+=*(unsigned short*)(buf+o+16)){
+    char *name=buf+o+19;
+    if(name[0]!='f')continue;
+    *tens=name[1];*ones=name[2];results[x]=S(87,f,0,0);seen+=!results[x];
+   }
+  results[x++]=seen;results[x++]=n;
+  S(8,l,0,0);seen=0;
+  while((n=S(217,l,buf,32))>0)if(buf[19]=='f')seen++;
+  results[x++]=seen;results[x++]=S(84,d,0,0);
+  S(3,l,0,0);}
  if(CASE==51){ /* getdents64 lists in the file system's order, the same on every read */
   static char d[]="/tmp/paludarium-files-order",f[]="/tmp/paludarium-files-order/f00";
   char *tens=f+sizeof(f)-3,*ones=f+sizeof(f)-2;

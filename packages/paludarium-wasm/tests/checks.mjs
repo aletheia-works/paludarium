@@ -72,6 +72,8 @@ export async function runChecks({ wasmUrl, readGuest, native }) {
     }
     // Several simultaneous nested execution Workers use actual Arc<Session>/WasmHost objects.
     const integer = await readGuest("integer");
+    // One after the other, a run takes the Worker the one before it left.
+    for (let run = 0; run < 2; run++) await observe(runtime, integer);
     const simultaneous = await Promise.all(Array.from({ length: 4 }, () => observe(runtime, integer)));
     check(simultaneous.every(result => result.status.kind === "exited" && result.status.code === expected.get("integer").returncode), "simultaneous shared Rust sessions failed");
     results.push({ case: "simultaneous-shared-Rust-sessions", pass: true, workers: simultaneous.length });
@@ -79,7 +81,7 @@ export async function runChecks({ wasmUrl, readGuest, native }) {
     check(diagnostics.length >= 10, "nonzero nested Worker diagnostics missing");
     check(diagnostics.every(row => row.sharedMemory && row.nestedWorker && row.token === 73 && row.tlsBefore === 0 && row.tlsAfter > 0 && row.stackTop > row.regionPointer && row.tlsAfter !== row.coordinatorTls && row.threadToken !== row.coordinatorThreadToken), "shared heap/stack/TLS initialization check failed");
     // A finished run's Worker serves the next: in WebKit one that ended while a guest ran could crash the page.
-    check(new Set(diagnostics.map(row => row.workerSerial)).size < diagnostics.length, "finished Workers were not reused");
+    check(Number.isInteger(diagnostics.at(-6).workerSerial) && diagnostics.at(-6).workerSerial === diagnostics.at(-5).workerSerial, "a finished Worker was not reused");
     const concurrent = diagnostics.slice(-4);
     check(new Set(concurrent.map(row => row.stackTop)).size === 4 && new Set(concurrent.map(row => row.tlsAfter)).size === 4 && new Set(concurrent.map(row => row.threadToken)).size === 4, "concurrent nested Workers reused stack/TLS/thread identity");
     results.push({ case: "actual-shared-heap-nested-Worker", pass: true, diagnostics });

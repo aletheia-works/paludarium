@@ -948,6 +948,7 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // The closed files are released only after the table is unlocked.
     drop(fds);
     for descriptor in closed.into_iter().map(|(_, d)| d) {
+        crate::record_locks::closed(c, &descriptor);
         crate::inet::linger(c, &descriptor.file);
     }
     Ok(0)
@@ -1371,6 +1372,45 @@ fn stat(
     output(c, addr, &bytes)?;
     Ok(0)
 }
+/// Waits up to 10 ms for a lock another holder has, as a blocking `flock` or
+/// `F_SETLKW` does between its tries: `EINTR` when a signal, a group exit or
+/// a cancellation comes first.
+pub(crate) fn pause_for_lock(c: &mut Context<'_>) -> Result<(), Errno> {
+    let timer_generation = c.group.timer_generation();
+    let receipt = c.inbox.drain(c.process);
+    c.group.drain_process(c.process);
+    let now = c.host.clock(ClockId::Monotonic)?;
+    c.group.expire_timer(c.process, now);
+    if c.group.status().is_some()
+        || crate::signals::next_pending(c.process, true).is_some()
+        || receipt.interrupted
+    {
+        return Err(Errno(4));
+    }
+    if !c.inbox.owns_wake(c.cancellation)
+        && c.cancellation.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(Errno(4));
+    }
+    let outcome = c.host.wait_until(
+        ClockId::Monotonic,
+        now.saturating_add(10_000_000),
+        c.cancellation,
+    )?;
+    let receipt = c.inbox.drain(c.process);
+    c.group.drain_process(c.process);
+    if c.group.status().is_some()
+        || crate::signals::next_pending(c.process, true).is_some()
+        || receipt.interrupted
+        || (outcome == paludarium_host::WaitOutcome::Interrupted
+            && !receipt.timer_changed
+            && !receipt.signals
+            && c.group.timer_generation() == timer_generation)
+    {
+        return Err(Errno(4));
+    }
+    Ok(())
+}
 /// The device of the file a descriptor holds: a memfd's own (it is on no
 /// mount), else that of the mount holding its path.
 pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
@@ -1772,6 +1812,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&(a[0] as u32))
                 .ok_or(Errno::EBADF)?;
+            crate::record_locks::closed(c, &closed);
             crate::inet::linger(c, &closed.file);
             Ok(0)
         }
@@ -1851,6 +1892,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 ..c.files.descriptor(u64::from(old))?
             };
             if let Some(closed) = c.files.replace(new, d)? {
+                crate::record_locks::closed(c, &closed);
                 crate::inet::linger(c, &closed.file);
             }
             Ok(u64::from(new))
@@ -1912,6 +1954,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 4 => crate::fasync::set_flags(c, &d.file, a[0], a[2] as u32).map(|()| 0),
                 // The owner and signal of signal-driven I/O.
                 8..=11 | 15 | 16 => crate::fasync::fcntl(c, &d.file, a[1], a[2]),
+                // Byte-range locks: F_GETLK, F_SETLK, F_SETLKW and their OFD forms.
+                5..=7 | 36..=38 => crate::record_locks::fcntl(c, &d, a[1], a[2]),
                 _ => Err(Errno::EINVAL),
             }
         }
@@ -1920,41 +1964,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             loop {
                 match d.file.flock(a[1] as u32) {
                     Ok(()) => return Ok(0),
-                    Err(e) if e == Errno::EAGAIN && a[1] & 4 == 0 => {
-                        let timer_generation = c.group.timer_generation();
-                        let receipt = c.inbox.drain(c.process);
-                        c.group.drain_process(c.process);
-                        let now = c.host.clock(ClockId::Monotonic)?;
-                        c.group.expire_timer(c.process, now);
-                        if c.group.status().is_some()
-                            || crate::signals::next_pending(c.process, true).is_some()
-                            || receipt.interrupted
-                        {
-                            return Err(Errno(4));
-                        }
-                        if !c.inbox.owns_wake(c.cancellation)
-                            && c.cancellation.load(std::sync::atomic::Ordering::SeqCst)
-                        {
-                            return Err(Errno(4));
-                        }
-                        let outcome = c.host.wait_until(
-                            ClockId::Monotonic,
-                            now.saturating_add(10_000_000),
-                            c.cancellation,
-                        )?;
-                        let receipt = c.inbox.drain(c.process);
-                        c.group.drain_process(c.process);
-                        if c.group.status().is_some()
-                            || crate::signals::next_pending(c.process, true).is_some()
-                            || receipt.interrupted
-                            || (outcome == paludarium_host::WaitOutcome::Interrupted
-                                && !receipt.timer_changed
-                                && !receipt.signals
-                                && c.group.timer_generation() == timer_generation)
-                        {
-                            return Err(Errno(4));
-                        }
-                    }
+                    Err(e) if e == Errno::EAGAIN && a[1] & 4 == 0 => pause_for_lock(c)?,
                     Err(e) => return Err(e),
                 }
             }

@@ -121,6 +121,8 @@ pub struct Processes {
     changed: WaitToken,
     /// The owners of the open files that are neither pipes nor sockets.
     file_owners: Mutex<crate::fasync::Owners>,
+    /// The machine's byte-range locks (`fcntl`'s `F_SETLK` and OFD locks).
+    locks: crate::record_locks::Locks,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -133,6 +135,7 @@ impl Processes {
             nr_open: AtomicU64::new(NR_OPEN),
             changed: WaitToken::default(),
             file_owners: Mutex::default(),
+            locks: crate::record_locks::Locks::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -491,6 +494,9 @@ impl Processes {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&pid);
     }
+    pub(crate) fn locks(&self) -> &crate::record_locks::Locks {
+        &self.locks
+    }
     pub(crate) fn finish(&self, pid: u32, status: ExitStatus) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(&pid) {
@@ -501,6 +507,8 @@ impl Processes {
         } else {
             return;
         }
+        // An exiting process's record locks go with it (locks_remove_posix).
+        self.locks.release_process(pid);
         // The first process is the init of the emulator's PID namespace: when
         // it exits, every other process gets SIGKILL from the kernel, as in
         // Linux's zap_pid_ns_processes.
@@ -1915,6 +1923,7 @@ impl Kernel {
             processes: &self.processes,
         };
         for descriptor in closed {
+            crate::record_locks::closed(&c, &descriptor);
             crate::inet::linger(&mut c, &descriptor.file);
         }
     }

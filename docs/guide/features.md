@@ -171,6 +171,22 @@ kernel.
   file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
+- `fcntl`'s byte-range locks, as Linux's `fs/locks.c` keeps them: record
+  locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a process owns, and open
+  file description locks (`F_OFD_SETLK`, `F_OFD_SETLKW`, `F_OFD_GETLK`),
+  which a description owns, conflicting with each other. A lock on a range
+  replaces, splits or merges the owner's own there, as `posix_lock_inode`
+  does, and `F_GETLK` reports the first conflicting lock with its owner's PID
+  (-1 for a description's), or `F_UNLCK`. The arguments are checked in the
+  order of `fcntl_getlk` and `fcntl_setlk` (the whence, the range with
+  `EINVAL` or `EOVERFLOW`, the type, `EBADF` for a type the descriptor's
+  access does not allow, and an OFD lock's `l_pid`). A process's record locks
+  on a file go when it closes any descriptor of the file or exits, not with
+  `fork` or `execve`; a description's go when its last descriptor closes.
+  `F_SETLKW` waits until the range is free, `EDEADLK` when the record locks
+  of processes waiting for each other (up to 10) would close a cycle. The
+  locks are the guest's own: a program on the host does not see them, nor
+  they its.
 - A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
   `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
   at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.
@@ -1077,7 +1093,8 @@ one only with an `--allow-net`.
   continue with `SIGSTOP`. A blocking call that a stop interrupts runs again
   after the continue, as Linux restarts it when no handler runs: `read`,
   `write`, `readv`, `writev`, `pread64`, `pwrite64`, `preadv`, `pwritev`,
-  `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `sendto`, `recvfrom`,
+  `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `fcntl`'s `F_SETLKW` and
+  `F_OFD_SETLKW`, `sendto`, `recvfrom`,
   `sendmsg`, `recvmsg`, `ppoll`, `select`, `pselect6`, `poll` with no timeout
   and a `futex` wait with none. `nanosleep`, a relative `clock_nanosleep`,
   `poll` with a timeout and a timed `futex` wait resume through

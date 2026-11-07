@@ -27,6 +27,7 @@ mod memfd;
 mod page_cache;
 mod proc;
 mod processes;
+mod record_locks;
 mod sockets;
 mod syscalls;
 mod threads;

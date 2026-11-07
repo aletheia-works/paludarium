@@ -156,6 +156,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `O_DIRECTORY`、`O_NOFOLLOW`、`O_PATH` だけを持ちます。パイプ、ソケット、カーネル
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
   除いて `O_LARGEFILE` がありません。
+- `fcntl` のバイト範囲のロックを、Linux の `fs/locks.c` と同じく扱います。プロセスが持つ
+  レコードロック（`F_SETLK`、`F_SETLKW`、`F_GETLK`）と、開いたファイルの記述が持つ OFD ロック
+  （`F_OFD_SETLK`、`F_OFD_SETLKW`、`F_OFD_GETLK`）で、互いにぶつかります。ある範囲のロックは、
+  `posix_lock_inode` と同じく、そこにある持ち主自身のロックを置き換え、分け、まとめます。
+  `F_GETLK` は、最初にぶつかるロックを持ち主の PID（記述のロックは -1）とともに返し、なければ
+  `F_UNLCK` を返します。引数は `fcntl_getlk` と `fcntl_setlk` の順に確かめます（whence、
+  `EINVAL` か `EOVERFLOW` になる範囲、種類、記述子のアクセスで許されない種類の `EBADF`、
+  OFD ロックの `l_pid`）。プロセスのレコードロックは、そのファイルの記述子をどれか閉じるか、
+  プロセスが終わると外れ、`fork` や `execve` では外れません。記述のロックは、最後の記述子が
+  閉じると外れます。`F_SETLKW` は範囲が空くまで待ち、互いを待つプロセスのレコードロックが
+  （10 個までで）輪になるなら `EDEADLK` を返します。ロックはゲストだけのもので、ホストの
+  プログラムからは見えず、ゲストからもホストのロックは見えません。
 - パイプは Linux と同じく 64 KiB を持ちます。`fcntl` の `F_SETPIPE_SZ` と
   `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。大きさは
   1 ページ以上の 2 のべき乗で、読まれていないデータより小さくすると `EBUSY`、
@@ -992,7 +1004,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
-  `sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
   `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll`、時間制限つきの `futex` の待ちは、
   `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
   `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが

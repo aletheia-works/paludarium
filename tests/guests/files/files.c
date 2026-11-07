@@ -182,6 +182,84 @@ void _start(void) {
   while((n=S(217,l,buf,32))>0)if(buf[19]=='f')seen++;
   results[x++]=seen;results[x++]=S(84,d,0,0);
   S(3,l,0,0);}
+ if(CASE==54){ /* fcntl's record locks between two processes: conflicts, splits, release */
+  /* struct flock: l_type, l_whence, l_start, l_len, l_pid. */
+  static long fl[4];
+  #define LK(cmd,f_,type,whence,start,len) (((short*)fl)[0]=(type),((short*)fl)[1]=(whence),fl[1]=(start),fl[2]=(len),((int*)fl)[6]=0,S(72,f_,cmd,fl))
+  long pipe[2];S(22,pipe,0,0);long *pfd=pipe;int *ends=(int*)pfd;
+  long me=S(39,0,0,0);
+  results[x++]=LK(6,fd,1,0,0,10);
+  /* The owner's own lock never conflicts with it. */
+  results[x++]=LK(5,fd,1,0,0,10);results[x++]=((short*)fl)[0];
+  long pid=S(57,0,0,0);
+  if(!pid){
+   long r[8],k=0;
+   r[k++]=LK(5,fd,1,0,5,1);r[k++]=((short*)fl)[0];r[k++]=fl[1];r[k++]=fl[2];r[k++]=((int*)fl)[6]==S(110,0,0,0);
+   r[k++]=LK(6,fd,0,0,5,1);r[k++]=LK(6,fd,1,0,20,5);
+   S(1,ends[1],r,k*8);S(60,0,0,0);
+  }
+  call(61,pid,0,0,0,0,0);
+  long got[8];results[x++]=S(0,ends[0],got,7*8);for(int i=0;i<7;i++)results[x++]=got[i];
+  /* The child's lock went when it exited. */
+  results[x++]=LK(5,fd,1,0,20,5);results[x++]=((short*)fl)[0];
+  /* Unlocking the middle splits the lock in two. */
+  results[x++]=LK(6,fd,2,0,3,2);
+  pid=S(57,0,0,0);
+  if(!pid){
+   long r[8],k=0;
+   LK(5,fd,1,0,3,2);r[k++]=((short*)fl)[0];
+   LK(5,fd,1,0,0,1);r[k++]=fl[1];r[k++]=fl[2];
+   LK(5,fd,1,0,7,1);r[k++]=fl[1];r[k++]=fl[2];
+   /* To the end of the file, read back as a length of 0. */
+   S(1,ends[1],r,k*8);S(60,0,0,0);
+  }
+  call(61,pid,0,0,0,0,0);results[x++]=S(0,ends[0],got,5*8);for(int i=0;i<5;i++)results[x++]=got[i];
+  results[x++]=LK(6,fd,0,0,100,0);
+  pid=S(57,0,0,0);
+  if(!pid){long r[3];LK(5,fd,1,0,200,1);r[0]=((short*)fl)[0];r[1]=fl[1];r[2]=fl[2];S(1,ends[1],r,24);S(60,0,0,0);}
+  call(61,pid,0,0,0,0,0);results[x++]=S(0,ends[0],got,3*8);for(int i=0;i<3;i++)results[x++]=got[i];
+  /* Closing any descriptor of the file drops the process's locks on it. */
+  long other=S(2,p,0,0);S(3,other,0,0);
+  pid=S(57,0,0,0);
+  if(!pid){long r[1];LK(5,fd,1,0,0,1000);r[0]=((short*)fl)[0];S(1,ends[1],r,8);S(60,0,0,0);}
+  call(61,pid,0,0,0,0,0);results[x++]=S(0,ends[0],got,8);results[x++]=got[0];
+  /* F_SETLKW waits until the holder lets go. */
+  long ready[2];S(22,ready,0,0);int *rd=(int*)ready;
+  pid=S(57,0,0,0);
+  if(!pid){
+   LK(6,fd,1,0,0,1);S(1,rd[1],"r",1);
+   long ts[2]={0,50000000};S(35,ts,0,0);LK(6,fd,2,0,0,1);S(60,0,0,0);
+  }
+  S(0,rd[0],buf,1);results[x++]=LK(7,fd,1,0,0,1);
+  call(61,pid,0,0,0,0,0);
+  results[x++]=me>0;
+  #undef LK
+ }
+ if(CASE==55){ /* fcntl's lock arguments, checked in Linux's order, and OFD locks */
+  static long fl[4];
+  #define LK(cmd,f_,type,whence,start,len) (((short*)fl)[0]=(type),((short*)fl)[1]=(whence),fl[1]=(start),fl[2]=(len),((int*)fl)[6]=0,S(72,f_,cmd,fl))
+  results[x++]=LK(6,fd,3,0,0,1);results[x++]=LK(6,fd,1,3,0,1);results[x++]=LK(6,fd,1,0,-1,1);
+  results[x++]=LK(6,fd,1,0,0,-1);results[x++]=LK(6,fd,1,0,0x7fffffffffffffffL,2);
+  results[x++]=LK(5,fd,2,0,0,1);results[x++]=LK(5,fd,3,0,0,1);results[x++]=S(72,fd,6,1);results[x++]=S(72,fd,5,1);
+  long ro=S(2,p,0,0),wo=S(2,p,1,0);
+  results[x++]=LK(6,ro,1,0,0,1);results[x++]=LK(6,wo,0,0,0,1);results[x++]=LK(6,ro,0,0,0,1);results[x++]=LK(6,wo,1,0,0,1);
+  results[x++]=LK(6,ro,2,0,0,1);
+  /* A negative length locks the bytes before the start; SEEK_CUR and SEEK_END. */
+  results[x++]=LK(6,fd,1,0,10,-5);S(1,fd,"0123456789",10);results[x++]=LK(6,fd,1,1,-2,1);results[x++]=LK(6,fd,1,2,0,0);
+  /* l_pid must be 0 for an OFD lock. */
+  ((short*)fl)[0]=1;((short*)fl)[1]=0;fl[1]=0;fl[2]=1;((int*)fl)[6]=1;results[x++]=S(72,fd,37,fl);
+  ((short*)fl)[0]=1;((short*)fl)[1]=0;fl[1]=0;fl[2]=1;((int*)fl)[6]=1;results[x++]=S(72,fd,36,fl);
+  /* Two descriptions of one process conflict over OFD locks, and with its record locks. */
+  results[x++]=LK(6,fd,2,0,0,0);
+  long a=S(2,p,2,0),b=S(2,p,2,0);
+  results[x++]=LK(37,a,1,0,100,1);results[x++]=LK(37,b,1,0,100,1);
+  results[x++]=LK(36,b,1,0,100,1);results[x++]=((short*)fl)[0];results[x++]=((int*)fl)[6];results[x++]=fl[1];
+  results[x++]=LK(6,b,1,0,100,1);results[x++]=LK(37,a,0,0,100,1);
+  long dup=S(32,a,0,0);S(3,a,0,0);results[x++]=LK(37,b,1,0,100,1);
+  S(3,dup,0,0);results[x++]=LK(37,b,1,0,100,1);
+  S(3,ro,0,0);S(3,wo,0,0);S(3,b,0,0);
+  #undef LK
+ }
  if(CASE==53){ /* extended attributes in user.*, as any owner of the file may use them */
   static char f[]="/tmp/paludarium-files-xattr",l[]="/tmp/paludarium-files-xattr-link",h[]="/tmp/paludarium-files-xattr-hard";
   static char d[]="/tmp/paludarium-files-xattr-dir",n[]="/tmp/paludarium-files-xattr-none";

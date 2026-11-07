@@ -2979,9 +2979,11 @@ static int lock_cases(void) {
         lock_show("across-protections", n, base, (size_t)(4 * page), 0);
         lock_show("unmapped", n, (void *)(uintptr_t)page, (size_t)page, 0);
         lock_show("runs-past-mapping", n, base + 15 * page, (size_t)(4 * page), 0);
-        lock_show("huge", n, a, (size_t)-4096, 0);
+        /* A lock looks at RLIMIT_MEMLOCK first, which only a user without
+           CAP_IPC_LOCK meets: ENOMEM there and EINVAL for root, as the guest. */
+        if (n == SYS_munlock) lock_show("huge", n, a, (size_t)-4096, 0);
         lock_show("wraps-to-nothing", n, a + 1, (size_t)-1, 0);
-        lock_show("wraps", n, a, (size_t)-1 - 8191, 0);
+        if (n == SYS_munlock) lock_show("wraps", n, a, (size_t)-1 - 8191, 0);
         lock_show("past-user-space", n, (void *)(uintptr_t)0x800000000000, (size_t)page, 0);
         lock_show("kernel", n, (void *)(uintptr_t)-4096, (size_t)page, 0);
     }

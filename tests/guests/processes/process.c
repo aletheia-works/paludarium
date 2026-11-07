@@ -2941,6 +2941,82 @@ static int robust_list_cases(const char *self) {
     return 0;
 }
 
+static void lock_show(const char *label, long number, void *at, size_t length, long flags) {
+    errno = 0;
+    long r = syscall(number, at, length, flags);
+    printf("%s: r=%ld errno=%d\n", label, r, errno);
+}
+
+static void lock_all_show(long flags) {
+    errno = 0;
+    long r = syscall(SYS_mlockall, flags);
+    int e = errno;
+    errno = 0;
+    long undone = syscall(SYS_munlockall);
+    printf("mlockall %ld: r=%ld errno=%d, munlockall r=%ld errno=%d\n", flags, r, e, undone, errno);
+}
+
+static int lock_cases(void) {
+    long page = 4096;
+    char *base = mmap(NULL, 16 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 80;
+    int flags = MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS;
+    char *a = mmap(base + 2 * page, 4 * page, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (a == MAP_FAILED) return 81;
+    a[page] = 42;
+    long numbers[] = {SYS_mlock, SYS_munlock, SYS_mlock2};
+    const char *names[] = {"mlock", "munlock", "mlock2"};
+    for (int i = 0; i < 3; i++) {
+        long n = numbers[i];
+        printf("--- %s\n", names[i]);
+        lock_show("whole", n, a, (size_t)(4 * page), 0);
+        lock_show("past-page-start", n, a + 1, (size_t)(4 * page - 1), 0);
+        lock_show("one-byte", n, a + page + 7, 1, 0);
+        lock_show("no-length", n, a, 0, 0);
+        lock_show("no-length-unmapped", n, (void *)(uintptr_t)page, 0, 0);
+        lock_show("no-length-past-page-start", n, (char *)(uintptr_t)page + 1, 0, 0);
+        lock_show("no-access", n, base, (size_t)page, 0);
+        lock_show("across-protections", n, base, (size_t)(4 * page), 0);
+        lock_show("unmapped", n, (void *)(uintptr_t)page, (size_t)page, 0);
+        lock_show("runs-past-mapping", n, base + 15 * page, (size_t)(4 * page), 0);
+        lock_show("huge", n, a, (size_t)-4096, 0);
+        lock_show("wraps-to-nothing", n, a + 1, (size_t)-1, 0);
+        lock_show("wraps", n, a, (size_t)-1 - 8191, 0);
+        lock_show("past-user-space", n, (void *)(uintptr_t)0x800000000000, (size_t)page, 0);
+        lock_show("kernel", n, (void *)(uintptr_t)-4096, (size_t)page, 0);
+    }
+    printf("--- flags\n");
+    lock_show("onfault", SYS_mlock2, a, (size_t)page, 1);
+    lock_show("unknown", SYS_mlock2, a, (size_t)page, 2);
+    lock_show("onfault-and-unknown", SYS_mlock2, a, (size_t)page, 3);
+    lock_show("unknown-unmapped", SYS_mlock2, (void *)(uintptr_t)page, (size_t)page, 2);
+    lock_show("unknown-no-length", SYS_mlock2, a, 0, 2);
+    lock_show("onfault-no-access", SYS_mlock2, base, (size_t)page, 1);
+    lock_show("onfault-high-bits", SYS_mlock2, a, (size_t)page, (1L << 32) | 1);
+    lock_show("no-flags-high-bits", SYS_mlock2, a, (size_t)page, 1L << 32);
+    lock_show("onfault-across-protections", SYS_mlock2, base, (size_t)(4 * page), 1);
+    syscall(SYS_munlock, base, (size_t)(4 * page));
+    char *shared = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) return 83;
+    lock_show("shared", SYS_mlock, shared, (size_t)page, 0);
+    lock_show("shared", SYS_munlock, shared, (size_t)page, 0);
+    munmap(shared, (size_t)page);
+    syscall(SYS_munlock, a, (size_t)page);
+    /* A gap in the range: what is before it does not change the result. */
+    munmap(a + 2 * page, (size_t)page);
+    lock_show("gap", SYS_mlock, a, (size_t)(4 * page), 0);
+    lock_show("gap", SYS_munlock, a, (size_t)(4 * page), 0);
+    lock_show("after-gap", SYS_mlock, a + 3 * page, (size_t)page, 0);
+    lock_show("after-gap", SYS_munlock, a + 3 * page, (size_t)page, 0);
+    printf("contents %d\n", a[page]);
+    for (long f = 0; f <= 8; f++) lock_all_show(f);
+    lock_all_show(1L << 32);
+    lock_all_show((1L << 32) | 1);
+    /* With memory no access reaches: it is left out, and is not an error. */
+    lock_all_show(1);
+    return 0;
+}
+
 static int mincore_show(const char *label, void *at, size_t length, size_t pages) {
     unsigned char vec[16];
     memset(vec, 7, sizeof vec);
@@ -10881,6 +10957,7 @@ int main(int argc, char **argv) {
         return r == 0 && length == 24 ? 0 : 1;
     }
     if (!strcmp(mode, "mincore")) return mincore_cases();
+    if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {
         x87_arithmetic_cases();
         return 0;

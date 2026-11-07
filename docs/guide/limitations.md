@@ -121,12 +121,21 @@ verified.
     carries on without it. Its promise is that a thread's critical section is
     abandoned if it is preempted, which emulated threads running truly in
     parallel cannot keep, so registering would let per-CPU data break.
+  - `landlock_create_ruleset`, `pkey_alloc` and `io_uring_setup` are too, as on
+    a Linux built without them. Programs check for that and carry on. Saying
+    yes would be wrong without the rest: Landlock's rules would not be enforced,
+    and protection keys need the CPU feature, which `CPUID` does not report.
   - `get_robust_list` of another process is `ESRCH`, where Linux gives it to a
     caller that may trace that process. The wake of a robust futex reaches only
     waiters of the same process, as `futex` does here.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
-    `MAP_POPULATE` or `MAP_LOCKED` brought in until it is touched.
+    `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
+  - Memory locks leave no state. So `RLIMIT_MEMLOCK` is not enforced, which
+    matters only to a guest that gave up `CAP_IPC_LOCK`, `MADV_DONTNEED` works on
+    locked memory where Linux gives `EINVAL`, `mlock` succeeds on the pages of a
+    file mapping past the end of the file where Linux gives `ENOMEM`, and
+    `/proc` shows no locked memory.
 - **File owners**: a file in a mounted host directory stays root's, so
   `chown` to any other owner or group returns `EPERM` there, and a file a
   guest that is not root makes there is root's too, which that guest may

@@ -53,6 +53,11 @@ pub mod nr {
     pub const MSYNC: u64 = 26;
     pub const MADVISE: u64 = 28;
     pub const MINCORE: u64 = 27;
+    pub const MLOCK: u64 = 149;
+    pub const MUNLOCK: u64 = 150;
+    pub const MLOCKALL: u64 = 151;
+    pub const MUNLOCKALL: u64 = 152;
+    pub const MLOCK2: u64 = 325;
     pub const SET_ROBUST_LIST: u64 = 273;
     pub const GET_ROBUST_LIST: u64 = 274;
     pub const UNAME: u64 = 63;
@@ -125,7 +130,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 59] = [
+        let entries: [(u64, Handler); 64] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -159,6 +164,11 @@ impl SyscallTable {
             (nr::MSYNC, sys_msync),
             (nr::MADVISE, sys_madvise),
             (nr::MINCORE, sys_mincore),
+            (nr::MLOCK, sys_mlock),
+            (nr::MUNLOCK, sys_munlock),
+            (nr::MLOCK2, sys_mlock2),
+            (nr::MLOCKALL, sys_mlockall),
+            (nr::MUNLOCKALL, sys_munlockall),
             (nr::SET_ROBUST_LIST, sys_set_robust_list),
             (nr::GET_ROBUST_LIST, sys_get_robust_list),
             (nr::UNAME, sys_uname),
@@ -1537,6 +1547,78 @@ fn sys_mincore(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
         done += piece.len() as u64;
     }
+    ok(0)
+}
+
+const MLOCK_ONFAULT: u32 = 1;
+const MCL_CURRENT: u32 = 1;
+const MCL_FUTURE: u32 = 2;
+const MCL_ONFAULT: u32 = 4;
+
+/// Whether `mlock` and its kin may take `[addr, addr + len)`, as Linux's
+/// `do_mlock` and `do_munlock` decide. Nothing is ever swapped out here, so
+/// that is all there is to do. `populate` is a lock that brings its pages in,
+/// which a page without access fails, as `__mm_populate` does.
+fn lock_range(c: &Context<'_>, addr: u64, len: u64, populate: bool) -> Outcome {
+    // Rounded as Linux's PAGE_ALIGN is, so a huge length may wrap to none.
+    let length = len.wrapping_add(addr & 4095).wrapping_add(4095) & !4095;
+    let start = addr & !4095;
+    let Some(end) = start.checked_add(length) else {
+        return err(Errno::EINVAL);
+    };
+    if length == 0 {
+        return ok(0);
+    }
+    let mut mappings: Vec<_> = c
+        .mem
+        .mappings()
+        .filter(|m| m.start.0 < end && m.end() > start)
+        .collect();
+    mappings.sort_by_key(|m| m.start.0);
+    let mut covered = start;
+    for m in &mappings {
+        if m.start.0 > covered || populate && m.prot == Prot::NONE {
+            return err(Errno::ENOMEM);
+        }
+        covered = m.end();
+    }
+    if covered < end {
+        return err(Errno::ENOMEM);
+    }
+    ok(0)
+}
+
+/// `mlock(addr, len)`.
+fn sys_mlock(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    lock_range(c, a[0], a[1], true)
+}
+
+/// `munlock(addr, len)`.
+fn sys_munlock(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    lock_range(c, a[0], a[1], false)
+}
+
+/// `mlock2(addr, len, flags)`: `MLOCK_ONFAULT` brings no page in.
+fn sys_mlock2(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let flags = a[2] as u32;
+    if flags & !MLOCK_ONFAULT != 0 {
+        return err(Errno::EINVAL);
+    }
+    lock_range(c, a[0], a[1], flags & MLOCK_ONFAULT == 0)
+}
+
+/// `mlockall(flags)`: it covers what is mapped, so only the flags can be wrong.
+fn sys_mlockall(_: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let flags = a[0] as u32;
+    if flags == 0 || flags == MCL_ONFAULT || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0
+    {
+        return err(Errno::EINVAL);
+    }
+    ok(0)
+}
+
+/// `munlockall()`.
+fn sys_munlockall(_: &mut Context<'_>, _: [u64; 6]) -> Outcome {
     ok(0)
 }
 

@@ -1008,6 +1008,52 @@ fn set_and_get_robust_list_check_their_arguments() {
     );
 }
 #[test]
+fn memory_locks_check_their_range_and_flags() {
+    let mut f = fixture();
+    let page = 4096;
+    let anon_private = 0x22;
+    let base = f.ret(nr::MMAP, &[0, 8 * page, 0, anon_private, u64::MAX, 0]);
+    assert_eq!(f.ret(nr::MPROTECT, &[base + page, 2 * page, 3]), 0);
+    let readable = base + page;
+    let enomem = errno(Errno::ENOMEM);
+    let einval = errno(Errno::EINVAL);
+
+    assert_eq!(f.ret(nr::MLOCK, &[readable, 2 * page]), 0);
+    assert_eq!(f.ret(nr::MLOCK, &[readable + 1, 2 * page - 1]), 0);
+    assert_eq!(f.ret(nr::MLOCK, &[readable, 0]), 0);
+    assert_eq!(f.ret(nr::MLOCK, &[page, 0]), 0);
+    assert_eq!(f.ret(nr::MLOCK, &[page + 1, 0]), enomem);
+    // Bringing pages in fails without access; only a lock does that.
+    assert_eq!(f.ret(nr::MLOCK, &[base, page]), enomem);
+    assert_eq!(f.ret(nr::MLOCK2, &[base, page, 0]), enomem);
+    assert_eq!(f.ret(nr::MLOCK2, &[base, page, 1]), 0);
+    assert_eq!(f.ret(nr::MUNLOCK, &[base, page]), 0);
+    assert_eq!(f.ret(nr::MLOCK2, &[readable, page, 2]), einval);
+    // Lengths round up, and may wrap to nothing or past the end of addresses.
+    assert_eq!(f.ret(nr::MLOCK, &[readable + 1, u64::MAX]), 0);
+    assert_eq!(f.ret(nr::MLOCK, &[readable, u64::MAX - 4095]), einval);
+    assert_eq!(f.ret(nr::MUNLOCK, &[base + 7 * page, 2 * page]), enomem);
+    assert_eq!(f.ret(nr::MUNMAP, &[base + 2 * page, page]), 0);
+    assert_eq!(f.ret(nr::MUNLOCK, &[base, 4 * page]), enomem);
+
+    for (flags, expected) in [
+        (0, einval),
+        (1, 0),
+        (2, 0),
+        (3, 0),
+        (4, einval),
+        (5, 0),
+        (7, 0),
+        (8, einval),
+        (1 << 32, einval),
+        ((1 << 32) | 1, 0),
+    ] {
+        assert_eq!(f.ret(nr::MLOCKALL, &[flags]), expected, "flags {flags}");
+    }
+    assert_eq!(f.ret(nr::MUNLOCKALL, &[]), 0);
+}
+
+#[test]
 fn mincore_reports_what_was_touched_up_to_what_is_not_mapped() {
     let mut f = fixture();
     let (vec, page) = (DATA + 0x800, 4096);

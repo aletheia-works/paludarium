@@ -278,6 +278,7 @@ mod linux {
         processes_x87_arithmetic => ("x87-arithmetic","process"),
         processes_robust_list => ("robust-list","process"),
         processes_mincore => ("mincore","process"),
+        processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),
         processes_time_calls => ("time-calls","process"),
         processes_dynamic => ("dynamic","dynamic"),

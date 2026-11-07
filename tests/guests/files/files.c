@@ -143,6 +143,26 @@ void _start(void) {
    results[x++]=S(8,l,0,0);
   }
   S(3,l,0,0);S(87,f,0,0);S(84,d,0,0);}
+ if(CASE==51){ /* getdents64 lists in the file system's order, the same on every read */
+  static char d[]="/tmp/paludarium-files-order",f[]="/tmp/paludarium-files-order/f00";
+  char *tens=f+sizeof(f)-3,*ones=f+sizeof(f)-2;
+  for(long i=0;i<20;i++){*tens='0'+i/10;*ones='0'+i%10;S(87,f,0,0);}
+  S(84,d,0,0);results[x++]=S(83,d,0755,0);
+  for(long i=0;i<20;i++){*tens='0'+i/10;*ones='0'+i%10;S(3,S(2,f,66,0644),0,0);}
+  long l=S(2,d,0200000,0),n;
+  for(long round=0;round<2;round++){
+   /* All at once, then one entry a call. */
+   while((n=S(217,l,buf,round?32:4096))>0)
+    for(long o=0;o<n;o+=*(unsigned short*)(buf+o+16)){
+     char *name=buf+o+19;
+     if(name[0]=='f')results[x++]=(name[1]-'0')*10+name[2]-'0';
+    }
+   results[x++]=n;
+   S(8,l,0,0);
+  }
+  S(3,l,0,0);
+  for(long i=0;i<20;i++){*tens='0'+i/10;*ones='0'+i%10;S(87,f,0,0);}
+  S(84,d,0,0);}
  if(CASE==49){ /* AF_UNIX bind makes a socket file, which connect finds */
   static char sa[110]="\1\0/tmp/paludarium-files-socket"; long len=2+sizeof("/tmp/paludarium-files-socket");
   char *path=sa+2; S(87,path,0,0); S(95,022,0,0);

@@ -367,10 +367,13 @@ impl HostFs for MountedFs {
     fn read_dir(&self, p: &[u8]) -> Result<Vec<DirectoryEntry>, Errno> {
         let p = self.resolve(p, true, false)?;
         let (_, fs, relative) = self.route(&p)?;
-        let mut entries: BTreeMap<Vec<u8>, DirectoryEntry> = fs
-            .read_dir(&relative)?
-            .into_iter()
-            .map(|e| (e.name.clone(), e))
+        // In the order the file system lists them, as on Linux: programs can
+        // see it, as in the file list rsync sends.
+        let mut entries = fs.read_dir(&relative)?;
+        let mut positions: BTreeMap<Vec<u8>, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name.clone(), i))
             .collect();
         if let Ok(private) = self.base.read_dir(&p) {
             for e in private {
@@ -379,15 +382,19 @@ impl HostFs for MountedFs {
                     child.push(b'/')
                 }
                 child.extend_from_slice(&e.name);
-                if self.private_files.contains(&child) || !entries.contains_key(&e.name) {
-                    entries.insert(e.name.clone(), e);
+                match positions.get(&e.name) {
+                    Some(&i) if self.private_files.contains(&child) => entries[i] = e,
+                    Some(_) => {}
+                    None => {
+                        positions.insert(e.name.clone(), entries.len());
+                        entries.push(e);
+                    }
                 }
             }
         }
         // A host's directory listing leaves out `.` and `..`. Both come from
         // the mounted view, so their inodes are those `stat` reports.
-        entries.remove(b".".as_slice());
-        entries.remove(b"..".as_slice());
+        entries.retain(|e| e.name != b"." && e.name != b"..");
         let parent = match p.iter().rposition(|&b| b == b'/') {
             Some(0) | None => b"/".as_slice(),
             Some(i) => &p[..i],
@@ -404,7 +411,7 @@ impl HostFs for MountedFs {
                 kind: 4,
             },
         ];
-        out.extend(entries.into_values());
+        out.extend(entries);
         Ok(out)
     }
 }
@@ -494,6 +501,25 @@ mod mount_tests {
             assert_eq!(list[1].kind, 4);
             assert_eq!(list.iter().filter(|e| e.name[0] == b'.').count(), 2);
         }
+    }
+    #[test]
+    fn mount_lists_in_the_host_order() {
+        let x = Fixture::new();
+        for i in 0..40 {
+            std::fs::write(x.root.join(format!("f{i}")), b"").unwrap();
+        }
+        let host: Vec<Vec<u8>> = std::fs::read_dir(&x.root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_encoded_bytes())
+            .collect();
+        let listed: Vec<Vec<u8>> =
+            x.fs.read_dir(b"/mnt")
+                .unwrap()
+                .into_iter()
+                .skip(2)
+                .map(|e| e.name)
+                .collect();
+        assert_eq!(listed, host);
     }
     #[test]
     fn mount_link_unlink() {

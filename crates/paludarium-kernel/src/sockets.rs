@@ -4185,6 +4185,18 @@ mod events_tests {
     fn release_another() {
         drop(pair());
     }
+    /// Whether `closed` comes true soon. Another test's collection may have
+    /// taken the garbage already, and closes it after releasing its lock.
+    fn closes(closed: impl Fn() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while !closed() {
+            if start.elapsed().as_secs() >= 10 {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
     #[test]
     fn datagrams_take_what_linux_counts() {
         // The head's power of two, and past SKB_MAX_ALLOC page
@@ -4226,8 +4238,8 @@ mod events_tests {
         assert!(!a.lock_sides()[1].closed);
         drop(other);
         release_another();
-        assert!(gone.upgrade().is_none());
-        assert!(a.lock_sides()[1].closed);
+        assert!(closes(|| gone.upgrade().is_none()));
+        assert!(closes(|| a.lock_sides()[1].closed));
         // So do two that hold each other, with a pipe end passed with them.
         let ([a, b], [c, d]) = (pair(), pair());
         let [reader, writer] = PipeEnd::pair(0, Arc::default()).unwrap();
@@ -4243,9 +4255,11 @@ mod events_tests {
         assert!(!a.lock_sides()[1].closed && !c.lock_sides()[1].closed);
         drop(other);
         release_another();
-        assert!(gone.iter().all(|end| end.upgrade().is_none()));
-        assert!(written.upgrade().is_none());
-        assert!(a.lock_sides()[1].closed && c.lock_sides()[1].closed);
+        assert!(closes(|| gone.iter().all(|end| end.upgrade().is_none())));
+        assert!(closes(|| written.upgrade().is_none()));
+        assert!(closes(
+            || a.lock_sides()[1].closed && c.lock_sides()[1].closed
+        ));
         drop(reader);
         // One a socket with a descriptor still holds stays, until that one
         // goes.

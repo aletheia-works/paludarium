@@ -2771,14 +2771,19 @@ fn a_listener_only_its_connections_not_accepted_hold_is_collected() {
     assert_eq!(f.ret(3, [listener, 0, 0, 0, 0, 0]), 0);
     // Another socket goes: the listener is garbage, and its close resets
     // the connection. (Another test's socket may have gone first, so what
-    // the client reads before this is not looked at.)
+    // the client reads before this is not looked at, and that collection
+    // closes what it took after releasing its lock, so the reset can come
+    // just after this socket's own collection found nothing.)
     let (x, y) = pair(&mut f, 53, [1, 1, 0, DATA + 0x780, 0, 0]);
     assert_eq!(f.ret(3, [x, 0, 0, 0, 0, 0]), 0);
     assert_eq!(f.ret(3, [y, 0, 0, 0, 0, 0]), 0);
-    assert_eq!(
-        f.ret(45, [client, DATA + 0x300, 1, 0x40, 0, 0]),
-        Errno(104).to_syscall_return()
-    );
+    let start = std::time::Instant::now();
+    let mut read = f.ret(45, [client, DATA + 0x300, 1, 0x40, 0, 0]);
+    while read == Errno(11).to_syscall_return() && start.elapsed().as_secs() < 10 {
+        std::thread::yield_now();
+        read = f.ret(45, [client, DATA + 0x300, 1, 0x40, 0, 0]);
+    }
+    assert_eq!(read, Errno(104).to_syscall_return());
 }
 /// Takes the IDs real 1000, effective 2000, saved 3000 and the groups 1100,
 /// 2100 and 3100.

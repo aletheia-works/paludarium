@@ -166,12 +166,14 @@ fn list(c: &Context<'_>, target: &Target, addr: u64, size: u64) -> Result<u64, E
     )?;
     let length = names.len() as u64;
     if size != 0 {
-        if length > size {
-            return Err(ERANGE);
-        }
-        // What `listxattr` says of a list longer than it would ever copy.
-        if length > XATTR_LIST_MAX {
-            return Err(E2BIG);
+        // `listxattr` copies at most XATTR_LIST_MAX, and says so of a list
+        // that does not fit a buffer of that size.
+        if length > size.min(XATTR_LIST_MAX) {
+            return Err(if size >= XATTR_LIST_MAX {
+                E2BIG
+            } else {
+                ERANGE
+            });
         }
         output(c, addr, &names)?;
     }

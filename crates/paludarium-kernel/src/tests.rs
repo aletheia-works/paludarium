@@ -1059,7 +1059,8 @@ fn an_xattr_list_longer_than_linux_copies_is_too_big() {
     let length = 300 * 241;
     let start = f.ret(nr::MMAP, &[0, 1 << 20, 3, 0x22, u64::MAX, 0]);
     assert_eq!(f.ret(194, &[path, 0, 0]), length);
-    assert_eq!(f.ret(194, &[path, start, 65536]), errno(Errno(34)));
+    assert_eq!(f.ret(194, &[path, start, 65535]), errno(Errno(34)));
+    assert_eq!(f.ret(194, &[path, start, 65536]), errno(Errno(7)));
     assert_eq!(f.ret(194, &[path, start, length]), errno(Errno(7)));
     assert_eq!(f.ret(194, &[path, start, 1 << 20]), errno(Errno(7)));
 }

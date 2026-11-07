@@ -39,6 +39,13 @@ class CompareTest(unittest.TestCase):
             ],
         )
 
+    def test_emulator_options_come_before_the_program(self):
+        argv = compare.command(["/bin/true"], "/w/o", "/e/p", {}, ["--allow-net", "127.0.0.1"])
+        self.assertEqual(
+            argv,
+            ["/e/p", "--report-enosys", "--mount", "/:/", "--allow-net", "127.0.0.1", "/bin/true"],
+        )
+
     def test_same_needs_equal_status_and_stdout(self):
         self.assertTrue(compare.outcome("a", result(0, b"x"), result(0, b"x", b"noise"))["same"])
         self.assertFalse(compare.outcome("a", result(0, b"x"), result(1, b"x"))["same"])

@@ -82,6 +82,8 @@ export async function runChecks({ wasmUrl, readGuest, native }) {
     check(diagnostics.every(row => row.sharedMemory && row.nestedWorker && row.token === 73 && row.tlsBefore === 0 && row.tlsAfter > 0 && row.stackTop > row.regionPointer && row.tlsAfter !== row.coordinatorTls && row.threadToken !== row.coordinatorThreadToken), "shared heap/stack/TLS initialization check failed");
     // A finished run's Worker serves the next: in WebKit one that ended while a guest ran could crash the page.
     check(Number.isInteger(diagnostics.at(-6).workerSerial) && diagnostics.at(-6).workerSerial === diagnostics.at(-5).workerSerial, "a finished Worker was not reused");
+    // Those two and the four at once, on no more Workers than ran at once.
+    check(new Set(diagnostics.slice(-6).map(row => row.workerSerial)).size <= 4, "finished Workers were not reused");
     const concurrent = diagnostics.slice(-4);
     check(new Set(concurrent.map(row => row.stackTop)).size === 4 && new Set(concurrent.map(row => row.tlsAfter)).size === 4 && new Set(concurrent.map(row => row.threadToken)).size === 4, "concurrent nested Workers reused stack/TLS/thread identity");
     results.push({ case: "actual-shared-heap-nested-Worker", pass: true, diagnostics });

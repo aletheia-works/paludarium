@@ -2539,6 +2539,9 @@ pub(crate) struct StandardFile {
     /// watches the host's input for it.
     registration: Mutex<Option<crate::fasync::Registration>>,
     watching: std::sync::atomic::AtomicBool,
+    /// The guest was told `EAGAIN`, and may wait for `SIGIO` from now on. The
+    /// watcher looks only now and then, and must not miss what comes next.
+    refused: std::sync::atomic::AtomicBool,
 }
 /// The flags `F_SETFL` changes (Linux's `SETFL_MASK` but `O_ASYNC`, which
 /// only a file with `fasync` keeps): `O_APPEND`, `O_NONBLOCK`, `O_DIRECT`
@@ -2580,6 +2583,7 @@ impl StandardFile {
             flags: AtomicU32::new(u32::from(channel != 0)),
             registration: Mutex::new(None),
             watching: std::sync::atomic::AtomicBool::new(false),
+            refused: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// Whether the host's standard input has something for a read: bytes,
@@ -2602,9 +2606,13 @@ impl StandardFile {
     /// descriptor's own `O_NONBLOCK` could stop it short, and that flag is
     /// shared with the host's other processes.
     pub(crate) fn would_block(&self) -> bool {
-        self.channel != 0
+        let full = self.channel != 0
             && self.flags() & crate::events::NONBLOCK != 0
-            && self.host.output_writable(self.channel) == Some(false)
+            && self.host.output_writable(self.channel) == Some(false);
+        if full {
+            self.refused.store(true, Ordering::SeqCst);
+        }
+        full
     }
     /// Whether the host's stream behind this one is a pipe, socket or
     /// terminal, which signals with `O_ASYNC`.
@@ -2619,7 +2627,7 @@ impl StandardFile {
     /// host's streams change outside the emulator, so a thread looks at the
     /// stream every [`STREAM_WATCH`] while `O_ASYNC` is on, and sends `SIGIO`
     /// each time it becomes ready ([`StandardFile::ready`]) after it was
-    /// not: `POLL_IN` for input that comes, as Linux's pipe and terminal do,
+    /// not, or after the guest was told `EAGAIN`: `POLL_IN` for input that comes, as Linux's pipe and terminal do,
     /// and `POLL_OUT` for output that has room again. A host without
     /// threads (WebAssembly) sends none.
     pub(crate) fn set_async(
@@ -2638,6 +2646,7 @@ impl StandardFile {
         let file = Arc::downgrade(file);
         // Taken now, so that a change before the thread first looks still
         // counts.
+        self.refused.store(false, Ordering::SeqCst);
         let mut was = self.ready();
         let reason = if self.channel == 0 {
             crate::fasync::Reason::In
@@ -2662,9 +2671,11 @@ impl StandardFile {
                     };
                     to
                 };
+                // Read in this order: a refusal after it counts next time.
+                let refused = stream.refused.swap(false, Ordering::SeqCst);
                 let ready = stream.ready();
                 if ready
-                    && !was
+                    && (!was || refused)
                     && let Some(processes) = to.processes.upgrade()
                 {
                     let owner = processes.file_owner(&file);
@@ -2735,6 +2746,7 @@ impl FileHandle for StandardFile {
     fn read(&self, b: &mut [u8]) -> Result<usize, Errno> {
         if self.channel == 0 {
             if !b.is_empty() && !self.stdin_ready() {
+                self.refused.store(true, Ordering::SeqCst);
                 return Err(Errno::EAGAIN);
             }
             self.host.read_stdin(b)

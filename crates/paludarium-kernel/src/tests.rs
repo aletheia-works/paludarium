@@ -2398,11 +2398,17 @@ mod stdin_readiness {
             assert_eq!(f.ret(127, &[DATA + 72, 8]), 0);
             f.mem.read_u64(GuestAddr(DATA + 72)).unwrap() & 1 << 28 != 0
         };
-        // Room all along: nothing. Full, then room again: SIGIO.
+        // Room all along: nothing. Full, then room again: SIGIO. The guest
+        // told EAGAIN waits for it, however soon the room comes, and the
+        // watcher looks only now and then.
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!pending(&mut f));
         f.host.set_output_full(1, true);
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(f.ret(72, &[1, 4, 0o24001]), 0);
+        assert_eq!(
+            f.ret(1, &[1, DATA + 80, 1]),
+            Errno::EAGAIN.to_syscall_return()
+        );
         assert!(!pending(&mut f));
         f.host.set_output_full(1, false);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2412,6 +2418,35 @@ mod stdin_readiness {
         }
         assert_eq!(f.ret(72, &[1, 4, 0]), 0);
         assert_eq!(f.ret(72, &[1, 3]), 1);
+    }
+    #[test]
+    fn standard_input_signals_a_reader_it_told_to_wait() {
+        // Ready when the watcher starts, so it never saw it not ready: input
+        // right after the guest was told EAGAIN still sends SIGIO.
+        let mut f = fixture();
+        f.host.open_stdin();
+        f.host.push_stdin(b"x");
+        let pid = f.ret(39, &[]);
+        assert_eq!(f.ret(72, &[0, 8, pid]), 0);
+        f.mem.write_u64(GuestAddr(DATA + 64), 1 << 28).unwrap();
+        assert_eq!(f.ret(14, &[0, DATA + 64, 0, 8]), 0);
+        assert_eq!(f.ret(72, &[0, 4, 0o24000]), 0);
+        assert_eq!(f.ret(0, &[0, DATA + 256, 16]), 1);
+        assert_eq!(
+            f.ret(0, &[0, DATA + 256, 16]),
+            Errno::EAGAIN.to_syscall_return()
+        );
+        f.host.push_stdin(b"y");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert_eq!(f.ret(127, &[DATA + 72, 8]), 0);
+            if f.mem.read_u64(GuestAddr(DATA + 72)).unwrap() & 1 << 28 != 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no SIGIO");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(f.ret(72, &[0, 4, 0]), 0);
     }
     #[test]
     fn a_host_that_cannot_tell_keeps_standard_input_ready() {

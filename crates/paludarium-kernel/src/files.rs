@@ -30,11 +30,18 @@ pub(crate) struct Descriptor {
 struct Listed {
     order: Vec<Vec<u8>>,
     names: BTreeSet<Vec<u8>>,
+    /// Where the last call left the position: past the end of the listing
+    /// it is more than `order` holds.
+    position: usize,
 }
 impl Listed {
     /// Follows a position that `lseek` moved: back forgets the names after
     /// it, and ahead passes the next ones in `entries`.
     fn seek(&mut self, position: usize, entries: &[paludarium_host::DirectoryEntry]) {
+        if position == self.position {
+            return;
+        }
+        self.position = position;
         while self.order.len() > position {
             if let Some(name) = self.order.pop() {
                 self.names.remove(&name);
@@ -51,6 +58,13 @@ impl Listed {
         if self.names.insert(name.to_vec()) {
             self.order.push(name.to_vec());
         }
+    }
+    /// The call returned `names`, which moved the position past them.
+    fn returned(&mut self, names: &[&Vec<u8>]) {
+        for name in names {
+            self.pass(name);
+        }
+        self.position += names.len();
     }
 }
 impl Descriptor {
@@ -2202,9 +2216,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             }
             output(c, a[1], &bytes)?;
             d.file.seek(returned.len() as i64, 1)?;
-            for name in returned {
-                listed.pass(name);
-            }
+            listed.returned(&returned);
             Ok(bytes.len() as u64)
         }
         // umask
@@ -2777,6 +2789,45 @@ impl FileHandle for StandardFile {
 #[cfg(test)]
 mod files_tests {
     use super::*;
+    fn entries(names: &[&str]) -> Vec<paludarium_host::DirectoryEntry> {
+        names
+            .iter()
+            .map(|n| paludarium_host::DirectoryEntry {
+                name: n.as_bytes().to_vec(),
+                inode: 1,
+                kind: 8,
+            })
+            .collect()
+    }
+    #[test]
+    fn listing_past_its_end_passes_nothing_added_later() {
+        let mut listed = Listed::default();
+        listed.seek(100, &entries(&["a", "b"]));
+        assert_eq!(listed.order.len(), 2);
+        // The position did not move, so what comes now was not passed.
+        listed.seek(100, &entries(&["a", "b", "c"]));
+        assert!(!listed.names.contains(b"c".as_slice()));
+        listed.returned(&[&b"c".to_vec()]);
+        assert_eq!(listed.position, 101);
+        // Not a size to allocate.
+        let mut far = Listed::default();
+        far.seek(usize::MAX, &entries(&["a"]));
+        assert_eq!(far.order.len(), 1);
+    }
+    #[test]
+    fn listing_back_forgets_what_came_after() {
+        let mut listed = Listed::default();
+        let all = entries(&["a", "b", "c"]);
+        listed.returned(&[&b"a".to_vec(), &b"b".to_vec()]);
+        listed.seek(1, &all);
+        assert_eq!(listed.order, [b"a".to_vec()]);
+        assert!(!listed.names.contains(b"b".as_slice()));
+        listed.seek(0, &all);
+        assert!(listed.names.is_empty());
+        // Ahead on a new description passes as many of the listing.
+        listed.seek(2, &all);
+        assert_eq!(listed.order, [b"a".to_vec(), b"b".to_vec()]);
+    }
     fn d(fs: &MemFs, p: &[u8]) -> Descriptor {
         Descriptor {
             file: fs.open(p, 66, 0o600).unwrap(),

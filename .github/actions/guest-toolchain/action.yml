@@ -28,6 +28,9 @@ runs:
         deadline=$((SECONDS + 720))
         download() {
           local limit
+          # apt exits 100 for a misspelled package and for a failed fetch alike. This needs no
+          # network, so what no retry can fix fails here at once.
+          apt-get install --simulate --no-install-recommends "$@" > /dev/null || return
           while true; do
             limit=$((deadline - SECONDS))
             if [ "$limit" -le 0 ]; then
@@ -42,7 +45,8 @@ runs:
               return 0
             fi
             echo "apt download failed or hit its limit of $limit seconds" >&2
-            if [ -f "$mirrors" ] && grep -q 'azure\.archive\.ubuntu\.com' "$mirrors"; then
+            if [ -f "$mirrors" ] && grep -q 'azure\.archive\.ubuntu\.com' "$mirrors" &&
+              grep -qv 'azure\.archive\.ubuntu\.com' "$mirrors"; then
               sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
               # The lists came from the mirror just dropped, and the others may differ from it.
               sudo timeout --kill-after=10 120 apt-get update || echo "apt-get update failed" >&2

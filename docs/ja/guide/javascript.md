@@ -2,7 +2,7 @@
 
 [`@aletheia-works/paludarium-wasm`](https://www.npmjs.com/package/@aletheia-works/paludarium-wasm)
 は、x86-64 Linux のプログラムを、共有された WebAssembly のメモリの上で動かします。
-ゲストのスレッド 1 つにつき Worker を 1 つ使います。同じモジュールが、ブラウザでも
+ゲストのスレッド 1 つにつき Worker を 1 つ使い、スレッドが終わると次のスレッドに使います。同じモジュールが、ブラウザでも
 Node.js（`worker_threads`）でも動きます。[デモ](../demo) もこのパッケージを使っています。
 
 ```sh

@@ -2,7 +2,7 @@
 
 [`@aletheia-works/paludarium-wasm`](https://www.npmjs.com/package/@aletheia-works/paludarium-wasm)
 runs x86-64 Linux programs in a shared WebAssembly memory, with one Worker per
-guest thread. The same modules run in browsers and in Node.js
+guest thread, which stays for the next thread once its own ends. The same modules run in browsers and in Node.js
 (`worker_threads`). The [live demo](../demo) uses this package.
 
 ```sh

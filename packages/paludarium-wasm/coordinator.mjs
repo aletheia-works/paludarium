@@ -7,6 +7,26 @@ let module, memory, e;
 const jobs = new Map();
 const latestDiagnostics = [];
 const childWorkers = new Set();
+const idleWorkers = [];
+let workerSerial = 0;
+/**
+ * A Worker for one execution, kept for the next instead of being stopped. In WebKit, a Worker that
+ * holds an instance of a shared memory ending while another thread grows that memory crashes the
+ * page, so none may end while a guest runs. Each execution instantiates anew, as a new Worker would.
+ */
+async function takeWorker() {
+  const idle = idleWorkers.pop();
+  if (idle) return idle;
+  const worker = await spawnWorker(new URL("execution.mjs", import.meta.url));
+  childWorkers.add(worker);
+  const slot = { worker, serial: ++workerSerial, report: null, failed: null };
+  listen(worker, report => slot.report?.(report), cause => { if (slot.failed) slot.failed(cause); else fatal(String(cause)); });
+  return slot;
+}
+function releaseWorker(slot) {
+  slot.report = null; slot.failed = null;
+  idleWorkers.push(slot);
+}
 let abandoned = false;
 const failure = (kind, message) => ({ kind, message });
 function check(value, name) { if (value < 0) throw new Error(`${name} rejected`); return value; }
@@ -244,16 +264,16 @@ async function sharedProbe() {
       const pointer = e.region_pointer(region), tlsPointer = Math.ceil(pointer / align) * align;
       const stackTop = Math.ceil((tlsPointer + tlsSize) / 16) * 16 + 2 * 1024 * 1024;
       const token = putBuffer(e, new Uint8Array([73]));
-      const worker = await spawnWorker(new URL("execution.mjs", import.meta.url));
-      childWorkers.add(worker);
-      const child = { worker, region, token, pending: new Map() };
+      const slot = await takeWorker();
+      const child = { slot, worker: slot.worker, region, token, pending: new Map() };
       child.next = type => new Promise((resolve, reject) => child.pending.set(type, { resolve, reject }));
-      listen(worker, report => {
+      slot.report = report => {
         if (report.type === "failed") { fatal(report.error); for (const promise of child.pending.values()) promise.reject(new Error(report.error)); }
         else { child.pending.get(report.type)?.resolve(report); child.pending.delete(report.type); }
-      }, cause => { fatal(String(cause)); for (const promise of child.pending.values()) promise.reject(cause); });
+      };
+      slot.failed = cause => { fatal(String(cause)); for (const promise of child.pending.values()) promise.reject(cause); };
       const started = child.next("started"); children.push(child);
-      worker.postMessage({ type: "execute", operation: "probe", module, memory, stackTop, tlsPointer, tokenHandle: token });
+      slot.worker.postMessage({ type: "execute", operation: "probe", module, memory, stackTop, tlsPointer, tokenHandle: token });
       child.diagnostics = (await started).diagnostics;
     }
     const completions = children.map(child => { const done = child.next("probe-done"); child.worker.postMessage({ type: "probe-go", space }); return done; });
@@ -267,7 +287,7 @@ async function sharedProbe() {
     check(e.shared_wait_word(space, 1), "notify word");
     const notified = e.shared_notify(space, 1), waited = (await done).result;
     if (abandoned) throw new Error("shared runtime abandoned");
-    for (const child of children) { await stopWorker(child.worker); childWorkers.delete(child.worker); e.region_drop(child.region); e.buffer_drop(child.token); }
+    for (const child of children) { releaseWorker(child.slot); e.region_drop(child.region); e.buffer_drop(child.token); }
     e.shared_space_drop(space);
     return { value, allocations, notified, waited, workers: children.map(child => child.diagnostics) };
   } catch (cause) {
@@ -281,11 +301,10 @@ async function finish(job, result, error) {
   job.finished = true;
   clearTimeout(job.timer); clearInterval(job.poll);
   try { flush(job); } catch (cause) { error ??= failure("internal", String(cause)); }
-  if (job.worker) await stopWorker(job.worker);
   await Promise.all([...job.tasks.values()].map(task => task.done));
   if (abandoned) return;
-  childWorkers.delete(job.worker);
-  // Parent owns these allocations until the child is gone; never free an active stack.
+  if (job.slot) releaseWorker(job.slot);
+  // Parent owns these allocations until the child has returned; never free an active stack.
   // This path is reached only after Rust returned, including a typed guest error.
   // Traps and forced failures discard the complete runtime through fatal().
   e.region_drop(job.region); e.buffer_drop(job.token);
@@ -307,24 +326,23 @@ async function launchTask(job, handle) {
   const task = { region, token, done: new Promise(resolve => { resolveDone = resolve; }) };
   job.tasks.set(handle, task);
   try {
-    const worker = await spawnWorker(new URL("execution.mjs", import.meta.url));
-    task.worker = worker; childWorkers.add(worker);
-    listen(worker, report => {
+    const slot = await takeWorker();
+    task.worker = slot.worker;
+    slot.failed = cause => { fatal(String(cause)); resolveDone(); };
+    slot.report = report => {
       if (report.type === "spawn-task") void launchTask(job, report.handle);
       else if (report.type === "net") void netRequest(job, report.request);
       else if (report.type === "started") {
-        latestDiagnostics.push({ ...report.diagnostics, taskHandle: handle, guestThread: true, regionPointer: pointer,
+        latestDiagnostics.push({ ...report.diagnostics, workerSerial: slot.serial, taskHandle: handle, guestThread: true, regionPointer: pointer,
           coordinatorTls: e.__tls_base.value, coordinatorThreadToken: String(e.thread_token()), sharedMemory: memory.buffer instanceof SharedArrayBuffer, nestedWorker: true });
       } else if (report.type === "task-finished") {
         if (report.result !== 0) { fatal("guest task execution rejected"); resolveDone(); return; }
-        void stopWorker(worker).then(() => {
-          childWorkers.delete(worker);
-          if (!abandoned) { e.region_drop(region); e.buffer_drop(token); }
-          resolveDone();
-        }).catch(cause => { fatal(String(cause)); resolveDone(); });
+        releaseWorker(slot);
+        if (!abandoned) { e.region_drop(region); e.buffer_drop(token); }
+        resolveDone();
       } else if (report.type === "failed") { fatal(report.error); resolveDone(); }
-    }, cause => { fatal(String(cause)); resolveDone(); });
-    worker.postMessage({ type: "execute", operation: "task", module, memory, sessionHandle: job.handle, taskHandle: handle, stackTop, tlsPointer, tokenHandle: token });
+    };
+    slot.worker.postMessage({ type: "execute", operation: "task", module, memory, sessionHandle: job.handle, taskHandle: handle, stackTop, tlsPointer, tokenHandle: token });
   } catch (cause) { fatal(`guest Worker start failed: ${cause}`); resolveDone(); }
 }
 async function launch(message) {
@@ -357,17 +375,18 @@ async function launch(message) {
     const job = { id: message.id, handle, region, token, offsets: { stdout: 0, stderr: 0 }, finished: false, diagnostics: null, tasks: new Map(), network: message.options.network !== undefined, relay: message.options.network?.relay, tickets: new Map(), sockets: new Set(), lookups: new Set() };
     jobs.set(message.id, job);
     port.send({ type: "accepted", id: message.id });
-    job.worker = await spawnWorker(new URL("execution.mjs", import.meta.url));
-    childWorkers.add(job.worker);
-    listen(job.worker, report => {
-      if (report.type === "started") { job.diagnostics = { ...report.diagnostics, regionPointer: pointer, coordinatorTls: e.__tls_base.value, coordinatorThreadToken: String(e.thread_token()), sharedMemory: memory.buffer instanceof SharedArrayBuffer, nestedWorker: true }; latestDiagnostics.push(job.diagnostics); }
+    const slot = await takeWorker();
+    job.slot = slot;
+    slot.failed = cause => fatal(String(cause));
+    slot.report = report => {
+      if (report.type === "started") { job.diagnostics = { ...report.diagnostics, workerSerial: slot.serial, regionPointer: pointer, coordinatorTls: e.__tls_base.value, coordinatorThreadToken: String(e.thread_token()), sharedMemory: memory.buffer instanceof SharedArrayBuffer, nestedWorker: true }; latestDiagnostics.push(job.diagnostics); }
       else if (report.type === "spawn-task") void launchTask(job, report.handle);
       else if (report.type === "net") void netRequest(job, report.request);
       else if (report.type === "finished") void finish(job, report.result, report.result < 0 ? errorFor(handle) : null);
       else if (report.type === "failed") fatal(report.error);
-    }, cause => fatal(String(cause)));
+    };
     job.poll = setInterval(() => { try { flush(job); } catch (cause) { fatal(String(cause)); } }, 10);
-    job.worker.postMessage({ type: "execute", module, memory, sessionHandle: handle, stackTop, tlsPointer, tokenHandle: token });
+    slot.worker.postMessage({ type: "execute", module, memory, sessionHandle: handle, stackTop, tlsPointer, tokenHandle: token });
   } finally { if (typeof e.config_drop === "function") e.config_drop(config); }
 }
 port.listen(async message => {
@@ -410,6 +429,8 @@ port.listen(async message => {
     else if (message.type === "dispose") {
       for (const job of jobs.values()) e.session_kill(job.handle);
       while (jobs.size) await new Promise(resolve => setTimeout(resolve, 10));
+      // No guest runs any more, so nothing can grow the memory as these end.
+      await Promise.all(idleWorkers.splice(0).map(slot => { childWorkers.delete(slot.worker); return stopWorker(slot.worker); }));
       port.send({ type: "disposed" });
     }
   } catch (cause) { port.send({ type: "failed", id: message.id, error: failure(cause?.kind ?? "internal", cause?.kind ? cause.message : String(cause)) }); }

@@ -57,6 +57,9 @@ Chromium・Firefox・本物の Safari で動くことを確かめてから、作
 
 - Worker を作るのは起動用の JavaScript です。WebAssembly から直接 Worker を作れず、
   主スレッドでは待てず、止めるときにまとめて止められるからです。
+- 終わった Worker は次のスレッドを待ち、ランチャーとともに終わります。WebKit では、共有メモリの
+  インスタンスを持つ Worker が終わるときに別のスレッドがそのメモリを grow すると、ページが
+  クラッシュします。アロケーターがその方法でメモリを求めるので、grow は避けられません。
 - エミュレータ全体（Rust のヒープと std）を Worker の間で共有するために、std も atomics
   付きで作り直し、Worker ごとにスタックと TLS を分けています。
 

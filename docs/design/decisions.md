@@ -63,6 +63,10 @@ the real work started.
 - The JavaScript launcher creates the Workers: WebAssembly cannot create
   Workers itself, the main thread cannot wait, and the launcher can stop them
   all at once.
+- A finished Worker waits for the next thread, and only ends with the launcher.
+  In WebKit, a Worker with an instance of a shared memory ending while another
+  thread grows that memory crashes the page. Growing cannot be avoided, since
+  the allocator asks for memory that way.
 - To share the whole emulator (the Rust heap and std) between Workers, std is
   rebuilt with atomics and every Worker gets its own stack and TLS.
 

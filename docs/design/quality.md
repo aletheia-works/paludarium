@@ -99,7 +99,8 @@ CI run produces them afresh on an x86-64 Linux runner.
   awk, Perl, Python, Ruby, PHP, Lua, Tcl, Node.js, SQLite, compressors, Git,
   OpenSSL, GnuPG, rsync, make, CMake, gcc, g++ and binutils, among others,
   and cases that use signals and timers, child processes and threads,
-  sockets on the loopback, file locks and `/proc`.
+  sockets on the loopback, file locks (SQLite's WAL with several writers)
+  and `/proc`.
   Under the emulator they run with the container's root mounted, so both
   sides load the same libraries. Each case writes to its own directory, and
   none prints times, so no output is masked. Every case succeeds natively;

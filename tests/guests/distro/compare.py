@@ -24,7 +24,7 @@ import sys
 import time
 
 # Even if every case ran out its time, the cases would end in about 116
-# minutes (83 cases on 4 workers, 330 s each), within the workflow's 150 with
+# minutes (84 cases on 4 workers, 330 s each), within the workflow's 150 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
 # ended. The slowest case, g++, took 75 to 150 s under the emulator on CI, and
@@ -194,10 +194,10 @@ def cases(fx):
         "dpkg-query": ["/usr/bin/dpkg-query", "-W", "-f=${Version}\\n", "bash"],
         # Signals, processes, sockets, locks and /proc. Left out until paludarium has
         # them: pseudo-terminals (python's pty, script), mkfifo, /proc/self/stat
-        # (ps), fcntl's byte-range locks (sqlite's WAL), /proc/self/exe and
-        # cmdline, /proc/loadavg and meminfo, and two hangs: multiprocessing's
-        # processes joined while several write to a queue, and Node.js's child
-        # processes connected by pipes (execFile, spawnSync).
+        # (ps), /proc/self/exe and cmdline, /proc/loadavg and meminfo, and two
+        # hangs: multiprocessing's processes joined while several write to a
+        # queue, and Node.js's child processes connected by pipes (execFile,
+        # spawnSync).
         "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
         "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],
         "python-processes": ["/usr/bin/python3", f"{SCRIPTS}/processes.py"],
@@ -225,6 +225,14 @@ def cases(fx):
         ),
         "split": shell(
             "cd {O} && seq 1000 > n && split -l 300 n p && wc -l p* && cat p* | cmp - n && echo same"
+        ),
+        # Four processes write to one database in WAL mode at once; SQLite takes
+        # fcntl's byte-range locks on the database and on its -shm file.
+        "sqlite-wal": shell(
+            "cd {O} && sqlite3 w.db 'pragma journal_mode=wal; create table t(a);' && "
+            "for i in 1 2 3 4; do (for j in $(seq 50); do "
+            "sqlite3 -cmd '.timeout 5000' w.db \"insert into t values($i)\"; done) & done; wait; "
+            "sqlite3 w.db 'select count(*), count(distinct a) from t; pragma integrity_check;'"
         ),
         "flock": shell(
             "flock {O}/l -c 'echo locked'; flock {O}/l -c 'flock -n {O}/l true; echo inner $?'"

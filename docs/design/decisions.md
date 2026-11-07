@@ -74,7 +74,10 @@ the real work started.
   browsers grow the memory as needed, since on Windows, and in Firefox on
   Linux, a grown memory counts against the system's commit limit at once.
   WebKit browsers are told apart by their user agent: `AppleWebKit/` without
-  `Chrome/`, which includes every browser on iOS.
+  `Chrome/`, which includes every browser on iOS. The crash is reported as
+  [WebKit bug 330591](https://bugs.webkit.org/show_bug.cgi?id=330591), with a
+  reproduction that needs no paludarium; once it is fixed, WebKit may not need
+  this.
 - A finished Worker waits for the next thread, and only ends with the launcher.
   In WebKit, a Worker with an instance of a shared memory ending while another
   thread grows that memory crashes the page.

@@ -9,6 +9,7 @@ const latestDiagnostics = [];
 const childWorkers = new Set();
 const idleWorkers = [];
 let workerSerial = 0;
+let disposing = false;
 /**
  * A Worker for one execution, kept for the next instead of being stopped. In WebKit, a Worker that
  * holds an instance of a shared memory ending while another thread grows that memory crashes the
@@ -25,7 +26,9 @@ async function takeWorker() {
 }
 function releaseWorker(slot) {
   slot.report = null; slot.failed = null;
-  idleWorkers.push(slot);
+  // A probe can outlast dispose, and nothing would stop what it left idle.
+  if (disposing) { childWorkers.delete(slot.worker); void stopWorker(slot.worker); }
+  else idleWorkers.push(slot);
 }
 let abandoned = false;
 const failure = (kind, message) => ({ kind, message });
@@ -430,6 +433,7 @@ port.listen(async message => {
       for (const job of jobs.values()) e.session_kill(job.handle);
       while (jobs.size) await new Promise(resolve => setTimeout(resolve, 10));
       // No guest runs any more, so nothing can grow the memory as these end.
+      disposing = true;
       await Promise.all(idleWorkers.splice(0).map(slot => { childWorkers.delete(slot.worker); return stopWorker(slot.worker); }));
       port.send({ type: "disposed" });
     }

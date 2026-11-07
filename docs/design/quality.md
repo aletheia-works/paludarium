@@ -103,7 +103,11 @@ CI run produces them afresh on an x86-64 Linux runner.
   none prints times, so no output is masked. Every case succeeds natively;
   one that fails there counts as a failure, since comparing two failures
   would check little. The emulator is a static musl
-  build, since the container's glibc may be older than the runner's.
+  build, since the container's glibc may be older than the runner's. The
+  Debian image and packages are not pinned, so that the emulator is checked
+  against what Debian ships now. This comparison is also part of the run
+  before a release, so a Debian update that breaks a program blocks a release
+  until the emulator is fixed; the versions are kept with the results.
 
 ## Fuzzing
 

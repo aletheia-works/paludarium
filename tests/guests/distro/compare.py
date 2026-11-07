@@ -23,8 +23,11 @@ import subprocess
 import sys
 import time
 
-NATIVE_TIMEOUT = 300
-EMULATED_TIMEOUT = 1800
+# Even if every case ran out its time, the run would end within the workflow's
+# 90 minutes: 53 cases on 4 workers, 360 s each. The slowest case takes about
+# 75 s under the emulator on CI, and under a second natively.
+NATIVE_TIMEOUT = 60
+EMULATED_TIMEOUT = 300
 
 
 def fixtures(work):
@@ -272,6 +275,14 @@ def enosys(results):
     return counts
 
 
+def save(results, output):
+    """Replace results.json in output with these results."""
+    path = os.path.join(output, "results.json")
+    with open(path + ".new", "w") as file:
+        json.dump(results, file, indent=1)
+    os.replace(path + ".new", path)
+
+
 def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--emulator", required=True)
@@ -296,10 +307,16 @@ def main(arguments=None):
         name, argv = item
         return outcome(name, run(name, argv, work, None, env), run(name, argv, work, emulator, env))
 
+    order = [name for name, _ in selected]
     results = []
+    os.makedirs(options.output, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(options.jobs) as executor:
-        for result in executor.map(one, selected):
+        for future in concurrent.futures.as_completed(
+            [executor.submit(one, item) for item in selected]
+        ):
+            result = future.result()
             results.append(result)
+            results.sort(key=lambda result: order.index(result["name"]))
             native, emulated = result["native"], result["emulated"]
             print(
                 "same" if result["same"] else "DIFF",
@@ -308,9 +325,8 @@ def main(arguments=None):
                 f"emulated {emulated['status']} in {emulated['seconds']} s",
                 flush=True,
             )
-    os.makedirs(options.output, exist_ok=True)
-    with open(os.path.join(options.output, "results.json"), "w") as file:
-        json.dump(results, file, indent=1)
+            # Written after every case, so that a run the job's time limit stops keeps what ended.
+            save(results, options.output)
     for line, count in enosys(results).most_common():
         print(f"{count} {line}")
     different = [result["name"] for result in results if not result["same"]]

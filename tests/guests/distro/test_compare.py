@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import pathlib
 import sys
 import tempfile
@@ -66,6 +67,16 @@ class CompareTest(unittest.TestCase):
                 files = [part for part in table[name] if fx in part]
                 self.assertTrue(files, name)
             self.assertTrue(pathlib.Path(fx, "words").read_text().startswith("0 word0\n"))
+
+    def test_results_are_replaced_whole(self):
+        with tempfile.TemporaryDirectory() as output:
+            compare.save([{"name": "a"}], output)
+            compare.save([{"name": "a"}, {"name": "b"}], output)
+            saved = json.loads(pathlib.Path(output, "results.json").read_text())
+            self.assertEqual([record["name"] for record in saved], ["a", "b"])
+            self.assertEqual(
+                sorted(p.name for p in pathlib.Path(output).iterdir()), ["results.json"]
+            )
 
     def test_an_unknown_case_is_an_error(self):
         with (

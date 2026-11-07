@@ -1,4 +1,11 @@
 export const isNode = typeof process !== "undefined" && Boolean(process.versions?.node);
+/**
+ * Whether `userAgent` is a WebKit browser: Safari, the other WebKit browsers and every browser on iOS.
+ * Chromium's agents name AppleWebKit too, but with Chrome/; Firefox's and Node.js's do not name it.
+ */
+export function isWebKit(userAgent) {
+  return typeof userAgent === "string" && userAgent.includes("AppleWebKit/") && !userAgent.includes("Chrome/");
+}
 export async function channel() {
   if (isNode) {
     const { parentPort } = await import("node:worker_threads");

@@ -63,10 +63,21 @@ the real work started.
 - The JavaScript launcher creates the Workers: WebAssembly cannot create
   Workers itself, the main thread cannot wait, and the launcher can stop them
   all at once.
+- In WebKit, the launcher grows the shared memory to its maximum of 1 GiB
+  before any guest runs. There, growing a shared memory while other threads run
+  in it sometimes makes them fail with "Out of bounds memory access" or crashes
+  the page: 13 of 2,700 runs of a test program that grows its memory while
+  threads start and end, against none of 2,700 with the memory grown
+  beforehand. The allocator gets more memory only by growing it, so the
+  launcher allocates the heap and frees it at once. It does not write to these
+  blocks, so on macOS their pages take no physical memory until used. Other
+  browsers grow the memory as needed, since on Windows, and in Firefox on
+  Linux, a grown memory counts against the system's commit limit at once.
+  WebKit browsers are told apart by their user agent: `AppleWebKit/` without
+  `Chrome/`, which includes every browser on iOS.
 - A finished Worker waits for the next thread, and only ends with the launcher.
   In WebKit, a Worker with an instance of a shared memory ending while another
-  thread grows that memory crashes the page. Growing cannot be avoided, since
-  the allocator asks for memory that way.
+  thread grows that memory crashes the page.
 - To share the whole emulator (the Rust heap and std) between Workers, std is
   rebuilt with atomics and every Worker gets its own stack and TLS.
 

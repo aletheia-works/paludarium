@@ -1,4 +1,4 @@
-import { channel, imports, spawnWorker, listen, stopWorker, putBuffer, takeBuffer } from "./worker-support.mjs";
+import { channel, imports, isWebKit, spawnWorker, listen, stopWorker, putBuffer, takeBuffer } from "./worker-support.mjs";
 import { costSnapshot } from "./jit-support.mjs";
 import { VERSION, WINDOW, ENETUNREACH, ECONNRESET, canonicalIp, errnoOf, joinAddress, splitAddress } from "./relay-protocol.mjs";
 const port = await channel();
@@ -400,6 +400,11 @@ port.listen(async message => {
       // Dropping a session closes its sockets from here: their kicks come back through the same path.
       e = (await WebAssembly.instantiate(module, imports(memory, { net: request => queueMicrotask(() => void netRequest(null, request)) }))).exports;
       if (typeof e.cost_reset === "function") e.cost_reset();
+      // In WebKit, growing a shared memory while other threads run in it fails them ("Out of bounds
+      // memory access") or crashes the page, so grow it to its maximum now, before any guest runs. The
+      // heap is reserved untouched, so the pages are not resident until used. Only in WebKit: on
+      // Windows, and in Firefox on Linux, the grown memory counts against the commit limit at once.
+      if (typeof e.heap_reserve === "function" && isWebKit(globalThis.navigator?.userAgent)) e.heap_reserve(0xffffffff);
       port.send({ type: "ready", exports: WebAssembly.Module.exports(module), imports: WebAssembly.Module.imports(module) });
     } else if (message.type === "filesystem-new") {
       const config = withBytes(encoder.encode("/"), id => e.config_new(id));

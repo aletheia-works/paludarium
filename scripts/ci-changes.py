@@ -136,6 +136,8 @@ def self_test():
         "packages/paludarium-wasm/index.mjs": {"wasm", "production_wasm", "release_check"},
         "tests/guests/programs/cases.json": {"programs", "wasm"},
         "tests/guests/encodings/observe.c": {"rust"},
+        "tests/guests/distro/compare.py": {"rust"},
+        ".github/workflows/distro-programs.yml": NONE,
         "scripts/coverage-check.py": {"rust"},
         "scripts/syscall-docs.py": NONE,
         "scripts/interface-docs.py": NONE,

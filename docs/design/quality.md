@@ -93,6 +93,17 @@ CI run produces them afresh on an x86-64 Linux runner.
   writes everything before it reads anything) and its parity with the
   kernel's rules. `wasm-browser-network.mjs` runs the guests through the
   relay in Chromium, Firefox, WebKit and Safari in CI.
+- Every night, Debian's own dynamically linked programs run natively and
+  under the emulator in a Debian container, and their exit status and
+  standard output are compared (`tests/guests/distro/compare.py`): shells,
+  awk, Perl, Python, Ruby, PHP, Lua, Tcl, Node.js, SQLite, compressors, Git,
+  OpenSSL, GnuPG, rsync, make, CMake, gcc, g++ and binutils, among others.
+  Under the emulator they run with the container's root mounted, so both
+  sides load the same libraries. Each case writes to its own directory, and
+  none prints times, so no output is masked. Every case succeeds natively;
+  one that fails there counts as a failure, since comparing two failures
+  would check little. The emulator is a static musl
+  build, since the container's glibc may be older than the runner's.
 
 ## Fuzzing
 
@@ -116,7 +127,7 @@ checking that no guest input makes the emulator panic.
 | When | What |
 |---|---|
 | Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments and in WebKit on x86-64 Linux; part of the fuzzing |
-| Every night | fuzzing of the 13 targets; differential tests on macOS and Windows; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
+| Every night | fuzzing of the 13 targets; differential tests on macOS and Windows; Debian's own programs on x86-64 Linux; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
 | Every day | every scheduled workflow is checked to have started on time; one that failed to start, did not run or was disabled opens an Issue |
 | Every week | the pinned nightly Rust and the aube and ripgrep guests move to their latest releases, each in a pull request that merges itself once its checks pass |
 | Before a release | all of the above on the exact code being released (below) |

@@ -88,6 +88,16 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   （すべて書いてからでないと読まない相手も含む）、カーネルの規則と同じであることを
   確かめます。CI では `wasm-browser-network.mjs` が、Chromium、Firefox、WebKit、Safari で
   ゲストに中継を通させます。
+- 毎晩、Debian の動的リンクのプログラムを、Debian のコンテナの中で本物の Linux と
+  エミュレーターの両方で動かし、終了コードと標準出力を比べます
+  （`tests/guests/distro/compare.py`）。シェル、awk、Perl、Python、Ruby、PHP、Lua、Tcl、
+  Node.js、SQLite、圧縮のツール、Git、OpenSSL、GnuPG、rsync、make、CMake、gcc、g++、
+  binutils などです。エミュレーターではコンテナのルートをマウントして動かすので、
+  両方とも同じライブラリを読みます。どのケースも自分のディレクトリに書き、時刻を
+  出さないので、出力を伏せるところはありません。どのケースも本物の Linux では成功します。
+  そこで失敗したケースは、失敗どうしを比べてもあまり確かめられないので、失敗と数えます。
+  コンテナの glibc は runner のものより
+  古いことがあるので、エミュレーターは musl の静的なビルドを使います。
 
 ## ファジング
 
@@ -110,7 +120,7 @@ LeakSanitizer を付けて、それぞれ 600 秒動かします。夜間の CI 
 | いつ | 何を |
 |---|---|
 | プルリクエストごと | Linux・macOS・Windows の単体テスト、lint、依存の検査、WebAssembly のビルド、x86-64 Linux での差分テスト、カバレッジ、probe・aube・ripgrep の差分テスト、4 つの WebAssembly の環境と x86-64 Linux の WebKit での受け入れのテスト、ファジングの一部 |
-| 毎晩 | 13 の対象のファジング、macOS と Windows での差分テスト、4 つの WebAssembly の環境と x86-64 Linux の WebKit での JIT ありとなし、速さの測定 |
+| 毎晩 | 13 の対象のファジング、macOS と Windows での差分テスト、x86-64 Linux での Debian のプログラム、4 つの WebAssembly の環境と x86-64 Linux の WebKit での JIT ありとなし、速さの測定 |
 | 毎日 | 定期実行のワークフローが時間どおりに始まったかを確かめます。始まらなかった、動かなかった、無効になっていたときは Issue を立てます |
 | 毎週 | 固定した nightly の Rust と、aube と ripgrep のゲストを最新のリリースへ上げます。それぞれのプルリクエストは、検査が通ると自分でマージされます |
 | 公開の前 | 公開する同じコードで、上のすべて（下を参照） |

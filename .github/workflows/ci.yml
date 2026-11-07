@@ -175,6 +175,9 @@ jobs:
         run: bash scripts/rustup-retry.test.sh
       - name: pin bump script tests
         run: python3 -B scripts/bump-pins.py --self-test
+      # The comparison itself runs every night (distro-programs.yml).
+      - name: distribution program comparison tests
+        run: python3 -B -m unittest discover -s tests/guests/distro -p 'test_*.py'
       - name: rustfmt
         run: |
           cargo fmt --all --check

@@ -2627,8 +2627,9 @@ impl StandardFile {
     /// host's streams change outside the emulator, so a thread looks at the
     /// stream every [`STREAM_WATCH`] while `O_ASYNC` is on, and sends `SIGIO`
     /// each time it becomes ready ([`StandardFile::ready`]) after it was
-    /// not, or after the guest was told `EAGAIN`: `POLL_IN` for input that comes, as Linux's pipe and terminal do,
-    /// and `POLL_OUT` for output that has room again. A host without
+    /// not, or after the guest was told `EAGAIN`: `POLL_IN` for input that
+    /// comes, as Linux's pipe and terminal do, and `POLL_OUT` for output that
+    /// has room again. A host without
     /// threads (WebAssembly) sends none.
     pub(crate) fn set_async(
         &self,

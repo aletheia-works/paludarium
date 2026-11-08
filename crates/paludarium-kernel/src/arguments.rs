@@ -264,6 +264,18 @@ fn widths(number: u64) -> &'static [u8] {
         463..=467 => b"ilu",
         // file_getattr, file_setattr: dfd, at_flags
         468 | 469 => b"illlu",
+        // delete_module: flags
+        176 => b"lu",
+        // quotactl: cmd, id
+        179 => b"ulu",
+        // add_key: ringid
+        248 => b"lllli",
+        // request_key: destringid
+        249 => b"llli",
+        // keyctl: option
+        250 => b"i",
+        // Every argument a full register (kexec_load and mseal among those
+        // with only unsigned long flags), or a number Linux does not have.
         _ => b"",
     }
 }
@@ -307,6 +319,38 @@ mod tests {
         let mut args = [dirty; 6];
         narrow(100_000, &mut args);
         assert_eq!(args, [dirty; 6]);
+    }
+
+    /// Calls whose arguments are all full registers, so that one missing from
+    /// the table above is a choice, not an oversight: a handler for any other
+    /// number must give its narrower arguments a line there.
+    #[test]
+    fn full_width_calls_are_listed() {
+        // stat, lstat, mmap, mprotect, munmap, brk, rt_sigreturn, pipe,
+        // sched_yield, mremap, mincore, shmdt, pause, nanosleep, getpid,
+        // clone, fork, vfork, execve, uname, truncate, getcwd, chdir, rename,
+        // rmdir, link, unlink, symlink, gettimeofday, sysinfo, times, ptrace,
+        // the get*id calls, getppid, getpgrp, setsid, getresuid, getresgid,
+        // capget, capset, rt_sigpending, rt_sigtimedwait, rt_sigsuspend,
+        // sigaltstack, utime, uselib, statfs, mlock, munlock, munlockall,
+        // vhangup, pivot_root, _sysctl, adjtimex, chroot, sync, acct,
+        // settimeofday, mount, swapoff, init_module, gettid, the xattr calls
+        // by path, time, set_thread_area, io_destroy..io_cancel,
+        // get_thread_area, remap_file_pages, set_tid_address,
+        // restart_syscall, utimes, get_mempolicy, mq_unlink, kexec_load,
+        // inotify_init, unshare, set_robust_list, getcpu, pkey_alloc,
+        // io_pgetevents, clone3, set_mempolicy_home_node, mseal
+        let full = [
+            4, 6, 9, 10, 11, 12, 15, 22, 24, 25, 27, 67, 34, 35, 39, 56, 57, 58, 59, 63, 76, 79,
+            80, 82, 84, 86, 87, 88, 96, 99, 100, 101, 102, 104, 107, 108, 110, 111, 112, 118, 120,
+            125, 126, 127, 128, 130, 131, 132, 134, 137, 149, 150, 152, 153, 155, 156, 159, 161,
+            162, 163, 164, 165, 168, 175, 186, 191, 192, 194, 195, 197, 198, 201, 205, 207, 208,
+            209, 210, 211, 216, 218, 219, 235, 239, 241, 246, 253, 272, 273, 309, 330, 333, 435,
+            450, 462,
+        ];
+        for number in full {
+            assert!(widths(number).is_empty(), "{number}");
+        }
     }
 
     #[test]

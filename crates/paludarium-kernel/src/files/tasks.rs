@@ -63,6 +63,9 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
     Ok(Task {
         pid,
         tid,
+        // Only under `task`: a thread's own ID names a directory of
+        // Linux's `tgid_base_stuff`, whose `stat` is the whole process's
+        // (`proc_tgid_stat`), as `/proc/<pid>/stat` is.
         thread: path.tid.is_some(),
         view,
         public,

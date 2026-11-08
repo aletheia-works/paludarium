@@ -4039,9 +4039,15 @@ pub(crate) fn rule_object(
     if d.path.is_empty() {
         return Err(Errno(77));
     }
-    let path = resolved(c.files, &d.path).ok_or(Errno(77))?;
-    let object = identity(c, &path).ok_or(Errno(77))?;
-    let directory = d.file.stat()?.mode & 0o170000 == 0o040000;
+    let stat = d.file.stat()?;
+    let directory = stat.mode & 0o170000 == 0o040000;
+    // The file the descriptor holds, as `fstat` names it, wherever it is
+    // now; a file of /proc or /dev by its path, which nothing renames.
+    let object = if generated(&d.path) {
+        identity(c, &d.path).ok_or(Errno(77))?
+    } else {
+        (descriptor_device(c, &d), stat.inode)
+    };
     Ok((object, directory))
 }
 pub(crate) fn generated(path: &[u8]) -> bool {

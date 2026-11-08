@@ -4623,6 +4623,28 @@ int main(int argc, char **argv) {
         }
         waitpid(pid, NULL, 0);
 
+        /* A rule names the file its descriptor holds, even renamed since. */
+        pid = child();
+        if (pid == 0) {
+            char d1[128], d2[128], inner[160];
+            snprintf(d1, sizeof d1, "%s/d1", top);
+            snprintf(d2, sizeof d2, "%s/d2", top);
+            snprintf(inner, sizeof inner, "%s/f", d2);
+            mkdir(d1, 0755);
+            int held = open(d1, O_PATH | O_DIRECTORY);
+            result("renamed", ll_call(rename(d1, d2)));
+            close(open(inner, O_CREAT | O_WRONLY, 0644));
+            long r = ll_ruleset(LL_READ_FILE);
+            struct ll_path_beneath held_rule = {LL_READ_FILE, held};
+            result("rule-renamed", ll_call(syscall(445, r, 1, &held_rule, 0)));
+            ll_enforce(r);
+            result("read-renamed", ll_open(inner, O_RDONLY));
+            result("read-other", ll_open(af, O_RDONLY));
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
         /* Running a program: EXECUTE. */
         pid = child();
         if (pid == 0) {

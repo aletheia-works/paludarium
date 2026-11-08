@@ -177,7 +177,11 @@ verified.
   `landlock_restrict_self` flags and no errata query (`EINVAL`), and nothing
   is logged. A rename's Landlock check comes after its permission checks,
   where Linux's comes before them, which shows only when both refuse. A rule
-  on a file under `/proc` does not count for `execve`.
+  on a file under `/proc` does not count for `execve`. An open checks the
+  file its path reaches before it opens it (and the file it made after), so
+  another thread renaming the name in between can make the two differ. There
+  is no `mount`, `umount2` or `pivot_root` (`ENOSYS`), which Linux refuses a
+  thread in a domain (`EPERM`).
 - **Credentials**: the IDs and capabilities a thread takes are checked on
   files, signals, resource limits, priorities, socket credentials and core
   files but nowhere else yet. `F_SETOWN` records no sender's credentials, so

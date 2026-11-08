@@ -147,6 +147,11 @@ pub trait HostFs: Send + Sync {
     fn make_socket(&self, _path: &[u8], _mode: u32) -> Result<FileStat, Errno> {
         Err(Errno::EPERM)
     }
+    /// Makes a FIFO at `path` with the permission bits of `mode`, as
+    /// `mknod` with `S_IFIFO` makes one; its status.
+    fn make_fifo(&self, _path: &[u8], _mode: u32) -> Result<FileStat, Errno> {
+        Err(Errno::EPERM)
+    }
     /// As [`FileHandle::with_xattrs`], for `path`; with `follow` false a final
     /// symbolic link itself is meant.
     fn with_xattrs(

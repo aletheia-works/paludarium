@@ -134,6 +134,7 @@ NAMES = {
     129: "rt_sigqueueinfo",
     130: "rt_sigsuspend",
     131: "sigaltstack",
+    133: "mknod",
     137: "statfs",
     138: "fstatfs",
     140: "getpriority",
@@ -183,6 +184,7 @@ NAMES = {
     247: "waitid",
     257: "openat",
     258: "mkdirat",
+    259: "mknodat",
     260: "fchownat",
     262: "newfstatat",
     263: "unlinkat",
@@ -221,6 +223,7 @@ NAMES = {
     435: "clone3",
     436: "close_range",
     439: "faccessat2",
+    452: "fchmodat2",
 }
 
 

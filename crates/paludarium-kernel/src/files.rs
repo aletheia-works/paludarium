@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
-    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 137, 138, 162, 188, 189, 190, 191, 192,
-    193, 194, 195, 196, 197, 198, 199, 217, 221, 257, 258, 260, 262, 263, 264, 265, 266, 267, 268,
-    269, 280, 285, 292, 293, 295, 296, 319, 326, 332, 436, 439,
+    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 133, 137, 138, 162, 188, 189, 190, 191,
+    192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 257, 258, 259, 260, 262, 263, 264, 265, 266,
+    267, 268, 269, 280, 285, 292, 293, 295, 296, 319, 326, 332, 436, 439, 452,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -659,6 +659,41 @@ fn chown_path(
         c.files.fs.set_mode(path, mode)?;
     }
     Ok(0)
+}
+/// `fchmodat2`, as Linux's `do_fchmodat`: `fchmodat` with flags.
+/// `AT_SYMLINK_NOFOLLOW` gives a symbolic link `EOPNOTSUPP`, since its mode
+/// cannot change, and `AT_EMPTY_PATH` changes the descriptor's file.
+fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    if a[3] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let raw = path(c, a[1])?;
+    let (p, stat) = if raw.is_empty() && a[3] & AT_EMPTY_PATH != 0 {
+        if a[0] as i32 != -100 {
+            let file = c.files.descriptor(a[0])?.file;
+            let mode =
+                crate::permissions::chmod(&c.process.credentials, &file.stat()?, a[2] as u32)?;
+            return file.set_mode(mode).map(|()| 0);
+        }
+        let cwd = c
+            .files
+            .cwd
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let stat = c.files.fs.metadata(&cwd, true)?;
+        (cwd, stat)
+    } else {
+        let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
+        let (p, _) = lookup(c, a[0], raw, follow)?;
+        let stat = c.files.fs.metadata(&p, follow)?;
+        (p, stat)
+    };
+    if stat.mode & 0o170000 == 0o120000 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let mode = crate::permissions::chmod(&c.process.credentials, &stat, a[2] as u32)?;
+    c.files.fs.set_mode(&p, mode).map(|()| 0)
 }
 /// `fchownat(dirfd, path, owner, group, flags)`, in `do_fchownat`'s order:
 /// the flags (EINVAL), then the path; an empty one with `AT_EMPTY_PATH`
@@ -2109,6 +2144,15 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             }
             Ok(0)
         }
+        133 | 259 => {
+            let (dir, raw, mode) = if n == 133 {
+                ((-100i32) as u64, path(c, a[0])?, a[1] as u32)
+            } else {
+                (a[0], path(c, a[1])?, a[2] as u32)
+            };
+            mknod(c, dir, &raw, mode)?;
+            Ok(0)
+        }
         84 | 87 | 263 => {
             let (at_dir, raw, dir) = if n == 263 {
                 if a[2] & !512 != 0 {
@@ -2295,6 +2339,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 crate::permissions::chmod(&c.process.credentials, &file.stat()?, a[1] as u32)?;
             file.set_mode(mode).map(|()| 0)
         }
+        452 => fchmodat2(c, a),
         // Extended attributes.
         188..=199 => xattrs::call(c, n, a),
         // chown, fchown, lchown, fchownat
@@ -3156,6 +3201,22 @@ fn open_path(
             }
         }
     } else {
+        // A FIFO opens as the pipe every opener of the node shares, except
+        // with O_PATH, which takes only its path.
+        if flags & O_PATH == 0
+            && let Ok(node) = c.files.fs.metadata(p, flags & O_NOFOLLOW == 0)
+            && node.mode & 0o170000 == 0o010000
+        {
+            const O_DIRECTORY: u32 = 0o200000;
+            if flags & 0o300 == 0o300 {
+                return Err(Errno::EEXIST);
+            }
+            if flags & O_DIRECTORY != 0 {
+                return Err(Errno::ENOTDIR);
+            }
+            let key = (device(c, p), node.inode);
+            return Ok((crate::fifo::open(c, key, &node, flags)?, p.to_vec()));
+        }
         let file = c.files.fs.open(p, flags, mode & !c.files.umask())?;
         const O_TRUNC: u32 = 0o1000;
         if flags & O_TRUNC != 0 && flags & O_PATH == 0 {
@@ -3558,6 +3619,41 @@ fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
                 .unwrap_or(0),
         ),
     }
+}
+/// `mknod` and `mknodat`, as Linux's `do_mknodat`: a regular file (type 0
+/// too), a FIFO or a socket node, with the permission bits of `mode` less
+/// the umask. A directory's type is `EPERM` and an unknown one `EINVAL`. A
+/// device needs a device to stand for, which paludarium has none of: `EPERM`,
+/// as for a process without `CAP_MKNOD`.
+fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32) -> Result<(), Errno> {
+    const S_IFMT: u32 = 0o170000;
+    let kind = mode & S_IFMT;
+    match kind {
+        0 | 0o100000 | 0o010000 | 0o140000 => {}
+        0o020000 | 0o060000 | 0o040000 => return Err(Errno::EPERM),
+        _ => return Err(Errno::EINVAL),
+    }
+    let p = c.files.path(dir, raw.to_vec())?;
+    let created = crate::permissions::create(c.files, &c.process.credentials, dir, raw)?;
+    let permissions = mode & 0o7777 & !c.files.umask();
+    match kind {
+        0o010000 => {
+            c.files.fs.make_fifo(&p, permissions)?;
+        }
+        0o140000 => {
+            c.files.fs.make_socket(&p, permissions)?;
+        }
+        _ => {
+            // O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW: a new empty file.
+            c.files
+                .fs
+                .open(&p, 0o1 | 0o100 | 0o200 | 0o400000, permissions)?;
+        }
+    }
+    if let Some(parent) = created {
+        crate::permissions::own(c.files, &c.process.credentials, &p, false, &parent);
+    }
+    Ok(())
 }
 /// This process's `/proc/self/status`.
 fn status(c: &Context<'_>) -> Vec<u8> {

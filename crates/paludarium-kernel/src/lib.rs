@@ -18,6 +18,7 @@ mod devices;
 mod epoll;
 mod events;
 mod fasync;
+mod fifo;
 mod files;
 mod inet;
 mod loopback;

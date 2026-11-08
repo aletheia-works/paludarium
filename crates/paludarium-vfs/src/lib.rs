@@ -140,8 +140,10 @@ enum Kind {
     File(Contents),
     Dir(BTreeMap<Vec<u8>, u64>),
     Symlink(Vec<u8>),
-    /// A socket file, as `bind` of an AF_UNIX socket to a path makes one.
-    Socket,
+    /// A node without contents, of the type its mode gives: a socket file,
+    /// as `bind` of an AF_UNIX socket to a path makes one, or a FIFO, as
+    /// `mknod` makes one.
+    Special,
 }
 struct Node {
     kind: Kind,
@@ -161,7 +163,7 @@ impl Node {
             size: match &self.kind {
                 Kind::File(contents) => contents.len(),
                 Kind::Symlink(b) => b.len() as u64,
-                Kind::Dir(_) | Kind::Socket => 0,
+                Kind::Dir(_) | Kind::Special => 0,
             },
             blocks: match &self.kind {
                 Kind::File(contents) => Some(contents.blocks()),

@@ -4700,6 +4700,18 @@ fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
         crate::proc::SystemEntry::Meminfo => {
             crate::proc::render_meminfo(crate::syscalls::SYSINFO_RAM)
         }
+        crate::proc::SystemEntry::Stat => {
+            let (_, forks) = c.processes.task_counts();
+            let clock = |id| c.host.clock(id).unwrap_or(0);
+            let boot = clock(paludarium_host::ClockId::Realtime)
+                .saturating_sub(clock(paludarium_host::ClockId::Monotonic));
+            crate::proc::render_system_stat(&crate::proc::SystemStat {
+                cpus: crate::syscalls::active_cpus(c),
+                boot_time: boot / 1_000_000_000,
+                forks,
+                running: 1,
+            })
+        }
         crate::proc::SystemEntry::Uptime => crate::proc::render_uptime(
             c.host
                 .clock(paludarium_host::ClockId::Monotonic)

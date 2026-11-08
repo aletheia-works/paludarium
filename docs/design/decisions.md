@@ -45,6 +45,13 @@ ordering, which keeps that order on an Arm host too, without the lock. A write
 to an executable page moves the code generation on after its bytes, so whoever
 sees the new generation sees the new code.
 
+An aligned load of 16 bytes (`MOVDQA`, for one) is one access on an x86-64
+CPU, so it sees a `CMPXCHG16B` or a 16-byte store of another thread whole.
+The emulator keeps page contents as 8-byte words, and a load takes no lock, so
+each page counts the writes of more than one word it has started and finished.
+Such a load reads its two words again while one of them may have come between
+them; other loads and writes pay nothing for it.
+
 ## Owning the waiting primitives
 
 `futex`, `epoll`, `eventfd` and `timerfd` are implemented in paludarium's

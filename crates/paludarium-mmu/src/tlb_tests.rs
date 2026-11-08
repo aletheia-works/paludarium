@@ -449,3 +449,27 @@ fn a_space_never_takes_the_pages_of_another_space_in_a_threads_tlb() {
     assert!(!second.read(GuestAddr(AT), &mut [0]).unwrap_err().mapped);
     assert_ne!(second.code.epoch.load(Ordering::Acquire), 0);
 }
+
+#[test]
+fn a_load_it_holds_sees_a_16_byte_exchange_whole() {
+    let space = Arc::new(space(1, Prot::READ_WRITE));
+    space.write(GuestAddr(AT), &[0; 16]).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let (reader, finished) = (Arc::clone(&space), Arc::clone(&done));
+    let thread = std::thread::spawn(move || {
+        used(&reader, AT);
+        while !finished.load(Ordering::Relaxed) {
+            let mut value = [0; 16];
+            reader.read(GuestAddr(AT), &mut value).unwrap();
+            assert!(value == [0; 16] || value == [0xff; 16], "{value:?}");
+        }
+    });
+    for round in 0..100_000 {
+        let value = if round % 2 == 0 { u128::MAX } else { 0 };
+        space
+            .atomic(GuestAddr(AT), AtomicWidth::W128, AtomicOp::Exchange(value))
+            .unwrap();
+    }
+    done.store(true, Ordering::Relaxed);
+    thread.join().unwrap();
+}

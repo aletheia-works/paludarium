@@ -3174,7 +3174,7 @@ static long proc_read(const char *path, char *buffer, size_t size) {
 }
 
 /* This process's stat, cmdline, comm, exe and cwd, and the system's loadavg,
-   meminfo and uptime: their format, and what the system calls say too. */
+   meminfo, uptime and stat: their format, and what the system calls say too. */
 static int proc_own_files_cases(int argc, char **argv) {
     static char buffer[65536];
     sigset_t set;
@@ -3282,6 +3282,35 @@ static int proc_own_files_cases(int argc, char **argv) {
     int uptime_fields = sscanf(buffer, "%lf %lf", &up, &idle);
     printf("uptime fields=%d near-sysinfo=%d\n", uptime_fields,
            up >= (double)info.uptime - 1 && up <= (double)info.uptime + 2);
+    /* /proc/stat: the all-CPU line, one per online CPU, then the counters
+       in show_stat's order; the boot time is now less the uptime. */
+    n = proc_read("/proc/stat", buffer, sizeof buffer);
+    cpu_set_t online;
+    int cpus = sched_getaffinity(0, sizeof online, &online) ? -1 : CPU_COUNT(&online);
+    int cpu_lines = 0, times = 0, order = 0, softirqs = 0;
+    long long btime = -1, processes = -1, procs_running = -1;
+    const char *keys[] = {"intr ", "ctxt ", "btime ", "processes ", "procs_running ", "procs_blocked ", "softirq "};
+    for (char *line = n > 0 ? buffer : NULL, *end; line && *line; line = end + 1) {
+        if (!(end = strchr(line, '\n'))) break;
+        *end = 0;
+        if (!strncmp(line, "cpu  ", 5)) {
+            for (char *t = strtok(line + 5, " "); t; t = strtok(NULL, " ")) times++;
+        } else if (!strncmp(line, "cpu", 3)) {
+            cpu_lines += atoi(line + 3) == cpu_lines;
+        } else if (order < 7 && !strncmp(line, keys[order], strlen(keys[order]))) {
+            if (order == 2) btime = atoll(line + 6);
+            if (order == 3) processes = atoll(line + 10);
+            if (order == 4) procs_running = atoll(line + 14);
+            if (order == 6)
+                for (char *t = strtok(line + 8, " "); t; t = strtok(NULL, " ")) softirqs++;
+            order++;
+        }
+    }
+    long long booted = (long long)time(NULL) - info.uptime;
+    printf("proc-stat first-cpu=%d times=%d per-cpu=%d counters-in-order=%d softirq-values=%d\n",
+           !strncmp(buffer, "cpu  ", 5), times, cpu_lines == cpus, order, softirqs);
+    printf("proc-stat btime-near-boot=%d processes=%d running=%d\n", btime >= booted - 2 && btime <= booted + 2,
+           processes >= 1, procs_running >= 1);
 
     DIR *own = opendir("/proc/self");
     int seen = 0;

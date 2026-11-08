@@ -206,11 +206,13 @@ def cases(fx):
         ),
         # ps and pgrep read the /proc directories of this shell's children, sleep's once it
         # sleeps. Only the children: the native side shares its /proc with the other cases.
+        # STIME needs the boot time from /proc/stat; only whether ps finds it is compared.
         "ps": shell(
             'sleep 30 & s=$!; until [ "$(cat /proc/$s/comm 2>/dev/null)" = sleep ] && '
             "grep -q 'State:.S' /proc/$s/status; do :; done; "
             "ps -o user=,stat=,tty=,time=,nlwp=,ni=,comm= --ppid $$ > {O}/p; sort {O}/p; "
             "ps -o args= -p $s; ps -L -o nlwp=,comm= -p $s; readlink /proc/$s/exe /proc/$s/cwd; "
+            "ps -o stime= -p $s > /dev/null; echo stime $?; "
             '[ "$(pgrep -x -P $$ sleep)" = "$s" ] && echo pgrep found; kill $s; wait $s; echo $?'
         ),
         "timeout": shell("timeout 0.2 sleep 5; echo $?; timeout -s KILL 0.2 sleep 5; echo $?"),

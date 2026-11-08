@@ -96,9 +96,10 @@ CI run produces them afresh on an x86-64 Linux runner.
 - Every night, Debian's own dynamically linked programs run natively and
   under the emulator in a Debian container, and their exit status and
   standard output are compared (`tests/guests/distro/compare.py`): shells,
-  awk, Perl, Python, Ruby, PHP, Lua, Tcl, Node.js, SQLite, compressors, Git,
-  OpenSSL, GnuPG, rsync, make, CMake, gcc, g++ and binutils, among others,
-  and cases that use signals and timers, child processes and threads,
+  awk, Perl, Python, Ruby, PHP, Lua, Tcl, Node.js, Go, Emacs, BusyBox, SQLite,
+  Redis, compressors, Git, OpenSSL, GnuPG, rsync, make, CMake, Ninja, gcc,
+  g++ and binutils, among others, and cases that use signals and timers,
+  child processes and threads,
   sockets on the loopback, file locks (SQLite's WAL with several writers)
   and `/proc`.
   Under the emulator they run with the container's root mounted, so both

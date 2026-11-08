@@ -23,12 +23,12 @@ import subprocess
 import sys
 import time
 
-# Even if every case ran out its time, the cases would end in about 121
-# minutes (86 cases on 4 workers, 330 s each), within the workflow's 150 with
+# Even if every case ran out its time, the cases would end in about 143
+# minutes (101 cases on 4 workers, 330 s each), within the workflow's 180 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
-# ended. The slowest case, g++, took 75 to 150 s under the emulator on CI, and
-# under a second natively.
+# ended. The slowest cases, Emacs and g++, took up to 180 s under the emulator
+# on CI, and under a second natively; all of them took 12 minutes.
 SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 NATIVE_TIMEOUT = 30
 EMULATED_TIMEOUT = 300
@@ -325,6 +325,87 @@ def cases(fx):
             "cd {O} && mkdir t && echo a > t/f && chmod 751 t/f && ln -s f t/l && tar czf t.tgz t && "
             "mkdir x && tar xzf t.tgz -C x && stat -c '%a %F' x/t/f x/t/l"
         ),
+        # Built by the Dockerfile; the go command itself only reports its version.
+        "go": shell("/usr/local/bin/goroutines && go version | cut -d' ' -f1-2"),
+        "python-stdlib": ["/usr/bin/python3", f"{SCRIPTS}/stdlib.py"],
+        "redis": shell(
+            "cd {O} && (redis-server --port 16379 --bind 127.0.0.1 --save '' --appendonly no "
+            "--dir {O} >/dev/null &) && for i in $(seq 200); do redis-cli -p 16379 ping 2>/dev/null && break; "
+            "sleep 0.1; done && redis-cli -p 16379 set k v && redis-cli -p 16379 incrby n 41 && "
+            "redis-cli -p 16379 incr n && redis-cli -p 16379 lpush l a b c && redis-cli -p 16379 lrange l 0 -1 && "
+            "redis-cli -p 16379 shutdown nosave; true"
+        ),
+        "http-server": shell(
+            "cd {O} && echo served > page && { python3 -m http.server 18080 --bind 127.0.0.1 "
+            ">/dev/null 2>&1 & } && server=$! && for i in $(seq 200); do curl -sf http://127.0.0.1:18080/page && "
+            "break; sleep 0.1; done && curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:18080/missing; "
+            "kill $server; wait $server; echo server $?"
+        ),
+        "busybox": shell(
+            "busybox echo hi; echo 'b a' | busybox awk '{print $2, $1}'; busybox seq 3 | busybox sed 's/^/n/'; "
+            "printf 'x\\ny\\n' | busybox sort -r; busybox sh -c 'for i in 1 2; do echo sh$i; done'; "
+            "busybox expr 6 \\* 7"
+        ),
+        "zsh": [
+            "/usr/bin/zsh",
+            "-c",
+            "setopt extendedglob; a=(3 1 2); print -l ${(n)a}; print ${${:-hello}:u}; "
+            "f() { print args $#; }; f 1 2 3; (( x = 2 ** 10 )); print $x; sleep 0.1 & wait; print waited $?",
+        ],
+        "mksh": [
+            "/bin/mksh",
+            "-c",
+            "typeset -i n=0; while (( n < 3 )); do (( n++ )); done; echo $n; "
+            "set -A a z y; echo ${a[1]}; echo $(( 7 % 3 )); trap 'echo trapped' EXIT",
+        ],
+        "emacs": [
+            "/usr/bin/emacs",
+            "--batch",
+            "--eval",
+            '(progn (princ (format "%s\\n" (mapcar (lambda (x) (* x x)) (number-sequence 1 5)))) '
+            '(princ (format "%s\\n" (string-to-number "42"))) '
+            '(with-temp-buffer (insert "b\\na\\n") (sort-lines nil (point-min) (point-max)) '
+            "(princ (buffer-string))))",
+        ],
+        "perl-threads": [
+            "/usr/bin/perl",
+            "-Mthreads",
+            "-MJSON::PP",
+            "-MDigest::SHA=sha256_hex",
+            "-e",
+            "my @t = map { threads->create(sub { $_[0] * 2 }, $_) } 1..4; print join(',', map { $_->join } @t), \"\\n\"; "
+            "print JSON::PP->new->canonical->encode({b => [1, 2], a => 'x'}), \"\\n\"; print sha256_hex('abc'), \"\\n\";",
+        ],
+        "coreutils-more": shell(
+            "cd {O} && seq 10 | shuf --random-source=<(yes) | sort -n | tr '\\n' ' '; echo; "
+            "printf abc | tee t1 | head -c 2; echo; truncate -s 5000 sp && stat -c %s sp && "
+            "cp --sparse=always sp sp2 && cmp sp sp2 && echo sparse-same; mktemp -p . tmp.XXXX | wc -c; "
+            "id -u; nice -n 5 nice; nohup echo detached 2>/dev/null; stdbuf -oL echo buffered; "
+            "df -P . | tail -1 | wc -w"
+        ),
+        "util-linux": shell(
+            "getopt -o ab: -- -a -b x y; printf 'a b\\nccc d\\n' | column -t; echo stressed | rev; "
+            "printf 'AB' | hexdump -C | head -1; findmnt -n -o TARGET / ; setsid sh -c 'echo new session'; "
+            "prlimit --nofile=128 sh -c 'ulimit -n'; taskset -c 0 echo pinned"
+        ),
+        "compressors": shell(
+            "cd {O} && seq 10000 > n && lz4 -q n n.lz4 && lz4 -dc n.lz4 | cmp - n && echo lz4; "
+            "brotli -c n > n.br && brotli -dc n.br | cmp - n && echo brotli; "
+            "pigz -p 4 -c n > n.gz && gzip -dc n.gz | cmp - n && echo pigz; "
+            "lzip -c n > n.lz && lzip -dc n.lz | cmp - n && echo lzip"
+        ),
+        "ninja": shell(
+            "cd {O} && printf 'cmake_minimum_required(VERSION 3.10)\\nproject(p C)\\n"
+            "add_executable(p p.c)\\n' > CMakeLists.txt && printf 'int main(void){return 7;}\\n' > p.c && "
+            "cmake -G Ninja -S . -B b >/dev/null && ninja -C b >/dev/null && ./b/p; echo status $?"
+        ),
+        "parallel": shell(
+            "seq 8 | parallel --will-cite -j4 -k 'echo job {}; echo {} >&2' 2>/dev/null; "
+            "parallel --will-cite -k echo ::: a b ::: 1 2"
+        ),
+        "ed": shell(
+            "cd {O} && printf 'one\\ntwo\\n' > f && printf '2s/two/2/\\n1i\\nzero\\n.\\nw\\nq\\n' | ed -s f && cat f"
+        ),
     }
 
 
@@ -341,7 +422,9 @@ def environment(work):
 
 # The emulator's own options for a case. Without --allow-net a guest has no
 # network, not even a loopback (docs/guide/features.md#network).
-OPTIONS = {"python-sockets": ["--allow-net", "127.0.0.1"]}
+OPTIONS = {
+    name: ["--allow-net", "127.0.0.1"] for name in ("python-sockets", "redis", "http-server")
+}
 
 
 def command(argv, directory, emulator, env, options=()):

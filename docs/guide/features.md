@@ -53,7 +53,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
@@ -509,6 +509,13 @@ kernel.
   `MS_ASYNC` writes the stores of shared file mappings back to their files.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
+  `sched_setaffinity` keeps a mask for a thread of the process, as Linux
+  reads it: up to a CPU mask's size (a shorter one counts the rest as clear),
+  only the host's CPUs, and `EINVAL` if none is left. `sched_getaffinity`
+  then gives that mask, and new threads and processes inherit it, but the
+  host still runs the thread on any of its CPUs. Both find a thread of
+  another process too, as root may, and give `ESRCH` when no live thread
+  has the ID.
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like
   `CPUID`, it does not reveal the host. The guest starts as root (user and
   group 0, with every capability). Each thread has its own credentials, as

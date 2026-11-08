@@ -3499,6 +3499,12 @@ static int mincore_cases(void) {
     return 0;
 }
 
+/* The CPU mask a new thread starts with, for the affinity case. */
+static void *affinity_of_thread(void *mask) {
+    syscall(SYS_sched_getaffinity, 0, 16 * sizeof(unsigned long), mask);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
@@ -3659,6 +3665,57 @@ int main(int argc, char **argv) {
         errno = 0;
         result("fault", syscall(SYS_sched_getaffinity, 0, 8, (void *)1));
         result("errno", errno);
+
+        /* sched_setaffinity: a mask kept for the thread, read up to a CPU
+           mask's size, inherited by threads and processes, and settable for
+           another process. */
+        int cpus = __builtin_popcountl(mask[0]);
+        unsigned long all[16] = {0}, one[16] = {1}, none[16] = {0};
+        syscall(SYS_sched_getaffinity, 0, sizeof all, all);
+        result("set-one", syscall(SYS_sched_setaffinity, 0, sizeof one, one));
+        syscall(SYS_sched_getaffinity, 0, sizeof mask, mask);
+        result("got-one", mask[0] == 1);
+        unsigned char short_mask = 1;
+        result("set-short", syscall(SYS_sched_setaffinity, 0, 1, &short_mask));
+        errno = 0;
+        result("set-none", syscall(SYS_sched_setaffinity, 0, sizeof none, none));
+        result("errno", errno);
+        errno = 0;
+        result("set-fault", syscall(SYS_sched_setaffinity, 0, sizeof one, (void *)1));
+        result("errno", errno);
+        errno = 0;
+        result("set-missing", syscall(SYS_sched_setaffinity, 0x3fffffff, sizeof one, one));
+        result("errno", errno);
+        pthread_t thread;
+        static unsigned long seen[16];
+        pthread_create(&thread, NULL, affinity_of_thread, seen);
+        pthread_join(thread, NULL);
+        result("thread-inherits", seen[0] == 1);
+        int wait_pipe[2], ready_pipe[2];
+        if (pipe(wait_pipe) || pipe(ready_pipe)) return 1;
+        fflush(stdout);
+        pid_t child = fork();
+        if (!child) {
+            unsigned long inherited[16] = {0};
+            syscall(SYS_sched_getaffinity, 0, sizeof inherited, inherited);
+            char byte;
+            /* The parent changes the mask only once this one was read. */
+            if (write(ready_pipe[1], "r", 1) != 1 || read(wait_pipe[0], &byte, 1) != 1) _exit(99);
+            unsigned long now[16] = {0};
+            syscall(SYS_sched_getaffinity, 0, sizeof now, now);
+            _exit((inherited[0] == 1) | (__builtin_popcountl(now[0]) == cpus) << 1);
+        }
+        char ready;
+        if (read(ready_pipe[0], &ready, 1) != 1) return 1;
+        result("set-other", syscall(SYS_sched_setaffinity, child, sizeof all, all));
+        unsigned long other[16] = {0};
+        syscall(SYS_sched_getaffinity, child, sizeof other, other);
+        result("got-other", __builtin_popcountl(other[0]) == cpus);
+        if (write(wait_pipe[1], "x", 1) != 1) return 1;
+        int status;
+        waitpid(child, &status, 0);
+        result("child", WEXITSTATUS(status));
+        syscall(SYS_sched_setaffinity, 0, sizeof all, all);
         return 0;
     }
     if (!strcmp(mode, "ids")) {

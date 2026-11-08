@@ -25,6 +25,9 @@ pub struct ThreadGroup {
     /// stays after it exits, as its zombie task does, until the process is
     /// reaped.
     nice: Mutex<BTreeMap<u32, i32>>,
+    /// The CPU mask `sched_setaffinity` gave each thread, which Linux keeps
+    /// per thread; one without lets every CPU run it.
+    affinity: Mutex<BTreeMap<u32, Vec<u64>>>,
     /// What signalling each thread looks at, for other processes to read;
     /// a thread without one is root's ([`TaskIds`]).
     task_ids: Mutex<BTreeMap<u32, TaskIds>>,
@@ -65,6 +68,7 @@ impl Default for ThreadGroup {
             stopped: std::sync::atomic::AtomicBool::new(false),
             members: Mutex::new(BTreeMap::new()),
             nice: Mutex::default(),
+            affinity: Mutex::default(),
             task_ids: Mutex::default(),
             status: Mutex::new(None),
             actions: Mutex::default(),
@@ -152,6 +156,14 @@ impl ThreadGroup {
         // values, so only the PID's value is kept.
         nice.retain(|&tid, _| tid == pid);
         drop(nice);
+        // So does its CPU mask.
+        let mut affinity = self.affinity.lock().unwrap_or_else(PoisonError::into_inner);
+        let kept = affinity.remove(&old_tid);
+        affinity.clear();
+        if let Some(mask) = kept {
+            affinity.insert(pid, mask);
+        }
+        drop(affinity);
         self.retired
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -391,6 +403,20 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&tid)
             .copied()
+    }
+    /// The CPU mask of thread `tid`, if `sched_setaffinity` gave it one.
+    pub(crate) fn affinity(&self, tid: u32) -> Option<Vec<u64>> {
+        self.affinity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .cloned()
+    }
+    pub(crate) fn set_affinity(&self, tid: u32, mask: Vec<u64>) {
+        self.affinity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, mask);
     }
     pub(crate) fn set_nice(&self, tid: u32, value: i32) {
         self.nice
@@ -947,6 +973,10 @@ impl Kernel {
         // is registered so that no one sees it without one.
         if let Some(value) = self.group.nice(parent.tid) {
             self.group.set_nice(tid, value);
+        }
+        // And its CPU mask, as Linux's `dup_task_struct` copies it.
+        if let Some(mask) = self.group.affinity(parent.tid) {
+            self.group.set_affinity(tid, mask);
         }
         self.group.register(tid, inbox);
         // Linux ignores unsuccessful parent/child TID stores (native case 23).

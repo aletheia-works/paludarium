@@ -45,7 +45,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
@@ -465,6 +465,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マッピングへの書き込みをファイルに書き戻します。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
+  `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。
+  CPU マスクの大きさまで読み（短ければ残りは空とみなします）、ホストの CPU だけを残し、
+  何も残らなければ `EINVAL` です。その後の `sched_getaffinity` はそのマスクを返し、新しい
+  スレッドとプロセスはそれを継ぎます。ただし、ホストはそのスレッドをどの CPU でも動かします。
+  どちらも、root と同じくほかのプロセスのスレッドも見つけ、その ID の生きているスレッドが
+  なければ `ESRCH` です。
 - `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、
   ホストのことは見せません。ゲストは root（ユーザーとグループが 0 で、すべての
   ケーパビリティを持つ）として始まります。Linux と同じく、資格情報はスレッドごとに

@@ -818,6 +818,17 @@ impl Processes {
             parent.group.notify_child(signals::CLD_STOPPED, child);
         }
     }
+    /// The thread group of the live thread named by its ID, in any process,
+    /// as `find_task_by_vpid` finds it.
+    pub(crate) fn group_of(&self, named: u32) -> Option<Arc<ThreadGroup>> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .iter()
+            .find(|&(&key, entry)| {
+                entry.status.is_none() && (key == named || entry.group.has_member(named))
+            })
+            .map(|(_, entry)| Arc::clone(&entry.group))
+    }
     /// What another thread named by its ID looks like to the thread acting
     /// on it, as `kill` finds it.
     pub(crate) fn task_ids(&self, named: u32) -> Option<TaskIds> {
@@ -1601,6 +1612,9 @@ impl Kernel {
         group.set_process_inbox(inbox.clone());
         if let Some(value) = self.group.nice(parent.tid) {
             group.set_nice(pid, value);
+        }
+        if let Some(mask) = self.group.affinity(parent.tid) {
+            group.set_affinity(pid, mask);
         }
         group.register(pid, inbox.clone());
         let mut state = parent.state.clone();

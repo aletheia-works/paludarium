@@ -192,13 +192,14 @@ def cases(fx):
         "xxd": ["/usr/bin/xxd", "-l", "32", f"{fx}/words"],
         "less": shell("less -F /etc/os-release | wc -l"),
         "dpkg-query": ["/usr/bin/dpkg-query", "-W", "-f=${Version}\\n", "bash"],
-        # Signals, processes, sockets, locks and /proc. Left out until paludarium has
-        # them: pseudo-terminals (python's pty, script), mkfifo, and the /proc
+        # Signals, processes, sockets, pseudo-terminals, locks and /proc. Left out until
+        # paludarium has them: script (signalfd), mkfifo, and the /proc
         # directories of other processes (ps).
         "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
         "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],
         "python-processes": ["/usr/bin/python3", f"{SCRIPTS}/processes.py"],
         "python-proc": ["/usr/bin/python3", f"{SCRIPTS}/proc.py"],
+        "python-pty": ["/usr/bin/python3", f"{SCRIPTS}/terminals.py"],
         "timeout": shell("timeout 0.2 sleep 5; echo $?; timeout -s KILL 0.2 sleep 5; echo $?"),
         "bash-trap": shell(
             "trap 'echo got USR1' USR1; kill -USR1 $$; echo after; "

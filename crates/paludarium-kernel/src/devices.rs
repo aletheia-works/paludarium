@@ -1,6 +1,7 @@
 //! `/dev`: the character devices null, zero, full, random and urandom, each
-//! a kernel object, and the links into `/proc/self/fd` that Linux systems
-//! have there (`fd`, `stdin`, `stdout`, `stderr`).
+//! a kernel object, the links into `/proc/self/fd` that Linux systems have
+//! there (`fd`, `stdin`, `stdout`, `stderr`), and the pseudo-terminals'
+//! `ptmx` and devpts directory `pts` ([`crate::pty`]).
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat, Host};
 use paludarium_types::Errno;
 use std::sync::Arc;
@@ -22,14 +23,25 @@ pub(crate) enum Entry {
     Device(Kind),
     /// A symbolic link, and its target.
     Link(&'static [u8]),
+    /// `/dev/ptmx`, and devpts's own `/dev/pts/ptmx`.
+    Ptmx {
+        devpts: bool,
+    },
+    /// `/dev/pts`.
+    Pts,
+    /// A name in `/dev/pts`: a slave's number, or `None` for a name no
+    /// slave can have.
+    Slave(Option<u32>),
 }
 /// The names in `/dev`, sorted as it lists them. Each has the inode number
 /// two more than its place here, and `/dev` itself has 1, so that `stat` and
 /// `getdents` agree.
-const NAMES: [(&[u8], Entry); 9] = [
+const NAMES: [(&[u8], Entry); 11] = [
     (b"fd", Entry::Link(b"/proc/self/fd")),
     (b"full", Entry::Device(Kind::Full)),
     (b"null", Entry::Device(Kind::Null)),
+    (b"ptmx", Entry::Ptmx { devpts: false }),
+    (b"pts", Entry::Pts),
     (b"random", Entry::Device(Kind::Random)),
     (b"stderr", Entry::Link(b"/proc/self/fd/2")),
     (b"stdin", Entry::Link(b"/proc/self/fd/0")),
@@ -49,6 +61,25 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
         return Some(Entry::Directory);
     }
     let name = path.strip_prefix(b"/dev/")?;
+    if name == b"pts/" {
+        return Some(Entry::Pts);
+    }
+    if let Some(name) = name.strip_prefix(b"pts/") {
+        if name == b"ptmx" {
+            return Some(Entry::Ptmx { devpts: true });
+        }
+        if name.contains(&b'/') {
+            return None;
+        }
+        // devpts names a slave by its number in decimal, without leading
+        // zeros.
+        let number = std::str::from_utf8(name)
+            .ok()
+            .filter(|digits| !digits.starts_with('0') || *digits == "0")
+            .filter(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse().ok());
+        return Some(Entry::Slave(number));
+    }
     NAMES.iter().find(|(n, _)| *n == name).map(|&(_, e)| e)
 }
 /// A path through one of the links, with the link replaced by its target
@@ -92,6 +123,13 @@ pub(crate) fn stat(entry: Entry) -> FileStat {
             size: target.len() as u64,
             ..FileStat::default()
         },
+        Entry::Ptmx { devpts } => FileStat {
+            inode: if devpts { 2 } else { inode(entry) },
+            ..crate::pty::ptmx_stat(devpts)
+        },
+        Entry::Pts => crate::pty::directory_stat(),
+        // A slave's own, which `crate::pty::slave_stat` gives.
+        Entry::Slave(_) => FileStat::default(),
     }
 }
 /// `/dev`'s entries: `.`, `..` (the root, with inode `root`), then the
@@ -101,10 +139,10 @@ pub(crate) fn entries(root: u64) -> Vec<DirectoryEntry> {
     const DT_DIR: u8 = 4;
     const DT_LNK: u8 = 10;
     let named = NAMES.iter().map(|&(name, entry)| {
-        let kind = if matches!(entry, Entry::Link(_)) {
-            DT_LNK
-        } else {
-            DT_CHR
+        let kind = match entry {
+            Entry::Link(_) => DT_LNK,
+            Entry::Pts => DT_DIR,
+            _ => DT_CHR,
         };
         (name, inode(entry), kind)
     });
@@ -285,7 +323,9 @@ mod device_tests {
         // Each entry's inode is the one its stat reports.
         assert_eq!(listed[1].inode, 7);
         assert_eq!(listed[0].inode, directory_stat().inode);
-        for e in &listed[2..] {
+        // But `pts`, which devpts is mounted on, as on Linux, whose `stat`
+        // gives the root of devpts.
+        for e in listed[2..].iter().filter(|e| e.name != b"pts") {
             let path = [&b"/dev/"[..], &e.name].concat();
             assert_eq!(stat(entry(&path).unwrap()).inode, e.inode);
         }

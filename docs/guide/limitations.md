@@ -211,7 +211,7 @@ verified.
   which some (ext4 with delayed allocation, overlayfs) count later than
   `st_blocks`.
 - **Block size**: `st_blksize`, `stx_blksize` and `FIGETBSZ` are 1024 for
-  `/proc` and terminals, as on Linux
+  `/proc` and terminals, pseudo-terminals' slaves included, as on Linux
   ([System calls](./features#system-calls)), and 4096 for every other
   file, where Linux gives a mounted directory its host filesystem's (4096
   for most), whose `statfs` here does report the host's. A host terminal
@@ -231,6 +231,18 @@ verified.
   own `O_NONBLOCK` could stop it short, and the host's other processes
   share that flag. A Windows host cannot tell, so there it is never
   `EAGAIN`.
+- **Pseudo-terminals, in part** ([features](./features#system-calls)):
+  packet mode (`TIOCPKT`), the old `termio` requests (`TCGETA` and its
+  kin), locked `termios` (`TIOCSLCKTRMIOS`), `TIOCVHANGUP`, `TIOCCONS` and
+  `O_ASYNC` on a terminal are not implemented (`ENOTTY`, and `FIOASYNC`
+  too). One side's write reaches the other's line discipline at once,
+  where Linux passes it on from a work queue, so a reader here never
+  finds only part of a write; each side holds up to Linux's default flip
+  buffer of 640 KiB, without Linux's memory accounting behind it.
+  `/proc/self/stat` shows no terminal (`tty_nr` 0, `tpgid` -1) even for a
+  process that has one. The host's own terminal is not one of these: the
+  guest's standard streams on it answer only `TCGETS` and `TIOCGWINSZ`.
+  `script` needs `signalfd`, which is not implemented.
 - **`FIONREAD` and `SIOCOUTQ` on the host's standard streams**: both return
   `ENOTTY`, where Linux answers for what is behind them: `FIONREAD` for a
   pipe, terminal, socket or regular file, `SIOCOUTQ` for a terminal or

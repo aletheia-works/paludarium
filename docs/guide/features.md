@@ -60,7 +60,7 @@ kernel.
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
-| I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, and the pseudo-terminals' requests below) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
@@ -608,8 +608,9 @@ kernel.
   `--mount`, without host paths). Each mount has its own `st_dev`, as its
   line in `mountinfo` says, so `df` lists every mount.
 - A file's block size (`st_blksize`, `stx_blksize`, `FIGETBSZ`) is its
-  filesystem's, as on Linux: 1024 for `/proc` (procfs) and for a terminal
-  on standard input, output or error (devpts), and 4096 for the rest,
+  filesystem's, as on Linux: 1024 for `/proc` (procfs), a pseudo-terminal's
+  slave and a terminal on standard input, output or error (devpts), and 4096
+  for the rest,
   pipes, sockets, `memfd` and `/dev` included. `statfs` there gives
   procfs's or devpts's type with a 4096 `f_bsize`, as Linux's
   `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but `stat`,
@@ -705,8 +706,9 @@ kernel.
   A removed file
   of a directory mounted from a host other than Linux, which Linux can
   open, gives `ENXIO` here.
-- `/dev` (mode 0755) holds the memory devices and the links Linux systems
-  keep there, and lists only these: a file a guest makes under `/dev` can be
+- `/dev` (mode 0755) holds the memory devices, the links Linux systems
+  keep there and the pseudo-terminals' `ptmx` and `pts` (below), and lists
+  only these: a file a guest makes under `/dev` can be
   opened and stat'ed but is not listed. Each entry has one inode number,
   which `stat` and `getdents` both report. `/dev` opens only for reading
   (`EISDIR`), and a device not with `O_DIRECTORY` (`ENOTDIR`). `null`, `zero`, `full`, `random` and
@@ -720,6 +722,52 @@ kernel.
   (`/dev/fd/3`); `O_NOFOLLOW` on one gives `ELOOP`, and with `O_PATH` opens
   the link itself, as in `/proc/self/fd`. Files on host mounts report no
   device number.
+- **Pseudo-terminals**, as Linux's devpts, `pty.c` and N_TTY line discipline
+  make them. Each open of `/dev/ptmx` (5:2, mode 0666; also devpts's own
+  `/dev/pts/ptmx`) makes a pair whose slave is `/dev/pts/<n>`, the lowest
+  free number: a character device (136:n, mode 0620, group 5, owned by
+  the opener) that `/dev/pts` lists while the master is open. The slave is
+  locked until `TIOCSPTLCK` unlocks it, which with `TIOCGPTN` and
+  `TIOCGPTLCK` makes `posix_openpt`, `grantpt`, `unlockpt`, `ptsname` and
+  `openpty` work, and `TIOCGPTPEER` opens it from the master; a locked
+  slave, or one whose master closed, opens with `EIO`.
+  - What the master writes is the slave's input, and what the slave writes
+    the master reads. The slave's line discipline edits a canonical line
+    (`VERASE`, `VWERASE`, `VKILL`, `VLNEXT`, `VREPRINT`, `VEOF`, `VEOL`,
+    `VEOL2`) and echoes as `ECHO`, `ECHOE`, `ECHOK`, `ECHOKE`, `ECHONL`,
+    `ECHOCTL` and `ECHOPRT` say; reads in non-canonical mode as `VMIN` and
+    `VTIME` say; converts input (`ICRNL`, `INLCR`, `IGNCR`, `ISTRIP`,
+    `IUCLC`) and output (`OPOST`, `ONLCR`, `OCRNL`, `ONOCR`, `ONLRET`,
+    `OLCUC`, `XTABS`); stops and starts its output (`IXON`, `IXANY`); and
+    with `ISIG` sends `SIGINT`, `SIGQUIT` and `SIGTSTP` to the foreground
+    process group, dropping the input unless `NOFLSH`. The master's side
+    passes bytes as they are.
+  - `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF` and their `termios2` forms
+    (`TCGETS2` and so on) reach the slave's `termios` from either side;
+    it keeps `CS8 | CREAD` without parity and takes its speeds from
+    `CBAUD` or `BOTHER`. `TIOCGWINSZ` and `TIOCSWINSZ` (a change sends
+    `SIGWINCH` to the foreground group), `FIONREAD`, `TIOCOUTQ`, `TCFLSH`,
+    `TCXONC`, `TCSBRK`, `TIOCEXCL`, `TIOCGEXCL`, `TIOCGETD` and `TIOCSETD`
+    (N_TTY only), `TIOCGDEV`, `TIOCSIG` and, for `CAP_SYS_ADMIN`,
+    `TIOCSTI` work as on Linux.
+  - A session leader without a controlling terminal takes one with
+    `TIOCSCTTY` or by opening the slave for reading without `O_NOCTTY`;
+    its children inherit it and `setsid` drops it. `/dev/tty` opens the
+    controlling terminal (`ENXIO` without one; a process of the session
+    outside the emulator keeps the host's `/dev/tty`). `TIOCSPGRP`,
+    `TIOCGPGRP` and `TIOCGSID` set and give the foreground group and the
+    session. A background group's read gets `SIGTTIN`, and its write with
+    `TOSTOP` or its `termios` change `SIGTTOU`, which restarts the call
+    once the group continues, or `EIO` when the signal is ignored,
+    blocked (but `SIGTTOU` then lets it go) or the group orphaned.
+    `TIOCNOTTY` lets the terminal go, a leader's whole session with
+    `SIGHUP` and `SIGCONT` to its foreground group.
+  - When every description of the slave has closed, the master reads what
+    is left, then `EIO`, and polls as hung up. When the master closes, the
+    slave hangs up (it reads nothing, and writes and requests are `EIO`),
+    its name goes, the session it controls loses it and the session's
+    leader gets `SIGHUP` and `SIGCONT`. A session leader's exit sends
+    `SIGHUP` to its terminal's foreground group.
 - CPU time is the host thread's CPU time (user and system together) from a
   guest thread's first system call, where the host can measure it (Linux,
   macOS, Windows); elsewhere, as in WebAssembly, it is wall time instead.

@@ -4,6 +4,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 out="${1:-$here/../../../target/guests/processes}"
 mkdir -p "$out"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/process" "$here/process.c"
+musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/pty" "$here/pty.c"
 # The dynamic case: its linker is the one musl-gcc names, on the host and in the
 # emulator.
 musl-gcc -shared -fPIC -O1 -fno-stack-protector -o "$out/dynamic-plugin.so" "$here/dynamic-plugin.c"

@@ -190,7 +190,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   その時点で確保した分で、遅延割り当ての ext4 や overlayfs では `st_blocks` より遅れて
   数えます。
 - **ブロックの大きさ**：`st_blksize`、`stx_blksize`、`FIGETBSZ` は、Linux と同じく
-  `/proc` と端末では 1024 です（[システムコール](./features#system-calls)）。
+  `/proc` と端末（疑似端末のスレーブも）では 1024 です（[システムコール](./features#system-calls)）。
   ほかのファイルはどれも 4096 です。Linux では、マウントしたディレクトリは
   ホストのファイルシステムのもの（たいていは 4096）です。マウントしたディレクトリの
   `statfs` は、ここでもホストの値を返します。ホストの端末は疑似端末（devpts）と
@@ -208,6 +208,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   止めるにはホストのディスクリプタ自身の `O_NONBLOCK` が要りますが、そのフラグはホストの
   ほかのプロセスと共有しています。Windows のホストは見分けられないので、`EAGAIN` には
   なりません。
+- **疑似端末の一部**（[機能](./features#system-calls)）：パケットモード
+  （`TIOCPKT`）、古い `termio` のリクエスト（`TCGETA` など）、`termios` のロック
+  （`TIOCSLCKTRMIOS`）、`TIOCVHANGUP`、`TIOCCONS`、端末の `O_ASYNC` はありません
+  （`ENOTTY` で、`FIOASYNC` もです）。片側の書き込みは、すぐにもう片側の行規則に
+  届きます。Linux はワークキューから渡すので、ここでは書き込みの一部だけが読める
+  ことはありません。それぞれの側は Linux の既定のフリップバッファと同じ 640 KiB まで
+  持ちますが、その裏の Linux のメモリの勘定はありません。`/proc/self/stat` は、
+  制御端末を持つプロセスでも端末なし（`tty_nr` 0、`tpgid` -1）を示します。
+  ホスト自身の端末はこの疑似端末ではありません。そこにつながるゲストの標準入出力は
+  `TCGETS` と `TIOCGWINSZ` にだけ答えます。`script` は `signalfd` を使い、それは
+  まだありません。
 - **ホストの標準入出力への `FIONREAD` と `SIOCOUTQ`**：どちらも `ENOTTY` を返します。
   Linux では、その先にあるものについて答えます。`FIONREAD` はパイプ、端末、ソケット、
   通常のファイルについて、`SIOCOUTQ` は端末とソケットについてです。ゲスト自身のパイプ、

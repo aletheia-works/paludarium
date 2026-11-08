@@ -289,18 +289,20 @@ void _start(void) {
    long cmd=round&1?38:7,restart=round>>1;
    int hp[2],rp[2],gp[2];call(293,(long)hp,04000,0,0,0,0);S(22,rp,0,0);S(22,gp,0,0);
    LK(6,fd,1,0,0,1);
+   /* The handler is set before fork: a signal before the wait only runs it. */
+   hit_fd=hp[1];
+   unsigned long a[4]={(unsigned long)interrupted,4|0x4000000|(restart?0x10000000:0),(unsigned long)restorer,0};
+   call(13,10,(long)a,0,8,0,0);
    long pid=S(57,0,0,0);
    if(!pid){
-    hit_fd=hp[1];
-    unsigned long a[4]={(unsigned long)interrupted,4|0x4000000|(restart?0x10000000:0),(unsigned long)restorer,0};
-    call(13,10,(long)a,0,8,0,0);
     long own=cmd==38?S(2,p,2,0):fd;
     ((short*)fl)[0]=1;((short*)fl)[1]=0;fl[1]=0;fl[2]=1;((int*)fl)[6]=0;
     long r[6],k=0;
     r[k++]=lock_call(own,cmd,fl);r[k++]=hit;r[k++]=hit_rax;r[k++]=hit_at;
-    /* After EINTR the parent's lock is still there, and the child has none. */
+    /* F_GETLK finds the parent's lock after EINTR, none after a restart took it. */
     LK(cmd==38?36:5,own,1,0,0,1);r[k++]=((short*)fl)[0];r[k++]=((int*)fl)[6]==S(110,0,0,0);
-    S(1,rp[1],r,k*8);S(0,gp[0],buf,1);S(60,0,0,0);
+    /* A signal sent late may interrupt this read too. */
+    S(1,rp[1],r,k*8);while(S(0,gp[0],buf,1)==-4);S(60,0,0,0);
    }
    /* Signal until the child's handler saw the signal come during the wait. */
    while(S(0,hp[0],buf,1)!=1){S(62,pid,10,0);S(24,0,0,0);}

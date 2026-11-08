@@ -192,7 +192,10 @@ kernel.
   on a file go when it closes any descriptor of the file or exits, not with
   `fork` or `execve`; a description's go when its last descriptor closes.
   `F_SETLKW` waits until the range is free, `EDEADLK` when the record locks
-  of processes waiting for each other (up to 10) would close a cycle. The
+  of processes waiting for each other (up to 10) would close a cycle. A
+  wait counts for that only while the lock it waits for stays as it was:
+  unlocking, changing or closing it ends the wait there at once, as
+  `locks_wake_up_blocks` does, even before the waiter runs again. The
   locks are the guest's own: a program on the host does not see them, nor
   they its.
 - A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and

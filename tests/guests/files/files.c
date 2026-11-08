@@ -338,6 +338,31 @@ void _start(void) {
   S(3,rp[0],0,0);S(3,rp[1],0,0);S(3,gp[0],0,0);S(3,gp[1],0,0);
   #undef LK
  }
+ if(CASE==58){ /* letting go of a lock ends the waits for it: waiting then closes no cycle */
+  static long fl[4];
+  #define LK(cmd,f_,type,whence,start,len) (((short*)fl)[0]=(type),((short*)fl)[1]=(whence),fl[1]=(start),fl[2]=(len),((int*)fl)[6]=0,S(72,f_,cmd,fl))
+  int rp[2];S(22,rp,0,0);
+  LK(6,fd,1,0,0,1);
+  long t=1,theirs=1,rounds=0;
+  for(;rounds<10000;rounds++){
+   long pid=S(57,0,0,0);
+   if(!pid){LK(6,fd,1,0,1,1);S(1,rp[1],"r",1);long r=LK(7,fd,1,0,0,1);S(1,rp[1],&r,8);S(60,0,0,0);}
+   S(0,rp[0],buf,1);S(24,0,0,0);
+   /* EDEADLK shows that the child already waits for byte 0. Otherwise the
+      child got EDEADLK itself and gave byte 1 up by exiting: try again. */
+   long m=LK(7,fd,1,0,1,1);
+   if(m==-35){
+    /* Unlocking byte 0 ends the child's wait for it, so the parent's wait
+       for the child's byte 1 is no deadlock: it ends when the child exits. */
+    LK(6,fd,2,0,0,1);t=LK(7,fd,1,0,1,1);
+    S(0,rp[0],&theirs,8);call(61,pid,0,0,0,0,0);break;
+   }
+   S(0,rp[0],&theirs,8);call(61,pid,0,0,0,0,0);LK(6,fd,2,0,1,1);
+  }
+  results[x++]=rounds<10000;results[x++]=t;results[x++]=theirs;
+  S(3,rp[0],0,0);S(3,rp[1],0,0);
+  #undef LK
+ }
  if(CASE==53){ /* extended attributes in user.*, as any owner of the file may use them */
   static char f[]="/tmp/paludarium-files-xattr",l[]="/tmp/paludarium-files-xattr-link",h[]="/tmp/paludarium-files-xattr-hard";
   static char d[]="/tmp/paludarium-files-xattr-dir",n[]="/tmp/paludarium-files-xattr-none";

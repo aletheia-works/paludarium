@@ -3993,6 +3993,15 @@ int main(int argc, char **argv) {
         result("set-one", syscall(SYS_sched_setaffinity, 0, sizeof one, one));
         syscall(SYS_sched_getaffinity, 0, sizeof mask, mask);
         result("got-one", mask[0] == 1);
+        /* getcpu: pinned to CPU 0, the thread runs there, on node 0. */
+        unsigned cpu = 99, node = 99;
+        result("getcpu", syscall(SYS_getcpu, &cpu, &node, NULL));
+        result("cpu", cpu);
+        result("node", node);
+        result("getcpu-null", syscall(SYS_getcpu, NULL, NULL, NULL));
+        errno = 0;
+        result("getcpu-fault", syscall(SYS_getcpu, (void *)1, NULL, NULL));
+        result("errno", errno);
         unsigned char short_mask = 1;
         result("set-short", syscall(SYS_sched_setaffinity, 0, 1, &short_mask));
         errno = 0;

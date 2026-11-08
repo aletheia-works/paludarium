@@ -250,16 +250,14 @@ verified.
   share that flag. A Windows host cannot tell, so there it is never
   `EAGAIN`.
 - **Pseudo-terminals, in part** ([features](./features#system-calls)):
-  packet mode (`TIOCPKT`), the old `termio` requests (`TCGETA` and its
-  kin), locked `termios` (`TIOCSLCKTRMIOS`), `TIOCVHANGUP`, `TIOCCONS` and
-  `O_ASYNC` on a terminal are not implemented (`ENOTTY`, and `FIOASYNC`
-  too). One side's write reaches the other's line discipline at once,
-  where Linux passes it on from a work queue, so a reader here never
-  finds only part of a write; each side holds up to Linux's default flip
-  buffer of 640 KiB, without Linux's memory accounting behind it.
-  `/proc/self/stat` shows no terminal (`tty_nr` 0, `tpgid` -1) even for a
-  process that has one. The host's own terminal is not one of these: the
-  guest's standard streams on it answer only `TCGETS` and `TIOCGWINSZ`.
+  `TIOCVHANGUP`, `TIOCCONS` and `O_ASYNC` on a terminal are not
+  implemented (`ENOTTY`, and `FIOASYNC` too). One side's write reaches the
+  other's line discipline at once, where Linux passes it on from a work
+  queue, so a reader here never finds only part of a write; each side
+  holds up to Linux's default flip buffer of 640 KiB, without Linux's
+  memory accounting behind it. The host's own terminal is not one of
+  these: the guest's standard streams on it answer only `TCGETS` and
+  `TIOCGWINSZ`.
 - **`FIONREAD` and `SIOCOUTQ` on the host's standard streams**: both return
   `ENOTTY`, where Linux answers for what is behind them: `FIONREAD` for a
   pipe, terminal, socket or regular file, `SIOCOUTQ` for a terminal or

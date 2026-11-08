@@ -128,6 +128,8 @@ pub(crate) struct ProcessView {
     pub zombie: bool,
     pub exit_signal: i32,
     pub group: Arc<ThreadGroup>,
+    /// The controlling terminal.
+    pub terminal: Option<Arc<crate::pty::Terminal>>,
 }
 pub struct Processes {
     next: AtomicU32,
@@ -753,6 +755,7 @@ impl Processes {
             zombie: entry.status.is_some(),
             exit_signal: entry.exit_signal,
             group: Arc::clone(&entry.group),
+            terminal: entry.terminal.clone(),
         })
     }
     fn parent(&self, pid: u32) -> u32 {
@@ -2267,43 +2270,20 @@ impl Kernel {
                 Some(crate::files::Followed::Path { path, .. }) => path,
                 _ => path,
             };
-        let (mut program, mut readable) =
+        let (program, mut readable) =
             crate::permissions::exec(&self.files, &thread.state.credentials, &raw, &path)?;
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;
         let mut argv = read_vector(mem, a[1], &mut budget)?;
         let envp = read_vector(mem, a[2], &mut budget)?;
-        // A script runs its interpreter, which may be a script too, on the
-        // way to a program: its set-ID bits are the ones exec takes.
-        let mut loaded = path.clone();
-        let mut named = raw.clone();
-        for depth in 0.. {
-            let Some(head) = program
-                .as_ref()
-                .and_then(|_| read_head(&self.files, &loaded))
-            else {
-                break;
-            };
-            let Some((interpreter, argument)) = script_interpreter(&head)? else {
-                break;
-            };
-            splice_script(&mut argv, &mut budget, &interpreter, argument, named)?;
-            // `open_exec` of an empty name finds the working directory.
-            if interpreter.is_empty() {
-                return Err(Errno::EACCES);
-            }
-            loaded = self.files.exec_path(interpreter.clone())?;
-            (program, readable) = crate::permissions::exec(
-                &self.files,
-                &thread.state.credentials,
-                &interpreter,
-                &loaded,
-            )?;
-            named = interpreter;
-            // `exec_binprm` takes six handlers at most.
-            if depth == MAX_SCRIPT_DEPTH && program.is_some() {
-                return Err(Errno(40));
-            }
-        }
+        let (loaded, program) = follow_scripts(
+            &self.files,
+            &thread.state.credentials,
+            (raw.clone(), path.clone()),
+            program,
+            &mut readable,
+            &mut argv,
+            &mut budget,
+        )?;
         let mut random = [0; 16];
         self.host
             .random_bytes(&mut random)
@@ -2515,6 +2495,45 @@ fn read_string(
         bytes.push(byte[0]);
     }
     Err(long)
+}
+/// Follows the `#!` lines from `named`, the program as exec was given it, at
+/// `loaded`, to the program that runs, as Linux's `load_script` does: each
+/// script runs its interpreter, which may be a script too, with the arguments
+/// [`splice_script`] gives it. Returns the path loaded and its status, whose
+/// set-ID bits are the ones exec takes; `readable` drops when one of them may
+/// not be read.
+pub(crate) fn follow_scripts(
+    files: &crate::files::Files,
+    credentials: &crate::credentials::Credentials,
+    (mut named, mut loaded): (Vec<u8>, Vec<u8>),
+    mut program: Option<paludarium_host::FileStat>,
+    readable: &mut bool,
+    argv: &mut Vec<Vec<u8>>,
+    budget: &mut usize,
+) -> Result<(Vec<u8>, Option<paludarium_host::FileStat>), Errno> {
+    for depth in 0.. {
+        let Some(head) = program.as_ref().and_then(|_| read_head(files, &loaded)) else {
+            break;
+        };
+        let Some((interpreter, argument)) = script_interpreter(&head)? else {
+            break;
+        };
+        splice_script(argv, budget, &interpreter, argument, named)?;
+        // `open_exec` of an empty name finds the working directory.
+        if interpreter.is_empty() {
+            return Err(Errno::EACCES);
+        }
+        loaded = files.exec_path(interpreter.clone())?;
+        let may_read;
+        (program, may_read) = crate::permissions::exec(files, credentials, &interpreter, &loaded)?;
+        *readable = may_read;
+        named = interpreter;
+        // `exec_binprm` takes six handlers at most.
+        if depth == MAX_SCRIPT_DEPTH && program.is_some() {
+            return Err(Errno(40));
+        }
+    }
+    Ok((loaded, program))
 }
 /// A script's interpreter, and its argument if any.
 pub(crate) type Script = (Vec<u8>, Option<Vec<u8>>);

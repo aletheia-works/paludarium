@@ -394,31 +394,8 @@ impl Session {
                 s
             })
             .collect();
-        let start = StartInfo {
-            argv: &self.config.args,
-            envp: &envp,
-            execfn: &self.config.program,
-            random,
-            // The first process runs as root.
-            ids: [0; 4],
-            secure: false,
-        };
-        let mut mem = match self.config.limits.memory {
-            Some(max) => AddressSpace::new().with_memory_meter(Arc::new(MemoryMeter::new(max))),
-            None => AddressSpace::new(),
-        };
-        let image = load(&*fs, &self.config.program, &start, &mut mem).map_err(|error| {
-            if mem.take_out_of_memory() {
-                Error::new(
-                    ErrorKind::InvalidProgram,
-                    "program does not fit in the memory limit",
-                )
-            } else {
-                error.into()
-            }
-        })?;
         let mut kernel = Kernel::new(Arc::clone(&self.host))
-            .with_file_system(fs)
+            .with_file_system(Arc::clone(&fs))
             .with_signal_inbox(Arc::clone(&self.signal_inbox))
             .with_unimplemented_log(Arc::clone(&self.unimplemented));
         if let Some(tty) = self.config.tty {
@@ -438,8 +415,38 @@ impl Session {
                 Error::new(ErrorKind::InvalidProgram, "current directory unavailable")
             })?;
         }
+        // A script runs its interpreter, as exec runs it.
+        let mut argv = self.config.args.clone();
+        let (loaded, script) = kernel
+            .first_program(&self.config.program, &mut argv, &envp)
+            .map_err(script_error)?;
+        let start = StartInfo {
+            argv: &argv,
+            envp: &envp,
+            execfn: &self.config.program,
+            random,
+            // The first process runs as root.
+            ids: [0; 4],
+            secure: false,
+        };
+        let mut mem = match self.config.limits.memory {
+            Some(max) => AddressSpace::new().with_memory_meter(Arc::new(MemoryMeter::new(max))),
+            None => AddressSpace::new(),
+        };
+        let image = load(&*fs, &loaded, &start, &mut mem).map_err(|error| {
+            if mem.take_out_of_memory() {
+                Error::new(
+                    ErrorKind::InvalidProgram,
+                    "program does not fit in the memory limit",
+                )
+            } else if script && matches!(error, paludarium_loader::LoadError::NotFound) {
+                script_error(paludarium_types::Errno::ENOENT)
+            } else {
+                error.into()
+            }
+        })?;
         let mut thread = kernel.spawn_initial(&image);
-        kernel.set_executable(&self.config.program);
+        kernel.set_executable(&loaded);
         thread.state.name_after(&self.config.program);
         let execution = Arc::new(Execution::new(
             Arc::clone(&self.host),
@@ -456,6 +463,20 @@ impl Session {
         execution.execute(kernel, thread, Arc::new(mem));
         execution.finish()
     }
+}
+
+/// The error of a first program whose `#!` line names no interpreter that
+/// runs.
+fn script_error(errno: paludarium_types::Errno) -> Error {
+    let message = match errno.0 {
+        2 => "the script's interpreter was not found",
+        7 => "the script's arguments are too long",
+        8 => "invalid #! line",
+        13 => "the script's interpreter may not be run",
+        40 => "too many levels of script interpreters",
+        _ => "the script's interpreter cannot be run",
+    };
+    Error::new(ErrorKind::InvalidProgram, message)
 }
 
 #[cfg(test)]

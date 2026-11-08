@@ -97,10 +97,10 @@ CI run produces them afresh on an x86-64 Linux runner.
   under the emulator in a Debian container, and their exit status and
   standard output are compared (`tests/guests/distro/compare.py`): shells
   (fish among them),
-  awk, Perl, Python, Ruby, PHP, Lua, LuaJIT, Tcl, Node.js, Go, OCaml, R,
-  Guile, SBCL, pandoc, Emacs, BusyBox, SQLite, PostgreSQL, Redis, memcached,
-  nginx, compressors, Git, OpenSSL, GnuPG, rsync, make, CMake, Ninja, gcc, g++
-  and binutils, among others, and cases that use signals and timers, child
+  awk, Perl, Python, Ruby, PHP, Lua, LuaJIT, Tcl, Node.js, Go, Java, Erlang,
+  OCaml, R, Guile, SBCL, pandoc, Emacs, BusyBox, SQLite, PostgreSQL, Redis,
+  memcached, nginx, compressors, Git, OpenSSL, GnuPG, rsync, make, CMake,
+  Ninja, gcc, g++ and binutils, among others, and cases that use signals and timers, child
   processes and threads,
   sockets on the loopback, file locks (SQLite's WAL with several writers)
   and `/proc`.

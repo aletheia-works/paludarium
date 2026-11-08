@@ -627,7 +627,12 @@ impl FileHandle for NativeFile {
             let file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
             let current = rustix::fs::fcntl_getfl(&*file).map_err(|e| err(e.into()))?;
             let mutable = rustix::fs::OFlags::APPEND | rustix::fs::OFlags::NONBLOCK;
-            let flags = (current & !mutable) | (rustix::fs::OFlags::from_bits_retain(f) & mutable);
+            // `f` holds Linux's values (O_APPEND 0o2000, O_NONBLOCK 0o4000),
+            // which are not the host's on macOS and the BSDs.
+            let mut wanted = rustix::fs::OFlags::empty();
+            wanted.set(rustix::fs::OFlags::APPEND, f & 1024 != 0);
+            wanted.set(rustix::fs::OFlags::NONBLOCK, f & 2048 != 0);
+            let flags = (current & !mutable) | wanted;
             rustix::fs::fcntl_setfl(&*file, flags).map_err(|e| err(e.into()))?;
             let mut saved = self.flags.lock().unwrap_or_else(PoisonError::into_inner);
             *saved = (*saved & !3072) | (f & 3072);
@@ -1405,6 +1410,28 @@ mod files_tests {
         assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"a\0\0de\0!");
         let read_only = x.fs().open(b"a", 0, 0).unwrap();
         assert_eq!(read_only.zero_range(0, 1), Err(Errno::EBADF));
+    }
+    /// `F_SETFL` with Linux's flag values, as Go's `os.OpenFile` sets and
+    /// clears `O_NONBLOCK` on every file it opens: `O_APPEND` stays, and the
+    /// writes still go to the end.
+    #[cfg(unix)]
+    #[test]
+    fn set_flags_keeps_appending_with_the_guest_flag_values() {
+        const O_LARGEFILE: u32 = 0o100000;
+        let x = Fixture::new();
+        let f = x.fs().open(b"a", 66, 0o600).unwrap();
+        assert_eq!(f.write(b"abc"), Ok(3));
+        let appending = x.fs().open(b"a", 1025, 0).unwrap();
+        assert_eq!(appending.set_flags(1025 | 2048 | O_LARGEFILE), Ok(()));
+        assert_eq!(appending.set_flags(1025 | O_LARGEFILE), Ok(()));
+        assert_eq!(appending.flags() & 3075, 1025);
+        assert_eq!(appending.write(b"!"), Ok(1));
+        assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"abc!");
+        // Turned off, the next write goes to the position again.
+        assert_eq!(appending.set_flags(1), Ok(()));
+        assert_eq!(appending.seek(0, 0), Ok(0));
+        assert_eq!(appending.write(b"A"), Ok(1));
+        assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"Abc!");
     }
     #[test]
     fn write_back_writes_in_place_within_the_file() {

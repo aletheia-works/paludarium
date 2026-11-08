@@ -42,9 +42,24 @@
 #ifndef TIOCGDEV
 #define TIOCGDEV 0x80045432
 #endif
+#ifndef TIOCGPKT
+#define TIOCGPKT 0x80045438
+#endif
+#define K_TCGETA 0x5405
+#define K_TCSETA 0x5406
+#define K_TCSETAF 0x5408
+#define K_TIOCGLCKTRMIOS 0x5456
+#define K_TIOCSLCKTRMIOS 0x5457
+#define K_EXTPROC 0200000
 #define K_TCGETS2 0x802c542a
 #define K_TCSETS2 0x402c542b
 #define K_BOTHER 010000
+
+/* The kernel's struct termio. */
+struct ktermio {
+    unsigned short iflag, oflag, cflag, lflag;
+    unsigned char line, cc[8];
+};
 
 /* The kernel's struct termios2. */
 struct ktermios {
@@ -765,6 +780,214 @@ static void on_hangup(int number) {
 
 /* The master's close hangs up the slave and tells the session's leader; the
    leader's exit tells its foreground group. */
+/* A master in packet mode reads the slave's flushes, stops, starts and
+   flow-control changes as a status byte alone, and data after a 0 byte. */
+static int case_packet(void) {
+    int m, s;
+    if (openpty(&m, &s, NULL, NULL, NULL)) return 1;
+    int on = 1, off = 0, mode = -1;
+    TRY("TIOCPKT slave", ioctl(s, TIOCPKT, &on));
+    TRY("TIOCGPKT slave", ioctl(s, TIOCGPKT, &mode));
+    TRY("TIOCGPKT", ioctl(m, TIOCGPKT, &mode));
+    say("mode %d", mode);
+    TRY("TIOCPKT fault", ioctl(m, TIOCPKT, NULL));
+    /* Events before packet mode are not kept. */
+    tcflush(s, TCIFLUSH);
+    TRY("TIOCPKT", ioctl(m, TIOCPKT, &on));
+    TRY("TIOCGPKT", ioctl(m, TIOCGPKT, &mode));
+    say("mode %d", mode);
+    say("poll empty %#x", polled(m, POLLIN | POLLPRI));
+    write(s, "hi", 2);
+    show_drained("data", m, 1);
+    tcflush(s, TCIFLUSH);
+    say("poll flush %#x", polled(m, POLLIN | POLLPRI));
+    show_drained("flush input", m, 1);
+    tcflush(s, TCOFLUSH);
+    show_drained("flush output", m, 1);
+    tcflush(s, TCIOFLUSH);
+    show_drained("flush both", m, 1);
+    /* The master's own flushes are not events. */
+    tcflush(m, TCIOFLUSH);
+    show_drained("master flush", m, 1);
+    tcflow(s, TCOOFF);
+    show_drained("tcoff", m, 1);
+    tcflow(s, TCOOFF);
+    show_drained("tcoff again", m, 1);
+    tcflow(s, TCOON);
+    show_drained("tcon", m, 1);
+    /* Two events before a read: a start forgets the stop. */
+    tcflow(s, TCOOFF);
+    tcflow(s, TCOON);
+    show_drained("stop then start", m, 1);
+    struct termios t;
+    tcgetattr(s, &t);
+    t.c_iflag &= ~IXON;
+    tcsetattr(s, TCSANOW, &t);
+    show_drained("no ixon", m, 1);
+    t.c_iflag |= IXON;
+    tcsetattr(m, TCSANOW, &t);
+    show_drained("ixon from master", m, 1);
+    t.c_cc[VSTOP] = 1;
+    tcsetattr(s, TCSANOW, &t);
+    show_drained("other stop char", m, 1);
+    t.c_cc[VSTOP] = 023;
+    tcsetattr(s, TCSAFLUSH, &t);
+    show_drained("tcsaflush", m, 1);
+    t.c_lflag |= K_EXTPROC;
+    tcsetattr(s, TCSANOW, &t);
+    show_drained("extproc", m, 1);
+    t.c_lflag &= ~K_EXTPROC;
+    tcsetattr(s, TCSANOW, &t);
+    show_drained("extproc off", m, 1);
+    /* ^S and ^Q typed, and ^C, which flushes both ways and echoes. */
+    write(m, "\023", 1);
+    show_drained("typed stop", m, 1);
+    write(m, "\021", 1);
+    show_drained("typed start", m, 1);
+    write(m, "ab\003", 3);
+    show_drained("interrupt", m, 1);
+    /* A one-byte read of data gives the 0 byte alone. */
+    write(s, "xy", 2);
+    char buffer[8];
+    usleep(100000);
+    TRY("short read", read(m, buffer, 1));
+    say("short byte %d", buffer[0]);
+    show_drained("rest", m, 1);
+    TRY("TIOCPKT off", ioctl(m, TIOCPKT, &off));
+    tcflush(s, TCIFLUSH);
+    write(s, "z", 1);
+    show_drained("off", m, 1);
+    close(s);
+    close(m);
+    return 0;
+}
+
+static void show_termio(const char *label, struct ktermio *t) {
+    printf("%s %04x %04x %04x %04x %d", label, t->iflag, t->oflag, t->cflag, t->lflag, t->line);
+    for (int i = 0; i < 8; i++) printf(" %d", t->cc[i]);
+    say("");
+}
+
+/* The old struct termio, and the slave's locked termios. */
+static int case_termio(void) {
+    int m, s;
+    if (openpty(&m, &s, NULL, NULL, NULL)) return 1;
+    struct ktermio t;
+    memset(&t, 0xff, sizeof t);
+    TRY("TCGETA", ioctl(s, K_TCGETA, &t));
+    show_termio("slave", &t);
+    TRY("TCGETA master", ioctl(m, K_TCGETA, &t));
+    show_termio("master", &t);
+    TRY("TCGETA fault", ioctl(s, K_TCGETA, NULL));
+    TRY("TCSETA fault", ioctl(s, K_TCSETA, NULL));
+    /* The high bits of the flags and the other characters stay. */
+    struct termios full;
+    tcgetattr(s, &full);
+    full.c_lflag |= K_EXTPROC;
+    full.c_cc[VEOL2] = 7;
+    tcsetattr(s, TCSANOW, &full);
+    t.lflag &= ~ECHO;
+    t.cc[VINTR] = 1;
+    t.cflag = (t.cflag & ~CBAUD) | B9600 | PARENB;
+    TRY("TCSETA", ioctl(m, K_TCSETA, &t));
+    tcgetattr(s, &full);
+    say("after %o %o %o %d %d speed %d %d", full.c_lflag, full.c_cflag, full.c_iflag,
+        full.c_cc[VINTR], full.c_cc[VEOL2], (int)cfgetospeed(&full), (int)cfgetispeed(&full));
+    /* TCSETAF drops the input. */
+    cfmakeraw(&full);
+    tcsetattr(s, TCSANOW, &full);
+    write(m, "abc", 3);
+    polled(s, POLLIN);
+    int count = -1;
+    ioctl(s, FIONREAD, &count);
+    say("queued %d", count);
+    ioctl(s, K_TCGETA, &t);
+    TRY("TCSETAF", ioctl(s, K_TCSETAF, &t));
+    ioctl(s, FIONREAD, &count);
+    say("queued after %d", count);
+    struct termios locked;
+    memset(&locked, 0xff, sizeof locked);
+    TRY("TIOCGLCKTRMIOS", ioctl(s, K_TIOCGLCKTRMIOS, &locked));
+    unsigned char *bytes = (unsigned char *)&locked;
+    int nonzero = 0;
+    for (int i = 0; i < 36; i++) nonzero += bytes[i] != 0;
+    say("locked nonzero %d", nonzero);
+    TRY("TIOCGLCKTRMIOS master", ioctl(m, K_TIOCGLCKTRMIOS, &locked));
+    TRY("TIOCGLCKTRMIOS fault", ioctl(s, K_TIOCGLCKTRMIOS, NULL));
+    /* Only CAP_SYS_ADMIN locks, which is checked first. */
+    if (geteuid() != 0) TRY("TIOCSLCKTRMIOS", ioctl(s, K_TIOCSLCKTRMIOS, NULL));
+    else say("TIOCSLCKTRMIOS -1 1");
+    close(s);
+    close(m);
+    return 0;
+}
+
+/* Fields 7 and 8 of /proc/<pid>/stat: the controlling terminal and its
+   foreground group. */
+static void stat_terminal(pid_t pid, long *tty, long *tpgid) {
+    char path[64], line[1024];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    FILE *f = fopen(path, "r");
+    *tty = *tpgid = -2;
+    if (!f) return;
+    if (fgets(line, sizeof line, f)) {
+        char *rest = strrchr(line, ')');
+        if (rest) sscanf(rest + 2, "%*c %*d %*d %*d %ld %ld", tty, tpgid);
+    }
+    fclose(f);
+}
+
+static int case_proc_stat(void) {
+    int m, s;
+    if (openpty(&m, &s, NULL, NULL, NULL)) return 1;
+    struct stat st;
+    fstat(s, &st);
+    int ready[2], done[2];
+    pipe(ready);
+    pipe(done);
+    pid_t child = fork();
+    if (child == 0) {
+        long tty, tpgid;
+        setsid();
+        stat_terminal(getpid(), &tty, &tpgid);
+        say("no terminal %ld %ld", tty, tpgid);
+        ioctl(s, TIOCSCTTY, 0);
+        stat_terminal(getpid(), &tty, &tpgid);
+        say("terminal %d tpgid %d", tty == (long)st.st_rdev, tpgid == getpgrp());
+        pid_t job = fork();
+        if (job == 0) {
+            setpgid(0, 0);
+            pause();
+            _exit(0);
+        }
+        setpgid(job, job);
+        tcsetpgrp(s, job);
+        stat_terminal(getpid(), &tty, &tpgid);
+        say("job %d tpgid %d", tty == (long)st.st_rdev, tpgid == job);
+        stat_terminal(job, &tty, &tpgid);
+        say("job's own %d tpgid %d", tty == (long)st.st_rdev, tpgid == job);
+        write(ready[1], "r", 1);
+        char byte;
+        read(done[0], &byte, 1);
+        kill(job, SIGKILL);
+        waitpid(job, NULL, 0);
+        stat_terminal(getpid(), &tty, &tpgid);
+        say("job gone %d tpgid %d", tty == (long)st.st_rdev, tpgid == job);
+        ioctl(s, TIOCNOTTY);
+        stat_terminal(getpid(), &tty, &tpgid);
+        say("released %ld %ld", tty, tpgid);
+        _exit(0);
+    }
+    char byte;
+    read(ready[0], &byte, 1);
+    long tty, tpgid;
+    stat_terminal(child, &tty, &tpgid);
+    say("child from parent %d tpgid %d", tty == (long)st.st_rdev, tpgid > 0 && tpgid != child);
+    write(done[1], "d", 1);
+    waitpid(child, NULL, 0);
+    return 0;
+}
+
 static int case_hangup(void) {
     prctl(PR_SET_CHILD_SUBREAPER, 1);
     int m, s;
@@ -860,5 +1083,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "pty-session")) return case_session();
     if (!strcmp(mode, "pty-signals")) return case_signals();
     if (!strcmp(mode, "pty-hangup")) return case_hangup();
+    if (!strcmp(mode, "pty-packet")) return case_packet();
+    if (!strcmp(mode, "pty-termio")) return case_termio();
+    if (!strcmp(mode, "pty-proc-stat")) return case_proc_stat();
     return 2;
 }

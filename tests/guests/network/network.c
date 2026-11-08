@@ -1642,9 +1642,37 @@ int main(int argc, char **argv) {
         bind_to("v4-beside-dual", b4, htonl(INADDR_LOOPBACK), port);
         close(b4);
         close(l);
-        int only = socket(AF_INET6, SOCK_STREAM, 0);
-        set_option("v6only", only, IPPROTO_IPV6, IPV6_V6ONLY, 1);
-        call("only-bind", bind(only, (void *)&any, sizeof any));
+        /* An IPv6-only bind does not conflict with IPv4 ones, so the port
+           Linux hands it may be one where some other IPv4 socket on the
+           host listens (the test's own server, say), and the IPv4 steps
+           below would reach that one. Take a port no IPv4 socket holds:
+           try again while an IPv4 bind to it on every address fails. The
+           steps are printed once, for the socket that is kept. */
+        int only, set_r, set_e, got, bind_r, bind_e;
+        for (int tries = 0;; tries++) {
+            only = socket(AF_INET6, SOCK_STREAM, 0);
+            int on = 1;
+            errno = 0;
+            set_r = setsockopt(only, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof on);
+            set_e = errno;
+            got = -7;
+            socklen_t got_len = sizeof got;
+            getsockopt(only, IPPROTO_IPV6, IPV6_V6ONLY, &got, &got_len);
+            errno = 0;
+            bind_r = bind(only, (void *)&any, sizeof any);
+            bind_e = bind_r < 0 ? errno : 0;
+            if (bind_r || tries == 99)
+                break;
+            int probe = tcp(0);
+            struct sockaddr_in every = {.sin_family = AF_INET, .sin_port = htons(port_of(only))};
+            int free4 = !bind(probe, (void *)&every, sizeof every);
+            close(probe);
+            if (free4)
+                break;
+            close(only);
+        }
+        printf("  set v6only=%d errno=%d got=%d\n", set_r, set_e, got);
+        printf("  only-bind=%d errno=%d\n", bind_r, bind_e);
         set_option("v6only-bound", only, IPPROTO_IPV6, IPV6_V6ONLY, 0);
         call("only-listen", listen(only, 4));
         int only_port = port_of(only);

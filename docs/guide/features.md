@@ -21,7 +21,8 @@ Linux.
 - Instructions are decoded with [iced-x86](https://github.com/icedland/iced).
 - `CPUID` does not reveal the host's values. It names AMD as the vendor, because
   glibc reads the features only for a vendor it knows, and reports the features
-  every x86-64 CPU has, because glibc requires them. Of those, the FPU and MMX
+  every x86-64 CPU has, because glibc requires them, and `CLFLUSH` with its
+  64-byte line, because HotSpot requires it. Of those, the FPU and MMX
   are not implemented; it advertises no other feature that is not. The name
   changes nothing else: where vendors' CPUs differ, as in the flags after a
   `REP` faults, the virtual CPU keeps its own behaviour.
@@ -53,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
@@ -537,7 +538,8 @@ kernel.
   then gives that mask, and new threads and processes inherit it, but the
   host still runs the thread on any of its CPUs. Both find a thread of
   another process too, as root may, and give `ESRCH` when no live thread
-  has the ID.
+  has the ID. `getcpu` gives the lowest CPU the thread's mask allows, and
+  NUMA node 0.
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like
   `CPUID`, it does not reveal the host. The guest starts as root (user and
   group 0, with every capability). Each thread has its own credentials, as
@@ -610,7 +612,8 @@ kernel.
   names it and may give it one argument, its arguments are that name, that
   argument and the script's path in place of `argv[0]`, and the interpreter's
   set-ID bits count, not the script's. An interpreter may be a script too, up
-  to 5 levels below the first script (`ELOOP` past that). As on Linux, `chown`
+  to 5 levels below the first script (`ELOOP` past that). The first program
+  may be a script too, which runs the same way. As on Linux, `chown`
   takes the set-user-ID bit from a file that is not a directory, and the set-group-ID
   bit when the group may execute it or the caller is neither in its group
   nor holds `CAP_FSETID`, even when the owner and group stay. A write or a
@@ -719,7 +722,8 @@ kernel.
   `environ` are empty and `exe` and `cwd` are `ENOENT`, as on Linux.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
-  and session, no terminal, the CPU time of the process and of its waited-for
+  and session, the controlling terminal's device and foreground group (0
+  and -1 without one), the CPU time of the process and of its waited-for
   children in `USER_HZ` (100) ticks, the priority and nice value, the threads,
   the size of the mappings, the `RLIMIT_RSS` limit, the start of the stack and
   of the heap, the signal sets as decimal numbers, `wchan` (1 for a task that
@@ -732,7 +736,8 @@ kernel.
   newline.
 - `/proc/self/exe` and `/proc/self/cwd` are symbolic links (0777, size 0) to
   the program the process runs (the one `execve` loaded, with symbolic links
-  resolved; for the first program, the path the CLI gives it, `/<file name>`)
+  resolved; for the first program, the path the CLI gives it: its path in a
+  `--mount`, else `/<file name>`)
   and to the current directory. `stat` and `open` follow them, and
   `O_NOFOLLOW` does not (`ELOOP`).
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
@@ -833,10 +838,17 @@ kernel.
     with `ISIG` sends `SIGINT`, `SIGQUIT` and `SIGTSTP` to the foreground
     process group, dropping the input unless `NOFLSH`. The master's side
     passes bytes as they are.
-  - `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF` and their `termios2` forms
-    (`TCGETS2` and so on) reach the slave's `termios` from either side;
-    it keeps `CS8 | CREAD` without parity and takes its speeds from
-    `CBAUD` or `BOTHER`. `TIOCGWINSZ` and `TIOCSWINSZ` (a change sends
+  - `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF`, their `termios2` forms
+    (`TCGETS2` and so on) and the old `struct termio` ones (`TCGETA`,
+    `TCSETA`, `TCSETAW`, `TCSETAF`, which set the low 16 bits of each flag
+    and the first 8 characters) reach the slave's `termios` from either
+    side; it keeps `CS8 | CREAD` without parity, takes its speeds from
+    `CBAUD` or `BOTHER`, and keeps what `TIOCSLCKTRMIOS` locked (which
+    needs `CAP_SYS_ADMIN`; `TIOCGLCKTRMIOS` reads it). With `TIOCPKT` the
+    master reads in packet mode: the slave's flushes, the stops and starts
+    of its output, and changes to whether `^S` and `^Q` control it (or to
+    `EXTPROC`) come as a status byte alone, which `poll` shows as
+    `POLLPRI`, and data after a 0 byte; `TIOCGPKT` reads the mode. `TIOCGWINSZ` and `TIOCSWINSZ` (a change sends
     `SIGWINCH` to the foreground group), `FIONREAD`, `TIOCOUTQ`, `TCFLSH`,
     `TCXONC`, `TCSBRK`, `TIOCEXCL`, `TIOCGEXCL`, `TIOCGETD` and `TIOCSETD`
     (N_TTY only), `TIOCGDEV` and `TIOCSIG` work as on Linux, and so does

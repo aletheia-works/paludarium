@@ -341,6 +341,40 @@ impl Kernel {
         &self.process
     }
 
+    /// The program the first process loads to run `path` with `argv` and
+    /// `envp`, as exec runs it, and whether `path` is a script: a `#!`
+    /// script runs its interpreter, and `argv` becomes the interpreter's
+    /// (`load_script`). The first process
+    /// runs as root, so an interpreter needs one execute bit; `path` itself
+    /// is loaded as it is, without that check.
+    pub fn first_program(
+        &self,
+        path: &[u8],
+        argv: &mut Vec<Vec<u8>>,
+        envp: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, bool), paludarium_types::Errno> {
+        let loaded = self.files.exec_path(path.to_vec())?;
+        let resolved = loaded.clone();
+        let program = self.files.fs.metadata(&loaded, true).ok();
+        let mut budget = (paludarium_loader::MAX_ARG_BYTES as usize).saturating_sub(
+            argv.iter()
+                .chain(envp)
+                .map(|s| s.len() + 1 + 8)
+                .sum::<usize>(),
+        );
+        let (loaded, _) = processes::follow_scripts(
+            &self.files,
+            &credentials::Credentials::default(),
+            (path.to_vec(), loaded),
+            program,
+            &mut true,
+            argv,
+            &mut budget,
+        )?;
+        let script = loaded != resolved;
+        Ok((loaded, script))
+    }
+
     /// Records `path` as the program the first process runs, as
     /// `/proc/self/exe` names it: with its symbolic links resolved.
     pub fn set_executable(&self, path: &[u8]) {

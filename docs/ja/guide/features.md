@@ -53,6 +53,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
+| Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
@@ -190,6 +191,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `O_DIRECTORY`、`O_NOFOLLOW`、`O_PATH` だけを持ちます。パイプ、ソケット、カーネル
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
   除いて `O_LARGEFILE` がありません。
+- `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
+  読み書き、`lseek`、`flock`、`getdents64`、`sendfile`、`copy_file_range`、`fsync`、
+  `fdatasync`、`fadvise64`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
+  呼び出し、`epoll_ctl`（epoll のディスクリプタとしても対象としても）、`epoll_wait`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
+  `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
+  `select` は準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
+  `close` は受け付け、`*at` の呼び出しではディレクトリになります。
 - `fcntl` のバイト範囲のロックを、Linux の `fs/locks.c` と同じく扱います。プロセスが持つ
   レコードロック（`F_SETLK`、`F_SETLKW`、`F_GETLK`）と、開いたファイルの記述が持つ OFD ロック
   （`F_OFD_SETLK`、`F_OFD_SETLKW`、`F_OFD_GETLK`）で、互いにぶつかります。ある範囲のロックは、
@@ -322,9 +330,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - プロセス、または負の値でプロセスグループ
   - `F_SETOWN_EX` では、1 つのスレッドも
 
-  持ち主がいなければ `ESRCH` です。`F_GETOWN` と `F_GETOWN_EX` で読み出し、`F_SETSIG` で
-  送るシグナルを選びます。`O_ASYNC` を持てるのはパイプ、ソケット、疑似端末、それにパイプ、
-  ソケット、端末のどれかであるときのホストの標準のストリームだけで、ほかのファイルでは
+  Linux と同じく ID で探すので、どの種類の持ち主でも、その ID のスレッド、プロセス、
+  グループ、セッションがなければ `ESRCH` です。`F_GETOWN` と `F_GETOWN_EX` で
+  読み出し、その役割のもの（たとえばプロセスのいないグループ）がない間は 0 です。
+  `F_SETSIG` で送るシグナルを選びます。`O_ASYNC` を持てるのはパイプ、ソケット、
+  疑似端末、それにパイプ、ソケット、端末のどれかであるときのホストの標準の
+  ストリームだけで、ほかのファイルでは
   `F_SETFL` が落とし、`FIOASYNC` で付けようとすると `ENOTTY` です。`O_ASYNC` を付けた
   パイプ、ソケット、疑似端末（疑似端末は後述のとおり）は、持ち主にカーネルから
   `SIGIO` を送ります。`F_SETSIG` があれば代わりにそのシグナルを送り、`si_code`
@@ -930,7 +941,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マスクのシグナルが保留されている間、Linux と同じく読めると見ます。そのため
   スレッド自身へのシグナルはそのスレッドにだけ見え、fork した子が受け継いだ
   ファイルは子のシグナルを読みます。エッジトリガーの `epoll` は、ファイルのシグナルが
-  保留されている間、スレッドかそのプロセスにシグナルが積まれるたびにエッジを受けます。
+  待つスレッドに保留されている間、プロセスかそのどれかのスレッドにシグナルが積まれる
+  たびにエッジを受けます。
   Linux の `signalfd_notify` が、そのたびにファイルを起こすのと同じです。同じ番号が
   待っているリアルタイムシグナルも数え、すでに保留されている標準のシグナルや、
   ブロックされずに無視されるシグナルは数えません。マスクが変わるのもエッジです。
@@ -1043,10 +1055,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ダンプしたと報告するのと同じように、ダンプしたと返します。
 
   プロセスグループとセッションも同じように持ち、`wait4` と `waitid` でプロセス
-  グループを選んで待てます。最初のプロセスのセッションはエミュレータの外で始まった
-  ものなので、`getsid` は、Linux が PID 名前空間の外の ID を示すのと同じく 0 を
-  返します。`setsid` は、PID がグループを指すプロセスでは `EPERM` で失敗し、それ
-  以外のプロセスを新しいセッションとグループの先頭にします。`setpgid` は Linux と
+  グループを選んで待てます。最初のプロセスは PID 名前空間の最初のプロセスと同じで、
+  そのグループとセッションはエミュレータの外で始まったものなので、`getpgrp` と
+  `getsid` は、Linux が PID 名前空間の外の ID を示すのと同じく 0 を返し、自分の
+  セッションを始めることもできます。`setsid` は、PID がグループを指すプロセス
+  では `EPERM` で失敗し、それ以外のプロセスを新しいセッションとグループの先頭に
+  します。`setpgid` は Linux と
   同じくセッションを確かめ、セッションの先頭、別のセッションの子、別のセッションの
   グループには `EPERM` を、`execve` を済ませた子には `EACCES` を返します。グループは、
   まだ回収されていない終わった子も含め、メンバーが残っている間は存在します。
@@ -1323,6 +1337,19 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   います。メモリ上でも、Linux か macOS でマウントしたホストのディレクトリでも使えます。
   `RENAME_WHITEOUT` には `CAP_MKNOD` が要り（なければ `EPERM`）、あっても
   ホワイトアウトのない Linux のファイルシステムと同じく `EINVAL` を返します。
+- Landlock は、スレッドがアクセスできるファイルの階層を ABI バージョン 3 の範囲で
+  制限します。`landlock_create_ruleset`（バージョンの問い合わせを含む）、
+  `LANDLOCK_RULE_PATH_BENEATH` の `landlock_add_rule`、`landlock_restrict_self`
+  （`no_new_privs` か `CAP_SYS_ADMIN` が要ります）に対応し、層は 16 までです。各層は、
+  扱う権利を、ルールが指すファイルやディレクトリの下でだけ許します。ルールはデバイスと
+  inode で指すので、名前を変えたディレクトリにもついていきます。ファイルを開くと
+  `LANDLOCK_ACCESS_FS_READ_FILE`、`WRITE_FILE`、`READ_DIR` を、`execve` とその
+  インタープリタでは `EXECUTE` を確かめます。名前を作るときはディレクトリについて
+  種類ごとの `MAKE_*` を、消すときは `REMOVE_FILE` か `REMOVE_DIR` を、切り詰めるときは
+  `TRUNCATE` を確かめます。`TRUNCATE` は、開いたときの結果を開いたファイルの記述が
+  持ち続けます。別のディレクトリへのリンクや名前の変更には `REFER` が要り、ファイルの
+  権利が増えてはいけません（`EXDEV`）。スレッド、プロセス、`execve` はドメインを
+  引き継ぎます。`O_PATH`、`stat`、制限の前に開いた記述子は確かめません。
 - 起動の前にファイルを置けます。
 - 指定したときだけ、ホストのディレクトリをマウントできます（コマンドの `--mount`、
   Rust の `Config::mounts`）。操作はすべてそのディレクトリの中に閉じ込められ、

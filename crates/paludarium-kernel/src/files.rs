@@ -25,6 +25,10 @@ pub(crate) struct Descriptor {
     opened: bool,
     /// What `getdents64` has returned from it, shared as the position is.
     listed: Arc<Mutex<Listed>>,
+    /// The Landlock rights its open file description keeps
+    /// (`LANDLOCK_ACCESS_FS_TRUNCATE`), all of them unless a Landlock domain
+    /// opened it ([`crate::landlock::open`]).
+    pub(crate) landlock: u64,
 }
 /// The names a directory's position has passed, in the order they came. The
 /// position counts these and not places in the listing, which a later call
@@ -79,6 +83,7 @@ impl Descriptor {
             cloexec,
             opened: false,
             listed: Arc::default(),
+            landlock: crate::landlock::FS,
         }
     }
     /// The descriptor a process gets for this one's open file over
@@ -242,6 +247,7 @@ impl Files {
                 cloexec,
                 opened: false,
                 listed: Arc::default(),
+                landlock: crate::landlock::FS,
             },
             0,
             limit,
@@ -270,6 +276,7 @@ impl Files {
                     cloexec,
                     opened: false,
                     listed: Arc::default(),
+                    landlock: crate::landlock::FS,
                 },
             );
         }
@@ -306,6 +313,7 @@ impl Files {
                 cloexec,
                 opened: false,
                 listed: Arc::default(),
+                landlock: crate::landlock::FS,
             },
         );
     }
@@ -341,6 +349,7 @@ impl Files {
                         cloexec: false,
                         opened: false,
                         listed: Arc::default(),
+                        landlock: crate::landlock::FS,
                     },
                 );
         }
@@ -788,6 +797,33 @@ fn io_descriptor(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno>
         return Err(Errno::EBADF);
     }
     Ok(file)
+}
+/// EBADF for a call that takes its descriptors as Linux's `fdget` does,
+/// which refuses an `O_PATH` one: reads and writes, `lseek`, `flock`,
+/// `getdents`, `sendfile` and `copy_file_range`, and `fcntl` but for the
+/// commands `check_fcntl_cmd` lets through (duplicating, the descriptor
+/// flags and `F_GETFL`). A descriptor that is not open is left to the call.
+fn refuse_path_only(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<(), Errno> {
+    let descriptors: &[u64] = match n {
+        // read, readv, writev, pread64, pwrite64, preadv, pwritev, lseek,
+        // flock, getdents64
+        0 | 8 | 17 | 18 | 19 | 20 | 73 | 217 | 295 | 296 => &a[..1],
+        // sendfile(out, in), copy_file_range(in, _, out)
+        40 => &a[..2],
+        326 => &[a[0], a[2]],
+        // F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_DUPFD_QUERY, F_DUPFD_CLOEXEC
+        72 if !matches!(a[1] as u32, 0..=3 | 1027 | 1030) => &a[..1],
+        _ => return Ok(()),
+    };
+    for &fd in descriptors {
+        if c.files
+            .descriptor(fd)
+            .is_ok_and(|d| d.file.flags() & O_PATH != 0)
+        {
+            return Err(Errno::EBADF);
+        }
+    }
+    Ok(())
 }
 /// `chmod` of the file a link in `/proc/self/fd` leads to, which the
 /// descriptor's access does not limit: an `O_PATH` one's file changes too,
@@ -1779,6 +1815,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
 }
 pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
+    refuse_path_only(c, n, a)?;
     match n {
         40 => sendfile(c, a),
         332 => statx(c, a),
@@ -2146,9 +2183,21 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         76 | 77 => {
             let f = if n == 77 {
-                io_descriptor(c, a[0])?
+                let file = io_descriptor(c, a[0])?;
+                // Landlock's right kept from the open (`hook_file_truncate`),
+                // for a description open for writing.
+                if file.flags() & 3 != 0
+                    && c.files.descriptor(a[0])?.landlock & crate::landlock::TRUNCATE == 0
+                {
+                    return Err(Errno::EACCES);
+                }
+                file
             } else {
                 let (p, found) = looked_up(c, (-100i32) as u64, a[0], true)?;
+                // Landlock's TRUNCATE on the file (`hook_path_truncate`).
+                if let Some(target) = landlock_target(c, &p, true) {
+                    crate::landlock::check(c, &target, crate::landlock::TRUNCATE)?;
+                }
                 match followed(c, &p, true)? {
                     // A link in `/proc/self/fd` leads to the descriptor's
                     // file, which the call opens for writing again.
@@ -2270,6 +2319,17 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             {
                 return Err(Errno::EEXIST);
             }
+            // Landlock's check (`hook_path_rename`) of names that are there
+            // as the flags ask, on one filesystem.
+            if c.process.credentials.landlock != Default::default()
+                && device(c, &old) == device(c, &new)
+                && let (Some((old_path, Some(_))), Some((new_path, new_stat))) =
+                    (landlock_named(c, &old), landlock_named(c, &new))
+                && (flags & 1 == 0 || new_stat.is_none())
+                && (flags & 2 == 0 || new_stat.is_some())
+            {
+                crate::landlock::refer(c, &old_path, &new_path, true, flags & 2 != 0)?;
+            }
             c.files.fs.rename_with(&old, &new, flags)?;
             // The paths of descriptors and the working directory under a
             // name that moved; an exchange moves both names.
@@ -2310,6 +2370,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             };
             let p = c.files.path(dir, raw.clone())?;
             let created = crate::permissions::create(c.files, &c.process.credentials, dir, &raw)?;
+            if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
+                landlock_name(c, &p, crate::landlock::MAKE_DIR)?;
+            }
             c.files.fs.mkdir(&p, (mode as u32) & !c.files.umask())?;
             if let Some(parent) = created {
                 crate::permissions::own(c.files, &c.process.credentials, &p, false, &parent);
@@ -2336,6 +2399,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             };
             let p = c.files.path(at_dir, raw.clone())?;
             crate::permissions::delete(c.files, &c.process.credentials, at_dir, &raw)?;
+            if landlock_named(c, &p).is_some_and(|(_, there)| there.is_some()) {
+                let request = if dir {
+                    crate::landlock::REMOVE_DIR
+                } else {
+                    crate::landlock::REMOVE_FILE
+                };
+                landlock_name(c, &p, request)?;
+            }
             c.files.fs.unlink(&p, dir)?;
             Ok(0)
         }
@@ -2357,6 +2428,15 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if source.file.is_some() && device(c, &old) == device(c, &new) {
                 crate::permissions::create(c.files, &c.process.credentials, new_dir, &new_raw)?;
             }
+            // Landlock's check (`hook_path_link`) of a new name on the same
+            // filesystem, whatever the permission walk found.
+            if c.process.credentials.landlock != Default::default()
+                && device(c, &old) == device(c, &new)
+                && let (Some((old_path, Some(_))), Some((new_path, None))) =
+                    (landlock_named(c, &old), landlock_named(c, &new))
+            {
+                crate::landlock::refer(c, &old_path, &new_path, false, false)?;
+            }
             c.files.fs.link(&old, &new)?;
             Ok(0)
         }
@@ -2369,6 +2449,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             };
             let p = c.files.path(dir, raw.clone())?;
             let created = crate::permissions::create(c.files, &c.process.credentials, dir, &raw)?;
+            if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
+                landlock_name(c, &p, crate::landlock::MAKE_SYM)?;
+            }
             c.files.fs.symlink(&target, &p)?;
             if let Some(parent) = created {
                 crate::permissions::own(c.files, &c.process.credentials, &p, false, &parent);
@@ -2572,13 +2655,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         21 => access(c, (-100i32) as u64, a[0], a[1], 0),
         269 => access(c, a[0], a[1], a[2], 0),
         439 => access(c, a[0], a[1], a[2], a[3]),
-        // fsync, fdatasync: both write everything, as nothing is cached
-        74 | 75 => c.files.descriptor(a[0])?.file.sync().map(|()| 0),
+        // fsync, fdatasync: both write everything, as nothing is cached; an
+        // `O_PATH` descriptor is EBADF, as Linux's `fdget` refuses it.
+        74 | 75 => io_descriptor(c, a[0])?.sync().map(|()| 0),
         // sync: nothing is cached, so there is nothing to write
         162 => Ok(0),
         // fadvise64: a hint, checked as Linux checks it
         221 => {
-            let file = c.files.descriptor(a[0])?.file;
+            let file = io_descriptor(c, a[0])?;
             if file.stat()?.mode & 0o170000 == 0o010000 {
                 return Err(Errno(29)); // ESPIPE
             }
@@ -3148,6 +3232,7 @@ mod files_tests {
             cloexec: false,
             opened: true,
             listed: Arc::default(),
+            landlock: crate::landlock::FS,
         }
     }
     #[test]
@@ -3304,15 +3389,22 @@ fn open_at(
     let fd = c.files.reserve(c.group.nofile())?;
     let credentials = &c.process.credentials;
     let opened = match crate::permissions::open(c.files, credentials, dir, &raw, flags) {
-        Ok(created) => open_path(c, &p, flags, mode).inspect(|_| {
-            if let Some(parent) = created {
-                crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
-            }
+        Ok(created) => landlock_before_open(c, &p, flags).and_then(|landlock| {
+            let opened = open_path(c, &p, flags, mode).inspect(|_| {
+                if let Some(parent) = created {
+                    crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
+                }
+            })?;
+            let landlock = match landlock {
+                Some(rights) => rights,
+                None => landlock_after_open(c, &p, flags)?,
+            };
+            Ok((opened, landlock))
         }),
         Err(error) => Err(error),
     };
     match opened {
-        Ok((file, path)) => {
+        Ok(((file, path), landlock)) => {
             let cloexec = flags & 0x80000 != 0;
             c.files.fill(
                 fd,
@@ -3322,6 +3414,7 @@ fn open_at(
                     cloexec,
                     opened: true,
                     listed: Arc::default(),
+                    landlock,
                 },
             );
             Ok(u64::from(fd))
@@ -3851,6 +3944,141 @@ fn reopen(
     }
 }
 /// Whether `path` is one of the generated files, which no filesystem holds.
+/// The resolved path an open of `p` reaches: its last component followed
+/// unless `O_NOFOLLOW`, and kept when it does not exist, for the file the
+/// open would make. `None` when its directory does not exist.
+fn landlock_target(c: &Context<'_>, p: &[u8], follow: bool) -> Option<Vec<u8>> {
+    // /proc and /dev are named as given: no name there is a mounted file.
+    if let Ok(normal) = paludarium_vfs::normalize_path(p)
+        && (normal == b"/proc" || generated(&normal))
+    {
+        return Some(normal);
+    }
+    if follow && let Some(path) = resolved(c.files, p) {
+        return Some(path);
+    }
+    let normal = paludarium_vfs::normalize_path(p).ok()?;
+    let at = normal.iter().rposition(|&b| b == b'/')?;
+    let dir = resolved(c.files, if at == 0 { b"/" } else { &normal[..at] })?;
+    let mut path = dir;
+    if path != b"/" {
+        path.push(b'/');
+    }
+    path.extend_from_slice(&normal[at + 1..]);
+    Some(path)
+}
+/// The status of the file at the resolved `path`, `/proc` and `/dev` too.
+fn landlock_stat(c: &Context<'_>, path: &[u8]) -> Option<FileStat> {
+    match generated_stat(c, path, false) {
+        Ok(Some((stat, _, _))) => Some(stat),
+        _ => c.files.fs.metadata(path, false).ok(),
+    }
+}
+/// Landlock's checks of an open of `p` with `flags` before it happens: of
+/// opening the file there (and truncating it with `O_TRUNC`), which gives
+/// the rights its description keeps, or of making a regular file in its
+/// directory, in which case the open's own check waits for the file
+/// (`None`, [`landlock_after_open`]). `O_PATH` checks nothing.
+fn landlock_before_open(c: &Context<'_>, p: &[u8], flags: u32) -> Result<Option<u64>, Errno> {
+    if flags & O_PATH != 0 || c.process.credentials.landlock == Default::default() {
+        return Ok(Some(crate::landlock::FS));
+    }
+    let Some(target) = landlock_target(c, p, flags & 0x20000 == 0) else {
+        return Ok(Some(crate::landlock::FS));
+    };
+    match landlock_stat(c, &target) {
+        // O_CREAT | O_EXCL on a file that is there is EEXIST first.
+        Some(_) if flags & 192 == 192 => Ok(None),
+        Some(stat) => {
+            let mode = flags & 3;
+            let rights = crate::landlock::open(c, &target, &stat, mode != 1, mode != 0, false)?;
+            if flags & 512 != 0
+                && stat.mode & 0o170000 == 0o100000
+                && rights & crate::landlock::TRUNCATE == 0
+            {
+                return Err(Errno::EACCES);
+            }
+            Ok(Some(rights))
+        }
+        None if flags & 64 != 0 => {
+            let dir = match target.iter().rposition(|&b| b == b'/') {
+                Some(0) | None => b"/".to_vec(),
+                Some(at) => target[..at].to_vec(),
+            };
+            crate::landlock::check(c, &dir, crate::landlock::MAKE_REG)?;
+            Ok(None)
+        }
+        None => Ok(Some(crate::landlock::FS)),
+    }
+}
+/// Landlock's check of making or removing the name `p`: `request` on the
+/// directory that holds it. Nothing when the thread has no domain.
+pub(crate) fn landlock_name(c: &Context<'_>, p: &[u8], request: u64) -> Result<(), Errno> {
+    if c.process.credentials.landlock == Default::default() {
+        return Ok(());
+    }
+    match landlock_target(c, p, false) {
+        Some(target) => crate::landlock::check(c, crate::landlock::parent(&target), request),
+        None => Ok(()),
+    }
+}
+/// The resolved path of the name `p` itself, and whether a file is there.
+fn landlock_named(c: &Context<'_>, p: &[u8]) -> Option<(Vec<u8>, Option<FileStat>)> {
+    let target = landlock_target(c, p, false)?;
+    let stat = landlock_stat(c, &target);
+    Some((target, stat))
+}
+/// Landlock's check of an open that made the file at `p`.
+fn landlock_after_open(c: &Context<'_>, p: &[u8], flags: u32) -> Result<u64, Errno> {
+    let Some(target) = landlock_target(c, p, flags & 0x20000 == 0) else {
+        return Ok(crate::landlock::FS);
+    };
+    let Some(stat) = landlock_stat(c, &target) else {
+        return Ok(crate::landlock::FS);
+    };
+    let mode = flags & 3;
+    crate::landlock::open(c, &target, &stat, mode != 1, mode != 0, false)
+}
+/// The device and inode `stat` gives the file at the resolved `path`, which
+/// Landlock's rules name ([`crate::landlock`]); `None` when there is none.
+pub(crate) fn identity(c: &Context<'_>, path: &[u8]) -> Option<crate::landlock::Object> {
+    if let Ok(Some((stat, device, _))) = generated_stat(c, path, false) {
+        return Some((device, stat.inode));
+    }
+    file_identity(c.files, path)
+}
+/// [`identity`] of a file outside `/proc` and `/dev`, for a caller with
+/// only the files.
+pub(crate) fn file_identity(files: &Files, path: &[u8]) -> Option<crate::landlock::Object> {
+    let stat = files.fs.metadata(path, false).ok()?;
+    Some((
+        crate::page_cache::mount_device(&files.fs.mounts(), path),
+        stat.inode,
+    ))
+}
+/// The object of a Landlock rule's `parent_fd`, and whether it is a
+/// directory: the file a descriptor (`O_PATH` too) holds. A ruleset, a pipe,
+/// a socket or another file of no path is `EBADFD`, as Linux refuses
+/// internal filesystems.
+pub(crate) fn rule_object(
+    c: &Context<'_>,
+    fd: i32,
+) -> Result<(crate::landlock::Object, bool), Errno> {
+    let d = c.files.descriptor(u64::from(fd as u32))?;
+    if d.path.is_empty() {
+        return Err(Errno(77));
+    }
+    let stat = d.file.stat()?;
+    let directory = stat.mode & 0o170000 == 0o040000;
+    // The file the descriptor holds, as `fstat` names it, wherever it is
+    // now; a file of /proc or /dev by its path, which nothing renames.
+    let object = if generated(&d.path) {
+        identity(c, &d.path).ok_or(Errno(77))?
+    } else {
+        (descriptor_device(c, &d), stat.inode)
+    };
+    Ok((object, directory))
+}
 pub(crate) fn generated(path: &[u8]) -> bool {
     crate::devices::entry(path).is_some() || path.starts_with(b"/proc/")
 }
@@ -3994,6 +4222,7 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
             Some(v) if v.is::<crate::epoll::EpollInstance>() => "eventpoll",
             Some(v) if v.is::<crate::timerfd::TimerFile>() => "timerfd",
             Some(v) if v.is::<crate::signalfd::SignalFile>() => "signalfd",
+            Some(v) if v.is::<crate::landlock::Ruleset>() => "landlock-ruleset",
             // The last kind of no type; Linux 6.9 and later name it from
             // pidfs instead.
             _ => "pidfd",
@@ -4302,6 +4531,9 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32) -> Result<(), Err
     }
     let p = c.files.path(dir, raw.to_vec())?;
     let created = crate::permissions::create(c.files, &c.process.credentials, dir, raw)?;
+    if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
+        landlock_name(c, &p, crate::landlock::make_access(kind))?;
+    }
     let permissions = mode & 0o7777 & !c.files.umask();
     match kind {
         0o010000 => {

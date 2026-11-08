@@ -406,6 +406,10 @@ impl UnixSocket {
         let creds = &c.process.credentials;
         let parent = crate::permissions::create(c.files, creds, AT_FDCWD, path)?;
         let full = c.files.exec_path(path.to_vec())?;
+        // Landlock's MAKE_SOCK on its directory, for a name not there yet.
+        if c.files.fs.metadata(&full, false).is_err() {
+            crate::files::landlock_name(c, &full, crate::landlock::MAKE_SOCK)?;
+        }
         let stat = c
             .files
             .fs

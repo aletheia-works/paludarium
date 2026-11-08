@@ -7,6 +7,9 @@ use paludarium_types::{Errno, GuestAddr};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+/// `O_PATH`: only a path, not an open file.
+const O_PATH: u32 = 0o10000000;
+
 const ET: u32 = 1 << 31;
 const ONESHOT: u32 = 1 << 30;
 struct Interest {
@@ -249,14 +252,23 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 )
                 .map(u64::from);
         }
+        // The epoll descriptor too, as `fdget` takes it (EBADF for `O_PATH`).
         let d = c.files.descriptor(a[0])?;
+        if d.file.flags() & O_PATH != 0 {
+            return Err(Errno::EBADF);
+        }
         let epoll = d
             .file
             .as_any()
             .and_then(|v| v.downcast_ref::<EpollInstance>())
             .ok_or(Errno::EINVAL)?;
         if number == 233 {
+            // The target as Linux's `fdget` takes it: an `O_PATH` one is
+            // not a file to watch (EBADF).
             let target = c.files.descriptor(a[2])?;
+            if target.file.flags() & O_PATH != 0 {
+                return Err(Errno::EBADF);
+            }
             let (events, data) = if a[1] == 2 {
                 (0, 0)
             } else {

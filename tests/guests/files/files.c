@@ -725,6 +725,24 @@ void _start(void) {
   results[x++]=call(191,(long)p,(long)"user.k",(long)buf,8,0,0);
   results[x++]=call(188,(long)fdpath(900),(long)"user.k",(long)"v",1,0,0);
   S(3,op,0,0);}
+ if(CASE==66){ /* an O_PATH descriptor refuses I/O (EBADF), as Linux's fdget has it */
+  static long xv[2];static int pf[2];
+  S(1,fd,"abcd",4);long op=S(2,p,010000000,0),dp=S(2,"/tmp",010200000,0);
+  results[x++]=S(74,op,0,0);results[x++]=S(75,op,0,0);results[x++]=call(221,op,0,0,0,0,0);
+  results[x++]=S(0,op,buf,1);results[x++]=S(1,op,"x",1);results[x++]=call(17,op,(long)buf,1,0,0,0);
+  results[x++]=S(8,op,0,0);results[x++]=S(16,op,0x541B,xv);results[x++]=S(73,op,1,0);
+  results[x++]=call(285,op,0,0,8,0,0);results[x++]=call(9,0,4096,1,2,op,0);
+  results[x++]=call(193,op,(long)"user.k",(long)buf,8,0,0);results[x++]=call(190,op,(long)"user.k",(long)"v",1,0,0);
+  results[x++]=call(196,op,(long)buf,64,0,0,0);results[x++]=call(199,op,(long)"user.k",0,0,0,0);
+  results[x++]=S(217,dp,buf,4096);results[x++]=call(40,fd,op,0,1,0,0);results[x++]=call(326,op,0,fd,0,1,0);
+  results[x++]=S(72,op,4,0);results[x++]=S(72,op,1,0);results[x++]=S(72,op,3,0)&0xffffff;
+  results[x++]=S(5,op,st,0);results[x++]=S(138,op,buf,0);results[x++]=S(81,dp,0,0);
+  pf[0]=op;pf[1]=1;results[x++]=S(7,pf,1,0);results[x++]=((short*)pf)[3];
+  {static unsigned long set[16];set[op/64]=1UL<<(op%64);static long tv[2];results[x++]=call(23,op+1,(long)set,0,0,(long)tv,0);}
+  long ep=S(291,0,0,0);xv[0]=1;results[x++]=call(233,ep,1,op,(long)xv,0,0);
+  results[x++]=call(233,op,1,ep,(long)xv,0,0);results[x++]=call(232,op,(long)xv,1,0,0,0);S(3,ep,0,0);
+  long d=S(32,op,0,0);results[x++]=d>=0;results[x++]=S(3,d,0,0);
+  S(3,op,0,0);S(3,dp,0,0);}
  if(CASE==42){ /* close_range(first, last, flags): 4..7 are copies of fd 3 */
   #define CR(f,l,fl) call(436,f,l,fl,0,0,0)
   #define OPEN(n) (S(72,n,1,0)>=0)

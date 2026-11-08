@@ -491,6 +491,15 @@ pub(crate) fn exec(
     }
     permission(creds, &stat, MAY_EXEC)?;
     let readable = permission(creds, &stat, MAY_READ).is_ok();
+    // Landlock's check of the open for execution (`hook_file_open`).
+    if let Some(resolved) = crate::files::resolved(files, path) {
+        crate::landlock::check_with(
+            &creds.landlock,
+            &|p| crate::files::file_identity(files, p),
+            &resolved,
+            crate::landlock::READ_FILE | crate::landlock::EXECUTE,
+        )?;
+    }
     Ok((Some(stat), readable))
 }
 

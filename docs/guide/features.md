@@ -705,7 +705,10 @@ kernel.
   (`BINPRM_FLAGS_PATH_INACCESSIBLE`). A memfd or a removed file, which no
   path names, runs from its descriptor (`fexecve`), through `execveat` or
   a link in `/proc/self/fd`, and `/proc/self/exe` then reads the memfd's
-  link or the path with `(deleted)`. `AT_EXECVE_CHECK` (Linux 6.14) is
+  link or the path with `(deleted)`. Such a file is read whole, so one
+  larger than the memory limit is `ENOMEM` even when its segments are small,
+  and one that is neither an ELF program nor a script is `ENOEXEC` from its
+  first bytes. `AT_EXECVE_CHECK` (Linux 6.14) is
   `EINVAL`.
 - `chmod` and `utimensat` work in the in-memory filesystem and in mounted
   host directories; on a Windows host, `chmod` only sets or clears the

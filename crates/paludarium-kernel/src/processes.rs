@@ -2433,7 +2433,7 @@ impl Kernel {
                         if file.stat()?.size > limit {
                             return Err(Errno::ENOMEM);
                         }
-                        Some((read_whole(&*file)?, name))
+                        Some((read_whole(&*file, limit)?, name))
                     }
                     // A script reads itself by its name, which a descriptor
                     // closed on exec leaves to nothing
@@ -2800,14 +2800,18 @@ pub(crate) fn follow_scripts(
 /// All of `file`, read from its start, for exec of a file only a
 /// descriptor holds.
 /// It grows as the bytes come, as [`paludarium_vfs`]'s `read_file` reads a
-/// path's program.
-fn read_whole(file: &dyn paludarium_host::FileHandle) -> Result<Vec<u8>, Errno> {
+/// path's program, and stops past `limit` bytes (ENOMEM), however the file
+/// grows meanwhile.
+fn read_whole(file: &dyn paludarium_host::FileHandle, limit: u64) -> Result<Vec<u8>, Errno> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 65536];
     loop {
         match file.read_at(bytes.len() as u64, &mut chunk)? {
             0 => return Ok(bytes),
             n => bytes.extend_from_slice(&chunk[..n]),
+        }
+        if bytes.len() as u64 > limit {
+            return Err(Errno::ENOMEM);
         }
     }
 }

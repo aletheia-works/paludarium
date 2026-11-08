@@ -647,7 +647,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`BINPRM_FLAGS_PATH_INACCESSIBLE`）。どのパスも指さない memfd や削除したファイルは、
   `execveat` でも `/proc/self/fd` のリンクでも、ディスクリプタから動きます
   （`fexecve`）。そのとき `/proc/self/exe` は memfd のリンクか、` (deleted)` の付いた
-  パスを読みます。`AT_EXECVE_CHECK`（Linux 6.14）は `EINVAL` です。
+  パスを読みます。そのファイルは丸ごと読むので、メモリの上限より大きいものは、
+  セグメントが小さくても `ENOMEM` です。ELF のプログラムでもスクリプトでもないものは、
+  先頭のバイトで `ENOEXEC` になります。`AT_EXECVE_CHECK`（Linux 6.14）は `EINVAL` です。
 - `chmod` と `utimensat` は、メモリ上のファイルシステムでも、マウントしたホストの
   ディレクトリでも使えます。Windows のホストでは、`chmod` が変えるのは読み取り専用の
   属性だけです。`fchmodat2`（Linux 6.6）は `AT_SYMLINK_NOFOLLOW` と `AT_EMPTY_PATH` を

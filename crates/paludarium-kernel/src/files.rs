@@ -1396,6 +1396,11 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const AT_STATX_SYNC_TYPE: u64 = 0x6000;
 /// STATX_TYPE ... STATX_BLOCKS: the fields a `stat` also has.
 const STATX_BASIC_STATS: u32 = 0x7ff;
+/// `stx_mnt_id` holds the mount's ID, as /proc/self/mountinfo numbers it.
+const STATX_MNT_ID: u32 = 0x1000;
+/// `stx_mnt_id` holds the mount's 64-bit ID that is never reused (Linux 6.8),
+/// numbered from 2^31 (Linux's `MNT_UNIQUE_ID_OFFSET`).
+const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
 /// `statx(dirfd, path, flags, mask, buffer)`, with the checks of Linux's
 /// do_statx and vfs_statx. As since Linux 6.11, a null path with
 /// AT_EMPTY_PATH names the descriptor like an empty one.
@@ -1445,7 +1450,21 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             ),
         }
     };
-    output(c, out, &encode_statx(s, device, block_size)?)?;
+    let mut b = encode_statx(s, device, block_size)?;
+    // As Linux's vfs_statx, the mount's ID whether or not it was asked for:
+    // the unique one if that was, the one mountinfo shows otherwise. A
+    // mount's minor number is its position in mountinfo, whose IDs start at
+    // 21; a memfd's device 0 gives 20, a mount mountinfo does not show, as
+    // Linux's internal one for memfds is not shown.
+    let id = 20 + (device & 0xff | (device >> 12) & !0xff);
+    let (bit, id) = if mask & STATX_MNT_ID_UNIQUE != 0 {
+        (STATX_MNT_ID_UNIQUE, 1 << 31 | id)
+    } else {
+        (STATX_MNT_ID, id)
+    };
+    b[0..4].copy_from_slice(&(STATX_BASIC_STATS | bit).to_le_bytes());
+    b[144..152].copy_from_slice(&id.to_le_bytes());
+    output(c, out, &b)?;
     Ok(0)
 }
 /// `struct statx` with what [`encode_stat`] gives a `struct stat`: the basic

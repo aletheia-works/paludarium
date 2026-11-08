@@ -86,8 +86,11 @@ kernel.
   (`E2BIG`), and any other namespace gives `EOPNOTSUPP`.
 - `statx` reports the fields a `stat` has (`STATX_BASIC_STATS`) and the
   mount's `st_dev` as its device numbers, with Linux's flag and mask checks
-  (`EINVAL`). `AT_EMPTY_PATH` names the descriptor, or the working directory
-  for `AT_FDCWD`, and as since Linux 6.11 a null path with it does too.
+  (`EINVAL`). Whatever the mask asks for, it also gives the mount's ID, as
+  Linux does: the one `/proc/self/mountinfo` shows (`STATX_MNT_ID`), or a
+  64-bit one in its place when `STATX_MNT_ID_UNIQUE` is asked for.
+  `AT_EMPTY_PATH` names the descriptor, or the working directory for
+  `AT_FDCWD`, and as since Linux 6.11 a null path with it does too.
 - `fallocate` checks its arguments as Linux's `vfs_fallocate` does, in
   order (`EINVAL`, `EOPNOTSUPP`, `EBADF`, then `ESPIPE`, `EISDIR` or
   `ENODEV` for a file that is not regular, and `EFBIG`). Files then behave
@@ -535,10 +538,11 @@ kernel.
   NUMA node 0.
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like
   `CPUID`, it does not reveal the host. The guest starts as root (user and
-  group 0, with every capability). Each thread has its own credentials, as
-  on Linux: the real, effective, saved and filesystem user and group IDs,
-  the supplementary groups and the permitted, effective and inheritable
-  capabilities.
+  group 0, with every capability) without supplementary groups, as Linux's
+  first process does; a native program has its launcher's instead. Each
+  thread has its own credentials, as on Linux: the real, effective, saved
+  and filesystem user and group IDs, the supplementary groups and the
+  permitted, effective and inheritable capabilities.
   `capget` reads any thread's capabilities in all three header versions, and
   `capset` changes the calling thread's, within what it holds by Linux's rules.
   The `set*id` calls and `setgroups` change them by Linux's rules: an ID

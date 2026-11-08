@@ -141,7 +141,18 @@ void _start(void) {
   /* A mask of 0 is allowed; which fields it reports depends on the kernel
      (from 6.13 multigrain timestamps leave out MTIME and CTIME), so only the
      result is compared. */
-  results[x++]=SX(p,0,0);S(87,q,0,0);}
+  results[x++]=SX(p,0,0);
+  /* The mount's ID comes whatever the mask asks for: STATX_MNT_ID, or in its
+     place STATX_MNT_ID_UNIQUE when that is asked for (Linux 6.8). Which IDs
+     the mounts have depends on the system, so only that the file and its
+     directory share one, and that the unique ID is past 2^31, are compared. */
+  #define SXMASK() (*(unsigned*)sx&0x5000)
+  #define SXMNT() (*(unsigned long*)(sx+144))
+  results[x++]=SX(p,0,0x7ff);results[x++]=SXMASK();unsigned long mnt=SXMNT();results[x++]=mnt!=0;
+  results[x++]=SX(p,0,0);results[x++]=SXMASK();results[x++]=SXMNT()==mnt;
+  results[x++]=SX("/tmp",0x100,0x7ff);results[x++]=SXMASK();results[x++]=SXMNT()==mnt;
+  results[x++]=SX(p,0,0x5000);results[x++]=SXMASK();results[x++]=SXMNT()>=1UL<<31;
+  S(87,q,0,0);}
  if(CASE==50){ /* getdents64 of a new directory: itself, its parent, and one file */
   static char d[]="/tmp/paludarium-files-dents",f[]="/tmp/paludarium-files-dents/a",e[]="/tmp/paludarium-files-dents/.";
   static char up[]="/tmp/paludarium-files-dents/..";

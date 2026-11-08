@@ -670,8 +670,9 @@ kernel.
   `utimensat`, `truncate`, `chdir`, the extended-attribute calls and
   `execve`. A removed file, a memfd or a pipe is reached through the
   descriptor itself (`execve` of those is not); a symbolic link an
-  `O_PATH | O_NOFOLLOW` descriptor holds is not followed again, and its mode
-  cannot change (`EOPNOTSUPP`).
+  `O_PATH | O_NOFOLLOW` descriptor holds is not followed again: its mode
+  cannot change (`EOPNOTSUPP`), `chdir` finds no directory (`ENOTDIR`),
+  `truncate` no regular file (`EINVAL`) and `execve` gives `ELOOP`.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
   `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a

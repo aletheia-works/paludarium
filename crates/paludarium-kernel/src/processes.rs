@@ -2248,9 +2248,22 @@ impl Kernel {
         let raw = path.clone();
         let path = self.files.exec_path(path)?;
         // A link in `/proc/self/fd`, as `fexecve` falls back to, runs the
-        // file its descriptor holds while a path still names it.
+        // file its descriptor holds while a path still names it. A symbolic
+        // link an `O_PATH | O_NOFOLLOW` descriptor holds is not followed
+        // again, and opens as no program (`ELOOP`, `may_open`).
         let path =
             match crate::files::through_descriptor(&self.files, self.process.pid, &path, true)? {
+                Some(crate::files::Followed::Path {
+                    path,
+                    follow: false,
+                }) if self
+                    .files
+                    .fs
+                    .metadata(&path, false)
+                    .is_ok_and(|s| s.mode & 0o170000 == 0o120000) =>
+                {
+                    return Err(Errno(40));
+                }
                 Some(crate::files::Followed::Path { path, .. }) => path,
                 _ => path,
             };

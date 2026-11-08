@@ -2166,7 +2166,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let p = if n == 80 {
                 let p = looked_up(c, (-100i32) as u64, a[0], true)?.0;
                 match followed(c, &p, true)? {
-                    Some(Followed::Path { path, .. }) => path,
+                    // A symbolic link an `O_PATH | O_NOFOLLOW` descriptor
+                    // holds is not followed again: it is no directory.
+                    Some(Followed::Path { path, follow }) => {
+                        if c.files.fs.metadata(&path, follow)?.mode & 0o170000 != 0o040000 {
+                            return Err(Errno::ENOTDIR);
+                        }
+                        path
+                    }
                     Some(Followed::File(d)) if d.file.stat()?.mode & 0o170000 != 0o040000 => {
                         return Err(Errno::ENOTDIR);
                     }

@@ -610,8 +610,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `chmod` と `fchmodat`、`chown` と `fchownat`、`utimensat`、`truncate`、`chdir`、
   拡張属性の呼び出し、`execve` がそうです。削除したファイル、memfd、パイプには
   ディスクリプタ自身を通して届きます（それらの `execve` はできません）。
-  `O_PATH | O_NOFOLLOW` のディスクリプタが持つシンボリックリンクはもうたどらず、
-  そのモードは変えられません（`EOPNOTSUPP`）。
+  `O_PATH | O_NOFOLLOW` のディスクリプタが持つシンボリックリンクはもうたどりません。
+  そのモードは変えられず（`EOPNOTSUPP`）、`chdir` はディレクトリでないもの（`ENOTDIR`）、
+  `truncate` は通常のファイルでないもの（`EINVAL`）とし、`execve` は `ELOOP` になります。
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの

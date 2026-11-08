@@ -674,6 +674,8 @@ void _start(void) {
   /* A symbolic link an O_PATH | O_NOFOLLOW descriptor holds: not followed
      again, and its mode cannot change. */
   S(88,p,q,0);long ol=S(2,q,010400000,0);results[x++]=S(90,fdpath(ol),0600,0);S(4,p,st,0);results[x++]=MODE();
+  results[x++]=S(80,fdpath(ol),0,0);results[x++]=S(76,fdpath(ol),0,0);S(5,fd,st,0);results[x++]=*(long*)(st+48);
+  {static char *argv[]={"x",0};results[x++]=call(59,(long)fdpath(ol),(long)argv,0,0,0,0);}
   /* chown to the IDs it has, utimensat and truncate. */
   long uid=S(107,0,0,0),gid=S(108,0,0,0);
   results[x++]=S(92,fdpath(op),uid,gid);results[x++]=call(260,-100,(long)fdpath(op),uid,gid,0,0);

@@ -129,7 +129,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `u32` は下位 32 ビットを、`umode_t` は下位 16 ビットを読みます。レジスタの残りを
   0 にせずに呼ぶもの（fish の `fcntl`）でも、Linux と同じ結果になります。ポインタと
   `long`・`unsigned long`・`size_t`・`loff_t` の引数はそのまま全体を読むので、`prot` の
-  32 ビットより上が立っている `mprotect` は `EINVAL` のままです。
+  32 ビットより上が立っている `mprotect` は `EINVAL` のままです。システムコールの番号も、
+  Linux の `do_syscall_64` が `int` で受け取るのと同じく `rax` の下位 32 ビットから読み、
+  負の番号は `ENOSYS` です。
 - `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET` を扱います。ワードは Linux の
   `get_futex_key` と同じように見分けます。共有マッピング（共有の無名メモリかファイルのもの）では、
   shared の操作はそのメモリとその中のオフセットを指すので、wake はそのメモリをマップしている

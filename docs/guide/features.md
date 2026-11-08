@@ -142,7 +142,9 @@ kernel.
   `umode_t` from the low 16. A caller that leaves the rest of a register dirty
   (fish's `fcntl` does) gets what it would on Linux. Pointers and `long`,
   `unsigned long`, `size_t` and `loff_t` arguments are read whole, so
-  `mprotect` with a bit set past 32 in `prot` is still `EINVAL`.
+  `mprotect` with a bit set past 32 in `prot` is still `EINVAL`. The number
+  itself is read from the low 32 bits of `rax` too, as Linux's
+  `do_syscall_64` takes an `int`, and a negative one gives `ENOSYS`.
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`. A word is
   told apart as Linux's `get_futex_key` does: in a shared mapping (shared
   anonymous memory or a file's), a shared operation names the memory and the

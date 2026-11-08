@@ -5199,6 +5199,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "session")) {
+        /* The case names its own group, which the emulated first process,
+           like a PID namespace's, is not in until it makes one. */
+        if (setpgid(0, 0)) return 80;
         /* setsid in a child, which is not a group leader; what each check
            gives is a bit, sent back through a pipe. */
         int bits_pipe[2], go[2];
@@ -5459,6 +5462,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "signal-io")) {
+        /* The case names its own group, which the emulated first process,
+           like a PID namespace's, is not in until it makes one. */
+        if (setpgid(0, 0)) return 80;
         /* O_ASYNC: a pipe or socket signals its F_SETOWN owner as it
            changes, with SIGIO or F_SETSIG's signal (code, band and fd);
            F_SETOWN works on any file, O_ASYNC stays only on these. The
@@ -6129,6 +6135,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "socket-options")) {
+        /* The case names its own group, which the emulated first process,
+           like a PID namespace's, is not in until it makes one. */
+        if (setpgid(0, 0)) return 80;
         /* SOL_SOCKET options on socket pairs, as Linux's sk_setsockopt and
            sk_getsockopt keep them, SO_OOBINLINE's out-of-band byte read with
            the data, and the SIGURG that F_SETOWN's owner gets for one. Only

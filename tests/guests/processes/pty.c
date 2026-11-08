@@ -183,8 +183,9 @@ static int case_open(void) {
     say("locked %d", locked);
     struct stat path, opened;
     say("stat slave %d", stat(name, &path));
-    say("slave %d %d %d %#o %d", S_ISCHR(path.st_mode), major(path.st_rdev) == 136,
-        minor(path.st_rdev) == number, path.st_mode & 07777, path.st_uid == getuid());
+    /* Its mode and group are devpts's mount options. */
+    say("slave %d %d %d %d", S_ISCHR(path.st_mode), major(path.st_rdev) == 136,
+        minor(path.st_rdev) == number, path.st_uid == getuid());
     int s = open(name, O_RDWR | O_NOCTTY);
     say("open slave %d", s >= 0);
     fstat(s, &opened);
@@ -850,6 +851,8 @@ static int case_hangup(void) {
 
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
+    /* A case that waits for good ends with what it printed so far. */
+    alarm(20);
     if (!strcmp(mode, "pty-open")) return case_open();
     if (!strcmp(mode, "pty-termios")) return case_termios();
     if (!strcmp(mode, "pty-canonical")) return case_canonical();

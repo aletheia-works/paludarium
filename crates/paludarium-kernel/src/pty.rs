@@ -1211,7 +1211,7 @@ fn open_slave(
     flags: u32,
     alias: bool,
 ) -> Result<Arc<Slave>, Errno> {
-    let generation = {
+    let (generation, signals) = {
         let mut state = terminal.lock();
         if state.exclusive && !c.process.credentials.may_administer() {
             return Err(EBUSY);
@@ -1221,8 +1221,12 @@ fn open_slave(
         }
         state.slaves += 1;
         state.other_closed = false;
-        state.hangups
+        // What the master wrote before reaches the line discipline now.
+        let mut signals = Vec::new();
+        state.receive(&mut signals);
+        (state.hangups, signals)
     };
+    terminal.deliver(signals);
     let slave = Arc::new(Slave {
         terminal: Arc::clone(terminal),
         flags: AtomicU32::new(flags & (3 | NONBLOCK)),
@@ -1407,7 +1411,11 @@ impl Master {
                 bytes.len().min(FLIP.saturating_sub(state.pending.len()))
             };
             state.pending.extend(&bytes[..count]);
-            state.receive(&mut signals);
+            // The line discipline takes input only while the slave is
+            // open: what comes before waits, and is echoed at its open.
+            if state.slaves > 0 {
+                state.receive(&mut signals);
+            }
             count
         };
         terminal.hub.changed();

@@ -674,6 +674,9 @@ mod tests {
         );
         assert_eq!(at(usr, &[mount(usr, "/x")]), None);
         assert_eq!(at(java, &[mount(usr, "/x/../y")]), None);
+        // `..` names no file; Windows's `absolute` resolves it to a directory,
+        // which the command then refuses as a program.
+        #[cfg(unix)]
         assert_eq!(at("..", &[mount(root, "/")]), None);
     }
 

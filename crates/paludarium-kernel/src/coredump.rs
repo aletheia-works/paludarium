@@ -359,12 +359,28 @@ fn prpsinfo(who: &Identity, thread: &ThreadCore, mem: &AddressSpace) -> [u8; 136
 /// address to past the last one's NUL, read from the vectors the initial
 /// stack at `start_stack` holds. Empty ranges at 0 when they cannot be read.
 pub(crate) fn string_ranges(mem: &AddressSpace, start_stack: u64) -> ((u64, u64), (u64, u64)) {
-    let read = |at: u64| mem.read_u64(GuestAddr(at)).ok();
+    string_ranges_in(
+        &|at, buf: &mut [u8]| mem.read(GuestAddr(at), buf).is_ok(),
+        start_stack,
+    )
+}
+/// [`string_ranges`] of a space that `read` reads, which tells whether it
+/// could.
+pub(crate) fn string_ranges_in(
+    memory: &dyn Fn(u64, &mut [u8]) -> bool,
+    start_stack: u64,
+) -> ((u64, u64), (u64, u64)) {
+    let read = |at: u64| {
+        let mut word = [0; 8];
+        memory(at, &mut word).then(|| u64::from_le_bytes(word))
+    };
     let end_of = |start: u64| {
         let mut end = start;
         let mut byte = [1u8];
         while byte[0] != 0 && end - start < 1 << 17 {
-            mem.read(GuestAddr(end), &mut byte).ok()?;
+            if !memory(end, &mut byte) {
+                return None;
+            }
             end += 1;
         }
         Some(end)

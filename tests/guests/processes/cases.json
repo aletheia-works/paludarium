@@ -62,6 +62,7 @@
     {"name":"proc-maps","binary":"process"},
     {"name":"fifo","binary":"process"},
     {"name":"proc-own-files","binary":"process"},
+    {"name":"proc-other-files","binary":"process"},
     {"name":"script-exec","binary":"process"},
     {"name":"capabilities","binary":"process"},
     {"name":"set-id-writes","binary":"process"},

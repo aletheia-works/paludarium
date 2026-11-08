@@ -224,6 +224,21 @@ pub struct Kernel {
     /// The task this thread counts as, for a thread other than its process's
     /// leader; the leader's is the process's, kept until it is reaped.
     task: Option<processes::TaskCharge>,
+    /// What this thread last published for `/proc` ([`Self::publish`]).
+    published: Option<Published>,
+}
+
+/// What a thread published for `/proc`, to tell when it changes: the
+/// thread, its name, blocked and pending signals, the address space and
+/// the files, and its credentials.
+#[derive(PartialEq, Eq)]
+struct Published {
+    tid: u32,
+    name: [u8; 16],
+    signals: (u64, u64, usize),
+    memory: usize,
+    files: [usize; 3],
+    credentials: credentials::Credentials,
 }
 
 impl Kernel {
@@ -248,6 +263,7 @@ impl Kernel {
             vfork_wait: None,
             unimplemented: Arc::default(),
             task: None,
+            published: None,
         }
     }
 
@@ -395,6 +411,49 @@ impl Kernel {
         Ok(())
     }
 
+    /// Publishes what other processes read of this thread in `/proc`, when
+    /// it has changed since the last time.
+    pub(crate) fn publish(&mut self, tid: u32, state: &ThreadState, mem: &AddressSpace) {
+        let pending = state
+            .pending
+            .iter()
+            .filter(|s| (1..=64).contains(&s.number))
+            .fold(0u64, |mask, s| mask | 1 << (s.number - 1));
+        let signals = (state.signal_mask, pending, state.pending.len());
+        let memory = std::ptr::from_ref(mem).addr();
+        let files = self.files.identity();
+        if self.published.as_ref().is_some_and(|p| {
+            p.tid == tid
+                && p.name == state.name
+                && p.signals == signals
+                && p.memory == memory
+                && p.files == files
+                && p.credentials == state.credentials
+        }) {
+            return;
+        }
+        self.group.publish(
+            tid,
+            threads::PublicThread {
+                name: state.name,
+                blocked: signals.0,
+                pending,
+                queued: signals.2,
+                credentials: state.credentials.clone(),
+                memory: Some(mem.view()),
+                files: self.files.view(),
+            },
+        );
+        self.published = Some(Published {
+            tid,
+            name: state.name,
+            signals,
+            memory,
+            files,
+            credentials: state.credentials.clone(),
+        });
+    }
+
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         // Only the checkpoint right after the syscall may restart it.
@@ -406,6 +465,7 @@ impl Kernel {
         if let Some(status) = self.group.status() {
             return Next::Exit(status);
         }
+        self.publish(thread.tid, &thread.state, mem);
         // A write found no memory under the session's limit: the process
         // ends by SIGKILL, as the cgroup OOM killer ends one, before it can
         // see the failed write as a fault or EFAULT.
@@ -659,7 +719,12 @@ impl Kernel {
             return self.checkpoint(thread, mem);
         }
         match reason {
-            ExitReason::Syscall { .. } => self.syscall(thread, mem),
+            ExitReason::Syscall { .. } => {
+                self.inbox.set_in_call(true);
+                let next = self.syscall(thread, mem);
+                self.inbox.set_in_call(false);
+                next
+            }
             ExitReason::PageFault { .. }
             | ExitReason::GeneralProtection { .. }
             | ExitReason::Halt { .. } => self.terminate(thread, signal::SIGSEGV),

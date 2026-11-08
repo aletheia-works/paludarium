@@ -634,29 +634,54 @@ kernel.
   `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but `stat`,
   `statfs` and `open` through it reach its file.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
-  `/proc/uptime` (below) and this process's own: `/proc/<pid>`, a
+  `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
   link, `stat` and a trailing slash follow it, `O_NOFOLLOW` does not
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
-  `/proc/self/status`, `stat`, `cmdline`, `comm`, `exe`, `cwd`, `maps` and
-  `fd`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
+  `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
+  `maps`, `fd` and `task`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
   signal masks, capabilities and so on) without the memory and CPU ones,
-  which nothing measures. Any other path under `/proc`, including another
-  process's directory, is looked up in the filesystem like any path, so with
+  which nothing measures. Any other path in this process's directory or
+  elsewhere under `/proc` is looked up in the filesystem like any path, so with
   `--mount /:/` it reaches the host's own `/proc`.
+- `/proc` lists what the filesystem has there that is not a process (with
+  `--mount /:/`, the host's own entries except its processes), the files above,
+  and then a directory for every process of the guest, zombies included, as
+  Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
+  process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
+  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd` and `task`, made as
+  `fs/proc/base.c` and `array.c` make them for root; any other name there is
+  `ENOENT`, as is the directory of a process that was never there or was
+  reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
+  the process, and `/proc/<pid>/task/<tid>` (the reader's own threads too)
+  has the same files but `task`, of that thread: its name, its signal masks,
+  and its ID as `Pid` with the process's as `Tgid`. What a process shows of
+  another is what that process's threads published at their last system call
+  or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
+  signals and the credentials, with the process's dispositions, memory (for
+  `cmdline`, `environ` and the sizes in `stat`), current directory, umask and
+  descriptors as they are. Its state is `R` for the reader, `T (stopped)`
+  during a job-control stop, `Z (zombie)` once it has ended and until it is
+  reaped, `S (sleeping)` while its thread is in a system call, where it waits
+  if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
+  thread, and has no memory, umask or descriptors: its `cmdline` and
+  `environ` are empty and `exe` and `cwd` are `ENOENT`, as on Linux.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
-  state `R` (the process is running, reading it), the parent, process group
+  state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, no terminal, the CPU time of the process and of its waited-for
   children in `USER_HZ` (100) ticks, the priority and nice value, the threads,
   the size of the mappings, the `RLIMIT_RSS` limit, the start of the stack and
-  of the heap, the signal sets as decimal numbers, `exit_signal` 17, and where
+  of the heap, the signal sets as decimal numbers, `wchan` (1 for a task that
+  waits, as Linux shows root, though not for a process of more than one thread
+  as a whole), `exit_signal` (17 for the reader's own), and where
   the argument and environment strings lie. What nothing measures is 0: page
   faults, resident memory, the start time, the code range and the scheduler's
-  figures. `cmdline` is the argument strings as they are in memory now, each
-  ending in its NUL, and `comm` the name and a newline.
+  figures. `cmdline` and `environ` are the argument and environment strings
+  as they are in memory now, each ending in its NUL, and `comm` the name and a
+  newline.
 - `/proc/self/exe` and `/proc/self/cwd` are symbolic links (0777, size 0) to
   the program the process runs (the one `execve` loaded, with symbolic links
   resolved; for the first program, the path the CLI gives it, `/<file name>`)

@@ -210,6 +210,32 @@ fn uname_names_linux_x86_64_and_ids_are_root() {
 }
 
 #[test]
+fn getcpu_reports_the_lowest_allowed_cpu_and_node_0() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), &[0xff; 8]).unwrap();
+    assert_eq!(f.ret(nr::GETCPU, &[DATA, DATA + 4, 0]), 0);
+    let mut bytes = [0u8; 8];
+    f.mem.read(GuestAddr(DATA), &mut bytes).unwrap();
+    assert_eq!(bytes, [0; 8]);
+    assert_eq!(f.ret(nr::GETCPU, &[0, 0, 0]), 0);
+    assert_eq!(f.ret(nr::GETCPU, &[1, 0, 0]), errno(Errno::EFAULT));
+    // The node is written even when the CPU cannot be.
+    f.mem.write(GuestAddr(DATA), &[0xff; 4]).unwrap();
+    assert_eq!(f.ret(nr::GETCPU, &[1, DATA, 0]), errno(Errno::EFAULT));
+    f.mem.read(GuestAddr(DATA), &mut bytes[..4]).unwrap();
+    assert_eq!(bytes[..4], [0; 4]);
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    if cpus > 1 {
+        // Pinned to CPU 1, the thread is on CPU 1.
+        f.mem.write(GuestAddr(DATA), &2u64.to_le_bytes()).unwrap();
+        assert_eq!(f.ret(nr::SCHED_SETAFFINITY, &[0, 8, DATA]), 0);
+        assert_eq!(f.ret(nr::GETCPU, &[DATA, 0, 0]), 0);
+        f.mem.read(GuestAddr(DATA), &mut bytes[..4]).unwrap();
+        assert_eq!(bytes[..4], 1u32.to_le_bytes());
+    }
+}
+
+#[test]
 fn sched_getaffinity_reports_every_host_cpu() {
     let mut f = fixture();
     let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);

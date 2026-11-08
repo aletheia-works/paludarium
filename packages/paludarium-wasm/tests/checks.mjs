@@ -29,8 +29,9 @@ export async function runChecks({ wasmUrl, readGuest, native }) {
       check(JSON.stringify(observed.status) === JSON.stringify(desired), `${name}: exit/signal mismatch`);
       // CPUID is a deliberately virtual identity/features contract. The native
       // host row proves fixture execution/provenance, not identity equivalence.
-      // Leaf 1's EAX, EBX, ECX and EDX: family 15, and x86-64's baseline.
-      let desiredStdout = name === "encodings-cpuid" ? "000f0000" + "00000000" + "00000000" + "01818007" : row.stdout;
+      // Leaf 1's EAX, EBX, ECX and EDX: family 15, the 64-byte CLFLUSH line,
+      // and x86-64's baseline with CLFLUSH.
+      let desiredStdout = name === "encodings-cpuid" ? "000f0000" + "00080000" + "00000000" + "01818807" : row.stdout;
       if (["events-52", "events-53", "events-54"].includes(name)) {
         const policyStdout = "9fffffffffffffff" + "00".repeat(24);
         check(row.policy_exception === "AF_INET/AF_INET6 unavailable: EAFNOSUPPORT" && row.policy_stdout === policyStdout, `${name}: missing network policy boundary`);

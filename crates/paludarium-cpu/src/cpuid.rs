@@ -24,6 +24,13 @@ const SIGNATURE: u32 = 0xf00;
 /// MMX is not implemented, but a program of this architecture may use it
 /// without asking, so saying so changes nothing for it.
 const BASELINE: u32 = 1 | 1 << 8 | 1 << 15 | 1 << 23 | 1 << 24 | 1 << 25 | 1 << 26;
+/// `CLFLUSH`, which every x86-64 CPU has too and the CPU runs, and which
+/// HotSpot refuses to start without. There is no cache, so it flushes
+/// nothing.
+const CLFSH: u32 = 1 << 19;
+/// Leaf 1's EBX with the line `CLFLUSH` flushes, in 8-byte units, as a CPU
+/// that has it says: 64 bytes, the one size HotSpot accepts.
+const CLFLUSH_LINE: u32 = 8 << 8;
 
 pub(crate) fn values(leaf: u32, _subleaf: u32) -> [u32; 4] {
     match leaf {
@@ -36,7 +43,7 @@ pub(crate) fn values(leaf: u32, _subleaf: u32) -> [u32; 4] {
             u32::from_le_bytes(*b"cAMD"),
             u32::from_le_bytes(*b"enti"),
         ],
-        1 => [SIGNATURE, 0, 0, BASELINE],
+        1 => [SIGNATURE, CLFLUSH_LINE, 0, BASELINE | CLFSH],
         0x8000_0000 => [0x8000_0001, 0, 0, 0],
         0x8000_0001 => [0, 0, 0, 1 << 29],
         // Partial target subsets never advertise a complete feature family.

@@ -23,8 +23,8 @@ import subprocess
 import sys
 import time
 
-# Even if every case ran out its time, the cases would end in about 160
-# minutes (116 cases on 4 workers, 330 s each), within the workflow's 180 with
+# Even if every case ran out its time, the cases would end in about 165
+# minutes (119 cases on 4 workers, 330 s each), within the workflow's 180 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
 # ended. The slowest cases, Emacs and g++, took up to 180 s under the emulator
@@ -426,10 +426,18 @@ def cases(fx):
 def runtimes(shell):
     """Language runtimes with their own threads, memory management or JIT, and
     servers on the loopback."""
-    # Left out until paludarium handles them: Java and Erlang, since the CLI
-    # runs the first program as /<file name> (Java's $ORIGIN) and only an ELF
-    # one (erl is a script).
     return {
+        # java finds libjli.so from its own path ($ORIGIN), and erl is a script.
+        # The class is compiled by the Dockerfile.
+        "java": ["/usr/bin/java", "-cp", "/opt/java", "Threads"],
+        "erlang": [
+            "/usr/bin/erl",
+            "-noshell",
+            "-eval",
+            "Self = self(), [spawn(fun() -> Self ! {sq, N * N} end) || N <- lists:seq(1, 5)], "
+            "L = [receive {sq, V} -> V end || _ <- lists:seq(1, 5)], "
+            'io:format("~p ~p~n", [lists:sort(L), lists:sum([X * X || X <- lists:seq(1, 100)])]), halt().',
+        ],
         "sbcl": [
             "/usr/bin/sbcl",
             "--non-interactive",

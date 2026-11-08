@@ -12,7 +12,7 @@
 //! `tty_pair_get_tty` makes them. The terminal keeps its session and
 //! foreground group; [`crate::processes::Processes`] keeps which terminal
 //! controls each process (Linux's `signal->tty`).
-use crate::events::{IN, NONBLOCK, OUT, ReadinessHub};
+use crate::events::{IN, NONBLOCK, OUT, PRI, ReadinessHub};
 use crate::processes::Processes;
 use crate::syscalls::Context;
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat};
@@ -33,6 +33,15 @@ const SIGTSTP: i32 = 20;
 const SIGTTIN: i32 = 21;
 const SIGTTOU: i32 = 22;
 const SIGWINCH: i32 = 28;
+
+/// `TIOCPKT_*`: the events a master in packet mode reads.
+const TIOCPKT_FLUSHREAD: u8 = 1;
+const TIOCPKT_FLUSHWRITE: u8 = 2;
+const TIOCPKT_STOP: u8 = 4;
+const TIOCPKT_START: u8 = 8;
+const TIOCPKT_NOSTOP: u8 = 0x10;
+const TIOCPKT_DOSTOP: u8 = 0x20;
+const TIOCPKT_IOCTL: u8 = 0x40;
 
 /// `kernel.pty.max`: how many pairs may be open at once.
 const PTY_MAX: usize = 4096;
@@ -150,6 +159,17 @@ impl Termios {
         ispeed: 38400,
         ospeed: 38400,
     };
+    /// Nothing locked: a new slave's `termios_locked`.
+    const ZERO: Self = Self {
+        iflag: 0,
+        oflag: 0,
+        cflag: 0,
+        lflag: 0,
+        line: 0,
+        cc: [0; 19],
+        ispeed: 0,
+        ospeed: 0,
+    };
     /// The master's control characters, `INIT_C_CC`, which `TCXONC` sends.
     const MASTER_CC: [u8; 19] = Self::SLAVE.cc;
     /// `struct termios`, or with `long` `struct termios2`.
@@ -166,11 +186,41 @@ impl Termios {
         }
         bytes
     }
+    /// `struct termio` (`TCGETA`): the low 16 bits of each flag, the line
+    /// discipline and the first 8 control characters, as Linux's
+    /// `kernel_termios_to_user_termio`.
+    fn termio(&self) -> [u8; 18] {
+        let mut bytes = [0; 18];
+        for (i, flag) in [self.iflag, self.oflag, self.cflag, self.lflag]
+            .into_iter()
+            .enumerate()
+        {
+            bytes[i * 2..i * 2 + 2].copy_from_slice(&(flag as u16).to_le_bytes());
+        }
+        bytes[8] = self.line;
+        bytes[9..17].copy_from_slice(&self.cc[..8]);
+        bytes
+    }
+    /// The `struct termios` that `TCSETA`'s `struct termio` makes of
+    /// `self`, as Linux's `user_termio_to_kernel_termios`: the high bits of
+    /// the flags and the other control characters stay.
+    fn with_termio(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut new = *self;
+        let half = |i: usize| u32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+        new.iflag = self.iflag & 0xffff_0000 | half(0);
+        new.oflag = self.oflag & 0xffff_0000 | half(2);
+        new.cflag = self.cflag & 0xffff_0000 | half(4);
+        new.lflag = self.lflag & 0xffff_0000 | half(6);
+        new.line = bytes[8];
+        new.cc[..8].copy_from_slice(&bytes[9..17]);
+        new.encode(false)
+    }
     /// What `TCSETS` (36 bytes) or `TCSETS2` (44) sets over `self`, as
-    /// Linux's `set_termios`: the speeds follow the `CBAUD` codes, and a
+    /// Linux's `set_termios`: the speeds follow the `CBAUD` codes, what
+    /// `locked` holds stays as it was (`unset_locked_termios`), and a
     /// pseudo-terminal keeps `CS8 | CREAD` without parity
     /// (`pty_set_termios`).
-    fn decoded(&self, bytes: &[u8]) -> Self {
+    fn decoded(&self, bytes: &[u8], locked: &Self) -> Self {
         let word =
             |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
         let mut new = *self;
@@ -186,6 +236,24 @@ impl Termios {
         }
         new.ispeed = new.input_speed();
         new.ospeed = new.output_speed();
+        // As on Linux, the speeds come from the request before the lock
+        // applies: `set_termios` sets them, then `tty_set_termios` calls
+        // `unset_locked_termios`, which leaves them ("FIXME: What should we
+        // do for i/ospeed"), so a locked `CBAUD` keeps the old code while
+        // the speeds follow the request.
+        let keep = |new: u32, old: u32, locked: u32| new & !locked | old & locked;
+        new.iflag = keep(new.iflag, self.iflag, locked.iflag);
+        new.oflag = keep(new.oflag, self.oflag, locked.oflag);
+        new.cflag = keep(new.cflag, self.cflag, locked.cflag);
+        new.lflag = keep(new.lflag, self.lflag, locked.lflag);
+        if locked.line != 0 {
+            new.line = self.line;
+        }
+        for (i, &lock) in locked.cc.iter().enumerate() {
+            if lock != 0 {
+                new.cc[i] = self.cc[i];
+            }
+        }
         new.cflag = (new.cflag & !(CSIZE | PARENB)) | CS8 | CREAD;
         new
     }
@@ -276,6 +344,13 @@ struct State {
     session: Option<u32>,
     pgrp: Option<u32>,
     exclusive: bool,
+    /// `TIOCSLCKTRMIOS`: the slave's bits and characters that stay.
+    locked_termios: Termios,
+    /// `TIOCPKT`: the master reads in packet mode.
+    packet: bool,
+    /// The slave's `ctrl.pktstatus`: the `TIOCPKT_*` events the master has
+    /// not read yet.
+    pktstatus: u8,
     /// The slave's inode: owner, group and mode.
     uid: u32,
     gid: u32,
@@ -338,6 +413,9 @@ impl State {
             session: None,
             pgrp: None,
             exclusive: false,
+            locked_termios: Termios::ZERO,
+            packet: false,
+            pktstatus: 0,
             uid,
             gid: TTY_GROUP,
             mode: SLAVE_MODE,
@@ -734,6 +812,7 @@ impl State {
         if !self.local(NOFLSH) {
             self.echoes.clear();
             self.reset();
+            self.packet_event(TIOCPKT_FLUSHWRITE | TIOCPKT_FLUSHREAD, 0);
         }
         if self.input(IXON) {
             self.start();
@@ -742,9 +821,21 @@ impl State {
             self.echo_char(c);
         }
     }
+    /// Notes `set` (clearing `clear`) for a master in packet mode, which
+    /// wakes it, as `pty_stop`, `pty_start`, `pty_flush_buffer`,
+    /// `n_tty_packet_mode_flush` and `pty_set_termios` do.
+    fn packet_event(&mut self, set: u8, clear: u8) {
+        if self.packet {
+            self.pktstatus = self.pktstatus & !clear | set;
+            self.edge(MASTER_IN);
+        }
+    }
     /// `stop_tty`.
     fn stop(&mut self) {
-        self.flow.stopped = true;
+        if !self.flow.stopped {
+            self.flow.stopped = true;
+            self.packet_event(TIOCPKT_STOP, TIOCPKT_START);
+        }
     }
     /// `start_tty`: the held echoes go out.
     fn start(&mut self) {
@@ -752,6 +843,7 @@ impl State {
             return;
         }
         self.flow.stopped = false;
+        self.packet_event(TIOCPKT_START, TIOCPKT_STOP);
         self.flush_echoes();
         self.edge(SLAVE_OUT);
     }
@@ -942,6 +1034,25 @@ impl State {
     fn set_termios(&mut self, termios: Termios) {
         let old = self.termios;
         self.termios = termios;
+        // `pty_set_termios`: whether ^S and ^Q now stop and start output.
+        let flow = |t: &Termios| t.iflag & IXON != 0 && t.cc[VSTOP] == 0o23 && t.cc[VSTART] == 0o21;
+        let extproc = (old.lflag | termios.lflag) & EXTPROC != 0;
+        if flow(&old) != flow(&termios) || extproc {
+            let mut set = 0;
+            let mut clear = 0;
+            if flow(&old) != flow(&termios) {
+                clear = TIOCPKT_DOSTOP | TIOCPKT_NOSTOP;
+                set = if flow(&termios) {
+                    TIOCPKT_DOSTOP
+                } else {
+                    TIOCPKT_NOSTOP
+                };
+            }
+            if extproc {
+                set |= TIOCPKT_IOCTL;
+            }
+            self.packet_event(set, clear);
+        }
         if (old.lflag ^ termios.lflag) & (ICANON | EXTPROC) != 0 {
             for cell in &mut self.read {
                 cell.end = false;
@@ -1385,15 +1496,28 @@ impl Master {
     fn read_once(&self, out: &mut [u8]) -> Result<usize, Errno> {
         let terminal = &self.terminal;
         let mut state = terminal.lock();
+        // In packet mode the events come first, a byte alone; data comes
+        // after a 0 byte (`TIOCPKT_DATA`), as Linux's `n_tty_read`.
+        if state.packet && state.pktstatus != 0 {
+            out[0] = std::mem::take(&mut state.pktstatus);
+            return Ok(1);
+        }
         if !state.output.is_empty() {
-            let n = out.len().min(state.output.len());
-            for (slot, byte) in out.iter_mut().zip(state.output.drain(..n)) {
+            let (head, rest) = if state.packet {
+                let (head, rest) = out.split_at_mut(1);
+                head[0] = 0;
+                (1, rest)
+            } else {
+                (0, out)
+            };
+            let n = rest.len().min(state.output.len());
+            for (slot, byte) in rest.iter_mut().zip(state.output.drain(..n)) {
                 *slot = byte;
             }
             state.edge(SLAVE_OUT);
             drop(state);
             terminal.hub.changed();
-            return Ok(n);
+            return Ok(head + n);
         }
         if state.other_closed {
             return Err(EIO);
@@ -1666,6 +1790,14 @@ fn terminal_ioctl(
     const TIOCGPTLCK: u32 = 0x8004_5439;
     const TIOCGEXCL: u32 = 0x8004_5440;
     const TIOCGPTPEER: u32 = 0x5441;
+    const TCGETA: u32 = 0x5405;
+    const TCSETA: u32 = 0x5406;
+    const TCSETAW: u32 = 0x5407;
+    const TCSETAF: u32 = 0x5408;
+    const TIOCPKT: u32 = 0x5420;
+    const TIOCGPKT: u32 = 0x8004_5438;
+    const TIOCGLCKTRMIOS: u32 = 0x5456;
+    const TIOCSLCKTRMIOS: u32 = 0x5457;
     let terminal = Arc::clone(side.terminal());
     let master = matches!(side, Side::Master(_));
     // A hung-up slave answers only these (`hung_up_tty_ioctl`).
@@ -1690,21 +1822,36 @@ fn terminal_ioctl(
             let bytes = terminal.lock().termios.encode(request == TCGETS2);
             write_bytes(c, arg, &bytes)
         }
-        TCSETS | TCSETSW | TCSETSF | TCSETS2 | TCSETSW2 | TCSETSF2 => {
+        TCGETA => write_bytes(c, arg, &terminal.lock().termios.termio()),
+        TCSETS | TCSETSW | TCSETSF | TCSETS2 | TCSETSW2 | TCSETSF2 | TCSETA | TCSETAW | TCSETAF => {
             check_change(c, &terminal, SIGTTOU)?;
+            let termio = matches!(request, TCSETA | TCSETAW | TCSETAF);
             let long = request >= TCSETS2;
-            let mut bytes = vec![0; if long { 44 } else { 36 }];
+            let mut bytes = vec![
+                0;
+                if termio {
+                    18
+                } else if long {
+                    44
+                } else {
+                    36
+                }
+            ];
             c.mem
                 .read(GuestAddr(arg), &mut bytes)
                 .map_err(|_| Errno::EFAULT)?;
             let mut signals = Vec::new();
             {
                 let mut state = terminal.lock();
-                if matches!(request, TCSETSF | TCSETSF2) {
+                if matches!(request, TCSETSF | TCSETSF2 | TCSETAF) {
                     state.reset();
+                    state.packet_event(TIOCPKT_FLUSHREAD, 0);
                     state.receive(&mut signals);
                 }
-                let termios = state.termios.decoded(&bytes);
+                if termio {
+                    bytes = state.termios.with_termio(&bytes);
+                }
+                let termios = state.termios.decoded(&bytes, &state.locked_termios);
                 state.set_termios(termios);
             }
             terminal.hub.changed();
@@ -1786,6 +1933,44 @@ fn terminal_ioctl(
                 .leave_terminal(c.process.pid, &terminal)
                 .map(|()| 0)
         }
+        // The slave's, whichever side asks (`tty_mode_ioctl`'s `real_tty`).
+        TIOCGLCKTRMIOS => {
+            let bytes = terminal.lock().locked_termios.encode(false);
+            write_bytes(c, arg, &bytes)
+        }
+        TIOCSLCKTRMIOS => {
+            if !admin {
+                return Err(Errno::EPERM);
+            }
+            let mut bytes = [0; 36];
+            c.mem
+                .read(GuestAddr(arg), &mut bytes)
+                .map_err(|_| Errno::EFAULT)?;
+            let mut state = terminal.lock();
+            let locked = state.locked_termios;
+            let mut new = locked;
+            let word =
+                |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+            (new.iflag, new.oflag, new.cflag, new.lflag) = (word(0), word(4), word(8), word(12));
+            new.line = bytes[16];
+            new.cc.copy_from_slice(&bytes[17..36]);
+            state.locked_termios = new;
+            Ok(0)
+        }
+        // `pty_set_pktmode`: turning it on forgets the events so far.
+        TIOCPKT if master => {
+            let on = read_int(c, arg)? != 0;
+            let mut state = terminal.lock();
+            if on && !state.packet {
+                state.pktstatus = 0;
+            }
+            state.packet = on;
+            Ok(0)
+        }
+        TIOCGPKT if master => {
+            let on = i32::from(terminal.lock().packet);
+            write_bytes(c, arg, &on.to_le_bytes())
+        }
         TIOCGPTN if master => write_bytes(c, arg, &terminal.index.to_le_bytes()),
         TIOCSPTLCK if master => {
             let locked = read_int(c, arg)? != 0;
@@ -1825,7 +2010,7 @@ fn terminal_ioctl(
             }
         }
         TIOCGDEV => {
-            let device = encode_new(SLAVE_MAJOR as u32, terminal.index);
+            let device = terminal.device();
             write_bytes(c, arg, &device.to_le_bytes())
         }
         TIOCEXCL | TIOCNXCL => {
@@ -1854,25 +2039,33 @@ fn terminal_ioctl(
             let mut signals = Vec::new();
             {
                 let mut state = terminal.lock();
-                let flow = if master {
-                    &mut state.master_flow
+                let tco = if master {
+                    state.master_flow.tco
                 } else {
-                    &mut state.flow
+                    state.flow.tco
                 };
                 match arg {
-                    // TCOOFF, TCOON
-                    0 => {
-                        flow.tco = true;
-                        flow.stopped = true;
-                    }
-                    1 => {
-                        flow.tco = false;
+                    // TCOOFF, TCOON: only what TCOOFF stopped starts again.
+                    0 if !tco => {
                         if master {
-                            state.master_flow.stopped = false;
+                            state.master_flow = Flow {
+                                stopped: true,
+                                tco: true,
+                            };
                         } else {
+                            state.flow.tco = true;
+                            state.stop();
+                        }
+                    }
+                    1 if tco => {
+                        if master {
+                            state.master_flow = Flow::default();
+                        } else {
+                            state.flow.tco = false;
                             state.start();
                         }
                     }
+                    0 | 1 => {}
                     // TCIOFF, TCION: the STOP or START character goes to
                     // the other side.
                     2 | 3 => {
@@ -1918,9 +2111,15 @@ fn terminal_ioctl(
                     if output {
                         state.pending.clear();
                     }
-                } else if input {
-                    state.pending.clear();
-                    state.reset();
+                } else {
+                    if input {
+                        state.pending.clear();
+                        state.reset();
+                        state.packet_event(TIOCPKT_FLUSHREAD, 0);
+                    }
+                    if output {
+                        state.packet_event(TIOCPKT_FLUSHWRITE, 0);
+                    }
                 }
                 for edge in [SLAVE_OUT, MASTER_OUT] {
                     state.edge(edge);
@@ -1970,6 +2169,20 @@ fn terminal_ioctl(
     }
 }
 
+/// `tty_nr` and `tpgid` of `/proc/<pid>/stat` for a process controlled by
+/// `terminal`: the slave's device and its foreground group (0 for none);
+/// 0 and -1 for no terminal.
+pub(crate) fn stat_fields(terminal: Option<&Terminal>) -> (u32, i32) {
+    terminal.map_or((0, -1), |t| {
+        (t.device(), t.foreground().map_or(0, u32::cast_signed))
+    })
+}
+impl Terminal {
+    /// The slave's device number, `new_encode_dev` as `TIOCGDEV` gives it.
+    fn device(&self) -> u32 {
+        encode_new(SLAVE_MAJOR as u32, self.index)
+    }
+}
 /// Linux's `new_encode_dev`, as `TIOCGDEV` gives it.
 fn encode_new(major: u32, minor: u32) -> u32 {
     (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
@@ -1996,6 +2209,9 @@ impl FileHandle for Master {
         let mut mask = 0;
         if !state.output.is_empty() {
             mask |= IN | 0x40;
+        }
+        if state.packet && state.pktstatus != 0 {
+            mask |= IN | PRI | 0x40;
         }
         if state.other_closed {
             mask |= 0x10;
@@ -2208,12 +2424,73 @@ mod tests {
     }
 
     #[test]
+    fn termio_and_locked_termios() {
+        let termios = Termios::SLAVE;
+        let termio = termios.termio();
+        assert_eq!(termio[0..2], (ICRNL as u16 | IXON as u16).to_le_bytes());
+        assert_eq!(termio[9..17], termios.cc[..8]);
+        let mut changed = termio;
+        changed[6..8].copy_from_slice(&0u16.to_le_bytes());
+        changed[9] = 1;
+        let mut high = termios;
+        high.lflag |= EXTPROC;
+        high.cc[VEOL2] = 7;
+        let set = high.decoded(&high.with_termio(&changed), &Termios::ZERO);
+        assert_eq!((set.lflag, set.cc[VINTR], set.cc[VEOL2]), (EXTPROC, 1, 7));
+        // What is locked stays: ECHO, the line and VINTR.
+        let mut locked = Termios::ZERO;
+        locked.lflag = ECHO;
+        locked.line = 1;
+        locked.cc[VINTR] = 1;
+        let mut bytes = termios.encode(false);
+        bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+        bytes[16] = 5;
+        bytes[17] = 9;
+        bytes[17 + VQUIT] = 9;
+        let set = termios.decoded(&bytes, &locked);
+        assert_eq!((set.lflag, set.line), (ECHO, 0));
+        assert_eq!((set.cc[VINTR], set.cc[VQUIT]), (3, 9));
+        // A locked CBAUD keeps B38400 in cflag; the speeds follow B9600.
+        let mut speed = Termios::ZERO;
+        speed.cflag = CBAUD;
+        let mut bytes = termios.encode(false);
+        bytes[8..12].copy_from_slice(&(0o15 | CS8 | CREAD).to_le_bytes());
+        let set = termios.decoded(&bytes, &speed);
+        assert_eq!(
+            (set.cflag & CBAUD, set.ospeed, set.ispeed),
+            (B38400, 9600, 9600)
+        );
+    }
+
+    #[test]
+    fn packet_events() {
+        let mut state = State::new(0);
+        state.stop();
+        assert_eq!(state.pktstatus, 0);
+        state.start();
+        state.packet = true;
+        state.stop();
+        state.stop();
+        assert_eq!(state.pktstatus, TIOCPKT_STOP);
+        state.start();
+        assert_eq!(state.pktstatus, TIOCPKT_START);
+        let mut termios = state.termios;
+        termios.iflag &= !IXON;
+        state.set_termios(termios);
+        assert_eq!(state.pktstatus, TIOCPKT_START | TIOCPKT_NOSTOP);
+        termios.lflag |= EXTPROC;
+        state.pktstatus = 0;
+        state.set_termios(termios);
+        assert_eq!(state.pktstatus, TIOCPKT_IOCTL);
+    }
+
+    #[test]
     fn termios_speeds_and_fixed_control_flags() {
         let termios = Termios::SLAVE;
         let mut bytes = termios.encode(false);
         // B9600 with parity and 7 bits.
         bytes[8..12].copy_from_slice(&(0o15u32 | 0o400 | 0o40).to_le_bytes());
-        let set = termios.decoded(&bytes);
+        let set = termios.decoded(&bytes, &Termios::ZERO);
         assert_eq!((set.ispeed, set.ospeed), (9600, 9600));
         assert_eq!(set.cflag, 0o15 | CS8 | CREAD);
         assert_eq!(termios.encode(true).len(), 44);

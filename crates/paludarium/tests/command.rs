@@ -77,12 +77,21 @@ fn emulator_errors_exit_with_seventy() {
     let dir = std::env::temp_dir().join(format!("paludarium-command-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("script");
-    std::fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
+    std::fs::write(&path, b"echo hi\n").unwrap();
     let out = binary().arg(&path).output().unwrap();
     assert_eq!(out.status.code(), Some(70));
     assert_eq!(
         out.stderr,
         b"paludarium: invalid-program: not an ELF file\n"
+    );
+    // A script outside every mount runs its interpreter, which the guest
+    // does not have without one.
+    std::fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
+    let out = binary().arg(&path).output().unwrap();
+    assert_eq!(out.status.code(), Some(70));
+    assert_eq!(
+        out.stderr,
+        b"paludarium: invalid-program: the script's interpreter was not found\n"
     );
 }
 
@@ -151,4 +160,104 @@ fn cli_empty_argument_is_preserved() {
     assert_eq!(out.stdout, [0]);
     assert!(out.stderr.is_empty());
     std::fs::remove_file(path).unwrap();
+}
+
+/// Writes `length` bytes from `argv[1]` on, then where `/proc/self/exe` leads.
+fn interpreter(length: u8) -> Vec<u8> {
+    #[rustfmt::skip]
+    let code = [
+        0x48, 0x8b, 0x74, 0x24, 0x10, // mov rsi, [rsp + 16]
+        0xb8, 1, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0xba, length, 0, 0, 0, 0x0f, 0x05, // write
+        0xb8, 89, 0, 0, 0, 0xbf, 0x00, 0x20, 0x40, 0x00, // readlink(data,
+        0xbe, 0x20, 0x20, 0x40, 0x00, 0xba, 64, 0, 0, 0, 0x0f, 0x05, // data + 32, 64)
+        0x89, 0xc2, 0xb8, 1, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0x0f, 0x05, // write
+        0xb8, 231, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05, // exit_group(0)
+    ];
+    let mut data = b"/proc/self/exe".to_vec();
+    data.resize(32 + 64, 0);
+    tiny_exec(&code, &data)
+}
+
+fn executable(path: &std::path::Path, content: &[u8]) {
+    std::fs::write(path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn cli_program_in_a_mount_runs_at_its_guest_path() {
+    let root = std::env::temp_dir().join(format!("paludarium-cli-mounted-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    executable(&root.join("bin/interp"), &interpreter(0));
+    executable(&root.join("run.sh"), b"#!/bin/interp -x\n");
+    let option = format!("{}:/", root.display());
+    let run = |program: &str, args: &[&str]| {
+        let out = binary()
+            .args(["--mount", &option])
+            .arg(root.join(program))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        out.stdout
+    };
+    // /proc/self/exe names the program where the guest finds it.
+    assert_eq!(run("bin/interp", &[]), b"/bin/interp");
+    assert_eq!(run("bin/./interp", &[]), b"/bin/interp");
+    // A script runs its interpreter with its guest path, as exec does.
+    executable(&root.join("bin/interp"), &interpreter(16));
+    #[cfg(unix)]
+    assert_eq!(run("run.sh", &["extra"]), b"-x\0/run.sh\0extra/bin/interp");
+    // A Windows host's files have no execute bits (0644), so an interpreter
+    // in a mount there may not be run.
+    #[cfg(windows)]
+    {
+        let out = binary()
+            .args(["--mount", &option])
+            .arg(root.join("run.sh"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(70));
+        assert_eq!(
+            out.stderr,
+            b"paludarium: invalid-program: the script's interpreter may not be run\n"
+        );
+    }
+    #[cfg(unix)]
+    {
+        // /proc/self/exe resolves the links on the way, as on Linux.
+        std::os::unix::fs::symlink("interp", root.join("bin/link")).unwrap();
+        executable(&root.join("bin/interp"), &interpreter(0));
+        assert_eq!(run("bin/link", &[]), b"/bin/interp");
+        // An absolute link names a guest path, which the host need not have.
+        std::os::unix::fs::symlink("/bin/interp", root.join("bin/absolute")).unwrap();
+        assert_eq!(run("bin/absolute", &[]), b"/bin/interp");
+    }
+    // Under a deeper mount the program has that mount's path.
+    std::fs::create_dir_all(root.join("opt/tools")).unwrap();
+    let deeper = format!("{}:/opt/tools", root.join("bin").display());
+    let out = binary()
+        .args(["--mount", &option, "--mount", &deeper])
+        .arg(root.join("bin/interp"))
+        .output()
+        .unwrap();
+    assert_eq!(out.stdout, b"/opt/tools/interp");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cli_missing_program_in_a_mount_is_a_usage_error() {
+    let root = std::env::temp_dir().join(format!("paludarium-cli-missing-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let out = binary()
+        .args(["--mount", &format!("{}:/", root.display())])
+        .arg(root.join("missing"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot read the program file"));
+    std::fs::remove_dir_all(root).unwrap();
 }

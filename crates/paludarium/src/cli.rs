@@ -13,6 +13,10 @@
 //!                     resolve it (repeatable; no network without it)
 //! ```
 //!
+//! A program inside a `--mount` runs at the guest path the mount gives it, as
+//! Linux's `execve` of that path would; any other is copied in at
+//! `/<file name>`. A `#!` script runs its interpreter.
+//!
 //! Exit codes: the guest's exit code; 128 + signal number when the guest was
 //! killed by a signal; 2 for usage errors and an unreadable program file; 70
 //! for a program that cannot be started and for errors of the emulator itself.
@@ -233,7 +237,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
     }))
 }
 
-/// The guest path a host program is placed at: `/<file name>`.
+/// The guest path a host program outside every mount is placed at:
+/// `/<file name>`.
 pub fn guest_path(program: &Path) -> Result<Vec<u8>, UsageError> {
     let name = program
         .file_name()
@@ -241,6 +246,86 @@ pub fn guest_path(program: &Path) -> Result<Vec<u8>, UsageError> {
     let mut path = b"/".to_vec();
     path.extend_from_slice(name.as_encoded_bytes());
     Ok(path)
+}
+
+/// The components of a guest path, without the empty ones and `.`; `None`
+/// for one with `..`.
+fn guest_components(path: &[u8]) -> Option<Vec<&[u8]>> {
+    let parts: Vec<&[u8]> = path
+        .split(|&b| b == b'/')
+        .filter(|part| !part.is_empty() && *part != b".")
+        .collect();
+    (!parts.contains(&&b".."[..])).then_some(parts)
+}
+
+/// The guest path at which `mount` shows the host file `program`, if the
+/// file lies inside its host directory: as the paths are written, or else
+/// with the symbolic links of the program's directory and of the host
+/// directory resolved (`/tmp` and `/private/tmp` on macOS). The program's own
+/// name stays a link, as exec of it names it.
+fn path_in_mount(program: &Path, mount: &Mount) -> Option<Vec<Vec<u8>>> {
+    let written = || {
+        let program = std::path::absolute(program).ok()?;
+        let host = std::path::absolute(&mount.host).ok()?;
+        program.strip_prefix(host).ok().map(Path::to_path_buf)
+    };
+    let resolved = || {
+        let name = program.file_name()?;
+        let parent = match program.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let program = std::fs::canonicalize(parent).ok()?.join(name);
+        let host = std::fs::canonicalize(&mount.host).ok()?;
+        program.strip_prefix(host).ok().map(Path::to_path_buf)
+    };
+    let relative = written().or_else(resolved)?;
+    let mut parts: Vec<Vec<u8>> = guest_components(&mount.guest)?
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.as_encoded_bytes().to_vec()),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(parts)
+}
+
+/// The guest path at which the mounts show the host file `program`, as Linux
+/// would run it from there, or `None` when no mount shows it. A path counts
+/// only from the mount the guest sees it through: the one with the deepest
+/// guest directory above it, and the later one of two at the same directory.
+pub fn mounted_path(program: &Path, mounts: &[Mount]) -> Option<Vec<u8>> {
+    let points: Vec<Option<Vec<&[u8]>>> = mounts
+        .iter()
+        .map(|mount| guest_components(&mount.guest))
+        .collect();
+    let covering = |parts: &[Vec<u8>]| {
+        points
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| point.as_ref().map(|point| (index, point)))
+            .filter(|(_, point)| {
+                point.len() <= parts.len() && point.iter().zip(parts).all(|(a, b)| *a == &b[..])
+            })
+            .max_by_key(|(index, point)| (point.len(), *index))
+            .map(|(index, _)| index)
+    };
+    mounts.iter().enumerate().rev().find_map(|(index, mount)| {
+        let parts = path_in_mount(program, mount)?;
+        if parts.len() == points[index].as_ref()?.len() || covering(&parts) != Some(index) {
+            return None;
+        }
+        Some(
+            parts
+                .iter()
+                .flat_map(|part| [&b"/"[..], part].concat())
+                .collect(),
+        )
+    })
 }
 
 fn signal_name(number: i32) -> String {
@@ -347,12 +432,27 @@ pub fn main_with(
         Err(e) => return usage_error(stderr, e),
     };
     let program_path = Path::new(&invocation.program);
-    let guest = match guest_path(program_path) {
-        Ok(p) => p,
-        Err(e) => return usage_error(stderr, e),
-    };
-    let Ok(content) = read_program_file(program_path) else {
-        return usage_error(stderr, UsageError("cannot read the program file"));
+    // A program a mount shows runs from there, as exec of its path in the
+    // guest would run it; any other is copied in at `/<file name>`.
+    let (guest, content) = match mounted_path(program_path, &invocation.mounts) {
+        Some(guest) => {
+            // A symbolic link is the guest's to follow: its target may be a
+            // guest path the host does not have.
+            if !std::fs::symlink_metadata(program_path).is_ok_and(|m| !m.is_dir()) {
+                return usage_error(stderr, UsageError("cannot read the program file"));
+            }
+            (guest, None)
+        }
+        None => {
+            let guest = match guest_path(program_path) {
+                Ok(p) => p,
+                Err(e) => return usage_error(stderr, e),
+            };
+            let Ok(content) = read_program_file(program_path) else {
+                return usage_error(stderr, UsageError("cannot read the program file"));
+            };
+            (guest, Some(content))
+        }
     };
     let mut argv = vec![invocation.program.as_encoded_bytes().to_vec()];
     argv.extend(
@@ -361,7 +461,10 @@ pub fn main_with(
             .iter()
             .map(|a| a.as_encoded_bytes().to_vec()),
     );
-    let mut config = Config::new(guest.clone(), argv).with_file(guest, content);
+    let mut config = Config::new(guest.clone(), argv);
+    if let Some(content) = content {
+        config = config.with_file(guest, content);
+    }
     config.env = invocation.env;
     config.mounts = invocation.mounts;
     config.limits = invocation.limits;
@@ -524,6 +627,57 @@ mod tests {
         assert_eq!(guest_path(Path::new("some/dir/hello")).unwrap(), b"/hello");
         assert_eq!(guest_path(Path::new("hello")).unwrap(), b"/hello");
         assert!(guest_path(Path::new("..")).is_err());
+    }
+
+    fn mount(host: &str, guest: &str) -> Mount {
+        Mount {
+            host: std::path::PathBuf::from(host),
+            guest: guest.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn mounted_path_maps_a_program_inside_a_mount() {
+        let at = |program: &str, mounts: &[Mount]| mounted_path(Path::new(program), mounts);
+        let root = std::path::absolute("/").unwrap();
+        let root = root.to_str().unwrap();
+        let usr = std::path::absolute("/usr").unwrap();
+        let usr = usr.to_str().unwrap();
+        let java = std::path::absolute("/usr/lib/jvm/bin/java").unwrap();
+        let java = java.to_str().unwrap();
+        assert_eq!(
+            at(java, &[mount(root, "/")]).as_deref(),
+            Some(&b"/usr/lib/jvm/bin/java"[..])
+        );
+        assert_eq!(
+            at(java, &[mount(usr, "/data/")]).as_deref(),
+            Some(&b"/data/lib/jvm/bin/java"[..])
+        );
+        // The guest sees the path through the deepest mount above it, the
+        // later of two at one directory.
+        let lib = std::path::absolute("/usr/lib").unwrap();
+        let lib = lib.to_str().unwrap();
+        assert_eq!(
+            at(java, &[mount(root, "/"), mount(lib, "/usr")]).as_deref(),
+            Some(&b"/usr/jvm/bin/java"[..])
+        );
+        assert_eq!(
+            at(java, &[mount(usr, "/x"), mount(lib, "/x")]).as_deref(),
+            Some(&b"/x/jvm/bin/java"[..])
+        );
+        assert_eq!(at(java, &[]), None);
+        // A mount's own directory, or a guest path with `..`, is not one.
+        // /x/jvm/bin/java through the first is the second's.
+        assert_eq!(
+            at(java, &[mount(lib, "/x"), mount(usr, "/x/jvm")]).as_deref(),
+            Some(&b"/x/jvm/lib/jvm/bin/java"[..])
+        );
+        assert_eq!(at(usr, &[mount(usr, "/x")]), None);
+        assert_eq!(at(java, &[mount(usr, "/x/../y")]), None);
+        // `..` names no file; Windows's `absolute` resolves it to a directory,
+        // which the command then refuses as a program.
+        #[cfg(unix)]
+        assert_eq!(at("..", &[mount(root, "/")]), None);
     }
 
     #[test]

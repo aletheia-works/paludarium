@@ -18,7 +18,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - 命令のデコードには [iced-x86](https://github.com/icedland/iced) を使っています。
 - `CPUID` はホストの値を見せません。glibc は知っているベンダーの機能しか読まないので、
   ベンダーには AMD を名乗ります。glibc が必須とするので、すべての x86-64 の CPU にある機能も
-  示します。そのうち FPU と MMX は実装していませんが、それ以外に実装していない機能は広告
+  示します。HotSpot が必須とするので、`CLFLUSH` とその 64 バイトの行も示します。
+  そのうち FPU と MMX は実装していませんが、それ以外に実装していない機能は広告
   しません。名乗りが変えるのはここだけです。`REP` のフォルト後のフラグなど、ベンダーで
   CPU の動きが違うところは、仮想 CPU 自身の動きのままです。
 - `RDTSC` と `RDTSCP` は仮想 CPU のカウンタを読みます。カウンタは時間ではなく読むたびに
@@ -45,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
@@ -475,7 +476,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   何も残らなければ `EINVAL` です。その後の `sched_getaffinity` はそのマスクを返し、新しい
   スレッドとプロセスはそれを継ぎます。ただし、ホストはそのスレッドをどの CPU でも動かします。
   どちらも、root と同じくほかのプロセスのスレッドも見つけ、その ID の生きているスレッドが
-  なければ `ESRCH` です。
+  なければ `ESRCH` です。`getcpu` は、スレッドのマスクが許すいちばん小さい番号の CPU と、
+  NUMA ノード 0 を返します。
 - `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、
   ホストのことは見せません。ゲストは root（ユーザーとグループが 0 で、すべての
   ケーパビリティを持つ）として始まります。Linux と同じく、資格情報はスレッドごとに
@@ -542,7 +544,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   最初の行（255 バイトまで）がインタプリタの名前と、任意の引数 1 つを示します。引数は、
   その名前、その引数、そして `argv[0]` の代わりにスクリプトのパスです。set-ID ビットは
   スクリプトではなくインタプリタのものが効きます。インタプリタもスクリプトでよく、
-  最初のスクリプトの 5 段下までです（それより深いと `ELOOP`）。Linux と同じく、
+  最初のスクリプトの 5 段下までです（それより深いと `ELOOP`）。最初のプログラムも
+  スクリプトでよく、同じように動きます。Linux と同じく、
   `chown` はディレクトリ以外のファイルから set-user-ID のビットを外します。
   set-group-ID のビットも、グループが実行できるとき、または呼んだ側がそのグループに
   属さず `CAP_FSETID` もないときに外します。持ち主とグループが変わらなくても外します。
@@ -631,7 +634,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
   持ちません。Linux と同じく、`cmdline` と `environ` は空で、`exe` と `cwd` は `ENOENT` です。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
-  `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、端末なし、
+  `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、
   スレッドの数、マッピングの大きさ、`RLIMIT_RSS` の上限、スタックとヒープの始まり、
   10 進数のシグナルの集合、`wchan`（Linux が root に見せるのと同じく、待っているタスクは
@@ -642,7 +645,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   それぞれ NUL で終わります。`comm` は名前と改行です。
 - `/proc/self/exe` と `/proc/self/cwd` はシンボリックリンク（0777、サイズ 0）で、それぞれ
   プロセスが動かしているプログラム（`execve` が読み込んだもので、シンボリックリンクは
-  たどった後のパス。最初のプログラムは CLI が与えるパスの `/<ファイル名>`）と、カレント
+  たどった後のパス。最初のプログラムは CLI が与えるパスで、`--mount` の中ならそのパス、ほかは
+  `/<ファイル名>`）と、カレント
   ディレクトリを指します。`stat` と `open` はたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。
 - `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime` は、Linux と同じ形式で `sysinfo` と
   合った値を返します。ロードアベレージは 0 で、動いているタスクと生きているタスクの数、
@@ -732,9 +736,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `IXANY`）、`ISIG` があれば `SIGINT`、`SIGQUIT`、`SIGTSTP` をフォアグラウンドの
     プロセスグループに送って、`NOFLSH` がなければ入力を捨てます。マスター側は
     バイトをそのまま渡します。
-  - `TCGETS`、`TCSETS`、`TCSETSW`、`TCSETSF` とその `termios2` 版（`TCGETS2`
-    など）は、どちらの側からでもスレーブの `termios` に届きます。`termios` は
-    パリティなしの `CS8 | CREAD` を保ち、速さは `CBAUD` か `BOTHER` から決めます。
+  - `TCGETS`、`TCSETS`、`TCSETSW`、`TCSETSF`、その `termios2` 版（`TCGETS2`
+    など）と古い `struct termio` 版（`TCGETA`、`TCSETA`、`TCSETAW`、`TCSETAF`。
+    各フラグの下位 16 ビットと最初の 8 文字を設定します）は、どちらの側からでも
+    スレーブの `termios` に届きます。`termios` はパリティなしの `CS8 | CREAD` を
+    保ち、速さは `CBAUD` か `BOTHER` から決め、`TIOCSLCKTRMIOS` でロックした部分は
+    変えません（ロックには `CAP_SYS_ADMIN` が要り、`TIOCGLCKTRMIOS` で読めます）。
+    `TIOCPKT` でマスターはパケットモードで読みます。スレーブのフラッシュ、出力の
+    停止と再開、`^S` と `^Q` で出力を止めるかどうか（と `EXTPROC`）の変化は、
+    状態のバイト 1 つだけで届き、`poll` には `POLLPRI` として見えます。データは
+    0 のバイトの後に続きます。`TIOCGPKT` はモードを返します。
     `TIOCGWINSZ` と `TIOCSWINSZ`（変わるとフォアグラウンドのグループに `SIGWINCH`
     を送ります）、`FIONREAD`、`TIOCOUTQ`、`TCFLSH`、`TCXONC`、`TCSBRK`、`TIOCEXCL`、
     `TIOCGEXCL`、`TIOCGETD` と `TIOCSETD`（N_TTY だけ）、`TIOCGDEV`、`TIOCSIG` は

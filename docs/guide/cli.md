@@ -10,8 +10,23 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
            [--allow-net HOST[:PORT]]... <program> [args...]
 ```
 
-- `<program>` is a file on the host. Inside the guest it is placed at
-  `/<file name>`, and `argv[0]` is the string you gave.
+- `<program>` is a file on the host, and `argv[0]` is the string you gave.
+  When it lies inside a `--mount` host directory, the guest runs it from
+  there, at the path the mount gives it, as Linux's `execve` of that path
+  would: `/proc/self/exe`, `AT_EXECFN` and so the dynamic loader's `$ORIGIN`
+  name it there (with `--mount /:/`, `/usr/bin/java` runs as
+  `/usr/bin/java`). It counts as inside when its path, as written or with
+  the symbolic links of its directory and of the host directory resolved,
+  starts with the host directory, and only through the mount the guest sees
+  that path through (the one with the deepest guest directory above it).
+  Any other program is copied into the guest at `/<file name>`.
+- A program that starts with `#!` is a script and runs its interpreter, as
+  `execve` runs one ([System calls](./features#system-calls)). The interpreter is a
+  guest path, so the script needs a `--mount` that shows it (`#!/bin/sh` with
+  `--mount /:/`). On a Windows host the files of a mount have no execute
+  bits (mode `0644`), so neither an interpreter nor any other program in a
+  mount may be run from the guest (`EACCES`); only the program given on the
+  command line starts.
 - `--env KEY=VALUE` (or `--env=KEY=VALUE`) adds an environment variable.
   Repeat it for more.
 - `--mount HOST:GUEST` (or `--mount=HOST:GUEST`) shows one host directory to
@@ -55,9 +70,10 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 | 70 | the guest could not be started, or an error of the emulator itself (`EX_SOFTWARE`) |
 
 The guest cannot be started when, for example, the program is not an ELF file
-paludarium can load, it does not fit in `--max-memory`, or a `--mount` host
-directory cannot be opened. A `paludarium:` line on standard error then names
-the kind of the error, such as `invalid-program` or `host`.
+paludarium can load nor a script whose interpreter is one, it does not fit in
+`--max-memory`, or a `--mount` host directory cannot be opened. A
+`paludarium:` line on standard error then names the kind of the error, such as
+`invalid-program` or `host`.
 
 ## Finding what is missing
 

@@ -18,8 +18,12 @@ RUN apt-get update \
 COPY scripts/goroutines.go /opt/go/goroutines.go
 RUN cd /opt/go && GOCACHE=/tmp/go-cache CGO_ENABLED=0 go build -o /usr/local/bin/goroutines goroutines.go \
  && rm -rf /tmp/go-cache
-# Language runtimes and servers the runtimes() cases run.
+# Language runtimes and servers the runtimes() cases run, and a Java class
+# compiled here, natively, like the Go program.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    fish graphviz guile-3.0 imagemagick luajit memcached nginx ocaml pandoc postgresql r-base-core sbcl socat \
+    default-jdk-headless erlang-nox fish graphviz guile-3.0 imagemagick luajit memcached nginx \
+    ocaml pandoc postgresql r-base-core sbcl socat \
  && rm -rf /var/lib/apt/lists/*
+COPY scripts/Threads.java /opt/java/Threads.java
+RUN cd /opt/java && javac Threads.java

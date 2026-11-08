@@ -421,6 +421,11 @@ def cases(fx):
 def runtimes(shell):
     """Language runtimes with their own threads, memory management or JIT, and
     servers on the loopback."""
+    # Left out until paludarium handles them: Java and Erlang, since the CLI
+    # runs the first program as /<file name> (Java's $ORIGIN) and only an ELF
+    # one (erl is a script); fish, whose command substitution fails with EBADF
+    # from fcntl; and PostgreSQL, whose data directory must belong to postgres,
+    # which a host mount cannot give it.
     return {
         "sbcl": [
             "/usr/bin/sbcl",

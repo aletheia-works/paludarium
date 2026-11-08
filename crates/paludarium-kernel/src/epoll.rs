@@ -7,6 +7,9 @@ use paludarium_types::{Errno, GuestAddr};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+/// `O_PATH`: only a path, not an open file.
+const O_PATH: u32 = 0o10000000;
+
 const ET: u32 = 1 << 31;
 const ONESHOT: u32 = 1 << 30;
 struct Interest {
@@ -259,7 +262,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             // The target as Linux's `fdget` takes it: an `O_PATH` one is
             // not a file to watch (EBADF).
             let target = c.files.descriptor(a[2])?;
-            if target.file.flags() & 0o10000000 != 0 {
+            if target.file.flags() & O_PATH != 0 {
                 return Err(Errno::EBADF);
             }
             let (events, data) = if a[1] == 2 {

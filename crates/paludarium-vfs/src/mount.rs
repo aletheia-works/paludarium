@@ -318,17 +318,24 @@ impl HostFs for MountedFs {
         self.raw_readlink(&self.resolve(p, false, false)?)
     }
     fn rename(&self, a: &[u8], b: &[u8]) -> Result<(), Errno> {
+        self.rename_with(a, b, 0)
+    }
+    fn rename_with(&self, a: &[u8], b: &[u8], flags: u32) -> Result<(), Errno> {
         self.require_trailing_directory(a)?;
+        if flags & 2 != 0 {
+            self.require_trailing_directory(b)?;
+        }
         let a = self.resolve(a, false, false)?;
-        let b = self.resolve(b, false, true)?;
+        let b = self.resolve(b, false, flags & 2 == 0)?;
         let (i, fs, old) = self.route(&a)?;
         let (j, _, new) = self.route(&b)?;
         if i != j {
             return Err(Errno(18));
         }
         let old_inode = fs.metadata(&old, false)?.inode;
-        let replaced = fs.metadata(&new, false).ok();
-        fs.rename(&old, &new)?;
+        // An exchange keeps both files, and a refused replacement neither.
+        let replaced = fs.metadata(&new, false).ok().filter(|_| flags == 0);
+        fs.rename_with(&old, &new, flags)?;
         if let Some(s) = replaced
             && s.inode != old_inode
             && s.links <= 1

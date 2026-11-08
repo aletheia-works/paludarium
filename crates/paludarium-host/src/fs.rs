@@ -136,6 +136,16 @@ pub trait HostFs: Send + Sync {
     fn symlink(&self, target: &[u8], path: &[u8]) -> Result<(), Errno>;
     fn readlink(&self, path: &[u8]) -> Result<Vec<u8>, Errno>;
     fn rename(&self, old: &[u8], new: &[u8]) -> Result<(), Errno>;
+    /// `renameat2` with `flags`: `RENAME_NOREPLACE` (1) refuses to replace
+    /// a file (`EEXIST`) and `RENAME_EXCHANGE` (2) swaps the two names. A
+    /// filesystem without them gives `EINVAL`, as Linux's do.
+    fn rename_with(&self, old: &[u8], new: &[u8], flags: u32) -> Result<(), Errno> {
+        if flags == 0 {
+            self.rename(old, new)
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
     fn read_dir(&self, path: &[u8]) -> Result<Vec<DirectoryEntry>, Errno>;
     /// `statfs`: the filesystem that holds `path` (which must exist).
     fn statfs(&self, _path: &[u8]) -> Result<FsStats, Errno> {

@@ -218,6 +218,7 @@ NAMES = {
     297: "rt_tgsigqueueinfo",
     302: "prlimit64",
     309: "getcpu",
+    316: "renameat2",
     318: "getrandom",
     319: "memfd_create",
     325: "mlock2",

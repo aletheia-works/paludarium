@@ -429,3 +429,31 @@ fn a_socket_file_is_made_once_and_opens_nothing() {
     assert_eq!(fs.metadata(b"/t", true).unwrap().inode, made.inode);
     fs.unlink(b"/t", false).unwrap();
 }
+#[test]
+fn rename_without_replacing_and_exchanging() {
+    let fs = MemFs::new();
+    let a = fs.open(b"/a", 66, 0o644).unwrap();
+    a.write(b"abc").unwrap();
+    fs.open(b"/b", 66, 0o644).unwrap();
+    let size = |p: &[u8]| fs.metadata(p, false).map(|s| s.size);
+    assert_eq!(fs.rename_with(b"/a", b"/b", 1), Err(Errno::EEXIST));
+    assert_eq!(fs.rename_with(b"/a", b"/c", 2), Err(Errno::ENOENT));
+    assert_eq!(fs.rename_with(b"/a", b"/b", 4), Err(Errno::EINVAL));
+    assert_eq!(fs.rename_with(b"/a", b"/b", 3), Err(Errno::EINVAL));
+    fs.rename_with(b"/a", b"/c", 1).unwrap();
+    fs.rename_with(b"/c", b"/b", 2).unwrap();
+    assert_eq!((size(b"/b"), size(b"/c")), (Ok(3), Ok(0)));
+    // A directory swapped with a file in another directory moves its
+    // parent's link.
+    fs.mkdir(b"/d", 0o755).unwrap();
+    fs.mkdir(b"/d/e", 0o755).unwrap();
+    let links = |p: &[u8]| fs.metadata(p, false).unwrap().links;
+    let (root, d) = (links(b"/"), links(b"/d"));
+    fs.rename_with(b"/c", b"/d/e", 2).unwrap();
+    assert_eq!((links(b"/") - root, d - links(b"/d")), (1, 1));
+    assert_eq!(fs.metadata(b"/c", false).unwrap().mode & 0o170000, 0o040000);
+    // A directory may not swap with one inside it, either way round.
+    fs.mkdir(b"/c/f", 0o755).unwrap();
+    assert_eq!(fs.rename_with(b"/c", b"/c/f", 2), Err(Errno::EINVAL));
+    assert_eq!(fs.rename_with(b"/c/f", b"/c", 2), Err(Errno::EINVAL));
+}

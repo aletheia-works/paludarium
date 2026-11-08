@@ -572,6 +572,9 @@ impl HostFs for CoherentFs {
     fn rename(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
         self.inner.rename(old, new)
     }
+    fn rename_with(&self, old: &[u8], new: &[u8], flags: u32) -> Result<(), Errno> {
+        self.inner.rename_with(old, new, flags)
+    }
     fn read_dir(&self, path: &[u8]) -> Result<Vec<DirectoryEntry>, Errno> {
         self.inner.read_dir(path)
     }

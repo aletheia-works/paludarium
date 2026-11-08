@@ -23,7 +23,10 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 - A program that starts with `#!` is a script and runs its interpreter, as
   `execve` runs one ([System calls](./features#system-calls)). The interpreter is a
   guest path, so the script needs a `--mount` that shows it (`#!/bin/sh` with
-  `--mount /:/`).
+  `--mount /:/`). On a Windows host the files of a mount have no execute
+  bits (mode `0644`), so neither an interpreter nor any other program in a
+  mount may be run from the guest (`EACCES`); only the program given on the
+  command line starts.
 - `--env KEY=VALUE` (or `--env=KEY=VALUE`) adds an environment variable.
   Repeat it for more.
 - `--mount HOST:GUEST` (or `--mount=HOST:GUEST`) shows one host directory to

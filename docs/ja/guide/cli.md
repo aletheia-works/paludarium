@@ -22,7 +22,10 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
   `/<ファイル名>` に写して置きます。
 - `#!` で始まるプログラムはスクリプトで、`execve` と同じくインタプリタを動かします
   （[システムコール](./features#system-calls)）。インタプリタはゲストのパスなので、それを見せる
-  `--mount` が要ります（`#!/bin/sh` なら `--mount /:/`）。
+  `--mount` が要ります（`#!/bin/sh` なら `--mount /:/`）。Windows のホストでは、
+  マウントのファイルに実行のビットがない（モード `0644`）ので、マウントの中の
+  インタプリタもほかのプログラムも、ゲストからは実行できません（`EACCES`）。
+  起動できるのは、コマンドラインで指定したプログラムだけです。
 - `--env KEY=VALUE`（`--env=KEY=VALUE` とも書けます）は環境変数を足します。何度でも
   指定できます。
 - `--mount HOST:GUEST`（`--mount=HOST:GUEST` とも書けます）は、ホストのディレクトリを

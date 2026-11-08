@@ -209,7 +209,23 @@ fn cli_program_in_a_mount_runs_at_its_guest_path() {
     assert_eq!(run("bin/./interp", &[]), b"/bin/interp");
     // A script runs its interpreter with its guest path, as exec does.
     executable(&root.join("bin/interp"), &interpreter(16));
+    #[cfg(unix)]
     assert_eq!(run("run.sh", &["extra"]), b"-x\0/run.sh\0extra/bin/interp");
+    // A Windows host's files have no execute bits (0644), so an interpreter
+    // in a mount there may not be run.
+    #[cfg(windows)]
+    {
+        let out = binary()
+            .args(["--mount", &option])
+            .arg(root.join("run.sh"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(70));
+        assert_eq!(
+            out.stderr,
+            b"paludarium: invalid-program: the script's interpreter may not be run\n"
+        );
+    }
     #[cfg(unix)]
     {
         // /proc/self/exe resolves the links on the way, as on Linux.

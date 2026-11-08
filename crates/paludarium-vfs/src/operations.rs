@@ -250,8 +250,20 @@ impl HostFs for MemFs {
         }
     }
     fn rename(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
+        self.rename_with(old, new, 0)
+    }
+    /// `renameat2`'s `RENAME_NOREPLACE` (1) and `RENAME_EXCHANGE` (2);
+    /// `RENAME_WHITEOUT` and anything else is `EINVAL`, as for a Linux
+    /// filesystem without whiteouts.
+    fn rename_with(&self, old: &[u8], new: &[u8], flags: u32) -> Result<(), Errno> {
+        if flags & !3 != 0 || flags == 3 {
+            return Err(Errno::EINVAL);
+        }
         let mut t = lock(&self.tree);
         t.require_trailing_directory(old)?;
+        if flags == 2 {
+            t.require_trailing_directory(new)?;
+        }
         let (op, on) = t.parent(old)?;
         let (np, nn) = t.parent(new)?;
         let oa = t.node(op)?;
@@ -264,20 +276,49 @@ impl HostFs for MemFs {
             Kind::Dir(m) => m.get(&nn).copied(),
             _ => return Err(Errno::ENOTDIR),
         };
+        match (flags, dst) {
+            (1, Some(_)) => return Err(Errno::EEXIST),
+            (2, None) => return Err(Errno::ENOENT),
+            _ => {}
+        }
         if dst == Some(id) {
             return Ok(());
         }
         let src_dir = matches!(lock(&*t.node(id)?).kind, Kind::Dir(_));
-        if src_dir {
-            let mut ancestors = VecDeque::from([id]);
+        // A directory may not go into itself or below it.
+        let within = |t: &Tree, dir: u64, place: u64| -> Result<bool, Errno> {
+            let mut ancestors = VecDeque::from([dir]);
             while let Some(a) = ancestors.pop_front() {
-                if a == np {
-                    return Err(Errno::EINVAL);
+                if a == place {
+                    return Ok(true);
                 }
                 if let Kind::Dir(m) = &lock(&*t.node(a)?).kind {
                     ancestors.extend(m.values().copied())
                 }
             }
+            Ok(false)
+        };
+        if src_dir && within(&t, id, np)? {
+            return Err(Errno::EINVAL);
+        }
+        if flags == 2 {
+            let d = dst.ok_or(Errno::ENOENT)?;
+            let dst_dir = matches!(lock(&*t.node(d)?).kind, Kind::Dir(_));
+            if dst_dir && within(&t, d, op)? {
+                return Err(Errno::EINVAL);
+            }
+            if let Kind::Dir(m) = &mut lock(&oa).kind {
+                m.insert(on, d);
+            }
+            if let Kind::Dir(m) = &mut lock(&na).kind {
+                m.insert(nn, id);
+            }
+            if op != np && src_dir != dst_dir {
+                let (from, to) = if src_dir { (&oa, &na) } else { (&na, &oa) };
+                lock(from).links -= 1;
+                lock(to).links += 1;
+            }
+            return Ok(());
         }
         if let Some(d) = dst {
             let a = t.node(d)?;

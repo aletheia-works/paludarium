@@ -161,6 +161,9 @@ verified.
   In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), a value
   of `security.capability` is not checked, and a sticky directory does not limit
   `user.*` to its owner.
+- **Rename flags**: on a Windows host, `renameat2` in a mounted directory
+  takes neither `RENAME_NOREPLACE` nor `RENAME_EXCHANGE` (`EINVAL`), as a
+  Linux filesystem without them.
 - **File owners**: in a mounted host directory, the owner and group that
   `chown` gives a file, and those of a file a guest makes there, are kept
   only while the emulator runs, not on the host file. The next run sees

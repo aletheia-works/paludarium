@@ -14,7 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
@@ -479,9 +479,13 @@ pub struct SharedPages {
     /// gives shared anonymous memory does.
     id: u64,
     frames: Arc<Mutex<BTreeMap<u64, Frame>>>,
-    /// Bumped by every store to the frames: before and after one through a
-    /// mapping, and by those of the kernel ([`Self::store`], [`Self::zero`]).
+    /// Bumped by every store to the frames, before and after it: one
+    /// through a mapping, and those of the kernel ([`Self::store`],
+    /// [`Self::zero`]).
     generation: Arc<AtomicU64>,
+    /// The code generations of the spaces that may run code from the
+    /// frames ([`Self::watch`]), which every bump of `generation` bumps too.
+    watchers: Arc<Watchers>,
     /// Held only to keep the owner alive.
     _owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// The file of a page cache, which a page without contents is read
@@ -506,6 +510,7 @@ impl SharedPages {
             id: NEXT_SHARED_PAGES_ID.fetch_add(1, Ordering::Relaxed),
             frames: Arc::new(Mutex::new(frames)),
             generation: Arc::default(),
+            watchers: Arc::default(),
             _owner: None,
             source: None,
         }
@@ -531,6 +536,26 @@ impl SharedPages {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+    /// Bumps the generation, and the code generation of every space that
+    /// watches the frames, after a store to them (and, for one through a
+    /// mapping, before it too).
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.watchers.changed();
+    }
+    /// Makes every later store to the frames bump `code`'s generation, as a
+    /// space that may run code from them needs.
+    ///
+    /// A store whose bump after it found no watcher comes before the
+    /// [`Watchers::add`] in the single order of `SeqCst` operations, and so
+    /// does that bump. The load of the generation after the `add` therefore
+    /// reads it, and synchronizes with it: the stored bytes are visible to
+    /// every fetch the space makes afterwards, which caches them under a
+    /// generation read later still.
+    fn watch(&self, code: &Arc<CodeCounters>) {
+        self.watchers.add(code);
+        self.generation.load(Ordering::SeqCst);
     }
     fn lock(&self) -> MutexGuard<'_, BTreeMap<u64, Frame>> {
         self.frames.lock().unwrap_or_else(PoisonError::into_inner)
@@ -587,7 +612,7 @@ impl SharedPages {
             done += piece;
         }
         // After the bytes, as in `AddressSpaceData::store`.
-        self.generation.fetch_add(1, Ordering::Release);
+        self.changed();
     }
     /// Zeros `[start, end)` of the memory, as truncating or punching a hole
     /// in the file does to its page cache. The pages do not become dirty.
@@ -605,7 +630,7 @@ impl SharedPages {
                 }
             }
         }
-        self.generation.fetch_add(1, Ordering::Release);
+        self.changed();
     }
     /// Hands each page a guest store changed since the last call to
     /// `write`, with its key, and marks it clean. A page whose `write`
@@ -812,16 +837,31 @@ static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SHARED_PAGES_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Where the code generations of spaces start, each far from the others,
+/// so that a value means one space's code ([`AddressSpaceData::code_generation`]).
+/// The starts wrap after 2^24 spaces, and a space that is bumped 2^40 times
+/// reaches the next one's. Nothing depends on it in the emulator: each
+/// thread's decode cache serves one space, and is made anew when `execve`
+/// replaces it (paludarium-runtime's `workers`). It keeps a cache that
+/// someone does move to another space from finding its old entries.
+static NEXT_CODE_GENERATION: AtomicU64 = AtomicU64::new(0);
+const CODE_GENERATIONS_PER_SPACE: u64 = 1 << 40;
+
 /// The counters of a space that [`AddressSpace::code_generation_cached`]
 /// and the loads through a [`ThreadTlb`] read without the locks.
 struct CodeCounters {
-    /// Bumped whenever executable memory or the mappings change; lets the
-    /// CPU cache decoded instructions safely (see
-    /// [`AddressSpaceData::code_generation`]).
+    /// Bumped whenever executable memory or the mappings change, and by
+    /// every store to the shared mappings and page caches the space may run
+    /// code from (which it [`SharedPages::watch`]es); lets the CPU cache
+    /// decoded instructions safely (see [`AddressSpaceData::code_generation`]).
     generation: AtomicU64,
     /// Bumped whenever the space is borrowed mutably, which may change its
-    /// shared mappings and page caches, whose generations count too.
+    /// shared mappings and page caches, and the protection of their pages.
     layout: AtomicU64,
+    /// One more than the layout at which the space last watched every
+    /// shared mapping and page cache it may run code from, or 0 before it
+    /// first did.
+    watched: AtomicU64,
     /// Set to a new value of [`NEXT_EPOCH`] whenever the space's [`Tlb`] is
     /// emptied, which empties the [`ThreadTlb`]s at their next access.
     epoch: AtomicU64,
@@ -829,9 +869,11 @@ struct CodeCounters {
 
 impl Default for CodeCounters {
     fn default() -> Self {
+        let start = NEXT_CODE_GENERATION.fetch_add(CODE_GENERATIONS_PER_SPACE, Ordering::Relaxed);
         CodeCounters {
-            generation: AtomicU64::new(0),
+            generation: AtomicU64::new(start),
             layout: AtomicU64::new(0),
+            watched: AtomicU64::new(0),
             epoch: AtomicU64::new(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)),
         }
     }
@@ -854,14 +896,54 @@ impl CodeCounters {
     }
 }
 
-/// What [`AddressSpace::code_generation_cached`] keeps between calls: the
-/// counters of the space it last read and the generations of that space's
-/// shared mappings and page caches, as they were at `layout`.
+/// The spaces that watch a [`SharedPages`]: once one does, every store to
+/// the frames bumps their code generations.
 #[derive(Default)]
-pub struct CodeSources {
-    counters: Option<Arc<CodeCounters>>,
-    layout: u64,
-    pages: Vec<Arc<AtomicU64>>,
+struct Watchers {
+    /// Whether `spaces` has ever had one, so that stores to memory no space
+    /// runs code from take no lock.
+    any: AtomicBool,
+    spaces: Mutex<Vec<Weak<CodeCounters>>>,
+}
+
+impl Watchers {
+    fn spaces(&self) -> MutexGuard<'_, Vec<Weak<CodeCounters>>> {
+        self.spaces.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Bumps the watching spaces' code generations. A store that finds no
+    /// space here is seen by one that adds itself later
+    /// ([`SharedPages::watch`]).
+    /// Once every watching space is gone, stores take no lock again.
+    fn changed(&self) {
+        if !self.any.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut spaces = self.spaces();
+        spaces.retain(|space| match space.upgrade() {
+            Some(space) => {
+                space.generation.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        });
+        if spaces.is_empty() {
+            // Under the lock, so that an `add` either comes after and sets
+            // it again, or came before and kept `spaces` from being empty.
+            self.any.store(false, Ordering::SeqCst);
+        }
+    }
+    fn add(&self, code: &Arc<CodeCounters>) {
+        let mut spaces = self.spaces();
+        spaces.retain(|space| space.strong_count() > 0);
+        if !spaces
+            .iter()
+            .any(|space| std::ptr::eq(space.as_ptr(), Arc::as_ptr(code)))
+        {
+            spaces.push(Arc::downgrade(code));
+        }
+        drop(spaces);
+        self.any.store(true, Ordering::SeqCst);
+    }
 }
 
 /// One process's guest address space.
@@ -983,25 +1065,54 @@ impl AddressSpaceData {
     }
 
     /// A counter that changes whenever executable memory is written or the
-    /// mappings change (map, unmap, protect). Decoded instructions cached
-    /// under one value stay valid while the value is unchanged.
+    /// mappings change (map, unmap, protect), including a store by any space
+    /// or the kernel to a shared mapping or page cache that this space maps
+    /// executable. Decoded instructions cached under one value stay valid
+    /// while the value is unchanged. Values of different spaces differ too,
+    /// up to the bound of [`CODE_GENERATIONS_PER_SPACE`].
     #[must_use]
     pub fn code_generation(&self) -> u64 {
-        self.code_sources().fold(
-            self.code.generation.load(Ordering::Acquire),
-            |value, generation| value.wrapping_add(generation.load(Ordering::Acquire)),
-        )
+        let layout = self.code.layout.load(Ordering::Acquire);
+        if self.code.watched.load(Ordering::Acquire) != layout.wrapping_add(1) {
+            self.watch_code_sources();
+            self.code
+                .watched
+                .store(layout.wrapping_add(1), Ordering::Release);
+        }
+        self.code.generation.load(Ordering::SeqCst)
     }
 
-    /// The generations of the shared mappings and page caches, which
-    /// [`Self::code_generation`] adds to the space's own.
-    fn code_sources(&self) -> impl Iterator<Item = &Arc<AtomicU64>> {
-        let caches = self.backing.values().filter_map(|b| b.cache.as_ref());
-        self.shared
-            .values()
-            .map(|shared| &shared.pages)
-            .chain(caches)
-            .map(|pages| &pages.generation)
+    /// Watches every shared mapping and page cache that has a page this
+    /// space may run code from, so that their stores bump its generation.
+    /// A shared mapping or page cache stays watched once it was, even when
+    /// its pages are no longer executable: that costs decodes, not
+    /// correctness.
+    fn watch_code_sources(&self) {
+        let shared = self
+            .shared
+            .iter()
+            .map(|(&start, shared)| (start, shared.end, Some(&shared.pages)));
+        let caches = self
+            .backing
+            .iter()
+            .map(|(&start, backing)| (start, backing.end, backing.cache.as_ref()));
+        for (start, end, pages) in shared.chain(caches) {
+            if let Some(pages) = pages
+                && self.executable(start, end)
+            {
+                pages.watch(&self.code);
+            }
+        }
+    }
+
+    /// Whether a mapping that overlaps `[start, end)` is executable.
+    fn executable(&self, start: u64, end: u64) -> bool {
+        // Mappings never overlap, so their ends rise with their starts.
+        self.mappings
+            .range(..end)
+            .rev()
+            .take_while(|(_, mapping)| mapping.end() > start)
+            .any(|(_, mapping)| mapping.prot.contains(Prot::EXEC))
     }
 
     fn shared_at(&self, page: u64) -> Option<&SharedMapping> {
@@ -1579,7 +1690,7 @@ impl AddressSpaceData {
         for (page, offset, range) in chunks(addr, buf.len()) {
             if let Some(p) = lookup(directory, page) {
                 if let Some(mapping) = self.shared_at(page) {
-                    mapping.pages.generation.fetch_add(1, Ordering::Release);
+                    mapping.pages.changed();
                 }
                 let Some(frame) = p.frame_for_write(self.meter.as_ref()) else {
                     self.out_of_memory.store(true, Ordering::SeqCst);
@@ -1604,7 +1715,7 @@ impl AddressSpaceData {
                 // Again once the page is dirty, so that a write-back that ran
                 // between the bumps sees the generation change after it.
                 if let Some(mapping) = self.shared_at(page) {
-                    mapping.pages.generation.fetch_add(1, Ordering::Release);
+                    mapping.pages.changed();
                 }
             }
         }
@@ -2432,6 +2543,10 @@ pub struct AddressSpace {
     /// The data's `out_of_memory`, so that every checkpoint can read it
     /// without taking the session-wide serialization lock.
     out_of_memory: Arc<AtomicBool>,
+    /// The kernel's `membarrier` registrations for this space, as Linux's
+    /// `mm->membarrier_state`: a fork's copy keeps it, a new space (exec)
+    /// has none.
+    membarrier: AtomicU32,
 }
 
 /// An address space's VMAs for as long as a thread uses it, as Linux's
@@ -2444,6 +2559,11 @@ pub struct MemoryView {
 }
 
 impl MemoryView {
+    /// Whether this is a view of `space`, while it lives.
+    #[must_use]
+    pub fn is_of(&self, space: &AddressSpace) -> bool {
+        std::ptr::eq(self.data.as_ptr(), Arc::as_ptr(&space.data))
+    }
     /// The first VMA that ends after `addr`, if the space still lives and
     /// has one.
     #[must_use]
@@ -2581,6 +2701,7 @@ impl AddressSpace {
             code: Arc::clone(&data.code),
             data: Arc::new(Mutex::new(data)),
             serialization,
+            membarrier: AtomicU32::new(0),
         }
     }
     /// The space's data alone, without the session's serialization, for a
@@ -2622,7 +2743,12 @@ impl AddressSpace {
     /// copies them; MAP_SHARED pages stay shared. A shared serialization lock
     /// keeps cross-process memory operations indivisible.
     pub fn fork(&self) -> Self {
-        Self::with_data(self.locked().fork(), self.serialization.clone())
+        let child = Self::with_data(self.locked().fork(), self.serialization.clone());
+        // Linux's dup_mm copies the mm whole, membarrier_state with it.
+        child
+            .membarrier
+            .store(self.membarrier.load(Ordering::SeqCst), Ordering::SeqCst);
+        child
     }
     /// Marks a newly created mapping as Linux MAP_SHARED, independently of VM sharing.
     pub fn mark_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
@@ -2708,28 +2834,20 @@ impl AddressSpace {
     pub fn code_generation(&self) -> u64 {
         self.locked().code_generation()
     }
-    /// [`Self::code_generation`], taking the locks only when `sources`
-    /// holds another space's or the space has been borrowed mutably since:
-    /// the shared mappings and page caches whose generations count change
-    /// only then. Reading the generation before fetching the instruction
-    /// under the locks keeps a decoded instruction from outliving a change,
-    /// as every write bumps the generation while it holds them.
-    pub fn code_generation_cached(&self, sources: &mut CodeSources) -> u64 {
+    /// [`Self::code_generation`], taking the locks only when the space has
+    /// been borrowed mutably since it last watched the shared mappings and
+    /// page caches it may run code from: those change only then. One load
+    /// otherwise, as the interpreter makes before every instruction.
+    /// Reading the generation before fetching the instruction under the
+    /// locks keeps a decoded instruction from outliving a change, as every
+    /// store to code bumps the generation around it.
+    #[must_use]
+    pub fn code_generation_cached(&self) -> u64 {
         let layout = self.code.layout.load(Ordering::Acquire);
-        let current = sources
-            .counters
-            .as_ref()
-            .is_some_and(|counters| Arc::ptr_eq(counters, &self.code));
-        if !current || sources.layout != layout {
-            let data = self.locked();
-            sources.layout = self.code.layout.load(Ordering::Acquire);
-            sources.pages = data.code_sources().cloned().collect();
-            sources.counters = Some(Arc::clone(&self.code));
+        if self.code.watched.load(Ordering::Acquire) != layout.wrapping_add(1) {
+            return self.locked().code_generation();
         }
-        sources.pages.iter().fold(
-            self.code.generation.load(Ordering::Acquire),
-            |value, generation| value.wrapping_add(generation.load(Ordering::Acquire)),
-        )
+        self.code.generation.load(Ordering::SeqCst)
     }
     /// Reads cache identity and generation under the same serialization guard.
     #[must_use]
@@ -2812,6 +2930,12 @@ impl AddressSpace {
             source: source.is_some(),
             offset,
         })
+    }
+    /// The kernel's `membarrier` state for this space, shared by every
+    /// thread that runs in it.
+    #[must_use]
+    pub fn membarrier_state(&self) -> &AtomicU32 {
+        &self.membarrier
     }
     /// This space's VMAs as `/proc/<pid>/maps` reads them ([`MemoryView`]).
     #[must_use]

@@ -25,10 +25,13 @@ thread_local! {
     /// have come for it and its process so far, and a count bumped whenever
     /// that grows: one for each signal queued, as Linux's `signalfd_notify`
     /// wakes the file for each (an edge for edge-triggered epoll).
-    static VIEW: Cell<View> = const { Cell::new(View { set: 0, arrivals: 0, epoch: 0 }) };
+    static VIEW: Cell<View> = const { Cell::new(View { thread: 0, set: 0, arrivals: 0, epoch: 0 }) };
 }
 #[derive(Clone, Copy)]
 struct View {
+    /// The guest thread it is of, by its inbox: a thread's first look only
+    /// records, as nothing came since it last looked.
+    thread: usize,
     set: u64,
     arrivals: u64,
     epoch: u64,
@@ -41,21 +44,28 @@ pub(crate) fn observe(process: &ThreadState, inbox: &SignalInbox, group: &Thread
     if LIVE.load(Ordering::SeqCst) == 0 {
         return;
     }
+    inbox.publish(process);
     let (shared, shared_arrivals) = group.process_pending_set();
     let (queued, coming) = inbox.queued_set(process);
     let set = set_of(&process.pending) | queued | shared;
+    // Another thread's signal counts once that thread publishes it, as
+    // Linux wakes every signal file of the process for each signal.
     let arrivals = process
         .arrivals
         .wrapping_add(coming)
-        .wrapping_add(shared_arrivals);
+        .wrapping_add(shared_arrivals)
+        .wrapping_add(inbox.others_arrivals());
+    let thread = std::ptr::from_ref(inbox) as usize;
     VIEW.with(|view| {
         let seen = view.get();
-        let epoch = if set & !seen.set != 0 || arrivals != seen.arrivals {
+        let changed = set & !seen.set != 0 || arrivals != seen.arrivals;
+        let epoch = if seen.thread == thread && changed {
             seen.epoch.wrapping_add(1)
         } else {
             seen.epoch
         };
         view.set(View {
+            thread,
             set,
             arrivals,
             epoch,
@@ -381,6 +391,7 @@ mod tests {
     fn readiness_follows_the_view() {
         let file = SignalFile::new(1 << 9, NONBLOCK);
         let view = |set, epoch| View {
+            thread: 0,
             set,
             arrivals: 0,
             epoch,

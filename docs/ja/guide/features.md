@@ -46,13 +46,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_getscheduler`／`sched_getparam`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_get`、`personality`、`unshare`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
@@ -122,6 +122,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EBUSY` になり、書き込みを封じた memfd の共有マッピングは書き込めるようにできません
   （`EACCES`）。実行できる memfd への `F_SEAL_EXEC` も書き込みを封じるので、そのときは
   Linux 7.1 以降と同じく `EBUSY` になります（それより前のカーネルはシールを加えます）。
+- `openat2` は `openat` と同じように開き（FIFO も）、`struct open_how` を Linux と同じく
+  より厳しく調べます。24 バイトに満たない大きさは `EINVAL`、1 ページを超えるものや、
+  最初の版より後ろに 0 でない未知のバイトがあるものは `E2BIG` です。未知のフラグや
+  `RESOLVE_*` フラグ、`O_CREAT` も `O_TMPFILE` もないのに付けたモードや許可ビットを
+  超えるモード、`O_CREAT | O_DIRECTORY`、`O_DIRECTORY`・`O_NOFOLLOW`・`O_CLOEXEC`
+  以外のフラグを伴う `O_PATH` は `EINVAL` です。`RESOLVE_NO_SYMLINKS` はシンボリック
+  リンクを、`RESOLVE_NO_MAGICLINKS` は `/proc/self/fd` のリンクや `exe`・`cwd` を
+  たどりません（`ELOOP`）。`RESOLVE_NO_XDEV` は `/proc` や `/dev` も含めてマウントを
+  越えません（`EXDEV`）。`RESOLVE_BENEATH` では絶対パスや絶対パスへのリンク、
+  ディレクトリの外に出る `..`、マジックリンクが `EXDEV` になり、`RESOLVE_IN_ROOT` は
+  ディレクトリをルートとして扱うので、それらはその中にとどまります（マジックリンクは
+  `EXDEV`）。両方のスコープのフラグを付けると `EINVAL` です。`RESOLVE_CACHED` は
+  `O_CREAT`、`O_TRUNC`、`O_TMPFILE` と一緒なら `EAGAIN` で、それ以外はすべての名前が
+  キャッシュにあるものとして常にファイルを見つけます。
 - `close_range` は `first` から `last` までの開いているディスクリプタを閉じ、
   `CLOSE_RANGE_CLOEXEC` なら閉じずに close-on-exec を付けます。`CLOSE_RANGE_UNSHARE`
   は先に、`CLONE_FILES` のスレッドと共有している表をそのスレッド専用の写しにします。
@@ -489,6 +503,46 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どちらも、root と同じくほかのプロセスのスレッドも見つけ、その ID の生きているスレッドが
   なければ `ESRCH` です。`getcpu` は、スレッドのマスクが許すいちばん小さい番号の CPU と、
   NUMA ノード 0 を返します。
+- `sched_setscheduler`、`sched_setparam`、`sched_setattr` はないので、どのスレッドも
+  `SCHED_OTHER` で動きます。`sched_getscheduler` は 0 を、`sched_getparam` は優先度 0 を
+  返します。どのプロセスのスレッドでも見つけ、その ID のスレッドがなければ `ESRCH`、負の
+  ID なら `EINVAL` です（Linux と同じく、先に確かめる NULL の引数も `EINVAL`）。
+  `sched_get_priority_max` と `sched_get_priority_min` は、Linux と同じく `SCHED_FIFO` と
+  `SCHED_RR` で 99 と 1、ほかのポリシーで 0 です。`sched_rr_get_interval` は、Linux の
+  ホストではホストのスケジューラーがそのスレッドに与えるタイムスライスを返します。
+  ゲストのスレッドはホストのスレッドで動くからです。ほかのホストでは Linux 6.12 の
+  1000 Hz での既定値、つまり 0.75 ms に 1 + log2(CPU の数、最大 8) を掛けた値を
+  ミリ秒単位に切り捨てたものです。`ioprio_get` は `getpriority` と同じようにスレッドを
+  見つけます（`IOPRIO_WHO_PROCESS`、`IOPRIO_WHO_PGRP`、`IOPRIO_WHO_USER`）。どの
+  スレッドも優先度を設定できない（`ioprio_set` は `ENOSYS`）ので、どれも優先度を
+  持たず（0、`IOPRIO_CLASS_NONE`）、スレッドが 1 つならそれを返します。複数なら、Linux の
+  `ioprio_best` がそれぞれを `IOPRIO_CLASS_BE` のレベル 4 とみなすので、その値（16388）を
+  返します。
+- `personality` は、Linux と同じくどんな値でもスレッドに持ち、前の値を返します
+  （`0xffffffff` は問い合わせだけです）。新しいスレッドとプロセスはそれを継ぎ、
+  `execve` は `READ_IMPLIES_EXEC` を、set-ID のプログラムなら `PER_CLEAR_ON_SETID` も
+  落として保ちます。Linux と同じく、3 つの設定はゲストに見えるものを変えます。
+  `PER_LINUX32` なら `uname` は `i686` と、`UNAME26` なら 2.6 のリリース（`2.6.72`）と
+  答え、`READ_IMPLIES_EXEC` なら `mmap` と `mprotect` は読めるマッピングを実行もできる
+  ようにします。ほかのフラグ（`ADDR_NO_RANDOMIZE`、`ADDR_COMPAT_LAYOUT`、
+  `MMAP_PAGE_ZERO` など）は持つだけです。配置は変わらず、もともとランダムにもしません。
+- `membarrier` は、`CONFIG_RSEQ` があって `nohz_full` の CPU がない x86-64 の Linux の
+  コマンドを持ちます（`MEMBARRIER_CMD_QUERY` は `0x3ff`）。プライベートのコマンドは、
+  アドレス空間がそれに登録するまで `EPERM` です。fork は登録を保ち、exec のあとは登録がなく、
+  `MEMBARRIER_CMD_GET_REGISTRATIONS` は Linux と同じビットで登録を答えます（`SYNC_CORE`
+  に登録すると、空間はプライベートとしても印が付きます）。バリアはホストのフェンス
+  です。ゲストのメモリーへのアクセスはどれもアドレス空間のロックを取るので、各スレッドで
+  バリアを実行したのと同じく、ほかのスレッドのアクセスとの順序がすでに決まっています。
+- `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
+  `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
+  `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
+  `EINVAL` です。プロセスにほかのスレッドがあるとき、ほかのプロセスとシグナルの扱いを
+  共有しているとき（`CLONE_SIGHAND`）、ほかのプロセスとメモリーを共有しているとき
+  （`CLONE_THREAD` なしの `CLONE_VM`）です。System V IPC がないので、`CLONE_SYSVSEM` で
+  捨てるセマフォーの調整値はありません。名前空間はありません。そのフラグは、Linux と
+  同じく `CAP_SYS_ADMIN` がなければ `EPERM`、あれば `EINVAL` です。後者は、その名前空間
+  なしでビルドしたカーネルと同じで、ここでの `clone` とも同じです。Linux ではユーザーも
+  使える `CLONE_NEWUSER` も `EINVAL` です。[制限](./limitations.md)を見てください。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、
@@ -616,8 +670,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   標準入力・出力・エラーの端末（devpts）は 1024 で、ほかは、パイプ、ソケット、`memfd`、`/dev` も含めて 4096
   です。そこでの `statfs` は、Linux の `simple_statfs` と同じく、procfs や devpts の
   種類と 4096 の `f_bsize` を返します。
-  `/proc/self/fd` のリンクは procfs のものですが、それを通した `stat`、`statfs`、`open`
-  はリンク先のファイルに届きます。
+  `/proc/self/fd` のリンクは procfs のものですが、Linux のマジックリンクと同じく、
+  それをたどる呼び出しはディスクリプタのファイルそのものに届きます。アクセスモードは
+  問いません（`O_PATH` のディスクリプタも）。`stat`、`statfs`、`open`、`access`、
+  `chmod` と `fchmodat`、`chown` と `fchownat`、`utimensat`、`truncate`、`chdir`、
+  拡張属性の呼び出し、`execve` がそうです（`O_PATH` のディスクリプタへの `fchmod`、
+  `fchown`、`futimens`、`ftruncate` は `EBADF` です）。削除したファイル、memfd、パイプには
+  ディスクリプタ自身を通して届きます（それらの `execve` はできません）。
+  `O_PATH | O_NOFOLLOW` のディスクリプタが持つシンボリックリンクはもうたどりません。
+  そのモードは変えられず（`EOPNOTSUPP`）、`chdir` はディレクトリでないもの（`ENOTDIR`）、
+  `truncate` は通常のファイルでないもの（`EINVAL`）とし、`execve` は `ELOOP` になります。
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
@@ -840,7 +902,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マスクのシグナルが保留されている間、Linux と同じく読めると見ます。そのため
   スレッド自身へのシグナルはそのスレッドにだけ見え、fork した子が受け継いだ
   ファイルは子のシグナルを読みます。エッジトリガーの `epoll` は、ファイルのシグナルが
-  保留されている間、スレッドかそのプロセスにシグナルが積まれるたびにエッジを受けます。
+  待つスレッドに保留されている間、プロセスかそのどれかのスレッドにシグナルが積まれる
+  たびにエッジを受けます。
   Linux の `signalfd_notify` が、そのたびにファイルを起こすのと同じです。同じ番号が
   待っているリアルタイムシグナルも数え、すでに保留されている標準のシグナルや、
   ブロックされずに無視されるシグナルは数えません。マスクが変わるのもエッジです。

@@ -195,6 +195,10 @@ pub struct ThreadState {
     pub(crate) restart_block: Option<signals::RestartBlock>,
     /// The thread's user and group IDs and capabilities.
     pub credentials: credentials::Credentials,
+    /// The execution domain and flags `personality` sets, as Linux's
+    /// `task_struct.personality`: copied to new threads and processes, and
+    /// kept across exec but for the flags exec clears.
+    pub(crate) personality: u32,
 }
 
 impl ThreadState {

@@ -12,7 +12,7 @@ pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
     82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 133, 137, 138, 162, 188, 189, 190, 191,
     192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 257, 258, 259, 260, 262, 263, 264, 265, 266,
-    267, 268, 269, 280, 285, 292, 293, 295, 296, 316, 319, 326, 332, 436, 439, 452,
+    267, 268, 269, 280, 285, 292, 293, 295, 296, 316, 319, 326, 332, 436, 437, 439, 452,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -643,12 +643,34 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         a[3] & AT_EMPTY_PATH != 0 && path(c, a[1])?.is_empty()
     };
     if descriptor {
-        let file = c.files.descriptor(a[0])?.file;
+        // `futimens` takes the descriptor as `fdget` does, which an `O_PATH`
+        // one is not; `AT_EMPTY_PATH` takes it as a path.
+        let file = if a[1] == 0 {
+            io_descriptor(c, a[0])?
+        } else {
+            c.files.descriptor(a[0])?.file
+        };
         crate::permissions::times(&c.process.credentials, &file.stat()?, touch)?;
         return file.set_times(atime, mtime).map(|()| 0);
     }
     let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
     let (p, found) = looked_up(c, a[0], a[1], follow)?;
+    match followed(c, &p, follow)? {
+        Some(Followed::Path { path, follow }) => {
+            let stat = c.files.fs.metadata(&path, follow)?;
+            crate::permissions::times(&c.process.credentials, &stat, touch)?;
+            return c
+                .files
+                .fs
+                .set_times(&path, follow, atime, mtime)
+                .map(|()| 0);
+        }
+        Some(Followed::File(d)) => {
+            crate::permissions::times(&c.process.credentials, &d.file.stat()?, touch)?;
+            return d.file.set_times(atime, mtime).map(|()| 0);
+        }
+        None => {}
+    }
     if let Some(stat) = found.file {
         crate::permissions::times(&c.process.credentials, &stat, touch)?;
     }
@@ -691,7 +713,8 @@ fn chown_file(
     Ok(0)
 }
 /// `chown` of `path`; with `follow` false (`lchown`) a final symbolic link
-/// itself, which has no set-user-ID bit to lose.
+/// itself, which has no set-user-ID bit to lose. A link in `/proc/self/fd`
+/// that it follows leads to the descriptor's file ([`Followed`]).
 fn chown_path(
     c: &Context<'_>,
     path: &[u8],
@@ -699,6 +722,11 @@ fn chown_path(
     uid: u64,
     gid: u64,
 ) -> Result<u64, Errno> {
+    match followed(c, path, follow)? {
+        Some(Followed::Path { path, follow }) => return chown_path(c, &path, follow, uid, gid),
+        Some(Followed::File(d)) => return chown_file(c, &d.file, uid, gid),
+        None => {}
+    }
     let stat = c.files.fs.metadata(path, follow)?;
     let (uid, gid) = (owner_id(uid), owner_id(gid));
     let keeps_sgid = crate::permissions::chown(&c.process.credentials, &stat, uid, gid)?;
@@ -734,7 +762,14 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     } else {
         let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
         let (p, _) = lookup(c, a[0], raw, follow)?;
-        let stat = c.files.fs.metadata(&p, follow)?;
+        if let Some(target) = followed(c, &p, follow)? {
+            return chmod_followed(c, target, a[2] as u32);
+        }
+        // A link in `/proc` or `/dev` not followed is a symbolic link too.
+        let stat = match generated_stat(c, &p, follow)? {
+            Some((stat, ..)) => stat,
+            None => c.files.fs.metadata(&p, follow)?,
+        };
         (p, stat)
     };
     if stat.mode & 0o170000 == 0o120000 {
@@ -742,6 +777,38 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     let mode = crate::permissions::chmod(&c.process.credentials, &stat, a[2] as u32)?;
     c.files.fs.set_mode(&p, mode).map(|()| 0)
+}
+/// The file of descriptor `fd` for a call that takes it as Linux's `fdget`
+/// does (`fchmod`, `fchown`, `futimens`, `ftruncate`): an `O_PATH` descriptor is
+/// `EBADF`, as only path calls (`AT_EMPTY_PATH`, a link in `/proc/self/fd`)
+/// reach its file.
+fn io_descriptor(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
+    let file = c.files.descriptor(fd)?.file;
+    if file.flags() & O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    Ok(file)
+}
+/// `chmod` of the file a link in `/proc/self/fd` leads to, which the
+/// descriptor's access does not limit: an `O_PATH` one's file changes too,
+/// as glibc's `fchmodat` with `AT_SYMLINK_NOFOLLOW` has it. A symbolic link
+/// has a mode that cannot change (`EOPNOTSUPP`, Linux's `notify_change`).
+fn chmod_followed(c: &Context<'_>, target: Followed, mode: u32) -> Result<u64, Errno> {
+    let creds = &c.process.credentials;
+    match target {
+        Followed::Path { path, follow } => {
+            let stat = c.files.fs.metadata(&path, follow)?;
+            if stat.mode & 0o170000 == 0o120000 {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let mode = crate::permissions::chmod(creds, &stat, mode)?;
+            c.files.fs.set_mode(&path, mode).map(|()| 0)
+        }
+        Followed::File(d) => {
+            let mode = crate::permissions::chmod(creds, &d.file.stat()?, mode)?;
+            d.file.set_mode(mode).map(|()| 0)
+        }
+    }
 }
 /// `fchownat(dirfd, path, owner, group, flags)`, in `do_fchownat`'s order:
 /// the flags (EINVAL), then the path; an empty one with `AT_EMPTY_PATH`
@@ -1909,44 +1976,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 85 => ((-100i32) as u64, path(c, a[0])?, 577, a[1]),
                 _ => (a[0], path(c, a[1])?, a[2], a[3]),
             };
-            let p = c.files.path(dir, raw.clone())?;
-            let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
-            if flags & 3 == 3 {
-                return Err(Errno::EINVAL);
-            }
-            // Linux takes the descriptor before it opens, so with none free
-            // nothing is opened or created.
-            let fd = c.files.reserve(c.group.nofile())?;
-            let credentials = &c.process.credentials;
-            let opened = match crate::permissions::open(c.files, credentials, dir, &raw, flags) {
-                Ok(created) => open_path(c, &p, flags, mode as u32).inspect(|_| {
-                    if let Some(parent) = created {
-                        crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
-                    }
-                }),
-                Err(error) => Err(error),
-            };
-            match opened {
-                Ok((file, path)) => {
-                    let cloexec = flags & 0x80000 != 0;
-                    c.files.fill(
-                        fd,
-                        Descriptor {
-                            file,
-                            path,
-                            cloexec,
-                            opened: true,
-                            listed: Arc::default(),
-                        },
-                    );
-                    Ok(u64::from(fd))
-                }
-                Err(error) => {
-                    c.files.unreserve(fd);
-                    Err(error)
-                }
-            }
+            open_at(c, dir, raw, flags, mode as u32, 0)
         }
+        437 => openat2(c, a),
         3 => {
             let closed = c
                 .files
@@ -2114,13 +2146,28 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         76 | 77 => {
             let f = if n == 77 {
-                c.files.descriptor(a[0])?.file
+                io_descriptor(c, a[0])?
             } else {
                 let (p, found) = looked_up(c, (-100i32) as u64, a[0], true)?;
-                if let Some(stat) = found.file {
-                    crate::permissions::truncate(&c.process.credentials, &stat)?;
+                match followed(c, &p, true)? {
+                    // A link in `/proc/self/fd` leads to the descriptor's
+                    // file, which the call opens for writing again.
+                    Some(Followed::Path { path, follow }) => {
+                        let stat = c.files.fs.metadata(&path, follow)?;
+                        crate::permissions::truncate(&c.process.credentials, &stat)?;
+                        c.files.fs.open(&path, 1, 0)?
+                    }
+                    Some(Followed::File(d)) => {
+                        crate::permissions::truncate(&c.process.credentials, &d.file.stat()?)?;
+                        d.file.reopen(1)?
+                    }
+                    None => {
+                        if let Some(stat) = found.file {
+                            crate::permissions::truncate(&c.process.credentials, &stat)?;
+                        }
+                        c.files.fs.open(&p, 1, 0)?
+                    }
                 }
-                c.files.fs.open(&p, 1, 0)?
             };
             if a[1] > i64::MAX as u64 {
                 return Err(Errno::EINVAL);
@@ -2150,7 +2197,22 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         80 | 81 => {
             let p = if n == 80 {
-                looked_up(c, (-100i32) as u64, a[0], true)?.0
+                let p = looked_up(c, (-100i32) as u64, a[0], true)?.0;
+                match followed(c, &p, true)? {
+                    // A symbolic link an `O_PATH | O_NOFOLLOW` descriptor
+                    // holds is not followed again: it is no directory.
+                    Some(Followed::Path { path, follow }) => {
+                        if c.files.fs.metadata(&path, follow)?.mode & 0o170000 != 0o040000 {
+                            return Err(Errno::ENOTDIR);
+                        }
+                        path
+                    }
+                    Some(Followed::File(d)) if d.file.stat()?.mode & 0o170000 != 0o040000 => {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    Some(Followed::File(d)) => d.path,
+                    None => p,
+                }
             } else {
                 c.files.descriptor(a[0])?.path
             };
@@ -2448,6 +2510,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 (looked_up(c, a[0], a[1], true)?, a[2])
             };
             let (p, found) = p;
+            if let Some(target) = followed(c, &p, true)? {
+                return chmod_followed(c, target, mode as u32);
+            }
             let mode = match found.file {
                 Some(stat) => {
                     crate::permissions::chmod(&c.process.credentials, &stat, mode as u32)?
@@ -2457,7 +2522,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.files.fs.set_mode(&p, mode).map(|()| 0)
         }
         91 => {
-            let file = c.files.descriptor(a[0])?.file;
+            let file = io_descriptor(c, a[0])?;
             let mode =
                 crate::permissions::chmod(&c.process.credentials, &file.stat()?, a[1] as u32)?;
             file.set_mode(mode).map(|()| 0)
@@ -2470,7 +2535,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], n == 92)?;
             chown_path(c, &p, n == 92, a[1], a[2])
         }
-        93 => chown_file(c, &c.files.descriptor(a[0])?.file, a[1], a[2]),
+        93 => chown_file(c, &io_descriptor(c, a[0])?, a[1], a[2]),
         260 => fchownat(c, a),
         280 => utimensat(c, a),
         // statfs, fstatfs
@@ -3211,6 +3276,346 @@ mod files_tests {
     }
 }
 
+/// `open`, `creat` and `openat` of `raw` from `dir`, and `openat2` with its
+/// `RESOLVE_*` flags `resolve` ([`resolve_scoped`]).
+fn open_at(
+    c: &mut Context<'_>,
+    dir: u64,
+    raw: Vec<u8>,
+    flags: u64,
+    mode: u32,
+    resolve: u64,
+) -> Result<u64, Errno> {
+    let p = c.files.path(dir, raw.clone())?;
+    let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
+    if flags & 3 == 3 {
+        return Err(Errno::EINVAL);
+    }
+    // The walk of `openat2` with `RESOLVE_*` flags, which ends at a path
+    // the rest of the open takes as it is.
+    let (dir, raw, p) = if resolve == 0 {
+        (dir, raw, p)
+    } else {
+        let p = resolve_scoped(c, dir, &raw, flags, resolve)?;
+        ((-100i32) as u64, p.clone(), p)
+    };
+    // Linux takes the descriptor before it opens, so with none free
+    // nothing is opened or created.
+    let fd = c.files.reserve(c.group.nofile())?;
+    let credentials = &c.process.credentials;
+    let opened = match crate::permissions::open(c.files, credentials, dir, &raw, flags) {
+        Ok(created) => open_path(c, &p, flags, mode).inspect(|_| {
+            if let Some(parent) = created {
+                crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
+            }
+        }),
+        Err(error) => Err(error),
+    };
+    match opened {
+        Ok((file, path)) => {
+            let cloexec = flags & 0x80000 != 0;
+            c.files.fill(
+                fd,
+                Descriptor {
+                    file,
+                    path,
+                    cloexec,
+                    opened: true,
+                    listed: Arc::default(),
+                },
+            );
+            Ok(u64::from(fd))
+        }
+        Err(error) => {
+            c.files.unreserve(fd);
+            Err(error)
+        }
+    }
+}
+const EXDEV: Errno = Errno(18);
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+const RESOLVE_CACHED: u64 = 0x20;
+/// `openat2(dirfd, path, how, size)`, as Linux's `do_sys_openat2` takes
+/// `struct open_how` (`flags`, `mode` and `resolve`, 24 bytes in its first
+/// version) and `build_open_flags` checks it: unlike `openat`, an unknown
+/// flag, a mode without `O_CREAT` or `O_TMPFILE` or with more than the
+/// permission bits, and `O_PATH` with other flags than `O_DIRECTORY`,
+/// `O_NOFOLLOW` and `O_CLOEXEC` are all `EINVAL`.
+fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    const OPEN_HOW_SIZE_VER0: u64 = 24;
+    const PAGE_SIZE: u64 = 4096;
+    const E2BIG: Errno = Errno(7);
+    const O_CREAT: u64 = 0o100;
+    const O_TRUNC: u64 = 0o1000;
+    const O_DSYNC: u64 = 0o10000;
+    const O_DIRECTORY: u64 = 0o200000;
+    const O_NOFOLLOW: u64 = 0o400000;
+    const O_CLOEXEC: u64 = 0o2000000;
+    const O_SYNC: u64 = 0o4000000;
+    const O_PATH: u64 = 0o10000000;
+    const O_TMPFILE: u64 = 0o20000000;
+    // Linux's `VALID_OPEN_FLAGS`: the access mode and every flag from
+    // `O_CREAT` to `__O_TMPFILE`.
+    const VALID_OPEN_FLAGS: u64 = 0o37777703;
+    const VALID_RESOLVE_FLAGS: u64 = 0x3f;
+    let size = a[3];
+    if size < OPEN_HOW_SIZE_VER0 {
+        return Err(Errno::EINVAL);
+    }
+    if size > PAGE_SIZE {
+        return Err(E2BIG);
+    }
+    // `copy_struct_from_user`: what a later version adds must be zero, which
+    // `check_zeroed_user` reads a page at a time up to the first byte that
+    // is not, before the first version is copied.
+    let mut at = a[2].checked_add(OPEN_HOW_SIZE_VER0).ok_or(Errno::EFAULT)?;
+    let end = a[2].checked_add(size).ok_or(Errno::EFAULT)?;
+    while at < end {
+        let next = end.min((at | (PAGE_SIZE - 1)) + 1);
+        let mut tail = vec![0; (next - at) as usize];
+        c.mem
+            .read(GuestAddr(at), &mut tail)
+            .map_err(|_| Errno::EFAULT)?;
+        if tail.iter().any(|&b| b != 0) {
+            return Err(E2BIG);
+        }
+        at = next;
+    }
+    let mut how = [0; OPEN_HOW_SIZE_VER0 as usize];
+    c.mem
+        .read(GuestAddr(a[2]), &mut how)
+        .map_err(|_| Errno::EFAULT)?;
+    let field = |i: usize| u64::from_le_bytes(how[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    let (flags, mode, resolve) = (field(0), field(1), field(2));
+    let mut flags = flags;
+    if flags & !O_CLOEXEC & !VALID_OPEN_FLAGS != 0 || resolve & !VALID_RESOLVE_FLAGS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if resolve & RESOLVE_BENEATH != 0 && resolve & RESOLVE_IN_ROOT != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & (O_CREAT | O_TMPFILE) != 0 {
+        if mode & !0o7777 != 0 {
+            return Err(Errno::EINVAL);
+        }
+    } else if mode != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & (O_DIRECTORY | O_CREAT) == O_DIRECTORY | O_CREAT {
+        return Err(Errno::EINVAL);
+    }
+    if flags & O_TMPFILE != 0 && (flags & O_DIRECTORY == 0 || flags & 3 == 0) {
+        return Err(Errno::EINVAL);
+    }
+    if flags & O_PATH != 0 && flags & !(O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // `RESOLVE_CACHED` would only look in the dentry cache, so an open that
+    // may change a file never tries; anything else this walk always finds.
+    if resolve & RESOLVE_CACHED != 0 && flags & (O_TRUNC | O_CREAT | O_TMPFILE) != 0 {
+        return Err(Errno::EAGAIN);
+    }
+    if flags & O_SYNC != 0 {
+        flags |= O_DSYNC;
+    }
+    let raw = path(c, a[1])?;
+    open_at(c, a[0], raw, flags, mode as u32, resolve & !RESOLVE_CACHED)
+}
+/// The mount `path` is on, for `RESOLVE_NO_XDEV`: procfs, devtmpfs and
+/// devpts, which Linux mounts at `/proc`, `/dev` and `/dev/pts`, or the
+/// guest's own mounts ([`device`]).
+fn mount_of(c: &Context<'_>, path: &[u8]) -> u64 {
+    let under = |root: &[u8]| {
+        path.strip_prefix(root)
+            .is_some_and(|rest| rest.is_empty() || rest[0] == b'/')
+    };
+    if under(b"/proc") {
+        u64::MAX
+    } else if under(b"/dev/pts") {
+        u64::MAX - 1
+    } else if under(b"/dev") {
+        u64::MAX - 2
+    } else {
+        device(c, path)
+    }
+}
+/// The path `openat2` opens for `raw` from `dir` with the `RESOLVE_*` flags
+/// `resolve`, as Linux's walk with them (`LOOKUP_NO_XDEV` and the rest)
+/// goes one name at a time, at most 40 symbolic links:
+/// - `RESOLVE_NO_SYMLINKS` follows no link (`ELOOP`), and
+///   `RESOLVE_NO_MAGICLINKS` none in `/proc/self/fd` or `exe` and `cwd`
+///   (`ELOOP`, `nd_jump_link`).
+/// - `RESOLVE_NO_XDEV` crosses no mount (`EXDEV`), as a name, `..`, a link
+///   to an absolute path or a magic link may.
+/// - `RESOLVE_BENEATH` stays in `dir`: an absolute path or link, `..` out
+///   of it and a magic link are `EXDEV`. `RESOLVE_IN_ROOT` takes `dir` as
+///   the root, where those stay, but for a magic link (`EXDEV`).
+///
+/// The last name is followed as `open` follows it (not with `O_NOFOLLOW`
+/// or `O_CREAT | O_EXCL`); a magic link there is left for the open to take
+/// ([`reopen`]).
+fn resolve_scoped(
+    c: &Context<'_>,
+    dir: u64,
+    raw: &[u8],
+    flags: u32,
+    resolve: u64,
+) -> Result<Vec<u8>, Errno> {
+    const O_NOFOLLOW: u32 = 0o400000;
+    let join = |parts: &[Vec<u8>]| -> Vec<u8> {
+        if parts.is_empty() {
+            return b"/".to_vec();
+        }
+        parts.iter().flat_map(|p| [&b"/"[..], p].concat()).collect()
+    };
+    let split = |p: &[u8]| -> Vec<Vec<u8>> {
+        p.split(|&b| b == b'/')
+            .filter(|p| !p.is_empty() && *p != b".")
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let scoped = resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT) != 0;
+    let start = paludarium_vfs::normalize_path(&c.files.path(dir, b".".to_vec())?)?;
+    let root = if scoped { split(&start) } else { Vec::new() };
+    let mut parts = if raw.first() == Some(&b'/') {
+        if resolve & RESOLVE_BENEATH != 0 {
+            return Err(EXDEV);
+        }
+        root.clone()
+    } else {
+        split(&start)
+    };
+    // `O_CREAT | O_EXCL` follows no last link either, as `build_open_flags`
+    // walks with `O_NOFOLLOW` then.
+    let follow_last = flags & O_NOFOLLOW == 0 && flags & 0o300 != 0o300;
+    let trailing_slash = raw.last() == Some(&b'/');
+    let mut pending: Vec<Vec<u8>> = raw
+        .split(|&b| b == b'/')
+        .rev()
+        .map(<[u8]>::to_vec)
+        .collect();
+    let mut links = 0;
+    while let Some(part) = pending.pop() {
+        let here = join(&parts);
+        match &part[..] {
+            b"" | b"." => continue,
+            b".." => {
+                if parts.len() <= root.len() {
+                    if resolve & RESOLVE_BENEATH != 0 {
+                        return Err(EXDEV);
+                    }
+                    continue;
+                }
+                let parent = join(&parts[..parts.len() - 1]);
+                if resolve & RESOLVE_NO_XDEV != 0 && mount_of(c, &parent) != mount_of(c, &here) {
+                    return Err(EXDEV);
+                }
+                parts.pop();
+                continue;
+            }
+            _ => {}
+        }
+        parts.push(part);
+        let candidate = join(&parts);
+        if resolve & RESOLVE_NO_XDEV != 0 && mount_of(c, &candidate) != mount_of(c, &here) {
+            return Err(EXDEV);
+        }
+        let last = pending.iter().all(|p| p.is_empty());
+        if last && !follow_last && !trailing_slash {
+            break;
+        }
+        let magic =
+            matches!(
+                crate::proc::own_entry(&candidate, c.process.pid),
+                Some(
+                    crate::proc::OwnEntry::Descriptor(_)
+                        | crate::proc::OwnEntry::Exe
+                        | crate::proc::OwnEntry::Cwd
+                )
+            ) || crate::proc::task_path(&candidate, c.process.pid, c.tid).is_some_and(|path| {
+                matches!(
+                    path.entry,
+                    crate::proc::TaskEntry::Exe | crate::proc::TaskEntry::Cwd
+                )
+            });
+        if magic {
+            // The link of a descriptor that is not open is not there.
+            if let Some(crate::proc::OwnEntry::Descriptor(n)) =
+                crate::proc::own_entry(&candidate, c.process.pid)
+            {
+                c.files
+                    .descriptor(u64::from(n))
+                    .map_err(|_| Errno::ENOENT)?;
+            }
+            if resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS) != 0 {
+                return Err(Errno(40)); // ELOOP
+            }
+            let target = match followed(c, &candidate, true)? {
+                Some(Followed::Path { path, .. }) => Some(path),
+                Some(Followed::File(_)) => None,
+                None => own_link_target(c, &candidate),
+            };
+            if resolve & RESOLVE_NO_XDEV != 0
+                && target
+                    .as_deref()
+                    .is_none_or(|target| mount_of(c, target) != mount_of(c, &here))
+            {
+                return Err(EXDEV);
+            }
+            if scoped {
+                return Err(EXDEV);
+            }
+            if last {
+                break;
+            }
+            parts = split(&target.ok_or(Errno::ENOTDIR)?);
+            continue;
+        }
+        let Some(link) = LinkPath::of(c, &candidate)? else {
+            continue;
+        };
+        if resolve & RESOLVE_NO_SYMLINKS != 0 {
+            return Err(Errno(40)); // ELOOP
+        }
+        links += 1;
+        if links > 40 {
+            return Err(Errno(40));
+        }
+        let target = link.target(c)?;
+        parts.pop();
+        if target.first() == Some(&b'/') {
+            if resolve & RESOLVE_BENEATH != 0 {
+                return Err(EXDEV);
+            }
+            if resolve & RESOLVE_NO_XDEV != 0
+                && mount_of(c, &join(&parts)) != mount_of(c, &join(&root))
+            {
+                return Err(EXDEV);
+            }
+            parts = root.clone();
+        }
+        pending.extend(target.split(|&b| b == b'/').rev().map(<[u8]>::to_vec));
+    }
+    let mut p = join(&parts);
+    if trailing_slash {
+        p.push(b'/');
+    }
+    Ok(p)
+}
+/// Where this process's `exe` or `cwd` link at `path` leads, or another
+/// task's.
+fn own_link_target(c: &Context<'_>, path: &[u8]) -> Option<Vec<u8>> {
+    if let Some(entry) = crate::proc::own_entry(path, c.process.pid) {
+        return own_link(c, entry);
+    }
+    let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
+    let task = tasks::find(c, &task_path).ok()?;
+    tasks::link(&task, task_path.entry)?.ok()
+}
 /// The file that opening guest path `p` gives, and the path its descriptor
 /// records: the generated files, a link in `/proc/self/fd` opened again,
 /// or the filesystem's file.
@@ -3439,7 +3844,7 @@ fn reopen(
         _ if d.path.is_empty() && is_pidfd => Ok((d.file.reopen(flags)?, Vec::new())),
         _ if d.path.is_empty() => Err(ENXIO),
         _ if generated(&d.path) => open_path(c, &d.path.clone(), flags, mode),
-        _ => match current_path(c, &d, stat.inode) {
+        _ => match current_path(c.files, &d, stat.inode) {
             Some(path) => open_path(c, &path, flags, mode),
             None => Ok((d.file.reopen(flags)?, d.path.clone())),
         },
@@ -3500,13 +3905,76 @@ pub(crate) fn resolved(files: &Files, path: &[u8]) -> Option<Vec<u8>> {
 }
 /// The path that still names the file of `d` (its recorded path resolved),
 /// or `None` once nothing does.
-fn current_path(c: &Context<'_>, d: &Descriptor, inode: u64) -> Option<Vec<u8>> {
-    let path = resolved(c.files, &d.path)?;
-    c.files
+fn current_path(files: &Files, d: &Descriptor, inode: u64) -> Option<Vec<u8>> {
+    let path = resolved(files, &d.path)?;
+    files
         .fs
         .metadata(&path, false)
         .is_ok_and(|s| s.inode == inode)
         .then_some(path)
+}
+/// Where a call that follows a link in `/proc/self/fd` (or one of `/dev`'s
+/// links to it) gets to: Linux's link is a "magic link", which leads to the
+/// descriptor's file itself, as `open` takes it ([`reopen`]).
+pub(crate) enum Followed {
+    /// A file a path still names, or a symbolic link itself, which an
+    /// `O_PATH | O_NOFOLLOW` descriptor holds and which is not followed
+    /// again (`follow` false).
+    Path { path: Vec<u8>, follow: bool },
+    /// A file no path names: a removed one, a memfd, a pipe or a socket,
+    /// which the call reaches through the descriptor's own file.
+    File(Descriptor),
+}
+/// What a call that follows path `p` (with `follow`) reaches, when `p` is a
+/// link in the `fd` directory of process `pid`: `None` for any other path,
+/// or when the call does not follow, and `ENOENT` for a descriptor that is
+/// not open, whose link is not there.
+pub(crate) fn through_descriptor(
+    files: &Files,
+    pid: u32,
+    p: &[u8],
+    follow: bool,
+) -> Result<Option<Followed>, Errno> {
+    if !follow {
+        return Ok(None);
+    }
+    let p = crate::devices::through_link(p).unwrap_or_else(|| p.to_vec());
+    let p = match crate::devices::entry(&p) {
+        Some(crate::devices::Entry::Link(target)) => target.to_vec(),
+        _ => p,
+    };
+    let Some(crate::proc::OwnEntry::Descriptor(n)) = crate::proc::own_entry(&p, pid) else {
+        return Ok(None);
+    };
+    let d = files.descriptor(u64::from(n)).map_err(|_| Errno::ENOENT)?;
+    let any = d.file.as_any();
+    if any.is_some_and(|v| v.is::<LinkPath>()) {
+        return Ok(Some(Followed::Path {
+            path: opened_path(&d),
+            follow: false,
+        }));
+    }
+    if d.path.is_empty() || any.is_some_and(|v| v.is::<crate::memfd::Memfd>()) {
+        return Ok(Some(Followed::File(d)));
+    }
+    if generated(&d.path) {
+        return Ok(Some(Followed::Path {
+            path: d.path.clone(),
+            follow: true,
+        }));
+    }
+    let inode = d.file.stat()?.inode;
+    Ok(Some(match current_path(files, &d, inode) {
+        Some(path) => Followed::Path {
+            path,
+            follow: false,
+        },
+        None => Followed::File(d),
+    }))
+}
+/// [`through_descriptor`] for this thread's process.
+fn followed(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {
+    through_descriptor(c.files, c.process.pid, p, follow)
 }
 /// What a link in `/proc/self/fd` reads: the path of a file on a mount
 /// (marked ` (deleted)` once removed), `pipe:[<inode>]`, `socket:[<inode>]`,
@@ -3542,7 +4010,7 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
         _ if any.is_some_and(|v| v.is::<LinkPath>()) => {
             paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())
         }
-        _ => current_path(c, d, stat.inode).unwrap_or_else(|| {
+        _ => current_path(c.files, d, stat.inode).unwrap_or_else(|| {
             let mut path = opened_path(d);
             path.extend_from_slice(b" (deleted)");
             path
@@ -3566,7 +4034,7 @@ pub(crate) fn mapped_path(c: &Context<'_>, d: &Descriptor) -> Option<Vec<u8>> {
         return Some(memfd.path());
     }
     let stat = d.file.stat().ok()?;
-    Some(current_path(c, d, stat.inode).unwrap_or_else(|| opened_path(d)))
+    Some(current_path(c.files, d, stat.inode).unwrap_or_else(|| opened_path(d)))
 }
 /// The entries of `/proc/self/fd`: `.`, `..` and a link per descriptor, in
 /// order, as Linux lists them.

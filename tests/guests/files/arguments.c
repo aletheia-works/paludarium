@@ -28,6 +28,8 @@ int main(void){
  S1(87,F);S1(87,H);S1(87,L);S1(84,G);
  fd=S3(2,F,66,0644);S3(1,fd,"hello world",11);
  S2(83,G,0755);
+ P("syscall number",{r=sc(dirty?W(39):39,0,0,0,0,0,0)==S0(39);});
+ P("negative syscall number",{r=sc(dirty?0x12345678ffffffffL:-1L,0,0,0,0,0,0);});
  /* files */
  P("open flags,mode",{long f=S3(2,F,D(0),D(0));r=f>=0;S1(3,f);});
  P("openat dfd,flags",{long f=S4(257,D(-100),F,D(0),D(0));r=f>=0;S1(3,f);});

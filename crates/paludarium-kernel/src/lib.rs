@@ -748,7 +748,10 @@ impl Kernel {
         self.group.apply_discards(&mut thread.state);
         self.group.sync_timer(&mut thread.state);
         account_cpu(&*self.host, &self.group, &mut thread.state);
-        let mut number = thread.cpu.gpr[reg::RAX];
+        // The number is an int, as Linux's do_syscall_64 takes it, compared
+        // unsigned: a dirty upper half of rax is not read, and a negative
+        // number is past every table (ENOSYS).
+        let mut number = u64::from(thread.cpu.gpr[reg::RAX] as u32);
         let mut args = [
             thread.cpu.gpr[reg::RDI],
             thread.cpu.gpr[reg::RSI],
@@ -758,7 +761,9 @@ impl Kernel {
             thread.cpu.gpr[reg::R9],
         ];
         arguments::narrow(number, &mut args);
-        thread.state.restart = signals::restarts_without_handler(number, &args).then_some(number);
+        // A restart puts back the whole register, as Linux puts back orig_ax.
+        thread.state.restart =
+            signals::restarts_without_handler(number, &args).then_some(thread.cpu.gpr[reg::RAX]);
         // clone reads only the low 32 bits of its flags, as Linux's sys_clone
         // does (lower_32_bits); clone3's wider flags reach the code below.
         if number == 56 {

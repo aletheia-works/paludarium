@@ -259,8 +259,8 @@ fn widths(number: u64) -> &'static [u8] {
     }
 }
 
-/// Narrows `args` of system call `number` to their C types, as Linux's
-/// syscall wrappers do.
+/// Narrows `args` of system call `number` (itself already cut to 32 bits by
+/// `Kernel::syscall`) to their C types, as Linux's syscall wrappers do.
 pub(crate) fn narrow(number: u64, args: &mut [u64; 6]) {
     for (arg, width) in args.iter_mut().zip(widths(number)) {
         *arg = match width {

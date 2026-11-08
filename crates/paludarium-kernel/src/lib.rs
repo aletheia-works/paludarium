@@ -12,6 +12,7 @@ mod arguments;
 mod coredump;
 mod credentials;
 mod inbox;
+mod landlock;
 mod permissions;
 mod signalfd;
 mod signals;

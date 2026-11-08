@@ -171,6 +171,13 @@ verified.
   `chown` gives a file, and those of a file a guest makes there, are kept
   only while the emulator runs, not on the host file. The next run sees
   every file there as root's again.
+- **Landlock**: only ABI version 3 is there, so `LANDLOCK_CREATE_RULESET_VERSION`
+  gives 3 where a recent Linux gives more: no network rules
+  (`LANDLOCK_RULE_NET_PORT`), no `LANDLOCK_ACCESS_FS_IOCTL_DEV`, no scopes, no
+  `landlock_restrict_self` flags and no errata query (`EINVAL`), and nothing
+  is logged. A rename's Landlock check comes after its permission checks,
+  where Linux's comes before them, which shows only when both refuse. A rule
+  on a file under `/proc` does not count for `execve`.
 - **Credentials**: the IDs and capabilities a thread takes are checked on
   files, signals, resource limits, priorities, socket credentials and core
   files but nowhere else yet. `F_SETOWN` records no sender's credentials, so

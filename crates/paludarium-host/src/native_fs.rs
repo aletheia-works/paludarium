@@ -44,7 +44,9 @@ type Key = (u64, u64);
 /// made took, for as long as this emulator runs. The host files themselves
 /// keep theirs, so a file with no entry shows as root's, as every host file
 /// did before. One table for the process, so that the same host file seen
-/// through two mounts has one owner.
+/// through two mounts has one owner. Removing a file leaves its entry, which
+/// a file made later with its inode drops ([`made`]), so the table grows
+/// with the files given an owner during the run.
 fn owners() -> std::sync::MutexGuard<'static, std::collections::HashMap<Key, (u32, u32)>> {
     static OWNERS: std::sync::OnceLock<Mutex<std::collections::HashMap<Key, (u32, u32)>>> =
         std::sync::OnceLock::new();
@@ -255,6 +257,7 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
         };
         #[cfg(not(windows))]
         let (inode, links) = (0, 1);
+        let (uid, gid) = owner_of((0, inode));
         Ok(FileStat {
             inode,
             size: m.len(),
@@ -265,8 +268,8 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
             } else {
                 0o100644
             },
-            uid: owner_of((0, inode)).0,
-            gid: owner_of((0, inode)).1,
+            uid,
+            gid,
             links,
             mtime_ns,
             rdev: 0,
@@ -304,6 +307,13 @@ impl NativeFs {
     /// [`made`] for the file just made at `p`; one that is gone already
     /// has nothing to drop.
     fn made(&self, p: &[u8]) {
+        if let Ok(key) = self.key(p, false) {
+            self.made_key(key, p);
+        }
+    }
+    /// [`made`] for the file `key`, just made at `p` or at the target of a
+    /// symbolic link there, in `p`'s directory.
+    fn made_key(&self, key: Key, p: &[u8]) {
         let parent = match p.iter().rposition(|b| *b == b'/') {
             Some(i) => &p[..i],
             None => &b"."[..],
@@ -311,9 +321,7 @@ impl NativeFs {
         let parent = self
             .metadata(if parent.is_empty() { b"." } else { parent }, true)
             .ok();
-        if let Ok(key) = self.key(p, false) {
-            made(key, parent.as_ref());
-        }
+        made(key, parent.as_ref());
     }
 }
 struct NativeFile {
@@ -702,7 +710,15 @@ impl HostFs for NativeFs {
             o.follow(FollowSymlinks::No);
         }
         let relative = path(p)?;
-        let existed = f & 64 == 0 || self.root.symlink_metadata(&relative).is_ok();
+        // Whether the open may make the file: through a symbolic link unless
+        // O_NOFOLLOW, as the open itself goes. A file another process makes
+        // in between is taken as the guest's.
+        let existed = f & 64 == 0
+            || if f & 131072 != 0 {
+                self.root.symlink_metadata(&relative).is_ok()
+            } else {
+                self.root.metadata(&relative).is_ok()
+            };
         let readonly_create = f & 3 == 0 && f & 64 != 0 && f & (128 | 512) == 0;
         if readonly_create {
             o.create(false);
@@ -730,7 +746,7 @@ impl HostFs for NativeFs {
             return Err(Errno::ENOTDIR);
         }
         if !existed {
-            self.made(p);
+            self.made_key(std_key(&file.metadata().map_err(err)?)?, p);
         }
         Ok(Arc::new(NativeFile {
             file: Mutex::new(file),
@@ -1062,6 +1078,7 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
         };
         #[cfg(not(windows))]
         let (inode, links) = (0, 1);
+        let (uid, gid) = owner_of((0, inode));
         Ok(FileStat {
             inode,
             size: m.len(),
@@ -1072,8 +1089,8 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
             } else {
                 0o100644
             },
-            uid: owner_of((0, inode)).0,
-            gid: owner_of((0, inode)).1,
+            uid,
+            gid,
             links,
             mtime_ns,
             rdev: 0,
@@ -1453,6 +1470,10 @@ mod files_tests {
             x.fs().open(b"d/g", 66, 0o600).unwrap();
             x.fs().mkdir(b"d/e", 0o755).unwrap();
             assert_eq!((ids(b"d/g"), ids(b"d/e")), ((0, 60), (0, 60)));
+            // O_CREAT through a dangling symbolic link makes its target.
+            x.fs().symlink(b"h", b"d/dl").unwrap();
+            x.fs().open(b"d/dl", 66, 0o600).unwrap();
+            assert_eq!(ids(b"d/h"), (0, 60));
         }
         drop(file);
     }

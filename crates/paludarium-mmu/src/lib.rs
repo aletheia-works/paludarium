@@ -1524,9 +1524,9 @@ impl AddressSpaceData {
     }
 
     /// Remembers the page at `page` in the [`Tlb`], and in this thread's
-    /// [`ThreadTlb`], when an access to it
-    /// needs only its protection checked: it is populated, and neither
-    /// shared nor of a file mapping, whose file may end before it.
+    /// [`ThreadTlb`], when an access to it needs only its protection
+    /// checked: it is populated, and neither shared nor of a file mapping,
+    /// whose file may end before it.
     fn remember(&self, directory: &Directory, page: u64) {
         let Some(p) = lookup(directory, page) else {
             return;
@@ -1643,9 +1643,9 @@ impl AddressSpaceData {
     }
 
     fn read_with(&self, addr: GuestAddr, buf: &mut [u8], access: Access) -> Result<(), Fault> {
-        // Not through the space's [`Tlb`], which holds the pages of every
+        // Not through the space's `Tlb`, which holds the pages of every
         // thread's writes: `remember` gives the page to this thread's
-        // [`ThreadTlb`] as well, for its next loads without the lock.
+        // `ThreadTlb` as well, for its next loads without the lock.
         let ready = |directory: &Directory, page: u64| {
             lookup(directory, page).is_some_and(|p| !self.may_be_truncated(page, p))
         };
@@ -3221,9 +3221,11 @@ impl AddressSpace {
             AtomicOp::Neg => (old.wrapping_neg(), true),
         };
         Self::write_locked(data, addr, &(new & mask).to_le_bytes()[..len])?;
-        // A locked instruction is a full fence. The lock no longer orders a
-        // later load, which takes none, and an `Acquire` load may pass an
-        // earlier store on Arm: Go's scheduler, for one, depends on it not.
+        // A locked instruction is a full fence. Earlier stores already come
+        // before its store: every store takes this lock and is a `Release`
+        // store, and so is this one. But the lock no longer orders a later
+        // load, which takes none, and an `Acquire` load may pass an earlier
+        // store on Arm: Go's scheduler, for one, depends on it not.
         std::sync::atomic::fence(Ordering::SeqCst);
         Ok(AtomicResult { old, exchanged })
     }

@@ -199,11 +199,15 @@ impl Locks {
     /// Whether process `pid` waiting for `blocker` would wait forever: the
     /// chain of processes waiting for each other's record locks leads back to
     /// it, as `posix_locks_deadlock` finds. A description's locks take no part.
-    pub(crate) fn would_deadlock(&self, pid: u32, blocker: &Owner) -> bool {
+    #[cfg(test)]
+    fn would_deadlock(&self, pid: u32, blocker: &Owner) -> bool {
+        let waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::closes_cycle(&waiting, pid, blocker)
+    }
+    fn closes_cycle(waiting: &BTreeMap<u32, u32>, pid: u32, blocker: &Owner) -> bool {
         let &Owner::Process(mut next) = blocker else {
             return false;
         };
-        let waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..MAX_DEADLOCK_ITERATIONS {
             if next == pid {
                 return true;
@@ -215,6 +219,24 @@ impl Locks {
         }
         false
     }
+    /// Records that process `pid` waits for `blocker`'s record lock, or with
+    /// `false` that the wait would close a cycle. One check under one lock,
+    /// as Linux holds `blocked_lock_lock` from `posix_locks_deadlock` to
+    /// `__locks_insert_block`: two processes asking for each other's locks at
+    /// once cannot both miss the cycle and wait forever.
+    pub(crate) fn wait_for_owner(&self, pid: u32, blocker: &Owner) -> bool {
+        let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        if Self::closes_cycle(&waiting, pid, blocker) {
+            waiting.remove(&pid);
+            return false;
+        }
+        match blocker {
+            &Owner::Process(other) => waiting.insert(pid, other),
+            Owner::Description(_) => waiting.remove(&pid),
+        };
+        true
+    }
+    #[cfg(test)]
     fn wait_for(&self, pid: u32, blocker: u32) {
         self.waiting
             .lock()
@@ -364,14 +386,8 @@ pub(crate) fn fcntl(
             }
             Err(_) if !wait => return Err(Errno::EAGAIN),
             Err(blocker) => {
-                if !ofd && locks.would_deadlock(pid, &blocker.owner) {
-                    locks.stop_waiting(pid);
+                if !ofd && !locks.wait_for_owner(pid, &blocker.owner) {
                     return Err(Errno(35));
-                }
-                if let Owner::Process(other) = blocker.owner
-                    && !ofd
-                {
-                    locks.wait_for(pid, other);
                 }
                 if let Err(e) = crate::files::pause_for_lock(c) {
                     locks.stop_waiting(pid);
@@ -479,5 +495,15 @@ mod tests {
         assert!(!locks.would_deadlock(4, &Owner::Process(2)));
         locks.stop_waiting(3);
         assert!(!locks.would_deadlock(1, &Owner::Process(2)));
+    }
+
+    #[test]
+    fn the_second_of_two_waiters_for_each_other_gets_the_deadlock() {
+        let locks = Locks::default();
+        assert!(locks.wait_for_owner(1, &Owner::Process(2)));
+        assert!(!locks.wait_for_owner(2, &Owner::Process(1)));
+        // The refused one waits for nothing; the first still waits.
+        assert!(!locks.would_deadlock(1, &Owner::Process(2)));
+        assert!(locks.would_deadlock(2, &Owner::Process(1)));
     }
 }

@@ -243,6 +243,14 @@ impl MemoryMeter {
 /// store to store. Only a store followed by a load may be reordered, as on
 /// x86. The space's lock orders the accesses as well today; these orders
 /// let an access go without it. On an x86-64 host they cost nothing.
+///
+/// Two writes of a piece of a word still load and store it apart, which is
+/// right only while the space's lock keeps other threads off the frame:
+/// [`Self::write_exclusive`] and the one in
+/// [`AddressSpaceData::write_value_cached`]. Threads of one space (`CLONE_VM`)
+/// share a private page's frame, so without the lock two of them writing
+/// other bytes of one word would lose one write: these must become the
+/// `AcqRel` read-modify-write [`Self::write`] uses when the lock goes.
 struct FrameBytes {
     /// The bytes as little-endian words, so that an aligned word of a guest
     /// takes one atomic access, where each byte would take its own.
@@ -2368,7 +2376,7 @@ pub struct AtomicResult {
 }
 
 /// A shared address space. Every memory and mapping operation takes the
-/// space's lock, and all but an access through the [`Tlb`] also take the
+/// space's lock, and all but an access through the TLB also take the
 /// session's serialization lock. The private data implementation never calls
 /// back through this public wrapper (no reentry).
 pub struct AddressSpace {

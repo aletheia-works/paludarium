@@ -483,6 +483,20 @@ pub fn load_with(
     load_image(&bytes, Some(&name), start, mem, Some((fs, interpreter)))
 }
 
+/// Loads the program `bytes`, read from a file that `name` names in
+/// `/proc/self/exe` and the maps, as [`load_with`] loads one from a path: a
+/// memfd or a removed file, which `execveat` runs through its descriptor.
+pub fn load_file_with(
+    fs: &dyn FileSystem,
+    bytes: &[u8],
+    name: &[u8],
+    start: &StartInfo<'_>,
+    mem: &mut AddressSpace,
+    interpreter: InterpreterCheck<'_>,
+) -> Result<LoadedImage, LoadError> {
+    load_image(bytes, Some(name), start, mem, Some((fs, interpreter)))
+}
+
 /// Loads an ELF image from memory.
 pub fn load_bytes(
     bytes: &[u8],

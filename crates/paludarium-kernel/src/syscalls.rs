@@ -2615,12 +2615,12 @@ fn sys_sched_rr_get_interval(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// flag only for `PRIVATE_EXPEDITED_RSEQ`, the registrations each private
 /// command needs (`EPERM` without), and `GET_REGISTRATIONS` reporting them
 /// with Linux's bits of state, one set for the address space, which a
-/// fork copies and an exec starts without. Each barrier is a host fence:
-/// every guest memory access already takes its address space's lock,
-/// which orders it with the other threads' accesses as a barrier on each
-/// would.
+/// fork copies and an exec starts without. Each barrier is one on every
+/// thread of the address space ([`AddressSpace::barrier`]). Other processes
+/// share only shared memory, whose every access takes the session's
+/// serialization lock, which the barrier takes too.
 fn sys_membarrier(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    use std::sync::atomic::{Ordering, fence};
+    use std::sync::atomic::Ordering;
     const QUERY: i32 = 0;
     const GLOBAL: i32 = 1;
     const GLOBAL_EXPEDITED: i32 = 1 << 1;
@@ -2664,13 +2664,13 @@ fn sys_membarrier(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if state.load(Ordering::SeqCst) & ready == 0 {
             return err(Errno::EPERM);
         }
-        fence(Ordering::SeqCst);
+        c.mem.barrier();
         ok(0)
     };
     match cmd {
         QUERY => ok(0x3ff),
         GLOBAL | GLOBAL_EXPEDITED => {
-            fence(Ordering::SeqCst);
+            c.mem.barrier();
             ok(0)
         }
         REGISTER_GLOBAL_EXPEDITED => register(GLOBAL_STATE, GLOBAL_READY),

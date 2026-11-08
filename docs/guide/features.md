@@ -593,9 +593,10 @@ kernel.
   commands give `EPERM` until the address space registers for them, a fork
   keeps the registrations and an exec starts with none, and `MEMBARRIER_CMD_GET_REGISTRATIONS`
   reports them with Linux's bits (registering `SYNC_CORE` marks the space
-  private too). A barrier is a fence on the host: every guest memory access
-  already takes its address space's lock, which orders it with the other
-  threads' as a barrier on each of them would.
+  private too). A barrier is one on every thread of the address space, as
+  Linux's interrupts give: most accesses take no lock, so it takes the
+  space's locks and moves the epoch of the threads' TLBs on, which waits for
+  each store under way and sends each thread's next access to the locks.
 - `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
   with `CLONE_FS` its own working directory and umask, as Linux. With
   `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is

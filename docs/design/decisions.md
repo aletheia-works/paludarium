@@ -31,12 +31,22 @@ cache of the private pages used last (a software TLB of 64 entries) lets the
 next access to one of them skip the page table, still checking its
 protection; it is emptied whenever a mapping or a page entry may change.
 
-Each guest thread has a TLB of its own for its loads and instruction fetches,
-which take no lock: threads that only read their memory then do not wait for
-each other. The TLB is valid while the address space keeps the epoch it was
-filled at. The epoch moves on wherever the TLB used to be emptied, and every
-load compares it. Writes still take the address space's lock, and so do
-locked instructions, which are full fences.
+Each guest thread has a TLB of its own. Its loads, stores and instruction
+fetches, and its locked instructions within one 8-byte word, take no lock
+when the TLB holds the page, so threads do not wait for each other. The TLB
+is valid while the address space keeps the epoch it was filled at. The epoch
+moves on whenever a mapping or a page entry may change, and every access
+compares it. A store says which epoch it is under while it is under way, and
+moving the epoch on waits until no store is under the old one. Then, as with
+Linux's TLB shootdown, no other thread writes through the old page after
+`mprotect` or `fork` returns.
+
+A locked instruction within one word is one compare-and-swap of the word, so
+it stays atomic against the stores that take no lock, and it is a full fence.
+A split lock across two words, or `CMPXCHG16B`, takes the locks and first
+moves the epoch on, which waits for the stores under way and sends the next
+ones to the locks. Until it ends, only loads run without a lock, and a load
+that spans the words may see one of them written before the other.
 
 A guest's threads see each other's memory in the order x86 gives (TSO): a
 thread's loads and stores stay in order, except that a load may pass an earlier

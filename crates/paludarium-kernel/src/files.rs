@@ -3305,14 +3305,26 @@ fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if size > PAGE_SIZE {
         return Err(E2BIG);
     }
-    // `copy_struct_from_user`: what a later version adds must be zero.
-    let mut how = vec![0; size as usize];
+    // `copy_struct_from_user`: what a later version adds must be zero, which
+    // `check_zeroed_user` reads a page at a time up to the first byte that
+    // is not, before the first version is copied.
+    let mut at = a[2].checked_add(OPEN_HOW_SIZE_VER0).ok_or(Errno::EFAULT)?;
+    let end = a[2].checked_add(size).ok_or(Errno::EFAULT)?;
+    while at < end {
+        let next = end.min((at | (PAGE_SIZE - 1)) + 1);
+        let mut tail = vec![0; (next - at) as usize];
+        c.mem
+            .read(GuestAddr(at), &mut tail)
+            .map_err(|_| Errno::EFAULT)?;
+        if tail.iter().any(|&b| b != 0) {
+            return Err(E2BIG);
+        }
+        at = next;
+    }
+    let mut how = [0; OPEN_HOW_SIZE_VER0 as usize];
     c.mem
         .read(GuestAddr(a[2]), &mut how)
         .map_err(|_| Errno::EFAULT)?;
-    if how[OPEN_HOW_SIZE_VER0 as usize..].iter().any(|&b| b != 0) {
-        return Err(E2BIG);
-    }
     let field = |i: usize| u64::from_le_bytes(how[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
     let (flags, mode, resolve) = (field(0), field(1), field(2));
     let mut flags = flags;

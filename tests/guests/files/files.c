@@ -656,8 +656,9 @@ void _start(void) {
   {long pd=S(2,"/proc/self/fd",0200000,0);HOW(0,0,8);results[x++]=O2(pd,numbered("",fd),24);
    HOW(0,0,0x10);results[x++]=O2(pd,numbered("",fd),24);HOW(0,0,1);results[x++]=O2(pd,numbered("",fd),24);
    HOW(0,0,0);OK2(pd,numbered("",fd));S(3,pd,0,0);}
-  /* RESOLVE_NO_XDEV: /proc and /dev are mounts of their own. */
-  HOW(0,0,1);OK2(t,"paludarium-files-fixture");OK2(-100,p);
+  /* RESOLVE_NO_XDEV: /proc and /dev are mounts of their own (whether
+     /tmp is one depends on the system, so nothing here crosses into it). */
+  HOW(0,0,1);OK2(t,"paludarium-files-fixture");
   results[x++]=O2(-100,"/proc/self/status",24);results[x++]=O2(-100,"/dev/null",24);
   results[x++]=O2(t,"../proc/self/status",24);
   HOW(0,0,0);OK2(-100,"/proc/self/status");

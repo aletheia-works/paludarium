@@ -1523,14 +1523,15 @@ mod files_tests {
         x.fs().open(b"b", 66, 0o600).unwrap();
         x.fs().mkdir(b"d", 0o755).unwrap();
         let size = |p: &[u8]| x.fs().metadata(p, false).map(|s| s.size);
-        assert_eq!(x.fs().rename_with(b"a", b"b", 1), Err(Errno::EEXIST));
         assert_eq!(x.fs().rename_with(b"a", b"b", 3), Err(Errno::EINVAL));
         if cfg!(any(target_os = "linux", target_vendor = "apple")) {
+            assert_eq!(x.fs().rename_with(b"a", b"b", 1), Err(Errno::EEXIST));
             x.fs().rename_with(b"a", b"d/c", 1).unwrap();
             x.fs().rename_with(b"d/c", b"b", 2).unwrap();
             assert_eq!((size(b"b"), size(b"d/c")), (Ok(3), Ok(0)));
             assert_eq!(x.fs().rename_with(b"b", b"e", 2), Err(Errno::ENOENT));
         } else {
+            assert_eq!(x.fs().rename_with(b"a", b"b", 1), Err(Errno::EINVAL));
             assert_eq!(x.fs().rename_with(b"a", b"c", 2), Err(Errno::EINVAL));
         }
     }

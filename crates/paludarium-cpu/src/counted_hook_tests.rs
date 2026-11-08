@@ -202,7 +202,7 @@ fn decode_hint_slot_collision_cannot_transfer_rejection() {
     let (mut cache, _) = cached_boundary();
     cache.reject_acceleration(4096, 1);
     let collision = (0..1 << 32)
-        .find(|&rip| rip != 4096 && DecodeCache::slot(rip) == DecodeCache::slot(4096))
+        .find(|&rip| rip != 4096 && cache.slot(rip) == cache.slot(4096))
         .unwrap();
     let instruction = paludarium_decoder::decode(&[0x90], GuestAddr(collision)).unwrap();
     cache.put(collision, 1, instruction);

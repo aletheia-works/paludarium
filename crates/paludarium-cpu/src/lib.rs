@@ -13,6 +13,8 @@ mod counted_hook_tests;
 mod cpuid;
 mod crypto;
 #[cfg(test)]
+mod decode_cache_tests;
+#[cfg(test)]
 mod encodings_tests;
 mod exec;
 #[cfg(test)]
@@ -44,24 +46,83 @@ pub use x87::X87;
 
 use exec::Stop;
 
-/// Number of entries of a [`DecodeCache`]: 2 MiB of 128-byte entries
-/// per guest thread. At 4096, programs as large as jj missed it on one
-/// instruction in nine, each miss decoding again.
-const CACHE_ENTRIES: usize = 16384;
+/// Number of entries a [`DecodeCache`] starts with: 2 MiB of 128-byte
+/// entries per guest thread. At 4096, programs as large as jj missed it on
+/// one instruction in nine, each miss decoding again.
+const INITIAL_ENTRIES: usize = 1 << 14;
+
+/// The most entries a [`DecodeCache`] grows to: 16 MiB. Perl compiling GNU
+/// parallel runs about 120,000 distinct instructions, and at 16384 entries
+/// one lookup in seven found another instruction in its slot; at 131072,
+/// one in fifty. The WebAssembly build keeps the size it had, as each
+/// Worker's cache takes from the one shared heap.
+#[cfg(not(target_family = "wasm"))]
+const MAX_ENTRIES: usize = 1 << 17;
+#[cfg(target_family = "wasm")]
+const MAX_ENTRIES: usize = INITIAL_ENTRIES;
+
+/// A [`DecodeCache`] decides whether to grow after this many lookups have
+/// found another instruction in their slot.
+const GROWTH_WINDOW: u64 = 1 << 16;
+
+/// It doubles when more than one lookup in this many found another
+/// instruction in its slot. Misses after a code change do not count: a
+/// larger cache would not keep them.
+const GROWTH_RATIO: u64 = 64;
 
 /// Decoded instructions by address. An entry is used only while the
 /// address space's [`AddressSpace::code_generation`] is unchanged, so
 /// writes to executable memory and mapping changes (self-modifying code,
 /// `mprotect`, `munmap`) are always seen. A cache serves one address space:
 /// make a new one for another (as after `execve`).
+///
+/// It starts small, as most threads and processes run little code, and
+/// doubles up to [`MAX_ENTRIES`] while the instructions a thread runs
+/// often keep taking each other's slots.
 pub struct DecodeCache {
     entries: Vec<Option<Entry>>,
+    /// The number of entries less one; their number is a power of two.
+    mask: u64,
+    growth: Growth,
+}
+
+/// When a [`DecodeCache`] grows.
+#[derive(Default)]
+struct Growth {
+    /// Lookups so far.
+    lookups: u64,
+    /// `lookups` when the current window started.
+    window_start: u64,
+    /// Lookups in the current window that found another instruction in
+    /// their slot.
+    collisions: u64,
+    /// Set when a window decided to grow; done at the next lookup, when no
+    /// entry is borrowed.
+    pending: bool,
+}
+
+impl Growth {
+    /// Counts a lookup that found another instruction in its slot of a
+    /// cache of `entries`.
+    #[cold]
+    fn collided(&mut self, entries: usize) {
+        self.collisions += 1;
+        if self.collisions < GROWTH_WINDOW {
+            return;
+        }
+        let lookups = self.lookups.wrapping_sub(self.window_start);
+        self.pending = entries < MAX_ENTRIES && lookups < GROWTH_WINDOW * GROWTH_RATIO;
+        self.collisions = 0;
+        self.window_start = self.lookups;
+    }
 }
 
 impl Default for DecodeCache {
     fn default() -> Self {
         DecodeCache {
-            entries: vec![None; CACHE_ENTRIES],
+            entries: vec![None; INITIAL_ENTRIES],
+            mask: INITIAL_ENTRIES as u64 - 1,
+            growth: Growth::default(),
         }
     }
 }
@@ -104,9 +165,40 @@ impl DecodeCache {
         Self::default()
     }
 
-    fn slot(rip: u64) -> usize {
-        // CACHE_ENTRIES is a power of two; the mask keeps the index in range.
-        usize::try_from((rip ^ (rip >> 12)) & (CACHE_ENTRIES as u64 - 1)).unwrap_or(0)
+    /// The slot of `rip` in a cache whose entries less one are `mask`.
+    fn slot_in(mask: u64, rip: u64) -> usize {
+        // The number of entries is a power of two; the mask keeps the index
+        // in range.
+        usize::try_from((rip ^ (rip >> 12)) & mask).unwrap_or(0)
+    }
+
+    fn slot(&self, rip: u64) -> usize {
+        Self::slot_in(self.mask, rip)
+    }
+
+    /// Counts a lookup, first doubling the cache if the last window decided
+    /// to.
+    #[inline]
+    fn lookup(&mut self) {
+        if self.growth.pending {
+            self.grow();
+        }
+        self.growth.lookups = self.growth.lookups.wrapping_add(1);
+    }
+
+    /// Doubles the cache. The entries move to their new slots, so none is
+    /// decoded again.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        self.growth.pending = false;
+        let mask = self.mask * 2 + 1;
+        let mut entries = vec![None; self.entries.len() * 2];
+        for entry in self.entries.drain(..).flatten() {
+            entries[Self::slot_in(mask, entry.rip)] = Some(entry);
+        }
+        self.entries = entries;
+        self.mask = mask;
     }
 
     /// The instruction at `rip` under `generation`, decoded by `decode`
@@ -118,10 +210,15 @@ impl DecodeCache {
         generation: u64,
         decode: impl FnOnce() -> Result<Instruction, ExitReason>,
     ) -> Result<&Decoded, ExitReason> {
-        let entry = &mut self.entries[Self::slot(rip)];
+        self.lookup();
+        let entries = self.entries.len();
+        let entry = &mut self.entries[Self::slot_in(self.mask, rip)];
         match entry {
             Some(e) if e.rip == rip && e.generation == generation => Ok(&e.decoded),
             _ => {
+                if entry.is_some_and(|e| e.rip != rip) {
+                    self.growth.collided(entries);
+                }
                 let decoded = Decoded::new(decode()?);
                 let e = entry.insert(Entry {
                     rip,
@@ -134,9 +231,15 @@ impl DecodeCache {
         }
     }
 
+    /// Stores the instruction that a [`Self::get_with_hint`] after a
+    /// [`Self::lookup`] did not find.
     fn put(&mut self, rip: u64, generation: u64, instruction: Instruction) -> Decoded {
         let decoded = Decoded::new(instruction);
-        self.entries[Self::slot(rip)] = Some(Entry {
+        let slot = self.slot(rip);
+        if self.entries[slot].is_some_and(|e| e.rip != rip) {
+            self.growth.collided(self.entries.len());
+        }
+        self.entries[slot] = Some(Entry {
             rip,
             generation,
             decoded,
@@ -146,14 +249,15 @@ impl DecodeCache {
     }
 
     fn get_with_hint(&self, rip: u64, generation: u64) -> Option<(Decoded, bool)> {
-        match &self.entries[Self::slot(rip)] {
+        match &self.entries[self.slot(rip)] {
             Some(e) if e.rip == rip && e.generation == generation => Some((e.decoded, e.rejected)),
             _ => None,
         }
     }
 
     fn reject_acceleration(&mut self, rip: u64, generation: u64) {
-        if let Some(e) = &mut self.entries[Self::slot(rip)]
+        let slot = self.slot(rip);
+        if let Some(e) = &mut self.entries[slot]
             && e.rip == rip
             && e.generation == generation
         {
@@ -164,7 +268,7 @@ impl DecodeCache {
     #[cfg(feature = "cost-profile")]
     fn observe_slot(&self, rip: u64, generation: u64) {
         use jit_cost::{Counter, add};
-        let counter = match &self.entries[Self::slot(rip)] {
+        let counter = match &self.entries[self.slot(rip)] {
             None => Counter::DecodeSlotEmpty,
             Some(e) if e.rip != rip => Counter::DecodeSlotRipCollision,
             Some(e) if e.generation != generation => Counter::DecodeSlotEpochStale,
@@ -531,6 +635,7 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
         if CACHE_REJECTIONS {
             cache.observe_slot(state.rip.0, generation);
         }
+        cache.lookup();
         let (decoded, rejected) = match cache.get_with_hint(state.rip.0, generation) {
             Some(entry) => entry,
             None => match fetch_for_state(state, mem) {

@@ -1880,6 +1880,9 @@ impl Kernel {
         if let Some(mask) = self.group.affinity(parent.tid) {
             group.set_affinity(pid, mask);
         }
+        self.group
+            .numa()
+            .new_process(group.numa(), parent.tid, pid, flags & 0x100 != 0);
         group.register(pid, inbox.clone());
         let mut state = parent.state.clone();
         state.pid = pid;

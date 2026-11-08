@@ -156,6 +156,9 @@ verified.
     locked memory where Linux gives `EINVAL`, `mlock` succeeds on the pages of a
     file mapping past the end of the file where Linux gives `ENOMEM`, and
     `/proc` shows no locked memory.
+  - A memory policy that `mbind` gives a shared mapping belongs to that
+    mapping, where Linux keeps it with the shared memory itself, for every
+    process that maps it. `/proc/<pid>/numa_maps` does not exist.
 - **Extended attributes**: a mounted host directory behaves as a file system
   without them, so reading finds none (`ENODATA`) and writing gives `EOPNOTSUPP`.
   In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), a value

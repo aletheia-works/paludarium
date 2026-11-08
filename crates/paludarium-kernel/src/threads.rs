@@ -28,6 +28,8 @@ pub struct ThreadGroup {
     /// The CPU mask `sched_setaffinity` gave each thread, which Linux keeps
     /// per thread; one without lets every CPU run it.
     affinity: Mutex<BTreeMap<u32, Vec<u64>>>,
+    /// The NUMA memory policies of its threads and of its address space.
+    numa: crate::mempolicy::Numa,
     /// What signalling each thread looks at, for other processes to read;
     /// a thread without one is root's ([`TaskIds`]).
     task_ids: Mutex<BTreeMap<u32, TaskIds>>,
@@ -86,6 +88,7 @@ impl Default for ThreadGroup {
             members: Mutex::new(BTreeMap::new()),
             nice: Mutex::default(),
             affinity: Mutex::default(),
+            numa: crate::mempolicy::Numa::default(),
             task_ids: Mutex::default(),
             status: Mutex::new(None),
             actions: Mutex::default(),
@@ -190,6 +193,8 @@ impl ThreadGroup {
             affinity.insert(pid, mask);
         }
         drop(affinity);
+        // And its memory policy; the new address space has none of its own.
+        self.numa.exec(old_tid, pid);
         self.retired
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -429,6 +434,10 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&tid)
             .copied()
+    }
+    /// The NUMA memory policies ([`crate::mempolicy`]).
+    pub(crate) fn numa(&self) -> &crate::mempolicy::Numa {
+        &self.numa
     }
     /// The CPU mask of thread `tid`, if `sched_setaffinity` gave it one.
     pub(crate) fn affinity(&self, tid: u32) -> Option<Vec<u64>> {
@@ -1041,6 +1050,8 @@ impl Kernel {
         if let Some(mask) = self.group.affinity(parent.tid) {
             self.group.set_affinity(tid, mask);
         }
+        // And its memory policy.
+        self.group.numa().new_thread(parent.tid, tid);
         self.group.register(tid, inbox);
         // Linux ignores unsuccessful parent/child TID stores (native case 23).
         if flags & 0x100000 != 0 {

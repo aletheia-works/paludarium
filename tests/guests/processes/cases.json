@@ -10,6 +10,7 @@
     {"name":"fork","binary":"process"},
     {"name":"uname","binary":"process"},
     {"name":"affinity","binary":"process"},
+    {"name":"mempolicy","binary":"process"},
     {"name":"ids","binary":"process"},
     {"name":"access","binary":"process"},
     {"name":"chown","binary":"process"},

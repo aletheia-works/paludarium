@@ -55,7 +55,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `msync`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -533,6 +533,16 @@ kernel.
   another process too, as root may, and give `ESRCH` when no live thread
   has the ID. `getcpu` gives the lowest CPU the thread's mask allows, and
   NUMA node 0.
+- The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
+  every mode Linux 6.9 has, with its flags, and check the node mask as Linux
+  does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,
+  and so is a bit past Linux's 1024 nodes. `get_mempolicy` reports the
+  thread's policy, a range's (`MPOL_F_ADDR`), the allowed nodes
+  (`MPOL_F_MEMS_ALLOWED`) and node 0 for a page or the next interleaved one
+  (`MPOL_F_NODE`). A new thread or process takes its creator's policy and
+  `execve` keeps it; a process's ranges keep theirs through `fork` and
+  `mremap`, until the pages are unmapped or mapped anew. All memory is on
+  node 0, so no policy moves a page.
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like
   `CPUID`, it does not reveal the host. The guest starts as root (user and
   group 0, with every capability). Each thread has its own credentials, as

@@ -62,6 +62,27 @@ static pid_t child(void) { return syscall(SYS_fork); }
 static void outcome(const char *name, long value) {
     printf("%s=%ld errno=%d\n", name, value, value < 0 ? errno : 0);
 }
+
+/* get_mempolicy's mode and first node word, with flags and an address. */
+static void policy(const char *name, unsigned long maxnode, void *addr, unsigned long flags) {
+    int mode = -1;
+    unsigned long nodes[2] = {~0UL, ~0UL};
+    errno = 0;
+    long r = syscall(SYS_get_mempolicy, &mode, nodes, maxnode, addr, flags);
+    printf("%s=%ld errno=%d mode=%d nodes=%#lx next=%#lx\n", name, r, r < 0 ? errno : 0, mode,
+           nodes[0], nodes[1]);
+}
+/* set_mempolicy with the node mask's first word. */
+static void set_policy(const char *name, long mode, unsigned long nodes, unsigned long maxnode) {
+    unsigned long mask[32] = {nodes};
+    outcome(name, syscall(SYS_set_mempolicy, mode, mask, maxnode));
+}
+static void *policy_thread(void *arg) {
+    (void)arg;
+    policy("thread-inherits", 65, NULL, 0);
+    set_policy("thread-sets", 2, 1, 65);
+    return NULL;
+}
 /* Touching a page that may lie past the end of its mapped file. */
 static sigjmp_buf bus_return;
 static volatile int bus_code;
@@ -3960,6 +3981,140 @@ int main(int argc, char **argv) {
         errno = 0;
         result("fault", syscall(SYS_uname, (void *)1));
         result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "mempolicy")) {
+        /* NUMA memory policies on a machine with one node, node 0, which the
+           emulator shows and the CI runners have. Modes: 0 default, 1
+           preferred, 2 bind, 3 interleave, 4 local, 5 preferred-many, 6
+           weighted interleave; flags 0x8000 static, 0x4000 relative, 0x2000
+           NUMA balancing. */
+        policy("default", 65, NULL, 0);
+        policy("default-129", 129, NULL, 0);
+        policy("default-1", 1, NULL, 0);
+        policy("maxnode-0", 0, NULL, 0);
+        policy("mems-allowed", 65, NULL, 4);
+        policy("mems-and-node", 65, NULL, 5);
+        policy("unknown-flag", 65, NULL, 8);
+        policy("addr-without-flag", 65, (void *)4096, 0);
+        policy("node-of-default", 65, NULL, 1);
+        errno = 0;
+        outcome("mode-fault", syscall(SYS_get_mempolicy, (void *)1, NULL, 0, NULL, 0));
+        outcome("mask-fault", syscall(SYS_get_mempolicy, NULL, (void *)1, 65, NULL, 0));
+        outcome("mask-too-big", syscall(SYS_get_mempolicy, NULL, (void *)1, 4096 * 8 + 2, NULL, 0));
+
+        set_policy("bind-0", 2, 1, 65);
+        policy("bind-0-get", 65, NULL, 0);
+        set_policy("bind-01", 2, 3, 65);
+        policy("bind-01-get", 65, NULL, 0);
+        set_policy("bind-1", 2, 2, 65);
+        policy("after-bind-1", 65, NULL, 0);
+        set_policy("bind-empty", 2, 0, 65);
+        set_policy("bind-maxnode-1", 2, 1, 1);
+        set_policy("interleave", 3, 1, 65);
+        policy("interleave-node", 65, NULL, 1);
+        set_policy("weighted", 6, 1, 65);
+        policy("weighted-get", 65, NULL, 0);
+        policy("weighted-node", 65, NULL, 1);
+        set_policy("preferred-empty", 1, 0, 65);
+        policy("preferred-empty-get", 65, NULL, 0);
+        set_policy("preferred-01", 1, 3, 65);
+        policy("preferred-01-get", 65, NULL, 0);
+        set_policy("preferred-many", 5, 1, 65);
+        policy("preferred-many-get", 65, NULL, 0);
+        set_policy("local", 4, 0, 65);
+        policy("local-get", 65, NULL, 0);
+        set_policy("local-nodes", 4, 1, 65);
+        set_policy("default-nodes", 0, 1, 65);
+        set_policy("mode-7", 7, 1, 65);
+        set_policy("static", 2 | 0x8000, 3, 65);
+        policy("static-get", 65, NULL, 0);
+        set_policy("relative", 3 | 0x4000, 4, 65);
+        policy("relative-get", 65, NULL, 0);
+        set_policy("static-relative", 2 | 0xc000, 1, 65);
+        set_policy("preferred-static-empty", 1 | 0x8000, 0, 65);
+        set_policy("balancing", 2 | 0x2000, 1, 65);
+        policy("balancing-get", 65, NULL, 0);
+        set_policy("balancing-interleave", 3 | 0x2000, 1, 65);
+        {
+            /* Bits up to MAX_NUMNODES (1024) beyond the nodes are dropped;
+               one past it is EINVAL. */
+            unsigned long mask[32] = {1};
+            mask[15] = 1UL << 63;
+            outcome("bit-1023", syscall(SYS_set_mempolicy, 2, mask, 1025));
+            mask[15] = 0;
+            mask[16] = 1;
+            outcome("bit-1024", syscall(SYS_set_mempolicy, 2, mask, 2000));
+            outcome("too-long", syscall(SYS_set_mempolicy, 2, mask, 4096 * 8 + 2));
+            outcome("nodes-fault", syscall(SYS_set_mempolicy, 2, (void *)1, 65));
+            outcome("null-nodes", syscall(SYS_set_mempolicy, 2, NULL, 65));
+        }
+
+        /* A thread starts with its creator's policy, and a new process with
+           the forking thread's. */
+        set_policy("interleave-again", 3, 1, 65);
+        pthread_t thread;
+        pthread_create(&thread, NULL, policy_thread, NULL);
+        pthread_join(thread, NULL);
+        policy("main-after-thread", 65, NULL, 0);
+        fflush(stdout);
+        pid_t pid = child();
+        if (pid == 0) {
+            policy("child-inherits", 65, NULL, 0);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+        set_policy("back-to-default", 0, 0, 65);
+        policy("default-again", 65, NULL, 0);
+
+        /* mbind: a policy for the pages of a range, which F_ADDR reports. */
+        char *map = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        unsigned long one[2] = {1};
+#define MBIND(a, l, m, n, f) syscall(SYS_mbind, (a), (l), (m), (n), 65, (f))
+        outcome("mbind", MBIND(map, 2 * 4096, 2, one, 0));
+        policy("addr-bound", 65, map + 4096 + 7, 2);
+        policy("addr-after", 65, map + 2 * 4096, 2);
+        policy("addr-node", 65, map, 3);
+        policy("task-unchanged", 65, NULL, 0);
+        outcome("mbind-unaligned", MBIND(map + 1, 4096, 2, one, 0));
+        outcome("mbind-zero", MBIND(map, 0, 2, one, 0));
+        outcome("mbind-zero-bad-mode", MBIND(map, 0, 7, one, 0));
+        outcome("mbind-empty", MBIND(map, 4096, 2, NULL, 0));
+        outcome("mbind-flag", MBIND(map, 4096, 2, one, 8));
+        outcome("mbind-strict", MBIND(map + 3 * 4096, 4096, 3, one, 1));
+        outcome("mbind-move", MBIND(map + 3 * 4096, 4096, 3, one, 2));
+        policy("addr-interleave", 65, map + 3 * 4096, 2);
+        outcome("mbind-default-part", MBIND(map + 4096, 4096, 0, NULL, 0));
+        policy("addr-split-low", 65, map, 2);
+        policy("addr-split-high", 65, map + 4096, 2);
+        munmap(map + 2 * 4096, 4096);
+        policy("addr-unmapped", 65, map + 2 * 4096, 2);
+        outcome("mbind-hole", MBIND(map, 4 * 4096, 2, one, 0));
+        outcome("mbind-hole-default", MBIND(map, 4 * 4096, 0, NULL, 0));
+        policy("hole-default-low", 65, map, 2);
+        outcome("mbind-all-hole", MBIND(map + 2 * 4096, 4096, 0, NULL, 0));
+        /* A new mapping over a range has no policy; a moved one keeps it. */
+        outcome("mbind-again", MBIND(map, 4096, 2, one, 0));
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            policy("child-range", 65, map, 2);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+        char *moved = mmap(NULL, 2 * 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        policy("addr-none-node", 65, moved, 3);
+        munmap(moved, 2 * 4096);
+        char *to = mremap(map, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, moved);
+        result("moved", to == moved);
+        policy("moved-policy", 65, moved, 2);
+        policy("moved-from", 65, map, 2);
+        char *fresh = mmap(moved, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        result("fresh", fresh == moved);
+        policy("fresh-policy", 65, moved, 2);
+#undef MBIND
         return 0;
     }
     if (!strcmp(mode, "affinity")) {

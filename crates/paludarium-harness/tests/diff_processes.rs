@@ -237,6 +237,7 @@ mod linux {
         processes_fork => ("fork","process"),
         processes_uname => ("uname","process"),
         processes_affinity => ("affinity","process"),
+        processes_mempolicy => ("mempolicy","process"),
         processes_ids => ("ids","process"),
         processes_access => ("access","process"),
         processes_chown => ("chown","process"),

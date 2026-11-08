@@ -142,10 +142,10 @@ verified.
     carries on without it. Its promise is that a thread's critical section is
     abandoned if it is preempted, which emulated threads running truly in
     parallel cannot keep, so registering would let per-CPU data break.
-  - `landlock_create_ruleset`, `pkey_alloc` and `io_uring_setup` are too, as on
-    a Linux built without them. Programs check for that and carry on. Saying
-    yes would be wrong without the rest: Landlock's rules would not be enforced,
-    and protection keys need the CPU feature, which `CPUID` does not report.
+  - `pkey_alloc` and `io_uring_setup` are too, as on a Linux built without
+    them. Programs check for that and carry on. Saying yes would be wrong
+    without the rest: protection keys need the CPU feature, which `CPUID` does
+    not report, and io_uring's rings would do no work.
   - `get_robust_list` of another process is `ESRCH`, where Linux gives it to a
     caller that may trace that process.
   - `mincore` counts a page of a file as in memory whenever it lies within the

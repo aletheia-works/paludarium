@@ -159,6 +159,10 @@ mod linux {
         case("nonblocking");
     }
     #[test]
+    fn network_landlock() {
+        case("landlock");
+    }
+    #[test]
     fn network_refused() {
         case("refused");
     }

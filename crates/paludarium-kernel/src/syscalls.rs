@@ -2017,6 +2017,12 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if descriptor.file.flags() & O_PATH != 0 {
             return Err(Errno::EBADF);
         }
+        // security_file_ioctl: Landlock's device right, before any command.
+        if descriptor.landlock & crate::landlock::IOCTL_DEV == 0
+            && let Ok(stat) = descriptor.file.stat()
+        {
+            crate::landlock::ioctl(descriptor.landlock, &stat, a[1] as u32)?;
+        }
         let file = descriptor.file;
         let read_int = |c: &Context<'_>| {
             let mut bytes = [0; 4];

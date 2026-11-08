@@ -151,9 +151,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルの持ち主とグループ、そしてゲストがそこに作ったファイルの持ち主とグループを、
   エミュレータが動いている間だけ覚えます。ホストのファイルには書きません。次に動かすと、
   そこのファイルはまたすべて root のものに見えます。
-- **Landlock**：ABI バージョン 3 だけなので、`LANDLOCK_CREATE_RULESET_VERSION` は、
-  新しい Linux より小さい 3 を返します。ネットワークのルール（`LANDLOCK_RULE_NET_PORT`）、
-  `LANDLOCK_ACCESS_FS_IOCTL_DEV`、スコープ、`landlock_restrict_self` のフラグ、
+- **Landlock**：ABI バージョン 5 だけなので、`LANDLOCK_CREATE_RULESET_VERSION` は、
+  新しい Linux より小さい 5 を返します。スコープ、`landlock_restrict_self` のフラグ、
   errata の問い合わせはありません（`EINVAL`）。何も記録しません。名前の変更での
   Landlock の確認は許可の確認の後で、Linux は前です。違いが出るのは両方が断るときだけです。
   `/proc` の下のファイルへのルールは、`execve` には効きません。開くときは、パスが

@@ -64,7 +64,7 @@ static void outcome(const char *name, long value) {
 }
 
 
-/* Landlock: raw system calls (444 to 446), ABI 3 rights only, which a newer
+/* Landlock: raw system calls (444 to 446), ABI 5 rights only, which a newer
    kernel shares. */
 #define LL_EXECUTE (1ULL << 0)
 #define LL_WRITE_FILE (1ULL << 1)
@@ -79,8 +79,30 @@ static void outcome(const char *name, long value) {
 #define LL_MAKE_SYM (1ULL << 12)
 #define LL_REFER (1ULL << 13)
 #define LL_TRUNCATE (1ULL << 14)
-#define LL_FS ((1ULL << 15) - 1)
+#define LL_IOCTL_DEV (1ULL << 15)
+#define LL_FS ((1ULL << 16) - 1)
+#define LL_BIND_TCP (1ULL << 0)
+#define LL_CONNECT_TCP (1ULL << 1)
 struct ll_path_beneath { unsigned long long allowed; int parent_fd; } __attribute__((packed));
+struct ll_ruleset_attr { unsigned long long fs, net; };
+struct ll_net_port { unsigned long long allowed, port; };
+/* An open's outcome: 0, or the errno. */
+static int ll_open(const char *path, int flags) {
+    int fd = open(path, flags, 0600);
+    if (fd < 0)
+        return errno;
+    close(fd);
+    return 0;
+}
+static int ll_call(long r) { return r < 0 ? errno : 0; }
+static long ll_net_ruleset(unsigned long long fs, unsigned long long net) {
+    struct ll_ruleset_attr attr = {fs, net};
+    return syscall(444, &attr, sizeof attr, 0);
+}
+static long ll_port(long ruleset, unsigned long long port, unsigned long long allowed) {
+    struct ll_net_port rule = {allowed, port};
+    return syscall(445, ruleset, 2, &rule, 0);
+}
 static long ll_ruleset(unsigned long long handled) {
     return syscall(444, &handled, sizeof handled, 0);
 }
@@ -96,15 +118,6 @@ static long ll_enforce(long ruleset) {
     close(ruleset);
     return r;
 }
-/* An open's outcome: 0, or the errno. */
-static int ll_open(const char *path, int flags) {
-    int fd = open(path, flags, 0600);
-    if (fd < 0)
-        return errno;
-    close(fd);
-    return 0;
-}
-static int ll_call(long r) { return r < 0 ? errno : 0; }
 /* get_mempolicy's mode and first node word, with flags and an address. */
 static void policy(const char *name, unsigned long maxnode, void *addr, unsigned long flags) {
     int mode = -1;
@@ -4470,6 +4483,7 @@ int main(int argc, char **argv) {
 
         long abi = syscall(444, NULL, 0, 1);
         result("abi-at-least-3", abi >= 3);
+        result("abi-at-least-5", abi >= 5);
         errno = 0;
         unsigned long long big[8] = {LL_READ_FILE};
         result("version-with-attr", ll_call(syscall(444, big, 8, 1)));
@@ -4555,6 +4569,7 @@ int main(int argc, char **argv) {
             close(fa);
             result("proc-status", ll_open("/proc/self/status", O_RDONLY));
             /* A child keeps the domain. */
+            fflush(stdout);
             fflush(stdout);
             pid_t grandchild = child();
             if (grandchild == 0) {
@@ -4715,6 +4730,94 @@ int main(int argc, char **argv) {
             char *argv[] = {"x", NULL};
             execv(tmp, argv);
             result("exec-outside", errno);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
+        /* ABI 4: the ruleset's network rights, and rules on TCP ports. */
+        {
+            struct ll_ruleset_attr unknown_net = {0, 1ULL << 40};
+            result("unknown-net-right", ll_call(syscall(444, &unknown_net, sizeof unknown_net, 0)));
+            long only_net = ll_net_ruleset(0, LL_BIND_TCP);
+            result("net-only-ruleset", only_net >= 0);
+            result("port-empty", ll_call(ll_port(only_net, 80, 0)));
+            result("port-unhandled", ll_call(ll_port(only_net, 80, LL_CONNECT_TCP)));
+            result("port-too-big", ll_call(ll_port(only_net, 65536, LL_BIND_TCP)));
+            result("port-null", ll_call(syscall(445, only_net, 2, NULL, 0)));
+            result("port", ll_call(ll_port(only_net, 80, LL_BIND_TCP)));
+            struct ll_path_beneath rule = {LL_READ_FILE, open(a, O_PATH)};
+            result("path-on-net-only", ll_call(syscall(445, only_net, 1, &rule, 0)));
+            close(rule.parent_fd);
+            close(only_net);
+            long only_fs = ll_ruleset(LL_READ_FILE);
+            result("port-on-fs-only", ll_call(ll_port(only_fs, 80, LL_BIND_TCP)));
+            rule.allowed = LL_IOCTL_DEV;
+            rule.parent_fd = open(a, O_PATH);
+            result("ioctl-unhandled", ll_call(syscall(445, only_fs, 1, &rule, 0)));
+            close(rule.parent_fd);
+            close(only_fs);
+        }
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            long r = ll_net_ruleset(0, LL_BIND_TCP | LL_CONNECT_TCP);
+            result("enforce-net", ll_call(ll_enforce(r)));
+            /* A layer that handles only the network still checks REFER for
+               the file layers' moves; a domain of only network layers checks
+               no file at all. */
+            char x[128];
+            snprintf(x, sizeof x, "%s/moved", b);
+            snprintf(tmp, sizeof tmp, "%s/net-only", a);
+            close(open(tmp, O_CREAT | O_WRONLY, 0644));
+            result("net-only-rename", ll_call(rename(tmp, x)));
+            result("net-only-read", ll_open(x, O_RDONLY));
+            long fs = ll_ruleset(LL_READ_FILE | LL_MAKE_REG | LL_REMOVE_FILE | LL_REFER);
+            ll_rule(fs, top, LL_READ_FILE | LL_MAKE_REG | LL_REMOVE_FILE | LL_REFER);
+            ll_enforce(fs);
+            result("mixed-rename", ll_call(rename(x, tmp)));
+            result("mixed-read", ll_open(x, O_RDONLY));
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
+        /* ABI 5: ioctl on a device needs IOCTL_DEV, but for the commands
+           every file answers; what an open kept stays. */
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            int before = open("/dev/null", O_RDONLY);
+            snprintf(tmp, sizeof tmp, "%s/regular", a);
+            int file = open(tmp, O_CREAT | O_RDONLY, 0644);
+            long r = ll_ruleset(LL_IOCTL_DEV);
+            result("ioctl-file-rule", ll_call(ll_rule(r, "/dev/zero", LL_IOCTL_DEV)));
+            result("enforce-ioctl", ll_call(ll_enforce(r)));
+            int null = open("/dev/null", O_RDONLY), zero = open("/dev/zero", O_RDONLY);
+            int n = 0;
+            result("fionread-null", ll_call(ioctl(null, FIONREAD, &n)));
+            result("tcgets-null", ll_call(ioctl(null, TCGETS, &n)));
+            result("fioclex-null", ll_call(ioctl(null, FIOCLEX)));
+            result("fionbio-null", ll_call(ioctl(null, FIONBIO, &n)));
+            result("figetbsz-null", ll_call(ioctl(null, FIGETBSZ, &n)));
+            result("fionread-zero", ll_call(ioctl(zero, FIONREAD, &n)));
+            result("fionread-before", ll_call(ioctl(before, FIONREAD, &n)));
+            result("fionread-file", ll_call(ioctl(file, FIONREAD, &n)));
+            int pipes[2];
+            pipe(pipes);
+            result("fionread-pipe", ll_call(ioctl(pipes[0], FIONREAD, &n)));
+            result("ioctl-bad-fd", ll_call(ioctl(9999, FIONREAD, &n)));
+            int path = open("/dev/null", O_PATH);
+            result("ioctl-o-path", ll_call(ioctl(path, FIONREAD, &n)));
+            /* Passed on: the right stays with the open file description. */
+            fflush(stdout);
+            pid_t grandchild = child();
+            if (grandchild == 0) {
+                result("child-fionread-null", ll_call(ioctl(null, FIONREAD, &n)));
+                fflush(stdout);
+                _exit(0);
+            }
+            waitpid(grandchild, NULL, 0);
             fflush(stdout);
             _exit(0);
         }
@@ -13202,6 +13305,7 @@ int main(int argc, char **argv) {
         if (middle == 0) {
             int ready[2];
             if (pipe(ready)) _exit(82);
+            fflush(stdout);
             pid_t grandchild = child();
             if (grandchild == 0) {
                 sigset_t set;

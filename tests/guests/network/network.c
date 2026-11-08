@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -363,6 +364,21 @@ static void receive_stamped(const char *name, int fd, size_t room, int flags, lo
         }
     printf("\n");
 }
+/* Landlock (ABI 4): a ruleset of TCP rights, a rule on a port, enforcing. */
+static long ll_ruleset(unsigned long long net) {
+    unsigned long long attr[2] = {0, net};
+    return syscall(444, attr, sizeof attr, 0);
+}
+static long ll_port(long ruleset, unsigned long long port, unsigned long long allowed) {
+    unsigned long long rule[2] = {allowed, port};
+    return syscall(445, ruleset, 2, rule, 0);
+}
+/* bind of a new socket of `domain` and `type` to `address`. */
+static void ll_bind(const char *name, int domain, int type, const void *address, socklen_t len) {
+    int s = socket(domain, type | SOCK_CLOEXEC, 0);
+    call(name, bind(s, address, len));
+    close(s);
+}
 static void on_alarm(int signal) { (void)signal; alarms++; }
 
 int main(int argc, char **argv) {
@@ -515,6 +531,61 @@ int main(int argc, char **argv) {
         call("recv-again", recv(fd, buf, sizeof buf, 0));
         close(ep);
         close(fd);
+        return 0;
+    }
+    if (!strcmp(mode, "landlock")) {
+        /* Landlock's TCP rights: bind and connect need a rule on the port,
+           checked after the address's length and family. */
+        enum { BIND = 1, CONNECT = 2 };
+        int probe = tcp(0);
+        struct sockaddr_in here = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+        socklen_t len = sizeof here;
+        bind(probe, (void *)&here, sizeof here);
+        getsockname(probe, (void *)&here, &len);
+        close(probe);
+        int free_port = ntohs(here.sin_port);
+        long r = ll_ruleset(BIND | CONNECT);
+        call("port", ll_port(r, open_port, CONNECT));
+        call("port-bind", ll_port(r, free_port, BIND));
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        call("enforce", syscall(446, r, 0));
+        close(r);
+        int fd = tcp(0);
+        struct sockaddr_in a = to(open_port);
+        call("connect-allowed", connect(fd, (void *)&a, sizeof a));
+        close(fd);
+        fd = tcp(0);
+        a = to(closed_port);
+        call("connect-denied", connect(fd, (void *)&a, sizeof a));
+        struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+        call("connect-unspec", connect(fd, &unspec, sizeof unspec));
+        call("connect-short", connect(fd, (void *)&a, 8));
+        call("connect-tiny", connect(fd, (void *)&a, 1));
+        close(fd);
+        here.sin_port = htons(free_port);
+        ll_bind("bind-allowed", AF_INET, SOCK_STREAM, &here, sizeof here);
+        here.sin_port = 0;
+        ll_bind("bind-any-port", AF_INET, SOCK_STREAM, &here, sizeof here);
+        here.sin_port = htons(closed_port);
+        ll_bind("bind-denied", AF_INET, SOCK_STREAM, &here, sizeof here);
+        ll_bind("bind-udp", AF_INET, SOCK_DGRAM, &here, sizeof here);
+        /* AF_UNSPEC binds as AF_INET only with the unspecified address. */
+        struct sockaddr_in unspec_any = {.sin_family = AF_UNSPEC, .sin_port = htons(free_port)};
+        ll_bind("bind-unspec-any", AF_INET, SOCK_STREAM, &unspec_any, sizeof unspec_any);
+        unspec_any.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ll_bind("bind-unspec-loopback", AF_INET, SOCK_STREAM, &unspec_any, sizeof unspec_any);
+        ll_bind("bind-unspec-short", AF_INET, SOCK_STREAM, &unspec_any, 8);
+        /* IPv6: AF_UNSPEC never binds, and another family is EINVAL. */
+        struct sockaddr_in6 six = {.sin6_family = AF_UNSPEC};
+        ll_bind("bind6-unspec", AF_INET6, SOCK_STREAM, &six, sizeof six);
+        ll_bind("bind6-unspec-short", AF_INET6, SOCK_STREAM, &six, 16);
+        six.sin6_family = AF_INET6;
+        six.sin6_port = htons(closed_port);
+        ll_bind("bind6-denied", AF_INET6, SOCK_STREAM, &six, sizeof six);
+        ll_bind("bind6-inet", AF_INET6, SOCK_STREAM, &here, sizeof here);
+        /* A family Landlock does not know is the protocol's to refuse. */
+        struct sockaddr unknown = {.sa_family = AF_UNIX};
+        ll_bind("bind-unix-family", AF_INET, SOCK_STREAM, &unknown, sizeof here);
         return 0;
     }
     if (!strcmp(mode, "refused")) {

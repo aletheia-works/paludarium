@@ -1468,9 +1468,10 @@ one only with an `--allow-net`.
   missing), in memory and in a host directory mounted on Linux or macOS.
   `RENAME_WHITEOUT` needs `CAP_MKNOD` (`EPERM`), and then gives `EINVAL`, as
   on a Linux filesystem without whiteouts.
-- Landlock restricts a thread's access to file hierarchies, at ABI version 3:
-  `landlock_create_ruleset` (and its version query), `landlock_add_rule` with
-  `LANDLOCK_RULE_PATH_BENEATH`, and `landlock_restrict_self` (which needs
+- Landlock restricts a thread's access to file hierarchies and TCP ports, at
+  ABI version 5: `landlock_create_ruleset` (and its version query),
+  `landlock_add_rule` with `LANDLOCK_RULE_PATH_BENEATH` and
+  `LANDLOCK_RULE_NET_PORT`, and `landlock_restrict_self` (which needs
   `no_new_privs` or `CAP_SYS_ADMIN`), up to 16 layers. Each layer allows a
   right it handles only beneath the files and directories its rules name, by
   device and inode, so a rule follows a renamed directory. Opening a file
@@ -1478,8 +1479,13 @@ one only with an `--allow-net`.
   `execve` and its interpreters, `EXECUTE`; making a name checks its
   directory for the `MAKE_*` right of its type, removing one `REMOVE_FILE` or
   `REMOVE_DIR`, and truncating `TRUNCATE`, which an open file description
-  keeps from its open. A link or rename to another directory needs `REFER`
-  and must not give the file more rights than it had (`EXDEV`). Threads,
+  keeps from its open. An `ioctl` on a character or block device needs
+  `IOCTL_DEV`, kept the same way, except for the commands every file answers
+  (`FIOCLEX`, `FIONBIO`, `FIGETBSZ` and the like). A link or rename to another
+  directory needs `REFER` and must not give the file more rights than it had
+  (`EXDEV`). A TCP socket's `bind` needs `LANDLOCK_ACCESS_NET_BIND_TCP` and its
+  `connect` `CONNECT_TCP` for the port, with Linux's checks of the address
+  first; UDP and `connect` to `AF_UNSPEC` are not checked. Threads,
   processes and `execve` keep the domain; `O_PATH`, `stat` and descriptors
   opened before are not checked.
 - Files can be placed before the start.

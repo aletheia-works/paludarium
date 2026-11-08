@@ -3408,3 +3408,87 @@ fn fchmod_and_fchown_change_pipes_and_sockets() {
     assert_eq!(stat(&mut f, a), (0o140_600, 0, 7));
     assert_eq!(stat(&mut f, b), (0o140_777, 0, 0));
 }
+#[test]
+fn landlock_restricts_tcp_ports_and_device_ioctls() {
+    const BIND: u64 = 1;
+    const CONNECT: u64 = 2;
+    const IOCTL_DEV: u64 = 1 << 15;
+    let mut f = network_fixture(&[]);
+    let errno = |e: i32| Errno(e).to_syscall_return();
+    // A ruleset of both sizes' fields: the network's, and a device right.
+    f.mem.write(GuestAddr(DATA), &[0; 32]).unwrap();
+    f.mem
+        .write(GuestAddr(DATA + 8), &(1u64 << 40).to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(444, [DATA, 16, 0, 0, 0, 0]), errno(22));
+    f.mem
+        .write(GuestAddr(DATA), &IOCTL_DEV.to_le_bytes())
+        .unwrap();
+    f.mem
+        .write(GuestAddr(DATA + 8), &(BIND | CONNECT).to_le_bytes())
+        .unwrap();
+    let ruleset = f.ret(444, [DATA, 16, 0, 0, 0, 0]);
+    assert!(ruleset < 1024);
+    let port = |f: &mut Fixture, allowed: u64, port: u64| {
+        f.mem
+            .write(GuestAddr(DATA + 0x40), &allowed.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 0x48), &port.to_le_bytes())
+            .unwrap();
+        f.ret(445, [ruleset, 2, DATA + 0x40, 0, 0, 0])
+    };
+    assert_eq!(port(&mut f, 0, 80), errno(42));
+    assert_eq!(port(&mut f, 4, 80), errno(22));
+    assert_eq!(port(&mut f, BIND, 65536), errno(22));
+    assert_eq!(f.ret(445, [ruleset, 2, 0, 0, 0, 0]), errno(14));
+    assert_eq!(port(&mut f, CONNECT, 8080), 0);
+    assert_eq!(port(&mut f, BIND, 9090), 0);
+    f.mem
+        .write(GuestAddr(DATA + 0x300), b"/dev/null\0")
+        .unwrap();
+    let before = f.ret(2, [DATA + 0x300, 0, 0, 0, 0, 0]);
+    assert!(before < 1024);
+    assert_eq!(f.ret(446, [ruleset, 0, 0, 0, 0, 0]), 0);
+    // An IPv4 address at DATA + 0x100: family, port, 127.0.0.1.
+    let address = |f: &mut Fixture, family: u16, port: u16| {
+        let mut raw = [0u8; 16];
+        raw[..2].copy_from_slice(&family.to_le_bytes());
+        raw[2..4].copy_from_slice(&port.to_be_bytes());
+        raw[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        f.mem.write(GuestAddr(DATA + 0x100), &raw).unwrap();
+    };
+    let tcp = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    address(&mut f, 2, 9091);
+    assert_eq!(f.ret(49, [tcp, DATA + 0x100, 16, 0, 0, 0]), errno(13));
+    assert_eq!(f.ret(49, [tcp, DATA + 0x100, 8, 0, 0, 0]), errno(22));
+    assert_eq!(f.ret(49, [tcp, DATA + 0x100, 1, 0, 0, 0]), errno(22));
+    address(&mut f, 0, 9090);
+    assert_eq!(f.ret(49, [tcp, DATA + 0x100, 16, 0, 0, 0]), errno(97));
+    address(&mut f, 1, 9091);
+    assert_eq!(f.ret(49, [tcp, DATA + 0x100, 16, 0, 0, 0]), errno(97));
+    address(&mut f, 2, 9090);
+    assert_eq!(f.ret(49, [tcp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let tcp = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    address(&mut f, 2, 8081);
+    assert_eq!(f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]), errno(13));
+    address(&mut f, 0, 8081);
+    assert_ne!(f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]), errno(13));
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    address(&mut f, 2, 9091);
+    assert_eq!(f.ret(49, [udp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    // IPv6: AF_UNSPEC never binds, and IPv4's family is EINVAL.
+    let six = f.ret(41, [10, 1, 0, 0, 0, 0]);
+    f.mem.write(GuestAddr(DATA + 0x100), &[0; 28]).unwrap();
+    assert_eq!(f.ret(49, [six, DATA + 0x100, 28, 0, 0, 0]), errno(97));
+    assert_eq!(f.ret(49, [six, DATA + 0x100, 16, 0, 0, 0]), errno(22));
+    address(&mut f, 2, 9091);
+    assert_eq!(f.ret(49, [six, DATA + 0x100, 16, 0, 0, 0]), errno(22));
+    // A device: FIONREAD needs IOCTL_DEV, FIOCLEX never does, and a
+    // descriptor opened before keeps every right.
+    let null = f.ret(2, [DATA + 0x300, 0, 0, 0, 0, 0]);
+    assert!(null < 1024);
+    assert_eq!(f.ret(16, [null, 0x541b, DATA, 0, 0, 0]), errno(13));
+    assert_eq!(f.ret(16, [null, 0x5451, 0, 0, 0, 0]), 0);
+    assert_ne!(f.ret(16, [before, 0x541b, DATA, 0, 0, 0]), errno(13));
+}

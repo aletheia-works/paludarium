@@ -2796,7 +2796,7 @@ fn landlock_restricts_access_beneath_its_rules() {
         assert_eq!(f.ret(3, &[fd]), 0);
     }
     // The version, and the attribute's checks.
-    assert_eq!(f.ret(444, &[0, 0, 1]), 3);
+    assert_eq!(f.ret(444, &[0, 0, 1]), 5);
     assert_eq!(f.ret(444, &[0, 0, 2]), errno(Errno::EINVAL));
     assert_eq!(f.ret(444, &[DATA, 8, 1]), errno(Errno::EINVAL));
     assert_eq!(f.ret(444, &[0, 8, 0]), errno(Errno::EFAULT));

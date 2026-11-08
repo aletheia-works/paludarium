@@ -1,16 +1,19 @@
 //! Landlock (`landlock_create_ruleset`, `landlock_add_rule`,
 //! `landlock_restrict_self`), as Linux's `security/landlock` restricts a
-//! thread's access to file hierarchies. This is ABI version 3: the file
-//! system access rights of versions 1 to 3 (`LANDLOCK_ACCESS_FS_EXECUTE` to
-//! `LANDLOCK_ACCESS_FS_TRUNCATE`, with `REFER`); network rules, device
-//! ioctls and scopes come with later versions, which this does not report.
+//! thread's access to file hierarchies and TCP ports. This is ABI version 5:
+//! the file system access rights of versions 1 to 3
+//! (`LANDLOCK_ACCESS_FS_EXECUTE` to `LANDLOCK_ACCESS_FS_TRUNCATE`, with
+//! `REFER`), TCP `bind` and `connect` by port (version 4) and `ioctl` on
+//! devices (`LANDLOCK_ACCESS_FS_IOCTL_DEV`, version 5); scopes and the later
+//! flags come with versions this does not report.
 //!
 //! A domain is a stack of up to 16 layers, one for each enforced ruleset.
 //! Each layer handles some access rights and allows them only beneath the
 //! files and directories its rules name; an access is allowed when every
 //! layer that handles it has a rule granting it on the file or one of its
 //! ancestors. Rules name objects by device and inode, as Linux ties them to
-//! inodes, so they follow a renamed directory and every link of a file.
+//! inodes, so they follow a renamed directory and every link of a file, and
+//! ports by number.
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
@@ -18,9 +21,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The ABI version `LANDLOCK_CREATE_RULESET_VERSION` reports.
-const ABI: u64 = 3;
+const ABI: u64 = 5;
 const CREATE_RULESET_VERSION: u64 = 1;
 const RULE_PATH_BENEATH: u64 = 1;
+const RULE_NET_PORT: u64 = 2;
 /// Linux's `LANDLOCK_MAX_NUM_LAYERS`.
 const MAX_LAYERS: usize = 16;
 
@@ -39,10 +43,15 @@ pub(crate) const MAKE_BLOCK: u64 = 1 << 11;
 pub(crate) const MAKE_SYM: u64 = 1 << 12;
 pub(crate) const REFER: u64 = 1 << 13;
 pub(crate) const TRUNCATE: u64 = 1 << 14;
+pub(crate) const IOCTL_DEV: u64 = 1 << 15;
 /// Every file system access right of this ABI.
-pub(crate) const FS: u64 = (1 << 15) - 1;
+pub(crate) const FS: u64 = (1 << 16) - 1;
 /// The rights a rule on a file that is not a directory may grant.
-const ACCESS_FILE: u64 = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE;
+const ACCESS_FILE: u64 = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV;
+pub(crate) const BIND_TCP: u64 = 1 << 0;
+pub(crate) const CONNECT_TCP: u64 = 1 << 1;
+/// Every network access right of this ABI.
+const NET: u64 = (1 << 2) - 1;
 
 /// A file or directory, as `stat` names it: device and inode.
 pub(crate) type Object = (u64, u64);
@@ -50,17 +59,24 @@ pub(crate) type Object = (u64, u64);
 /// A ruleset being built, behind a `[landlock-ruleset]` descriptor.
 pub(crate) struct Ruleset {
     handled: u64,
+    handled_net: u64,
     rules: Mutex<BTreeMap<Object, u64>>,
+    ports: Mutex<BTreeMap<u16, u64>>,
 }
 
 /// An enforced stack of rulesets (Linux's domain).
 #[derive(Debug)]
 pub(crate) struct Domain {
-    /// What each layer handles, the oldest first.
+    /// The file system rights each layer handles, the oldest first, with
+    /// `REFER` when it handles any (`landlock_upgrade_handled_access_masks`).
     layers: Vec<u64>,
+    /// The network rights each layer handles.
+    net: Vec<u64>,
     /// For each object, the layers with a rule on it and what that rule
     /// allows.
     rules: BTreeMap<Object, Vec<(usize, u64)>>,
+    /// For each port, the same.
+    ports: BTreeMap<u16, Vec<(usize, u64)>>,
 }
 
 /// A thread's domain, kept with its credentials: threads, processes and
@@ -80,11 +96,17 @@ impl PartialEq for Landlock {
 impl Eq for Landlock {}
 
 impl Landlock {
-    /// The domain, if one handles any of `request`.
+    /// The domain, if one handles any of the file system rights `request`.
     fn applicable(&self, request: u64) -> Option<&Domain> {
         self.0
             .as_deref()
             .filter(|d| d.layers.iter().any(|h| h & request != 0))
+    }
+    /// The domain, if one handles any of the network rights `request`.
+    fn applicable_net(&self, request: u64) -> Option<&Domain> {
+        self.0
+            .as_deref()
+            .filter(|d| d.net.iter().any(|h| h & request != 0))
     }
 }
 
@@ -94,10 +116,16 @@ impl Landlock {
 struct Masks(Vec<u64>);
 
 impl Masks {
-    /// `landlock_init_layer_masks`: the masks for `request`, and which of it
-    /// any layer handles.
+    /// `landlock_init_layer_masks`: the masks for the file system rights
+    /// `request`, and which of it any layer handles. Every layer handles
+    /// `REFER` here, even one that handles no other file right
+    /// (`landlock_get_fs_access_mask`).
     fn new(domain: &Domain, request: u64) -> (u64, Masks) {
-        let masks: Vec<u64> = domain.layers.iter().map(|h| h & request).collect();
+        Self::of(domain.layers.iter().map(|h| h | REFER), request)
+    }
+    /// The masks for `request`, of layers that handle `handled`.
+    fn of(handled: impl Iterator<Item = u64>, request: u64) -> (u64, Masks) {
+        let masks: Vec<u64> = handled.map(|h| h & request).collect();
         let handled = masks.iter().fold(0, |a, m| a | m);
         (handled, Masks(masks))
     }
@@ -107,10 +135,12 @@ impl Masks {
     /// `landlock_unmask_layers`: what a rule on an object grants. Returns
     /// whether every layer is now satisfied.
     fn unmask(&mut self, domain: &Domain, object: Option<Object>) -> bool {
-        if let Some(rule) = object.and_then(|o| domain.rules.get(&o)) {
-            for (layer, allowed) in rule {
-                self.0[*layer] &= !allowed;
-            }
+        self.grant(object.and_then(|o| domain.rules.get(&o)))
+    }
+    /// What `rule`, for each of its layers, grants.
+    fn grant(&mut self, rule: Option<&Vec<(usize, u64)>>) -> bool {
+        for (layer, allowed) in rule.into_iter().flatten() {
+            self.0[*layer] &= !allowed;
         }
         self.allowed()
     }
@@ -231,7 +261,8 @@ pub(crate) fn check_with(
 /// `hook_file_open`: the rights an open needs (`READ_DIR` for a directory,
 /// else `READ_FILE`, `WRITE_FILE` and `EXECUTE` as its mode asks) on the
 /// file at `path`, with `stat` its status. Returns the rights the open file
-/// description keeps (`TRUNCATE`), all of them for a thread without a domain.
+/// description keeps (`TRUNCATE`, and `IOCTL_DEV` for a device), all of them
+/// for a thread without a domain.
 pub(crate) fn open(
     c: &Context<'_>,
     path: &[u8],
@@ -257,7 +288,10 @@ pub(crate) fn open(
     if exec {
         request |= EXECUTE;
     }
-    let full = request | TRUNCATE;
+    let mut full = request | TRUNCATE;
+    if is_device(stat) {
+        full |= IOCTL_DEV;
+    }
     let (_, mut masks) = Masks::new(domain, full);
     walk(&|p| crate::files::identity(c, p), domain, path, &mut masks);
     let allowed = full & !masks.missing();
@@ -265,6 +299,95 @@ pub(crate) fn open(
         return Err(Errno(13));
     }
     Ok(allowed)
+}
+
+/// `is_device`: a character or block device.
+pub(crate) fn is_device(stat: &FileStat) -> bool {
+    matches!(stat.mode & 0o170000, 0o020000 | 0o060000)
+}
+
+/// `hook_file_ioctl`: `ioctl` command `command` on an open file description
+/// whose open kept the rights `allowed`, with `stat` its status. A device
+/// needs `IOCTL_DEV` unless the command is one `do_vfs_ioctl` answers for
+/// every file (`is_masked_device_ioctl`); as Linux's, this holds whoever
+/// calls, with or without a domain.
+pub(crate) fn ioctl(allowed: u64, stat: &FileStat, command: u32) -> Result<(), Errno> {
+    const MASKED: [u32; 14] = [
+        0x5451,      // FIOCLEX
+        0x5450,      // FIONCLEX
+        0x5421,      // FIONBIO
+        0x5452,      // FIOASYNC
+        0x5460,      // FIOQSIZE
+        0xc004_5877, // FIFREEZE
+        0xc004_5878, // FITHAW
+        0xc020_660b, // FS_IOC_FIEMAP
+        0x2,         // FIGETBSZ
+        0x4004_9409, // FICLONE
+        0x4020_940d, // FICLONERANGE
+        0xc018_9436, // FIDEDUPERANGE
+        0x8011_1500, // FS_IOC_GETFSUUID
+        0x8081_1501, // FS_IOC_GETFSSYSFSPATH
+    ];
+    if allowed & IOCTL_DEV != 0 || !is_device(stat) || MASKED.contains(&command) {
+        Ok(())
+    } else {
+        Err(Errno(13))
+    }
+}
+
+/// `current_check_access_socket`: `bind` (`BIND_TCP`) or `connect`
+/// (`CONNECT_TCP`) of a TCP socket of `v6` or IPv4 to the address `raw`,
+/// before the protocol looks at it. Only the port matters; a family other
+/// than IPv4, IPv6 and `AF_UNSPEC` is the protocol's to refuse.
+pub(crate) fn socket(c: &Context<'_>, v6: bool, raw: &[u8], request: u64) -> Result<(), Errno> {
+    const AF_UNSPEC: u16 = 0;
+    const AF_INET: u16 = 2;
+    const AF_INET6: u16 = 10;
+    // sizeof(struct sockaddr_in) and SIN6_LEN_RFC2133.
+    const V4_LEN: usize = 16;
+    const V6_LEN: usize = 24;
+    let Some(domain) = c.process.credentials.landlock.applicable_net(request) else {
+        return Ok(());
+    };
+    if raw.len() < 2 {
+        return Err(Errno::EINVAL);
+    }
+    let family = u16::from_le_bytes([raw[0], raw[1]]);
+    let length = match family {
+        // Dissolving a connection is always allowed.
+        AF_UNSPEC if request == CONNECT_TCP => return Ok(()),
+        // IPv4 binds the unspecified address of AF_UNSPEC as AF_INET; IPv6
+        // never does.
+        AF_UNSPEC if v6 => {
+            return Err(if raw.len() < V6_LEN {
+                Errno::EINVAL
+            } else {
+                Errno(97) // EAFNOSUPPORT
+            });
+        }
+        AF_UNSPEC => {
+            if raw.len() >= V4_LEN && raw[4..8] != [0; 4] {
+                return Err(Errno(97));
+            }
+            V4_LEN
+        }
+        AF_INET => V4_LEN,
+        AF_INET6 => V6_LEN,
+        _ => return Ok(()),
+    };
+    if raw.len() < length {
+        return Err(Errno::EINVAL);
+    }
+    if family != AF_UNSPEC && family != if v6 { AF_INET6 } else { AF_INET } {
+        return Err(Errno::EINVAL);
+    }
+    let port = u16::from_be_bytes([raw[2], raw[3]]);
+    let (handled, mut masks) = Masks::of(domain.net.iter().copied(), request);
+    if handled == 0 || masks.grant(domain.ports.get(&port)) {
+        Ok(())
+    } else {
+        Err(Errno(13))
+    }
 }
 
 /// `get_mode_access`: the right to make a file of `mode`.
@@ -472,8 +595,9 @@ pub(crate) fn sys_create_ruleset(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64
             Err(Errno::EINVAL)
         };
     }
-    // copy_min_struct_from_user: handled_access_fs, the only field of this
-    // ABI; any other byte the caller gives must be zero.
+    // copy_min_struct_from_user: at least handled_access_fs, then
+    // handled_access_net, the fields of this ABI; any other byte the caller
+    // gives must be zero.
     if attr == 0 {
         return Err(Errno::EFAULT);
     }
@@ -487,19 +611,26 @@ pub(crate) fn sys_create_ruleset(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64
     c.mem
         .read(GuestAddr(attr), &mut bytes)
         .map_err(|_| Errno::EFAULT)?;
-    if bytes[8..].iter().any(|b| *b != 0) {
+    if bytes
+        .get(16..)
+        .is_some_and(|rest| rest.iter().any(|b| *b != 0))
+    {
         return Err(Errno(7));
     }
-    let handled = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
-    if handled & !FS != 0 {
+    bytes.resize(16, 0);
+    let field = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
+    let (handled, handled_net) = (field(0), field(8));
+    if handled & !FS != 0 || handled_net & !NET != 0 {
         return Err(Errno::EINVAL);
     }
-    if handled == 0 {
+    if handled == 0 && handled_net == 0 {
         return Err(Errno(42)); // ENOMSG
     }
     let ruleset = Arc::new(Ruleset {
         handled,
+        handled_net,
         rules: Mutex::default(),
+        ports: Mutex::default(),
     });
     c.files
         .install(ruleset, true, c.group.nofile())
@@ -515,8 +646,10 @@ pub(crate) fn sys_add_rule(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
     let Some(ruleset) = file.as_any().and_then(|f| f.downcast_ref::<Ruleset>()) else {
         return Err(Errno(77));
     };
-    if a[1] as u32 as u64 != RULE_PATH_BENEATH {
-        return Err(Errno::EINVAL);
+    match a[1] as u32 as u64 {
+        RULE_PATH_BENEATH => {}
+        RULE_NET_PORT => return add_port(c, ruleset, a[2]),
+        _ => return Err(Errno::EINVAL),
     }
     let mut attr = [0u8; 12];
     c.mem
@@ -546,6 +679,34 @@ pub(crate) fn sys_add_rule(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
     Ok(0)
 }
 
+/// `add_rule_net_port`: a `landlock_net_port_attr` at `at`, the rights
+/// `allowed` on TCP port `port`.
+fn add_port(c: &Context<'_>, ruleset: &Ruleset, at: u64) -> Result<u64, Errno> {
+    let mut attr = [0u8; 16];
+    c.mem
+        .read(GuestAddr(at), &mut attr)
+        .map_err(|_| Errno::EFAULT)?;
+    let allowed = u64::from_le_bytes(attr[..8].try_into().unwrap_or([0; 8]));
+    let port = u64::from_le_bytes(attr[8..].try_into().unwrap_or([0; 8]));
+    if allowed == 0 {
+        return Err(Errno(42)); // ENOMSG
+    }
+    if allowed & !ruleset.handled_net != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let Ok(port) = u16::try_from(port) else {
+        return Err(Errno::EINVAL);
+    };
+    // landlock_append_net_rule: what the ruleset does not handle is allowed.
+    *ruleset
+        .ports
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(port)
+        .or_insert(0) |= allowed | NET & !ruleset.handled_net;
+    Ok(0)
+}
+
 /// `landlock_restrict_self(ruleset_fd, flags)`: the thread's domain with the
 /// ruleset as a new layer on top.
 pub(crate) fn sys_restrict_self(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
@@ -566,11 +727,26 @@ pub(crate) fn sys_restrict_self(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64,
     if layers.len() >= MAX_LAYERS {
         return Err(Errno(7)); // E2BIG
     }
+    let mut net = old.map_or_else(Vec::new, |d| d.net.clone());
     let mut rules = old.map_or_else(BTreeMap::new, |d| d.rules.clone());
+    let mut ports = old.map_or_else(BTreeMap::new, |d| d.ports.clone());
     let layer = layers.len();
     // A layer that handles any file right also denies REFER
     // (`_LANDLOCK_ACCESS_FS_INITIALLY_DENIED`).
-    layers.push(ruleset.handled | REFER);
+    layers.push(if ruleset.handled == 0 {
+        0
+    } else {
+        ruleset.handled | REFER
+    });
+    net.push(ruleset.handled_net);
+    for (port, allowed) in ruleset
+        .ports
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+    {
+        ports.entry(*port).or_default().push((layer, *allowed));
+    }
     for (object, allowed) in ruleset
         .rules
         .lock()
@@ -579,7 +755,12 @@ pub(crate) fn sys_restrict_self(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64,
     {
         rules.entry(*object).or_default().push((layer, *allowed));
     }
-    c.process.credentials.landlock = Landlock(Some(Arc::new(Domain { layers, rules })));
+    c.process.credentials.landlock = Landlock(Some(Arc::new(Domain {
+        layers,
+        net,
+        rules,
+        ports,
+    })));
     Ok(0)
 }
 
@@ -590,10 +771,13 @@ mod tests {
     fn domain(layers: &[(u64, &[(Object, u64)])]) -> Domain {
         let mut d = Domain {
             layers: Vec::new(),
+            net: Vec::new(),
             rules: BTreeMap::new(),
+            ports: BTreeMap::new(),
         };
         for (i, (handled, rules)) in layers.iter().enumerate() {
             d.layers.push(handled | REFER);
+            d.net.push(0);
             for (object, allowed) in *rules {
                 d.rules
                     .entry(*object)

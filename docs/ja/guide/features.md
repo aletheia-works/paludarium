@@ -1334,18 +1334,24 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   います。メモリ上でも、Linux か macOS でマウントしたホストのディレクトリでも使えます。
   `RENAME_WHITEOUT` には `CAP_MKNOD` が要り（なければ `EPERM`）、あっても
   ホワイトアウトのない Linux のファイルシステムと同じく `EINVAL` を返します。
-- Landlock は、スレッドがアクセスできるファイルの階層を ABI バージョン 3 の範囲で
-  制限します。`landlock_create_ruleset`（バージョンの問い合わせを含む）、
-  `LANDLOCK_RULE_PATH_BENEATH` の `landlock_add_rule`、`landlock_restrict_self`
-  （`no_new_privs` か `CAP_SYS_ADMIN` が要ります）に対応し、層は 16 までです。各層は、
+- Landlock は、スレッドがアクセスできるファイルの階層と TCP のポートを ABI バージョン 5
+  の範囲で制限します。`landlock_create_ruleset`（バージョンの問い合わせを含む）、
+  `LANDLOCK_RULE_PATH_BENEATH` と `LANDLOCK_RULE_NET_PORT` の `landlock_add_rule`、
+  `landlock_restrict_self`（`no_new_privs` か `CAP_SYS_ADMIN` が要ります）に対応し、
+  層は 16 までです。各層は、
   扱う権利を、ルールが指すファイルやディレクトリの下でだけ許します。ルールはデバイスと
   inode で指すので、名前を変えたディレクトリにもついていきます。ファイルを開くと
   `LANDLOCK_ACCESS_FS_READ_FILE`、`WRITE_FILE`、`READ_DIR` を、`execve` とその
   インタープリタでは `EXECUTE` を確かめます。名前を作るときはディレクトリについて
   種類ごとの `MAKE_*` を、消すときは `REMOVE_FILE` か `REMOVE_DIR` を、切り詰めるときは
   `TRUNCATE` を確かめます。`TRUNCATE` は、開いたときの結果を開いたファイルの記述が
-  持ち続けます。別のディレクトリへのリンクや名前の変更には `REFER` が要り、ファイルの
-  権利が増えてはいけません（`EXDEV`）。スレッド、プロセス、`execve` はドメインを
+  持ち続けます。キャラクタデバイスとブロックデバイスへの `ioctl` には `IOCTL_DEV` が要り、
+  これも開いたときの結果を持ち続けます。ただし、どのファイルでも答えるコマンド
+  （`FIOCLEX`、`FIONBIO`、`FIGETBSZ` など）は除きます。別のディレクトリへのリンクや
+  名前の変更には `REFER` が要り、ファイルの権利が増えてはいけません（`EXDEV`）。
+  TCP のソケットの `bind` にはそのポートの `LANDLOCK_ACCESS_NET_BIND_TCP` が、`connect`
+  には `CONNECT_TCP` が要ります。その前に、Linux と同じくアドレスを確かめます。
+  UDP と、`AF_UNSPEC` への `connect` は確かめません。スレッド、プロセス、`execve` はドメインを
   引き継ぎます。`O_PATH`、`stat`、制限の前に開いた記述子は確かめません。
 - 起動の前にファイルを置けます。
 - 指定したときだけ、ホストのディレクトリをマウントできます（コマンドの `--mount`、

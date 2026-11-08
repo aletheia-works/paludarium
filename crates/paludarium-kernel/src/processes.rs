@@ -128,6 +128,8 @@ pub(crate) struct ProcessView {
     pub zombie: bool,
     pub exit_signal: i32,
     pub group: Arc<ThreadGroup>,
+    /// The controlling terminal.
+    pub terminal: Option<Arc<crate::pty::Terminal>>,
 }
 pub struct Processes {
     next: AtomicU32,
@@ -753,6 +755,7 @@ impl Processes {
             zombie: entry.status.is_some(),
             exit_signal: entry.exit_signal,
             group: Arc::clone(&entry.group),
+            terminal: entry.terminal.clone(),
         })
     }
     fn parent(&self, pid: u32) -> u32 {

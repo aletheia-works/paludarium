@@ -280,6 +280,9 @@ pub(crate) struct ProcessStat<'a> {
     pub parent: u32,
     pub group: u32,
     pub session: u32,
+    /// `tty_nr` and `tpgid`: the controlling terminal's device and its
+    /// foreground group, or 0 and -1.
+    pub terminal: (u32, i32),
     /// Process and waited-for children's CPU time, in nanoseconds.
     pub cpu: u64,
     pub children_cpu: u64,
@@ -298,9 +301,9 @@ pub(crate) struct ProcessStat<'a> {
     pub ignored: u64,
     pub caught: u64,
 }
-/// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it: 52 fields, no
-/// terminal, and 0 for what nothing measures (page faults, resident memory,
-/// start time, the code range and the scheduler's figures).
+/// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it: 52 fields, and
+/// 0 for what nothing measures (page faults, resident memory, start time,
+/// the code range and the scheduler's figures).
 pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
     /// USER_HZ, the unit of the times, as on x86-64 Linux.
     const TICKS: u64 = 100;
@@ -310,8 +313,8 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         s.parent.to_string(),
         s.group.to_string(),
         s.session.to_string(),
-        "0".into(),  // tty_nr
-        "-1".into(), // tpgid
+        s.terminal.0.to_string(),
+        s.terminal.1.to_string(),
         // PF_RANDOMIZE, as for a process that address space randomization
         // applies to.
         "4194304".into(),
@@ -1263,6 +1266,7 @@ mod generated_tests {
             parent: 1,
             group: 5,
             session: 1,
+            terminal: (0, -1),
             cpu: 1_230_000_000,
             children_cpu: 20_000_000,
             nice: 3,

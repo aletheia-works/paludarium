@@ -206,6 +206,7 @@ pub(super) fn content(task: &Task, entry: TaskEntry) -> Option<Vec<u8>> {
                 parent: task.view.parent,
                 group: task.view.group_id,
                 session: task.view.session,
+                terminal: crate::pty::stat_fields(task.view.terminal.as_deref()),
                 cpu: task.view.group.process_cpu(),
                 children_cpu: task.view.children_cpu,
                 nice: task.view.group.nice(task.tid).unwrap_or(0),

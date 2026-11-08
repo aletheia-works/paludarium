@@ -3730,6 +3730,7 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
                 parent,
                 group,
                 session,
+                terminal: crate::pty::stat_fields(c.processes.terminal(c.process.pid).as_deref()),
                 cpu: c.group.process_cpu(),
                 children_cpu,
                 nice: c.group.nice(c.process.pid).unwrap_or(0),

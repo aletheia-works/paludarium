@@ -695,7 +695,8 @@ kernel.
   `environ` are empty and `exe` and `cwd` are `ENOENT`, as on Linux.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
-  and session, no terminal, the CPU time of the process and of its waited-for
+  and session, the controlling terminal's device and foreground group (0
+  and -1 without one), the CPU time of the process and of its waited-for
   children in `USER_HZ` (100) ticks, the priority and nice value, the threads,
   the size of the mappings, the `RLIMIT_RSS` limit, the start of the stack and
   of the heap, the signal sets as decimal numbers, `wchan` (1 for a task that
@@ -809,10 +810,17 @@ kernel.
     with `ISIG` sends `SIGINT`, `SIGQUIT` and `SIGTSTP` to the foreground
     process group, dropping the input unless `NOFLSH`. The master's side
     passes bytes as they are.
-  - `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF` and their `termios2` forms
-    (`TCGETS2` and so on) reach the slave's `termios` from either side;
-    it keeps `CS8 | CREAD` without parity and takes its speeds from
-    `CBAUD` or `BOTHER`. `TIOCGWINSZ` and `TIOCSWINSZ` (a change sends
+  - `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF`, their `termios2` forms
+    (`TCGETS2` and so on) and the old `struct termio` ones (`TCGETA`,
+    `TCSETA`, `TCSETAW`, `TCSETAF`, which set the low 16 bits of each flag
+    and the first 8 characters) reach the slave's `termios` from either
+    side; it keeps `CS8 | CREAD` without parity, takes its speeds from
+    `CBAUD` or `BOTHER`, and keeps what `TIOCSLCKTRMIOS` locked (which
+    needs `CAP_SYS_ADMIN`; `TIOCGLCKTRMIOS` reads it). With `TIOCPKT` the
+    master reads in packet mode: the slave's flushes, the stops and starts
+    of its output, and changes to whether `^S` and `^Q` control it (or to
+    `EXTPROC`) come as a status byte alone, which `poll` shows as
+    `POLLPRI`, and data after a 0 byte; `TIOCGPKT` reads the mode. `TIOCGWINSZ` and `TIOCSWINSZ` (a change sends
     `SIGWINCH` to the foreground group), `FIONREAD`, `TIOCOUTQ`, `TCFLSH`,
     `TCXONC`, `TCSBRK`, `TIOCEXCL`, `TIOCGEXCL`, `TIOCGETD` and `TIOCSETD`
     (N_TTY only), `TIOCGDEV` and `TIOCSIG` work as on Linux, and so does

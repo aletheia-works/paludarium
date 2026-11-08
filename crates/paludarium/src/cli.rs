@@ -436,7 +436,9 @@ pub fn main_with(
     // guest would run it; any other is copied in at `/<file name>`.
     let (guest, content) = match mounted_path(program_path, &invocation.mounts) {
         Some(guest) => {
-            if !std::fs::metadata(program_path).is_ok_and(|m| m.is_file()) {
+            // A symbolic link is the guest's to follow: its target may be a
+            // guest path the host does not have.
+            if !std::fs::symlink_metadata(program_path).is_ok_and(|m| !m.is_dir()) {
                 return usage_error(stderr, UsageError("cannot read the program file"));
             }
             (guest, None)

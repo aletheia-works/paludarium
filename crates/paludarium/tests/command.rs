@@ -216,6 +216,9 @@ fn cli_program_in_a_mount_runs_at_its_guest_path() {
         std::os::unix::fs::symlink("interp", root.join("bin/link")).unwrap();
         executable(&root.join("bin/interp"), &interpreter(0));
         assert_eq!(run("bin/link", &[]), b"/bin/interp");
+        // An absolute link names a guest path, which the host need not have.
+        std::os::unix::fs::symlink("/bin/interp", root.join("bin/absolute")).unwrap();
+        assert_eq!(run("bin/absolute", &[]), b"/bin/interp");
     }
     // Under a deeper mount the program has that mount's path.
     std::fs::create_dir_all(root.join("opt/tools")).unwrap();

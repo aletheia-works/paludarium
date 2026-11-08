@@ -264,7 +264,8 @@ struct FrameBytes {
     dirty: AtomicBool,
     /// How many writes of more than one word have started and finished, so
     /// that an aligned 16-byte read sees one of them whole, as it does on an
-    /// x86-64 CPU ([`Self::read_16`]).
+    /// x86-64 CPU ([`Self::read_16`]). They are a ticket lock as well, which
+    /// such writes take one at a time ([`Self::write_with`]).
     spanning_started: AtomicU64,
     spanning_finished: AtomicU64,
 }
@@ -422,14 +423,27 @@ impl FrameBytes {
     #[inline]
     fn write_with(&self, offset: usize, data: &[u8], piece: impl Fn(&AtomicU64, u64, u64)) {
         // A write within one word is one access already ([`Self::read_16`]).
-        let spanning = offset % WORD_BYTES + data.len() > WORD_BYTES;
-        if spanning {
-            self.spanning_started.fetch_add(1, Ordering::Relaxed);
+        if offset % WORD_BYTES + data.len() <= WORD_BYTES {
+            self.write_words(offset, data, piece);
+            return;
+        }
+        // One at a time, in the order they start: a store takes no lock, and
+        // two that wrote their words in turn could leave the low one of one
+        // and the high one of the other, which neither wrote. On x86-64 an
+        // aligned 16-byte store is whole against the other stores too.
+        let ticket = self.spanning_started.fetch_add(1, Ordering::Relaxed);
+        let mut spins = 0u32;
+        // `Acquire`: the writes before this one come before its words.
+        while self.spanning_finished.load(Ordering::Acquire) != ticket {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
         }
         self.write_words(offset, data, piece);
-        if spanning {
-            self.spanning_finished.fetch_add(1, Ordering::Release);
-        }
+        self.spanning_finished.store(ticket + 1, Ordering::Release);
     }
 
     #[inline]
@@ -453,6 +467,12 @@ impl FrameBytes {
             }
             left = rest;
             at += n;
+            #[cfg(test)]
+            if !left.is_empty()
+                && let Some(stall) = WORD_STALL.get()
+            {
+                std::thread::sleep(stall);
+            }
         }
     }
 }
@@ -955,6 +975,10 @@ static STORES: RwLock<Vec<Arc<AtomicU64>>> = RwLock::new(Vec::new());
 
 #[cfg(test)]
 thread_local! {
+    /// How long a write of more than one word by this thread waits between
+    /// the words, so that a test can come between them.
+    static WORD_STALL: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
     /// How long a store through this thread's TLB waits while it is under
     /// way, so that a test can show the store was waited for.
     static STORE_STALL: std::cell::Cell<Option<std::time::Duration>> =
@@ -3644,6 +3668,25 @@ mod tests {
             }
             done.store(true, Ordering::Relaxed);
         });
+    }
+
+    #[test]
+    fn writes_of_16_bytes_from_two_threads_leave_one_of_them_whole() {
+        let frame = frame_of(&[]);
+        std::thread::scope(|scope| {
+            let slow = scope.spawn(|| {
+                WORD_STALL.set(Some(std::time::Duration::from_millis(100)));
+                frame.write(16, &[0xaa; 16]);
+            });
+            // While the slow write waits between its words, unless it waits
+            // for this one first.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            frame.write(16, &[0x55; 16]);
+            slow.join().unwrap();
+        });
+        let mut value = [0; 16];
+        frame.read(16, &mut value);
+        assert!(value == [0xaa; 16] || value == [0x55; 16], "{value:?}");
     }
 
     #[test]

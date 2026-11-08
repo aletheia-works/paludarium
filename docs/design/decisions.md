@@ -61,7 +61,9 @@ CPU, so it sees a `CMPXCHG16B` or a 16-byte store of another thread whole.
 The emulator keeps page contents as 8-byte words, and a load takes no lock, so
 each page counts the writes of more than one word it has started and finished.
 Such a load reads its two words again while one of them may have come between
-them; other loads and writes pay nothing for it.
+them; other loads and writes pay nothing for it. The counts also make such
+writes to a page take turns, as stores take no lock: two 16-byte stores never
+leave the low word of one with the high word of the other.
 
 ## Owning the waiting primitives
 

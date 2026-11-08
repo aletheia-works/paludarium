@@ -2023,9 +2023,6 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         72 => {
             let mut d = c.files.descriptor(a[0])?;
-            // fcntl(unsigned int fd, unsigned int cmd, unsigned long arg).
-            let mut a = a;
-            a[1] &= 0xffff_ffff;
             match a[1] {
                 0 | 1030 => {
                     d.cloexec = a[1] == 1030;

@@ -8,6 +8,7 @@
 //! records signal registrations but never delivers signals.
 #![forbid(unsafe_code)]
 
+mod arguments;
 mod coredump;
 mod credentials;
 mod inbox;
@@ -756,6 +757,7 @@ impl Kernel {
             thread.cpu.gpr[reg::R8],
             thread.cpu.gpr[reg::R9],
         ];
+        arguments::narrow(number, &mut args);
         thread.state.restart = signals::restarts_without_handler(number, &args).then_some(number);
         // clone reads only the low 32 bits of its flags, as Linux's sys_clone
         // does (lower_32_bits); clone3's wider flags reach the code below.

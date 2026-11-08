@@ -67,6 +67,9 @@ cases!(record_locks=>54,host_record_locks=>54,lock_arguments=>55,host_lock_argum
 cases!(lock_signals=>56,host_lock_signals=>56,lock_deadlock=>57,host_lock_deadlock=>57);
 cases!(lock_wake=>58,host_lock_wake=>58);
 cases!(wide_descriptors=>59,host_wide_descriptors=>59);
+cases!(openat2=>62,host_openat2=>62,proc_fd_paths=>64,host_proc_fd_paths=>64);
+// Only in memory, as files_xattrs.
+cases!(proc_fd_xattrs=>65);
 cases!(wide_arguments=>60,host_wide_arguments=>60);
 // Only on the emulator's own host: the mounted run's recorded clock moves only
 // when the guest waits with a deadline, so an itimer never interrupts a read.

@@ -243,6 +243,14 @@ impl Host for RecordingHost {
         buf.fill(Self::RANDOM_BYTE);
         Ok(())
     }
+    /// The machine's own, as [`Host::cpu_count`] is: the differential
+    /// harness runs the guest on the machine it compares with.
+    fn time_slice(&self) -> Option<u64> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return crate::clock::native_time_slice();
+        #[cfg(target_arch = "wasm32")]
+        None
+    }
     fn connect(
         &self,
         address: core::net::SocketAddr,

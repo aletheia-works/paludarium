@@ -222,16 +222,19 @@ verified.
   than those 10 ms can go unseen and send none, unless a read or write told
   the guest `EAGAIN`, which always gets its signal. In WebAssembly, which has
   no thread to look, they send none.
-- **Edge-triggered `epoll` on a signalfd**: a signal queued only for
-  another thread of the process gives the waiting thread no edge, where
-  Linux's `signalfd_notify` wakes the process's signal files for every
-  signal, so the waiter sees its own pending one again.
+- **Edge-triggered `epoll` on a signalfd**: a signal queued for another
+  thread of the process gives the waiting thread its edge once that thread
+  takes it in, at its next system call or within 10 ms of a wait, where
+  Linux's `signalfd_notify` wakes the file as the signal is sent; an
+  `epoll_wait` that does not wait can come before it.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for
   `clone3`) fail with `EINVAL` and create no child, where Linux lets the
-  guest, which runs as root, create the namespace. `unshare` and `setns`
-  return `ENOSYS`.
+  guest, which runs as root, create the namespace. `unshare` with a
+  namespace flag fails too, with `EINVAL` (`EPERM` for a thread without
+  `CAP_SYS_ADMIN`, as on Linux), and so does `CLONE_NEWUSER`, which Linux
+  also lets a user have. `setns` returns `ENOSYS`.
 - **Files of a mounted host directory on hosts other than Linux and macOS**:
   `lseek` with `SEEK_DATA` or `SEEK_HOLE` treats the whole file as data,
   where Linux finds the holes. On Windows `st_blocks` is also the size

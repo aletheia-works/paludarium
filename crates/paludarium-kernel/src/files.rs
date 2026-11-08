@@ -789,6 +789,91 @@ fn io_descriptor(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno>
     }
     Ok(file)
 }
+/// `link(old, new)` and `linkat(olddir, old, newdir, new, flags)`, as
+/// Linux's `do_linkat`: `AT_SYMLINK_FOLLOW` follows a symbolic link the old
+/// path ends in, and a link in `/proc/self/fd` to the descriptor's file, and
+/// `AT_EMPTY_PATH` with an empty old path links the file `olddir` holds
+/// (the working directory's, a directory, is EPERM). The old name is looked
+/// up, the new one must not be there (EEXIST) and be on the same filesystem
+/// (EXDEV), which the link finds, before `may_create`. A file no path names
+/// any more is ENOENT, as Linux's `vfs_link` finds it with no links, and a
+/// memfd, a pipe or a socket is on a filesystem of its own (EXDEV).
+/// The checks `filename_create` makes of a new name before a link that
+/// fails later: its directory is searched, and the name is not there.
+fn new_name_free(c: &Context<'_>, dir: u64, raw: &[u8], new: &[u8]) -> Result<(), Errno> {
+    crate::permissions::search(c.files, &c.process.credentials, dir, raw, false)?;
+    if c.files.fs.metadata(new, false).is_ok() {
+        return Err(Errno::EEXIST);
+    }
+    Ok(())
+}
+fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    let ((old_dir, old_ptr), (new_dir, new_ptr), flags) = if n == 86 {
+        (((-100i32) as u64, a[0]), ((-100i32) as u64, a[1]), 0)
+    } else {
+        ((a[0], a[1]), (a[2], a[3]), a[4])
+    };
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let follow = flags & AT_SYMLINK_FOLLOW != 0;
+    let old_raw = path(c, old_ptr)?;
+    let target = if old_raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if old_dir as i32 == -100 {
+            Followed::Path {
+                path: c.files.path(old_dir, b".".to_vec())?,
+                follow: false,
+            }
+        } else {
+            descriptor_followed(c.files, c.files.descriptor(old_dir)?)?
+        }
+    } else {
+        let (old, _) = lookup(c, old_dir, old_raw, follow)?;
+        match followed(c, &old, follow)? {
+            Some(target) => target,
+            // A dangling symbolic link leads nowhere (ENOENT).
+            None if follow => Followed::Path {
+                path: resolved(c.files, &old).ok_or(Errno::ENOENT)?,
+                follow: false,
+            },
+            None => Followed::Path {
+                path: old,
+                follow: false,
+            },
+        }
+    };
+    let new_raw = path(c, new_ptr)?;
+    let new = c.files.path(new_dir, new_raw.clone())?;
+    let old = match target {
+        Followed::Path { path, follow: true } => resolved(c.files, &path).unwrap_or(path),
+        Followed::Path { path, .. } => path,
+        // Not linkable: the new name is still looked up first.
+        Followed::File(d) => {
+            new_name_free(c, new_dir, &new_raw, &new)?;
+            let named = !d.path.is_empty()
+                && d.file
+                    .as_any()
+                    .is_none_or(|v| !v.is::<crate::memfd::Memfd>());
+            if named && device(c, &d.path) == device(c, &new) {
+                return Err(Errno::ENOENT);
+            }
+            return Err(EXDEV);
+        }
+    };
+    // A file of `/proc` or `/dev` (a link in `/proc/self/fd` not followed)
+    // is on procfs or devtmpfs, which the new name is not.
+    if generated(&old) {
+        new_name_free(c, new_dir, &new_raw, &new)?;
+        return Err(EXDEV);
+    }
+    let source = c.files.fs.metadata(&old, false).ok();
+    if source.is_some() && device(c, &old) == device(c, &new) {
+        crate::permissions::create(c.files, &c.process.credentials, new_dir, &new_raw)?;
+    }
+    c.files.fs.link(&old, &new)?;
+    Ok(0)
+}
 /// `chmod` of the file a link in `/proc/self/fd` leads to, which the
 /// descriptor's access does not limit: an `O_PATH` one's file changes too,
 /// as glibc's `fchmodat` with `AT_SYMLINK_NOFOLLOW` has it. A symbolic link
@@ -2339,27 +2424,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.files.fs.unlink(&p, dir)?;
             Ok(0)
         }
-        86 | 265 => {
-            let ((old_dir, old_ptr), (new_dir, new_ptr)) = if n == 86 {
-                (((-100i32) as u64, a[0]), ((-100i32) as u64, a[1]))
-            } else {
-                if a[4] != 0 {
-                    return Err(Errno::EINVAL);
-                }
-                ((a[0], a[1]), (a[2], a[3]))
-            };
-            // `do_linkat`: the old name is looked up, the new one must not
-            // be there (EEXIST) and be on the same filesystem (EXDEV), which
-            // the link finds, before `may_create`.
-            let (old, source) = looked_up(c, old_dir, old_ptr, false)?;
-            let new_raw = path(c, new_ptr)?;
-            let new = c.files.path(new_dir, new_raw.clone())?;
-            if source.file.is_some() && device(c, &old) == device(c, &new) {
-                crate::permissions::create(c.files, &c.process.credentials, new_dir, &new_raw)?;
-            }
-            c.files.fs.link(&old, &new)?;
-            Ok(0)
-        }
+        86 | 265 => link(c, n, a),
         88 | 266 => {
             let target = path(c, a[0])?;
             let (dir, raw) = if n == 88 {
@@ -3947,30 +4012,35 @@ pub(crate) fn through_descriptor(
         return Ok(None);
     };
     let d = files.descriptor(u64::from(n)).map_err(|_| Errno::ENOENT)?;
+    descriptor_followed(files, d).map(Some)
+}
+/// Where the file descriptor `d` holds is reached: by the path that still
+/// names it, or through the descriptor itself.
+fn descriptor_followed(files: &Files, d: Descriptor) -> Result<Followed, Errno> {
     let any = d.file.as_any();
     if any.is_some_and(|v| v.is::<LinkPath>()) {
-        return Ok(Some(Followed::Path {
+        return Ok(Followed::Path {
             path: opened_path(&d),
             follow: false,
-        }));
+        });
     }
     if d.path.is_empty() || any.is_some_and(|v| v.is::<crate::memfd::Memfd>()) {
-        return Ok(Some(Followed::File(d)));
+        return Ok(Followed::File(d));
     }
     if generated(&d.path) {
-        return Ok(Some(Followed::Path {
+        return Ok(Followed::Path {
             path: d.path.clone(),
             follow: true,
-        }));
+        });
     }
     let inode = d.file.stat()?.inode;
-    Ok(Some(match current_path(files, &d, inode) {
+    Ok(match current_path(files, &d, inode) {
         Some(path) => Followed::Path {
             path,
             follow: false,
         },
         None => Followed::File(d),
-    }))
+    })
 }
 /// [`through_descriptor`] for this thread's process.
 fn followed(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {

@@ -3486,8 +3486,10 @@ impl AddressSpace {
         operation: AtomicOp,
     ) -> Result<AtomicResult, Fault> {
         let data = self.locked();
-        data.code.bump_epoch();
+        // Checked first, so that one that faults leaves the TLBs: nothing
+        // that takes no lock changes a protection.
         data.check(&data.read_directory(), addr, size, Access::Write)?;
+        data.code.bump_epoch();
         let mut bytes = [0u8; 16];
         data.read(addr, &mut bytes[..size])?;
         let old = u128::from_le_bytes(bytes);

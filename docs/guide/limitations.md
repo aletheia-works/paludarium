@@ -37,6 +37,13 @@ verified.
   started by, never marked `(deleted)`, where Linux follows a rename and resolves
   symbolic links. `/proc/<pid>/maps` of another process, `smaps` and
   `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+- **The rest of `/proc`, in part**: only the process's own directory and a few
+  system files are made (see [features](./features)). Another process's
+  `/proc/<pid>` (what `ps` reads), `/proc/self/task` and the other system
+  files are looked up like any path, which with `--mount /:/` finds the
+  host's `/proc`. In `/proc/self/stat`, page faults, resident memory, the
+  start time and the code range are 0, and `meminfo` shows the fixed 4 GiB
+  that `sysinfo` reports, with nothing used.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.

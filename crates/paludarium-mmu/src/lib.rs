@@ -236,6 +236,13 @@ impl MemoryMeter {
 }
 
 /// The bytes of one page frame, charged to the meter while they exist.
+///
+/// The words are read with `Acquire` and written with `Release` (a piece of
+/// a word with an `AcqRel` read-modify-write), which keeps the orders x86
+/// keeps between a thread's accesses (TSO): load to load, load to store and
+/// store to store. Only a store followed by a load may be reordered, as on
+/// x86. The space's lock orders the accesses as well today; these orders
+/// let an access go without it. On an x86-64 host they cost nothing.
 struct FrameBytes {
     /// The bytes as little-endian words, so that an aligned word of a guest
     /// takes one atomic access, where each byte would take its own.
@@ -296,7 +303,7 @@ impl FrameBytes {
         while !left.is_empty() {
             let within = at % WORD_BYTES;
             let n = left.len().min(WORD_BYTES - within);
-            let mut word = self.words[at / WORD_BYTES].load(Ordering::Relaxed) >> (8 * within);
+            let mut word = self.words[at / WORD_BYTES].load(Ordering::Acquire) >> (8 * within);
             let (now, rest) = left.split_at_mut(n);
             for byte in now {
                 *byte = word as u8;
@@ -312,7 +319,7 @@ impl FrameBytes {
     /// be writing them.
     fn write(&self, offset: usize, data: &[u8]) {
         self.write_with(offset, data, |word, kept, value| {
-            let _ = word.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            let _ = word.try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                 Some(old & kept | value)
             });
         });
@@ -325,7 +332,7 @@ impl FrameBytes {
         self.write_with(offset, data, |word, kept, value| {
             word.store(
                 word.load(Ordering::Relaxed) & kept | value,
-                Ordering::Relaxed,
+                Ordering::Release,
             );
         });
     }
@@ -345,7 +352,7 @@ impl FrameBytes {
                 .fold(0, |value, byte| value << 8 | u64::from(*byte))
                 << (8 * within);
             if n == WORD_BYTES {
-                word.store(value, Ordering::Relaxed);
+                word.store(value, Ordering::Release);
             } else {
                 piece(word, !((u64::MAX >> (64 - 8 * n)) << (8 * within)), value);
             }
@@ -410,7 +417,7 @@ fn copied(frame: &Frame, meter: Option<&Arc<MemoryMeter>>) -> Option<Frame> {
             bytes
                 .words
                 .iter()
-                .map(|word| AtomicU64::new(word.load(Ordering::Relaxed)))
+                .map(|word| AtomicU64::new(word.load(Ordering::Acquire)))
                 .collect()
         })?;
         let _ = copy.set(bytes);
@@ -559,7 +566,6 @@ impl SharedPages {
         if data.is_empty() {
             return;
         }
-        self.generation.fetch_add(1, Ordering::Release);
         let mut done = 0;
         while done < data.len() {
             let offset = at + done as u64;
@@ -572,6 +578,8 @@ impl SharedPages {
             }
             done += piece;
         }
+        // After the bytes, as in `AddressSpaceData::store`.
+        self.generation.fetch_add(1, Ordering::Release);
     }
     /// Zeros `[start, end)` of the memory, as truncating or punching a hole
     /// in the file does to its page cache. The pages do not become dirty.
@@ -579,7 +587,6 @@ impl SharedPages {
         if end <= start {
             return;
         }
-        self.generation.fetch_add(1, Ordering::Release);
         for (key, frame) in self.frames_in(start, end) {
             if let Some(bytes) = frame.get() {
                 let from = usize::try_from(start.saturating_sub(key)).unwrap_or(PAGE_BYTES);
@@ -590,6 +597,7 @@ impl SharedPages {
                 }
             }
         }
+        self.generation.fetch_add(1, Ordering::Release);
     }
     /// Hands each page a guest store changed since the last call to
     /// `write`, with its key, and marks it clean. A page whose `write`
@@ -1390,14 +1398,15 @@ impl AddressSpaceData {
         let Some(frame) = entry.frame.get() else {
             return false;
         };
-        if entry.prot.contains(Prot::EXEC) {
-            // Code may have changed: decoded instructions are stale.
-            self.code.generation.fetch_add(1, Ordering::Release);
-        }
         // The page is neither shared nor of a file, and the caller holds the
         // space's lock: no other thread can be at this frame.
         // Nor does anything write such a page back, so it need not be marked.
         frame.write_exclusive(page_offset(addr.0), buf);
+        if entry.prot.contains(Prot::EXEC) {
+            // Code may have changed: decoded instructions are stale. After
+            // the bytes, as in `store`.
+            self.code.generation.fetch_add(1, Ordering::Release);
+        }
         true
     }
 
@@ -1416,7 +1425,7 @@ impl AddressSpaceData {
         let Some(frame) = entry.frame.get() else {
             return Some(0);
         };
-        let word = frame.words[offset / WORD_BYTES].load(Ordering::Relaxed);
+        let word = frame.words[offset / WORD_BYTES].load(Ordering::Acquire);
         Some(word >> (8 * within) & value_mask(size))
     }
 
@@ -1438,21 +1447,22 @@ impl AddressSpaceData {
         let Some(frame) = entry.frame.get() else {
             return false;
         };
-        if entry.prot.contains(Prot::EXEC) {
-            // Code may have changed: decoded instructions are stale.
-            self.code.generation.fetch_add(1, Ordering::Release);
-        }
         let word = &frame.words[offset / WORD_BYTES];
         if size == WORD_BYTES {
-            word.store(value, Ordering::Relaxed);
+            word.store(value, Ordering::Release);
         } else {
             // As in `write_cached`, nothing else can be at this frame.
             let mask = value_mask(size) << (8 * within);
             let old = word.load(Ordering::Relaxed);
             word.store(
                 old & !mask | value << (8 * within) & mask,
-                Ordering::Relaxed,
+                Ordering::Release,
             );
+        }
+        if entry.prot.contains(Prot::EXEC) {
+            // Code may have changed: decoded instructions are stale. After
+            // the bytes, as in `store`.
+            self.code.generation.fetch_add(1, Ordering::Release);
         }
         true
     }
@@ -1519,10 +1529,6 @@ impl AddressSpaceData {
                 if let Some(mapping) = self.shared_at(page) {
                     mapping.pages.generation.fetch_add(1, Ordering::Release);
                 }
-                if p.prot.contains(Prot::EXEC) {
-                    // Code may have changed: decoded instructions are stale.
-                    self.code.generation.fetch_add(1, Ordering::Release);
-                }
                 let Some(frame) = p.frame_for_write(self.meter.as_ref()) else {
                     self.out_of_memory.store(true, Ordering::SeqCst);
                     return Err(Fault {
@@ -1535,6 +1541,13 @@ impl AddressSpaceData {
                     });
                 };
                 frame.write(offset, &buf[range]);
+                if p.prot.contains(Prot::EXEC) {
+                    // Code may have changed: decoded instructions are stale.
+                    // After the bytes: a fetch that reads the new generation
+                    // (Acquire) then reads the new bytes too, with or without
+                    // the lock.
+                    self.code.generation.fetch_add(1, Ordering::Release);
+                }
                 frame.dirty.store(true, Ordering::Release);
                 // Again once the page is dirty, so that a write-back that ran
                 // between the bumps sees the generation change after it.
@@ -2354,9 +2367,10 @@ pub struct AtomicResult {
     pub exchanged: bool,
 }
 
-/// A shared address space. Every memory and mapping operation serializes on
-/// this one lock, including ordinary reads/writes/fetches. The private data
-/// implementation never calls back through this public wrapper (no reentry).
+/// A shared address space. Every memory and mapping operation takes the
+/// space's lock, and all but an access through the [`Tlb`] also take the
+/// session's serialization lock. The private data implementation never calls
+/// back through this public wrapper (no reentry).
 pub struct AddressSpace {
     data: Arc<Mutex<AddressSpaceData>>,
     /// The data's `code`, for [`Self::code_generation_cached`].

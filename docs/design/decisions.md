@@ -31,6 +31,14 @@ cache of the private pages used last (a software TLB of 64 entries) lets the
 next access to one of them skip the page table, still checking its
 protection; it is emptied whenever a mapping or a page entry may change.
 
+A guest's threads see each other's memory in the order x86 gives (TSO): a
+thread's loads and stores stay in order, except that a load may pass an earlier
+store. The address space's lock orders every access today. The page contents
+are also read with acquire and written with release ordering, which keeps that
+order without the lock on an Arm host too, so that accesses can later go
+without it. A write to an executable page moves the code generation on after
+its bytes, so whoever sees the new generation sees the new code.
+
 ## Owning the waiting primitives
 
 `futex`, `epoll`, `eventfd` and `timerfd` are implemented in paludarium's

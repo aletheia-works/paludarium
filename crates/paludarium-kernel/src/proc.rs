@@ -201,12 +201,6 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
     /// USER_HZ, the unit of the times, as on x86-64 Linux.
     const TICKS: u64 = 100;
     let ticks = |ns: u64| ns / (1_000_000_000 / TICKS);
-    let name: String = s
-        .name
-        .iter()
-        .take_while(|&&b| b != 0)
-        .map(|&b| char::from(b))
-        .collect();
     let fields: [String; 50] = [
         "R".into(),
         s.parent.to_string(),
@@ -261,7 +255,11 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         s.environment.1.to_string(),
         "0".into(), // exit_code
     ];
-    format!("{} ({name}) {}\n", s.pid, fields.join(" ")).into_bytes()
+    // The name's bytes as they are, as `comm` gives them.
+    let mut line = format!("{} (", s.pid).into_bytes();
+    line.extend(s.name.iter().take_while(|&&b| b != 0));
+    line.extend(format!(") {}\n", fields.join(" ")).into_bytes());
+    line
 }
 /// `/proc/<pid>/comm`: the name, up to its NUL, and a newline.
 pub(crate) fn render_comm(name: &[u8]) -> Vec<u8> {
@@ -1083,7 +1081,7 @@ mod generated_tests {
     fn stat_has_linux_s_52_fields_after_the_name() {
         let line = render_stat(&ProcessStat {
             pid: 5,
-            name: b"a b) c\0junk",
+            name: b"a b) \xe9\0junk",
             parent: 1,
             group: 5,
             session: 1,
@@ -1102,9 +1100,10 @@ mod generated_tests {
             ignored: 2048,
             caught: 1,
         });
-        let line = String::from_utf8(line).unwrap();
-        // The name stays as it is; the fields start after its last ')'.
-        assert!(line.starts_with("5 (a b) c) R 1 5 1 0 -1 "));
+        // The name's bytes stay as they are, not UTF-8 encoded.
+        assert!(line.starts_with(b"5 (a b) \xe9) R 1 5 1 0 -1 "));
+        let line = String::from_utf8_lossy(&line);
+        // The fields start after the name's last ')'.
         assert!(line.ends_with(" 0\n"));
         let rest = &line[line.rfind(')').unwrap() + 2..];
         let fields: Vec<&str> = rest.split_whitespace().collect();

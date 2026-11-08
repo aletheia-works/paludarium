@@ -479,8 +479,6 @@ impl Processes {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.get(&pid).map_or(0, |entry| entry.children_cpu)
     }
-    /// What `/proc/self/status` shows of `pid`: its parent, its
-    /// RLIMIT_SIGPENDING soft limit and PR_SET_NO_NEW_PRIVS.
     /// The parent, process group, session, waited-for children's CPU time
     /// and RLIMIT_RSS soft limit of `pid`, for `/proc/<pid>/stat`.
     pub(crate) fn stat_of(&self, pid: u32) -> (u32, u32, u32, u64, u64) {
@@ -495,6 +493,8 @@ impl Processes {
             )
         })
     }
+    /// What `/proc/self/status` shows of `pid`: its parent, its
+    /// RLIMIT_SIGPENDING soft limit and PR_SET_NO_NEW_PRIVS.
     pub(crate) fn status_of(&self, pid: u32) -> (u32, u64, bool) {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.get(&pid).map_or((0, 4096, false), |entry| {

@@ -24,7 +24,7 @@ import sys
 import time
 
 # Even if every case ran out its time, the cases would end in about 160
-# minutes (115 cases on 4 workers, 330 s each), within the workflow's 180 with
+# minutes (116 cases on 4 workers, 330 s each), within the workflow's 180 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
 # ended. The slowest cases, Emacs and g++, took up to 180 s under the emulator
@@ -423,8 +423,7 @@ def runtimes(shell):
     servers on the loopback."""
     # Left out until paludarium handles them: Java and Erlang, since the CLI
     # runs the first program as /<file name> (Java's $ORIGIN) and only an ELF
-    # one (erl is a script); fish, whose command substitution fails with EBADF
-    # from fcntl.
+    # one (erl is a script).
     return {
         "sbcl": [
             "/usr/bin/sbcl",
@@ -455,6 +454,15 @@ def runtimes(shell):
             "/usr/bin/guile",
             "-c",
             "(display (apply + (map (lambda (x) (* x x)) (iota 10)))) (newline)",
+        ],
+        # A shell written in Rust; its command substitution duplicates a pipe
+        # with fcntl from a register whose upper half is not cleared.
+        "fish": [
+            "/usr/bin/fish",
+            "--no-config",
+            "-c",
+            "for i in (seq 3); echo n$i; end; math 6 \\* 7; set -l l a b c; echo (count $l); "
+            "function f; echo args $argv; end; f x y",
         ],
         "pandoc": shell(
             "printf '# Title\\n\\nSome *emphasis* and `code`.\\n' | pandoc -f markdown -t html"

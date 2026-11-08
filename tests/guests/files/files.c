@@ -627,9 +627,19 @@ void _start(void) {
   results[x++]=CR(100,~0u,0);results[x++]=CR(7,~0u,2);results[x++]=OPEN(7);results[x++]=OPEN(4);
   results[x++]=CR(0x100000004L,4,0);results[x++]=OPEN(4);results[x++]=S(32,fd,0,0);
   results[x++]=CR(4,4,6);results[x++]=S(72,4,1,0);S(3,4,0,0);}
+ if(CASE==59){ /* descriptors and fcntl/ioctl commands in registers with a dirty upper half: Linux reads an int */
+  #define W(n) ((long)(n)|0x500000000L)
+  long d=S(72,W(fd),1030,10);results[x++]=d;results[x++]=S(72,W(d),1,0);results[x++]=S(72,W(d),2,0);results[x++]=S(72,d,1,0);
+  results[x++]=S(16,W(d),0x5451,0);results[x++]=S(72,d,1,0);results[x++]=S(72,W(fd),3,0)&3;
+  results[x++]=S(1,W(fd),"abc",3);results[x++]=S(8,W(fd),1,0);results[x++]=S(0,W(fd),buf,2);
+  results[x++]=S(5,W(fd),st,0);results[x++]=*(long*)(st+48);results[x++]=S(73,W(fd),6,0);results[x++]=S(73,W(fd),8,0);
+  long e=S(32,W(fd),0,0);results[x++]=e;results[x++]=S(3,W(e),0,0);results[x++]=S(72,e,1,0);
+  long t=S(2,"/tmp",65536,0);long o=call(257,W(t),(long)(p+5),0,0,0,0);results[x++]=o>=0;
+  results[x++]=S(72,0x7fffffff00000000L|99,1,0);results[x++]=S(72,d,W(1),0);results[x++]=S(16,d,W(0x5450),0);results[x++]=S(72,d,W(1),0);results[x++]=S(72,W(0xffffffffL),1,0);
+  S(3,d,0,0);S(3,t,0,0);S(3,o,0,0);}
  S(3,fd,0,0);S(87,p,0,0);S(87,q,0,0);S(87,r,0,0);
  }
- S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);
+ S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27||CASE==59)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);
 }
 
 

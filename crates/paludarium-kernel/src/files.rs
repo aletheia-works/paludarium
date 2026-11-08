@@ -353,7 +353,7 @@ impl Files {
         self.descriptor(fd)
             .ok()
             .and_then(|d| d.file.stdio_channel())
-            == u32::try_from(fd).ok()
+            == Some(fd as u32)
     }
     /// Gives `d` the lowest free number from `min`, which must be below the
     /// RLIMIT_NOFILE soft limit `limit` (EMFILE).
@@ -370,16 +370,18 @@ impl Files {
         self.fds
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(&u32::try_from(fd).map_err(|_| Errno::EBADF)?)
+            .get_mut(&(fd as u32))
             .ok_or(Errno::EBADF)?
             .cloexec = cloexec;
         Ok(())
     }
+    /// Descriptor `fd`, from the low 32 bits of the register only, as Linux's
+    /// `fget` takes an `unsigned int`: a caller may leave the upper half dirty.
     pub(crate) fn descriptor(&self, fd: u64) -> Result<Descriptor, Errno> {
         self.fds
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&u32::try_from(fd).map_err(|_| Errno::EBADF)?)
+            .get(&(fd as u32))
             .cloned()
             .ok_or(Errno::EBADF)
     }
@@ -2009,6 +2011,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         72 => {
             let mut d = c.files.descriptor(a[0])?;
+            // fcntl(unsigned int fd, unsigned int cmd, unsigned long arg).
+            let mut a = a;
+            a[1] &= 0xffff_ffff;
             match a[1] {
                 0 | 1030 => {
                     d.cloexec = a[1] == 1030;

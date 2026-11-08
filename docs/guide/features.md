@@ -135,6 +135,10 @@ kernel.
   gives the thread its own copy of a table it shares with `CLONE_FILES`
   threads, which keep their descriptors. Unknown flags and `first` above
   `last` give `EINVAL`.
+- A descriptor argument, and the command of `fcntl` and `ioctl`, is read from
+  the low 32 bits of its register, as Linux's `int` and `unsigned int`
+  parameters are, so a caller that leaves the upper half dirty (fish's `fcntl`
+  does) still names its descriptor.
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`. A word is
   told apart as Linux's `get_futex_key` does: in a shared mapping (shared
   anonymous memory or a file's), a shared operation names the memory and the

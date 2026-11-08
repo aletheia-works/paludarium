@@ -685,6 +685,7 @@ void _start(void) {
   S(5,fd,st,0);results[x++]=MTIME();
   results[x++]=S(76,fdpath(op),2,0);S(5,fd,st,0);results[x++]=*(long*)(st+48);
   results[x++]=S(76,fdpath(900),0,0);
+  results[x++]=S(21,fdpath(op),4,0);results[x++]=call(439,-100,(long)fdpath(op),6,0x200,0,0);results[x++]=S(21,fdpath(900),0,0);
   /* chdir to a directory an O_PATH descriptor holds. */
   ok=S(79,here,300,0);long dp=S(2,"/tmp",010200000,0);results[x++]=S(80,fdpath(dp),0,0);
   S(79,buf,300,0);results[x++]=same(buf,4,"/tmp")&&buf[4]==0;results[x++]=S(80,fdpath(op),0,0);
@@ -699,6 +700,7 @@ void _start(void) {
   S(87,p,0,0);results[x++]=S(90,fdpath(fd),0611,0);S(5,fd,st,0);results[x++]=MODE();
   results[x++]=S(76,fdpath(fd),1,0);S(5,fd,st,0);results[x++]=*(long*)(st+48);
   ts[2]=2000;results[x++]=call(280,-100,(long)fdpath(fd),(long)ts,0,0,0);S(5,fd,st,0);results[x++]=MTIME();
+  results[x++]=S(21,fdpath(fd),4,0);
   S(3,op,0,0);S(3,ol,0,0);S(3,dp,0,0);}
  if(CASE==62){ /* extended attributes through a link in /proc/self/fd */
   long op=S(2,p,010000000,0);

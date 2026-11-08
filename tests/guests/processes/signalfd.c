@@ -112,7 +112,9 @@ static int case_calls(void) {
     ssize_t length = readlink(path, link, sizeof link - 1);
     link[length < 0 ? 0 : length] = 0;
     say("link %s", link);
-    say("reopen %ld", TRY(open(path, O_RDONLY)));
+    /* Opening the link is EACCES for a user other than root, which Linux
+       checks before the anonymous inode's ENXIO; paludarium opens it as for
+       root (see the features page), so the case does not open it. */
     say("poll empty %d", readable(fd, 0));
 
     /* A pending signal that is not blocked is delivered, not read; a

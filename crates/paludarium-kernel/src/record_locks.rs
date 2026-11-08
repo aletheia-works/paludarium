@@ -113,17 +113,16 @@ impl Table {
         }
         false
     }
-    /// Ends the waits for `owner`'s locks on the file that touch
-    /// `start..=end`, which a change there replaced, split or merged.
-    fn wake(&mut self, key: Key, owner: &Owner, start: u64, end: u64) {
+    /// Ends the waits for `owner`'s locks on the file in `changed`, which a
+    /// change replaced, split or merged.
+    fn wake(&mut self, key: Key, owner: &Owner, changed: &[(u64, u64)]) {
         let &Owner::Process(pid) = owner else {
             return;
         };
         self.waiting.retain(|_, w| {
             !(w.blocker == pid
                 && w.key == key
-                && w.start <= end.saturating_add(1)
-                && start <= w.end.saturating_add(1))
+                && changed.iter().any(|&(s, e)| w.start <= e && s <= w.end))
         });
     }
 }
@@ -222,6 +221,8 @@ impl Locks {
         }
         let (mut new_start, mut new_end) = (start, end);
         let mut kept = Vec::with_capacity(list.len() + 1);
+        // The owner's locks this replaces, splits or merges, whose waits end.
+        let mut changed = Vec::new();
         for l in list.drain(..) {
             if !l.owner.same(owner) {
                 kept.push(l);
@@ -231,7 +232,9 @@ impl Locks {
             if Some(l.kind) == kind && touches {
                 new_start = new_start.min(l.start);
                 new_end = new_end.max(l.end);
+                changed.push((l.start, l.end));
             } else if l.overlaps(start, end) {
+                changed.push((l.start, l.end));
                 if l.start < start {
                     kept.push(Lock {
                         end: start - 1,
@@ -265,7 +268,7 @@ impl Locks {
         if let Some(pid) = waiter {
             table.waiting.remove(&pid);
         }
-        table.wake(key, owner, start, end);
+        table.wake(key, owner, &changed);
         Ok(())
     }
     /// Drops `owner`'s locks on the file, as a process's close of any of its
@@ -278,7 +281,7 @@ impl Locks {
                 table.files.remove(&key);
             }
         }
-        table.wake(key, owner, 0, OFFSET_MAX);
+        table.wake(key, owner, &[(0, OFFSET_MAX)]);
     }
     /// Drops every record lock of process `pid`, which exited, and the waits
     /// for them and its own.
@@ -607,11 +610,18 @@ mod tests {
         locks.set(KEY, &a, None, 0, 0, None).unwrap();
         assert!(!locks.table().waiting.contains_key(&2));
         assert!(!deadlock(&locks, 1, 1));
-        // A change to another of 1's locks leaves a wait for byte 5 alone.
+        // A change to another of 1's locks leaves a wait for byte 5 alone,
+        // and so does a lock of another kind next to it, which leaves it as
+        // it was.
         locks.stop_waiting(1);
         assert!(!deadlock(&locks, 2, 5));
         locks.set(KEY, &a, Some(Kind::Read), 9, 9, None).unwrap();
+        locks.set(KEY, &a, Some(Kind::Read), 6, 6, None).unwrap();
         assert!(locks.table().waiting.contains_key(&2));
+        // Merging it with a write lock next to it changes it.
+        locks.set(KEY, &a, Some(Kind::Write), 4, 4, None).unwrap();
+        assert!(!locks.table().waiting.contains_key(&2));
+        assert!(!deadlock(&locks, 2, 5));
         // Closing the file, or exiting, ends the waits for all of 1's locks.
         locks.release(KEY, &a);
         assert!(!locks.table().waiting.contains_key(&2));

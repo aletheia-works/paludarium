@@ -163,13 +163,16 @@ impl SignalInbox {
             .iter()
             .filter(|s| (1..=64).contains(&s.number))
             .fold(0, |set, s| set | 1 << (s.number - 1));
+        // As `signals::queue` keeps them: every real-time signal, and a
+        // standard one only when neither the pending signals nor one queued
+        // earlier here (two timers' can be) has its number and target.
         let coming = queue
             .iter()
-            .filter(|s| {
-                (s.number >= 32
-                    || !pending
-                        .iter()
-                        .any(|p| p.number == s.number && p.target == s.target))
+            .enumerate()
+            .filter(|&(at, s)| {
+                let same =
+                    |p: &signals::PendingSignal| p.number == s.number && p.target == s.target;
+                (s.number >= 32 || !(pending.iter().any(same) || queue[..at].iter().any(same)))
                     && signals::wakes(process, s)
             })
             .count();
@@ -233,6 +236,29 @@ impl SignalInbox {
 #[cfg(test)]
 mod signals_time_tests {
     use super::*;
+
+    #[test]
+    fn queued_arrivals_count_a_standard_signal_once() {
+        let inbox = SignalInbox::default();
+        let mut process = ThreadState {
+            signal_mask: !0,
+            ..ThreadState::default()
+        };
+        let thread = |number| signals::PendingSignal::thread(number, 0);
+        // Two timers' SIGALRM come in without the queue's own coalescing.
+        inbox
+            .queue
+            .lock()
+            .unwrap()
+            .extend([thread(14), thread(14), thread(40), thread(40)]);
+        assert_eq!(inbox.queued_set(&process).1, 3);
+        let before = process.arrivals;
+        inbox.drain(&mut process);
+        assert_eq!(process.arrivals - before, 3);
+        // One already pending counts nothing more.
+        inbox.queue.lock().unwrap().push(thread(14));
+        assert_eq!(inbox.queued_set(&process).1, 0);
+    }
     #[test]
     fn a_signal_from_outside_has_no_sender() {
         let inbox = SignalInbox::default();

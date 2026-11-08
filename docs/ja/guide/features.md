@@ -609,7 +609,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   問いません（`O_PATH` のディスクリプタも）。`stat`、`statfs`、`open`、`access`、
   `chmod` と `fchmodat`、`chown` と `fchownat`、`utimensat`、`truncate`、`chdir`、
   拡張属性の呼び出し、`execve` がそうです（`O_PATH` のディスクリプタへの `fchmod`、
-  `fchown`、`futimens` は `EBADF` です）。削除したファイル、memfd、パイプには
+  `fchown`、`futimens`、`ftruncate` は `EBADF` です）。削除したファイル、memfd、パイプには
   ディスクリプタ自身を通して届きます（それらの `execve` はできません）。
   `O_PATH | O_NOFOLLOW` のディスクリプタが持つシンボリックリンクはもうたどりません。
   そのモードは変えられず（`EOPNOTSUPP`）、`chdir` はディレクトリでないもの（`ENOTDIR`）、

@@ -779,7 +779,7 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     c.files.fs.set_mode(&p, mode).map(|()| 0)
 }
 /// The file of descriptor `fd` for a call that takes it as Linux's `fdget`
-/// does (`fchmod`, `fchown`, `futimens`): an `O_PATH` descriptor is
+/// does (`fchmod`, `fchown`, `futimens`, `ftruncate`): an `O_PATH` descriptor is
 /// `EBADF`, as only path calls (`AT_EMPTY_PATH`, a link in `/proc/self/fd`)
 /// reach its file.
 fn io_descriptor(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
@@ -2130,7 +2130,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         76 | 77 => {
             let f = if n == 77 {
-                c.files.descriptor(a[0])?.file
+                io_descriptor(c, a[0])?
             } else {
                 let (p, found) = looked_up(c, (-100i32) as u64, a[0], true)?;
                 match followed(c, &p, true)? {

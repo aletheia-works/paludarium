@@ -668,8 +668,8 @@ kernel.
   whatever its access (an `O_PATH` descriptor's too): `stat`, `statfs`,
   `open`, `access`, `chmod` and `fchmodat`, `chown` and `fchownat`,
   `utimensat`, `truncate`, `chdir`, the extended-attribute calls and
-  `execve`, where `fchmod`, `fchown` and `futimens` of an `O_PATH`
-  descriptor are `EBADF`. A removed file, a memfd or a pipe is reached through the
+  `execve`, where `fchmod`, `fchown`, `futimens` and `ftruncate` of an
+  `O_PATH` descriptor are `EBADF`. A removed file, a memfd or a pipe is reached through the
   descriptor itself (`execve` of those is not); a symbolic link an
   `O_PATH | O_NOFOLLOW` descriptor holds is not followed again: its mode
   cannot change (`EOPNOTSUPP`), `chdir` finds no directory (`ENOTDIR`),

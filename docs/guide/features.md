@@ -21,7 +21,8 @@ Linux.
 - Instructions are decoded with [iced-x86](https://github.com/icedland/iced).
 - `CPUID` does not reveal the host's values. It names AMD as the vendor, because
   glibc reads the features only for a vendor it knows, and reports the features
-  every x86-64 CPU has, because glibc requires them. Of those, the FPU and MMX
+  every x86-64 CPU has, because glibc requires them, and `CLFLUSH` with its
+  64-byte line, because HotSpot requires it. Of those, the FPU and MMX
   are not implemented; it advertises no other feature that is not. The name
   changes nothing else: where vendors' CPUs differ, as in the flags after a
   `REP` faults, the virtual CPU keeps its own behaviour.

@@ -264,21 +264,23 @@ fn cpuid_vendor_order_and_max_leaf() {
 #[test]
 fn cpuid_partial_families_are_not_advertised() {
     assert_eq!(&cpuid_state(7, 0).gpr[..4], &[0; 4]);
-    // RAX, RCX, RDX, RBX: leaf 1's RCX and RBX have no feature in them.
+    // RAX, RCX, RDX, RBX: leaf 1's RCX has no feature in it, and RBX only
+    // the CLFLUSH line size, 64 bytes.
     let leaf_1 = cpuid_state(1, 0);
-    assert_eq!((leaf_1.gpr[1], leaf_1.gpr[3]), (0, 0));
+    assert_eq!((leaf_1.gpr[1], leaf_1.gpr[3]), (0, 8 << 8));
 }
 #[test]
 fn cpuid_leaf_1_says_what_glibc_requires_of_x86_64() {
     let s = cpuid_state(1, 0);
     assert_eq!(s.gpr[0], 0xf00, "family 15, no model");
     let features = s.gpr[2];
-    for bit in [0, 8, 15, 23, 24, 25, 26] {
+    // And CLFLUSH (19), which HotSpot requires.
+    for bit in [0, 8, 15, 19, 23, 24, 25, 26] {
         assert_ne!(features >> bit & 1, 0, "bit {bit}");
     }
     assert_eq!(
         features.count_ones(),
-        7,
+        8,
         "nothing past the baseline: {features:x}"
     );
 }

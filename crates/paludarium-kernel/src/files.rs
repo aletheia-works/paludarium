@@ -638,9 +638,6 @@ fn chown_path(
     }
     Ok(0)
 }
-/// `fchownat(dirfd, path, owner, group, flags)`, in `do_fchownat`'s order:
-/// the flags (EINVAL), then the path; an empty one with `AT_EMPTY_PATH`
-/// names `dirfd` itself, or the working directory.
 /// `fchmodat2`, as Linux's `do_fchmodat`: `fchmodat` with flags.
 /// `AT_SYMLINK_NOFOLLOW` gives a symbolic link `EOPNOTSUPP`, since its mode
 /// cannot change, and `AT_EMPTY_PATH` changes the descriptor's file.
@@ -676,6 +673,9 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let mode = crate::permissions::chmod(&c.process.credentials, &stat, a[2] as u32)?;
     c.files.fs.set_mode(&p, mode).map(|()| 0)
 }
+/// `fchownat(dirfd, path, owner, group, flags)`, in `do_fchownat`'s order:
+/// the flags (EINVAL), then the path; an empty one with `AT_EMPTY_PATH`
+/// names `dirfd` itself, or the working directory.
 fn fchownat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if a[4] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL);

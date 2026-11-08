@@ -238,6 +238,12 @@ pub trait Host: Send + Sync {
     fn cpu_count(&self) -> usize {
         std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     }
+    /// The time slice, in nanoseconds, the host's scheduler gives the calling
+    /// thread, as Linux's `sched_rr_get_interval` reports it; `None` where
+    /// the host does not tell.
+    fn time_slice(&self) -> Option<u64> {
+        None
+    }
     /// Waits until a deadline while polling cancellation outside guest memory locks.
     fn wait_until(
         &self,
@@ -329,6 +335,11 @@ impl Host for NativeHost {
     }
     fn thread_cpu_time(&self) -> Result<u64, Errno> {
         clock::native_thread_cpu_time()
+    }
+    /// On Linux, the guest's threads are the host's, so the host's time
+    /// slice for this thread is the guest thread's.
+    fn time_slice(&self) -> Option<u64> {
+        clock::native_time_slice()
     }
     fn wait_until(
         &self,

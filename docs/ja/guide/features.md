@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_getscheduler`／`sched_getparam`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_get`、`personality`、`unshare`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
@@ -485,6 +485,46 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どちらも、root と同じくほかのプロセスのスレッドも見つけ、その ID の生きているスレッドが
   なければ `ESRCH` です。`getcpu` は、スレッドのマスクが許すいちばん小さい番号の CPU と、
   NUMA ノード 0 を返します。
+- `sched_setscheduler`、`sched_setparam`、`sched_setattr` はないので、どのスレッドも
+  `SCHED_OTHER` で動きます。`sched_getscheduler` は 0 を、`sched_getparam` は優先度 0 を
+  返します。どのプロセスのスレッドでも見つけ、その ID のスレッドがなければ `ESRCH`、負の
+  ID なら `EINVAL` です（Linux と同じく、先に確かめる NULL の引数も `EINVAL`）。
+  `sched_get_priority_max` と `sched_get_priority_min` は、Linux と同じく `SCHED_FIFO` と
+  `SCHED_RR` で 99 と 1、ほかのポリシーで 0 です。`sched_rr_get_interval` は、Linux の
+  ホストではホストのスケジューラーがそのスレッドに与えるタイムスライスを返します。
+  ゲストのスレッドはホストのスレッドで動くからです。ほかのホストでは Linux 6.12 の
+  1000 Hz での既定値、つまり 0.75 ms に 1 + log2(CPU の数、最大 8) を掛けた値を
+  ミリ秒単位に切り捨てたものです。`ioprio_get` は `getpriority` と同じようにスレッドを
+  見つけます（`IOPRIO_WHO_PROCESS`、`IOPRIO_WHO_PGRP`、`IOPRIO_WHO_USER`）。どの
+  スレッドも優先度を設定できない（`ioprio_set` は `ENOSYS`）ので、どれも優先度を
+  持たず（0、`IOPRIO_CLASS_NONE`）、スレッドが 1 つならそれを返します。複数なら、Linux の
+  `ioprio_best` がそれぞれを `IOPRIO_CLASS_BE` のレベル 4 とみなすので、その値（16388）を
+  返します。
+- `personality` は、Linux と同じくどんな値でもスレッドに持ち、前の値を返します
+  （`0xffffffff` は問い合わせだけです）。新しいスレッドとプロセスはそれを継ぎ、
+  `execve` は `READ_IMPLIES_EXEC` を、set-ID のプログラムなら `PER_CLEAR_ON_SETID` も
+  落として保ちます。Linux と同じく、3 つの設定はゲストに見えるものを変えます。
+  `PER_LINUX32` なら `uname` は `i686` と、`UNAME26` なら 2.6 のリリース（`2.6.72`）と
+  答え、`READ_IMPLIES_EXEC` なら `mmap` と `mprotect` は読めるマッピングを実行もできる
+  ようにします。ほかのフラグ（`ADDR_NO_RANDOMIZE`、`ADDR_COMPAT_LAYOUT`、
+  `MMAP_PAGE_ZERO` など）は持つだけです。配置は変わらず、もともとランダムにもしません。
+- `membarrier` は、`CONFIG_RSEQ` があって `nohz_full` の CPU がない x86-64 の Linux の
+  コマンドを持ちます（`MEMBARRIER_CMD_QUERY` は `0x3ff`）。プライベートのコマンドは、
+  アドレス空間がそれに登録するまで `EPERM` です。fork は登録を保ち、exec のあとは登録がなく、
+  `MEMBARRIER_CMD_GET_REGISTRATIONS` は Linux と同じビットで登録を答えます（`SYNC_CORE`
+  に登録すると、空間はプライベートとしても印が付きます）。バリアはホストのフェンス
+  です。ゲストのメモリーへのアクセスはどれもアドレス空間のロックを取るので、各スレッドで
+  バリアを実行したのと同じく、ほかのスレッドのアクセスとの順序がすでに決まっています。
+- `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
+  `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
+  `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
+  `EINVAL` です。プロセスにほかのスレッドがあるとき、ほかのプロセスとシグナルの扱いを
+  共有しているとき（`CLONE_SIGHAND`）、ほかのプロセスとメモリーを共有しているとき
+  （`CLONE_THREAD` なしの `CLONE_VM`）です。System V IPC がないので、`CLONE_SYSVSEM` で
+  捨てるセマフォーの調整値はありません。名前空間はありません。そのフラグは、Linux と
+  同じく `CAP_SYS_ADMIN` がなければ `EPERM`、あれば `EINVAL` です。後者は、その名前空間
+  なしでビルドしたカーネルと同じで、ここでの `clone` とも同じです。Linux ではユーザーも
+  使える `CLONE_NEWUSER` も `EINVAL` です。[制限](./limitations.md)を見てください。
 - `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、
   ホストのことは見せません。ゲストは root（ユーザーとグループが 0 で、すべての
   ケーパビリティを持つ）として始まります。Linux と同じく、資格情報はスレッドごとに

@@ -1082,6 +1082,15 @@ impl Processes {
             parent.group.notify_child(signals::CLD_STOPPED, child);
         }
     }
+    /// Whether a live process other than `pid` runs in `space` (`CLONE_VM`
+    /// without `CLONE_THREAD`), as Linux's `current_is_single_threaded`
+    /// looks for one.
+    pub(crate) fn shares_memory(&self, pid: u32, space: &AddressSpace) -> bool {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.iter().any(|(&other, entry)| {
+            other != pid && entry.status.is_none() && entry.group.uses_memory(space)
+        })
+    }
     /// The thread group of the live thread named by its ID, in any process,
     /// as `find_task_by_vpid` finds it.
     pub(crate) fn group_of(&self, named: u32) -> Option<Arc<ThreadGroup>> {
@@ -1661,6 +1670,8 @@ impl Kernel {
             // getpriority, setpriority
             140 => self.getpriority(thread, a),
             141 => self.setpriority(thread, a),
+            252 => self.ioprio_get(thread, a),
+            272 => self.unshare(thread, mem, a[0]),
             // prlimit64, getrlimit, setrlimit
             302 => self.prlimit(thread, mem, a[0], a[1], a[2], a[3]),
             97 => self.prlimit(thread, mem, 0, a[0], 0, a[1]),
@@ -1750,6 +1761,100 @@ impl Kernel {
             .map(|found| (20 - found.nice) as u64)
             .max()
             .ok_or(Errno(3))
+    }
+    /// `ioprio_get(which, who)`: the I/O priority of a thread
+    /// (`IOPRIO_WHO_PROCESS`), the best of a process group's threads
+    /// (`IOPRIO_WHO_PGRP`) or of a user's (`IOPRIO_WHO_USER`), found as
+    /// `getpriority` finds them. No thread has an I/O context, as
+    /// `ioprio_set` is not offered, so each has no priority (0, class
+    /// `IOPRIO_CLASS_NONE`): the answer for one thread. Linux compares
+    /// several with `ioprio_best`, which counts a thread without one as
+    /// `IOPRIO_CLASS_BE` level 4 (16388). None found is `ESRCH`.
+    fn ioprio_get(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
+        let which = match a[0] as i32 {
+            which @ 1..=3 => which - 1,
+            _ => return Err(Errno::EINVAL),
+        };
+        let threads = self.processes.priority_threads(
+            which,
+            a[1] as i32,
+            self.process.pid,
+            thread.tid,
+            thread.state.credentials.uid,
+        )?;
+        const BEST_EFFORT_NORMAL: u64 = 2 << 13 | 4;
+        match threads.len() {
+            0 => Err(Errno(3)),
+            1 => Ok(0),
+            _ => Ok(BEST_EFFORT_NORMAL),
+        }
+    }
+    /// `unshare(flags)`, as Linux's `ksys_unshare` with its checks in order.
+    /// `CLONE_FILES` and `CLONE_FS` give the thread its own descriptor table
+    /// and its own working directory and umask; `CLONE_THREAD`,
+    /// `CLONE_SIGHAND` and `CLONE_VM` succeed where there is nothing to
+    /// unshare (one thread, dispositions and memory no other process shares)
+    /// and are `EINVAL` otherwise, as Linux has them; `CLONE_SYSVSEM` has no
+    /// semaphore adjustments to drop. There are no namespaces: the flags of
+    /// one are `EPERM` without CAP_SYS_ADMIN, as on Linux, and `EINVAL` with
+    /// it, as from a kernel built without that namespace, the error `clone`
+    /// gives them here; `CLONE_NEWUSER`, which needs no capability, is
+    /// `EINVAL` too.
+    fn unshare(&mut self, thread: &Thread, mem: &AddressSpace, flags: u64) -> Result<u64, Errno> {
+        const VM: u64 = 0x100;
+        const FS: u64 = 0x200;
+        const FILES: u64 = 0x400;
+        const SIGHAND: u64 = 0x800;
+        const THREAD: u64 = 0x1_0000;
+        const NEWNS: u64 = 0x2_0000;
+        const SYSVSEM: u64 = 0x4_0000;
+        const NEWUSER: u64 = 0x1000_0000;
+        // CLONE_NEWTIME, NEWCGROUP, NEWUTS, NEWIPC, NEWPID and NEWNET.
+        const NAMESPACES: u64 =
+            0x80 | 0x200_0000 | 0x400_0000 | 0x800_0000 | 0x2000_0000 | 0x4000_0000;
+        let mut flags = flags;
+        if flags & NEWUSER != 0 {
+            flags |= THREAD | FS;
+        }
+        if flags & VM != 0 {
+            flags |= SIGHAND;
+        }
+        if flags & SIGHAND != 0 {
+            flags |= THREAD;
+        }
+        if flags & NEWNS != 0 {
+            flags |= FS;
+        }
+        // check_unshare_flags.
+        if flags & !(THREAD | FS | NEWNS | SIGHAND | VM | FILES | SYSVSEM | NEWUSER | NAMESPACES)
+            != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        if flags & (THREAD | SIGHAND | VM) != 0 && self.group.active_threads() > 1 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & (SIGHAND | VM) != 0 && self.group.shares_actions() {
+            return Err(Errno::EINVAL);
+        }
+        if flags & VM != 0 && self.processes.shares_memory(self.process.pid, mem) {
+            return Err(Errno::EINVAL);
+        }
+        // unshare_userns, then unshare_nsproxy_namespaces.
+        if flags & NEWUSER != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & (NEWNS | NAMESPACES) != 0 {
+            return Err(if thread.state.credentials.may_administer() {
+                Errno::EINVAL
+            } else {
+                Errno::EPERM
+            });
+        }
+        if flags & (FS | FILES) != 0 {
+            self.files = self.files.for_clone(flags & FILES == 0, flags & FS == 0);
+        }
+        Ok(0)
     }
     /// `setpriority(which, who, nice)`: sets the nice value of every thread
     /// the caller may change to `nice`, cut to -20..19, as Linux's
@@ -2365,11 +2470,18 @@ impl Kernel {
         // exec keeps the thread's CPU time, as it keeps the process.
         let cpu = std::mem::take(&mut thread.state.cpu);
         let old = std::mem::take(&mut thread.state.credentials);
+        // A 64-bit program drops READ_IMPLIES_EXEC (x86's
+        // set_personality_64bit), and a set-ID one PER_CLEAR_ON_SETID too.
+        let mut personality = thread.state.personality & !crate::syscalls::READ_IMPLIES_EXEC;
+        if secure {
+            personality &= !crate::syscalls::PER_CLEAR_ON_SETID;
+        }
         thread.state = ThreadState {
             pid: self.process.pid,
             signal_mask: thread.state.signal_mask,
             signal_actions: ignored,
             cpu,
+            personality,
             ..ThreadState::default()
         };
         thread.state.name_after(&path);

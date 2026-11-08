@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_getscheduler`/`sched_getparam`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_get`, `personality`, `unshare`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
@@ -533,6 +533,49 @@ kernel.
   another process too, as root may, and give `ESRCH` when no live thread
   has the ID. `getcpu` gives the lowest CPU the thread's mask allows, and
   NUMA node 0.
+- Every thread runs under `SCHED_OTHER`, as `sched_setscheduler`,
+  `sched_setparam` and `sched_setattr` are not offered: `sched_getscheduler`
+  gives 0 and `sched_getparam` a priority of 0, for a thread of any process,
+  `ESRCH` when none has the ID and `EINVAL` for a negative one (or a NULL
+  parameter, checked first, as Linux does). `sched_get_priority_max` and
+  `sched_get_priority_min` give Linux's 99 and 1 for `SCHED_FIFO` and
+  `SCHED_RR` and 0 for the other policies. `sched_rr_get_interval` gives the
+  time slice the host's scheduler gives the thread on a Linux host, whose
+  threads run the guest's; elsewhere Linux 6.12's default at 1000 Hz, whole
+  milliseconds of 0.75 ms times 1 + log2 of the CPUs (at most 8).
+  `ioprio_get` finds threads as `getpriority` does (`IOPRIO_WHO_PROCESS`,
+  `IOPRIO_WHO_PGRP`, `IOPRIO_WHO_USER`). No thread can set a priority
+  (`ioprio_set` gives `ENOSYS`), so each has none (0, `IOPRIO_CLASS_NONE`),
+  which a single thread reports; for several, Linux's `ioprio_best` counts
+  each as `IOPRIO_CLASS_BE` level 4, which they report (16388).
+- `personality` keeps any value for the thread, as Linux stores it, and
+  returns the old one (`0xffffffff` only asks). New threads and processes
+  inherit it, and `execve` keeps it but for `READ_IMPLIES_EXEC`, and
+  `PER_CLEAR_ON_SETID` for a set-ID program. Three settings change what the
+  guest sees, as on Linux: `PER_LINUX32` makes `uname` report `i686`,
+  `UNAME26` a 2.6 release (`2.6.72`), and `READ_IMPLIES_EXEC` makes what
+  `mmap` and `mprotect` map readable executable too. The others
+  (`ADDR_NO_RANDOMIZE`, `ADDR_COMPAT_LAYOUT`, `MMAP_PAGE_ZERO`, ...) are only
+  kept: the layout does not change, and is not randomized to begin with.
+- `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
+  `nohz_full` CPU (`MEMBARRIER_CMD_QUERY` gives `0x3ff`). The private
+  commands give `EPERM` until the address space registers for them, a fork
+  keeps the registrations and an exec starts with none, and `MEMBARRIER_CMD_GET_REGISTRATIONS`
+  reports them with Linux's bits (registering `SYNC_CORE` marks the space
+  private too). A barrier is a fence on the host: every guest memory access
+  already takes its address space's lock, which orders it with the other
+  threads' as a barrier on each of them would.
+- `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
+  with `CLONE_FS` its own working directory and umask, as Linux. With
+  `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is
+  nothing to unshare and gives `EINVAL` where Linux does: another thread in
+  the process, dispositions shared with another process (`CLONE_SIGHAND`), or
+  memory shared with one (`CLONE_VM` without `CLONE_THREAD`). `CLONE_SYSVSEM`
+  has no semaphore adjustments to drop, as there is no System V IPC. There
+  are no namespaces: their flags give `EPERM` without `CAP_SYS_ADMIN`, as on
+  Linux, and `EINVAL` with it, as from a kernel built without that namespace
+  and as `clone` gives them here; `CLONE_NEWUSER`, which Linux lets a user
+  have, gives `EINVAL` too. See [Limitations](./limitations.md).
 - `uname` reports Linux on x86_64 with the host name `paludarium`; like
   `CPUID`, it does not reveal the host. The guest starts as root (user and
   group 0, with every capability). Each thread has its own credentials, as

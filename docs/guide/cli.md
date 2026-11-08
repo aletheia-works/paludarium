@@ -70,9 +70,10 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 | 70 | the guest could not be started, or an error of the emulator itself (`EX_SOFTWARE`) |
 
 The guest cannot be started when, for example, the program is not an ELF file
-paludarium can load nor a script whose interpreter is one, it does not fit in `--max-memory`, or a `--mount` host
-directory cannot be opened. A `paludarium:` line on standard error then names
-the kind of the error, such as `invalid-program` or `host`.
+paludarium can load nor a script whose interpreter is one, it does not fit in
+`--max-memory`, or a `--mount` host directory cannot be opened. A
+`paludarium:` line on standard error then names the kind of the error, such as
+`invalid-program` or `host`.
 
 ## Finding what is missing
 

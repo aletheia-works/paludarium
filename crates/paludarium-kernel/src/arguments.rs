@@ -13,7 +13,8 @@
 /// is sign-extended; `u` for an unsigned one (`unsigned int`, `u32`, `uid_t`,
 /// `gid_t`, `dev_t`'s `unsigned`), which is zero-extended; `h` for `umode_t`;
 /// and `l` for a full register (pointers, `long`, `size_t`, `loff_t`).
-/// Arguments past the end are full registers.
+/// Arguments past the end are full registers. An `unsigned long` that Linux
+/// itself passes on as an `unsigned` (an iovec count) is `u`.
 fn widths(number: u64) -> &'static [u8] {
     match number {
         // read, write, close, fstat, pread64, pwrite64, dup, fsync,
@@ -37,12 +38,12 @@ fn widths(number: u64) -> &'static [u8] {
         // exit_group, set_mempolicy, mq_timedreceive, mq_notify,
         // mq_getsetattr, migrate_pages, futimesat, pselect6, get_robust_list,
         // signalfd, timerfd_gettime, epoll_create1, inotify_init1,
-        // clock_adjtime, syncfs, process_vm_readv/writev, userfaultfd,
+        // clock_adjtime, syncfs, userfaultfd,
         // pkey_free, openat2
         13 | 14 | 23 | 36 | 38 | 60 | 95 | 98 | 115 | 116 | 121 | 124 | 142 | 143 | 145 | 146
         | 147 | 148 | 151 | 157 | 158 | 139 | 154 | 187 | 193 | 196 | 199 | 213 | 224 | 225
         | 226 | 227 | 228 | 229 | 231 | 238 | 243 | 244 | 245 | 256 | 261 | 270 | 274 | 282
-        | 287 | 291 | 294 | 305 | 306 | 310 | 311 | 323 | 331 | 437 => b"i",
+        | 287 | 291 | 294 | 305 | 306 | 323 | 331 | 437 => b"i",
         // ioctl, fcntl, flock: fd, cmd; dup2; setreuid, setregid;
         // fanotify_init; seccomp
         16 | 72 | 73 | 33 | 113 | 114 | 300 | 317 => b"uu",
@@ -150,8 +151,16 @@ fn widths(number: u64) -> &'static [u8] {
         275 | 326 => b"ilillu",
         // tee: fdin, fdout, flags
         276 => b"iilu",
-        // sync_file_range, vmsplice: fd, flags
-        277 | 278 => b"illu",
+        // sync_file_range: fd, flags
+        277 => b"illu",
+        // vmsplice: fd, nr_segs, flags
+        278 => b"iluu",
+        // readv, writev, preadv, pwritev: vlen. Linux declares it unsigned
+        // long but hands it to import_iovec, whose nr_segs is unsigned.
+        19 | 20 | 295 | 296 => b"llu",
+        // process_vm_readv, process_vm_writev: pid, liovcnt (import_iovec's
+        // too; riovcnt is read whole)
+        310 | 311 => b"ilu",
         // move_pages: pid, flags
         279 => b"illlli",
         // accept4, signalfd4: fd, flags
@@ -186,8 +195,8 @@ fn widths(number: u64) -> &'static [u8] {
         322 => b"illli",
         // membarrier: cmd, flags, cpu_id
         324 => b"iui",
-        // preadv2, pwritev2: flags
-        327 | 328 => b"llllli",
+        // preadv2, pwritev2: vlen (import_iovec's), flags
+        327 | 328 => b"llulli",
         // pkey_mprotect: pkey
         329 => b"llli",
         // statx: dfd, flags, mask

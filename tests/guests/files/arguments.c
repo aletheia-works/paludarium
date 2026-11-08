@@ -1,8 +1,8 @@
 /* Each system call twice: with clean arguments, then with the upper half of
    every 32-bit argument dirty (and bits 16-31 of a umode_t). Linux casts the
    registers to the types its SYSCALL_DEFINEs declare, so the two match, except
-   for unsigned long arguments (readv's vlen, mprotect's prot), which it reads
-   whole. Only whether they match is printed: the results themselves are the
+   for unsigned long arguments it reads whole (mprotect's prot). readv's vlen
+   is unsigned long too, but import_iovec takes it as an unsigned. Only whether they match is printed: the results themselves are the
    other guests' business. */
 #include <stdio.h>
 #include <string.h>
@@ -36,7 +36,9 @@ int main(void){
  P("creat mode",{long f=S2(85,H,D(0600));S2(5,f,st);r=*(unsigned*)(st+24);S1(3,f);S1(87,H);});
  P("lseek whence",{r=S3(8,fd,2,D(0));});
  P("pread64 fd",{r=S4(17,D(fd),buf,3,1);});
- P("readv vlen(ulong)",{long iov[2]={(long)buf,3};r=S3(19,fd,iov,dirty?W(1):1);});
+ P("readv vlen",{long iov[2]={(long)buf,3};r=S3(19,fd,iov,dirty?W(1):1);});
+ P("writev vlen",{long iov[2]={(long)"abc",3};r=S3(20,fd,iov,dirty?W(1):1);});
+ P("preadv vlen",{long iov[2]={(long)buf,3};r=S5(295,fd,iov,dirty?W(1):1,0,0);});
  P("access mode",{r=S2(21,F,D(4));});
  P("faccessat dfd,mode",{r=S3(269,D(-100),F,D(4));});
  P("faccessat2 mode,flags",{r=S4(439,D(-100),F,D(4),D(0x200));});

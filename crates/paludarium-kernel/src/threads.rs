@@ -38,6 +38,9 @@ pub struct ThreadGroup {
     process_inbox: Mutex<Arc<SignalInbox>>,
     process_pending: Mutex<ThreadState>,
     discards: Arc<signals::Discards>,
+    /// The signals the threads' drains made pending, for the signal files
+    /// of the other threads ([`SignalInbox::others_arrivals`]).
+    arrivals: Arc<std::sync::atomic::AtomicU64>,
     timer_generation: AtomicU64,
     /// The RLIMIT_NOFILE soft limit, which bounds the descriptor numbers this
     /// process allocates, and the RLIMIT_FSIZE one, which bounds the files it
@@ -92,6 +95,7 @@ impl Default for ThreadGroup {
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
             process_pending: Mutex::new(ThreadState::default()),
             discards: Arc::default(),
+            arrivals: Arc::default(),
             timer_generation: AtomicU64::new(0),
             nofile: AtomicU64::new(1024),
             fsize: AtomicU64::new(u64::MAX),
@@ -396,7 +400,7 @@ impl ThreadGroup {
         self.drain_process(local);
     }
     pub(crate) fn register(&self, tid: u32, inbox: Arc<SignalInbox>) {
-        inbox.attach(Arc::clone(&self.discards));
+        inbox.attach(Arc::clone(&self.discards), Arc::clone(&self.arrivals));
         let wake = inbox.wake_token();
         let mut members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
         let owner = self.exec_owner.load(Ordering::SeqCst);

@@ -912,8 +912,8 @@ kernel.
   readable while one of its signals is pending for the calling thread, as
   on Linux, so a thread's own signal is seen by that thread alone and a
   forked child's inherited file reads the child's signals. Edge-triggered
-  `epoll` gets an edge for each signal queued to the thread or its process
-  while one of the file's signals is pending, as Linux's `signalfd_notify`
+  `epoll` gets an edge for each signal queued to the process or any of its
+  threads while one of the file's signals is pending for the waiter, as Linux's `signalfd_notify`
   wakes the file for each: another real-time signal of a number already
   waiting counts, a standard signal already pending or one ignored and
   unblocked does not; a new mask is an edge too. `signalfd` on a

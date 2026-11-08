@@ -44,10 +44,13 @@ pub(crate) fn observe(process: &ThreadState, inbox: &SignalInbox, group: &Thread
     let (shared, shared_arrivals) = group.process_pending_set();
     let (queued, coming) = inbox.queued_set(process);
     let set = set_of(&process.pending) | queued | shared;
+    // Another thread's signal counts once its drain takes it in, as Linux
+    // wakes every signal file of the process for each signal.
     let arrivals = process
         .arrivals
         .wrapping_add(coming)
-        .wrapping_add(shared_arrivals);
+        .wrapping_add(shared_arrivals)
+        .wrapping_add(inbox.others_arrivals());
     VIEW.with(|view| {
         let seen = view.get();
         let epoch = if set & !seen.set != 0 || arrivals != seen.arrivals {

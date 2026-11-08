@@ -4687,9 +4687,12 @@ int main(int argc, char **argv) {
             char removed_in[112], removed_out[112];
             snprintf(removed_in, sizeof removed_in, "%s/removed", a);
             snprintf(removed_out, sizeof removed_out, "%s/removed", b);
-            int in = open(removed_in, O_CREAT | O_RDWR, 0755), out = open(removed_out, O_CREAT | O_RDWR, 0755);
+            /* Open for reading only: a file open for writing is ETXTBSY. */
+            close(open(removed_in, O_CREAT | O_WRONLY, 0755));
+            close(open(removed_out, O_CREAT | O_WRONLY, 0755));
             chmod(removed_in, 0755);
             chmod(removed_out, 0755);
+            int in = open(removed_in, O_RDONLY), out = open(removed_out, O_RDONLY);
             unlink(removed_in);
             unlink(removed_out);
             long r = ll_ruleset(LL_EXECUTE);

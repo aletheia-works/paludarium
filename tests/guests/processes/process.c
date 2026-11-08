@@ -4491,6 +4491,9 @@ int main(int argc, char **argv) {
         rule.parent_fd = parent;
         result("rule-dir", ll_call(syscall(445, rs, 1, &rule, 0)));
         close(parent);
+        /* The native side runs unprivileged, which no_new_privs lets
+           restrict itself; the flags and the descriptor come after. */
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         result("restrict-flags", ll_call(syscall(446, rs, 1 << 10)));
         result("restrict-not-ruleset", ll_call(syscall(446, ev, 0)));
         close(ev);

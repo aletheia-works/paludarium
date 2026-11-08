@@ -784,8 +784,8 @@ kernel.
   own walk); a path relative to a descriptor of `/proc` or to a working
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
-- The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
-  `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
+- The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
+  `/proc/stat` and `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -852,6 +852,12 @@ kernel.
   the last ID handed out; 4 GiB of total, free and available memory and
   nothing else used, no swap and no huge pages; and the monotonic clock's
   uptime with no idle time.
+- `/proc/stat` is in the format of Linux's `show_stat`: a `cpu` line and one
+  for each CPU `sched_getaffinity` reports, every time 0 as `/proc/uptime`
+  counts no idle time; `intr 0`, `ctxt 0`; `btime`, the real-time clock less
+  the monotonic one in seconds, so `ps` finds the boot time; `processes`, the
+  IDs handed out; `procs_running 1`, `procs_blocked 0`; and a `softirq` line
+  of zeros.
 - `/proc/self/maps` lists the VMAs in Linux's format, with adjacent mappings
   merged and split as Linux does: the range, the protection, `s` or `p`, the
   offset in the file, the file's device and inode as `stat` gives them, and

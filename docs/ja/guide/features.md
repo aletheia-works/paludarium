@@ -716,7 +716,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `openat2` は自身の解決の中で扱います）。`/proc` のディスクリプタや `/proc` の中の
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）、
+- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
@@ -774,6 +774,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   最後に割り当てた ID が続きます。メモリは合計、空き、使えるものがどれも 4 GiB で、ほかの
   使用はなく、スワップも huge page もありません。起動からの時間は単調時計の値で、アイドルの
   時間は数えません。
+- `/proc/stat` は Linux の `show_stat` と同じ形式です。`cpu` の行と、`sched_getaffinity` が
+  返す CPU ごとの行があり、`/proc/uptime` がアイドルの時間を数えないのと同じく、時間はどれも
+  0 です。続いて `intr 0`、`ctxt 0`、`btime`（実時間の時計から単調時計を引いた秒数で、`ps` は
+  これで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running 1`、
+  `procs_blocked 0`、0 が並ぶ `softirq` の行です。
 - `/proc/self/maps` は VMA を Linux の形式で並べます。隣り合うマッピングの併合と
   分割も Linux と同じです。項目は、範囲、保護、`s` か `p`、ファイル内のオフセット、
   `stat` と同じファイルのデバイスと inode、Linux と同じ桁に置く名前です。名前は

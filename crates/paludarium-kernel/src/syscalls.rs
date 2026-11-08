@@ -2405,7 +2405,7 @@ fn affinity_target(
 }
 
 /// The host's CPUs, numbered from 0, as Linux's `cpu_active_mask`.
-fn active_cpus(c: &Context<'_>) -> usize {
+pub(crate) fn active_cpus(c: &Context<'_>) -> usize {
     c.host.cpu_count().clamp(1, 8192)
 }
 

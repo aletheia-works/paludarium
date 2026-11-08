@@ -17,8 +17,9 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
   name it there (with `--mount /:/`, `/usr/bin/java` runs as
   `/usr/bin/java`). It counts as inside when its path, as written or with
   the symbolic links and `..` of its directory and of the host directory
-  resolved, starts with the host directory, and only through the mount the guest sees
-  that path through (the one with the deepest guest directory above it).
+  resolved, starts with the host directory, and only through the mount the
+  guest sees that path through (the one with the deepest guest directory
+  above it).
   Any other program is copied into the guest at `/<file name>`.
 - A program that starts with `#!` is a script and runs its interpreter, as
   `execve` runs one ([System calls](./features#system-calls)). The interpreter is a

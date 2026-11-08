@@ -261,8 +261,8 @@ fn guest_components(path: &[u8]) -> Option<Vec<&[u8]>> {
 /// The guest path at which `mount` shows the host file `program`, if the
 /// file lies inside its host directory: as the paths are written, or else
 /// with the symbolic links and `..` of the program's directory and of the
-/// host directory resolved (`/tmp` and `/private/tmp` on macOS). The program's own
-/// name stays a link, as exec of it names it.
+/// host directory resolved (`/tmp` and `/private/tmp` on macOS). The
+/// program's own name stays a link, as exec of it names it.
 fn path_in_mount(program: &Path, mount: &Mount) -> Option<Vec<Vec<u8>>> {
     let written = || {
         let program = std::path::absolute(program).ok()?;
@@ -672,11 +672,16 @@ mod tests {
         );
         assert_eq!(at(java, &[]), None);
         // A `..` in the program's directory is resolved, as exec resolves it.
-        let up = std::path::absolute("/usr/lib/../bin").unwrap().join("java");
+        // The directories are real ones, since resolving them reads them.
+        let tree = std::env::temp_dir().join(format!("paludarium-dotdot-{}", std::process::id()));
+        std::fs::create_dir_all(tree.join("lib")).unwrap();
+        std::fs::create_dir_all(tree.join("bin")).unwrap();
+        let up = tree.join("lib").join("..").join("bin").join("java");
         assert_eq!(
-            at(up.to_str().unwrap(), &[mount(usr, "/x")]).as_deref(),
+            at(up.to_str().unwrap(), &[mount(tree.to_str().unwrap(), "/x")]).as_deref(),
             Some(&b"/x/bin/java"[..])
         );
+        std::fs::remove_dir_all(&tree).unwrap();
         // A mount's own directory, or a guest path with `..`, is not one.
         // /x/jvm/bin/java through the first is the second's.
         assert_eq!(

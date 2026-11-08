@@ -278,6 +278,7 @@ mod linux {
         processes_x87_arithmetic => ("x87-arithmetic","process"),
         processes_robust_list => ("robust-list","process"),
         processes_futex_shared => ("futex-shared","process"),
+        processes_late_handler => ("late-handler","process"),
         processes_mincore => ("mincore","process"),
         processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),

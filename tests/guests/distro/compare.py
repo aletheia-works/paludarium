@@ -23,8 +23,8 @@ import subprocess
 import sys
 import time
 
-# Even if every case ran out its time, the cases would end in about 116
-# minutes (84 cases on 4 workers, 330 s each), within the workflow's 150 with
+# Even if every case ran out its time, the cases would end in about 121
+# minutes (85 cases on 4 workers, 330 s each), within the workflow's 150 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
 # ended. The slowest case, g++, took 75 to 150 s under the emulator on CI, and
@@ -194,9 +194,7 @@ def cases(fx):
         "dpkg-query": ["/usr/bin/dpkg-query", "-W", "-f=${Version}\\n", "bash"],
         # Signals, processes, sockets, locks and /proc. Left out until paludarium has
         # them: pseudo-terminals (python's pty, script), mkfifo, /proc/self/stat
-        # (ps), /proc/self/exe and cmdline, /proc/loadavg and meminfo, and a
-        # hang of Node.js's child processes connected by pipes (execFile,
-        # spawnSync).
+        # (ps), /proc/self/exe and cmdline, and /proc/loadavg and meminfo.
         "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
         "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],
         "python-processes": ["/usr/bin/python3", f"{SCRIPTS}/processes.py"],
@@ -255,6 +253,17 @@ def cases(fx):
             'const { Worker } = require("worker_threads"); '
             "new Worker(\"require('worker_threads').parentPort.postMessage(6 * 7)\", { eval: true })"
             '.on("message", (m) => console.log("worker", m));',
+        ],
+        # Child processes whose standard streams are pipes, one after another.
+        "node-child-process": [
+            "/usr/bin/node",
+            "-e",
+            'const cp = require("child_process"); '
+            'const r = cp.spawnSync("/bin/sh", ["-c", "echo sync; exit 3"]); '
+            "console.log(r.status, String(r.stdout).trim()); "
+            'cp.execFile("/bin/echo", ["async"], (error, out) => { console.log(error, out.trim()); '
+            'const cat = cp.spawn("/bin/cat"); cat.stdout.on("data", (d) => process.stdout.write("cat " + d)); '
+            'cat.on("close", (code) => console.log("closed", code)); cat.stdin.end("piped\\n"); });',
         ],
         "php-proc": [
             "/usr/bin/php",

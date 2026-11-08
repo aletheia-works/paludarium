@@ -3022,6 +3022,53 @@ static int futex_shared_cases(void) {
     return 0;
 }
 
+/* A handler set while another thread already waits is that thread's too:
+   the actions are the process's (Linux's sighand_struct). Both threads block
+   SIGCHLD but for the waiter's epoll_pwait mask, so the signal can only
+   arrive in that wait, which it ends with EINTR after the handler ran. */
+static volatile int late_ready, late_handled;
+static void late_handler(int number) {
+    (void)number;
+    late_handled++;
+}
+static void *late_waiter(void *unused) {
+    (void)unused;
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    sigset_t open;
+    pthread_sigmask(SIG_SETMASK, NULL, &open);
+    sigdelset(&open, SIGCHLD);
+    struct epoll_event event;
+    late_ready = 1;
+    int r = epoll_pwait(ep, &event, 1, -1, &open);
+    int error = errno;
+    printf("epoll_pwait=%d errno=%s handled=%d\n", r, error == EINTR ? "EINTR" : "other", late_handled);
+    close(ep);
+    return NULL;
+}
+static int late_handler_cases(void) {
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &blocked, NULL);
+    signal(SIGCHLD, SIG_DFL);
+    pthread_t waiter;
+    if (pthread_create(&waiter, NULL, late_waiter, NULL)) return 80;
+    while (!late_ready) sched_yield();
+    /* Most likely the waiter is in its wait by now; the output is the same
+       either way. */
+    for (int i = 0; i < 1000; i++) sched_yield();
+    struct sigaction action = {.sa_handler = late_handler};
+    sigaction(SIGCHLD, &action, NULL);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 81;
+    if (!child) _exit(0);
+    pthread_join(waiter, NULL);
+    int status;
+    printf("waitpid=%d status=%d\n", waitpid(child, &status, 0) == child, status);
+    return 0;
+}
+
 static void lock_show(const char *label, long number, void *at, size_t length, long flags) {
     errno = 0;
     long r = syscall(number, at, length, flags);
@@ -11038,6 +11085,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-maps")) return maps_cases(argv[2]);
     if (!strcmp(mode, "proc-maps-after-exec")) return maps_after_exec(argv[2]);
     if (!strcmp(mode, "robust-list")) return robust_list_cases(self);
+    if (!strcmp(mode, "late-handler")) return late_handler_cases();
     if (!strcmp(mode, "futex-shared")) return futex_shared_cases();
     if (!strcmp(mode, "robust-list-after-exec")) {
         void *head = (void *)1;

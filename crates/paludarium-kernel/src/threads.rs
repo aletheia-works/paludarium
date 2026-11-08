@@ -575,6 +575,17 @@ impl ThreadGroup {
         self.discards.apply(local);
     }
     pub(crate) fn drain_process(&self, local: &mut ThreadState) {
+        // The actions are the process's, as Linux's sighand_struct is: a
+        // thread that has waited since another one set a handler would
+        // otherwise take a signal in as ignored and wait on past it.
+        for (&number, &action) in self
+            .shared_actions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            local.signal_actions.insert(number, action);
+        }
         self.discards.apply(local);
         let mut pending = self
             .process_pending

@@ -1093,6 +1093,12 @@ one only with an `--allow-net`.
   `CLONE_THREAD` shares its signal dispositions with its parent: a
   `sigaction` in one is seen by the other. `execve` gives the process its own
   copy again, as in Linux.
+- The threads of a process share its signal dispositions, as Linux's
+  `sighand_struct` does. A thread that was already waiting (in `epoll_wait`,
+  `poll` or a `futex` wait, say) when another thread called `sigaction` takes
+  a process-directed signal in with the new handler. So a SIGCHLD handler
+  set after a helper thread began to wait still runs, as Node.js's child
+  processes need.
 
 ## Signals
 

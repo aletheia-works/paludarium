@@ -797,3 +797,19 @@ fn futex_signal_frame_restarts_only_untimed_sa_restart() {
         }
     }
 }
+#[test]
+fn a_waiting_thread_sees_a_handler_set_after_it_began_waiting() {
+    let group = ThreadGroup::default();
+    // The waiter's copy of the actions predates the handler.
+    let mut waiter = ThreadState::default();
+    group.set_action(
+        signals::SIGCHLD,
+        SignalAction {
+            handler: 0x1000,
+            ..SignalAction::default()
+        },
+    );
+    group.send_process_from(signals::SIGCHLD, 2, 0).unwrap();
+    group.drain_process(&mut waiter);
+    assert!(signals::next_pending(&waiter, true).is_some());
+}

@@ -725,8 +725,9 @@ impl ThreadGroup {
         let index = signals::lowest_in(&pending.pending, set)?;
         Some(pending.pending.remove(index))
     }
-    /// The process-directed signals waiting here, as a signal set.
-    pub(crate) fn process_pending_set(&self) -> u64 {
+    /// The process-directed signals waiting here, as a signal set, and how
+    /// many have come so far.
+    pub(crate) fn process_pending_set(&self) -> (u64, u64) {
         let mut pending = self
             .process_pending
             .lock()
@@ -735,10 +736,11 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .drain_process(&mut pending);
-        pending
+        let set = pending
             .pending
             .iter()
-            .fold(0, |set, signal| set | 1 << (signal.number - 1))
+            .fold(0, |set, signal| set | 1 << (signal.number - 1));
+        (set, pending.arrivals)
     }
     pub(crate) fn set_action(&self, n: i32, a: SignalAction) {
         self.shared_actions()

@@ -125,8 +125,9 @@ mod linux {
             // The credentials, permissions, setuid, signal-permissions,
             // limit-permissions, peer-credentials, core-credentials,
             // set-id-writes, socket-owners, capabilities and script-exec cases
-            // change IDs as root, so Linux runs them as root, through sudo when the
-            // tests do not run as root.
+            // change IDs as root, and pty-vhangup needs root's capabilities, so
+            // Linux runs them as root, through sudo when the tests do not run as
+            // root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -142,6 +143,7 @@ mod linux {
                     | "script-exec"
                     | "proc-maps"
                     | "dynamic-exec"
+                    | "pty-vhangup"
             );
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
@@ -261,12 +263,15 @@ mod linux {
         pty_packet => ("pty-packet","pty"),
         pty_termio => ("pty-termio","pty"),
         pty_proc_stat => ("pty-proc-stat","pty"),
+        pty_async => ("pty-async","pty"),
+        pty_vhangup => ("pty-vhangup","pty"),
         signalfd_calls => ("signalfd-calls","signalfd"),
         signalfd_child => ("signalfd-child","signalfd"),
         signalfd_epoll => ("signalfd-epoll","signalfd"),
         signalfd_threads => ("signalfd-threads","signalfd"),
         signalfd_fork => ("signalfd-fork","signalfd"),
         signalfd_interrupt => ("signalfd-interrupt","signalfd"),
+        signalfd_edges => ("signalfd-edges","signalfd"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),

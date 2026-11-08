@@ -21,6 +21,7 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -41,6 +42,9 @@
 #endif
 #ifndef TIOCGDEV
 #define TIOCGDEV 0x80045432
+#endif
+#ifndef TIOCVHANGUP
+#define TIOCVHANGUP 0x5437
 #endif
 #ifndef TIOCGPKT
 #define TIOCGPKT 0x80045438
@@ -1072,6 +1076,293 @@ static int case_hangup(void) {
     return 0;
 }
 
+/* The queued signals of `number` that came, each as its code, band and
+   whether its descriptor is `fd`, the same in a row once. Waits for Linux's
+   work queue first. */
+static void collect(const char *label, int number, int fd) {
+    usleep(100000);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, number);
+    struct timespec none = {0, 0};
+    siginfo_t info;
+    int count = 0, last_code = 0;
+    long last_band = 0;
+    printf("%s", label);
+    while (sigtimedwait(&set, &info, &none) == number) {
+        if (count++ && info.si_code == last_code && info.si_band == last_band) continue;
+        last_code = info.si_code;
+        last_band = info.si_band;
+        printf(" %d/%#lx/%d", info.si_code, info.si_band, info.si_fd == fd);
+    }
+    say("%s", count ? "" : " none");
+}
+
+static void show_owner(const char *label, int fd) {
+    struct f_owner_ex owner = {-1, -1};
+    fcntl(fd, F_GETOWN_EX, &owner);
+    int own = fcntl(fd, F_GETOWN);
+    say("%s type %d self %d group %d", label, owner.type, own == getpid(),
+        own < 0 && -own == getpgrp());
+}
+
+/* O_ASYNC on either side: who owns a file it is turned on for, which input
+   signals (a whole line in canonical mode, any byte otherwise), the room
+   after a short write, and the hang-up that turns it off. */
+static int case_async(void) {
+    int m, s;
+    if (openpty(&m, &s, NULL, NULL, NULL)) return 1;
+    int in = SIGRTMIN + 1, out = SIGRTMIN + 2;
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, in);
+    sigaddset(&block, out);
+    sigaddset(&block, SIGIO);
+    sigprocmask(SIG_BLOCK, &block, NULL);
+    show_owner("before", s);
+    TRY("F_SETFL", fcntl(s, F_SETFL, O_ASYNC));
+    say("O_ASYNC %d", (fcntl(s, F_GETFL) & O_ASYNC) != 0);
+    show_owner("slave", s);
+    fcntl(s, F_SETSIG, in);
+    /* Canonical input signals at the end of a line. */
+    write(m, "ab", 2);
+    collect("partial line", in, s);
+    write(m, "c\n", 2);
+    collect("line", in, s);
+    char buffer[8192];
+    read(s, buffer, sizeof buffer);
+    write(m, "\004", 1);
+    collect("end of file", in, s);
+    read(s, buffer, sizeof buffer);
+    struct termios t;
+    tcgetattr(s, &t);
+    cfmakeraw(&t);
+    tcsetattr(s, TCSANOW, &t);
+    collect("raw", in, s);
+    write(m, "x", 1);
+    collect("raw byte", in, s);
+    read(s, buffer, sizeof buffer);
+    /* The master: an owner set before stays. */
+    TRY("F_SETOWN master", fcntl(m, F_SETOWN, getpid()));
+    int one = 1;
+    TRY("FIOASYNC master", ioctl(m, FIOASYNC, &one));
+    say("master O_ASYNC %d", (fcntl(m, F_GETFL) & O_ASYNC) != 0);
+    show_owner("master", m);
+    fcntl(m, F_SETSIG, out);
+    write(s, "out", 3);
+    collect("slave output", out, m);
+    read(m, buffer, sizeof buffer);
+    collect("master read", out, m);
+    /* Packet events wake the master but do not signal. */
+    int on = 1;
+    ioctl(m, TIOCPKT, &on);
+    tcflow(s, TCOOFF);
+    say("packet poll %#x", polled(m, POLLPRI));
+    collect("packet stop", out, m);
+    tcflow(s, TCOON);
+    read(m, buffer, sizeof buffer);
+    collect("packet start", out, m);
+    ioctl(m, TIOCPKT, &(int){0});
+    /* A master that fills the slave's input gets POLL_OUT for room once the
+       slave reads; a write that went whole does not. */
+    fcntl(m, F_SETFL, O_ASYNC | O_NONBLOCK);
+    fcntl(s, F_SETFL, O_ASYNC | O_NONBLOCK);
+    long written = 0;
+    for (;;) {
+        ssize_t n = write(m, buffer, sizeof buffer);
+        if (n <= 0) break;
+        written += n;
+    }
+    say("filled %d %d", written > 4096, errno);
+    collect("full", out, m);
+    collect("slave input", in, s);
+    long taken = 0;
+    for (int quiet = 0; quiet < 3;) {
+        ssize_t n = read(s, buffer, sizeof buffer);
+        if (n > 0) {
+            taken += n;
+            quiet = 0;
+        } else {
+            quiet++;
+            usleep(20000);
+        }
+    }
+    say("drained %d", taken == written);
+    sigset_t pending;
+    sigpending(&pending);
+    say("room %d", sigismember(&pending, out));
+    collect("room", out, m);
+    /* The slave's descriptions lose O_ASYNC with the master's close, and
+       cannot take it again. */
+    close(m);
+    say("hung up O_ASYNC %d", (fcntl(s, F_GETFL) & O_ASYNC) != 0);
+    TRY("F_SETFL hung up", fcntl(s, F_SETFL, O_ASYNC));
+    TRY("FIOASYNC hung up", ioctl(s, FIOASYNC, &one));
+    TRY("F_SETFL hung up other", fcntl(s, F_SETFL, O_NONBLOCK));
+    close(s);
+    /* The slave's foreground group owns a file that had no owner. */
+    if (openpty(&m, &s, NULL, NULL, NULL)) return 1;
+    pid_t child = fork();
+    if (child == 0) {
+        close(m);
+        setsid();
+        ioctl(s, TIOCSCTTY, 0);
+        TRY("F_SETFL controlling", fcntl(s, F_SETFL, O_ASYNC));
+        show_owner("controlling", s);
+        int again = open(ttyname(s), O_RDWR);
+        TRY("F_SETOWN 0", fcntl(again, F_SETOWN, 0));
+        fcntl(again, F_SETFL, O_ASYNC);
+        show_owner("no owner", again);
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    close(s);
+    close(m);
+    return 0;
+}
+
+/* What a hung-up file of either side answers. */
+static void show_hung_up(const char *label, int fd) {
+    char buffer[8];
+    TRY(label, read(fd, buffer, sizeof buffer));
+    TRY("  write", write(fd, "x", 1));
+    TRY("  TIOCGPGRP", ioctl(fd, TIOCGPGRP, &(int){0}));
+    TRY("  TIOCSPGRP", ioctl(fd, TIOCSPGRP, &(int){0}));
+    say("  poll %#x", polled(fd, POLLIN | POLLOUT));
+}
+
+/* As root: TIOCVHANGUP of the slave and of the master, vhangup, and
+   TIOCCONS, and what a process without the capabilities gets. */
+static int case_vhangup(void) {
+    int m, s;
+    if (openpty(&m, &s, NULL, NULL, NULL)) return 1;
+    char name[64];
+    strcpy(name, ttyname(s));
+    pid_t child = fork();
+    if (child == 0) {
+        setuid(65534);
+        TRY("TIOCVHANGUP user", ioctl(s, TIOCVHANGUP));
+        TRY("TIOCVHANGUP user master", ioctl(m, TIOCVHANGUP));
+        TRY("TIOCCONS user", ioctl(s, TIOCCONS));
+        TRY("TIOCCONS user master", ioctl(m, TIOCCONS));
+        TRY("vhangup user", syscall(SYS_vhangup));
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    /* Only without a controlling terminal, which it would hang up. */
+    int own = open("/dev/tty", O_RDONLY);
+    if (own < 0) TRY("vhangup without a terminal", syscall(SYS_vhangup));
+    else {
+        say("vhangup without a terminal 0 0");
+        close(own);
+    }
+    /* The slave hangs up with the master open; the session it controls
+       loses it, its leader told. */
+    struct termios t;
+    tcgetattr(s, &t);
+    t.c_lflag &= ~ECHO;
+    tcsetattr(s, TCSANOW, &t);
+    signal(SIGIO, SIG_IGN);
+    fcntl(s, F_SETFL, O_ASYNC);
+    write(m, "ab\n", 3);
+    polled(s, POLLIN);
+    pipe(signals_pipe);
+    child = fork();
+    if (child == 0) {
+        close(m);
+        close(s);
+        setsid();
+        int tty = open(name, O_RDWR);
+        struct sigaction action = {.sa_handler = on_hangup};
+        sigaction(SIGHUP, &action, NULL);
+        sigaction(SIGCONT, &action, NULL);
+        sigset_t all, none;
+        sigfillset(&all);
+        sigemptyset(&none);
+        sigprocmask(SIG_BLOCK, &all, NULL);
+        write(signals_pipe[1], "r", 1);
+        while (!hangups || !continues) sigsuspend(&none);
+        say("leader told %d %d", hangups, continues);
+        TRY("leader tcgetsid", tcgetsid(tty));
+        TRY("leader /dev/tty", open("/dev/tty", O_RDWR));
+        _exit(0);
+    }
+    char byte;
+    read(signals_pipe[0], &byte, 1);
+    int hung = ioctl(s, TIOCVHANGUP), error = errno;
+    waitpid(child, NULL, 0);
+    say("TIOCVHANGUP %d %d", hung, hung < 0 ? error : 0);
+    show_hung_up("slave read", s);
+    say("O_ASYNC %d", (fcntl(s, F_GETFL) & O_ASYNC) != 0);
+    TRY("F_SETFL", fcntl(s, F_SETFL, O_ASYNC));
+    /* The line discipline is gone: the master's input waits, unechoed,
+       until an open brings it back and the master writes again. */
+    show_drained("echo before", m, 1);
+    write(m, "cd", 2);
+    show_drained("echo gone", m, 1);
+    int again = open(name, O_RDWR | O_NOCTTY);
+    say("reopened %d", again >= 0);
+    tcgetattr(again, &t);
+    say("termios reset %d", (t.c_lflag & ECHO) != 0);
+    show_drained("echo on open", m, 1);
+    show_drained("input on open", again, 1);
+    write(m, "e\n", 2);
+    show_drained("echo after", m, 1);
+    show_drained("input after", again, 1);
+    close(s);
+    /* The master hangs up alone: its file reads nothing, while the slave
+       still writes. */
+    TRY("TIOCVHANGUP master", ioctl(m, TIOCVHANGUP));
+    show_hung_up("master read", m);
+    TRY("  TIOCGPTN", ioctl(m, TIOCGPTN, &(int){0}));
+    TRY("slave write", write(again, "y", 1));
+    TRY("slave TIOCGPGRP", ioctl(again, TIOCGPGRP, &(int){0}));
+    say("slave poll %#x", polled(again, POLLIN | POLLOUT));
+    close(m);
+    say("slave poll closed %#x", polled(again, POLLIN | POLLOUT));
+    close(again);
+    /* vhangup hangs up the caller's controlling terminal. */
+    if (openpty(&m, &s, NULL, NULL, NULL)) return 1;
+    hangups = continues = 0;
+    child = fork();
+    if (child == 0) {
+        close(m);
+        setsid();
+        ioctl(s, TIOCSCTTY, 0);
+        struct sigaction action = {.sa_handler = on_hangup};
+        sigaction(SIGHUP, &action, NULL);
+        sigaction(SIGCONT, &action, NULL);
+        TRY("vhangup", syscall(SYS_vhangup));
+        say("vhangup told %d %d", hangups, continues);
+        TRY("vhangup tcgetsid", tcgetsid(s));
+        TRY("vhangup TIOCSCTTY", ioctl(s, TIOCSCTTY, 0));
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    close(s);
+    close(m);
+    /* One terminal takes the console's output at a time, until it hangs
+       up. */
+    int m2, s2;
+    if (openpty(&m, &s, NULL, NULL, NULL) || openpty(&m2, &s2, NULL, NULL, NULL)) return 1;
+    int reader = open(ttyname(s), O_RDONLY | O_NOCTTY);
+    TRY("TIOCCONS master", ioctl(m, TIOCCONS));
+    TRY("TIOCCONS read only", ioctl(reader, TIOCCONS));
+    TRY("TIOCCONS", ioctl(s, TIOCCONS));
+    TRY("TIOCCONS again", ioctl(s, TIOCCONS));
+    TRY("TIOCCONS other", ioctl(s2, TIOCCONS));
+    ioctl(s, TIOCVHANGUP);
+    TRY("TIOCCONS after hang-up", ioctl(s2, TIOCCONS));
+    ioctl(s2, TIOCVHANGUP);
+    TRY("TIOCCONS free", ioctl(s, TIOCCONS));
+    close(reader);
+    close(s);
+    close(s2);
+    close(m2);
+    close(m);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     /* A case that waits for good ends with what it printed so far. */
@@ -1086,5 +1377,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "pty-packet")) return case_packet();
     if (!strcmp(mode, "pty-termio")) return case_termio();
     if (!strcmp(mode, "pty-proc-stat")) return case_proc_stat();
+    if (!strcmp(mode, "pty-async")) return case_async();
+    if (!strcmp(mode, "pty-vhangup")) return case_vhangup();
     return 2;
 }

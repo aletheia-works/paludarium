@@ -61,7 +61,7 @@ kernel.
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
-| I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, and the pseudo-terminals' requests below) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, and the pseudo-terminals' requests below) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
@@ -337,11 +337,12 @@ kernel.
   - with `F_SETOWN_EX`, also a single thread.
 
   `ESRCH` when the owner does not exist. `F_GETOWN` and `F_GETOWN_EX` read
-  it back, and `F_SETSIG` picks the signal. Only pipes and sockets, and the
-  host's standard streams when they are a pipe, a socket or a terminal, keep
-  `O_ASYNC` (`F_SETFL` drops it on other files, and `FIOASYNC` setting it
-  there is `ENOTTY`). With it, a pipe or socket
-  sends its owner `SIGIO` from the kernel. With `F_SETSIG`, it sends that
+  it back, and `F_SETSIG` picks the signal. Only pipes, sockets and
+  pseudo-terminals, and the host's standard streams when they are a pipe, a
+  socket or a terminal, keep `O_ASYNC` (`F_SETFL` drops it on other files,
+  and `FIOASYNC` setting it there is `ENOTTY`). With it, a pipe, socket or
+  pseudo-terminal (as the pseudo-terminals below say) sends its owner
+  `SIGIO` from the kernel. With `F_SETSIG`, it sends that
   signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_ERR`,
   `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set through as
   `si_fd`.
@@ -838,6 +839,13 @@ kernel.
     (N_TTY only), `TIOCGDEV` and `TIOCSIG` work as on Linux, and so does
     `TIOCSTI` with `dev.tty.legacy_tiocsti` off: it pushes input only for
     `CAP_SYS_ADMIN`, and is `EIO` for anyone else.
+  - With `O_ASYNC` (signal-driven I/O, below) the slave signals `POLL_IN`
+    when a line can be read in canonical mode, or a byte otherwise, and
+    the master when the slave's output (or an echo) reaches it; a write
+    left short signals `POLL_OUT` once the other side reads its buffer
+    down to 128 bytes, or its output starts again. Packet events do not
+    signal. Turning `O_ASYNC` on gives a file without an owner one: the
+    slave's foreground process group, else the calling process.
   - A session leader without a controlling terminal takes one with
     `TIOCSCTTY` or by opening the slave for reading without `O_NOCTTY`;
     its children inherit it and `setsid` drops it. `/dev/tty` opens the
@@ -856,6 +864,19 @@ kernel.
     its name goes, the session it controls loses it and the session's
     leader gets `SIGHUP` and `SIGCONT`. A session leader's exit sends
     `SIGHUP` to its terminal's foreground group.
+  - `TIOCVHANGUP` (`CAP_SYS_ADMIN`, else `EPERM`) hangs up the slave with
+    the master still open, as the master's close does, and `vhangup`
+    (`CAP_SYS_TTY_CONFIG`) the caller's controlling terminal. The slave's
+    descriptions open then are hung up and lose `O_ASYNC` (which they cannot
+    take again: `ENOTTY`); its input is dropped, its `termios` is a new
+    slave's again, and its line discipline is gone until the slave is opened
+    again, so what the master writes meanwhile waits, unechoed, for the
+    master's next write after that open. `TIOCVHANGUP` on the master hangs up
+    only the master's file, which then reads nothing, while the slave still
+    writes. `TIOCCONS` (`CAP_SYS_ADMIN`; `EINVAL` on the master, `EBADF` for
+    a slave not open for writing) makes the slave take the console's output,
+    holding it open, until that slave hangs up; another while one has it is
+    `EBUSY`.
 - CPU time is the host thread's CPU time (user and system together) from a
   guest thread's first system call, where the host can measure it (Linux,
   macOS, Windows); elsewhere, as in WebAssembly, it is wall time instead.
@@ -890,7 +911,12 @@ kernel.
   which `SA_RESTART` restarts). `poll`, `select` and `epoll` see the file
   readable while one of its signals is pending for the calling thread, as
   on Linux, so a thread's own signal is seen by that thread alone and a
-  forked child's inherited file reads the child's signals. `signalfd` on a
+  forked child's inherited file reads the child's signals. Edge-triggered
+  `epoll` gets an edge for each signal queued to the thread or its process
+  while one of the file's signals is pending, as Linux's `signalfd_notify`
+  wakes the file for each: another real-time signal of a number already
+  waiting counts, a standard signal already pending or one ignored and
+  unblocked does not; a new mask is an edge too. `signalfd` on a
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);
   `SIGKILL` and `SIGSTOP` never enter one. A write gives `EINVAL`, `pread`
   and `pwrite` `ESPIPE`, and `lseek` 0, as Linux's `noop_llseek`.

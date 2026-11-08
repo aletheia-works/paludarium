@@ -2370,6 +2370,7 @@ impl Kernel {
             signal_mask: thread.state.signal_mask,
             signal_actions: ignored,
             cpu,
+            arrivals: thread.state.arrivals,
             ..ThreadState::default()
         };
         thread.state.name_after(&path);

@@ -21,10 +21,17 @@ const UNTAKEABLE: u64 = 1 << 8 | 1 << 18;
 /// Signal files that exist; while there are none, [`observe`] does nothing.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
-    /// The signals pending for the thread this host thread runs, and a
-    /// count bumped whenever one more becomes pending, which stands for
-    /// Linux's `signalfd_notify` wakeup (an edge for edge-triggered epoll).
-    static VIEW: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// The signals pending for the thread this host thread runs, how many
+    /// have come for it and its process so far, and a count bumped whenever
+    /// that grows: one for each signal queued, as Linux's `signalfd_notify`
+    /// wakes the file for each (an edge for edge-triggered epoll).
+    static VIEW: Cell<View> = const { Cell::new(View { set: 0, arrivals: 0, epoch: 0 }) };
+}
+#[derive(Clone, Copy)]
+struct View {
+    set: u64,
+    arrivals: u64,
+    epoch: u64,
 }
 
 /// Records the signals pending for the calling thread: those in its own
@@ -34,15 +41,25 @@ pub(crate) fn observe(process: &ThreadState, inbox: &SignalInbox, group: &Thread
     if LIVE.load(Ordering::SeqCst) == 0 {
         return;
     }
-    let set = set_of(&process.pending) | inbox.queued_set() | group.process_pending_set();
+    let (shared, shared_arrivals) = group.process_pending_set();
+    let (queued, coming) = inbox.queued_set(process);
+    let set = set_of(&process.pending) | queued | shared;
+    let arrivals = process
+        .arrivals
+        .wrapping_add(coming)
+        .wrapping_add(shared_arrivals);
     VIEW.with(|view| {
-        let (seen, epoch) = view.get();
-        let epoch = if set & !seen != 0 {
-            epoch.wrapping_add(1)
+        let seen = view.get();
+        let epoch = if set & !seen.set != 0 || arrivals != seen.arrivals {
+            seen.epoch.wrapping_add(1)
         } else {
-            epoch
+            seen.epoch
         };
-        view.set((set, epoch));
+        view.set(View {
+            set,
+            arrivals,
+            epoch,
+        });
     });
 }
 
@@ -90,7 +107,8 @@ fn create(c: &mut Context<'_>, fd: u64, mask: u64, size: u64, flags: u64) -> Res
         .ok_or(Errno::EINVAL)?;
     signal.mask.store(mask, Ordering::SeqCst);
     // A waiter on the file looks again with the new mask, as Linux wakes
-    // `signalfd_wqh`.
+    // `signalfd_wqh`, which is an edge for edge-triggered epoll.
+    signal.updates.fetch_add(1, Ordering::SeqCst);
     c.files.readiness.changed();
     Ok(fd as u32 as u64)
 }
@@ -98,6 +116,8 @@ fn create(c: &mut Context<'_>, fd: u64, mask: u64, size: u64, flags: u64) -> Res
 pub(crate) struct SignalFile {
     mask: AtomicU64,
     flags: AtomicU32,
+    /// Changes of the mask, each a wakeup of the file.
+    updates: AtomicU64,
 }
 impl SignalFile {
     fn new(mask: u64, flags: u32) -> Self {
@@ -105,6 +125,7 @@ impl SignalFile {
         Self {
             mask: AtomicU64::new(mask),
             flags: AtomicU32::new(2 | flags & NONBLOCK),
+            updates: AtomicU64::new(0),
         }
     }
 }
@@ -260,8 +281,9 @@ fn siginfo(info: &[u8; 128]) -> [u8; RECORD] {
 
 impl FileHandle for SignalFile {
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
-        let (set, epoch) = VIEW.with(Cell::get);
-        let ready = set & self.mask.load(Ordering::SeqCst) != 0;
+        let view = VIEW.with(Cell::get);
+        let ready = view.set & self.mask.load(Ordering::SeqCst) != 0;
+        let epoch = view.epoch.wrapping_add(self.updates.load(Ordering::SeqCst));
         Ok((u32::from(ready) * IN, epoch, 0))
     }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -358,9 +380,14 @@ mod tests {
     #[test]
     fn readiness_follows_the_view() {
         let file = SignalFile::new(1 << 9, NONBLOCK);
-        VIEW.with(|v| v.set((1 << 9, 4)));
+        let view = |set, epoch| View {
+            set,
+            arrivals: 0,
+            epoch,
+        };
+        VIEW.with(|v| v.set(view(1 << 9, 4)));
         assert_eq!(file.readiness(), Ok((IN, 4, 0)));
-        VIEW.with(|v| v.set((1 << 10, 5)));
+        VIEW.with(|v| v.set(view(1 << 10, 5)));
         assert_eq!(file.readiness(), Ok((0, 5, 0)));
         assert_eq!(file.flags(), 2 | NONBLOCK);
         assert_eq!(file.read(&mut [0; 127]), Err(Errno::EINVAL));

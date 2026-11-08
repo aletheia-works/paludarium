@@ -163,9 +163,9 @@ mod process {
     fn sessions_follow_setsid_and_bound_setpgid() {
         let (mut k, mut t, m) = setup();
         let eperm = Errno::EPERM.to_syscall_return();
-        // The first process leads its group, in a session from outside.
+        // The first process's group and session are outside the emulator.
         assert_eq!(syscall(&mut k, &mut t, &m, 124, [0; 6]), 0); // getsid
-        assert_eq!(syscall(&mut k, &mut t, &m, 112, [0; 6]), eperm);
+        assert_eq!(syscall(&mut k, &mut t, &m, 111, [0; 6]), 0); // getpgrp
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         let child = u64::from(ct.tid);
         assert_eq!(syscall(&mut c, &mut ct, &cm, 124, [0; 6]), 0);
@@ -2977,11 +2977,18 @@ mod signal_driven_io {
             fcntl(&mut k, &mut t, &m, event, 15, DATA),
             Errno(3).to_syscall_return()
         );
-        // The first process leads group 1, which F_SETOWN names negative.
+        // F_SETOWN names group 1 negative: no group has the ID, but the
+        // first process does, and Linux finds the ID, not a group. Reading
+        // the owner back gives 0 while no process is in the group.
         assert_eq!(
             fcntl(&mut k, &mut t, &m, event, 8, (-1i32) as u32 as u64),
             0
         );
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 9, 0), 0);
+        assert_eq!(fcntl(&mut k, &mut t, &m, event, 16, DATA + 8), 0);
+        assert_eq!(m.read_u64(GuestAddr(DATA + 8)).unwrap(), 2);
+        // Once the first process leads group 1, the group is read back.
+        assert_eq!(syscall(&mut k, &mut t, &m, 109, [0; 6]), 0);
         assert_eq!(fcntl(&mut k, &mut t, &m, event, 9, 0) as i64, -1);
         assert_eq!(fcntl(&mut k, &mut t, &m, event, 16, DATA + 8), 0);
         assert_eq!(m.read_u64(GuestAddr(DATA + 8)).unwrap(), 1 << 32 | 2);

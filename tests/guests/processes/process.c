@@ -5155,7 +5155,53 @@ int main(int argc, char **argv) {
         finish(member);
         return 0;
     }
+    if (!strcmp(mode, "pid-namespace")) {
+        /* The emulated program is the first process of a PID namespace, its
+           parent, group and session outside it. Natively root makes such a
+           namespace and the case goes on in its first process. */
+        if (!(getpid() == 1 && getppid() == 0 && getpgrp() == 0)) {
+            if (unshare(CLONE_NEWPID)) return 90;
+            fflush(stdout);
+            pid_t pid = child();
+            if (pid < 0) return 91;
+            if (pid > 0) {
+                int status;
+                if (waitpid(pid, &status, 0) != pid) return 92;
+                return WIFEXITED(status) ? WEXITSTATUS(status) : 93;
+            }
+        }
+        printf("pid=%d ppid=%d pgrp=%d pgid=%d sid=%d\n", getpid(), getppid(), getpgrp(), getpgid(0), getsid(0));
+        int status;
+        fflush(stdout);
+        pid_t kid = child();
+        if (kid == 0) {
+            printf("child pid=%d ppid=%d pgrp=%d sid=%d\n", getpid(), getppid(), getpgrp(), getsid(0));
+            fflush(stdout);
+            _exit(0);
+        }
+        printf("waited=%d\n", waitpid(kid, &status, 0) == kid && status == 0);
+        /* F_SETOWN finds the ID, not a group: -1 names this process's ID. */
+        int ends[2];
+        if (pipe(ends)) return 94;
+        errno = 0;
+        long owned = fcntl(ends[0], F_SETOWN, -1);
+        struct f_owner_ex ex = {0};
+        printf("setown=%ld errno=%d getown=%d", owned, owned < 0 ? errno : 0, fcntl(ends[0], F_GETOWN));
+        printf(" getown-ex=%d,%d", fcntl(ends[0], F_GETOWN_EX, &ex), ex.pid);
+        printf(" type=%d\n", ex.type == F_OWNER_PGRP);
+        errno = 0;
+        long started = setsid();
+        printf("setsid=%ld errno=%d pgrp=%d sid=%d\n", started, started < 0 ? errno : 0, getpgrp(), getsid(0));
+        /* Now group 1 exists, and the owner reads back as it. */
+        printf("getown=%d\n", fcntl(ends[0], F_GETOWN));
+        close(ends[0]);
+        close(ends[1]);
+        return 0;
+    }
     if (!strcmp(mode, "session")) {
+        /* The case names its own group, which the emulated first process,
+           like a PID namespace's, is not in until it makes one. */
+        if (setpgid(0, 0)) return 80;
         /* setsid in a child, which is not a group leader; what each check
            gives is a bit, sent back through a pipe. */
         int bits_pipe[2], go[2];
@@ -5416,6 +5462,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "signal-io")) {
+        /* The case names its own group, which the emulated first process,
+           like a PID namespace's, is not in until it makes one. */
+        if (setpgid(0, 0)) return 80;
         /* O_ASYNC: a pipe or socket signals its F_SETOWN owner as it
            changes, with SIGIO or F_SETSIG's signal (code, band and fd);
            F_SETOWN works on any file, O_ASYNC stays only on these. The
@@ -6086,6 +6135,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "socket-options")) {
+        /* The case names its own group, which the emulated first process,
+           like a PID namespace's, is not in until it makes one. */
+        if (setpgid(0, 0)) return 80;
         /* SOL_SOCKET options on socket pairs, as Linux's sk_setsockopt and
            sk_getsockopt keep them, SO_OOBINLINE's out-of-band byte read with
            the data, and the SIGURG that F_SETOWN's owner gets for one. Only

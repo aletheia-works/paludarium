@@ -2,6 +2,7 @@
 //! [`AddressSpace::code_generation`] gives under the locks, through every
 //! change of the code, the mappings, the shared mappings and the page
 //! caches, and takes no lock while none of them has been borrowed mutably.
+//! Stores to shared memory count only where a space may run code from it.
 use super::*;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -30,8 +31,8 @@ fn space() -> AddressSpace {
     space
 }
 /// The generation without the locks, checked against the one under them.
-fn cached(space: &AddressSpace, sources: &mut CodeSources) -> u64 {
-    let generation = space.code_generation_cached(sources);
+fn cached(space: &AddressSpace) -> u64 {
+    let generation = space.code_generation_cached();
     assert_eq!(generation, space.code_generation());
     generation
 }
@@ -39,22 +40,21 @@ fn cached(space: &AddressSpace, sources: &mut CodeSources) -> u64 {
 #[test]
 fn it_follows_code_writes_and_mapping_changes() {
     let mut space = space();
-    let mut sources = CodeSources::default();
-    let g0 = cached(&space, &mut sources);
+    let g0 = cached(&space);
     space.write(GuestAddr(DATA), &[1]).unwrap();
     space.write(GuestAddr(DATA), &[2]).unwrap();
-    assert_eq!(cached(&space, &mut sources), g0, "data writes keep code");
+    assert_eq!(cached(&space), g0, "data writes keep code");
     space.write(GuestAddr(CODE), &[0x90]).unwrap();
-    let g1 = cached(&space, &mut sources);
+    let g1 = cached(&space);
     assert_ne!(g1, g0);
     // A write through the TLB, to a page written before, too.
     space.write(GuestAddr(CODE + 1), &[0x90]).unwrap();
-    let g2 = cached(&space, &mut sources);
+    let g2 = cached(&space);
     assert_ne!(g2, g1);
     space
         .protect(GuestAddr(DATA), PAGE_SIZE, Prot::READ_EXEC)
         .unwrap();
-    assert_ne!(cached(&space, &mut sources), g2);
+    assert_ne!(cached(&space), g2);
 }
 
 struct Zeros;
@@ -81,14 +81,13 @@ fn with_cache() -> (AddressSpace, GuestAddr, SharedPages) {
 #[test]
 fn it_counts_a_page_cache_added_without_a_mapping_change() {
     let (space, at, pages) = with_cache();
-    let mut sources = CodeSources::default();
-    cached(&space, &mut sources);
+    cached(&space);
     // Backing the mapping with a page cache bumps no generation; the store
     // to the cache, which another process may make, must still count.
     space.back_with_cache(at, PAGE_SIZE, &pages, 0).unwrap();
-    let before = cached(&space, &mut sources);
+    let before = cached(&space);
     pages.store(0, &[0xc3]);
-    assert_ne!(cached(&space, &mut sources), before);
+    assert_ne!(cached(&space), before);
 }
 
 #[test]
@@ -104,9 +103,8 @@ fn it_tells_spaces_apart_whatever_their_layout() {
         .back_with_cache(second_at, PAGE_SIZE, &second_pages, 0)
         .unwrap();
     first_pages.store(0, &[0xc3]);
-    let mut sources = CodeSources::default();
-    let one = cached(&first, &mut sources);
-    let other = cached(&second, &mut sources);
+    let one = cached(&first);
+    let other = cached(&second);
     assert_ne!(one, other);
 }
 
@@ -115,35 +113,32 @@ fn it_counts_another_space_s_writes_to_shared_memory() {
     let parent = space();
     parent.mark_shared(GuestAddr(CODE), PAGE_SIZE).unwrap();
     let child = parent.fork();
-    let mut sources = CodeSources::default();
-    let before = cached(&parent, &mut sources);
+    let before = cached(&parent);
     child.write(GuestAddr(CODE), &[0xc3]).unwrap();
-    assert_ne!(cached(&parent, &mut sources), before);
+    assert_ne!(cached(&parent), before);
 }
 
 #[test]
 fn it_reads_another_space_afresh() {
     let first = space();
     first.write(GuestAddr(CODE), &[0x90]).unwrap();
-    let mut sources = CodeSources::default();
-    cached(&first, &mut sources);
+    cached(&first);
     let second = first.fork();
     second.write(GuestAddr(CODE), &[0xc3]).unwrap();
-    cached(&second, &mut sources);
-    cached(&AddressSpace::new(), &mut sources);
-    cached(&first, &mut sources);
+    cached(&second);
+    cached(&AddressSpace::new());
+    cached(&first);
 }
 
 #[test]
 fn it_takes_no_lock_while_the_space_is_not_borrowed_mutably() {
     let space = Arc::new(space());
-    let mut sources = CodeSources::default();
-    let before = cached(&space, &mut sources);
+    let before = cached(&space);
     let held = space.data.lock().unwrap();
     let (sent, received) = mpsc::channel();
     let reader = Arc::clone(&space);
     std::thread::spawn(move || {
-        let generation = reader.code_generation_cached(&mut sources);
+        let generation = reader.code_generation_cached();
         sent.send(generation).unwrap();
     });
     assert_eq!(
@@ -152,4 +147,62 @@ fn it_takes_no_lock_while_the_space_is_not_borrowed_mutably() {
         "the generation was read without the lock"
     );
     drop(held);
+}
+
+#[test]
+fn it_ignores_another_space_s_writes_to_shared_data() {
+    let parent = space();
+    parent.mark_shared(GuestAddr(DATA), PAGE_SIZE).unwrap();
+    let child = parent.fork();
+    let before = cached(&parent);
+    // Neither space may run code from the page, so nothing decoded is stale.
+    child.write(GuestAddr(DATA), &[0xc3]).unwrap();
+    assert_eq!(cached(&parent), before);
+}
+
+#[test]
+fn it_counts_shared_memory_made_executable_later() {
+    let mut parent = space();
+    parent.mark_shared(GuestAddr(DATA), PAGE_SIZE).unwrap();
+    let child = parent.fork();
+    cached(&parent);
+    parent
+        .protect(GuestAddr(DATA), PAGE_SIZE, Prot::READ_EXEC)
+        .unwrap();
+    let before = cached(&parent);
+    child.write(GuestAddr(DATA), &[0xc3]).unwrap();
+    assert_ne!(cached(&parent), before);
+}
+
+#[test]
+fn it_counts_a_page_cache_store_without_the_locks() {
+    let (space, at, pages) = with_cache();
+    space.back_with_cache(at, PAGE_SIZE, &pages, 0).unwrap();
+    let before = cached(&space);
+    pages.store(0, &[0xc3]);
+    // The store reached the space's own generation: the read without the
+    // locks sees it.
+    assert_ne!(space.code_generation_cached(), before);
+}
+
+#[test]
+fn a_page_cache_outlives_the_spaces_that_watched_it() {
+    let (first, first_at, pages) = with_cache();
+    first
+        .back_with_cache(first_at, PAGE_SIZE, &pages, 0)
+        .unwrap();
+    cached(&first);
+    drop(first);
+    pages.store(0, &[0xc3]);
+    assert!(
+        !pages.watchers.any.load(Ordering::SeqCst),
+        "stores take no lock once no space watches"
+    );
+    let (second, second_at, _) = with_cache();
+    second
+        .back_with_cache(second_at, PAGE_SIZE, &pages, 0)
+        .unwrap();
+    let before = cached(&second);
+    pages.store(0, &[0x90]);
+    assert_ne!(cached(&second), before);
 }

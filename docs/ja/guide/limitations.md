@@ -193,10 +193,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   10 ms より短い間だけ満杯や空だったストリームは見逃され、送らないことがあります。ただし、
   読み書きがゲストに `EAGAIN` を返したあとは必ず送ります。スレッドがない WebAssembly では
   送りません。
-- **signalfd へのエッジトリガーの `epoll`**：プロセスのほかのスレッドだけに積まれた
-  シグナルでは、待つスレッドにエッジが来ません。Linux の `signalfd_notify` はどの
-  シグナルでもプロセスの signalfd を起こすので、待つスレッドは自分に保留されている
-  ものをもう一度受け取ります。
+- **signalfd へのエッジトリガーの `epoll`**：プロセスのほかのスレッドに積まれた
+  シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
+  待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
+  ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
 - **名前空間**：名前空間のフラグ（`CLONE_NEWNS`、`CLONE_NEWUTS`、`CLONE_NEWIPC`、
   `CLONE_NEWUSER`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWCGROUP`、`clone3` では
   `CLONE_NEWTIME` も）を付けた `clone` と `clone3` は、子を作らずに `EINVAL` で失敗します。

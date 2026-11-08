@@ -247,24 +247,55 @@ const SHOULD_FINISH: std::time::Duration = std::time::Duration::from_secs(60);
 /// Waiting for an access that should not: a late finish still passes.
 const SHOULD_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Whether `access` finishes within `patience` while another thread holds the
-/// session's serialization lock.
+/// Which of the space's locks another thread holds while the access runs.
+#[derive(Clone, Copy)]
+enum Held {
+    /// The session's serialization lock.
+    Serialization,
+    /// That and the space's own lock.
+    Both,
+}
+
+/// Whether `access` finishes within `patience` while another thread holds
+/// the `held` locks. The accessing thread runs `prepare` first, without them,
+/// so that its own TLB can hold the page.
+fn finishes_while_held(
+    space: &Arc<AddressSpace>,
+    held: Held,
+    patience: std::time::Duration,
+    prepare: impl FnOnce(&AddressSpace) + Send + 'static,
+    access: impl FnOnce(&AddressSpace) + Send + 'static,
+) -> bool {
+    let (ready, prepared) = std::sync::mpsc::channel();
+    let (go, started) = std::sync::mpsc::channel::<()>();
+    let (sent, received) = std::sync::mpsc::channel();
+    let accessing = Arc::clone(space);
+    let thread = std::thread::spawn(move || {
+        prepare(&accessing);
+        ready.send(()).unwrap();
+        started.recv().unwrap();
+        access(&accessing);
+        sent.send(()).unwrap();
+    });
+    prepared.recv().unwrap();
+    let serialization = space.serialization.lock().unwrap();
+    let data = matches!(held, Held::Both).then(|| space.data.lock().unwrap());
+    go.send(()).unwrap();
+    let finished = received.recv_timeout(patience).is_ok();
+    drop(data);
+    drop(serialization);
+    thread.join().unwrap();
+    finished
+}
+
+/// [`finishes_while_held`] with the serialization lock held and nothing
+/// prepared.
 fn finishes_under_serialization(
     space: &Arc<AddressSpace>,
     patience: std::time::Duration,
     access: impl FnOnce(&AddressSpace) + Send + 'static,
 ) -> bool {
-    let held = space.serialization.lock().unwrap();
-    let (sent, received) = std::sync::mpsc::channel();
-    let accessing = Arc::clone(space);
-    let thread = std::thread::spawn(move || {
-        access(&accessing);
-        sent.send(()).unwrap();
-    });
-    let finished = received.recv_timeout(patience).is_ok();
-    drop(held);
-    thread.join().unwrap();
-    finished
+    finishes_while_held(space, Held::Serialization, patience, |_| {}, access)
 }
 
 #[test]
@@ -272,9 +303,13 @@ fn an_access_it_holds_needs_no_serialization() {
     let space = Arc::new(space(1, Prot::READ_WRITE));
     space.write(GuestAddr(AT), &[1]).unwrap();
     assert_eq!(used(&space, AT), 1);
-    assert!(finishes_under_serialization(
+    assert!(finishes_while_held(
         &space,
+        Held::Serialization,
         SHOULD_FINISH,
+        |space| {
+            used(space, AT);
+        },
         |space| {
             assert_eq!(byte(space, AT), 1);
         }
@@ -319,4 +354,98 @@ fn an_access_it_does_not_hold_waits_for_serialization() {
             assert_eq!(byte(shared, AT), 1);
         }
     ));
+}
+
+#[test]
+fn a_load_its_thread_holds_takes_no_lock() {
+    let space = Arc::new(space(1, Prot::READ_WRITE.union(Prot::EXEC)));
+    space
+        .write(GuestAddr(AT), &[1, 2, 3, 4, 5, 6, 7, 8])
+        .unwrap();
+    assert!(finishes_while_held(
+        &space,
+        Held::Both,
+        SHOULD_FINISH,
+        |space| {
+            used(space, AT);
+        },
+        |space| {
+            assert_eq!(byte(space, AT + 1), 2);
+            assert_eq!(space.read_value(GuestAddr(AT), 4).unwrap(), 0x0403_0201);
+            let mut code = [0; 3];
+            assert_eq!(
+                space.fetch_partial(GuestAddr(AT + 2), &mut code).unwrap(),
+                3
+            );
+            assert_eq!(code, [3, 4, 5]);
+        }
+    ));
+    // A write still takes the space's lock.
+    assert!(!finishes_while_held(
+        &space,
+        Held::Both,
+        SHOULD_WAIT,
+        |space| {
+            used(space, AT);
+        },
+        |space| {
+            space.write(GuestAddr(AT), &[9]).unwrap();
+        }
+    ));
+    assert_eq!(byte(&space, AT), 9);
+}
+
+#[test]
+fn a_page_another_thread_holds_shows_what_this_one_does_to_it() {
+    let space = Arc::new(space(2, Prot::READ_WRITE));
+    space.write(GuestAddr(AT), &[1]).unwrap();
+    space.write(GuestAddr(AT + PAGE_SIZE), &[1]).unwrap();
+    let (filled, wait_filled) = std::sync::mpsc::channel();
+    let (changed, wait_changed) = std::sync::mpsc::channel::<u32>();
+    let (seen, wait_seen) = std::sync::mpsc::channel();
+    let other = Arc::clone(&space);
+    let thread = std::thread::spawn(move || {
+        used(&other, AT);
+        used(&other, AT + PAGE_SIZE);
+        filled.send(()).unwrap();
+        while let Ok(step) = wait_changed.recv() {
+            let result = match step {
+                0 => Ok(byte(&other, AT)),
+                1 => other.read(GuestAddr(AT), &mut [0]).map(|()| 0),
+                _ => other.read(GuestAddr(AT + PAGE_SIZE), &mut [0]).map(|()| 0),
+            };
+            seen.send(result).unwrap();
+        }
+    });
+    wait_filled.recv().unwrap();
+    // A write through the frame both TLBs show.
+    space.write(GuestAddr(AT), &[2]).unwrap();
+    changed.send(0).unwrap();
+    assert_eq!(wait_seen.recv().unwrap().unwrap(), 2);
+    // mprotect and munmap by this thread, which the other one held.
+    space
+        .protect_shared(GuestAddr(AT), PAGE_SIZE, Prot::NONE)
+        .unwrap();
+    changed.send(1).unwrap();
+    let fault = wait_seen.recv().unwrap().unwrap_err();
+    assert!(fault.mapped && !fault.present);
+    space
+        .unmap_shared(GuestAddr(AT + PAGE_SIZE), PAGE_SIZE)
+        .unwrap();
+    changed.send(2).unwrap();
+    assert!(!wait_seen.recv().unwrap().unwrap_err().mapped);
+    drop(changed);
+    thread.join().unwrap();
+}
+
+#[test]
+fn a_space_never_takes_the_pages_of_another_space_in_a_threads_tlb() {
+    let first = space(1, Prot::READ_WRITE);
+    first.write(GuestAddr(AT), &[1]).unwrap();
+    assert_eq!(used(&first, AT), 1);
+    drop(first);
+    // Made after the first was dropped, so possibly where it was.
+    let second = AddressSpace::new();
+    assert!(!second.read(GuestAddr(AT), &mut [0]).unwrap_err().mapped);
+    assert_ne!(second.code.epoch.load(Ordering::Acquire), 0);
 }

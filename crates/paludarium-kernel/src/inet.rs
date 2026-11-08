@@ -1530,11 +1530,6 @@ impl InetSocket {
             time_wait: None,
         }
     }
-    /// `bind` of a TCP or UDP socket, with Linux's checks in its order
-    /// (`__inet_bind`, `__inet6_bind`). The guest's own addresses are the
-    /// loopback's and the unspecified one, and the IPv4 multicast and
-    /// broadcast ones Linux takes too; any other is `EADDRNOTAVAIL`. Port 0
-    /// takes an ephemeral port.
     /// Landlock's `socket_bind` and `socket_connect` hooks, which only a TCP
     /// socket meets.
     fn landlock(&self, c: &Context<'_>, raw: &[u8], request: u64) -> Result<(), Errno> {
@@ -1543,6 +1538,11 @@ impl InetSocket {
         }
         crate::landlock::socket(c, self.family == Family::V6, raw, request)
     }
+    /// `bind` of a TCP or UDP socket, with Linux's checks in its order
+    /// (`__inet_bind`, `__inet6_bind`). The guest's own addresses are the
+    /// loopback's and the unspecified one, and the IPv4 multicast and
+    /// broadcast ones Linux takes too; any other is `EADDRNOTAVAIL`. Port 0
+    /// takes an ephemeral port.
     fn bind(&self, raw: &[u8]) -> Result<u64, Errno> {
         let options = *self.options();
         let mut s = self.lock();

@@ -2421,12 +2421,20 @@ impl Kernel {
         let mut path = comm;
         let image = match image {
             Some((file, name)) => {
-                let bytes = read_whole(&*file)?;
                 let mut head = [0; SCRIPT_HEAD];
-                let len = bytes.len().min(SCRIPT_HEAD);
-                head[..len].copy_from_slice(&bytes[..len]);
+                read_from(&*file, &mut head)?;
                 match script_interpreter(&head)? {
-                    None => Some((bytes, name)),
+                    // Only an ELF program is read whole, and no more of it
+                    // than the memory limit could hold (ENOMEM), as a file
+                    // may be sparse and far larger.
+                    None if head[..4] != *b"\x7fELF" => return Err(Errno(8)),
+                    None => {
+                        let limit = mem.memory_meter().map_or(u64::MAX, |m| m.max());
+                        if file.stat()?.size > limit {
+                            return Err(Errno::ENOMEM);
+                        }
+                        Some((read_whole(&*file)?, name))
+                    }
                     // A script reads itself by its name, which a descriptor
                     // closed on exec leaves to nothing
                     // (`BINPRM_FLAGS_PATH_INACCESSIBLE`).
@@ -2791,18 +2799,28 @@ pub(crate) fn follow_scripts(
 }
 /// All of `file`, read from its start, for exec of a file only a
 /// descriptor holds.
+/// It grows as the bytes come, as [`paludarium_vfs`]'s `read_file` reads a
+/// path's program.
 fn read_whole(file: &dyn paludarium_host::FileHandle) -> Result<Vec<u8>, Errno> {
-    let size = usize::try_from(file.stat()?.size).map_err(|_| Errno(7))?;
-    let mut bytes = vec![0; size];
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 65536];
+    loop {
+        match file.read_at(bytes.len() as u64, &mut chunk)? {
+            0 => return Ok(bytes),
+            n => bytes.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+/// The first bytes of `file` into `head`, zero after its end.
+fn read_from(file: &dyn paludarium_host::FileHandle, head: &mut [u8]) -> Result<(), Errno> {
     let mut at = 0;
-    while at < size {
-        match file.read_at(at as u64, &mut bytes[at..])? {
+    while at < head.len() {
+        match file.read_at(at as u64, &mut head[at..])? {
             0 => break,
             n => at += n,
         }
     }
-    bytes.truncate(at);
-    Ok(bytes)
+    Ok(())
 }
 /// A script's interpreter, and its argument if any.
 pub(crate) type Script = (Vec<u8>, Option<Vec<u8>>);

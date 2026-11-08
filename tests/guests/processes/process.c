@@ -12003,6 +12003,11 @@ int main(int argc, char **argv) {
         outcome("directory", execveat_call(d, "", args, AT_EMPTY_PATH));
         outcome("cwd", execveat_call(AT_FDCWD, "", args, AT_EMPTY_PATH));
         outcome("pipe", execveat_call(p[0], "", args, AT_EMPTY_PATH));
+        /* A sparse file of no format is ENOEXEC from its first bytes, however
+           large it is. */
+        int sparse = syscall(SYS_memfd_create, "sparse", 0);
+        if (sparse < 0 || ftruncate(sparse, 1L << 32) || fchmod(sparse, 0755)) return 79;
+        outcome("sparse", execveat_call(sparse, "", args, AT_EMPTY_PATH));
         if (fchmod(memfd, 0600)) return 78;
         outcome("not-executable", execveat_call(memfd, "", args, AT_EMPTY_PATH));
         unlink(link_path);

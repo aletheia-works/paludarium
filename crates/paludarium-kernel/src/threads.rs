@@ -53,6 +53,9 @@ pub struct ThreadGroup {
     start_stack: AtomicU64,
     /// The head `set_robust_list` gave each thread that called it.
     robust_lists: Mutex<BTreeMap<u32, u64>>,
+    /// The path of the program the process runs, which `/proc/self/exe`
+    /// names (Linux's `exe_file`).
+    executable: Mutex<Vec<u8>>,
 }
 impl Default for ThreadGroup {
     fn default() -> Self {
@@ -77,6 +80,7 @@ impl Default for ThreadGroup {
             core: Mutex::default(),
             start_stack: AtomicU64::new(0),
             robust_lists: Mutex::default(),
+            executable: Mutex::default(),
         }
     }
 }
@@ -465,6 +469,18 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
+    }
+    pub(crate) fn set_executable(&self, path: Vec<u8>) {
+        *self
+            .executable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = path;
+    }
+    pub(crate) fn executable(&self) -> Vec<u8> {
+        self.executable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
     pub(crate) fn set_start_stack(&self, stack: u64) {
         self.start_stack.store(stack, Ordering::SeqCst);

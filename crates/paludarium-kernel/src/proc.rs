@@ -1,6 +1,7 @@
-//! The only /proc files paludarium has, generated when opened: the mount
-//! table (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's
-//! mounts, and this process's directory with its `status`, its `fd`
+//! The /proc files paludarium has, generated when opened: the mount table
+//! (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's mounts,
+//! `loadavg`, `meminfo` and `uptime`, and this process's directory with its
+//! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
 //! directory of links to the open descriptors, and its `maps`, which alone
 //! is generated as it is read.
 use paludarium_host::{FileHandle, FileStat};
@@ -34,6 +35,12 @@ pub(crate) fn mount_table(path: &[u8]) -> Option<bool> {
 pub(crate) enum OwnEntry {
     Directory,
     Status,
+    Stat,
+    Cmdline,
+    Comm,
+    /// The links to the running program and to the current directory.
+    Exe,
+    Cwd,
     Maps,
     /// `fd`, and one of its links by descriptor number.
     Descriptors,
@@ -51,11 +58,218 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
     match tail {
         b"" | b"/" => Some(OwnEntry::Directory),
         b"/status" => Some(OwnEntry::Status),
+        b"/stat" => Some(OwnEntry::Stat),
+        b"/cmdline" => Some(OwnEntry::Cmdline),
+        b"/comm" => Some(OwnEntry::Comm),
+        b"/exe" => Some(OwnEntry::Exe),
+        b"/cwd" => Some(OwnEntry::Cwd),
         b"/maps" => Some(OwnEntry::Maps),
         b"/fd" | b"/fd/" => Some(OwnEntry::Descriptors),
         _ => descriptor_number(tail.strip_prefix(b"/fd/")?).map(OwnEntry::Descriptor),
     }
 }
+/// The names in this process's directory, with their `d_type`, in the order
+/// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
+pub(crate) const OWN_NAMES: [(&[u8], u8); 10] = [
+    (b"fd", 4),
+    (b"status", 8),
+    (b"cmdline", 8),
+    (b"stat", 8),
+    (b"maps", 8),
+    (b"mounts", 8),
+    (b"mountinfo", 8),
+    (b"cwd", 10),
+    (b"exe", 10),
+    (b"comm", 8),
+];
+
+/// System-wide files under /proc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SystemEntry {
+    Loadavg,
+    Meminfo,
+    Uptime,
+}
+pub(crate) fn system_entry(path: &[u8]) -> Option<SystemEntry> {
+    match path {
+        b"/proc/loadavg" => Some(SystemEntry::Loadavg),
+        b"/proc/meminfo" => Some(SystemEntry::Meminfo),
+        b"/proc/uptime" => Some(SystemEntry::Uptime),
+        _ => None,
+    }
+}
+/// `/proc/loadavg` as Linux's `loadavg_proc_show` prints it. The averages
+/// are 0, as `sysinfo` reports them, since nothing measures the load.
+pub(crate) fn render_loadavg(running: usize, tasks: usize, last_pid: u32) -> Vec<u8> {
+    format!("0.00 0.00 0.00 {running}/{tasks} {last_pid}\n").into_bytes()
+}
+/// `/proc/uptime` as Linux's `uptime_proc_show` prints it, from the
+/// monotonic clock that `sysinfo` reports too, with no idle time counted.
+pub(crate) fn render_uptime(nanoseconds: u64) -> Vec<u8> {
+    let hundredths = nanoseconds / 10_000_000;
+    format!("{}.{:02} 0.00\n", hundredths / 100, hundredths % 100).into_bytes()
+}
+/// `/proc/meminfo` in Linux's field order and format, with the memory
+/// `sysinfo` reports: all of it free and nothing used, no swap and no huge
+/// pages.
+pub(crate) fn render_meminfo(total: u64) -> Vec<u8> {
+    let kb = total / 1024;
+    let mut fields: Vec<(&str, u64)> =
+        vec![("MemTotal", kb), ("MemFree", kb), ("MemAvailable", kb)];
+    fields.extend(
+        [
+            "Buffers",
+            "Cached",
+            "SwapCached",
+            "Active",
+            "Inactive",
+            "Active(anon)",
+            "Inactive(anon)",
+            "Active(file)",
+            "Inactive(file)",
+            "Unevictable",
+            "Mlocked",
+            "SwapTotal",
+            "SwapFree",
+            "Dirty",
+            "Writeback",
+            "AnonPages",
+            "Mapped",
+            "Shmem",
+            "KReclaimable",
+            "Slab",
+            "SReclaimable",
+            "SUnreclaim",
+            "KernelStack",
+            "PageTables",
+            "NFS_Unstable",
+            "Bounce",
+            "WritebackTmp",
+        ]
+        .map(|name| (name, 0)),
+    );
+    fields.extend([("CommitLimit", kb), ("Committed_AS", 0)]);
+    fields.extend(["VmallocTotal", "VmallocUsed", "VmallocChunk", "Percpu"].map(|name| (name, 0)));
+    let mut out = String::new();
+    for (name, value) in fields {
+        out.push_str(&format!("{:<16}{value:>8} kB\n", format!("{name}:")));
+    }
+    // Counts of huge pages have no unit.
+    for name in [
+        "HugePages_Total",
+        "HugePages_Free",
+        "HugePages_Rsvd",
+        "HugePages_Surp",
+    ] {
+        out.push_str(&format!("{:<16}{:>8}\n", format!("{name}:"), 0));
+    }
+    out.push_str(&format!("{:<16}{:>8} kB\n", "Hugepagesize:", 2048));
+    out.push_str(&format!("{:<16}{:>8} kB\n", "Hugetlb:", 0));
+    out.into_bytes()
+}
+
+/// What `/proc/<pid>/stat` reports.
+pub(crate) struct ProcessStat<'a> {
+    pub pid: u32,
+    pub name: &'a [u8],
+    pub parent: u32,
+    pub group: u32,
+    pub session: u32,
+    /// Process and waited-for children's CPU time, in nanoseconds.
+    pub cpu: u64,
+    pub children_cpu: u64,
+    pub nice: i32,
+    pub threads: usize,
+    /// The total size of the mappings, in bytes.
+    pub virtual_size: u64,
+    pub rss_limit: u64,
+    pub start_stack: u64,
+    pub start_brk: u64,
+    /// `[arg_start, arg_end)` and `[env_start, env_end)`.
+    pub arguments: (u64, u64),
+    pub environment: (u64, u64),
+    pub pending: u64,
+    pub blocked: u64,
+    pub ignored: u64,
+    pub caught: u64,
+}
+/// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it for a process
+/// reading its own: 52 fields, state `R` (it is running, reading this),
+/// no terminal, and 0 for what nothing measures (page faults, resident
+/// memory, start time, the code range and the scheduler's figures).
+pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
+    /// USER_HZ, the unit of the times, as on x86-64 Linux.
+    const TICKS: u64 = 100;
+    let ticks = |ns: u64| ns / (1_000_000_000 / TICKS);
+    let name: String = s
+        .name
+        .iter()
+        .take_while(|&&b| b != 0)
+        .map(|&b| char::from(b))
+        .collect();
+    let fields: [String; 50] = [
+        "R".into(),
+        s.parent.to_string(),
+        s.group.to_string(),
+        s.session.to_string(),
+        "0".into(),  // tty_nr
+        "-1".into(), // tpgid
+        // PF_RANDOMIZE, as for a process that address space randomization
+        // applies to.
+        "4194304".into(),
+        "0".into(),
+        "0".into(),
+        "0".into(),
+        "0".into(),
+        ticks(s.cpu).to_string(),
+        "0".into(),
+        ticks(s.children_cpu).to_string(),
+        "0".into(),
+        (20 + s.nice).to_string(),
+        s.nice.to_string(),
+        s.threads.to_string(),
+        "0".into(), // itrealvalue
+        "0".into(), // starttime
+        s.virtual_size.to_string(),
+        "0".into(), // rss
+        s.rss_limit.to_string(),
+        "0".into(), // startcode
+        "0".into(), // endcode
+        s.start_stack.to_string(),
+        "0".into(), // kstkesp
+        "0".into(), // kstkeip
+        s.pending.to_string(),
+        s.blocked.to_string(),
+        s.ignored.to_string(),
+        s.caught.to_string(),
+        "0".into(),  // wchan
+        "0".into(),  // nswap
+        "0".into(),  // cnswap
+        "17".into(), // exit_signal: SIGCHLD
+        "0".into(),  // processor
+        "0".into(),  // rt_priority
+        "0".into(),  // policy: SCHED_OTHER
+        "0".into(),  // delayacct_blkio_ticks
+        "0".into(),  // guest_time
+        "0".into(),  // cguest_time
+        "0".into(),  // start_data
+        "0".into(),  // end_data
+        s.start_brk.to_string(),
+        s.arguments.0.to_string(),
+        s.arguments.1.to_string(),
+        s.environment.0.to_string(),
+        s.environment.1.to_string(),
+        "0".into(), // exit_code
+    ];
+    format!("{} ({name}) {}\n", s.pid, fields.join(" ")).into_bytes()
+}
+/// `/proc/<pid>/comm`: the name, up to its NUL, and a newline.
+pub(crate) fn render_comm(name: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = name.iter().copied().take_while(|&b| b != 0).collect();
+    out.push(b'\n');
+    out
+}
+
 /// A descriptor's name in `fd`: decimal digits without a leading zero (but
 /// "0"), within `u32`, as Linux's name_to_int reads them; a trailing slash
 /// is allowed.
@@ -736,7 +950,7 @@ mod tests {
         assert_eq!(own_entry(b"/proc/7/maps", 7), Some(OwnEntry::Maps));
         assert_eq!(own_entry(b"/proc/8/maps", 7), None);
         assert_eq!(own_entry(b"/proc/8/status", 7), None);
-        assert_eq!(own_entry(b"/proc/self/stat", 7), None);
+        assert_eq!(own_entry(b"/proc/self/statm", 7), None);
         assert_eq!(own_entry(b"/proc/selfish", 7), None);
     }
     #[test]
@@ -845,5 +1059,77 @@ mod descriptor_tests {
         }
         assert_eq!(link_stat(0).mode, 0o120_500);
         assert_eq!(link_stat(2).mode, 0o120_700);
+    }
+}
+
+#[cfg(test)]
+mod generated_tests {
+    use super::*;
+    #[test]
+    fn own_and_system_entries_are_found_by_name() {
+        let entry = |path: &[u8]| own_entry(path, 7);
+        assert_eq!(entry(b"/proc/self/stat"), Some(OwnEntry::Stat));
+        assert_eq!(entry(b"/proc/7/cmdline"), Some(OwnEntry::Cmdline));
+        assert_eq!(entry(b"/proc/self/comm"), Some(OwnEntry::Comm));
+        assert_eq!(entry(b"/proc/self/exe"), Some(OwnEntry::Exe));
+        assert_eq!(entry(b"/proc/self/cwd"), Some(OwnEntry::Cwd));
+        assert_eq!(entry(b"/proc/8/stat"), None);
+        assert_eq!(system_entry(b"/proc/loadavg"), Some(SystemEntry::Loadavg));
+        assert_eq!(system_entry(b"/proc/meminfo"), Some(SystemEntry::Meminfo));
+        assert_eq!(system_entry(b"/proc/uptime"), Some(SystemEntry::Uptime));
+        assert_eq!(system_entry(b"/proc/self/uptime"), None);
+    }
+    #[test]
+    fn stat_has_linux_s_52_fields_after_the_name() {
+        let line = render_stat(&ProcessStat {
+            pid: 5,
+            name: b"a b) c\0junk",
+            parent: 1,
+            group: 5,
+            session: 1,
+            cpu: 1_230_000_000,
+            children_cpu: 20_000_000,
+            nice: 3,
+            threads: 2,
+            virtual_size: 8192,
+            rss_limit: u64::MAX,
+            start_stack: 0x7fff_0000,
+            start_brk: 0x60_0000,
+            arguments: (10, 20),
+            environment: (20, 30),
+            pending: 0,
+            blocked: 512,
+            ignored: 2048,
+            caught: 1,
+        });
+        let line = String::from_utf8(line).unwrap();
+        // The name stays as it is; the fields start after its last ')'.
+        assert!(line.starts_with("5 (a b) c) R 1 5 1 0 -1 "));
+        assert!(line.ends_with(" 0\n"));
+        let rest = &line[line.rfind(')').unwrap() + 2..];
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(fields.len() + 2, 52);
+        // utime and cutime in USER_HZ ticks; priority, nice, threads.
+        assert_eq!(fields[11], "123");
+        assert_eq!(fields[13], "2");
+        assert_eq!(&fields[15..18], ["23", "3", "2"]);
+        assert_eq!(fields[22], "18446744073709551615");
+        assert_eq!(&fields[28..32], ["0", "512", "2048", "1"]);
+        assert_eq!(fields[35], "17");
+        assert_eq!(&fields[45..49], ["10", "20", "20", "30"]);
+    }
+    #[test]
+    fn system_files_have_linux_s_formats() {
+        assert_eq!(render_loadavg(1, 4, 9), b"0.00 0.00 0.00 1/4 9\n");
+        assert_eq!(render_uptime(1_234_567_891), b"1.23 0.00\n");
+        assert_eq!(render_uptime(5_000_000), b"0.00 0.00\n");
+        let meminfo = String::from_utf8(render_meminfo(4 << 30)).unwrap();
+        let lines: Vec<&str> = meminfo.lines().collect();
+        assert_eq!(lines[0], "MemTotal:        4194304 kB");
+        assert_eq!(lines[2], "MemAvailable:    4194304 kB");
+        assert!(lines.contains(&"SwapTotal:             0 kB"));
+        assert!(lines.contains(&"HugePages_Total:       0"));
+        assert_eq!(lines.last(), Some(&"Hugetlb:               0 kB"));
+        assert_eq!(render_comm(b"name\0rest"), b"name\n");
     }
 }

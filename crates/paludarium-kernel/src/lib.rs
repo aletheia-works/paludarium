@@ -322,6 +322,17 @@ impl Kernel {
         &self.process
     }
 
+    /// Records `path` as the program the first process runs, as
+    /// `/proc/self/exe` names it: with its symbolic links resolved.
+    pub fn set_executable(&self, path: &[u8]) {
+        let path = self
+            .files
+            .exec_path(path.to_vec())
+            .unwrap_or_else(|_| path.to_vec());
+        let path = crate::files::resolved(&self.files, &path).unwrap_or(path);
+        self.group.set_executable(path);
+    }
+
     /// Creates the initial thread for a loaded image: rip at the entry
     /// point, rsp at the initial stack, everything else zero.
     #[must_use]

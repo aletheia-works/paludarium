@@ -282,6 +282,7 @@ mod linux {
         processes_mincore => ("mincore","process"),
         processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),
+        processes_proc_own_files => ("proc-own-files","process"),
         processes_time_calls => ("time-calls","process"),
         processes_dynamic => ("dynamic","dynamic"),
         processes_dynamic_no_pie => ("dynamic-no-pie","dynamic-no-pie"),

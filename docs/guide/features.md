@@ -614,17 +614,40 @@ kernel.
   procfs's or devpts's type with a 4096 `f_bsize`, as Linux's
   `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but `stat`,
   `statfs` and `open` through it reach its file.
-- The only other `/proc` entries are this process's own: `/proc/<pid>`, a
-  directory its entries can be opened relative to, and `/proc/self`, a
+- The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
+  `/proc/uptime` (below) and this process's own: `/proc/<pid>`, a
+  directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
   link, `stat` and a trailing slash follow it, `O_NOFOLLOW` does not
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
-  `/proc/self/status`, `/proc/self/maps` and `/proc/self/fd`. `status`
-  has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
-  capabilities and so on) without the memory and CPU ones, which nothing
-  measures.
+  `/proc/self/status`, `stat`, `cmdline`, `comm`, `exe`, `cwd`, `maps` and
+  `fd`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
+  signal masks, capabilities and so on) without the memory and CPU ones,
+  which nothing measures. Any other path under `/proc`, including another
+  process's directory, is looked up in the filesystem like any path, so with
+  `--mount /:/` it reaches the host's own `/proc`.
+- `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
+  state `R` (the process is running, reading it), the parent, process group
+  and session, no terminal, the CPU time of the process and of its waited-for
+  children in `USER_HZ` (100) ticks, the priority and nice value, the threads,
+  the size of the mappings, the `RLIMIT_RSS` limit, the start of the stack and
+  of the heap, the signal sets as decimal numbers, `exit_signal` 17, and where
+  the argument and environment strings lie. What nothing measures is 0: page
+  faults, resident memory, the start time, the code range and the scheduler's
+  figures. `cmdline` is the argument strings as they are in memory now, each
+  ending in its NUL, and `comm` the name and a newline.
+- `/proc/self/exe` and `/proc/self/cwd` are symbolic links (0777, size 0) to
+  the program the process runs (the one `execve` loaded, with symbolic links
+  resolved; for the first program, the path the CLI gives it, `/<file name>`)
+  and to the current directory. `stat` and `open` follow them, and
+  `O_NOFOLLOW` does not (`ELOOP`).
+- `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
+  in Linux's formats: load averages of 0 with the running and live tasks and
+  the last ID handed out; 4 GiB of total, free and available memory and
+  nothing else used, no swap and no huge pages; and the monotonic clock's
+  uptime with no idle time.
 - `/proc/self/maps` lists the VMAs in Linux's format, with adjacent mappings
   merged and split as Linux does: the range, the protection, `s` or `p`, the
   offset in the file, the file's device and inode as `stat` gives them, and
@@ -711,7 +734,8 @@ kernel.
   `CLOCK_TAI` (with a TAI offset of 0). `clock_getres` gives 1 ns, and 4 ms
   for the coarse clocks.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
-  revealing the host's; the uptime is the monotonic clock's.
+  revealing the host's; the uptime is the monotonic clock's, rounded up to
+  a whole second as Linux rounds it.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

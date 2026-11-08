@@ -3069,6 +3069,118 @@ static int late_handler_cases(void) {
     return 0;
 }
 
+/* The whole of a small /proc file, NUL-terminated; its length or -1. */
+static long proc_read(const char *path, char *buffer, size_t size) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    long total = 0, n;
+    while (total < (long)size - 1 && (n = read(fd, buffer + total, size - 1 - (size_t)total)) > 0) total += n;
+    close(fd);
+    buffer[total] = 0;
+    return total;
+}
+
+/* This process's stat, cmdline, comm, exe and cwd, and the system's loadavg,
+   meminfo and uptime: their format, and what the system calls say too. */
+static int proc_own_files_cases(int argc, char **argv) {
+    static char buffer[65536];
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    signal(SIGUSR2, SIG_IGN);
+    signal(SIGHUP, interrupted);
+
+    long n = proc_read("/proc/self/stat", buffer, sizeof buffer);
+    char *close_paren = n > 0 ? strrchr(buffer, ')') : NULL;
+    char *open_paren = n > 0 ? strchr(buffer, '(') : NULL;
+    if (!close_paren || !open_paren) return 80;
+    *close_paren = 0;
+    printf("stat comm=%s pid=%d newline=%d\n", open_paren + 1, atol(buffer) == getpid(), buffer[n - 1] == '\n');
+    char *fields[64];
+    int count = 0;
+    for (char *field = strtok(close_paren + 2, " \n"); field && count < 64; field = strtok(NULL, " \n")) fields[count++] = field;
+    /* fields[0] is the state, the third field of the line. */
+    printf("stat fields=%d state=%s\n", count + 2, count ? fields[0] : "-");
+    if (count >= 50) {
+        printf("stat ppid=%d pgrp=%d session=%d\n", atol(fields[1]) == getppid(), atol(fields[2]) == getpgrp(),
+               atol(fields[3]) == getsid(0));
+        printf("stat priority=%s nice=%s threads=%s itrealvalue=%s\n", fields[15], fields[16], fields[17], fields[18]);
+        printf("stat signal=%s blocked=%s ignored=%s caught=%s exit_signal=%s\n", fields[28], fields[29], fields[30],
+               fields[31], fields[35]);
+        unsigned long arg_start = strtoul(fields[45], NULL, 10), arg_end = strtoul(fields[46], NULL, 10);
+        unsigned long env_start = strtoul(fields[47], NULL, 10), env_end = strtoul(fields[48], NULL, 10);
+        printf("stat arguments-at-argv=%d environment-after-arguments=%d\n", arg_start == (unsigned long)argv[0],
+               env_start >= arg_end && env_end >= env_start);
+    }
+
+    n = proc_read("/proc/self/cmdline", buffer, sizeof buffer);
+    long expected = 0;
+    int same = 1;
+    for (int i = 0; i < argc; i++) {
+        size_t length = strlen(argv[i]) + 1;
+        same &= expected + (long)length <= n && !memcmp(buffer + expected, argv[i], length);
+        expected += (long)length;
+    }
+    printf("cmdline is-argv=%d\n", same && n == expected);
+    n = proc_read("/proc/self/comm", buffer, sizeof buffer);
+    printf("comm=%s", buffer);
+
+    struct stat link, through, target;
+    char path[4096];
+    ssize_t length = readlink("/proc/self/exe", path, sizeof path - 1);
+    path[length > 0 ? length : 0] = 0;
+    int is_link = lstat("/proc/self/exe", &link) == 0 && S_ISLNK(link.st_mode);
+    int same_file = stat("/proc/self/exe", &through) == 0 && stat(path, &target) == 0 &&
+                    through.st_ino == target.st_ino && through.st_dev == target.st_dev;
+    printf("exe link=%d mode=%o absolute=%d same-file=%d\n", is_link, (unsigned)(link.st_mode & 07777), path[0] == '/',
+           same_file);
+    int exe = open("/proc/self/exe", O_RDONLY);
+    char magic[4] = {0};
+    printf("exe opens=%d elf=%d\n", exe >= 0, exe >= 0 && read(exe, magic, 4) == 4 && !memcmp(magic, "\177ELF", 4));
+    if (exe >= 0) close(exe);
+    errno = 0;
+    int nofollow = open("/proc/self/exe", O_RDONLY | O_NOFOLLOW);
+    printf("exe nofollow=%d errno=%d\n", nofollow, errno);
+    if (chdir("/tmp")) return 81;
+    char cwd[4096];
+    length = readlink("/proc/self/cwd", path, sizeof path - 1);
+    path[length > 0 ? length : 0] = 0;
+    printf("cwd is-getcwd=%d\n", getcwd(cwd, sizeof cwd) && !strcmp(cwd, path));
+
+    struct sysinfo info;
+    sysinfo(&info);
+    n = proc_read("/proc/loadavg", buffer, sizeof buffer);
+    double one, five, fifteen;
+    int running, tasks, last;
+    int matched = sscanf(buffer, "%lf %lf %lf %d/%d %d", &one, &five, &fifteen, &running, &tasks, &last);
+    printf("loadavg fields=%d running-of-tasks=%d newline=%d\n", matched, running >= 1 && running <= tasks,
+           n > 0 && buffer[n - 1] == '\n');
+    n = proc_read("/proc/meminfo", buffer, sizeof buffer);
+    unsigned long total = 0, free = 0, available = 0;
+    char *line = strstr(buffer, "MemTotal:");
+    if (line) sscanf(line, "MemTotal: %lu kB", &total);
+    if ((line = strstr(buffer, "MemFree:"))) sscanf(line, "MemFree: %lu kB", &free);
+    if ((line = strstr(buffer, "MemAvailable:"))) sscanf(line, "MemAvailable: %lu kB", &available);
+    printf("meminfo first=%d total-is-sysinfo=%d free-within-total=%d\n", !strncmp(buffer, "MemTotal:", 9),
+           total == info.totalram * info.mem_unit / 1024, free <= total && available <= total);
+    n = proc_read("/proc/uptime", buffer, sizeof buffer);
+    double up = -1, idle = -1;
+    int uptime_fields = sscanf(buffer, "%lf %lf", &up, &idle);
+    printf("uptime fields=%d near-sysinfo=%d\n", uptime_fields,
+           up >= (double)info.uptime - 1 && up <= (double)info.uptime + 2);
+
+    DIR *own = opendir("/proc/self");
+    int seen = 0;
+    const char *names[] = {"cmdline", "comm", "cwd", "exe", "fd", "maps", "stat", "status"};
+    for (struct dirent *entry; own && (entry = readdir(own));)
+        for (int i = 0; i < 8; i++)
+            if (!strcmp(entry->d_name, names[i])) seen |= 1 << i;
+    if (own) closedir(own);
+    printf("listed=%x\n", seen);
+    return 0;
+}
+
 static void lock_show(const char *label, long number, void *at, size_t length, long flags) {
     errno = 0;
     long r = syscall(number, at, length, flags);
@@ -11085,6 +11197,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-maps")) return maps_cases(argv[2]);
     if (!strcmp(mode, "proc-maps-after-exec")) return maps_after_exec(argv[2]);
     if (!strcmp(mode, "robust-list")) return robust_list_cases(self);
+    if (!strcmp(mode, "proc-own-files")) return proc_own_files_cases(argc, argv);
     if (!strcmp(mode, "late-handler")) return late_handler_cases();
     if (!strcmp(mode, "futex-shared")) return futex_shared_cases();
     if (!strcmp(mode, "robust-list-after-exec")) {

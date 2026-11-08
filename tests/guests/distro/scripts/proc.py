@@ -1,6 +1,8 @@
-"""What /proc says about the process itself."""
+"""What /proc says about the process itself and about the system."""
 
 import os
+import subprocess
+import sys
 import threading
 
 with open("/proc/self/status") as status:
@@ -20,3 +22,36 @@ print("fd link", os.readlink(f"/proc/self/fd/{fd}"))
 os.close(fd)
 with open("/proc/self/maps") as maps:
     print("maps has python", any("python" in line for line in maps))
+with open("/proc/self/stat") as stat:
+    line = stat.read()
+fields = line[line.rindex(")") + 2 :].split()
+print("stat fields", len(fields) + 2, "state", fields[0], "threads", fields[17])
+print(
+    "stat ids",
+    int(line.split()[0]) == os.getpid(),
+    int(fields[1]) == os.getppid(),
+    int(fields[2]) == os.getpgrp(),
+    int(fields[3]) == os.getsid(0),
+)
+with open("/proc/self/cmdline", "rb") as cmdline:
+    print("cmdline", cmdline.read().split(b"\0")[1:])
+with open("/proc/self/comm") as comm:
+    print("comm", comm.read().strip())
+with open("/proc/self/exe", "rb") as exe, open(sys.executable, "rb") as program:
+    print("exe is this program", exe.read() == program.read())
+# A program execve loaded names itself with its links resolved.
+print(
+    "exec'd exe",
+    subprocess.run(
+        ["/bin/sh", "-c", "readlink /proc/self/exe"], capture_output=True, text=True
+    ).stdout,
+)
+with open("/proc/loadavg") as loadavg:
+    load = loadavg.read().split()
+print("loadavg fields", len(load), "running/tasks", "/" in load[3])
+with open("/proc/meminfo") as meminfo:
+    memory = dict(line.split(":", 1) for line in meminfo)
+total, free = (int(memory[name].split()[0]) for name in ("MemTotal", "MemFree"))
+print("meminfo", "MemAvailable" in memory, 0 < free <= total)
+with open("/proc/uptime") as uptime:
+    print("uptime fields", len(uptime.read().split()))

@@ -2197,7 +2197,7 @@ fn sys_sched_yield(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
 }
 
 /// Memory a guest is told it has; like `uname`, the host's is not revealed.
-const SYSINFO_RAM: u64 = 4 << 30;
+pub(crate) const SYSINFO_RAM: u64 = 4 << 30;
 
 /// A `struct rusage` with `cpu` nanoseconds as user time. The emulator's
 /// own work for the guest's system calls happens in user space on the host,
@@ -2253,8 +2253,9 @@ fn sys_times(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// memory is a fixed [`SYSINFO_RAM`] with nothing used and no swap, the load
 /// averages are 0 and `procs` counts this process's threads.
 fn sys_sysinfo(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    // Rounded up to a whole second, as Linux's do_sysinfo rounds it.
     let uptime = match c.host.clock(ClockId::Monotonic) {
-        Ok(ns) => ns / 1_000_000_000,
+        Ok(ns) => ns.div_ceil(1_000_000_000),
         Err(e) => return err(e),
     };
     let mut info = [0u8; 112];

@@ -193,8 +193,8 @@ def cases(fx):
         "less": shell("less -F /etc/os-release | wc -l"),
         "dpkg-query": ["/usr/bin/dpkg-query", "-W", "-f=${Version}\\n", "bash"],
         # Signals, processes, sockets, locks and /proc. Left out until paludarium has
-        # them: pseudo-terminals (python's pty, script), mkfifo, /proc/self/stat
-        # (ps), /proc/self/exe and cmdline, and /proc/loadavg and meminfo.
+        # them: pseudo-terminals (python's pty, script), mkfifo, and the /proc
+        # directories of other processes (ps).
         "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
         "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],
         "python-processes": ["/usr/bin/python3", f"{SCRIPTS}/processes.py"],

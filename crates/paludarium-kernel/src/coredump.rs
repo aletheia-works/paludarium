@@ -354,6 +354,45 @@ fn prpsinfo(who: &Identity, thread: &ThreadCore, mem: &AddressSpace) -> [u8; 136
     s
 }
 
+/// Where the arguments and the environment strings lie, as Linux's
+/// `arg_start`..`arg_end` and `env_start`..`env_end`: from the first string's
+/// address to past the last one's NUL, read from the vectors the initial
+/// stack at `start_stack` holds. Empty ranges at 0 when they cannot be read.
+pub(crate) fn string_ranges(mem: &AddressSpace, start_stack: u64) -> ((u64, u64), (u64, u64)) {
+    let read = |at: u64| mem.read_u64(GuestAddr(at)).ok();
+    let end_of = |start: u64| {
+        let mut end = start;
+        let mut byte = [1u8];
+        while byte[0] != 0 && end - start < 1 << 17 {
+            mem.read(GuestAddr(end), &mut byte).ok()?;
+            end += 1;
+        }
+        Some(end)
+    };
+    // A vector of pointers from `at` to its NULL: its first and last string.
+    let vector = |at: u64| -> Option<(u64, u64)> {
+        let first = read(at)?;
+        if first == 0 {
+            return None;
+        }
+        let mut last = first;
+        for i in 1..(1 << 16) {
+            match read(at + 8 * i)? {
+                0 => break,
+                pointer => last = pointer,
+            }
+        }
+        Some((first, end_of(last)?))
+    };
+    let Some(count) = read(start_stack).filter(|&count| count <= 1 << 20) else {
+        return ((0, 0), (0, 0));
+    };
+    let arguments = vector(start_stack + 8).unwrap_or((0, 0));
+    // With no environment, Linux's range is empty where the arguments end.
+    let environment = vector(start_stack + 8 * (count + 2)).unwrap_or((arguments.1, arguments.1));
+    (arguments, environment)
+}
+
 /// The bytes from the first argument to the end of the last one, each
 /// ending in its NUL, as Linux's `arg_start` to `arg_end`.
 fn arguments(who: &Identity, mem: &AddressSpace) -> Vec<u8> {

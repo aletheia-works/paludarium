@@ -439,6 +439,7 @@ impl Session {
             })?;
         }
         let mut thread = kernel.spawn_initial(&image);
+        kernel.set_executable(&self.config.program);
         thread.state.name_after(&self.config.program);
         let execution = Arc::new(Execution::new(
             Arc::clone(&self.host),

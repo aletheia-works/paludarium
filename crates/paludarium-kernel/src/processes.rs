@@ -191,6 +191,16 @@ impl Processes {
             entry.group.set_soft_limit(7, soft.min(max));
         }
     }
+    /// The live tasks, threads included, and the last ID handed out, for
+    /// `/proc/loadavg`.
+    pub(crate) fn task_counts(&self) -> (usize, u32) {
+        let live = self.tasks.live.load(Ordering::SeqCst);
+        let next = self.next.load(Ordering::SeqCst);
+        (
+            usize::try_from(live).unwrap_or(usize::MAX),
+            next.saturating_sub(1),
+        )
+    }
     pub(crate) fn allocate(&self) -> Result<u32, Errno> {
         self.next
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -471,6 +481,20 @@ impl Processes {
     }
     /// What `/proc/self/status` shows of `pid`: its parent, its
     /// RLIMIT_SIGPENDING soft limit and PR_SET_NO_NEW_PRIVS.
+    /// The parent, process group, session, waited-for children's CPU time
+    /// and RLIMIT_RSS soft limit of `pid`, for `/proc/<pid>/stat`.
+    pub(crate) fn stat_of(&self, pid: u32) -> (u32, u32, u32, u64, u64) {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.get(&pid).map_or((0, 0, 0, 0, u64::MAX), |entry| {
+            (
+                entry.parent,
+                entry.pgid,
+                entry.sid,
+                entry.children_cpu,
+                entry.limits[5].0,
+            )
+        })
+    }
     pub(crate) fn status_of(&self, pid: u32) -> (u32, u64, bool) {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.get(&pid).map_or((0, 4096, false), |entry| {
@@ -2062,6 +2086,8 @@ impl Kernel {
         self.group.exec_actions();
         thread.cpu = CpuState::new(image.entry_point, image.initial_stack_pointer);
         self.group.set_start_stack(image.initial_stack_pointer.0);
+        self.group
+            .set_executable(crate::files::resolved(&self.files, &loaded).unwrap_or(loaded));
         let ignored = thread
             .state
             .signal_actions

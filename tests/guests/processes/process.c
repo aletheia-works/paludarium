@@ -3201,6 +3201,134 @@ static int proc_own_files_cases(int argc, char **argv) {
     return 0;
 }
 
+/* FIFOs: mkfifo and mknod make the node, and every open of it joins one pipe
+   (fs/pipe.c's fifo_open). A blocking reader waits for a writer and a
+   blocking writer for a reader, so the parent and a forked child meet. */
+static void fifo_show(const char *label, long r) {
+    printf("%s: r=%ld errno=%d\n", label, r < 0 ? -1L : r, r < 0 ? errno : 0);
+}
+static int fifo_cases(void) {
+    const char *path = "/tmp/paludarium-fifo";
+    unlink(path);
+    umask(022);
+    errno = 0;
+    fifo_show("mkfifo", mkfifo(path, 0666));
+    struct stat st;
+    stat(path, &st);
+    printf("node: fifo=%d mode=%o size=%ld\n", S_ISFIFO(st.st_mode), (unsigned)(st.st_mode & 07777), (long)st.st_size);
+    errno = 0;
+    fifo_show("mkfifo-again", mkfifo(path, 0666));
+
+    /* Nonblocking: a writer without a reader is ENXIO; a reader opens, and
+       reads the end of the file while no writer is there. */
+    errno = 0;
+    fifo_show("write-alone", open(path, O_WRONLY | O_NONBLOCK));
+    int reader = open(path, O_RDONLY | O_NONBLOCK);
+    char buffer[64];
+    errno = 0;
+    fifo_show("read-no-writer", read(reader, buffer, sizeof buffer));
+    int writer = open(path, O_WRONLY | O_NONBLOCK);
+    printf("both-open: reader=%d writer=%d\n", reader >= 0, writer >= 0);
+    fifo_show("write", write(writer, "abc", 3));
+    long got = read(reader, buffer, sizeof buffer);
+    printf("read: %ld %.*s\n", got, (int)(got > 0 ? got : 0), buffer);
+    struct stat opened;
+    fstat(reader, &opened);
+    printf("fstat: fifo=%d same-inode=%d mode=%o\n", S_ISFIFO(opened.st_mode), opened.st_ino == st.st_ino,
+           (unsigned)(opened.st_mode & 07777));
+    close(writer);
+    errno = 0;
+    fifo_show("read-after-writer", read(reader, buffer, sizeof buffer));
+    close(reader);
+
+    /* Blocking: the child's writer and the parent's reader wait for each
+       other, whichever comes first. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 80;
+    if (!child) {
+        int w = open(path, O_WRONLY);
+        if (w < 0 || write(w, "from child\n", 11) != 11) _exit(1);
+        close(w);
+        _exit(0);
+    }
+    reader = open(path, O_RDONLY);
+    long total = 0;
+    while ((got = read(reader, buffer + total, sizeof buffer - (size_t)total)) > 0) total += got;
+    int status;
+    waitpid(child, &status, 0);
+    printf("blocking: %.*s", (int)total, buffer);
+    printf("blocking: end=%ld status=%d\n", got, status);
+    close(reader);
+
+    /* O_RDWR is both ends and waits for neither. */
+    int both = open(path, O_RDWR);
+    fifo_show("rdwr-write", write(both, "xy", 2));
+    got = read(both, buffer, sizeof buffer);
+    printf("rdwr-read: %ld %.*s\n", got, (int)(got > 0 ? got : 0), buffer);
+    close(both);
+    errno = 0;
+    fifo_show("excl", open(path, O_RDWR | O_CREAT | O_EXCL, 0600));
+    errno = 0;
+    fifo_show("directory", open(path, O_RDONLY | O_DIRECTORY | O_NONBLOCK));
+    fifo_show("unlink", unlink(path));
+
+    /* mknod's other types. */
+    const char *other = "/tmp/paludarium-mknod";
+    unlink(other);
+    errno = 0;
+    fifo_show("mknod-fifo", mknod(other, S_IFIFO | 0600, 0));
+    stat(other, &st);
+    printf("mknod-fifo: fifo=%d mode=%o\n", S_ISFIFO(st.st_mode), (unsigned)(st.st_mode & 07777));
+    unlink(other);
+    errno = 0;
+    fifo_show("mknod-regular", mknod(other, S_IFREG | 0640, 0));
+    stat(other, &st);
+    printf("mknod-regular: regular=%d mode=%o size=%ld\n", S_ISREG(st.st_mode), (unsigned)(st.st_mode & 07777),
+           (long)st.st_size);
+    unlink(other);
+    errno = 0;
+    fifo_show("mknod-no-type", mknod(other, 0600, 0));
+    stat(other, &st);
+    printf("mknod-no-type: regular=%d\n", S_ISREG(st.st_mode));
+    unlink(other);
+    errno = 0;
+    fifo_show("mknod-directory", mknod(other, S_IFDIR | 0700, 0));
+    errno = 0;
+    fifo_show("mknod-bad-type", mknod(other, 0170000 | 0600, 0));
+    errno = 0;
+    fifo_show("mknodat-exists", mknodat(AT_FDCWD, "/tmp", S_IFIFO | 0600, 0));
+    errno = 0;
+    fifo_show("mknod-missing-parent", mknod("/tmp/no-such-dir/f", S_IFIFO | 0600, 0));
+
+    /* fchmodat2 (452, Linux 6.6), which glibc's lchmod calls first. */
+    const char *link = "/tmp/paludarium-mknod-link";
+    unlink(link);
+    mkfifo(other, 0600);
+    symlink(other, link);
+    errno = 0;
+    fifo_show("fchmodat2", syscall(452, AT_FDCWD, other, 0640, AT_SYMLINK_NOFOLLOW));
+    stat(other, &st);
+    printf("fchmodat2: mode=%o\n", (unsigned)(st.st_mode & 07777));
+    errno = 0;
+    fifo_show("fchmodat2-link", syscall(452, AT_FDCWD, link, 0600, AT_SYMLINK_NOFOLLOW));
+    errno = 0;
+    fifo_show("fchmodat2-follows", syscall(452, AT_FDCWD, link, 0604, 0));
+    stat(other, &st);
+    printf("fchmodat2-follows: mode=%o\n", (unsigned)(st.st_mode & 07777));
+    errno = 0;
+    fifo_show("fchmodat2-flags", syscall(452, AT_FDCWD, other, 0600, 1));
+    int node = open(other, O_PATH);
+    errno = 0;
+    fifo_show("fchmodat2-empty-path", syscall(452, node, "", 0600, AT_EMPTY_PATH));
+    stat(other, &st);
+    printf("fchmodat2-empty-path: mode=%o\n", (unsigned)(st.st_mode & 07777));
+    close(node);
+    unlink(link);
+    unlink(other);
+    return 0;
+}
+
 static void lock_show(const char *label, long number, void *at, size_t length, long flags) {
     errno = 0;
     long r = syscall(number, at, length, flags);
@@ -11217,6 +11345,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-maps")) return maps_cases(argv[2]);
     if (!strcmp(mode, "proc-maps-after-exec")) return maps_after_exec(argv[2]);
     if (!strcmp(mode, "robust-list")) return robust_list_cases(self);
+    if (!strcmp(mode, "fifo")) return fifo_cases();
     if (!strcmp(mode, "proc-own-files")) return proc_own_files_cases(argc, argv);
     if (!strcmp(mode, "late-handler")) return late_handler_cases();
     if (!strcmp(mode, "futex-shared")) return futex_shared_cases();

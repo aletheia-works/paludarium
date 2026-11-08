@@ -123,6 +123,8 @@ pub struct Processes {
     file_owners: Mutex<crate::fasync::Owners>,
     /// The machine's byte-range locks (`fcntl`'s `F_SETLK` and OFD locks).
     locks: crate::record_locks::Locks,
+    /// The machine's FIFOs, which every process opening one joins.
+    fifos: Arc<crate::fifo::Fifos>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -136,6 +138,7 @@ impl Processes {
             changed: WaitToken::default(),
             file_owners: Mutex::default(),
             locks: crate::record_locks::Locks::default(),
+            fifos: Arc::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -520,6 +523,9 @@ impl Processes {
     }
     pub(crate) fn locks(&self) -> &crate::record_locks::Locks {
         &self.locks
+    }
+    pub(crate) fn fifos(&self) -> Arc<crate::fifo::Fifos> {
+        Arc::clone(&self.fifos)
     }
     pub(crate) fn finish(&self, pid: u32, status: ExitStatus) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);

@@ -44,6 +44,11 @@ verified.
   host's `/proc`. In `/proc/self/stat`, page faults, resident memory, the
   start time and the code range are 0, and `meminfo` shows the fixed 4 GiB
   that `sysinfo` reports, with nothing used.
+- **Device nodes and FIFOs on the host**: `mknod` of a character or block
+  device is `EPERM`, although the guest runs as root, since paludarium has
+  no device for it to stand for. A FIFO in a mounted host directory can be
+  made on Linux hosts only, and connects only the guest's own openers, not
+  host programs that open the same node.
 - **Network**: without an allow list (`--allow-net`,
   `Config::with_network`, or the JavaScript `network` option, which a
   browser needs a [relay](./relay) for) `socket()` returns `EAFNOSUPPORT` for every family.

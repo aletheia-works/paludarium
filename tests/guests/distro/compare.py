@@ -24,7 +24,7 @@ import sys
 import time
 
 # Even if every case ran out its time, the cases would end in about 121
-# minutes (85 cases on 4 workers, 330 s each), within the workflow's 150 with
+# minutes (86 cases on 4 workers, 330 s each), within the workflow's 150 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
 # ended. The slowest case, g++, took 75 to 150 s under the emulator on CI, and
@@ -193,7 +193,7 @@ def cases(fx):
         "less": shell("less -F /etc/os-release | wc -l"),
         "dpkg-query": ["/usr/bin/dpkg-query", "-W", "-f=${Version}\\n", "bash"],
         # Signals, processes, sockets, locks and /proc. Left out until paludarium has
-        # them: pseudo-terminals (python's pty, script), mkfifo, and the /proc
+        # them: pseudo-terminals (python's pty, script), and the /proc
         # directories of other processes (ps).
         "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
         "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],
@@ -230,6 +230,15 @@ def cases(fx):
             "for i in 1 2 3 4; do (for j in $(seq 50); do "
             "sqlite3 -cmd '.timeout 5000' w.db \"insert into t values($i)\"; done) & done; wait; "
             "sqlite3 w.db 'select count(*), count(distinct a) from t; pragma integrity_check;'"
+        ),
+        # A FIFO between a background writer and a reader, then one descriptor
+        # opened for both ends, and Python's os.mkfifo with a writer thread.
+        "mkfifo": shell(
+            "cd {O} && mkfifo -m 600 p && stat -c '%F %a' p && { echo through the fifo > p & } && cat p && wait && "
+            "exec 3<>p && echo both ends >&3 && read -r line <&3 && echo $line && exec 3<&- && "
+            'python3 -c \'import os, threading; os.mkfifo("q"); '
+            't = threading.Thread(target=lambda: open("q", "w").write("python\\n")); t.start(); '
+            'print(open("q").read().strip()); t.join()\''
         ),
         "flock": shell(
             "flock {O}/l -c 'echo locked'; flock {O}/l -c 'flock -n {O}/l true; echo inner $?'"

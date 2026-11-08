@@ -66,8 +66,11 @@ impl HostFs for MemFs {
         if matches!(n.kind, Kind::Symlink(_)) {
             return Err(Errno(40));
         }
-        // A socket file opens no file, as Linux's `no_open` (ENXIO).
-        if matches!(n.kind, Kind::Socket) {
+        // A socket file opens no file, as Linux's `no_open` (ENXIO); the
+        // kernel opens a FIFO as a pipe before it comes here. With O_PATH
+        // either opens, as only a path.
+        const O_PATH: u32 = 0o10000000;
+        if matches!(n.kind, Kind::Special) && flags & O_PATH == 0 {
             return Err(Errno(6));
         }
         if flags & 65536 != 0 && !matches!(n.kind, Kind::Dir(_)) {
@@ -166,7 +169,12 @@ impl HostFs for MemFs {
     }
     fn make_socket(&self, path: &[u8], mode: u32) -> Result<FileStat, Errno> {
         let mut t = lock(&self.tree);
-        let id = t.insert(path, Kind::Socket, 0o140000 | (mode & 0o7777))?;
+        let id = t.insert(path, Kind::Special, 0o140000 | (mode & 0o7777))?;
+        Ok(lock(&*t.node(id)?).stat(id))
+    }
+    fn make_fifo(&self, path: &[u8], mode: u32) -> Result<FileStat, Errno> {
+        let mut t = lock(&self.tree);
+        let id = t.insert(path, Kind::Special, 0o010000 | (mode & 0o7777))?;
         Ok(lock(&*t.node(id)?).stat(id))
     }
     fn unlink(&self, path: &[u8], directory: bool) -> Result<(), Errno> {

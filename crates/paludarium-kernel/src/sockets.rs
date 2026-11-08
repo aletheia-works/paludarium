@@ -273,13 +273,31 @@ mod pipe_tests {
 const PIPE_DEFAULT: usize = 16 * 4096;
 impl PipeEnd {
     pub(crate) fn pair(flags: u32, hub: Arc<ReadinessHub>) -> Result<[Arc<Self>; 2], Errno> {
+        Self::make(flags, hub, None)
+    }
+    /// The pipe of a FIFO, whose ends show the inode, mode and owner of the
+    /// FIFO's node `node`, as Linux's inode of a FIFO is the file's.
+    pub(crate) fn fifo(node: &FileStat, hub: Arc<ReadinessHub>) -> Result<[Arc<Self>; 2], Errno> {
+        Self::make(0, hub, Some(node))
+    }
+    fn make(
+        flags: u32,
+        hub: Arc<ReadinessHub>,
+        node: Option<&FileStat>,
+    ) -> Result<[Arc<Self>; 2], Errno> {
         let [reader, writer] = SocketPairEnd::pair(1 | flags, hub)?;
         reader.pair.window.store(PIPE_DEFAULT, Ordering::SeqCst);
         reader.pair.pipe.store(true, Ordering::SeqCst);
         reader.shutdown(1)?;
         writer.shutdown(0)?;
-        let inode = reader.inode;
-        let attributes = Arc::new(Attributes::new(0o010600));
+        let (inode, attributes) = match node {
+            Some(node) => {
+                let attributes = Attributes::new(node.mode);
+                attributes.set_owner(Some(node.uid), Some(node.gid));
+                (node.inode, Arc::new(attributes))
+            }
+            None => (reader.inode, Arc::new(Attributes::new(0o010600))),
+        };
         let ends = Arc::new(Mutex::new([
             Arc::downgrade(&reader),
             Arc::downgrade(&writer),
@@ -310,6 +328,30 @@ impl PipeEnd {
             end.listen();
             Arc::new(end)
         }))
+    }
+}
+impl PipeEnd {
+    /// [`FileHandle::reopen`], as the pipe end itself, which a FIFO keeps.
+    pub(crate) fn open_again(&self, flags: u32) -> Result<Arc<Self>, Errno> {
+        const ENXIO: Errno = Errno(6);
+        let (endpoint, reader, writer) = match flags & 3 {
+            0 => (self.end(true), true, None),
+            1 => (self.end(false), false, None),
+            2 => (self.end(true), true, Some(self.end(false))),
+            _ => return Err(ENXIO),
+        };
+        let description = Self {
+            endpoint,
+            reader,
+            inode: self.inode,
+            attributes: Arc::clone(&self.attributes),
+            nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
+            ends: Arc::clone(&self.ends),
+            writer,
+            signalling: Arc::default(),
+        };
+        description.listen();
+        Ok(Arc::new(description))
     }
 }
 impl PipeEnd {
@@ -484,25 +526,7 @@ impl FileHandle for PipeEnd {
     /// pipe, unlike a FIFO, neither waits for the other end nor refuses a
     /// writer without a reader.
     fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
-        const ENXIO: Errno = Errno(6);
-        let (endpoint, reader, writer) = match flags & 3 {
-            0 => (self.end(true), true, None),
-            1 => (self.end(false), false, None),
-            2 => (self.end(true), true, Some(self.end(false))),
-            _ => return Err(ENXIO),
-        };
-        let description = Self {
-            endpoint,
-            reader,
-            inode: self.inode,
-            attributes: Arc::clone(&self.attributes),
-            nonblocking: AtomicBool::new(flags & NONBLOCK != 0),
-            ends: Arc::clone(&self.ends),
-            writer,
-            signalling: Arc::default(),
-        };
-        description.listen();
-        Ok(Arc::new(description))
+        Ok(self.open_again(flags)?)
     }
     fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
         Err(Errno::ESPIPE)

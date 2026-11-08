@@ -530,6 +530,48 @@ impl FileHandle for NativeFile {
         }
     }
 }
+/// On a Linux host, a node of type `kind` (a socket or a FIFO) made with
+/// `mknodat` in the mounted directory, with exactly the permission bits of
+/// `m` where `/proc` is mounted (otherwise the host's umask takes some away).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn make_node(
+    fs: &NativeFs,
+    p: &[u8],
+    m: u32,
+    kind: rustix::fs::FileType,
+) -> Result<FileStat, Errno> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let relative = path(p)?;
+    let name = relative.file_name().ok_or(Errno::EEXIST)?;
+    let dir = match relative.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => fs.root.open_dir(parent),
+        None => fs.root.try_clone(),
+    }
+    .map_err(err)?;
+    let mode = Mode::from_raw_mode(m & 0o7777);
+    let fail = |e: rustix::io::Errno| err(e.into());
+    rustix::fs::mknodat(&dir, name, kind, mode, 0).map_err(fail)?;
+    // The umask took bits away. The node itself, not whatever its name
+    // may meanwhile lead to, gets them back: `fchmodat` cannot refuse
+    // to follow a symbolic link, so through a descriptor of the node.
+    let node = rustix::fs::openat(
+        &dir,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(fail)?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&node).map_err(fail)?.st_mode) != kind {
+        // Something else took the name since: not ours to remove.
+        return Err(Errno::EEXIST);
+    }
+    // Without `/proc` (a chroot, a minimal container) the node keeps
+    // the bits the host's umask left it, still a node that works.
+    let own = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&node));
+    let _ = rustix::fs::chmod(own.as_str(), mode);
+    fs.metadata(p, false)
+}
+
 impl HostFs for NativeFs {
     fn open(&self, p: &[u8], f: u32, m: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         if f & (64 | 65536) == 64 | 65536 {
@@ -766,45 +808,18 @@ impl HostFs for NativeFs {
         }
         .map_err(err)
     }
-    /// On a Linux host, a socket node made with `mknodat` in the mounted
-    /// directory, with exactly the permission bits of `m` where `/proc` is
-    /// mounted (otherwise the host's umask takes some away). Other hosts
-    /// cannot make one inside the mount without root (macOS) or at all, so
-    /// it stays `EPERM` there.
+    /// On a Linux host, a socket node made in the mounted directory
+    /// ([`make_node`]). Other hosts cannot make one inside the mount without
+    /// root (macOS) or at all, so it stays `EPERM` there.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn make_socket(&self, p: &[u8], m: u32) -> Result<FileStat, Errno> {
-        use rustix::fs::{FileType, Mode, OFlags};
-        let relative = path(p)?;
-        let name = relative.file_name().ok_or(Errno::EEXIST)?;
-        let dir = match relative.parent().filter(|p| !p.as_os_str().is_empty()) {
-            Some(parent) => self.root.open_dir(parent),
-            None => self.root.try_clone(),
-        }
-        .map_err(err)?;
-        let mode = Mode::from_raw_mode(m & 0o7777);
-        let fail = |e: rustix::io::Errno| err(e.into());
-        rustix::fs::mknodat(&dir, name, FileType::Socket, mode, 0).map_err(fail)?;
-        // The umask took bits away. The node itself, not whatever its name
-        // may meanwhile lead to, gets them back: `fchmodat` cannot refuse
-        // to follow a symbolic link, so through a descriptor of the node.
-        let node = rustix::fs::openat(
-            &dir,
-            name,
-            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(fail)?;
-        if FileType::from_raw_mode(rustix::fs::fstat(&node).map_err(fail)?.st_mode)
-            != FileType::Socket
-        {
-            // Something else took the name since: not ours to remove.
-            return Err(Errno::EEXIST);
-        }
-        // Without `/proc` (a chroot, a minimal container) the node keeps
-        // the bits the host's umask left it, still a socket file that works.
-        let own = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&node));
-        let _ = rustix::fs::chmod(own.as_str(), mode);
-        self.metadata(p, false)
+        make_node(self, p, m, rustix::fs::FileType::Socket)
+    }
+    /// On a Linux host, a FIFO made in the mounted directory ([`make_node`]);
+    /// `EPERM` elsewhere, as for a socket.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn make_fifo(&self, p: &[u8], m: u32) -> Result<FileStat, Errno> {
+        make_node(self, p, m, rustix::fs::FileType::Fifo)
     }
     fn mkdir(&self, p: &[u8], m: u32) -> Result<(), Errno> {
         let builder = cap_std::fs::DirBuilder::new();
@@ -976,6 +991,28 @@ mod files_tests {
                 Ok(i128::from(represented_ns))
             );
         }
+    }
+    #[test]
+    fn make_fifo_makes_a_fifo_node_on_linux_hosts() {
+        let base = std::env::temp_dir().join(format!(
+            "paludarium-fifo-node-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(base.join("root/dir")).unwrap();
+        let fs = NativeFs::new(&base.join("root")).unwrap();
+        let made = fs.make_fifo(b"dir/f", 0o640);
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            assert_eq!(made.unwrap().mode, 0o010640);
+            assert_eq!(fs.metadata(b"dir/f", false).unwrap().mode, 0o010640);
+            assert_eq!(fs.make_fifo(b"dir/f", 0o640), Err(Errno::EEXIST));
+            assert_eq!(fs.make_fifo(b"missing/f", 0o640), Err(Errno::ENOENT));
+            assert!(fs.make_fifo(b"../outside", 0o640).is_err());
+            assert!(!base.join("outside").exists());
+        } else {
+            assert_eq!(made, Err(Errno::EPERM));
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
     #[test]
     fn make_socket_makes_a_socket_node_on_linux_hosts() {

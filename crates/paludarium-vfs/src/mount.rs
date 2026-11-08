@@ -239,6 +239,11 @@ impl HostFs for MountedFs {
         let (_, fs, p) = self.route(&p)?;
         fs.make_socket(&p, m)
     }
+    fn make_fifo(&self, p: &[u8], m: u32) -> Result<FileStat, Errno> {
+        let p = self.resolve(p, false, true)?;
+        let (_, fs, p) = self.route(&p)?;
+        fs.make_fifo(&p, m)
+    }
     fn unlink(&self, p: &[u8], directory: bool) -> Result<(), Errno> {
         self.require_trailing_directory(p)?;
         let p = self.resolve(p, false, false)?;

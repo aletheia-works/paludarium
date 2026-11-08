@@ -468,7 +468,8 @@ fn scheduling_policies_are_kept_and_reported() {
             0,
             0,
             [10_000_000, 30_000_000, 100_000_000],
-            [1024, 1024]
+            // A deadline task's minimum is not raised as a real-time one's.
+            [0, 1024]
         )
     );
     assert_eq!(interval(&mut f), 0);

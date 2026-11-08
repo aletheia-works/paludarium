@@ -4146,7 +4146,20 @@ int main(int argc, char **argv) {
         struct attr a = {.size = 48, .policy = SCHED_OTHER, .nice = 5, .runtime = 3000000};
         result("attr-nice", syscall(SYS_sched_setattr, 0, &a, 0));
         sched_show("attr-nice");
-        a.runtime = 1;
+        /* A child keeps a custom slice when the reset flag is not set. */
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            sched_show("slice-child");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("reaped", reaped(pid));
+        /* SCHED_EXT takes a nice value and a slice as the fair policies do. */
+        a = (struct attr){.size = 48, .policy = 7, .nice = 3, .runtime = 500000};
+        result("ext-nice", syscall(SYS_sched_setattr, 0, &a, 0));
+        sched_show("ext-nice");
+        a = (struct attr){.size = 48, .policy = SCHED_OTHER, .nice = 5, .runtime = 1};
         result("attr-short", syscall(SYS_sched_setattr, 0, &a, 0));
         sched_show("attr-short");
         a = (struct attr){.size = 48, .flags = 0x08 | 0x10};

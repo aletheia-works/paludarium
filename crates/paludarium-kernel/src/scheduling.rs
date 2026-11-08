@@ -322,7 +322,8 @@ pub(crate) fn set(
         sched.slice = (attr.runtime != 0).then(|| attr.runtime.clamp(100_000, 100_000_000));
     }
     // __setscheduler_uclamp: a clamp the task did not ask for follows the
-    // class (a real-time task's minimum is 1024), and -1 asks for that.
+    // class (a FIFO or RR task's minimum is 1024, as 6.12's rt_task, which
+    // leaves deadline tasks out), and -1 asks for that.
     for (index, (flag, value)) in [
         (FLAG_UTIL_CLAMP_MIN, attr.util_min),
         (FLAG_UTIL_CLAMP_MAX, attr.util_max),
@@ -334,9 +335,8 @@ pub(crate) fn set(
         let reset = attr.flags & FLAG_UTIL_CLAMP == 0 && !clamp.user
             || attr.flags & flag != 0 && value == u32::MAX;
         if reset {
-            let realtime = rt_policy(policy) || policy == SCHED_DEADLINE;
             *clamp = Clamp {
-                value: if index == 0 && realtime {
+                value: if index == 0 && rt_policy(policy) {
                     CAPACITY
                 } else {
                     [0, CAPACITY][index]

@@ -21,6 +21,14 @@ pub(crate) fn stat(length: usize) -> FileStat {
         ..FileStat::default()
     }
 }
+/// `environ`'s `stat`: as [`stat`], but 0400, as Linux keeps it to the
+/// process's owner.
+pub(crate) fn private_stat(length: usize) -> FileStat {
+    FileStat {
+        mode: 0o100_400,
+        ..stat(length)
+    }
+}
 /// The paths served, and whether each one is the mountinfo format.
 pub(crate) fn mount_table(path: &[u8]) -> Option<bool> {
     match path {
@@ -37,6 +45,7 @@ pub(crate) enum OwnEntry {
     Status,
     Stat,
     Cmdline,
+    Environ,
     Comm,
     /// The links to the running program and to the current directory.
     Exe,
@@ -60,6 +69,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
         b"/status" => Some(OwnEntry::Status),
         b"/stat" => Some(OwnEntry::Stat),
         b"/cmdline" => Some(OwnEntry::Cmdline),
+        b"/environ" => Some(OwnEntry::Environ),
         b"/comm" => Some(OwnEntry::Comm),
         b"/exe" => Some(OwnEntry::Exe),
         b"/cwd" => Some(OwnEntry::Cwd),
@@ -70,18 +80,109 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 10] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 12] = [
+    (b"task", 4),
     (b"fd", 4),
+    (b"environ", 8),
     (b"status", 8),
+    (b"comm", 8),
     (b"cmdline", 8),
     (b"stat", 8),
     (b"maps", 8),
-    (b"mounts", 8),
-    (b"mountinfo", 8),
     (b"cwd", 10),
     (b"exe", 10),
-    (b"comm", 8),
+    (b"mounts", 8),
+    (b"mountinfo", 8),
 ];
+/// The names in another process's directory, in the same order.
+pub(crate) const TASK_NAMES: [(&[u8], u8); 8] = [
+    (b"task", 4),
+    (b"environ", 8),
+    (b"status", 8),
+    (b"comm", 8),
+    (b"cmdline", 8),
+    (b"stat", 8),
+    (b"cwd", 10),
+    (b"exe", 10),
+];
+
+/// An entry of another process's directory, `/proc/<pid>`, or of a
+/// thread's, `/proc/<pid>/task/<tid>` (the reader's own threads too).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskEntry {
+    Directory,
+    /// `task`, the directory of the process's threads.
+    Threads,
+    Status,
+    Stat,
+    Cmdline,
+    Environ,
+    Comm,
+    Exe,
+    Cwd,
+    /// `/proc/thread-self`, a link to the reading thread's directory.
+    ThreadLink,
+    /// A name paludarium does not have there.
+    Missing,
+}
+/// A path [`task_path`] found: the process, the thread under `task` if the
+/// path names one, and the entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TaskPath {
+    pub pid: u32,
+    pub tid: Option<u32>,
+    pub entry: TaskEntry,
+}
+/// The path under `/proc/<pid>` of a process other than `own`, the reader,
+/// under `task` of any process, or under `/proc/thread-self`, the reading
+/// thread `own_tid`'s; `None` for the rest of the reader's own directory,
+/// which [`own_entry`] finds. The path is taken as it reads, `.` and `..`
+/// included.
+pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath> {
+    if !path.starts_with(b"/proc/") {
+        return None;
+    }
+    // `/proc/thread-self` is the link itself; with a slash or more after
+    // it, the directory it leads to.
+    let link_itself = path.ends_with(b"/thread-self");
+    let path = paludarium_vfs::normalize_path(path).ok()?;
+    let rest = path.strip_prefix(b"/proc/")?;
+    let mut parts = rest.split(|&b| b == b'/');
+    let head = parts.next()?;
+    let thread_self = head == b"thread-self";
+    let pid = if head == b"self" || thread_self {
+        own
+    } else {
+        descriptor_number(head).filter(|&pid| pid != 0)?
+    };
+    let parts: Vec<&[u8]> = parts.collect();
+    let file = |name: &[u8]| match name {
+        b"status" => TaskEntry::Status,
+        b"stat" => TaskEntry::Stat,
+        b"cmdline" => TaskEntry::Cmdline,
+        b"environ" => TaskEntry::Environ,
+        b"comm" => TaskEntry::Comm,
+        b"exe" => TaskEntry::Exe,
+        b"cwd" => TaskEntry::Cwd,
+        _ => TaskEntry::Missing,
+    };
+    let thread = |name: &[u8]| descriptor_number(name).filter(|&tid| tid != 0);
+    let (tid, entry) = match parts[..] {
+        [] if thread_self && link_itself => (Some(own_tid), TaskEntry::ThreadLink),
+        [] if thread_self => (Some(own_tid), TaskEntry::Directory),
+        [name] if thread_self => (Some(own_tid), file(name)),
+        _ if thread_self => (Some(own_tid), TaskEntry::Missing),
+        [b"task"] => (None, TaskEntry::Threads),
+        [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
+        [b"task", tid, name] => (Some(thread(tid)?), file(name)),
+        [b"task", tid, ..] => (Some(thread(tid)?), TaskEntry::Missing),
+        _ if pid == own => return None,
+        [] => (None, TaskEntry::Directory),
+        [name] => (None, file(name)),
+        _ => (None, TaskEntry::Missing),
+    };
+    Some(TaskPath { pid, tid, entry })
+}
 
 /// System-wide files under /proc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +273,10 @@ pub(crate) fn render_meminfo(total: u64) -> Vec<u8> {
 pub(crate) struct ProcessStat<'a> {
     pub pid: u32,
     pub name: &'a [u8],
+    /// The state's letter, and whether it is waiting somewhere (`wchan`).
+    pub state: char,
+    pub waiting: bool,
+    pub exit_signal: i32,
     pub parent: u32,
     pub group: u32,
     pub session: u32,
@@ -193,16 +298,15 @@ pub(crate) struct ProcessStat<'a> {
     pub ignored: u64,
     pub caught: u64,
 }
-/// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it for a process
-/// reading its own: 52 fields, state `R` (it is running, reading this),
-/// no terminal, and 0 for what nothing measures (page faults, resident
-/// memory, start time, the code range and the scheduler's figures).
+/// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it: 52 fields, no
+/// terminal, and 0 for what nothing measures (page faults, resident memory,
+/// start time, the code range and the scheduler's figures).
 pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
     /// USER_HZ, the unit of the times, as on x86-64 Linux.
     const TICKS: u64 = 100;
     let ticks = |ns: u64| ns / (1_000_000_000 / TICKS);
     let fields: [String; 50] = [
-        "R".into(),
+        s.state.to_string(),
         s.parent.to_string(),
         s.group.to_string(),
         s.session.to_string(),
@@ -236,18 +340,18 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         s.blocked.to_string(),
         s.ignored.to_string(),
         s.caught.to_string(),
-        "0".into(),  // wchan
-        "0".into(),  // nswap
-        "0".into(),  // cnswap
-        "17".into(), // exit_signal: SIGCHLD
-        "0".into(),  // processor
-        "0".into(),  // rt_priority
-        "0".into(),  // policy: SCHED_OTHER
-        "0".into(),  // delayacct_blkio_ticks
-        "0".into(),  // guest_time
-        "0".into(),  // cguest_time
-        "0".into(),  // start_data
-        "0".into(),  // end_data
+        u8::from(s.waiting).to_string(), // wchan
+        "0".into(),                      // nswap
+        "0".into(),                      // cnswap
+        s.exit_signal.to_string(),
+        "0".into(), // processor
+        "0".into(), // rt_priority
+        "0".into(), // policy: SCHED_OTHER
+        "0".into(), // delayacct_blkio_ticks
+        "0".into(), // guest_time
+        "0".into(), // cguest_time
+        "0".into(), // start_data
+        "0".into(), // end_data
         s.start_brk.to_string(),
         s.arguments.0.to_string(),
         s.arguments.1.to_string(),
@@ -325,10 +429,14 @@ pub(crate) fn directory_stat() -> FileStat {
 /// What `/proc/self/status` reports.
 pub(crate) struct Status<'a> {
     pub name: &'a [u8],
-    pub umask: u32,
+    /// The umask and the descriptors in use, which a zombie no longer has.
+    pub umask: Option<u32>,
+    /// The state as `status` names it, such as `R (running)`.
+    pub state: &'a str,
+    pub tgid: u32,
     pub pid: u32,
     pub parent: u32,
-    pub descriptors: usize,
+    pub descriptors: Option<usize>,
     pub threads: usize,
     pub queued: usize,
     pub queue_limit: u64,
@@ -351,15 +459,20 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         }
     }
     // Linux sizes the descriptor table in powers of two from 64.
-    let fd_size = s.descriptors.next_power_of_two().max(64);
-    let pid = s.pid;
+    let fd_size = s
+        .descriptors
+        .map_or(0, |count| count.next_power_of_two().max(64));
+    let umask = s.umask.map_or_else(String::new, |umask| {
+        format!("Umask:\t{:04o}\n", umask & 0o777)
+    });
+    let (state, tgid, pid) = (s.state, s.tgid, s.pid);
     let c = s.credentials;
     // Each group, then a space Linux has always written after them.
     let groups: Vec<String> = c.groups.iter().map(u32::to_string).collect();
     let groups = groups.join(" ");
     let bounding = crate::credentials::ALL_CAPABILITIES;
     format!(
-        "Name:\t{name}\nUmask:\t{:04o}\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\n\
+        "Name:\t{name}\n{umask}State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\n\
          Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
          FDSize:\t{fd_size}\nGroups:\t{groups} \nThreads:\t{}\nSigQ:\t{}/{}\n\
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
@@ -367,7 +480,6 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
          CapEff:\t{:016x}\nCapBnd:\t{bounding:016x}\nCapAmb:\t{:016x}\n\
          NoNewPrivs:\t{}\nSeccomp:\t0\nSeccomp_filters:\t0\n\
          voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
-        s.umask & 0o777,
         s.parent,
         c.uid,
         c.euid,
@@ -952,13 +1064,73 @@ mod tests {
         assert_eq!(own_entry(b"/proc/selfish", 7), None);
     }
     #[test]
+    fn task_paths_are_other_processes_and_threads() {
+        let path = |p: &[u8]| task_path(p, 7, 9);
+        let at = |pid, tid, entry| Some(TaskPath { pid, tid, entry });
+        assert_eq!(path(b"/proc/8"), at(8, None, TaskEntry::Directory));
+        assert_eq!(path(b"/proc/8/"), at(8, None, TaskEntry::Directory));
+        assert_eq!(path(b"/proc/./8/."), at(8, None, TaskEntry::Directory));
+        assert_eq!(path(b"/proc/8/task/../stat"), at(8, None, TaskEntry::Stat));
+        assert_eq!(path(b"/proc/8/stat"), at(8, None, TaskEntry::Stat));
+        assert_eq!(path(b"/proc/8/exe"), at(8, None, TaskEntry::Exe));
+        assert_eq!(path(b"/proc/8/environ"), at(8, None, TaskEntry::Environ));
+        assert_eq!(
+            path(b"/proc/thread-self"),
+            at(7, Some(9), TaskEntry::ThreadLink)
+        );
+        assert_eq!(
+            path(b"/proc/thread-self/"),
+            at(7, Some(9), TaskEntry::Directory)
+        );
+        assert_eq!(
+            path(b"/proc/thread-self/."),
+            at(7, Some(9), TaskEntry::Directory)
+        );
+        assert_eq!(
+            path(b"/proc/thread-self/stat"),
+            at(7, Some(9), TaskEntry::Stat)
+        );
+        assert_eq!(path(b"/proc/8/maps"), at(8, None, TaskEntry::Missing));
+        assert_eq!(path(b"/proc/8/fd/1"), at(8, None, TaskEntry::Missing));
+        assert_eq!(path(b"/proc/8/task"), at(8, None, TaskEntry::Threads));
+        assert_eq!(path(b"/proc/self/task/"), at(7, None, TaskEntry::Threads));
+        assert_eq!(
+            path(b"/proc/7/task/9"),
+            at(7, Some(9), TaskEntry::Directory)
+        );
+        assert_eq!(
+            path(b"/proc/self/task/9/comm"),
+            at(7, Some(9), TaskEntry::Comm)
+        );
+        assert_eq!(
+            path(b"/proc/8/task/8/task"),
+            at(8, Some(8), TaskEntry::Missing)
+        );
+        // The reader's own directory is own_entry's; names that are no
+        // process are not these.
+        for none in [
+            &b"/proc/7"[..],
+            b"/proc/self/stat",
+            b"/proc/7/auxv",
+            b"/proc/08",
+            b"/proc/0",
+            b"/proc/loadavg",
+            b"/proc/8/task/x",
+            b"/proc/8/task/0",
+        ] {
+            assert_eq!(path(none), None, "{}", String::from_utf8_lossy(none));
+        }
+    }
+    #[test]
     fn status_has_the_fields_parsers_require() {
         let text = String::from_utf8(render_status(&Status {
             name: b"a\\b\nc\0\0",
-            umask: 0o22,
-            pid: 3,
+            umask: Some(0o22),
+            state: "S (sleeping)",
+            tgid: 3,
+            pid: 4,
             parent: 1,
-            descriptors: 70,
+            descriptors: Some(70),
             threads: 2,
             queued: 1,
             queue_limit: 4096,
@@ -982,7 +1154,9 @@ mod tests {
         for line in [
             "Name:\ta\\\\b\\nc\n",
             "Umask:\t0022\n",
+            "State:\tS (sleeping)\n",
             "Tgid:\t3\n",
+            "Pid:\t4\n",
             "PPid:\t1\n",
             "FDSize:\t128\n",
             "Threads:\t2\n",
@@ -1068,6 +1242,7 @@ mod generated_tests {
         let entry = |path: &[u8]| own_entry(path, 7);
         assert_eq!(entry(b"/proc/self/stat"), Some(OwnEntry::Stat));
         assert_eq!(entry(b"/proc/7/cmdline"), Some(OwnEntry::Cmdline));
+        assert_eq!(entry(b"/proc/self/environ"), Some(OwnEntry::Environ));
         assert_eq!(entry(b"/proc/self/comm"), Some(OwnEntry::Comm));
         assert_eq!(entry(b"/proc/self/exe"), Some(OwnEntry::Exe));
         assert_eq!(entry(b"/proc/self/cwd"), Some(OwnEntry::Cwd));
@@ -1082,6 +1257,9 @@ mod generated_tests {
         let line = render_stat(&ProcessStat {
             pid: 5,
             name: b"a b) \xe9\0junk",
+            state: 'R',
+            waiting: false,
+            exit_signal: 17,
             parent: 1,
             group: 5,
             session: 1,

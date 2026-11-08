@@ -1921,7 +1921,7 @@ fn sys_rt_sigprocmask(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 /// Only known terminal queries are interpreted, never forwarded to Host.
 fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let run = || -> Result<u64, Errno> {
+    let mut run = || -> Result<u64, Errno> {
         // Linux's `do_vfs_ioctl` answers these for every file, and an
         // `O_PATH` descriptor for none.
         let descriptor = c.files.descriptor(a[0])?;
@@ -1988,6 +1988,10 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 return Ok(0);
             }
             _ => {}
+        }
+        // A pseudo-terminal's own requests.
+        if let Some(result) = crate::pty::ioctl(c, &file, a[1], a[2]) {
+            return result;
         }
         // SIOCATMARK: whether a socket's next read is at its out-of-band mark.
         if a[1] == 0x8905 {

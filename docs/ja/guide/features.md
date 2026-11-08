@@ -52,7 +52,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
@@ -580,33 +580,60 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのパスは見せません）。マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
   `df` はどのマウントも表示します。
 - ファイルのブロックの大きさ（`st_blksize`、`stx_blksize`、`FIGETBSZ`）は、Linux と
-  同じくそのファイルシステムのものです。`/proc`（procfs）と、標準入力・出力・エラーの
-  端末（devpts）は 1024 で、ほかは、パイプ、ソケット、`memfd`、`/dev` も含めて 4096
+  同じくそのファイルシステムのものです。`/proc`（procfs）と、疑似端末のスレーブ、
+  標準入力・出力・エラーの端末（devpts）は 1024 で、ほかは、パイプ、ソケット、`memfd`、`/dev` も含めて 4096
   です。そこでの `statfs` は、Linux の `simple_statfs` と同じく、procfs や devpts の
   種類と 4096 の `f_bsize` を返します。
   `/proc/self/fd` のリンクは procfs のものですが、それを通した `stat`、`statfs`、`open`
   はリンク先のファイルに届きます。
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）と、
-  自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
+- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）、
+  プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
   `AT_SYMLINK_NOFOLLOW` の `fstatat` や `statx` はリンクを返し、`stat` と末尾の `/` は
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
-  名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`comm`、`exe`、`cwd`、`maps`、
-  `fd` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
+  名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
+  `cwd`、`maps`、`fd`、`task` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。ただし、何も
-  測っていないメモリと CPU の項目はありません。`/proc` の下のそれ以外のパスは、ほかの
-  プロセスのディレクトリも含めて、ふつうのパスと同じようにファイルシステムで探します。
+  測っていないメモリと CPU の項目はありません。自分のディレクトリと `/proc` の下の
+  それ以外のパスは、ふつうのパスと同じようにファイルシステムで探します。
   そのため `--mount /:/` では、ホストの `/proc` に届きます。
+- `/proc` は、ファイルシステムがそこに持つプロセス以外のもの（`--mount /:/` では、
+  ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
+  ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
+  が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
+  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`task` があり、
+  Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
+  `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
+  ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
+  `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task` 以外の同じファイルが
+  あり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
+  プロセスの ID）を示します。`/proc/thread-self` は読んでいるスレッドのディレクトリへの
+  リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
+  そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
+  `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
+  `environ` は実 ID が、`exe` と `cwd` はファイルシステムの ID が、ダンプできるプロセスの
+  ユーザーとグループのすべての ID と同じでなければ `EACCES` です。ダンプできないプロセスの
+  ディレクトリの持ち主は root です。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
+  最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
+  ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
+  シグナルの扱い、メモリ（`cmdline`、`environ`、`stat` の大きさ）、カレントディレクトリ、
+  umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
+  いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、スレッドがシステム
+  コールの中にいる間（待つならそこで待つので）は `S (sleeping)`、それ以外は `R` です。
+  ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
+  持ちません。Linux と同じく、`cmdline` と `environ` は空で、`exe` と `cwd` は `ENOENT` です。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
-  `R`（読んでいるプロセスは動いているので）、親、プロセスグループ、セッション、端末なし、
+  `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、端末なし、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、
   スレッドの数、マッピングの大きさ、`RLIMIT_RSS` の上限、スタックとヒープの始まり、
-  10 進数のシグナルの集合、`exit_signal` の 17、引数と環境変数の文字列の位置です。何も
+  10 進数のシグナルの集合、`wchan`（Linux が root に見せるのと同じく、待っているタスクは
+  1。ただし複数のスレッドを持つプロセス全体のものは 0）、`exit_signal`（読むプロセス自身は
+  17）、引数と環境変数の文字列の位置です。何も
   測っていないもの（ページフォールト、常駐メモリ、開始時刻、コードの範囲、スケジューラーの
-  数値）は 0 です。`cmdline` は、今メモリにある引数の文字列で、それぞれ NUL で終わります。
-  `comm` は名前と改行です。
+  数値）は 0 です。`cmdline` と `environ` は、今メモリにある引数と環境変数の文字列で、
+  それぞれ NUL で終わります。`comm` は名前と改行です。
 - `/proc/self/exe` と `/proc/self/cwd` はシンボリックリンク（0777、サイズ 0）で、それぞれ
   プロセスが動かしているプログラム（`execve` が読み込んだもので、シンボリックリンクは
   たどった後のパス。最初のプログラムは CLI が与えるパスの `/<ファイル名>`）と、カレント
@@ -666,8 +693,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   inode のモード（root の 0600、pidfd は 0700）を確かめるので、ほかのユーザーは
   `EACCES` になりますが、paludarium は root と同じように開きます。Linux 以外のホストからマウントした
   ディレクトリの消されたファイルは、Linux なら開けますが、ここでは `ENXIO` です。
-- `/dev`（モード 0755）は、メモリのデバイスと、Linux のシステムがそこに置くリンクを
-  持ち、それだけを並べます。ゲストが `/dev` の下に作ったファイルは、開いたり `stat`
+- `/dev`（モード 0755）は、メモリのデバイスと、Linux のシステムがそこに置くリンクと、
+  疑似端末の `ptmx` と `pts`（後述）を持ち、それだけを並べます。ゲストが `/dev` の下に作ったファイルは、開いたり `stat`
   したりできますが、一覧には出ません。各エントリは 1 つの inode 番号を持ち、`stat` と
   `getdents` は同じ番号を返します。`/dev` は読み込み用にしか開けず（`EISDIR`）、
   デバイスは `O_DIRECTORY` では開けません（`ENOTDIR`）。`null`、`zero`、`full`、`random`、`urandom` は
@@ -680,6 +707,49 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクに `O_NOFOLLOW` を付けると `ELOOP` で、`O_PATH` も付けると `/proc/self/fd` と
   同じくリンクそのものを開きます。ホストのマウントのファイルはデバイス番号を
   持ちません。
+- **疑似端末**は、Linux の devpts、`pty.c`、N_TTY の行規則と同じに動きます。
+  `/dev/ptmx`（5:2、モード 0666。devpts 自身の `/dev/pts/ptmx` も）を開くたびに
+  組が 1 つでき、そのスレーブは空いている最も小さい番号の `/dev/pts/<n>` です。
+  スレーブはキャラクタデバイス（136:n、モード 0620、グループ 5、持ち主は開いた
+  ユーザー）で、マスターが開いている間 `/dev/pts` に並びます。スレーブは
+  `TIOCSPTLCK` で解くまでロックされています。これと `TIOCGPTN`、`TIOCGPTLCK` で
+  `posix_openpt`、`grantpt`、`unlockpt`、`ptsname`、`openpty` が動き、
+  `TIOCGPTPEER` はマスターからスレーブを開きます。ロックされたスレーブや、マスターが
+  閉じたスレーブを開くと `EIO` です。
+  - マスターが書いたものはスレーブの入力になり、スレーブが書いたものをマスターが
+    読みます。スレーブの行規則は、カノニカルモードの行を編集し（`VERASE`、`VWERASE`、
+    `VKILL`、`VLNEXT`、`VREPRINT`、`VEOF`、`VEOL`、`VEOL2`）、`ECHO`、`ECHOE`、
+    `ECHOK`、`ECHOKE`、`ECHONL`、`ECHOCTL`、`ECHOPRT` のとおりにエコーします。
+    非カノニカルモードでは `VMIN` と `VTIME` のとおりに読みます。入力（`ICRNL`、
+    `INLCR`、`IGNCR`、`ISTRIP`、`IUCLC`）と出力（`OPOST`、`ONLCR`、`OCRNL`、
+    `ONOCR`、`ONLRET`、`OLCUC`、`XTABS`）を変換し、出力を止めて再開し（`IXON`、
+    `IXANY`）、`ISIG` があれば `SIGINT`、`SIGQUIT`、`SIGTSTP` をフォアグラウンドの
+    プロセスグループに送って、`NOFLSH` がなければ入力を捨てます。マスター側は
+    バイトをそのまま渡します。
+  - `TCGETS`、`TCSETS`、`TCSETSW`、`TCSETSF` とその `termios2` 版（`TCGETS2`
+    など）は、どちらの側からでもスレーブの `termios` に届きます。`termios` は
+    パリティなしの `CS8 | CREAD` を保ち、速さは `CBAUD` か `BOTHER` から決めます。
+    `TIOCGWINSZ` と `TIOCSWINSZ`（変わるとフォアグラウンドのグループに `SIGWINCH`
+    を送ります）、`FIONREAD`、`TIOCOUTQ`、`TCFLSH`、`TCXONC`、`TCSBRK`、`TIOCEXCL`、
+    `TIOCGEXCL`、`TIOCGETD` と `TIOCSETD`（N_TTY だけ）、`TIOCGDEV`、`TIOCSIG` は
+    Linux と同じに動きます。`TIOCSTI` も `dev.tty.legacy_tiocsti` が無効のときと同じで、
+    入力を押し込めるのは `CAP_SYS_ADMIN` だけで、ほかは `EIO` です。
+  - 制御端末のないセッションリーダーは、`TIOCSCTTY` か、スレーブを `O_NOCTTY`
+    なしに読み込み用に開くと、それを制御端末にします。子はそれを継ぎ、`setsid` で
+    なくなります。`/dev/tty` は制御端末を開きます（なければ `ENXIO`。エミュレーターの
+    外のセッションのプロセスは、ホストの `/dev/tty` のままです）。`TIOCSPGRP`、
+    `TIOCGPGRP`、`TIOCGSID` はフォアグラウンドのグループとセッションを決めて返します。
+    バックグラウンドのグループが読むと `SIGTTIN`、`TOSTOP` のもとで書くか
+    `termios` を変えると `SIGTTOU` を受け、グループが再開すると呼び出しをやり直します。
+    シグナルを無視しているか、ブロックしている（ただし `SIGTTOU` ならそのまま進みます）
+    か、グループが孤立しているときは `EIO` です。`TIOCNOTTY` は制御端末を手放し、
+    リーダーならセッション全体が手放して、フォアグラウンドのグループに `SIGHUP` と
+    `SIGCONT` を送ります。
+  - スレーブの記述がすべて閉じると、マスターは残りを読んだ後 `EIO` になり、`poll` では
+    切断された状態です。マスターが閉じるとスレーブは切断され（何も読めず、書き込みと
+    リクエストは `EIO`）、名前も消えます。それが制御していたセッションは制御端末を
+    失い、セッションリーダーに `SIGHUP` と `SIGCONT` が届きます。セッションリーダーが
+    終わると、その端末のフォアグラウンドのグループに `SIGHUP` が届きます。
 - CPU 時間は、ホストが測れるところ（Linux・macOS・Windows）では、ゲストのスレッドの
   最初のシステムコールからの、ホストのスレッドの CPU 時間（ユーザーとシステムの合計）
   です。WebAssembly などそれ以外では、代わりに経過時間を数えます。

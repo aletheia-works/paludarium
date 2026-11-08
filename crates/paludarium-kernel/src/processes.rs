@@ -51,6 +51,10 @@ struct Entry {
     subreaper: bool,
     /// Whether its fatal signal wrote a whole core (CLD_DUMPED).
     dumped: bool,
+    /// Its controlling terminal (Linux's `signal->tty`), when that is a
+    /// pseudo-terminal of the emulator: inherited on fork, kept across
+    /// exec, and lost by `setsid`.
+    terminal: Option<Arc<crate::pty::Terminal>>,
     /// The task the process counts as until it is reaped, as its leader does
     /// in Linux's pids controller even as a zombie.
     _task: TaskCharge,
@@ -72,6 +76,7 @@ impl Drop for TaskCharge {
     }
 }
 
+const SIGHUP: i32 = 1;
 const SIGCONT: i32 = 18;
 /// RLIMIT_CPU ... RLIMIT_RTTIME.
 pub(crate) const RLIMITS: usize = 16;
@@ -108,6 +113,22 @@ struct PriorityThread {
 }
 /// fs.nr_open: the highest RLIMIT_NOFILE Linux accepts by default.
 const NR_OPEN: u64 = 1 << 20;
+/// A process as [`Processes::view`] gives it.
+pub(crate) struct ProcessView {
+    pub parent: u32,
+    pub group_id: u32,
+    pub session: u32,
+    pub children_cpu: u64,
+    /// The RLIMIT_RSS and RLIMIT_SIGPENDING soft limits.
+    pub rss_limit: u64,
+    pub queue_limit: u64,
+    pub no_new_privs: bool,
+    pub dumpable: bool,
+    /// It has ended and waits to be reaped.
+    pub zombie: bool,
+    pub exit_signal: i32,
+    pub group: Arc<ThreadGroup>,
+}
 pub struct Processes {
     next: AtomicU32,
     entries: Mutex<BTreeMap<u32, Entry>>,
@@ -158,6 +179,7 @@ impl Processes {
                     exit_signal: signals::SIGCHLD,
                     subreaper: false,
                     dumped: false,
+                    terminal: None,
                     _task: TaskCharge(Arc::clone(&tasks)),
                 },
             )])),
@@ -220,11 +242,19 @@ impl Processes {
         task: TaskCharge,
     ) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let (pgid, sid, limits, dumpable, no_new_privs) = entries
-            .get(&parent)
-            .map_or((pid, 0, DEFAULT_LIMITS, true, false), |p| {
-                (p.pgid, p.sid, p.limits, p.dumpable, p.no_new_privs)
-            });
+        let (pgid, sid, limits, dumpable, no_new_privs, terminal) =
+            entries
+                .get(&parent)
+                .map_or((pid, 0, DEFAULT_LIMITS, true, false, None), |p| {
+                    (
+                        p.pgid,
+                        p.sid,
+                        p.limits,
+                        p.dumpable,
+                        p.no_new_privs,
+                        p.terminal.clone(),
+                    )
+                });
         entries.insert(
             pid,
             Entry {
@@ -244,6 +274,7 @@ impl Processes {
                 exit_signal,
                 subreaper: false,
                 dumped: false,
+                terminal,
                 _task: task,
             },
         );
@@ -287,6 +318,193 @@ impl Processes {
             _ => Err(Errno::EINVAL),
         }
     }
+    /// The controlling terminal of process `pid`.
+    pub(crate) fn terminal(&self, pid: u32) -> Option<Arc<crate::pty::Terminal>> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.get(&pid).and_then(|entry| entry.terminal.clone())
+    }
+    /// The process group and session of process `pid`.
+    pub(crate) fn group_and_session(&self, pid: u32) -> Result<(u32, u32), Errno> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .get(&pid)
+            .map(|entry| (entry.pgid, entry.sid))
+            .ok_or(Errno(3))
+    }
+    /// Sends `number` to every process of group `pgid`: from the kernel,
+    /// or with `sender` (its PID and real user ID) as `kill` sends it.
+    pub(crate) fn signal_group(&self, pgid: u32, number: i32, sender: Option<(u32, u32)>) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let signal = match sender {
+            Some((pid, uid)) => Self::from_process(number, pid, uid),
+            None => Self::from_kernel(number),
+        };
+        Self::signal_members(&mut entries, pgid, signal);
+        self.changed.notify();
+    }
+    fn signal_members(
+        entries: &mut BTreeMap<u32, Entry>,
+        pgid: u32,
+        signal: signals::PendingSignal,
+    ) {
+        let members: Vec<u32> = entries
+            .iter()
+            .filter(|(_, entry)| entry.pgid == pgid)
+            .map(|(&pid, _)| pid)
+            .collect();
+        for member in members {
+            let _ = Self::deliver(entries, member, None, signal);
+        }
+    }
+    /// Whether group `pgid` is orphaned (Linux's `will_become_orphaned_pgrp`
+    /// with no task left out): no live member has a parent in another
+    /// group of its session.
+    pub(crate) fn group_orphaned(&self, pgid: u32) -> bool {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        !entries
+            .values()
+            .filter(|entry| entry.pgid == pgid && entry.status.is_none())
+            .any(|entry| Self::links_group(&entries, entry))
+    }
+    /// The session of process group `id`, or of process `id` when no group
+    /// has that ID (Linux's `session_of_pgrp`); `None` when neither exists.
+    pub(crate) fn session_of_group(&self, id: u32) -> Option<u32> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .values()
+            .find(|entry| entry.pgid == id)
+            .or_else(|| entries.get(&id))
+            .map(|entry| entry.sid)
+    }
+    /// `TIOCSCTTY` from `pid`, as Linux's `tiocsctty`: a session leader
+    /// without a controlling terminal takes `terminal`, with its group in
+    /// the foreground, unless another session has it, which only
+    /// CAP_SYS_ADMIN with `steal` takes away. A descriptor not open for
+    /// reading needs CAP_SYS_ADMIN too.
+    pub(crate) fn set_terminal(
+        &self,
+        pid: u32,
+        terminal: &Arc<crate::pty::Terminal>,
+        steal: bool,
+        readable: bool,
+        admin: bool,
+    ) -> Result<(), Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get(&pid).ok_or(Errno(3))?;
+        let (sid, pgid) = (entry.sid, entry.pgid);
+        let leader = sid == pid;
+        if leader && terminal.session() == Some(sid) {
+            return Ok(());
+        }
+        if !leader || entry.terminal.is_some() {
+            return Err(Errno::EPERM);
+        }
+        if let Some(other) = terminal.session() {
+            if !(steal && admin) {
+                return Err(Errno::EPERM);
+            }
+            Self::clear_session(&mut entries, other);
+        }
+        if !readable && !admin {
+            return Err(Errno::EPERM);
+        }
+        if let Some(entry) = entries.get_mut(&pid) {
+            entry.terminal = Some(Arc::clone(terminal));
+        }
+        terminal.control(sid, pgid);
+        Ok(())
+    }
+    /// An open of `terminal` without `O_NOCTTY` by `pid`, as Linux's
+    /// `tty_open_proc_set_tty`: a session leader without a controlling
+    /// terminal gets it, if no session has it.
+    pub(crate) fn open_terminal(&self, pid: u32, terminal: &Arc<crate::pty::Terminal>) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = entries.get_mut(&pid)
+            && entry.sid == pid
+            && entry.terminal.is_none()
+            && terminal.session().is_none()
+        {
+            entry.terminal = Some(Arc::clone(terminal));
+            terminal.control(entry.sid, entry.pgid);
+        }
+    }
+    /// `TIOCNOTTY` from `pid`, whose controlling terminal `terminal` is: a
+    /// session leader's session loses it, its foreground group told with
+    /// SIGHUP and SIGCONT (Linux's `disassociate_ctty(0)`); any other
+    /// process only lets it go.
+    pub(crate) fn leave_terminal(
+        &self,
+        pid: u32,
+        terminal: &Arc<crate::pty::Terminal>,
+    ) -> Result<(), Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
+        if entry.sid != pid {
+            entry.terminal = None;
+            return Ok(());
+        }
+        Self::disassociate(&mut entries, pid, terminal, true);
+        self.changed.notify();
+        Ok(())
+    }
+    /// Linux's `disassociate_ctty` for session leader `pid`: the terminal's
+    /// foreground group gets SIGHUP from the kernel, and with `cont`, as
+    /// for `TIOCNOTTY`, SIGCONT too, from `pid`; then no process of the
+    /// session has it, and it controls no session.
+    fn disassociate(
+        entries: &mut BTreeMap<u32, Entry>,
+        pid: u32,
+        terminal: &Arc<crate::pty::Terminal>,
+        cont: bool,
+    ) {
+        if let Some(pgrp) = terminal.foreground() {
+            let uid = entries
+                .get(&pid)
+                .map_or(0, |entry| entry.group.task_ids(pid, pid).uid);
+            let sent = |number| {
+                if cont {
+                    Self::from_process(number, pid, uid)
+                } else {
+                    Self::from_kernel(number)
+                }
+            };
+            Self::signal_members(entries, pgrp, sent(SIGHUP));
+            if cont {
+                Self::signal_members(entries, pgrp, sent(SIGCONT));
+            }
+        }
+        Self::clear_session(entries, pid);
+        terminal.release();
+    }
+    /// `session_clear_tty`: no process of session `sid` has a controlling
+    /// terminal.
+    fn clear_session(entries: &mut BTreeMap<u32, Entry>, sid: u32) {
+        for entry in entries.values_mut().filter(|entry| entry.sid == sid) {
+            entry.terminal = None;
+        }
+    }
+    /// A hang-up of `terminal`, whose master closed, as Linux's
+    /// `tty_signal_session_leader`: the processes of the session it
+    /// controls lose it, and the session's leader gets SIGHUP and SIGCONT.
+    pub(crate) fn hang_up_terminal(&self, terminal: &Arc<crate::pty::Terminal>) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(sid) = terminal.session() {
+            for entry in entries.values_mut().filter(|entry| entry.sid == sid) {
+                if entry
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|own| Arc::ptr_eq(own, terminal))
+                {
+                    entry.terminal = None;
+                }
+            }
+            for number in [SIGHUP, SIGCONT] {
+                let _ = Self::deliver(&mut entries, sid, None, Self::from_kernel(number));
+            }
+        }
+        terminal.release();
+        self.changed.notify();
+    }
     fn pgid(&self, pid: u32) -> Result<u32, Errno> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.get(&pid).map(|e| e.pgid).ok_or(Errno(3))
@@ -305,6 +523,7 @@ impl Processes {
         }
         let entry = entries.get_mut(&caller).ok_or(Errno(3))?;
         (entry.sid, entry.pgid) = (caller, caller);
+        entry.terminal = None;
         Ok(caller)
     }
     /// `setpgid` from `caller`, in Linux's order: the target is the caller or
@@ -504,6 +723,38 @@ impl Processes {
             (entry.parent, entry.limits[11].0, entry.no_new_privs)
         })
     }
+    /// The live process that thread `tid` is in.
+    pub(crate) fn thread_leader(&self, tid: u32) -> Option<u32> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .iter()
+            .find(|(_, entry)| entry.status.is_none() && entry.group.has_member(tid))
+            .map(|(&pid, _)| pid)
+    }
+    /// The processes there are, zombies too, in order, as `/proc` lists them.
+    pub(crate) fn pids(&self) -> Vec<u32> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.keys().copied().collect()
+    }
+    /// What `/proc/<pid>` shows of a process other than the reader, or
+    /// `None` when there is no such process.
+    pub(crate) fn view(&self, pid: u32) -> Option<ProcessView> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get(&pid)?;
+        Some(ProcessView {
+            parent: entry.parent,
+            group_id: entry.pgid,
+            session: entry.sid,
+            children_cpu: entry.children_cpu,
+            rss_limit: entry.limits[5].0,
+            queue_limit: entry.limits[11].0,
+            no_new_privs: entry.no_new_privs,
+            dumpable: entry.dumpable,
+            zombie: entry.status.is_some(),
+            exit_signal: entry.exit_signal,
+            group: Arc::clone(&entry.group),
+        })
+    }
     fn parent(&self, pid: u32) -> u32 {
         self.entries
             .lock()
@@ -539,6 +790,16 @@ impl Processes {
         }
         // An exiting process's record locks go with it (locks_remove_posix).
         self.locks.release_process(pid);
+        // A session leader's exit, as Linux's disassociate_ctty(1): the
+        // foreground group of its pseudo-terminal gets SIGHUP, and the
+        // session loses the terminal.
+        if let Some(terminal) = entries
+            .get(&pid)
+            .filter(|entry| entry.sid == pid)
+            .and_then(|entry| entry.terminal.clone())
+        {
+            Self::disassociate(&mut entries, pid, &terminal, false);
+        }
         // The first process is the init of the emulator's PID namespace: when
         // it exits, every other process gets SIGKILL from the kernel, as in
         // Linux's zap_pid_ns_processes.
@@ -1656,7 +1917,7 @@ impl Kernel {
             (flags & 0xff) as i32,
             task,
         );
-        let child = Kernel {
+        let mut child = Kernel {
             host: self.host.clone(),
             process: crate::Process { pid },
             table: crate::SyscallTable::u1(),
@@ -1672,7 +1933,11 @@ impl Kernel {
             vfork_wait: None,
             unimplemented: self.unimplemented.clone(),
             task: None,
+            published: None,
         };
+        // Shown in /proc from the start, before its first system call.
+        let memory = child.spawn_memory.clone();
+        child.publish(pid, &state, memory.as_deref().unwrap_or(mem));
         self.vfork_wait = release;
         self.pending_child = Some((
             Box::new(child),

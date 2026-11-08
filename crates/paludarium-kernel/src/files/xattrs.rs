@@ -37,7 +37,7 @@ enum Target {
 impl Target {
     fn at_path(c: &Context<'_>, ptr: u64, follow: bool) -> Result<Self, Errno> {
         let (path, found) = looked_up(c, (-100i32) as u64, ptr, follow)?;
-        if let Some((stat, ..)) = generated_stat(c, &path, follow) {
+        if let Some((stat, ..)) = generated_stat(c, &path, follow)? {
             return Ok(Self::Generated { stat });
         }
         // A walk leaves out the last name's status when it does not need it.

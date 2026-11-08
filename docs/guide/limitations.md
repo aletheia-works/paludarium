@@ -37,13 +37,22 @@ verified.
   started by, never marked `(deleted)`, where Linux follows a rename and resolves
   symbolic links. `/proc/<pid>/maps` of another process, `smaps` and
   `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
-- **The rest of `/proc`, in part**: only the process's own directory and a few
-  system files are made (see [features](./features)). Another process's
-  `/proc/<pid>` (what `ps` reads), `/proc/self/task` and the other system
-  files are looked up like any path, which with `--mount /:/` finds the
-  host's `/proc`. In `/proc/self/stat`, page faults, resident memory, the
-  start time and the code range are 0, and `meminfo` shows the fixed 4 GiB
-  that `sysinfo` reports, with nothing used.
+- **The rest of `/proc`, in part**: only the process directories and a few
+  system files are made (see [features](./features)). The other system files
+  (`/proc/stat`, `/proc/cpuinfo`, `/proc/sys`, ...) and the other names in
+  the reader's own directory (`auxv`, `limits`, ...) are looked up like any
+  path, which with `--mount /:/` finds the host's `/proc`; in another
+  process's directory they are `ENOENT`, where Linux shows root `fd`, `maps`,
+  `statm` and the rest. In `stat`, page faults, resident memory, the start
+  time and the code range are 0, so `ps` shows no `RSS`, and its `STIME` and
+  `START` come from the host's `/proc/stat` (without it, `ps -f` fails to
+  find the boot time). A thread's `stat` gives its process's CPU time, and
+  another process's state is taken from where its thread is (in a system
+  call or not), not from whether it waits. A thread shows another process
+  what it published at its last system call or signal check, so a mask
+  changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is not
+  seen. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing
+  used.
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has
   no device for it to stand for. A FIFO in a mounted host directory can be
@@ -216,7 +225,7 @@ verified.
   which some (ext4 with delayed allocation, overlayfs) count later than
   `st_blocks`.
 - **Block size**: `st_blksize`, `stx_blksize` and `FIGETBSZ` are 1024 for
-  `/proc` and terminals, as on Linux
+  `/proc` and terminals, pseudo-terminals' slaves included, as on Linux
   ([System calls](./features#system-calls)), and 4096 for every other
   file, where Linux gives a mounted directory its host filesystem's (4096
   for most), whose `statfs` here does report the host's. A host terminal
@@ -236,6 +245,18 @@ verified.
   own `O_NONBLOCK` could stop it short, and the host's other processes
   share that flag. A Windows host cannot tell, so there it is never
   `EAGAIN`.
+- **Pseudo-terminals, in part** ([features](./features#system-calls)):
+  packet mode (`TIOCPKT`), the old `termio` requests (`TCGETA` and its
+  kin), locked `termios` (`TIOCSLCKTRMIOS`), `TIOCVHANGUP`, `TIOCCONS` and
+  `O_ASYNC` on a terminal are not implemented (`ENOTTY`, and `FIOASYNC`
+  too). One side's write reaches the other's line discipline at once,
+  where Linux passes it on from a work queue, so a reader here never
+  finds only part of a write; each side holds up to Linux's default flip
+  buffer of 640 KiB, without Linux's memory accounting behind it.
+  `/proc/self/stat` shows no terminal (`tty_nr` 0, `tpgid` -1) even for a
+  process that has one. The host's own terminal is not one of these: the
+  guest's standard streams on it answer only `TCGETS` and `TIOCGWINSZ`.
+  `script` needs `signalfd`, which is not implemented.
 - **`FIONREAD` and `SIOCOUTQ` on the host's standard streams**: both return
   `ENOTTY`, where Linux answers for what is behind them: `FIONREAD` for a
   pipe, terminal, socket or regular file, `SIOCOUTQ` for a terminal or

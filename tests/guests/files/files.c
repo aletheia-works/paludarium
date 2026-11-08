@@ -17,6 +17,27 @@ static long starts(const char *a,long n,const char *b){long i=0;for(;b[i];i++)if
 /* Whole pages of the program's own data (in the file) and bss (not). */
 static char data_pages[8192] __attribute__((aligned(4096))) = {1, 2, 3};
 static char bss_pages[8192] __attribute__((aligned(4096)));
+#if CASE==56
+/* fcntl(fd, cmd, flock) with the syscall at lock_at, so that a handler can
+   tell from the frame that a signal came during the call. */
+__asm__(".global lock_call\nlock_call: xor %ecx,%ecx\nmov $72,%eax\n.global lock_at\nlock_at: syscall\n"
+        ".global lock_ret\nlock_ret: ret\n.global restorer\nrestorer: mov $15,%rax\nsyscall");
+extern long lock_call(long fd,long cmd,void *fl);
+extern char lock_at[],lock_ret[];
+extern void restorer(void);
+static long hit,hit_rax,hit_at,hit_fd;
+/* ucontext: the registers from byte 40 (rax 13th, rcx 14th, rip 16th).
+   rcx holds lock_ret only once the syscall ran; a signal during the wait
+   leaves rip at lock_at with rax the call's number again (SA_RESTART) or
+   at lock_ret with -EINTR. */
+static void interrupted(int sig,void *info,unsigned char *uc) {
+ (void)sig;(void)info;
+ unsigned long rip=*(unsigned long*)(uc+168),rcx=*(unsigned long*)(uc+152);
+ if(!hit&&rcx==(unsigned long)lock_ret&&(rip==(unsigned long)lock_at||rip==(unsigned long)lock_ret)){
+  hit=1;hit_rax=*(long*)(uc+144);hit_at=rip==(unsigned long)lock_at;S(1,hit_fd,"h",1);
+ }
+}
+#endif
 void _start(void) {
  long fd,x=0;
  if(CASE==0) results[x++]=S(4,0,st,0);
@@ -258,6 +279,63 @@ void _start(void) {
   long dup=S(32,a,0,0);S(3,a,0,0);results[x++]=LK(37,b,1,0,100,1);
   S(3,dup,0,0);results[x++]=LK(37,b,1,0,100,1);
   S(3,ro,0,0);S(3,wo,0,0);S(3,b,0,0);
+  #undef LK
+ }
+ if(CASE==56){ /* F_SETLKW and F_OFD_SETLKW interrupted by a signal: EINTR, or SA_RESTART's restart */
+#if CASE==56
+  static long fl[4];
+  #define LK(cmd,f_,type,whence,start,len) (((short*)fl)[0]=(type),((short*)fl)[1]=(whence),fl[1]=(start),fl[2]=(len),((int*)fl)[6]=0,S(72,f_,cmd,fl))
+  for(long round=0;round<4;round++){
+   long cmd=round&1?38:7,restart=round>>1;
+   int hp[2],rp[2],gp[2];call(293,(long)hp,04000,0,0,0,0);S(22,rp,0,0);S(22,gp,0,0);
+   LK(6,fd,1,0,0,1);
+   /* The handler is set before fork: a signal before the wait only runs it. */
+   hit_fd=hp[1];
+   unsigned long a[4]={(unsigned long)interrupted,4|0x4000000|(restart?0x10000000:0),(unsigned long)restorer,0};
+   call(13,10,(long)a,0,8,0,0);
+   long pid=S(57,0,0,0);
+   if(!pid){
+    long own=cmd==38?S(2,p,2,0):fd;
+    ((short*)fl)[0]=1;((short*)fl)[1]=0;fl[1]=0;fl[2]=1;((int*)fl)[6]=0;
+    long r[6],k=0;
+    r[k++]=lock_call(own,cmd,fl);r[k++]=hit;r[k++]=hit_rax;r[k++]=hit_at;
+    /* F_GETLK finds the parent's lock after EINTR, none after a restart took it. */
+    LK(cmd==38?36:5,own,1,0,0,1);r[k++]=((short*)fl)[0];r[k++]=((int*)fl)[6]==S(110,0,0,0);
+    /* A signal sent late may interrupt this read too. */
+    S(1,rp[1],r,k*8);while(S(0,gp[0],buf,1)==-4);S(60,0,0,0);
+   }
+   /* Signal until the child's handler saw the signal come during the wait. */
+   while(S(0,hp[0],buf,1)!=1){S(62,pid,10,0);S(24,0,0,0);}
+   if(restart)LK(6,fd,2,0,0,1);
+   long got[6];results[x++]=S(0,rp[0],got,6*8);for(int i=0;i<6;i++)results[x++]=got[i];
+   /* A restarted wait took the lock: the parent sees it. */
+   LK(5,fd,1,0,0,1);results[x++]=((short*)fl)[0];results[x++]=((int*)fl)[6]==pid?1:((int*)fl)[6];
+   S(1,gp[1],"g",1);call(61,pid,0,0,0,0,0);LK(6,fd,2,0,0,1);
+   S(3,hp[0],0,0);S(3,hp[1],0,0);S(3,rp[0],0,0);S(3,rp[1],0,0);S(3,gp[0],0,0);S(3,gp[1],0,0);
+  }
+  #undef LK
+#endif
+ }
+ if(CASE==57){ /* EDEADLK: two processes that would wait for each other's record locks */
+  static long fl[4];
+  #define LK(cmd,f_,type,whence,start,len) (((short*)fl)[0]=(type),((short*)fl)[1]=(whence),fl[1]=(start),fl[2]=(len),((int*)fl)[6]=0,S(72,f_,cmd,fl))
+  int rp[2],gp[2];S(22,rp,0,0);S(22,gp,0,0);
+  LK(6,fd,1,0,0,1);
+  long pid=S(57,0,0,0);
+  if(!pid){
+   LK(6,fd,1,0,1,1);S(1,rp[1],"r",1);S(0,gp[0],buf,1);
+   long r=LK(7,fd,1,0,0,1);
+   /* The one that would close the cycle lets go, so the other one goes on. */
+   if(r==-35)LK(6,fd,2,0,1,1);
+   S(1,rp[1],&r,8);S(60,0,0,0);
+  }
+  S(0,rp[0],buf,1);S(1,gp[1],"g",1);
+  /* Whichever of the two asks second gets EDEADLK, in either order. */
+  long mine=LK(7,fd,1,0,1,1);
+  if(mine==-35)LK(6,fd,2,0,0,1);
+  long theirs=0;results[x++]=S(0,rp[0],&theirs,8);call(61,pid,0,0,0,0,0);
+  results[x++]=mine<theirs?mine:theirs;results[x++]=mine<theirs?theirs:mine;
+  S(3,rp[0],0,0);S(3,rp[1],0,0);S(3,gp[0],0,0);S(3,gp[1],0,0);
   #undef LK
  }
  if(CASE==53){ /* extended attributes in user.*, as any owner of the file may use them */

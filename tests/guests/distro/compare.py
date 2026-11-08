@@ -23,8 +23,8 @@ import subprocess
 import sys
 import time
 
-# Even if every case ran out its time, the cases would end in about 154
-# minutes (112 cases on 4 workers, 330 s each), within the workflow's 180 with
+# Even if every case ran out its time, the cases would end in about 160
+# minutes (114 cases on 4 workers, 330 s each), within the workflow's 180 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
 # ended. The slowest cases, Emacs and g++, took up to 180 s under the emulator
@@ -192,18 +192,22 @@ def cases(fx):
         "xxd": ["/usr/bin/xxd", "-l", "32", f"{fx}/words"],
         "less": shell("less -F /etc/os-release | wc -l"),
         "dpkg-query": ["/usr/bin/dpkg-query", "-W", "-f=${Version}\\n", "bash"],
-        # Signals, processes, sockets, locks and /proc. Left out until paludarium has
-        # them: pseudo-terminals (python's pty, script), and the /proc
-        # directories of other processes (ps).
-        # Left out of runtimes() until paludarium handles them: Java and Erlang,
-        # since the CLI runs the first program as /<file name> (Java's $ORIGIN)
-        # and only an ELF one (erl is a script); fish, whose command
-        # substitution fails with EBADF from fcntl; and PostgreSQL, whose data
-        # directory must belong to postgres, which a host mount cannot give it.
+        # Signals, processes, sockets, pseudo-terminals, locks and /proc. Left out until
+        # paludarium has it: script (signalfd).
         "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
         "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],
         "python-processes": ["/usr/bin/python3", f"{SCRIPTS}/processes.py"],
         "python-proc": ["/usr/bin/python3", f"{SCRIPTS}/proc.py"],
+        "python-pty": ["/usr/bin/python3", f"{SCRIPTS}/terminals.py"],
+        # ps and pgrep read the /proc directories of this shell's children, sleep's once it
+        # sleeps. Only the children: the native side shares its /proc with the other cases.
+        "ps": shell(
+            'sleep 30 & s=$!; until [ "$(cat /proc/$s/comm 2>/dev/null)" = sleep ] && '
+            "grep -q 'State:.S' /proc/$s/status; do :; done; "
+            "ps -o user=,stat=,tty=,time=,nlwp=,ni=,comm= --ppid $$ > {O}/p; sort {O}/p; "
+            "ps -o args= -p $s; ps -L -o nlwp=,comm= -p $s; readlink /proc/$s/exe /proc/$s/cwd; "
+            '[ "$(pgrep -x -P $$ sleep)" = "$s" ] && echo pgrep found; kill $s; wait $s; echo $?'
+        ),
         "timeout": shell("timeout 0.2 sleep 5; echo $?; timeout -s KILL 0.2 sleep 5; echo $?"),
         "bash-trap": shell(
             "trap 'echo got USR1' USR1; kill -USR1 $$; echo after; "

@@ -3329,6 +3329,324 @@ static int fifo_cases(void) {
     return 0;
 }
 
+/* The fields of a /proc stat line after the name, which ends at the last
+   ')': fields[0] is the state, the line's third field. Their count, or -1. */
+static int proc_fields(const char *path, char *buffer, size_t size, char **fields, int most) {
+    if (proc_read(path, buffer, size) <= 0) return -1;
+    char *close_paren = strrchr(buffer, ')');
+    if (!close_paren) return -1;
+    int count = 0;
+    for (char *field = strtok(close_paren + 2, " \n"); field && count < most; field = strtok(NULL, " \n"))
+        fields[count++] = field;
+    return count;
+}
+
+/* The value of a status line, such as "State", or "" when it has none; the
+   last eight values stay, for one printf. */
+static const char *proc_status_field(char *status, const char *name) {
+    static char values[8][256];
+    static int next;
+    char *value = values[next++ % 8];
+    size_t length = strlen(name);
+    value[0] = 0;
+    for (char *line = status; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL)
+        if (!strncmp(line, name, length) && line[length] == ':') {
+            char *start = line + length + 1;
+            while (*start == '\t' || *start == ' ') start++;
+            size_t n = strcspn(start, "\n");
+            if (n >= sizeof values[0]) n = sizeof values[0] - 1;
+            memcpy(value, start, n);
+            value[n] = 0;
+            break;
+        }
+    return value;
+}
+
+/* Whether directory `path` lists `name`, or -1 when it does not open. */
+static int proc_lists(const char *path, const char *name) {
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+    int found = 0;
+    for (struct dirent *entry; (entry = readdir(dir));) found |= !strcmp(entry->d_name, name);
+    closedir(dir);
+    return found;
+}
+
+/* The child the case reads: named, with signals blocked, ignored and caught,
+   in /tmp with umask 027, its environment its own, waiting in a read. */
+static int proc_other_child(char **argv) {
+    int ready = atoi(argv[3]), hold = atoi(argv[4]);
+    prctl(PR_SET_NAME, "kid name");
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigaddset(&set, SIGTERM);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    signal(SIGUSR2, SIG_IGN);
+    signal(SIGHUP, interrupted);
+    umask(027);
+    if (chdir("/tmp")) return 2;
+    if (write(ready, "x", 1) != 1) return 3;
+    char byte;
+    while (read(hold, &byte, 1) < 0 && errno == EINTR) {}
+    return 0;
+}
+
+static volatile int proc_worker_ready;
+static int proc_worker_hold[2];
+static void *proc_worker(void *unused) {
+    (void)unused;
+    prctl(PR_SET_NAME, "worker");
+    proc_worker_ready = (int)syscall(SYS_gettid);
+    char byte;
+    while (read(proc_worker_hold[0], &byte, 1) < 0 && errno == EINTR) {}
+    return NULL;
+}
+
+/* Another process's stat, status, cmdline, environ, comm, exe and cwd, its
+   directory and /proc's listing, a zombie's, a stopped one's and a reaped
+   one's, and the task directories of this process's threads. */
+static int proc_other_files_cases(const char *self) {
+    static char buffer[65536];
+    char path[256], *fields[64];
+    int ready[2], hold[2];
+    if (pipe(ready) || pipe(hold)) return 80;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 81;
+    if (!kid) {
+        close(ready[0]);
+        close(hold[1]);
+        char ready_fd[16], hold_fd[16];
+        snprintf(ready_fd, sizeof ready_fd, "%d", ready[1]);
+        snprintf(hold_fd, sizeof hold_fd, "%d", hold[0]);
+        char *arguments[] = {(char *)self, "proc-other-child", (char *)self, ready_fd, hold_fd, "an arg", NULL};
+        char *environment[] = {"A=1", "B=two words", NULL};
+        execve(self, arguments, environment);
+        _exit(90);
+    }
+    close(ready[1]);
+    close(hold[0]);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 82;
+    /* What its cmdline holds: its arguments, each ending in a NUL. */
+    char expected[8192];
+    int expected_length = snprintf(expected, sizeof expected, "%s|proc-other-child|%s|%d|%d|an arg|", self, self,
+                                   ready[1], hold[0]);
+    /* It reads its pipe now, or is about to: wait until it sleeps there. */
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    int count = -1;
+    for (int i = 0; i < 100000; i++) {
+        count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+        if (count > 0 && !strcmp(fields[0], "S")) break;
+        sched_yield();
+    }
+    long n = proc_read(path, buffer, sizeof buffer);
+    char *open_paren = strchr(buffer, '(');
+    char *close_paren = strrchr(buffer, ')');
+    if (n <= 0 || !open_paren || !close_paren) return 83;
+    *close_paren = 0;
+    printf("stat pid=%d comm=%s\n", atol(buffer) == kid, open_paren + 1);
+    count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+    printf("stat fields=%d state=%s\n", count + 2, count > 0 ? fields[0] : "-");
+    if (count >= 50) {
+        printf("stat ppid=%d pgrp=%d session=%d tty=%s tpgid=%s\n", atol(fields[1]) == getpid(),
+               atol(fields[2]) == getpgid(kid), atol(fields[3]) == getsid(kid), fields[4], fields[5]);
+        printf("stat priority=%s nice=%s threads=%s itrealvalue=%s\n", fields[15], fields[16], fields[17], fields[18]);
+        printf("stat signal=%s blocked=%s ignored=%s caught=%s wchan=%s exit_signal=%s\n", fields[28], fields[29],
+               fields[30], fields[31], fields[32], fields[35]);
+        unsigned long arg_start = strtoul(fields[45], NULL, 10), arg_end = strtoul(fields[46], NULL, 10);
+        unsigned long env_start = strtoul(fields[47], NULL, 10), env_end = strtoul(fields[48], NULL, 10);
+        printf("stat arguments-are-cmdline=%d environment=%lu after=%d\n",
+               arg_end - arg_start == (unsigned long)expected_length, env_end - env_start, env_start >= arg_end);
+    }
+    snprintf(path, sizeof path, "/proc/%d/status", (int)kid);
+    proc_read(path, buffer, sizeof buffer);
+    char pid_text[16], own_text[16];
+    snprintf(pid_text, sizeof pid_text, "%d", (int)kid);
+    snprintf(own_text, sizeof own_text, "%d", (int)getpid());
+    printf("status first=%d name=%s umask=%s state=%s\n", !strncmp(buffer, "Name:", 5),
+           proc_status_field(buffer, "Name"), proc_status_field(buffer, "Umask"),
+           proc_status_field(buffer, "State"));
+    /* FDSize is left out: a table the native run inherits may have grown. */
+    printf("status tgid=%d pid=%d ppid=%d threads=%s\n", !strcmp(proc_status_field(buffer, "Tgid"), pid_text),
+           !strcmp(proc_status_field(buffer, "Pid"), pid_text), !strcmp(proc_status_field(buffer, "PPid"), own_text),
+           proc_status_field(buffer, "Threads"));
+    char ids[64];
+    snprintf(ids, sizeof ids, "%u\t%u\t%u\t%u", getuid(), getuid(), getuid(), getuid());
+    printf("status uid=%d sigpnd=%s shdpnd=%s\n", !strcmp(proc_status_field(buffer, "Uid"), ids),
+           proc_status_field(buffer, "SigPnd"), proc_status_field(buffer, "ShdPnd"));
+    printf("status sigblk=%s sigign=%s sigcgt=%s\n", proc_status_field(buffer, "SigBlk"),
+           proc_status_field(buffer, "SigIgn"), proc_status_field(buffer, "SigCgt"));
+
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)kid);
+    n = proc_read(path, buffer, sizeof buffer);
+    for (long i = 0; i < n; i++)
+        if (!buffer[i]) buffer[i] = '|';
+    printf("cmdline is-arguments=%d\n", n == expected_length && !memcmp(buffer, expected, (size_t)n));
+    snprintf(path, sizeof path, "/proc/%d/environ", (int)kid);
+    n = proc_read(path, buffer, sizeof buffer);
+    for (long i = 0; i < n; i++)
+        if (!buffer[i]) buffer[i] = '|';
+    printf("environ=%s length=%ld\n", buffer, n);
+    snprintf(path, sizeof path, "/proc/%d/comm", (int)kid);
+    proc_read(path, buffer, sizeof buffer);
+    printf("comm=%s", buffer);
+
+    /* The kid runs `self`, which the emulated run's own program is only a
+       copy of, so its link names `self` with its links resolved. */
+    char target[4096], own_exe[4096];
+    ssize_t length;
+    if (!realpath(self, own_exe)) own_exe[0] = 0;
+    snprintf(path, sizeof path, "/proc/%d/exe", (int)kid);
+    length = readlink(path, target, sizeof target - 1);
+    target[length > 0 ? length : 0] = 0;
+    struct stat link, through, program;
+    printf("exe same=%d link=%d same-file=%d\n", !strcmp(target, own_exe),
+           lstat(path, &link) == 0 && S_ISLNK(link.st_mode),
+           stat(path, &through) == 0 && stat(own_exe, &program) == 0 && through.st_ino == program.st_ino);
+    errno = 0;
+    int nofollow = open(path, O_RDONLY | O_NOFOLLOW);
+    printf("exe nofollow=%d errno=%d\n", nofollow, errno);
+    snprintf(path, sizeof path, "/proc/%d/cwd", (int)kid);
+    length = readlink(path, target, sizeof target - 1);
+    target[length > 0 ? length : 0] = 0;
+    printf("cwd=%s\n", target);
+    errno = 0;
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    length = readlink(path, target, sizeof target - 1);
+    printf("readlink-of-stat=%ld errno=%d\n", (long)length, errno);
+
+    struct stat directory;
+    snprintf(path, sizeof path, "/proc/%d", (int)kid);
+    int found = stat(path, &directory) == 0;
+    printf("directory stat=%d mode=%o owner=%d\n", found, (unsigned)directory.st_mode & 0177777,
+           directory.st_uid == geteuid());
+    printf("proc lists kid=%d self=%d self-link=%d\n", proc_lists("/proc", pid_text), proc_lists("/proc", own_text),
+           proc_lists("/proc", "self"));
+    const char *names[] = {"cmdline", "comm", "cwd", "environ", "exe", "stat", "status", "task"};
+    int seen = 0;
+    for (int i = 0; i < 8; i++) seen |= (proc_lists(path, names[i]) == 1) << i;
+    printf("kid lists=%x\n", seen);
+    snprintf(path, sizeof path, "/proc/%d/task", (int)kid);
+    printf("kid task lists-kid=%d\n", proc_lists(path, pid_text));
+    snprintf(path, sizeof path, "/proc/%d/task/%d/comm", (int)kid, (int)kid);
+    proc_read(path, buffer, sizeof buffer);
+    printf("kid task comm=%s", buffer);
+    snprintf(path, sizeof path, "/proc/%d/task/%d", (int)kid, (int)getpid());
+    errno = 0;
+    found = stat(path, &directory);
+    printf("kid task of another=%d errno=%d\n", found, errno);
+
+    /* Stopped, then going on. */
+    kill(kid, SIGSTOP);
+    int status;
+    waitpid(kid, &status, WUNTRACED);
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+    printf("stopped state=%s\n", count > 0 ? fields[0] : "-");
+    snprintf(path, sizeof path, "/proc/%d/status", (int)kid);
+    proc_read(path, buffer, sizeof buffer);
+    printf("stopped status=%s\n", proc_status_field(buffer, "State"));
+    kill(kid, SIGCONT);
+    waitpid(kid, &status, WCONTINUED);
+
+    /* Ended and not yet reaped, then reaped. */
+    close(hold[1]);
+    siginfo_t info;
+    waitid(P_PID, (id_t)kid, &info, WEXITED | WNOWAIT);
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+    printf("zombie state=%s threads=%s vsize=%s\n", count > 0 ? fields[0] : "-", count > 17 ? fields[17] : "-",
+           count > 20 ? fields[20] : "-");
+    snprintf(path, sizeof path, "/proc/%d/status", (int)kid);
+    proc_read(path, buffer, sizeof buffer);
+    printf("zombie status=%s name=%s umask=[%s]\n", proc_status_field(buffer, "State"),
+           proc_status_field(buffer, "Name"), proc_status_field(buffer, "Umask"));
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)kid);
+    printf("zombie cmdline=%ld\n", proc_read(path, buffer, sizeof buffer));
+    snprintf(path, sizeof path, "/proc/%d/exe", (int)kid);
+    errno = 0;
+    length = readlink(path, target, sizeof target);
+    printf("zombie exe=%ld errno=%d\n", (long)length, errno);
+    printf("zombie listed=%d\n", proc_lists("/proc", pid_text));
+    waitpid(kid, &status, 0);
+    printf("reaped status=%d\n", status);
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    errno = 0;
+    found = open(path, O_RDONLY);
+    int error = errno;
+    printf("reaped open=%d errno=%d listed=%d\n", found, error, proc_lists("/proc", pid_text));
+    snprintf(path, sizeof path, "/proc/%d", (int)kid);
+    errno = 0;
+    found = stat(path, &directory);
+    printf("reaped stat=%d errno=%d\n", found, errno);
+
+    /* This process's threads under task. */
+    if (pipe(proc_worker_hold)) return 84;
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, proc_worker, NULL)) return 85;
+    while (!proc_worker_ready) sched_yield();
+    int tid = proc_worker_ready;
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+    for (int i = 0; i < 100000; i++) {
+        count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+        if (count > 0 && !strcmp(fields[0], "S")) break;
+        sched_yield();
+    }
+    char tid_text[16];
+    snprintf(tid_text, sizeof tid_text, "%d", tid);
+    printf("task lists self=%d worker=%d\n", proc_lists("/proc/self/task", own_text),
+           proc_lists("/proc/self/task", tid_text));
+    printf("task worker state=%s threads=%s wchan=%s\n", count > 0 ? fields[0] : "-", count > 17 ? fields[17] : "-",
+           count > 32 ? fields[32] : "-");
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", (int)getpid());
+    count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+    printf("task self state=%s\n", count > 0 ? fields[0] : "-");
+    snprintf(path, sizeof path, "/proc/%d/task/%d/comm", (int)getpid(), tid);
+    proc_read(path, buffer, sizeof buffer);
+    printf("task worker comm=%s", buffer);
+    snprintf(path, sizeof path, "/proc/self/task/%d/status", tid);
+    proc_read(path, buffer, sizeof buffer);
+    printf("task worker status name=%s tgid=%d pid=%d threads=%s\n", proc_status_field(buffer, "Name"),
+           !strcmp(proc_status_field(buffer, "Tgid"), own_text), !strcmp(proc_status_field(buffer, "Pid"), tid_text),
+           proc_status_field(buffer, "Threads"));
+    snprintf(path, sizeof path, "/proc/self/task/%d", tid);
+    seen = 0;
+    for (int i = 0; i < 8; i++) seen |= (proc_lists(path, names[i]) == 1) << i;
+    printf("task worker lists=%x\n", seen);
+    /* A thread's own ID names a directory too, which /proc does not list. */
+    snprintf(path, sizeof path, "/proc/%d/status", tid);
+    proc_read(path, buffer, sizeof buffer);
+    printf("thread directory name=%s tgid=%d pid=%d listed=%d\n", proc_status_field(buffer, "Name"),
+           !strcmp(proc_status_field(buffer, "Tgid"), own_text), !strcmp(proc_status_field(buffer, "Pid"), tid_text),
+           proc_lists("/proc", tid_text));
+    /* thread-self is a link to the reading thread's directory under task. */
+    char expected_link[64];
+    snprintf(expected_link, sizeof expected_link, "%d/task/%d", (int)getpid(), (int)getpid());
+    length = readlink("/proc/thread-self", target, sizeof target - 1);
+    target[length > 0 ? length : 0] = 0;
+    struct stat self_link;
+    found = lstat("/proc/thread-self", &self_link) == 0 && S_ISLNK(self_link.st_mode);
+    proc_read("/proc/thread-self/comm", buffer, sizeof buffer);
+    printf("thread-self link=%d is-link=%d listed=%d comm=%s", !strcmp(target, expected_link), found,
+           proc_lists("/proc", "thread-self"), buffer);
+    /* A trailing slash or dot follows the link to the directory. */
+    int slash = lstat("/proc/thread-self/", &self_link) == 0 && S_ISDIR(self_link.st_mode);
+    printf("thread-self slash-is-directory=%d dot-lists-comm=%d\n", slash, proc_lists("/proc/thread-self/.", "comm"));
+    close(proc_worker_hold[1]);
+    pthread_join(worker, NULL);
+    /* Linux wakes the join before the thread is quite gone. */
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+    int ended = 0;
+    for (int i = 0; i < 100000 && (ended = open(path, O_RDONLY)) >= 0; i++) {
+        close(ended);
+        sched_yield();
+    }
+    printf("task ended open=%d errno=%d\n", ended, errno);
+    return 0;
+}
+
 static void lock_show(const char *label, long number, void *at, size_t length, long flags) {
     errno = 0;
     long r = syscall(number, at, length, flags);
@@ -11412,6 +11730,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "robust-list")) return robust_list_cases(self);
     if (!strcmp(mode, "fifo")) return fifo_cases();
     if (!strcmp(mode, "proc-own-files")) return proc_own_files_cases(argc, argv);
+    if (!strcmp(mode, "proc-other-files")) return proc_other_files_cases(self);
+    if (!strcmp(mode, "proc-other-child") && argc >= 5) return proc_other_child(argv);
     if (!strcmp(mode, "late-handler")) return late_handler_cases();
     if (!strcmp(mode, "futex-shared")) return futex_shared_cases();
     if (!strcmp(mode, "robust-list-after-exec")) {

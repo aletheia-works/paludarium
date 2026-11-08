@@ -15,6 +15,9 @@ pub struct SignalInbox {
     listeners: Mutex<Vec<Weak<AtomicBool>>>,
     /// The discards of the thread group this inbox belongs to.
     discards: Mutex<Option<Arc<signals::Discards>>>,
+    /// Whether the thread is in a system call, where it waits if it waits,
+    /// which `/proc` shows other processes as sleeping.
+    in_call: AtomicBool,
 }
 #[derive(Default)]
 pub(crate) struct WakeReceipt {
@@ -23,6 +26,12 @@ pub(crate) struct WakeReceipt {
     pub interrupted: bool,
 }
 impl SignalInbox {
+    pub(crate) fn set_in_call(&self, in_call: bool) {
+        self.in_call.store(in_call, Ordering::Relaxed);
+    }
+    pub(crate) fn in_call(&self) -> bool {
+        self.in_call.load(Ordering::Relaxed)
+    }
     /// Queues a signal for the single guest process from outside the
     /// emulator. The guest cannot see the sender, so `si_pid` is 0, as a PID
     /// namespace reports a sender outside it.

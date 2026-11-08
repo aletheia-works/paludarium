@@ -739,7 +739,8 @@ void _start(void) {
   results[x++]=S(5,op,st,0);results[x++]=S(138,op,buf,0);results[x++]=S(81,dp,0,0);
   pf[0]=op;pf[1]=1;results[x++]=S(7,pf,1,0);results[x++]=((short*)pf)[3];
   {static unsigned long set[16];set[op/64]=1UL<<(op%64);static long tv[2];results[x++]=call(23,op+1,(long)set,0,0,(long)tv,0);}
-  long ep=S(291,0,0,0);xv[0]=1;results[x++]=call(233,ep,1,op,(long)xv,0,0);S(3,ep,0,0);
+  long ep=S(291,0,0,0);xv[0]=1;results[x++]=call(233,ep,1,op,(long)xv,0,0);
+  results[x++]=call(233,op,1,ep,(long)xv,0,0);results[x++]=call(232,op,(long)xv,1,0,0,0);S(3,ep,0,0);
   long d=S(32,op,0,0);results[x++]=d>=0;results[x++]=S(3,d,0,0);
   S(3,op,0,0);S(3,dp,0,0);}
  if(CASE==42){ /* close_range(first, last, flags): 4..7 are copies of fd 3 */

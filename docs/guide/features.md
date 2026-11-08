@@ -213,7 +213,8 @@ kernel.
 - An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
   reading and writing it, `lseek`, `flock`, `getdents64`, `sendfile`,
   `copy_file_range`, `fsync`, `fdatasync`, `fadvise64`, `ftruncate`,
-  `fallocate`, `mmap`, `ioctl`, the `f*xattr` calls, `epoll_ctl` and `fcntl`
+  `fallocate`, `mmap`, `ioctl`, the `f*xattr` calls, `epoll_ctl` (as the
+  epoll descriptor or the target), `epoll_wait` and `fcntl`
   (but for `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_DUPFD_QUERY`, `F_GETFD`,
   `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
   `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`

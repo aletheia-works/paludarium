@@ -252,7 +252,11 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 )
                 .map(u64::from);
         }
+        // The epoll descriptor too, as `fdget` takes it (EBADF for `O_PATH`).
         let d = c.files.descriptor(a[0])?;
+        if d.file.flags() & O_PATH != 0 {
+            return Err(Errno::EBADF);
+        }
         let epoll = d
             .file
             .as_any()

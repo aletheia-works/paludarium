@@ -1438,18 +1438,22 @@ mod files_tests {
         x.fs().symlink(b"a", b"l").unwrap();
         x.fs().set_owner(b"l", false, Some(7), Some(8)).unwrap();
         assert_eq!((ids(b"l"), ids(b"a")), ((7, 8), (1000, 50)));
-        // A file made in a set-group-ID directory takes its group, and one
-        // made again under a name starts as root's.
+        // A file made again under a name starts as root's.
         x.fs().mkdir(b"d", 0o755).unwrap();
-        x.fs().set_owner(b"d", true, None, Some(60)).unwrap();
-        x.fs().set_mode(b"d", 0o2775).unwrap();
         x.fs().open(b"d/f", 66, 0o600).unwrap();
-        x.fs().mkdir(b"d/e", 0o755).unwrap();
-        assert_eq!((ids(b"d/f"), ids(b"d/e")), ((0, 60), (0, 60)));
-        x.fs().set_owner(b"d/f", true, Some(3), None).unwrap();
+        x.fs().set_owner(b"d/f", true, Some(3), Some(4)).unwrap();
         x.fs().unlink(b"d/f", false).unwrap();
         x.fs().open(b"d/f", 66, 0o600).unwrap();
-        assert_eq!(ids(b"d/f"), (0, 60));
+        assert_eq!(ids(b"d/f"), (0, 0));
+        // A file made in a set-group-ID directory takes its group. Windows
+        // keeps no set-group-ID bit.
+        if cfg!(unix) {
+            x.fs().set_owner(b"d", true, None, Some(60)).unwrap();
+            x.fs().set_mode(b"d", 0o2775).unwrap();
+            x.fs().open(b"d/g", 66, 0o600).unwrap();
+            x.fs().mkdir(b"d/e", 0o755).unwrap();
+            assert_eq!((ids(b"d/g"), ids(b"d/e")), ((0, 60), (0, 60)));
+        }
         drop(file);
     }
     #[test]

@@ -1221,7 +1221,7 @@ fn open_slave(
         }
         state.slaves += 1;
         state.other_closed = false;
-        // What the master wrote before reaches the line discipline now.
+        // Input waiting for room, if any, goes on.
         let mut signals = Vec::new();
         state.receive(&mut signals);
         (state.hangups, signals)
@@ -1411,11 +1411,7 @@ impl Master {
                 bytes.len().min(FLIP.saturating_sub(state.pending.len()))
             };
             state.pending.extend(&bytes[..count]);
-            // The line discipline takes input only while the slave is
-            // open: what comes before waits, and is echoed at its open.
-            if state.slaves > 0 {
-                state.receive(&mut signals);
-            }
+            state.receive(&mut signals);
             count
         };
         if count > 0 {

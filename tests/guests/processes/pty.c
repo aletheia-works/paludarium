@@ -173,11 +173,9 @@ static int case_open(void) {
     say("locked %d", locked);
     TRY("open locked", open(name, O_RDWR | O_NOCTTY));
     TRY("TIOCGPTPEER locked", ioctl(m, TIOCGPTPEER, O_RDWR | O_NOCTTY));
+    /* The slave's line discipline takes it, echoing it at some time Linux's
+       work queue decides: only the slave's read below shows it. */
     TRY("write without a slave", write(m, "x", 1));
-    say("poll without a slave %#x", polled(m, POLLIN | POLLOUT));
-    fcntl(m, F_SETFL, O_NONBLOCK);
-    TRY("read nothing", read(m, buffer, 1));
-    fcntl(m, F_SETFL, 0);
     say("grantpt %d unlockpt %d", grantpt(m), unlockpt(m));
     TRY("TIOCGPTLCK", ioctl(m, TIOCGPTLCK, &locked));
     say("locked %d", locked);

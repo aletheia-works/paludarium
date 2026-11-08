@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 with open("/proc/self/status") as status:
     fields = dict(line.split(":", 1) for line in status if ":" in line)
@@ -16,6 +17,12 @@ with open("/proc/self/status") as status:
 print("tasks", len(os.listdir("/proc/self/task")))
 event.set()
 thread.join()
+# join() returns once the thread has signalled that it is done, before the kernel
+# has removed the task, on Linux too. Wait, within a bound, until it is gone, so
+# that the count read from /proc/self/stat below does not race.
+deadline = time.monotonic() + 30
+while len(os.listdir("/proc/self/task")) > 1 and time.monotonic() < deadline:
+    time.sleep(0.01)
 print("cwd", os.readlink("/proc/self/cwd"))
 fd = os.open("/etc/os-release", os.O_RDONLY)
 print("fd link", os.readlink(f"/proc/self/fd/{fd}"))

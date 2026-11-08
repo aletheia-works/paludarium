@@ -27,6 +27,7 @@ mod loopback;
 pub use inet::{InvalidRule, NetworkPolicy};
 mod futex;
 mod memfd;
+mod mempolicy;
 mod page_cache;
 mod proc;
 mod processes;

@@ -47,7 +47,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_getscheduler`／`sched_getparam`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_get`、`personality`、`unshare`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`msync`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -526,6 +526,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく `CAP_SYS_ADMIN` がなければ `EPERM`、あれば `EINVAL` です。後者は、その名前空間
   なしでビルドしたカーネルと同じで、ここでの `clone` とも同じです。Linux ではユーザーも
   使える `CLONE_NEWUSER` も `EINVAL` です。[制限](./limitations.md)を見てください。
+- マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
+  Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
+  確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、
+  Linux の 1024 ノードを超えるビットも `EINVAL` です。`get_mempolicy` は、スレッドの
+  ポリシー、範囲のポリシー（`MPOL_F_ADDR`）、使えるノード（`MPOL_F_MEMS_ALLOWED`）、
+  ページや次にインターリーブするノードとしてのノード 0（`MPOL_F_NODE`）を返します。
+  新しいスレッドやプロセスは作ったスレッドのポリシーを継ぎ、`execve` の後も残ります。
+  プロセスの範囲のポリシーは `fork` と `mremap` の後も残り、ページの割り当てを外すか
+  新しく割り当てるまで続きます。メモリはすべてノード 0 にあるので、どのポリシーでも
+  ページは動きません。
 - `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、
   ホストのことは見せません。ゲストは root（ユーザーとグループが 0 で、すべての
   ケーパビリティを持つ）として始まります。Linux と同じく、資格情報はスレッドごとに

@@ -678,6 +678,18 @@ fn syscall_huge_bad_read_buffer() {
     assert_eq!(f.ret(0, &[0, 1, u64::MAX]), errno(Errno::EFAULT));
 }
 #[test]
+fn openat2_tail_in_the_last_page_is_efault() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
+    // A `struct open_how` whose later-version tail ends at the top of the
+    // address space: the zero check reads it (EFAULT), without overflowing.
+    let how = u64::MAX - 64;
+    assert_eq!(
+        f.ret(437, &[(-100i64) as u64, DATA, how, 64]),
+        errno(Errno::EFAULT)
+    );
+}
+#[test]
 fn syscall_huge_bad_write_buffer() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();

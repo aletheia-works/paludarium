@@ -3621,7 +3621,8 @@ fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let mut at = a[2].checked_add(OPEN_HOW_SIZE_VER0).ok_or(Errno::EFAULT)?;
     let end = a[2].checked_add(size).ok_or(Errno::EFAULT)?;
     while at < end {
-        let next = end.min((at | (PAGE_SIZE - 1)) + 1);
+        // The page's end, which in the last page is past `u64::MAX`.
+        let next = end.min((at | (PAGE_SIZE - 1)).saturating_add(1));
         let mut tail = vec![0; (next - at) as usize];
         c.mem
             .read(GuestAddr(at), &mut tail)

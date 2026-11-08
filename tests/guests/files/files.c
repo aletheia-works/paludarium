@@ -639,16 +639,16 @@ void _start(void) {
   S(3,d,0,0);S(3,t,0,0);S(3,o,0,0);}
  if(CASE==63){ /* renameat2: RENAME_NOREPLACE (1), RENAME_EXCHANGE (2), and the flags Linux refuses */
   #define R2(a,b,f) call(316,-100,(long)(a),-100,(long)(b),f,0)
-  #define SIZE(n) (S(4,n,st,0)<0?-1:*(long*)(st+48))
+  #define RSIZE(n) (S(4,n,st,0)<0?-1:*(long*)(st+48))
   #define ISDIR(n) (S(6,n,st,0)<0?-1:(*(unsigned*)(st+24)&0170000)==040000)
   #define LINKS(n) (S(4,n,st,0)<0?-1:*(long*)(st+16))
   static char d[]="/tmp/paludarium-files-dir",sub[]="/tmp/paludarium-files-dir/sub";
   S(1,fd,"abc",3);long o=S(2,q,66,0600);S(1,o,"quux!",5);S(3,o,0,0);
   results[x++]=R2(p,q,8);results[x++]=R2(p,q,3);results[x++]=R2(p,q,6);results[x++]=R2(p,q,5);
   results[x++]=R2(p,q,1);results[x++]=R2(p,p,1);results[x++]=R2("/tmp/paludarium-files-missing",q,1);
-  results[x++]=R2(p,r,2);results[x++]=R2(p,r,1);results[x++]=SIZE(p);results[x++]=SIZE(r);results[x++]=R2(r,p,0);
+  results[x++]=R2(p,r,2);results[x++]=R2(p,r,1);results[x++]=RSIZE(p);results[x++]=RSIZE(r);results[x++]=R2(r,p,0);
   /* An exchange swaps the files; the descriptor's name follows its file. */
-  results[x++]=R2(p,q,2);results[x++]=SIZE(p);results[x++]=SIZE(q);
+  results[x++]=R2(p,q,2);results[x++]=RSIZE(p);results[x++]=RSIZE(q);
   long n=S(89,fdpath(fd),buf,4096);results[x++]=same(buf,n,q);results[x++]=R2(p,p,2);
   /* A directory and a file, in one directory and between two. */
   S(83,d,0755,0);S(83,sub,0755,0);

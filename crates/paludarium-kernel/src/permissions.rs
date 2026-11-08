@@ -341,9 +341,11 @@ pub(crate) fn rename(
     }
     // renameat2's: a name RENAME_NOREPLACE would replace, and one
     // RENAME_EXCHANGE would swap with nothing, before any permission.
-    match (flags, &to.file) {
-        (1, Some(_)) => return Err(Errno::EEXIST),
-        (2, None) => return Err(Errno::ENOENT),
+    // By the bit, as Linux tests it: RENAME_NOREPLACE with
+    // RENAME_WHITEOUT refuses a name that is there too.
+    match &to.file {
+        Some(_) if flags & 1 != 0 => return Err(Errno::EEXIST),
+        None if flags & 2 != 0 => return Err(Errno::ENOENT),
         _ => {}
     }
     if to.file.is_some_and(|target| target.inode == source.inode) {

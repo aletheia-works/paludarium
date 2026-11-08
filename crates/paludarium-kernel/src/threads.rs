@@ -40,7 +40,7 @@ pub struct ThreadGroup {
     discards: Arc<signals::Discards>,
     /// The signals the threads' drains made pending, for the signal files
     /// of the other threads ([`SignalInbox::others_arrivals`]).
-    arrivals: Arc<std::sync::atomic::AtomicU64>,
+    arrivals: Arc<AtomicU64>,
     timer_generation: AtomicU64,
     /// The RLIMIT_NOFILE soft limit, which bounds the descriptor numbers this
     /// process allocates, and the RLIMIT_FSIZE one, which bounds the files it
@@ -1015,6 +1015,8 @@ impl Kernel {
             .set_task_ids(tid, parent.state.credentials.task_ids());
         state.timer = signals::RealTimer::default();
         state.pending.clear();
+        // Nothing has come for the new thread yet, which its group counts.
+        state.arrivals = 0;
         state.frames.clear();
         state.alt_stack = AltStack::default();
         state.exit_status = None;

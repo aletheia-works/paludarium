@@ -15,11 +15,13 @@ pub struct SignalInbox {
     listeners: Mutex<Vec<Weak<AtomicBool>>>,
     /// The discards of the thread group this inbox belongs to.
     discards: Mutex<Option<Arc<signals::Discards>>>,
-    /// The thread group's count of the signals its threads' drains made
-    /// pending ([`ThreadState::arrivals`]), which this inbox's drains add to,
-    /// and how much of it they added.
+    /// The thread group's count of the signals its threads made pending
+    /// ([`ThreadState::arrivals`]), which this inbox's thread adds its own
+    /// to ([`Self::publish`]); the thread's count when it last did, and how
+    /// much it has added in all.
     arrivals: Mutex<Option<Arc<AtomicU64>>>,
-    drained: AtomicU64,
+    published: AtomicU64,
+    contributed: AtomicU64,
     /// Whether the thread is in a system call, where it waits if it waits,
     /// which `/proc` shows other processes as sleeping.
     in_call: AtomicBool,
@@ -160,8 +162,23 @@ impl SignalInbox {
         *self.discards.lock().unwrap_or_else(PoisonError::into_inner) = Some(discards);
         *self.arrivals.lock().unwrap_or_else(PoisonError::into_inner) = Some(arrivals);
     }
-    /// The arrivals the drains of the group's other threads made: the
-    /// group's count less what this inbox's drains added.
+    /// Adds the signals this inbox's thread made pending since it last did
+    /// to the group's count, whether a drain took them in or the kernel
+    /// queued them for the thread itself.
+    pub(crate) fn publish(&self, process: &ThreadState) {
+        let added = process
+            .arrivals
+            .wrapping_sub(self.published.swap(process.arrivals, Ordering::SeqCst));
+        if added == 0 {
+            return;
+        }
+        self.contributed.fetch_add(added, Ordering::SeqCst);
+        if let Some(count) = &*self.arrivals.lock().unwrap_or_else(PoisonError::into_inner) {
+            count.fetch_add(added, Ordering::SeqCst);
+        }
+    }
+    /// The arrivals the group's other threads made: the group's count less
+    /// what this inbox's thread added.
     pub(crate) fn others_arrivals(&self) -> u64 {
         let total = self
             .arrivals
@@ -169,7 +186,7 @@ impl SignalInbox {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map_or(0, |count| count.load(Ordering::SeqCst));
-        total.wrapping_sub(self.drained.load(Ordering::SeqCst))
+        total.wrapping_sub(self.contributed.load(Ordering::SeqCst))
     }
     /// The signals queued here, as a signal set, and how many of them a
     /// drain into `process` will count as arrivals ([`signals::queue`] keeps
@@ -218,7 +235,6 @@ impl SignalInbox {
             timer_changed: self.timer_wake.swap(false, Ordering::SeqCst),
             interrupted: self.control_wake.swap(false, Ordering::SeqCst),
         };
-        let before = process.arrivals;
         queue.retain(|signal| {
             if signal.target == signals::PendingTarget::Thread {
                 signals::queue(process, *signal);
@@ -227,13 +243,7 @@ impl SignalInbox {
                 true
             }
         });
-        let added = process.arrivals.wrapping_sub(before);
-        if added != 0 {
-            self.drained.fetch_add(added, Ordering::SeqCst);
-            if let Some(count) = &*self.arrivals.lock().unwrap_or_else(PoisonError::into_inner) {
-                count.fetch_add(added, Ordering::SeqCst);
-            }
-        }
+        self.publish(process);
         // Sender stores while holding this same mutex, preventing a lost wake.
         // A process signal still queued keeps it until it is dispatched.
         self.wake.store(!queue.is_empty(), Ordering::SeqCst);
@@ -283,6 +293,11 @@ mod signals_time_tests {
         one.send_thread(10, 0).unwrap();
         one.drain(&mut state);
         assert_eq!(two.others_arrivals(), 2);
+        // What the kernel queues for the thread itself counts once published.
+        signals::queue(&mut state, signals::PendingSignal::thread(41, 0));
+        one.publish(&state);
+        assert_eq!(two.others_arrivals(), 3);
+        assert_eq!(one.others_arrivals(), 0);
     }
 
     #[test]

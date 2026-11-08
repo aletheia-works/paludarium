@@ -3686,6 +3686,14 @@ int main(int argc, char **argv) {
         errno = 0;
         result("set-missing", syscall(SYS_sched_setaffinity, 0x3fffffff, sizeof one, one));
         result("errno", errno);
+        /* The mask is read before the thread is looked for, and that before
+           an empty mask is refused. */
+        errno = 0;
+        result("set-missing-fault", syscall(SYS_sched_setaffinity, 0x3fffffff, sizeof one, (void *)1));
+        result("errno", errno);
+        errno = 0;
+        result("set-missing-none", syscall(SYS_sched_setaffinity, 0x3fffffff, sizeof none, none));
+        result("errno", errno);
         pthread_t thread;
         static unsigned long seen[16];
         pthread_create(&thread, NULL, affinity_of_thread, seen);

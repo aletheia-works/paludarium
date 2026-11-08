@@ -2339,10 +2339,6 @@ fn sys_sched_getaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// processes; the host still runs the thread on any of its CPUs.
 fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (pid, len) = (a[0] as u32 as i32, a[1] as usize);
-    let (tid, other) = match affinity_target(c, pid) {
-        Ok(target) => target,
-        Err(e) => return err(e),
-    };
     let cpus = active_cpus(c);
     let words = cpus.div_ceil(64);
     let mut bytes = vec![0u8; words * 8];
@@ -2362,6 +2358,12 @@ fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     {
         *last &= (1u64 << (cpus % 64)) - 1;
     }
+    // The mask is read first (EFAULT), then the thread found (ESRCH), and
+    // only then is an empty mask refused (EINVAL), as in Linux.
+    let (tid, other) = match affinity_target(c, pid) {
+        Ok(target) => target,
+        Err(e) => return err(e),
+    };
     if mask.iter().all(|&word| word == 0) {
         return err(Errno::EINVAL);
     }

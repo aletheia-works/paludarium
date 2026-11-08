@@ -595,7 +595,8 @@ kernel.
   names it and may give it one argument, its arguments are that name, that
   argument and the script's path in place of `argv[0]`, and the interpreter's
   set-ID bits count, not the script's. An interpreter may be a script too, up
-  to 5 levels below the first script (`ELOOP` past that). As on Linux, `chown`
+  to 5 levels below the first script (`ELOOP` past that). The first program
+  may be a script too, which runs the same way. As on Linux, `chown`
   takes the set-user-ID bit from a file that is not a directory, and the set-group-ID
   bit when the group may execute it or the caller is neither in its group
   nor holds `CAP_FSETID`, even when the owner and group stay. A write or a
@@ -708,7 +709,8 @@ kernel.
   newline.
 - `/proc/self/exe` and `/proc/self/cwd` are symbolic links (0777, size 0) to
   the program the process runs (the one `execve` loaded, with symbolic links
-  resolved; for the first program, the path the CLI gives it, `/<file name>`)
+  resolved; for the first program, the path the CLI gives it: its path in a
+  `--mount`, else `/<file name>`)
   and to the current directory. `stat` and `open` follow them, and
   `O_NOFOLLOW` does not (`ELOOP`).
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,

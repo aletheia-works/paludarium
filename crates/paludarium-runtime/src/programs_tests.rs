@@ -123,3 +123,74 @@ fn duplicate_normalized_override_rejected() {
         ErrorKind::InvalidProgram
     );
 }
+
+/// Writes `length` bytes from `argv[1]` on, then where `/proc/self/exe` leads.
+fn interpreter(length: u8) -> Vec<u8> {
+    #[rustfmt::skip]
+    let code = [
+        0x48, 0x8b, 0x74, 0x24, 0x10, // mov rsi, [rsp + 16]
+        0xb8, 1, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0xba, length, 0, 0, 0, 0x0f, 0x05, // write
+        0xb8, 89, 0, 0, 0, 0xbf, 0x00, 0x20, 0x40, 0x00, // readlink(data,
+        0xbe, 0x20, 0x20, 0x40, 0x00, 0xba, 64, 0, 0, 0, 0x0f, 0x05, // data + 32, 64)
+        0x89, 0xc2, 0xb8, 1, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0x0f, 0x05, // write
+        0xb8, 231, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05, // exit_group(0)
+    ];
+    let mut data = b"/proc/self/exe".to_vec();
+    data.resize(32 + 64, 0);
+    paludarium_loader::testing::tiny_exec(&code, &data)
+}
+
+fn run_script(config: Config) -> Result<Vec<u8>, Error> {
+    let host = Arc::new(RecordingHost::new());
+    let session = Session::new(config, host.clone())?;
+    assert_eq!(session.run()?, ExitStatus::Exited(0));
+    Ok(host.stdout())
+}
+
+#[test]
+fn first_program_script_runs_its_interpreter() {
+    let config = Config::new("/script", vec![b"script".to_vec(), b"extra".to_vec()])
+        .with_file("/bin/interp", interpreter(16))
+        .with_file("/script", b"#!/bin/interp -x\nignored\n".to_vec());
+    assert_eq!(
+        run_script(config).unwrap(),
+        b"-x\0/script\0extra/bin/interp"
+    );
+}
+
+#[test]
+fn first_program_script_of_a_script() {
+    // The inner script's path takes the place of the outer one's name.
+    let config = Config::new("/outer", vec![b"outer".to_vec()])
+        .with_file("/bin/interp", interpreter(21))
+        .with_file("/bin/inner", b"#!/bin/interp\n".to_vec())
+        .with_file("/outer", b"#! /bin/inner  a b \n".to_vec());
+    assert_eq!(
+        run_script(config).unwrap(),
+        b"/bin/inner\0a b\0/outer/bin/interp"
+    );
+}
+
+#[test]
+fn first_program_script_errors() {
+    let error = |script: &[u8]| {
+        let config = Config::new("/script", vec![b"script".to_vec()])
+            .with_file("/bin/interp", interpreter(0))
+            .with_file("/script", script.to_vec());
+        run_script(config).unwrap_err().message
+    };
+    assert_eq!(
+        error(b"#!/missing\n"),
+        "the script's interpreter was not found"
+    );
+    assert_eq!(error(b"#!\n"), "invalid #! line");
+    assert_eq!(
+        error(b"#!/tmp\n"),
+        "the script's interpreter may not be run"
+    );
+    assert_eq!(
+        error(b"#!/script\n"),
+        "too many levels of script interpreters"
+    );
+    assert_eq!(error(b"not a script\n"), "not an ELF file");
+}

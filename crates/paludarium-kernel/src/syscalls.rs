@@ -98,6 +98,9 @@ pub mod nr {
 }
 
 pub(crate) struct Context<'a> {
+    /// The system call's number, from the low 32 bits of `rax`: handlers
+    /// that serve several numbers read it here, never from the register.
+    pub number: u64,
     pub files: &'a mut crate::files::Files,
     pub host: &'a dyn Host,
     /// The same host, for files that keep it (a timerfd reads its clock).

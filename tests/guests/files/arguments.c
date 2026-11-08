@@ -4,6 +4,7 @@
    for unsigned long arguments it reads whole (mprotect's prot). readv's vlen
    is unsigned long too, but import_iovec takes it as an unsigned. Only whether they match is printed: the results themselves are the
    other guests' business. */
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 static long sc(long n,long a,long b,long c,long d,long e,long f){
@@ -24,12 +25,27 @@ static void out(const char*n,long c,long d){if(c==d)printf("%s: same\n",n);else 
 static char F[]="/tmp/paludarium-arguments-file",G[]="/tmp/paludarium-arguments-dir",H[]="/tmp/paludarium-arguments-h",L[]="/tmp/paludarium-arguments-l";
 static char buf[4096];static unsigned char st[256];
 static int fd;
+/* A SA_RESTART handler that fills the pipe a blocked read waits on. */
+static int sp[2];
+static void tick(int s){(void)s;S3(1,sp[1],"x",1);}
+static void arm(void){long it[4]={0,0,0,20000};S3(38,0,it,0);}
 int main(void){
  S1(87,F);S1(87,H);S1(87,L);S1(84,G);
  fd=S3(2,F,66,0644);S3(1,fd,"hello world",11);
  S2(83,G,0755);
  P("syscall number",{r=sc(dirty?W(39):39,0,0,0,0,0,0)==S0(39);});
+ /* Numbers that one handler serves among others: files, epoll, sockets. */
+ P("number of lseek",{r=sc(dirty?W(8):8,fd,0,1,0,0,0);});
+ P("number of epoll_create1",{long e=sc(dirty?W(291):291,0,0,0,0,0,0);r=e>=0;S1(3,e);});
+ P("number of socket",{long k=sc(dirty?W(41):41,1,1,0,0,0,0);r=k>=0;S1(3,k);});
  P("negative syscall number",{r=sc(dirty?0x12345678ffffffffL:-1L,0,0,0,0,0,0);});
+ /* A dirty rax with a restart: poll is ERESTARTNOHAND, so a handler makes it
+    EINTR even with SA_RESTART; read is ERESTARTSYS and runs again. */
+ {struct sigaction a;memset(&a,0,sizeof a);a.sa_handler=tick;a.sa_flags=SA_RESTART;sigaction(SIGALRM,&a,0);}
+ S2(293,sp,0);
+ P("poll restart",{int pf[2]={sp[0],1};arm();r=sc(dirty?W(7):7,(long)pf,1,-1,0,0,0);char c;S3(0,sp[0],&c,1);});
+ P("read restart",{char c;arm();r=sc(dirty?W(0):0,sp[0],(long)&c,1,0,0,0);});
+ S1(3,sp[0]);S1(3,sp[1]);signal(SIGALRM,SIG_DFL);
  /* files */
  P("open flags,mode",{long f=S3(2,F,D(0),D(0));r=f>=0;S1(3,f);});
  P("openat dfd,flags",{long f=S4(257,D(-100),F,D(0),D(0));r=f>=0;S1(3,f);});

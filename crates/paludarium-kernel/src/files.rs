@@ -1686,7 +1686,7 @@ mod mtime_tests {
     }
 }
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let n = c.cpu.gpr[paludarium_cpu::reg::RAX];
+    let n = c.number;
     match run(c, n, a) {
         Ok(v) => Outcome::Return(v),
         Err(e) => Outcome::Return(e.to_syscall_return()),

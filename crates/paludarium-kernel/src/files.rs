@@ -2183,6 +2183,15 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 flags,
                 || device(c, &old) == device(c, &new),
             )?;
+            // A filesystem here refuses RENAME_WHITEOUT (EINVAL), but Linux
+            // first refuses a name RENAME_NOREPLACE would replace, also for
+            // root, whose lookups permissions::rename skips.
+            if flags & 5 == 5
+                && c.files.fs.metadata(&old, false).is_ok()
+                && c.files.fs.metadata(&new, false).is_ok()
+            {
+                return Err(Errno::EEXIST);
+            }
             c.files.fs.rename_with(&old, &new, flags)?;
             // The paths of descriptors and the working directory under a
             // name that moved; an exchange moves both names.

@@ -125,9 +125,9 @@ mod linux {
             // The credentials, permissions, setuid, signal-permissions,
             // limit-permissions, peer-credentials, core-credentials,
             // set-id-writes, socket-owners, capabilities and script-exec cases
-            // change IDs as root, and pty-vhangup needs root's capabilities, so
-            // Linux runs them as root, through sudo when the tests do not run as
-            // root.
+            // change IDs as root, pty-vhangup needs root's capabilities and
+            // pid-namespace makes a PID namespace, so Linux runs them as root,
+            // through sudo when the tests do not run as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -144,6 +144,7 @@ mod linux {
                     | "proc-maps"
                     | "dynamic-exec"
                     | "pty-vhangup"
+                    | "pid-namespace"
             );
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
@@ -254,6 +255,7 @@ mod linux {
         processes_fsize_limit => ("fsize-limit","process"),
         processes_pgid => ("pgid","process"),
         processes_session => ("session","process"),
+        processes_pid_namespace => ("pid-namespace","process"),
         pty_open => ("pty-open","pty"),
         pty_termios => ("pty-termios","pty"),
         pty_canonical => ("pty-canonical","pty"),

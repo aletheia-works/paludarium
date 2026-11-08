@@ -1390,17 +1390,29 @@ fn resource_limits_are_recorded_in_linux_order() {
     assert_eq!(f.mem.read_u64(GuestAddr(old + 8)).unwrap(), u64::MAX);
 }
 #[test]
-fn process_groups_start_at_the_first_process() {
+fn process_groups_start_outside_the_emulator() {
     let mut f = fixture();
-    assert_eq!(f.ret(111, &[]), 1); // getpgrp
-    assert_eq!(f.ret(121, &[0]), 1); // getpgid
+    // The first process's group is outside, shown as 0 as Linux shows an ID
+    // outside a PID namespace, so the process may start a session.
+    assert_eq!(f.ret(111, &[]), 0); // getpgrp
+    assert_eq!(f.ret(121, &[0]), 0); // getpgid
+    assert_eq!(f.ret(121, &[1]), 0);
     assert_eq!(f.ret(109, &[0, 0]), 0); // setpgid
+    assert_eq!(f.ret(111, &[]), 1);
     assert_eq!(f.ret(109, &[1, 1]), 0);
     assert_eq!(f.ret(109, &[0, 77]), errno(Errno::EPERM));
     assert_eq!(f.ret(109, &[0, u64::MAX]), errno(Errno::EINVAL));
     assert_eq!(f.ret(109, &[99, 0]), errno(Errno(3)));
     assert_eq!(f.ret(121, &[99]), errno(Errno(3)));
     assert_eq!(f.ret(121, &[u64::MAX]), errno(Errno(3)));
+}
+#[test]
+fn the_first_process_may_start_a_session() {
+    let mut f = fixture();
+    assert_eq!(f.ret(124, &[0]), 0); // getsid
+    assert_eq!(f.ret(112, &[]), 1); // setsid
+    assert_eq!((f.ret(124, &[0]), f.ret(111, &[])), (1, 1));
+    assert_eq!(f.ret(112, &[]), errno(Errno::EPERM));
 }
 #[test]
 fn posix_timer_signal_reaches_sigtimedwait() {

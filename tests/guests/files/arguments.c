@@ -39,13 +39,16 @@ int main(void){
  P("number of epoll_create1",{long e=sc(dirty?W(291):291,0,0,0,0,0,0);r=e>=0;S1(3,e);});
  P("number of socket",{long k=sc(dirty?W(41):41,1,1,0,0,0,0);r=k>=0;S1(3,k);});
  P("negative syscall number",{r=sc(dirty?0x12345678ffffffffL:-1L,0,0,0,0,0,0);});
- /* A dirty rax with a restart: poll is ERESTARTNOHAND, so a handler makes it
-    EINTR even with SA_RESTART; read is ERESTARTSYS and runs again. */
+ #ifdef RESTARTS
+ /* Case 61: a dirty rax with a restart. poll is ERESTARTNOHAND, so a handler
+    makes it EINTR even with SA_RESTART; read is ERESTARTSYS and runs again.
+    It needs a real-time itimer, so it runs on the emulator's own host only. */
  {struct sigaction a;memset(&a,0,sizeof a);a.sa_handler=tick;a.sa_flags=SA_RESTART;sigaction(SIGALRM,&a,0);}
  S2(293,sp,0);
  P("poll restart",{int pf[2]={sp[0],1};arm();r=sc(dirty?W(7):7,(long)pf,1,-1,0,0,0);char c;S3(0,sp[0],&c,1);});
  P("read restart",{char c;arm();r=sc(dirty?W(0):0,sp[0],(long)&c,1,0,0,0);});
  S1(3,sp[0]);S1(3,sp[1]);signal(SIGALRM,SIG_DFL);
+ #else
  /* files */
  P("open flags,mode",{long f=S3(2,F,D(0),D(0));r=f>=0;S1(3,f);});
  P("openat dfd,flags",{long f=S4(257,D(-100),F,D(0),D(0));r=f>=0;S1(3,f);});
@@ -154,6 +157,7 @@ int main(void){
  P("setsockopt level,name,len",{long s=S3(41,1,1,0);int v=1;r=S5(54,D(s),D(1),D(2),&v,D(4));int g=0,gl=4;r=r*10+S5(55,D(s),D(1),D(2),&g,&gl);r=r*10+g;S1(3,s);});
  P("bind/listen/accept4",{long s=S3(41,1,1,0);char a[110]={1,0};strcpy(a+2,"/tmp/paludarium-arguments-sock");S1(87,"/tmp/paludarium-arguments-sock");r=S3(49,D(s),a,D(33));r=r*10+S2(50,D(s),D(4));long c=S3(41,1,1,0);r=r*10+S3(42,D(c),a,D(33));long k=S4(288,D(s),0,0,D(0x80000));r=r*10+(k>=0);if(k>=0)r=r*10+S2(72,k,1);S1(3,k);S1(3,c);S1(3,s);S1(87,"/tmp/paludarium-arguments-sock");});
  P("sendmsg/recvmsg flags",{int sv[2];S4(53,1,1,0,sv);long iov[2]={(long)"xy",2};long m[7]={0,0,(long)iov,1,0,0,0};r=S3(46,sv[0],m,D(0x4000));long iov2[2]={(long)buf,2};long m2[7]={0,0,(long)iov2,1,0,0,0};r=r*10+S3(47,sv[1],m2,D(0x40));S1(3,sv[0]);S1(3,sv[1]);});
+ #endif
  S1(3,fd);S1(87,F);S1(84,G);
  return 0;
 }

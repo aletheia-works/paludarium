@@ -334,6 +334,7 @@ impl FrameBytes {
     #[inline]
     fn read_16(&self, offset: usize) -> u128 {
         let words = &self.words[offset / WORD_BYTES..][..2];
+        let mut spins = 0u32;
         loop {
             // Each write adds to `spanning_started` before its stores, which
             // release it, and to `spanning_finished` after them. A word read
@@ -348,7 +349,13 @@ impl FrameBytes {
                     return u128::from(high) << 64 | u128::from(low);
                 }
             }
-            std::hint::spin_loop();
+            // Writes may be queued for their turn as well as under way.
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 
@@ -1053,8 +1060,10 @@ impl CodeCounters {
         });
         // Each store sets its `storing` and then reads the epoch again, both
         // `SeqCst`, as this swap and these loads are: either it reads the new
-        // epoch, and stores nothing, or this sees it under the old one. It is
-        // under way for one store, without a lock, so the wait is short.
+        // epoch, and stores nothing, or this sees it under the old one. A store
+        // takes no lock while it is under way, but one that spans words waits
+        // for those to the same page ahead of it (`FrameBytes::write_with`),
+        // so the wait is as long as that queue, usually one store.
         let stores = STORES.read().unwrap_or_else(PoisonError::into_inner);
         for storing in stores.iter() {
             let mut spins = 0u32;

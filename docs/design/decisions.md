@@ -39,7 +39,9 @@ moves on whenever a mapping or a page entry may change, and every access
 compares it. A store says which epoch it is under while it is under way, and
 moving the epoch on waits until no store is under the old one. Then, as with
 Linux's TLB shootdown, no other thread writes through the old page after
-`mprotect` or `fork` returns.
+`mprotect` or `fork` returns. The wait is usually for one store per thread,
+but a store that spans words first waits its turn behind the others to the
+same page (below), so it can last as long as that queue.
 
 A locked instruction within one word is one compare-and-swap of the word, so
 it stays atomic against the stores that take no lock, and it is a full fence.

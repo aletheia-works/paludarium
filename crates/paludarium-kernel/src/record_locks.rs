@@ -76,16 +76,79 @@ impl Lock {
     }
 }
 
+/// What a waiting process waits for: the process that holds the lock in
+/// its way, and that lock, so that a change to it ends the wait in the
+/// deadlock table as Linux's `locks_wake_up_blocks` does.
+#[derive(Clone, Copy, Debug)]
+struct Wait {
+    blocker: u32,
+    key: Key,
+    start: u64,
+    end: u64,
+}
+
+#[derive(Default)]
+struct Table {
+    files: BTreeMap<Key, Vec<Lock>>,
+    /// Each waiting process's wait, for deadlock detection.
+    waiting: BTreeMap<u32, Wait>,
+}
+
+impl Table {
+    /// Whether process `pid` waiting for `blocker` would wait forever: the
+    /// chain of processes waiting for each other's record locks leads back to
+    /// it, as `posix_locks_deadlock` finds. A description's locks take no part.
+    fn closes_cycle(&self, pid: u32, blocker: &Owner) -> bool {
+        let &Owner::Process(mut next) = blocker else {
+            return false;
+        };
+        for _ in 0..MAX_DEADLOCK_ITERATIONS {
+            if next == pid {
+                return true;
+            }
+            match self.waiting.get(&next) {
+                Some(wait) => next = wait.blocker,
+                None => return false,
+            }
+        }
+        false
+    }
+    /// Ends the waits for `owner`'s locks on the file in `changed`, which a
+    /// change replaced, split or merged.
+    fn wake(&mut self, key: Key, owner: &Owner, changed: &[(u64, u64)]) {
+        let &Owner::Process(pid) = owner else {
+            return;
+        };
+        self.waiting.retain(|_, w| {
+            !(w.blocker == pid
+                && w.key == key
+                && changed.iter().any(|&(s, e)| w.start <= e && s <= w.end))
+        });
+    }
+}
+
+/// Why [`Locks::set`] did not set a lock.
+#[derive(Debug)]
+pub(crate) enum Refused {
+    /// Another owner's lock is in the way.
+    Conflict,
+    /// Waiting for that lock would close a cycle of waiting processes.
+    Deadlock,
+}
+
 #[derive(Default)]
 pub(crate) struct Locks {
-    files: Mutex<BTreeMap<Key, Vec<Lock>>>,
-    /// The process each waiting process waits for, for deadlock detection.
-    waiting: Mutex<BTreeMap<u32, u32>>,
+    /// The locks and the waits for them under one lock, as Linux checks a
+    /// conflict, a deadlock and records the wait under `flc_lock` and
+    /// `blocked_lock_lock` at once: a lock let go of in between cannot leave
+    /// a stale wait behind, and two processes asking for each other's locks
+    /// cannot both miss the cycle.
+    table: Mutex<Table>,
 }
 
 impl Locks {
-    fn files(&self) -> std::sync::MutexGuard<'_, BTreeMap<Key, Vec<Lock>>> {
-        self.files.lock().unwrap_or_else(PoisonError::into_inner)
+    fn table(&self) -> std::sync::MutexGuard<'_, Table> {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
     /// The first lock of another owner that `kind` on `start..=end` would
     /// conflict with, as `posix_test_lock` finds it.
@@ -97,8 +160,8 @@ impl Locks {
         start: u64,
         end: u64,
     ) -> Option<Lock> {
-        let mut files = self.files();
-        let list = files.get_mut(&key)?;
+        let mut table = self.table();
+        let list = table.files.get_mut(&key)?;
         list.retain(|l| l.owner.live());
         list.iter()
             .find(|l| {
@@ -111,7 +174,9 @@ impl Locks {
     /// Sets `kind` on `start..=end`, or with `None` unlocks it, for `owner`,
     /// as `posix_lock_inode` does: the owner's own locks there are replaced,
     /// split around the range, or merged with it when of the same kind and
-    /// touching it. A conflicting lock of another owner is the error.
+    /// touching it, and the waits for them end. A conflicting lock of another
+    /// owner is the error; with `waiter`, the process that will wait for it,
+    /// the wait is recorded unless it would close a cycle.
     pub(crate) fn set(
         &self,
         key: Key,
@@ -119,9 +184,10 @@ impl Locks {
         kind: Option<Kind>,
         start: u64,
         end: u64,
-    ) -> Result<(), Lock> {
-        let mut files = self.files();
-        let list = files.entry(key).or_default();
+        waiter: Option<u32>,
+    ) -> Result<(), Refused> {
+        let mut table = self.table();
+        let list = table.files.entry(key).or_default();
         list.retain(|l| l.owner.live());
         if let Some(kind) = kind
             && let Some(conflict) = list.iter().find(|l| {
@@ -130,10 +196,33 @@ impl Locks {
                     && (kind == Kind::Write || l.kind == Kind::Write)
             })
         {
-            return Err(conflict.clone());
+            let conflict = conflict.clone();
+            if let Some(pid) = waiter {
+                if table.closes_cycle(pid, &conflict.owner) {
+                    table.waiting.remove(&pid);
+                    return Err(Refused::Deadlock);
+                }
+                match conflict.owner {
+                    Owner::Process(blocker) => {
+                        let wait = Wait {
+                            blocker,
+                            key,
+                            start: conflict.start,
+                            end: conflict.end,
+                        };
+                        table.waiting.insert(pid, wait);
+                    }
+                    Owner::Description(_) => {
+                        table.waiting.remove(&pid);
+                    }
+                }
+            }
+            return Err(Refused::Conflict);
         }
         let (mut new_start, mut new_end) = (start, end);
         let mut kept = Vec::with_capacity(list.len() + 1);
+        // The owner's locks this replaces, splits or merges, whose waits end.
+        let mut changed = Vec::new();
         for l in list.drain(..) {
             if !l.owner.same(owner) {
                 kept.push(l);
@@ -143,7 +232,9 @@ impl Locks {
             if Some(l.kind) == kind && touches {
                 new_start = new_start.min(l.start);
                 new_end = new_end.max(l.end);
+                changed.push((l.start, l.end));
             } else if l.overlaps(start, end) {
+                changed.push((l.start, l.end));
                 if l.start < start {
                     kept.push(Lock {
                         end: start - 1,
@@ -170,84 +261,44 @@ impl Locks {
         }
         kept.sort_by_key(|l| l.start);
         if kept.is_empty() {
-            files.remove(&key);
+            table.files.remove(&key);
         } else {
             *list = kept;
         }
+        if let Some(pid) = waiter {
+            table.waiting.remove(&pid);
+        }
+        table.wake(key, owner, &changed);
         Ok(())
     }
     /// Drops `owner`'s locks on the file, as a process's close of any of its
     /// descriptors does to its record locks (`locks_remove_posix`).
     pub(crate) fn release(&self, key: Key, owner: &Owner) {
-        let mut files = self.files();
-        if let Some(list) = files.get_mut(&key) {
+        let mut table = self.table();
+        if let Some(list) = table.files.get_mut(&key) {
             list.retain(|l| l.owner.live() && !l.owner.same(owner));
             if list.is_empty() {
-                files.remove(&key);
+                table.files.remove(&key);
             }
         }
+        table.wake(key, owner, &[(0, OFFSET_MAX)]);
     }
-    /// Drops every record lock of process `pid`, which exited.
+    /// Drops every record lock of process `pid`, which exited, and the waits
+    /// for them and its own.
     pub(crate) fn release_process(&self, pid: u32) {
         let owner = Owner::Process(pid);
-        self.files().retain(|_, list| {
+        let mut table = self.table();
+        table.files.retain(|_, list| {
             list.retain(|l| l.owner.live() && !l.owner.same(&owner));
             !list.is_empty()
         });
-        self.stop_waiting(pid);
+        table
+            .waiting
+            .retain(|&waiter, w| waiter != pid && w.blocker != pid);
     }
-    /// Whether process `pid` waiting for `blocker` would wait forever: the
-    /// chain of processes waiting for each other's record locks leads back to
-    /// it, as `posix_locks_deadlock` finds. A description's locks take no part.
-    #[cfg(test)]
-    fn would_deadlock(&self, pid: u32, blocker: &Owner) -> bool {
-        let waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
-        Self::closes_cycle(&waiting, pid, blocker)
-    }
-    fn closes_cycle(waiting: &BTreeMap<u32, u32>, pid: u32, blocker: &Owner) -> bool {
-        let &Owner::Process(mut next) = blocker else {
-            return false;
-        };
-        for _ in 0..MAX_DEADLOCK_ITERATIONS {
-            if next == pid {
-                return true;
-            }
-            match waiting.get(&next) {
-                Some(&other) => next = other,
-                None => return false,
-            }
-        }
-        false
-    }
-    /// Records that process `pid` waits for `blocker`'s record lock, or with
-    /// `false` that the wait would close a cycle. One check under one lock,
-    /// as Linux holds `blocked_lock_lock` from `posix_locks_deadlock` to
-    /// `__locks_insert_block`: two processes asking for each other's locks at
-    /// once cannot both miss the cycle and wait forever.
-    pub(crate) fn wait_for_owner(&self, pid: u32, blocker: &Owner) -> bool {
-        let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
-        if Self::closes_cycle(&waiting, pid, blocker) {
-            waiting.remove(&pid);
-            return false;
-        }
-        match blocker {
-            &Owner::Process(other) => waiting.insert(pid, other),
-            Owner::Description(_) => waiting.remove(&pid),
-        };
-        true
-    }
-    #[cfg(test)]
-    fn wait_for(&self, pid: u32, blocker: u32) {
-        self.waiting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(pid, blocker);
-    }
-    fn stop_waiting(&self, pid: u32) {
-        self.waiting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&pid);
+    /// Ends process `pid`'s wait, which a signal interrupted.
+    pub(crate) fn stop_waiting(&self, pid: u32) {
+        self.table().waiting.remove(&pid);
     }
 }
 
@@ -377,20 +428,18 @@ pub(crate) fn fcntl(
         return Err(Errno::EINVAL);
     }
     let wait = command == 7 || command == 38;
-    let pid = c.process.pid;
+    // An OFD lock's wait takes no part in deadlock detection.
+    let waiter = (wait && !ofd).then_some(c.process.pid);
     loop {
-        match locks.set(key, &owner, kind, start, end) {
-            Ok(()) => {
-                locks.stop_waiting(pid);
-                return Ok(0);
-            }
-            Err(_) if !wait => return Err(Errno::EAGAIN),
-            Err(blocker) => {
-                if !ofd && !locks.wait_for_owner(pid, &blocker.owner) {
-                    return Err(Errno(35));
-                }
+        match locks.set(key, &owner, kind, start, end, waiter) {
+            Ok(()) => return Ok(0),
+            Err(Refused::Deadlock) => return Err(Errno(35)),
+            Err(Refused::Conflict) if !wait => return Err(Errno::EAGAIN),
+            Err(Refused::Conflict) => {
                 if let Err(e) = crate::files::pause_for_lock(c) {
-                    locks.stop_waiting(pid);
+                    if let Some(pid) = waiter {
+                        locks.stop_waiting(pid);
+                    }
                     return Err(e);
                 }
             }
@@ -406,7 +455,7 @@ mod tests {
     const KEY: Key = (1, 2);
 
     fn ranges(locks: &Locks) -> Vec<(u64, u64, Kind)> {
-        locks.files().get(&KEY).map_or_else(Vec::new, |list| {
+        locks.table().files.get(&KEY).map_or_else(Vec::new, |list| {
             list.iter().map(|l| (l.start, l.end, l.kind)).collect()
         })
     }
@@ -415,9 +464,9 @@ mod tests {
     fn an_owner_never_conflicts_with_itself() {
         let locks = Locks::default();
         let a = Owner::Process(1);
-        assert!(locks.set(KEY, &a, Some(Kind::Write), 0, 9).is_ok());
+        assert!(locks.set(KEY, &a, Some(Kind::Write), 0, 9, None).is_ok());
         assert!(locks.conflict(KEY, &a, Kind::Write, 0, 9).is_none());
-        assert!(locks.set(KEY, &a, Some(Kind::Read), 3, 4).is_ok());
+        assert!(locks.set(KEY, &a, Some(Kind::Read), 3, 4, None).is_ok());
         assert_eq!(
             ranges(&locks),
             [(0, 2, Kind::Write), (3, 4, Kind::Read), (5, 9, Kind::Write)]
@@ -428,29 +477,33 @@ mod tests {
     fn readers_share_and_writers_conflict() {
         let locks = Locks::default();
         let (a, b) = (Owner::Process(1), Owner::Process(2));
-        assert!(locks.set(KEY, &a, Some(Kind::Read), 0, 9).is_ok());
-        assert!(locks.set(KEY, &b, Some(Kind::Read), 5, 14).is_ok());
-        let blocker = locks.set(KEY, &b, Some(Kind::Write), 9, 9).unwrap_err();
+        assert!(locks.set(KEY, &a, Some(Kind::Read), 0, 9, None).is_ok());
+        assert!(locks.set(KEY, &b, Some(Kind::Read), 5, 14, None).is_ok());
+        assert!(matches!(
+            locks.set(KEY, &b, Some(Kind::Write), 9, 9, None),
+            Err(Refused::Conflict)
+        ));
+        let blocker = locks.conflict(KEY, &b, Kind::Write, 9, 9).unwrap();
         assert!(blocker.owner.same(&a));
-        assert!(locks.set(KEY, &b, Some(Kind::Write), 10, 14).is_ok());
+        assert!(locks.set(KEY, &b, Some(Kind::Write), 10, 14, None).is_ok());
     }
 
     #[test]
     fn unlocking_splits_and_same_kind_merges() {
         let locks = Locks::default();
         let a = Owner::Process(1);
-        locks.set(KEY, &a, Some(Kind::Write), 0, 9).unwrap();
-        locks.set(KEY, &a, None, 3, 4).unwrap();
+        locks.set(KEY, &a, Some(Kind::Write), 0, 9, None).unwrap();
+        locks.set(KEY, &a, None, 3, 4, None).unwrap();
         assert_eq!(ranges(&locks), [(0, 2, Kind::Write), (5, 9, Kind::Write)]);
-        locks.set(KEY, &a, Some(Kind::Write), 3, 4).unwrap();
+        locks.set(KEY, &a, Some(Kind::Write), 3, 4, None).unwrap();
         assert_eq!(ranges(&locks), [(0, 9, Kind::Write)]);
         // Adjacent locks of the same kind merge too.
         locks
-            .set(KEY, &a, Some(Kind::Write), 10, OFFSET_MAX)
+            .set(KEY, &a, Some(Kind::Write), 10, OFFSET_MAX, None)
             .unwrap();
         assert_eq!(ranges(&locks), [(0, OFFSET_MAX, Kind::Write)]);
-        locks.set(KEY, &a, None, 0, OFFSET_MAX).unwrap();
-        assert!(locks.files().is_empty());
+        locks.set(KEY, &a, None, 0, OFFSET_MAX, None).unwrap();
+        assert!(locks.table().files.is_empty());
     }
 
     #[test]
@@ -458,7 +511,9 @@ mod tests {
         let locks = Locks::default();
         let file = paludarium_vfs::MemFs::new().open(b"/f", 66, 0o600).unwrap();
         let owner = Owner::Description(Arc::downgrade(&file));
-        locks.set(KEY, &owner, Some(Kind::Write), 0, 0).unwrap();
+        locks
+            .set(KEY, &owner, Some(Kind::Write), 0, 0, None)
+            .unwrap();
         let other = Owner::Process(7);
         assert!(locks.conflict(KEY, &other, Kind::Read, 0, 0).is_some());
         assert_eq!(
@@ -477,33 +532,101 @@ mod tests {
     fn release_drops_only_that_owner() {
         let locks = Locks::default();
         let (a, b) = (Owner::Process(1), Owner::Process(2));
-        locks.set(KEY, &a, Some(Kind::Read), 0, 0).unwrap();
-        locks.set(KEY, &b, Some(Kind::Read), 0, 0).unwrap();
+        locks.set(KEY, &a, Some(Kind::Read), 0, 0, None).unwrap();
+        locks.set(KEY, &b, Some(Kind::Read), 0, 0, None).unwrap();
         locks.release(KEY, &a);
         assert!(locks.conflict(KEY, &a, Kind::Write, 0, 0).is_some());
         locks.release_process(2);
-        assert!(locks.files().is_empty());
+        assert!(locks.table().files.is_empty());
+    }
+
+    fn deadlock(locks: &Locks, pid: u32, start: u64) -> bool {
+        matches!(
+            locks.set(
+                KEY,
+                &Owner::Process(pid),
+                Some(Kind::Write),
+                start,
+                start,
+                Some(pid)
+            ),
+            Err(Refused::Deadlock)
+        )
     }
 
     #[test]
     fn a_cycle_of_waiting_processes_is_a_deadlock() {
         let locks = Locks::default();
-        // 2 waits for 3, which waits for 1: 1 waiting for 2 closes the cycle.
-        locks.wait_for(2, 3);
-        locks.wait_for(3, 1);
-        assert!(locks.would_deadlock(1, &Owner::Process(2)));
-        assert!(!locks.would_deadlock(4, &Owner::Process(2)));
+        for pid in 1..=3 {
+            let start = u64::from(pid);
+            locks
+                .set(
+                    KEY,
+                    &Owner::Process(pid),
+                    Some(Kind::Write),
+                    start,
+                    start,
+                    None,
+                )
+                .unwrap();
+        }
+        // 2 waits for 3, which waits for 1: 1 waiting for 2 closes the cycle,
+        // and 1 is refused without waiting.
+        assert!(!deadlock(&locks, 2, 3));
+        assert!(!deadlock(&locks, 3, 1));
+        assert!(deadlock(&locks, 1, 2));
+        assert!(!locks.table().waiting.contains_key(&1));
+        // 3 no longer waits once interrupted, and then nothing closes a cycle.
         locks.stop_waiting(3);
-        assert!(!locks.would_deadlock(1, &Owner::Process(2)));
+        assert!(!deadlock(&locks, 1, 2));
     }
 
     #[test]
     fn the_second_of_two_waiters_for_each_other_gets_the_deadlock() {
         let locks = Locks::default();
-        assert!(locks.wait_for_owner(1, &Owner::Process(2)));
-        assert!(!locks.wait_for_owner(2, &Owner::Process(1)));
+        locks
+            .set(KEY, &Owner::Process(1), Some(Kind::Write), 1, 1, None)
+            .unwrap();
+        locks
+            .set(KEY, &Owner::Process(2), Some(Kind::Write), 2, 2, None)
+            .unwrap();
+        assert!(!deadlock(&locks, 1, 2));
+        assert!(deadlock(&locks, 2, 1));
         // The refused one waits for nothing; the first still waits.
-        assert!(!locks.would_deadlock(1, &Owner::Process(2)));
-        assert!(locks.would_deadlock(2, &Owner::Process(1)));
+        assert!(!locks.table().waiting.contains_key(&2));
+        assert_eq!(locks.table().waiting.get(&1).map(|w| w.blocker), Some(2));
+    }
+
+    #[test]
+    fn letting_go_of_a_lock_ends_the_waits_for_it() {
+        let locks = Locks::default();
+        let (a, b) = (Owner::Process(1), Owner::Process(2));
+        locks.set(KEY, &a, Some(Kind::Write), 0, 0, None).unwrap();
+        locks.set(KEY, &a, Some(Kind::Write), 5, 5, None).unwrap();
+        locks.set(KEY, &b, Some(Kind::Write), 1, 1, None).unwrap();
+        // 2 waits for 1's byte 0; 1 unlocking it ends the wait, so 1 may then
+        // wait for 2's byte 1 with no deadlock.
+        assert!(!deadlock(&locks, 2, 0));
+        locks.set(KEY, &a, None, 0, 0, None).unwrap();
+        assert!(!locks.table().waiting.contains_key(&2));
+        assert!(!deadlock(&locks, 1, 1));
+        // A change to another of 1's locks leaves a wait for byte 5 alone,
+        // and so does a lock of another kind next to it, which leaves it as
+        // it was.
+        locks.stop_waiting(1);
+        assert!(!deadlock(&locks, 2, 5));
+        locks.set(KEY, &a, Some(Kind::Read), 9, 9, None).unwrap();
+        locks.set(KEY, &a, Some(Kind::Read), 6, 6, None).unwrap();
+        assert!(locks.table().waiting.contains_key(&2));
+        // Merging it with a write lock next to it changes it.
+        locks.set(KEY, &a, Some(Kind::Write), 4, 4, None).unwrap();
+        assert!(!locks.table().waiting.contains_key(&2));
+        assert!(!deadlock(&locks, 2, 5));
+        // Closing the file, or exiting, ends the waits for all of 1's locks.
+        locks.release(KEY, &a);
+        assert!(!locks.table().waiting.contains_key(&2));
+        assert!(!deadlock(&locks, 1, 1));
+        locks.release_process(2);
+        assert!(locks.table().waiting.is_empty());
     }
 }

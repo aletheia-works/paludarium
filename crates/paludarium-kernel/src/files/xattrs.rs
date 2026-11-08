@@ -1,7 +1,7 @@
 //! Extended attributes, as Linux's `fs/xattr.c` handles them. They are kept
 //! with a file in memory; what holds no attributes, as a mounted host
 //! directory, behaves as a file system without them.
-use super::{O_PATH, generated_stat, looked_up, output};
+use super::{Followed, O_PATH, generated_stat, looked_up, output};
 use crate::credentials::Credentials;
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat, Xattrs};
@@ -37,11 +37,30 @@ enum Target {
 impl Target {
     fn at_path(c: &Context<'_>, ptr: u64, follow: bool) -> Result<Self, Errno> {
         let (path, found) = looked_up(c, (-100i32) as u64, ptr, follow)?;
+        // A link in `/proc/self/fd` leads to the descriptor's file, whatever
+        // its access, as an `O_PATH` one has none.
+        match super::followed(c, &path, follow)? {
+            Some(Followed::Path { path, follow }) => return Self::found(c, path, follow, None),
+            Some(Followed::File(d)) => {
+                let stat = d.file.stat()?;
+                return Ok(Self::File { file: d.file, stat });
+            }
+            None => {}
+        }
+        Self::found(c, path, follow, found.file)
+    }
+    /// The file at `path`, of which a walk to it may have given the status.
+    fn found(
+        c: &Context<'_>,
+        path: Vec<u8>,
+        follow: bool,
+        walked: Option<FileStat>,
+    ) -> Result<Self, Errno> {
         if let Some((stat, ..)) = generated_stat(c, &path, follow)? {
             return Ok(Self::Generated { stat });
         }
         // A walk leaves out the last name's status when it does not need it.
-        let stat = match found.file {
+        let stat = match walked {
             Some(stat) => stat,
             None => c.files.fs.metadata(&path, follow)?,
         };

@@ -2247,6 +2247,13 @@ impl Kernel {
         let path = read_string(mem, a[0], 4096, Errno::ENAMETOOLONG)?;
         let raw = path.clone();
         let path = self.files.exec_path(path)?;
+        // A link in `/proc/self/fd`, as `fexecve` falls back to, runs the
+        // file its descriptor holds while a path still names it.
+        let path =
+            match crate::files::through_descriptor(&self.files, self.process.pid, &path, true)? {
+                Some(crate::files::Followed::Path { path, .. }) => path,
+                _ => path,
+            };
         let (mut program, mut readable) =
             crate::permissions::exec(&self.files, &thread.state.credentials, &raw, &path)?;
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;

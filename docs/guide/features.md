@@ -59,7 +59,7 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, and the pseudo-terminals' requests below) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
@@ -130,6 +130,21 @@ kernel.
   of a memfd sealed against writes cannot become writable (`EACCES`).
   `F_SEAL_EXEC` on an executable memfd, which seals writes too, gives `EBUSY`
   then as well, as since Linux 7.1; earlier kernels add the seals.
+- `openat2` opens as `openat` does (a FIFO too), with Linux's stricter
+  checks of its `struct open_how`: a size below 24 bytes is `EINVAL`, above
+  a page or with unknown nonzero bytes past the first version `E2BIG`; an
+  unknown flag or `RESOLVE_*` flag, a mode without `O_CREAT` or `O_TMPFILE`
+  or with more than the permission bits, `O_CREAT | O_DIRECTORY`, and
+  `O_PATH` with other flags than `O_DIRECTORY`, `O_NOFOLLOW` and
+  `O_CLOEXEC` are `EINVAL`. `RESOLVE_NO_SYMLINKS` follows no symbolic link
+  and `RESOLVE_NO_MAGICLINKS` no link in `/proc/self/fd` or `exe` and `cwd`
+  (`ELOOP`); `RESOLVE_NO_XDEV` crosses no mount, `/proc` and `/dev`
+  included (`EXDEV`); `RESOLVE_BENEATH` gives `EXDEV` for an absolute path
+  or link, `..` out of the directory and a magic link, and
+  `RESOLVE_IN_ROOT` takes the directory as the root, where those stay but
+  a magic link (`EXDEV`). With both scoping flags the call is `EINVAL`.
+  `RESOLVE_CACHED` gives `EAGAIN` with `O_CREAT`, `O_TRUNC` or `O_TMPFILE`,
+  and otherwise always finds the file, as if every name were cached.
 - `close_range` closes the open descriptors from `first` to `last`, or with
   `CLOSE_RANGE_CLOEXEC` marks them close-on-exec. `CLOSE_RANGE_UNSHARE` first
   gives the thread its own copy of a table it shares with `CLONE_FILES`
@@ -648,8 +663,15 @@ kernel.
   for the rest,
   pipes, sockets, `memfd` and `/dev` included. `statfs` there gives
   procfs's or devpts's type with a 4096 `f_bsize`, as Linux's
-  `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but `stat`,
-  `statfs` and `open` through it reach its file.
+  `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but a call
+  that follows it reaches the descriptor's file, as Linux's magic link does,
+  whatever its access (an `O_PATH` descriptor's too): `stat`, `statfs`,
+  `open`, `access`, `chmod` and `fchmodat`, `chown` and `fchownat`,
+  `utimensat`, `truncate`, `chdir`, the extended-attribute calls and
+  `execve`. A removed file, a memfd or a pipe is reached through the
+  descriptor itself (`execve` of those is not); a symbolic link an
+  `O_PATH | O_NOFOLLOW` descriptor holds is not followed again, and its mode
+  cannot change (`EOPNOTSUPP`).
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
   `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a

@@ -51,7 +51,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
@@ -118,6 +118,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EBUSY` になり、書き込みを封じた memfd の共有マッピングは書き込めるようにできません
   （`EACCES`）。実行できる memfd への `F_SEAL_EXEC` も書き込みを封じるので、そのときは
   Linux 7.1 以降と同じく `EBUSY` になります（それより前のカーネルはシールを加えます）。
+- `openat2` は `openat` と同じように開き（FIFO も）、`struct open_how` を Linux と同じく
+  より厳しく調べます。24 バイトに満たない大きさは `EINVAL`、1 ページを超えるものや、
+  最初の版より後ろに 0 でない未知のバイトがあるものは `E2BIG` です。未知のフラグや
+  `RESOLVE_*` フラグ、`O_CREAT` も `O_TMPFILE` もないのに付けたモードや許可ビットを
+  超えるモード、`O_CREAT | O_DIRECTORY`、`O_DIRECTORY`・`O_NOFOLLOW`・`O_CLOEXEC`
+  以外のフラグを伴う `O_PATH` は `EINVAL` です。`RESOLVE_NO_SYMLINKS` はシンボリック
+  リンクを、`RESOLVE_NO_MAGICLINKS` は `/proc/self/fd` のリンクや `exe`・`cwd` を
+  たどりません（`ELOOP`）。`RESOLVE_NO_XDEV` は `/proc` や `/dev` も含めてマウントを
+  越えません（`EXDEV`）。`RESOLVE_BENEATH` では絶対パスや絶対パスへのリンク、
+  ディレクトリの外に出る `..`、マジックリンクが `EXDEV` になり、`RESOLVE_IN_ROOT` は
+  ディレクトリをルートとして扱うので、それらはその中にとどまります（マジックリンクは
+  `EXDEV`）。両方のスコープのフラグを付けると `EINVAL` です。`RESOLVE_CACHED` は
+  `O_CREAT`、`O_TRUNC`、`O_TMPFILE` と一緒なら `EAGAIN` で、それ以外はすべての名前が
+  キャッシュにあるものとして常にファイルを見つけます。
 - `close_range` は `first` から `last` までの開いているディスクリプタを閉じ、
   `CLOSE_RANGE_CLOEXEC` なら閉じずに close-on-exec を付けます。`CLOSE_RANGE_UNSHARE`
   は先に、`CLONE_FILES` のスレッドと共有している表をそのスレッド専用の写しにします。
@@ -590,8 +604,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   標準入力・出力・エラーの端末（devpts）は 1024 で、ほかは、パイプ、ソケット、`memfd`、`/dev` も含めて 4096
   です。そこでの `statfs` は、Linux の `simple_statfs` と同じく、procfs や devpts の
   種類と 4096 の `f_bsize` を返します。
-  `/proc/self/fd` のリンクは procfs のものですが、それを通した `stat`、`statfs`、`open`
-  はリンク先のファイルに届きます。
+  `/proc/self/fd` のリンクは procfs のものですが、Linux のマジックリンクと同じく、
+  それをたどる呼び出しはディスクリプタのファイルそのものに届きます。アクセスモードは
+  問いません（`O_PATH` のディスクリプタも）。`stat`、`statfs`、`open`、`access`、
+  `chmod` と `fchmodat`、`chown` と `fchownat`、`utimensat`、`truncate`、`chdir`、
+  拡張属性の呼び出し、`execve` がそうです。削除したファイル、memfd、パイプには
+  ディスクリプタ自身を通して届きます（それらの `execve` はできません）。
+  `O_PATH | O_NOFOLLOW` のディスクリプタが持つシンボリックリンクはもうたどらず、
+  そのモードは変えられません（`EOPNOTSUPP`）。
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの

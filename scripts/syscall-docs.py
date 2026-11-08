@@ -225,6 +225,7 @@ NAMES = {
     434: "pidfd_open",
     435: "clone3",
     436: "close_range",
+    437: "openat2",
     439: "faccessat2",
     452: "fchmodat2",
 }

@@ -1469,6 +1469,14 @@ one only with an `--allow-net`.
   `RENAME_WHITEOUT` needs `CAP_MKNOD` (`EPERM`), and then gives `EINVAL`, as
   on a Linux filesystem without whiteouts.
 - `linkat` takes `AT_SYMLINK_FOLLOW`, which follows a symbolic link the old
+  path ends in (a dangling one is `ENOENT`) and a link in `/proc/self/fd` to
+  the descriptor's file, and `AT_EMPTY_PATH`, which with an empty old path
+  links the file a descriptor holds, an `O_PATH` one's too (a directory is
+  `EPERM`). A removed file has no name to link again (`ENOENT`), and a
+  memfd, a pipe, a socket or a file of `/proc` is on a filesystem of its own
+  (`EXDEV`). Linux 6.10 and later also refuse `AT_EMPTY_PATH` for a file
+  opened with other credentials than the caller's, without
+  `CAP_DAC_READ_SEARCH` (`ENOENT`); this is not checked.
 - Landlock restricts a thread's access to file hierarchies, at ABI version 3:
   `landlock_create_ruleset` (and its version query), `landlock_add_rule` with
   `LANDLOCK_RULE_PATH_BENEATH`, and `landlock_restrict_self` (which needs
@@ -1483,14 +1491,6 @@ one only with an `--allow-net`.
   and must not give the file more rights than it had (`EXDEV`). Threads,
   processes and `execve` keep the domain; `O_PATH`, `stat` and descriptors
   opened before are not checked.
-  path ends in (a dangling one is `ENOENT`) and a link in `/proc/self/fd` to
-  the descriptor's file, and `AT_EMPTY_PATH`, which with an empty old path
-  links the file a descriptor holds, an `O_PATH` one's too (a directory is
-  `EPERM`). A removed file has no name to link again (`ENOENT`), and a
-  memfd, a pipe, a socket or a file of `/proc` is on a filesystem of its own
-  (`EXDEV`). Linux 6.10 and later also refuse `AT_EMPTY_PATH` for a file
-  opened with other credentials than the caller's, without
-  `CAP_DAC_READ_SEARCH` (`ENOENT`); this is not checked.
 - Files can be placed before the start.
 - A host directory can be mounted when you ask for it (`--mount` on the
   command line, `Config::mounts` in Rust). Every operation stays inside that

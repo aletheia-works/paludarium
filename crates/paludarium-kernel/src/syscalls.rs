@@ -78,6 +78,7 @@ pub mod nr {
     pub const GETGID: u64 = 104;
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
+    pub const SCHED_SETAFFINITY: u64 = 203;
     pub const SCHED_GETAFFINITY: u64 = 204;
     pub const SCHED_YIELD: u64 = 24;
     pub const SYSINFO: u64 = 99;
@@ -130,7 +131,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 64] = [
+        let entries: [(u64, Handler); 65] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -176,6 +177,7 @@ impl SyscallTable {
             (nr::GETGID, credentials::sys_getgid),
             (nr::GETEUID, credentials::sys_geteuid),
             (nr::GETEGID, credentials::sys_getegid),
+            (nr::SCHED_SETAFFINITY, sys_sched_setaffinity),
             (nr::SCHED_GETAFFINITY, sys_sched_getaffinity),
             (nr::SCHED_YIELD, sys_sched_yield),
             (nr::SYSINFO, sys_sysinfo),
@@ -2273,29 +2275,100 @@ fn sys_sysinfo(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
 }
 
-/// Every guest thread may run on each of the host's CPUs, numbered from 0.
+/// The thread `pid` names for the affinity calls, and its thread group when
+/// that is another process's: 0 is the caller, and any live thread of any
+/// process is found by its ID, as root may set another's mask (`ESRCH` when
+/// none has it).
+fn affinity_target(
+    c: &Context<'_>,
+    pid: i32,
+) -> Result<(u32, Option<std::sync::Arc<crate::ThreadGroup>>), Errno> {
+    match u32::try_from(pid) {
+        Ok(0) => Ok((c.tid, None)),
+        Ok(p) if p == c.process.pid || c.group.has_member(p) => Ok((p, None)),
+        Ok(p) => c
+            .processes
+            .group_of(p)
+            .map(|group| (p, Some(group)))
+            .ok_or(Errno(3)),
+        Err(_) => Err(Errno(3)), // ESRCH
+    }
+}
+
+/// The host's CPUs, numbered from 0, as Linux's `cpu_active_mask`.
+fn active_cpus(c: &Context<'_>) -> usize {
+    c.host.cpu_count().clamp(1, 8192)
+}
+
+/// The CPU mask of thread `pid`: the one `sched_setaffinity` gave it, or
+/// every CPU. Linux copies its whole CPU mask, a whole number of 64-bit
+/// words.
 fn sys_sched_getaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (pid, len) = (a[0] as u32 as i32, a[1] as u32);
-    let cpus = c.host.cpu_count().clamp(1, 8192);
+    let cpus = active_cpus(c);
     if (len as usize) * 8 < cpus || len % 8 != 0 {
         return err(Errno::EINVAL);
     }
-    let known =
-        pid == 0 || u32::try_from(pid).is_ok_and(|p| p == c.process.pid || c.group.has_member(p));
-    if !known {
-        return err(Errno(3)); // ESRCH
-    }
-    // Linux copies its whole CPU mask, a whole number of 64-bit words.
-    let size = cpus.div_ceil(64) * 8;
-    let mut mask = vec![0u8; size];
+    let (tid, other) = match affinity_target(c, pid) {
+        Ok(target) => target,
+        Err(e) => return err(e),
+    };
+    let words = cpus.div_ceil(64);
+    let set = other.as_deref().unwrap_or(c.group).affinity(tid);
+    let mut mask = vec![0u8; words * 8];
     for cpu in 0..cpus {
-        mask[cpu / 8] |= 1 << (cpu % 8);
+        let allowed = set.as_ref().is_none_or(|set| {
+            set.get(cpu / 64)
+                .is_some_and(|word| word >> (cpu % 64) & 1 != 0)
+        });
+        if allowed {
+            mask[cpu / 8] |= 1 << (cpu % 8);
+        }
     }
-    let copied = size.min(len as usize);
+    let copied = mask.len().min(len as usize);
     match c.mem.write(GuestAddr(a[2]), &mask[..copied]) {
         Ok(()) => ok(copied as u64),
         Err(_) => err(Errno::EFAULT),
     }
+}
+
+/// `sched_setaffinity`, as Linux's: the mask is read up to the size of a CPU
+/// mask (a shorter one counts the rest as clear, `EFAULT` if it cannot be
+/// read), keeps only the host's CPUs, and an empty result is `EINVAL`. The
+/// mask is kept for `sched_getaffinity` and inherited by new threads and
+/// processes; the host still runs the thread on any of its CPUs.
+fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (pid, len) = (a[0] as u32 as i32, a[1] as usize);
+    let cpus = active_cpus(c);
+    let words = cpus.div_ceil(64);
+    let mut bytes = vec![0u8; words * 8];
+    let read = len.min(bytes.len());
+    if c.mem.read(GuestAddr(a[2]), &mut bytes[..read]).is_err() {
+        return err(Errno::EFAULT);
+    }
+    let mut mask: Vec<u64> = bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|word| u64::from_le_bytes(*word))
+        .collect();
+    // Only the CPUs the host has.
+    if cpus % 64 != 0
+        && let Some(last) = mask.last_mut()
+    {
+        *last &= (1u64 << (cpus % 64)) - 1;
+    }
+    // The mask is read first (EFAULT), then the thread found (ESRCH), and
+    // only then is an empty mask refused (EINVAL), as in Linux.
+    let (tid, other) = match affinity_target(c, pid) {
+        Ok(target) => target,
+        Err(e) => return err(e),
+    };
+    if mask.iter().all(|&word| word == 0) {
+        return err(Errno::EINVAL);
+    }
+    other.as_deref().unwrap_or(c.group).set_affinity(tid, mask);
+    ok(0)
 }
 
 fn sys_set_tid_address(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {

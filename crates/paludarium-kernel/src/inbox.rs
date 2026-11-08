@@ -153,6 +153,15 @@ impl SignalInbox {
     pub(crate) fn attach(&self, discards: Arc<signals::Discards>) {
         *self.discards.lock().unwrap_or_else(PoisonError::into_inner) = Some(discards);
     }
+    /// The signals queued here, as a signal set.
+    pub(crate) fn queued_set(&self) -> u64 {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|s| (1..=64).contains(&s.number))
+            .fold(0, |set, s| set | 1 << (s.number - 1))
+    }
     /// Drops the queued instances of signal `number`.
     pub(crate) fn purge(&self, number: i32) {
         self.queue

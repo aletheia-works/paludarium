@@ -187,6 +187,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   10 ms より短い間だけ満杯や空だったストリームは見逃され、送らないことがあります。ただし、
   読み書きがゲストに `EAGAIN` を返したあとは必ず送ります。スレッドがない WebAssembly では
   送りません。
+- **signalfd へのエッジトリガーの `epoll`**：新しいエッジは、待つスレッドに保留されて
+  いなかったファイルのシグナルが保留されたときに来ます。Linux は、同じ番号のものが
+  待っている間に積まれたリアルタイムシグナルでも、そのたびにファイルを起こします。
 - **名前空間**：名前空間のフラグ（`CLONE_NEWNS`、`CLONE_NEWUTS`、`CLONE_NEWIPC`、
   `CLONE_NEWUSER`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWCGROUP`、`clone3` では
   `CLONE_NEWTIME` も）を付けた `clone` と `clone3` は、子を作らずに `EINVAL` で失敗します。
@@ -228,8 +231,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   持ちますが、その裏の Linux のメモリの勘定はありません。`/proc/self/stat` は、
   制御端末を持つプロセスでも端末なし（`tty_nr` 0、`tpgid` -1）を示します。
   ホスト自身の端末はこの疑似端末ではありません。そこにつながるゲストの標準入出力は
-  `TCGETS` と `TIOCGWINSZ` にだけ答えます。`script` は `signalfd` を使い、それは
-  まだありません。
+  `TCGETS` と `TIOCGWINSZ` にだけ答えます。
 - **ホストの標準入出力への `FIONREAD` と `SIOCOUTQ`**：どちらも `ENOTTY` を返します。
   Linux では、その先にあるものについて答えます。`FIONREAD` はパイプ、端末、ソケット、
   通常のファイルについて、`SIOCOUTQ` は端末とソケットについてです。ゲスト自身のパイプ、

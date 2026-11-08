@@ -209,6 +209,10 @@ verified.
   than those 10 ms can go unseen and send none, unless a read or write told
   the guest `EAGAIN`, which always gets its signal. In WebAssembly, which has
   no thread to look, they send none.
+- **Edge-triggered `epoll` on a signalfd**: a new edge comes when one of
+  the file's signals becomes pending for the waiting thread where it was
+  not, where Linux also wakes the file for each further real-time signal
+  queued while one of its number waits.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for
@@ -256,7 +260,6 @@ verified.
   `/proc/self/stat` shows no terminal (`tty_nr` 0, `tpgid` -1) even for a
   process that has one. The host's own terminal is not one of these: the
   guest's standard streams on it answer only `TCGETS` and `TIOCGWINSZ`.
-  `script` needs `signalfd`, which is not implemented.
 - **`FIONREAD` and `SIOCOUTQ` on the host's standard streams**: both return
   `ENOTTY`, where Linux answers for what is behind them: `FIONREAD` for a
   pipe, terminal, socket or regular file, `SIOCOUTQ` for a terminal or

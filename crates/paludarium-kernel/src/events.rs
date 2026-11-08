@@ -63,6 +63,7 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
         c.process,
         c.host.clock(paludarium_host::ClockId::Monotonic)?,
     );
+    crate::signalfd::observe(c.process, c.inbox, c.group);
     if signalled(c)
         || receipt.interrupted
         || (outcome == paludarium_host::WaitOutcome::Interrupted

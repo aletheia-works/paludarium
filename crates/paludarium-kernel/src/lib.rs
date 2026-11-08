@@ -12,6 +12,7 @@ mod coredump;
 mod credentials;
 mod inbox;
 mod permissions;
+mod signalfd;
 mod signals;
 pub use inbox::SignalInbox;
 mod devices;
@@ -785,6 +786,7 @@ impl Kernel {
             thread.cpu.gpr[reg::RAX] = paludarium_types::Errno::ENOSYS.to_syscall_return();
             return Next::Resume;
         };
+        signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             tid: thread.tid,
             host: &*self.host,

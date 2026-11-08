@@ -61,7 +61,7 @@ kernel.
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, and the pseudo-terminals' requests below) |
-| Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
+| Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
@@ -730,7 +730,7 @@ kernel.
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
   for this process's entries), followed by a space and `(deleted)` once
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
-  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]` or `[pidfd]` (an
+  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]` or `[pidfd]` (an
   anonymous inode's name, which pidfs, from Linux 6.9, still gives), and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
   own for it. Opening a link opens the file again by its path, or, for a
@@ -758,7 +758,7 @@ kernel.
   `O_PATH` descriptor of anything else), whose own link names the link, and
   that nothing reads through (`EBADF`); an open that follows its own link
   reaches the link (`ELOOP`). A socket gives `ENXIO`, as on Linux, and so
-  do an eventfd, an epoll and a timerfd, whose anonymous inode Linux opens
+  do an eventfd, an epoll, a timerfd and a signalfd, whose anonymous inode Linux opens
   with `no_open`. A pidfd opens as another description of its process, as
   root opens it (pidfs has no `open` of its own): with the access it is
   opened with and `O_NONBLOCK` of its own, even after the process is
@@ -851,6 +851,23 @@ kernel.
   the expirations since the last one, and `poll` and `epoll` see it readable
   once it has expired. `TFD_TIMER_CANCEL_ON_SET` is accepted, but the guest
   cannot set the clock, so it never cancels; the alarm clocks give `EPERM`.
+- A signalfd (`signalfd`, `signalfd4`) reads the signals of its mask that are
+  pending for the thread reading it, blocked or not, as Linux's
+  `dequeue_signal` takes them: the thread's own first, then the process's,
+  the lowest number first. A read gives as many 128-byte
+  `struct signalfd_siginfo` records as fit (`EINVAL` for less than one),
+  each with the fields Linux copies for that kind of signal: the sender's
+  process and user for `kill` and `sigqueue` (with the value), the child's
+  process, status and CPU time for `SIGCHLD`, a timer's ID, overrun and
+  value, and a fault's address. It waits for the first unless the file is
+  non-blocking, and a signal that can be delivered ends the wait (`EINTR`,
+  which `SA_RESTART` restarts). `poll`, `select` and `epoll` see the file
+  readable while one of its signals is pending for the calling thread, as
+  on Linux, so a thread's own signal is seen by that thread alone and a
+  forked child's inherited file reads the child's signals. `signalfd` on a
+  signalfd's descriptor gives it a new mask (`EINVAL` for another file);
+  `SIGKILL` and `SIGSTOP` never enter one. A write gives `EINVAL`, `pread`
+  and `pwrite` `ESPIPE`, and `lseek` 0, as Linux's `noop_llseek`.
 - POSIX timers run on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` and notify with
   a signal to the process (`SIGEV_SIGNAL`, with `SI_TIMER` siginfo and
   overruns), a signal to one of its threads (`SIGEV_THREAD_ID`), or not at all

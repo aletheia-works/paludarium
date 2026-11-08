@@ -53,7 +53,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、後述の疑似端末のリクエスト） |
-| イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
+| イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
@@ -663,7 +663,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `.`、`..` とシンボリックリンクを解決したファイルのパス（このプロセスのものは
   `/proc/<pid>/…`）で、どこからも指されなくなれば空白と `(deleted)` が付きます。ほかに
   `pipe:[<inode>]`、`socket:[<inode>]`、`anon_inode:[eventfd]`・`[eventpoll]`・
-  `[timerfd]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
+  `[timerfd]`・`[signalfd]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
   名前を返します）、`/memfd:<名前> (deleted)` です。
   そのためにパイプとソケットは自分の inode 番号を持ちます。リンクを開くと、ファイルを
   パスで開き直します。どのパスもそのファイルを指さなくなったとき（消された、または
@@ -688,7 +688,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `readlinkat(fd, "")` はリンク先を読み（ほかのものの `O_PATH` のディスクリプタでは
   `ENOENT`）、自分のリンクはそのリンクを指し、そこから読むことはできません（`EBADF`）。
   自分のリンクをたどって開くと、そのリンクに着くので `ELOOP` です。ソケットは Linux と
-  同じく `ENXIO` です。eventfd、epoll、timerfd も、Linux がその無名 inode を
+  同じく `ENXIO` です。eventfd、epoll、timerfd、signalfd も、Linux がその無名 inode を
   `no_open` で開くので `ENXIO` です。pidfd は、root が開いたときと同じく、そのプロセスの
   別の記述として開きます（pidfs は自分の `open` を持ちません）。アクセスは開いたときの
   もので、`O_NONBLOCK` も自分で持ち、プロセスが回収された後でも開けます。Linux は先に
@@ -770,6 +770,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。
   `TFD_TIMER_CANCEL_ON_SET` は受け付けますが、ゲストは時計を設定できないので取り消しは
   起きません。アラームの時計は `EPERM` を返します。
+- signalfd（`signalfd`、`signalfd4`）は、読むスレッドに保留されているシグナルのうち
+  マスクにあるものを、ブロックされていてもいなくても、Linux の `dequeue_signal` と
+  同じ順で読みます。スレッド自身のものが先で、次にプロセスのもの、それぞれ番号の
+  小さいものからです。1 回の読み込みで、入るだけの 128 バイトの
+  `struct signalfd_siginfo` を返し（1 つも入らなければ `EINVAL`）、それぞれに
+  Linux がシグナルの種類ごとに写す欄を入れます。`kill` と `sigqueue` なら送り手の
+  プロセスとユーザー（と値）、`SIGCHLD` なら子のプロセス・状態・CPU 時間、タイマー
+  なら ID・オーバーラン・値、フォールトならアドレスです。非ブロッキングでなければ
+  最初の 1 つを待ち、配送できるシグナルが来るとその待ちは終わります（`EINTR` で、
+  `SA_RESTART` なら再開します）。`poll`・`select`・`epoll` は、呼んだスレッドに
+  マスクのシグナルが保留されている間、Linux と同じく読めると見ます。そのため
+  スレッド自身へのシグナルはそのスレッドにだけ見え、fork した子が受け継いだ
+  ファイルは子のシグナルを読みます。signalfd のディスクリプタに `signalfd` を呼ぶと
+  マスクが変わります（ほかのファイルなら `EINVAL`）。`SIGKILL` と `SIGSTOP` は
+  マスクに入りません。書き込みは `EINVAL`、`pread` と `pwrite` は `ESPIPE`、`lseek` は
+  Linux の `noop_llseek` と同じく 0 を返します。
 - POSIX タイマーは `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き、プロセスへの
   シグナル（`SIGEV_SIGNAL`。`SI_TIMER` の siginfo とオーバーランつき）か、プロセスの
   中の 1 つのスレッドへのシグナル（`SIGEV_THREAD_ID`）で知らせるか、何も知らせません

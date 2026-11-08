@@ -784,6 +784,14 @@ fn positioned(
     }
     let file = c.files.descriptor(fd)?.file;
     file.seek(0, 1).map_err(|_| Errno::ESPIPE)?;
+    // A signalfd seeks (Linux's `noop_llseek`) but is not opened with
+    // FMODE_PREAD or FMODE_PWRITE.
+    if file
+        .as_any()
+        .is_some_and(|any| any.is::<crate::signalfd::SignalFile>())
+    {
+        return Err(Errno::ESPIPE);
+    }
     if file.flags() & 3 == if write { 0 } else { 1 } {
         return Err(Errno::EBADF);
     }
@@ -1311,6 +1319,10 @@ fn read_blocking(
 ) -> Result<usize, Errno> {
     // A pseudo-terminal reads as its line discipline says.
     if let Some(result) = crate::pty::read(c, file, b) {
+        return result;
+    }
+    // A signal file reads the reading thread's signals.
+    if let Some(result) = crate::signalfd::read(c, file, b) {
         return result;
     }
     // A socket's read waits as its SO_RCVLOWAT says. A pipe is a PipeEnd,
@@ -3461,6 +3473,7 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
             Some(v) if v.is::<crate::events::EventCounter>() => "eventfd",
             Some(v) if v.is::<crate::epoll::EpollInstance>() => "eventpoll",
             Some(v) if v.is::<crate::timerfd::TimerFile>() => "timerfd",
+            Some(v) if v.is::<crate::signalfd::SignalFile>() => "signalfd",
             // The last kind of no type; Linux 6.9 and later name it from
             // pidfs instead.
             _ => "pidfd",

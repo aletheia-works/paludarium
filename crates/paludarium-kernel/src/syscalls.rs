@@ -219,6 +219,8 @@ impl SyscallTable {
         ];
         handlers.extend(ids);
         handlers.insert(290, crate::events::dispatch);
+        handlers.insert(282, crate::signalfd::sys_signalfd);
+        handlers.insert(289, crate::signalfd::sys_signalfd4);
         // Tokio's current Linux std uses GRND_INSECURE to seed its scheduler;
         // the Host random boundary supplies secure bytes without OS passthrough.
         handlers.insert(318, sys_getrandom);

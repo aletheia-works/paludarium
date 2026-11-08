@@ -192,13 +192,18 @@ def cases(fx):
         "xxd": ["/usr/bin/xxd", "-l", "32", f"{fx}/words"],
         "less": shell("less -F /etc/os-release | wc -l"),
         "dpkg-query": ["/usr/bin/dpkg-query", "-W", "-f=${Version}\\n", "bash"],
-        # Signals, processes, sockets, pseudo-terminals, locks and /proc. Left out until
-        # paludarium has it: script (signalfd).
+        # Signals, processes, sockets, pseudo-terminals, locks and /proc.
         "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
         "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],
         "python-processes": ["/usr/bin/python3", f"{SCRIPTS}/processes.py"],
         "python-proc": ["/usr/bin/python3", f"{SCRIPTS}/proc.py"],
         "python-pty": ["/usr/bin/python3", f"{SCRIPTS}/terminals.py"],
+        # script runs a shell on a pseudo-terminal and waits on a signalfd for its SIGCHLD. The
+        # terminal echoes the piped line; the log's header and footer lines carry the date.
+        "script": shell(
+            "printf 'abc\\n' | script -qec 'read x; echo got $x; tty | sed s/[0-9]*$//; stty size; "
+            "exit 3' {O}/t; echo rc=$?; tr -d '\\r' < {O}/t | grep -v '^Script '"
+        ),
         # ps and pgrep read the /proc directories of this shell's children, sleep's once it
         # sleeps. Only the children: the native side shares its /proc with the other cases.
         "ps": shell(

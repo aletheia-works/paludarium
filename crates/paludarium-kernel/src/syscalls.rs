@@ -91,6 +91,7 @@ pub mod nr {
     pub const SCHED_GET_PRIORITY_MIN: u64 = 147;
     pub const SCHED_RR_GET_INTERVAL: u64 = 148;
     pub const MEMBARRIER: u64 = 324;
+    pub const SCHED_GETATTR: u64 = 315;
     pub const SCHED_YIELD: u64 = 24;
     pub const SYSINFO: u64 = 99;
     pub const GETGROUPS: u64 = 115;
@@ -145,7 +146,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 76] = [
+        let entries: [(u64, Handler); 77] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -201,6 +202,7 @@ impl SyscallTable {
             (nr::SCHED_GET_PRIORITY_MIN, sys_sched_get_priority),
             (nr::SCHED_RR_GET_INTERVAL, sys_sched_rr_get_interval),
             (nr::MEMBARRIER, sys_membarrier),
+            (nr::SCHED_GETATTR, sys_sched_getattr),
             (nr::MBIND, crate::mempolicy::sys_mbind),
             (nr::SET_MEMPOLICY, crate::mempolicy::sys_set_mempolicy),
             (nr::GET_MEMPOLICY, crate::mempolicy::sys_get_mempolicy),
@@ -2407,7 +2409,8 @@ fn sys_sched_getaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// mask (a shorter one counts the rest as clear, `EFAULT` if it cannot be
 /// read), keeps only the host's CPUs, and an empty result is `EINVAL`. The
 /// mask is kept for `sched_getaffinity` and inherited by new threads and
-/// processes; the host still runs the thread on any of its CPUs.
+/// processes; the host still runs the thread on any of its CPUs. A
+/// `SCHED_DEADLINE` thread's mask must keep every CPU (`EBUSY`).
 fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (pid, len) = (a[0] as u32 as i32, a[1] as usize);
     let cpus = active_cpus(c);
@@ -2435,6 +2438,16 @@ fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Ok(target) => target,
         Err(e) => return err(e),
     };
+    // dl_task_check_affinity: a deadline thread keeps every CPU (EBUSY).
+    let group = other.as_deref().unwrap_or(c.group);
+    if group.sched(tid).deadline_policy()
+        && !(0..cpus).all(|cpu| {
+            mask.get(cpu / 64)
+                .is_some_and(|word| word >> (cpu % 64) & 1 != 0)
+        })
+    {
+        return err(Errno(16)); // EBUSY
+    }
     if mask.iter().all(|&word| word == 0) {
         return err(Errno::EINVAL);
     }
@@ -2474,6 +2487,9 @@ pub(crate) const READ_IMPLIES_EXEC: u32 = 0x40_0000;
 /// `MMAP_PAGE_ZERO`.
 pub(crate) const PER_CLEAR_ON_SETID: u32 = 0x40_0000 | 0x4_0000 | 0x20_0000 | 0x10_0000;
 const UNAME26: u32 = 0x2_0000;
+/// `ADDR_COMPAT_LAYOUT` and `MMAP_PAGE_ZERO`, which the next exec applies.
+pub(crate) const ADDR_COMPAT_LAYOUT: u32 = 0x20_0000;
+pub(crate) const MMAP_PAGE_ZERO: u32 = 0x10_0000;
 const PER_LINUX32: u32 = 0x8;
 
 /// A readable mapping is also executable under `READ_IMPLIES_EXEC`, as
@@ -2502,36 +2518,41 @@ fn sys_personality(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// The thread `pid` names for the `sched_get*` calls (Linux's
-/// `find_process_by_pid`): 0 is the caller, a negative one is `EINVAL`, and
-/// one of no live thread `ESRCH`.
-fn sched_target(c: &Context<'_>, pid: u64) -> Result<(), Errno> {
+/// `find_process_by_pid`), with its scheduling attributes and nice value:
+/// 0 is the caller, a negative one is `EINVAL`, and one of no live thread
+/// `ESRCH`.
+fn sched_target(c: &Context<'_>, pid: u64) -> Result<(crate::scheduling::Sched, i32), Errno> {
     let pid = pid as u32 as i32;
     if pid < 0 {
         return Err(Errno::EINVAL);
     }
-    affinity_target(c, pid).map(drop)
+    let (tid, other) = affinity_target(c, pid)?;
+    let group = other.as_deref().unwrap_or(c.group);
+    Ok((group.sched(tid), group.nice(tid).unwrap_or(0)))
 }
 
-/// `sched_getscheduler(pid)`: every thread runs under `SCHED_OTHER` (0), as
-/// `sched_setscheduler` is not offered.
+/// `sched_getscheduler(pid)`: the thread's policy, with
+/// `SCHED_RESET_ON_FORK` when it is set.
 fn sys_sched_getscheduler(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     match sched_target(c, a[0]) {
-        Ok(()) => ok(0),
+        Ok((sched, _)) => ok(u64::from(sched.reported_policy())),
         Err(e) => err(e),
     }
 }
 
-/// `sched_getparam(pid, param)`: a `struct sched_param` whose priority is
-/// 0, as for every thread not under a real-time policy. A NULL `param` is
+/// `sched_getparam(pid, param)`: a `struct sched_param` with the thread's
+/// real-time priority, 0 under any other policy. A NULL `param` is
 /// `EINVAL` before the thread is looked for, as in Linux.
 fn sys_sched_getparam(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if a[1] == 0 {
         return err(Errno::EINVAL);
     }
-    if let Err(e) = sched_target(c, a[0]) {
-        return err(e);
-    }
-    match c.mem.write(GuestAddr(a[1]), &0i32.to_le_bytes()) {
+    let priority = match sched_target(c, a[0]) {
+        Ok((sched, _)) if crate::scheduling::rt_policy(sched.policy) => sched.priority,
+        Ok(_) => 0,
+        Err(e) => return err(e),
+    };
+    match c.mem.write(GuestAddr(a[1]), &priority.to_le_bytes()) {
         Ok(()) => ok(0),
         Err(_) => err(Errno::EFAULT),
     }
@@ -2550,23 +2571,93 @@ fn sys_sched_get_priority(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
 }
 
-/// `sched_rr_get_interval(pid, interval)`: the time slice of a thread
-/// under `SCHED_OTHER`, as Linux's `get_rr_interval_fair` gives it in
-/// whole jiffies: the host's own where it can tell ([`Host::time_slice`]),
-/// or else Linux's default at 1000 Hz, the base slice of 0.75 ms times
-/// 1 + log2 of the CPUs (at most 8).
+/// The normal policy's slice and the tick: the host's where it tells
+/// ([`Host::scheduler_slice`]), or else Linux 6.12's default at 1000 Hz,
+/// the base slice of 0.75 ms times 1 + log2 of the CPUs (at most 8).
+pub(crate) fn scheduler_slice(host: &dyn Host) -> paludarium_host::SchedulerSlice {
+    host.scheduler_slice().unwrap_or_else(|| {
+        let cpus = host.cpu_count().clamp(1, 8192);
+        paludarium_host::SchedulerSlice {
+            slice: 750_000 * (1 + u64::from(cpus.min(8).ilog2())),
+            tick: 1_000_000,
+        }
+    })
+}
+
+/// `sched_rr_get_interval(pid, interval)`, as Linux's classes give it:
+/// 100 ms under `SCHED_RR` (`sched_rr_timeslice_ms`), 0 under `SCHED_FIFO`
+/// and `SCHED_DEADLINE`, and else the thread's slice (the one
+/// `sched_setattr` asked for, or [`scheduler_slice`]'s) in whole ticks.
 fn sys_sched_rr_get_interval(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    if let Err(e) = sched_target(c, a[0]) {
-        return err(e);
-    }
-    let slice = c.host.time_slice().unwrap_or_else(|| {
-        let factor = 1 + u64::from(active_cpus(c).min(8).ilog2());
-        750_000 * factor / 1_000_000 * 1_000_000
-    });
+    use crate::scheduling::{SCHED_DEADLINE, SCHED_FIFO, SCHED_RR};
+    let sched = match sched_target(c, a[0]) {
+        Ok((sched, _)) => sched,
+        Err(e) => return err(e),
+    };
+    let interval = match sched.policy {
+        SCHED_RR => 100_000_000,
+        SCHED_FIFO | SCHED_DEADLINE => 0,
+        _ => {
+            let host = scheduler_slice(c.host);
+            sched.slice.unwrap_or(host.slice) / host.tick * host.tick
+        }
+    };
     let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&(slice / 1_000_000_000).to_le_bytes());
-    bytes[8..].copy_from_slice(&(slice % 1_000_000_000).to_le_bytes());
+    bytes[..8].copy_from_slice(&(interval / 1_000_000_000).to_le_bytes());
+    bytes[8..].copy_from_slice(&(interval % 1_000_000_000).to_le_bytes());
     match c.mem.write(GuestAddr(a[1]), &bytes) {
+        Ok(()) => ok(0),
+        Err(_) => err(Errno::EFAULT),
+    }
+}
+
+/// `sched_getattr(pid, attr, size, flags)`, as Linux's: `EINVAL` for a
+/// NULL `attr`, a negative `pid`, a size outside 48 (`SCHED_ATTR_SIZE_VER0`)
+/// to a page or any flag; then the thread (`ESRCH`); and the attributes,
+/// cut to `size` with `size` written as what was copied (at most 56). A
+/// normal policy reports its nice value and its slice as `sched_runtime`.
+fn sys_sched_getattr(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    use crate::scheduling::{FLAG_ALL, FLAG_RESET_ON_FORK, rt_policy};
+    let (pid, size, flags) = (a[0] as u32 as i32, a[2] as u32, a[3] as u32);
+    if a[1] == 0 || pid < 0 || !(48..=4096).contains(&size) || flags != 0 {
+        return err(Errno::EINVAL);
+    }
+    let (sched, nice) = match sched_target(c, a[0]) {
+        Ok(target) => target,
+        Err(e) => return err(e),
+    };
+    let mut sched_flags = if sched.reset_on_fork {
+        FLAG_RESET_ON_FORK
+    } else {
+        0
+    };
+    let (mut attr_nice, mut priority, mut runtime, mut deadline, mut period) = (0, 0, 0, 0, 0);
+    if sched.deadline_policy() {
+        priority = sched.priority;
+        runtime = sched.runtime;
+        deadline = sched.deadline;
+        period = sched.period;
+        sched_flags |= sched.dl_flags;
+    } else if rt_policy(sched.policy) {
+        priority = sched.priority;
+    } else {
+        attr_nice = nice;
+        runtime = sched.slice.unwrap_or_else(|| scheduler_slice(c.host).slice);
+    }
+    sched_flags &= FLAG_ALL;
+    let copied = size.min(56);
+    let mut bytes = Vec::with_capacity(56);
+    bytes.extend_from_slice(&copied.to_le_bytes());
+    bytes.extend_from_slice(&sched.policy.to_le_bytes());
+    bytes.extend_from_slice(&sched_flags.to_le_bytes());
+    bytes.extend_from_slice(&attr_nice.to_le_bytes());
+    bytes.extend_from_slice(&priority.to_le_bytes());
+    for value in [runtime, deadline, period] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&sched.clamps[0].value.to_le_bytes());
+    bytes.extend_from_slice(&sched.clamps[1].value.to_le_bytes());
+    match c.mem.write(GuestAddr(a[1]), &bytes[..copied as usize]) {
         Ok(()) => ok(0),
         Err(_) => err(Errno::EFAULT),
     }

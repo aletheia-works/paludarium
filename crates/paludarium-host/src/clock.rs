@@ -79,23 +79,31 @@ pub(crate) fn native_thread_cpu_time() -> Result<u64, Errno> {
 pub(crate) fn native_thread_cpu_time() -> Result<u64, Errno> {
     Err(Errno::ENOSYS)
 }
+/// The calling thread's slice from `sched_getattr` (Linux 6.12 and later
+/// report `se.slice` as `sched_runtime`), and the tick from the resolution
+/// of `CLOCK_MONOTONIC_COARSE`.
 #[cfg(target_os = "linux")]
-pub(crate) fn native_time_slice() -> Option<u64> {
-    let mut interval = libc::timespec {
+pub(crate) fn native_scheduler_slice() -> Option<crate::SchedulerSlice> {
+    // struct sched_attr: size, policy, flags, nice, priority, runtime, ...
+    let mut attr = [0u64; 7];
+    // SAFETY: `attr` is a live, aligned 56-byte buffer, the size passed.
+    let r = unsafe { libc::syscall(libc::SYS_sched_getattr, 0, attr.as_mut_ptr(), 56u32, 0u32) };
+    let mut resolution = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `interval` is a live, aligned timespec the call writes.
-    if unsafe { libc::sched_rr_get_interval(0, &raw mut interval) } != 0 {
-        return None;
-    }
-    u64::try_from(interval.tv_sec)
-        .ok()?
-        .checked_mul(1_000_000_000)?
-        .checked_add(u64::try_from(interval.tv_nsec).ok()?)
+    // SAFETY: `resolution` is a live, aligned timespec the call writes.
+    let ticked = unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC_COARSE, &raw mut resolution) };
+    let tick = u64::try_from(resolution.tv_nsec).ok()?;
+    (r == 0 && ticked == 0 && attr[3] != 0 && resolution.tv_sec == 0 && tick != 0).then_some(
+        crate::SchedulerSlice {
+            slice: attr[3],
+            tick,
+        },
+    )
 }
 #[cfg(not(any(target_os = "linux", target_arch = "wasm32")))]
-pub(crate) fn native_time_slice() -> Option<u64> {
+pub(crate) fn native_scheduler_slice() -> Option<crate::SchedulerSlice> {
     None
 }
 #[cfg(not(target_arch = "wasm32"))]

@@ -245,9 +245,9 @@ impl Host for RecordingHost {
     }
     /// The machine's own, as [`Host::cpu_count`] is: the differential
     /// harness runs the guest on the machine it compares with.
-    fn time_slice(&self) -> Option<u64> {
+    fn scheduler_slice(&self) -> Option<crate::SchedulerSlice> {
         #[cfg(not(target_arch = "wasm32"))]
-        return crate::clock::native_time_slice();
+        return crate::clock::native_scheduler_slice();
         #[cfg(target_arch = "wasm32")]
         None
     }

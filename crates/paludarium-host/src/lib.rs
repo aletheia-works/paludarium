@@ -238,10 +238,10 @@ pub trait Host: Send + Sync {
     fn cpu_count(&self) -> usize {
         std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     }
-    /// The time slice, in nanoseconds, the host's scheduler gives the calling
-    /// thread, as Linux's `sched_rr_get_interval` reports it; `None` where
-    /// the host does not tell.
-    fn time_slice(&self) -> Option<u64> {
+    /// The time slice the host's scheduler gives a thread of the normal
+    /// policy, and its tick, as Linux reports them; `None` where the host
+    /// does not tell.
+    fn scheduler_slice(&self) -> Option<SchedulerSlice> {
         None
     }
     /// Waits until a deadline while polling cancellation outside guest memory locks.
@@ -307,6 +307,15 @@ fn write_through(out: &mut dyn Write, buf: &[u8]) -> Result<usize, Errno> {
     Ok(buf.len())
 }
 
+/// The time slice of a thread under Linux's normal policy (`se.slice`, the
+/// `sched_runtime` that `sched_getattr` reports) and the scheduler's tick
+/// (the resolution of `CLOCK_MONOTONIC_COARSE`), both in nanoseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedulerSlice {
+    pub slice: u64,
+    pub tick: u64,
+}
+
 /// The native host (Linux, and the portable parts for macOS and Windows).
 /// Writes are unbuffered from the guest's point of view: every guest
 /// `write` is flushed before it returns.
@@ -338,8 +347,8 @@ impl Host for NativeHost {
     }
     /// On Linux, the guest's threads are the host's, so the host's time
     /// slice for this thread is the guest thread's.
-    fn time_slice(&self) -> Option<u64> {
-        clock::native_time_slice()
+    fn scheduler_slice(&self) -> Option<SchedulerSlice> {
+        clock::native_scheduler_slice()
     }
     fn wait_until(
         &self,

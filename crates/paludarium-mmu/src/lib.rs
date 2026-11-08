@@ -818,6 +818,10 @@ struct AddressSpaceData {
     initial_break: GuestAddr,
     current_break: GuestAddr,
     mmap_top: u64,
+    /// Where mappings without a fixed address start, upward, in Linux's
+    /// legacy layout (`ADDR_COMPAT_LAYOUT`); else they go down from
+    /// `mmap_top`.
+    bottom_up: Option<u64>,
     shared: BTreeMap<u64, SharedMapping>,
     /// The files of private file mappings, by range ([`FileBacking`]).
     backing: BTreeMap<u64, FileBacking>,
@@ -909,6 +913,7 @@ impl AddressSpaceData {
             initial_break: GuestAddr(0),
             current_break: GuestAddr(0),
             mmap_top: DEFAULT_MMAP_TOP,
+            bottom_up: None,
             meter: None,
             out_of_memory: Arc::default(),
             tlb: RefCell::default(),
@@ -1223,6 +1228,7 @@ impl AddressSpaceData {
         copy.initial_break = self.initial_break;
         copy.current_break = self.current_break;
         copy.mmap_top = self.mmap_top;
+        copy.bottom_up = self.bottom_up;
         let mut directory = BTreeMap::new();
         let shared = &self.shared;
         let own = self
@@ -1271,6 +1277,16 @@ impl AddressSpaceData {
     /// Sets the top of the region used for mappings without a fixed address.
     pub fn set_mmap_top(&mut self, top: GuestAddr) {
         self.mmap_top = top.page_align_down().0.min(USER_ADDRESS_LIMIT);
+    }
+    /// Places mappings without a fixed address upward from `base`, as
+    /// Linux's legacy layout does, or (`None`) down from the top.
+    pub fn set_bottom_up(&mut self, base: Option<GuestAddr>) {
+        self.bottom_up = base.map(|base| base.page_align_down().0);
+    }
+    /// Where mappings without a fixed address start, upward, if they do.
+    #[must_use]
+    pub fn bottom_up(&self) -> Option<u64> {
+        self.bottom_up
     }
 
     fn read_directory(&self) -> RwLockReadGuard<'_, Directory> {
@@ -1762,7 +1778,26 @@ impl AddressSpaceData {
             .is_some_and(|(_, m)| m.end() > start)
     }
 
+    /// The lowest address from `from`, a multiple of `align` (a power of
+    /// two), with `len` free bytes below TASK_SIZE.
+    fn lowest_gap(&self, from: u64, len: u64, align: u64) -> Option<u64> {
+        let limit = USER_ADDRESS_LIMIT - PAGE_SIZE;
+        let mut start = from.checked_next_multiple_of(align)?;
+        for (_, m) in self.mappings.range(..limit) {
+            if m.end() <= start {
+                continue;
+            }
+            if m.start.0 >= start.checked_add(len)? {
+                break;
+            }
+            start = m.end().checked_next_multiple_of(align)?;
+        }
+        (start.checked_add(len)? <= limit).then_some(start)
+    }
     fn find_free(&self, len: u64) -> Option<u64> {
+        if let Some(base) = self.bottom_up {
+            return self.lowest_gap(base, len, PAGE_SIZE);
+        }
         let mut end = self.mmap_top;
         for (_, m) in self.mappings.range(..self.mmap_top).rev() {
             if m.end() <= end && end - m.end() >= len {
@@ -2805,6 +2840,21 @@ impl AddressSpace {
     }
     pub fn set_mmap_top(&mut self, top: GuestAddr) {
         self.locked().set_mmap_top(top);
+    }
+    /// Places mappings without a fixed address upward from `base`, as
+    /// Linux's legacy layout does, or (`None`) down from the top.
+    pub fn set_bottom_up(&mut self, base: Option<GuestAddr>) {
+        self.locked().set_bottom_up(base);
+    }
+    /// The lowest address from `from`, a multiple of `align` (a power of
+    /// two), with `len` free bytes below TASK_SIZE.
+    #[must_use]
+    pub fn lowest_gap(&self, from: GuestAddr, len: u64, align: u64) -> Option<GuestAddr> {
+        self.locked().lowest_gap(from.0, len, align).map(GuestAddr)
+    }
+    #[must_use]
+    pub fn bottom_up(&self) -> Option<u64> {
+        self.locked().bottom_up()
     }
     pub fn read(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
         if self.data_locked().read_cached(addr, buf, Access::Read) {

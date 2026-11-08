@@ -33,6 +33,7 @@ mod proc;
 mod processes;
 mod pty;
 mod record_locks;
+mod scheduling;
 mod sockets;
 mod syscalls;
 mod threads;

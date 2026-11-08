@@ -23,8 +23,8 @@ import subprocess
 import sys
 import time
 
-# Even if every case ran out its time, the cases would end in about 143
-# minutes (101 cases on 4 workers, 330 s each), within the workflow's 180 with
+# Even if every case ran out its time, the cases would end in about 154
+# minutes (112 cases on 4 workers, 330 s each), within the workflow's 180 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
 # ended. The slowest cases, Emacs and g++, took up to 180 s under the emulator
@@ -82,7 +82,7 @@ def cases(fx):
     def shell(script):
         return ["/bin/bash", "-c", script]
 
-    return {
+    return runtimes(shell) | {
         "ls": ["/bin/ls", "-la", "/usr/share/doc/bash"],
         "cat": ["/bin/cat", "/etc/os-release"],
         "sort": ["/usr/bin/sort", "-n", f"{fx}/words"],
@@ -195,6 +195,11 @@ def cases(fx):
         # Signals, processes, sockets, locks and /proc. Left out until paludarium has
         # them: pseudo-terminals (python's pty, script), and the /proc
         # directories of other processes (ps).
+        # Left out of runtimes() until paludarium handles them: Java and Erlang,
+        # since the CLI runs the first program as /<file name> (Java's $ORIGIN)
+        # and only an ELF one (erl is a script); fish, whose command
+        # substitution fails with EBADF from fcntl; and PostgreSQL, whose data
+        # directory must belong to postgres, which a host mount cannot give it.
         "python-signals": ["/usr/bin/python3", f"{SCRIPTS}/signals.py"],
         "python-sockets": ["/usr/bin/python3", f"{SCRIPTS}/sockets.py"],
         "python-processes": ["/usr/bin/python3", f"{SCRIPTS}/processes.py"],
@@ -409,6 +414,75 @@ def cases(fx):
     }
 
 
+def runtimes(shell):
+    """Language runtimes with their own threads, memory management or JIT, and
+    servers on the loopback."""
+    return {
+        "sbcl": [
+            "/usr/bin/sbcl",
+            "--non-interactive",
+            "--no-userinit",
+            "--no-sysinit",
+            "--eval",
+            "(progn (print (loop for i from 1 to 100 sum (* i i))) "
+            "(let ((v (make-array 1000000 :initial-element 1))) (sb-ext:gc :full t) (print (reduce #'+ v))) "
+            "(print (length (make-list 100000))) (terpri))",
+        ],
+        "luajit": [
+            "/usr/bin/luajit",
+            "-e",
+            "local s = 0 for i = 1, 1e7 do s = s + i % 7 end print(s) print((jit.status()))",
+        ],
+        "ocaml": shell(
+            'cd {O} && echo \'let () = List.iter (Printf.printf "%d ") (List.sort compare [3; 1; 2]); '
+            'print_newline (); Printf.printf "%.3f\\n" (sqrt 2.)\' > t.ml && ocaml t.ml'
+        ),
+        "r": [
+            "/usr/bin/Rscript",
+            "-e",
+            "x <- c(3, 1, 2); print(sort(x)); d <- data.frame(x = 1:10, y = 2 * (1:10) + 1); "
+            "print(round(coef(lm(y ~ x, d)), 6)); print(sum(sapply(1:100, function(i) i^2)))",
+        ],
+        "guile": [
+            "/usr/bin/guile",
+            "-c",
+            "(display (apply + (map (lambda (x) (* x x)) (iota 10)))) (newline)",
+        ],
+        "pandoc": shell(
+            "printf '# Title\\n\\nSome *emphasis* and `code`.\\n' | pandoc -f markdown -t html"
+        ),
+        "graphviz": shell(
+            "echo 'digraph { a -> b; b -> c; }' | dot -Tsvg | grep -c '<g id=\"node'"
+        ),
+        "imagemagick": shell(
+            "cd {O} && convert -size 16x8 xc:red -fill blue -draw 'rectangle 0,0 7,7' i.png && "
+            "identify -format '%wx%h %m\\n' i.png && convert i.png -format '%[pixel:p{1,1}] %[pixel:p{12,4}]\\n' info:"
+        ),
+        # Its workers run as root: making them another user chowns its
+        # temporary directories, which a host mount refuses (EPERM).
+        "nginx": shell(
+            "cd {O} && mkdir www logs && echo from nginx > www/index.html && "
+            "printf 'daemon off; user root root; worker_processes 2; error_log {O}/logs/error.log; pid {O}/nginx.pid;\\n"
+            "events {}\\nhttp { access_log off; server { listen 127.0.0.1:18081; root {O}/www; } }\\n' > nginx.conf && "
+            "{ /usr/sbin/nginx -p {O}/ -c {O}/nginx.conf & } && server=$! && for i in $(seq 200); do "
+            "curl -sf http://127.0.0.1:18081/ && break; sleep 0.1; done && "
+            "curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:18081/missing; kill -QUIT $server; wait $server; "
+            "echo server $?"
+        ),
+        "memcached": shell(
+            "{ memcached -u root -l 127.0.0.1 -p 11311 -t 2 & } && server=$! && for i in $(seq 200); do "
+            "printf 'version\\r\\n' | socat -t1 - TCP:127.0.0.1:11311 >/dev/null 2>&1 && break; sleep 0.1; done && "
+            "printf 'set k 0 0 5\\r\\nhello\\r\\nget k\\r\\nincr n 1\\r\\nquit\\r\\n' | socat -t2 - TCP:127.0.0.1:11311 "
+            "| tr -d '\\r'; kill $server; wait $server; echo server $?"
+        ),
+        "socat": shell(
+            "{ socat TCP-LISTEN:18082,bind=127.0.0.1,reuseaddr,fork EXEC:'tr a-z A-Z' & } && server=$! && "
+            "for i in $(seq 200); do echo probe | socat -t1 - TCP:127.0.0.1:18082 >/dev/null 2>&1 && break; sleep 0.1; done; "
+            "echo through socat | socat -t2 - TCP:127.0.0.1:18082; kill $server; wait $server 2>/dev/null; echo done"
+        ),
+    }
+
+
 def environment(work):
     return {
         "PATH": "/usr/bin:/bin",
@@ -423,7 +497,8 @@ def environment(work):
 # The emulator's own options for a case. Without --allow-net a guest has no
 # network, not even a loopback (docs/guide/features.md#network).
 OPTIONS = {
-    name: ["--allow-net", "127.0.0.1"] for name in ("python-sockets", "redis", "http-server")
+    name: ["--allow-net", "127.0.0.1"]
+    for name in ("python-sockets", "redis", "http-server", "nginx", "memcached", "socat")
 }
 
 

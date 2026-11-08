@@ -91,7 +91,7 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
 - 毎晩、Debian の動的リンクのプログラムを、Debian のコンテナの中で本物の Linux と
   エミュレーターの両方で動かし、終了コードと標準出力を比べます
   （`tests/guests/distro/compare.py`）。シェル、awk、Perl、Python、Ruby、PHP、Lua、Tcl、
-  Node.js、Go、Emacs、BusyBox、SQLite、Redis、圧縮のツール、Git、OpenSSL、GnuPG、rsync、
+  Node.js、Go、LuaJIT、OCaml、R、Guile、SBCL、pandoc、Emacs、BusyBox、SQLite、Redis、memcached、nginx、圧縮のツール、Git、OpenSSL、GnuPG、rsync、
   make、CMake、Ninja、gcc、g++、binutils などです。シグナルとタイマー、子プロセスとスレッド、ループバックのソケット、
   ファイルのロック（複数のプロセスが書き込む SQLite の WAL）、`/proc` を使うケースもあります。エミュレーターではコンテナのルートをマウントして動かすので、
   両方とも同じライブラリを読みます。どのケースも自分のディレクトリに書き、時刻を

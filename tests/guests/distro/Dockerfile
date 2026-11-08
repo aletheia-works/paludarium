@@ -18,3 +18,8 @@ RUN apt-get update \
 COPY scripts/goroutines.go /opt/go/goroutines.go
 RUN cd /opt/go && GOCACHE=/tmp/go-cache CGO_ENABLED=0 go build -o /usr/local/bin/goroutines goroutines.go \
  && rm -rf /tmp/go-cache
+# Language runtimes and servers the runtimes() cases run.
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    graphviz guile-3.0 imagemagick luajit memcached nginx ocaml pandoc r-base-core sbcl socat \
+ && rm -rf /var/lib/apt/lists/*

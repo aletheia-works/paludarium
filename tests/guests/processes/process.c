@@ -3493,9 +3493,11 @@ static int proc_other_files_cases(const char *self) {
     proc_read(path, buffer, sizeof buffer);
     printf("comm=%s", buffer);
 
+    /* The kid runs `self`, which the emulated run's own program is only a
+       copy of, so its link names `self` with its links resolved. */
     char target[4096], own_exe[4096];
-    ssize_t length = readlink("/proc/self/exe", own_exe, sizeof own_exe - 1);
-    own_exe[length > 0 ? length : 0] = 0;
+    ssize_t length;
+    if (!realpath(self, own_exe)) own_exe[0] = 0;
     snprintf(path, sizeof path, "/proc/%d/exe", (int)kid);
     length = readlink(path, target, sizeof target - 1);
     target[length > 0 ? length : 0] = 0;

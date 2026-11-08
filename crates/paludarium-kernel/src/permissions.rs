@@ -326,6 +326,7 @@ pub(crate) fn rename(
     creds: &Credentials,
     old: (u64, &[u8]),
     new: (u64, &[u8]),
+    flags: u32,
     devices: impl Fn() -> bool,
 ) -> Result<(), Errno> {
     let from = search(files, creds, old.0, old.1, false)?;
@@ -334,7 +335,20 @@ pub(crate) fn rename(
     else {
         return Ok(());
     };
-    if !devices() || to.file.is_some_and(|target| target.inode == source.inode) {
+    // Another mount is the filesystem's EXDEV.
+    if !devices() {
+        return Ok(());
+    }
+    // renameat2's: a name RENAME_NOREPLACE would replace, and one
+    // RENAME_EXCHANGE would swap with nothing, before any permission.
+    // By the bit, as Linux tests it: RENAME_NOREPLACE with
+    // RENAME_WHITEOUT refuses a name that is there too.
+    match &to.file {
+        Some(_) if flags & 1 != 0 => return Err(Errno::EEXIST),
+        None if flags & 2 != 0 => return Err(Errno::ENOENT),
+        _ => {}
+    }
+    if to.file.is_some_and(|target| target.inode == source.inode) {
         return Ok(());
     }
     may_delete(creds, &old_parent, &source)?;
@@ -345,7 +359,18 @@ pub(crate) fn rename(
     if source.mode & TYPE == DIRECTORY && old_parent.inode != new_parent.inode {
         permission(creds, &source, MAY_WRITE)?;
     }
+    // An exchange also moves the other directory to the first's parent.
+    if let Some(target) = to.file.filter(|t| flags == 2 && t.mode & TYPE == DIRECTORY)
+        && old_parent.inode != new_parent.inode
+    {
+        permission(creds, &target, MAY_WRITE)?;
+    }
     Ok(())
+}
+
+/// `CAP_MKNOD`, which `RENAME_WHITEOUT` needs.
+pub(crate) fn may_mknod(creds: &Credentials) -> bool {
+    capable(creds, 1 << 27)
 }
 
 /// `chmod`'s check (`setattr_prepare`): the owner or `CAP_FOWNER`, else

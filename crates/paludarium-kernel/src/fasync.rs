@@ -1,15 +1,15 @@
 //! Signal-driven I/O, as Linux's `fcntl.c` and `kill_fasync` have it: the
 //! owner (`F_SETOWN`, `F_SETOWN_EX`) and signal (`F_SETSIG`) of an open file,
-//! and the signal a pipe, socket or the host's standard stream with
-//! `O_ASYNC` sends its owner when it changes.
+//! and the signal a pipe, socket, pseudo-terminal or the host's standard
+//! stream with `O_ASYNC` sends its owner when it changes.
 use crate::processes::Processes;
 use crate::syscalls::Context;
 use paludarium_host::FileHandle;
 use paludarium_types::{Errno, GuestAddr};
 use std::sync::{Arc, Weak};
 
-/// `O_ASYNC` (`FASYNC`): only pipes, sockets and a standard stream that is
-/// one or a terminal keep it, the files that have Linux's `fasync`
+/// `O_ASYNC` (`FASYNC`): only pipes, sockets, pseudo-terminals and a
+/// standard stream that is one or a terminal keep it, the files that have Linux's `fasync`
 /// ([`has_fasync`]); on any other `F_SETFL` drops it.
 pub(crate) const O_ASYNC: u32 = 0o20000;
 
@@ -89,11 +89,13 @@ pub(crate) fn siginfo(signal: i32, fd: i32, reason: Reason) -> [u8; 48] {
     info
 }
 
-/// Whether `file` has Linux's `fasync`: a pipe or a socket, or a host's
-/// standard stream when that is one, or a terminal.
+/// Whether `file` has Linux's `fasync`: a pipe, a socket or a
+/// pseudo-terminal, or a host's standard stream when that is a pipe, a
+/// socket or a terminal.
 pub(crate) fn has_fasync(file: &Arc<dyn FileHandle>) -> bool {
     crate::sockets::endpoint(file).is_some()
         || crate::inet::of(file).is_some()
+        || crate::pty::is_terminal(file)
         || crate::files::standard(file).is_some_and(crate::files::StandardFile::signals)
 }
 
@@ -158,6 +160,10 @@ pub(crate) fn set_flags(
         flags & !O_ASYNC
     };
     let before = file.flags();
+    // A hung-up terminal's `fasync` refuses, and nothing changes.
+    if (before ^ flags) & O_ASYNC != 0 && crate::pty::hung_up(file) {
+        return Err(Errno::ENOTTY);
+    }
     file.set_flags(flags)?;
     if (before ^ flags) & O_ASYNC != 0 {
         let registration = (flags & O_ASYNC != 0).then(|| Registration {
@@ -170,6 +176,8 @@ pub(crate) fn set_flags(
             endpoint.set_async(registration);
         } else if let Some(socket) = crate::inet::of(file) {
             socket.set_async(registration);
+        } else if crate::pty::is_terminal(file) {
+            crate::pty::set_async(c, file, registration);
         } else if let Some(stdin) = crate::files::standard(file) {
             stdin.set_async(file, registration);
         }

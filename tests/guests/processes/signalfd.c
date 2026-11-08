@@ -223,6 +223,54 @@ static int case_epoll(void) {
     return 0;
 }
 
+/* Edge-triggered epoll gets an edge for each signal queued to the process,
+   as Linux's signalfd_notify wakes the file: one of the file's again, a
+   real-time signal while one of its number waits, or another signal while
+   one of the file's waits; and for a new mask. A signal already pending, or
+   one ignored, queues nothing. */
+static int case_edges(void) {
+    int rt = SIGRTMIN + 1;
+    sigset_t set = set_of(2, SIGUSR1, rt);
+    block(set_of(4, SIGUSR1, SIGUSR2, rt, SIGCHLD));
+    int fd = signalfd(-1, &set, SFD_NONBLOCK);
+    int edge = epoll_create1(0);
+    struct epoll_event event = {.events = EPOLLIN | EPOLLET, .data.u32 = 1};
+    epoll_ctl(edge, EPOLL_CTL_ADD, fd, &event);
+    struct epoll_event out[2];
+    say("empty %d", epoll_wait(edge, out, 2, 0));
+    kill(getpid(), SIGUSR2);
+    say("other signal alone %d", epoll_wait(edge, out, 2, 0));
+    kill(getpid(), SIGUSR1);
+    say("signal %d", epoll_wait(edge, out, 2, 0));
+    say("again %d", epoll_wait(edge, out, 2, 0));
+    kill(getpid(), SIGUSR1);
+    say("already pending %d", epoll_wait(edge, out, 2, 0));
+    kill(getpid(), SIGUSR2);
+    say("already pending other %d", epoll_wait(edge, out, 2, 0));
+    signal(SIGURG, SIG_DFL);
+    kill(getpid(), SIGURG);
+    say("ignored %d", epoll_wait(edge, out, 2, 0));
+    signal(SIGPIPE, SIG_IGN);
+    kill(getpid(), SIGPIPE);
+    say("ignored by handler %d", epoll_wait(edge, out, 2, 0));
+    kill(getpid(), SIGCHLD);
+    say("blocked default-ignored %d", epoll_wait(edge, out, 2, 0));
+    sigqueue(getpid(), rt, (union sigval){0});
+    say("real-time %d", epoll_wait(edge, out, 2, 0));
+    sigqueue(getpid(), rt, (union sigval){0});
+    say("real-time again %d", epoll_wait(edge, out, 2, 0));
+    say("quiet %d", epoll_wait(edge, out, 2, 0));
+    say("new mask %d", TRY(signalfd(fd, &set, 0)) == fd);
+    say("after new mask %d", epoll_wait(edge, out, 2, 0));
+    /* The thread's own signal counts as the process's does. */
+    syscall(SYS_tgkill, getpid(), gettid(), rt);
+    say("thread signal %d", epoll_wait(edge, out, 2, 0));
+    struct signalfd_siginfo info[8];
+    say("read %ld", TRY(read(fd, info, sizeof info)) / (long)sizeof *info);
+    say("taken %d", epoll_wait(edge, out, 2, 0));
+    return 0;
+}
+
 static int thread_fd;
 static pid_t thread_id;
 static volatile int thread_go;
@@ -319,5 +367,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "signalfd-threads")) return case_threads();
     if (!strcmp(mode, "signalfd-fork")) return case_fork();
     if (!strcmp(mode, "signalfd-interrupt")) return case_interrupt();
+    if (!strcmp(mode, "signalfd-edges")) return case_edges();
     return 2;
 }

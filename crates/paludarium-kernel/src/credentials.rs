@@ -18,6 +18,7 @@ const CAP_SETPCAP: u64 = 1 << 8;
 const CAP_SYS_ADMIN: u64 = 1 << 21;
 const CAP_SYS_NICE: u64 = 1 << 23;
 const CAP_SYS_RESOURCE: u64 = 1 << 24;
+const CAP_SYS_TTY_CONFIG: u64 = 1 << 26;
 /// The capabilities a filesystem ID of root brings (`CAP_FS_MASK`):
 /// CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER,
 /// CAP_FSETID, CAP_LINUX_IMMUTABLE, CAP_MKNOD and CAP_MAC_OVERRIDE.
@@ -174,6 +175,10 @@ impl Credentials {
             inheritable,
             ..self.clone()
         })
+    }
+    /// CAP_SYS_TTY_CONFIG, which `vhangup` asks for.
+    pub(crate) fn may_configure_terminals(&self) -> bool {
+        self.effective & CAP_SYS_TTY_CONFIG != 0
     }
     /// CAP_SYS_ADMIN, which `trusted.*` and `security.*` attributes ask for.
     pub(crate) fn may_administer(&self) -> bool {

@@ -637,6 +637,28 @@ void _start(void) {
   long t=S(2,"/tmp",65536,0);long o=call(257,W(t),(long)(p+5),0,0,0,0);results[x++]=o>=0;
   results[x++]=S(72,0x7fffffff00000000L|99,1,0);results[x++]=S(72,d,W(1),0);results[x++]=S(16,d,W(0x5450),0);results[x++]=S(72,d,W(1),0);results[x++]=S(72,W(0xffffffffL),1,0);
   S(3,d,0,0);S(3,t,0,0);S(3,o,0,0);}
+ if(CASE==63){ /* renameat2: RENAME_NOREPLACE (1), RENAME_EXCHANGE (2), and the flags Linux refuses */
+  #define R2(a,b,f) call(316,-100,(long)(a),-100,(long)(b),f,0)
+  #define RSIZE(n) (S(4,n,st,0)<0?-1:*(long*)(st+48))
+  #define ISDIR(n) (S(6,n,st,0)<0?-1:(*(unsigned*)(st+24)&0170000)==040000)
+  #define LINKS(n) (S(4,n,st,0)<0?-1:*(long*)(st+16))
+  static char d[]="/tmp/paludarium-files-dir",sub[]="/tmp/paludarium-files-dir/sub";
+  S(1,fd,"abc",3);long o=S(2,q,66,0600);S(1,o,"quux!",5);S(3,o,0,0);
+  results[x++]=R2(p,q,8);results[x++]=R2(p,q,3);results[x++]=R2(p,q,6);results[x++]=R2(p,q,5);
+  results[x++]=R2(p,q,1);results[x++]=R2(p,p,1);results[x++]=R2("/tmp/paludarium-files-missing",q,1);
+  results[x++]=R2(p,r,2);results[x++]=R2(p,r,1);results[x++]=RSIZE(p);results[x++]=RSIZE(r);results[x++]=R2(r,p,0);
+  /* An exchange swaps the files; the descriptor's name follows its file. */
+  results[x++]=R2(p,q,2);results[x++]=RSIZE(p);results[x++]=RSIZE(q);
+  long n=S(89,fdpath(fd),buf,4096);results[x++]=same(buf,n,q);results[x++]=R2(p,p,2);
+  /* A directory and a file, in one directory and between two. */
+  S(83,d,0755,0);S(83,sub,0755,0);
+  results[x++]=R2(d,q,2);results[x++]=ISDIR(q);results[x++]=ISDIR(d);
+  n=S(89,fdpath(fd),buf,4096);results[x++]=same(buf,n,d);results[x++]=R2(q,d,2);
+  results[x++]=R2(d,sub,2);results[x++]=R2(sub,d,2);results[x++]=R2(d,sub,1);
+  o=S(2,r,66,0600);S(3,o,0,0);long before=LINKS("/tmp"),dlinks=LINKS(d);
+  results[x++]=R2(r,sub,2);results[x++]=ISDIR(r);results[x++]=ISDIR(sub);
+  results[x++]=LINKS(d)-dlinks;results[x++]=LINKS("/tmp")-before;
+  S(84,r,0,0);S(87,sub,0,0);S(84,d,0,0);}
  S(3,fd,0,0);S(87,p,0,0);S(87,q,0,0);S(87,r,0,0);
  }
  S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27||CASE==59)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);

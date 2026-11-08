@@ -12,7 +12,7 @@ pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
     82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 133, 137, 138, 162, 188, 189, 190, 191,
     192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 257, 258, 259, 260, 262, 263, 264, 265, 266,
-    267, 268, 269, 280, 285, 292, 293, 295, 296, 319, 326, 332, 436, 439, 452,
+    267, 268, 269, 280, 285, 292, 293, 295, 296, 316, 319, 326, 332, 436, 439, 452,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -2149,7 +2149,19 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             *c.files.cwd.lock().unwrap_or_else(PoisonError::into_inner) = p;
             Ok(0)
         }
-        82 | 264 => {
+        82 | 264 | 316 => {
+            // renameat2's flags, checked as Linux's do_renameat2 checks them
+            // before it looks a name up: RENAME_NOREPLACE (1),
+            // RENAME_EXCHANGE (2) and RENAME_WHITEOUT (4), which needs
+            // CAP_MKNOD and which no filesystem here has (EINVAL).
+            let flags = if n == 316 { a[4] } else { 0 };
+            if flags & !7 != 0 || flags & 5 != 0 && flags & 2 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if flags & 4 != 0 && !crate::permissions::may_mknod(&c.process.credentials) {
+                return Err(Errno::EPERM);
+            }
+            let flags = flags as u32;
             let ((old_dir, old_raw), (new_dir, new_raw)) = if n == 82 {
                 (
                     ((-100i32) as u64, path(c, a[0])?),
@@ -2165,9 +2177,33 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 &c.process.credentials,
                 (old_dir, &old_raw),
                 (new_dir, &new_raw),
+                flags,
                 || device(c, &old) == device(c, &new),
             )?;
-            c.files.fs.rename(&old, &new)?;
+            // A filesystem here refuses RENAME_WHITEOUT (EINVAL), but Linux
+            // first refuses a name RENAME_NOREPLACE would replace, also for
+            // root, whose lookups permissions::rename skips.
+            if flags & 5 == 5
+                && c.files.fs.metadata(&old, false).is_ok()
+                && c.files.fs.metadata(&new, false).is_ok()
+            {
+                return Err(Errno::EEXIST);
+            }
+            c.files.fs.rename_with(&old, &new, flags)?;
+            // The paths of descriptors and the working directory under a
+            // name that moved; an exchange moves both names.
+            let moved = |p: &[u8]| -> Option<Vec<u8>> {
+                let under = |from: &[u8], to: &[u8]| {
+                    (p == from || p.starts_with(from) && p.get(from.len()) == Some(&b'/')).then(
+                        || {
+                            let mut q = to.to_vec();
+                            q.extend_from_slice(&p[from.len()..]);
+                            q
+                        },
+                    )
+                };
+                under(&old, &new).or_else(|| (flags == 2).then(|| under(&new, &old)).flatten())
+            };
             for d in c
                 .files
                 .fds
@@ -2175,17 +2211,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 .unwrap_or_else(PoisonError::into_inner)
                 .values_mut()
             {
-                if d.path == old || d.path.starts_with(&old) && d.path.get(old.len()) == Some(&b'/')
-                {
-                    let mut p = new.clone();
-                    p.extend_from_slice(&d.path[old.len()..]);
+                if let Some(p) = moved(&d.path) {
                     d.path = p;
                 }
             }
             let mut cwd = c.files.cwd.lock().unwrap_or_else(PoisonError::into_inner);
-            if *cwd == old || cwd.starts_with(&old) && cwd.get(old.len()) == Some(&b'/') {
-                let mut p = new.clone();
-                p.extend_from_slice(&cwd[old.len()..]);
+            if let Some(p) = moved(&cwd) {
                 *cwd = p;
             }
             Ok(0)

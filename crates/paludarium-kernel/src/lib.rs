@@ -170,6 +170,10 @@ pub struct ThreadState {
     pub clear_child_tid: u64,
     pub exit_status: Option<ExitStatus>,
     pub(crate) pending: Vec<signals::PendingSignal>,
+    /// The signals [`signals::queue`] has made pending here that Linux would
+    /// have queued ([`signals::wakes`]), each of which its `signalfd_notify`
+    /// wakes a signal file for.
+    pub(crate) arrivals: u64,
     pub(crate) frames: Vec<signals::SavedFrame>,
     pub(crate) timer: signals::RealTimer,
     /// The earliest POSIX timer deadline, synced from the thread group.

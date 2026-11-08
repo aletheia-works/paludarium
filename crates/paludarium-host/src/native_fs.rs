@@ -1019,6 +1019,45 @@ impl HostFs for NativeFs {
             .rename(path(a)?, &self.root, path(b)?)
             .map_err(err)
     }
+    /// The host's own `renameat2` (Linux) or `renameatx_np` (macOS), on the
+    /// final names in their parent directories, which are opened within the
+    /// mount. Other hosts have neither flag (`EINVAL`).
+    fn rename_with(&self, a: &[u8], b: &[u8], flags: u32) -> Result<(), Errno> {
+        if flags == 0 {
+            return self.rename(a, b);
+        }
+        if flags & !3 != 0 || flags == 3 {
+            return Err(Errno::EINVAL);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            use rustix::fs::RenameFlags;
+            let parent = |p: &[u8]| -> Result<(Dir, PathBuf), Errno> {
+                let relative = path(p)?;
+                let name = PathBuf::from(relative.file_name().ok_or(Errno(16))?); // EBUSY: the mount itself
+                let dir = match relative.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    Some(parent) => self.root.open_dir(parent),
+                    None => self.root.try_clone(),
+                }
+                .map_err(err)?;
+                Ok((dir, name))
+            };
+            let (old_dir, old) = parent(a)?;
+            let (new_dir, new) = parent(b)?;
+            let flags = if flags == 1 {
+                RenameFlags::NOREPLACE
+            } else {
+                RenameFlags::EXCHANGE
+            };
+            rustix::fs::renameat_with(&old_dir, &old, &new_dir, &new, flags)
+                .map_err(|e| err(e.into()))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        {
+            let _ = (a, b);
+            Err(Errno::EINVAL)
+        }
+    }
     fn read_dir(&self, p: &[u8]) -> Result<Vec<DirectoryEntry>, Errno> {
         self.root
             .read_dir(path(p)?)
@@ -1503,6 +1542,25 @@ mod files_tests {
             assert_eq!(ids(b"d/h"), (0, 60));
         }
         drop(file);
+    }
+    #[test]
+    fn native_rename_flags() {
+        let x = Fixture::new();
+        x.fs().open(b"a", 66, 0o600).unwrap().write(b"abc").unwrap();
+        x.fs().open(b"b", 66, 0o600).unwrap();
+        x.fs().mkdir(b"d", 0o755).unwrap();
+        let size = |p: &[u8]| x.fs().metadata(p, false).map(|s| s.size);
+        assert_eq!(x.fs().rename_with(b"a", b"b", 3), Err(Errno::EINVAL));
+        if cfg!(any(target_os = "linux", target_vendor = "apple")) {
+            assert_eq!(x.fs().rename_with(b"a", b"b", 1), Err(Errno::EEXIST));
+            x.fs().rename_with(b"a", b"d/c", 1).unwrap();
+            x.fs().rename_with(b"d/c", b"b", 2).unwrap();
+            assert_eq!((size(b"b"), size(b"d/c")), (Ok(3), Ok(0)));
+            assert_eq!(x.fs().rename_with(b"b", b"e", 2), Err(Errno::ENOENT));
+        } else {
+            assert_eq!(x.fs().rename_with(b"a", b"b", 1), Err(Errno::EINVAL));
+            assert_eq!(x.fs().rename_with(b"a", b"c", 2), Err(Errno::EINVAL));
+        }
     }
     #[test]
     fn native_error_namespace() {

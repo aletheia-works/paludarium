@@ -2482,6 +2482,7 @@ impl Kernel {
             signal_actions: ignored,
             cpu,
             personality,
+            arrivals: thread.state.arrivals,
             ..ThreadState::default()
         };
         thread.state.name_after(&path);

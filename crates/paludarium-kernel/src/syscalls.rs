@@ -1813,8 +1813,13 @@ fn sys_brk(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let new = c.mem.set_break_shared(GuestAddr(a[0])).0;
     // The pages it gives back, or a new VMA it grows into, have no memory
     // policy (Linux expands the heap's VMA only when it has none).
-    let (low, high) = (old.min(new) & !4095, old.max(new));
-    c.group.numa().forget(low, high - low);
+    // set_break maps and unmaps whole pages between the two breaks rounded
+    // up, so the page that holds an unaligned break keeps its policy.
+    let up = |n: u64| n.saturating_add(4095) & !4095;
+    let (low, high) = (up(old.min(new)), up(old.max(new)));
+    if high > low {
+        c.group.numa().forget(low, high - low);
+    }
     ok(new)
 }
 

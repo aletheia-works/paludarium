@@ -4114,6 +4114,20 @@ int main(int argc, char **argv) {
         char *fresh = mmap(moved, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         result("fresh", fresh == moved);
         policy("fresh-policy", 65, moved, 2);
+        /* The heap: a brk that maps or unmaps no page keeps the policy of
+           the page that holds an unaligned break. */
+        char *heap = (char *)syscall(SYS_brk, 0);
+        char *top = heap + 2 * 4096 + 100;
+        result("grown", (char *)syscall(SYS_brk, top) == top);
+        char *last = (char *)((unsigned long)(top - 1) & ~4095UL);
+        outcome("mbind-heap", MBIND(last, 4096, 2, one, 0));
+        syscall(SYS_brk, 0);
+        result("same-page", (char *)syscall(SYS_brk, top + 50) == top + 50);
+        policy("heap-kept", 65, last, 2);
+        result("shrunk", (char *)syscall(SYS_brk, last) == last);
+        policy("heap-gone", 65, last, 2);
+        result("regrown", (char *)syscall(SYS_brk, top) == top);
+        policy("heap-new", 65, last, 2);
 #undef MBIND
         return 0;
     }

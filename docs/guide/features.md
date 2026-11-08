@@ -54,13 +54,13 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_getscheduler`/`sched_getparam`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_get`, `personality`, `unshare`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, and the pseudo-terminals' requests below) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
@@ -134,6 +134,21 @@ kernel.
   of a memfd sealed against writes cannot become writable (`EACCES`).
   `F_SEAL_EXEC` on an executable memfd, which seals writes too, gives `EBUSY`
   then as well, as since Linux 7.1; earlier kernels add the seals.
+- `openat2` opens as `openat` does (a FIFO too), with Linux's stricter
+  checks of its `struct open_how`: a size below 24 bytes is `EINVAL`, above
+  a page or with unknown nonzero bytes past the first version `E2BIG`; an
+  unknown flag or `RESOLVE_*` flag, a mode without `O_CREAT` or `O_TMPFILE`
+  or with more than the permission bits, `O_CREAT | O_DIRECTORY`, and
+  `O_PATH` with other flags than `O_DIRECTORY`, `O_NOFOLLOW` and
+  `O_CLOEXEC` are `EINVAL`. `RESOLVE_NO_SYMLINKS` follows no symbolic link
+  and `RESOLVE_NO_MAGICLINKS` no link in `/proc/self/fd` or `exe` and `cwd`
+  (`ELOOP`); `RESOLVE_NO_XDEV` crosses no mount, `/proc` and `/dev`
+  included (`EXDEV`); `RESOLVE_BENEATH` gives `EXDEV` for an absolute path
+  or link, `..` out of the directory and a magic link, and
+  `RESOLVE_IN_ROOT` takes the directory as the root, where those stay but
+  a magic link (`EXDEV`). With both scoping flags the call is `EINVAL`.
+  `RESOLVE_CACHED` gives `EAGAIN` with `O_CREAT`, `O_TRUNC` or `O_TMPFILE`,
+  and otherwise always finds the file, as if every name were cached.
 - `close_range` closes the open descriptors from `first` to `last`, or with
   `CLOSE_RANGE_CLOEXEC` marks them close-on-exec. `CLOSE_RANGE_UNSHARE` first
   gives the thread its own copy of a table it shares with `CLONE_FILES`
@@ -539,6 +554,49 @@ kernel.
   another process too, as root may, and give `ESRCH` when no live thread
   has the ID. `getcpu` gives the lowest CPU the thread's mask allows, and
   NUMA node 0.
+- Every thread runs under `SCHED_OTHER`, as `sched_setscheduler`,
+  `sched_setparam` and `sched_setattr` are not offered: `sched_getscheduler`
+  gives 0 and `sched_getparam` a priority of 0, for a thread of any process,
+  `ESRCH` when none has the ID and `EINVAL` for a negative one (or a NULL
+  parameter, checked first, as Linux does). `sched_get_priority_max` and
+  `sched_get_priority_min` give Linux's 99 and 1 for `SCHED_FIFO` and
+  `SCHED_RR` and 0 for the other policies. `sched_rr_get_interval` gives the
+  time slice the host's scheduler gives the thread on a Linux host, whose
+  threads run the guest's; elsewhere Linux 6.12's default at 1000 Hz, whole
+  milliseconds of 0.75 ms times 1 + log2 of the CPUs (at most 8).
+  `ioprio_get` finds threads as `getpriority` does (`IOPRIO_WHO_PROCESS`,
+  `IOPRIO_WHO_PGRP`, `IOPRIO_WHO_USER`). No thread can set a priority
+  (`ioprio_set` gives `ENOSYS`), so each has none (0, `IOPRIO_CLASS_NONE`),
+  which a single thread reports; for several, Linux's `ioprio_best` counts
+  each as `IOPRIO_CLASS_BE` level 4, which they report (16388).
+- `personality` keeps any value for the thread, as Linux stores it, and
+  returns the old one (`0xffffffff` only asks). New threads and processes
+  inherit it, and `execve` keeps it but for `READ_IMPLIES_EXEC`, and
+  `PER_CLEAR_ON_SETID` for a set-ID program. Three settings change what the
+  guest sees, as on Linux: `PER_LINUX32` makes `uname` report `i686`,
+  `UNAME26` a 2.6 release (`2.6.72`), and `READ_IMPLIES_EXEC` makes what
+  `mmap` and `mprotect` map readable executable too. The others
+  (`ADDR_NO_RANDOMIZE`, `ADDR_COMPAT_LAYOUT`, `MMAP_PAGE_ZERO`, ...) are only
+  kept: the layout does not change, and is not randomized to begin with.
+- `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
+  `nohz_full` CPU (`MEMBARRIER_CMD_QUERY` gives `0x3ff`). The private
+  commands give `EPERM` until the address space registers for them, a fork
+  keeps the registrations and an exec starts with none, and `MEMBARRIER_CMD_GET_REGISTRATIONS`
+  reports them with Linux's bits (registering `SYNC_CORE` marks the space
+  private too). A barrier is a fence on the host: every guest memory access
+  already takes its address space's lock, which orders it with the other
+  threads' as a barrier on each of them would.
+- `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
+  with `CLONE_FS` its own working directory and umask, as Linux. With
+  `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is
+  nothing to unshare and gives `EINVAL` where Linux does: another thread in
+  the process, dispositions shared with another process (`CLONE_SIGHAND`), or
+  memory shared with one (`CLONE_VM` without `CLONE_THREAD`). `CLONE_SYSVSEM`
+  has no semaphore adjustments to drop, as there is no System V IPC. There
+  are no namespaces: their flags give `EPERM` without `CAP_SYS_ADMIN`, as on
+  Linux, and `EINVAL` with it, as from a kernel built without that namespace
+  and as `clone` gives them here; `CLONE_NEWUSER`, which Linux lets a user
+  have, gives `EINVAL` too. See [Limitations](./limitations.md).
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,
@@ -676,8 +734,17 @@ kernel.
   for the rest,
   pipes, sockets, `memfd` and `/dev` included. `statfs` there gives
   procfs's or devpts's type with a 4096 `f_bsize`, as Linux's
-  `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but `stat`,
-  `statfs` and `open` through it reach its file.
+  `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but a call
+  that follows it reaches the descriptor's file, as Linux's magic link does,
+  whatever its access (an `O_PATH` descriptor's too): `stat`, `statfs`,
+  `open`, `access`, `chmod` and `fchmodat`, `chown` and `fchownat`,
+  `utimensat`, `truncate`, `chdir`, the extended-attribute calls and
+  `execve`, where `fchmod`, `fchown`, `futimens` and `ftruncate` of an
+  `O_PATH` descriptor are `EBADF`. A removed file, a memfd or a pipe is reached through the
+  descriptor itself (`execve` of those is not); a symbolic link an
+  `O_PATH | O_NOFOLLOW` descriptor holds is not followed again: its mode
+  cannot change (`EOPNOTSUPP`), `chdir` finds no directory (`ENOTDIR`),
+  `truncate` no regular file (`EINVAL`) and `execve` gives `ELOOP`.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
   `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a

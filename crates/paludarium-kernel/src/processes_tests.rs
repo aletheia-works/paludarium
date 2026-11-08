@@ -1715,13 +1715,162 @@ mod namespaces {
             );
             assert!(k.take_child().is_none());
         }
-        // unshare and setns are not implemented.
-        for number in [272, 308] {
+        // setns is not implemented.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [0; 6]),
+            Errno::ENOSYS.to_syscall_return()
+        );
+    }
+    #[test]
+    fn unshare_succeeds_with_nothing_shared_and_refuses_namespaces() {
+        let (mut k, mut t, m) = setup();
+        let einval = Errno::EINVAL.to_syscall_return();
+        // Nothing to unshare: one thread, its own dispositions and memory.
+        for flags in [0, 0x100, 0x200, 0x400, 0x800, 0x1_0000, 0x4_0000, 0x4_0f00] {
             assert_eq!(
-                syscall(&mut k, &mut t, &m, number, [0; 6]),
-                Errno::ENOSYS.to_syscall_return()
+                syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
+                0,
+                "{flags:#x}"
             );
         }
+        // Unknown flags, and the upper half of the register.
+        for flags in [0x8, 0x1000, 0x1_0000_0000] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
+                einval
+            );
+        }
+        // A user namespace is not offered; the others need CAP_SYS_ADMIN,
+        // which root has (EINVAL, as clone) and a user does not (EPERM).
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [0x1000_0000, 0, 0, 0, 0, 0]),
+            einval
+        );
+        let namespaces = [
+            0x80,
+            0x2_0000,
+            0x200_0000,
+            0x400_0000,
+            0x800_0000,
+            0x2000_0000,
+            0x4000_0000,
+        ];
+        for flags in namespaces {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
+                einval
+            );
+        }
+        t.state.credentials = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        for flags in namespaces {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
+                Errno::EPERM.to_syscall_return()
+            );
+        }
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [0x1000_0000, 0, 0, 0, 0, 0]),
+            einval
+        );
+    }
+    #[test]
+    fn unshare_files_and_fs_give_the_thread_its_own() {
+        let (mut k, mut t, m) = setup();
+        let shared = k.files.for_clone(true, true);
+        assert_eq!(syscall(&mut k, &mut t, &m, 272, [0x400, 0, 0, 0, 0, 0]), 0);
+        // The identity is the working directory, the umask and the table.
+        let (own, other) = (k.files.identity(), shared.identity());
+        assert_eq!((own[..2] == other[..2], own[2] == other[2]), (true, false));
+        assert_eq!(syscall(&mut k, &mut t, &m, 272, [0x200, 0, 0, 0, 0, 0]), 0);
+        let own = k.files.identity();
+        assert_eq!((own[0] == other[0], own[1] == other[1]), (false, false));
+    }
+    #[test]
+    fn unshare_refuses_a_shared_thread_group_dispositions_or_memory() {
+        let einval = Errno::EINVAL.to_syscall_return();
+        // A second thread: CLONE_THREAD, CLONE_SIGHAND and CLONE_VM.
+        let (mut k, mut t, m) = setup();
+        k.group.register(2, Arc::new(SignalInbox::default()));
+        for flags in [0x100, 0x800, 0x1_0000] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
+                einval
+            );
+        }
+        assert_eq!(syscall(&mut k, &mut t, &m, 272, [0x400, 0, 0, 0, 0, 0]), 0);
+        // Dispositions shared with a CLONE_VM | CLONE_SIGHAND child.
+        let (mut k, mut t, m) = setup();
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        assert_ne!(
+            syscall(&mut k, &mut t, &m, 56, [0x900 | 17, 0, 0, 0, 0, 0]) as i64,
+            -1
+        );
+        let (mut child, mut ct) = k.take_child().unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [0x800, 0, 0, 0, 0, 0]),
+            einval
+        );
+        assert_eq!(
+            syscall(&mut child, &mut ct, &m, 272, [0x100, 0, 0, 0, 0, 0]),
+            einval
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [0x1_0000, 0, 0, 0, 0, 0]),
+            0
+        );
+        // Memory shared with a CLONE_VM child, which has its own dispositions.
+        let (mut k, mut t, m) = setup();
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        k.publish(1, &t.state, &m);
+        assert_ne!(
+            syscall(&mut k, &mut t, &m, 56, [0x100 | 17, 0, 0, 0, 0, 0]) as i64,
+            -1
+        );
+        let (mut child, mut ct) = k.take_child().unwrap();
+        assert_eq!(
+            syscall(&mut child, &mut ct, &m, 272, [0x800, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut child, &mut ct, &m, 272, [0x100, 0, 0, 0, 0, 0]),
+            einval
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [0x100, 0, 0, 0, 0, 0]),
+            einval
+        );
+    }
+    #[test]
+    fn ioprio_get_reports_the_default_of_the_threads_found() {
+        let (mut k, mut t, m) = setup();
+        let ret = |k: &mut Kernel, t: &mut Thread, which: u64, who: u64| {
+            syscall(k, t, &m, 252, [which, who, 0, 0, 0, 0])
+        };
+        let esrch = Errno(3).to_syscall_return();
+        for which in 1..=3 {
+            assert_eq!(ret(&mut k, &mut t, which, 0), 0, "{which}");
+        }
+        assert_eq!(ret(&mut k, &mut t, 1, 1), 0);
+        assert_eq!(ret(&mut k, &mut t, 1, 99), esrch);
+        assert_eq!(ret(&mut k, &mut t, 1, u64::MAX), esrch);
+        assert_eq!(ret(&mut k, &mut t, 2, 99), esrch);
+        assert_eq!(ret(&mut k, &mut t, 3, 4242), esrch);
+        for which in [0, 4, u64::MAX] {
+            assert_eq!(
+                ret(&mut k, &mut t, which, 0),
+                Errno::EINVAL.to_syscall_return()
+            );
+        }
+        // Several threads: ioprio_best counts each as best-effort level 4.
+        k.group.register(2, Arc::new(SignalInbox::default()));
+        k.group.set_nice(2, 0);
+        assert_eq!(ret(&mut k, &mut t, 1, 0), 0);
+        assert_eq!(ret(&mut k, &mut t, 2, 0), 2 << 13 | 4);
+        // The upper halves are not read.
+        assert_eq!(
+            ret(&mut k, &mut t, 0xffff_ffff_0000_0001, 0xffff_ffff_0000_0000),
+            0
+        );
     }
 }
 mod orphaned_groups {

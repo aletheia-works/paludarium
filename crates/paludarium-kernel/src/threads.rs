@@ -552,6 +552,19 @@ impl ThreadGroup {
             .map(|(&tid, inbox)| (tid, inbox.in_call()))
             .collect()
     }
+    /// Whether a thread of this group runs in `space`, as it last published.
+    pub(crate) fn uses_memory(&self, space: &paludarium_mmu::AddressSpace) -> bool {
+        self.public
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|thread| thread.memory.as_ref().is_some_and(|view| view.is_of(space)))
+    }
+    /// Whether another process shares these signal dispositions
+    /// (`CLONE_SIGHAND`), as Linux's `sighand->count` above one.
+    pub(crate) fn shares_actions(&self) -> bool {
+        Arc::strong_count(&self.actions.lock().unwrap_or_else(PoisonError::into_inner)) > 1
+    }
     pub(crate) fn has_member(&self, tid: u32) -> bool {
         self.members
             .lock()

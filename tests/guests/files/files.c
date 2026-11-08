@@ -628,6 +628,103 @@ void _start(void) {
   results[x++]=FA(ro,0,0,1);results[x++]=FA(ro,0x100,0,1);results[x++]=FA(pf[1],0,0,1);results[x++]=FA(pf[0],0,0,1);results[x++]=FA(d,0,0,1);results[x++]=FA(sv[0],0,0,1);
   results[x++]=FA(fd,0,0x7fffffffffffffffL,1);results[x++]=FA(fd,1,1,0x7fffffffffffffffL);results[x++]=SIZE();
   S(3,ro,0,0);S(3,ap,0,0);S(3,d,0,0);S(3,pf[0],0,0);S(3,pf[1],0,0);S(3,sv[0],0,0);S(3,sv[1],0,0);}
+ if(CASE==62){ /* openat2(dirfd, path, how, size): open_how's checks and RESOLVE_* */
+  static unsigned long how[8];static char u2[]="/tmp/paludarium-files-unused";
+  #define HOW(f,m,r) (how[0]=(f),how[1]=(m),how[2]=(r))
+  #define O2(d,path,sz) call(437,d,(long)(path),(long)how,sz,0,0)
+  #define OK2(d,path) {long o=O2(d,path,24);results[x++]=o>=0;S(3,o,0,0);}
+  S(87,u2,0,0);long t=S(2,"/tmp",0200000,0);
+  HOW(0,0,0);OK2(-100,p);results[x++]=O2(-100,p,23);results[x++]=O2(-100,p,4097);
+  how[3]=1;results[x++]=O2(-100,p,32);results[x++]=O2(-100,p,4096);how[3]=0;
+  {long o=O2(-100,p,32);results[x++]=o>=0;results[x++]=S(72,o,3,0);S(3,o,0,0);}
+  results[x++]=call(437,-100,(long)p,8,24,0,0);results[x++]=O2(-100,"",24);results[x++]=O2(-100,0,24);
+  /* Flags and mode: what openat would ignore, openat2 refuses. */
+  HOW(4,0,0);results[x++]=O2(-100,p,24);HOW(1L<<32,0,0);results[x++]=O2(-100,p,24);
+  HOW(0,0644,0);results[x++]=O2(-100,p,24);HOW(0100,010644,0);results[x++]=O2(-100,u2,24);
+  HOW(0300000,0644,0);results[x++]=O2(-100,u2,24);HOW(020000002,0600,0);results[x++]=O2(-100,"/tmp",24);
+  HOW(020200000,0600,0);results[x++]=O2(-100,"/tmp",24);HOW(010000002,0,0);results[x++]=O2(-100,p,24);
+  HOW(012400000,0,0);{long o=O2(-100,p,24);results[x++]=o>=0;results[x++]=S(72,o,3,0);results[x++]=S(72,o,1,0);S(3,o,0,0);}
+  HOW(0,0,0x40);results[x++]=O2(-100,p,24);HOW(0,0,0x18);results[x++]=O2(-100,p,24);
+  HOW(01000,0,0x20);results[x++]=O2(-100,p,24);HOW(0100,0600,0x20);results[x++]=O2(-100,u2,24);
+  HOW(0301,0640,0);{long o=O2(-100,u2,24);results[x++]=o>=0;S(5,o,st,0);results[x++]=MODE();S(3,o,0,0);}
+  results[x++]=O2(-100,u2,24);S(87,u2,0,0);
+  /* A FIFO opens as through openat. */
+  S(133,u2,010644,0);HOW(04000,0,0);{long rd=O2(-100,u2,24);results[x++]=rd>=0;HOW(04001,0,0);long w=O2(-100,u2,24);results[x++]=w>=0;S(3,w,0,0);S(3,rd,0,0);}
+  results[x++]=O2(-100,u2,24);S(87,u2,0,0);
+  /* RESOLVE_NO_SYMLINKS and RESOLVE_NO_MAGICLINKS. */
+  S(88,p,q,0);S(88,"paludarium-files-fixture",r,0);
+  HOW(0,0,4);results[x++]=O2(-100,q,24);results[x++]=O2(-100,numbered("/dev/fd/",fd),24);
+  HOW(012400000,0,4);OK2(-100,q);
+  HOW(0,0,2);OK2(-100,q);results[x++]=O2(-100,fdpath(fd),24);results[x++]=O2(-100,numbered("/dev/fd/",fd),24);
+  results[x++]=O2(-100,"/proc/self/exe",24);results[x++]=O2(-100,fdpath(900),24);
+  HOW(0,0,0);OK2(-100,fdpath(fd));HOW(010400000,0,2);OK2(-100,fdpath(fd));
+  /* RESOLVE_BENEATH and RESOLVE_IN_ROOT from /tmp. */
+  HOW(0,0,8);OK2(t,"paludarium-files-fixture");OK2(t,"paludarium-files-renamed");
+  results[x++]=O2(t,p,24);results[x++]=O2(t,"../tmp/paludarium-files-fixture",24);results[x++]=O2(t,"paludarium-files-link",24);
+  HOW(0200000,0,8);OK2(t,".");
+  HOW(0,0,0x10);OK2(t,"/paludarium-files-fixture");OK2(t,"../../paludarium-files-fixture");OK2(t,"paludarium-files-renamed");
+  results[x++]=O2(t,"paludarium-files-link",24);
+  {long pd=S(2,"/proc/self/fd",0200000,0);HOW(0,0,8);results[x++]=O2(pd,numbered("",fd),24);
+   HOW(0,0,0x10);results[x++]=O2(pd,numbered("",fd),24);HOW(0,0,1);results[x++]=O2(pd,numbered("",fd),24);
+   HOW(0,0,0);OK2(pd,numbered("",fd));S(3,pd,0,0);}
+  /* RESOLVE_NO_XDEV: /proc and /dev are mounts of their own (whether
+     /tmp is one depends on the system, so nothing here crosses into it). */
+  HOW(0,0,1);OK2(t,"paludarium-files-fixture");
+  results[x++]=O2(-100,"/proc/self/status",24);results[x++]=O2(-100,"/dev/null",24);
+  results[x++]=O2(t,"../proc/self/status",24);
+  HOW(0,0,0);OK2(-100,"/proc/self/status");
+  S(3,t,0,0);}
+ if(CASE==64){ /* a link in /proc/self/fd leads path calls to the descriptor's file */
+  static long ts[4];static char here[300];long ok;
+  long op=S(2,p,010000000,0);S(1,fd,"abcd",4);
+  results[x++]=S(90,fdpath(fd),0600,0);S(5,fd,st,0);results[x++]=MODE();
+  results[x++]=S(91,op,0640,0);results[x++]=S(93,op,-1,-1);results[x++]=call(280,op,0,0,0,0,0);results[x++]=S(77,op,0,0);
+  results[x++]=S(90,fdpath(op),0640,0);S(4,p,st,0);results[x++]=MODE();
+  results[x++]=call(268,-100,(long)fdpath(op),0604,0,0,0);S(4,p,st,0);results[x++]=MODE();
+  results[x++]=call(452,-100,(long)fdpath(op),0644,0,0,0);S(4,p,st,0);results[x++]=MODE();
+  results[x++]=call(452,-100,(long)fdpath(op),0644,0x100,0,0);
+  results[x++]=S(90,fdpath(900),0600,0);
+  /* A symbolic link an O_PATH | O_NOFOLLOW descriptor holds: not followed
+     again, and its mode cannot change. */
+  S(88,p,q,0);long ol=S(2,q,010400000,0);results[x++]=S(90,fdpath(ol),0600,0);S(4,p,st,0);results[x++]=MODE();
+  results[x++]=S(80,fdpath(ol),0,0);results[x++]=S(76,fdpath(ol),0,0);S(5,fd,st,0);results[x++]=*(long*)(st+48);
+  {static char *argv[]={"x",0};results[x++]=call(59,(long)fdpath(ol),(long)argv,0,0,0,0);}
+  /* chown to the IDs it has, utimensat and truncate. */
+  long uid=S(107,0,0,0),gid=S(108,0,0,0);
+  results[x++]=S(92,fdpath(op),uid,gid);results[x++]=call(260,-100,(long)fdpath(op),uid,gid,0,0);
+  results[x++]=S(92,fdpath(op),-1,-1);results[x++]=S(92,fdpath(900),-1,-1);
+  ts[0]=1;ts[1]=0;ts[2]=1000;ts[3]=0;results[x++]=call(280,-100,(long)fdpath(op),(long)ts,0,0,0);
+  S(5,fd,st,0);results[x++]=MTIME();
+  results[x++]=S(76,fdpath(op),2,0);S(5,fd,st,0);results[x++]=*(long*)(st+48);
+  results[x++]=S(76,fdpath(900),0,0);
+  results[x++]=S(21,fdpath(op),4,0);results[x++]=call(439,-100,(long)fdpath(op),6,0x200,0,0);results[x++]=S(21,fdpath(900),0,0);
+  /* chdir to a directory an O_PATH descriptor holds. */
+  ok=S(79,here,300,0);long dp=S(2,"/tmp",010200000,0);results[x++]=S(80,fdpath(dp),0,0);
+  S(79,buf,300,0);results[x++]=same(buf,4,"/tmp")&&buf[4]==0;results[x++]=S(80,fdpath(op),0,0);
+  if(ok>0)S(80,here,0,0);
+  /* execve reaches the file: a directory is EACCES, a file of no format
+     it knows (and that nothing has open to write) ENOEXEC. */
+  {static char *argv[]={"x",0};static char u2[]="/tmp/paludarium-files-unused";
+   results[x++]=call(59,(long)fdpath(dp),(long)argv,0,0,0,0);
+   S(87,u2,0,0);long w=S(2,u2,0101,0700);S(1,w,"xx",2);S(3,w,0,0);long xp=S(2,u2,010000000,0);
+   results[x++]=call(59,(long)fdpath(xp),(long)argv,0,0,0,0);S(3,xp,0,0);S(87,u2,0,0);}
+  /* A removed file is reached through its descriptor. */
+  S(87,p,0,0);results[x++]=S(90,fdpath(fd),0611,0);S(5,fd,st,0);results[x++]=MODE();
+  results[x++]=S(76,fdpath(fd),1,0);S(5,fd,st,0);results[x++]=*(long*)(st+48);
+  ts[2]=2000;results[x++]=call(280,-100,(long)fdpath(fd),(long)ts,0,0,0);S(5,fd,st,0);results[x++]=MTIME();
+  results[x++]=S(21,fdpath(fd),4,0);
+  S(3,op,0,0);S(3,ol,0,0);S(3,dp,0,0);}
+ if(CASE==65){ /* extended attributes through a link in /proc/self/fd */
+  long op=S(2,p,010000000,0);
+  results[x++]=call(188,(long)fdpath(op),(long)"user.k",(long)"v",1,0,0);
+  results[x++]=call(191,(long)p,(long)"user.k",(long)buf,8,0,0);results[x++]=buf[0];
+  results[x++]=call(191,(long)fdpath(op),(long)"user.k",(long)buf,8,0,0);
+  results[x++]=call(192,(long)fdpath(op),(long)"user.k",(long)buf,8,0,0);
+  results[x++]=call(194,(long)fdpath(op),(long)buf,64,0,0,0);
+  results[x++]=call(197,(long)fdpath(op),(long)"user.k",0,0,0,0);
+  results[x++]=call(191,(long)p,(long)"user.k",(long)buf,8,0,0);
+  results[x++]=call(188,(long)fdpath(900),(long)"user.k",(long)"v",1,0,0);
+  S(3,op,0,0);}
  if(CASE==42){ /* close_range(first, last, flags): 4..7 are copies of fd 3 */
   #define CR(f,l,fl) call(436,f,l,fl,0,0,0)
   #define OPEN(n) (S(72,n,1,0)>=0)

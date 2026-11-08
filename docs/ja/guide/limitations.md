@@ -200,8 +200,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **名前空間**：名前空間のフラグ（`CLONE_NEWNS`、`CLONE_NEWUTS`、`CLONE_NEWIPC`、
   `CLONE_NEWUSER`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWCGROUP`、`clone3` では
   `CLONE_NEWTIME` も）を付けた `clone` と `clone3` は、子を作らずに `EINVAL` で失敗します。
-  Linux では、root で動くゲストは名前空間を作れます。`unshare` と `setns` は `ENOSYS` を
-  返します。
+  Linux では、root で動くゲストは名前空間を作れます。名前空間のフラグを付けた `unshare`
+  も `EINVAL` で失敗します（`CAP_SYS_ADMIN` のないスレッドでは Linux と同じく `EPERM`）。
+  Linux ではユーザーも使える `CLONE_NEWUSER` も同じです。`setns` は `ENOSYS` を返します。
 - **Linux と macOS 以外のホストでマウントしたディレクトリのファイル**：`SEEK_DATA`
   や `SEEK_HOLE` の `lseek` はファイル全体をデータとして扱います。Linux では穴を
   見つけます。Windows では `st_blocks` も大きさを 512 バイトのブロックに切り上げた

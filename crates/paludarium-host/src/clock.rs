@@ -79,6 +79,25 @@ pub(crate) fn native_thread_cpu_time() -> Result<u64, Errno> {
 pub(crate) fn native_thread_cpu_time() -> Result<u64, Errno> {
     Err(Errno::ENOSYS)
 }
+#[cfg(target_os = "linux")]
+pub(crate) fn native_time_slice() -> Option<u64> {
+    let mut interval = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `interval` is a live, aligned timespec the call writes.
+    if unsafe { libc::sched_rr_get_interval(0, &raw mut interval) } != 0 {
+        return None;
+    }
+    u64::try_from(interval.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(interval.tv_nsec).ok()?)
+}
+#[cfg(not(any(target_os = "linux", target_arch = "wasm32")))]
+pub(crate) fn native_time_slice() -> Option<u64> {
+    None
+}
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn native_wait(
     clock: ClockId,

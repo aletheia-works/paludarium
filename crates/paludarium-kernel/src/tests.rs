@@ -236,6 +236,158 @@ fn getcpu_reports_the_lowest_allowed_cpu_and_node_0() {
 }
 
 #[test]
+fn personality_is_kept_and_changes_uname_and_mappings() {
+    let mut f = fixture();
+    assert_eq!(f.ret(nr::PERSONALITY, &[0xffff_ffff]), 0);
+    // Any value is stored; the upper half of the register is not read.
+    assert_eq!(f.ret(nr::PERSONALITY, &[0xffff_ffff_8000_0001]), 0);
+    assert_eq!(f.ret(nr::PERSONALITY, &[u64::MAX]), 0x8000_0001);
+    let field = |f: &mut Fixture, index: u64| {
+        let mut bytes = [0u8; 65];
+        f.mem
+            .read(GuestAddr(DATA + 65 * index), &mut bytes)
+            .unwrap();
+        bytes.split(|&b| b == 0).next().unwrap().to_vec()
+    };
+    // PER_LINUX32 | UNAME26.
+    assert_eq!(f.ret(nr::PERSONALITY, &[0x2_0008]), 0x8000_0001);
+    assert_eq!(f.ret(nr::UNAME, &[DATA]), 0);
+    assert_eq!(field(&mut f, 2), b"2.6.72-paludarium");
+    assert_eq!(field(&mut f, 4), b"i686");
+    // READ_IMPLIES_EXEC makes readable mappings executable.
+    assert_eq!(f.ret(nr::PERSONALITY, &[0x40_0000]), 0x2_0008);
+    assert_eq!(f.ret(nr::UNAME, &[DATA]), 0);
+    assert_eq!(field(&mut f, 4), b"x86_64");
+    let exec_of = |f: &mut Fixture, at: u64| {
+        f.mem
+            .mappings()
+            .find(|m| m.start.0 <= at && at < m.start.0 + m.length)
+            .unwrap()
+            .prot
+            .contains(Prot::EXEC)
+    };
+    let at = f.ret(nr::MMAP, &[0, 4096, 1, 0x22, u64::MAX, 0]);
+    assert!(exec_of(&mut f, at));
+    assert_eq!(f.ret(nr::MPROTECT, &[at, 4096, 0]), 0);
+    assert!(!exec_of(&mut f, at));
+    assert_eq!(f.ret(nr::MPROTECT, &[at, 4096, 3]), 0);
+    assert!(exec_of(&mut f, at));
+    assert_eq!(f.ret(nr::PERSONALITY, &[0]), 0x40_0000);
+    assert_eq!(f.ret(nr::MPROTECT, &[at, 4096, 1]), 0);
+    assert!(!exec_of(&mut f, at));
+}
+
+#[test]
+fn sched_queries_report_the_normal_policy() {
+    let mut f = fixture();
+    let (einval, esrch) = (errno(Errno::EINVAL), errno(Errno(3)));
+    for pid in [0, 1] {
+        assert_eq!(f.ret(nr::SCHED_GETSCHEDULER, &[pid]), 0);
+        f.mem.write(GuestAddr(DATA), &[0xff; 4]).unwrap();
+        assert_eq!(f.ret(nr::SCHED_GETPARAM, &[pid, DATA]), 0);
+        assert_eq!(f.mem.read_value(GuestAddr(DATA), 4).unwrap(), 0);
+    }
+    assert_eq!(f.ret(nr::SCHED_GETSCHEDULER, &[99]), esrch);
+    assert_eq!(f.ret(nr::SCHED_GETSCHEDULER, &[u64::MAX]), einval);
+    // A NULL parameter is EINVAL before the thread is looked for.
+    assert_eq!(f.ret(nr::SCHED_GETPARAM, &[99, 0]), einval);
+    assert_eq!(f.ret(nr::SCHED_GETPARAM, &[99, DATA]), esrch);
+    assert_eq!(f.ret(nr::SCHED_GETPARAM, &[0, 1]), errno(Errno::EFAULT));
+    for (policy, max, min) in [
+        (0, 0, 0),
+        (1, 99, 1),
+        (2, 99, 1),
+        (3, 0, 0),
+        (5, 0, 0),
+        (6, 0, 0),
+        (7, 0, 0),
+    ] {
+        assert_eq!(
+            f.ret(nr::SCHED_GET_PRIORITY_MAX, &[policy]),
+            max,
+            "{policy}"
+        );
+        assert_eq!(
+            f.ret(nr::SCHED_GET_PRIORITY_MIN, &[policy]),
+            min,
+            "{policy}"
+        );
+    }
+    for policy in [4, 8, u64::MAX, 0x1_0000_0000 - 1] {
+        assert_eq!(f.ret(nr::SCHED_GET_PRIORITY_MAX, &[policy]), einval);
+        assert_eq!(f.ret(nr::SCHED_GET_PRIORITY_MIN, &[policy]), einval);
+    }
+    // The upper half is not read: 0x1_0000_0001 is SCHED_FIFO.
+    assert_eq!(f.ret(nr::SCHED_GET_PRIORITY_MAX, &[0x1_0000_0001]), 99);
+    // The host's slice, or where it does not tell (macOS) Linux's default
+    // at 1000 Hz: whole milliseconds of 0.75 ms times 1 + log2 of the CPUs.
+    assert_eq!(f.ret(nr::SCHED_RR_GET_INTERVAL, &[0, DATA]), 0);
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let slice = paludarium_host::Host::time_slice(&*f.host)
+        .unwrap_or(750_000 * (1 + cpus.min(8).ilog2() as u64) / 1_000_000 * 1_000_000);
+    assert_eq!(f.mem.read_value(GuestAddr(DATA), 8).unwrap(), 0);
+    assert_eq!(f.mem.read_value(GuestAddr(DATA + 8), 8).unwrap(), slice);
+    assert_eq!(f.ret(nr::SCHED_RR_GET_INTERVAL, &[99, DATA]), esrch);
+    assert_eq!(f.ret(nr::SCHED_RR_GET_INTERVAL, &[u64::MAX, DATA]), einval);
+    assert_eq!(
+        f.ret(nr::SCHED_RR_GET_INTERVAL, &[0, 1]),
+        errno(Errno::EFAULT)
+    );
+}
+
+#[test]
+fn membarrier_needs_registrations_and_reports_them() {
+    let mut f = fixture();
+    let (einval, eperm) = (errno(Errno::EINVAL), errno(Errno::EPERM));
+    let call = |f: &mut Fixture, cmd: u64, flags: u64| f.ret(nr::MEMBARRIER, &[cmd, flags, 0]);
+    assert_eq!(call(&mut f, 0, 0), 0x3ff);
+    assert_eq!(call(&mut f, 0, 1), einval);
+    assert_eq!(call(&mut f, 3, 0), einval);
+    assert_eq!(call(&mut f, 1024, 0), einval);
+    assert_eq!(call(&mut f, 1, 0), 0);
+    assert_eq!(call(&mut f, 2, 0), 0);
+    // The private commands need their registration.
+    for cmd in [8, 32, 128] {
+        assert_eq!(call(&mut f, cmd, 0), eperm, "{cmd}");
+    }
+    assert_eq!(call(&mut f, 512, 0), 0);
+    assert_eq!(call(&mut f, 64, 0), 0);
+    // SYNC_CORE's registration marks the space private too (Linux's
+    // set_state), which GET_REGISTRATIONS reports, but is not PRIVATE's.
+    assert_eq!(call(&mut f, 512, 0), 64 | 16);
+    assert_eq!(call(&mut f, 32, 0), 0);
+    assert_eq!(call(&mut f, 8, 0), eperm);
+    assert_eq!(call(&mut f, 16, 0), 0);
+    assert_eq!(call(&mut f, 16, 0), 0);
+    assert_eq!(call(&mut f, 8, 0), 0);
+    // FLAG_CPU is for PRIVATE_EXPEDITED_RSEQ alone.
+    assert_eq!(call(&mut f, 8, 1), einval);
+    assert_eq!(call(&mut f, 128, 1), eperm);
+    assert_eq!(call(&mut f, 256, 0), 0);
+    assert_eq!(f.ret(nr::MEMBARRIER, &[128, 1, 12345]), 0);
+    assert_eq!(call(&mut f, 128, 2), einval);
+    assert_eq!(call(&mut f, 4, 0), 0);
+    assert_eq!(call(&mut f, 512, 0), 4 | 16 | 64 | 256);
+    // A fork's copy of the space keeps them, and a new one has none.
+    let copy = f.mem.fork();
+    assert_eq!(
+        copy.membarrier_state()
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0xff
+    );
+    f.mem = AddressSpace::new();
+    f.mem
+        .map(
+            Some(GuestAddr(DATA)),
+            0x2000,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    assert_eq!(call(&mut f, 512, 0), 0);
+}
+
+#[test]
 fn sched_getaffinity_reports_every_host_cpu() {
     let mut f = fixture();
     let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);

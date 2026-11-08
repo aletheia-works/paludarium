@@ -14,7 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
@@ -2387,6 +2387,10 @@ pub struct AddressSpace {
     /// The data's `out_of_memory`, so that every checkpoint can read it
     /// without taking the session-wide serialization lock.
     out_of_memory: Arc<AtomicBool>,
+    /// The kernel's `membarrier` registrations for this space, as Linux's
+    /// `mm->membarrier_state`: a fork's copy keeps it, a new space (exec)
+    /// has none.
+    membarrier: AtomicU32,
 }
 
 /// An address space's VMAs for as long as a thread uses it, as Linux's
@@ -2399,6 +2403,11 @@ pub struct MemoryView {
 }
 
 impl MemoryView {
+    /// Whether this is a view of `space`, while it lives.
+    #[must_use]
+    pub fn is_of(&self, space: &AddressSpace) -> bool {
+        std::ptr::eq(self.data.as_ptr(), Arc::as_ptr(&space.data))
+    }
     /// The first VMA that ends after `addr`, if the space still lives and
     /// has one.
     #[must_use]
@@ -2534,6 +2543,7 @@ impl AddressSpace {
             code: Arc::clone(&data.code),
             data: Arc::new(Mutex::new(data)),
             serialization,
+            membarrier: AtomicU32::new(0),
         }
     }
     /// The space's data alone, without the session's serialization, for an
@@ -2575,7 +2585,12 @@ impl AddressSpace {
     /// copies them; MAP_SHARED pages stay shared. A shared serialization lock
     /// keeps cross-process memory operations indivisible.
     pub fn fork(&self) -> Self {
-        Self::with_data(self.locked().fork(), self.serialization.clone())
+        let child = Self::with_data(self.locked().fork(), self.serialization.clone());
+        // Linux's dup_mm copies the mm whole, membarrier_state with it.
+        child
+            .membarrier
+            .store(self.membarrier.load(Ordering::SeqCst), Ordering::SeqCst);
+        child
     }
     /// Marks a newly created mapping as Linux MAP_SHARED, independently of VM sharing.
     pub fn mark_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
@@ -2765,6 +2780,12 @@ impl AddressSpace {
             source: source.is_some(),
             offset,
         })
+    }
+    /// The kernel's `membarrier` state for this space, shared by every
+    /// thread that runs in it.
+    #[must_use]
+    pub fn membarrier_state(&self) -> &AtomicU32 {
+        &self.membarrier
     }
     /// This space's VMAs as `/proc/<pid>/maps` reads them ([`MemoryView`]).
     #[must_use]

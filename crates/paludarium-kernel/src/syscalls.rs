@@ -84,6 +84,13 @@ pub mod nr {
     pub const GET_MEMPOLICY: u64 = 239;
     pub const SCHED_GETAFFINITY: u64 = 204;
     pub const GETCPU: u64 = 309;
+    pub const PERSONALITY: u64 = 135;
+    pub const SCHED_GETPARAM: u64 = 143;
+    pub const SCHED_GETSCHEDULER: u64 = 145;
+    pub const SCHED_GET_PRIORITY_MAX: u64 = 146;
+    pub const SCHED_GET_PRIORITY_MIN: u64 = 147;
+    pub const SCHED_RR_GET_INTERVAL: u64 = 148;
+    pub const MEMBARRIER: u64 = 324;
     pub const SCHED_YIELD: u64 = 24;
     pub const SYSINFO: u64 = 99;
     pub const GETGROUPS: u64 = 115;
@@ -138,7 +145,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 69] = [
+        let entries: [(u64, Handler); 76] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -187,6 +194,13 @@ impl SyscallTable {
             (nr::SCHED_SETAFFINITY, sys_sched_setaffinity),
             (nr::SCHED_GETAFFINITY, sys_sched_getaffinity),
             (nr::GETCPU, sys_getcpu),
+            (nr::PERSONALITY, sys_personality),
+            (nr::SCHED_GETPARAM, sys_sched_getparam),
+            (nr::SCHED_GETSCHEDULER, sys_sched_getscheduler),
+            (nr::SCHED_GET_PRIORITY_MAX, sys_sched_get_priority),
+            (nr::SCHED_GET_PRIORITY_MIN, sys_sched_get_priority),
+            (nr::SCHED_RR_GET_INTERVAL, sys_sched_rr_get_interval),
+            (nr::MEMBARRIER, sys_membarrier),
             (nr::MBIND, crate::mempolicy::sys_mbind),
             (nr::SET_MEMPOLICY, crate::mempolicy::sys_set_mempolicy),
             (nr::GET_MEMPOLICY, crate::mempolicy::sys_get_mempolicy),
@@ -1330,6 +1344,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let Some(prot) = Prot::from_bits(prot) else {
         return err(Errno::EINVAL);
     };
+    let prot = read_implies_exec(c.process, prot);
     if offset & 4095 != 0 {
         return err(Errno::EINVAL);
     }
@@ -1728,6 +1743,7 @@ fn sys_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let Some(prot) = Prot::from_bits(a[2] & !8) else {
         return err(Errno::EINVAL);
     };
+    let prot = read_implies_exec(c.process, prot);
     if a[1] == 0 {
         return if GuestAddr(a[0]).page_offset() == 0 {
             ok(0)
@@ -2212,14 +2228,30 @@ fn sys_arch_prctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 /// Linux's `struct utsname`: six NUL-terminated fields of 65 bytes. The host's
 /// name and kernel are not revealed, as with `CPUID`.
+///
+/// `uname`, with the release and machine a personality asks for, as
+/// Linux's `override_release` and `override_architecture`: `UNAME26` makes
+/// the release a 2.6 one, its patch level 60 more than the minor version,
+/// and `PER_LINUX32` the machine `i686`.
 fn sys_uname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     const FIELD: usize = 65;
+    let personality = c.process.personality;
+    let release: &[u8] = if personality & UNAME26 != 0 {
+        b"2.6.72-paludarium"
+    } else {
+        b"6.12.0-paludarium"
+    };
+    let machine: &[u8] = if personality & 0xff == PER_LINUX32 {
+        b"i686"
+    } else {
+        b"x86_64"
+    };
     let fields: [&[u8]; 6] = [
         b"Linux",
         b"paludarium",
-        b"6.12.0-paludarium",
+        release,
         b"#1 SMP PREEMPT_DYNAMIC",
-        b"x86_64",
+        machine,
         b"(none)",
     ];
     let mut bytes = [0u8; FIELD * 6];
@@ -2433,6 +2465,202 @@ fn sys_getcpu(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
     }
     if failed { err(Errno::EFAULT) } else { ok(0) }
+}
+
+/// `READ_IMPLIES_EXEC`, which makes readable mappings executable.
+pub(crate) const READ_IMPLIES_EXEC: u32 = 0x40_0000;
+/// The personality flags a set-ID exec clears (`PER_CLEAR_ON_SETID`):
+/// `READ_IMPLIES_EXEC`, `ADDR_NO_RANDOMIZE`, `ADDR_COMPAT_LAYOUT` and
+/// `MMAP_PAGE_ZERO`.
+pub(crate) const PER_CLEAR_ON_SETID: u32 = 0x40_0000 | 0x4_0000 | 0x20_0000 | 0x10_0000;
+const UNAME26: u32 = 0x2_0000;
+const PER_LINUX32: u32 = 0x8;
+
+/// A readable mapping is also executable under `READ_IMPLIES_EXEC`, as
+/// Linux's `do_mmap` and `mprotect` make it.
+fn read_implies_exec(state: &ThreadState, prot: Prot) -> Prot {
+    if state.personality & READ_IMPLIES_EXEC != 0 && prot.contains(Prot::READ) {
+        prot.union(Prot::EXEC)
+    } else {
+        prot
+    }
+}
+
+/// `personality(persona)`: the thread's personality, which becomes
+/// `persona` unless that is `0xffffffff`, as Linux stores it whatever it
+/// is. `PER_LINUX32` and `UNAME26` change what `uname` reports and
+/// `READ_IMPLIES_EXEC` what `mmap` and `mprotect` map; the other flags are
+/// kept and reported only (the layout does not change, and is not
+/// randomized to begin with).
+fn sys_personality(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let old = c.process.personality;
+    let persona = a[0] as u32;
+    if persona != u32::MAX {
+        c.process.personality = persona;
+    }
+    ok(u64::from(old))
+}
+
+/// The thread `pid` names for the `sched_get*` calls (Linux's
+/// `find_process_by_pid`): 0 is the caller, a negative one is `EINVAL`, and
+/// one of no live thread `ESRCH`.
+fn sched_target(c: &Context<'_>, pid: u64) -> Result<(), Errno> {
+    let pid = pid as u32 as i32;
+    if pid < 0 {
+        return Err(Errno::EINVAL);
+    }
+    affinity_target(c, pid).map(drop)
+}
+
+/// `sched_getscheduler(pid)`: every thread runs under `SCHED_OTHER` (0), as
+/// `sched_setscheduler` is not offered.
+fn sys_sched_getscheduler(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    match sched_target(c, a[0]) {
+        Ok(()) => ok(0),
+        Err(e) => err(e),
+    }
+}
+
+/// `sched_getparam(pid, param)`: a `struct sched_param` whose priority is
+/// 0, as for every thread not under a real-time policy. A NULL `param` is
+/// `EINVAL` before the thread is looked for, as in Linux.
+fn sys_sched_getparam(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    if a[1] == 0 {
+        return err(Errno::EINVAL);
+    }
+    if let Err(e) = sched_target(c, a[0]) {
+        return err(e);
+    }
+    match c.mem.write(GuestAddr(a[1]), &0i32.to_le_bytes()) {
+        Ok(()) => ok(0),
+        Err(_) => err(Errno::EFAULT),
+    }
+}
+
+/// `sched_get_priority_max(policy)` and `sched_get_priority_min(policy)`:
+/// 99 and 1 for `SCHED_FIFO` and `SCHED_RR`, 0 for `SCHED_OTHER`,
+/// `SCHED_BATCH`, `SCHED_IDLE`, `SCHED_DEADLINE` and `SCHED_EXT`, and
+/// `EINVAL` for anything else, as Linux.
+fn sys_sched_get_priority(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let maximum = c.number == nr::SCHED_GET_PRIORITY_MAX;
+    match a[0] as u32 as i32 {
+        1 | 2 => ok(if maximum { 99 } else { 1 }),
+        0 | 3 | 5 | 6 | 7 => ok(0),
+        _ => err(Errno::EINVAL),
+    }
+}
+
+/// `sched_rr_get_interval(pid, interval)`: the time slice of a thread
+/// under `SCHED_OTHER`, as Linux's `get_rr_interval_fair` gives it in
+/// whole jiffies: the host's own where it can tell ([`Host::time_slice`]),
+/// or else Linux's default at 1000 Hz, the base slice of 0.75 ms times
+/// 1 + log2 of the CPUs (at most 8).
+fn sys_sched_rr_get_interval(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    if let Err(e) = sched_target(c, a[0]) {
+        return err(e);
+    }
+    let slice = c.host.time_slice().unwrap_or_else(|| {
+        let factor = 1 + u64::from(active_cpus(c).min(8).ilog2());
+        750_000 * factor / 1_000_000 * 1_000_000
+    });
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&(slice / 1_000_000_000).to_le_bytes());
+    bytes[8..].copy_from_slice(&(slice % 1_000_000_000).to_le_bytes());
+    match c.mem.write(GuestAddr(a[1]), &bytes) {
+        Ok(()) => ok(0),
+        Err(_) => err(Errno::EFAULT),
+    }
+}
+
+/// `membarrier(cmd, flags, cpu_id)`, as Linux's on x86-64 with `CONFIG_RSEQ`
+/// and no `nohz_full` CPUs: the commands, the `MEMBARRIER_CMD_FLAG_CPU`
+/// flag only for `PRIVATE_EXPEDITED_RSEQ`, the registrations each private
+/// command needs (`EPERM` without), and `GET_REGISTRATIONS` reporting them
+/// with Linux's bits of state, one set for the address space, which a
+/// fork copies and an exec starts without. Each barrier is a host fence:
+/// every guest memory access already takes its address space's lock,
+/// which orders it with the other threads' accesses as a barrier on each
+/// would.
+fn sys_membarrier(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    use std::sync::atomic::{Ordering, fence};
+    const QUERY: i32 = 0;
+    const GLOBAL: i32 = 1;
+    const GLOBAL_EXPEDITED: i32 = 1 << 1;
+    const REGISTER_GLOBAL_EXPEDITED: i32 = 1 << 2;
+    const PRIVATE_EXPEDITED: i32 = 1 << 3;
+    const REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
+    const PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 5;
+    const REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 6;
+    const PRIVATE_EXPEDITED_RSEQ: i32 = 1 << 7;
+    const REGISTER_PRIVATE_EXPEDITED_RSEQ: i32 = 1 << 8;
+    const GET_REGISTRATIONS: i32 = 1 << 9;
+    const FLAG_CPU: u32 = 1;
+    // Linux's MEMBARRIER_STATE_* bits: each registration's "ready" bit is
+    // the one below its own.
+    const PRIVATE_READY: u32 = 1;
+    const PRIVATE: u32 = 1 << 1;
+    const GLOBAL_READY: u32 = 1 << 2;
+    const GLOBAL_STATE: u32 = 1 << 3;
+    const SYNC_CORE_READY: u32 = 1 << 4;
+    const SYNC_CORE: u32 = 1 << 5;
+    const RSEQ_READY: u32 = 1 << 6;
+    const RSEQ: u32 = 1 << 7;
+    let (cmd, flags) = (a[0] as u32 as i32, a[1] as u32);
+    let allowed = if cmd == PRIVATE_EXPEDITED_RSEQ {
+        FLAG_CPU
+    } else {
+        0
+    };
+    if flags & !allowed != 0 {
+        return err(Errno::EINVAL);
+    }
+    let state = c.mem.membarrier_state();
+    let register = |set: u32, ready: u32| {
+        if state.load(Ordering::SeqCst) & ready != ready {
+            state.fetch_or(set, Ordering::SeqCst);
+            state.fetch_or(ready, Ordering::SeqCst);
+        }
+        ok(0)
+    };
+    let barrier = |ready: u32| {
+        if state.load(Ordering::SeqCst) & ready == 0 {
+            return err(Errno::EPERM);
+        }
+        fence(Ordering::SeqCst);
+        ok(0)
+    };
+    match cmd {
+        QUERY => ok(0x3ff),
+        GLOBAL | GLOBAL_EXPEDITED => {
+            fence(Ordering::SeqCst);
+            ok(0)
+        }
+        REGISTER_GLOBAL_EXPEDITED => register(GLOBAL_STATE, GLOBAL_READY),
+        PRIVATE_EXPEDITED => barrier(PRIVATE_READY),
+        REGISTER_PRIVATE_EXPEDITED => register(PRIVATE, PRIVATE_READY),
+        PRIVATE_EXPEDITED_SYNC_CORE => barrier(SYNC_CORE_READY),
+        REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => register(PRIVATE | SYNC_CORE, SYNC_CORE_READY),
+        PRIVATE_EXPEDITED_RSEQ => barrier(RSEQ_READY),
+        REGISTER_PRIVATE_EXPEDITED_RSEQ => register(PRIVATE | RSEQ, RSEQ_READY),
+        GET_REGISTRATIONS => {
+            let state = state.load(Ordering::SeqCst);
+            let registrations = [
+                (GLOBAL_STATE | GLOBAL_READY, REGISTER_GLOBAL_EXPEDITED),
+                (PRIVATE | PRIVATE_READY, REGISTER_PRIVATE_EXPEDITED),
+                (
+                    SYNC_CORE | SYNC_CORE_READY,
+                    REGISTER_PRIVATE_EXPEDITED_SYNC_CORE,
+                ),
+                (RSEQ | RSEQ_READY, REGISTER_PRIVATE_EXPEDITED_RSEQ),
+            ];
+            let mask = registrations
+                .iter()
+                .filter(|(bits, _)| state & bits != 0)
+                .fold(0, |mask, (_, command)| mask | command);
+            ok(mask as u64)
+        }
+        _ => err(Errno::EINVAL),
+    }
 }
 
 fn sys_set_tid_address(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {

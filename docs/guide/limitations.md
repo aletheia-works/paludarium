@@ -223,8 +223,10 @@ verified.
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for
   `clone3`) fail with `EINVAL` and create no child, where Linux lets the
-  guest, which runs as root, create the namespace. `unshare` and `setns`
-  return `ENOSYS`.
+  guest, which runs as root, create the namespace. `unshare` with a
+  namespace flag fails too, with `EINVAL` (`EPERM` for a thread without
+  `CAP_SYS_ADMIN`, as on Linux), and so does `CLONE_NEWUSER`, which Linux
+  also lets a user have. `setns` returns `ENOSYS`.
 - **Files of a mounted host directory on hosts other than Linux and macOS**:
   `lseek` with `SEEK_DATA` or `SEEK_HOLE` treats the whole file as data,
   where Linux finds the holes. On Windows `st_blocks` is also the size

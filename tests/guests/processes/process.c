@@ -3839,6 +3839,49 @@ static int mincore_cases(void) {
 }
 
 /* The CPU mask a new thread starts with, for the affinity case. */
+static void *membarrier_thread(void *unused) {
+    (void)unused;
+    printf("thread: registrations=%ld private=%ld\n", syscall(SYS_membarrier, 512, 0, 0),
+           syscall(SYS_membarrier, 8, 0, 0));
+    return NULL;
+}
+static volatile int unshare_release, unshare_child_done;
+static void *unshare_waiter(void *unused) {
+    (void)unused;
+    while (!unshare_release) sched_yield();
+    return NULL;
+}
+/* A thread that unshares its descriptor table and its directory, then
+   closes, moves and changes them, which the process does not see. */
+static void *unshare_thread(void *unused) {
+    (void)unused;
+    long r = syscall(SYS_unshare, CLONE_FILES|CLONE_FS);
+    int fd = open("/", O_RDONLY);
+    printf("thread: unshare=%ld\n", r);
+    close(fd);
+    for (int i = 3; i < 64; i++) close(i);
+    chdir("/proc");
+    umask(077);
+    return NULL;
+}
+static int unshare_vm_child(void *unused) {
+    (void)unused;
+    long results[2];
+    int errors[2];
+    long tries[] = {CLONE_SIGHAND, CLONE_VM};
+    for (int i = 0; i < 2; i++) {
+        errno = 0;
+        results[i] = syscall(SYS_unshare, tries[i]);
+        errors[i] = errno;
+    }
+    char line[96];
+    int n = snprintf(line, sizeof line, "child 0x800: %ld errno=%d\nchild 0x100: %ld errno=%d\n",
+                     results[0], errors[0], results[1], errors[1]);
+    write(1, line, n);
+    unshare_child_done = 1;
+    while (!unshare_release) sched_yield();
+    return 0;
+}
 static void *affinity_of_thread(void *mask) {
     syscall(SYS_sched_getaffinity, 0, 16 * sizeof(unsigned long), mask);
     return NULL;
@@ -3969,6 +4012,212 @@ int main(int argc, char **argv) {
         result("errno", errno);
         result("old-state", 1);
         if (!strcmp(mode, "bad-elf")) unlink(path);
+        return 0;
+    }
+    if (!strcmp(mode, "scheduling")) {
+        /* Every thread runs under SCHED_OTHER with priority 0, found as
+           Linux finds a thread: 0 is the caller, and another process's
+           thread counts. */
+        pid_t other = child();
+        if (other == 0) { pause(); _exit(0); }
+        long pids[] = {0, getpid(), other, 0x3fffffff, -1};
+        const char *names[] = {"self", "pid", "child", "missing", "negative"};
+        for (int i = 0; i < 5; i++) {
+            int param = 99;
+            errno = 0;
+            long r = syscall(SYS_sched_getscheduler, pids[i]);
+            printf("%s: scheduler=%ld errno=%d", names[i], r, errno);
+            errno = 0;
+            r = syscall(SYS_sched_getparam, pids[i], &param);
+            printf(" param=%ld errno=%d priority=%d", r, errno, param);
+            struct timespec slice = {99, 99}, native;
+            errno = 0;
+            r = syscall(SYS_sched_rr_get_interval, pids[i], &slice);
+            /* The caller's slice is the machine's, and so the same on both
+               sides; a sleeping thread's depends on what its CPU runs. */
+            sched_rr_get_interval(0, &native);
+            int same = slice.tv_sec == native.tv_sec && slice.tv_nsec == native.tv_nsec;
+            printf(" interval=%ld errno=%d same=%d\n", r, errno,
+                   r ? slice.tv_sec == 99 : pids[i] == other || same);
+        }
+        errno = 0;
+        result("param-null", syscall(SYS_sched_getparam, 0x3fffffff, NULL));
+        result("errno", errno);
+        errno = 0;
+        result("param-fault", syscall(SYS_sched_getparam, 0, (void *)1));
+        result("errno", errno);
+        errno = 0;
+        result("interval-fault", syscall(SYS_sched_rr_get_interval, 0, (void *)1));
+        result("errno", errno);
+        /* The upper half of an int argument is not read. */
+        result("dirty-pid", syscall(SYS_sched_getscheduler, 0xffffffff00000000UL));
+        long policies[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, -1, 0x100000001L};
+        for (int i = 0; i < 11; i++) {
+            errno = 0;
+            long max = syscall(SYS_sched_get_priority_max, policies[i]);
+            int max_errno = errno;
+            errno = 0;
+            long min = syscall(SYS_sched_get_priority_min, policies[i]);
+            printf("policy %ld: max=%ld errno=%d min=%ld errno=%d\n", policies[i], max, max_errno, min, errno);
+        }
+        /* ioprio_get: no thread has set an I/O priority; one reports none,
+           several the best-effort level 4 ioprio_best counts them as. */
+        long who[][2] = {{1, 0}, {1, getpid()}, {1, other}, {1, 0x3fffffff}, {1, -1}, {2, 0},
+                         {2, getpgrp()}, {2, 0x3fffffff}, {3, 0}, {3, getuid()}, {3, -1}, {0, 0}, {4, 0},
+                         {0x100000001L, 0}};
+        for (int i = 0; i < 14; i++) {
+            errno = 0;
+            long r = syscall(SYS_ioprio_get, who[i][0], who[i][1]);
+            printf("ioprio %ld: %ld errno=%d\n", who[i][0], r, errno);
+        }
+        kill(other, SIGKILL);
+        result("reaped", reaped(other));
+        return 0;
+    }
+    if (!strcmp(mode, "personality") || !strcmp(mode, "personality-exec")) {
+        struct utsname names;
+        uname(&names);
+        printf("%s: personality=%#lx machine=%s release-2.6=%d\n", mode,
+               syscall(SYS_personality, 0xffffffffUL), names.machine, !strncmp(names.release, "2.6.", 4));
+        if (!strcmp(mode, "personality-exec")) return 0;
+        /* Any value is kept; the upper half of the register is not read. */
+        result("set", syscall(SYS_personality, 0xffffffff80000001UL));
+        result("get", syscall(SYS_personality, 0xffffffffUL));
+        /* UNAME26 and PER_LINUX32. */
+        syscall(SYS_personality, 0x20008UL);
+        uname(&names);
+        printf("uname26: machine=%s release-2.6=%d\n", names.machine, !strncmp(names.release, "2.6.", 4));
+        /* READ_IMPLIES_EXEC: a readable mapping is executable too. */
+        result("rie", syscall(SYS_personality, 0x400000UL));
+        char *page = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        maps_show("read", page, NULL);
+        mprotect(page, 4096, PROT_NONE);
+        maps_show("none", page, NULL);
+        mprotect(page, 4096, PROT_READ|PROT_WRITE);
+        maps_show("read-write", page, NULL);
+        syscall(SYS_personality, 0UL);
+        mprotect(page, 4096, PROT_READ);
+        maps_show("read-after", page, NULL);
+        /* A child keeps the personality, and an exec keeps it but for
+           READ_IMPLIES_EXEC. */
+        result("set-flags", syscall(SYS_personality, 0x400008UL | 0x40000UL));
+        pid_t pid = child();
+        if (pid == 0) {
+            printf("child: personality=%#lx\n", syscall(SYS_personality, 0xffffffffUL));
+            fflush(stdout);
+            char *arguments[] = {(char *)self, "personality-exec", (char *)self, NULL};
+            execv(self, arguments);
+            _exit(120);
+        }
+        result("reaped", reaped(pid));
+        result("kept", syscall(SYS_personality, 0UL));
+        return 0;
+    }
+    if (!strcmp(mode, "membarrier")) {
+        /* The commands each need their registration, which belongs to the
+           address space: its threads share it, and a fork's copy keeps it. */
+        result("query", syscall(SYS_membarrier, 0, 0, 0));
+        long commands[] = {1, 2, 3, 8, 32, 128, 512, 1024, -1};
+        for (int i = 0; i < 9; i++) {
+            errno = 0;
+            long r = syscall(SYS_membarrier, commands[i], 0, 0);
+            printf("command %ld: %ld errno=%d\n", commands[i], r, errno);
+        }
+        long steps[][3] = {{64, 0, 0}, {512, 0, 0}, {32, 0, 0}, {8, 0, 0}, {16, 0, 0}, {8, 0, 0},
+                           {8, 1, 0}, {128, 1, 0}, {256, 0, 0}, {128, 1, 3}, {128, 1, 99999}, {128, 0, 0},
+                           {128, 2, 0}, {0, 1, 0}, {4, 0, 0}, {4, 0, 0}, {512, 0, 0}};
+        for (int i = 0; i < 17; i++) {
+            errno = 0;
+            long r = syscall(SYS_membarrier, steps[i][0], steps[i][1], steps[i][2]);
+            printf("step %ld %ld: %ld errno=%d\n", steps[i][0], steps[i][1], r, errno);
+        }
+        pthread_t thread;
+        pthread_create(&thread, NULL, membarrier_thread, NULL);
+        pthread_join(thread, NULL);
+        fflush(stdout);
+        pid_t pid = child();
+        if (pid == 0) {
+            printf("fork: registrations=%ld\n", syscall(SYS_membarrier, 512, 0, 0));
+            errno = 0;
+            long r = syscall(SYS_membarrier, 8, 0, 0);
+            printf("fork: private=%ld errno=%d\n", r, errno);
+            fflush(stdout);
+            _exit(0);
+        }
+        result("reaped", reaped(pid));
+        return 0;
+    }
+    if (!strcmp(mode, "unshare")) {
+        /* Nothing to unshare: one thread, its own dispositions and memory. */
+        long flags[] = {0, CLONE_VM, CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_THREAD, CLONE_SYSVSEM,
+                        CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM,
+                        0x8, 0x1000, 0x100000000L};
+        for (int i = 0; i < 11; i++) {
+            errno = 0;
+            long r = syscall(SYS_unshare, flags[i]);
+            printf("unshare %#lx: %ld errno=%d\n", flags[i], r, errno);
+        }
+        /* The namespaces need CAP_SYS_ADMIN, which a user does not have.
+           (Root, as this case runs, may create them on Linux.) */
+        fflush(stdout);
+        pid_t user = child();
+        if (user == 0) {
+            if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+            long spaces[] = {CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWPID, CLONE_NEWNET,
+                             CLONE_NEWCGROUP, 0x80 /* CLONE_NEWTIME */, CLONE_NEWNS|CLONE_FILES};
+            for (int i = 0; i < 8; i++) {
+                errno = 0;
+                long r = syscall(SYS_unshare, spaces[i]);
+                printf("namespace %#lx: %ld errno=%d\n", spaces[i], r, errno);
+            }
+            fflush(stdout);
+            _exit(0);
+        }
+        result("user", reaped(user));
+        /* CLONE_FILES and CLONE_FS: the thread's own table, directory and
+           umask, which a thread sharing them no longer sees change. */
+        pthread_t thread;
+        pthread_create(&thread, NULL, unshare_thread, NULL);
+        pthread_join(thread, NULL);
+        int fd = open("/", O_RDONLY);
+        char cwd[256];
+        mode_t mask = umask(022);
+        umask(mask);
+        printf("after-thread: fd-open=%d moved=%d masked=%d\n", fcntl(fd, F_GETFD) >= 0,
+               getcwd(cwd, sizeof cwd) && !strcmp(cwd, "/proc"), mask == 077);
+        close(fd);
+        /* A second thread: CLONE_THREAD, CLONE_SIGHAND and CLONE_VM are
+           EINVAL, CLONE_NEWUSER (which takes CLONE_THREAD) too. */
+        pthread_create(&thread, NULL, unshare_waiter, NULL);
+        long threaded[] = {CLONE_THREAD, CLONE_SIGHAND, CLONE_VM, CLONE_NEWUSER, CLONE_FILES};
+        for (int i = 0; i < 5; i++) {
+            errno = 0;
+            long r = syscall(SYS_unshare, threaded[i]);
+            printf("threaded %#lx: %ld errno=%d\n", threaded[i], r, errno);
+        }
+        unshare_release = 1;
+        pthread_join(thread, NULL);
+        /* Memory, and then dispositions too, shared with a CLONE_VM child,
+           which tries to unshare them while the parent waits. */
+        char *stack = mmap(NULL, 65536, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        long shared[] = {CLONE_VM, CLONE_VM|CLONE_SIGHAND};
+        for (int i = 0; i < 2; i++) {
+            fflush(stdout);
+            unshare_child_done = unshare_release = 0;
+            pid_t pid = clone(unshare_vm_child, stack + 65536, shared[i]|SIGCHLD, NULL);
+            while (!unshare_child_done) sched_yield();
+            long tries[] = {CLONE_SIGHAND, CLONE_VM};
+            for (int j = 0; j < 2; j++) {
+                errno = 0;
+                long r = syscall(SYS_unshare, tries[j]);
+                printf("parent %#lx: %ld errno=%d\n", tries[j], r, errno);
+            }
+            unshare_release = 1;
+            result("reaped", reaped(pid));
+        }
+        errno = 0;
+        result("alone", syscall(SYS_unshare, CLONE_VM|CLONE_SIGHAND));
+        result("errno", errno);
         return 0;
     }
     if (!strcmp(mode, "uname")) {

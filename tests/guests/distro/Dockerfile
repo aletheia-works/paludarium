@@ -21,5 +21,5 @@ RUN cd /opt/go && GOCACHE=/tmp/go-cache CGO_ENABLED=0 go build -o /usr/local/bin
 # Language runtimes and servers the runtimes() cases run.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    graphviz guile-3.0 imagemagick luajit memcached nginx ocaml pandoc r-base-core sbcl socat \
+    fish graphviz guile-3.0 imagemagick luajit memcached nginx ocaml pandoc r-base-core sbcl socat \
  && rm -rf /var/lib/apt/lists/*

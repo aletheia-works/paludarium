@@ -95,7 +95,8 @@ CI run produces them afresh on an x86-64 Linux runner.
   relay in Chromium, Firefox, WebKit and Safari in CI.
 - Every night, Debian's own dynamically linked programs run natively and
   under the emulator in a Debian container, and their exit status and
-  standard output are compared (`tests/guests/distro/compare.py`): shells,
+  standard output are compared (`tests/guests/distro/compare.py`): shells
+  (fish among them),
   awk, Perl, Python, Ruby, PHP, Lua, LuaJIT, Tcl, Node.js, Go, OCaml, R,
   Guile, SBCL, pandoc, Emacs, BusyBox, SQLite, Redis, memcached, nginx,
   compressors, Git, OpenSSL, GnuPG, rsync, make, CMake, Ninja, gcc, g++ and

@@ -725,6 +725,33 @@ void _start(void) {
   results[x++]=call(191,(long)p,(long)"user.k",(long)buf,8,0,0);
   results[x++]=call(188,(long)fdpath(900),(long)"user.k",(long)"v",1,0,0);
   S(3,op,0,0);}
+ if(CASE==68){ /* a link in /proc/self/fd (and /proc/self/cwd, /dev/fd) inside a path: the walk goes on from the descriptor's file */
+  #define UNDER(pre,n,rest) ({static char u[256];char *a=numbered(pre,n),*o=u;while(*a)*o++=*a++;const char *b=rest;while(*b)*o++=*b++;*o=0;u;})
+  #define INODE(n) (S(4,n,st,0)<0?-1:*(long*)(st+8))
+  static char dd[]="/tmp/paludarium-files-dir",dd2[]="/tmp/paludarium-files-dir2",here[300];
+  S(1,fd,"abcd",4);long d=S(2,"/tmp",0200000,0),op=S(2,"/tmp",010200000,0);
+  results[x++]=S(4,UNDER("/proc/self/fd/",d,"/paludarium-files-fixture"),st,0);results[x++]=*(long*)(st+48);
+  long o=S(2,UNDER("/proc/self/fd/",d,"/paludarium-files-fixture"),0,0);results[x++]=o>=0;results[x++]=S(0,o,buf,4);S(3,o,0,0);
+  results[x++]=S(4,UNDER("/proc/self/fd/",op,"/paludarium-files-fixture"),st,0);
+  results[x++]=S(4,UNDER("/dev/fd/",d,"/paludarium-files-fixture"),st,0);
+  results[x++]=S(4,UNDER("/proc/self/fd/",fd,"/x"),st,0);results[x++]=S(4,UNDER("/proc/self/fd/",900,"/x"),st,0);
+  results[x++]=S(4,UNDER("/proc/self/fd/",d,"/missing"),st,0);
+  results[x++]=INODE(UNDER("/proc/self/fd/",d,"/.."))==INODE("/");results[x++]=INODE(UNDER("/proc/self/fd/",d,"/."))==INODE("/tmp");
+  /* Creating and removing through it, and a directory renamed since it was opened. */
+  results[x++]=S(83,UNDER("/proc/self/fd/",d,"/paludarium-files-dir"),0755,0);results[x++]=S(4,dd,st,0);
+  long e=S(2,dd,0200000,0);S(82,dd,dd2,0);
+  long w=S(2,UNDER("/proc/self/fd/",e,"/inner"),0101,0600);results[x++]=w>=0;S(3,w,0,0);
+  results[x++]=S(4,"/tmp/paludarium-files-dir2/inner",st,0);
+  results[x++]=S(87,UNDER("/proc/self/fd/",e,"/inner"),0,0);results[x++]=S(4,"/tmp/paludarium-files-dir2/inner",st,0);
+  results[x++]=S(84,dd2,0,0);results[x++]=S(4,UNDER("/proc/self/fd/",e,"/inner"),st,0);
+  /* The working directory's link. */
+  long ok=S(79,here,300,0);S(80,"/tmp",0,0);results[x++]=S(4,"/proc/self/cwd/paludarium-files-fixture",st,0);if(ok>0)S(80,here,0,0);
+  results[x++]=S(4,"/proc/self/exe/x",st,0);
+  /* openat2's RESOLVE_* flags meet the link inside the path too: a magic link (ELOOP) and another mount (EXDEV). */
+  {static unsigned long how[3];how[0]=0;how[1]=0;
+   for(int k=0;k<3;k++){how[2]=k==0?0x02:k==1?0x04:0x01;long o2=call(437,-100,(long)UNDER("/proc/self/fd/",d,"/paludarium-files-fixture"),(long)how,24,0,0);results[x++]=o2>=0?0:o2;if(o2>=0)S(3,o2,0,0);}
+   how[2]=0x10;long o3=call(437,-100,(long)UNDER("/proc/self/fd/",d,"/paludarium-files-fixture"),(long)how,24,0,0);results[x++]=o3>=0;if(o3>=0)S(3,o3,0,0);}
+  S(3,e,0,0);S(3,d,0,0);S(3,op,0,0);}
  if(CASE==66){ /* an O_PATH descriptor refuses I/O (EBADF), as Linux's fdget has it */
   static long xv[2];static int pf[2];
   S(1,fd,"abcd",4);long op=S(2,p,010000000,0),dp=S(2,"/tmp",010200000,0);

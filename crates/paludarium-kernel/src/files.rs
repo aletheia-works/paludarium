@@ -208,6 +208,16 @@ impl Files {
     pub(crate) fn umask(&self) -> u32 {
         self.umask.load(Ordering::SeqCst)
     }
+    /// Whether descriptor `fd` is open and closes on exec.
+    pub(crate) fn is_cloexec(&self, fd: u64) -> bool {
+        u32::try_from(fd).is_ok_and(|fd| {
+            self.fds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&fd)
+                .is_some_and(|d| d.cloexec)
+        })
+    }
     pub(crate) fn exec_path(&self, path: Vec<u8>) -> Result<Vec<u8>, Errno> {
         self.path((-100i32) as u64, path)
     }
@@ -482,7 +492,85 @@ fn lowest_free(
         Err(Errno::EMFILE)
     }
 }
+/// The path at `addr`, with a link in `/proc/self/fd` (or `/proc/self/cwd`,
+/// `/proc/self/exe`, `/dev/fd`) before its last component taken to where it
+/// leads ([`through_magic_links`]).
 fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
+    through_magic_links(c, string(c, addr)?)
+}
+/// Path `p` with each magic link it goes through, a link in a process's
+/// `fd` directory, its `cwd` or `exe`, which Linux's walk (`nd_jump_link`)
+/// does not read but jumps to the file of, replaced by that file's path: a
+/// directory a descriptor holds by the path that names it now (it may have
+/// been renamed), a removed one is ENOENT, and a file that is not a
+/// directory ENOTDIR. A link the path ends in is left to the call, which
+/// may not follow it.
+fn through_magic_links(c: &Context<'_>, mut p: Vec<u8>) -> Result<Vec<u8>, Errno> {
+    for _ in 0..40 {
+        if !p.starts_with(b"/proc/") && !p.starts_with(b"/dev/") {
+            return Ok(p);
+        }
+        let jump = (1..p.len()).filter(|&i| p[i] == b'/').find_map(|i| {
+            let prefix = crate::devices::through_link(&p[..i]).unwrap_or_else(|| p[..i].to_vec());
+            let prefix = match crate::devices::entry(&prefix) {
+                Some(crate::devices::Entry::Link(target)) => target.to_vec(),
+                _ => prefix,
+            };
+            magic_link_directory(c, &prefix).map(|target| (target, i))
+        });
+        let Some((target, at)) = jump else {
+            return Ok(p);
+        };
+        let mut next = target?;
+        next.extend_from_slice(&p[at..]);
+        p = next;
+    }
+    Err(Errno(40)) // ELOOP
+}
+/// The directory magic link `path` leads to, for [`through_magic_links`],
+/// or `None` when `path` is not one.
+fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, Errno>> {
+    const ENOTDIR: Errno = Errno::ENOTDIR;
+    let is_dir = |stat: FileStat| stat.mode & 0o170000 == 0o040000;
+    match crate::proc::own_entry(path, c.process.pid) {
+        Some(crate::proc::OwnEntry::Descriptor(n)) => Some((|| {
+            let d = c
+                .files
+                .descriptor(u64::from(n))
+                .map_err(|_| Errno::ENOENT)?;
+            let stat = d.file.stat()?;
+            if !is_dir(stat) || d.file.as_any().is_some_and(|v| v.is::<LinkPath>()) {
+                return Err(ENOTDIR);
+            }
+            let path = d.file.guest_path_hint().unwrap_or_else(|| d.path.clone());
+            // The path still names the directory, or it was removed.
+            let named = generated(&path)
+                || c.files
+                    .fs
+                    .metadata(&path, true)
+                    .is_ok_and(|now| now.inode == stat.inode);
+            if named { Ok(path) } else { Err(Errno::ENOENT) }
+        })()),
+        Some(entry @ (crate::proc::OwnEntry::Cwd | crate::proc::OwnEntry::Exe)) => {
+            let target = own_link(c, entry)?;
+            Some(if entry == crate::proc::OwnEntry::Exe {
+                Err(ENOTDIR)
+            } else {
+                Ok(target)
+            })
+        }
+        _ => {
+            let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
+            match task_path.entry {
+                crate::proc::TaskEntry::Exe => Some(Err(ENOTDIR)),
+                crate::proc::TaskEntry::Cwd => Some(own_link_target(c, path).ok_or(Errno::ENOENT)),
+                _ => None,
+            }
+        }
+    }
+}
+/// The NUL-terminated string at `addr`, of at most 4096 bytes.
+fn string(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     if addr == 0 {
         return Err(Errno::EFAULT);
     }
@@ -2441,7 +2529,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             Ok(0)
         }
         88 | 266 => {
-            let target = path(c, a[0])?;
+            let target = string(c, a[0])?;
             let (dir, raw) = if n == 88 {
                 ((-100i32) as u64, path(c, a[1])?)
             } else {
@@ -3515,7 +3603,13 @@ fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if flags & O_SYNC != 0 {
         flags |= O_DSYNC;
     }
-    let raw = path(c, a[1])?;
+    // With `RESOLVE_*` flags its own walk meets each magic link, which they
+    // may refuse; without, the path is taken as `openat` takes it.
+    let raw = if resolve & !RESOLVE_CACHED == 0 {
+        path(c, a[1])?
+    } else {
+        string(c, a[1])?
+    };
     open_at(c, a[0], raw, flags, mode as u32, resolve & !RESOLVE_CACHED)
 }
 /// The mount `path` is on, for `RESOLVE_NO_XDEV`: procfs, devtmpfs and
@@ -4175,30 +4269,127 @@ pub(crate) fn through_descriptor(
         return Ok(None);
     };
     let d = files.descriptor(u64::from(n)).map_err(|_| Errno::ENOENT)?;
+    descriptor_followed(files, d).map(Some)
+}
+/// Where the file descriptor `d` holds is reached: by the path that still
+/// names it, or through the descriptor itself.
+fn descriptor_followed(files: &Files, d: Descriptor) -> Result<Followed, Errno> {
     let any = d.file.as_any();
     if any.is_some_and(|v| v.is::<LinkPath>()) {
-        return Ok(Some(Followed::Path {
+        return Ok(Followed::Path {
             path: opened_path(&d),
             follow: false,
-        }));
+        });
     }
     if d.path.is_empty() || any.is_some_and(|v| v.is::<crate::memfd::Memfd>()) {
-        return Ok(Some(Followed::File(d)));
+        return Ok(Followed::File(d));
     }
     if generated(&d.path) {
-        return Ok(Some(Followed::Path {
+        return Ok(Followed::Path {
             path: d.path.clone(),
             follow: true,
-        }));
+        });
     }
     let inode = d.file.stat()?.inode;
-    Ok(Some(match current_path(files, &d, inode) {
+    Ok(match current_path(files, &d, inode) {
         Some(path) => Followed::Path {
             path,
             follow: false,
         },
         None => Followed::File(d),
-    }))
+    })
+}
+/// The program `execveat(dir, raw, .., flags)` runs: a file a path names
+/// (`dir` and `raw` taken as Linux's `do_open_execat` takes them, a link in
+/// `/proc/self/fd` followed to the descriptor's file), or one no path names,
+/// a memfd or a removed file, which runs from its descriptor. An empty `raw`
+/// takes the file `dir` holds with `AT_EMPTY_PATH` (ENOENT without), and
+/// `AT_SYMLINK_NOFOLLOW` refuses a symbolic link (ELOOP), as `may_open`
+/// refuses the one an `O_PATH | O_NOFOLLOW` descriptor holds.
+pub(crate) enum Program {
+    Path(Vec<u8>),
+    File {
+        file: Arc<dyn FileHandle>,
+        /// What `/proc/self/exe` reads.
+        name: Vec<u8>,
+        /// The name of its directory entry, which names the process.
+        entry: Vec<u8>,
+        /// The path a removed file had, whose directories Landlock still
+        /// walks from its dentry; none for a memfd.
+        removed: Option<Vec<u8>>,
+    },
+}
+pub(crate) fn exec_program(
+    files: &Files,
+    pid: u32,
+    dir: u64,
+    raw: &[u8],
+    flags: u64,
+) -> Result<Program, Errno> {
+    const ELOOP: Errno = Errno(40);
+    let symlink = |path: &[u8]| {
+        files
+            .fs
+            .metadata(path, false)
+            .is_ok_and(|s| s.mode & 0o170000 == 0o120000)
+    };
+    let target = if raw.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if dir as i32 == -100 {
+            return Ok(Program::Path(files.path(dir, b".".to_vec())?));
+        }
+        descriptor_followed(files, files.descriptor(dir)?)?
+    } else {
+        let path = files.path(dir, raw.to_vec())?;
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        if !follow && symlink(&path) {
+            return Err(ELOOP);
+        }
+        match through_descriptor(files, pid, &path, follow)? {
+            Some(target) => target,
+            None => return Ok(Program::Path(path)),
+        }
+    };
+    Ok(match target {
+        Followed::Path {
+            path,
+            follow: false,
+        } if symlink(&path) => return Err(ELOOP),
+        Followed::Path { path, .. } => Program::Path(path),
+        Followed::File(d) => {
+            let memfd = d
+                .file
+                .as_any()
+                .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>());
+            let (name, entry) = match memfd {
+                Some(memfd) => {
+                    let name = memfd.link_target();
+                    let entry = name
+                        .strip_prefix(b"/")
+                        .and_then(|n| n.strip_suffix(b" (deleted)"))
+                        .unwrap_or(&name)
+                        .to_vec();
+                    (name, entry)
+                }
+                None => (
+                    [&d.path[..], b" (deleted)"].concat(),
+                    d.path
+                        .rsplit(|&b| b == b'/')
+                        .next()
+                        .unwrap_or(&d.path)
+                        .to_vec(),
+                ),
+            };
+            Program::File {
+                removed: memfd.is_none().then(|| d.path.clone()),
+                file: d.file,
+                name,
+                entry,
+            }
+        }
+    })
 }
 /// [`through_descriptor`] for this thread's process.
 fn followed(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {

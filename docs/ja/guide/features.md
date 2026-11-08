@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_getscheduler`／`sched_getparam`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_get`、`personality`、`unshare`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_getscheduler`／`sched_getparam`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_get`、`personality`、`unshare`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
@@ -649,6 +649,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   変えます。パイプでは両端がそれらを共有し、ソケットペアでは端ごとに持ちます。最初の
   持ち主は、それを作ったスレッド、または接続を受け付けたスレッドのファイルシステム ID です。
   ホストが用意する標準入力、標準出力、標準エラー出力では `EPERM` を返します。
+- `execveat(dir, path, argv, envp, flags)` は `execve` と同じくプログラムを動かし、
+  相対パスは `dir` から探します。`AT_EMPTY_PATH` は、パスが空のときディスクリプタ
+  （`O_PATH` のものも）が持つファイルを動かし、`AT_SYMLINK_NOFOLLOW` はシンボリック
+  リンクを断ります（`ELOOP`）。ほかのフラグは `EINVAL`、`AT_EMPTY_PATH` のない空の
+  パスは `ENOENT` です。プログラムは、Linux の `alloc_bprm` と同じく `/dev/fd/<dir>`
+  か `/dev/fd/<dir>/<path>` を `AT_EXECFN` として、スクリプトならそのパスとして
+  受け取ります。exec で閉じるディスクリプタのスクリプトは `ENOENT` です
+  （`BINPRM_FLAGS_PATH_INACCESSIBLE`）。どのパスも指さない memfd や削除したファイルは、
+  `execveat` でも `/proc/self/fd` のリンクでも、ディスクリプタから動きます
+  （`fexecve`）。そのとき `/proc/self/exe` は memfd のリンクか、` (deleted)` の付いた
+  パスを読みます。そのファイルは丸ごと読むので、メモリの上限より大きいものは、
+  セグメントが小さくても `ENOMEM` です。ELF のプログラムでもスクリプトでもないものは、
+  先頭のバイトで `ENOEXEC` になります。Landlock は、削除したファイルの `EXECUTE` を、
+  Linux がその dentry から確かめるのと同じく、もとの場所から確かめます。memfd はどの
+  階層にも属しません。`AT_EXECVE_CHECK`（Linux 6.14）は `EINVAL` です。
 - `chmod` と `utimensat` は、メモリ上のファイルシステムでも、マウントしたホストの
   ディレクトリでも使えます。Windows のホストでは、`chmod` が変えるのは読み取り専用の
   属性だけです。`fchmodat2`（Linux 6.6）は `AT_SYMLINK_NOFOLLOW` と `AT_EMPTY_PATH` を
@@ -688,10 +703,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `chmod` と `fchmodat`、`chown` と `fchownat`、`utimensat`、`truncate`、`chdir`、
   拡張属性の呼び出し、`execve` がそうです（`O_PATH` のディスクリプタへの `fchmod`、
   `fchown`、`futimens`、`ftruncate` は `EBADF` です）。削除したファイル、memfd、パイプには
-  ディスクリプタ自身を通して届きます（それらの `execve` はできません）。
+  ディスクリプタ自身を通して届きます（memfd と削除したファイルの `execve` はそれを
+  動かし、パイプのものは `EACCES` です）。
   `O_PATH | O_NOFOLLOW` のディスクリプタが持つシンボリックリンクはもうたどりません。
   そのモードは変えられず（`EOPNOTSUPP`）、`chdir` はディレクトリでないもの（`ENOTDIR`）、
   `truncate` は通常のファイルでないもの（`EINVAL`）とし、`execve` は `ELOOP` になります。
+- パスの途中にある `/proc/self/fd`（や `/dev/fd`）のリンク、`/proc/self/cwd`、
+  `/proc/self/exe` は、Linux の `nd_jump_link` と同じく飛び越えます。
+  `/proc/self/fd/3/name` は、ディスクリプタ 3 が持つディレクトリの中の `name` で、
+  そのディレクトリは名前を変えた後も今の名前で見つかり、`..` はそこから続きます。
+  削除したディレクトリと開いていないディスクリプタは `ENOENT`、ディレクトリでない
+  ファイルは `ENOTDIR` です。絶対パスを取るファイルの呼び出しはこう扱います（`RESOLVE_*` フラグ付きの
+  `openat2` は自身の解決の中で扱います）。`/proc` のディスクリプタや `/proc` の中の
+  作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
+  `execve`、Unix ソケットのアドレスは扱いません。
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの

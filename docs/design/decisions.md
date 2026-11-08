@@ -46,7 +46,8 @@ it stays atomic against the stores that take no lock, and it is a full fence.
 A split lock across two words, or `CMPXCHG16B`, takes the locks and first
 moves the epoch on, which waits for the stores under way and sends the next
 ones to the locks. Until it ends, only loads run without a lock, and a load
-that spans the words may see one of them written before the other.
+that spans the words may see one of them written before the other, except an
+aligned 16-byte load (below).
 
 A guest's threads see each other's memory in the order x86 gives (TSO): a
 thread's loads and stores stay in order, except that a load may pass an earlier
@@ -54,6 +55,13 @@ store. The page contents are read with acquire and written with release
 ordering, which keeps that order on an Arm host too, without the lock. A write
 to an executable page moves the code generation on after its bytes, so whoever
 sees the new generation sees the new code.
+
+An aligned load of 16 bytes (`MOVDQA`, for one) is one access on an x86-64
+CPU, so it sees a `CMPXCHG16B` or a 16-byte store of another thread whole.
+The emulator keeps page contents as 8-byte words, and a load takes no lock, so
+each page counts the writes of more than one word it has started and finished.
+Such a load reads its two words again while one of them may have come between
+them; other loads and writes pay nothing for it.
 
 ## Owning the waiting primitives
 

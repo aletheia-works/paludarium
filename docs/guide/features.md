@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_getscheduler`/`sched_getparam`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_get`, `personality`, `unshare`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_getscheduler`/`sched_getparam`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_get`, `personality`, `unshare`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
@@ -707,6 +707,24 @@ kernel.
   two ends share them, and for each socket, which start as the filesystem IDs
   of the thread that made them, or that accepted a connection. Standard input,
   output and error, which the host provides, give `EPERM`.
+- `execveat(dir, path, argv, envp, flags)` runs a program as `execve` does,
+  from `dir` for a relative path, and takes `AT_EMPTY_PATH`, which with an
+  empty path runs the file the descriptor holds (an `O_PATH` one's too), and
+  `AT_SYMLINK_NOFOLLOW`, which refuses a symbolic link (`ELOOP`); other flags
+  are `EINVAL`, and an empty path without `AT_EMPTY_PATH` is `ENOENT`. The
+  program gets `/dev/fd/<dir>` or `/dev/fd/<dir>/<path>` as its `AT_EXECFN`
+  and, for a script, as the script's path, as Linux's `alloc_bprm` names
+  it; a script from a descriptor that closes on exec is `ENOENT`
+  (`BINPRM_FLAGS_PATH_INACCESSIBLE`). A memfd or a removed file, which no
+  path names, runs from its descriptor (`fexecve`), through `execveat` or
+  a link in `/proc/self/fd`, and `/proc/self/exe` then reads the memfd's
+  link or the path with `(deleted)`. Such a file is read whole, so one
+  larger than the memory limit is `ENOMEM` even when its segments are small,
+  and one that is neither an ELF program nor a script is `ENOEXEC` from its
+  first bytes. Landlock checks a removed one for `EXECUTE` from where it
+  was, as from its dentry on Linux; a memfd is in no hierarchy.
+  `AT_EXECVE_CHECK` (Linux 6.14) is
+  `EINVAL`.
 - `chmod` and `utimensat` work in the in-memory filesystem and in mounted
   host directories; on a Windows host, `chmod` only sets or clears the
   read-only attribute. `fchmodat2` (Linux 6.6) takes `AT_SYMLINK_NOFOLLOW`,
@@ -752,10 +770,21 @@ kernel.
   `utimensat`, `truncate`, `chdir`, the extended-attribute calls and
   `execve`, where `fchmod`, `fchown`, `futimens` and `ftruncate` of an
   `O_PATH` descriptor are `EBADF`. A removed file, a memfd or a pipe is reached through the
-  descriptor itself (`execve` of those is not); a symbolic link an
+  descriptor itself (`execve` of a memfd or a removed file runs it, and
+  of a pipe is `EACCES`); a symbolic link an
   `O_PATH | O_NOFOLLOW` descriptor holds is not followed again: its mode
   cannot change (`EOPNOTSUPP`), `chdir` finds no directory (`ENOTDIR`),
   `truncate` no regular file (`EINVAL`) and `execve` gives `ELOOP`.
+- Inside a path, a link in `/proc/self/fd` (or `/dev/fd`), `/proc/self/cwd`
+  and `/proc/self/exe` is jumped through as Linux's `nd_jump_link` does:
+  `/proc/self/fd/3/name` is `name` in the directory descriptor 3 holds, by
+  the path that names it now, even after a rename, and `..` goes on from
+  there. A removed directory is `ENOENT`, a descriptor that is not open
+  `ENOENT`, and a file that is not a directory `ENOTDIR`. The file calls
+  that take an absolute path do this (`openat2` with `RESOLVE_*` flags in its
+  own walk); a path relative to a descriptor of `/proc` or to a working
+  directory there, one whose `..` or symbolic link leads into `/proc`,
+  `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
   `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a

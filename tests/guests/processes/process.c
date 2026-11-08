@@ -980,6 +980,36 @@ static int reaped(long pid) {
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+/* execveat(dir, path, argv, envp, flags) through the raw call. */
+static long execveat_call(int dir, const char *path, char *const *argv, int flags) {
+    char *env[] = {NULL};
+    return syscall(SYS_execveat, dir, path, argv, env, flags);
+}
+/* A copy of the file at `from` in descriptor `to`, from its start. */
+static int copy_into(const char *from, int to) {
+    char buffer[65536];
+    long n;
+    int in = open(from, O_RDONLY);
+    if (in < 0) return -1;
+    while ((n = read(in, buffer, sizeof buffer)) > 0)
+        if (write(to, buffer, n) != n) return -1;
+    close(in);
+    return n < 0 ? -1 : 0;
+}
+/* Runs `label` in a child: execveat as given, which reports from the new
+   program, or the error it gives. */
+static void execveat_child(const char *label, int dir, const char *path, int flags) {
+    fflush(stdout);
+    pid_t pid = child();
+    if (pid == 0) {
+        char *args[] = {"x", "execveat-run", (char *)label, NULL};
+        long r = execveat_call(dir, path, args, flags);
+        printf("%s: failed=%ld errno=%d\n", label, r, errno);
+        fflush(stdout);
+        _exit(9);
+    }
+    printf("%s: status=%d\n", label, reaped(pid));
+}
 /* The value of `field` in /proc/self/status, read through a /proc/self
    descriptor as procfs readers do. */
 static int status_field(const char *field, char *value, size_t size) {
@@ -4651,9 +4681,32 @@ int main(int argc, char **argv) {
         /* Running a program: EXECUTE. */
         pid = child();
         if (pid == 0) {
+            /* Removed files, one in a and one outside, which execveat runs
+               from their descriptors: Landlock still walks up from where
+               each was (EACCES outside a), and the one in a is no program. */
+            char removed_in[112], removed_out[112];
+            snprintf(removed_in, sizeof removed_in, "%s/removed", a);
+            snprintf(removed_out, sizeof removed_out, "%s/removed", b);
+            /* Open for reading only: a file open for writing is ETXTBSY. */
+            close(open(removed_in, O_CREAT | O_WRONLY, 0755));
+            close(open(removed_out, O_CREAT | O_WRONLY, 0755));
+            chmod(removed_in, 0755);
+            chmod(removed_out, 0755);
+            int in = open(removed_in, O_RDONLY), out = open(removed_out, O_RDONLY);
+            unlink(removed_in);
+            unlink(removed_out);
             long r = ll_ruleset(LL_EXECUTE);
             ll_rule(r, a, LL_EXECUTE);
             ll_enforce(r);
+            {
+                char *argv[] = {"x", NULL}, *envp[] = {NULL};
+                errno = 0;
+                syscall(SYS_execveat, in, "", argv, envp, AT_EMPTY_PATH);
+                result("exec-removed-inside", errno);
+                errno = 0;
+                syscall(SYS_execveat, out, "", argv, envp, AT_EMPTY_PATH);
+                result("exec-removed-outside", errno);
+            }
             /* A file that may be executed, outside a: Landlock refuses the
                open for execution before the file is read. */
             snprintf(tmp, sizeof tmp, "%s/x", b);
@@ -12288,6 +12341,84 @@ int main(int argc, char **argv) {
         unlink("theirs");
         unlink("prog");
         if (chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "execveat-run")) {
+        /* What the program execveat ran sees: its name, AT_EXECFN and the
+           file /proc/self/exe leads to. */
+        char exe[4096];
+        long n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        exe[n < 0 ? 0 : n] = 0;
+        const char *execfn = (const char *)getauxval(AT_EXECFN);
+        printf("%s: argc=%d", argc > 2 ? argv[2] : "?", argc);
+        for (int i = 0; i < argc; i++) printf(" [%s]", argv[i]);
+        printf(" execfn=%s exe=%s\n", execfn ? execfn : "", exe);
+        return 0;
+    }
+    if (!strcmp(mode, "execveat")) {
+        /* execveat and fexecve: by path, from a directory descriptor, a
+           descriptor's own file (AT_EMPTY_PATH), a memfd and a removed file,
+           and the errors do_open_execat gives. */
+        static char copy[] = "/tmp/paludarium-execveat-copy", link_path[] = "/tmp/paludarium-execveat-link";
+        char dir[4096];
+        strcpy(dir, self);
+        char *slash = strrchr(dir, '/');
+        if (!slash) return 70;
+        *slash = 0;
+        const char *base = slash + 1;
+        int d = open(*dir ? dir : "/", O_RDONLY | O_DIRECTORY);
+        int file = open(self, O_RDONLY), path_only = open(self, O_PATH);
+        if (d < 0 || file < 0 || path_only < 0) return 71;
+        execveat_child("path", AT_FDCWD, self, 0);
+        execveat_child("relative", d, base, 0);
+        execveat_child("empty-path", file, "", AT_EMPTY_PATH);
+        execveat_child("o-path", path_only, "", AT_EMPTY_PATH);
+        int memfd = syscall(SYS_memfd_create, "prog", 0);
+        if (memfd < 0 || copy_into(self, memfd)) return 72;
+        execveat_child("memfd", memfd, "", AT_EMPTY_PATH);
+        char through[64];
+        snprintf(through, sizeof through, "/proc/self/fd/%d", memfd);
+        execveat_child("fexecve-memfd", AT_FDCWD, through, 0);
+        unlink(copy);
+        int w = open(copy, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+        if (w < 0 || copy_into(self, w) || close(w)) return 73;
+        int removed = open(copy, O_RDONLY);
+        if (removed < 0 || unlink(copy)) return 74;
+        execveat_child("removed", removed, "", AT_EMPTY_PATH);
+        snprintf(through, sizeof through, "/proc/self/fd/%d", removed);
+        execveat_child("fexecve-removed", AT_FDCWD, through, 0);
+        /* A script in a memfd names itself /dev/fd/<n>, which a descriptor
+           closed on exec leaves to nothing (ENOENT). */
+        char line[4200];
+        snprintf(line, sizeof line, "#!%s execveat-run\n", self);
+        int script = syscall(SYS_memfd_create, "script", 0);
+        int closing = syscall(SYS_memfd_create, "closing", 1);
+        if (script < 0 || closing < 0) return 75;
+        if (write(script, line, strlen(line)) < 0 || write(closing, line, strlen(line)) < 0) return 75;
+        execveat_child("memfd-script", script, "", AT_EMPTY_PATH);
+        char *args[] = {"x", "execveat-run", "error", NULL};
+        int p[2];
+        if (pipe(p)) return 76;
+        unlink(link_path);
+        if (symlink(self, link_path)) return 77;
+        errno = 0;
+        outcome("cloexec-script", execveat_call(closing, "", args, AT_EMPTY_PATH));
+        outcome("bad-flags", execveat_call(AT_FDCWD, self, args, 0x2));
+        outcome("empty-without-flag", execveat_call(file, "", args, 0));
+        outcome("closed", execveat_call(900, "", args, AT_EMPTY_PATH));
+        outcome("not-a-directory", execveat_call(file, "x", args, 0));
+        outcome("nofollow", execveat_call(AT_FDCWD, link_path, args, AT_SYMLINK_NOFOLLOW));
+        outcome("directory", execveat_call(d, "", args, AT_EMPTY_PATH));
+        outcome("cwd", execveat_call(AT_FDCWD, "", args, AT_EMPTY_PATH));
+        outcome("pipe", execveat_call(p[0], "", args, AT_EMPTY_PATH));
+        /* A sparse file of no format is ENOEXEC from its first bytes, however
+           large it is. */
+        int sparse = syscall(SYS_memfd_create, "sparse", 0);
+        if (sparse < 0 || ftruncate(sparse, 1L << 32) || fchmod(sparse, 0755)) return 79;
+        outcome("sparse", execveat_call(sparse, "", args, AT_EMPTY_PATH));
+        if (fchmod(memfd, 0600)) return 78;
+        outcome("not-executable", execveat_call(memfd, "", args, AT_EMPTY_PATH));
+        unlink(link_path);
         return 0;
     }
     if (!strcmp(mode, "script-exec")) {

@@ -1920,7 +1920,10 @@ fn sys_rt_sigprocmask(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// Only known terminal queries are interpreted, never forwarded to Host.
-fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+fn sys_ioctl(c: &mut Context<'_>, mut a: [u64; 6]) -> Outcome {
+    // The request is an unsigned int, as in Linux's ioctl(unsigned int fd,
+    // unsigned int cmd, unsigned long arg): the register's upper half is not read.
+    a[1] &= 0xffff_ffff;
     let mut run = || -> Result<u64, Errno> {
         // Linux's `do_vfs_ioctl` answers these for every file, and an
         // `O_PATH` descriptor for none.

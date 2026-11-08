@@ -260,14 +260,19 @@ fn guest_components(path: &[u8]) -> Option<Vec<&[u8]>> {
 
 /// The guest path at which `mount` shows the host file `program`, if the
 /// file lies inside its host directory: as the paths are written, or else
-/// with the symbolic links of the program's directory and of the host
-/// directory resolved (`/tmp` and `/private/tmp` on macOS). The program's own
+/// with the symbolic links and `..` of the program's directory and of the
+/// host directory resolved (`/tmp` and `/private/tmp` on macOS). The program's own
 /// name stays a link, as exec of it names it.
 fn path_in_mount(program: &Path, mount: &Mount) -> Option<Vec<Vec<u8>>> {
     let written = || {
         let program = std::path::absolute(program).ok()?;
         let host = std::path::absolute(&mount.host).ok()?;
-        program.strip_prefix(host).ok().map(Path::to_path_buf)
+        let relative = program.strip_prefix(host).ok()?;
+        // A `..` left in the path is the resolved path's to settle.
+        (!relative
+            .components()
+            .any(|c| c == std::path::Component::ParentDir))
+        .then(|| relative.to_path_buf())
     };
     let resolved = || {
         let name = program.file_name()?;
@@ -666,6 +671,12 @@ mod tests {
             Some(&b"/x/jvm/bin/java"[..])
         );
         assert_eq!(at(java, &[]), None);
+        // A `..` in the program's directory is resolved, as exec resolves it.
+        let up = std::path::absolute("/usr/lib/../bin").unwrap().join("java");
+        assert_eq!(
+            at(up.to_str().unwrap(), &[mount(usr, "/x")]).as_deref(),
+            Some(&b"/x/bin/java"[..])
+        );
         // A mount's own directory, or a guest path with `..`, is not one.
         // /x/jvm/bin/java through the first is the second's.
         assert_eq!(

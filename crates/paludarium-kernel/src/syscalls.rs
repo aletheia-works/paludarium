@@ -80,6 +80,7 @@ pub mod nr {
     pub const GETEGID: u64 = 108;
     pub const SCHED_SETAFFINITY: u64 = 203;
     pub const SCHED_GETAFFINITY: u64 = 204;
+    pub const GETCPU: u64 = 309;
     pub const SCHED_YIELD: u64 = 24;
     pub const SYSINFO: u64 = 99;
     pub const GETGROUPS: u64 = 115;
@@ -131,7 +132,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 65] = [
+        let entries: [(u64, Handler); 66] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -179,6 +180,7 @@ impl SyscallTable {
             (nr::GETEGID, credentials::sys_getegid),
             (nr::SCHED_SETAFFINITY, sys_sched_setaffinity),
             (nr::SCHED_GETAFFINITY, sys_sched_getaffinity),
+            (nr::GETCPU, sys_getcpu),
             (nr::SCHED_YIELD, sys_sched_yield),
             (nr::SYSINFO, sys_sysinfo),
             (nr::GETRUSAGE, sys_getrusage),
@@ -2378,6 +2380,31 @@ fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
     other.as_deref().unwrap_or(c.group).set_affinity(tid, mask);
     ok(0)
+}
+
+/// `getcpu(cpu, node, cache)`: the CPU the thread runs on, the lowest its
+/// mask allows, and NUMA node 0, each written where its pointer is not NULL;
+/// `EFAULT` when one cannot be written, as Linux, which still writes the
+/// other. The cache is ignored, as on Linux.
+fn sys_getcpu(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let cpu = c.group.affinity(c.tid).map_or(0, |set| {
+        set.iter()
+            .enumerate()
+            .find(|(_, word)| **word != 0)
+            .map_or(0, |(index, word)| {
+                index * 64 + word.trailing_zeros() as usize
+            })
+    }) as u32;
+    let mut failed = false;
+    for (address, value) in [(a[0], cpu), (a[1], 0)] {
+        if address != 0 {
+            failed |= c
+                .mem
+                .write(GuestAddr(address), &value.to_le_bytes())
+                .is_err();
+        }
+    }
+    if failed { err(Errno::EFAULT) } else { ok(0) }
 }
 
 fn sys_set_tid_address(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {

@@ -767,8 +767,9 @@ kernel.
     `CBAUD` or `BOTHER`. `TIOCGWINSZ` and `TIOCSWINSZ` (a change sends
     `SIGWINCH` to the foreground group), `FIONREAD`, `TIOCOUTQ`, `TCFLSH`,
     `TCXONC`, `TCSBRK`, `TIOCEXCL`, `TIOCGEXCL`, `TIOCGETD` and `TIOCSETD`
-    (N_TTY only), `TIOCGDEV`, `TIOCSIG` and, for `CAP_SYS_ADMIN`,
-    `TIOCSTI` work as on Linux.
+    (N_TTY only), `TIOCGDEV` and `TIOCSIG` work as on Linux, and so does
+    `TIOCSTI` with `dev.tty.legacy_tiocsti` off: it pushes input only for
+    `CAP_SYS_ADMIN`, and is `EIO` for anyone else.
   - A session leader without a controlling terminal takes one with
     `TIOCSCTTY` or by opening the slave for reading without `O_NOCTTY`;
     its children inherit it and `setsid` drops it. `/dev/tty` opens the

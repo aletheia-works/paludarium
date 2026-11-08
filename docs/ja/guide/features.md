@@ -698,8 +698,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     パリティなしの `CS8 | CREAD` を保ち、速さは `CBAUD` か `BOTHER` から決めます。
     `TIOCGWINSZ` と `TIOCSWINSZ`（変わるとフォアグラウンドのグループに `SIGWINCH`
     を送ります）、`FIONREAD`、`TIOCOUTQ`、`TCFLSH`、`TCXONC`、`TCSBRK`、`TIOCEXCL`、
-    `TIOCGEXCL`、`TIOCGETD` と `TIOCSETD`（N_TTY だけ）、`TIOCGDEV`、`TIOCSIG`、
-    `CAP_SYS_ADMIN` なら `TIOCSTI` も、Linux と同じに動きます。
+    `TIOCGEXCL`、`TIOCGETD` と `TIOCSETD`（N_TTY だけ）、`TIOCGDEV`、`TIOCSIG` は
+    Linux と同じに動きます。`TIOCSTI` も `dev.tty.legacy_tiocsti` が無効のときと同じで、
+    入力を押し込めるのは `CAP_SYS_ADMIN` だけで、ほかは `EIO` です。
   - 制御端末のないセッションリーダーは、`TIOCSCTTY` か、スレーブを `O_NOCTTY`
     なしに読み込み用に開くと、それを制御端末にします。子はそれを継ぎ、`setsid` で
     なくなります。`/dev/tty` は制御端末を開きます（なければ `ENXIO`。エミュレーターの

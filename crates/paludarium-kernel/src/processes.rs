@@ -113,6 +113,22 @@ struct PriorityThread {
 }
 /// fs.nr_open: the highest RLIMIT_NOFILE Linux accepts by default.
 const NR_OPEN: u64 = 1 << 20;
+/// A process as [`Processes::view`] gives it.
+pub(crate) struct ProcessView {
+    pub parent: u32,
+    pub group_id: u32,
+    pub session: u32,
+    pub children_cpu: u64,
+    /// The RLIMIT_RSS and RLIMIT_SIGPENDING soft limits.
+    pub rss_limit: u64,
+    pub queue_limit: u64,
+    pub no_new_privs: bool,
+    pub dumpable: bool,
+    /// It has ended and waits to be reaped.
+    pub zombie: bool,
+    pub exit_signal: i32,
+    pub group: Arc<ThreadGroup>,
+}
 pub struct Processes {
     next: AtomicU32,
     entries: Mutex<BTreeMap<u32, Entry>>,
@@ -707,6 +723,38 @@ impl Processes {
             (entry.parent, entry.limits[11].0, entry.no_new_privs)
         })
     }
+    /// The live process that thread `tid` is in.
+    pub(crate) fn thread_leader(&self, tid: u32) -> Option<u32> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .iter()
+            .find(|(_, entry)| entry.status.is_none() && entry.group.has_member(tid))
+            .map(|(&pid, _)| pid)
+    }
+    /// The processes there are, zombies too, in order, as `/proc` lists them.
+    pub(crate) fn pids(&self) -> Vec<u32> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.keys().copied().collect()
+    }
+    /// What `/proc/<pid>` shows of a process other than the reader, or
+    /// `None` when there is no such process.
+    pub(crate) fn view(&self, pid: u32) -> Option<ProcessView> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get(&pid)?;
+        Some(ProcessView {
+            parent: entry.parent,
+            group_id: entry.pgid,
+            session: entry.sid,
+            children_cpu: entry.children_cpu,
+            rss_limit: entry.limits[5].0,
+            queue_limit: entry.limits[11].0,
+            no_new_privs: entry.no_new_privs,
+            dumpable: entry.dumpable,
+            zombie: entry.status.is_some(),
+            exit_signal: entry.exit_signal,
+            group: Arc::clone(&entry.group),
+        })
+    }
     fn parent(&self, pid: u32) -> u32 {
         self.entries
             .lock()
@@ -1030,6 +1078,17 @@ impl Processes {
         {
             parent.group.notify_child(signals::CLD_STOPPED, child);
         }
+    }
+    /// The thread group of the live thread named by its ID, in any process,
+    /// as `find_task_by_vpid` finds it.
+    pub(crate) fn group_of(&self, named: u32) -> Option<Arc<ThreadGroup>> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .iter()
+            .find(|&(&key, entry)| {
+                entry.status.is_none() && (key == named || entry.group.has_member(named))
+            })
+            .map(|(_, entry)| Arc::clone(&entry.group))
     }
     /// What another thread named by its ID looks like to the thread acting
     /// on it, as `kill` finds it.
@@ -1815,6 +1874,9 @@ impl Kernel {
         if let Some(value) = self.group.nice(parent.tid) {
             group.set_nice(pid, value);
         }
+        if let Some(mask) = self.group.affinity(parent.tid) {
+            group.set_affinity(pid, mask);
+        }
         group.register(pid, inbox.clone());
         let mut state = parent.state.clone();
         state.pid = pid;
@@ -1855,7 +1917,7 @@ impl Kernel {
             (flags & 0xff) as i32,
             task,
         );
-        let child = Kernel {
+        let mut child = Kernel {
             host: self.host.clone(),
             process: crate::Process { pid },
             table: crate::SyscallTable::u1(),
@@ -1871,7 +1933,11 @@ impl Kernel {
             vfork_wait: None,
             unimplemented: self.unimplemented.clone(),
             task: None,
+            published: None,
         };
+        // Shown in /proc from the start, before its first system call.
+        let memory = child.spawn_memory.clone();
+        child.publish(pid, &state, memory.as_deref().unwrap_or(mem));
         self.vfork_wait = release;
         self.pending_child = Some((
             Box::new(child),

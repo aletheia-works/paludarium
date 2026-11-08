@@ -2398,6 +2398,34 @@ impl MemoryView {
         }
         Some(vma)
     }
+    /// Runs `f` on the space, if it still lives, under its locks.
+    fn with_data<T>(&self, f: impl FnOnce(&AddressSpaceData) -> T) -> Option<T> {
+        let data = self.data.upgrade()?;
+        let _serialization = self
+            .serialization
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let data = data.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(f(&data))
+    }
+    /// Reads the space's memory, as another process's `/proc/<pid>/cmdline`
+    /// does: false once the space is gone or where a page is not mapped.
+    #[must_use]
+    pub fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.with_data(|data| data.read(GuestAddr(addr), buf).is_ok())
+            .unwrap_or(false)
+    }
+    /// The total length of the space's mappings and its initial break, or
+    /// `None` once it is gone.
+    #[must_use]
+    pub fn size_and_break(&self) -> Option<(u64, u64)> {
+        self.with_data(|data| {
+            (
+                data.mappings().map(|m| m.length).sum(),
+                data.initial_break().0,
+            )
+        })
+    }
 }
 
 /// Owned instruction bytes and their epoch, captured under one MMU lock.

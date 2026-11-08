@@ -45,7 +45,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`sched_yield`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
@@ -465,6 +465,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マッピングへの書き込みをファイルに書き戻します。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
+  `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。
+  CPU マスクの大きさまで読み（短ければ残りは空とみなします）、ホストの CPU だけを残し、
+  何も残らなければ `EINVAL` です。その後の `sched_getaffinity` はそのマスクを返し、新しい
+  スレッドとプロセスはそれを継ぎます。ただし、ホストはそのスレッドをどの CPU でも動かします。
+  どちらも、root と同じくほかのプロセスのスレッドも見つけ、その ID の生きているスレッドが
+  なければ `ESRCH` です。
 - `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、
   ホストのことは見せません。ゲストは root（ユーザーとグループが 0 で、すべての
   ケーパビリティを持つ）として始まります。Linux と同じく、資格情報はスレッドごとに
@@ -580,27 +586,54 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   種類と 4096 の `f_bsize` を返します。
   `/proc/self/fd` のリンクは procfs のものですが、それを通した `stat`、`statfs`、`open`
   はリンク先のファイルに届きます。
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）と、
-  自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
+- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）、
+  プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
   `AT_SYMLINK_NOFOLLOW` の `fstatat` や `statx` はリンクを返し、`stat` と末尾の `/` は
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
-  名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`comm`、`exe`、`cwd`、`maps`、
-  `fd` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
+  名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
+  `cwd`、`maps`、`fd`、`task` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。ただし、何も
-  測っていないメモリと CPU の項目はありません。`/proc` の下のそれ以外のパスは、ほかの
-  プロセスのディレクトリも含めて、ふつうのパスと同じようにファイルシステムで探します。
+  測っていないメモリと CPU の項目はありません。自分のディレクトリと `/proc` の下の
+  それ以外のパスは、ふつうのパスと同じようにファイルシステムで探します。
   そのため `--mount /:/` では、ホストの `/proc` に届きます。
+- `/proc` は、ファイルシステムがそこに持つプロセス以外のもの（`--mount /:/` では、
+  ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
+  ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
+  が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
+  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`task` があり、
+  Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
+  `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
+  ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
+  `/proc/<pid>/task/<tid>`（読むプロセス自身のスレッドも）には `task` 以外の同じファイルが
+  あり、そのスレッドのもの（名前、シグナルのマスク、`Pid` にスレッドの ID、`Tgid` に
+  プロセスの ID）を示します。`/proc/thread-self` は読んでいるスレッドのディレクトリへの
+  リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
+  そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
+  `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
+  `environ` は実 ID が、`exe` と `cwd` はファイルシステムの ID が、ダンプできるプロセスの
+  ユーザーとグループのすべての ID と同じでなければ `EACCES` です。ダンプできないプロセスの
+  ディレクトリの持ち主は root です。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
+  最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
+  ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
+  シグナルの扱い、メモリ（`cmdline`、`environ`、`stat` の大きさ）、カレントディレクトリ、
+  umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
+  いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、スレッドがシステム
+  コールの中にいる間（待つならそこで待つので）は `S (sleeping)`、それ以外は `R` です。
+  ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
+  持ちません。Linux と同じく、`cmdline` と `environ` は空で、`exe` と `cwd` は `ENOENT` です。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
-  `R`（読んでいるプロセスは動いているので）、親、プロセスグループ、セッション、端末なし、
+  `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、端末なし、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、
   スレッドの数、マッピングの大きさ、`RLIMIT_RSS` の上限、スタックとヒープの始まり、
-  10 進数のシグナルの集合、`exit_signal` の 17、引数と環境変数の文字列の位置です。何も
+  10 進数のシグナルの集合、`wchan`（Linux が root に見せるのと同じく、待っているタスクは
+  1。ただし複数のスレッドを持つプロセス全体のものは 0）、`exit_signal`（読むプロセス自身は
+  17）、引数と環境変数の文字列の位置です。何も
   測っていないもの（ページフォールト、常駐メモリ、開始時刻、コードの範囲、スケジューラーの
-  数値）は 0 です。`cmdline` は、今メモリにある引数の文字列で、それぞれ NUL で終わります。
-  `comm` は名前と改行です。
+  数値）は 0 です。`cmdline` と `environ` は、今メモリにある引数と環境変数の文字列で、
+  それぞれ NUL で終わります。`comm` は名前と改行です。
 - `/proc/self/exe` と `/proc/self/cwd` はシンボリックリンク（0777、サイズ 0）で、それぞれ
   プロセスが動かしているプログラム（`execve` が読み込んだもので、シンボリックリンクは
   たどった後のパス。最初のプログラムは CLI が与えるパスの `/<ファイル名>`）と、カレント

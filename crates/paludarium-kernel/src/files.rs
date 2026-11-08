@@ -1,5 +1,6 @@
 //! Linux x86-64 file ABI and descriptor table. All guest memory is checked.
 use crate::syscalls::{Context, Outcome};
+mod tasks;
 mod xattrs;
 use paludarium_host::{ClockId, FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
@@ -132,7 +133,52 @@ impl Default for Files {
         }
     }
 }
+/// What another process's `/proc/<pid>` shows of a process's files: its
+/// current directory, umask and descriptor table, as long as they last.
+#[derive(Clone, Default)]
+pub(crate) struct FilesView {
+    cwd: std::sync::Weak<Mutex<Vec<u8>>>,
+    umask: std::sync::Weak<AtomicU32>,
+    fds: std::sync::Weak<Mutex<BTreeMap<u32, Descriptor>>>,
+}
+impl FilesView {
+    pub(crate) fn cwd(&self) -> Option<Vec<u8>> {
+        let cwd = self.cwd.upgrade()?;
+        Some(cwd.lock().unwrap_or_else(PoisonError::into_inner).clone())
+    }
+    pub(crate) fn umask(&self) -> u32 {
+        self.umask
+            .upgrade()
+            .map_or(0o022, |umask| umask.load(Ordering::SeqCst))
+    }
+    /// One past the highest open descriptor.
+    pub(crate) fn descriptors(&self) -> usize {
+        self.fds.upgrade().map_or(0, |fds| {
+            fds.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .keys()
+                .next_back()
+                .map_or(0, |&fd| fd as usize + 1)
+        })
+    }
+}
 impl Files {
+    /// This process's files as [`FilesView`] shows them to others.
+    pub(crate) fn view(&self) -> FilesView {
+        FilesView {
+            cwd: Arc::downgrade(&self.cwd),
+            umask: Arc::downgrade(&self.umask),
+            fds: Arc::downgrade(&self.fds),
+        }
+    }
+    /// What [`Self::view`] holds, to tell when it changes.
+    pub(crate) fn identity(&self) -> [usize; 3] {
+        [
+            Arc::as_ptr(&self.cwd).addr(),
+            Arc::as_ptr(&self.umask).addr(),
+            Arc::as_ptr(&self.fds).addr(),
+        ]
+    }
     /// Uses `fs`, keeping its files in step with their page caches.
     pub(crate) fn set_file_system(&mut self, fs: Arc<dyn FileSystem>) {
         self.fs = Arc::new(crate::page_cache::CoherentFs::new(
@@ -2241,6 +2287,16 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let p = crate::devices::through_link(&p).unwrap_or(p);
             let b = if p == b"/proc/self" {
                 c.process.pid.to_string().into_bytes()
+            } else if let Some(path) = crate::proc::task_path(&p, c.process.pid, c.tid) {
+                let task = tasks::find(c, &path)?;
+                tasks::check(c, &task, path.entry)?;
+                match tasks::link(&task, path.entry) {
+                    Some(target) => target?,
+                    None if path.entry == crate::proc::TaskEntry::Missing => {
+                        return Err(Errno::ENOENT);
+                    }
+                    None => return Err(Errno::EINVAL),
+                }
             } else if let Some(entry) = crate::devices::entry(&p) {
                 let crate::devices::Entry::Link(target) = entry else {
                     return Err(Errno::EINVAL);
@@ -2273,7 +2329,10 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if d.file.stat()?.mode & 0o170000 != 0o040000 {
                 return Err(Errno::ENOTDIR);
             }
+            let task = crate::proc::task_path(&d.path, c.process.pid, c.tid);
             let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
+                _ if tasks::is_root(&d.path) => tasks::root_entries(c),
+                _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
                 Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c),
                 Some(crate::proc::OwnEntry::Directory) => own_entries(),
                 _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Directory) => {
@@ -2566,6 +2625,17 @@ impl LinkPath {
                 stat: crate::proc::self_link_stat(),
                 target: LinkTarget::OwnProcess,
             }));
+        }
+        if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
+            let task = tasks::find(c, &path)?;
+            tasks::check(c, &task, path.entry)?;
+            return match tasks::link(&task, path.entry) {
+                Some(target) => Ok(Some(Self {
+                    stat: crate::proc::self_link_stat(),
+                    target: LinkTarget::Fixed(target?),
+                })),
+                None => Ok(None),
+            };
         }
         if generated(p) {
             return Ok(None);
@@ -3138,6 +3208,34 @@ fn open_path(
     } else if let Some(mountinfo) = crate::proc::mount_table(p) {
         let content = crate::proc::render(&c.files.fs.mounts(), mountinfo);
         Arc::new(crate::proc::GeneratedFile::open(content, flags))
+    } else if tasks::is_root(p) {
+        if flags & 3 != 0 {
+            return Err(Errno::EISDIR);
+        }
+        Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
+    } else if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
+        let task = tasks::find(c, &path)?;
+        tasks::check(c, &task, path.entry)?;
+        if let Some(content) = tasks::content(&task, path.entry) {
+            Arc::new(crate::proc::GeneratedFile::open(content, flags))
+        } else if let Some(target) = tasks::link(&task, path.entry) {
+            // `exe`, `cwd` and `thread-self` are links, which O_NOFOLLOW
+            // does not follow; `thread-self`'s is relative to /proc.
+            let mut target = target?;
+            if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 {
+                return Err(Errno(40)); // ELOOP
+            }
+            if path.entry == crate::proc::TaskEntry::ThreadLink {
+                target = [&b"/proc/"[..], &target].concat();
+            }
+            return open_path(c, &target, flags, mode);
+        } else {
+            let (stat, ..) = tasks::stat(c, p, &task, path.entry, false)?;
+            if flags & 3 != 0 {
+                return Err(Errno::EISDIR);
+            }
+            Arc::new(crate::proc::OwnDirectory::new(stat))
+        }
     } else if let Some(entry) = crate::proc::system_entry(p) {
         Arc::new(crate::proc::GeneratedFile::open(
             system_file(c, entry),
@@ -3174,6 +3272,7 @@ fn open_path(
             // Opened above.
             crate::proc::OwnEntry::Stat
             | crate::proc::OwnEntry::Cmdline
+            | crate::proc::OwnEntry::Environ
             | crate::proc::OwnEntry::Comm
             | crate::proc::OwnEntry::Exe
             | crate::proc::OwnEntry::Cwd => return Err(Errno::ENOENT),
@@ -3426,18 +3525,32 @@ fn descriptor_entries(c: &Context<'_>) -> Vec<paludarium_host::DirectoryEntry> {
 /// device and block size (devtmpfs's for `/dev`, devpts's for `/dev/pts`,
 /// procfs's for `/proc`), or `None` for any other path and for a link to a
 /// descriptor that is not open. A link in `/proc/self/fd` is followed to its
-/// file, whose block size it takes, unless `follow` is false. A name in
-/// `/dev/pts` that no slave has is `ENOENT`, as devpts holds no other.
+/// file, whose block size it takes, unless `follow` is false.
 fn generated_stat(
     c: &Context<'_>,
     path: &[u8],
     follow: bool,
 ) -> Result<Option<(FileStat, u64, u32)>, Errno> {
+    // Under another process's directory or `task`: ENOENT for what is not
+    // there, rather than whatever a mounted directory holds at the path.
+    if let Some(task_path) = crate::proc::task_path(path, c.process.pid, c.tid) {
+        let task = tasks::find(c, &task_path)?;
+        return tasks::stat(c, path, &task, task_path.entry, follow).map(Some);
+    }
+    known_stat(c, path, follow)
+}
+/// [`generated_stat`] of the files that are always there. A name in
+/// `/dev/pts` that no slave has is `ENOENT`, as devpts holds no other.
+fn known_stat(
+    c: &Context<'_>,
+    path: &[u8],
+    follow: bool,
+) -> Result<Option<(FileStat, u64, u32)>, Errno> {
     if let Some(target) = crate::devices::through_link(path) {
-        return generated_stat(c, &target, follow);
+        return known_stat(c, &target, follow);
     }
     match crate::devices::entry(path) {
-        Some(crate::devices::Entry::Link(target)) if follow => generated_stat(c, target, follow),
+        Some(crate::devices::Entry::Link(target)) if follow => known_stat(c, target, follow),
         Some(crate::devices::Entry::Slave(number)) => {
             let stat = crate::pty::slave_stat(c, number.ok_or(Errno::ENOENT)?)?;
             Ok(Some((stat, device(c, path), SMALL_BLOCK_SIZE)))
@@ -3480,6 +3593,13 @@ fn other_generated_stat(
         let length = system_file(c, entry).len();
         return Some((crate::proc::stat(length), device(c, path), SMALL_BLOCK_SIZE));
     }
+    if tasks::is_root(path) {
+        return Some((
+            crate::proc::directory_stat(),
+            device(c, path),
+            SMALL_BLOCK_SIZE,
+        ));
+    }
     let entry = crate::proc::own_entry(path, c.process.pid)?;
     if let Some(target) = own_link(c, entry) {
         if follow {
@@ -3500,6 +3620,9 @@ fn other_generated_stat(
         | crate::proc::OwnEntry::Cmdline
         | crate::proc::OwnEntry::Comm => {
             crate::proc::stat(own_file(c, entry).map_or(0, |content| content.len()))
+        }
+        crate::proc::OwnEntry::Environ => {
+            crate::proc::private_stat(own_file(c, entry).map_or(0, |content| content.len()))
         }
         crate::proc::OwnEntry::Exe | crate::proc::OwnEntry::Cwd => return None,
         crate::proc::OwnEntry::Maps => crate::proc::stat(0),
@@ -3554,11 +3677,17 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
     let (arguments, environment) = crate::coredump::string_ranges(c.mem, start_stack);
     Some(match entry {
         crate::proc::OwnEntry::Comm => crate::proc::render_comm(&c.process.name),
-        // The argument strings as they are in memory now, as Linux reads them.
-        crate::proc::OwnEntry::Cmdline => {
-            let length = usize::try_from(arguments.1 - arguments.0).unwrap_or(0);
+        // The argument or environment strings as they are in memory now, as
+        // Linux reads them.
+        crate::proc::OwnEntry::Cmdline | crate::proc::OwnEntry::Environ => {
+            let (start, end) = if entry == crate::proc::OwnEntry::Cmdline {
+                arguments
+            } else {
+                environment
+            };
+            let length = usize::try_from(end - start).unwrap_or(0);
             let mut bytes = vec![0; length];
-            if c.mem.read(GuestAddr(arguments.0), &mut bytes).is_err() {
+            if c.mem.read(GuestAddr(start), &mut bytes).is_err() {
                 bytes.clear();
             }
             bytes
@@ -3576,6 +3705,10 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
             crate::proc::render_stat(&crate::proc::ProcessStat {
                 pid: c.process.pid,
                 name: &c.process.name,
+                // Running, reading this.
+                state: 'R',
+                waiting: false,
+                exit_signal: 17,
                 parent,
                 group,
                 session,
@@ -3674,10 +3807,12 @@ fn status(c: &Context<'_>) -> Vec<u8> {
         .map_or(0, |&fd| fd as usize + 1);
     crate::proc::render_status(&crate::proc::Status {
         name: &c.process.name,
-        umask: c.files.umask(),
+        umask: Some(c.files.umask()),
+        state: "R (running)",
+        tgid: c.process.pid,
         pid: c.process.pid,
         parent,
-        descriptors,
+        descriptors: Some(descriptors),
         threads: c.group.active_threads(),
         queued: c.process.pending.len(),
         queue_limit,

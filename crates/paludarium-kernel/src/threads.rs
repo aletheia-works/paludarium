@@ -25,6 +25,9 @@ pub struct ThreadGroup {
     /// stays after it exits, as its zombie task does, until the process is
     /// reaped.
     nice: Mutex<BTreeMap<u32, i32>>,
+    /// The CPU mask `sched_setaffinity` gave each thread, which Linux keeps
+    /// per thread; one without lets every CPU run it.
+    affinity: Mutex<BTreeMap<u32, Vec<u64>>>,
     /// What signalling each thread looks at, for other processes to read;
     /// a thread without one is root's ([`TaskIds`]).
     task_ids: Mutex<BTreeMap<u32, TaskIds>>,
@@ -56,6 +59,23 @@ pub struct ThreadGroup {
     /// The path of the program the process runs, which `/proc/self/exe`
     /// names (Linux's `exe_file`).
     executable: Mutex<Vec<u8>>,
+    /// What each thread keeps itself that other processes read in `/proc`,
+    /// as of its last checkpoint. The leader's stays while it is a zombie.
+    public: Mutex<BTreeMap<u32, PublicThread>>,
+}
+/// What `/proc/<pid>` shows another process of a thread: its name, signal
+/// state and credentials, and its process's memory and files, which it
+/// does not keep alive.
+#[derive(Clone, Default)]
+pub(crate) struct PublicThread {
+    pub name: [u8; 16],
+    pub blocked: u64,
+    /// The signals pending for it, and how many are queued.
+    pub pending: u64,
+    pub queued: usize,
+    pub credentials: crate::credentials::Credentials,
+    pub memory: Option<paludarium_mmu::MemoryView>,
+    pub files: crate::files::FilesView,
 }
 impl Default for ThreadGroup {
     fn default() -> Self {
@@ -65,6 +85,7 @@ impl Default for ThreadGroup {
             stopped: std::sync::atomic::AtomicBool::new(false),
             members: Mutex::new(BTreeMap::new()),
             nice: Mutex::default(),
+            affinity: Mutex::default(),
             task_ids: Mutex::default(),
             status: Mutex::new(None),
             actions: Mutex::default(),
@@ -81,6 +102,7 @@ impl Default for ThreadGroup {
             start_stack: AtomicU64::new(0),
             robust_lists: Mutex::default(),
             executable: Mutex::default(),
+            public: Mutex::default(),
         }
     }
 }
@@ -152,6 +174,22 @@ impl ThreadGroup {
         // values, so only the PID's value is kept.
         nice.retain(|&tid, _| tid == pid);
         drop(nice);
+        // So is the record of the thread that ran it, until it publishes
+        // what the new program shows.
+        let mut public = self.public.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(record) = public.remove(&old_tid) {
+            public.insert(pid, record);
+        }
+        public.retain(|&tid, _| tid == pid);
+        drop(public);
+        // So does its CPU mask.
+        let mut affinity = self.affinity.lock().unwrap_or_else(PoisonError::into_inner);
+        let kept = affinity.remove(&old_tid);
+        affinity.clear();
+        if let Some(mask) = kept {
+            affinity.insert(pid, mask);
+        }
+        drop(affinity);
         self.retired
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -392,6 +430,20 @@ impl ThreadGroup {
             .get(&tid)
             .copied()
     }
+    /// The CPU mask of thread `tid`, if `sched_setaffinity` gave it one.
+    pub(crate) fn affinity(&self, tid: u32) -> Option<Vec<u64>> {
+        self.affinity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .cloned()
+    }
+    pub(crate) fn set_affinity(&self, tid: u32, mask: Vec<u64>) {
+        self.affinity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, mask);
+    }
     pub(crate) fn set_nice(&self, tid: u32, value: i32) {
         self.nice
             .lock()
@@ -456,6 +508,40 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
+    }
+    /// Publishes what thread `tid` shows in `/proc`.
+    pub(crate) fn publish(&self, tid: u32, thread: PublicThread) {
+        self.public
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, thread);
+    }
+    /// What thread `tid` last published, if it is here.
+    pub(crate) fn public(&self, tid: u32) -> Option<PublicThread> {
+        self.public
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .cloned()
+    }
+    /// Thread `tid` is gone, unless it led process `pid`, whose zombie
+    /// keeps what it showed.
+    fn forget_public(&self, pid: u32, tid: u32) {
+        if tid != pid {
+            self.public
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&tid);
+        }
+    }
+    /// The live threads, in order, and whether each is in a system call.
+    pub(crate) fn threads(&self) -> Vec<(u32, bool)> {
+        self.members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(&tid, inbox)| (tid, inbox.in_call()))
+            .collect()
     }
     pub(crate) fn has_member(&self, tid: u32) -> bool {
         self.members
@@ -677,6 +763,7 @@ impl Kernel {
             .remove(&tid);
         self.group.forget_nice(tid);
         self.group.forget_task_ids(self.process.pid, tid);
+        self.group.forget_public(self.process.pid, tid);
     }
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
         self.files.release_descriptors();
@@ -743,6 +830,7 @@ impl Kernel {
             self.group.forget_nice(thread.tid);
         }
         self.group.forget_task_ids(self.process.pid, thread.tid);
+        self.group.forget_public(self.process.pid, thread.tid);
     }
     fn clear_child_tid(group: &ThreadGroup, mem: &AddressSpace, addr: u64) {
         if addr != 0 && mem.write(GuestAddr(addr), &0u32.to_le_bytes()).is_ok() {
@@ -926,7 +1014,7 @@ impl Kernel {
         state.exit_status = None;
         state.clear_child_tid = if flags & 0x200000 != 0 { a[3] } else { 0 };
         let inbox = Arc::new(SignalInbox::default());
-        let child = Kernel {
+        let mut child = Kernel {
             host: self.host.clone(),
             process: self.process.clone(),
             table: crate::SyscallTable::u1(),
@@ -942,11 +1030,16 @@ impl Kernel {
             vfork_wait: None,
             unimplemented: self.unimplemented.clone(),
             task: Some(task),
+            published: None,
         };
         // A new thread starts with its creator's nice value, set before it
         // is registered so that no one sees it without one.
         if let Some(value) = self.group.nice(parent.tid) {
             self.group.set_nice(tid, value);
+        }
+        // And its CPU mask, as Linux's `dup_task_struct` copies it.
+        if let Some(mask) = self.group.affinity(parent.tid) {
+            self.group.set_affinity(tid, mask);
         }
         self.group.register(tid, inbox);
         // Linux ignores unsuccessful parent/child TID stores (native case 23).
@@ -956,6 +1049,7 @@ impl Kernel {
         if flags & 0x1000000 != 0 {
             let _ = mem.write(GuestAddr(a[3]), &tid.to_le_bytes());
         }
+        child.publish(tid, &state, mem);
         self.pending_child = Some((Box::new(child), Thread { tid, cpu, state }));
         Ok(u64::from(tid))
     }

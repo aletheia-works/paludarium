@@ -163,6 +163,7 @@ NAMES = {
     200: "tkill",
     201: "time",
     202: "futex",
+    203: "sched_setaffinity",
     204: "sched_getaffinity",
     213: "epoll_create",
     217: "getdents64",

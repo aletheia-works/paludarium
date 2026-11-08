@@ -6,8 +6,15 @@
 FROM debian:trixie
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    bc binutils bsdutils bzip2 ca-certificates cmake coreutils curl dc diffutils file findutils \
-    g++ gawk gcc gdb git gnupg jq less libc6-dev lua5.4 make mawk nodejs openssh-client openssl \
-    patch perl php-cli procps python3 rsync ruby sqlite3 tar tcl tzdata unzip util-linux \
-    vim-tiny xxd xz-utils zip zstd \
+    bc binutils brotli bsdextrautils bsdutils busybox bzip2 ca-certificates cmake coreutils curl dc diffutils \
+    ed emacs-nox file findutils g++ gawk gcc gdb git gnupg golang-go jq less libc6-dev \
+    libjson-pp-perl lua5.4 lz4 lzip make mawk mksh ninja-build nodejs openssh-client openssl \
+    parallel patch perl php-cli pigz procps python3 redis-server redis-tools rsync ruby sqlite3 \
+    tar tcl tzdata unzip util-linux vim-tiny xxd xz-utils zip zsh zstd \
  && rm -rf /var/lib/apt/lists/*
+# Go programs are built here, natively: compiling Go's standard library under
+# the emulator takes far longer than a case may (8 s natively, over 15 minutes
+# emulated), and the cases check the Go runtime, not the compiler.
+COPY scripts/goroutines.go /opt/go/goroutines.go
+RUN cd /opt/go && GOCACHE=/tmp/go-cache CGO_ENABLED=0 go build -o /usr/local/bin/goroutines goroutines.go \
+ && rm -rf /tmp/go-cache

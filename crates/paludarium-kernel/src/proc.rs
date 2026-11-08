@@ -142,6 +142,9 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
     if !path.starts_with(b"/proc/") {
         return None;
     }
+    // `/proc/thread-self` is the link itself; with a slash or more after
+    // it, the directory it leads to.
+    let link_itself = path.ends_with(b"/thread-self");
     let path = paludarium_vfs::normalize_path(path).ok()?;
     let rest = path.strip_prefix(b"/proc/")?;
     let mut parts = rest.split(|&b| b == b'/');
@@ -165,7 +168,8 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
     };
     let thread = |name: &[u8]| descriptor_number(name).filter(|&tid| tid != 0);
     let (tid, entry) = match parts[..] {
-        [] if thread_self => (Some(own_tid), TaskEntry::ThreadLink),
+        [] if thread_self && link_itself => (Some(own_tid), TaskEntry::ThreadLink),
+        [] if thread_self => (Some(own_tid), TaskEntry::Directory),
         [name] if thread_self => (Some(own_tid), file(name)),
         _ if thread_self => (Some(own_tid), TaskEntry::Missing),
         [b"task"] => (None, TaskEntry::Threads),
@@ -1073,6 +1077,14 @@ mod tests {
         assert_eq!(
             path(b"/proc/thread-self"),
             at(7, Some(9), TaskEntry::ThreadLink)
+        );
+        assert_eq!(
+            path(b"/proc/thread-self/"),
+            at(7, Some(9), TaskEntry::Directory)
+        );
+        assert_eq!(
+            path(b"/proc/thread-self/."),
+            at(7, Some(9), TaskEntry::Directory)
         );
         assert_eq!(
             path(b"/proc/thread-self/stat"),

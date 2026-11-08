@@ -3629,6 +3629,9 @@ static int proc_other_files_cases(const char *self) {
     proc_read("/proc/thread-self/comm", buffer, sizeof buffer);
     printf("thread-self link=%d is-link=%d listed=%d comm=%s", !strcmp(target, expected_link), found,
            proc_lists("/proc", "thread-self"), buffer);
+    /* A trailing slash or dot follows the link to the directory. */
+    int slash = lstat("/proc/thread-self/", &self_link) == 0 && S_ISDIR(self_link.st_mode);
+    printf("thread-self slash-is-directory=%d dot-lists-comm=%d\n", slash, proc_lists("/proc/thread-self/.", "comm"));
     close(proc_worker_hold[1]);
     pthread_join(worker, NULL);
     /* Linux wakes the join before the thread is quite gone. */

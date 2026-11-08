@@ -131,17 +131,23 @@ impl Task {
     }
     /// Whether the reader may see the task's memory and links, as Linux's
     /// `ptrace_may_access` in read mode decides: its own process, a reader
-    /// with `CAP_SYS_PTRACE`, or one whose filesystem IDs are every user and
-    /// group ID of a dumpable task.
-    fn may_access(&self, c: &Context<'_>) -> bool {
+    /// with `CAP_SYS_PTRACE`, or one whose IDs are every user and group ID of
+    /// a dumpable task: its filesystem IDs, or with `real` (`environ`'s
+    /// `PTRACE_MODE_REALCREDS`) its real ones.
+    fn may_access(&self, c: &Context<'_>, real: bool) -> bool {
         const CAP_SYS_PTRACE: u64 = 1 << 19;
         let reader = &c.process.credentials;
         let target = &self.public.credentials;
+        let (uid, gid) = if real {
+            (reader.uid, reader.gid)
+        } else {
+            (reader.fsuid, reader.fsgid)
+        };
         self.pid == c.process.pid
             || reader.effective & CAP_SYS_PTRACE != 0
             || self.view.dumpable
-                && [target.uid, target.euid, target.suid] == [reader.fsuid; 3]
-                && [target.gid, target.egid, target.sgid] == [reader.fsgid; 3]
+                && [target.uid, target.euid, target.suid] == [uid; 3]
+                && [target.gid, target.egid, target.sgid] == [gid; 3]
     }
 }
 
@@ -150,9 +156,8 @@ impl Task {
 /// do.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
-        TaskEntry::Environ | TaskEntry::Exe | TaskEntry::Cwd if !task.may_access(c) => {
-            Err(Errno::EACCES)
-        }
+        TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
+        TaskEntry::Exe | TaskEntry::Cwd if !task.may_access(c, false) => Err(Errno::EACCES),
         _ => Ok(()),
     }
 }

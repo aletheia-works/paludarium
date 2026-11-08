@@ -223,13 +223,16 @@ static int case_epoll(void) {
     return 0;
 }
 
-static volatile int edge_thread_done;
+/* Waits, its signals blocked, until a byte comes: a wait without a
+   timeout, which the harness's virtual clock does not run through. */
+static int edge_thread_pipe[2];
 static void *edge_thread(void *unused) {
     (void)unused;
     sigset_t all;
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, NULL);
-    while (!edge_thread_done) usleep(10000);
+    char byte;
+    read(edge_thread_pipe[0], &byte, 1);
     return NULL;
 }
 
@@ -278,12 +281,13 @@ static int case_edges(void) {
     /* Another thread's signal wakes the file too, and the waiter sees its
        own pending signals again. */
     pthread_t other;
+    pipe(edge_thread_pipe);
     pthread_create(&other, NULL, edge_thread, NULL);
     usleep(50000);
     pthread_kill(other, SIGUSR2);
     say("other thread's signal %d", epoll_wait(edge, out, 2, 1000));
     say("other thread quiet %d", epoll_wait(edge, out, 2, 200));
-    edge_thread_done = 1;
+    write(edge_thread_pipe[1], "x", 1);
     pthread_join(other, NULL);
     struct signalfd_siginfo info[8];
     say("read %ld", TRY(read(fd, info, sizeof info)) / (long)sizeof *info);

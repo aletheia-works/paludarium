@@ -120,6 +120,8 @@ pub(crate) enum TaskEntry {
     Comm,
     Exe,
     Cwd,
+    /// `/proc/thread-self`, a link to the reading thread's directory.
+    ThreadLink,
     /// A name paludarium does not have there.
     Missing,
 }
@@ -132,10 +134,11 @@ pub(crate) struct TaskPath {
     pub entry: TaskEntry,
 }
 /// The path under `/proc/<pid>` of a process other than `own`, the reader,
-/// or under `task` of any process; `None` for the rest of the reader's own
-/// directory, which [`own_entry`] finds.
-/// The path is taken as it reads, `.` and `..` included.
-pub(crate) fn task_path(path: &[u8], own: u32) -> Option<TaskPath> {
+/// under `task` of any process, or under `/proc/thread-self`, the reading
+/// thread `own_tid`'s; `None` for the rest of the reader's own directory,
+/// which [`own_entry`] finds. The path is taken as it reads, `.` and `..`
+/// included.
+pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath> {
     if !path.starts_with(b"/proc/") {
         return None;
     }
@@ -143,7 +146,8 @@ pub(crate) fn task_path(path: &[u8], own: u32) -> Option<TaskPath> {
     let rest = path.strip_prefix(b"/proc/")?;
     let mut parts = rest.split(|&b| b == b'/');
     let head = parts.next()?;
-    let pid = if head == b"self" {
+    let thread_self = head == b"thread-self";
+    let pid = if head == b"self" || thread_self {
         own
     } else {
         descriptor_number(head).filter(|&pid| pid != 0)?
@@ -161,6 +165,9 @@ pub(crate) fn task_path(path: &[u8], own: u32) -> Option<TaskPath> {
     };
     let thread = |name: &[u8]| descriptor_number(name).filter(|&tid| tid != 0);
     let (tid, entry) = match parts[..] {
+        [] if thread_self => (Some(own_tid), TaskEntry::ThreadLink),
+        [name] if thread_self => (Some(own_tid), file(name)),
+        _ if thread_self => (Some(own_tid), TaskEntry::Missing),
         [b"task"] => (None, TaskEntry::Threads),
         [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
         [b"task", tid, name] => (Some(thread(tid)?), file(name)),
@@ -1054,7 +1061,7 @@ mod tests {
     }
     #[test]
     fn task_paths_are_other_processes_and_threads() {
-        let path = |p: &[u8]| task_path(p, 7);
+        let path = |p: &[u8]| task_path(p, 7, 9);
         let at = |pid, tid, entry| Some(TaskPath { pid, tid, entry });
         assert_eq!(path(b"/proc/8"), at(8, None, TaskEntry::Directory));
         assert_eq!(path(b"/proc/8/"), at(8, None, TaskEntry::Directory));
@@ -1063,6 +1070,14 @@ mod tests {
         assert_eq!(path(b"/proc/8/stat"), at(8, None, TaskEntry::Stat));
         assert_eq!(path(b"/proc/8/exe"), at(8, None, TaskEntry::Exe));
         assert_eq!(path(b"/proc/8/environ"), at(8, None, TaskEntry::Environ));
+        assert_eq!(
+            path(b"/proc/thread-self"),
+            at(7, Some(9), TaskEntry::ThreadLink)
+        );
+        assert_eq!(
+            path(b"/proc/thread-self/stat"),
+            at(7, Some(9), TaskEntry::Stat)
+        );
         assert_eq!(path(b"/proc/8/maps"), at(8, None, TaskEntry::Missing));
         assert_eq!(path(b"/proc/8/fd/1"), at(8, None, TaskEntry::Missing));
         assert_eq!(path(b"/proc/8/task"), at(8, None, TaskEntry::Threads));

@@ -3613,6 +3613,22 @@ static int proc_other_files_cases(const char *self) {
     seen = 0;
     for (int i = 0; i < 8; i++) seen |= (proc_lists(path, names[i]) == 1) << i;
     printf("task worker lists=%x\n", seen);
+    /* A thread's own ID names a directory too, which /proc does not list. */
+    snprintf(path, sizeof path, "/proc/%d/status", tid);
+    proc_read(path, buffer, sizeof buffer);
+    printf("thread directory name=%s tgid=%d pid=%d listed=%d\n", proc_status_field(buffer, "Name"),
+           !strcmp(proc_status_field(buffer, "Tgid"), own_text), !strcmp(proc_status_field(buffer, "Pid"), tid_text),
+           proc_lists("/proc", tid_text));
+    /* thread-self is a link to the reading thread's directory under task. */
+    char expected_link[64];
+    snprintf(expected_link, sizeof expected_link, "%d/task/%d", (int)getpid(), (int)getpid());
+    length = readlink("/proc/thread-self", target, sizeof target - 1);
+    target[length > 0 ? length : 0] = 0;
+    struct stat self_link;
+    found = lstat("/proc/thread-self", &self_link) == 0 && S_ISLNK(self_link.st_mode);
+    proc_read("/proc/thread-self/comm", buffer, sizeof buffer);
+    printf("thread-self link=%d is-link=%d listed=%d comm=%s", !strcmp(target, expected_link), found,
+           proc_lists("/proc", "thread-self"), buffer);
     close(proc_worker_hold[1]);
     pthread_join(worker, NULL);
     /* Linux wakes the join before the thread is quite gone. */

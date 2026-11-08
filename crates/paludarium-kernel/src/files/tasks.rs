@@ -28,19 +28,27 @@ pub(super) struct Task {
 }
 
 /// The thread of `path`: ENOENT for a process that is not there (reaped,
-/// or never was) and for a thread not in it.
+/// or never was) and for a thread not in it. A thread's ID other than its
+/// process's names a directory too, which /proc does not list, as on Linux:
+/// that of the process, as the thread sees it.
 pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
-    let view = c.processes.view(path.pid).ok_or(Errno::ENOENT)?;
+    let (view, pid) = match c.processes.view(path.pid) {
+        Some(view) => (view, path.pid),
+        None => {
+            let pid = c.processes.thread_leader(path.pid).ok_or(Errno::ENOENT)?;
+            (c.processes.view(pid).ok_or(Errno::ENOENT)?, pid)
+        }
+    };
     let threads = view.group.threads();
     let tid = path.tid.unwrap_or(path.pid);
     let member = threads.iter().find(|&&(t, _)| t == tid).copied();
-    if path.tid.is_some() && member.is_none() && !(view.zombie && tid == path.pid) {
+    if path.tid.is_some() && member.is_none() && !(view.zombie && tid == pid) {
         return Err(Errno::ENOENT);
     }
     let public = view
         .group
         .public(tid)
-        .or_else(|| view.group.public(path.pid))
+        .or_else(|| view.group.public(pid))
         .unwrap_or_default();
     // A thread is shown asleep while it is in a system call, where it waits
     // if it waits, and running otherwise; the reader is running, reading.
@@ -53,7 +61,7 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
         Some(_) => ('R', "R (running)"),
     };
     Ok(Task {
-        pid: path.pid,
+        pid,
         tid,
         thread: path.tid.is_some(),
         view,
@@ -110,13 +118,42 @@ impl Task {
         )
     }
     /// Its files' owner: the task's effective IDs, as Linux's
-    /// `task_dump_owner` gives a dumpable task's.
+    /// `task_dump_owner` gives a dumpable task's, and root an undumpable
+    /// one's.
     fn owned(&self, stat: FileStat) -> FileStat {
-        FileStat {
-            uid: self.public.credentials.euid,
-            gid: self.public.credentials.egid,
-            ..stat
+        let ids = &self.public.credentials;
+        let (uid, gid) = if self.view.dumpable {
+            (ids.euid, ids.egid)
+        } else {
+            (0, 0)
+        };
+        FileStat { uid, gid, ..stat }
+    }
+    /// Whether the reader may see the task's memory and links, as Linux's
+    /// `ptrace_may_access` in read mode decides: its own process, a reader
+    /// with `CAP_SYS_PTRACE`, or one whose filesystem IDs are every user and
+    /// group ID of a dumpable task.
+    fn may_access(&self, c: &Context<'_>) -> bool {
+        const CAP_SYS_PTRACE: u64 = 1 << 19;
+        let reader = &c.process.credentials;
+        let target = &self.public.credentials;
+        self.pid == c.process.pid
+            || reader.effective & CAP_SYS_PTRACE != 0
+            || self.view.dumpable
+                && [target.uid, target.euid, target.suid] == [reader.fsuid; 3]
+                && [target.gid, target.egid, target.sgid] == [reader.fsgid; 3]
+    }
+}
+
+/// Refuses what the reader may not see of the task: `environ`, `exe` and
+/// `cwd` (`EACCES`), as Linux's `proc_mem_open` and `proc_fd_access_allowed`
+/// do.
+pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
+    match entry {
+        TaskEntry::Environ | TaskEntry::Exe | TaskEntry::Cwd if !task.may_access(c) => {
+            Err(Errno::EACCES)
         }
+        _ => Ok(()),
     }
 }
 
@@ -200,9 +237,12 @@ pub(super) fn content(task: &Task, entry: TaskEntry) -> Option<Vec<u8>> {
 }
 
 /// Where `exe` or `cwd` leads: the program and the current directory, or
-/// ENOENT once the process has ended. `None` for any other entry.
+/// ENOENT once the process has ended; and `thread-self`, the thread's
+/// directory, relative to /proc as Linux's link reads. `None` for any other
+/// entry.
 pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errno>> {
     let target = match entry {
+        TaskEntry::ThreadLink => Some(format!("{}/task/{}", task.pid, task.tid).into_bytes()),
         TaskEntry::Exe => task.live().then(|| task.view.group.executable()),
         TaskEntry::Cwd => task.live().then(|| task.public.files.cwd()).flatten(),
         _ => return None,
@@ -218,22 +258,25 @@ pub(super) fn stat(
     task: &Task,
     entry: TaskEntry,
     follow: bool,
-) -> Option<(FileStat, u64, u32)> {
+) -> Result<(FileStat, u64, u32), Errno> {
     let stat = match entry {
         TaskEntry::Directory | TaskEntry::Threads => crate::proc::directory_stat(),
+        TaskEntry::ThreadLink if follow => crate::proc::directory_stat(),
+        TaskEntry::ThreadLink => crate::proc::self_link_stat(),
         TaskEntry::Exe | TaskEntry::Cwd if follow => {
-            let target = link(task, entry)?.ok()?;
-            let stat = c.files.fs.metadata(&target, true).ok()?;
-            return Some((stat, device(c, &target), BLOCK_SIZE));
+            check(c, task, entry)?;
+            let target = link(task, entry).ok_or(Errno::ENOENT)??;
+            let stat = c.files.fs.metadata(&target, true)?;
+            return Ok((stat, device(c, &target), BLOCK_SIZE));
         }
         TaskEntry::Exe | TaskEntry::Cwd => crate::proc::self_link_stat(),
-        TaskEntry::Missing => return None,
+        TaskEntry::Missing => return Err(Errno::ENOENT),
         TaskEntry::Environ => {
             crate::proc::private_stat(content(task, entry).map_or(0, |content| content.len()))
         }
         _ => crate::proc::stat(content(task, entry).map_or(0, |content| content.len())),
     };
-    Some((task.owned(stat), device(c, path), SMALL_BLOCK_SIZE))
+    Ok((task.owned(stat), device(c, path), SMALL_BLOCK_SIZE))
 }
 
 /// Numbered entries after `.` and `..`, as `getdents` returns them.
@@ -281,8 +324,9 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
 }
 
 /// The names /proc generates at its top, with their types.
-const ROOT_NAMES: [(&[u8], u8); 5] = [
+const ROOT_NAMES: [(&[u8], u8); 6] = [
     (b"self", DT_LNK),
+    (b"thread-self", DT_LNK),
     (b"mounts", DT_LNK),
     (b"loadavg", DT_REG),
     (b"meminfo", DT_REG),

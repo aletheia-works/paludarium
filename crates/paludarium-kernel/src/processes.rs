@@ -118,6 +118,7 @@ pub(crate) struct ProcessView {
     pub rss_limit: u64,
     pub queue_limit: u64,
     pub no_new_privs: bool,
+    pub dumpable: bool,
     /// It has ended and waits to be reaped.
     pub zombie: bool,
     pub exit_signal: i32,
@@ -519,6 +520,14 @@ impl Processes {
             (entry.parent, entry.limits[11].0, entry.no_new_privs)
         })
     }
+    /// The live process that thread `tid` is in.
+    pub(crate) fn thread_leader(&self, tid: u32) -> Option<u32> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .iter()
+            .find(|(_, entry)| entry.status.is_none() && entry.group.has_member(tid))
+            .map(|(&pid, _)| pid)
+    }
     /// The processes there are, zombies too, in order, as `/proc` lists them.
     pub(crate) fn pids(&self) -> Vec<u32> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
@@ -537,6 +546,7 @@ impl Processes {
             rss_limit: entry.limits[5].0,
             queue_limit: entry.limits[11].0,
             no_new_privs: entry.no_new_privs,
+            dumpable: entry.dumpable,
             zombie: entry.status.is_some(),
             exit_signal: entry.exit_signal,
             group: Arc::clone(&entry.group),

@@ -2258,8 +2258,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let p = crate::devices::through_link(&p).unwrap_or(p);
             let b = if p == b"/proc/self" {
                 c.process.pid.to_string().into_bytes()
-            } else if let Some(path) = crate::proc::task_path(&p, c.process.pid) {
+            } else if let Some(path) = crate::proc::task_path(&p, c.process.pid, c.tid) {
                 let task = tasks::find(c, &path)?;
+                tasks::check(c, &task, path.entry)?;
                 match tasks::link(&task, path.entry) {
                     Some(target) => target?,
                     None if path.entry == crate::proc::TaskEntry::Missing => {
@@ -2299,7 +2300,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if d.file.stat()?.mode & 0o170000 != 0o040000 {
                 return Err(Errno::ENOTDIR);
             }
-            let task = crate::proc::task_path(&d.path, c.process.pid);
+            let task = crate::proc::task_path(&d.path, c.process.pid, c.tid);
             let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
                 _ if tasks::is_root(&d.path) => tasks::root_entries(c),
                 _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
@@ -2588,8 +2589,9 @@ impl LinkPath {
                 target: LinkTarget::OwnProcess,
             }));
         }
-        if let Some(path) = crate::proc::task_path(p, c.process.pid) {
+        if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
             let task = tasks::find(c, &path)?;
+            tasks::check(c, &task, path.entry)?;
             return match tasks::link(&task, path.entry) {
                 Some(target) => Ok(Some(Self {
                     stat: crate::proc::self_link_stat(),
@@ -3155,19 +3157,24 @@ fn open_path(
             return Err(Errno::EISDIR);
         }
         Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
-    } else if let Some(path) = crate::proc::task_path(p, c.process.pid) {
+    } else if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
         let task = tasks::find(c, &path)?;
+        tasks::check(c, &task, path.entry)?;
         if let Some(content) = tasks::content(&task, path.entry) {
             Arc::new(crate::proc::GeneratedFile::open(content, flags))
         } else if let Some(target) = tasks::link(&task, path.entry) {
-            // `exe` and `cwd` are links, which O_NOFOLLOW does not follow.
-            let target = target?;
+            // `exe`, `cwd` and `thread-self` are links, which O_NOFOLLOW
+            // does not follow; `thread-self`'s is relative to /proc.
+            let mut target = target?;
             if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 {
                 return Err(Errno(40)); // ELOOP
             }
+            if path.entry == crate::proc::TaskEntry::ThreadLink {
+                target = [&b"/proc/"[..], &target].concat();
+            }
             return open_path(c, &target, flags, mode);
         } else {
-            let (stat, ..) = tasks::stat(c, p, &task, path.entry, false).ok_or(Errno::ENOENT)?;
+            let (stat, ..) = tasks::stat(c, p, &task, path.entry, false)?;
             if flags & 3 != 0 {
                 return Err(Errno::EISDIR);
             }
@@ -3470,11 +3477,9 @@ fn generated_stat(
 ) -> Result<Option<(FileStat, u64, u32)>, Errno> {
     // Under another process's directory or `task`: ENOENT for what is not
     // there, rather than whatever a mounted directory holds at the path.
-    if let Some(task_path) = crate::proc::task_path(path, c.process.pid) {
+    if let Some(task_path) = crate::proc::task_path(path, c.process.pid, c.tid) {
         let task = tasks::find(c, &task_path)?;
-        return tasks::stat(c, path, &task, task_path.entry, follow)
-            .map(Some)
-            .ok_or(Errno::ENOENT);
+        return tasks::stat(c, path, &task, task_path.entry, follow).map(Some);
     }
     Ok(known_stat(c, path, follow))
 }

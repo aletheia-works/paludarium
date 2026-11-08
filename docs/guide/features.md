@@ -658,7 +658,14 @@ kernel.
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
   the process, and `/proc/<pid>/task/<tid>` (the reader's own threads too)
   has the same files but `task`, of that thread: its name, its signal masks,
-  and its ID as `Pid` with the process's as `Tgid`. What a process shows of
+  and its ID as `Pid` with the process's as `Tgid`. `/proc/thread-self` is a
+  link (0777) to the reading thread's, which reads as `<pid>/task/<tid>`. A
+  thread's own ID names a directory of its process as that thread sees it,
+  which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
+  decides, a reader that is not of the process, has no `CAP_SYS_PTRACE` and
+  whose filesystem IDs are not every user and group ID of a dumpable process
+  gets `EACCES` for `environ`, `exe` and `cwd`; an undumpable process's
+  directory is root's. What a process shows of
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for

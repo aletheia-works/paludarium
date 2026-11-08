@@ -674,6 +674,8 @@ mod tests {
         // A `..` in the program's directory is resolved, as exec resolves it.
         // The directories are real ones, since resolving them reads them.
         let tree = std::env::temp_dir().join(format!("paludarium-dotdot-{}", std::process::id()));
+        // A run that failed before its cleanup may have left one.
+        let _ = std::fs::remove_dir_all(&tree);
         std::fs::create_dir_all(tree.join("lib")).unwrap();
         std::fs::create_dir_all(tree.join("bin")).unwrap();
         let up = tree.join("lib").join("..").join("bin").join("java");

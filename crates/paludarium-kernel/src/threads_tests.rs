@@ -110,6 +110,58 @@ fn preentry_timer_metadata_keeps_sleep_deadline_but_real_interrupt_wins() {
         );
     }
 }
+/// A signal sent to the process after its last checkpoint and before it
+/// sleeps ends the sleep at once: the sleep takes it in while it expires the
+/// timers, which clears the wake the host wait watches, so it must not wait
+/// first. GNU parallel kills its `sleep 10101` placeholders in this window.
+#[test]
+fn a_signal_sent_before_a_sleep_ends_it_without_waiting() {
+    use paludarium_host::{ClockId, Host};
+    for (number, handled) in [(9, false), (15, false), (10, true)] {
+        let host = Arc::new(paludarium_host::testing::RecordingHost::new());
+        let inbox = Arc::new(SignalInbox::default());
+        let mut k = Kernel::new(host.clone()).with_signal_inbox(inbox.clone());
+        k.group.register(1, inbox.clone());
+        let mut t = thread();
+        if handled {
+            let action = SignalAction {
+                handler: 0x401000,
+                ..SignalAction::default()
+            };
+            t.state.signal_actions.insert(number, action);
+            k.group.set_action(number, action);
+        }
+        k.group
+            .send_process_signal(signals::PendingSignal::user(number, 0))
+            .unwrap();
+        let m = memory();
+        m.write(GuestAddr(DATA), &10_101u64.to_le_bytes()).unwrap();
+        t.cpu.gpr[reg::RAX] = syscalls::nr::CLOCK_NANOSLEEP;
+        t.cpu.gpr[reg::RDX] = DATA;
+        t.cpu.gpr[reg::RSP] = DATA + 4096;
+        let next = k.handle(
+            &mut t,
+            &m,
+            ExitReason::Syscall {
+                rip: GuestAddr(0x400000),
+            },
+        );
+        assert_eq!(
+            host.clock(ClockId::Monotonic).unwrap(),
+            0,
+            "signal {number}"
+        );
+        if handled {
+            assert!(matches!(next, Next::Resume), "signal {number}");
+            assert_eq!(t.cpu.rip, GuestAddr(0x401000), "signal {number}");
+        } else {
+            assert!(
+                matches!(next, Next::Exit(ExitStatus::Signaled(n)) if n == number),
+                "signal {number}"
+            );
+        }
+    }
+}
 fn memory() -> AddressSpace {
     let mem = AddressSpace::new();
     mem.map_shared(

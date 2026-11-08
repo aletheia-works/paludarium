@@ -9097,6 +9097,48 @@ int main(int argc, char **argv) {
         if (waitpid(leader, &status, 0) != leader) return 96;
         return WIFEXITED(status) ? WEXITSTATUS(status) : 97;
     }
+    if (!strcmp(mode, "kill-before-sleep")) {
+        /* A SIGKILL that comes while a child runs on to a long sleep ends
+           the child: it does not sleep first. GNU parallel kills its
+           `sleep 10101` placeholders so, as they start. The child says it
+           runs, waits for the parent's go and spins a while after it, swept
+           four times from none to about a checkpoint budget of
+           instructions, so that some kills land just before its nanosleep
+           however fast the kill comes; a kill missed until the sleep ends
+           shows as a wait of more than 1000 s on the monotonic clock. */
+        volatile int *shared = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        if (shared == MAP_FAILED) return 80;
+        volatile int *ready = shared, *go = shared + 1;
+        int killed = 0, late = 0;
+        for (int i = 0; i < 400; i++) {
+            *ready = 0;
+            *go = 0;
+            fflush(stdout);
+            pid_t pid = child();
+            if (pid < 0) return 79;
+            if (pid == 0) {
+                *ready = 1;
+                while (!*go) {}
+                for (volatile int spin = 0; spin < (i % 100) * 500; spin++) {}
+                struct timespec forever = {10101, 0};
+                syscall(SYS_nanosleep, &forever, NULL);
+                _exit(0);
+            }
+            while (!*ready) {}
+            struct timespec before, after;
+            clock_gettime(CLOCK_MONOTONIC, &before);
+            *go = 1;
+            kill(pid, SIGKILL);
+            int status = 0;
+            if (waitpid(pid, &status, 0) != pid) return 78;
+            clock_gettime(CLOCK_MONOTONIC, &after);
+            killed += WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+            late += after.tv_sec - before.tv_sec > 1000;
+        }
+        result("killed", killed);
+        result("late", late);
+        return 0;
+    }
     if (!strcmp(mode, "signal-sender")) {
         /* A signal from kill or pidfd_send_signal names its sender in
            si_pid, and the parent-death signal names the parent that exited;

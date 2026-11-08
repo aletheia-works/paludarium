@@ -94,6 +94,7 @@
     {"name":"orphaned-group","binary":"process"},
     {"name":"kill-group","binary":"process"},
     {"name":"signal-sender","binary":"process"},
+    {"name":"kill-before-sleep","binary":"process"},
     {"name":"core-dump","binary":"process"},
     {"name":"core-mappings","binary":"process"},
     {"name":"sigqueue","binary":"process"},

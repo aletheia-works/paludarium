@@ -323,6 +323,7 @@ mod linux {
         processes_orphaned_group => ("orphaned-group","process"),
         processes_kill_group => ("kill-group","process"),
         processes_signal_sender => ("signal-sender","process"),
+        processes_kill_before_sleep => ("kill-before-sleep","process"),
         processes_core_dump => ("core-dump","process"),
         processes_core_mappings => ("core-mappings","process"),
         processes_sigqueue => ("sigqueue","process"),

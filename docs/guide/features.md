@@ -556,6 +556,8 @@ kernel.
   start belong to root, and a file, directory, symbolic link or memfd a
   thread makes belongs to its filesystem user and group IDs, until `chown`
   gives it another owner or group, which the in-memory filesystem keeps.
+  A mounted host directory starts with every file root's and keeps the
+  owners and groups for the run.
 - Files are checked as Linux checks them (`generic_permission`): the
   owner's permission bits apply to the owner, the group's to a member of the
   file's group (by the filesystem group ID or a supplementary group) and

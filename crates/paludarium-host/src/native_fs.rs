@@ -37,14 +37,83 @@ fn lock_err(e: std::io::Error) -> Errno {
         err(e)
     }
 }
-/// `chown` of a host file: the guest sees every one as root's and cannot
-/// give one to anyone else, so only an owner and a group of 0 are taken
-/// (EPERM otherwise).
-fn stays_root(uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
-    if uid.is_some_and(|id| id != 0) || gid.is_some_and(|id| id != 0) {
-        return Err(Errno::EPERM);
+/// A host file's identity: its device and inode. Hosts other than Unix
+/// give the inode alone.
+type Key = (u64, u64);
+/// The owners and groups `chown` gave host files, and the files a guest
+/// made took, for as long as this emulator runs. The host files themselves
+/// keep theirs, so a file with no entry shows as root's, as every host file
+/// did before. One table for the process, so that the same host file seen
+/// through two mounts has one owner.
+fn owners() -> std::sync::MutexGuard<'static, std::collections::HashMap<Key, (u32, u32)>> {
+    static OWNERS: std::sync::OnceLock<Mutex<std::collections::HashMap<Key, (u32, u32)>>> =
+        std::sync::OnceLock::new();
+    OWNERS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+/// `chown` of the host file `key`: `None` keeps that one as it was.
+fn record_owner(key: Key, uid: Option<u32>, gid: Option<u32>) {
+    let mut owners = owners();
+    let entry = owners.entry(key).or_insert((0, 0));
+    if let Some(uid) = uid {
+        entry.0 = uid;
     }
-    Ok(())
+    if let Some(gid) = gid {
+        entry.1 = gid;
+    }
+}
+/// A file just made at `key`, in a directory of `parent`: root's, or in a
+/// set-group-ID directory its group, as on Linux, until the kernel gives it
+/// its maker's IDs. An inode the host reuses for it may still have the
+/// owner of the file that had it, which this drops.
+fn made(key: Key, parent: Option<&FileStat>) {
+    let mut owners = owners();
+    match parent.filter(|p| p.mode & 0o2000 != 0 && p.gid != 0) {
+        Some(p) => owners.insert(key, (0, p.gid)),
+        None => owners.remove(&key),
+    };
+}
+/// The [`Key`] of a host file's metadata.
+fn std_key(m: &std::fs::Metadata) -> Result<Key, Errno> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((m.dev(), m.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok((0, m.file_index().ok_or(Errno::EIO)?))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = m;
+        Ok((0, 0))
+    }
+}
+/// [`std_key`] of metadata read through the retained directory.
+fn cap_key(m: &cap_std::fs::Metadata) -> Result<Key, Errno> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+        Ok((m.dev(), m.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        Ok((0, m.file_index().ok_or(Errno::EIO)?))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = m;
+        Ok((0, 0))
+    }
+}
+/// The recorded owner and group of `key`, root's if none.
+fn owner_of(key: Key) -> (u32, u32) {
+    owners().get(&key).copied().unwrap_or((0, 0))
 }
 /// A guest time (nanoseconds since the Unix epoch) as a host time.
 fn system_time(ns: i128) -> Result<std::time::SystemTime, Errno> {
@@ -158,12 +227,13 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let (uid, gid) = owner_of((m.dev(), m.ino()));
         Ok(FileStat {
             inode: m.ino(),
             size: m.len(),
             mode: m.mode(),
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             links: m.nlink(),
             mtime_ns,
             // A host device's number is in the host's encoding; none is
@@ -195,8 +265,8 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
             } else {
                 0o100644
             },
-            uid: 0,
-            gid: 0,
+            uid: owner_of((0, inode)).0,
+            gid: owner_of((0, inode)).1,
             links,
             mtime_ns,
             rdev: 0,
@@ -219,6 +289,31 @@ impl NativeFs {
             #[cfg(windows)]
             root_path: root.to_path_buf(),
         })
+    }
+    /// The [`Key`] of the host file at `p`.
+    fn key(&self, p: &[u8], follow: bool) -> Result<Key, Errno> {
+        let p = path(p)?;
+        let m = if follow {
+            self.root.metadata(p)
+        } else {
+            self.root.symlink_metadata(p)
+        }
+        .map_err(err)?;
+        cap_key(&m)
+    }
+    /// [`made`] for the file just made at `p`; one that is gone already
+    /// has nothing to drop.
+    fn made(&self, p: &[u8]) {
+        let parent = match p.iter().rposition(|b| *b == b'/') {
+            Some(i) => &p[..i],
+            None => &b"."[..],
+        };
+        let parent = self
+            .metadata(if parent.is_empty() { b"." } else { parent }, true)
+            .ok();
+        if let Ok(key) = self.key(p, false) {
+            made(key, parent.as_ref());
+        }
     }
 }
 struct NativeFile {
@@ -488,7 +583,14 @@ impl FileHandle for NativeFile {
         return read_only::set(&file, mode).map_err(err);
     }
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
-        stays_root(uid, gid)
+        let metadata = self
+            .file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .metadata()
+            .map_err(err)?;
+        record_owner(std_key(&metadata)?, uid, gid);
+        Ok(())
     }
     fn set_times(&self, atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
         let mut times = std::fs::FileTimes::new();
@@ -569,6 +671,7 @@ fn make_node(
     // the bits the host's umask left it, still a node that works.
     let own = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&node));
     let _ = rustix::fs::chmod(own.as_str(), mode);
+    fs.made(p);
     fs.metadata(p, false)
 }
 
@@ -599,6 +702,7 @@ impl HostFs for NativeFs {
             o.follow(FollowSymlinks::No);
         }
         let relative = path(p)?;
+        let existed = f & 64 == 0 || self.root.symlink_metadata(&relative).is_ok();
         let readonly_create = f & 3 == 0 && f & 64 != 0 && f & (128 | 512) == 0;
         if readonly_create {
             o.create(false);
@@ -624,6 +728,9 @@ impl HostFs for NativeFs {
         .into_std();
         if f & 65536 != 0 && !file.metadata().map_err(err)?.is_dir() {
             return Err(Errno::ENOTDIR);
+        }
+        if !existed {
+            self.made(p);
         }
         Ok(Arc::new(NativeFile {
             file: Mutex::new(file),
@@ -721,8 +828,8 @@ impl HostFs for NativeFs {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> Result<(), Errno> {
-        self.metadata(p, follow)?;
-        stays_root(uid, gid)
+        record_owner(self.key(p, follow)?, uid, gid);
+        Ok(())
     }
     fn set_times(
         &self,
@@ -832,7 +939,9 @@ impl HostFs for NativeFs {
         };
         #[cfg(not(unix))]
         let _ = m;
-        self.root.create_dir_with(path(p)?, &builder).map_err(err)
+        self.root.create_dir_with(path(p)?, &builder).map_err(err)?;
+        self.made(p);
+        Ok(())
     }
     fn unlink(&self, p: &[u8], d: bool) -> Result<(), Errno> {
         if d {
@@ -850,7 +959,7 @@ impl HostFs for NativeFs {
     fn symlink(&self, a: &[u8], b: &[u8]) -> Result<(), Errno> {
         #[cfg(not(windows))]
         {
-            self.root.symlink(path(a)?, path(b)?).map_err(err)
+            self.root.symlink(path(a)?, path(b)?).map_err(err)?;
         }
         #[cfg(windows)]
         {
@@ -873,8 +982,10 @@ impl HostFs for NativeFs {
             } else {
                 self.root.symlink_file(target, link)
             }
-            .map_err(err)
+            .map_err(err)?;
         }
+        self.made(b);
+        Ok(())
     }
     fn readlink(&self, p: &[u8]) -> Result<Vec<u8>, Errno> {
         self.root
@@ -923,12 +1034,13 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
     #[cfg(unix)]
     {
         use cap_std::fs::MetadataExt;
+        let (uid, gid) = owner_of((m.dev(), m.ino()));
         Ok(FileStat {
             inode: m.ino(),
             size: m.len(),
             mode: m.mode(),
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             links: m.nlink(),
             mtime_ns,
             // A host device's number is in the host's encoding; none is
@@ -960,8 +1072,8 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
             } else {
                 0o100644
             },
-            uid: 0,
-            gid: 0,
+            uid: owner_of((0, inode)).0,
+            gid: owner_of((0, inode)).1,
             links,
             mtime_ns,
             rdev: 0,
@@ -1307,6 +1419,38 @@ mod files_tests {
         x.fs().unlink(b"a", false).unwrap();
         assert_eq!(x.fs().metadata(b"b", true).unwrap().links, 1);
         assert_eq!(file.stat().unwrap().links, 1);
+    }
+    #[test]
+    fn owners_last_for_the_run_and_hold_for_every_name() {
+        let x = Fixture::new();
+        let ids = |p: &[u8]| {
+            let s = x.fs().metadata(p, false).unwrap();
+            (s.uid, s.gid)
+        };
+        let file = x.fs().open(b"a", 66, 0o600).unwrap();
+        assert_eq!(ids(b"a"), (0, 0));
+        x.fs().set_owner(b"a", true, Some(1000), None).unwrap();
+        assert_eq!((ids(b"a"), file.stat().unwrap().uid), ((1000, 0), 1000));
+        file.set_owner(None, Some(50)).unwrap();
+        x.fs().link(b"a", b"b").unwrap();
+        assert_eq!(ids(b"b"), (1000, 50));
+        // A symbolic link has an owner of its own.
+        x.fs().symlink(b"a", b"l").unwrap();
+        x.fs().set_owner(b"l", false, Some(7), Some(8)).unwrap();
+        assert_eq!((ids(b"l"), ids(b"a")), ((7, 8), (1000, 50)));
+        // A file made in a set-group-ID directory takes its group, and one
+        // made again under a name starts as root's.
+        x.fs().mkdir(b"d", 0o755).unwrap();
+        x.fs().set_owner(b"d", true, None, Some(60)).unwrap();
+        x.fs().set_mode(b"d", 0o2775).unwrap();
+        x.fs().open(b"d/f", 66, 0o600).unwrap();
+        x.fs().mkdir(b"d/e", 0o755).unwrap();
+        assert_eq!((ids(b"d/f"), ids(b"d/e")), ((0, 60), (0, 60)));
+        x.fs().set_owner(b"d/f", true, Some(3), None).unwrap();
+        x.fs().unlink(b"d/f", false).unwrap();
+        x.fs().open(b"d/f", 66, 0o600).unwrap();
+        assert_eq!(ids(b"d/f"), (0, 60));
+        drop(file);
     }
     #[test]
     fn native_error_namespace() {

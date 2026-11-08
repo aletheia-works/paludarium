@@ -24,7 +24,7 @@ import sys
 import time
 
 # Even if every case ran out its time, the cases would end in about 160
-# minutes (114 cases on 4 workers, 330 s each), within the workflow's 180 with
+# minutes (115 cases on 4 workers, 330 s each), within the workflow's 180 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
 # ended. The slowest cases, Emacs and g++, took up to 180 s under the emulator
@@ -424,8 +424,7 @@ def runtimes(shell):
     # Left out until paludarium handles them: Java and Erlang, since the CLI
     # runs the first program as /<file name> (Java's $ORIGIN) and only an ELF
     # one (erl is a script); fish, whose command substitution fails with EBADF
-    # from fcntl; and PostgreSQL, whose data directory must belong to postgres,
-    # which a host mount cannot give it.
+    # from fcntl.
     return {
         "sbcl": [
             "/usr/bin/sbcl",
@@ -467,16 +466,29 @@ def runtimes(shell):
             "cd {O} && convert -size 16x8 xc:red -fill blue -draw 'rectangle 0,0 7,7' i.png && "
             "identify -format '%wx%h %m\\n' i.png && convert i.png -format '%[pixel:p{1,1}] %[pixel:p{12,4}]\\n' info:"
         ),
-        # Its workers run as root: making them another user chowns its
-        # temporary directories, which a host mount refuses (EPERM).
+        # Its workers run as www-data, whose temporary directories the master
+        # chowns to it.
         "nginx": shell(
             "cd {O} && mkdir www logs && echo from nginx > www/index.html && "
-            "printf 'daemon off; user root root; worker_processes 2; error_log {O}/logs/error.log; pid {O}/nginx.pid;\\n"
+            "printf 'daemon off; user www-data www-data; worker_processes 2; error_log {O}/logs/error.log; pid {O}/nginx.pid;\\n"
             "events {}\\nhttp { access_log off; server { listen 127.0.0.1:18081; root {O}/www; } }\\n' > nginx.conf && "
             "{ /usr/sbin/nginx -p {O}/ -c {O}/nginx.conf & } && server=$! && for i in $(seq 200); do "
             "curl -sf http://127.0.0.1:18081/ && break; sleep 0.1; done && "
             "curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:18081/missing; kill -QUIT $server; wait $server; "
             "echo server $?"
+        ),
+        # The server runs as postgres, in a data directory root gave it, and
+        # answers on a socket in the case's directory only.
+        "postgresql": shell(
+            "cd {O} && mkdir pg s && chown postgres:postgres pg s && b=$(echo /usr/lib/postgresql/*/bin) && "
+            "setpriv --reuid=postgres --regid=postgres --init-groups /bin/sh -c '"
+            "$0/initdb -D {O}/pg -A trust -E UTF8 --locale=C.UTF-8 >/dev/null && "
+            '$0/pg_ctl -D {O}/pg -o "-k {O}/s -c listen_addresses=" -w -l {O}/log start >/dev/null && '
+            '$0/psql -h {O}/s -d postgres -XAtc "create table t(a int, b text); '
+            "insert into t select i, md5(i::text) from generate_series(1, 1000) i; "
+            'select count(*), sum(a), max(b) from t; select current_user"; '
+            "$0/pg_ctl -D {O}/pg -m fast -w stop >/dev/null; echo stopped $?' $b; "
+            "stat -c '%U %G %a' pg"
         ),
         "memcached": shell(
             "{ memcached -u root -l 127.0.0.1 -p 11311 -t 2 & } && server=$! && for i in $(seq 200); do "

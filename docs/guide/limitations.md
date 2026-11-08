@@ -161,10 +161,10 @@ verified.
   In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), a value
   of `security.capability` is not checked, and a sticky directory does not limit
   `user.*` to its owner.
-- **File owners**: a file in a mounted host directory stays root's, so
-  `chown` to any other owner or group returns `EPERM` there, and a file a
-  guest that is not root makes there is root's too, which that guest may
-  then not be allowed to open again.
+- **File owners**: in a mounted host directory, the owner and group that
+  `chown` gives a file, and those of a file a guest makes there, are kept
+  only while the emulator runs, not on the host file. The next run sees
+  every file there as root's again.
 - **Credentials**: the IDs and capabilities a thread takes are checked on
   files, signals, resource limits, priorities, socket credentials and core
   files but nowhere else yet. `F_SETOWN` records no sender's credentials, so

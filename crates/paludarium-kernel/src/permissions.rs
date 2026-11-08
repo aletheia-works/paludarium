@@ -289,8 +289,8 @@ pub(crate) fn create(
 
 /// Makes a file the thread just made at `path` its own: its filesystem
 /// user ID, and its filesystem group ID unless the directory `parent` is
-/// set-group-ID, whose group the file already took. A mounted host
-/// directory keeps its files root's, which this leaves.
+/// set-group-ID, whose group the file already took. In a mounted host
+/// directory these are kept for the run, not on the host file.
 pub(crate) fn own(
     files: &Files,
     creds: &Credentials,

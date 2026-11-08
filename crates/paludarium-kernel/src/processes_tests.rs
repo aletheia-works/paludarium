@@ -1209,10 +1209,7 @@ mod exec {
         assert_eq!(syscall(&mut k, &mut t, &m, 251, [1, 0, 0, 0, 0, 0]), 0);
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         assert_eq!(syscall(&mut c, &mut ct, &cm, 252, [1, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(
-            syscall(&mut k, &mut t, &m, 252, [1, 0, 0, 0, 0, 0]),
-            1 << 13 | 3
-        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 252, [1, 0, 0, 0, 0, 0]), 0);
     }
     /// `load_script`'s view of a first line.
     fn parsed(line: &[u8]) -> Result<Option<crate::processes::Script>, Errno> {

@@ -420,24 +420,11 @@ pub(crate) fn check_ioprio(ioprio: i32, may_realtime: bool) -> Result<(), Errno>
     }
 }
 
-/// The I/O priority `ioprio_get` reports for a thread (Linux's
-/// `__get_task_ioprio`): 0 without an I/O context, and for the class none
-/// one from the scheduling policy and the nice value.
-pub(crate) fn reported_ioprio(sched: &Sched, nice: i32) -> u16 {
-    let Some(io) = sched.io else {
-        return 0;
-    };
-    if io_class(io) != 0 {
-        return io;
-    }
-    let class = if sched.policy == SCHED_IDLE {
-        3
-    } else if rt_policy(sched.policy) || sched.deadline_policy() {
-        1
-    } else {
-        2
-    };
-    class << 13 | ((nice + 20) / 5) as u16
+/// The I/O priority `ioprio_get` reports for a thread: the one it was
+/// given, the class none (0) included, and 0 without one, as Linux does
+/// (a class-none priority is not turned into one from the nice value).
+pub(crate) fn reported_ioprio(sched: &Sched) -> u16 {
+    sched.io.unwrap_or(0)
 }
 
 /// Linux's `ioprio_best`, which counts a priority without a class as

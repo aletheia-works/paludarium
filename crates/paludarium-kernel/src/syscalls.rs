@@ -2652,8 +2652,9 @@ fn sys_sched_rr_get_interval(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// `sched_getattr(pid, attr, size, flags)`, as Linux's: `EINVAL` for a
 /// NULL `attr`, a negative `pid`, a size outside 48 (`SCHED_ATTR_SIZE_VER0`)
 /// to a page or any flag; then the thread (`ESRCH`); and the attributes,
-/// cut to `size` with `size` written as what was copied (at most 56). A
-/// normal policy reports its nice value and its slice as `sched_runtime`.
+/// cut to `size` with `size` written as what was copied (at most 56) and
+/// zeros after them in a larger buffer, as Linux 6.13's
+/// `copy_struct_to_user`. A normal policy reports its nice value and its slice as `sched_runtime`.
 fn sys_sched_getattr(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     use crate::scheduling::{FLAG_ALL, FLAG_RESET_ON_FORK, rt_policy};
     let (pid, size, flags) = (a[0] as u32 as i32, a[2] as u32, a[3] as u32);
@@ -2695,7 +2696,10 @@ fn sys_sched_getattr(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
     bytes.extend_from_slice(&sched.clamps[0].value.to_le_bytes());
     bytes.extend_from_slice(&sched.clamps[1].value.to_le_bytes());
-    match c.mem.write(GuestAddr(a[1]), &bytes[..copied as usize]) {
+    // copy_struct_to_user (since Linux 6.13): a larger buffer gets zeros
+    // after the structure.
+    bytes.resize(size as usize, 0);
+    match c.mem.write(GuestAddr(a[1]), &bytes) {
         Ok(()) => ok(0),
         Err(_) => err(Errno::EFAULT),
     }

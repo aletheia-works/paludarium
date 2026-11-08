@@ -1808,8 +1808,8 @@ impl Kernel {
     /// (`IOPRIO_WHO_PROCESS`), or the best of a process group's threads
     /// (`IOPRIO_WHO_PGRP`) or of a user's (`IOPRIO_WHO_USER`), found as
     /// `getpriority` finds them, as Linux's `ioprio_best` compares them. A
-    /// thread without an I/O context reports 0; with the class none, its
-    /// policy and nice value make one ([`scheduling::reported_ioprio`]).
+    /// thread reports the priority it was given, or 0
+    /// ([`scheduling::reported_ioprio`]).
     /// None found is `ESRCH`.
     fn ioprio_get(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
         let which = match a[0] as i32 {
@@ -1825,7 +1825,7 @@ impl Kernel {
         )?;
         threads
             .iter()
-            .map(|found| scheduling::reported_ioprio(&found.group.sched(found.tid), found.nice))
+            .map(|found| scheduling::reported_ioprio(&found.group.sched(found.tid)))
             .reduce(scheduling::best_ioprio)
             .map(u64::from)
             .ok_or(Errno(3))

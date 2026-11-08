@@ -580,7 +580,8 @@ kernel.
   95% of each CPU less the 5% its fair server takes (`EBUSY`).
   `sched_getscheduler`, `sched_getparam` and `sched_getattr` report them, for a
   thread of any process; `sched_getattr` gives a normal policy's nice value
-  and its slice as `sched_runtime`. New threads and processes inherit them, as
+  and its slice as `sched_runtime`, and fills a buffer larger than the
+  structure with zeros, as Linux 6.13 and later. New threads and processes inherit them, as
   Linux's `sched_fork` has it: with the reset flag a real-time or deadline
   task's child is a normal one with nice 0 and no flag, and a deadline task
   may not fork (`EAGAIN`); `sched_setaffinity` keeps every CPU for a
@@ -598,9 +599,9 @@ kernel.
   checks the priority first, as Linux's `ioprio_check_cap` (a known class, a
   real-time one only with `CAP_SYS_NICE` or `CAP_SYS_ADMIN`), then gives it to
   each thread whose real user ID is the caller's real or effective one
-  (`EPERM` otherwise, without `CAP_SYS_NICE`). `ioprio_get` reports 0 for a
-  thread that never had one, and for the class none one from the thread's
-  policy and nice value; for several threads, the best as Linux's
+  (`EPERM` otherwise, without `CAP_SYS_NICE`). `ioprio_get` reports the
+  priority a thread was given, and 0 for one that never had one or was given
+  the class none, whatever its nice value; for several threads, the best as Linux's
   `ioprio_best` compares them (one without a class counts as best-effort
   level 4). A priority with a class passes to new threads and processes.
 - `personality` keeps any value for the thread, as Linux stores it, and

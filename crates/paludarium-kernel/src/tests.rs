@@ -396,6 +396,14 @@ fn scheduling_policies_are_kept_and_reported() {
         f.mem.read_value(GuestAddr(DATA + 0x48), 8).unwrap()
             + f.mem.read_value(GuestAddr(DATA + 0x40), 8).unwrap() * 1_000_000_000
     };
+    // A buffer larger than the structure gets zeros after it, as Linux
+    // 6.13's copy_struct_to_user.
+    f.mem.write(GuestAddr(DATA), &[0xee; 64]).unwrap();
+    assert_eq!(f.ret(nr::SCHED_GETATTR, &[0, DATA, 64, 0]), 0);
+    let mut tail = [0xffu8; 8];
+    f.mem.read(GuestAddr(DATA + 56), &mut tail).unwrap();
+    assert_eq!(tail, [0; 8]);
+    assert_eq!(f.mem.read_value(GuestAddr(DATA), 4).unwrap(), 56);
     // The defaults: SCHED_OTHER, nice 0, the host's slice and no clamps.
     assert_eq!(
         sched_attributes(&mut f, 0),
@@ -539,11 +547,11 @@ fn ioprio_set_is_kept_and_reported() {
     // Best-effort level 3, with a hint.
     assert_eq!(f.ret(251, &[1, 0, 2 << 13 | 1 << 3 | 3]), 0);
     assert_eq!(f.ret(252, &[1, 0]), 2 << 13 | 1 << 3 | 3);
-    // The class none takes its class and level from the nice value.
+    // The class none is reported as 0, whatever the nice value.
     assert_eq!(f.ret(251, &[1, 0, 0]), 0);
-    assert_eq!(f.ret(252, &[1, 0]), 2 << 13 | 4);
+    assert_eq!(f.ret(252, &[1, 0]), 0);
     assert_eq!(f.ret(141, &[0, 0, 10]), 0);
-    assert_eq!(f.ret(252, &[1, 0]), 2 << 13 | 6);
+    assert_eq!(f.ret(252, &[1, 0]), 0);
     // Real-time and idle classes.
     assert_eq!(f.ret(251, &[1, 0, 1 << 13 | 7]), 0);
     assert_eq!(f.ret(252, &[2, 0]), 1 << 13 | 7);

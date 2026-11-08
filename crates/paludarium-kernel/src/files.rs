@@ -3500,7 +3500,13 @@ fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if flags & O_SYNC != 0 {
         flags |= O_DSYNC;
     }
-    let raw = path(c, a[1])?;
+    // With `RESOLVE_*` flags its own walk meets each magic link, which they
+    // may refuse; without, the path is taken as `openat` takes it.
+    let raw = if resolve & !RESOLVE_CACHED == 0 {
+        path(c, a[1])?
+    } else {
+        string(c, a[1])?
+    };
     open_at(c, a[0], raw, flags, mode as u32, resolve & !RESOLVE_CACHED)
 }
 /// The mount `path` is on, for `RESOLVE_NO_XDEV`: procfs, devtmpfs and

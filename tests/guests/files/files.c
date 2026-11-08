@@ -747,6 +747,10 @@ void _start(void) {
   /* The working directory's link. */
   long ok=S(79,here,300,0);S(80,"/tmp",0,0);results[x++]=S(4,"/proc/self/cwd/paludarium-files-fixture",st,0);if(ok>0)S(80,here,0,0);
   results[x++]=S(4,"/proc/self/exe/x",st,0);
+  /* openat2's RESOLVE_* flags meet the link inside the path too: a magic link (ELOOP) and another mount (EXDEV). */
+  {static unsigned long how[3];how[0]=0;how[1]=0;
+   for(int k=0;k<3;k++){how[2]=k==0?0x02:k==1?0x04:0x01;long o2=call(437,-100,(long)UNDER("/proc/self/fd/",d,"/paludarium-files-fixture"),(long)how,24,0,0);results[x++]=o2>=0?0:o2;if(o2>=0)S(3,o2,0,0);}
+   how[2]=0x10;long o3=call(437,-100,(long)UNDER("/proc/self/fd/",d,"/paludarium-files-fixture"),(long)how,24,0,0);results[x++]=o3>=0;if(o3>=0)S(3,o3,0,0);}
   S(3,e,0,0);S(3,d,0,0);S(3,op,0,0);}
  if(CASE==42){ /* close_range(first, last, flags): 4..7 are copies of fd 3 */
   #define CR(f,l,fl) call(436,f,l,fl,0,0,0)

@@ -749,7 +749,9 @@ kernel.
   the path that names it now, even after a rename, and `..` goes on from
   there. A removed directory is `ENOENT`, a descriptor that is not open
   `ENOENT`, and a file that is not a directory `ENOTDIR`. The file calls
-  that take a path do this; `execve` and a Unix socket's address do not.
+  that take an absolute path do this (`openat2` with `RESOLVE_*` flags in its
+  own walk); a path relative to a descriptor of `/proc`, one with `..`
+  before the link, `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
   `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a

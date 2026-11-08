@@ -136,10 +136,18 @@ kernel.
   gives the thread its own copy of a table it shares with `CLONE_FILES`
   threads, which keep their descriptors. Unknown flags and `first` above
   `last` give `EINVAL`.
-- A descriptor argument, and the command of `fcntl` and `ioctl`, is read from
-  the low 32 bits of its register, as Linux's `int` and `unsigned int`
-  parameters are, so a caller that leaves the upper half dirty (fish's `fcntl`
-  does) still names its descriptor.
+- Every system call reads its arguments at the width of the C type Linux
+  declares them with, as Linux's syscall wrappers cast the registers before
+  the call runs: an `int`, `pid_t` or `clockid_t` from the low 32 bits,
+  sign-extended; an `unsigned int`, `uid_t` or `u32` from the low 32 bits; a
+  `umode_t` from the low 16. A caller that leaves the rest of a register dirty
+  (fish's `fcntl` does) gets what it would on Linux. Pointers and `long`,
+  `unsigned long`, `size_t` and `loff_t` arguments are read whole, so
+  `mprotect` with a bit set past 32 in `prot` is still `EINVAL`; the iovec
+  count of `readv`, `writev` and their kin is the exception, since Linux passes
+  it on as an `unsigned`. The number
+  itself is read from the low 32 bits of `rax` too, as Linux's
+  `do_syscall_64` takes an `int`, and a negative one gives `ENOSYS`.
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`. A word is
   told apart as Linux's `get_futex_key` does: in a shared mapping (shared
   anonymous memory or a file's), a shared operation names the memory and the

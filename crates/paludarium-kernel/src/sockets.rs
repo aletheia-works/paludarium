@@ -551,7 +551,7 @@ impl FileHandle for PipeEnd {
 }
 
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let number = c.cpu.gpr[paludarium_cpu::reg::RAX];
+    let number = c.number;
     let result = (|| match number {
         // AF_INET and AF_INET6, with a network, and AF_UNIX.
         41 if a[0] == 1 => crate::unix::socket(c, a),

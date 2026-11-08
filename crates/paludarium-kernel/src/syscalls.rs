@@ -99,6 +99,9 @@ pub mod nr {
 }
 
 pub(crate) struct Context<'a> {
+    /// The system call's number, from the low 32 bits of `rax`: handlers
+    /// that serve several numbers read it here, never from the register.
+    pub number: u64,
     pub files: &'a mut crate::files::Files,
     pub host: &'a dyn Host,
     /// The same host, for files that keep it (a timerfd reads its clock).
@@ -1924,10 +1927,7 @@ fn sys_rt_sigprocmask(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// Only known terminal queries are interpreted, never forwarded to Host.
-fn sys_ioctl(c: &mut Context<'_>, mut a: [u64; 6]) -> Outcome {
-    // The request is an unsigned int, as in Linux's ioctl(unsigned int fd,
-    // unsigned int cmd, unsigned long arg): the register's upper half is not read.
-    a[1] &= 0xffff_ffff;
+fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let mut run = || -> Result<u64, Errno> {
         // Linux's `do_vfs_ioctl` answers these for every file, and an
         // `O_PATH` descriptor for none.

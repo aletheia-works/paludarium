@@ -124,9 +124,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   は先に、`CLONE_FILES` のスレッドと共有している表をそのスレッド専用の写しにします。
   共有していたスレッドのディスクリプタはそのまま残ります。未知のフラグや `last` より
   大きい `first` は `EINVAL` です。
-- ディスクリプタの引数と、`fcntl`・`ioctl` のコマンドは、Linux の `int` や
-  `unsigned int` の引数と同じく、レジスタの下位 32 ビットだけから読みます。上位の半分を 0 にせずに呼ぶもの（fish の `fcntl`）でも、
-  そのディスクリプタになります。
+- どのシステムコールも、引数を Linux が宣言している C の型の幅で読みます。Linux の
+  システムコールの入口が、呼び出しの前にレジスタをその型にキャストするのと同じです。
+  `int`・`pid_t`・`clockid_t` は下位 32 ビットを符号拡張して、`unsigned int`・`uid_t`・
+  `u32` は下位 32 ビットを、`umode_t` は下位 16 ビットを読みます。レジスタの残りを
+  0 にせずに呼ぶもの（fish の `fcntl`）でも、Linux と同じ結果になります。ポインタと
+  `long`・`unsigned long`・`size_t`・`loff_t` の引数はそのまま全体を読むので、`prot` の
+  32 ビットより上が立っている `mprotect` は `EINVAL` のままです。ただし `readv`・`writev`
+  などの iovec の数は、Linux が `unsigned` として渡すので下位 32 ビットだけを読みます。システムコールの番号も、
+  Linux の `do_syscall_64` が `int` で受け取るのと同じく `rax` の下位 32 ビットから読み、
+  負の番号は `ENOSYS` です。
 - `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET` を扱います。ワードは Linux の
   `get_futex_key` と同じように見分けます。共有マッピング（共有の無名メモリかファイルのもの）では、
   shared の操作はそのメモリとその中のオフセットを指すので、wake はそのメモリをマップしている

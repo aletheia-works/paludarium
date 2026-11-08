@@ -235,7 +235,7 @@ impl FileHandle for EpollInstance {
 }
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = (|| {
-        let number = c.cpu.gpr[paludarium_cpu::reg::RAX];
+        let number = c.number;
         if number == 213 || number == 291 {
             if (number == 213 && a[0] as i32 <= 0) || (number == 291 && a[0] & !0x80000 != 0) {
                 return Err(Errno::EINVAL);

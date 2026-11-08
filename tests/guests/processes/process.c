@@ -3135,6 +3135,26 @@ static int proc_own_files_cases(int argc, char **argv) {
                     through.st_ino == target.st_ino && through.st_dev == target.st_dev;
     printf("exe link=%d mode=%o absolute=%d same-file=%d\n", is_link, (unsigned)(link.st_mode & 07777), path[0] == '/',
            same_file);
+    /* A forked child runs the same program, so its link names the same path. */
+    fflush(stdout);
+    int link_pipe[2];
+    if (pipe(link_pipe)) return 82;
+    pid_t child = fork();
+    if (child < 0) return 83;
+    if (!child) {
+        char child_path[4096];
+        ssize_t got = readlink("/proc/self/exe", child_path, sizeof child_path);
+        if (got > 0 && write(link_pipe[1], child_path, (size_t)got) != got) _exit(2);
+        _exit(got > 0 ? 0 : 1);
+    }
+    close(link_pipe[1]);
+    char child_path[4096];
+    ssize_t got = read(link_pipe[0], child_path, sizeof child_path - 1);
+    child_path[got > 0 ? got : 0] = 0;
+    close(link_pipe[0]);
+    int child_status;
+    waitpid(child, &child_status, 0);
+    printf("exe forked-child-same=%d status=%d\n", !strcmp(child_path, path), child_status);
     int exe = open("/proc/self/exe", O_RDONLY);
     char magic[4] = {0};
     printf("exe opens=%d elf=%d\n", exe >= 0, exe >= 0 && read(exe, magic, 4) == 4 && !memcmp(magic, "\177ELF", 4));

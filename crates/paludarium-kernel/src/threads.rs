@@ -175,8 +175,10 @@ impl ThreadGroup {
             actions: Mutex::new(actions),
             nofile: AtomicU64::new(self.nofile()),
             fsize: AtomicU64::new(self.fsize()),
-            // A fork keeps the memory, and so the program's initial stack.
+            // A fork keeps the memory, and so the program's initial stack
+            // and the program itself (Linux's `exe_file`).
             start_stack: AtomicU64::new(self.start_stack()),
+            executable: Mutex::new(self.executable()),
             ..Self::default()
         }
     }

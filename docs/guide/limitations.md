@@ -212,10 +212,10 @@ verified.
   than those 10 ms can go unseen and send none, unless a read or write told
   the guest `EAGAIN`, which always gets its signal. In WebAssembly, which has
   no thread to look, they send none.
-- **Edge-triggered `epoll` on a signalfd**: a new edge comes when one of
-  the file's signals becomes pending for the waiting thread where it was
-  not, where Linux also wakes the file for each further real-time signal
-  queued while one of its number waits.
+- **Edge-triggered `epoll` on a signalfd**: a signal queued only for
+  another thread of the process gives the waiting thread no edge, where
+  Linux's `signalfd_notify` wakes the process's signal files for every
+  signal, so the waiter sees its own pending one again.
 - **Namespaces**: `clone` and `clone3` with a namespace flag
   (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
   `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for
@@ -253,12 +253,15 @@ verified.
   share that flag. A Windows host cannot tell, so there it is never
   `EAGAIN`.
 - **Pseudo-terminals, in part** ([features](./features#system-calls)):
-  `TIOCVHANGUP`, `TIOCCONS` and `O_ASYNC` on a terminal are not
-  implemented (`ENOTTY`, and `FIOASYNC` too). One side's write reaches the
-  other's line discipline at once, where Linux passes it on from a work
-  queue, so a reader here never finds only part of a write; each side
-  holds up to Linux's default flip buffer of 640 KiB, without Linux's
-  memory accounting behind it. The host's own terminal is not one of
+  One side's write reaches the other's line discipline at once, where Linux
+  passes it on from a work queue, so a reader here never finds only part of
+  a write, and `O_ASYNC` signals once for each write (or echo) where Linux
+  signals once for each piece its work queue passes on, which a queued
+  `F_SETSIG` signal counts; each side holds up to Linux's default flip
+  buffer of 640 KiB, without Linux's memory accounting behind it. There is
+  no `/dev/console`, so a `TIOCCONS` redirect is never written to, and
+  `vhangup` does nothing when the controlling terminal is the host's, which
+  Linux would hang up. The host's own terminal is not one of
   these: the guest's standard streams on it answer only `TCGETS` and
   `TIOCGWINSZ`.
 - **`FIONREAD` and `SIOCOUTQ` on the host's standard streams**: both return

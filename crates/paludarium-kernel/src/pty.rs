@@ -13,6 +13,7 @@
 //! foreground group; [`crate::processes::Processes`] keeps which terminal
 //! controls each process (Linux's `signal->tty`).
 use crate::events::{IN, NONBLOCK, OUT, PRI, ReadinessHub};
+use crate::fasync::{FileOwner, Notice, O_ASYNC, OwnerKind, Reason, Registration};
 use crate::processes::Processes;
 use crate::syscalls::Context;
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat};
@@ -357,7 +358,30 @@ struct State {
     mode: u32,
     /// Rising edges of the slave's and the master's input and output.
     edges: [u64; 4],
+    /// The slave's line discipline is gone, from a hang-up until the slave
+    /// is opened again (`tty_ldisc_kill`, `tty_reopen`): what the master
+    /// writes waits in the flip buffer.
+    ldisc_down: bool,
+    /// `TIOCVHANGUP` hung up the master: its file reads nothing, and its
+    /// line discipline is gone.
+    master_hung_up: bool,
+    /// The `fasync` lists of the slave ([`SLAVE`]) and the master
+    /// ([`MASTER`]): the descriptions open with `O_ASYNC`, the latest first
+    /// as `fasync_insert_entry` puts them, and the descriptor each was set
+    /// through.
+    fasync: [Vec<(Weak<dyn FileHandle>, Registration)>; 2],
+    /// Each side's `TTY_DO_WRITE_WAKEUP`: a write left bytes unwritten while
+    /// the side had `O_ASYNC` descriptions, so room signals `POLL_OUT`.
+    write_wakeup: [bool; 2],
+    /// The `kill_fasync` calls made under the lock, sent once it is let go.
+    io: Vec<(usize, Reason)>,
 }
+/// The sides of [`State::fasync`].
+const SLAVE: usize = 0;
+const MASTER: usize = 1;
+/// `TTY_THRESHOLD_UNTHROTTLE`: a read that leaves at most this many bytes
+/// wakes the other side's writers (`n_tty_check_unthrottle`).
+const UNTHROTTLE: u64 = 128;
 const SLAVE_IN: usize = 0;
 const SLAVE_OUT: usize = 1;
 const MASTER_IN: usize = 2;
@@ -420,6 +444,39 @@ impl State {
             gid: TTY_GROUP,
             mode: SLAVE_MODE,
             edges: [0; 4],
+            ldisc_down: false,
+            master_hung_up: false,
+            fasync: [Vec::new(), Vec::new()],
+            write_wakeup: [false; 2],
+            io: Vec::new(),
+        }
+    }
+    /// `kill_fasync` of `side`'s list with `reason`, sent with the next
+    /// [`Terminal::changed`].
+    fn kill_fasync(&mut self, side: usize, reason: Reason) {
+        if !self.fasync[side].is_empty() && !self.io.contains(&(side, reason)) {
+            self.io.push((side, reason));
+        }
+    }
+    /// `tty_wakeup` of `side`: room for a write that was left short.
+    fn wakeup(&mut self, side: usize) {
+        if std::mem::take(&mut self.write_wakeup[side]) {
+            self.kill_fasync(side, Reason::Out);
+        }
+    }
+    /// The end of `__receive_buf`: outside canonical mode, input in the
+    /// buffer signals the slave's readers.
+    fn received(&mut self) {
+        if !self.canonical() && !self.read.is_empty() {
+            self.kill_fasync(SLAVE, Reason::In);
+        }
+    }
+    /// `chars_in_buffer` of the slave: the bytes a read could take.
+    fn chars_in_buffer(&self) -> u64 {
+        if self.canonical() {
+            self.canon_head - self.tail
+        } else {
+            self.head - self.tail
         }
     }
     fn input(&self, flag: u32) -> bool {
@@ -452,6 +509,7 @@ impl State {
         } else {
             self.output.extend(bytes);
             self.edge(MASTER_IN);
+            self.kill_fasync(MASTER, Reason::In);
         }
     }
     /// `flush_echoes`: the echoes go out, unless the output is stopped.
@@ -460,6 +518,7 @@ impl State {
             let echoes = std::mem::take(&mut self.echoes);
             self.output.extend(echoes);
             self.edge(MASTER_IN);
+            self.kill_fasync(MASTER, Reason::In);
         }
     }
     /// Linux's `do_output_char` with `room` bytes free: false when it does
@@ -620,6 +679,9 @@ impl State {
     /// `n_tty_receive_buf_common`: a canonical line that fills it keeps
     /// only its last byte changing, so that a newline still ends it.
     fn receive(&mut self, signals: &mut Signals) {
+        if self.ldisc_down {
+            return;
+        }
         let before = self.pending.len();
         while let Some(&c) = self.pending.front() {
             if self.read.len() >= BUFFER - 1 {
@@ -636,6 +698,7 @@ impl State {
         }
         if self.pending.len() != before {
             self.edge(MASTER_OUT);
+            self.received();
         }
         self.flush_echoes();
     }
@@ -802,6 +865,7 @@ impl State {
         self.queue(c, true);
         self.canon_head = self.head;
         self.edge(SLAVE_IN);
+        self.kill_fasync(SLAVE, Reason::In);
     }
     /// `n_tty_receive_signal_char`: the foreground group gets `signal`,
     /// and unless `NOFLSH` the input and the echoes not yet made go.
@@ -846,6 +910,7 @@ impl State {
         self.packet_event(TIOCPKT_START, TIOCPKT_STOP);
         self.flush_echoes();
         self.edge(SLAVE_OUT);
+        self.wakeup(SLAVE);
     }
     /// The cells from `at` (a count, as `head`) to the head, which go.
     fn cut(&mut self, at: u64) -> Vec<u8> {
@@ -1013,9 +1078,15 @@ impl State {
         n
     }
     /// After a read: the room it made takes more of the pending input.
+    /// A read that leaves little in the buffer wakes the master's writers,
+    /// as `n_tty_check_unthrottle` does before the flip buffer refills it.
     fn after_read(&mut self, signals: &mut Signals) {
+        let low = self.chars_in_buffer() <= UNTHROTTLE;
         self.receive(signals);
         self.edge(MASTER_OUT);
+        if low {
+            self.wakeup(MASTER);
+        }
     }
     /// `TIOCINQ` of the slave: the bytes of whole lines without their ends
     /// of file in canonical mode, else all.
@@ -1081,6 +1152,9 @@ impl State {
 #[derive(Default)]
 pub(crate) struct Devpts {
     terminals: Mutex<BTreeMap<u32, Weak<Terminal>>>,
+    /// Linux's `redirect`: the terminal file `TIOCCONS` gave the console's
+    /// output, which it holds open until its terminal hangs up.
+    redirect: Mutex<Option<Arc<dyn FileHandle>>>,
 }
 impl Devpts {
     fn lock(&self) -> MutexGuard<'_, BTreeMap<u32, Weak<Terminal>>> {
@@ -1091,7 +1165,7 @@ impl Devpts {
     /// A new pair with the lowest free number (`ENOSPC` past
     /// `kernel.pty.max`), its slave owned by `uid` and locked.
     fn create(
-        &self,
+        self: &Arc<Self>,
         hub: &Arc<ReadinessHub>,
         processes: &Arc<Processes>,
         uid: u32,
@@ -1106,6 +1180,7 @@ impl Devpts {
             index,
             hub: Arc::clone(hub),
             processes: Arc::downgrade(processes),
+            devpts: Arc::downgrade(self),
             state: Mutex::new(State::new(uid)),
         });
         terminals.insert(index, Arc::downgrade(&terminal));
@@ -1158,11 +1233,120 @@ pub(crate) struct Terminal {
     index: u32,
     hub: Arc<ReadinessHub>,
     processes: Weak<Processes>,
+    devpts: Weak<Devpts>,
     state: Mutex<State>,
 }
 impl Terminal {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Wakes the terminal's waiters, and sends the signals its `O_ASYNC`
+    /// descriptions are owed, each to the owner of its description.
+    fn changed(&self) {
+        self.hub.changed();
+        let notices: Vec<_> = {
+            let mut state = self.lock();
+            let io = std::mem::take(&mut state.io);
+            io.into_iter()
+                .flat_map(|(side, reason)| {
+                    state.fasync[side]
+                        .iter()
+                        .map(move |(file, to)| (file.clone(), to.clone(), reason))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        if notices.is_empty() {
+            return;
+        }
+        let Some(processes) = self.processes.upgrade() else {
+            return;
+        };
+        for (file, to, reason) in notices {
+            if let Some(file) = file.upgrade() {
+                let owner = processes.file_owner(&file);
+                Notice { to, owner, reason }.send();
+            }
+        }
+    }
+    /// Takes `side`'s `fasync` list away, its descriptions' `O_ASYNC` with
+    /// it, as `__tty_hangup` calls `__tty_fasync(-1, filp, 0)` for each.
+    /// Returns the descriptions, for the caller to let go of once the state
+    /// is unlocked, as the last of one closes it, which locks the state.
+    fn drop_fasync(state: &mut State, which: usize) -> Vec<Arc<dyn FileHandle>> {
+        state.write_wakeup[which] = false;
+        let files: Vec<_> = std::mem::take(&mut state.fasync[which])
+            .into_iter()
+            .filter_map(|(file, _)| file.upgrade())
+            .collect();
+        for file in &files {
+            let flags = match side(file) {
+                Some(Side::Master(master)) => &master.flags,
+                Some(Side::Slave(slave)) => &slave.flags,
+                None => continue,
+            };
+            flags.fetch_and(!O_ASYNC, Ordering::SeqCst);
+        }
+        files
+    }
+    /// `tty_vhangup` of the slave, as the master's close and `TIOCVHANGUP`
+    /// make it: every description of the slave open now is hung up and
+    /// loses `O_ASYNC`, the line discipline flushes and goes until the next
+    /// open, the `termios` is the driver's again (`TTY_DRIVER_RESET_TERMIOS`),
+    /// the packet events go, and the session the terminal controls loses it,
+    /// its leader told with SIGHUP and SIGCONT. A `TIOCCONS` redirect to the
+    /// slave ends.
+    fn hang_up(self: &Arc<Self>) {
+        let released = {
+            let mut state = self.lock();
+            state.hangups += 1;
+            let released = Self::drop_fasync(&mut state, SLAVE);
+            state.reset();
+            state.echoes.clear();
+            state.ldisc_down = true;
+            state.termios = Termios::SLAVE;
+            state.pktstatus = 0;
+            for edge in [SLAVE_IN, SLAVE_OUT, MASTER_OUT] {
+                state.edge(edge);
+            }
+            released
+        };
+        drop(released);
+        // The redirect goes after the lock, as dropping it may close a slave.
+        let redirect = self.devpts.upgrade().and_then(|devpts| {
+            let mut redirect = devpts
+                .redirect
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let ours = redirect
+                .as_ref()
+                .and_then(side)
+                .is_some_and(|side| Arc::ptr_eq(side.terminal(), self));
+            if ours { redirect.take() } else { None }
+        });
+        drop(redirect);
+        self.changed();
+        if let Some(processes) = self.processes.upgrade() {
+            processes.hang_up_terminal(self);
+        }
+    }
+    /// `tty_vhangup` of the master: its file is hung up and loses
+    /// `O_ASYNC`, and the master's line discipline flushes what it holds of
+    /// the slave's output, and the slave's input not taken yet
+    /// (`pty_flush_buffer`), and goes.
+    fn hang_up_master(&self) {
+        let released = {
+            let mut state = self.lock();
+            state.master_hung_up = true;
+            state.output.clear();
+            state.pending.clear();
+            for edge in [MASTER_IN, MASTER_OUT, SLAVE_OUT] {
+                state.edge(edge);
+            }
+            Self::drop_fasync(&mut state, MASTER)
+        };
+        drop(released);
+        self.changed();
     }
     /// The session this terminal controls (`tty->ctrl.session`).
     pub(crate) fn session(&self) -> Option<u32> {
@@ -1255,19 +1439,8 @@ impl Drop for Master {
     /// `pty_close` of the master: the slave hangs up, its name goes, and
     /// the session it controls loses it, its leader told with SIGHUP.
     fn drop(&mut self) {
-        let terminal = &self.terminal;
-        {
-            let mut state = terminal.lock();
-            state.master = false;
-            state.hangups += 1;
-            for edge in [SLAVE_IN, SLAVE_OUT] {
-                state.edge(edge);
-            }
-        }
-        terminal.hub.changed();
-        if let Some(processes) = terminal.processes.upgrade() {
-            processes.hang_up_terminal(terminal);
-        }
+        self.terminal.lock().master = false;
+        self.terminal.hang_up();
     }
 }
 /// An open file description of a slave, or of `/dev/tty` (`alias`).
@@ -1288,7 +1461,7 @@ impl Drop for Slave {
                 state.edge(MASTER_IN);
             }
         }
-        self.terminal.hub.changed();
+        self.terminal.changed();
     }
 }
 impl Slave {
@@ -1332,9 +1505,15 @@ fn open_slave(
         }
         state.slaves += 1;
         state.other_closed = false;
-        // Input waiting for room, if any, goes on.
+        // Input waiting for room, if any, goes on. After a hang-up the line
+        // discipline comes back, and what waits goes with the master's next
+        // write, as Linux's `tty_reopen` does not push the flip buffer.
         let mut signals = Vec::new();
-        state.receive(&mut signals);
+        if state.ldisc_down {
+            state.ldisc_down = false;
+        } else {
+            state.receive(&mut signals);
+        }
         (state.hangups, signals)
     };
     terminal.deliver(signals);
@@ -1344,7 +1523,7 @@ fn open_slave(
         generation,
         alias,
     });
-    terminal.hub.changed();
+    terminal.changed();
     if flags & O_NOCTTY == 0 && !alias && flags & 3 != 1 {
         c.processes.open_terminal(c.process.pid, terminal);
     }
@@ -1406,6 +1585,60 @@ impl Side<'_> {
             Side::Master(master) => master.flags.load(Ordering::SeqCst),
             Side::Slave(slave) => slave.flags.load(Ordering::SeqCst),
         }
+    }
+}
+
+/// Whether `file` is a pseudo-terminal's, which has `fasync`.
+pub(crate) fn is_terminal(file: &Arc<dyn FileHandle>) -> bool {
+    side(file).is_some()
+}
+
+/// Whether `file` is a pseudo-terminal's that is hung up, whose
+/// `hung_up_tty_fasync` refuses `O_ASYNC` with `ENOTTY`.
+pub(crate) fn hung_up(file: &Arc<dyn FileHandle>) -> bool {
+    match side(file) {
+        Some(Side::Slave(slave)) => slave.hung_up(&slave.terminal.lock()),
+        Some(Side::Master(master)) => master.terminal.lock().master_hung_up,
+        None => false,
+    }
+}
+
+/// `__tty_fasync`: `F_SETFL` turning `O_ASYNC` of a terminal's `file` on,
+/// with its registration, or off. Turning it on gives a file without an
+/// owner one: the foreground process group of the slave, or else the
+/// calling process, as `__f_setown` without `force`.
+pub(crate) fn set_async(
+    c: &Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    registration: Option<Registration>,
+) {
+    let Some(side) = side(file) else { return };
+    let terminal = side.terminal();
+    let which = if matches!(side, Side::Master(_)) {
+        MASTER
+    } else {
+        SLAVE
+    };
+    let foreground = {
+        let mut state = terminal.lock();
+        let list = &mut state.fasync[which];
+        list.retain(|(entry, _)| {
+            entry.strong_count() != 0 && !std::ptr::addr_eq(entry.as_ptr(), Arc::as_ptr(file))
+        });
+        let Some(registration) = registration else {
+            return;
+        };
+        list.insert(0, (Arc::downgrade(file), registration));
+        if which == SLAVE { state.pgrp } else { None }
+    };
+    let owner = c.processes.file_owner(file);
+    if owner.id == 0 {
+        let (kind, id) = match foreground {
+            Some(pgrp) => (OwnerKind::Group, pgrp),
+            None => (OwnerKind::Process, c.process.pid),
+        };
+        c.processes
+            .set_file_owner(file, FileOwner { kind, id, ..owner });
     }
 }
 
@@ -1496,6 +1729,10 @@ impl Master {
     fn read_once(&self, out: &mut [u8]) -> Result<usize, Errno> {
         let terminal = &self.terminal;
         let mut state = terminal.lock();
+        // `hung_up_tty_read`.
+        if state.master_hung_up {
+            return Ok(0);
+        }
         // In packet mode the events come first, a byte alone; data comes
         // after a 0 byte (`TIOCPKT_DATA`), as Linux's `n_tty_read`.
         if state.packet && state.pktstatus != 0 {
@@ -1511,12 +1748,19 @@ impl Master {
                 (0, out)
             };
             let n = rest.len().min(state.output.len());
+            // What the master's line discipline held, a buffer's worth of it.
+            let held = state.output.len().min(BUFFER);
             for (slot, byte) in rest.iter_mut().zip(state.output.drain(..n)) {
                 *slot = byte;
             }
             state.edge(SLAVE_OUT);
+            // `n_tty_check_unthrottle` of the master: a read that leaves
+            // little of that wakes the slave's writers.
+            if held.saturating_sub(n) as u64 <= UNTHROTTLE {
+                state.wakeup(SLAVE);
+            }
             drop(state);
-            terminal.hub.changed();
+            terminal.changed();
             return Ok(head + n);
         }
         if state.other_closed {
@@ -1529,6 +1773,9 @@ impl Master {
         let mut signals = Vec::new();
         let count = {
             let mut state = terminal.lock();
+            if state.master_hung_up {
+                return Err(EIO);
+            }
             let count = if state.master_flow.stopped {
                 0
             } else {
@@ -1539,7 +1786,7 @@ impl Master {
             count
         };
         if count > 0 {
-            terminal.hub.changed();
+            terminal.changed();
         }
         terminal.deliver(signals);
         if count == 0 && !bytes.is_empty() {
@@ -1596,7 +1843,7 @@ fn read_slave(c: &mut Context<'_>, slave: &Slave, out: &mut [u8]) -> Result<usiz
             (done, min, time)
         };
         if took {
-            terminal.hub.changed();
+            terminal.changed();
         }
         terminal.deliver(signals);
         if let Some(count) = done {
@@ -1645,7 +1892,7 @@ impl Slave {
             }
         };
         if result.as_ref().is_ok_and(|&n| n > 0) {
-            terminal.hub.changed();
+            terminal.changed();
         }
         terminal.deliver(signals);
         result
@@ -1659,7 +1906,7 @@ impl Slave {
             state.write_output(bytes)
         };
         if count > 0 {
-            self.terminal.hub.changed();
+            self.terminal.changed();
         }
         if count == 0 && !bytes.is_empty() {
             return Err(Errno::EAGAIN);
@@ -1677,6 +1924,9 @@ pub(crate) fn write(
 ) -> Option<Result<u64, Errno>> {
     let side = side(file)?;
     let terminal = Arc::clone(side.terminal());
+    if matches!(side, Side::Master(_)) && terminal.lock().master_hung_up {
+        return Some(Err(EIO));
+    }
     if let Side::Slave(slave) = side {
         let (hung_up, tostop) = {
             let state = terminal.lock();
@@ -1690,7 +1940,7 @@ pub(crate) fn write(
         }
     }
     let mut done = 0;
-    Some(loop {
+    let result = loop {
         let ticket = terminal.hub.token.value();
         let result = match side {
             Side::Master(master) => master.write_once(&bytes[done..]),
@@ -1716,7 +1966,21 @@ pub(crate) fn write(
         if let Err(e) = wait(c, ticket, None) {
             break if done > 0 { Ok(done as u64) } else { Err(e) };
         }
-    })
+    };
+    // `n_tty_write`: a write left short, with `O_ASYNC` descriptions,
+    // signals `POLL_OUT` when room comes (`TTY_DO_WRITE_WAKEUP`).
+    if done < bytes.len() {
+        let which = if matches!(side, Side::Master(_)) {
+            MASTER
+        } else {
+            SLAVE
+        };
+        let mut state = terminal.lock();
+        if !state.fasync[which].is_empty() {
+            state.write_wakeup[which] = true;
+        }
+    }
+    Some(result)
 }
 
 fn read_int(c: &Context<'_>, address: u64) -> Result<i32, Errno> {
@@ -1741,7 +2005,7 @@ pub(crate) fn ioctl(
     arg: u64,
 ) -> Option<Result<u64, Errno>> {
     let side = side(file)?;
-    let result = terminal_ioctl(c, &side, request as u32, arg);
+    let result = terminal_ioctl(c, file, &side, request as u32, arg);
     // A call job control stopped runs again, as Linux's ERESTARTSYS.
     if result == Err(EINTR) {
         c.process.restart = Some(16);
@@ -1751,6 +2015,7 @@ pub(crate) fn ioctl(
 
 fn terminal_ioctl(
     c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
     side: &Side<'_>,
     request: u32,
     arg: u64,
@@ -1798,12 +2063,16 @@ fn terminal_ioctl(
     const TIOCGPKT: u32 = 0x8004_5438;
     const TIOCGLCKTRMIOS: u32 = 0x5456;
     const TIOCSLCKTRMIOS: u32 = 0x5457;
+    const TIOCCONS: u32 = 0x541d;
+    const TIOCVHANGUP: u32 = 0x5437;
     let terminal = Arc::clone(side.terminal());
     let master = matches!(side, Side::Master(_));
-    // A hung-up slave answers only these (`hung_up_tty_ioctl`).
-    if let Side::Slave(slave) = side
-        && slave.hung_up(&terminal.lock())
-    {
+    // A hung-up file answers only these (`hung_up_tty_ioctl`).
+    let hung_up = match side {
+        Side::Slave(slave) => slave.hung_up(&terminal.lock()),
+        Side::Master(_) => terminal.lock().master_hung_up,
+    };
+    if hung_up {
         return Err(if request == TIOCSPGRP {
             Errno::ENOTTY
         } else {
@@ -1818,6 +2087,41 @@ fn terminal_ioctl(
     };
     let admin = c.process.credentials.may_administer();
     match request {
+        // `tty_vhangup` of this side.
+        TIOCVHANGUP => {
+            if !admin {
+                return Err(Errno::EPERM);
+            }
+            if master {
+                terminal.hang_up_master();
+            } else {
+                terminal.hang_up();
+            }
+            Ok(0)
+        }
+        // `tioccons`: the console's output goes to this slave, which must
+        // be open for writing, while no other terminal has it.
+        TIOCCONS => {
+            if master {
+                return Err(Errno::EINVAL);
+            }
+            if !admin {
+                return Err(Errno::EPERM);
+            }
+            if side.flags() & 3 == 0 {
+                return Err(Errno::EBADF);
+            }
+            let devpts = &c.files.devpts;
+            let mut redirect = devpts
+                .redirect
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if redirect.is_some() {
+                return Err(EBUSY);
+            }
+            *redirect = Some(Arc::clone(file));
+            Ok(0)
+        }
         TCGETS | TCGETS2 => {
             let bytes = terminal.lock().termios.encode(request == TCGETS2);
             write_bytes(c, arg, &bytes)
@@ -1854,7 +2158,7 @@ fn terminal_ioctl(
                 let termios = state.termios.decoded(&bytes, &state.locked_termios);
                 state.set_termios(termios);
             }
-            terminal.hub.changed();
+            terminal.changed();
             terminal.deliver(signals);
             Ok(0)
         }
@@ -2060,6 +2364,7 @@ fn terminal_ioctl(
                     1 if tco => {
                         if master {
                             state.master_flow = Flow::default();
+                            state.wakeup(MASTER);
                         } else {
                             state.flow.tco = false;
                             state.start();
@@ -2082,6 +2387,7 @@ fn terminal_ioctl(
                             } else {
                                 state.output.push_back(ch);
                                 state.edge(MASTER_IN);
+                                state.kill_fasync(MASTER, Reason::In);
                             }
                         }
                     }
@@ -2090,7 +2396,7 @@ fn terminal_ioctl(
                 state.edge(SLAVE_OUT);
                 state.edge(MASTER_OUT);
             }
-            terminal.hub.changed();
+            terminal.changed();
             terminal.deliver(signals);
             Ok(0)
         }
@@ -2125,7 +2431,7 @@ fn terminal_ioctl(
                     state.edge(edge);
                 }
             }
-            terminal.hub.changed();
+            terminal.changed();
             Ok(0)
         }
         FIONREAD => {
@@ -2156,17 +2462,32 @@ fn terminal_ioctl(
                 if master {
                     state.output.push_back(byte[0]);
                     state.edge(MASTER_IN);
+                    state.kill_fasync(MASTER, Reason::In);
                 } else {
                     state.receive_char(byte[0], &mut signals);
+                    state.received();
                     state.flush_echoes();
                 }
             }
-            terminal.hub.changed();
+            terminal.changed();
             terminal.deliver(signals);
             Ok(0)
         }
         _ => Err(Errno::ENOTTY),
     }
+}
+
+/// `vhangup`: with CAP_SYS_TTY_CONFIG (else `EPERM`), the calling process's
+/// controlling terminal hangs up, as `TIOCVHANGUP` of its slave
+/// (`tty_vhangup_self`); without one it does nothing.
+pub(crate) fn sys_vhangup(c: &mut Context<'_>, _: [u64; 6]) -> crate::syscalls::Outcome {
+    if !c.process.credentials.may_configure_terminals() {
+        return crate::syscalls::err(Errno::EPERM);
+    }
+    if let Some(terminal) = c.processes.terminal(c.process.pid) {
+        terminal.hang_up();
+    }
+    crate::syscalls::ok(0)
 }
 
 /// `tty_nr` and `tpgid` of `/proc/<pid>/stat` for a process controlled by
@@ -2206,6 +2527,10 @@ impl FileHandle for Master {
     /// slave description has closed.
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         let state = self.terminal.lock();
+        if state.master_hung_up {
+            let edges = (state.edges[MASTER_IN], state.edges[MASTER_OUT]);
+            return Ok((IN | OUT | 0x8 | 0x10 | 0x40 | 0x100, edges.0, edges.1));
+        }
         let mut mask = 0;
         if !state.output.is_empty() {
             mask |= IN | 0x40;
@@ -2482,6 +2807,79 @@ mod tests {
         state.pktstatus = 0;
         state.set_termios(termios);
         assert_eq!(state.pktstatus, TIOCPKT_IOCTL);
+    }
+
+    /// A description in `side`'s `fasync` list, which the test keeps alive.
+    fn listen(state: &mut State, side: usize) -> Arc<dyn FileHandle> {
+        let [file, _] = crate::sockets::PipeEnd::pair(0, Arc::default()).unwrap();
+        let file: Arc<dyn FileHandle> = file;
+        let registration = Registration {
+            processes: Weak::new(),
+            fd: 3,
+        };
+        state.fasync[side].push((Arc::downgrade(&file), registration));
+        file
+    }
+
+    #[test]
+    fn async_input_signals_lines_or_bytes() {
+        let mut state = state();
+        // Nothing listens: nothing is owed.
+        type_in(&mut state, b"a\n");
+        assert!(state.io.is_empty());
+        state.reset();
+        let _slave = listen(&mut state, SLAVE);
+        let _master = listen(&mut state, MASTER);
+        // Canonical: only the end of a line; its echo reaches the master.
+        type_in(&mut state, b"ab");
+        assert_eq!(state.io, [(MASTER, Reason::In)]);
+        state.io.clear();
+        type_in(&mut state, b"\n\x04");
+        assert_eq!(state.io, [(SLAVE, Reason::In), (MASTER, Reason::In)]);
+        state.io.clear();
+        // Raw: any byte, and no echo.
+        let mut termios = state.termios;
+        termios.lflag = 0;
+        state.set_termios(termios);
+        type_in(&mut state, b"xy");
+        assert_eq!(state.io, [(SLAVE, Reason::In)]);
+        state.io.clear();
+        // The line discipline gone, input waits.
+        state.ldisc_down = true;
+        type_in(&mut state, b"z");
+        assert!(state.io.is_empty());
+        assert_eq!(state.pending.len(), 1);
+    }
+
+    #[test]
+    fn room_signals_only_a_short_writer() {
+        let mut state = state();
+        let _master = listen(&mut state, MASTER);
+        let _slave = listen(&mut state, SLAVE);
+        let mut termios = state.termios;
+        termios.lflag = 0;
+        state.set_termios(termios);
+        type_in(&mut state, &[b'q'; 400]);
+        state.io.clear();
+        let mut signals = Vec::new();
+        state.after_read(&mut signals);
+        assert!(state.io.is_empty());
+        // A short write, then a read that leaves little: one POLL_OUT.
+        state.write_wakeup[MASTER] = true;
+        let mut out = [0; 200];
+        state.read_raw(&mut out);
+        state.after_read(&mut signals);
+        assert!(state.io.is_empty(), "200 bytes left are over the threshold");
+        state.read_raw(&mut out);
+        state.after_read(&mut signals);
+        assert_eq!(state.io, [(MASTER, Reason::Out)]);
+        assert!(!state.write_wakeup[MASTER]);
+        state.io.clear();
+        // The slave's start is room for its writers.
+        state.write_wakeup[SLAVE] = true;
+        state.stop();
+        state.start();
+        assert_eq!(state.io, [(SLAVE, Reason::Out)]);
     }
 
     #[test]

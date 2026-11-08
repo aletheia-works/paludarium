@@ -53,7 +53,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、後述の疑似端末のリクエスト） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
@@ -320,9 +320,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - `F_SETOWN_EX` では、1 つのスレッドも
 
   持ち主がいなければ `ESRCH` です。`F_GETOWN` と `F_GETOWN_EX` で読み出し、`F_SETSIG` で
-  送るシグナルを選びます。`O_ASYNC` を持てるのはパイプとソケット、それにパイプ、ソケット、
-  端末のどれかであるときのホストの標準のストリームだけで、ほかのファイルでは
-  `F_SETFL` が落とし、`FIOASYNC` で付けようとすると `ENOTTY` です。`O_ASYNC` を付けたパイプやソケットは、持ち主にカーネルから
+  送るシグナルを選びます。`O_ASYNC` を持てるのはパイプ、ソケット、疑似端末、それにパイプ、
+  ソケット、端末のどれかであるときのホストの標準のストリームだけで、ほかのファイルでは
+  `F_SETFL` が落とし、`FIOASYNC` で付けようとすると `ENOTTY` です。`O_ASYNC` を付けた
+  パイプ、ソケット、疑似端末（疑似端末は後述のとおり）は、持ち主にカーネルから
   `SIGIO` を送ります。`F_SETSIG` があれば代わりにそのシグナルを送り、`si_code`
   （`POLL_IN`、`POLL_OUT`、`POLL_ERR`、`POLL_PRI`、`POLL_HUP`）、`si_band`、`si_fd`（`O_ASYNC` を
   付けたディスクリプタ）を付けます。
@@ -780,6 +781,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `TIOCGEXCL`、`TIOCGETD` と `TIOCSETD`（N_TTY だけ）、`TIOCGDEV`、`TIOCSIG` は
     Linux と同じに動きます。`TIOCSTI` も `dev.tty.legacy_tiocsti` が無効のときと同じで、
     入力を押し込めるのは `CAP_SYS_ADMIN` だけで、ほかは `EIO` です。
+  - `O_ASYNC`（後述のシグナル駆動の入出力）を付けると、スレーブはカノニカル
+    モードでは 1 行が読めるようになったとき、それ以外では 1 バイトが入ったときに
+    `POLL_IN` を送り、マスターはスレーブの出力（やエコー）が届いたときに送ります。
+    書き切れなかった書き込みは、相手の側がバッファを 128 バイトまで読み減らすか、
+    出力が再開すると `POLL_OUT` を送ります。パケットのイベントでは送りません。
+    `O_ASYNC` を付けると、持ち主のないファイルには持ち主が決まります。スレーブの
+    フォアグラウンドのプロセスグループ、なければ呼んだプロセスです。
   - 制御端末のないセッションリーダーは、`TIOCSCTTY` か、スレーブを `O_NOCTTY`
     なしに読み込み用に開くと、それを制御端末にします。子はそれを継ぎ、`setsid` で
     なくなります。`/dev/tty` は制御端末を開きます（なければ `ENXIO`。エミュレーターの
@@ -796,6 +804,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     リクエストは `EIO`）、名前も消えます。それが制御していたセッションは制御端末を
     失い、セッションリーダーに `SIGHUP` と `SIGCONT` が届きます。セッションリーダーが
     終わると、その端末のフォアグラウンドのグループに `SIGHUP` が届きます。
+  - `TIOCVHANGUP`（`CAP_SYS_ADMIN` が要り、なければ `EPERM`）は、マスターが開いたまま
+    スレーブを、マスターが閉じたときと同じに切断します。`vhangup`
+    （`CAP_SYS_TTY_CONFIG`）は呼んだプロセスの制御端末を切断します。そのとき開いている
+    スレーブの記述は切断されて `O_ASYNC` を失い、もう付けられません（`ENOTTY`）。
+    入力は捨てられ、`termios` は新しいスレーブのものに戻り、行規則はスレーブがまた
+    開かれるまでなくなります。その間にマスターが書いたものはエコーされずに待ち、
+    開いた後のマスターの次の書き込みで一緒に届きます。マスターへの `TIOCVHANGUP` は
+    マスターのファイルだけを切断し、そのファイルは何も読めなくなりますが、スレーブは
+    書き続けられます。`TIOCCONS`（`CAP_SYS_ADMIN` が要ります。マスターなら `EINVAL`、
+    書き込み用に開いていないスレーブなら `EBADF`）は、コンソールの出力をスレーブが
+    受け取るようにし、そのスレーブが切断されるまで開いたまま持ちます。ほかの端末が
+    持っている間は `EBUSY` です。
 - CPU 時間は、ホストが測れるところ（Linux・macOS・Windows）では、ゲストのスレッドの
   最初のシステムコールからの、ホストのスレッドの CPU 時間（ユーザーとシステムの合計）
   です。WebAssembly などそれ以外では、代わりに経過時間を数えます。
@@ -826,7 +846,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `SA_RESTART` なら再開します）。`poll`・`select`・`epoll` は、呼んだスレッドに
   マスクのシグナルが保留されている間、Linux と同じく読めると見ます。そのため
   スレッド自身へのシグナルはそのスレッドにだけ見え、fork した子が受け継いだ
-  ファイルは子のシグナルを読みます。signalfd のディスクリプタに `signalfd` を呼ぶと
+  ファイルは子のシグナルを読みます。エッジトリガーの `epoll` は、ファイルのシグナルが
+  保留されている間、スレッドかそのプロセスにシグナルが積まれるたびにエッジを受けます。
+  Linux の `signalfd_notify` が、そのたびにファイルを起こすのと同じです。同じ番号が
+  待っているリアルタイムシグナルも数え、すでに保留されている標準のシグナルや、
+  ブロックされずに無視されるシグナルは数えません。マスクが変わるのもエッジです。
+  signalfd のディスクリプタに `signalfd` を呼ぶと
   マスクが変わります（ほかのファイルなら `EINVAL`）。`SIGKILL` と `SIGSTOP` は
   マスクに入りません。書き込みは `EINVAL`、`pread` と `pwrite` は `ESPIPE`、`lseek` は
   Linux の `noop_llseek` と同じく 0 を返します。

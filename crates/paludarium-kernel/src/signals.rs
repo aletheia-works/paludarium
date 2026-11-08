@@ -236,6 +236,23 @@ pub(crate) fn queue(process: &mut ThreadState, signal: PendingSignal) {
         return;
     }
     process.pending.push(signal);
+    if wakes(process, &signal) {
+        process.arrivals = process.arrivals.wrapping_add(1);
+    }
+}
+/// Whether Linux would queue `signal` for `process`, and so wake a signal
+/// file (`signalfd_notify`): not when it is unblocked and ignored, which
+/// `prepare_signal` drops as it is sent.
+pub(crate) fn wakes(process: &ThreadState, signal: &PendingSignal) -> bool {
+    let blocked = process.signal_mask & (1u64 << (signal.number - 1)) != 0;
+    let action = process
+        .signal_actions
+        .get(&signal.number)
+        .copied()
+        .unwrap_or_default();
+    let ignored =
+        action.handler == 1 || action.handler == 0 && matches!(signal.number, 17 | 18 | 23 | 28);
+    signal.synchronous || blocked || !ignored
 }
 
 /// A wait that `restart_syscall` resumes after a stop, with its absolute

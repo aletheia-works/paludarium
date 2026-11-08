@@ -224,6 +224,7 @@ impl SyscallTable {
         ];
         handlers.extend(ids);
         handlers.insert(290, crate::events::dispatch);
+        handlers.insert(153, crate::pty::sys_vhangup);
         handlers.insert(282, crate::signalfd::sys_signalfd);
         handlers.insert(289, crate::signalfd::sys_signalfd4);
         // Tokio's current Linux std uses GRND_INSECURE to seed its scheduler;
@@ -1880,7 +1881,7 @@ fn sys_rt_sigpending(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         .process
         .pending
         .iter()
-        .fold(c.group.process_pending_set(), |set, signal| {
+        .fold(c.group.process_pending_set().0, |set, signal| {
             set | 1 << (signal.number - 1)
         })
         & c.process.signal_mask;

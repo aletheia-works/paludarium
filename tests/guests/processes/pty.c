@@ -609,6 +609,7 @@ static int case_session(void) {
         TRY("tcsetpgrp missing", tcsetpgrp(s, bad));
         TRY("tcsetpgrp other session", tcsetpgrp(s, getppid()));
         TRY("tcsetpgrp negative", ioctl(s, TIOCSPGRP, &(pid_t){-1}));
+        TRY("tcsetpgrp zero", ioctl(s, TIOCSPGRP, &(pid_t){0}));
         /* A job in the foreground. */
         int ready[2];
         pipe(ready);

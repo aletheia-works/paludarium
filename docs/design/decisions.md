@@ -31,13 +31,19 @@ cache of the private pages used last (a software TLB of 64 entries) lets the
 next access to one of them skip the page table, still checking its
 protection; it is emptied whenever a mapping or a page entry may change.
 
+Each guest thread has a TLB of its own for its loads and instruction fetches,
+which take no lock: threads that only read their memory then do not wait for
+each other. The TLB is valid while the address space keeps the epoch it was
+filled at. The epoch moves on wherever the TLB used to be emptied, and every
+load compares it. Writes still take the address space's lock, and so do
+locked instructions, which are full fences.
+
 A guest's threads see each other's memory in the order x86 gives (TSO): a
 thread's loads and stores stay in order, except that a load may pass an earlier
-store. The address space's lock orders every access today. The page contents
-are also read with acquire and written with release ordering, which keeps that
-order without the lock on an Arm host too, so that accesses can later go
-without it. A write to an executable page moves the code generation on after
-its bytes, so whoever sees the new generation sees the new code.
+store. The page contents are read with acquire and written with release
+ordering, which keeps that order on an Arm host too, without the lock. A write
+to an executable page moves the code generation on after its bytes, so whoever
+sees the new generation sees the new code.
 
 ## Owning the waiting primitives
 

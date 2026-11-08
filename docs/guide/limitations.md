@@ -142,10 +142,10 @@ verified.
     carries on without it. Its promise is that a thread's critical section is
     abandoned if it is preempted, which emulated threads running truly in
     parallel cannot keep, so registering would let per-CPU data break.
-  - `landlock_create_ruleset`, `pkey_alloc` and `io_uring_setup` are too, as on
-    a Linux built without them. Programs check for that and carry on. Saying
-    yes would be wrong without the rest: Landlock's rules would not be enforced,
-    and protection keys need the CPU feature, which `CPUID` does not report.
+  - `pkey_alloc` and `io_uring_setup` are too, as on a Linux built without
+    them. Programs check for that and carry on. Saying yes would be wrong
+    without the rest: protection keys need the CPU feature, which `CPUID` does
+    not report, and io_uring's rings would do no work.
   - `get_robust_list` of another process is `ESRCH`, where Linux gives it to a
     caller that may trace that process.
   - `mincore` counts a page of a file as in memory whenever it lies within the
@@ -171,6 +171,17 @@ verified.
   `chown` gives a file, and those of a file a guest makes there, are kept
   only while the emulator runs, not on the host file. The next run sees
   every file there as root's again.
+- **Landlock**: only ABI version 3 is there, so `LANDLOCK_CREATE_RULESET_VERSION`
+  gives 3 where a recent Linux gives more: no network rules
+  (`LANDLOCK_RULE_NET_PORT`), no `LANDLOCK_ACCESS_FS_IOCTL_DEV`, no scopes, no
+  `landlock_restrict_self` flags and no errata query (`EINVAL`), and nothing
+  is logged. A rename's Landlock check comes after its permission checks,
+  where Linux's comes before them, which shows only when both refuse. A rule
+  on a file under `/proc` does not count for `execve`. An open checks the
+  file its path reaches before it opens it (and the file it made after), so
+  another thread renaming the name in between can make the two differ. There
+  is no `mount`, `umount2` or `pivot_root` (`ENOSYS`), which Linux refuses a
+  thread in a domain (`EPERM`).
 - **Credentials**: the IDs and capabilities a thread takes are checked on
   files, signals, resource limits, priorities, socket credentials and core
   files but nowhere else yet. `F_SETOWN` records no sender's credentials, so

@@ -2206,6 +2206,11 @@ fn terminal_ioctl(
             if pgrp < 0 {
                 return Err(Errno::EINVAL);
             }
+            // No process has ID 0 (Linux's find_vpid(0)), though a group
+            // outside the emulator is shown as 0.
+            if pgrp == 0 {
+                return Err(ESRCH);
+            }
             let pgrp = pgrp.cast_unsigned();
             match c.processes.session_of_group(pgrp) {
                 None => Err(ESRCH),

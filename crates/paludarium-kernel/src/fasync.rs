@@ -201,7 +201,7 @@ pub(crate) fn fcntl(
             who => take_owner(c, file, OwnerKind::Process, who as u32),
         },
         9 => {
-            let id = current.id as i32;
+            let id = shown_id(c, current) as i32;
             let id = if current.kind == OwnerKind::Group {
                 -id
             } else {
@@ -245,13 +245,26 @@ pub(crate) fn fcntl(
         }
         16 => {
             let kind = current.kind as i32;
-            let bytes = [kind.to_le_bytes(), current.id.to_le_bytes()].concat();
+            let id = shown_id(c, current);
+            let bytes = [kind.to_le_bytes(), id.to_le_bytes()].concat();
             c.mem
                 .write(GuestAddr(arg), &bytes)
                 .map_err(|_| Errno::EFAULT)?;
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
+    }
+}
+
+/// The owner's ID as `F_GETOWN` and `F_GETOWN_EX` read it back: 0 while
+/// nothing it names is there, as Linux's `f_getown` gives an ID only while
+/// a task has it in the owner's role (`pid_task`), such as a group's ID
+/// when no process is in that group.
+fn shown_id(c: &Context<'_>, owner: FileOwner) -> u32 {
+    if owner.id != 0 && c.processes.owner_present(owner) {
+        owner.id
+    } else {
+        0
     }
 }
 

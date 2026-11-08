@@ -61,6 +61,7 @@ kernel.
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, and the pseudo-terminals' requests below) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
@@ -210,6 +211,15 @@ kernel.
   file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
+- An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
+  reading and writing it, `lseek`, `flock`, `getdents64`, `sendfile`,
+  `copy_file_range`, `fsync`, `fdatasync`, `fadvise64`, `ftruncate`,
+  `fallocate`, `mmap`, `ioctl`, the `f*xattr` calls, `epoll_ctl` (as the
+  epoll descriptor or the target), `epoll_wait` and `fcntl`
+  (but for `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_DUPFD_QUERY`, `F_GETFD`,
+  `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
+  `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
+  take it, and it is a directory for the `*at` calls.
 - `fcntl`'s byte-range locks, as Linux's `fs/locks.c` keeps them: record
   locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a process owns, and open
   file description locks (`F_OFD_SETLK`, `F_OFD_SETLKW`, `F_OFD_GETLK`),
@@ -354,16 +364,18 @@ kernel.
   - a process or, negative, a process group;
   - with `F_SETOWN_EX`, also a single thread.
 
-  `ESRCH` when the owner does not exist. `F_GETOWN` and `F_GETOWN_EX` read
-  it back, and `F_SETSIG` picks the signal. Only pipes, sockets and
-  pseudo-terminals, and the host's standard streams when they are a pipe, a
-  socket or a terminal, keep `O_ASYNC` (`F_SETFL` drops it on other files,
-  and `FIOASYNC` setting it there is `ENOTTY`). With it, a pipe, socket or
-  pseudo-terminal (as the pseudo-terminals below say) sends its owner
-  `SIGIO` from the kernel. With `F_SETSIG`, it sends that
+  `ESRCH` when no thread, process, group or session has the ID, whichever
+  kind of owner it names, as Linux finds the ID. `F_GETOWN` and
+  `F_GETOWN_EX` read it back, as 0 while nothing is there in that role
+  (such as a group no process is in), and `F_SETSIG` picks the signal.
+  Only pipes, sockets and pseudo-terminals, and the host's standard streams
+  when they are a pipe, a socket or a terminal, keep `O_ASYNC` (`F_SETFL`
+  drops it on other files, and `FIOASYNC` setting it there is `ENOTTY`). With
+  it, a pipe, socket or pseudo-terminal (as the pseudo-terminals below say)
+  sends its owner `SIGIO` from the kernel. With `F_SETSIG`, it sends that
   signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_ERR`,
-  `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set through as
-  `si_fd`.
+  `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set
+  through as `si_fd`.
   - **Pipes.** Every write signals the reader as it ends, even one that
     finds the pipe full, and also before each wait. Every read signals the
     writer as it ends, with data or not. The close of either end signals
@@ -1130,14 +1142,16 @@ kernel.
     dumped, as Linux reports a core once it has started to write it.
 
   Process groups and sessions are kept the same way, and `wait4` and
-  `waitid` can wait for a group. The first process's session started outside
-  the emulator, so `getsid` reports it as 0, as Linux reports an ID outside a
-  PID namespace. `setsid` fails with `EPERM` in a process whose PID names a
-  group, and makes any other process the leader of a new session and group.
-  `setpgid` checks the session as Linux does: a session leader, a child in
-  another session and a group in another session give `EPERM`, and a child
-  that has run `execve` gives `EACCES`. A group exists while any member is
-  left, an exited child not yet reaped included.
+  `waitid` can wait for a group. The first process is like the first of a
+  PID namespace: its group and session started outside the emulator, so
+  `getpgrp` and `getsid` report them as 0, as Linux reports an ID outside a
+  PID namespace, and it may start a session of its own. `setsid` fails
+  with `EPERM` in a process whose PID names a group, and makes any other
+  process the leader of a new session and group. `setpgid` checks the session
+  as Linux does: a session leader, a child in another session and a group in
+  another session give `EPERM`, and a child that has run `execve` gives
+  `EACCES`. A group exists while any member is left, an exited child not yet
+  reaped included.
 - Nice values are kept per thread, as on Linux: a new thread or process
   starts with its creator's, and `execve` keeps the caller's. `getpriority`
   reports the highest priority among the threads it finds, as `20 - nice`,
@@ -1442,6 +1456,20 @@ one only with an `--allow-net`.
   missing), in memory and in a host directory mounted on Linux or macOS.
   `RENAME_WHITEOUT` needs `CAP_MKNOD` (`EPERM`), and then gives `EINVAL`, as
   on a Linux filesystem without whiteouts.
+- Landlock restricts a thread's access to file hierarchies, at ABI version 3:
+  `landlock_create_ruleset` (and its version query), `landlock_add_rule` with
+  `LANDLOCK_RULE_PATH_BENEATH`, and `landlock_restrict_self` (which needs
+  `no_new_privs` or `CAP_SYS_ADMIN`), up to 16 layers. Each layer allows a
+  right it handles only beneath the files and directories its rules name, by
+  device and inode, so a rule follows a renamed directory. Opening a file
+  checks `LANDLOCK_ACCESS_FS_READ_FILE`, `WRITE_FILE`, `READ_DIR` and, for
+  `execve` and its interpreters, `EXECUTE`; making a name checks its
+  directory for the `MAKE_*` right of its type, removing one `REMOVE_FILE` or
+  `REMOVE_DIR`, and truncating `TRUNCATE`, which an open file description
+  keeps from its open. A link or rename to another directory needs `REFER`
+  and must not give the file more rights than it had (`EXDEV`). Threads,
+  processes and `execve` keep the domain; `O_PATH`, `stat` and descriptors
+  opened before are not checked.
 - Files can be placed before the start.
 - A host directory can be mounted when you ask for it (`--mount` on the
   command line, `Config::mounts` in Rust). Every operation stays inside that

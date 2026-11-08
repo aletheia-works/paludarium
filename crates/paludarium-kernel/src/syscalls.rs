@@ -250,6 +250,21 @@ impl SyscallTable {
         // Tokio's current Linux std uses GRND_INSECURE to seed its scheduler;
         // the Host random boundary supplies secure bytes without OS passthrough.
         handlers.insert(318, sys_getrandom);
+        handlers.insert(444, |c, a| {
+            Outcome::Return(
+                crate::landlock::sys_create_ruleset(c, a).unwrap_or_else(Errno::to_syscall_return),
+            )
+        });
+        handlers.insert(445, |c, a| {
+            Outcome::Return(
+                crate::landlock::sys_add_rule(c, a).unwrap_or_else(Errno::to_syscall_return),
+            )
+        });
+        handlers.insert(446, |c, a| {
+            Outcome::Return(
+                crate::landlock::sys_restrict_self(c, a).unwrap_or_else(Errno::to_syscall_return),
+            )
+        });
         for number in [213, 233, 232, 281, 291] {
             handlers.insert(number, crate::epoll::dispatch);
         }
@@ -1320,7 +1335,17 @@ fn poll_once(c: &mut Context<'_>, fds: u64, nfds: u64) -> Result<u64, Errno> {
         c.mem.read(at, &mut entry).map_err(|_| Errno::EFAULT)?;
         let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
         let events = u16::from_le_bytes([entry[4], entry[5]]);
-        let revents = revents(c, fd, events);
+        // `poll` takes the descriptor as Linux's `fdget` does, which refuses
+        // an `O_PATH` one (POLLNVAL); `select` finds it open, and ready.
+        let path_only = fd >= 0
+            && c.files
+                .descriptor(fd as u64)
+                .is_ok_and(|d| d.file.flags() & O_PATH != 0);
+        let revents = if path_only {
+            POLLNVAL
+        } else {
+            revents(c, fd, events)
+        };
         c.mem
             .write(at.wrapping_add(6), &revents.to_le_bytes())
             .map_err(|_| Errno::EFAULT)?;

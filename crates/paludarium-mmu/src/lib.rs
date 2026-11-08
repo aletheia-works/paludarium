@@ -765,7 +765,9 @@ struct TlbEntry {
 /// The pages the latest accesses used, so that the next ones skip the page
 /// table, the mappings and the locks of the directory. It is emptied before
 /// anything can change a page entry or a mapping: when the directory is
-/// locked for writing, and whenever the space is borrowed mutably.
+/// locked for writing, and whenever the space is borrowed mutably. A space
+/// has one for its writes, under its lock, and each host thread has one for
+/// its loads and fetches, without a lock ([`ThreadTlb`]).
 struct Tlb {
     entries: [Option<TlbEntry>; TLB_ENTRIES],
     /// Which entries are set, so that emptying touches only those.
@@ -808,6 +810,36 @@ impl Tlb {
     }
 }
 
+/// The [`Tlb`] of one host thread, which runs one guest thread, for the
+/// loads and fetches that take no lock. Its entries are those of the space
+/// whose epoch ([`CodeCounters::epoch`]) it holds, and only while that space
+/// keeps the epoch: each access compares the two, and empties the TLB when
+/// they differ. An entry holds its frame, so a frame stays as long as an
+/// entry of another thread shows it, until that thread's next access.
+///
+/// An access that read the epoch before another thread changed it may still
+/// use the page it showed, as an x86 access already under way when another
+/// processor changes the mapping does. But anything that happens after the
+/// change and that this thread sees, the epoch's `Acquire` makes this thread
+/// see the new epoch with.
+struct ThreadTlb {
+    epoch: u64,
+    tlb: Tlb,
+}
+
+thread_local! {
+    static THREAD_TLB: RefCell<ThreadTlb> = RefCell::new(ThreadTlb {
+        // No space has epoch 0 (`NEXT_EPOCH` starts at 1).
+        epoch: 0,
+        tlb: Tlb::default(),
+    });
+}
+
+/// The next epoch of any space: the values are unique in the process, so
+/// that a space made where a dropped one was never takes the entries a
+/// thread's TLB holds for that one.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
 static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SHARED_PAGES_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -822,7 +854,7 @@ static NEXT_CODE_GENERATION: AtomicU64 = AtomicU64::new(0);
 const CODE_GENERATIONS_PER_SPACE: u64 = 1 << 40;
 
 /// The counters of a space that [`AddressSpace::code_generation_cached`]
-/// reads without the locks.
+/// and the loads through a [`ThreadTlb`] read without the locks.
 struct CodeCounters {
     /// Bumped whenever executable memory or the mappings change, and by
     /// every store to the shared mappings and page caches the space may run
@@ -836,6 +868,9 @@ struct CodeCounters {
     /// shared mapping and page cache it may run code from, or 0 before it
     /// first did.
     watched: AtomicU64,
+    /// Set to a new value of [`NEXT_EPOCH`] whenever the space's [`Tlb`] is
+    /// emptied, which empties the [`ThreadTlb`]s at their next access.
+    epoch: AtomicU64,
 }
 
 impl Default for CodeCounters {
@@ -845,7 +880,25 @@ impl Default for CodeCounters {
             generation: AtomicU64::new(start),
             layout: AtomicU64::new(0),
             watched: AtomicU64::new(0),
+            epoch: AtomicU64::new(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)),
         }
+    }
+}
+
+impl CodeCounters {
+    /// Moves the epoch on, before a page entry or a mapping changes. This
+    /// thread's own TLB is emptied at once, so that the frames it holds go
+    /// now; the other threads' go at their next access.
+    fn bump_epoch(&self) {
+        self.epoch.store(
+            NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
+            Ordering::Release,
+        );
+        THREAD_TLB.with(|cell| {
+            if let Ok(mut thread) = cell.try_borrow_mut() {
+                thread.tlb.flush();
+            }
+        });
     }
 }
 
@@ -1404,10 +1457,12 @@ impl AddressSpaceData {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The directory, locked for writing: the [`Tlb`] is emptied first, as
-    /// the entries it copies may change.
+    /// The directory, locked for writing: the [`Tlb`] is emptied first, and
+    /// the epoch moved on for the [`ThreadTlb`]s, as the entries they copy
+    /// may change.
     fn write_directory(&self) -> RwLockWriteGuard<'_, Directory> {
         self.tlb.borrow_mut().flush();
+        self.code.bump_epoch();
         self.directory
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1474,9 +1529,10 @@ impl AddressSpaceData {
         Ok(())
     }
 
-    /// Remembers the page at `page` in the [`Tlb`] when an access to it
-    /// needs only its protection checked: it is populated, and neither
-    /// shared nor of a file mapping, whose file may end before it.
+    /// Remembers the page at `page` in the [`Tlb`], and in this thread's
+    /// [`ThreadTlb`], when an access to it needs only its protection
+    /// checked: it is populated, and neither shared nor of a file mapping,
+    /// whose file may end before it.
     fn remember(&self, directory: &Directory, page: u64) {
         let Some(p) = lookup(directory, page) else {
             return;
@@ -1490,6 +1546,23 @@ impl AddressSpaceData {
             frame: p.frame.clone(),
             cow: p.cow,
         });
+        // The lock is held, so the epoch is the one the entry is valid at.
+        let epoch = self.code.epoch.load(Ordering::Acquire);
+        THREAD_TLB.with(|cell| {
+            let Ok(mut thread) = cell.try_borrow_mut() else {
+                return;
+            };
+            if thread.epoch != epoch {
+                thread.tlb.flush();
+                thread.epoch = epoch;
+            }
+            thread.tlb.insert(TlbEntry {
+                page,
+                prot: p.prot,
+                frame: p.frame.clone(),
+                cow: p.cow,
+            });
+        });
     }
 
     /// The page of `[addr, addr+len)` when the access lies inside one page;
@@ -1497,24 +1570,6 @@ impl AddressSpaceData {
     fn single_page(addr: GuestAddr, len: usize) -> Option<u64> {
         let offset = page_offset(addr.0);
         (len > 0 && offset + len <= PAGE_BYTES).then(|| addr.0 - offset as u64)
-    }
-
-    /// Reads `buf` through the [`Tlb`]; `false` when it does not hold the
-    /// page or the access is not permitted there, which then takes the
-    /// page table's path, with its faults.
-    fn read_cached(&self, addr: GuestAddr, buf: &mut [u8], access: Access) -> bool {
-        let Some(page) = Self::single_page(addr, buf.len()) else {
-            return false;
-        };
-        let tlb = self.tlb.borrow();
-        let Some(entry) = tlb.get(page).filter(|e| access.permitted(e.prot)) else {
-            return false;
-        };
-        match entry.frame.get() {
-            Some(frame) => frame.read(page_offset(addr.0), buf),
-            None => buf.fill(0),
-        }
-        true
     }
 
     /// Writes `buf` through the [`Tlb`] into a page that has had its first
@@ -1541,25 +1596,6 @@ impl AddressSpaceData {
             self.code.generation.fetch_add(1, Ordering::Release);
         }
         true
-    }
-
-    /// [`Self::read_cached`] of `size` bytes, 1 to 8, that lie in one word.
-    #[inline]
-    fn read_value_cached(&self, addr: GuestAddr, size: usize) -> Option<u64> {
-        let offset = page_offset(addr.0);
-        let within = offset % WORD_BYTES;
-        if size == 0 || within + size > WORD_BYTES {
-            return None;
-        }
-        let tlb = self.tlb.borrow();
-        let entry = tlb
-            .get(addr.0 - offset as u64)
-            .filter(|e| e.prot.allows_read())?;
-        let Some(frame) = entry.frame.get() else {
-            return Some(0);
-        };
-        let word = frame.words[offset / WORD_BYTES].load(Ordering::Acquire);
-        Some(word >> (8 * within) & value_mask(size))
     }
 
     /// [`Self::write_cached`] of `size` bytes, 1 to 8, that lie in one word.
@@ -1613,9 +1649,9 @@ impl AddressSpaceData {
     }
 
     fn read_with(&self, addr: GuestAddr, buf: &mut [u8], access: Access) -> Result<(), Fault> {
-        if access != Access::Dump && self.read_cached(addr, buf, access) {
-            return Ok(());
-        }
+        // Not through the space's `Tlb`, which holds the pages of every
+        // thread's writes: `remember` gives the page to this thread's
+        // `ThreadTlb` as well, for its next loads without the lock.
         let ready = |directory: &Directory, page: u64| {
             lookup(directory, page).is_some_and(|p| !self.may_be_truncated(page, p))
         };
@@ -2500,8 +2536,9 @@ pub struct AtomicResult {
     pub exchanged: bool,
 }
 
-/// A shared address space. Every memory and mapping operation takes the
-/// space's lock, and all but an access through the TLB also take the
+/// A shared address space. A load or a fetch from a page this thread's TLB
+/// holds takes no lock. Every other memory and mapping operation takes the
+/// space's lock, and all but a write through the space's TLB also take the
 /// session's serialization lock. The private data implementation never calls
 /// back through this public wrapper (no reentry).
 pub struct AddressSpace {
@@ -2631,11 +2668,13 @@ impl std::ops::Deref for AddressSpaceGuard<'_> {
     }
 }
 impl std::ops::DerefMut for AddressSpaceGuard<'_> {
-    /// Empties the [`Tlb`] first, and moves the layout on
+    /// Empties the [`Tlb`] first (and the [`ThreadTlb`]s, by the epoch),
+    /// and moves the layout on
     /// ([`CodeCounters`]): a mutable borrow may change the mappings, the
     /// page entries the TLB copies, and the shared mappings and page caches.
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.data.tlb.get_mut().flush();
+        self.data.code.bump_epoch();
         self.data.code.layout.fetch_add(1, Ordering::Release);
         &mut self.data
     }
@@ -2671,8 +2710,8 @@ impl AddressSpace {
             membarrier: AtomicU32::new(0),
         }
     }
-    /// The space's data alone, without the session's serialization, for an
-    /// access through the [`Tlb`]. It holds only pages no other space can
+    /// The space's data alone, without the session's serialization, for a
+    /// write through the [`Tlb`]. It holds only pages no other space can
     /// write: neither shared nor of a file, and a frame `fork` shares stays
     /// as it is while the entry's own reference keeps its count above one.
     /// So only the threads of this space can be at them, which this lock
@@ -2924,10 +2963,43 @@ impl AddressSpace {
         self.locked().set_mmap_top(top);
     }
     pub fn read(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), Fault> {
-        if self.data_locked().read_cached(addr, buf, Access::Read) {
+        if self.read_unlocked(addr, buf, Access::Read) {
             return Ok(());
         }
         self.locked().read(addr, buf)
+    }
+    /// Runs `f` on this thread's [`ThreadTlb`] if it holds this space's
+    /// pages; `None` otherwise, which empties it for the locked path to fill.
+    #[inline]
+    fn with_thread_tlb<T>(&self, f: impl FnOnce(&Tlb) -> Option<T>) -> Option<T> {
+        let epoch = self.code.epoch.load(Ordering::Acquire);
+        THREAD_TLB.with(|cell| {
+            let mut thread = cell.try_borrow_mut().ok()?;
+            if thread.epoch != epoch {
+                thread.tlb.flush();
+                thread.epoch = epoch;
+                return None;
+            }
+            f(&thread.tlb)
+        })
+    }
+    /// Reads `buf`, which lies in one page, through this thread's
+    /// [`ThreadTlb`] without a lock; `false` when the TLB does not hold the
+    /// page or the access is not permitted there.
+    #[inline]
+    fn read_unlocked(&self, addr: GuestAddr, buf: &mut [u8], access: Access) -> bool {
+        let Some(page) = AddressSpaceData::single_page(addr, buf.len()) else {
+            return false;
+        };
+        self.with_thread_tlb(|tlb| {
+            let entry = tlb.get(page).filter(|e| access.permitted(e.prot))?;
+            match entry.frame.get() {
+                Some(frame) => frame.read(page_offset(addr.0), buf),
+                None => buf.fill(0),
+            }
+            Some(())
+        })
+        .is_some()
     }
     /// Reads guest memory whatever its protection, as Linux's core dump
     /// does: a page that is mapped at all reads.
@@ -2967,6 +3039,12 @@ impl AddressSpace {
         self.locked().fetch(addr, buf)
     }
     pub fn fetch_partial(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<usize, Fault> {
+        // A write to an executable page moves the code generation on after
+        // its bytes, so a fetch here that follows a read of the new
+        // generation reads the new bytes, as one under the lock does.
+        if self.read_unlocked(addr, buf, Access::Fetch) {
+            return Ok(buf.len());
+        }
         self.locked().fetch_partial(addr, buf)
     }
     pub fn write_initial(&self, addr: GuestAddr, buf: &[u8]) -> Result<(), Fault> {
@@ -2983,12 +3061,31 @@ impl AddressSpace {
     /// lie in one word.
     #[inline]
     pub fn read_value(&self, addr: GuestAddr, size: usize) -> Result<u64, Fault> {
-        if let Some(value) = self.data_locked().read_value_cached(addr, size) {
+        if let Some(value) = self.read_value_unlocked(addr, size) {
             return Ok(value);
         }
         let mut bytes = [0; WORD_BYTES];
         self.read(addr, &mut bytes[..size.min(WORD_BYTES)])?;
         Ok(u64::from_le_bytes(bytes))
+    }
+    /// [`Self::read_unlocked`] of `size` bytes, 1 to 8, that lie in one word.
+    #[inline]
+    fn read_value_unlocked(&self, addr: GuestAddr, size: usize) -> Option<u64> {
+        let offset = page_offset(addr.0);
+        let within = offset % WORD_BYTES;
+        if size == 0 || within + size > WORD_BYTES {
+            return None;
+        }
+        self.with_thread_tlb(|tlb| {
+            let entry = tlb
+                .get(addr.0 - offset as u64)
+                .filter(|e| e.prot.allows_read())?;
+            let Some(frame) = entry.frame.get() else {
+                return Some(0);
+            };
+            let word = frame.words[offset / WORD_BYTES].load(Ordering::Acquire);
+            Some(word >> (8 * within) & value_mask(size))
+        })
     }
     /// Writes the low `size` bytes of `value`, of which 8 are the most it
     /// takes, as [`Self::write`] does.
@@ -3130,6 +3227,12 @@ impl AddressSpace {
             AtomicOp::Neg => (old.wrapping_neg(), true),
         };
         Self::write_locked(data, addr, &(new & mask).to_le_bytes()[..len])?;
+        // A locked instruction is a full fence. Earlier stores already come
+        // before its store: every store takes this lock and is a `Release`
+        // store, and so is this one. But the lock no longer orders a later
+        // load, which takes none, and an `Acquire` load may pass an earlier
+        // store on Arm: Go's scheduler, for one, depends on it not.
+        std::sync::atomic::fence(Ordering::SeqCst);
         Ok(AtomicResult { old, exchanged })
     }
 }

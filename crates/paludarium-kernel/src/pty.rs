@@ -1418,7 +1418,9 @@ impl Master {
             }
             count
         };
-        terminal.hub.changed();
+        if count > 0 {
+            terminal.hub.changed();
+        }
         terminal.deliver(signals);
         if count == 0 && !bytes.is_empty() {
             return Err(Errno::EAGAIN);
@@ -1445,6 +1447,8 @@ fn read_slave(c: &mut Context<'_>, slave: &Slave, out: &mut [u8]) -> Result<usiz
     loop {
         let ticket = terminal.hub.token.value();
         let mut signals = Vec::new();
+        // Whether this pass took input, which wakes the master's writers.
+        let mut took = false;
         let (done, min, time) = {
             let mut state = terminal.lock();
             let (min, time) = (state.cc(VMIN), state.cc(VTIME));
@@ -1454,12 +1458,14 @@ fn read_slave(c: &mut Context<'_>, slave: &Slave, out: &mut [u8]) -> Result<usiz
                 state.input_available(false).then(|| {
                     let n = state.read_line(&mut out[got..]);
                     state.after_read(&mut signals);
+                    took = true;
                     got + n
                 })
             } else {
                 if !state.read.is_empty() {
                     got += state.read_raw(&mut out[got..]);
                     state.after_read(&mut signals);
+                    took = true;
                     if min > 0 && time > 0 {
                         deadline = None;
                     }
@@ -1469,7 +1475,9 @@ fn read_slave(c: &mut Context<'_>, slave: &Slave, out: &mut [u8]) -> Result<usiz
             };
             (done, min, time)
         };
-        terminal.hub.changed();
+        if took {
+            terminal.hub.changed();
+        }
         terminal.deliver(signals);
         if let Some(count) = done {
             return Ok(count);
@@ -1516,7 +1524,9 @@ impl Slave {
                 Err(Errno::EAGAIN)
             }
         };
-        terminal.hub.changed();
+        if result.as_ref().is_ok_and(|&n| n > 0) {
+            terminal.hub.changed();
+        }
         terminal.deliver(signals);
         result
     }
@@ -1528,7 +1538,9 @@ impl Slave {
             }
             state.write_output(bytes)
         };
-        self.terminal.hub.changed();
+        if count > 0 {
+            self.terminal.hub.changed();
+        }
         if count == 0 && !bytes.is_empty() {
             return Err(Errno::EAGAIN);
         }

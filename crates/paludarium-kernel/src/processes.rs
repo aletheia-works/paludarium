@@ -168,7 +168,11 @@ impl Processes {
                     parent: 0,
                     group,
                     status: None,
-                    pgid: 1,
+                    // Like its session, the first process's group is outside
+                    // the emulator, and Linux shows an ID outside a PID
+                    // namespace as 0. So the process is no group's leader and
+                    // may start a session.
+                    pgid: 0,
                     sid: 0,
                     executed: false,
                     limits: DEFAULT_LIMITS,
@@ -1272,11 +1276,22 @@ impl Processes {
             })
             .collect()
     }
-    /// Whether `owner` names anything (ESRCH otherwise, as Linux's
-    /// `f_setown` finds the pid).
-    pub(crate) fn owner_exists(&self, owner: FileOwner) -> bool {
+    /// Whether anything is there in the role `owner` names it in: a thread,
+    /// a process or a member of a group (Linux's `pid_task`).
+    pub(crate) fn owner_present(&self, owner: FileOwner) -> bool {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         !Self::owned_by(&entries, owner).is_empty()
+    }
+    /// Whether `owner`'s ID is in use, as Linux's `f_setown` and
+    /// `SCM_CREDENTIALS` find it with `find_vpid` (ESRCH otherwise): a
+    /// thread, or a process, group or session, whatever kind of owner it is.
+    pub(crate) fn owner_exists(&self, owner: FileOwner) -> bool {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let id = owner.id;
+        !Self::owned_by(&entries, owner).is_empty()
+            || entries
+                .iter()
+                .any(|(&pid, entry)| pid == id || entry.pgid == id || entry.sid == id)
     }
     fn send_owner(&self, owner: FileOwner, signal: signals::PendingSignal) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);

@@ -32,7 +32,7 @@ mod state;
 mod x87;
 
 use paludarium_decoder::{DecodeError, Instruction, decode};
-use paludarium_mmu::{AddressSpace, CodeSources};
+use paludarium_mmu::AddressSpace;
 use paludarium_types::{ExitReason, GuestAddr, InstructionBytes, MAX_INSTRUCTION_LEN};
 
 pub use alu::{condition, sign_extend, size_mask};
@@ -52,19 +52,16 @@ const CACHE_ENTRIES: usize = 16384;
 /// Decoded instructions by address. An entry is used only while the
 /// address space's [`AddressSpace::code_generation`] is unchanged, so
 /// writes to executable memory and mapping changes (self-modifying code,
-/// `mprotect`, `munmap`) are always seen.
+/// `mprotect`, `munmap`) are always seen. A cache serves one address space:
+/// make a new one for another (as after `execve`).
 pub struct DecodeCache {
     entries: Vec<Option<Entry>>,
-    /// What reading the generation without the locks needs
-    /// ([`AddressSpace::code_generation_cached`]).
-    sources: CodeSources,
 }
 
 impl Default for DecodeCache {
     fn default() -> Self {
         DecodeCache {
             entries: vec![None; CACHE_ENTRIES],
-            sources: CodeSources::default(),
         }
     }
 }
@@ -384,7 +381,7 @@ pub fn step_cached(
 ) -> Result<(), ExitReason> {
     #[cfg(feature = "cost-profile")]
     jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
-    let generation = mem.code_generation_cached(&mut cache.sources);
+    let generation = mem.code_generation_cached();
     let decoded = cache.decoded(state.rip.0, generation, || fetch_for_state(state, mem))?;
     execute_decoded(state, mem, decoded)
 }
@@ -527,7 +524,7 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
     #[cfg(feature = "cost-profile")]
     let observed_space = mem.code_epoch().0;
     while consumed < budget {
-        let generation = mem.code_generation_cached(&mut cache.sources);
+        let generation = mem.code_generation_cached();
         #[cfg(feature = "cost-profile")]
         let observed_rip = state.rip.0;
         #[cfg(feature = "cost-profile")]

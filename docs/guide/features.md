@@ -210,6 +210,15 @@ kernel.
   file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
+- An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
+  reading and writing it, `lseek`, `flock`, `getdents64`, `sendfile`,
+  `copy_file_range`, `fsync`, `fdatasync`, `fadvise64`, `ftruncate`,
+  `fallocate`, `mmap`, `ioctl`, the `f*xattr` calls, `epoll_ctl` (as the
+  epoll descriptor or the target), `epoll_wait` and `fcntl`
+  (but for `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_DUPFD_QUERY`, `F_GETFD`,
+  `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
+  `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
+  take it, and it is a directory for the `*at` calls.
 - `fcntl`'s byte-range locks, as Linux's `fs/locks.c` keeps them: record
   locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a process owns, and open
   file description locks (`F_OFD_SETLK`, `F_OFD_SETLKW`, `F_OFD_GETLK`),
@@ -354,16 +363,18 @@ kernel.
   - a process or, negative, a process group;
   - with `F_SETOWN_EX`, also a single thread.
 
-  `ESRCH` when the owner does not exist. `F_GETOWN` and `F_GETOWN_EX` read
-  it back, and `F_SETSIG` picks the signal. Only pipes, sockets and
-  pseudo-terminals, and the host's standard streams when they are a pipe, a
-  socket or a terminal, keep `O_ASYNC` (`F_SETFL` drops it on other files,
-  and `FIOASYNC` setting it there is `ENOTTY`). With it, a pipe, socket or
-  pseudo-terminal (as the pseudo-terminals below say) sends its owner
-  `SIGIO` from the kernel. With `F_SETSIG`, it sends that
+  `ESRCH` when no thread, process, group or session has the ID, whichever
+  kind of owner it names, as Linux finds the ID. `F_GETOWN` and
+  `F_GETOWN_EX` read it back, as 0 while nothing is there in that role
+  (such as a group no process is in), and `F_SETSIG` picks the signal.
+  Only pipes, sockets and pseudo-terminals, and the host's standard streams
+  when they are a pipe, a socket or a terminal, keep `O_ASYNC` (`F_SETFL`
+  drops it on other files, and `FIOASYNC` setting it there is `ENOTTY`). With
+  it, a pipe, socket or pseudo-terminal (as the pseudo-terminals below say)
+  sends its owner `SIGIO` from the kernel. With `F_SETSIG`, it sends that
   signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_ERR`,
-  `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set through as
-  `si_fd`.
+  `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set
+  through as `si_fd`.
   - **Pipes.** Every write signals the reader as it ends, even one that
     finds the pipe full, and also before each wait. Every read signals the
     writer as it ends, with data or not. The close of either end signals
@@ -1123,14 +1134,16 @@ kernel.
     dumped, as Linux reports a core once it has started to write it.
 
   Process groups and sessions are kept the same way, and `wait4` and
-  `waitid` can wait for a group. The first process's session started outside
-  the emulator, so `getsid` reports it as 0, as Linux reports an ID outside a
-  PID namespace. `setsid` fails with `EPERM` in a process whose PID names a
-  group, and makes any other process the leader of a new session and group.
-  `setpgid` checks the session as Linux does: a session leader, a child in
-  another session and a group in another session give `EPERM`, and a child
-  that has run `execve` gives `EACCES`. A group exists while any member is
-  left, an exited child not yet reaped included.
+  `waitid` can wait for a group. The first process is like the first of a
+  PID namespace: its group and session started outside the emulator, so
+  `getpgrp` and `getsid` report them as 0, as Linux reports an ID outside a
+  PID namespace, and it may start a session of its own. `setsid` fails
+  with `EPERM` in a process whose PID names a group, and makes any other
+  process the leader of a new session and group. `setpgid` checks the session
+  as Linux does: a session leader, a child in another session and a group in
+  another session give `EPERM`, and a child that has run `execve` gives
+  `EACCES`. A group exists while any member is left, an exited child not yet
+  reaped included.
 - Nice values are kept per thread, as on Linux: a new thread or process
   starts with its creator's, and `execve` keeps the caller's. `getpriority`
   reports the highest priority among the threads it finds, as `20 - nice`,

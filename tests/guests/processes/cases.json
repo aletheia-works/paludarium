@@ -29,6 +29,7 @@
     {"name":"fsize-limit","binary":"process"},
     {"name":"pgid","binary":"process"},
     {"name":"session","binary":"process"},
+    {"name":"pid-namespace","binary":"process"},
     {"name":"pty-open","binary":"pty"},
     {"name":"pty-termios","binary":"pty"},
     {"name":"pty-canonical","binary":"pty"},

@@ -860,6 +860,22 @@ fn fsync_sync_and_fadvise_check_the_descriptor() {
     assert_eq!(f.ret(221, &[fd, 0, 0, 6]), errno(Errno::EINVAL));
     assert_eq!(f.ret(221, &[fd, 0, u64::MAX, 0]), errno(Errno::EINVAL));
     assert_eq!(f.ret(221, &[99, 0, 0, 0]), errno(Errno::EBADF));
+    // An `O_PATH` descriptor is EBADF to them, as to every call that takes
+    // its descriptor as Linux's `fdget` does; `fstat` and `F_GETFL` take it.
+    let path = f.ret(2, &[DATA, 0o10000000, 0]);
+    for (number, args) in [
+        (74, [path, 0, 0]),
+        (75, [path, 0, 0]),
+        (221, [path, 0, 0]),
+        (0, [path, DATA + 0x400, 1]),
+        (8, [path, 0, 0]),
+        (73, [path, 1, 0]),
+        (72, [path, 4, 0]),
+    ] {
+        assert_eq!(f.ret(number, &args), errno(Errno::EBADF), "{number}");
+    }
+    assert_eq!(f.ret(5, &[path, DATA + 0x400]), 0);
+    assert_eq!(f.ret(72, &[path, 3, 0]), 0o10000000);
 }
 #[test]
 fn access_grants_root_reading_and_writing_but_execution_needs_a_bit() {
@@ -1542,17 +1558,29 @@ fn resource_limits_are_recorded_in_linux_order() {
     assert_eq!(f.mem.read_u64(GuestAddr(old + 8)).unwrap(), u64::MAX);
 }
 #[test]
-fn process_groups_start_at_the_first_process() {
+fn process_groups_start_outside_the_emulator() {
     let mut f = fixture();
-    assert_eq!(f.ret(111, &[]), 1); // getpgrp
-    assert_eq!(f.ret(121, &[0]), 1); // getpgid
+    // The first process's group is outside, shown as 0 as Linux shows an ID
+    // outside a PID namespace, so the process may start a session.
+    assert_eq!(f.ret(111, &[]), 0); // getpgrp
+    assert_eq!(f.ret(121, &[0]), 0); // getpgid
+    assert_eq!(f.ret(121, &[1]), 0);
     assert_eq!(f.ret(109, &[0, 0]), 0); // setpgid
+    assert_eq!(f.ret(111, &[]), 1);
     assert_eq!(f.ret(109, &[1, 1]), 0);
     assert_eq!(f.ret(109, &[0, 77]), errno(Errno::EPERM));
     assert_eq!(f.ret(109, &[0, u64::MAX]), errno(Errno::EINVAL));
     assert_eq!(f.ret(109, &[99, 0]), errno(Errno(3)));
     assert_eq!(f.ret(121, &[99]), errno(Errno(3)));
     assert_eq!(f.ret(121, &[u64::MAX]), errno(Errno(3)));
+}
+#[test]
+fn the_first_process_may_start_a_session() {
+    let mut f = fixture();
+    assert_eq!(f.ret(124, &[0]), 0); // getsid
+    assert_eq!(f.ret(112, &[]), 1); // setsid
+    assert_eq!((f.ret(124, &[0]), f.ret(111, &[])), (1, 1));
+    assert_eq!(f.ret(112, &[]), errno(Errno::EPERM));
 }
 #[test]
 fn posix_timer_signal_reaches_sigtimedwait() {

@@ -667,7 +667,8 @@ void _start(void) {
   static long ts[4];static char here[300];long ok;
   long op=S(2,p,010000000,0);S(1,fd,"abcd",4);
   results[x++]=S(90,fdpath(fd),0600,0);S(5,fd,st,0);results[x++]=MODE();
-  results[x++]=S(91,op,0640,0);results[x++]=S(90,fdpath(op),0640,0);S(4,p,st,0);results[x++]=MODE();
+  results[x++]=S(91,op,0640,0);results[x++]=S(93,op,-1,-1);results[x++]=call(280,op,0,0,0,0,0);
+  results[x++]=S(90,fdpath(op),0640,0);S(4,p,st,0);results[x++]=MODE();
   results[x++]=call(268,-100,(long)fdpath(op),0604,0,0,0);S(4,p,st,0);results[x++]=MODE();
   results[x++]=call(452,-100,(long)fdpath(op),0644,0,0,0);S(4,p,st,0);results[x++]=MODE();
   results[x++]=call(452,-100,(long)fdpath(op),0644,0x100,0,0);

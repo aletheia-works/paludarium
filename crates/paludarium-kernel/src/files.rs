@@ -643,7 +643,13 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         a[3] & AT_EMPTY_PATH != 0 && path(c, a[1])?.is_empty()
     };
     if descriptor {
-        let file = c.files.descriptor(a[0])?.file;
+        // `futimens` takes the descriptor as `fdget` does, which an `O_PATH`
+        // one is not; `AT_EMPTY_PATH` takes it as a path.
+        let file = if a[1] == 0 {
+            io_descriptor(c, a[0])?
+        } else {
+            c.files.descriptor(a[0])?.file
+        };
         crate::permissions::times(&c.process.credentials, &file.stat()?, touch)?;
         return file.set_times(atime, mtime).map(|()| 0);
     }
@@ -771,6 +777,17 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     let mode = crate::permissions::chmod(&c.process.credentials, &stat, a[2] as u32)?;
     c.files.fs.set_mode(&p, mode).map(|()| 0)
+}
+/// The file of descriptor `fd` for a call that takes it as Linux's `fdget`
+/// does (`fchmod`, `fchown`, `futimens`): an `O_PATH` descriptor is
+/// `EBADF`, as only path calls (`AT_EMPTY_PATH`, a link in `/proc/self/fd`)
+/// reach its file.
+fn io_descriptor(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
+    let file = c.files.descriptor(fd)?.file;
+    if file.flags() & O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    Ok(file)
 }
 /// `chmod` of the file a link in `/proc/self/fd` leads to, which the
 /// descriptor's access does not limit: an `O_PATH` one's file changes too,
@@ -2458,7 +2475,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.files.fs.set_mode(&p, mode).map(|()| 0)
         }
         91 => {
-            let file = c.files.descriptor(a[0])?.file;
+            let file = io_descriptor(c, a[0])?;
             let mode =
                 crate::permissions::chmod(&c.process.credentials, &file.stat()?, a[1] as u32)?;
             file.set_mode(mode).map(|()| 0)
@@ -2471,7 +2488,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], n == 92)?;
             chown_path(c, &p, n == 92, a[1], a[2])
         }
-        93 => chown_file(c, &c.files.descriptor(a[0])?.file, a[1], a[2]),
+        93 => chown_file(c, &io_descriptor(c, a[0])?, a[1], a[2]),
         260 => fchownat(c, a),
         280 => utimensat(c, a),
         // statfs, fstatfs

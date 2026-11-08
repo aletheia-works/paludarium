@@ -2436,6 +2436,34 @@ pub struct CodeSnapshot {
     pub bytes: Vec<u8>,
 }
 
+/// Locks `mutex`, which guards each memory access of a space's threads
+/// and is held only for that access. On macOS, where a contended
+/// `pthread_mutex` sleeps in the kernel at once, it first tries again a few
+/// times, pausing twice as long after each try so as not to fight the
+/// holder for the lock's cache line: the threads of a multithreaded guest
+/// (Go's compiler, for one) took it millions of times, and sleeping and
+/// waking for each cost more than the emulation. Elsewhere `Mutex` spins
+/// by itself before it sleeps.
+fn lock_spinning<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    #[cfg(target_vendor = "apple")]
+    for round in 0..TRIES {
+        match mutex.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                for _ in 0..1u32 << round {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+/// How many times [`lock_spinning`] tries before it sleeps: 1023 pauses in
+/// all, a few microseconds.
+#[cfg(target_vendor = "apple")]
+const TRIES: u32 = 10;
+
 struct AddressSpaceGuard<'a> {
     data: MutexGuard<'a, AddressSpaceData>,
     _serialization: MutexGuard<'a, ()>,
@@ -2493,15 +2521,12 @@ impl AddressSpace {
     /// So only the threads of this space can be at them, which this lock
     /// excludes, as it does [`Self::with_code_epoch`].
     fn data_locked(&self) -> MutexGuard<'_, AddressSpaceData> {
-        self.data.lock().unwrap_or_else(PoisonError::into_inner)
+        lock_spinning(&self.data)
     }
     fn locked(&self) -> AddressSpaceGuard<'_> {
-        let serialization = self
-            .serialization
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let serialization = lock_spinning(&self.serialization);
         AddressSpaceGuard {
-            data: self.data.lock().unwrap_or_else(PoisonError::into_inner),
+            data: lock_spinning(&self.data),
             _serialization: serialization,
         }
     }

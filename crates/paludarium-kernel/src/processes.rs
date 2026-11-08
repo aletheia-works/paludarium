@@ -2222,6 +2222,8 @@ impl Kernel {
     ) {
         let tid = thread.tid;
         let mut c = crate::syscalls::Context {
+            // execve, whose closing descriptors these are.
+            number: 59,
             tid,
             host: &*self.host,
             shared_host: &self.host,

@@ -8,6 +8,7 @@
 //! records signal registrations but never delivers signals.
 #![forbid(unsafe_code)]
 
+mod arguments;
 mod coredump;
 mod credentials;
 mod inbox;
@@ -180,6 +181,9 @@ pub struct ThreadState {
     /// The syscall now returning, when Linux would run it again (rather than
     /// fail it with EINTR) if the signal that interrupted it runs no handler.
     pub(crate) restart: Option<u64>,
+    /// `rax` as the syscall now returning found it, upper half and all:
+    /// Linux's `orig_ax`, which a restart of that same call puts back.
+    pub(crate) syscall_rax: u64,
     /// What `restart_syscall` resumes after a stop: a wait with a timeout,
     /// which Linux restarts with the time left (ERESTART_RESTARTBLOCK). It
     /// lasts until a handler runs, through the checkpoints of the stop.
@@ -611,7 +615,14 @@ impl Kernel {
             && let Some(rip) = thread.cpu.rip.0.checked_sub(2)
         {
             thread.cpu.rip = paludarium_types::GuestAddr(rip);
-            thread.cpu.gpr[reg::RAX] = number;
+            // The call itself runs again with the whole register, as Linux
+            // puts back orig_ax; restart_syscall is put in afresh.
+            let rax = thread.state.syscall_rax;
+            thread.cpu.gpr[reg::RAX] = if number == u64::from(rax as u32) {
+                rax
+            } else {
+                number
+            };
         }
     }
 
@@ -781,7 +792,10 @@ impl Kernel {
         self.group.apply_discards(&mut thread.state);
         self.group.sync_timer(&mut thread.state);
         account_cpu(&*self.host, &self.group, &mut thread.state);
-        let mut number = thread.cpu.gpr[reg::RAX];
+        // The number is an int, as Linux's do_syscall_64 takes it, compared
+        // unsigned: a dirty upper half of rax is not read, and a negative
+        // number is past every table (ENOSYS).
+        let mut number = u64::from(thread.cpu.gpr[reg::RAX] as u32);
         let mut args = [
             thread.cpu.gpr[reg::RDI],
             thread.cpu.gpr[reg::RSI],
@@ -790,6 +804,8 @@ impl Kernel {
             thread.cpu.gpr[reg::R8],
             thread.cpu.gpr[reg::R9],
         ];
+        arguments::narrow(number, &mut args);
+        thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
         thread.state.restart = signals::restarts_without_handler(number, &args).then_some(number);
         // clone reads only the low 32 bits of its flags, as Linux's sys_clone
         // does (lower_32_bits); clone3's wider flags reach the code below.
@@ -822,6 +838,7 @@ impl Kernel {
         };
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
+            number,
             tid: thread.tid,
             host: &*self.host,
             shared_host: &self.host,

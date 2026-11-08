@@ -617,7 +617,7 @@ void _start(void) {
   results[x++]=FA(ro,0,0,1);results[x++]=FA(ro,0x100,0,1);results[x++]=FA(pf[1],0,0,1);results[x++]=FA(pf[0],0,0,1);results[x++]=FA(d,0,0,1);results[x++]=FA(sv[0],0,0,1);
   results[x++]=FA(fd,0,0x7fffffffffffffffL,1);results[x++]=FA(fd,1,1,0x7fffffffffffffffL);results[x++]=SIZE();
   S(3,ro,0,0);S(3,ap,0,0);S(3,d,0,0);S(3,pf[0],0,0);S(3,pf[1],0,0);S(3,sv[0],0,0);S(3,sv[1],0,0);}
- if(CASE==60){ /* openat2(dirfd, path, how, size): open_how's checks and RESOLVE_* */
+ if(CASE==62){ /* openat2(dirfd, path, how, size): open_how's checks and RESOLVE_* */
   static unsigned long how[8];static char u2[]="/tmp/paludarium-files-unused";
   #define HOW(f,m,r) (how[0]=(f),how[1]=(m),how[2]=(r))
   #define O2(d,path,sz) call(437,d,(long)(path),(long)how,sz,0,0)
@@ -663,7 +663,7 @@ void _start(void) {
   results[x++]=O2(t,"../proc/self/status",24);
   HOW(0,0,0);OK2(-100,"/proc/self/status");
   S(3,t,0,0);}
- if(CASE==61){ /* a link in /proc/self/fd leads path calls to the descriptor's file */
+ if(CASE==63){ /* a link in /proc/self/fd leads path calls to the descriptor's file */
   static long ts[4];static char here[300];long ok;
   long op=S(2,p,010000000,0);S(1,fd,"abcd",4);
   results[x++]=S(90,fdpath(fd),0600,0);S(5,fd,st,0);results[x++]=MODE();
@@ -703,7 +703,7 @@ void _start(void) {
   ts[2]=2000;results[x++]=call(280,-100,(long)fdpath(fd),(long)ts,0,0,0);S(5,fd,st,0);results[x++]=MTIME();
   results[x++]=S(21,fdpath(fd),4,0);
   S(3,op,0,0);S(3,ol,0,0);S(3,dp,0,0);}
- if(CASE==62){ /* extended attributes through a link in /proc/self/fd */
+ if(CASE==64){ /* extended attributes through a link in /proc/self/fd */
   long op=S(2,p,010000000,0);
   results[x++]=call(188,(long)fdpath(op),(long)"user.k",(long)"v",1,0,0);
   results[x++]=call(191,(long)p,(long)"user.k",(long)buf,8,0,0);results[x++]=buf[0];

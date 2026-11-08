@@ -473,7 +473,85 @@ fn lowest_free(
         Err(Errno::EMFILE)
     }
 }
+/// The path at `addr`, with a link in `/proc/self/fd` (or `/proc/self/cwd`,
+/// `/proc/self/exe`, `/dev/fd`) before its last component taken to where it
+/// leads ([`through_magic_links`]).
 fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
+    through_magic_links(c, string(c, addr)?)
+}
+/// Path `p` with each magic link it goes through, a link in a process's
+/// `fd` directory, its `cwd` or `exe`, which Linux's walk (`nd_jump_link`)
+/// does not read but jumps to the file of, replaced by that file's path: a
+/// directory a descriptor holds by the path that names it now (it may have
+/// been renamed), a removed one is ENOENT, and a file that is not a
+/// directory ENOTDIR. A link the path ends in is left to the call, which
+/// may not follow it.
+fn through_magic_links(c: &Context<'_>, mut p: Vec<u8>) -> Result<Vec<u8>, Errno> {
+    for _ in 0..40 {
+        if !p.starts_with(b"/proc/") && !p.starts_with(b"/dev/") {
+            return Ok(p);
+        }
+        let jump = (1..p.len()).filter(|&i| p[i] == b'/').find_map(|i| {
+            let prefix = crate::devices::through_link(&p[..i]).unwrap_or_else(|| p[..i].to_vec());
+            let prefix = match crate::devices::entry(&prefix) {
+                Some(crate::devices::Entry::Link(target)) => target.to_vec(),
+                _ => prefix,
+            };
+            magic_link_directory(c, &prefix).map(|target| (target, i))
+        });
+        let Some((target, at)) = jump else {
+            return Ok(p);
+        };
+        let mut next = target?;
+        next.extend_from_slice(&p[at..]);
+        p = next;
+    }
+    Err(Errno(40)) // ELOOP
+}
+/// The directory magic link `path` leads to, for [`through_magic_links`],
+/// or `None` when `path` is not one.
+fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, Errno>> {
+    const ENOTDIR: Errno = Errno::ENOTDIR;
+    let is_dir = |stat: FileStat| stat.mode & 0o170000 == 0o040000;
+    match crate::proc::own_entry(path, c.process.pid) {
+        Some(crate::proc::OwnEntry::Descriptor(n)) => Some((|| {
+            let d = c
+                .files
+                .descriptor(u64::from(n))
+                .map_err(|_| Errno::ENOENT)?;
+            let stat = d.file.stat()?;
+            if !is_dir(stat) || d.file.as_any().is_some_and(|v| v.is::<LinkPath>()) {
+                return Err(ENOTDIR);
+            }
+            let path = d.file.guest_path_hint().unwrap_or_else(|| d.path.clone());
+            // The path still names the directory, or it was removed.
+            let named = generated(&path)
+                || c.files
+                    .fs
+                    .metadata(&path, true)
+                    .is_ok_and(|now| now.inode == stat.inode);
+            if named { Ok(path) } else { Err(Errno::ENOENT) }
+        })()),
+        Some(entry @ (crate::proc::OwnEntry::Cwd | crate::proc::OwnEntry::Exe)) => {
+            let target = own_link(c, entry)?;
+            Some(if entry == crate::proc::OwnEntry::Exe {
+                Err(ENOTDIR)
+            } else {
+                Ok(target)
+            })
+        }
+        _ => {
+            let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
+            match task_path.entry {
+                crate::proc::TaskEntry::Exe => Some(Err(ENOTDIR)),
+                crate::proc::TaskEntry::Cwd => Some(own_link_target(c, path).ok_or(Errno::ENOENT)),
+                _ => None,
+            }
+        }
+    }
+}
+/// The NUL-terminated string at `addr`, of at most 4096 bytes.
+fn string(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     if addr == 0 {
         return Err(Errno::EFAULT);
     }
@@ -2361,7 +2439,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             Ok(0)
         }
         88 | 266 => {
-            let target = path(c, a[0])?;
+            let target = string(c, a[0])?;
             let (dir, raw) = if n == 88 {
                 ((-100i32) as u64, path(c, a[1])?)
             } else {

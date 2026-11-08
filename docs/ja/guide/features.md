@@ -680,6 +680,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `O_PATH | O_NOFOLLOW` のディスクリプタが持つシンボリックリンクはもうたどりません。
   そのモードは変えられず（`EOPNOTSUPP`）、`chdir` はディレクトリでないもの（`ENOTDIR`）、
   `truncate` は通常のファイルでないもの（`EINVAL`）とし、`execve` は `ELOOP` になります。
+- パスの途中にある `/proc/self/fd`（や `/dev/fd`）のリンク、`/proc/self/cwd`、
+  `/proc/self/exe` は、Linux の `nd_jump_link` と同じく飛び越えます。
+  `/proc/self/fd/3/name` は、ディスクリプタ 3 が持つディレクトリの中の `name` で、
+  そのディレクトリは名前を変えた後も今の名前で見つかり、`..` はそこから続きます。
+  削除したディレクトリと開いていないディスクリプタは `ENOENT`、ディレクトリでない
+  ファイルは `ENOTDIR` です。パスを取るファイルの呼び出しはこう扱いますが、`execve` と
+  Unix ソケットのアドレスは扱いません。
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの

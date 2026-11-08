@@ -725,6 +725,29 @@ void _start(void) {
   results[x++]=call(191,(long)p,(long)"user.k",(long)buf,8,0,0);
   results[x++]=call(188,(long)fdpath(900),(long)"user.k",(long)"v",1,0,0);
   S(3,op,0,0);}
+ if(CASE==68){ /* a link in /proc/self/fd (and /proc/self/cwd, /dev/fd) inside a path: the walk goes on from the descriptor's file */
+  #define UNDER(pre,n,rest) ({static char u[256];char *a=numbered(pre,n),*o=u;while(*a)*o++=*a++;const char *b=rest;while(*b)*o++=*b++;*o=0;u;})
+  #define INODE(n) (S(4,n,st,0)<0?-1:*(long*)(st+8))
+  static char dd[]="/tmp/paludarium-files-dir",dd2[]="/tmp/paludarium-files-dir2",here[300];
+  S(1,fd,"abcd",4);long d=S(2,"/tmp",0200000,0),op=S(2,"/tmp",010200000,0);
+  results[x++]=S(4,UNDER("/proc/self/fd/",d,"/paludarium-files-fixture"),st,0);results[x++]=*(long*)(st+48);
+  long o=S(2,UNDER("/proc/self/fd/",d,"/paludarium-files-fixture"),0,0);results[x++]=o>=0;results[x++]=S(0,o,buf,4);S(3,o,0,0);
+  results[x++]=S(4,UNDER("/proc/self/fd/",op,"/paludarium-files-fixture"),st,0);
+  results[x++]=S(4,UNDER("/dev/fd/",d,"/paludarium-files-fixture"),st,0);
+  results[x++]=S(4,UNDER("/proc/self/fd/",fd,"/x"),st,0);results[x++]=S(4,UNDER("/proc/self/fd/",900,"/x"),st,0);
+  results[x++]=S(4,UNDER("/proc/self/fd/",d,"/missing"),st,0);
+  results[x++]=INODE(UNDER("/proc/self/fd/",d,"/.."))==INODE("/");results[x++]=INODE(UNDER("/proc/self/fd/",d,"/."))==INODE("/tmp");
+  /* Creating and removing through it, and a directory renamed since it was opened. */
+  results[x++]=S(83,UNDER("/proc/self/fd/",d,"/paludarium-files-dir"),0755,0);results[x++]=S(4,dd,st,0);
+  long e=S(2,dd,0200000,0);S(82,dd,dd2,0);
+  long w=S(2,UNDER("/proc/self/fd/",e,"/inner"),0101,0600);results[x++]=w>=0;S(3,w,0,0);
+  results[x++]=S(4,"/tmp/paludarium-files-dir2/inner",st,0);
+  results[x++]=S(87,UNDER("/proc/self/fd/",e,"/inner"),0,0);results[x++]=S(4,"/tmp/paludarium-files-dir2/inner",st,0);
+  results[x++]=S(84,dd2,0,0);results[x++]=S(4,UNDER("/proc/self/fd/",e,"/inner"),st,0);
+  /* The working directory's link. */
+  long ok=S(79,here,300,0);S(80,"/tmp",0,0);results[x++]=S(4,"/proc/self/cwd/paludarium-files-fixture",st,0);if(ok>0)S(80,here,0,0);
+  results[x++]=S(4,"/proc/self/exe/x",st,0);
+  S(3,e,0,0);S(3,d,0,0);S(3,op,0,0);}
  if(CASE==42){ /* close_range(first, last, flags): 4..7 are copies of fd 3 */
   #define CR(f,l,fl) call(436,f,l,fl,0,0,0)
   #define OPEN(n) (S(72,n,1,0)>=0)

@@ -743,6 +743,13 @@ kernel.
   `O_PATH | O_NOFOLLOW` descriptor holds is not followed again: its mode
   cannot change (`EOPNOTSUPP`), `chdir` finds no directory (`ENOTDIR`),
   `truncate` no regular file (`EINVAL`) and `execve` gives `ELOOP`.
+- Inside a path, a link in `/proc/self/fd` (or `/dev/fd`), `/proc/self/cwd`
+  and `/proc/self/exe` is jumped through as Linux's `nd_jump_link` does:
+  `/proc/self/fd/3/name` is `name` in the directory descriptor 3 holds, by
+  the path that names it now, even after a rename, and `..` goes on from
+  there. A removed directory is `ENOENT`, a descriptor that is not open
+  `ENOENT`, and a file that is not a directory `ENOTDIR`. The file calls
+  that take a path do this; `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
   `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a

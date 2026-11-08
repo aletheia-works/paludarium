@@ -232,6 +232,7 @@ NAMES = {
     316: "renameat2",
     318: "getrandom",
     319: "memfd_create",
+    322: "execveat",
     324: "membarrier",
     325: "mlock2",
     326: "copy_file_range",

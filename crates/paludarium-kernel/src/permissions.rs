@@ -477,10 +477,15 @@ pub(crate) fn truncate(creds: &Credentials, stat: &FileStat) -> Result<(), Errno
 pub(crate) fn exec(
     files: &Files,
     creds: &Credentials,
+    dir: u64,
     raw: &[u8],
     path: &[u8],
 ) -> Result<(Option<FileStat>, bool), Errno> {
-    search(files, creds, (-100i32) as u64, raw, true)?;
+    // A descriptor's own file (`AT_EMPTY_PATH`) is searched for in no
+    // directory.
+    if !raw.is_empty() {
+        search(files, creds, dir, raw, true)?;
+    }
     let stat = match files.fs.metadata(path, true) {
         Ok(stat) => stat,
         Err(e) if e == Errno::ENOTDIR => return Err(e),

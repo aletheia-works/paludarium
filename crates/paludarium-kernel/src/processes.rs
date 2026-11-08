@@ -1639,7 +1639,7 @@ impl Kernel {
             56 if a[0] & 0x10000 == 0 => self.clone_process(thread, mem, a),
             57 => self.clone_process(thread, mem, [17, 0, 0, 0, 0, 0]),
             58 => self.clone_process(thread, mem, [0x4111, 0, 0, 0, 0, 0]),
-            59 => match self.exec(thread, mem, a) {
+            59 | 322 => match self.exec(thread, mem, n, a) {
                 Ok(closed) => {
                     self.close_on_exec(thread, mem, closed);
                     return Some(Next::Resume);
@@ -2357,45 +2357,163 @@ impl Kernel {
         &mut self,
         thread: &mut Thread,
         mem: &AddressSpace,
+        n: u64,
         a: [u64; 6],
     ) -> Result<Vec<crate::files::Descriptor>, Errno> {
-        let path = read_string(mem, a[0], 4096, Errno::ENAMETOOLONG)?;
-        let raw = path.clone();
-        let path = self.files.exec_path(path)?;
+        const AT_FDCWD: u64 = -100i64 as u64;
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        // execve(path, argv, envp), execveat(dir, path, argv, envp, flags)
+        let (dir, a) = if n == 322 {
+            (a[0], [a[1], a[2], a[3], a[4], 0, 0])
+        } else {
+            (AT_FDCWD, [a[0], a[1], a[2], 0, 0, 0])
+        };
+        let raw = read_string(mem, a[0], 4096, Errno::ENAMETOOLONG)?;
+        if a[3] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // The name the program gets (`AT_EXECFN`, and a script's argument),
+        // as Linux's `alloc_bprm` makes it for a path from a descriptor.
+        let fd = dir as i32;
+        let named = if raw.first() == Some(&b'/') || fd == -100 {
+            raw.clone()
+        } else if raw.is_empty() {
+            format!("/dev/fd/{fd}").into_bytes()
+        } else {
+            [format!("/dev/fd/{fd}/").as_bytes(), &raw].concat()
+        };
         // A link in `/proc/self/fd`, as `fexecve` falls back to, runs the
-        // file its descriptor holds while a path still names it. A symbolic
-        // link an `O_PATH | O_NOFOLLOW` descriptor holds is not followed
-        // again, and opens as no program (`ELOOP`, `may_open`).
-        let path =
-            match crate::files::through_descriptor(&self.files, self.process.pid, &path, true)? {
-                Some(crate::files::Followed::Path {
-                    path,
-                    follow: false,
-                }) if self
-                    .files
-                    .fs
-                    .metadata(&path, false)
-                    .is_ok_and(|s| s.mode & 0o170000 == 0o120000) =>
-                {
-                    return Err(Errno(40));
-                }
-                Some(crate::files::Followed::Path { path, .. }) => path,
-                _ => path,
-            };
-        let (program, mut readable) =
-            crate::permissions::exec(&self.files, &thread.state.credentials, &raw, &path)?;
+        // file its descriptor holds while a path still names it, and a file
+        // none names (a memfd, a removed one) from the descriptor.
+        let program = crate::files::exec_program(&self.files, self.process.pid, dir, &raw, a[3])?;
         let mut budget = paludarium_loader::MAX_ARG_BYTES as usize;
+        let creds = &thread.state.credentials;
+        // What runs: a path's program, whose scripts are followed below, or
+        // the bytes of a file only a descriptor holds (`image`), which, if a
+        // script, hands over to its interpreter by path.
+        let (start, program, mut readable, image) = match program {
+            crate::files::Program::Path(path) => {
+                let (program, readable) =
+                    crate::permissions::exec(&self.files, creds, dir, &raw, &path)?;
+                ((named.clone(), path.clone(), path), program, readable, None)
+            }
+            crate::files::Program::File { file, name, entry } => {
+                let stat = file.stat()?;
+                if stat.mode & 0o170000 != 0o100000 {
+                    return Err(Errno::EACCES);
+                }
+                crate::permissions::permission(creds, &stat, crate::permissions::MAY_EXEC)?;
+                let readable =
+                    crate::permissions::permission(creds, &stat, crate::permissions::MAY_READ)
+                        .is_ok();
+                (
+                    (Vec::new(), Vec::new(), entry),
+                    Some(stat),
+                    readable,
+                    Some((file, name)),
+                )
+            }
+        };
         let mut argv = read_vector(mem, a[1], &mut budget)?;
         let envp = read_vector(mem, a[2], &mut budget)?;
-        let (loaded, program) = follow_scripts(
-            &self.files,
-            &thread.state.credentials,
-            (raw.clone(), path.clone()),
+        let (named_first, first, comm) = start;
+        let mut path = comm;
+        let image = match image {
+            Some((file, name)) => {
+                let bytes = read_whole(&*file)?;
+                let mut head = [0; SCRIPT_HEAD];
+                let len = bytes.len().min(SCRIPT_HEAD);
+                head[..len].copy_from_slice(&bytes[..len]);
+                match script_interpreter(&head)? {
+                    None => Some((bytes, name)),
+                    // A script reads itself by its name, which a descriptor
+                    // closed on exec leaves to nothing
+                    // (`BINPRM_FLAGS_PATH_INACCESSIBLE`).
+                    Some((interpreter, argument)) => {
+                        if fd != -100 && raw.first() != Some(&b'/') && self.files.is_cloexec(dir) {
+                            return Err(Errno::ENOENT);
+                        }
+                        splice_script(
+                            &mut argv,
+                            &mut budget,
+                            &interpreter,
+                            argument,
+                            named.clone(),
+                        )?;
+                        if interpreter.is_empty() {
+                            return Err(Errno::EACCES);
+                        }
+                        let loaded = self.files.exec_path(interpreter.clone())?;
+                        let (program, may_read) = crate::permissions::exec(
+                            &self.files,
+                            creds,
+                            AT_FDCWD,
+                            &interpreter,
+                            &loaded,
+                        )?;
+                        readable = may_read;
+                        let (loaded, program) = follow_scripts(
+                            &self.files,
+                            creds,
+                            (interpreter, loaded),
+                            program,
+                            &mut readable,
+                            &mut argv,
+                            &mut budget,
+                        )?;
+                        path = loaded.clone();
+                        return self.exec_image(
+                            thread,
+                            mem,
+                            (named, path, loaded),
+                            program,
+                            readable,
+                            (argv, envp),
+                            None,
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+        let (loaded, program) = match image {
+            Some(_) => (Vec::new(), program),
+            None => follow_scripts(
+                &self.files,
+                creds,
+                (named_first, first),
+                program,
+                &mut readable,
+                &mut argv,
+                &mut budget,
+            )?,
+        };
+        self.exec_image(
+            thread,
+            mem,
+            (named, path, loaded),
             program,
-            &mut readable,
-            &mut argv,
-            &mut budget,
-        )?;
+            readable,
+            (argv, envp),
+            image,
+        )
+    }
+    /// The rest of exec, once the program is known: `raw` is its name,
+    /// `path` names the process, and `loaded` is what loads, unless `image`
+    /// holds the bytes of a file no path names and what `/proc/self/exe`
+    /// reads of it.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_image(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        (raw, path, loaded): (Vec<u8>, Vec<u8>, Vec<u8>),
+        program: Option<paludarium_host::FileStat>,
+        mut readable: bool,
+        (argv, envp): (Vec<Vec<u8>>, Vec<Vec<u8>>),
+        held: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         let mut random = [0; 16];
         self.host
             .random_bytes(&mut random)
@@ -2422,26 +2540,39 @@ impl Kernel {
             Some(meter) => AddressSpace::new().with_memory_meter(meter),
             None => AddressSpace::new(),
         };
-        let image = paludarium_loader::load_with(
-            &*self.files.fs,
-            &loaded,
-            &start,
-            &mut memory,
-            // As Linux's `open_exec` of it: it needs execute permission
-            // (EACCES), and an unreadable one makes the program undumpable
-            // (`would_dump`). Its set-ID bits do not count.
-            &mut |name| {
-                // An empty name finds the working directory.
-                if name.is_empty() {
-                    return Err(Errno::EACCES);
-                }
-                let path = self.files.exec_path(name.to_vec())?;
-                let (_, may_read) =
-                    crate::permissions::exec(&self.files, &thread.state.credentials, name, &path)?;
-                readable &= may_read;
-                Ok(path)
-            },
-        )
+        // As Linux's `open_exec` of an interpreter: it needs execute
+        // permission (EACCES), and an unreadable one makes the program
+        // undumpable (`would_dump`). Its set-ID bits do not count.
+        let mut interpreter = |name: &[u8]| {
+            // An empty name finds the working directory.
+            if name.is_empty() {
+                return Err(Errno::EACCES);
+            }
+            let path = self.files.exec_path(name.to_vec())?;
+            let (_, may_read) = crate::permissions::exec(
+                &self.files,
+                &thread.state.credentials,
+                -100i64 as u64,
+                name,
+                &path,
+            )?;
+            readable &= may_read;
+            Ok(path)
+        };
+        let fs = &*self.files.fs;
+        let image = match &held {
+            Some((bytes, name)) => paludarium_loader::load_file_with(
+                fs,
+                bytes,
+                name,
+                &start,
+                &mut memory,
+                &mut interpreter,
+            ),
+            None => {
+                paludarium_loader::load_with(fs, &loaded, &start, &mut memory, &mut interpreter)
+            }
+        }
         .map_err(|error| match error {
             // The new image did not fit under the memory limit.
             _ if memory.take_out_of_memory() => Errno::ENOMEM,
@@ -2483,8 +2614,10 @@ impl Kernel {
         self.group.exec_actions();
         thread.cpu = CpuState::new(image.entry_point, image.initial_stack_pointer);
         self.group.set_start_stack(image.initial_stack_pointer.0);
-        self.group
-            .set_executable(crate::files::resolved(&self.files, &loaded).unwrap_or(loaded));
+        self.group.set_executable(match held {
+            Some((_, name)) => name,
+            None => crate::files::resolved(&self.files, &loaded).unwrap_or(loaded),
+        });
         let ignored = thread
             .state
             .signal_actions
@@ -2645,7 +2778,8 @@ pub(crate) fn follow_scripts(
         }
         loaded = files.exec_path(interpreter.clone())?;
         let may_read;
-        (program, may_read) = crate::permissions::exec(files, credentials, &interpreter, &loaded)?;
+        (program, may_read) =
+            crate::permissions::exec(files, credentials, -100i64 as u64, &interpreter, &loaded)?;
         *readable = may_read;
         named = interpreter;
         // `exec_binprm` takes six handlers at most.
@@ -2654,6 +2788,21 @@ pub(crate) fn follow_scripts(
         }
     }
     Ok((loaded, program))
+}
+/// All of `file`, read from its start, for exec of a file only a
+/// descriptor holds.
+fn read_whole(file: &dyn paludarium_host::FileHandle) -> Result<Vec<u8>, Errno> {
+    let size = usize::try_from(file.stat()?.size).map_err(|_| Errno(7))?;
+    let mut bytes = vec![0; size];
+    let mut at = 0;
+    while at < size {
+        match file.read_at(at as u64, &mut bytes[at..])? {
+            0 => break,
+            n => at += n,
+        }
+    }
+    bytes.truncate(at);
+    Ok(bytes)
 }
 /// A script's interpreter, and its argument if any.
 pub(crate) type Script = (Vec<u8>, Option<Vec<u8>>);

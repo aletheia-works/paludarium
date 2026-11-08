@@ -203,6 +203,16 @@ impl Files {
     pub(crate) fn umask(&self) -> u32 {
         self.umask.load(Ordering::SeqCst)
     }
+    /// Whether descriptor `fd` is open and closes on exec.
+    pub(crate) fn is_cloexec(&self, fd: u64) -> bool {
+        u32::try_from(fd).is_ok_and(|fd| {
+            self.fds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&fd)
+                .is_some_and(|d| d.cloexec)
+        })
+    }
     pub(crate) fn exec_path(&self, path: Vec<u8>) -> Result<Vec<u8>, Errno> {
         self.path((-100i32) as u64, path)
     }
@@ -3947,30 +3957,123 @@ pub(crate) fn through_descriptor(
         return Ok(None);
     };
     let d = files.descriptor(u64::from(n)).map_err(|_| Errno::ENOENT)?;
+    descriptor_followed(files, d).map(Some)
+}
+/// Where the file descriptor `d` holds is reached: by the path that still
+/// names it, or through the descriptor itself.
+fn descriptor_followed(files: &Files, d: Descriptor) -> Result<Followed, Errno> {
     let any = d.file.as_any();
     if any.is_some_and(|v| v.is::<LinkPath>()) {
-        return Ok(Some(Followed::Path {
+        return Ok(Followed::Path {
             path: opened_path(&d),
             follow: false,
-        }));
+        });
     }
     if d.path.is_empty() || any.is_some_and(|v| v.is::<crate::memfd::Memfd>()) {
-        return Ok(Some(Followed::File(d)));
+        return Ok(Followed::File(d));
     }
     if generated(&d.path) {
-        return Ok(Some(Followed::Path {
+        return Ok(Followed::Path {
             path: d.path.clone(),
             follow: true,
-        }));
+        });
     }
     let inode = d.file.stat()?.inode;
-    Ok(Some(match current_path(files, &d, inode) {
+    Ok(match current_path(files, &d, inode) {
         Some(path) => Followed::Path {
             path,
             follow: false,
         },
         None => Followed::File(d),
-    }))
+    })
+}
+/// The program `execveat(dir, raw, .., flags)` runs: a file a path names
+/// (`dir` and `raw` taken as Linux's `do_open_execat` takes them, a link in
+/// `/proc/self/fd` followed to the descriptor's file), or one no path names,
+/// a memfd or a removed file, which runs from its descriptor. An empty `raw`
+/// takes the file `dir` holds with `AT_EMPTY_PATH` (ENOENT without), and
+/// `AT_SYMLINK_NOFOLLOW` refuses a symbolic link (ELOOP), as `may_open`
+/// refuses the one an `O_PATH | O_NOFOLLOW` descriptor holds.
+pub(crate) enum Program {
+    Path(Vec<u8>),
+    File {
+        file: Arc<dyn FileHandle>,
+        /// What `/proc/self/exe` reads.
+        name: Vec<u8>,
+        /// The name of its directory entry, which names the process.
+        entry: Vec<u8>,
+    },
+}
+pub(crate) fn exec_program(
+    files: &Files,
+    pid: u32,
+    dir: u64,
+    raw: &[u8],
+    flags: u64,
+) -> Result<Program, Errno> {
+    const ELOOP: Errno = Errno(40);
+    let symlink = |path: &[u8]| {
+        files
+            .fs
+            .metadata(path, false)
+            .is_ok_and(|s| s.mode & 0o170000 == 0o120000)
+    };
+    let target = if raw.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if dir as i32 == -100 {
+            return Ok(Program::Path(files.path(dir, b".".to_vec())?));
+        }
+        descriptor_followed(files, files.descriptor(dir)?)?
+    } else {
+        let path = files.path(dir, raw.to_vec())?;
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        if !follow && symlink(&path) {
+            return Err(ELOOP);
+        }
+        match through_descriptor(files, pid, &path, follow)? {
+            Some(target) => target,
+            None => return Ok(Program::Path(path)),
+        }
+    };
+    Ok(match target {
+        Followed::Path {
+            path,
+            follow: false,
+        } if symlink(&path) => return Err(ELOOP),
+        Followed::Path { path, .. } => Program::Path(path),
+        Followed::File(d) => {
+            let memfd = d
+                .file
+                .as_any()
+                .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>());
+            let (name, entry) = match memfd {
+                Some(memfd) => {
+                    let name = memfd.link_target();
+                    let entry = name
+                        .strip_prefix(b"/")
+                        .and_then(|n| n.strip_suffix(b" (deleted)"))
+                        .unwrap_or(&name)
+                        .to_vec();
+                    (name, entry)
+                }
+                None => (
+                    [&d.path[..], b" (deleted)"].concat(),
+                    d.path
+                        .rsplit(|&b| b == b'/')
+                        .next()
+                        .unwrap_or(&d.path)
+                        .to_vec(),
+                ),
+            };
+            Program::File {
+                file: d.file,
+                name,
+                entry,
+            }
+        }
+    })
 }
 /// [`through_descriptor`] for this thread's process.
 fn followed(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {

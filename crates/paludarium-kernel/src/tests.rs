@@ -708,6 +708,22 @@ fn fsync_sync_and_fadvise_check_the_descriptor() {
     assert_eq!(f.ret(221, &[fd, 0, 0, 6]), errno(Errno::EINVAL));
     assert_eq!(f.ret(221, &[fd, 0, u64::MAX, 0]), errno(Errno::EINVAL));
     assert_eq!(f.ret(221, &[99, 0, 0, 0]), errno(Errno::EBADF));
+    // An `O_PATH` descriptor is EBADF to them, as to every call that takes
+    // its descriptor as Linux's `fdget` does; `fstat` and `F_GETFL` take it.
+    let path = f.ret(2, &[DATA, 0o10000000, 0]);
+    for (number, args) in [
+        (74, [path, 0, 0]),
+        (75, [path, 0, 0]),
+        (221, [path, 0, 0]),
+        (0, [path, DATA + 0x400, 1]),
+        (8, [path, 0, 0]),
+        (73, [path, 1, 0]),
+        (72, [path, 4, 0]),
+    ] {
+        assert_eq!(f.ret(number, &args), errno(Errno::EBADF), "{number}");
+    }
+    assert_eq!(f.ret(5, &[path, DATA + 0x400]), 0);
+    assert_eq!(f.ret(72, &[path, 3, 0]), 0o10000000);
 }
 #[test]
 fn access_grants_root_reading_and_writing_but_execution_needs_a_bit() {

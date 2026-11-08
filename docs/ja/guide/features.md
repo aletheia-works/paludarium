@@ -190,6 +190,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `O_DIRECTORY`、`O_NOFOLLOW`、`O_PATH` だけを持ちます。パイプ、ソケット、カーネル
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
   除いて `O_LARGEFILE` がありません。
+- `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
+  読み書き、`lseek`、`flock`、`getdents64`、`sendfile`、`copy_file_range`、`fsync`、
+  `fdatasync`、`fadvise64`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
+  呼び出し、`epoll_ctl`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
+  `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
+  `select` は準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
+  `close` は受け付け、`*at` の呼び出しではディレクトリになります。
 - `fcntl` のバイト範囲のロックを、Linux の `fs/locks.c` と同じく扱います。プロセスが持つ
   レコードロック（`F_SETLK`、`F_SETLKW`、`F_GETLK`）と、開いたファイルの記述が持つ OFD ロック
   （`F_OFD_SETLK`、`F_OFD_SETLKW`、`F_OFD_GETLK`）で、互いにぶつかります。ある範囲のロックは、

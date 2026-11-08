@@ -789,6 +789,33 @@ fn io_descriptor(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno>
     }
     Ok(file)
 }
+/// EBADF for a call that takes its descriptors as Linux's `fdget` does,
+/// which refuses an `O_PATH` one: reads and writes, `lseek`, `flock`,
+/// `getdents`, `sendfile` and `copy_file_range`, and `fcntl` but for the
+/// commands `check_fcntl_cmd` lets through (duplicating, the descriptor
+/// flags and `F_GETFL`). A descriptor that is not open is left to the call.
+fn refuse_path_only(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<(), Errno> {
+    let descriptors: &[u64] = match n {
+        // read, readv, writev, pread64, pwrite64, preadv, pwritev, lseek,
+        // flock, getdents64
+        0 | 8 | 17 | 18 | 19 | 20 | 73 | 217 | 295 | 296 => &a[..1],
+        // sendfile(out, in), copy_file_range(in, _, out)
+        40 => &a[..2],
+        326 => &[a[0], a[2]],
+        // F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_DUPFD_QUERY, F_DUPFD_CLOEXEC
+        72 if !matches!(a[1] as u32, 0..=3 | 1027 | 1030) => &a[..1],
+        _ => return Ok(()),
+    };
+    for &fd in descriptors {
+        if c.files
+            .descriptor(fd)
+            .is_ok_and(|d| d.file.flags() & O_PATH != 0)
+        {
+            return Err(Errno::EBADF);
+        }
+    }
+    Ok(())
+}
 /// `chmod` of the file a link in `/proc/self/fd` leads to, which the
 /// descriptor's access does not limit: an `O_PATH` one's file changes too,
 /// as glibc's `fchmodat` with `AT_SYMLINK_NOFOLLOW` has it. A symbolic link
@@ -1779,6 +1806,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
 }
 pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
+    refuse_path_only(c, n, a)?;
     match n {
         40 => sendfile(c, a),
         332 => statx(c, a),
@@ -2572,13 +2600,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         21 => access(c, (-100i32) as u64, a[0], a[1], 0),
         269 => access(c, a[0], a[1], a[2], 0),
         439 => access(c, a[0], a[1], a[2], a[3]),
-        // fsync, fdatasync: both write everything, as nothing is cached
-        74 | 75 => c.files.descriptor(a[0])?.file.sync().map(|()| 0),
+        // fsync, fdatasync: both write everything, as nothing is cached; an
+        // `O_PATH` descriptor is EBADF, as Linux's `fdget` refuses it.
+        74 | 75 => io_descriptor(c, a[0])?.sync().map(|()| 0),
         // sync: nothing is cached, so there is nothing to write
         162 => Ok(0),
         // fadvise64: a hint, checked as Linux checks it
         221 => {
-            let file = c.files.descriptor(a[0])?.file;
+            let file = io_descriptor(c, a[0])?;
             if file.stat()?.mode & 0o170000 == 0o010000 {
                 return Err(Errno(29)); // ESPIPE
             }

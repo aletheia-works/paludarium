@@ -256,7 +256,12 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             .and_then(|v| v.downcast_ref::<EpollInstance>())
             .ok_or(Errno::EINVAL)?;
         if number == 233 {
+            // The target as Linux's `fdget` takes it: an `O_PATH` one is
+            // not a file to watch (EBADF).
             let target = c.files.descriptor(a[2])?;
+            if target.file.flags() & 0o10000000 != 0 {
+                return Err(Errno::EBADF);
+            }
             let (events, data) = if a[1] == 2 {
                 (0, 0)
             } else {

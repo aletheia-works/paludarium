@@ -4681,9 +4681,29 @@ int main(int argc, char **argv) {
         /* Running a program: EXECUTE. */
         pid = child();
         if (pid == 0) {
+            /* Removed files, one in a and one outside, which execveat runs
+               from their descriptors: Landlock still walks up from where
+               each was (EACCES outside a), and the one in a is no program. */
+            char removed_in[112], removed_out[112];
+            snprintf(removed_in, sizeof removed_in, "%s/removed", a);
+            snprintf(removed_out, sizeof removed_out, "%s/removed", b);
+            int in = open(removed_in, O_CREAT | O_RDWR, 0755), out = open(removed_out, O_CREAT | O_RDWR, 0755);
+            chmod(removed_in, 0755);
+            chmod(removed_out, 0755);
+            unlink(removed_in);
+            unlink(removed_out);
             long r = ll_ruleset(LL_EXECUTE);
             ll_rule(r, a, LL_EXECUTE);
             ll_enforce(r);
+            {
+                char *argv[] = {"x", NULL}, *envp[] = {NULL};
+                errno = 0;
+                syscall(SYS_execveat, in, "", argv, envp, AT_EMPTY_PATH);
+                result("exec-removed-inside", errno);
+                errno = 0;
+                syscall(SYS_execveat, out, "", argv, envp, AT_EMPTY_PATH);
+                result("exec-removed-outside", errno);
+            }
             /* A file that may be executed, outside a: Landlock refuses the
                open for execution before the file is read. */
             snprintf(tmp, sizeof tmp, "%s/x", b);

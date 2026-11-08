@@ -2413,7 +2413,12 @@ impl Kernel {
                     crate::permissions::exec(&self.files, creds, dir, &raw, &path)?;
                 ((named.clone(), path.clone(), path), program, readable, None)
             }
-            crate::files::Program::File { file, name, entry } => {
+            crate::files::Program::File {
+                file,
+                name,
+                entry,
+                removed,
+            } => {
                 let stat = file.stat()?;
                 if stat.mode & 0o170000 != 0o100000 {
                     return Err(Errno::EACCES);
@@ -2422,6 +2427,25 @@ impl Kernel {
                 let readable =
                     crate::permissions::permission(creds, &stat, crate::permissions::MAY_READ)
                         .is_ok();
+                // Landlock's check of the open for execution, which for a
+                // removed file walks up from where it was, the file itself
+                // still the object it was (a memfd is in no hierarchy).
+                if let Some(path) = &removed {
+                    let device = crate::page_cache::mount_device(&self.files.fs.mounts(), path);
+                    let files = &self.files;
+                    crate::landlock::check_with(
+                        &creds.landlock,
+                        &|p| {
+                            if p == path.as_slice() {
+                                Some((device, stat.inode))
+                            } else {
+                                crate::files::file_identity(files, p)
+                            }
+                        },
+                        path,
+                        crate::landlock::READ_FILE | crate::landlock::EXECUTE,
+                    )?;
+                }
                 (
                     (Vec::new(), Vec::new(), entry),
                     Some(stat),

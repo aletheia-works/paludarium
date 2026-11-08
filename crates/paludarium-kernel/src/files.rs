@@ -4230,6 +4230,9 @@ pub(crate) enum Program {
         name: Vec<u8>,
         /// The name of its directory entry, which names the process.
         entry: Vec<u8>,
+        /// The path a removed file had, whose directories Landlock still
+        /// walks from its dentry; none for a memfd.
+        removed: Option<Vec<u8>>,
     },
 }
 pub(crate) fn exec_program(
@@ -4296,6 +4299,7 @@ pub(crate) fn exec_program(
                 ),
             };
             Program::File {
+                removed: memfd.is_none().then(|| d.path.clone()),
                 file: d.file,
                 name,
                 entry,

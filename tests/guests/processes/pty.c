@@ -243,7 +243,9 @@ static int case_open(void) {
     TRY("write", write(m, "x", 1));
     say("still named %d", stat(name, &other));
     s = open(name, O_RDWR | O_NOCTTY);
-    say("open again %d poll %#x", s >= 0, polled(m, POLLIN | POLLOUT));
+    /* Whether the slave's line discipline has echoed the "x" yet is Linux's
+       work queue's timing, so only POLLOUT is looked at. */
+    say("open again %d poll %#x", s >= 0, polled(m, POLLOUT));
     /* The master closed: the slave is hung up. */
     close(m);
     TRY("unnamed", stat(name, &other));

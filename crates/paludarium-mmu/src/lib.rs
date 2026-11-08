@@ -220,6 +220,12 @@ impl MemoryMeter {
         }
     }
 
+    /// The bytes of page frames it allows.
+    #[must_use]
+    pub const fn max(&self) -> u64 {
+        self.max
+    }
+
     /// The bytes of page frames held now.
     #[must_use]
     pub fn used(&self) -> u64 {

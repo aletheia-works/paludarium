@@ -483,11 +483,19 @@ fn sleep_until(
             Ok(t) => t,
             Err(e) => return err(e),
         };
+        // Expiring the timers also takes in the process's signals, which
+        // clears the wake the wait watches: a signal already taken in ends
+        // the sleep before it starts, as Linux's do_nanosleep finds it
+        // pending when it schedules.
         c.group.expire_timer(c.process, mono_now);
-        let timer_deadline = signals::next_deadline(c.process)
-            .and_then(|d| clock_now.checked_add(d.saturating_sub(mono_now)));
-        let next = timer_deadline.map_or(deadline, |t| deadline.min(t));
-        let result = c.host.wait_until(clock, next, c.cancellation);
+        let result = if ends_sleep(c.process) || c.group.status().is_some() {
+            Ok(WaitOutcome::Interrupted)
+        } else {
+            let timer_deadline = signals::next_deadline(c.process)
+                .and_then(|d| clock_now.checked_add(d.saturating_sub(mono_now)));
+            let next = timer_deadline.map_or(deadline, |t| deadline.min(t));
+            c.host.wait_until(clock, next, c.cancellation)
+        };
         let received = c.inbox.drain(c.process);
         c.group.drain_process(c.process);
         let interrupted = received.interrupted
@@ -496,14 +504,7 @@ fn sleep_until(
         if let Ok(now) = c.host.clock(ClockId::Monotonic) {
             c.group.expire_timer(c.process, now);
         }
-        let pending = c.process.pending.iter().any(|s| {
-            c.process.signal_mask & (1u64 << (s.number - 1)) == 0
-                && c.process.signal_actions.get(&s.number).is_none_or(|a| {
-                    a.handler != 1 && (a.handler != 0 || !matches!(s.number, 17 | 18 | 23 | 28))
-                })
-                && (c.process.signal_actions.contains_key(&s.number)
-                    || !matches!(s.number, 17 | 18 | 23 | 28))
-        });
+        let pending = ends_sleep(c.process);
         match result {
             Ok(_)
                 if !pending
@@ -548,6 +549,18 @@ fn sleep_until(
             Err(e) => return err(e),
         }
     }
+}
+/// Whether a signal pending for the thread ends a sleep: one it does not
+/// block and does not ignore, by its action or by default.
+fn ends_sleep(process: &ThreadState) -> bool {
+    process.pending.iter().any(|s| {
+        process.signal_mask & (1u64 << (s.number - 1)) == 0
+            && process.signal_actions.get(&s.number).is_none_or(|a| {
+                a.handler != 1 && (a.handler != 0 || !matches!(s.number, 17 | 18 | 23 | 28))
+            })
+            && (process.signal_actions.contains_key(&s.number)
+                || !matches!(s.number, 17 | 18 | 23 | 28))
+    })
 }
 fn read_timeval(sec: u64, usec: u64) -> Result<u64, Errno> {
     if (sec as i64) < 0 || usec >= 1_000_000 {

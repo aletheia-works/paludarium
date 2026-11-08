@@ -3468,10 +3468,10 @@ static int proc_other_files_cases(const char *self) {
     printf("status first=%d name=%s umask=%s state=%s\n", !strncmp(buffer, "Name:", 5),
            proc_status_field(buffer, "Name"), proc_status_field(buffer, "Umask"),
            proc_status_field(buffer, "State"));
-    printf("status tgid=%d pid=%d ppid=%d threads=%s fdsize=%s\n",
-           !strcmp(proc_status_field(buffer, "Tgid"), pid_text), !strcmp(proc_status_field(buffer, "Pid"), pid_text),
-           !strcmp(proc_status_field(buffer, "PPid"), own_text), proc_status_field(buffer, "Threads"),
-           proc_status_field(buffer, "FDSize"));
+    /* FDSize is left out: a table the native run inherits may have grown. */
+    printf("status tgid=%d pid=%d ppid=%d threads=%s\n", !strcmp(proc_status_field(buffer, "Tgid"), pid_text),
+           !strcmp(proc_status_field(buffer, "Pid"), pid_text), !strcmp(proc_status_field(buffer, "PPid"), own_text),
+           proc_status_field(buffer, "Threads"));
     char ids[64];
     snprintf(ids, sizeof ids, "%u\t%u\t%u\t%u", getuid(), getuid(), getuid(), getuid());
     printf("status uid=%d sigpnd=%s shdpnd=%s\n", !strcmp(proc_status_field(buffer, "Uid"), ids),

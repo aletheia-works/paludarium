@@ -2786,3 +2786,155 @@ fn a_thread_that_is_not_root_is_checked_on_files() {
     assert_eq!(owner, [0xe8, 3, 0, 0, 0, 0, 0, 0]);
     assert_eq!(f.ret(84, &[closed]), errno(Errno::EACCES));
 }
+
+/// Landlock through its system calls: rulesets and their errors, then a
+/// domain that allows reading and making files only under `/tmp/ll/a`.
+#[test]
+fn landlock_restricts_access_beneath_its_rules() {
+    const READ_FILE: u64 = 1 << 2;
+    const WRITE_FILE: u64 = 1 << 1;
+    const READ_DIR: u64 = 1 << 3;
+    const REMOVE_FILE: u64 = 1 << 5;
+    const MAKE_DIR: u64 = 1 << 7;
+    const MAKE_REG: u64 = 1 << 8;
+    const MAKE_SYM: u64 = 1 << 12;
+    const REFER: u64 = 1 << 13;
+    const TRUNCATE: u64 = 1 << 14;
+    let mut f = fixture();
+    let mut at = DATA + 0x1000;
+    let mut text = |f: &mut Fixture, s: &str| {
+        let address = at;
+        f.mem.write(GuestAddr(address), s.as_bytes()).unwrap();
+        f.mem
+            .write(GuestAddr(address + s.len() as u64), &[0])
+            .unwrap();
+        at += s.len() as u64 + 1;
+        address
+    };
+    let tmp = text(&mut f, "/tmp/ll");
+    let a = text(&mut f, "/tmp/ll/a");
+    let b = text(&mut f, "/tmp/ll/b");
+    let af = text(&mut f, "/tmp/ll/a/f");
+    let bf = text(&mut f, "/tmp/ll/b/f");
+    let ag = text(&mut f, "/tmp/ll/a/g");
+    let bg = text(&mut f, "/tmp/ll/b/g");
+    let bd = text(&mut f, "/tmp/ll/b/d");
+    let bs = text(&mut f, "/tmp/ll/b/s");
+    let target = text(&mut f, "x");
+    for dir in [tmp, a, b] {
+        assert_eq!(f.ret(83, &[dir, 0o755]), 0);
+    }
+    for file in [af, bf] {
+        let fd = f.ret(2, &[file, 0o1101, 0o644]);
+        assert_eq!(f.ret(3, &[fd]), 0);
+    }
+    // The version, and the attribute's checks.
+    assert_eq!(f.ret(444, &[0, 0, 1]), 3);
+    assert_eq!(f.ret(444, &[0, 0, 2]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(444, &[DATA, 8, 1]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(444, &[0, 8, 0]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(444, &[DATA, 4, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(444, &[DATA, 4097, 0]), errno(Errno(7)));
+    f.mem.write(GuestAddr(DATA), &[0; 32]).unwrap();
+    assert_eq!(f.ret(444, &[DATA, 8, 0]), errno(Errno(42)));
+    f.mem.write(GuestAddr(DATA + 16), &[1]).unwrap();
+    assert_eq!(f.ret(444, &[DATA, 32, 0]), errno(Errno(7)));
+    f.mem
+        .write(GuestAddr(DATA), &(1u64 << 40).to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(444, &[DATA, 8, 0]), errno(Errno::EINVAL));
+    let handled = READ_FILE | WRITE_FILE | READ_DIR | MAKE_REG | MAKE_DIR | MAKE_SYM;
+    let handled = handled | REMOVE_FILE | REFER | TRUNCATE;
+    f.mem
+        .write(GuestAddr(DATA), &handled.to_le_bytes())
+        .unwrap();
+    f.mem.write(GuestAddr(DATA + 8), &[0; 24]).unwrap();
+    let ruleset = f.ret(444, &[DATA, 8, 0]);
+    assert!(ruleset < 1024);
+    assert_eq!(f.ret(0, &[ruleset, DATA + 64, 1]), errno(Errno::EINVAL));
+    // Rules: the descriptor, the type, the rights and the parent.
+    let rule = DATA + 0x200;
+    let put_rule = |f: &mut Fixture, allowed: u64, parent: u64| {
+        f.mem
+            .write(GuestAddr(rule), &allowed.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(rule + 8), &(parent as u32).to_le_bytes())
+            .unwrap();
+    };
+    let dir_a = f.ret(2, &[a, 0o10000000, 0]);
+    let file_af = f.ret(2, &[af, 0o10000000, 0]);
+    put_rule(&mut f, READ_FILE, dir_a);
+    assert_eq!(f.ret(445, &[ruleset, 1, rule, 1]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(445, &[999, 1, rule, 0]), errno(Errno::EBADF));
+    assert_eq!(f.ret(445, &[dir_a, 1, rule, 0]), errno(Errno(77)));
+    assert_eq!(f.ret(445, &[ruleset, 3, rule, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(445, &[ruleset, 1, 0, 0]), errno(Errno::EFAULT));
+    put_rule(&mut f, 0, dir_a);
+    assert_eq!(f.ret(445, &[ruleset, 1, rule, 0]), errno(Errno(42)));
+    put_rule(&mut f, 1, dir_a);
+    assert_eq!(f.ret(445, &[ruleset, 1, rule, 0]), errno(Errno::EINVAL));
+    put_rule(&mut f, READ_FILE, 999);
+    assert_eq!(f.ret(445, &[ruleset, 1, rule, 0]), errno(Errno::EBADF));
+    put_rule(&mut f, READ_FILE, ruleset);
+    assert_eq!(f.ret(445, &[ruleset, 1, rule, 0]), errno(Errno(77)));
+    put_rule(&mut f, MAKE_REG, file_af);
+    assert_eq!(f.ret(445, &[ruleset, 1, rule, 0]), errno(Errno::EINVAL));
+    put_rule(&mut f, READ_FILE | WRITE_FILE | READ_DIR | MAKE_REG, dir_a);
+    assert_eq!(f.ret(445, &[ruleset, 1, rule, 0]), 0);
+    put_rule(&mut f, REFER | MAKE_REG | REMOVE_FILE | TRUNCATE, dir_a);
+    assert_eq!(f.ret(445, &[ruleset, 1, rule, 0]), 0);
+    let before = f.ret(2, &[bf, 1, 0]);
+    // Enforcing: flags, then a descriptor that is no ruleset.
+    assert_eq!(f.ret(446, &[ruleset, 1]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(446, &[dir_a, 0]), errno(Errno(77)));
+    assert_eq!(f.ret(446, &[ruleset, 0]), 0);
+    let eacces = errno(Errno::EACCES);
+    let open = |f: &mut Fixture, path: u64, flags: u64| {
+        let fd = f.ret(2, &[path, flags, 0o644]);
+        if fd < 1024 {
+            f.ret(3, &[fd]);
+            0
+        } else {
+            fd
+        }
+    };
+    assert_eq!(open(&mut f, af, 0), 0);
+    assert_eq!(open(&mut f, af, 2), 0);
+    assert_eq!(open(&mut f, bf, 0), eacces);
+    assert_eq!(open(&mut f, bf, 1), eacces);
+    assert_eq!(open(&mut f, b, 0o200000), eacces);
+    assert_eq!(open(&mut f, bf, 0o10000000), 0);
+    assert_eq!(open(&mut f, af, 0o1001), 0);
+    assert_eq!(open(&mut f, ag, 0o101), 0);
+    assert_eq!(open(&mut f, bg, 0o101), eacces);
+    // Truncation: by path, by a descriptor from before and from after.
+    assert_eq!(f.ret(76, &[af, 0]), 0);
+    assert_eq!(f.ret(76, &[bf, 0]), eacces);
+    assert_eq!(f.ret(77, &[before, 0]), 0);
+    // Making and removing names.
+    assert_eq!(f.ret(83, &[bd, 0o755]), eacces);
+    assert_eq!(f.ret(88, &[target, bs]), eacces);
+    assert_eq!(f.ret(87, &[bf]), eacces);
+    assert_eq!(f.ret(87, &[ag]), 0);
+    // b has no rule, so making a name there is missing: EACCES, not EXDEV.
+    assert_eq!(f.ret(82, &[af, bg]), eacces);
+    assert_eq!(f.ret(86, &[af, bg]), eacces);
+    assert_eq!(f.ret(82, &[af, ag]), 0);
+    // A second layer narrows the first.
+    let second = f.ret(444, &[DATA, 8, 0]);
+    put_rule(&mut f, READ_FILE, dir_a);
+    f.mem
+        .write(GuestAddr(DATA), &READ_FILE.to_le_bytes())
+        .unwrap();
+    let narrow = f.ret(444, &[DATA, 8, 0]);
+    let file_ag = f.ret(2, &[ag, 0o10000000, 0]);
+    put_rule(&mut f, READ_FILE, file_ag);
+    assert_eq!(f.ret(445, &[narrow, 1, rule, 0]), 0);
+    assert_eq!(f.ret(446, &[narrow, 0]), 0);
+    assert_eq!(open(&mut f, ag, 0), 0);
+    let ah = text(&mut f, "/tmp/ll/a/h");
+    assert_eq!(open(&mut f, ah, 0o101), 0);
+    assert_eq!(open(&mut f, ah, 0), eacces);
+    f.ret(3, &[second]);
+}

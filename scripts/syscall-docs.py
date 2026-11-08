@@ -242,6 +242,9 @@ NAMES = {
     436: "close_range",
     437: "openat2",
     439: "faccessat2",
+    444: "landlock_create_ruleset",
+    445: "landlock_add_rule",
+    446: "landlock_restrict_self",
     452: "fchmodat2",
 }
 

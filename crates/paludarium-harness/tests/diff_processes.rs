@@ -246,6 +246,7 @@ mod linux {
         processes_personality => ("personality","process"),
         processes_membarrier => ("membarrier","process"),
         processes_unshare => ("unshare","process"),
+        processes_landlock => ("landlock","process"),
         processes_mempolicy => ("mempolicy","process"),
         processes_ids => ("ids","process"),
         processes_access => ("access","process"),

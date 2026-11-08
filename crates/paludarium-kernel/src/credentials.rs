@@ -111,6 +111,8 @@ pub struct Credentials {
     /// `PR_SET_KEEPCAPS` (`SECBIT_KEEP_CAPS`): leaving root keeps the
     /// permitted capabilities. Cleared by exec.
     pub keep_caps: bool,
+    /// The Landlock domain ([`crate::landlock`]), which exec keeps.
+    pub landlock: crate::landlock::Landlock,
 }
 
 /// Root with every capability, as the first process starts.
@@ -130,6 +132,7 @@ impl Default for Credentials {
             effective: ALL_CAPABILITIES,
             inheritable: 0,
             keep_caps: false,
+            landlock: crate::landlock::Landlock::default(),
         }
     }
 }

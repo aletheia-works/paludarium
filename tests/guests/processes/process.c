@@ -63,6 +63,48 @@ static void outcome(const char *name, long value) {
     printf("%s=%ld errno=%d\n", name, value, value < 0 ? errno : 0);
 }
 
+
+/* Landlock: raw system calls (444 to 446), ABI 3 rights only, which a newer
+   kernel shares. */
+#define LL_EXECUTE (1ULL << 0)
+#define LL_WRITE_FILE (1ULL << 1)
+#define LL_READ_FILE (1ULL << 2)
+#define LL_READ_DIR (1ULL << 3)
+#define LL_REMOVE_DIR (1ULL << 4)
+#define LL_REMOVE_FILE (1ULL << 5)
+#define LL_MAKE_DIR (1ULL << 7)
+#define LL_MAKE_REG (1ULL << 8)
+#define LL_MAKE_SOCK (1ULL << 9)
+#define LL_MAKE_FIFO (1ULL << 10)
+#define LL_MAKE_SYM (1ULL << 12)
+#define LL_REFER (1ULL << 13)
+#define LL_TRUNCATE (1ULL << 14)
+#define LL_FS ((1ULL << 15) - 1)
+struct ll_path_beneath { unsigned long long allowed; int parent_fd; } __attribute__((packed));
+static long ll_ruleset(unsigned long long handled) {
+    return syscall(444, &handled, sizeof handled, 0);
+}
+static long ll_rule(long ruleset, const char *path, unsigned long long allowed) {
+    struct ll_path_beneath rule = {allowed, open(path, O_PATH | O_CLOEXEC)};
+    long r = syscall(445, ruleset, 1, &rule, 0);
+    close(rule.parent_fd);
+    return r;
+}
+static long ll_enforce(long ruleset) {
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    long r = syscall(446, ruleset, 0);
+    close(ruleset);
+    return r;
+}
+/* An open's outcome: 0, or the errno. */
+static int ll_open(const char *path, int flags) {
+    int fd = open(path, flags, 0600);
+    if (fd < 0)
+        return errno;
+    close(fd);
+    return 0;
+}
+static int ll_call(long r) { return r < 0 ? errno : 0; }
 /* get_mempolicy's mode and first node word, with flags and an address. */
 static void policy(const char *name, unsigned long maxnode, void *addr, unsigned long flags) {
     int mode = -1;
@@ -4378,6 +4420,255 @@ int main(int argc, char **argv) {
         result("regrown", (char *)syscall(SYS_brk, top) == top);
         policy("heap-new", 65, last, 2);
 #undef MBIND
+        return 0;
+    }
+    if (!strcmp(mode, "landlock")) {
+        /* A directory with a and b inside, each with a file f; c in a. */
+        char top[64], a[80], b[80], af[96], bf[96], ac[96], tmp[128];
+        snprintf(top, sizeof top, "/tmp/paludarium-landlock-%d", getpid());
+        snprintf(a, sizeof a, "%s/a", top);
+        snprintf(b, sizeof b, "%s/b", top);
+        snprintf(af, sizeof af, "%s/f", a);
+        snprintf(bf, sizeof bf, "%s/f", b);
+        snprintf(ac, sizeof ac, "%s/c", a);
+        mkdir(top, 0755);
+        mkdir(a, 0755);
+        mkdir(b, 0755);
+        close(open(af, O_CREAT | O_WRONLY, 0644));
+        close(open(bf, O_CREAT | O_WRONLY, 0644));
+        mkdir(ac, 0755);
+
+        long abi = syscall(444, NULL, 0, 1);
+        result("abi-at-least-3", abi >= 3);
+        errno = 0;
+        unsigned long long big[8] = {LL_READ_FILE};
+        result("version-with-attr", ll_call(syscall(444, big, 8, 1)));
+        result("unknown-flag", ll_call(syscall(444, NULL, 0, 4)));
+        result("null-attr", ll_call(syscall(444, NULL, 8, 0)));
+        result("short-attr", ll_call(syscall(444, big, 4, 0)));
+        result("huge-attr", ll_call(syscall(444, big, 4097, 0)));
+        big[5] = 1;
+        result("nonzero-tail", ll_call(syscall(444, big, sizeof big, 0)));
+        big[5] = 0;
+        long zeros = syscall(444, big, sizeof big, 0);
+        result("zero-tail", zeros >= 0);
+        close(zeros);
+        unsigned long long none = 0, unknown = 1ULL << 40;
+        result("nothing-handled", ll_call(syscall(444, &none, 8, 0)));
+        result("unknown-right", ll_call(syscall(444, &unknown, 8, 0)));
+        long rs = ll_ruleset(LL_READ_FILE | LL_MAKE_REG);
+        result("ruleset", rs >= 0);
+        result("cloexec", fcntl(rs, F_GETFD) & FD_CLOEXEC);
+        char target[64] = {0};
+        snprintf(tmp, sizeof tmp, "/proc/self/fd/%ld", rs);
+        readlink(tmp, target, sizeof target - 1);
+        printf("link=%s\n", target);
+        char byte;
+        result("read", ll_call(read(rs, &byte, 1)));
+        struct ll_path_beneath rule = {LL_READ_FILE, open(a, O_PATH)};
+        result("rule-flags", ll_call(syscall(445, rs, 1, &rule, 1)));
+        result("rule-bad-fd", ll_call(syscall(445, 9999, 1, &rule, 0)));
+        int ev = eventfd(0, 0);
+        result("rule-not-ruleset", ll_call(syscall(445, ev, 1, &rule, 0)));
+        result("rule-type", ll_call(syscall(445, rs, 3, &rule, 0)));
+        result("rule-null", ll_call(syscall(445, rs, 1, NULL, 0)));
+        rule.allowed = 0;
+        result("rule-empty", ll_call(syscall(445, rs, 1, &rule, 0)));
+        rule.allowed = LL_WRITE_FILE;
+        result("rule-unhandled", ll_call(syscall(445, rs, 1, &rule, 0)));
+        rule.allowed = LL_READ_FILE;
+        int parent = rule.parent_fd;
+        rule.parent_fd = -1;
+        result("rule-parent-bad", ll_call(syscall(445, rs, 1, &rule, 0)));
+        rule.parent_fd = ev;
+        result("rule-parent-eventfd", ll_call(syscall(445, rs, 1, &rule, 0)));
+        rule.parent_fd = open(af, O_PATH);
+        rule.allowed = LL_MAKE_REG;
+        result("rule-file-make", ll_call(syscall(445, rs, 1, &rule, 0)));
+        rule.allowed = LL_READ_FILE;
+        result("rule-file-read", ll_call(syscall(445, rs, 1, &rule, 0)));
+        close(rule.parent_fd);
+        rule.parent_fd = parent;
+        result("rule-dir", ll_call(syscall(445, rs, 1, &rule, 0)));
+        close(parent);
+        /* The native side runs unprivileged, which no_new_privs lets
+           restrict itself; the flags and the descriptor come after. */
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        result("restrict-flags", ll_call(syscall(446, rs, 1 << 10)));
+        result("restrict-not-ruleset", ll_call(syscall(446, ev, 0)));
+        close(ev);
+        close(rs);
+        fflush(stdout);
+
+        /* Reading and writing: a allows both, b nothing; one layer. */
+        pid_t pid = child();
+        if (pid == 0) {
+            int before = open(bf, O_WRONLY);
+            long r = ll_ruleset(LL_READ_FILE | LL_WRITE_FILE | LL_READ_DIR | LL_TRUNCATE);
+            ll_rule(r, a, LL_READ_FILE | LL_WRITE_FILE | LL_READ_DIR | LL_TRUNCATE);
+            result("enforce", ll_call(ll_enforce(r)));
+            result("read-a", ll_open(af, O_RDONLY));
+            result("write-a", ll_open(af, O_WRONLY));
+            result("read-b", ll_open(bf, O_RDONLY));
+            result("write-b", ll_open(bf, O_WRONLY));
+            result("dir-a", ll_open(a, O_RDONLY | O_DIRECTORY));
+            result("dir-b", ll_open(b, O_RDONLY | O_DIRECTORY));
+            result("path-b", ll_open(bf, O_PATH));
+            struct stat st;
+            result("stat-b", ll_call(stat(bf, &st)));
+            result("trunc-open-a", ll_open(af, O_WRONLY | O_TRUNC));
+            result("truncate-a", ll_call(truncate(af, 0)));
+            result("truncate-b", ll_call(truncate(bf, 0)));
+            result("ftruncate-before", ll_call(ftruncate(before, 0)));
+            int fa = open(af, O_WRONLY);
+            result("ftruncate-a", ll_call(ftruncate(fa, 0)));
+            close(fa);
+            result("proc-status", ll_open("/proc/self/status", O_RDONLY));
+            /* A child keeps the domain. */
+            fflush(stdout);
+            pid_t grandchild = child();
+            if (grandchild == 0) {
+                result("child-read-b", ll_open(bf, O_RDONLY));
+                fflush(stdout);
+                _exit(0);
+            }
+            waitpid(grandchild, NULL, 0);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
+        /* Truncation without TRUNCATE, and a second layer. */
+        pid = child();
+        if (pid == 0) {
+            long r = ll_ruleset(LL_READ_FILE | LL_WRITE_FILE | LL_TRUNCATE);
+            ll_rule(r, a, LL_READ_FILE | LL_WRITE_FILE);
+            ll_rule(r, b, LL_READ_FILE | LL_WRITE_FILE | LL_TRUNCATE);
+            ll_enforce(r);
+            result("trunc-no-right", ll_open(af, O_WRONLY | O_TRUNC));
+            result("write-no-trunc", ll_open(af, O_WRONLY));
+            result("trunc-b", ll_open(bf, O_WRONLY | O_TRUNC));
+            r = ll_ruleset(LL_READ_FILE);
+            ll_rule(r, a, LL_READ_FILE);
+            result("second-layer", ll_call(ll_enforce(r)));
+            result("layered-read-a", ll_open(af, O_RDONLY));
+            result("layered-read-b", ll_open(bf, O_RDONLY));
+            result("layered-write-b", ll_open(bf, O_WRONLY));
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
+        /* Making and removing names. */
+        pid = child();
+        if (pid == 0) {
+            unsigned long long make = LL_MAKE_REG | LL_MAKE_DIR | LL_MAKE_SYM | LL_MAKE_FIFO |
+                                      LL_MAKE_SOCK | LL_REMOVE_FILE | LL_REMOVE_DIR;
+            long r = ll_ruleset(make);
+            ll_rule(r, a, make);
+            ll_enforce(r);
+            snprintf(tmp, sizeof tmp, "%s/new", a);
+            result("create-a", ll_open(tmp, O_CREAT | O_WRONLY));
+            result("unlink-a", ll_call(unlink(tmp)));
+            snprintf(tmp, sizeof tmp, "%s/new", b);
+            result("create-b", ll_open(tmp, O_CREAT | O_WRONLY));
+            result("create-existing-b", ll_open(bf, O_CREAT | O_WRONLY));
+            result("mkdir-b", ll_call(mkdir(tmp, 0755)));
+            result("symlink-b", ll_call(symlink("x", tmp)));
+            result("mkfifo-b", ll_call(mkfifo(tmp, 0644)));
+            result("unlink-b", ll_call(unlink(bf)));
+            result("unlink-missing-b", ll_call(unlink(tmp)));
+            snprintf(tmp, sizeof tmp, "%s/d", a);
+            result("mkdir-a", ll_call(mkdir(tmp, 0755)));
+            result("rmdir-a", ll_call(rmdir(tmp)));
+            int s = socket(AF_UNIX, SOCK_STREAM, 0);
+            struct sockaddr_un sun = {AF_UNIX};
+            snprintf(sun.sun_path, sizeof sun.sun_path, "%s/s", b);
+            result("bind-b", ll_call(bind(s, (void *)&sun, sizeof sun)));
+            close(s);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
+        /* Moving between directories: REFER, and no new rights. */
+        pid = child();
+        if (pid == 0) {
+            unsigned long long move = LL_MAKE_REG | LL_REMOVE_FILE | LL_READ_FILE | LL_REFER;
+            long r = ll_ruleset(move);
+            ll_rule(r, a, LL_MAKE_REG | LL_REMOVE_FILE | LL_REFER);
+            ll_rule(r, b, LL_MAKE_REG | LL_REMOVE_FILE | LL_REFER | LL_READ_FILE);
+            ll_enforce(r);
+            char x[128], y[128];
+            snprintf(x, sizeof x, "%s/g", a);
+            snprintf(y, sizeof y, "%s/g", b);
+            result("same-dir-rename", ll_call(rename(af, x)));
+            result("gaining-rename", ll_call(rename(x, y)));
+            result("gaining-link", ll_call(link(x, y)));
+            result("losing-rename", ll_call(rename(bf, x)));
+            result("exchange", ll_call(syscall(316, AT_FDCWD, x, AT_FDCWD, y, 2)));
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+        pid = child();
+        if (pid == 0) {
+            /* Without REFER handled, moving to another directory is EXDEV. */
+            long r = ll_ruleset(LL_MAKE_REG | LL_REMOVE_FILE);
+            ll_rule(r, top, LL_MAKE_REG | LL_REMOVE_FILE);
+            ll_enforce(r);
+            char x[128];
+            snprintf(x, sizeof x, "%s/h", b);
+            snprintf(tmp, sizeof tmp, "%s/g", a);
+            result("no-refer-rename", ll_call(rename(tmp, x)));
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
+        /* A rule names the file its descriptor holds, even renamed since. */
+        pid = child();
+        if (pid == 0) {
+            char d1[128], d2[128], inner[160];
+            snprintf(d1, sizeof d1, "%s/d1", top);
+            snprintf(d2, sizeof d2, "%s/d2", top);
+            snprintf(inner, sizeof inner, "%s/f", d2);
+            mkdir(d1, 0755);
+            int held = open(d1, O_PATH | O_DIRECTORY);
+            result("renamed", ll_call(rename(d1, d2)));
+            close(open(inner, O_CREAT | O_WRONLY, 0644));
+            long r = ll_ruleset(LL_READ_FILE);
+            struct ll_path_beneath held_rule = {LL_READ_FILE, held};
+            result("rule-renamed", ll_call(syscall(445, r, 1, &held_rule, 0)));
+            ll_enforce(r);
+            result("read-renamed", ll_open(inner, O_RDONLY));
+            result("read-other", ll_open(af, O_RDONLY));
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
+        /* Running a program: EXECUTE. */
+        pid = child();
+        if (pid == 0) {
+            long r = ll_ruleset(LL_EXECUTE);
+            ll_rule(r, a, LL_EXECUTE);
+            ll_enforce(r);
+            /* A file that may be executed, outside a: Landlock refuses the
+               open for execution before the file is read. */
+            snprintf(tmp, sizeof tmp, "%s/x", b);
+            close(open(tmp, O_CREAT | O_WRONLY, 0755));
+            chmod(tmp, 0755);
+            char *argv[] = {"x", NULL};
+            execv(tmp, argv);
+            result("exec-outside", errno);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
+        snprintf(tmp, sizeof tmp, "rm -rf %s", top);
+        system(tmp);
         return 0;
     }
     if (!strcmp(mode, "affinity")) {

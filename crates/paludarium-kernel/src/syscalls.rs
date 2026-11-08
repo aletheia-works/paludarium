@@ -250,6 +250,21 @@ impl SyscallTable {
         // Tokio's current Linux std uses GRND_INSECURE to seed its scheduler;
         // the Host random boundary supplies secure bytes without OS passthrough.
         handlers.insert(318, sys_getrandom);
+        handlers.insert(444, |c, a| {
+            Outcome::Return(
+                crate::landlock::sys_create_ruleset(c, a).unwrap_or_else(Errno::to_syscall_return),
+            )
+        });
+        handlers.insert(445, |c, a| {
+            Outcome::Return(
+                crate::landlock::sys_add_rule(c, a).unwrap_or_else(Errno::to_syscall_return),
+            )
+        });
+        handlers.insert(446, |c, a| {
+            Outcome::Return(
+                crate::landlock::sys_restrict_self(c, a).unwrap_or_else(Errno::to_syscall_return),
+            )
+        });
         for number in [213, 233, 232, 281, 291] {
             handlers.insert(number, crate::epoll::dispatch);
         }

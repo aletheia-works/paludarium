@@ -236,6 +236,11 @@ impl Termios {
         }
         new.ispeed = new.input_speed();
         new.ospeed = new.output_speed();
+        // As on Linux, the speeds come from the request before the lock
+        // applies: `set_termios` sets them, then `tty_set_termios` calls
+        // `unset_locked_termios`, which leaves them ("FIXME: What should we
+        // do for i/ospeed"), so a locked `CBAUD` keeps the old code while
+        // the speeds follow the request.
         let keep = |new: u32, old: u32, locked: u32| new & !locked | old & locked;
         new.iflag = keep(new.iflag, self.iflag, locked.iflag);
         new.oflag = keep(new.oflag, self.oflag, locked.oflag);
@@ -2445,6 +2450,16 @@ mod tests {
         let set = termios.decoded(&bytes, &locked);
         assert_eq!((set.lflag, set.line), (ECHO, 0));
         assert_eq!((set.cc[VINTR], set.cc[VQUIT]), (3, 9));
+        // A locked CBAUD keeps B38400 in cflag; the speeds follow B9600.
+        let mut speed = Termios::ZERO;
+        speed.cflag = CBAUD;
+        let mut bytes = termios.encode(false);
+        bytes[8..12].copy_from_slice(&(0o15 | CS8 | CREAD).to_le_bytes());
+        let set = termios.decoded(&bytes, &speed);
+        assert_eq!(
+            (set.cflag & CBAUD, set.ospeed, set.ispeed),
+            (B38400, 9600, 9600)
+        );
     }
 
     #[test]

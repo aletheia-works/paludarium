@@ -3137,9 +3137,11 @@ fn landlock_restricts_access_beneath_its_rules() {
     let before = f.ret(2, &[bf, 1, 0]);
     // Enforcing: flags, then a descriptor that is no ruleset.
     assert_eq!(f.ret(446, &[ruleset, 1 << 4]), errno(Errno::EINVAL));
-    // LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF alone needs no ruleset; with
-    // another flag, -1 is no descriptor.
+    // LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF, with or without
+    // LANDLOCK_RESTRICT_SELF_TSYNC, needs no ruleset; with another flag, -1
+    // is no descriptor.
     assert_eq!(f.ret(446, &[u64::MAX, 4]), 0);
+    assert_eq!(f.ret(446, &[u64::MAX, 4 | 8]), 0);
     assert_eq!(f.ret(446, &[u64::MAX, 5]), errno(Errno::EBADF));
     assert_eq!(f.ret(446, &[dir_a, 0]), errno(Errno(77)));
     assert_eq!(f.ret(446, &[ruleset, 0]), 0);

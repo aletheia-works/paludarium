@@ -785,9 +785,11 @@ fn add_port(c: &Context<'_>, ruleset: &Ruleset, at: u64) -> Result<u64, Errno> {
 /// `landlock_restrict_self(ruleset_fd, flags)`: the thread's domain with the
 /// ruleset as a new layer on top, in a hierarchy of its own, and with
 /// `LANDLOCK_RESTRICT_SELF_TSYNC` every other thread's too. The logging
-/// flags are taken and change nothing, as nothing is logged; with
-/// `LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF` alone a descriptor of -1
-/// asks for nothing more.
+/// flags are taken and change nothing, as nothing is logged. With
+/// `LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF`, and optionally
+/// `LANDLOCK_RESTRICT_SELF_TSYNC`, a descriptor of -1 makes no new domain;
+/// TSYNC then gives the other threads the caller's own, as Linux's does
+/// (the check in its `syscalls.c` after 7.0, which the runner's kernel has).
 pub(crate) fn sys_restrict_self(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     const CAP_SYS_ADMIN: u64 = 1 << 21;
     let no_new_privs = c.processes.status_of(c.process.pid).2;
@@ -798,7 +800,11 @@ pub(crate) fn sys_restrict_self(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64,
     if flags & !RESTRICT_SELF != 0 {
         return Err(Errno::EINVAL);
     }
-    if a[0] as i32 == -1 && flags == RESTRICT_SELF_LOG_SUBDOMAINS_OFF {
+    if a[0] as i32 == -1 && flags & !RESTRICT_SELF_TSYNC == RESTRICT_SELF_LOG_SUBDOMAINS_OFF {
+        if flags & RESTRICT_SELF_TSYNC != 0 {
+            let domain = c.process.credentials.landlock.clone();
+            c.process.credentials.landlock_sync = c.group.sync_landlock(&domain);
+        }
         return Ok(0);
     }
     let file = ruleset(c, a[0])?;

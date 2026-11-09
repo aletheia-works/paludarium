@@ -5214,8 +5214,11 @@ int main(int argc, char **argv) {
             result("restrict-unknown-flag", ll_call(syscall(446, r, 1U << 4)));
             result("subdomains-off-alone", ll_call(syscall(446, -1, LL_LOG_SUBDOMAINS_OFF)));
             result("no-ruleset", ll_call(syscall(446, -1, 0)));
+            /* -1 may come with TSYNC too, but with no other flag. */
             result("subdomains-off-and-more",
                    ll_call(syscall(446, -1, LL_LOG_SUBDOMAINS_OFF | LL_TSYNC)));
+            result("subdomains-off-and-log",
+                   ll_call(syscall(446, -1, LL_LOG_SUBDOMAINS_OFF | LL_LOG_SAME_EXEC_OFF)));
             close(r);
         }
         fflush(stdout);

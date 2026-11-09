@@ -173,9 +173,9 @@ verified.
   every file there as root's again.
 - **Landlock**: ABI version 8 is the newest there; the logging flags are
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
-  threads take the new domain when they next enter the kernel, where Linux
-  waits until they all have, and `/proc` shows a thread's domain from its
-  next system call on. `SIGIO` and `SIGURG` from `F_SETOWN` are not scoped,
+  threads take the new domain for their own checks when they next enter the
+  kernel, where Linux waits until they all have. Signals to them meet it at
+  once, and `/proc` shows it after each one's next system call. `SIGIO` and `SIGURG` from `F_SETOWN` are not scoped,
   as `F_SETOWN` records no sender. A rename's Landlock check comes after its permission checks,
   where Linux's comes before them, which shows only when both refuse. A rule
   on a file under `/proc` does not count for `execve`. An open checks the

@@ -114,26 +114,32 @@ static long ll_scoped(unsigned long long fs, unsigned long long scoped) {
     struct ll_scoped_attr attr = {fs, 0, scoped};
     return syscall(444, &attr, sizeof attr, 0);
 }
-/* A sibling thread for TSYNC: it waits for a byte, then opens `ll_target`
-   and reports the errno. */
-static const char *ll_target;
-static int ll_go[2], ll_done[2];
+/* A sibling thread for TSYNC: it first enforces a layer of its own that
+   handles WRITE_FILE, then waits for a byte, opens `ll_target` for reading
+   and `ll_writable` for writing, and reports both errnos. */
+static long ll_ruleset(unsigned long long handled);
+static const char *ll_target, *ll_writable;
+static int ll_go[2], ll_done[2], ll_ready[2];
 static void *ll_thread_open(void *unused) {
     (void)unused;
+    long own = ll_ruleset(1ULL << 1);
+    int r = ll_call(syscall(446, own, 0));
+    close(own);
+    if (write(ll_ready[1], &r, sizeof r) != sizeof r)
+        return NULL;
     char byte;
     if (read(ll_go[0], &byte, 1) != 1)
         return NULL;
-    int r = ll_open(ll_target, O_RDONLY);
-    if (write(ll_done[1], &r, sizeof r) != sizeof r)
+    int found[2] = {ll_open(ll_target, O_RDONLY), ll_open(ll_writable, O_WRONLY)};
+    if (write(ll_done[1], found, sizeof found) != sizeof found)
         return NULL;
     return NULL;
 }
 /* What the sibling thread found, after it is told to look. */
-static int ll_ask_thread(void) {
-    int r = -1;
-    if (write(ll_go[1], "x", 1) != 1 || read(ll_done[0], &r, sizeof r) != sizeof r)
-        return -1;
-    return r;
+static void ll_ask_thread(int found[2]) {
+    found[0] = found[1] = -1;
+    if (write(ll_go[1], "x", 1) != 1 || read(ll_done[0], found, 2 * sizeof *found) != 2 * sizeof *found)
+        found[0] = found[1] = -1;
 }
 /* A thread that enforces a ruleset scoping signals for itself alone, then
    signals the thread that made it (erratum 2: threads of one process may). */
@@ -5325,18 +5331,32 @@ int main(int argc, char **argv) {
             if (pid == 0) {
                 snprintf(tmp, sizeof tmp, "%s/tsync", b);
                 close(open(tmp, O_CREAT | O_WRONLY, 0644));
+                char writable[128];
+                snprintf(writable, sizeof writable, "%s/tsync-write", a);
+                close(open(writable, O_CREAT | O_WRONLY, 0644));
                 ll_target = tmp;
+                ll_writable = writable;
                 pipe(ll_go);
                 pipe(ll_done);
+                pipe(ll_ready);
+                prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                 pthread_t thread;
                 pthread_create(&thread, NULL, ll_thread_open, NULL);
+                int own = -1;
+                if (read(ll_ready[0], &own, sizeof own) != sizeof own)
+                    own = -1;
+                result("sibling-own-layer", own);
                 long r = ll_ruleset(LL_READ_FILE);
                 ll_rule(r, a, LL_READ_FILE);
-                prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                 result(tsync ? "enforce-tsync" : "enforce-alone",
                        ll_call(syscall(446, r, tsync ? LL_TSYNC : 0)));
                 close(r);
-                result(tsync ? "sibling-with-tsync" : "sibling-without", ll_ask_thread());
+                /* TSYNC replaces the sibling's own domain with the caller's,
+                   whatever it was, so its WRITE_FILE layer goes. */
+                int found[2];
+                ll_ask_thread(found);
+                result(tsync ? "sibling-with-tsync" : "sibling-without", found[0]);
+                result(tsync ? "sibling-write-with-tsync" : "sibling-write-without", found[1]);
                 result(tsync ? "self-with-tsync" : "self-without", ll_open(tmp, O_RDONLY));
                 pthread_join(thread, NULL);
                 fflush(stdout);

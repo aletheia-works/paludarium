@@ -4943,6 +4943,10 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
 /// This process's `/proc/self/status`.
 fn status(c: &Context<'_>) -> Vec<u8> {
     let (parent, queue_limit, no_new_privs) = c.processes.status_of(c.process.pid);
+    let (group_id, session, space) = c.processes.view(c.process.pid).map_or_else(
+        || (0, 0, c.group.namespaces(c.tid).pid.clone()),
+        |view| (view.group_id, view.session, view.space),
+    );
     let mask = |numbers: &mut dyn Iterator<Item = i32>| {
         numbers
             .filter(|n| (1..=64).contains(n))
@@ -4964,6 +4968,9 @@ fn status(c: &Context<'_>) -> Vec<u8> {
         tgid: c.process.pid,
         pid: c.process.pid,
         parent,
+        group_id,
+        session,
+        space: &space,
         descriptors: Some(descriptors),
         threads: c.group.active_threads(),
         queued: c.process.pending.len(),

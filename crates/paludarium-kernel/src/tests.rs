@@ -2350,10 +2350,11 @@ fn clone3_arguments_follow_linux() {
     put(&[
         0x10_0000, 0, 0x200, 0x300, 17, 0x1000, 0x800, 0x400, 0, 0, 0,
     ]);
-    assert_eq!(args(64), Ok([0x10_0011, 0x1800, 0x300, 0x200, 0x400, 0]));
+    let legacy = [0x10_0011, 0x1800, 0x300, 0x200, 0x400, 0];
+    assert_eq!(args(64), Ok((legacy, vec![])));
     assert_eq!(args(63), Err(Errno::EINVAL));
     assert_eq!(args(4097), Err(Errno(7)));
-    assert_eq!(args(96), Ok([0x10_0011, 0x1800, 0x300, 0x200, 0x400, 0]));
+    assert_eq!(args(96), Ok((legacy, vec![])));
     f.mem.write(GuestAddr(DATA + 90), &[1]).unwrap();
     assert_eq!(args(96), Err(Errno(7)));
     for words in [
@@ -2370,11 +2371,18 @@ fn clone3_arguments_follow_linux() {
         put(&[&words[..], &[0, 0, 0]].concat());
         assert_eq!(args(88), Err(Errno::EINVAL), "{words:x?}");
     }
-    // set_tid and its size come together, and are not supported.
+    // set_tid and its size come together, at most 32 numbers, which are
+    // read before the flags are looked at.
     put(&[0, 0, 0, 0, 17, 0, 0, 0, 0, 1, 0]);
     assert_eq!(args(88), Err(Errno::EINVAL));
-    put(&[0, 0, 0, 0, 17, 0, 0, 0, DATA, 1, 0]);
+    put(&[0, 0, 0, 0, 17, 0, 0, 0, DATA, 0, 0]);
     assert_eq!(args(88), Err(Errno::EINVAL));
+    put(&[0, 0, 0, 0, 17, 0, 0, 0, DATA, 33, 0]);
+    assert_eq!(args(88), Err(Errno::EINVAL));
+    put(&[0x11, 0, 0, 0, 17, 0, 0, 0, 0x10, 2, 0]);
+    assert_eq!(args(88), Err(Errno::EFAULT));
+    put(&[0, 0, 0, 0, 17, 0, 0, 0, DATA + 88, 2, 0, 7 | 3 << 32]);
+    assert_eq!(args(88), Ok(([17, 0, 0, 0, 0, 0], vec![7, 3])));
     assert_eq!(
         crate::processes::clone3_args(&f.mem, 0x10, 64),
         Err(Errno::EFAULT)

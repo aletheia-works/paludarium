@@ -57,8 +57,9 @@ pub mod auxv {
     /// What `AT_RSEQ_FEATURE_SIZE` gives: the part of `struct rseq` the
     /// kernel keeps up to date, Linux's `offsetof(struct rseq, end)`.
     pub const RSEQ_FEATURE_SIZE: u64 = 28;
-    /// What `AT_RSEQ_ALIGN` gives: `__alignof__(struct rseq)`.
-    pub const RSEQ_ALIGN: u64 = 32;
+    /// What `AT_RSEQ_ALIGN` gives: `__alignof__(struct rseq)`, 64 since
+    /// Linux's `struct rseq` grew past its original 32 bytes.
+    pub const RSEQ_ALIGN: u64 = 64;
 }
 
 /// Why a program could not be loaded.

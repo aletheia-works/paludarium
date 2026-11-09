@@ -87,63 +87,75 @@ fn a_thread_in_its_section_goes_on_at_the_abort_handler() {
 }
 
 #[test]
-fn descriptors_linux_does_not_accept_are_refused_wherever_the_thread_is() {
+fn a_descriptor_is_refused_only_for_a_thread_inside_its_section() {
     let mem = memory();
-    let outside = START + 0x40;
-    for (version, flags, abort) in [(1, 0, ABORT), (0, 0, START + 4)] {
+    // A version, flags, an abort handler inside the section, and another
+    // signature before the handler.
+    let refused: [(u32, u32, u64, u32); 4] = [
+        (1, 0, ABORT, SIGNATURE),
+        (0, 1, ABORT, SIGNATURE),
+        (0, 0, START + 4, SIGNATURE),
+        (0, 0, ABORT, 1),
+    ];
+    for (version, flags, abort, signature) in refused {
+        // Outside the section, the descriptor is only cleared, as current
+        // Linux reads no more of it than where the section is.
+        for outside in [START - 1, START + 0x20, START + 0x40] {
+            describe(&mem, version, flags, abort);
+            mem.write(GuestAddr(abort - 4), &signature.to_le_bytes())
+                .unwrap();
+            let mut rip = outside;
+            assert_eq!(fixup(&mem, &registration(), &mut rip, true), Ok(()));
+            assert_eq!((rip, descriptor(&mem)), (outside, 0));
+        }
         describe(&mem, version, flags, abort);
-        let mut rip = outside;
+        mem.write(GuestAddr(abort - 4), &signature.to_le_bytes())
+            .unwrap();
+        let mut rip = START + 2;
         assert_eq!(fixup(&mem, &registration(), &mut rip, true), Err(()));
-        assert_eq!(rip, outside);
+        assert_eq!(rip, START + 2);
     }
-    // Another signature before the abort handler.
-    describe(&mem, 0, 0, ABORT);
-    mem.write(GuestAddr(ABORT - 4), &1u32.to_le_bytes())
-        .unwrap();
-    assert_eq!(
-        fixup(&mem, &registration(), &mut outside.clone(), true),
-        Err(())
-    );
-    // A section past the end of user space, and a descriptor there.
-    describe(&mem, 0, 0, ABORT);
-    let mut bytes = [0; 8];
-    bytes.copy_from_slice(&(TASK_SIZE - 0x10).to_le_bytes());
-    mem.write(GuestAddr(DESCRIPTOR + 8), &bytes).unwrap();
-    assert_eq!(
-        fixup(&mem, &registration(), &mut outside.clone(), true),
-        Err(())
-    );
-    mem.write(GuestAddr(AREA + 8), &TASK_SIZE.to_le_bytes())
-        .unwrap();
-    assert_eq!(
-        fixup(&mem, &registration(), &mut outside.clone(), true),
-        Err(())
-    );
-    // A descriptor it cannot read.
-    mem.write(GuestAddr(AREA + 8), &0x40_0000u64.to_le_bytes())
-        .unwrap();
-    assert_eq!(
-        fixup(&mem, &registration(), &mut outside.clone(), true),
-        Err(())
-    );
-}
-
-#[test]
-fn flags_are_refused_only_inside_the_section() {
-    let mem = memory();
-    describe(&mem, 0, 1, ABORT);
-    let mut rip = START + 0x40;
-    assert_eq!(fixup(&mem, &registration(), &mut rip, true), Ok(()));
-    assert_eq!(descriptor(&mem), 0);
-    describe(&mem, 0, 1, ABORT);
-    let mut rip = START;
-    assert_eq!(fixup(&mem, &registration(), &mut rip, true), Err(()));
-    // The area's own flags too.
+    // The area's own flags are no longer read.
     describe(&mem, 0, 0, ABORT);
     mem.write(GuestAddr(AREA + 16), &2u32.to_le_bytes())
         .unwrap();
-    assert_eq!(fixup(&mem, &registration(), &mut rip, true), Err(()));
-    assert_eq!(rip, START);
+    let mut rip = START;
+    assert_eq!(fixup(&mem, &registration(), &mut rip, true), Ok(()));
+    assert_eq!(rip, ABORT);
+}
+
+#[test]
+fn a_section_or_descriptor_past_user_space_is_refused_wherever_the_thread_is() {
+    let mem = memory();
+    let outside = START + 0x40;
+    // A section that ends past user space, for a thread past its start.
+    describe(&mem, 0, 0, ABORT);
+    mem.write(
+        GuestAddr(DESCRIPTOR + 16),
+        &(TASK_SIZE - 0x10).to_le_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        fixup(&mem, &registration(), &mut outside.clone(), true),
+        Err(())
+    );
+    // One that starts there.
+    describe(&mem, 0, 0, ABORT);
+    mem.write(GuestAddr(DESCRIPTOR + 8), &TASK_SIZE.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        fixup(&mem, &registration(), &mut outside.clone(), true),
+        Err(())
+    );
+    // A descriptor there, and one it cannot read.
+    for address in [TASK_SIZE, 0x40_0000] {
+        mem.write(GuestAddr(AREA + 8), &address.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            fixup(&mem, &registration(), &mut outside.clone(), true),
+            Err(())
+        );
+    }
 }
 
 #[test]

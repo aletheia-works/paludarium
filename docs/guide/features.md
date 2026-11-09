@@ -652,7 +652,8 @@ kernel.
 - `rseq` registers a thread's area as Linux does, with its checks and
   errors (`EINVAL`, `EPERM`, `EBUSY`, `EFAULT`), and clears the area's
   `rseq_cs` when it registers, as current Linux does. The auxiliary vector
-  gives `AT_RSEQ_FEATURE_SIZE` 28 and `AT_RSEQ_ALIGN` 32. A thread with
+  gives `AT_RSEQ_FEATURE_SIZE` 28 and `AT_RSEQ_ALIGN` 64, as current Linux
+  does, so an area longer than 32 bytes is aligned on 64. A thread with
   `rseq` runs on one of the machine's virtual CPUs, one for each CPU it
   reports, where no other such thread runs at the same time, within its
   CPU mask; the area shows that CPU, NUMA node 0 and a concurrency ID
@@ -662,9 +663,12 @@ kernel.
   to another CPU, or to its own after another thread had it, or after a
   `membarrier`, or when a signal is delivered, a critical section it is in
   goes on at its abort handler, as after Linux's preemption, migration or
-  signal; a descriptor Linux does not accept (a version, flags, an abort
-  handler inside the section or without the signature before it) and an
-  area the kernel cannot write end it by `SIGSEGV`. While threads wait for
+  signal. As current Linux, the kernel reads only where the section is
+  while the thread is outside it, and then clears the area's `rseq_cs`; a
+  descriptor it does not accept for a thread inside the section (a version,
+  flags, an abort handler inside it or without the signature before it), a
+  section past user space and an area the kernel cannot write end the
+  thread by `SIGSEGV`. While threads wait for
   a CPU, one that has kept its own for 4 ms lets them have it first. A
   fork keeps the registration; a new thread, a `CLONE_VM` child and an
   exec start without one.

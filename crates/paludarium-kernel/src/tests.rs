@@ -3339,12 +3339,9 @@ mod rseq {
         assert!(Kernel::rseq_signal(&mut f.thread, &f.mem));
         assert_eq!(f.thread.cpu.rip, GuestAddr(abort));
         assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 0);
-        // With a signature that differs, the thread gets SIGSEGV, which a
-        // thread with no handler for it dies of.
-        f.mem
-            .write(GuestAddr(DATA + 8), &descriptor.to_le_bytes())
-            .unwrap();
-        f.mem.write(GuestAddr(abort - 4), &[0; 4]).unwrap();
+        // A handler runs with the section aborted; with a signature that
+        // differs, the thread gets SIGSEGV instead, which a thread with no
+        // handler for it dies of.
         f.thread.state.signal_actions.insert(
             10,
             SignalAction {
@@ -3352,10 +3349,25 @@ mod rseq {
                 ..SignalAction::default()
             },
         );
-        signals::queue(&mut f.thread.state, signals::PendingSignal::user(10, 0));
-        assert_eq!(
-            f.kernel.checkpoint(&mut f.thread, &f.mem),
-            Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
-        );
+        f.thread.cpu.gpr[reg::RSP] = DATA + 0x1800;
+        for (signature, next) in [
+            (SIGNATURE as u32, Next::Resume),
+            (0, Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))),
+        ] {
+            f.mem
+                .write(GuestAddr(DATA + 8), &descriptor.to_le_bytes())
+                .unwrap();
+            f.mem
+                .write(GuestAddr(abort - 4), &signature.to_le_bytes())
+                .unwrap();
+            f.thread.cpu.rip = GuestAddr(start + 8);
+            // As after the first handler returned.
+            f.thread.state.signal_mask = 0;
+            signals::queue(&mut f.thread.state, signals::PendingSignal::user(10, 0));
+            assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), next);
+            // Aborted, the section's descriptor is cleared; refused, it stays.
+            let cleared = f.mem.read_u64(GuestAddr(DATA + 8)).unwrap() == 0;
+            assert_eq!(cleared, next == Next::Resume);
+        }
     }
 }

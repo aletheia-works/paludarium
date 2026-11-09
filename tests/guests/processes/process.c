@@ -4348,8 +4348,7 @@ static long shm_call(long number, long a, long b, long c) {
 __asm__(".text\n"
         ".globl rseq_spin\n"
         "rseq_spin:\n"
-        "    leaq rseq_spin_cs(%rip), %rax\n"
-        "    movq %rax, (%rdi)\n"
+        "    movq %rcx, (%rdi)\n"
         ".globl rseq_spin_start\n"
         "rseq_spin_start:\n"
         "    movl $1, (%rsi)\n"
@@ -4390,7 +4389,7 @@ __asm__(".text\n"
         "    .long 0, 0\n"
         "    .quad rseq_unsigned_start, rseq_unsigned_end - rseq_unsigned_start, rseq_unsigned_abort\n"
         ".text\n");
-int rseq_spin(volatile uint64_t *cs, volatile int *ready, volatile int *flag);
+int rseq_spin(volatile uint64_t *cs, volatile int *ready, volatile int *flag, const void *descriptor);
 int rseq_unsigned(volatile uint64_t *cs, volatile int *ready, volatile int *flag);
 extern char rseq_spin_start[], rseq_spin_end[], rseq_spin_abort[], rseq_spin_cs[];
 
@@ -4446,8 +4445,9 @@ static void rseq_arm(struct rseq_sender *sender) {
 }
 
 /* The signal a child ends by when it spins while its area's rseq_cs is
- * `desc` and a signal comes: in the unsigned section when `desc` is 0. */
-static int rseq_child_dies(struct rseq_desc *desc) {
+ * `desc` and a signal comes: in the unsigned section when `desc` is 0, in
+ * the section `desc` describes when `inside`, else outside it. */
+static int rseq_child_dies(struct rseq_desc *desc, int inside) {
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -4456,6 +4456,7 @@ static int rseq_child_dies(struct rseq_desc *desc) {
         struct rseq_sender sender;
         rseq_arm(&sender);
         if (!desc) _exit(rseq_unsigned(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag) + 50);
+        if (inside) _exit(rseq_spin(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag, desc) + 50);
         rseq_main.rseq_cs = (uint64_t)desc;
         rseq_ready = 1;
         while (!rseq_flag) {}
@@ -4475,17 +4476,23 @@ static void *rseq_other_thread(void *unused) {
         rseq_other_ready = 1;
         return 0;
     }
-    rseq_other_result = rseq_spin(&rseq_other.rseq_cs, &rseq_other_ready, &rseq_other_flag);
+    rseq_other_result = rseq_spin(&rseq_other.rseq_cs, &rseq_other_ready, &rseq_other_flag, rseq_spin_cs);
     return 0;
 }
 
 static int rseq_case(void) {
     long cpus = sysconf(_SC_NPROCESSORS_CONF);
     printf("auxv feature-size>=28=%d align=%lu\n", getauxval(27) >= 28, getauxval(28));
-    printf("before unregister=%ld flags=%ld short=%ld misaligned=%ld past-user=%ld\n",
-           rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE), rseq_call(&rseq_main, 32, 2, RSEQ_SIGNATURE),
-           rseq_call(&rseq_main, 31, 0, RSEQ_SIGNATURE), rseq_call(rseq_space + 16, 32, 0, RSEQ_SIGNATURE),
-           rseq_call((void *)0x7fffffffffe0, 32, 0, RSEQ_SIGNATURE));
+    /* Each call a statement of its own: the order a call's arguments are
+     * evaluated in is not C's to say. An unknown flag, not one a newer
+     * Linux may have (2 is RSEQ_FLAG_SLICE_EXT_DEFAULT_ON there). */
+    long unregister = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE);
+    long unknown = rseq_call(&rseq_main, 32, 1 << 30, RSEQ_SIGNATURE);
+    long short_area = rseq_call(&rseq_main, 31, 0, RSEQ_SIGNATURE);
+    long misaligned = rseq_call(rseq_space + 16, 32, 0, RSEQ_SIGNATURE);
+    long past_user = rseq_call((void *)0x7fffffffffe0, 32, 0, RSEQ_SIGNATURE);
+    printf("before unregister=%ld unknown-flag=%ld short=%ld misaligned=%ld past-user=%ld\n", unregister,
+           unknown, short_area, misaligned, past_user);
     void *gone = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (gone == MAP_FAILED || munmap(gone, 4096)) return 10;
     printf("unmapped=%ld\n", rseq_call(gone, 32, 0, RSEQ_SIGNATURE));
@@ -4506,9 +4513,12 @@ static int rseq_case(void) {
            rseq_main.rseq_cs == 0, rseq_main.cpu_id < (unsigned long)cpus,
            rseq_main.cpu_id_start < (unsigned long)cpus, rseq_main.node_id,
            rseq_main.mm_cid < (unsigned long)cpus, matches);
-    printf("again same=%ld other-area=%ld other-length=%ld other-signature=%ld\n",
-           rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE), rseq_call(&rseq_other, 32, 0, RSEQ_SIGNATURE),
-           rseq_call(&rseq_main, 64, 0, RSEQ_SIGNATURE), rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE + 1));
+    long same = rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE);
+    long other_area = rseq_call(&rseq_other, 32, 0, RSEQ_SIGNATURE);
+    long other_length = rseq_call(&rseq_main, 64, 0, RSEQ_SIGNATURE);
+    long other_signature = rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE + 1);
+    printf("again same=%ld other-area=%ld other-length=%ld other-signature=%ld\n", same, other_area,
+           other_length, other_signature);
 
     /* A signal in the critical section sends it to its abort handler, and
      * the kernel clears rseq_cs; outside it, the kernel only clears it. */
@@ -4517,7 +4527,7 @@ static int rseq_case(void) {
     sigaction(SIGUSR1, &sa, 0);
     struct rseq_sender sender;
     rseq_arm(&sender);
-    int aborted = rseq_spin(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag);
+    int aborted = rseq_spin(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag, rseq_spin_cs);
     pthread_join(sender.thread, 0);
     printf("signal aborted=%d handled=%d cs-cleared=%d\n", aborted, rseq_flag, rseq_main.rseq_cs == 0);
     rseq_arm(&sender);
@@ -4527,18 +4537,23 @@ static int rseq_case(void) {
     pthread_join(sender.thread, 0);
     printf("outside cs-cleared=%d\n", rseq_main.rseq_cs == 0);
 
-    /* Descriptors the kernel does not accept end the thread by SIGSEGV
-     * when it next looks at them: here, for a signal. */
+    /* Descriptors the kernel does not accept end a thread inside their
+     * section by SIGSEGV when it next looks at them: here, for a signal. */
     static struct rseq_desc version = {1, 0, 0, 0, 0}, flagged = {0, 1, 0, 0, 0};
     static struct rseq_desc inside = {0, 0, 0, 0, 0};
     version.start = flagged.start = inside.start = (uint64_t)rseq_spin_start;
     version.length = flagged.length = inside.length = (uint64_t)(rseq_spin_end - rseq_spin_start);
     version.abort = flagged.abort = (uint64_t)rseq_spin_abort;
     inside.abort = (uint64_t)rseq_spin_start + 2;
-    printf("refused signature=%d version=%d abort-inside=%d", rseq_child_dies(0), rseq_child_dies(&version),
-           rseq_child_dies(&inside));
-    /* Flags are refused only inside the section, so outside this is cleared. */
-    printf(" flags-outside=%d\n", rseq_child_dies(&flagged));
+    /* Current Linux refuses a descriptor only for a thread inside its
+     * section, so outside it these are only cleared (the child exits 40). */
+    int unsigned_abort = rseq_child_dies(0, 1);
+    int in_version = rseq_child_dies(&version, 1), out_version = rseq_child_dies(&version, 0);
+    int in_flags = rseq_child_dies(&flagged, 1), out_flags = rseq_child_dies(&flagged, 0);
+    int in_abort = rseq_child_dies(&inside, 1), out_abort = rseq_child_dies(&inside, 0);
+    printf("refused signature=%d version=%d flags=%d abort-inside=%d\n", unsigned_abort, in_version, in_flags,
+           in_abort);
+    printf("outside version=%d flags=%d abort-inside=%d\n", out_version, out_flags, out_abort);
 
     /* membarrier's RSEQ command aborts another thread's critical section. */
     errno = 0;
@@ -4560,12 +4575,15 @@ static int rseq_case(void) {
 
     /* Unregistering needs the same area, length and signature, and leaves
      * the area showing no CPU. */
-    printf("unregister other-signature=%ld other-length=%ld other-area=%ld",
-           rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE + 1), rseq_call(&rseq_main, 64, 1, RSEQ_SIGNATURE),
-           rseq_call(&rseq_other, 32, 1, RSEQ_SIGNATURE));
+    other_signature = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE + 1);
+    other_length = rseq_call(&rseq_main, 64, 1, RSEQ_SIGNATURE);
+    other_area = rseq_call(&rseq_other, 32, 1, RSEQ_SIGNATURE);
+    printf("unregister other-signature=%ld other-length=%ld other-area=%ld", other_signature, other_length,
+           other_area);
     r = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE);
-    printf(" done=%ld cpu=%x start=%u again=%ld\n", r, rseq_main.cpu_id, rseq_main.cpu_id_start,
-           rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE));
+    unsigned cpu = rseq_main.cpu_id, start = rseq_main.cpu_id_start;
+    long again = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE);
+    printf(" done=%ld cpu=%x start=%u again=%ld\n", r, cpu, start, again);
     return 0;
 }
 

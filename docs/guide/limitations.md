@@ -144,7 +144,9 @@ verified.
   host preempts it, which no other thread with `rseq` can notice. A CPU mask
   another thread sets takes effect at the thread's next stop, and a thread
   in a system call holds no CPU, so its area shows the CPU it last ran on.
-  Threads without `rseq` run on no virtual CPU and are not counted.
+  Threads without `rseq` run on no virtual CPU and are not counted. There is
+  no time slice extension: `RSEQ_FLAG_SLICE_EXT_DEFAULT_ON` gives `EINVAL`,
+  as on a Linux built without it.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
   - `pkey_alloc` and `io_uring_setup` are among them, as on a Linux built without

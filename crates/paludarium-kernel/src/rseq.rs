@@ -20,6 +20,10 @@
 use crate::syscalls::{Context, Outcome, err, ok};
 use crate::{Kernel, Next, Thread, signals};
 use paludarium_host::{ClockId, Host, WaitToken};
+// `AT_RSEQ_FEATURE_SIZE` and `AT_RSEQ_ALIGN`, which the loader gives the
+// program: the fields this kernel keeps up to date (`cpu_id_start` to
+// `mm_cid`), and the alignment of an area longer than the original.
+use paludarium_loader::auxv::{RSEQ_ALIGN as ALIGNMENT, RSEQ_FEATURE_SIZE as FEATURE_SIZE};
 use paludarium_mmu::AddressSpace;
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,10 +32,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 /// The size of Linux's original `struct rseq`, and its alignment.
 const ORIGINAL_SIZE: u32 = 32;
-/// `AT_RSEQ_FEATURE_SIZE` and `AT_RSEQ_ALIGN`, which the loader gives the
-/// program: the fields this kernel keeps up to date (`cpu_id_start` to
-/// `mm_cid`), and the area's alignment.
-use paludarium_loader::auxv::{RSEQ_ALIGN as ALIGNMENT, RSEQ_FEATURE_SIZE as FEATURE_SIZE};
 /// `RSEQ_FLAG_UNREGISTER`.
 const UNREGISTER: u32 = 1;
 /// `RSEQ_CPU_ID_UNINITIALIZED`, the `cpu_id` of an area no longer registered.
@@ -511,14 +511,15 @@ fn clear(mem: &AddressSpace, area: u64) -> Result<(), ()> {
         .map_err(drop)
 }
 
-/// Linux's `rseq_ip_fixup`: the critical section the area's `rseq_cs`
-/// describes, if any, is checked, and the descriptor cleared once `rip` is
-/// outside it. A thread inside it goes on at the section's abort handler
-/// instead when `restart`: it was preempted, moved or sent a signal. `Err`
-/// is what Linux sends `SIGSEGV` for: an area or descriptor it cannot read
-/// or write, a descriptor it does not accept (a version, a section past the
-/// end of user space, an abort handler inside the section or not after the
-/// signature), or flags, which Linux no longer accepts.
+/// Linux's `rseq_update_user_cs`, as its current kernels have it: the
+/// descriptor the area's `rseq_cs` names, if any, is cleared once `rip` is
+/// outside the section it describes, which is all that is read of it then.
+/// A thread inside it goes on at the section's abort handler instead when
+/// `restart`: it was preempted, moved or sent a signal. `Err` is what Linux
+/// sends `SIGSEGV` for: an area or descriptor it cannot read or write, a
+/// section past the end of user space, or, for a thread inside the section,
+/// a descriptor it does not accept: an abort handler past user space,
+/// inside the section or not after the signature, or a version or flags.
 pub(crate) fn fixup(
     mem: &AddressSpace,
     registration: &Registration,
@@ -533,41 +534,30 @@ pub(crate) fn fixup(
     if descriptor >= TASK_SIZE {
         return Err(());
     }
-    let mut bytes = [0; 32];
-    mem.read(GuestAddr(descriptor), &mut bytes).map_err(drop)?;
-    let word =
-        |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-    let quad = |at: usize| {
-        u64::from_le_bytes([
-            bytes[at],
-            bytes[at + 1],
-            bytes[at + 2],
-            bytes[at + 3],
-            bytes[at + 4],
-            bytes[at + 5],
-            bytes[at + 6],
-            bytes[at + 7],
-        ])
-    };
-    let (version, flags) = (word(0), word(4));
-    let (start, length, abort) = (quad(8), quad(16), quad(24));
-    if version > 0 {
+    let start = read_u64(mem, descriptor.wrapping_add(8))?;
+    if start >= TASK_SIZE {
         return Err(());
     }
-    let end = start.checked_add(length).ok_or(())?;
-    if start >= TASK_SIZE || end >= TASK_SIZE {
-        return Err(());
-    }
-    if abort.wrapping_sub(start) < length {
-        return Err(());
-    }
-    if read_u32(mem, abort.wrapping_sub(4))? != registration.signature {
-        return Err(());
-    }
-    if rip.wrapping_sub(start) >= length {
+    if *rip < start {
         return clear(mem, area);
     }
-    if flags != 0 || read_u32(mem, area.wrapping_add(16))? != 0 {
+    let length = read_u64(mem, descriptor.wrapping_add(16))?;
+    let end = start.wrapping_add(length);
+    if end >= TASK_SIZE || end < start {
+        return Err(());
+    }
+    if *rip >= end {
+        return clear(mem, area);
+    }
+    let abort = read_u64(mem, descriptor.wrapping_add(24))?;
+    if !(4..TASK_SIZE).contains(&abort) || abort.wrapping_sub(start) < length {
+        return Err(());
+    }
+    // The version and the flags, which must both be 0.
+    if read_u64(mem, descriptor)? != 0 {
+        return Err(());
+    }
+    if read_u32(mem, abort - 4)? != registration.signature {
         return Err(());
     }
     if !restart {
@@ -593,9 +583,11 @@ pub(crate) fn update(mem: &AddressSpace, registration: &Registration, on: OnCpu)
 /// needs the same area, length and signature (`EINVAL`, `EPERM` for the
 /// signature). Registering again is `EBUSY` with the same, else the same
 /// errors. An area must be 32 bytes long and aligned on 32, or longer than
-/// that and as aligned (`EINVAL`), and within user space (`EFAULT`). A
-/// registration clears the area's `rseq_cs`, which old C libraries leave
-/// set, and the area shows the CPU once the call returns.
+/// that and aligned on [`ALIGNMENT`] (`EINVAL`), and within user space
+/// (`EFAULT`). A registration clears the area's `rseq_cs`, which old C
+/// libraries leave set, and the area shows the CPU once the call returns.
+/// Any other flag is `EINVAL`, `RSEQ_FLAG_SLICE_EXT_DEFAULT_ON` too: there
+/// is no time slice extension, as on a Linux built without it.
 pub(crate) fn sys_rseq(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (address, length, flags, signature) = (a[0], a[1] as u32, a[2] as u32, a[3] as u32);
     if flags & UNREGISTER != 0 {

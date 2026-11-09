@@ -223,12 +223,12 @@ fn decode_hint_does_not_change_ordinary_interpreter_cache_contract() {
     let (mut cache, instruction) = cached_boundary();
     cache.reject_acceleration(4096, 1);
     // A decode that would stop shows whether the cache held the entry.
-    let stop = || Err(ExitReason::Halt { rip: GuestAddr(0) });
-    assert_eq!(
-        cache.decoded(4096, 1, stop).map(|d| d.instruction),
-        Ok(instruction)
-    );
-    assert!(cache.decoded(4096, 2, stop).is_err());
+    let stop = |_: &mut Vec<Decoded>| Err(ExitReason::Halt { rip: GuestAddr(0) });
+    let first = cache
+        .block(4096, 1, stop)
+        .map(|block| cache.code[block.start].instruction);
+    assert_eq!(first, Ok(instruction));
+    assert!(cache.block(4096, 2, stop).is_err());
 }
 
 fn hint_attempt(

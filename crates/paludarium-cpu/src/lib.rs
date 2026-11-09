@@ -48,44 +48,67 @@ pub use x87::X87;
 
 use exec::Stop;
 
-/// Number of entries a [`DecodeCache`] starts with: 2 MiB of 128-byte
-/// entries per guest thread. At 4096, programs as large as jj missed it on
-/// one instruction in nine, each miss decoding again.
+/// Number of slots a [`DecodeCache`] starts with, and of instructions it
+/// has room for. With room for 4096 instructions, programs as large as jj
+/// missed it on one instruction in nine, each miss decoding again. Each
+/// slot takes 24 bytes and each instruction 152, 176 bytes in all as the
+/// one-instruction slots before blocks did: 2.75 MiB per guest thread.
 const INITIAL_ENTRIES: usize = 1 << 14;
 
-/// The most entries a [`DecodeCache`] grows to: 16 MiB. Perl compiling GNU
-/// parallel runs about 120,000 distinct instructions, and at 16384 entries
-/// one lookup in seven found another instruction in its slot; at 131072,
-/// one in fifty. The WebAssembly build keeps the size it had, as each
-/// Worker's cache takes from the one shared heap.
+/// The most slots, and instructions, a [`DecodeCache`] grows to: 22 MiB.
+/// Perl compiling GNU parallel runs about 120,000 distinct instructions,
+/// and with room for 16384 one lookup in seven found another instruction in
+/// its slot; with room for 131072, one in fifty. The WebAssembly build keeps
+/// the size it had, as each Worker's cache takes from the one shared heap.
 #[cfg(not(target_family = "wasm"))]
 const MAX_ENTRIES: usize = 1 << 17;
 #[cfg(target_family = "wasm")]
 const MAX_ENTRIES: usize = INITIAL_ENTRIES;
 
 /// A [`DecodeCache`] decides whether to grow after this many lookups have
-/// found another instruction in their slot.
+/// found another block in their slot.
 const GROWTH_WINDOW: u64 = 1 << 16;
 
-/// It doubles when more than one lookup in this many found another
-/// instruction of the current code generation in its slot. An entry left
-/// from before a code change does not count, whatever its address: the
-/// lookup would miss in a larger cache too.
+/// It doubles when more than one lookup in this many found another block
+/// of the current code generation in its slot. A block left from before a
+/// code change does not count, whatever its address: the lookup would miss
+/// in a larger cache too.
 const GROWTH_RATIO: u64 = 64;
 
-/// Decoded instructions by address. An entry is used only while the
-/// address space's [`AddressSpace::code_generation`] is unchanged, so
-/// writes to executable memory and mapping changes (self-modifying code,
-/// `mprotect`, `munmap`) are always seen. A cache serves one address space:
-/// make a new one for another (as after `execve`).
+/// The most instructions a block holds. The limit bounds the copies of
+/// instructions that a jump into the middle of a block decodes again.
+const MAX_BLOCK: usize = 32;
+
+/// Decoded instructions by address, in blocks: a block holds instructions
+/// that follow each other in memory, from the one at its address up to a
+/// `jmp`, `call`, `ret`, `syscall` or other instruction after which the next
+/// one in memory rarely runs ([`ends_block`]), or [`MAX_BLOCK`] of them. The
+/// interpreter looks up the block of an address only when the instruction
+/// it runs is not the next one in the current block (after a branch, a
+/// system call or a fault, at the end of the block, or after a code
+/// change), so falling through from one instruction to the next needs no
+/// lookup. A block starts with its first instruction and grows as it runs:
+/// an instruction is decoded, as it would be without blocks, when it first
+/// runs after the last one of a block, and added to that block if it can
+/// take it ([`DecodeCache::extend`]).
+///
+/// A block is used only while the address space's
+/// [`AddressSpace::code_generation`] is unchanged, so writes to executable
+/// memory and mapping changes (self-modifying code, `mprotect`, `munmap`)
+/// are always seen. A cache serves one address space: make a new one for
+/// another (as after `execve`).
 ///
 /// It starts small, as most threads and processes run little code, and
-/// doubles up to [`MAX_ENTRIES`] while the instructions a thread runs
-/// often keep taking each other's slots.
+/// doubles up to [`MAX_ENTRIES`] while the blocks a thread runs often keep
+/// taking each other's slots, or fill the room for instructions.
 pub struct DecodeCache {
-    entries: Vec<Option<Entry>>,
-    /// The number of entries less one; their number is a power of two.
+    /// The blocks; a block's slot depends on its address only.
+    slots: Vec<Slot>,
+    /// The number of slots less one; their number is a power of two.
     mask: u64,
+    /// The instructions of the blocks, each block's together. It holds at
+    /// most as many as there are slots ([`Self::make_room`]).
+    code: Vec<Decoded>,
     growth: Growth,
 }
 
@@ -96,17 +119,17 @@ struct Growth {
     lookups: u64,
     /// `lookups` when the current window started.
     window_start: u64,
-    /// Lookups in the current window that found another instruction in
-    /// their slot.
+    /// Lookups in the current window that found another block in their
+    /// slot.
     collisions: u64,
     /// Set when a window decided to grow; done at the next lookup, when no
-    /// entry is borrowed.
+    /// instruction is borrowed.
     pending: bool,
 }
 
 impl Growth {
-    /// Counts a lookup that found another instruction in its slot of a
-    /// cache of `entries`.
+    /// Counts a lookup that found another block in its slot of a cache of
+    /// `entries` slots.
     #[cold]
     fn collided(&mut self, entries: usize) {
         self.collisions += 1;
@@ -123,8 +146,9 @@ impl Growth {
 impl Default for DecodeCache {
     fn default() -> Self {
         DecodeCache {
-            entries: vec![None; INITIAL_ENTRIES],
+            slots: vec![Slot::default(); INITIAL_ENTRIES],
             mask: INITIAL_ENTRIES as u64 - 1,
+            code: Vec::with_capacity(INITIAL_ENTRIES),
             growth: Growth::default(),
         }
     }
@@ -154,14 +178,46 @@ impl Decoded {
     }
 }
 
-/// An instruction decoded at `rip` under `generation`; `rejected` when the
-/// accelerator has turned it down.
-#[derive(Clone, Copy)]
-struct Entry {
+/// Whether the instruction after `insn` in memory starts a block rather
+/// than following it in its own: after a jump, call, return, system call or
+/// stop, the next instruction in memory runs, if ever, only after a branch
+/// to it. A conditional branch does not end a block, as either way is
+/// common.
+fn ends_block(insn: &Instruction) -> bool {
+    use paludarium_decoder::Mnemonic as M;
+    matches!(
+        insn.mnemonic,
+        M::Jmp | M::Call | M::Ret | M::Syscall | M::Hlt | M::Ud2
+    )
+}
+
+/// The block of instructions decoded from `rip` under `generation`, at
+/// `start..start + len` of [`DecodeCache::code`]; empty when `len` is 0.
+/// `rejected` when the accelerator has turned down its first instruction.
+#[derive(Clone, Copy, Default)]
+struct Slot {
     rip: u64,
     generation: u64,
-    decoded: Decoded,
+    start: u32,
+    len: u8,
     rejected: bool,
+}
+
+impl Slot {
+    fn holds(&self, rip: u64, generation: u64) -> bool {
+        self.len > 0 && self.rip == rip && self.generation == generation
+    }
+
+    /// Whether it holds another block of `generation` than the one at
+    /// `rip`.
+    fn holds_other(&self, rip: u64, generation: u64) -> bool {
+        self.len > 0 && self.rip != rip && self.generation == generation
+    }
+
+    fn range(&self) -> std::ops::Range<usize> {
+        let start = self.start as usize;
+        start..start + usize::from(self.len)
+    }
 }
 
 impl DecodeCache {
@@ -171,9 +227,9 @@ impl DecodeCache {
         Self::default()
     }
 
-    /// The slot of `rip` in a cache whose entries less one are `mask`.
+    /// The slot of `rip` in a cache whose slots less one are `mask`.
     fn slot_in(mask: u64, rip: u64) -> usize {
-        // The number of entries is a power of two; the mask keeps the index
+        // The number of slots is a power of two; the mask keeps the index
         // in range.
         usize::try_from((rip ^ (rip >> 12)) & mask).unwrap_or(0)
     }
@@ -192,94 +248,170 @@ impl DecodeCache {
         self.growth.lookups = self.growth.lookups.wrapping_add(1);
     }
 
-    /// Doubles the cache. The entries move to their new slots, so none is
+    /// Doubles the cache. The blocks move to their new slots, so none is
     /// decoded again.
     #[cold]
     #[inline(never)]
     fn grow(&mut self) {
         self.growth.pending = false;
         let mask = self.mask * 2 + 1;
-        let mut entries = vec![None; self.entries.len() * 2];
-        for entry in self.entries.drain(..).flatten() {
-            entries[Self::slot_in(mask, entry.rip)] = Some(entry);
+        let mut slots = vec![Slot::default(); self.slots.len() * 2];
+        for slot in self.slots.drain(..).filter(|s| s.len > 0) {
+            slots[Self::slot_in(mask, slot.rip)] = slot;
         }
-        self.entries = entries;
+        self.slots = slots;
         self.mask = mask;
+        self.code.reserve_exact(self.slots.len() - self.code.len());
     }
 
-    /// The instruction at `rip` under `generation`, decoded by `decode`
-    /// unless the cache holds it; returned by reference, as copying it
-    /// cost as much as a short instruction.
-    fn decoded(
+    /// Makes room in [`Self::code`] for a block of up to [`MAX_BLOCK`]
+    /// instructions decoded under `generation`: doubles the cache if the
+    /// blocks of `generation` fill more than half of it, and drops every
+    /// block otherwise. Nothing is copied, and the room is not allocated
+    /// again: a program that changes its code often, as SBCL does, fills the
+    /// room with blocks of earlier generations again and again.
+    #[cold]
+    #[inline(never)]
+    fn make_room(&mut self, generation: u64) {
+        let current: usize = self
+            .slots
+            .iter()
+            .filter(|s| s.len > 0 && s.generation == generation)
+            .map(|s| usize::from(s.len))
+            .sum();
+        if current > self.slots.len() / 2 && self.slots.len() < MAX_ENTRIES {
+            self.grow();
+        }
+        if self.code.len() + MAX_BLOCK > self.slots.len() {
+            self.slots.fill(Slot::default());
+            self.code.clear();
+        }
+    }
+
+    /// Stores the block whose instructions `decode` appends to
+    /// [`Self::code`] (one at least, unless it fails) at `rip` under
+    /// `generation`.
+    fn insert(
         &mut self,
         rip: u64,
         generation: u64,
-        decode: impl FnOnce() -> Result<Instruction, ExitReason>,
-    ) -> Result<&Decoded, ExitReason> {
-        self.lookup();
-        let entries = self.entries.len();
-        let entry = &mut self.entries[Self::slot_in(self.mask, rip)];
-        match entry {
-            Some(e) if e.rip == rip && e.generation == generation => Ok(&e.decoded),
-            _ => {
-                if entry.is_some_and(|e| e.rip != rip && e.generation == generation) {
-                    self.growth.collided(entries);
-                }
-                let decoded = Decoded::new(decode()?);
-                let e = entry.insert(Entry {
-                    rip,
-                    generation,
-                    decoded,
-                    rejected: false,
-                });
-                Ok(&e.decoded)
-            }
+        decode: impl FnOnce(&mut Vec<Decoded>) -> Result<(), ExitReason>,
+    ) -> Result<std::ops::Range<usize>, ExitReason> {
+        if self.code.len() + MAX_BLOCK > self.slots.len() {
+            self.make_room(generation);
         }
+        let start = self.code.len();
+        if let Err(reason) = decode(&mut self.code) {
+            self.code.truncate(start);
+            return Err(reason);
+        }
+        let len = (self.code.len() - start).min(MAX_BLOCK);
+        self.code.truncate(start + len);
+        let slot = self.slot(rip);
+        let entries = self.slots.len();
+        let s = &mut self.slots[slot];
+        if s.holds_other(rip, generation) {
+            self.growth.collided(entries);
+        }
+        *s = Slot {
+            rip,
+            generation,
+            start: u32::try_from(start).unwrap_or(u32::MAX),
+            len: u8::try_from(len).unwrap_or(u8::MAX),
+            rejected: false,
+        };
+        Ok(s.range())
+    }
+
+    /// Where in [`Self::code`] the block at `rip` under `generation` is,
+    /// decoded by `decode` unless the cache holds it. `decode` appends the
+    /// block's instructions to the vector it is given, the first at `rip`.
+    #[inline]
+    fn block(
+        &mut self,
+        rip: u64,
+        generation: u64,
+        decode: impl FnOnce(&mut Vec<Decoded>) -> Result<(), ExitReason>,
+    ) -> Result<std::ops::Range<usize>, ExitReason> {
+        self.lookup();
+        let s = &self.slots[self.slot(rip)];
+        if s.holds(rip, generation) {
+            return Ok(s.range());
+        }
+        self.insert(rip, generation, decode)
+    }
+
+    /// Adds to the block at `rip` under `generation`, whose instructions end
+    /// at `end` of [`Self::code`], the instruction that follows them, which
+    /// `decode` decodes, unless the block cannot take it. It cannot when it
+    /// is no longer in its slot, or holds [`MAX_BLOCK`] instructions, or ends
+    /// with an instruction that [`ends_block`], or when another block has
+    /// been stored after it or the room is full. Returns whether it took the
+    /// instruction.
+    fn extend(
+        &mut self,
+        rip: u64,
+        end: usize,
+        generation: u64,
+        decode: impl FnOnce() -> Result<Instruction, ExitReason>,
+    ) -> Result<bool, ExitReason> {
+        let slot = self.slot(rip);
+        let s = &self.slots[slot];
+        if !s.holds(rip, generation)
+            || s.range().end != end
+            || end != self.code.len()
+            || end >= self.slots.len()
+            || usize::from(s.len) >= MAX_BLOCK
+            || ends_block(&self.code[end - 1].instruction)
+        {
+            return Ok(false);
+        }
+        self.code.push(Decoded::new(decode()?));
+        self.slots[slot].len += 1;
+        Ok(true)
     }
 
     /// Stores the instruction that a [`Self::get_with_hint`] after a
-    /// [`Self::lookup`] did not find.
+    /// [`Self::lookup`] did not find, as a block of its own.
     fn put(&mut self, rip: u64, generation: u64, instruction: Instruction) -> Decoded {
         let decoded = Decoded::new(instruction);
-        let slot = self.slot(rip);
-        if self.entries[slot].is_some_and(|e| e.rip != rip && e.generation == generation) {
-            self.growth.collided(self.entries.len());
-        }
-        self.entries[slot] = Some(Entry {
-            rip,
-            generation,
-            decoded,
-            rejected: false,
+        let _ = self.insert(rip, generation, |code| {
+            code.push(decoded);
+            Ok(())
         });
         decoded
     }
 
+    /// The first instruction of the block at `rip` under `generation`, and
+    /// whether the accelerator has turned it down.
     fn get_with_hint(&self, rip: u64, generation: u64) -> Option<(Decoded, bool)> {
-        match &self.entries[self.slot(rip)] {
-            Some(e) if e.rip == rip && e.generation == generation => Some((e.decoded, e.rejected)),
-            _ => None,
-        }
+        let s = &self.slots[self.slot(rip)];
+        s.holds(rip, generation)
+            .then(|| (self.code[s.start as usize], s.rejected))
     }
 
     fn reject_acceleration(&mut self, rip: u64, generation: u64) {
         let slot = self.slot(rip);
-        if let Some(e) = &mut self.entries[slot]
-            && e.rip == rip
-            && e.generation == generation
-        {
-            e.rejected = true;
+        let s = &mut self.slots[slot];
+        if s.holds(rip, generation) {
+            s.rejected = true;
         }
     }
 
     #[cfg(feature = "cost-profile")]
     fn observe_slot(&self, rip: u64, generation: u64) {
         use jit_cost::{Counter, add};
-        let counter = match &self.entries[self.slot(rip)] {
-            None => Counter::DecodeSlotEmpty,
-            Some(e) if e.rip != rip => Counter::DecodeSlotRipCollision,
-            Some(e) if e.generation != generation => Counter::DecodeSlotEpochStale,
-            Some(e) if e.rejected => Counter::DecodeHintHit,
-            Some(_) => Counter::DecodedHit,
+        let s = &self.slots[self.slot(rip)];
+        let counter = if s.len == 0 {
+            Counter::DecodeSlotEmpty
+        } else if s.rip != rip {
+            Counter::DecodeSlotRipCollision
+        } else if s.generation != generation {
+            Counter::DecodeSlotEpochStale
+        } else if s.rejected {
+            Counter::DecodeHintHit
+        } else {
+            Counter::DecodedHit
         };
         add(counter, 1);
     }
@@ -500,8 +632,21 @@ pub fn step_cached(
     #[cfg(feature = "cost-profile")]
     jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
     let generation = mem.code_generation_cached();
-    let decoded = cache.decoded(state.rip.0, generation, || fetch_for_state(state, mem))?;
-    execute_decoded(state, mem, decoded)
+    let block = cache.block(state.rip.0, generation, |code| {
+        decode_block(state, mem, code)
+    })?;
+    execute_decoded(state, mem, &cache.code[block.start])
+}
+
+/// Appends to `code` the first instruction of the block at `state.rip`:
+/// [`DecodeCache::block`]'s `decode` for the interpreter.
+fn decode_block(
+    state: &mut CpuState,
+    mem: &AddressSpace,
+    code: &mut Vec<Decoded>,
+) -> Result<(), ExitReason> {
+    code.push(Decoded::new(fetch_for_state(state, mem)?));
+    Ok(())
 }
 
 fn fetch_for_state(state: &mut CpuState, mem: &AddressSpace) -> Result<Instruction, ExitReason> {
@@ -533,9 +678,39 @@ pub fn run_cached(
     budget: u64,
     cache: &mut DecodeCache,
 ) -> ExitReason {
-    for _ in 0..budget {
-        if let Err(reason) = step_cached(state, mem, cache) {
-            return reason;
+    let mut left = budget;
+    while left > 0 {
+        let generation = mem.code_generation_cached();
+        let rip = state.rip.0;
+        let block = match cache.block(rip, generation, |code| decode_block(state, mem, code)) {
+            Ok(block) => block,
+            Err(reason) => return reason,
+        };
+        let (mut i, mut end) = (block.start, block.end);
+        loop {
+            #[cfg(feature = "cost-profile")]
+            jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
+            let decoded = &cache.code[i];
+            let next = decoded.instruction.next_rip();
+            if let Err(reason) = execute_decoded(state, mem, decoded) {
+                return reason;
+            }
+            left -= 1;
+            i += 1;
+            // The next instruction is looked up again unless it follows in
+            // memory, still of the generation the block was decoded under.
+            if left == 0 || state.rip != next || mem.code_generation_cached() != generation {
+                break;
+            }
+            // Past the end of the block, the instruction is decoded as it
+            // would be without blocks, and added to it when it can be.
+            if i == end {
+                match cache.extend(rip, end, generation, || fetch_for_state(state, mem)) {
+                    Ok(true) => end += 1,
+                    Ok(false) => break,
+                    Err(reason) => return reason,
+                }
+            }
         }
     }
     ExitReason::BudgetExhausted { rip: state.rip }

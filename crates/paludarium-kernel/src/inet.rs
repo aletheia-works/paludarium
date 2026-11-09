@@ -24,6 +24,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
+/// The interface requests of `ioctl` ([`Network::interface`]).
+pub(crate) const SIOCGIFFLAGS: u64 = 0x8913;
+pub(crate) const SIOCSIFFLAGS: u64 = 0x8914;
+pub(crate) const SIOCGIFINDEX: u64 = 0x8933;
 const AF_UNSPEC: u16 = 0;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
@@ -287,7 +291,20 @@ pub(crate) struct Network {
     /// The loopback connections whose handshake a full queue dropped, to be
     /// tried again. Taken out before any socket's state is locked.
     syns: Mutex<Vec<Syn>>,
+    /// A nested network namespace's, which has nothing but its loopback:
+    /// no route to the host, and no DNS stub.
+    isolated: bool,
+    /// Whether its loopback interface is up; it has `::1` only then, as
+    /// Linux's `addrconf` adds it at `NETDEV_UP` and `addrconf_ifdown`
+    /// takes it away at `NETDEV_DOWN` (`keep_addr_on_down` is 0).
+    up: AtomicBool,
 }
+/// The flags `SIOCGIFFLAGS` gives the loopback: `IFF_LOOPBACK`, with
+/// `IFF_UP` and `IFF_RUNNING` while it is up.
+const IFF_UP: u16 = 0x1;
+const IFF_LOOPBACK: u16 = 0x8;
+const IFF_RUNNING: u16 = 0x40;
+const ENODEV: Errno = Errno(19);
 impl Network {
     pub(crate) fn new(policy: NetworkPolicy) -> Self {
         Self {
@@ -297,6 +314,65 @@ impl Network {
             tcp_ports: Mutex::default(),
             udp_ports: Mutex::default(),
             syns: Mutex::default(),
+            isolated: false,
+            up: AtomicBool::new(true),
+        }
+    }
+    /// A new network namespace's network: only a loopback, down and without
+    /// `::1`, as Linux's `loopback_net_init` makes it.
+    pub(crate) fn isolated() -> Self {
+        Self {
+            isolated: true,
+            up: AtomicBool::new(false),
+            ..Self::new(NetworkPolicy::default())
+        }
+    }
+    /// Where a connection or datagram to `to` goes: on the loopback, while
+    /// it is up, to an address of it or the unspecified one
+    /// ([`crate::loopback::destination`]); `None` off it, which only the
+    /// first namespace has a route to. `ENETUNREACH` where no route goes.
+    fn route(&self, to: SocketAddr) -> Result<Option<SocketAddr>, Errno> {
+        match crate::loopback::destination(to) {
+            Some(_) if !self.up.load(Ordering::SeqCst) => Err(ENETUNREACH),
+            None if self.isolated => Err(ENETUNREACH),
+            to => Ok(to),
+        }
+    }
+    /// Whether the loopback has `::1` to bind to.
+    fn has_loopback_address(&self) -> bool {
+        self.up.load(Ordering::SeqCst)
+    }
+    /// `SIOCGIFFLAGS`, `SIOCSIFFLAGS` and `SIOCGIFINDEX` on the interface
+    /// `name` (the `ifr_name` of a `struct ifreq`): the loopback `lo`, index
+    /// 1, is the only one (`ENODEV` for another). Setting flags needs
+    /// CAP_NET_ADMIN (`EPERM`, before the name is looked at) and takes only
+    /// `IFF_UP`; the loopback has `::1` while it is up.
+    pub(crate) fn interface(
+        &self,
+        name: &[u8],
+        request: u64,
+        flags: u16,
+        may_administer: bool,
+    ) -> Result<u32, Errno> {
+        // `dev_ioctl` checks the capability before it looks the name up.
+        if request == SIOCSIFFLAGS && !may_administer {
+            return Err(Errno::EPERM);
+        }
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        if &name[..end] != b"lo" {
+            return Err(ENODEV);
+        }
+        match request {
+            SIOCGIFFLAGS => Ok(u32::from(if self.up.load(Ordering::SeqCst) {
+                IFF_UP | IFF_LOOPBACK | IFF_RUNNING
+            } else {
+                IFF_LOOPBACK
+            })),
+            SIOCSIFFLAGS => {
+                self.up.store(flags & IFF_UP != 0, Ordering::SeqCst);
+                Ok(0)
+            }
+            _ => Ok(1),
         }
     }
     /// How many dropped handshakes wait to be tried again.
@@ -831,6 +907,10 @@ impl InetSocket {
             signals: Arc::default(),
         })
     }
+    /// The network it was made in.
+    pub(crate) fn network(&self) -> &Network {
+        &self.network
+    }
     /// `F_GETOWN` and `F_GETSIG`.
     pub(crate) fn file_owner(&self) -> FileOwner {
         *self
@@ -1047,10 +1127,9 @@ impl InetSocket {
                 Connection::Connected => return Err(EISCONN),
                 Connection::Connecting => EALREADY,
                 Connection::Unconnected => {
-                    let to = crate::loopback::destination(SocketAddr::new(
-                        plain(address.ip()),
-                        address.port(),
-                    ));
+                    let to = self
+                        .network
+                        .route(SocketAddr::new(plain(address.ip()), address.port()))?;
                     let opened = match to {
                         Some(to) => self.open_loopback(&mut s, to, &options)?,
                         None => None,
@@ -1238,7 +1317,7 @@ impl InetSocket {
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
         }
-        match crate::loopback::destination(to) {
+        match self.network.route(to)? {
             Some(to) => {
                 let from = self.datagram_source(&mut s, to, &options)?;
                 self.ports().connect(&self.this, from, Some(to));
@@ -1321,7 +1400,7 @@ impl InetSocket {
             None => Ok(()),
         };
         let plain_to = SocketAddr::new(plain(to.ip()), to.port());
-        if let Some(dest) = crate::loopback::destination(plain_to) {
+        if let Some(dest) = self.network.route(plain_to)? {
             if self.family == Family::V6 && options.v6_only && dest.is_ipv4() {
                 return Err(ENETUNREACH);
             }
@@ -1340,7 +1419,8 @@ impl InetSocket {
                 receiver.deliver(from, bytes);
                 return Ok(bytes.len());
             }
-            if dest.port() != DNS {
+            // A nested namespace has no stub.
+            if dest.port() != DNS || self.network.isolated {
                 // The loopback answers with ICMP's port unreachable, which
                 // only a socket connected there learns of
                 // (`__udp4_lib_err`).
@@ -1547,6 +1627,9 @@ impl InetSocket {
         let options = *self.options();
         let mut s = self.lock();
         let taken = |s: &State| s.bound.is_some() || s.stream.is_some();
+        // IPv4's loopback addresses are local even while the loopback is
+        // down (its `local` routes), but `::1` only once it has come up.
+        let addressed = self.network.has_loopback_address();
         let own = |ip: Ipv4Addr| {
             ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast()
         };
@@ -1595,7 +1678,7 @@ impl InetSocket {
                         return Err(EADDRNOTAVAIL);
                     }
                     SocketAddr::from((v4, port))
-                } else if ip.is_unspecified() || ip.is_loopback() {
+                } else if ip.is_unspecified() || ip.is_loopback() && addressed {
                     SocketAddr::from((ip, port))
                 } else if ip.segments()[0] & 0xffc0 == 0xfe80 && scope == 0 {
                     // A link-local address needs its interface.

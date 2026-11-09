@@ -249,12 +249,14 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **Namespaces**: there are no new network or user namespaces.
-  `clone`, `clone3` and `unshare` with `CLONE_NEWNET` fail
-  with `EINVAL` (`EPERM` for a thread without `CAP_SYS_ADMIN`, as on Linux)
-  and create no child, where Linux lets the guest, which runs as root,
-  create one; `CLONE_NEWUSER`, which Linux also lets a user have, is
-  `EINVAL` for every thread. The other namespaces keep nothing apart that
+- **Namespaces**: there are no new user namespaces: `clone`, `clone3` and
+  `unshare` with `CLONE_NEWUSER`, which Linux lets even a user have, are
+  `EINVAL` for every thread. A network namespace has no interface but its
+  loopback (no `veth` pairs to reach another), and there is no netlink
+  (`AF_NETLINK`), so `ip link set lo up` cannot bring the loopback up: only
+  `SIOCSIFFLAGS` on a TCP or UDP socket does, and the interface requests
+  take no other socket and no other flag than `IFF_UP`. The first namespace
+  shows `lo` alone too, where Linux shows the host's interfaces. The other namespaces keep nothing apart that
   paludarium has, but for the System V shared memory of an IPC namespace:
   there are no System V semaphores, System V message queues or POSIX
   message queues for one, no `mount` for a mount namespace (whose mounts keep their IDs

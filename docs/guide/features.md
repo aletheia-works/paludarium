@@ -63,9 +63,9 @@ kernel.
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
-| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, and the pseudo-terminals' requests below) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS` and `SIOCGIFINDEX` of the loopback, and the pseudo-terminals' requests below) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
-| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network), else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -186,7 +186,7 @@ kernel.
 - `futex`, `epoll` and `eventfd` are implemented inside paludarium, not with the
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
-- Without a [network](#network), `socket()` returns `EAFNOSUPPORT` for
+- Without a [network](#network), outside a new network namespace, `socket()` returns `EAFNOSUPPORT` for
   `AF_INET` and `AF_INET6`.
 - `poll` waits like `epoll_wait`: until a descriptor is ready, the timeout
   in milliseconds passes (a negative one never does) or a signal arrives
@@ -654,9 +654,10 @@ kernel.
   has no semaphore adjustments to drop, as there are no System V semaphores. Its
   namespace flags give the thread new namespaces, as below.
 - Each thread has its own namespaces, as Linux's `nsproxy`: UTS, IPC,
-  mount, cgroup, time and PID ones of its own, and the first network and
-  user namespaces. `unshare` with `CLONE_NEWUTS`, `CLONE_NEWIPC`,
-  `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWTIME` or `CLONE_NEWPID` gives
+  mount, cgroup, time, PID and network ones of its own, and the first
+  user namespace. `unshare` with `CLONE_NEWUTS`, `CLONE_NEWIPC`,
+  `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWTIME`, `CLONE_NEWPID` or
+  `CLONE_NEWNET` gives
   it new ones, and so does `clone` (`CLONE_NEWTIME` through `clone3`) for
   its child, a thread too (but not `CLONE_NEWPID`), with `CAP_SYS_ADMIN`
   (`EPERM` without it). A new UTS namespace starts
@@ -679,8 +680,9 @@ kernel.
   `CAP_SYS_ADMIN` (`EPERM`), and a PID namespace must be the thread's own
   or one nested in it (`EINVAL`). Entering a mount namespace moves the working
   directory to its root, and entering a PID namespace makes it the one the
-  thread's children are numbered in. See [Limitations](./limitations.md) for
-  the namespaces paludarium has no new ones of.
+  thread's children are numbered in; entering a network namespace makes it
+  the one the thread's new sockets are in. See [Limitations](./limitations.md)
+  for the namespaces paludarium has no new ones of.
 - A new PID namespace, as Linux's, is the one the thread's children are
   numbered in; the thread stays in its own, and its `pid_for_children` link
   is `ENOENT` until the first child, the namespace's init, numbered 1. A
@@ -708,6 +710,24 @@ kernel.
   other process of the namespace gets SIGKILL and none may join it any more
   (`ENOMEM`); its parent learns of the exit only once the rest is gone, its
   children reaped by the init, as Linux's `zap_pid_ns_processes`.
+- A new network namespace, as Linux's `loopback_net_init` makes it, has a
+  loopback alone, `lo` (index 1), which is down: a TCP or UDP socket there
+  binds IPv4's loopback addresses, which are local all the same, but not
+  `::1` (`EADDRNOTAVAIL`), and a connection or datagram goes nowhere
+  (`ENETUNREACH`). `SIOCSIFFLAGS` with `IFF_UP` (CAP_NET_ADMIN, else
+  `EPERM`) brings it up, with `::1`, which it has only while it is up:
+  then it is a
+  [loopback](#loopback-servers) of its own, whose ports, listeners and
+  datagrams are apart from every other namespace's, and anything off it is
+  still `ENETUNREACH`, port 53 too, as there is no DNS stub; a session with
+  no network has one there all the same. A socket stays in the namespace it
+  was made in. An abstract unix socket name (one starting with 0) is bound
+  and looked for among the names of the socket's namespace, as Linux's
+  `unix_find_abstract`, while a socket file on a path is reached from any
+  namespace. `SIOCGIFFLAGS` and `SIOCGIFINDEX` on a TCP or UDP socket read
+  its namespace's loopback (`IFF_UP | IFF_LOOPBACK | IFF_RUNNING` while it
+  is up, in the first namespace too), and another interface name is
+  `ENODEV`.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,

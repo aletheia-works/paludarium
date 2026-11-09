@@ -55,9 +55,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、後述の疑似端末のリクエスト） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があれば `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -168,7 +168,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書きます。新しいスレッドとプロセスのリストは空です。
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
-- [ネットワーク](#network)がなければ、`socket()` は `AF_INET` と `AF_INET6` に
+- [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET` と `AF_INET6` に
   `EAFNOSUPPORT` を返します。
 - `poll` は `epoll_wait` と同じように、どれかの記述子が準備できるか、ミリ秒の
   タイムアウトが過ぎるか（負の値なら過ぎません）、シグナルが届くまで（`EINTR`）待ちます。
@@ -597,9 +597,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   で捨てるセマフォーの調整値はありません。名前空間のフラグは、次のとおりスレッドに新しい
   名前空間を与えます。
 - スレッドは、Linux の `nsproxy` と同じく自分の名前空間を持ちます。UTS・IPC・マウント・
-  cgroup・time・PID の名前空間は自分のもので、ネットワーク・ユーザーの名前空間は最初の
+  cgroup・time・PID・ネットワークの名前空間は自分のもので、ユーザーの名前空間は最初の
   ものです。`CLONE_NEWUTS`、`CLONE_NEWIPC`、`CLONE_NEWNS`、`CLONE_NEWCGROUP`、
-  `CLONE_NEWTIME`、`CLONE_NEWPID` を付けた `unshare` はスレッドに新しい名前空間を与え、
+  `CLONE_NEWTIME`、`CLONE_NEWPID`、`CLONE_NEWNET` を付けた `unshare` はスレッドに新しい
+  名前空間を与え、
   `clone` も子に（`CLONE_NEWPID` を除いてスレッドにも）与えます（`CLONE_NEWTIME` は
   `clone3` で付けます）。どれも `CAP_SYS_ADMIN` が要ります（なければ `EPERM`）。新しい UTS 名前空間はホスト名と
   ドメイン名の写しで始まり、その後の `sethostname` と `setdomainname` はその名前空間だけを
@@ -618,7 +619,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `CAP_SYS_CHROOT`、どの名前空間も `CAP_SYS_ADMIN`（`EPERM`）が要り、PID 名前空間は
   スレッド自身のものか、その中のものでなければなりません（`EINVAL`）。マウント
   名前空間に入ると、作業ディレクトリーはその root に移り、PID 名前空間に入ると、それが
-  スレッドの子に番号を付ける名前空間になります。新しく作れない名前空間は
+  スレッドの子に番号を付ける名前空間になり、ネットワーク名前空間に入ると、それが
+  スレッドが新しく作るソケットの名前空間になります。新しく作れない名前空間は
   [制限](./limitations.md)を見てください。
 - 新しい PID 名前空間は、Linux と同じく、スレッドの子に番号を付ける名前空間です。
   スレッド自身は元の名前空間に残り、`pid_for_children` のリンクは、最初の子
@@ -643,6 +645,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   終わると、名前空間のほかのプロセスはすべて SIGKILL を受け、名前空間にはもう入れません
   （`ENOMEM`）。init の親は、Linux の `zap_pid_ns_processes` と同じく、残りがいなくなって
   から（init の子は init が刈り取ります）init の終了を知ります。
+- 新しいネットワーク名前空間には、Linux の `loopback_net_init` と同じく、ループバックの
+  `lo`（インデックス 1）だけがあり、それは落ちています。そこでの TCP や UDP のソケットは、
+  それでもローカルな IPv4 のループバックのアドレスには bind できますが、`::1` には
+  できず（`EADDRNOTAVAIL`）、接続もデータグラムもどこにも届きません（`ENETUNREACH`）。
+  `IFF_UP` を付けた `SIOCSIFFLAGS`（CAP_NET_ADMIN が要り、なければ `EPERM`）で上げると、
+  上がっている間だけ `::1` が付き、ほかのどの名前空間とも別のポート・待ち受け・データグラムを持つ
+  自分の[ループバック](#loopback-servers)になります。ループバックの外は、DNS スタブが
+  ないので 53 番ポートも含めて、`ENETUNREACH` のままです。ネットワークのないセッションでも
+  そこにはループバックがあります。ソケットは作られた名前空間に残ります。抽象名前空間の
+  unix ソケットの名前（0 で始まるもの）は、Linux の `unix_find_abstract` と同じく
+  ソケットの名前空間の名前の中で bind され、探されます。パスのソケットファイルには
+  どの名前空間からも届きます。TCP や UDP のソケットへの `SIOCGIFFLAGS` と
+  `SIOCGIFINDEX` は、その名前空間のループバックを読みます（上がっている間は最初の
+  名前空間でも `IFF_UP | IFF_LOOPBACK | IFF_RUNNING`）。ほかのインターフェースの名前は
+  `ENODEV` です。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、

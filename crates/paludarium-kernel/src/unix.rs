@@ -42,15 +42,16 @@ const SOMAXCONN: usize = 4096;
 const SUN_PATH: usize = 2;
 const SOCKADDR_UN: usize = 110;
 
-/// The abstract names bound on the machine, by socket type and name, as
-/// Linux's `unix_socket_table` hashes them with the type, so that sockets of
-/// different types can share one; and where an autobind looks for the next
-/// free one. A socket bound to a path is found by its socket file instead,
-/// by the file's mount and inode, as Linux's `unix_find_socket_byinode`.
+/// The abstract names bound in a network namespace, by socket type and
+/// name, as Linux's `unix_socket_table` hashes them with the type, so that
+/// sockets of different types can share one; and where an autobind looks
+/// for the next free one. A socket bound to a path is found by its socket
+/// file instead, by the file's mount and inode, as Linux's
+/// `unix_find_socket_byinode`, in every namespace of the machine.
 #[derive(Default)]
 pub(crate) struct Names {
     bound: Mutex<Bound>,
-    files: Mutex<BTreeMap<Inode, Weak<UnixSocket>>>,
+    files: Arc<Mutex<BTreeMap<Inode, Weak<UnixSocket>>>>,
     next: AtomicU32,
 }
 type Bound = BTreeMap<(u32, Vec<u8>), Weak<UnixSocket>>;
@@ -62,6 +63,14 @@ impl Names {
     }
     fn files(&self) -> MutexGuard<'_, BTreeMap<Inode, Weak<UnixSocket>>> {
         self.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// A new network namespace's: no abstract names, and the machine's
+    /// socket files.
+    pub(crate) fn nested(&self) -> Self {
+        Self {
+            files: Arc::clone(&self.files),
+            ..Self::default()
+        }
     }
 }
 /// A socket's name, once it is bound: the whole `sun_path` it gave,
@@ -156,7 +165,7 @@ pub(crate) fn pair(c: &Context<'_>, kind: u32) -> Result<[Arc<UnixSocket>; 2], E
                 end,
                 spare: Mutex::new(None),
                 name,
-                names: Arc::clone(&c.files.unix),
+                names: c.unix_names(),
                 hub: Arc::clone(&c.files.readiness),
                 state: Mutex::default(),
                 landlock: c.process.credentials.landlock.clone(),
@@ -280,12 +289,19 @@ pub(crate) fn validate(address: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 /// The socket of `kind` a valid `address` names, as Linux's
-/// `unix_find_other`: one bound to that abstract name (`ECONNREFUSED` where
-/// none is), or to the socket file a path leads to, as `unix_find_bsd`
-/// looks it up: the path's error, `ECONNREFUSED` for a file that is no
-/// socket's or one whose socket has gone, `EPROTOTYPE` for a socket of
-/// another type.
-pub(crate) fn find(c: &Context<'_>, address: &[u8], kind: u32) -> Result<Arc<UnixSocket>, Errno> {
+/// `unix_find_other`: one bound to that abstract name among `names`, those
+/// of the network namespace the looking socket was made in, as
+/// `unix_find_abstract` looks in `sock_net` (`ECONNREFUSED` where none is),
+/// or to the socket file a path leads to, in any namespace, as
+/// `unix_find_bsd` looks it up: the path's error, `ECONNREFUSED` for a file
+/// that is no socket's or one whose socket has gone, `EPROTOTYPE` for a
+/// socket of another type.
+pub(crate) fn find(
+    c: &Context<'_>,
+    names: &Names,
+    address: &[u8],
+    kind: u32,
+) -> Result<Arc<UnixSocket>, Errno> {
     let name = &address[SUN_PATH..];
     if name[0] != 0 {
         crate::permissions::connect(c.files, &c.process.credentials, &path_of(name))?;
@@ -294,9 +310,7 @@ pub(crate) fn find(c: &Context<'_>, address: &[u8], kind: u32) -> Result<Arc<Uni
         if stat.mode & 0o170000 != 0o140000 {
             return Err(ECONNREFUSED);
         }
-        let socket = c
-            .files
-            .unix
+        let socket = names
             .files()
             .get(&inode(c, &path, stat.inode))
             .and_then(Weak::upgrade)
@@ -306,8 +320,7 @@ pub(crate) fn find(c: &Context<'_>, address: &[u8], kind: u32) -> Result<Arc<Uni
         }
         return Ok(socket);
     }
-    c.files
-        .unix
+    names
         .lock()
         .get(&(kind, name.to_vec()))
         .and_then(Weak::upgrade)
@@ -357,7 +370,7 @@ impl UnixSocket {
                 end,
                 spare: Mutex::new(spare),
                 name: Address::default(),
-                names: Arc::clone(&c.files.unix),
+                names: c.unix_names(),
                 hub: Arc::clone(&c.files.readiness),
                 state: Mutex::default(),
                 landlock: c.process.credentials.landlock.clone(),
@@ -382,6 +395,10 @@ impl UnixSocket {
     }
     fn datagram(&self) -> bool {
         self.end.kind() == SOCK_DGRAM
+    }
+    /// The abstract names of the network namespace it was made in.
+    pub(crate) fn names(&self) -> Arc<Names> {
+        Arc::clone(&self.names)
     }
     /// The name it is bound to, which what it sends carries.
     pub(crate) fn address(&self) -> Address {
@@ -522,7 +539,7 @@ impl UnixSocket {
         let wait = crate::sockets::deadline(c, &file, false)?;
         loop {
             let ticket = c.files.readiness.token.value();
-            let listener = find(c, address, self.end.kind())?;
+            let listener = find(c, &self.names, address, self.end.kind())?;
             match listener.take(self, c) {
                 Ok(()) => return Ok(0),
                 Err(e) if e == Errno::EAGAIN => {
@@ -636,7 +653,7 @@ impl UnixSocket {
             if self.end.passes_any() {
                 self.autobind()?;
             }
-            let other = find(c, address, SOCK_DGRAM)?;
+            let other = find(c, &self.names, address, SOCK_DGRAM)?;
             if !self.connected_to(std::ptr::from_ref(&*other)) {
                 other.landlock_scope(c)?;
             }

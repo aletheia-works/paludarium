@@ -912,6 +912,33 @@ impl Context<'_> {
     pub(crate) fn pid_space(&self) -> std::sync::Arc<crate::namespaces::Namespace> {
         self.group.namespaces(self.tid).pid.clone()
     }
+    /// The network the caller's sockets are made in: its network
+    /// namespace's own, or for the first one the session's, if it has one.
+    pub(crate) fn network(&self) -> Option<std::sync::Arc<crate::inet::Network>> {
+        let namespaces = self.group.namespaces(self.tid);
+        namespaces
+            .net
+            .sockets
+            .network
+            .get()
+            .cloned()
+            .or_else(|| self.files.network.clone())
+    }
+    /// The names a unix socket the caller makes binds abstract names among:
+    /// its network namespace's, for the first one the session's. A socket
+    /// file is found by its inode in every namespace, as in Linux.
+    pub(crate) fn unix_names(&self) -> std::sync::Arc<crate::unix::Names> {
+        let namespaces = self.group.namespaces(self.tid);
+        let sockets = &namespaces.net.sockets;
+        if sockets.network.get().is_none() {
+            return std::sync::Arc::clone(&self.files.unix);
+        }
+        std::sync::Arc::clone(
+            sockets
+                .unix
+                .get_or_init(|| std::sync::Arc::new(self.files.unix.nested())),
+        )
+    }
     /// The task the caller names by `number`, or nobody.
     pub(crate) fn named(&self, number: u32) -> u32 {
         self.pid_space()
@@ -2118,6 +2145,40 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         // A pseudo-terminal's own requests.
         if let Some(result) = crate::pty::ioctl(c, &file, a[1], a[2]) {
             return result;
+        }
+        // SIOCGIFFLAGS, SIOCSIFFLAGS and SIOCGIFINDEX of an inet socket's
+        // network, whose interface is its loopback: a `struct ifreq` of 40
+        // bytes, read whole and written back, as Linux's `dev_ioctl` does.
+        if let Some(socket) = crate::inet::of(&file)
+            && matches!(
+                a[1],
+                crate::inet::SIOCGIFFLAGS | crate::inet::SIOCSIFFLAGS | crate::inet::SIOCGIFINDEX
+            )
+        {
+            const CAP_NET_ADMIN: u64 = 1 << 12;
+            let mut request = [0; 40];
+            c.mem
+                .read(GuestAddr(a[2]), &mut request)
+                .map_err(|_| Errno::EFAULT)?;
+            request[15] = 0;
+            let flags = u16::from_le_bytes([request[16], request[17]]);
+            let admin = c.process.credentials.effective & CAP_NET_ADMIN != 0;
+            let value = socket
+                .network()
+                .interface(&request[..16], a[1], flags, admin)?;
+            match a[1] {
+                crate::inet::SIOCGIFFLAGS => {
+                    request[16..18].copy_from_slice(&(value as u16).to_le_bytes());
+                }
+                crate::inet::SIOCGIFINDEX => {
+                    request[16..20].copy_from_slice(&value.to_le_bytes());
+                }
+                _ => return Ok(0),
+            }
+            c.mem
+                .write(GuestAddr(a[2]), &request)
+                .map_err(|_| Errno::EFAULT)?;
+            return Ok(0);
         }
         // SIOCATMARK: whether a socket's next read is at its out-of-band mark.
         if a[1] == 0x8905 {

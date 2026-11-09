@@ -222,11 +222,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **名前空間**：新しいネットワーク・ユーザーの名前空間は作れません。
-  `CLONE_NEWNET` を付けた `clone`、`clone3`、`unshare` は、子を作らずに
-  `EINVAL` で失敗します（`CAP_SYS_ADMIN` のないスレッドでは Linux と同じく `EPERM`）。
-  Linux では、root で動くゲストはこれを作れます。Linux ではユーザーも使える
-  `CLONE_NEWUSER` は、どのスレッドでも `EINVAL` です。ほかの名前空間は、paludarium に
+- **名前空間**：新しいユーザーの名前空間は作れません。Linux ではユーザーも使える
+  `CLONE_NEWUSER` を付けた `clone`、`clone3`、`unshare` は、どのスレッドでも `EINVAL`
+  です。ネットワーク名前空間には、ループバックのほかにインターフェースがなく（別の
+  名前空間に届く `veth` の組もありません）、netlink（`AF_NETLINK`）もないので、
+  `ip link set lo up` ではループバックを上げられません。上げられるのは TCP や UDP の
+  ソケットへの `SIOCSIFFLAGS` だけで、インターフェースのリクエストはほかのソケットも、
+  `IFF_UP` のほかのフラグも受け付けません。最初の名前空間でも `lo` しか見えません。
+  Linux ではホストのインターフェースが見えます。ほかの名前空間は、paludarium に
   分けるものがありません（IPC 名前空間の System V の共有メモリを除きます）。IPC 名前空間には
   System V のセマフォーとメッセージキューも、POSIX メッセージキューもなく、
   マウント名前空間には `mount` がありません（`/proc/self/mountinfo` のマウント ID は

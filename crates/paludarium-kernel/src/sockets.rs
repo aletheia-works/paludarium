@@ -555,7 +555,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = (|| match number {
         // AF_INET and AF_INET6, with a network, and AF_UNIX.
         41 if a[0] == 1 => crate::unix::socket(c, a),
-        41 => match c.files.network.clone() {
+        41 => match c.network() {
             Some(network) if matches!(a[0], 2 | 10) => {
                 if a[1] as u32 & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
                     return Err(Errno::EINVAL);
@@ -1005,7 +1005,10 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .read(GuestAddr(a[1]), &mut bytes)
         .map_err(|_| Errno::EFAULT)?;
     let to = if lookup {
-        let to = crate::unix::find(c, &address, SOCK_DGRAM)?;
+        let names = socket
+            .unix()
+            .map_or_else(|| c.unix_names(), |own| own.names());
+        let to = crate::unix::find(c, &names, &address, SOCK_DGRAM)?;
         crate::unix::may_send(c, socket, &to)?;
         Some(to)
     } else {
@@ -1104,7 +1107,10 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .map_err(|_| Errno::EFAULT)?;
     }
     let to = if lookup {
-        let to = crate::unix::find(c, &address, SOCK_DGRAM)?;
+        let names = socket
+            .unix()
+            .map_or_else(|| c.unix_names(), |own| own.names());
+        let to = crate::unix::find(c, &names, &address, SOCK_DGRAM)?;
         crate::unix::may_send(c, socket, &to)?;
         Some(to)
     } else {

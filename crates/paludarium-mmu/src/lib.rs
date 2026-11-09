@@ -913,14 +913,56 @@ pub struct Remap {
 /// How many pages the [`Tlb`] remembers.
 const TLB_ENTRIES: usize = 64;
 
-/// A populated page that is neither shared nor of a file mapping, as the
-/// page table held it: an access that stays inside it needs only its
-/// protection checked, as [`AddressSpaceData::check`] would.
+/// A populated page that is not shared, as the page table held it: an
+/// access that stays inside it needs only its protection checked, as
+/// [`AddressSpaceData::check`] would, and, for a page of a file mapping,
+/// its file ([`FileEnd`]).
 struct TlbEntry {
     page: u64,
     prot: Prot,
     frame: Frame,
     cow: bool,
+    file: Option<FileEnd>,
+}
+
+/// What an access through a [`Tlb`] to a page of a private file mapping
+/// checks first, since the file can change without the space's lock, by
+/// `ftruncate` from anywhere: that the page is not wholly past the end of
+/// the file, which raises SIGBUS ([`AddressSpaceData::check`]), and, for a
+/// copy of the page's own, that the file has not shrunk since the entry
+/// was made, after which the copy may have to go
+/// ([`AddressSpaceData::refresh`]). Otherwise the access takes the locks,
+/// which do both.
+///
+/// Each access checks both itself, so it does not matter in which order a
+/// truncation changes them. An access that saw neither change comes before
+/// the truncation, like one already under way when it ran. A store of that
+/// kind may still land after the truncation returns, but where it lands
+/// gives the same result as a store just before it. A copy that the
+/// truncation leaves wholly past the end is never seen again, as the next
+/// access under the locks replaces it, so the store goes with it. A copy
+/// that it leaves within the file stays, with the store in it.
+struct FileEnd {
+    source: Arc<dyn PageSource>,
+    /// The page's offset in the file.
+    offset: u64,
+    /// How many times the file had shrunk ([`PageSource::shrinks`]) when the
+    /// copy was made or last checked, or `None` for a page that shows the
+    /// file's page cache, which no shrink replaces.
+    shrinks: Option<u64>,
+}
+
+impl FileEnd {
+    /// Whether an access through the entry may go ahead without the locks.
+    #[inline]
+    fn holds(&self) -> bool {
+        self.shrinks
+            .is_none_or(|shrinks| self.source.shrinks() == shrinks)
+            && self
+                .source
+                .size()
+                .is_none_or(|size| self.offset < size.div_ceil(PAGE_SIZE) * PAGE_SIZE)
+    }
 }
 
 /// The pages the latest accesses used, so that the next ones skip the page
@@ -952,7 +994,7 @@ impl Tlb {
     fn get(&self, page: u64) -> Option<&TlbEntry> {
         self.entries[Self::slot(page)]
             .as_ref()
-            .filter(|entry| entry.page == page)
+            .filter(|entry| entry.page == page && entry.file.as_ref().is_none_or(FileEnd::holds))
     }
 
     fn insert(&mut self, entry: TlbEntry) {
@@ -1528,7 +1570,11 @@ impl AddressSpaceData {
                     .shrunk_since(p.shrinks)
                     .is_some_and(|size| offset >= size.div_ceil(PAGE_SIZE) * PAGE_SIZE);
                 if past {
-                    *entry = Some(self.fresh(page, p.prot));
+                    // Made after the shrinks so far, which it must not go
+                    // with in turn.
+                    let mut fresh = self.fresh(page, p.prot);
+                    fresh.shrinks = count;
+                    *entry = Some(fresh);
                 } else {
                     p.shrinks = count;
                 }
@@ -1770,15 +1816,29 @@ impl AddressSpaceData {
     }
 
     /// Remembers the page at `page` in this thread's [`ThreadTlb`] when an
-    /// access to it needs only its protection checked: it is populated, and
-    /// neither shared nor of a file mapping, whose file may end before it.
+    /// access to it needs only its protection checked, and its file if it
+    /// has one ([`FileEnd`]): it is populated, and not shared (a store to a
+    /// shared page makes it dirty and moves the shared pages' generation on,
+    /// under the locks).
     fn remember(&self, directory: &Directory, page: u64) {
         let Some(p) = lookup(directory, page) else {
             return;
         };
-        if p.file || p.cache || self.shared_at(page).is_some() {
+        if self.shared_at(page).is_some() || self.may_be_truncated(page, p) {
             return;
         }
+        let file = if p.file {
+            let Some((source, offset)) = self.file_at(page) else {
+                return;
+            };
+            Some(FileEnd {
+                source: Arc::clone(source),
+                offset,
+                shrinks: (!p.cache).then_some(p.shrinks),
+            })
+        } else {
+            None
+        };
         // The lock is held, so the epoch is the one the entry is valid at.
         let epoch = self.code.epoch.load(Ordering::Acquire);
         THREAD_TLB.with(|cell| {
@@ -1794,6 +1854,7 @@ impl AddressSpaceData {
                 prot: p.prot,
                 frame: p.frame.clone(),
                 cow: p.cow,
+                file,
             });
         });
     }
@@ -3392,8 +3453,9 @@ impl AddressSpace {
         let entry = tlb
             .get(page)
             .filter(|e| e.prot.contains(Prot::WRITE) && !e.cow)?;
-        // The page is neither shared nor of a file: nothing writes it back,
-        // so it need not be marked dirty.
+        // The page is not shared, so nothing writes it back and it need not
+        // be marked dirty. A page-cache page, which is, has `cow` set and is
+        // left out above.
         Some((entry.frame.get()?, entry.prot.contains(Prot::EXEC)))
     }
     /// After a store through a [`ThreadTlb`]: a store to code makes the

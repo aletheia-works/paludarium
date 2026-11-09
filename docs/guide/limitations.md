@@ -136,13 +136,20 @@ verified.
   open with `O_APPEND` do not reach the file. The end of a mapped file, past
   which a page raises `SIGBUS`, is the size the guest's own file operations
   give it, so a host program changing the size does not move it.
+- **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
+  CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
+  not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its
+  critical section is aborted when it changes CPU or another thread ran on
+  its own, which is when Linux's could be interrupted too, but not when the
+  host preempts it, which no other thread with `rseq` can notice. A CPU mask
+  another thread sets takes effect at the thread's next stop, and a thread
+  in a system call holds no CPU, so its area shows the CPU it last ran on.
+  Threads without `rseq` run on no virtual CPU and are not counted. There is
+  no time slice extension: `RSEQ_FLAG_SLICE_EXT_DEFAULT_ON` gives `EINVAL`,
+  as on a Linux built without it.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
-  - `rseq` is one of them, as on a Linux built without `CONFIG_RSEQ`, and glibc
-    carries on without it. Its promise is that a thread's critical section is
-    abandoned if it is preempted, which emulated threads running truly in
-    parallel cannot keep, so registering would let per-CPU data break.
-  - `pkey_alloc` and `io_uring_setup` are too, as on a Linux built without
+  - `pkey_alloc` and `io_uring_setup` are among them, as on a Linux built without
     them. Programs check for that and carry on. Saying yes would be wrong
     without the rest: protection keys need the CPU feature, which `CPUID` does
     not report, and io_uring's rings would do no work.
@@ -249,9 +256,14 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **Namespaces**: there are no new user namespaces: `clone`, `clone3` and
-  `unshare` with `CLONE_NEWUSER`, which Linux lets even a user have, are
-  `EINVAL` for every thread. A network namespace has no interface but its
+- **Namespaces**: a user namespace has no `projid_map` and no
+  `user.max_*` limits; its map files check a write with the credentials
+  the file was opened with, where Linux also takes the writer's for the
+  `CAP_SETUID` and `CAP_SETGID` it needs in the parent; and the `/proc` files
+  of a process that is not dumpable belong to root of the first namespace,
+  where Linux gives them to root of the process's own when it maps one.
+  There are no file capabilities, in a user namespace either. A network
+  namespace has no interface but its
   loopback (no `veth` pairs to reach another), and there is no netlink
   (`AF_NETLINK`), so `ip link set lo up` cannot bring the loopback up: only
   `SIOCSIFFLAGS` on a TCP or UDP socket does, and the interface requests

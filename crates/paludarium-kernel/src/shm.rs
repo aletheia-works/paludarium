@@ -244,8 +244,8 @@ impl Table {
 /// Whether `credentials` may use a segment for `flag`'s permission bits, as
 /// Linux's `ipcperms`: as its owner or creator, else as a member of its
 /// group (by the filesystem group ID, as `in_group_p`), else as anyone, or
-/// with `CAP_IPC_OWNER`.
-fn permitted(segment: &Segment, credentials: &Credentials, flag: u32) -> bool {
+/// with `CAP_IPC_OWNER` over the IPC namespace (`owner_capable`).
+fn permitted(segment: &Segment, credentials: &Credentials, flag: u32, owner_capable: bool) -> bool {
     let requested = (flag >> 6) | (flag >> 3) | flag;
     let in_group = |gid: u32| credentials.fsgid == gid || credentials.groups.contains(&gid);
     let granted = if credentials.euid == segment.cuid || credentials.euid == segment.uid {
@@ -255,7 +255,15 @@ fn permitted(segment: &Segment, credentials: &Credentials, flag: u32) -> bool {
     } else {
         segment.mode
     };
-    requested & !granted & 0o7 == 0 || credentials.effective & CAP_IPC_OWNER != 0
+    requested & !granted & 0o7 == 0 || owner_capable
+}
+/// Whether the caller has `cap` in the user namespace that owns its IPC
+/// namespace (`ns_capable(ns->user_ns, cap)`).
+fn ipc_capable(c: &Context<'_>, cap: u64) -> bool {
+    let namespaces = c.group.namespaces(c.tid);
+    c.process
+        .credentials
+        .capable_in(cap, namespaces.ipc.owner())
 }
 
 fn now(c: &Context<'_>) -> i64 {
@@ -286,6 +294,7 @@ pub(crate) fn sys_shmget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno> {
     let credentials = &c.process.credentials;
+    let owner = ipc_capable(c, CAP_IPC_OWNER);
     let shm = segments(c);
     let mut table = shm.lock();
     if key != IPC_PRIVATE {
@@ -296,7 +305,7 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
             if segment.size < size {
                 return Err(Errno::EINVAL);
             }
-            if !permitted(segment, credentials, flag as u32) {
+            if !permitted(segment, credentials, flag as u32, owner) {
                 return Err(Errno::EACCES);
             }
             return Ok(u64::from(segment.id as u32));
@@ -386,10 +395,11 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         access |= 0o111;
     }
     let (attachment, size) = {
+        let owner = ipc_capable(c, CAP_IPC_OWNER);
         let shm = segments(c);
         let mut table = shm.lock();
         let segment = table.checked(id)?;
-        if !permitted(segment, &c.process.credentials, access) {
+        if !permitted(segment, &c.process.credentials, access, owner) {
             return Err(Errno::EACCES);
         }
         let attachment = Arc::new(Attachment {
@@ -575,7 +585,14 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                         .get_mut(&(id as u32 % IPCMNI))
                         .ok_or(Errno::EINVAL)?
                 };
-                if cmd != SHM_STAT_ANY && !permitted(segment, &c.process.credentials, 0o444) {
+                if cmd != SHM_STAT_ANY
+                    && !permitted(
+                        segment,
+                        &c.process.credentials,
+                        0o444,
+                        ipc_capable(c, CAP_IPC_OWNER),
+                    )
+                {
                     return Err(Errno::EACCES);
                 }
                 let returned = if cmd == IPC_STAT {
@@ -583,7 +600,10 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                 } else {
                     u64::from(segment.id as u32)
                 };
-                (shmid_ds(segment, &c.pid_space()), returned)
+                (
+                    shmid_ds(segment, &c.pid_space(), &c.process.credentials.user),
+                    returned,
+                )
             };
             write(&ds)?;
             Ok(returned)
@@ -596,23 +616,26 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                     .map_err(|_| Errno::EFAULT)?;
             }
             let now = now(c);
+            let admin = ipc_capable(c, CAP_SYS_ADMIN);
             let shm = segments(c);
             let mut table = shm.lock();
             let credentials = &c.process.credentials;
             let segment = table.checked(id)?;
-            if credentials.euid != segment.cuid
-                && credentials.euid != segment.uid
-                && credentials.effective & CAP_SYS_ADMIN == 0
-            {
+            if credentials.euid != segment.cuid && credentials.euid != segment.uid && !admin {
                 return Err(Errno::EPERM);
             }
             if cmd == IPC_SET {
                 let field =
                     |at: usize| u32::from_le_bytes([ds[at], ds[at + 1], ds[at + 2], ds[at + 3]]);
                 let (uid, gid, mode) = (field(4), field(8), field(20));
-                if uid == u32::MAX || gid == u32::MAX {
+                // In the caller's user namespace (`ipc_update_perm`).
+                let user = &credentials.user;
+                let (Some(uid), Some(gid)) = (
+                    user.kernel_of(crate::users::Ids::User, uid),
+                    user.kernel_of(crate::users::Ids::Group, gid),
+                ) else {
                     return Err(Errno::EINVAL);
-                }
+                };
                 segment.uid = uid;
                 segment.gid = gid;
                 segment.mode = segment.mode & !0o777 | mode & 0o777;
@@ -633,14 +656,20 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
 
 /// `struct shmid64_ds` of `segment`, as x86-64 lays it out, its PIDs as
 /// the caller's PID namespace `space` numbers them (Linux's `pid_vnr`).
-fn shmid_ds(segment: &Segment, space: &crate::namespaces::Namespace) -> [u8; 112] {
+/// Its owners as the caller's user namespace `user` shows them.
+fn shmid_ds(
+    segment: &Segment,
+    space: &crate::namespaces::Namespace,
+    user: &crate::namespaces::Namespace,
+) -> [u8; 112] {
+    use crate::users::Ids;
     let mut ds = [0u8; 112];
     let mut put = |at: usize, bytes: &[u8]| ds[at..at + bytes.len()].copy_from_slice(bytes);
     put(0, &segment.key.to_le_bytes());
-    put(4, &segment.uid.to_le_bytes());
-    put(8, &segment.gid.to_le_bytes());
-    put(12, &segment.cuid.to_le_bytes());
-    put(16, &segment.cgid.to_le_bytes());
+    put(4, &user.shown(Ids::User, segment.uid).to_le_bytes());
+    put(8, &user.shown(Ids::Group, segment.gid).to_le_bytes());
+    put(12, &user.shown(Ids::User, segment.cuid).to_le_bytes());
+    put(16, &user.shown(Ids::Group, segment.cgid).to_le_bytes());
     put(20, &segment.mode.to_le_bytes());
     put(24, &((segment.id as u32 >> SEQ_SHIFT) as u16).to_le_bytes());
     put(48, &segment.size.to_le_bytes());
@@ -660,7 +689,7 @@ fn shmid_ds(segment: &Segment, space: &crate::namespaces::Namespace) -> [u8; 112
 /// a lock changes nothing else.
 fn lock(c: &Context<'_>, id: i32, lock: bool) -> Result<u64, Errno> {
     let credentials = &c.process.credentials;
-    let capable = credentials.effective & CAP_IPC_LOCK != 0;
+    let capable = ipc_capable(c, CAP_IPC_LOCK);
     let limit = c.processes.soft_limit(c.process.pid, RLIMIT_MEMLOCK);
     let shm = segments(c);
     let mut table = shm.lock();

@@ -645,9 +645,6 @@ const SCM_RIGHTS: u32 = 1;
 const SCM_CREDENTIALS: u32 = 2;
 /// `struct ucred`: a process ID, a user and a group.
 const UCRED: usize = 12;
-/// The user and group a message without credentials reads as, Linux's
-/// `overflowuid` and `overflowgid`.
-const OVERFLOW_ID: u32 = 65534;
 /// `SCM_MAX_FD`: the most descriptors one message passes.
 const MAX_PASSED: usize = 253;
 /// `struct cmsghdr`: `cmsg_len` (8 bytes), `cmsg_level` and `cmsg_type`.
@@ -868,12 +865,18 @@ fn control_messages(c: &Context<'_>, control: &[u8]) -> Result<(Passed, Option<U
                 id: pid,
                 signal: 0,
             };
-            // scm_check_creds refuses an ID of -1 first.
-            if uid == u32::MAX || gid == u32::MAX {
+            // scm_check_creds takes the IDs in the sender's user namespace,
+            // and refuses one it does not map (`-1` too) first.
+            let user = &c.process.credentials.user;
+            let (Some(uid), Some(gid)) = (
+                user.kernel_of(crate::users::Ids::User, uid),
+                user.kernel_of(crate::users::Ids::Group, gid),
+            ) else {
                 return Err(Errno::EINVAL);
-            }
+            };
             if !c.process.credentials.may_send_credentials(
                 number == space.number(c.process.pid),
+                space.owner(),
                 uid,
                 gid,
             ) {
@@ -1328,11 +1331,10 @@ fn deliver(
     if let Some(credentials) = credentials {
         let mut ucred = [0; UCRED];
         // The sender as the receiver's PID namespace numbers it.
+        // And its IDs as the receiver's user namespace shows them.
         let pid = c.pid_space().number(credentials.pid);
-        for (i, id) in [pid, credentials.uid, credentials.gid]
-            .into_iter()
-            .enumerate()
-        {
+        let (uid, gid) = (c.shown_uid(credentials.uid), c.shown_gid(credentials.gid));
+        for (i, id) in [pid, uid, gid].into_iter().enumerate() {
             ucred[4 * i..][..4].copy_from_slice(&id.to_le_bytes());
         }
         cut |= put_control(c, &mut room, SCM_CREDENTIALS, &ucred);
@@ -1859,7 +1861,13 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 uid: u32::MAX,
                 gid: u32::MAX,
             });
-            [c.pid_space().number(peer.pid), peer.uid, peer.gid]
+            // An ID of -1, for no peer, stays.
+            let (uid, gid) = if peer.uid == u32::MAX {
+                (peer.uid, peer.gid)
+            } else {
+                (c.shown_uid(peer.uid), c.shown_gid(peer.gid))
+            };
+            [c.pid_space().number(peer.pid), uid, gid]
                 .iter()
                 .flat_map(|id| id.to_le_bytes())
                 .collect()
@@ -1969,8 +1977,8 @@ fn stream_truesize(len: usize) -> usize {
 /// The credentials a write carries, as Linux's `UNIXCB` keeps them for
 /// `SCM_CREDENTIALS`: its sender's process ID, user and group when either
 /// end passed credentials (`SO_PASSCRED`) as it was sent, or those it gave
-/// itself, else none, which a receiver reads as process 0 and the overflow
-/// IDs.
+/// itself, else none: process 0 and no user or group (`INVALID_UID`),
+/// which a receiver reads as the overflow IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ucred {
     pid: u32,
@@ -1981,8 +1989,8 @@ impl Default for Ucred {
     fn default() -> Self {
         Self {
             pid: 0,
-            uid: OVERFLOW_ID,
-            gid: OVERFLOW_ID,
+            uid: crate::users::INVALID,
+            gid: crate::users::INVALID,
         }
     }
 }

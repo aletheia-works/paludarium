@@ -911,6 +911,18 @@ fn syscall_huge_bad_read_buffer() {
     assert_eq!(f.ret(0, &[0, 1, u64::MAX]), errno(Errno::EFAULT));
 }
 #[test]
+fn openat2_tail_in_the_last_page_is_efault() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
+    // A `struct open_how` whose later-version tail ends at the top of the
+    // address space: the zero check reads it (EFAULT), without overflowing.
+    let how = u64::MAX - 64;
+    assert_eq!(
+        f.ret(437, &[(-100i64) as u64, DATA, how, 64]),
+        errno(Errno::EFAULT)
+    );
+}
+#[test]
 fn syscall_huge_bad_write_buffer() {
     let mut f = fixture();
     f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
@@ -950,6 +962,39 @@ fn umask_and_the_chmod_family_set_permission_bits() {
     assert_eq!(f.ret(90, &[DATA + 0x20, 0o600]), errno(Errno::ENOENT));
     assert_eq!(f.ret(91, &[99, 0o600]), errno(Errno::EBADF));
     assert_eq!(f.ret(90, &[0, 0o600]), errno(Errno::EFAULT));
+}
+#[test]
+fn linkat_follows_a_link_with_at_symlink_follow_and_links_a_descriptor_with_at_empty_path() {
+    let mut f = fixture();
+    let cwd = (-100i64) as u64;
+    f.mem.write(GuestAddr(DATA), b"/file\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x10), b"/link\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x20), b"/new\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x30), b"\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x40), b"/none\0").unwrap();
+    f.mem.write(GuestAddr(DATA + 0x50), b"/dangling\0").unwrap();
+    let fd = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(88, &[DATA, DATA + 0x10]), 0);
+    let link = |f: &mut Fixture, dir, old, flags| f.ret(265, &[dir, old, cwd, DATA + 0x20, flags]);
+    assert_eq!(link(&mut f, cwd, DATA + 0x10, 0x800), errno(Errno::EINVAL));
+    // Without the flag the symbolic link itself is linked.
+    assert_eq!(link(&mut f, cwd, DATA + 0x10, 0), 0);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA + 0x20, true).0, 0o120_777);
+    assert_eq!(f.ret(87, &[DATA + 0x20]), 0);
+    assert_eq!(link(&mut f, cwd, DATA + 0x10, 0x400), 0);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA + 0x20, true).0, 0o100_600);
+    assert_eq!(f.ret(87, &[DATA + 0x20]), 0);
+    assert_eq!(link(&mut f, fd, DATA + 0x30, 0), errno(Errno::ENOENT));
+    assert_eq!(link(&mut f, fd, DATA + 0x30, 0x1000), 0);
+    assert_eq!(stat_mode_and_mtime(&mut f, DATA + 0x20, true).0, 0o100_600);
+    assert_eq!(link(&mut f, fd, DATA + 0x30, 0x1000), errno(Errno::EEXIST));
+    assert_eq!(f.ret(87, &[DATA + 0x20]), 0);
+    assert_eq!(link(&mut f, 99, DATA + 0x30, 0x1000), errno(Errno::EBADF));
+    // A dangling link leads nowhere, and a removed file has no name.
+    assert_eq!(f.ret(88, &[DATA + 0x40, DATA + 0x50]), 0);
+    assert_eq!(link(&mut f, cwd, DATA + 0x50, 0x400), errno(Errno::ENOENT));
+    assert_eq!(f.ret(87, &[DATA]), 0);
+    assert_eq!(link(&mut f, fd, DATA + 0x30, 0x1000), errno(Errno::ENOENT));
 }
 /// The owner, group and mode `stat` (or `lstat`) gives for the path at `at`.
 fn stat_owner(f: &mut Fixture, at: u64, nofollow: bool) -> (u32, u32, u32) {

@@ -725,6 +725,33 @@ void _start(void) {
   results[x++]=call(191,(long)p,(long)"user.k",(long)buf,8,0,0);
   results[x++]=call(188,(long)fdpath(900),(long)"user.k",(long)"v",1,0,0);
   S(3,op,0,0);}
+ if(CASE==67){ /* linkat's AT_SYMLINK_FOLLOW (0x400) and AT_EMPTY_PATH (0x1000) */
+  #define LK(od,o,f) call(265,od,(long)(o),-100,(long)r,f,0)
+  #define NLINK(n) (S(6,n,st,0)<0?-1:*(long*)(st+16))
+  #define ISLNK(n) (S(6,n,st,0)<0?-1:(*(unsigned*)(st+24)&0170000)==0120000)
+  static char u2[]="/tmp/paludarium-files-unused",dl[]="/tmp/paludarium-files-dangling";
+  S(1,fd,"abc",3);S(88,p,q,0);
+  results[x++]=LK(-100,q,0x800);results[x++]=LK(-100,q,0x401);
+  results[x++]=LK(-100,q,0);results[x++]=ISLNK(r);S(87,r,0,0);
+  results[x++]=LK(-100,q,0x400);results[x++]=ISLNK(r);results[x++]=NLINK(p);S(87,r,0,0);
+  results[x++]=LK(fd,"",0x1000);results[x++]=NLINK(p);S(87,r,0,0);
+  results[x++]=LK(fd,"",0);results[x++]=LK(fd,"",0x1400);S(87,r,0,0);
+  long op=S(2,p,010000000,0);results[x++]=LK(op,"",0x1000);results[x++]=NLINK(r);S(87,r,0,0);
+  long ol=S(2,q,010400000,0);results[x++]=LK(ol,"",0x1000);results[x++]=ISLNK(r);S(87,r,0,0);
+  long dp=S(2,"/tmp",010200000,0);results[x++]=LK(dp,"",0x1000);
+  results[x++]=LK(-100,fdpath(fd),0x400);results[x++]=NLINK(p);S(87,r,0,0);
+  results[x++]=LK(-100,fdpath(op),0x400);S(87,r,0,0);
+  results[x++]=LK(-100,fdpath(fd),0);results[x++]=LK(-100,fdpath(900),0x400);
+  results[x++]=call(265,fd,(long)"",-100,(long)q,0x1000,0);
+  /* A removed file has no name to link again; a pipe or a memfd is on a
+     filesystem of its own. */
+  S(87,u2,0,0);long w=S(2,u2,0102,0600);S(87,u2,0,0);
+  results[x++]=LK(w,"",0x1000);results[x++]=LK(-100,fdpath(w),0x400);
+  results[x++]=call(265,w,(long)"",-100,(long)q,0x1000,0);
+  int pf[2];S(22,pf,0,0);results[x++]=LK(pf[0],"",0x1000);
+  long m=S(319,"m",0,0);results[x++]=LK(m,"",0x1000);results[x++]=LK(-100,fdpath(m),0x400);
+  S(88,"/tmp/paludarium-files-missing",dl,0);results[x++]=LK(-100,dl,0x400);results[x++]=LK(-100,dl,0);results[x++]=ISLNK(r);S(87,r,0,0);
+  S(87,dl,0,0);S(3,w,0,0);S(3,pf[0],0,0);S(3,pf[1],0,0);S(3,m,0,0);S(3,op,0,0);S(3,ol,0,0);S(3,dp,0,0);}
  if(CASE==68){ /* a link in /proc/self/fd (and /proc/self/cwd, /dev/fd) inside a path: the walk goes on from the descriptor's file */
   #define UNDER(pre,n,rest) ({static char u[256];char *a=numbered(pre,n),*o=u;while(*a)*o++=*a++;const char *b=rest;while(*b)*o++=*b++;*o=0;u;})
   #define INODE(n) (S(4,n,st,0)<0?-1:*(long*)(st+8))

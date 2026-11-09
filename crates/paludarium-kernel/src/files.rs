@@ -886,6 +886,100 @@ fn io_descriptor(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno>
     }
     Ok(file)
 }
+/// The checks `filename_create` makes of a new name before a link that
+/// fails later: its directory is searched, and the name is not there.
+fn new_name_free(c: &Context<'_>, dir: u64, raw: &[u8], new: &[u8]) -> Result<(), Errno> {
+    crate::permissions::search(c.files, &c.process.credentials, dir, raw, false)?;
+    if c.files.fs.metadata(new, false).is_ok() {
+        return Err(Errno::EEXIST);
+    }
+    Ok(())
+}
+/// `link(old, new)` and `linkat(olddir, old, newdir, new, flags)`, as
+/// Linux's `do_linkat`: `AT_SYMLINK_FOLLOW` follows a symbolic link the old
+/// path ends in, and a link in `/proc/self/fd` to the descriptor's file, and
+/// `AT_EMPTY_PATH` with an empty old path links the file `olddir` holds
+/// (the working directory's, a directory, is EPERM). The old name is looked
+/// up, the new one must not be there (EEXIST) and be on the same filesystem
+/// (EXDEV), which the link finds, before `may_create`. A file no path names
+/// any more is ENOENT, as Linux's `vfs_link` finds it with no links, and a
+/// memfd, a pipe or a socket is on a filesystem of its own (EXDEV).
+fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    let ((old_dir, old_ptr), (new_dir, new_ptr), flags) = if n == 86 {
+        (((-100i32) as u64, a[0]), ((-100i32) as u64, a[1]), 0)
+    } else {
+        ((a[0], a[1]), (a[2], a[3]), a[4])
+    };
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let follow = flags & AT_SYMLINK_FOLLOW != 0;
+    let old_raw = path(c, old_ptr)?;
+    let target = if old_raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if old_dir as i32 == -100 {
+            Followed::Path {
+                path: c.files.path(old_dir, b".".to_vec())?,
+                follow: false,
+            }
+        } else {
+            descriptor_followed(c.files, c.files.descriptor(old_dir)?)?
+        }
+    } else {
+        let (old, _) = lookup(c, old_dir, old_raw, follow)?;
+        match followed(c, &old, follow)? {
+            Some(target) => target,
+            // A dangling symbolic link leads nowhere (ENOENT).
+            None if follow => Followed::Path {
+                path: resolved(c.files, &old).ok_or(Errno::ENOENT)?,
+                follow: false,
+            },
+            None => Followed::Path {
+                path: old,
+                follow: false,
+            },
+        }
+    };
+    let new_raw = path(c, new_ptr)?;
+    let new = c.files.path(new_dir, new_raw.clone())?;
+    let old = match target {
+        Followed::Path { path, follow: true } => resolved(c.files, &path).unwrap_or(path),
+        Followed::Path { path, .. } => path,
+        // Not linkable: the new name is still looked up first.
+        Followed::File(d) => {
+            new_name_free(c, new_dir, &new_raw, &new)?;
+            let named = !d.path.is_empty()
+                && d.file
+                    .as_any()
+                    .is_none_or(|v| !v.is::<crate::memfd::Memfd>());
+            if named && device(c, &d.path) == device(c, &new) {
+                return Err(Errno::ENOENT);
+            }
+            return Err(EXDEV);
+        }
+    };
+    // A file of `/proc` or `/dev` (a link in `/proc/self/fd` not followed)
+    // is on procfs or devtmpfs, which the new name is not.
+    if generated(&old) {
+        new_name_free(c, new_dir, &new_raw, &new)?;
+        return Err(EXDEV);
+    }
+    let source = c.files.fs.metadata(&old, false).ok();
+    if source.is_some() && device(c, &old) == device(c, &new) {
+        crate::permissions::create(c.files, &c.process.credentials, new_dir, &new_raw)?;
+    }
+    // Landlock's check (`hook_path_link`) of a new name on the same
+    // filesystem, whatever the permission walk found.
+    if c.process.credentials.landlock != Default::default()
+        && device(c, &old) == device(c, &new)
+        && let (Some((old_path, Some(_))), Some((new_path, None))) =
+            (landlock_named(c, &old), landlock_named(c, &new))
+    {
+        crate::landlock::refer(c, &old_path, &new_path, false, 0)?;
+    }
+    c.files.fs.link(&old, &new)?;
+    Ok(0)
+}
 /// EBADF for a call that takes its descriptors as Linux's `fdget` does,
 /// which refuses an `O_PATH` one: reads and writes, `lseek`, `flock`,
 /// `getdents`, `sendfile` and `copy_file_range`, and `fcntl` but for the
@@ -2498,36 +2592,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.files.fs.unlink(&p, dir)?;
             Ok(0)
         }
-        86 | 265 => {
-            let ((old_dir, old_ptr), (new_dir, new_ptr)) = if n == 86 {
-                (((-100i32) as u64, a[0]), ((-100i32) as u64, a[1]))
-            } else {
-                if a[4] != 0 {
-                    return Err(Errno::EINVAL);
-                }
-                ((a[0], a[1]), (a[2], a[3]))
-            };
-            // `do_linkat`: the old name is looked up, the new one must not
-            // be there (EEXIST) and be on the same filesystem (EXDEV), which
-            // the link finds, before `may_create`.
-            let (old, source) = looked_up(c, old_dir, old_ptr, false)?;
-            let new_raw = path(c, new_ptr)?;
-            let new = c.files.path(new_dir, new_raw.clone())?;
-            if source.file.is_some() && device(c, &old) == device(c, &new) {
-                crate::permissions::create(c.files, &c.process.credentials, new_dir, &new_raw)?;
-            }
-            // Landlock's check (`hook_path_link`) of a new name on the same
-            // filesystem, whatever the permission walk found.
-            if c.process.credentials.landlock != Default::default()
-                && device(c, &old) == device(c, &new)
-                && let (Some((old_path, Some(_))), Some((new_path, None))) =
-                    (landlock_named(c, &old), landlock_named(c, &new))
-            {
-                crate::landlock::refer(c, &old_path, &new_path, false, 0)?;
-            }
-            c.files.fs.link(&old, &new)?;
-            Ok(0)
-        }
+        86 | 265 => link(c, n, a),
         88 | 266 => {
             let target = string(c, a[0])?;
             let (dir, raw) = if n == 88 {
@@ -3556,7 +3621,8 @@ fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let mut at = a[2].checked_add(OPEN_HOW_SIZE_VER0).ok_or(Errno::EFAULT)?;
     let end = a[2].checked_add(size).ok_or(Errno::EFAULT)?;
     while at < end {
-        let next = end.min((at | (PAGE_SIZE - 1)) + 1);
+        // The page's end, which in the last page is past `u64::MAX`.
+        let next = end.min((at | (PAGE_SIZE - 1)).saturating_add(1));
         let mut tail = vec![0; (next - at) as usize];
         c.mem
             .read(GuestAddr(at), &mut tail)

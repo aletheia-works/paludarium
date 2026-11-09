@@ -449,8 +449,13 @@ impl FrameBytes {
                 std::thread::yield_now();
             }
         }
+        // Finished when it ends however it does, so that a panic in the
+        // middle leaves no read or later write waiting for it.
+        let _finished = SpanningWrite {
+            finished: &self.spanning_finished,
+            ticket,
+        };
         self.write_words(offset, data, piece);
-        self.spanning_finished.store(ticket + 1, Ordering::Release);
     }
 
     #[inline]
@@ -481,6 +486,20 @@ impl FrameBytes {
                 std::thread::sleep(stall);
             }
         }
+    }
+}
+
+/// The turn of a write of more than one word ([`FrameBytes::read_16`]),
+/// which ends when it drops: the next write's turn comes.
+struct SpanningWrite<'a> {
+    finished: &'a AtomicU64,
+    ticket: u64,
+}
+
+impl Drop for SpanningWrite<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.finished.store(self.ticket + 1, Ordering::Release);
     }
 }
 
@@ -3727,6 +3746,39 @@ mod tests {
             }
             done.store(true, Ordering::Relaxed);
         });
+    }
+
+    #[test]
+    fn a_write_that_panics_partway_leaves_reads_and_writes_free_to_go_on() {
+        let frame = Arc::new(frame_of(&[]));
+        // Past the page's end: the first word is written, then the index
+        // panics, between the write's start and its end.
+        let past = Arc::clone(&frame);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            past.write(PAGE_BYTES - 4, &[0xee; 16]);
+        }));
+        assert!(unwound.is_err());
+        let (done, finished) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&frame);
+        std::thread::spawn(move || {
+            let mut value = [0xff; 16];
+            reader.read(0, &mut value);
+            let _ = done.send(value);
+        });
+        let value = finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read waits for a write that is gone");
+        assert_eq!(value, [0; 16]);
+        // And a later write of more than one word gets its turn.
+        let writer = Arc::clone(&frame);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            writer.write(16, &[0x55; 16]);
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the write waits for one that is gone");
     }
 
     #[test]

@@ -250,6 +250,7 @@ NAMES = {
     325: "mlock2",
     326: "copy_file_range",
     332: "statx",
+    334: "rseq",
     424: "pidfd_send_signal",
     434: "pidfd_open",
     435: "clone3",

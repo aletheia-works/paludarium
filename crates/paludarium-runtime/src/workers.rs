@@ -107,7 +107,12 @@ impl Execution {
                 self.processes
                     .stop_all(ExitStatus::Signaled(signal::SIGKILL));
             }
-            match kernel.checkpoint(thread, memory) {
+            // A thread with rseq takes a virtual CPU before it runs.
+            let next = match kernel.checkpoint(thread, memory) {
+                Next::Resume => kernel.enter_cpu(thread, memory),
+                next => next,
+            };
+            match next {
                 Next::Exit(status) => return Ok(status),
                 Next::Stopped => {
                     self.stopped.store(true, Ordering::SeqCst);

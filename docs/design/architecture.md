@@ -52,7 +52,28 @@ The kernel owns the register state of each thread; the CPU only runs the state
 it is given.
 
 The interpreter keeps each thread's decoded instructions in a decode cache, so
-an instruction is decoded once. When it is decoded, the most frequent simple
+an instruction is decoded once for each block it is in. A block holds the
+instructions that follow each other in memory from its address, up to a `jmp`,
+`call`, `ret`, `syscall`, `hlt` or `ud2`, or 32 instructions; a conditional
+branch does not end a block. The interpreter looks up a block only when the
+next instruction is not the next one of the current block: after a branch, a
+system call or a fault, at the end of the block, or when the code generation
+has moved on. Falling through from one instruction to the next needs no lookup.
+
+A block starts with its first instruction and grows as it runs. An instruction
+that runs right after the last one of a block is decoded on its own, as it would
+be without blocks, and added to that block unless another block was stored
+after it. So an instruction is decoded only when it first runs, and one that
+cannot be decoded faults only when it is reached, as without blocks.
+
+The cache has room for as many instructions as it has slots, counting copies: a
+branch into the middle of a block starts another block, which decodes the rest
+of the first again. When the room is full, the cache doubles if the blocks of
+the current code generation fill more than half of it, and drops every block
+otherwise. It copies nothing either way: a program that changes its code often,
+as SBCL does, fills the room with blocks of earlier generations again and again.
+
+When an instruction is decoded, the most frequent simple
 forms (`nop` and `endbr64`, moves between registers and memory, `movzx` from
 memory, `lea`, `push` and `pop`, direct branches, `call`, `ret`, `add`, `sub`,
 `and`, `or`, `xor`, `cmp` and `test` on a register, and `cmp` and `test` on

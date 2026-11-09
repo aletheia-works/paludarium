@@ -12,7 +12,7 @@ pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
     82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 133, 137, 138, 162, 188, 189, 190, 191,
     192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 257, 258, 259, 260, 262, 263, 264, 265, 266,
-    267, 268, 269, 280, 285, 292, 293, 295, 296, 316, 319, 326, 332, 436, 437, 439, 452,
+    267, 268, 269, 277, 280, 285, 292, 293, 295, 296, 316, 319, 326, 332, 436, 437, 439, 452,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -2813,6 +2813,28 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         74 | 75 => io_descriptor(c, a[0])?.sync().map(|()| 0),
         // sync: nothing is cached, so there is nothing to write
         162 => Ok(0),
+        // sync_file_range(fd, offset, nbytes, flags), checked in the order of
+        // Linux's: the descriptor (EBADF, `O_PATH` too), the flags and the
+        // range (EINVAL: a negative offset or end, or an end before the
+        // offset), then the file's type (ESPIPE for one that is not a regular
+        // file, a directory, a block device or a link). Its `stat` writes the
+        // stores of shared mappings back to the file; what reaches the host's
+        // file is the host's to write out, as for `write`.
+        277 => {
+            let file = io_descriptor(c, a[0])?;
+            let (offset, nbytes) = (a[1] as i64, a[2] as i64);
+            let end = offset.wrapping_add(nbytes);
+            if a[3] as u32 & !7 != 0 || offset < 0 || end < 0 || end < offset {
+                return Err(Errno::EINVAL);
+            }
+            if !matches!(
+                file.stat()?.mode & 0o170000,
+                0o100000 | 0o040000 | 0o060000 | 0o120000
+            ) {
+                return Err(Errno(29)); // ESPIPE
+            }
+            Ok(0)
+        }
         // fadvise64: a hint, checked as Linux checks it
         221 => {
             let file = io_descriptor(c, a[0])?;

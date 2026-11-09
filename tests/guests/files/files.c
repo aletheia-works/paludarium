@@ -90,7 +90,11 @@ void _start(void) {
   t[1]=1000000000;results[x++]=call(280,-100,(long)p,(long)t,0,0,0);t[1]=0;results[x++]=call(280,-100,(long)p,(long)t,2,0,0);results[x++]=call(280,fd,0,(long)t,0x100,0,0);
   t[1]=omit;t[3]=omit;results[x++]=call(280,-100,(long)"/tmp/paludarium-files-missing",(long)t,0,0,0);results[x++]=call(280,-100,(long)p,8,0,0,0);}
  if(CASE==36){int pipefd[2];S(22,pipefd,0,0);results[x++]=S(74,fd,0,0);results[x++]=S(75,fd,0,0);results[x++]=S(74,pipefd[0],0,0);results[x++]=S(75,99,0,0);results[x++]=S(162,0,0,0);
-  results[x++]=call(221,fd,0,0,2,0,0);results[x++]=call(221,pipefd[0],0,0,2,0,0);results[x++]=call(221,fd,0,0,6,0,0);results[x++]=call(221,fd,0,-1,0,0,0);results[x++]=call(221,99,0,0,0,0,0);S(3,pipefd[0],0,0);S(3,pipefd[1],0,0);}
+  results[x++]=call(221,fd,0,0,2,0,0);results[x++]=call(221,pipefd[0],0,0,2,0,0);results[x++]=call(221,fd,0,0,6,0,0);results[x++]=call(221,fd,0,-1,0,0,0);results[x++]=call(221,99,0,0,0,0,0);
+  /* sync_file_range: the descriptor, the flags and the range, then the type */
+  long dd=S(2,"/tmp",0200000,0);results[x++]=call(277,fd,0,0,7,0,0);results[x++]=call(277,fd,4096,4096,2,0,0);results[x++]=call(277,dd,0,0,7,0,0);
+  results[x++]=call(277,fd,0,0,8,0,0);results[x++]=call(277,fd,-1,0,0,0,0);results[x++]=call(277,fd,1,-2,0,0,0);results[x++]=call(277,fd,10,-5,0,0,0);results[x++]=call(277,fd,0x7fffffffffffffffL,1,0,0,0);
+  results[x++]=call(277,pipefd[0],0,0,2,0,0);results[x++]=call(277,pipefd[0],0,0,8,0,0);results[x++]=call(277,99,0,0,8,0,0);S(3,dd,0,0);S(3,pipefd[0],0,0);S(3,pipefd[1],0,0);}
  #define MMAP(len,prot,flags,f,off) call(9,0,len,prot,flags,f,off)
  if(CASE==37){S(1,fd,"hello",5);char*m=(char*)MMAP(8192,1,2,fd,0);results[x++]=(long)m>0;results[x++]=m[0]+m[4];results[x++]=m[5];results[x++]=S(8,fd,0,1);
   char*w=(char*)MMAP(4096,3,2,fd,0);w[0]='X';S(8,fd,0,0);S(0,fd,buf,1);results[x++]=buf[0];results[x++]=m[0];
@@ -782,7 +786,7 @@ void _start(void) {
  if(CASE==66){ /* an O_PATH descriptor refuses I/O (EBADF), as Linux's fdget has it */
   static long xv[2];static int pf[2];
   S(1,fd,"abcd",4);long op=S(2,p,010000000,0),dp=S(2,"/tmp",010200000,0);
-  results[x++]=S(74,op,0,0);results[x++]=S(75,op,0,0);results[x++]=call(221,op,0,0,0,0,0);
+  results[x++]=S(74,op,0,0);results[x++]=S(75,op,0,0);results[x++]=call(221,op,0,0,0,0,0);results[x++]=call(277,op,0,0,0,0,0);
   results[x++]=S(0,op,buf,1);results[x++]=S(1,op,"x",1);results[x++]=call(17,op,(long)buf,1,0,0,0);
   results[x++]=S(8,op,0,0);results[x++]=S(16,op,0x541B,xv);results[x++]=S(73,op,1,0);
   results[x++]=call(285,op,0,0,8,0,0);results[x++]=call(9,0,4096,1,2,op,0);

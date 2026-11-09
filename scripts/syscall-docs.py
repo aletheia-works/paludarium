@@ -214,6 +214,7 @@ NAMES = {
     272: "unshare",
     273: "set_robust_list",
     274: "get_robust_list",
+    277: "sync_file_range",
     280: "utimensat",
     281: "epoll_pwait",
     282: "signalfd",

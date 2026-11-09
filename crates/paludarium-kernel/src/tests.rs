@@ -1138,6 +1138,26 @@ fn fsync_sync_and_fadvise_check_the_descriptor() {
     assert_eq!(f.ret(221, &[fd, 0, 0, 6]), errno(Errno::EINVAL));
     assert_eq!(f.ret(221, &[fd, 0, u64::MAX, 0]), errno(Errno::EINVAL));
     assert_eq!(f.ret(221, &[99, 0, 0, 0]), errno(Errno::EBADF));
+    // sync_file_range: the descriptor, then the flags and the range, then
+    // the file's type.
+    assert_eq!(f.ret(277, &[fd, 0, 0, 7]), 0);
+    assert_eq!(f.ret(277, &[fd, 4096, 4096, 2]), 0);
+    for (offset, nbytes, flags) in [
+        (0, 0, 8),
+        (u64::MAX, 0, 0),
+        (1, (-2i64) as u64, 0),
+        (10, (-5i64) as u64, 0),
+        (i64::MAX as u64, 1, 0),
+    ] {
+        assert_eq!(
+            f.ret(277, &[fd, offset, nbytes, flags]),
+            errno(Errno::EINVAL),
+            "{offset} {nbytes} {flags}"
+        );
+    }
+    assert_eq!(f.ret(277, &[pipe, 0, 0, 2]), errno(Errno(29)));
+    assert_eq!(f.ret(277, &[pipe, 0, 0, 8]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(277, &[99, 0, 0, 8]), errno(Errno::EBADF));
     // An `O_PATH` descriptor is EBADF to them, as to every call that takes
     // its descriptor as Linux's `fdget` does; `fstat` and `F_GETFL` take it.
     let path = f.ret(2, &[DATA, 0o10000000, 0]);
@@ -1145,6 +1165,7 @@ fn fsync_sync_and_fadvise_check_the_descriptor() {
         (74, [path, 0, 0]),
         (75, [path, 0, 0]),
         (221, [path, 0, 0]),
+        (277, [path, 0, 0]),
         (0, [path, DATA + 0x400, 1]),
         (8, [path, 0, 0]),
         (73, [path, 1, 0]),

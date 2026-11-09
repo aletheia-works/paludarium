@@ -52,7 +52,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
@@ -193,7 +193,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   除いて `O_LARGEFILE` がありません。
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
   読み書き、`lseek`、`flock`、`getdents64`、`sendfile`、`copy_file_range`、`fsync`、
-  `fdatasync`、`fadvise64`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
+  `fdatasync`、`sync_file_range`、`fadvise64`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
   呼び出し、`epoll_ctl`（epoll のディスクリプタとしても対象としても）、`epoll_wait`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
   `select` は準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
@@ -713,6 +713,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   umask は、Linux で `CLONE_FS` が共有するのと同じく、スレッドの間で共有します。
   `fsync` と `fdatasync` はファイルとディレクトリでは成功し、パイプ・ソケット・端末では
   `EINVAL` を返します。`fadvise64` はヒントとして受け付けます。
+  `sync_file_range` は、Linux と同じくフラグと範囲（`EINVAL`）、次にファイル（通常の
+  ファイル、ディレクトリー、ブロックデバイス以外は `ESPIPE`）を確かめ、共有のマッピングへの
+  書き込みをファイルに書き戻します。
 - `mknod` と `mknodat` は、FIFO、ソケットのノード、空の通常のファイル（種類が 0 のときも）を、
   モードの許可のビットから umask を除いて作ります。Linux の `do_mknodat` と同じく、ディレクトリの
   種類は `EPERM`、知らない種類は `EINVAL` です。キャラクターデバイスとブロックデバイスは、

@@ -1816,8 +1816,9 @@ impl AddressSpaceData {
 
     /// Remembers the page at `page` in this thread's [`ThreadTlb`] when an
     /// access to it needs only its protection checked, and its file if it
-    /// has one ([`FileEnd`]): it is populated, and not shared, whose stores
-    /// change the shared pages' generation and make them dirty.
+    /// has one ([`FileEnd`]): it is populated, and not shared (a store to a
+    /// shared page makes it dirty and moves the shared pages' generation on,
+    /// under the locks).
     fn remember(&self, directory: &Directory, page: u64) {
         let Some(p) = lookup(directory, page) else {
             return;

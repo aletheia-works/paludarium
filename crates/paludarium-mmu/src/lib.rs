@@ -130,6 +130,18 @@ pub struct MappedFile {
     pub offset: u64,
 }
 
+/// One shared mapping of an address space, as
+/// [`AddressSpace::shared_fragments`] lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedFragment {
+    pub start: u64,
+    pub end: u64,
+    /// Where `start` lies in the shared memory (a file's offset).
+    pub offset: u64,
+    /// The open file it maps ([`PageSource::open_file`]), or 0 for none.
+    pub open_file: usize,
+}
+
 /// A Linux VMA as `/proc/<pid>/maps` shows it ([`MemoryView::vma_from`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vma {
@@ -665,6 +677,20 @@ impl SharedPages {
             ..self.clone()
         }
     }
+    /// Tells this memory from any other: its clones share it.
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+    /// How many of its pages have contents (Linux's resident pages of a
+    /// shared memory file).
+    #[must_use]
+    pub fn resident(&self) -> u64 {
+        self.lock()
+            .values()
+            .filter(|frame| frame.get().is_some())
+            .count() as u64
+    }
     /// Changes whenever the contents may have changed.
     #[must_use]
     pub fn generation(&self) -> u64 {
@@ -847,6 +873,14 @@ pub trait PageSource: Send + Sync {
     /// `vm_file`), which mappings must share to merge, or 0 if nothing does.
     fn open_file(&self) -> usize {
         0
+    }
+    /// Whether two VMAs of a shared mapping of the file may be one. Linux
+    /// never merges those of a file whose VMAs have a `close` operation, as
+    /// System V shared memory's count its attachments: each shared mapping
+    /// of such a file is then a VMA of its own, which `mprotect` splits
+    /// where it changes the protection of part of it.
+    fn merges(&self) -> bool {
+        true
     }
 }
 /// The file behind `[start, end)` of a private file mapping: the page at
@@ -2206,6 +2240,37 @@ impl AddressSpaceData {
         Ok(GuestAddr(start))
     }
 
+    /// Splits the shared mapping across `at` in two when its memory's VMAs
+    /// never merge ([`PageSource::merges`]) and its protection is not
+    /// `prot`, as Linux's `mprotect` splits a VMA whose flags it changes.
+    fn split_unmergeable_shared(&mut self, at: u64, prot: Prot) {
+        let Some((&start, shared)) = self.shared.range(..at).next_back() else {
+            return;
+        };
+        if shared.end <= at
+            || shared.pages.source.as_ref().is_none_or(|s| s.merges())
+            || self.mapping_at(at).is_none_or(|m| m.prot == prot)
+        {
+            return;
+        }
+        let tail = shared.clone();
+        if let Some(head) = self.shared.get_mut(&start) {
+            head.end = at;
+        }
+        self.shared.insert(at, tail);
+    }
+    /// The shared mappings, by address.
+    fn shared_fragments(&self) -> Vec<SharedFragment> {
+        self.shared
+            .iter()
+            .map(|(&start, shared)| SharedFragment {
+                start,
+                end: shared.end,
+                offset: start.wrapping_add(shared.shift),
+                open_file: shared.pages.source.as_ref().map_or(0, |s| s.open_file()),
+            })
+            .collect()
+    }
     /// Splits mappings so that `at` is a mapping boundary.
     fn split_at(&mut self, at: u64) {
         let Some((&start, &m)) = self.mappings.range(..at).next_back() else {
@@ -2286,7 +2351,9 @@ impl AddressSpaceData {
                     _ => false,
                 },
                 (Some(x), Some(y)) => {
-                    Arc::ptr_eq(&x.pages.frames, &y.pages.frames) && x.shift == y.shift
+                    Arc::ptr_eq(&x.pages.frames, &y.pages.frames)
+                        && x.shift == y.shift
+                        && (x.end == y.end || x.pages.source.as_ref().is_none_or(|s| s.merges()))
                 }
                 _ => false,
             }
@@ -2557,6 +2624,8 @@ impl AddressSpaceData {
         // a mapping that refuses the protection.
         let incomplete = covered < end;
         let end = end.min(covered);
+        self.split_unmergeable_shared(addr.0, prot);
+        self.split_unmergeable_shared(end, prot);
         self.split_at(addr.0);
         self.split_at(end);
         self.bump_code_generation();
@@ -3455,6 +3524,11 @@ impl AddressSpace {
     }
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.protect_shared(addr, len, prot)
+    }
+    /// The shared mappings of the space, by address.
+    #[must_use]
+    pub fn shared_fragments(&self) -> Vec<SharedFragment> {
+        self.locked().shared_fragments()
     }
     /// See [`AddressSpaceData::discard`].
     pub fn discard_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {

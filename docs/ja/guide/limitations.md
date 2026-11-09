@@ -128,19 +128,30 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - `pkey_alloc` と `io_uring_setup` も、これらなしでビルドした Linux と同じです。
     プログラムはこれを確かめて続けます。残りの部分なしで成功させるのは誤りです。保護キーには
     `CPUID` が報告しない CPU の機能が必要で、io_uring のリングは何も処理しません。
+  - System V のセマフォー（`semget`、`semop`、`semtimedop`、`semctl`）とメッセージ
+    キュー（`msgget`、`msgsnd`、`msgrcv`、`msgctl`）もそうです。実装しているのは共有
+    メモリだけです。`/proc/sysvipc` はなく、共有メモリの上限は Linux の既定値で、
+    `/proc/sys/kernel` から変えられません。
   - ほかのプロセスの `get_robust_list` は `ESRCH` です。Linux は、そのプロセスを
     トレースできる呼び出し元には返します。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
     Linux はページキャッシュを調べます。`MAP_POPULATE` や `MAP_LOCKED`、メモリのロックで
     読み込んだページも、触るまでは数えません。
-  - メモリのロックは状態を残しません。そのため `RLIMIT_MEMLOCK` は適用しません
-    （`CAP_IPC_LOCK` を手放したゲストにだけ関係します）。ロックしたメモリへの
+  - メモリのロックは状態を残しません。そのためロックには `RLIMIT_MEMLOCK` を適用
+    しません（適用するのは `SHM_LOCK` だけで、`CAP_IPC_LOCK` を手放したゲストにだけ
+    関係します）。ロックしたメモリへの
     `MADV_DONTNEED` は、Linux の `EINVAL` と違って成功します。ファイルの終わりより後ろの
     ファイルのマッピングのページへの `mlock` は、Linux の `ENOMEM` と違って成功します。
     `/proc` にもロックしたメモリは出ません。
   - 共有のマッピングに `mbind` で付けたメモリのポリシーは、そのマッピングのものに
     なります。Linux はそのポリシーを共有メモリそのものに付け、マッピングしている
     すべてのプロセスで使います。`/proc/<pid>/numa_maps` はありません。
+  - System V の共有メモリのセグメントの `shm_atime`、`shm_dtime`、`shm_lpid` は、
+    `shmat` と `shmdt` でだけ変わります。Linux は、`fork` がつないだ領域を写すとき、
+    `munmap` や `mprotect` がそれを分けるとき、それを持つプロセスが終わるときや exec する
+    ときにも変えます。つないだ領域の一部を隣のかけらと同じ保護に戻す `mprotect` は、
+    独立したかけらを作り、それも 1 つのつながりと数えます。最近の Linux は、2 つの境目を
+    動かします。
 - **拡張属性**：マウントしたホストのディレクトリは、拡張属性のないファイルシステムとして
   振る舞います。読むと見つからず（`ENODATA`）、書くと `EOPNOTSUPP` です。メモリ上では、
   `system.*` の属性はなく（`EOPNOTSUPP`）、`security.capability` の値は確かめず、スティッキー

@@ -4125,6 +4125,238 @@ static void *affinity_of_thread(void *mask) {
     return NULL;
 }
 
+/* System V shared memory, compared without the IDs, keys and addresses the
+   machine chooses: the IDs and keys of other programs on a native machine
+   share its one IPC namespace. */
+enum {
+    SHMX_CREAT = 01000, SHMX_EXCL = 02000, SHMX_RDONLY = 010000, SHMX_RND = 020000,
+    SHMX_REMAP = 040000, SHMX_RMID = 0, SHMX_SET = 1, SHMX_STAT = 2, SHMX_INFO = 3,
+    SHMX_LOCK = 11, SHMX_UNLOCK = 12, SHMX_STAT_INDEX = 13, SHMX_INFO_ALL = 14,
+};
+struct shm_status {
+    int key, cpid, lpid;
+    unsigned uid, gid, cuid, cgid, mode, seq;
+    unsigned long segsz, nattch;
+    long atime, dtime, ctime;
+};
+/* shmctl's `struct shmid64_ds`, read by its x86-64 offsets; the result, or
+   -errno. */
+static long shm_status_of(int id, int cmd, struct shm_status *s) {
+    unsigned char ds[112];
+    unsigned short seq = 0;
+    memset(ds, 0, sizeof ds);
+    memset(s, 0, sizeof *s);
+    long r = syscall(SYS_shmctl, id, cmd, ds);
+    if (r < 0) return -errno;
+    memcpy(&s->key, ds, 4);
+    memcpy(&s->uid, ds + 4, 4);
+    memcpy(&s->gid, ds + 8, 4);
+    memcpy(&s->cuid, ds + 12, 4);
+    memcpy(&s->cgid, ds + 16, 4);
+    memcpy(&s->mode, ds + 20, 4);
+    memcpy(&seq, ds + 24, 2);
+    s->seq = seq;
+    memcpy(&s->segsz, ds + 48, 8);
+    memcpy(&s->atime, ds + 56, 8);
+    memcpy(&s->dtime, ds + 64, 8);
+    memcpy(&s->ctime, ds + 72, 8);
+    memcpy(&s->cpid, ds + 80, 4);
+    memcpy(&s->lpid, ds + 84, 4);
+    memcpy(&s->nattch, ds + 88, 8);
+    return r;
+}
+static long shm_nattch(int id) {
+    struct shm_status s;
+    long r = shm_status_of(id, SHMX_STAT, &s);
+    return r < 0 ? r : (long)s.nattch;
+}
+/* 0 for a call that worked, else its errno. */
+static int shm_errno(long r) { return r == -1 ? errno : 0; }
+static long shm_call(long number, long a, long b, long c) {
+    errno = 0;
+    return syscall(number, a, b, c);
+}
+
+static int shm_case(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    struct shm_status s;
+    int id = (int)syscall(SYS_shmget, 0, 3 * page - 10, SHMX_CREAT | 0600);
+    if (id < 0) return 10;
+    long r = shm_status_of(id, SHMX_STAT, &s);
+    printf("new stat=%ld key=%d mode=%o segsz=%lu nattch=%lu cpid-own=%d lpid=%d atime=%ld dtime=%ld "
+           "ctime-set=%d owner-own=%d seq-of-id=%d\n",
+           r, s.key, s.mode, s.segsz, s.nattch, s.cpid == getpid(), s.lpid, s.atime, s.dtime, s.ctime > 0,
+           s.uid == geteuid() && s.cuid == geteuid() && s.gid == getegid() && s.cgid == getegid(),
+           s.seq == (unsigned)(id >> 15));
+
+    /* A key finds its segment after ipcget's checks. */
+    int key = 0x5a000000 | (getpid() & 0xffffff);
+    int keyed = (int)syscall(SYS_shmget, key, 100, SHMX_CREAT | SHMX_EXCL | 0604);
+    if (keyed < 0) return 11;
+    printf("key same=%d", syscall(SYS_shmget, key, 0, 0) == keyed);
+    printf(" exclusive=%d", shm_errno(shm_call(SYS_shmget, key, 100, SHMX_CREAT | SHMX_EXCL)));
+    printf(" larger=%d", shm_errno(shm_call(SYS_shmget, key, 101, 0)));
+    printf(" missing=%d", shm_errno(shm_call(SYS_shmget, key ^ 0x02000000, 100, 0600)));
+    printf(" empty=%d\n", shm_errno(shm_call(SYS_shmget, 0, 0, SHMX_CREAT)));
+
+    /* Attachments share the memory, and count as their mappings. */
+    char *a = (char *)syscall(SYS_shmat, id, 0, 0);
+    char *b = (char *)syscall(SYS_shmat, id, 0, SHMX_RDONLY);
+    if (a == (char *)-1 || b == (char *)-1) return 12;
+    strcpy(a + page, "shared");
+    printf("attached seen=%d zero=%d nattch=%ld\n", !strcmp(b + page, "shared"),
+           b[0] == 0 && b[3 * page - 11] == 0, shm_nattch(id));
+    errno = 0;
+    r = mprotect(b, page, PROT_READ | PROT_WRITE);
+    printf("read-only mprotect=%ld errno=%d\n", r, errno);
+    shm_status_of(id, SHMX_STAT, &s);
+    printf("after attach atime-set=%d lpid-own=%d\n", s.atime > 0, s.lpid == getpid());
+    {
+        struct maps_line line;
+        int maps = open("/proc/self/maps", O_RDONLY);
+        if (maps < 0 || !maps_find(maps_text(maps), (unsigned long)a, &line)) return 13;
+        printf("maps from-here=%d pages=%lu %s offset=%lx device=%02x:%02x inode-is-id=%d name=[%.*s]\n",
+               line.start == (unsigned long)a, (line.end - line.start) / page, line.perms, line.offset,
+               line.major, line.minor, line.inode == (unsigned long)id, line.name_length, line.name);
+        close(maps);
+    }
+    /* mprotect splits an attachment where it changes it, and the pieces do
+       not merge again; an unchanged protection splits nothing. */
+    if (mprotect(a + page, page, PROT_READ)) return 14;
+    printf("split nattch=%ld\n", shm_nattch(id));
+    if (mprotect(a + page, page, PROT_READ | PROT_WRITE)) return 15;
+    maps_show("restored", a, NULL);
+    maps_show("restored-middle", a + page, NULL);
+    printf("restored nattch=%ld\n", shm_nattch(id));
+    if (mprotect(b + page, page, PROT_READ)) return 16;
+    printf("unchanged nattch=%ld\n", shm_nattch(id));
+
+    /* A fork copies them; shmdt takes every piece of one, and an exit the rest. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 17;
+    if (child == 0) {
+        printf("child nattch=%ld", shm_nattch(id));
+        printf(" detach=%ld", syscall(SYS_shmdt, a));
+        printf(" nattch=%ld", shm_nattch(id));
+        printf(" again=%d", shm_errno(shm_call(SYS_shmdt, (long)a, 0, 0)));
+        printf(" unaligned=%d\n", shm_errno(shm_call(SYS_shmdt, (long)a + 1, 0, 0)));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child) return 18;
+    shm_status_of(id, SHMX_STAT, &s);
+    printf("child gone nattch=%lu lpid-child=%d dtime-set=%d\n", s.nattch, s.lpid == child, s.dtime > 0);
+    /* An unmapped head leaves one piece, which shmdt from the old start
+       finds by its offset. */
+    if (munmap(b, page)) return 19;
+    printf("unmapped head nattch=%ld", shm_nattch(id));
+    printf(" detach-old-start=%ld", syscall(SYS_shmdt, b));
+    printf(" nattch=%ld", shm_nattch(id));
+    printf(" detach-pieces=%ld", syscall(SYS_shmdt, a));
+    printf(" nattch=%ld\n", shm_nattch(id));
+
+    /* Addresses: page-aligned unless SHM_RND rounds them, free unless
+       SHM_REMAP replaces what is there. */
+    printf("addresses unaligned=%d", shm_errno(shm_call(SYS_shmat, id, (long)a + 1, 0)));
+    printf(" remap-without=%d", shm_errno(shm_call(SYS_shmat, id, 0, SHMX_REMAP)));
+    printf(" rounded=%d", syscall(SYS_shmat, id, (long)a + 1, SHMX_RND) == (long)a);
+    printf(" taken=%d", shm_errno(shm_call(SYS_shmat, id, (long)a, 0)));
+    printf(" remapped=%d", syscall(SYS_shmat, id, (long)a, SHMX_REMAP) == (long)a);
+    printf(" nattch=%ld", shm_nattch(id));
+    printf(" kept=%d\n", !strcmp(a + page, "shared"));
+    syscall(SYS_shmdt, a);
+
+    /* Removal waits for the last detach; meanwhile no key finds it. */
+    char *x = (char *)syscall(SYS_shmat, keyed, 0, 0);
+    if (x == (char *)-1) return 20;
+    printf("remove=%ld", syscall(SYS_shmctl, keyed, SHMX_RMID, 0));
+    shm_status_of(keyed, SHMX_STAT, &s);
+    printf(" key=%d mode=%o nattch=%lu", s.key, s.mode, s.nattch);
+    printf(" by-key=%d", shm_errno(shm_call(SYS_shmget, key, 0, 0)));
+    char *y = (char *)syscall(SYS_shmat, keyed, 0, 0);
+    printf(" attach-again=%d nattch=%ld", y != (char *)-1, shm_nattch(keyed));
+    syscall(SYS_shmdt, x);
+    syscall(SYS_shmdt, y);
+    printf(" gone=%ld\n", shm_nattch(keyed));
+
+    /* IPC_SET, SHM_LOCK and the information. */
+    {
+        unsigned char ds[112];
+        unsigned mode = 0640, none = (unsigned)-1;
+        if (syscall(SYS_shmctl, id, SHMX_STAT, ds)) return 21;
+        memcpy(ds + 20, &mode, 4);
+        printf("set=%ld", syscall(SYS_shmctl, id, SHMX_SET, ds));
+        shm_status_of(id, SHMX_STAT, &s);
+        printf(" mode=%o", s.mode);
+        memcpy(ds + 4, &none, 4);
+        printf(" bad-uid=%d", shm_errno(shm_call(SYS_shmctl, id, SHMX_SET, (long)ds)));
+        printf(" bad-buffer=%d\n", shm_errno(shm_call(SYS_shmctl, id, SHMX_SET, 8)));
+    }
+    printf("lock=%ld", syscall(SYS_shmctl, id, SHMX_LOCK, 0));
+    shm_status_of(id, SHMX_STAT, &s);
+    printf(" mode=%o", s.mode);
+    printf(" unlock=%ld", syscall(SYS_shmctl, id, SHMX_UNLOCK, 0));
+    shm_status_of(id, SHMX_STAT, &s);
+    printf(" mode=%o\n", s.mode);
+    {
+        unsigned long info[9];
+        struct {
+            int used;
+            unsigned long total, resident, swapped, attempts, successes;
+        } all;
+        memset(info, 0xff, sizeof info);
+        r = syscall(SYS_shmctl, 0, SHMX_INFO, info);
+        printf("info ok=%d shmmin=%lu shmmni=%lu shmseg=%lu unused=%lu", r >= id % 32768, info[1], info[2],
+               info[3], info[5] | info[6] | info[7] | info[8]);
+        r = syscall(SYS_shmctl, 0, SHMX_INFO_ALL, &all);
+        printf(" all ok=%d", r >= id % 32768 && all.used >= 1 && all.total >= 3 && all.swapped == 0);
+        printf(" by-index=%d\n", shm_status_of(id % 32768, SHMX_STAT_INDEX, &s) == id);
+    }
+    unsigned char ds[112];
+    printf("errors negative-id=%d", shm_errno(shm_call(SYS_shmctl, -1, SHMX_STAT, (long)ds)));
+    printf(" ipc64=%d", shm_errno(shm_call(SYS_shmctl, id, 0x100 | SHMX_STAT, (long)ds)));
+    printf(" command=%d", shm_errno(shm_call(SYS_shmctl, id, 99, (long)ds)));
+    printf(" buffer=%d", shm_errno(shm_call(SYS_shmctl, id, SHMX_STAT, 8)));
+    printf(" attach-negative=%d", shm_errno(shm_call(SYS_shmat, -1, 0, 0)));
+    printf(" attach-old-sequence=%d\n", shm_errno(shm_call(SYS_shmat, id ^ (1 << 15), 0, 0)));
+
+    /* As another user the 0604 segment lets only reading through, and its
+       owner's commands nothing; as its owner, everything. Each is whether
+       the outcome is the one for this process's user. */
+    int keyed2 = (int)syscall(SYS_shmget, 0x5b000000 | (getpid() & 0xffffff), 64, SHMX_CREAT | SHMX_EXCL | 0604);
+    if (keyed2 < 0) return 22;
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 22;
+    if (child == 0) {
+        int other = 0;
+        if (geteuid() == 0)
+            other = !setgroups(0, NULL) && !setresgid(65534, 65534, 65534) && !setresuid(65534, 65534, 65534);
+        long got = shm_call(SYS_shmget, 0x5b000000 | (getppid() & 0xffffff), 0, 0600);
+        int get = other ? got == -1 && errno == EACCES : got == keyed2;
+        long at = shm_call(SYS_shmat, keyed2, 0, 0);
+        int attach = other ? at == -1 && errno == EACCES : at != -1;
+        int read_only = syscall(SYS_shmat, keyed2, 0, SHMX_RDONLY) != -1;
+        unsigned char ds[112];
+        syscall(SYS_shmctl, keyed2, SHMX_STAT, ds);
+        long set = shm_call(SYS_shmctl, keyed2, SHMX_SET, (long)ds);
+        int setting = other ? set == -1 && errno == EPERM : set == 0;
+        long locked = shm_call(SYS_shmctl, keyed2, SHMX_LOCK, 0);
+        int locking = other ? locked == -1 && errno == EPERM : locked == 0;
+        syscall(SYS_shmctl, keyed2, SHMX_UNLOCK, 0);
+        printf("permissions as-expected get=%d attach=%d read-only=%d set=%d lock=%d\n", get, attach,
+               read_only, setting, locking);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, &status, 0) != child) return 23;
+    printf("removed=%ld", syscall(SYS_shmctl, id, SHMX_RMID, 0));
+    printf(" %ld\n", syscall(SYS_shmctl, keyed2, SHMX_RMID, 0));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
@@ -13046,6 +13278,7 @@ int main(int argc, char **argv) {
         if (chdir("/") || rmdir(dir)) return 89;
         return 0;
     }
+    if (!strcmp(mode, "shm")) return shm_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

@@ -56,6 +56,7 @@ kernel.
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
+| System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory) |
 | System information | `uname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -554,6 +555,19 @@ kernel.
   `EFAULT`.
 - `msync` checks its arguments and the range, and with `MS_SYNC` or
   `MS_ASYNC` writes the stores of shared file mappings back to their files.
+- System V shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) has one IPC
+  namespace for the machine, with Linux's checks in Linux's order and its
+  default limits. A segment's ID is its index and a sequence number, given
+  out in turn as Linux gives them, and `/proc/<pid>/maps` names an attachment
+  `/SYSV<key> (deleted)` on device 00:01, with the ID as its inode. The count
+  of attachments (`shm_nattch`) counts each VMA that shows the segment, in
+  every process, as Linux does: a `fork` copies them, and `munmap` and an
+  `mprotect` that changes part of one split them, and they never merge.
+  `shmdt` takes every piece of the attachment that `munmap` and `mprotect`
+  left. A segment removed with `IPC_RMID` while attached keeps its ID, is
+  found by no key, and goes at its last detach. `SHM_LOCK` checks the owner
+  and `RLIMIT_MEMLOCK` as Linux does, and `SHM_HUGETLB` gives `ENOSYS`, as
+  from a kernel built without hugetlbfs.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux
@@ -635,7 +649,7 @@ kernel.
   nothing to unshare and gives `EINVAL` where Linux does: another thread in
   the process, dispositions shared with another process (`CLONE_SIGHAND`), or
   memory shared with one (`CLONE_VM` without `CLONE_THREAD`). `CLONE_SYSVSEM`
-  has no semaphore adjustments to drop, as there is no System V IPC. There
+  has no semaphore adjustments to drop, as there are no System V semaphores. There
   are no namespaces: their flags give `EPERM` without `CAP_SYS_ADMIN`, as on
   Linux, and `EINVAL` with it, as from a kernel built without that namespace
   and as `clone` gives them here; `CLONE_NEWUSER`, which Linux lets a user

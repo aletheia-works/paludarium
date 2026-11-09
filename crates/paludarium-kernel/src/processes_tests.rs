@@ -3337,3 +3337,304 @@ mod socket_credentials {
         );
     }
 }
+mod shm {
+    use super::*;
+    const IPC_CREAT: u64 = 0o1000;
+    const IPC_EXCL: u64 = 0o2000;
+    const IPC_RMID: u64 = 0;
+    const IPC_SET: u64 = 1;
+    const IPC_STAT: u64 = 2;
+    const IPC_INFO: u64 = 3;
+    const SHM_STAT: u64 = 13;
+    const SHM_INFO: u64 = 14;
+    const SHM_RDONLY: u64 = 0o10000;
+    const SHM_RND: u64 = 0o20000;
+    const SHM_REMAP: u64 = 0o40000;
+    const DS: u64 = DATA + 0x800;
+    fn e(errno: Errno) -> u64 {
+        errno.to_syscall_return()
+    }
+    fn shmget(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        key: u64,
+        size: u64,
+        flag: u64,
+    ) -> u64 {
+        syscall(k, t, m, 29, [key, size, flag, 0, 0, 0])
+    }
+    fn shmat(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        id: u64,
+        addr: u64,
+        flag: u64,
+    ) -> u64 {
+        syscall(k, t, m, 30, [id, addr, flag, 0, 0, 0])
+    }
+    fn shmdt(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, addr: u64) -> u64 {
+        syscall(k, t, m, 67, [addr, 0, 0, 0, 0, 0])
+    }
+    /// `shm_perm.key`, `shm_perm.mode`, `shm_segsz` and `shm_nattch` of
+    /// `IPC_STAT`, or its error.
+    fn stat(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        id: u64,
+    ) -> Result<(i32, u32, u64, u64), u64> {
+        match syscall(k, t, m, 31, [id, IPC_STAT, DS, 0, 0, 0]) {
+            0 => {
+                let mut ds = [0u8; 112];
+                m.read(GuestAddr(DS), &mut ds).unwrap();
+                let word = |at: usize| u32::from_le_bytes(ds[at..at + 4].try_into().unwrap());
+                let long = |at: usize| u64::from_le_bytes(ds[at..at + 8].try_into().unwrap());
+                Ok((word(0) as i32, word(20), long(48), long(88)))
+            }
+            error => Err(error),
+        }
+    }
+    fn nattch(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, id: u64) -> u64 {
+        stat(k, t, m, id).unwrap().3
+    }
+
+    #[test]
+    fn keys_find_their_segment_after_the_checks_of_ipcget() {
+        let (mut k, mut t, m) = setup();
+        let id = shmget(&mut k, &mut t, &m, 42, 100, IPC_CREAT | 0o600);
+        assert_eq!(id, 0);
+        assert_eq!(shmget(&mut k, &mut t, &m, 42, 0, 0), id);
+        assert_eq!(shmget(&mut k, &mut t, &m, 42, 100, IPC_CREAT | 0o600), id);
+        assert_eq!(
+            shmget(&mut k, &mut t, &m, 42, 100, IPC_CREAT | IPC_EXCL),
+            e(Errno::EEXIST)
+        );
+        // A size larger than the segment's is refused before permissions.
+        assert_eq!(shmget(&mut k, &mut t, &m, 42, 101, 0), e(Errno::EINVAL));
+        assert_eq!(shmget(&mut k, &mut t, &m, 43, 100, 0o600), e(Errno::ENOENT));
+        assert_eq!(
+            shmget(&mut k, &mut t, &m, 43, 0, IPC_CREAT),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            shmget(&mut k, &mut t, &m, 43, 100, IPC_CREAT | 0o4000),
+            e(Errno::ENOSYS)
+        );
+        // IPC_PRIVATE always makes a new segment, at the next index.
+        assert_eq!(shmget(&mut k, &mut t, &m, 0, 1, IPC_CREAT | IPC_EXCL), 1);
+        assert_eq!(shmget(&mut k, &mut t, &m, 0, 1, 0), 2);
+        assert_eq!(stat(&mut k, &mut t, &m, id), Ok((42, 0o600, 100, 0)));
+        // Indexes are given out in turn below 64 here, and one given out again
+        // after a higher one has the next sequence number.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [1, IPC_RMID, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(stat(&mut k, &mut t, &m, 1), Err(e(Errno::EINVAL)));
+        for index in 3..64 {
+            assert_eq!(shmget(&mut k, &mut t, &m, 0, 1, 0), index);
+            let rmid = [index, IPC_RMID, 0, 0, 0, 0];
+            assert_eq!(syscall(&mut k, &mut t, &m, 31, rmid), 0);
+        }
+        assert_eq!(shmget(&mut k, &mut t, &m, 0, 1, 0), (1 << 15) + 1);
+        assert_eq!(stat(&mut k, &mut t, &m, 1), Err(e(Errno::EINVAL)));
+        // SHM_STAT takes an index and gives the ID.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [1, SHM_STAT, DS, 0, 0, 0]),
+            (1 << 15) + 1
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [0, IPC_INFO, DS, 0, 0, 0]),
+            2
+        );
+        assert_eq!(m.read_u64(GuestAddr(DS + 16)).unwrap(), 4096);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [0, SHM_INFO, DS, 0, 0, 0]),
+            2
+        );
+        assert_eq!(m.read_u64(GuestAddr(DS)).unwrap() as u32, 3);
+        assert_eq!(m.read_u64(GuestAddr(DS + 8)).unwrap(), 3);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [0, 0x102, DS, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn attachments_share_memory_and_count_as_their_mappings() {
+        let (mut k, mut t, m) = setup();
+        let id = shmget(&mut k, &mut t, &m, 0, 3 * PAGE_SIZE - 10, 0o600);
+        let a = shmat(&mut k, &mut t, &m, id, 0, 0);
+        let b = shmat(&mut k, &mut t, &m, id, 0, SHM_RDONLY);
+        assert!(a < 1 << 47 && b < 1 << 47 && a != b, "{a:#x} {b:#x}");
+        m.write(GuestAddr(a + PAGE_SIZE), b"shared").unwrap();
+        let mut seen = [0u8; 6];
+        m.read(GuestAddr(b + PAGE_SIZE), &mut seen).unwrap();
+        assert_eq!(&seen, b"shared");
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 2);
+        // A read-only attachment may not become writable.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 10, [b, PAGE_SIZE, 3, 0, 0, 0]),
+            e(Errno::EACCES)
+        );
+        // /proc/<pid>/maps names the segment's file, on 00:01, by its ID.
+        let vma = m.view().vma_from(a).unwrap();
+        assert_eq!(
+            (vma.start, vma.end, vma.identity),
+            (a, a + 3 * PAGE_SIZE, (1, id))
+        );
+        assert_eq!(
+            vma.file.unwrap().name.unwrap(),
+            b"/SYSV00000000 (deleted)".to_vec()
+        );
+        // mprotect splits an attachment where it changes it, as Linux splits
+        // the VMA, which counts once more.
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                10,
+                [a + PAGE_SIZE, PAGE_SIZE, 1, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 4);
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                10,
+                [a + PAGE_SIZE, PAGE_SIZE, 3, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 4);
+        assert_eq!(m.view().vma_from(a).unwrap().end, a + PAGE_SIZE);
+        // Unchanged protection splits nothing.
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                10,
+                [b + PAGE_SIZE, PAGE_SIZE, 1, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 4);
+        // A fork copies them.
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 8);
+        // shmdt takes every piece of the attachment.
+        assert_eq!(shmdt(&mut c, &mut ct, &cm, a), 0);
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 5);
+        assert_eq!(shmdt(&mut c, &mut ct, &cm, a), e(Errno::EINVAL));
+        assert_eq!(shmdt(&mut c, &mut ct, &cm, a + 1), e(Errno::EINVAL));
+        // Exiting detaches the rest.
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        drop((c, ct, cm));
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 4);
+        // An unmapped head leaves a piece, still one attachment, that shmdt
+        // from the old start finds by its offset.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 11, [b, PAGE_SIZE, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 4);
+        assert_eq!(shmdt(&mut k, &mut t, &m, b), 0);
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 3);
+        let mut ds = [0u8; 112];
+        m.read(GuestAddr(DS), &mut ds).unwrap();
+        assert_eq!(u32::from_le_bytes(ds[84..88].try_into().unwrap()), t.tid);
+    }
+
+    #[test]
+    fn addresses_follow_shm_rnd_and_shm_remap() {
+        let (mut k, mut t, m) = setup();
+        let id = shmget(&mut k, &mut t, &m, 0, PAGE_SIZE, 0o600);
+        let at = 0x7000_0000;
+        assert_eq!(shmat(&mut k, &mut t, &m, id, at + 1, 0), e(Errno::EINVAL));
+        assert_eq!(
+            shmat(&mut k, &mut t, &m, id, 0, SHM_REMAP),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            shmat(&mut k, &mut t, &m, id, 1, SHM_RND | SHM_REMAP),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(shmat(&mut k, &mut t, &m, id, at + 1, SHM_RND), at);
+        // Without SHM_REMAP the range must be free; with it, it is replaced.
+        assert_eq!(shmat(&mut k, &mut t, &m, id, at, 0), e(Errno::EINVAL));
+        assert_eq!(shmat(&mut k, &mut t, &m, id, DATA, 0), e(Errno::EINVAL));
+        assert_eq!(shmat(&mut k, &mut t, &m, id, at, SHM_REMAP), at);
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 1);
+        assert_eq!(shmat(&mut k, &mut t, &m, id + 1, 0, 0), e(Errno::EINVAL));
+        assert_eq!(shmat(&mut k, &mut t, &m, u64::MAX, 0, 0), e(Errno::EINVAL));
+        assert_eq!(shmdt(&mut k, &mut t, &m, at), 0);
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 0);
+    }
+
+    #[test]
+    fn removal_waits_for_the_last_detach() {
+        let (mut k, mut t, m) = setup();
+        let id = shmget(&mut k, &mut t, &m, 7, 64, IPC_CREAT | 0o640);
+        let at = shmat(&mut k, &mut t, &m, id, 0, 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [id, IPC_RMID, 0, 0, 0, 0]),
+            0
+        );
+        // Marked, it is found by its ID but not by its key.
+        assert_eq!(stat(&mut k, &mut t, &m, id), Ok((0, 0o1640, 64, 1)));
+        assert_eq!(shmget(&mut k, &mut t, &m, 7, 64, 0), e(Errno::ENOENT));
+        let again = shmat(&mut k, &mut t, &m, id, 0, 0);
+        assert_eq!(nattch(&mut k, &mut t, &m, id), 2);
+        assert_eq!(shmdt(&mut k, &mut t, &m, at), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 11, [again, PAGE_SIZE, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(stat(&mut k, &mut t, &m, id), Err(e(Errno::EINVAL)));
+        assert_eq!(shmget(&mut k, &mut t, &m, 7, 64, IPC_CREAT | IPC_EXCL), 1);
+    }
+
+    #[test]
+    fn permissions_follow_ipcperms_and_the_owner() {
+        let (mut k, mut t, m) = setup();
+        let id = shmget(&mut k, &mut t, &m, 9, 64, IPC_CREAT | 0o604);
+        // setresgid and setresuid(1000, 1000, 1000) drop every capability.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 119, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        assert_eq!(shmget(&mut k, &mut t, &m, 9, 64, 0o600), e(Errno::EACCES));
+        assert_eq!(shmget(&mut k, &mut t, &m, 9, 64, 0o004), id);
+        assert_eq!(shmat(&mut k, &mut t, &m, id, 0, 0), e(Errno::EACCES));
+        let at = shmat(&mut k, &mut t, &m, id, 0, SHM_RDONLY);
+        assert!(at < 1 << 47, "{at:#x}");
+        assert!(stat(&mut k, &mut t, &m, id).is_ok());
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [id, IPC_RMID, 0, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [id, IPC_SET, 1, 0, 0, 0]),
+            e(Errno::EFAULT)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [id, IPC_SET, DS, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [id, 11, 0, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+    }
+}

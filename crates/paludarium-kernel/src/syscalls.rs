@@ -252,6 +252,10 @@ impl SyscallTable {
         // Tokio's current Linux std uses GRND_INSECURE to seed its scheduler;
         // the Host random boundary supplies secure bytes without OS passthrough.
         handlers.insert(318, sys_getrandom);
+        handlers.insert(29, crate::shm::sys_shmget);
+        handlers.insert(30, crate::shm::sys_shmat);
+        handlers.insert(31, crate::shm::sys_shmctl);
+        handlers.insert(67, crate::shm::sys_shmdt);
         handlers.insert(444, |c, a| {
             Outcome::Return(
                 crate::landlock::sys_create_ruleset(c, a).unwrap_or_else(Errno::to_syscall_return),
@@ -2538,7 +2542,7 @@ const PER_LINUX32: u32 = 0x8;
 
 /// A readable mapping is also executable under `READ_IMPLIES_EXEC`, as
 /// Linux's `do_mmap` and `mprotect` make it.
-fn read_implies_exec(state: &ThreadState, prot: Prot) -> Prot {
+pub(crate) fn read_implies_exec(state: &ThreadState, prot: Prot) -> Prot {
     if state.personality & READ_IMPLIES_EXEC != 0 && prot.contains(Prot::READ) {
         prot.union(Prot::EXEC)
     } else {

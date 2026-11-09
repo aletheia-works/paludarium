@@ -1,0 +1,673 @@
+//! System V shared memory: `shmget`, `shmat`, `shmdt` and `shmctl`, in the
+//! one IPC namespace of the machine, as Linux's `ipc/shm.c` has them.
+//!
+//! A segment is shared memory that every attachment shows, in every process.
+//! Each `shmat` is an open file of its own (Linux's clone of the segment's
+//! file), which the shared mappings it makes keep alive: a `fork` copies
+//! them, and `munmap`, `mprotect` and `mremap` split them as Linux splits
+//! their VMAs, which never merge. So the segment's count of attachments
+//! (`shm_nattch`) is how many of those mappings live, as Linux's `shm_open`
+//! and `shm_close` count its VMAs. A segment marked for removal is removed
+//! once that count is 0.
+use crate::credentials::Credentials;
+use crate::syscalls::{Context, Outcome};
+use paludarium_host::ClockId;
+use paludarium_mmu::{MappingKind, PageSource, Prot, SharedPages};
+use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+
+const IPC_PRIVATE: i32 = 0;
+const IPC_CREAT: i32 = 0o1000;
+const IPC_EXCL: i32 = 0o2000;
+const SHM_HUGETLB: i32 = 0o4000;
+const SHM_RDONLY: i32 = 0o10000;
+const SHM_RND: i32 = 0o20000;
+const SHM_REMAP: i32 = 0o40000;
+const SHM_EXEC: i32 = 0o100000;
+/// The mode bits of a segment marked for removal and of a locked one.
+const SHM_DEST: u32 = 0o1000;
+const SHM_LOCKED: u32 = 0o2000;
+
+const IPC_RMID: i32 = 0;
+const IPC_SET: i32 = 1;
+const IPC_STAT: i32 = 2;
+const IPC_INFO: i32 = 3;
+const SHM_LOCK: i32 = 11;
+const SHM_UNLOCK: i32 = 12;
+const SHM_STAT: i32 = 13;
+const SHM_INFO: i32 = 14;
+const SHM_STAT_ANY: i32 = 15;
+
+/// Linux's defaults of `kernel.shmmax`, `kernel.shmall` (in pages) and
+/// `kernel.shmmni`.
+const SHMMIN: u64 = 1;
+const SHMMAX: u64 = u64::MAX - (1 << 24);
+const SHMALL: u64 = u64::MAX - (1 << 24);
+const SHMMNI: usize = 4096;
+/// An ID is its index plus its sequence number shifted by this (Linux's
+/// `IPCMNI_SHIFT`), and indexes are allocated in turn below at least 64.
+const SEQ_SHIFT: u32 = 15;
+const IPCMNI: u32 = 1 << SEQ_SHIFT;
+const SEQ_MAX: u32 = i32::MAX as u32 >> SEQ_SHIFT;
+const MIN_CYCLE: usize = 64;
+const PAGE: u64 = 4096;
+/// The device a segment's file lies on, which `/proc/<pid>/maps` shows:
+/// Linux's internal tmpfs mount, 00:01.
+const DEVICE: u64 = 1;
+
+const CAP_IPC_LOCK: u64 = 1 << 14;
+const CAP_IPC_OWNER: u64 = 1 << 15;
+const CAP_SYS_ADMIN: u64 = 1 << 21;
+const RLIMIT_MEMLOCK: usize = 8;
+const ENOMEM: Errno = Errno::ENOMEM;
+
+/// The segments of the machine.
+#[derive(Default)]
+pub(crate) struct Segments(Arc<Mutex<Table>>);
+
+#[derive(Default)]
+struct Table {
+    /// By index.
+    segments: BTreeMap<u32, Segment>,
+    /// The sequence number of the IDs given out, which goes up whenever an
+    /// index is given out again after a higher one (Linux's `ids->seq`).
+    seq: u32,
+    /// The index given out last, and where the search for the next starts.
+    last: Option<u32>,
+    next: u32,
+    /// The pages of all segments (Linux's `shm_tot`).
+    pages: u64,
+}
+
+struct Segment {
+    id: i32,
+    /// Its key, `IPC_PRIVATE` once it is marked for removal.
+    key: i32,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    /// The permissions, with `SHM_DEST` and `SHM_LOCKED`.
+    mode: u32,
+    size: u64,
+    atime: i64,
+    dtime: i64,
+    ctime: i64,
+    cpid: u32,
+    lpid: u32,
+    memory: SharedPages,
+    /// `/SYSV<key> (deleted)`, after the key it was made with.
+    name: Arc<[u8]>,
+    attachments: Vec<Weak<Attachment>>,
+    /// The real user whose `RLIMIT_MEMLOCK` its `SHM_LOCK` counts against.
+    locker: Option<u32>,
+}
+
+impl Segment {
+    /// How many shared mappings show it (`shm_nattch`).
+    fn attached(&self) -> u64 {
+        self.attachments
+            .iter()
+            .map(|attachment| attachment.strong_count() as u64)
+            .sum()
+    }
+    fn pages(&self) -> u64 {
+        self.size.div_ceil(PAGE)
+    }
+}
+
+/// One `shmat`'s open file of a segment, which its shared mappings hold.
+struct Attachment {
+    id: i32,
+    size: u64,
+    name: Arc<[u8]>,
+    /// Told when the last mapping goes, to remove a segment marked for it.
+    table: Weak<Mutex<Table>>,
+}
+
+impl PageSource for Attachment {
+    /// A page that has no contents yet is zeros.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let count = usize::try_from(self.size.saturating_sub(offset))
+            .map_or(buf.len(), |n| n.min(buf.len()));
+        buf[..count].fill(0);
+        Ok(count)
+    }
+    fn size(&self) -> Option<u64> {
+        Some(self.size)
+    }
+    /// No name links a segment's file, so a core holds its mappings, as
+    /// Linux's dump of shared anonymous memory.
+    fn linked(&self) -> bool {
+        false
+    }
+    fn name(&self) -> Option<Vec<u8>> {
+        Some(self.name.to_vec())
+    }
+    /// Linux gives a segment's file the segment's ID as its inode.
+    fn identity(&self) -> (u64, u64) {
+        (DEVICE, u64::from(self.id as u32))
+    }
+    fn open_file(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+    fn merges(&self) -> bool {
+        false
+    }
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        if let Some(table) = self.table.upgrade() {
+            table.lock().unwrap_or_else(PoisonError::into_inner).purge();
+        }
+    }
+}
+
+impl Segments {
+    fn lock(&self) -> MutexGuard<'_, Table> {
+        let mut table = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        table.purge();
+        table
+    }
+}
+
+impl Table {
+    /// Removes the segments marked for removal that nothing shows any more,
+    /// as Linux's `shm_destroy` at their last detach.
+    fn purge(&mut self) {
+        let doomed: Vec<u32> = self
+            .segments
+            .iter()
+            .filter(|(_, segment)| segment.mode & SHM_DEST != 0 && segment.attached() == 0)
+            .map(|(&index, _)| index)
+            .collect();
+        for index in doomed {
+            if let Some(segment) = self.segments.remove(&index) {
+                self.pages -= segment.pages();
+            }
+        }
+    }
+    /// The segment with this ID, `EINVAL` for none (Linux's
+    /// `ipc_obtain_object_check`).
+    fn checked(&mut self, id: i32) -> Result<&mut Segment, Errno> {
+        self.segments
+            .get_mut(&(id as u32 % IPCMNI))
+            .filter(|segment| segment.id == id)
+            .ok_or(Errno::EINVAL)
+    }
+    /// The highest index in use, or 0 for none (Linux's `ipc_get_maxidx`).
+    fn max_index(&self) -> u64 {
+        self.segments
+            .keys()
+            .next_back()
+            .map_or(0, |&index| u64::from(index))
+    }
+    /// A new ID, as Linux's `ipc_idr_alloc`: the next free index from the
+    /// last one given out, below the larger of 64 and half as many again
+    /// as are in use, or the first free one from 0, which starts a new
+    /// sequence number.
+    fn allocate(&mut self) -> Result<i32, Errno> {
+        let in_use = self.segments.len();
+        if in_use >= SHMMNI {
+            return Err(Errno::ENOSPC);
+        }
+        let end = (in_use * 3 / 2).clamp(MIN_CYCLE, IPCMNI as usize) as u32;
+        let free = |from: u32| (from..end).find(|index| !self.segments.contains_key(index));
+        let index = free(self.next).or_else(|| free(0)).ok_or(Errno::ENOSPC)?;
+        self.next = index + 1;
+        if self.last.is_some_and(|last| index <= last) {
+            self.seq += 1;
+            if self.seq >= SEQ_MAX {
+                self.seq = 0;
+            }
+        }
+        self.last = Some(index);
+        Ok(((self.seq << SEQ_SHIFT) + index) as i32)
+    }
+}
+
+/// Whether `credentials` may use a segment for `flag`'s permission bits, as
+/// Linux's `ipcperms`: as its owner or creator, else as a member of its
+/// group (by the filesystem group ID, as `in_group_p`), else as anyone, or
+/// with `CAP_IPC_OWNER`.
+fn permitted(segment: &Segment, credentials: &Credentials, flag: u32) -> bool {
+    let requested = (flag >> 6) | (flag >> 3) | flag;
+    let in_group = |gid: u32| credentials.fsgid == gid || credentials.groups.contains(&gid);
+    let granted = if credentials.euid == segment.cuid || credentials.euid == segment.uid {
+        segment.mode >> 6
+    } else if in_group(segment.cgid) || in_group(segment.gid) {
+        segment.mode >> 3
+    } else {
+        segment.mode
+    };
+    requested & !granted & 0o7 == 0 || credentials.effective & CAP_IPC_OWNER != 0
+}
+
+fn now(c: &Context<'_>) -> i64 {
+    c.host
+        .clock(ClockId::Realtime)
+        .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
+}
+
+fn segments<'a>(c: &Context<'a>) -> &'a Segments {
+    c.processes.shm()
+}
+
+fn result(value: Result<u64, Errno>) -> Outcome {
+    Outcome::Return(value.unwrap_or_else(Errno::to_syscall_return))
+}
+
+/// `shmget(key, size, shmflg)`, in the order of Linux's `ipcget`: a key in
+/// use gives its segment unless `IPC_CREAT | IPC_EXCL` (`EEXIST`), the size
+/// is more than it has (`EINVAL`) or the permissions asked for are not
+/// granted (`EACCES`); a key not in use is `ENOENT` without `IPC_CREAT`.
+/// A new segment's checks are its size (`EINVAL`), the pages of all
+/// segments (`ENOSPC`), `SHM_HUGETLB` (`ENOSYS`, as from a kernel built
+/// without hugetlbfs) and the number of segments (`ENOSPC`).
+pub(crate) fn sys_shmget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    result(shmget(c, a[0] as i32, a[1], a[2] as i32))
+}
+
+fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno> {
+    let credentials = &c.process.credentials;
+    let mut table = segments(c).lock();
+    if key != IPC_PRIVATE {
+        if let Some(segment) = table.segments.values().find(|segment| segment.key == key) {
+            if flag & IPC_CREAT != 0 && flag & IPC_EXCL != 0 {
+                return Err(Errno::EEXIST);
+            }
+            if segment.size < size {
+                return Err(Errno::EINVAL);
+            }
+            if !permitted(segment, credentials, flag as u32) {
+                return Err(Errno::EACCES);
+            }
+            return Ok(u64::from(segment.id as u32));
+        }
+        if flag & IPC_CREAT == 0 {
+            return Err(Errno::ENOENT);
+        }
+    }
+    if !(SHMMIN..=SHMMAX).contains(&size) {
+        return Err(Errno::EINVAL);
+    }
+    let pages = size.div_ceil(PAGE);
+    if table
+        .pages
+        .checked_add(pages)
+        .is_none_or(|total| total > SHMALL)
+    {
+        return Err(Errno::ENOSPC);
+    }
+    if flag & SHM_HUGETLB != 0 {
+        return Err(Errno::ENOSYS);
+    }
+    let id = table.allocate()?;
+    let name = format!("/SYSV{:08x} (deleted)", key as u32);
+    table.segments.insert(
+        id as u32 % IPCMNI,
+        Segment {
+            id,
+            key,
+            uid: credentials.euid,
+            gid: credentials.egid,
+            cuid: credentials.euid,
+            cgid: credentials.egid,
+            mode: flag as u32 & 0o777,
+            size,
+            atime: 0,
+            dtime: 0,
+            ctime: now(c),
+            cpid: c.process.pid,
+            lpid: 0,
+            memory: SharedPages::new(),
+            name: name.into_bytes().into(),
+            attachments: Vec::new(),
+            locker: None,
+        },
+    );
+    table.pages += pages;
+    Ok(u64::from(id as u32))
+}
+
+/// `shmat(shmid, shmaddr, shmflg)`, as Linux's `do_shmat`: an address must
+/// be page-aligned unless `SHM_RND` rounds it down, and without
+/// `SHM_REMAP` the segment's size from it must be free (`EINVAL`); then
+/// the segment (`EINVAL`) and the permission to read it, and write it
+/// without `SHM_RDONLY` and execute it with `SHM_EXEC` (`EACCES`). The
+/// mapping is shared, and may become writable only without `SHM_RDONLY`.
+pub(crate) fn sys_shmat(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    result(shmat(c, a[0] as i32, a[1], a[2] as i32))
+}
+
+fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
+    if id < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fixed = addr != 0;
+    let mut addr = addr;
+    if fixed {
+        if !addr.is_multiple_of(PAGE) {
+            if flag & SHM_RND == 0 {
+                return Err(Errno::EINVAL);
+            }
+            addr -= addr % PAGE;
+            if addr == 0 && flag & SHM_REMAP != 0 {
+                return Err(Errno::EINVAL);
+            }
+        }
+    } else if flag & SHM_REMAP != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (mut prot, mut access) = if flag & SHM_RDONLY != 0 {
+        (Prot::READ, 0o444)
+    } else {
+        (Prot::READ.union(Prot::WRITE), 0o666)
+    };
+    if flag & SHM_EXEC != 0 {
+        prot = prot.union(Prot::EXEC);
+        access |= 0o111;
+    }
+    let (attachment, size) = {
+        let mut table = segments(c).lock();
+        let segment = table.checked(id)?;
+        if !permitted(segment, &c.process.credentials, access) {
+            return Err(Errno::EACCES);
+        }
+        let attachment = Arc::new(Attachment {
+            id: segment.id,
+            size: segment.size,
+            name: Arc::clone(&segment.name),
+            table: Arc::downgrade(&segments(c).0),
+        });
+        segment
+            .attachments
+            .retain(|attachment| attachment.strong_count() > 0);
+        segment.attachments.push(Arc::downgrade(&attachment));
+        let memory = segment.memory.with_source(attachment.clone());
+        ((attachment, memory), segment.size)
+    };
+    let (attachment, memory) = attachment;
+    let len = size.div_ceil(PAGE) * PAGE;
+    if fixed && addr != 0 && flag & SHM_REMAP == 0 {
+        let end = addr.checked_add(size).ok_or(Errno::EINVAL)?;
+        if c.mem.mappings().any(|m| m.start.0 < end && m.end() > addr) {
+            return Err(Errno::EINVAL);
+        }
+    }
+    let prot = crate::syscalls::read_implies_exec(c.process, prot);
+    let at = if fixed {
+        if addr
+            .checked_add(len)
+            .is_none_or(|end| end > USER_ADDRESS_LIMIT - PAGE)
+        {
+            return Err(ENOMEM);
+        }
+        let at = GuestAddr(addr);
+        c.mem.unmap_shared(at, len)?;
+        c.mem.map_shared(Some(at), len, prot, MappingKind::File)?
+    } else {
+        c.mem.map_shared(None, len, prot, MappingKind::File)?
+    };
+    if let Err(error) = c
+        .mem
+        .share_pages(at, len, &memory, 0, flag & SHM_RDONLY == 0)
+    {
+        let _ = c.mem.unmap_shared(at, len);
+        return Err(error);
+    }
+    c.group.numa().forget(at.0, len);
+    drop(memory);
+    let mut table = segments(c).lock();
+    if let Ok(segment) = table.checked(attachment.id) {
+        segment.atime = now(c);
+        segment.lpid = c.process.pid;
+    }
+    drop(table);
+    drop(attachment);
+    Ok(at.0)
+}
+
+/// `shmdt(shmaddr)`, as Linux's: the first attachment from `shmaddr` on
+/// whose start lies as far from it as the start's offset in the segment
+/// (`EINVAL` for none), and then the pieces of the same attachment within
+/// the segment's size of `shmaddr` that lie so too, which `munmap` and
+/// `mprotect` left.
+pub(crate) fn sys_shmdt(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    result(shmdt(c, a[0]))
+}
+
+fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
+    if !addr.is_multiple_of(PAGE) {
+        return Err(Errno::EINVAL);
+    }
+    // The segments' attachments, by open file, with the segment's ID and size.
+    let attachments: BTreeMap<usize, (i32, u64)> = segments(c)
+        .lock()
+        .segments
+        .values()
+        .flat_map(|segment| {
+            segment
+                .attachments
+                .iter()
+                .filter(|attachment| attachment.strong_count() > 0)
+                .map(|attachment| (attachment.as_ptr().addr(), (segment.id, segment.size)))
+        })
+        .collect();
+    let fragments = c.mem.shared_fragments();
+    let lies = |start: u64, offset: u64| start.wrapping_sub(addr) / PAGE == offset / PAGE;
+    let mut rest = fragments.iter().skip_while(|f| f.end <= addr);
+    let mut found = None;
+    for f in rest.by_ref() {
+        if let Some(&(id, size)) = attachments.get(&f.open_file)
+            && lies(f.start, f.offset)
+        {
+            found = Some((f.open_file, id, size.div_ceil(PAGE) * PAGE));
+            c.mem.unmap_shared(GuestAddr(f.start), f.end - f.start)?;
+            c.group.numa().forget(f.start, f.end - f.start);
+            break;
+        }
+    }
+    let Some((file, id, size)) = found else {
+        return Err(Errno::EINVAL);
+    };
+    for f in rest.take_while(|f| f.end - addr <= size) {
+        if f.open_file == file && lies(f.start, f.offset) {
+            c.mem.unmap_shared(GuestAddr(f.start), f.end - f.start)?;
+            c.group.numa().forget(f.start, f.end - f.start);
+        }
+    }
+    let mut table = segments(c).lock();
+    if let Ok(segment) = table.checked(id) {
+        segment.dtime = now(c);
+        segment.lpid = c.process.pid;
+    }
+    Ok(0)
+}
+
+/// `shmctl(shmid, cmd, buf)`, as Linux's on x86-64 (where `cmd` has no
+/// `IPC_64`).
+pub(crate) fn sys_shmctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    result(shmctl(c, a[0] as i32, a[1] as i32, a[2]))
+}
+
+fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
+    if cmd < 0 || id < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let write = |bytes: &[u8]| {
+        c.mem
+            .write(GuestAddr(buf), bytes)
+            .map_err(|_| Errno::EFAULT)
+    };
+    match cmd {
+        // `struct shminfo64`, and the highest index in use.
+        IPC_INFO => {
+            let max = segments(c).lock().max_index();
+            let mut info = [0u8; 72];
+            for (n, value) in [SHMMAX, SHMMIN, SHMMNI as u64, SHMMNI as u64, SHMALL]
+                .into_iter()
+                .enumerate()
+            {
+                info[n * 8..n * 8 + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            write(&info)?;
+            Ok(max)
+        }
+        // `struct shm_info`, and the highest index in use.
+        SHM_INFO => {
+            let (max, used, total, resident) = {
+                let table = segments(c).lock();
+                let resident = table
+                    .segments
+                    .values()
+                    .map(|s| s.memory.resident())
+                    .sum::<u64>();
+                (
+                    table.max_index(),
+                    table.segments.len() as u32,
+                    table.pages,
+                    resident,
+                )
+            };
+            let mut info = [0u8; 48];
+            info[..4].copy_from_slice(&used.to_le_bytes());
+            info[8..16].copy_from_slice(&total.to_le_bytes());
+            info[16..24].copy_from_slice(&resident.to_le_bytes());
+            write(&info)?;
+            Ok(max)
+        }
+        IPC_STAT | SHM_STAT | SHM_STAT_ANY => {
+            let (ds, returned) = {
+                let mut table = segments(c).lock();
+                let segment = if cmd == IPC_STAT {
+                    table.checked(id)?
+                } else {
+                    table
+                        .segments
+                        .get_mut(&(id as u32 % IPCMNI))
+                        .ok_or(Errno::EINVAL)?
+                };
+                if cmd != SHM_STAT_ANY && !permitted(segment, &c.process.credentials, 0o444) {
+                    return Err(Errno::EACCES);
+                }
+                let returned = if cmd == IPC_STAT {
+                    0
+                } else {
+                    u64::from(segment.id as u32)
+                };
+                (shmid_ds(segment), returned)
+            };
+            write(&ds)?;
+            Ok(returned)
+        }
+        IPC_SET | IPC_RMID => {
+            let mut ds = [0u8; 112];
+            if cmd == IPC_SET {
+                c.mem
+                    .read(GuestAddr(buf), &mut ds)
+                    .map_err(|_| Errno::EFAULT)?;
+            }
+            let now = now(c);
+            let mut table = segments(c).lock();
+            let credentials = &c.process.credentials;
+            let segment = table.checked(id)?;
+            if credentials.euid != segment.cuid
+                && credentials.euid != segment.uid
+                && credentials.effective & CAP_SYS_ADMIN == 0
+            {
+                return Err(Errno::EPERM);
+            }
+            if cmd == IPC_SET {
+                let field =
+                    |at: usize| u32::from_le_bytes([ds[at], ds[at + 1], ds[at + 2], ds[at + 3]]);
+                let (uid, gid, mode) = (field(4), field(8), field(20));
+                if uid == u32::MAX || gid == u32::MAX {
+                    return Err(Errno::EINVAL);
+                }
+                segment.uid = uid;
+                segment.gid = gid;
+                segment.mode = segment.mode & !0o777 | mode & 0o777;
+                segment.ctime = now;
+                return Ok(0);
+            }
+            // Marked for removal while attached, and found by no key; the
+            // last detach removes it.
+            segment.mode |= SHM_DEST;
+            segment.key = IPC_PRIVATE;
+            table.purge();
+            Ok(0)
+        }
+        SHM_LOCK | SHM_UNLOCK => lock(c, id, cmd == SHM_LOCK),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `struct shmid64_ds` of `segment`, as x86-64 lays it out.
+fn shmid_ds(segment: &Segment) -> [u8; 112] {
+    let mut ds = [0u8; 112];
+    let mut put = |at: usize, bytes: &[u8]| ds[at..at + bytes.len()].copy_from_slice(bytes);
+    put(0, &segment.key.to_le_bytes());
+    put(4, &segment.uid.to_le_bytes());
+    put(8, &segment.gid.to_le_bytes());
+    put(12, &segment.cuid.to_le_bytes());
+    put(16, &segment.cgid.to_le_bytes());
+    put(20, &segment.mode.to_le_bytes());
+    put(24, &((segment.id as u32 >> SEQ_SHIFT) as u16).to_le_bytes());
+    put(48, &segment.size.to_le_bytes());
+    put(56, &segment.atime.to_le_bytes());
+    put(64, &segment.dtime.to_le_bytes());
+    put(72, &segment.ctime.to_le_bytes());
+    put(80, &segment.cpid.to_le_bytes());
+    put(84, &segment.lpid.to_le_bytes());
+    put(88, &segment.attached().to_le_bytes());
+    ds
+}
+
+/// `SHM_LOCK` and `SHM_UNLOCK`, as Linux's `shmctl_do_lock`: without
+/// `CAP_IPC_LOCK` only for the segment's owner or creator, and a lock
+/// needs a `RLIMIT_MEMLOCK` (`EPERM`) with room for the segment among
+/// those the real user locked (`ENOMEM`). Nothing is ever swapped out, so
+/// a lock changes nothing else.
+fn lock(c: &Context<'_>, id: i32, lock: bool) -> Result<u64, Errno> {
+    let credentials = &c.process.credentials;
+    let capable = credentials.effective & CAP_IPC_LOCK != 0;
+    let limit = c.processes.soft_limit(c.process.pid, RLIMIT_MEMLOCK);
+    let mut table = segments(c).lock();
+    let locked_by_user: u64 = table
+        .segments
+        .values()
+        .filter(|segment| segment.locker == Some(credentials.uid))
+        .map(Segment::pages)
+        .sum();
+    let segment = table.checked(id)?;
+    if !capable {
+        if credentials.euid != segment.uid && credentials.euid != segment.cuid {
+            return Err(Errno::EPERM);
+        }
+        if lock && limit == 0 {
+            return Err(Errno::EPERM);
+        }
+    }
+    if lock {
+        if segment.mode & SHM_LOCKED != 0 {
+            return Ok(0);
+        }
+        let limit = if limit == u64::MAX {
+            limit
+        } else {
+            limit / PAGE
+        };
+        if locked_by_user + segment.pages() > limit && !capable {
+            return Err(ENOMEM);
+        }
+        segment.mode |= SHM_LOCKED;
+        segment.locker = Some(credentials.uid);
+    } else if segment.mode & SHM_LOCKED != 0 {
+        segment.mode &= !SHM_LOCKED;
+        segment.locker = None;
+    }
+    Ok(0)
+}

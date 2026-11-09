@@ -153,6 +153,8 @@ pub struct Processes {
     locks: crate::record_locks::Locks,
     /// The machine's FIFOs, which every process opening one joins.
     fifos: Arc<crate::fifo::Fifos>,
+    /// The machine's System V shared memory segments.
+    shm: crate::shm::Segments,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -167,6 +169,7 @@ impl Processes {
             file_owners: Mutex::default(),
             locks: crate::record_locks::Locks::default(),
             fifos: Arc::default(),
+            shm: crate::shm::Segments::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -790,6 +793,19 @@ impl Processes {
     }
     pub(crate) fn fifos(&self) -> Arc<crate::fifo::Fifos> {
         Arc::clone(&self.fifos)
+    }
+    pub(crate) fn shm(&self) -> &crate::shm::Segments {
+        &self.shm
+    }
+    /// The soft limit of `resource` of process `pid`, or infinity for a
+    /// process that is gone.
+    pub(crate) fn soft_limit(&self, pid: u32, resource: usize) -> u64 {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&pid)
+            .and_then(|entry| entry.limits.get(resource))
+            .map_or(u64::MAX, |&(soft, _)| soft)
     }
     pub(crate) fn finish(&self, pid: u32, status: ExitStatus) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);

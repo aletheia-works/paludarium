@@ -169,6 +169,7 @@
     {"name":"bad-elf","binary":"process"},
     {"name":"execveat","binary":"process"},
     {"name":"etxtbsy","binary":"process"},
+    {"name":"shm","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

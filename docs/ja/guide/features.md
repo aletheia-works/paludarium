@@ -48,6 +48,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
+| System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ） |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -505,6 +506,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MREMAP_FIXED` で動かすと、`EFAULT` になります（最近の Linux は動かせます）。
 - `msync` は、引数と範囲を確かめ、`MS_SYNC` か `MS_ASYNC` なら共有のファイルの
   マッピングへの書き込みをファイルに書き戻します。
+- System V の共有メモリ（`shmget`、`shmat`、`shmdt`、`shmctl`）は、マシンに 1 つの IPC
+  名前空間を持ちます。確かめる内容とその順序、既定の上限は Linux と同じです。
+  セグメントの ID は添字とシーケンス番号からなり、Linux と同じ順に割り当てます。
+  `/proc/<pid>/maps` は、つないだ領域をデバイス 00:01 の `/SYSV<key> (deleted)` と示し、
+  inode は ID です。つないでいる数（`shm_nattch`）は、Linux と同じく、どのプロセスでも
+  セグメントを映す VMA ごとに数えます。`fork` はそれを写し、`munmap` と、一部の保護を
+  変える `mprotect` はそれを分け、分かれたものは 1 つに戻りません。`shmdt` は、`munmap`
+  と `mprotect` が残したその領域のかけらをすべて外します。つながったまま `IPC_RMID`
+  したセグメントは、ID はそのままで、どのキーでも見つからなくなり、最後に外れたとき
+  消えます。`SHM_LOCK` は Linux と同じく所有者と `RLIMIT_MEMLOCK` を確かめます。
+  `SHM_HUGETLB` は、hugetlbfs なしでビルドしたカーネルと同じく `ENOSYS` です。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。
@@ -579,8 +591,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
   `EINVAL` です。プロセスにほかのスレッドがあるとき、ほかのプロセスとシグナルの扱いを
   共有しているとき（`CLONE_SIGHAND`）、ほかのプロセスとメモリーを共有しているとき
-  （`CLONE_THREAD` なしの `CLONE_VM`）です。System V IPC がないので、`CLONE_SYSVSEM` で
-  捨てるセマフォーの調整値はありません。名前空間はありません。そのフラグは、Linux と
+  （`CLONE_THREAD` なしの `CLONE_VM`）です。System V のセマフォーがないので、`CLONE_SYSVSEM`
+  で捨てるセマフォーの調整値はありません。名前空間はありません。そのフラグは、Linux と
   同じく `CAP_SYS_ADMIN` がなければ `EPERM`、あれば `EINVAL` です。後者は、その名前空間
   なしでビルドしたカーネルと同じで、ここでの `clone` とも同じです。Linux ではユーザーも
   使える `CLONE_NEWUSER` も `EINVAL` です。[制限](./limitations.md)を見てください。

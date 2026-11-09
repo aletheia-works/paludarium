@@ -2650,11 +2650,15 @@ impl Kernel {
         // What runs: a path's program, whose scripts are followed below, or
         // the bytes of a file only a descriptor holds (`image`), which, if a
         // script, hands over to its interpreter by path.
+        // The denial of writes to the file a path names, held from the
+        // open on, as `do_open_execat` takes it, until exec ends; the program
+        // it loads takes its own.
+        let mut opened = None;
         let (start, program, mut readable, image) = match program {
             crate::files::Program::Path(path) => {
                 let (program, readable) =
                     crate::permissions::exec(&self.files, creds, dir, &raw, &path)?;
-                drop(deny_writes(&self.files, &path)?);
+                opened = deny_writes(&self.files, &path)?;
                 ((named.clone(), path.clone(), path), program, readable, None)
             }
             crate::files::Program::File {
@@ -2796,7 +2800,7 @@ impl Kernel {
                 (loaded, program, None, exe)
             }
         };
-        self.exec_image(
+        let done = self.exec_image(
             thread,
             mem,
             (named, path, loaded),
@@ -2805,7 +2809,9 @@ impl Kernel {
             (argv, envp),
             image,
             exe,
-        )
+        );
+        drop(opened);
+        done
     }
     /// The rest of exec, once the program is known: `raw` is its name,
     /// `path` names the process, and `loaded` is what loads, unless `image`

@@ -307,8 +307,9 @@ impl FileCache {
                 shrinks.pop();
             }
             shrinks.push((count, size));
+        } else {
+            self.size.store(size, Ordering::SeqCst);
         }
-        self.size.store(size, Ordering::SeqCst);
         self.pages.zero(old.min(size), u64::MAX);
     }
     /// The bytes from `start` to `end` read as zeros now.

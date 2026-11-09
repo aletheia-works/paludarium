@@ -937,12 +937,15 @@ fn a_write_that_copies_a_page_as_its_file_shrinks_past_it_is_a_bus_error() {
 
 #[test]
 fn a_page_first_touched_after_its_file_shrank_and_grew_keeps_its_writes() {
-    let file = Shrinking::new(2 * PAGE_SIZE);
-    let space = file_space(&file, 2, FileView::Copy);
-    file.resize(0);
-    file.resize(2 * PAGE_SIZE);
-    space.write(GuestAddr(AT + PAGE_SIZE), &[0xee]).unwrap();
-    assert_eq!(byte(&space, AT + PAGE_SIZE), 0xee);
+    for view in [FileView::Copy, FileView::Cache] {
+        let file = Shrinking::new(2 * PAGE_SIZE);
+        let space = file_space(&file, 2, view);
+        file.resize(0);
+        file.resize(2 * PAGE_SIZE);
+        space.write(GuestAddr(AT + PAGE_SIZE), &[0xee]).unwrap();
+        assert_eq!(byte(&space, AT + PAGE_SIZE), 0xee, "{view:?}");
+        assert_eq!(byte(&space, AT + PAGE_SIZE), 0xee, "{view:?}");
+    }
 }
 
 #[test]

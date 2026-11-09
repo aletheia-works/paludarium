@@ -74,6 +74,26 @@ fn decodes_after_a_code_change_do_not_count() {
 }
 
 #[test]
+fn other_addresses_left_from_before_a_code_change_do_not_count() {
+    let mut cache = DecodeCache::new();
+    cache.lookup();
+    // Each decode finds the other address in its slot, decoded under the
+    // generation before.
+    for generation in 0..=GROWTH_WINDOW {
+        let rip = if generation % 2 == 0 { FIRST } else { SECOND };
+        cache.put(rip, generation, nop(rip));
+    }
+    cache.lookup();
+    assert_eq!(cache.entries.len(), INITIAL_ENTRIES);
+    let mut cache = DecodeCache::new();
+    for generation in 0..=GROWTH_WINDOW + 1 {
+        let rip = if generation % 2 == 0 { FIRST } else { SECOND };
+        assert!(cache.decoded(rip, generation, || Ok(nop(rip))).is_ok());
+    }
+    assert_eq!(cache.entries.len(), INITIAL_ENTRIES);
+}
+
+#[test]
 fn the_cache_grows_no_further_than_its_limit() {
     let mut cache = DecodeCache::new();
     while cache.entries.len() < MAX_ENTRIES {

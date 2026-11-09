@@ -66,8 +66,9 @@ const MAX_ENTRIES: usize = INITIAL_ENTRIES;
 const GROWTH_WINDOW: u64 = 1 << 16;
 
 /// It doubles when more than one lookup in this many found another
-/// instruction in its slot. Misses after a code change do not count: a
-/// larger cache would not keep them.
+/// instruction of the current code generation in its slot. An entry left
+/// from before a code change does not count, whatever its address: the
+/// lookup would miss in a larger cache too.
 const GROWTH_RATIO: u64 = 64;
 
 /// Decoded instructions by address. An entry is used only while the
@@ -216,7 +217,7 @@ impl DecodeCache {
         match entry {
             Some(e) if e.rip == rip && e.generation == generation => Ok(&e.decoded),
             _ => {
-                if entry.is_some_and(|e| e.rip != rip) {
+                if entry.is_some_and(|e| e.rip != rip && e.generation == generation) {
                     self.growth.collided(entries);
                 }
                 let decoded = Decoded::new(decode()?);
@@ -236,7 +237,7 @@ impl DecodeCache {
     fn put(&mut self, rip: u64, generation: u64, instruction: Instruction) -> Decoded {
         let decoded = Decoded::new(instruction);
         let slot = self.slot(rip);
-        if self.entries[slot].is_some_and(|e| e.rip != rip) {
+        if self.entries[slot].is_some_and(|e| e.rip != rip && e.generation == generation) {
             self.growth.collided(self.entries.len());
         }
         self.entries[slot] = Some(Entry {

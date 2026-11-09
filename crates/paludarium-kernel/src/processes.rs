@@ -3123,6 +3123,9 @@ pub(crate) fn follow_scripts(
 /// Write access to the regular file `path` names denied (ETXTBSY while a
 /// description has it open for writing), as Linux's `do_open_execat` denies
 /// it to each file exec opens; none for another file, which fails later.
+/// It finds the file by its path again, after the permission check did, where
+/// Linux does both on the one file `do_open_execat` opened; a rename between
+/// the two may check another file.
 pub(crate) fn deny_writes(
     files: &crate::files::Files,
     path: &[u8],

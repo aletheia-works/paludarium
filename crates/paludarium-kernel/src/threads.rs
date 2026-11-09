@@ -840,11 +840,19 @@ impl Kernel {
         self.pending_child.take()
     }
     pub fn abandon_thread(&self, tid: u32) {
-        self.group
-            .members
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&tid);
+        let alone = {
+            let mut members = self
+                .group
+                .members
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            members.remove(&tid);
+            members.is_empty()
+        };
+        // As in `finish_thread`: no thread left runs the program.
+        if alone {
+            self.group.set_exe_file(None);
+        }
         self.group.forget_nice(tid);
         self.group.forget_task_ids(self.process.pid, tid);
         self.group.forget_public(self.process.pid, tid);

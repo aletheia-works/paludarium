@@ -398,7 +398,9 @@ impl Kernel {
             .exec_path(path.to_vec())
             .unwrap_or_else(|_| path.to_vec());
         let path = crate::files::resolved(&self.files, &path).unwrap_or(path);
-        // It runs, so its file may not be opened for writing (ETXTBSY).
+        // It runs, so its file may not be opened for writing (ETXTBSY). A
+        // writer can only be the host's here, which is not counted, so the
+        // program still runs, without the denial.
         if let Ok(denied) = crate::processes::deny_writes(&self.files, &path) {
             self.group.set_exe_file(denied.map(Arc::new));
         }

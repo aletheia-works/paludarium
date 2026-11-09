@@ -1900,14 +1900,15 @@ fn is_terminal(c: &Context<'_>, d: &Descriptor) -> bool {
     };
     c.files.terminal_size.is_some() || matches!(c.host.terminal_info(stream), Ok(Some(_)))
 }
-/// The block size of the file a descriptor holds: procfs's for one opened
-/// in `/proc`, devpts's for a terminal, else [`BLOCK_SIZE`].
 /// Whether `d` holds a namespace file (nsfs), which a path in /proc opens.
 fn is_namespace(d: &Descriptor) -> bool {
     d.file
         .as_any()
         .is_some_and(|v| v.is::<crate::namespaces::NamespaceFile>())
 }
+/// The block size of the file a descriptor holds: procfs's for one opened
+/// in `/proc` but a namespace file, devpts's for a terminal, else
+/// [`BLOCK_SIZE`].
 pub(crate) fn descriptor_block_size(c: &Context<'_>, d: &Descriptor) -> u32 {
     if in_proc(&d.path) && !is_namespace(d) || is_terminal(c, d) {
         SMALL_BLOCK_SIZE

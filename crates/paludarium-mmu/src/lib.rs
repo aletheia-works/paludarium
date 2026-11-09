@@ -936,11 +936,12 @@ struct TlbEntry {
 ///
 /// Each access checks both itself, so it does not matter in which order a
 /// truncation changes them. An access that saw neither change comes before
-/// the truncation, like one already under way when it ran. For a store,
-/// nothing after the truncation can tell the difference. A copy that the
+/// the truncation, like one already under way when it ran. A store of that
+/// kind may still land after the truncation returns, but where it lands
+/// gives the same result as a store just before it. A copy that the
 /// truncation leaves wholly past the end is never seen again, as the next
-/// access under the locks replaces it. A copy that it leaves within the
-/// file stays, and a store to it may as well have come after.
+/// access under the locks replaces it, so the store goes with it. A copy
+/// that it leaves within the file stays, with the store in it.
 struct FileEnd {
     source: Arc<dyn PageSource>,
     /// The page's offset in the file.

@@ -385,11 +385,11 @@ kernel.
   - **Sockets.** A send signals the peer. On a stream or packet socket, so
     do a write shutdown and the close, which hangs up; a datagram socket's
     do not. A blocking read of a stream socket that waits for data gets no
-    signal for the data, end or hang-up that ends the wait, as Linux's
-    `SOCKWQ_ASYNC_WAITDATA` (Linux also sends one when the woken reader
-    runs before the sender looks). A send that found the buffer full
-    signals once when reads leave three quarters of the buffer free, and so
-    does a full datagram or packet socket that `poll`, `select` or
+    signal for the data, end or hang-up that ends the wait, as with Linux's
+    `SOCKWQ_ASYNC_WAITDATA`. Linux also signals when the woken reader runs
+    before the sender looks; the emulator never does. A send that found the
+    buffer full signals once when reads leave three quarters of the buffer
+    free, and so does a full datagram or packet socket that `poll`, `select` or
     `epoll_ctl` asked to take a write, or
     `epoll_wait` did, as Linux's asks only what is on its ready list: an
     interest it listed when added, after a wakeup, or after a

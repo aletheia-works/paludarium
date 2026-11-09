@@ -189,3 +189,36 @@ mod signals_time_tests {
     use super::*;
     include!("signals_time_tests.rs");
 }
+#[test]
+fn a_replacing_map_takes_the_place_of_what_was_mapped() {
+    let m = memory(2);
+    let a = GuestAddr(0x10000);
+    m.write_u64(a, 7).unwrap();
+    m.write_u64(GuestAddr(0x10000 + PAGE_SIZE), 8).unwrap();
+    let generation = m.code_generation();
+    assert_eq!(
+        m.map_replacing(a, PAGE_SIZE, Prot::READ_EXEC, MappingKind::Anonymous),
+        Ok(a)
+    );
+    // The page is new, zero and executable; the next one stays as it was.
+    assert_eq!(m.read_u64(a).unwrap(), 0);
+    assert!(m.write_u64(a, 1).is_err());
+    m.fetch(a, &mut [0]).unwrap();
+    assert_eq!(m.read_u64(GuestAddr(0x10000 + PAGE_SIZE)).unwrap(), 8);
+    assert_ne!(m.code_generation(), generation);
+    // Where nothing was mapped, it maps; a bad range maps nothing.
+    let free = GuestAddr(0x40000);
+    assert_eq!(
+        m.map_replacing(free, PAGE_SIZE, Prot::READ, MappingKind::Anonymous),
+        Ok(free)
+    );
+    assert_eq!(
+        m.map_replacing(
+            GuestAddr(0x40001),
+            PAGE_SIZE,
+            Prot::READ,
+            MappingKind::Anonymous
+        ),
+        Err(Errno::EINVAL)
+    );
+}

@@ -3885,6 +3885,22 @@ impl AddressSpace {
     pub fn unmap_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().unmap(addr, len)
     }
+    /// Maps zero-filled pages at `[addr, addr+len)` in place of whatever is
+    /// mapped there, as Linux's `MAP_FIXED` does: the unmap and the map
+    /// happen under one hold of the locks, so another thread's `mmap`
+    /// cannot take the range between them and make the map fail with
+    /// `EEXIST`.
+    pub fn map_replacing(
+        &self,
+        addr: GuestAddr,
+        len: u64,
+        prot: Prot,
+        kind: MappingKind,
+    ) -> Result<GuestAddr, Errno> {
+        let mut data = self.locked();
+        data.unmap(addr, len)?;
+        data.map(Some(addr), len, prot, kind)
+    }
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.protect_shared(addr, len, prot)
     }

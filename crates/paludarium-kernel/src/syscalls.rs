@@ -1479,12 +1479,11 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if at.page_offset() != 0 {
             return err(Errno::EINVAL);
         }
-        if flags & MAP_FIXED_NOREPLACE == 0
-            && let Err(e) = c.mem.unmap_shared(at, len)
-        {
-            return err(e);
+        if flags & MAP_FIXED_NOREPLACE == 0 {
+            c.mem.map_replacing(at, len, prot, kind)
+        } else {
+            c.mem.map_shared(Some(at), len, prot, kind)
         }
-        c.mem.map_shared(Some(at), len, prot, kind)
     } else {
         // Linux rounds a non-fixed hint down to its page boundary.
         let hint = GuestAddr(addr & !4095);

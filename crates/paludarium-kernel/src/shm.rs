@@ -353,8 +353,7 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
             return Err(ENOMEM);
         }
         let at = GuestAddr(addr);
-        c.mem.unmap_shared(at, len)?;
-        c.mem.map_shared(Some(at), len, prot, MappingKind::File)?
+        c.mem.map_replacing(at, len, prot, MappingKind::File)?
     } else {
         c.mem.map_shared(None, len, prot, MappingKind::File)?
     };

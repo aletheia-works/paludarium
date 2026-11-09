@@ -1544,8 +1544,11 @@ one only with an `--allow-net`.
   domain may not read `/proc/<pid>/environ` and the like of a task outside
   it. `landlock_restrict_self` takes the logging flags and
   `LANDLOCK_RESTRICT_SELF_TSYNC`, which gives every thread of the process
-  the new domain. Threads, processes and `execve` keep the domain;
-  `O_PATH`, `stat` and descriptors opened before are not checked.
+  the new domain in place of the one it had. With a descriptor of -1 it
+  takes `LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF`, alone or with TSYNC,
+  which then gives the others the caller's own domain; any other flag with
+  -1 is `EBADF`. Threads, processes and `execve` keep the domain; `O_PATH`,
+  `stat` and descriptors opened before are not checked.
 - Files can be placed before the start.
 - A host directory can be mounted when you ask for it (`--mount` on the
   command line, `Config::mounts` in Rust). Every operation stays inside that

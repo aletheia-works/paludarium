@@ -14,6 +14,8 @@
     {"name":"personality","binary":"process"},
     {"name":"membarrier","binary":"process"},
     {"name":"unshare","binary":"process"},
+    {"name":"scheduling-set","binary":"process"},
+    {"name":"personality-layout","binary":"process"},
     {"name":"landlock","binary":"process"},
     {"name":"mempolicy","binary":"process"},
     {"name":"ids","binary":"process"},

@@ -314,9 +314,13 @@ fn an_access_it_holds_needs_no_serialization() {
             assert_eq!(byte(space, AT), 1);
         }
     ));
-    assert!(finishes_under_serialization(
+    assert!(finishes_while_held(
         &space,
+        Held::Serialization,
         SHOULD_FINISH,
+        |space| {
+            used(space, AT);
+        },
         |space| {
             space.write(GuestAddr(AT), &[2]).unwrap();
         }
@@ -357,11 +361,12 @@ fn an_access_it_does_not_hold_waits_for_serialization() {
 }
 
 #[test]
-fn a_load_its_thread_holds_takes_no_lock() {
-    let space = Arc::new(space(1, Prot::READ_WRITE.union(Prot::EXEC)));
+fn an_access_its_thread_holds_takes_no_lock() {
+    let space = Arc::new(space(2, Prot::READ_WRITE.union(Prot::EXEC)));
     space
         .write(GuestAddr(AT), &[1, 2, 3, 4, 5, 6, 7, 8])
         .unwrap();
+    let generation = space.code_generation();
     assert!(finishes_while_held(
         &space,
         Held::Both,
@@ -378,9 +383,20 @@ fn a_load_its_thread_holds_takes_no_lock() {
                 3
             );
             assert_eq!(code, [3, 4, 5]);
+            space.write(GuestAddr(AT), &[9]).unwrap();
+            space.write_value(GuestAddr(AT + 1), 2, 0x0b0a).unwrap();
+            let result = space
+                .atomic(GuestAddr(AT + 4), AtomicWidth::W32, AtomicOp::Add(1))
+                .unwrap();
+            assert_eq!(result.old, 0x0807_0605);
         }
     ));
-    // A write still takes the space's lock.
+    let mut bytes = [0; 8];
+    space.read(GuestAddr(AT), &mut bytes).unwrap();
+    assert_eq!(bytes, [9, 10, 11, 4, 6, 6, 7, 8]);
+    // Stores to code still make its decoded instructions stale.
+    assert_ne!(space.code_generation(), generation);
+    // A page it does not hold takes the locks.
     assert!(!finishes_while_held(
         &space,
         Held::Both,
@@ -389,10 +405,169 @@ fn a_load_its_thread_holds_takes_no_lock() {
             used(space, AT);
         },
         |space| {
-            space.write(GuestAddr(AT), &[9]).unwrap();
+            space.write(GuestAddr(AT + PAGE_SIZE), &[9]).unwrap();
         }
     ));
-    assert_eq!(byte(&space, AT), 9);
+    assert_eq!(byte(&space, AT + PAGE_SIZE), 9);
+}
+
+/// What one thread of a [`race`] does.
+type Racer = Box<dyn FnOnce(&AddressSpace) + Send>;
+
+/// Runs `threads` threads at once, each of which uses the page first.
+fn race(space: &Arc<AddressSpace>, threads: Vec<Racer>) {
+    let start = Arc::new(std::sync::Barrier::new(threads.len()));
+    let handles: Vec<_> = threads
+        .into_iter()
+        .map(|run| {
+            let (space, start) = (Arc::clone(space), Arc::clone(&start));
+            std::thread::spawn(move || {
+                used(&space, AT);
+                start.wait();
+                run(&space);
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+const ROUNDS: u64 = 20_000;
+
+#[test]
+fn a_locked_instruction_keeps_the_stores_to_its_word_that_take_no_lock() {
+    let space = Arc::new(space(1, Prot::READ_WRITE));
+    space.write(GuestAddr(AT), &[0; 8]).unwrap();
+    let add = |space: &AddressSpace| {
+        for _ in 0..ROUNDS {
+            space
+                .atomic(GuestAddr(AT), AtomicWidth::W32, AtomicOp::Add(1))
+                .unwrap();
+        }
+    };
+    race(
+        &space,
+        vec![
+            Box::new(add),
+            Box::new(add),
+            Box::new(|space: &AddressSpace| {
+                for round in 0..ROUNDS {
+                    space.write(GuestAddr(AT + 5), &[round as u8]).unwrap();
+                    space
+                        .write_value(GuestAddr(AT + 6), 2, round & 0xffff)
+                        .unwrap();
+                }
+            }),
+        ],
+    );
+    assert_eq!(space.read_value(GuestAddr(AT), 4).unwrap(), 2 * ROUNDS);
+    let last = ROUNDS - 1;
+    assert_eq!(
+        space.read_value(GuestAddr(AT + 5), 3).unwrap(),
+        last & 0xff | (last & 0xffff) << 8
+    );
+}
+
+#[test]
+fn a_locked_instruction_across_words_is_whole_against_ones_within_them() {
+    let space = Arc::new(space(1, Prot::READ_WRITE));
+    space.write(GuestAddr(AT), &[0; 64]).unwrap();
+    race(
+        &space,
+        vec![
+            // `CMPXCHG16B`'s width, and a split lock across two words.
+            Box::new(|space: &AddressSpace| {
+                for _ in 0..ROUNDS {
+                    space
+                        .atomic(GuestAddr(AT + 16), AtomicWidth::W128, AtomicOp::Add(1))
+                        .unwrap();
+                    space
+                        .atomic(GuestAddr(AT + 44), AtomicWidth::W64, AtomicOp::Add(1))
+                        .unwrap();
+                }
+            }),
+            Box::new(|space: &AddressSpace| {
+                for _ in 0..ROUNDS {
+                    space
+                        .atomic(GuestAddr(AT + 16), AtomicWidth::W64, AtomicOp::Add(1))
+                        .unwrap();
+                    space
+                        .atomic(GuestAddr(AT + 44), AtomicWidth::W32, AtomicOp::Add(1))
+                        .unwrap();
+                }
+            }),
+        ],
+    );
+    assert_eq!(space.read_u64(GuestAddr(AT + 16)).unwrap(), 2 * ROUNDS);
+    assert_eq!(space.read_u64(GuestAddr(AT + 24)).unwrap(), 0);
+    assert_eq!(space.read_u64(GuestAddr(AT + 44)).unwrap(), 2 * ROUNDS);
+}
+
+/// Stores `1, 2, …` at `AT` without a lock from another thread until one
+/// faults, while `change` runs in this one; then checks that the value
+/// `after` reads no longer changes. After the first stores, each one waits
+/// while it is under way, so that `change` comes in the middle of one.
+fn no_store_lands_after(
+    change: impl FnOnce(&AddressSpace),
+    after: impl Fn(&AddressSpace) -> u64,
+    space: &Arc<AddressSpace>,
+) {
+    let storing = Arc::clone(space);
+    let (started, wait_started) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        used(&storing, AT);
+        let mut value = 0;
+        loop {
+            value += 1;
+            if storing.write_u64(GuestAddr(AT), value).is_err() {
+                break;
+            }
+            if value == 1000 {
+                STORE_STALL.set(Some(std::time::Duration::from_millis(20)));
+                started.send(()).unwrap();
+            }
+        }
+    });
+    wait_started.recv().unwrap();
+    change(space);
+    let first = after(space);
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(after(space), first);
+    // Undo the change, if it was one, so that the thread stops.
+    let _ = space.protect_shared(GuestAddr(AT), PAGE_SIZE, Prot::READ);
+    thread.join().unwrap();
+}
+
+#[test]
+fn no_store_without_a_lock_lands_after_mprotect_returns() {
+    for _ in 0..3 {
+        let space = Arc::new(space(1, Prot::READ_WRITE));
+        no_store_lands_after(
+            |space| {
+                space
+                    .protect_shared(GuestAddr(AT), PAGE_SIZE, Prot::READ)
+                    .unwrap();
+            },
+            |space| space.read_u64(GuestAddr(AT)).unwrap(),
+            &space,
+        );
+    }
+}
+
+#[test]
+fn no_store_without_a_lock_lands_in_a_child_after_fork_returns() {
+    for _ in 0..20 {
+        let space = Arc::new(space(1, Prot::READ_WRITE));
+        let child = std::sync::OnceLock::new();
+        no_store_lands_after(
+            |space| {
+                let _ = child.set(space.fork());
+            },
+            |_| child.get().unwrap().read_u64(GuestAddr(AT)).unwrap(),
+            &space,
+        );
+    }
 }
 
 #[test]
@@ -448,6 +623,25 @@ fn a_space_never_takes_the_pages_of_another_space_in_a_threads_tlb() {
     let second = AddressSpace::new();
     assert!(!second.read(GuestAddr(AT), &mut [0]).unwrap_err().mapped);
     assert_ne!(second.code.epoch.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn a_barrier_waits_for_a_store_under_way_in_another_thread() {
+    let space = Arc::new(space(1, Prot::READ_WRITE));
+    space.write_u64(GuestAddr(AT), 1).unwrap();
+    let storing = Arc::clone(&space);
+    let (started, wait_started) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        used(&storing, AT);
+        STORE_STALL.set(Some(std::time::Duration::from_millis(100)));
+        started.send(()).unwrap();
+        storing.write_u64(GuestAddr(AT), 2).unwrap();
+    });
+    wait_started.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    space.barrier();
+    assert_eq!(space.read_u64(GuestAddr(AT)).unwrap(), 2);
+    thread.join().unwrap();
 }
 
 #[test]

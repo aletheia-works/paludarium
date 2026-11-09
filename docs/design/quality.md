@@ -122,6 +122,21 @@ each run for 600 seconds with AddressSanitizer and LeakSanitizer, every night.
 Fuzzing for a fixed time does not prove that every input is safe, but it keeps
 checking that no guest input makes the emulator panic.
 
+## Memory order
+
+Litmus tests (`crates/paludarium-cpu/tests/litmus.rs`) run small programs of
+`MOV`, `MFENCE`, `XCHG` and `LOCK OR` on two to four guest threads that share
+memory, for many rounds, and fail on any outcome x86 forbids: MP, LB, SB with
+each kind of fence, 2+2W, S and IRIW. They run on every host in CI, the Arm
+one (macOS) included, where the emulator itself has to keep x86's order.
+
+They are meant for an order the emulator breaks in its own logic, such as a
+store it holds back or a value it keeps too long. A missing host fence they
+mostly do not catch: an emulated instruction takes long enough that a
+host's store has become visible before the next one runs, and on the Arm
+machines tried, removing the fence of `MFENCE` or of a locked instruction left
+every test passing.
+
 ## Coverage and static checks
 
 - Line coverage must stay at 80 % or more. The measurement before the first

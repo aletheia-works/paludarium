@@ -127,8 +127,10 @@ mod linux {
             // set-id-writes, socket-owners, capabilities and script-exec cases
             // change IDs as root, pty-vhangup needs root's capabilities and
             // pid-namespace makes a PID namespace, so Linux runs them as root,
-            // through sudo when the tests do not run as root; so does the
-            // unshare case, whose checks depend on CAP_SYS_ADMIN.
+            // through sudo when the tests do not run as root; so do the
+            // unshare case, whose checks depend on CAP_SYS_ADMIN, the
+            // scheduling-set case, which sets real-time and deadline policies,
+            // and the personality-layout case, which maps page 0.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -147,6 +149,8 @@ mod linux {
                     | "pty-vhangup"
                     | "pid-namespace"
                     | "unshare"
+                    | "scheduling-set"
+                    | "personality-layout"
             );
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
@@ -246,6 +250,8 @@ mod linux {
         processes_personality => ("personality","process"),
         processes_membarrier => ("membarrier","process"),
         processes_unshare => ("unshare","process"),
+        processes_scheduling_set => ("scheduling-set","process"),
+        processes_personality_layout => ("personality-layout","process"),
         processes_landlock => ("landlock","process"),
         processes_mempolicy => ("mempolicy","process"),
         processes_ids => ("ids","process"),

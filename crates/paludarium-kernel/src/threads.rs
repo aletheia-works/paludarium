@@ -25,6 +25,9 @@ pub struct ThreadGroup {
     /// stays after it exits, as its zombie task does, until the process is
     /// reaped.
     nice: Mutex<BTreeMap<u32, i32>>,
+    /// Each thread's scheduling attributes and I/O priority, kept as its
+    /// nice value is; one without has the defaults.
+    sched: Mutex<BTreeMap<u32, crate::scheduling::Sched>>,
     /// The CPU mask `sched_setaffinity` gave each thread, which Linux keeps
     /// per thread; one without lets every CPU run it.
     affinity: Mutex<BTreeMap<u32, Vec<u64>>>,
@@ -90,6 +93,7 @@ impl Default for ThreadGroup {
             stopped: std::sync::atomic::AtomicBool::new(false),
             members: Mutex::new(BTreeMap::new()),
             nice: Mutex::default(),
+            sched: Mutex::default(),
             affinity: Mutex::default(),
             numa: crate::mempolicy::Numa::default(),
             task_ids: Mutex::default(),
@@ -181,6 +185,12 @@ impl ThreadGroup {
         // values, so only the PID's value is kept.
         nice.retain(|&tid, _| tid == pid);
         drop(nice);
+        let mut sched = self.sched.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(value) = sched.remove(&old_tid) {
+            sched.insert(pid, value);
+        }
+        sched.retain(|&tid, _| tid == pid);
+        drop(sched);
         // So is the record of the thread that ran it, until it publishes
         // what the new program shows.
         let mut public = self.public.lock().unwrap_or_else(PoisonError::into_inner);
@@ -475,6 +485,31 @@ impl ThreadGroup {
             *nice = value;
         }
     }
+    /// The scheduling attributes of thread `tid`.
+    pub(crate) fn sched(&self, tid: u32) -> crate::scheduling::Sched {
+        self.sched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .copied()
+            .unwrap_or_default()
+    }
+    pub(crate) fn set_sched(&self, tid: u32, value: crate::scheduling::Sched) {
+        self.sched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, value);
+    }
+    /// The bandwidth the group's deadline threads take, but `except`'s.
+    pub(crate) fn deadline_bandwidth(&self, except: Option<u32>) -> u64 {
+        self.sched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|&(&tid, _)| Some(tid) != except)
+            .map(|(_, sched)| sched.bandwidth())
+            .sum()
+    }
     /// The nice values of every thread, for `PRIO_PGRP` and `PRIO_USER`.
     pub(crate) fn nices(&self) -> Vec<(u32, i32)> {
         self.nice
@@ -518,6 +553,10 @@ impl ThreadGroup {
     }
     fn forget_nice(&self, tid: u32) {
         self.nice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tid);
+        self.sched
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
@@ -1019,6 +1058,11 @@ impl Kernel {
         {
             return Err(Errno::EPERM);
         }
+        // sched_fork: a deadline thread's child is EAGAIN.
+        let forked = self
+            .group
+            .sched(parent.tid)
+            .forked(self.group.nice(parent.tid).unwrap_or(0))?;
         let task = self.processes.charge_task()?;
         let tid = self.processes.allocate()?;
         if tid > i32::MAX as u32 {
@@ -1063,9 +1107,13 @@ impl Kernel {
             published: None,
         };
         // A new thread starts with its creator's nice value, set before it
-        // is registered so that no one sees it without one.
-        if let Some(value) = self.group.nice(parent.tid) {
-            self.group.set_nice(tid, value);
+        // is registered so that no one sees it without one, and its
+        // scheduling attributes as sched_fork passes them on.
+        let nice = self.group.nice(parent.tid);
+        let (sched, reset_nice) = forked;
+        self.group.set_sched(tid, sched);
+        if let Some(value) = nice {
+            self.group.set_nice(tid, if reset_nice { 0 } else { value });
         }
         // And its CPU mask, as Linux's `dup_task_struct` copies it.
         if let Some(mask) = self.group.affinity(parent.tid) {

@@ -1100,6 +1100,117 @@ fn exec_setup() -> (Kernel, Thread, AddressSpace) {
 }
 mod exec {
     use super::*;
+    #[test]
+    fn exec_applies_the_layout_flags_of_the_personality() {
+        // ADDR_COMPAT_LAYOUT: mappings go up from TASK_UNMAPPED_BASE.
+        let (mut k, mut t, m) = exec_setup();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 135, [0x20_0000, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        let em = k.take_exec_memory().unwrap();
+        assert_eq!(em.bottom_up(), Some(0x2aaa_aaaa_b000));
+        let first = syscall(&mut k, &mut t, &em, 9, [0, 4096, 3, 0x22, u64::MAX, 0]);
+        let second = syscall(&mut k, &mut t, &em, 9, [0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert_eq!((first, second), (0x2aaa_aaaa_b000, 0x2aaa_aaaa_c000));
+        // The flag stays for the next exec; without it, top-down again.
+        assert_eq!(
+            syscall(&mut k, &mut t, &em, 135, [0, 0, 0, 0, 0, 0]),
+            0x20_0000
+        );
+        em.map_shared(
+            Some(GuestAddr(DATA)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        em.write(GuestAddr(DATA), b"/child\0").unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &em, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(k.take_exec_memory().unwrap().bottom_up(), None);
+        // MMAP_PAGE_ZERO: page 0, read and execute, for root.
+        let (mut k, mut t, m) = exec_setup();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 135, [0x10_0000, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        let em = k.take_exec_memory().unwrap();
+        let zero = em.mappings().find(|mapping| mapping.start.0 == 0).unwrap();
+        assert_eq!(
+            (zero.length, zero.prot),
+            (4096, Prot::READ.union(Prot::EXEC))
+        );
+        // A user without CAP_SYS_RAWIO gets none.
+        let (mut k, mut t, m) = exec_setup();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 135, [0x10_0000, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        let em = k.take_exec_memory().unwrap();
+        assert!(em.mappings().all(|mapping| mapping.start.0 != 0));
+    }
+    #[test]
+    fn scheduling_attributes_pass_to_children_as_sched_fork_has_them() {
+        let (mut k, mut t, m) = setup();
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        let attributes = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace| {
+            let policy = syscall(k, t, m, 145, [0; 6]);
+            assert_eq!(syscall(k, t, m, 143, [0, DATA, 0, 0, 0, 0]), 0);
+            (
+                policy,
+                m.read_value(GuestAddr(DATA), 4).unwrap(),
+                syscall(k, t, m, 140, [0; 6]),
+            )
+        };
+        // SCHED_FIFO 5 and nice -5 pass on.
+        m.write(GuestAddr(DATA + 0x80), &5u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 141, [0, 0, (-5i64) as u64, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 144, [0, 1, DATA + 0x80, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 251, [1, 0, 3 << 13, 0, 0, 0]),
+            0
+        );
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(attributes(&mut c, &mut ct, &cm), (1, 5, 25));
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 252, [1, 0, 0, 0, 0, 0]),
+            3 << 13
+        );
+        // With SCHED_RESET_ON_FORK the child is a normal task with nice 0,
+        // and the flag is gone.
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                144,
+                [0, 0x4000_0001, DATA + 0x80, 0, 0, 0]
+            ),
+            0
+        );
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(attributes(&mut c, &mut ct, &cm), (0, 0, 20));
+        assert_eq!(attributes(&mut k, &mut t, &m), (0x4000_0001, 5, 25));
+        // A priority of the class none does not pass on.
+        assert_eq!(syscall(&mut k, &mut t, &m, 251, [1, 0, 0, 0, 0, 0]), 0);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 252, [1, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 252, [1, 0, 0, 0, 0, 0]), 0);
+    }
     /// `load_script`'s view of a first line.
     fn parsed(line: &[u8]) -> Result<Option<crate::processes::Script>, Errno> {
         let mut head = [0; 256];

@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_getscheduler`／`sched_getparam`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_get`、`personality`、`unshare`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
 | システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
@@ -514,36 +514,66 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どちらも、root と同じくほかのプロセスのスレッドも見つけ、その ID の生きているスレッドが
   なければ `ESRCH` です。`getcpu` は、スレッドのマスクが許すいちばん小さい番号の CPU と、
   NUMA ノード 0 を返します。
-- `sched_setscheduler`、`sched_setparam`、`sched_setattr` はないので、どのスレッドも
-  `SCHED_OTHER` で動きます。`sched_getscheduler` は 0 を、`sched_getparam` は優先度 0 を
-  返します。どのプロセスのスレッドでも見つけ、その ID のスレッドがなければ `ESRCH`、負の
-  ID なら `EINVAL` です（Linux と同じく、先に確かめる NULL の引数も `EINVAL`）。
-  `sched_get_priority_max` と `sched_get_priority_min` は、Linux と同じく `SCHED_FIFO` と
-  `SCHED_RR` で 99 と 1、ほかのポリシーで 0 です。`sched_rr_get_interval` は、Linux の
-  ホストではホストのスケジューラーがそのスレッドに与えるタイムスライスを返します。
-  ゲストのスレッドはホストのスレッドで動くからです。ほかのホストでは Linux 6.12 の
-  1000 Hz での既定値、つまり 0.75 ms に 1 + log2(CPU の数、最大 8) を掛けた値を
-  ミリ秒単位に切り捨てたものです。`ioprio_get` は `getpriority` と同じようにスレッドを
-  見つけます（`IOPRIO_WHO_PROCESS`、`IOPRIO_WHO_PGRP`、`IOPRIO_WHO_USER`）。どの
-  スレッドも優先度を設定できない（`ioprio_set` は `ENOSYS`）ので、どれも優先度を
-  持たず（0、`IOPRIO_CLASS_NONE`）、スレッドが 1 つならそれを返します。複数なら、Linux の
-  `ioprio_best` がそれぞれを `IOPRIO_CLASS_BE` のレベル 4 とみなすので、その値（16388）を
-  返します。
+- Linux と同じく、スレッドごとにスケジューリングの属性があります。ポリシー
+  （`SCHED_OTHER`、`SCHED_BATCH`、`SCHED_IDLE`、`SCHED_EXT`、`SCHED_FIFO`、`SCHED_RR`、
+  `SCHED_DEADLINE`）、リアルタイムの優先度、`SCHED_RESET_ON_FORK`、デッドライン
+  タスクのランタイム・デッドライン・周期、通常のポリシーのスライス、使用率のクランプ
+  です。`sched_setscheduler`、`sched_setparam`、`sched_setattr` は、Linux と同じ確認を
+  同じ順に行って設定します。引数、ポリシーと優先度、デッドラインの値、それから権限です。
+  `CAP_SYS_NICE` がなければ、リアルタイムのポリシーには `RLIMIT_RTPRIO` が、nice 値を
+  下げるには `RLIMIT_NICE` が要り、ユーザーは `SCHED_DEADLINE` を取れず、`SCHED_IDLE`
+  からも戻れず、リセットのフラグも外せません。`sched_setattr` は Linux と同じように
+  `struct sched_attr` を読み（大きさを書き戻して `E2BIG`）、`SCHED_FLAG_KEEP_POLICY` と
+  `SCHED_FLAG_KEEP_PARAMS` ではポリシーや値を保ち、デッドラインのタスクを Linux 6.12 と
+  同じく受け入れます。マスクがすべての CPU を含むこと（でなければ `EPERM`）、各 CPU の
+  95% から fair server の 5% を引いた範囲に収まること（でなければ `EBUSY`）です。
+  `sched_getscheduler`、`sched_getparam`、`sched_getattr` は、どのプロセスのスレッドでも
+  それを返します。`sched_getattr` は、通常のポリシーなら nice 値と、スライスを
+  `sched_runtime` として返します。構造体より大きいバッファーの残りは、Linux 6.13
+  以降と同じく 0 で埋めます。新しいスレッドとプロセスは Linux の `sched_fork` と
+  同じくそれを継ぎます。リセットのフラグがあれば、リアルタイムやデッドラインのタスクの
+  子は通常のタスクになり、nice 値は 0、フラグはなくなります。デッドラインのタスクは
+  fork できません（`EAGAIN`）。`sched_setaffinity` は、デッドラインのスレッドには
+  すべての CPU を残させます（`EBUSY`）。ホストはどのゲストのスレッドも通常のスレッドと
+  して動かします。`sched_get_priority_max` と `sched_get_priority_min` は、Linux と同じく
+  `SCHED_FIFO` と `SCHED_RR` で 99 と 1、ほかのポリシーで 0 です。
+  `sched_rr_get_interval` は、`SCHED_RR` なら 100 ms、`SCHED_FIFO` と `SCHED_DEADLINE` なら
+  0、それ以外ならスレッドのスライスをティック単位に切り捨てて返します。スライスは、
+  `sched_setattr` で求めたもの（0.1 ms から 100 ms）か、Linux のホストではホストの
+  スケジューラーがそのスレッドに与えるものです。ゲストのスレッドはホストのスレッドで
+  動くからです。ほかのホストでは Linux 6.12 の 1000 Hz での既定値、つまり 0.75 ms に
+  1 + log2(CPU の数、最大 8) を掛けた値です。
+- `ioprio_set` と `ioprio_get` は、`getpriority` と同じようにスレッドを見つけます
+  （`IOPRIO_WHO_PROCESS`、`IOPRIO_WHO_PGRP`、`IOPRIO_WHO_USER`）。`ioprio_set` は、まず
+  Linux の `ioprio_check_cap` と同じく優先度を確かめ（知られたクラスであること、
+  リアルタイムは `CAP_SYS_NICE` か `CAP_SYS_ADMIN` があること）、実ユーザー ID が呼んだ
+  側の実または実効ユーザー ID であるスレッドにそれを与えます（`CAP_SYS_NICE` が
+  なければ、ほかは `EPERM`）。`ioprio_get` は、スレッドに与えた優先度を返し、一度も
+  持たなかったスレッドやクラスなしを与えたスレッドには、nice 値にかかわらず 0 を返します。複数の
+  スレッドなら、Linux の `ioprio_best` と同じように比べていちばんよいものです（クラスの
+  ないものはベストエフォートのレベル 4 とみなします）。クラスのある優先度は、新しい
+  スレッドとプロセスに渡ります。
 - `personality` は、Linux と同じくどんな値でもスレッドに持ち、前の値を返します
   （`0xffffffff` は問い合わせだけです）。新しいスレッドとプロセスはそれを継ぎ、
   `execve` は `READ_IMPLIES_EXEC` を、set-ID のプログラムなら `PER_CLEAR_ON_SETID` も
   落として保ちます。Linux と同じく、3 つの設定はゲストに見えるものを変えます。
   `PER_LINUX32` なら `uname` は `i686` と、`UNAME26` なら 2.6 のリリース（`2.6.72`）と
   答え、`READ_IMPLIES_EXEC` なら `mmap` と `mprotect` は読めるマッピングを実行もできる
-  ようにします。ほかのフラグ（`ADDR_NO_RANDOMIZE`、`ADDR_COMPAT_LAYOUT`、
-  `MMAP_PAGE_ZERO` など）は持つだけです。配置は変わらず、もともとランダムにもしません。
+  ようにします。Linux の `load_elf_binary` と同じく、さらに 2 つは次の `execve` で
+  効きます。`ADDR_COMPAT_LAYOUT` なら、アドレスを決めないマッピング（インタープリターも）
+  を、上から下ではなく `TASK_UNMAPPED_BASE`（アドレス空間の 3 分の 1）から上に置きます。
+  `MMAP_PAGE_ZERO` なら、新しい資格情報に `CAP_SYS_RAWIO` があればページ 0 を読み取りと
+  実行のできるようにマップします。`ADDR_NO_RANDOMIZE` は持つだけです。もともと何も
+  ランダムにしないからです。x86-64 の Linux でも何もしないフラグ（`ADDR_LIMIT_32BIT`、
+  `SHORT_INODE`、`WHOLE_SECONDS`、`STICKY_TIMEOUTS` など）も持つだけです。
 - `membarrier` は、`CONFIG_RSEQ` があって `nohz_full` の CPU がない x86-64 の Linux の
   コマンドを持ちます（`MEMBARRIER_CMD_QUERY` は `0x3ff`）。プライベートのコマンドは、
   アドレス空間がそれに登録するまで `EPERM` です。fork は登録を保ち、exec のあとは登録がなく、
   `MEMBARRIER_CMD_GET_REGISTRATIONS` は Linux と同じビットで登録を答えます（`SYNC_CORE`
-  に登録すると、空間はプライベートとしても印が付きます）。バリアはホストのフェンス
-  です。ゲストのメモリーへのアクセスはどれもアドレス空間のロックを取るので、各スレッドで
-  バリアを実行したのと同じく、ほかのスレッドのアクセスとの順序がすでに決まっています。
+  に登録すると、空間はプライベートとしても印が付きます）。バリアは、Linux の割り込みと
+  同じく、アドレス空間のすべてのスレッドにかかります。ほとんどのアクセスはロックを取らない
+  ので、空間のロックを取り、スレッドの TLB のエポックを進めます。これで途中の書き込みを
+  待ち、各スレッドの次のアクセスをロックへ回します。
 - `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
   `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
   `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
@@ -1370,7 +1400,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
 - **probe**：スレッドとファイルシステムの機能を 8 項目で確かめる Rust のプログラム
   （tokio のタイマー、UNIX のソケットの組、rayon の並列処理、Mutex と Condvar、
   ファイル操作、ハードリンク、シンボリックリンク、`flock`）。
-- **aube**：Rust で書かれた Node.js のパッケージマネージャ（v2.8.5）。`--version`、
+- **aube**：Rust で書かれた Node.js のパッケージマネージャ（v2.9.0）。`--version`、
   `install`、`install --frozen-lockfile`、`list` の 4 つの操作が、本物の Linux と
   同じ出力と終了コードになります。
 - **ripgrep**：Rust で書かれたテキストの検索のツール（15.2.0）。検索を複数のスレッドで

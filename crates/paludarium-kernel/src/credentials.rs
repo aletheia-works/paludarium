@@ -15,6 +15,7 @@ const CAP_KILL: u64 = 1 << 5;
 const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
 const CAP_SETPCAP: u64 = 1 << 8;
+const CAP_SYS_RAWIO: u64 = 1 << 17;
 const CAP_SYS_ADMIN: u64 = 1 << 21;
 const CAP_SYS_NICE: u64 = 1 << 23;
 const CAP_SYS_RESOURCE: u64 = 1 << 24;
@@ -182,6 +183,11 @@ impl Credentials {
     /// CAP_SYS_TTY_CONFIG, which `vhangup` asks for.
     pub(crate) fn may_configure_terminals(&self) -> bool {
         self.effective & CAP_SYS_TTY_CONFIG != 0
+    }
+    /// CAP_SYS_RAWIO, which a mapping below `mmap_min_addr` needs (Linux's
+    /// `cap_mmap_addr`).
+    pub(crate) fn may_map_low(&self) -> bool {
+        self.effective & CAP_SYS_RAWIO != 0
     }
     /// CAP_SYS_ADMIN, which `trusted.*` and `security.*` attributes ask for.
     pub(crate) fn may_administer(&self) -> bool {

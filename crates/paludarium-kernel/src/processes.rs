@@ -1,6 +1,7 @@
 //! Emulated process registry; no lock spans Host waits or guest execution.
 use crate::credentials::TaskIds;
 use crate::fasync::{FileOwner, OwnerKind, Reason};
+use crate::scheduling;
 use crate::{Kernel, Next, SignalInbox, Thread, ThreadGroup, ThreadState, signals};
 use paludarium_cpu::{CpuState, reg};
 use paludarium_host::{ClockId, FileHandle, WaitToken};
@@ -102,14 +103,18 @@ const DEFAULT_LIMITS: [(u64, u64); RLIMITS] = [
     (INFINITY, INFINITY), // RTTIME
 ];
 const RLIMIT_NICE: usize = 13;
+const RLIMIT_RTPRIO: usize = 14;
+/// Linux's TASK_UNMAPPED_BASE on x86-64: a third of TASK_SIZE, page-aligned.
+const TASK_UNMAPPED_BASE: u64 = (((1 << 47) - 4096) / 3 + 4095) & !4095;
 /// A thread `getpriority` or `setpriority` found.
 struct PriorityThread {
     group: Arc<ThreadGroup>,
     tid: u32,
     nice: i32,
     ids: TaskIds,
-    /// The RLIMIT_NICE soft limit of its process.
+    /// The RLIMIT_NICE and RLIMIT_RTPRIO soft limits of its process.
     nice_limit: u64,
+    rtprio_limit: u64,
 }
 /// fs.nr_open: the highest RLIMIT_NOFILE Linux accepts by default.
 const NR_OPEN: u64 = 1 << 20;
@@ -583,6 +588,7 @@ impl Processes {
             nice,
             ids: entry.group.task_ids(pid, tid),
             nice_limit: entry.limits[RLIMIT_NICE].0,
+            rtprio_limit: entry.limits[RLIMIT_RTPRIO].0,
         };
         let all = |(&pid, entry): (&u32, &Entry)| {
             entry
@@ -1097,6 +1103,19 @@ impl Processes {
     }
     /// The thread group of the live thread named by its ID, in any process,
     /// as `find_task_by_vpid` finds it.
+    /// The bandwidth every live deadline thread takes, but thread `tid` of
+    /// `group`.
+    fn deadline_bandwidth(&self, group: &Arc<ThreadGroup>, tid: u32) -> u64 {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .values()
+            .filter(|entry| entry.status.is_none())
+            .map(|entry| {
+                let except = Arc::ptr_eq(&entry.group, group).then_some(tid);
+                entry.group.deadline_bandwidth(except)
+            })
+            .sum()
+    }
     pub(crate) fn group_of(&self, named: u32) -> Option<Arc<ThreadGroup>> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries
@@ -1686,6 +1705,14 @@ impl Kernel {
             140 => self.getpriority(thread, a),
             141 => self.setpriority(thread, a),
             252 => self.ioprio_get(thread, a),
+            251 => self.ioprio_set(thread, a),
+            // sched_setparam, sched_setscheduler, sched_setattr
+            142 => self.sched_setscheduler(thread, mem, a[0], None, a[1]),
+            144 => match a[1] as i32 {
+                policy if policy < 0 => Err(Errno::EINVAL),
+                policy => self.sched_setscheduler(thread, mem, a[0], Some(policy as u32), a[2]),
+            },
+            314 => self.sched_setattr(thread, mem, a),
             272 => self.unshare(thread, mem, a[0]),
             // prlimit64, getrlimit, setrlimit
             302 => self.prlimit(thread, mem, a[0], a[1], a[2], a[3]),
@@ -1778,13 +1805,12 @@ impl Kernel {
             .ok_or(Errno(3))
     }
     /// `ioprio_get(which, who)`: the I/O priority of a thread
-    /// (`IOPRIO_WHO_PROCESS`), the best of a process group's threads
+    /// (`IOPRIO_WHO_PROCESS`), or the best of a process group's threads
     /// (`IOPRIO_WHO_PGRP`) or of a user's (`IOPRIO_WHO_USER`), found as
-    /// `getpriority` finds them. No thread has an I/O context, as
-    /// `ioprio_set` is not offered, so each has no priority (0, class
-    /// `IOPRIO_CLASS_NONE`): the answer for one thread. Linux compares
-    /// several with `ioprio_best`, which counts a thread without one as
-    /// `IOPRIO_CLASS_BE` level 4 (16388). None found is `ESRCH`.
+    /// `getpriority` finds them, as Linux's `ioprio_best` compares them. A
+    /// thread reports the priority it was given, or 0
+    /// ([`scheduling::reported_ioprio`]).
+    /// None found is `ESRCH`.
     fn ioprio_get(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
         let which = match a[0] as i32 {
             which @ 1..=3 => which - 1,
@@ -1797,12 +1823,223 @@ impl Kernel {
             thread.tid,
             thread.state.credentials.uid,
         )?;
-        const BEST_EFFORT_NORMAL: u64 = 2 << 13 | 4;
-        match threads.len() {
-            0 => Err(Errno(3)),
-            1 => Ok(0),
-            _ => Ok(BEST_EFFORT_NORMAL),
+        threads
+            .iter()
+            .map(|found| scheduling::reported_ioprio(&found.group.sched(found.tid)))
+            .reduce(scheduling::best_ioprio)
+            .map(u64::from)
+            .ok_or(Errno(3))
+    }
+    /// `ioprio_set(which, who, ioprio)`, as Linux's: the priority is checked
+    /// first (`ioprio_check_cap`), then each thread found as `ioprio_get`
+    /// finds them is given it in turn, stopping at the first the caller may
+    /// not change (`EPERM`: its real user ID is not the caller's real or
+    /// effective one, and the caller lacks CAP_SYS_NICE). The priority is
+    /// kept and reported, and a new thread or process keeps one with a class.
+    fn ioprio_set(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
+        let ioprio = a[2] as i32;
+        let caller = thread.state.credentials.task_ids();
+        scheduling::check_ioprio(
+            ioprio,
+            caller.cap_sys_nice || thread.state.credentials.may_administer(),
+        )?;
+        let which = match a[0] as i32 {
+            which @ 1..=3 => which - 1,
+            _ => return Err(Errno::EINVAL),
+        };
+        let threads = self.processes.priority_threads(
+            which,
+            a[1] as i32,
+            self.process.pid,
+            thread.tid,
+            caller.uid,
+        )?;
+        let mut result = Err(Errno(3));
+        for found in threads {
+            if found.ids.uid != caller.euid && found.ids.uid != caller.uid && !caller.cap_sys_nice {
+                return Err(Errno::EPERM);
+            }
+            let mut sched = found.group.sched(found.tid);
+            sched.io = Some(ioprio as u16);
+            found.group.set_sched(found.tid, sched);
+            result = Ok(0);
         }
+        result
+    }
+    /// The thread `pid` names for the `sched_set*` calls: 0 is the caller.
+    fn sched_thread(&self, thread: &Thread, pid: i32) -> Result<PriorityThread, Errno> {
+        self.processes
+            .priority_threads(
+                0,
+                pid,
+                self.process.pid,
+                thread.tid,
+                thread.state.credentials.uid,
+            )?
+            .into_iter()
+            .next()
+            .ok_or(Errno(3))
+    }
+    /// `sched_setscheduler(pid, policy, param)` and, with no policy,
+    /// `sched_setparam(pid, param)`, as Linux's `do_sched_setscheduler`: a
+    /// NULL `param` or a negative `pid` is `EINVAL`, then the parameter is
+    /// read (`EFAULT`) and the thread found (`ESRCH`). `SCHED_RESET_ON_FORK`
+    /// in the policy is the flag; the nice value stays.
+    fn sched_setscheduler(
+        &self,
+        thread: &Thread,
+        mem: &AddressSpace,
+        pid: u64,
+        policy: Option<u32>,
+        param: u64,
+    ) -> Result<u64, Errno> {
+        let pid = pid as u32 as i32;
+        if param == 0 || pid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut priority = [0u8; 4];
+        mem.read(GuestAddr(param), &mut priority)
+            .map_err(|_| Errno::EFAULT)?;
+        let target = self.sched_thread(thread, pid)?;
+        let mut attr = scheduling::Attr {
+            policy,
+            priority: u32::from_le_bytes(priority),
+            nice: target.nice,
+            ..scheduling::Attr::default()
+        };
+        if let Some(policy) = policy
+            && policy & scheduling::SCHED_RESET_ON_FORK != 0
+        {
+            attr.flags |= scheduling::FLAG_RESET_ON_FORK;
+            attr.policy = Some(policy & !scheduling::SCHED_RESET_ON_FORK);
+        }
+        self.apply_sched(thread, &target, &attr)
+    }
+    /// `sched_setattr(pid, attr, flags)`, as Linux's: `EINVAL` for a NULL
+    /// `attr`, a negative `pid` or any flag; `struct sched_attr` read as
+    /// `sched_copy_attr` reads it (a size of 0 is 48; one below 48, above a
+    /// page or with nonzero bytes past the 56 known is `E2BIG`, with 56
+    /// written as the size; the clamps need all 56 bytes); a negative policy
+    /// is `EINVAL`; `SCHED_FLAG_KEEP_POLICY` and `SCHED_FLAG_KEEP_PARAMS`
+    /// keep the thread's.
+    fn sched_setattr(
+        &self,
+        thread: &Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
+        let (pid, address, flags) = (a[0] as u32 as i32, a[1], a[2] as u32);
+        if address == 0 || pid < 0 || flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut word = [0u8; 4];
+        mem.read(GuestAddr(address), &mut word)
+            .map_err(|_| Errno::EFAULT)?;
+        let size = match u32::from_le_bytes(word) {
+            0 => 48,
+            size => size,
+        };
+        let too_big = || {
+            let _ = mem.write(GuestAddr(address), &56u32.to_le_bytes());
+            Err(Errno(7)) // E2BIG
+        };
+        if !(48..=4096).contains(&size) {
+            return too_big();
+        }
+        let mut bytes = vec![0u8; size as usize];
+        mem.read(GuestAddr(address), &mut bytes)
+            .map_err(|_| Errno::EFAULT)?;
+        if bytes.iter().skip(56).any(|&b| b != 0) {
+            return too_big();
+        }
+        bytes.resize(56, 0);
+        let u32_at =
+            |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap_or_default());
+        let u64_at =
+            |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or_default());
+        let sched_flags = u64_at(8);
+        if sched_flags & (scheduling::FLAG_UTIL_CLAMP_MIN | scheduling::FLAG_UTIL_CLAMP_MAX) != 0
+            && size < 56
+        {
+            return Err(Errno::EINVAL);
+        }
+        let policy = u32_at(4);
+        if (policy as i32) < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut attr = scheduling::Attr {
+            policy: (sched_flags & scheduling::FLAG_KEEP_POLICY == 0).then_some(policy),
+            flags: sched_flags,
+            nice: (u32_at(16) as i32).clamp(-20, 19),
+            priority: u32_at(20),
+            runtime: u64_at(24),
+            deadline: u64_at(32),
+            period: u64_at(40),
+            util_min: u32_at(48),
+            util_max: u32_at(52),
+        };
+        let target = self.sched_thread(thread, pid)?;
+        if sched_flags & scheduling::FLAG_KEEP_PARAMS != 0 {
+            // get_params.
+            let current = target.group.sched(target.tid);
+            if current.deadline_policy() {
+                attr.priority = current.priority;
+                attr.runtime = current.runtime;
+                attr.deadline = current.deadline;
+                attr.period = current.period;
+                attr.flags = attr.flags & !0x1000_0006 | current.dl_flags;
+            } else if scheduling::rt_policy(current.policy) {
+                attr.priority = current.priority;
+            } else {
+                attr.nice = target.nice;
+                attr.runtime = current
+                    .slice
+                    .unwrap_or_else(|| crate::syscalls::scheduler_slice(&*self.host).slice);
+            }
+        }
+        self.apply_sched(thread, &target, &attr)
+    }
+    /// Decides and makes a change of scheduling attributes
+    /// ([`scheduling::set`]), with the deadline capacity of Linux 6.12: 95%
+    /// of each CPU (`sched_rt_runtime_us`), less the 5% its fair server
+    /// takes.
+    fn apply_sched(
+        &self,
+        thread: &Thread,
+        target: &PriorityThread,
+        attr: &scheduling::Attr,
+    ) -> Result<u64, Errno> {
+        let caller = thread.state.credentials.task_ids();
+        let cpus = self.host.cpu_count().clamp(1, 8192);
+        let every_cpu = target.group.affinity(target.tid).is_none_or(|mask| {
+            (0..cpus).all(|cpu| {
+                mask.get(cpu / 64)
+                    .is_some_and(|word| word >> (cpu % 64) & 1 != 0)
+            })
+        });
+        let decided = scheduling::Target {
+            sched: target.group.sched(target.tid),
+            nice: target.nice,
+            nice_limit: target.nice_limit,
+            rtprio_limit: target.rtprio_limit,
+            same_owner: caller.euid == target.ids.euid || caller.euid == target.ids.uid,
+            every_cpu,
+            base_slice: crate::syscalls::scheduler_slice(&*self.host).slice,
+        };
+        let per_cpu = scheduling::ratio(1_000_000_000, 950_000_000)
+            - scheduling::ratio(1_000_000_000, 50_000_000);
+        let change = scheduling::set(
+            &decided,
+            attr,
+            caller.cap_sys_nice,
+            self.processes.deadline_bandwidth(&target.group, target.tid),
+            per_cpu * cpus as u64,
+        )?;
+        target.group.set_sched(target.tid, change.sched);
+        if let Some(nice) = change.nice {
+            target.group.update_nice(target.tid, nice);
+        }
+        Ok(0)
     }
     /// `unshare(flags)`, as Linux's `ksys_unshare` with its checks in order.
     /// `CLONE_FILES` and `CLONE_FS` give the thread its own descriptor table
@@ -1979,6 +2216,11 @@ impl Kernel {
         {
             return Err(Errno::EPERM);
         }
+        // sched_fork: a deadline task's child is EAGAIN.
+        let (sched, reset_nice) = self
+            .group
+            .sched(parent.tid)
+            .forked(self.group.nice(parent.tid).unwrap_or(0))?;
         let task = self.processes.charge_task()?;
         let child_mem = if flags & 0x100 == 0 {
             Some(Arc::new(mem.fork()))
@@ -1995,8 +2237,9 @@ impl Kernel {
         let inbox = Arc::new(SignalInbox::default());
         group.set_process_inbox(inbox.clone());
         if let Some(value) = self.group.nice(parent.tid) {
-            group.set_nice(pid, value);
+            group.set_nice(pid, if reset_nice { 0 } else { value });
         }
+        group.set_sched(pid, sched);
         if let Some(mask) = self.group.affinity(parent.tid) {
             group.set_affinity(pid, mask);
         }
@@ -2587,6 +2830,18 @@ impl Kernel {
             Some(meter) => AddressSpace::new().with_memory_meter(meter),
             None => AddressSpace::new(),
         };
+        // A 64-bit program drops READ_IMPLIES_EXEC (x86's
+        // set_personality_64bit), and a set-ID one PER_CLEAR_ON_SETID too
+        // (begin_new_exec), before the layout is picked.
+        let mut personality = thread.state.personality & !crate::syscalls::READ_IMPLIES_EXEC;
+        if secure {
+            personality &= !crate::syscalls::PER_CLEAR_ON_SETID;
+        }
+        // ADDR_COMPAT_LAYOUT: Linux's legacy layout, upward from
+        // TASK_UNMAPPED_BASE (a third of TASK_SIZE), not randomized here.
+        if personality & crate::syscalls::ADDR_COMPAT_LAYOUT != 0 {
+            memory.set_bottom_up(Some(GuestAddr(TASK_UNMAPPED_BASE)));
+        }
         // As Linux's `open_exec` of an interpreter: it needs execute
         // permission (EACCES), and an unreadable one makes the program
         // undumpable (`would_dump`). Its set-ID bits do not count.
@@ -2629,6 +2884,17 @@ impl Kernel {
             LoadError::Errno(error) => error,
             _ => Errno(8),
         })?;
+        // MMAP_PAGE_ZERO: SVr4's read-only page 0, as load_elf_binary maps it
+        // last, when the new credentials may map below mmap_min_addr
+        // (CAP_SYS_RAWIO); a failure is ignored, as there.
+        if personality & crate::syscalls::MMAP_PAGE_ZERO != 0 && credentials.may_map_low() {
+            let _ = memory.map_shared(
+                Some(GuestAddr(0)),
+                4096,
+                paludarium_mmu::Prot::READ.union(paludarium_mmu::Prot::EXEC),
+                paludarium_mmu::MappingKind::Anonymous,
+            );
+        }
         // All validation precedes retirement. Old siblings must stop touching
         // their image and shared descriptors before the replacement is visible.
         self.group.begin_exec(thread.tid)?;
@@ -2675,12 +2941,6 @@ impl Kernel {
         // exec keeps the thread's CPU time, as it keeps the process.
         let cpu = std::mem::take(&mut thread.state.cpu);
         let old = std::mem::take(&mut thread.state.credentials);
-        // A 64-bit program drops READ_IMPLIES_EXEC (x86's
-        // set_personality_64bit), and a set-ID one PER_CLEAR_ON_SETID too.
-        let mut personality = thread.state.personality & !crate::syscalls::READ_IMPLIES_EXEC;
-        if secure {
-            personality &= !crate::syscalls::PER_CLEAR_ON_SETID;
-        }
         thread.state = ThreadState {
             pid: self.process.pid,
             signal_mask: thread.state.signal_mask,

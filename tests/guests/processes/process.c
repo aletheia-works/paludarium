@@ -3953,6 +3953,31 @@ static int mincore_cases(void) {
 }
 
 /* The CPU mask a new thread starts with, for the affinity case. */
+/* struct sched_attr. */
+struct attr {
+    uint32_t size, policy;
+    uint64_t flags;
+    int32_t nice;
+    uint32_t priority;
+    uint64_t runtime, deadline, period;
+    uint32_t util_min, util_max;
+};
+/* What the sched_get* calls report for the calling thread. */
+static void sched_show(const char *label) {
+    int param = -1;
+    struct attr a;
+    memset(&a, 0xee, sizeof a);
+    long scheduler = syscall(SYS_sched_getscheduler, 0);
+    syscall(SYS_sched_getparam, 0, &param);
+    struct timespec slice = {-1, -1};
+    syscall(SYS_sched_rr_get_interval, 0, &slice);
+    long r = syscall(SYS_sched_getattr, 0, &a, sizeof a, 0);
+    printf("%s: scheduler=%#lx param=%d interval=%ld.%09ld nice=%d getattr=%ld size=%u policy=%u flags=%#lx "
+           "nice=%d priority=%u runtime=%lu deadline=%lu period=%lu clamps=%u,%u\n",
+           label, scheduler, param, (long)slice.tv_sec, slice.tv_nsec, getpriority(PRIO_PROCESS, 0), r, a.size,
+           a.policy, (unsigned long)a.flags, a.nice, a.priority, (unsigned long)a.runtime,
+           (unsigned long)a.deadline, (unsigned long)a.period, a.util_min, a.util_max);
+}
 static void *membarrier_thread(void *unused) {
     (void)unused;
     printf("thread: registrations=%ld private=%ld\n", syscall(SYS_membarrier, 512, 0, 0),
@@ -4186,6 +4211,263 @@ int main(int argc, char **argv) {
         }
         kill(other, SIGKILL);
         result("reaped", reaped(other));
+        return 0;
+    }
+    if (!strcmp(mode, "scheduling-set")) {
+        /* The policies and attributes sched_setscheduler, sched_setparam and
+           sched_setattr set, and what the sched_get* calls and children see.
+           Linux runs this case as root, as the guest is. */
+        int param = 10;
+        result("fifo", syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &param));
+        sched_show("fifo");
+        param = 5;
+        result("rr-reset", syscall(SYS_sched_setscheduler, 0, SCHED_RR | 0x40000000, &param));
+        sched_show("rr");
+        param = 20;
+        result("setparam", syscall(SYS_sched_setparam, 0, &param));
+        sched_show("setparam");
+        fflush(stdout);
+        pid_t pid = child();
+        if (pid == 0) {
+            sched_show("reset-child");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("reaped", reaped(pid));
+        /* The checks, in order. */
+        struct { long pid, policy; int value; int null; } bad[] = {
+            {0, SCHED_RR, 0, 0}, {0, 4, 0, 0}, {0, SCHED_FIFO, 100, 0}, {0, SCHED_OTHER, 1, 0},
+            {0, SCHED_OTHER, 0, 1}, {-1, SCHED_OTHER, 0, 0}, {0x3fffffff, SCHED_OTHER, 0, 0}, {0, -1, 0, 0},
+        };
+        for (int i = 0; i < 8; i++) {
+            param = bad[i].value;
+            errno = 0;
+            long r = syscall(SYS_sched_setscheduler, bad[i].pid, bad[i].policy, bad[i].null ? NULL : &param);
+            printf("bad %d: %ld errno=%d\n", i, r, errno);
+        }
+        errno = 0;
+        long r = syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, (void *)1);
+        printf("fault: %ld errno=%d\n", r, errno);
+        /* The normal policies, and their nice value and slice. */
+        long policies[] = {SCHED_BATCH, SCHED_IDLE, 7, SCHED_OTHER};
+        for (int i = 0; i < 4; i++) {
+            param = 0;
+            errno = 0;
+            r = syscall(SYS_sched_setscheduler, 0, policies[i], &param);
+            printf("policy %ld: %ld errno=%d\n", policies[i], r, errno);
+            sched_show("normal");
+        }
+        struct attr a = {.size = 48, .policy = SCHED_OTHER, .nice = 5, .runtime = 3000000};
+        result("attr-nice", syscall(SYS_sched_setattr, 0, &a, 0));
+        sched_show("attr-nice");
+        /* A child keeps a custom slice when the reset flag is not set. */
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            sched_show("slice-child");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("reaped", reaped(pid));
+        /* SCHED_EXT takes a nice value and a slice as the fair policies do. */
+        a = (struct attr){.size = 48, .policy = 7, .nice = 3, .runtime = 500000};
+        result("ext-nice", syscall(SYS_sched_setattr, 0, &a, 0));
+        sched_show("ext-nice");
+        a = (struct attr){.size = 48, .policy = SCHED_OTHER, .nice = 5, .runtime = 1};
+        result("attr-short", syscall(SYS_sched_setattr, 0, &a, 0));
+        sched_show("attr-short");
+        a = (struct attr){.size = 48, .flags = 0x08 | 0x10};
+        result("keep", syscall(SYS_sched_setattr, 0, &a, 0));
+        sched_show("keep");
+        /* SCHED_DEADLINE: 10 ms every 100 ms, by 30 ms. It may not fork,
+           nor leave a CPU out of its mask. */
+        a = (struct attr){.size = 48, .policy = 6, .runtime = 10000000, .deadline = 30000000, .period = 100000000};
+        result("deadline", syscall(SYS_sched_setattr, 0, &a, 0));
+        sched_show("deadline");
+        errno = 0;
+        result("deadline-fork", syscall(SYS_fork));
+        result("errno", errno);
+        unsigned long one[16] = {1};
+        errno = 0;
+        r = syscall(SYS_sched_setaffinity, 0, sizeof one, one);
+        printf("deadline-affinity: one-cpu=%d %ld errno=%d\n", sysconf(_SC_NPROCESSORS_ONLN) == 1, r, errno);
+        struct attr deadlines[] = {
+            {.size = 48, .policy = 6, .runtime = 40000000, .deadline = 30000000, .period = 100000000},
+            {.size = 48, .policy = 6, .runtime = 10000000, .deadline = 30000000, .period = 50000},
+            {.size = 48, .policy = 6, .runtime = 1000, .deadline = 30000000},
+            {.size = 48, .policy = 6, .runtime = 10000000, .deadline = 0},
+        };
+        for (int i = 0; i < 4; i++) {
+            errno = 0;
+            r = syscall(SYS_sched_setattr, 0, &deadlines[i], 0);
+            printf("bad deadline %d: %ld errno=%d\n", i, r, errno);
+        }
+        a = (struct attr){.size = 48, .policy = SCHED_OTHER};
+        result("normal-again", syscall(SYS_sched_setattr, 0, &a, 0));
+        /* Sizes and flags. */
+        unsigned char big[64] = {0};
+        struct attr *b = (struct attr *)big;
+        b->size = 64;
+        result("size-64", syscall(SYS_sched_setattr, 0, big, 0));
+        big[60] = 1;
+        errno = 0;
+        r = syscall(SYS_sched_setattr, 0, big, 0);
+        printf("size-64-dirty: %ld errno=%d size=%u\n", r, errno, b->size);
+        a = (struct attr){.size = 40};
+        errno = 0;
+        r = syscall(SYS_sched_setattr, 0, &a, 0);
+        printf("size-40: %ld errno=%d size=%u\n", r, errno, a.size);
+        a = (struct attr){.size = 0};
+        result("size-0", syscall(SYS_sched_setattr, 0, &a, 0));
+        long setattr_bad[][3] = {{0, 0, 0}, {0, 1, 1}, {-1, 1, 0}, {0x3fffffff, 1, 0}};
+        a = (struct attr){.size = 48};
+        for (int i = 0; i < 4; i++) {
+            errno = 0;
+            r = syscall(SYS_sched_setattr, setattr_bad[i][0], setattr_bad[i][1] ? &a : NULL, setattr_bad[i][2]);
+            printf("setattr bad %d: %ld errno=%d\n", i, r, errno);
+        }
+        a = (struct attr){.size = 48, .flags = 0x80};
+        errno = 0;
+        r = syscall(SYS_sched_setattr, 0, &a, 0);
+        printf("unknown-flag: %ld errno=%d\n", r, errno);
+        a = (struct attr){.size = 48, .policy = 0x80000000};
+        errno = 0;
+        r = syscall(SYS_sched_setattr, 0, &a, 0);
+        printf("negative-policy: %ld errno=%d\n", r, errno);
+        /* The utilization clamps. */
+        long clamps[][2] = {{100, 200}, {-1, 200}, {300, 200}, {2000, 0}, {0, -1}};
+        for (int i = 0; i < 5; i++) {
+            a = (struct attr){.size = 56, .flags = 0x60, .util_min = clamps[i][0], .util_max = clamps[i][1]};
+            errno = 0;
+            r = syscall(SYS_sched_setattr, 0, &a, 0);
+            printf("clamp %d: %ld errno=%d\n", i, r, errno);
+            sched_show("clamp");
+        }
+        a = (struct attr){.size = 48, .flags = 0x20};
+        errno = 0;
+        r = syscall(SYS_sched_setattr, 0, &a, 0);
+        printf("clamp-short: %ld errno=%d\n", r, errno);
+        /* sched_getattr's checks, and a short copy. */
+        long getattr_bad[][4] = {{0, 0, 56, 0}, {0, 1, 47, 0}, {0, 1, 4097, 0}, {0, 1, 56, 1}, {-1, 1, 56, 0}, {0x3fffffff, 1, 56, 0}};
+        for (int i = 0; i < 6; i++) {
+            errno = 0;
+            r = syscall(SYS_sched_getattr, getattr_bad[i][0], getattr_bad[i][1] ? &a : NULL, getattr_bad[i][2], getattr_bad[i][3]);
+            printf("getattr bad %d: %ld errno=%d\n", i, r, errno);
+        }
+        memset(big, 0xee, sizeof big);
+        r = syscall(SYS_sched_getattr, 0, big, 48, 0);
+        printf("getattr-48: %ld size=%u after=%#x\n", r, b->size, big[48]);
+        r = syscall(SYS_sched_getattr, 0, big, 64, 0);
+        printf("getattr-64: %ld size=%u after=%#x\n", r, b->size, big[60]);
+        /* A user: no real-time policy without RLIMIT_RTPRIO, no lower nice
+           value without RLIMIT_NICE, no way back from SCHED_IDLE, and no
+           clearing of SCHED_RESET_ON_FORK. */
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+            param = 1;
+            errno = 0;
+            r = syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &param);
+            printf("user fifo: %ld errno=%d\n", r, errno);
+            a = (struct attr){.size = 48, .nice = -5};
+            errno = 0;
+            r = syscall(SYS_sched_setattr, 0, &a, 0);
+            printf("user nice: %ld errno=%d\n", r, errno);
+            a = (struct attr){.size = 48, .policy = 6, .runtime = 10000000, .deadline = 30000000};
+            errno = 0;
+            r = syscall(SYS_sched_setattr, 0, &a, 0);
+            printf("user deadline: %ld errno=%d\n", r, errno);
+            param = 0;
+            errno = 0;
+            r = syscall(SYS_sched_setscheduler, getppid(), SCHED_BATCH, &param);
+            printf("user other's: %ld errno=%d\n", r, errno);
+            result("user reset", syscall(SYS_sched_setscheduler, 0, SCHED_OTHER | 0x40000000, &param));
+            errno = 0;
+            r = syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &param);
+            printf("user unreset: %ld errno=%d\n", r, errno);
+            result("user idle", syscall(SYS_sched_setscheduler, 0, SCHED_IDLE | 0x40000000, &param));
+            errno = 0;
+            r = syscall(SYS_sched_setscheduler, 0, SCHED_OTHER | 0x40000000, &param);
+            printf("user from idle: %ld errno=%d\n", r, errno);
+            fflush(stdout);
+            _exit(0);
+        }
+        result("user", reaped(pid));
+        /* ioprio_set: the priority is kept and reported, and passes to a
+           child when it has a class. */
+        setpriority(PRIO_PROCESS, 0, 0);
+        long ioprios[] = {2 << 13 | 3, 2 << 13 | 1 << 3 | 3, 0, 1 << 13 | 7, 3 << 13, 4 << 13, 7 << 13, 1, -1};
+        for (int i = 0; i < 9; i++) {
+            errno = 0;
+            r = syscall(SYS_ioprio_set, 1, 0, ioprios[i]);
+            int set_errno = errno;
+            printf("ioprio %#lx: %ld errno=%d now=%#lx\n", ioprios[i], r, set_errno, syscall(SYS_ioprio_get, 1, 0));
+        }
+        setpriority(PRIO_PROCESS, 0, 10);
+        syscall(SYS_ioprio_set, 1, 0, 0);
+        printf("ioprio niced: %#lx\n", syscall(SYS_ioprio_get, 1, 0));
+        setpriority(PRIO_PROCESS, 0, 0);
+        long whos[][2] = {{0, 0}, {1, 0x3fffffff}, {2, 0x3fffffff}, {3, -1}};
+        for (int i = 0; i < 4; i++) {
+            errno = 0;
+            r = syscall(SYS_ioprio_set, whos[i][0], whos[i][1], 2 << 13);
+            printf("ioprio who %d: %ld errno=%d\n", i, r, errno);
+        }
+        syscall(SYS_ioprio_set, 1, 0, 2 << 13 | 2);
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            printf("child ioprio: %#lx\n", syscall(SYS_ioprio_get, 1, 0));
+            if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+            errno = 0;
+            r = syscall(SYS_ioprio_set, 1, 0, 1 << 13);
+            printf("user ioprio rt: %ld errno=%d\n", r, errno);
+            errno = 0;
+            r = syscall(SYS_ioprio_set, 1, getppid(), 2 << 13);
+            printf("user ioprio other's: %ld errno=%d\n", r, errno);
+            result("user ioprio idle", syscall(SYS_ioprio_set, 1, 0, 3 << 13));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("reaped", reaped(pid));
+        syscall(SYS_ioprio_set, 1, 0, 0);
+        pid = child();
+        if (pid == 0) {
+            printf("child of none: %#lx\n", syscall(SYS_ioprio_get, 1, 0));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("reaped", reaped(pid));
+        return 0;
+    }
+    if (!strcmp(mode, "personality-layout") || !strcmp(mode, "layout-exec")) {
+        /* ADDR_COMPAT_LAYOUT and MMAP_PAGE_ZERO, which an exec applies.
+           Linux runs this case as root, whose page 0 it may map (a user's
+           exec maps none, which the kernel's unit tests check). */
+        if (!strcmp(mode, "layout-exec")) {
+            char *first = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            char *second = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            unsigned long persona = syscall(SYS_personality, 0xffffffffUL);
+            printf("exec %#lx: upward=%d legacy-base=%d\n", persona, second > first,
+                   (unsigned long)first >= 0x2aaaaaaab000UL && (unsigned long)first < 0x500000000000UL);
+            maps_show("page-zero", (void *)0, NULL);
+            if (persona & 0x100000) printf("page-zero byte=%d\n", *(volatile char *)0);
+            fflush(stdout);
+            return 0;
+        }
+        unsigned long personas[] = {0, 0x200000, 0x100000, 0x300000};
+        for (int i = 0; i < 4; i++) {
+            fflush(stdout);
+            pid_t pid = child();
+            if (pid == 0) {
+                syscall(SYS_personality, personas[i]);
+                char *arguments[] = {(char *)self, "layout-exec", (char *)self, NULL};
+                execv(self, arguments);
+                _exit(120);
+            }
+            result("reaped", reaped(pid));
+        }
         return 0;
     }
     if (!strcmp(mode, "personality") || !strcmp(mode, "personality-exec")) {

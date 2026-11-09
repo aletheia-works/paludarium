@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_getscheduler`/`sched_getparam`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_get`, `personality`, `unshare`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
 | System information | `uname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
@@ -564,38 +564,71 @@ kernel.
   another process too, as root may, and give `ESRCH` when no live thread
   has the ID. `getcpu` gives the lowest CPU the thread's mask allows, and
   NUMA node 0.
-- Every thread runs under `SCHED_OTHER`, as `sched_setscheduler`,
-  `sched_setparam` and `sched_setattr` are not offered: `sched_getscheduler`
-  gives 0 and `sched_getparam` a priority of 0, for a thread of any process,
-  `ESRCH` when none has the ID and `EINVAL` for a negative one (or a NULL
-  parameter, checked first, as Linux does). `sched_get_priority_max` and
-  `sched_get_priority_min` give Linux's 99 and 1 for `SCHED_FIFO` and
-  `SCHED_RR` and 0 for the other policies. `sched_rr_get_interval` gives the
-  time slice the host's scheduler gives the thread on a Linux host, whose
-  threads run the guest's; elsewhere Linux 6.12's default at 1000 Hz, whole
-  milliseconds of 0.75 ms times 1 + log2 of the CPUs (at most 8).
-  `ioprio_get` finds threads as `getpriority` does (`IOPRIO_WHO_PROCESS`,
-  `IOPRIO_WHO_PGRP`, `IOPRIO_WHO_USER`). No thread can set a priority
-  (`ioprio_set` gives `ENOSYS`), so each has none (0, `IOPRIO_CLASS_NONE`),
-  which a single thread reports; for several, Linux's `ioprio_best` counts
-  each as `IOPRIO_CLASS_BE` level 4, which they report (16388).
+- Each thread has scheduling attributes, as on Linux: a policy
+  (`SCHED_OTHER`, `SCHED_BATCH`, `SCHED_IDLE`, `SCHED_EXT`, `SCHED_FIFO`,
+  `SCHED_RR`, `SCHED_DEADLINE`), a real-time priority, `SCHED_RESET_ON_FORK`,
+  the deadline task's runtime, deadline and period, the normal policy's
+  slice and the utilization clamps. `sched_setscheduler`, `sched_setparam` and
+  `sched_setattr` set them with Linux's checks in its order (the arguments,
+  the policy and priority, the deadline parameters, then the permission:
+  without `CAP_SYS_NICE` a real-time policy needs `RLIMIT_RTPRIO`, a lower nice
+  value `RLIMIT_NICE`, and no user may take `SCHED_DEADLINE`, leave `SCHED_IDLE`
+  or clear the reset flag). `sched_setattr` reads `struct sched_attr` as Linux
+  does (`E2BIG` with the size written back), keeps the policy or parameters
+  for `SCHED_FLAG_KEEP_POLICY` and `SCHED_FLAG_KEEP_PARAMS`, and admits a
+  deadline task as Linux 6.12 does: on every CPU of its mask (`EPERM`), within
+  95% of each CPU less the 5% its fair server takes (`EBUSY`).
+  `sched_getscheduler`, `sched_getparam` and `sched_getattr` report them, for a
+  thread of any process; `sched_getattr` gives a normal policy's nice value
+  and its slice as `sched_runtime`, and fills a buffer larger than the
+  structure with zeros, as Linux 6.13 and later. New threads and processes inherit them, as
+  Linux's `sched_fork` has it: with the reset flag a real-time or deadline
+  task's child is a normal one with nice 0 and no flag, and a deadline task
+  may not fork (`EAGAIN`); `sched_setaffinity` keeps every CPU for a
+  deadline thread (`EBUSY`). The host still runs every guest thread as a
+  normal one. `sched_get_priority_max` and `sched_get_priority_min` give
+  Linux's 99 and 1 for `SCHED_FIFO` and `SCHED_RR` and 0 for the other
+  policies. `sched_rr_get_interval` gives 100 ms under `SCHED_RR`, 0 under
+  `SCHED_FIFO` and `SCHED_DEADLINE`, and otherwise the thread's slice in whole
+  ticks: the slice `sched_setattr` asked for (0.1 ms to 100 ms), or the one
+  the host's scheduler gives its threads on a Linux host, whose threads run
+  the guest's; elsewhere Linux 6.12's default at 1000 Hz, 0.75 ms times 1 +
+  log2 of the CPUs (at most 8).
+- `ioprio_set` and `ioprio_get` find threads as `getpriority` does
+  (`IOPRIO_WHO_PROCESS`, `IOPRIO_WHO_PGRP`, `IOPRIO_WHO_USER`). `ioprio_set`
+  checks the priority first, as Linux's `ioprio_check_cap` (a known class, a
+  real-time one only with `CAP_SYS_NICE` or `CAP_SYS_ADMIN`), then gives it to
+  each thread whose real user ID is the caller's real or effective one
+  (`EPERM` otherwise, without `CAP_SYS_NICE`). `ioprio_get` reports the
+  priority a thread was given, and 0 for one that never had one or was given
+  the class none, whatever its nice value; for several threads, the best as Linux's
+  `ioprio_best` compares them (one without a class counts as best-effort
+  level 4). A priority with a class passes to new threads and processes.
 - `personality` keeps any value for the thread, as Linux stores it, and
   returns the old one (`0xffffffff` only asks). New threads and processes
   inherit it, and `execve` keeps it but for `READ_IMPLIES_EXEC`, and
   `PER_CLEAR_ON_SETID` for a set-ID program. Three settings change what the
   guest sees, as on Linux: `PER_LINUX32` makes `uname` report `i686`,
   `UNAME26` a 2.6 release (`2.6.72`), and `READ_IMPLIES_EXEC` makes what
-  `mmap` and `mprotect` map readable executable too. The others
-  (`ADDR_NO_RANDOMIZE`, `ADDR_COMPAT_LAYOUT`, `MMAP_PAGE_ZERO`, ...) are only
-  kept: the layout does not change, and is not randomized to begin with.
+  `mmap` and `mprotect` map readable executable too. Two more take effect at
+  the next `execve`, as Linux's `load_elf_binary` applies them:
+  `ADDR_COMPAT_LAYOUT` places mappings without a fixed address, the
+  interpreter's too, upward from `TASK_UNMAPPED_BASE` (a third of the address
+  space) instead of down from the top, and `MMAP_PAGE_ZERO` maps page 0
+  readable and executable when the new credentials have `CAP_SYS_RAWIO`.
+  `ADDR_NO_RANDOMIZE` is kept only, as nothing is randomized to begin with,
+  and so are the flags that do nothing on x86-64 Linux either
+  (`ADDR_LIMIT_32BIT`, `SHORT_INODE`, `WHOLE_SECONDS`, `STICKY_TIMEOUTS`,
+  ...).
 - `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
   `nohz_full` CPU (`MEMBARRIER_CMD_QUERY` gives `0x3ff`). The private
   commands give `EPERM` until the address space registers for them, a fork
   keeps the registrations and an exec starts with none, and `MEMBARRIER_CMD_GET_REGISTRATIONS`
   reports them with Linux's bits (registering `SYNC_CORE` marks the space
-  private too). A barrier is a fence on the host: every guest memory access
-  already takes its address space's lock, which orders it with the other
-  threads' as a barrier on each of them would.
+  private too). A barrier is one on every thread of the address space, as
+  Linux's interrupts give: most accesses take no lock, so it takes the
+  space's locks and moves the epoch of the threads' TLBs on, which waits for
+  each store under way and sends each thread's next access to the locks.
 - `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
   with `CLONE_FS` its own working directory and umask, as Linux. With
   `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is
@@ -1507,7 +1540,7 @@ one only with an `--allow-net`.
 - **probe**: a Rust program that checks eight thread and filesystem features
   (a tokio timer, a UNIX socket pair, rayon parallelism, Mutex and Condvar,
   file operations, hard links, symbolic links and `flock`).
-- **aube**: a Node.js package manager written in Rust (v2.8.5). `--version`,
+- **aube**: a Node.js package manager written in Rust (v2.9.0). `--version`,
   `install`, `install --frozen-lockfile` and `list` give the same output and
   exit status as on real Linux.
 - **ripgrep**: a text search tool written in Rust (15.2.0), which runs its

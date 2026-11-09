@@ -319,12 +319,16 @@ fn sched_queries_report_the_normal_policy() {
     }
     // The upper half is not read: 0x1_0000_0001 is SCHED_FIFO.
     assert_eq!(f.ret(nr::SCHED_GET_PRIORITY_MAX, &[0x1_0000_0001]), 99);
-    // The host's slice, or where it does not tell (macOS) Linux's default
-    // at 1000 Hz: whole milliseconds of 0.75 ms times 1 + log2 of the CPUs.
+    // The host's slice in whole ticks, or where it does not tell (macOS)
+    // Linux's default at 1000 Hz: 0.75 ms times 1 + log2 of the CPUs.
     assert_eq!(f.ret(nr::SCHED_RR_GET_INTERVAL, &[0, DATA]), 0);
-    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let slice = paludarium_host::Host::time_slice(&*f.host)
-        .unwrap_or(750_000 * (1 + cpus.min(8).ilog2() as u64) / 1_000_000 * 1_000_000);
+    let host = crate::syscalls::scheduler_slice(&*f.host);
+    if paludarium_host::Host::scheduler_slice(&*f.host).is_none() {
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        assert_eq!(host.slice, 750_000 * (1 + cpus.min(8).ilog2() as u64));
+        assert_eq!(host.tick, 1_000_000);
+    }
+    let slice = host.slice / host.tick * host.tick;
     assert_eq!(f.mem.read_value(GuestAddr(DATA), 8).unwrap(), 0);
     assert_eq!(f.mem.read_value(GuestAddr(DATA + 8), 8).unwrap(), slice);
     assert_eq!(f.ret(nr::SCHED_RR_GET_INTERVAL, &[99, DATA]), esrch);
@@ -333,6 +337,235 @@ fn sched_queries_report_the_normal_policy() {
         f.ret(nr::SCHED_RR_GET_INTERVAL, &[0, 1]),
         errno(Errno::EFAULT)
     );
+}
+
+/// The attributes `sched_getattr` reports: policy, flags, nice, priority,
+/// runtime, deadline, period and the clamps.
+fn sched_attributes(f: &mut Fixture, pid: u64) -> (u32, u64, i32, u32, [u64; 3], [u32; 2]) {
+    assert_eq!(f.ret(nr::SCHED_GETATTR, &[pid, DATA, 56, 0]), 0);
+    let mut b = [0u8; 56];
+    f.mem.read(GuestAddr(DATA), &mut b).unwrap();
+    let w = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let d = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    assert_eq!(w(0), 56);
+    (
+        w(4),
+        d(8),
+        w(16) as i32,
+        w(20),
+        [d(24), d(32), d(40)],
+        [w(48), w(52)],
+    )
+}
+
+/// Writes a `struct sched_attr` at `DATA + 0x100`.
+fn write_attr(
+    f: &mut Fixture,
+    size: u32,
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    times: [u64; 3],
+) {
+    let mut b = Vec::new();
+    b.extend_from_slice(&size.to_le_bytes());
+    b.extend_from_slice(&policy.to_le_bytes());
+    b.extend_from_slice(&flags.to_le_bytes());
+    b.extend_from_slice(&nice.to_le_bytes());
+    b.extend_from_slice(&priority.to_le_bytes());
+    for t in times {
+        b.extend_from_slice(&t.to_le_bytes());
+    }
+    b.extend_from_slice(&[0; 8]);
+    f.mem.write(GuestAddr(DATA + 0x100), &b).unwrap();
+}
+
+#[test]
+fn scheduling_policies_are_kept_and_reported() {
+    let mut f = fixture();
+    let (einval, esrch, efault) = (errno(Errno::EINVAL), errno(Errno(3)), errno(Errno::EFAULT));
+    let host = crate::syscalls::scheduler_slice(&*f.host);
+    let param = |f: &mut Fixture, value: u32| {
+        f.mem
+            .write(GuestAddr(DATA + 0x80), &value.to_le_bytes())
+            .unwrap()
+    };
+    let interval = |f: &mut Fixture| {
+        assert_eq!(f.ret(nr::SCHED_RR_GET_INTERVAL, &[0, DATA + 0x40]), 0);
+        f.mem.read_value(GuestAddr(DATA + 0x48), 8).unwrap()
+            + f.mem.read_value(GuestAddr(DATA + 0x40), 8).unwrap() * 1_000_000_000
+    };
+    // A buffer larger than the structure gets zeros after it, as Linux
+    // 6.13's copy_struct_to_user.
+    f.mem.write(GuestAddr(DATA), &[0xee; 64]).unwrap();
+    assert_eq!(f.ret(nr::SCHED_GETATTR, &[0, DATA, 64, 0]), 0);
+    let mut tail = [0xffu8; 8];
+    f.mem.read(GuestAddr(DATA + 56), &mut tail).unwrap();
+    assert_eq!(tail, [0; 8]);
+    assert_eq!(f.mem.read_value(GuestAddr(DATA), 4).unwrap(), 56);
+    // The defaults: SCHED_OTHER, nice 0, the host's slice and no clamps.
+    assert_eq!(
+        sched_attributes(&mut f, 0),
+        (0, 0, 0, 0, [host.slice, 0, 0], [0, 1024])
+    );
+    // SCHED_FIFO 10: a real-time task's minimum clamp is 1024.
+    param(&mut f, 10);
+    assert_eq!(f.ret(144, &[0, 1, DATA + 0x80]), 0);
+    assert_eq!(f.ret(nr::SCHED_GETSCHEDULER, &[0]), 1);
+    assert_eq!(f.ret(nr::SCHED_GETPARAM, &[0, DATA]), 0);
+    assert_eq!(f.mem.read_value(GuestAddr(DATA), 4).unwrap(), 10);
+    assert_eq!(interval(&mut f), 0);
+    assert_eq!(
+        sched_attributes(&mut f, 0),
+        (1, 0, 0, 10, [0, 0, 0], [1024, 1024])
+    );
+    // SCHED_RR with SCHED_RESET_ON_FORK, through sched_setparam.
+    assert_eq!(f.ret(144, &[0, 2 | 0x4000_0000, DATA + 0x80]), 0);
+    assert_eq!(f.ret(nr::SCHED_GETSCHEDULER, &[0]), 0x4000_0002);
+    assert_eq!(interval(&mut f), 100_000_000);
+    param(&mut f, 20);
+    assert_eq!(f.ret(142, &[0, DATA + 0x80]), 0);
+    assert_eq!(f.ret(nr::SCHED_GETSCHEDULER, &[0]), 0x4000_0002);
+    assert_eq!(sched_attributes(&mut f, 0).3, 20);
+    param(&mut f, 0);
+    assert_eq!(f.ret(142, &[0, DATA + 0x80]), einval);
+    // The checks, in order.
+    assert_eq!(f.ret(144, &[0, u64::from(u32::MAX), DATA + 0x80]), einval);
+    assert_eq!(f.ret(144, &[0, 4, DATA + 0x80]), einval);
+    assert_eq!(f.ret(144, &[0, 0, 0]), einval);
+    assert_eq!(f.ret(144, &[u64::MAX, 0, DATA + 0x80]), einval);
+    assert_eq!(f.ret(144, &[0, 0, 1]), efault);
+    assert_eq!(f.ret(144, &[99, 0, DATA + 0x80]), esrch);
+    param(&mut f, 100);
+    assert_eq!(f.ret(144, &[0, 1, DATA + 0x80]), einval);
+    param(&mut f, 1);
+    assert_eq!(f.ret(144, &[0, 0, DATA + 0x80]), einval);
+    param(&mut f, 0);
+    assert_eq!(f.ret(144, &[0, 3, DATA + 0x80]), 0);
+    assert_eq!(f.ret(nr::SCHED_GETSCHEDULER, &[0]), 3);
+    assert_eq!(sched_attributes(&mut f, 0).5, [0, 1024]);
+    // sched_setattr: a normal policy's nice value and slice.
+    write_attr(&mut f, 48, 0, 0, 5, 0, [3_000_000, 0, 0]);
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), 0);
+    assert_eq!(f.ret(140, &[0, 0]), 15);
+    assert_eq!(
+        sched_attributes(&mut f, 0),
+        (0, 0, 5, 0, [3_000_000, 0, 0], [0, 1024])
+    );
+    assert_eq!(interval(&mut f), 3_000_000 / host.tick * host.tick);
+    write_attr(&mut f, 48, 0, 0, 5, 0, [1, 0, 0]);
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), 0);
+    assert_eq!(sched_attributes(&mut f, 0).4[0], 100_000);
+    // SCHED_DEADLINE: 10 ms every 100 ms, by 30 ms; no forks.
+    write_attr(
+        &mut f,
+        48,
+        6,
+        0,
+        0,
+        0,
+        [10_000_000, 30_000_000, 100_000_000],
+    );
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), 0);
+    assert_eq!(
+        sched_attributes(&mut f, 0),
+        (
+            6,
+            0,
+            0,
+            0,
+            [10_000_000, 30_000_000, 100_000_000],
+            // A deadline task's minimum is not raised as a real-time one's.
+            [0, 1024]
+        )
+    );
+    assert_eq!(interval(&mut f), 0);
+    assert_eq!(f.ret(57, &[]), errno(Errno(11)));
+    write_attr(
+        &mut f,
+        48,
+        6,
+        0,
+        0,
+        0,
+        [40_000_000, 30_000_000, 100_000_000],
+    );
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), einval);
+    write_attr(&mut f, 48, 6, 0, 0, 0, [10_000_000, 30_000_000, 50_000]);
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), einval);
+    // Sizes: 0 is 48; below 48, or nonzero bytes past 56, is E2BIG with 56.
+    write_attr(&mut f, 0, 0, 0, 0, 0, [0; 3]);
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), 0);
+    write_attr(&mut f, 40, 0, 0, 0, 0, [0; 3]);
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), errno(Errno(7)));
+    assert_eq!(f.mem.read_value(GuestAddr(DATA + 0x100), 4).unwrap(), 56);
+    write_attr(&mut f, 64, 0, 0, 0, 0, [0; 3]);
+    f.mem.write(GuestAddr(DATA + 0x100 + 60), &[1]).unwrap();
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), errno(Errno(7)));
+    f.mem.write(GuestAddr(DATA + 0x100 + 60), &[0]).unwrap();
+    write_attr(&mut f, 64, 0, 0, 0, 0, [0; 3]);
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), 0);
+    assert_eq!(f.ret(314, &[0, 0, 0]), einval);
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 1]), einval);
+    // The clamps need all 56 bytes; -1 is the default again.
+    write_attr(&mut f, 48, 0, 0x60, 0, 0, [0; 3]);
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), einval);
+    write_attr(&mut f, 56, 0, 0x60, 0, 0, [0; 3]);
+    f.mem
+        .write(GuestAddr(DATA + 0x100 + 48), &[100, 0, 0, 0, 200, 0, 0, 0])
+        .unwrap();
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), 0);
+    assert_eq!(sched_attributes(&mut f, 0).5, [100, 200]);
+    f.mem
+        .write(GuestAddr(DATA + 0x100 + 48), &[0xff; 4])
+        .unwrap();
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), 0);
+    assert_eq!(sched_attributes(&mut f, 0).5, [0, 200]);
+    f.mem
+        .write(GuestAddr(DATA + 0x100 + 48), &[0, 1, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    assert_eq!(f.ret(314, &[0, DATA + 0x100, 0]), einval);
+    // sched_getattr's checks, and a size cut to 48.
+    assert_eq!(f.ret(nr::SCHED_GETATTR, &[0, 0, 56, 0]), einval);
+    assert_eq!(f.ret(nr::SCHED_GETATTR, &[0, DATA, 47, 0]), einval);
+    assert_eq!(f.ret(nr::SCHED_GETATTR, &[0, DATA, 56, 1]), einval);
+    assert_eq!(f.ret(nr::SCHED_GETATTR, &[99, DATA, 56, 0]), esrch);
+    assert_eq!(f.ret(nr::SCHED_GETATTR, &[0, DATA, 48, 0]), 0);
+    assert_eq!(f.mem.read_value(GuestAddr(DATA), 4).unwrap(), 48);
+    // Without CAP_SYS_NICE, a real-time policy needs RLIMIT_RTPRIO.
+    assert_eq!(f.ret(117, &[1000, 1000, 1000]), 0);
+    param(&mut f, 1);
+    assert_eq!(f.ret(144, &[0, 1, DATA + 0x80]), errno(Errno::EPERM));
+}
+
+#[test]
+fn ioprio_set_is_kept_and_reported() {
+    let mut f = fixture();
+    let (einval, eperm) = (errno(Errno::EINVAL), errno(Errno::EPERM));
+    assert_eq!(f.ret(252, &[1, 0]), 0);
+    // Best-effort level 3, with a hint.
+    assert_eq!(f.ret(251, &[1, 0, 2 << 13 | 1 << 3 | 3]), 0);
+    assert_eq!(f.ret(252, &[1, 0]), 2 << 13 | 1 << 3 | 3);
+    // The class none is reported as 0, whatever the nice value.
+    assert_eq!(f.ret(251, &[1, 0, 0]), 0);
+    assert_eq!(f.ret(252, &[1, 0]), 0);
+    assert_eq!(f.ret(141, &[0, 0, 10]), 0);
+    assert_eq!(f.ret(252, &[1, 0]), 0);
+    // Real-time and idle classes.
+    assert_eq!(f.ret(251, &[1, 0, 1 << 13 | 7]), 0);
+    assert_eq!(f.ret(252, &[2, 0]), 1 << 13 | 7);
+    assert_eq!(f.ret(251, &[3, 0, 3 << 13]), 0);
+    assert_eq!(f.ret(252, &[3, 0]), 3 << 13);
+    for bad in [4 << 13, 7 << 13, 1, u64::from(u32::MAX)] {
+        assert_eq!(f.ret(251, &[1, 0, bad]), einval, "{bad:#x}");
+    }
+    assert_eq!(f.ret(251, &[0, 0, 0]), einval);
+    assert_eq!(f.ret(251, &[1, 99, 0]), errno(Errno(3)));
+    // Real-time needs CAP_SYS_NICE (or CAP_SYS_ADMIN), checked first.
+    assert_eq!(f.ret(117, &[1000, 1000, 1000]), 0);
+    assert_eq!(f.ret(251, &[1, 99, 1 << 13]), eperm);
+    assert_eq!(f.ret(251, &[1, 0, 2 << 13]), 0);
 }
 
 #[test]

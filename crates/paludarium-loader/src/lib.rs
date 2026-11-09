@@ -539,6 +539,25 @@ fn interpreter_base(info: &ElfInfo, top: u64) -> Result<u64, LoadError> {
     Ok(top.checked_sub(span).ok_or(too_large)? & !(align - 1))
 }
 
+/// Where the legacy layout puts an interpreter: the lowest gap from `base`
+/// that holds its segments.
+fn interpreter_low(info: &ElfInfo, mem: &AddressSpace, base: u64) -> Result<u64, LoadError> {
+    let too_large = LoadError::Interpreter(Errno(12));
+    let span = info
+        .loads()
+        .try_fold(0u64, |end, h| Some(end.max(h.vaddr.checked_add(h.memsz)?)))
+        .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
+        .ok_or(too_large)?;
+    let align = info
+        .loads()
+        .map(|h| h.align)
+        .fold(PAGE_SIZE, u64::max)
+        .next_power_of_two();
+    mem.lowest_gap(GuestAddr(base), span, align)
+        .map(|at| at.0)
+        .ok_or(LoadError::Interpreter(Errno(12)))
+}
+
 /// Loads an ELF image, read from the file `name` if it has one.
 fn load_image(
     bytes: &[u8],
@@ -578,7 +597,12 @@ fn load_image(
     let mut interpreter_at = 0;
     if let Some((path, file, parsed)) = interpreter {
         let top = paludarium_mmu::DEFAULT_MMAP_TOP;
-        let wanted = interpreter_base(&parsed, top)?;
+        let wanted = match mem.bottom_up() {
+            // The legacy layout maps it upward from its base, as any other
+            // mapping without a fixed address.
+            Some(base) => interpreter_low(&parsed, mem, base)?,
+            None => interpreter_base(&parsed, top)?,
+        };
         let (at, _) = map_segments(&file, Some(&path), identity(&path), &parsed, mem, wanted)?;
         entry_point = GuestAddr(at.wrapping_add(parsed.entry));
         interpreter_at = at;

@@ -85,6 +85,10 @@ pub struct ThreadGroup {
     /// What each thread keeps itself that other processes read in `/proc`,
     /// as of its last checkpoint. The leader's stays while it is a zombie.
     public: Mutex<BTreeMap<u32, PublicThread>>,
+    /// The process is the init of a nested PID namespace, which takes only
+    /// the signals it handles, and SIGKILL and SIGSTOP from outside (Linux's
+    /// SIGNAL_UNKILLABLE), until a fault ends it.
+    unkillable: std::sync::atomic::AtomicBool,
 }
 /// What `/proc/<pid>` shows another process of a thread: its name, signal
 /// state and credentials, and its process's memory and files, which it
@@ -134,10 +138,40 @@ impl Default for ThreadGroup {
             executable: Mutex::default(),
             exe_file: Mutex::default(),
             public: Mutex::default(),
+            unkillable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
 impl ThreadGroup {
+    /// Whether the process is the init of a nested PID namespace.
+    pub(crate) fn unkillable(&self) -> bool {
+        self.unkillable.load(Ordering::SeqCst)
+    }
+    /// Whether the init of a nested PID namespace drops signal `number`
+    /// (1 to 64) as it is sent, as Linux's `sig_task_ignored` with
+    /// SIGNAL_UNKILLABLE: it has no handler for it, the receiving thread
+    /// does not block it (`blocked`), and it is not SIGKILL or SIGSTOP
+    /// `forced`, from outside the namespace or by the kernel.
+    pub(crate) fn drops_as_init(&self, number: i32, forced: bool, blocked: u64) -> bool {
+        let handled = self
+            .shared_actions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&number)
+            .is_some_and(|action| action.handler != 0);
+        self.unkillable()
+            && !handled
+            && blocked & (1u64 << (number - 1)) == 0
+            && !(forced && matches!(number, 9 | 19))
+    }
+    /// The signals thread `tid` last published as blocked.
+    pub(crate) fn blocked(&self, tid: u32) -> u64 {
+        self.public(tid).map_or(0, |thread| thread.blocked)
+    }
+    /// Makes the process the init of a nested PID namespace.
+    pub(crate) fn set_unkillable(&self) {
+        self.unkillable.store(true, Ordering::SeqCst);
+    }
     /// Keeps the robust list head of `tid`.
     pub(crate) fn set_robust_list(&self, tid: u32, head: u64) {
         self.robust_lists
@@ -627,10 +661,15 @@ impl ThreadGroup {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&tid);
-            self.namespaces
+            let namespaces = self
+                .namespaces
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&tid);
+            // Its number goes with it; the leader's waits for the process.
+            if let Some(namespaces) = namespaces {
+                namespaces.pid.leave(tid);
+            }
         }
     }
     /// After exec, thread `pid` is all there is.
@@ -756,13 +795,21 @@ impl ThreadGroup {
             inbox.interrupt();
         }
     }
-    fn send(&self, tid: u32, number: i32, uid: u32) -> Result<(), Errno> {
-        let members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
-        let inbox = members.get(&tid).ok_or(Errno(3))?;
-        if number == 0 {
+    /// `tkill` of thread `tid` from a thread of this process, `sender` as
+    /// their PID namespace numbers the process. The init of a nested one
+    /// drops what it would from any thread of the namespace.
+    fn send(&self, tid: u32, number: i32, sender: u32, uid: u32) -> Result<(), Errno> {
+        let inbox = self
+            .members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .cloned()
+            .ok_or(Errno(3))?;
+        if number == 0 || self.drops_as_init(number, false, self.blocked(tid)) {
             return Ok(());
         }
-        inbox.send_thread(number, uid)
+        inbox.send_thread_from(number, sender, uid)
     }
     pub(crate) fn set_process_inbox(&self, inbox: Arc<SignalInbox>) {
         *self
@@ -1058,10 +1105,11 @@ impl Kernel {
     ) -> Option<Next> {
         let result = match n {
             56 => self.clone_thread(thread, mem, a),
-            186 => Ok(u64::from(thread.tid)),
+            // As the thread's PID namespace numbers it.
+            186 => Ok(u64::from(self.pid_space(thread.tid).number(thread.tid))),
             218 => {
                 thread.state.clear_child_tid = a[0];
-                Ok(u64::from(thread.tid))
+                Ok(u64::from(self.pid_space(thread.tid).number(thread.tid)))
             }
             60 => {
                 return Some(Next::Exit(ExitStatus::Exited((a[0] & 255) as i32)));
@@ -1102,8 +1150,10 @@ impl Kernel {
                 )
             }
             200 | 234 => {
+                let space = self.pid_space(thread.tid);
+                let own = space.number(self.process.pid);
                 let (tid, number) = if n == 234 {
-                    if a[0] != u64::from(self.process.pid) {
+                    if a[0] != u64::from(own) {
                         return Some(self.return_error(thread, Errno(3)));
                     }
                     (a[1], a[2])
@@ -1114,10 +1164,12 @@ impl Kernel {
                     Err(Errno::EINVAL)
                 } else {
                     u32::try_from(tid)
-                        .map_err(|_| Errno(3))
+                        .ok()
+                        .and_then(|tid| space.task(tid))
+                        .ok_or(Errno(3))
                         .and_then(|tid| {
                             self.group
-                                .send(tid, number as i32, thread.state.credentials.uid)
+                                .send(tid, number as i32, own, thread.state.credentials.uid)
                         })
                         .map(|()| 0)
                 }
@@ -1168,9 +1220,13 @@ impl Kernel {
         if flags & THREAD != 0 && flags & SIGHAND == 0 || flags & SIGHAND != 0 && flags & VM == 0 {
             return Err(Errno::EINVAL);
         }
+        // Nor can it be numbered in another PID namespace than its process,
+        // as after `unshare(CLONE_NEWPID)` or `setns` to one.
+        let own = self.group.namespaces(parent.tid);
         if flags & THREAD != 0
-            && namespaces & (crate::namespaces::CLONE_NEWUSER | crate::namespaces::CLONE_NEWPID)
+            && (namespaces & (crate::namespaces::CLONE_NEWUSER | crate::namespaces::CLONE_NEWPID)
                 != 0
+                || !Arc::ptr_eq(&own.pid, &own.pid_for_children))
         {
             return Err(Errno::EINVAL);
         }
@@ -1197,14 +1253,12 @@ impl Kernel {
         if namespaces & crate::namespaces::CLONE_NEWIPC != 0 && flags & 0x40000 != 0 {
             return Err(Errno::EINVAL);
         }
-        let child_namespaces = self
-            .group
-            .namespaces(parent.tid)
-            .for_child(namespaces, true);
+        let child_namespaces = own.for_child(namespaces, true)?;
         let tid = self.processes.allocate()?;
         if tid > i32::MAX as u32 {
             return Err(Errno::EAGAIN);
         }
+        child_namespaces.pid.enter(tid)?;
         let mut cpu = parent.cpu.clone();
         cpu.gpr[reg::RAX] = 0;
         if a[1] != 0 {

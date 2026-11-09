@@ -575,7 +575,7 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                 } else {
                     u64::from(segment.id as u32)
                 };
-                (shmid_ds(segment), returned)
+                (shmid_ds(segment, &c.pid_space()), returned)
             };
             write(&ds)?;
             Ok(returned)
@@ -623,8 +623,9 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
     }
 }
 
-/// `struct shmid64_ds` of `segment`, as x86-64 lays it out.
-fn shmid_ds(segment: &Segment) -> [u8; 112] {
+/// `struct shmid64_ds` of `segment`, as x86-64 lays it out, its PIDs as
+/// the caller's PID namespace `space` numbers them (Linux's `pid_vnr`).
+fn shmid_ds(segment: &Segment, space: &crate::namespaces::Namespace) -> [u8; 112] {
     let mut ds = [0u8; 112];
     let mut put = |at: usize, bytes: &[u8]| ds[at..at + bytes.len()].copy_from_slice(bytes);
     put(0, &segment.key.to_le_bytes());
@@ -638,8 +639,8 @@ fn shmid_ds(segment: &Segment) -> [u8; 112] {
     put(56, &segment.atime.to_le_bytes());
     put(64, &segment.dtime.to_le_bytes());
     put(72, &segment.ctime.to_le_bytes());
-    put(80, &segment.cpid.to_le_bytes());
-    put(84, &segment.lpid.to_le_bytes());
+    put(80, &space.number(segment.cpid).to_le_bytes());
+    put(84, &space.number(segment.lpid).to_le_bytes());
     put(88, &segment.attached().to_le_bytes());
     ds
 }

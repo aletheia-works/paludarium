@@ -560,6 +560,12 @@ impl Kernel {
             {
                 continue;
             }
+            // The init of a nested PID namespace takes no signal it has no
+            // handler for, but SIGKILL and SIGSTOP, which come only forced
+            // (Linux's SIGNAL_UNKILLABLE in `get_signal`).
+            if action.handler == 0 && !matches!(signal.number, 9 | 19) && self.group.unkillable() {
+                continue;
+            }
             if signal.number == 19 || action.handler == 0 && matches!(signal.number, 20..=22) {
                 thread.state.stopped = true;
                 // A group stop is reported once, by the thread that starts it.

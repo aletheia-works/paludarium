@@ -2190,7 +2190,8 @@ fn terminal_ioctl(
             if !master && !controlled(c) {
                 return Err(Errno::ENOTTY);
             }
-            let pgrp = terminal.foreground().unwrap_or(0);
+            // As the caller's PID namespace numbers it (`pid_vnr`).
+            let pgrp = c.pid_space().number(terminal.foreground().unwrap_or(0));
             write_bytes(c, arg, &pgrp.to_le_bytes())
         }
         TIOCSPGRP => {
@@ -2211,7 +2212,7 @@ fn terminal_ioctl(
             if pgrp == 0 {
                 return Err(ESRCH);
             }
-            let pgrp = pgrp.cast_unsigned();
+            let pgrp = c.named(pgrp.cast_unsigned());
             match c.processes.session_of_group(pgrp) {
                 None => Err(ESRCH),
                 Some(other) if other != session => Err(Errno::EPERM),
@@ -2226,6 +2227,7 @@ fn terminal_ioctl(
                 return Err(Errno::ENOTTY);
             }
             let session = terminal.session().ok_or(Errno::ENOTTY)?;
+            let session = c.pid_space().number(session);
             write_bytes(c, arg, &session.to_le_bytes())
         }
         TIOCSCTTY => {

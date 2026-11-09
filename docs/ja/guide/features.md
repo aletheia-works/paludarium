@@ -597,11 +597,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   で捨てるセマフォーの調整値はありません。名前空間のフラグは、次のとおりスレッドに新しい
   名前空間を与えます。
 - スレッドは、Linux の `nsproxy` と同じく自分の名前空間を持ちます。UTS・IPC・マウント・
-  cgroup・time の名前空間は自分のもので、ネットワーク・PID・ユーザーの名前空間は最初の
+  cgroup・time・PID の名前空間は自分のもので、ネットワーク・ユーザーの名前空間は最初の
   ものです。`CLONE_NEWUTS`、`CLONE_NEWIPC`、`CLONE_NEWNS`、`CLONE_NEWCGROUP`、
-  `CLONE_NEWTIME` を付けた `unshare` はスレッドに新しい名前空間を与え、`clone` も子に
-  （スレッドにも）与えます（`CLONE_NEWTIME` は `clone3` で付けます）。どれも
-  `CAP_SYS_ADMIN` が要ります（なければ `EPERM`）。新しい UTS 名前空間はホスト名と
+  `CLONE_NEWTIME`、`CLONE_NEWPID` を付けた `unshare` はスレッドに新しい名前空間を与え、
+  `clone` も子に（`CLONE_NEWPID` を除いてスレッドにも）与えます（`CLONE_NEWTIME` は
+  `clone3` で付けます）。どれも `CAP_SYS_ADMIN` が要ります（なければ `EPERM`）。新しい UTS 名前空間はホスト名と
   ドメイン名の写しで始まり、その後の `sethostname` と `setdomainname` はその名前空間だけを
   変えます。新しい time 名前空間は、スレッドの子が入るものです。メモリーを共有しない子は
   それに入り、スレッドもプログラムを実行するとそれに入ります。`clone` は、Linux と同じく
@@ -615,9 +615,34 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   確かめる中身と順番は Linux と同じです。スレッド自身のユーザー名前空間は `EINVAL`、
   time 名前空間はスレッドがメモリーの中でひとりであること（`EUSERS`）、マウント名前空間に
   それだけで入るときはほかのスレッドと共有しない作業ディレクトリー（`EINVAL`）と
-  `CAP_SYS_CHROOT`、どの名前空間も `CAP_SYS_ADMIN`（`EPERM`）が要ります。マウント
-  名前空間に入ると、作業ディレクトリーはその root に移ります。新しく作れない名前空間は
+  `CAP_SYS_CHROOT`、どの名前空間も `CAP_SYS_ADMIN`（`EPERM`）が要り、PID 名前空間は
+  スレッド自身のものか、その中のものでなければなりません（`EINVAL`）。マウント
+  名前空間に入ると、作業ディレクトリーはその root に移り、PID 名前空間に入ると、それが
+  スレッドの子に番号を付ける名前空間になります。新しく作れない名前空間は
   [制限](./limitations.md)を見てください。
+- 新しい PID 名前空間は、Linux と同じく、スレッドの子に番号を付ける名前空間です。
+  スレッド自身は元の名前空間に残り、`pid_for_children` のリンクは、最初の子
+  （名前空間の init で、番号は 1）ができるまで `ENOENT` です。子が新しい名前空間に
+  入る状態での 2 度目の `CLONE_NEWPID` は `EINVAL` で、そのときのスレッドの作成も、
+  プロセスと別に番号が付くことになるので `EINVAL` です。Linux の 32 段（最初の名前空間を
+  0 段目とします）より深い名前空間は `ENOSPC` です。プロセスやスレッドは、自分の
+  名前空間と、それを含む名前空間のそれぞれで番号を持ち、ほかのプロセスを自分の名前空間の
+  番号で見ます。名前空間の外のプロセスは 0 で、名前空間が配っていない番号は何も指しません。
+  これは `getpid`、`gettid`、`getppid`、`getpgid`、`getpgrp`、`getsid`、`setsid`、
+  `setpgid`、`kill`、`tkill`、`tgkill`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`wait4`、
+  `waitid`、`pidfd_open`、`getpriority`、`setpriority`、`ioprio_get`、`ioprio_set`、
+  `sched_*` の呼び出し、`prlimit64`、`capget`、`capset`、`get_robust_list` でも、`clone`
+  が返して書き込む ID、`set_tid_address` が返す ID、シグナルの `si_pid`（外からなら 0）でも、
+  `F_SETOWN`、`F_GETOWN`、`F_GETLK` の `l_pid`、`TIOCGPGRP`、`TIOCSPGRP`、`TIOCGSID`
+  でも、`SCM_CREDENTIALS` と `SO_PEERCRED` でも、`shmctl` のプロセス ID とコアの中でも
+  同じです。`kill(-1)` は、呼び出したプロセスの名前空間の、init を除くプロセスに送ります。
+  `/proc` は、Linux で最初の名前空間でマウントした `/proc` と同じく、最初の名前空間の ID を
+  見せます。init は、ハンドラーのあるシグナルと、名前空間の外かカーネルからの SIGKILL と
+  SIGSTOP だけを受け取ります（Linux の `SIGNAL_UNKILLABLE`）。フォールトでは終わります。
+  名前空間の孤児は init か、名前空間の中の子のサブリーパーに引き取られます。init が
+  終わると、名前空間のほかのプロセスはすべて SIGKILL を受け、名前空間にはもう入れません
+  （`ENOMEM`）。init の親は、Linux の `zap_pid_ns_processes` と同じく、残りがいなくなって
+  から（init の子は init が刈り取ります）init の終了を知ります。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、

@@ -823,11 +823,13 @@ mod process {
         let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
         finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
         let processes = k.processes();
+        let space = k.pid_space(1);
         let ids = std::thread::scope(|scope| {
             let a = processes.clone();
             let b = processes.clone();
-            let first = scope.spawn(move || a.reap(1, crate::processes::Wanted::Any, EXITS));
-            let second = scope.spawn(move || b.reap(1, crate::processes::Wanted::Any, EXITS));
+            let (one, two) = (space.clone(), space.clone());
+            let first = scope.spawn(move || a.reap(1, &one, crate::processes::Wanted::Any, EXITS));
+            let second = scope.spawn(move || b.reap(1, &two, crate::processes::Wanted::Any, EXITS));
             [first.join().unwrap(), second.join().unwrap()]
         });
         assert_eq!(
@@ -2044,8 +2046,8 @@ mod namespaces {
         assert_eq!(before[4], after[4]);
         assert_eq!(before[6], after[6]);
         assert_eq!(&after[5][..5], b"time:");
-        // No new user, PID or network namespace; with a supported flag too.
-        for flags in [NEWUSER, NEWPID, NEWNET, NEWPID | NEWUTS] {
+        // No new user or network namespace; with a supported flag too.
+        for flags in [NEWUSER, NEWNET, NEWNET | NEWUTS] {
             assert_eq!(
                 syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
                 einval
@@ -2104,7 +2106,6 @@ mod namespaces {
             NEWUSER | 0x200,
             NEWIPC | 0x4_0000,
             NEWUSER,
-            NEWPID,
             NEWNET,
             NEWNET | NEWUTS,
         ] {
@@ -4058,5 +4059,275 @@ mod shm {
             syscall(&mut k, &mut t, &m, 31, [id, 11, 0, 0, 0, 0]),
             e(Errno::EPERM)
         );
+    }
+}
+mod pid_namespaces {
+    use super::*;
+    const NEWPID: u64 = 0x2000_0000;
+    const TERM: u64 = 1 << 14;
+    const USR1: u64 = 1 << 9;
+    type Process = (Box<Kernel>, Thread, Arc<AddressSpace>);
+    fn e(error: Errno) -> u64 {
+        error.to_syscall_return()
+    }
+    /// A child of `k` and the number `k`'s PID namespace gives it.
+    fn spawn(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> (Process, u64) {
+        let number = syscall(k, t, m, 57, [0; 6]);
+        assert!(number < 1 << 20, "{}", number as i64);
+        let (mut child, thread) = k.take_child().unwrap();
+        let memory = child.take_spawn_memory().unwrap();
+        ((child, thread, memory), number)
+    }
+    /// What the link at `path` reads, or the error.
+    fn link(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, path: &str) -> Result<Vec<u8>, u64> {
+        m.write(GuestAddr(DATA), format!("{path}\0").as_bytes())
+            .unwrap();
+        let count = syscall(k, t, m, 89, [DATA, DATA + 512, 256, 0, 0, 0]);
+        if count >= 256 {
+            return Err(count);
+        }
+        let mut bytes = vec![0; count as usize];
+        m.read(GuestAddr(DATA + 512), &mut bytes).unwrap();
+        Ok(bytes)
+    }
+    fn pending(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> u64 {
+        assert_eq!(syscall(k, t, m, 127, [DATA + 520, 8, 0, 0, 0, 0]), 0);
+        m.read_u64(GuestAddr(DATA + 520)).unwrap()
+    }
+    fn kill(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, target: u64, number: u64) -> u64 {
+        syscall(k, t, m, 62, [target, number, 0, 0, 0, 0])
+    }
+    /// The first process, after `unshare(CLONE_NEWPID)`, and the init of
+    /// the new namespace, its first child.
+    fn namespace() -> ((Kernel, Thread, AddressSpace), Process) {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(syscall(&mut k, &mut t, &m, 272, [NEWPID, 0, 0, 0, 0, 0]), 0);
+        let (init, number) = spawn(&mut k, &mut t, &m);
+        assert_eq!(number, u64::from(init.1.tid));
+        ((k, t, m), init)
+    }
+    #[test]
+    fn unsharing_makes_the_next_child_the_init_of_a_new_namespace() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(syscall(&mut k, &mut t, &m, 272, [NEWPID, 0, 0, 0, 0, 0]), 0);
+        // The caller stays where it is; its children take one with no
+        // process yet, which its link does not lead to.
+        assert_eq!(syscall(&mut k, &mut t, &m, 39, [0; 6]), 1);
+        assert_eq!(
+            link(&mut k, &mut t, &m, "/proc/self/ns/pid_for_children"),
+            Err(e(Errno::ENOENT))
+        );
+        // Only one new namespace for children at a time.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [NEWPID, 0, 0, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+        // Nor a thread, which would be numbered in another namespace than
+        // its process.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 56, [0x1_0900, 0, 0, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+        let ((mut i, mut it, im), number) = spawn(&mut k, &mut t, &m);
+        assert_eq!(number, u64::from(it.tid));
+        // Inside, the init is 1, with its parent, group and session
+        // outside, as 0.
+        for (call, value) in [(39, 1), (186, 1), (110, 0), (111, 0), (124, 0)] {
+            assert_eq!(syscall(&mut i, &mut it, &im, call, [0; 6]), value, "{call}");
+        }
+        let children = link(&mut k, &mut t, &m, "/proc/self/ns/pid_for_children").unwrap();
+        assert_eq!(
+            link(&mut i, &mut it, &im, "/proc/self/ns/pid"),
+            Ok(children.clone())
+        );
+        assert_ne!(
+            link(&mut k, &mut t, &m, "/proc/self/ns/pid").unwrap(),
+            children
+        );
+        // The next process in it is 2, also to the first process's wait.
+        let ((mut c, mut ct, cm), number) = spawn(&mut i, &mut it, &im);
+        assert_eq!(number, 2);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 39, [0; 6]), 2);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 110, [0; 6]), 1);
+        // Inside, the numbers outside name nothing.
+        assert_eq!(kill(&mut i, &mut it, &im, 2, 0), 0);
+        assert_eq!(
+            kill(&mut i, &mut it, &im, u64::from(ct.tid), 0),
+            e(Errno(3))
+        );
+        assert_eq!(kill(&mut k, &mut t, &m, u64::from(ct.tid), 0), 0);
+        // Its own group: setpgid names it by its number.
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 109, [0, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 111, [0; 6]), 2);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 121, [u64::from(ct.tid), 0, 0, 0, 0, 0]),
+            u64::from(ct.tid)
+        );
+        // A child that exits is reported by its number.
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(4));
+        assert_eq!(
+            syscall(&mut i, &mut it, &im, 61, [u64::MAX, DATA + 64, 0, 0, 0, 0]),
+            2
+        );
+        assert_eq!(im.read_u64(GuestAddr(DATA + 64)).unwrap() as u32, 4 << 8);
+    }
+    #[test]
+    fn a_clone_with_a_new_namespace_starts_it() {
+        let (mut k, mut t, m) = setup();
+        let number = syscall(&mut k, &mut t, &m, 56, [NEWPID | 17, 0, 0, 0, 0, 0]);
+        let (mut i, mut it) = k.take_child().unwrap();
+        assert_eq!(number, u64::from(it.tid));
+        let im = i.take_spawn_memory().unwrap();
+        assert_eq!(syscall(&mut i, &mut it, &im, 39, [0; 6]), 1);
+        // The parent's children still take its own.
+        assert_eq!(
+            link(&mut k, &mut t, &m, "/proc/self/ns/pid_for_children"),
+            link(&mut k, &mut t, &m, "/proc/self/ns/pid")
+        );
+        // Without CAP_SYS_ADMIN, EPERM.
+        let user = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        t.state.credentials = user;
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 56, [NEWPID | 17, 0, 0, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [NEWPID, 0, 0, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+    }
+    #[test]
+    fn the_init_takes_only_the_signals_it_handles() {
+        let ((mut k, mut t, m), (mut i, mut it, im)) = namespace();
+        let ((mut c, mut ct, cm), _) = spawn(&mut i, &mut it, &im);
+        // From inside, neither SIGTERM nor SIGKILL reaches it.
+        assert_eq!(kill(&mut c, &mut ct, &cm, 1, 15), 0);
+        assert_eq!(kill(&mut c, &mut ct, &cm, 1, 9), 0);
+        assert_eq!(kill(&mut i, &mut it, &im, 0, 15), 0);
+        assert_eq!(syscall(&mut i, &mut it, &im, 234, [1, 1, 9, 0, 0, 0]), 0);
+        assert_eq!(pending(&mut i, &mut it, &im), 0);
+        assert_eq!(i.checkpoint(&mut it, &im), Next::Resume);
+        // A signal it blocks waits, as one it handles would.
+        m.write_u64(GuestAddr(DATA + 512), USR1).unwrap();
+        im.write_u64(GuestAddr(DATA + 512), USR1).unwrap();
+        assert_eq!(
+            syscall(&mut i, &mut it, &im, 14, [0, DATA + 512, 0, 8, 0, 0]),
+            0
+        );
+        assert_eq!(kill(&mut c, &mut ct, &cm, 1, 10), 0);
+        assert_eq!(pending(&mut i, &mut it, &im), USR1);
+        // From outside, SIGTERM neither, but SIGKILL ends it.
+        let init = u64::from(it.tid);
+        assert_eq!(kill(&mut k, &mut t, &m, init, 15), 0);
+        assert_eq!(pending(&mut i, &mut it, &im), USR1);
+        assert_eq!(kill(&mut k, &mut t, &m, init, 9), 0);
+        assert_eq!(
+            i.checkpoint(&mut it, &im),
+            Next::Exit(ExitStatus::Signaled(9))
+        );
+        // Another process of the namespace takes SIGTERM as any process.
+        assert_eq!(kill(&mut i, &mut it, &im, 2, 0), 0);
+        assert_eq!(pending(&mut c, &mut ct, &cm) & TERM, 0);
+    }
+    #[test]
+    fn the_sender_is_shown_as_the_receiver_numbers_it() {
+        let ((mut k, mut t, m), (mut i, mut it, im)) = namespace();
+        let ((mut c, mut ct, cm), _) = spawn(&mut i, &mut it, &im);
+        // SIGUSR1 blocked in the child, then sent from inside and outside.
+        cm.write_u64(GuestAddr(DATA + 512), USR1).unwrap();
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 14, [0, DATA + 512, 0, 8, 0, 0]),
+            0
+        );
+        let info = |c: &mut Box<Kernel>, ct: &mut Thread, cm: &AddressSpace| {
+            cm.write_u64(GuestAddr(DATA + 512), USR1).unwrap();
+            assert_eq!(
+                syscall(c, ct, cm, 128, [DATA + 512, DATA + 600, 0, 8, 0, 0]),
+                10
+            );
+            cm.read_u64(GuestAddr(DATA + 616)).unwrap() as u32
+        };
+        assert_eq!(kill(&mut i, &mut it, &im, 2, 10), 0);
+        assert_eq!(info(&mut c, &mut ct, &cm), 1);
+        assert_eq!(kill(&mut k, &mut t, &m, u64::from(ct.tid), 10), 0);
+        assert_eq!(info(&mut c, &mut ct, &cm), 0);
+    }
+    #[test]
+    fn the_exit_of_the_init_ends_the_namespace() {
+        let ((mut k, mut t, m), (mut i, mut it, im)) = namespace();
+        let ((mut c, mut ct, cm), _) = spawn(&mut i, &mut it, &im);
+        let ((mut g, mut gt, gm), number) = spawn(&mut c, &mut ct, &cm);
+        assert_eq!(number, 3);
+        // The child exits first: its own child goes to the init.
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(syscall(&mut g, &mut gt, &gm, 110, [0; 6]), 1);
+        finish(&mut i, &it, &im, ExitStatus::Exited(5));
+        // The rest of it gets SIGKILL, and nothing may join it.
+        assert_eq!(
+            g.checkpoint(&mut gt, &gm),
+            Next::Exit(ExitStatus::Signaled(9))
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 57, [0; 6]), e(Errno::ENOMEM));
+        assert!(k.take_child().is_none());
+        // The init is not reported before the last of it is gone, which it
+        // reaps itself.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [u64::MAX, 0, 1, 0, 0, 0]),
+            0
+        );
+        finish(&mut g, &gt, &gm, ExitStatus::Signaled(9));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [u64::MAX, DATA + 64, 1, 0, 0, 0]),
+            u64::from(it.tid)
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA + 64)).unwrap() as u32, 5 << 8);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [u64::MAX, 0, 1, 0, 0, 0]),
+            e(Errno(10))
+        );
+    }
+    #[test]
+    fn setns_enters_only_the_own_namespace_or_one_within_it() {
+        let ((mut k, mut t, m), (mut i, mut it, im)) = namespace();
+        let open = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, path: &str| {
+            m.write(GuestAddr(DATA), format!("{path}\0").as_bytes())
+                .unwrap();
+            syscall(k, t, m, 2, [DATA, 0, 0, 0, 0, 0])
+        };
+        // From the init's namespace, the first one is outside.
+        let first = open(&mut k, &mut t, &m, "/proc/self/ns/pid");
+        let inner = open(&mut i, &mut it, &im, "/proc/self/ns/pid");
+        assert!(first < 1024 && inner < 1024);
+        let outer = open(&mut i, &mut it, &im, "/proc/1/ns/pid");
+        assert_eq!(
+            syscall(&mut i, &mut it, &im, 308, [outer, NEWPID, 0, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            syscall(&mut i, &mut it, &im, 308, [inner, NEWPID, 0, 0, 0, 0]),
+            0
+        );
+        // The first process may enter the nested one for its children, and
+        // back.
+        let path = format!("/proc/{}/ns/pid", it.tid);
+        let nested = open(&mut k, &mut t, &m, &path);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [first, NEWPID, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            link(&mut k, &mut t, &m, "/proc/self/ns/pid_for_children"),
+            link(&mut k, &mut t, &m, "/proc/self/ns/pid")
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [nested, NEWPID, 0, 0, 0, 0]),
+            0
+        );
+        // A process it forks now joins the namespace, as its number 2, with
+        // its parent outside.
+        let ((mut c, mut ct, cm), number) = spawn(&mut k, &mut t, &m);
+        assert_eq!(number, u64::from(ct.tid));
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 39, [0; 6]), 2);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 110, [0; 6]), 0);
     }
 }

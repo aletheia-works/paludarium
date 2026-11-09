@@ -68,6 +68,14 @@ pub(crate) struct Identity {
     /// The initial stack pointer, where argc, argv, envp and the
     /// auxiliary vector start.
     pub start_stack: u64,
+    /// The process's PID namespace, which numbers the IDs the core shows
+    /// (Linux's `task_pid_vnr` of the dumping task).
+    pub space: std::sync::Arc<crate::namespaces::Namespace>,
+}
+impl Identity {
+    fn number(&self, id: u32) -> u32 {
+        self.space.number(id)
+    }
 }
 
 /// Writes the core through `emit`, in the pieces Linux writes it in, and
@@ -284,10 +292,10 @@ fn prstatus(dump: &Dump, who: &Identity, thread: &ThreadCore) -> [u8; 336] {
     put16(&mut s, 12, dump.signal as u16); // pr_cursig
     put64(&mut s, 16, thread.pending);
     put64(&mut s, 24, thread.blocked);
-    put32(&mut s, 32, thread.tid);
-    put32(&mut s, 36, who.ppid);
-    put32(&mut s, 40, who.pgrp);
-    put32(&mut s, 44, who.sid);
+    put32(&mut s, 32, who.number(thread.tid));
+    put32(&mut s, 36, who.number(who.ppid));
+    put32(&mut s, 40, who.number(who.pgrp));
+    put32(&mut s, 44, who.number(who.sid));
     // The leader reports the whole process's time, as Linux does.
     if thread.tid == who.pid {
         put_time(&mut s, 48, who.cpu);
@@ -338,10 +346,10 @@ fn prpsinfo(who: &Identity, thread: &ThreadCore, mem: &AddressSpace) -> [u8; 136
     s[1] = b'R';
     put32(&mut s, 16, who.uid);
     put32(&mut s, 20, who.gid);
-    put32(&mut s, 24, who.pid);
-    put32(&mut s, 28, who.ppid);
-    put32(&mut s, 32, who.pgrp);
-    put32(&mut s, 36, who.sid);
+    put32(&mut s, 24, who.number(who.pid));
+    put32(&mut s, 28, who.number(who.ppid));
+    put32(&mut s, 32, who.number(who.pgrp));
+    put32(&mut s, 36, who.number(who.sid));
     s[40..56].copy_from_slice(&thread.name);
     let mut args = arguments(who, mem);
     args.truncate(79);

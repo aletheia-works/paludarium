@@ -128,8 +128,8 @@ mod linux {
             // change IDs as root, pty-vhangup needs root's capabilities and
             // pid-namespace makes a PID namespace, so Linux runs them as root,
             // through sudo when the tests do not run as root; so do the
-            // unshare and namespaces cases, whose checks depend on
-            // CAP_SYS_ADMIN and which make namespaces, the
+            // unshare, namespaces and pid-namespaces cases, whose checks
+            // depend on CAP_SYS_ADMIN and which make namespaces, the
             // scheduling-set case, which sets real-time and deadline policies,
             // and the personality-layout case, which maps page 0.
             let as_root = matches!(
@@ -151,6 +151,7 @@ mod linux {
                     | "pid-namespace"
                     | "unshare"
                     | "namespaces"
+                    | "pid-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
             );
@@ -253,6 +254,7 @@ mod linux {
         processes_membarrier => ("membarrier","process"),
         processes_unshare => ("unshare","process"),
         processes_namespaces => ("namespaces","process"),
+        processes_pid_namespaces => ("pid-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
         processes_landlock => ("landlock","process"),

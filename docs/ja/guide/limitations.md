@@ -222,17 +222,21 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **名前空間**：新しいネットワーク・PID・ユーザーの名前空間は作れません。
-  `CLONE_NEWNET` や `CLONE_NEWPID` を付けた `clone`、`clone3`、`unshare` は、子を作らずに
+- **名前空間**：新しいネットワーク・ユーザーの名前空間は作れません。
+  `CLONE_NEWNET` を付けた `clone`、`clone3`、`unshare` は、子を作らずに
   `EINVAL` で失敗します（`CAP_SYS_ADMIN` のないスレッドでは Linux と同じく `EPERM`）。
-  Linux では、root で動くゲストはこれらを作れます。Linux ではユーザーも使える
+  Linux では、root で動くゲストはこれを作れます。Linux ではユーザーも使える
   `CLONE_NEWUSER` は、どのスレッドでも `EINVAL` です。ほかの名前空間は、paludarium に
   分けるものがありません（IPC 名前空間の System V の共有メモリを除きます）。IPC 名前空間には
   System V のセマフォーとメッセージキューも、POSIX メッセージキューもなく、
   マウント名前空間には `mount` がありません（`/proc/self/mountinfo` のマウント ID は
   変わりません。Linux では新しい名前空間の写しに新しい ID が付きます）。cgroup 名前空間には
   `/proc/self/cgroup` がなく、time 名前空間には `/proc/<pid>/timens_offsets` がなく、
-  時計は最初の名前空間のものです。名前空間のファイルは `NS_GET_*` の `ioctl` を持たず、
+  時計は最初の名前空間のものです。PID 名前空間はそれぞれの番号を 1 度だけ配ります。
+  Linux では `pid_max` で一回りして使い回します。`/proc/<pid>/status` には `NStgid`、
+  `NSpid`、`NSpgid`、`NSsid` の行がなく、PID 名前空間でも `clone3` の `set_tid` は
+  使えません。受け手の名前空間の外から積んだシグナル（`rt_sigqueueinfo`）は、`si_code`
+  によらず `si_pid` を 0 にします。名前空間のファイルは `NS_GET_*` の `ioctl` を持たず、
   新しい名前空間の番号は、空いた番号を使い回す Linux のものとは違います。
 - **Linux と macOS 以外のホストでマウントしたディレクトリのファイル**：`SEEK_DATA`
   や `SEEK_HOLE` の `lseek` はファイル全体をデータとして扱います。Linux では穴を

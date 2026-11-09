@@ -1129,6 +1129,80 @@ static int reaped(long pid) {
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+/* The pid-namespaces case: the SIGUSR1s the init of a nested PID
+   namespace handled, and the sender the last one showed. */
+static volatile sig_atomic_t pidns_usr1, pidns_from = -1;
+static void pidns_handler(int signal, siginfo_t *info, void *context) {
+    (void)signal;
+    (void)context;
+    pidns_usr1++;
+    pidns_from = info->si_pid;
+}
+/* The init of the namespace: what it is and sees, the signals it drops
+   and takes, an orphan it adopts; then it exits, leaving a process. It
+   tells the maker on `done` when to signal it, and waits on `go`. */
+static int pidns_init(int outer, int go, int done) {
+    struct sigaction action = {0};
+    action.sa_sigaction = pidns_handler;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGUSR1, &action, NULL);
+    printf("init: pid=%d tid=%ld ppid=%d pgrp=%d sid=%d\n", getpid(), syscall(SYS_gettid), getppid(),
+           getpgrp(), getsid(0));
+    int own = ns_open("self", "pid");
+    long outer_in = ns_setns(outer, CLONE_NEWPID), own_in = ns_setns(own, CLONE_NEWPID);
+    printf("init: setns-outer=%ld setns-own=%ld\n", outer_in, own_in);
+    /* From inside, SIGTERM and SIGKILL do not reach it; SIGUSR1, which it
+       handles, does, from the sender's number. */
+    fflush(stdout);
+    pid_t sender = child();
+    if (sender == 0) {
+        errno = 0;
+        long none = kill(99, 0);
+        printf("sender: pid=%d ppid=%d none=%ld errno=%d\n", getpid(), getppid(), none, errno);
+        kill(1, SIGTERM);
+        kill(1, SIGKILL);
+        kill(1, SIGUSR1);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    pid_t waited = waitpid(sender, &status, 0);
+    printf("init: sender=%d waited=%d status=%d usr1=%d from=%d\n", sender, waited, status, pidns_usr1,
+           pidns_from);
+    /* An orphan comes to the init. */
+    fflush(stdout);
+    pid_t parent = child();
+    if (parent == 0) {
+        pid_t orphan = child();
+        if (orphan == 0) {
+            for (int i = 0; i < 10000 && getppid() != 1; i++) usleep(1000);
+            printf("orphan: pid=%d ppid=%d\n", getpid(), getppid());
+            fflush(stdout);
+            _exit(0);
+        }
+        printf("parent: pid=%d orphan=%d\n", getpid(), orphan);
+        fflush(stdout);
+        _exit(0);
+    }
+    pid_t first = waitpid(parent, &status, 0), second = waitpid(-1, &status, 0);
+    printf("init: parent=%d reaped=%d,%d\n", parent, first, second);
+    /* From outside, SIGTERM neither; SIGUSR1 from no number it has. */
+    pidns_usr1 = 0;
+    pidns_from = -1;
+    fflush(stdout);
+    char byte;
+    if (write(done, "x", 1) != 1 || read(go, &byte, 1) != 1) return 80;
+    printf("init: outside usr1=%d from=%d\n", pidns_usr1, pidns_from);
+    /* Its exit takes the rest of the namespace with it. */
+    fflush(stdout);
+    pid_t stayer = child();
+    if (stayer == 0) {
+        for (;;) pause();
+    }
+    printf("init: stayer=%d\n", stayer);
+    fflush(stdout);
+    return 7;
+}
 /* execveat(dir, path, argv, envp, flags) through the raw call. */
 static long execveat_call(int dir, const char *path, char *const *argv, int flags) {
     char *env[] = {NULL};
@@ -5034,6 +5108,78 @@ int main(int argc, char **argv) {
         errno = 0;
         result("alone", syscall(SYS_unshare, CLONE_VM|CLONE_SIGHAND));
         result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "pid-namespaces")) {
+        /* clone with CLONE_NEWPID: the child is the init of a new
+           namespace, its parent outside it. */
+        fflush(stdout);
+        long cloned = syscall(SYS_clone, CLONE_NEWPID | SIGCHLD, 0, 0, 0, 0);
+        if (cloned == 0) {
+            printf("cloned: pid=%d ppid=%d\n", getpid(), getppid());
+            fflush(stdout);
+            _exit(0);
+        }
+        result("cloned", reaped(cloned));
+        /* A child makes one for its children, which has no process, nor a
+           link, until the first of them, its init. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            char buf[64];
+            int outer = ns_open("self", "pid");
+            errno = 0;
+            long made = syscall(SYS_unshare, CLONE_NEWPID);
+            printf("maker: unshare=%ld errno=%d", made, errno);
+            errno = 0;
+            ns_link("self", "pid_for_children", buf, sizeof buf);
+            printf(" link=%d errno=%d", buf[0] != 0, errno);
+            errno = 0;
+            long again = syscall(SYS_unshare, CLONE_NEWPID);
+            printf(" again=%ld errno=%d", again, errno);
+            errno = 0;
+            long nested = syscall(SYS_clone, CLONE_NEWPID | SIGCHLD, 0, 0, 0, 0);
+            if (nested == 0) _exit(99);
+            printf(" clone=%ld errno=%d", nested, errno);
+            /* A thread would be numbered outside its process's namespace. */
+            ns_spin_go = 1;
+            pthread_t thread;
+            int threaded = pthread_create(&thread, NULL, ns_spinner, NULL);
+            if (!threaded) pthread_join(thread, NULL);
+            printf(" thread=%d\n", threaded);
+            int go[2], done[2];
+            if (pipe(go) || pipe(done)) _exit(90);
+            fflush(stdout);
+            pid_t init = child();
+            if (init == 0) {
+                close(go[1]);
+                close(done[0]);
+                _exit(pidns_init(outer, go[0], done[1]));
+            }
+            close(go[0]);
+            close(done[1]);
+            char byte, who[16];
+            if (read(done[0], &byte, 1) != 1) _exit(91);
+            snprintf(who, sizeof who, "%d", init);
+            printf("maker: same=%d own=%d\n", ns_same("self", "pid_for_children", who, "pid"),
+                   ns_same("self", "pid", "self", "pid_for_children"));
+            fflush(stdout);
+            kill(init, SIGTERM);
+            kill(init, SIGUSR1);
+            if (write(go[1], "x", 1) != 1) _exit(92);
+            /* Its init has exited: no process may join it any more. */
+            int status = 0;
+            pid_t waited = waitpid(init, &status, 0);
+            printf("maker: init-waited=%d status=%d\n", waited == init,
+                   WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            errno = 0;
+            pid_t late = child();
+            if (late == 0) _exit(98);
+            printf("maker: late=%d errno=%d\n", late, errno);
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
         return 0;
     }
     if (!strcmp(mode, "namespaces")) {

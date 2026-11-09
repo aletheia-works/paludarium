@@ -1,14 +1,16 @@
 //! A thread's namespaces, as Linux's `nsproxy` with the user and PID
 //! namespaces beside it: each thread has its own set, which `clone`,
 //! `unshare` and `setns` change and `/proc/<pid>/ns` shows. The UTS
-//! namespace holds the host and domain names that `uname` reports, and the
-//! IPC namespace the System V shared memory segments; the mount, cgroup and
-//! time namespaces have nothing in them that paludarium keeps apart (there
-//! is no `mount`, no cgroup file and no clock offset), so a new one differs
-//! only in its identity. The network,
-//! PID and user namespaces are the first ones only.
+//! namespace holds the host and domain names that `uname` reports, the IPC
+//! namespace the System V shared memory segments, and a PID namespace the
+//! numbers it gives the tasks in it ([`Pids`]); the mount, cgroup and time
+//! namespaces have nothing in them that paludarium keeps apart (there is no
+//! `mount`, no cgroup file and no clock offset), so a new one differs only
+//! in its identity. The network and user namespaces are the first ones
+//! only.
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -22,7 +24,7 @@ pub(crate) const CLONE_NEWPID: u64 = 0x2000_0000;
 pub(crate) const CLONE_NEWNET: u64 = 0x4000_0000;
 /// The namespaces a thread can have new ones of here.
 pub(crate) const SUPPORTED: u64 =
-    CLONE_NEWTIME | CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC;
+    CLONE_NEWTIME | CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID;
 /// Every namespace flag; those not in [`SUPPORTED`] are `EINVAL`, as from a
 /// kernel built without them.
 pub(crate) const ALL: u64 = SUPPORTED | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
@@ -63,6 +65,9 @@ const PID_INIT: u32 = 0xEFFF_FFFC;
 const CGROUP_INIT: u32 = 0xEFFF_FFFB;
 const TIME_INIT: u32 = 0xEFFF_FFFA;
 const DYNAMIC_FIRST: u32 = 0xF000_0000;
+/// `MAX_PID_NS_LEVEL`: how many PID namespaces nest below the first, which
+/// is level 0, as Linux's `init_pid_ns`.
+const MAX_PID_LEVEL: u32 = 32;
 
 /// What kind of namespace one is, by its `CLONE_NEW*` flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,14 +128,20 @@ pub(crate) struct Namespace {
     /// The System V shared memory segments of an IPC namespace, which go
     /// with it, as Linux's `shm_exit_ns` removes them.
     pub shm: crate::shm::Segments,
+    /// The numbers of a PID namespace.
+    pids: Pids,
 }
 impl Namespace {
     fn new(kind: Kind, inode: u32, names: UtsNames) -> Arc<Self> {
+        Self::within(kind, inode, names, Pids::default())
+    }
+    fn within(kind: Kind, inode: u32, names: UtsNames, pids: Pids) -> Arc<Self> {
         Arc::new(Self {
             kind,
             inode,
             names: Mutex::new(names),
             shm: crate::shm::Segments::default(),
+            pids,
         })
     }
     /// What its link in `/proc/<pid>/ns` reads, as Linux's `ns_get_name`.
@@ -156,6 +167,139 @@ impl Namespace {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .domain = name.to_vec();
+    }
+}
+
+/// What a PID namespace numbers, as Linux's `struct pid` gives a task a
+/// number in each namespace from its own up to the first. The first
+/// namespace numbers every task by its ID in the emulator, which is what
+/// the rest of the kernel names tasks by, so it keeps no table; a nested
+/// one hands out its own numbers from 1, and its task 1 is its init.
+#[derive(Debug, Default)]
+struct Pids {
+    /// The namespace it was made in; none for the first.
+    parent: Option<Arc<Namespace>>,
+    /// How many namespaces it is beneath the first.
+    depth: u32,
+    numbers: Mutex<Numbers>,
+}
+#[derive(Debug, Default)]
+struct Numbers {
+    /// The last number handed out.
+    last: u32,
+    /// Each task's number, by the task's ID in the emulator, and back.
+    by_task: BTreeMap<u32, u32>,
+    by_number: BTreeMap<u32, u32>,
+    /// The task numbered 1, the namespace's init (Linux's
+    /// `child_reaper`), once there is one; it stays after the init exits.
+    init: Option<u32>,
+    /// Its init has exited, so no task may join it (Linux clears
+    /// `PIDNS_ADDING`).
+    closed: bool,
+}
+impl Namespace {
+    fn numbers(&self) -> std::sync::MutexGuard<'_, Numbers> {
+        self.pids
+            .numbers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Whether this is the first PID namespace.
+    pub(crate) fn is_first(&self) -> bool {
+        self.pids.parent.is_none()
+    }
+    /// The number this PID namespace knows task `id` by (Linux's
+    /// `pid_nr_ns`): 0 for a task outside it, and for 0.
+    pub(crate) fn number(&self, id: u32) -> u32 {
+        if self.is_first() {
+            return id;
+        }
+        self.numbers().by_task.get(&id).copied().unwrap_or(0)
+    }
+    /// The task this PID namespace numbers `number`, by its ID in the
+    /// emulator (`find_pid_ns`); `None` for 0 and for a number it has not
+    /// handed out.
+    pub(crate) fn task(&self, number: u32) -> Option<u32> {
+        if number == 0 {
+            return None;
+        }
+        if self.is_first() {
+            return Some(number);
+        }
+        self.numbers().by_number.get(&number).copied()
+    }
+    /// Whether this PID namespace is `other` or nested within it, so that
+    /// `other` numbers every task in it.
+    pub(crate) fn is_within(&self, other: &Namespace) -> bool {
+        let mut at = self;
+        loop {
+            if std::ptr::eq(at, other) {
+                return true;
+            }
+            match &at.pids.parent {
+                Some(parent) => at = parent,
+                None => return false,
+            }
+        }
+    }
+    /// The init of this PID namespace, by its ID in the emulator: the first
+    /// process for the first namespace, the task numbered 1 of another.
+    pub(crate) fn init(&self) -> Option<u32> {
+        if self.is_first() {
+            return Some(1);
+        }
+        self.numbers().init
+    }
+    /// Its init has exited: no task may join it any more.
+    pub(crate) fn close(&self) {
+        self.numbers().closed = true;
+    }
+    /// Gives task `id` a number in this PID namespace and in each one it is
+    /// in, as Linux's `alloc_pid`: `ENOMEM` when its init has exited (as
+    /// there, only this namespace's is looked at), and the first task of a
+    /// namespace is its init. On a failure it has no number in any.
+    pub(crate) fn enter(&self, id: u32) -> Result<(), Errno> {
+        if self.is_first() {
+            return Ok(());
+        }
+        if self.numbers().closed {
+            return Err(Errno::ENOMEM);
+        }
+        let mut at = self;
+        while let Some(parent) = &at.pids.parent {
+            let mut numbers = at.numbers();
+            let number = numbers
+                .last
+                .checked_add(1)
+                .filter(|&n| n <= i32::MAX as u32);
+            let Some(number) = number else {
+                drop(numbers);
+                self.leave(id);
+                return Err(Errno::EAGAIN);
+            };
+            numbers.last = number;
+            numbers.by_task.insert(id, number);
+            numbers.by_number.insert(number, id);
+            if number == 1 {
+                numbers.init = Some(id);
+            }
+            drop(numbers);
+            at = parent;
+        }
+        Ok(())
+    }
+    /// Forgets task `id`, which is gone, in this PID namespace and in each
+    /// one it is in (`free_pid`).
+    pub(crate) fn leave(&self, id: u32) {
+        let mut at = self;
+        while let Some(parent) = &at.pids.parent {
+            let mut numbers = at.numbers();
+            if let Some(number) = numbers.by_task.remove(&id) {
+                numbers.by_number.remove(&number);
+            }
+            drop(numbers);
+            at = parent;
+        }
     }
 }
 
@@ -275,9 +419,21 @@ impl Namespaces {
     }
     /// The namespaces with new ones for the [`SUPPORTED`] flags in `flags`,
     /// as Linux's `create_new_namespaces`: a new UTS namespace starts with
-    /// a copy of the names, and a new time namespace is the one children
-    /// take, made from the one they took before.
-    pub(crate) fn unshared(&self, flags: u64) -> Self {
+    /// a copy of the names, and new time and PID namespaces are the ones
+    /// children take, made from the ones they took before. As
+    /// `copy_pid_ns`, a new PID namespace is `EINVAL` while the children
+    /// already take another than the thread's own, and `ENOSPC` beyond
+    /// [`MAX_PID_LEVEL`]; that is checked before anything is made.
+    pub(crate) fn unshared(&self, flags: u64) -> Result<Self, Errno> {
+        if flags & CLONE_NEWPID != 0 {
+            if !Arc::ptr_eq(&self.pid, &self.pid_for_children) {
+                return Err(Errno::EINVAL);
+            }
+            // The level Linux gives the new one, the first being 0.
+            if self.pid.pids.depth + 1 > MAX_PID_LEVEL {
+                return Err(Errno(28)); // ENOSPC
+            }
+        }
         let mut new = self.clone();
         if flags & CLONE_NEWUTS != 0 {
             new.uts = self.fresh(&self.uts);
@@ -288,23 +444,34 @@ impl Namespaces {
         if flags & CLONE_NEWNS != 0 {
             new.mnt = self.fresh(&self.mnt);
         }
+        if flags & CLONE_NEWPID != 0 {
+            let inode = self.inodes.fetch_add(1, Ordering::SeqCst);
+            let pids = Pids {
+                parent: Some(self.pid.clone()),
+                depth: self.pid.pids.depth + 1,
+                numbers: Mutex::default(),
+            };
+            new.pid_for_children = Namespace::within(Kind::Pid, inode, self.pid.names(), pids);
+        }
         if flags & CLONE_NEWCGROUP != 0 {
             new.cgroup = self.fresh(&self.cgroup);
         }
         if flags & CLONE_NEWTIME != 0 {
             new.time_for_children = self.fresh(&self.time_for_children);
         }
-        new
+        Ok(new)
     }
     /// A child's namespaces, as Linux's `copy_namespaces`: new ones for
-    /// `flags`, and, for a child that does not share the memory
-    /// (`timens_on_fork`), the time namespace children take.
-    pub(crate) fn for_child(&self, flags: u64, shares_memory: bool) -> Self {
-        let mut new = self.unshared(flags);
+    /// `flags`; the PID namespace children take, which numbers the child;
+    /// and, for a child that does not share the memory (`timens_on_fork`),
+    /// the time namespace children take.
+    pub(crate) fn for_child(&self, flags: u64, shares_memory: bool) -> Result<Self, Errno> {
+        let mut new = self.unshared(flags)?;
         if !shares_memory {
             new.time = new.time_for_children.clone();
         }
-        new
+        new.pid = new.pid_for_children.clone();
+        Ok(new)
     }
     /// After exec, as Linux's `exec_task_namespaces`: the program runs in
     /// the time namespace children take.
@@ -404,7 +571,7 @@ mod tests {
     #[test]
     fn unsharing_makes_new_namespaces_of_only_the_flags() {
         let first = Namespaces::default();
-        let new = first.unshared(CLONE_NEWUTS | CLONE_NEWNS);
+        let new = first.unshared(CLONE_NEWUTS | CLONE_NEWNS).unwrap();
         assert!(!Arc::ptr_eq(&first.uts, &new.uts));
         assert!(!Arc::ptr_eq(&first.mnt, &new.mnt));
         assert!(Arc::ptr_eq(&first.ipc, &new.ipc));
@@ -420,16 +587,44 @@ mod tests {
     #[test]
     fn a_new_time_namespace_is_for_children() {
         let first = Namespaces::default();
-        let new = first.unshared(CLONE_NEWTIME);
+        let new = first.unshared(CLONE_NEWTIME).unwrap();
         assert!(Arc::ptr_eq(&first.time, &new.time));
         assert!(!Arc::ptr_eq(&new.time, &new.time_for_children));
         // A fork enters it; a child sharing the memory (vfork, a thread)
         // does not, until it runs a program.
-        let forked = new.for_child(0, false);
+        let forked = new.for_child(0, false).unwrap();
         assert!(Arc::ptr_eq(&forked.time, &new.time_for_children));
-        let shared = new.for_child(0, true);
+        let shared = new.for_child(0, true).unwrap();
         assert!(Arc::ptr_eq(&shared.time, &first.time));
         assert!(Arc::ptr_eq(&shared.exec().time, &new.time_for_children));
+    }
+
+    #[test]
+    fn pid_namespaces_nest_32_levels_below_the_first() {
+        let mut at = Namespaces::default();
+        for _ in 0..MAX_PID_LEVEL {
+            at = at.for_child(CLONE_NEWPID, false).unwrap();
+        }
+        assert_eq!(at.pid.pids.depth, 32);
+        assert_eq!(at.unshared(CLONE_NEWPID).unwrap_err(), Errno(28));
+    }
+
+    #[test]
+    fn a_task_has_a_number_in_each_namespace_it_is_in() {
+        let outer = Namespaces::default()
+            .for_child(CLONE_NEWPID, false)
+            .unwrap();
+        let inner = outer.for_child(CLONE_NEWPID, false).unwrap();
+        inner.pid.enter(7).unwrap();
+        assert_eq!((inner.pid.number(7), outer.pid.number(7)), (1, 1));
+        assert_eq!(inner.pid.init(), Some(7));
+        inner.pid.enter(9).unwrap();
+        assert_eq!(inner.pid.task(2), Some(9));
+        inner.pid.leave(9);
+        assert_eq!((inner.pid.number(9), outer.pid.number(9)), (0, 0));
+        inner.pid.close();
+        assert_eq!(inner.pid.enter(11), Err(Errno::ENOMEM));
+        assert_eq!(outer.pid.number(11), 0);
     }
 
     #[test]

@@ -654,11 +654,12 @@ kernel.
   has no semaphore adjustments to drop, as there are no System V semaphores. Its
   namespace flags give the thread new namespaces, as below.
 - Each thread has its own namespaces, as Linux's `nsproxy`: UTS, IPC,
-  mount, cgroup and time ones of its own, and the first network, PID and
+  mount, cgroup, time and PID ones of its own, and the first network and
   user namespaces. `unshare` with `CLONE_NEWUTS`, `CLONE_NEWIPC`,
-  `CLONE_NEWNS`, `CLONE_NEWCGROUP` or `CLONE_NEWTIME` gives it new ones, and
-  so does `clone` (`CLONE_NEWTIME` through `clone3`) for its child, a thread
-  too, with `CAP_SYS_ADMIN` (`EPERM` without it). A new UTS namespace starts
+  `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWTIME` or `CLONE_NEWPID` gives
+  it new ones, and so does `clone` (`CLONE_NEWTIME` through `clone3`) for
+  its child, a thread too (but not `CLONE_NEWPID`), with `CAP_SYS_ADMIN`
+  (`EPERM` without it). A new UTS namespace starts
   with a copy of the host and domain names, which `sethostname` and
   `setdomainname` then change for it alone. A new time namespace is the one
   the thread's children enter: a child that does not share its memory
@@ -675,9 +676,38 @@ kernel.
   user namespace is `EINVAL`, a time namespace needs the thread alone in its
   memory (`EUSERS`), a mount namespace entered by itself a working directory
   no other thread shares (`EINVAL`) and `CAP_SYS_CHROOT`, and each one
-  `CAP_SYS_ADMIN` (`EPERM`). Entering a mount namespace moves the working
-  directory to its root. See [Limitations](./limitations.md) for the
-  namespaces paludarium has no new ones of.
+  `CAP_SYS_ADMIN` (`EPERM`), and a PID namespace must be the thread's own
+  or one nested in it (`EINVAL`). Entering a mount namespace moves the working
+  directory to its root, and entering a PID namespace makes it the one the
+  thread's children are numbered in. See [Limitations](./limitations.md) for
+  the namespaces paludarium has no new ones of.
+- A new PID namespace, as Linux's, is the one the thread's children are
+  numbered in; the thread stays in its own, and its `pid_for_children` link
+  is `ENOENT` until the first child, the namespace's init, numbered 1. A
+  second `CLONE_NEWPID` while the children have a new one is `EINVAL`, and so
+  is a thread then, which would be numbered apart from its process; a
+  namespace more than Linux's 32 levels below the first is
+  `ENOSPC`. A process or thread has a number in its namespace and in each
+  one that namespace is in, and a process sees the others as its namespace
+  numbers them: a process outside it is 0, and a number it has not handed
+  out names nothing. So it is for `getpid`, `gettid`, `getppid`, `getpgid`,
+  `getpgrp`, `getsid`, `setsid`, `setpgid`, `kill`, `tkill`, `tgkill`,
+  `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `wait4`, `waitid`, `pidfd_open`,
+  `getpriority`, `setpriority`, `ioprio_get`, `ioprio_set`, the `sched_*`
+  calls, `prlimit64`, `capget`, `capset` and `get_robust_list`; for what
+  `clone` returns and stores, `set_tid_address` returns, and the `si_pid` of
+  a signal (0 from outside); for `F_SETOWN`, `F_GETOWN`, `F_GETLK`'s `l_pid`,
+  `TIOCGPGRP`, `TIOCSPGRP` and `TIOCGSID`; for `SCM_CREDENTIALS` and
+  `SO_PEERCRED`; for `shmctl`'s process IDs; and for a core's. `kill(-1)`
+  signals the processes of the caller's namespace but its init. `/proc`
+  shows the first namespace's IDs, as Linux's `/proc` mounted in it does.
+  The init takes only the signals it has a handler for, and SIGKILL and
+  SIGSTOP from outside its namespace or from the kernel (Linux's
+  `SIGNAL_UNKILLABLE`); a fault still ends it. Orphans of the namespace come
+  to it, or to a child subreaper within the namespace. When it exits, every
+  other process of the namespace gets SIGKILL and none may join it any more
+  (`ENOMEM`); its parent learns of the exit only once the rest is gone, its
+  children reaped by the init, as Linux's `zap_pid_ns_processes`.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,

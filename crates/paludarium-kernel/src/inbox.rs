@@ -62,8 +62,17 @@ impl SignalInbox {
             ..signals::PendingSignal::user(17, code)
         })
     }
+    #[cfg(test)]
     pub(crate) fn send_thread(&self, number: i32, uid: u32) -> Result<(), Errno> {
         self.send_pending(signals::PendingSignal {
+            sender_uid: Some(uid),
+            ..signals::PendingSignal::thread(number, -6)
+        })
+    }
+    /// The same from process `sender`, as the receiver numbers it.
+    pub(crate) fn send_thread_from(&self, number: i32, sender: u32, uid: u32) -> Result<(), Errno> {
+        self.send_pending(signals::PendingSignal {
+            sender: Some(sender),
             sender_uid: Some(uid),
             ..signals::PendingSignal::thread(number, -6)
         })

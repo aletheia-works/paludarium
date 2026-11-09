@@ -685,7 +685,7 @@ kernel.
   is `ENOENT` until the first child, the namespace's init, numbered 1. A
   second `CLONE_NEWPID` while the children have a new one is `EINVAL`, and so
   is a thread then, which would be numbered apart from its process; a
-  namespace deeper than Linux's 32 levels (the first one being level 1) is
+  namespace more than Linux's 32 levels below the first is
   `ENOSPC`. A process or thread has a number in its namespace and in each
   one that namespace is in, and a process sees the others as its namespace
   numbers them: a process outside it is 0, and a number it has not handed

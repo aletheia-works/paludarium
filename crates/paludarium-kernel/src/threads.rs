@@ -143,7 +143,7 @@ impl Default for ThreadGroup {
     }
 }
 impl ThreadGroup {
-    /// Keeps the robust list head of `tid`.
+    /// Whether the process is the init of a nested PID namespace.
     pub(crate) fn unkillable(&self) -> bool {
         self.unkillable.load(Ordering::SeqCst)
     }
@@ -168,9 +168,11 @@ impl ThreadGroup {
     pub(crate) fn blocked(&self, tid: u32) -> u64 {
         self.public(tid).map_or(0, |thread| thread.blocked)
     }
+    /// Makes the process the init of a nested PID namespace.
     pub(crate) fn set_unkillable(&self) {
         self.unkillable.store(true, Ordering::SeqCst);
     }
+    /// Keeps the robust list head of `tid`.
     pub(crate) fn set_robust_list(&self, tid: u32, head: u64) {
         self.robust_lists
             .lock()

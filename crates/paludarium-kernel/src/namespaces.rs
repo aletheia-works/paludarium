@@ -65,9 +65,8 @@ const PID_INIT: u32 = 0xEFFF_FFFC;
 const CGROUP_INIT: u32 = 0xEFFF_FFFB;
 const TIME_INIT: u32 = 0xEFFF_FFFA;
 const DYNAMIC_FIRST: u32 = 0xF000_0000;
-/// `MAX_PID_NS_LEVEL`: how deep PID namespaces nest. The first one counts
-/// as level 1, as the first process is the init of a namespace beneath the
-/// host's.
+/// `MAX_PID_NS_LEVEL`: how many PID namespaces nest below the first, which
+/// is level 0, as Linux's `init_pid_ns`.
 const MAX_PID_LEVEL: u32 = 32;
 
 /// What kind of namespace one is, by its `CLONE_NEW*` flag.
@@ -256,8 +255,9 @@ impl Namespace {
         self.numbers().closed = true;
     }
     /// Gives task `id` a number in this PID namespace and in each one it is
-    /// in, as Linux's `alloc_pid`: `ENOMEM` when its init has exited, and
-    /// the first task of a namespace is its init.
+    /// in, as Linux's `alloc_pid`: `ENOMEM` when its init has exited (as
+    /// there, only this namespace's is looked at), and the first task of a
+    /// namespace is its init. On a failure it has no number in any.
     pub(crate) fn enter(&self, id: u32) -> Result<(), Errno> {
         if self.is_first() {
             return Ok(());
@@ -272,7 +272,11 @@ impl Namespace {
                 .last
                 .checked_add(1)
                 .filter(|&n| n <= i32::MAX as u32);
-            let number = number.ok_or(Errno::EAGAIN)?;
+            let Some(number) = number else {
+                drop(numbers);
+                self.leave(id);
+                return Err(Errno::EAGAIN);
+            };
             numbers.last = number;
             numbers.by_task.insert(id, number);
             numbers.by_number.insert(number, id);
@@ -425,8 +429,8 @@ impl Namespaces {
             if !Arc::ptr_eq(&self.pid, &self.pid_for_children) {
                 return Err(Errno::EINVAL);
             }
-            // The level Linux gives the new one, the first being 1.
-            if self.pid.pids.depth + 2 > MAX_PID_LEVEL {
+            // The level Linux gives the new one, the first being 0.
+            if self.pid.pids.depth + 1 > MAX_PID_LEVEL {
                 return Err(Errno(28)); // ENOSPC
             }
         }
@@ -593,6 +597,34 @@ mod tests {
         let shared = new.for_child(0, true).unwrap();
         assert!(Arc::ptr_eq(&shared.time, &first.time));
         assert!(Arc::ptr_eq(&shared.exec().time, &new.time_for_children));
+    }
+
+    #[test]
+    fn pid_namespaces_nest_32_levels_below_the_first() {
+        let mut at = Namespaces::default();
+        for _ in 0..MAX_PID_LEVEL {
+            at = at.for_child(CLONE_NEWPID, false).unwrap();
+        }
+        assert_eq!(at.pid.pids.depth, 32);
+        assert_eq!(at.unshared(CLONE_NEWPID).unwrap_err(), Errno(28));
+    }
+
+    #[test]
+    fn a_task_has_a_number_in_each_namespace_it_is_in() {
+        let outer = Namespaces::default()
+            .for_child(CLONE_NEWPID, false)
+            .unwrap();
+        let inner = outer.for_child(CLONE_NEWPID, false).unwrap();
+        inner.pid.enter(7).unwrap();
+        assert_eq!((inner.pid.number(7), outer.pid.number(7)), (1, 1));
+        assert_eq!(inner.pid.init(), Some(7));
+        inner.pid.enter(9).unwrap();
+        assert_eq!(inner.pid.task(2), Some(9));
+        inner.pid.leave(9);
+        assert_eq!((inner.pid.number(9), outer.pid.number(9)), (0, 0));
+        inner.pid.close();
+        assert_eq!(inner.pid.enter(11), Err(Errno::ENOMEM));
+        assert_eq!(outer.pid.number(11), 0);
     }
 
     #[test]

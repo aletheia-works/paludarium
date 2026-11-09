@@ -2290,6 +2290,30 @@ mod namespaces {
         );
     }
     #[test]
+    fn clone_ignores_the_upper_half_of_its_flags() {
+        // sys_clone keeps the low 32 bits: the bit clone3's CLONE_NEWTIME
+        // travels in is a plain fork from clone, as are CLONE_CLEAR_SIGHAND's,
+        // with or without CAP_SYS_ADMIN, and the child stays in the time
+        // namespace.
+        let (mut k, mut t, m) = setup();
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        let time = link(&mut k, &mut t, &m, "/proc/self/ns/time");
+        t.state.credentials = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        for high in [
+            crate::namespaces::CLONE3_NEWTIME,
+            crate::processes::CLONE_CLEAR_SIGHAND,
+        ] {
+            let pid = syscall(&mut k, &mut t, &m, 56, [high | 17, 0, 0, 0, 0, 0]);
+            assert!(pid < 1 << 20, "{high:#x}: {}", pid as i64);
+            let (mut child, mut ct) = k.take_child().unwrap();
+            assert_eq!(link(&mut child, &mut ct, &m, "/proc/self/ns/time"), time);
+            assert_eq!(
+                link(&mut child, &mut ct, &m, "/proc/self/ns/time_for_children"),
+                time
+            );
+        }
+    }
+    #[test]
     fn setns_into_a_time_namespace_enters_it_and_gives_it_to_children() {
         let (mut k, mut t, m) = setup();
         assert_eq!(

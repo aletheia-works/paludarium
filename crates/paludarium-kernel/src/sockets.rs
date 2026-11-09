@@ -645,9 +645,6 @@ const SCM_RIGHTS: u32 = 1;
 const SCM_CREDENTIALS: u32 = 2;
 /// `struct ucred`: a process ID, a user and a group.
 const UCRED: usize = 12;
-/// The user and group a message without credentials reads as, Linux's
-/// `overflowuid` and `overflowgid`.
-const OVERFLOW_ID: u32 = 65534;
 /// `SCM_MAX_FD`: the most descriptors one message passes.
 const MAX_PASSED: usize = 253;
 /// `struct cmsghdr`: `cmsg_len` (8 bytes), `cmsg_level` and `cmsg_type`.
@@ -1980,8 +1977,8 @@ fn stream_truesize(len: usize) -> usize {
 /// The credentials a write carries, as Linux's `UNIXCB` keeps them for
 /// `SCM_CREDENTIALS`: its sender's process ID, user and group when either
 /// end passed credentials (`SO_PASSCRED`) as it was sent, or those it gave
-/// itself, else none, which a receiver reads as process 0 and the overflow
-/// IDs.
+/// itself, else none: process 0 and no user or group (`INVALID_UID`),
+/// which a receiver reads as the overflow IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ucred {
     pid: u32,
@@ -1992,8 +1989,8 @@ impl Default for Ucred {
     fn default() -> Self {
         Self {
             pid: 0,
-            uid: OVERFLOW_ID,
-            gid: OVERFLOW_ID,
+            uid: crate::users::INVALID,
+            gid: crate::users::INVALID,
         }
     }
 }

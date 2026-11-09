@@ -4016,7 +4016,7 @@ fn open_path(
         // The user namespace's files take one write, as Linux's
         // `proc_uid_map_write` and `proc_setgroups_write`: opened for writing
         // by whom their mode lets, and `setgroups` only with CAP_SYS_ADMIN
-        // in the namespace.
+        // in the namespace (`proc_setgroups_open`'s `EACCES`).
         if let crate::proc::TaskEntry::IdMap(_) | crate::proc::TaskEntry::Setgroups = path.entry {
             let content =
                 tasks::content(&task, path.entry, &c.process.credentials.user).unwrap_or_default();
@@ -4028,7 +4028,7 @@ fn open_path(
                 if path.entry == crate::proc::TaskEntry::Setgroups
                     && !creds.capable_in(crate::credentials::CAP_SYS_ADMIN, &user)
                 {
-                    return Err(Errno::EPERM);
+                    return Err(Errno::EACCES);
                 }
             }
             let ids = match path.entry {

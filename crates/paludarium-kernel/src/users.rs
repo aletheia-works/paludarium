@@ -137,8 +137,12 @@ impl Namespace {
         Ok(Namespace::user(inode, users))
     }
     /// The ID that `kernel` (an ID of the first namespace) is here
-    /// (`from_kuid`): `None` when the namespace does not map it.
+    /// (`from_kuid`): `None` when the namespace does not map it, and for
+    /// [`INVALID`], which names nobody.
     pub(crate) fn id_of(&self, ids: Ids, kernel: u32) -> Option<u32> {
+        if kernel == INVALID {
+            return None;
+        }
         if self.is_first_user() {
             return Some(kernel);
         }
@@ -567,6 +571,17 @@ impl paludarium_host::FileHandle for MapFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nobody_shows_as_the_overflow_id_where_65534_is_mapped() {
+        let root = Credentials::default();
+        let ns = Namespace::new_user(first(), 0xF000_1000, &root).unwrap();
+        ns.write_map(Ids::User, b"0 65534 1", &root, &root).unwrap();
+        assert_eq!(ns.shown(Ids::User, OVERFLOW), 0);
+        assert_eq!(ns.shown(Ids::User, INVALID), OVERFLOW);
+        assert_eq!(first().shown(Ids::User, INVALID), OVERFLOW);
+        assert_eq!(first().id_of(Ids::Group, INVALID), None);
+    }
 
     #[test]
     fn maps_parse_as_linux_reads_them() {

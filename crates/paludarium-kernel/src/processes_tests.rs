@@ -4434,6 +4434,14 @@ mod user_namespaces {
             write(&mut k, &mut t, &m, setgroups, b"deny"),
             e(Errno::EPERM)
         );
+        // Opening it to write needs CAP_SYS_ADMIN in the namespace.
+        let caps = t.state.credentials.effective;
+        t.state.credentials.effective = 0;
+        assert_eq!(
+            write(&mut k, &mut t, &m, setgroups, b"deny"),
+            e(Errno::EACCES)
+        );
+        t.state.credentials.effective = caps;
         assert_eq!(
             read(&mut k, &mut t, &m, map),
             b"         0       1000          1\n"

@@ -664,11 +664,11 @@ kernel.
   `membarrier`, or when a signal is delivered, a critical section it is in
   goes on at its abort handler, as after Linux's preemption, migration or
   signal. As current Linux, the kernel reads only where the section is
-  while the thread is outside it, and then clears the area's `rseq_cs`; a
-  descriptor it does not accept for a thread inside the section (a version,
-  flags, an abort handler inside it or without the signature before it), a
-  section past user space and an area the kernel cannot write end the
-  thread by `SIGSEGV`. While threads wait for
+  while the thread is outside it, and then clears the area's `rseq_cs`, and
+  reads neither a descriptor's version nor its flags. An abort handler a
+  thread inside the section cannot use (inside the section, or without the
+  signature before it), a section past user space and an area the kernel
+  cannot write end the thread by `SIGSEGV`. While threads wait for
   a CPU, one that has kept its own for 4 ms lets them have it first. A
   fork keeps the registration; a new thread, a `CLONE_VM` child and an
   exec start without one.

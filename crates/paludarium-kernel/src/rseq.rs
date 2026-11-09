@@ -518,8 +518,9 @@ fn clear(mem: &AddressSpace, area: u64) -> Result<(), ()> {
 /// `restart`: it was preempted, moved or sent a signal. `Err` is what Linux
 /// sends `SIGSEGV` for: an area or descriptor it cannot read or write, a
 /// section past the end of user space, or, for a thread inside the section,
-/// a descriptor it does not accept: an abort handler past user space,
-/// inside the section or not after the signature, or a version or flags.
+/// an abort handler past user space, inside the section or not after the
+/// signature. The descriptor's version and flags are not read, as current
+/// Linux no longer reads them.
 pub(crate) fn fixup(
     mem: &AddressSpace,
     registration: &Registration,
@@ -551,10 +552,6 @@ pub(crate) fn fixup(
     }
     let abort = read_u64(mem, descriptor.wrapping_add(24))?;
     if !(4..TASK_SIZE).contains(&abort) || abort.wrapping_sub(start) < length {
-        return Err(());
-    }
-    // The version and the flags, which must both be 0.
-    if read_u64(mem, descriptor)? != 0 {
         return Err(());
     }
     if read_u32(mem, abort - 4)? != registration.signature {

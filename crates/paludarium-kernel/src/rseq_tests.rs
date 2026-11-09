@@ -89,14 +89,9 @@ fn a_thread_in_its_section_goes_on_at_the_abort_handler() {
 #[test]
 fn a_descriptor_is_refused_only_for_a_thread_inside_its_section() {
     let mem = memory();
-    // A version, flags, an abort handler inside the section, and another
-    // signature before the handler.
-    let refused: [(u32, u32, u64, u32); 4] = [
-        (1, 0, ABORT, SIGNATURE),
-        (0, 1, ABORT, SIGNATURE),
-        (0, 0, START + 4, SIGNATURE),
-        (0, 0, ABORT, 1),
-    ];
+    // An abort handler inside the section, and another signature before
+    // the handler.
+    let refused: [(u32, u32, u64, u32); 2] = [(0, 0, START + 4, SIGNATURE), (0, 0, ABORT, 1)];
     for (version, flags, abort, signature) in refused {
         // Outside the section, the descriptor is only cleared, as current
         // Linux reads no more of it than where the section is.
@@ -115,13 +110,16 @@ fn a_descriptor_is_refused_only_for_a_thread_inside_its_section() {
         assert_eq!(fixup(&mem, &registration(), &mut rip, true), Err(()));
         assert_eq!(rip, START + 2);
     }
-    // The area's own flags are no longer read.
-    describe(&mem, 0, 0, ABORT);
-    mem.write(GuestAddr(AREA + 16), &2u32.to_le_bytes())
-        .unwrap();
-    let mut rip = START;
-    assert_eq!(fixup(&mem, &registration(), &mut rip, true), Ok(()));
-    assert_eq!(rip, ABORT);
+    // Neither the descriptor's version and flags nor the area's own flags
+    // are read any more: the section is aborted.
+    for (version, flags) in [(1, 0), (0, 1)] {
+        describe(&mem, version, flags, ABORT);
+        mem.write(GuestAddr(AREA + 16), &2u32.to_le_bytes())
+            .unwrap();
+        let mut rip = START;
+        assert_eq!(fixup(&mem, &registration(), &mut rip, true), Ok(()));
+        assert_eq!(rip, ABORT);
+    }
 }
 
 #[test]

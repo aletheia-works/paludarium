@@ -4537,8 +4537,10 @@ static int rseq_case(void) {
     pthread_join(sender.thread, 0);
     printf("outside cs-cleared=%d\n", rseq_main.rseq_cs == 0);
 
-    /* Descriptors the kernel does not accept end a thread inside their
-     * section by SIGSEGV when it next looks at them: here, for a signal. */
+    /* A descriptor the kernel does not accept ends a thread inside its
+     * section by SIGSEGV when it next looks at it: here, for a signal.
+     * Current Linux reads neither the version nor the flags, so a section
+     * with them is aborted (the child exits 51). */
     static struct rseq_desc version = {1, 0, 0, 0, 0}, flagged = {0, 1, 0, 0, 0};
     static struct rseq_desc inside = {0, 0, 0, 0, 0};
     version.start = flagged.start = inside.start = (uint64_t)rseq_spin_start;

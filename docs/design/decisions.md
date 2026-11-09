@@ -43,6 +43,22 @@ Linux's TLB shootdown, no other thread writes through the old page after
 but a store that spans words first waits its turn behind the others to the
 same page (below), so it can last as long as that queue.
 
+The pages of a private file mapping go in the TLB too: the file's page-cache
+pages, which the mapping shows until it writes them, and the copies it has
+made. Their file can shrink without the address space's lock, by `ftruncate`
+from any process, so an access through the TLB to one of them also checks
+that the page is not wholly past the end of the file, which raises SIGBUS,
+and, for a copy, that the file has not shrunk since the TLB took it, after
+which Linux may have dropped the copy. Otherwise it takes the locks, which do
+both. Each access checks both itself, so the order in which a truncation
+changes them does not matter: an access that saw neither change comes before
+the truncation, as one under way while it ran, and a copy that the truncation
+leaves past the end is replaced at the next access under the locks, so a
+store that landed in it is never seen. No access that starts after the
+truncation returns uses the page. Shared mappings stay out of the TLB, as
+their stores mark the pages dirty for write-back and move the shared pages'
+generation on.
+
 A locked instruction within one word is one compare-and-swap of the word, so
 it stays atomic against the stores that take no lock, and it is a full fence.
 A split lock across two words, or `CMPXCHG16B`, takes the locks and first

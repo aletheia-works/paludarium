@@ -667,3 +667,241 @@ fn a_load_it_holds_sees_a_16_byte_exchange_whole() {
     done.store(true, Ordering::Relaxed);
     thread.join().unwrap();
 }
+
+/// A file that can shrink, as the page cache counts it: each byte is its
+/// offset modulo 251, and a shrink counts, then sets the size, as the
+/// kernel's page cache does.
+struct Shrinking {
+    size: AtomicU64,
+    shrinks: std::sync::Mutex<Vec<(u64, u64)>>,
+    count: AtomicU64,
+}
+impl Shrinking {
+    fn new(size: u64) -> Arc<Self> {
+        Arc::new(Shrinking {
+            size: AtomicU64::new(size),
+            shrinks: std::sync::Mutex::default(),
+            count: AtomicU64::new(0),
+        })
+    }
+    fn resize(&self, size: u64) {
+        if size < self.size.load(Ordering::SeqCst) {
+            let mut shrinks = self.shrinks.lock().unwrap();
+            let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+            shrinks.push((count, size));
+        }
+        self.size.store(size, Ordering::SeqCst);
+    }
+}
+impl PageSource for Shrinking {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let size = self.size.load(Ordering::SeqCst);
+        let n =
+            usize::try_from(size.saturating_sub(offset)).map_or(buf.len(), |n| n.min(buf.len()));
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            *b = ((offset + i as u64) % 251) as u8;
+        }
+        Ok(n)
+    }
+    fn size(&self) -> Option<u64> {
+        Some(self.size.load(Ordering::SeqCst))
+    }
+    fn shrinks(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
+    }
+    fn shrunk_since(&self, count: u64) -> Option<u64> {
+        let shrinks = self.shrinks.lock().unwrap();
+        shrinks
+            .iter()
+            .filter(|&&(after, _)| after > count)
+            .map(|&(_, size)| size)
+            .min()
+    }
+}
+
+/// How a page of a private file mapping shows its file.
+#[derive(Clone, Copy, Debug)]
+enum FileView {
+    /// A copy of its own, read from the file when first touched.
+    Copy,
+    /// The file's page-cache page, until a write copies it.
+    Cache,
+}
+
+/// A space with `pages` pages of `file` mapped privately at `AT`, shown as
+/// `view` says.
+fn file_space(file: &Arc<Shrinking>, pages: u64, view: FileView) -> Arc<AddressSpace> {
+    let space = AddressSpace::new();
+    let len = pages * PAGE_SIZE;
+    space
+        .map_shared(
+            Some(GuestAddr(AT)),
+            len,
+            Prot::READ_WRITE,
+            MappingKind::File,
+        )
+        .unwrap();
+    let source: Arc<dyn PageSource> = file.clone();
+    match view {
+        FileView::Copy => space.back_with_file(GuestAddr(AT), len, source, 0),
+        FileView::Cache => {
+            let pages = SharedPages::new().with_source(source);
+            space.back_with_cache(GuestAddr(AT), len, &pages, 0)
+        }
+    }
+    .unwrap();
+    Arc::new(space)
+}
+
+#[test]
+fn a_file_page_its_thread_holds_takes_no_lock() {
+    for view in [FileView::Copy, FileView::Cache] {
+        let file = Shrinking::new(2 * PAGE_SIZE);
+        let space = file_space(&file, 2, view);
+        // A load of the file, and a store to a copy of its own.
+        assert!(
+            finishes_while_held(
+                &space,
+                Held::Both,
+                SHOULD_FINISH,
+                |space| {
+                    // The first touch of a page changes the page table,
+                    // which empties the TLB, so both come first.
+                    byte(space, AT + 5);
+                    space.write(GuestAddr(AT + PAGE_SIZE), &[1]).unwrap();
+                    used(space, AT + PAGE_SIZE);
+                    used(space, AT + 5);
+                },
+                |space| {
+                    assert_eq!(byte(space, AT + 5), 5);
+                    space.write(GuestAddr(AT + PAGE_SIZE + 1), &[2]).unwrap();
+                    space.write_u64(GuestAddr(AT + PAGE_SIZE + 8), 3).unwrap();
+                },
+            ),
+            "{view:?}"
+        );
+        assert_eq!(byte(&space, AT + PAGE_SIZE + 1), 2);
+        assert_eq!(space.read_u64(GuestAddr(AT + PAGE_SIZE + 8)).unwrap(), 3);
+        // A page-cache page is still copied first, under the locks.
+        if let FileView::Cache = view {
+            assert!(!finishes_while_held(
+                &space,
+                Held::Both,
+                SHOULD_WAIT,
+                |space| {
+                    used(space, AT);
+                },
+                |space| {
+                    space.write(GuestAddr(AT), &[9]).unwrap();
+                },
+            ));
+            assert_eq!(byte(&space, AT), 9);
+        }
+    }
+}
+
+#[test]
+fn a_file_page_it_holds_is_a_bus_error_once_its_file_ends_before_it() {
+    for view in [FileView::Copy, FileView::Cache] {
+        let file = Shrinking::new(2 * PAGE_SIZE);
+        let space = file_space(&file, 2, view);
+        let last = AT + PAGE_SIZE;
+        // A copy, or the page-cache page, which no write copied.
+        let shown = match view {
+            FileView::Copy => {
+                space.write(GuestAddr(last), &[7]).unwrap();
+                7
+            }
+            FileView::Cache => pattern(PAGE_SIZE),
+        };
+        assert_eq!(used(&space, last), shown, "{view:?}");
+        assert_eq!(used(&space, AT + 3), 3, "{view:?}");
+        // Within the last page of the file, the page stays.
+        file.resize(PAGE_SIZE + 1);
+        assert_eq!(byte(&space, last), shown, "{view:?}");
+        file.resize(PAGE_SIZE);
+        let fault = space.read(GuestAddr(last), &mut [0]).unwrap_err();
+        assert!(fault.bus && !fault.write, "{view:?}");
+        assert!(space.write(GuestAddr(last), &[8]).unwrap_err().bus);
+        assert!(space.read_u64(GuestAddr(last + 8)).unwrap_err().bus);
+        assert!(space.write_u64(GuestAddr(last + 8), 1).unwrap_err().bus);
+        assert_eq!(byte(&space, AT + 3), 3, "{view:?}");
+    }
+}
+
+#[test]
+fn a_copy_it_holds_goes_once_its_file_shrinks_past_it_even_when_it_grows_again() {
+    for view in [FileView::Copy, FileView::Cache] {
+        let file = Shrinking::new(2 * PAGE_SIZE);
+        let space = file_space(&file, 2, view);
+        let last = AT + PAGE_SIZE;
+        space.write(GuestAddr(last + 1), &[0xee]).unwrap();
+        assert_eq!(used(&space, last + 1), 0xee, "{view:?}");
+        file.resize(PAGE_SIZE);
+        file.resize(2 * PAGE_SIZE);
+        // As Linux drops the copy: the file shows again.
+        assert_eq!(byte(&space, last + 1), pattern(PAGE_SIZE + 1), "{view:?}");
+        // A shrink that leaves the copy within the file keeps it.
+        space.write(GuestAddr(last + 1), &[0xdd]).unwrap();
+        assert_eq!(used(&space, last + 1), 0xdd, "{view:?}");
+        file.resize(PAGE_SIZE + 2);
+        file.resize(2 * PAGE_SIZE);
+        assert_eq!(byte(&space, last + 1), 0xdd, "{view:?}");
+    }
+}
+
+fn pattern(offset: u64) -> u8 {
+    (offset % 251) as u8
+}
+
+/// Accesses the last page of a two-page file from another thread, without a
+/// lock, until one is a bus error, while this one shrinks the file to one
+/// page: no access that starts after the shrink returns may succeed, as
+/// Linux's truncation unmaps the page before it returns.
+fn no_access_succeeds_after_a_shrink_past_it(
+    view: FileView,
+    access: fn(&AddressSpace, u64) -> Result<(), Fault>,
+) {
+    let file = Shrinking::new(2 * PAGE_SIZE);
+    let space = file_space(&file, 2, view);
+    let last = AT + PAGE_SIZE;
+    let shrunk = Arc::new(AtomicBool::new(false));
+    let (started, wait_started) = std::sync::mpsc::channel();
+    let (accessing, after) = (Arc::clone(&space), Arc::clone(&shrunk));
+    let thread = std::thread::spawn(move || {
+        used(&accessing, last);
+        let mut value = 0u64;
+        loop {
+            value += 1;
+            let late = after.load(Ordering::SeqCst);
+            match access(&accessing, value) {
+                Ok(()) => assert!(!late, "an access after the shrink succeeded"),
+                Err(fault) => {
+                    assert!(fault.bus);
+                    break;
+                }
+            }
+            if value == 1000 {
+                started.send(()).unwrap();
+            }
+        }
+    });
+    wait_started.recv().unwrap();
+    file.resize(PAGE_SIZE);
+    shrunk.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
+}
+
+#[test]
+fn no_load_or_store_without_a_lock_succeeds_after_a_shrink_past_it_returns() {
+    for _ in 0..10 {
+        for view in [FileView::Copy, FileView::Cache] {
+            no_access_succeeds_after_a_shrink_past_it(view, |space, _| {
+                space.read_u64(GuestAddr(AT + PAGE_SIZE + 8)).map(drop)
+            });
+            no_access_succeeds_after_a_shrink_past_it(view, |space, value| {
+                space.write_u64(GuestAddr(AT + PAGE_SIZE + 8), value)
+            });
+        }
+    }
+}

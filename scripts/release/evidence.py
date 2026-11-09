@@ -211,7 +211,8 @@ def release_notes(text, version):
 
 
 # Release Please's default changelog sections, in its order; other types are
-# hidden from the notes.
+# hidden from the notes, but a breaking change of any type is listed first.
+BREAKING = "⚠ BREAKING CHANGES"
 SECTIONS = {
     "feat": "Features",
     "fix": "Bug Fixes",
@@ -219,26 +220,34 @@ SECTIONS = {
     "revert": "Reverts",
 }
 SUBJECT = re.compile(
-    r"(?P<type>[a-z]+)(?:\((?P<scope>[^()]+)\))?!?: (?P<text>.+?)(?: \(#(?P<pr>\d+)\))?"
+    r"(?P<type>[a-z]+)(?:\((?P<scope>[^()]+)\))?(?P<breaking>!)?: "
+    r"(?P<text>.+?)(?: \(#(?P<pr>\d+)\))?"
 )
+FOOTER = re.compile(r"^BREAKING[ -]CHANGE: (?P<note>.+)$", re.M)
 COMPARE_LIMIT = 250
 
 
-def entry(sha, message):
-    """The notes line Release Please writes for a commit, with its section;
-    None for a commit it leaves out."""
-    found = SUBJECT.fullmatch(message.split("\n", 1)[0].strip())
-    if not found or found["type"] not in SECTIONS:
-        return None
-    url = "https://github.com/" + policy.REPOSITORY
-    line = "* "
-    if found["scope"]:
-        line += "**{}:** ".format(found["scope"])
-    line += found["text"]
-    if found["pr"]:
-        line += " ([#{0}]({1}/issues/{0}))".format(found["pr"], url)
-    line += f" ([{sha[:7]}]({url}/commit/{sha}))"
-    return SECTIONS[found["type"]], line
+def entries(sha, message):
+    """The notes lines Release Please writes for a commit, each with its
+    section: one in the section of its type, and for a breaking change (`!`,
+    or a `BREAKING CHANGE:` footer) its note, without links, in BREAKING."""
+    subject = message.split("\n", 1)[0].strip()
+    found = SUBJECT.fullmatch(subject)
+    if not found:
+        return []
+    scope = "**{}:** ".format(found["scope"]) if found["scope"] else ""
+    lines = []
+    footer = FOOTER.search(message, len(subject))
+    if found["breaking"] or footer:
+        lines.append((BREAKING, "* " + scope + (footer["note"] if footer else found["text"])))
+    if found["type"] in SECTIONS:
+        url = "https://github.com/" + policy.REPOSITORY
+        line = "* " + scope + found["text"]
+        if found["pr"]:
+            line += " ([#{0}]({1}/issues/{0}))".format(found["pr"], url)
+        line += f" ([{sha[:7]}]({url}/commit/{sha}))"
+        lines.append((SECTIONS[found["type"]], line))
+    return lines
 
 
 def with_later_commits(notes, commits):
@@ -250,9 +259,8 @@ def with_later_commits(notes, commits):
     """
     added = {}
     for commit in commits:
-        found = entry(commit["sha"], commit["commit"]["message"])
-        if found:
-            added.setdefault(found[0], []).append(found[1])
+        for title, line in entries(commit["sha"], commit["commit"]["message"]):
+            added.setdefault(title, []).append(line)
     if not added:
         return notes
     # [title, lines] for each section, the title None for any lines before
@@ -263,7 +271,7 @@ def with_later_commits(notes, commits):
             blocks.append([line[4:], []])
         else:
             blocks[-1][1].append(line)
-    order = list(SECTIONS.values())
+    order = [BREAKING, *SECTIONS.values()]
     for title in order:
         if title not in added:
             continue

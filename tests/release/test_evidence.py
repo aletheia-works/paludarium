@@ -413,6 +413,7 @@ class ReleaseNotes(unittest.TestCase):
         # Please lists them, and other types are left out.
         self.assertEqual(
             E.release_pr_notes(FakePulls([release_pr()], commits=LATER), HEAD, "0.1.1"),
+            "### ⚠ BREAKING CHANGES\n\n* **cpu:** run forms first\n\n\n"
             "### Features\n\n"
             f"* **kernel:** add sync_file_range ([#411]({URL}/issues/411)) "
             f"([1111111]({URL}/commit/{'1' * 40}))\n\n\n"
@@ -433,6 +434,25 @@ class ReleaseNotes(unittest.TestCase):
         )
         hidden = FakePulls([], commits=LATER[1:2] + LATER[4:]).commits
         self.assertEqual(E.with_later_commits(notes, hidden), notes)
+
+    def test_breaking_changes_come_first_with_their_note(self):
+        # A footer gives the note; a breaking change of a hidden type is
+        # listed only there; an existing breaking section is extended.
+        commits = FakePulls(
+            [],
+            commits=(
+                ("6" * 40, "fix(kernel): keep it\n\nBREAKING CHANGE: the old flag is gone"),
+                ("7" * 40, "chore!: drop Python 3.14 (#420)"),
+            ),
+        ).commits
+        notes = "### ⚠ BREAKING CHANGES\n\n* earlier\n\n\n### Features\n\n* a\n"
+        self.assertEqual(
+            E.with_later_commits(notes, commits),
+            "### ⚠ BREAKING CHANGES\n\n* earlier\n* **kernel:** the old flag is gone\n"
+            "* drop Python 3.14\n\n\n"
+            "### Features\n\n* a\n\n\n"
+            f"### Bug Fixes\n\n* **kernel:** keep it ([6666666]({URL}/commit/{'6' * 40}))\n",
+        )
 
     def test_an_incomplete_list_of_later_commits_stops(self):
         for pulls in (

@@ -22,6 +22,8 @@ release PR をマージするかどうかだけです。詳しい手順と、す
    前の Publish の run が止まっている間に main が進むと、公開するのは release PR の
    マージコミットより後の main の head になります。そのときは、間に入ったコミットのうち
    `feat`、`fix`、`perf`、`revert` を、Release Please と同じ形でそれぞれの節に書き足します。
+   互換を壊す変更（`!` か `BREAKING CHANGE:` の footer）は、その説明を
+   `⚠ BREAKING CHANGES` の節にも書きます。
    次の release PR はタグより後のコミットしか数えないため、ここで書き足さないと、
    どのリリースノートにも載りません。
 

@@ -86,8 +86,11 @@ A guest's threads see each other's memory in the order x86 gives (TSO): a
 thread's loads and stores stay in order, except that a load may pass an earlier
 store. The page contents are read with acquire and written with release
 ordering, which keeps that order on an Arm host too, without the lock. A write
-to an executable page moves the code generation on after its bytes, so whoever
-sees the new generation sees the new code.
+to an executable page that an instruction was fetched from moves the code
+generation on after its bytes, so whoever sees the new generation sees the new
+code. The first fetch from a page marks it under the locks after moving the
+epoch on, so a store through the TLB only loads the mark: either it sees the
+mark, or the fetch sees its bytes.
 
 An aligned load of 16 bytes (`MOVDQA`, for one) is one access on an x86-64
 CPU, so it sees a `CMPXCHG16B` or a 16-byte store of another thread whole.

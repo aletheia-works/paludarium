@@ -44,6 +44,7 @@ fn it_follows_code_writes_and_mapping_changes() {
     space.write(GuestAddr(DATA), &[1]).unwrap();
     space.write(GuestAddr(DATA), &[2]).unwrap();
     assert_eq!(cached(&space), g0, "data writes keep code");
+    space.fetch(GuestAddr(CODE), &mut [0]).unwrap();
     space.write(GuestAddr(CODE), &[0x90]).unwrap();
     let g1 = cached(&space);
     assert_ne!(g1, g0);
@@ -205,4 +206,151 @@ fn a_page_cache_outlives_the_spaces_that_watched_it() {
     let before = cached(&second);
     pages.store(0, &[0x90]);
     assert_ne!(cached(&second), before);
+}
+
+/// Fetches the instruction byte at `addr`, as decoding it does.
+fn fetch(space: &AddressSpace, addr: u64) {
+    space.fetch(GuestAddr(addr), &mut [0]).unwrap();
+}
+
+#[test]
+fn a_store_to_code_nothing_fetched_keeps_decoded_instructions() {
+    let space = space();
+    let before = cached(&space);
+    // The first under the locks, the next through the TLB, as data on an
+    // executable heap (SBCL's dynamic space) is stored.
+    space.write(GuestAddr(CODE), &[1]).unwrap();
+    space.write(GuestAddr(CODE + 1), &[2]).unwrap();
+    space.write_value(GuestAddr(CODE + 8), 8, 3).unwrap();
+    space
+        .atomic(GuestAddr(CODE + 16), AtomicWidth::W32, AtomicOp::Add(1))
+        .unwrap();
+    space.write_initial(GuestAddr(CODE + 24), &[4]).unwrap();
+    assert_eq!(cached(&space), before);
+}
+
+#[test]
+fn every_store_to_code_once_fetched_makes_it_stale() {
+    let space = space();
+    space.write(GuestAddr(CODE), &[0x90]).unwrap();
+    fetch(&space, CODE);
+    let stores: [&dyn Fn(&AddressSpace); 4] = [
+        &|space| space.write(GuestAddr(CODE + 1), &[0xc3]).unwrap(),
+        &|space| space.write_value(GuestAddr(CODE + 8), 8, 3).unwrap(),
+        &|space| {
+            space
+                .atomic(GuestAddr(CODE + 16), AtomicWidth::W32, AtomicOp::Add(1))
+                .unwrap();
+        },
+        &|space| space.write_initial(GuestAddr(CODE + 24), &[4]).unwrap(),
+    ];
+    for store in stores {
+        // Twice: under the locks and through the TLB where it can.
+        for _ in 0..2 {
+            let before = cached(&space);
+            store(&space);
+            assert_ne!(cached(&space), before);
+        }
+    }
+}
+
+#[test]
+fn a_page_fetched_before_its_first_write_keeps_its_mark() {
+    // The page reads as zeros, without a frame, when it is fetched.
+    let space = space();
+    fetch(&space, CODE);
+    let before = cached(&space);
+    space.write(GuestAddr(CODE), &[0xc3]).unwrap();
+    assert_ne!(cached(&space), before);
+}
+
+#[test]
+fn a_copy_of_fetched_code_keeps_its_mark() {
+    // A page `fork` shares, with contents and without.
+    for written in [true, false] {
+        let parent = space();
+        if written {
+            parent.write(GuestAddr(CODE), &[0x90]).unwrap();
+        }
+        fetch(&parent, CODE);
+        let child = parent.fork();
+        for space in [&parent, &child] {
+            let before = cached(space);
+            space.write(GuestAddr(CODE), &[0xc3]).unwrap();
+            assert_ne!(cached(space), before, "written first: {written}");
+        }
+    }
+}
+
+#[test]
+fn a_fetch_reaches_a_page_another_thread_holds() {
+    let space = Arc::new(space());
+    let (sent, received) = mpsc::channel::<()>();
+    let (stored, done) = mpsc::channel();
+    let writer = Arc::clone(&space);
+    let thread = std::thread::spawn(move || {
+        // Twice, so that this thread's TLB holds the page.
+        writer.write(GuestAddr(CODE), &[1]).unwrap();
+        writer.write(GuestAddr(CODE), &[2]).unwrap();
+        stored.send(()).unwrap();
+        received.recv().unwrap();
+        let before = writer.code_generation_cached();
+        writer.write(GuestAddr(CODE + 1), &[0xc3]).unwrap();
+        writer.code_generation_cached() != before
+    });
+    done.recv().unwrap();
+    fetch(&space, CODE);
+    sent.send(()).unwrap();
+    assert!(thread.join().unwrap(), "the store saw the fetch's mark");
+}
+
+#[test]
+fn a_fetch_sees_a_store_under_way_that_missed_its_mark() {
+    let space = Arc::new(space());
+    let (started, starting) = mpsc::channel();
+    let writer = Arc::clone(&space);
+    let thread = std::thread::spawn(move || {
+        // Twice, so that this thread's TLB holds the page.
+        writer.write(GuestAddr(CODE), &[0; 24]).unwrap();
+        writer.write(GuestAddr(CODE), &[0; 24]).unwrap();
+        // The store reads the page's mark, unset, and then writes its words
+        // with a pause between each.
+        WORD_STALL.set(Some(Duration::from_millis(200)));
+        started.send(()).unwrap();
+        writer.write(GuestAddr(CODE + 4), &[0xc3; 16]).unwrap();
+    });
+    starting.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let before = space.code_generation_cached();
+    let mut code = [0; 16];
+    space.fetch(GuestAddr(CODE + 4), &mut code).unwrap();
+    thread.join().unwrap();
+    // The store bumped the generation after its bytes, or the fetch waited
+    // for them: no instruction stays decoded from half of them.
+    assert!(
+        code == [0xc3; 16] || space.code_generation_cached() != before,
+        "{code:x?}"
+    );
+}
+
+#[test]
+fn a_first_fetch_keeps_the_pages_its_thread_holds() {
+    let space = space();
+    // Twice each, so that this thread's TLB holds both pages.
+    for _ in 0..2 {
+        space.write(GuestAddr(DATA), &[1]).unwrap();
+        space.write(GuestAddr(CODE), &[0x90]).unwrap();
+    }
+    fetch(&space, CODE);
+    let held = THREAD_TLB.with(|cell| {
+        let thread = cell.borrow();
+        thread.epoch == space.code.epoch.load(Ordering::SeqCst)
+            && thread.tlb.get(DATA).is_some()
+            && thread.tlb.get(CODE).is_some()
+    });
+    assert!(held, "marking a page changes no entry");
+    // A store through the entry it kept sees the mark.
+    let before = cached(&space);
+    space.write(GuestAddr(CODE + 1), &[0xc3]).unwrap();
+    assert_ne!(cached(&space), before);
 }

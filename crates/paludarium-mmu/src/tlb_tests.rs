@@ -373,6 +373,8 @@ fn an_access_its_thread_holds_takes_no_lock() {
         Held::Both,
         SHOULD_FINISH,
         |space| {
+            // A page is fetched from under the locks the first time.
+            space.fetch(GuestAddr(AT), &mut [0]).unwrap();
             used(space, AT);
         },
         |space| {
@@ -395,7 +397,8 @@ fn an_access_its_thread_holds_takes_no_lock() {
     let mut bytes = [0; 8];
     space.read(GuestAddr(AT), &mut bytes).unwrap();
     assert_eq!(bytes, [9, 10, 11, 4, 6, 6, 7, 8]);
-    // Stores to code still make its decoded instructions stale.
+    // Stores to code that was fetched still make its decoded instructions
+    // stale.
     assert_ne!(space.code_generation(), generation);
     // A page it does not hold takes the locks.
     assert!(!finishes_while_held(
@@ -1062,4 +1065,34 @@ fn a_thread_tlb_never_keeps_a_file_or_its_owner_alive() {
             assert_eq!(byte(space, AT + 1), 2);
         },
     ));
+}
+
+#[test]
+fn code_a_truncation_takes_back_is_stale() {
+    let file = Shrinking::new(PAGE_SIZE);
+    let space = AddressSpace::new();
+    space
+        .map_shared(
+            Some(GuestAddr(AT)),
+            PAGE_SIZE,
+            Prot::READ_WRITE.union(Prot::EXEC),
+            MappingKind::File,
+        )
+        .unwrap();
+    let source: Arc<dyn PageSource> = file.clone();
+    space
+        .back_with_file(GuestAddr(AT), PAGE_SIZE, source, 0)
+        .unwrap();
+    space.write(GuestAddr(AT), &[0xc3]).unwrap();
+    let mut code = [0];
+    space.fetch(GuestAddr(AT), &mut code).unwrap();
+    assert_eq!(code, [0xc3]);
+    let before = space.code_generation();
+    // Shrunk past the page and grown again: the page shows the file once
+    // more, not the copy the instruction was decoded from.
+    file.resize(0);
+    file.resize(PAGE_SIZE);
+    space.fetch(GuestAddr(AT), &mut code).unwrap();
+    assert_eq!(code, [0]);
+    assert_ne!(space.code_generation(), before);
 }

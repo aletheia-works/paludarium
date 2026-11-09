@@ -7419,7 +7419,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "signal-io-wait")) {
         /* The O_ASYNC signals around waits. A stream whose reader waits
            gets none for the data that ends the wait (Linux's
-           SOCKWQ_ASYNC_WAITDATA), and at most one POLL_IN for the peer's
+           SOCKWQ_ASYNC_WAITDATA) on at least one of up to ten sends, as
+           Linux signals one whose reader ran before the sender looked,
+           and at most one POLL_IN for the peer's
            shutdown and one POLL_HUP for its close (io_at_most_one), where
            a datagram or packet socket still signals. A send that found
            the buffer full signals POLL_OUT only once three quarters of it

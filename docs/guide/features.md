@@ -384,13 +384,9 @@ kernel.
     the other.
   - **Sockets.** A send signals the peer. On a stream or packet socket, so
     do a write shutdown and the close, which hangs up; a datagram socket's
-    do not. A blocking read of a stream socket that waits for data gets no
-    signal for the data, end or hang-up that ends the wait, as with Linux's
-    `SOCKWQ_ASYNC_WAITDATA`. Linux also signals when the woken reader runs
-    before the sender looks; the emulator never does. A send that found the
-    buffer full signals once when reads leave three quarters of the buffer
-    free, and so does a full datagram or packet socket that `poll`, `select` or
-    `epoll_ctl` asked to take a write, or
+    do not. A send that found the buffer full signals once when reads leave
+    three quarters of the buffer free, and so does a full datagram or packet
+    socket that `poll`, `select` or `epoll_ctl` asked to take a write, or
     `epoll_wait` did, as Linux's asks only what is on its ready list: an
     interest it listed when added, after a wakeup, or after a
     level-triggered report (an edge-triggered one is not listed again). Only
@@ -418,10 +414,11 @@ kernel.
     UDP socket signals `POLL_ERR`. An urgent byte on the loopback signals
     `POLL_PRI` after its `SIGURG`.
   - **A waiting reader.** A stream whose read waits gets no signal for the
-    data, end or hang-up that ends the wait, as Linux holds it back; of a
-    send in parts, only the first. For the peer's shutdown or close Linux
-    holds it back only when the reader has not run yet (it wakes the
-    reader before it looks), so there it sometimes signals. A datagram or
+    data, end or hang-up that ends the wait, as Linux holds it back
+    (`SOCKWQ_ASYNC_WAITDATA`); of a send in parts, only the first. Linux
+    holds it back only when the reader has not run yet, as it wakes the
+    reader before it looks, so for a send, the peer's shutdown or its
+    close Linux sometimes signals; the emulator never does. A datagram or
     packet socket's reader gets it.
 - `setsockopt` and `getsockopt` take the `SOL_SOCKET` options as Linux's
   `sk_setsockopt` and `sk_getsockopt` do, with their defaults and checks: an

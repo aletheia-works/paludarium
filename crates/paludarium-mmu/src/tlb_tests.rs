@@ -951,7 +951,8 @@ fn a_page_gone_leaves_the_meter_though_another_thread_still_holds_it() {
 
 #[test]
 fn a_thread_holds_a_thousand_pages_without_a_lock() {
-    let pages = TLB_ENTRIES as u64;
+    // The size the docs give, not `TLB_ENTRIES`, so that a smaller TLB fails.
+    let pages = 1024;
     let space = Arc::new(space(pages, Prot::READ_WRITE));
     for page in 0..pages {
         space

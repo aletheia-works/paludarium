@@ -4341,8 +4341,10 @@ static long shm_call(long number, long a, long b, long c) {
 
 /* rseq: registration, the abort of a critical section that a signal or
  * membarrier interrupts, and the descriptors Linux does not accept.
- * Each section spins until SIGALRM sets the flag: rseq_spin returns 1 when
- * the kernel sent it to the abort handler, 0 when it committed. */
+ * Each section spins until SIGUSR1 sets the flag: rseq_spin returns 1 when
+ * the kernel sent it to the abort handler, 0 when it committed. Another
+ * thread sends the signal once the spinning one is ready, with no timer,
+ * so that no clock has to move. */
 __asm__(".text\n"
         ".globl rseq_spin\n"
         "rseq_spin:\n"
@@ -4419,11 +4421,28 @@ static long rseq_call(volatile void *area, unsigned length, int flags, unsigned 
     return r < 0 ? -errno : r;
 }
 
-/* SIGALRM in 20 ms, which sets the flag. */
-static void rseq_arm(void) {
-    struct itimerval t = {{0, 0}, {0, 20000}};
+/* Sends the calling thread SIGUSR1, which sets the flag, from another
+ * thread once `ready` is set. */
+struct rseq_sender {
+    volatile int *ready;
+    pid_t pid, tid;
+    pthread_t thread;
+};
+
+static void *rseq_send(void *argument) {
+    struct rseq_sender *sender = argument;
+    while (!*sender->ready) {}
+    syscall(SYS_tgkill, sender->pid, sender->tid, SIGUSR1);
+    return 0;
+}
+
+static void rseq_arm(struct rseq_sender *sender) {
     rseq_flag = 0;
-    setitimer(ITIMER_REAL, &t, 0);
+    rseq_ready = 0;
+    sender->ready = &rseq_ready;
+    sender->pid = getpid();
+    sender->tid = (pid_t)syscall(SYS_gettid);
+    if (pthread_create(&sender->thread, 0, rseq_send, sender)) _exit(60);
 }
 
 /* The signal a child ends by when it spins while its area's rseq_cs is
@@ -4434,9 +4453,11 @@ static int rseq_child_dies(struct rseq_desc *desc) {
     if (child == 0) {
         struct rlimit none = {0, 0};
         setrlimit(RLIMIT_CORE, &none);
-        rseq_arm();
+        struct rseq_sender sender;
+        rseq_arm(&sender);
         if (!desc) _exit(rseq_unsigned(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag) + 50);
         rseq_main.rseq_cs = (uint64_t)desc;
+        rseq_ready = 1;
         while (!rseq_flag) {}
         _exit(40);
     }
@@ -4493,13 +4514,17 @@ static int rseq_case(void) {
      * the kernel clears rseq_cs; outside it, the kernel only clears it. */
     struct sigaction sa = {0};
     sa.sa_handler = rseq_alarm;
-    sigaction(SIGALRM, &sa, 0);
-    rseq_arm();
+    sigaction(SIGUSR1, &sa, 0);
+    struct rseq_sender sender;
+    rseq_arm(&sender);
     int aborted = rseq_spin(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag);
+    pthread_join(sender.thread, 0);
     printf("signal aborted=%d handled=%d cs-cleared=%d\n", aborted, rseq_flag, rseq_main.rseq_cs == 0);
-    rseq_arm();
+    rseq_arm(&sender);
     rseq_main.rseq_cs = (uint64_t)rseq_spin_cs;
+    rseq_ready = 1;
     while (!rseq_flag) {}
+    pthread_join(sender.thread, 0);
     printf("outside cs-cleared=%d\n", rseq_main.rseq_cs == 0);
 
     /* Descriptors the kernel does not accept end the thread by SIGSEGV

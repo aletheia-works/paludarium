@@ -956,29 +956,6 @@ static void io_taken(const char *name) {
                info.si_code, (long)info.si_band, info.si_fd);
     printf("\n");
 }
-/* signal-io-wait: takes the pending signals of a stream whose peer shut
-   its sending down or closed while its reader waited, and says only
-   whether they are at most one signal of `code` and `band` for `fd`.
-   Linux's unix_shutdown and unix_release_sock wake the reader
-   (sk_state_change) before they look at SOCKWQ_ASYNC_WAITDATA
-   (sk_wake_async), so a reader that runs at once has cleared it and is
-   signalled, and one that does not is not: either is Linux, and nothing
-   else is. */
-static void io_at_most_one(const char *name, int fd, const char *what, int code, long band) {
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGIO);
-    sigaddset(&set, SIGURG);
-    sigaddset(&set, IO_RT);
-    struct timespec zero = {0, 0};
-    siginfo_t info;
-    int number, count = 0, other = 0;
-    while ((number = sigtimedwait(&set, &info, &zero)) > 0) {
-        count++;
-        other |= number != IO_RT || info.si_code != code || info.si_band != band || info.si_fd != fd;
-    }
-    printf("  %s: at-most-one-%s=%d\n", name, what, count <= 1 && !other);
-}
 /* Counts the queued IO_RT signals with code `code` and takes the rest. */
 static int io_count(int code) {
     sigset_t set;
@@ -7564,12 +7541,11 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "signal-io-wait")) {
         /* The O_ASYNC signals around waits. A stream whose reader waits
-           gets none for the data that ends the wait (Linux's
-           SOCKWQ_ASYNC_WAITDATA) on at least one of up to ten sends, as
-           Linux signals one whose reader ran before the sender looked,
-           and at most one POLL_IN for the peer's
-           shutdown and one POLL_HUP for its close (io_at_most_one), where
-           a datagram or packet socket still signals. A send that found
+           gets none for the data, the peer's shutdown or its close that
+           ends the wait (Linux's SOCKWQ_ASYNC_WAITDATA) on at least one
+           of up to ten attempts, as Linux signals one whose reader ran
+           before the sender looked, where a datagram or packet socket
+           still signals. A send that found
            the buffer full signals POLL_OUT only once three quarters of it
            is free. A pipe write signals its reader before each wait. A
            reader's child acts after a while (io_pause). */
@@ -7613,12 +7589,14 @@ int main(int argc, char **argv) {
                 /* A busy host can keep the reader from reaching recv
                    before the child acts. Then the reader does not wait
                    and the signal is due, so the attempt is taken again.
-                   So it is when a stream's send signals: Linux's
-                   sock_def_readable wakes the reader before it looks at
-                   SOCKWQ_ASYNC_WAITDATA (sk_wake_async), so a send that
-                   came before the reader slept, or whose reader ran at
-                   once and cleared it, signals, and one whose reader
-                   waited and had not yet run does not. Up to ten
+                   So it is when a stream's reader is signalled: Linux's
+                   sock_def_readable (a send), unix_shutdown (a
+                   shutdown) and unix_release_sock (a close) wake the
+                   reader before they look at SOCKWQ_ASYNC_WAITDATA
+                   (sk_wake_async), so what came before the reader slept,
+                   or whose reader ran at once and cleared it, signals,
+                   and what found the reader waiting and not yet run does
+                   not. Up to ten
                    attempts give the second on Linux, so the emulator
                    must give it too. */
                 struct pollfd ready = {sv[1], POLLIN | POLLRDHUP, 0};
@@ -7630,11 +7608,9 @@ int main(int argc, char **argv) {
                 else if (read(acted[0], buf, 1) != 1) return 72;
                 sigset_t pending;
                 sigpending(&pending);
-                int again = (early || (types[t] == SOCK_STREAM && a == 0 && sigismember(&pending, IO_RT)))
+                int again = (early || (types[t] == SOCK_STREAM && sigismember(&pending, IO_RT)))
                             && ++tries < 10;
                 if (again) io_count(0);
-                else if (types[t] == SOCK_STREAM && a == 1) io_at_most_one(name, sv[1], "in", POLL_IN, 0x41);
-                else if (types[t] == SOCK_STREAM && a == 2) io_at_most_one(name, sv[1], "hang-up", POLL_HUP, 0x18);
                 else io_taken(name);
                 close(sv[1]);
                 if (a != 2) {

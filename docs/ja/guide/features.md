@@ -716,7 +716,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `openat2` は自身の解決の中で扱います）。`/proc` のディスクリプタや `/proc` の中の
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime`（後述）、
+- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
@@ -774,6 +774,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   最後に割り当てた ID が続きます。メモリは合計、空き、使えるものがどれも 4 GiB で、ほかの
   使用はなく、スワップも huge page もありません。起動からの時間は単調時計の値で、アイドルの
   時間は数えません。
+- `/proc/stat` は Linux の `show_stat` と同じ形式です。`cpu` の行と、`sched_getaffinity` が
+  返す CPU ごとの行があり、`/proc/uptime` がアイドルの時間を数えないのと同じく、時間はどれも
+  0 です。続いて `intr 0`、`ctxt 0`、`btime`（実時間の時計から単調時計を引いた秒数で、`ps` は
+  これで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running 1`、
+  `procs_blocked 0`、0 が並ぶ `softirq` の行です。
 - `/proc/self/maps` は VMA を Linux の形式で並べます。隣り合うマッピングの併合と
   分割も Linux と同じです。項目は、範囲、保護、`s` か `p`、ファイル内のオフセット、
   `stat` と同じファイルのデバイスと inode、Linux と同じ桁に置く名前です。名前は
@@ -1343,18 +1348,24 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   システムにあります（`EXDEV`）。Linux 6.10 以降は、呼び出し元と違う資格情報で
   開いたファイルへの `AT_EMPTY_PATH` を、`CAP_DAC_READ_SEARCH` がなければ断ります
   （`ENOENT`）が、paludarium はこれを確かめません。
-- Landlock は、スレッドがアクセスできるファイルの階層を ABI バージョン 3 の範囲で
-  制限します。`landlock_create_ruleset`（バージョンの問い合わせを含む）、
-  `LANDLOCK_RULE_PATH_BENEATH` の `landlock_add_rule`、`landlock_restrict_self`
-  （`no_new_privs` か `CAP_SYS_ADMIN` が要ります）に対応し、層は 16 までです。各層は、
+- Landlock は、スレッドがアクセスできるファイルの階層と TCP のポートを ABI バージョン 5
+  の範囲で制限します。`landlock_create_ruleset`（バージョンの問い合わせを含む）、
+  `LANDLOCK_RULE_PATH_BENEATH` と `LANDLOCK_RULE_NET_PORT` の `landlock_add_rule`、
+  `landlock_restrict_self`（`no_new_privs` か `CAP_SYS_ADMIN` が要ります）に対応し、
+  層は 16 までです。各層は、
   扱う権利を、ルールが指すファイルやディレクトリの下でだけ許します。ルールはデバイスと
   inode で指すので、名前を変えたディレクトリにもついていきます。ファイルを開くと
   `LANDLOCK_ACCESS_FS_READ_FILE`、`WRITE_FILE`、`READ_DIR` を、`execve` とその
   インタープリタでは `EXECUTE` を確かめます。名前を作るときはディレクトリについて
   種類ごとの `MAKE_*` を、消すときは `REMOVE_FILE` か `REMOVE_DIR` を、切り詰めるときは
   `TRUNCATE` を確かめます。`TRUNCATE` は、開いたときの結果を開いたファイルの記述が
-  持ち続けます。別のディレクトリへのリンクや名前の変更には `REFER` が要り、ファイルの
-  権利が増えてはいけません（`EXDEV`）。スレッド、プロセス、`execve` はドメインを
+  持ち続けます。キャラクタデバイスとブロックデバイスへの `ioctl` には `IOCTL_DEV` が要り、
+  これも開いたときの結果を持ち続けます。ただし、どのファイルでも答えるコマンド
+  （`FIOCLEX`、`FIONBIO`、`FIGETBSZ` など）は除きます。別のディレクトリへのリンクや
+  名前の変更には `REFER` が要り、ファイルの権利が増えてはいけません（`EXDEV`）。
+  TCP のソケットの `bind` にはそのポートの `LANDLOCK_ACCESS_NET_BIND_TCP` が、`connect`
+  には `CONNECT_TCP` が要ります。その前に、Linux と同じくアドレスを確かめます。
+  UDP と、`AF_UNSPEC` への `connect` は確かめません。スレッド、プロセス、`execve` はドメインを
   引き継ぎます。`O_PATH`、`stat`、制限の前に開いた記述子は確かめません。
 - 起動の前にファイルを置けます。
 - 指定したときだけ、ホストのディレクトリをマウントできます（コマンドの `--mount`、

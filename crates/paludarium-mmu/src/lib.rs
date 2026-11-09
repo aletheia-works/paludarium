@@ -265,6 +265,11 @@ struct FrameBytes {
     /// A guest store changed the bytes since [`SharedPages::write_back`]
     /// last took them.
     dirty: AtomicBool,
+    /// How many writes of more than one word have started and finished, so
+    /// that an aligned 16-byte read sees one of them whole, as it does on an
+    /// x86-64 CPU ([`Self::read_16`]).
+    spanning_started: AtomicU64,
+    spanning_finished: AtomicU64,
 }
 
 impl FrameBytes {
@@ -280,6 +285,8 @@ impl FrameBytes {
             words: words(),
             meter: meter.cloned(),
             dirty: AtomicBool::new(false),
+            spanning_started: AtomicU64::new(0),
+            spanning_finished: AtomicU64::new(0),
         })
     }
 }
@@ -312,6 +319,44 @@ impl FrameBytes {
     /// `buf`.
     #[inline]
     fn read(&self, offset: usize, buf: &mut [u8]) {
+        if let Ok(value) = <&mut [u8; 16]>::try_from(&mut *buf)
+            && offset.is_multiple_of(16)
+        {
+            *value = self.read_16(offset).to_le_bytes();
+            return;
+        }
+        self.read_words(offset, buf);
+    }
+
+    /// The aligned 16 bytes at `offset` as no write of more than one word
+    /// leaves them halfway, though a load takes no lock: an x86-64 CPU reads
+    /// them in one access (`MOVDQA`, `MOVAPS` and the like), so a thread
+    /// sees a `CMPXCHG16B` or a 16-byte store of another one whole. The two
+    /// words are read again while such a write may have come between them.
+    #[inline]
+    fn read_16(&self, offset: usize) -> u128 {
+        let words = &self.words[offset / WORD_BYTES..][..2];
+        loop {
+            // Each write adds to `spanning_started` before its stores, which
+            // release it, and to `spanning_finished` after them. A word read
+            // from a write therefore shows the write started, and the same
+            // count of both shows that no write had started and not finished.
+            let finished = self.spanning_finished.load(Ordering::Acquire);
+            let started = self.spanning_started.load(Ordering::Relaxed);
+            if started == finished {
+                let low = words[0].load(Ordering::Acquire);
+                let high = words[1].load(Ordering::Acquire);
+                if self.spanning_started.load(Ordering::Relaxed) == started {
+                    return u128::from(high) << 64 | u128::from(low);
+                }
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// [`Self::read`] a word at a time, each word as one access.
+    #[inline]
+    fn read_words(&self, offset: usize, buf: &mut [u8]) {
         let mut at = offset;
         let mut left = buf;
         while !left.is_empty() {
@@ -353,6 +398,19 @@ impl FrameBytes {
 
     #[inline]
     fn write_with(&self, offset: usize, data: &[u8], piece: impl Fn(&AtomicU64, u64, u64)) {
+        // A write within one word is one access already ([`Self::read_16`]).
+        let spanning = offset % WORD_BYTES + data.len() > WORD_BYTES;
+        if spanning {
+            self.spanning_started.fetch_add(1, Ordering::Relaxed);
+        }
+        self.write_words(offset, data, piece);
+        if spanning {
+            self.spanning_finished.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn write_words(&self, offset: usize, data: &[u8], piece: impl Fn(&AtomicU64, u64, u64)) {
         let mut at = offset;
         let mut left = data;
         while !left.is_empty() {
@@ -3321,6 +3379,25 @@ mod tests {
             });
             for round in 0..200_000 {
                 frame.write(8, &[if round % 2 == 0 { 0xff } else { 0 }; WORD_BYTES]);
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn aligned_16_bytes_are_read_whole_though_another_thread_writes_them() {
+        let frame = Arc::new(frame_of(&[]));
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    let mut value = [0; 16];
+                    frame.read(16, &mut value);
+                    assert!(value == [0; 16] || value == [0xff; 16], "{value:?}");
+                }
+            });
+            for round in 0..200_000 {
+                frame.write(16, &[if round % 2 == 0 { 0xff } else { 0 }; 16]);
             }
             done.store(true, Ordering::Relaxed);
         });

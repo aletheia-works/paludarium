@@ -333,12 +333,13 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
 }
 
 /// The names /proc generates at its top, with their types.
-const ROOT_NAMES: [(&[u8], u8); 6] = [
+const ROOT_NAMES: [(&[u8], u8); 7] = [
     (b"self", DT_LNK),
     (b"thread-self", DT_LNK),
     (b"mounts", DT_LNK),
     (b"loadavg", DT_REG),
     (b"meminfo", DT_REG),
+    (b"stat", DT_REG),
     (b"uptime", DT_REG),
 ];
 

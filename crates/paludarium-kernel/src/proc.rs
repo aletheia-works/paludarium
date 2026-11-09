@@ -1,6 +1,6 @@
 //! The /proc files paludarium has, generated when opened: the mount table
 //! (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's mounts,
-//! `loadavg`, `meminfo` and `uptime`, and this process's directory with its
+//! `loadavg`, `meminfo`, `stat` and `uptime`, and this process's directory with its
 //! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
 //! directory of links to the open descriptors, and its `maps`, which alone
 //! is generated as it is read.
@@ -189,12 +189,14 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
 pub(crate) enum SystemEntry {
     Loadavg,
     Meminfo,
+    Stat,
     Uptime,
 }
 pub(crate) fn system_entry(path: &[u8]) -> Option<SystemEntry> {
     match path {
         b"/proc/loadavg" => Some(SystemEntry::Loadavg),
         b"/proc/meminfo" => Some(SystemEntry::Meminfo),
+        b"/proc/stat" => Some(SystemEntry::Stat),
         b"/proc/uptime" => Some(SystemEntry::Uptime),
         _ => None,
     }
@@ -209,6 +211,34 @@ pub(crate) fn render_loadavg(running: usize, tasks: usize, last_pid: u32) -> Vec
 pub(crate) fn render_uptime(nanoseconds: u64) -> Vec<u8> {
     let hundredths = nanoseconds / 10_000_000;
     format!("{}.{:02} 0.00\n", hundredths / 100, hundredths % 100).into_bytes()
+}
+/// The figures `/proc/stat` reports.
+pub(crate) struct SystemStat {
+    /// The CPUs, as `sched_getaffinity` counts them.
+    pub(crate) cpus: usize,
+    /// When the system booted, in seconds since the epoch: the real-time
+    /// clock less the monotonic one.
+    pub(crate) boot_time: u64,
+    /// The process and thread IDs handed out so far.
+    pub(crate) forks: u32,
+    pub(crate) running: usize,
+}
+/// `/proc/stat` as Linux's `show_stat` prints it: the time every CPU spent
+/// in each state, all 0 as `/proc/uptime` counts no idle time, a line for
+/// each CPU, no interrupts, context switches or softirqs (a count of 0 with
+/// none listed after it, or all 10 kinds at 0), the boot time, the forks
+/// and the running tasks with none blocked.
+pub(crate) fn render_system_stat(stat: &SystemStat) -> Vec<u8> {
+    const TIMES: &str = " 0 0 0 0 0 0 0 0 0 0";
+    let mut out = format!("cpu {TIMES}\n");
+    for cpu in 0..stat.cpus {
+        out.push_str(&format!("cpu{cpu}{TIMES}\n"));
+    }
+    out.push_str(&format!(
+        "intr 0\nctxt 0\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked 0\nsoftirq 0{TIMES}\n",
+        stat.boot_time, stat.forks, stat.running
+    ));
+    out.into_bytes()
 }
 /// `/proc/meminfo` in Linux's field order and format, with the memory
 /// `sysinfo` reports: all of it free and nothing used, no swap and no huge
@@ -1252,6 +1282,7 @@ mod generated_tests {
         assert_eq!(entry(b"/proc/8/stat"), None);
         assert_eq!(system_entry(b"/proc/loadavg"), Some(SystemEntry::Loadavg));
         assert_eq!(system_entry(b"/proc/meminfo"), Some(SystemEntry::Meminfo));
+        assert_eq!(system_entry(b"/proc/stat"), Some(SystemEntry::Stat));
         assert_eq!(system_entry(b"/proc/uptime"), Some(SystemEntry::Uptime));
         assert_eq!(system_entry(b"/proc/self/uptime"), None);
     }
@@ -1312,5 +1343,24 @@ mod generated_tests {
         assert!(lines.contains(&"HugePages_Total:       0"));
         assert_eq!(lines.last(), Some(&"Hugetlb:               0 kB"));
         assert_eq!(render_comm(b"name\0rest"), b"name\n");
+        let stat = render_system_stat(&SystemStat {
+            cpus: 2,
+            boot_time: 1_700_000_000,
+            forks: 9,
+            running: 1,
+        });
+        assert_eq!(
+            String::from_utf8(stat).unwrap(),
+            "cpu  0 0 0 0 0 0 0 0 0 0\n\
+             cpu0 0 0 0 0 0 0 0 0 0 0\n\
+             cpu1 0 0 0 0 0 0 0 0 0 0\n\
+             intr 0\n\
+             ctxt 0\n\
+             btime 1700000000\n\
+             processes 9\n\
+             procs_running 1\n\
+             procs_blocked 0\n\
+             softirq 0 0 0 0 0 0 0 0 0 0 0\n"
+        );
     }
 }

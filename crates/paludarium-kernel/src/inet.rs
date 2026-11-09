@@ -1530,6 +1530,14 @@ impl InetSocket {
             time_wait: None,
         }
     }
+    /// Landlock's `socket_bind` and `socket_connect` hooks, which only a TCP
+    /// socket meets.
+    fn landlock(&self, c: &Context<'_>, raw: &[u8], request: u64) -> Result<(), Errno> {
+        if self.datagram {
+            return Ok(());
+        }
+        crate::landlock::socket(c, self.family == Family::V6, raw, request)
+    }
     /// `bind` of a TCP or UDP socket, with Linux's checks in its order
     /// (`__inet_bind`, `__inet6_bind`). The guest's own addresses are the
     /// loopback's and the unspecified one, and the IPv4 multicast and
@@ -2347,13 +2355,18 @@ pub(crate) fn dispatch(
     match number {
         // connect
         42 => {
-            let address = read_address(c, socket, a[1], a[2])?;
-            socket.connect(c, address)
+            let raw = read_raw(c, a[1], a[2])?;
+            socket.landlock(c, &raw, crate::landlock::CONNECT_TCP)?;
+            socket.connect(c, parse_address(socket.family, &raw)?)
         }
         // accept and accept4
         43 | 288 => accept(c, socket, a, if number == 288 { a[3] } else { 0 }),
         // bind, to the guest's own addresses
-        49 => socket.bind(&read_raw(c, a[1], a[2])?),
+        49 => {
+            let raw = read_raw(c, a[1], a[2])?;
+            socket.landlock(c, &raw, crate::landlock::BIND_TCP)?;
+            socket.bind(&raw)
+        }
         // listen
         50 => socket.listen(a[1]),
         // getsockname and getpeername

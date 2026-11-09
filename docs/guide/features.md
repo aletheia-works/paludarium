@@ -784,8 +784,8 @@ kernel.
   own walk); a path relative to a descriptor of `/proc` or to a working
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
-- The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo` and
-  `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
+- The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
+  `/proc/stat` and `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -852,6 +852,12 @@ kernel.
   the last ID handed out; 4 GiB of total, free and available memory and
   nothing else used, no swap and no huge pages; and the monotonic clock's
   uptime with no idle time.
+- `/proc/stat` is in the format of Linux's `show_stat`: a `cpu` line and one
+  for each CPU `sched_getaffinity` reports, every time 0 as `/proc/uptime`
+  counts no idle time; `intr 0`, `ctxt 0`; `btime`, the real-time clock less
+  the monotonic one in seconds, so `ps` finds the boot time; `processes`, the
+  IDs handed out; `procs_running 1`, `procs_blocked 0`; and a `softirq` line
+  of zeros.
 - `/proc/self/maps` lists the VMAs in Linux's format, with adjacent mappings
   merged and split as Linux does: the range, the protection, `s` or `p`, the
   offset in the file, the file's device and inode as `stat` gives them, and
@@ -1477,9 +1483,10 @@ one only with an `--allow-net`.
   (`EXDEV`). Linux 6.10 and later also refuse `AT_EMPTY_PATH` for a file
   opened with other credentials than the caller's, without
   `CAP_DAC_READ_SEARCH` (`ENOENT`); this is not checked.
-- Landlock restricts a thread's access to file hierarchies, at ABI version 3:
-  `landlock_create_ruleset` (and its version query), `landlock_add_rule` with
-  `LANDLOCK_RULE_PATH_BENEATH`, and `landlock_restrict_self` (which needs
+- Landlock restricts a thread's access to file hierarchies and TCP ports, at
+  ABI version 5: `landlock_create_ruleset` (and its version query),
+  `landlock_add_rule` with `LANDLOCK_RULE_PATH_BENEATH` and
+  `LANDLOCK_RULE_NET_PORT`, and `landlock_restrict_self` (which needs
   `no_new_privs` or `CAP_SYS_ADMIN`), up to 16 layers. Each layer allows a
   right it handles only beneath the files and directories its rules name, by
   device and inode, so a rule follows a renamed directory. Opening a file
@@ -1487,8 +1494,13 @@ one only with an `--allow-net`.
   `execve` and its interpreters, `EXECUTE`; making a name checks its
   directory for the `MAKE_*` right of its type, removing one `REMOVE_FILE` or
   `REMOVE_DIR`, and truncating `TRUNCATE`, which an open file description
-  keeps from its open. A link or rename to another directory needs `REFER`
-  and must not give the file more rights than it had (`EXDEV`). Threads,
+  keeps from its open. An `ioctl` on a character or block device needs
+  `IOCTL_DEV`, kept the same way, except for the commands every file answers
+  (`FIOCLEX`, `FIONBIO`, `FIGETBSZ` and the like). A link or rename to another
+  directory needs `REFER` and must not give the file more rights than it had
+  (`EXDEV`). A TCP socket's `bind` needs `LANDLOCK_ACCESS_NET_BIND_TCP` and its
+  `connect` `CONNECT_TCP` for the port, with Linux's checks of the address
+  first; UDP and `connect` to `AF_UNSPEC` are not checked. Threads,
   processes and `execve` keep the domain; `O_PATH`, `stat` and descriptors
   opened before are not checked.
 - Files can be placed before the start.

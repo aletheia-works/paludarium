@@ -95,8 +95,8 @@ const MAX_BLOCK: usize = 32;
 /// A block is used only while the address space's
 /// [`AddressSpace::code_generation`] is unchanged, so writes to executable
 /// memory that was fetched from and mapping changes (self-modifying code,
-/// `mprotect`, `munmap`) are always seen. A cache serves one address space: make a new one for
-/// another (as after `execve`).
+/// `mprotect`, `munmap`) are always seen. A cache serves one address space:
+/// make a new one for another (as after `execve`).
 ///
 /// It starts small, as most threads and processes run little code, and
 /// doubles up to [`MAX_ENTRIES`] while the blocks a thread runs often keep

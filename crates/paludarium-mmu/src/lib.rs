@@ -1284,10 +1284,10 @@ const CODE_GENERATIONS_PER_SPACE: u64 = 1 << 40;
 /// and the loads through a [`ThreadTlb`] read without the locks.
 struct CodeCounters {
     /// Bumped whenever executable memory that was fetched from or the
-    /// mappings change, and by
-    /// every store to the shared mappings and page caches the space may run
-    /// code from (which it [`SharedPages::watch`]es); lets the CPU cache
-    /// decoded instructions safely (see [`AddressSpaceData::code_generation`]).
+    /// mappings change, and by every store to the shared mappings and page
+    /// caches the space may run code from (which it [`SharedPages::watch`]es);
+    /// lets the CPU cache decoded instructions safely (see
+    /// [`AddressSpaceData::code_generation`]).
     generation: AtomicU64,
     /// Bumped whenever the space is borrowed mutably, which may change its
     /// shared mappings and page caches, and the protection of their pages.

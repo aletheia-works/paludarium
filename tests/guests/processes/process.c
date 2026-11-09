@@ -4518,6 +4518,296 @@ static int shm_case(void) {
     return 0;
 }
 
+/* System V semaphores, compared without the IDs, keys and PIDs the machine
+   chooses, as the shared memory above. Each wait is seen begun through
+   GETNCNT or GETZCNT before what ends it. */
+enum {
+    SEMX_CREAT = 01000, SEMX_EXCL = 02000, SEMX_NOWAIT = 04000, SEMX_UNDO = 0x1000,
+    SEMX_RMID = 0, SEMX_SET = 1, SEMX_STAT = 2, SEMX_INFO = 3, SEMX_GETPID = 11,
+    SEMX_GETVAL = 12, SEMX_GETALL = 13, SEMX_GETNCNT = 14, SEMX_GETZCNT = 15,
+    SEMX_SETVAL = 16, SEMX_SETALL = 17, SEMX_STAT_INDEX = 18, SEMX_INFO_ALL = 19,
+    SEMX_STAT_ANY = 20,
+};
+struct semx_op {
+    unsigned short num;
+    short op, flags;
+};
+static long semx_ctl(int id, int n, int cmd, long arg) { return syscall(SYS_semctl, id, n, cmd, arg); }
+static int semx_errno(long r) { return r == -1 ? errno : 0; }
+/* One operation, or its error. */
+static int semx_op(int id, unsigned short num, short op, short flags) {
+    struct semx_op o = {num, op, flags};
+    return semx_errno(syscall(SYS_semop, id, &o, 1));
+}
+static void semx_await(int id, int n, int cmd, long count) {
+    while (semx_ctl(id, n, cmd, 0) != count) usleep(1000);
+}
+/* A child that does one operation and exits with its error. */
+static pid_t semx_child(int id, unsigned short num, short op, short flags) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) _exit(semx_op(id, num, op, flags));
+    return child;
+}
+static int semx_reaped(pid_t child) {
+    int status;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+static void semx_alarm(int signal) { (void)signal; }
+static void *semx_thread(void *arg) {
+    int id = *(int *)arg;
+    semx_op(id, 0, 1, SEMX_UNDO);
+    return NULL;
+}
+static int sem_case(void) {
+    int key = 0x5c000000 | (getpid() & 0xffffff);
+    printf("get too-many=%d", semx_errno(syscall(SYS_semget, 0, 32001, 0600)));
+    printf(" negative=%d", semx_errno(syscall(SYS_semget, 0, -1, 0600)));
+    printf(" none=%d", semx_errno(syscall(SYS_semget, 0, 0, 0600)));
+    int id = (int)syscall(SYS_semget, key, 3, SEMX_CREAT | SEMX_EXCL | 0640);
+    if (id < 0) return 10;
+    printf(" same=%d", syscall(SYS_semget, key, 0, 0) == id);
+    printf(" fewer=%d", syscall(SYS_semget, key, 2, 0600) == id);
+    printf(" exclusive=%d", semx_errno(syscall(SYS_semget, key, 3, SEMX_CREAT | SEMX_EXCL)));
+    printf(" more=%d", semx_errno(syscall(SYS_semget, key, 4, 0)));
+    printf(" missing=%d\n", semx_errno(syscall(SYS_semget, key ^ 0x01000000, 1, 0600)));
+
+    unsigned char ds[104];
+    memset(ds, 0, sizeof ds);
+    printf("stat=%ld", semx_ctl(id, 0, SEMX_STAT, (long)ds));
+    unsigned mode, uid, cuid;
+    long otime, ctime;
+    unsigned long nsems;
+    memcpy(&uid, ds + 4, 4);
+    memcpy(&cuid, ds + 12, 4);
+    memcpy(&mode, ds + 20, 4);
+    memcpy(&otime, ds + 48, 8);
+    memcpy(&ctime, ds + 64, 8);
+    memcpy(&nsems, ds + 80, 8);
+    printf(" mode=%o nsems=%lu otime=%ld ctime-set=%d owner=%d creator=%d\n", mode, nsems, otime,
+           ctime > 0, uid == geteuid(), cuid == geteuid());
+
+    /* Values. */
+    printf("setval=%ld", semx_ctl(id, 1, SEMX_SETVAL, 7));
+    printf(" getval=%ld", semx_ctl(id, 1, SEMX_GETVAL, 0));
+    printf(" getpid-self=%d", semx_ctl(id, 1, SEMX_GETPID, 0) == getpid());
+    printf(" getpid-none=%ld", semx_ctl(id, 0, SEMX_GETPID, 0));
+    printf(" too-big=%d", semx_errno(semx_ctl(id, 1, SEMX_SETVAL, 32768)));
+    printf(" negative=%d", semx_errno(semx_ctl(id, 1, SEMX_SETVAL, -1)));
+    printf(" too-big-bad-id=%d", semx_errno(semx_ctl(id ^ (1 << 15), 1, SEMX_SETVAL, 32768)));
+    printf(" beyond=%d", semx_errno(semx_ctl(id, 3, SEMX_SETVAL, 1)));
+    printf(" get-beyond=%d", semx_errno(semx_ctl(id, 3, SEMX_GETVAL, 0)));
+    printf(" get-negative=%d\n", semx_errno(semx_ctl(id, -1, SEMX_GETVAL, 0)));
+    unsigned short all[3] = {1, 32767, 3}, got[3] = {0};
+    printf("setall=%ld", semx_ctl(id, 0, SEMX_SETALL, (long)all));
+    printf(" getall=%ld", semx_ctl(id, 0, SEMX_GETALL, (long)got));
+    printf(" values=%u,%u,%u", got[0], got[1], got[2]);
+    all[1] = 32768;
+    printf(" too-big=%d", semx_errno(semx_ctl(id, 0, SEMX_SETALL, (long)all)));
+    printf(" unchanged=%ld", semx_ctl(id, 1, SEMX_GETVAL, 0));
+    printf(" fault=%d", semx_errno(semx_ctl(id, 0, SEMX_GETALL, 8)));
+    printf(" set-fault=%d\n", semx_errno(semx_ctl(id, 0, SEMX_SETALL, 8)));
+
+    /* Operations, in Linux's order of checks. */
+    struct semx_op ops[2] = {{0, -1, 0}, {2, 1, 0}};
+    printf("op too-many=%d", semx_errno(syscall(SYS_semop, id, ops, 501)));
+    printf(" none=%d", semx_errno(syscall(SYS_semop, id, ops, 0)));
+    printf(" fault=%d", semx_errno(syscall(SYS_semop, id, 8, 1)));
+    printf(" negative-id=%d", semx_errno(syscall(SYS_semop, -1, ops, 1)));
+    printf(" old-sequence=%d", semx_errno(syscall(SYS_semop, id ^ (1 << 15), ops, 1)));
+    printf(" beyond=%d", semx_op(id, 3, 1, 0));
+    printf(" both=%ld", syscall(SYS_semop, id, ops, 2));
+    printf(" values=%ld,%ld", semx_ctl(id, 0, SEMX_GETVAL, 0), semx_ctl(id, 2, SEMX_GETVAL, 0));
+    printf(" nowait=%d", semx_op(id, 0, -1, SEMX_NOWAIT));
+    printf(" zero=%d", semx_op(id, 0, 0, 0));
+    printf(" not-zero=%d", semx_op(id, 2, 0, SEMX_NOWAIT));
+    printf(" over=%d", semx_op(id, 1, 1, 0));
+    /* The first that would wait decides on IPC_NOWAIT; the rest go back. */
+    struct semx_op partly[2] = {{2, -1, 0}, {0, -1, SEMX_NOWAIT}};
+    printf(" partly=%d", semx_errno(syscall(SYS_semop, id, partly, 2)));
+    printf(" back=%ld", semx_ctl(id, 2, SEMX_GETVAL, 0));
+    memset(ds, 0, sizeof ds);
+    semx_ctl(id, 0, SEMX_STAT, (long)ds);
+    memcpy(&otime, ds + 48, 8);
+    printf(" otime-set=%d\n", otime > 0);
+
+    /* semtimedop: the timeout is read first and checked after the count. */
+    struct timespec timeout = {0, 1000000000};
+    struct semx_op one = {0, -1, 0};
+    printf("timed fault=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 501, 8)));
+    printf(" too-many=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 501, &timeout)));
+    printf(" invalid=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 1, &timeout)));
+    timeout.tv_nsec = 0;
+    printf(" zero=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 1, &timeout)));
+    timeout.tv_nsec = 50000000;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    printf(" expired=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 1, &timeout)));
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long waited = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    printf(" waited=%d ncnt=%ld\n", waited >= 45, semx_ctl(id, 0, SEMX_GETNCNT, 0));
+
+    /* Waits: counted by what they wait on, let through in order. */
+    pid_t first = semx_child(id, 0, -2, 0);
+    semx_await(id, 0, SEMX_GETNCNT, 1);
+    pid_t second = semx_child(id, 0, -1, 0);
+    semx_await(id, 0, SEMX_GETNCNT, 2);
+    pid_t zero = semx_child(id, 2, 0, 0);
+    semx_await(id, 2, SEMX_GETZCNT, 1);
+    printf("waiting ncnt=%ld zcnt=%ld", semx_ctl(id, 0, SEMX_GETNCNT, 0), semx_ctl(id, 2, SEMX_GETZCNT, 0));
+    printf(" up=%d", semx_op(id, 0, 2, 0));
+    printf(" first=%d", semx_reaped(first));
+    printf(" by-first=%d", semx_ctl(id, 0, SEMX_GETPID, 0) == first);
+    printf(" ncnt=%ld", semx_ctl(id, 0, SEMX_GETNCNT, 0));
+    printf(" setval=%ld", semx_ctl(id, 0, SEMX_SETVAL, 1));
+    printf(" second=%d", semx_reaped(second));
+    printf(" value=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    printf(" down=%d", semx_op(id, 2, -4, 0));
+    printf(" zero=%d", semx_reaped(zero));
+    printf(" by-zero=%d\n", semx_ctl(id, 2, SEMX_GETPID, 0) == zero);
+
+    /* A signal ends a wait with EINTR, even with SA_RESTART. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sigaction action = {0};
+        action.sa_handler = semx_alarm;
+        action.sa_flags = SA_RESTART;
+        sigaction(SIGALRM, &action, NULL);
+        struct itimerval in = {{0, 0}, {0, 50000}};
+        setitimer(ITIMER_REAL, &in, NULL);
+        _exit(semx_op(id, 0, -1, 0));
+    }
+    printf("signal=%d", semx_reaped(child));
+    printf(" ncnt=%ld", semx_ctl(id, 0, SEMX_GETNCNT, 0));
+
+    /* SEM_UNDO: an exit adds the adjustments back, cut to 0, as the exiting
+       process. */
+    semx_ctl(id, 0, SEMX_SETVAL, 3);
+    child = semx_child(id, 0, -1, SEMX_UNDO);
+    printf(" undone=%d", semx_reaped(child));
+    printf(" value=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    printf(" by-child=%d", semx_ctl(id, 0, SEMX_GETPID, 0) == child);
+    fflush(stdout);
+    /* The child says when it has changed the value, and exits when told. */
+    int up[2], go[2];
+    if (pipe(up) || pipe(go)) return 11;
+    child = fork();
+    if (child == 0) {
+        char c;
+        semx_op(id, 0, 5, SEMX_UNDO);
+        if (write(up[1], "u", 1) != 1 || read(go[0], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    char c;
+    if (read(up[0], &c, 1) != 1) return 12;
+    printf(" up=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    semx_op(id, 0, -7, 0);
+    if (write(go[1], "u", 1) != 1) return 13;
+    printf(" exited=%d", semx_reaped(child));
+    printf(" cut=%ld\n", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    close(up[0]);
+    close(up[1]);
+    close(go[0]);
+    close(go[1]);
+
+    /* The undo list is a process's: threads share it (CLONE_SYSVSEM), a
+       fork does not, unshare(CLONE_SYSVSEM) leaves it, SETVAL clears it. */
+    semx_ctl(id, 0, SEMX_SETVAL, 0);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, semx_thread, &id) || pthread_join(thread, NULL)) _exit(1);
+        printf("threads after-thread=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+        fflush(stdout);
+        pid_t grandchild = fork();
+        if (grandchild == 0) _exit(0);
+        printf(" after-fork=%d", semx_reaped(grandchild));
+        printf(",%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+        printf(" unshare=%ld", syscall(SYS_unshare, CLONE_SYSVSEM));
+        /* The thread may not have left the list yet, which it then applies. */
+        int waits = 0;
+        while (semx_ctl(id, 0, SEMX_GETVAL, 0) != 0 && waits++ < 1000) usleep(1000);
+        printf(" left=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+        semx_op(id, 0, 2, SEMX_UNDO);
+        semx_op(id, 1, -1, SEMX_UNDO);
+        semx_ctl(id, 0, SEMX_SETVAL, 4);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf(" exited=%d", semx_reaped(child));
+    printf(" values=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    printf(",%ld\n", semx_ctl(id, 1, SEMX_GETVAL, 0));
+
+    /* IPC_SET, the information and removal. */
+    semx_ctl(id, 0, SEMX_STAT, (long)ds);
+    mode = 01600;
+    memcpy(ds + 20, &mode, 4);
+    printf("set=%ld", semx_ctl(id, 0, SEMX_SET, (long)ds));
+    semx_ctl(id, 0, SEMX_STAT, (long)ds);
+    memcpy(&mode, ds + 20, 4);
+    printf(" mode=%o", mode);
+    unsigned none = (unsigned)-1;
+    memcpy(ds + 4, &none, 4);
+    printf(" bad-uid=%d", semx_errno(semx_ctl(id, 0, SEMX_SET, (long)ds)));
+    printf(" bad-buffer=%d", semx_errno(semx_ctl(id, 0, SEMX_SET, 8)));
+    printf(" by-index=%d", semx_ctl(id % 32768, 0, SEMX_STAT_INDEX, (long)ds) == id);
+    printf(" by-index-any=%d", semx_ctl(id % 32768, 0, SEMX_STAT_ANY, (long)ds) == id);
+    printf(" command=%d", semx_errno(semx_ctl(id, 0, 99, 0)));
+    printf(" ipc64=%d\n", semx_errno(semx_ctl(id, 0, 0x100 | SEMX_STAT, (long)ds)));
+    {
+        int info[10];
+        memset(info, 0xff, sizeof info);
+        long r = semx_ctl(0, 0, SEMX_INFO, (long)info);
+        printf("info ok=%d map=%d mni=%d mns=%d mnu=%d msl=%d opm=%d ume=%d usz=%d vmx=%d aem=%d", r >= id % 32768,
+               info[0], info[1], info[2], info[3], info[4], info[5], info[6], info[7], info[8], info[9]);
+        r = semx_ctl(0, 0, SEMX_INFO_ALL, (long)info);
+        printf(" all ok=%d in-use=%d used=%d", r >= id % 32768, info[7] >= 1, info[9] >= 3);
+        printf(" fault=%d\n", semx_errno(semx_ctl(0, 0, SEMX_INFO, 8)));
+    }
+
+    /* As another user the 0604 set lets only reading through, and its
+       owner's commands nothing; as its owner, everything. */
+    int keyed = (int)syscall(SYS_semget, key ^ 0x02000000, 1, SEMX_CREAT | SEMX_EXCL | 0604);
+    if (keyed < 0) return 14;
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        int other = 0;
+        if (geteuid() == 0)
+            other = !setgroups(0, NULL) && !setresgid(65534, 65534, 65534) && !setresuid(65534, 65534, 65534);
+        long got = syscall(SYS_semget, key ^ 0x02000000, 0, 0600);
+        int get = other ? got == -1 && errno == EACCES : got == keyed;
+        int reading = semx_op(keyed, 0, 0, 0) == 0 && semx_ctl(keyed, 0, SEMX_GETVAL, 0) == 0;
+        int change = other ? semx_op(keyed, 0, 1, 0) == EACCES : semx_op(keyed, 0, 1, 0) == 0;
+        long set = semx_ctl(keyed, 0, SEMX_SETVAL, 0);
+        int setting = other ? set == -1 && errno == EACCES : set == 0;
+        unsigned char ds[104];
+        semx_ctl(keyed, 0, SEMX_STAT, (long)ds);
+        long stat_set = semx_ctl(keyed, 0, SEMX_SET, (long)ds);
+        int owner = other ? stat_set == -1 && errno == EPERM : stat_set == 0;
+        printf("permissions as-expected get=%d read=%d change=%d setval=%d set=%d\n", get, reading, change, setting,
+               owner);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (semx_reaped(child)) return 15;
+
+    /* Removal ends the waits with EIDRM. */
+    semx_ctl(id, 0, SEMX_SETVAL, 0);
+    child = semx_child(id, 0, -1, 0);
+    semx_await(id, 0, SEMX_GETNCNT, 1);
+    printf("remove=%ld", semx_ctl(id, 0, SEMX_RMID, 0));
+    printf(" waiter=%d", semx_reaped(child));
+    printf(" gone=%d", semx_errno(semx_ctl(id, 0, SEMX_GETVAL, 0)));
+    printf(" by-key=%d", semx_errno(syscall(SYS_semget, key, 0, 0)));
+    printf(" again=%d", semx_errno(semx_ctl(id, 0, SEMX_RMID, 0)));
+    printf(" other=%ld\n", semx_ctl(keyed, 0, SEMX_RMID, 0));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
@@ -14016,6 +14306,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "shm")) return shm_case();
+    if (!strcmp(mode, "sem")) return sem_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

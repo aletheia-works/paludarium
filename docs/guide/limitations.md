@@ -146,11 +146,15 @@ verified.
     them. Programs check for that and carry on. Saying yes would be wrong
     without the rest: protection keys need the CPU feature, which `CPUID` does
     not report, and io_uring's rings would do no work.
-  - System V semaphores (`semget`, `semop`, `semtimedop`, `semctl`) and
-    message queues (`msgget`, `msgsnd`, `msgrcv`, `msgctl`) are too; only its
-    shared memory is implemented. There is no `/proc/sysvipc`, and the limits
-    of shared memory are Linux's defaults, which `/proc/sys/kernel` cannot
-    change.
+  - System V message queues (`msgget`, `msgsnd`, `msgrcv`, `msgctl`) are
+    too; only its shared memory and semaphores are implemented. There is no
+    `/proc/sysvipc`, and the limits of shared memory and semaphores are
+    Linux's defaults, which `/proc/sys/kernel` cannot change.
+  - A set's waiting semaphore operations are tried in one queue in the
+    order they began, the waits for zero first. Linux keeps a queue for
+    each semaphore beside one for operations on several, and which of two
+    waits that both could go through goes first can differ where waits of
+    both kinds are mixed.
   - `get_robust_list` of another process is `ESRCH`, where Linux gives it to a
     caller that may trace that process.
   - `mincore` counts a page of a file as in memory whenever it lies within the
@@ -262,9 +266,9 @@ verified.
   `SIOCSIFFLAGS` on a TCP or UDP socket does, and the interface requests
   take no other socket and no other flag than `IFF_UP`. The first namespace
   shows `lo` alone too, where Linux shows the host's interfaces. The other namespaces keep nothing apart that
-  paludarium has, but for the System V shared memory of an IPC namespace:
-  there are no System V semaphores, System V message queues or POSIX
-  message queues for one, no `mount` for a mount namespace (whose mounts keep their IDs
+  paludarium has, but for the System V shared memory and semaphores of an
+  IPC namespace: there are no System V message queues or POSIX message
+  queues for one, no `mount` for a mount namespace (whose mounts keep their IDs
   in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new
   ones), no `/proc/self/cgroup` for a cgroup namespace, and no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the

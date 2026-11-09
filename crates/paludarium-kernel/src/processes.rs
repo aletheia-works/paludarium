@@ -2248,9 +2248,10 @@ impl Kernel {
     /// and its own working directory and umask; `CLONE_THREAD`,
     /// `CLONE_SIGHAND` and `CLONE_VM` succeed where there is nothing to
     /// unshare (one thread, dispositions and memory no other process shares)
-    /// and are `EINVAL` otherwise, as Linux has them; `CLONE_SYSVSEM` has no
-    /// semaphore adjustments to drop. A namespace flag gives the thread a
-    /// new namespace of that kind ([`crate::namespaces::check`] has which).
+    /// and are `EINVAL` otherwise, as Linux has them. `CLONE_SYSVSEM` and
+    /// `CLONE_NEWIPC` leave the semaphore undo list, as an exit does
+    /// (`exit_sem`). A namespace flag gives the thread a new namespace of
+    /// that kind ([`crate::namespaces::check`] has which).
     fn unshare(
         &mut self,
         thread: &mut Thread,
@@ -2310,6 +2311,10 @@ impl Kernel {
         }
         if flags & (FS | FILES) != 0 {
             self.files = self.files.for_clone(flags & FILES == 0, flags & FS == 0);
+        }
+        if flags & (SYSVSEM | crate::namespaces::CLONE_NEWIPC) != 0 {
+            self.group
+                .leave_sem_undo_list(thread.tid, self.process.pid, self.wall_seconds());
         }
         Ok(0)
     }
@@ -2537,7 +2542,15 @@ impl Kernel {
             match kind {
                 Kind::Net => mine.net = new,
                 Kind::Uts => mine.uts = new,
-                Kind::Ipc => mine.ipc = new,
+                // ipcns_install leaves the semaphore undo list (`exit_sem`).
+                Kind::Ipc => {
+                    mine.ipc = new;
+                    self.group.leave_sem_undo_list(
+                        thread.tid,
+                        self.process.pid,
+                        self.wall_seconds(),
+                    );
+                }
                 Kind::Pid => mine.pid_for_children = new,
                 Kind::User => mine.user = new,
                 Kind::Mnt => {
@@ -2605,7 +2618,7 @@ impl Kernel {
             .sched(parent.tid)
             .forked(self.group.nice(parent.tid).unwrap_or(0))?;
         let task = self.processes.charge_task()?;
-        // copy_namespaces; CLONE_NEWIPC leaves the semaphore adjustments,
+        // copy_namespaces; CLONE_NEWIPC leaves the semaphore undo list,
         // which CLONE_SYSVSEM would share.
         // copy_creds first, whose new user namespace the others are in.
         let own = self.group.namespaces(parent.tid);
@@ -2648,6 +2661,11 @@ impl Kernel {
             .numa()
             .new_process(group.numa(), parent.tid, pid, flags & 0x100 != 0);
         group.register(pid, inbox.clone());
+        // copy_semundo: CLONE_SYSVSEM shares the undo list, which the
+        // parent is given first if it has none.
+        if flags & 0x40000 != 0 {
+            group.set_sem_undo_list(pid, self.group.sem_undo_list(parent.tid).share());
+        }
         let mut state = parent.state.clone();
         state.credentials = credentials.clone();
         state.pid = pid;
@@ -3390,6 +3408,12 @@ impl Kernel {
         // exec deletes the POSIX timers (the interval timer stays).
         self.group
             .with_timers(&mut thread.state, |timers| timers.clear());
+        // The thread's undo list goes with its new number.
+        if thread.tid != self.process.pid
+            && let Some(list) = self.group.take_sem_undo_list(thread.tid)
+        {
+            self.group.set_sem_undo_list(self.process.pid, list);
+        }
         thread.tid = self.process.pid;
         let closed = self.files.take_close_on_exec();
         self.files = self.files.for_exec();

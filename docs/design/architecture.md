@@ -53,9 +53,10 @@ it is given.
 
 The interpreter keeps each thread's decoded instructions in a decode cache, so
 an instruction is decoded once. When it is decoded, the most frequent simple
-forms (moves between registers and memory, `lea`, `push` and `pop`, direct
-branches, `call`, `ret`, and `add`, `sub`, `and`, `or`, `xor`, `cmp` and `test`
-on a register) are also worked out: their operands are taken out in advance,
+forms (`nop` and `endbr64`, moves between registers and memory, `movzx` from
+memory, `lea`, `push` and `pop`, direct branches, `call`, `ret`, `add`, `sub`,
+`and`, `or`, `xor`, `cmp` and `test` on a register, and `cmp` and `test` on
+memory) are also worked out: their operands are taken out in advance,
 so running them needs neither the general dispatch by mnemonic nor the general
 operand handling. Such a form changes the state only after everything that can
 fail. When it fails, nothing has changed, and the instruction runs again

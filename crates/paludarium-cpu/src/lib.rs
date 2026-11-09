@@ -411,7 +411,7 @@ fn execute_decoded(
     let insn = &decoded.instruction;
     // A form that fails changes nothing, and runs again below to give the
     // fault.
-    if decoded.fast != exec::Fast::None
+    if !matches!(decoded.fast, exec::Fast::None)
         && exec::execute_fast(state, mem, insn, &decoded.fast).is_ok()
     {
         state.repeat_continuation = None;

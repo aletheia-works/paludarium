@@ -28,11 +28,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 /// The size of Linux's original `struct rseq`, and its alignment.
 const ORIGINAL_SIZE: u32 = 32;
-/// `AT_RSEQ_FEATURE_SIZE`: `offsetof(struct rseq, end)`, the fields this
-/// kernel keeps up to date (`cpu_id_start` to `mm_cid`).
-pub const FEATURE_SIZE: u64 = 28;
-/// `AT_RSEQ_ALIGN`: `__alignof__(struct rseq)`.
-pub const ALIGNMENT: u64 = 32;
+/// `AT_RSEQ_FEATURE_SIZE` and `AT_RSEQ_ALIGN`, which the loader gives the
+/// program: the fields this kernel keeps up to date (`cpu_id_start` to
+/// `mm_cid`), and the area's alignment.
+use paludarium_loader::auxv::{RSEQ_ALIGN as ALIGNMENT, RSEQ_FEATURE_SIZE as FEATURE_SIZE};
 /// `RSEQ_FLAG_UNREGISTER`.
 const UNREGISTER: u32 = 1;
 /// `RSEQ_CPU_ID_UNINITIALIZED`, the `cpu_id` of an area no longer registered.

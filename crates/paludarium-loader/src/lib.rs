@@ -54,6 +54,11 @@ pub mod auxv {
     pub const AT_EXECFN: u64 = 31;
     pub const AT_RSEQ_FEATURE_SIZE: u64 = 27;
     pub const AT_RSEQ_ALIGN: u64 = 28;
+    /// What `AT_RSEQ_FEATURE_SIZE` gives: the part of `struct rseq` the
+    /// kernel keeps up to date, Linux's `offsetof(struct rseq, end)`.
+    pub const RSEQ_FEATURE_SIZE: u64 = 28;
+    /// What `AT_RSEQ_ALIGN` gives: `__alignof__(struct rseq)`.
+    pub const RSEQ_ALIGN: u64 = 32;
 }
 
 /// Why a program could not be loaded.
@@ -431,10 +436,8 @@ fn build_stack(
         (AT_HWCAP, 0),
         (AT_RANDOM, random),
         (AT_EXECFN, execfn),
-        // What the kernel's rseq keeps up to date, as Linux's
-        // offsetof(struct rseq, end), and the area's alignment.
-        (AT_RSEQ_FEATURE_SIZE, 28),
-        (AT_RSEQ_ALIGN, 32),
+        (AT_RSEQ_FEATURE_SIZE, RSEQ_FEATURE_SIZE),
+        (AT_RSEQ_ALIGN, RSEQ_ALIGN),
         (AT_NULL, 0),
     ];
     let mut words: Vec<u64> = Vec::with_capacity(3 + arg_ptrs.len() + env_ptrs.len() + 38);

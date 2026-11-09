@@ -11,6 +11,6 @@
     "check:safari": "node browser-check.mjs safari"
   },
   "devDependencies": {
-    "playwright": "1.64.1"
+    "playwright": "1.65.0"
   }
 }

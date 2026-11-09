@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 paludarium.workspace = true
+paludarium-jit-native.workspace = true
 
 [dev-dependencies]
 paludarium-cpu.workspace = true

@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod alu;
+pub mod compile;
 #[cfg(test)]
 mod counted_hook_tests;
 mod cpuid;
@@ -110,6 +111,8 @@ pub struct DecodeCache {
     /// most as many as there are slots ([`Self::make_room`]).
     code: Code,
     growth: Growth,
+    /// The compiled blocks that slots refer to ([`Slot::compiled`]).
+    compiled: Vec<std::sync::Arc<dyn compile::CompiledBlock>>,
 }
 
 /// When a [`DecodeCache`] grows.
@@ -150,6 +153,7 @@ impl Default for DecodeCache {
             mask: INITIAL_ENTRIES as u64 - 1,
             code: Code::with_capacity(INITIAL_ENTRIES),
             growth: Growth::default(),
+            compiled: Vec::new(),
         }
     }
 }
@@ -249,7 +253,20 @@ struct Slot {
     start: u32,
     len: u8,
     rejected: bool,
+    /// How many times [`run_compiled`] has entered the block uncompiled.
+    runs: u16,
+    /// Its compiled code: 0 for none yet, [`NOT_COMPILED`] when the
+    /// compiler turned it down, else one more than its index in
+    /// [`DecodeCache::compiled`].
+    compiled: u32,
 }
+
+/// [`Slot::compiled`] of a block the compiler turned down.
+const NOT_COMPILED: u32 = u32::MAX;
+
+/// The most compiled blocks a [`DecodeCache`] keeps; past it, all are
+/// dropped and compiled again as they run.
+const MAX_COMPILED: usize = 1 << 13;
 
 impl Slot {
     fn holds(&self, rip: u64, generation: u64) -> bool {
@@ -333,6 +350,7 @@ impl DecodeCache {
         if self.code.len() + MAX_BLOCK > self.slots.len() {
             self.slots.fill(Slot::default());
             self.code.clear();
+            self.compiled.clear();
         }
     }
 
@@ -367,6 +385,8 @@ impl DecodeCache {
             start: u32::try_from(start).unwrap_or(u32::MAX),
             len: u8::try_from(len).unwrap_or(u8::MAX),
             rejected: false,
+            runs: 0,
+            compiled: 0,
         };
         Ok(s.range())
     }

@@ -68,6 +68,11 @@ PALUDARIUM_TEST_NODE="${PALUDARIUM_TEST_NODE:-$(command -v node)}" cargo test --
 description = "Differential tests against native Linux (x86-64 Linux only; elsewhere use `mise run linux-dev -- ...`)"
 run = "cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network -- --nocapture"
 
+[tasks."test:diff:jit"]
+description = "Differential tests with the native JIT compiling every block the first time it runs (x86-64 Linux only)"
+env = { PALUDARIUM_TEST_JIT = "1" }
+run = "cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network -- --nocapture"
+
 [tasks.coverage]
 description = "Line coverage with the 80 % floor (x86-64 Linux)"
 run = "cargo llvm-cov --locked --workspace --fail-under-lines 80"

@@ -193,7 +193,18 @@ pub fn run_emulated(
     argv.extend(args.iter().map(|a| a.as_bytes().to_vec()));
     let config = Config::new(guest_path.clone(), argv).with_file(guest_path, content);
     let host = Arc::new(RecordingHost::new());
-    let session = Arc::new(Session::new(config, host.clone()).map_err(|e| e.to_string())?);
+    let mut session = Session::new(config, host.clone()).map_err(|e| e.to_string())?;
+    // `PALUDARIUM_TEST_JIT=N` runs the guest with the native JIT, compiling
+    // the blocks run N times (1: every block, the first time it runs).
+    if let Some(threshold) = std::env::var("PALUDARIUM_TEST_JIT")
+        .ok()
+        .and_then(|n| n.parse::<u16>().ok())
+    {
+        let compiler = paludarium_jit_native::compiler_with(threshold, false)
+            .ok_or("PALUDARIUM_TEST_JIT: this host has no JIT")?;
+        session = session.with_compiler(compiler);
+    }
+    let session = Arc::new(session);
     let started = Instant::now();
     let runner = {
         let session = Arc::clone(&session);

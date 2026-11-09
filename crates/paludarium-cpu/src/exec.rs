@@ -39,7 +39,8 @@ const FX_AREA: usize = 512;
 type Result<T> = core::result::Result<T, Stop>;
 
 mod fast;
-pub(crate) use fast::{Fast, execute as execute_fast};
+pub(crate) use fast::execute as execute_fast;
+pub use fast::{Address, Alu, Fast, Source};
 
 fn atomic_width(size: u8) -> Result<AtomicWidth> {
     match size {

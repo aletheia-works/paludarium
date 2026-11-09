@@ -38,6 +38,13 @@ test = false
 [[bin]]
 bench = false
 doc = false
+name = "jit_native"
+path = "fuzz_targets/jit_native.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
 name = "mmu_instructions"
 path = "fuzz_targets/mmu_instructions.rs"
 test = false
@@ -111,6 +118,7 @@ paludarium-cpu = { path = "../crates/paludarium-cpu" }
 paludarium-decoder = { path = "../crates/paludarium-decoder" }
 paludarium-host = { path = "../crates/paludarium-host" }
 paludarium-jit = { path = "../crates/paludarium-jit", features = ["fuzzing"] }
+paludarium-jit-native = { path = "../crates/paludarium-jit-native" }
 paludarium-kernel = { path = "../crates/paludarium-kernel" }
 paludarium-loader = { path = "../crates/paludarium-loader" }
 paludarium-mmu = { path = "../crates/paludarium-mmu" }

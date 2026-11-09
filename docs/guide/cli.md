@@ -5,7 +5,7 @@ x86-64 Linux program on the host.
 
 ```sh
 cargo install paludarium
-paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys]
+paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--jit[=N]] [--report-enosys]
            [--max-tasks N] [--max-open-files N] [--max-memory N]
            [--allow-net HOST[:PORT]]... <program> [args...]
 ```
@@ -33,7 +33,14 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 - `--mount HOST:GUEST` (or `--mount=HOST:GUEST`) shows one host directory to
   the guest at the absolute guest path `GUEST`. Repeat it for more. The guest
   cannot leave the directory through `..` or symbolic links.
-- `--no-jit` is accepted for compatibility; the native build has no JIT.
+- `--jit` (or `--jit=N`) turns on the native JIT, which is experimental.
+  A block of instructions that has run `N` times (100 without `=N`, at most
+  65535) is compiled to host code with Cranelift on a thread of its own, and
+  runs as host code once it is ready; the interpreter runs everything else
+  ([Architecture](../design/architecture#the-native-jit)). Only Linux on
+  x86-64 hosts has it: elsewhere `--jit` stops with an error. Without
+  `--jit` the JIT is off.
+- `--no-jit` turns the native JIT off, even with `--jit`.
 - `--report-enosys` lists, after the run, the system calls the guest called
   that paludarium does not implement (they returned `ENOSYS`), by number.
 - `--max-tasks N` lets the guest have at most `N` tasks (at least 1): threads,

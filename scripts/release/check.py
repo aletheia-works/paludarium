@@ -177,7 +177,7 @@ def validate(root):
     return dict(
         validated=True,
         version=inv["version"],
-        crates=11,
+        crates=len(policy.PUBLIC),
         publish_eligible=False,
         outstanding=outstanding,
     )
@@ -290,7 +290,7 @@ def registry_version(url):
 
 
 def registry_presence(order):
-    """Which of the eleven crate names and @aletheia-works/paludarium-wasm exist on their registry."""
+    """Which of the twelve crate names and @aletheia-works/paludarium-wasm exist on their registry."""
     urls = {name: CRATES_API + name for name in order}
     urls[NPM_NAME] = NPM_PACKAGE_URL
     return dict(

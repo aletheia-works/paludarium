@@ -18,8 +18,8 @@ use crate::alu::{self, size_mask};
 use crate::state::{CpuState, flag};
 
 /// An arithmetic or logic operation of [`Fast`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Alu {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Alu {
     Add,
     Sub,
     And,
@@ -43,7 +43,10 @@ impl Alu {
         })
     }
 
-    fn writes(self) -> bool {
+    /// Whether the operation writes its result to the destination
+    /// (`cmp` and `test` only set the flags).
+    #[must_use]
+    pub fn writes(self) -> bool {
         !matches!(self, Self::Cmp | Self::Test)
     }
 
@@ -61,24 +64,30 @@ impl Alu {
 }
 
 /// A second operand of [`Fast`]: a register or an immediate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Source {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Source {
     Register(Register),
     Immediate(u64),
 }
 
 /// A memory operand of [`Fast`]: a [`MemoryOperand`] whose base and index
 /// are general-purpose registers read whole, kept in 16 bytes instead of 24.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Address {
-    displacement: u64,
-    base: Option<u8>,
-    index: Option<u8>,
-    scale: u8,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Address {
+    /// Added to the base and the scaled index.
+    pub displacement: u64,
+    /// The base register, read whole.
+    pub base: Option<u8>,
+    /// The index register, read whole.
+    pub index: Option<u8>,
+    /// What the index is multiplied by: 1, 2, 4 or 8.
+    pub scale: u8,
     /// Size of the accessed value in bytes.
-    size: u8,
-    segment: Segment,
-    address_size_32: bool,
+    pub size: u8,
+    /// The segment whose base is added (`fs` or `gs`).
+    pub segment: Segment,
+    /// Whether the address is truncated to 32 bits (a `0x67` prefix).
+    pub address_size_32: bool,
 }
 
 impl Address {
@@ -105,8 +114,8 @@ impl Address {
 }
 
 /// The operation of a decoded instruction, if it has one of these forms.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Fast {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fast {
     /// Every other form, run by [`super::execute`].
     None,
     Nop,
@@ -207,7 +216,8 @@ fn branch(o: Option<Operand>) -> Option<u64> {
 
 impl Fast {
     /// The form of `i`, or [`Fast::None`].
-    pub(crate) fn of(i: &Instruction) -> Self {
+    #[must_use]
+    pub fn of(i: &Instruction) -> Self {
         if i.lock || i.rep != RepPrefix::None {
             return Self::None;
         }

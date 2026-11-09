@@ -16,7 +16,7 @@ class ReleaseIntegrationTests(unittest.TestCase):
             return dict(published=True)
 
         result = check.publish_sequence(state, inventory, upload, lambda n, r: True)
-        self.assertEqual(len(result), 12)
+        self.assertEqual(len(result), 13)
         self.assertEqual(result, uploaded)
 
     def test_preflight_denies_upload_zero(self):

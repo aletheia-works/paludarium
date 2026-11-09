@@ -169,11 +169,11 @@ class PublishAdapterTests(unittest.TestCase):
             return check.publish_artifacts(self.root, None)
 
     def test_mocked_upload_transport(self):
-        self.assertEqual(len(self.execute()["published"]), 12)
+        self.assertEqual(len(self.execute()["published"]), 13)
 
     def test_older_cargo_dry_run_location(self):
         self.dry_dir = "target/package"
-        self.assertEqual(len(self.execute()["published"]), 12)
+        self.assertEqual(len(self.execute()["published"]), 13)
 
     def test_upload_that_shows_up_late_is_waited_for(self):
         request = self.request
@@ -189,7 +189,7 @@ class PublishAdapterTests(unittest.TestCase):
 
         self.request = late
         with patch.object(check.time, "sleep", side_effect=sleeps.append):
-            self.assertEqual(len(self.execute()["published"]), 12)
+            self.assertEqual(len(self.execute()["published"]), 13)
         self.assertEqual(sleeps, [check.UPLOAD_POLL_SECONDS] * 5)
 
     def test_upload_that_never_shows_up_stops(self):
@@ -227,7 +227,7 @@ class PublishAdapterTests(unittest.TestCase):
 
     def test_existing_versions_are_not_uploaded(self):
         self.uploaded = set(self.inv["order"]) | {"npm"}
-        self.assertEqual(len(self.execute()["published"]), 12)
+        self.assertEqual(len(self.execute()["published"]), 13)
 
     def test_artifact_head_changed_before_upload(self):
         self.result["head"] = "b" * 40
@@ -250,7 +250,7 @@ class PublishAdapterTests(unittest.TestCase):
         dry = [e for n, e in self.envs if n.startswith("dry-")]
         uploads = [e for n, e in self.envs if n.startswith("publish-") and n != "publish-npm"]
         npm_env = [e for n, e in self.envs if n == "publish-npm"]
-        self.assertEqual((len(dry), len(uploads), len(npm_env)), (11, 11, 1))
+        self.assertEqual((len(dry), len(uploads), len(npm_env)), (12, 12, 1))
         self.assertTrue(all(token not in e.values() for e in dry + npm_env))
         self.assertTrue(all(e["CARGO_REGISTRY_TOKEN"] == token for e in uploads))
         recorded = json.dumps(result) + (self.out / "publication-progress.json").read_text()
@@ -277,7 +277,7 @@ class PublishAdapterTests(unittest.TestCase):
         names = [n for n, _ in self.envs]
         self.assertFalse([n for n in names if any(n.endswith("-" + d) for d in done)])
         self.assertEqual(
-            len([n for n in names if n.startswith("publish-") and n != "publish-npm"]), 8
+            len([n for n in names if n.startswith("publish-") and n != "publish-npm"]), 9
         )
         self.assertIn("publish-npm", names)
         progress = json.loads((self.out / "publication-progress.json").read_text())
@@ -330,7 +330,7 @@ class PublishAdapterTests(unittest.TestCase):
         self.execute()
         cargo = [e for n, e in self.envs if n != "publish-npm"]
         npm = next(e for n, e in self.envs if n == "publish-npm")
-        self.assertEqual(len(cargo), 22)
+        self.assertEqual(len(cargo), 24)
         self.assertTrue(
             all(
                 not {

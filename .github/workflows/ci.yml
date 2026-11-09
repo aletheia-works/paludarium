@@ -27,6 +27,7 @@ env:
     -p paludarium-types -p paludarium-decoder -p paludarium-mmu
     -p paludarium-cpu -p paludarium-loader -p paludarium-vfs
     -p paludarium-kernel -p paludarium-host -p paludarium-jit
+    -p paludarium-jit-native
     -p paludarium-runtime -p paludarium
 
 jobs:
@@ -260,6 +261,39 @@ jobs:
           path: target/encodings-guests/
           retention-days: 7
 
+  # The same differential tests with the native JIT compiling every block the
+  # first time it runs, so that compiled code, not the interpreter, runs the
+  # guests' instructions (docs/design/quality.md).
+  differential-jit:
+    name: differential tests with the native JIT (x86-64 Linux)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/guest-toolchain
+        with:
+          packages: musl-tools
+      # As in the differential job.
+      - name: Write cores to the working directory
+        run: |
+          sudo sysctl -w kernel.core_pattern=core kernel.core_uses_pid=0
+          sudo prlimit --pid "$PPID" --core=0:
+      - name: Check that this step took the core limit
+        run: test "$(ulimit -Sc)" = 0
+      - name: Keep the default AF_UNIX datagram queue length
+        run: sudo sysctl -w net.unix.max_dgram_qlen=10
+      - name: Differential tests, every block compiled the first time it runs
+        env:
+          PALUDARIUM_TEST_JIT: "1"
+        run: cargo test --locked -p paludarium-harness --test diff_core --test diff_instructions --test parallel_instructions --test diff_signals_time --test diff_terminal --test diff_encodings --test diff_processes --test diff_network -- --nocapture
+
   coverage:
     name: line coverage >= 80%
     needs: changes
@@ -427,6 +461,7 @@ jobs:
       - lint
       - dependencies
       - differential
+      - differential-jit
       - coverage
     runs-on: ubuntu-latest
     timeout-minutes: 5

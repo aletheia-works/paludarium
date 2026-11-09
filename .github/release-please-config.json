@@ -24,12 +24,12 @@
         {
           "type": "toml",
           "path": "Cargo.lock",
-          "jsonpath": "$.package[?(@.name.value=='paludarium' || @.name.value=='paludarium-cpu' || @.name.value=='paludarium-decoder' || @.name.value=='paludarium-harness' || @.name.value=='paludarium-host' || @.name.value=='paludarium-jit' || @.name.value=='paludarium-kernel' || @.name.value=='paludarium-loader' || @.name.value=='paludarium-mmu' || @.name.value=='paludarium-runtime' || @.name.value=='paludarium-types' || @.name.value=='paludarium-vfs' || @.name.value=='paludarium-wasm')].version"
+          "jsonpath": "$.package[?(@.name.value=='paludarium' || @.name.value=='paludarium-cpu' || @.name.value=='paludarium-decoder' || @.name.value=='paludarium-harness' || @.name.value=='paludarium-host' || @.name.value=='paludarium-jit' || @.name.value=='paludarium-jit-native' || @.name.value=='paludarium-kernel' || @.name.value=='paludarium-loader' || @.name.value=='paludarium-mmu' || @.name.value=='paludarium-runtime' || @.name.value=='paludarium-types' || @.name.value=='paludarium-vfs' || @.name.value=='paludarium-wasm')].version"
         },
         {
           "type": "toml",
           "path": "fuzz/Cargo.lock",
-          "jsonpath": "$.package[?(@.name.value=='paludarium-cpu' || @.name.value=='paludarium-decoder' || @.name.value=='paludarium-host' || @.name.value=='paludarium-jit' || @.name.value=='paludarium-kernel' || @.name.value=='paludarium-loader' || @.name.value=='paludarium-mmu' || @.name.value=='paludarium-types' || @.name.value=='paludarium-vfs')].version"
+          "jsonpath": "$.package[?(@.name.value=='paludarium-cpu' || @.name.value=='paludarium-decoder' || @.name.value=='paludarium-host' || @.name.value=='paludarium-jit' || @.name.value=='paludarium-jit-native' || @.name.value=='paludarium-kernel' || @.name.value=='paludarium-loader' || @.name.value=='paludarium-mmu' || @.name.value=='paludarium-types' || @.name.value=='paludarium-vfs')].version"
         },
         {
           "type": "json",

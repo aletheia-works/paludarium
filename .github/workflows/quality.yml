@@ -32,6 +32,7 @@ env:
     -p paludarium-types -p paludarium-decoder -p paludarium-mmu
     -p paludarium-cpu -p paludarium-loader -p paludarium-vfs
     -p paludarium-kernel -p paludarium-host -p paludarium-jit
+    -p paludarium-jit-native
     -p paludarium-runtime -p paludarium
 
 defaults:

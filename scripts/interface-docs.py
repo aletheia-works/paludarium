@@ -29,7 +29,13 @@ CRATES = ROOT / "crates"
 DETAILED = ("Config", "Limits", "Mount", "TerminalInfo", "Session", "Error", "ExitStatus")
 UNDOCUMENTED = {
     "Config": {"entries", "with_entry"},
-    "Session": {"with_code_cache", "initial_file_system", "run_with_file_system", "with_budget"},
+    "Session": {
+        "with_code_cache",
+        "with_compiler",
+        "initial_file_system",
+        "run_with_file_system",
+        "with_budget",
+    },
     "Error": {"new", "with_rip", "with_bytes", "with_syscall"},
 }
 LANGUAGES = ("guide", "ja/guide")

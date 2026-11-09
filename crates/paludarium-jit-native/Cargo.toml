@@ -1,0 +1,24 @@
+[package]
+name = "paludarium-jit-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Native JIT for paludarium: hot blocks compiled to host code with Cranelift"
+readme.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+paludarium-cpu.workspace = true
+paludarium-decoder.workspace = true
+paludarium-mmu.workspace = true
+paludarium-types.workspace = true
+
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
+cranelift-codegen = "0.137.1"
+cranelift-frontend = "0.137.1"
+cranelift-native = "0.137.1"
+libc = "0.2.191"
+
+[lints]
+workspace = true

@@ -117,8 +117,9 @@ CI run produces them afresh on an x86-64 Linux runner.
 
 ## Fuzzing
 
-Thirteen targets (decoding, ELF loading, system call arguments, filesystem
-paths, MMU operations, the CPU, threads, futexes, events, sockets and the JIT)
+Fourteen targets (decoding, ELF loading, system call arguments, filesystem
+paths, MMU operations, the CPU, threads, futexes, events, sockets and the two
+JITs)
 each run for 600 seconds with AddressSanitizer and LeakSanitizer, every night.
 
 Fuzzing for a fixed time does not prove that every input is safe, but it keeps
@@ -151,8 +152,8 @@ every test passing.
 
 | When | What |
 |---|---|
-| Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments and in WebKit on x86-64 Linux; part of the fuzzing |
-| Every night | fuzzing of the 13 targets; differential tests on macOS and Windows; Debian's own programs on x86-64 Linux; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
+| Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux, also with the native JIT; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments and in WebKit on x86-64 Linux; part of the fuzzing |
+| Every night | fuzzing of the 14 targets; differential tests on macOS and Windows; Debian's own programs on x86-64 Linux; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
 | Every day | every scheduled workflow is checked to have started on time; one that failed to start, did not run or was disabled opens an Issue |
 | Every week | the pinned nightly Rust and the aube and ripgrep guests move to their latest releases, each in a pull request that merges itself once its checks pass |
 | Before a release | all of the above on the exact code being released (below) |
@@ -190,6 +191,17 @@ its own: the same differential tests run with and without it. Instructions the
 JIT cannot translate run in the interpreter, and such runs do not count as JIT
 successes. In the four WebAssembly environments, probe, aube and the ripgrep
 searches all run in both modes, and each JIT run must execute translated code.
+
+### The native JIT
+
+The native JIT has no semantics of its own either. Its unit tests run every
+form it compiles, and random runs of them, from random registers, flags and
+memory, and compare the registers, flags and memory with the interpreter's;
+a stop before an instruction must be one the interpreter faults on. On every
+pull request the differential tests also run with every block compiled the
+first time it runs (`PALUDARIUM_TEST_JIT=1`, the `differential-jit` job), and
+the `jit_native` fuzz target compares compiled code with the interpreter for
+arbitrary instruction bytes.
 
 ### How speed is measured
 

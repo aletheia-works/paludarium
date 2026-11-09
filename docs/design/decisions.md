@@ -179,6 +179,34 @@ Rust translates blocks into WebAssembly bytes; the JavaScript in the guest's
 Worker compiles and runs them. Generated code keeps the MMU's permission and
 range checks, and translations of rewritten pages are discarded.
 
+## A native JIT with Cranelift
+
+Native builds get a JIT of their own rather than the WebAssembly one, which
+needs a JavaScript engine to compile its output. It compiles with Cranelift,
+a code generator written in Rust that compiles a small function in tens to
+hundreds of microseconds, rather than with LLVM, which is far slower to
+compile with and is not a Rust library. It compiles the forms the
+interpreter already works out when it decodes, not instructions of its own,
+so each instruction it compiles has one meaning, the interpreter's, which
+unit tests from random states, a fuzz target and the differential tests with
+every block compiled check.
+
+It is a crate of its own because it needs `unsafe`, to map code and call
+it, and every other crate but the host's forbids it. Compiling happens on a
+thread of its own while the interpreter goes on, because compiling on the
+thread that runs the block made short programs, which run many blocks only a
+few hundred times, up to twice as slow. Cranelift's `speed` level costs
+more to compile than `none` but makes faster code, which a background
+compile can afford. The registers live in memory, not in Cranelift
+variables: each early exit then needs no copy of every register, which made
+compiling about three times faster and the code faster too.
+
+In a same-runner comparison on CI (x86-64 Linux), against the interpreter
+without it, `--jit` made Perl's hash and string benchmarks 15% and 27%
+faster, LuaJIT 15% and OCaml 8%, with every Debian program still giving
+native Linux's results; programs that run briefly changed within the
+measurement's noise. It is off by default until it has more to show.
+
 ## One way to create a filesystem
 
 A snapshot is passed back to `createFileSystem` as its `entries` rather than to

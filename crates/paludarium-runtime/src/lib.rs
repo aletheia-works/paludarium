@@ -196,6 +196,7 @@ pub struct Session {
     host: Arc<dyn Host>,
     code_cache: Arc<dyn CodeCache>,
     accelerated: bool,
+    compiler: Option<Arc<dyn paludarium_cpu::compile::Compiler>>,
     budget: u64,
     kill_requested: Arc<AtomicBool>,
     signal_inbox: Arc<SignalInbox>,
@@ -211,6 +212,13 @@ impl Session {
     pub fn with_code_cache(mut self, cache: Arc<dyn CodeCache>) -> Self {
         self.code_cache = cache;
         self.accelerated = true;
+        self
+    }
+    /// Runs the guest's hot blocks as host code from `compiler` (the
+    /// native JIT); the interpreter runs the rest.
+    #[must_use]
+    pub fn with_compiler(mut self, compiler: Arc<dyn paludarium_cpu::compile::Compiler>) -> Self {
+        self.compiler = Some(compiler);
         self
     }
     /// Validates the configuration. Mounts are not implemented in the core emulator.
@@ -278,6 +286,7 @@ impl Session {
             host,
             code_cache: Arc::new(NoopCodeCache),
             accelerated: false,
+            compiler: None,
             budget: DEFAULT_BUDGET,
             kill_requested: Arc::new(AtomicBool::new(false)),
             signal_inbox: Arc::new(SignalInbox::default()),
@@ -458,6 +467,7 @@ impl Session {
             Arc::clone(&self.last_stop),
             Arc::clone(&self.code_cache),
             self.accelerated,
+            self.compiler.clone(),
             self.budget,
         ));
         execution.execute(kernel, thread, Arc::new(mem));

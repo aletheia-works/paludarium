@@ -5,8 +5,9 @@ paludarium は、役割ごとに分けた crate でできています。依存�
 
 | 層 | 使う層 |
 |---|---|
-| 入口（`paludarium` コマンド、Rust の API、WebAssembly の launcher） | runtime |
+| 入口（`paludarium` コマンド、Rust の API、WebAssembly の launcher） | runtime、jit-native |
 | runtime | cpu、jit、kernel、loader、host |
+| jit-native | cpu、decoder、mmu |
 | cpu、jit | decoder、mmu |
 | kernel | mmu、vfs、loader、host |
 | loader | mmu、vfs |
@@ -26,6 +27,7 @@ paludarium は、役割ごとに分けた crate でできています。依存�
 | `paludarium-loader` | ELF と、それが求めるインタプリタの読み込みと、最初のスタック（argv・envp・補助ベクタ） |
 | `paludarium-cpu` | x86-64 のインタプリタ |
 | `paludarium-jit` | コードキャッシュの口と、WebAssembly 向けの JIT |
+| `paludarium-jit-native` | ネイティブの JIT。よく実行されるブロックを Cranelift でホストのコードにする |
 | `paludarium-kernel` | Linux のシステムコール。プロセスとスレッドの状態を持つ |
 | `paludarium-runtime` | `Session` と、スレッドごとの実行ループ |
 | `paludarium` | 公開の API と `paludarium` コマンド |
@@ -85,6 +87,29 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 汎用の経路だけが読むデコードした命令そのものとは別に持ちます。そのため、こうした形が続くあいだに読む
 ホストのメモリは少なくて済みます。
 
+## ネイティブの JIT {#the-native-jit}
+
+`--jit` を付けると、デコードキャッシュのブロックのうち、よく実行されるものをホストの
+コードにコンパイルします（`paludarium-jit-native`、x86-64 の Linux のホストだけ）。
+ブロックは、入った回数を数えます。それがしきい値（既定は 100）に達すると、先頭の命令の形を、
+形のない最初の命令の手前まで、コンパイラに渡します。JIT 専用のスレッドがそれを Cranelift の
+IR にしてコンパイルし、書き込みと実行が同時にはできないメモリに置きます。コードができるまでと、
+コンパイルに失敗したときは、インタプリタが今までどおりそのブロックを実行します。
+
+コンパイルしたコードの意味は、インタプリタの形の意味とまったく同じです。レジスタの写しを
+メモリ上で読み書きし、ゲストのメモリには MMU 自身の読み書きを通してだけ触るので、その検査も
+そのまま働きます。読み書きが失敗する命令の手前では、その命令について何も変えずに止まり、
+インタプリタがその命令を実行し直して fault を報告します。コードの世代を進めた読み書きの後でも
+止まります。分岐が成立したときと、`jmp`、`call`、`ret` で終わります。実行した命令の数を返し、
+インタプリタはその次の命令から続けます。
+
+コードの世代が進むと、インタプリタはすべてのブロックをデコードし直しますが、ほとんどは同じ形に
+なります。JIT はコンパイルしたコードを形ごとに覚えておき（65536 ブロックまで）、形が同じ
+ブロックには同じコードを渡します。そのため、メモリをよくマップするプログラムでも、何度も
+コンパイルし直すことはありません。コードは、Session のすべてのスレッドとプロセスで共有します。
+環境変数 `PALUDARIUM_JIT_STATS` を設定すると、コンパイルしたブロックと命令の数と、それに
+かかった時間を標準エラーに出します。
+
 ## ホストとの境界
 
 ネイティブと WebAssembly の違いは、`paludarium-host` の中だけに閉じ込めています。
@@ -110,7 +135,9 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 ## 安全のための決まり
 
 - `unsafe` を使ってよいのは、ホストとの接続部と JIT だけです。それ以外の crate は
-  `#![forbid(unsafe_code)]` です（今は JIT も `unsafe` を使っていません）。
+  `#![forbid(unsafe_code)]` です。WebAssembly 向けの JIT は、今は `unsafe` を使っていません。
+  ネイティブの JIT が使うのは 1 つのモジュールだけで、そこでコンパイルしたコードをマップして
+  呼び出し、MMU を呼び返します。
 - 製品のコードでは、`unwrap`・`expect`・`panic` を clippy で禁止しています。
 - ゲストのアドレス（`GuestAddr(u64)`）とホストのアドレスを型で分けています。
   WebAssembly では `usize` が 32 bit なので、境界の変換はすべて検査します。

@@ -363,8 +363,10 @@ verified.
   resolves symbolic links.
 - **Memory limit**: a write beyond the limit ends the process that made it,
   where Linux's OOM killer picks the process using the most memory.
-- **A native JIT**: only the WebAssembly build has a JIT; native builds use the
-  interpreter.
+- **The native JIT**: it is experimental and off unless `--jit` asks for it,
+  and only Linux on x86-64 hosts has it; the other native builds use the
+  interpreter. It compiles only the instructions with a simple form at the
+  start of a block ([Architecture](../design/architecture#the-native-jit)).
 - **Stable Rust**: a nightly Rust is required.
 
 ## Not verified

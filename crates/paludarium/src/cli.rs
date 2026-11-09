@@ -3,7 +3,9 @@
 //! ```text
 //! paludarium [options] <program> [args...]
 //!   --env KEY=VALUE   add a guest environment variable (repeatable)
-//!   --no-jit          accepted; the native build has no JIT
+//!   --no-jit          accepted; the JIT is off unless --jit asks for it
+//!   --jit[=N]         compile blocks run N times (100 by default) to host
+//!                     code (experimental; Linux x86-64 hosts only)
 //!   --mount HOST:GUEST expose one explicit host directory (repeatable)
 //!   --report-enosys   list the unimplemented system calls the guest called
 //!   --max-tasks N     at most N threads and unreaped processes (EAGAIN)
@@ -43,7 +45,7 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_EMULATOR_ERROR: i32 = 70;
 
 /// Usage text printed on errors and for `--help`.
-pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] [--max-tasks N] [--max-open-files N] [--max-memory N] [--allow-net HOST[:PORT]]... <program> [args...]\n";
+pub const USAGE: &str = "usage: paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--jit[=N]] [--report-enosys] [--max-tasks N] [--max-open-files N] [--max-memory N] [--allow-net HOST[:PORT]]... <program> [args...]\n";
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +56,8 @@ pub struct Invocation {
     pub args: Vec<OsString>,
     pub env: Vec<(Vec<u8>, Vec<u8>)>,
     pub no_jit: bool,
+    /// `--jit[=N]`: compile the blocks run this many times.
+    pub jit: Option<u16>,
     pub mounts: Vec<Mount>,
     /// List the unimplemented system calls the guest called, after the run.
     pub report_enosys: bool,
@@ -168,6 +172,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
     let mut args = args.into_iter();
     let mut env = Vec::new();
     let mut no_jit = false;
+    let mut jit = None;
     let mut mounts = Vec::new();
     let mut report_enosys = false;
     let mut limits = Limits::default();
@@ -181,6 +186,16 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
             b"--" => break args.next().ok_or(UsageError("no program given"))?,
             b"-h" | b"--help" => return Ok(Command::Help),
             b"--no-jit" => no_jit = true,
+            b"--jit" => jit = Some(paludarium_jit_native::DEFAULT_THRESHOLD),
+            _ if bytes.starts_with(b"--jit=") => {
+                jit = Some(
+                    arg.to_str()
+                        .and_then(|value| value.get(6..))
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .filter(|n| *n > 0)
+                        .ok_or(UsageError("--jit= needs a number from 1 to 65535"))?,
+                );
+            }
             b"--report-enosys" => report_enosys = true,
             b"--max-tasks" => {
                 let max = parse_limit(
@@ -230,6 +245,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
         args: args.collect(),
         env,
         no_jit,
+        jit,
         mounts,
         report_enosys,
         limits,
@@ -474,10 +490,18 @@ pub fn main_with(
     config.mounts = invocation.mounts;
     config.limits = invocation.limits;
     config.network = invocation.network;
-    // --no-jit is accepted and has no effect: the native build has no JIT.
     config.jit = false;
     let session = match Session::new(config, host) {
-        Ok(session) => session,
+        Ok(session) => match invocation.jit.filter(|_| !invocation.no_jit) {
+            Some(threshold) => match paludarium_jit_native::compiler(threshold) {
+                Some(compiler) => session.with_compiler(compiler),
+                None => {
+                    let _ = writeln!(stderr, "paludarium: --jit: this host has no JIT");
+                    return EXIT_EMULATOR_ERROR;
+                }
+            },
+            None => session,
+        },
         Err(e) => {
             let _ = writeln!(stderr, "paludarium: {e}");
             return EXIT_EMULATOR_ERROR;
@@ -550,6 +574,7 @@ mod tests {
                     (b"B".to_vec(), b"x=y".to_vec())
                 ],
                 no_jit: true,
+                jit: None,
                 mounts: vec![],
                 report_enosys: false,
                 limits: Limits::default(),

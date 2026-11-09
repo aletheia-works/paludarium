@@ -5,7 +5,7 @@
 
 ```sh
 cargo install paludarium
-paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys]
+paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--jit[=N]] [--report-enosys]
            [--max-tasks N] [--max-open-files N] [--max-memory N]
            [--allow-net HOST[:PORT]]... <program> [args...]
 ```
@@ -31,7 +31,14 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-eno
 - `--mount HOST:GUEST`（`--mount=HOST:GUEST` とも書けます）は、ホストのディレクトリを
   1 つ、ゲストの絶対パス `GUEST` に見せます。何度でも指定できます。ゲストは `..` や
   シンボリックリンクを使っても、そのディレクトリの外には出られません。
-- `--no-jit` は互換のために受け付けますが、ネイティブ版には JIT がないので何もしません。
+- `--jit`（または `--jit=N`）は、ネイティブの JIT を有効にします。試験的な機能です。
+  `N` 回（`=N` がなければ 100 回、最大 65535 回）実行された命令のブロックを、専用の
+  スレッドで Cranelift によってホストのコードにコンパイルし、でき次第ホストのコードとして
+  実行します。それ以外はインタプリタが実行します
+  （[アーキテクチャ](../design/architecture#the-native-jit)）。使えるのは x86-64 の
+  Linux のホストだけで、それ以外では `--jit` はエラーで止まります。`--jit` がなければ
+  JIT は使いません。
+- `--no-jit` は、`--jit` があってもネイティブの JIT を使わないようにします。
 - `--report-enosys` を付けると、ゲストが呼んだのに paludarium が実装していない
   システムコール（`ENOSYS` を返したもの）の番号を、終わった後に表示します。
 - `--max-tasks N` は、ゲストが持てるタスクを `N` 個（1 以上）までにします。タスクは

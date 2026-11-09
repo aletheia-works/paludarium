@@ -5,8 +5,9 @@ downwards; there are no cycles.
 
 | Layer | Uses |
 |---|---|
-| Entry points (the `paludarium` command, the Rust API, the WebAssembly launcher) | runtime |
+| Entry points (the `paludarium` command, the Rust API, the WebAssembly launcher) | runtime, jit-native |
 | runtime | cpu, jit, kernel, loader, host |
+| jit-native | cpu, decoder, mmu |
 | cpu, jit | decoder, mmu |
 | kernel | mmu, vfs, loader, host |
 | loader | mmu, vfs |
@@ -26,6 +27,7 @@ Every crate uses the shared types of `paludarium-types`.
 | `paludarium-loader` | Loading ELF files, with the interpreter they ask for, and building the initial stack (argv, envp, auxiliary vector) |
 | `paludarium-cpu` | The x86-64 interpreter |
 | `paludarium-jit` | The code cache interface and the WebAssembly JIT |
+| `paludarium-jit-native` | The native JIT: hot blocks compiled to host code with Cranelift |
 | `paludarium-kernel` | Linux system calls; owns the process and thread state |
 | `paludarium-runtime` | `Session` and the per-thread execution loop |
 | `paludarium` | The public API and the `paludarium` command |
@@ -101,6 +103,34 @@ cache keeps the form, with the address of the next instruction and two flags
 (within one 64-byte cache line), apart from the decoded instruction itself, which only the
 general path reads. A run of such forms therefore reads little host memory.
 
+## The native JIT
+
+With `--jit`, the blocks of the decode cache that run often are compiled to
+host code (`paludarium-jit-native`, Linux on x86-64 hosts only). Each block
+counts how many times it is entered; at the threshold (100 by default), the
+forms of its first instructions, up to the first instruction without one,
+are handed to the compiler. A thread of the JIT's own builds Cranelift IR
+for them, compiles it and maps the code into memory that is never writable
+and executable at once. Until the code is ready, and when compiling fails,
+the interpreter runs the block as before.
+
+Compiled code means exactly what the interpreter's forms mean. It works on a
+copy of the registers, reads and writes them in memory, and reaches guest
+memory only through the MMU's own loads and stores, with their checks. It
+stops before an instruction whose load or store fails, having changed nothing
+for it, so that the interpreter runs it again and reports the fault, and
+after a load or store that moved the code generation on. A taken branch,
+`jmp`, `call` and `ret` end it. It returns how many instructions ran, and the
+interpreter goes on from the next one.
+
+When the code generation moves on, the interpreter decodes every block again,
+mostly to the same forms. The JIT keeps the code it compiled by its forms (up
+to 65536 blocks) and gives the same code to a block whose forms are the same,
+so a program that maps memory often is not compiled again and again. The
+code is shared by every thread and process of the session.
+`PALUDARIUM_JIT_STATS` set in the environment prints, on standard error, how
+many blocks and instructions it has compiled and in how long.
+
 ## The host boundary
 
 All differences between native hosts and WebAssembly stay inside
@@ -126,8 +156,10 @@ A guest's exit (`ExitStatus`) is never mixed with an emulator error.
 
 ## Safety rules
 
-- `unsafe` is allowed only in the host connection and the JIT; every other
-  crate is `#![forbid(unsafe_code)]` (and the JIT does not use `unsafe` today).
+- `unsafe` is allowed only in the host connection and the JITs; every other
+  crate is `#![forbid(unsafe_code)]`. The WebAssembly JIT does not use
+  `unsafe` today; the native JIT uses it only in one module, which maps the
+  compiled code and calls it, and calls back into the MMU.
 - `unwrap`, `expect` and `panic` are denied by clippy in product code.
 - Guest addresses (`GuestAddr(u64)`) and host addresses are different types. In
   WebAssembly `usize` is 32 bits wide, so every conversion is checked.

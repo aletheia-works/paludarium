@@ -7,6 +7,7 @@ members = [
   "crates/paludarium-harness",
   "crates/paludarium-host",
   "crates/paludarium-jit",
+  "crates/paludarium-jit-native",
   "crates/paludarium-kernel",
   "crates/paludarium-loader",
   "crates/paludarium-mmu",
@@ -33,6 +34,7 @@ paludarium-cpu = { path = "crates/paludarium-cpu", version = "0.13.0" }
 paludarium-decoder = { path = "crates/paludarium-decoder", version = "0.13.0" }
 paludarium-host = { path = "crates/paludarium-host", version = "0.13.0" }
 paludarium-jit = { path = "crates/paludarium-jit", version = "0.13.0" }
+paludarium-jit-native = { path = "crates/paludarium-jit-native", version = "0.13.0" }
 paludarium-kernel = { path = "crates/paludarium-kernel", version = "0.13.0" }
 paludarium-loader = { path = "crates/paludarium-loader", version = "0.13.0" }
 paludarium-mmu = { path = "crates/paludarium-mmu", version = "0.13.0" }

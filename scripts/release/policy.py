@@ -14,6 +14,7 @@ PUBLIC = (
     "paludarium-loader",
     "paludarium-cpu",
     "paludarium-jit",
+    "paludarium-jit-native",
     "paludarium-kernel",
     "paludarium-runtime",
     "paludarium",

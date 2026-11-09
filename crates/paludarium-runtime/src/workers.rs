@@ -1,4 +1,5 @@
 //! Each real Host worker owns CPU/decoder/thread context and shares only process resources.
+use paludarium_cpu::compile::{Compiler, run_compiled};
 use paludarium_cpu::{DecodeCache, reg, run_cached, run_cached_with_counted_hook};
 use paludarium_host::{ClockId, Host, ThreadHandle};
 use paludarium_jit::CodeCache;
@@ -20,6 +21,7 @@ pub(crate) struct Execution {
     last_stop: Arc<Mutex<Option<ExitReason>>>,
     cache: Arc<dyn CodeCache>,
     accelerated: bool,
+    compiler: Option<Arc<dyn Compiler>>,
     budget: u64,
     handles: Mutex<Vec<Box<dyn ThreadHandle>>>,
     results: Mutex<Vec<Result<ExitStatus, Error>>>,
@@ -36,6 +38,7 @@ impl Execution {
         last_stop: Arc<Mutex<Option<ExitReason>>>,
         cache: Arc<dyn CodeCache>,
         accelerated: bool,
+        compiler: Option<Arc<dyn Compiler>>,
         budget: u64,
     ) -> Self {
         Self {
@@ -48,6 +51,7 @@ impl Execution {
             last_stop,
             cache,
             accelerated,
+            compiler,
             budget,
             handles: Mutex::new(Vec::new()),
             results: Mutex::new(Vec::new()),
@@ -147,6 +151,14 @@ impl Execution {
                         *deterministic_rejection = rejected;
                         result
                     },
+                )
+            } else if let Some(compiler) = &self.compiler {
+                run_compiled(
+                    &mut thread.cpu,
+                    memory,
+                    self.budget,
+                    &mut decode,
+                    compiler.as_ref(),
                 )
             } else {
                 run_cached(&mut thread.cpu, memory, self.budget, &mut decode)

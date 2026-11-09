@@ -5,7 +5,7 @@
 Every release is listed on the
 [releases page](https://github.com/aletheia-works/paludarium/releases); the
 workspace version in `Cargo.toml` stays that of the latest release until the
-Release Please pull request raises it. The eleven crates and
+Release Please pull request raises it. The twelve crates and
 `@aletheia-works/paludarium-wasm` are published only by Trusted Publishing
 (OIDC) from `publish.yml`, after the same-head evidence of the head (steps 5
 and 6 below). Only the first release, `v0.1.0` (2026-10-20, tag on
@@ -13,8 +13,8 @@ and 6 below). Only the first release, `v0.1.0` (2026-10-20, tag on
 crates.io lets a Trusted Publisher be registered only for a crate that
 already exists.
 
-The eleven public crates are types, host, mmu, vfs, loader, decoder, cpu,
-jit, kernel, runtime and paludarium, in the dependency order calculated from
+The twelve public crates are types, host, mmu, vfs, loader, decoder, cpu,
+jit, jit-native, kernel, runtime and paludarium, in the dependency order calculated from
 the manifests. They share the workspace version, which Release Please sets
 together with the internal dependency versions and the npm package version.
 Harness, the Rust Wasm adapter and the fuzz crate have `publish = false`.
@@ -38,7 +38,7 @@ python3 -B scripts/release/check.py --mode package-check
 `package-check` creates an exclusive `target/release-evidence/package-*` directory. It
 retains argv, tool SHA, stdout, stderr, real exit/timeout/reaping, source and
 lock before/after hashes. The original source is never rewritten. It builds
-eleven real `.crate` files, checks all members and normalized dependencies,
+twelve real `.crate` files, checks all members and normalized dependencies,
 builds a crate-external consumer from a temporary sparse registry, probes
 stable separately, and builds the production Wasm without diagnostic features.
 One npm tarball is inspected and used for all seven distribution boundary
@@ -175,7 +175,7 @@ release-please branch with `autorelease: pending`, merged by squash at its
 current head once the required checks pass.
 
 `.github/release-please-config.json` uses the `simple` release type and
-updates the workspace version, the eleven internal dependency versions, the
+updates the workspace version, the twelve internal dependency versions, the
 workspace crates' entries in `Cargo.lock` and `fuzz/Cargo.lock` (the fuzz
 crate keeps `0.0.0`), and the npm package version. The first version was
 fixed with `release-as: 0.1.0`, removed after `v0.1.0` was published; Release
@@ -222,7 +222,7 @@ itself.
    variables, the GitHub context named in the provenance statement and
    setup-node's `.npmrc`). Receipts and `publication-progress.json` record
    no token value.
-4. **Register the Trusted Publishers.** For each of the eleven crates on
+4. **Register the Trusted Publishers.** For each of the twelve crates on
    crates.io and for `@aletheia-works/paludarium-wasm` on npm, register
    repository `aletheia-works/paludarium`, workflow `publish.yml` and
    environment `release`. npm also requires `repository.url` in
@@ -281,7 +281,7 @@ itself.
    that was not published therefore never gets a tag, and no tag is ever
    deleted or moved. Confirm: the run succeeded and
    `publication-progress.json` (in the run's artifact
-   `publication-progress-attempt-<n>`) lists all eleven
+   `publication-progress-attempt-<n>`) lists all twelve
    crates and `@aletheia-works/paludarium-wasm`; then, independently, each crate's
    `https://crates.io/api/v1/crates/<name>/<version>` `checksum` equals the
    `.crate` SHA-256 in the `release-package` artifact, `npm view
@@ -312,7 +312,7 @@ with provenance. No registry token is stored anywhere. All
 third-party actions are pinned to
 officially resolved commit SHAs. The fork is never substituted for upstream.
 
-The publish job checks the previously tested eleven crate artifacts and npm
+The publish job checks the previously tested twelve crate artifacts and npm
 tarball. Cargo dry-run reassembly must have the approved byte digest before
 upload; original source/locks must remain unchanged. Existing versions are
 queried first: an equal digest is verified without re-upload, a different

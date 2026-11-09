@@ -145,9 +145,9 @@ class PackageTests(unittest.TestCase):
             paths.append(p)
         return paths, inventory
 
-    def test_eleven_crates(self):
+    def test_twelve_crates(self):
         paths, inv = self.crates()
-        self.assertEqual(len(package.inspect_crates(paths, inv)), 11)
+        self.assertEqual(len(package.inspect_crates(paths, inv)), 12)
 
     def test_dependency_version(self):
         def change(name, files):

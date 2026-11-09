@@ -109,7 +109,7 @@ def inspect_npm(path, expected):
 
 def inspect_crates(paths, inventory):
     expected = inventory["packages"]
-    policy.require(len(paths) == 11, "eleven crates required")
+    policy.require(len(paths) == 12, "twelve crates required")
     seen = {}
     for path in paths:
         name = next(

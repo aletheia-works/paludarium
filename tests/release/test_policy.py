@@ -61,7 +61,7 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(policy.release_gate(self.s, self.i)["eligible"])
 
     def test_actual_inventory(self):
-        self.assertEqual(len(self.i["packages"]), 11)
+        self.assertEqual(len(self.i["packages"]), 12)
         self.assertEqual(len(self.i["private"]), 2)
         self.assertLess(
             self.i["order"].index("paludarium-types"), self.i["order"].index("paludarium-runtime")
@@ -204,7 +204,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(workspace["package"]["version"], version)
         self.assertEqual(sorted(internal), sorted(policy.PUBLIC))
         self.assertEqual({v["version"] for v in internal.values()}, {version})
-        self.assertEqual(len(inv["packages"]), 11)
+        self.assertEqual(len(inv["packages"]), 12)
         self.assertEqual({r["version"] for r in inv["packages"].values()}, {version})
         self.assertEqual(
             {v for r in inv["packages"].values() for v in r["dependencies"].values()}, {version}

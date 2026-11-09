@@ -38,7 +38,7 @@ reference; no code is copied). Its first user is
 
 ```sh
 mise run build         # cargo build --release --locked
-paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--report-enosys] <program> [args...]
+paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--jit[=N]] [--report-enosys] <program> [args...]
 mise run wasm:build    # paludarium.wasm for packages/paludarium-wasm
 ```
 
@@ -50,6 +50,7 @@ Within mise, `target/release` is on `PATH`.
 |---|---|
 | `mise run test` | Unit tests of every crate (Linux, macOS, Windows) |
 | `mise run test:diff` | Differential tests (x86-64 Linux only) |
+| `mise run test:diff:jit` | The same, with the native JIT compiling every block the first time it runs (x86-64 Linux only) |
 | `mise run coverage` | Line coverage; fails under 80 % (x86-64 Linux) |
 | `mise run fuzz <target> [--seconds N]` | One target in `fuzz/fuzz_targets/` with the nightly's settings (x86-64 Linux) |
 | `mise run deny` | `cargo deny --locked check` |

@@ -25,6 +25,9 @@ Nothing here is a promise, but these are on the table:
 - More system calls and instructions (see [Limitations](../guide/limitations)).
 - x87's transcendental instructions for the `long double` math of programs on
   glibc that reach them.
-- Considering a native JIT.
+- The native JIT (`--jit`, experimental on Linux x86-64): turning it on by
+  default, other hosts (Arm64, macOS, Windows), and compiling more of each
+  block (more instructions, blocks joined to each other, flags worked out
+  only when they are read).
 - Revisiting building with stable Rust.
 - Revisiting how much checking a release needs.

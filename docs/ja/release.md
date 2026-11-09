@@ -14,7 +14,7 @@ release PR をマージするかどうかだけです。詳しい手順と、す
 3. **同じコードでの確かめ**：マージしたコードで、[テストと検証](./design/quality) のすべて
    （3 つの OS、4 つの WebAssembly の環境、JIT ありとなし、速さの測定）を動かし、
    受け入れの条件がそろったことを確かめます。
-4. **公開**：11 の crate を crates.io に、`@aletheia-works/paludarium-wasm` を npm に、
+4. **公開**：12 の crate を crates.io に、`@aletheia-works/paludarium-wasm` を npm に、
    Trusted Publishing（OIDC）で公開します。npm には provenance を付けます。人の承認は
    待ちません。
 5. **タグ**：すべての公開が成功した後で、最後にタグと GitHub Release を作ります。
@@ -41,5 +41,5 @@ job を再実行します。再実行した job の artifact は、いちばん�
 
 依存の順に、`paludarium-types`、`paludarium-host`、`paludarium-mmu`、`paludarium-vfs`、
 `paludarium-loader`、`paludarium-decoder`、`paludarium-cpu`、`paludarium-jit`、
-`paludarium-kernel`、`paludarium-runtime`、`paludarium` の 11 個です。0.x の間は、
+`paludarium-jit-native`、`paludarium-kernel`、`paludarium-runtime`、`paludarium` の 12 個です。0.x の間は、
 minor を上げることで互換を壊す変更をすることがあり、その場合はリリースノートに書きます。

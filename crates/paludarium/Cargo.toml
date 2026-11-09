@@ -10,6 +10,7 @@ license.workspace = true
 
 [dependencies]
 paludarium-host.workspace = true
+paludarium-jit-native.workspace = true
 paludarium-loader.workspace = true
 paludarium-runtime.workspace = true
 paludarium-types.workspace = true

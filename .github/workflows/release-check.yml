@@ -39,7 +39,7 @@ jobs:
         run: .venv-release/bin/python -B -m coverage run --data-file=target/release-evidence/python.coverage --include='*/scripts/release/policy.py,*/scripts/release/package.py,*/scripts/release/check.py,*/scripts/release/acceptance.py' -m unittest discover -s tests/release -p 'test_*.py' -v
       - name: Static configuration
         run: .venv-release/bin/python -B -m coverage run --append --data-file=target/release-evidence/python.coverage scripts/release/check.py --mode validate
-      - name: Actual eleven crates, isolated registry and same npm tarball
+      - name: Actual twelve crates, isolated registry and same npm tarball
         run: |
           PALUDARIUM_TEST_NODE="$(command -v node)" PALUDARIUM_RELEASE_NPM="$GITHUB_WORKSPACE/target/release-evidence/tools/node_modules/npm/bin/npm-cli.js" .venv-release/bin/python -B -m coverage run --append --data-file=target/release-evidence/python.coverage scripts/release/check.py --mode package-check --output target/release-evidence/package-result.json
       - name: Each fixed release component retains 80 percent

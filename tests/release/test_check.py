@@ -160,7 +160,7 @@ class CheckTests(unittest.TestCase):
         result = self.presence(registry)
         order = policy.inventory(ROOT)["order"]
         self.assertEqual(result, dict(present=[], checked=sorted([*order, check.NPM_NAME])))
-        self.assertEqual(len(registry.requests), 12)
+        self.assertEqual(len(registry.requests), 13)
         self.assertTrue(
             all(
                 r.get_method() == "GET" and r.get_header("User-agent") == check.REGISTRY_USER_AGENT
@@ -177,14 +177,14 @@ class CheckTests(unittest.TestCase):
             with self.subTest(name):
                 result = self.presence(Registry(present=[name]))
                 self.assertEqual(result["present"], [name])
-                self.assertEqual(len(result["checked"]), 12)
+                self.assertEqual(len(result["checked"]), 13)
                 self.assertIn(check.NPM_NAME, result["checked"])
 
     def test_registry_presence_all(self):
         order = policy.inventory(ROOT)["order"]
         result = self.presence(Registry(present=[*order, check.NPM_NAME]))
         self.assertEqual(result["present"], result["checked"])
-        self.assertEqual(len(result["present"]), 12)
+        self.assertEqual(len(result["present"]), 13)
 
     def test_registry_presence_unknown(self):
         with self.assertRaisesRegex(ValueError, "503"):

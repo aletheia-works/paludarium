@@ -64,7 +64,7 @@ static void outcome(const char *name, long value) {
 }
 
 
-/* Landlock: raw system calls (444 to 446), ABI 5 rights only, which a newer
+/* Landlock: raw system calls (444 to 446), ABI 8 rights only, which a newer
    kernel shares. */
 #define LL_EXECUTE (1ULL << 0)
 #define LL_WRITE_FILE (1ULL << 1)
@@ -86,6 +86,13 @@ static void outcome(const char *name, long value) {
 struct ll_path_beneath { unsigned long long allowed; int parent_fd; } __attribute__((packed));
 struct ll_ruleset_attr { unsigned long long fs, net; };
 struct ll_net_port { unsigned long long allowed, port; };
+#define LL_SCOPE_ABSTRACT_UNIX (1ULL << 0)
+#define LL_SCOPE_SIGNAL (1ULL << 1)
+#define LL_LOG_SAME_EXEC_OFF (1U << 0)
+#define LL_LOG_NEW_EXEC_ON (1U << 1)
+#define LL_LOG_SUBDOMAINS_OFF (1U << 2)
+#define LL_TSYNC (1U << 3)
+struct ll_scoped_attr { unsigned long long fs, net, scoped; };
 /* An open's outcome: 0, or the errno. */
 static int ll_open(const char *path, int flags) {
     int fd = open(path, flags, 0600);
@@ -102,6 +109,41 @@ static long ll_net_ruleset(unsigned long long fs, unsigned long long net) {
 static long ll_port(long ruleset, unsigned long long port, unsigned long long allowed) {
     struct ll_net_port rule = {allowed, port};
     return syscall(445, ruleset, 2, &rule, 0);
+}
+static long ll_scoped(unsigned long long fs, unsigned long long scoped) {
+    struct ll_scoped_attr attr = {fs, 0, scoped};
+    return syscall(444, &attr, sizeof attr, 0);
+}
+/* A sibling thread for TSYNC: it waits for a byte, then opens `ll_target`
+   and reports the errno. */
+static const char *ll_target;
+static int ll_go[2], ll_done[2];
+static void *ll_thread_open(void *unused) {
+    (void)unused;
+    char byte;
+    if (read(ll_go[0], &byte, 1) != 1)
+        return NULL;
+    int r = ll_open(ll_target, O_RDONLY);
+    if (write(ll_done[1], &r, sizeof r) != sizeof r)
+        return NULL;
+    return NULL;
+}
+/* What the sibling thread found, after it is told to look. */
+static int ll_ask_thread(void) {
+    int r = -1;
+    if (write(ll_go[1], "x", 1) != 1 || read(ll_done[0], &r, sizeof r) != sizeof r)
+        return -1;
+    return r;
+}
+/* A thread that enforces a ruleset scoping signals for itself alone, then
+   signals the thread that made it (erratum 2: threads of one process may). */
+static pid_t ll_main_tid;
+static void *ll_thread_signal(void *out) {
+    long r = ll_scoped(0, LL_SCOPE_SIGNAL);
+    syscall(446, r, 0);
+    close(r);
+    *(int *)out = ll_call(syscall(SYS_tgkill, getpid(), ll_main_tid, 0));
+    return NULL;
 }
 static long ll_ruleset(unsigned long long handled) {
     return syscall(444, &handled, sizeof handled, 0);
@@ -4795,6 +4837,10 @@ int main(int argc, char **argv) {
         long abi = syscall(444, NULL, 0, 1);
         result("abi-at-least-3", abi >= 3);
         result("abi-at-least-5", abi >= 5);
+        result("abi-at-least-8", abi >= 8);
+        /* Errata 1 to 4, which the runner's kernel has. */
+        long errata = syscall(444, NULL, 0, 2);
+        result("errata-1-to-4", errata >= 0 && (errata & 15) == 15);
         errno = 0;
         unsigned long long big[8] = {LL_READ_FILE};
         result("version-with-attr", ll_call(syscall(444, big, 8, 1)));
@@ -5129,6 +5175,174 @@ int main(int argc, char **argv) {
                 _exit(0);
             }
             waitpid(grandchild, NULL, 0);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+
+        /* ABI 6: scopes in the ruleset, ABI 7 and 8: restrict_self flags. */
+        {
+            struct ll_scoped_attr attr = {0, 0, 1ULL << 40};
+            result("unknown-scope", ll_call(syscall(444, &attr, sizeof attr, 0)));
+            long only_scope = ll_scoped(0, LL_SCOPE_SIGNAL);
+            result("scope-only-ruleset", only_scope >= 0);
+            close(only_scope);
+            unsigned long long longer[4] = {LL_READ_FILE, 0, 0, 1};
+            result("past-scoped", ll_call(syscall(444, longer, sizeof longer, 0)));
+            prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+            long r = ll_ruleset(LL_READ_FILE);
+            result("restrict-unknown-flag", ll_call(syscall(446, r, 1U << 4)));
+            result("subdomains-off-alone", ll_call(syscall(446, -1, LL_LOG_SUBDOMAINS_OFF)));
+            result("no-ruleset", ll_call(syscall(446, -1, 0)));
+            result("subdomains-off-and-more",
+                   ll_call(syscall(446, -1, LL_LOG_SUBDOMAINS_OFF | LL_TSYNC)));
+            close(r);
+        }
+        fflush(stdout);
+        pid_t outsider = child();
+        if (outsider == 0) {
+            pause();
+            _exit(0);
+        }
+        /* Abstract unix sockets made outside the domain: a listener and a
+           datagram socket. */
+        char abstract_name[64];
+        int name_len = snprintf(abstract_name, sizeof abstract_name, "%cpaludarium-ll-%d", 0, getpid());
+        struct sockaddr_un outside = {AF_UNIX};
+        memcpy(outside.sun_path, abstract_name, name_len);
+        socklen_t outside_len = offsetof(struct sockaddr_un, sun_path) + name_len;
+        int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        bind(listener, (void *)&outside, outside_len);
+        listen(listener, 8);
+        struct sockaddr_un outside_dgram = outside;
+        outside_dgram.sun_path[1] = 'D';
+        int dgram = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        bind(dgram, (void *)&outside_dgram, outside_len);
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            long r = ll_scoped(0, LL_SCOPE_SIGNAL | LL_SCOPE_ABSTRACT_UNIX);
+            result("enforce-scoped",
+                   ll_call(syscall(446, r, LL_LOG_SAME_EXEC_OFF | LL_LOG_NEW_EXEC_ON)));
+            close(r);
+            /* Signals: outside the domain is EPERM, its own process and
+               what it starts are not. */
+            result("kill-outsider", ll_call(kill(outsider, 0)));
+            result("kill-parent", ll_call(kill(getppid(), 0)));
+            result("kill-self", ll_call(kill(getpid(), 0)));
+            result("kill-missing", ll_call(kill(999999, 0)));
+            fflush(stdout);
+            pid_t inside = child();
+            if (inside == 0) {
+                result("inside-kill-parent", ll_call(kill(getppid(), 0)));
+                fflush(stdout);
+                _exit(0);
+            }
+            /* Until it is reaped, a zombie keeps its domain. */
+            siginfo_t info;
+            waitid(P_PID, inside, &info, WEXITED | WNOWAIT);
+            result("kill-inside", ll_call(kill(inside, 0)));
+            waitpid(inside, NULL, 0);
+            ll_main_tid = syscall(SYS_gettid);
+            int from_thread = -1;
+            pthread_t thread;
+            pthread_create(&thread, NULL, ll_thread_signal, &from_thread);
+            pthread_join(thread, NULL);
+            result("thread-signals-main", from_thread);
+            /* /proc: a task outside the domain is as ptrace sees it. */
+            char environ_path[64];
+            snprintf(environ_path, sizeof environ_path, "/proc/%d/environ", getppid());
+            result("environ-outside", ll_open(environ_path, O_RDONLY));
+            result("environ-self", ll_open("/proc/self/environ", O_RDONLY));
+            /* Abstract unix sockets made outside: EPERM; one made inside and
+               a pathname socket are not scoped. */
+            int s = socket(AF_UNIX, SOCK_STREAM, 0);
+            result("connect-outside", ll_call(connect(s, (void *)&outside, outside_len)));
+            close(s);
+            s = socket(AF_UNIX, SOCK_DGRAM, 0);
+            result("sendto-outside",
+                   ll_call(sendto(s, "x", 1, 0, (void *)&outside_dgram, outside_len)));
+            result("connect-dgram-outside",
+                   ll_call(connect(s, (void *)&outside_dgram, outside_len)));
+            close(s);
+            struct sockaddr_un own = outside;
+            own.sun_path[1] = 'I';
+            int own_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+            bind(own_listener, (void *)&own, outside_len);
+            listen(own_listener, 8);
+            s = socket(AF_UNIX, SOCK_STREAM, 0);
+            result("connect-inside", ll_call(connect(s, (void *)&own, outside_len)));
+            close(s);
+            struct sockaddr_un named = {AF_UNIX};
+            snprintf(named.sun_path, sizeof named.sun_path, "%s/sock", top);
+            int path_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+            bind(path_listener, (void *)&named, sizeof named);
+            listen(path_listener, 8);
+            fflush(stdout);
+            pid_t path_child = child();
+            if (path_child == 0) {
+                long more = ll_scoped(0, LL_SCOPE_ABSTRACT_UNIX);
+                syscall(446, more, 0);
+                s = socket(AF_UNIX, SOCK_STREAM, 0);
+                result("connect-pathname", ll_call(connect(s, (void *)&named, sizeof named)));
+                s = socket(AF_UNIX, SOCK_STREAM, 0);
+                /* The parent's domain is not this child's new one. */
+                result("connect-parent-made", ll_call(connect(s, (void *)&own, outside_len)));
+                fflush(stdout);
+                _exit(0);
+            }
+            waitpid(path_child, NULL, 0);
+            close(own_listener);
+            unlink(named.sun_path);
+            fflush(stdout);
+            _exit(0);
+        }
+        waitpid(pid, NULL, 0);
+        kill(outsider, SIGKILL);
+        waitpid(outsider, NULL, 0);
+        close(listener);
+        close(dgram);
+
+        /* ABI 8: LANDLOCK_RESTRICT_SELF_TSYNC gives every thread the domain;
+           without it a sibling keeps its own. */
+        for (int tsync = 0; tsync <= 1; tsync++) {
+            fflush(stdout);
+            pid = child();
+            if (pid == 0) {
+                snprintf(tmp, sizeof tmp, "%s/tsync", b);
+                close(open(tmp, O_CREAT | O_WRONLY, 0644));
+                ll_target = tmp;
+                pipe(ll_go);
+                pipe(ll_done);
+                pthread_t thread;
+                pthread_create(&thread, NULL, ll_thread_open, NULL);
+                long r = ll_ruleset(LL_READ_FILE);
+                ll_rule(r, a, LL_READ_FILE);
+                prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                result(tsync ? "enforce-tsync" : "enforce-alone",
+                       ll_call(syscall(446, r, tsync ? LL_TSYNC : 0)));
+                close(r);
+                result(tsync ? "sibling-with-tsync" : "sibling-without", ll_ask_thread());
+                result(tsync ? "self-with-tsync" : "self-without", ll_open(tmp, O_RDONLY));
+                pthread_join(thread, NULL);
+                fflush(stdout);
+                _exit(0);
+            }
+            waitpid(pid, NULL, 0);
+        }
+
+        /* Erratum 4: a whiteout (a character device 0) needs MAKE_REG, not
+           MAKE_CHAR. */
+        fflush(stdout);
+        pid = child();
+        if (pid == 0) {
+            long r = ll_ruleset(LL_MAKE_REG | (1ULL << 6));
+            ll_rule(r, a, 1ULL << 6);
+            ll_enforce(r);
+            snprintf(tmp, sizeof tmp, "%s/whiteout", a);
+            result("whiteout-needs-make-reg", ll_call(mknod(tmp, S_IFCHR | 0600, 0)));
+            snprintf(tmp, sizeof tmp, "%s/whiteout", b);
+            result("whiteout-outside", ll_call(mknod(tmp, S_IFCHR | 0600, 0)));
             fflush(stdout);
             _exit(0);
         }

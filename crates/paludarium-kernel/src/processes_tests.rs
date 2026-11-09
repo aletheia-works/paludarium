@@ -2377,11 +2377,11 @@ fn capget_reads_another_process_and_capabilities_decide() {
         )
         .unwrap()
         .task_ids();
-    assert!(!without.may_signal(other));
+    assert!(!without.may_signal(&other));
     assert!(
         crate::credentials::Credentials::default()
             .task_ids()
-            .may_signal(other)
+            .may_signal(&other)
     );
 }
 mod core_dumps {

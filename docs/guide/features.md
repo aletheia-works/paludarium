@@ -1507,8 +1507,9 @@ one only with an `--allow-net`.
   missing), in memory and in a host directory mounted on Linux or macOS.
   `RENAME_WHITEOUT` needs `CAP_MKNOD` (`EPERM`), and then gives `EINVAL`, as
   on a Linux filesystem without whiteouts.
-- Landlock restricts a thread's access to file hierarchies and TCP ports, at
-  ABI version 5: `landlock_create_ruleset` (and its version query),
+- Landlock restricts a thread's access to file hierarchies and TCP ports and
+  what it may reach outside its domain, at ABI version 8 with errata 1 to 4:
+  `landlock_create_ruleset` (and its version and errata queries),
   `landlock_add_rule` with `LANDLOCK_RULE_PATH_BENEATH` and
   `LANDLOCK_RULE_NET_PORT`, and `landlock_restrict_self` (which needs
   `no_new_privs` or `CAP_SYS_ADMIN`), up to 16 layers. Each layer allows a
@@ -1524,9 +1525,18 @@ one only with an `--allow-net`.
   directory needs `REFER` and must not give the file more rights than it had
   (`EXDEV`). A TCP socket's `bind` needs `LANDLOCK_ACCESS_NET_BIND_TCP` and its
   `connect` `CONNECT_TCP` for the port, with Linux's checks of the address
-  first; UDP and `connect` to `AF_UNSPEC` are not checked. Threads,
-  processes and `execve` keep the domain; `O_PATH`, `stat` and descriptors
-  opened before are not checked.
+  first; UDP and `connect` to `AF_UNSPEC` are not checked. A whiteout, which
+  `mknod` makes as character device 0 and `RENAME_WHITEOUT` leaves, needs
+  `MAKE_REG`. A ruleset's scopes keep the thread from what a thread outside
+  its domain made or is: `LANDLOCK_SCOPE_SIGNAL` from signalling one
+  (threads of one process may always signal each other) and
+  `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` from connecting or sending to an
+  abstract unix socket one made (`EPERM`). As for `ptrace`, a thread in a
+  domain may not read `/proc/<pid>/environ` and the like of a task outside
+  it. `landlock_restrict_self` takes the logging flags and
+  `LANDLOCK_RESTRICT_SELF_TSYNC`, which gives every thread of the process
+  the new domain. Threads, processes and `execve` keep the domain;
+  `O_PATH`, `stat` and descriptors opened before are not checked.
 - Files can be placed before the start.
 - A host directory can be mounted when you ask for it (`--mount` on the
   command line, `Config::mounts` in Rust). Every operation stays inside that

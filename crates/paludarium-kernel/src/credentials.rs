@@ -39,7 +39,7 @@ const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
 /// What acting on another thread looks at in credentials, which another
 /// process can read ([`crate::ThreadGroup::task_ids`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskIds {
     pub uid: u32,
     pub euid: u32,
@@ -54,12 +54,15 @@ pub(crate) struct TaskIds {
     pub effective: u64,
     pub permitted: u64,
     pub inheritable: u64,
+    /// The thread's Landlock domain, which scopes the signals it may send
+    /// and be sent.
+    pub landlock: crate::landlock::Landlock,
 }
 
 impl TaskIds {
     /// Linux's `kill_ok_by_cred`: the sender's real or effective user ID is
     /// the target's real or saved one, or the sender has CAP_KILL.
-    pub(crate) fn may_signal(self, target: Self) -> bool {
+    pub(crate) fn may_signal(&self, target: &Self) -> bool {
         self.cap_kill
             || self.euid == target.suid
             || self.euid == target.uid
@@ -69,7 +72,7 @@ impl TaskIds {
     /// Linux's `check_prlimit_permission`, to read or set another thread's
     /// limits: the sender's real IDs are all of the target's IDs, or the
     /// sender has CAP_SYS_RESOURCE.
-    pub(crate) fn may_prlimit(self, target: Self) -> bool {
+    pub(crate) fn may_prlimit(&self, target: &Self) -> bool {
         self.cap_sys_resource
             || (self.uid == target.uid
                 && self.uid == target.euid
@@ -80,7 +83,7 @@ impl TaskIds {
     }
     /// Linux's `set_one_prio_perm`: the sender's effective user ID is the
     /// target's real or effective one, or the sender has CAP_SYS_NICE.
-    pub(crate) fn may_set_priority(self, target: Self) -> bool {
+    pub(crate) fn may_set_priority(&self, target: &Self) -> bool {
         self.cap_sys_nice || self.euid == target.uid || self.euid == target.euid
     }
 }
@@ -114,6 +117,9 @@ pub struct Credentials {
     pub keep_caps: bool,
     /// The Landlock domain ([`crate::landlock`]), which exec keeps.
     pub landlock: crate::landlock::Landlock,
+    /// The last `LANDLOCK_RESTRICT_SELF_TSYNC` of its process this thread has
+    /// taken ([`crate::ThreadGroup::sync_landlock`]).
+    pub landlock_sync: u64,
 }
 
 /// Root with every capability, as the first process starts.
@@ -134,6 +140,7 @@ impl Default for Credentials {
             inheritable: 0,
             keep_caps: false,
             landlock: crate::landlock::Landlock::default(),
+            landlock_sync: 0,
         }
     }
 }
@@ -153,6 +160,7 @@ impl Credentials {
             effective: self.effective,
             permitted: self.permitted,
             inheritable: self.inheritable,
+            landlock: self.landlock.clone(),
         }
     }
     /// `capset`, as Linux's `cap_capset`: a new inheritable set within the
@@ -734,19 +742,19 @@ mod credentials_tests {
                 .task_ids()
         };
         let sender = ids(2000, 3000, 3000);
-        assert!(sender.may_prlimit(ids(2000, 2000, 2000)), "the real ID");
-        assert!(!sender.may_prlimit(ids(2000, 3000, 2000)), "its effective");
-        assert!(!sender.may_prlimit(ids(2000, 2000, 3000)), "its saved");
-        assert!(!sender.may_prlimit(ids(3000, 2000, 2000)), "its real");
+        assert!(sender.may_prlimit(&ids(2000, 2000, 2000)), "the real ID");
+        assert!(!sender.may_prlimit(&ids(2000, 3000, 2000)), "its effective");
+        assert!(!sender.may_prlimit(&ids(2000, 2000, 3000)), "its saved");
+        assert!(!sender.may_prlimit(&ids(3000, 2000, 2000)), "its real");
         let group = |change: fn(&mut TaskIds)| {
             let mut target = ids(2000, 2000, 2000);
             change(&mut target);
             target
         };
-        assert!(!sender.may_prlimit(group(|t| t.gid = 1)));
-        assert!(!sender.may_prlimit(group(|t| t.egid = 1)));
-        assert!(!sender.may_prlimit(group(|t| t.sgid = 1)));
-        assert!(Credentials::default().task_ids().may_prlimit(sender));
+        assert!(!sender.may_prlimit(&group(|t| t.gid = 1)));
+        assert!(!sender.may_prlimit(&group(|t| t.egid = 1)));
+        assert!(!sender.may_prlimit(&group(|t| t.sgid = 1)));
+        assert!(Credentials::default().task_ids().may_prlimit(&sender));
         let groups = Credentials::default()
             .setresgid(1, 2, 3)
             .unwrap()
@@ -828,40 +836,43 @@ mod credentials_tests {
                 .task_ids()
         };
         let sender = ids(3000, 2000, 2000);
-        assert!(sender.may_set_priority(ids(2000, 3000, 3000)), "its real");
+        assert!(sender.may_set_priority(&ids(2000, 3000, 3000)), "its real");
         assert!(
-            sender.may_set_priority(ids(3000, 2000, 3000)),
+            sender.may_set_priority(&ids(3000, 2000, 3000)),
             "its effective"
         );
-        assert!(!sender.may_set_priority(ids(3000, 3000, 2000)), "its saved");
         assert!(
-            !ids(2000, 3000, 3000).may_set_priority(ids(2000, 2000, 2000)),
+            !sender.may_set_priority(&ids(3000, 3000, 2000)),
+            "its saved"
+        );
+        assert!(
+            !ids(2000, 3000, 3000).may_set_priority(&ids(2000, 2000, 2000)),
             "the sender's real ID does not count"
         );
-        assert!(Credentials::default().task_ids().may_set_priority(sender));
+        assert!(Credentials::default().task_ids().may_set_priority(&sender));
     }
     #[test]
     fn a_signal_needs_a_shared_real_or_saved_id_or_cap_kill() {
         let root = Credentials::default();
         let ids = |r, e, s| root.setresuid(r, e, s).unwrap().task_ids();
         let sender = ids(2000, 2000, 2000);
-        assert!(sender.may_signal(ids(2000, 3000, 3000)), "the real ID");
-        assert!(sender.may_signal(ids(3000, 3000, 2000)), "the saved ID");
+        assert!(sender.may_signal(&ids(2000, 3000, 3000)), "the real ID");
+        assert!(sender.may_signal(&ids(3000, 3000, 2000)), "the saved ID");
         assert!(
-            !sender.may_signal(ids(3000, 2000, 3000)),
+            !sender.may_signal(&ids(3000, 2000, 3000)),
             "the effective ID"
         );
         assert!(
-            ids(2001, 2000, 2001).may_signal(ids(2000, 3000, 3000)),
+            ids(2001, 2000, 2001).may_signal(&ids(2000, 3000, 3000)),
             "by euid"
         );
         assert!(
-            !ids(2001, 2001, 2000).may_signal(ids(2000, 3000, 2000)),
+            !ids(2001, 2001, 2000).may_signal(&ids(2000, 3000, 2000)),
             "by suid"
         );
         // The effective capability decides: a real ID of root gives none.
-        assert!(root.task_ids().may_signal(ids(3000, 3000, 3000)));
-        assert!(!ids(0, 3000, 0).may_signal(ids(4000, 4000, 4000)));
+        assert!(root.task_ids().may_signal(&ids(3000, 3000, 3000)));
+        assert!(!ids(0, 3000, 0).may_signal(&ids(4000, 4000, 4000)));
     }
 
     #[test]

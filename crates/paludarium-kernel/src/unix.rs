@@ -81,6 +81,9 @@ pub(crate) struct UnixSocket {
     names: Arc<Names>,
     hub: Arc<ReadinessHub>,
     state: Mutex<State>,
+    /// The Landlock domain of the thread that made it (the socket file's
+    /// credentials), which abstract unix socket scoping looks at.
+    landlock: crate::landlock::Landlock,
 }
 #[derive(Default)]
 struct State {
@@ -156,6 +159,7 @@ pub(crate) fn pair(c: &Context<'_>, kind: u32) -> Result<[Arc<UnixSocket>; 2], E
                 names: Arc::clone(&c.files.unix),
                 hub: Arc::clone(&c.files.readiness),
                 state: Mutex::default(),
+                landlock: c.process.credentials.landlock.clone(),
             }
         })
     });
@@ -309,6 +313,22 @@ pub(crate) fn find(c: &Context<'_>, address: &[u8], kind: u32) -> Result<Arc<Uni
         .and_then(Weak::upgrade)
         .ok_or(ECONNREFUSED)
 }
+/// Landlock's check of a datagram from `sender` to `other` by name
+/// (`hook_unix_may_send`), which the socket the sender is connected to skips.
+pub(crate) fn may_send(
+    c: &Context<'_>,
+    sender: &crate::sockets::SocketPairEnd,
+    other: &UnixSocket,
+) -> Result<(), Errno> {
+    if sender
+        .unix()
+        .is_some_and(|own| own.connected_to(std::ptr::from_ref(other)))
+    {
+        Ok(())
+    } else {
+        other.landlock_scope(c)
+    }
+}
 /// The path a `sun_path` that does not start with 0 names: up to its first
 /// 0, as Linux's `unix_mkname_bsd` ends it.
 fn path_of(name: &[u8]) -> Vec<u8> {
@@ -340,6 +360,7 @@ impl UnixSocket {
                 names: Arc::clone(&c.files.unix),
                 hub: Arc::clone(&c.files.readiness),
                 state: Mutex::default(),
+                landlock: c.process.credentials.landlock.clone(),
             }
         }))
     }
@@ -554,6 +575,7 @@ impl UnixSocket {
         if theirs.listen.is_some() {
             return Err(Errno::EINVAL);
         }
+        self.landlock_scope(c)?;
         let spare = {
             let mut slot = client.spare.lock().unwrap_or_else(PoisonError::into_inner);
             let spare = slot.as_ref().ok_or(Errno::EINVAL)?;
@@ -586,6 +608,7 @@ impl UnixSocket {
                     peer: Some(Arc::clone(&client.name)),
                     ..State::default()
                 }),
+                landlock: self.landlock.clone(),
             }
         });
         theirs.peer = Some(Arc::clone(&self.name));
@@ -614,6 +637,9 @@ impl UnixSocket {
                 self.autobind()?;
             }
             let other = find(c, address, SOCK_DGRAM)?;
+            if !self.connected_to(std::ptr::from_ref(&*other)) {
+                other.landlock_scope(c)?;
+            }
             if !other.may_receive_from(self) {
                 return Err(EPERM);
             }
@@ -652,6 +678,24 @@ impl UnixSocket {
             .to
             .as_ref()
             .is_none_or(|(to, _)| std::ptr::eq(to.as_ptr(), sender))
+    }
+    /// Landlock's `hook_unix_stream_connect` and `hook_unix_may_send`: a
+    /// domain that scopes abstract unix sockets keeps the caller from this
+    /// socket when it is bound to an abstract name and a thread outside the
+    /// caller's domain made it (`EPERM`).
+    fn landlock_scope(&self, c: &Context<'_>) -> Result<(), Errno> {
+        let in_abstract = self.name.get().is_some_and(|name| name.first() == Some(&0));
+        if in_abstract
+            && crate::landlock::scoped(
+                &c.process.credentials.landlock,
+                &self.landlock,
+                crate::landlock::SCOPE_ABSTRACT_UNIX_SOCKET,
+            )
+        {
+            Err(EPERM)
+        } else {
+            Ok(())
+        }
     }
     /// Whether this datagram socket is connected to `other`.
     fn connected_to(&self, other: *const UnixSocket) -> bool {

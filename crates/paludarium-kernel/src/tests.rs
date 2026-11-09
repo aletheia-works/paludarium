@@ -3029,16 +3029,21 @@ fn landlock_restricts_access_beneath_its_rules() {
         assert_eq!(f.ret(3, &[fd]), 0);
     }
     // The version, and the attribute's checks.
-    assert_eq!(f.ret(444, &[0, 0, 1]), 5);
-    assert_eq!(f.ret(444, &[0, 0, 2]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(444, &[0, 0, 1]), 8);
+    assert_eq!(f.ret(444, &[0, 0, 2]), 15);
+    assert_eq!(f.ret(444, &[0, 0, 4]), errno(Errno::EINVAL));
     assert_eq!(f.ret(444, &[DATA, 8, 1]), errno(Errno::EINVAL));
     assert_eq!(f.ret(444, &[0, 8, 0]), errno(Errno::EFAULT));
     assert_eq!(f.ret(444, &[DATA, 4, 0]), errno(Errno::EINVAL));
     assert_eq!(f.ret(444, &[DATA, 4097, 0]), errno(Errno(7)));
     f.mem.write(GuestAddr(DATA), &[0; 32]).unwrap();
     assert_eq!(f.ret(444, &[DATA, 8, 0]), errno(Errno(42)));
-    f.mem.write(GuestAddr(DATA + 16), &[1]).unwrap();
+    f.mem.write(GuestAddr(DATA + 24), &[1]).unwrap();
     assert_eq!(f.ret(444, &[DATA, 32, 0]), errno(Errno(7)));
+    f.mem.write(GuestAddr(DATA + 24), &[0]).unwrap();
+    f.mem.write(GuestAddr(DATA + 16), &[4]).unwrap();
+    assert_eq!(f.ret(444, &[DATA, 24, 0]), errno(Errno::EINVAL));
+    f.mem.write(GuestAddr(DATA + 16), &[0]).unwrap();
     f.mem
         .write(GuestAddr(DATA), &(1u64 << 40).to_le_bytes())
         .unwrap();
@@ -3086,7 +3091,11 @@ fn landlock_restricts_access_beneath_its_rules() {
     assert_eq!(f.ret(445, &[ruleset, 1, rule, 0]), 0);
     let before = f.ret(2, &[bf, 1, 0]);
     // Enforcing: flags, then a descriptor that is no ruleset.
-    assert_eq!(f.ret(446, &[ruleset, 1]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(446, &[ruleset, 1 << 4]), errno(Errno::EINVAL));
+    // LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF alone needs no ruleset; with
+    // another flag, -1 is no descriptor.
+    assert_eq!(f.ret(446, &[u64::MAX, 4]), 0);
+    assert_eq!(f.ret(446, &[u64::MAX, 5]), errno(Errno::EBADF));
     assert_eq!(f.ret(446, &[dir_a, 0]), errno(Errno(77)));
     assert_eq!(f.ret(446, &[ruleset, 0]), 0);
     let eacces = errno(Errno::EACCES);

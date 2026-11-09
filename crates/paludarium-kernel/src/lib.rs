@@ -798,6 +798,7 @@ impl Kernel {
 
     fn syscall(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         self.sync_actions(thread);
+        self.group.take_landlock(&mut thread.state.credentials);
         // Before the call queues a signal itself (a fault, SIGPIPE, tgkill
         // to itself), so that it does not merge into a discarded one.
         self.group.apply_discards(&mut thread.state);

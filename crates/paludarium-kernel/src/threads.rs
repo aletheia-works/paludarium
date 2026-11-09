@@ -36,6 +36,10 @@ pub struct ThreadGroup {
     /// What signalling each thread looks at, for other processes to read;
     /// a thread without one is root's ([`TaskIds`]).
     task_ids: Mutex<BTreeMap<u32, TaskIds>>,
+    /// The last `LANDLOCK_RESTRICT_SELF_TSYNC`: its number and the domain
+    /// every thread takes when it next enters the kernel.
+    landlock_syncs: AtomicU64,
+    landlock_sync: Mutex<crate::landlock::Landlock>,
     status: Mutex<Option<ExitStatus>>,
     /// The signal dispositions, which clone with `CLONE_SIGHAND` also shares
     /// with another process (Linux's `sighand_struct`).
@@ -97,6 +101,8 @@ impl Default for ThreadGroup {
             affinity: Mutex::default(),
             numa: crate::mempolicy::Numa::default(),
             task_ids: Mutex::default(),
+            landlock_syncs: AtomicU64::new(0),
+            landlock_sync: Mutex::default(),
             status: Mutex::new(None),
             actions: Mutex::default(),
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
@@ -533,8 +539,41 @@ impl ThreadGroup {
         let ids = self.task_ids.lock().unwrap_or_else(PoisonError::into_inner);
         ids.get(&tid)
             .or_else(|| ids.get(&pid))
-            .copied()
+            .cloned()
             .unwrap_or_default()
+    }
+    /// `LANDLOCK_RESTRICT_SELF_TSYNC`: every thread takes `domain`, which
+    /// is what acting on them looks at from now on. Returns the number the
+    /// caller, which takes it itself, records as taken.
+    pub(crate) fn sync_landlock(&self, domain: &crate::landlock::Landlock) -> u64 {
+        let mut sync = self
+            .landlock_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *sync = domain.clone();
+        for ids in self
+            .task_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values_mut()
+        {
+            ids.landlock = domain.clone();
+        }
+        self.landlock_syncs.fetch_add(1, Ordering::SeqCst) + 1
+    }
+    /// A thread entering the kernel takes the domain of a
+    /// `LANDLOCK_RESTRICT_SELF_TSYNC` it has not taken yet, as Linux's task
+    /// work does before it returns to the thread.
+    pub(crate) fn take_landlock(&self, credentials: &mut crate::credentials::Credentials) {
+        let syncs = self.landlock_syncs.load(Ordering::SeqCst);
+        if syncs != credentials.landlock_sync {
+            let sync = self
+                .landlock_sync
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            credentials.landlock = sync.clone();
+            credentials.landlock_sync = self.landlock_syncs.load(Ordering::SeqCst);
+        }
     }
     /// Thread `tid` is gone, unless it led process `pid`.
     fn forget_task_ids(&self, pid: u32, tid: u32) {

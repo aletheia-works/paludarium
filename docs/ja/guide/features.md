@@ -1369,12 +1369,13 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   います。メモリ上でも、Linux か macOS でマウントしたホストのディレクトリでも使えます。
   `RENAME_WHITEOUT` には `CAP_MKNOD` が要り（なければ `EPERM`）、あっても
   ホワイトアウトのない Linux のファイルシステムと同じく `EINVAL` を返します。
-- Landlock は、スレッドがアクセスできるファイルの階層と TCP のポートを ABI バージョン 5
-  の範囲で制限します。`landlock_create_ruleset`（バージョンの問い合わせを含む）、
+- Landlock は、スレッドがアクセスできるファイルの階層と TCP のポート、ドメインの外で
+  届くものを、ABI バージョン 8 と errata 1〜4 の範囲で制限します。
+  `landlock_create_ruleset`（バージョンと errata の問い合わせを含む）、
   `LANDLOCK_RULE_PATH_BENEATH` と `LANDLOCK_RULE_NET_PORT` の `landlock_add_rule`、
   `landlock_restrict_self`（`no_new_privs` か `CAP_SYS_ADMIN` が要ります）に対応し、
-  層は 16 までです。各層は、
-  扱う権利を、ルールが指すファイルやディレクトリの下でだけ許します。ルールはデバイスと
+  層は 16 までです。各層は、扱う権利を、ルールが指すファイルやディレクトリの下でだけ
+  許します。ルールはデバイスと
   inode で指すので、名前を変えたディレクトリにもついていきます。ファイルを開くと
   `LANDLOCK_ACCESS_FS_READ_FILE`、`WRITE_FILE`、`READ_DIR` を、`execve` とその
   インタープリタでは `EXECUTE` を確かめます。名前を作るときはディレクトリについて
@@ -1386,8 +1387,17 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   名前の変更には `REFER` が要り、ファイルの権利が増えてはいけません（`EXDEV`）。
   TCP のソケットの `bind` にはそのポートの `LANDLOCK_ACCESS_NET_BIND_TCP` が、`connect`
   には `CONNECT_TCP` が要ります。その前に、Linux と同じくアドレスを確かめます。
-  UDP と、`AF_UNSPEC` への `connect` は確かめません。スレッド、プロセス、`execve` はドメインを
-  引き継ぎます。`O_PATH`、`stat`、制限の前に開いた記述子は確かめません。
+  UDP と、`AF_UNSPEC` への `connect` は確かめません。ホワイトアウト（`mknod` が
+  キャラクタデバイス 0 として作り、`RENAME_WHITEOUT` が残すもの）には `MAKE_REG` が
+  要ります。ルールセットのスコープは、ドメインの外のスレッドが作ったものや、そのスレッド
+  そのものからスレッドを遠ざけます。`LANDLOCK_SCOPE_SIGNAL` はそのスレッドへのシグナルを、
+  `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` はそのスレッドが作った抽象名前空間の unix
+  ソケットへの接続と送信を断ります（`EPERM`）。同じプロセスのスレッドどうしは、いつでも
+  シグナルを送れます。`ptrace` と同じく、ドメインの中のスレッドは、外のタスクの
+  `/proc/<pid>/environ` などを読めません。`landlock_restrict_self` は記録のフラグと
+  `LANDLOCK_RESTRICT_SELF_TSYNC` を受け付け、TSYNC はプロセスのすべてのスレッドに新しい
+  ドメインを与えます。スレッド、プロセス、`execve` はドメインを引き継ぎます。`O_PATH`、
+  `stat`、制限の前に開いた記述子は確かめません。
 - 起動の前にファイルを置けます。
 - 指定したときだけ、ホストのディレクトリをマウントできます（コマンドの `--mount`、
   Rust の `Config::mounts`）。操作はすべてそのディレクトリの中に閉じ込められ、

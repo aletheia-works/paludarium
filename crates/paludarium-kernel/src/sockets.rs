@@ -998,7 +998,9 @@ fn send_to(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .read(GuestAddr(a[1]), &mut bytes)
         .map_err(|_| Errno::EFAULT)?;
     let to = if lookup {
-        Some(crate::unix::find(c, &address, SOCK_DGRAM)?)
+        let to = crate::unix::find(c, &address, SOCK_DGRAM)?;
+        crate::unix::may_send(c, socket, &to)?;
+        Some(to)
     } else {
         None
     };
@@ -1095,7 +1097,9 @@ fn send_message(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .map_err(|_| Errno::EFAULT)?;
     }
     let to = if lookup {
-        Some(crate::unix::find(c, &address, SOCK_DGRAM)?)
+        let to = crate::unix::find(c, &address, SOCK_DGRAM)?;
+        crate::unix::may_send(c, socket, &to)?;
+        Some(to)
     } else {
         None
     };

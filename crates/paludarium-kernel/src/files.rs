@@ -2416,7 +2416,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 && (flags & 1 == 0 || new_stat.is_none())
                 && (flags & 2 == 0 || new_stat.is_some())
             {
-                crate::landlock::refer(c, &old_path, &new_path, true, flags & 2 != 0)?;
+                crate::landlock::refer(c, &old_path, &new_path, true, flags)?;
             }
             c.files.fs.rename_with(&old, &new, flags)?;
             // The paths of descriptors and the working directory under a
@@ -2468,12 +2468,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             Ok(0)
         }
         133 | 259 => {
-            let (dir, raw, mode) = if n == 133 {
-                ((-100i32) as u64, path(c, a[0])?, a[1] as u32)
+            let (dir, raw, mode, dev) = if n == 133 {
+                ((-100i32) as u64, path(c, a[0])?, a[1] as u32, a[2] as u32)
             } else {
-                (a[0], path(c, a[1])?, a[2] as u32)
+                (a[0], path(c, a[1])?, a[2] as u32, a[3] as u32)
             };
-            mknod(c, dir, &raw, mode)?;
+            mknod(c, dir, &raw, mode, dev)?;
             Ok(0)
         }
         84 | 87 | 263 => {
@@ -2523,7 +2523,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 && let (Some((old_path, Some(_))), Some((new_path, None))) =
                     (landlock_named(c, &old), landlock_named(c, &new))
             {
-                crate::landlock::refer(c, &old_path, &new_path, false, false)?;
+                crate::landlock::refer(c, &old_path, &new_path, false, 0)?;
             }
             c.files.fs.link(&old, &new)?;
             Ok(0)
@@ -4723,19 +4723,29 @@ fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
 /// too), a FIFO or a socket node, with the permission bits of `mode` less
 /// the umask. A directory's type is `EPERM` and an unknown one `EINVAL`. A
 /// device needs a device to stand for, which paludarium has none of: `EPERM`,
-/// as for a process without `CAP_MKNOD`.
-fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32) -> Result<(), Errno> {
+/// as for a process without `CAP_MKNOD`. Landlock's check (`hook_path_mknod`)
+/// of a device, a whiteout too, comes before that refusal, as in Linux.
+fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Result<(), Errno> {
     const S_IFMT: u32 = 0o170000;
     let kind = mode & S_IFMT;
     match kind {
         0 | 0o100000 | 0o010000 | 0o140000 => {}
-        0o020000 | 0o060000 | 0o040000 => return Err(Errno::EPERM),
+        0o020000 | 0o060000 => {
+            if c.process.credentials.landlock != Default::default() {
+                let p = c.files.path(dir, raw.to_vec())?;
+                if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
+                    landlock_name(c, &p, crate::landlock::make_access(kind, u64::from(dev)))?;
+                }
+            }
+            return Err(Errno::EPERM);
+        }
+        0o040000 => return Err(Errno::EPERM),
         _ => return Err(Errno::EINVAL),
     }
     let p = c.files.path(dir, raw.to_vec())?;
     let created = crate::permissions::create(c.files, &c.process.credentials, dir, raw)?;
     if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
-        landlock_name(c, &p, crate::landlock::make_access(kind))?;
+        landlock_name(c, &p, crate::landlock::make_access(kind, 0))?;
     }
     let permissions = mode & 0o7777 & !c.files.umask();
     match kind {

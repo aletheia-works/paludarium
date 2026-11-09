@@ -689,7 +689,7 @@ impl Processes {
             .map(|(&key, _)| key)
             .ok_or(Errno(3))?;
         let entry = entries.get_mut(&pid).ok_or(Errno(3))?;
-        if !own && !sender.may_prlimit(entry.group.task_ids(pid, named)) {
+        if !own && !sender.may_prlimit(&entry.group.task_ids(pid, named)) {
             return Err(Errno::EPERM);
         }
         let old = *entry.limits.get(resource).ok_or(Errno::EINVAL)?;
@@ -833,9 +833,15 @@ impl Processes {
         for (&child_pid, child) in entries.iter() {
             if child.parent == pid && child.status.is_none() && child.death_signal != 0 {
                 // Linux sends it as the exiting parent, as with `kill`.
-                let sender = parent_ids.unwrap_or_default();
-                if sender.may_signal(child.group.task_ids(child_pid, child_pid))
-                    || (child.death_signal == SIGCONT && same_session(child))
+                let sender = parent_ids.clone().unwrap_or_default();
+                let target = child.group.task_ids(child_pid, child_pid);
+                if (sender.may_signal(&target)
+                    || (child.death_signal == SIGCONT && same_session(child)))
+                    && !crate::landlock::scoped(
+                        &sender.landlock,
+                        &target.landlock,
+                        crate::landlock::SCOPE_SIGNAL,
+                    )
                 {
                     let _ = child
                         .group
@@ -1238,7 +1244,7 @@ impl Processes {
         let signal = Self::from_process(number, caller, sender.uid);
         let (mut last, mut delivered) = (Ok(()), false);
         for (pid, named) in pids {
-            let result = Self::check_kill(&entries, caller, sender, pid, named, number)
+            let result = Self::check_kill(&entries, caller, &sender, pid, named, number)
                 .and_then(|()| self.send(&mut entries, pid, None, signal));
             delivered |= result.is_ok();
             // -1 does not report a process it may not signal, so with only
@@ -1256,11 +1262,13 @@ impl Processes {
     /// Linux's `check_kill_permission` of `number` from a thread of `caller`
     /// to process `pid` through its thread `named`: an invalid signal is left
     /// for delivery to refuse (EINVAL first), its own process may always be
-    /// signalled, and SIGCONT may also be sent within the session.
+    /// signalled, and SIGCONT may also be sent within the session. Then a
+    /// Landlock domain that scopes signals keeps the sender from a thread
+    /// outside it (`hook_task_kill`, `EPERM`).
     fn check_kill(
         entries: &BTreeMap<u32, Entry>,
         caller: u32,
-        sender: TaskIds,
+        sender: &TaskIds,
         pid: u32,
         named: u32,
         number: i32,
@@ -1270,8 +1278,13 @@ impl Processes {
         }
         let entry = entries.get(&pid).ok_or(Errno(3))?;
         let session = entries.get(&caller).map(|c| c.sid);
-        if sender.may_signal(entry.group.task_ids(pid, named))
-            || (number == SIGCONT && session == Some(entry.sid))
+        let target = entry.group.task_ids(pid, named);
+        if (sender.may_signal(&target) || (number == SIGCONT && session == Some(entry.sid)))
+            && !crate::landlock::scoped(
+                &sender.landlock,
+                &target.landlock,
+                crate::landlock::SCOPE_SIGNAL,
+            )
         {
             Ok(())
         } else {
@@ -1357,7 +1370,7 @@ impl Processes {
     /// Whether `pidfd_send_signal` from `caller` may signal process `pid`.
     fn may_signal(&self, caller: u32, sender: TaskIds, pid: u32, number: i32) -> Result<(), Errno> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        Self::check_kill(&entries, caller, sender, pid, pid, number)
+        Self::check_kill(&entries, caller, &sender, pid, pid, number)
     }
     fn signal(&self, caller: u32, uid: u32, pid: u32, number: i32) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1385,7 +1398,7 @@ impl Processes {
             })
             .map(|(&key, _)| key)
             .ok_or(Errno(3))?;
-        Self::check_kill(&entries, caller, sender, found, pid, signal.number)?;
+        Self::check_kill(&entries, caller, &sender, found, pid, signal.number)?;
         self.send(&mut entries, found, None, signal)
     }
     /// `rt_tgsigqueueinfo` of `signal` to thread `tid` of process `tgid`.
@@ -1404,7 +1417,7 @@ impl Processes {
         {
             return Err(Errno(3));
         }
-        Self::check_kill(&entries, caller, sender, tgid, tid, signal.number)?;
+        Self::check_kill(&entries, caller, &sender, tgid, tid, signal.number)?;
         self.send(&mut entries, tgid, Some(tid), signal)
     }
     /// [`Self::deliver`] for a process's `kill` or queued signal, which wakes
@@ -2125,7 +2138,7 @@ impl Kernel {
         let nice = (a[2] as i32).clamp(-20, 19);
         let mut result = Err(Errno(3));
         for found in threads {
-            if !sender.may_set_priority(found.ids) {
+            if !sender.may_set_priority(&found.ids) {
                 result = Err(Errno::EPERM);
             } else if nice < found.nice
                 && (20 - nice) as u64 > found.nice_limit
@@ -2255,6 +2268,8 @@ impl Kernel {
         state.frames.clear();
         state.exit_status = None;
         state.timer = signals::RealTimer::default();
+        // A new process has taken no `LANDLOCK_RESTRICT_SELF_TSYNC` of its own.
+        state.credentials.landlock_sync = 0;
         state.clear_child_tid = if flags & 0x200000 != 0 { a[3] } else { 0 };
         if flags & 0x100 != 0 {
             state.alt_stack = crate::AltStack::default();
@@ -2571,7 +2586,7 @@ impl Kernel {
         let exited = self.processes.exited(pidfd.pid).ok_or(Errno(3))?;
         let sender = thread.state.credentials.task_ids();
         self.processes
-            .may_signal(self.process.pid, sender, pidfd.pid, number)?;
+            .may_signal(self.process.pid, sender.clone(), pidfd.pid, number)?;
         if exited {
             return Ok(0);
         }

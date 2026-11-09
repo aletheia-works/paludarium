@@ -1,11 +1,13 @@
 //! Landlock (`landlock_create_ruleset`, `landlock_add_rule`,
 //! `landlock_restrict_self`), as Linux's `security/landlock` restricts a
-//! thread's access to file hierarchies and TCP ports. This is ABI version 5:
-//! the file system access rights of versions 1 to 3
-//! (`LANDLOCK_ACCESS_FS_EXECUTE` to `LANDLOCK_ACCESS_FS_TRUNCATE`, with
-//! `REFER`), TCP `bind` and `connect` by port (version 4) and `ioctl` on
-//! devices (`LANDLOCK_ACCESS_FS_IOCTL_DEV`, version 5); scopes and the later
-//! flags come with versions this does not report.
+//! thread's access to file hierarchies and TCP ports and what it may reach
+//! outside its domain. This is ABI version 8: the file system access rights
+//! of versions 1 to 3 (`LANDLOCK_ACCESS_FS_EXECUTE` to
+//! `LANDLOCK_ACCESS_FS_TRUNCATE`, with `REFER`), TCP `bind` and `connect` by
+//! port (version 4), `ioctl` on devices (`LANDLOCK_ACCESS_FS_IOCTL_DEV`,
+//! version 5), the abstract unix socket and signal scopes (version 6), the
+//! logging flags of `landlock_restrict_self` (version 7, accepted; nothing is
+//! logged) and `LANDLOCK_RESTRICT_SELF_TSYNC` (version 8), with errata 1 to 4.
 //!
 //! A domain is a stack of up to 16 layers, one for each enforced ruleset.
 //! Each layer handles some access rights and allows them only beneath the
@@ -14,15 +16,27 @@
 //! ancestors. Rules name objects by device and inode, as Linux ties them to
 //! inodes, so they follow a renamed directory and every link of a file, and
 //! ports by number.
+//!
+//! Each layer also belongs to a hierarchy, Linux's `landlock_hierarchy`: the
+//! domains made from it share it, and a scope keeps a thread from what lives
+//! outside its own hierarchy at that layer.
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The ABI version `LANDLOCK_CREATE_RULESET_VERSION` reports.
-const ABI: u64 = 5;
+const ABI: u64 = 8;
 const CREATE_RULESET_VERSION: u64 = 1;
+const CREATE_RULESET_ERRATA: u64 = 2;
+/// The errata `LANDLOCK_CREATE_RULESET_ERRATA` reports, as Linux's
+/// `security/landlock/errata`: 1, only TCP sockets meet the TCP rights (no
+/// other stream protocol is here); 2, threads of one process may always
+/// signal each other; 3, a disconnected directory widens no right (no bind
+/// mount moves one here); 4, a whiteout needs `MAKE_REG`.
+const ERRATA: u64 = 0b1111;
 const RULE_PATH_BENEATH: u64 = 1;
 const RULE_NET_PORT: u64 = 2;
 /// Linux's `LANDLOCK_MAX_NUM_LAYERS`.
@@ -52,6 +66,17 @@ pub(crate) const BIND_TCP: u64 = 1 << 0;
 pub(crate) const CONNECT_TCP: u64 = 1 << 1;
 /// Every network access right of this ABI.
 const NET: u64 = (1 << 2) - 1;
+pub(crate) const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+pub(crate) const SCOPE_SIGNAL: u64 = 1 << 1;
+/// Every scope of this ABI.
+const SCOPE: u64 = (1 << 2) - 1;
+const RESTRICT_SELF_LOG_SUBDOMAINS_OFF: u32 = 1 << 2;
+const RESTRICT_SELF_TSYNC: u32 = 1 << 3;
+/// Every `landlock_restrict_self` flag of this ABI.
+const RESTRICT_SELF: u32 = (1 << 4) - 1;
+
+/// The next hierarchy a `landlock_restrict_self` makes.
+static HIERARCHIES: AtomicU64 = AtomicU64::new(1);
 
 /// A file or directory, as `stat` names it: device and inode.
 pub(crate) type Object = (u64, u64);
@@ -60,6 +85,7 @@ pub(crate) type Object = (u64, u64);
 pub(crate) struct Ruleset {
     handled: u64,
     handled_net: u64,
+    scoped: u64,
     rules: Mutex<BTreeMap<Object, u64>>,
     ports: Mutex<BTreeMap<u16, u64>>,
 }
@@ -72,6 +98,11 @@ pub(crate) struct Domain {
     layers: Vec<u64>,
     /// The network rights each layer handles.
     net: Vec<u64>,
+    /// What each layer scopes.
+    scopes: Vec<u64>,
+    /// The hierarchy of each layer: a domain made from another shares its
+    /// layers' hierarchies.
+    hierarchies: Vec<u64>,
     /// For each object, the layers with a rule on it and what that rule
     /// allows.
     rules: BTreeMap<Object, Vec<(usize, u64)>>,
@@ -108,6 +139,38 @@ impl Landlock {
             .as_deref()
             .filter(|d| d.net.iter().any(|h| h & request != 0))
     }
+    /// The hierarchies of the domain's layers, the oldest first.
+    fn hierarchies(&self) -> &[u64] {
+        self.0.as_deref().map_or(&[], |d| &d.hierarchies)
+    }
+}
+
+/// `domain_is_scoped`: whether `client`, scoping `scope`, may not reach what
+/// belongs to `server`. A layer of the client that scopes it keeps the client
+/// from anything outside that layer's hierarchy, so the server must share it.
+pub(crate) fn scoped(client: &Landlock, server: &Landlock, scope: u64) -> bool {
+    let Some(domain) = client.0.as_deref() else {
+        return false;
+    };
+    let theirs = server.hierarchies();
+    domain
+        .scopes
+        .iter()
+        .zip(&domain.hierarchies)
+        .enumerate()
+        .any(|(layer, (scopes, hierarchy))| {
+            scopes & scope != 0 && theirs.get(layer) != Some(hierarchy)
+        })
+}
+
+/// `domain_scope_le`, Landlock's ptrace check: `tracer` may act on `tracee`
+/// when the tracer has no domain or the tracee's descends from it.
+pub(crate) fn may_trace(tracer: &Landlock, tracee: &Landlock) -> bool {
+    let mine = tracer.hierarchies();
+    let Some(top) = mine.last() else {
+        return true;
+    };
+    tracee.hierarchies().get(mine.len() - 1) == Some(top)
 }
 
 /// For each layer, the requested rights it handles that no rule granted yet
@@ -390,11 +453,14 @@ pub(crate) fn socket(c: &Context<'_>, v6: bool, raw: &[u8], request: u64) -> Res
     }
 }
 
-/// `get_mode_access`: the right to make a file of `mode`.
-pub(crate) fn make_access(mode: u32) -> u64 {
+/// `get_mode_access`: the right to make a file of `mode` and device `rdev`.
+/// A whiteout, a character device numbered 0, is guarded as a regular file
+/// (erratum 4).
+pub(crate) fn make_access(mode: u32, rdev: u64) -> u64 {
     match mode & 0o170000 {
         0o120000 => MAKE_SYM,
         0o040000 => MAKE_DIR,
+        0o020000 if rdev == 0 => MAKE_REG,
         0o020000 => MAKE_CHAR,
         0o060000 => MAKE_BLOCK,
         0o010000 => MAKE_FIFO,
@@ -448,17 +514,22 @@ fn collect(
 }
 
 /// `current_check_refer_path`: a link (`removable` false) or rename of the
-/// file at the resolved path `old` to `new`, or their exchange. A move to
-/// another directory needs `REFER` on both and must not give the file more
-/// rights than it had: `EXDEV` when only that fails, as Linux's lets the
-/// caller copy instead, and `EACCES` for a missing right to make or remove.
+/// file at the resolved path `old` to `new`, with the `renameat2` flags
+/// `flags`: an exchange, or a whiteout left where the file was, which needs
+/// `MAKE_REG` there. A move to another directory needs `REFER` on both and
+/// must not give the file more rights than it had: `EXDEV` when only that
+/// fails, as Linux's lets the caller copy instead, and `EACCES` for a missing
+/// right to make or remove.
 pub(crate) fn refer(
     c: &Context<'_>,
     old: &[u8],
     new: &[u8],
     removable: bool,
-    exchange: bool,
+    flags: u32,
 ) -> Result<(), Errno> {
+    const RENAME_EXCHANGE: u32 = 2;
+    const RENAME_WHITEOUT: u32 = 4;
+    let exchange = flags & RENAME_EXCHANGE != 0;
     let Some(domain) = c.process.credentials.landlock.applicable(FS) else {
         return Ok(());
     };
@@ -472,12 +543,15 @@ pub(crate) fn refer(
         let Some(new_stat) = &new_stat else {
             return Err(Errno::ENOENT);
         };
-        request1 = make_access(new_stat.mode);
+        request1 = make_access(new_stat.mode, new_stat.rdev);
     }
-    let mut request2 = make_access(old_stat.mode);
+    let mut request2 = make_access(old_stat.mode, old_stat.rdev);
     if removable {
         request1 |= remove_access(Some(&old_stat));
         request2 |= remove_access(new_stat.as_ref());
+    }
+    if flags & RENAME_WHITEOUT != 0 {
+        request1 |= make_access(0o020000, 0);
     }
     let identity = |p: &[u8]| crate::files::identity(c, p);
     let (old_dir, new_dir) = (parent(old), parent(new));
@@ -589,15 +663,15 @@ pub(crate) fn sys_create_ruleset(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64
         if attr != 0 || size != 0 {
             return Err(Errno::EINVAL);
         }
-        return if flags == CREATE_RULESET_VERSION {
-            Ok(ABI)
-        } else {
-            Err(Errno::EINVAL)
+        return match flags {
+            CREATE_RULESET_VERSION => Ok(ABI),
+            CREATE_RULESET_ERRATA => Ok(ERRATA),
+            _ => Err(Errno::EINVAL),
         };
     }
     // copy_min_struct_from_user: at least handled_access_fs, then
-    // handled_access_net, the fields of this ABI; any other byte the caller
-    // gives must be zero.
+    // handled_access_net and scoped, the fields of this ABI; any other byte
+    // the caller gives must be zero.
     if attr == 0 {
         return Err(Errno::EFAULT);
     }
@@ -612,23 +686,24 @@ pub(crate) fn sys_create_ruleset(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64
         .read(GuestAddr(attr), &mut bytes)
         .map_err(|_| Errno::EFAULT)?;
     if bytes
-        .get(16..)
+        .get(24..)
         .is_some_and(|rest| rest.iter().any(|b| *b != 0))
     {
         return Err(Errno(7));
     }
-    bytes.resize(16, 0);
+    bytes.resize(24, 0);
     let field = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
-    let (handled, handled_net) = (field(0), field(8));
-    if handled & !FS != 0 || handled_net & !NET != 0 {
+    let (handled, handled_net, scoped) = (field(0), field(8), field(16));
+    if handled & !FS != 0 || handled_net & !NET != 0 || scoped & !SCOPE != 0 {
         return Err(Errno::EINVAL);
     }
-    if handled == 0 && handled_net == 0 {
+    if handled == 0 && handled_net == 0 && scoped == 0 {
         return Err(Errno(42)); // ENOMSG
     }
     let ruleset = Arc::new(Ruleset {
         handled,
         handled_net,
+        scoped,
         rules: Mutex::default(),
         ports: Mutex::default(),
     });
@@ -708,15 +783,23 @@ fn add_port(c: &Context<'_>, ruleset: &Ruleset, at: u64) -> Result<u64, Errno> {
 }
 
 /// `landlock_restrict_self(ruleset_fd, flags)`: the thread's domain with the
-/// ruleset as a new layer on top.
+/// ruleset as a new layer on top, in a hierarchy of its own, and with
+/// `LANDLOCK_RESTRICT_SELF_TSYNC` every other thread's too. The logging
+/// flags are taken and change nothing, as nothing is logged; with
+/// `LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF` alone a descriptor of -1
+/// asks for nothing more.
 pub(crate) fn sys_restrict_self(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     const CAP_SYS_ADMIN: u64 = 1 << 21;
     let no_new_privs = c.processes.status_of(c.process.pid).2;
     if !no_new_privs && c.process.credentials.effective & CAP_SYS_ADMIN == 0 {
         return Err(Errno::EPERM);
     }
-    if a[1] as u32 != 0 {
+    let flags = a[1] as u32;
+    if flags & !RESTRICT_SELF != 0 {
         return Err(Errno::EINVAL);
+    }
+    if a[0] as i32 == -1 && flags == RESTRICT_SELF_LOG_SUBDOMAINS_OFF {
+        return Ok(0);
     }
     let file = ruleset(c, a[0])?;
     let Some(ruleset) = file.as_any().and_then(|f| f.downcast_ref::<Ruleset>()) else {
@@ -728,6 +811,8 @@ pub(crate) fn sys_restrict_self(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64,
         return Err(Errno(7)); // E2BIG
     }
     let mut net = old.map_or_else(Vec::new, |d| d.net.clone());
+    let mut scopes = old.map_or_else(Vec::new, |d| d.scopes.clone());
+    let mut hierarchies = old.map_or_else(Vec::new, |d| d.hierarchies.clone());
     let mut rules = old.map_or_else(BTreeMap::new, |d| d.rules.clone());
     let mut ports = old.map_or_else(BTreeMap::new, |d| d.ports.clone());
     let layer = layers.len();
@@ -739,6 +824,8 @@ pub(crate) fn sys_restrict_self(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64,
         ruleset.handled | REFER
     });
     net.push(ruleset.handled_net);
+    scopes.push(ruleset.scoped);
+    hierarchies.push(HIERARCHIES.fetch_add(1, Ordering::Relaxed));
     for (port, allowed) in ruleset
         .ports
         .lock()
@@ -755,12 +842,23 @@ pub(crate) fn sys_restrict_self(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64,
     {
         rules.entry(*object).or_default().push((layer, *allowed));
     }
-    c.process.credentials.landlock = Landlock(Some(Arc::new(Domain {
+    let domain = Landlock(Some(Arc::new(Domain {
         layers,
         net,
+        scopes,
+        hierarchies,
         rules,
         ports,
     })));
+    if flags & RESTRICT_SELF_TSYNC != 0 {
+        // Every other thread takes the same domain when it next enters the
+        // kernel, as Linux's task works do before they return to it; what
+        // others see of them changes now.
+        c.process.credentials.landlock_sync = c.group.sync_landlock(&domain);
+    }
+    c.process.credentials.landlock = domain;
+    c.group
+        .set_task_ids(c.tid, c.process.credentials.task_ids());
     Ok(0)
 }
 
@@ -772,12 +870,16 @@ mod tests {
         let mut d = Domain {
             layers: Vec::new(),
             net: Vec::new(),
+            scopes: Vec::new(),
+            hierarchies: Vec::new(),
             rules: BTreeMap::new(),
             ports: BTreeMap::new(),
         };
         for (i, (handled, rules)) in layers.iter().enumerate() {
             d.layers.push(handled | REFER);
             d.net.push(0);
+            d.scopes.push(0);
+            d.hierarchies.push(i as u64);
             for (object, allowed) in *rules {
                 d.rules
                     .entry(*object)
@@ -834,13 +936,56 @@ mod tests {
         assert!(!may_refer(&parent(0), &child(0), &parent(MAKE_DIR), true));
     }
 
+    /// A domain whose layers scope `scopes` and belong to `hierarchies`.
+    fn scoping(scopes: &[u64], hierarchies: &[u64]) -> Landlock {
+        Landlock(Some(Arc::new(Domain {
+            layers: vec![0; scopes.len()],
+            net: vec![0; scopes.len()],
+            scopes: scopes.to_vec(),
+            hierarchies: hierarchies.to_vec(),
+            rules: BTreeMap::new(),
+            ports: BTreeMap::new(),
+        })))
+    }
+
+    #[test]
+    fn a_scope_keeps_a_thread_inside_its_hierarchy() {
+        let none = Landlock::default();
+        let parent = scoping(&[SCOPE_SIGNAL], &[1]);
+        let child = scoping(&[SCOPE_SIGNAL, 0], &[1, 2]);
+        let sibling = scoping(&[SCOPE_SIGNAL], &[3]);
+        // No domain scopes nothing; a domain scoping signals reaches its own
+        // hierarchy and what descends from it, not what is outside.
+        assert!(!scoped(&none, &parent, SCOPE_SIGNAL));
+        assert!(scoped(&parent, &none, SCOPE_SIGNAL));
+        assert!(!scoped(&parent, &child, SCOPE_SIGNAL));
+        assert!(scoped(&parent, &sibling, SCOPE_SIGNAL));
+        // Another scope is not asked for.
+        assert!(!scoped(&parent, &none, SCOPE_ABSTRACT_UNIX_SOCKET));
+        // The child's own layer scopes nothing, so its parent is reachable;
+        // a layer that does scope keeps it from the parent.
+        assert!(!scoped(&child, &parent, SCOPE_SIGNAL));
+        let strict = scoping(&[0, SCOPE_SIGNAL], &[1, 4]);
+        assert!(scoped(&strict, &parent, SCOPE_SIGNAL));
+        // ptrace: a tracer reaches only what descends from its domain.
+        assert!(may_trace(&none, &parent));
+        assert!(may_trace(&parent, &child));
+        assert!(!may_trace(&child, &parent));
+        assert!(!may_trace(&parent, &none));
+        assert!(!may_trace(&parent, &sibling));
+    }
+
     #[test]
     fn make_access_follows_the_file_type() {
-        assert_eq!(make_access(0o100644), MAKE_REG);
-        assert_eq!(make_access(0), MAKE_REG);
-        assert_eq!(make_access(0o040755), MAKE_DIR);
-        assert_eq!(make_access(0o120777), MAKE_SYM);
-        assert_eq!(make_access(0o010644), MAKE_FIFO);
-        assert_eq!(make_access(0o140755), MAKE_SOCK);
+        assert_eq!(make_access(0o100644, 0), MAKE_REG);
+        assert_eq!(make_access(0, 0), MAKE_REG);
+        assert_eq!(make_access(0o040755, 0), MAKE_DIR);
+        assert_eq!(make_access(0o120777, 0), MAKE_SYM);
+        assert_eq!(make_access(0o010644, 0), MAKE_FIFO);
+        assert_eq!(make_access(0o140755, 0), MAKE_SOCK);
+        // A whiteout is guarded as a regular file (erratum 4).
+        assert_eq!(make_access(0o020000, 0), MAKE_REG);
+        assert_eq!(make_access(0o020644, 0x0103), MAKE_CHAR);
+        assert_eq!(make_access(0o060644, 0x0801), MAKE_BLOCK);
     }
 }

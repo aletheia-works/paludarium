@@ -837,10 +837,6 @@ struct SharedMapping {
     may_write: bool,
 }
 
-/// The file of a file mapping, read at an offset: a page that has no
-/// contents yet is read from it, and a private mapping without the file's
-/// page cache reads the pages given back with `MADV_DONTNEED` from it again,
-/// as Linux faults them in from the file once their private copies are gone.
 /// A file's size and how many times it has shrunk, which a [`PageSource`]
 /// whose size changes keeps here ([`PageSource::file_size`]), so that a
 /// thread's TLB can check the end of the file while holding only this, not
@@ -883,6 +879,10 @@ impl FileSize {
     }
 }
 
+/// The file of a file mapping, read at an offset: a page that has no
+/// contents yet is read from it, and a private mapping without the file's
+/// page cache reads the pages given back with `MADV_DONTNEED` from it again,
+/// as Linux faults them in from the file once their private copies are gone.
 pub trait PageSource: Send + Sync {
     /// Reads from `offset`, filling `buf` unless the file ends first, and
     /// returns how much it read.

@@ -501,12 +501,13 @@ def runtimes(shell):
             "echo server $?"
         ),
         # The server runs as postgres, in a data directory root gave it, and
-        # answers on a socket in the case's directory only.
+        # answers on a socket in the case's directory only; its log is kept
+        # there too, as postgres cannot write to the case's own directory.
         "postgresql": shell(
             "cd {O} && mkdir pg s && chown postgres:postgres pg s && b=$(echo /usr/lib/postgresql/*/bin) && "
             "setpriv --reuid=postgres --regid=postgres --init-groups /bin/sh -c '"
             "$0/initdb -D {O}/pg -A trust -E UTF8 --locale=C.UTF-8 >/dev/null && "
-            '$0/pg_ctl -D {O}/pg -o "-k {O}/s -c listen_addresses=" -w -l {O}/log start >/dev/null && '
+            '$0/pg_ctl -D {O}/pg -o "-k {O}/s -c listen_addresses=" -w -l {O}/s/log start >/dev/null && '
             '$0/psql -h {O}/s -d postgres -XAtc "create table t(a int, b text); '
             "insert into t select i, md5(i::text) from generate_series(1, 1000) i; "
             'select count(*), sum(a), max(b) from t; select current_user"; '

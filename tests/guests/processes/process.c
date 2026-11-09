@@ -5453,10 +5453,10 @@ int main(int argc, char **argv) {
             printf("bound: short=%ld bound=%ld own=%d in_use=%ld other=%ld negative=%d type=%d domain=%d\n",
                    short_bind, bound, port == (unsigned)getpid(), in_use, other_bound, (int)other_name.pid < 0, type,
                    domain);
-            char index_name[IF_NAMESIZE] = "", other_name[IF_NAMESIZE] = "";
+            char index_name[IF_NAMESIZE] = "", unknown_name[IF_NAMESIZE] = "";
             const char *named = if_indextoname(1, index_name);
             errno = 0;
-            const char *unnamed = if_indextoname(1000000, other_name);
+            const char *unnamed = if_indextoname(1000000, unknown_name);
             printf("index: lo=%u nope=%u name=%s other=%d errno=%d\n", if_nametoindex("lo"), if_nametoindex("nope"),
                    named ? named : "-", unnamed != NULL, errno);
             /* Down: the link alone, and no address. */
@@ -5466,7 +5466,7 @@ int main(int argc, char **argv) {
             nl_getifaddrs("down ifaddrs");
             /* Errors and acknowledgements. */
             struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
-            nl_answer(fd, nl_send(fd, 200, NL_F_REQUEST, &family, 1), port, "unknown");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, &family, 1), port, "no route doit");
             struct nl_link nowhere = {.index = 1000000, .flags = IFF_UP, .change = IFF_UP};
             nl_answer(fd, nl_send(fd, 16, NL_F_REQUEST | NL_F_ACK, &nowhere, sizeof nowhere), port, "nowhere");
             nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST, &family, 1), port, "short");

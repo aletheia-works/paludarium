@@ -819,14 +819,6 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec<u8> {
     attribute(&mut body, IFLA_GRO_MAX_SIZE, &u32_of(GSO_MAX_SIZE));
     attribute(&mut body, IFLA_NUM_RX_QUEUES, &u32_of(1));
     attribute(&mut body, IFLA_CARRIER, &[1]);
-    // A device gets its queueing discipline when it first opens, and keeps
-    // it when it goes down (`dev_activate`).
-    let qdisc: &[u8] = if network.has_ipv4_address() {
-        b"noqueue\0"
-    } else {
-        b"noop\0"
-    };
-    attribute(&mut body, IFLA_QDISC, qdisc);
     attribute(&mut body, IFLA_CARRIER_CHANGES, &u32_of(0));
     attribute(&mut body, IFLA_PROTO_DOWN, &[0]);
     attribute(&mut body, IFLA_CARRIER_UP_COUNT, &u32_of(0));
@@ -835,6 +827,14 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec<u8> {
     attribute(&mut body, IFLA_BROADCAST, &[0; 6]);
     attribute(&mut body, IFLA_STATS64, &[0; STATS64_LEN]);
     attribute(&mut body, IFLA_STATS, &[0; STATS_LEN]);
+    // A device gets its queueing discipline when it first opens, and keeps
+    // it when it goes down (`dev_activate`).
+    let qdisc: &[u8] = if network.has_ipv4_address() {
+        b"noqueue\0"
+    } else {
+        b"noop\0"
+    };
+    attribute(&mut body, IFLA_QDISC, qdisc);
     message(RTM_NEWLINK, flags, seq, port, &body)
 }
 /// An `ifaddrmsg` of `lo` for `family`, `prefix` and `flags`.

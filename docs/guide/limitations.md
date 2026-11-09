@@ -272,7 +272,9 @@ verified.
   subset of Linux's attributes (no `IFLA_AF_SPEC`, `IFLA_MAP`, `IFLA_XDP`
   and others), its statistics are zero, an address's creation times are 0,
   `NETLINK_EXT_ACK` adds no attributes to an error and strict checking
-  checks nothing more. A dump is answered whole at once, where Linux may
+  checks nothing more. A message type past the last that `rtnetlink`
+  knows is answered with `EOPNOTSUPP` in `NLMSG_ERROR`, where Linux 7.0
+  refuses the send itself with `EOPNOTSUPP`. A dump is answered whole at once, where Linux may
   split it over datagrams, and a socket whose receive buffer is full drops
   an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
   acts with the capability of the thread that opened it alone. The other namespaces keep nothing apart that

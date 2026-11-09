@@ -669,12 +669,14 @@ fn a_load_it_holds_sees_a_16_byte_exchange_whole() {
 }
 
 /// A file that can shrink, as the page cache counts it: each byte is its
-/// offset modulo 251, and a shrink counts, then sets the size, as the
+/// offset modulo 251, and a shrink sets the size, then counts, as the
 /// kernel's page cache does.
 struct Shrinking {
     size: AtomicU64,
     shrinks: std::sync::Mutex<Vec<(u64, u64)>>,
     count: AtomicU64,
+    /// A size to shrink to as the count is next read, or 0.
+    shrink_when_counted: AtomicU64,
 }
 impl Shrinking {
     fn new(size: u64) -> Arc<Self> {
@@ -682,11 +684,13 @@ impl Shrinking {
             size: AtomicU64::new(size),
             shrinks: std::sync::Mutex::default(),
             count: AtomicU64::new(0),
+            shrink_when_counted: AtomicU64::new(0),
         })
     }
     fn resize(&self, size: u64) {
         if size < self.size.load(Ordering::SeqCst) {
             let mut shrinks = self.shrinks.lock().unwrap();
+            self.size.store(size, Ordering::SeqCst);
             let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
             shrinks.push((count, size));
         }
@@ -707,6 +711,10 @@ impl PageSource for Shrinking {
         Some(self.size.load(Ordering::SeqCst))
     }
     fn shrinks(&self) -> u64 {
+        match self.shrink_when_counted.swap(0, Ordering::SeqCst) {
+            0 => {}
+            size => self.resize(size),
+        }
         self.count.load(Ordering::SeqCst)
     }
     fn shrunk_since(&self, count: u64) -> Option<u64> {
@@ -890,6 +898,10 @@ fn no_access_succeeds_after_a_shrink_past_it(
     file.resize(PAGE_SIZE);
     shrunk.store(true, Ordering::SeqCst);
     thread.join().unwrap();
+    // Grown again, the file shows: whatever stores came in the shrink's
+    // way went with the copy.
+    file.resize(2 * PAGE_SIZE);
+    assert_eq!(byte(&space, last + 8), pattern(PAGE_SIZE + 8), "{view:?}");
 }
 
 #[test]
@@ -904,4 +916,43 @@ fn no_load_or_store_without_a_lock_succeeds_after_a_shrink_past_it_returns() {
             });
         }
     }
+}
+
+#[test]
+fn a_write_that_copies_a_page_as_its_file_shrinks_past_it_is_a_bus_error() {
+    // The page-cache page is copied for the write under the locks, after
+    // the check of the file's end, and the copy records the shrinks so far:
+    // a shrink between the two would leave a copy past the end that no
+    // later shrink check drops.
+    let file = Shrinking::new(2 * PAGE_SIZE);
+    let space = file_space(&file, 2, FileView::Cache);
+    let last = AT + PAGE_SIZE;
+    assert_eq!(byte(&space, last), pattern(PAGE_SIZE));
+    file.shrink_when_counted.store(PAGE_SIZE, Ordering::SeqCst);
+    let fault = space.write(GuestAddr(last), &[0xee]).unwrap_err();
+    assert!(fault.bus && fault.write);
+    file.resize(2 * PAGE_SIZE);
+    assert_eq!(byte(&space, last), pattern(PAGE_SIZE));
+}
+
+#[test]
+fn a_page_first_touched_after_its_file_shrank_and_grew_keeps_its_writes() {
+    let file = Shrinking::new(2 * PAGE_SIZE);
+    let space = file_space(&file, 2, FileView::Copy);
+    file.resize(0);
+    file.resize(2 * PAGE_SIZE);
+    space.write(GuestAddr(AT + PAGE_SIZE), &[0xee]).unwrap();
+    assert_eq!(byte(&space, AT + PAGE_SIZE), 0xee);
+}
+
+#[test]
+fn a_first_read_as_its_file_shrinks_past_the_page_is_a_bus_error() {
+    // The page entry is made under the locks after the check of the file's
+    // end, and records the shrinks so far: a shrink between the two must
+    // still be a bus error, not a page of zeros.
+    let file = Shrinking::new(2 * PAGE_SIZE);
+    let space = file_space(&file, 2, FileView::Copy);
+    file.shrink_when_counted.store(PAGE_SIZE, Ordering::SeqCst);
+    let fault = space.read(GuestAddr(AT + PAGE_SIZE), &mut [0]).unwrap_err();
+    assert!(fault.bus && !fault.write);
 }

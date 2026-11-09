@@ -844,7 +844,9 @@ pub trait PageSource: Send + Sync {
     fn size(&self) -> Option<u64> {
         None
     }
-    /// How many times the file has shrunk.
+    /// How many times the file has shrunk. A shrink is counted after
+    /// [`Self::size`] gives the new size, so that whoever reads the new count
+    /// and then the size sees a page past the end as past it.
     fn shrinks(&self) -> u64 {
         0
     }
@@ -1532,7 +1534,8 @@ impl AddressSpaceData {
                 .is_some_and(|m| m.kind == MappingKind::File),
             cow: shared.is_none() && cache().is_some(),
             cache: shared.is_none() && cache().is_some(),
-            shrinks: 0,
+            // Made now, so no shrink so far can leave it past the end.
+            shrinks: self.file_at(page).map_or(0, |(source, _)| source.shrinks()),
         }
     }
     /// A new entry for `page`, with its file read into it if need be.
@@ -1570,11 +1573,7 @@ impl AddressSpaceData {
                     .shrunk_since(p.shrinks)
                     .is_some_and(|size| offset >= size.div_ceil(PAGE_SIZE) * PAGE_SIZE);
                 if past {
-                    // Made after the shrinks so far, which it must not go
-                    // with in turn.
-                    let mut fresh = self.fresh(page, p.prot);
-                    fresh.shrinks = count;
-                    *entry = Some(fresh);
+                    *entry = Some(self.fresh(page, p.prot));
                 } else {
                     p.shrinks = count;
                 }
@@ -1909,6 +1908,9 @@ impl AddressSpaceData {
                 }
             }
         }
+        // Again, as a truncation may have come between the check and the
+        // refresh: a page it left past the end of the file is a bus error.
+        self.check(&directory, addr, buf.len(), access)?;
         Self::copy_out(&directory, addr, buf);
         if let Some(page) = Self::single_page(addr, buf.len()) {
             self.remember(&directory, page);
@@ -2037,6 +2039,11 @@ impl AddressSpaceData {
                 return Err(self.out_of_room(page));
             }
         }
+        // Again, as a truncation may have come between the check and the
+        // refresh, which read the shrinks after it: a page it left past the
+        // end of the file must not take the write, in a copy that records
+        // the shrink and so would stay.
+        self.check(&directory, addr, len, access)?;
         if let Some(page) = Self::single_page(addr, len) {
             self.remember(&directory, page);
         }

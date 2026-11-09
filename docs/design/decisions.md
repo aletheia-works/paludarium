@@ -55,7 +55,11 @@ changes them does not matter: an access that saw neither change comes before
 the truncation, as one under way while it ran, and a copy that the truncation
 leaves past the end is replaced at the next access under the locks, so a
 store that landed in it is never seen. No access that starts after the
-truncation returns uses the page. Shared mappings stay out of the TLB, as
+truncation returns uses the page. Under the locks, an access checks the end
+of the file again after it has brought the page entry up to date, as a
+truncation may come between the two. The page cache gives the new size
+before it counts the shrink, so an entry that records the new count was
+made after the new size could be seen. Shared mappings stay out of the TLB, as
 their stores mark the pages dirty for write-back and move the shared pages'
 generation on.
 

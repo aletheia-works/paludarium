@@ -295,6 +295,10 @@ impl FileCache {
     fn resized(&self, old: u64, size: u64) {
         if size < old {
             let mut shrinks = self.shrinks.lock().unwrap_or_else(PoisonError::into_inner);
+            // The size first: whoever reads the new count then reads the new
+            // size, and so sees a page past it as past the end
+            // (`paludarium_mmu::PageSource::shrinks`).
+            self.size.store(size, Ordering::SeqCst);
             let count = self.shrink_count.fetch_add(1, Ordering::SeqCst) + 1;
             while shrinks
                 .last()

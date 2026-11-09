@@ -7464,7 +7464,15 @@ int main(int argc, char **argv) {
                 if (a == 2) close(sv[0]);
                 /* A busy host can keep the reader from reaching recv
                    before the child acts. Then the reader does not wait
-                   and the signal is due, so the attempt is taken again. */
+                   and the signal is due, so the attempt is taken again.
+                   So it is when a stream's send signals: Linux's
+                   sock_def_readable wakes the reader before it looks at
+                   SOCKWQ_ASYNC_WAITDATA (sk_wake_async), so a send that
+                   came before the reader slept, or whose reader ran at
+                   once and cleared it, signals, and one whose reader
+                   waited and had not yet run does not. Up to ten
+                   attempts give the second on Linux, so the emulator
+                   must give it too. */
                 struct pollfd ready = {sv[1], POLLIN | POLLRDHUP, 0};
                 int early = poll(&ready, 1, 0) != 0;
                 long r = recv(sv[1], buf, sizeof buf, 0);
@@ -7472,7 +7480,11 @@ int main(int argc, char **argv) {
                 snprintf(name, sizeof name, "%s-%s=%ld", type_names[t], actions[a], r);
                 if (a == 2) waitpid(forked, &status, 0);
                 else if (read(acted[0], buf, 1) != 1) return 72;
-                if (early && ++tries < 10) io_count(0);
+                sigset_t pending;
+                sigpending(&pending);
+                int again = (early || (types[t] == SOCK_STREAM && a == 0 && sigismember(&pending, IO_RT)))
+                            && ++tries < 10;
+                if (again) io_count(0);
                 else if (types[t] == SOCK_STREAM && a == 1) io_at_most_one(name, sv[1], "in", POLL_IN, 0x41);
                 else if (types[t] == SOCK_STREAM && a == 2) io_at_most_one(name, sv[1], "hang-up", POLL_HUP, 0x18);
                 else io_taken(name);
@@ -7484,7 +7496,7 @@ int main(int argc, char **argv) {
                 if (status) return 73;
                 if (a != 2) close(sv[0]);
                 close(go[0]); close(go[1]); close(acted[0]); close(acted[1]);
-                if (early && tries < 10) a--;
+                if (again) a--;
                 else tries = 0;
             }
         }

@@ -289,14 +289,13 @@ pub(crate) fn validate(address: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 /// The socket of `kind` a valid `address` names, as Linux's
-/// `unix_find_other`: one bound to that abstract name (`ECONNREFUSED` where
-/// none is), or to the socket file a path leads to, as `unix_find_bsd`
-/// looks it up: the path's error, `ECONNREFUSED` for a file that is no
-/// socket's or one whose socket has gone, `EPROTOTYPE` for a socket of
-/// another type.
-/// An abstract name is looked for among `names`, those of the namespace
-/// the looking socket was made in, as Linux's `unix_find_abstract` looks in
-/// `sock_net`.
+/// `unix_find_other`: one bound to that abstract name among `names`, those
+/// of the network namespace the looking socket was made in, as
+/// `unix_find_abstract` looks in `sock_net` (`ECONNREFUSED` where none is),
+/// or to the socket file a path leads to, in any namespace, as
+/// `unix_find_bsd` looks it up: the path's error, `ECONNREFUSED` for a file
+/// that is no socket's or one whose socket has gone, `EPROTOTYPE` for a
+/// socket of another type.
 pub(crate) fn find(
     c: &Context<'_>,
     names: &Names,
@@ -397,11 +396,11 @@ impl UnixSocket {
     fn datagram(&self) -> bool {
         self.end.kind() == SOCK_DGRAM
     }
-    /// The name it is bound to, which what it sends carries.
     /// The abstract names of the network namespace it was made in.
     pub(crate) fn names(&self) -> Arc<Names> {
         Arc::clone(&self.names)
     }
+    /// The name it is bound to, which what it sends carries.
     pub(crate) fn address(&self) -> Address {
         Arc::clone(&self.name)
     }

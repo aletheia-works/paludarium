@@ -914,11 +914,11 @@ impl InetSocket {
             signals: Arc::default(),
         })
     }
-    /// `F_GETOWN` and `F_GETSIG`.
     /// The network it was made in.
     pub(crate) fn network(&self) -> &Network {
         &self.network
     }
+    /// `F_GETOWN` and `F_GETSIG`.
     pub(crate) fn file_owner(&self) -> FileOwner {
         *self
             .signals

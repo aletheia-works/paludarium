@@ -4520,7 +4520,11 @@ static int rseq_case(void) {
     long unregistered = syscall(SYS_membarrier, 1 << 7, 0, 0);
     printf("membarrier unregistered=%ld errno=%d", unregistered, errno);
     printf(" register=%ld", (long)syscall(SYS_membarrier, 1 << 8, 0, 0));
-    printf(" far-cpu=%ld\n", (long)syscall(SYS_membarrier, 1 << 7, 1, 100000));
+    printf(" far-cpu=%ld", (long)syscall(SYS_membarrier, 1 << 7, 1, 100000));
+    /* A negative CPU with the flag is every CPU, as without the flag. */
+    errno = 0;
+    long negative = syscall(SYS_membarrier, 1 << 7, 1, -1);
+    printf(" negative-cpu=%ld errno=%d\n", negative, errno);
     pthread_t other;
     if (pthread_create(&other, 0, rseq_other_thread, 0)) return 11;
     while (!rseq_other_ready) {}

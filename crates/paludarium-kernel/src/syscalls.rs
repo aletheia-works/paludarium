@@ -2855,6 +2855,8 @@ fn sys_membarrier(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             if state.load(Ordering::SeqCst) & RSEQ_READY == 0 {
                 return err(Errno::EPERM);
             }
+            // A negative CPU is every CPU, as Linux's
+            // membarrier_private_expedited takes it.
             let cpu = (flags & FLAG_CPU != 0).then_some(a[2] as u32 as i32);
             let cpus = &c.processes.cpus;
             if let Some(cpu) = cpu.filter(|&cpu| cpu >= 0)

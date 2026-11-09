@@ -3960,10 +3960,23 @@ static void *membarrier_thread(void *unused) {
     return NULL;
 }
 static volatile int unshare_release, unshare_child_done;
+static volatile int unshare_waiter_tid;
 static void *unshare_waiter(void *unused) {
     (void)unused;
+    unshare_waiter_tid = syscall(SYS_gettid);
     while (!unshare_release) sched_yield();
     return NULL;
+}
+/* Waits until /proc/self/task no longer lists a joined thread. pthread_join
+   returns when the thread clears its TID, before Linux's release_task takes
+   it out of the thread group and drops its share of the signal handlers,
+   which unshare checks; paludarium likewise wakes the joiner before the
+   thread leaves its group. */
+static void unshare_wait_gone(int tid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d", tid);
+    struct stat st;
+    while (stat(path, &st) == 0) sched_yield();
 }
 /* A thread that unshares its descriptor table and its directory, then
    closes, moves and changes them, which the process does not see. */
@@ -4311,6 +4324,7 @@ int main(int argc, char **argv) {
         }
         unshare_release = 1;
         pthread_join(thread, NULL);
+        unshare_wait_gone(unshare_waiter_tid);
         /* Memory, and then dispositions too, shared with a CLONE_VM child,
            which tries to unshare them while the parent waits. */
         char *stack = mmap(NULL, 65536, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);

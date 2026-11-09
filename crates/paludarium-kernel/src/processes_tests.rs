@@ -1317,6 +1317,121 @@ mod exec {
         image[header + 40..header + 48].copy_from_slice(&size);
         image
     }
+    /// Opens `path` with `flags` in `k`, as `open(2)` does.
+    fn open(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, path: &[u8], flags: u64) -> u64 {
+        let mut name = path.to_vec();
+        name.push(0);
+        m.write(GuestAddr(DATA + 0x200), &name).unwrap();
+        syscall(k, t, m, 2, [DATA + 0x200, flags, 0o755, 0, 0, 0])
+    }
+    #[test]
+    fn exec_and_writers_refuse_each_other_with_etxtbsy() {
+        let mut linker = paludarium_loader::testing::tiny_exec(&[0x90], b"");
+        linker[16] = 3;
+        let via_ld = asks_for(b"/ld\0");
+        let (mut k, mut t, m) = with_scripts(&[
+            ("/ok", &via_ld),
+            ("/ld", &linker),
+            ("/script", b"#!/child\n"),
+        ]);
+        let busy = Errno(26).to_syscall_return();
+        let close = |k: &mut Kernel, t: &mut Thread, fd: u64| {
+            assert_eq!(syscall(k, t, &m, 3, [fd, 0, 0, 0, 0, 0]), 0);
+        };
+        // A description open for writing refuses the exec of its file, of a
+        // script whose interpreter it is, and of a program whose ELF
+        // interpreter it is (`do_open_execat`, `open_exec`).
+        for (written, runs) in [
+            (&b"/child"[..], &b"/child"[..]),
+            (b"/child", b"/script"),
+            (b"/script", b"/script"),
+            (b"/ld", b"/ok"),
+        ] {
+            let fd = open(&mut k, &mut t, &m, written, 2);
+            assert!(fd < 1024, "{fd:#x}");
+            assert_eq!(run(&mut k, &mut t, &m, runs), busy);
+            close(&mut k, &mut t, fd);
+        }
+        // A running program's file is not opened for writing, truncated by
+        // an open, or by `truncate`; read, it is.
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(run(&mut c, &mut ct, &cm, b"/child"), 0);
+        assert_eq!(open(&mut k, &mut t, &m, b"/child", 1), busy);
+        assert_eq!(open(&mut k, &mut t, &m, b"/child", 0o1000), busy);
+        m.write(GuestAddr(DATA + 0x200), b"/child\0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 76, [DATA + 0x200, 0, 0, 0, 0, 0]),
+            busy
+        );
+        let fd = open(&mut k, &mut t, &m, b"/child", 0);
+        assert!(fd < 1024, "{fd:#x}");
+        close(&mut k, &mut t, fd);
+        // An ELF interpreter and a script are given back once loaded.
+        let (mut l, mut lt, lm) = fork(&mut k, &mut t, &m);
+        assert_eq!(run(&mut l, &mut lt, &lm, b"/ok"), 0);
+        assert_eq!(open(&mut k, &mut t, &m, b"/ok", 1), busy);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        assert_eq!(run(&mut s, &mut st, &sm, b"/script"), 0);
+        for path in [&b"/ld"[..], b"/script"] {
+            let fd = open(&mut k, &mut t, &m, path, 1);
+            assert!(fd < 1024, "{fd:#x}");
+            close(&mut k, &mut t, fd);
+        }
+        // A fork runs the program too, until the last of them ends.
+        let (mut g, gt, gm) = fork(&mut c, &mut ct, &cm);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        finish(&mut s, &st, &sm, ExitStatus::Exited(0));
+        assert_eq!(open(&mut k, &mut t, &m, b"/child", 1), busy);
+        finish(&mut g, &gt, &gm, ExitStatus::Exited(0));
+        let fd = open(&mut k, &mut t, &m, b"/child", 1);
+        assert!(fd < 1024, "{fd:#x}");
+        close(&mut k, &mut t, fd);
+        finish(&mut l, &lt, &lm, ExitStatus::Exited(0));
+    }
+    #[test]
+    fn a_memfds_own_descriptor_is_no_writer_but_one_opened_again_is() {
+        let (mut k, mut t, m) = exec_setup();
+        let image = paludarium_loader::testing::tiny_exec(&[0x90], b"");
+        m.write(GuestAddr(DATA + 0x100), b"m\0").unwrap();
+        let fd = syscall(&mut k, &mut t, &m, 319, [DATA + 0x100, 0, 0, 0, 0, 0]);
+        assert!(fd < 1024, "{fd:#x}");
+        let len = image.len() as u64;
+        let buffer = DATA + 16 * PAGE_SIZE;
+        m.map_shared(
+            Some(GuestAddr(buffer)),
+            len.next_multiple_of(PAGE_SIZE),
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        m.write(GuestAddr(buffer), &image).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 1, [fd, buffer, len, 0, 0, 0]),
+            len
+        );
+        // `memfd_create`'s descriptor is open for writing, yet runs.
+        m.write(GuestAddr(DATA + 0x100), b"\0").unwrap();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let at = [fd, DATA + 0x100, 0, 0, 0x1000, 0];
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 322, at), 0);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        // Opened again for writing, it is a writer (`do_dentry_open`).
+        let again = open(
+            &mut k,
+            &mut t,
+            &m,
+            format!("/proc/self/fd/{fd}").as_bytes(),
+            2,
+        );
+        assert!(again < 1024, "{again:#x}");
+        m.write(GuestAddr(DATA + 0x100), b"\0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 322, at),
+            Errno(26).to_syscall_return()
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 3, [again, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 322, at), 0);
+    }
     #[test]
     fn exec_checks_the_interpreter_with_the_callers_permissions() {
         // Position independent, so it does not collide with the program.

@@ -2654,6 +2654,7 @@ impl Kernel {
             crate::files::Program::Path(path) => {
                 let (program, readable) =
                     crate::permissions::exec(&self.files, creds, dir, &raw, &path)?;
+                drop(deny_writes(&self.files, &path)?);
                 ((named.clone(), path.clone(), path), program, readable, None)
             }
             crate::files::Program::File {
@@ -2689,11 +2690,18 @@ impl Kernel {
                         crate::landlock::READ_FILE | crate::landlock::EXECUTE,
                     )?;
                 }
+                // A memfd is on a device of its own; a removed file still on
+                // its mount's.
+                let device = match &removed {
+                    Some(path) => crate::page_cache::mount_device(&self.files.fs.mounts(), path),
+                    None => crate::memfd::DEVICE,
+                };
+                let denied = self.files.caches.deny_write_access((device, stat.inode))?;
                 (
                     (Vec::new(), Vec::new(), entry),
                     Some(stat),
                     readable,
-                    Some((file, name)),
+                    Some((file, name, denied)),
                 )
             }
         };
@@ -2702,7 +2710,7 @@ impl Kernel {
         let (named_first, first, comm) = start;
         let mut path = comm;
         let image = match image {
-            Some((file, name)) => {
+            Some((file, name, denied)) => {
                 let mut head = [0; SCRIPT_HEAD];
                 read_from(&*file, &mut head)?;
                 match script_interpreter(&head)? {
@@ -2715,7 +2723,7 @@ impl Kernel {
                         if file.stat()?.size > limit {
                             return Err(Errno::ENOMEM);
                         }
-                        Some((read_whole(&*file, limit)?, name))
+                        Some((read_whole(&*file, limit)?, name, denied))
                     }
                     // A script reads itself by its name, which a descriptor
                     // closed on exec leaves to nothing
@@ -2753,6 +2761,10 @@ impl Kernel {
                             &mut budget,
                         )?;
                         path = loaded.clone();
+                        // The script's own denial ends once its interpreter
+                        // takes over (`exec_binprm`).
+                        drop(denied);
+                        let exe = deny_writes(&self.files, &loaded)?;
                         return self.exec_image(
                             thread,
                             mem,
@@ -2761,23 +2773,28 @@ impl Kernel {
                             readable,
                             (argv, envp),
                             None,
+                            exe,
                         );
                     }
                 }
             }
             None => None,
         };
-        let (loaded, program) = match image {
-            Some(_) => (Vec::new(), program),
-            None => follow_scripts(
-                &self.files,
-                creds,
-                (named_first, first),
-                program,
-                &mut readable,
-                &mut argv,
-                &mut budget,
-            )?,
+        let (loaded, program, image, exe) = match image {
+            Some((bytes, name, denied)) => (Vec::new(), program, Some((bytes, name)), Some(denied)),
+            None => {
+                let (loaded, program) = follow_scripts(
+                    &self.files,
+                    creds,
+                    (named_first, first),
+                    program,
+                    &mut readable,
+                    &mut argv,
+                    &mut budget,
+                )?;
+                let exe = deny_writes(&self.files, &loaded)?;
+                (loaded, program, None, exe)
+            }
         };
         self.exec_image(
             thread,
@@ -2787,12 +2804,14 @@ impl Kernel {
             readable,
             (argv, envp),
             image,
+            exe,
         )
     }
     /// The rest of exec, once the program is known: `raw` is its name,
     /// `path` names the process, and `loaded` is what loads, unless `image`
     /// holds the bytes of a file no path names and what `/proc/self/exe`
-    /// reads of it.
+    /// reads of it. `exe` denies writes to the program's file, which the
+    /// process keeps while it runs it (Linux's `exe_file`).
     #[allow(clippy::too_many_arguments)]
     fn exec_image(
         &mut self,
@@ -2803,6 +2822,7 @@ impl Kernel {
         mut readable: bool,
         (argv, envp): (Vec<Vec<u8>>, Vec<Vec<u8>>),
         held: Option<(Vec<u8>, Vec<u8>)>,
+        exe: Option<crate::page_cache::WriteAccess>,
     ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         let mut random = [0; 16];
         self.host
@@ -2858,6 +2878,8 @@ impl Kernel {
                 name,
                 &path,
             )?;
+            // Denied only while it loads, as `load_elf_binary` gives it back.
+            drop(deny_writes(&self.files, &path)?);
             readable &= may_read;
             Ok(path)
         };
@@ -2931,6 +2953,7 @@ impl Kernel {
             Some((_, name)) => name,
             None => crate::files::resolved(&self.files, &loaded).unwrap_or(loaded),
         });
+        self.group.set_exe_file(exe.map(Arc::new));
         let ignored = thread
             .state
             .signal_actions
@@ -3087,6 +3110,7 @@ pub(crate) fn follow_scripts(
         let may_read;
         (program, may_read) =
             crate::permissions::exec(files, credentials, -100i64 as u64, &interpreter, &loaded)?;
+        drop(deny_writes(files, &loaded)?);
         *readable = may_read;
         named = interpreter;
         // `exec_binprm` takes six handlers at most.
@@ -3095,6 +3119,25 @@ pub(crate) fn follow_scripts(
         }
     }
     Ok((loaded, program))
+}
+/// Write access to the regular file `path` names denied (ETXTBSY while a
+/// description has it open for writing), as Linux's `do_open_execat` denies
+/// it to each file exec opens; none for another file, which fails later.
+pub(crate) fn deny_writes(
+    files: &crate::files::Files,
+    path: &[u8],
+) -> Result<Option<crate::page_cache::WriteAccess>, Errno> {
+    let Ok(stat) = files.fs.metadata(path, true) else {
+        return Ok(None);
+    };
+    if stat.mode & 0o170000 != 0o100000 {
+        return Ok(None);
+    }
+    let key = (
+        crate::page_cache::mount_device(&files.fs.mounts(), path),
+        stat.inode,
+    );
+    files.caches.deny_write_access(key).map(Some)
 }
 /// All of `file`, read from its start, for exec of a file only a
 /// descriptor holds.

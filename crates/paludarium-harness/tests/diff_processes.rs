@@ -393,6 +393,7 @@ mod linux {
         processes_offset => ("offset","process"),
         vfork_exec => ("vfork-exec","process"),
         processes_execveat => ("execveat","process"),
+        processes_etxtbsy => ("etxtbsy","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

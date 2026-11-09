@@ -1023,6 +1023,44 @@ static void execveat_child(const char *label, int dir, const char *path, int fla
     }
     printf("%s: status=%d\n", label, reaped(pid));
 }
+/* The pipe whose write end keeps an etxtbsy-run child running. */
+static int etxtbsy_release[2];
+/* Starts a child that runs `path` (execveat on `dir` with `flags`) in the
+   etxtbsy-run mode, and returns once that program runs. */
+static pid_t etxtbsy_start(int dir, const char *path, int flags) {
+    int ready[2];
+    if (pipe(etxtbsy_release) || pipe(ready)) return -1;
+    fflush(stdout);
+    pid_t pid = child();
+    if (pid == 0) {
+        dup2(etxtbsy_release[0], 10);
+        dup2(ready[1], 11);
+        close(etxtbsy_release[0]);
+        close(etxtbsy_release[1]);
+        close(ready[0]);
+        close(ready[1]);
+        char *args[] = {"x", "etxtbsy-run", "x", NULL};
+        execveat_call(dir, path, args, flags);
+        _exit(9);
+    }
+    close(etxtbsy_release[0]);
+    close(ready[1]);
+    char c;
+    result("started", read(ready[0], &c, 1));
+    close(ready[0]);
+    return pid;
+}
+static void etxtbsy_stop(pid_t pid) {
+    close(etxtbsy_release[1]);
+    result("stopped", reaped(pid));
+}
+/* Opens `path` with `flags`, reporting the outcome, and closes it. */
+static void etxtbsy_open(const char *name, const char *path, int flags) {
+    errno = 0;
+    int fd = open(path, flags | O_CLOEXEC);
+    printf("%s=%d errno=%d\n", name, fd >= 0, fd < 0 ? errno : 0);
+    if (fd >= 0) close(fd);
+}
 /* The value of `field` in /proc/self/status, read through a /proc/self
    descriptor as procfs readers do. */
 static int status_field(const char *field, char *value, size_t size) {
@@ -12769,6 +12807,79 @@ int main(int argc, char **argv) {
         unlink("theirs");
         unlink("prog");
         if (chdir("/") || rmdir(dir)) return 89;
+        return 0;
+    }
+    if (!strcmp(mode, "etxtbsy-run")) {
+        /* Says it runs, then runs until its parent closes the pipe. */
+        char c;
+        if (write(11, "r", 1) != 1) return 8;
+        while (read(10, &c, 1) > 0) {}
+        return 0;
+    }
+    if (!strcmp(mode, "etxtbsy")) {
+        static const char prog[] = "/tmp/paludarium-etxtbsy";
+        static const char script[] = "/tmp/paludarium-etxtbsy.sh";
+        static const char line[] = "#!/tmp/paludarium-etxtbsy etxtbsy-run\n";
+        char *args[] = {"x", "etxtbsy-run", "x", NULL}, *none[] = {NULL};
+        unlink(prog);
+        unlink(script);
+        /* A program, and a script it interprets. */
+        int w = open(prog, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+        result("copied", copy_into(self, w));
+        int sw = open(script, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+        result("script", write(sw, line, sizeof line - 1));
+        close(sw);
+        /* A description open for writing refuses exec of its file, of a
+           script it interprets, and of the script itself (ETXTBSY). */
+        errno = 0;
+        outcome("writer-exec", execve(prog, args, none));
+        errno = 0;
+        outcome("writer-interpreter", execve(script, args, none));
+        close(w);
+        sw = open(script, O_WRONLY | O_CLOEXEC);
+        errno = 0;
+        outcome("writer-script", execve(script, args, none));
+        close(sw);
+        /* A running program's file: not opened for writing nor truncated,
+           read, and writable again once the program ends. */
+        pid_t pid = etxtbsy_start(AT_FDCWD, prog, 0);
+        etxtbsy_open("running-write", prog, O_WRONLY);
+        etxtbsy_open("running-rdwr", prog, O_RDWR);
+        etxtbsy_open("running-trunc", prog, O_RDONLY | O_TRUNC);
+        errno = 0;
+        outcome("running-truncate", truncate(prog, 0));
+        etxtbsy_open("running-read", prog, O_RDONLY);
+        struct stat st;
+        result("size-kept", stat(prog, &st) == 0 && st.st_size > 0);
+        etxtbsy_stop(pid);
+        etxtbsy_open("after-exit", prog, O_WRONLY);
+        /* A running script: its interpreter is the program, and the script
+           itself is not held. */
+        pid = etxtbsy_start(AT_FDCWD, script, 0);
+        etxtbsy_open("script-write", script, O_WRONLY);
+        etxtbsy_open("interpreter-write", prog, O_WRONLY);
+        etxtbsy_stop(pid);
+        /* A memfd: its own descriptor is no writer, so it runs, and writes
+           through it go on; opened again for writing, it is refused while
+           the program runs, and refuses exec while open. */
+        int m = memfd_create("etxtbsy", 0);
+        result("memfd-copied", copy_into(self, m));
+        char again[64];
+        snprintf(again, sizeof again, "/proc/self/fd/%d", m);
+        pid = etxtbsy_start(m, "", AT_EMPTY_PATH);
+        struct stat ms;
+        fstat(m, &ms);
+        result("memfd-own-write", pwrite(m, "", 1, ms.st_size));
+        etxtbsy_open("memfd-reopen", again, O_RDWR);
+        etxtbsy_stop(pid);
+        int r = open(again, O_RDWR | O_CLOEXEC);
+        result("memfd-reopened", r >= 0);
+        errno = 0;
+        outcome("memfd-writer-exec", execveat_call(m, "", args, AT_EMPTY_PATH));
+        close(r);
+        close(m);
+        unlink(prog);
+        unlink(script);
         return 0;
     }
     if (!strcmp(mode, "execveat-run")) {

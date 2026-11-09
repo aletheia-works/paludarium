@@ -757,6 +757,17 @@ kernel.
   was, as from its dentry on Linux; a memfd is in no hierarchy.
   `AT_EXECVE_CHECK` (Linux 6.14) is
   `EINVAL`.
+- A program's file and writes to it exclude each other, as Linux's
+  `i_writecount` does (`ETXTBSY`). Exec refuses a file that a description
+  has open for writing: the program, each script and its interpreter, and an
+  ELF program's interpreter. While a process runs a program, and a fork of
+  it does, the file does not open for writing, `O_TRUNC` and `truncate` do
+  not empty it, and it may be written again once the last of them ends or
+  execs another. A script and an ELF interpreter are held only while they
+  load. A memfd's own descriptor from `memfd_create` is no writer, so it runs
+  and is written through as Linux allows, while opening it again for writing
+  through `/proc/self/fd` counts. Only the emulator's own processes are
+  counted: a host program writing a file in a mounted directory is not.
 - `chmod` and `utimensat` work in the in-memory filesystem and in mounted
   host directories; on a Windows host, `chmod` only sets or clears the
   read-only attribute. `fchmodat2` (Linux 6.6) takes `AT_SYMLINK_NOFOLLOW`,

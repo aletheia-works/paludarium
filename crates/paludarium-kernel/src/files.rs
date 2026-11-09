@@ -4077,11 +4077,14 @@ fn reopen(
         .as_any()
         .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
     {
+        // An open for writing counts as a writer, as through
+        // `do_dentry_open`, unlike `memfd_create`'s own descriptor.
         let file = crate::page_cache::CoherentFile::with_device(
             memfd.reopen(flags)?,
             Arc::clone(&c.files.caches),
             crate::memfd::DEVICE,
-        );
+        )
+        .writing(flags)?;
         return Ok((Arc::new(file), Vec::new()));
     }
     let is_pidfd = d

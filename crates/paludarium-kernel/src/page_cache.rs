@@ -23,6 +23,8 @@ pub(crate) type Key = (u64, u64);
 const REGULAR: u32 = 0o100000;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
+const O_PATH: u32 = 0o10000000;
+const ETXTBSY: Errno = Errno(26);
 
 /// The page caches of one machine, by file.
 #[derive(Default)]
@@ -31,6 +33,35 @@ pub(crate) struct PageCaches {
     /// handles one load.
     live: AtomicUsize,
     files: Mutex<HashMap<Key, Weak<FileCache>>>,
+    /// Linux's `i_writecount` of each file that has one: above zero, how
+    /// many descriptions have it open for writing; below, how many programs
+    /// run from it (or are being loaded from it).
+    writes: Mutex<HashMap<Key, i64>>,
+}
+
+/// One count of [`PageCaches`]' `writes`, given back when dropped: write
+/// access a description holds (Linux's `get_write_access`), or the denial
+/// of it a running program holds (`deny_write_access`).
+pub(crate) struct WriteAccess {
+    caches: Arc<PageCaches>,
+    key: Key,
+    change: i64,
+}
+
+impl Drop for WriteAccess {
+    fn drop(&mut self) {
+        let mut writes = self
+            .caches
+            .writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = writes.get_mut(&self.key) {
+            *count -= self.change;
+            if *count == 0 {
+                writes.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl PageCaches {
@@ -62,6 +93,30 @@ impl PageCaches {
         });
         files.insert(key, Arc::downgrade(&cache));
         cache
+    }
+    /// Write access to `key`, which a program running from it refuses
+    /// (ETXTBSY), as Linux's `get_write_access`.
+    pub(crate) fn write_access(self: &Arc<Self>, key: Key) -> Result<WriteAccess, Errno> {
+        self.count(key, 1)
+    }
+    /// Write access to `key` denied while the guard lives, which a
+    /// description open for writing refuses (ETXTBSY), as Linux's
+    /// `deny_write_access` of a program it executes.
+    pub(crate) fn deny_write_access(self: &Arc<Self>, key: Key) -> Result<WriteAccess, Errno> {
+        self.count(key, -1)
+    }
+    fn count(self: &Arc<Self>, key: Key, change: i64) -> Result<WriteAccess, Errno> {
+        let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = writes.entry(key).or_insert(0);
+        if *count * change < 0 {
+            return Err(ETXTBSY);
+        }
+        *count += change;
+        Ok(WriteAccess {
+            caches: Arc::clone(self),
+            key,
+            change,
+        })
     }
     /// The cache of `key`, if the file has one.
     pub(crate) fn find(&self, key: Key) -> Option<Arc<FileCache>> {
@@ -338,6 +393,9 @@ pub(crate) struct CoherentFile {
     /// The file's key, found on first use, or none for a file that is not
     /// regular and so cannot be mapped shared.
     key: OnceLock<Option<Key>>,
+    /// The write access a description open for writing holds, which a
+    /// program run from the file refuses while it lasts.
+    write: Option<WriteAccess>,
 }
 
 impl CoherentFile {
@@ -352,21 +410,39 @@ impl CoherentFile {
             caches,
             device: Device::Fixed(device),
             key: OnceLock::new(),
+            write: None,
         }
     }
-    fn cache(&self) -> Option<Arc<FileCache>> {
-        if !self.caches.any() {
-            return None;
-        }
-        let key = self.key.get_or_init(|| {
+    /// The file's key, as `stat` names it, or none for a file that is not
+    /// regular.
+    pub(crate) fn key(&self) -> Option<Key> {
+        *self.key.get_or_init(|| {
             let stat = self.inner.stat().ok()?;
             let device = match &self.device {
                 Device::Mount(fs, path) => mount_device(&fs.mounts(), path),
                 Device::Fixed(device) => *device,
             };
             (stat.mode & 0o170000 == REGULAR).then_some((device, stat.inode))
-        });
-        self.caches.find((*key)?)
+        })
+    }
+    /// This handle, holding write access to its file when `flags` open it
+    /// for writing, as Linux's `do_dentry_open` takes it: refused (ETXTBSY)
+    /// while a program runs from the file. A memfd's own descriptor has none,
+    /// as `memfd_create` makes its file without `do_dentry_open`.
+    pub(crate) fn writing(mut self, flags: u32) -> Result<Self, Errno> {
+        if flags & O_PATH == 0
+            && flags & 3 != 0
+            && let Some(key) = self.key()
+        {
+            self.write = Some(self.caches.write_access(key)?);
+        }
+        Ok(self)
+    }
+    fn cache(&self) -> Option<Arc<FileCache>> {
+        if !self.caches.any() {
+            return None;
+        }
+        self.caches.find(self.key()?)
     }
     /// Writes the cache back before the file is read. A page that cannot be
     /// written stays dirty and the read goes on, as a Linux read does not
@@ -397,7 +473,9 @@ impl FileHandle for CoherentFile {
                 .get()
                 .copied()
                 .map_or_else(OnceLock::new, OnceLock::from),
-        };
+            write: None,
+        }
+        .writing(flags)?;
         if flags & O_TRUNC != 0
             && let Some(cache) = file.cache()
         {
@@ -524,12 +602,25 @@ impl FileSystem for CoherentFs {
 
 impl HostFs for CoherentFs {
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        // A running program's file is not truncated: `handle_truncate`
+        // takes write access first (ETXTBSY), whatever the access mode.
+        const O_NOFOLLOW: u32 = 0o400000;
+        if flags & O_TRUNC != 0
+            && flags & O_PATH == 0
+            && let Ok(stat) = self.inner.metadata(path, flags & O_NOFOLLOW == 0)
+            && stat.mode & 0o170000 == REGULAR
+        {
+            let key = (mount_device(&self.inner.mounts(), path), stat.inode);
+            drop(self.caches.write_access(key)?);
+        }
         let file = CoherentFile {
             inner: self.inner.open(path, flags, mode)?,
             caches: Arc::clone(&self.caches),
             device: Device::Mount(Arc::clone(&self.inner), path.to_vec()),
             key: OnceLock::new(),
-        };
+            write: None,
+        }
+        .writing(flags)?;
         if flags & O_TRUNC != 0
             && let Some(cache) = file.cache()
         {

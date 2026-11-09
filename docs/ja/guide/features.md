@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ） |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
@@ -526,8 +526,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   何も残らなければ `EINVAL` です。その後の `sched_getaffinity` はそのマスクを返し、新しい
   スレッドとプロセスはそれを継ぎます。ただし、ホストはそのスレッドをどの CPU でも動かします。
   どちらも、root と同じくほかのプロセスのスレッドも見つけ、その ID の生きているスレッドが
-  なければ `ESRCH` です。`getcpu` は、スレッドのマスクが許すいちばん小さい番号の CPU と、
-  NUMA ノード 0 を返します。
+  なければ `ESRCH` です。`getcpu` は NUMA ノード 0 と、`rseq` を登録したスレッドなら
+  その仮想 CPU を返します。ほかのスレッドには、マスクが許すいちばん小さい番号の CPU を返します。
 - Linux と同じく、スレッドごとにスケジューリングの属性があります。ポリシー
   （`SCHED_OTHER`、`SCHED_BATCH`、`SCHED_IDLE`、`SCHED_EXT`、`SCHED_FIFO`、`SCHED_RR`、
   `SCHED_DEADLINE`）、リアルタイムの優先度、`SCHED_RESET_ON_FORK`、デッドライン
@@ -588,6 +588,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、アドレス空間のすべてのスレッドにかかります。ほとんどのアクセスはロックを取らない
   ので、空間のロックを取り、スレッドの TLB のエポックを進めます。これで途中の書き込みを
   待ち、各スレッドの次のアクセスをロックへ回します。
+  `MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ` は、さらに空間のほかのスレッドの `rseq` の
+  クリティカルセクションを中止させます（`MEMBARRIER_CMD_FLAG_CPU` ならその CPU のスレッドだけ、
+  マシンにない CPU ならどれも）。ゲストのコードを実行していたスレッドがそれぞれ止まってから
+  戻ります。
+- `rseq` は、Linux と同じ検査とエラー（`EINVAL`、`EPERM`、`EBUSY`、`EFAULT`）でスレッドの
+  領域を登録し、今の Linux と同じく登録のときに領域の `rseq_cs` を消します。補助ベクターは
+  今の Linux と同じく `AT_RSEQ_FEATURE_SIZE` に 28、`AT_RSEQ_ALIGN` に 64 を与えるので、
+  32 バイトより長い領域は 64 にそろえます。`rseq` を登録したスレッドは、
+  マシンが報告する CPU の数だけある仮想 CPU の一つで、CPU マスクの範囲で動きます。そこでは同時に
+  ほかのそうしたスレッドは動きません。領域には、その CPU、NUMA ノード 0、並行 ID（`mm_cid`）を
+  示します。並行 ID は CPU の数より小さく、アドレス空間のほかの動いているスレッドが持たない
+  ものです。スレッドはゲストのコードを実行する前に CPU を取り、システムコール、フォールト、
+  バジェットの終わりのたびに手放します。別の CPU に戻ったとき、ほかのスレッドが使ったあとの
+  自分の CPU に戻ったとき、`membarrier` のあと、シグナルを届けるときには、中にいる
+  クリティカルセクションは中止ハンドラーから続きます。Linux のプリエンプト、移動、シグナルの
+  あとと同じです。今の Linux と同じく、スレッドがセクションの外にいる間は、カーネルは
+  セクションの場所だけを読んで領域の `rseq_cs` を消します。ディスクリプターのバージョンと
+  フラグは読みません。セクションの中のスレッドが使えない中止ハンドラー（セクションの中にある
+  もの、前にシグネチャーのないもの）、ユーザー空間の外にあるセクション、カーネルが書けない領域
+  では、スレッドは `SIGSEGV` で終わります。CPU を待つスレッドがあると、自分の CPU を 4 ms 使った
+  スレッドは先に譲ります。fork は登録を保ち、新しいスレッド、`CLONE_VM` の子、exec は登録なしで
+  始まります。
 - `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
   `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
   `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に

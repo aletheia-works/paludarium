@@ -4338,6 +4338,256 @@ static long shm_call(long number, long a, long b, long c) {
     return syscall(number, a, b, c);
 }
 
+/* rseq: registration, the abort of a critical section that a signal or
+ * membarrier interrupts, and the descriptors Linux does not accept.
+ * Each section spins until SIGUSR1 sets the flag: rseq_spin returns 1 when
+ * the kernel sent it to the abort handler, 0 when it committed. Another
+ * thread sends the signal once the spinning one is ready, with no timer,
+ * so that no clock has to move. */
+__asm__(".text\n"
+        ".globl rseq_spin\n"
+        "rseq_spin:\n"
+        "    movq %rcx, (%rdi)\n"
+        ".globl rseq_spin_start\n"
+        "rseq_spin_start:\n"
+        "    movl $1, (%rsi)\n"
+        "1:  cmpl $0, (%rdx)\n"
+        "    je 1b\n"
+        ".globl rseq_spin_end\n"
+        "rseq_spin_end:\n"
+        "    xorl %eax, %eax\n"
+        "    ret\n"
+        "    .long 0x53053053\n"
+        ".globl rseq_spin_abort\n"
+        "rseq_spin_abort:\n"
+        "    movl $1, %eax\n"
+        "    ret\n"
+        ".globl rseq_unsigned\n"
+        "rseq_unsigned:\n"
+        "    leaq rseq_unsigned_cs(%rip), %rax\n"
+        "    movq %rax, (%rdi)\n"
+        "rseq_unsigned_start:\n"
+        "    movl $1, (%rsi)\n"
+        "1:  cmpl $0, (%rdx)\n"
+        "    je 1b\n"
+        "rseq_unsigned_end:\n"
+        "    xorl %eax, %eax\n"
+        "    ret\n"
+        "    .long 0x12345678\n"
+        "rseq_unsigned_abort:\n"
+        "    movl $1, %eax\n"
+        "    ret\n"
+        ".data\n"
+        ".balign 32\n"
+        ".globl rseq_spin_cs\n"
+        "rseq_spin_cs:\n"
+        "    .long 0, 0\n"
+        "    .quad rseq_spin_start, rseq_spin_end - rseq_spin_start, rseq_spin_abort\n"
+        ".balign 32\n"
+        "rseq_unsigned_cs:\n"
+        "    .long 0, 0\n"
+        "    .quad rseq_unsigned_start, rseq_unsigned_end - rseq_unsigned_start, rseq_unsigned_abort\n"
+        ".text\n");
+int rseq_spin(volatile uint64_t *cs, volatile int *ready, volatile int *flag, const void *descriptor);
+int rseq_unsigned(volatile uint64_t *cs, volatile int *ready, volatile int *flag);
+extern char rseq_spin_start[], rseq_spin_end[], rseq_spin_abort[], rseq_spin_cs[];
+
+struct rseq_area {
+    uint32_t cpu_id_start, cpu_id;
+    uint64_t rseq_cs;
+    uint32_t flags, node_id, mm_cid, pad;
+} __attribute__((aligned(32)));
+struct rseq_desc {
+    uint32_t version, flags;
+    uint64_t start, length, abort;
+} __attribute__((aligned(32)));
+
+#define RSEQ_SIGNATURE 0x53053053
+static volatile int rseq_flag, rseq_ready;
+/* Volatile: the kernel reads and writes them behind the compiler's back. */
+static volatile struct rseq_area rseq_main, rseq_other;
+static _Alignas(32) char rseq_space[128];
+
+static void rseq_alarm(int sig) {
+    (void)sig;
+    rseq_flag = 1;
+}
+
+static long rseq_call(volatile void *area, unsigned length, int flags, unsigned signature) {
+    errno = 0;
+    long r = syscall(334, (void *)area, length, flags, signature);
+    return r < 0 ? -errno : r;
+}
+
+/* Sends the calling thread SIGUSR1, which sets the flag, from another
+ * thread once `ready` is set. */
+struct rseq_sender {
+    volatile int *ready;
+    pid_t pid, tid;
+    pthread_t thread;
+};
+
+static void *rseq_send(void *argument) {
+    struct rseq_sender *sender = argument;
+    while (!*sender->ready) {}
+    syscall(SYS_tgkill, sender->pid, sender->tid, SIGUSR1);
+    return 0;
+}
+
+static void rseq_arm(struct rseq_sender *sender) {
+    rseq_flag = 0;
+    rseq_ready = 0;
+    sender->ready = &rseq_ready;
+    sender->pid = getpid();
+    sender->tid = (pid_t)syscall(SYS_gettid);
+    if (pthread_create(&sender->thread, 0, rseq_send, sender)) _exit(60);
+}
+
+/* The signal a child ends by when it spins while its area's rseq_cs is
+ * `desc` and a signal comes: in the unsigned section when `desc` is 0, in
+ * the section `desc` describes when `inside`, else outside it. */
+static int rseq_child_dies(struct rseq_desc *desc, int inside) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct rlimit none = {0, 0};
+        setrlimit(RLIMIT_CORE, &none);
+        struct rseq_sender sender;
+        rseq_arm(&sender);
+        if (!desc) _exit(rseq_unsigned(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag) + 50);
+        if (inside) _exit(rseq_spin(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag, desc) + 50);
+        rseq_main.rseq_cs = (uint64_t)desc;
+        rseq_ready = 1;
+        while (!rseq_flag) {}
+        _exit(40);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child) return -1;
+    return WIFSIGNALED(status) ? WTERMSIG(status) : 100 + WEXITSTATUS(status);
+}
+
+static volatile int rseq_other_flag, rseq_other_ready, rseq_other_result;
+
+static void *rseq_other_thread(void *unused) {
+    (void)unused;
+    if (rseq_call(&rseq_other, 32, 0, RSEQ_SIGNATURE)) {
+        rseq_other_result = -1;
+        rseq_other_ready = 1;
+        return 0;
+    }
+    rseq_other_result = rseq_spin(&rseq_other.rseq_cs, &rseq_other_ready, &rseq_other_flag, rseq_spin_cs);
+    return 0;
+}
+
+static int rseq_case(void) {
+    long cpus = sysconf(_SC_NPROCESSORS_CONF);
+    printf("auxv feature-size>=28=%d align=%lu\n", getauxval(27) >= 28, getauxval(28));
+    /* Each call a statement of its own: the order a call's arguments are
+     * evaluated in is not C's to say. An unknown flag, not one a newer
+     * Linux may have (2 is RSEQ_FLAG_SLICE_EXT_DEFAULT_ON there). */
+    long unregister = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE);
+    long unknown = rseq_call(&rseq_main, 32, 1 << 30, RSEQ_SIGNATURE);
+    long short_area = rseq_call(&rseq_main, 31, 0, RSEQ_SIGNATURE);
+    long misaligned = rseq_call(rseq_space + 16, 32, 0, RSEQ_SIGNATURE);
+    long past_user = rseq_call((void *)0x7fffffffffe0, 32, 0, RSEQ_SIGNATURE);
+    printf("before unregister=%ld unknown-flag=%ld short=%ld misaligned=%ld past-user=%ld\n", unregister,
+           unknown, short_area, misaligned, past_user);
+    void *gone = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (gone == MAP_FAILED || munmap(gone, 4096)) return 10;
+    printf("unmapped=%ld\n", rseq_call(gone, 32, 0, RSEQ_SIGNATURE));
+
+    /* A registration clears rseq_cs, and the area shows where it runs. */
+    rseq_main.rseq_cs = 0x1234;
+    rseq_main.cpu_id = 0xfffffffe;
+    long r = rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE);
+    int matches = 0;
+    for (int i = 0; i < 1000 && !matches; i++) {
+        unsigned before, after;
+        syscall(SYS_getcpu, &before, 0, 0);
+        unsigned seen = rseq_main.cpu_id;
+        syscall(SYS_getcpu, &after, 0, 0);
+        matches = before == after && seen == before;
+    }
+    printf("register=%ld cs-cleared=%d cpu-valid=%d start-same=%d node=%u cid-valid=%d getcpu-same=%d\n", r,
+           rseq_main.rseq_cs == 0, rseq_main.cpu_id < (unsigned long)cpus,
+           rseq_main.cpu_id_start < (unsigned long)cpus, rseq_main.node_id,
+           rseq_main.mm_cid < (unsigned long)cpus, matches);
+    long same = rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE);
+    long other_area = rseq_call(&rseq_other, 32, 0, RSEQ_SIGNATURE);
+    long other_length = rseq_call(&rseq_main, 64, 0, RSEQ_SIGNATURE);
+    long other_signature = rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE + 1);
+    printf("again same=%ld other-area=%ld other-length=%ld other-signature=%ld\n", same, other_area,
+           other_length, other_signature);
+
+    /* A signal in the critical section sends it to its abort handler, and
+     * the kernel clears rseq_cs; outside it, the kernel only clears it. */
+    struct sigaction sa = {0};
+    sa.sa_handler = rseq_alarm;
+    sigaction(SIGUSR1, &sa, 0);
+    struct rseq_sender sender;
+    rseq_arm(&sender);
+    int aborted = rseq_spin(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag, rseq_spin_cs);
+    pthread_join(sender.thread, 0);
+    printf("signal aborted=%d handled=%d cs-cleared=%d\n", aborted, rseq_flag, rseq_main.rseq_cs == 0);
+    rseq_arm(&sender);
+    rseq_main.rseq_cs = (uint64_t)rseq_spin_cs;
+    rseq_ready = 1;
+    while (!rseq_flag) {}
+    pthread_join(sender.thread, 0);
+    printf("outside cs-cleared=%d\n", rseq_main.rseq_cs == 0);
+
+    /* A descriptor the kernel does not accept ends a thread inside its
+     * section by SIGSEGV when it next looks at it: here, for a signal.
+     * Current Linux reads neither the version nor the flags, so a section
+     * with them is aborted (the child exits 51). */
+    static struct rseq_desc version = {1, 0, 0, 0, 0}, flagged = {0, 1, 0, 0, 0};
+    static struct rseq_desc inside = {0, 0, 0, 0, 0};
+    version.start = flagged.start = inside.start = (uint64_t)rseq_spin_start;
+    version.length = flagged.length = inside.length = (uint64_t)(rseq_spin_end - rseq_spin_start);
+    version.abort = flagged.abort = (uint64_t)rseq_spin_abort;
+    inside.abort = (uint64_t)rseq_spin_start + 2;
+    /* Current Linux refuses a descriptor only for a thread inside its
+     * section, so outside it these are only cleared (the child exits 40). */
+    int unsigned_abort = rseq_child_dies(0, 1);
+    int in_version = rseq_child_dies(&version, 1), out_version = rseq_child_dies(&version, 0);
+    int in_flags = rseq_child_dies(&flagged, 1), out_flags = rseq_child_dies(&flagged, 0);
+    int in_abort = rseq_child_dies(&inside, 1), out_abort = rseq_child_dies(&inside, 0);
+    printf("refused signature=%d version=%d flags=%d abort-inside=%d\n", unsigned_abort, in_version, in_flags,
+           in_abort);
+    printf("outside version=%d flags=%d abort-inside=%d\n", out_version, out_flags, out_abort);
+
+    /* membarrier's RSEQ command aborts another thread's critical section. */
+    errno = 0;
+    long unregistered = syscall(SYS_membarrier, 1 << 7, 0, 0);
+    printf("membarrier unregistered=%ld errno=%d", unregistered, errno);
+    printf(" register=%ld", (long)syscall(SYS_membarrier, 1 << 8, 0, 0));
+    printf(" far-cpu=%ld", (long)syscall(SYS_membarrier, 1 << 7, 1, 100000));
+    /* A negative CPU with the flag is every CPU, as without the flag. */
+    errno = 0;
+    long negative = syscall(SYS_membarrier, 1 << 7, 1, -1);
+    printf(" negative-cpu=%ld errno=%d\n", negative, errno);
+    pthread_t other;
+    if (pthread_create(&other, 0, rseq_other_thread, 0)) return 11;
+    while (!rseq_other_ready) {}
+    r = syscall(SYS_membarrier, 1 << 7, 0, 0);
+    rseq_other_flag = 1;
+    pthread_join(other, 0);
+    printf("membarrier rseq=%ld other-aborted=%d\n", r, rseq_other_result);
+
+    /* Unregistering needs the same area, length and signature, and leaves
+     * the area showing no CPU. */
+    other_signature = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE + 1);
+    other_length = rseq_call(&rseq_main, 64, 1, RSEQ_SIGNATURE);
+    other_area = rseq_call(&rseq_other, 32, 1, RSEQ_SIGNATURE);
+    printf("unregister other-signature=%ld other-length=%ld other-area=%ld", other_signature, other_length,
+           other_area);
+    r = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE);
+    unsigned cpu = rseq_main.cpu_id, start = rseq_main.cpu_id_start;
+    long again = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE);
+    printf(" done=%ld cpu=%x start=%u again=%ld\n", r, cpu, start, again);
+    return 0;
+}
+
 static int shm_case(void) {
     long page = sysconf(_SC_PAGESIZE);
     struct shm_status s;
@@ -14016,6 +14266,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "shm")) return shm_case();
+    if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

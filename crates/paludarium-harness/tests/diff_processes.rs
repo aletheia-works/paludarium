@@ -404,6 +404,7 @@ mod linux {
         processes_execveat => ("execveat","process"),
         processes_etxtbsy => ("etxtbsy","process"),
         processes_shm => ("shm","process"),
+        processes_rseq => ("rseq","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

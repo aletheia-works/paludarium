@@ -26,10 +26,18 @@ rewritten, without touching anything else.
 WebAssembly (wasm32) memory stops at 4 GB, so a guest's 64-bit address space
 cannot be placed in it directly. paludarium therefore uses a software MMU with
 two-level page tables of 4 KiB pages on every host. Every access is checked; a
-missing page or a permission violation becomes a guest exception. A small
-cache of the private pages used last (a software TLB of 64 entries) lets the
+missing page or a permission violation becomes a guest exception. A cache
+of the private pages used last (a software TLB of 1024 entries) lets the
 next access to one of them skip the page table, still checking its
 protection; it is emptied whenever a mapping or a page entry may change.
+
+An entry holds the bytes of its page's frame, but not the frame's charge to
+the session's memory meter (`memory.current`), which the page tables and
+shared memory hold. A thread empties its TLB only at its next access, so a
+thread that is waiting may hold the bytes of pages that are gone; they no
+longer count, and new frames find the room at once. Only a frame that had no
+bytes when the TLB took it is held whole, as another space sharing it may
+give it bytes without this space's lock.
 
 Each guest thread has a TLB of its own. Its loads, stores and instruction
 fetches, and its locked instructions within one 8-byte word, take no lock

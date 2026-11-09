@@ -161,6 +161,8 @@ pub struct Processes {
     locks: crate::record_locks::Locks,
     /// The machine's FIFOs, which every process opening one joins.
     fifos: Arc<crate::fifo::Fifos>,
+    /// The machine's virtual CPUs, which threads with `rseq` run on.
+    pub(crate) cpus: Arc<crate::rseq::Cpus>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -176,6 +178,7 @@ impl Processes {
             file_owners: Mutex::default(),
             locks: crate::record_locks::Locks::default(),
             fifos: Arc::default(),
+            cpus: Arc::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -2662,7 +2665,12 @@ impl Kernel {
         state.clear_child_tid = if flags & 0x200000 != 0 { a[3] } else { 0 };
         if flags & 0x100 != 0 {
             state.alt_stack = crate::AltStack::default();
+            // A child sharing the memory registers its own rseq area, as
+            // Linux's rseq_fork gives a CLONE_VM child none.
+            state.rseq = None;
+            state.rseq_notify = false;
         }
+        state.on_cpu = None;
         if flags & CLONE_CLEAR_SIGHAND != 0 {
             state.signal_actions.retain(|_, action| action.handler == 1);
         }
@@ -2714,6 +2722,7 @@ impl Kernel {
             unimplemented: self.unimplemented.clone(),
             task: None,
             published: None,
+            seat: None,
         };
         // Shown in /proc from the start, before its first system call.
         let memory = child.spawn_memory.clone();

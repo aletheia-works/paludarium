@@ -35,6 +35,7 @@ mod proc;
 mod processes;
 mod pty;
 mod record_locks;
+mod rseq;
 mod scheduling;
 mod shm;
 mod sockets;
@@ -204,6 +205,16 @@ pub struct ThreadState {
     /// `task_struct.personality`: copied to new threads and processes, and
     /// kept across exec but for the flags exec clears.
     pub(crate) personality: u32,
+    /// The thread's `rseq` area, as Linux's `task_struct.rseq`: a fork
+    /// copies it, a new thread or `CLONE_VM` child and an exec start
+    /// without one.
+    pub(crate) rseq: Option<rseq::Registration>,
+    /// The virtual CPU it last ran on while it has `rseq`
+    /// ([`Kernel::enter_cpu`]), which `getcpu` reports.
+    pub(crate) on_cpu: Option<rseq::OnCpu>,
+    /// The area is to be brought up to date before the thread runs again,
+    /// as just registered (Linux's `rseq_set_notify_resume`).
+    pub(crate) rseq_notify: bool,
 }
 
 impl ThreadState {
@@ -246,6 +257,8 @@ pub struct Kernel {
     task: Option<processes::TaskCharge>,
     /// What this thread last published for `/proc` ([`Self::publish`]).
     published: Option<Published>,
+    /// The thread's place among the virtual CPUs while it has `rseq`.
+    seat: Option<rseq::Seat>,
 }
 
 /// What a thread published for `/proc`, to tell when it changes: the
@@ -284,6 +297,7 @@ impl Kernel {
             unimplemented: Arc::default(),
             task: None,
             published: None,
+            seat: None,
         }
     }
 
@@ -602,6 +616,12 @@ impl Kernel {
                 // its ucontext must restore the original mask on sigreturn.
                 thread.state.signal_mask = mask;
             }
+            // Linux's rseq_signal_deliver: an area it cannot bring up to
+            // date sends SIGSEGV, fatal when that is the signal delivered.
+            let forced = !Self::rseq_signal(thread, mem);
+            if forced && signal.number == signal::SIGSEGV {
+                return self.terminate(thread, signal::SIGSEGV);
+            }
             if signals::install(&mut thread.state, &mut thread.cpu, mem, signal, action).is_err() {
                 return self.terminate(thread, signal::SIGSEGV);
             }
@@ -617,6 +637,12 @@ impl Kernel {
             if action.flags & signals::SA_RESETHAND != 0 {
                 self.group
                     .set_action(signal.number, SignalAction::default());
+            }
+            if forced {
+                // Delivered before the handler runs, as Linux's loop on the
+                // way back to user space does.
+                signals::queue(&mut thread.state, rseq::forced_sigsegv());
+                continue;
             }
             return Next::Resume;
         }
@@ -654,6 +680,8 @@ impl Kernel {
 
     /// Handles a stop of `thread` (W3, W4).
     pub fn handle(&mut self, thread: &mut Thread, mem: &AddressSpace, reason: ExitReason) -> Next {
+        // The thread runs no guest code until it takes a CPU again.
+        self.leave_cpu();
         self.group.register(thread.tid, Arc::clone(&self.inbox));
         let fault = match reason {
             ExitReason::PageFault {

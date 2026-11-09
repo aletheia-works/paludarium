@@ -275,7 +275,8 @@ impl Drop for Runner {
 /// A [`Kernel`]'s runner, and the CPU mask it last read for its thread.
 pub(crate) struct Seat {
     runner: Arc<Runner>,
-    mask: Option<Vec<u64>>,
+    /// Shared, so that each entry takes it without copying it.
+    mask: Option<Arc<[u64]>>,
     /// The [`crate::ThreadGroup::affinity_generation`] `mask` was read in.
     generation: Option<u64>,
     /// How many `membarrier` requests it has acted on.
@@ -343,7 +344,13 @@ impl Kernel {
         thread.cpu.rip = GuestAddr(rip);
         if result.is_err() {
             signals::queue(&mut thread.state, forced_sigsegv());
-            return self.checkpoint(thread, mem);
+            let next = self.checkpoint(thread, mem);
+            // A thread that stops (or ends) here runs no guest code, so it
+            // must not keep the CPU while it waits.
+            if next != Next::Resume {
+                self.leave_cpu();
+            }
+            return next;
         }
         Next::Resume
     }
@@ -356,7 +363,7 @@ impl Kernel {
         let generation = self.group.affinity_generation();
         let seat = self.seat.as_mut()?;
         if seat.generation != Some(generation) {
-            seat.mask = self.group.affinity(thread.tid);
+            seat.mask = self.group.affinity(thread.tid).map(Arc::from);
             seat.generation = Some(generation);
         }
         let runner = Arc::clone(&seat.runner);

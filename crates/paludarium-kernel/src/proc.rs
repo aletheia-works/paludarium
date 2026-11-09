@@ -81,7 +81,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 13] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 16] = [
     (b"task", 4),
     (b"fd", 4),
     (b"ns", 4),
@@ -95,9 +95,12 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 13] = [
     (b"exe", 10),
     (b"mounts", 8),
     (b"mountinfo", 8),
+    (b"uid_map", 8),
+    (b"gid_map", 8),
+    (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 9] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 12] = [
     (b"task", 4),
     (b"ns", 4),
     (b"environ", 8),
@@ -107,6 +110,9 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 9] = [
     (b"stat", 8),
     (b"cwd", 10),
     (b"exe", 10),
+    (b"uid_map", 8),
+    (b"gid_map", 8),
+    (b"setgroups", 8),
 ];
 
 /// An entry of another process's directory, `/proc/<pid>`, or of a
@@ -128,6 +134,10 @@ pub(crate) enum TaskEntry {
     /// `ns`, the directory of the task's namespaces, and one of its links.
     Namespaces,
     Namespace(crate::namespaces::Entry),
+    /// `uid_map` or `gid_map`, and `setgroups`, of the task's user
+    /// namespace.
+    IdMap(crate::users::Ids),
+    Setgroups,
     /// A name paludarium does not have there.
     Missing,
 }
@@ -171,6 +181,9 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"exe" => TaskEntry::Exe,
         b"cwd" => TaskEntry::Cwd,
         b"ns" => TaskEntry::Namespaces,
+        b"uid_map" => TaskEntry::IdMap(crate::users::Ids::User),
+        b"gid_map" => TaskEntry::IdMap(crate::users::Ids::Group),
+        b"setgroups" => TaskEntry::Setgroups,
         _ => TaskEntry::Missing,
     };
     // An entry of the task's directory, or a link of its `ns`.
@@ -189,9 +202,9 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         [b"task"] => (None, TaskEntry::Threads),
         [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
         [b"task", tid, ref rest @ ..] => (Some(thread(tid)?), entry(rest)),
-        // The process's own `ns` is here; the rest of its own directory is
-        // `own_entry`'s.
-        [b"ns", ..] => (None, entry(&parts)),
+        // The process's own `ns` and user namespace files are here; the
+        // rest of its own directory is `own_entry`'s.
+        [b"ns", ..] | [b"uid_map" | b"gid_map" | b"setgroups"] => (None, entry(&parts)),
         _ if pid == own => return None,
         [] => (None, TaskEntry::Directory),
         _ => (None, entry(&parts)),
@@ -501,6 +514,8 @@ pub(crate) struct Status<'a> {
     pub caught: u64,
     pub no_new_privs: bool,
     pub credentials: &'a crate::credentials::Credentials,
+    /// The reader's user namespace, which the IDs are shown in.
+    pub reader: &'a crate::namespaces::Namespace,
 }
 /// `/proc/<pid>/status` in Linux's field order. The memory and CPU fields
 /// are left out, as nothing measures them; parsers treat them as optional.
@@ -522,8 +537,12 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
     });
     let (state, tgid, pid) = (s.state, s.tgid, s.pid);
     let c = s.credentials;
+    let (uid, gid) = (
+        |id| s.reader.shown(crate::users::Ids::User, id),
+        |id| s.reader.shown(crate::users::Ids::Group, id),
+    );
     // Each group, then a space Linux has always written after them.
-    let groups: Vec<String> = c.groups.iter().map(u32::to_string).collect();
+    let groups: Vec<String> = c.groups.iter().map(|&g| gid(g).to_string()).collect();
     let groups = groups.join(" ");
     let bounding = crate::credentials::ALL_CAPABILITIES;
     format!(
@@ -536,14 +555,14 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
          NoNewPrivs:\t{}\nSeccomp:\t0\nSeccomp_filters:\t0\n\
          voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         s.parent,
-        c.uid,
-        c.euid,
-        c.suid,
-        c.fsuid,
-        c.gid,
-        c.egid,
-        c.sgid,
-        c.fsgid,
+        uid(c.uid),
+        uid(c.euid),
+        uid(c.suid),
+        uid(c.fsuid),
+        gid(c.gid),
+        gid(c.egid),
+        gid(c.sgid),
+        gid(c.fsgid),
         s.threads,
         s.queued,
         s.queue_limit,
@@ -1204,6 +1223,7 @@ mod tests {
                 inheritable: 0x42,
                 ..crate::credentials::Credentials::default()
             },
+            reader: crate::users::first(),
         }))
         .unwrap();
         for line in [

@@ -462,7 +462,7 @@ pub(crate) fn sys_mbind(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         return err(Errno::EINVAL);
     }
     // MPOL_MF_MOVE_ALL needs CAP_SYS_NICE.
-    if flags & MPOL_MF_MOVE_ALL != 0 && c.process.credentials.effective & (1 << 23) == 0 {
+    if flags & MPOL_MF_MOVE_ALL != 0 && !c.process.credentials.capable(1 << 23) {
         return err(Errno::EPERM);
     }
     if start & 4095 != 0 {

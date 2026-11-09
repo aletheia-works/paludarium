@@ -21,8 +21,13 @@ const REGULAR: u32 = 0o100000;
 const SYMLINK: u32 = 0o120000;
 const TYPE: u32 = 0o170000;
 
-fn capable(creds: &Credentials, capability: u64) -> bool {
+/// `capable_wrt_inode_uidgid`: `capability` in the thread's own user
+/// namespace, which maps the file's owner and group.
+fn capable(creds: &Credentials, stat: &FileStat, capability: u64) -> bool {
+    use crate::users::Ids;
     creds.effective & capability != 0
+        && creds.user.id_of(Ids::User, stat.uid).is_some()
+        && creds.user.id_of(Ids::Group, stat.gid).is_some()
 }
 
 /// `in_group_p`: the filesystem group or a supplementary one.
@@ -34,12 +39,15 @@ pub(crate) fn in_group(creds: &Credentials, gid: u32) -> bool {
 /// with no execute bit), and nothing they make needs another owner.
 pub(crate) fn unchecked(creds: &Credentials) -> bool {
     let all = CAP_CHOWN | CAP_DAC_OVERRIDE | CAP_DAC_READ_SEARCH | CAP_FOWNER | CAP_FSETID;
-    creds.effective & all == all && creds.fsuid == 0 && creds.fsgid == 0
+    creds.effective & all == all
+        && creds.fsuid == 0
+        && creds.fsgid == 0
+        && creds.user == crate::users::UserNs::default()
 }
 
 /// `inode_owner_or_capable`.
 fn owner_or_capable(creds: &Credentials, stat: &FileStat) -> bool {
-    creds.fsuid == stat.uid || capable(creds, CAP_FOWNER)
+    creds.fsuid == stat.uid || capable(creds, stat, CAP_FOWNER)
 }
 
 /// `generic_permission`: the owner's bits for the owner, the group's for a
@@ -58,18 +66,18 @@ pub(crate) fn permission(creds: &Credentials, stat: &FileStat, mask: u32) -> Res
         return Ok(());
     }
     if stat.mode & TYPE == DIRECTORY {
-        if mask & MAY_WRITE == 0 && capable(creds, CAP_DAC_READ_SEARCH) {
+        if mask & MAY_WRITE == 0 && capable(creds, stat, CAP_DAC_READ_SEARCH) {
             return Ok(());
         }
-        if capable(creds, CAP_DAC_OVERRIDE) {
+        if capable(creds, stat, CAP_DAC_OVERRIDE) {
             return Ok(());
         }
         return Err(Errno::EACCES);
     }
-    if mask == MAY_READ && capable(creds, CAP_DAC_READ_SEARCH) {
+    if mask == MAY_READ && capable(creds, stat, CAP_DAC_READ_SEARCH) {
         return Ok(());
     }
-    if (mask & MAY_EXEC == 0 || stat.mode & 0o111 != 0) && capable(creds, CAP_DAC_OVERRIDE) {
+    if (mask & MAY_EXEC == 0 || stat.mode & 0o111 != 0) && capable(creds, stat, CAP_DAC_OVERRIDE) {
         return Ok(());
     }
     Err(Errno::EACCES)
@@ -88,7 +96,7 @@ fn may_delete(creds: &Credentials, parent: &FileStat, file: &FileStat) -> Result
     if parent.mode & 0o1000 != 0
         && creds.fsuid != file.uid
         && creds.fsuid != parent.uid
-        && !capable(creds, CAP_FOWNER)
+        && !capable(creds, file, CAP_FOWNER)
     {
         return Err(Errno::EPERM);
     }
@@ -370,7 +378,7 @@ pub(crate) fn rename(
 
 /// `CAP_MKNOD`, which `RENAME_WHITEOUT` needs.
 pub(crate) fn may_mknod(creds: &Credentials) -> bool {
-    capable(creds, 1 << 27)
+    creds.capable(1 << 27)
 }
 
 /// `chmod`'s check (`setattr_prepare`): the owner or `CAP_FOWNER`, else
@@ -383,7 +391,7 @@ pub(crate) fn chmod(creds: &Credentials, stat: &FileStat, mode: u32) -> Result<u
     if !owner_or_capable(creds, stat) {
         return Err(Errno::EPERM);
     }
-    if mode & 0o2000 != 0 && !in_group(creds, stat.gid) && !capable(creds, CAP_FSETID) {
+    if mode & 0o2000 != 0 && !in_group(creds, stat.gid) && !capable(creds, stat, CAP_FSETID) {
         return Ok(mode & !0o2000);
     }
     Ok(mode)
@@ -401,14 +409,14 @@ pub(crate) fn chown(
     gid: Option<u32>,
 ) -> Result<bool, Errno> {
     let owner = creds.fsuid == stat.uid;
-    let chown = capable(creds, CAP_CHOWN);
+    let chown = capable(creds, stat, CAP_CHOWN);
     if uid.is_some_and(|uid| !(owner && uid == stat.uid) && !chown) {
         return Err(Errno::EPERM);
     }
     if gid.is_some_and(|gid| !(owner && (gid == stat.gid || in_group(creds, gid))) && !chown) {
         return Err(Errno::EPERM);
     }
-    Ok(in_group(creds, stat.gid) || capable(creds, CAP_FSETID))
+    Ok(in_group(creds, stat.gid) || capable(creds, stat, CAP_FSETID))
 }
 
 /// What a write or a truncation takes from a regular file without
@@ -416,12 +424,12 @@ pub(crate) fn chown(
 /// set-group-ID bit with group execution or when the thread is not in its
 /// group. Linux's `file_remove_privs` and `do_truncate`.
 pub(crate) fn remove_set_ids(creds: &Credentials, file: &dyn FileHandle) {
-    if capable(creds, CAP_FSETID) {
-        return;
-    }
     let Ok(stat) = file.stat() else {
         return;
     };
+    if capable(creds, &stat, CAP_FSETID) {
+        return;
+    }
     if stat.mode & TYPE != REGULAR {
         return;
     }

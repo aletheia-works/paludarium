@@ -654,13 +654,15 @@ kernel.
   has no semaphore adjustments to drop, as there are no System V semaphores. Its
   namespace flags give the thread new namespaces, as below.
 - Each thread has its own namespaces, as Linux's `nsproxy`: UTS, IPC,
-  mount, cgroup, time, PID and network ones of its own, and the first
-  user namespace. `unshare` with `CLONE_NEWUTS`, `CLONE_NEWIPC`,
-  `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWTIME`, `CLONE_NEWPID` or
-  `CLONE_NEWNET` gives
-  it new ones, and so does `clone` (`CLONE_NEWTIME` through `clone3`) for
-  its child, a thread too (but not `CLONE_NEWPID`), with `CAP_SYS_ADMIN`
-  (`EPERM` without it). A new UTS namespace starts
+  mount, cgroup, time, PID, network and user ones of its own (the user
+  namespace in its credentials). `unshare` with `CLONE_NEWUTS`,
+  `CLONE_NEWIPC`, `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWTIME`,
+  `CLONE_NEWPID`, `CLONE_NEWNET` or `CLONE_NEWUSER` gives it new ones, and
+  so does `clone` (`CLONE_NEWTIME` through `clone3`) for its child, a thread
+  too (but not `CLONE_NEWPID` or `CLONE_NEWUSER`). A new user namespace
+  needs no capability; the others need `CAP_SYS_ADMIN` (`EPERM` without
+  it) in the user namespace the thread then has, so a new one with them
+  gives it. A new UTS namespace starts
   with a copy of the host and domain names, which `sethostname` and
   `setdomainname` then change for it alone. A new time namespace is the one
   the thread's children enter: a child that does not share its memory
@@ -673,16 +675,51 @@ kernel.
   handle that reads and writes as `EINVAL` and seeks as `ESPIPE`, whose
   inode is that number. `setns` enters the namespace of such a file (its
   kind or 0 for `nstype`), or the namespaces of a pidfd's process that
-  `nstype` names, with Linux's checks in Linux's order: the thread's own
-  user namespace is `EINVAL`, a time namespace needs the thread alone in its
-  memory (`EUSERS`), a mount namespace entered by itself a working directory
-  no other thread shares (`EINVAL`) and `CAP_SYS_CHROOT`, and each one
-  `CAP_SYS_ADMIN` (`EPERM`), and a PID namespace must be the thread's own
-  or one nested in it (`EINVAL`). Entering a mount namespace moves the working
+  `nstype` names, with Linux's checks in Linux's order: a user namespace
+  must not be the thread's own, nor be entered by a thread that shares its
+  memory or working directory (`EINVAL`), and needs `CAP_SYS_ADMIN` in it,
+  which then gives the thread every capability there; a time namespace
+  needs the thread alone in its memory (`EUSERS`), a mount namespace
+  entered by itself a working directory no other thread shares (`EINVAL`)
+  and `CAP_SYS_CHROOT`, and each one `CAP_SYS_ADMIN` in the user namespace
+  that owns it and in the thread's own (`EPERM`), and a PID namespace must
+  be the thread's own or one nested in it (`EINVAL`). Entering a mount namespace moves the working
   directory to its root, and entering a PID namespace makes it the one the
   thread's children are numbered in; entering a network namespace makes it
   the one the thread's new sockets are in. See [Limitations](./limitations.md)
   for the namespaces paludarium has no new ones of.
+- A new user namespace, as Linux's `create_user_ns` makes it, is nested
+  in the thread's and owned by its effective user (`EPERM` when that user
+  or group has no ID in it, `ENOSPC` past 32 levels); the thread has every
+  capability in it, and in the namespaces made with it, which it owns.
+  The kernel keeps IDs as the first user namespace has them; a system call
+  takes and gives them as the caller's namespace maps them, and an ID it
+  does not map shows as 65534 (`overflowuid`) and is `EINVAL` given: the
+  `get*id` and `set*id` calls and `setgroups`, `getgroups`, `stat` and
+  `statx`, `chown` and its kin, the `si_uid` of a signal and `waitid`,
+  `SCM_CREDENTIALS` and `SO_PEERCRED`, `shmctl`, `/proc/<pid>/status` and a
+  core. Root is the ID the namespace maps as 0 for the capability rules of
+  `set*id`, `access` and exec, and a set-user-ID program whose owner or
+  group it does not map runs as the caller. A capability counts in the
+  thread's own user namespace and in those nested in it that its
+  effective user made (Linux's `cap_capable`): over a file only when the
+  namespace maps the file's owner and group, over a namespace (setting
+  its host name, entering it, `SIOCSIFFLAGS`, System V shared memory) as
+  the user namespace that owns it has it, over another process (`kill`,
+  `ptrace` access, priorities, limits) as its user namespace has it, and
+  over the machine (`RENAME_WHITEOUT`, real-time scheduling, `vhangup`, the
+  `trusted.*` attributes and the like) only in the first user namespace.
+  `/proc/<pid>/uid_map` and `gid_map` read the extents of the task's user
+  namespace, the lower IDs as the reader's namespace has them (its parent's
+  for its own), and take one write of up to 340 lines of three numbers, in
+  Linux's order and with its checks (`proc_uid_map_write`, `map_write`,
+  `new_idmap_permitted`): from a thread of the namespace or its parent that
+  has `CAP_SYS_ADMIN` in it, its owner may map its own effective ID alone
+  (a group only once `setgroups` is denied), and anything else needs
+  `CAP_SETUID` or `CAP_SETGID` in the parent; mapping the parent's root needs
+  `CAP_SETFCAP`. `/proc/<pid>/setgroups` reads `allow` or `deny`, which
+  may be written before the gid map; `setgroups` needs it allowed and the
+  gid map written.
 - A new PID namespace, as Linux's, is the one the thread's children are
   numbered in; the thread stays in its own, and its `pid_for_children` link
   is `ENOENT` until the first child, the namespace's init, numbered 1. A

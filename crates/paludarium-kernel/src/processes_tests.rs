@@ -2046,14 +2046,7 @@ mod namespaces {
         assert_eq!(before[4], after[4]);
         assert_eq!(before[6], after[6]);
         assert_eq!(&after[5][..5], b"time:");
-        // No new user namespace; with a supported flag too.
-        for flags in [NEWUSER, NEWUSER | NEWUTS] {
-            assert_eq!(
-                syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
-                einval
-            );
-        }
-        // Without CAP_SYS_ADMIN, EPERM, but EINVAL for a user namespace.
+        // Without CAP_SYS_ADMIN, EPERM, but a user namespace needs none.
         t.state.credentials = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
         for flags in [NEWUTS, NEWIPC, NEWNS, NEWCGROUP, NEWTIME, NEWPID, NEWNET] {
             assert_eq!(
@@ -2063,7 +2056,7 @@ mod namespaces {
         }
         assert_eq!(
             syscall(&mut k, &mut t, &m, 272, [NEWUSER, 0, 0, 0, 0, 0]),
-            einval
+            0
         );
     }
     #[test]
@@ -2098,16 +2091,9 @@ mod namespaces {
         let (mut k, mut t, m) = setup();
         k.group.register(1, Arc::new(SignalInbox::default()));
         let einval = Errno::EINVAL.to_syscall_return();
-        // CLONE_FS with a new mount or user namespace; CLONE_SYSVSEM with a
-        // new IPC namespace; and the namespaces paludarium has no new ones
-        // of: no child.
-        for flags in [
-            NEWNS | 0x200,
-            NEWUSER | 0x200,
-            NEWIPC | 0x4_0000,
-            NEWUSER,
-            NEWUSER | NEWUTS,
-        ] {
+        // CLONE_FS with a new mount or user namespace, and CLONE_SYSVSEM
+        // with a new IPC namespace: no child.
+        for flags in [NEWNS | 0x200, NEWUSER | 0x200, NEWIPC | 0x4_0000] {
             assert_eq!(
                 syscall(&mut k, &mut t, &m, 56, [flags | 17, 0, 0, 0, 0, 0]),
                 einval,
@@ -4328,5 +4314,232 @@ mod pid_namespaces {
         assert_eq!(number, u64::from(ct.tid));
         assert_eq!(syscall(&mut c, &mut ct, &cm, 39, [0; 6]), 2);
         assert_eq!(syscall(&mut c, &mut ct, &cm, 110, [0; 6]), 0);
+    }
+}
+mod user_namespaces {
+    use super::*;
+    const NEWUSER: u64 = 0x1000_0000;
+    const NEWUTS: u64 = 0x400_0000;
+    fn e(error: Errno) -> u64 {
+        error.to_syscall_return()
+    }
+    fn path(m: &AddressSpace, at: u64, path: &str) {
+        m.write(GuestAddr(at), format!("{path}\0").as_bytes())
+            .unwrap();
+    }
+    /// What the file at `name` reads.
+    fn read(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, name: &str) -> Vec<u8> {
+        path(m, DATA, name);
+        let fd = syscall(k, t, m, 2, [DATA, 0, 0, 0, 0, 0]);
+        assert!(fd < 1024, "{name}: {}", fd as i64);
+        let count = syscall(k, t, m, 0, [fd, DATA + 0x800, 512, 0, 0, 0]);
+        assert!(count <= 512, "{name}: {}", count as i64);
+        syscall(k, t, m, 3, [fd, 0, 0, 0, 0, 0]);
+        let mut bytes = vec![0; count as usize];
+        m.read(GuestAddr(DATA + 0x800), &mut bytes).unwrap();
+        bytes
+    }
+    /// Writes `text` to the file at `name` in one write: its result.
+    fn write(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, name: &str, text: &[u8]) -> u64 {
+        path(m, DATA, name);
+        let fd = syscall(k, t, m, 2, [DATA, 1, 0, 0, 0, 0]);
+        if fd >= 1024 {
+            return fd;
+        }
+        m.write(GuestAddr(DATA + 0x800), text).unwrap();
+        let r = syscall(k, t, m, 1, [fd, DATA + 0x800, text.len() as u64, 0, 0, 0]);
+        syscall(k, t, m, 3, [fd, 0, 0, 0, 0, 0]);
+        r
+    }
+    /// The owner and group `stat` shows of `name`.
+    fn owner(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, name: &str) -> (u32, u32) {
+        path(m, DATA, name);
+        assert_eq!(syscall(k, t, m, 4, [DATA, DATA + 0x400, 0, 0, 0, 0]), 0);
+        let field = |at: u64| m.read_u64(GuestAddr(DATA + 0x400 + at)).unwrap() as u32;
+        (field(28), field(32))
+    }
+    /// A user of ID 1000, with a file of its own and one of root's.
+    fn user() -> (Kernel, Thread, AddressSpace) {
+        let (mut k, mut t, m) = setup();
+        for (name, uid) in [("/own", 1000), ("/root", 0)] {
+            path(&m, DATA, name);
+            let fd = syscall(&mut k, &mut t, &m, 2, [DATA, 0o101, 0o644, 0, 0, 0]);
+            assert!(fd < 1024);
+            syscall(&mut k, &mut t, &m, 3, [fd, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 92, [DATA, uid, uid, 0, 0, 0]),
+                0
+            );
+        }
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 119, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        // Dumpable again, as a program the user started is, so that its
+        // `/proc` files are its own.
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [4, 1, 0, 0, 0, 0]), 0);
+        (k, t, m)
+    }
+    #[test]
+    fn a_user_makes_one_and_maps_itself_as_root() {
+        let (mut k, mut t, m) = user();
+        let first = read(&mut k, &mut t, &m, "/proc/self/uid_map");
+        assert_eq!(first, b"         0          0 4294967295\n");
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [NEWUSER, 0, 0, 0, 0, 0]),
+            0
+        );
+        // Unmapped, it is nobody, with every capability in the namespace.
+        assert_eq!(syscall(&mut k, &mut t, &m, 102, [0; 6]), 65534);
+        assert_eq!(syscall(&mut k, &mut t, &m, 104, [0; 6]), 65534);
+        assert_eq!(owner(&mut k, &mut t, &m, "/own"), (65534, 65534));
+        assert_eq!(
+            t.state.credentials.effective,
+            crate::credentials::ALL_CAPABILITIES
+        );
+        assert_eq!(read(&mut k, &mut t, &m, "/proc/self/uid_map"), b"");
+        assert_eq!(read(&mut k, &mut t, &m, "/proc/self/setgroups"), b"allow\n");
+        // Its own ID, alone; the group only once setgroups is denied.
+        let map = "/proc/self/uid_map";
+        assert_eq!(
+            write(&mut k, &mut t, &m, map, b"0 1000 2\n"),
+            e(Errno::EPERM)
+        );
+        assert_eq!(
+            write(&mut k, &mut t, &m, map, b"0 1000\n"),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(write(&mut k, &mut t, &m, map, b"0 1000 1\n"), 9);
+        assert_eq!(
+            write(&mut k, &mut t, &m, map, b"0 1000 1\n"),
+            e(Errno::EPERM)
+        );
+        let gids = "/proc/self/gid_map";
+        assert_eq!(
+            write(&mut k, &mut t, &m, gids, b"0 1000 1"),
+            e(Errno::EPERM)
+        );
+        let setgroups = "/proc/self/setgroups";
+        assert_eq!(write(&mut k, &mut t, &m, setgroups, b"deny"), 4);
+        assert_eq!(
+            write(&mut k, &mut t, &m, setgroups, b"allow\n"),
+            e(Errno::EPERM)
+        );
+        assert_eq!(write(&mut k, &mut t, &m, gids, b"0 1000 1"), 8);
+        assert_eq!(
+            write(&mut k, &mut t, &m, setgroups, b"deny"),
+            e(Errno::EPERM)
+        );
+        // Opening it to write needs CAP_SYS_ADMIN in the namespace.
+        let caps = t.state.credentials.effective;
+        t.state.credentials.effective = 0;
+        assert_eq!(
+            write(&mut k, &mut t, &m, setgroups, b"deny"),
+            e(Errno::EACCES)
+        );
+        t.state.credentials.effective = caps;
+        assert_eq!(
+            read(&mut k, &mut t, &m, map),
+            b"         0       1000          1\n"
+        );
+        // Now root there, its file root's and root's file nobody's.
+        assert_eq!(syscall(&mut k, &mut t, &m, 102, [0; 6]), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 104, [0; 6]), 0);
+        assert_eq!(owner(&mut k, &mut t, &m, "/own"), (0, 0));
+        assert_eq!(owner(&mut k, &mut t, &m, "/root"), (65534, 65534));
+        // IDs it does not map are EINVAL; setgroups is denied.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 105, [5, 0, 0, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+        path(&m, DATA, "/own");
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                92,
+                [DATA, 5, u64::from(u32::MAX), 0, 0, 0]
+            ),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 116, [0, 0, 0, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        // Its capabilities count for what the namespace maps and owns
+        // only: not root's file, not the first UTS namespace.
+        path(&m, DATA, "/root");
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 90, [DATA, 0o600, 0, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        path(&m, DATA, "/own");
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 90, [DATA, 0o600, 0, 0, 0, 0]),
+            0
+        );
+        m.write(GuestAddr(DATA + 0x100), b"inside").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 170, [DATA + 0x100, 6, 0, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 272, [NEWUTS, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 170, [DATA + 0x100, 6, 0, 0, 0, 0]),
+            0
+        );
+    }
+    #[test]
+    fn another_user_namespace_sees_through_its_own() {
+        let (mut k, mut t, m) = user();
+        // A child makes one with a new UTS namespace, which it owns.
+        let pid = syscall(
+            &mut k,
+            &mut t,
+            &m,
+            56,
+            [NEWUSER | NEWUTS | 17, 0, 0, 0, 0, 0],
+        );
+        assert!(pid < 1 << 20);
+        let (mut c, mut ct) = k.take_child().unwrap();
+        let cm = c.take_spawn_memory().unwrap();
+        m.write(GuestAddr(DATA + 0x100), b"inside").unwrap();
+        cm.write(GuestAddr(DATA + 0x100), b"inside").unwrap();
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 170, [DATA + 0x100, 6, 0, 0, 0, 0]),
+            0
+        );
+        // The parent, its owner, writes the child's maps: as the parent's
+        // namespace has the lower IDs.
+        let map = format!("/proc/{pid}/uid_map");
+        assert_eq!(write(&mut k, &mut t, &m, &map, b"0 1000 1"), 8);
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 102, [0; 6]), 0);
+        assert_eq!(
+            read(&mut k, &mut t, &m, &map),
+            b"         0       1000          1\n"
+        );
+        assert_eq!(
+            read(&mut c, &mut ct, &cm, &map),
+            b"         0       1000          1\n"
+        );
+        // Root of the first namespace may enter the child's, once.
+        t.state.credentials = crate::credentials::Credentials::default();
+        path(&m, DATA, &format!("/proc/{pid}/ns/user"));
+        let fd = syscall(&mut k, &mut t, &m, 2, [DATA, 0, 0, 0, 0, 0]);
+        assert!(fd < 1024);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [fd, NEWUSER, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 102, [0; 6]), 65534);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [fd, NEWUSER, 0, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
     }
 }

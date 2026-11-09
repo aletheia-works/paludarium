@@ -160,7 +160,7 @@ fn hinted(
 ) -> Option<(paludarium_decoder::Instruction, bool)> {
     cache
         .get_with_hint(rip, generation)
-        .map(|(decoded, rejected)| (decoded.instruction, rejected))
+        .map(|(_, instruction, rejected)| (instruction, rejected))
 }
 
 fn cached_boundary() -> (DecodeCache, paludarium_decoder::Instruction) {
@@ -178,8 +178,9 @@ fn decode_hint_empty_boundary_requires_fetch() {
 #[test]
 fn decode_hint_hit_preserves_exact_decoded_instruction() {
     let (cache, expected) = cached_boundary();
-    let (decoded, rejected) = cache.get_with_hint(4096, 1).unwrap();
-    assert_eq!(decoded.instruction, expected);
+    let (decoded, instruction, rejected) = cache.get_with_hint(4096, 1).unwrap();
+    assert_eq!(instruction, expected);
+    assert_eq!(decoded.next, expected.next_rip().0);
     assert!(!rejected);
 }
 
@@ -223,10 +224,10 @@ fn decode_hint_does_not_change_ordinary_interpreter_cache_contract() {
     let (mut cache, instruction) = cached_boundary();
     cache.reject_acceleration(4096, 1);
     // A decode that would stop shows whether the cache held the entry.
-    let stop = |_: &mut Vec<Decoded>| Err(ExitReason::Halt { rip: GuestAddr(0) });
+    let stop = |_: &mut Code| Err(ExitReason::Halt { rip: GuestAddr(0) });
     let first = cache
         .block(4096, 1, stop)
-        .map(|block| cache.code[block.start].instruction);
+        .map(|block| cache.code.instructions[block.start]);
     assert_eq!(first, Ok(instruction));
     assert!(cache.block(4096, 2, stop).is_err());
 }

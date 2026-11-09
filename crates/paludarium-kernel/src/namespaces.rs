@@ -39,24 +39,37 @@ pub(crate) const ALL: u64 = SUPPORTED | CLONE_NEWUSER;
 pub(crate) const CLONE3_NEWTIME: u64 = 1 << 40;
 
 /// The namespace checks of `clone` and `unshare`, as Linux's
-/// `copy_namespaces` and `unshare_nsproxy_namespaces` make them:
-/// `CLONE_NEWUSER`, which needs no capability, is `EINVAL`, as from a kernel
-/// without user namespaces; the rest need CAP_SYS_ADMIN (`EPERM`), and those
-/// paludarium has no new ones of are `EINVAL` after that.
-pub(crate) fn check(flags: u64, may_administer: bool) -> Result<(), Errno> {
-    if flags & ALL == 0 {
-        return Ok(());
-    }
-    if flags & CLONE_NEWUSER != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if !may_administer {
+/// `copy_namespaces` and `unshare_nsproxy_namespaces` make them: a new
+/// namespace but a user one needs CAP_SYS_ADMIN (`EPERM`) in the user
+/// namespace the thread then has (`administers`), which a new user
+/// namespace gives it.
+pub(crate) fn check(flags: u64, administers: bool) -> Result<(), Errno> {
+    if flags & SUPPORTED != 0 && !administers {
         return Err(Errno::EPERM);
     }
-    if flags & ALL & !SUPPORTED != 0 {
-        return Err(Errno::EINVAL);
-    }
     Ok(())
+}
+/// The credentials a thread with `creds` has after `flags`: with
+/// `CLONE_NEWUSER`, in a new user namespace in its own, which it owns and
+/// has every capability in (Linux's `create_user_ns` and
+/// `set_cred_user_ns`).
+pub(crate) fn user_for(
+    namespaces: &Namespaces,
+    creds: &crate::credentials::Credentials,
+    flags: u64,
+) -> Result<crate::credentials::Credentials, Errno> {
+    if flags & CLONE_NEWUSER == 0 {
+        return Ok(creds.clone());
+    }
+    let user = Namespace::new_user(&creds.user.0, namespaces.next_inode(), creds)?;
+    Ok(crate::credentials::Credentials {
+        user: crate::users::UserNs(user),
+        permitted: crate::credentials::ALL_CAPABILITIES,
+        effective: crate::credentials::ALL_CAPABILITIES,
+        inheritable: 0,
+        keep_caps: false,
+        ..creds.clone()
+    })
 }
 /// `__NEW_UTS_LEN`: the longest host or domain name.
 pub(crate) const NAME_LENGTH: usize = 64;
@@ -138,6 +151,11 @@ pub(crate) struct Namespace {
     pids: Pids,
     /// A nested network namespace's sockets.
     pub sockets: Sockets,
+    /// What a user namespace holds ([`crate::users`]).
+    pub users: crate::users::Users,
+    /// The user namespace that owns it, whose capabilities act on it
+    /// (Linux's `ns->user_ns`); none for one the first user namespace owns.
+    owner: Option<Arc<Namespace>>,
 }
 /// What the sockets of a nested network namespace are in: its own network,
 /// and its abstract socket names once a socket looks for them. The first
@@ -158,9 +176,15 @@ impl std::fmt::Debug for Sockets {
 }
 impl Namespace {
     fn new(kind: Kind, inode: u32, names: UtsNames) -> Arc<Self> {
-        Self::within(kind, inode, names, Pids::default())
+        Self::within(kind, inode, names, Pids::default(), None)
     }
-    fn within(kind: Kind, inode: u32, names: UtsNames, pids: Pids) -> Arc<Self> {
+    fn within(
+        kind: Kind,
+        inode: u32,
+        names: UtsNames,
+        pids: Pids,
+        owner: Option<Arc<Namespace>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             kind,
             inode,
@@ -168,7 +192,34 @@ impl Namespace {
             shm: crate::shm::Segments::default(),
             pids,
             sockets: Sockets::default(),
+            users: crate::users::Users::default(),
+            owner,
         })
+    }
+    /// The first user namespace ([`crate::users::first`]).
+    pub(crate) fn first_user() -> Arc<Self> {
+        Self::user(USER_INIT, crate::users::Users::default())
+    }
+    /// A user namespace, which the namespace it is in owns.
+    pub(crate) fn user(inode: u32, users: crate::users::Users) -> Arc<Self> {
+        Arc::new(Self {
+            kind: Kind::User,
+            inode,
+            names: Mutex::new(UtsNames {
+                host: Vec::new(),
+                domain: Vec::new(),
+            }),
+            shm: crate::shm::Segments::default(),
+            pids: Pids::default(),
+            sockets: Sockets::default(),
+            owner: users.parent().cloned(),
+            users,
+        })
+    }
+    /// The user namespace that owns it; a user namespace's is its parent,
+    /// and the first one's itself.
+    pub(crate) fn owner(&self) -> &Namespace {
+        self.owner.as_deref().unwrap_or(crate::users::first())
     }
     /// What its link in `/proc/<pid>/ns` reads, as Linux's `ns_get_name`.
     pub(crate) fn link(&self) -> Vec<u8> {
@@ -413,7 +464,7 @@ impl Default for Namespaces {
             ipc: new(Kind::Ipc, IPC_INIT),
             pid_for_children: pid.clone(),
             pid,
-            user: new(Kind::User, USER_INIT),
+            user: Arc::clone(crate::users::first()),
             mnt: new(Kind::Mnt, DYNAMIC_FIRST + 1),
             cgroup: new(Kind::Cgroup, CGROUP_INIT),
             time_for_children: time.clone(),
@@ -439,9 +490,19 @@ impl Namespaces {
             Entry::TimeForChildren => &self.time_for_children,
         }
     }
-    fn fresh(&self, from: &Namespace) -> Arc<Namespace> {
+    fn fresh(&self, from: &Namespace, owner: &Arc<Namespace>) -> Arc<Namespace> {
         let inode = self.inodes.fetch_add(1, Ordering::SeqCst);
-        Namespace::new(from.kind, inode, from.names())
+        Namespace::within(
+            from.kind,
+            inode,
+            from.names(),
+            Pids::default(),
+            Some(Arc::clone(owner)),
+        )
+    }
+    /// The next inode number, for a new user namespace.
+    pub(crate) fn next_inode(&self) -> u32 {
+        self.inodes.fetch_add(1, Ordering::SeqCst)
     }
     /// The namespaces with new ones for the [`SUPPORTED`] flags in `flags`,
     /// as Linux's `create_new_namespaces`: a new UTS namespace starts with
@@ -449,8 +510,9 @@ impl Namespaces {
     /// children take, made from the ones they took before. As
     /// `copy_pid_ns`, a new PID namespace is `EINVAL` while the children
     /// already take another than the thread's own, and `ENOSPC` beyond
-    /// [`MAX_PID_LEVEL`]; that is checked before anything is made.
-    pub(crate) fn unshared(&self, flags: u64) -> Result<Self, Errno> {
+    /// [`MAX_PID_LEVEL`]; that is checked before anything is made. The new
+    /// ones are `owner`'s, the user namespace of the thread that makes them.
+    pub(crate) fn unshared(&self, flags: u64, owner: &Arc<Namespace>) -> Result<Self, Errno> {
         if flags & CLONE_NEWPID != 0 {
             if !Arc::ptr_eq(&self.pid, &self.pid_for_children) {
                 return Err(Errno::EINVAL);
@@ -462,13 +524,13 @@ impl Namespaces {
         }
         let mut new = self.clone();
         if flags & CLONE_NEWUTS != 0 {
-            new.uts = self.fresh(&self.uts);
+            new.uts = self.fresh(&self.uts, owner);
         }
         if flags & CLONE_NEWIPC != 0 {
-            new.ipc = self.fresh(&self.ipc);
+            new.ipc = self.fresh(&self.ipc, owner);
         }
         if flags & CLONE_NEWNS != 0 {
-            new.mnt = self.fresh(&self.mnt);
+            new.mnt = self.fresh(&self.mnt, owner);
         }
         if flags & CLONE_NEWPID != 0 {
             let inode = self.inodes.fetch_add(1, Ordering::SeqCst);
@@ -477,18 +539,24 @@ impl Namespaces {
                 depth: self.pid.pids.depth + 1,
                 numbers: Mutex::default(),
             };
-            new.pid_for_children = Namespace::within(Kind::Pid, inode, self.pid.names(), pids);
+            new.pid_for_children = Namespace::within(
+                Kind::Pid,
+                inode,
+                self.pid.names(),
+                pids,
+                Some(Arc::clone(owner)),
+            );
         }
         if flags & CLONE_NEWCGROUP != 0 {
-            new.cgroup = self.fresh(&self.cgroup);
+            new.cgroup = self.fresh(&self.cgroup, owner);
         }
         if flags & CLONE_NEWNET != 0 {
-            new.net = self.fresh(&self.net);
+            new.net = self.fresh(&self.net, owner);
             let network = Arc::new(crate::inet::Network::isolated());
             let _ = new.net.sockets.network.set(network);
         }
         if flags & CLONE_NEWTIME != 0 {
-            new.time_for_children = self.fresh(&self.time_for_children);
+            new.time_for_children = self.fresh(&self.time_for_children, owner);
         }
         Ok(new)
     }
@@ -496,8 +564,13 @@ impl Namespaces {
     /// `flags`; the PID namespace children take, which numbers the child;
     /// and, for a child that does not share the memory (`timens_on_fork`),
     /// the time namespace children take.
-    pub(crate) fn for_child(&self, flags: u64, shares_memory: bool) -> Result<Self, Errno> {
-        let mut new = self.unshared(flags)?;
+    pub(crate) fn for_child(
+        &self,
+        flags: u64,
+        shares_memory: bool,
+        owner: &Arc<Namespace>,
+    ) -> Result<Self, Errno> {
+        let mut new = self.unshared(flags, owner)?;
         if !shares_memory {
             new.time = new.time_for_children.clone();
         }
@@ -602,7 +675,9 @@ mod tests {
     #[test]
     fn unsharing_makes_new_namespaces_of_only_the_flags() {
         let first = Namespaces::default();
-        let new = first.unshared(CLONE_NEWUTS | CLONE_NEWNS).unwrap();
+        let new = first
+            .unshared(CLONE_NEWUTS | CLONE_NEWNS, crate::users::first())
+            .unwrap();
         assert!(!Arc::ptr_eq(&first.uts, &new.uts));
         assert!(!Arc::ptr_eq(&first.mnt, &new.mnt));
         assert!(Arc::ptr_eq(&first.ipc, &new.ipc));
@@ -618,14 +693,16 @@ mod tests {
     #[test]
     fn a_new_time_namespace_is_for_children() {
         let first = Namespaces::default();
-        let new = first.unshared(CLONE_NEWTIME).unwrap();
+        let new = first
+            .unshared(CLONE_NEWTIME, crate::users::first())
+            .unwrap();
         assert!(Arc::ptr_eq(&first.time, &new.time));
         assert!(!Arc::ptr_eq(&new.time, &new.time_for_children));
         // A fork enters it; a child sharing the memory (vfork, a thread)
         // does not, until it runs a program.
-        let forked = new.for_child(0, false).unwrap();
+        let forked = new.for_child(0, false, crate::users::first()).unwrap();
         assert!(Arc::ptr_eq(&forked.time, &new.time_for_children));
-        let shared = new.for_child(0, true).unwrap();
+        let shared = new.for_child(0, true, crate::users::first()).unwrap();
         assert!(Arc::ptr_eq(&shared.time, &first.time));
         assert!(Arc::ptr_eq(&shared.exec().time, &new.time_for_children));
     }
@@ -634,18 +711,26 @@ mod tests {
     fn pid_namespaces_nest_32_levels_below_the_first() {
         let mut at = Namespaces::default();
         for _ in 0..MAX_PID_LEVEL {
-            at = at.for_child(CLONE_NEWPID, false).unwrap();
+            at = at
+                .for_child(CLONE_NEWPID, false, crate::users::first())
+                .unwrap();
         }
         assert_eq!(at.pid.pids.depth, 32);
-        assert_eq!(at.unshared(CLONE_NEWPID).unwrap_err(), Errno(28));
+        assert_eq!(
+            at.unshared(CLONE_NEWPID, crate::users::first())
+                .unwrap_err(),
+            Errno(28)
+        );
     }
 
     #[test]
     fn a_task_has_a_number_in_each_namespace_it_is_in() {
         let outer = Namespaces::default()
-            .for_child(CLONE_NEWPID, false)
+            .for_child(CLONE_NEWPID, false, crate::users::first())
             .unwrap();
-        let inner = outer.for_child(CLONE_NEWPID, false).unwrap();
+        let inner = outer
+            .for_child(CLONE_NEWPID, false, crate::users::first())
+            .unwrap();
         inner.pid.enter(7).unwrap();
         assert_eq!((inner.pid.number(7), outer.pid.number(7)), (1, 1));
         assert_eq!(inner.pid.init(), Some(7));

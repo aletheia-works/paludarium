@@ -714,7 +714,7 @@ impl Processes {
             if resource == 7 && hard > self.nr_open.load(Ordering::SeqCst) {
                 return Err(Errno::EPERM);
             }
-            if hard > old.1 && !sender.cap_sys_resource {
+            if hard > old.1 && !sender.capable(crate::credentials::CAP_SYS_RESOURCE) {
                 return Err(Errno::EPERM);
             }
             entry.limits[resource] = (soft, hard);
@@ -1275,8 +1275,9 @@ impl Processes {
             ppid: entry.parent,
             pgrp: entry.pgid,
             sid: entry.sid,
-            uid: leader.uid,
-            gid: leader.gid,
+            // As its own user namespace shows them (`fill_psinfo`).
+            uid: leader.user.shown(crate::users::Ids::User, leader.uid),
+            gid: leader.user.shown(crate::users::Ids::Group, leader.gid),
             cpu,
             children_cpu: entry.children_cpu,
             start_stack,
@@ -2038,7 +2039,8 @@ impl Kernel {
         let caller = thread.state.credentials.task_ids();
         scheduling::check_ioprio(
             ioprio,
-            caller.cap_sys_nice || thread.state.credentials.may_administer(),
+            caller.capable(crate::credentials::CAP_SYS_NICE)
+                || thread.state.credentials.may_administer(),
         )?;
         let which = match a[0] as i32 {
             which @ 1..=3 => which - 1,
@@ -2053,7 +2055,10 @@ impl Kernel {
         )?;
         let mut result = Err(Errno(3));
         for found in threads {
-            if found.ids.uid != caller.euid && found.ids.uid != caller.uid && !caller.cap_sys_nice {
+            if found.ids.uid != caller.euid
+                && found.ids.uid != caller.uid
+                && !caller.capable(crate::credentials::CAP_SYS_NICE)
+            {
                 return Err(Errno::EPERM);
             }
             let mut sched = found.group.sched(found.tid);
@@ -2228,7 +2233,7 @@ impl Kernel {
         let change = scheduling::set(
             &decided,
             attr,
-            caller.cap_sys_nice,
+            caller.capable(crate::credentials::CAP_SYS_NICE),
             self.processes.deadline_bandwidth(&target.group, target.tid),
             per_cpu * cpus as u64,
         )?;
@@ -2246,7 +2251,12 @@ impl Kernel {
     /// and are `EINVAL` otherwise, as Linux has them; `CLONE_SYSVSEM` has no
     /// semaphore adjustments to drop. A namespace flag gives the thread a
     /// new namespace of that kind ([`crate::namespaces::check`] has which).
-    fn unshare(&mut self, thread: &Thread, mem: &AddressSpace, flags: u64) -> Result<u64, Errno> {
+    fn unshare(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        flags: u64,
+    ) -> Result<u64, Errno> {
         const VM: u64 = 0x100;
         const FS: u64 = 0x200;
         const FILES: u64 = 0x400;
@@ -2284,11 +2294,19 @@ impl Kernel {
         if flags & VM != 0 && self.processes.shares_memory(self.process.pid, mem) {
             return Err(Errno::EINVAL);
         }
-        // unshare_userns, then unshare_nsproxy_namespaces.
-        crate::namespaces::check(flags, thread.state.credentials.may_administer())?;
-        if flags & crate::namespaces::SUPPORTED != 0 {
-            let namespaces = self.group.namespaces(thread.tid).unshared(flags)?;
+        // unshare_userns, then unshare_nsproxy_namespaces with the
+        // credentials it gave.
+        let own = self.group.namespaces(thread.tid);
+        let credentials = crate::namespaces::user_for(&own, &thread.state.credentials, flags)?;
+        crate::namespaces::check(flags, credentials.administers_own())?;
+        if flags & NAMESPACES != 0 {
+            let mut namespaces = own.unshared(flags, &credentials.user.0)?;
+            namespaces.user = Arc::clone(&credentials.user.0);
             self.group.set_namespaces(thread.tid, namespaces);
+        }
+        if credentials != thread.state.credentials {
+            self.group.set_task_ids(thread.tid, credentials.task_ids());
+            thread.state.credentials = credentials;
         }
         if flags & (FS | FILES) != 0 {
             self.files = self.files.for_clone(flags & FILES == 0, flags & FS == 0);
@@ -2316,7 +2334,7 @@ impl Kernel {
                 result = Err(Errno::EPERM);
             } else if nice < found.nice
                 && (20 - nice) as u64 > found.nice_limit
-                && !sender.cap_sys_nice
+                && !sender.capable(crate::credentials::CAP_SYS_NICE)
             {
                 result = Err(Errno::EACCES);
             } else {
@@ -2380,16 +2398,24 @@ impl Kernel {
     /// `/proc/<pid>/ns`, whose kind `nstype` names or is 0, or a pidfd and
     /// the namespaces of its process to enter (`EINVAL` for none or another
     /// flag). Each is checked in Linux's order (`validate_nsset`) before
-    /// any is entered: the user namespace is the thread's own (`EINVAL`);
-    /// a mount namespace needs CAP_SYS_ADMIN and CAP_SYS_CHROOT, and a
-    /// working directory no other thread shares when it is all that is
-    /// entered; a time namespace a thread alone in its memory (`EUSERS`);
-    /// every one CAP_SYS_ADMIN (`EPERM`); a PID namespace is the thread's
-    /// own or one nested in it (`EINVAL`). Entering a mount namespace moves
-    /// the working directory to its root; a PID namespace is the one
-    /// children take, and a time namespace is the thread's and its
-    /// children's.
-    fn setns(&mut self, thread: &Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
+    /// any is entered: a user namespace must not be the thread's own, nor be
+    /// entered by a thread sharing its memory or working directory
+    /// (`EINVAL`), and needs CAP_SYS_ADMIN in it (`EPERM`), which then gives
+    /// the thread every capability there, for the checks after it; a mount
+    /// namespace needs CAP_SYS_ADMIN and CAP_SYS_CHROOT, and a working
+    /// directory no other thread shares when it is all that is entered; a
+    /// time namespace a thread alone in its memory (`EUSERS`); every one
+    /// CAP_SYS_ADMIN over it, in the user namespace that owns it, and in
+    /// the thread's own (`EPERM`); a PID namespace is the thread's own or
+    /// one nested in it (`EINVAL`). Entering a mount namespace moves the
+    /// working directory to its root; a PID namespace is the one children
+    /// take, and a time namespace is the thread's and its children's.
+    fn setns(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
         use crate::namespaces::{self as ns, Kind};
         const CAP_SYS_CHROOT: u64 = 1 << 18;
         const CAP_SYS_PTRACE: u64 = 1 << 19;
@@ -2416,7 +2442,7 @@ impl Kernel {
                 let reader = &thread.state.credentials;
                 let target = view.group.task_ids(pidfd.pid, pidfd.pid);
                 if pidfd.pid != self.process.pid
-                    && reader.effective & CAP_SYS_PTRACE == 0
+                    && !reader.capable_in(CAP_SYS_PTRACE, &target.user)
                     && !(view.dumpable
                         && [target.uid, target.euid, target.suid] == [reader.uid; 3]
                         && [target.gid, target.egid, target.sgid] == [reader.gid; 3])
@@ -2440,8 +2466,7 @@ impl Kernel {
                 Kind::Time => all.time.clone(),
             },
         };
-        let credentials = &thread.state.credentials;
-        let admin = credentials.may_administer();
+        let mut credentials = thread.state.credentials.clone();
         let order = [
             Kind::User,
             Kind::Mnt,
@@ -2457,10 +2482,31 @@ impl Kernel {
             .filter(|kind| flags & kind.flag() != 0)
             .collect();
         for &kind in &entered {
+            let target = namespace(kind);
+            let admin = credentials.capable_in(crate::credentials::CAP_SYS_ADMIN, target.owner())
+                && credentials.administers_own();
             match kind {
-                // userns_install: there is only the first user namespace,
-                // which is the thread's own.
-                Kind::User => return Err(Errno::EINVAL),
+                // userns_install.
+                Kind::User => {
+                    if Arc::ptr_eq(&target, &credentials.user.0)
+                        || self.group.active_threads() > 1
+                        || self.processes.shares_memory(self.process.pid, mem)
+                        || self.files.shares_fs()
+                    {
+                        return Err(Errno::EINVAL);
+                    }
+                    if !credentials.capable_in(crate::credentials::CAP_SYS_ADMIN, &target) {
+                        return Err(Errno::EPERM);
+                    }
+                    credentials = crate::credentials::Credentials {
+                        user: crate::users::UserNs(Arc::clone(&target)),
+                        permitted: crate::credentials::ALL_CAPABILITIES,
+                        effective: crate::credentials::ALL_CAPABILITIES,
+                        inheritable: 0,
+                        keep_caps: false,
+                        ..credentials
+                    };
+                }
                 Kind::Mnt if !admin || credentials.effective & CAP_SYS_CHROOT == 0 => {
                     return Err(Errno::EPERM);
                 }
@@ -2479,7 +2525,7 @@ impl Kernel {
                 _ if !admin => return Err(Errno::EPERM),
                 // pidns_install: only the thread's own PID namespace or one
                 // nested in it, so that its children stay within it.
-                Kind::Pid if !namespace(kind).is_within(&self.pid_space(thread.tid)) => {
+                Kind::Pid if !target.is_within(&self.pid_space(thread.tid)) => {
                     return Err(Errno::EINVAL);
                 }
                 _ => {}
@@ -2506,6 +2552,10 @@ impl Kernel {
             }
         }
         self.group.set_namespaces(thread.tid, mine);
+        if credentials != thread.state.credentials {
+            self.group.set_task_ids(thread.tid, credentials.task_ids());
+            thread.state.credentials = credentials;
+        }
         Ok(0)
     }
     fn clone_process(
@@ -2557,14 +2607,16 @@ impl Kernel {
         let task = self.processes.charge_task()?;
         // copy_namespaces; CLONE_NEWIPC leaves the semaphore adjustments,
         // which CLONE_SYSVSEM would share.
-        crate::namespaces::check(namespaces, parent.state.credentials.may_administer())?;
+        // copy_creds first, whose new user namespace the others are in.
+        let own = self.group.namespaces(parent.tid);
+        let credentials = crate::namespaces::user_for(&own, &parent.state.credentials, namespaces)?;
+        crate::namespaces::check(namespaces, credentials.administers_own())?;
         if namespaces & crate::namespaces::CLONE_NEWIPC != 0 && flags & 0x40000 != 0 {
             return Err(Errno::EINVAL);
         }
-        let child_namespaces = self
-            .group
-            .namespaces(parent.tid)
-            .for_child(namespaces, flags & 0x100 != 0)?;
+        let mut child_namespaces =
+            own.for_child(namespaces, flags & 0x100 != 0, &credentials.user.0)?;
+        child_namespaces.user = Arc::clone(&credentials.user.0);
         let child_mem = if flags & 0x100 == 0 {
             Some(Arc::new(mem.fork()))
         } else {
@@ -2597,6 +2649,7 @@ impl Kernel {
             .new_process(group.numa(), parent.tid, pid, flags & 0x100 != 0);
         group.register(pid, inbox.clone());
         let mut state = parent.state.clone();
+        state.credentials = credentials.clone();
         state.pid = pid;
         state.pending.clear();
         // Nothing has come for the new task yet, which its group counts.
@@ -2634,7 +2687,7 @@ impl Kernel {
                 .write(GuestAddr(a[3]), &space.number(pid).to_le_bytes());
         }
         let release = (flags & 0x4000 != 0).then(|| Arc::new(AtomicBool::new(false)));
-        group.set_task_ids(pid, parent.state.credentials.task_ids());
+        group.set_task_ids(pid, credentials.task_ids());
         group.set_namespaces(pid, child_namespaces);
         self.processes.insert(
             pid,
@@ -2778,7 +2831,14 @@ impl Kernel {
                 (0, signo),
                 (8, code),
                 (16, pid as i32),
-                (20, uid as i32),
+                (
+                    20,
+                    thread
+                        .state
+                        .credentials
+                        .user
+                        .shown(crate::users::Ids::User, uid) as i32,
+                ),
                 (24, status),
             ] {
                 info[at..at + 4].copy_from_slice(&value.to_le_bytes());

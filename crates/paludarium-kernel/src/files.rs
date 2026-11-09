@@ -783,10 +783,19 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     c.files.fs.set_times(&p, follow, atime, mtime).map(|()| 0)
 }
-/// The owner or group of a `chown` call; -1 leaves it as it is.
-fn owner_id(id: u64) -> Option<u32> {
-    let id = id as u32;
-    (id != u32::MAX).then_some(id)
+/// The owner and group of a `chown` call, as kernel IDs: -1 leaves one as
+/// it is, and one the caller's user namespace does not map is `EINVAL`
+/// (`chown_common`).
+fn owner_ids(c: &Context<'_>, uid: u64, gid: u64) -> Result<(Option<u32>, Option<u32>), Errno> {
+    let user = &c.process.credentials.user;
+    let id = |id: u64, ids: crate::users::Ids| match id as u32 {
+        u32::MAX => Ok(None),
+        id => user.kernel_of(ids, id).map(Some).ok_or(Errno::EINVAL),
+    };
+    Ok((
+        id(uid, crate::users::Ids::User)?,
+        id(gid, crate::users::Ids::Group)?,
+    ))
 }
 /// The mode a file of `mode` has after `chown`, when it changes: as Linux's
 /// `chown_common`, a file that is not a directory loses its set-user-ID bit,
@@ -811,7 +820,7 @@ fn chown_file(
     gid: u64,
 ) -> Result<u64, Errno> {
     let stat = file.stat()?;
-    let (uid, gid) = (owner_id(uid), owner_id(gid));
+    let (uid, gid) = owner_ids(c, uid, gid)?;
     let keeps_sgid = crate::permissions::chown(&c.process.credentials, &stat, uid, gid)?;
     file.set_owner(uid, gid)?;
     if let Some(mode) = mode_after_chown(stat.mode, keeps_sgid) {
@@ -835,7 +844,7 @@ fn chown_path(
         None => {}
     }
     let stat = c.files.fs.metadata(path, follow)?;
-    let (uid, gid) = (owner_id(uid), owner_id(gid));
+    let (uid, gid) = owner_ids(c, uid, gid)?;
     let keeps_sgid = crate::permissions::chown(&c.process.credentials, &stat, uid, gid)?;
     c.files.fs.set_owner(path, follow, uid, gid)?;
     if let Some(mode) = mode_after_chown(stat.mode, keeps_sgid) {
@@ -1745,7 +1754,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             ),
         }
     };
-    let mut b = encode_statx(s, device, block_size)?;
+    let mut b = encode_statx(shown(c, s), device, block_size)?;
     // As Linux's vfs_statx, the mount's ID whether or not it was asked for:
     // the unique one if that was, the one mountinfo shows otherwise. A
     // mount's minor number is its position in mountinfo, whose IDs start at
@@ -1802,7 +1811,7 @@ fn stat(
     device: u64,
     block_size: u32,
 ) -> Result<u64, Errno> {
-    let mut bytes = encode_stat(s, block_size)?;
+    let mut bytes = encode_stat(shown(c, s), block_size)?;
     bytes[0..8].copy_from_slice(&device.to_le_bytes());
     output(c, addr, &bytes)?;
     Ok(0)
@@ -1919,6 +1928,15 @@ pub(crate) fn descriptor_block_size(c: &Context<'_>, d: &Descriptor) -> u32 {
 /// `st_blocks`: what the file system counts, or the size in 512-byte blocks.
 pub(crate) fn blocks(s: &FileStat) -> u64 {
     s.blocks.unwrap_or(s.size.div_ceil(512))
+}
+/// A file's status with its owner and group as the caller's user
+/// namespace shows them (`from_kuid_munged`).
+fn shown(c: &Context<'_>, s: FileStat) -> FileStat {
+    FileStat {
+        uid: c.shown_uid(s.uid),
+        gid: c.shown_gid(s.gid),
+        ..s
+    }
 }
 fn encode_stat(s: FileStat, block_size: u32) -> Result<[u8; 144], Errno> {
     let (seconds, nanos) = linux_mtime(s.mtime_ns)?;
@@ -3995,7 +4013,32 @@ fn open_path(
             let file = crate::namespaces::NamespaceFile::new(namespace, flags);
             return Ok((Arc::new(file), p.to_vec()));
         }
-        if let Some(content) = tasks::content(&task, path.entry) {
+        // The user namespace's files take one write, as Linux's
+        // `proc_uid_map_write` and `proc_setgroups_write`: opened for writing
+        // by whom their mode lets, and `setgroups` only with CAP_SYS_ADMIN
+        // in the namespace (`proc_setgroups_open`'s `EACCES`).
+        if let crate::proc::TaskEntry::IdMap(_) | crate::proc::TaskEntry::Setgroups = path.entry {
+            let content =
+                tasks::content(&task, path.entry, &c.process.credentials.user).unwrap_or_default();
+            let creds = &c.process.credentials;
+            let user = task.user();
+            if flags & 3 != 0 {
+                let (stat, ..) = tasks::stat(c, p, &task, path.entry, false)?;
+                crate::permissions::permission(creds, &stat, crate::permissions::MAY_WRITE)?;
+                if path.entry == crate::proc::TaskEntry::Setgroups
+                    && !creds.capable_in(crate::credentials::CAP_SYS_ADMIN, &user)
+                {
+                    return Err(Errno::EACCES);
+                }
+            }
+            let ids = match path.entry {
+                crate::proc::TaskEntry::IdMap(ids) => Some(ids),
+                _ => None,
+            };
+            let file = crate::users::MapFile::open(user, ids, content, creds.clone(), flags);
+            return Ok((Arc::new(file), p.to_vec()));
+        }
+        if let Some(content) = tasks::content(&task, path.entry, &c.process.credentials.user) {
             Arc::new(crate::proc::GeneratedFile::open(content, flags))
         } else if let Some(target) = tasks::link(&task, path.entry) {
             // `exe`, `cwd` and `thread-self` are links, which O_NOFOLLOW
@@ -4941,5 +4984,6 @@ fn status(c: &Context<'_>) -> Vec<u8> {
         ),
         no_new_privs,
         credentials: &c.process.credentials,
+        reader: &c.process.credentials.user,
     })
 }

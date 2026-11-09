@@ -89,7 +89,7 @@ fn anything_else_may_change_the_vector_state() {
         assert!(!exec::keeps_vector_state(&insn), "{bytes:02x?}");
         let state = CpuState::default();
         assert!(
-            Snapshot::of(&state, Decoded::new(insn).keeps_vector_state)
+            Snapshot::of(&state, Decoded::new(&insn).keeps_vector_state)
                 .vector
                 .is_some()
         );

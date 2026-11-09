@@ -10,8 +10,8 @@ fn nop(rip: u64) -> Instruction {
 }
 
 /// Appends the block of a lone `nop` at `rip`.
-fn lone(code: &mut Vec<Decoded>, rip: u64) -> Result<(), ExitReason> {
-    code.push(Decoded::new(nop(rip)));
+fn lone(code: &mut Code, rip: u64) -> Result<(), ExitReason> {
+    code.push(nop(rip));
     Ok(())
 }
 
@@ -54,7 +54,7 @@ fn frequent_collisions_double_the_cache_and_keep_its_entries() {
     cache.lookup();
     assert_eq!(cache.slots.len(), INITIAL_ENTRIES * 2);
     assert_eq!(cache.mask, INITIAL_ENTRIES as u64 * 2 - 1);
-    let found = |rip| cache.get_with_hint(rip, 1).map(|(d, _)| d.instruction);
+    let found = |rip| cache.get_with_hint(rip, 1).map(|(_, i, _)| i);
     assert_eq!(found(other), Some(nop(other)));
     assert_eq!(found(FIRST), Some(nop(FIRST)));
 }
@@ -135,17 +135,17 @@ fn the_interpreter_grows_the_cache_it_misses() {
             decodes.set(decodes.get() + 1);
             lone(code, rip)
         });
-        let block = block.map(|b| {
-            cache.code[b]
-                .iter()
-                .map(|d| d.instruction)
-                .collect::<Vec<_>>()
-        });
+        let block = block.map(|b| cache.code.instructions[b].to_vec());
         assert_eq!(block, Ok(vec![nop(rip)]));
     }
     assert!(lookups > GROWTH_WINDOW);
     assert_eq!(decodes.get(), lookups);
     assert_eq!(cache.slots.len(), INITIAL_ENTRIES * 2);
+}
+
+#[test]
+fn what_every_run_reads_fits_in_a_cache_line() {
+    assert!(size_of::<Decoded>() <= 64, "{}", size_of::<Decoded>());
 }
 
 #[test]

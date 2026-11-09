@@ -17,6 +17,7 @@
     {"name":"namespaces","binary":"process"},
     {"name":"pid-namespaces","binary":"process"},
     {"name":"net-namespaces","binary":"process"},
+    {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},
     {"name":"landlock","binary":"process"},

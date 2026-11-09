@@ -28,6 +28,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <grp.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -5106,6 +5107,136 @@ int main(int argc, char **argv) {
         errno = 0;
         result("alone", syscall(SYS_unshare, CLONE_VM|CLONE_SIGHAND));
         result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "user-namespaces")) {
+        /* Root makes files of three owners, and a child that makes a user
+           namespace, whose maps root writes for it. */
+        char dir[] = "/tmp/userns-XXXXXX";
+        if (!mkdtemp(dir) || chmod(dir, 0755)) return 90;
+        char own[64], other[64], roots[64];
+        snprintf(own, sizeof own, "%s/own", dir);
+        snprintf(other, sizeof other, "%s/other", dir);
+        snprintf(roots, sizeof roots, "%s/root", dir);
+        const char *names[] = {own, other, roots};
+        uid_t owners[] = {1000, 2005, 0};
+        for (int i = 0; i < 3; i++) {
+            int fd = open(names[i], O_CREAT | O_WRONLY, 0644);
+            if (fd < 0 || fchown(fd, owners[i], owners[i])) return 91;
+            close(fd);
+        }
+        int ready[2], mapped[2];
+        if (pipe(ready) || pipe(mapped)) return 92;
+        fflush(stdout);
+        pid_t inner = child();
+        if (inner == 0) {
+            char before[64], after[64], byte;
+            ns_link("self", "user", before, sizeof before);
+            errno = 0;
+            long made = syscall(SYS_unshare, CLONE_NEWUSER);
+            ns_link("self", "user", after, sizeof after);
+            struct caps_word caps[2];
+            caps_get(CAPS_V3, 0, caps);
+            uint64_t effective = caps[0].effective | (uint64_t)caps[1].effective << 32;
+            printf("inner: unshare=%ld errno=%d changed=%d uid=%d gid=%d full=%d\n", made, errno,
+                   strcmp(before, after) != 0, getuid(), getgid(), effective == CAPS_ALL);
+            char text[256] = {0};
+            int fd = open("/proc/self/uid_map", O_RDONLY);
+            long n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+            printf("inner: uid_map=%ld", n);
+            close(fd);
+            fd = open("/proc/self/setgroups", O_RDONLY);
+            n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+            text[n > 0 ? n : 0] = 0;
+            printf(" setgroups=%s", text);
+            close(fd);
+            fflush(stdout);
+            if (write(ready[1], "x", 1) != 1 || read(mapped[0], &byte, 1) != 1) _exit(93);
+            /* Mapped: root is root, 1 is 1000 and 5 and 6 are 2005 and 2006
+               outside. */
+            struct stat st;
+            printf("mapped: uid=%d gid=%d", getuid(), getgid());
+            for (int i = 0; i < 3; i++) {
+                stat(names[i], &st);
+                printf(" %s=%d,%d", i == 0 ? "own" : i == 1 ? "other" : "root", st.st_uid, st.st_gid);
+            }
+            printf("\n");
+            fd = open("/proc/self/uid_map", O_RDONLY);
+            n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+            text[n > 0 ? n : 0] = 0;
+            printf("mapped: uid_map=\n%s", text);
+            close(fd);
+            fd = open("/proc/self/uid_map", O_WRONLY);
+            errno = 0;
+            long again = write(fd, "0 1000 1\n", 9);
+            printf("mapped: again=%ld errno=%d\n", again, errno);
+            close(fd);
+            /* Capabilities count for what the namespace maps: its own file,
+               not root's; a group list it may set. */
+            errno = 0;
+            long mine = chmod(own, 0600);
+            int mine_errno = errno;
+            errno = 0;
+            long theirs = chmod(roots, 0600);
+            printf("mapped: chmod-own=%ld errno=%d chmod-root=%ld errno=%d", mine, mine_errno, theirs,
+                   errno);
+            errno = 0;
+            long unmapped = setuid(50);
+            printf(" setuid-unmapped=%ld errno=%d", unmapped, errno);
+            errno = 0;
+            long groups = setgroups(0, NULL);
+            printf(" setgroups=%ld errno=%d\n", groups, errno);
+            /* Its capabilities do not reach the first UTS namespace, but
+               one it makes is its own. */
+            fflush(stdout);
+            pid_t named = child();
+            if (named == 0) {
+                errno = 0;
+                long first = sethostname("inner", 5);
+                int first_errno = errno;
+                long uts = syscall(SYS_unshare, CLONE_NEWUTS);
+                long second = sethostname("inner", 5);
+                struct utsname names_now;
+                uname(&names_now);
+                printf("named: first=%ld errno=%d unshare=%ld second=%ld nodename=%s\n", first, first_errno,
+                       uts, second, names_now.nodename);
+                fflush(stdout);
+                _exit(0);
+            }
+            result("named", reaped(named));
+            /* An ID it maps it may become, and it is then that ID outside. */
+            errno = 0;
+            long became = setresuid(6, 6, 6);
+            int became_errno = errno;
+            long stated = stat(other, &st);
+            printf("mapped: setresuid=%ld errno=%d uid=%d stat=%ld other=%d\n", became, became_errno,
+                   getuid(), stated, st.st_uid);
+            fflush(stdout);
+            _exit(0);
+        }
+        char byte;
+        if (read(ready[0], &byte, 1) != 1) return 94;
+        char path[64], text[256] = {0};
+        snprintf(path, sizeof path, "/proc/%d/uid_map", inner);
+        int fd = open(path, O_WRONLY);
+        const char *map = "0 0 1\n1 1000 1\n5 2005 2\n";
+        long uid_written = write(fd, map, strlen(map));
+        close(fd);
+        snprintf(path, sizeof path, "/proc/%d/gid_map", inner);
+        fd = open(path, O_WRONLY);
+        long gid_written = write(fd, map, strlen(map));
+        close(fd);
+        snprintf(path, sizeof path, "/proc/%d/uid_map", inner);
+        fd = open(path, O_RDONLY);
+        long n = read(fd, text, sizeof text - 1);
+        text[n > 0 ? n : 0] = 0;
+        close(fd);
+        printf("outer: uid=%ld gid=%ld uid_map=\n%s", uid_written, gid_written, text);
+        fflush(stdout);
+        if (write(mapped[1], "x", 1) != 1) return 95;
+        result("inner", reaped(inner));
+        for (int i = 0; i < 3; i++) unlink(names[i]);
+        rmdir(dir);
         return 0;
     }
     if (!strcmp(mode, "net-namespaces")) {

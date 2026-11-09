@@ -20,8 +20,10 @@ CI run produces them afresh on an x86-64 Linux runner.
 - Each case has a 30-second timeout, or a longer one for a case that waits
   out a timer of Linux's own, such as `TIME_WAIT`.
 - The emulated side of the program cases runs on a virtual clock
-  (`RecordingHost`): a sleep jumps it to its deadline at once, and a timed
-  wait does so after up to 10 ms of real time for a wake-up. The clock is
+  (`RecordingHost`): a sleep or a timed wait jumps it to its deadline after
+  up to 10 ms of real time (no more than the wait itself) for a wake-up from
+  another thread, so a signal another process sends just as a long sleep
+  starts still comes before the sleep ends, as on Linux. The clock is
   shared by every process and thread of the guest, so one that sleeps moves
   the time another one sees. A case therefore prints no times, and compares
   how long a wait took only when no other process or thread sleeps

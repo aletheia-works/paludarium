@@ -45,6 +45,33 @@ impl Default for Streams {
         }
     }
 }
+impl Streams {
+    fn now(&self, clock: ClockId) -> u64 {
+        match clock {
+            ClockId::Monotonic => self.monotonic,
+            ClockId::Realtime => self.realtime,
+        }
+    }
+}
+/// The real time, in nanoseconds, a wait on the virtual clock gives other
+/// threads to wake it before it jumps to its deadline.
+const GRACE: u64 = 10_000_000;
+/// Whether `cancel` is set within `nanos` of real time.
+#[cfg(not(target_arch = "wasm32"))]
+fn cancelled_within(cancel: &std::sync::atomic::AtomicBool, nanos: u64) -> bool {
+    use std::time::{Duration, Instant};
+    let end = Instant::now() + Duration::from_nanos(nanos);
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= end {
+            return false;
+        }
+        std::thread::sleep((end - now).min(Duration::from_micros(100)));
+    }
+}
 /// Records guest output in memory.
 #[derive(Default)]
 pub struct RecordingHost {
@@ -122,6 +149,24 @@ impl RecordingHost {
     fn lock(&self) -> std::sync::MutexGuard<'_, Streams> {
         self.streams.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Ends a wait at `deadline` on the virtual clock at once, unless it is
+    /// cancelled or interrupted first.
+    fn jump(
+        &self,
+        clock: ClockId,
+        deadline: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<WaitOutcome, Errno> {
+        let mut s = self.lock();
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) || s.interrupt_wait {
+            s.interrupt_wait = false;
+            return Ok(WaitOutcome::Interrupted);
+        }
+        let elapsed = deadline.saturating_sub(s.now(clock));
+        s.monotonic = s.monotonic.saturating_add(elapsed);
+        s.realtime = s.realtime.saturating_add(elapsed);
+        Ok(WaitOutcome::Complete)
+    }
 
     /// Everything written to standard output so far.
     #[must_use]
@@ -142,34 +187,38 @@ impl Host for RecordingHost {
     }
 
     fn clock(&self, clock: ClockId) -> Result<u64, Errno> {
-        let s = self.lock();
-        Ok(match clock {
-            ClockId::Monotonic => s.monotonic,
-            ClockId::Realtime => s.realtime,
-        })
+        Ok(self.lock().now(clock))
     }
+    /// Gives other threads the wait's time, up to [`GRACE`], of real time
+    /// to cancel it, then reaches its deadline at once on the virtual clock.
+    /// A signal another process sends while this one sleeps still comes
+    /// before the sleep ends, as it does on Linux, where the sleep lasts: a
+    /// clock that jumped at once would let a long sleep end, and the
+    /// sleeper exit, before a kill sent just as it started could land.
     fn wait_until(
         &self,
         clock: ClockId,
         deadline: u64,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<WaitOutcome, Errno> {
-        let mut s = self.lock();
-        if cancel.load(std::sync::atomic::Ordering::SeqCst) || s.interrupt_wait {
-            s.interrupt_wait = false;
+        let remaining = {
+            let mut s = self.lock();
+            if s.interrupt_wait {
+                s.interrupt_wait = false;
+                return Ok(WaitOutcome::Interrupted);
+            }
+            deadline.saturating_sub(s.now(clock))
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if cancelled_within(cancel, remaining.min(GRACE)) {
             return Ok(WaitOutcome::Interrupted);
         }
-        let current = match clock {
-            ClockId::Monotonic => s.monotonic,
-            ClockId::Realtime => s.realtime,
-        };
-        let elapsed = deadline.saturating_sub(current);
-        s.monotonic = s.monotonic.saturating_add(elapsed);
-        s.realtime = s.realtime.saturating_add(elapsed);
-        Ok(WaitOutcome::Complete)
+        #[cfg(target_arch = "wasm32")]
+        let _ = remaining;
+        self.jump(clock, deadline, cancel)
     }
-    /// A bounded wait gives other threads 10 ms of real time to change the
-    /// token, then reaches its deadline at once on the virtual clock, as
+    /// A bounded wait gives other threads [`GRACE`] of real time to change
+    /// the token, then reaches its deadline at once on the virtual clock, as
     /// [`Host::wait_until`] does here; an unbounded one waits in real time.
     fn wait_on(
         &self,
@@ -182,12 +231,12 @@ impl Host for RecordingHost {
             return crate::threads::wait(self, token, expected, None, cancel);
         };
         if token.value() == expected && !cancel.load(std::sync::atomic::Ordering::SeqCst) {
-            crate::threads::wait_briefly(token, expected, 10_000_000);
+            crate::threads::wait_briefly(token, expected, GRACE);
         }
         if token.value() != expected {
             return Ok(WaitOutcome::Complete);
         }
-        self.wait_until(clock, end, cancel)
+        self.jump(clock, end, cancel)
     }
     /// Only once [`RecordingHost::open_stdin`] made it a live stream: bytes
     /// to read, nothing yet, or its end after [`RecordingHost::close_stdin`].
@@ -280,5 +329,85 @@ impl Host for RecordingHost {
         }
         let _ = address;
         Ok(None)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{Duration, Instant};
+
+    /// A long sleep on the virtual clock still takes real time, its grace,
+    /// before it reaches its deadline, and then moves both clocks by it.
+    #[test]
+    fn a_long_wait_takes_its_grace_of_real_time_before_it_jumps() {
+        let host = RecordingHost::new();
+        let start = Instant::now();
+        let outcome = host.wait_until(
+            ClockId::Monotonic,
+            10_101_000_000_000,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(outcome, Ok(WaitOutcome::Complete));
+        assert!(start.elapsed() >= Duration::from_nanos(GRACE));
+        assert_eq!(host.clock(ClockId::Monotonic), Ok(10_101_000_000_000));
+        assert_eq!(
+            host.clock(ClockId::Realtime),
+            Ok(1_700_000_000_000_000_000 + 10_101_000_000_000)
+        );
+    }
+
+    /// A wake another thread gives once the sleep has started ends it,
+    /// without moving the clock: the kill-before-sleep case's parent kills
+    /// a child that has just started a 10101 s nanosleep. Without the grace
+    /// the sleep ended first, and the child exited before the kill.
+    #[test]
+    fn a_wake_after_a_long_wait_starts_interrupts_it() {
+        let host = Arc::new(RecordingHost::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (host, cancel, started) = (host.clone(), cancel.clone(), started.clone());
+            std::thread::spawn(move || {
+                started.store(true, Ordering::SeqCst);
+                host.wait_until(ClockId::Monotonic, 10_101_000_000_000, &cancel)
+            })
+        };
+        while !started.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        // Well after the waiter reached its wait, well within the grace.
+        let late = Instant::now() + Duration::from_millis(1);
+        while Instant::now() < late {
+            std::hint::spin_loop();
+        }
+        cancel.store(true, Ordering::SeqCst);
+        assert_eq!(waiter.join().unwrap(), Ok(WaitOutcome::Interrupted));
+        assert_eq!(host.clock(ClockId::Monotonic), Ok(0));
+    }
+
+    /// A wait already cancelled is interrupted, and one at its deadline
+    /// completes, both without moving the clock. (No bound on the real time
+    /// they take: a loaded machine can stall any thread.)
+    #[test]
+    fn a_cancelled_or_due_wait_ends_without_moving_the_clock() {
+        let host = RecordingHost::new();
+        assert_eq!(
+            host.wait_until(
+                ClockId::Monotonic,
+                10_101_000_000_000,
+                &AtomicBool::new(true)
+            ),
+            Ok(WaitOutcome::Interrupted)
+        );
+        assert_eq!(
+            host.wait_until(ClockId::Monotonic, 0, &AtomicBool::new(false)),
+            Ok(WaitOutcome::Complete)
+        );
+        assert_eq!(host.clock(ClockId::Monotonic), Ok(0));
     }
 }

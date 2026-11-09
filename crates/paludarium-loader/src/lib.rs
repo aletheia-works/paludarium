@@ -52,6 +52,8 @@ pub mod auxv {
     pub const AT_SECURE: u64 = 23;
     pub const AT_RANDOM: u64 = 25;
     pub const AT_EXECFN: u64 = 31;
+    pub const AT_RSEQ_FEATURE_SIZE: u64 = 27;
+    pub const AT_RSEQ_ALIGN: u64 = 28;
 }
 
 /// Why a program could not be loaded.
@@ -412,7 +414,7 @@ fn build_stack(
     let random = w.push_bytes(&start.random)?;
 
     use auxv::*;
-    let aux: [(u64, u64); 17] = [
+    let aux: [(u64, u64); 19] = [
         (AT_PHDR, image.program_header_address.0),
         (AT_PHENT, elf::PHDR_SIZE),
         (AT_PHNUM, u64::from(image.program_header_count)),
@@ -429,9 +431,13 @@ fn build_stack(
         (AT_HWCAP, 0),
         (AT_RANDOM, random),
         (AT_EXECFN, execfn),
+        // What the kernel's rseq keeps up to date, as Linux's
+        // offsetof(struct rseq, end), and the area's alignment.
+        (AT_RSEQ_FEATURE_SIZE, 28),
+        (AT_RSEQ_ALIGN, 32),
         (AT_NULL, 0),
     ];
-    let mut words: Vec<u64> = Vec::with_capacity(3 + arg_ptrs.len() + env_ptrs.len() + 34);
+    let mut words: Vec<u64> = Vec::with_capacity(3 + arg_ptrs.len() + env_ptrs.len() + 38);
     words.push(u64::try_from(arg_ptrs.len()).map_err(|_| LoadError::TooLarge)?);
     words.extend(&arg_ptrs);
     words.push(0);

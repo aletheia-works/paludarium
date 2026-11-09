@@ -31,6 +31,9 @@ pub struct ThreadGroup {
     /// The CPU mask `sched_setaffinity` gave each thread, which Linux keeps
     /// per thread; one without lets every CPU run it.
     affinity: Mutex<BTreeMap<u32, Vec<u64>>>,
+    /// How many times a CPU mask has been set, so that a thread on a
+    /// virtual CPU reads its mask again only after a change.
+    affinity_changes: std::sync::atomic::AtomicU64,
     /// The NUMA memory policies of its threads and of its address space.
     numa: crate::mempolicy::Numa,
     /// What signalling each thread looks at, for other processes to read;
@@ -114,6 +117,7 @@ impl Default for ThreadGroup {
             nice: Mutex::default(),
             sched: Mutex::default(),
             affinity: Mutex::default(),
+            affinity_changes: std::sync::atomic::AtomicU64::new(0),
             numa: crate::mempolicy::Numa::default(),
             task_ids: Mutex::default(),
             namespaces: Mutex::default(),
@@ -527,6 +531,13 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(tid, mask);
+        self.affinity_changes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Changes with every [`Self::set_affinity`].
+    pub(crate) fn affinity_generation(&self) -> u64 {
+        self.affinity_changes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
     pub(crate) fn set_nice(&self, tid: u32, value: i32) {
         self.nice
@@ -1279,6 +1290,10 @@ impl Kernel {
         state.alt_stack = AltStack::default();
         state.exit_status = None;
         state.clear_child_tid = if flags & 0x200000 != 0 { a[3] } else { 0 };
+        // A new thread registers its own rseq area (Linux's rseq_fork).
+        state.rseq = None;
+        state.on_cpu = None;
+        state.rseq_notify = false;
         let inbox = Arc::new(SignalInbox::default());
         let mut child = Kernel {
             host: self.host.clone(),
@@ -1297,6 +1312,7 @@ impl Kernel {
             unimplemented: self.unimplemented.clone(),
             task: Some(task),
             published: None,
+            seat: None,
         };
         // A new thread starts with its creator's nice value, set before it
         // is registered so that no one sees it without one, and its

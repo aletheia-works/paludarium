@@ -464,6 +464,8 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
         if let Some(&(id, size)) = attachments.get(&f.open_file)
             && lies(f.start, f.offset)
         {
+            // Linux bounds the pieces by the size rounded up to a page
+            // (`size = PAGE_ALIGN(size)` before its second loop).
             found = Some((f.open_file, id, size.div_ceil(PAGE) * PAGE));
             c.mem.unmap_shared(GuestAddr(f.start), f.end - f.start)?;
             c.group.numa().forget(f.start, f.end - f.start);
@@ -545,6 +547,8 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                 let segment = if cmd == IPC_STAT {
                     table.checked(id)?
                 } else {
+                    // An index, of which Linux's `ipc_obtain_object_idr` takes
+                    // the low bits (`ipcid_to_idx`), as of an ID.
                     table
                         .segments
                         .get_mut(&(id as u32 % IPCMNI))

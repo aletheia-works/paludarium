@@ -334,6 +334,8 @@ impl Processes {
             Some(&id) => self.take(id)?,
             None => self.allocate()?,
         };
+        // When the namespaces refuse it, the ID stays used up, as one from
+        // `allocate` does: IDs here are never handed out twice.
         space.enter(id, &set_tid[..set_tid.len().min(levels.len() - 1)])?;
         Ok(id)
     }

@@ -1265,11 +1265,12 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let child_namespaces = own.for_child(namespaces, true, &parent.state.credentials.user.0)?;
-        let tid = self.processes.allocate()?;
-        if tid > i32::MAX as u32 {
-            return Err(Errno::EAGAIN);
-        }
-        child_namespaces.pid.enter(tid)?;
+        let set_tid = std::mem::take(&mut self.set_tid);
+        let tid = self.processes.allocate_in(
+            &child_namespaces.pid,
+            &set_tid,
+            &parent.state.credentials,
+        )?;
         let mut cpu = parent.cpu.clone();
         cpu.gpr[reg::RAX] = 0;
         if a[1] != 0 {
@@ -1312,6 +1313,7 @@ impl Kernel {
             unimplemented: self.unimplemented.clone(),
             task: Some(task),
             published: None,
+            set_tid: Vec::new(),
             seat: None,
         };
         // A new thread starts with its creator's nice value, set before it

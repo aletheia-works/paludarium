@@ -691,7 +691,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   でも、`SCM_CREDENTIALS` と `SO_PEERCRED` でも、`shmctl` のプロセス ID とコアの中でも
   同じです。`kill(-1)` は、呼び出したプロセスの名前空間の、init を除くプロセスに送ります。
   `/proc` は、Linux で最初の名前空間でマウントした `/proc` と同じく、最初の名前空間の ID を
-  見せます。init は、ハンドラーのあるシグナルと、名前空間の外かカーネルからの SIGKILL と
+  見せます。`/proc/<pid>/status` の `NStgid`、`NSpid`、`NSpgid`、`NSsid` の行は、
+  タスクの ID を、そこと、その下から自分の名前空間までのそれぞれの名前空間で示します
+  （名前空間の外のグループやセッションは 0）。`clone3` の `set_tid` は、子が取る番号を
+  自分の名前空間から外へ 1 つずつ与え、Linux の `alloc_pid` と同じく確かめます。名前空間より
+  多い番号、1 より小さいか 4194304（Linux の `pid_max` の最大）以上の番号、init がまだない
+  名前空間での 1 以外の番号は `EINVAL`、その名前空間を持つユーザー名前空間で
+  `CAP_SYS_ADMIN` も `CAP_CHECKPOINT_RESTORE` もなければ `EPERM`、使われている番号は
+  `EEXIST` です。最初の名前空間の番号は paludarium がタスクを呼ぶ ID なので、そこでの
+  `set_tid` は、まだどのタスクも持ったことのない ID を取ります。init は、ハンドラーのあるシグナルと、名前空間の外かカーネルからの SIGKILL と
   SIGSTOP だけを受け取ります（Linux の `SIGNAL_UNKILLABLE`）。フォールトでは終わります。
   名前空間の孤児は init か、名前空間の中の子のサブリーパーに引き取られます。init が
   終わると、名前空間のほかのプロセスはすべて SIGKILL を受け、名前空間にはもう入れません
@@ -1138,8 +1146,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   届いてブロックされているシグナルも受け取ります。
 - `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が
   0 でない長い構造体には `E2BIG`）、それが表す `clone` として動きます。
-  `CLONE_CLEAR_SIGHAND` は、ハンドラを設定したシグナルを既定に戻します。`set_tid` と
-  `CLONE_INTO_CGROUP` は `EINVAL` を返します。`clone` そのものは、Linux と同じく flags の
+  `CLONE_CLEAR_SIGHAND` は、ハンドラを設定したシグナルを既定に戻します。`set_tid` は上の PID
+  名前空間で書いたとおりで、`CLONE_INTO_CGROUP` は `EINVAL` を返します。`clone` そのものは、Linux と同じく flags の
   下位 32 ビットだけを読むので、`CLONE_CLEAR_SIGHAND` は `clone3` でしか使えません。
 - `prctl` は `PR_SET_NAME`／`PR_GET_NAME`（スレッドごとの 15 バイトまでの名前。
   `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、

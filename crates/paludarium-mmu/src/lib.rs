@@ -581,7 +581,7 @@ impl Page {
 /// A frame with a copy of the contents of `frame`, which has none if `frame`
 /// has none; `None` when the meter has no room for them.
 fn copied(frame: &Frame, meter: Option<&Arc<MemoryMeter>>) -> Option<Frame> {
-    let copy = Frame::default();
+    let copy = Arc::new(frame.successor());
     if let Some(bytes) = frame.get() {
         let bytes = FrameBytes::new(meter, || {
             bytes
@@ -629,7 +629,52 @@ impl PageTable {
 /// The upper level: a sparse map from directory index to page table.
 type Directory = BTreeMap<u64, PageTable>;
 
-type Frame = Arc<OnceLock<FrameBytes>>;
+type Frame = Arc<FrameCell>;
+
+/// The contents of a page, which its entry, the [`ThreadTlb`]s that hold
+/// it and a [`SharedPages`] share, and whether an instruction was fetched
+/// from it.
+#[derive(Default)]
+struct FrameCell {
+    bytes: OnceLock<FrameBytes>,
+    /// An instruction was fetched from the page: from then on a store to it
+    /// while it is executable bumps the code generation, as decoded
+    /// instructions of the page may be cached. A store to code nothing
+    /// fetched leaves the generation, so that one to data on a page that is
+    /// also executable (the heap of SBCL, of a JIT) does not make every
+    /// decoded instruction stale. Set under the space's locks after the
+    /// epoch moved on ([`AddressSpaceData::mark_fetched`]), and never
+    /// cleared: a page that holds data again costs decodes, not
+    /// correctness. The [`TlbEntry`]s of the page share it, as they hold
+    /// the bytes and not the cell ([`TlbFrame`]).
+    fetched: Arc<AtomicBool>,
+}
+
+impl FrameCell {
+    #[inline]
+    fn get(&self) -> Option<&FrameBytes> {
+        self.bytes.get()
+    }
+    fn set(&self, bytes: FrameBytes) -> Result<(), FrameBytes> {
+        self.bytes.set(bytes)
+    }
+    /// Whether an instruction was fetched from the page. `Acquire`: a
+    /// fetch that sees it set sees every store that did not see it
+    /// ([`AddressSpaceData::mark_fetched`]).
+    #[inline]
+    fn fetched(&self) -> bool {
+        self.fetched.load(Ordering::Acquire)
+    }
+    /// A cell without contents that keeps this one's mark, for a frame that
+    /// takes the place of this one: an instruction decoded from this one
+    /// is as stale after a store to that one.
+    fn successor(&self) -> Self {
+        FrameCell {
+            bytes: OnceLock::new(),
+            fetched: Arc::new(AtomicBool::new(self.fetched())),
+        }
+    }
+}
 
 /// Memory that every mapping of it shows, in every address space: shared
 /// anonymous memory, or the page cache of a file, whose frames are keyed by
@@ -1002,6 +1047,9 @@ struct TlbEntry {
     frame: TlbFrame,
     cow: bool,
     file: Option<FileEnd>,
+    /// The page's mark that an instruction was fetched from it
+    /// ([`FrameCell::fetched`]).
+    fetched: Arc<AtomicBool>,
     /// The bookkeeping of the shared mapping's memory the page shows, whose
     /// generation a store moves on, as under the locks.
     shared: Option<SharedStores>,
@@ -1241,10 +1289,11 @@ const CODE_GENERATIONS_PER_SPACE: u64 = 1 << 40;
 /// The counters of a space that [`AddressSpace::code_generation_cached`]
 /// and the loads through a [`ThreadTlb`] read without the locks.
 struct CodeCounters {
-    /// Bumped whenever executable memory or the mappings change, and by
-    /// every store to the shared mappings and page caches the space may run
-    /// code from (which it [`SharedPages::watch`]es); lets the CPU cache
-    /// decoded instructions safely (see [`AddressSpaceData::code_generation`]).
+    /// Bumped whenever executable memory that was fetched from or the
+    /// mappings change, and by every store to the shared mappings and page
+    /// caches the space may run code from (which it [`SharedPages::watch`]es);
+    /// lets the CPU cache decoded instructions safely (see
+    /// [`AddressSpaceData::code_generation`]).
     generation: AtomicU64,
     /// Bumped whenever the space is borrowed mutably, which may change its
     /// shared mappings and page caches, and the protection of their pages.
@@ -1278,12 +1327,28 @@ impl CodeCounters {
     /// emptied at once, so that the frames it holds go now; the other
     /// threads' go at their next access.
     fn bump_epoch(&self) {
-        let old = self
-            .epoch
-            .swap(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed), Ordering::SeqCst);
+        self.move_epoch(false);
+    }
+
+    /// [`Self::bump_epoch`] when no page entry or mapping changes, only what
+    /// a store reads from the frames ([`AddressSpaceData::mark_fetched`]):
+    /// this thread's own TLB keeps its entries, which stay as valid, and
+    /// moves to the new epoch with them, as its own later stores see what
+    /// it did before. Only the other threads' TLBs are emptied.
+    fn bump_epoch_keeping_own(&self) {
+        self.move_epoch(true);
+    }
+
+    fn move_epoch(&self, keep_own: bool) {
+        let new = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+        let old = self.epoch.swap(new, Ordering::SeqCst);
         THREAD_TLB.with(|cell| {
             if let Ok(mut thread) = cell.try_borrow_mut() {
-                thread.tlb.flush();
+                if keep_own && thread.epoch == old {
+                    thread.epoch = new;
+                } else {
+                    thread.tlb.flush();
+                }
             }
         });
         // Each store sets its `storing` and then reads the epoch again, both
@@ -1476,8 +1541,9 @@ impl AddressSpaceData {
         self.id
     }
 
-    /// A counter that changes whenever executable memory is written or the
-    /// mappings change (map, unmap, protect), including a store by any space
+    /// A counter that changes whenever executable memory that an instruction
+    /// was fetched from is written ([`FrameCell::fetched`]) or the mappings
+    /// change (map, unmap, protect), including a store by any space
     /// or the kernel to a shared mapping or page cache that this space maps
     /// executable. Decoded instructions cached under one value stay valid
     /// while the value is unchanged. Values of different spaces differ too,
@@ -1704,7 +1770,13 @@ impl AddressSpaceData {
                     .shrunk_since(p.shrinks)
                     .is_some_and(|size| offset >= size.div_ceil(PAGE_SIZE) * PAGE_SIZE);
                 if past {
+                    let fetched = p.frame.fetched();
                     *entry = Some(self.fresh(page, p.prot));
+                    if fetched {
+                        // The page shows other bytes than the instructions
+                        // decoded from it.
+                        self.code.generation.fetch_add(1, Ordering::Release);
+                    }
                 } else {
                     p.shrinks = count;
                 }
@@ -1830,16 +1902,23 @@ impl AddressSpaceData {
                         .range(..=address)
                         .next_back()
                         .is_some_and(|(_, mapping)| address < mapping.end);
-                    // Shared memory and a page-cache page stay as they are; a
-                    // private page without contents gets a frame of its own.
+                    // Shared memory and a page-cache page stay as they are. A
+                    // private page with contents is copied by the first write
+                    // in either space; one without contents gets a frame of
+                    // its own in the child, so that neither space's first
+                    // write fills the other's.
+                    let mut child = page.share();
                     if !is_shared && !page.cache {
                         if page.frame.get().is_some() {
                             page.cow = true;
+                            child.cow = true;
                         } else {
-                            page.frame = Frame::default();
+                            // Keeping the mark, as a copy does
+                            // ([`FrameCell::successor`]).
+                            child.frame = Arc::new(page.frame.successor());
                         }
                     }
-                    cloned.pages[slot] = Some(page.share());
+                    cloned.pages[slot] = Some(child);
                 }
             }
             directory.insert(index, cloned);
@@ -1994,6 +2073,7 @@ impl AddressSpaceData {
                 page,
                 prot: p.prot,
                 frame: TlbFrame::of(&p.frame),
+                fetched: Arc::clone(&p.frame.fetched),
                 cow: p.cow,
                 file,
                 shared,
@@ -2028,6 +2108,9 @@ impl AddressSpaceData {
             let directory = self.read_directory();
             self.check(&directory, addr, buf.len(), access)?;
             if chunks(addr, buf.len()).all(|(page, _, _)| ready(&directory, page)) {
+                if access == Access::Fetch {
+                    self.mark_fetched(&directory, addr, buf.len());
+                }
                 Self::copy_out(&directory, addr, buf);
                 if let Some(page) = Self::single_page(addr, buf.len()) {
                     self.remember(&directory, page);
@@ -2054,11 +2137,47 @@ impl AddressSpaceData {
         // Again, as a truncation may have come between the check and the
         // refresh: a page it left past the end of the file is a bus error.
         self.check(&directory, addr, buf.len(), access)?;
+        if access == Access::Fetch {
+            self.mark_fetched(&directory, addr, buf.len());
+        }
         Self::copy_out(&directory, addr, buf);
         if let Some(page) = Self::single_page(addr, buf.len()) {
             self.remember(&directory, page);
         }
         Ok(())
+    }
+
+    /// Marks the pages of `[addr, addr+len)` fetched from ([`FrameCell`]),
+    /// before a fetch reads them under the locks, so that a later store to
+    /// them bumps the code generation.
+    ///
+    /// The epoch moves on before the first mark: that waits for each store
+    /// under way through another thread's [`ThreadTlb`], which may not have
+    /// seen the mark, and makes the bytes it stored visible to this fetch
+    /// ([`CodeCounters::bump_epoch_keeping_own`]). Every later store of
+    /// another thread either takes the locks or goes through an entry
+    /// remembered under them after the mark was set, and so sees it; this
+    /// thread's own TLB keeps its entries, and its stores come after the
+    /// mark in its own order. A fetch without the locks uses a page only
+    /// once it is marked, and its `Acquire` load of the mark makes the bytes
+    /// of every store that missed the mark visible to it as well. Either the
+    /// store sees the mark, and bumps the generation after its bytes, or the
+    /// fetch sees the bytes.
+    fn mark_fetched(&self, directory: &Directory, addr: GuestAddr, len: usize) {
+        let mut waited = false;
+        for (page, _, _) in chunks(addr, len) {
+            let Some(p) = lookup(directory, page) else {
+                continue;
+            };
+            if p.frame.fetched() {
+                continue;
+            }
+            if !waited {
+                self.code.bump_epoch_keeping_own();
+                waited = true;
+            }
+            p.frame.fetched.store(true, Ordering::Release);
+        }
     }
 
     /// The fault of a write to `page` that the meter has no room for, which
@@ -2102,11 +2221,12 @@ impl AddressSpaceData {
                     return Err(self.out_of_room(page));
                 };
                 write(frame, offset, range);
-                if p.prot.contains(Prot::EXEC) {
-                    // Code may have changed: decoded instructions are stale.
-                    // After the bytes: a fetch that reads the new generation
-                    // (Acquire) then reads the new bytes too, with or without
-                    // the lock.
+                // Under the locks, which every mark is set under: `Relaxed`.
+                if p.prot.contains(Prot::EXEC) && p.frame.fetched.load(Ordering::Relaxed) {
+                    // Code that was fetched may have changed: decoded
+                    // instructions are stale. After the bytes: a fetch that
+                    // reads the new generation (Acquire) then reads the new
+                    // bytes too, with or without the lock.
                     self.code.generation.fetch_add(1, Ordering::Release);
                 }
                 frame.dirty.store(true, Ordering::Release);
@@ -3343,9 +3463,9 @@ impl AddressSpace {
     /// been borrowed mutably since it last watched the shared mappings and
     /// page caches it may run code from: those change only then. One load
     /// otherwise, as the interpreter makes before every instruction.
-    /// Reading the generation before fetching the instruction under the
-    /// locks keeps a decoded instruction from outliving a change, as every
-    /// store to code bumps the generation around it.
+    /// Reading the generation before fetching the instruction keeps a
+    /// decoded instruction from outliving a change, as every store to code
+    /// that was fetched bumps the generation after it.
     #[must_use]
     #[inline]
     pub fn code_generation_cached(&self) -> u64 {
@@ -3529,6 +3649,10 @@ impl AddressSpace {
         };
         self.with_thread_tlb(|tlb| {
             let entry = tlb.get(page).filter(|e| access.permitted(e.prot))?;
+            // The first fetch from a page marks it under the locks.
+            if access == Access::Fetch && !entry.fetched.load(Ordering::Acquire) {
+                return None;
+            }
             match entry.frame.get() {
                 Some(frame) => frame.read(page_offset(addr.0), buf),
                 None => buf.fill(0),
@@ -3600,7 +3724,8 @@ impl AddressSpace {
     /// is given after the bytes; for a shared page, its memory's generation
     /// has moved on before them, as `store_with` does under the locks. A
     /// private page-cache page has `cow` set and is left out: it is copied
-    /// under the locks first.
+    /// under the locks first. `code` says whether the page is executable
+    /// code that was fetched ([`FrameCell::fetched`]).
     #[inline]
     fn writable(tlb: &Tlb, page: u64) -> Option<StoreTarget<'_>> {
         let entry = tlb
@@ -3608,7 +3733,10 @@ impl AddressSpace {
             .filter(|e| e.prot.contains(Prot::WRITE) && !e.cow)?;
         let target = StoreTarget {
             frame: entry.frame.get()?,
-            code: entry.prot.contains(Prot::EXEC),
+            // `Relaxed`: a mark set before this entry was remembered, under
+            // the locks, is seen; one set since moved the epoch on first,
+            // which waits for this store ([`AddressSpaceData::mark_fetched`]).
+            code: entry.prot.contains(Prot::EXEC) && entry.fetched.load(Ordering::Relaxed),
             shared: entry.shared.as_ref(),
         };
         if let Some(shared) = target.shared {
@@ -3617,11 +3745,11 @@ impl AddressSpace {
         Some(target)
     }
     /// After a store through a [`ThreadTlb`], as in `store_with`, after the
-    /// bytes: a store to code makes the decoded instructions stale, and a
-    /// shared page becomes dirty, for write-back, and moves its memory's
-    /// generation on again, so that a write-back that ran between the two
-    /// bumps sees a change after it. A private page is never written back,
-    /// so it need not be marked dirty.
+    /// bytes: a store to code that was fetched makes the decoded
+    /// instructions stale, and a shared page becomes dirty, for write-back,
+    /// and moves its memory's generation on again, so that a write-back that
+    /// ran between the two bumps sees a change after it. A private page is
+    /// never written back, so it need not be marked dirty.
     #[inline]
     fn wrote(&self, target: &StoreTarget<'_>) {
         if target.code {
@@ -3659,9 +3787,10 @@ impl AddressSpace {
         self.locked().fetch(addr, buf)
     }
     pub fn fetch_partial(&self, addr: GuestAddr, buf: &mut [u8]) -> Result<usize, Fault> {
-        // A write to an executable page moves the code generation on after
-        // its bytes, so a fetch here that follows a read of the new
-        // generation reads the new bytes, as one under the lock does.
+        // A write to an executable page that was fetched from moves the code
+        // generation on after its bytes, so a fetch here that follows a read
+        // of the new generation reads the new bytes, as one under the lock
+        // does. A page not fetched from yet is marked under the locks.
         if self.read_unlocked(addr, buf, Access::Fetch) {
             return Ok(buf.len());
         }
@@ -4165,6 +4294,7 @@ mod tests {
     fn a_value_written_to_code_makes_decoded_instructions_stale() {
         let space = space_with(0x10000, PAGE_SIZE, Prot::READ_WRITE.union(Prot::EXEC));
         space.write_u64(GuestAddr(0x10000), 1).unwrap();
+        space.fetch(GuestAddr(0x10000), &mut [0]).unwrap();
         // Twice, so that the second goes through the Tlb.
         space.write_value(GuestAddr(0x10000), 8, 2).unwrap();
         let before = space.code_generation();
@@ -4359,6 +4489,7 @@ mod tests {
             g0,
             "data writes keep decoded code valid"
         );
+        space.fetch(GuestAddr(0x10000), &mut [0]).unwrap();
         space.write_initial(GuestAddr(0x10000), &[0x90]).unwrap();
         let g1 = space.code_generation();
         assert_ne!(g1, g0);

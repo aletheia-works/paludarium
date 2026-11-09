@@ -257,6 +257,9 @@ pub struct Kernel {
     task: Option<processes::TaskCharge>,
     /// What this thread last published for `/proc` ([`Self::publish`]).
     published: Option<Published>,
+    /// The numbers `clone3`'s `set_tid` asks the clone it runs to take
+    /// ([`processes::Processes::allocate_in`]); empty for any other call.
+    set_tid: Vec<u32>,
     /// The thread's place among the virtual CPUs while it has `rseq`.
     seat: Option<rseq::Seat>,
 }
@@ -297,6 +300,7 @@ impl Kernel {
             unimplemented: Arc::default(),
             task: None,
             published: None,
+            set_tid: Vec::new(),
             seat: None,
         }
     }
@@ -868,9 +872,13 @@ impl Kernel {
             args[0] &= 0xffff_ffff;
         }
         // clone3 runs as the clone it describes.
+        self.set_tid.clear();
         if number == 435 {
             match processes::clone3_args(mem, args[0], args[1]) {
-                Ok(legacy) => (number, args) = (56, legacy),
+                Ok((legacy, set_tid)) => {
+                    (number, args) = (56, legacy);
+                    self.set_tid = set_tid;
+                }
                 Err(error) => {
                     thread.cpu.gpr[reg::RAX] = error.to_syscall_return();
                     return Next::Resume;

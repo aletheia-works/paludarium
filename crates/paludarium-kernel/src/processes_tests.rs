@@ -4316,6 +4316,166 @@ mod pid_namespaces {
         assert_eq!(syscall(&mut c, &mut ct, &cm, 110, [0; 6]), 0);
     }
 }
+mod set_tid {
+    use super::*;
+    use crate::credentials::Credentials;
+    use crate::namespaces::{CLONE_NEWPID, CLONE_NEWUSER, Namespaces};
+    fn root() -> Credentials {
+        Credentials::default()
+    }
+    fn user() -> Credentials {
+        Credentials {
+            uid: 1000,
+            euid: 1000,
+            suid: 1000,
+            fsuid: 1000,
+            permitted: 0,
+            effective: 0,
+            ..Credentials::default()
+        }
+    }
+    #[test]
+    fn the_first_namespace_takes_an_id_no_task_has_had() {
+        let (k, _t, _m) = setup();
+        let processes = &k.processes;
+        let first = Namespaces::default();
+        let next = processes.allocate().unwrap();
+        // The next ID out of turn, which the next one passes over.
+        assert_eq!(
+            processes.allocate_in(&first.pid, &[next + 1], &root()),
+            Ok(next + 1)
+        );
+        assert_eq!(processes.allocate().unwrap(), next + 2);
+        for taken in [next + 1, next, 1] {
+            assert_eq!(
+                processes.allocate_in(&first.pid, &[taken], &root()),
+                Err(Errno::EEXIST)
+            );
+        }
+        assert_eq!(
+            processes.allocate_in(&first.pid, &[next + 100], &root()),
+            Ok(next + 100)
+        );
+        for number in [0, crate::processes::PID_MAX, u32::MAX] {
+            assert_eq!(
+                processes.allocate_in(&first.pid, &[number], &root()),
+                Err(Errno::EINVAL)
+            );
+        }
+        // More numbers than namespaces.
+        assert_eq!(
+            processes.allocate_in(&first.pid, &[next + 200, next + 201], &root()),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            processes.allocate_in(&first.pid, &[next + 200], &user()),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(processes.allocate().unwrap(), next + 3);
+    }
+
+    #[test]
+    fn a_nested_namespace_takes_its_numbers_from_the_innermost_out() {
+        let (k, _t, _m) = setup();
+        let processes = &k.processes;
+        let space = Namespaces::default()
+            .for_child(CLONE_NEWPID, false, crate::users::first())
+            .unwrap()
+            .pid;
+        // Its first task must be its init, 1.
+        assert_eq!(
+            processes.allocate_in(&space, &[2], &root()),
+            Err(Errno::EINVAL)
+        );
+        let init = processes.allocate_in(&space, &[1], &root()).unwrap();
+        assert_eq!(space.number(init), 1);
+        assert_eq!(space.init(), Some(init));
+        assert_eq!(
+            processes.allocate_in(&space, &[1], &root()),
+            Err(Errno::EEXIST)
+        );
+        let five = processes.allocate_in(&space, &[5], &root()).unwrap();
+        assert_eq!(space.number(five), 5);
+        // The others go on from the last handed out, past those taken.
+        let numbers: Vec<u32> = (0..5)
+            .map(|_| space.number(processes.allocate_in(&space, &[], &root()).unwrap()))
+            .collect();
+        assert_eq!(numbers, [2, 3, 4, 6, 7]);
+        // Both levels: the first namespace's number is the ID.
+        let next = processes.allocate().unwrap();
+        let both = processes
+            .allocate_in(&space, &[9, next + 1], &root())
+            .unwrap();
+        assert_eq!((both, space.number(both)), (next + 1, 9));
+        // A failure in the first namespace leaves no number in the inner.
+        assert_eq!(
+            processes.allocate_in(&space, &[10, next], &root()),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(space.task(10), None);
+        assert_eq!(
+            processes.allocate_in(&space, &[10, 1, 1], &root()),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn each_number_needs_the_capability_over_its_namespace() {
+        let (k, _t, _m) = setup();
+        let processes = &k.processes;
+        let first = Namespaces::default();
+        let owner = crate::namespaces::user_for(&first, &user(), CLONE_NEWUSER).unwrap();
+        let space = first
+            .for_child(CLONE_NEWPID, false, &owner.user.0)
+            .unwrap()
+            .pid;
+        // The user who made the user namespace has every capability in it
+        // but none in the first.
+        let init = processes.allocate_in(&space, &[1], &user()).unwrap();
+        assert_eq!(space.number(init), 1);
+        assert_eq!(
+            processes.allocate_in(&space, &[3, 4_000_000], &user()),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(space.task(3), None);
+        // As does CAP_CHECKPOINT_RESTORE alone.
+        let restorer = Credentials {
+            effective: crate::credentials::CAP_CHECKPOINT_RESTORE,
+            ..user()
+        };
+        assert_eq!(
+            processes.allocate_in(&space, &[3, 4_000_000], &restorer),
+            Ok(4_000_000)
+        );
+    }
+
+    #[test]
+    fn clone3_children_take_the_numbers_of_set_tid() {
+        let (mut k, mut t, m) = setup();
+        let next = k.processes.allocate().unwrap() + 1;
+        // struct clone_args, then set_tid's one number.
+        let mut args = [0u64; 12];
+        args[4] = 17;
+        args[8] = DATA + 128;
+        args[9] = 1;
+        let bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
+        m.write(GuestAddr(DATA), &bytes).unwrap();
+        m.write(GuestAddr(DATA + 128), &next.to_le_bytes()).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 435, [DATA, 88, 0, 0, 0, 0]),
+            u64::from(next)
+        );
+        let (_child, thread) = k.take_child().unwrap();
+        assert_eq!(thread.tid, next);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 435, [DATA, 88, 0, 0, 0, 0]),
+            Errno::EEXIST.to_syscall_return()
+        );
+        // A fork after it takes none.
+        let forked = syscall(&mut k, &mut t, &m, 57, [0; 6]);
+        assert_eq!(forked, u64::from(next) + 1);
+    }
+}
 mod user_namespaces {
     use super::*;
     const NEWUSER: u64 = 0x1000_0000;

@@ -276,9 +276,11 @@ verified.
   ones), no `/proc/self/cgroup` for a cgroup namespace, and no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the
   first one's. A PID namespace hands out its numbers once each, where
-  Linux's wrap at `pid_max` and are used again; `/proc/<pid>/status` has no
-  `NStgid`, `NSpid`, `NSpgid` or `NSsid` lines; `clone3`'s `set_tid` is not
-  supported in one either; and a queued signal (`rt_sigqueueinfo`) from
+  Linux's wrap at `pid_max` and are used again; for the same reason
+  `clone3`'s `set_tid` cannot take an ID of the first namespace that a task
+  had before, even once it is freed (`EEXIST`), where Linux takes it again,
+  and its numbers are below 4194304, Linux's highest `pid_max`, whatever the
+  host's is; and a queued signal (`rt_sigqueueinfo`) from
   outside the receiver's namespace has its `si_pid` cleared whatever its
   `si_code`. A namespace file has none of the `NS_GET_*` `ioctl` requests,
   and the numbers of new namespaces are not Linux's, which reuses freed

@@ -767,7 +767,18 @@ kernel.
   `TIOCGPGRP`, `TIOCSPGRP` and `TIOCGSID`; for `SCM_CREDENTIALS` and
   `SO_PEERCRED`; for `shmctl`'s process IDs; and for a core's. `kill(-1)`
   signals the processes of the caller's namespace but its init. `/proc`
-  shows the first namespace's IDs, as Linux's `/proc` mounted in it does.
+  shows the first namespace's IDs, as Linux's `/proc` mounted in it does,
+  and the `NStgid`, `NSpid`, `NSpgid` and `NSsid` lines of
+  `/proc/<pid>/status` give a task's IDs there and in each namespace below
+  it down to its own (0 for a group or session outside one). `clone3`'s
+  `set_tid` gives the numbers a child takes, one for each namespace from
+  its own out, as Linux's `alloc_pid` checks them: `EINVAL` for more numbers
+  than namespaces, for one below 1 or from 4194304 (Linux's highest
+  `pid_max`) on, and for one other than 1 in a namespace with no init yet;
+  `EPERM` without `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` in the user
+  namespace that owns the namespace; and `EEXIST` for a number that is
+  taken. The first namespace's numbers are the IDs paludarium knows tasks
+  by, so there `set_tid` takes an ID no task has had yet.
   The init takes only the signals it has a handler for, and SIGKILL and
   SIGSTOP from outside its namespace or from the kernel (Linux's
   `SIGNAL_UNKILLABLE`); a fault still ends it. Orphans of the namespace come
@@ -1264,7 +1275,8 @@ kernel.
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a
   longer struct whose extra part is not zero) and then runs as the `clone` it
   describes; `CLONE_CLEAR_SIGHAND` resets handled signals to their default.
-  `set_tid` and `CLONE_INTO_CGROUP` give `EINVAL`. `clone` itself reads only
+  `set_tid` is as under the PID namespaces above, and `CLONE_INTO_CGROUP`
+  gives `EINVAL`. `clone` itself reads only
   the low 32 bits of its flags, as in Linux, so `CLONE_CLEAR_SIGHAND` is
   `clone3`'s alone.
 - `prctl` supports `PR_SET_NAME`/`PR_GET_NAME` (a name of up to 15 bytes per

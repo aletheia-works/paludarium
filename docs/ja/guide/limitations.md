@@ -245,9 +245,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   変わりません。Linux では新しい名前空間の写しに新しい ID が付きます）。cgroup 名前空間には
   `/proc/self/cgroup` がなく、time 名前空間には `/proc/<pid>/timens_offsets` がなく、
   時計は最初の名前空間のものです。PID 名前空間はそれぞれの番号を 1 度だけ配ります。
-  Linux では `pid_max` で一回りして使い回します。`/proc/<pid>/status` には `NStgid`、
-  `NSpid`、`NSpgid`、`NSsid` の行がなく、PID 名前空間でも `clone3` の `set_tid` は
-  使えません。受け手の名前空間の外から積んだシグナル（`rt_sigqueueinfo`）は、`si_code`
+  Linux では `pid_max` で一回りして使い回します。同じ理由で、`clone3` の `set_tid` は、
+  最初の名前空間でタスクが一度持った ID を、空いた後でも取れません（`EEXIST`）。Linux では
+  また取れます。その番号は、ホストのものによらず、Linux の `pid_max` の最大の 4194304
+  より小さい値です。受け手の名前空間の外から積んだシグナル（`rt_sigqueueinfo`）は、`si_code`
   によらず `si_pid` を 0 にします。名前空間のファイルは `NS_GET_*` の `ioctl` を持たず、
   新しい名前空間の番号は、空いた番号を使い回す Linux のものとは違います。
 - **Linux と macOS 以外のホストでマウントしたディレクトリのファイル**：`SEEK_DATA`

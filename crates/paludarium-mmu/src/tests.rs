@@ -146,6 +146,7 @@ fn mapping_mutation_and_fetch_use_same_view() {
     let a = GuestAddr(0x10000);
     m.protect_shared(a, PAGE_SIZE, Prot::READ_EXEC.union(Prot::WRITE))
         .unwrap();
+    m.fetch(a, &mut [0]).unwrap();
     let generation = m.code_generation();
     m.atomic(a, AtomicWidth::W8, AtomicOp::Exchange(0x90))
         .unwrap();

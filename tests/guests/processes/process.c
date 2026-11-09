@@ -1110,6 +1110,85 @@ static int reaped(long pid) {
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+/* The pid-set-tid case: clone3 with `flags`, `exit_signal` and the numbers
+   `tids` of set_tid, from the innermost PID namespace out. The child's PID,
+   0 in the child, or -errno. */
+static long settid_clone(unsigned long long flags, int exit_signal, const pid_t *tids, int count) {
+    struct {
+        unsigned long long flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid,
+            set_tid_size;
+    } args = {flags, 0, 0, 0, (unsigned)exit_signal, 0, 0, 0, (unsigned long)tids, (unsigned)count};
+    fflush(stdout);
+    errno = 0;
+    long r = syscall(435, &args, sizeof args);
+    return r < 0 ? -errno : r;
+}
+/* An error of settid_clone, whose child (when there is one) exits. */
+static long settid_error(unsigned long long flags, int exit_signal, const pid_t *tids, int count) {
+    long r = settid_clone(flags, exit_signal, tids, count);
+    if (r == 0) _exit(99);
+    if (r > 0) waitpid(r, NULL, __WALL);
+    return r < 0 ? r : 1000;
+}
+/* The numbers of line `name` of /proc/self/status, at most 4; how many. */
+static int settid_numbers(const char *name, long *numbers) {
+    FILE *file = fopen("/proc/self/status", "r");
+    char line[256];
+    int count = 0;
+    size_t length = strlen(name);
+    while (file && fgets(line, sizeof line, file)) {
+        if (strncmp(line, name, length) || line[length] != ':') continue;
+        char *at = line + length + 1, *end;
+        while (count < 4) {
+            long value = strtol(at, &end, 10);
+            if (end == at) break;
+            numbers[count++] = value;
+            at = end;
+        }
+        break;
+    }
+    if (file) fclose(file);
+    return count;
+}
+/* /proc/self/stat's PID, process group and session, as /proc's PID
+   namespace numbers them. */
+static void settid_stat(long *pid, long *group, long *session) {
+    char buf[512] = {0};
+    FILE *file = fopen("/proc/self/stat", "r");
+    if (file) {
+        if (!fgets(buf, sizeof buf, file)) buf[0] = 0;
+        fclose(file);
+    }
+    char *close = strrchr(buf, ')');
+    *pid = strtol(buf, NULL, 10);
+    *group = *session = -1;
+    if (close) sscanf(close + 2, "%*c %*d %ld %ld", group, session);
+}
+/* The NS* lines of /proc/self/status: how many numbers each has, and
+   whether the first of each is what /proc/self/stat gives. */
+static void settid_lines(const char *who) {
+    long pid, group, session, numbers[4];
+    settid_stat(&pid, &group, &session);
+    const char *names[] = {"NStgid", "NSpid", "NSpgid", "NSsid"};
+    long firsts[] = {pid, pid, group, session};
+    printf("%s:", who);
+    for (int i = 0; i < 4; i++) {
+        int count = settid_numbers(names[i], numbers);
+        printf(" %s=%d/%d", names[i], count, count > 0 && numbers[0] == firsts[i]);
+        for (int j = 1; j < count; j++) printf(",%ld", numbers[j]);
+    }
+    /* In Linux's place, right after Groups. */
+    FILE *file = fopen("/proc/self/status", "r");
+    char line[256];
+    int after = 0;
+    while (file && fgets(line, sizeof line, file)) {
+        if (strncmp(line, "Groups:", 7)) continue;
+        after = fgets(line, sizeof line, file) && !strncmp(line, "NStgid:", 7);
+        break;
+    }
+    if (file) fclose(file);
+    printf(" after-groups=%d\n", after);
+}
 /* The net-namespaces case: a request of the loopback interface on `fd`,
    its result (the flags, or the index) or -errno. */
 static long netns_lo(int fd, unsigned long request, const char *name, short flags) {
@@ -5579,6 +5658,108 @@ int main(int argc, char **argv) {
             _exit(0);
         }
         result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "pid-set-tid")) {
+        /* clone3's set_tid (the native side runs as root), and the NS*
+           lines of /proc/<pid>/status, which number a task in /proc's PID
+           namespace and each one below it down to its own. */
+        const unsigned long long thread = CLONE_VM | CLONE_THREAD | CLONE_SIGHAND;
+        settid_lines("first");
+        pid_t tids[3] = {1, 1, 1};
+        result("too-many", settid_error(0, SIGCHLD, tids, 2));
+        tids[0] = 0;
+        result("zero", settid_error(0, SIGCHLD, tids, 1));
+        tids[0] = 4194304;
+        result("pid-max", settid_error(0, SIGCHLD, tids, 1));
+        tids[0] = 1;
+        result("taken-init", settid_error(0, SIGCHLD, tids, 1));
+        tids[0] = getpid();
+        result("taken-self", settid_error(0, SIGCHLD, tids, 1));
+        result("thread-taken", settid_error(thread, 0, tids, 1));
+        result("fault", settid_error(0, SIGCHLD, (const pid_t *)1, 1));
+        result("too-many-at-most", settid_error(0, SIGCHLD, tids, 33));
+        /* An ID no task has: natively the first free one of a few far
+           ahead, which another process may have taken. */
+        long taken = -EEXIST;
+        pid_t wanted = 0;
+        for (int i = 0; i < 16 && taken == -EEXIST; i++) {
+            wanted = getpid() + 100000 + i * 7919;
+            tids[0] = wanted;
+            taken = settid_clone(0, SIGCHLD, tids, 1);
+            if (taken == 0) _exit(getpid() == wanted ? 0 : 1);
+        }
+        printf("first: taken=%d status=%d\n", taken == wanted, taken > 0 ? reaped(taken) : -1);
+        /* Without the capability over the first namespace. */
+        pid_t nobody = child();
+        if (nobody == 0) {
+            if (setresuid(65534, 65534, 65534)) _exit(90);
+            tids[0] = getpid() + 100000;
+            result("unprivileged", settid_error(0, SIGCHLD, tids, 1));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("nobody", reaped(nobody));
+        /* A new PID namespace: its first task must be 1. */
+        tids[0] = 2;
+        result("new-not-init", settid_error(CLONE_NEWPID, SIGCHLD, tids, 1));
+        tids[0] = 1;
+        result("new-outer-taken", settid_error(CLONE_NEWPID, SIGCHLD, tids, 2));
+        result("new-too-many", settid_error(CLONE_NEWPID, SIGCHLD, tids, 3));
+        long init = settid_clone(CLONE_NEWPID, SIGCHLD, tids, 1);
+        if (init == 0) {
+            long numbers[4];
+            printf("init: pid=%d\n", getpid());
+            settid_lines("init");
+            int count = settid_numbers("NSpid", numbers);
+            pid_t outer = count == 2 ? numbers[0] : 0;
+            pid_t inner[3] = {1, outer, 1};
+            result("init-taken", settid_error(0, SIGCHLD, inner, 1));
+            inner[0] = 3;
+            result("init-outer-taken", settid_error(0, SIGCHLD, inner, 2));
+            result("init-too-many", settid_error(0, SIGCHLD, inner, 3));
+            inner[0] = 1;
+            result("init-thread-taken", settid_error(thread, 0, inner, 1));
+            /* 5 here, then the next one takes 2, the first after the last
+               handed out that is free. */
+            inner[0] = 5;
+            long five = settid_clone(0, SIGCHLD, inner, 1);
+            if (five == 0) {
+                count = settid_numbers("NSpid", numbers);
+                _exit(getpid() == 5 && count == 2 && numbers[1] == 5 ? 0 : 1);
+            }
+            printf("init: five=%ld status=%d\n", five, five > 0 ? reaped(five) : -1);
+            fflush(stdout);
+            pid_t next = child();
+            if (next == 0) _exit(0);
+            printf("init: next=%d status=%d\n", next, reaped(next));
+            /* Two levels: 1 in a namespace of its own, 7 here. */
+            pid_t two[2] = {1, 7};
+            long nested = settid_clone(CLONE_NEWPID, SIGCHLD, two, 2);
+            if (nested == 0) {
+                count = settid_numbers("NSpid", numbers);
+                _exit(getpid() == 1 && count == 3 && numbers[1] == 7 && numbers[2] == 1 ? 0 : 1);
+            }
+            printf("init: nested=%ld status=%d\n", nested, nested > 0 ? reaped(nested) : -1);
+            /* In a user namespace of its own: the new PID namespace is its
+               own, this one is not. */
+            fflush(stdout);
+            pid_t user = child();
+            if (user == 0) {
+                if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+                pid_t own[2] = {1, 9};
+                result("user-outer", settid_error(CLONE_NEWPID, SIGCHLD, own, 2));
+                long made = settid_clone(CLONE_NEWPID, SIGCHLD, own, 1);
+                if (made == 0) _exit(getpid() == 1 ? 0 : 1);
+                printf("user: made=%d status=%d\n", made > 0, made > 0 ? reaped(made) : -1);
+                fflush(stdout);
+                _exit(0);
+            }
+            result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("init", reaped(init));
         return 0;
     }
     if (!strcmp(mode, "pid-namespaces")) {

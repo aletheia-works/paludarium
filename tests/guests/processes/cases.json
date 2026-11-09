@@ -16,6 +16,7 @@
     {"name":"unshare","binary":"process"},
     {"name":"namespaces","binary":"process"},
     {"name":"pid-namespaces","binary":"process"},
+    {"name":"pid-set-tid","binary":"process"},
     {"name":"net-namespaces","binary":"process"},
     {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},

@@ -126,6 +126,9 @@ struct PriorityThread {
 }
 /// fs.nr_open: the highest RLIMIT_NOFILE Linux accepts by default.
 const NR_OPEN: u64 = 1 << 20;
+/// `pid_max`, at its highest (`PID_MAX_LIMIT`), as on a 64-bit Linux that
+/// systemd starts: `set_tid` takes numbers below it.
+pub(crate) const PID_MAX: u32 = 4_194_304;
 /// A process as [`Processes::view`] gives it.
 pub(crate) struct ProcessView {
     pub parent: u32,
@@ -143,9 +146,14 @@ pub(crate) struct ProcessView {
     pub group: Arc<ThreadGroup>,
     /// The controlling terminal.
     pub terminal: Option<Arc<crate::pty::Terminal>>,
+    /// The PID namespace it is numbered in, its own.
+    pub space: Arc<Namespace>,
 }
 pub struct Processes {
     next: AtomicU32,
+    /// The IDs from `next` on that `clone3`'s `set_tid` took out of turn,
+    /// which [`Self::allocate`] passes over; held while `next` moves.
+    taken: Mutex<std::collections::BTreeSet<u32>>,
     entries: Mutex<BTreeMap<u32, Entry>>,
     tasks: Arc<TaskCount>,
     /// The highest RLIMIT_NOFILE hard limit a process may set, as fs.nr_open.
@@ -173,6 +181,7 @@ impl Processes {
         });
         Self {
             next: AtomicU32::new(2),
+            taken: Mutex::default(),
             nr_open: AtomicU64::new(NR_OPEN),
             changed: WaitToken::default(),
             file_owners: Mutex::default(),
@@ -251,12 +260,84 @@ impl Processes {
             next.saturating_sub(1),
         )
     }
+    /// The next ID, which no task has had: the IDs of the first PID
+    /// namespace are handed out once each, and those `set_tid` took are
+    /// passed over.
     pub(crate) fn allocate(&self) -> Result<u32, Errno> {
-        self.next
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                (value < i32::MAX as u32).then_some(value + 1)
-            })
-            .map_err(|_| Errno::EAGAIN)
+        let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let id = self
+                .next
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    (value < i32::MAX as u32).then_some(value + 1)
+                })
+                .map_err(|_| Errno::EAGAIN)?;
+            if !taken.remove(&id) {
+                return Ok(id);
+            }
+        }
+    }
+    /// Whether ID `id` is free for `set_tid`: no task has had it. One
+    /// handed out before is not, even once it is freed, as IDs here are
+    /// never used twice (where Linux's `idr_alloc` takes a freed one).
+    fn is_free(&self, id: u32) -> bool {
+        let taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
+        id >= self.next.load(Ordering::SeqCst) && !taken.contains(&id)
+    }
+    /// Takes ID `id` for `set_tid`, or `EEXIST` when it is not free.
+    fn take(&self, id: u32) -> Result<u32, Errno> {
+        let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
+        if id < self.next.load(Ordering::SeqCst) || !taken.insert(id) {
+            return Err(Errno::EEXIST);
+        }
+        Ok(id)
+    }
+    /// The ID of a new task in PID namespace `space`, numbered there and in
+    /// each namespace it is in, as Linux's `alloc_pid`. `set_tid` (`clone3`'s)
+    /// gives the numbers to take, from `space` out, the first namespace's
+    /// being the ID itself. For each, from `space` out: `EINVAL` beyond the
+    /// namespaces, for a number below 1 or from `pid_max` on, and for one
+    /// other than 1 in a namespace with no init yet; `EPERM` unless
+    /// `credentials` (the caller's) have CAP_SYS_ADMIN or
+    /// CAP_CHECKPOINT_RESTORE in the user namespace owning the namespace;
+    /// and `EEXIST` for a number that is taken.
+    pub(crate) fn allocate_in(
+        &self,
+        space: &Namespace,
+        set_tid: &[u32],
+        credentials: &crate::credentials::Credentials,
+    ) -> Result<u32, Errno> {
+        let levels = space.levels();
+        if set_tid.len() > levels.len() {
+            return Err(Errno::EINVAL);
+        }
+        for (&number, &level) in set_tid.iter().zip(levels.iter().rev()) {
+            if !(1..PID_MAX).contains(&number) || number != 1 && level.init().is_none() {
+                return Err(Errno::EINVAL);
+            }
+            let owner = level.owner();
+            if !credentials.capable_in(crate::credentials::CAP_SYS_ADMIN, owner)
+                && !credentials.capable_in(crate::credentials::CAP_CHECKPOINT_RESTORE, owner)
+            {
+                return Err(Errno::EPERM);
+            }
+            let taken = if level.is_first() {
+                !self.is_free(number)
+            } else {
+                level.task(number).is_some()
+            };
+            if taken {
+                return Err(Errno::EEXIST);
+            }
+        }
+        let id = match set_tid.get(levels.len() - 1) {
+            Some(&id) => self.take(id)?,
+            None => self.allocate()?,
+        };
+        // When the namespaces refuse it, the ID stays used up, as one from
+        // `allocate` does: IDs here are never handed out twice.
+        space.enter(id, &set_tid[..set_tid.len().min(levels.len() - 1)])?;
+        Ok(id)
     }
     pub(crate) fn insert(
         &self,
@@ -783,6 +864,7 @@ impl Processes {
             exit_signal: entry.exit_signal,
             group: Arc::clone(&entry.group),
             terminal: entry.terminal.clone(),
+            space: Arc::clone(&entry.space),
         })
     }
     fn parent(&self, pid: u32) -> u32 {
@@ -2625,10 +2707,12 @@ impl Kernel {
         } else {
             None
         };
-        let pid = self.processes.allocate()?;
         // Numbered in the PID namespace children take, and those it is in.
         let space = child_namespaces.pid.clone();
-        space.enter(pid)?;
+        let set_tid = std::mem::take(&mut self.set_tid);
+        let pid = self
+            .processes
+            .allocate_in(&space, &set_tid, &parent.state.credentials)?;
         let group = Arc::new(self.group.fork(flags & 0x800 != 0));
         if !space.is_first() && space.init() == Some(pid) {
             group.set_unkillable();
@@ -2722,6 +2806,7 @@ impl Kernel {
             unimplemented: self.unimplemented.clone(),
             task: None,
             published: None,
+            set_tid: Vec::new(),
             seat: None,
         };
         // Shown in /proc from the start, before its first system call.
@@ -3464,8 +3549,13 @@ pub(crate) fn namespace_flags(flags: u64) -> u64 {
 /// order (`copy_clone_args_from_user`, then `clone3_args_valid` and
 /// `kernel_clone`), and returns the legacy `clone` arguments: flags with the
 /// exit signal, the stack top, the parent and child TID addresses and the
-/// TLS. `set_tid` and `CLONE_INTO_CGROUP` are not supported (`EINVAL`).
-pub(crate) fn clone3_args(mem: &AddressSpace, address: u64, size: u64) -> Result<[u64; 6], Errno> {
+/// TLS; and the numbers of `set_tid`, which [`Processes::allocate_in`]
+/// checks. `CLONE_INTO_CGROUP` is not supported (`EINVAL`).
+pub(crate) fn clone3_args(
+    mem: &AddressSpace,
+    address: u64,
+    size: u64,
+) -> Result<([u64; 6], Vec<u32>), Errno> {
     const VER0: u64 = 64;
     const KNOWN: u64 = 88;
     if size > 4096 {
@@ -3496,9 +3586,24 @@ pub(crate) fn clone3_args(mem: &AddressSpace, address: u64, size: u64) -> Result
         set_tid,
         set_tid_size,
     ] = std::array::from_fn(word);
-    if set_tid_size > 32 || (set_tid == 0) != (set_tid_size == 0) || exit_signal & !0xff != 0 {
+    if set_tid_size > 32
+        || (set_tid == 0) != (set_tid_size == 0)
+        || exit_signal & !0xff != 0
+        || exit_signal > 64
+    {
         return Err(Errno::EINVAL);
     }
+    let mut numbers = vec![0; usize::try_from(set_tid_size).unwrap_or(0) * 4];
+    if !numbers.is_empty() {
+        mem.read(GuestAddr(set_tid), &mut numbers)
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    let set_tid = numbers
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&n| u32::from_le_bytes(n))
+        .collect();
     const LEGACY: u64 = 0xffff_ffff & !0xff;
     const DETACHED: u64 = 0x400000;
     const SIGHAND: u64 = 0x800;
@@ -3520,16 +3625,16 @@ pub(crate) fn clone3_args(mem: &AddressSpace, address: u64, size: u64) -> Result
             .filter(|&top| top <= paludarium_types::USER_ADDRESS_LIMIT)
             .ok_or(Errno::EINVAL)?,
     };
-    if set_tid != 0 || exit_signal > 64 {
-        return Err(Errno::EINVAL);
-    }
     // CLONE_NEWTIME moves out of the exit signal's bits.
     let flags = if flags & 0x80 != 0 {
         flags & !0x80 | crate::namespaces::CLONE3_NEWTIME
     } else {
         flags
     };
-    Ok([flags | exit_signal, top, parent_tid, child_tid, tls, 0])
+    Ok((
+        [flags | exit_signal, top, parent_tid, child_tid, tls, 0],
+        set_tid,
+    ))
 }
 fn read_string(
     mem: &AddressSpace,

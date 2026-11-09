@@ -700,8 +700,14 @@ impl SharedPages {
     /// watches the frames, after a store to them (and, for one through a
     /// mapping, before it too).
     fn changed(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        self.watchers.changed();
+        self.stores().changed();
+    }
+    /// What a store moves on, for a [`Tlb`] to hold.
+    fn stores(&self) -> SharedStores {
+        SharedStores {
+            generation: Arc::clone(&self.generation),
+            watchers: Arc::clone(&self.watchers),
+        }
     }
     /// Makes every later store to the frames bump `code`'s generation, as a
     /// space that may run code from them needs.
@@ -835,6 +841,48 @@ struct SharedMapping {
 /// contents yet is read from it, and a private mapping without the file's
 /// page cache reads the pages given back with `MADV_DONTNEED` from it again,
 /// as Linux faults them in from the file once their private copies are gone.
+/// A file's size and how many times it has shrunk, which a [`PageSource`]
+/// whose size changes keeps here ([`PageSource::file_size`]), so that a
+/// thread's TLB can check the end of the file while holding only this, not
+/// the file: holding the file would keep it open, and System V shared
+/// memory, for one, counts its attachments by who holds them.
+#[derive(Debug, Default)]
+pub struct FileSize {
+    size: AtomicU64,
+    shrinks: AtomicU64,
+}
+
+impl FileSize {
+    #[must_use]
+    pub fn new(size: u64) -> Self {
+        FileSize {
+            size: AtomicU64::new(size),
+            shrinks: AtomicU64::new(0),
+        }
+    }
+    /// The size now.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.size.load(Ordering::SeqCst)
+    }
+    /// How many times the file has shrunk.
+    #[must_use]
+    pub fn shrinks(&self) -> u64 {
+        self.shrinks.load(Ordering::SeqCst)
+    }
+    /// Makes the size at least `size`, as a write past the end does.
+    pub fn grow_to(&self, size: u64) {
+        self.size.fetch_max(size, Ordering::SeqCst);
+    }
+    /// Sets the size, and returns the new count of shrinks if it shrank.
+    /// The count moves on after the new size shows, so that whoever reads
+    /// the new count and then the size sees the new size.
+    pub fn set(&self, size: u64) -> Option<u64> {
+        let old = self.size.swap(size, Ordering::SeqCst);
+        (size < old).then(|| self.shrinks.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+}
+
 pub trait PageSource: Send + Sync {
     /// Reads from `offset`, filling `buf` unless the file ends first, and
     /// returns how much it read.
@@ -847,6 +895,13 @@ pub trait PageSource: Send + Sync {
     /// How many times the file has shrunk.
     fn shrinks(&self) -> u64 {
         0
+    }
+    /// Where the file keeps its size and shrinks, which [`Self::size`] and
+    /// [`Self::shrinks`] give: a thread's TLB holds the pages of a file
+    /// mapping that has an end only if the source gives it. A source whose
+    /// [`Self::size`] is `None` has no end, and needs none.
+    fn file_size(&self) -> Option<Arc<FileSize>> {
+        None
     }
     /// The smallest size the file shrank to after it had shrunk `count`
     /// times, or `None` if it has not shrunk since.
@@ -913,20 +968,22 @@ pub struct Remap {
 /// How many pages the [`Tlb`] remembers.
 const TLB_ENTRIES: usize = 64;
 
-/// A populated page that is not shared, as the page table held it: an
-/// access that stays inside it needs only its protection checked, as
-/// [`AddressSpaceData::check`] would, and, for a page of a file mapping,
-/// its file ([`FileEnd`]).
+/// A populated page, as the page table held it: an access that stays inside
+/// it needs only its protection checked, as [`AddressSpaceData::check`]
+/// would, and, for a page of a file mapping, its file ([`FileEnd`]).
 struct TlbEntry {
     page: u64,
     prot: Prot,
     frame: Frame,
     cow: bool,
     file: Option<FileEnd>,
+    /// The bookkeeping of the shared mapping's memory the page shows, whose
+    /// generation a store moves on, as under the locks.
+    shared: Option<SharedStores>,
 }
 
-/// What an access through a [`Tlb`] to a page of a private file mapping
-/// checks first, since the file can change without the space's lock, by
+/// What an access through a [`Tlb`] to a page of a file mapping checks
+/// first, since the file can change without the space's lock, by
 /// `ftruncate` from anywhere: that the page is not wholly past the end of
 /// the file, which raises SIGBUS ([`AddressSpaceData::check`]), and, for a
 /// copy of the page's own, that the file has not shrunk since the entry
@@ -943,7 +1000,7 @@ struct TlbEntry {
 /// access under the locks replaces it, so the store goes with it. A copy
 /// that it leaves within the file stays, with the store in it.
 struct FileEnd {
-    source: Arc<dyn PageSource>,
+    size: Arc<FileSize>,
     /// The page's offset in the file.
     offset: u64,
     /// How many times the file had shrunk ([`PageSource::shrinks`]) when the
@@ -957,11 +1014,31 @@ impl FileEnd {
     #[inline]
     fn holds(&self) -> bool {
         self.shrinks
-            .is_none_or(|shrinks| self.source.shrinks() == shrinks)
-            && self
-                .source
-                .size()
-                .is_none_or(|size| self.offset < size.div_ceil(PAGE_SIZE) * PAGE_SIZE)
+            .is_none_or(|shrinks| self.size.shrinks() == shrinks)
+            && self.offset < self.size.get().div_ceil(PAGE_SIZE) * PAGE_SIZE
+    }
+}
+
+/// The frame a store through a [`Tlb`] writes, whether its page is
+/// executable, and the shared mapping's memory it shows, if any.
+struct StoreTarget<'a> {
+    frame: &'a FrameBytes,
+    code: bool,
+    shared: Option<&'a SharedStores>,
+}
+
+/// What a store to [`SharedPages`] moves on, without the frames, the
+/// source or the owner, which a thread's TLB must not keep alive.
+struct SharedStores {
+    generation: Arc<AtomicU64>,
+    watchers: Arc<Watchers>,
+}
+
+impl SharedStores {
+    /// [`SharedPages::changed`].
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.watchers.changed();
     }
 }
 
@@ -1816,28 +1893,33 @@ impl AddressSpaceData {
     }
 
     /// Remembers the page at `page` in this thread's [`ThreadTlb`] when an
-    /// access to it needs only its protection checked, and its file if it
-    /// has one ([`FileEnd`]): it is populated, and not shared (a store to a
-    /// shared page makes it dirty and moves the shared pages' generation on,
-    /// under the locks).
+    /// access to it needs only its protection checked, its file if it has
+    /// one ([`FileEnd`]), and, for a shared page, the memory whose
+    /// bookkeeping a store does ([`AddressSpace::wrote`]): it is populated,
+    /// and up to date with its file's shrinks.
     fn remember(&self, directory: &Directory, page: u64) {
         let Some(p) = lookup(directory, page) else {
             return;
         };
-        if self.shared_at(page).is_some() || self.may_be_truncated(page, p) {
+        if self.may_be_truncated(page, p) {
             return;
         }
-        let file = if p.file {
-            let Some((source, offset)) = self.file_at(page) else {
-                return;
-            };
-            Some(FileEnd {
-                source: Arc::clone(source),
-                offset,
-                shrinks: (!p.cache).then_some(p.shrinks),
-            })
-        } else {
-            None
+        let shared = self.shared_at(page).map(|mapping| mapping.pages.stores());
+        // A file mapping without a file, or whose file has no end, has no end
+        // to check, as in `check`. One whose file does not say where it keeps
+        // its size stays out.
+        let file = match p.file.then(|| self.file_at(page)).flatten() {
+            Some((source, offset)) if source.size().is_some() => {
+                let Some(size) = source.file_size() else {
+                    return;
+                };
+                Some(FileEnd {
+                    size,
+                    offset,
+                    shrinks: (!p.cache).then_some(p.shrinks),
+                })
+            }
+            _ => None,
         };
         // The lock is held, so the epoch is the one the entry is valid at.
         let epoch = self.code.epoch.load(Ordering::Acquire);
@@ -1855,6 +1937,7 @@ impl AddressSpaceData {
                 frame: p.frame.clone(),
                 cow: p.cow,
                 file,
+                shared,
             });
         });
     }
@@ -3439,31 +3522,47 @@ impl AddressSpace {
             return false;
         };
         self.storing_through_thread_tlb(|tlb| {
-            let (frame, code) = Self::writable(tlb, page)?;
-            frame.write(page_offset(addr.0), buf);
-            self.wrote(code);
+            let target = Self::writable(tlb, page)?;
+            target.frame.write(page_offset(addr.0), buf);
+            self.wrote(&target);
             Some(())
         })
         .is_some()
     }
-    /// The frame of `page` that a store through `tlb` may write, and whether
-    /// it is executable.
+    /// What a store through `tlb` to `page` writes, which [`Self::wrote`]
+    /// is given after the bytes; for a shared page, its memory's generation
+    /// has moved on before them, as `store_with` does under the locks. A
+    /// private page-cache page has `cow` set and is left out: it is copied
+    /// under the locks first.
     #[inline]
-    fn writable(tlb: &Tlb, page: u64) -> Option<(&FrameBytes, bool)> {
+    fn writable(tlb: &Tlb, page: u64) -> Option<StoreTarget<'_>> {
         let entry = tlb
             .get(page)
             .filter(|e| e.prot.contains(Prot::WRITE) && !e.cow)?;
-        // The page is not shared, so nothing writes it back and it need not
-        // be marked dirty. A page-cache page, which is, has `cow` set and is
-        // left out above.
-        Some((entry.frame.get()?, entry.prot.contains(Prot::EXEC)))
+        let target = StoreTarget {
+            frame: entry.frame.get()?,
+            code: entry.prot.contains(Prot::EXEC),
+            shared: entry.shared.as_ref(),
+        };
+        if let Some(shared) = target.shared {
+            shared.changed();
+        }
+        Some(target)
     }
-    /// After a store through a [`ThreadTlb`]: a store to code makes the
-    /// decoded instructions stale. After the bytes, as in `store_with`.
+    /// After a store through a [`ThreadTlb`], as in `store_with`, after the
+    /// bytes: a store to code makes the decoded instructions stale, and a
+    /// shared page becomes dirty, for write-back, and moves its memory's
+    /// generation on again, so that a write-back that ran between the two
+    /// bumps sees a change after it. A private page is never written back,
+    /// so it need not be marked dirty.
     #[inline]
-    fn wrote(&self, code: bool) {
-        if code {
+    fn wrote(&self, target: &StoreTarget<'_>) {
+        if target.code {
             self.code.generation.fetch_add(1, Ordering::Release);
+        }
+        if let Some(shared) = target.shared {
+            target.frame.dirty.store(true, Ordering::Release);
+            shared.changed();
         }
     }
     /// Writes guest memory, which requires `PROT_WRITE`, through a shared
@@ -3558,9 +3657,9 @@ impl AddressSpace {
             return false;
         }
         self.storing_through_thread_tlb(|tlb| {
-            let (frame, code) = Self::writable(tlb, addr.0 - offset as u64)?;
-            frame.write_value(offset, size, value);
-            self.wrote(code);
+            let target = Self::writable(tlb, addr.0 - offset as u64)?;
+            target.frame.write_value(offset, size, value);
+            self.wrote(&target);
             Some(())
         })
         .is_some()
@@ -3710,9 +3809,9 @@ impl AddressSpace {
     ) -> Option<AtomicResult> {
         let offset = page_offset(addr.0);
         self.storing_through_thread_tlb(|tlb| {
-            let (frame, code) = Self::writable(tlb, addr.0 - offset as u64)?;
-            let result = frame.update(offset, size, operation);
-            self.wrote(code);
+            let target = Self::writable(tlb, addr.0 - offset as u64)?;
+            let result = target.frame.update(offset, size, operation);
+            self.wrote(&target);
             Some(result)
         })
     }

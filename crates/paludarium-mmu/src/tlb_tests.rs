@@ -349,7 +349,8 @@ fn an_access_it_does_not_hold_waits_for_serialization() {
         }
     ));
     assert_eq!(byte(&shared, AT), 1);
-    // Nor does shared memory ever get in, however much it is used.
+    // Nor does a page that only another thread used: each thread has a TLB
+    // of its own.
     assert_eq!(used(&shared, AT), 1);
     assert!(!finishes_under_serialization(
         &shared,
@@ -672,30 +673,26 @@ fn a_load_it_holds_sees_a_16_byte_exchange_whole() {
 /// offset modulo 251, and a shrink counts, then sets the size, as the
 /// kernel's page cache does.
 struct Shrinking {
-    size: AtomicU64,
+    size: Arc<FileSize>,
     shrinks: std::sync::Mutex<Vec<(u64, u64)>>,
-    count: AtomicU64,
 }
 impl Shrinking {
     fn new(size: u64) -> Arc<Self> {
         Arc::new(Shrinking {
-            size: AtomicU64::new(size),
+            size: Arc::new(FileSize::new(size)),
             shrinks: std::sync::Mutex::default(),
-            count: AtomicU64::new(0),
         })
     }
     fn resize(&self, size: u64) {
-        if size < self.size.load(Ordering::SeqCst) {
-            let mut shrinks = self.shrinks.lock().unwrap();
-            let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut shrinks = self.shrinks.lock().unwrap();
+        if let Some(count) = self.size.set(size) {
             shrinks.push((count, size));
         }
-        self.size.store(size, Ordering::SeqCst);
     }
 }
 impl PageSource for Shrinking {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
-        let size = self.size.load(Ordering::SeqCst);
+        let size = self.size.get();
         let n =
             usize::try_from(size.saturating_sub(offset)).map_or(buf.len(), |n| n.min(buf.len()));
         for (i, b) in buf[..n].iter_mut().enumerate() {
@@ -704,10 +701,13 @@ impl PageSource for Shrinking {
         Ok(n)
     }
     fn size(&self) -> Option<u64> {
-        Some(self.size.load(Ordering::SeqCst))
+        Some(self.size.get())
     }
     fn shrinks(&self) -> u64 {
-        self.count.load(Ordering::SeqCst)
+        self.size.shrinks()
+    }
+    fn file_size(&self) -> Option<Arc<FileSize>> {
+        Some(Arc::clone(&self.size))
     }
     fn shrunk_since(&self, count: u64) -> Option<u64> {
         let shrinks = self.shrinks.lock().unwrap();
@@ -904,4 +904,162 @@ fn no_load_or_store_without_a_lock_succeeds_after_a_shrink_past_it_returns() {
             });
         }
     }
+}
+
+/// A space with `pages` pages of `memory` mapped shared at `AT`, with
+/// `prot`, as a `MAP_SHARED` mapping of a file or of shared memory shows it.
+fn shared_space(memory: &SharedPages, pages: u64, prot: Prot) -> Arc<AddressSpace> {
+    let space = AddressSpace::new();
+    let len = pages * PAGE_SIZE;
+    space
+        .map_shared(Some(GuestAddr(AT)), len, prot, MappingKind::File)
+        .unwrap();
+    space
+        .share_pages(GuestAddr(AT), len, memory, 0, true)
+        .unwrap();
+    Arc::new(space)
+}
+
+#[test]
+fn a_shared_page_its_thread_holds_takes_no_lock() {
+    let file = Shrinking::new(PAGE_SIZE);
+    let source: Arc<dyn PageSource> = file;
+    for (memory, file) in [
+        (SharedPages::new(), false),
+        (SharedPages::new().with_source(source), true),
+    ] {
+        let space = shared_space(&memory, 1, Prot::READ_WRITE);
+        let generation = memory.generation();
+        assert!(finishes_while_held(
+            &space,
+            Held::Both,
+            SHOULD_FINISH,
+            |space| {
+                space.write(GuestAddr(AT), &[1]).unwrap();
+                used(space, AT);
+            },
+            |space| {
+                assert_eq!(byte(space, AT), 1);
+                space.write(GuestAddr(AT + 1), &[2]).unwrap();
+                space.write_u64(GuestAddr(AT + 8), 3).unwrap();
+                space
+                    .atomic(GuestAddr(AT + 16), AtomicWidth::W32, AtomicOp::Add(4))
+                    .unwrap();
+            },
+        ));
+        // Each store moved the memory's generation on, and the page is
+        // dirty, as under the locks.
+        assert_ne!(memory.generation(), generation);
+        let mut pages = Vec::new();
+        memory
+            .write_back(|key, page| {
+                pages.push((key, page[..20].to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        // What the file held, or zeros, with the stores over it.
+        let mut expected: Vec<u8> = (0..20)
+            .map(|offset| if file { pattern(offset) } else { 0 })
+            .collect();
+        expected[..2].copy_from_slice(&[1, 2]);
+        expected[8..16].copy_from_slice(&3u64.to_le_bytes());
+        expected[16] = expected[16].wrapping_add(4);
+        assert_eq!(pages, [(0, expected)]);
+    }
+}
+
+#[test]
+fn a_store_without_a_lock_to_shared_memory_shows_in_every_space_and_changes_its_code() {
+    let memory = SharedPages::new();
+    let writer = shared_space(&memory, 1, Prot::READ_WRITE);
+    let runner = shared_space(&memory, 1, Prot::READ.union(Prot::EXEC));
+    writer.write(GuestAddr(AT), &[1]).unwrap();
+    assert_eq!(used(&writer, AT), 1);
+    // The runner watches the memory it may run code from.
+    let code = runner.code_generation_cached();
+    assert!(finishes_while_held(
+        &writer,
+        Held::Both,
+        SHOULD_FINISH,
+        |space| {
+            used(space, AT);
+        },
+        |space| {
+            space.write(GuestAddr(AT), &[0x90]).unwrap();
+        },
+    ));
+    assert_eq!(byte(&runner, AT), 0x90);
+    assert_ne!(runner.code_generation_cached(), code);
+}
+
+#[test]
+fn a_write_back_never_misses_a_store_that_takes_no_lock() {
+    // Each write-back marks the page clean before it reads it, and each
+    // store makes it dirty after its bytes: whatever a write-back missed,
+    // the next one hands over.
+    let memory = SharedPages::new();
+    let space = shared_space(&memory, 1, Prot::READ_WRITE);
+    space.write_u64(GuestAddr(AT), 0).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let (storing, finished) = (Arc::clone(&space), Arc::clone(&done));
+    let thread = std::thread::spawn(move || {
+        used(&storing, AT);
+        let mut value = 0;
+        while !finished.load(Ordering::SeqCst) {
+            value += 1;
+            storing.write_u64(GuestAddr(AT), value).unwrap();
+        }
+        value
+    });
+    let mut seen = 0;
+    let take = |seen: &mut u64| {
+        memory
+            .write_back(|_, page| {
+                *seen = u64::from_le_bytes(page[..8].try_into().unwrap());
+                Ok(())
+            })
+            .unwrap();
+    };
+    for _ in 0..10_000 {
+        take(&mut seen);
+    }
+    done.store(true, Ordering::SeqCst);
+    let last = thread.join().unwrap();
+    take(&mut seen);
+    assert_eq!(seen, last);
+}
+
+#[test]
+fn a_thread_tlb_never_keeps_a_file_or_its_owner_alive() {
+    // Holding them would keep the file open after `munmap`, and count as
+    // an attachment of System V shared memory.
+    let file = Shrinking::new(2 * PAGE_SIZE);
+    let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+    let source: Arc<dyn PageSource> = file.clone();
+    let memory = SharedPages::new()
+        .with_source(Arc::clone(&source))
+        .with_owner(Arc::clone(&owner));
+    let private = file_space(&file, 2, FileView::Copy);
+    let shared = shared_space(&memory, 2, Prot::READ_WRITE);
+    drop(memory);
+    let (files, owners) = (Arc::strong_count(&file), Arc::strong_count(&owner));
+    for space in [&private, &shared] {
+        space.write(GuestAddr(AT), &[1]).unwrap();
+        assert_eq!(used(space, AT), 1);
+        space.write(GuestAddr(AT + 1), &[2]).unwrap();
+    }
+    assert_eq!(Arc::strong_count(&file), files);
+    assert_eq!(Arc::strong_count(&owner), owners);
+    // The pages were held, without a lock.
+    assert!(finishes_while_held(
+        &shared,
+        Held::Both,
+        SHOULD_FINISH,
+        |space| {
+            used(space, AT);
+        },
+        |space| {
+            assert_eq!(byte(space, AT + 1), 2);
+        },
+    ));
 }

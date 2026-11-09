@@ -9,7 +9,7 @@
 //! written back by `msync` and when the last mapping of the file goes away
 //! (unmapped, or with the address space of a process that exits or execs).
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs};
-use paludarium_mmu::{MemoryMeter, SharedPages};
+use paludarium_mmu::{FileSize, MemoryMeter, SharedPages};
 use paludarium_types::{Errno, PAGE_SIZE};
 use paludarium_vfs::{FileSystem, MountPoint};
 use std::collections::HashMap;
@@ -83,9 +83,8 @@ impl PageCaches {
             key,
             pages: SharedPages::new(),
             writer: Mutex::new(None),
-            size: AtomicU64::new(size),
+            size: Arc::new(FileSize::new(size)),
             shrinks: Mutex::default(),
-            shrink_count: AtomicU64::new(0),
             writable: AtomicUsize::new(0),
             clean: AtomicU64::new(0),
             meter,
@@ -164,13 +163,13 @@ pub(crate) struct FileCache {
     /// A handle open for writing, from the first mapping that may write.
     writer: Mutex<Option<Arc<dyn FileHandle>>>,
     /// The file's size, kept by its handles: a mapping cannot reach a page
-    /// wholly past it (SIGBUS).
-    size: AtomicU64,
+    /// wholly past it (SIGBUS). With how many times it has shrunk, which the
+    /// threads' TLBs hold ([`paludarium_mmu::PageSource::file_size`]).
+    size: Arc<FileSize>,
     /// The sizes the file shrank to, each after how many shrinks, kept
     /// only while no later one is as small: the first one after a count is
     /// the smallest since ([`paludarium_mmu::PageSource::shrunk_since`]).
     shrinks: Mutex<Vec<(u64, u64)>>,
-    shrink_count: AtomicU64,
     /// The mappings that may write, which `F_SEAL_WRITE` refuses to seal.
     writable: AtomicUsize,
     /// The pages' generation when they were last written back: a store
@@ -286,16 +285,16 @@ impl FileCache {
     }
     /// The file got `data` at `offset`.
     fn wrote(&self, offset: u64, data: &[u8]) {
-        self.size
-            .fetch_max(offset.saturating_add(data.len() as u64), Ordering::SeqCst);
+        self.size.grow_to(offset.saturating_add(data.len() as u64));
         self.pages.store(offset, data);
     }
     /// The file went from `old` bytes to `size`: what lay past the end reads
     /// as zeros if it grows again.
     fn resized(&self, old: u64, size: u64) {
-        if size < old {
-            let mut shrinks = self.shrinks.lock().unwrap_or_else(PoisonError::into_inner);
-            let count = self.shrink_count.fetch_add(1, Ordering::SeqCst) + 1;
+        // Under the lock of the list, so that a count and its size go in
+        // together, in order.
+        let mut shrinks = self.shrinks.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = self.size.set(size) {
             while shrinks
                 .last()
                 .is_some_and(|&(_, smallest)| smallest >= size)
@@ -304,7 +303,7 @@ impl FileCache {
             }
             shrinks.push((count, size));
         }
-        self.size.store(size, Ordering::SeqCst);
+        drop(shrinks);
         self.pages.zero(old.min(size), u64::MAX);
     }
     /// The bytes from `start` to `end` read as zeros now.
@@ -340,10 +339,13 @@ impl paludarium_mmu::PageSource for FilePages {
         self.file.read_at(offset, buf)
     }
     fn size(&self) -> Option<u64> {
-        Some(self.cache.size.load(Ordering::SeqCst))
+        Some(self.cache.size.get())
     }
     fn shrinks(&self) -> u64 {
-        self.cache.shrink_count.load(Ordering::SeqCst)
+        self.cache.size.shrinks()
+    }
+    fn file_size(&self) -> Option<Arc<FileSize>> {
+        Some(Arc::clone(&self.cache.size))
     }
     fn shrunk_since(&self, count: u64) -> Option<u64> {
         let shrinks = self

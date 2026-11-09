@@ -28,6 +28,9 @@
 #include <sys/time.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/un.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
@@ -956,29 +959,6 @@ static void io_taken(const char *name) {
                info.si_code, (long)info.si_band, info.si_fd);
     printf("\n");
 }
-/* signal-io-wait: takes the pending signals of a stream whose peer shut
-   its sending down or closed while its reader waited, and says only
-   whether they are at most one signal of `code` and `band` for `fd`.
-   Linux's unix_shutdown and unix_release_sock wake the reader
-   (sk_state_change) before they look at SOCKWQ_ASYNC_WAITDATA
-   (sk_wake_async), so a reader that runs at once has cleared it and is
-   signalled, and one that does not is not: either is Linux, and nothing
-   else is. */
-static void io_at_most_one(const char *name, int fd, const char *what, int code, long band) {
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGIO);
-    sigaddset(&set, SIGURG);
-    sigaddset(&set, IO_RT);
-    struct timespec zero = {0, 0};
-    siginfo_t info;
-    int number, count = 0, other = 0;
-    while ((number = sigtimedwait(&set, &info, &zero)) > 0) {
-        count++;
-        other |= number != IO_RT || info.si_code != code || info.si_band != band || info.si_fd != fd;
-    }
-    printf("  %s: at-most-one-%s=%d\n", name, what, count <= 1 && !other);
-}
 /* Counts the queued IO_RT signals with code `code` and takes the rest. */
 static int io_count(int code) {
     sigset_t set;
@@ -1129,6 +1109,24 @@ static int reaped(long pid) {
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+/* The net-namespaces case: a request of the loopback interface on `fd`,
+   its result (the flags, or the index) or -errno. */
+static long netns_lo(int fd, unsigned long request, const char *name, short flags) {
+    struct ifreq request_of = {0};
+    strncpy(request_of.ifr_name, name, IFNAMSIZ - 1);
+    request_of.ifr_flags = flags;
+    errno = 0;
+    if (ioctl(fd, request, &request_of) < 0) return -errno;
+    if (request == SIOCGIFFLAGS) return request_of.ifr_flags & (IFF_UP | IFF_LOOPBACK | IFF_RUNNING);
+    if (request == SIOCGIFINDEX) return request_of.ifr_ifindex;
+    return 0;
+}
+static struct sockaddr_in netns_v4(const char *ip, int port) {
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(port)};
+    inet_pton(AF_INET, ip, &address.sin_addr);
+    return address;
+}
+static long netns_result(long r) { return r < 0 ? -errno : r; }
 /* The pid-namespaces case: the SIGUSR1s the init of a nested PID
    namespace handled, and the sender the last one showed. */
 static volatile sig_atomic_t pidns_usr1, pidns_from = -1;
@@ -5110,6 +5108,98 @@ int main(int argc, char **argv) {
         result("errno", errno);
         return 0;
     }
+    if (!strcmp(mode, "net-namespaces")) {
+        /* A child makes a network namespace, which has only a loopback,
+           down and without addresses, and abstract socket names of its
+           own; the first namespace's name stays out of its reach. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            char before[64], after[64];
+            ns_link("self", "net", before, sizeof before);
+            int first_ns = ns_open("self", "net");
+            struct sockaddr_un name = {.sun_family = AF_UNIX};
+            memcpy(name.sun_path, "\0paludarium-netns", 17);
+            socklen_t name_len = offsetof(struct sockaddr_un, sun_path) + 17;
+            int first = socket(AF_UNIX, SOCK_STREAM, 0);
+            long bound = netns_result(bind(first, (void *)&name, name_len));
+            listen(first, 1);
+            errno = 0;
+            long made = syscall(SYS_unshare, CLONE_NEWNET);
+            printf("maker: bound=%ld unshare=%ld errno=%d", bound, made, errno);
+            ns_link("self", "net", after, sizeof after);
+            printf(" changed=%d\n", strcmp(before, after) != 0);
+            int unix_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+            long reached = netns_result(connect(unix_fd, (void *)&name, name_len));
+            int own = socket(AF_UNIX, SOCK_STREAM, 0);
+            long own_bound = netns_result(bind(own, (void *)&name, name_len));
+            printf("abstract: reached=%ld bound=%ld\n", reached, own_bound);
+            int tcp = socket(AF_INET, SOCK_STREAM, 0), udp = socket(AF_INET, SOCK_DGRAM, 0);
+            printf("down: tcp=%d udp=%d flags=%ld index=%ld eth0=%ld\n", tcp >= 0, udp >= 0,
+                   netns_lo(tcp, SIOCGIFFLAGS, "lo", 0), netns_lo(tcp, SIOCGIFINDEX, "lo", 0),
+                   netns_lo(tcp, SIOCGIFFLAGS, "eth0", 0));
+            struct sockaddr_in local = netns_v4("127.0.0.1", 0), closed = netns_v4("127.0.0.1", 1);
+            struct sockaddr_in dns = netns_v4("8.8.8.8", 53), far = netns_v4("192.0.2.1", 80);
+            long bind_down = netns_result(bind(udp, (void *)&local, sizeof local));
+            long connect_down = netns_result(connect(tcp, (void *)&closed, sizeof closed));
+            long send_down = netns_result(sendto(udp, "x", 1, 0, (void *)&closed, sizeof closed));
+            long dns_down = netns_result(sendto(udp, "x", 1, 0, (void *)&dns, sizeof dns));
+            printf("down: bind=%ld connect=%ld send=%ld dns=%ld\n", bind_down, connect_down, send_down,
+                   dns_down);
+            /* Up, the loopback has its addresses and works; nothing else
+               is reachable. */
+            long up = netns_lo(tcp, SIOCSIFFLAGS, "lo", IFF_UP);
+            printf("up: set=%ld flags=%ld\n", up, netns_lo(udp, SIOCGIFFLAGS, "lo", 0));
+            int receiver = socket(AF_INET, SOCK_DGRAM, 0), sender = socket(AF_INET, SOCK_DGRAM, 0);
+            struct sockaddr_in at;
+            socklen_t at_len = sizeof at;
+            long udp_bound = netns_result(bind(receiver, (void *)&local, sizeof local));
+            getsockname(receiver, (void *)&at, &at_len);
+            long sent = netns_result(sendto(sender, "hi", 2, 0, (void *)&at, sizeof at));
+            char buf[8];
+            long got = netns_result(recv(receiver, buf, sizeof buf, MSG_DONTWAIT));
+            printf("up: udp bound=%ld sent=%ld got=%ld\n", udp_bound, sent, got);
+            int listener = socket(AF_INET, SOCK_STREAM, 0), client = socket(AF_INET, SOCK_STREAM, 0);
+            at_len = sizeof at;
+            long tcp_bound = netns_result(bind(listener, (void *)&local, sizeof local));
+            listen(listener, 1);
+            getsockname(listener, (void *)&at, &at_len);
+            long connected = netns_result(connect(client, (void *)&at, sizeof at));
+            int accepted = accept(listener, NULL, NULL);
+            long written = netns_result(write(client, "x", 1));
+            long read_back = accepted >= 0 ? netns_result(read(accepted, buf, sizeof buf)) : -1;
+            printf("up: tcp bound=%ld connected=%ld accepted=%d moved=%ld,%ld\n", tcp_bound, connected,
+                   accepted >= 0, written, read_back);
+            int refused = socket(AF_INET, SOCK_STREAM, 0), outside = socket(AF_INET, SOCK_STREAM, 0);
+            long closed_up = netns_result(connect(refused, (void *)&closed, sizeof closed));
+            long far_up = netns_result(connect(outside, (void *)&far, sizeof far));
+            long dns_up = netns_result(sendto(sender, "x", 1, 0, (void *)&dns, sizeof dns));
+            printf("up: closed=%ld far=%ld dns=%ld\n", closed_up, far_up, dns_up);
+            /* Back in the first namespace, its abstract name is reached
+               again; a socket made in the other stays in that one. */
+            long back = ns_setns(first_ns, CLONE_NEWNET);
+            int again = socket(AF_UNIX, SOCK_STREAM, 0);
+            long reached_again = netns_result(connect(again, (void *)&name, name_len));
+            printf("back: setns=%ld reached=%ld flags=%ld\n", back, reached_again,
+                   netns_lo(udp, SIOCGIFFLAGS, "lo", 0));
+            /* Without CAP_NET_ADMIN, setting flags is EPERM, whatever the
+               name. */
+            fflush(stdout);
+            pid_t user = child();
+            if (user == 0) {
+                if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+                printf("user: lo=%ld nope=%ld get=%ld\n", netns_lo(udp, SIOCSIFFLAGS, "lo", 0),
+                       netns_lo(udp, SIOCSIFFLAGS, "nope", 0), netns_lo(udp, SIOCGIFFLAGS, "lo", 0));
+                fflush(stdout);
+                _exit(0);
+            }
+            result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
     if (!strcmp(mode, "pid-namespaces")) {
         /* clone with CLONE_NEWPID: the child is the init of a new
            namespace, its parent outside it. */
@@ -7564,15 +7654,15 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "signal-io-wait")) {
         /* The O_ASYNC signals around waits. A stream whose reader waits
-           gets none for the data that ends the wait (Linux's
-           SOCKWQ_ASYNC_WAITDATA) on at least one of up to ten sends, as
-           Linux signals one whose reader ran before the sender looked,
-           and at most one POLL_IN for the peer's
-           shutdown and one POLL_HUP for its close (io_at_most_one), where
-           a datagram or packet socket still signals. A send that found
-           the buffer full signals POLL_OUT only once three quarters of it
-           is free. A pipe write signals its reader before each wait. A
-           reader's child acts after a while (io_pause). */
+           gets none for the data, the peer's shutdown or its close that
+           ends the wait (Linux's SOCKWQ_ASYNC_WAITDATA), where a datagram
+           or packet socket still signals. Linux signals one whose reader
+           ran before the sender looked, so an attempt whose reader was
+           signalled is taken again, and the last of up to ten is printed
+           as it is. A send that found the buffer full signals POLL_OUT
+           only once three quarters of it is free. A pipe write signals
+           its reader before each wait. A reader's child acts after a
+           while (io_pause). */
         sigset_t set;
         sigemptyset(&set);
         sigaddset(&set, SIGIO);
@@ -7613,12 +7703,14 @@ int main(int argc, char **argv) {
                 /* A busy host can keep the reader from reaching recv
                    before the child acts. Then the reader does not wait
                    and the signal is due, so the attempt is taken again.
-                   So it is when a stream's send signals: Linux's
-                   sock_def_readable wakes the reader before it looks at
-                   SOCKWQ_ASYNC_WAITDATA (sk_wake_async), so a send that
-                   came before the reader slept, or whose reader ran at
-                   once and cleared it, signals, and one whose reader
-                   waited and had not yet run does not. Up to ten
+                   So it is when a stream's reader is signalled: Linux's
+                   sock_def_readable (a send), unix_shutdown (a
+                   shutdown) and unix_release_sock (a close) wake the
+                   reader before they look at SOCKWQ_ASYNC_WAITDATA
+                   (sk_wake_async), so what came before the reader slept,
+                   or whose reader ran at once and cleared it, signals,
+                   and what found the reader waiting and not yet run does
+                   not. Up to ten
                    attempts give the second on Linux, so the emulator
                    must give it too. */
                 struct pollfd ready = {sv[1], POLLIN | POLLRDHUP, 0};
@@ -7630,11 +7722,9 @@ int main(int argc, char **argv) {
                 else if (read(acted[0], buf, 1) != 1) return 72;
                 sigset_t pending;
                 sigpending(&pending);
-                int again = (early || (types[t] == SOCK_STREAM && a == 0 && sigismember(&pending, IO_RT)))
+                int again = (early || (types[t] == SOCK_STREAM && sigismember(&pending, IO_RT)))
                             && ++tries < 10;
                 if (again) io_count(0);
-                else if (types[t] == SOCK_STREAM && a == 1) io_at_most_one(name, sv[1], "in", POLL_IN, 0x41);
-                else if (types[t] == SOCK_STREAM && a == 2) io_at_most_one(name, sv[1], "hang-up", POLL_HUP, 0x18);
                 else io_taken(name);
                 close(sv[1]);
                 if (a != 2) {

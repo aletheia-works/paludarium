@@ -19,6 +19,13 @@ release PR をマージするかどうかだけです。詳しい手順と、す
    待ちません。
 5. **タグ**：すべての公開が成功した後で、最後にタグと GitHub Release を作ります。
    GitHub Release の本文には、マージした release PR の本文のリリースノートを使います。
+   前の Publish の run が止まっている間に main が進むと、公開するのは release PR の
+   マージコミットより後の main の head になります。そのときは、間に入ったコミットのうち
+   `feat`、`fix`、`perf`、`revert` を、Release Please と同じ形でそれぞれの節に書き足します。
+   互換を壊す変更（`!` か `BREAKING CHANGE:` の footer）は、その説明を
+   `⚠ BREAKING CHANGES` の節にも書きます。
+   次の release PR はタグより後のコミットしか数えないため、ここで書き足さないと、
+   どのリリースノートにも載りません。
 
 確かめの job がエミュレーターと関係のない理由（ブラウザーがページを読み込めなかった、
 runner がなかったなど）で失敗したら、同じ run の中でその job を再実行します。そのあと、

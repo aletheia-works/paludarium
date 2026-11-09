@@ -8,7 +8,7 @@
 //! the instruction runs again in [`super::execute`], which gives the fault.
 
 use paludarium_decoder::{
-    Condition, Instruction, MemoryOperand, Mnemonic, Operand, Register, RepPrefix,
+    Condition, Instruction, MemoryOperand, Mnemonic, Operand, Register, RepPrefix, Segment,
 };
 use paludarium_mmu::AddressSpace;
 use paludarium_types::GuestAddr;
@@ -67,6 +67,43 @@ pub(crate) enum Source {
     Immediate(u64),
 }
 
+/// A memory operand of [`Fast`]: a [`MemoryOperand`] whose base and index
+/// are general-purpose registers read whole, kept in 16 bytes instead of 24.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Address {
+    displacement: u64,
+    base: Option<u8>,
+    index: Option<u8>,
+    scale: u8,
+    /// Size of the accessed value in bytes.
+    size: u8,
+    segment: Segment,
+    address_size_32: bool,
+}
+
+impl Address {
+    /// `m` as an [`Address`], when [`super::Exec::address`] reads its base
+    /// and index whole: 64-bit registers, or 32-bit ones of an address that
+    /// is truncated to 32 bits anyway.
+    fn of(m: MemoryOperand) -> Option<Self> {
+        let whole = |r: Option<Register>| match r {
+            None => Some(None),
+            Some(Register::Gpr { index, size: 8 }) => Some(Some(index & 15)),
+            Some(Register::Gpr { index, size: 4 }) if m.address_size_32 => Some(Some(index & 15)),
+            Some(_) => None,
+        };
+        Some(Address {
+            displacement: m.displacement,
+            base: whole(m.base)?,
+            index: whole(m.index)?,
+            scale: m.scale,
+            size: m.size,
+            segment: m.segment,
+            address_size_32: m.address_size_32,
+        })
+    }
+}
+
 /// The operation of a decoded instruction, if it has one of these forms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fast {
@@ -81,22 +118,22 @@ pub(crate) enum Fast {
     /// `mov r, [m]`.
     Load {
         dst: Register,
-        mem: MemoryOperand,
+        mem: Address,
     },
     /// `mov [m], r/imm`.
     Store {
-        mem: MemoryOperand,
+        mem: Address,
         src: Source,
     },
     /// `movzx r, [m]`.
     LoadZeroExtended {
         dst: Register,
-        mem: MemoryOperand,
+        mem: Address,
     },
     /// `lea r64, [m]`.
     Lea {
         dst: u8,
-        mem: MemoryOperand,
+        mem: Address,
     },
     /// `push r64`.
     Push(u8),
@@ -119,7 +156,7 @@ pub(crate) enum Fast {
     /// `cmp`/`test [m], r/imm`.
     Compare {
         op: Alu,
-        mem: MemoryOperand,
+        mem: Address,
         src: Source,
     },
 }
@@ -157,6 +194,10 @@ fn memory(o: Option<Operand>) -> Option<MemoryOperand> {
     }
 }
 
+fn address(o: Option<Operand>) -> Option<Address> {
+    Address::of(memory(o)?)
+}
+
 fn branch(o: Option<Operand>) -> Option<u64> {
     match o {
         Some(Operand::Branch(t)) => Some(t.0),
@@ -182,7 +223,7 @@ impl Fast {
             Mnemonic::Nop | Mnemonic::Endbr64 => Self::Nop,
             Mnemonic::Mov => {
                 if let Some(dst) = gpr(a) {
-                    match memory(b) {
+                    match address(b) {
                         Some(mem) if mem.size == dst.size() => Self::Load { dst, mem },
                         Some(_) => return None,
                         None => Self::Move {
@@ -191,7 +232,7 @@ impl Fast {
                         },
                     }
                 } else {
-                    let mem = memory(a)?;
+                    let mem = address(a)?;
                     Self::Store {
                         mem,
                         src: source(b, mem.size)?,
@@ -200,7 +241,7 @@ impl Fast {
             }
             Mnemonic::Movzx => {
                 let dst = gpr(a)?;
-                let mem = memory(b)?;
+                let mem = address(b)?;
                 if !matches!(mem.size, 1 | 2) || dst.size() <= mem.size {
                     return None;
                 }
@@ -208,7 +249,7 @@ impl Fast {
             }
             Mnemonic::Lea => Self::Lea {
                 dst: gpr64(a)?,
-                mem: memory(b)?,
+                mem: address(b)?,
             },
             Mnemonic::Push if i.implicit_size == 8 && b.is_none() => Self::Push(gpr64(a)?),
             Mnemonic::Pop if i.implicit_size == 8 && b.is_none() => Self::Pop(gpr64(a)?),
@@ -230,7 +271,7 @@ impl Fast {
                 } else if op.writes() {
                     return None;
                 } else {
-                    let mem = memory(a)?;
+                    let mem = address(a)?;
                     Self::Compare {
                         op,
                         mem,
@@ -243,6 +284,32 @@ impl Fast {
 }
 
 impl Exec<'_> {
+    /// [`Exec::linear`] of `m`.
+    #[inline]
+    fn fast_linear(&self, m: &Address) -> GuestAddr {
+        GuestAddr(self.fast_address(m).0.wrapping_add(match m.segment {
+            Segment::Fs => self.s.fs_base,
+            Segment::Gs => self.s.gs_base,
+            Segment::None => 0,
+        }))
+    }
+
+    /// [`Exec::address`] of `m`.
+    #[inline]
+    fn fast_address(&self, m: &Address) -> GuestAddr {
+        let mut ea = m.displacement;
+        if let Some(b) = m.base {
+            ea = ea.wrapping_add(self.s.gpr[usize::from(b)]);
+        }
+        if let Some(x) = m.index {
+            ea = ea.wrapping_add(self.s.gpr[usize::from(x)].wrapping_mul(u64::from(m.scale)));
+        }
+        if m.address_size_32 {
+            ea &= 0xffff_ffff;
+        }
+        GuestAddr(ea)
+    }
+
     #[inline]
     fn source(&self, src: Source, size: u8) -> u64 {
         match src {
@@ -252,16 +319,18 @@ impl Exec<'_> {
     }
 }
 
-/// Runs `f`, the form of `i`, which is not [`Fast::None`]. When it fails, the
-/// state is as it was.
+/// Runs `f`, the form of `i`, which is not [`Fast::None`], where the next
+/// instruction is at `next`. When it fails, the state is as it was. `i` is
+/// not read, so that running a form touches only the small part of a
+/// decoded instruction that holds it.
 #[inline]
 pub(crate) fn execute(
     s: &mut CpuState,
     mem: &AddressSpace,
     i: &Instruction,
     f: &Fast,
+    next: u64,
 ) -> Result<()> {
-    let next = i.next_rip().0;
     let mut x = Exec { s, mem, i };
     let target = match *f {
         Fast::None | Fast::Nop => next,
@@ -271,22 +340,22 @@ pub(crate) fn execute(
             next
         }
         Fast::Load { dst, mem } => {
-            let v = x.load(x.linear(&mem), mem.size)?;
+            let v = x.load(x.fast_linear(&mem), mem.size)?;
             x.write_reg(dst, v & size_mask(dst.size()));
             next
         }
         Fast::Store { mem, src } => {
             let v = x.source(src, mem.size);
-            x.store(x.linear(&mem), mem.size, v)?;
+            x.store(x.fast_linear(&mem), mem.size, v)?;
             next
         }
         Fast::LoadZeroExtended { dst, mem } => {
-            let v = x.load(x.linear(&mem), mem.size)?;
+            let v = x.load(x.fast_linear(&mem), mem.size)?;
             x.write_reg(dst, v & size_mask(dst.size()));
             next
         }
         Fast::Lea { dst, mem } => {
-            x.s.gpr[usize::from(dst)] = x.address(&mem).0;
+            x.s.gpr[usize::from(dst)] = x.fast_address(&mem).0;
             next
         }
         Fast::Push(r) => {
@@ -326,7 +395,7 @@ pub(crate) fn execute(
         Fast::Compare { op, mem, src } => {
             let size = mem.size;
             let b = x.source(src, size);
-            let a = x.load(x.linear(&mem), size)?;
+            let a = x.load(x.fast_linear(&mem), size)?;
             let (_, flags) = op.apply(a, b, size);
             x.set_status(flag::STATUS, flags);
             next

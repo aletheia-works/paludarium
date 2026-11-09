@@ -153,13 +153,20 @@ aletheia-works repositories, with the `aletheia-works-bot` App token
 (`vars.BOT_CLIENT_ID`, `secrets.BOT_PRIVATE_KEY`). Unlike those
 repositories, a push to
 main only creates or updates the release PR (`skip-github-release`): the
-same-head evidence of step 5 must exist for the release PR's merge commit
-before anything is published, so Release Please never tags: `publish.yml`
-publishes that commit and creates the tag and the GitHub release last
-(steps 5 and 6), as biome and mise do. The labels `autorelease: pending` and `autorelease: tagged` are
-managed in `infra/github/main.tf`. Release Please writes no `CHANGELOG.md`
+same-head evidence of step 5 must exist for the head being published, so
+Release Please never tags: `publish.yml` publishes that head and creates the
+tag and the GitHub release last (steps 5 and 6), as biome and mise do. That
+head is the release PR's merge commit, or a later main head when an earlier
+`Publish` run stopped and main moved on before the version was tagged. The
+labels `autorelease: pending` and `autorelease: tagged` are managed in
+`infra/github/main.tf`. Release Please writes no `CHANGELOG.md`
 (`skip-changelog`): the release PR body holds the release notes, and the
-`tag` job copies that section into the GitHub release.
+`tag` job copies that section into the GitHub release. When the head is
+later than the merge commit, the `tag` job adds the commits between them, as
+Release Please lists them: the `feat`, `fix`, `perf` and `revert` commits in
+their sections, and the note of any breaking change (`!` or a
+`BREAKING CHANGE:` footer) under `⚠ BREAKING CHANGES`. They are released
+too, and the next release PR starts after the tag and would not list them.
 
 `.github/workflows/release-merge.yml` enables auto-merge on the pending
 release PR every Monday (00:23 UTC) or on dispatch, as in the other
@@ -268,8 +275,8 @@ itself.
    Trusted Publishing, without waiting for an approval). Only after all of
    them succeeded does its `tag` job create tag `v<version>` and the GitHub
    release (notes from the body of the merged release PR, whose merge commit
-   that head must contain) on that head with the workflow's own
-   token, and move the merged release PR from `autorelease: pending` to
+   that head must contain, with the commits after it added) on that head
+   with the workflow's own token, and move the merged release PR from `autorelease: pending` to
    `autorelease: tagged`, as Release Please does when it tags. A version
    that was not published therefore never gets a tag, and no tag is ever
    deleted or moved. Confirm: the run succeeded and

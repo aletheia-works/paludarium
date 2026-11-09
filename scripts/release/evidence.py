@@ -22,6 +22,7 @@ any dispatch.
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -209,13 +210,98 @@ def release_notes(text, version):
     return text + "\n"
 
 
+# Release Please's default changelog sections, in its order; other types are
+# hidden from the notes, but a breaking change of any type is listed first.
+BREAKING = "⚠ BREAKING CHANGES"
+SECTIONS = {
+    "feat": "Features",
+    "fix": "Bug Fixes",
+    "perf": "Performance Improvements",
+    "revert": "Reverts",
+}
+SUBJECT = re.compile(
+    r"(?P<type>[a-z]+)(?:\((?P<scope>[^()]+)\))?(?P<breaking>!)?: "
+    r"(?P<text>.+?)(?: \(#(?P<pr>\d+)\))?"
+)
+FOOTER = re.compile(r"^BREAKING[ -]CHANGE: (?P<note>.+)$", re.M)
+COMPARE_LIMIT = 250
+
+
+def entries(sha, message):
+    """The notes lines Release Please writes for a commit, each with its
+    section: one in the section of its type, and for a breaking change (`!`,
+    or a `BREAKING CHANGE:` footer) its note, without links, in BREAKING."""
+    subject = message.split("\n", 1)[0].strip()
+    found = SUBJECT.fullmatch(subject)
+    if not found:
+        return []
+    scope = "**{}:** ".format(found["scope"]) if found["scope"] else ""
+    lines = []
+    footer = FOOTER.search(message, len(subject))
+    if found["breaking"] or footer:
+        lines.append((BREAKING, "* " + scope + (footer["note"] if footer else found["text"])))
+    if found["type"] in SECTIONS:
+        url = "https://github.com/" + policy.REPOSITORY
+        line = "* " + scope + found["text"]
+        if found["pr"]:
+            line += " ([#{0}]({1}/issues/{0}))".format(found["pr"], url)
+        line += f" ([{sha[:7]}]({url}/commit/{sha}))"
+        lines.append((SECTIONS[found["type"]], line))
+    return lines
+
+
+def with_later_commits(notes, commits):
+    """notes with the commits main gained after the release PR was merged.
+
+    Each goes at the end of its section, which is added in Release Please's
+    order when the notes have none yet. Sections are apart by two blank
+    lines, as Release Please writes them.
+    """
+    added = {}
+    for commit in commits:
+        for title, line in entries(commit["sha"], commit["commit"]["message"]):
+            added.setdefault(title, []).append(line)
+    if not added:
+        return notes
+    # [title, lines] for each section, the title None for any lines before
+    # the first heading.
+    blocks = [[None, []]]
+    for line in notes.rstrip("\n").split("\n"):
+        if line.startswith("### "):
+            blocks.append([line[4:], []])
+        else:
+            blocks[-1][1].append(line)
+    order = [BREAKING, *SECTIONS.values()]
+    for title in order:
+        if title not in added:
+            continue
+        block = next((b for b in blocks if b[0] == title), None)
+        if block is None:
+            block = [title, [""]]
+            later = [i for i, b in enumerate(blocks) if b[0] in order[order.index(title) + 1 :]]
+            blocks.insert(later[0] if later else len(blocks), block)
+        while block[1] and block[1][-1] == "":
+            block[1].pop()
+        block[1].extend(added[title])
+    parts = ["\n".join(lines).strip("\n") for title, lines in blocks if title is None]
+    parts = [p for p in parts if p]
+    parts += [
+        "### {}\n\n{}".format(title, "\n".join(lines).strip("\n"))
+        for title, lines in blocks
+        if title
+    ]
+    return "\n\n\n".join(parts) + "\n"
+
+
 def release_pr_notes(api, head, version):
     """The notes of version from the body of its merged release PR.
 
     Release Please writes no CHANGELOG.md (skip-changelog); the release PR body
     holds the same section. Exactly one merged release PR from the bot on the
     release-please branch may still be pending, and head must contain its
-    merge commit (main may have moved on after the release PR was merged).
+    merge commit. Main may have moved on after the release PR was merged (when
+    an earlier Publish run stopped); the commits since then are released too,
+    so they are added to the notes, as Release Please would have listed them.
     """
     owner = policy.REPOSITORY.split("/")[0]
     pulls = api.get(f"pulls?state=closed&base=main&head={owner}:{RELEASE_BRANCH}&per_page=100")
@@ -235,12 +321,17 @@ def release_pr_notes(api, head, version):
         f"{len(pending):d} merged release PRs are pending (exactly one required)",
     )
     merge = pending[0]["merge_commit_sha"]
-    status = api.get(f"compare/{merge}...{head}")["status"]
+    compare = api.get(f"compare/{merge}...{head}")
     policy.require(
-        status in ("ahead", "identical"),
+        compare["status"] in ("ahead", "identical"),
         "release PR #{:d} merge commit is not in {}".format(pending[0]["number"], head),
     )
-    return release_notes(pending[0]["body"] or "", version)
+    commits = compare.get("commits") or []
+    policy.require(
+        len(commits) == compare.get("ahead_by", 0) and len(commits) < COMPARE_LIMIT,
+        f"commits after the release PR incomplete: {len(commits):d} listed",
+    )
+    return with_later_commits(release_notes(pending[0]["body"] or "", version), commits)
 
 
 def main(environ=None, api=None, **kwargs):

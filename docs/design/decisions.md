@@ -62,9 +62,24 @@ zeros past it, before it counts the shrink, and a copy of a page-cache page
 records the count read before it copies. So an entry that records the new
 count was made after the new size could be seen, and a copy that took bytes
 from before the shrink records an older count, and goes if the page is past
-the end. Shared mappings stay out of the TLB, as
-their stores mark the pages dirty for write-back and move the shared pages'
-generation on.
+the end.
+
+The pages of a shared mapping (`MAP_SHARED` memory or file, System V shared
+memory) go in the TLB too, with the memory they show. A store through the
+TLB does what one under the locks does: it moves the memory's generation on
+before and after its bytes, and marks the page dirty in between, so that a
+write-back, which marks a page clean before it reads it, either hands over
+the store or leaves the page dirty for the next one. Other processes that
+share the memory already stored to it without this space's lock, so taking
+none here changes nothing they can see. A store to a shared mapping that
+another space may run code from moves that space's code generation on, as
+before.
+
+A TLB entry holds neither the file nor the memory's owner, only the file's
+size and count of shrinks, which the file keeps apart for this, and the
+memory's generation. Holding the file would keep it open after `munmap`
+until the thread's next access, and System V shared memory counts its
+attachments (`shm_nattch`) by who holds them.
 
 A locked instruction within one word is one compare-and-swap of the word, so
 it stays atomic against the stores that take no lock, and it is a full fence.

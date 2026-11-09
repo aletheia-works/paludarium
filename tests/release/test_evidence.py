@@ -339,14 +339,26 @@ def release_pr(
 
 
 class FakePulls:
-    def __init__(self, pulls, status="ahead"):
+    def __init__(self, pulls, status="ahead", commits=(), ahead_by=None):
         self.pulls, self.status, self.routes = pulls, status, []
+        self.commits = [dict(sha=sha, commit=dict(message=m)) for sha, m in commits]
+        self.ahead_by = len(self.commits) if ahead_by is None else ahead_by
 
     def get(self, route):
         self.routes.append(route)
         if route.startswith("pulls?"):
             return self.pulls
-        return dict(status=self.status)
+        return dict(status=self.status, ahead_by=self.ahead_by, commits=self.commits)
+
+
+URL = "https://github.com/" + policy.REPOSITORY
+LATER = (
+    ("1" * 40, "feat(kernel): add sync_file_range (#411)\n\nbody\n\nCo-authored-by: x"),
+    ("2" * 40, "chore(deps): bump something (#412)"),
+    ("3" * 40, "fix: keep the port (#413)"),
+    ("4" * 40, "perf(cpu)!: run forms first"),
+    ("5" * 40, "Merge branch 'x'"),
+)
 
 
 class ReleaseNotes(unittest.TestCase):
@@ -394,6 +406,61 @@ class ReleaseNotes(unittest.TestCase):
             E.release_pr_notes(FakePulls([release_pr()], "identical"), HEAD, "0.1.1"),
             E.release_notes(BODY, "0.1.1"),
         )
+
+    def test_commits_after_the_release_pr_join_their_sections(self):
+        # Main moved on after the release PR merged, so a later head is
+        # released: its feat, fix and perf commits are listed as Release
+        # Please lists them, and other types are left out.
+        self.assertEqual(
+            E.release_pr_notes(FakePulls([release_pr()], commits=LATER), HEAD, "0.1.1"),
+            "### ⚠ BREAKING CHANGES\n\n* **cpu:** run forms first\n\n\n"
+            "### Features\n\n"
+            f"* **kernel:** add sync_file_range ([#411]({URL}/issues/411)) "
+            f"([1111111]({URL}/commit/{'1' * 40}))\n\n\n"
+            "### Bug Fixes\n\n"
+            "* **harness:** run ignored encodings tests in the bounded child\n"
+            f"* keep the port ([#413]({URL}/issues/413)) ([3333333]({URL}/commit/{'3' * 40}))\n\n\n"
+            "### Performance Improvements\n\n"
+            f"* **cpu:** run forms first ([4444444]({URL}/commit/{'4' * 40}))\n",
+        )
+
+    def test_later_commits_go_before_a_later_section(self):
+        notes = "### Performance Improvements\n\n* **cpu:** a\n"
+        self.assertEqual(
+            E.with_later_commits(notes, FakePulls([], commits=LATER[2:3]).commits),
+            f"### Bug Fixes\n\n* keep the port ([#413]({URL}/issues/413)) "
+            f"([3333333]({URL}/commit/{'3' * 40}))\n\n\n"
+            "### Performance Improvements\n\n* **cpu:** a\n",
+        )
+        hidden = FakePulls([], commits=LATER[1:2] + LATER[4:]).commits
+        self.assertEqual(E.with_later_commits(notes, hidden), notes)
+
+    def test_breaking_changes_come_first_with_their_note(self):
+        # A footer gives the note; a breaking change of a hidden type is
+        # listed only there; an existing breaking section is extended.
+        commits = FakePulls(
+            [],
+            commits=(
+                ("6" * 40, "fix(kernel): keep it\n\nBREAKING CHANGE: the old flag is gone"),
+                ("7" * 40, "chore!: drop Python 3.14 (#420)"),
+            ),
+        ).commits
+        notes = "### ⚠ BREAKING CHANGES\n\n* earlier\n\n\n### Features\n\n* a\n"
+        self.assertEqual(
+            E.with_later_commits(notes, commits),
+            "### ⚠ BREAKING CHANGES\n\n* earlier\n* **kernel:** the old flag is gone\n"
+            "* drop Python 3.14\n\n\n"
+            "### Features\n\n* a\n\n\n"
+            f"### Bug Fixes\n\n* **kernel:** keep it ([6666666]({URL}/commit/{'6' * 40}))\n",
+        )
+
+    def test_an_incomplete_list_of_later_commits_stops(self):
+        for pulls in (
+            FakePulls([release_pr()], commits=LATER, ahead_by=6),
+            FakePulls([release_pr()], commits=LATER * 50),
+        ):
+            with self.assertRaisesRegex(ValueError, "after the release PR incomplete"):
+                E.release_pr_notes(pulls, HEAD, "0.1.1")
 
     def test_only_the_bots_merged_pending_pr_from_this_repository_counts(self):
         for pr in (

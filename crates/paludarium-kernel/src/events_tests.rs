@@ -3492,3 +3492,142 @@ fn landlock_restricts_tcp_ports_and_device_ioctls() {
     assert_eq!(f.ret(16, [null, 0x5451, 0, 0, 0, 0]), 0);
     assert_ne!(f.ret(16, [before, 0x541b, DATA, 0, 0, 0]), errno(13));
 }
+/// A `struct ifreq` for interface `name` at `at`, with `flags`.
+fn interface_request(f: &Fixture, at: u64, name: &[u8], flags: u16) {
+    let mut raw = [0; 40];
+    raw[..name.len()].copy_from_slice(name);
+    raw[16..18].copy_from_slice(&flags.to_le_bytes());
+    f.mem.write(GuestAddr(at), &raw).unwrap();
+}
+/// What `SIOCGIFFLAGS` (or `SIOCGIFINDEX`) gives for `lo` on `fd`.
+fn loopback_field(f: &mut Fixture, fd: u64, request: u64) -> u64 {
+    interface_request(f, DATA + 0x400, b"lo", 0);
+    let r = f.ret(16, [fd, request, DATA + 0x400, 0, 0, 0]);
+    assert_eq!(r, 0, "{}", r as i64);
+    let mut raw = [0; 4];
+    f.mem.read(GuestAddr(DATA + 0x410), &mut raw).unwrap();
+    if request == 0x8913 {
+        u64::from(u16::from_le_bytes([raw[0], raw[1]]))
+    } else {
+        u64::from(u32::from_le_bytes(raw))
+    }
+}
+#[test]
+fn the_first_network_has_its_loopback_up() {
+    let mut f = network_fixture(&[]);
+    let fd = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(loopback_field(&mut f, fd, 0x8913), 0x49);
+    assert_eq!(loopback_field(&mut f, fd, 0x8933), 1);
+    interface_request(&f, DATA + 0x400, b"eth0", 0);
+    assert_eq!(
+        f.ret(16, [fd, 0x8913, DATA + 0x400, 0, 0, 0]),
+        Errno(19).to_syscall_return()
+    );
+}
+#[test]
+fn a_new_network_namespace_has_only_a_loopback_that_starts_down() {
+    // Even a session without a network has one in a new namespace.
+    let mut f = Fixture::new();
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    let tcp = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    assert!((tcp as i64) >= 0 && (udp as i64) >= 0);
+    assert_eq!(loopback_field(&mut f, tcp, 0x8913), 0x8);
+    // Down: nowhere to go, though IPv4's loopback addresses bind, and
+    // without `::1`.
+    let unreachable = Errno(101).to_syscall_return();
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 5000);
+    let bound = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(f.ret(49, [bound, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let v6 = f.ret(41, [10, 2, 0, 0, 0, 0]);
+    let mut raw = [0; 28];
+    raw[0] = 10;
+    raw[23] = 1;
+    f.mem.write(GuestAddr(DATA + 0x500), &raw).unwrap();
+    assert_eq!(
+        f.ret(49, [v6, DATA + 0x500, 28, 0, 0, 0]),
+        Errno(99).to_syscall_return()
+    );
+    assert_eq!(f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]), unreachable);
+    assert_eq!(f.ret(44, [udp, DATA, 1, 0, DATA + 0x100, 16]), unreachable);
+    inet_address(&f, DATA + 0x100, [8, 8, 8, 8], 53);
+    assert_eq!(f.ret(44, [udp, DATA, 1, 0, DATA + 0x100, 16]), unreachable);
+    // Up, the loopback works, and the rest is still unreachable.
+    interface_request(&f, DATA + 0x400, b"lo", 1);
+    assert_eq!(f.ret(16, [tcp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    assert_eq!(loopback_field(&mut f, udp, 0x8913), 0x49);
+    assert_eq!(f.ret(49, [v6, DATA + 0x500, 28, 0, 0, 0]), 0);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 5001);
+    assert_eq!(f.ret(49, [udp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let sender = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    f.mem.write(GuestAddr(DATA), b"hi").unwrap();
+    assert_eq!(f.ret(44, [sender, DATA, 2, 0, DATA + 0x100, 16]), 2);
+    assert_eq!(f.ret(45, [udp, DATA + 0x200, 8, 0x40, 0, 0]), 2);
+    // No DNS stub: a query to port 53 finds no socket, as any datagram.
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 53], 53);
+    assert_eq!(f.ret(44, [sender, DATA, 2, 0, DATA + 0x100, 16]), 2);
+    assert_eq!(
+        f.ret(45, [sender, DATA + 0x200, 8, 0x40, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 1);
+    assert_eq!(
+        f.ret(42, [tcp, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(111).to_syscall_return()
+    );
+    let other = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 80);
+    assert_eq!(f.ret(42, [other, DATA + 0x100, 16, 0, 0, 0]), unreachable);
+    // Down again, it loses `::1`, and has it back when it comes up.
+    interface_request(&f, DATA + 0x400, b"lo", 0);
+    assert_eq!(f.ret(16, [tcp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    let again = f.ret(41, [10, 2, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(49, [again, DATA + 0x500, 28, 0, 0, 0]),
+        Errno(99).to_syscall_return()
+    );
+    interface_request(&f, DATA + 0x400, b"lo", 1);
+    assert_eq!(f.ret(16, [tcp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    assert_eq!(f.ret(49, [again, DATA + 0x500, 28, 0, 0, 0]), 0);
+    // Setting flags needs CAP_NET_ADMIN, before the name is looked at.
+    f.thread.state.credentials = f
+        .thread
+        .state
+        .credentials
+        .setresuid(1000, 1000, 1000)
+        .unwrap();
+    interface_request(&f, DATA + 0x400, b"nope", 0);
+    assert_eq!(
+        f.ret(16, [udp, 0x8914, DATA + 0x400, 0, 0, 0]),
+        Errno::EPERM.to_syscall_return()
+    );
+}
+#[test]
+fn a_network_namespace_has_abstract_names_of_its_own() {
+    let mut f = Fixture::new();
+    let name = |f: &Fixture| {
+        f.mem
+            .write(GuestAddr(DATA + 0x100), b"\x01\x00\x00name")
+            .unwrap();
+        7
+    };
+    let first = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    let len = name(&f);
+    assert_eq!(f.ret(49, [first, DATA + 0x100, len, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [first, 1, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    // The name is free in the new one, and a socket there does not reach
+    // the first one's.
+    let caller = f.ret(41, [1, 1 | 0x800, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(42, [caller, DATA + 0x100, len, 0, 0, 0]),
+        Errno(111).to_syscall_return()
+    );
+    let nested = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    assert_eq!(f.ret(49, [nested, DATA + 0x100, len, 0, 0, 0]), 0);
+    let again = f.ret(41, [1, 1, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(49, [again, DATA + 0x100, len, 0, 0, 0]),
+        Errno(98).to_syscall_return()
+    );
+}

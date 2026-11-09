@@ -3,16 +3,17 @@
 //! `unshare` and `setns` change and `/proc/<pid>/ns` shows. The UTS
 //! namespace holds the host and domain names that `uname` reports, the IPC
 //! namespace the System V shared memory segments, and a PID namespace the
-//! numbers it gives the tasks in it ([`Pids`]); the mount, cgroup and time
-//! namespaces have nothing in them that paludarium keeps apart (there is no
-//! `mount`, no cgroup file and no clock offset), so a new one differs only
-//! in its identity. The network and user namespaces are the first ones
-//! only.
+//! numbers it gives the tasks in it ([`Pids`]), and a nested network
+//! namespace its own network, with only a loopback, and abstract socket
+//! names ([`Sockets`]); the mount, cgroup and time namespaces have nothing
+//! in them that paludarium keeps apart (there is no `mount`, no cgroup file
+//! and no clock offset), so a new one differs only in its identity. The
+//! user namespace is the first one only.
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 pub(crate) const CLONE_NEWTIME: u64 = 0x80;
 pub(crate) const CLONE_NEWNS: u64 = 0x2_0000;
@@ -23,11 +24,16 @@ pub(crate) const CLONE_NEWUSER: u64 = 0x1000_0000;
 pub(crate) const CLONE_NEWPID: u64 = 0x2000_0000;
 pub(crate) const CLONE_NEWNET: u64 = 0x4000_0000;
 /// The namespaces a thread can have new ones of here.
-pub(crate) const SUPPORTED: u64 =
-    CLONE_NEWTIME | CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID;
+pub(crate) const SUPPORTED: u64 = CLONE_NEWTIME
+    | CLONE_NEWNS
+    | CLONE_NEWCGROUP
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWPID
+    | CLONE_NEWNET;
 /// Every namespace flag; those not in [`SUPPORTED`] are `EINVAL`, as from a
 /// kernel built without them.
-pub(crate) const ALL: u64 = SUPPORTED | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+pub(crate) const ALL: u64 = SUPPORTED | CLONE_NEWUSER;
 /// `clone3`'s `CLONE_NEWTIME`, which is a bit of the exit signal in
 /// `clone`'s flags, as `clone3` passes it on to the `clone` it runs.
 pub(crate) const CLONE3_NEWTIME: u64 = 1 << 40;
@@ -130,6 +136,25 @@ pub(crate) struct Namespace {
     pub shm: crate::shm::Segments,
     /// The numbers of a PID namespace.
     pids: Pids,
+    /// A nested network namespace's sockets.
+    pub sockets: Sockets,
+}
+/// What the sockets of a nested network namespace are in: its own network,
+/// and its abstract socket names once a socket looks for them. The first
+/// namespace has none, and its sockets are in the session's.
+#[derive(Default)]
+pub(crate) struct Sockets {
+    pub network: OnceLock<Arc<crate::inet::Network>>,
+    pub unix: OnceLock<Arc<crate::unix::Names>>,
+}
+impl std::fmt::Debug for Sockets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.network.get().is_some() {
+            "Sockets(own)"
+        } else {
+            "Sockets(first)"
+        })
+    }
 }
 impl Namespace {
     fn new(kind: Kind, inode: u32, names: UtsNames) -> Arc<Self> {
@@ -142,6 +167,7 @@ impl Namespace {
             names: Mutex::new(names),
             shm: crate::shm::Segments::default(),
             pids,
+            sockets: Sockets::default(),
         })
     }
     /// What its link in `/proc/<pid>/ns` reads, as Linux's `ns_get_name`.
@@ -455,6 +481,11 @@ impl Namespaces {
         }
         if flags & CLONE_NEWCGROUP != 0 {
             new.cgroup = self.fresh(&self.cgroup);
+        }
+        if flags & CLONE_NEWNET != 0 {
+            new.net = self.fresh(&self.net);
+            let network = Arc::new(crate::inet::Network::isolated());
+            let _ = new.net.sockets.network.set(network);
         }
         if flags & CLONE_NEWTIME != 0 {
             new.time_for_children = self.fresh(&self.time_for_children);

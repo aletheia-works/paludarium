@@ -2046,8 +2046,8 @@ mod namespaces {
         assert_eq!(before[4], after[4]);
         assert_eq!(before[6], after[6]);
         assert_eq!(&after[5][..5], b"time:");
-        // No new user or network namespace; with a supported flag too.
-        for flags in [NEWUSER, NEWNET, NEWNET | NEWUTS] {
+        // No new user namespace; with a supported flag too.
+        for flags in [NEWUSER, NEWUSER | NEWUTS] {
             assert_eq!(
                 syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
                 einval
@@ -2106,8 +2106,7 @@ mod namespaces {
             NEWUSER | 0x200,
             NEWIPC | 0x4_0000,
             NEWUSER,
-            NEWNET,
-            NEWNET | NEWUTS,
+            NEWUSER | NEWUTS,
         ] {
             assert_eq!(
                 syscall(&mut k, &mut t, &m, 56, [flags | 17, 0, 0, 0, 0, 0]),

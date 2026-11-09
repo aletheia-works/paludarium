@@ -194,7 +194,13 @@ fn every_form_does_what_the_interpreter_does() {
             let mut fast_state = before.clone();
             let mut slow_state = before.clone();
             let slow = exec::execute(&mut slow_state, &slow_memory, &instruction);
-            match exec::execute_fast(&mut fast_state, &fast_memory, &instruction, &fast) {
+            match exec::execute_fast(
+                &mut fast_state,
+                &fast_memory,
+                &instruction,
+                &fast,
+                instruction.next_rip().0,
+            ) {
                 Ok(()) => {
                     assert_eq!(slow, Ok(()), "{code:02x?} from {before:x?}");
                     assert_eq!(fast_state, slow_state, "{code:02x?} from {before:x?}");

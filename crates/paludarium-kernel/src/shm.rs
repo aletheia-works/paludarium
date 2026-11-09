@@ -12,7 +12,7 @@
 use crate::credentials::Credentials;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::ClockId;
-use paludarium_mmu::{MappingKind, PageSource, Prot, SharedPages};
+use paludarium_mmu::{FileSize, MappingKind, PageSource, Prot, SharedPages};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -127,6 +127,10 @@ impl Segment {
 struct Attachment {
     id: i32,
     size: u64,
+    /// The same size, which never changes, for the threads' TLBs to check
+    /// without holding the attachment, which would count as a mapping
+    /// ([`PageSource::file_size`]).
+    file_size: Arc<FileSize>,
     name: Arc<[u8]>,
     /// Told when the last mapping goes, to remove a segment marked for it.
     table: Weak<Mutex<Table>>,
@@ -142,6 +146,9 @@ impl PageSource for Attachment {
     }
     fn size(&self) -> Option<u64> {
         Some(self.size)
+    }
+    fn file_size(&self) -> Option<Arc<FileSize>> {
+        Some(Arc::clone(&self.file_size))
     }
     /// No name links a segment's file, so a core holds its mappings, as
     /// Linux's dump of shared anonymous memory.
@@ -388,6 +395,7 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         let attachment = Arc::new(Attachment {
             id: segment.id,
             size: segment.size,
+            file_size: Arc::new(FileSize::new(segment.size)),
             name: Arc::clone(&segment.name),
             table: Arc::downgrade(&shm.0),
         });

@@ -108,7 +108,7 @@ pub struct DecodeCache {
     mask: u64,
     /// The instructions of the blocks, each block's together. It holds at
     /// most as many as there are slots ([`Self::make_room`]).
-    code: Vec<Decoded>,
+    code: Code,
     growth: Growth,
 }
 
@@ -148,33 +148,81 @@ impl Default for DecodeCache {
         DecodeCache {
             slots: vec![Slot::default(); INITIAL_ENTRIES],
             mask: INITIAL_ENTRIES as u64 - 1,
-            code: Vec::with_capacity(INITIAL_ENTRIES),
+            code: Code::with_capacity(INITIAL_ENTRIES),
             growth: Growth::default(),
         }
     }
 }
 
-/// A decoded instruction, with what [`execute_decoded`] needs to know of
-/// it beforehand, worked out once when it is decoded.
+/// What running a decoded instruction needs first, worked out once when it
+/// is decoded, in one 64-byte cache line (a test checks that it fits);
+/// [`Code`] keeps the [`Instruction`] apart. An instruction that has a [`exec::Fast`] form runs from this alone.
 #[derive(Clone, Copy)]
 struct Decoded {
-    instruction: Instruction,
+    /// The form [`exec::execute_fast`] runs, if it has one.
+    fast: exec::Fast,
+    /// [`Instruction::next_rip`].
+    next: u64,
     /// [`exec::keeps_vector_state`].
     keeps_vector_state: bool,
     /// [`exec::fails_cleanly`]: no [`Snapshot`] is needed.
     fails_cleanly: bool,
-    /// The form [`exec::execute_fast`] runs, if it has one.
-    fast: exec::Fast,
 }
 
 impl Decoded {
-    fn new(instruction: Instruction) -> Self {
+    fn new(instruction: &Instruction) -> Self {
         Decoded {
-            keeps_vector_state: exec::keeps_vector_state(&instruction),
-            fails_cleanly: exec::fails_cleanly(&instruction),
-            fast: exec::Fast::of(&instruction),
-            instruction,
+            fast: exec::Fast::of(instruction),
+            next: instruction.next_rip().0,
+            keeps_vector_state: exec::keeps_vector_state(instruction),
+            fails_cleanly: exec::fails_cleanly(instruction),
         }
+    }
+}
+
+/// Decoded instructions: the [`Decoded`] part of each, which every run of
+/// it reads, apart from the [`Instruction`], which only the general path
+/// reads. Kept apart, the parts that a run of frequent forms reads lie
+/// close together in host memory.
+#[derive(Default)]
+struct Code {
+    decoded: Vec<Decoded>,
+    /// The instruction of each of `decoded`, at the same index.
+    instructions: Vec<Instruction>,
+}
+
+impl Code {
+    fn with_capacity(n: usize) -> Self {
+        Code {
+            decoded: Vec::with_capacity(n),
+            instructions: Vec::with_capacity(n),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.decoded.len()
+    }
+
+    fn push(&mut self, instruction: Instruction) {
+        self.decoded.push(Decoded::new(&instruction));
+        self.instructions.push(instruction);
+    }
+
+    fn truncate(&mut self, n: usize) {
+        self.decoded.truncate(n);
+        self.instructions.truncate(n);
+    }
+
+    fn clear(&mut self) {
+        self.truncate(0);
+    }
+
+    /// Room for `n` instructions in all.
+    fn reserve_to(&mut self, n: usize) {
+        self.decoded
+            .reserve_exact(n.saturating_sub(self.decoded.len()));
+        self.instructions
+            .reserve_exact(n.saturating_sub(self.instructions.len()));
     }
 }
 
@@ -261,7 +309,7 @@ impl DecodeCache {
         }
         self.slots = slots;
         self.mask = mask;
-        self.code.reserve_exact(self.slots.len() - self.code.len());
+        self.code.reserve_to(self.slots.len());
     }
 
     /// Makes room in [`Self::code`] for a block of up to [`MAX_BLOCK`]
@@ -295,7 +343,7 @@ impl DecodeCache {
         &mut self,
         rip: u64,
         generation: u64,
-        decode: impl FnOnce(&mut Vec<Decoded>) -> Result<(), ExitReason>,
+        decode: impl FnOnce(&mut Code) -> Result<(), ExitReason>,
     ) -> Result<std::ops::Range<usize>, ExitReason> {
         if self.code.len() + MAX_BLOCK > self.slots.len() {
             self.make_room(generation);
@@ -331,7 +379,7 @@ impl DecodeCache {
         &mut self,
         rip: u64,
         generation: u64,
-        decode: impl FnOnce(&mut Vec<Decoded>) -> Result<(), ExitReason>,
+        decode: impl FnOnce(&mut Code) -> Result<(), ExitReason>,
     ) -> Result<std::ops::Range<usize>, ExitReason> {
         self.lookup();
         let s = &self.slots[self.slot(rip)];
@@ -362,11 +410,11 @@ impl DecodeCache {
             || end != self.code.len()
             || end >= self.slots.len()
             || usize::from(s.len) >= MAX_BLOCK
-            || ends_block(&self.code[end - 1].instruction)
+            || ends_block(&self.code.instructions[end - 1])
         {
             return Ok(false);
         }
-        self.code.push(Decoded::new(decode()?));
+        self.code.push(decode()?);
         self.slots[slot].len += 1;
         Ok(true)
     }
@@ -374,20 +422,29 @@ impl DecodeCache {
     /// Stores the instruction that a [`Self::get_with_hint`] after a
     /// [`Self::lookup`] did not find, as a block of its own.
     fn put(&mut self, rip: u64, generation: u64, instruction: Instruction) -> Decoded {
-        let decoded = Decoded::new(instruction);
-        let _ = self.insert(rip, generation, |code| {
-            code.push(decoded);
+        let block = self.insert(rip, generation, |code| {
+            code.push(instruction);
             Ok(())
         });
-        decoded
+        // The decode above cannot fail, so the block holds the instruction.
+        match block {
+            Ok(block) => self.code.decoded[block.start],
+            Err(_) => Decoded::new(&instruction),
+        }
     }
 
     /// The first instruction of the block at `rip` under `generation`, and
     /// whether the accelerator has turned it down.
-    fn get_with_hint(&self, rip: u64, generation: u64) -> Option<(Decoded, bool)> {
+    fn get_with_hint(&self, rip: u64, generation: u64) -> Option<(Decoded, Instruction, bool)> {
         let s = &self.slots[self.slot(rip)];
-        s.holds(rip, generation)
-            .then(|| (self.code[s.start as usize], s.rejected))
+        let start = s.start as usize;
+        s.holds(rip, generation).then(|| {
+            (
+                self.code.decoded[start],
+                self.code.instructions[start],
+                s.rejected,
+            )
+        })
     }
 
     fn reject_acceleration(&mut self, rip: u64, generation: u64) {
@@ -539,12 +596,12 @@ fn execute_decoded(
     state: &mut CpuState,
     mem: &AddressSpace,
     decoded: &Decoded,
+    insn: &Instruction,
 ) -> Result<(), ExitReason> {
-    let insn = &decoded.instruction;
     // A form that fails changes nothing, and runs again below to give the
     // fault.
     if !matches!(decoded.fast, exec::Fast::None)
-        && exec::execute_fast(state, mem, insn, &decoded.fast).is_ok()
+        && exec::execute_fast(state, mem, insn, &decoded.fast, decoded.next).is_ok()
     {
         state.repeat_continuation = None;
         return Ok(());
@@ -620,7 +677,7 @@ fn execute_decoded(
 /// Executes one instruction. `Ok(())` means the guest can continue.
 pub fn step(state: &mut CpuState, mem: &AddressSpace) -> Result<(), ExitReason> {
     let insn = fetch_for_state(state, mem)?;
-    execute_decoded(state, mem, &Decoded::new(insn))
+    execute_decoded(state, mem, &Decoded::new(&insn), &insn)
 }
 
 /// Executes one instruction, reusing decoded instructions from `cache`.
@@ -635,7 +692,13 @@ pub fn step_cached(
     let block = cache.block(state.rip.0, generation, |code| {
         decode_block(state, mem, code)
     })?;
-    execute_decoded(state, mem, &cache.code[block.start])
+    let code = &cache.code;
+    execute_decoded(
+        state,
+        mem,
+        &code.decoded[block.start],
+        &code.instructions[block.start],
+    )
 }
 
 /// Appends to `code` the first instruction of the block at `state.rip`:
@@ -643,9 +706,9 @@ pub fn step_cached(
 fn decode_block(
     state: &mut CpuState,
     mem: &AddressSpace,
-    code: &mut Vec<Decoded>,
+    code: &mut Code,
 ) -> Result<(), ExitReason> {
-    code.push(Decoded::new(fetch_for_state(state, mem)?));
+    code.push(fetch_for_state(state, mem)?);
     Ok(())
 }
 
@@ -690,16 +753,16 @@ pub fn run_cached(
         loop {
             #[cfg(feature = "cost-profile")]
             jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
-            let decoded = &cache.code[i];
-            let next = decoded.instruction.next_rip();
-            if let Err(reason) = execute_decoded(state, mem, decoded) {
+            let decoded = &cache.code.decoded[i];
+            let next = decoded.next;
+            if let Err(reason) = execute_decoded(state, mem, decoded, &cache.code.instructions[i]) {
                 return reason;
             }
             left -= 1;
             i += 1;
             // The next instruction is looked up again unless it follows in
             // memory, still of the generation the block was decoded under.
-            if left == 0 || state.rip != next || mem.code_generation_cached() != generation {
+            if left == 0 || state.rip.0 != next || mem.code_generation_cached() != generation {
                 break;
             }
             // Past the end of the block, the instruction is decoded as it
@@ -825,10 +888,14 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
             cache.observe_slot(state.rip.0, generation);
         }
         cache.lookup();
-        let (decoded, rejected) = match cache.get_with_hint(state.rip.0, generation) {
+        let (decoded, instruction, rejected) = match cache.get_with_hint(state.rip.0, generation) {
             Some(entry) => entry,
             None => match fetch_for_state(state, mem) {
-                Ok(instruction) => (cache.put(state.rip.0, generation, instruction), false),
+                Ok(instruction) => (
+                    cache.put(state.rip.0, generation, instruction),
+                    instruction,
+                    false,
+                ),
                 Err(reason) => {
                     #[cfg(feature = "cost-profile")]
                     observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
@@ -836,7 +903,6 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
                 }
             },
         };
-        let instruction = decoded.instruction;
         let mut deterministic_rejection = false;
         if !(CACHE_REJECTIONS && rejected)
             && maximum_block > 0
@@ -901,7 +967,7 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
         }
         #[cfg(feature = "cost-profile")]
         jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
-        if let Err(reason) = execute_decoded(state, mem, &decoded) {
+        if let Err(reason) = execute_decoded(state, mem, &decoded, &instruction) {
             #[cfg(feature = "cost-profile")]
             observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
             return reason;

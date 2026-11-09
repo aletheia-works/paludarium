@@ -295,10 +295,11 @@ impl FileCache {
     fn resized(&self, old: u64, size: u64) {
         if size < old {
             let mut shrinks = self.shrinks.lock().unwrap_or_else(PoisonError::into_inner);
-            // The size first: whoever reads the new count then reads the new
-            // size, and so sees a page past it as past the end
+            // The size and the zeros first: whoever reads the new count then
+            // reads the new size, and copies no bytes from before the shrink
             // (`paludarium_mmu::PageSource::shrinks`).
             self.size.store(size, Ordering::SeqCst);
+            self.pages.zero(size, u64::MAX);
             let count = self.shrink_count.fetch_add(1, Ordering::SeqCst) + 1;
             while shrinks
                 .last()
@@ -309,8 +310,8 @@ impl FileCache {
             shrinks.push((count, size));
         } else {
             self.size.store(size, Ordering::SeqCst);
+            self.pages.zero(old, u64::MAX);
         }
-        self.pages.zero(old.min(size), u64::MAX);
     }
     /// The bytes from `start` to `end` read as zeros now.
     fn zeroed(&self, start: u64, end: u64) {

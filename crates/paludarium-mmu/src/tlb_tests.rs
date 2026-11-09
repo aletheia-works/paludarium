@@ -669,10 +669,14 @@ fn a_load_it_holds_sees_a_16_byte_exchange_whole() {
 }
 
 /// A file that can shrink, as the page cache counts it: each byte is its
-/// offset modulo 251, and a shrink sets the size, then counts, as the
-/// kernel's page cache does.
+/// offset modulo 251, and a shrink sets the size, zeros its page cache past
+/// it, then counts, as the kernel's page cache does.
 struct Shrinking {
+    /// Its page cache, once a mapping shows it.
+    cache: std::sync::OnceLock<SharedPages>,
     size: AtomicU64,
+    /// The smallest size it has shrunk to: past it, it reads as zeros.
+    zeros_from: AtomicU64,
     shrinks: std::sync::Mutex<Vec<(u64, u64)>>,
     count: AtomicU64,
     /// A size to shrink to as the count is next read, or 0.
@@ -681,7 +685,9 @@ struct Shrinking {
 impl Shrinking {
     fn new(size: u64) -> Arc<Self> {
         Arc::new(Shrinking {
+            cache: std::sync::OnceLock::new(),
             size: AtomicU64::new(size),
+            zeros_from: AtomicU64::new(u64::MAX),
             shrinks: std::sync::Mutex::default(),
             count: AtomicU64::new(0),
             shrink_when_counted: AtomicU64::new(0),
@@ -691,6 +697,10 @@ impl Shrinking {
         if size < self.size.load(Ordering::SeqCst) {
             let mut shrinks = self.shrinks.lock().unwrap();
             self.size.store(size, Ordering::SeqCst);
+            self.zeros_from.fetch_min(size, Ordering::SeqCst);
+            if let Some(cache) = self.cache.get() {
+                cache.zero(size, u64::MAX);
+            }
             let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
             shrinks.push((count, size));
         }
@@ -702,8 +712,10 @@ impl PageSource for Shrinking {
         let size = self.size.load(Ordering::SeqCst);
         let n =
             usize::try_from(size.saturating_sub(offset)).map_or(buf.len(), |n| n.min(buf.len()));
+        let zeros_from = self.zeros_from.load(Ordering::SeqCst);
         for (i, b) in buf[..n].iter_mut().enumerate() {
-            *b = ((offset + i as u64) % 251) as u8;
+            let at = offset + i as u64;
+            *b = if at < zeros_from { (at % 251) as u8 } else { 0 };
         }
         Ok(n)
     }
@@ -754,6 +766,7 @@ fn file_space(file: &Arc<Shrinking>, pages: u64, view: FileView) -> Arc<AddressS
         FileView::Copy => space.back_with_file(GuestAddr(AT), len, source, 0),
         FileView::Cache => {
             let pages = SharedPages::new().with_source(source);
+            let _ = file.cache.set(pages.clone());
             space.back_with_cache(GuestAddr(AT), len, &pages, 0)
         }
     }
@@ -847,8 +860,9 @@ fn a_copy_it_holds_goes_once_its_file_shrinks_past_it_even_when_it_grows_again()
         assert_eq!(used(&space, last + 1), 0xee, "{view:?}");
         file.resize(PAGE_SIZE);
         file.resize(2 * PAGE_SIZE);
-        // As Linux drops the copy: the file shows again.
-        assert_eq!(byte(&space, last + 1), pattern(PAGE_SIZE + 1), "{view:?}");
+        // As Linux drops the copy: the file shows again, zeros where it
+        // shrank.
+        assert_eq!(byte(&space, last + 1), 0, "{view:?}");
         // A shrink that leaves the copy within the file keeps it.
         space.write(GuestAddr(last + 1), &[0xdd]).unwrap();
         assert_eq!(used(&space, last + 1), 0xdd, "{view:?}");
@@ -898,10 +912,10 @@ fn no_access_succeeds_after_a_shrink_past_it(
     file.resize(PAGE_SIZE);
     shrunk.store(true, Ordering::SeqCst);
     thread.join().unwrap();
-    // Grown again, the file shows: whatever stores came in the shrink's
-    // way went with the copy.
+    // Grown again, the file shows, zeros where it shrank: whatever stores
+    // came in the shrink's way went with the copy.
     file.resize(2 * PAGE_SIZE);
-    assert_eq!(byte(&space, last + 8), pattern(PAGE_SIZE + 8), "{view:?}");
+    assert_eq!(byte(&space, last + 8), 0, "{view:?}");
 }
 
 #[test]
@@ -931,8 +945,11 @@ fn a_write_that_copies_a_page_as_its_file_shrinks_past_it_is_a_bus_error() {
     file.shrink_when_counted.store(PAGE_SIZE, Ordering::SeqCst);
     let fault = space.write(GuestAddr(last), &[0xee]).unwrap_err();
     assert!(fault.bus && fault.write);
+    // Grown again, the page reads as the page cache does after the shrink,
+    // zeros, as in Linux: not the bytes from before it, which the write's
+    // copy took if it copied before the shrink zeroed them.
     file.resize(2 * PAGE_SIZE);
-    assert_eq!(byte(&space, last), pattern(PAGE_SIZE));
+    assert_eq!(byte(&space, last), 0);
 }
 
 #[test]

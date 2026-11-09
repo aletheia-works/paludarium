@@ -845,8 +845,9 @@ pub trait PageSource: Send + Sync {
         None
     }
     /// How many times the file has shrunk. A shrink is counted after
-    /// [`Self::size`] gives the new size, so that whoever reads the new count
-    /// and then the size sees a page past the end as past it.
+    /// [`Self::size`] gives the new size and the page cache reads as zeros
+    /// past it, so that whoever reads the new count sees both: a page past
+    /// the end as past it, and no bytes from before the shrink there.
     fn shrinks(&self) -> u64 {
         0
     }
@@ -1585,6 +1586,12 @@ impl AddressSpaceData {
         };
         // A forked frame that no other space holds any more is this one's
         // own: the space holds its lock, so no other can take it meanwhile.
+        // A copy of a page-cache page records the shrinks counted before it
+        // copies: a truncation counts a shrink only once the bytes past the
+        // new end read as zeros, so a copy that took the bytes from before
+        // it records an older count, and goes if the page is past the end.
+        let shrinks = (write && p.cow && p.cache)
+            .then(|| self.file_at(page).map_or(0, |(source, _)| source.shrinks()));
         if write && p.cow && (p.cache || Arc::strong_count(&p.frame) > 1) {
             let Some(frame) = copied(&p.frame, self.meter.as_ref()) else {
                 self.out_of_memory.store(true, Ordering::SeqCst);
@@ -1596,7 +1603,7 @@ impl AddressSpaceData {
             p.cow = false;
             if p.cache {
                 p.cache = false;
-                p.shrinks = self.file_at(page).map_or(0, |(source, _)| source.shrinks());
+                p.shrinks = shrinks.unwrap_or_default();
             }
         }
         true

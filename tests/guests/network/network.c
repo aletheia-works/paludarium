@@ -1717,8 +1717,11 @@ int main(int argc, char **argv) {
            Linux hands it may be one where some other IPv4 socket on the
            host listens (the test's own server, say), and the IPv4 steps
            below would reach that one. Take a port no IPv4 socket holds:
-           try again while an IPv4 bind to it on every address fails. The
-           steps are printed once, for the socket that is kept. */
+           try again while an IPv4 bind to it on every address fails, or
+           while it is the server's port or the closed one. The emulator's
+           loopback is the guest's own, so the bind there does not see the
+           server, but an IPv4 connect to its port reaches it on the host.
+           The steps are printed once, for the socket that is kept. */
         int only, set_r, set_e, got, bind_r, bind_e;
         for (int tries = 0;; tries++) {
             only = socket(AF_INET6, SOCK_STREAM, 0);
@@ -1734,9 +1737,11 @@ int main(int argc, char **argv) {
             bind_e = bind_r < 0 ? errno : 0;
             if (bind_r || tries == 99)
                 break;
+            int candidate = port_of(only);
             int probe = tcp(0);
-            struct sockaddr_in every = {.sin_family = AF_INET, .sin_port = htons(port_of(only))};
-            int free4 = !bind(probe, (void *)&every, sizeof every);
+            struct sockaddr_in every = {.sin_family = AF_INET, .sin_port = htons(candidate)};
+            int free4 = !bind(probe, (void *)&every, sizeof every) && candidate != open_port &&
+                        candidate != closed_port;
             close(probe);
             if (free4)
                 break;

@@ -450,6 +450,16 @@ impl Files {
         }
         Ok(file)
     }
+    /// Whether another thread shares the working directory and umask
+    /// (`CLONE_FS`), as Linux's `fs_struct` counts its users.
+    pub(crate) fn shares_fs(&self) -> bool {
+        Arc::strong_count(&self.cwd) > 1
+    }
+    /// Entering a mount namespace: the working directory is its root, as
+    /// Linux's `mntns_install` sets it.
+    pub(crate) fn enter_root(&self) {
+        *self.cwd.lock().unwrap_or_else(PoisonError::into_inner) = b"/".to_vec();
+    }
     pub(crate) fn for_clone(&self, share_files: bool, share_fs: bool) -> Self {
         let mut child = self.clone();
         if !share_files {
@@ -1839,11 +1849,11 @@ pub(crate) fn pause_for_lock(c: &mut Context<'_>) -> Result<(), Errno> {
 /// The device of the file a descriptor holds: a memfd's own (it is on no
 /// mount), else that of the mount holding its path.
 pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
-    if d.file
-        .as_any()
-        .is_some_and(|v| v.is::<crate::memfd::Memfd>())
-    {
+    let any = d.file.as_any();
+    if any.is_some_and(|v| v.is::<crate::memfd::Memfd>()) {
         crate::memfd::DEVICE
+    } else if is_namespace(d) {
+        crate::namespaces::DEVICE
     } else {
         device(c, &d.path)
     }
@@ -1890,10 +1900,17 @@ fn is_terminal(c: &Context<'_>, d: &Descriptor) -> bool {
     };
     c.files.terminal_size.is_some() || matches!(c.host.terminal_info(stream), Ok(Some(_)))
 }
+/// Whether `d` holds a namespace file (nsfs), which a path in /proc opens.
+fn is_namespace(d: &Descriptor) -> bool {
+    d.file
+        .as_any()
+        .is_some_and(|v| v.is::<crate::namespaces::NamespaceFile>())
+}
 /// The block size of the file a descriptor holds: procfs's for one opened
-/// in `/proc`, devpts's for a terminal, else [`BLOCK_SIZE`].
+/// in `/proc` but a namespace file, devpts's for a terminal, else
+/// [`BLOCK_SIZE`].
 pub(crate) fn descriptor_block_size(c: &Context<'_>, d: &Descriptor) -> u32 {
-    if in_proc(&d.path) || is_terminal(c, d) {
+    if in_proc(&d.path) && !is_namespace(d) || is_terminal(c, d) {
         SMALL_BLOCK_SIZE
     } else {
         BLOCK_SIZE
@@ -2145,7 +2162,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let len = if n == 0 {
                 if let Some(d) = &d {
                     let metadata = d.file.stat()?;
-                    if metadata.mode & 0o170000 != 0o100000 {
+                    // A namespace file is regular but has no position.
+                    if metadata.mode & 0o170000 != 0o100000 || is_namespace(d) {
                         requested
                     } else {
                         let size = read_limit(&d.file, &metadata);
@@ -3938,6 +3956,23 @@ fn open_path(
     } else if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
         let task = tasks::find(c, &path)?;
         tasks::check(c, &task, path.entry)?;
+        // A link of `ns` leads to its namespace's file, which it opens as
+        // Linux's `proc_ns_get_link` does.
+        if let crate::proc::TaskEntry::Namespace(entry) = path.entry {
+            const O_DIRECTORY: u32 = 0o200000;
+            let namespace = tasks::namespace(&task, entry).ok_or(Errno::ENOENT)?;
+            if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 {
+                return Err(Errno(40)); // ELOOP
+            }
+            if flags & 0o300 == 0o300 {
+                return Err(Errno::EEXIST);
+            }
+            if flags & O_DIRECTORY != 0 {
+                return Err(Errno::ENOTDIR);
+            }
+            let file = crate::namespaces::NamespaceFile::new(namespace, flags);
+            return Ok((Arc::new(file), p.to_vec()));
+        }
         if let Some(content) = tasks::content(&task, path.entry) {
             Arc::new(crate::proc::GeneratedFile::open(content, flags))
         } else if let Some(target) = tasks::link(&task, path.entry) {
@@ -4471,6 +4506,10 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     let any = d.file.as_any();
     if let Some(memfd) = any.and_then(|v| v.downcast_ref::<crate::memfd::Memfd>()) {
         return Ok(memfd.link_target());
+    }
+    // A namespace file names its namespace, as its link in `ns` reads.
+    if let Some(file) = any.and_then(|v| v.downcast_ref::<crate::namespaces::NamespaceFile>()) {
+        return Ok(file.namespace.link());
     }
     let stat = d.file.stat()?;
     let anonymous = |kind: &str| format!("anon_inode:[{kind}]").into_bytes();

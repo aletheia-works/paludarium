@@ -488,19 +488,20 @@ mod process {
         );
     }
     #[test]
-    fn clone3_with_clone_newtime_creates_no_child() {
-        // clone3 joins CLONE_NEWTIME (0x80) to the exit signal's bits, so
-        // the clone sees 0x91 there and refuses it: no child is left whose
-        // exit signal is not SIGCHLD. Time namespaces are not supported.
+    fn clone3_with_clone_newtime_keeps_the_exit_signal() {
+        // CLONE_NEWTIME (0x80) is a bit of the exit signal in clone's
+        // flags: the child of clone3 still has SIGCHLD, so a wait without
+        // __WCLONE finds it.
         let (mut k, mut t, m) = setup();
         let words = [0x80u64, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0];
         m.write(GuestAddr(DATA + 512), &words.map(u64::to_le_bytes).concat())
             .unwrap();
-        assert_eq!(
-            syscall(&mut k, &mut t, &m, 435, [DATA + 512, 88, 0, 0, 0, 0]),
-            Errno::EINVAL.to_syscall_return()
-        );
-        assert!(k.take_child().is_none());
+        let pid = syscall(&mut k, &mut t, &m, 435, [DATA + 512, 88, 0, 0, 0, 0]);
+        assert!(pid < 1 << 20, "{}", pid as i64);
+        let (mut c, ct) = k.take_child().unwrap();
+        let cm = c.take_spawn_memory().unwrap();
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(6));
+        assert_eq!(syscall(&mut k, &mut t, &m, 61, [pid, 0, 0, 0, 0, 0]), pid);
     }
     #[test]
     fn orphans_go_to_the_first_process_or_the_nearest_subreaper() {
@@ -1919,36 +1920,77 @@ mod ignored_pending {
 }
 mod namespaces {
     use super::*;
+    const NEWNS: u64 = 0x2_0000;
+    const NEWCGROUP: u64 = 0x200_0000;
+    const NEWUTS: u64 = 0x400_0000;
+    const NEWIPC: u64 = 0x800_0000;
+    const NEWUSER: u64 = 0x1000_0000;
+    const NEWPID: u64 = 0x2000_0000;
+    const NEWNET: u64 = 0x4000_0000;
+    const NEWTIME: u64 = 0x80;
+    /// The host and domain names `uname` reports.
+    fn names(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> (Vec<u8>, Vec<u8>) {
+        assert_eq!(syscall(k, t, m, 63, [DATA + 1024, 0, 0, 0, 0, 0]), 0);
+        let mut bytes = [0; 65 * 6];
+        m.read(GuestAddr(DATA + 1024), &mut bytes).unwrap();
+        let field = |i: usize| {
+            let field = &bytes[i * 65..(i + 1) * 65];
+            field[..field.iter().position(|&b| b == 0).unwrap()].to_vec()
+        };
+        (field(1), field(5))
+    }
+    /// What the link at `path` reads.
+    fn link(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, path: &str) -> Vec<u8> {
+        m.write(GuestAddr(DATA), format!("{path}\0").as_bytes())
+            .unwrap();
+        let count = syscall(k, t, m, 89, [DATA, DATA + 512, 256, 0, 0, 0]);
+        assert!(count < 256, "{path}: {}", count as i64);
+        let mut bytes = vec![0; count as usize];
+        m.read(GuestAddr(DATA + 512), &mut bytes).unwrap();
+        bytes
+    }
+    fn set_name(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, n: u64, name: &[u8]) -> u64 {
+        m.write(GuestAddr(DATA + 2048), name).unwrap();
+        syscall(k, t, m, n, [DATA + 2048, name.len() as u64, 0, 0, 0, 0])
+    }
     #[test]
-    fn namespace_flags_and_calls_are_refused() {
+    fn sethostname_and_setdomainname_change_what_uname_reports() {
         let (mut k, mut t, m) = setup();
-        // CLONE_NEWNS, CLONE_NEWCGROUP, CLONE_NEWUTS, CLONE_NEWIPC,
-        // CLONE_NEWUSER, CLONE_NEWPID and CLONE_NEWNET, which root may use
-        // on Linux: no namespace is created, and neither is a child.
-        for flag in [
-            0x2_0000,
-            0x200_0000,
-            0x400_0000,
-            0x800_0000,
-            0x1000_0000,
-            0x2000_0000,
-            0x4000_0000,
-        ] {
-            assert_eq!(
-                syscall(&mut k, &mut t, &m, 56, [flag | 17, 0, 0, 0, 0, 0]),
-                Errno::EINVAL.to_syscall_return(),
-                "{flag:#x}"
-            );
-            assert!(k.take_child().is_none());
-        }
-        // setns is not implemented.
         assert_eq!(
-            syscall(&mut k, &mut t, &m, 308, [0; 6]),
-            Errno::ENOSYS.to_syscall_return()
+            names(&mut k, &mut t, &m),
+            (b"paludarium".to_vec(), b"(none)".to_vec())
+        );
+        assert_eq!(set_name(&mut k, &mut t, &m, 170, b"box"), 0);
+        assert_eq!(set_name(&mut k, &mut t, &m, 171, b"example.org"), 0);
+        assert_eq!(
+            names(&mut k, &mut t, &m),
+            (b"box".to_vec(), b"example.org".to_vec())
+        );
+        // 64 bytes fill the field; 65 or a negative length are EINVAL.
+        assert_eq!(set_name(&mut k, &mut t, &m, 170, &[b'a'; 64]), 0);
+        assert_eq!(names(&mut k, &mut t, &m).0, vec![b'a'; 64]);
+        let einval = Errno::EINVAL.to_syscall_return();
+        assert_eq!(set_name(&mut k, &mut t, &m, 170, &[b'a'; 65]), einval);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 171, [DATA, u64::MAX, 0, 0, 0, 0]),
+            einval
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 170, [1, 4, 0, 0, 0, 0]),
+            Errno::EFAULT.to_syscall_return()
+        );
+        // An empty name, from any address.
+        assert_eq!(syscall(&mut k, &mut t, &m, 171, [1, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(names(&mut k, &mut t, &m).1, b"");
+        // Without CAP_SYS_ADMIN, EPERM before the length is looked at.
+        t.state.credentials = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(
+            set_name(&mut k, &mut t, &m, 170, &[b'a'; 65]),
+            Errno::EPERM.to_syscall_return()
         );
     }
     #[test]
-    fn unshare_succeeds_with_nothing_shared_and_refuses_namespaces() {
+    fn unshare_gives_new_namespaces_and_refuses_the_others() {
         let (mut k, mut t, m) = setup();
         let einval = Errno::EINVAL.to_syscall_return();
         // Nothing to unshare: one thread, its own dispositions and memory.
@@ -1966,37 +2008,397 @@ mod namespaces {
                 einval
             );
         }
-        // A user namespace is not offered; the others need CAP_SYS_ADMIN,
-        // which root has (EINVAL, as clone) and a user does not (EPERM).
-        assert_eq!(
-            syscall(&mut k, &mut t, &m, 272, [0x1000_0000, 0, 0, 0, 0, 0]),
-            einval
-        );
-        let namespaces = [
-            0x80,
-            0x2_0000,
-            0x200_0000,
-            0x400_0000,
-            0x800_0000,
-            0x2000_0000,
-            0x4000_0000,
-        ];
-        for flags in namespaces {
+        let before = [
+            "uts",
+            "ipc",
+            "mnt",
+            "cgroup",
+            "time",
+            "time_for_children",
+            "net",
+        ]
+        .map(|name| link(&mut k, &mut t, &m, &format!("/proc/self/ns/{name}")));
+        assert_eq!(before[0], b"uts:[4026531838]");
+        for flags in [NEWUTS, NEWIPC, NEWNS, NEWCGROUP, NEWTIME] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
+                0,
+                "{flags:#x}"
+            );
+        }
+        let after = [
+            "uts",
+            "ipc",
+            "mnt",
+            "cgroup",
+            "time",
+            "time_for_children",
+            "net",
+        ]
+        .map(|name| link(&mut k, &mut t, &m, &format!("/proc/self/ns/{name}")));
+        // New ones of each, but the time namespace, which is the children's.
+        for i in [0, 1, 2, 3, 5] {
+            assert_ne!(before[i], after[i], "{i}");
+            assert_eq!(before[i][..4], after[i][..4]);
+        }
+        assert_eq!(before[4], after[4]);
+        assert_eq!(before[6], after[6]);
+        assert_eq!(&after[5][..5], b"time:");
+        // No new user, PID or network namespace; with a supported flag too.
+        for flags in [NEWUSER, NEWPID, NEWNET, NEWPID | NEWUTS] {
             assert_eq!(
                 syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
                 einval
             );
         }
+        // Without CAP_SYS_ADMIN, EPERM, but EINVAL for a user namespace.
         t.state.credentials = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
-        for flags in namespaces {
+        for flags in [NEWUTS, NEWIPC, NEWNS, NEWCGROUP, NEWTIME, NEWPID, NEWNET] {
             assert_eq!(
                 syscall(&mut k, &mut t, &m, 272, [flags, 0, 0, 0, 0, 0]),
                 Errno::EPERM.to_syscall_return()
             );
         }
         assert_eq!(
-            syscall(&mut k, &mut t, &m, 272, [0x1000_0000, 0, 0, 0, 0, 0]),
+            syscall(&mut k, &mut t, &m, 272, [NEWUSER, 0, 0, 0, 0, 0]),
             einval
+        );
+    }
+    #[test]
+    fn a_uts_namespace_keeps_its_names_from_others() {
+        let (mut k, mut t, m) = setup();
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        let pid = syscall(&mut k, &mut t, &m, 56, [17, 0, 0, 0, 0, 0]);
+        assert!(pid < 1 << 20);
+        let (mut child, mut ct) = k.take_child().unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &m, 272, [NEWUTS, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(set_name(&mut k, &mut t, &m, 170, b"inside"), 0);
+        assert_eq!(names(&mut k, &mut t, &m).0, b"inside");
+        assert_eq!(names(&mut child, &mut ct, &m).0, b"paludarium");
+        // A child of the process starts in its new namespace.
+        let pid = syscall(&mut k, &mut t, &m, 56, [17, 0, 0, 0, 0, 0]);
+        assert!(pid < 1 << 20);
+        let (mut second, mut st) = k.take_child().unwrap();
+        assert_eq!(names(&mut second, &mut st, &m).0, b"inside");
+        // A clone with CLONE_NEWUTS gives the child a new one of its own.
+        let pid = syscall(&mut k, &mut t, &m, 56, [NEWUTS | 17, 0, 0, 0, 0, 0]);
+        assert!(pid < 1 << 20);
+        let (mut third, mut tt) = k.take_child().unwrap();
+        assert_eq!(set_name(&mut third, &mut tt, &m, 170, b"third"), 0);
+        assert_eq!(names(&mut k, &mut t, &m).0, b"inside");
+        assert_ne!(
+            link(&mut k, &mut t, &m, "/proc/self/ns/uts"),
+            link(&mut third, &mut tt, &m, "/proc/self/ns/uts")
+        );
+    }
+    #[test]
+    fn clone_checks_namespace_flags_as_linux_does() {
+        let (mut k, mut t, m) = setup();
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        let einval = Errno::EINVAL.to_syscall_return();
+        // CLONE_FS with a new mount or user namespace; CLONE_SYSVSEM with a
+        // new IPC namespace; and the namespaces paludarium has no new ones
+        // of: no child.
+        for flags in [
+            NEWNS | 0x200,
+            NEWUSER | 0x200,
+            NEWIPC | 0x4_0000,
+            NEWUSER,
+            NEWPID,
+            NEWNET,
+            NEWNET | NEWUTS,
+        ] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 56, [flags | 17, 0, 0, 0, 0, 0]),
+                einval,
+                "{flags:#x}"
+            );
+            assert!(k.take_child().is_none());
+        }
+        // A thread may not have a new user or PID namespace; the others
+        // need CAP_SYS_ADMIN.
+        for flags in [NEWUSER, NEWPID] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 56, [flags | 0x1_0900, 0, 0, 0, 0, 0]),
+                einval
+            );
+        }
+        let user = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        let root = std::mem::replace(&mut t.state.credentials, user);
+        for flags in [NEWUTS, NEWIPC, NEWNS, NEWCGROUP, NEWPID] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 56, [flags | 17, 0, 0, 0, 0, 0]),
+                Errno::EPERM.to_syscall_return()
+            );
+            assert!(k.take_child().is_none());
+        }
+        t.state.credentials = root;
+        // A thread with a new UTS namespace has its own names.
+        let tid = syscall(&mut k, &mut t, &m, 56, [NEWUTS | 0x1_0b00, 0, 0, 0, 0, 0]);
+        assert!(tid < 1 << 20, "{}", tid as i64);
+        let (mut thread, mut tt) = k.take_child().unwrap();
+        assert_eq!(set_name(&mut thread, &mut tt, &m, 170, b"thread"), 0);
+        assert_eq!(names(&mut k, &mut t, &m).0, b"paludarium");
+    }
+    #[test]
+    fn a_new_time_namespace_is_entered_by_children_and_exec() {
+        let (mut k, mut t, m) = setup();
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [NEWTIME, 0, 0, 0, 0, 0]),
+            0
+        );
+        let children = link(&mut k, &mut t, &m, "/proc/self/ns/time_for_children");
+        assert_ne!(link(&mut k, &mut t, &m, "/proc/self/ns/time"), children);
+        // A fork is in it; a vfork-like child sharing the memory is not.
+        let pid = syscall(&mut k, &mut t, &m, 56, [17, 0, 0, 0, 0, 0]);
+        assert!(pid < 1 << 20);
+        let (mut child, mut ct) = k.take_child().unwrap();
+        assert_eq!(
+            link(&mut child, &mut ct, &m, "/proc/self/ns/time"),
+            children
+        );
+        let pid = syscall(&mut k, &mut t, &m, 56, [0x100 | 17, 0, 0, 0, 0, 0]);
+        assert!(pid < 1 << 20);
+        let (mut shared, mut st) = k.take_child().unwrap();
+        assert_ne!(
+            link(&mut shared, &mut st, &m, "/proc/self/ns/time"),
+            children
+        );
+        // clone3's CLONE_NEWTIME gives the child a new one, which it enters
+        // as a fork enters its children's (`timens_on_fork`).
+        m.write(GuestAddr(DATA + 3072), &[0; 88]).unwrap();
+        m.write_u64(GuestAddr(DATA + 3072), NEWTIME).unwrap();
+        m.write_u64(GuestAddr(DATA + 3072 + 32), 17).unwrap();
+        let pid = syscall(&mut k, &mut t, &m, 435, [DATA + 3072, 88, 0, 0, 0, 0]);
+        assert!(pid < 1 << 20, "{}", pid as i64);
+        let (mut third, mut tt) = k.take_child().unwrap();
+        let own = link(&mut third, &mut tt, &m, "/proc/self/ns/time");
+        assert_ne!(own, children);
+        assert_eq!(
+            link(&mut third, &mut tt, &m, "/proc/self/ns/time_for_children"),
+            own
+        );
+    }
+    #[test]
+    fn setns_enters_the_namespaces_of_a_file_or_a_process() {
+        let (mut k, mut t, m) = setup();
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        let pid = syscall(
+            &mut k,
+            &mut t,
+            &m,
+            56,
+            [NEWUTS | NEWIPC | 17, 0, 0, 0, 0, 0],
+        );
+        assert!(pid < 1 << 20);
+        let (mut child, mut ct) = k.take_child().unwrap();
+        assert_eq!(set_name(&mut child, &mut ct, &m, 170, b"child"), 0);
+        let theirs = link(&mut k, &mut t, &m, &format!("/proc/{pid}/ns/uts"));
+        assert_eq!(theirs, link(&mut child, &mut ct, &m, "/proc/self/ns/uts"));
+        m.write(GuestAddr(DATA), format!("/proc/{pid}/ns/uts\0").as_bytes())
+            .unwrap();
+        let fd = syscall(&mut k, &mut t, &m, 2, [DATA, 0, 0, 0, 0, 0]);
+        assert!(fd < 1024, "{}", fd as i64);
+        // A namespace file is only a handle: reading it is EINVAL, and its
+        // descriptor's link names the namespace.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 0, [fd, DATA + 512, 8, 0, 0, 0]),
+            einval()
+        );
+        assert_eq!(
+            link(&mut k, &mut t, &m, &format!("/proc/self/fd/{fd}")),
+            theirs
+        );
+        // The wrong kind, then the right one or none.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [fd, NEWIPC, 0, 0, 0, 0]),
+            einval()
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [fd, NEWUTS, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(names(&mut k, &mut t, &m).0, b"child");
+        assert_eq!(link(&mut k, &mut t, &m, "/proc/self/ns/uts"), theirs);
+        // A pidfd and the namespaces to enter: none or an unknown flag is
+        // EINVAL; a user namespace is the thread's own (EINVAL).
+        let pidfd = syscall(&mut k, &mut t, &m, 434, [pid, 0, 0, 0, 0, 0]);
+        assert!(pidfd < 1024);
+        for flags in [0, 0x100, NEWUSER | NEWIPC] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 308, [pidfd, flags, 0, 0, 0, 0]),
+                einval()
+            );
+        }
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [pidfd, NEWIPC, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            link(&mut k, &mut t, &m, "/proc/self/ns/ipc"),
+            link(&mut child, &mut ct, &m, "/proc/self/ns/ipc")
+        );
+        // Neither a namespace file nor a pidfd.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [0, 0, 0, 0, 0, 0]),
+            einval()
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [999, 0, 0, 0, 0, 0]),
+            Errno::EBADF.to_syscall_return()
+        );
+        // Without CAP_SYS_ADMIN, EPERM.
+        t.state.credentials = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [fd, 0, 0, 0, 0, 0]),
+            Errno::EPERM.to_syscall_return()
+        );
+    }
+    #[test]
+    fn setns_into_a_mount_namespace_moves_to_its_root() {
+        let (mut k, mut t, m) = setup();
+        m.write(GuestAddr(DATA), b"/proc/self/ns/mnt\0").unwrap();
+        let fd = syscall(&mut k, &mut t, &m, 2, [DATA, 0, 0, 0, 0, 0]);
+        assert!(fd < 1024);
+        m.write(GuestAddr(DATA), b"/namespaces\0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 83, [DATA, 0o755, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 80, [DATA, 0, 0, 0, 0, 0]), 0);
+        // A working directory another thread shares: EINVAL.
+        let shared = k.files.for_clone(true, true);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [fd, 0, 0, 0, 0, 0]),
+            einval()
+        );
+        drop(shared);
+        assert_eq!(syscall(&mut k, &mut t, &m, 308, [fd, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 79, [DATA, 64, 0, 0, 0, 0]), 2);
+        let mut cwd = [0; 2];
+        m.read(GuestAddr(DATA), &mut cwd).unwrap();
+        assert_eq!(&cwd, b"/\0");
+        // A time namespace needs the thread alone (EUSERS).
+        m.write(GuestAddr(DATA), b"/proc/self/ns/time\0").unwrap();
+        let time = syscall(&mut k, &mut t, &m, 2, [DATA, 0, 0, 0, 0, 0]);
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        k.group.register(2, Arc::new(SignalInbox::default()));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 308, [time, 0, 0, 0, 0, 0]),
+            Errno(87).to_syscall_return()
+        );
+    }
+    #[test]
+    fn clone_ignores_the_upper_half_of_its_flags() {
+        // sys_clone keeps the low 32 bits: the bit clone3's CLONE_NEWTIME
+        // travels in is a plain fork from clone, as are CLONE_CLEAR_SIGHAND's,
+        // with or without CAP_SYS_ADMIN, and the child stays in the time
+        // namespace.
+        let (mut k, mut t, m) = setup();
+        k.group.register(1, Arc::new(SignalInbox::default()));
+        let time = link(&mut k, &mut t, &m, "/proc/self/ns/time");
+        t.state.credentials = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        for high in [
+            crate::namespaces::CLONE3_NEWTIME,
+            crate::processes::CLONE_CLEAR_SIGHAND,
+        ] {
+            let pid = syscall(&mut k, &mut t, &m, 56, [high | 17, 0, 0, 0, 0, 0]);
+            assert!(pid < 1 << 20, "{high:#x}: {}", pid as i64);
+            let (mut child, mut ct) = k.take_child().unwrap();
+            assert_eq!(link(&mut child, &mut ct, &m, "/proc/self/ns/time"), time);
+            assert_eq!(
+                link(&mut child, &mut ct, &m, "/proc/self/ns/time_for_children"),
+                time
+            );
+        }
+    }
+    #[test]
+    fn setns_into_a_time_namespace_enters_it_and_gives_it_to_children() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [NEWTIME, 0, 0, 0, 0, 0]),
+            0
+        );
+        let theirs = link(&mut k, &mut t, &m, "/proc/self/ns/time_for_children");
+        assert_ne!(link(&mut k, &mut t, &m, "/proc/self/ns/time"), theirs);
+        m.write(GuestAddr(DATA), b"/proc/self/ns/time_for_children\0")
+            .unwrap();
+        let fd = syscall(&mut k, &mut t, &m, 2, [DATA, 0, 0, 0, 0, 0]);
+        assert_eq!(syscall(&mut k, &mut t, &m, 308, [fd, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(link(&mut k, &mut t, &m, "/proc/self/ns/time"), theirs);
+        assert_eq!(
+            link(&mut k, &mut t, &m, "/proc/self/ns/time_for_children"),
+            theirs
+        );
+    }
+    fn einval() -> u64 {
+        Errno::EINVAL.to_syscall_return()
+    }
+    #[test]
+    fn proc_lists_and_stats_the_namespace_links() {
+        let (mut k, mut t, m) = setup();
+        m.write(GuestAddr(DATA), b"/proc/self/ns\0").unwrap();
+        let fd = syscall(&mut k, &mut t, &m, 2, [DATA, 0o200000, 0, 0, 0, 0]);
+        assert!(fd < 1024, "{}", fd as i64);
+        let count = syscall(&mut k, &mut t, &m, 217, [fd, DATA + 512, 1024, 0, 0, 0]);
+        assert!(count < 1024);
+        let mut bytes = vec![0; count as usize];
+        m.read(GuestAddr(DATA + 512), &mut bytes).unwrap();
+        let mut names = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let length = u16::from_le_bytes([bytes[at + 16], bytes[at + 17]]) as usize;
+            let name = &bytes[at + 19..at + length];
+            names.push(
+                String::from_utf8_lossy(&name[..name.iter().position(|&b| b == 0).unwrap()])
+                    .into_owned(),
+            );
+            at += length;
+        }
+        assert_eq!(
+            names,
+            [
+                ".",
+                "..",
+                "net",
+                "uts",
+                "ipc",
+                "pid",
+                "pid_for_children",
+                "user",
+                "mnt",
+                "cgroup",
+                "time",
+                "time_for_children"
+            ]
+        );
+        // The link itself, and the namespace's file it leads to.
+        m.write(GuestAddr(DATA), b"/proc/self/ns/uts\0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 6, [DATA, DATA + 512, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            m.read_u64(GuestAddr(DATA + 512 + 24)).unwrap() as u32,
+            0o120_777
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 4, [DATA, DATA + 512, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            m.read_u64(GuestAddr(DATA + 512 + 24)).unwrap() as u32,
+            0o100_444
+        );
+        assert_eq!(
+            m.read_u64(GuestAddr(DATA + 512 + 8)).unwrap(),
+            4_026_531_838
+        );
+        m.write(GuestAddr(DATA), b"/proc/self/ns/nope\0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 4, [DATA, DATA + 512, 0, 0, 0, 0]),
+            Errno::ENOENT.to_syscall_return()
         );
     }
     #[test]
@@ -3599,6 +4001,26 @@ mod shm {
         );
         assert_eq!(stat(&mut k, &mut t, &m, id), Err(e(Errno::EINVAL)));
         assert_eq!(shmget(&mut k, &mut t, &m, 7, 64, IPC_CREAT | IPC_EXCL), 1);
+    }
+
+    #[test]
+    fn each_ipc_namespace_has_its_own_segments() {
+        let (mut k, mut t, m) = setup();
+        let id = shmget(&mut k, &mut t, &m, 5, 64, IPC_CREAT | 0o600);
+        let at = shmat(&mut k, &mut t, &m, id, 0, 0);
+        // unshare(CLONE_NEWIPC): no key or ID of the first namespace is found.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [0x800_0000, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(shmget(&mut k, &mut t, &m, 5, 64, 0), e(Errno::ENOENT));
+        assert_eq!(stat(&mut k, &mut t, &m, id), Err(e(Errno::EINVAL)));
+        assert_eq!(shmget(&mut k, &mut t, &m, 5, 64, IPC_CREAT | 0o600), 0);
+        // The attachment stays, and still shows the memory.
+        m.write(GuestAddr(at), b"kept").unwrap();
+        let mut seen = [0u8; 4];
+        m.read(GuestAddr(at), &mut seen).unwrap();
+        assert_eq!(&seen, b"kept");
     }
 
     #[test]

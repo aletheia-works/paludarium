@@ -149,7 +149,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - System V の共有メモリのセグメントの `shm_atime`、`shm_dtime`、`shm_lpid` は、
     `shmat` と `shmdt` でだけ変わります。Linux は、`fork` がつないだ領域を写すとき、
     `munmap` や `mprotect` がそれを分けるとき、それを持つプロセスが終わるときや exec する
-    ときにも変えます。つないだ領域の一部を隣のかけらと同じ保護に戻す `mprotect` は、
+    ときにも変えます。`shmdt` が見つけるのは、スレッドの IPC 名前空間のセグメントにつないだ
+    領域だけです。Linux は、`setns` や `unshare` でスレッドがほかの名前空間に移る前に
+    つないだ領域も外します。つないだ領域の一部を隣のかけらと同じ保護に戻す `mprotect` は、
     独立したかけらを作り、それも 1 つのつながりと数えます。最近の Linux は、2 つの境目を
     動かします。
 - **拡張属性**：マウントしたホストのディレクトリは、拡張属性のないファイルシステムとして
@@ -220,12 +222,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **名前空間**：名前空間のフラグ（`CLONE_NEWNS`、`CLONE_NEWUTS`、`CLONE_NEWIPC`、
-  `CLONE_NEWUSER`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWCGROUP`、`clone3` では
-  `CLONE_NEWTIME` も）を付けた `clone` と `clone3` は、子を作らずに `EINVAL` で失敗します。
-  Linux では、root で動くゲストは名前空間を作れます。名前空間のフラグを付けた `unshare`
-  も `EINVAL` で失敗します（`CAP_SYS_ADMIN` のないスレッドでは Linux と同じく `EPERM`）。
-  Linux ではユーザーも使える `CLONE_NEWUSER` も同じです。`setns` は `ENOSYS` を返します。
+- **名前空間**：新しいネットワーク・PID・ユーザーの名前空間は作れません。
+  `CLONE_NEWNET` や `CLONE_NEWPID` を付けた `clone`、`clone3`、`unshare` は、子を作らずに
+  `EINVAL` で失敗します（`CAP_SYS_ADMIN` のないスレッドでは Linux と同じく `EPERM`）。
+  Linux では、root で動くゲストはこれらを作れます。Linux ではユーザーも使える
+  `CLONE_NEWUSER` は、どのスレッドでも `EINVAL` です。ほかの名前空間は、paludarium に
+  分けるものがありません（IPC 名前空間の System V の共有メモリを除きます）。IPC 名前空間には
+  System V のセマフォーとメッセージキューも、POSIX メッセージキューもなく、
+  マウント名前空間には `mount` がありません（`/proc/self/mountinfo` のマウント ID は
+  変わりません。Linux では新しい名前空間の写しに新しい ID が付きます）。cgroup 名前空間には
+  `/proc/self/cgroup` がなく、time 名前空間には `/proc/<pid>/timens_offsets` がなく、
+  時計は最初の名前空間のものです。名前空間のファイルは `NS_GET_*` の `ioctl` を持たず、
+  新しい名前空間の番号は、空いた番号を使い回す Linux のものとは違います。
 - **Linux と macOS 以外のホストでマウントしたディレクトリのファイル**：`SEEK_DATA`
   や `SEEK_HOLE` の `lseek` はファイル全体をデータとして扱います。Linux では穴を
   見つけます。Windows では `st_blocks` も大きさを 512 バイトのブロックに切り上げた

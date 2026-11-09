@@ -1,5 +1,5 @@
 //! System V shared memory: `shmget`, `shmat`, `shmdt` and `shmctl`, in the
-//! one IPC namespace of the machine, as Linux's `ipc/shm.c` has them.
+//! calling thread's IPC namespace, as Linux's `ipc/shm.c` has them.
 //!
 //! A segment is shared memory that every attachment shows, in every process.
 //! Each `shmat` is an open file of its own (Linux's clone of the segment's
@@ -62,9 +62,15 @@ const CAP_SYS_ADMIN: u64 = 1 << 21;
 const RLIMIT_MEMLOCK: usize = 8;
 const ENOMEM: Errno = Errno::ENOMEM;
 
-/// The segments of the machine.
-#[derive(Default)]
+/// The segments of an IPC namespace.
+#[derive(Clone, Default)]
 pub(crate) struct Segments(Arc<Mutex<Table>>);
+
+impl std::fmt::Debug for Segments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Segments")
+    }
+}
 
 #[derive(Default)]
 struct Table {
@@ -251,8 +257,9 @@ fn now(c: &Context<'_>) -> i64 {
         .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
 }
 
-fn segments<'a>(c: &Context<'a>) -> &'a Segments {
-    c.processes.shm()
+/// The segments of the calling thread's IPC namespace.
+fn segments(c: &Context<'_>) -> Segments {
+    c.group.namespaces(c.tid).ipc.shm.clone()
 }
 
 fn result(value: Result<u64, Errno>) -> Outcome {
@@ -272,7 +279,8 @@ pub(crate) fn sys_shmget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno> {
     let credentials = &c.process.credentials;
-    let mut table = segments(c).lock();
+    let shm = segments(c);
+    let mut table = shm.lock();
     if key != IPC_PRIVATE {
         if let Some(segment) = table.segments.values().find(|segment| segment.key == key) {
             if flag & IPC_CREAT != 0 && flag & IPC_EXCL != 0 {
@@ -371,7 +379,8 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         access |= 0o111;
     }
     let (attachment, size) = {
-        let mut table = segments(c).lock();
+        let shm = segments(c);
+        let mut table = shm.lock();
         let segment = table.checked(id)?;
         if !permitted(segment, &c.process.credentials, access) {
             return Err(Errno::EACCES);
@@ -380,7 +389,7 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
             id: segment.id,
             size: segment.size,
             name: Arc::clone(&segment.name),
-            table: Arc::downgrade(&segments(c).0),
+            table: Arc::downgrade(&shm.0),
         });
         segment
             .attachments
@@ -420,7 +429,8 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
     }
     c.group.numa().forget(at.0, len);
     drop(memory);
-    let mut table = segments(c).lock();
+    let shm = segments(c);
+    let mut table = shm.lock();
     if let Ok(segment) = table.checked(attachment.id) {
         segment.atime = now(c);
         segment.lpid = c.process.pid;
@@ -481,7 +491,8 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
             c.group.numa().forget(f.start, f.end - f.start);
         }
     }
-    let mut table = segments(c).lock();
+    let shm = segments(c);
+    let mut table = shm.lock();
     if let Ok(segment) = table.checked(id) {
         segment.dtime = now(c);
         segment.lpid = c.process.pid;
@@ -521,7 +532,8 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
         // `struct shm_info`, and the highest index in use.
         SHM_INFO => {
             let (max, used, total, resident) = {
-                let table = segments(c).lock();
+                let shm = segments(c);
+                let table = shm.lock();
                 let resident = table
                     .segments
                     .values()
@@ -543,7 +555,8 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
         }
         IPC_STAT | SHM_STAT | SHM_STAT_ANY => {
             let (ds, returned) = {
-                let mut table = segments(c).lock();
+                let shm = segments(c);
+                let mut table = shm.lock();
                 let segment = if cmd == IPC_STAT {
                     table.checked(id)?
                 } else {
@@ -575,7 +588,8 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                     .map_err(|_| Errno::EFAULT)?;
             }
             let now = now(c);
-            let mut table = segments(c).lock();
+            let shm = segments(c);
+            let mut table = shm.lock();
             let credentials = &c.process.credentials;
             let segment = table.checked(id)?;
             if credentials.euid != segment.cuid
@@ -639,7 +653,8 @@ fn lock(c: &Context<'_>, id: i32, lock: bool) -> Result<u64, Errno> {
     let credentials = &c.process.credentials;
     let capable = credentials.effective & CAP_IPC_LOCK != 0;
     let limit = c.processes.soft_limit(c.process.pid, RLIMIT_MEMLOCK);
-    let mut table = segments(c).lock();
+    let shm = segments(c);
+    let mut table = shm.lock();
     let locked_by_user: u64 = table
         .segments
         .values()

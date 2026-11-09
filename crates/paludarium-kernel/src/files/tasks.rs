@@ -156,13 +156,15 @@ impl Task {
     }
 }
 
-/// Refuses what the reader may not see of the task: `environ`, `exe` and
-/// `cwd` (`EACCES`), as Linux's `proc_mem_open` and `proc_fd_access_allowed`
-/// do.
+/// Refuses what the reader may not see of the task: `environ`, `exe`,
+/// `cwd` and the links of `ns` (`EACCES`), as Linux's `proc_mem_open`,
+/// `proc_fd_access_allowed` and `proc_ns_get_link` do.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
         TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
-        TaskEntry::Exe | TaskEntry::Cwd if !task.may_access(c, false) => Err(Errno::EACCES),
+        TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Namespace(_) if !task.may_access(c, false) => {
+            Err(Errno::EACCES)
+        }
         _ => Ok(()),
     }
 }
@@ -248,17 +250,27 @@ pub(super) fn content(task: &Task, entry: TaskEntry) -> Option<Vec<u8>> {
 }
 
 /// Where `exe` or `cwd` leads: the program and the current directory, or
-/// ENOENT once the process has ended; and `thread-self`, the thread's
-/// directory, relative to /proc as Linux's link reads. `None` for any other
-/// entry.
+/// ENOENT once the process has ended; `thread-self`, the thread's
+/// directory, relative to /proc as Linux's link reads; and what a link of
+/// `ns` reads, such as `uts:[4026531838]`. `None` for any other entry.
 pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errno>> {
     let target = match entry {
         TaskEntry::ThreadLink => Some(format!("{}/task/{}", task.pid, task.tid).into_bytes()),
         TaskEntry::Exe => task.live().then(|| task.view.group.executable()),
         TaskEntry::Cwd => task.live().then(|| task.public.files.cwd()).flatten(),
+        TaskEntry::Namespace(entry) => namespace(task, entry).map(|namespace| namespace.link()),
         _ => return None,
     };
     Some(target.ok_or(Errno::ENOENT))
+}
+/// The namespace a link of the task's `ns` names; none once it has ended,
+/// as Linux's task then has no `nsproxy`.
+pub(super) fn namespace(
+    task: &Task,
+    entry: crate::namespaces::Entry,
+) -> Option<std::sync::Arc<crate::namespaces::Namespace>> {
+    task.live()
+        .then(|| task.view.group.namespaces(task.tid).entry(entry).clone())
 }
 
 /// The `stat` of the entry, with its device and block size; a link is
@@ -281,6 +293,17 @@ pub(super) fn stat(
             return Ok((stat, device(c, &target), BLOCK_SIZE));
         }
         TaskEntry::Exe | TaskEntry::Cwd => crate::proc::self_link_stat(),
+        TaskEntry::Namespaces => crate::proc::namespaces_stat(),
+        TaskEntry::Namespace(entry) if follow => {
+            check(c, task, TaskEntry::Namespace(entry))?;
+            let namespace = namespace(task, entry).ok_or(Errno::ENOENT)?;
+            return Ok((
+                crate::namespaces::file_stat(&namespace),
+                crate::namespaces::DEVICE,
+                BLOCK_SIZE,
+            ));
+        }
+        TaskEntry::Namespace(_) => crate::proc::self_link_stat(),
         TaskEntry::Missing => return Err(Errno::ENOENT),
         TaskEntry::Environ => {
             crate::proc::private_stat(content(task, entry).map_or(0, |content| content.len()))
@@ -304,9 +327,15 @@ fn listing(names: impl IntoIterator<Item = (Vec<u8>, u8)>) -> Vec<DirectoryEntry
         .collect()
 }
 
-/// The entries of a process's or a thread's directory, or of `task`.
+/// The entries of a process's or a thread's directory, of `task`, or of
+/// `ns`.
 pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
     match entry {
+        TaskEntry::Namespaces => listing(
+            crate::namespaces::ENTRIES
+                .into_iter()
+                .map(|entry| (entry.name().to_vec(), DT_LNK)),
+        ),
         TaskEntry::Threads => {
             let mut threads: Vec<u32> = task
                 .view

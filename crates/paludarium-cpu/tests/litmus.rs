@@ -11,7 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use paludarium_cpu::{CpuState, reg, step};
 use paludarium_mmu::{AddressSpace, MappingKind, Prot};
@@ -79,16 +79,33 @@ fn memory(threads: &[Thread]) -> Arc<AddressSpace> {
 }
 
 /// Waits until every thread has arrived `round + 1` times, spinning so that
-/// the threads leave as close together as they can.
-fn arrive(arrived: &AtomicU64, threads: u64, round: u64) {
+/// the threads leave as close together as they can; `false` when a thread
+/// panicked instead, which then never arrives.
+fn arrive(arrived: &AtomicU64, aborted: &AtomicBool, threads: u64, round: u64) -> bool {
     arrived.fetch_add(1, Ordering::SeqCst);
     let mut spins = 0u32;
     while arrived.load(Ordering::SeqCst) < threads * (round + 1) {
+        if aborted.load(Ordering::SeqCst) {
+            return false;
+        }
         spins += 1;
         if spins < 1 << 12 {
             std::hint::spin_loop();
         } else {
             std::thread::yield_now();
+        }
+    }
+    true
+}
+
+/// Says the threads of a test are to stop if its thread panics, so that a
+/// failure in one shows as a failure, not as the others waiting forever.
+struct AbortOnPanic(Arc<AtomicBool>);
+
+impl Drop for AbortOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -125,6 +142,7 @@ fn litmus(name: &str, threads: Vec<Thread>, allowed: fn(&AddressSpace, u64, &[Lo
     let m = memory(&threads);
     let n = threads.len() as u64;
     let arrived = Arc::new(AtomicU64::new(0));
+    let aborted = Arc::new(AtomicBool::new(false));
     let loaded: Arc<Vec<[AtomicU64; 2]>> = Arc::new(
         (0..n)
             .map(|_| [AtomicU64::new(0), AtomicU64::new(0)])
@@ -135,8 +153,10 @@ fn litmus(name: &str, threads: Vec<Thread>, allowed: fn(&AddressSpace, u64, &[Lo
         .enumerate()
         .map(|(t, thread)| {
             let (m, arrived, loaded) = (Arc::clone(&m), Arc::clone(&arrived), Arc::clone(&loaded));
+            let aborted = Arc::clone(&aborted);
             let name = name.to_owned();
             std::thread::spawn(move || {
+                let _abort = AbortOnPanic(Arc::clone(&aborted));
                 // Use the pages first, so that the accesses take the paths
                 // without a lock where those exist.
                 for _ in 0..2 {
@@ -146,14 +166,18 @@ fn litmus(name: &str, threads: Vec<Thread>, allowed: fn(&AddressSpace, u64, &[Lo
                 }
                 let mut forbidden = 0u64;
                 for round in 0..ROUNDS {
-                    arrive(&arrived, n, 2 * round);
+                    if !arrive(&arrived, &aborted, n, 2 * round) {
+                        break;
+                    }
                     for _ in 0..jitter(t as u64, round) {
                         std::hint::spin_loop();
                     }
                     let values = run(&m, t, &thread, round + 1);
                     loaded[t][0].store(values[0], Ordering::SeqCst);
                     loaded[t][1].store(values[1], Ordering::SeqCst);
-                    arrive(&arrived, n, 2 * round + 1);
+                    if !arrive(&arrived, &aborted, n, 2 * round + 1) {
+                        break;
+                    }
                     if t == 0 {
                         let all: Vec<Loaded> = loaded
                             .iter()

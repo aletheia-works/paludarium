@@ -3453,8 +3453,9 @@ impl AddressSpace {
         let entry = tlb
             .get(page)
             .filter(|e| e.prot.contains(Prot::WRITE) && !e.cow)?;
-        // The page is neither shared nor of a file: nothing writes it back,
-        // so it need not be marked dirty.
+        // The page is not shared, so nothing writes it back and it need not
+        // be marked dirty. A page-cache page, which is, has `cow` set and is
+        // left out above.
         Some((entry.frame.get()?, entry.prot.contains(Prot::EXEC)))
     }
     /// After a store through a [`ThreadTlb`]: a store to code makes the

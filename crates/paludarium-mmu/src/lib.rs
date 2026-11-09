@@ -1664,14 +1664,14 @@ impl AddressSpaceData {
         let Some(p) = entry.as_mut() else {
             return true;
         };
-        // A forked frame that no other space holds any more is this one's
-        // own: the space holds its lock, so no other can take it meanwhile.
         // A copy of a page-cache page records the shrinks counted before it
         // copies: a truncation counts a shrink only once the bytes past the
         // new end read as zeros, so a copy that took the bytes from before
         // it records an older count, and goes if the page is past the end.
         let shrinks = (write && p.cow && p.cache)
             .then(|| self.file_at(page).map_or(0, |(source, _)| source.shrinks()));
+        // A forked frame that no other space holds any more is this one's
+        // own: the space holds its lock, so no other can take it meanwhile.
         if write && p.cow && (p.cache || Arc::strong_count(&p.frame) > 1) {
             let Some(frame) = copied(&p.frame, self.meter.as_ref()) else {
                 self.out_of_memory.store(true, Ordering::SeqCst);

@@ -43,6 +43,7 @@ mod threads;
 mod timerfd;
 mod timers;
 mod unix;
+mod users;
 pub use processes::Processes;
 pub use threads::ThreadGroup;
 

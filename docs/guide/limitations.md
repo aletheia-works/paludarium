@@ -249,9 +249,14 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **Namespaces**: there are no new user namespaces: `clone`, `clone3` and
-  `unshare` with `CLONE_NEWUSER`, which Linux lets even a user have, are
-  `EINVAL` for every thread. A network namespace has no interface but its
+- **Namespaces**: a user namespace has no `projid_map` and no
+  `user.max_*` limits; its map files check a write with the credentials
+  the file was opened with, where Linux also takes the writer's for the
+  `CAP_SETUID` and `CAP_SETGID` it needs in the parent; and the `/proc` files
+  of a process that is not dumpable belong to root of the first namespace,
+  where Linux gives them to root of the process's own when it maps one.
+  There are no file capabilities, in a user namespace either. A network
+  namespace has no interface but its
   loopback (no `veth` pairs to reach another), and there is no netlink
   (`AF_NETLINK`), so `ip link set lo up` cannot bring the loopback up: only
   `SIOCSIFFLAGS` on a TCP or UDP socket does, and the interface requests

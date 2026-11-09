@@ -16,9 +16,9 @@ const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
 const CAP_SETPCAP: u64 = 1 << 8;
 const CAP_SYS_RAWIO: u64 = 1 << 17;
-const CAP_SYS_ADMIN: u64 = 1 << 21;
-const CAP_SYS_NICE: u64 = 1 << 23;
-const CAP_SYS_RESOURCE: u64 = 1 << 24;
+pub(crate) const CAP_SYS_ADMIN: u64 = 1 << 21;
+pub(crate) const CAP_SYS_NICE: u64 = 1 << 23;
+pub(crate) const CAP_SYS_RESOURCE: u64 = 1 << 24;
 const CAP_SYS_TTY_CONFIG: u64 = 1 << 26;
 /// The capabilities a filesystem ID of root brings (`CAP_FS_MASK`):
 /// CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER,
@@ -47,9 +47,8 @@ pub(crate) struct TaskIds {
     pub gid: u32,
     pub egid: u32,
     pub sgid: u32,
-    pub cap_kill: bool,
-    pub cap_sys_nice: bool,
-    pub cap_sys_resource: bool,
+    /// The user namespace its capabilities count in.
+    pub user: crate::users::UserNs,
     /// The sets `capget` reads of another thread.
     pub effective: u64,
     pub permitted: u64,
@@ -60,10 +59,23 @@ pub(crate) struct TaskIds {
 }
 
 impl TaskIds {
+    /// Whether the thread has `cap` in the first user namespace (Linux's
+    /// `capable`).
+    pub(crate) fn capable(&self, cap: u64) -> bool {
+        crate::users::first().grants(&self.user, self.euid, self.effective, cap)
+    }
+    /// Whether it has `cap` in the user namespace of `target`'s
+    /// credentials (`ns_capable(tcred->user_ns, cap)`).
+    fn capable_over(&self, cap: u64, target: &Self) -> bool {
+        target
+            .user
+            .grants(&self.user, self.euid, self.effective, cap)
+    }
     /// Linux's `kill_ok_by_cred`: the sender's real or effective user ID is
-    /// the target's real or saved one, or the sender has CAP_KILL.
+    /// the target's real or saved one, or the sender has CAP_KILL in the
+    /// target's user namespace.
     pub(crate) fn may_signal(&self, target: &Self) -> bool {
-        self.cap_kill
+        self.capable_over(CAP_KILL, target)
             || self.euid == target.suid
             || self.euid == target.uid
             || self.uid == target.suid
@@ -71,9 +83,9 @@ impl TaskIds {
     }
     /// Linux's `check_prlimit_permission`, to read or set another thread's
     /// limits: the sender's real IDs are all of the target's IDs, or the
-    /// sender has CAP_SYS_RESOURCE.
+    /// sender has CAP_SYS_RESOURCE in the target's user namespace.
     pub(crate) fn may_prlimit(&self, target: &Self) -> bool {
-        self.cap_sys_resource
+        self.capable_over(CAP_SYS_RESOURCE, target)
             || (self.uid == target.uid
                 && self.uid == target.euid
                 && self.uid == target.suid
@@ -82,9 +94,12 @@ impl TaskIds {
                 && self.gid == target.sgid)
     }
     /// Linux's `set_one_prio_perm`: the sender's effective user ID is the
-    /// target's real or effective one, or the sender has CAP_SYS_NICE.
+    /// target's real or effective one, or the sender has CAP_SYS_NICE in
+    /// the target's user namespace.
     pub(crate) fn may_set_priority(&self, target: &Self) -> bool {
-        self.cap_sys_nice || self.euid == target.uid || self.euid == target.euid
+        self.capable_over(CAP_SYS_NICE, target)
+            || self.euid == target.uid
+            || self.euid == target.euid
     }
 }
 
@@ -120,6 +135,10 @@ pub struct Credentials {
     /// The last `LANDLOCK_RESTRICT_SELF_TSYNC` of its process this thread has
     /// taken ([`crate::ThreadGroup::sync_landlock`]).
     pub landlock_sync: u64,
+    /// The user namespace the capabilities count in, and the IDs a system
+    /// call takes and gives are in; the IDs here are kernel IDs, those of
+    /// the first user namespace ([`crate::users`]).
+    pub(crate) user: crate::users::UserNs,
 }
 
 /// Root with every capability, as the first process starts.
@@ -141,6 +160,7 @@ impl Default for Credentials {
             keep_caps: false,
             landlock: crate::landlock::Landlock::default(),
             landlock_sync: 0,
+            user: crate::users::UserNs::default(),
         }
     }
 }
@@ -154,9 +174,7 @@ impl Credentials {
             gid: self.gid,
             egid: self.egid,
             sgid: self.sgid,
-            cap_kill: self.effective & CAP_KILL != 0,
-            cap_sys_nice: self.effective & CAP_SYS_NICE != 0,
-            cap_sys_resource: self.effective & CAP_SYS_RESOURCE != 0,
+            user: self.user.clone(),
             effective: self.effective,
             permitted: self.permitted,
             inheritable: self.inheritable,
@@ -188,25 +206,56 @@ impl Credentials {
             ..self.clone()
         })
     }
+    /// Whether the thread has `cap` in user namespace `ns`, as Linux's
+    /// `ns_capable` ([`crate::namespaces::Namespace::grants`]).
+    pub(crate) fn capable_in(&self, cap: u64, ns: &crate::namespaces::Namespace) -> bool {
+        ns.grants(&self.user, self.euid, self.effective, cap)
+    }
+    /// Whether it has `cap` in the first user namespace (`capable`), as a
+    /// capability over the whole machine asks.
+    pub(crate) fn capable(&self, cap: u64) -> bool {
+        self.capable_in(cap, crate::users::first())
+    }
+    /// The kernel ID of root in the thread's user namespace, which the
+    /// capability rules of `set*id` and exec take as root.
+    fn root_uid(&self) -> Option<u32> {
+        self.user.kernel_of(crate::users::Ids::User, 0)
+    }
+    fn is_root(&self, uid: u32) -> bool {
+        self.root_uid() == Some(uid)
+    }
     /// CAP_SYS_TTY_CONFIG, which `vhangup` asks for.
     pub(crate) fn may_configure_terminals(&self) -> bool {
-        self.effective & CAP_SYS_TTY_CONFIG != 0
+        self.capable(CAP_SYS_TTY_CONFIG)
     }
     /// CAP_SYS_RAWIO, which a mapping below `mmap_min_addr` needs (Linux's
     /// `cap_mmap_addr`).
     pub(crate) fn may_map_low(&self) -> bool {
-        self.effective & CAP_SYS_RAWIO != 0
+        self.capable(CAP_SYS_RAWIO)
     }
-    /// CAP_SYS_ADMIN, which `trusted.*` and `security.*` attributes ask for.
+    /// CAP_SYS_ADMIN over the machine, which `trusted.*` and `security.*`
+    /// attributes and a terminal's `TIOCEXCL` and `TIOCSCTTY` ask for.
     pub(crate) fn may_administer(&self) -> bool {
+        self.capable(CAP_SYS_ADMIN)
+    }
+    /// CAP_SYS_ADMIN in the thread's own user namespace, which new
+    /// namespaces ask for.
+    pub(crate) fn administers_own(&self) -> bool {
         self.effective & CAP_SYS_ADMIN != 0
     }
     /// Linux's `scm_check_creds`, for what `SCM_CREDENTIALS` may say: the
-    /// caller's own process, or CAP_SYS_ADMIN; one of its real, effective
-    /// and saved user IDs, or CAP_SETUID; and one of its group IDs, or
-    /// CAP_SETGID.
-    pub(crate) fn may_send_credentials(&self, own_process: bool, uid: u32, gid: u32) -> bool {
-        (own_process || self.effective & CAP_SYS_ADMIN != 0)
+    /// caller's own process, or CAP_SYS_ADMIN over its PID namespace
+    /// (`pid_owner`, the user namespace that owns it); one of its real,
+    /// effective and saved user IDs, or CAP_SETUID; and one of its group
+    /// IDs, or CAP_SETGID. The IDs are kernel IDs.
+    pub(crate) fn may_send_credentials(
+        &self,
+        own_process: bool,
+        pid_owner: &crate::namespaces::Namespace,
+        uid: u32,
+        gid: u32,
+    ) -> bool {
+        (own_process || self.capable_in(CAP_SYS_ADMIN, pid_owner))
             && (uid == self.uid || uid == self.euid || uid == self.suid || self.may_setuid())
             && (gid == self.gid || gid == self.egid || gid == self.sgid || self.may_setgid())
     }
@@ -299,10 +348,10 @@ impl Credentials {
         }
         let mut new = self.clone();
         new.fsuid = fsuid;
-        if self.fsuid == 0 && fsuid != 0 {
+        if self.is_root(self.fsuid) && !self.is_root(fsuid) {
             new.effective &= !FS_CAPABILITIES;
         }
-        if self.fsuid != 0 && fsuid == 0 {
+        if !self.is_root(self.fsuid) && self.is_root(fsuid) {
             new.effective |= new.permitted & FS_CAPABILITIES;
         }
         Some(new)
@@ -312,15 +361,15 @@ impl Credentials {
     /// for `keep_caps`, the permitted ones), an effective ID leaving root
     /// drops the effective ones, and one coming back to it raises them.
     fn fix_setuid(mut self, old: &Self) -> Self {
-        let root = |c: &Self| c.uid == 0 || c.euid == 0 || c.suid == 0;
+        let root = |c: &Self| c.is_root(c.uid) || c.is_root(c.euid) || c.is_root(c.suid);
         if root(old) && !root(&self) && !self.keep_caps {
             self.permitted = 0;
             self.effective = 0;
         }
-        if old.euid == 0 && self.euid != 0 {
+        if old.is_root(old.euid) && !self.is_root(self.euid) {
             self.effective = 0;
         }
-        if old.euid != 0 && self.euid == 0 {
+        if !old.is_root(old.euid) && self.is_root(self.euid) {
             self.effective = self.permitted;
         }
         self
@@ -415,7 +464,11 @@ impl Credentials {
         let mut new = self.clone();
         new.fsuid = new.uid;
         new.fsgid = new.gid;
-        new.effective = if new.uid == 0 { new.permitted } else { 0 };
+        new.effective = if new.is_root(new.uid) {
+            new.permitted
+        } else {
+            0
+        };
         new
     }
 
@@ -440,7 +493,18 @@ impl Credentials {
         no_new_privs: bool,
     ) -> (Self, bool) {
         let mut new = self.clone();
-        if let Some(program) = program.filter(|_| !no_new_privs) {
+        // A program whose owner or group the user namespace does not map
+        // changes no ID (`bprm_fill_uid`).
+        let mapped = |program: &&FileStat| {
+            self.user
+                .id_of(crate::users::Ids::User, program.uid)
+                .is_some()
+                && self
+                    .user
+                    .id_of(crate::users::Ids::Group, program.gid)
+                    .is_some()
+        };
+        if let Some(program) = program.filter(|_| !no_new_privs).filter(mapped) {
             if program.mode & SET_USER_ID != 0 {
                 new.euid = program.uid;
             }
@@ -449,12 +513,12 @@ impl Credentials {
             }
         }
         new.keep_caps = false;
-        new.permitted = if new.uid == 0 || new.euid == 0 {
+        new.permitted = if new.is_root(new.uid) || new.is_root(new.euid) {
             ALL_CAPABILITIES
         } else {
             0
         };
-        let effective = new.euid == 0;
+        let effective = new.is_root(new.euid);
         let changed =
             new.euid != self.euid || (new.egid != self.fsgid && !self.groups.contains(&new.egid));
         if no_new_privs && (changed || new.permitted & !self.permitted != 0) {
@@ -470,7 +534,7 @@ impl Credentials {
         let secure = changed
             || new.euid != self.uid
             || new.egid != self.gid
-            || (new.uid != 0 && (effective || new.permitted != 0));
+            || (!new.is_root(new.uid) && (effective || new.permitted != 0));
         (new, secure)
     }
 }
@@ -499,46 +563,84 @@ fn set(c: &mut Context<'_>, change: Result<Credentials, Errno>) -> Outcome {
     }
 }
 
+impl Context<'_> {
+    /// User ID `kernel` as the caller's user namespace shows it.
+    pub(crate) fn shown_uid(&self, kernel: u32) -> u32 {
+        self.process
+            .credentials
+            .user
+            .shown(crate::users::Ids::User, kernel)
+    }
+    /// Group ID `kernel` as the caller's user namespace shows it.
+    pub(crate) fn shown_gid(&self, kernel: u32) -> u32 {
+        self.process
+            .credentials
+            .user
+            .shown(crate::users::Ids::Group, kernel)
+    }
+}
+/// The kernel ID a `set*id` argument names in the caller's user namespace:
+/// `-1` stays "unchanged", and an ID the namespace does not map is
+/// `EINVAL` (`make_kuid`, `uid_valid`).
+fn kernel_id(c: &Context<'_>, ids: crate::users::Ids, value: u64) -> Result<u32, Errno> {
+    match id(value) {
+        UNCHANGED => Ok(UNCHANGED),
+        id => c
+            .process
+            .credentials
+            .user
+            .kernel_of(ids, id)
+            .ok_or(Errno::EINVAL),
+    }
+}
+fn uids<const N: usize>(c: &Context<'_>, a: [u64; 6]) -> Result<[u32; N], Errno> {
+    let mut ids = [0; N];
+    for (slot, &value) in ids.iter_mut().zip(&a) {
+        *slot = kernel_id(c, crate::users::Ids::User, value)?;
+    }
+    Ok(ids)
+}
+fn gids<const N: usize>(c: &Context<'_>, a: [u64; 6]) -> Result<[u32; N], Errno> {
+    let mut ids = [0; N];
+    for (slot, &value) in ids.iter_mut().zip(&a) {
+        *slot = kernel_id(c, crate::users::Ids::Group, value)?;
+    }
+    Ok(ids)
+}
 pub(crate) fn sys_getuid(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
-    ok(u64::from(c.process.credentials.uid))
+    ok(u64::from(c.shown_uid(c.process.credentials.uid)))
 }
 pub(crate) fn sys_geteuid(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
-    ok(u64::from(c.process.credentials.euid))
+    ok(u64::from(c.shown_uid(c.process.credentials.euid)))
 }
 pub(crate) fn sys_getgid(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
-    ok(u64::from(c.process.credentials.gid))
+    ok(u64::from(c.shown_gid(c.process.credentials.gid)))
 }
 pub(crate) fn sys_getegid(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
-    ok(u64::from(c.process.credentials.egid))
+    ok(u64::from(c.shown_gid(c.process.credentials.egid)))
 }
 pub(crate) fn sys_setuid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let change = c.process.credentials.setuid(id(a[0]));
+    let change = uids::<1>(c, a).and_then(|[uid]| c.process.credentials.setuid(uid));
     set(c, change)
 }
 pub(crate) fn sys_setgid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let change = c.process.credentials.setgid(id(a[0]));
+    let change = gids::<1>(c, a).and_then(|[gid]| c.process.credentials.setgid(gid));
     set(c, change)
 }
 pub(crate) fn sys_setreuid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let change = c.process.credentials.setreuid(id(a[0]), id(a[1]));
+    let change = uids::<2>(c, a).and_then(|[r, e]| c.process.credentials.setreuid(r, e));
     set(c, change)
 }
 pub(crate) fn sys_setregid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let change = c.process.credentials.setregid(id(a[0]), id(a[1]));
+    let change = gids::<2>(c, a).and_then(|[r, e]| c.process.credentials.setregid(r, e));
     set(c, change)
 }
 pub(crate) fn sys_setresuid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let change = c
-        .process
-        .credentials
-        .setresuid(id(a[0]), id(a[1]), id(a[2]));
+    let change = uids::<3>(c, a).and_then(|[r, e, s]| c.process.credentials.setresuid(r, e, s));
     set(c, change)
 }
 pub(crate) fn sys_setresgid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let change = c
-        .process
-        .credentials
-        .setresgid(id(a[0]), id(a[1]), id(a[2]));
+    let change = gids::<3>(c, a).and_then(|[r, e, s]| c.process.credentials.setresgid(r, e, s));
     set(c, change)
 }
 /// `getresuid` and `getresgid`: the three IDs, each written in turn.
@@ -552,25 +654,30 @@ fn write_three(c: &mut Context<'_>, a: [u64; 6], ids: [u32; 3]) -> Outcome {
 }
 pub(crate) fn sys_getresuid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let s = &c.process.credentials;
-    let ids = [s.uid, s.euid, s.suid];
+    let ids = [s.uid, s.euid, s.suid].map(|id| c.shown_uid(id));
     write_three(c, a, ids)
 }
 pub(crate) fn sys_getresgid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let s = &c.process.credentials;
-    let ids = [s.gid, s.egid, s.sgid];
+    let ids = [s.gid, s.egid, s.sgid].map(|id| c.shown_gid(id));
     write_three(c, a, ids)
 }
-/// `setfsuid` and `setfsgid` return the old ID whether or not it changed.
+/// `setfsuid` and `setfsgid` return the old ID whether or not it changed;
+/// one the user namespace does not map changes nothing.
 pub(crate) fn sys_setfsuid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let old = c.process.credentials.fsuid;
-    if let Some(new) = c.process.credentials.setfsuid(id(a[0])) {
+    let old = c.shown_uid(c.process.credentials.fsuid);
+    if let Ok([uid]) = uids::<1>(c, a)
+        && let Some(new) = c.process.credentials.setfsuid(uid)
+    {
         commit(c, new);
     }
     ok(u64::from(old))
 }
 pub(crate) fn sys_setfsgid(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let old = c.process.credentials.fsgid;
-    if let Some(new) = c.process.credentials.setfsgid(id(a[0])) {
+    let old = c.shown_gid(c.process.credentials.fsgid);
+    if let Ok([gid]) = gids::<1>(c, a)
+        && let Some(new) = c.process.credentials.setfsgid(gid)
+    {
         commit(c, new);
     }
     ok(u64::from(old))
@@ -589,7 +696,10 @@ pub(crate) fn sys_getgroups(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if groups.len() > size as usize {
         return err(Errno::EINVAL);
     }
-    let bytes: Vec<u8> = groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+    let bytes: Vec<u8> = groups
+        .iter()
+        .flat_map(|&g| c.shown_gid(g).to_le_bytes())
+        .collect();
     match c.mem.write(GuestAddr(a[1]), &bytes) {
         Ok(()) => ok(groups.len() as u64),
         Err(_) => err(Errno::EFAULT),
@@ -696,10 +806,11 @@ pub(crate) fn sys_capset(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         .capset(effective, permitted, inheritable);
     set(c, change)
 }
-/// `setgroups(size, list)`: with CAP_SETGID, at most `NGROUPS_MAX` groups,
-/// none the ID that names no group; kept sorted.
+/// `setgroups(size, list)`: with CAP_SETGID, in a user namespace that
+/// allows it (`may_setgroups`), at most `NGROUPS_MAX` groups, none one the
+/// namespace does not map; kept sorted, as kernel IDs.
 pub(crate) fn sys_setgroups(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    if !c.process.credentials.may_setgid() {
+    if !c.process.credentials.may_setgid() || !c.process.credentials.user.may_setgroups() {
         return err(Errno::EPERM);
     }
     let size = u64::from(a[0] as u32);
@@ -717,8 +828,16 @@ pub(crate) fn sys_setgroups(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         .iter()
         .map(|&b| u32::from_le_bytes(b))
         .collect();
-    if groups.contains(&UNCHANGED) {
-        return err(Errno::EINVAL);
+    for group in &mut groups {
+        match c
+            .process
+            .credentials
+            .user
+            .kernel_of(crate::users::Ids::Group, *group)
+        {
+            Some(kernel) => *group = kernel,
+            None => return err(Errno::EINVAL),
+        }
     }
     groups.sort_unstable();
     let mut new = c.process.credentials.clone();
@@ -802,32 +921,47 @@ mod credentials_tests {
     #[test]
     fn scm_credentials_name_the_callers_own_ids_without_capabilities() {
         let root = Credentials::default();
-        assert!(root.may_send_credentials(false, 4000, 4100));
+        assert!(root.may_send_credentials(false, crate::users::first(), 4000, 4100));
         let user = root
             .setresgid(1100, 2100, 3100)
             .unwrap()
             .setresuid(1000, 2000, 3000)
             .unwrap();
         for uid in [1000, 2000, 3000] {
-            assert!(user.may_send_credentials(true, uid, 1100), "{uid}");
+            assert!(
+                user.may_send_credentials(true, crate::users::first(), uid, 1100),
+                "{uid}"
+            );
         }
         for gid in [1100, 2100, 3100] {
-            assert!(user.may_send_credentials(true, 1000, gid), "{gid}");
+            assert!(
+                user.may_send_credentials(true, crate::users::first(), 1000, gid),
+                "{gid}"
+            );
         }
-        assert!(!user.may_send_credentials(false, 1000, 1100), "a process");
-        assert!(!user.may_send_credentials(true, 4000, 1100), "a user");
-        assert!(!user.may_send_credentials(true, 1000, 4100), "a group");
+        assert!(
+            !user.may_send_credentials(false, crate::users::first(), 1000, 1100),
+            "a process"
+        );
+        assert!(
+            !user.may_send_credentials(true, crate::users::first(), 4000, 1100),
+            "a user"
+        );
+        assert!(
+            !user.may_send_credentials(true, crate::users::first(), 1000, 4100),
+            "a group"
+        );
         // Each capability allows its own part alone.
         let with = |capability| Credentials {
             effective: capability,
             ..user.clone()
         };
-        assert!(with(CAP_SYS_ADMIN).may_send_credentials(false, 1000, 1100));
-        assert!(!with(CAP_SYS_ADMIN).may_send_credentials(true, 4000, 4100));
-        assert!(with(CAP_SETUID).may_send_credentials(true, 4000, 1100));
-        assert!(!with(CAP_SETUID).may_send_credentials(false, 4000, 4100));
-        assert!(with(CAP_SETGID).may_send_credentials(true, 1000, 4100));
-        assert!(!with(CAP_SETGID).may_send_credentials(true, 4000, 4100));
+        assert!(with(CAP_SYS_ADMIN).may_send_credentials(false, crate::users::first(), 1000, 1100));
+        assert!(!with(CAP_SYS_ADMIN).may_send_credentials(true, crate::users::first(), 4000, 4100));
+        assert!(with(CAP_SETUID).may_send_credentials(true, crate::users::first(), 4000, 1100));
+        assert!(!with(CAP_SETUID).may_send_credentials(false, crate::users::first(), 4000, 4100));
+        assert!(with(CAP_SETGID).may_send_credentials(true, crate::users::first(), 1000, 4100));
+        assert!(!with(CAP_SETGID).may_send_credentials(true, crate::users::first(), 4000, 4100));
     }
     #[test]
     fn another_threads_priority_needs_the_effective_id_or_cap_sys_nice() {

@@ -123,6 +123,10 @@ impl Task {
     /// Its files' owner: the task's effective IDs, as Linux's
     /// `task_dump_owner` gives a dumpable task's, and root an undumpable
     /// one's.
+    /// The user namespace of the task's credentials.
+    pub(super) fn user(&self) -> std::sync::Arc<crate::namespaces::Namespace> {
+        std::sync::Arc::clone(&self.public.credentials.user.0)
+    }
     fn owned(&self, stat: FileStat) -> FileStat {
         let ids = &self.public.credentials;
         let (uid, gid) = if self.view.dumpable {
@@ -148,7 +152,7 @@ impl Task {
             (reader.fsuid, reader.fsgid)
         };
         self.pid == c.process.pid
-            || (reader.effective & CAP_SYS_PTRACE != 0
+            || (reader.capable_in(CAP_SYS_PTRACE, &target.user)
                 || self.view.dumpable
                     && [target.uid, target.euid, target.suid] == [uid; 3]
                     && [target.gid, target.egid, target.sgid] == [gid; 3])
@@ -171,11 +175,17 @@ pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<()
 
 /// The contents of `status`, `stat`, `cmdline` or `comm`; `None` for any
 /// other entry.
-pub(super) fn content(task: &Task, entry: TaskEntry) -> Option<Vec<u8>> {
+pub(super) fn content(
+    task: &Task,
+    entry: TaskEntry,
+    reader: &crate::namespaces::Namespace,
+) -> Option<Vec<u8>> {
     let public = &task.public;
     let (ignored, caught) = task.handled();
     Some(match entry {
         TaskEntry::Comm => crate::proc::render_comm(&public.name),
+        TaskEntry::IdMap(ids) => public.credentials.user.map_text(ids, reader),
+        TaskEntry::Setgroups => public.credentials.user.setgroups_text().to_vec(),
         // The argument or environment strings as they are in its memory now;
         // nothing for a zombie.
         TaskEntry::Cmdline | TaskEntry::Environ => {
@@ -244,6 +254,7 @@ pub(super) fn content(task: &Task, entry: TaskEntry) -> Option<Vec<u8>> {
             caught,
             no_new_privs: task.view.no_new_privs,
             credentials: &public.credentials,
+            reader,
         }),
         _ => return None,
     })
@@ -309,10 +320,20 @@ pub(super) fn stat(
         }
         TaskEntry::Namespace(_) => crate::proc::self_link_stat(),
         TaskEntry::Missing => return Err(Errno::ENOENT),
-        TaskEntry::Environ => {
-            crate::proc::private_stat(content(task, entry).map_or(0, |content| content.len()))
+        // 0644, which their owner may write.
+        TaskEntry::IdMap(_) | TaskEntry::Setgroups => {
+            let length = content(task, entry, &c.process.credentials.user).map_or(0, |c| c.len());
+            FileStat {
+                mode: 0o100_644,
+                ..crate::proc::stat(length)
+            }
         }
-        _ => crate::proc::stat(content(task, entry).map_or(0, |content| content.len())),
+        TaskEntry::Environ => crate::proc::private_stat(
+            content(task, entry, &c.process.credentials.user).map_or(0, |content| content.len()),
+        ),
+        _ => crate::proc::stat(
+            content(task, entry, &c.process.credentials.user).map_or(0, |content| content.len()),
+        ),
     };
     Ok((task.owned(stat), device(c, path), SMALL_BLOCK_SIZE))
 }

@@ -159,13 +159,19 @@ pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128
     } else if let Some(child) = signal.child {
         // Times are in USER_HZ ticks.
         info[16..20].copy_from_slice(&child.pid.to_le_bytes());
-        info[20..24].copy_from_slice(&child.uid.to_le_bytes());
+        // User IDs as the receiver's user namespace shows them.
+        let uid = process
+            .credentials
+            .user
+            .shown(crate::users::Ids::User, child.uid);
+        info[20..24].copy_from_slice(&uid.to_le_bytes());
         info[24..28].copy_from_slice(&child.status.to_le_bytes());
         info[32..40].copy_from_slice(&(child.cpu / 10_000_000).to_le_bytes());
     } else if signal.code != SI_KERNEL {
         let sender = signal.sender.unwrap_or(process.pid);
         info[16..20].copy_from_slice(&sender.to_le_bytes());
         let uid = signal.sender_uid.unwrap_or(process.credentials.uid);
+        let uid = process.credentials.user.shown(crate::users::Ids::User, uid);
         info[20..24].copy_from_slice(&uid.to_le_bytes());
     }
     info

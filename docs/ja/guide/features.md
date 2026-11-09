@@ -597,12 +597,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   で捨てるセマフォーの調整値はありません。名前空間のフラグは、次のとおりスレッドに新しい
   名前空間を与えます。
 - スレッドは、Linux の `nsproxy` と同じく自分の名前空間を持ちます。UTS・IPC・マウント・
-  cgroup・time・PID・ネットワークの名前空間は自分のもので、ユーザーの名前空間は最初の
-  ものです。`CLONE_NEWUTS`、`CLONE_NEWIPC`、`CLONE_NEWNS`、`CLONE_NEWCGROUP`、
-  `CLONE_NEWTIME`、`CLONE_NEWPID`、`CLONE_NEWNET` を付けた `unshare` はスレッドに新しい
-  名前空間を与え、
-  `clone` も子に（`CLONE_NEWPID` を除いてスレッドにも）与えます（`CLONE_NEWTIME` は
-  `clone3` で付けます）。どれも `CAP_SYS_ADMIN` が要ります（なければ `EPERM`）。新しい UTS 名前空間はホスト名と
+  cgroup・time・PID・ネットワーク・ユーザーの名前空間は自分のものです（ユーザーの名前空間は
+  資格情報が持ちます）。`CLONE_NEWUTS`、`CLONE_NEWIPC`、`CLONE_NEWNS`、`CLONE_NEWCGROUP`、
+  `CLONE_NEWTIME`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWUSER` を付けた `unshare` は
+  スレッドに新しい名前空間を与え、`clone` も子に（`CLONE_NEWPID` と `CLONE_NEWUSER` を
+  除いてスレッドにも）与えます（`CLONE_NEWTIME` は `clone3` で付けます）。新しいユーザーの
+  名前空間には特権が要りません。ほかの名前空間には、そのときスレッドが持つユーザーの名前空間での
+  `CAP_SYS_ADMIN` が要り（なければ `EPERM`）、いっしょに作る新しいユーザーの名前空間が
+  それを与えます。新しい UTS 名前空間はホスト名と
   ドメイン名の写しで始まり、その後の `sethostname` と `setdomainname` はその名前空間だけを
   変えます。新しい time 名前空間は、スレッドの子が入るものです。メモリーを共有しない子は
   それに入り、スレッドもプログラムを実行するとそれに入ります。`clone` は、Linux と同じく
@@ -613,15 +615,43 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   開くと名前空間のファイルになります。これはハンドルで、読み書きは `EINVAL`、シークは
   `ESPIPE` で、inode はその番号です。`setns` は、そのファイルの名前空間（`nstype` は
   その種類か 0）か、pidfd のプロセスの名前空間のうち `nstype` で指定したものに入ります。
-  確かめる中身と順番は Linux と同じです。スレッド自身のユーザー名前空間は `EINVAL`、
-  time 名前空間はスレッドがメモリーの中でひとりであること（`EUSERS`）、マウント名前空間に
-  それだけで入るときはほかのスレッドと共有しない作業ディレクトリー（`EINVAL`）と
-  `CAP_SYS_CHROOT`、どの名前空間も `CAP_SYS_ADMIN`（`EPERM`）が要り、PID 名前空間は
-  スレッド自身のものか、その中のものでなければなりません（`EINVAL`）。マウント
+  確かめる中身と順番は Linux と同じです。ユーザーの名前空間は、スレッド自身のものでも、
+  メモリーか作業ディレクトリーをほかと共有するスレッドでもいけず（`EINVAL`）、その中での
+  `CAP_SYS_ADMIN` が要り、入るとそこでのすべてのケーパビリティを持ちます。time 名前空間は
+  スレッドがメモリーの中でひとりであること（`EUSERS`）、マウント名前空間にそれだけで入る
+  ときはほかのスレッドと共有しない作業ディレクトリー（`EINVAL`）と `CAP_SYS_CHROOT`、
+  どの名前空間も、それを持つユーザーの名前空間とスレッド自身のものでの `CAP_SYS_ADMIN`
+  （`EPERM`）が要り、PID 名前空間はスレッド自身のものか、その中のものでなければなりません
+  （`EINVAL`）。マウント
   名前空間に入ると、作業ディレクトリーはその root に移り、PID 名前空間に入ると、それが
   スレッドの子に番号を付ける名前空間になり、ネットワーク名前空間に入ると、それが
   スレッドが新しく作るソケットの名前空間になります。新しく作れない名前空間は
   [制限](./limitations.md)を見てください。
+- 新しいユーザーの名前空間は、Linux の `create_user_ns` と同じく、スレッドのものの中に
+  入れ子になり、その実効ユーザーが持ち主です（そのユーザーかグループに中での ID がなければ
+  `EPERM`、32 段を超えると `ENOSPC`）。スレッドはその中と、いっしょに作った名前空間で
+  すべてのケーパビリティを持ちます。カーネルは ID を最初のユーザーの名前空間のものとして
+  持ち、システムコールは呼び出し元の名前空間の対応表で ID を受け渡しします。対応のない ID は
+  65534（`overflowuid`）に見え、渡すと `EINVAL` です。これは `get*id` と `set*id`、
+  `setgroups`、`getgroups`、`stat` と `statx`、`chown` の仲間、シグナルと `waitid` の
+  `si_uid`、`SCM_CREDENTIALS` と `SO_PEERCRED`、`shmctl`、`/proc/<pid>/status`、コアで
+  同じです。`set*id`・`access`・exec のケーパビリティの規則でのルートは、名前空間が 0 に
+  対応させる ID で、持ち主かグループに対応のない set-user-ID のプログラムは呼び出し元の
+  ままで動きます。ケーパビリティは、Linux の `cap_capable` と同じく、スレッド自身の
+  ユーザーの名前空間と、その実効ユーザーが作った入れ子の名前空間で効きます。ファイルには
+  名前空間がその持ち主とグループに対応を持つときだけ、名前空間（ホスト名の設定、`setns`、
+  `SIOCSIFFLAGS`、System V の共有メモリ）にはそれを持つユーザーの名前空間でのもの、ほかの
+  プロセス（`kill`、`ptrace` のアクセス、優先度、リソース制限）にはそのユーザーの名前空間での
+  もの、マシン全体（`RENAME_WHITEOUT`、リアルタイムのスケジューリング、`vhangup`、`trusted.*` の属性
+  など）には最初のユーザーの名前空間でのものだけが効きます。`/proc/<pid>/uid_map` と
+  `gid_map` は、タスクのユーザーの名前空間の範囲を、下の ID を読み手の名前空間のもの
+  （自分の名前空間なら親のもの）で読みます。書き込みは、3 つの数の行を 340 行までの 1 回だけで、
+  確かめる中身と順番は Linux の `proc_uid_map_write`・`map_write`・`new_idmap_permitted` と
+  同じです。その名前空間かその親の、中で `CAP_SYS_ADMIN` を持つスレッドから書き、持ち主は
+  自分の実効 ID だけを対応させられます（グループは `setgroups` を `deny` にしてから）。
+  ほかの対応には親での `CAP_SETUID` か `CAP_SETGID` が、親のルートの対応には
+  `CAP_SETFCAP` が要ります。`/proc/<pid>/setgroups` は `allow` か `deny` を読み、gid の
+  対応表より前に書けます。`setgroups` には、それが `allow` で gid の対応表があることが要ります。
 - 新しい PID 名前空間は、Linux と同じく、スレッドの子に番号を付ける名前空間です。
   スレッド自身は元の名前空間に残り、`pid_for_children` のリンクは、最初の子
   （名前空間の init で、番号は 1）ができるまで `ENOENT` です。子が新しい名前空間に

@@ -1249,11 +1249,11 @@ impl Kernel {
         let task = self.processes.charge_task()?;
         // copy_namespaces; CLONE_NEWIPC leaves the semaphore adjustments,
         // which CLONE_SYSVSEM would share.
-        crate::namespaces::check(namespaces, parent.state.credentials.may_administer())?;
+        crate::namespaces::check(namespaces, parent.state.credentials.administers_own())?;
         if namespaces & crate::namespaces::CLONE_NEWIPC != 0 && flags & 0x40000 != 0 {
             return Err(Errno::EINVAL);
         }
-        let child_namespaces = own.for_child(namespaces, true)?;
+        let child_namespaces = own.for_child(namespaces, true, &parent.state.credentials.user.0)?;
         let tid = self.processes.allocate()?;
         if tid > i32::MAX as u32 {
             return Err(Errno::EAGAIN);

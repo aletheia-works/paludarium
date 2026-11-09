@@ -2162,7 +2162,11 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .map_err(|_| Errno::EFAULT)?;
             request[15] = 0;
             let flags = u16::from_le_bytes([request[16], request[17]]);
-            let admin = c.process.credentials.effective & CAP_NET_ADMIN != 0;
+            let namespaces = c.group.namespaces(c.tid);
+            let admin = c
+                .process
+                .credentials
+                .capable_in(CAP_NET_ADMIN, namespaces.net.owner());
             let value = socket
                 .network()
                 .interface(&request[..16], a[1], flags, admin)?;
@@ -2403,10 +2407,15 @@ fn sys_uname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// `sethostname(name, len)` and `setdomainname`, as Linux's: CAP_SYS_ADMIN
-/// (`EPERM`), then a length of at most 64 (`EINVAL`), then the name, which
-/// may hold any bytes, into the thread's UTS namespace.
+/// over the thread's UTS namespace (`EPERM`), then a length of at most 64
+/// (`EINVAL`), then the name, which may hold any bytes, into it.
 fn set_uts_name(c: &mut Context<'_>, a: [u64; 6], host: bool) -> Outcome {
-    if !c.process.credentials.may_administer() {
+    let namespaces = c.group.namespaces(c.tid);
+    if !c
+        .process
+        .credentials
+        .capable_in(crate::credentials::CAP_SYS_ADMIN, namespaces.uts.owner())
+    {
         return err(Errno::EPERM);
     }
     let Ok(length) = usize::try_from(a[1] as i64) else {

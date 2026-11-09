@@ -1063,3 +1063,73 @@ fn a_thread_tlb_never_keeps_a_file_or_its_owner_alive() {
         },
     ));
 }
+
+#[test]
+fn a_page_gone_leaves_the_meter_though_another_thread_still_holds_it() {
+    // The other thread does not run again until after the check, so its TLB
+    // still has the entry: only the bytes, not the charge.
+    let meter = Arc::new(MemoryMeter::new(16 * PAGE_SIZE));
+    let space = Arc::new(space(4, Prot::READ_WRITE).with_memory_meter(Arc::clone(&meter)));
+    for page in 0..4 {
+        space.write(GuestAddr(AT + page * PAGE_SIZE), &[1]).unwrap();
+    }
+    assert_eq!(meter.used(), 4 * PAGE_SIZE);
+    let (held, wait_held) = std::sync::mpsc::channel();
+    let (go, wait_go) = std::sync::mpsc::channel::<()>();
+    let holding = Arc::clone(&space);
+    let thread = std::thread::spawn(move || {
+        for page in 0..4 {
+            assert_eq!(used(&holding, AT + page * PAGE_SIZE), 1);
+        }
+        held.send(()).unwrap();
+        wait_go.recv().unwrap();
+        // Its next access sees the change.
+        assert!(!holding.read(GuestAddr(AT), &mut [0]).unwrap_err().mapped);
+    });
+    wait_held.recv().unwrap();
+    space.unmap_shared(GuestAddr(AT), 4 * PAGE_SIZE).unwrap();
+    assert_eq!(meter.used(), 0);
+    // So there is room for as many new frames again.
+    let fresh = space
+        .map_shared(
+            None,
+            16 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    for page in 0..16 {
+        space
+            .write(GuestAddr(fresh.0 + page * PAGE_SIZE), &[2])
+            .unwrap();
+    }
+    go.send(()).unwrap();
+    thread.join().unwrap();
+}
+
+#[test]
+fn a_thread_holds_a_thousand_pages_without_a_lock() {
+    // The size the docs give, not `TLB_ENTRIES`, so that a smaller TLB fails.
+    let pages = 1024;
+    let space = Arc::new(space(pages, Prot::READ_WRITE));
+    for page in 0..pages {
+        space
+            .write(GuestAddr(AT + page * PAGE_SIZE), &[page as u8])
+            .unwrap();
+    }
+    assert!(finishes_while_held(
+        &space,
+        Held::Both,
+        SHOULD_FINISH,
+        move |space| {
+            for page in 0..pages {
+                used(space, AT + page * PAGE_SIZE);
+            }
+        },
+        move |space| {
+            for page in 0..pages {
+                assert_eq!(byte(space, AT + page * PAGE_SIZE), page as u8);
+            }
+        },
+    ));
+}

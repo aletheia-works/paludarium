@@ -264,6 +264,7 @@ impl SyscallTable {
         handlers.insert(65, crate::sem::sys_semop);
         handlers.insert(66, crate::sem::sys_semctl);
         handlers.insert(220, crate::sem::sys_semtimedop);
+        handlers.insert(334, crate::rseq::sys_rseq);
         handlers.insert(444, |c, a| {
             Outcome::Return(
                 crate::landlock::sys_create_ruleset(c, a).unwrap_or_else(Errno::to_syscall_return),
@@ -2636,19 +2637,23 @@ fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     ok(0)
 }
 
-/// `getcpu(cpu, node, cache)`: the CPU the thread runs on, the lowest its
-/// mask allows, and NUMA node 0, each written where its pointer is not NULL;
-/// `EFAULT` when one cannot be written, as Linux, which still writes the
-/// other. The cache is ignored, as on Linux.
+/// `getcpu(cpu, node, cache)`: the CPU the thread runs on, and NUMA node 0,
+/// each written where its pointer is not NULL; `EFAULT` when one cannot be
+/// written, as Linux, which still writes the other. The cache is ignored,
+/// as on Linux. A thread with `rseq` runs on a virtual CPU, the one its area
+/// shows; another on none, so it reports the lowest its mask allows.
 fn sys_getcpu(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let cpu = c.group.affinity(c.tid).map_or(0, |set| {
-        set.iter()
-            .enumerate()
-            .find(|(_, word)| **word != 0)
-            .map_or(0, |(index, word)| {
-                index * 64 + word.trailing_zeros() as usize
-            })
-    }) as u32;
+    let cpu = c.process.on_cpu.map(|on| on.cpu);
+    let cpu = cpu.unwrap_or_else(|| {
+        c.group.affinity(c.tid).map_or(0, |set| {
+            set.iter()
+                .enumerate()
+                .find(|(_, word)| **word != 0)
+                .map_or(0, |(index, word)| {
+                    index * 64 + word.trailing_zeros() as usize
+                })
+        }) as u32
+    });
     let mut failed = false;
     for (address, value) in [(a[0], cpu), (a[1], 0)] {
         if address != 0 {
@@ -2856,7 +2861,11 @@ fn sys_sched_getattr(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// fork copies and an exec starts without. Each barrier is one on every
 /// thread of the address space ([`AddressSpace::barrier`]). Other processes
 /// share only shared memory, whose every access takes the session's
-/// serialization lock, which the barrier takes too.
+/// serialization lock, which the barrier takes too. `PRIVATE_EXPEDITED_RSEQ`
+/// also aborts the `rseq` critical sections of the space's other threads
+/// (of the one on the CPU `cpu_id` names, with the flag, and of none for a
+/// CPU past the machine's), as Linux's interrupts do, and returns once those
+/// that were running guest code have stopped since.
 fn sys_membarrier(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     use std::sync::atomic::Ordering;
     const QUERY: i32 = 0;
@@ -2916,7 +2925,30 @@ fn sys_membarrier(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         REGISTER_PRIVATE_EXPEDITED => register(PRIVATE, PRIVATE_READY),
         PRIVATE_EXPEDITED_SYNC_CORE => barrier(SYNC_CORE_READY),
         REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => register(PRIVATE | SYNC_CORE, SYNC_CORE_READY),
-        PRIVATE_EXPEDITED_RSEQ => barrier(RSEQ_READY),
+        PRIVATE_EXPEDITED_RSEQ => {
+            if state.load(Ordering::SeqCst) & RSEQ_READY == 0 {
+                return err(Errno::EPERM);
+            }
+            // A negative CPU is every CPU, as Linux's
+            // membarrier_private_expedited takes it.
+            let cpu = (flags & FLAG_CPU != 0).then_some(a[2] as u32 as i32);
+            let cpus = &c.processes.cpus;
+            if let Some(cpu) = cpu.filter(|&cpu| cpu >= 0)
+                && cpu as usize >= c.host.cpu_count().clamp(1, 8192)
+            {
+                return ok(0);
+            }
+            c.mem.barrier();
+            crate::rseq::restart_others(
+                cpus,
+                c.host,
+                c.cancellation,
+                std::ptr::from_ref(c.mem).addr(),
+                c.process.on_cpu.map(|on| on.runner),
+                cpu.filter(|&cpu| cpu >= 0).map(|cpu| cpu as u32),
+            );
+            ok(0)
+        }
         REGISTER_PRIVATE_EXPEDITED_RSEQ => register(PRIVATE | RSEQ, RSEQ_READY),
         GET_REGISTRATIONS => {
             let state = state.load(Ordering::SeqCst);

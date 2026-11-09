@@ -253,7 +253,23 @@ impl MemoryMeter {
     }
 }
 
-/// The bytes of one page frame, charged to the meter while they exist.
+/// The bytes of one page frame ([`FrameData`]), charged to the meter while
+/// the page tables or shared memory hold them: a thread's [`Tlb`] holds only
+/// the bytes, so the frames of a page that is gone leave the meter at once,
+/// though a thread that has not run since may still hold their bytes.
+struct FrameBytes {
+    data: Arc<FrameData>,
+    meter: Option<Arc<MemoryMeter>>,
+}
+
+impl std::ops::Deref for FrameBytes {
+    type Target = FrameData;
+    fn deref(&self) -> &FrameData {
+        &self.data
+    }
+}
+
+/// The contents of a page frame.
 ///
 /// The words are read with `Acquire` and written with `Release` (a piece of
 /// a word with an `AcqRel` read-modify-write), which keeps the orders x86
@@ -266,11 +282,10 @@ impl MemoryMeter {
 /// write other bytes of one word at once, so a piece of a word is always
 /// written with a read-modify-write of the word, which keeps the others'.
 /// A locked instruction within one word is one too ([`Self::update`]).
-struct FrameBytes {
+struct FrameData {
     /// The bytes as little-endian words, so that an aligned word of a guest
     /// takes one atomic access, where each byte would take its own.
     words: Box<[AtomicU64]>,
-    meter: Option<Arc<MemoryMeter>>,
     /// A guest store changed the bytes since [`SharedPages::write_back`]
     /// last took them.
     dirty: AtomicBool,
@@ -292,11 +307,13 @@ impl FrameBytes {
             return None;
         }
         Some(FrameBytes {
-            words: words(),
+            data: Arc::new(FrameData {
+                words: words(),
+                dirty: AtomicBool::new(false),
+                spanning_started: AtomicU64::new(0),
+                spanning_finished: AtomicU64::new(0),
+            }),
             meter: meter.cloned(),
-            dirty: AtomicBool::new(false),
-            spanning_started: AtomicU64::new(0),
-            spanning_finished: AtomicU64::new(0),
         })
     }
 }
@@ -324,7 +341,7 @@ fn page_words(bytes: &[u8]) -> Box<[AtomicU64]> {
         .collect()
 }
 
-impl FrameBytes {
+impl FrameData {
     /// Copies the bytes from `offset`, which must stay inside the page, to
     /// `buf`.
     #[inline]
@@ -965,8 +982,10 @@ pub struct Remap {
     pub new_addr: GuestAddr,
 }
 
-/// How many pages the [`Tlb`] remembers.
-const TLB_ENTRIES: usize = 64;
+/// How many pages the [`Tlb`] remembers. An entry holds the bytes of its
+/// frame, not its charge to the meter ([`TlbFrame`]), so more of them keep
+/// no more guest memory.
+const TLB_ENTRIES: usize = 1024;
 
 /// A populated page, as the page table held it: an access that stays inside
 /// it needs only its protection checked, as [`AddressSpaceData::check`]
@@ -974,7 +993,7 @@ const TLB_ENTRIES: usize = 64;
 struct TlbEntry {
     page: u64,
     prot: Prot,
-    frame: Frame,
+    frame: TlbFrame,
     cow: bool,
     file: Option<FileEnd>,
     /// The bookkeeping of the shared mapping's memory the page shows, whose
@@ -1022,7 +1041,7 @@ impl FileEnd {
 /// The frame a store through a [`Tlb`] writes, whether its page is
 /// executable, and the shared mapping's memory it shows, if any.
 struct StoreTarget<'a> {
-    frame: &'a FrameBytes,
+    frame: &'a FrameData,
     code: bool,
     shared: Option<&'a SharedStores>,
 }
@@ -1042,32 +1061,60 @@ impl SharedStores {
     }
 }
 
+/// The frame of a [`TlbEntry`]: its bytes, which keep no charge to the
+/// meter alive ([`FrameBytes`]), or, before it has any, the frame itself, as
+/// another space that shares it may give it bytes without this one's lock.
+enum TlbFrame {
+    Bytes(Arc<FrameData>),
+    Empty(Frame),
+}
+
+impl TlbFrame {
+    fn of(frame: &Frame) -> Self {
+        match frame.get() {
+            Some(bytes) => TlbFrame::Bytes(Arc::clone(&bytes.data)),
+            None => TlbFrame::Empty(Arc::clone(frame)),
+        }
+    }
+    /// The bytes, or `None` while the page reads as zeros.
+    #[inline]
+    fn get(&self) -> Option<&FrameData> {
+        match self {
+            TlbFrame::Bytes(data) => Some(data),
+            TlbFrame::Empty(frame) => frame.get().map(|bytes| &*bytes.data),
+        }
+    }
+}
+
 /// The pages the latest accesses used, so that the next ones skip the page
 /// table, the mappings and the locks of the directory. It is emptied before
 /// anything can change a page entry or a mapping: when the directory is
 /// locked for writing, and whenever the space is borrowed mutably. Each host
 /// thread has one, which it uses without a lock ([`ThreadTlb`]).
 struct Tlb {
-    entries: [Option<TlbEntry>; TLB_ENTRIES],
-    /// Which entries are set, so that emptying touches only those.
-    used: u64,
+    entries: Box<[Option<TlbEntry>]>,
+    /// Which entries are set, one bit each, so that emptying touches only
+    /// those.
+    used: [u64; TLB_ENTRIES / 64],
 }
 
 impl Default for Tlb {
     fn default() -> Self {
         Tlb {
-            entries: std::array::from_fn(|_| None),
-            used: 0,
+            entries: std::iter::repeat_with(|| None).take(TLB_ENTRIES).collect(),
+            used: [0; TLB_ENTRIES / 64],
         }
     }
 }
 
 impl Tlb {
+    #[inline]
     fn slot(page: u64) -> usize {
-        // The remainder is below 64, so it always fits in usize.
+        // The remainder is below TLB_ENTRIES, so it always fits in usize.
         usize::try_from((page / PAGE_SIZE) % TLB_ENTRIES as u64).unwrap_or(0)
     }
 
+    #[inline]
     fn get(&self, page: u64) -> Option<&TlbEntry> {
         self.entries[Self::slot(page)]
             .as_ref()
@@ -1077,14 +1124,16 @@ impl Tlb {
     fn insert(&mut self, entry: TlbEntry) {
         let slot = Self::slot(entry.page);
         self.entries[slot] = Some(entry);
-        self.used |= 1 << slot;
+        self.used[slot / 64] |= 1 << (slot % 64);
     }
 
     fn flush(&mut self) {
-        while self.used != 0 {
-            let slot = self.used.trailing_zeros() as usize;
-            self.entries[slot] = None;
-            self.used &= self.used - 1;
+        for (word, used) in self.used.iter_mut().enumerate() {
+            while *used != 0 {
+                let slot = word * 64 + used.trailing_zeros() as usize;
+                self.entries[slot] = None;
+                *used &= *used - 1;
+            }
         }
     }
 }
@@ -1093,9 +1142,10 @@ impl Tlb {
 /// loads, stores, fetches and locked instructions that take no lock. Its
 /// entries are those of the space whose epoch ([`CodeCounters::epoch`]) it
 /// holds, and only while that space keeps the epoch: each access compares
-/// the two, and empties the TLB when they differ. An entry holds its frame,
-/// so a frame stays as long as an entry of another thread shows it, until
-/// that thread's next access.
+/// the two, and empties the TLB when they differ. An entry holds the bytes
+/// of its frame ([`TlbFrame`]), so they stay as long as an entry of another
+/// thread shows them, until that thread's next access, though the meter no
+/// longer counts them.
 ///
 /// A load that read the epoch before another thread changed it may still
 /// use the page it showed, as an x86 load already under way when another
@@ -1934,7 +1984,7 @@ impl AddressSpaceData {
             thread.tlb.insert(TlbEntry {
                 page,
                 prot: p.prot,
-                frame: p.frame.clone(),
+                frame: TlbFrame::of(&p.frame),
                 cow: p.cow,
                 file,
                 shared,

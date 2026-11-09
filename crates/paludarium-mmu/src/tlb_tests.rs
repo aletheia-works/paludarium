@@ -158,6 +158,20 @@ fn fork_keeps_the_parent_and_the_child_apart() {
 }
 
 #[test]
+fn a_page_only_read_before_fork_gets_a_frame_in_each_space() {
+    // The parent reads the page, so that it has an entry but no contents.
+    let parent = space(1, Prot::READ_WRITE);
+    assert_eq!(used(&parent, AT), 0);
+    let child = parent.fork();
+    child.write(GuestAddr(AT), &[7]).unwrap();
+    assert_eq!(byte(&parent, AT), 0);
+    assert_eq!(used(&child, AT), 7);
+    parent.write(GuestAddr(AT + 1), &[8]).unwrap();
+    assert_eq!(byte(&child, AT + 1), 0);
+    assert_eq!(used(&parent, AT + 1), 8);
+}
+
+#[test]
 fn a_page_shared_after_fork_is_read_through_its_copy() {
     let parent = space(1, Prot::READ_WRITE);
     parent.write(GuestAddr(AT), &[1]).unwrap();

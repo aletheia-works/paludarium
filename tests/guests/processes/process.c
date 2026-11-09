@@ -7542,13 +7542,14 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "signal-io-wait")) {
         /* The O_ASYNC signals around waits. A stream whose reader waits
            gets none for the data, the peer's shutdown or its close that
-           ends the wait (Linux's SOCKWQ_ASYNC_WAITDATA) on at least one
-           of up to ten attempts, as Linux signals one whose reader ran
-           before the sender looked, where a datagram or packet socket
-           still signals. A send that found
-           the buffer full signals POLL_OUT only once three quarters of it
-           is free. A pipe write signals its reader before each wait. A
-           reader's child acts after a while (io_pause). */
+           ends the wait (Linux's SOCKWQ_ASYNC_WAITDATA), where a datagram
+           or packet socket still signals. Linux signals one whose reader
+           ran before the sender looked, so an attempt whose reader was
+           signalled is taken again, and the last of up to ten is printed
+           as it is. A send that found the buffer full signals POLL_OUT
+           only once three quarters of it is free. A pipe write signals
+           its reader before each wait. A reader's child acts after a
+           while (io_pause). */
         sigset_t set;
         sigemptyset(&set);
         sigaddset(&set, SIGIO);

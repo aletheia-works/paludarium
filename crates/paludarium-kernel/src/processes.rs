@@ -1,6 +1,7 @@
 //! Emulated process registry; no lock spans Host waits or guest execution.
 use crate::credentials::TaskIds;
 use crate::fasync::{FileOwner, OwnerKind, Reason};
+use crate::namespaces::Namespace;
 use crate::scheduling;
 use crate::{Kernel, Next, SignalInbox, Thread, ThreadGroup, ThreadState, signals};
 use paludarium_cpu::{CpuState, reg};
@@ -59,6 +60,13 @@ struct Entry {
     /// The task the process counts as until it is reaped, as its leader does
     /// in Linux's pids controller even as a zombie.
     _task: TaskCharge,
+    /// The PID namespace it is in (Linux's `task_active_pid_ns`), which
+    /// numbers it, and the IDs it is shown, from its own up to the first.
+    space: Arc<Namespace>,
+    /// The init of a nested PID namespace whose exit waits for the rest of
+    /// the namespace to be gone, as Linux's `zap_pid_ns_processes` waits,
+    /// before its parent is told.
+    held: bool,
 }
 
 /// The tasks of a session and their limit, as a cgroup's `pids.current` and
@@ -156,6 +164,7 @@ pub struct Processes {
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
+        let space = group.namespaces(1).pid.clone();
         let tasks = Arc::new(TaskCount {
             live: AtomicU64::new(1),
             max: AtomicU64::new(u64::MAX),
@@ -192,6 +201,8 @@ impl Processes {
                     dumped: false,
                     terminal: None,
                     _task: TaskCharge(Arc::clone(&tasks)),
+                    space,
+                    held: false,
                 },
             )])),
             tasks,
@@ -251,6 +262,7 @@ impl Processes {
         group: Arc<ThreadGroup>,
         exit_signal: i32,
         task: TaskCharge,
+        space: Arc<Namespace>,
     ) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let (pgid, sid, limits, dumpable, no_new_privs, terminal) =
@@ -287,6 +299,8 @@ impl Processes {
                 dumped: false,
                 terminal,
                 _task: task,
+                space,
+                held: false,
             },
         );
     }
@@ -780,10 +794,10 @@ impl Processes {
         &self.changed
     }
     pub(crate) fn remove(&self, pid: u32) {
-        self.entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&pid);
+        Self::release(
+            &mut self.entries.lock().unwrap_or_else(PoisonError::into_inner),
+            pid,
+        );
     }
     pub(crate) fn locks(&self) -> &crate::record_locks::Locks {
         &self.locks
@@ -823,13 +837,21 @@ impl Processes {
         {
             Self::disassociate(&mut entries, pid, &terminal, false);
         }
-        // The first process is the init of the emulator's PID namespace: when
-        // it exits, every other process gets SIGKILL from the kernel, as in
-        // Linux's zap_pid_ns_processes.
-        if pid == 1 {
+        // The init of a PID namespace (the first process is the emulator's):
+        // when it exits, every other process the namespace numbers gets
+        // SIGKILL from the kernel, and no process may join a nested one any
+        // more, as in Linux's zap_pid_ns_processes.
+        let space = entries.get(&pid).map(|entry| entry.space.clone());
+        let zapped = space.filter(|space| space.init() == Some(pid));
+        if let Some(space) = &zapped {
+            if !space.is_first() {
+                space.close();
+            }
             let live: Vec<u32> = entries
                 .iter()
-                .filter(|&(&other, entry)| other != 1 && entry.status.is_none())
+                .filter(|&(&other, entry)| {
+                    other != pid && entry.status.is_none() && entry.space.is_within(space)
+                })
                 .map(|(&other, _)| other)
                 .collect();
             for other in live {
@@ -853,9 +875,18 @@ impl Processes {
                         crate::landlock::SCOPE_SIGNAL,
                     )
                 {
-                    let _ = child
+                    // From outside the child's PID namespace it is forced;
+                    // the init of one drops what it has no handler for.
+                    let from = child.space.number(pid);
+                    let blocked = child.group.blocked(child_pid);
+                    if !child
                         .group
-                        .send_process_from(child.death_signal, pid, sender.uid);
+                        .drops_as_init(child.death_signal, from == 0, blocked)
+                    {
+                        let _ = child
+                            .group
+                            .send_process_from(child.death_signal, from, sender.uid);
+                    }
                 }
             }
         }
@@ -882,17 +913,62 @@ impl Processes {
                     .is_some_and(|entry| entry.status.is_some())
                     && Self::notify_parent(&entries, orphan);
             }
+            // The exiting init of a nested PID namespace reaps a child that
+            // has already exited itself, as zap_pid_ns_processes does.
+            reaped |= zapped.as_ref().is_some_and(|space| !space.is_first())
+                && entries
+                    .get(&orphan)
+                    .is_some_and(|entry| entry.status.is_some());
             // As reparent_leader, also for a zombie reaped just now.
             Self::hang_up_orphaned(&mut entries, orphan, pid);
             if reaped {
-                entries.remove(&orphan);
+                Self::release(&mut entries, orphan);
             }
         }
         Self::hang_up_orphaned(&mut entries, pid, pid);
-        if Self::notify_parent(&entries, pid) {
-            entries.remove(&pid);
+        if let Some(space) = zapped.filter(|space| !space.is_first())
+            && Self::populated(&entries, &space, pid)
+        {
+            if let Some(entry) = entries.get_mut(&pid) {
+                entry.held = true;
+            }
+        } else if Self::notify_parent(&entries, pid) {
+            Self::release(&mut entries, pid);
         }
         self.changed.notify();
+    }
+    /// Whether a process other than `init` is in PID namespace `space` or
+    /// one nested in it.
+    fn populated(entries: &BTreeMap<u32, Entry>, space: &Namespace, init: u32) -> bool {
+        entries
+            .iter()
+            .any(|(&other, entry)| other != init && entry.space.is_within(space))
+    }
+    /// Removes process `pid`, which is reaped, and forgets its numbers, as
+    /// Linux's `release_task`. The init of a nested PID namespace that
+    /// waited for it to be gone now tells its parent.
+    fn release(entries: &mut BTreeMap<u32, Entry>, pid: u32) {
+        let Some(entry) = entries.remove(&pid) else {
+            return;
+        };
+        entry.space.leave(pid);
+        let held: Vec<u32> = entries
+            .iter()
+            .filter(|&(&init, other)| {
+                other.held
+                    && entry.space.is_within(&other.space)
+                    && !Self::populated(entries, &other.space, init)
+            })
+            .map(|(&init, _)| init)
+            .collect();
+        for init in held {
+            if let Some(other) = entries.get_mut(&init) {
+                other.held = false;
+            }
+            if Self::notify_parent(entries, init) {
+                Self::release(entries, init);
+            }
+        }
     }
     /// As Linux's kill_orphaned_pgrp, after `exiting` has exited: if `pid`
     /// (`exiting` itself or one of its children) was in a group that `exiting`
@@ -947,17 +1023,24 @@ impl Processes {
     /// which acts as the init of a PID namespace. None when that is `pid`
     /// itself or has exited.
     fn new_reaper(entries: &BTreeMap<u32, Entry>, pid: u32) -> Option<u32> {
+        let space = &entries.get(&pid)?.space;
         let mut ancestor = entries.get(&pid)?.parent;
-        while let Some(entry) = entries.get(&ancestor) {
+        // As find_new_reaper, only within the PID namespace.
+        while let Some(entry) = entries.get(&ancestor)
+            && Arc::ptr_eq(&entry.space, space)
+        {
             if entry.subreaper && entry.status.is_none() {
                 return Some(ancestor);
             }
             ancestor = entry.parent;
         }
+        // The init of a nested namespace takes them even once it has
+        // exited, and reaps them, as zap_pid_ns_processes does.
+        let init = space.init().filter(|&init| init != pid)?;
         entries
-            .get(&1)
-            .filter(|entry| pid != 1 && entry.status.is_none())
-            .map(|_| 1)
+            .get(&init)
+            .filter(|entry| !space.is_first() || entry.status.is_none())
+            .map(|_| init)
     }
     /// Tells the parent of `pid`, which has exited, as Linux's
     /// do_notify_parent: a SIGCHLD child of a parent that ignores SIGCHLD or
@@ -972,6 +1055,13 @@ impl Processes {
         let (Some(status), Some(parent)) = (entry.status, entries.get(&entry.parent)) else {
             return false;
         };
+        // The exited init of a nested PID namespace reaps its children.
+        if parent.status.is_some()
+            && !parent.space.is_first()
+            && parent.space.init() == Some(entry.parent)
+        {
+            return true;
+        }
         let (ignored, no_wait) = parent.group.child_exit_disposition();
         let reap = entry.exit_signal == signals::SIGCHLD && (ignored || no_wait);
         let (code, status) = match status {
@@ -985,7 +1075,7 @@ impl Processes {
             parent.group.notify_child(
                 code,
                 signals::ChildSignal {
-                    pid,
+                    pid: parent.space.number(pid),
                     uid: entry.group.task_ids(pid, pid).uid,
                     status,
                     cpu,
@@ -1017,10 +1107,12 @@ impl Processes {
     /// exit (removing the child), else an unreported stop, else an
     /// unreported continue. With `keep` (WNOWAIT) nothing is consumed.
     /// `ECHILD` when no child can be waited for: as in `do_wait`, an exited
-    /// child counts only with WEXITED or WCONTINUED.
+    /// child counts only with WEXITED or WCONTINUED. The child is given as
+    /// the waiter's PID namespace `space` numbers it.
     pub(crate) fn reap(
         &self,
         parent: u32,
+        space: &Namespace,
         wanted: Wanted,
         wait: WaitFor,
     ) -> Result<Option<(u32, ChildEvent, u64, u32)>, Errno> {
@@ -1042,6 +1134,10 @@ impl Processes {
             if !matching(pid, entry) {
                 return None;
             }
+            // A held init has not finished exiting yet.
+            if entry.held {
+                return None;
+            }
             let event = match entry.status {
                 Some(ExitStatus::Signaled(signal)) if entry.dumped => {
                     wait.exits.then_some(ChildEvent::Dumped(signal))
@@ -1055,13 +1151,14 @@ impl Processes {
             let cpu = entry.group.process_cpu().saturating_add(entry.children_cpu);
             Some((pid, event, cpu, entry.group.task_ids(pid, pid).uid))
         });
+        let number = ready.map(|(pid, ..)| space.number(pid));
         if let Some((pid, event, cpu, _)) = ready
             && !wait.keep
         {
             match event {
                 // A reaped child's CPU time joins its parent's children's.
                 ChildEvent::Exited(_) | ChildEvent::Dumped(_) => {
-                    entries.remove(&pid);
+                    Self::release(&mut entries, pid);
                     if let Some(parent) = entries.get_mut(&parent) {
                         parent.children_cpu = parent.children_cpu.saturating_add(cpu);
                     }
@@ -1078,7 +1175,9 @@ impl Processes {
                 }
             }
         }
-        Ok(ready)
+        Ok(ready
+            .zip(number)
+            .map(|((_, event, cpu, uid), number)| (number, event, cpu, uid)))
     }
     /// Stops `group` (process `pid`) on `signal`. A new group stop is
     /// recorded for the parent's wait, and the parent gets SIGCHLD unless it
@@ -1105,7 +1204,10 @@ impl Processes {
         if let Some(parent) = entries.get(&parent)
             && parent.group.wants_stop_notices()
         {
-            parent.group.notify_child(signals::CLD_STOPPED, child);
+            let pid = parent.space.number(pid);
+            parent
+                .group
+                .notify_child(signals::CLD_STOPPED, signals::ChildSignal { pid, ..child });
         }
     }
     /// Whether a live process other than `pid` runs in `space` (`CLONE_VM`
@@ -1178,6 +1280,7 @@ impl Processes {
             cpu,
             children_cpu: entry.children_cpu,
             start_stack,
+            space: entry.space.clone(),
         })
     }
     pub(crate) fn set_dumped(&self, pid: u32) {
@@ -1203,14 +1306,23 @@ impl Processes {
             Err(Errno(3))
         }
     }
-    /// `kill(target, number)` from `caller`, as Linux's kill_something_info:
-    /// a positive target is that process (or the process of that thread), 0
-    /// the caller's process group, -1 every process but the first and the
-    /// caller, and any other negative target the group `-target`. Zombies
-    /// count until they are reaped. With no process to send to it is `ESRCH`,
-    /// even for an invalid signal; otherwise a group succeeds if any member
-    /// took the signal, and -1 reports the last error.
-    fn kill(&self, caller: u32, sender: TaskIds, target: i32, number: i32) -> Result<(), Errno> {
+    /// `kill(target, number)` from `caller`, in PID namespace `space`, as
+    /// Linux's kill_something_info: a positive target is that process (or
+    /// the process of that thread), 0 the caller's process group, -1 every
+    /// process the namespace numbers but its init and the caller, and any
+    /// other negative target the group `-target`, the IDs as the namespace
+    /// numbers them. Zombies count until they are reaped. With no process
+    /// to send to it is `ESRCH`, even for an invalid signal; otherwise a
+    /// group succeeds if any member took the signal, and -1 reports the
+    /// last error.
+    fn kill(
+        &self,
+        caller: u32,
+        space: &Namespace,
+        sender: TaskIds,
+        target: i32,
+        number: i32,
+    ) -> Result<(), Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         // The processes, with the thread each is named by, whose credentials
         // decide: Linux signals a thread group through the task it finds.
@@ -1218,7 +1330,7 @@ impl Processes {
             // A thread's ID names its process, as Linux finds the task and
             // signals its thread group.
             pid if pid > 0 => {
-                let pid = pid.cast_unsigned();
+                let pid = Kernel::named(space, pid.cast_unsigned());
                 entries
                     .iter()
                     .find(|&(&key, entry)| {
@@ -1229,17 +1341,18 @@ impl Processes {
                     .collect()
             }
             -1 => entries
-                .keys()
-                .copied()
-                .filter(|&pid| pid != 1 && pid != caller)
-                .map(|pid| (pid, pid))
+                .iter()
+                .filter(|&(&pid, entry)| {
+                    pid != caller && entry.space.is_within(space) && space.number(pid) > 1
+                })
+                .map(|(&pid, _)| (pid, pid))
                 .collect(),
             i32::MIN => Vec::new(),
             group => {
                 let pgid = if group == 0 {
                     entries.get(&caller).ok_or(Errno(3))?.pgid
                 } else {
-                    group.unsigned_abs()
+                    Kernel::named(space, group.unsigned_abs())
                 };
                 entries
                     .iter()
@@ -1409,6 +1522,11 @@ impl Processes {
             .map(|(&key, _)| key)
             .ok_or(Errno(3))?;
         Self::check_kill(&entries, caller, &sender, found, pid, signal.number)?;
+        // The sender only decides whether the receiver sees it (`deliver`).
+        let signal = signals::PendingSignal {
+            sender: Some(caller),
+            ..signal
+        };
         self.send(&mut entries, found, None, signal)
     }
     /// `rt_tgsigqueueinfo` of `signal` to thread `tid` of process `tgid`.
@@ -1428,6 +1546,10 @@ impl Processes {
             return Err(Errno(3));
         }
         Self::check_kill(&entries, caller, &sender, tgid, tid, signal.number)?;
+        let signal = signals::PendingSignal {
+            sender: Some(caller),
+            ..signal
+        };
         self.send(&mut entries, tgid, Some(tid), signal)
     }
     /// [`Self::deliver`] for a process's `kill` or queued signal, which wakes
@@ -1469,6 +1591,29 @@ impl Processes {
         if number == 0 {
             return Ok(());
         }
+        // `si_pid` is the sender as the receiver's PID namespace numbers it,
+        // 0 from outside it, as Linux's `send_signal_locked` gives it; a
+        // signal from outside, or from the kernel, is forced.
+        let mut signal = signal;
+        let mut forced = signal.code == signals::SI_KERNEL;
+        if let Some(sender) = signal.sender {
+            let number = entry.space.number(sender);
+            forced |= number == 0;
+            signal.sender = Some(number);
+            // A queued siginfo keeps its own `si_pid`, but not from outside.
+            if number == 0
+                && let Some(queued) = signal.queued.as_mut()
+            {
+                queued[16..20].fill(0);
+            }
+        }
+        // The init of a nested PID namespace drops what it has no handler
+        // for, as the receiving thread (the leader for its process) blocks
+        // it or not; a signal it blocked it drops when it takes it.
+        let blocked = entry.group.blocked(thread.unwrap_or(pid));
+        if (1..=64).contains(&number) && entry.group.drops_as_init(number, forced, blocked) {
+            return Ok(());
+        }
         let send = |group: &ThreadGroup| match thread {
             Some(tid) => group.send_thread_signal(tid, signal),
             None => group.send_process_signal(signal),
@@ -1490,7 +1635,11 @@ impl Processes {
             if let Some(parent) = entries.get(&parent)
                 && parent.group.wants_stop_notices()
             {
-                parent.group.notify_child(signals::CLD_CONTINUED, child);
+                let pid = parent.space.number(pid);
+                parent.group.notify_child(
+                    signals::CLD_CONTINUED,
+                    signals::ChildSignal { pid, ..child },
+                );
             }
             return Ok(());
         }
@@ -1524,6 +1673,8 @@ pub(crate) enum Wanted {
     Pgid(u32),
 }
 
+/// No task's ID: what a number a PID namespace has not handed out names.
+pub(crate) const NOBODY: u32 = u32::MAX;
 const WNOHANG: u64 = 1;
 const WEXITED: u64 = 4;
 const WNOWAIT: u64 = 0x0100_0000;
@@ -1705,25 +1856,36 @@ impl Kernel {
             },
             61 => self.wait4(thread, mem, a),
             247 => self.waitid(thread, mem, a),
-            434 => self.pidfd_open(a),
+            434 => self.pidfd_open(thread, a),
             424 => self.pidfd_send_signal(thread, a),
             129 => self.sigqueueinfo(thread, mem, a),
             297 => self.tgsigqueueinfo(thread, mem, a),
-            110 => Ok(u64::from(self.processes.parent(self.process.pid))),
+            // The IDs these give are as the caller's PID namespace numbers
+            // them: 0 for a process outside it.
+            110 => Ok(u64::from(
+                self.pid_space(thread.tid)
+                    .number(self.processes.parent(self.process.pid)),
+            )),
             157 => self.prctl(thread, mem, a),
             // setpgid, getpgid, getpgrp
-            109 => self.setpgid(a),
+            109 => self.setpgid(thread, a),
             121 => self
-                .target_pid(a[0])
+                .target_pid(thread.tid, a[0])
                 .and_then(|pid| self.processes.pgid(pid))
-                .map(u64::from),
-            111 => self.processes.pgid(self.process.pid).map(u64::from),
+                .map(|id| u64::from(self.pid_space(thread.tid).number(id))),
+            111 => self
+                .processes
+                .pgid(self.process.pid)
+                .map(|id| u64::from(self.pid_space(thread.tid).number(id))),
             // setsid, getsid
-            112 => self.processes.set_sid(self.process.pid).map(u64::from),
+            112 => self
+                .processes
+                .set_sid(self.process.pid)
+                .map(|id| u64::from(self.pid_space(thread.tid).number(id))),
             124 => self
-                .target_pid(a[0])
+                .target_pid(thread.tid, a[0])
                 .and_then(|pid| self.processes.sid(pid))
-                .map(u64::from),
+                .map(|id| u64::from(self.pid_space(thread.tid).number(id))),
             // getpriority, setpriority
             140 => self.getpriority(thread, a),
             141 => self.setpriority(thread, a),
@@ -1746,6 +1908,7 @@ impl Kernel {
                 .processes
                 .kill(
                     self.process.pid,
+                    &self.pid_space(thread.tid),
                     thread.state.credentials.task_ids(),
                     a[0] as i32,
                     a[1] as i32,
@@ -1756,12 +1919,22 @@ impl Kernel {
         thread.cpu.gpr[reg::RAX] = result.unwrap_or_else(Errno::to_syscall_return);
         Some(self.checkpoint(thread, mem))
     }
-    /// A pid argument: 0 is the caller; anything that is not a pid is ESRCH.
-    fn target_pid(&self, value: u64) -> Result<u32, Errno> {
+    /// A pid argument of thread `tid`: 0 is the caller, another its PID
+    /// namespace's number of a task; anything that is not a pid is ESRCH.
+    fn target_pid(&self, tid: u32, value: u64) -> Result<u32, Errno> {
         match value as u32 as i32 {
             0 => Ok(self.process.pid),
-            pid if pid > 0 => Ok(pid as u32),
+            pid if pid > 0 => Ok(Self::named(&self.pid_space(tid), pid as u32)),
             _ => Err(Errno(3)),
+        }
+    }
+    /// The `who` of `getpriority` and the others for `which`, as the
+    /// caller's PID namespace numbers it: a thread or a process group.
+    fn priority_who(&self, tid: u32, which: i32, who: i32) -> i32 {
+        if matches!(which, 0 | 1) && who > 0 {
+            Self::named(&self.pid_space(tid), who.cast_unsigned()).cast_signed()
+        } else {
+            who
         }
     }
     /// `prctl(option, ...)`: PR_SET/GET_NAME and PR_SET/GET_KEEPCAPS (per thread),
@@ -1817,7 +1990,7 @@ impl Kernel {
     fn getpriority(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
         let threads = self.processes.priority_threads(
             a[0] as i32,
-            a[1] as i32,
+            self.priority_who(thread.tid, a[0] as i32, a[1] as i32),
             self.process.pid,
             thread.tid,
             thread.state.credentials.uid,
@@ -1842,7 +2015,7 @@ impl Kernel {
         };
         let threads = self.processes.priority_threads(
             which,
-            a[1] as i32,
+            self.priority_who(thread.tid, which, a[1] as i32),
             self.process.pid,
             thread.tid,
             thread.state.credentials.uid,
@@ -1873,7 +2046,7 @@ impl Kernel {
         };
         let threads = self.processes.priority_threads(
             which,
-            a[1] as i32,
+            self.priority_who(thread.tid, which, a[1] as i32),
             self.process.pid,
             thread.tid,
             caller.uid,
@@ -1895,7 +2068,7 @@ impl Kernel {
         self.processes
             .priority_threads(
                 0,
-                pid,
+                self.priority_who(thread.tid, 0, pid),
                 self.process.pid,
                 thread.tid,
                 thread.state.credentials.uid,
@@ -2114,7 +2287,7 @@ impl Kernel {
         // unshare_userns, then unshare_nsproxy_namespaces.
         crate::namespaces::check(flags, thread.state.credentials.may_administer())?;
         if flags & crate::namespaces::SUPPORTED != 0 {
-            let namespaces = self.group.namespaces(thread.tid).unshared(flags);
+            let namespaces = self.group.namespaces(thread.tid).unshared(flags)?;
             self.group.set_namespaces(thread.tid, namespaces);
         }
         if flags & (FS | FILES) != 0 {
@@ -2131,7 +2304,7 @@ impl Kernel {
         let sender = thread.state.credentials.task_ids();
         let threads = self.processes.priority_threads(
             a[0] as i32,
-            a[1] as i32,
+            self.priority_who(thread.tid, a[0] as i32, a[1] as i32),
             self.process.pid,
             thread.tid,
             sender.uid,
@@ -2155,13 +2328,17 @@ impl Kernel {
         }
         result
     }
-    fn setpgid(&self, a: [u64; 6]) -> Result<u64, Errno> {
+    fn setpgid(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
         let pgid = a[1] as u32 as i32;
         if pgid < 0 {
             return Err(Errno::EINVAL);
         }
-        let pid = self.target_pid(a[0])?;
-        let pgid = if pgid == 0 { pid } else { pgid as u32 };
+        let pid = self.target_pid(thread.tid, a[0])?;
+        let pgid = if pgid == 0 {
+            pid
+        } else {
+            Self::named(&self.pid_space(thread.tid), pgid as u32)
+        };
         self.processes
             .set_pgid(self.process.pid, pid, pgid)
             .map(|()| 0)
@@ -2186,8 +2363,8 @@ impl Kernel {
                 .map_err(|_| Errno::EFAULT)?;
             Some((soft, hard))
         };
-        let own = pid as u32 == 0 || pid as u32 == thread.tid;
-        let named = self.target_pid(pid)?;
+        let named = self.target_pid(thread.tid, pid)?;
+        let own = pid as u32 == 0 || named == thread.tid;
         let resource = usize::try_from(resource as u32).map_err(|_| Errno::EINVAL)?;
         let sender = thread.state.credentials.task_ids();
         let (soft, hard) = self.processes.limit(sender, own, named, resource, new)?;
@@ -2207,7 +2384,8 @@ impl Kernel {
     /// a mount namespace needs CAP_SYS_ADMIN and CAP_SYS_CHROOT, and a
     /// working directory no other thread shares when it is all that is
     /// entered; a time namespace a thread alone in its memory (`EUSERS`);
-    /// every one CAP_SYS_ADMIN (`EPERM`). Entering a mount namespace moves
+    /// every one CAP_SYS_ADMIN (`EPERM`); a PID namespace is the thread's
+    /// own or one nested in it (`EINVAL`). Entering a mount namespace moves
     /// the working directory to its root; a PID namespace is the one
     /// children take, and a time namespace is the thread's and its
     /// children's.
@@ -2299,6 +2477,11 @@ impl Kernel {
                     return Err(Errno(87)); // EUSERS
                 }
                 _ if !admin => return Err(Errno::EPERM),
+                // pidns_install: only the thread's own PID namespace or one
+                // nested in it, so that its children stay within it.
+                Kind::Pid if !namespace(kind).is_within(&self.pid_space(thread.tid)) => {
+                    return Err(Errno::EINVAL);
+                }
                 _ => {}
             }
         }
@@ -2381,14 +2564,20 @@ impl Kernel {
         let child_namespaces = self
             .group
             .namespaces(parent.tid)
-            .for_child(namespaces, flags & 0x100 != 0);
+            .for_child(namespaces, flags & 0x100 != 0)?;
         let child_mem = if flags & 0x100 == 0 {
             Some(Arc::new(mem.fork()))
         } else {
             None
         };
         let pid = self.processes.allocate()?;
+        // Numbered in the PID namespace children take, and those it is in.
+        let space = child_namespaces.pid.clone();
+        space.enter(pid)?;
         let group = Arc::new(self.group.fork(flags & 0x800 != 0));
+        if !space.is_first() && space.init() == Some(pid) {
+            group.set_unkillable();
+        }
         // CLONE_CLEAR_SIGHAND resets handled signals to their default and
         // keeps ignored ones, as execve does.
         if flags & CLONE_CLEAR_SIGHAND != 0 {
@@ -2432,14 +2621,17 @@ impl Kernel {
         if flags & 0x80000 != 0 {
             cpu.fs_base = a[4];
         }
+        // The parent's word has the child as the parent's PID namespace
+        // numbers it, which `clone` returns; the child's, as its own does.
+        let number = self.pid_space(parent.tid).number(pid);
         if flags & 0x100000 != 0 {
-            let _ = mem.write(GuestAddr(a[2]), &pid.to_le_bytes());
+            let _ = mem.write(GuestAddr(a[2]), &number.to_le_bytes());
         }
         if flags & 0x1000000 != 0 {
             let _ = child_mem
                 .as_deref()
                 .unwrap_or(mem)
-                .write(GuestAddr(a[3]), &pid.to_le_bytes());
+                .write(GuestAddr(a[3]), &space.number(pid).to_le_bytes());
         }
         let release = (flags & 0x4000 != 0).then(|| Arc::new(AtomicBool::new(false)));
         group.set_task_ids(pid, parent.state.credentials.task_ids());
@@ -2450,6 +2642,7 @@ impl Kernel {
             group.clone(),
             (flags & 0xff) as i32,
             task,
+            space,
         );
         let mut child = Kernel {
             host: self.host.clone(),
@@ -2481,19 +2674,31 @@ impl Kernel {
                 state,
             },
         ));
-        Ok(u64::from(pid))
+        Ok(u64::from(number))
+    }
+    /// The PID namespace thread `tid` is in, which numbers the tasks it
+    /// names and sees.
+    pub(crate) fn pid_space(&self, tid: u32) -> Arc<Namespace> {
+        self.group.namespaces(tid).pid.clone()
+    }
+    /// The task a thread of PID namespace `space` names by `number`, or
+    /// [`NOBODY`] for one it does not number, which nothing matches.
+    fn named(space: &Namespace, number: u32) -> u32 {
+        space.task(number).unwrap_or(NOBODY)
     }
     fn wait4(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         if a[2] & !(1 | 2 | 8 | 0xe0000000) != 0 {
             return Err(Errno::EINVAL);
         }
-        // -1 is any child, 0 this process's group, below -1 that group.
+        // -1 is any child, 0 this process's group, below -1 that group, as
+        // the caller's PID namespace numbers them, and so is what it gives.
+        let space = self.pid_space(thread.tid);
         let wanted = match a[0] as i32 {
             -1 => Wanted::Any,
             0 => Wanted::Pgid(self.processes.pgid(self.process.pid)?),
             i32::MIN => return Err(Errno(3)),
-            pgid if pgid < 0 => Wanted::Pgid(pgid.unsigned_abs()),
-            pid => Wanted::Pid(pid as u32),
+            pgid if pgid < 0 => Wanted::Pgid(Self::named(&space, pgid.unsigned_abs())),
+            pid => Wanted::Pid(Self::named(&space, pid as u32)),
         };
         let wait = WaitFor {
             exits: true,
@@ -2504,7 +2709,8 @@ impl Kernel {
         loop {
             let ticket = self.processes.changed().value();
             if let Some((pid, event, cpu, _)) =
-                self.processes.reap(self.process.pid, wanted, wait)?
+                self.processes
+                    .reap(self.process.pid, &space, wanted, wait)?
             {
                 let raw = match event {
                     ChildEvent::Exited(ExitStatus::Exited(code)) => (code & 255) << 8,
@@ -2595,10 +2801,11 @@ impl Kernel {
         }
         let id = a[1] as i32;
         let mut nonblocking = false;
+        let space = self.pid_space(thread.tid);
         let wanted = match a[0] as i32 {
             0 => Wanted::Any,
-            1 if id > 0 => Wanted::Pid(id as u32),
-            2 if id > 0 => Wanted::Pgid(id as u32),
+            1 if id > 0 => Wanted::Pid(Self::named(&space, id as u32)),
+            2 if id > 0 => Wanted::Pgid(Self::named(&space, id as u32)),
             2 if id == 0 => Wanted::Pgid(self.processes.pgid(self.process.pid)?),
             3 if id >= 0 => {
                 let d = self.files.descriptor(id as u64)?;
@@ -2617,6 +2824,7 @@ impl Kernel {
             let ticket = self.processes.changed().value();
             let found = self.processes.reap(
                 self.process.pid,
+                &space,
                 wanted,
                 WaitFor {
                     keep: options & WNOWAIT != 0,
@@ -2644,12 +2852,12 @@ impl Kernel {
     }
     /// `pidfd_open(pid, flags)`: a close-on-exec pidfd for a process.
     /// `PIDFD_THREAD` is accepted but still names the whole process.
-    fn pidfd_open(&mut self, a: [u64; 6]) -> Result<u64, Errno> {
+    fn pidfd_open(&mut self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
         let flags = u64::from(a[1] as u32);
         if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 || a[0] as i32 <= 0 {
             return Err(Errno::EINVAL);
         }
-        let pid = a[0] as u32;
+        let pid = Self::named(&self.pid_space(thread.tid), a[0] as u32);
         match self.processes.pidfd_target(pid) {
             Err(e) if e == Errno::ENOENT && flags & PIDFD_THREAD != 0 => {
                 // A pidfd for one thread of another process is not supported.
@@ -2672,7 +2880,8 @@ impl Kernel {
     fn sigqueueinfo(&self, thread: &Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         let (pid, number) = (a[0] as i32, a[1] as i32);
         let signal = queued_siginfo(mem, a[2], number)?;
-        if impersonates(signal.code) && pid != thread.tid as i32 {
+        let space = self.pid_space(thread.tid);
+        if impersonates(signal.code) && pid != space.number(thread.tid) as i32 {
             return Err(Errno(1));
         }
         if pid <= 0 {
@@ -2682,7 +2891,7 @@ impl Kernel {
             .queue(
                 self.process.pid,
                 thread.state.credentials.task_ids(),
-                pid.cast_unsigned(),
+                Self::named(&space, pid.cast_unsigned()),
                 signal,
             )
             .map(|()| 0)
@@ -2700,15 +2909,16 @@ impl Kernel {
         if tgid <= 0 || tid <= 0 {
             return Err(Errno::EINVAL);
         }
-        if impersonates(signal.code) && tid != thread.tid as i32 {
+        let space = self.pid_space(thread.tid);
+        if impersonates(signal.code) && tid != space.number(thread.tid) as i32 {
             return Err(Errno(1));
         }
         self.processes
             .queue_thread(
                 self.process.pid,
                 thread.state.credentials.task_ids(),
-                tgid.cast_unsigned(),
-                tid.cast_unsigned(),
+                Self::named(&space, tgid.cast_unsigned()),
+                Self::named(&space, tid.cast_unsigned()),
                 signal,
             )
             .map(|()| 0)
@@ -3108,6 +3318,11 @@ impl Kernel {
         // The program runs in the namespaces of the thread that ran it, and
         // in the time namespace its children take.
         let namespaces = self.group.namespaces(thread.tid).exec();
+        // A thread other than the leader takes the leader's number, and its
+        // own goes, as Linux's `exchange_tids`.
+        if thread.tid != self.process.pid {
+            namespaces.pid.leave(thread.tid);
+        }
         self.group
             .end_exec(thread.tid, self.process.pid, Arc::clone(&self.inbox));
         // The thread is now the leader, which the process entry counts.

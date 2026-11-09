@@ -906,20 +906,41 @@ fn sys_rt_sigreturn(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
         Outcome::BadFrame
     }
 }
+impl Context<'_> {
+    /// The PID namespace of the calling thread, which numbers the tasks it
+    /// names and sees.
+    pub(crate) fn pid_space(&self) -> std::sync::Arc<crate::namespaces::Namespace> {
+        self.group.namespaces(self.tid).pid.clone()
+    }
+    /// The task the caller names by `number`, or nobody.
+    pub(crate) fn named(&self, number: u32) -> u32 {
+        self.pid_space()
+            .task(number)
+            .unwrap_or(crate::processes::NOBODY)
+    }
+}
+/// `getpid`, and `gettid` of a process's only thread, as the caller's PID
+/// namespace numbers it.
 fn sys_getpid(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
-    ok(u64::from(c.process.pid))
+    ok(u64::from(c.pid_space().number(c.process.pid)))
 }
 fn send_signal(c: &mut Context<'_>, target: u64, signal: signals::PendingSignal) -> Outcome {
     let number = signal.number;
     if !(0..=64).contains(&number) {
         return err(Errno::EINVAL);
     }
-    if target != u64::from(c.process.pid) {
+    let own = c.pid_space().number(c.process.pid);
+    if target != u64::from(own) {
         return err(Errno(3));
     }
-    if number == 0 {
+    // The init of a nested PID namespace drops what it has no handler for.
+    if number == 0 || c.group.drops_as_init(number, false, c.process.signal_mask) {
         return ok(0);
     }
+    let signal = signals::PendingSignal {
+        sender: Some(own),
+        ..signal
+    };
     signals::queue(c.process, signal);
     ok(0)
 }
@@ -931,7 +952,7 @@ fn sys_tkill(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     )
 }
 fn sys_tgkill(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    if a[0] != u64::from(c.process.pid) {
+    if a[0] != u64::from(c.pid_space().number(c.process.pid)) {
         return err(Errno(3));
     }
     send_signal(
@@ -1717,7 +1738,7 @@ fn sys_set_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// `ESRCH` for any other (Linux gives another process's if it may trace it).
 fn sys_get_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let tid = a[0] as u32;
-    let tid = if tid == 0 { c.tid } else { tid };
+    let tid = if tid == 0 { c.tid } else { c.named(tid) };
     let Some(head) = c.group.robust_list(tid) else {
         return err(Errno(3));
     };
@@ -2442,7 +2463,7 @@ fn affinity_target(
     c: &Context<'_>,
     pid: i32,
 ) -> Result<(u32, Option<std::sync::Arc<crate::ThreadGroup>>), Errno> {
-    match u32::try_from(pid) {
+    match u32::try_from(pid).map(|p| if p == 0 { 0 } else { c.named(p) }) {
         Ok(0) => Ok((c.tid, None)),
         Ok(p) if p == c.process.pid || c.group.has_member(p) => Ok((p, None)),
         Ok(p) => c

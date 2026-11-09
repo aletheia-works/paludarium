@@ -855,7 +855,14 @@ fn control_messages(c: &Context<'_>, control: &[u8]) -> Result<(Passed, Option<U
             if len != CMSG_HEADER + UCRED {
                 return Err(Errno::EINVAL);
             }
-            let [pid, uid, gid] = [0, 4, 8].map(|i| field(at + CMSG_HEADER + i));
+            let [number, uid, gid] = [0, 4, 8].map(|i| field(at + CMSG_HEADER + i));
+            // The process as the sender's PID namespace numbers it.
+            let space = c.pid_space();
+            let pid = if number.cast_signed() <= 0 {
+                number
+            } else {
+                c.named(number)
+            };
             let owner = FileOwner {
                 kind: crate::fasync::OwnerKind::Process,
                 id: pid,
@@ -865,14 +872,14 @@ fn control_messages(c: &Context<'_>, control: &[u8]) -> Result<(Passed, Option<U
             if uid == u32::MAX || gid == u32::MAX {
                 return Err(Errno::EINVAL);
             }
-            if !c
-                .process
-                .credentials
-                .may_send_credentials(pid == c.process.pid, uid, gid)
-            {
+            if !c.process.credentials.may_send_credentials(
+                number == space.number(c.process.pid),
+                uid,
+                gid,
+            ) {
                 return Err(Errno::EPERM);
             }
-            if pid.cast_signed() <= 0 || !c.processes.owner_exists(owner) {
+            if number.cast_signed() <= 0 || !c.processes.owner_exists(owner) {
                 return Err(Errno(3));
             }
             credentials = Some(Ucred { pid, uid, gid });
@@ -1314,7 +1321,9 @@ fn deliver(
     }
     if let Some(credentials) = credentials {
         let mut ucred = [0; UCRED];
-        for (i, id) in [credentials.pid, credentials.uid, credentials.gid]
+        // The sender as the receiver's PID namespace numbers it.
+        let pid = c.pid_space().number(credentials.pid);
+        for (i, id) in [pid, credentials.uid, credentials.gid]
             .into_iter()
             .enumerate()
         {
@@ -1844,7 +1853,7 @@ fn get_option(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 uid: u32::MAX,
                 gid: u32::MAX,
             });
-            [peer.pid, peer.uid, peer.gid]
+            [c.pid_space().number(peer.pid), peer.uid, peer.gid]
                 .iter()
                 .flat_map(|id| id.to_le_bytes())
                 .collect()

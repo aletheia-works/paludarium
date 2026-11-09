@@ -126,13 +126,15 @@ fn set_owner(c: &Context<'_>, file: &Arc<dyn FileHandle>, owner: FileOwner) {
 }
 
 /// Makes `kind` and `id` the owner, ESRCH (and the owner as it was) when
-/// nothing has the ID, as Linux's `f_setown` finds the pid.
+/// nothing has the ID, as Linux's `f_setown` finds the pid in the caller's
+/// PID namespace.
 fn take_owner(
     c: &Context<'_>,
     file: &Arc<dyn FileHandle>,
     kind: OwnerKind,
     id: u32,
 ) -> Result<u64, Errno> {
+    let id = if id == 0 { 0 } else { c.named(id) };
     let owner = FileOwner {
         kind,
         id,
@@ -259,10 +261,11 @@ pub(crate) fn fcntl(
 /// The owner's ID as `F_GETOWN` and `F_GETOWN_EX` read it back: 0 while
 /// nothing it names is there, as Linux's `f_getown` gives an ID only while
 /// a task has it in the owner's role (`pid_task`), such as a group's ID
-/// when no process is in that group.
+/// when no process is in that group, and as the caller's PID namespace
+/// numbers it (`pid_vnr`).
 fn shown_id(c: &Context<'_>, owner: FileOwner) -> u32 {
     if owner.id != 0 && c.processes.owner_present(owner) {
-        owner.id
+        c.pid_space().number(owner.id)
     } else {
         0
     }

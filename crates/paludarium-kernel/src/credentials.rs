@@ -638,6 +638,8 @@ pub(crate) fn sys_capget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Ok(pid) => pid.cast_unsigned(),
         Err(e) => return err(e),
     };
+    // The PID as the caller's PID namespace numbers it.
+    let pid = if pid == 0 { 0 } else { c.named(pid) };
     let ids = if pid == 0 || pid == c.tid {
         c.process.credentials.task_ids()
     } else {
@@ -667,7 +669,7 @@ pub(crate) fn sys_capset(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Err(e) => return err(e),
     };
     match capability_pid(c, header) {
-        Ok(pid) if pid != 0 && pid.cast_unsigned() != c.tid => return err(Errno::EPERM),
+        Ok(pid) if pid != 0 && c.named(pid.cast_unsigned()) != c.tid => return err(Errno::EPERM),
         Ok(_) => {}
         Err(e) => return err(e),
     }

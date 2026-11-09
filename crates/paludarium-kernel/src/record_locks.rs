@@ -53,10 +53,12 @@ impl Owner {
             Self::Description(d) => d.strong_count() > 0,
         }
     }
-    /// The `l_pid` that `F_GETLK` reports: -1 for a description's lock.
-    fn pid(&self) -> i32 {
+    /// The `l_pid` that `F_GETLK` reports to a process of PID namespace
+    /// `space`: the owner as it numbers it (0 outside it), as Linux's
+    /// `locks_translate_pid`, or -1 for a description's lock.
+    fn pid(&self, space: &crate::namespaces::Namespace) -> i32 {
         match self {
-            Self::Process(pid) => *pid as i32,
+            Self::Process(pid) => space.number(*pid) as i32,
             Self::Description(_) => -1,
         }
     }
@@ -405,7 +407,7 @@ pub(crate) fn fcntl(
                 raw[2..4].copy_from_slice(&0i16.to_le_bytes());
                 raw[8..16].copy_from_slice(&(lock.start as i64).to_le_bytes());
                 raw[16..24].copy_from_slice(&len.to_le_bytes());
-                raw[24..28].copy_from_slice(&lock.owner.pid().to_le_bytes());
+                raw[24..28].copy_from_slice(&lock.owner.pid(&c.pid_space()).to_le_bytes());
             }
             None => raw[0..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
         }
@@ -521,7 +523,7 @@ mod tests {
                 .conflict(KEY, &other, Kind::Read, 0, 0)
                 .unwrap()
                 .owner
-                .pid(),
+                .pid(&crate::namespaces::Namespaces::default().pid),
             -1
         );
         drop(file);

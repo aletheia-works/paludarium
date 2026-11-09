@@ -249,11 +249,11 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **Namespaces**: there are no new network, PID or user namespaces.
-  `clone`, `clone3` and `unshare` with `CLONE_NEWNET` or `CLONE_NEWPID` fail
+- **Namespaces**: there are no new network or user namespaces.
+  `clone`, `clone3` and `unshare` with `CLONE_NEWNET` fail
   with `EINVAL` (`EPERM` for a thread without `CAP_SYS_ADMIN`, as on Linux)
   and create no child, where Linux lets the guest, which runs as root,
-  create them; `CLONE_NEWUSER`, which Linux also lets a user have, is
+  create one; `CLONE_NEWUSER`, which Linux also lets a user have, is
   `EINVAL` for every thread. The other namespaces keep nothing apart that
   paludarium has, but for the System V shared memory of an IPC namespace:
   there are no System V semaphores, System V message queues or POSIX
@@ -261,7 +261,12 @@ verified.
   in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new
   ones), no `/proc/self/cgroup` for a cgroup namespace, and no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the
-  first one's. A namespace file has none of the `NS_GET_*` `ioctl` requests,
+  first one's. A PID namespace hands out its numbers once each, where
+  Linux's wrap at `pid_max` and are used again; `/proc/<pid>/status` has no
+  `NStgid`, `NSpid`, `NSpgid` or `NSsid` lines; `clone3`'s `set_tid` is not
+  supported in one either; and a queued signal (`rt_sigqueueinfo`) from
+  outside the receiver's namespace has its `si_pid` cleared whatever its
+  `si_code`. A namespace file has none of the `NS_GET_*` `ioctl` requests,
   and the numbers of new namespaces are not Linux's, which reuses freed
   ones.
 - **Files of a mounted host directory on hosts other than Linux and macOS**:

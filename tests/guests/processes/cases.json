@@ -15,6 +15,7 @@
     {"name":"membarrier","binary":"process"},
     {"name":"unshare","binary":"process"},
     {"name":"namespaces","binary":"process"},
+    {"name":"pid-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},
     {"name":"landlock","binary":"process"},

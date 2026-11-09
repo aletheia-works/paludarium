@@ -54,9 +54,9 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
-| System information | `uname`, `sysinfo`, `getrusage`, `times` |
+| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
@@ -635,11 +635,33 @@ kernel.
   nothing to unshare and gives `EINVAL` where Linux does: another thread in
   the process, dispositions shared with another process (`CLONE_SIGHAND`), or
   memory shared with one (`CLONE_VM` without `CLONE_THREAD`). `CLONE_SYSVSEM`
-  has no semaphore adjustments to drop, as there is no System V IPC. There
-  are no namespaces: their flags give `EPERM` without `CAP_SYS_ADMIN`, as on
-  Linux, and `EINVAL` with it, as from a kernel built without that namespace
-  and as `clone` gives them here; `CLONE_NEWUSER`, which Linux lets a user
-  have, gives `EINVAL` too. See [Limitations](./limitations.md).
+  has no semaphore adjustments to drop, as there is no System V IPC. Its
+  namespace flags give the thread new namespaces, as below.
+- Each thread has its own namespaces, as Linux's `nsproxy`: UTS, IPC,
+  mount, cgroup and time ones of its own, and the first network, PID and
+  user namespaces. `unshare` with `CLONE_NEWUTS`, `CLONE_NEWIPC`,
+  `CLONE_NEWNS`, `CLONE_NEWCGROUP` or `CLONE_NEWTIME` gives it new ones, and
+  so does `clone` (`CLONE_NEWTIME` through `clone3`) for its child, a thread
+  too, with `CAP_SYS_ADMIN` (`EPERM` without it). A new UTS namespace starts
+  with a copy of the host and domain names, which `sethostname` and
+  `setdomainname` then change for it alone. A new time namespace is the one
+  the thread's children enter: a child that does not share its memory
+  enters it, and so does the thread when it runs a program. `clone` refuses
+  `CLONE_NEWNS` with `CLONE_FS` and `CLONE_NEWIPC` with `CLONE_SYSVSEM`
+  (`EINVAL`), as Linux does. `/proc/<pid>/ns` (and `/proc/thread-self/ns`
+  and `/proc/<pid>/task/<tid>/ns`) has Linux's ten links, which read as
+  `uts:[4026531838]`; the first namespaces have Linux's fixed numbers and new
+  ones are numbered as they are made. A link opens the namespace's file, a
+  handle that reads and writes as `EINVAL` and seeks as `ESPIPE`, whose
+  inode is that number. `setns` enters the namespace of such a file (its
+  kind or 0 for `nstype`), or the namespaces of a pidfd's process that
+  `nstype` names, with Linux's checks in Linux's order: the thread's own
+  user namespace is `EINVAL`, a time namespace needs the thread alone in its
+  memory (`EUSERS`), a mount namespace entered by itself a working directory
+  no other thread shares (`EINVAL`) and `CAP_SYS_CHROOT`, and each one
+  `CAP_SYS_ADMIN` (`EPERM`). Entering a mount namespace moves the working
+  directory to its root. See [Limitations](./limitations.md) for the
+  namespaces paludarium has no new ones of.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,
@@ -650,8 +672,10 @@ kernel.
   `execve` keeps it; a process's ranges keep theirs through `fork` and
   `mremap`, until the pages are unmapped or mapped anew. All memory is on
   node 0, so no policy moves a page.
-- `uname` reports Linux on x86_64 with the host name `paludarium`; like
-  `CPUID`, it does not reveal the host. The guest starts as root (user and
+- `uname` reports Linux on x86_64 with the host name `paludarium` and the
+  domain name `(none)` of the thread's UTS namespace, until `sethostname` or
+  `setdomainname` changes them (`CAP_SYS_ADMIN`, else `EPERM`; at most 64
+  bytes, else `EINVAL`); like `CPUID`, it does not reveal the host. The guest starts as root (user and
   group 0, with every capability) without supplementary groups, as Linux's
   first process does; a native program has its launcher's instead. Each
   thread has its own credentials, as on Linux: the real, effective, saved
@@ -837,7 +861,7 @@ kernel.
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
-  `maps`, `fd` and `task`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
+  `maps`, `fd`, `ns` and `task`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
   signal masks, capabilities and so on) without the memory and CPU ones,
   which nothing measures. Any other path in this process's directory or
   elsewhere under `/proc` is looked up in the filesystem like any path, so with
@@ -847,7 +871,8 @@ kernel.
   and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
-  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd` and `task`, made as
+  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd`, `ns` (0511) and
+  `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
@@ -858,8 +883,8 @@ kernel.
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
-  gets `EACCES` for `environ` unless its real IDs, and for `exe` and `cwd`
-  unless its filesystem IDs, are every user and group ID of a dumpable
+  gets `EACCES` for `environ` unless its real IDs, and for `exe`, `cwd` and
+  the links of `ns` unless its filesystem IDs, are every user and group ID of a dumpable
   process; an undumpable process's directory is root's. What a process shows of
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending

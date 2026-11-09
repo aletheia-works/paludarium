@@ -46,9 +46,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
-| システムの情報 | `uname`、`sysinfo`、`getrusage`、`times` |
+| システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
@@ -580,10 +580,30 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EINVAL` です。プロセスにほかのスレッドがあるとき、ほかのプロセスとシグナルの扱いを
   共有しているとき（`CLONE_SIGHAND`）、ほかのプロセスとメモリーを共有しているとき
   （`CLONE_THREAD` なしの `CLONE_VM`）です。System V IPC がないので、`CLONE_SYSVSEM` で
-  捨てるセマフォーの調整値はありません。名前空間はありません。そのフラグは、Linux と
-  同じく `CAP_SYS_ADMIN` がなければ `EPERM`、あれば `EINVAL` です。後者は、その名前空間
-  なしでビルドしたカーネルと同じで、ここでの `clone` とも同じです。Linux ではユーザーも
-  使える `CLONE_NEWUSER` も `EINVAL` です。[制限](./limitations.md)を見てください。
+  捨てるセマフォーの調整値はありません。名前空間のフラグは、次のとおりスレッドに新しい
+  名前空間を与えます。
+- スレッドは、Linux の `nsproxy` と同じく自分の名前空間を持ちます。UTS・IPC・マウント・
+  cgroup・time の名前空間は自分のもので、ネットワーク・PID・ユーザーの名前空間は最初の
+  ものです。`CLONE_NEWUTS`、`CLONE_NEWIPC`、`CLONE_NEWNS`、`CLONE_NEWCGROUP`、
+  `CLONE_NEWTIME` を付けた `unshare` はスレッドに新しい名前空間を与え、`clone` も子に
+  （スレッドにも）与えます（`CLONE_NEWTIME` は `clone3` で付けます）。どれも
+  `CAP_SYS_ADMIN` が要ります（なければ `EPERM`）。新しい UTS 名前空間はホスト名と
+  ドメイン名の写しで始まり、その後の `sethostname` と `setdomainname` はその名前空間だけを
+  変えます。新しい time 名前空間は、スレッドの子が入るものです。メモリーを共有しない子は
+  それに入り、スレッドもプログラムを実行するとそれに入ります。`clone` は、Linux と同じく
+  `CLONE_FS` 付きの `CLONE_NEWNS` と `CLONE_SYSVSEM` 付きの `CLONE_NEWIPC` を `EINVAL`
+  で断ります。`/proc/<pid>/ns`（と `/proc/thread-self/ns`、`/proc/<pid>/task/<tid>/ns`）
+  には Linux と同じ 10 個のリンクがあり、`uts:[4026531838]` のように読めます。最初の
+  名前空間は Linux の固定の番号を持ち、新しい名前空間は作った順に番号が付きます。リンクを
+  開くと名前空間のファイルになります。これはハンドルで、読み書きは `EINVAL`、シークは
+  `ESPIPE` で、inode はその番号です。`setns` は、そのファイルの名前空間（`nstype` は
+  その種類か 0）か、pidfd のプロセスの名前空間のうち `nstype` で指定したものに入ります。
+  確かめる中身と順番は Linux と同じです。スレッド自身のユーザー名前空間は `EINVAL`、
+  time 名前空間はスレッドがメモリーの中でひとりであること（`EUSERS`）、マウント名前空間に
+  それだけで入るときはほかのスレッドと共有しない作業ディレクトリー（`EINVAL`）と
+  `CAP_SYS_CHROOT`、どの名前空間も `CAP_SYS_ADMIN`（`EPERM`）が要ります。マウント
+  名前空間に入ると、作業ディレクトリーはその root に移ります。新しく作れない名前空間は
+  [制限](./limitations.md)を見てください。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、
@@ -594,7 +614,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プロセスの範囲のポリシーは `fork` と `mremap` の後も残り、ページの割り当てを外すか
   新しく割り当てるまで続きます。メモリはすべてノード 0 にあるので、どのポリシーでも
   ページは動きません。
-- `uname` は x86_64 の Linux で、ホスト名は `paludarium` と答えます。`CPUID` と同じく、
+- `uname` は x86_64 の Linux で、スレッドの UTS 名前空間のホスト名 `paludarium` と
+  ドメイン名 `(none)` を答えます。これは `sethostname` と `setdomainname` で変えられます
+  （`CAP_SYS_ADMIN` がなければ `EPERM`、64 バイトを超えると `EINVAL`）。`CPUID` と同じく、
   ホストのことは見せません。ゲストは root（ユーザーとグループが 0 で、すべての
   ケーパビリティを持つ）として、Linux の最初のプロセスと同じく補助グループなしで
   始まります。ネイティブのプログラムは、起動したものの補助グループを持ちます。
@@ -765,7 +787,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
-  `cwd`、`maps`、`fd`、`task` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
+  `cwd`、`maps`、`fd`、`ns`、`task` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。ただし、何も
   測っていないメモリと CPU の項目はありません。自分のディレクトリと `/proc` の下の
   それ以外のパスは、ふつうのパスと同じようにファイルシステムで探します。
@@ -774,7 +796,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
-  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`task` があり、
+  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`ns`（0511）、
+  `task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
@@ -784,7 +807,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
-  `environ` は実 ID が、`exe` と `cwd` はファイルシステムの ID が、ダンプできるプロセスの
+  `environ` は実 ID が、`exe`、`cwd`、`ns` のリンクはファイルシステムの ID が、ダンプできるプロセスの
   ユーザーとグループのすべての ID と同じでなければ `EACCES` です。ダンプできないプロセスの
   ディレクトリの持ち主は root です。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
   最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、

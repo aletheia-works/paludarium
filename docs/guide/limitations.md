@@ -233,14 +233,20 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **Namespaces**: `clone` and `clone3` with a namespace flag
-  (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`,
-  `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWCGROUP`, or `CLONE_NEWTIME` for
-  `clone3`) fail with `EINVAL` and create no child, where Linux lets the
-  guest, which runs as root, create the namespace. `unshare` with a
-  namespace flag fails too, with `EINVAL` (`EPERM` for a thread without
-  `CAP_SYS_ADMIN`, as on Linux), and so does `CLONE_NEWUSER`, which Linux
-  also lets a user have. `setns` returns `ENOSYS`.
+- **Namespaces**: there are no new network, PID or user namespaces.
+  `clone`, `clone3` and `unshare` with `CLONE_NEWNET` or `CLONE_NEWPID` fail
+  with `EINVAL` (`EPERM` for a thread without `CAP_SYS_ADMIN`, as on Linux)
+  and create no child, where Linux lets the guest, which runs as root,
+  create them; `CLONE_NEWUSER`, which Linux also lets a user have, is
+  `EINVAL` for every thread. The other namespaces keep nothing apart that
+  paludarium has: there is no System V IPC or POSIX message queue for an IPC
+  namespace, no `mount` for a mount namespace (whose mounts keep their IDs
+  in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new
+  ones), no `/proc/self/cgroup` for a cgroup namespace, and no
+  `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the
+  first one's. A namespace file has none of the `NS_GET_*` `ioctl` requests,
+  and the numbers of new namespaces are not Linux's, which reuses freed
+  ones.
 - **Files of a mounted host directory on hosts other than Linux and macOS**:
   `lseek` with `SEEK_DATA` or `SEEK_HOLE` treats the whole file as data,
   where Linux finds the holes. On Windows `st_blocks` is also the size

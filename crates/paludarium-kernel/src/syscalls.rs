@@ -61,6 +61,8 @@ pub mod nr {
     pub const SET_ROBUST_LIST: u64 = 273;
     pub const GET_ROBUST_LIST: u64 = 274;
     pub const UNAME: u64 = 63;
+    pub const SETHOSTNAME: u64 = 170;
+    pub const SETDOMAINNAME: u64 = 171;
     pub const GETUID: u64 = 102;
     pub const SETUID: u64 = 105;
     pub const SETGID: u64 = 106;
@@ -146,7 +148,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 77] = [
+        let entries: [(u64, Handler); 79] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -188,6 +190,8 @@ impl SyscallTable {
             (nr::SET_ROBUST_LIST, sys_set_robust_list),
             (nr::GET_ROBUST_LIST, sys_get_robust_list),
             (nr::UNAME, sys_uname),
+            (nr::SETHOSTNAME, sys_sethostname),
+            (nr::SETDOMAINNAME, sys_setdomainname),
             (nr::GETUID, credentials::sys_getuid),
             (nr::GETGID, credentials::sys_getgid),
             (nr::GETEUID, credentials::sys_geteuid),
@@ -2273,7 +2277,8 @@ fn sys_arch_prctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// Linux's `struct utsname`: six NUL-terminated fields of 65 bytes. The host's
-/// name and kernel are not revealed, as with `CPUID`.
+/// name and kernel are not revealed, as with `CPUID`: the host and domain
+/// names are the thread's UTS namespace's ([`crate::namespaces`]).
 ///
 /// `uname`, with the release and machine a personality asks for, as
 /// Linux's `override_release` and `override_architecture`: `UNAME26` makes
@@ -2292,13 +2297,14 @@ fn sys_uname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     } else {
         b"x86_64"
     };
+    let names = c.group.namespaces(c.tid).uts.names();
     let fields: [&[u8]; 6] = [
         b"Linux",
-        b"paludarium",
+        &names.host,
         release,
         b"#1 SMP PREEMPT_DYNAMIC",
         machine,
-        b"(none)",
+        &names.domain,
     ];
     let mut bytes = [0u8; FIELD * 6];
     for (i, field) in fields.iter().enumerate() {
@@ -2308,6 +2314,38 @@ fn sys_uname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Ok(()) => ok(0),
         Err(_) => err(Errno::EFAULT),
     }
+}
+
+/// `sethostname(name, len)` and `setdomainname`, as Linux's: CAP_SYS_ADMIN
+/// (`EPERM`), then a length of at most 64 (`EINVAL`), then the name, which
+/// may hold any bytes, into the thread's UTS namespace.
+fn set_uts_name(c: &mut Context<'_>, a: [u64; 6], host: bool) -> Outcome {
+    if !c.process.credentials.may_administer() {
+        return err(Errno::EPERM);
+    }
+    let Ok(length) = usize::try_from(a[1] as i64) else {
+        return err(Errno::EINVAL);
+    };
+    if length > crate::namespaces::NAME_LENGTH {
+        return err(Errno::EINVAL);
+    }
+    let mut name = vec![0; length];
+    if c.mem.read(GuestAddr(a[0]), &mut name).is_err() {
+        return err(Errno::EFAULT);
+    }
+    let uts = c.group.namespaces(c.tid).uts.clone();
+    if host {
+        uts.set_host(&name);
+    } else {
+        uts.set_domain(&name);
+    }
+    ok(0)
+}
+fn sys_sethostname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    set_uts_name(c, a, true)
+}
+fn sys_setdomainname(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    set_uts_name(c, a, false)
 }
 
 fn sys_sched_yield(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {

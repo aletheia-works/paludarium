@@ -29,6 +29,7 @@ pub use inet::{InvalidRule, NetworkPolicy};
 mod futex;
 mod memfd;
 mod mempolicy;
+mod namespaces;
 mod page_cache;
 mod proc;
 mod processes;

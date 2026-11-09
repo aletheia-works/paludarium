@@ -36,6 +36,12 @@ pub struct ThreadGroup {
     /// What signalling each thread looks at, for other processes to read;
     /// a thread without one is root's ([`TaskIds`]).
     task_ids: Mutex<BTreeMap<u32, TaskIds>>,
+    /// Each thread's namespaces, which Linux keeps per thread (`nsproxy`),
+    /// for the thread itself and for other processes to read; a thread
+    /// without them has the first ones, which every process made from this
+    /// one shares.
+    namespaces: Mutex<BTreeMap<u32, Arc<crate::namespaces::Namespaces>>>,
+    first_namespaces: Arc<crate::namespaces::Namespaces>,
     /// The last `LANDLOCK_RESTRICT_SELF_TSYNC`: its number and the domain
     /// every thread takes when it next enters the kernel.
     landlock_syncs: AtomicU64,
@@ -106,6 +112,8 @@ impl Default for ThreadGroup {
             affinity: Mutex::default(),
             numa: crate::mempolicy::Numa::default(),
             task_ids: Mutex::default(),
+            namespaces: Mutex::default(),
+            first_namespaces: Arc::default(),
             landlock_syncs: AtomicU64::new(0),
             landlock_sync: Mutex::default(),
             status: Mutex::new(None),
@@ -248,6 +256,7 @@ impl ThreadGroup {
             // and the program itself (Linux's `exe_file`).
             start_stack: AtomicU64::new(self.start_stack()),
             executable: Mutex::new(self.executable()),
+            first_namespaces: self.first_namespaces.clone(),
             exe_file: Mutex::new(
                 self.exe_file
                     .lock()
@@ -554,6 +563,30 @@ impl ThreadGroup {
             .cloned()
             .unwrap_or_default()
     }
+    /// Thread `tid`'s namespaces.
+    pub(crate) fn namespaces(&self, tid: u32) -> Arc<crate::namespaces::Namespaces> {
+        self.namespaces
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .cloned()
+            .unwrap_or_else(|| self.first_namespaces.clone())
+    }
+    pub(crate) fn set_namespaces(&self, tid: u32, namespaces: crate::namespaces::Namespaces) {
+        self.namespaces
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, Arc::new(namespaces));
+    }
+    /// After exec, thread `pid` is all there is, with `namespaces`.
+    pub(crate) fn reset_namespaces(&self, pid: u32, namespaces: crate::namespaces::Namespaces) {
+        let mut all = self
+            .namespaces
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        all.clear();
+        all.insert(pid, Arc::new(namespaces));
+    }
     /// `LANDLOCK_RESTRICT_SELF_TSYNC`: every thread takes `domain`, which
     /// is what acting on them looks at from now on. Returns the number the
     /// caller, which takes it itself, records as taken.
@@ -591,6 +624,10 @@ impl ThreadGroup {
     fn forget_task_ids(&self, pid: u32, tid: u32) {
         if tid != pid {
             self.task_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&tid);
+            self.namespaces
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&tid);
@@ -1116,8 +1153,25 @@ impl Kernel {
             // musl's pthread clone retains this obsolete, ignored Linux bit.
             // The events Tokio native trace observes it on both worker creations.
             | 0x400000
-            | 0x1000000;
+            | 0x1000000
+            | crate::namespaces::ALL & !crate::namespaces::CLONE_NEWTIME
+            | crate::namespaces::CLONE3_NEWTIME;
+        let namespaces = crate::processes::namespace_flags(flags);
+        // copy_process: a new mount or user namespace needs a working
+        // directory and root of its own, and a thread can have neither a
+        // new user nor a new PID namespace.
+        if flags & 0x200 != 0
+            && namespaces & (crate::namespaces::CLONE_NEWNS | crate::namespaces::CLONE_NEWUSER) != 0
+        {
+            return Err(Errno::EINVAL);
+        }
         if flags & THREAD != 0 && flags & SIGHAND == 0 || flags & SIGHAND != 0 && flags & VM == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & THREAD != 0
+            && namespaces & (crate::namespaces::CLONE_NEWUSER | crate::namespaces::CLONE_NEWPID)
+                != 0
+        {
             return Err(Errno::EINVAL);
         }
         if flags & THREAD == 0 {
@@ -1137,6 +1191,16 @@ impl Kernel {
             .sched(parent.tid)
             .forked(self.group.nice(parent.tid).unwrap_or(0))?;
         let task = self.processes.charge_task()?;
+        // copy_namespaces; CLONE_NEWIPC leaves the semaphore adjustments,
+        // which CLONE_SYSVSEM would share.
+        crate::namespaces::check(namespaces, parent.state.credentials.may_administer())?;
+        if namespaces & crate::namespaces::CLONE_NEWIPC != 0 && flags & 0x40000 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let child_namespaces = self
+            .group
+            .namespaces(parent.tid)
+            .for_child(namespaces, true);
         let tid = self.processes.allocate()?;
         if tid > i32::MAX as u32 {
             return Err(Errno::EAGAIN);
@@ -1152,6 +1216,7 @@ impl Kernel {
         let mut state = parent.state.clone();
         self.group
             .set_task_ids(tid, parent.state.credentials.task_ids());
+        self.group.set_namespaces(tid, child_namespaces);
         state.timer = signals::RealTimer::default();
         state.pending.clear();
         // Nothing has come for the new thread yet, which its group counts.

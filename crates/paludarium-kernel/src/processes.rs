@@ -1727,6 +1727,7 @@ impl Kernel {
             },
             314 => self.sched_setattr(thread, mem, a),
             272 => self.unshare(thread, mem, a[0]),
+            308 => self.setns(thread, mem, a),
             // prlimit64, getrlimit, setrlimit
             302 => self.prlimit(thread, mem, a[0], a[1], a[2], a[3]),
             97 => self.prlimit(thread, mem, 0, a[0], 0, a[1]),
@@ -2060,23 +2061,18 @@ impl Kernel {
     /// `CLONE_SIGHAND` and `CLONE_VM` succeed where there is nothing to
     /// unshare (one thread, dispositions and memory no other process shares)
     /// and are `EINVAL` otherwise, as Linux has them; `CLONE_SYSVSEM` has no
-    /// semaphore adjustments to drop. There are no namespaces: the flags of
-    /// one are `EPERM` without CAP_SYS_ADMIN, as on Linux, and `EINVAL` with
-    /// it, as from a kernel built without that namespace, the error `clone`
-    /// gives them here; `CLONE_NEWUSER`, which needs no capability, is
-    /// `EINVAL` too.
+    /// semaphore adjustments to drop. A namespace flag gives the thread a
+    /// new namespace of that kind ([`crate::namespaces::check`] has which).
     fn unshare(&mut self, thread: &Thread, mem: &AddressSpace, flags: u64) -> Result<u64, Errno> {
         const VM: u64 = 0x100;
         const FS: u64 = 0x200;
         const FILES: u64 = 0x400;
         const SIGHAND: u64 = 0x800;
         const THREAD: u64 = 0x1_0000;
-        const NEWNS: u64 = 0x2_0000;
+        const NEWNS: u64 = crate::namespaces::CLONE_NEWNS;
         const SYSVSEM: u64 = 0x4_0000;
-        const NEWUSER: u64 = 0x1000_0000;
-        // CLONE_NEWTIME, NEWCGROUP, NEWUTS, NEWIPC, NEWPID and NEWNET.
-        const NAMESPACES: u64 =
-            0x80 | 0x200_0000 | 0x400_0000 | 0x800_0000 | 0x2000_0000 | 0x4000_0000;
+        const NEWUSER: u64 = crate::namespaces::CLONE_NEWUSER;
+        const NAMESPACES: u64 = crate::namespaces::ALL;
         let mut flags = flags;
         if flags & NEWUSER != 0 {
             flags |= THREAD | FS;
@@ -2106,15 +2102,10 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         // unshare_userns, then unshare_nsproxy_namespaces.
-        if flags & NEWUSER != 0 {
-            return Err(Errno::EINVAL);
-        }
-        if flags & (NEWNS | NAMESPACES) != 0 {
-            return Err(if thread.state.credentials.may_administer() {
-                Errno::EINVAL
-            } else {
-                Errno::EPERM
-            });
+        crate::namespaces::check(flags, thread.state.credentials.may_administer())?;
+        if flags & crate::namespaces::SUPPORTED != 0 {
+            let namespaces = self.group.namespaces(thread.tid).unshared(flags);
+            self.group.set_namespaces(thread.tid, namespaces);
         }
         if flags & (FS | FILES) != 0 {
             self.files = self.files.for_clone(flags & FILES == 0, flags & FS == 0);
@@ -2198,6 +2189,132 @@ impl Kernel {
         }
         Ok(0)
     }
+    /// `setns(fd, nstype)`, as Linux's: `fd` is a namespace file of
+    /// `/proc/<pid>/ns`, whose kind `nstype` names or is 0, or a pidfd and
+    /// the namespaces of its process to enter (`EINVAL` for none or another
+    /// flag). Each is checked in Linux's order (`validate_nsset`) before
+    /// any is entered: the user namespace is the thread's own (`EINVAL`);
+    /// a mount namespace needs CAP_SYS_ADMIN and CAP_SYS_CHROOT, and a
+    /// working directory no other thread shares when it is all that is
+    /// entered; a time namespace a thread alone in its memory (`EUSERS`);
+    /// every one CAP_SYS_ADMIN (`EPERM`). Entering a mount namespace moves
+    /// the working directory to its root; a PID namespace is the one
+    /// children take, and a time namespace is the thread's and its
+    /// children's.
+    fn setns(&mut self, thread: &Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
+        use crate::namespaces::{self as ns, Kind};
+        const CAP_SYS_CHROOT: u64 = 1 << 18;
+        const CAP_SYS_PTRACE: u64 = 1 << 19;
+        let flags = a[1];
+        let d = self.files.descriptor(a[0])?;
+        let any = d.file.as_any();
+        let (flags, theirs) =
+            if let Some(file) = any.and_then(|v| v.downcast_ref::<ns::NamespaceFile>()) {
+                let kind = file.namespace.kind.flag();
+                if flags != 0 && flags != kind {
+                    return Err(Errno::EINVAL);
+                }
+                (kind, Err(file.namespace.clone()))
+            } else if let Some(pidfd) = any.and_then(|v| v.downcast_ref::<PidFd>()) {
+                if flags == 0 || flags & !ns::ALL != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let view = self
+                    .processes
+                    .view(pidfd.pid)
+                    .filter(|view| !view.zombie)
+                    .ok_or(Errno(3))?; // ESRCH
+                // ptrace_may_access with the real IDs.
+                let reader = &thread.state.credentials;
+                let target = view.group.task_ids(pidfd.pid, pidfd.pid);
+                if pidfd.pid != self.process.pid
+                    && reader.effective & CAP_SYS_PTRACE == 0
+                    && !(view.dumpable
+                        && [target.uid, target.euid, target.suid] == [reader.uid; 3]
+                        && [target.gid, target.egid, target.sgid] == [reader.gid; 3])
+                {
+                    return Err(Errno::EPERM);
+                }
+                (flags, Ok(view.group.namespaces(pidfd.pid)))
+            } else {
+                return Err(Errno::EINVAL);
+            };
+        let namespace = |kind: Kind| match &theirs {
+            Err(one) => one.clone(),
+            Ok(all) => match kind {
+                Kind::Net => all.net.clone(),
+                Kind::Uts => all.uts.clone(),
+                Kind::Ipc => all.ipc.clone(),
+                Kind::Pid => all.pid.clone(),
+                Kind::User => all.user.clone(),
+                Kind::Mnt => all.mnt.clone(),
+                Kind::Cgroup => all.cgroup.clone(),
+                Kind::Time => all.time.clone(),
+            },
+        };
+        let credentials = &thread.state.credentials;
+        let admin = credentials.may_administer();
+        let order = [
+            Kind::User,
+            Kind::Mnt,
+            Kind::Uts,
+            Kind::Ipc,
+            Kind::Pid,
+            Kind::Cgroup,
+            Kind::Net,
+            Kind::Time,
+        ];
+        let entered: Vec<Kind> = order
+            .into_iter()
+            .filter(|kind| flags & kind.flag() != 0)
+            .collect();
+        for &kind in &entered {
+            match kind {
+                // userns_install: there is only the first user namespace,
+                // which is the thread's own.
+                Kind::User => return Err(Errno::EINVAL),
+                Kind::Mnt if !admin || credentials.effective & CAP_SYS_CHROOT == 0 => {
+                    return Err(Errno::EPERM);
+                }
+                // With more than the mount namespace, Linux enters it with
+                // a copy of the working directory, which it then gives the
+                // shared one.
+                Kind::Mnt if flags == ns::CLONE_NEWNS && self.files.shares_fs() => {
+                    return Err(Errno::EINVAL);
+                }
+                Kind::Time
+                    if self.group.active_threads() > 1
+                        || self.processes.shares_memory(self.process.pid, mem) =>
+                {
+                    return Err(Errno(87)); // EUSERS
+                }
+                _ if !admin => return Err(Errno::EPERM),
+                _ => {}
+            }
+        }
+        let mut mine = (*self.group.namespaces(thread.tid)).clone();
+        for kind in entered {
+            let new = namespace(kind);
+            match kind {
+                Kind::Net => mine.net = new,
+                Kind::Uts => mine.uts = new,
+                Kind::Ipc => mine.ipc = new,
+                Kind::Pid => mine.pid_for_children = new,
+                Kind::User => mine.user = new,
+                Kind::Mnt => {
+                    mine.mnt = new;
+                    self.files.enter_root();
+                }
+                Kind::Cgroup => mine.cgroup = new,
+                Kind::Time => {
+                    mine.time = new.clone();
+                    mine.time_for_children = new;
+                }
+            }
+        }
+        self.group.set_namespaces(thread.tid, mine);
+        Ok(0)
+    }
     fn clone_process(
         &mut self,
         parent: &Thread,
@@ -2217,7 +2334,17 @@ impl Kernel {
             | 0x200000
             | 0x400000
             | 0x1000000
-            | CLONE_CLEAR_SIGHAND;
+            | CLONE_CLEAR_SIGHAND
+            | crate::namespaces::ALL & !crate::namespaces::CLONE_NEWTIME
+            | crate::namespaces::CLONE3_NEWTIME;
+        // A new mount or user namespace needs a new working directory and
+        // root, which CLONE_FS would share.
+        let namespaces = namespace_flags(flags);
+        if flags & 0x200 != 0
+            && namespaces & (crate::namespaces::CLONE_NEWNS | crate::namespaces::CLONE_NEWUSER) != 0
+        {
+            return Err(Errno::EINVAL);
+        }
         if flags & 0x800 != 0 && flags & 0x100 == 0 || flags & 0xff > 64 {
             return Err(Errno::EINVAL);
         }
@@ -2235,6 +2362,16 @@ impl Kernel {
             .sched(parent.tid)
             .forked(self.group.nice(parent.tid).unwrap_or(0))?;
         let task = self.processes.charge_task()?;
+        // copy_namespaces; CLONE_NEWIPC leaves the semaphore adjustments,
+        // which CLONE_SYSVSEM would share.
+        crate::namespaces::check(namespaces, parent.state.credentials.may_administer())?;
+        if namespaces & crate::namespaces::CLONE_NEWIPC != 0 && flags & 0x40000 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let child_namespaces = self
+            .group
+            .namespaces(parent.tid)
+            .for_child(namespaces, flags & 0x100 != 0);
         let child_mem = if flags & 0x100 == 0 {
             Some(Arc::new(mem.fork()))
         } else {
@@ -2296,6 +2433,7 @@ impl Kernel {
         }
         let release = (flags & 0x4000 != 0).then(|| Arc::new(AtomicBool::new(false)));
         group.set_task_ids(pid, parent.state.credentials.task_ids());
+        group.set_namespaces(pid, child_namespaces);
         self.processes.insert(
             pid,
             self.process.pid,
@@ -2957,6 +3095,9 @@ impl Kernel {
         if let Some(head) = self.group.take_robust_list(thread.tid) {
             crate::futex::exit_robust_list(&self.group.futexes, mem, thread.tid, head);
         }
+        // The program runs in the namespaces of the thread that ran it, and
+        // in the time namespace its children take.
+        let namespaces = self.group.namespaces(thread.tid).exec();
         self.group
             .end_exec(thread.tid, self.process.pid, Arc::clone(&self.inbox));
         // The thread is now the leader, which the process entry counts.
@@ -3004,6 +3145,7 @@ impl Kernel {
             .executed_as(self.process.pid, dumpable, secure || changed, secure);
         self.group
             .reset_task_ids(self.process.pid, credentials.task_ids());
+        self.group.reset_namespaces(self.process.pid, namespaces);
         thread.state.credentials = credentials;
         self.processes.mark_executed(self.process.pid);
         self.exec_memory = Some(Arc::new(memory));
@@ -3013,6 +3155,16 @@ impl Kernel {
 }
 /// `clone3`'s own flag: reset the signal handlers in the child.
 pub(crate) const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
+/// The namespace flags of `clone`'s flags, with `clone3`'s `CLONE_NEWTIME`
+/// as itself.
+pub(crate) fn namespace_flags(flags: u64) -> u64 {
+    let time = if flags & crate::namespaces::CLONE3_NEWTIME != 0 {
+        crate::namespaces::CLONE_NEWTIME
+    } else {
+        0
+    };
+    flags & crate::namespaces::ALL & !crate::namespaces::CLONE_NEWTIME | time
+}
 
 /// Reads `struct clone_args` for `clone3` with Linux's checks in Linux's
 /// order (`copy_clone_args_from_user`, then `clone3_args_valid` and
@@ -3077,6 +3229,12 @@ pub(crate) fn clone3_args(mem: &AddressSpace, address: u64, size: u64) -> Result
     if set_tid != 0 || exit_signal > 64 {
         return Err(Errno::EINVAL);
     }
+    // CLONE_NEWTIME moves out of the exit signal's bits.
+    let flags = if flags & 0x80 != 0 {
+        flags & !0x80 | crate::namespaces::CLONE3_NEWTIME
+    } else {
+        flags
+    };
     Ok([flags | exit_signal, top, parent_tid, child_tid, tls, 0])
 }
 fn read_string(

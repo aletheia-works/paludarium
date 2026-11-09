@@ -2,8 +2,9 @@
 //! (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's mounts,
 //! `loadavg`, `meminfo`, `stat` and `uptime`, and this process's directory with its
 //! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
-//! directory of links to the open descriptors, and its `maps`, which alone
-//! is generated as it is read.
+//! directory of links to the open descriptors, its `ns` directory of links
+//! to its namespaces, and its `maps`, which alone is generated as it is
+//! read.
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_mmu::{MemoryView, Prot, Vma};
 use paludarium_types::Errno;
@@ -80,9 +81,10 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 12] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 13] = [
     (b"task", 4),
     (b"fd", 4),
+    (b"ns", 4),
     (b"environ", 8),
     (b"status", 8),
     (b"comm", 8),
@@ -95,8 +97,9 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 12] = [
     (b"mountinfo", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 8] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 9] = [
     (b"task", 4),
+    (b"ns", 4),
     (b"environ", 8),
     (b"status", 8),
     (b"comm", 8),
@@ -122,6 +125,9 @@ pub(crate) enum TaskEntry {
     Cwd,
     /// `/proc/thread-self`, a link to the reading thread's directory.
     ThreadLink,
+    /// `ns`, the directory of the task's namespaces, and one of its links.
+    Namespaces,
+    Namespace(crate::namespaces::Entry),
     /// A name paludarium does not have there.
     Missing,
 }
@@ -164,22 +170,31 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"comm" => TaskEntry::Comm,
         b"exe" => TaskEntry::Exe,
         b"cwd" => TaskEntry::Cwd,
+        b"ns" => TaskEntry::Namespaces,
+        _ => TaskEntry::Missing,
+    };
+    // An entry of the task's directory, or a link of its `ns`.
+    let entry = |parts: &[&[u8]]| match parts {
+        [name] => file(name),
+        [b"ns", name] => {
+            crate::namespaces::Entry::named(name).map_or(TaskEntry::Missing, TaskEntry::Namespace)
+        }
         _ => TaskEntry::Missing,
     };
     let thread = |name: &[u8]| descriptor_number(name).filter(|&tid| tid != 0);
     let (tid, entry) = match parts[..] {
         [] if thread_self && link_itself => (Some(own_tid), TaskEntry::ThreadLink),
         [] if thread_self => (Some(own_tid), TaskEntry::Directory),
-        [name] if thread_self => (Some(own_tid), file(name)),
-        _ if thread_self => (Some(own_tid), TaskEntry::Missing),
+        _ if thread_self => (Some(own_tid), entry(&parts)),
         [b"task"] => (None, TaskEntry::Threads),
         [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
-        [b"task", tid, name] => (Some(thread(tid)?), file(name)),
-        [b"task", tid, ..] => (Some(thread(tid)?), TaskEntry::Missing),
+        [b"task", tid, ref rest @ ..] => (Some(thread(tid)?), entry(rest)),
+        // The process's own `ns` is here; the rest of its own directory is
+        // `own_entry`'s.
+        [b"ns", ..] => (None, entry(&parts)),
         _ if pid == own => return None,
         [] => (None, TaskEntry::Directory),
-        [name] => (None, file(name)),
-        _ => (None, TaskEntry::Missing),
+        _ => (None, entry(&parts)),
     };
     Some(TaskPath { pid, tid, entry })
 }
@@ -448,6 +463,13 @@ pub(crate) fn self_link_stat() -> FileStat {
         mode: 0o120_777,
         links: 1,
         ..FileStat::default()
+    }
+}
+/// The `stat` of a task's `ns`: 0511, as Linux's `tgid_base_stuff` has it.
+pub(crate) fn namespaces_stat() -> FileStat {
+    FileStat {
+        mode: 0o040_511,
+        ..directory_stat()
     }
 }
 /// The directory's `stat`: 0555, as Linux shows it.

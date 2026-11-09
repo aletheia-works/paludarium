@@ -58,6 +58,94 @@
 
 static void result(const char *name, long value) { printf("%s=%ld\n", name, value); }
 static pid_t child(void) { return syscall(SYS_fork); }
+
+/* The namespaces case. Natively every change happens in a child that has
+   unshared first, so the host's own namespaces stay as they are. */
+#define NS_NEWTIME 0x80
+#define NS_SYS_CLONE3 435
+#define NS_SYS_SETNS 308
+static const char *ns_kinds[] = {"net", "uts", "ipc", "pid", "pid_for_children", "user", "mnt",
+                                 "cgroup", "time", "time_for_children"};
+/* What /proc/<who>/ns/<kind> reads, or "" with errno set. */
+static const char *ns_link(const char *who, const char *kind, char *buf, size_t size) {
+    char path[96];
+    snprintf(path, sizeof path, "/proc/%s/ns/%s", who, kind);
+    ssize_t n = readlink(path, buf, size - 1);
+    buf[n < 0 ? 0 : n] = 0;
+    return buf;
+}
+/* Whether a link reads "<name>:[<digits>]", its namespace's kind. */
+static int ns_named(const char *link, const char *name) {
+    size_t length = strlen(name);
+    if (strncmp(link, name, length) || link[length] != ':' || link[length + 1] != '[') return 0;
+    const char *digit = link + length + 2;
+    if (*digit < '0' || *digit > '9') return 0;
+    while (*digit >= '0' && *digit <= '9') digit++;
+    return digit[0] == ']' && digit[1] == 0;
+}
+static int ns_same(const char *who, const char *kind, const char *other_who, const char *other_kind) {
+    char a[64], b[64];
+    ns_link(who, kind, a, sizeof a);
+    ns_link(other_who, other_kind, b, sizeof b);
+    return a[0] && !strcmp(a, b);
+}
+static int ns_open(const char *who, const char *kind) {
+    char path[96];
+    snprintf(path, sizeof path, "/proc/%s/ns/%s", who, kind);
+    return open(path, O_RDONLY | O_CLOEXEC);
+}
+/* The names as the case started, which are the host's natively and so
+   are compared, never printed. */
+static struct utsname ns_before;
+static void ns_names(const char *label) {
+    struct utsname names;
+    uname(&names);
+    printf("%s: nodename=%s\n", label, names.nodename);
+}
+static void ns_kept(const char *label) {
+    struct utsname names;
+    uname(&names);
+    printf("%s: kept=%d\n", label,
+           !strcmp(names.nodename, ns_before.nodename) && !strcmp(names.domainname, ns_before.domainname));
+}
+static long ns_setns(int fd, long type) {
+    errno = 0;
+    long r = syscall(NS_SYS_SETNS, fd, type);
+    return r < 0 ? -errno : r;
+}
+static int ns_spin_go;
+static void *ns_spinner(void *unused) {
+    (void)unused;
+    while (!__atomic_load_n(&ns_spin_go, __ATOMIC_SEQ_CST)) sched_yield();
+    return NULL;
+}
+static char ns_thread_link[64];
+static char ns_thread_name[65];
+static volatile int ns_thread_done;
+static long ns_thread_set;
+static int ns_thread(void *unused) {
+    (void)unused;
+    struct utsname names;
+    ns_thread_set = syscall(SYS_sethostname, "thread-host", 11);
+    syscall(SYS_uname, &names);
+    memcpy(ns_thread_name, names.nodename, sizeof ns_thread_name);
+    long n = syscall(SYS_readlink, "/proc/thread-self/ns/uts", ns_thread_link, sizeof ns_thread_link - 1);
+    ns_thread_link[n < 0 ? 0 : n] = 0;
+    ns_thread_done = 1;
+    return 0;
+}
+static int ns_exit_child(void *unused) {
+    (void)unused;
+    _exit(0);
+}
+static int ns_uts_child(void *unused) {
+    (void)unused;
+    long r = syscall(SYS_sethostname, "clone-host", 10);
+    printf("clone-child: sethostname=%ld\n", r);
+    ns_names("clone-child");
+    fflush(stdout);
+    _exit(0);
+}
 /* The return value of a call and its errno. */
 static void outcome(const char *name, long value) {
     printf("%s=%ld errno=%d\n", name, value, value < 0 ? errno : 0);
@@ -4714,6 +4802,274 @@ int main(int argc, char **argv) {
         errno = 0;
         result("alone", syscall(SYS_unshare, CLONE_VM|CLONE_SIGHAND));
         result("errno", errno);
+        return 0;
+    }
+    if (!strcmp(mode, "namespaces")) {
+        /* The links of /proc/self/ns, in Linux's order, each naming a
+           namespace of its kind; the ones for children are the thread's own
+           until it unshares. */
+        DIR *dir = opendir("/proc/self/ns");
+        printf("listing:");
+        for (struct dirent *entry; dir && (entry = readdir(dir));) printf(" %s/%d", entry->d_name, entry->d_type);
+        printf("\n");
+        if (dir) closedir(dir);
+        char buf[64];
+        for (int i = 0; i < 10; i++) {
+            const char *kind = ns_kinds[i];
+            const char *name = !strcmp(kind, "pid_for_children") ? "pid"
+                               : !strcmp(kind, "time_for_children") ? "time" : kind;
+            printf("%s: named=%d\n", kind, ns_named(ns_link("self", kind, buf, sizeof buf), name));
+        }
+        printf("for-children: pid=%d time=%d\n", ns_same("self", "pid", "self", "pid_for_children"),
+               ns_same("self", "time", "self", "time_for_children"));
+        /* The link and the namespace's file it leads to, whose inode is the
+           number in the link. */
+        struct stat link, file;
+        int listed = lstat("/proc/self/ns/uts", &link), stated = stat("/proc/self/ns/uts", &file);
+        unsigned long number = 0;
+        sscanf(ns_link("self", "uts", buf, sizeof buf), "uts:[%lu]", &number);
+        printf("lstat=%d mode=%o stat=%d mode=%o links=%lu size=%ld inode=%d\n", listed, link.st_mode, stated,
+               file.st_mode, (unsigned long)file.st_nlink, (long)file.st_size, file.st_ino == number);
+        errno = 0;
+        printf("missing=%d errno=%d\n", lstat("/proc/self/ns/nothing", &link), errno);
+        /* An open namespace file is a handle: reading is EINVAL, seeking
+           ESPIPE, and its descriptor's link names the namespace. */
+        int fd = ns_open("self", "uts");
+        char byte;
+        errno = 0;
+        long got = read(fd, &byte, 1);
+        printf("read=%ld errno=%d", got, errno);
+        errno = 0;
+        got = lseek(fd, 0, SEEK_SET);
+        printf(" lseek=%ld errno=%d", got, errno);
+        struct stat held;
+        fstat(fd, &held);
+        char fd_path[64], fd_link[64];
+        snprintf(fd_path, sizeof fd_path, "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(fd_path, fd_link, sizeof fd_link - 1);
+        fd_link[n < 0 ? 0 : n] = 0;
+        printf(" fstat-inode=%d fd-link=%d\n", held.st_ino == file.st_ino, !strcmp(fd_link, buf));
+        close(fd);
+        errno = 0;
+        printf("o-directory=%d errno=%d\n", open("/proc/self/ns/uts", O_RDONLY | O_DIRECTORY), errno);
+        /* sethostname and setdomainname: CAP_SYS_ADMIN, then at most 64
+           bytes; a negative length is EINVAL too. All of it in a new UTS
+           namespace, which the parent does not see. */
+        uname(&ns_before);
+        char before_uts[64];
+        ns_link("self", "uts", before_uts, sizeof before_uts);
+        int ready[2], go[2];
+        if (pipe(ready) || pipe(go)) return 90;
+        fflush(stdout);
+        pid_t first = child();
+        if (first == 0) {
+            char was[10][64];
+            for (int i = 0; i < 10; i++) ns_link("self", ns_kinds[i], was[i], sizeof was[i]);
+            errno = 0;
+            long r = syscall(SYS_unshare, CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNS | CLONE_NEWCGROUP | NS_NEWTIME);
+            printf("first: unshare=%ld errno=%d changed:", r, errno);
+            for (int i = 0; i < 10; i++) {
+                char now[64];
+                printf(" %s=%d", ns_kinds[i], strcmp(was[i], ns_link("self", ns_kinds[i], now, sizeof now)) != 0);
+            }
+            printf("\n");
+            long host_set = syscall(SYS_sethostname, "first-host", 10);
+            long domain_set = syscall(SYS_setdomainname, "first.example", 13);
+            printf("first: sethostname=%ld setdomainname=%ld\n", host_set, domain_set);
+            ns_names("first");
+            struct utsname set;
+            uname(&set);
+            printf("first: domainname=%s\n", set.domainname);
+            char long_name[66];
+            memset(long_name, 'a', sizeof long_name);
+            errno = 0;
+            r = syscall(SYS_sethostname, long_name, 65);
+            printf("first: long=%ld errno=%d", r, errno);
+            errno = 0;
+            r = syscall(SYS_sethostname, long_name, 64);
+            printf(" full=%ld", r);
+            errno = 0;
+            r = syscall(SYS_setdomainname, long_name, -1);
+            printf(" negative=%ld errno=%d", r, errno);
+            errno = 0;
+            r = syscall(SYS_sethostname, (void *)1, 4);
+            printf(" fault=%ld errno=%d\n", r, errno);
+            struct utsname full;
+            uname(&full);
+            printf("first: full-length=%zu\n", strlen(full.nodename));
+            syscall(SYS_sethostname, "first-host", 10);
+            /* A fork is in the time namespace for children, which the
+               process itself is not. */
+            fflush(stdout);
+            pid_t grandchild = child();
+            if (grandchild == 0) {
+                printf("grandchild: time=%d\n", ns_same("self", "time", "self", "time_for_children"));
+                ns_names("grandchild");
+                fflush(stdout);
+                _exit(0);
+            }
+            result("grandchild", reaped(grandchild));
+            printf("first: time=%d\n", ns_same("self", "time", "self", "time_for_children"));
+            fflush(stdout);
+            close(ready[0]);
+            close(go[1]);
+            if (write(ready[1], "r", 1) != 1) _exit(91);
+            if (read(go[0], &byte, 1) != 1) _exit(92);
+            _exit(0);
+        }
+        char who[16];
+        snprintf(who, sizeof who, "%d", first);
+        close(ready[1]);
+        close(go[0]);
+        if (read(ready[0], &byte, 1) != 1) return 93;
+        ns_kept("parent");
+        printf("parent: uts-kept=%d\n", !strcmp(ns_link("self", "uts", buf, sizeof buf), before_uts));
+        /* setns with a namespace file: its kind or 0; another is EINVAL. */
+        fflush(stdout);
+        pid_t joiner = child();
+        if (joiner == 0) {
+            int uts = ns_open(who, "uts"), mnt = ns_open(who, "mnt"), time = ns_open(who, "time_for_children");
+            long wrong = ns_setns(uts, CLONE_NEWIPC);
+            long right = ns_setns(uts, CLONE_NEWUTS);
+            printf("joiner: opened=%d wrong=%ld right=%ld", uts >= 0 && mnt >= 0 && time >= 0, wrong, right);
+            printf(" same-uts=%d\n", ns_same("self", "uts", who, "uts"));
+            ns_names("joiner");
+            struct utsname joined;
+            uname(&joined);
+            printf("joiner: domainname=%s\n", joined.domainname);
+            /* Away from the root, to the program's own directory, which
+               both sides have. */
+            char home[256];
+            snprintf(home, sizeof home, "%s", self);
+            char *slash = strrchr(home, '/');
+            if (!slash || slash == home) _exit(94);
+            *slash = 0;
+            if (chdir(home)) _exit(94);
+            printf("joiner: mnt=%ld", ns_setns(mnt, 0));
+            char cwd[64];
+            printf(" cwd=%s same-mnt=%d", getcwd(cwd, sizeof cwd) ? cwd : "?", ns_same("self", "mnt", who, "mnt"));
+            long entered = ns_setns(time, 0);
+            printf(" time=%ld same-time=%d", entered, ns_same("self", "time", who, "time_for_children"));
+            printf(" children=%d\n", ns_same("self", "time_for_children", who, "time_for_children"));
+            int regular = open("/proc/self/stat", O_RDONLY);
+            printf("joiner: regular=%ld badf=%ld\n", ns_setns(regular, 0), ns_setns(-1, 0));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("joiner", reaped(joiner));
+        /* setns with a pidfd and the namespaces to enter. */
+        fflush(stdout);
+        pid_t follower = child();
+        if (follower == 0) {
+            int pidfd = syscall(SYS_pidfd_open, first, 0);
+            long none = ns_setns(pidfd, 0), unknown = ns_setns(pidfd, CLONE_VM);
+            long user_too = ns_setns(pidfd, CLONE_NEWUSER | CLONE_NEWUTS);
+            printf("follower: none=%ld unknown=%ld user=%ld", none, unknown, user_too);
+            printf(" same-uts=%d", ns_same("self", "uts", who, "uts"));
+            long all = CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWNET | CLONE_NEWPID |
+                       NS_NEWTIME;
+            printf(" all=%ld\n", ns_setns(pidfd, all));
+            printf("follower: same:");
+            for (int i = 0; i < 10; i++) printf(" %s=%d", ns_kinds[i], ns_same("self", ns_kinds[i], who, ns_kinds[i]));
+            printf("\n");
+            ns_names("follower");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("follower", reaped(follower));
+        /* A time namespace needs the thread alone (EUSERS); a mount
+           namespace a working directory it alone has, unless more than the
+           mount namespace is entered. */
+        fflush(stdout);
+        pid_t threaded = child();
+        if (threaded == 0) {
+            int time = ns_open(who, "time_for_children"), mnt = ns_open(who, "mnt");
+            int pidfd = syscall(SYS_pidfd_open, first, 0);
+            pthread_t thread;
+            pthread_create(&thread, NULL, ns_spinner, NULL);
+            long timed_in = ns_setns(time, 0), mnt_in = ns_setns(mnt, 0);
+            long more = ns_setns(pidfd, CLONE_NEWNS | CLONE_NEWUTS);
+            printf("threaded: time=%ld mnt=%ld more=%ld", timed_in, mnt_in, more);
+            printf(" same-mnt=%d\n", ns_same("self", "mnt", who, "mnt"));
+            __atomic_store_n(&ns_spin_go, 1, __ATOMIC_SEQ_CST);
+            pthread_join(thread, NULL);
+            fflush(stdout);
+            _exit(0);
+        }
+        result("threaded", reaped(threaded));
+        /* Without CAP_SYS_ADMIN, EPERM; another user's links are EACCES. */
+        fflush(stdout);
+        pid_t user = child();
+        if (user == 0) {
+            int uts = ns_open(who, "uts");
+            if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(95);
+            errno = 0;
+            int other = ns_open(who, "ipc");
+            int opened_errno = errno;
+            long refused_setns = ns_setns(uts, 0);
+            printf("user: setns=%ld open=%d errno=%d", refused_setns, other, opened_errno);
+            char path[64];
+            snprintf(path, sizeof path, "/proc/%s/ns/uts", who);
+            errno = 0;
+            n = readlink(path, buf, sizeof buf);
+            printf(" readlink=%ld errno=%d", (long)n, errno);
+            errno = 0;
+            long r = syscall(SYS_sethostname, "x", 1);
+            printf(" sethostname=%ld errno=%d\n", r, errno);
+            fflush(stdout);
+            _exit(0);
+        }
+        result("user", reaped(user));
+        if (write(go[1], "g", 1) != 1) return 96;
+        result("first", reaped(first));
+        /* clone with namespace flags: a child in a new UTS namespace; a new
+           mount namespace with CLONE_FS, or an IPC one with CLONE_SYSVSEM,
+           is EINVAL. */
+        char *stack = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        fflush(stdout);
+        pid_t cloned = clone(ns_uts_child, stack + 65536, CLONE_NEWUTS | SIGCHLD, NULL);
+        result("cloned", reaped(cloned));
+        ns_kept("after-clone");
+        long refused[] = {CLONE_NEWNS | CLONE_FS, CLONE_NEWIPC | CLONE_SYSVSEM};
+        for (int i = 0; i < 2; i++) {
+            errno = 0;
+            pid_t r = clone(ns_exit_child, stack + 65536, refused[i] | SIGCHLD, NULL);
+            printf("refused %#lx: %d errno=%d\n", refused[i], r < 0 ? -1 : 0, errno);
+            if (r > 0) reaped(r);
+        }
+        /* clone3's CLONE_NEWTIME: the child is in the new time namespace,
+           which is its children's too, and its exit signal is SIGCHLD. */
+        uint64_t args[11] = {NS_NEWTIME, 0, 0, 0, SIGCHLD};
+        char parent[16];
+        snprintf(parent, sizeof parent, "%d", getpid());
+        fflush(stdout);
+        long timed = syscall(NS_SYS_CLONE3, args, 88);
+        if (timed == 0) {
+            printf("clone3-child: own=%d new=%d\n", ns_same("self", "time", "self", "time_for_children"),
+                   !ns_same("self", "time", parent, "time") && ns_named(ns_link("self", "time", buf, sizeof buf), "time"));
+            fflush(stdout);
+            _exit(0);
+        }
+        int status;
+        printf("clone3: waited=%d\n", timed > 0 && waitpid(timed, &status, 0) == timed && status == 0);
+        /* A thread with a new UTS namespace of its own, which /proc/self
+           (the leader's) does not show but /proc/thread-self does. */
+        fflush(stdout);
+        pid_t host = child();
+        if (host == 0) {
+            int tid = clone(ns_thread, stack + 65536,
+                            CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_NEWUTS,
+                            NULL);
+            while (tid > 0 && !ns_thread_done) sched_yield();
+            printf("thread: cloned=%d set=%ld name=%s own=%d leader=%d\n", tid > 0, ns_thread_set, ns_thread_name,
+                   ns_named(ns_thread_link, "uts") && strcmp(ns_thread_link, ns_link("self", "uts", buf, sizeof buf)),
+                   !strcmp(ns_link("self", "uts", buf, sizeof buf), before_uts));
+            ns_kept("thread-leader");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("host", reaped(host));
+        ns_kept("end");
         return 0;
     }
     if (!strcmp(mode, "uname")) {

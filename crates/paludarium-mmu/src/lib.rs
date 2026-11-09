@@ -1771,16 +1771,21 @@ impl AddressSpaceData {
                         .range(..=address)
                         .next_back()
                         .is_some_and(|(_, mapping)| address < mapping.end);
-                    // Shared memory and a page-cache page stay as they are; a
-                    // private page without contents gets a frame of its own.
+                    // Shared memory and a page-cache page stay as they are. A
+                    // private page with contents is copied by the first write
+                    // in either space; one without contents gets a frame of
+                    // its own in the child, so that neither space's first
+                    // write fills the other's.
+                    let mut child = page.share();
                     if !is_shared && !page.cache {
                         if page.frame.get().is_some() {
                             page.cow = true;
+                            child.cow = true;
                         } else {
-                            page.frame = Frame::default();
+                            child.frame = Frame::default();
                         }
                     }
-                    cloned.pages[slot] = Some(page.share());
+                    cloned.pages[slot] = Some(child);
                 }
             }
             directory.insert(index, cloned);

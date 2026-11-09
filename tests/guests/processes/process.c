@@ -29,6 +29,7 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <grp.h>
+#include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1128,6 +1129,184 @@ static struct sockaddr_in netns_v4(const char *ip, int port) {
     return address;
 }
 static long netns_result(long r) { return r < 0 ? -errno : r; }
+/* The netlink case: NETLINK_ROUTE's layouts, written out, as musl-gcc has
+   no kernel headers. */
+#define NL_AF_NETLINK 16
+#define NL_ROUTE 0
+#define NL_F_REQUEST 0x1
+#define NL_F_ACK 0x4
+#define NL_F_DUMP 0x300
+struct nl_header {
+    unsigned len;
+    unsigned short type, flags;
+    unsigned seq, pid;
+};
+struct nl_address {
+    unsigned short family, pad;
+    unsigned pid, groups;
+};
+static unsigned nl_seq = 100;
+/* Sends a request of `type` and `flags` with `payload` on `fd`; its
+   sequence number, or -errno. */
+static long nl_send(int fd, unsigned short type, unsigned short flags, const void *payload, size_t len) {
+    char buf[256] = {0};
+    struct nl_header *h = (void *)buf;
+    h->len = sizeof *h + len;
+    h->type = type;
+    h->flags = flags;
+    h->seq = ++nl_seq;
+    memcpy(buf + sizeof *h, payload, len);
+    struct nl_address kernel = {.family = NL_AF_NETLINK};
+    if (sendto(fd, buf, h->len, 0, (void *)&kernel, sizeof kernel) < 0) return -errno;
+    return h->seq;
+}
+/* The attributes of `len` bytes at `at`: calls `each` for every one. */
+static void nl_attributes(const unsigned char *at, int len, void (*each)(unsigned short, const unsigned char *, int)) {
+    while (len >= 4) {
+        unsigned short alen, type;
+        memcpy(&alen, at, 2);
+        memcpy(&type, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        each(type & 0x3fff, at + 4, alen - 4);
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+}
+static void nl_link_attribute(unsigned short type, const unsigned char *v, int len) {
+    unsigned value = 0;
+    if (len == 4) memcpy(&value, v, 4);
+    switch (type) {
+    case 3: printf(" name=%.*s", len, v); break;
+    case 4: printf(" mtu=%u", value); break;
+    case 13: printf(" txqlen=%u", value); break;
+    case 16: printf(" operstate=%u", v[0]); break;
+    case 17: printf(" linkmode=%u", v[0]); break;
+    case 6: printf(" qdisc=%.*s", len, v); break;
+    case 27: printf(" group=%u", value); break;
+    case 33: printf(" carrier=%u", v[0]); break;
+    case 1: printf(" address=%d", len); break;
+    case 2: printf(" broadcast=%d", len); break;
+    case 7: printf(" stats=%d", len); break;
+    case 23: printf(" stats64=%d", len); break;
+    }
+}
+static void nl_address_attribute(unsigned short type, const unsigned char *v, int len) {
+    char text[64] = "";
+    unsigned value = 0;
+    if (len == 4) memcpy(&value, v, 4);
+    printf(" %u", type);
+    if ((type == 1 || type == 2) && (len == 4 || len == 16)) {
+        inet_ntop(len == 4 ? AF_INET : AF_INET6, v, text, sizeof text);
+        printf("=%s", text);
+    } else if (type == 3) {
+        printf("=%.*s", len, v);
+    } else if (type == 8) {
+        printf("=%#x", value);
+    } else if (type == 11) {
+        printf("=%u", v[0]);
+    } else if (type == 6 && len == 16) {
+        unsigned lifetimes[2];
+        memcpy(lifetimes, v, 8);
+        printf("=%#x,%#x", lifetimes[0], lifetimes[1]);
+    }
+}
+/* Receives on `fd` until NLMSG_DONE or an error: prints each message of
+   the answer to request `seq` from `port`, whatever datagrams carry them,
+   and returns how many came, or -errno. */
+static long nl_answer(int fd, long seq, unsigned port, const char *label) {
+    long messages = 0;
+    for (;;) {
+        static char buf[16384];
+        struct nl_address from = {0};
+        struct iovec iov = {buf, sizeof buf};
+        struct msghdr msg = {.msg_name = &from, .msg_namelen = sizeof from, .msg_iov = &iov, .msg_iovlen = 1};
+        long peeked = recv(fd, buf, 1, MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT);
+        if (peeked < 0) return messages ? messages : -errno;
+        long n = recvmsg(fd, &msg, MSG_DONTWAIT);
+        if (n < 0) return -errno;
+        if (n != peeked || from.family != NL_AF_NETLINK || from.pid != 0 || msg.msg_namelen != sizeof from ||
+            msg.msg_flags)
+            printf("%s: datagram n=%ld peeked=%ld from=%u namelen=%u flags=%#x\n", label, n, peeked, from.pid,
+                   msg.msg_namelen, msg.msg_flags);
+        for (char *at = buf; at + sizeof(struct nl_header) <= buf + n;) {
+            struct nl_header *h = (void *)at;
+            if (h->len < sizeof *h || at + h->len > buf + n) break;
+            messages++;
+            unsigned char *body = (void *)(h + 1);
+            int body_len = h->len - sizeof *h;
+            /* Only `lo`: Linux may have fallback tunnels in every
+               namespace, as its ipip and gre modules make them. */
+            int index = 1;
+            if ((h->type == 16 && body_len >= 16) || (h->type == 20 && body_len >= 8)) memcpy(&index, body + 4, 4);
+            at += (h->len + 3) & ~3;
+            if (index != 1) continue;
+            printf("%s: type=%u flags=%#x seq=%d port=%d", label, h->type, h->flags, h->seq == seq, h->pid == port);
+            if (h->type == 2) {
+                printf(" len=%u", h->len);
+                int error;
+                memcpy(&error, body, 4);
+                printf(" error=%d echo=%d\n", error, body_len - 4);
+                return messages;
+            }
+            if (h->type == 3) {
+                printf(" len=%u", h->len);
+                int done;
+                memcpy(&done, body, 4);
+                printf(" done=%d\n", done);
+                return messages;
+            }
+            if (h->type == 16 && body_len >= 16) {
+                unsigned short type;
+                int index;
+                unsigned flags, change;
+                memcpy(&type, body + 2, 2);
+                memcpy(&index, body + 4, 4);
+                memcpy(&flags, body + 8, 4);
+                memcpy(&change, body + 12, 4);
+                printf(" family=%u arphrd=%u index=%d flags=%#x change=%#x", body[0], type, index, flags, change);
+                nl_attributes(body + 16, body_len - 16, nl_link_attribute);
+            } else if (h->type == 20 && body_len >= 8) {
+                int index;
+                memcpy(&index, body + 4, 4);
+                printf(" family=%u prefix=%u flags=%#x scope=%u index=%d attributes", body[0], body[1], body[2],
+                       body[3], index);
+                nl_attributes(body + 8, body_len - 8, nl_address_attribute);
+            }
+            printf("\n");
+        }
+    }
+}
+/* What getifaddrs gives, one line each. */
+static void nl_getifaddrs(const char *label) {
+    struct ifaddrs *list, *i;
+    if (getifaddrs(&list) < 0) {
+        printf("%s: getifaddrs=%d\n", label, -errno);
+        return;
+    }
+    for (i = list; i; i = i->ifa_next) {
+        if (strcmp(i->ifa_name, "lo")) continue;
+        char address[64] = "-", mask[64] = "-";
+        int family = i->ifa_addr ? i->ifa_addr->sa_family : -1;
+        if (family == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, address, sizeof address);
+            inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_netmask)->sin_addr, mask, sizeof mask);
+        } else if (family == AF_INET6) {
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr, address, sizeof address);
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)i->ifa_netmask)->sin6_addr, mask, sizeof mask);
+        }
+        printf("%s: %s family=%d flags=%#x address=%s mask=%s data=%d\n", label, i->ifa_name, family,
+               i->ifa_flags & (IFF_UP | IFF_LOOPBACK | IFF_RUNNING), address, mask, i->ifa_data != NULL);
+    }
+    freeifaddrs(list);
+}
+/* An `ifinfomsg` for interface `index`, setting `flags` of `change`. */
+struct nl_link {
+    unsigned char family, pad;
+    unsigned short type;
+    int index;
+    unsigned flags, change;
+};
 /* The pid-namespaces case: the SIGUSR1s the init of a nested PID
    namespace handled, and the sender the last one showed. */
 static volatile sig_atomic_t pidns_usr1, pidns_from = -1;
@@ -5237,6 +5416,101 @@ int main(int argc, char **argv) {
         result("inner", reaped(inner));
         for (int i = 0; i < 3; i++) unlink(names[i]);
         rmdir(dir);
+        return 0;
+    }
+    if (!strcmp(mode, "netlink")) {
+        /* A child makes a network namespace, whose loopback, its only
+           interface, NETLINK_ROUTE shows and brings up and down. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            printf("socket: stream=%d protocol=%d\n", socket(NL_AF_NETLINK, SOCK_STREAM, NL_ROUTE) < 0 ? -errno : 0,
+                   socket(NL_AF_NETLINK, SOCK_RAW, 40) < 0 ? -errno : 0);
+            int fd = socket(NL_AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NL_ROUTE);
+            struct nl_address name = {0};
+            socklen_t name_len = sizeof name;
+            getsockname(fd, (void *)&name, &name_len);
+            printf("unbound: family=%u pid=%u groups=%u len=%u\n", name.family, name.pid, name.groups, name_len);
+            struct nl_address any = {.family = NL_AF_NETLINK};
+            long short_bind = netns_result(bind(fd, (void *)&any, sizeof any - 1));
+            long bound = netns_result(bind(fd, (void *)&any, sizeof any));
+            name_len = sizeof name;
+            getsockname(fd, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            int other = socket(NL_AF_NETLINK, SOCK_DGRAM, NL_ROUTE);
+            struct nl_address taken = {.family = NL_AF_NETLINK, .pid = port};
+            long in_use = netns_result(bind(other, (void *)&taken, sizeof taken));
+            long other_bound = netns_result(bind(other, (void *)&any, sizeof any));
+            struct nl_address other_name = {0};
+            name_len = sizeof other_name;
+            getsockname(other, (void *)&other_name, &name_len);
+            int type = 0, domain = 0;
+            socklen_t option_len = sizeof type;
+            getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &option_len);
+            option_len = sizeof domain;
+            getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &option_len);
+            printf("bound: short=%ld bound=%ld own=%d in_use=%ld other=%ld negative=%d type=%d domain=%d\n",
+                   short_bind, bound, port == (unsigned)getpid(), in_use, other_bound, (int)other_name.pid < 0, type,
+                   domain);
+            char index_name[IF_NAMESIZE] = "", other_name[IF_NAMESIZE] = "";
+            const char *named = if_indextoname(1, index_name);
+            errno = 0;
+            const char *unnamed = if_indextoname(1000000, other_name);
+            printf("index: lo=%u nope=%u name=%s other=%d errno=%d\n", if_nametoindex("lo"), if_nametoindex("nope"),
+                   named ? named : "-", unnamed != NULL, errno);
+            /* Down: the link alone, and no address. */
+            unsigned char family = 0;
+            nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down link");
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down addr");
+            nl_getifaddrs("down ifaddrs");
+            /* Errors and acknowledgements. */
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            nl_answer(fd, nl_send(fd, 200, NL_F_REQUEST, &family, 1), port, "unknown");
+            struct nl_link nowhere = {.index = 1000000, .flags = IFF_UP, .change = IFF_UP};
+            nl_answer(fd, nl_send(fd, 16, NL_F_REQUEST | NL_F_ACK, &nowhere, sizeof nowhere), port, "nowhere");
+            nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST, &family, 1), port, "short");
+            nl_answer(fd, nl_send(fd, 16, NL_F_ACK, &link, sizeof link), port, "no request");
+            /* Unprivileged, setting is EPERM and getting works. */
+            fflush(stdout);
+            pid_t user = child();
+            if (user == 0) {
+                if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+                int own = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+                struct nl_address mine = {0};
+                socklen_t mine_len = sizeof mine;
+                nl_send(own, 18, NL_F_REQUEST | NL_F_DUMP, &family, 1);
+                getsockname(own, (void *)&mine, &mine_len);
+                nl_answer(own, nl_seq, mine.pid, "user link");
+                nl_answer(own, nl_send(own, 16, NL_F_REQUEST, &link, sizeof link), mine.pid, "user set");
+                fflush(stdout);
+                _exit(0);
+            }
+            result("user", reaped(user));
+            /* Up, without an acknowledgement, then with one. */
+            long up = nl_send(fd, 16, NL_F_REQUEST, &link, sizeof link);
+            printf("up: answer=%ld\n", nl_answer(fd, up, port, "up"));
+            nl_answer(fd, nl_send(fd, 16, NL_F_REQUEST | NL_F_ACK, &link, sizeof link), port, "up again");
+            nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "up link");
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "up addr");
+            unsigned char inet6 = AF_INET6;
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &inet6, 1), port, "up addr6");
+            char by_name[24] = {0};
+            unsigned short attribute[2] = {7, 3};
+            memcpy(by_name + 16, attribute, 4);
+            memcpy(by_name + 20, "lo", 3);
+            nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST, by_name, 23), port, "by name");
+            nl_getifaddrs("up ifaddrs");
+            /* Down again: 127.0.0.1 stays, ::1 goes. */
+            struct nl_link down = {.index = 1, .flags = 0, .change = IFF_UP};
+            nl_answer(fd, nl_send(fd, 19, NL_F_REQUEST | NL_F_ACK, &down, sizeof down), port, "down again");
+            nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again link");
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again addr");
+            nl_getifaddrs("down again ifaddrs");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
         return 0;
     }
     if (!strcmp(mode, "net-namespaces")) {

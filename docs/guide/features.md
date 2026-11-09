@@ -63,9 +63,9 @@ kernel.
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
-| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS` and `SIOCGIFINDEX` of the loopback, and the pseudo-terminals' requests below) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, and the pseudo-terminals' requests below) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
-| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET` and `AF_INET6` with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -187,7 +187,7 @@ kernel.
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
 - Without a [network](#network), outside a new network namespace, `socket()` returns `EAFNOSUPPORT` for
-  `AF_INET` and `AF_INET6`.
+  `AF_INET`, `AF_INET6` and `AF_NETLINK`.
 - `poll` waits like `epoll_wait`: until a descriptor is ready, the timeout
   in milliseconds passes (a negative one never does) or a signal arrives
   (`EINTR`). The host's standard input is readable only with bytes to read
@@ -761,10 +761,36 @@ kernel.
   was made in. An abstract unix socket name (one starting with 0) is bound
   and looked for among the names of the socket's namespace, as Linux's
   `unix_find_abstract`, while a socket file on a path is reached from any
-  namespace. `SIOCGIFFLAGS` and `SIOCGIFINDEX` on a TCP or UDP socket read
-  its namespace's loopback (`IFF_UP | IFF_LOOPBACK | IFF_RUNNING` while it
-  is up, in the first namespace too), and another interface name is
-  `ENODEV`.
+  namespace. `SIOCGIFFLAGS` and `SIOCGIFINDEX` on a TCP, UDP or netlink
+  socket read its namespace's loopback (`IFF_UP | IFF_LOOPBACK | IFF_RUNNING`
+  while it is up, in the first namespace too), and on an AF_UNIX socket,
+  as glibc's and musl's `if_nametoindex` use, the caller's; another
+  interface name is `ENODEV`. `SIOCGIFNAME` (`if_indextoname`) names index 1
+  `lo` (`ENODEV` for another).
+- A netlink socket (`AF_NETLINK`, `SOCK_RAW` or `SOCK_DGRAM`, protocol
+  `NETLINK_ROUTE`) shows and changes the loopback of the network namespace
+  it was made in, so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`
+  and `ip link set lo up` work. As Linux's `af_netlink`, `bind` takes a
+  port ID (`EADDRINUSE` for one another socket has) or with 0 the
+  process's ID, or a negative one when that is taken; `connect` or the
+  first send binds an unbound socket the same way; `getsockname` and
+  `getpeername` give the port and groups; a datagram to another socket's
+  port reaches it (`ECONNREFUSED` for none). The kernel, port 0, takes each
+  message of a datagram as `rtnetlink` does: `RTM_GETLINK` and
+  `RTM_GETADDR` with `NLM_F_DUMP` answer with `lo` (index 1, its flags,
+  name, MTU, queue, state, queueing discipline and zero statistics) and its
+  addresses, `127.0.0.1/8` once it has been up and `::1/128` while it is
+  up, then `NLMSG_DONE` at the next receive; `RTM_GETLINK` without a dump
+  answers for `lo` by index or `IFLA_IFNAME` (`ENODEV` for another);
+  `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`, which
+  needs `CAP_NET_ADMIN` in the user namespace that owns the network
+  namespace, for the sending thread and the socket's opener (`EPERM`). An
+  error, or a success with `NLM_F_ACK`, is answered with `NLMSG_ERROR`,
+  which carries the whole request with an error unless `NETLINK_CAP_ACK`
+  is set. `recvmsg` gives the sender's `sockaddr_nl`, `MSG_PEEK` and
+  `MSG_TRUNC` work, and `SO_RCVBUF`, `SO_SNDBUF`, `SO_RCVTIMEO`,
+  `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and `NETLINK_GET_STRICT_CHK` can be
+  set.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,

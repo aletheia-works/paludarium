@@ -2146,13 +2146,33 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if let Some(result) = crate::pty::ioctl(c, &file, a[1], a[2]) {
             return result;
         }
-        // SIOCGIFFLAGS, SIOCSIFFLAGS and SIOCGIFINDEX of an inet socket's
-        // network, whose interface is its loopback: a `struct ifreq` of 40
-        // bytes, read whole and written back, as Linux's `dev_ioctl` does.
-        if let Some(socket) = crate::inet::of(&file)
+        // SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCGIFINDEX and SIOCGIFNAME of a
+        // socket's network,
+        // whose interface is its loopback: a `struct ifreq` of 40 bytes, read
+        // whole and written back, as Linux's `dev_ioctl` does for a socket of
+        // any family. An inet or netlink socket's network is the one it was
+        // made in; an AF_UNIX socket's is the caller's.
+        let caller_network;
+        let network = if let Some(socket) = crate::inet::of(&file) {
+            Some(socket.network())
+        } else if let Some(socket) = crate::netlink::of(&file) {
+            Some(socket.network())
+        } else if file
+            .as_any()
+            .is_some_and(|v| v.is::<crate::sockets::SocketPairEnd>())
+        {
+            caller_network = c.network();
+            caller_network.as_deref()
+        } else {
+            None
+        };
+        if let Some(network) = network
             && matches!(
                 a[1],
-                crate::inet::SIOCGIFFLAGS | crate::inet::SIOCSIFFLAGS | crate::inet::SIOCGIFINDEX
+                crate::inet::SIOCGIFFLAGS
+                    | crate::inet::SIOCSIFFLAGS
+                    | crate::inet::SIOCGIFINDEX
+                    | crate::inet::SIOCGIFNAME
             )
         {
             const CAP_NET_ADMIN: u64 = 1 << 12;
@@ -2160,6 +2180,20 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             c.mem
                 .read(GuestAddr(a[2]), &mut request)
                 .map_err(|_| Errno::EFAULT)?;
+            // SIOCGIFNAME: the name of the interface `ifr_ifindex` names.
+            if a[1] == crate::inet::SIOCGIFNAME {
+                let index =
+                    i32::from_le_bytes([request[16], request[17], request[18], request[19]]);
+                if index != 1 {
+                    return Err(Errno(19));
+                }
+                request[..16].fill(0);
+                request[..2].copy_from_slice(b"lo");
+                c.mem
+                    .write(GuestAddr(a[2]), &request)
+                    .map_err(|_| Errno::EFAULT)?;
+                return Ok(0);
+            }
             request[15] = 0;
             let flags = u16::from_le_bytes([request[16], request[17]]);
             let namespaces = c.group.namespaces(c.tid);
@@ -2167,9 +2201,7 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .process
                 .credentials
                 .capable_in(CAP_NET_ADMIN, namespaces.net.owner());
-            let value = socket
-                .network()
-                .interface(&request[..16], a[1], flags, admin)?;
+            let value = network.interface(&request[..16], a[1], flags, admin)?;
             match a[1] {
                 crate::inet::SIOCGIFFLAGS => {
                     request[16..18].copy_from_slice(&(value as u16).to_le_bytes());

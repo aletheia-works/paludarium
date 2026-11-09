@@ -553,8 +553,9 @@ impl FileHandle for PipeEnd {
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let number = c.number;
     let result = (|| match number {
-        // AF_INET and AF_INET6, with a network, and AF_UNIX.
+        // AF_INET and AF_INET6, with a network, AF_UNIX and AF_NETLINK.
         41 if a[0] == 1 => crate::unix::socket(c, a),
+        41 if a[0] == 16 => crate::netlink::socket(c, a),
         41 => match c.network() {
             Some(network) if matches!(a[0], 2 | 10) => {
                 if a[1] as u32 & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
@@ -571,6 +572,14 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         {
             let file = c.files.descriptor(a[0])?.file;
             crate::inet::dispatch(c, number, a, &file)
+        }
+        42..=52 | 54 | 55 | 288
+            if c.files
+                .descriptor(a[0])
+                .is_ok_and(|d| crate::netlink::of(&d.file).is_some()) =>
+        {
+            let file = c.files.descriptor(a[0])?.file;
+            crate::netlink::dispatch(c, number, a, &file)
         }
         42 | 43 | 49 | 50 | 51 | 52 | 288
             if let Some(socket) = c

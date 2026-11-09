@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 pub(crate) const SIOCGIFFLAGS: u64 = 0x8913;
 pub(crate) const SIOCSIFFLAGS: u64 = 0x8914;
 pub(crate) const SIOCGIFINDEX: u64 = 0x8933;
+pub(crate) const SIOCGIFNAME: u64 = 0x8910;
 const AF_UNSPEC: u16 = 0;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
@@ -298,6 +299,11 @@ pub(crate) struct Network {
     /// Linux's `addrconf` adds it at `NETDEV_UP` and `addrconf_ifdown`
     /// takes it away at `NETDEV_DOWN` (`keep_addr_on_down` is 0).
     up: AtomicBool,
+    /// Whether its loopback has `127.0.0.1/8`, which Linux's `inetdev_event`
+    /// gives it at its first `NETDEV_UP` and keeps when it goes down.
+    addressed: AtomicBool,
+    /// The netlink sockets bound in it ([`crate::netlink`]).
+    pub(crate) netlink: crate::netlink::Ports,
 }
 /// The flags `SIOCGIFFLAGS` gives the loopback: `IFF_LOOPBACK`, with
 /// `IFF_UP` and `IFF_RUNNING` while it is up.
@@ -316,6 +322,8 @@ impl Network {
             syns: Mutex::default(),
             isolated: false,
             up: AtomicBool::new(true),
+            addressed: AtomicBool::new(true),
+            netlink: crate::netlink::Ports::default(),
         }
     }
     /// A new network namespace's network: only a loopback, down and without
@@ -324,6 +332,7 @@ impl Network {
         Self {
             isolated: true,
             up: AtomicBool::new(false),
+            addressed: AtomicBool::new(false),
             ..Self::new(NetworkPolicy::default())
         }
     }
@@ -341,6 +350,22 @@ impl Network {
     /// Whether the loopback has `::1` to bind to.
     fn has_loopback_address(&self) -> bool {
         self.up.load(Ordering::SeqCst)
+    }
+    /// Whether the loopback is up.
+    pub(crate) fn is_up(&self) -> bool {
+        self.up.load(Ordering::SeqCst)
+    }
+    /// Whether the loopback has `127.0.0.1/8`: once it has been up.
+    pub(crate) fn has_ipv4_address(&self) -> bool {
+        self.addressed.load(Ordering::SeqCst)
+    }
+    /// Brings the loopback up or down, as `SIOCSIFFLAGS` or netlink's
+    /// `RTM_NEWLINK` with `IFF_UP` does.
+    pub(crate) fn set_up(&self, up: bool) {
+        if up {
+            self.addressed.store(true, Ordering::SeqCst);
+        }
+        self.up.store(up, Ordering::SeqCst);
     }
     /// `SIOCGIFFLAGS`, `SIOCSIFFLAGS` and `SIOCGIFINDEX` on the interface
     /// `name` (the `ifr_name` of a `struct ifreq`): the loopback `lo`, index
@@ -369,7 +394,7 @@ impl Network {
                 IFF_LOOPBACK
             })),
             SIOCSIFFLAGS => {
-                self.up.store(flags & IFF_UP != 0, Ordering::SeqCst);
+                self.set_up(flags & IFF_UP != 0);
                 Ok(0)
             }
             _ => Ok(1),
@@ -2325,7 +2350,7 @@ fn read_address(
     parse_address(socket.family, &read_raw(c, at, len)?)
 }
 /// The `len` bytes of a socket address at `at`, as `move_addr_to_kernel`.
-fn read_raw(c: &Context<'_>, at: u64, len: u64) -> Result<Vec<u8>, Errno> {
+pub(crate) fn read_raw(c: &Context<'_>, at: u64, len: u64) -> Result<Vec<u8>, Errno> {
     let len = usize::try_from(len as u32 as i32)
         .ok()
         .filter(|&len| len <= 128)
@@ -2410,7 +2435,12 @@ fn encode_address(family: Family, address: SocketAddr) -> Vec<u8> {
 /// Writes `address` to `at` with its length at `len_at`, as
 /// `move_addr_to_user`: the length read there first (EFAULT, EINVAL when
 /// negative) bounds the bytes written, and the full length goes back.
-fn write_address(c: &Context<'_>, address: &[u8], at: u64, len_at: u64) -> Result<(), Errno> {
+pub(crate) fn write_address(
+    c: &Context<'_>,
+    address: &[u8],
+    at: u64,
+    len_at: u64,
+) -> Result<(), Errno> {
     let mut raw = [0; 4];
     c.mem
         .read(GuestAddr(len_at), &mut raw)

@@ -55,9 +55,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`、後述の疑似端末のリクエスト） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
-| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET` と `AF_INET6`、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -168,7 +168,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書きます。新しいスレッドとプロセスのリストは空です。
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
-- [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET` と `AF_INET6` に
+- [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET`、`AF_INET6`、`AF_NETLINK` に
   `EAFNOSUPPORT` を返します。
 - `poll` は `epoll_wait` と同じように、どれかの記述子が準備できるか、ミリ秒の
   タイムアウトが過ぎるか（負の値なら過ぎません）、シグナルが届くまで（`EINTR`）待ちます。
@@ -686,10 +686,33 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   そこにはループバックがあります。ソケットは作られた名前空間に残ります。抽象名前空間の
   unix ソケットの名前（0 で始まるもの）は、Linux の `unix_find_abstract` と同じく
   ソケットの名前空間の名前の中で bind され、探されます。パスのソケットファイルには
-  どの名前空間からも届きます。TCP や UDP のソケットへの `SIOCGIFFLAGS` と
+  どの名前空間からも届きます。TCP、UDP、netlink のソケットへの `SIOCGIFFLAGS` と
   `SIOCGIFINDEX` は、その名前空間のループバックを読みます（上がっている間は最初の
-  名前空間でも `IFF_UP | IFF_LOOPBACK | IFF_RUNNING`）。ほかのインターフェースの名前は
-  `ENODEV` です。
+  名前空間でも `IFF_UP | IFF_LOOPBACK | IFF_RUNNING`）。glibc と musl の
+  `if_nametoindex` が使う AF_UNIX のソケットへのものは、呼び出し元の名前空間のものを
+  読みます。ほかのインターフェースの名前は `ENODEV` です。`SIOCGIFNAME`
+  （`if_indextoname`）は、インデックス 1 を `lo` と答えます（ほかは `ENODEV`）。
+- netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
+  `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。
+  そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`、`ip link set lo up` が
+  動きます。Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが持つものは
+  `EADDRINUSE`）を、0 ならプロセスの ID を、それが使われていれば負の ID を取ります。
+  bind していないソケットは、`connect` か最初の送信で同じように bind されます。
+  `getsockname` と `getpeername` はポートとグループを返し、ほかのソケットのポートへの
+  データグラムはそのソケットに届きます（なければ `ECONNREFUSED`）。カーネル（ポート 0）は、
+  `rtnetlink` と同じくデータグラムのメッセージを 1 つずつ受け取ります。`NLM_F_DUMP` を
+  付けた `RTM_GETLINK` と `RTM_GETADDR` には、`lo`（インデックス 1、そのフラグ、名前、MTU、
+  キュー、状態、キューイング規律、0 の統計）とそのアドレス（1 度でも上がった後の
+  `127.0.0.1/8` と、上がっている間の `::1/128`）を返し、次の受信で `NLMSG_DONE` を
+  返します。ダンプでない `RTM_GETLINK` には、インデックスか `IFLA_IFNAME` で指した `lo` を
+  返します（ほかは `ENODEV`）。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
+  それには、ネットワーク名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送る
+  スレッドとソケットを開いたものの両方に要ります（なければ `EPERM`）。エラーと、
+  `NLM_F_ACK` を付けた成功には `NLMSG_ERROR` を返します。エラーのものは、
+  `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`recvmsg` は送り手の
+  `sockaddr_nl` を返し、`MSG_PEEK` と `MSG_TRUNC` が使えます。`SO_RCVBUF`、`SO_SNDBUF`、
+  `SO_RCVTIMEO`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、`NETLINK_GET_STRICT_CHK` を
+  設定できます。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、

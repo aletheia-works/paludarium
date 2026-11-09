@@ -3631,3 +3631,179 @@ fn a_network_namespace_has_abstract_names_of_its_own() {
         Errno(98).to_syscall_return()
     );
 }
+/// A netlink request at `at`: a header of `kind`, `flags` and `seq`, then
+/// `payload`. Its length.
+fn netlink_request(f: &Fixture, at: u64, kind: u16, flags: u16, seq: u32, payload: &[u8]) -> u64 {
+    let len = 16 + payload.len();
+    let mut raw = (len as u32).to_le_bytes().to_vec();
+    raw.extend_from_slice(&kind.to_le_bytes());
+    raw.extend_from_slice(&flags.to_le_bytes());
+    raw.extend_from_slice(&seq.to_le_bytes());
+    raw.extend_from_slice(&0u32.to_le_bytes());
+    raw.extend_from_slice(payload);
+    f.mem.write(GuestAddr(at), &raw).unwrap();
+    len as u64
+}
+/// The messages of the datagrams `fd` has, until `NLMSG_DONE` or nothing
+/// waits: each one's type, flags, sequence number, port and payload.
+fn netlink_replies(f: &mut Fixture, fd: u64) -> Vec<(u16, u16, u32, u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    loop {
+        let n = f.ret(45, [fd, DATA + 0x1000, 0x1000, 0x40, 0, 0]);
+        if n as i64 <= 0 {
+            return out;
+        }
+        let mut raw = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x1000), &mut raw).unwrap();
+        let mut rest = &raw[..];
+        while rest.len() >= 16 {
+            let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            let kind = u16::from_le_bytes([rest[4], rest[5]]);
+            out.push((
+                kind,
+                u16::from_le_bytes([rest[6], rest[7]]),
+                u32::from_le_bytes(rest[8..12].try_into().unwrap()),
+                u32::from_le_bytes(rest[12..16].try_into().unwrap()),
+                rest[16..len].to_vec(),
+            ));
+            if kind == 3 {
+                return out;
+            }
+            rest = &rest[(len + 3) & !3..];
+        }
+    }
+}
+#[test]
+fn netlink_dumps_and_sets_a_new_namespaces_loopback() {
+    let mut f = Fixture::new();
+    let errno = |e: i32| Errno(e).to_syscall_return();
+    // No network, no netlink; a new namespace has one.
+    assert_eq!(f.ret(41, [16, 3, 0, 0, 0, 0]), errno(97));
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(f.ret(41, [16, 1, 0, 0, 0, 0]), errno(94));
+    assert_eq!(f.ret(41, [16, 3, 16, 0, 0, 0]), errno(93));
+    let fd = f.ret(41, [16, 3 | 0x80000, 0, 0, 0, 0]);
+    assert!(fd < 1024);
+    // Unbound, its name has port 0; a send binds it to the process's ID.
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &12u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(51, [fd, DATA + 0x100, DATA + 0x200, 0, 0, 0]), 0);
+    assert_eq!(read_u32(&f, DATA + 0x104), 0);
+    let len = netlink_request(&f, DATA, 18, 0x301, 7, &[0]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(f.ret(51, [fd, DATA + 0x100, DATA + 0x200, 0, 0, 0]), 0);
+    let port = read_u32(&f, DATA + 0x104);
+    assert_eq!(port, 1);
+    // The link dump: `lo`, down, then NLMSG_DONE in a datagram of its own.
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies.len(), 2);
+    let (kind, flags, seq, to, payload) = &replies[0];
+    assert_eq!((*kind, *flags, *seq, *to), (16, 2, 7, port));
+    assert_eq!(&payload[2..8], &[4, 3, 1, 0, 0, 0]);
+    assert_eq!(&payload[8..12], &8u32.to_le_bytes());
+    assert_eq!(&replies[1].0, &3);
+    assert_eq!(&replies[1].4, &0i32.to_le_bytes());
+    // Down, there is no address; a dump of anything else is EOPNOTSUPP.
+    let len = netlink_request(&f, DATA, 22, 0x301, 8, &[0]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].0, 3);
+    let len = netlink_request(&f, DATA, 26, 0x301, 9, &[0]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies[0].0, 2);
+    assert_eq!(&replies[0].4[..4], &(-95i32).to_le_bytes());
+    // RTM_NEWLINK with IFF_UP brings it up, acknowledged with NLM_F_ACK.
+    let mut info = [0u8; 16];
+    info[4..8].copy_from_slice(&1i32.to_le_bytes());
+    info[8..12].copy_from_slice(&1u32.to_le_bytes());
+    info[12..16].copy_from_slice(&1u32.to_le_bytes());
+    let len = netlink_request(&f, DATA, 16, 0x5, 10, &info);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies.len(), 1);
+    assert_eq!((replies[0].0, replies[0].1, replies[0].2), (2, 0x100, 10));
+    assert_eq!(&replies[0].4[..4], &0i32.to_le_bytes());
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    assert_eq!(loopback_field(&mut f, udp, 0x8913), 0x49);
+    // Up, both addresses, IPv4's first; AF_INET6 alone gives `::1`.
+    let len = netlink_request(&f, DATA, 22, 0x301, 11, &[0]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies.len(), 3);
+    assert_eq!(&replies[0].4[..8], &[2, 8, 0x80, 254, 1, 0, 0, 0]);
+    assert_eq!(&replies[1].4[..8], &[10, 128, 0x80, 254, 1, 0, 0, 0]);
+    let len = netlink_request(&f, DATA, 22, 0x301, 12, &[10]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(netlink_replies(&mut f, fd).len(), 2);
+    // RTM_GETLINK by name answers once, unless the name is another's.
+    let mut by_name = [0u8; 24];
+    by_name[16..20].copy_from_slice(&[7, 0, 3, 0]);
+    by_name[20..23].copy_from_slice(b"lo\0");
+    let len = netlink_request(&f, DATA, 18, 0x1, 13, &by_name[..23]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies.len(), 1);
+    assert_eq!((replies[0].0, replies[0].1), (16, 0));
+    by_name[20..23].copy_from_slice(b"no\0");
+    let len = netlink_request(&f, DATA, 18, 0x1, 14, &by_name[..23]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(&replies[0].4[..4], &(-19i32).to_le_bytes());
+    // Nothing waits: EAGAIN without waiting.
+    assert_eq!(
+        f.ret(45, [fd, DATA + 0x1000, 16, 0x40, 0, 0]),
+        Errno::EAGAIN.to_syscall_return()
+    );
+    // A second socket binds elsewhere, and a datagram to it reaches it.
+    let other = f.ret(41, [16, 2, 0, 0, 0, 0]);
+    let mut name = [0u8; 12];
+    name[0] = 16;
+    f.mem.write(GuestAddr(DATA + 0x100), &name).unwrap();
+    assert_eq!(f.ret(49, [other, DATA + 0x100, 12, 0, 0, 0]), 0);
+    assert_eq!(f.ret(51, [other, DATA + 0x100, DATA + 0x200, 0, 0, 0]), 0);
+    let other_port = read_u32(&f, DATA + 0x104);
+    assert!((other_port as i32) < -4096);
+    assert_eq!(f.ret(49, [other, DATA + 0x100, 11, 0, 0, 0]), errno(22));
+    name[4..8].copy_from_slice(&port.to_le_bytes());
+    f.mem.write(GuestAddr(DATA + 0x100), &name).unwrap();
+    assert_eq!(f.ret(49, [other, DATA + 0x100, 12, 0, 0, 0]), errno(22));
+    name[4..8].copy_from_slice(&other_port.to_le_bytes());
+    f.mem.write(GuestAddr(DATA + 0x100), &name).unwrap();
+    f.mem.write(GuestAddr(DATA), b"hi").unwrap();
+    assert_eq!(f.ret(44, [fd, DATA, 2, 0, DATA + 0x100, 12]), 2);
+    assert_eq!(
+        f.ret(
+            45,
+            [other, DATA + 0x1000, 16, 0x40, DATA + 0x100, DATA + 0x200]
+        ),
+        2
+    );
+    assert_eq!(read_u32(&f, DATA + 0x104), port);
+    // Without CAP_NET_ADMIN, anything but a GET is EPERM.
+    f.thread.state.credentials = f
+        .thread
+        .state
+        .credentials
+        .setresuid(1000, 1000, 1000)
+        .unwrap();
+    let len = netlink_request(&f, DATA, 16, 0x1, 15, &info);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(&replies[0].4[..4], &(-1i32).to_le_bytes());
+    assert_eq!(loopback_field(&mut f, udp, 0x8913), 0x49);
+}
+#[test]
+fn interface_requests_take_unix_and_netlink_sockets() {
+    let mut f = network_fixture(&[]);
+    let unix = f.ret(41, [1, 2, 0, 0, 0, 0]);
+    assert_eq!(loopback_field(&mut f, unix, 0x8933), 1);
+    let netlink = f.ret(41, [16, 3, 0, 0, 0, 0]);
+    assert_eq!(loopback_field(&mut f, netlink, 0x8913), 0x49);
+    // The first namespace's loopback has both addresses from the start.
+    let len = netlink_request(&f, DATA, 22, 0x301, 1, &[0]);
+    assert_eq!(f.ret(44, [netlink, DATA, len, 0, 0, 0]), len);
+    assert_eq!(netlink_replies(&mut f, netlink).len(), 3);
+}

@@ -257,11 +257,25 @@ verified.
   where Linux gives them to root of the process's own when it maps one.
   There are no file capabilities, in a user namespace either. A network
   namespace has no interface but its
-  loopback (no `veth` pairs to reach another), and there is no netlink
-  (`AF_NETLINK`), so `ip link set lo up` cannot bring the loopback up: only
-  `SIOCSIFFLAGS` on a TCP or UDP socket does, and the interface requests
-  take no other socket and no other flag than `IFF_UP`. The first namespace
-  shows `lo` alone too, where Linux shows the host's interfaces. The other namespaces keep nothing apart that
+  loopback (no `veth` pairs to reach another), and the interface requests
+  and netlink change no other flag than `IFF_UP`; an AF_UNIX socket's
+  interface requests see the caller's namespace, not the one the socket
+  was made in. The first namespace shows `lo` alone too, where Linux shows
+  the host's interfaces. Netlink has only `NETLINK_ROUTE`
+  (`EPROTONOSUPPORT` for `NETLINK_GENERIC` and the rest), and of it only
+  the link and address requests: routes, neighbours, rules, queueing
+  disciplines and the rest are `EOPNOTSUPP`, as are adding or removing an
+  address, a non-dump `RTM_GETADDR`, renaming `lo` and setting any other
+  attribute of it. No notification is sent to a multicast group, though
+  `bind` takes groups; `NETLINK_ADD_MEMBERSHIP` and the other options not
+  listed in the features are `ENOPROTOOPT`. A link message carries a
+  subset of Linux's attributes (no `IFLA_AF_SPEC`, `IFLA_MAP`, `IFLA_XDP`
+  and others), its statistics are zero, an address's creation times are 0,
+  `NETLINK_EXT_ACK` adds no attributes to an error and strict checking
+  checks nothing more. A dump is answered whole at once, where Linux may
+  split it over datagrams, and a socket whose receive buffer is full drops
+  an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
+  acts with the capability of the thread that opened it alone. The other namespaces keep nothing apart that
   paludarium has, but for the System V shared memory of an IPC namespace:
   there are no System V semaphores, System V message queues or POSIX
   message queues for one, no `mount` for a mount namespace (whose mounts keep their IDs

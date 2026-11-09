@@ -1111,6 +1111,85 @@ static int reaped(long pid) {
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+/* The pid-set-tid case: clone3 with `flags`, `exit_signal` and the numbers
+   `tids` of set_tid, from the innermost PID namespace out. The child's PID,
+   0 in the child, or -errno. */
+static long settid_clone(unsigned long long flags, int exit_signal, const pid_t *tids, int count) {
+    struct {
+        unsigned long long flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid,
+            set_tid_size;
+    } args = {flags, 0, 0, 0, (unsigned)exit_signal, 0, 0, 0, (unsigned long)tids, (unsigned)count};
+    fflush(stdout);
+    errno = 0;
+    long r = syscall(435, &args, sizeof args);
+    return r < 0 ? -errno : r;
+}
+/* An error of settid_clone, whose child (when there is one) exits. */
+static long settid_error(unsigned long long flags, int exit_signal, const pid_t *tids, int count) {
+    long r = settid_clone(flags, exit_signal, tids, count);
+    if (r == 0) _exit(99);
+    if (r > 0) waitpid(r, NULL, __WALL);
+    return r < 0 ? r : 1000;
+}
+/* The numbers of line `name` of /proc/self/status, at most 4; how many. */
+static int settid_numbers(const char *name, long *numbers) {
+    FILE *file = fopen("/proc/self/status", "r");
+    char line[256];
+    int count = 0;
+    size_t length = strlen(name);
+    while (file && fgets(line, sizeof line, file)) {
+        if (strncmp(line, name, length) || line[length] != ':') continue;
+        char *at = line + length + 1, *end;
+        while (count < 4) {
+            long value = strtol(at, &end, 10);
+            if (end == at) break;
+            numbers[count++] = value;
+            at = end;
+        }
+        break;
+    }
+    if (file) fclose(file);
+    return count;
+}
+/* /proc/self/stat's PID, process group and session, as /proc's PID
+   namespace numbers them. */
+static void settid_stat(long *pid, long *group, long *session) {
+    char buf[512] = {0};
+    FILE *file = fopen("/proc/self/stat", "r");
+    if (file) {
+        if (!fgets(buf, sizeof buf, file)) buf[0] = 0;
+        fclose(file);
+    }
+    char *close = strrchr(buf, ')');
+    *pid = strtol(buf, NULL, 10);
+    *group = *session = -1;
+    if (close) sscanf(close + 2, "%*c %*d %ld %ld", group, session);
+}
+/* The NS* lines of /proc/self/status: how many numbers each has, and
+   whether the first of each is what /proc/self/stat gives. */
+static void settid_lines(const char *who) {
+    long pid, group, session, numbers[4];
+    settid_stat(&pid, &group, &session);
+    const char *names[] = {"NStgid", "NSpid", "NSpgid", "NSsid"};
+    long firsts[] = {pid, pid, group, session};
+    printf("%s:", who);
+    for (int i = 0; i < 4; i++) {
+        int count = settid_numbers(names[i], numbers);
+        printf(" %s=%d/%d", names[i], count, count > 0 && numbers[0] == firsts[i]);
+        for (int j = 1; j < count; j++) printf(",%ld", numbers[j]);
+    }
+    /* In Linux's place, right after Groups. */
+    FILE *file = fopen("/proc/self/status", "r");
+    char line[256];
+    int after = 0;
+    while (file && fgets(line, sizeof line, file)) {
+        if (strncmp(line, "Groups:", 7)) continue;
+        after = fgets(line, sizeof line, file) && !strncmp(line, "NStgid:", 7);
+        break;
+    }
+    if (file) fclose(file);
+    printf(" after-groups=%d\n", after);
+}
 /* The net-namespaces case: a request of the loopback interface on `fd`,
    its result (the flags, or the index) or -errno. */
 static long netns_lo(int fd, unsigned long request, const char *name, short flags) {
@@ -4517,6 +4596,256 @@ static long shm_call(long number, long a, long b, long c) {
     return syscall(number, a, b, c);
 }
 
+/* rseq: registration, the abort of a critical section that a signal or
+ * membarrier interrupts, and the descriptors Linux does not accept.
+ * Each section spins until SIGUSR1 sets the flag: rseq_spin returns 1 when
+ * the kernel sent it to the abort handler, 0 when it committed. Another
+ * thread sends the signal once the spinning one is ready, with no timer,
+ * so that no clock has to move. */
+__asm__(".text\n"
+        ".globl rseq_spin\n"
+        "rseq_spin:\n"
+        "    movq %rcx, (%rdi)\n"
+        ".globl rseq_spin_start\n"
+        "rseq_spin_start:\n"
+        "    movl $1, (%rsi)\n"
+        "1:  cmpl $0, (%rdx)\n"
+        "    je 1b\n"
+        ".globl rseq_spin_end\n"
+        "rseq_spin_end:\n"
+        "    xorl %eax, %eax\n"
+        "    ret\n"
+        "    .long 0x53053053\n"
+        ".globl rseq_spin_abort\n"
+        "rseq_spin_abort:\n"
+        "    movl $1, %eax\n"
+        "    ret\n"
+        ".globl rseq_unsigned\n"
+        "rseq_unsigned:\n"
+        "    leaq rseq_unsigned_cs(%rip), %rax\n"
+        "    movq %rax, (%rdi)\n"
+        "rseq_unsigned_start:\n"
+        "    movl $1, (%rsi)\n"
+        "1:  cmpl $0, (%rdx)\n"
+        "    je 1b\n"
+        "rseq_unsigned_end:\n"
+        "    xorl %eax, %eax\n"
+        "    ret\n"
+        "    .long 0x12345678\n"
+        "rseq_unsigned_abort:\n"
+        "    movl $1, %eax\n"
+        "    ret\n"
+        ".data\n"
+        ".balign 32\n"
+        ".globl rseq_spin_cs\n"
+        "rseq_spin_cs:\n"
+        "    .long 0, 0\n"
+        "    .quad rseq_spin_start, rseq_spin_end - rseq_spin_start, rseq_spin_abort\n"
+        ".balign 32\n"
+        "rseq_unsigned_cs:\n"
+        "    .long 0, 0\n"
+        "    .quad rseq_unsigned_start, rseq_unsigned_end - rseq_unsigned_start, rseq_unsigned_abort\n"
+        ".text\n");
+int rseq_spin(volatile uint64_t *cs, volatile int *ready, volatile int *flag, const void *descriptor);
+int rseq_unsigned(volatile uint64_t *cs, volatile int *ready, volatile int *flag);
+extern char rseq_spin_start[], rseq_spin_end[], rseq_spin_abort[], rseq_spin_cs[];
+
+struct rseq_area {
+    uint32_t cpu_id_start, cpu_id;
+    uint64_t rseq_cs;
+    uint32_t flags, node_id, mm_cid, pad;
+} __attribute__((aligned(32)));
+struct rseq_desc {
+    uint32_t version, flags;
+    uint64_t start, length, abort;
+} __attribute__((aligned(32)));
+
+#define RSEQ_SIGNATURE 0x53053053
+static volatile int rseq_flag, rseq_ready;
+/* Volatile: the kernel reads and writes them behind the compiler's back. */
+static volatile struct rseq_area rseq_main, rseq_other;
+static _Alignas(32) char rseq_space[128];
+
+static void rseq_alarm(int sig) {
+    (void)sig;
+    rseq_flag = 1;
+}
+
+static long rseq_call(volatile void *area, unsigned length, int flags, unsigned signature) {
+    errno = 0;
+    long r = syscall(334, (void *)area, length, flags, signature);
+    return r < 0 ? -errno : r;
+}
+
+/* Sends the calling thread SIGUSR1, which sets the flag, from another
+ * thread once `ready` is set. */
+struct rseq_sender {
+    volatile int *ready;
+    pid_t pid, tid;
+    pthread_t thread;
+};
+
+static void *rseq_send(void *argument) {
+    struct rseq_sender *sender = argument;
+    while (!*sender->ready) {}
+    syscall(SYS_tgkill, sender->pid, sender->tid, SIGUSR1);
+    return 0;
+}
+
+static void rseq_arm(struct rseq_sender *sender) {
+    rseq_flag = 0;
+    rseq_ready = 0;
+    sender->ready = &rseq_ready;
+    sender->pid = getpid();
+    sender->tid = (pid_t)syscall(SYS_gettid);
+    if (pthread_create(&sender->thread, 0, rseq_send, sender)) _exit(60);
+}
+
+/* The signal a child ends by when it spins while its area's rseq_cs is
+ * `desc` and a signal comes: in the unsigned section when `desc` is 0, in
+ * the section `desc` describes when `inside`, else outside it. */
+static int rseq_child_dies(struct rseq_desc *desc, int inside) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct rlimit none = {0, 0};
+        setrlimit(RLIMIT_CORE, &none);
+        struct rseq_sender sender;
+        rseq_arm(&sender);
+        if (!desc) _exit(rseq_unsigned(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag) + 50);
+        if (inside) _exit(rseq_spin(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag, desc) + 50);
+        rseq_main.rseq_cs = (uint64_t)desc;
+        rseq_ready = 1;
+        while (!rseq_flag) {}
+        _exit(40);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child) return -1;
+    return WIFSIGNALED(status) ? WTERMSIG(status) : 100 + WEXITSTATUS(status);
+}
+
+static volatile int rseq_other_flag, rseq_other_ready, rseq_other_result;
+
+static void *rseq_other_thread(void *unused) {
+    (void)unused;
+    if (rseq_call(&rseq_other, 32, 0, RSEQ_SIGNATURE)) {
+        rseq_other_result = -1;
+        rseq_other_ready = 1;
+        return 0;
+    }
+    rseq_other_result = rseq_spin(&rseq_other.rseq_cs, &rseq_other_ready, &rseq_other_flag, rseq_spin_cs);
+    return 0;
+}
+
+static int rseq_case(void) {
+    long cpus = sysconf(_SC_NPROCESSORS_CONF);
+    printf("auxv feature-size>=28=%d align=%lu\n", getauxval(27) >= 28, getauxval(28));
+    /* Each call a statement of its own: the order a call's arguments are
+     * evaluated in is not C's to say. An unknown flag, not one a newer
+     * Linux may have (2 is RSEQ_FLAG_SLICE_EXT_DEFAULT_ON there). */
+    long unregister = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE);
+    long unknown = rseq_call(&rseq_main, 32, 1 << 30, RSEQ_SIGNATURE);
+    long short_area = rseq_call(&rseq_main, 31, 0, RSEQ_SIGNATURE);
+    long misaligned = rseq_call(rseq_space + 16, 32, 0, RSEQ_SIGNATURE);
+    long past_user = rseq_call((void *)0x7fffffffffe0, 32, 0, RSEQ_SIGNATURE);
+    printf("before unregister=%ld unknown-flag=%ld short=%ld misaligned=%ld past-user=%ld\n", unregister,
+           unknown, short_area, misaligned, past_user);
+    void *gone = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (gone == MAP_FAILED || munmap(gone, 4096)) return 10;
+    printf("unmapped=%ld\n", rseq_call(gone, 32, 0, RSEQ_SIGNATURE));
+
+    /* A registration clears rseq_cs, and the area shows where it runs. */
+    rseq_main.rseq_cs = 0x1234;
+    rseq_main.cpu_id = 0xfffffffe;
+    long r = rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE);
+    int matches = 0;
+    for (int i = 0; i < 1000 && !matches; i++) {
+        unsigned before, after;
+        syscall(SYS_getcpu, &before, 0, 0);
+        unsigned seen = rseq_main.cpu_id;
+        syscall(SYS_getcpu, &after, 0, 0);
+        matches = before == after && seen == before;
+    }
+    printf("register=%ld cs-cleared=%d cpu-valid=%d start-same=%d node=%u cid-valid=%d getcpu-same=%d\n", r,
+           rseq_main.rseq_cs == 0, rseq_main.cpu_id < (unsigned long)cpus,
+           rseq_main.cpu_id_start < (unsigned long)cpus, rseq_main.node_id,
+           rseq_main.mm_cid < (unsigned long)cpus, matches);
+    long same = rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE);
+    long other_area = rseq_call(&rseq_other, 32, 0, RSEQ_SIGNATURE);
+    long other_length = rseq_call(&rseq_main, 64, 0, RSEQ_SIGNATURE);
+    long other_signature = rseq_call(&rseq_main, 32, 0, RSEQ_SIGNATURE + 1);
+    printf("again same=%ld other-area=%ld other-length=%ld other-signature=%ld\n", same, other_area,
+           other_length, other_signature);
+
+    /* A signal in the critical section sends it to its abort handler, and
+     * the kernel clears rseq_cs; outside it, the kernel only clears it. */
+    struct sigaction sa = {0};
+    sa.sa_handler = rseq_alarm;
+    sigaction(SIGUSR1, &sa, 0);
+    struct rseq_sender sender;
+    rseq_arm(&sender);
+    int aborted = rseq_spin(&rseq_main.rseq_cs, &rseq_ready, &rseq_flag, rseq_spin_cs);
+    pthread_join(sender.thread, 0);
+    printf("signal aborted=%d handled=%d cs-cleared=%d\n", aborted, rseq_flag, rseq_main.rseq_cs == 0);
+    rseq_arm(&sender);
+    rseq_main.rseq_cs = (uint64_t)rseq_spin_cs;
+    rseq_ready = 1;
+    while (!rseq_flag) {}
+    pthread_join(sender.thread, 0);
+    printf("outside cs-cleared=%d\n", rseq_main.rseq_cs == 0);
+
+    /* A descriptor the kernel does not accept ends a thread inside its
+     * section by SIGSEGV when it next looks at it: here, for a signal.
+     * Current Linux reads neither the version nor the flags, so a section
+     * with them is aborted (the child exits 51). */
+    static struct rseq_desc version = {1, 0, 0, 0, 0}, flagged = {0, 1, 0, 0, 0};
+    static struct rseq_desc inside = {0, 0, 0, 0, 0};
+    version.start = flagged.start = inside.start = (uint64_t)rseq_spin_start;
+    version.length = flagged.length = inside.length = (uint64_t)(rseq_spin_end - rseq_spin_start);
+    version.abort = flagged.abort = (uint64_t)rseq_spin_abort;
+    inside.abort = (uint64_t)rseq_spin_start + 2;
+    /* Current Linux refuses a descriptor only for a thread inside its
+     * section, so outside it these are only cleared (the child exits 40). */
+    int unsigned_abort = rseq_child_dies(0, 1);
+    int in_version = rseq_child_dies(&version, 1), out_version = rseq_child_dies(&version, 0);
+    int in_flags = rseq_child_dies(&flagged, 1), out_flags = rseq_child_dies(&flagged, 0);
+    int in_abort = rseq_child_dies(&inside, 1), out_abort = rseq_child_dies(&inside, 0);
+    printf("refused signature=%d version=%d flags=%d abort-inside=%d\n", unsigned_abort, in_version, in_flags,
+           in_abort);
+    printf("outside version=%d flags=%d abort-inside=%d\n", out_version, out_flags, out_abort);
+
+    /* membarrier's RSEQ command aborts another thread's critical section. */
+    errno = 0;
+    long unregistered = syscall(SYS_membarrier, 1 << 7, 0, 0);
+    printf("membarrier unregistered=%ld errno=%d", unregistered, errno);
+    printf(" register=%ld", (long)syscall(SYS_membarrier, 1 << 8, 0, 0));
+    printf(" far-cpu=%ld", (long)syscall(SYS_membarrier, 1 << 7, 1, 100000));
+    /* A negative CPU with the flag is every CPU, as without the flag. */
+    errno = 0;
+    long negative = syscall(SYS_membarrier, 1 << 7, 1, -1);
+    printf(" negative-cpu=%ld errno=%d\n", negative, errno);
+    pthread_t other;
+    if (pthread_create(&other, 0, rseq_other_thread, 0)) return 11;
+    while (!rseq_other_ready) {}
+    r = syscall(SYS_membarrier, 1 << 7, 0, 0);
+    rseq_other_flag = 1;
+    pthread_join(other, 0);
+    printf("membarrier rseq=%ld other-aborted=%d\n", r, rseq_other_result);
+
+    /* Unregistering needs the same area, length and signature, and leaves
+     * the area showing no CPU. */
+    other_signature = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE + 1);
+    other_length = rseq_call(&rseq_main, 64, 1, RSEQ_SIGNATURE);
+    other_area = rseq_call(&rseq_other, 32, 1, RSEQ_SIGNATURE);
+    printf("unregister other-signature=%ld other-length=%ld other-area=%ld", other_signature, other_length,
+           other_area);
+    r = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE);
+    unsigned cpu = rseq_main.cpu_id, start = rseq_main.cpu_id_start;
+    long again = rseq_call(&rseq_main, 32, 1, RSEQ_SIGNATURE);
+    printf(" done=%ld cpu=%x start=%u again=%ld\n", r, cpu, start, again);
+    return 0;
+}
+
 static int shm_case(void) {
     long page = sysconf(_SC_PAGESIZE);
     struct shm_status s;
@@ -4694,6 +5023,296 @@ static int shm_case(void) {
     if (waitpid(child, &status, 0) != child) return 23;
     printf("removed=%ld", syscall(SYS_shmctl, id, SHMX_RMID, 0));
     printf(" %ld\n", syscall(SYS_shmctl, keyed2, SHMX_RMID, 0));
+    return 0;
+}
+
+/* System V semaphores, compared without the IDs, keys and PIDs the machine
+   chooses, as the shared memory above. Each wait is seen begun through
+   GETNCNT or GETZCNT before what ends it. */
+enum {
+    SEMX_CREAT = 01000, SEMX_EXCL = 02000, SEMX_NOWAIT = 04000, SEMX_UNDO = 0x1000,
+    SEMX_RMID = 0, SEMX_SET = 1, SEMX_STAT = 2, SEMX_INFO = 3, SEMX_GETPID = 11,
+    SEMX_GETVAL = 12, SEMX_GETALL = 13, SEMX_GETNCNT = 14, SEMX_GETZCNT = 15,
+    SEMX_SETVAL = 16, SEMX_SETALL = 17, SEMX_STAT_INDEX = 18, SEMX_INFO_ALL = 19,
+    SEMX_STAT_ANY = 20,
+};
+struct semx_op {
+    unsigned short num;
+    short op, flags;
+};
+static long semx_ctl(int id, int n, int cmd, long arg) { return syscall(SYS_semctl, id, n, cmd, arg); }
+static int semx_errno(long r) { return r == -1 ? errno : 0; }
+/* One operation, or its error. */
+static int semx_op(int id, unsigned short num, short op, short flags) {
+    struct semx_op o = {num, op, flags};
+    return semx_errno(syscall(SYS_semop, id, &o, 1));
+}
+static void semx_await(int id, int n, int cmd, long count) {
+    while (semx_ctl(id, n, cmd, 0) != count) usleep(1000);
+}
+/* A child that does one operation and exits with its error. */
+static pid_t semx_child(int id, unsigned short num, short op, short flags) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) _exit(semx_op(id, num, op, flags));
+    return child;
+}
+static int semx_reaped(pid_t child) {
+    int status;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+static void semx_alarm(int signal) { (void)signal; }
+static void *semx_thread(void *arg) {
+    int id = *(int *)arg;
+    semx_op(id, 0, 1, SEMX_UNDO);
+    return NULL;
+}
+static int sem_case(void) {
+    int key = 0x5c000000 | (getpid() & 0xffffff);
+    printf("get too-many=%d", semx_errno(syscall(SYS_semget, 0, 32001, 0600)));
+    printf(" negative=%d", semx_errno(syscall(SYS_semget, 0, -1, 0600)));
+    printf(" none=%d", semx_errno(syscall(SYS_semget, 0, 0, 0600)));
+    int id = (int)syscall(SYS_semget, key, 3, SEMX_CREAT | SEMX_EXCL | 0640);
+    if (id < 0) return 10;
+    printf(" same=%d", syscall(SYS_semget, key, 0, 0) == id);
+    printf(" fewer=%d", syscall(SYS_semget, key, 2, 0600) == id);
+    printf(" exclusive=%d", semx_errno(syscall(SYS_semget, key, 3, SEMX_CREAT | SEMX_EXCL)));
+    printf(" more=%d", semx_errno(syscall(SYS_semget, key, 4, 0)));
+    printf(" missing=%d\n", semx_errno(syscall(SYS_semget, key ^ 0x01000000, 1, 0600)));
+
+    unsigned char ds[104];
+    memset(ds, 0, sizeof ds);
+    printf("stat=%ld", semx_ctl(id, 0, SEMX_STAT, (long)ds));
+    unsigned mode, uid, cuid;
+    long otime, ctime;
+    unsigned long nsems;
+    memcpy(&uid, ds + 4, 4);
+    memcpy(&cuid, ds + 12, 4);
+    memcpy(&mode, ds + 20, 4);
+    memcpy(&otime, ds + 48, 8);
+    memcpy(&ctime, ds + 64, 8);
+    memcpy(&nsems, ds + 80, 8);
+    printf(" mode=%o nsems=%lu otime=%ld ctime-set=%d owner=%d creator=%d\n", mode, nsems, otime,
+           ctime > 0, uid == geteuid(), cuid == geteuid());
+
+    /* Values. */
+    printf("setval=%ld", semx_ctl(id, 1, SEMX_SETVAL, 7));
+    printf(" getval=%ld", semx_ctl(id, 1, SEMX_GETVAL, 0));
+    printf(" getpid-self=%d", semx_ctl(id, 1, SEMX_GETPID, 0) == getpid());
+    printf(" getpid-none=%ld", semx_ctl(id, 0, SEMX_GETPID, 0));
+    printf(" too-big=%d", semx_errno(semx_ctl(id, 1, SEMX_SETVAL, 32768)));
+    printf(" negative=%d", semx_errno(semx_ctl(id, 1, SEMX_SETVAL, -1)));
+    printf(" too-big-bad-id=%d", semx_errno(semx_ctl(id ^ (1 << 15), 1, SEMX_SETVAL, 32768)));
+    printf(" beyond=%d", semx_errno(semx_ctl(id, 3, SEMX_SETVAL, 1)));
+    printf(" get-beyond=%d", semx_errno(semx_ctl(id, 3, SEMX_GETVAL, 0)));
+    printf(" get-negative=%d\n", semx_errno(semx_ctl(id, -1, SEMX_GETVAL, 0)));
+    unsigned short all[3] = {1, 32767, 3}, got[3] = {0};
+    printf("setall=%ld", semx_ctl(id, 0, SEMX_SETALL, (long)all));
+    printf(" getall=%ld", semx_ctl(id, 0, SEMX_GETALL, (long)got));
+    printf(" values=%u,%u,%u", got[0], got[1], got[2]);
+    all[1] = 32768;
+    printf(" too-big=%d", semx_errno(semx_ctl(id, 0, SEMX_SETALL, (long)all)));
+    printf(" unchanged=%ld", semx_ctl(id, 1, SEMX_GETVAL, 0));
+    printf(" fault=%d", semx_errno(semx_ctl(id, 0, SEMX_GETALL, 8)));
+    printf(" set-fault=%d\n", semx_errno(semx_ctl(id, 0, SEMX_SETALL, 8)));
+
+    /* Operations, in Linux's order of checks. */
+    struct semx_op ops[2] = {{0, -1, 0}, {2, 1, 0}};
+    printf("op too-many=%d", semx_errno(syscall(SYS_semop, id, ops, 501)));
+    printf(" none=%d", semx_errno(syscall(SYS_semop, id, ops, 0)));
+    printf(" fault=%d", semx_errno(syscall(SYS_semop, id, 8, 1)));
+    printf(" negative-id=%d", semx_errno(syscall(SYS_semop, -1, ops, 1)));
+    printf(" old-sequence=%d", semx_errno(syscall(SYS_semop, id ^ (1 << 15), ops, 1)));
+    printf(" beyond=%d", semx_op(id, 3, 1, 0));
+    printf(" both=%ld", syscall(SYS_semop, id, ops, 2));
+    printf(" values=%ld,%ld", semx_ctl(id, 0, SEMX_GETVAL, 0), semx_ctl(id, 2, SEMX_GETVAL, 0));
+    printf(" nowait=%d", semx_op(id, 0, -1, SEMX_NOWAIT));
+    printf(" zero=%d", semx_op(id, 0, 0, 0));
+    printf(" not-zero=%d", semx_op(id, 2, 0, SEMX_NOWAIT));
+    printf(" over=%d", semx_op(id, 1, 1, 0));
+    /* The first that would wait decides on IPC_NOWAIT; the rest go back. */
+    struct semx_op partly[2] = {{2, -1, 0}, {0, -1, SEMX_NOWAIT}};
+    printf(" partly=%d", semx_errno(syscall(SYS_semop, id, partly, 2)));
+    printf(" back=%ld", semx_ctl(id, 2, SEMX_GETVAL, 0));
+    memset(ds, 0, sizeof ds);
+    semx_ctl(id, 0, SEMX_STAT, (long)ds);
+    memcpy(&otime, ds + 48, 8);
+    printf(" otime-set=%d\n", otime > 0);
+
+    /* semtimedop: the timeout is read first and checked after the count. */
+    struct timespec timeout = {0, 1000000000};
+    struct semx_op one = {0, -1, 0};
+    printf("timed fault=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 501, 8)));
+    printf(" too-many=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 501, &timeout)));
+    printf(" invalid=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 1, &timeout)));
+    timeout.tv_nsec = 0;
+    printf(" zero=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 1, &timeout)));
+    timeout.tv_nsec = 50000000;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    printf(" expired=%d", semx_errno(syscall(SYS_semtimedop, id, &one, 1, &timeout)));
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long waited = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    printf(" waited=%d ncnt=%ld\n", waited >= 45, semx_ctl(id, 0, SEMX_GETNCNT, 0));
+
+    /* Waits: counted by what they wait on, let through in order. */
+    pid_t first = semx_child(id, 0, -2, 0);
+    semx_await(id, 0, SEMX_GETNCNT, 1);
+    pid_t second = semx_child(id, 0, -1, 0);
+    semx_await(id, 0, SEMX_GETNCNT, 2);
+    pid_t zero = semx_child(id, 2, 0, 0);
+    semx_await(id, 2, SEMX_GETZCNT, 1);
+    printf("waiting ncnt=%ld zcnt=%ld", semx_ctl(id, 0, SEMX_GETNCNT, 0), semx_ctl(id, 2, SEMX_GETZCNT, 0));
+    printf(" up=%d", semx_op(id, 0, 2, 0));
+    printf(" first=%d", semx_reaped(first));
+    printf(" by-first=%d", semx_ctl(id, 0, SEMX_GETPID, 0) == first);
+    printf(" ncnt=%ld", semx_ctl(id, 0, SEMX_GETNCNT, 0));
+    printf(" setval=%ld", semx_ctl(id, 0, SEMX_SETVAL, 1));
+    printf(" second=%d", semx_reaped(second));
+    printf(" value=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    printf(" down=%d", semx_op(id, 2, -4, 0));
+    printf(" zero=%d", semx_reaped(zero));
+    printf(" by-zero=%d\n", semx_ctl(id, 2, SEMX_GETPID, 0) == zero);
+
+    /* A signal ends a wait with EINTR, even with SA_RESTART. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sigaction action = {0};
+        action.sa_handler = semx_alarm;
+        action.sa_flags = SA_RESTART;
+        sigaction(SIGALRM, &action, NULL);
+        struct itimerval in = {{0, 0}, {0, 50000}};
+        setitimer(ITIMER_REAL, &in, NULL);
+        _exit(semx_op(id, 0, -1, 0));
+    }
+    printf("signal=%d", semx_reaped(child));
+    printf(" ncnt=%ld", semx_ctl(id, 0, SEMX_GETNCNT, 0));
+
+    /* SEM_UNDO: an exit adds the adjustments back, cut to 0, as the exiting
+       process. */
+    semx_ctl(id, 0, SEMX_SETVAL, 3);
+    child = semx_child(id, 0, -1, SEMX_UNDO);
+    printf(" undone=%d", semx_reaped(child));
+    printf(" value=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    printf(" by-child=%d", semx_ctl(id, 0, SEMX_GETPID, 0) == child);
+    fflush(stdout);
+    /* The child says when it has changed the value, and exits when told. */
+    int up[2], go[2];
+    if (pipe(up) || pipe(go)) return 11;
+    child = fork();
+    if (child == 0) {
+        char c;
+        semx_op(id, 0, 5, SEMX_UNDO);
+        if (write(up[1], "u", 1) != 1 || read(go[0], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    char c;
+    if (read(up[0], &c, 1) != 1) return 12;
+    printf(" up=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    semx_op(id, 0, -7, 0);
+    if (write(go[1], "u", 1) != 1) return 13;
+    printf(" exited=%d", semx_reaped(child));
+    printf(" cut=%ld\n", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    close(up[0]);
+    close(up[1]);
+    close(go[0]);
+    close(go[1]);
+
+    /* The undo list is a process's: threads share it (CLONE_SYSVSEM), a
+       fork does not, unshare(CLONE_SYSVSEM) leaves it, SETVAL clears it. */
+    semx_ctl(id, 0, SEMX_SETVAL, 0);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, semx_thread, &id) || pthread_join(thread, NULL)) _exit(1);
+        printf("threads after-thread=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+        fflush(stdout);
+        pid_t grandchild = fork();
+        if (grandchild == 0) _exit(0);
+        printf(" after-fork=%d", semx_reaped(grandchild));
+        printf(",%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+        printf(" unshare=%ld", syscall(SYS_unshare, CLONE_SYSVSEM));
+        /* The thread may not have left the list yet, which it then applies. */
+        int waits = 0;
+        while (semx_ctl(id, 0, SEMX_GETVAL, 0) != 0 && waits++ < 1000) usleep(1000);
+        printf(" left=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+        semx_op(id, 0, 2, SEMX_UNDO);
+        semx_op(id, 1, -1, SEMX_UNDO);
+        semx_ctl(id, 0, SEMX_SETVAL, 4);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf(" exited=%d", semx_reaped(child));
+    printf(" values=%ld", semx_ctl(id, 0, SEMX_GETVAL, 0));
+    printf(",%ld\n", semx_ctl(id, 1, SEMX_GETVAL, 0));
+
+    /* IPC_SET, the information and removal. */
+    semx_ctl(id, 0, SEMX_STAT, (long)ds);
+    mode = 01600;
+    memcpy(ds + 20, &mode, 4);
+    printf("set=%ld", semx_ctl(id, 0, SEMX_SET, (long)ds));
+    semx_ctl(id, 0, SEMX_STAT, (long)ds);
+    memcpy(&mode, ds + 20, 4);
+    printf(" mode=%o", mode);
+    unsigned none = (unsigned)-1;
+    memcpy(ds + 4, &none, 4);
+    printf(" bad-uid=%d", semx_errno(semx_ctl(id, 0, SEMX_SET, (long)ds)));
+    printf(" bad-buffer=%d", semx_errno(semx_ctl(id, 0, SEMX_SET, 8)));
+    printf(" by-index=%d", semx_ctl(id % 32768, 0, SEMX_STAT_INDEX, (long)ds) == id);
+    printf(" by-index-any=%d", semx_ctl(id % 32768, 0, SEMX_STAT_ANY, (long)ds) == id);
+    printf(" command=%d", semx_errno(semx_ctl(id, 0, 99, 0)));
+    printf(" ipc64=%d\n", semx_errno(semx_ctl(id, 0, 0x100 | SEMX_STAT, (long)ds)));
+    {
+        int info[10];
+        memset(info, 0xff, sizeof info);
+        long r = semx_ctl(0, 0, SEMX_INFO, (long)info);
+        printf("info ok=%d map=%d mni=%d mns=%d mnu=%d msl=%d opm=%d ume=%d usz=%d vmx=%d aem=%d", r >= id % 32768,
+               info[0], info[1], info[2], info[3], info[4], info[5], info[6], info[7], info[8], info[9]);
+        r = semx_ctl(0, 0, SEMX_INFO_ALL, (long)info);
+        printf(" all ok=%d in-use=%d used=%d", r >= id % 32768, info[7] >= 1, info[9] >= 3);
+        printf(" fault=%d\n", semx_errno(semx_ctl(0, 0, SEMX_INFO, 8)));
+    }
+
+    /* As another user the 0604 set lets only reading through, and its
+       owner's commands nothing; as its owner, everything. */
+    int keyed = (int)syscall(SYS_semget, key ^ 0x02000000, 1, SEMX_CREAT | SEMX_EXCL | 0604);
+    if (keyed < 0) return 14;
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        int other = 0;
+        if (geteuid() == 0)
+            other = !setgroups(0, NULL) && !setresgid(65534, 65534, 65534) && !setresuid(65534, 65534, 65534);
+        long got = syscall(SYS_semget, key ^ 0x02000000, 0, 0600);
+        int get = other ? got == -1 && errno == EACCES : got == keyed;
+        int reading = semx_op(keyed, 0, 0, 0) == 0 && semx_ctl(keyed, 0, SEMX_GETVAL, 0) == 0;
+        int change = other ? semx_op(keyed, 0, 1, 0) == EACCES : semx_op(keyed, 0, 1, 0) == 0;
+        long set = semx_ctl(keyed, 0, SEMX_SETVAL, 0);
+        int setting = other ? set == -1 && errno == EACCES : set == 0;
+        unsigned char ds[104];
+        semx_ctl(keyed, 0, SEMX_STAT, (long)ds);
+        long stat_set = semx_ctl(keyed, 0, SEMX_SET, (long)ds);
+        int owner = other ? stat_set == -1 && errno == EPERM : stat_set == 0;
+        printf("permissions as-expected get=%d read=%d change=%d setval=%d set=%d\n", get, reading, change, setting,
+               owner);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (semx_reaped(child)) return 15;
+
+    /* Removal ends the waits with EIDRM. */
+    semx_ctl(id, 0, SEMX_SETVAL, 0);
+    child = semx_child(id, 0, -1, 0);
+    semx_await(id, 0, SEMX_GETNCNT, 1);
+    printf("remove=%ld", semx_ctl(id, 0, SEMX_RMID, 0));
+    printf(" waiter=%d", semx_reaped(child));
+    printf(" gone=%d", semx_errno(semx_ctl(id, 0, SEMX_GETVAL, 0)));
+    printf(" by-key=%d", semx_errno(syscall(SYS_semget, key, 0, 0)));
+    printf(" again=%d", semx_errno(semx_ctl(id, 0, SEMX_RMID, 0)));
+    printf(" other=%ld\n", semx_ctl(keyed, 0, SEMX_RMID, 0));
     return 0;
 }
 
@@ -5603,6 +6222,108 @@ int main(int argc, char **argv) {
             _exit(0);
         }
         result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "pid-set-tid")) {
+        /* clone3's set_tid (the native side runs as root), and the NS*
+           lines of /proc/<pid>/status, which number a task in /proc's PID
+           namespace and each one below it down to its own. */
+        const unsigned long long thread = CLONE_VM | CLONE_THREAD | CLONE_SIGHAND;
+        settid_lines("first");
+        pid_t tids[3] = {1, 1, 1};
+        result("too-many", settid_error(0, SIGCHLD, tids, 2));
+        tids[0] = 0;
+        result("zero", settid_error(0, SIGCHLD, tids, 1));
+        tids[0] = 4194304;
+        result("pid-max", settid_error(0, SIGCHLD, tids, 1));
+        tids[0] = 1;
+        result("taken-init", settid_error(0, SIGCHLD, tids, 1));
+        tids[0] = getpid();
+        result("taken-self", settid_error(0, SIGCHLD, tids, 1));
+        result("thread-taken", settid_error(thread, 0, tids, 1));
+        result("fault", settid_error(0, SIGCHLD, (const pid_t *)1, 1));
+        result("too-many-at-most", settid_error(0, SIGCHLD, tids, 33));
+        /* An ID no task has: natively the first free one of a few far
+           ahead, which another process may have taken. */
+        long taken = -EEXIST;
+        pid_t wanted = 0;
+        for (int i = 0; i < 16 && taken == -EEXIST; i++) {
+            wanted = getpid() + 100000 + i * 7919;
+            tids[0] = wanted;
+            taken = settid_clone(0, SIGCHLD, tids, 1);
+            if (taken == 0) _exit(getpid() == wanted ? 0 : 1);
+        }
+        printf("first: taken=%d status=%d\n", taken == wanted, taken > 0 ? reaped(taken) : -1);
+        /* Without the capability over the first namespace. */
+        pid_t nobody = child();
+        if (nobody == 0) {
+            if (setresuid(65534, 65534, 65534)) _exit(90);
+            tids[0] = getpid() + 100000;
+            result("unprivileged", settid_error(0, SIGCHLD, tids, 1));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("nobody", reaped(nobody));
+        /* A new PID namespace: its first task must be 1. */
+        tids[0] = 2;
+        result("new-not-init", settid_error(CLONE_NEWPID, SIGCHLD, tids, 1));
+        tids[0] = 1;
+        result("new-outer-taken", settid_error(CLONE_NEWPID, SIGCHLD, tids, 2));
+        result("new-too-many", settid_error(CLONE_NEWPID, SIGCHLD, tids, 3));
+        long init = settid_clone(CLONE_NEWPID, SIGCHLD, tids, 1);
+        if (init == 0) {
+            long numbers[4];
+            printf("init: pid=%d\n", getpid());
+            settid_lines("init");
+            int count = settid_numbers("NSpid", numbers);
+            pid_t outer = count == 2 ? numbers[0] : 0;
+            pid_t inner[3] = {1, outer, 1};
+            result("init-taken", settid_error(0, SIGCHLD, inner, 1));
+            inner[0] = 3;
+            result("init-outer-taken", settid_error(0, SIGCHLD, inner, 2));
+            result("init-too-many", settid_error(0, SIGCHLD, inner, 3));
+            inner[0] = 1;
+            result("init-thread-taken", settid_error(thread, 0, inner, 1));
+            /* 5 here, then the next one takes 2, the first after the last
+               handed out that is free. */
+            inner[0] = 5;
+            long five = settid_clone(0, SIGCHLD, inner, 1);
+            if (five == 0) {
+                count = settid_numbers("NSpid", numbers);
+                _exit(getpid() == 5 && count == 2 && numbers[1] == 5 ? 0 : 1);
+            }
+            printf("init: five=%ld status=%d\n", five, five > 0 ? reaped(five) : -1);
+            fflush(stdout);
+            pid_t next = child();
+            if (next == 0) _exit(0);
+            printf("init: next=%d status=%d\n", next, reaped(next));
+            /* Two levels: 1 in a namespace of its own, 7 here. */
+            pid_t two[2] = {1, 7};
+            long nested = settid_clone(CLONE_NEWPID, SIGCHLD, two, 2);
+            if (nested == 0) {
+                count = settid_numbers("NSpid", numbers);
+                _exit(getpid() == 1 && count == 3 && numbers[1] == 7 && numbers[2] == 1 ? 0 : 1);
+            }
+            printf("init: nested=%ld status=%d\n", nested, nested > 0 ? reaped(nested) : -1);
+            /* In a user namespace of its own: the new PID namespace is its
+               own, this one is not. */
+            fflush(stdout);
+            pid_t user = child();
+            if (user == 0) {
+                if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+                pid_t own[2] = {1, 9};
+                result("user-outer", settid_error(CLONE_NEWPID, SIGCHLD, own, 2));
+                long made = settid_clone(CLONE_NEWPID, SIGCHLD, own, 1);
+                if (made == 0) _exit(getpid() == 1 ? 0 : 1);
+                printf("user: made=%d status=%d\n", made > 0, made > 0 ? reaped(made) : -1);
+                fflush(stdout);
+                _exit(0);
+            }
+            result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("init", reaped(init));
         return 0;
     }
     if (!strcmp(mode, "pid-namespaces")) {
@@ -14290,6 +15011,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "shm")) return shm_case();
+    if (!strcmp(mode, "sem")) return sem_case();
+    if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

@@ -294,7 +294,12 @@ impl FileCache {
         // Under the lock of the list, so that a count and its size go in
         // together, in order.
         let mut shrinks = self.shrinks.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = self.size.set(size) {
+        if self.size.set(size) {
+            // The size and the zeros before the count: whoever reads the new
+            // count then reads the new size, and copies no bytes from before
+            // the shrink (`paludarium_mmu::PageSource::shrinks`).
+            self.pages.zero(size, u64::MAX);
+            let count = self.size.count_shrink();
             while shrinks
                 .last()
                 .is_some_and(|&(_, smallest)| smallest >= size)
@@ -302,9 +307,9 @@ impl FileCache {
                 shrinks.pop();
             }
             shrinks.push((count, size));
+        } else {
+            self.pages.zero(old, u64::MAX);
         }
-        drop(shrinks);
-        self.pages.zero(old.min(size), u64::MAX);
     }
     /// The bytes from `start` to `end` read as zeros now.
     fn zeroed(&self, start: u64, end: u64) {

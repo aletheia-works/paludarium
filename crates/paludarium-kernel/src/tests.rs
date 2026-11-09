@@ -2350,10 +2350,11 @@ fn clone3_arguments_follow_linux() {
     put(&[
         0x10_0000, 0, 0x200, 0x300, 17, 0x1000, 0x800, 0x400, 0, 0, 0,
     ]);
-    assert_eq!(args(64), Ok([0x10_0011, 0x1800, 0x300, 0x200, 0x400, 0]));
+    let legacy = [0x10_0011, 0x1800, 0x300, 0x200, 0x400, 0];
+    assert_eq!(args(64), Ok((legacy, vec![])));
     assert_eq!(args(63), Err(Errno::EINVAL));
     assert_eq!(args(4097), Err(Errno(7)));
-    assert_eq!(args(96), Ok([0x10_0011, 0x1800, 0x300, 0x200, 0x400, 0]));
+    assert_eq!(args(96), Ok((legacy, vec![])));
     f.mem.write(GuestAddr(DATA + 90), &[1]).unwrap();
     assert_eq!(args(96), Err(Errno(7)));
     for words in [
@@ -2370,11 +2371,18 @@ fn clone3_arguments_follow_linux() {
         put(&[&words[..], &[0, 0, 0]].concat());
         assert_eq!(args(88), Err(Errno::EINVAL), "{words:x?}");
     }
-    // set_tid and its size come together, and are not supported.
+    // set_tid and its size come together, at most 32 numbers, which are
+    // read before the flags are looked at.
     put(&[0, 0, 0, 0, 17, 0, 0, 0, 0, 1, 0]);
     assert_eq!(args(88), Err(Errno::EINVAL));
-    put(&[0, 0, 0, 0, 17, 0, 0, 0, DATA, 1, 0]);
+    put(&[0, 0, 0, 0, 17, 0, 0, 0, DATA, 0, 0]);
     assert_eq!(args(88), Err(Errno::EINVAL));
+    put(&[0, 0, 0, 0, 17, 0, 0, 0, DATA, 33, 0]);
+    assert_eq!(args(88), Err(Errno::EINVAL));
+    put(&[0x11, 0, 0, 0, 17, 0, 0, 0, 0x10, 2, 0]);
+    assert_eq!(args(88), Err(Errno::EFAULT));
+    put(&[0, 0, 0, 0, 17, 0, 0, 0, DATA + 88, 2, 0, 7 | 3 << 32]);
+    assert_eq!(args(88), Ok(([17, 0, 0, 0, 0, 0], vec![7, 3])));
     assert_eq!(
         crate::processes::clone3_args(&f.mem, 0x10, 64),
         Err(Errno::EFAULT)
@@ -3214,4 +3222,160 @@ fn landlock_restricts_access_beneath_its_rules() {
     assert_eq!(open(&mut f, ah, 0o101), 0);
     assert_eq!(open(&mut f, ah, 0), eacces);
     f.ret(3, &[second]);
+}
+
+mod rseq {
+    use super::*;
+
+    const SIGNATURE: u64 = 0x5305_3053;
+
+    #[test]
+    fn rseq_checks_its_arguments_as_linux_does() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // Nothing to unregister, flags, a length or an alignment Linux refuses.
+        assert_eq!(f.ret(334, &[DATA, 32, 1, SIGNATURE]), einval);
+        assert_eq!(f.ret(334, &[DATA, 32, 2, SIGNATURE]), einval);
+        assert_eq!(f.ret(334, &[DATA, 31, 0, SIGNATURE]), einval);
+        assert_eq!(f.ret(334, &[DATA + 16, 32, 0, SIGNATURE]), einval);
+        assert_eq!(f.ret(334, &[DATA + 16, 64, 0, SIGNATURE]), einval);
+        // Past user space, or where nothing is mapped.
+        let efault = errno(Errno::EFAULT);
+        assert_eq!(
+            f.ret(334, &[USER_ADDRESS_LIMIT - 32, 32, 0, SIGNATURE]),
+            efault
+        );
+        assert_eq!(f.ret(334, &[0x40_0000, 32, 0, SIGNATURE]), efault);
+        // A registration clears rseq_cs.
+        f.mem
+            .write(GuestAddr(DATA + 8), &0x1234u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(334, &[DATA, 32, 0, SIGNATURE]), 0);
+        assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 0);
+        assert!(f.thread.state.rseq_notify);
+        // Once registered: EBUSY for the same, else what differs.
+        assert_eq!(f.ret(334, &[DATA, 32, 0, SIGNATURE]), errno(Errno(16)));
+        assert_eq!(f.ret(334, &[DATA + 32, 32, 0, SIGNATURE]), einval);
+        assert_eq!(f.ret(334, &[DATA, 64, 0, SIGNATURE]), einval);
+        assert_eq!(
+            f.ret(334, &[DATA, 32, 0, SIGNATURE + 1]),
+            errno(Errno::EPERM)
+        );
+        assert_eq!(
+            f.ret(334, &[DATA, 32, 1, SIGNATURE + 1]),
+            errno(Errno::EPERM)
+        );
+        assert_eq!(f.ret(334, &[DATA, 64, 1, SIGNATURE]), einval);
+        assert_eq!(f.ret(334, &[DATA + 32, 32, 1, SIGNATURE]), einval);
+        assert_eq!(f.ret(334, &[DATA, 32, 3, SIGNATURE]), einval);
+        // Unregistering leaves the area showing no CPU.
+        f.mem.write(GuestAddr(DATA), &[0xff; 32]).unwrap();
+        assert_eq!(f.ret(334, &[DATA, 32, 1, SIGNATURE]), 0);
+        let mut area = [0; 28];
+        f.mem.read(GuestAddr(DATA), &mut area).unwrap();
+        assert_eq!(area[..8], [0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(area[20..], [0; 8]);
+        assert_eq!(f.thread.state.rseq, None);
+        assert_eq!(f.ret(334, &[DATA, 32, 1, SIGNATURE]), einval);
+    }
+
+    #[test]
+    fn a_registered_thread_runs_on_a_virtual_cpu_that_getcpu_reports() {
+        let mut f = fixture();
+        f.mem.write(GuestAddr(DATA), &[0xff; 32]).unwrap();
+        f.mem.write(GuestAddr(DATA + 8), &[0; 8]).unwrap();
+        assert_eq!(f.ret(334, &[DATA, 32, 0, SIGNATURE]), 0);
+        assert_eq!(f.kernel.enter_cpu(&mut f.thread, &f.mem), Next::Resume);
+        let on = f.thread.state.on_cpu.expect("on a CPU");
+        assert!(!f.thread.state.rseq_notify);
+        let mut area = [0; 28];
+        f.mem.read(GuestAddr(DATA), &mut area).unwrap();
+        let cpu = on.cpu.to_le_bytes();
+        assert_eq!(area[..8], [cpu, cpu].concat()[..]);
+        assert_eq!(area[20..], [0, 0, 0, 0, 0, 0, 0, 0]);
+        // A system call leaves the CPU; getcpu still reports it.
+        assert_eq!(f.ret(nr::GETCPU, &[DATA + 0x100, 0, 0]), 0);
+        assert_eq!(
+            f.mem.read_u64(GuestAddr(DATA + 0x100)).unwrap() as u32,
+            on.cpu
+        );
+        // Taken back, untouched, the CPU is the same and nothing is written.
+        f.mem.write(GuestAddr(DATA), &[0xee; 8]).unwrap();
+        assert_eq!(f.kernel.enter_cpu(&mut f.thread, &f.mem), Next::Resume);
+        assert_eq!(f.thread.state.on_cpu, Some(on));
+        assert_eq!(
+            f.mem.read_u64(GuestAddr(DATA)).unwrap(),
+            u64::MAX / 0xff * 0xee
+        );
+        // Unregistered, the thread leaves the virtual CPUs.
+        assert_eq!(f.ret(334, &[DATA, 32, 1, SIGNATURE]), 0);
+        assert_eq!(f.kernel.enter_cpu(&mut f.thread, &f.mem), Next::Resume);
+        assert!(f.kernel.seat.is_none() && f.thread.state.on_cpu.is_none());
+    }
+
+    #[test]
+    fn an_area_the_kernel_cannot_write_sends_sigsegv() {
+        let mut f = fixture();
+        assert_eq!(f.ret(334, &[DATA, 32, 0, SIGNATURE]), 0);
+        f.mem.protect(GuestAddr(DATA), 0x1000, Prot::READ).unwrap();
+        assert_eq!(
+            f.kernel.enter_cpu(&mut f.thread, &f.mem),
+            Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
+        );
+    }
+
+    #[test]
+    fn a_signal_aborts_the_critical_section_before_its_handler_runs() {
+        let mut f = fixture();
+        // A section at 0x10_1100..0x10_1120 aborting to 0x10_1200.
+        let (descriptor, start, abort) = (DATA + 0x40, DATA + 0x1100, DATA + 0x1200);
+        let mut bytes = vec![0; 8];
+        bytes.extend(start.to_le_bytes());
+        bytes.extend(0x20u64.to_le_bytes());
+        bytes.extend(abort.to_le_bytes());
+        f.mem.write(GuestAddr(descriptor), &bytes).unwrap();
+        f.mem
+            .write(GuestAddr(abort - 4), &(SIGNATURE as u32).to_le_bytes())
+            .unwrap();
+        f.mem.write(GuestAddr(DATA + 8), &[0; 8]).unwrap();
+        assert_eq!(f.ret(334, &[DATA, 32, 0, SIGNATURE]), 0);
+        assert_eq!(f.kernel.enter_cpu(&mut f.thread, &f.mem), Next::Resume);
+        f.mem
+            .write(GuestAddr(DATA + 8), &descriptor.to_le_bytes())
+            .unwrap();
+        f.thread.cpu.rip = GuestAddr(start + 8);
+        assert!(Kernel::rseq_signal(&mut f.thread, &f.mem));
+        assert_eq!(f.thread.cpu.rip, GuestAddr(abort));
+        assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 0);
+        // A handler runs with the section aborted; with a signature that
+        // differs, the thread gets SIGSEGV instead, which a thread with no
+        // handler for it dies of.
+        f.thread.state.signal_actions.insert(
+            10,
+            SignalAction {
+                handler: 0x10_1300,
+                ..SignalAction::default()
+            },
+        );
+        f.thread.cpu.gpr[reg::RSP] = DATA + 0x1800;
+        for (signature, next) in [
+            (SIGNATURE as u32, Next::Resume),
+            (0, Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))),
+        ] {
+            f.mem
+                .write(GuestAddr(DATA + 8), &descriptor.to_le_bytes())
+                .unwrap();
+            f.mem
+                .write(GuestAddr(abort - 4), &signature.to_le_bytes())
+                .unwrap();
+            f.thread.cpu.rip = GuestAddr(start + 8);
+            // As after the first handler returned.
+            f.thread.state.signal_mask = 0;
+            signals::queue(&mut f.thread.state, signals::PendingSignal::user(10, 0));
+            assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), next);
+            // Aborted, the section's descriptor is cleared; refused, it stays.
+            let cleared = f.mem.read_u64(GuestAddr(DATA + 8)).unwrap() == 0;
+            assert_eq!(cleared, next == Next::Resume);
+        }
+    }
 }

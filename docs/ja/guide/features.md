@@ -46,9 +46,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
-| System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ） |
+| System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー） |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -519,6 +519,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   したセグメントは、ID はそのままで、どのキーでも見つからなくなり、最後に外れたとき
   消えます。`SHM_LOCK` は Linux と同じく所有者と `RLIMIT_MEMLOCK` を確かめます。
   `SHM_HUGETLB` は、hugetlbfs なしでビルドしたカーネルと同じく `ENOSYS` です。
+- System V のセマフォー（`semget`、`semop`、`semtimedop`、`semctl`）も、スレッドの IPC
+  名前空間のものです。確かめる内容とその順序は Linux の `ipc/sem.c` と同じで、上限は
+  Linux の既定値（`SEMMSL` 32000、`SEMMNS` 1024000000、`SEMOPM` 500、`SEMMNI` 32000、
+  `SEMVMX` 32767）です。セットの ID はセグメントと同じように割り当てます。`semctl` には
+  `IPC_STAT`、`IPC_SET`、`IPC_RMID`、`IPC_INFO`、`SEM_INFO`、`SEM_STAT`、`SEM_STAT_ANY`、
+  `GETVAL`、`SETVAL`、`GETALL`、`SETALL`、`GETPID`（呼び出し元の PID 名前空間の番号）、
+  `GETNCNT` と `GETZCNT`（待ちがどの操作で待っているかで数えます）があります。1 回の
+  呼び出しの操作は、すべてまとめて行うか、どれも行いません。すぐに通らない操作は、待つ
+  ことになる操作に `IPC_NOWAIT` があれば `EAGAIN` で、なければ変更で通れるようになるか、
+  セットが消える（`EIDRM`）か、シグナルが来る（`EINTR`。Linux と同じく再開しません）か、
+  `semtimedop` の時間切れ（`EAGAIN`）まで待ちます。変更のたびに、Linux の
+  `do_smart_update` と同じく待ちを試します。0 を待つものが先で、ほかは待ち始めた順です。
+  `SEM_UNDO` の調整値はプロセスの undo リストに持ちます。このリストは `CLONE_SYSVSEM` で
+  共有し（`pthread_create` はこれを渡します）、`fork` では共有しません。`SETVAL` と
+  `SETALL` は調整値を消します。リストを共有する最後のスレッドが、終わるとき、または
+  `unshare`（`CLONE_SYSVSEM` か `CLONE_NEWIPC`）やほかの IPC 名前空間への `setns` で
+  リストを離れるときに、Linux と同じく 0 と `SEMVMX` の間に収めて値に足します。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。
@@ -526,8 +543,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   何も残らなければ `EINVAL` です。その後の `sched_getaffinity` はそのマスクを返し、新しい
   スレッドとプロセスはそれを継ぎます。ただし、ホストはそのスレッドをどの CPU でも動かします。
   どちらも、root と同じくほかのプロセスのスレッドも見つけ、その ID の生きているスレッドが
-  なければ `ESRCH` です。`getcpu` は、スレッドのマスクが許すいちばん小さい番号の CPU と、
-  NUMA ノード 0 を返します。
+  なければ `ESRCH` です。`getcpu` は NUMA ノード 0 と、`rseq` を登録したスレッドなら
+  その仮想 CPU を返します。ほかのスレッドには、マスクが許すいちばん小さい番号の CPU を返します。
 - Linux と同じく、スレッドごとにスケジューリングの属性があります。ポリシー
   （`SCHED_OTHER`、`SCHED_BATCH`、`SCHED_IDLE`、`SCHED_EXT`、`SCHED_FIFO`、`SCHED_RR`、
   `SCHED_DEADLINE`）、リアルタイムの優先度、`SCHED_RESET_ON_FORK`、デッドライン
@@ -588,14 +605,36 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、アドレス空間のすべてのスレッドにかかります。ほとんどのアクセスはロックを取らない
   ので、空間のロックを取り、スレッドの TLB のエポックを進めます。これで途中の書き込みを
   待ち、各スレッドの次のアクセスをロックへ回します。
+  `MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ` は、さらに空間のほかのスレッドの `rseq` の
+  クリティカルセクションを中止させます（`MEMBARRIER_CMD_FLAG_CPU` ならその CPU のスレッドだけ、
+  マシンにない CPU ならどれも）。ゲストのコードを実行していたスレッドがそれぞれ止まってから
+  戻ります。
+- `rseq` は、Linux と同じ検査とエラー（`EINVAL`、`EPERM`、`EBUSY`、`EFAULT`）でスレッドの
+  領域を登録し、今の Linux と同じく登録のときに領域の `rseq_cs` を消します。補助ベクターは
+  今の Linux と同じく `AT_RSEQ_FEATURE_SIZE` に 28、`AT_RSEQ_ALIGN` に 64 を与えるので、
+  32 バイトより長い領域は 64 にそろえます。`rseq` を登録したスレッドは、
+  マシンが報告する CPU の数だけある仮想 CPU の一つで、CPU マスクの範囲で動きます。そこでは同時に
+  ほかのそうしたスレッドは動きません。領域には、その CPU、NUMA ノード 0、並行 ID（`mm_cid`）を
+  示します。並行 ID は CPU の数より小さく、アドレス空間のほかの動いているスレッドが持たない
+  ものです。スレッドはゲストのコードを実行する前に CPU を取り、システムコール、フォールト、
+  バジェットの終わりのたびに手放します。別の CPU に戻ったとき、ほかのスレッドが使ったあとの
+  自分の CPU に戻ったとき、`membarrier` のあと、シグナルを届けるときには、中にいる
+  クリティカルセクションは中止ハンドラーから続きます。Linux のプリエンプト、移動、シグナルの
+  あとと同じです。今の Linux と同じく、スレッドがセクションの外にいる間は、カーネルは
+  セクションの場所だけを読んで領域の `rseq_cs` を消します。ディスクリプターのバージョンと
+  フラグは読みません。セクションの中のスレッドが使えない中止ハンドラー（セクションの中にある
+  もの、前にシグネチャーのないもの）、ユーザー空間の外にあるセクション、カーネルが書けない領域
+  では、スレッドは `SIGSEGV` で終わります。CPU を待つスレッドがあると、自分の CPU を 4 ms 使った
+  スレッドは先に譲ります。fork は登録を保ち、新しいスレッド、`CLONE_VM` の子、exec は登録なしで
+  始まります。
 - `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
   `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
   `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
   `EINVAL` です。プロセスにほかのスレッドがあるとき、ほかのプロセスとシグナルの扱いを
   共有しているとき（`CLONE_SIGHAND`）、ほかのプロセスとメモリーを共有しているとき
-  （`CLONE_THREAD` なしの `CLONE_VM`）です。System V のセマフォーがないので、`CLONE_SYSVSEM`
-  で捨てるセマフォーの調整値はありません。名前空間のフラグは、次のとおりスレッドに新しい
-  名前空間を与えます。
+  （`CLONE_THREAD` なしの `CLONE_VM`）です。`CLONE_SYSVSEM`（と `CLONE_NEWIPC`）は、
+  終了と同じくセマフォーの undo リストを離れます。名前空間のフラグは、次のとおりスレッドに
+  新しい名前空間を与えます。
 - スレッドは、Linux の `nsproxy` と同じく自分の名前空間を持ちます。UTS・IPC・マウント・
   cgroup・time・PID・ネットワーク・ユーザーの名前空間は自分のものです（ユーザーの名前空間は
   資格情報が持ちます）。`CLONE_NEWUTS`、`CLONE_NEWIPC`、`CLONE_NEWNS`、`CLONE_NEWCGROUP`、
@@ -634,13 +673,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   持ち、システムコールは呼び出し元の名前空間の対応表で ID を受け渡しします。対応のない ID は
   65534（`overflowuid`）に見え、渡すと `EINVAL` です。これは `get*id` と `set*id`、
   `setgroups`、`getgroups`、`stat` と `statx`、`chown` の仲間、シグナルと `waitid` の
-  `si_uid`、`SCM_CREDENTIALS` と `SO_PEERCRED`、`shmctl`、`/proc/<pid>/status`、コアで
-  同じです。`set*id`・`access`・exec のケーパビリティの規則でのルートは、名前空間が 0 に
+  `si_uid`、`SCM_CREDENTIALS` と `SO_PEERCRED`、`shmctl` と `semctl`、
+  `/proc/<pid>/status`、コアで同じです。`set*id`・`access`・exec のケーパビリティの規則でのルートは、名前空間が 0 に
   対応させる ID で、持ち主かグループに対応のない set-user-ID のプログラムは呼び出し元の
   ままで動きます。ケーパビリティは、Linux の `cap_capable` と同じく、スレッド自身の
   ユーザーの名前空間と、その実効ユーザーが作った入れ子の名前空間で効きます。ファイルには
   名前空間がその持ち主とグループに対応を持つときだけ、名前空間（ホスト名の設定、`setns`、
-  `SIOCSIFFLAGS`、System V の共有メモリ）にはそれを持つユーザーの名前空間でのもの、ほかの
+  `SIOCSIFFLAGS`、System V の共有メモリとセマフォー）にはそれを持つユーザーの名前空間でのもの、ほかの
   プロセス（`kill`、`ptrace` のアクセス、優先度、リソース制限）にはそのユーザーの名前空間での
   もの、マシン全体（`RENAME_WHITEOUT`、リアルタイムのスケジューリング、`vhangup`、`trusted.*` の属性
   など）には最初のユーザーの名前空間でのものだけが効きます。`/proc/<pid>/uid_map` と
@@ -666,10 +705,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `sched_*` の呼び出し、`prlimit64`、`capget`、`capset`、`get_robust_list` でも、`clone`
   が返して書き込む ID、`set_tid_address` が返す ID、シグナルの `si_pid`（外からなら 0）でも、
   `F_SETOWN`、`F_GETOWN`、`F_GETLK` の `l_pid`、`TIOCGPGRP`、`TIOCSPGRP`、`TIOCGSID`
-  でも、`SCM_CREDENTIALS` と `SO_PEERCRED` でも、`shmctl` のプロセス ID とコアの中でも
-  同じです。`kill(-1)` は、呼び出したプロセスの名前空間の、init を除くプロセスに送ります。
+  でも、`SCM_CREDENTIALS` と `SO_PEERCRED` でも、`shmctl` のプロセス ID と `semctl` の
+  `GETPID`、コアの中でも同じです。`kill(-1)` は、呼び出したプロセスの名前空間の、init を除くプロセスに送ります。
   `/proc` は、Linux で最初の名前空間でマウントした `/proc` と同じく、最初の名前空間の ID を
-  見せます。init は、ハンドラーのあるシグナルと、名前空間の外かカーネルからの SIGKILL と
+  見せます。`/proc/<pid>/status` の `NStgid`、`NSpid`、`NSpgid`、`NSsid` の行は、
+  タスクの ID を、そこと、その下から自分の名前空間までのそれぞれの名前空間で示します
+  （名前空間の外のグループやセッションは 0）。`clone3` の `set_tid` は、子が取る番号を
+  自分の名前空間から外へ 1 つずつ与え、Linux の `alloc_pid` と同じく確かめます。名前空間より
+  多い番号、1 より小さいか 4194304（Linux の `pid_max` の最大）以上の番号、init がまだない
+  名前空間での 1 以外の番号は `EINVAL`、その名前空間を持つユーザー名前空間で
+  `CAP_SYS_ADMIN` も `CAP_CHECKPOINT_RESTORE` もなければ `EPERM`、使われている番号は
+  `EEXIST` です。最初の名前空間の番号は paludarium がタスクを呼ぶ ID なので、そこでの
+  `set_tid` は、まだどのタスクも持ったことのない ID を取ります。init は、ハンドラーのあるシグナルと、名前空間の外かカーネルからの SIGKILL と
   SIGSTOP だけを受け取ります（Linux の `SIGNAL_UNKILLABLE`）。フォールトでは終わります。
   名前空間の孤児は init か、名前空間の中の子のサブリーパーに引き取られます。init が
   終わると、名前空間のほかのプロセスはすべて SIGKILL を受け、名前空間にはもう入れません
@@ -1139,8 +1186,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   届いてブロックされているシグナルも受け取ります。
 - `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が
   0 でない長い構造体には `E2BIG`）、それが表す `clone` として動きます。
-  `CLONE_CLEAR_SIGHAND` は、ハンドラを設定したシグナルを既定に戻します。`set_tid` と
-  `CLONE_INTO_CGROUP` は `EINVAL` を返します。`clone` そのものは、Linux と同じく flags の
+  `CLONE_CLEAR_SIGHAND` は、ハンドラを設定したシグナルを既定に戻します。`set_tid` は上の PID
+  名前空間で書いたとおりで、`CLONE_INTO_CGROUP` は `EINVAL` を返します。`clone` そのものは、Linux と同じく flags の
   下位 32 ビットだけを読むので、`CLONE_CLEAR_SIGHAND` は `clone3` でしか使えません。
 - `prctl` は `PR_SET_NAME`／`PR_GET_NAME`（スレッドごとの 15 バイトまでの名前。
   `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、

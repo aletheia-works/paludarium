@@ -4316,6 +4316,166 @@ mod pid_namespaces {
         assert_eq!(syscall(&mut c, &mut ct, &cm, 110, [0; 6]), 0);
     }
 }
+mod set_tid {
+    use super::*;
+    use crate::credentials::Credentials;
+    use crate::namespaces::{CLONE_NEWPID, CLONE_NEWUSER, Namespaces};
+    fn root() -> Credentials {
+        Credentials::default()
+    }
+    fn user() -> Credentials {
+        Credentials {
+            uid: 1000,
+            euid: 1000,
+            suid: 1000,
+            fsuid: 1000,
+            permitted: 0,
+            effective: 0,
+            ..Credentials::default()
+        }
+    }
+    #[test]
+    fn the_first_namespace_takes_an_id_no_task_has_had() {
+        let (k, _t, _m) = setup();
+        let processes = &k.processes;
+        let first = Namespaces::default();
+        let next = processes.allocate().unwrap();
+        // The next ID out of turn, which the next one passes over.
+        assert_eq!(
+            processes.allocate_in(&first.pid, &[next + 1], &root()),
+            Ok(next + 1)
+        );
+        assert_eq!(processes.allocate().unwrap(), next + 2);
+        for taken in [next + 1, next, 1] {
+            assert_eq!(
+                processes.allocate_in(&first.pid, &[taken], &root()),
+                Err(Errno::EEXIST)
+            );
+        }
+        assert_eq!(
+            processes.allocate_in(&first.pid, &[next + 100], &root()),
+            Ok(next + 100)
+        );
+        for number in [0, crate::processes::PID_MAX, u32::MAX] {
+            assert_eq!(
+                processes.allocate_in(&first.pid, &[number], &root()),
+                Err(Errno::EINVAL)
+            );
+        }
+        // More numbers than namespaces.
+        assert_eq!(
+            processes.allocate_in(&first.pid, &[next + 200, next + 201], &root()),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            processes.allocate_in(&first.pid, &[next + 200], &user()),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(processes.allocate().unwrap(), next + 3);
+    }
+
+    #[test]
+    fn a_nested_namespace_takes_its_numbers_from_the_innermost_out() {
+        let (k, _t, _m) = setup();
+        let processes = &k.processes;
+        let space = Namespaces::default()
+            .for_child(CLONE_NEWPID, false, crate::users::first())
+            .unwrap()
+            .pid;
+        // Its first task must be its init, 1.
+        assert_eq!(
+            processes.allocate_in(&space, &[2], &root()),
+            Err(Errno::EINVAL)
+        );
+        let init = processes.allocate_in(&space, &[1], &root()).unwrap();
+        assert_eq!(space.number(init), 1);
+        assert_eq!(space.init(), Some(init));
+        assert_eq!(
+            processes.allocate_in(&space, &[1], &root()),
+            Err(Errno::EEXIST)
+        );
+        let five = processes.allocate_in(&space, &[5], &root()).unwrap();
+        assert_eq!(space.number(five), 5);
+        // The others go on from the last handed out, past those taken.
+        let numbers: Vec<u32> = (0..5)
+            .map(|_| space.number(processes.allocate_in(&space, &[], &root()).unwrap()))
+            .collect();
+        assert_eq!(numbers, [2, 3, 4, 6, 7]);
+        // Both levels: the first namespace's number is the ID.
+        let next = processes.allocate().unwrap();
+        let both = processes
+            .allocate_in(&space, &[9, next + 1], &root())
+            .unwrap();
+        assert_eq!((both, space.number(both)), (next + 1, 9));
+        // A failure in the first namespace leaves no number in the inner.
+        assert_eq!(
+            processes.allocate_in(&space, &[10, next], &root()),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(space.task(10), None);
+        assert_eq!(
+            processes.allocate_in(&space, &[10, 1, 1], &root()),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn each_number_needs_the_capability_over_its_namespace() {
+        let (k, _t, _m) = setup();
+        let processes = &k.processes;
+        let first = Namespaces::default();
+        let owner = crate::namespaces::user_for(&first, &user(), CLONE_NEWUSER).unwrap();
+        let space = first
+            .for_child(CLONE_NEWPID, false, &owner.user.0)
+            .unwrap()
+            .pid;
+        // The user who made the user namespace has every capability in it
+        // but none in the first.
+        let init = processes.allocate_in(&space, &[1], &user()).unwrap();
+        assert_eq!(space.number(init), 1);
+        assert_eq!(
+            processes.allocate_in(&space, &[3, 4_000_000], &user()),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(space.task(3), None);
+        // As does CAP_CHECKPOINT_RESTORE alone.
+        let restorer = Credentials {
+            effective: crate::credentials::CAP_CHECKPOINT_RESTORE,
+            ..user()
+        };
+        assert_eq!(
+            processes.allocate_in(&space, &[3, 4_000_000], &restorer),
+            Ok(4_000_000)
+        );
+    }
+
+    #[test]
+    fn clone3_children_take_the_numbers_of_set_tid() {
+        let (mut k, mut t, m) = setup();
+        let next = k.processes.allocate().unwrap() + 1;
+        // struct clone_args, then set_tid's one number.
+        let mut args = [0u64; 12];
+        args[4] = 17;
+        args[8] = DATA + 128;
+        args[9] = 1;
+        let bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
+        m.write(GuestAddr(DATA), &bytes).unwrap();
+        m.write(GuestAddr(DATA + 128), &next.to_le_bytes()).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 435, [DATA, 88, 0, 0, 0, 0]),
+            u64::from(next)
+        );
+        let (_child, thread) = k.take_child().unwrap();
+        assert_eq!(thread.tid, next);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 435, [DATA, 88, 0, 0, 0, 0]),
+            Errno::EEXIST.to_syscall_return()
+        );
+        // A fork after it takes none.
+        let forked = syscall(&mut k, &mut t, &m, 57, [0; 6]);
+        assert_eq!(forked, u64::from(next) + 1);
+    }
+}
 mod user_namespaces {
     use super::*;
     const NEWUSER: u64 = 0x1000_0000;
@@ -4541,5 +4701,259 @@ mod user_namespaces {
             syscall(&mut k, &mut t, &m, 308, [fd, NEWUSER, 0, 0, 0, 0]),
             e(Errno::EINVAL)
         );
+    }
+}
+mod sem {
+    use super::*;
+    const IPC_CREAT: u64 = 0o1000;
+    const IPC_EXCL: u64 = 0o2000;
+    const IPC_NOWAIT: i16 = 0o4000;
+    const SEM_UNDO: i16 = 0x1000;
+    const IPC_RMID: u64 = 0;
+    const IPC_SET: u64 = 1;
+    const IPC_STAT: u64 = 2;
+    const IPC_INFO: u64 = 3;
+    const GETPID: u64 = 11;
+    const GETVAL: u64 = 12;
+    const GETALL: u64 = 13;
+    const GETNCNT: u64 = 14;
+    const GETZCNT: u64 = 15;
+    const SETVAL: u64 = 16;
+    const SETALL: u64 = 17;
+    const SEM_STAT: u64 = 18;
+    const SEM_INFO: u64 = 19;
+    const OPS: u64 = DATA + 0x400;
+    const DS: u64 = DATA + 0x800;
+    fn e(errno: i32) -> u64 {
+        Errno(errno).to_syscall_return()
+    }
+    fn semget(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        key: u64,
+        n: u64,
+        flag: u64,
+    ) -> u64 {
+        syscall(k, t, m, 64, [key, n, flag, 0, 0, 0])
+    }
+    fn semctl(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        id: u64,
+        n: u64,
+        cmd: u64,
+        arg: u64,
+    ) -> u64 {
+        syscall(k, t, m, 66, [id, n, cmd, arg, 0, 0])
+    }
+    /// `semop` with `ops` as `struct sembuf`s.
+    fn semop(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        id: u64,
+        ops: &[(u16, i16, i16)],
+    ) -> u64 {
+        write_ops(m, ops);
+        syscall(k, t, m, 65, [id, OPS, ops.len() as u64, 0, 0, 0])
+    }
+    fn write_ops(m: &AddressSpace, ops: &[(u16, i16, i16)]) {
+        let bytes: Vec<u8> = ops
+            .iter()
+            .flat_map(|&(num, op, flags)| {
+                [num.to_le_bytes(), op.to_le_bytes(), flags.to_le_bytes()].concat()
+            })
+            .collect();
+        m.write(GuestAddr(OPS), &bytes).unwrap();
+    }
+
+    #[test]
+    fn semget_checks_as_ipcget_and_newary() {
+        let (mut k, mut t, m) = setup();
+        assert_eq!(semget(&mut k, &mut t, &m, 0, 32001, IPC_CREAT), e(22));
+        assert_eq!(
+            semget(&mut k, &mut t, &m, 0, (-1i64) as u64, IPC_CREAT),
+            e(22)
+        );
+        assert_eq!(semget(&mut k, &mut t, &m, 0, 0, IPC_CREAT), e(22));
+        let id = semget(&mut k, &mut t, &m, 42, 3, IPC_CREAT | 0o600);
+        assert_eq!(id, 0);
+        assert_eq!(semget(&mut k, &mut t, &m, 42, 0, 0), id);
+        assert_eq!(
+            semget(&mut k, &mut t, &m, 42, 3, IPC_CREAT | IPC_EXCL),
+            e(17)
+        );
+        assert_eq!(semget(&mut k, &mut t, &m, 42, 4, 0), e(22));
+        assert_eq!(semget(&mut k, &mut t, &m, 43, 1, 0o600), e(2));
+        assert_eq!(semget(&mut k, &mut t, &m, 0, 1, 0), 1);
+        // The information counts the sets and their semaphores.
+        assert_eq!(semctl(&mut k, &mut t, &m, 0, 0, SEM_INFO, DS), 1);
+        let mut info = [0u8; 40];
+        m.read(GuestAddr(DS), &mut info).unwrap();
+        let int = |at: usize| i32::from_le_bytes(info[at * 4..at * 4 + 4].try_into().unwrap());
+        assert_eq!((int(7), int(9)), (2, 4));
+        assert_eq!(semctl(&mut k, &mut t, &m, 0, 0, IPC_INFO, DS), 1);
+        m.read(GuestAddr(DS), &mut info).unwrap();
+        let int = |at: usize| i32::from_le_bytes(info[at * 4..at * 4 + 4].try_into().unwrap());
+        assert_eq!(
+            (int(1), int(2), int(4), int(5), int(7), int(8), int(9)),
+            (32000, 1_024_000_000, 32000, 500, 20, 32767, 32767)
+        );
+    }
+
+    #[test]
+    fn values_their_errors_and_status() {
+        let (mut k, mut t, m) = setup();
+        let id = semget(&mut k, &mut t, &m, 0, 2, 0o640);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 1, SETVAL, 32768), e(34));
+        assert_eq!(semctl(&mut k, &mut t, &m, id + 1, 1, SETVAL, 32768), e(34));
+        assert_eq!(semctl(&mut k, &mut t, &m, id + 1, 1, SETVAL, 1), e(22));
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 2, SETVAL, 1), e(22));
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 1, SETVAL, 7), 0);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 1, GETVAL, 0), 7);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 1, GETPID, 0), 1);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETPID, 0), 0);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 5, GETVAL, 0), e(22));
+        m.write(GuestAddr(DS), &[3, 0, 0xff, 0x7f]).unwrap();
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, SETALL, DS), 0);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETALL, DS + 8), 0);
+        let mut all = [0u8; 4];
+        m.read(GuestAddr(DS + 8), &mut all).unwrap();
+        assert_eq!(all, [3, 0, 0xff, 0x7f]);
+        m.write(GuestAddr(DS), &[0, 0x80]).unwrap();
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, SETALL, DS), e(34));
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETALL, 8), e(14));
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, 99, 0), e(22));
+        assert_eq!(
+            semctl(&mut k, &mut t, &m, (-1i64) as u64, 0, IPC_INFO, DS),
+            e(22)
+        );
+        // IPC_STAT: the permissions, the count, the sequence number.
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, IPC_STAT, DS), 0);
+        let mut ds = [0u8; 104];
+        m.read(GuestAddr(DS), &mut ds).unwrap();
+        let word = |ds: &[u8], at: usize| u32::from_le_bytes(ds[at..at + 4].try_into().unwrap());
+        assert_eq!(word(&ds, 20), 0o640);
+        assert_eq!(u64::from_le_bytes(ds[80..88].try_into().unwrap()), 2);
+        ds[20..24].copy_from_slice(&0o1600u32.to_le_bytes());
+        m.write(GuestAddr(DS), &ds).unwrap();
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, IPC_SET, DS), 0);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, SEM_STAT, DS), id);
+        m.read(GuestAddr(DS), &mut ds).unwrap();
+        assert_eq!(word(&ds, 20), 0o600);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, IPC_SET, 8), e(14));
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, IPC_RMID, 0), 0);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETVAL, 0), e(22));
+        // The index is given out again with the next sequence number.
+        assert_eq!(semget(&mut k, &mut t, &m, 0, 1, 0), 1);
+    }
+
+    #[test]
+    fn operations_check_in_linux_order_and_do_not_wait_with_nowait() {
+        let (mut k, mut t, m) = setup();
+        let id = semget(&mut k, &mut t, &m, 0, 2, 0o600);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 65, [id, OPS, 501, 0, 0, 0]),
+            e(7)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 65, [id, OPS, 0, 0, 0, 0]),
+            e(22)
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 65, [id, 8, 1, 0, 0, 0]), e(14));
+        assert_eq!(
+            semop(&mut k, &mut t, &m, (-1i64) as u64, &[(0, 1, 0)]),
+            e(22)
+        );
+        assert_eq!(semop(&mut k, &mut t, &m, id + 1, &[(0, 1, 0)]), e(22));
+        assert_eq!(semop(&mut k, &mut t, &m, id, &[(2, 1, 0)]), e(27));
+        assert_eq!(semop(&mut k, &mut t, &m, id, &[(0, -1, IPC_NOWAIT)]), e(11));
+        assert_eq!(semop(&mut k, &mut t, &m, id, &[(0, 2, 0), (1, 1, 0)]), 0);
+        assert_eq!(semop(&mut k, &mut t, &m, id, &[(0, 32766, 0)]), e(34));
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETVAL, 0), 2);
+        assert_eq!(semop(&mut k, &mut t, &m, id, &[(1, 0, IPC_NOWAIT)]), e(11));
+        // semtimedop: the timeout is read first and checked after the
+        // count; a timeout of 0 gives up at once.
+        write_ops(&m, &[(1, 0, 0)]);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 220, [id, OPS, 501, 8, 0, 0]),
+            e(14)
+        );
+        m.write_u64(GuestAddr(DS), 0).unwrap();
+        m.write_u64(GuestAddr(DS + 8), 1_000_000_000).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 220, [id, OPS, 1, DS, 0, 0]),
+            e(22)
+        );
+        m.write_u64(GuestAddr(DS + 8), 0).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 220, [id, OPS, 1, DS, 0, 0]),
+            e(11)
+        );
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 1, GETZCNT, 0), 0);
+    }
+
+    #[test]
+    fn a_wait_goes_through_when_the_value_lets_it_and_ends_when_the_set_goes() {
+        let (mut k, mut t, m) = setup();
+        let id = semget(&mut k, &mut t, &m, 0, 1, 0o600);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let waiter = std::thread::spawn(move || {
+            let first = semop(&mut c, &mut ct, &cm, id, &[(0, -1, 0)]);
+            let second = semop(&mut c, &mut ct, &cm, id, &[(0, -1, 0)]);
+            (first, second, ct.tid)
+        });
+        let waiting = |k: &mut Kernel, t: &mut Thread| {
+            while semctl(k, t, &m, id, 0, GETNCNT, 0) != 1 {
+                std::thread::yield_now();
+            }
+        };
+        waiting(&mut k, &mut t);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETZCNT, 0), 0);
+        assert_eq!(semop(&mut k, &mut t, &m, id, &[(0, 1, 0)]), 0);
+        waiting(&mut k, &mut t);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, IPC_RMID, 0), 0);
+        let (first, second, child) = waiter.join().unwrap();
+        assert_eq!((first, second), (0, e(43)));
+        assert_ne!(child, 1);
+    }
+
+    #[test]
+    fn undo_lists_are_applied_by_the_last_thread_that_shares_them() {
+        let (mut k, mut t, m) = setup();
+        let id = semget(&mut k, &mut t, &m, 0, 1, 0o600);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, SETVAL, 5), 0);
+        // A child of its own undoes as it ends.
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(semop(&mut c, &mut ct, &cm, id, &[(0, -2, SEM_UNDO)]), 0);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETVAL, 0), 3);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETVAL, 0), 5);
+        assert_eq!(
+            semctl(&mut k, &mut t, &m, id, 0, GETPID, 0),
+            u64::from(ct.tid)
+        );
+        // A thread with CLONE_SYSVSEM shares the list, so its end leaves
+        // the adjustment for the process's.
+        let (mut f, mut ft, fm) = fork(&mut k, &mut t, &m);
+        syscall(&mut f, &mut ft, &fm, 56, [0x50f00, 0, 0, 0, 0, 0]);
+        let (mut tk, mut tt) = f.take_child().unwrap();
+        assert_eq!(semop(&mut tk, &mut tt, &fm, id, &[(0, 1, SEM_UNDO)]), 0);
+        tk.finish_thread(&tt, &fm);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETVAL, 0), 6);
+        finish(&mut f, &ft, &fm, ExitStatus::Exited(0));
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETVAL, 0), 5);
+        // SETVAL clears the adjustments; unshare(CLONE_SYSVSEM) leaves the
+        // list as an exit does.
+        assert_eq!(semop(&mut k, &mut t, &m, id, &[(0, 2, SEM_UNDO)]), 0);
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, SETVAL, 1), 0);
+        assert_eq!(semop(&mut k, &mut t, &m, id, &[(0, 1, SEM_UNDO)]), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [0x40000, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETVAL, 0), 1);
     }
 }

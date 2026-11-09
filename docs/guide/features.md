@@ -54,9 +54,9 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
-| System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory) |
+| System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores) |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -570,6 +570,26 @@ kernel.
   found by no key, and goes at its last detach. `SHM_LOCK` checks the owner
   and `RLIMIT_MEMLOCK` as Linux does, and `SHM_HUGETLB` gives `ENOSYS`, as
   from a kernel built without hugetlbfs.
+- System V semaphores (`semget`, `semop`, `semtimedop`, `semctl`) belong to
+  the thread's IPC namespace too, with Linux's checks in Linux's order (as
+  `ipc/sem.c`) and its default limits (`SEMMSL` 32000, `SEMMNS`
+  1024000000, `SEMOPM` 500, `SEMMNI` 32000, `SEMVMX` 32767); a set's IDs are
+  given out as a segment's. `semctl` has `IPC_STAT`, `IPC_SET`, `IPC_RMID`,
+  `IPC_INFO`, `SEM_INFO`, `SEM_STAT`, `SEM_STAT_ANY`, `GETVAL`, `SETVAL`,
+  `GETALL`, `SETALL`, `GETPID` (in the caller's PID namespace), `GETNCNT`
+  and `GETZCNT` (counted by the operation each wait waits on). The
+  operations of one call are done all at once or not at all; one that
+  cannot go through waits, unless the operation it would wait on has
+  `IPC_NOWAIT` (`EAGAIN`), until a change lets it through, the set is
+  removed (`EIDRM`), a signal comes (`EINTR`, never restarted, as Linux) or
+  `semtimedop`'s timeout passes (`EAGAIN`). A change tries the waits as
+  Linux's `do_smart_update`: the waits for zero first, then the others in
+  the order they began. `SEM_UNDO` keeps the adjustments in the process's
+  undo list, which `CLONE_SYSVSEM` shares (`pthread_create` passes it) and
+  a `fork` does not; `SETVAL` and `SETALL` clear them. The last thread that
+  shares the list applies it as it ends, or as it leaves it with `unshare`
+  (`CLONE_SYSVSEM` or `CLONE_NEWIPC`) or `setns` to another IPC namespace,
+  cut to 0 and `SEMVMX` as Linux cuts them.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux
@@ -578,8 +598,9 @@ kernel.
   then gives that mask, and new threads and processes inherit it, but the
   host still runs the thread on any of its CPUs. Both find a thread of
   another process too, as root may, and give `ESRCH` when no live thread
-  has the ID. `getcpu` gives the lowest CPU the thread's mask allows, and
-  NUMA node 0.
+  has the ID. `getcpu` gives NUMA node 0, and the virtual CPU of a thread
+  that has registered `rseq`; for another thread, the lowest CPU its mask
+  allows.
 - Each thread has scheduling attributes, as on Linux: a policy
   (`SCHED_OTHER`, `SCHED_BATCH`, `SCHED_IDLE`, `SCHED_EXT`, `SCHED_FIFO`,
   `SCHED_RR`, `SCHED_DEADLINE`), a real-time priority, `SCHED_RESET_ON_FORK`,
@@ -645,13 +666,40 @@ kernel.
   Linux's interrupts give: most accesses take no lock, so it takes the
   space's locks and moves the epoch of the threads' TLBs on, which waits for
   each store under way and sends each thread's next access to the locks.
+  `MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ` also aborts the `rseq` critical
+  sections of the space's other threads (with `MEMBARRIER_CMD_FLAG_CPU`,
+  of the one on that CPU, and of none for a CPU the machine does not have),
+  and returns once each of them that was running guest code has stopped.
+- `rseq` registers a thread's area as Linux does, with its checks and
+  errors (`EINVAL`, `EPERM`, `EBUSY`, `EFAULT`), and clears the area's
+  `rseq_cs` when it registers, as current Linux does. The auxiliary vector
+  gives `AT_RSEQ_FEATURE_SIZE` 28 and `AT_RSEQ_ALIGN` 64, as current Linux
+  does, so an area longer than 32 bytes is aligned on 64. A thread with
+  `rseq` runs on one of the machine's virtual CPUs, one for each CPU it
+  reports, where no other such thread runs at the same time, within its
+  CPU mask; the area shows that CPU, NUMA node 0 and a concurrency ID
+  (`mm_cid`) below the count of CPUs that no other running thread of the
+  address space has. It takes the CPU before it runs guest code and leaves
+  it at each system call, fault and end of its budget. When it comes back
+  to another CPU, or to its own after another thread had it, or after a
+  `membarrier`, or when a signal is delivered, a critical section it is in
+  goes on at its abort handler, as after Linux's preemption, migration or
+  signal. As current Linux, the kernel reads only where the section is
+  while the thread is outside it, and then clears the area's `rseq_cs`, and
+  reads neither a descriptor's version nor its flags. An abort handler a
+  thread inside the section cannot use (inside the section, or without the
+  signature before it), a section past user space and an area the kernel
+  cannot write end the thread by `SIGSEGV`. While threads wait for
+  a CPU, one that has kept its own for 4 ms lets them have it first. A
+  fork keeps the registration; a new thread, a `CLONE_VM` child and an
+  exec start without one.
 - `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
   with `CLONE_FS` its own working directory and umask, as Linux. With
   `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is
   nothing to unshare and gives `EINVAL` where Linux does: another thread in
   the process, dispositions shared with another process (`CLONE_SIGHAND`), or
   memory shared with one (`CLONE_VM` without `CLONE_THREAD`). `CLONE_SYSVSEM`
-  has no semaphore adjustments to drop, as there are no System V semaphores. Its
+  (and `CLONE_NEWIPC`) leaves the semaphore undo list, as an exit does. Its
   namespace flags give the thread new namespaces, as below.
 - Each thread has its own namespaces, as Linux's `nsproxy`: UTS, IPC,
   mount, cgroup, time, PID, network and user ones of its own (the user
@@ -697,14 +745,15 @@ kernel.
   does not map shows as 65534 (`overflowuid`) and is `EINVAL` given: the
   `get*id` and `set*id` calls and `setgroups`, `getgroups`, `stat` and
   `statx`, `chown` and its kin, the `si_uid` of a signal and `waitid`,
-  `SCM_CREDENTIALS` and `SO_PEERCRED`, `shmctl`, `/proc/<pid>/status` and a
-  core. Root is the ID the namespace maps as 0 for the capability rules of
+  `SCM_CREDENTIALS` and `SO_PEERCRED`, `shmctl` and `semctl`,
+  `/proc/<pid>/status` and a core. Root is the ID the namespace maps as 0 for the capability rules of
   `set*id`, `access` and exec, and a set-user-ID program whose owner or
   group it does not map runs as the caller. A capability counts in the
   thread's own user namespace and in those nested in it that its
   effective user made (Linux's `cap_capable`): over a file only when the
   namespace maps the file's owner and group, over a namespace (setting
-  its host name, entering it, `SIOCSIFFLAGS`, System V shared memory) as
+  its host name, entering it, `SIOCSIFFLAGS`, System V shared memory and
+  semaphores) as
   the user namespace that owns it has it, over another process (`kill`,
   `ptrace` access, priorities, limits) as its user namespace has it, and
   over the machine (`RENAME_WHITEOUT`, real-time scheduling, `vhangup`, the
@@ -737,9 +786,21 @@ kernel.
   `clone` returns and stores, `set_tid_address` returns, and the `si_pid` of
   a signal (0 from outside); for `F_SETOWN`, `F_GETOWN`, `F_GETLK`'s `l_pid`,
   `TIOCGPGRP`, `TIOCSPGRP` and `TIOCGSID`; for `SCM_CREDENTIALS` and
-  `SO_PEERCRED`; for `shmctl`'s process IDs; and for a core's. `kill(-1)`
+  `SO_PEERCRED`; for `shmctl`'s process IDs and `semctl`'s `GETPID`; and
+  for a core's. `kill(-1)`
   signals the processes of the caller's namespace but its init. `/proc`
-  shows the first namespace's IDs, as Linux's `/proc` mounted in it does.
+  shows the first namespace's IDs, as Linux's `/proc` mounted in it does,
+  and the `NStgid`, `NSpid`, `NSpgid` and `NSsid` lines of
+  `/proc/<pid>/status` give a task's IDs there and in each namespace below
+  it down to its own (0 for a group or session outside one). `clone3`'s
+  `set_tid` gives the numbers a child takes, one for each namespace from
+  its own out, as Linux's `alloc_pid` checks them: `EINVAL` for more numbers
+  than namespaces, for one below 1 or from 4194304 (Linux's highest
+  `pid_max`) on, and for one other than 1 in a namespace with no init yet;
+  `EPERM` without `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` in the user
+  namespace that owns the namespace; and `EEXIST` for a number that is
+  taken. The first namespace's numbers are the IDs paludarium knows tasks
+  by, so there `set_tid` takes an ID no task has had yet.
   The init takes only the signals it has a handler for, and SIGKILL and
   SIGSTOP from outside its namespace or from the kernel (Linux's
   `SIGNAL_UNKILLABLE`); a fault still ends it. Orphans of the namespace come
@@ -1262,7 +1323,8 @@ kernel.
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a
   longer struct whose extra part is not zero) and then runs as the `clone` it
   describes; `CLONE_CLEAR_SIGHAND` resets handled signals to their default.
-  `set_tid` and `CLONE_INTO_CGROUP` give `EINVAL`. `clone` itself reads only
+  `set_tid` is as under the PID namespaces above, and `CLONE_INTO_CGROUP`
+  gives `EINVAL`. `clone` itself reads only
   the low 32 bits of its flags, as in Linux, so `CLONE_CLEAR_SIGHAND` is
   `clone3`'s alone.
 - `prctl` supports `PR_SET_NAME`/`PR_GET_NAME` (a name of up to 15 bytes per

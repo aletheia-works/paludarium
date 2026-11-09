@@ -31,6 +31,9 @@ pub struct ThreadGroup {
     /// The CPU mask `sched_setaffinity` gave each thread, which Linux keeps
     /// per thread; one without lets every CPU run it.
     affinity: Mutex<BTreeMap<u32, Vec<u64>>>,
+    /// How many times a CPU mask has been set, so that a thread on a
+    /// virtual CPU reads its mask again only after a change.
+    affinity_changes: std::sync::atomic::AtomicU64,
     /// The NUMA memory policies of its threads and of its address space.
     numa: crate::mempolicy::Numa,
     /// What signalling each thread looks at, for other processes to read;
@@ -74,6 +77,9 @@ pub struct ThreadGroup {
     start_stack: AtomicU64,
     /// The head `set_robust_list` gave each thread that called it.
     robust_lists: Mutex<BTreeMap<u32, u64>>,
+    /// Each thread's System V semaphore undo list, once it has one, which
+    /// `CLONE_SYSVSEM` shares (Linux's `sysvsem.undo_list`).
+    sem_undo: Mutex<BTreeMap<u32, Arc<crate::sem::UndoList>>>,
     /// The path of the program the process runs, which `/proc/self/exe`
     /// names (Linux's `exe_file`).
     executable: Mutex<Vec<u8>>,
@@ -114,6 +120,7 @@ impl Default for ThreadGroup {
             nice: Mutex::default(),
             sched: Mutex::default(),
             affinity: Mutex::default(),
+            affinity_changes: std::sync::atomic::AtomicU64::new(0),
             numa: crate::mempolicy::Numa::default(),
             task_ids: Mutex::default(),
             namespaces: Mutex::default(),
@@ -135,6 +142,7 @@ impl Default for ThreadGroup {
             core: Mutex::default(),
             start_stack: AtomicU64::new(0),
             robust_lists: Mutex::default(),
+            sem_undo: Mutex::default(),
             executable: Mutex::default(),
             exe_file: Mutex::default(),
             public: Mutex::default(),
@@ -205,6 +213,38 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid)
+    }
+    /// The undo list of `tid`, which it is given now if it has none
+    /// (Linux's `get_undo_list`).
+    pub(crate) fn sem_undo_list(&self, tid: u32) -> Arc<crate::sem::UndoList> {
+        Arc::clone(
+            self.sem_undo
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(tid)
+                .or_insert_with(crate::sem::UndoList::new),
+        )
+    }
+    /// Gives `tid` the undo list `list`.
+    pub(crate) fn set_sem_undo_list(&self, tid: u32, list: Arc<crate::sem::UndoList>) {
+        self.sem_undo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, list);
+    }
+    /// Takes the undo list of `tid`, as it ends or leaves it.
+    pub(crate) fn take_sem_undo_list(&self, tid: u32) -> Option<Arc<crate::sem::UndoList>> {
+        self.sem_undo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tid)
+    }
+    /// Thread `tid` of process `pid` leaves its undo list, if it has one,
+    /// which the last thread to leave applies (`exit_sem`).
+    pub(crate) fn leave_sem_undo_list(&self, tid: u32, pid: u32, now: i64) {
+        if let Some(list) = self.take_sem_undo_list(tid) {
+            list.leave(pid, now);
+        }
     }
     pub(crate) fn retired(&self, tid: u32) -> bool {
         self.retired
@@ -527,6 +567,13 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(tid, mask);
+        self.affinity_changes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Changes with every [`Self::set_affinity`].
+    pub(crate) fn affinity_generation(&self) -> u64 {
+        self.affinity_changes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
     pub(crate) fn set_nice(&self, tid: u32, value: i32) {
         self.nice
@@ -972,6 +1019,8 @@ impl Kernel {
             members.remove(&tid);
             members.is_empty()
         };
+        self.group
+            .leave_sem_undo_list(tid, self.process.pid, self.wall_seconds());
         // As in `finish_thread`: no thread left runs the program.
         if alone {
             self.group.set_exe_file(None);
@@ -979,6 +1028,12 @@ impl Kernel {
         self.group.forget_nice(tid);
         self.group.forget_task_ids(self.process.pid, tid);
         self.group.forget_public(self.process.pid, tid);
+    }
+    /// The time of day in seconds, for System V semaphores' times.
+    pub(crate) fn wall_seconds(&self) -> i64 {
+        self.host
+            .clock(ClockId::Realtime)
+            .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
     }
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
         self.files.release_descriptors();
@@ -1035,6 +1090,9 @@ impl Kernel {
                 Self::clear_child_tid(&self.group, mem, addr);
             }
         }
+        // exit_sem: the last thread sharing the undo list applies it.
+        self.group
+            .leave_sem_undo_list(thread.tid, self.process.pid, self.wall_seconds());
         let alone = {
             let mut members = self
                 .group
@@ -1247,18 +1305,19 @@ impl Kernel {
             .sched(parent.tid)
             .forked(self.group.nice(parent.tid).unwrap_or(0))?;
         let task = self.processes.charge_task()?;
-        // copy_namespaces; CLONE_NEWIPC leaves the semaphore adjustments,
+        // copy_namespaces; CLONE_NEWIPC leaves the semaphore undo list,
         // which CLONE_SYSVSEM would share.
         crate::namespaces::check(namespaces, parent.state.credentials.administers_own())?;
         if namespaces & crate::namespaces::CLONE_NEWIPC != 0 && flags & 0x40000 != 0 {
             return Err(Errno::EINVAL);
         }
         let child_namespaces = own.for_child(namespaces, true, &parent.state.credentials.user.0)?;
-        let tid = self.processes.allocate()?;
-        if tid > i32::MAX as u32 {
-            return Err(Errno::EAGAIN);
-        }
-        child_namespaces.pid.enter(tid)?;
+        let set_tid = std::mem::take(&mut self.set_tid);
+        let tid = self.processes.allocate_in(
+            &child_namespaces.pid,
+            &set_tid,
+            &parent.state.credentials,
+        )?;
         let mut cpu = parent.cpu.clone();
         cpu.gpr[reg::RAX] = 0;
         if a[1] != 0 {
@@ -1279,6 +1338,10 @@ impl Kernel {
         state.alt_stack = AltStack::default();
         state.exit_status = None;
         state.clear_child_tid = if flags & 0x200000 != 0 { a[3] } else { 0 };
+        // A new thread registers its own rseq area (Linux's rseq_fork).
+        state.rseq = None;
+        state.on_cpu = None;
+        state.rseq_notify = false;
         let inbox = Arc::new(SignalInbox::default());
         let mut child = Kernel {
             host: self.host.clone(),
@@ -1297,6 +1360,8 @@ impl Kernel {
             unimplemented: self.unimplemented.clone(),
             task: Some(task),
             published: None,
+            set_tid: Vec::new(),
+            seat: None,
         };
         // A new thread starts with its creator's nice value, set before it
         // is registered so that no one sees it without one, and its
@@ -1314,6 +1379,12 @@ impl Kernel {
         // And its memory policy.
         self.group.numa().new_thread(parent.tid, tid);
         self.group.register(tid, inbox);
+        // copy_semundo: CLONE_SYSVSEM shares the undo list, which the
+        // creator is given first if it has none.
+        if flags & 0x40000 != 0 {
+            let list = self.group.sem_undo_list(parent.tid).share();
+            self.group.set_sem_undo_list(tid, list);
+        }
         // Linux ignores unsuccessful parent/child TID stores (native case 23).
         if flags & 0x100000 != 0 {
             let _ = mem.write(GuestAddr(a[2]), &tid.to_le_bytes());

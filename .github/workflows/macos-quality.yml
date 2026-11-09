@@ -47,7 +47,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           args: toolchain install $RUST_TOOLCHAIN --profile minimal --component llvm-tools-preview
-      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
           install_args: aqua:taiki-e/cargo-llvm-cov
           cache: false

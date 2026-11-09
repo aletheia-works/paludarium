@@ -136,21 +136,32 @@ verified.
   open with `O_APPEND` do not reach the file. The end of a mapped file, past
   which a page raises `SIGBUS`, is the size the guest's own file operations
   give it, so a host program changing the size does not move it.
+- **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
+  CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
+  not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its
+  critical section is aborted when it changes CPU or another thread ran on
+  its own, which is when Linux's could be interrupted too, but not when the
+  host preempts it, which no other thread with `rseq` can notice. A CPU mask
+  another thread sets takes effect at the thread's next stop, and a thread
+  in a system call holds no CPU, so its area shows the CPU it last ran on.
+  Threads without `rseq` run on no virtual CPU and are not counted. There is
+  no time slice extension: `RSEQ_FLAG_SLICE_EXT_DEFAULT_ON` gives `EINVAL`,
+  as on a Linux built without it.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
-  - `rseq` is one of them, as on a Linux built without `CONFIG_RSEQ`, and glibc
-    carries on without it. Its promise is that a thread's critical section is
-    abandoned if it is preempted, which emulated threads running truly in
-    parallel cannot keep, so registering would let per-CPU data break.
-  - `pkey_alloc` and `io_uring_setup` are too, as on a Linux built without
+  - `pkey_alloc` and `io_uring_setup` are among them, as on a Linux built without
     them. Programs check for that and carry on. Saying yes would be wrong
     without the rest: protection keys need the CPU feature, which `CPUID` does
     not report, and io_uring's rings would do no work.
-  - System V semaphores (`semget`, `semop`, `semtimedop`, `semctl`) and
-    message queues (`msgget`, `msgsnd`, `msgrcv`, `msgctl`) are too; only its
-    shared memory is implemented. There is no `/proc/sysvipc`, and the limits
-    of shared memory are Linux's defaults, which `/proc/sys/kernel` cannot
-    change.
+  - System V message queues (`msgget`, `msgsnd`, `msgrcv`, `msgctl`) are
+    too; only its shared memory and semaphores are implemented. There is no
+    `/proc/sysvipc`, and the limits of shared memory and semaphores are
+    Linux's defaults, which `/proc/sys/kernel` cannot change.
+  - A set's waiting semaphore operations are tried in one queue in the
+    order they began, the waits for zero first. Linux keeps a queue for
+    each semaphore beside one for operations on several, and which of two
+    waits that both could go through goes first can differ where waits of
+    both kinds are mixed.
   - `get_robust_list` of another process is `ESRCH`, where Linux gives it to a
     caller that may trace that process.
   - `mincore` counts a page of a file as in memory whenever it lies within the
@@ -278,16 +289,18 @@ verified.
   split it over datagrams, and a socket whose receive buffer is full drops
   an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
   acts with the capability of the thread that opened it alone. The other namespaces keep nothing apart that
-  paludarium has, but for the System V shared memory of an IPC namespace:
-  there are no System V semaphores, System V message queues or POSIX
-  message queues for one, no `mount` for a mount namespace (whose mounts keep their IDs
+  paludarium has, but for the System V shared memory and semaphores of an
+  IPC namespace: there are no System V message queues or POSIX message
+  queues for one, no `mount` for a mount namespace (whose mounts keep their IDs
   in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new
   ones), no `/proc/self/cgroup` for a cgroup namespace, and no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the
   first one's. A PID namespace hands out its numbers once each, where
-  Linux's wrap at `pid_max` and are used again; `/proc/<pid>/status` has no
-  `NStgid`, `NSpid`, `NSpgid` or `NSsid` lines; `clone3`'s `set_tid` is not
-  supported in one either; and a queued signal (`rt_sigqueueinfo`) from
+  Linux's wrap at `pid_max` and are used again; for the same reason
+  `clone3`'s `set_tid` cannot take an ID of the first namespace that a task
+  had before, even once it is freed (`EEXIST`), where Linux takes it again,
+  and its numbers are below 4194304, Linux's highest `pid_max`, whatever the
+  host's is; and a queued signal (`rt_sigqueueinfo`) from
   outside the receiver's namespace has its `si_pid` cleared whatever its
   `si_code`. A namespace file has none of the `NS_GET_*` `ioctl` requests,
   and the numbers of new namespaces are not Linux's, which reuses freed

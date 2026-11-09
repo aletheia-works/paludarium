@@ -126,10 +126,10 @@ mod linux {
             // limit-permissions, peer-credentials, core-credentials,
             // set-id-writes, socket-owners, capabilities and script-exec cases
             // change IDs as root, pty-vhangup needs root's capabilities and
-            // pid-namespace makes a PID namespace, so Linux runs them as root,
-            // through sudo when the tests do not run as root; so do the
-            // unshare, namespaces, *-namespaces and netlink cases, whose checks depend
-            // on CAP_SYS_ADMIN and which make namespaces, the
+            // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
+            // them as root, through sudo when the tests do not run as root; so
+            // do the unshare, namespaces, *-namespaces and netlink cases, whose
+            // checks depend on CAP_SYS_ADMIN and which make namespaces, the
             // scheduling-set case, which sets real-time and deadline policies,
             // and the personality-layout case, which maps page 0.
             let as_root = matches!(
@@ -152,6 +152,7 @@ mod linux {
                     | "unshare"
                     | "namespaces"
                     | "pid-namespaces"
+                    | "pid-set-tid"
                     | "net-namespaces"
                     | "netlink"
                     | "user-namespaces"
@@ -258,6 +259,7 @@ mod linux {
         processes_unshare => ("unshare","process"),
         processes_namespaces => ("namespaces","process"),
         processes_pid_namespaces => ("pid-namespaces","process"),
+        processes_pid_set_tid => ("pid-set-tid","process"),
         processes_net_namespaces => ("net-namespaces","process"),
         processes_netlink => ("netlink","process"),
         processes_user_namespaces => ("user-namespaces","process"),
@@ -406,6 +408,8 @@ mod linux {
         processes_execveat => ("execveat","process"),
         processes_etxtbsy => ("etxtbsy","process"),
         processes_shm => ("shm","process"),
+        processes_sem => ("sem","process"),
+        processes_rseq => ("rseq","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

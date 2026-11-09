@@ -60,6 +60,20 @@ next instruction is not the next one of the current block: after a branch, a
 system call or a fault, at the end of the block, or when the code generation
 has moved on. Falling through from one instruction to the next needs no lookup.
 
+The code generation is a counter of the address space. It moves on when the
+mappings change (`mmap`, `munmap`, `mprotect`, `mremap`), when any process or
+the kernel stores to a shared mapping or page cache the space may run code
+from, and when the space stores to an executable page that an instruction has
+been fetched from. Each page remembers whether an instruction was fetched from
+it. The mark is never cleared, and the copy that copy-on-write or `fork` makes
+of a page keeps it. A store to an executable page that nothing was fetched from
+leaves the generation, so it makes no decoded instruction stale: SBCL's heap is
+readable, writable and executable, and before this every store to it made the
+interpreter decode everything again. The first fetch from a page sets the mark
+under the address space's lock, after moving the TLB epoch on, which waits for
+the stores under way without the lock. Either a store sees the mark and moves
+the generation on after its bytes, or the fetch sees the bytes.
+
 A block starts with its first instruction and grows as it runs. An instruction
 that runs right after the last one of a block is decoded on its own, as it would
 be without blocks, and added to that block unless another block was stored
@@ -71,7 +85,7 @@ branch into the middle of a block starts another block, which decodes the rest
 of the first again. When the room is full, the cache doubles if the blocks of
 the current code generation fill more than half of it, and drops every block
 otherwise. It copies nothing either way: a program that changes its code often,
-as SBCL does, fills the room with blocks of earlier generations again and again.
+as a JIT does, fills the room with blocks of earlier generations again and again.
 
 When an instruction is decoded, the most frequent simple
 forms (`nop` and `endbr64`, moves between registers and memory, `movzx` from

@@ -147,6 +147,8 @@ pub(crate) struct Namespace {
     /// The System V shared memory segments of an IPC namespace, which go
     /// with it, as Linux's `shm_exit_ns` removes them.
     pub shm: crate::shm::Segments,
+    /// Its System V semaphore sets, which go with it (`sem_exit_ns`).
+    pub sem: crate::sem::Sets,
     /// The numbers of a PID namespace.
     pids: Pids,
     /// A nested network namespace's sockets.
@@ -190,6 +192,7 @@ impl Namespace {
             inode,
             names: Mutex::new(names),
             shm: crate::shm::Segments::default(),
+            sem: crate::sem::Sets::default(),
             pids,
             sockets: Sockets::default(),
             users: crate::users::Users::default(),
@@ -210,6 +213,7 @@ impl Namespace {
                 domain: Vec::new(),
             }),
             shm: crate::shm::Segments::default(),
+            sem: crate::sem::Sets::default(),
             pids: Pids::default(),
             sockets: Sockets::default(),
             owner: users.parent().cloned(),
@@ -274,6 +278,24 @@ struct Numbers {
     /// `PIDNS_ADDING`).
     closed: bool,
 }
+impl Numbers {
+    /// The next number after the last handed out that no task has, as
+    /// `idr_alloc_cyclic` skips those `set_tid` took; `EAGAIN` past
+    /// `i32::MAX`.
+    fn next_free(&mut self) -> Result<u32, Errno> {
+        let mut number = self.last;
+        loop {
+            number = number
+                .checked_add(1)
+                .filter(|&n| n <= i32::MAX as u32)
+                .ok_or(Errno::EAGAIN)?;
+            if !self.by_number.contains_key(&number) {
+                self.last = number;
+                return Ok(number);
+            }
+        }
+    }
+}
 impl Namespace {
     fn numbers(&self) -> std::sync::MutexGuard<'_, Numbers> {
         self.pids
@@ -331,11 +353,26 @@ impl Namespace {
     pub(crate) fn close(&self) {
         self.numbers().closed = true;
     }
+    /// This PID namespace and each one it is in, from the first down to it,
+    /// as Linux's `pid->numbers` holds a task's numbers by level.
+    pub(crate) fn levels(&self) -> Vec<&Namespace> {
+        let mut levels = vec![self];
+        let mut at = self;
+        while let Some(parent) = &at.pids.parent {
+            levels.push(parent);
+            at = parent;
+        }
+        levels.reverse();
+        levels
+    }
     /// Gives task `id` a number in this PID namespace and in each one it is
-    /// in, as Linux's `alloc_pid`: `ENOMEM` when its init has exited (as
-    /// there, only this namespace's is looked at), and the first task of a
-    /// namespace is its init. On a failure it has no number in any.
-    pub(crate) fn enter(&self, id: u32) -> Result<(), Errno> {
+    /// in but the first, as Linux's `alloc_pid`: the numbers of `set_tid`
+    /// (`clone3`'s), from this namespace out, then the next free one in
+    /// each other. `ENOMEM` when its init has exited (as there, only this
+    /// namespace's is looked at), `EEXIST` for a number of `set_tid` that
+    /// is taken, and the first task of a namespace is its init. On a
+    /// failure it has no number in any.
+    pub(crate) fn enter(&self, id: u32, set_tid: &[u32]) -> Result<(), Errno> {
         if self.is_first() {
             return Ok(());
         }
@@ -343,18 +380,22 @@ impl Namespace {
             return Err(Errno::ENOMEM);
         }
         let mut at = self;
+        let mut level = 0;
         while let Some(parent) = &at.pids.parent {
             let mut numbers = at.numbers();
-            let number = numbers
-                .last
-                .checked_add(1)
-                .filter(|&n| n <= i32::MAX as u32);
-            let Some(number) = number else {
-                drop(numbers);
-                self.leave(id);
-                return Err(Errno::EAGAIN);
+            let number = match set_tid.get(level) {
+                Some(&number) if numbers.by_number.contains_key(&number) => Err(Errno::EEXIST),
+                Some(&number) => Ok(number),
+                None => numbers.next_free(),
             };
-            numbers.last = number;
+            let number = match number {
+                Ok(number) => number,
+                Err(error) => {
+                    drop(numbers);
+                    self.leave(id);
+                    return Err(error);
+                }
+            };
             numbers.by_task.insert(id, number);
             numbers.by_number.insert(number, id);
             if number == 1 {
@@ -362,6 +403,7 @@ impl Namespace {
             }
             drop(numbers);
             at = parent;
+            level += 1;
         }
         Ok(())
     }
@@ -731,15 +773,15 @@ mod tests {
         let inner = outer
             .for_child(CLONE_NEWPID, false, crate::users::first())
             .unwrap();
-        inner.pid.enter(7).unwrap();
+        inner.pid.enter(7, &[]).unwrap();
         assert_eq!((inner.pid.number(7), outer.pid.number(7)), (1, 1));
         assert_eq!(inner.pid.init(), Some(7));
-        inner.pid.enter(9).unwrap();
+        inner.pid.enter(9, &[]).unwrap();
         assert_eq!(inner.pid.task(2), Some(9));
         inner.pid.leave(9);
         assert_eq!((inner.pid.number(9), outer.pid.number(9)), (0, 0));
         inner.pid.close();
-        assert_eq!(inner.pid.enter(11), Err(Errno::ENOMEM));
+        assert_eq!(inner.pid.enter(11, &[]), Err(Errno::ENOMEM));
         assert_eq!(outer.pid.number(11), 0);
     }
 

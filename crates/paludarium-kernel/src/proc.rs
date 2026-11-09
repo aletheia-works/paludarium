@@ -504,6 +504,12 @@ pub(crate) struct Status<'a> {
     pub tgid: u32,
     pub pid: u32,
     pub parent: u32,
+    /// The process group and the session, by their IDs in the emulator.
+    pub group_id: u32,
+    pub session: u32,
+    /// The task's own PID namespace, whose numbers of it and those of each
+    /// namespace it is in the `NS*` lines give.
+    pub space: &'a crate::namespaces::Namespace,
     pub descriptors: Option<usize>,
     pub threads: usize,
     pub queued: usize,
@@ -545,10 +551,28 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
     let groups: Vec<String> = c.groups.iter().map(|&g| gid(g).to_string()).collect();
     let groups = groups.join(" ");
     let bounding = crate::credentials::ALL_CAPABILITIES;
+    // Each ID as the PID namespace of /proc, the first, numbers it, then each
+    // namespace below it down to the task's own (`task_state`).
+    let levels = s.space.levels();
+    let mut numbers = String::new();
+    for (name, id) in [
+        ("NStgid", tgid),
+        ("NSpid", pid),
+        ("NSpgid", s.group_id),
+        ("NSsid", s.session),
+    ] {
+        numbers.push_str(name);
+        numbers.push(':');
+        for level in &levels {
+            numbers.push('\t');
+            numbers.push_str(&level.number(id).to_string());
+        }
+        numbers.push('\n');
+    }
     format!(
         "Name:\t{name}\n{umask}State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\n\
          Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
-         FDSize:\t{fd_size}\nGroups:\t{groups} \nThreads:\t{}\nSigQ:\t{}/{}\n\
+         FDSize:\t{fd_size}\nGroups:\t{groups} \n{numbers}Threads:\t{}\nSigQ:\t{}/{}\n\
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
          SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\n\
          CapEff:\t{:016x}\nCapBnd:\t{bounding:016x}\nCapAmb:\t{:016x}\n\
@@ -1197,6 +1221,16 @@ mod tests {
     }
     #[test]
     fn status_has_the_fields_parsers_require() {
+        // Tasks 3 and 4 in a PID namespace below the first, as 1 and 2.
+        let namespaces = crate::namespaces::Namespaces::default()
+            .for_child(
+                crate::namespaces::CLONE_NEWPID,
+                false,
+                crate::users::first(),
+            )
+            .unwrap();
+        namespaces.pid.enter(3, &[]).unwrap();
+        namespaces.pid.enter(4, &[]).unwrap();
         let text = String::from_utf8(render_status(&Status {
             name: b"a\\b\nc\0\0",
             umask: Some(0o22),
@@ -1204,6 +1238,9 @@ mod tests {
             tgid: 3,
             pid: 4,
             parent: 1,
+            group_id: 3,
+            session: 2,
+            space: &namespaces.pid,
             descriptors: Some(70),
             threads: 2,
             queued: 1,
@@ -1240,7 +1277,8 @@ mod tests {
             "SigIgn:\t0000000000001000\n",
             "Uid:\t1\t2\t3\t4\n",
             "Gid:\t0\t0\t0\t0\n",
-            "Groups:\t5 6 \n",
+            // In Linux's place, the session's leader outside the namespace.
+            "Groups:\t5 6 \nNStgid:\t3\t1\nNSpid:\t4\t2\nNSpgid:\t3\t1\nNSsid:\t2\t0\nThreads:",
             "CapInh:\t0000000000000042\n",
             "CapPrm:\t000001ffffffffff\n",
             "CapEff:\t0000000000000000\n",

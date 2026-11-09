@@ -9,17 +9,16 @@
 //! (`shm_nattch`) is how many of those mappings live, as Linux's `shm_open`
 //! and `shm_close` count its VMAs. A segment marked for removal is removed
 //! once that count is 0.
-use crate::credentials::Credentials;
+use crate::ipc::{
+    self, CAP_IPC_OWNER, CAP_SYS_ADMIN, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
+    IPC_SET, IPC_STAT, Perm,
+};
 use crate::syscalls::{Context, Outcome};
-use paludarium_host::ClockId;
 use paludarium_mmu::{FileSize, MappingKind, PageSource, Prot, SharedPages};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-const IPC_PRIVATE: i32 = 0;
-const IPC_CREAT: i32 = 0o1000;
-const IPC_EXCL: i32 = 0o2000;
 const SHM_HUGETLB: i32 = 0o4000;
 const SHM_RDONLY: i32 = 0o10000;
 const SHM_RND: i32 = 0o20000;
@@ -29,10 +28,6 @@ const SHM_EXEC: i32 = 0o100000;
 const SHM_DEST: u32 = 0o1000;
 const SHM_LOCKED: u32 = 0o2000;
 
-const IPC_RMID: i32 = 0;
-const IPC_SET: i32 = 1;
-const IPC_STAT: i32 = 2;
-const IPC_INFO: i32 = 3;
 const SHM_LOCK: i32 = 11;
 const SHM_UNLOCK: i32 = 12;
 const SHM_STAT: i32 = 13;
@@ -45,20 +40,12 @@ const SHMMIN: u64 = 1;
 const SHMMAX: u64 = u64::MAX - (1 << 24);
 const SHMALL: u64 = u64::MAX - (1 << 24);
 const SHMMNI: usize = 4096;
-/// An ID is its index plus its sequence number shifted by this (Linux's
-/// `IPCMNI_SHIFT`), and indexes are allocated in turn below at least 64.
-const SEQ_SHIFT: u32 = 15;
-const IPCMNI: u32 = 1 << SEQ_SHIFT;
-const SEQ_MAX: u32 = i32::MAX as u32 >> SEQ_SHIFT;
-const MIN_CYCLE: usize = 64;
 const PAGE: u64 = 4096;
 /// The device a segment's file lies on, which `/proc/<pid>/maps` shows:
 /// Linux's internal tmpfs mount, 00:01.
 const DEVICE: u64 = 1;
 
 const CAP_IPC_LOCK: u64 = 1 << 14;
-const CAP_IPC_OWNER: u64 = 1 << 15;
-const CAP_SYS_ADMIN: u64 = 1 << 21;
 const RLIMIT_MEMLOCK: usize = 8;
 const ENOMEM: Errno = Errno::ENOMEM;
 
@@ -76,26 +63,16 @@ impl std::fmt::Debug for Segments {
 struct Table {
     /// By index.
     segments: BTreeMap<u32, Segment>,
-    /// The sequence number of the IDs given out, which goes up whenever an
-    /// index is given out again after a higher one (Linux's `ids->seq`).
-    seq: u32,
-    /// The index given out last, and where the search for the next starts.
-    last: Option<u32>,
-    next: u32,
+    ids: ipc::Ids,
     /// The pages of all segments (Linux's `shm_tot`).
     pages: u64,
 }
 
 struct Segment {
     id: i32,
-    /// Its key, `IPC_PRIVATE` once it is marked for removal.
-    key: i32,
-    uid: u32,
-    gid: u32,
-    cuid: u32,
-    cgid: u32,
-    /// The permissions, with `SHM_DEST` and `SHM_LOCKED`.
-    mode: u32,
+    /// Its key, `IPC_PRIVATE` once it is marked for removal, and its
+    /// permissions with `SHM_DEST` and `SHM_LOCKED`.
+    perm: Perm,
     size: u64,
     atime: i64,
     dtime: i64,
@@ -193,7 +170,7 @@ impl Table {
         let doomed: Vec<u32> = self
             .segments
             .iter()
-            .filter(|(_, segment)| segment.mode & SHM_DEST != 0 && segment.attached() == 0)
+            .filter(|(_, segment)| segment.perm.mode & SHM_DEST != 0 && segment.attached() == 0)
             .map(|(&index, _)| index)
             .collect();
         for index in doomed {
@@ -206,70 +183,10 @@ impl Table {
     /// `ipc_obtain_object_check`).
     fn checked(&mut self, id: i32) -> Result<&mut Segment, Errno> {
         self.segments
-            .get_mut(&(id as u32 % IPCMNI))
+            .get_mut(&ipc::index(id))
             .filter(|segment| segment.id == id)
             .ok_or(Errno::EINVAL)
     }
-    /// The highest index in use, or 0 for none (Linux's `ipc_get_maxidx`).
-    fn max_index(&self) -> u64 {
-        self.segments
-            .keys()
-            .next_back()
-            .map_or(0, |&index| u64::from(index))
-    }
-    /// A new ID, as Linux's `ipc_idr_alloc`: the next free index from the
-    /// last one given out, below the larger of 64 and half as many again
-    /// as are in use, or the first free one from 0, which starts a new
-    /// sequence number.
-    fn allocate(&mut self) -> Result<i32, Errno> {
-        let in_use = self.segments.len();
-        if in_use >= SHMMNI {
-            return Err(Errno::ENOSPC);
-        }
-        let end = (in_use * 3 / 2).clamp(MIN_CYCLE, IPCMNI as usize) as u32;
-        let free = |from: u32| (from..end).find(|index| !self.segments.contains_key(index));
-        let index = free(self.next).or_else(|| free(0)).ok_or(Errno::ENOSPC)?;
-        self.next = index + 1;
-        if self.last.is_some_and(|last| index <= last) {
-            self.seq += 1;
-            if self.seq >= SEQ_MAX {
-                self.seq = 0;
-            }
-        }
-        self.last = Some(index);
-        Ok(((self.seq << SEQ_SHIFT) + index) as i32)
-    }
-}
-
-/// Whether `credentials` may use a segment for `flag`'s permission bits, as
-/// Linux's `ipcperms`: as its owner or creator, else as a member of its
-/// group (by the filesystem group ID, as `in_group_p`), else as anyone, or
-/// with `CAP_IPC_OWNER` over the IPC namespace (`owner_capable`).
-fn permitted(segment: &Segment, credentials: &Credentials, flag: u32, owner_capable: bool) -> bool {
-    let requested = (flag >> 6) | (flag >> 3) | flag;
-    let in_group = |gid: u32| credentials.fsgid == gid || credentials.groups.contains(&gid);
-    let granted = if credentials.euid == segment.cuid || credentials.euid == segment.uid {
-        segment.mode >> 6
-    } else if in_group(segment.cgid) || in_group(segment.gid) {
-        segment.mode >> 3
-    } else {
-        segment.mode
-    };
-    requested & !granted & 0o7 == 0 || owner_capable
-}
-/// Whether the caller has `cap` in the user namespace that owns its IPC
-/// namespace (`ns_capable(ns->user_ns, cap)`).
-fn ipc_capable(c: &Context<'_>, cap: u64) -> bool {
-    let namespaces = c.group.namespaces(c.tid);
-    c.process
-        .credentials
-        .capable_in(cap, namespaces.ipc.owner())
-}
-
-fn now(c: &Context<'_>) -> i64 {
-    c.host
-        .clock(ClockId::Realtime)
-        .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
 }
 
 /// The segments of the calling thread's IPC namespace.
@@ -294,18 +211,22 @@ pub(crate) fn sys_shmget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno> {
     let credentials = &c.process.credentials;
-    let owner = ipc_capable(c, CAP_IPC_OWNER);
+    let owner = ipc::capable(c, CAP_IPC_OWNER);
     let shm = segments(c);
     let mut table = shm.lock();
     if key != IPC_PRIVATE {
-        if let Some(segment) = table.segments.values().find(|segment| segment.key == key) {
+        if let Some(segment) = table
+            .segments
+            .values()
+            .find(|segment| segment.perm.key == key)
+        {
             if flag & IPC_CREAT != 0 && flag & IPC_EXCL != 0 {
                 return Err(Errno::EEXIST);
             }
             if segment.size < size {
                 return Err(Errno::EINVAL);
             }
-            if !permitted(segment, credentials, flag as u32, owner) {
+            if !segment.perm.permitted(credentials, flag as u32, owner) {
                 return Err(Errno::EACCES);
             }
             return Ok(u64::from(segment.id as u32));
@@ -328,22 +249,18 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
     if flag & SHM_HUGETLB != 0 {
         return Err(Errno::ENOSYS);
     }
-    let id = table.allocate()?;
+    let table = &mut *table;
+    let id = table.ids.allocate(&table.segments, SHMMNI)?;
     let name = format!("/SYSV{:08x} (deleted)", key as u32);
     table.segments.insert(
-        id as u32 % IPCMNI,
+        ipc::index(id),
         Segment {
             id,
-            key,
-            uid: credentials.euid,
-            gid: credentials.egid,
-            cuid: credentials.euid,
-            cgid: credentials.egid,
-            mode: flag as u32 & 0o777,
+            perm: Perm::new(key, credentials, flag),
             size,
             atime: 0,
             dtime: 0,
-            ctime: now(c),
+            ctime: ipc::now(c),
             cpid: c.process.pid,
             lpid: 0,
             memory: SharedPages::new(),
@@ -395,11 +312,14 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         access |= 0o111;
     }
     let (attachment, size) = {
-        let owner = ipc_capable(c, CAP_IPC_OWNER);
+        let owner = ipc::capable(c, CAP_IPC_OWNER);
         let shm = segments(c);
         let mut table = shm.lock();
         let segment = table.checked(id)?;
-        if !permitted(segment, &c.process.credentials, access, owner) {
+        if !segment
+            .perm
+            .permitted(&c.process.credentials, access, owner)
+        {
             return Err(Errno::EACCES);
         }
         let attachment = Arc::new(Attachment {
@@ -450,7 +370,7 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
     let shm = segments(c);
     let mut table = shm.lock();
     if let Ok(segment) = table.checked(attachment.id) {
-        segment.atime = now(c);
+        segment.atime = ipc::now(c);
         segment.lpid = c.process.pid;
     }
     drop(table);
@@ -512,7 +432,7 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
     let shm = segments(c);
     let mut table = shm.lock();
     if let Ok(segment) = table.checked(id) {
-        segment.dtime = now(c);
+        segment.dtime = ipc::now(c);
         segment.lpid = c.process.pid;
     }
     Ok(0)
@@ -536,7 +456,7 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
     match cmd {
         // `struct shminfo64`, and the highest index in use.
         IPC_INFO => {
-            let max = segments(c).lock().max_index();
+            let max = ipc::max_index(&segments(c).lock().segments);
             let mut info = [0u8; 72];
             for (n, value) in [SHMMAX, SHMMIN, SHMMNI as u64, SHMMNI as u64, SHMALL]
                 .into_iter()
@@ -558,7 +478,7 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                     .map(|s| s.memory.resident())
                     .sum::<u64>();
                 (
-                    table.max_index(),
+                    ipc::max_index(&table.segments),
                     table.segments.len() as u32,
                     table.pages,
                     resident,
@@ -582,15 +502,14 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                     // the low bits (`ipcid_to_idx`), as of an ID.
                     table
                         .segments
-                        .get_mut(&(id as u32 % IPCMNI))
+                        .get_mut(&ipc::index(id))
                         .ok_or(Errno::EINVAL)?
                 };
                 if cmd != SHM_STAT_ANY
-                    && !permitted(
-                        segment,
+                    && !segment.perm.permitted(
                         &c.process.credentials,
                         0o444,
-                        ipc_capable(c, CAP_IPC_OWNER),
+                        ipc::capable(c, CAP_IPC_OWNER),
                     )
                 {
                     return Err(Errno::EACCES);
@@ -615,37 +534,24 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                     .read(GuestAddr(buf), &mut ds)
                     .map_err(|_| Errno::EFAULT)?;
             }
-            let now = now(c);
-            let admin = ipc_capable(c, CAP_SYS_ADMIN);
+            let now = ipc::now(c);
+            let admin = ipc::capable(c, CAP_SYS_ADMIN);
             let shm = segments(c);
             let mut table = shm.lock();
             let credentials = &c.process.credentials;
             let segment = table.checked(id)?;
-            if credentials.euid != segment.cuid && credentials.euid != segment.uid && !admin {
+            if !segment.perm.owned_by(credentials) && !admin {
                 return Err(Errno::EPERM);
             }
             if cmd == IPC_SET {
-                let field =
-                    |at: usize| u32::from_le_bytes([ds[at], ds[at + 1], ds[at + 2], ds[at + 3]]);
-                let (uid, gid, mode) = (field(4), field(8), field(20));
-                // In the caller's user namespace (`ipc_update_perm`).
-                let user = &credentials.user;
-                let (Some(uid), Some(gid)) = (
-                    user.kernel_of(crate::users::Ids::User, uid),
-                    user.kernel_of(crate::users::Ids::Group, gid),
-                ) else {
-                    return Err(Errno::EINVAL);
-                };
-                segment.uid = uid;
-                segment.gid = gid;
-                segment.mode = segment.mode & !0o777 | mode & 0o777;
+                segment.perm.update(&ds, &credentials.user)?;
                 segment.ctime = now;
                 return Ok(0);
             }
             // Marked for removal while attached, and found by no key; the
             // last detach removes it.
-            segment.mode |= SHM_DEST;
-            segment.key = IPC_PRIVATE;
+            segment.perm.mode |= SHM_DEST;
+            segment.perm.key = IPC_PRIVATE;
             table.purge();
             Ok(0)
         }
@@ -662,16 +568,9 @@ fn shmid_ds(
     space: &crate::namespaces::Namespace,
     user: &crate::namespaces::Namespace,
 ) -> [u8; 112] {
-    use crate::users::Ids;
     let mut ds = [0u8; 112];
+    segment.perm.put(&mut ds, segment.id, user);
     let mut put = |at: usize, bytes: &[u8]| ds[at..at + bytes.len()].copy_from_slice(bytes);
-    put(0, &segment.key.to_le_bytes());
-    put(4, &user.shown(Ids::User, segment.uid).to_le_bytes());
-    put(8, &user.shown(Ids::Group, segment.gid).to_le_bytes());
-    put(12, &user.shown(Ids::User, segment.cuid).to_le_bytes());
-    put(16, &user.shown(Ids::Group, segment.cgid).to_le_bytes());
-    put(20, &segment.mode.to_le_bytes());
-    put(24, &((segment.id as u32 >> SEQ_SHIFT) as u16).to_le_bytes());
     put(48, &segment.size.to_le_bytes());
     put(56, &segment.atime.to_le_bytes());
     put(64, &segment.dtime.to_le_bytes());
@@ -689,7 +588,7 @@ fn shmid_ds(
 /// a lock changes nothing else.
 fn lock(c: &Context<'_>, id: i32, lock: bool) -> Result<u64, Errno> {
     let credentials = &c.process.credentials;
-    let capable = ipc_capable(c, CAP_IPC_LOCK);
+    let capable = ipc::capable(c, CAP_IPC_LOCK);
     let limit = c.processes.soft_limit(c.process.pid, RLIMIT_MEMLOCK);
     let shm = segments(c);
     let mut table = shm.lock();
@@ -701,7 +600,7 @@ fn lock(c: &Context<'_>, id: i32, lock: bool) -> Result<u64, Errno> {
         .sum();
     let segment = table.checked(id)?;
     if !capable {
-        if credentials.euid != segment.uid && credentials.euid != segment.cuid {
+        if !segment.perm.owned_by(credentials) {
             return Err(Errno::EPERM);
         }
         if lock && limit == 0 {
@@ -709,7 +608,7 @@ fn lock(c: &Context<'_>, id: i32, lock: bool) -> Result<u64, Errno> {
         }
     }
     if lock {
-        if segment.mode & SHM_LOCKED != 0 {
+        if segment.perm.mode & SHM_LOCKED != 0 {
             return Ok(0);
         }
         let limit = if limit == u64::MAX {
@@ -720,10 +619,10 @@ fn lock(c: &Context<'_>, id: i32, lock: bool) -> Result<u64, Errno> {
         if locked_by_user + segment.pages() > limit && !capable {
             return Err(ENOMEM);
         }
-        segment.mode |= SHM_LOCKED;
+        segment.perm.mode |= SHM_LOCKED;
         segment.locker = Some(credentials.uid);
-    } else if segment.mode & SHM_LOCKED != 0 {
-        segment.mode &= !SHM_LOCKED;
+    } else if segment.perm.mode & SHM_LOCKED != 0 {
+        segment.perm.mode &= !SHM_LOCKED;
         segment.locker = None;
     }
     Ok(0)

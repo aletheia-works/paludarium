@@ -26,10 +26,18 @@ rewritten, without touching anything else.
 WebAssembly (wasm32) memory stops at 4 GB, so a guest's 64-bit address space
 cannot be placed in it directly. paludarium therefore uses a software MMU with
 two-level page tables of 4 KiB pages on every host. Every access is checked; a
-missing page or a permission violation becomes a guest exception. A small
-cache of the private pages used last (a software TLB of 64 entries) lets the
+missing page or a permission violation becomes a guest exception. A cache
+of the private pages used last (a software TLB of 1024 entries) lets the
 next access to one of them skip the page table, still checking its
 protection; it is emptied whenever a mapping or a page entry may change.
+
+An entry holds the bytes of its page's frame, but not the frame's charge to
+the session's memory meter (`memory.current`), which the page tables and
+shared memory hold. A thread empties its TLB only at its next access, so a
+thread that is waiting may hold the bytes of pages that are gone; they no
+longer count, and new frames find the room at once. Only a frame that had no
+bytes when the TLB took it is held whole, as another space sharing it may
+give it bytes without this space's lock.
 
 Each guest thread has a TLB of its own. Its loads, stores and instruction
 fetches, and its locked instructions within one 8-byte word, take no lock
@@ -55,7 +63,14 @@ changes them does not matter: an access that saw neither change comes before
 the truncation, as one under way while it ran, and a copy that the truncation
 leaves past the end is replaced at the next access under the locks, so a
 store that landed in it is never seen. No access that starts after the
-truncation returns uses the page.
+truncation returns uses the page. Under the locks, an access checks the end
+of the file again after it has brought the page entry up to date, as a
+truncation may come between the two. The page cache gives the new size, and
+zeros past it, before it counts the shrink, and a copy of a page-cache page
+records the count read before it copies. So an entry that records the new
+count was made after the new size could be seen, and a copy that took bytes
+from before the shrink records an older count, and goes if the page is past
+the end.
 
 The pages of a shared mapping (`MAP_SHARED` memory or file, System V shared
 memory) go in the TLB too, with the memory they show. A store through the
@@ -86,8 +101,11 @@ A guest's threads see each other's memory in the order x86 gives (TSO): a
 thread's loads and stores stay in order, except that a load may pass an earlier
 store. The page contents are read with acquire and written with release
 ordering, which keeps that order on an Arm host too, without the lock. A write
-to an executable page moves the code generation on after its bytes, so whoever
-sees the new generation sees the new code.
+to an executable page that an instruction was fetched from moves the code
+generation on after its bytes, so whoever sees the new generation sees the new
+code. The first fetch from a page marks it under the locks after moving the
+epoch on, so a store through the TLB only loads the mark: either it sees the
+mark, or the fetch sees its bytes.
 
 An aligned load of 16 bytes (`MOVDQA`, for one) is one access on an x86-64
 CPU, so it sees a `CMPXCHG16B` or a 16-byte store of another thread whole.

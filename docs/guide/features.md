@@ -714,7 +714,8 @@ kernel.
   binds IPv4's loopback addresses, which are local all the same, but not
   `::1` (`EADDRNOTAVAIL`), and a connection or datagram goes nowhere
   (`ENETUNREACH`). `SIOCSIFFLAGS` with `IFF_UP` (CAP_NET_ADMIN, else
-  `EPERM`) brings it up, with `::1`: then it is a
+  `EPERM`) brings it up, with `::1`, which it has only while it is up:
+  then it is a
   [loopback](#loopback-servers) of its own, whose ports, listeners and
   datagrams are apart from every other namespace's, and anything off it is
   still `ENETUNREACH`, port 53 too, as there is no DNS stub; a session with

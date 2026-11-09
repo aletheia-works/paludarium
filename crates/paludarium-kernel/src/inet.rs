@@ -294,11 +294,10 @@ pub(crate) struct Network {
     /// A nested network namespace's, which has nothing but its loopback:
     /// no route to the host, and no DNS stub.
     isolated: bool,
-    /// Its loopback interface: whether it is up, and whether it has `::1`,
-    /// which Linux's `addrconf` gives a new namespace's loopback the first
-    /// time it comes up.
+    /// Whether its loopback interface is up; it has `::1` only then, as
+    /// Linux's `addrconf` adds it at `NETDEV_UP` and `addrconf_ifdown`
+    /// takes it away at `NETDEV_DOWN` (`keep_addr_on_down` is 0).
     up: AtomicBool,
-    addressed: AtomicBool,
 }
 /// The flags `SIOCGIFFLAGS` gives the loopback: `IFF_LOOPBACK`, with
 /// `IFF_UP` and `IFF_RUNNING` while it is up.
@@ -317,7 +316,6 @@ impl Network {
             syns: Mutex::default(),
             isolated: false,
             up: AtomicBool::new(true),
-            addressed: AtomicBool::new(true),
         }
     }
     /// A new network namespace's network: only a loopback, down and without
@@ -326,7 +324,6 @@ impl Network {
         Self {
             isolated: true,
             up: AtomicBool::new(false),
-            addressed: AtomicBool::new(false),
             ..Self::new(NetworkPolicy::default())
         }
     }
@@ -343,13 +340,13 @@ impl Network {
     }
     /// Whether the loopback has `::1` to bind to.
     fn has_loopback_address(&self) -> bool {
-        self.addressed.load(Ordering::SeqCst)
+        self.up.load(Ordering::SeqCst)
     }
     /// `SIOCGIFFLAGS`, `SIOCSIFFLAGS` and `SIOCGIFINDEX` on the interface
     /// `name` (the `ifr_name` of a `struct ifreq`): the loopback `lo`, index
     /// 1, is the only one (`ENODEV` for another). Setting flags needs
     /// CAP_NET_ADMIN (`EPERM`, before the name is looked at) and takes only
-    /// `IFF_UP`; the first time the loopback comes up it gets `::1`.
+    /// `IFF_UP`; the loopback has `::1` while it is up.
     pub(crate) fn interface(
         &self,
         name: &[u8],
@@ -372,11 +369,7 @@ impl Network {
                 IFF_LOOPBACK
             })),
             SIOCSIFFLAGS => {
-                let up = flags & IFF_UP != 0;
-                self.up.store(up, Ordering::SeqCst);
-                if up {
-                    self.addressed.store(true, Ordering::SeqCst);
-                }
+                self.up.store(flags & IFF_UP != 0, Ordering::SeqCst);
                 Ok(0)
             }
             _ => Ok(1),

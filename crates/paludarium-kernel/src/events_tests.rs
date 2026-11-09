@@ -3578,6 +3578,17 @@ fn a_new_network_namespace_has_only_a_loopback_that_starts_down() {
     let other = f.ret(41, [2, 1, 0, 0, 0, 0]);
     inet_address(&f, DATA + 0x100, [192, 0, 2, 1], 80);
     assert_eq!(f.ret(42, [other, DATA + 0x100, 16, 0, 0, 0]), unreachable);
+    // Down again, it loses `::1`, and has it back when it comes up.
+    interface_request(&f, DATA + 0x400, b"lo", 0);
+    assert_eq!(f.ret(16, [tcp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    let again = f.ret(41, [10, 2, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(49, [again, DATA + 0x500, 28, 0, 0, 0]),
+        Errno(99).to_syscall_return()
+    );
+    interface_request(&f, DATA + 0x400, b"lo", 1);
+    assert_eq!(f.ret(16, [tcp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    assert_eq!(f.ret(49, [again, DATA + 0x500, 28, 0, 0, 0]), 0);
     // Setting flags needs CAP_NET_ADMIN, before the name is looked at.
     f.thread.state.credentials = f
         .thread

@@ -879,7 +879,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `lo`（インデックス 1）を返します（ほかは `ENODEV`）。属性は Linux 7.0 と同じものを
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、
     キューイング規律、0 の統計（`IFLA_EXT_MASK` に `RTEXT_FILTER_SKIP_STATS` があれば
-    載せません）、XDP、マップ、IPv4 と IPv6 の設定（`IFLA_AF_SPEC`）です。そのため
+    載せません）、XDP、マップ、MCTP と IPv4 と IPv6 の設定（MCTP を組み込んだカーネルと同じ `IFLA_AF_SPEC`）です。そのため
     `ip -d link` は Linux と同じ詳細を出します。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
   - **アドレス:** `RTM_GETADDR` は `lo` のアドレスを Linux の順でダンプします。IPv4 の
     プライマリは、同じかより広いスコープのプライマリの後に並び、セカンダリ（プライマリの

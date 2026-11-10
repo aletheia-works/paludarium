@@ -993,7 +993,8 @@ kernel.
     7.0's attributes in its order: its flags, name, queue, state, MTU,
     queues, segment sizes, carrier, queueing discipline, zero statistics (left out
     with `RTEXT_FILTER_SKIP_STATS` in `IFLA_EXT_MASK`), XDP, map, and its
-    IPv4 and IPv6 settings (`IFLA_AF_SPEC`), so `ip -d link` gives
+    MCTP, IPv4 and IPv6 settings (`IFLA_AF_SPEC`, as a kernel built with
+    MCTP gives it), so `ip -d link` gives
     Linux's details.
     `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`.
   - **Addresses:** `RTM_GETADDR` dumps `lo`'s addresses in Linux's orders:

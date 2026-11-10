@@ -155,6 +155,10 @@ const IFLA_TAILROOM: u16 = 69;
 /// The attributes inside `IFLA_XDP` and `IFLA_AF_SPEC`.
 const IFLA_XDP_ATTACHED: u16 = 2;
 const IFLA_INET_CONF: u16 = 1;
+const IFLA_MCTP_NET: u16 = 1;
+const IFLA_MCTP_PHYS_BINDING: u16 = 2;
+/// `AF_MCTP`, whose settings `IFLA_AF_SPEC` carries too.
+const AF_MCTP: u16 = 45;
 const IFLA_INET6_FLAGS: u16 = 1;
 const IFLA_INET6_CONF: u16 = 2;
 const IFLA_INET6_STATS: u16 = 3;
@@ -1074,8 +1078,8 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -
     attribute(&mut body, IFLA_DPLL_PIN | NLA_F_NESTED, &[]);
     message(RTM_NEWLINK, flags, seq, port, &body)
 }
-/// `lo`'s `IFLA_AF_SPEC`, as `inet_fill_link_af` and `inet6_fill_link_af`
-/// give it. Its IPv4 and IPv6 settings are those of a kernel whose sysctls
+/// `lo`'s `IFLA_AF_SPEC`, as `mctp_fill_link_af`, `inet_fill_link_af` and
+/// `inet6_fill_link_af` give it. Its IPv4 and IPv6 settings are those of a kernel whose sysctls
 /// are as built, a loopback's (no IPsec policy, no temporary addresses, no
 /// duplicate address detection, its MTU), not the host's a new namespace
 /// copies on Linux. IPv6 is ready while `lo` is up; its creation time is
@@ -1117,7 +1121,13 @@ fn af_spec(up: bool, stats: bool) -> Vec<u8> {
     }
     attribute(&mut inet6, IFLA_INET6_TOKEN, &[0; 16]);
     attribute(&mut inet6, IFLA_INET6_ADDR_GEN_MODE, &[0]);
+    // MCTP's, first, as a kernel built with it (Ubuntu's) gives: its
+    // default network, 1, and no physical binding.
+    let mut mctp = Vec::new();
+    attribute(&mut mctp, IFLA_MCTP_NET, &1u32.to_le_bytes());
+    attribute(&mut mctp, IFLA_MCTP_PHYS_BINDING, &[0]);
     let mut spec = Vec::new();
+    attribute(&mut spec, AF_MCTP, &mctp);
     attribute(&mut spec, u16::from(AF_INET), &inet);
     attribute(&mut spec, u16::from(AF_INET6), &inet6);
     spec
@@ -2155,11 +2165,15 @@ mod tests {
         assert_eq!(get(IFLA_STATS).map(<[u8]>::len), Some(STATS_LEN));
         assert_eq!(get(IFLA_NETNS_IMMUTABLE), Some(&[1][..]));
         assert_eq!(get(IFLA_MAP).map(<[u8]>::len), Some(32));
-        // IFLA_AF_SPEC: IPv4's 33 settings, then IPv6's, not yet ready.
+        // IFLA_AF_SPEC: MCTP's, IPv4's 33 settings, then IPv6's, not yet
+        // ready.
         let spec = attributes(get(IFLA_AF_SPEC).unwrap());
-        assert_eq!(spec.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [2, 10]);
-        assert_eq!(attributes(spec[0].1)[0].1.len(), 33 * 4);
-        let inet6 = attributes(spec[1].1);
+        assert_eq!(
+            spec.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            [45, 2, 10]
+        );
+        assert_eq!(attributes(spec[1].1)[0].1.len(), 33 * 4);
+        let inet6 = attributes(spec[2].1);
         assert_eq!(inet6[0], (IFLA_INET6_FLAGS, &[0u8; 4][..]));
         assert_eq!(
             inet6.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
@@ -2174,7 +2188,7 @@ mod tests {
                 .any(|(k, _)| *k == IFLA_STATS || *k == IFLA_STATS64)
         );
         let spec = found.iter().find(|(k, _)| *k == IFLA_AF_SPEC).unwrap().1;
-        let inet6 = attributes(attributes(spec)[1].1);
+        let inet6 = attributes(attributes(spec)[2].1);
         assert_eq!(
             inet6.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [1, 5, 2, 7, 8]

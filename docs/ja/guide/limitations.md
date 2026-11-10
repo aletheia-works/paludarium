@@ -258,13 +258,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **inotify の一部**：ファイルを開く・閉じる（`IN_OPEN`、`IN_CLOSE_WRITE`、
-  `IN_CLOSE_NOWRITE`）ことと、読み書き（`read`、`write`、`getdents64`、`sendfile`、
-  `copy_file_range`、`fallocate` などの `IN_ACCESS` と `IN_MODIFY`）は、まだ知らせ
-  ません。時刻の変更、切り詰め、`O_TRUNC` は知らせます。開いている間に消された
+- **inotify の一部**：FIFO をパスで開くこと、プログラムの起動（Linux は
+  `IN_OPEN`、`IN_ACCESS`、`IN_CLOSE_NOWRITE` を知らせます）、`splice` と `io_uring` の
+  読み書きはイベントになりません。開いている間に消された
   ファイル（や作業ディレクトリになっているディレクトリ）は、消されたときに
   `IN_DELETE_SELF` を受けます。Linux は最後に閉じたときに送ります。ディスクリプタを
-  通した変更（`fchmod`、`ftruncate` など）がファイルのディレクトリのウォッチに届くのは、
+  通した変更（`fchmod`、`ftruncate`、読み書き、閉じること）がファイルのディレクトリのウォッチに届くのは、
   開いたときのパスがまだそのファイルを指している間だけです。Linux は名前の変更を
   追い、消されたファイルなら元のディレクトリに知らせます。インスタンスはシグナル駆動の
   入出力に使えず（`FIOASYNC` は `ENOTTY` で、`fcntl` の `O_ASYNC` は付きません）、

@@ -316,6 +316,7 @@ mod linux {
         inotify_flags => ("inotify-flags","inotify"),
         inotify_overflow => ("inotify-overflow","inotify"),
         inotify_wait => ("inotify-wait","inotify"),
+        inotify_content => ("inotify-content","inotify"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),

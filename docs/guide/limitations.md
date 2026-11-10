@@ -291,15 +291,14 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: opening and closing a file (`IN_OPEN`,
-  `IN_CLOSE_WRITE`, `IN_CLOSE_NOWRITE`) and reading or writing it
-  (`IN_ACCESS` and `IN_MODIFY` of `read`, `write`, `getdents64`, `sendfile`,
-  `copy_file_range`, `fallocate` and the like) are not reported yet; changing
-  its times, truncating it and `O_TRUNC` are. A file removed while it is open
+- **inotify, in part**: opening a FIFO by its path, running a program
+  (which Linux reports as `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`),
+  `splice` and `io_uring`'s reads and writes are no events. A file removed while it is open
   (or a directory that is a working directory) gets `IN_DELETE_SELF` as it is
   removed, where Linux sends it at the last close. A change through a
-  descriptor (`fchmod`, `ftruncate` and the like) reaches the watch of the
-  file's directory only while the path it was opened at still names it, where
+  descriptor (`fchmod`, `ftruncate`, a read, a write or a close) reaches the
+  watch of the file's directory only while the path it was opened at still
+  names it, where
   Linux follows a rename and reports to the directory a removed file was in.
   An instance cannot be used for signal-driven I/O (`FIOASYNC` gives
   `ENOTTY`, and `fcntl` leaves `O_ASYNC` off), its `/proc/self/fdinfo` entry

@@ -4356,6 +4356,7 @@ mod inotify {
             masks(&got),
             [
                 (wd, 0x100, &b"a"[..]),
+                (wd, 0x20, b"a"),
                 (wd, 0x4, b"a"),
                 (wd, 0x40, b"a"),
                 (wd, 0x80, b"b"),
@@ -4365,8 +4366,8 @@ mod inotify {
             ]
         );
         // A rename's two events share a cookie.
-        assert_ne!(got[2].2, 0);
-        assert_eq!(got[2].2, got[3].2);
+        assert_ne!(got[3].2, 0);
+        assert_eq!(got[3].2, got[4].2);
         let _ = fresh;
     }
     #[test]
@@ -4400,6 +4401,37 @@ mod inotify {
         assert_eq!(
             masks(&events(&mut f, fd)),
             [(wd, 0x4, &b""[..]), (wd, 0x8000, b"")]
+        );
+    }
+    #[test]
+    fn opening_reading_writing_and_closing_are_events() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let file = put(&f, DATA, b"/tmp/c");
+        let d = f.ret(2, &[file, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        let wd = f.ret(ADD, &[fd, file, 0xfff]) as i32;
+        let d = f.ret(2, &[file, 2, 0]);
+        f.mem.write(GuestAddr(DATA + 0x40), b"abc").unwrap();
+        assert_eq!(f.ret(1, &[d, DATA + 0x40, 3]), 3);
+        assert_eq!(f.ret(17, &[d, DATA + 0x40, 3, 0]), 3);
+        // Nothing moved, no event.
+        assert_eq!(f.ret(0, &[d, DATA + 0x40, 3]), 0);
+        let copy = f.ret(32, &[d]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x20, &b""[..]), (wd, 0x2, b""), (wd, 0x1, b""),]
+        );
+        // The last close of the description is the close.
+        assert_eq!(f.ret(3, &[copy]), 0);
+        // truncate(2) opens nothing.
+        assert_eq!(f.ret(76, &[file, 1]), 0);
+        let d = f.ret(2, &[file, 0o10_000_000, 0]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x8, &b""[..]), (wd, 0x2, b"")]
         );
     }
     #[test]

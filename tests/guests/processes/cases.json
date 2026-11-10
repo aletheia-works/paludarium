@@ -67,6 +67,7 @@
     {"name":"inotify-flags","binary":"inotify"},
     {"name":"inotify-overflow","binary":"inotify"},
     {"name":"inotify-wait","binary":"inotify"},
+    {"name":"inotify-content","binary":"inotify"},
     {"name":"pgid-exec","binary":"process"},
     {"name":"priority","binary":"process"},
     {"name":"sysinfo","binary":"process"},

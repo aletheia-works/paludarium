@@ -3782,7 +3782,7 @@ const SCRIPT_HEAD: usize = 256;
 /// The first [`SCRIPT_HEAD`] bytes of the file at `path`, zero after its end,
 /// or `None` when it cannot be read, which loading it then reports.
 fn read_head(files: &crate::files::Files, path: &[u8]) -> Option<[u8; SCRIPT_HEAD]> {
-    let file = files.fs.open(path, 0, 0).ok()?;
+    let file = crate::inotify::unnoticed(|| files.fs.open(path, 0, 0)).ok()?;
     let mut head = [0; SCRIPT_HEAD];
     let mut at = 0;
     while at < SCRIPT_HEAD {

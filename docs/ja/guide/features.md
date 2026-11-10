@@ -1339,7 +1339,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   変更では何もありません）。モード、所有者（どちらも指定しない `chown` では何も
   ありません）、両方の時刻、拡張属性を変えると `IN_ATTRIB`、アクセス時刻だけなら
   `IN_ACCESS`、更新時刻だけなら `IN_MODIFY`、切り詰めは `IN_MODIFY` です（通常の
-  ファイルを空にする `O_TRUNC` も）。ファイルの変更は、そのディレクトリのウォッチに
+  ファイルを空にする `O_TRUNC` も、その `IN_OPEN` の後に）。開く（`O_PATH` 以外。
+  `/proc/self/fd` のリンクからも）と `IN_OPEN`、開いたファイル記述の最後の参照が
+  なくなると `IN_CLOSE_WRITE` か `IN_CLOSE_NOWRITE` です（マッピングは解除される
+  まで参照を持ちます）。バイトを動かした `read`、`write`、`pread64`、`pwrite64`、
+  `readv`、`writev`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`sendfile` と
+  `copy_file_range`（入力の後に出力）、`fallocate`、毎回の `getdents64` は
+  `IN_ACCESS` か `IN_MODIFY` です。`IN_EXCL_UNLINK` のウォッチは、どの名前からも
+  リンクされなくなったファイルを開く・閉じる・読み書きすることを受けません。
+  `truncate`、`mknod`、プログラムの起動は何も開きません。ファイルの変更は、そのディレクトリのウォッチに
   名前付きで先に届き、次にファイル自身のウォッチに届きます。ディレクトリのものには
   `IN_ISDIR` が付きます（`IN_DELETE_SELF` と `IN_MOVE_SELF` には Linux と同じく
   付きません）。`IN_ONESHOT` のウォッチは最初のイベントの後に `IN_IGNORED` とともに

@@ -57,6 +57,7 @@ kernel.
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
+| POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -647,6 +648,51 @@ kernel.
   `MSG_STAT_ANY` (the processes in the caller's PID namespace), `IPC_SET`
   (past `MSGMNB` with `CAP_SYS_RESOURCE`), `IPC_RMID`, `IPC_INFO` and
   `MSG_INFO`.
+- POSIX message queues (`mq_open`, `mq_unlink`, `mq_timedsend`,
+  `mq_timedreceive`, `mq_notify`, `mq_getsetattr`) are the files of the
+  thread's IPC namespace's own `mqueue` filesystem, with Linux's checks in
+  Linux's order (as `ipc/mqueue.c`). Its root is sticky and anyone may
+  write to it: a name is looked up there (`EACCES` for `.`, `..` or one with
+  a `/`, `ENAMETOOLONG` past 255 bytes), opening an existing queue checks
+  its permissions, and only the queue's owner or root unlinks it (`EPERM`).
+  A namespace starts with Linux's defaults: 256 queues (`queues_max`,
+  `ENOSPC`), at most 10 messages (`msg_max`, also the default) of at most
+  8192 bytes (`msgsize_max`, also the default); `CAP_SYS_RESOURCE` passes
+  the first and allows up to 65536 messages of 16 MiB. A queue charges its
+  creator's real user ID for its bytes and Linux's bookkeeping of each
+  message (48 + 48 bytes on x86-64) against `RLIMIT_MSGQUEUE` (`EMFILE`)
+  until it is unlinked and closed. `mq_open` gives a close-on-exec
+  descriptor, which `fork` shares with its `O_NONBLOCK` (which
+  `mq_getsetattr` and `fcntl` both set): `poll`, `select` and `epoll` find
+  it readable with a message and writable with room, whatever its access
+  mode, and each message queued wakes an edge-triggered `epoll` again;
+  `read` gives the state line Linux's does (`QSIZE`, `NOTIFY`, `SIGNO`,
+  `NOTIFY_PID`) from the file position, `fstat` a regular file of 80 bytes,
+  `fchmod` and `fchown` change it, and its link in `/proc/self/fd` is
+  `/<name>`, followed by a space and `(deleted)` once unlinked. Messages come highest
+  priority first (below 32768, `EINVAL`), in the order sent within one. A
+  receive into a buffer smaller than `mq_msgsize` is `EMSGSIZE`, and so is
+  a longer send. A receive from an empty queue and a send to a full one
+  give `EAGAIN` with `O_NONBLOCK`, else wait until the absolute
+  `CLOCK_REALTIME` timeout (`ETIMEDOUT`, read and checked first: `EFAULT`,
+  `EINVAL`) or a signal (`EINTR`, which `SA_RESTART` and a signal that runs
+  no handler restart, as `ERESTARTSYS`). The waiting receivers take
+  messages in the order they began, straight from the sender as Linux's
+  `pipelined_send`, and a waiting sender's message takes the room a
+  receive makes (`pipelined_receive`). `mq_notify` registers the calling
+  process (`EBUSY` while another is registered; no notification drops only
+  the caller's own) to hear of a message that comes to the empty queue
+  while no receiver waits, once: `SIGEV_SIGNAL` sends its signal with
+  `si_code` `SI_MESGQ`, the sender's process and real user ID and the
+  `sigev_value` (signal 0 sends nothing), unless the process has run
+  `execve` since; `SIGEV_NONE` only ends the registration; `SIGEV_THREAD`
+  copies 32 bytes from `sigev_value` and sends them to the netlink socket
+  `sigev_signo` names (`EBADF`, `ENOTSOCK`, or `EINVAL` for another
+  socket) as a datagram whose last byte is 1 (`NOTIFY_WOKENUP`), or 2
+  (`NOTIFY_REMOVED`) when the registration ends without a message, which is
+  what the C libraries' helper threads read to start the
+  `sigev_notify_function`. Closing any descriptor of the queue, or ending,
+  drops its process's registration, as Linux's `mqueue_flush_file`.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux

@@ -188,6 +188,17 @@ verified.
     `/proc/sys/kernel` cannot change. A message queue's waiting senders
     all look again whenever it changes, where Linux wakes them in the order
     they began only while each one's message fits.
+  - POSIX message queues have no `/proc/sys/fs/mqueue`, so their limits are
+    a new IPC namespace's defaults, and their filesystem cannot be mounted
+    (there is no `/dev/mqueue`). `RLIMIT_MSGQUEUE` charges each real user ID
+    once for the whole machine, where Linux charges it in each user
+    namespace too. A queue's file keeps only its creation time, and its
+    root belongs to root in every IPC namespace. A `SIGEV_THREAD` cookie
+    goes to its socket even when the socket's receive buffer is full,
+    where Linux's `mq_notify` first waits for room. The registration of a
+    process that ends goes when the queue is next used, which no other
+    process can tell from Linux's dropping it as the process closes its
+    descriptors.
   - A set's waiting semaphore operations are tried in one queue in the
     order they began, the waits for zero first. Linux keeps a queue for
     each semaphore beside one for operations on several, and which of two
@@ -336,8 +347,8 @@ verified.
   an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
   acts with the capability of the thread that opened it alone. The other namespaces keep nothing apart that
   paludarium has, but for the System V shared memory, semaphores and
-  message queues of an IPC namespace: there are no POSIX message queues
-  for one, no `mount` for a mount namespace (whose mounts keep their IDs
+  message queues and the POSIX message queues of an IPC namespace: there is
+  no `mount` for a mount namespace (whose mounts keep their IDs
   in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new
   ones), no `/proc/self/cgroup` for a cgroup namespace, and no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the

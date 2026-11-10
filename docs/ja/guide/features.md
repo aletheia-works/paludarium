@@ -49,6 +49,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
+| POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -583,6 +584,44 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`ERESTARTNOHAND`）。`msgctl` には、`IPC_STAT`、`MSG_STAT`、`MSG_STAT_ANY`（プロセスは
   呼び出し元の PID 名前空間の番号）、`IPC_SET`（`MSGMNB` を超えるには
   `CAP_SYS_RESOURCE`）、`IPC_RMID`、`IPC_INFO`、`MSG_INFO` があります。
+- POSIX メッセージキュー（`mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、
+  `mq_notify`、`mq_getsetattr`）は、スレッドの IPC 名前空間が持つ `mqueue` ファイル
+  システムのファイルです。確かめる内容とその順序は Linux の `ipc/mqueue.c` と同じです。
+  ルートはスティッキーで誰でも書き込めます。名前はそこで引き（`.`、`..`、`/` を含む名前は
+  `EACCES`、255 バイトを超えれば `ENAMETOOLONG`）、既存のキューを開くときはその
+  パーミッションを確かめ、キューを消せるのは持ち主か root だけです（`EPERM`）。名前空間は
+  Linux の既定値で始まります。キューは 256 個まで（`queues_max`、`ENOSPC`）、メッセージは
+  10 個まで（`msg_max`。既定値も同じ）、1 つ 8192 バイトまで（`msgsize_max`。既定値も
+  同じ）です。`CAP_SYS_RESOURCE` があれば 1 つめを超えられ、16 MiB のメッセージを 65536
+  個まで持てます。キューは、消されて閉じられるまで、作った者の実ユーザー ID に、その
+  バイト数と Linux がメッセージごとに使う管理領域（x86-64 で 48 + 48 バイト）を
+  `RLIMIT_MSGQUEUE` に対して課します（`EMFILE`）。`mq_open` は close-on-exec の
+  記述子を返し、`fork` はそれを `O_NONBLOCK`（`mq_getsetattr` でも `fcntl` でも設定
+  できます）ごと共有します。`poll`、`select`、`epoll` では、アクセスモードによらず、
+  メッセージがあれば読め、空きがあれば書けます。メッセージが入るたびに、エッジトリガーの
+  `epoll` はまた起きます。`read` はファイル位置から Linux と同じ状態の行（`QSIZE`、
+  `NOTIFY`、`SIGNO`、`NOTIFY_PID`）を返し、`fstat` は 80 バイトの通常ファイルを示し、
+  `fchmod` と `fchown` はそれを変えます。`/proc/self/fd` のリンクは `/<名前>` で、消された
+  あとは空白と `(deleted)` が後ろに付きます。メッセージは優先度の高い順（32768 未満。それ以外は
+  `EINVAL`）に、同じ優先度なら送った順に出てきます。`mq_msgsize` より小さいバッファーへの
+  受信は `EMSGSIZE` で、それより長い送信も同じです。空のキューからの受信といっぱいの
+  キューへの送信は、`O_NONBLOCK` があれば `EAGAIN` で、なければ `CLOCK_REALTIME` の
+  絶対時刻の時間切れ（`ETIMEDOUT`。時刻は最初に読んで確かめます：`EFAULT`、`EINVAL`）か
+  シグナル（`EINTR`。`ERESTARTSYS` と同じく、`SA_RESTART` とハンドラーを走らせない
+  シグナルなら再開します）まで待ちます。待っている受信者は、待ち始めた順に、Linux の
+  `pipelined_send` と同じく送信者から直接メッセージを受け取ります。待っている送信者の
+  メッセージは、受信でできた空きに入ります（`pipelined_receive`）。`mq_notify` は呼び出した
+  プロセスを登録し（ほかのプロセスが登録している間は `EBUSY`。通知なしで呼ぶと、自分の
+  登録だけを外します）、受信者が待っていないときに空のキューへメッセージが来たことを 1 回
+  知らせます。`SIGEV_SIGNAL` は、`si_code` が `SI_MESGQ` で、送ったプロセスとその実
+  ユーザー ID、`sigev_value` を持つシグナルを送ります（シグナル 0 なら何も送りません。
+  登録したあとに `execve` したプロセスにも送りません）。`SIGEV_NONE` は登録を終える
+  だけです。`SIGEV_THREAD` は `sigev_value` から 32 バイトを写し、`sigev_signo` が示す
+  netlink ソケット（`EBADF`、`ENOTSOCK`、ほかのソケットなら `EINVAL`）へ、最後の
+  バイトが 1（`NOTIFY_WOKENUP`）のデータグラムとして送ります。メッセージなしで登録が
+  終わるときは 2（`NOTIFY_REMOVED`）です。C ライブラリーの補助スレッドはこれを読んで
+  `sigev_notify_function` を始めます。キューのどの記述子を閉じても、またはプロセスが
+  終わっても、Linux の `mqueue_flush_file` と同じくそのプロセスの登録は外れます。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。

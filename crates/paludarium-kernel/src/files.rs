@@ -581,7 +581,7 @@ fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, 
     }
 }
 /// The NUL-terminated string at `addr`, of at most 4096 bytes.
-fn string(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
+pub(crate) fn string(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     if addr == 0 {
         return Err(Errno::EFAULT);
     }
@@ -1430,6 +1430,7 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     drop(fds);
     for descriptor in closed.into_iter().map(|(_, d)| d) {
         crate::record_locks::closed(c, &descriptor);
+        crate::mqueue::closed(c, &descriptor);
         crate::inet::linger(c, &descriptor.file);
     }
     Ok(0)
@@ -2459,6 +2460,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 .remove(&(a[0] as u32))
                 .ok_or(Errno::EBADF)?;
             crate::record_locks::closed(c, &closed);
+            crate::mqueue::closed(c, &closed);
             crate::inet::linger(c, &closed.file);
             Ok(0)
         }
@@ -2539,6 +2541,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             };
             if let Some(closed) = c.files.replace(new, d)? {
                 crate::record_locks::closed(c, &closed);
+                crate::mqueue::closed(c, &closed);
                 crate::inet::linger(c, &closed.file);
             }
             Ok(u64::from(new))
@@ -4812,11 +4815,15 @@ fn followed(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>,
 }
 /// What a link in `/proc/self/fd` reads: the path of a file on a mount
 /// (marked ` (deleted)` once removed), `pipe:[<inode>]`, `socket:[<inode>]`,
-/// `anon_inode:[<kind>]` for a file of no type, or a memfd's own name.
+/// `anon_inode:[<kind>]` for a file of no type, a memfd's own name, or a
+/// POSIX message queue's path in its filesystem.
 fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     let any = d.file.as_any();
     if let Some(memfd) = any.and_then(|v| v.downcast_ref::<crate::memfd::Memfd>()) {
         return Ok(memfd.link_target());
+    }
+    if let Some(queue) = any.and_then(|v| v.downcast_ref::<crate::mqueue::QueueFile>()) {
+        return Ok(queue.link_target());
     }
     // A namespace file names its namespace, as its link in `ns` reads.
     if let Some(file) = any.and_then(|v| v.downcast_ref::<crate::namespaces::NamespaceFile>()) {

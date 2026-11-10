@@ -151,6 +151,8 @@ pub(crate) struct Namespace {
     pub sem: crate::sem::Sets,
     /// Its System V message queues, which go with it (`msg_exit_ns`).
     pub msg: crate::msg::Queues,
+    /// Its POSIX message queues, the names of its `mqueue` filesystem.
+    pub mq: crate::mqueue::Queues,
     /// The numbers of a PID namespace.
     pids: Pids,
     /// A nested network namespace's sockets.
@@ -196,6 +198,7 @@ impl Namespace {
             shm: crate::shm::Segments::default(),
             sem: crate::sem::Sets::default(),
             msg: crate::msg::Queues::default(),
+            mq: crate::mqueue::Queues::default(),
             pids,
             sockets: Sockets::default(),
             users: crate::users::Users::default(),
@@ -218,6 +221,7 @@ impl Namespace {
             shm: crate::shm::Segments::default(),
             sem: crate::sem::Sets::default(),
             msg: crate::msg::Queues::default(),
+            mq: crate::mqueue::Queues::default(),
             pids: Pids::default(),
             sockets: Sockets::default(),
             owner: users.parent().cloned(),

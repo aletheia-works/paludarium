@@ -410,6 +410,20 @@ impl NetlinkSocket {
         s.arrivals += 1;
         self.hub.changed();
     }
+    /// Queues `bytes` from the kernel, past the receive buffer too, as
+    /// `netlink_sendskb` does with a POSIX message queue's `SIGEV_THREAD`
+    /// cookie ([`crate::mqueue`]).
+    pub(crate) fn attach(&self, bytes: Vec<u8>) {
+        let mut s = self.lock();
+        s.queued += bytes.len();
+        s.queue.push_back(Datagram {
+            from: 0,
+            group: 0,
+            bytes,
+        });
+        s.arrivals += 1;
+        self.hub.changed();
+    }
     /// `bind`, as Linux's `netlink_bind`: a `sockaddr_nl` (`EINVAL` for a
     /// shorter address or another family); a bound socket takes only its
     /// own port again (`EINVAL`), and a port another socket has is

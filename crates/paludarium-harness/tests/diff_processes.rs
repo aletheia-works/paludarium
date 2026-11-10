@@ -131,7 +131,9 @@ mod linux {
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
             // addresses, monitor and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
-            // its own, for its counts), the scheduling-set case, which sets
+            // its own, for its counts), the mqueue cases, which make IPC and
+            // network namespaces of their own for the namespace's default
+            // limits and become an unprivileged user, the scheduling-set case, which sets
             // real-time and deadline policies,
             // and the personality-layout case, which maps page 0.
             let as_root = matches!(
@@ -157,6 +159,12 @@ mod linux {
                     | "pid-set-tid"
                     | "net-namespaces"
                     | "msg"
+                    | "mqueue-calls"
+                    | "mqueue-limits"
+                    | "mqueue-wait"
+                    | "mqueue-poll"
+                    | "mqueue-notify"
+                    | "mqueue-fork"
                     | "netlink"
                     | "unix-interfaces"
                     | "addresses"
@@ -310,6 +318,12 @@ mod linux {
         signalfd_fork => ("signalfd-fork","signalfd"),
         signalfd_interrupt => ("signalfd-interrupt","signalfd"),
         signalfd_edges => ("signalfd-edges","signalfd"),
+        mqueue_calls => ("mqueue-calls","mqueue"),
+        mqueue_limits => ("mqueue-limits","mqueue"),
+        mqueue_wait => ("mqueue-wait","mqueue"),
+        mqueue_poll => ("mqueue-poll","mqueue"),
+        mqueue_notify => ("mqueue-notify","mqueue"),
+        mqueue_fork => ("mqueue-fork","mqueue"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),

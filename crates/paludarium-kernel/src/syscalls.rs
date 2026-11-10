@@ -278,6 +278,12 @@ impl SyscallTable {
         handlers.insert(69, crate::msg::sys_msgsnd);
         handlers.insert(70, crate::msg::sys_msgrcv);
         handlers.insert(71, crate::msg::sys_msgctl);
+        handlers.insert(240, crate::mqueue::sys_mq_open);
+        handlers.insert(241, crate::mqueue::sys_mq_unlink);
+        handlers.insert(242, crate::mqueue::sys_mq_timedsend);
+        handlers.insert(243, crate::mqueue::sys_mq_timedreceive);
+        handlers.insert(244, crate::mqueue::sys_mq_notify);
+        handlers.insert(245, crate::mqueue::sys_mq_getsetattr);
         handlers.insert(334, crate::rseq::sys_rseq);
         handlers.insert(425, crate::io_uring::sys_setup);
         handlers.insert(426, crate::io_uring::sys_enter);

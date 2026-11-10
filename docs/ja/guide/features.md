@@ -789,7 +789,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
   `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。
   そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`、`ip route`、
-  `ip link set lo up` が動きます。Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが持つものは
+  `ip route get`、`ip link set lo up` が動きます。Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが持つものは
   `EADDRINUSE`）を、0 ならプロセスの ID を、それが使われていれば負の ID を取ります。
   bind していないソケットは、`connect` か最初の送信で同じように bind されます。
   `getsockname` と `getpeername` はポートとグループを返し、ほかのソケットのポートへの
@@ -803,7 +803,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   1 度でも上がった後の `local 127.0.0.0/8` と `local 127.0.0.1`（落ちても残ります）、
   上がっている間の `broadcast 127.255.255.255` と `local ::1` です。`AF_INET` か
   `AF_INET6` だけを指せばそのファミリーのものを返し、マルチキャストの経路の
-  ファミリーには何も返しません。ダンプでない `RTM_GETLINK` には、インデックスか `IFLA_IFNAME` で指した `lo` を
+  ファミリーには何も返しません。ダンプでない `RTM_GETROUTE` は、`inet_rtm_getroute` と
+  `inet6_rtm_getroute` と同じく `RTA_DST` の指す宛先への経路を引きます。127.0.0.0/8 の
+  IPv4 のアドレス（`lo` が 1 度でも上がった後）と `0.0.0.0` は、`RTA_PREFSRC` が
+  127.0.0.1 で呼び出し元の `RTA_UID` を持つ、メインの表のローカルな経路になり、
+  127.255.255.255 は `lo` が上がっている間ブロードキャストの経路になります。`::1` は
+  `lo` が上がっている間そのローカルな経路になります。ほかの宛先は `ENETUNREACH`、
+  `AF_UNSPEC` は `EOPNOTSUPP` です。`RTM_F_FIB_MATCH` を付ければ、合った表の項目を
+  返します。ダンプでない `RTM_GETLINK` には、インデックスか `IFLA_IFNAME` で指した `lo` を
   返します（ほかは `ENODEV`）。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
   それには、ネットワーク名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送る
   スレッドとソケットを開いたものの両方に要ります（なければ `EPERM`）。エラーと、

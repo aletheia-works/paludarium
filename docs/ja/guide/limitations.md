@@ -256,10 +256,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   Linux ではホストのインターフェースが見えます。
   netlink には `NETLINK_ROUTE` しかなく（`NETLINK_GENERIC` などは `EPROTONOSUPPORT`）、
   そのうちリンクとアドレスのリクエストと経路のダンプだけです。近隣、ルール、キューイング
-  規律などは `EOPNOTSUPP` で、アドレスや経路の追加と削除、経路の引き当て（`ip route get`
-  が送るダンプでない `RTM_GETROUTE`）、ダンプでない `RTM_GETADDR`、`lo` の名前の変更、
-  ほかの属性の設定もそうです。経路のダンプは、厳密なリクエストが指す表や属性で
-  絞り込みません。`bind` はグループを受け付けますが、マルチキャストの
+  規律などは `EOPNOTSUPP` で、アドレスや経路の追加と削除、入力の経路の引き当て
+  （`ip route get ... iif` が送る `RTA_IIF`）、ダンプでない `RTM_GETADDR`、`lo` の名前の
+  変更、ほかの属性の設定もそうです。経路のダンプは、厳密なリクエストが指す表や属性で
+  絞り込みません。経路の引き当ては宛先のほかの条件（`RTA_SRC`、`RTA_OIF`、`RTA_MARK`
+  など）を見ず、その `rta_cacheinfo` は参照を 1 つと数えます。Linux はキャッシュされた
+  経路を使うほかのものも数えます。`bind` はグループを受け付けますが、マルチキャストの
   グループに通知は送りません。`NETLINK_ADD_MEMBERSHIP` など、機能のページに挙げていない
   オプションは `ENOPROTOOPT` です。リンクのメッセージは Linux の属性の一部だけを載せ
   （`IFLA_AF_SPEC`、`IFLA_MAP`、`IFLA_XDP` などはありません）、統計は 0、アドレスの

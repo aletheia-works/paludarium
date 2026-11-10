@@ -886,7 +886,7 @@ kernel.
 - A netlink socket (`AF_NETLINK`, `SOCK_RAW` or `SOCK_DGRAM`, protocol
   `NETLINK_ROUTE`) shows and changes the loopback of the network namespace
   it was made in, so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`,
-  `ip route` and `ip link set lo up` work. As Linux's `af_netlink`, `bind` takes a
+  `ip route`, `ip route get` and `ip link set lo up` work. As Linux's `af_netlink`, `bind` takes a
   port ID (`EADDRINUSE` for one another socket has) or with 0 the
   process's ID, or a negative one when that is taken; `connect` or the
   first send binds an unbound socket the same way; `getsockname` and
@@ -902,7 +902,15 @@ kernel.
   and `local 127.0.0.1` once `lo` has been up, which stay when it goes
   down, `broadcast 127.255.255.255` while it is up, and `local ::1` while it
   is up; `AF_INET` or `AF_INET6` alone gives that family's, and the
-  multicast routing families none. `RTM_GETLINK` without a dump
+  multicast routing families none. `RTM_GETROUTE` without a dump looks up
+  the route to the `RTA_DST` it names, as `inet_rtm_getroute` and
+  `inet6_rtm_getroute` do: an IPv4 address in 127.0.0.0/8 (once `lo` has
+  been up) or `0.0.0.0` gives a local route in the main table, with
+  `RTA_PREFSRC` 127.0.0.1 and the caller's `RTA_UID`, and
+  127.255.255.255 a broadcast one while `lo` is up; `::1` gives its local
+  route while `lo` is up; any other destination is `ENETUNREACH`, and
+  `AF_UNSPEC` `EOPNOTSUPP`. With `RTM_F_FIB_MATCH` the answer is the table
+  entry that matched. `RTM_GETLINK` without a dump
   answers for `lo` by index or `IFLA_IFNAME` (`ENODEV` for another);
   `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`, which
   needs `CAP_NET_ADMIN` in the user namespace that owns the network

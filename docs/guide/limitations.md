@@ -292,10 +292,13 @@ verified.
   (`EPROTONOSUPPORT` for `NETLINK_GENERIC` and the rest), and of it only
   the link and address requests and route dumps: neighbours, rules,
   queueing disciplines and the rest are `EOPNOTSUPP`, as are adding or
-  removing an address or a route, a route lookup (`RTM_GETROUTE` without a
-  dump, which `ip route get` sends), a non-dump `RTM_GETADDR`, renaming
-  `lo` and setting any other attribute of it. A route dump does not filter
-  by the table or attributes a strict request names. No notification is sent to a multicast group, though
+  removing an address or a route, an input route lookup (`RTA_IIF`, as
+  `ip route get ... iif` sends), a non-dump `RTM_GETADDR`, renaming `lo`
+  and setting any other attribute of it. A route dump does not filter by
+  the table or attributes a strict request names, and a lookup looks at
+  no selector but its destination (`RTA_SRC`, `RTA_OIF`, `RTA_MARK` and
+  the rest are not); its `rta_cacheinfo` counts one reference, where
+  Linux counts the other users of the cached route too. No notification is sent to a multicast group, though
   `bind` takes groups; `NETLINK_ADD_MEMBERSHIP` and the other options not
   listed in the features are `ENOPROTOOPT`. A link message carries a
   subset of Linux's attributes (no `IFLA_AF_SPEC`, `IFLA_MAP`, `IFLA_XDP`

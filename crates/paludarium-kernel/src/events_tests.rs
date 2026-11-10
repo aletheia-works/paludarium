@@ -3827,17 +3827,71 @@ fn netlink_dumps_the_routes_of_a_new_namespaces_loopback() {
     assert_eq!(dump(&mut f, 10, 4), [six, done]);
     assert_eq!(dump(&mut f, 17, 5), [local, host, broadcast, six, done]);
     assert_eq!(dump(&mut f, 128, 6), [done]);
-    // A route lookup, without a dump, is not supported.
-    let len = netlink_request(&f, DATA, 26, 0x1, 7, &[2]);
+    // Route lookups: an `rtmsg` of `family` and `flags`, with a
+    // destination; their reply's type, `rtm_type`, `rtm_flags`, and the
+    // error of an NLMSG_ERROR.
+    let lookup = |f: &mut Fixture, family: u8, flags: u32, dst: &[u8], seq: u32| {
+        let mut payload = vec![family, 0, 0, 0, 0, 0, 0, 0];
+        payload.extend_from_slice(&flags.to_le_bytes());
+        if !dst.is_empty() {
+            payload.extend_from_slice(&((4 + dst.len()) as u16).to_le_bytes());
+            payload.extend_from_slice(&1u16.to_le_bytes());
+            payload.extend_from_slice(dst);
+        }
+        let len = netlink_request(f, DATA, 26, 0x1, seq, &payload);
+        assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+        let replies = netlink_replies(f, fd);
+        assert_eq!(replies.len(), 1);
+        let (kind, flags, _, _, payload) = &replies[0];
+        assert_eq!(*flags, 0);
+        if *kind == 2 {
+            (
+                2,
+                0,
+                0,
+                i32::from_le_bytes(payload[..4].try_into().unwrap()),
+            )
+        } else {
+            let route_flags = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            (*kind, payload[7], route_flags, i32::from(payload[1]))
+        }
+    };
+    let mut one = [0u8; 16];
+    one[15] = 1;
+    assert_eq!(
+        lookup(&mut f, 2, 0, &[127, 1, 2, 3], 7),
+        (24, 2, 0x8000_0200, 32)
+    );
+    assert_eq!(
+        lookup(&mut f, 2, 0, &[127, 255, 255, 255], 8),
+        (24, 3, 0x9000_0200, 32)
+    );
+    assert_eq!(lookup(&mut f, 2, 0, &[], 9), (24, 2, 0x8000_0200, 32));
+    assert_eq!(lookup(&mut f, 2, 0, &[8, 8, 8, 8], 10), (2, 0, 0, -101));
+    assert_eq!(
+        lookup(&mut f, 2, 0x2000, &[127, 1, 2, 3], 11),
+        (24, 2, 0, 8)
+    );
+    assert_eq!(lookup(&mut f, 10, 0, &one, 12), (24, 2, 0, 128));
+    assert_eq!(lookup(&mut f, 10, 0, &[0; 16], 13), (2, 0, 0, -101));
+    assert_eq!(lookup(&mut f, 0, 0, &[], 14), (2, 0, 0, -95));
+    // Short of an rtmsg, a lookup is EINVAL.
+    let len = netlink_request(&f, DATA, 26, 0x1, 15, &[2]);
     assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
     assert_eq!(
         &netlink_replies(&mut f, fd)[0].4[..4],
-        &(-95i32).to_le_bytes()
+        &(-22i32).to_le_bytes()
     );
-    // Down again, the local IPv4 routes stay.
+    // Down again, the local IPv4 routes stay: the broadcast address is
+    // local too, and `::1` is unreachable.
     interface_request(&f, DATA + 0x400, b"lo", 0);
     assert_eq!(f.ret(16, [udp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
-    assert_eq!(dump(&mut f, 0, 8), [local, host, done]);
+    assert_eq!(dump(&mut f, 0, 16), [local, host, done]);
+    assert_eq!(
+        lookup(&mut f, 2, 0, &[127, 255, 255, 255], 17),
+        (24, 2, 0x8000_0200, 32)
+    );
+    assert_eq!(lookup(&mut f, 10, 0, &one, 18), (2, 0, 0, -101));
 }
 #[test]
 fn interface_requests_take_unix_and_netlink_sockets() {

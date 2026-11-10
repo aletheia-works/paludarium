@@ -32,6 +32,10 @@ run("/usr/bin/ip", "-o", "-4", "addr", "show", "dev", "lo")
 # local table.
 run("/usr/bin/ip", "-4", "route", "show", "table", "all", "dev", "lo")
 run("/usr/bin/ip", "-6", "route", "show", "table", "all", "dev", "lo")
+# Lookups of a loopback address, the table entry it matched, and ::1.
+run("/usr/bin/ip", "route", "get", "127.1.2.3")
+run("/usr/bin/ip", "route", "get", "fibmatch", "127.1.2.3")
+run("/usr/bin/ip", "-6", "route", "get", "::1")
 run(
     "/usr/bin/setpriv",
     "--reuid=65534",

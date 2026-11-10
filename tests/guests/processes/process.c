@@ -1389,6 +1389,31 @@ static long nl_answer(int fd, long seq, unsigned port, const char *label) {
         }
     }
 }
+/* Route lookups on `fd` (RTM_GETROUTE without a dump), as `ip route get`
+   sends them, printed by nl_answer: to each of the destinations below, and
+   with RTM_F_FIB_MATCH (0x2000) to one. */
+static void nl_lookups(int fd, unsigned port, const char *when) {
+    static const struct {
+        unsigned char family, len;
+        unsigned flags;
+        const char *text;
+    } asked[] = {
+        {AF_INET, 4, 0, "127.0.0.1"},       {AF_INET, 4, 0, "127.1.2.3"}, {AF_INET, 4, 0, "127.255.255.255"},
+        {AF_INET, 4, 0, "8.8.8.8"},         {AF_INET, 4, 0, "0.0.0.0"},   {AF_INET, 4, 0x2000, "127.1.2.3"},
+        {AF_INET, 4, 0x2000, "127.0.0.1"},  {AF_INET6, 16, 0, "::1"},     {AF_INET6, 16, 0, "2001:db8::1"},
+        {AF_INET6, 16, 0x2000, "::1"},
+    };
+    for (size_t i = 0; i < sizeof asked / sizeof asked[0]; i++) {
+        unsigned char request[12 + 4 + 16] = {asked[i].family, asked[i].len * 8};
+        memcpy(request + 8, &asked[i].flags, 4);
+        unsigned short attribute[2] = {4 + asked[i].len, 1};
+        memcpy(request + 12, attribute, 4);
+        inet_pton(asked[i].family, asked[i].text, request + 16);
+        char label[64];
+        snprintf(label, sizeof label, "%s get %s%s", when, asked[i].flags ? "fibmatch " : "", asked[i].text);
+        nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, 16 + asked[i].len), port, label);
+    }
+}
 /* What getifaddrs gives, one line each. */
 static void nl_getifaddrs(const char *label) {
     struct ifaddrs *list, *i;
@@ -6654,6 +6679,7 @@ int main(int argc, char **argv) {
             nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down link");
             nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down addr");
             nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down route");
+            nl_lookups(fd, port, "down");
             nl_getifaddrs("down ifaddrs");
             /* Errors and acknowledgements. */
             struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
@@ -6674,6 +6700,7 @@ int main(int argc, char **argv) {
                 getsockname(own, (void *)&mine, &mine_len);
                 nl_answer(own, nl_seq, mine.pid, "user link");
                 nl_answer(own, nl_send(own, 16, NL_F_REQUEST, &link, sizeof link), mine.pid, "user set");
+                nl_lookups(own, mine.pid, "user");
                 fflush(stdout);
                 _exit(0);
             }
@@ -6691,6 +6718,7 @@ int main(int argc, char **argv) {
             nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &inet4, 1), port, "up route4");
             nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &inet6, 1), port, "up route6");
             nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &multicast, 1), port, "up route ipmr");
+            nl_lookups(fd, port, "up");
             char by_name[24] = {0};
             unsigned short attribute[2] = {7, 3};
             memcpy(by_name + 16, attribute, 4);
@@ -6703,6 +6731,7 @@ int main(int argc, char **argv) {
             nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again link");
             nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again addr");
             nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again route");
+            nl_lookups(fd, port, "down again");
             nl_getifaddrs("down again ifaddrs");
             fflush(stdout);
             _exit(0);

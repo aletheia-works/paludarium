@@ -6,9 +6,9 @@
 //! its first `connect` or send. The kernel takes each message of a datagram
 //! sent to port 0 in turn: `RTM_GETLINK`, `RTM_GETADDR` and `RTM_GETROUTE`
 //! dumps (`NLM_F_DUMP`) answer with the loopback, its addresses and its
-//! routes, then
-//! `NLMSG_DONE` at the next receive; `RTM_GETLINK` without a dump answers
-//! for `lo` by index or name; `RTM_NEWLINK` and `RTM_SETLINK` bring it up or
+//! routes, then `NLMSG_DONE` at the next receive; `RTM_GETLINK` without a
+//! dump answers for `lo` by index or name, and `RTM_GETROUTE` without one
+//! looks a route up; `RTM_NEWLINK` and `RTM_SETLINK` bring it up or
 //! down with `IFF_UP`, given `CAP_NET_ADMIN` in the user namespace that owns
 //! the network namespace. An error, or a success the request asks for with
 //! `NLM_F_ACK`, is answered with `NLMSG_ERROR`; any other request is
@@ -49,6 +49,20 @@ const RTM_GETROUTE: u16 = 26;
 const RTNL_FAMILY_IPMR: u8 = 128;
 const RTNL_FAMILY_IP6MR: u8 = 129;
 const RTA_DST: u16 = 1;
+const RTA_SRC: u16 = 2;
+const RTA_IIF: u16 = 3;
+const RTA_UID: u16 = 25;
+/// `RTM_F_FIB_MATCH`: a lookup answers with the table's entry.
+const RTM_F_FIB_MATCH: u32 = 0x2000;
+/// The flags of a lookup's answer: `RTM_F_CLONED`, with `RTCF_LOCAL`, and
+/// `RTCF_BROADCAST` for the broadcast address.
+const RTM_F_CLONED: u32 = 0x200;
+const RTCF_LOCAL: u32 = 0x8000_0000;
+const RTCF_BROADCAST: u32 = 0x1000_0000;
+/// The main table, which with no policy rules Linux merges the local one
+/// into for lookups (`fib_unmerge`).
+const RT_TABLE_MAIN: u8 = 254;
+const ENETUNREACH: Errno = Errno(101);
 const RTA_OIF: u16 = 4;
 const RTA_PRIORITY: u16 = 6;
 const RTA_PREFSRC: u16 = 7;
@@ -221,8 +235,9 @@ pub(crate) struct NetlinkSocket {
     /// credentials, which Linux's `netlink_ns_capable` asks as well).
     opener_admin: bool,
     /// The process ID of whoever made it, which a `write` that binds it
-    /// takes.
+    /// takes, and its user ID, which a route lookup a `write` sends names.
     opener_pid: u32,
+    opener_uid: u32,
     hub: Arc<ReadinessHub>,
     flags: AtomicU32,
     inode: u64,
@@ -232,12 +247,14 @@ pub(crate) struct NetlinkSocket {
     state: Mutex<State>,
 }
 
-/// Who sends: the process ID an autobind takes, and whether it may
-/// administer the network.
+/// Who sends: the process ID an autobind takes, whether it may administer
+/// the network, and its user ID as its user namespace shows it, which a
+/// route lookup names (`RTA_UID`).
 #[derive(Clone, Copy)]
 struct Sender {
     pid: u32,
     admin: bool,
+    uid: u32,
 }
 
 /// `socket(AF_NETLINK, type, protocol)`, as Linux's `netlink_create`:
@@ -265,6 +282,7 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         namespace,
         opener_admin,
         opener_pid: c.pid_space().number(c.process.pid),
+        opener_uid: c.shown_uid(credentials.uid),
         hub: Arc::clone(&c.files.readiness),
         flags: AtomicU32::new(2 | (kind & NONBLOCK)),
         inode: crate::files::anonymous_inode(),
@@ -307,6 +325,7 @@ impl NetlinkSocket {
                 && c.process
                     .credentials
                     .capable_in(CAP_NET_ADMIN, self.namespace.owner()),
+            uid: c.shown_uid(c.process.credentials.uid),
         }
     }
     /// Binds to `port`, or with 0 to the process's ID or, that taken, the
@@ -434,7 +453,7 @@ impl NetlinkSocket {
             target.deliver(&mut t, port, group, bytes.to_vec());
             return Ok(bytes.len());
         }
-        self.take(&mut s, bytes, port, sender.admin);
+        self.take(&mut s, bytes, port, sender);
         Ok(bytes.len())
     }
     /// The kernel takes each message of a datagram from `port`, as Linux's
@@ -442,7 +461,7 @@ impl NetlinkSocket {
     /// what is left; one that is no request, or a control message, is only
     /// acknowledged; an error, or any result with `NLM_F_ACK`, is answered
     /// with `NLMSG_ERROR`, but for a dump that began.
-    fn take(&self, s: &mut State, mut bytes: &[u8], port: u32, admin: bool) {
+    fn take(&self, s: &mut State, mut bytes: &[u8], port: u32, sender: Sender) {
         while bytes.len() >= 16 {
             let header = Header::read(bytes);
             let len = header.len as usize;
@@ -453,7 +472,7 @@ impl NetlinkSocket {
             let result = if header.flags & NLM_F_REQUEST == 0 || header.kind < NLMSG_MIN_TYPE {
                 Ok(false)
             } else {
-                self.route(s, &header, &message[16..], port, admin)
+                self.route(s, &header, &message[16..], port, sender)
             };
             match result {
                 Ok(true) => {}
@@ -480,7 +499,7 @@ impl NetlinkSocket {
         header: &Header,
         payload: &[u8],
         port: u32,
-        admin: bool,
+        sender: Sender,
     ) -> Result<bool, Errno> {
         if header.kind > RTM_MAX {
             return Err(EOPNOTSUPP);
@@ -489,7 +508,7 @@ impl NetlinkSocket {
             return Ok(false);
         };
         let get = (header.kind - NLMSG_MIN_TYPE) & 3 == 2;
-        if !get && !admin {
+        if !get && !sender.admin {
             return Err(Errno::EPERM);
         }
         if get && header.flags & NLM_F_DUMP != 0 {
@@ -541,6 +560,11 @@ impl NetlinkSocket {
             return Ok(true);
         }
         match header.kind {
+            RTM_GETROUTE if matches!(family, AF_INET | AF_INET6) => {
+                let reply = lookup(&self.network, payload, header.seq, port, sender.uid)?;
+                self.deliver(s, 0, 0, reply);
+                Ok(false)
+            }
             RTM_GETLINK => {
                 self.find_link(payload, header, true)?;
                 let reply = link_message(&self.network, header.seq, port, 0);
@@ -689,6 +713,7 @@ impl FileHandle for NetlinkSocket {
         let sender = Sender {
             pid: self.opener_pid,
             admin: self.opener_admin,
+            uid: self.opener_uid,
         };
         self.send(buf, None, sender)
     }
@@ -913,6 +938,134 @@ fn route_header(family: u8, dst_len: u8, scope: u8, kind: u8) -> Vec<u8> {
     ];
     body.extend_from_slice(&0u32.to_le_bytes());
     body
+}
+/// `struct rta_cacheinfo` of a looked-up route, whose one reference is the
+/// lookup's; Linux's counts more where other sockets use it.
+fn lookup_cacheinfo() -> [u8; RTA_CACHEINFO_LEN] {
+    let mut raw = [0; RTA_CACHEINFO_LEN];
+    raw[0] = 1;
+    raw
+}
+/// A route lookup (`RTM_GETROUTE` without a dump), as `inet_rtm_getroute`
+/// and `inet6_rtm_getroute` answer one for the destination `RTA_DST` names
+/// (none is `0.0.0.0` or `::`): `EINVAL` for a request shorter than an
+/// `rtmsg`; `EOPNOTSUPP` for an input route (`RTA_IIF`), which is not
+/// supported; `ENETUNREACH` where no route goes. `RTA_SRC`, `RTA_OIF` and
+/// the other selectors are not looked at. With `RTM_F_FIB_MATCH` the
+/// answer is the table's entry that matched.
+fn lookup(
+    network: &Network,
+    payload: &[u8],
+    seq: u32,
+    port: u32,
+    uid: u32,
+) -> Result<Vec<u8>, Errno> {
+    if payload.len() < 12 {
+        return Err(Errno::EINVAL);
+    }
+    let family = payload[0];
+    let request_flags = u32::from_le_bytes(payload[8..12].try_into().unwrap_or_default());
+    let mut dst = None;
+    let mut asked_uid = None;
+    for (kind, value) in attributes(&payload[12..]) {
+        match kind {
+            RTA_DST => dst = Some(value),
+            RTA_IIF => return Err(EOPNOTSUPP),
+            RTA_UID if value.len() == 4 => {
+                asked_uid = Some(u32::from_le_bytes(value.try_into().unwrap_or_default()));
+            }
+            _ => {}
+        }
+    }
+    let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
+    if family == AF_INET6 {
+        let mut address = [0u8; 16];
+        if let Some(value) = dst {
+            let n = value.len().min(16);
+            address[..n].copy_from_slice(&value[..n]);
+        }
+        let mut one = [0u8; 16];
+        one[15] = 1;
+        if address != one || !network.is_up() {
+            return Err(ENETUNREACH);
+        }
+        if fib_match {
+            let mut route = ipv6_routes(network, seq, port);
+            // The answer of a request, not a part of a dump.
+            route[6..8].copy_from_slice(&0u16.to_le_bytes());
+            return Ok(route);
+        }
+        // `rt6_fill_node` with the request's source, unspecified.
+        let mut body = route_header(AF_INET6, 128, RT_SCOPE_UNIVERSE, RTN_LOCAL);
+        body[2] = 128;
+        attribute(
+            &mut body,
+            RTA_TABLE,
+            &u32::from(RT_TABLE_LOCAL).to_le_bytes(),
+        );
+        attribute(&mut body, RTA_DST, &one);
+        attribute(&mut body, RTA_SRC, &[0; 16]);
+        attribute(&mut body, RTA_PREFSRC, &one);
+        attribute(&mut body, RTA_PRIORITY, &0u32.to_le_bytes());
+        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+        attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
+        attribute(&mut body, RTA_PREF, &[0]);
+        return Ok(message(RTM_NEWROUTE, 0, seq, port, &body));
+    }
+    let mut address = [0u8; 4];
+    if let Some(value) = dst {
+        let n = value.len().min(4);
+        address[..n].copy_from_slice(&value[..n]);
+    }
+    let broadcast = address == [127, 255, 255, 255] && network.is_up();
+    let unspecified = address == [0; 4];
+    if !unspecified && !(address[0] == 127 && network.has_ipv4_address()) {
+        return Err(ENETUNREACH);
+    }
+    if fib_match {
+        // The entry that matched, longest first: the address, the
+        // broadcast address while up, or 127.0.0.0/8.
+        if unspecified {
+            return Err(ENETUNREACH);
+        }
+        let (entry, dst_len, scope, kind) = if address == [127, 0, 0, 1] {
+            ([127, 0, 0, 1], 32, RT_SCOPE_HOST, RTN_LOCAL)
+        } else if broadcast {
+            ([127, 255, 255, 255], 32, RT_SCOPE_LINK, RTN_BROADCAST)
+        } else {
+            ([127, 0, 0, 0], 8, RT_SCOPE_HOST, RTN_LOCAL)
+        };
+        let mut body = route_header(AF_INET, dst_len, scope, kind);
+        body[4] = RT_TABLE_MAIN;
+        attribute(
+            &mut body,
+            RTA_TABLE,
+            &u32::from(RT_TABLE_MAIN).to_le_bytes(),
+        );
+        attribute(&mut body, RTA_DST, &entry);
+        attribute(&mut body, RTA_PREFSRC, &[127, 0, 0, 1]);
+        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+        return Ok(message(RTM_NEWROUTE, 0, seq, port, &body));
+    }
+    // `rt_fill_info` of the cached route the lookup made.
+    let (kind, flags) = if broadcast {
+        (RTN_BROADCAST, RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST)
+    } else {
+        (RTN_LOCAL, RTM_F_CLONED | RTCF_LOCAL)
+    };
+    let mut body = vec![AF_INET, 32, 0, 0, RT_TABLE_MAIN, 0, RT_SCOPE_UNIVERSE, kind];
+    body.extend_from_slice(&flags.to_le_bytes());
+    attribute(
+        &mut body,
+        RTA_TABLE,
+        &u32::from(RT_TABLE_MAIN).to_le_bytes(),
+    );
+    attribute(&mut body, RTA_DST, &address);
+    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_PREFSRC, &[127, 0, 0, 1]);
+    attribute(&mut body, RTA_UID, &asked_uid.unwrap_or(uid).to_le_bytes());
+    attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
+    Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
 }
 /// The IPv4 routes `fib_add_ifaddr` gives `127.0.0.1/8` on `lo`, as
 /// `fib_dump_info` gives them, in the local table: `local 127.0.0.0/8` and

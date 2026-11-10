@@ -742,7 +742,8 @@ fn send_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// first only. The timeout is looked at only after each message, as on
 /// Linux, so the first is waited for without it; the time left is written
 /// back when a message came. It stops at an error, or after out-of-band
-/// data, and gives the error only when no message came.
+/// data, and gives the error only when no message came. Unlike `sendmmsg`,
+/// it takes any `vlen`, as `do_recvmmsg` caps none.
 fn receive_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let mut flags = a[3] & 0xffff_ffff;
     if flags & MSG_CMSG_COMPAT != 0 {
@@ -780,18 +781,19 @@ fn receive_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         if flags & MSG_WAITFORONE != 0 {
             flags |= MSG_DONTWAIT;
         }
+        // Nothing after a message gives an error: what came is counted.
         if let Some(end) = end {
-            let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+            let Ok(now) = c.host.clock(paludarium_host::ClockId::Monotonic) else {
+                break;
+            };
             let remaining = end.saturating_sub(now);
             left = Some(remaining);
             if remaining == 0 {
                 break;
             }
         }
-        let message_flags = c
-            .mem
-            .read_u64(GuestAddr(entry + MSG_FLAGS))
-            .map_err(|_| Errno::EFAULT)?;
+        // recvmsg has just written the message's flags there.
+        let message_flags = c.mem.read_u64(GuestAddr(entry + MSG_FLAGS)).unwrap_or(0);
         if message_flags & MSG_OOB != 0 {
             break;
         }

@@ -298,8 +298,9 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
     match number {
         // read, write, pread64, pwrite64, readv, writev, preadv, pwritev,
         // wait4, waitid, pause, rt_sigsuspend, flock, the blocking socket
-        // calls (sendmmsg and recvmmsg too) (a wait that SO_RCVTIMEO or SO_SNDTIMEO limits gives EINTR
-        // instead, and clears the restart itself), msgsnd and msgrcv.
+        // calls with sendmmsg and recvmmsg (a wait that SO_RCVTIMEO or
+        // SO_SNDTIMEO limits gives EINTR instead, and clears the restart
+        // itself), msgsnd and msgrcv.
         0
         | 1
         | 17..=20

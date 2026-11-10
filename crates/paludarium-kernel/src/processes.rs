@@ -30,6 +30,9 @@ struct Entry {
     /// Whether the process has run `execve` since its fork (Linux clears
     /// PF_FORKNOEXEC then); its parent can no longer change its group.
     executed: bool,
+    /// How many times it has run `execve` (Linux's `self_exec_id`), which a
+    /// message queue's registration must still match to signal it.
+    execs: u64,
     /// Resource limits (soft, hard), inherited on fork and kept across exec.
     /// They are recorded and reported; RLIMIT_FSIZE and RLIMIT_NOFILE are
     /// enforced, through the copy of their soft limits in the thread group.
@@ -171,6 +174,8 @@ pub struct Processes {
     fifos: Arc<crate::fifo::Fifos>,
     /// The machine's virtual CPUs, which threads with `rseq` run on.
     pub(crate) cpus: Arc<crate::rseq::Cpus>,
+    /// The bytes the users' POSIX message queues charge.
+    pub(crate) mqueue_charges: Arc<crate::mqueue::Charges>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -188,6 +193,7 @@ impl Processes {
             locks: crate::record_locks::Locks::default(),
             fifos: Arc::default(),
             cpus: Arc::default(),
+            mqueue_charges: Arc::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -201,6 +207,7 @@ impl Processes {
                     pgid: 0,
                     sid: 0,
                     executed: false,
+                    execs: 0,
                     limits: DEFAULT_LIMITS,
                     death_signal: 0,
                     dumpable: true,
@@ -371,6 +378,7 @@ impl Processes {
                 pgid,
                 sid,
                 executed: false,
+                execs: 0,
                 limits,
                 death_signal: 0,
                 dumpable,
@@ -763,6 +771,7 @@ impl Processes {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(&pid) {
             entry.executed = true;
+            entry.execs += 1;
         }
     }
     /// `prlimit64` from `sender`: returns the old limit of the process of
@@ -805,6 +814,50 @@ impl Processes {
             entry.group.set_soft_limit(resource, soft);
         }
         Ok(old)
+    }
+    /// How many times process `pid` has run `execve`, while it runs; none
+    /// once it has ended or is gone.
+    pub(crate) fn execs(&self, pid: u32) -> Option<u64> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .get(&pid)
+            .filter(|entry| entry.status.is_none())
+            .map(|entry| entry.execs)
+    }
+    /// A POSIX message queue's `SIGEV_SIGNAL` notification to process
+    /// `pid`, as Linux's `__do_notify` sends it past the checks of `kill`:
+    /// `number` with `si_code` `SI_MESGQ`, the sending process `sender` as
+    /// the receiver's PID namespace numbers it, the sender's user ID `uid`
+    /// (as the registration's user namespace shows it) and the
+    /// registration's `value`, unless `pid` has run `execve` since it
+    /// registered, after `execs` of them.
+    pub(crate) fn notify_message_queue(
+        &self,
+        pid: u32,
+        execs: u64,
+        number: i32,
+        sender: u32,
+        uid: u32,
+        value: u64,
+    ) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = entries.get(&pid) else {
+            return;
+        };
+        if entry.status.is_some() || entry.execs != execs {
+            return;
+        }
+        let mut info = [0u8; 48];
+        info[0..4].copy_from_slice(&number.to_le_bytes());
+        info[8..12].copy_from_slice(&crate::mqueue::SI_MESGQ.to_le_bytes());
+        info[16..20].copy_from_slice(&entry.space.number(sender).to_le_bytes());
+        info[20..24].copy_from_slice(&uid.to_le_bytes());
+        info[24..32].copy_from_slice(&value.to_le_bytes());
+        let signal = signals::PendingSignal {
+            queued: Some(info),
+            ..signals::PendingSignal::user(number, crate::mqueue::SI_MESGQ)
+        };
+        let _ = self.send(&mut entries, pid, None, signal);
     }
     /// The CPU time of the children `pid` has waited for.
     pub(crate) fn children_cpu(&self, pid: u32) -> u64 {
@@ -3151,6 +3204,7 @@ impl Kernel {
         };
         for descriptor in closed {
             crate::record_locks::closed(&c, &descriptor);
+            crate::mqueue::closed(&c, &descriptor);
             crate::inet::linger(&mut c, &descriptor.file);
         }
     }

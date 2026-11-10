@@ -23,7 +23,7 @@ const TYPE: u32 = 0o170000;
 
 /// `capable_wrt_inode_uidgid`: `capability` in the thread's own user
 /// namespace, which maps the file's owner and group.
-fn capable(creds: &Credentials, stat: &FileStat, capability: u64) -> bool {
+pub(crate) fn capable(creds: &Credentials, stat: &FileStat, capability: u64) -> bool {
     use crate::users::Ids;
     creds.effective & capability != 0
         && creds.user.id_of(Ids::User, stat.uid).is_some()

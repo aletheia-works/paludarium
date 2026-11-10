@@ -171,6 +171,10 @@ struct Decoded {
     keeps_vector_state: bool,
     /// [`exec::fails_cleanly`]: no [`Snapshot`] is needed.
     fails_cleanly: bool,
+    /// Whether the accelerator of [`run_cached_with_counted_hook`] has
+    /// turned this instruction down, with `cache_rejections`, so it is not
+    /// offered again while its block is cached.
+    rejected: bool,
 }
 
 impl Decoded {
@@ -180,6 +184,7 @@ impl Decoded {
             next: instruction.next_rip().0,
             keeps_vector_state: exec::keeps_vector_state(instruction),
             fails_cleanly: exec::fails_cleanly(instruction),
+            rejected: false,
         }
     }
 }
@@ -245,14 +250,12 @@ fn ends_block(insn: &Instruction) -> bool {
 
 /// The block of instructions decoded from `rip` under `generation`, at
 /// `start..start + len` of [`DecodeCache::code`]; empty when `len` is 0.
-/// `rejected` when the accelerator has turned down its first instruction.
 #[derive(Clone, Copy, Default)]
 struct Slot {
     rip: u64,
     generation: u64,
     start: u32,
     len: u8,
-    rejected: bool,
     /// How many times [`run_compiled`] has entered the block uncompiled.
     runs: u16,
     /// Its compiled code: 0 for none yet, [`NOT_COMPILED`] when the
@@ -384,7 +387,6 @@ impl DecodeCache {
             generation,
             start: u32::try_from(start).unwrap_or(u32::MAX),
             len: u8::try_from(len).unwrap_or(u8::MAX),
-            rejected: false,
             runs: 0,
             compiled: 0,
         };
@@ -441,6 +443,7 @@ impl DecodeCache {
 
     /// Stores the instruction that a [`Self::get_with_hint`] after a
     /// [`Self::lookup`] did not find, as a block of its own.
+    #[cfg(test)]
     fn put(&mut self, rip: u64, generation: u64, instruction: Instruction) -> Decoded {
         let block = self.insert(rip, generation, |code| {
             code.push(instruction);
@@ -455,23 +458,23 @@ impl DecodeCache {
 
     /// The first instruction of the block at `rip` under `generation`, and
     /// whether the accelerator has turned it down.
+    #[cfg(test)]
     fn get_with_hint(&self, rip: u64, generation: u64) -> Option<(Decoded, Instruction, bool)> {
         let s = &self.slots[self.slot(rip)];
         let start = s.start as usize;
         s.holds(rip, generation).then(|| {
-            (
-                self.code.decoded[start],
-                self.code.instructions[start],
-                s.rejected,
-            )
+            let decoded = self.code.decoded[start];
+            (decoded, self.code.instructions[start], decoded.rejected)
         })
     }
 
+    /// Marks the first instruction of the block at `rip` under
+    /// `generation` as turned down by the accelerator.
+    #[cfg(test)]
     fn reject_acceleration(&mut self, rip: u64, generation: u64) {
-        let slot = self.slot(rip);
-        let s = &mut self.slots[slot];
+        let s = self.slots[self.slot(rip)];
         if s.holds(rip, generation) {
-            s.rejected = true;
+            self.code.decoded[s.start as usize].rejected = true;
         }
     }
 
@@ -485,7 +488,7 @@ impl DecodeCache {
             Counter::DecodeSlotRipCollision
         } else if s.generation != generation {
             Counter::DecodeSlotEpochStale
-        } else if s.rejected {
+        } else if self.code.decoded[s.start as usize].rejected {
             Counter::DecodeHintHit
         } else {
             Counter::DecodedHit
@@ -899,100 +902,151 @@ fn run_counted_policy<const CACHE_REJECTIONS: bool>(
     let mut observed_chain = jit_cost::Chain::default();
     #[cfg(feature = "cost-profile")]
     let observed_space = mem.code_epoch().0;
-    while consumed < budget {
+    // As in `run_cached`, a block is looked up only where the instructions
+    // do not follow each other in memory; every instruction is still offered
+    // to the accelerator first, unless it has turned the instruction down.
+    'blocks: while consumed < budget {
         let generation = mem.code_generation_cached();
-        #[cfg(feature = "cost-profile")]
-        let observed_rip = state.rip.0;
+        let rip = state.rip.0;
         #[cfg(feature = "cost-profile")]
         if CACHE_REJECTIONS {
-            cache.observe_slot(state.rip.0, generation);
+            cache.observe_slot(rip, generation);
         }
-        cache.lookup();
-        let (decoded, instruction, rejected) = match cache.get_with_hint(state.rip.0, generation) {
-            Some(entry) => entry,
-            None => match fetch_for_state(state, mem) {
-                Ok(instruction) => (
-                    cache.put(state.rip.0, generation, instruction),
-                    instruction,
-                    false,
-                ),
-                Err(reason) => {
+        let block = match cache.block(rip, generation, |code| decode_block(state, mem, code)) {
+            Ok(block) => block,
+            Err(reason) => {
+                #[cfg(feature = "cost-profile")]
+                observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
+                return reason;
+            }
+        };
+        let (mut i, mut end) = (block.start, block.end);
+        // Whether instruction `i` was just added to the block.
+        #[cfg(feature = "cost-profile")]
+        let mut fresh = false;
+        loop {
+            #[cfg(feature = "cost-profile")]
+            let observed_rip = state.rip.0;
+            let rejected = CACHE_REJECTIONS && cache.code.decoded[i].rejected;
+            // Each boundary is counted as a lookup was before blocks were
+            // walked, so the profile's figures keep their meaning: one just
+            // decoded as a miss, one found in the block as a hit.
+            #[cfg(feature = "cost-profile")]
+            if CACHE_REJECTIONS && i != block.start {
+                jit_cost::add(
+                    if fresh {
+                        jit_cost::Counter::DecodeSlotEmpty
+                    } else if rejected {
+                        jit_cost::Counter::DecodeHintHit
+                    } else {
+                        jit_cost::Counter::DecodedHit
+                    },
+                    1,
+                );
+            }
+            let mut deterministic_rejection = false;
+            if !rejected && maximum_block > 0 && budget - consumed >= maximum_block {
+                let instruction = cache.code.instructions[i];
+                if let Some((reason, count)) =
+                    accelerate(state, &instruction, &mut deterministic_rejection)
+                {
+                    assert!(
+                        count > 0 && count <= maximum_block,
+                        "invalid accelerator instruction count"
+                    );
+                    #[cfg(feature = "cost-profile")]
+                    observed_chain.success(generation, jit_cost::add);
+                    #[cfg(feature = "cost-profile")]
+                    if CACHE_REJECTIONS {
+                        jit_cost::observe_site(
+                            observed_space,
+                            generation,
+                            observed_rip,
+                            1,
+                            &instruction,
+                        );
+                    }
+                    if matches!(reason, ExitReason::BudgetExhausted { .. }) {
+                        #[cfg(feature = "cost-profile")]
+                        jit_cost::add(jit_cost::Counter::BudgetCharged, count);
+                        consumed += count;
+                        continue 'blocks;
+                    }
                     #[cfg(feature = "cost-profile")]
                     observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
                     return reason;
                 }
-            },
-        };
-        let mut deterministic_rejection = false;
-        if !(CACHE_REJECTIONS && rejected)
-            && maximum_block > 0
-            && budget - consumed >= maximum_block
-            && let Some((reason, count)) =
-                accelerate(state, &instruction, &mut deterministic_rejection)
-        {
-            assert!(
-                count > 0 && count <= maximum_block,
-                "invalid accelerator instruction count"
-            );
+            }
             #[cfg(feature = "cost-profile")]
-            observed_chain.success(generation, jit_cost::add);
+            observed_chain.stop(
+                if rejected {
+                    jit_cost::Counter::StopNegative
+                } else if deterministic_rejection {
+                    jit_cost::Counter::StopUnsupported
+                } else if maximum_block > 0 && budget - consumed < maximum_block {
+                    jit_cost::Counter::StopBudget
+                } else {
+                    jit_cost::Counter::StopFallback
+                },
+                jit_cost::add,
+            );
+            if CACHE_REJECTIONS && deterministic_rejection {
+                cache.code.decoded[i].rejected = true;
+            }
             #[cfg(feature = "cost-profile")]
             if CACHE_REJECTIONS {
-                jit_cost::observe_site(observed_space, generation, observed_rip, 1, &instruction);
+                let class = if rejected {
+                    2
+                } else if deterministic_rejection {
+                    3
+                } else if maximum_block > 0 && budget - consumed < maximum_block {
+                    4
+                } else {
+                    5
+                };
+                jit_cost::observe_site(
+                    observed_space,
+                    generation,
+                    observed_rip,
+                    class,
+                    &cache.code.instructions[i],
+                );
             }
-            if matches!(reason, ExitReason::BudgetExhausted { .. }) {
+            #[cfg(feature = "cost-profile")]
+            jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
+            let decoded = &cache.code.decoded[i];
+            let next = decoded.next;
+            if let Err(reason) = execute_decoded(state, mem, decoded, &cache.code.instructions[i]) {
                 #[cfg(feature = "cost-profile")]
-                jit_cost::add(jit_cost::Counter::BudgetCharged, count);
-                consumed += count;
-                continue;
+                observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
+                return reason;
+            }
+            consumed += 1;
+            i += 1;
+            if consumed == budget
+                || state.rip.0 != next
+                || mem.code_generation_cached() != generation
+            {
+                continue 'blocks;
+            }
+            if i == end {
+                match cache.extend(rip, end, generation, || fetch_for_state(state, mem)) {
+                    Ok(true) => end += 1,
+                    Ok(false) => continue 'blocks,
+                    Err(reason) => {
+                        #[cfg(feature = "cost-profile")]
+                        observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
+                        return reason;
+                    }
+                }
             }
             #[cfg(feature = "cost-profile")]
-            observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
-            return reason;
+            {
+                // Past the block's end as it was looked up, every
+                // instruction was added by this walk.
+                fresh = i >= block.end;
+            }
         }
-        #[cfg(feature = "cost-profile")]
-        observed_chain.stop(
-            if CACHE_REJECTIONS && rejected {
-                jit_cost::Counter::StopNegative
-            } else if deterministic_rejection {
-                jit_cost::Counter::StopUnsupported
-            } else if maximum_block > 0 && budget - consumed < maximum_block {
-                jit_cost::Counter::StopBudget
-            } else {
-                jit_cost::Counter::StopFallback
-            },
-            jit_cost::add,
-        );
-        if CACHE_REJECTIONS && deterministic_rejection {
-            cache.reject_acceleration(state.rip.0, generation);
-        }
-        #[cfg(feature = "cost-profile")]
-        if CACHE_REJECTIONS {
-            let class = if rejected {
-                2
-            } else if deterministic_rejection {
-                3
-            } else if maximum_block > 0 && budget - consumed < maximum_block {
-                4
-            } else {
-                5
-            };
-            jit_cost::observe_site(
-                observed_space,
-                generation,
-                observed_rip,
-                class,
-                &instruction,
-            );
-        }
-        #[cfg(feature = "cost-profile")]
-        jit_cost::add(jit_cost::Counter::InterpreterSteps, 1);
-        if let Err(reason) = execute_decoded(state, mem, &decoded, &instruction) {
-            #[cfg(feature = "cost-profile")]
-            observed_chain.stop(jit_cost::Counter::StopExit, jit_cost::add);
-            return reason;
-        }
-        consumed += 1;
     }
     #[cfg(feature = "cost-profile")]
     observed_chain.stop(jit_cost::Counter::StopBudget, jit_cost::add);

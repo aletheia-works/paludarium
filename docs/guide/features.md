@@ -55,16 +55,17 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
+| POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, and the pseudo-terminals' requests below) |
-| Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
+| Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
@@ -90,7 +91,10 @@ kernel.
   file positions; `sendfile` writes its offset back even after an error.
 - `getdents64` goes on from what it has returned, so unlinking those entries
   skips nothing. `lseek` to a `d_off` leads to the same entry while the
-  directory is unchanged, and `dup` and `fork` share the place.
+  directory is unchanged, and `dup` and `fork` share the place. `getdents`
+  is the same with the old `linux_dirent`, whose last byte is the type. Both
+  keep the count in an `int` as Linux does, so one of 2 GiB or more fits no
+  entry (`EINVAL`).
 - Extended attributes stay with a file in memory, through hard links and
   renames and after its last name is gone. As on Linux, `user.*` is for regular
   files and directories (on others, reading gives `ENODATA` and writing `EPERM`),
@@ -231,7 +235,7 @@ kernel.
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
 - An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
-  reading and writing it, `lseek`, `flock`, `getdents64`, `sendfile`,
+  reading and writing it, `lseek`, `flock`, `getdents`, `getdents64`, `sendfile`,
   `copy_file_range`, `fsync`, `fdatasync`, `syncfs`, `sync_file_range`,
   `fadvise64`, `readahead`, `ftruncate`,
   `fallocate`, `mmap`, `ioctl`, the `f*xattr` calls, `epoll_ctl` (as the
@@ -595,6 +599,11 @@ kernel.
   `EFAULT`.
 - `msync` checks its arguments and the range, and with `MS_SYNC` or
   `MS_ASYNC` writes the stores of shared file mappings back to their files.
+- `remap_file_pages` maps a range of a shared mapping again at another page
+  of its file or shared memory, as Linux's `mmap` of the mapping's own file
+  does, keeping its protection. As on Linux, `prot` must be 0 and the range
+  must lie in shared mappings of the same memory that may write, with no
+  hole (`EINVAL`), and a page past what a file can reach is `EOVERFLOW`.
 - System V shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) belongs to
   the thread's IPC namespace, with Linux's checks in Linux's order and its
   default limits; a new IPC namespace starts with no segments. A segment's ID is its index and a sequence number, given
@@ -647,6 +656,51 @@ kernel.
   `MSG_STAT_ANY` (the processes in the caller's PID namespace), `IPC_SET`
   (past `MSGMNB` with `CAP_SYS_RESOURCE`), `IPC_RMID`, `IPC_INFO` and
   `MSG_INFO`.
+- POSIX message queues (`mq_open`, `mq_unlink`, `mq_timedsend`,
+  `mq_timedreceive`, `mq_notify`, `mq_getsetattr`) are the files of the
+  thread's IPC namespace's own `mqueue` filesystem, with Linux's checks in
+  Linux's order (as `ipc/mqueue.c`). Its root is sticky and anyone may
+  write to it: a name is looked up there (`EACCES` for `.`, `..` or one with
+  a `/`, `ENAMETOOLONG` past 255 bytes), opening an existing queue checks
+  its permissions, and only the queue's owner or root unlinks it (`EPERM`).
+  A namespace starts with Linux's defaults: 256 queues (`queues_max`,
+  `ENOSPC`), at most 10 messages (`msg_max`, also the default) of at most
+  8192 bytes (`msgsize_max`, also the default); `CAP_SYS_RESOURCE` passes
+  the first and allows up to 65536 messages of 16 MiB. A queue charges its
+  creator's real user ID for its bytes and Linux's bookkeeping of each
+  message (48 + 48 bytes on x86-64) against `RLIMIT_MSGQUEUE` (`EMFILE`)
+  until it is unlinked and closed. `mq_open` gives a close-on-exec
+  descriptor, which `fork` shares with its `O_NONBLOCK` (which
+  `mq_getsetattr` and `fcntl` both set): `poll`, `select` and `epoll` find
+  it readable with a message and writable with room, whatever its access
+  mode, and each message queued wakes an edge-triggered `epoll` again;
+  `read` gives the state line Linux's does (`QSIZE`, `NOTIFY`, `SIGNO`,
+  `NOTIFY_PID`) from the file position, `fstat` a regular file of 80 bytes,
+  `fchmod` and `fchown` change it, and its link in `/proc/self/fd` is
+  `/<name>`, followed by a space and `(deleted)` once unlinked. Messages come highest
+  priority first (below 32768, `EINVAL`), in the order sent within one. A
+  receive into a buffer smaller than `mq_msgsize` is `EMSGSIZE`, and so is
+  a longer send. A receive from an empty queue and a send to a full one
+  give `EAGAIN` with `O_NONBLOCK`, else wait until the absolute
+  `CLOCK_REALTIME` timeout (`ETIMEDOUT`, read and checked first: `EFAULT`,
+  `EINVAL`) or a signal (`EINTR`, which `SA_RESTART` and a signal that runs
+  no handler restart, as `ERESTARTSYS`). The waiting receivers take
+  messages in the order they began, straight from the sender as Linux's
+  `pipelined_send`, and a waiting sender's message takes the room a
+  receive makes (`pipelined_receive`). `mq_notify` registers the calling
+  process (`EBUSY` while another is registered; no notification drops only
+  the caller's own) to hear of a message that comes to the empty queue
+  while no receiver waits, once: `SIGEV_SIGNAL` sends its signal with
+  `si_code` `SI_MESGQ`, the sender's process and real user ID and the
+  `sigev_value` (signal 0 sends nothing), unless the process has run
+  `execve` since; `SIGEV_NONE` only ends the registration; `SIGEV_THREAD`
+  copies 32 bytes from `sigev_value` and sends them to the netlink socket
+  `sigev_signo` names (`EBADF`, `ENOTSOCK`, or `EINVAL` for another
+  socket) as a datagram whose last byte is 1 (`NOTIFY_WOKENUP`), or 2
+  (`NOTIFY_REMOVED`) when the registration ends without a message, which is
+  what the C libraries' helper threads read to start the
+  `sigev_notify_function`. Closing any descriptor of the queue, or ending,
+  drops its process's registration, as Linux's `mqueue_flush_file`.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux
@@ -915,8 +969,9 @@ kernel.
 - A netlink socket (`AF_NETLINK`, `SOCK_RAW` or `SOCK_DGRAM`, protocol
   `NETLINK_ROUTE`) shows and changes the loopback of the network namespace
   it was made in, so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`
-  (with `ip addr add` and `del`), `ip route`, `ip route get`,
-  `ip link set lo up` and `ip monitor` work.
+  (with `ip addr add` and `del`), `ip route` (with `ip route add`, `del`,
+  `replace` and `append`), `ip route get`, `ip link set lo up` and
+  `ip monitor` work.
   - **The socket:** as Linux's `af_netlink`, `bind` takes a port ID
     (`EADDRINUSE` for one another socket has) or with 0 the process's ID,
     or a negative one when that is taken; `connect` or the first send binds
@@ -953,36 +1008,58 @@ kernel.
     the first that has the `IFA_LOCAL`, `IFA_LABEL` and `IFA_ADDRESS` and
     prefix it names (`EADDRNOTAVAIL` for none), a primary with its
     secondaries; `127.0.0.1` and `::1` may go too.
-  - **Routes:** the addresses' routes are the kernel's, as
-    `fib_add_ifaddr` and `addrconf` make them. An IPv4 address has a
-    `local` route in the local table from the start; its prefix route,
-    `local` too on a loopback, comes at the first time `lo` is up with it
-    and stays when it goes down; its subnet's `broadcast` route, and that of
-    an `IFA_BROADCAST`, are there while it is up. An IPv6 address has a
-    `local` route in the local table, and, from the first time `lo` is up
-    with it, a unicast prefix route in the main table, metric 256, but for
-    `::1`. `RTM_GETROUTE` with `NLM_F_DUMP` gives them, IPv4's (by
-    destination) then IPv6's (the main table's, then the local one's);
-    `AF_INET` or `AF_INET6` alone gives that family's, and the multicast
-    routing families none. Without a dump it looks up the route to the
-    `RTA_DST` it names, as `inet_rtm_getroute` and `inet6_rtm_getroute`
-    do, by the longest prefix: an IPv4 local or broadcast one answers in
-    the main table, with its preferred source and the caller's `RTA_UID`
-    (or the one the request names, as it is; none for -1, and `ERANGE` for
-    one shorter than 4 bytes); `0.0.0.0` goes to the loopback from
-    127.0.0.1; an IPv6 address answers with its local route, and another
-    in a prefix with the prefix route, from that address, while `lo` is
-    up. Any other destination is `ENETUNREACH`, and `AF_UNSPEC`
+  - **Routes:** each family has its routing tables, as Linux's `fib_trie`
+    and `ip6_fib` keep them; IPv4's local and main tables share one trie,
+    as they do while there is no policy rule. The addresses' routes are the
+    kernel's, as `fib_add_ifaddr` and `addrconf` make them: an IPv4 address
+    has a `local` route in the local table from the start and, once `lo` is
+    up, its prefix route (`local` too on a loopback, which stays when it
+    goes down), its subnet's `broadcast` route and that of an
+    `IFA_BROADCAST`; an IPv6 address has a `local` route in the local table
+    and, from the first time `lo` is up with it, a unicast prefix route in
+    the main table, metric 256, but for `::1`. `RTM_NEWROUTE` adds a route
+    through `lo` or of a kind without a device (`blackhole`, `unreachable`,
+    `prohibit`, `throw`) to any table, with its metric, protocol, scope,
+    TOS, preferred source and an IPv4 gateway (on link too), as
+    `inet_rtm_newroute` and `inet6_rtm_newroute` do: `NLM_F_EXCL`,
+    `NLM_F_REPLACE`, `NLM_F_APPEND` and `NLM_F_CREATE` put it in Linux's
+    place, or Linux's error refuses it (`EEXIST`, `ENOENT`; `EINVAL` for a
+    bad prefix, scope, kind, gateway or preferred source; `ENODEV` for
+    another device; `ENETDOWN` while `lo` is down, but for an IPv4 route of
+    host scope). `RTM_DELROUTE` removes the first route that matches what it
+    names (`ESRCH` for none), a kernel's too, which a change of an address
+    or `lo` coming up brings back. Taking `lo` down removes IPv4's routes
+    through it but those of host scope, and every IPv6 route. Removing an
+    IPv4 address removes the main table's routes from it, and the last one
+    every route through `lo`; removing an IPv6 address removes the first
+    main table route to its prefix, whoever's, as `cleanup_prefix_route`
+    does. `RTM_GETROUTE` with `NLM_F_DUMP` gives the routes table by table,
+    in the order of Linux's table hash, IPv4's in their trie's order and
+    IPv6's in a walk of its tree; `AF_INET` or `AF_INET6` alone gives that
+    family's, and the multicast routing families none. Without a dump it
+    looks up the route to the `RTA_DST` it names, as `inet_rtm_getroute`
+    and `inet6_rtm_getroute` do: IPv4 by the longest prefix of the local
+    and main tables, then the default table's where they have none or a
+    `throw` route; IPv6 in the local table, then the main one, while `lo`
+    is up. A rejecting route's error is the answer (`EINVAL`,
+    `EHOSTUNREACH`, `EACCES`). An IPv4 answer names the main table (with
+    `RTM_F_LOOKUP_TABLE`, the table it came from), the source
+    `fib_select_path` picks, a gateway reached on link, and the caller's
+    `RTA_UID` (or the one the request names, as it is; none for -1, and
+    `ERANGE` for one shorter than 4 bytes); `0.0.0.0` goes to the loopback
+    from 127.0.0.1. An IPv6 answer names the source `ipv6_dev_get_saddr`
+    picks. Where no route goes it is `ENETUNREACH`, and `AF_UNSPEC`
     `EOPNOTSUPP`; a destination shorter than its family's address is
     `ERANGE` for IPv4 and `EINVAL` for IPv6. With `RTM_F_FIB_MATCH` the
     answer is the table entry that matched (`EHOSTUNREACH` for `0.0.0.0`,
     which none is).
-  - **Sockets:** an address the loopback's local routes have is the
-    guest's own: a TCP or UDP socket binds to it and reaches it on the
-    loopback, from the preferred source of its route. On a loopback an
-    IPv4 address makes its whole subnet local; an IPv6 one only itself.
-    Before IPv4 has any route at all, a socket binds to any IPv4 address,
-    as Linux's `inet_addr_type` takes each as broadcast then.
+  - **Sockets:** an address a local route has is the guest's own: a TCP or
+    UDP socket binds to it and reaches it on the loopback, from the
+    preferred source of its route. On a loopback an IPv4 address makes its
+    whole subnet local, and an IPv4 local route (as `ip route add local`
+    makes) every address of its prefix; IPv6 binds only to its addresses.
+    Before IPv4 has a local table, a socket binds to any IPv4 address, as
+    Linux's `inet_addr_type` takes each as broadcast then.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
@@ -993,14 +1070,15 @@ kernel.
     in Linux's order: bringing it up or down `RTM_NEWLINK` with `IFF_UP`
     in `ifi_change` (`RTNLGRP_LINK`); then the addresses that come or go
     (`RTNLGRP_IPV4_IFADDR`, `RTNLGRP_IPV6_IFADDR`) and the routes
-    (`RTNLGRP_IPV4_ROUTE`, `RTNLGRP_IPV6_ROUTE`, `NLM_F_CREATE |
-    NLM_F_EXCL` for a new one), as `inetdev_event`, `fib_add_ifaddr`,
-    `fib_del_ifaddr`, `addrconf` and `rt6_disable_ip` tell them. An IPv4
-    address's carries the request's sequence number and port; an IPv6
-    address is told of twice when added, tentative and then not. An
-    unbound socket hears nothing; the requester of an IPv4 address's change
-    has the notification before its acknowledgement, and with
-    `NLM_F_ECHO` as its own copy.
+    (`RTNLGRP_IPV4_ROUTE`, `RTNLGRP_IPV6_ROUTE`, a new one with the
+    `NLM_F_CREATE`, `NLM_F_EXCL`, `NLM_F_APPEND` or `NLM_F_REPLACE` Linux
+    gives it), as `inetdev_event`, `fib_add_ifaddr`, `fib_del_ifaddr`,
+    `addrconf`, `rt6_disable_ip`, `rtmsg_fib` and `inet6_rt_notify` tell
+    them. An IPv4 address's and a route request's carry the request's
+    sequence number and port; an IPv6 address is told of twice when added,
+    tentative and then not. An unbound socket hears nothing; the requester
+    of an IPv4 address's or a route's change has the notification before
+    its acknowledgement, and with `NLM_F_ECHO` as its own copy.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,
@@ -1173,7 +1251,9 @@ kernel.
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts (`tmpfs` for the root, `hostfs` for each
   `--mount`, without host paths). Each mount has its own `st_dev`, as its
-  line in `mountinfo` says, so `df` lists every mount.
+  line in `mountinfo` says, so `df` lists every mount. `ustat` of a mount's
+  `st_dev` gives its free blocks and inodes, and of any other device
+  `EINVAL`.
 - A file's block size (`st_blksize`, `stx_blksize`, `FIGETBSZ`) is its
   filesystem's, as on Linux: 1024 for `/proc` (procfs), a pseudo-terminal's
   slave and a terminal on standard input, output or error (devpts), and 4096

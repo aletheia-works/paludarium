@@ -1361,10 +1361,9 @@ kernel.
   past Linux's `KTIME_MAX` is clamped to it. `getitimer` gives the time left
   in microseconds, cut down, as Linux's `itimer_get_remtime`: an armed timer
   whose time is up shows 1 µs, and one with less than 1 µs left shows 0.
-  `alarm` sets it to whole
-  seconds with no interval and returns the seconds that were left, rounded to
-  the nearest and at least 1 while it was armed, as Linux's
-  `alarm_setitimer`.
+  `alarm` sets it to whole seconds with no interval and returns the seconds
+  that were left, rounded to the nearest and at least 1 while it was armed,
+  as Linux's `alarm_setitimer`.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's, rounded up to
   a whole second as Linux rounds it.

@@ -1523,6 +1523,45 @@ static void addresses_connect(const char *text, const char *when) {
     close(client), close(listener);
     if (accepted >= 0) close(accepted);
 }
+/* The monitor case: prints what the notifications `fd` has had are, until
+   none has come for 700 ms, as Linux tells some of them a little later.
+   `ctl` is the port of the socket that asked for the change. */
+static void monitor_show(int fd, unsigned ctl, const char *label) {
+    for (;;) {
+        struct pollfd ready = {.fd = fd, .events = POLLIN};
+        if (poll(&ready, 1, 700) <= 0) return;
+        static char buf[16384];
+        struct nl_address from = {0};
+        socklen_t from_len = sizeof from;
+        long n = recvfrom(fd, buf, sizeof buf, MSG_DONTWAIT, (void *)&from, &from_len);
+        if (n <= 0) return;
+        for (char *at = buf; at + sizeof(struct nl_header) <= buf + n;) {
+            struct nl_header *h = (void *)at;
+            if (h->len < sizeof *h || at + h->len > buf + n) break;
+            unsigned char *body = (void *)(h + 1);
+            int body_len = h->len - sizeof *h;
+            printf("%s: type=%u flags=%#x seq=%u pid=%s groups=%#x from=%u", label, h->type, h->flags, h->seq,
+                   h->pid == 0 ? "0" : h->pid == ctl ? "ctl" : "other", from.groups, from.pid);
+            if ((h->type == 16 || h->type == 17) && body_len >= 16) {
+                int index;
+                unsigned flags, change;
+                memcpy(&index, body + 4, 4);
+                memcpy(&flags, body + 8, 4);
+                memcpy(&change, body + 12, 4);
+                printf(" link family=%u index=%d flags=%#x change=%#x", body[0], index, flags, change);
+            } else if ((h->type == 20 || h->type == 21) && body_len >= 8) {
+                printf(" addr family=%u prefix=%u flags=%#x scope=%u attributes", body[0], body[1], body[2], body[3]);
+                nl_attributes(body + 8, body_len - 8, nl_address_attribute);
+            } else if ((h->type == 24 || h->type == 25) && body_len >= 12) {
+                printf(" route family=%u dst=%u table=%u protocol=%u scope=%u kind=%u attributes", body[0], body[1],
+                       body[4], body[5], body[6], body[7]);
+                nl_attributes(body + 12, body_len - 12, nl_route_attribute);
+            }
+            printf("\n");
+            at += (h->len + 3) & ~3;
+        }
+    }
+}
 /* What getifaddrs gives, one line each. */
 static void nl_getifaddrs(const char *label) {
     struct ifaddrs *list, *i;
@@ -6858,6 +6897,109 @@ int main(int argc, char **argv) {
         result("inner", reaped(inner));
         for (int i = 0; i < 3; i++) unlink(names[i]);
         rmdir(dir);
+        return 0;
+    }
+    if (!strcmp(mode, "monitor")) {
+        /* A child makes a network namespace and watches its link, address
+           and route notifications while another socket changes them. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            /* Membership: through NETLINK_ADD_MEMBERSHIP, unbound, then bind. */
+            int group;
+            static const int groups[] = {0, 1, 5, 32, 39, 40};
+            for (size_t i = 0; i < sizeof groups / sizeof groups[0]; i++) {
+                group = groups[i];
+                printf("add %d=%ld\n", group,
+                       netns_result(setsockopt(mon, 270, 1 /* NETLINK_ADD_MEMBERSHIP */, &group, sizeof group)));
+            }
+            group = 32;
+            printf("drop 32=%ld drop 6=%ld short=%ld\n", netns_result(setsockopt(mon, 270, 2, &group, sizeof group)),
+                   netns_result(setsockopt(mon, 270, 2, (group = 6, &group), sizeof group)),
+                   netns_result(setsockopt(mon, 270, 1, &group, 2)));
+            unsigned words[4] = {0};
+            socklen_t words_len = sizeof words;
+            long listed = netns_result(getsockopt(mon, 270, 9 /* NETLINK_LIST_MEMBERSHIPS */, words, &words_len));
+            name_len = sizeof name;
+            getsockname(mon, (void *)&name, &name_len);
+            printf("list=%ld len=%u %#x %#x name pid=%u groups=%#x\n", listed, words_len, words[0], words[1], name.pid,
+                   name.groups);
+            int option = 0;
+            socklen_t option_len = sizeof option;
+            printf("get add=%ld\n", netns_result(getsockopt(mon, 270, 1, &option, &option_len)));
+            /* Bound with link, IPv4 and IPv6 addresses and routes. */
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x551};
+            printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
+            words_len = sizeof words;
+            getsockopt(mon, 270, 9, words, &words_len);
+            name_len = sizeof name;
+            getsockname(mon, (void *)&name, &name_len);
+            printf("bound own=%d groups=%#x list=%#x %#x\n", name.pid == (unsigned)getpid(), name.groups, words[0],
+                   words[1]);
+            /* `ctl` is a member of IPv4's addresses too, but hears not of the
+               ones it changes itself. */
+            group = 5;
+            setsockopt(ctl, 270, 1, &group, sizeof group);
+            monitor_show(mon, port, "start");
+            int udp = socket(AF_INET, SOCK_DGRAM, 0);
+            netns_lo(udp, SIOCSIFFLAGS, "lo", IFF_UP);
+            monitor_show(mon, port, "ioctl up");
+            nl_addr(ctl, port, 20, 0x600, AF_INET, "10.1.2.3", 24, 0, 1, "add");
+            monitor_show(mon, port, "add 10.1.2.3/24");
+            nl_addr(ctl, port, 20, 0x600, AF_INET, "10.1.2.9", 24, 0, 1, "add");
+            monitor_show(mon, port, "add secondary");
+            nl_addr(ctl, port, 20, 0x600, AF_INET6, "2001:db8::5", 64, 0, 1, "add");
+            monitor_show(mon, port, "add v6");
+            nl_addr(ctl, port, 21, 0, AF_INET, "10.1.2.3", 24, 0, 1, "del");
+            monitor_show(mon, port, "del primary");
+            nl_addr(ctl, port, 21, 0, AF_INET6, "2001:db8::5", 64, 0, 1, "del");
+            monitor_show(mon, port, "del v6");
+            nl_addr(ctl, port, 20, 0x600, AF_INET6, "2001:db8:1::1", 64, 0, 1, "add");
+            monitor_show(mon, port, "add v6 again");
+            struct nl_link link = {.index = 1, .flags = 0, .change = IFF_UP};
+            nl_answer(ctl, nl_send(ctl, 16, NL_F_REQUEST | NL_F_ACK, &link, sizeof link), port, "netlink down");
+            monitor_show(mon, port, "netlink down");
+            nl_addr(ctl, port, 20, 0x600, AF_INET, "10.5.5.5", 24, 0, 1, "add");
+            nl_addr(ctl, port, 20, 0x600, AF_INET6, "2001:db8:2::2", 64, 0, 1, "add");
+            monitor_show(mon, port, "added while down");
+            link.flags = IFF_UP;
+            nl_answer(ctl, nl_send(ctl, 16, NL_F_REQUEST | NL_F_ACK, &link, sizeof link), port, "netlink up");
+            monitor_show(mon, port, "netlink up");
+            netns_lo(udp, SIOCSIFFLAGS, "lo", IFF_UP);
+            monitor_show(mon, port, "up again");
+            nl_addr(ctl, port, 21, 0, AF_INET, "127.0.0.1", 8, 0, 1, "del");
+            monitor_show(mon, port, "del 127");
+            netns_lo(udp, SIOCSIFFLAGS, "lo", 0);
+            monitor_show(mon, port, "ioctl down");
+            /* What `ctl` itself heard, besides its acknowledgements. */
+            monitor_show(ctl, port, "ctl");
+            /* A user may not join the multicast routing groups. */
+            fflush(stdout);
+            pid_t user = child();
+            if (user == 0) {
+                if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+                int own = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+                int g30 = 30, g32 = 32;
+                struct nl_address all = {.family = NL_AF_NETLINK, .groups = 0xffffffff};
+                printf("user: add 30=%ld add 32=%ld bind all=%ld\n",
+                       netns_result(setsockopt(own, 270, 1, &g30, sizeof g30)),
+                       netns_result(setsockopt(own, 270, 1, &g32, sizeof g32)),
+                       netns_result(bind(own, (void *)&all, sizeof all)));
+                fflush(stdout);
+                _exit(0);
+            }
+            result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
         return 0;
     }
     if (!strcmp(mode, "addresses")) {

@@ -4149,3 +4149,120 @@ fn netlink_adds_addresses_that_sockets_bind_and_reach() {
         -1
     );
 }
+#[test]
+fn netlink_tells_its_members_of_changes() {
+    let mut f = Fixture::new();
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    let errno = |e: i32| Errno(e).to_syscall_return();
+    // A member by bind (link, IPv4 addresses and routes), one by
+    // NETLINK_ADD_MEMBERSHIP alone, unbound, and the socket that asks.
+    let monitor = f.ret(41, [16, 3, 0, 0, 0, 0]);
+    let mut name = [0u8; 12];
+    name[0] = 16;
+    name[8..12].copy_from_slice(&(1u32 | 0x10 | 0x40).to_le_bytes());
+    f.mem.write(GuestAddr(DATA + 0x100), &name).unwrap();
+    assert_eq!(f.ret(49, [monitor, DATA + 0x100, 12, 0, 0, 0]), 0);
+    let joined = f.ret(41, [16, 3, 0, 0, 0, 0]);
+    let join = |f: &mut Fixture, fd: u64, name: u64, group: u32| {
+        f.mem
+            .write(GuestAddr(DATA + 0x200), &group.to_le_bytes())
+            .unwrap();
+        f.ret(54, [fd, 270, name, DATA + 0x200, 4, 0])
+    };
+    assert_eq!(join(&mut f, joined, 1, 5), 0);
+    assert_eq!(join(&mut f, joined, 1, 0), errno(22));
+    assert_eq!(join(&mut f, joined, 1, 40), errno(22));
+    assert_eq!(join(&mut f, joined, 1, 39), 0);
+    assert_eq!(join(&mut f, joined, 2, 39), 0);
+    // NETLINK_LIST_MEMBERSHIPS: two words, whatever room there is.
+    f.mem
+        .write(GuestAddr(DATA + 0x300), &4u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        f.ret(55, [joined, 270, 9, DATA + 0x304, DATA + 0x300, 0]),
+        0
+    );
+    assert_eq!(read_u32(&f, DATA + 0x300), 8);
+    assert_eq!(read_u32(&f, DATA + 0x304), 0x10);
+    let control = f.ret(41, [16, 3, 0, 0, 0, 0]);
+    // Up, through SIOCSIFFLAGS: the link, then 127.0.0.1/8 and its routes.
+    interface_request(&f, DATA + 0x400, b"lo", 1);
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    assert_eq!(f.ret(16, [udp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    let told = |f: &mut Fixture, fd: u64| {
+        let mut out = Vec::new();
+        loop {
+            f.mem
+                .write(GuestAddr(DATA + 0x200), &12u32.to_le_bytes())
+                .unwrap();
+            let n = f.ret(
+                45,
+                [fd, DATA + 0x1000, 0x1000, 0x40, DATA + 0x100, DATA + 0x200],
+            );
+            if n as i64 <= 0 {
+                return out;
+            }
+            f.mem
+                .write(GuestAddr(DATA + 0x200), &12u32.to_le_bytes())
+                .unwrap();
+            let mut raw = [0u8; 24];
+            f.mem.read(GuestAddr(DATA + 0x1000), &mut raw).unwrap();
+            let kind = u16::from_le_bytes([raw[4], raw[5]]);
+            let seq = read_u32(f, DATA + 0x1008);
+            out.push((kind, read_u32(f, DATA + 0x108), seq, raw[17]));
+        }
+    };
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &12u32.to_le_bytes())
+        .unwrap();
+    let up = told(&mut f, monitor);
+    let kinds: Vec<_> = up.iter().map(|t| (t.0, t.1)).collect();
+    assert_eq!(
+        kinds,
+        [(16, 1), (20, 0x10), (24, 0x40), (24, 0x40), (24, 0x40)]
+    );
+    // The unbound member hears nothing from the kernel itself.
+    assert!(told(&mut f, joined).is_empty());
+    // An address added through `control`, a member too: each bound member
+    // hears of it with the request's sequence number, `control` before its
+    // acknowledgement; the unbound one not at all.
+    assert_eq!(join(&mut f, control, 1, 5), 0);
+    let len = netlink_request(
+        &f,
+        DATA,
+        20,
+        0x605,
+        33,
+        &address_request(2, 24, &[10, 1, 2, 3]),
+    );
+    assert_eq!(f.ret(44, [control, DATA, len, 0, 0, 0]), len);
+    let added = told(&mut f, monitor);
+    assert_eq!(added[0], (20, 0x10, 33, 24));
+    assert_eq!(added.len(), 4);
+    assert!(told(&mut f, joined).is_empty());
+    let answers = netlink_replies(&mut f, control);
+    let kinds: Vec<_> = answers.iter().map(|a| a.0).collect();
+    assert_eq!(kinds, [20, 2]);
+    // With NLM_F_ECHO, `control` has its own copy, and is no member for it.
+    let len = netlink_request(
+        &f,
+        DATA,
+        20,
+        0x60d,
+        34,
+        &address_request(2, 24, &[10, 9, 9, 9]),
+    );
+    assert_eq!(f.ret(44, [control, DATA, len, 0, 0, 0]), len);
+    let answers = netlink_replies(&mut f, control);
+    let kinds: Vec<_> = answers.iter().map(|a| (a.0, a.2)).collect();
+    assert_eq!(kinds, [(20, 34), (2, 34)]);
+    // Without CAP_NET_ADMIN, the multicast routing groups are EPERM.
+    f.thread.state.credentials = f
+        .thread
+        .state
+        .credentials
+        .setresuid(1000, 1000, 1000)
+        .unwrap();
+    assert_eq!(join(&mut f, joined, 1, 30), errno(1));
+    assert_eq!(join(&mut f, joined, 1, 32), 0);
+}

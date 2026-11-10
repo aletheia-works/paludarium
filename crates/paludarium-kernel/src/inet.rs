@@ -405,18 +405,21 @@ impl Network {
     /// Brings the loopback up or down, as `SIOCSIFFLAGS` or netlink's
     /// `RTM_NEWLINK` with `IFF_UP` does, with what that does to its
     /// addresses ([`crate::interface::Addresses::up`] and `down`).
-    pub(crate) fn set_up(&self, up: bool) {
+    /// `None` when it already is, else what happened to the addresses and
+    /// routes, for netlink to tell ([`crate::netlink::set_up`]).
+    pub(crate) fn set_up(&self, up: bool) -> Option<Vec<crate::interface::Event>> {
         let mut addresses = self.addresses();
         if up == self.is_up() {
-            return;
+            return None;
         }
-        if up {
+        let events = if up {
             self.ever_up.store(true, Ordering::SeqCst);
-            addresses.up();
+            addresses.up()
         } else {
-            addresses.down();
-        }
+            addresses.down()
+        };
         self.up.store(up, Ordering::SeqCst);
+        Some(events)
     }
     /// `SIOCGIFFLAGS`, `SIOCSIFFLAGS` and `SIOCGIFINDEX` on the interface
     /// `name` (the `ifr_name` of a `struct ifreq`): the loopback `lo`, index
@@ -447,7 +450,7 @@ impl Network {
                 IFF_LOOPBACK
             })),
             SIOCSIFFLAGS => {
-                self.set_up(flags & IFF_UP != 0);
+                crate::netlink::set_up(self, flags & IFF_UP != 0);
                 Ok(0)
             }
             _ => Ok(1),

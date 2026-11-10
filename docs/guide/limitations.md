@@ -309,9 +309,13 @@ verified.
   the table or attributes a strict request names, and a lookup looks at
   no selector but its destination (`RTA_SRC`, `RTA_OIF`, `RTA_MARK` and
   the rest are not); its `rta_cacheinfo` counts one reference, where
-  Linux counts the other users of the cached route too. No notification is sent to a multicast group, though
-  `bind` takes groups; `NETLINK_ADD_MEMBERSHIP` and the other options not
-  listed in the features are `ENOPROTOOPT`. A link message carries a
+  Linux counts the other users of the cached route too. Notifications go
+  out for the link, addresses and routes alone, not for IPv6's own link
+  information (`RTNLGRP_IPV6_IFINFO`), neighbours, netconf or the other
+  groups, nor to a socket in another namespace (`NETLINK_LISTEN_ALL_NSID`
+  is not supported); IPv4's broadcast routes go without one when `lo`
+  goes down, as on Linux. `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the
+  other options not listed in the features are `ENOPROTOOPT`. A link message carries a
   subset of Linux's attributes (no `IFLA_AF_SPEC`, `IFLA_MAP`, `IFLA_XDP`
   and others), its statistics are zero, an address's creation times are 0,
   `NETLINK_EXT_ACK` adds no attributes to an error and strict checking

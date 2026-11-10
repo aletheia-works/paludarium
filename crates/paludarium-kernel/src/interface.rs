@@ -96,6 +96,25 @@ impl V6 {
     fn covers(&self, ip: Ipv6Addr) -> bool {
         (u128::from(ip) ^ u128::from(self.address)) & mask6(self.prefix) == 0
     }
+    /// Its route in the local table.
+    pub(crate) fn local_route(&self) -> Route6 {
+        Route6 {
+            dst: self.address,
+            len: 128,
+            kind: Kind::Local,
+        }
+    }
+    /// Its prefix route in the main table, from the first time the loopback
+    /// is up with it; `::1`, which the kernel gives, has none.
+    pub(crate) fn prefix_route(&self) -> Option<Route6> {
+        (self.prefixed && self.proto != KERNEL_LO && self.flags & NO_PREFIX_ROUTE == 0).then(|| {
+            Route6 {
+                dst: Ipv6Addr::from(u128::from(self.address) & mask6(self.prefix)),
+                len: self.prefix,
+                kind: Kind::Unicast,
+            }
+        })
+    }
 }
 fn mask4(prefix: u8) -> u32 {
     u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
@@ -128,6 +147,26 @@ pub(crate) struct Route4 {
     pub kind: Kind,
     pub source: Ipv4Addr,
 }
+impl Route4 {
+    /// The same route of the table, whatever its preferred source.
+    fn same(&self, other: &Self) -> bool {
+        self.dst == other.dst && self.len == other.len && self.kind == other.kind
+    }
+}
+/// A change to the loopback's addresses or routes Linux tells netlink of
+/// (`RTM_NEWADDR`, `RTM_DELADDR`, `RTM_NEWROUTE`, `RTM_DELROUTE`); an
+/// IPv6 address may be told of while tentative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Event {
+    NewAddr4(V4),
+    DelAddr4(V4),
+    NewRoute4(Route4),
+    DelRoute4(Route4),
+    NewAddr6(V6, bool),
+    DelAddr6(V6),
+    NewRoute6(Route6),
+    DelRoute6(Route6),
+}
 /// An IPv6 route: a local one of the local table, or a unicast prefix
 /// route of the main table, through `lo`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,7 +189,7 @@ impl Addresses {
     /// The first namespace's: `127.0.0.1/8` and `::1`, up.
     pub(crate) fn first() -> Self {
         let mut addresses = Self::isolated();
-        addresses.up();
+        let _ = addresses.up();
         addresses
     }
     /// A new namespace's: none.
@@ -161,32 +200,78 @@ impl Addresses {
             table: false,
         }
     }
-    /// The loopback comes up (`NETDEV_UP`): it takes `127.0.0.1/8` if it
-    /// has it not, every IPv4 address its prefix route, and `::1`.
-    pub(crate) fn up(&mut self) {
+    /// The loopback comes up (`NETDEV_UP`), and what Linux tells of it, in
+    /// its order: `127.0.0.1/8` if it has it not, with its routes
+    /// (`inetdev_event`); every IPv4 address's routes that come then, in
+    /// the addresses' order (`fib_netdev_event`); the prefix route of each
+    /// IPv6 address added while it was down (`addrconf_permanent_addr`);
+    /// and `::1` with its route.
+    pub(crate) fn up(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        let mut seen = self.routes4(false);
         let mut loopback = V4::new(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, 8, SCOPE_HOST);
         loopback.flags = PERMANENT;
-        let _ = self.add_v4(loopback, false, true);
+        if let Ok(added) = self.add_v4(loopback, false, true) {
+            for event in added {
+                if let Event::NewRoute4(route) = event {
+                    seen.push(route);
+                }
+                events.push(event);
+            }
+        }
         for address in &mut self.v4 {
             address.prefixed = true;
         }
-        let mut one = V6::new(Ipv6Addr::LOCALHOST, 128);
-        one.proto = KERNEL_LO;
-        let _ = self.add_v6(one, false, true);
+        for address in &self.v4 {
+            for route in self.candidates(address, true) {
+                if !seen.iter().any(|r| r.same(&route)) {
+                    seen.push(route);
+                    events.push(Event::NewRoute4(route));
+                }
+            }
+        }
+        let before = self.routes6();
         for address in &mut self.v6 {
             address.prefixed = true;
         }
+        for address in &self.v6 {
+            if let Some(route) = address.prefix_route().filter(|r| !before.contains(r))
+                && !events.contains(&Event::NewRoute6(route))
+            {
+                events.push(Event::NewRoute6(route));
+            }
+        }
+        if !self.local6(Ipv6Addr::LOCALHOST) {
+            let mut one = V6::new(Ipv6Addr::LOCALHOST, 128);
+            one.proto = KERNEL_LO;
+            one.prefixed = true;
+            events.push(Event::NewAddr6(one.clone(), false));
+            events.push(Event::NewRoute6(one.local_route()));
+            self.insert_v6(one);
+        }
+        events
     }
-    /// The loopback goes down: it loses every IPv6 address.
-    pub(crate) fn down(&mut self) {
-        self.v6.clear();
+    /// The loopback goes down: it loses every IPv6 address, and Linux tells
+    /// of their routes going (`rt6_disable_ip`), the main table's then the
+    /// local one's, then of the addresses (`addrconf_ifdown`). IPv4's
+    /// broadcast routes go without a word.
+    pub(crate) fn down(&mut self) -> Vec<Event> {
+        let mut events: Vec<Event> = self.routes6().into_iter().map(Event::DelRoute6).collect();
+        events.extend(self.v6.drain(..).map(Event::DelAddr6));
+        events
     }
     /// Adds an IPv4 address as `__inet_insert_ifa` does: the same local
     /// address and subnet again is `EEXIST`, unless `replace`, which takes
     /// its protocol; one in a subnet a primary address has is secondary,
     /// and goes last; a primary goes after the primaries of a scope as wide
-    /// or wider. `up` gives it its prefix route at once.
-    pub(crate) fn add_v4(&mut self, mut new: V4, replace: bool, up: bool) -> Result<(), Errno> {
+    /// or wider. `up` gives it its prefix route at once. What Linux tells:
+    /// the address, then the routes it brings (`fib_add_ifaddr`).
+    pub(crate) fn add_v4(
+        &mut self,
+        mut new: V4,
+        replace: bool,
+        up: bool,
+    ) -> Result<Vec<Event>, Errno> {
         new.flags &= !SECONDARY;
         new.flags |= PERMANENT;
         let mut last_primary = 0;
@@ -200,31 +285,43 @@ impl Addresses {
                         return Err(EEXIST);
                     }
                     old.proto = new.proto;
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
                 new.flags |= SECONDARY;
             }
         }
         new.prefixed = up;
         self.table = true;
+        let before = self.routes4(up);
+        let mut events = vec![Event::NewAddr4(new.clone())];
         if new.secondary() {
-            self.v4.push(new);
+            self.v4.push(new.clone());
         } else {
-            self.v4.insert(last_primary, new);
+            self.v4.insert(last_primary, new.clone());
         }
-        Ok(())
+        for route in self.candidates(&new, up) {
+            if !before.iter().any(|r| r.same(&route)) && !events.contains(&Event::NewRoute4(route))
+            {
+                events.push(Event::NewRoute4(route));
+            }
+        }
+        Ok(events)
     }
     /// Removes the first IPv4 address that has `local`, `label`, and
     /// `address` in a subnet of `prefix`, each as given, as
     /// `inet_rtm_deladdr`: `EADDRNOTAVAIL` for none. A primary takes its
-    /// secondaries with it (`promote_secondaries` is 0).
+    /// secondaries with it (`promote_secondaries` is 0), which go first.
+    /// What Linux tells: each address, then the routes that go with it, the
+    /// prefix route, the broadcast ones, then the local one
+    /// (`fib_del_ifaddr`).
     pub(crate) fn del_v4(
         &mut self,
         local: Option<Ipv4Addr>,
         address: Option<Ipv4Addr>,
         prefix: u8,
         label: Option<&[u8]>,
-    ) -> Result<(), Errno> {
+        up: bool,
+    ) -> Result<Vec<Event>, Errno> {
         let found = self
             .v4
             .iter()
@@ -234,44 +331,107 @@ impl Addresses {
                     && address.is_none_or(|address| a.prefix == prefix && a.covers(address))
             })
             .ok_or(EADDRNOTAVAIL)?;
-        let gone = self.v4.remove(found);
-        if !gone.secondary() {
-            self.v4
-                .retain(|a| !(a.secondary() && a.mask() == gone.mask() && gone.covers(a.address)));
+        let target = self.v4[found].clone();
+        let mut gone: Vec<V4> = Vec::new();
+        if !target.secondary() {
+            gone.extend(
+                self.v4
+                    .iter()
+                    .filter(|a| {
+                        a.secondary() && a.mask() == target.mask() && target.covers(a.address)
+                    })
+                    .cloned(),
+            );
         }
-        Ok(())
+        gone.push(target);
+        let mut events = Vec::new();
+        for address in gone {
+            let before = self.routes4(up);
+            // `fib_del_ifaddr`'s order: the prefix route, the broadcast ones,
+            // then the local one.
+            let candidates = self.candidates(&address, up);
+            let (local, rest) = candidates
+                .split_first()
+                .map_or((None, &[][..]), |(l, r)| (Some(*l), r));
+            let mut order: Vec<Route4> = rest
+                .iter()
+                .filter(|r| r.kind == Kind::Local)
+                .copied()
+                .collect();
+            order.extend(rest.iter().filter(|r| r.kind == Kind::Broadcast));
+            order.extend(local);
+            if let Some(i) = self.v4.iter().position(|a| *a == address) {
+                self.v4.remove(i);
+            }
+            let after = self.routes4(up);
+            events.push(Event::DelAddr4(address));
+            for route in order {
+                if before.iter().any(|r| r.same(&route)) && !after.iter().any(|r| r.same(&route)) {
+                    events.push(Event::DelRoute4(route));
+                }
+            }
+        }
+        Ok(events)
     }
     /// Adds an IPv6 address: the same one again is `EEXIST`, unless
     /// `replace`. Global ones go before host ones, the newest first
-    /// within a scope (`ipv6_link_dev_addr`).
-    pub(crate) fn add_v6(&mut self, mut new: V6, replace: bool, up: bool) -> Result<(), Errno> {
+    /// within a scope (`ipv6_link_dev_addr`). What Linux tells: while up,
+    /// its prefix route; the address, tentative, then once its duplicate
+    /// address detection has ended at once on a loopback, as it is; then
+    /// its local route.
+    pub(crate) fn add_v6(
+        &mut self,
+        mut new: V6,
+        replace: bool,
+        up: bool,
+    ) -> Result<Vec<Event>, Errno> {
         if let Some(old) = self.v6.iter_mut().find(|a| a.address == new.address) {
             if !replace {
                 return Err(EEXIST);
             }
             old.proto = new.proto;
-            return Ok(());
+            return Ok(Vec::new());
         }
         new.flags |= PERMANENT;
         new.prefixed = up;
+        let before = self.routes6();
+        let mut events = Vec::new();
+        if let Some(route) = new.prefix_route().filter(|r| !before.contains(r)) {
+            events.push(Event::NewRoute6(route));
+        }
+        events.push(Event::NewAddr6(new.clone(), true));
+        events.push(Event::NewAddr6(new.clone(), false));
+        events.push(Event::NewRoute6(new.local_route()));
+        self.insert_v6(new);
+        Ok(events)
+    }
+    fn insert_v6(&mut self, new: V6) {
         let at = self
             .v6
             .iter()
             .position(|a| a.scope() >= new.scope())
             .unwrap_or(self.v6.len());
         self.v6.insert(at, new);
-        Ok(())
     }
     /// Removes the IPv6 address `address/prefix` (`EADDRNOTAVAIL` for
-    /// none).
-    pub(crate) fn del_v6(&mut self, address: Ipv6Addr, prefix: u8) -> Result<(), Errno> {
+    /// none). What Linux tells: the address, its local route, then its
+    /// prefix route if no other address keeps it.
+    pub(crate) fn del_v6(&mut self, address: Ipv6Addr, prefix: u8) -> Result<Vec<Event>, Errno> {
         let found = self
             .v6
             .iter()
             .position(|a| a.address == address && a.prefix == prefix)
             .ok_or(EADDRNOTAVAIL)?;
-        self.v6.remove(found);
-        Ok(())
+        let gone = self.v6.remove(found);
+        let after = self.routes6();
+        let mut events = vec![
+            Event::DelAddr6(gone.clone()),
+            Event::DelRoute6(gone.local_route()),
+        ];
+        if let Some(route) = gone.prefix_route().filter(|r| !after.contains(r)) {
+            events.push(Event::DelRoute6(route));
+        }
+        Ok(events)
     }
     /// The primary address whose subnet `secondary` is in, or itself.
     fn primary_of(&self, address: &V4) -> Ipv4Addr {
@@ -283,73 +443,50 @@ impl Addresses {
             .find(|a| !a.secondary() && a.mask() == address.mask() && a.covers(address.address))
             .map_or(address.local, |a| a.local)
     }
+    /// The routes `fib_add_ifaddr` gives `address`, in its order: the local
+    /// one; while up, the broadcast one it names; its prefix route, `local`
+    /// on a loopback, once a `NETDEV_UP` has added it (it stays when the
+    /// loopback goes down); and while up, its subnet's broadcast route.
+    fn candidates(&self, address: &V4, up: bool) -> Vec<Route4> {
+        let source = self.primary_of(address);
+        let route = |dst, len, kind| Route4 {
+            dst,
+            len,
+            kind,
+            source,
+        };
+        let mut routes = vec![route(address.local, 32, Kind::Local)];
+        if up && let Some(broadcast) = address.broadcast.filter(|b| !b.is_broadcast()) {
+            routes.push(route(broadcast, 32, Kind::Broadcast));
+        }
+        let prefix = Ipv4Addr::from(u32::from(address.address) & address.mask());
+        if prefix.is_unspecified()
+            || address.secondary()
+            || (prefix == address.local && address.prefix == 32)
+        {
+            return routes;
+        }
+        if address.flags & NO_PREFIX_ROUTE == 0 && address.prefixed {
+            routes.push(route(prefix, address.prefix, Kind::Local));
+        }
+        if up && address.prefix < 31 {
+            routes.push(route(
+                Ipv4Addr::from(u32::from(prefix) | !address.mask()),
+                32,
+                Kind::Broadcast,
+            ));
+        }
+        routes
+    }
     /// The IPv4 routes of the local table, as `fib_add_ifaddr` makes them,
     /// in the order of its trie: by destination, the shorter prefix first.
     pub(crate) fn routes4(&self, up: bool) -> Vec<Route4> {
         let mut routes: Vec<Route4> = Vec::new();
-        let mut add = |route: Route4| {
-            if !routes
-                .iter()
-                .any(|r| r.dst == route.dst && r.len == route.len && r.kind == route.kind)
-            {
-                routes.push(route);
-            }
-        };
         for address in &self.v4 {
-            let source = self.primary_of(address);
-            add(Route4 {
-                dst: address.local,
-                len: 32,
-                kind: Kind::Local,
-                source,
-            });
-            if !up {
-                // The prefix routes a NETDEV_UP added stay when it goes down.
-                if address.prefixed && !address.secondary() && address.flags & NO_PREFIX_ROUTE == 0
-                {
-                    let prefix = Ipv4Addr::from(u32::from(address.address) & address.mask());
-                    if !prefix.is_unspecified() && (prefix != address.local || address.prefix < 32)
-                    {
-                        add(Route4 {
-                            dst: prefix,
-                            len: address.prefix,
-                            kind: Kind::Local,
-                            source,
-                        });
-                    }
+            for route in self.candidates(address, up) {
+                if !routes.iter().any(|r| r.same(&route)) {
+                    routes.push(route);
                 }
-                continue;
-            }
-            if let Some(broadcast) = address.broadcast.filter(|b| !b.is_broadcast()) {
-                add(Route4 {
-                    dst: broadcast,
-                    len: 32,
-                    kind: Kind::Broadcast,
-                    source,
-                });
-            }
-            let prefix = Ipv4Addr::from(u32::from(address.address) & address.mask());
-            if prefix.is_unspecified()
-                || address.secondary()
-                || (prefix == address.local && address.prefix == 32)
-            {
-                continue;
-            }
-            if address.flags & NO_PREFIX_ROUTE == 0 && address.prefixed {
-                add(Route4 {
-                    dst: prefix,
-                    len: address.prefix,
-                    kind: Kind::Local,
-                    source,
-                });
-            }
-            if address.prefix < 31 {
-                add(Route4 {
-                    dst: Ipv4Addr::from(u32::from(prefix) | !address.mask()),
-                    len: 32,
-                    kind: Kind::Broadcast,
-                    source,
-                });
             }
         }
         routes.sort_by_key(|r| (u32::from(r.dst), r.len));
@@ -361,26 +498,12 @@ impl Addresses {
         let mut main: Vec<Route6> = Vec::new();
         let mut local: Vec<Route6> = Vec::new();
         for address in &self.v6 {
-            let route = Route6 {
-                dst: address.address,
-                len: 128,
-                kind: Kind::Local,
-            };
+            let route = address.local_route();
             if !local.contains(&route) {
                 local.push(route);
             }
-            if address.prefixed
-                && address.proto != KERNEL_LO
-                && address.flags & NO_PREFIX_ROUTE == 0
-            {
-                let route = Route6 {
-                    dst: Ipv6Addr::from(u128::from(address.address) & mask6(address.prefix)),
-                    len: address.prefix,
-                    kind: Kind::Unicast,
-                };
-                if !main.contains(&route) {
-                    main.push(route);
-                }
+            if let Some(route) = address.prefix_route().filter(|r| !main.contains(r)) {
+                main.push(route);
             }
         }
         main.sort_by_key(|r| (u128::from(r.dst), r.len));
@@ -470,6 +593,98 @@ mod tests {
             kind,
             source: source.parse().unwrap(),
         }
+    }
+
+    /// A short form of an event: what it is and its address or route.
+    fn told(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                Event::NewAddr4(a) => format!("+addr {}/{}", a.local, a.prefix),
+                Event::DelAddr4(a) => format!("-addr {}/{}", a.local, a.prefix),
+                Event::NewRoute4(r) => format!("+route {}/{} {:?}", r.dst, r.len, r.kind),
+                Event::DelRoute4(r) => format!("-route {}/{} {:?}", r.dst, r.len, r.kind),
+                Event::NewAddr6(a, tentative) => {
+                    format!("+addr {}/{} {tentative}", a.address, a.prefix)
+                }
+                Event::DelAddr6(a) => format!("-addr {}/{}", a.address, a.prefix),
+                Event::NewRoute6(r) => format!("+route {}/{} {:?}", r.dst, r.len, r.kind),
+                Event::DelRoute6(r) => format!("-route {}/{} {:?}", r.dst, r.len, r.kind),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn changes_are_told_in_linux_order() {
+        let mut a = Addresses::isolated();
+        // Added while down: the address and its local route; IPv6's twice.
+        let added = a.add_v4(v4("10.5.5.5", 24), false, false).unwrap();
+        assert_eq!(
+            told(&added),
+            ["+addr 10.5.5.5/24", "+route 10.5.5.5/32 Local"]
+        );
+        let added = a
+            .add_v6(V6::new("2001:db8::5".parse().unwrap(), 64), false, false)
+            .unwrap();
+        assert_eq!(
+            told(&added),
+            [
+                "+addr 2001:db8::5/64 true",
+                "+addr 2001:db8::5/64 false",
+                "+route 2001:db8::5/128 Local",
+            ]
+        );
+        // Up: 127.0.0.1/8 and its routes, the routes the up brings the
+        // other address, IPv6's prefix route, then ::1.
+        assert_eq!(
+            told(&a.up()),
+            [
+                "+addr 127.0.0.1/8",
+                "+route 127.0.0.1/32 Local",
+                "+route 127.0.0.0/8 Local",
+                "+route 127.255.255.255/32 Broadcast",
+                "+route 10.5.5.0/24 Local",
+                "+route 10.5.5.255/32 Broadcast",
+                "+route 2001:db8::/64 Unicast",
+                "+addr ::1/128 false",
+                "+route ::1/128 Local",
+            ]
+        );
+        let added = a
+            .add_v6(V6::new("2001:db8:1::1".parse().unwrap(), 64), false, true)
+            .unwrap();
+        assert_eq!(told(&added)[0], "+route 2001:db8:1::/64 Unicast");
+        // A primary goes after its secondary: each address, then its
+        // routes, the prefix route first and the local one last.
+        a.add_v4(v4("10.5.5.9", 24), false, true).unwrap();
+        let gone = a
+            .del_v4(Some("10.5.5.5".parse().unwrap()), None, 24, None, true)
+            .unwrap();
+        assert_eq!(
+            told(&gone),
+            [
+                "-addr 10.5.5.9/24",
+                "-route 10.5.5.9/32 Local",
+                "-addr 10.5.5.5/24",
+                "-route 10.5.5.0/24 Local",
+                "-route 10.5.5.255/32 Broadcast",
+                "-route 10.5.5.5/32 Local",
+            ]
+        );
+        // Down: IPv6's routes, the main table's first, then its addresses.
+        assert_eq!(
+            told(&a.down()),
+            [
+                "-route 2001:db8::/64 Unicast",
+                "-route 2001:db8:1::/64 Unicast",
+                "-route ::1/128 Local",
+                "-route 2001:db8::5/128 Local",
+                "-route 2001:db8:1::1/128 Local",
+                "-addr 2001:db8:1::1/64",
+                "-addr 2001:db8::5/64",
+                "-addr ::1/128",
+            ]
+        );
     }
 
     #[test]
@@ -566,14 +781,16 @@ mod tests {
             Some("10.1.2.3".parse().unwrap()),
             24,
             None,
+            true,
         )
         .unwrap();
         assert_eq!(a.v4.len(), 2);
         assert_eq!(
-            a.del_v4(None, Some("10.1.2.3".parse().unwrap()), 24, None),
+            a.del_v4(None, Some("10.1.2.3".parse().unwrap()), 24, None, true),
             Err(EADDRNOTAVAIL)
         );
-        a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None).unwrap();
+        a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None, true)
+            .unwrap();
         assert!(!a.bindable4(Ipv4Addr::LOCALHOST, true));
         a.up();
         assert!(a.bindable4(Ipv4Addr::LOCALHOST, true));

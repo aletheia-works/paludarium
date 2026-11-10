@@ -129,10 +129,10 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // addresses and msg cases, whose checks depend on CAP_SYS_ADMIN and
-            // which make namespaces (msg an IPC namespace of its own, for its
-            // counts), the
-            // scheduling-set case, which sets real-time and deadline policies,
+            // addresses, monitor and msg cases, whose checks depend on
+            // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
+            // its own, for its counts), the scheduling-set case, which sets
+            // real-time and deadline policies,
             // and the personality-layout case, which maps page 0.
             let as_root = matches!(
                 mode,
@@ -160,6 +160,7 @@ mod linux {
                     | "netlink"
                     | "unix-interfaces"
                     | "addresses"
+                    | "monitor"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
@@ -269,6 +270,7 @@ mod linux {
         processes_netlink => ("netlink","process"),
         processes_unix_interfaces => ("unix-interfaces","process"),
         processes_addresses => ("addresses","process"),
+        processes_monitor => ("monitor","process"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),

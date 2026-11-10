@@ -886,8 +886,8 @@ kernel.
 - A netlink socket (`AF_NETLINK`, `SOCK_RAW` or `SOCK_DGRAM`, protocol
   `NETLINK_ROUTE`) shows and changes the loopback of the network namespace
   it was made in, so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`
-  (with `ip addr add` and `del`), `ip route`, `ip route get` and
-  `ip link set lo up` work.
+  (with `ip addr add` and `del`), `ip route`, `ip route get`,
+  `ip link set lo up` and `ip monitor` work.
   - **The socket:** as Linux's `af_netlink`, `bind` takes a port ID
     (`EADDRINUSE` for one another socket has) or with 0 the process's ID,
     or a negative one when that is taken; `connect` or the first send binds
@@ -954,6 +954,24 @@ kernel.
     IPv4 address makes its whole subnet local; an IPv6 one only itself.
     Before IPv4 has any route at all, a socket binds to any IPv4 address,
     as Linux's `inet_addr_type` takes each as broadcast then.
+  - **Notifications:** a socket is a member of the groups `bind` names
+    (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
+    of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
+    multicast routing groups 30 and 31 need `CAP_NET_ADMIN`, `EPERM`);
+    `NETLINK_DROP_MEMBERSHIP` leaves one, and `NETLINK_LIST_MEMBERSHIPS`
+    gives them all as two words. A change to `lo` is told to the members
+    of its group in the namespace, each notification its own datagram,
+    in Linux's order: bringing it up or down `RTM_NEWLINK` with `IFF_UP`
+    in `ifi_change` (`RTNLGRP_LINK`); then the addresses that come or go
+    (`RTNLGRP_IPV4_IFADDR`, `RTNLGRP_IPV6_IFADDR`) and the routes
+    (`RTNLGRP_IPV4_ROUTE`, `RTNLGRP_IPV6_ROUTE`, `NLM_F_CREATE |
+    NLM_F_EXCL` for a new one), as `inetdev_event`, `fib_add_ifaddr`,
+    `fib_del_ifaddr`, `addrconf` and `rt6_disable_ip` tell them. An IPv4
+    address's carries the request's sequence number and port; an IPv6
+    address is told of twice when added, tentative and then not. An
+    unbound socket hears nothing; the requester of an IPv4 address's change
+    has the notification before its acknowledgement, and with
+    `NLM_F_ECHO` as its own copy.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,

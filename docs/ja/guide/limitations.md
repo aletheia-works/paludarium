@@ -270,9 +270,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   そこへ送って捨てます。`lo` が落ちている間の IPv6 の経路の引き当ても `ENETUNREACH` です。経路のダンプは、厳密なリクエストが指す表や属性で
   絞り込みません。経路の引き当ては宛先のほかの条件（`RTA_SRC`、`RTA_OIF`、`RTA_MARK`
   など）を見ず、その `rta_cacheinfo` は参照を 1 つと数えます。Linux はキャッシュされた
-  経路を使うほかのものも数えます。`bind` はグループを受け付けますが、マルチキャストの
-  グループに通知は送りません。`NETLINK_ADD_MEMBERSHIP` など、機能のページに挙げていない
-  オプションは `ENOPROTOOPT` です。リンクのメッセージは Linux の属性の一部だけを載せ
+  経路を使うほかのものも数えます。通知はリンク、アドレス、経路のものだけで、IPv6 自身の
+  リンクの情報（`RTNLGRP_IPV6_IFINFO`）、近隣、netconf などのグループには送らず、ほかの
+  名前空間のソケットにも送りません（`NETLINK_LISTEN_ALL_NSID` はありません）。`lo` を
+  落としたときの IPv4 のブロードキャストの経路は、Linux と同じく何も言わずに消えます。
+  `NETLINK_PKTINFO`、`NETLINK_NO_ENOBUFS` など、機能のページに挙げていないオプションは
+  `ENOPROTOOPT` です。リンクのメッセージは Linux の属性の一部だけを載せ
   （`IFLA_AF_SPEC`、`IFLA_MAP`、`IFLA_XDP` などはありません）、統計は 0、アドレスの
   作成時刻は 0 です。`NETLINK_EXT_ACK` はエラーに属性を足さず、厳密な検査も何も
   足しません。`rtnetlink` の知る最後より後の型のメッセージには `NLMSG_ERROR` で

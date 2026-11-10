@@ -13,7 +13,9 @@
 //! down with `IFF_UP`, given `CAP_NET_ADMIN` in the user namespace that owns
 //! the network namespace. An error, or a success the request asks for with
 //! `NLM_F_ACK`, is answered with `NLMSG_ERROR`; any other request is
-//! `EOPNOTSUPP`. A datagram to another socket's port reaches it.
+//! `EOPNOTSUPP`. A datagram to another socket's port reaches it, and the
+//! members of a group hear of the changes to the link, addresses and
+//! routes as Linux tells them.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::inet::Network;
 use crate::sockets::Timeout;
@@ -34,6 +36,7 @@ const NLMSG_MIN_TYPE: u16 = 0x10;
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_MULTI: u16 = 0x2;
 const NLM_F_ACK: u16 = 0x4;
+const NLM_F_ECHO: u16 = 0x8;
 const NLM_F_DUMP: u16 = 0x300;
 const NLM_F_CAPPED: u16 = 0x100;
 const NLM_F_REPLACE: u16 = 0x100;
@@ -46,7 +49,23 @@ const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
 const RTM_GETROUTE: u16 = 26;
+/// The groups (`RTNLGRP_*`) notifications go to, and how many there are
+/// (`RTNLGRP_MAX`); the multicast routing ones of a full routing daemon
+/// need `CAP_NET_ADMIN` (bits of groups 30 and 31).
+const RTNLGRP_LINK: u32 = 1;
+const RTNLGRP_IPV4_IFADDR: u32 = 5;
+const RTNLGRP_IPV4_ROUTE: u32 = 7;
+const RTNLGRP_IPV6_IFADDR: u32 = 9;
+const RTNLGRP_IPV6_ROUTE: u32 = 11;
+const GROUPS: u32 = 39;
+const PRIVILEGED_GROUPS: u32 = 0x6000_0000;
+const NETLINK_ADD_MEMBERSHIP: u64 = 1;
+const NETLINK_DROP_MEMBERSHIP: u64 = 2;
+const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
+/// `IFA_F_TENTATIVE`, which an IPv6 address has when first told of.
+const IFA_F_TENTATIVE: u32 = 0x40;
 /// The multicast routing families, whose dumps find no route.
 const RTNL_FAMILY_IPMR: u8 = 128;
 const RTNL_FAMILY_IP6MR: u8 = 129;
@@ -175,18 +194,28 @@ const STATS64_LEN: usize = 25 * 8;
 pub(crate) struct Ports {
     bound: Mutex<BTreeMap<u32, Weak<NetlinkSocket>>>,
     rover: AtomicI32,
+    /// Every netlink socket of the namespace, which a notification goes
+    /// to when it is a member of the group.
+    all: Mutex<Vec<Weak<NetlinkSocket>>>,
 }
 impl Default for Ports {
     fn default() -> Self {
         Self {
             bound: Mutex::default(),
             rover: AtomicI32::new(-4097),
+            all: Mutex::default(),
         }
     }
 }
 impl Ports {
     fn lock(&self) -> MutexGuard<'_, BTreeMap<u32, Weak<NetlinkSocket>>> {
         self.bound.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// The sockets still open, the closed ones forgotten.
+    fn members(&self) -> Vec<Arc<NetlinkSocket>> {
+        let mut all = self.all.lock().unwrap_or_else(PoisonError::into_inner);
+        all.retain(|socket| socket.strong_count() > 0);
+        all.iter().filter_map(Weak::upgrade).collect()
     }
 }
 
@@ -202,8 +231,8 @@ struct Datagram {
 struct State {
     /// The port ID, once bound.
     port: Option<u32>,
-    /// The multicast groups `bind` asked for (the first 32).
-    groups: u32,
+    /// The multicast groups it is a member of, bit `g - 1` for group `g`.
+    groups: u64,
     /// Where a send without an address goes (`connect`): a port and a group
     /// number, 0 for none.
     peer: (u32, u32),
@@ -296,6 +325,13 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             ..State::default()
         }),
     });
+    socket
+        .network
+        .netlink
+        .all
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Arc::downgrade(&socket));
     c.files
         .install(socket, kind & CLOEXEC != 0, c.group.nofile())
         .map(u64::from)
@@ -376,16 +412,24 @@ impl NetlinkSocket {
     /// `bind`, as Linux's `netlink_bind`: a `sockaddr_nl` (`EINVAL` for a
     /// shorter address or another family); a bound socket takes only its
     /// own port again (`EINVAL`), and a port another socket has is
-    /// `EADDRINUSE`. Groups are noted, but no notification is ever sent.
+    /// `EADDRINUSE`. Its groups replace the first 32 the socket is a member
+    /// of; the multicast routing ones need `CAP_NET_ADMIN`
+    /// (`rtnetlink_bind`, `EPERM`).
     fn bind(&self, raw: &[u8], sender: Sender) -> Result<u64, Errno> {
         let (port, groups) = address(raw)?;
         let mut s = self.lock();
-        match s.port {
-            Some(own) if own != port => return Err(Errno::EINVAL),
-            Some(_) => {}
-            None => self.bind_port(&mut s, port, sender.pid)?,
+        if let Some(own) = s.port
+            && own != port
+        {
+            return Err(Errno::EINVAL);
         }
-        s.groups = groups;
+        if groups & PRIVILEGED_GROUPS != 0 && !sender.admin {
+            return Err(Errno::EPERM);
+        }
+        if s.port.is_none() {
+            self.bind_port(&mut s, port, sender.pid)?;
+        }
+        s.groups = (s.groups & !0xffff_ffff) | u64::from(groups);
         Ok(0)
     }
     /// `connect`, as `netlink_connect`: `AF_UNSPEC` forgets the peer; a
@@ -414,7 +458,7 @@ impl NetlinkSocket {
         let (port, groups) = if peer {
             (s.peer.0, group_mask(s.peer.1))
         } else {
-            (s.port.unwrap_or(0), s.groups)
+            (s.port.unwrap_or(0), s.groups as u32)
         };
         encode_address(port, groups)
     }
@@ -454,15 +498,27 @@ impl NetlinkSocket {
             target.deliver(&mut t, port, group, bytes.to_vec());
             return Ok(bytes.len());
         }
-        self.take(&mut s, bytes, port, sender);
+        let mut notices = Vec::new();
+        self.take(&mut s, bytes, port, sender, &mut notices);
+        drop(s);
+        notify(&self.network, notices, Some(self));
         Ok(bytes.len())
     }
     /// The kernel takes each message of a datagram from `port`, as Linux's
     /// `netlink_rcv_skb` does: it stops at one too short or longer than
     /// what is left; one that is no request, or a control message, is only
     /// acknowledged; an error, or any result with `NLM_F_ACK`, is answered
-    /// with `NLMSG_ERROR`, but for a dump that began.
-    fn take(&self, s: &mut State, mut bytes: &[u8], port: u32, sender: Sender) {
+    /// with `NLMSG_ERROR`, but for a dump that began. What a request
+    /// changes adds its notifications to `notices`, to go out once the
+    /// socket is unlocked.
+    fn take(
+        &self,
+        s: &mut State,
+        mut bytes: &[u8],
+        port: u32,
+        sender: Sender,
+        notices: &mut Vec<Notice>,
+    ) {
         while bytes.len() >= 16 {
             let header = Header::read(bytes);
             let len = header.len as usize;
@@ -473,7 +529,17 @@ impl NetlinkSocket {
             let result = if header.flags & NLM_F_REQUEST == 0 || header.kind < NLMSG_MIN_TYPE {
                 Ok(false)
             } else {
-                self.route(s, &header, &message[16..], port, sender)
+                let mut told = Vec::new();
+                let result = self.route(s, &header, &message[16..], port, sender, &mut told);
+                // This socket hears of what it changed as it happens, before
+                // its acknowledgement; the others once it is unlocked.
+                for notice in &told {
+                    if s.groups & (1u64 << (notice.group - 1)) != 0 && port != notice.origin {
+                        self.deliver(s, 0, notice.group, notice.bytes.clone());
+                    }
+                }
+                notices.extend(told);
+                result
             };
             match result {
                 Ok(true) => {}
@@ -501,6 +567,7 @@ impl NetlinkSocket {
         payload: &[u8],
         port: u32,
         sender: Sender,
+        notices: &mut Vec<Notice>,
     ) -> Result<bool, Errno> {
         if header.kind > RTM_MAX {
             return Err(EOPNOTSUPP);
@@ -567,7 +634,16 @@ impl NetlinkSocket {
                 Ok(false)
             }
             RTM_NEWADDR | RTM_DELADDR if matches!(family, AF_INET | AF_INET6) => {
-                change_address(&self.network, header, payload)?;
+                let events = change_address(&self.network, header, payload)?;
+                let echo = header.flags & NLM_F_ECHO != 0;
+                let told = told(events, header.seq, port, echo);
+                if echo {
+                    // `nlmsg_notify`'s own copy of an IPv4 address's.
+                    for notice in told.iter().filter(|n| n.origin == port && port != 0) {
+                        self.deliver(s, 0, 0, notice.bytes.clone());
+                    }
+                }
+                notices.extend(told);
                 Ok(false)
             }
             RTM_GETLINK => {
@@ -587,7 +663,7 @@ impl NetlinkSocket {
                         (flags & change) | (link_flags(&self.network) & !change)
                     } & IFF_UP
                         != 0;
-                    self.network.set_up(up);
+                    notices.extend(link_change(&self.network, up));
                 }
                 Ok(false)
             }
@@ -911,8 +987,21 @@ fn cacheinfo() -> [u8; 16] {
 /// `RTM_NEWADDR` for each IPv4 address of `lo`, in its order, as
 /// `inet_fill_ifaddr` gives them.
 fn ipv4_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
-    let mut messages = Vec::new();
-    for address in &network.addresses().v4 {
+    let addresses = network.addresses().v4.clone();
+    addresses
+        .iter()
+        .flat_map(|address| ipv4_address(address, RTM_NEWADDR, NLM_F_MULTI, seq, port))
+        .collect()
+}
+/// An IPv4 address's message of `kind`, with `flags`.
+fn ipv4_address(
+    address: &crate::interface::V4,
+    kind: u16,
+    flags: u16,
+    seq: u32,
+    port: u32,
+) -> Vec<u8> {
+    {
         let mut body = vec![AF_INET, address.prefix, address.flags as u8, address.scope];
         body.extend_from_slice(&1u32.to_le_bytes());
         if !address.address.is_unspecified() {
@@ -934,31 +1023,44 @@ fn ipv4_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
         }
         attribute(&mut body, IFA_FLAGS, &address.flags.to_le_bytes());
         attribute(&mut body, IFA_CACHEINFO, &cacheinfo());
-        messages.extend(message(RTM_NEWADDR, NLM_F_MULTI, seq, port, &body));
+        message(kind, flags, seq, port, &body)
     }
-    messages
 }
 /// `RTM_NEWADDR` for each IPv6 address of `lo`, in its order, as
 /// `inet6_fill_ifaddr` gives them.
 fn ipv6_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
-    let mut messages = Vec::new();
-    for address in &network.addresses().v6 {
+    let addresses = network.addresses().v6.clone();
+    addresses
+        .iter()
+        .flat_map(|address| ipv6_address(address, false, RTM_NEWADDR, NLM_F_MULTI, seq, port))
+        .collect()
+}
+/// An IPv6 address's message of `kind`, with `flags`, `tentative` or not.
+fn ipv6_address(
+    address: &crate::interface::V6,
+    tentative: bool,
+    kind: u16,
+    flags: u16,
+    seq: u32,
+    port: u32,
+) -> Vec<u8> {
+    {
+        let address_flags = address.flags | if tentative { IFA_F_TENTATIVE } else { 0 };
         let mut body = vec![
             AF_INET6,
             address.prefix,
-            address.flags as u8,
+            address_flags as u8,
             address.scope(),
         ];
         body.extend_from_slice(&1u32.to_le_bytes());
         attribute(&mut body, IFA_ADDRESS, &address.address.octets());
         attribute(&mut body, IFA_CACHEINFO, &cacheinfo());
-        attribute(&mut body, IFA_FLAGS, &address.flags.to_le_bytes());
+        attribute(&mut body, IFA_FLAGS, &address_flags.to_le_bytes());
         if address.proto != 0 {
             attribute(&mut body, IFA_PROTO, &[address.proto]);
         }
-        messages.extend(message(RTM_NEWADDR, NLM_F_MULTI, seq, port, &body));
+        message(kind, flags, seq, port, &body)
     }
-    messages
 }
 /// `RTM_NEWADDR` or `RTM_DELADDR` for `lo`, as `inet_rtm_newaddr`,
 /// `inet_rtm_deladdr`, `inet6_rtm_newaddr` and `inet6_rtm_deladdr` take
@@ -971,7 +1073,11 @@ fn ipv6_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
 /// `IFA_FLAGS` (of which `IFA_F_NOPREFIXROUTE` takes effect) and
 /// `IFA_PROTO` are kept; lifetimes (`IFA_CACHEINFO`) and `IFA_RT_PRIORITY`
 /// are not, and every address is permanent.
-fn change_address(network: &Network, header: &Header, payload: &[u8]) -> Result<(), Errno> {
+fn change_address(
+    network: &Network,
+    header: &Header,
+    payload: &[u8],
+) -> Result<Vec<crate::interface::Event>, Errno> {
     use core::net::{Ipv4Addr, Ipv6Addr};
     if payload.len() < 8 {
         return Err(Errno::EINVAL);
@@ -1024,7 +1130,7 @@ fn change_address(network: &Network, header: &Header, payload: &[u8]) -> Result<
         if !add {
             return network
                 .addresses()
-                .del_v4(local, address, prefix, label.as_deref());
+                .del_v4(local, address, prefix, label.as_deref(), up);
         }
         let local = local.unwrap_or(Ipv4Addr::UNSPECIFIED);
         let mut new = crate::interface::V4::new(local, address.unwrap_or(local), prefix, scope);
@@ -1100,6 +1206,17 @@ fn ipv4_route(
     port: u32,
     flags: u16,
 ) -> Vec<u8> {
+    ipv4_route_of(RTM_NEWROUTE, route, table, seq, port, flags)
+}
+/// [`ipv4_route`] as a message of `kind`.
+fn ipv4_route_of(
+    kind: u16,
+    route: crate::interface::Route4,
+    table: u8,
+    seq: u32,
+    port: u32,
+    flags: u16,
+) -> Vec<u8> {
     let scope = if route.kind == crate::interface::Kind::Broadcast {
         RT_SCOPE_LINK
     } else {
@@ -1111,12 +1228,22 @@ fn ipv4_route(
     attribute(&mut body, RTA_DST, &route.dst.octets());
     attribute(&mut body, RTA_PREFSRC, &route.source.octets());
     attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
-    message(RTM_NEWROUTE, flags, seq, port, &body)
+    message(kind, flags, seq, port, &body)
 }
 /// An IPv6 route, as `rt6_fill_node` gives it (with an empty
 /// `rta_cacheinfo`): a local one of the local table, metric 0, or a
 /// prefix route of the main table, metric 256.
 fn ipv6_route(route: crate::interface::Route6, seq: u32, port: u32, flags: u16) -> Vec<u8> {
+    ipv6_route_of(RTM_NEWROUTE, route, seq, port, flags)
+}
+/// [`ipv6_route`] as a message of `kind`.
+fn ipv6_route_of(
+    kind: u16,
+    route: crate::interface::Route6,
+    seq: u32,
+    port: u32,
+    flags: u16,
+) -> Vec<u8> {
     let local = route.kind == crate::interface::Kind::Local;
     let table = if local { RT_TABLE_LOCAL } else { RT_TABLE_MAIN };
     let mut body = route_header(
@@ -1133,7 +1260,7 @@ fn ipv6_route(route: crate::interface::Route6, seq: u32, port: u32, flags: u16) 
     attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &[0; RTA_CACHEINFO_LEN]);
     attribute(&mut body, RTA_PREF, &[0]);
-    message(RTM_NEWROUTE, flags, seq, port, &body)
+    message(kind, flags, seq, port, &body)
 }
 /// A route lookup (`RTM_GETROUTE` without a dump), as `inet_rtm_getroute`
 /// and `inet6_rtm_getroute` answer one for the destination `RTA_DST` names
@@ -1275,6 +1402,122 @@ fn ipv6_routes(network: &Network, seq: u32, port: u32) -> Vec<u8> {
         .into_iter()
         .flat_map(|route| ipv6_route(route, seq, port, NLM_F_MULTI))
         .collect()
+}
+/// A notification for the members of `group`, which goes to every one of
+/// them but the socket whose port is `origin` (`do_one_broadcast`): 0, so
+/// no unbound socket, or the port of a request with `NLM_F_ECHO`, which
+/// has its own copy instead (`nlmsg_notify`).
+pub(crate) struct Notice {
+    group: u32,
+    origin: u32,
+    bytes: Vec<u8>,
+}
+/// The notifications of `events`, as `rtmsg_ifa`, `inet6_ifa_notify`,
+/// `rtmsg_fib` and `inet6_rt_notify` make them. An IPv4 address's carries
+/// the request's `seq` and `port`, and with `echo` (`NLM_F_ECHO`) goes to
+/// the requester alone of the members at `port`; the rest carry none.
+fn told(events: Vec<crate::interface::Event>, seq: u32, port: u32, echo: bool) -> Vec<Notice> {
+    let origin = if echo { port } else { 0 };
+    use crate::interface::Event;
+    const CREATED: u16 = NLM_F_CREATE | NLM_F_EXCL;
+    events
+        .into_iter()
+        .map(|event| {
+            let (group, origin, bytes) = match event {
+                Event::NewAddr4(a) => (
+                    RTNLGRP_IPV4_IFADDR,
+                    origin,
+                    ipv4_address(&a, RTM_NEWADDR, 0, seq, port),
+                ),
+                Event::DelAddr4(a) => (
+                    RTNLGRP_IPV4_IFADDR,
+                    origin,
+                    ipv4_address(&a, RTM_DELADDR, 0, seq, port),
+                ),
+                Event::NewRoute4(r) => (
+                    RTNLGRP_IPV4_ROUTE,
+                    0,
+                    ipv4_route_of(RTM_NEWROUTE, r, RT_TABLE_LOCAL, 0, 0, CREATED),
+                ),
+                Event::DelRoute4(r) => (
+                    RTNLGRP_IPV4_ROUTE,
+                    0,
+                    ipv4_route_of(RTM_DELROUTE, r, RT_TABLE_LOCAL, 0, 0, 0),
+                ),
+                Event::NewAddr6(a, tentative) => (
+                    RTNLGRP_IPV6_IFADDR,
+                    0,
+                    ipv6_address(&a, tentative, RTM_NEWADDR, 0, 0, 0),
+                ),
+                Event::DelAddr6(a) => (
+                    RTNLGRP_IPV6_IFADDR,
+                    0,
+                    ipv6_address(&a, false, RTM_DELADDR, 0, 0, 0),
+                ),
+                Event::NewRoute6(r) => (
+                    RTNLGRP_IPV6_ROUTE,
+                    0,
+                    ipv6_route_of(RTM_NEWROUTE, r, 0, 0, CREATED),
+                ),
+                Event::DelRoute6(r) => (
+                    RTNLGRP_IPV6_ROUTE,
+                    0,
+                    ipv6_route_of(RTM_DELROUTE, r, 0, 0, 0),
+                ),
+            };
+            Notice {
+                group,
+                origin,
+                bytes,
+            }
+        })
+        .collect()
+}
+/// Brings `network`'s loopback up or down: `None` when it already is, else
+/// the notifications of it, `lo`'s `RTM_NEWLINK` with `IFF_UP` changed
+/// first (`rtmsg_ifinfo`), then what happens to its addresses and routes.
+fn link_change(network: &Network, up: bool) -> Vec<Notice> {
+    let Some(events) = network.set_up(up) else {
+        return Vec::new();
+    };
+    let mut link = link_message(network, 0, 0, 0);
+    link[28..32].copy_from_slice(&IFF_UP.to_le_bytes());
+    let mut notices = vec![Notice {
+        group: RTNLGRP_LINK,
+        origin: 0,
+        bytes: link,
+    }];
+    notices.extend(told(events, 0, 0, false));
+    notices
+}
+/// Brings `network`'s loopback up or down, as `SIOCSIFFLAGS` does, and
+/// tells netlink's members of it.
+pub(crate) fn set_up(network: &Network, up: bool) {
+    let notices = link_change(network, up);
+    notify(network, notices, None);
+}
+/// Sends each notification to the namespace's sockets that are members of
+/// its group, each its own datagram, as `netlink_broadcast` does; a socket
+/// whose receive buffer is full loses it, with `ENOBUFS` for its next
+/// receive. No socket is locked but the one it goes to, nor `except`,
+/// which has had them already.
+fn notify(network: &Network, notices: Vec<Notice>, except: Option<&NetlinkSocket>) {
+    if notices.is_empty() {
+        return;
+    }
+    let members = network.netlink.members();
+    for notice in notices {
+        let bit = 1u64 << (notice.group - 1);
+        for socket in &members {
+            if except.is_some_and(|except| core::ptr::eq(except, Arc::as_ptr(socket))) {
+                continue;
+            }
+            let mut s = socket.lock();
+            if s.groups & bit != 0 && s.port.unwrap_or(0) != notice.origin {
+                socket.deliver(&mut s, 0, notice.group, notice.bytes.clone());
+            }
+        }
+    }
 }
 /// The port and groups of a `sockaddr_nl`: `EINVAL` for fewer than its 12
 /// bytes or another family.
@@ -1481,6 +1724,24 @@ fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
                 s.receive_buffer = (value * 2).max(MIN_RECEIVE_BUFFER);
             }
         }
+        (SOL_NETLINK, NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP) => {
+            // `netlink_setsockopt`: a group past `RTNLGRP_MAX`, or 0, is
+            // `EINVAL`, and joining a multicast routing one needs
+            // `CAP_NET_ADMIN` (`rtnetlink_bind`).
+            let group = option_int(c, at, len)? as u32;
+            if group == 0 || group > GROUPS {
+                return Err(Errno::EINVAL);
+            }
+            let bit = 1u64 << (group - 1);
+            if name == NETLINK_ADD_MEMBERSHIP {
+                if bit & u64::from(PRIVILEGED_GROUPS) != 0 && !socket.sender(c).admin {
+                    return Err(Errno::EPERM);
+                }
+                socket.lock().groups |= bit;
+            } else {
+                socket.lock().groups &= !bit;
+            }
+        }
         (SOL_NETLINK, NETLINK_CAP_ACK | NETLINK_EXT_ACK | NETLINK_GET_STRICT_CHK) => {
             let on = option_int(c, at, len)? != 0;
             let mut s = socket.lock();
@@ -1504,9 +1765,26 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
         .read(GuestAddr(len_at), &mut raw)
         .map_err(|_| Errno::EFAULT)?;
     let room = usize::try_from(i32::from_le_bytes(raw)).map_err(|_| Errno::EINVAL)?;
+    if (level, name) == (SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS) {
+        // Each whole word that has room, and the length of them all.
+        let words = socket.lock().groups.to_le_bytes();
+        let all = (GROUPS as usize).div_ceil(32) * 4;
+        let n = room / 4 * 4;
+        c.mem
+            .write(GuestAddr(at), &words[..n.min(all)])
+            .map_err(|_| Errno::EFAULT)?;
+        c.mem
+            .write(GuestAddr(len_at), &(all as u32).to_le_bytes())
+            .map_err(|_| Errno::EFAULT)?;
+        return Ok(0);
+    }
     let value: Vec<u8> = {
         let mut s = socket.lock();
         match (level, name) {
+            // Set-only options.
+            (SOL_NETLINK, NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP) => {
+                return Err(EOPNOTSUPP);
+            }
             (SOL_SOCKET, 20 | 66) => s.receive_timeout.timeval().to_vec(),
             (SOL_SOCKET, 3) => (socket.kind as i32).to_le_bytes().to_vec(),
             (SOL_SOCKET, 4) => s.error.take().map_or(0, |e| e.0).to_le_bytes().to_vec(),

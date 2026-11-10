@@ -789,7 +789,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
   `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。
   そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`（`ip addr add` と `del` も）、
-  `ip route`、`ip route get`、`ip link set lo up` が動きます。
+  `ip route`、`ip route get`、`ip link set lo up`、`ip monitor` が動きます。
   - **ソケット:** Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが
     持つものは `EADDRINUSE`）を、0 ならプロセスの ID を、それが使われていれば負の ID を
     取ります。bind していないソケットは、`connect` か最初の送信で同じように bind されます。
@@ -846,6 +846,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     アドレスはそれ自身だけをローカルにします。IPv4 にまだ経路が 1 つもなければ、Linux の
     `inet_addr_type` がそのときどのアドレスもブロードキャストと見るのと同じく、ソケットは
     どの IPv4 のアドレスにも bind できます。
+  - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
+    `NETLINK_ADD_MEMBERSHIP` が足すグループのメンバーになります。グループは `RTNLGRP_*` の
+    1 から 39 で（0 とそれを超えるものは `EINVAL`、マルチキャストの経路の 30 と 31 には
+    `CAP_NET_ADMIN` が要り、なければ `EPERM`）、`NETLINK_DROP_MEMBERSHIP` で抜け、
+    `NETLINK_LIST_MEMBERSHIPS` は 2 ワードで全部を返します。`lo` の変化は、名前空間の中の
+    そのグループのメンバーに、1 つずつ別のデータグラムで、Linux の順に伝えます。上げ下げには
+    `ifi_change` に `IFF_UP` を持つ `RTM_NEWLINK`（`RTNLGRP_LINK`）を、それから
+    `inetdev_event`、`fib_add_ifaddr`、`fib_del_ifaddr`、`addrconf`、`rt6_disable_ip` と
+    同じく、増えたり消えたりしたアドレス（`RTNLGRP_IPV4_IFADDR`、`RTNLGRP_IPV6_IFADDR`）と
+    経路（`RTNLGRP_IPV4_ROUTE`、`RTNLGRP_IPV6_ROUTE`。新しいものは
+    `NLM_F_CREATE | NLM_F_EXCL`）を伝えます。IPv4 のアドレスのものはリクエストの
+    シーケンス番号とポートを持ち、IPv6 のアドレスは足したときに仮のものと仮でないものの
+    2 度伝えます。bind していないソケットには何も届きません。IPv4 のアドレスの変化を
+    求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を付ければ自分の写しとして届きます。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、

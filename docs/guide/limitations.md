@@ -175,7 +175,8 @@ verified.
     offset. `RWF_NOWAIT` behaves as on ext4 for every regular file: a read
     takes it, a write gives `EOPNOTSUPP`, where tmpfs refuses both and other
     filesystems may take a write, and a read never finds its pages uncached
-    (Linux's `EAGAIN`).
+    (Linux's `EAGAIN`). The flags of kernels after 6.12, `RWF_DONTCACHE`
+    and `RWF_NOSIGNAL`, are unknown here (`EOPNOTSUPP`).
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`,
     cannot be set: `setitimer` gives `EINVAL` for them, where Linux sets them
     and sends `SIGVTALRM` and `SIGPROF`, and `getitimer` shows them disarmed.

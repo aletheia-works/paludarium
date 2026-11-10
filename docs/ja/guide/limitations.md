@@ -152,7 +152,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     `RWF_NOWAIT` は、どの通常のファイルでも ext4 と同じく、読み込みは受け付け、書き込みは
     `EOPNOTSUPP` を返します。tmpfs はどちらも断り、ほかのファイルシステムは書き込みを
     受け付けることがあります。また、読み込みでページがキャッシュにない（Linux の `EAGAIN`）
-    ことはありません。
+    ことはありません。6.12 より後のカーネルのフラグ（`RWF_DONTCACHE` と `RWF_NOSIGNAL`）は
+    知らないフラグとして扱います（`EOPNOTSUPP`）。
   - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は設定できません。
     Linux はこれを設定して `SIGVTALRM` と `SIGPROF` を送りますが、`setitimer` は `EINVAL` を
     返し、`getitimer` は設定されていないものとして見せます。

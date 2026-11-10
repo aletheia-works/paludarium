@@ -185,7 +185,10 @@ verified.
     and sends `SIGVTALRM` and `SIGPROF`, and `getitimer` shows them disarmed.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
     socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
-    the superblock of its pseudo filesystem and gives its counts (0).
+    the superblock of its pseudo filesystem and gives its counts (0). A
+    file in `/proc` or `/dev` has the `st_dev` of the mount holding the
+    path, so `ustat` of it gives that mount's counts, where Linux gives
+    procfs's or devtmpfs's.
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared
     memory, semaphores and message queues are Linux's defaults, which
     `/proc/sys/kernel` cannot change. A message queue's waiting senders

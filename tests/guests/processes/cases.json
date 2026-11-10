@@ -177,6 +177,7 @@
     {"name":"etxtbsy","binary":"process"},
     {"name":"shm","binary":"process"},
     {"name":"sem","binary":"process"},
+    {"name":"msg","binary":"process"},
     {"name":"rseq","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},

@@ -28,6 +28,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <sys/msg.h>
 #include <grp.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -5067,6 +5068,189 @@ static void *semx_thread(void *arg) {
     int id = *(int *)arg;
     semx_op(id, 0, 1, SEMX_UNDO);
     return NULL;
+}
+/* The msg case: raw msgsnd and msgrcv of one buffer. musl's sys/msg.h has
+   no MSG_COPY, Linux's 040000. */
+#ifndef MSG_COPY
+#define MSG_COPY 040000
+#endif
+static struct {
+    long kind;
+    char text[64];
+} msgx_buf;
+static long msgx_send(int id, long kind, const char *text, int flags) {
+    msgx_buf.kind = kind;
+    size_t n = strlen(text);
+    memcpy(msgx_buf.text, text, n);
+    errno = 0;
+    long r = syscall(SYS_msgsnd, id, &msgx_buf, n, flags);
+    return r < 0 ? -errno : r;
+}
+/* Prints what a receive gave: its result or error, and the type and text. */
+static void msgx_show(const char *label, int id, size_t size, long kind, int flags) {
+    memset(&msgx_buf, 0, sizeof msgx_buf);
+    errno = 0;
+    long r = syscall(SYS_msgrcv, id, &msgx_buf, size, kind, flags);
+    if (r < 0) {
+        printf(" %s=-%d", label, errno);
+    } else {
+        printf(" %s=%ld:%ld:%.*s", label, r, msgx_buf.kind, (int)r, msgx_buf.text);
+    }
+}
+static volatile sig_atomic_t msgx_caught;
+static void msgx_handler(int signal) {
+    (void)signal;
+    msgx_caught++;
+}
+/* msqid64_ds: msg_cbytes, msg_qnum, msg_qbytes, and whether msg_lspid and
+   msg_lrpid are `sender` and `receiver`. */
+static void msgx_status(const char *label, int id, pid_t sender, pid_t receiver) {
+    unsigned char ds[120] = {0};
+    long r = syscall(SYS_msgctl, id, 2 /* IPC_STAT */, ds);
+    unsigned long cbytes, qnum, qbytes;
+    int lspid, lrpid;
+    unsigned mode;
+    memcpy(&mode, ds + 20, 4);
+    memcpy(&cbytes, ds + 72, 8);
+    memcpy(&qnum, ds + 80, 8);
+    memcpy(&qbytes, ds + 88, 8);
+    memcpy(&lspid, ds + 96, 4);
+    memcpy(&lrpid, ds + 100, 4);
+    printf("%s: stat=%ld mode=%o cbytes=%lu qnum=%lu qbytes=%lu lspid=%d lrpid=%d\n", label, r, mode, cbytes,
+           qnum, qbytes, lspid == sender, lrpid == receiver);
+}
+static int msg_case(void) {
+    /* Its own IPC namespace, whose queues and counts are the case's. */
+    if (syscall(SYS_unshare, CLONE_NEWIPC)) return 10;
+    int key = 0x4d000000 | (getpid() & 0xffffff);
+    errno = 0;
+    long missing = syscall(SYS_msgget, key, 0600);
+    printf("get missing=%ld errno=%d", missing, errno);
+    int id = (int)syscall(SYS_msgget, key, IPC_CREAT | IPC_EXCL | 0640);
+    if (id < 0) return 11;
+    errno = 0;
+    long again = syscall(SYS_msgget, key, IPC_CREAT | IPC_EXCL | 0600);
+    int again_errno = errno;
+    printf(" exclusive=%ld errno=%d same=%d\n", again, again_errno, syscall(SYS_msgget, key, 0) == id);
+    /* Checks before anything is sent; a bad address comes last, below. */
+    long zero = msgx_send(id, 0, "x", 0);
+    errno = 0;
+    long big = syscall(SYS_msgsnd, id, &msgx_buf, 8193, 0) < 0 ? -errno : 0;
+    long other_id = msgx_send(id + 1, 1, "x", 0);
+    printf("send zero=%ld big=%ld other=%ld\n", zero, big, other_id);
+    const char *texts[] = {"three", "one", "two", "uno"};
+    long kinds[] = {3, 1, 2, 1};
+    for (int i = 0; i < 4; i++) {
+        long sent = msgx_send(id, kinds[i], texts[i], 0);
+        printf("%s%ld", i ? "," : "sent=", sent);
+    }
+    printf("\n");
+    msgx_status("after-send", id, getpid(), 0);
+    printf("receive");
+    msgx_show("copy", id, 64, 2, MSG_COPY | IPC_NOWAIT);
+    msgx_show("copy-wait", id, 64, 2, MSG_COPY);
+    msgx_show("copy-none", id, 64, 9, MSG_COPY | IPC_NOWAIT);
+    msgx_show("small", id, 2, 2, 0);
+    msgx_show("cut", id, 2, 2, MSG_NOERROR);
+    msgx_show("except", id, 64, 3, MSG_EXCEPT);
+    msgx_show("lowest", id, 64, -2, 0);
+    msgx_show("any", id, 64, 0, 0);
+    msgx_show("empty", id, 64, 0, IPC_NOWAIT);
+    printf("\n");
+    msgx_status("after-receive", id, getpid(), getpid());
+    /* A smaller queue fills. */
+    unsigned char ds[120] = {0};
+    syscall(SYS_msgctl, id, 2, ds);
+    unsigned long qbytes = 4;
+    memcpy(ds + 88, &qbytes, 8);
+    long set = syscall(SYS_msgctl, id, 1 /* IPC_SET */, ds);
+    long fits = msgx_send(id, 1, "abc", 0);
+    long full = msgx_send(id, 1, "de", IPC_NOWAIT);
+    printf("set=%ld full=%ld,%ld", set, fits, full);
+    msgx_show("drain", id, 64, 0, 0);
+    printf("\n");
+    qbytes = 16384;
+    memcpy(ds + 88, &qbytes, 8);
+    syscall(SYS_msgctl, id, 1, ds);
+    /* A waiting receiver takes the message it waits for as it is sent. */
+    int ready[2];
+    if (pipe(ready)) return 12;
+    fflush(stdout);
+    pid_t waiter = child();
+    if (waiter == 0) {
+        alarm(10);
+        if (write(ready[1], "x", 1) != 1) _exit(90);
+        printf("waiter");
+        msgx_show("first", id, 64, 5, 0);
+        printf("\n");
+        fflush(stdout);
+        /* A signal it handles ends the next wait with EINTR, with
+           SA_RESTART too. */
+        for (int restart = 0; restart < 2; restart++) {
+            struct sigaction action = {0};
+            action.sa_handler = msgx_handler;
+            action.sa_flags = restart ? SA_RESTART : 0;
+            sigaction(SIGUSR1, &action, NULL);
+            if (write(ready[1], "x", 1) != 1) _exit(91);
+            printf("waiter restart=%d", restart);
+            msgx_show("signalled", id, 64, 7, 0);
+            printf(" caught=%d\n", (int)msgx_caught);
+            fflush(stdout);
+        }
+        if (write(ready[1], "x", 1) != 1) _exit(92);
+        printf("waiter");
+        /* A type no message has: the wait ends with the queue. */
+        msgx_show("removed", id, 64, 9, 0);
+        printf("\n");
+        fflush(stdout);
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 13;
+    usleep(100000);
+    long sent_other = msgx_send(id, 4, "four", 0);
+    long sent_wanted = msgx_send(id, 5, "five", 0);
+    printf("sent-other=%ld sent-wanted=%ld\n", sent_other, sent_wanted);
+    fflush(stdout);
+    for (int i = 0; i < 2; i++) {
+        if (read(ready[0], &byte, 1) != 1) return 14;
+        usleep(100000);
+        kill(waiter, SIGUSR1);
+    }
+    if (read(ready[0], &byte, 1) != 1) return 15;
+    usleep(100000);
+    /* The other message is still there, for no one. */
+    msgx_status("before-removal", id, getpid(), waiter);
+    printf("removal=%ld\n", syscall(SYS_msgctl, id, IPC_RMID, NULL));
+    fflush(stdout);
+    result("waiter", reaped(waiter));
+    errno = 0;
+    long removed = syscall(SYS_msgctl, id, 2, ds);
+    printf("stat-removed=%ld errno=%d\n", removed, errno);
+    /* The namespace's limits and what is in use in it. */
+    int info[8] = {0};
+    long max = syscall(SYS_msgctl, 0, 3 /* IPC_INFO */, info);
+    printf("info=%ld pool=%d map=%d max=%d mnb=%d mni=%d ssz=%d tql=%d seg=%u\n", max, info[0], info[1], info[2],
+           info[3], info[4], info[5], info[6], info[7] & 0xffff);
+    int other = (int)syscall(SYS_msgget, IPC_PRIVATE, 0600);
+    msgx_send(other, 1, "abc", 0);
+    long in_use = syscall(SYS_msgctl, 0, 12 /* MSG_INFO */, info);
+    printf("in-use=%ld queues=%d messages=%d bytes=%d\n", in_use, info[0], info[1], info[6]);
+    /* A text at no address, and a buffer at none, which takes the message
+       all the same. */
+    errno = 0;
+    long fault = syscall(SYS_msgsnd, other, NULL, 1, 0);
+    int fault_errno = errno;
+    errno = 0;
+    long lost = syscall(SYS_msgrcv, other, NULL, 64, 0, 0);
+    int lost_errno = errno;
+    unsigned char last[120] = {0};
+    syscall(SYS_msgctl, other, 2, last);
+    unsigned long qnum;
+    memcpy(&qnum, last + 80, 8);
+    printf("fault send=%ld errno=%d receive=%ld errno=%d left=%lu\n", fault, fault_errno, lost, lost_errno, qnum);
+    syscall(SYS_msgctl, other, IPC_RMID, NULL);
+    return 0;
 }
 static int sem_case(void) {
     int key = 0x5c000000 | (getpid() & 0xffffff);
@@ -15012,6 +15196,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "shm")) return shm_case();
     if (!strcmp(mode, "sem")) return sem_case();
+    if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */

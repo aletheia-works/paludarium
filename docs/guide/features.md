@@ -56,7 +56,7 @@ kernel.
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
-| System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores) |
+| System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -590,6 +590,25 @@ kernel.
   shares the list applies it as it ends, or as it leaves it with `unshare`
   (`CLONE_SYSVSEM` or `CLONE_NEWIPC`) or `setns` to another IPC namespace,
   cut to 0 and `SEMVMX` as Linux cuts them.
+- System V message queues (`msgget`, `msgsnd`, `msgrcv`, `msgctl`) belong to
+  the thread's IPC namespace too, with Linux's checks in Linux's order (as
+  `ipc/msg.c`) and its default limits (`MSGMAX` 8192, `MSGMNB` 16384,
+  `MSGMNI` 32000). A queue holds as many bytes as its `msg_qbytes`, and as
+  many messages; a send to a full one waits, unless `IPC_NOWAIT`
+  (`EAGAIN`), until a receive or `IPC_SET` makes room, the queue is
+  removed (`EIDRM`) or a signal comes. `msgrcv` takes the first message, the
+  first of a type, the first of another type (`MSG_EXCEPT`) or the lowest
+  type up to a bound (a negative `msgtyp`); one longer than the buffer is
+  `E2BIG`, unless `MSG_NOERROR` cuts it, and `MSG_COPY` with `IPC_NOWAIT`
+  copies the message at a position and leaves it. With none, it waits,
+  unless `IPC_NOWAIT` (`ENOMSG`), in the queue's list of receivers: a
+  message sent goes to the first that takes it, as Linux's
+  `pipelined_send`, which tells one whose buffer is too small `E2BIG`. A
+  signal ends either wait with `EINTR`, which a signal that runs no
+  handler restarts (`ERESTARTNOHAND`). `msgctl` has `IPC_STAT`, `MSG_STAT`,
+  `MSG_STAT_ANY` (the processes in the caller's PID namespace), `IPC_SET`
+  (past `MSGMNB` with `CAP_SYS_RESOURCE`), `IPC_RMID`, `IPC_INFO` and
+  `MSG_INFO`.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux

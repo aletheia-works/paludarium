@@ -264,6 +264,10 @@ impl SyscallTable {
         handlers.insert(65, crate::sem::sys_semop);
         handlers.insert(66, crate::sem::sys_semctl);
         handlers.insert(220, crate::sem::sys_semtimedop);
+        handlers.insert(68, crate::msg::sys_msgget);
+        handlers.insert(69, crate::msg::sys_msgsnd);
+        handlers.insert(70, crate::msg::sys_msgrcv);
+        handlers.insert(71, crate::msg::sys_msgctl);
         handlers.insert(334, crate::rseq::sys_rseq);
         handlers.insert(444, |c, a| {
             Outcome::Return(

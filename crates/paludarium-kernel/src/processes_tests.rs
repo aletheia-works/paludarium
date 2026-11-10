@@ -4957,3 +4957,268 @@ mod sem {
         assert_eq!(semctl(&mut k, &mut t, &m, id, 0, GETVAL, 0), 1);
     }
 }
+mod msg {
+    use super::*;
+    const IPC_CREAT: u64 = 0o1000;
+    const IPC_EXCL: u64 = 0o2000;
+    const IPC_NOWAIT: u64 = 0o4000;
+    const MSG_NOERROR: u64 = 0o10000;
+    const MSG_EXCEPT: u64 = 0o20000;
+    const MSG_COPY: u64 = 0o40000;
+    const IPC_RMID: u64 = 0;
+    const IPC_SET: u64 = 1;
+    const IPC_STAT: u64 = 2;
+    const IPC_INFO: u64 = 3;
+    const MSG_STAT: u64 = 11;
+    const MSG_INFO: u64 = 12;
+    const BUF: u64 = DATA + 0x400;
+    const DS: u64 = DATA + 0x800;
+    fn e(errno: i32) -> u64 {
+        Errno(errno).to_syscall_return()
+    }
+    fn send(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        id: u64,
+        kind: i64,
+        text: &[u8],
+        flag: u64,
+    ) -> u64 {
+        m.write_u64(GuestAddr(BUF), kind as u64).unwrap();
+        m.write(GuestAddr(BUF + 8), text).unwrap();
+        syscall(k, t, m, 69, [id, BUF, text.len() as u64, flag, 0, 0])
+    }
+    /// What `msgrcv` gives: its result, and the type and text it wrote.
+    fn receive(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        id: u64,
+        size: u64,
+        kind: i64,
+        flag: u64,
+    ) -> (u64, i64, Vec<u8>) {
+        m.write(GuestAddr(BUF), &[0; 64]).unwrap();
+        let r = syscall(k, t, m, 70, [id, BUF, size, kind as u64, flag, 0]);
+        let mut text = vec![0; if r < 64 { r as usize } else { 0 }];
+        m.read(GuestAddr(BUF + 8), &mut text).unwrap();
+        (r, m.read_u64(GuestAddr(BUF)).unwrap() as i64, text)
+    }
+    /// `msg_cbytes`, `msg_qnum`, `msg_qbytes`, `msg_lspid` and `msg_lrpid`.
+    fn status(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, id: u64) -> [u64; 5] {
+        assert_eq!(syscall(k, t, m, 71, [id, IPC_STAT, DS, 0, 0, 0]), 0);
+        let word = |at: u64| m.read_u64(GuestAddr(DS + at)).unwrap();
+        [
+            word(72),
+            word(80),
+            word(88),
+            word(96) & 0xffff_ffff,
+            word(96) >> 32,
+        ]
+    }
+    #[test]
+    fn msgget_finds_makes_and_refuses_as_ipcget() {
+        let (mut k, mut t, m) = setup();
+        let private = syscall(&mut k, &mut t, &m, 68, [0, 0o600, 0, 0, 0, 0]);
+        assert!(private < 1 << 31);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 68, [7, 0o600, 0, 0, 0, 0]),
+            e(2)
+        );
+        let keyed = syscall(&mut k, &mut t, &m, 68, [7, IPC_CREAT | 0o600, 0, 0, 0, 0]);
+        assert_eq!(syscall(&mut k, &mut t, &m, 68, [7, 0, 0, 0, 0, 0]), keyed);
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                68,
+                [7, IPC_CREAT | IPC_EXCL, 0, 0, 0, 0]
+            ),
+            e(17)
+        );
+        t.state.credentials = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 68, [7, 0o400, 0, 0, 0, 0]),
+            e(13)
+        );
+    }
+    #[test]
+    fn messages_come_out_by_the_type_asked_for() {
+        let (mut k, mut t, m) = setup();
+        let id = syscall(&mut k, &mut t, &m, 68, [0, 0o600, 0, 0, 0, 0]);
+        for (kind, text) in [(3, &b"three"[..]), (1, b"one"), (2, b"two"), (1, b"uno")] {
+            assert_eq!(send(&mut k, &mut t, &m, id, kind, text, 0), 0);
+        }
+        assert_eq!(status(&mut k, &mut t, &m, id), [14, 4, 16384, 1, 0]);
+        // MSG_COPY copies by position and leaves it there.
+        assert_eq!(
+            receive(&mut k, &mut t, &m, id, 64, 2, MSG_COPY | IPC_NOWAIT),
+            (3, 2, b"two".to_vec())
+        );
+        assert_eq!(
+            receive(&mut k, &mut t, &m, id, 64, 2, MSG_COPY),
+            (e(22), 0, vec![])
+        );
+        assert_eq!(
+            receive(&mut k, &mut t, &m, id, 64, 9, MSG_COPY | IPC_NOWAIT).0,
+            e(42)
+        );
+        // Too small a buffer is E2BIG, unless MSG_NOERROR cuts the text.
+        assert_eq!(receive(&mut k, &mut t, &m, id, 2, 2, 0).0, e(7));
+        assert_eq!(
+            receive(&mut k, &mut t, &m, id, 2, 2, MSG_NOERROR),
+            (2, 2, b"tw".to_vec())
+        );
+        assert_eq!(
+            receive(&mut k, &mut t, &m, id, 64, 3, MSG_EXCEPT),
+            (3, 1, b"one".to_vec())
+        );
+        assert_eq!(
+            receive(&mut k, &mut t, &m, id, 64, -2, 0),
+            (3, 1, b"uno".to_vec())
+        );
+        assert_eq!(
+            receive(&mut k, &mut t, &m, id, 64, 0, 0),
+            (5, 3, b"three".to_vec())
+        );
+        assert_eq!(receive(&mut k, &mut t, &m, id, 64, 0, IPC_NOWAIT).0, e(42));
+        assert_eq!(status(&mut k, &mut t, &m, id), [0, 0, 16384, 1, 1]);
+    }
+    #[test]
+    fn calls_check_in_linux_order() {
+        let (mut k, mut t, m) = setup();
+        let id = syscall(&mut k, &mut t, &m, 68, [0, 0o600, 0, 0, 0, 0]);
+        assert_eq!(send(&mut k, &mut t, &m, id, 0, b"x", 0), e(22));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 69, [id, BUF, 8193, 0, 0, 0]),
+            e(22)
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 69, [id, 0, 1, 0, 0, 0]), e(14));
+        assert_eq!(send(&mut k, &mut t, &m, id + 1, 1, b"x", 0), e(22));
+        assert_eq!(
+            send(&mut k, &mut t, &m, u64::from(u32::MAX), 1, b"x", 0),
+            e(22)
+        );
+        assert_eq!(receive(&mut k, &mut t, &m, id, u64::MAX, 0, 0).0, e(22));
+        assert_eq!(
+            receive(
+                &mut k,
+                &mut t,
+                &m,
+                id,
+                8,
+                0,
+                MSG_COPY | MSG_EXCEPT | IPC_NOWAIT
+            )
+            .0,
+            e(22)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id, 0x100 | IPC_STAT, DS, 0, 0, 0]),
+            e(22)
+        );
+        // A full queue: EAGAIN without waiting.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id, IPC_STAT, DS, 0, 0, 0]),
+            0
+        );
+        m.write_u64(GuestAddr(DS + 88), 4).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id, IPC_SET, DS, 0, 0, 0]),
+            0
+        );
+        assert_eq!(send(&mut k, &mut t, &m, id, 1, b"abc", 0), 0);
+        assert_eq!(send(&mut k, &mut t, &m, id, 1, b"de", IPC_NOWAIT), e(11));
+        // More than MSGMNB needs CAP_SYS_RESOURCE; another's queue, its owner.
+        m.write_u64(GuestAddr(DS + 88), 16385).unwrap();
+        let user = t.state.credentials.setresuid(1000, 1000, 1000).unwrap();
+        let root = std::mem::replace(&mut t.state.credentials, user);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id, IPC_SET, DS, 0, 0, 0]),
+            e(1)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id, IPC_RMID, 0, 0, 0, 0]),
+            e(1)
+        );
+        assert_eq!(send(&mut k, &mut t, &m, id, 1, b"x", IPC_NOWAIT), e(13));
+        t.state.credentials = root;
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id, IPC_SET, DS, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id, IPC_RMID, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id, IPC_STAT, DS, 0, 0, 0]),
+            e(22)
+        );
+    }
+    #[test]
+    fn a_waiting_receiver_takes_a_message_sent_and_hears_of_the_removal() {
+        let (mut k, mut t, m) = setup();
+        let id = syscall(&mut k, &mut t, &m, 68, [0, 0o600, 0, 0, 0, 0]);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let child = u64::from(ct.tid);
+        let receiver = std::thread::spawn(move || {
+            let first = receive(&mut c, &mut ct, &cm, id, 64, 5, 0);
+            let second = receive(&mut c, &mut ct, &cm, id, 64, 0, 0);
+            (first, second)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Not the type it waits for, then the one.
+        assert_eq!(send(&mut k, &mut t, &m, id, 4, b"four", 0), 0);
+        assert_eq!(send(&mut k, &mut t, &m, id, 5, b"five", 0), 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while status(&mut k, &mut t, &m, id)[4] != child {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(status(&mut k, &mut t, &m, id)[..2], [4, 1]);
+        assert_eq!(receive(&mut k, &mut t, &m, id, 64, 4, 0).0, 4);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id, IPC_RMID, 0, 0, 0, 0]),
+            0
+        );
+        let (first, second) = receiver.join().unwrap();
+        assert_eq!(first, (4, 5, b"five".to_vec()));
+        assert_eq!(second.0, e(43));
+    }
+    #[test]
+    fn info_gives_linux_defaults_and_what_is_in_use() {
+        let (mut k, mut t, m) = setup();
+        let info = |k: &mut Kernel, t: &mut Thread, cmd: u64| {
+            let r = syscall(k, t, &m, 71, [0, cmd, DS, 0, 0, 0]);
+            let mut raw = [0; 32];
+            m.read(GuestAddr(DS), &mut raw).unwrap();
+            let words: Vec<i32> = (0..7)
+                .map(|i| i32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap()))
+                .collect();
+            (r, words, u16::from_le_bytes([raw[28], raw[29]]))
+        };
+        assert_eq!(
+            info(&mut k, &mut t, IPC_INFO),
+            (
+                0,
+                vec![512_000, 16384, 8192, 16384, 32000, 16, 16384],
+                0xffff
+            )
+        );
+        let id = syscall(&mut k, &mut t, &m, 68, [0, 0o600, 0, 0, 0, 0]);
+        assert_eq!(send(&mut k, &mut t, &m, id, 1, b"abc", 0), 0);
+        assert_eq!(
+            info(&mut k, &mut t, MSG_INFO).1,
+            vec![1, 1, 8192, 16384, 32000, 16, 3]
+        );
+        // MSG_STAT takes an index and gives the ID.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [id & 0x7fff, MSG_STAT, DS, 0, 0, 0]),
+            id
+        );
+    }
+}

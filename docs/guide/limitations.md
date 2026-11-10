@@ -153,10 +153,11 @@ verified.
     them. Programs check for that and carry on. Saying yes would be wrong
     without the rest: protection keys need the CPU feature, which `CPUID` does
     not report, and io_uring's rings would do no work.
-  - System V message queues (`msgget`, `msgsnd`, `msgrcv`, `msgctl`) are
-    too; only its shared memory and semaphores are implemented. There is no
-    `/proc/sysvipc`, and the limits of shared memory and semaphores are
-    Linux's defaults, which `/proc/sys/kernel` cannot change.
+  - System V IPC has no `/proc/sysvipc`, and the limits of its shared
+    memory, semaphores and message queues are Linux's defaults, which
+    `/proc/sys/kernel` cannot change. A message queue's waiting senders
+    all look again whenever it changes, where Linux wakes them in the order
+    they began only while each one's message fits.
   - A set's waiting semaphore operations are tried in one queue in the
     order they began, the waits for zero first. Linux keeps a queue for
     each semaphore beside one for operations on several, and which of two
@@ -289,9 +290,9 @@ verified.
   split it over datagrams, and a socket whose receive buffer is full drops
   an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
   acts with the capability of the thread that opened it alone. The other namespaces keep nothing apart that
-  paludarium has, but for the System V shared memory and semaphores of an
-  IPC namespace: there are no System V message queues or POSIX message
-  queues for one, no `mount` for a mount namespace (whose mounts keep their IDs
+  paludarium has, but for the System V shared memory, semaphores and
+  message queues of an IPC namespace: there are no POSIX message queues
+  for one, no `mount` for a mount namespace (whose mounts keep their IDs
   in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new
   ones), no `/proc/self/cgroup` for a cgroup namespace, and no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the

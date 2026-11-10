@@ -297,10 +297,12 @@ pub(crate) enum RestartBlock {
 pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
     match number {
         // read, write, pread64, pwrite64, readv, writev, preadv, pwritev,
-        // wait4, waitid, pause, rt_sigsuspend, flock, and the blocking socket
+        // wait4, waitid, pause, rt_sigsuspend, flock, the blocking socket
         // calls (a wait that SO_RCVTIMEO or SO_SNDTIMEO limits gives EINTR
-        // instead, and clears the restart itself).
-        0 | 1 | 17..=20 | 295 | 296 | 61 | 247 | 34 | 130 | 73 | 43 | 288 | 44..=47 => true,
+        // instead, and clears the restart itself), msgsnd and msgrcv.
+        0 | 1 | 17..=20 | 295 | 296 | 61 | 247 | 34 | 130 | 73 | 43 | 288 | 44..=47 | 69 | 70 => {
+            true
+        }
         // fcntl's F_SETLKW and F_OFD_SETLKW.
         72 => matches!(args[1], 7 | 38),
         // open, openat and openat2, which wait only to open a FIFO.
@@ -317,13 +319,14 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
 
 /// Whether a handler set with SA_RESTART runs the interrupted syscall
 /// `number` again: the calls that return ERESTARTSYS. pause, rt_sigsuspend,
-/// poll, ppoll, select, pselect6 and an absolute clock_nanosleep return
-/// ERESTARTNOHAND, and the waits armed to go on through restart_syscall
+/// poll, ppoll, select, pselect6, msgsnd, msgrcv and an absolute
+/// clock_nanosleep return ERESTARTNOHAND, and the waits armed to go on
+/// through restart_syscall
 /// ERESTART_RESTARTBLOCK, which a handler ends with EINTR whatever its flags.
 /// The last two are not entered here: the interrupted wait records them (as
 /// 230 or 219) in place of its own number.
 pub(crate) fn restarts_with_handler(number: u64) -> bool {
-    !matches!(number, 7 | 23 | 34 | 130 | 219 | 230 | 270 | 271)
+    !matches!(number, 7 | 23 | 34 | 69 | 70 | 130 | 219 | 230 | 270 | 271)
 }
 
 /// Shared selection for delivery and syscall-restart preview. SIGKILL wins,

@@ -149,6 +149,8 @@ pub(crate) struct Namespace {
     pub shm: crate::shm::Segments,
     /// Its System V semaphore sets, which go with it (`sem_exit_ns`).
     pub sem: crate::sem::Sets,
+    /// Its System V message queues, which go with it (`msg_exit_ns`).
+    pub msg: crate::msg::Queues,
     /// The numbers of a PID namespace.
     pids: Pids,
     /// A nested network namespace's sockets.
@@ -193,6 +195,7 @@ impl Namespace {
             names: Mutex::new(names),
             shm: crate::shm::Segments::default(),
             sem: crate::sem::Sets::default(),
+            msg: crate::msg::Queues::default(),
             pids,
             sockets: Sockets::default(),
             users: crate::users::Users::default(),
@@ -214,6 +217,7 @@ impl Namespace {
             }),
             shm: crate::shm::Segments::default(),
             sem: crate::sem::Sets::default(),
+            msg: crate::msg::Queues::default(),
             pids: Pids::default(),
             sockets: Sockets::default(),
             owner: users.parent().cloned(),

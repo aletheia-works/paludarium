@@ -48,7 +48,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
-| System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー） |
+| System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`setitimer`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -536,6 +536,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `SETALL` は調整値を消します。リストを共有する最後のスレッドが、終わるとき、または
   `unshare`（`CLONE_SYSVSEM` か `CLONE_NEWIPC`）やほかの IPC 名前空間への `setns` で
   リストを離れるときに、Linux と同じく 0 と `SEMVMX` の間に収めて値に足します。
+- System V のメッセージキュー（`msgget`、`msgsnd`、`msgrcv`、`msgctl`）も、スレッドの
+  IPC 名前空間のものです。確かめる内容とその順序は Linux の `ipc/msg.c` と同じで、上限は
+  Linux の既定値（`MSGMAX` 8192、`MSGMNB` 16384、`MSGMNI` 32000）です。キューは
+  `msg_qbytes` のバイト数まで、同じ数のメッセージまで持ちます。いっぱいのキューへの送信は、
+  `IPC_NOWAIT` があれば `EAGAIN` で、なければ受信か `IPC_SET` で空きができるか、キューが
+  消える（`EIDRM`）か、シグナルが来るまで待ちます。`msgrcv` は、最初のメッセージ、ある型の
+  最初のもの、ほかの型の最初のもの（`MSG_EXCEPT`）、ある値までのいちばん小さい型のもの
+  （負の `msgtyp`）を取ります。バッファーより長いものは `E2BIG` で、`MSG_NOERROR` が
+  あれば切り詰めます。`IPC_NOWAIT` を付けた `MSG_COPY` は、その位置のメッセージを写して
+  残します。何もなければ、`IPC_NOWAIT` があれば `ENOMSG` で、なければキューの受信者の
+  列で待ちます。送られたメッセージは、Linux の `pipelined_send` と同じく、それを取る最初の
+  受信者に渡り、バッファーが小さすぎる受信者は `E2BIG` を受けます。どちらの待ちも
+  シグナルで `EINTR` になり、ハンドラーを走らせないシグナルなら再開します
+  （`ERESTARTNOHAND`）。`msgctl` には、`IPC_STAT`、`MSG_STAT`、`MSG_STAT_ANY`（プロセスは
+  呼び出し元の PID 名前空間の番号）、`IPC_SET`（`MSGMNB` を超えるには
+  `CAP_SYS_RESOURCE`）、`IPC_RMID`、`IPC_INFO`、`MSG_INFO` があります。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。

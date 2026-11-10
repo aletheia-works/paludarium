@@ -128,8 +128,9 @@ mod linux {
             // change IDs as root, pty-vhangup needs root's capabilities and
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
-            // do the unshare, namespaces, *-namespaces and netlink cases, whose
-            // checks depend on CAP_SYS_ADMIN and which make namespaces, the
+            // do the unshare, namespaces, *-namespaces, netlink and msg cases,
+            // whose checks depend on CAP_SYS_ADMIN and which make namespaces
+            // (msg an IPC namespace of its own, for its counts), the
             // scheduling-set case, which sets real-time and deadline policies,
             // and the personality-layout case, which maps page 0.
             let as_root = matches!(
@@ -154,6 +155,7 @@ mod linux {
                     | "pid-namespaces"
                     | "pid-set-tid"
                     | "net-namespaces"
+                    | "msg"
                     | "netlink"
                     | "user-namespaces"
                     | "scheduling-set"
@@ -409,6 +411,7 @@ mod linux {
         processes_etxtbsy => ("etxtbsy","process"),
         processes_shm => ("shm","process"),
         processes_sem => ("sem","process"),
+        processes_msg => ("msg","process"),
         processes_rseq => ("rseq","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),

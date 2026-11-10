@@ -411,7 +411,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "paludarium"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium-host",
  "paludarium-jit-native",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "paludarium-cpu"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium-decoder",
  "paludarium-mmu",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "paludarium-decoder"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "iced-x86",
  "paludarium-types",
@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "paludarium-harness"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium",
  "paludarium-cpu",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "paludarium-host"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "paludarium-jit"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium-cpu",
  "paludarium-decoder",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "paludarium-jit-native"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "paludarium-kernel"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium-cpu",
  "paludarium-host",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "paludarium-loader"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium-mmu",
  "paludarium-types",
@@ -511,14 +511,14 @@ dependencies = [
 
 [[package]]
 name = "paludarium-mmu"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium-types",
 ]
 
 [[package]]
 name = "paludarium-runtime"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium-cpu",
  "paludarium-host",
@@ -532,11 +532,11 @@ dependencies = [
 
 [[package]]
 name = "paludarium-types"
-version = "0.13.0"
+version = "0.14.0"
 
 [[package]]
 name = "paludarium-vfs"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium-host",
  "paludarium-types",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "paludarium-wasm"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "paludarium-host",
  "paludarium-jit",

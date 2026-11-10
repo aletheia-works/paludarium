@@ -422,7 +422,9 @@ impl Network {
     /// `name` (the `ifr_name` of a `struct ifreq`): the loopback `lo`, index
     /// 1, is the only one (`ENODEV` for another). Setting flags needs
     /// CAP_NET_ADMIN (`EPERM`, before the name is looked at) and takes only
-    /// `IFF_UP`; the loopback has `::1` while it is up.
+    /// `IFF_UP`, with what that does to the loopback's addresses
+    /// ([`Self::set_up`]): down, it loses every IPv6 address; up, it has
+    /// `127.0.0.1/8` and `::1` back.
     pub(crate) fn interface(
         &self,
         name: &[u8],

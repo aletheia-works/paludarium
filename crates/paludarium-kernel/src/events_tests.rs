@@ -3919,6 +3919,16 @@ fn netlink_dumps_the_routes_of_a_new_namespaces_loopback() {
     );
     assert_eq!(uid_lookup(&mut f, &[0xff; 4], 25), Ok(None));
     assert_eq!(uid_lookup(&mut f, &[0xe8, 3], 26), Err(-34));
+    // An IPv6 lookup checks its length too.
+    let mut payload = vec![10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 1, 0];
+    payload.extend_from_slice(&one);
+    payload.extend_from_slice(&[6, 0, 25, 0, 0xe8, 3, 0, 0]);
+    let len = netlink_request(&f, DATA, 26, 0x1, 27, &payload);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(
+        &netlink_replies(&mut f, fd)[0].4[..4],
+        &(-34i32).to_le_bytes()
+    );
     // Short of an rtmsg, a lookup is EINVAL.
     let len = netlink_request(&f, DATA, 26, 0x1, 15, &[2]);
     assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);

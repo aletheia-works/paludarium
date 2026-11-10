@@ -137,6 +137,8 @@ const MSG_OOB: u64 = 0x1;
 const MSG_PEEK: u64 = 0x2;
 const MSG_TRUNC: u64 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
+const EBUSY: Errno = Errno(16);
+const EEXIST: Errno = Errno(17);
 const ENODEV: Errno = Errno(19);
 const ERANGE: Errno = Errno(34);
 const ENOTSOCK: Errno = Errno(88);
@@ -147,12 +149,10 @@ const ESOCKTNOSUPPORT: Errno = Errno(94);
 const EOPNOTSUPP: Errno = Errno(95);
 const EAFNOSUPPORT: Errno = Errno(97);
 const EADDRINUSE: Errno = Errno(98);
-const ENOBUFS: Errno = Errno(105);
 const ENETUNREACH: Errno = Errno(101);
-const EHOSTUNREACH: Errno = Errno(113);
+const ENOBUFS: Errno = Errno(105);
 const ECONNREFUSED: Errno = Errno(111);
-const EBUSY: Errno = Errno(16);
-const EEXIST: Errno = Errno(17);
+const EHOSTUNREACH: Errno = Errno(113);
 /// `net.core.rmem_default` and `wmem_default`, and their `_max`.
 const BUFFER_DEFAULT: i32 = 212_992;
 const BUFFER_MAX: i32 = 212_992;
@@ -954,8 +954,9 @@ fn lookup_cacheinfo() -> [u8; RTA_CACHEINFO_LEN] {
 /// for IPv4 and `EINVAL` for IPv6, as their attribute policies give, and
 /// a longer one counts as its first bytes; `EOPNOTSUPP` for an input route
 /// (`RTA_IIF`), which is not supported; `ENETUNREACH` where no route goes.
-/// An `RTA_UID` it names (`ERANGE` when shorter than 4 bytes) is the one
-/// the answer gives, as it is; `RTA_SRC`, `RTA_OIF` and the other
+/// An `RTA_UID` it names (`ERANGE` when shorter than 4 bytes, for either
+/// family, as both policies take a `u32`) is the one an IPv4 answer gives,
+/// as it is; `RTA_SRC`, `RTA_OIF` and the other
 /// selectors are not looked at. With
 /// `RTM_F_FIB_MATCH` the answer is the table's entry that matched, and
 /// `EHOSTUNREACH` for `0.0.0.0`, which no entry is.

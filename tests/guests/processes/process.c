@@ -1429,6 +1429,18 @@ static void nl_lookups(int fd, unsigned port, const char *when) {
         snprintf(label, sizeof label, "%s get uid %zu", when, i);
         nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, 24 + ((uids[i].len + 3) & ~3)), port, label);
     }
+    {
+        /* An IPv6 lookup checks the length of RTA_UID too. */
+        unsigned char request[12 + 20 + 8] = {AF_INET6, 128};
+        unsigned short destination[2] = {20, 1}, user[2] = {6, 25};
+        memcpy(request + 12, destination, 4);
+        request[16 + 15] = 1;
+        memcpy(request + 32, user, 4);
+        memcpy(request + 36, "\xe8\x03", 2);
+        char label[64];
+        snprintf(label, sizeof label, "%s get IPv6 with a short uid", when);
+        nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, sizeof request), port, label);
+    }
     /* A destination shorter than its family's address, and one longer. */
     static const struct {
         unsigned char family, len;

@@ -1412,7 +1412,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     何も作りません）、上限を超える番号への `dup2`／`dup3` は `EBADF`、上限を超える
     番号からの `F_DUPFD` は `EINVAL` になります。
   - `RLIMIT_FSIZE`：通常のファイルへの書き込み（`O_APPEND` なら末尾から書く `write`、
-    `writev`、`pwrite`、`pwritev` と、`copy_file_range`、`sendfile`）はソフトの上限で
+    `writev`、`pwrite`、`pwritev` と、`copy_file_range`、`sendfile`、`splice`）はソフトの上限で
     止まります。上限かその先から始まる
     書き込みと、ファイルを上限より大きくする `truncate`／`ftruncate` と `fallocate` は、`SIGXFSZ` を
     起こして `EFBIG` で失敗します。

@@ -3019,7 +3019,7 @@ fn a_write_takes_nothing_from_what_is_not_a_regular_file() {
 #[test]
 fn every_way_of_changing_a_file_takes_its_set_id_bits() {
     type Way = fn(&mut Fixture, u64) -> u64;
-    let ways: [(&str, Way); 8] = [
+    let ways: [(&str, Way); 9] = [
         ("pwrite", |f, fd| f.ret(18, [fd, BYTES, 1, 0, 0, 0])),
         ("ftruncate", |f, fd| f.ret(77, [fd, 0, 0, 0, 0, 0])),
         ("truncate", |f, _| f.ret(76, [DATA + 0x300, 0, 0, 0, 0, 0])),
@@ -3049,6 +3049,11 @@ fn every_way_of_changing_a_file_takes_its_set_id_bits() {
                 .unwrap();
             f.ret(326, [from, DATA + 0x348, fd, 0, 1, 0]);
             0
+        }),
+        ("splice", |f, fd| {
+            let (r, w) = pair(f, 293, [DATA + 0x350, 0, 0, 0, 0, 0]);
+            assert_eq!(f.ret(1, [w, BYTES, 1, 0, 0, 0]), 1);
+            f.ret(275, [r, 0, fd, 0, 1, 0])
         }),
     ];
     for (name, way) in ways {

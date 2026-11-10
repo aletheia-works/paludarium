@@ -1588,8 +1588,8 @@ kernel.
     `open` creates nothing), `dup2`/`dup3` onto a number past it `EBADF`, and
     `F_DUPFD` from one past it `EINVAL`.
   - `RLIMIT_FSIZE`: a write to a regular file (`write`, `writev`, `pwrite` and
-    `pwritev`, which with `O_APPEND` start at the end, and `copy_file_range`
-    and `sendfile`) stops at the soft limit; one that
+    `pwritev`, which with `O_APPEND` start at the end, and `copy_file_range`,
+    `sendfile` and `splice`) stops at the soft limit; one that
     starts at or past it, and a `truncate`/`ftruncate` or `fallocate` that
     grows the file past it, raise `SIGXFSZ` and fail with `EFBIG`.
   - `RLIMIT_CORE`: a process that a core-dumping signal (`SIGSEGV`, `SIGABRT`,

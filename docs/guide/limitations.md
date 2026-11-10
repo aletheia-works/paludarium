@@ -164,7 +164,10 @@ verified.
   registered. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`), and
   `poll` and `epoll` cannot watch its descriptor. As every request completes
   in `io_uring_enter`, a wait for more completions than there are ends only
-  by a signal or its timeout.
+  by a signal or its timeout. The features are Linux 6.12's, so
+  `IORING_FEAT_REG_REG_RING` is reported though no ring descriptor can be
+  registered, and `IORING_FEAT_MIN_TIMEOUT` though a wait's `min_wait_usec`
+  changes nothing (no request is ever in flight).
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared

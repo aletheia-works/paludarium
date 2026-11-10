@@ -149,6 +149,9 @@ pub(crate) struct Ring {
     /// one that may submit and register, and wait with
     /// `IORING_SETUP_DEFER_TASKRUN`.
     submitter: Option<u32>,
+    /// Held across a submission, as Linux's `uring_lock`: threads that
+    /// submit at once take entries one after another, never the same ones.
+    submitting: Mutex<()>,
     state: Mutex<State>,
 }
 
@@ -554,6 +557,7 @@ fn setup(c: &mut Context<'_>, entries: u32, params: u64) -> Result<u32, Errno> {
         sqes: pages(sqes_len)?,
         sqes_len,
         submitter: (flags & SETUP_SINGLE_ISSUER != 0).then_some(c.tid),
+        submitting: Mutex::default(),
         state: Mutex::default(),
     };
     ring.store_u32(SQ_RING_MASK, sq_entries - 1);
@@ -637,10 +641,11 @@ fn enter(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         if ring.submitter.is_some_and(|tid| tid != c.tid) {
             return Err(EEXIST);
         }
-        {
-            let mut state = ring.state();
-            ring.flush(&mut state);
-        }
+        let _submitting = ring
+            .submitting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ring.flush(&mut ring.state());
         submitted = submit(c, ring, to_submit);
         if submitted != to_submit {
             return Ok(u64::from(submitted));

@@ -260,6 +260,8 @@ impl SyscallTable {
         ];
         handlers.extend(ids);
         handlers.insert(290, crate::events::dispatch);
+        handlers.insert(284, crate::events::sys_eventfd);
+        handlers.insert(216, sys_remap_file_pages);
         handlers.insert(153, crate::pty::sys_vhangup);
         handlers.insert(282, crate::signalfd::sys_signalfd);
         handlers.insert(289, crate::signalfd::sys_signalfd4);
@@ -1640,6 +1642,38 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             // A new VMA has no memory policy.
             c.group.numa().forget(a.0, len);
             ok(a.0)
+        }
+        Err(e) => err(e),
+    }
+}
+
+/// `remap_file_pages(start, size, prot, pgoff, flags)`, as Linux's, which
+/// makes it a `MAP_SHARED | MAP_FIXED` `mmap` of the VMA's own file: `prot`
+/// must be 0, `start` and `size` are taken down to whole pages and may not
+/// wrap or be empty, nor may `pgoff` with the pages (`EINVAL`), and `flags`
+/// is not looked at. What the range must be is
+/// [`paludarium_mmu::AddressSpace::remap_shared_pages`]'s; then the file
+/// must reach `pgoff`'s pages, which `mmap`'s `file_mmap_ok` limits to
+/// `MAX_LFS_FILESIZE` (`EOVERFLOW`).
+fn sys_remap_file_pages(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (start, size, prot, pgoff) = (a[0] & !4095, a[1] & !4095, a[2], a[3]);
+    if prot != 0
+        || start.checked_add(size).is_none_or(|end| end <= start)
+        || pgoff.checked_add(size >> 12).is_none()
+    {
+        return err(Errno::EINVAL);
+    }
+    let reach = (i64::MAX as u64).saturating_sub(size) >> 12;
+    let offset = if pgoff <= reach {
+        Ok(pgoff << 12)
+    } else {
+        Err(Errno::EOVERFLOW)
+    };
+    match c.mem.remap_shared_pages(GuestAddr(start), size, offset) {
+        Ok(()) => {
+            // A new VMA has no memory policy.
+            c.group.numa().forget(start, size);
+            ok(0)
         }
         Err(e) => err(e),
     }

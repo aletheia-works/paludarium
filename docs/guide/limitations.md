@@ -183,6 +183,9 @@ verified.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`,
     cannot be set: `setitimer` gives `EINVAL` for them, where Linux sets them
     and sends `SIGVTALRM` and `SIGPROF`, and `getitimer` shows them disarmed.
+  - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
+    socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
+    the superblock of its pseudo filesystem and gives its counts (0).
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared
     memory, semaphores and message queues are Linux's defaults, which
     `/proc/sys/kernel` cannot change. A message queue's waiting senders

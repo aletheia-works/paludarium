@@ -47,16 +47,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、後述の疑似端末のリクエスト） |
-| イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
+| イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
@@ -79,7 +79,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   失敗したときもオフセットを書き戻します。
 - `getdents64` は返したエントリーの続きから読むので、それらを `unlink` しても
   読み飛ばしません。ディレクトリが変わらない間は、`d_off` への `lseek` で同じ
-  エントリーに戻ります。`dup` と `fork` は読んでいる位置を共有します。
+  エントリーに戻ります。`dup` と `fork` は読んでいる位置を共有します。`getdents`
+  も同じで、古い `linux_dirent` を書きます（型は各エントリーの最後のバイトです）。
+  どちらも Linux と同じく大きさを `int` で持つので、2 GiB 以上ではどのエントリーも
+  入りません（`EINVAL`）。
 - 拡張属性はメモリ上のファイルとともに保持し、ハードリンクや名前の変更のあとも、
   最後の名前がなくなったあとも残ります。Linux と同じく、`user.*` は通常のファイルと
   ディレクトリ用で（ほかでは読むと `ENODATA`、書くと `EPERM`）、`trusted.*` は
@@ -538,6 +541,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MREMAP_FIXED` で動かすと、`EFAULT` になります（最近の Linux は動かせます）。
 - `msync` は、引数と範囲を確かめ、`MS_SYNC` か `MS_ASYNC` なら共有のファイルの
   マッピングへの書き込みをファイルに書き戻します。
+- `remap_file_pages` は、共有のマッピングの範囲を、そのファイルや共有メモリの別の
+  ページに張り直します。Linux がマッピング自身のファイルを `mmap` し直すのと同じで、
+  保護はそのままです。Linux と同じく、`prot` は 0 でなければならず、範囲は書き込める
+  同じメモリの共有のマッピングの中に隙間なく収まっていなければなりません（`EINVAL`）。
+  ファイルが届かないページは `EOVERFLOW` です。
 - System V の共有メモリ（`shmget`、`shmat`、`shmdt`、`shmctl`）は、スレッドの IPC
   名前空間のものです。新しい IPC 名前空間にはセグメントがありません。確かめる内容とその
   順序、既定の上限は Linux と同じです。
@@ -1042,7 +1050,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
   `/proc/mounts` はマウントの一覧です（ルートは `tmpfs`、`--mount` ごとに `hostfs`。
   ホストのパスは見せません）。マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
-  `df` はどのマウントも表示します。
+  `df` はどのマウントも表示します。`ustat` は、マウントの `st_dev` なら空きブロックと
+  空き inode の数を返し、ほかのデバイスなら `EINVAL` です。
 - ファイルのブロックの大きさ（`st_blksize`、`stx_blksize`、`FIGETBSZ`）は、Linux と
   同じくそのファイルシステムのものです。`/proc`（procfs）と、疑似端末のスレーブ、
   標準入力・出力・エラーの端末（devpts）は 1024 で、ほかは、パイプ、ソケット、`memfd`、`/dev` も含めて 4096

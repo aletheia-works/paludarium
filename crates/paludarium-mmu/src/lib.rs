@@ -1740,6 +1740,43 @@ impl AddressSpaceData {
         );
         Ok(())
     }
+    /// Maps `[start, start+len)` again to show the shared memory it shows
+    /// from key `offset` on, as Linux's `remap_file_pages` does with a
+    /// `MAP_SHARED | MAP_FIXED` `mmap` of the VMA's file: the mapping at
+    /// `start` must be shared and may write (`VM_SHARED`, which a file open
+    /// only for reading does not give), and the range must lie in it and in
+    /// mappings after it with no hole, of the same memory and protection
+    /// (`EINVAL`). Only then is `offset` taken, which is `mmap`'s error when
+    /// the file cannot reach it. The new mapping keeps that protection.
+    fn remap_shared_pages(
+        &mut self,
+        start: u64,
+        len: u64,
+        offset: Result<u64, Errno>,
+    ) -> Result<(), Errno> {
+        let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+        let first = *self.mapping_at(start).ok_or(Errno::EINVAL)?;
+        let shared = self
+            .shared_at(start)
+            .filter(|shared| shared.may_write)
+            .ok_or(Errno::EINVAL)?;
+        let pages = shared.pages.clone();
+        let mut last = first;
+        while last.end() < end {
+            let next = *self.mappings.get(&last.end()).ok_or(Errno::EINVAL)?;
+            let same = self.shared_at(next.start.0).is_some_and(|shared| {
+                shared.may_write && Arc::ptr_eq(&shared.pages.frames, &pages.frames)
+            });
+            if !same || next.prot != first.prot || next.kind != first.kind {
+                return Err(Errno::EINVAL);
+            }
+            last = next;
+        }
+        let offset = offset?;
+        self.unmap(GuestAddr(start), len)?;
+        self.map(Some(GuestAddr(start)), len, first.prot, first.kind)?;
+        self.share_pages(GuestAddr(start), len, &pages, offset, true)
+    }
     /// Makes the private file mapping `[addr, addr+len)` show the page
     /// cache `pages` of the file from `offset`, which must have its file
     /// ([`SharedPages::with_source`]): a page reads the cache until the
@@ -3515,6 +3552,16 @@ impl AddressSpace {
     ) -> Result<(), Errno> {
         self.locked()
             .share_pages(addr, len, pages, offset, may_write)
+    }
+    /// See [`AddressSpaceData::remap_shared_pages`], under one hold of the
+    /// locks, as Linux's `remap_file_pages` holds its `mmap_lock` for writing.
+    pub fn remap_shared_pages(
+        &self,
+        start: GuestAddr,
+        len: u64,
+        offset: Result<u64, Errno>,
+    ) -> Result<(), Errno> {
+        self.locked().remap_shared_pages(start.0, len, offset)
     }
     /// Maps `len` bytes where `placement` says and attaches `backing` to
     /// them, under one hold of the locks, as Linux's `mmap` does under its

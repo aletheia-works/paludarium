@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
-    0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
-    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 137, 138, 162, 187, 188, 189,
-    190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260, 261, 262,
-    263, 264, 265, 266, 267, 268, 269, 277, 280, 285, 292, 293, 295, 296, 306, 316, 319, 326, 327,
-    328, 332, 436, 437, 439, 452,
+    0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+    81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 136, 137, 138, 162, 187,
+    188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260,
+    261, 262, 263, 264, 265, 266, 267, 268, 269, 277, 280, 285, 292, 293, 295, 296, 306, 316, 319,
+    326, 327, 328, 332, 436, 437, 439, 452,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -1063,6 +1063,98 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     c.files.fs.link(&old, &new)?;
     Ok(0)
 }
+/// `getdents` and `getdents64(fd, buf, count)`: the directory's entries
+/// from its position on, as many as fit in `count` bytes, as Linux's
+/// `filldir` and `filldir64` write them (`EINVAL` when not even the first
+/// fits). `old` writes the `linux_dirent` of `getdents`, whose `d_type` is
+/// the last byte of each entry.
+fn directory_entries(
+    c: &mut Context<'_>,
+    fd: u64,
+    buf: u64,
+    count: u32,
+    old: bool,
+) -> Result<u64, Errno> {
+    let d = c.files.descriptor(fd)?;
+    if d.file.stat()?.mode & 0o170000 != 0o040000 {
+        return Err(Errno::ENOTDIR);
+    }
+    let task = crate::proc::task_path(&d.path, c.process.pid, c.tid);
+    let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
+        _ if tasks::is_root(&d.path) => tasks::root_entries(c),
+        _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
+        Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c),
+        Some(crate::proc::OwnEntry::Directory) => own_entries(),
+        _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Directory) => {
+            crate::devices::entries(c.files.fs.metadata(b"/", true)?.inode)
+        }
+        _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Pts) => c
+            .files
+            .devpts
+            .entries(crate::devices::directory_stat().inode),
+        _ => c.files.fs.read_dir(&d.path)?,
+    };
+    let position = d.file.seek(0, 1)? as usize;
+    let mut listed = d.listed.lock().unwrap_or_else(PoisonError::into_inner);
+    listed.seek(position, &entries);
+    let mut bytes = Vec::new();
+    let mut returned = Vec::new();
+    // Linux keeps the count in an `int`: one past `i32::MAX` is negative,
+    // so no entry fits.
+    let room = usize::try_from(count as i32).unwrap_or(0);
+    // A `linux_dirent` has its name after 18 bytes and its type in its last
+    // byte; a `linux_dirent64` has the type, then the name, after 18.
+    let name_at = if old { 18 } else { 19 };
+    for e in entries.iter().filter(|e| !listed.names.contains(&e.name)) {
+        let size = (name_at + e.name.len() + 1 + usize::from(old)).div_ceil(8) * 8;
+        if bytes.len() + size > room {
+            if bytes.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            break;
+        }
+        let pos = bytes.len();
+        bytes.resize(pos + size, 0);
+        bytes[pos..pos + 8].copy_from_slice(&e.inode.to_le_bytes());
+        let next = position + returned.len() + 1;
+        bytes[pos + 8..pos + 16].copy_from_slice(&(next as u64).to_le_bytes());
+        bytes[pos + 16..pos + 18].copy_from_slice(&(size as u16).to_le_bytes());
+        if old {
+            bytes[pos + size - 1] = e.kind;
+        } else {
+            bytes[pos + 18] = e.kind;
+        }
+        bytes[pos + name_at..pos + name_at + e.name.len()].copy_from_slice(&e.name);
+        returned.push(&e.name);
+    }
+    output(c, buf, &bytes)?;
+    d.file.seek(returned.len() as i64, 1)?;
+    listed.returned(&returned);
+    Ok(bytes.len() as u64)
+}
+/// `ustat(dev, ubuf)`, as Linux's: the free blocks and inodes of the
+/// filesystem whose device `dev` is, in the "new" encoding `stat`'s
+/// `st_dev` has (`new_decode_dev`), else `EINVAL`. The devices here are the
+/// mounts' (0:1 the root, as [`device`] numbers them). The 32-byte
+/// `struct ustat` has an `int f_tfree`, which takes the count's low bits as
+/// C's conversion does, and an `unsigned long f_tinode`; its names are
+/// empty.
+fn ustat(c: &Context<'_>, dev: u32, buf: u64) -> Result<u64, Errno> {
+    let major = (dev & 0xfff00) >> 8;
+    let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
+    let mounts = c.files.fs.mounts();
+    let mount = (major == 0)
+        .then(|| minor.checked_sub(1))
+        .flatten()
+        .and_then(|i| mounts.get(i as usize))
+        .ok_or(Errno::EINVAL)?;
+    let stats = c.files.fs.statfs(&mount.path)?;
+    let mut b = [0u8; 32];
+    b[0..4].copy_from_slice(&(stats.blocks_free as i32).to_le_bytes());
+    b[8..16].copy_from_slice(&stats.files_free.to_le_bytes());
+    output(c, buf, &b)?;
+    Ok(0)
+}
 /// EBADF for a call that takes its descriptors as Linux's `fdget` does,
 /// which refuses an `O_PATH` one: reads and writes, `lseek`, `flock`,
 /// `getdents`, `sendfile` and `copy_file_range`, and `fcntl` but for the
@@ -1071,8 +1163,8 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
 fn refuse_path_only(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<(), Errno> {
     let descriptors: &[u64] = match n {
         // read, readv, writev, pread64, pwrite64, preadv, pwritev, preadv2,
-        // pwritev2, lseek, flock, getdents64
-        0 | 8 | 17 | 18 | 19 | 20 | 73 | 217 | 295 | 296 | 327 | 328 => &a[..1],
+        // pwritev2, lseek, flock, getdents, getdents64
+        0 | 8 | 17 | 18 | 19 | 20 | 73 | 78 | 217 | 295 | 296 | 327 | 328 => &a[..1],
         // sendfile(out, in), copy_file_range(in, _, out)
         40 => &a[..2],
         326 => &[a[0], a[2]],
@@ -2938,54 +3030,10 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             output(c, buf, &b[..count])?;
             Ok(count as u64)
         }
-        217 => {
-            let d = c.files.descriptor(a[0])?;
-            if d.file.stat()?.mode & 0o170000 != 0o040000 {
-                return Err(Errno::ENOTDIR);
-            }
-            let task = crate::proc::task_path(&d.path, c.process.pid, c.tid);
-            let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
-                _ if tasks::is_root(&d.path) => tasks::root_entries(c),
-                _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
-                Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c),
-                Some(crate::proc::OwnEntry::Directory) => own_entries(),
-                _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Directory) => {
-                    crate::devices::entries(c.files.fs.metadata(b"/", true)?.inode)
-                }
-                _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Pts) => c
-                    .files
-                    .devpts
-                    .entries(crate::devices::directory_stat().inode),
-                _ => c.files.fs.read_dir(&d.path)?,
-            };
-            let position = d.file.seek(0, 1)? as usize;
-            let mut listed = d.listed.lock().unwrap_or_else(PoisonError::into_inner);
-            listed.seek(position, &entries);
-            let mut bytes = Vec::new();
-            let mut returned = Vec::new();
-            for e in entries.iter().filter(|e| !listed.names.contains(&e.name)) {
-                let size = (19 + e.name.len() + 1).div_ceil(8) * 8;
-                if bytes.len() + size > a[2] as usize {
-                    if bytes.is_empty() {
-                        return Err(Errno::EINVAL);
-                    }
-                    break;
-                }
-                let pos = bytes.len();
-                bytes.resize(pos + size, 0);
-                bytes[pos..pos + 8].copy_from_slice(&e.inode.to_le_bytes());
-                let next = position + returned.len() + 1;
-                bytes[pos + 8..pos + 16].copy_from_slice(&(next as u64).to_le_bytes());
-                bytes[pos + 16..pos + 18].copy_from_slice(&(size as u16).to_le_bytes());
-                bytes[pos + 18] = e.kind;
-                bytes[pos + 19..pos + 19 + e.name.len()].copy_from_slice(&e.name);
-                returned.push(&e.name);
-            }
-            output(c, a[1], &bytes)?;
-            d.file.seek(returned.len() as i64, 1)?;
-            listed.returned(&returned);
-            Ok(bytes.len() as u64)
-        }
+        // getdents (the old `linux_dirent`), getdents64
+        78 | 217 => directory_entries(c, a[0], a[1], a[2] as u32, n == 78),
+        // ustat(dev, ubuf)
+        136 => ustat(c, a[0] as u32, a[1]),
         // umask
         95 => Ok(u64::from(
             c.files.umask.swap(a[0] as u32 & 0o777, Ordering::SeqCst),

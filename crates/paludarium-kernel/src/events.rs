@@ -5,6 +5,12 @@ use paludarium_types::Errno;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+/// `eventfd(count)`: `eventfd2` without flags, as Linux's
+/// `do_eventfd(count, 0)`.
+pub(crate) fn sys_eventfd(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    dispatch(c, [a[0], 0, 0, 0, 0, 0])
+}
+
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = (|| {
         let flags = u32::try_from(a[1]).map_err(|_| Errno::EINVAL)?;

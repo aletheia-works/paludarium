@@ -4256,3 +4256,184 @@ mod old_time_calls {
         assert_eq!(f.ret(187, &[99, 0, 1]), errno(Errno::EBADF));
     }
 }
+
+mod old_forms {
+    use super::*;
+    /// The names and types of the `linux_dirent`s `getdents` wrote.
+    fn entries(f: &Fixture, at: u64, len: u64) -> Vec<(String, u8)> {
+        let mut b = vec![0; usize::try_from(len).unwrap()];
+        f.mem.read(GuestAddr(at), &mut b).unwrap();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let size = usize::from(u16::from_le_bytes([b[i + 16], b[i + 17]]));
+            let end = b[i + 18..].iter().position(|&c| c == 0).unwrap();
+            let name = String::from_utf8(b[i + 18..i + 18 + end].to_vec()).unwrap();
+            out.push((name, b[i + size - 1]));
+            i += size;
+        }
+        out
+    }
+    #[test]
+    fn getdents_writes_the_old_dirent() {
+        let mut f = fixture();
+        let (path, out) = (DATA, DATA + 0x100);
+        f.mem.write(GuestAddr(path), b"/d\0").unwrap();
+        assert_eq!(f.ret(83, &[path, 0o755]), 0);
+        f.mem.write(GuestAddr(path), b"/d/abc\0").unwrap();
+        let file = f.ret(2, &[path, 0o102, 0o600]);
+        assert_eq!(f.ret(3, &[file]), 0);
+        f.mem.write(GuestAddr(path), b"/d\0").unwrap();
+        let dir = f.ret(2, &[path, 0o200000]);
+        // Too small for the first entry, and a count Linux's `int` makes
+        // negative: neither fits one.
+        assert_eq!(f.ret(78, &[dir, out, 23]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(78, &[dir, out, 0x8000_0000]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(217, &[dir, out, 0x8000_0000]), errno(Errno::EINVAL));
+        // ".", ".." and "abc" take 24 bytes each: 18, the name, its NUL and
+        // the type, rounded up to 8.
+        assert_eq!(f.ret(78, &[dir, out, 0x7fff_ffff]), 72);
+        assert_eq!(
+            entries(&f, out, 72),
+            [(".".into(), 4), ("..".into(), 4), ("abc".into(), 8)]
+        );
+        // d_off of the last leads past it.
+        assert_eq!(f.mem.read_u64(GuestAddr(out + 56)).unwrap(), 3);
+        assert_eq!(f.ret(78, &[dir, out, 0x1000]), 0);
+        // A file is not a directory, and an `O_PATH` one is refused first.
+        f.mem.write(GuestAddr(path), b"/d/abc\0").unwrap();
+        let file = f.ret(2, &[path, 0]);
+        assert_eq!(f.ret(78, &[file, out, 0x1000]), errno(Errno::ENOTDIR));
+        f.mem.write(GuestAddr(path), b"/d\0").unwrap();
+        let only = f.ret(2, &[path, 0o10000000]);
+        assert_eq!(f.ret(78, &[only, out, 0x1000]), errno(Errno::EBADF));
+        assert_eq!(f.ret(78, &[99, out, 0x1000]), errno(Errno::EBADF));
+    }
+    #[test]
+    fn eventfd_is_eventfd2_without_flags() {
+        let mut f = fixture();
+        let fd = f.ret(284, &[5]);
+        assert_eq!(f.ret(72, &[fd, 3]), 2); // F_GETFL: O_RDWR
+        assert_eq!(f.ret(72, &[fd, 1]), 0); // F_GETFD: no FD_CLOEXEC
+        assert_eq!(f.ret(0, &[fd, DATA, 8]), 8);
+        assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 5);
+        // The register's upper half is not the count's.
+        let fd = f.ret(284, &[1 << 32 | 7]);
+        assert_eq!(f.ret(0, &[fd, DATA, 8]), 8);
+        assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 7);
+    }
+    #[test]
+    fn ustat_counts_a_mounts_free_blocks_and_inodes() {
+        let mut f = fixture();
+        let (path, stat, fs, out) = (DATA, DATA + 0x100, DATA + 0x200, DATA + 0x300);
+        f.mem.write(GuestAddr(path), b"/\0").unwrap();
+        assert_eq!(f.ret(4, &[path, stat]), 0);
+        let device = f.mem.read_u64(GuestAddr(stat)).unwrap();
+        assert_eq!(device, 1);
+        f.mem.write(GuestAddr(out), &[0xff; 32]).unwrap();
+        assert_eq!(f.ret(136, &[device, out]), 0);
+        assert_eq!(f.ret(137, &[path, fs]), 0);
+        let word = |f: &Fixture, at: u64| f.mem.read_u64(GuestAddr(at)).unwrap();
+        let free = word(&f, fs + 24);
+        assert_eq!(word(&f, out) & 0xffff_ffff, free & 0xffff_ffff);
+        assert_eq!(word(&f, out + 8), word(&f, fs + 48));
+        assert_eq!([word(&f, out + 16), word(&f, out + 24)], [0, 0]);
+        // No mount is 0:0 or 0:2, nor 1:1; the minor's high bits are above
+        // the major's.
+        for dev in [0, 2, 0x101, 1 << 20 | 1] {
+            assert_eq!(f.ret(136, &[dev, out]), errno(Errno::EINVAL));
+        }
+        // The register's upper half is not the device's.
+        assert_eq!(f.ret(136, &[1 << 32 | 1, out]), 0);
+        assert_eq!(f.ret(136, &[1, 0]), errno(Errno::EFAULT));
+    }
+    const MAP_SHARED: u64 = 1;
+    const MAP_PRIVATE: u64 = 2;
+    const MAP_ANONYMOUS: u64 = 0x20;
+    #[test]
+    fn remap_file_pages_maps_other_pages_of_shared_memory() {
+        let mut f = fixture();
+        let at = f.ret(9, &[0, 0x3000, 3, MAP_SHARED | MAP_ANONYMOUS, u64::MAX, 0]);
+        for page in 0..3 {
+            f.mem
+                .write(GuestAddr(at + page * 0x1000), &[b'a' + page as u8])
+                .unwrap();
+        }
+        // The first page shows the third; `start` and `size` are taken down
+        // to whole pages and `flags` is not looked at.
+        assert_eq!(f.ret(216, &[at + 5, 0x1fff, 0, 2, 0xffff]), 0);
+        let read = |f: &Fixture, addr: u64| {
+            let mut b = [0];
+            f.mem.read(GuestAddr(addr), &mut b).unwrap();
+            b[0]
+        };
+        assert_eq!(read(&f, at), b'c');
+        f.mem.write(GuestAddr(at), b"z").unwrap();
+        assert_eq!(read(&f, at + 0x2000), b'z');
+        assert_eq!(read(&f, at + 0x1000), b'b');
+        // Across both mappings of the same memory now.
+        assert_eq!(f.ret(216, &[at, 0x2000, 0, 0, 0]), 0);
+        assert_eq!([read(&f, at), read(&f, at + 0x1000)], [b'a', b'b']);
+        // Linux's checks, in its order.
+        assert_eq!(f.ret(216, &[at, 0x1000, 1, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(216, &[at, 0xfff, 0, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(
+            f.ret(216, &[at, 0x1000, 0, u64::MAX, 0]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(f.ret(216, &[at, 0x4000, 0, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(
+            f.ret(216, &[at, 0x1000, 0, 1 << 60, 0]),
+            errno(Errno::EOVERFLOW)
+        );
+        assert_eq!(
+            f.ret(216, &[0x4000_0000, 0x1000, 0, 0, 0]),
+            errno(Errno::EINVAL)
+        );
+        let private = f.ret(9, &[0, 0x1000, 3, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX, 0]);
+        assert_eq!(
+            f.ret(216, &[private, 0x1000, 0, 0, 0]),
+            errno(Errno::EINVAL)
+        );
+        // A different protection is another VMA.
+        assert_eq!(f.ret(10, &[at + 0x1000, 0x1000, 1]), 0);
+        assert_eq!(f.ret(216, &[at, 0x2000, 0, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(216, &[at + 0x1000, 0x1000, 0, 2, 0]), 0);
+        assert_eq!(read(&f, at + 0x1000), b'z');
+    }
+    #[test]
+    fn remap_file_pages_of_a_file_reads_and_writes_its_pages() {
+        let mut f = fixture();
+        let path = DATA;
+        f.mem.write(GuestAddr(path), b"/f\0").unwrap();
+        let fd = f.ret(2, &[path, 0o102, 0o600]);
+        for page in 0..3u8 {
+            f.mem
+                .write(GuestAddr(DATA + 0x100), &[b'0' + page])
+                .unwrap();
+            assert_eq!(
+                f.ret(18, &[fd, DATA + 0x100, 1, u64::from(page) * 0x1000]),
+                1
+            );
+        }
+        assert_eq!(f.ret(77, &[fd, 0x3000]), 0);
+        let at = f.ret(9, &[0, 0x1000, 3, MAP_SHARED, fd, 0]);
+        assert_eq!(f.ret(216, &[at, 0x1000, 0, 2, 0]), 0);
+        let mut b = [0];
+        f.mem.read(GuestAddr(at), &mut b).unwrap();
+        assert_eq!(&b, b"2");
+        f.mem.write(GuestAddr(at + 1), b"w").unwrap();
+        assert_eq!(f.ret(26, &[at, 0x1000, 4]), 0); // msync(MS_SYNC)
+        assert_eq!(f.ret(17, &[fd, DATA + 0x100, 2, 0x2000]), 2);
+        let mut b = [0; 2];
+        f.mem.read(GuestAddr(DATA + 0x100), &mut b).unwrap();
+        assert_eq!(&b, b"2w");
+        // A file open only for reading gives no VM_SHARED.
+        let only = f.ret(2, &[path, 0]);
+        let read_only = f.ret(9, &[0, 0x1000, 1, MAP_SHARED, only, 0]);
+        assert_eq!(
+            f.ret(216, &[read_only, 0x1000, 0, 1, 0]),
+            errno(Errno::EINVAL)
+        );
+    }
+}

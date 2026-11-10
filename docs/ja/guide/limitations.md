@@ -160,6 +160,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は設定できません。
     Linux はこれを設定して `SIGVTALRM` と `SIGPROF` を送りますが、`setitimer` は `EINVAL` を
     返し、`getitimer` は設定されていないものとして見せます。
+  - `ustat` が見つけるのはマウントのデバイスだけです。パイプ・ソケット・memfd・名前空間の
+    ファイルの `st_dev` では `EINVAL` を返します。Linux はその疑似ファイルシステムの
+    スーパーブロックを見つけ、その数（0）を返します。
   - System V IPC には `/proc/sysvipc` がなく、共有メモリ・セマフォー・メッセージキューの
     上限は Linux の既定値で、`/proc/sys/kernel` から変えられません。メッセージキューで
     待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの

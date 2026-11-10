@@ -5445,6 +5445,113 @@ static int old_times_case(void) {
     rmdir(dir);
     return 0;
 }
+/* The old forms: getdents's linux_dirent, eventfd, ustat and
+ * remap_file_pages, as Linux 6.12's. */
+static int of_names_cmp(const void *a, const void *b) { return strcmp(a, b); }
+static int old_forms_case(void) {
+    char dir[] = "/tmp/old-forms-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char path[64];
+    snprintf(path, sizeof path, "%s/file", dir);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) return 81;
+    snprintf(path, sizeof path, "%s/sub", dir);
+    if (mkdir(path, 0700)) return 82;
+    int d = open(dir, O_RDONLY | O_DIRECTORY);
+    int dp = open(dir, O_PATH);
+    long small = ot_errno(syscall(SYS_getdents, (long)d, path, 23L));
+    static char buf[4096];
+    long negative = ot_errno(syscall(SYS_getdents, (long)d, buf, 0x80000000L));
+    long negative64 = ot_errno(syscall(SYS_getdents64, (long)d, buf, 0x80000000L));
+    long n = ot_errno(syscall(SYS_getdents, (long)d, buf, (long)sizeof buf));
+    char names[8][16];
+    int count = 0, sizes_ok = 1;
+    for (long at = 0; at < n && count < 8;) {
+        unsigned short reclen = *(unsigned short *)(buf + at + 16);
+        const char *name = buf + at + 18;
+        size_t want = (18 + strlen(name) + 2 + 7) / 8 * 8;
+        if (reclen != want) sizes_ok = 0;
+        snprintf(names[count++], sizeof names[0], "%s:%d", name, buf[at + reclen - 1]);
+        at += reclen;
+    }
+    qsort(names, count, sizeof names[0], of_names_cmp);
+    printf("getdents small=%ld negative=%ld negative64=%ld sizes=%d entries=", small, negative,
+           negative64, sizes_ok);
+    for (int i = 0; i < count; i++) printf("%s%s", i ? "," : "", names[i]);
+    long end = ot_errno(syscall(SYS_getdents, (long)d, buf, (long)sizeof buf));
+    long notdir = ot_errno(syscall(SYS_getdents, (long)fd, buf, (long)sizeof buf));
+    long opath = ot_errno(syscall(SYS_getdents, (long)dp, buf, (long)sizeof buf));
+    long badf = ot_errno(syscall(SYS_getdents, 99L, buf, (long)sizeof buf));
+    printf(" end=%ld notdir=%ld path=%ld badf=%ld\n", end, notdir, opath, badf);
+    lseek(d, 0, SEEK_SET);
+    long fault = ot_errno(syscall(SYS_getdents, (long)d, (void *)8, (long)sizeof buf));
+    printf("getdents fault=%ld\n", fault);
+
+    int e = (int)syscall(SYS_eventfd, (1L << 32) | 3L);
+    uint64_t v = 0;
+    long got = ot_errno(read(e, &v, 8));
+    printf("eventfd count=%llu read=%ld fl=%#x fd=%d\n", (unsigned long long)v, got,
+           fcntl(e, F_GETFL) & O_ACCMODE, fcntl(e, F_GETFD));
+
+    struct stat st;
+    if (stat(dir, &st)) return 83;
+    char ust[32];
+    memset(ust, 0xff, sizeof ust);
+    long u = ot_errno(syscall(SYS_ustat, (long)st.st_dev, ust));
+    int names_empty = 1;
+    for (int i = 16; i < 28; i++) names_empty &= ust[i] == 0;
+    printf("ustat=%ld names-empty=%d none=%ld fault=%ld\n", u, names_empty,
+           ot_errno(syscall(SYS_ustat, 0L, ust)), ot_errno(syscall(SYS_ustat, (long)st.st_dev, NULL)));
+
+    char *shared = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) return 84;
+    for (int i = 0; i < 3; i++) shared[i * 4096] = 'a' + i;
+    long r = ot_errno(syscall(SYS_remap_file_pages, shared + 5, 0x1fffL, 0L, 2L, 0xffffL));
+    char first = shared[0];
+    shared[0] = 'z';
+    printf("remap anon=%ld first=%c third=%c second=%c\n", r, first, shared[2 * 4096], shared[4096]);
+    r = ot_errno(syscall(SYS_remap_file_pages, shared, 0x2000L, 0L, 0L, 0L));
+    printf("remap across=%ld first=%c second=%c\n", r, shared[0], shared[4096]);
+    char *private = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("remap prot=%ld empty=%ld wrap=%ld past=%ld huge=%ld unmapped=%ld private=%ld\n",
+           ot_errno(syscall(SYS_remap_file_pages, shared, 4096L, 1L, 0L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, shared, 0xfffL, 0L, 0L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, shared, 4096L, 0L, -1L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, shared, 0x4000L, 0L, 0L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, shared, 4096L, 0L, 1L << 60, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, (void *)0x10000L, 4096L, 0L, 0L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, private, 4096L, 0L, 0L, 0L)));
+    mprotect(shared + 4096, 4096, PROT_READ);
+    long split = ot_errno(syscall(SYS_remap_file_pages, shared, 0x2000L, 0L, 0L, 0L));
+    long kept = ot_errno(syscall(SYS_remap_file_pages, shared + 4096, 0x1000L, 0L, 2L, 0L));
+    printf("remap other-prot=%ld kept-prot=%ld second=%c\n", split, kept, shared[4096]);
+
+    for (int i = 0; i < 3; i++) {
+        char c = '0' + i;
+        if (pwrite(fd, &c, 1, i * 4096L) != 1) return 85;
+    }
+    if (ftruncate(fd, 3 * 4096)) return 86;
+    char *file = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (file == MAP_FAILED) return 87;
+    r = ot_errno(syscall(SYS_remap_file_pages, file, 4096L, 0L, 2L, 0L));
+    first = file[0];
+    file[1] = 'w';
+    msync(file, 4096, MS_SYNC);
+    char back[3] = {0};
+    pread(fd, back, 2, 2 * 4096);
+    snprintf(path, sizeof path, "%s/file", dir);
+    int ro = open(path, O_RDONLY);
+    char *read_only = mmap(NULL, 4096, PROT_READ, MAP_SHARED, ro, 0);
+    printf("remap file=%ld first=%c back=%s huge=%ld read-only=%ld\n", r, first, back,
+           ot_errno(syscall(SYS_remap_file_pages, file, 4096L, 0L, 1L << 60, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, read_only, 4096L, 0L, 1L, 0L)));
+    snprintf(path, sizeof path, "%s/sub", dir);
+    rmdir(path);
+    snprintf(path, sizeof path, "%s/file", dir);
+    unlink(path);
+    rmdir(dir);
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -16289,6 +16396,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "pkey")) return pkey_case();
     if (!strcmp(mode, "vector-flags")) return vector_flags_case();
     if (!strcmp(mode, "old-times")) return old_times_case();
+    if (!strcmp(mode, "old-forms")) return old_forms_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

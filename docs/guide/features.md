@@ -55,16 +55,16 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, and the pseudo-terminals' requests below) |
-| Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
+| Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
@@ -90,7 +90,10 @@ kernel.
   file positions; `sendfile` writes its offset back even after an error.
 - `getdents64` goes on from what it has returned, so unlinking those entries
   skips nothing. `lseek` to a `d_off` leads to the same entry while the
-  directory is unchanged, and `dup` and `fork` share the place.
+  directory is unchanged, and `dup` and `fork` share the place. `getdents`
+  is the same with the old `linux_dirent`, whose last byte is the type. Both
+  keep the count in an `int` as Linux does, so one of 2 GiB or more fits no
+  entry (`EINVAL`).
 - Extended attributes stay with a file in memory, through hard links and
   renames and after its last name is gone. As on Linux, `user.*` is for regular
   files and directories (on others, reading gives `ENODATA` and writing `EPERM`),
@@ -595,6 +598,11 @@ kernel.
   `EFAULT`.
 - `msync` checks its arguments and the range, and with `MS_SYNC` or
   `MS_ASYNC` writes the stores of shared file mappings back to their files.
+- `remap_file_pages` maps a range of a shared mapping again at another page
+  of its file or shared memory, as Linux's `mmap` of the mapping's own file
+  does, keeping its protection. As on Linux, `prot` must be 0 and the range
+  must lie in shared mappings of the same memory that may write, with no
+  hole (`EINVAL`), and a page past what a file can reach is `EOVERFLOW`.
 - System V shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) belongs to
   the thread's IPC namespace, with Linux's checks in Linux's order and its
   default limits; a new IPC namespace starts with no segments. A segment's ID is its index and a sequence number, given
@@ -1173,7 +1181,9 @@ kernel.
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts (`tmpfs` for the root, `hostfs` for each
   `--mount`, without host paths). Each mount has its own `st_dev`, as its
-  line in `mountinfo` says, so `df` lists every mount.
+  line in `mountinfo` says, so `df` lists every mount. `ustat` of a mount's
+  `st_dev` gives its free blocks and inodes, and of any other device
+  `EINVAL`.
 - A file's block size (`st_blksize`, `stx_blksize`, `FIGETBSZ`) is its
   filesystem's, as on Linux: 1024 for `/proc` (procfs), a pseudo-terminal's
   slave and a terminal on standard input, output or error (devpts), and 4096

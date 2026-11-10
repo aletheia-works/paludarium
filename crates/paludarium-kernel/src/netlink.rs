@@ -52,14 +52,15 @@ const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
 const RTM_GETROUTE: u16 = 26;
 /// The groups (`RTNLGRP_*`) notifications go to, and how many there are
-/// (`RTNLGRP_MAX`); the multicast routing ones of a full routing daemon
-/// need `CAP_NET_ADMIN` (bits of groups 30 and 31).
+/// (`RTNLGRP_MAX`).
 const RTNLGRP_LINK: u32 = 1;
 const RTNLGRP_IPV4_IFADDR: u32 = 5;
 const RTNLGRP_IPV4_ROUTE: u32 = 7;
 const RTNLGRP_IPV6_IFADDR: u32 = 9;
 const RTNLGRP_IPV6_ROUTE: u32 = 11;
 const GROUPS: u32 = 39;
+/// The bits of groups 30 and 31, the multicast routing ones of a full
+/// routing daemon, which need `CAP_NET_ADMIN` (`rtnetlink_bind`).
 const PRIVILEGED_GROUPS: u32 = 0x6000_0000;
 const NETLINK_ADD_MEMBERSHIP: u64 = 1;
 const NETLINK_DROP_MEMBERSHIP: u64 = 2;
@@ -1781,10 +1782,6 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
     let value: Vec<u8> = {
         let mut s = socket.lock();
         match (level, name) {
-            // Set-only options.
-            (SOL_NETLINK, NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP) => {
-                return Err(EOPNOTSUPP);
-            }
             (SOL_SOCKET, 20 | 66) => s.receive_timeout.timeval().to_vec(),
             (SOL_SOCKET, 3) => (socket.kind as i32).to_le_bytes().to_vec(),
             (SOL_SOCKET, 4) => s.error.take().map_or(0, |e| e.0).to_le_bytes().to_vec(),

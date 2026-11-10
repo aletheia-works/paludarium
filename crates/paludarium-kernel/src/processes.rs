@@ -2436,7 +2436,9 @@ impl Kernel {
         // unshare_userns, then unshare_nsproxy_namespaces with the
         // credentials it gave.
         let own = self.group.namespaces(thread.tid);
-        let credentials = crate::namespaces::user_for(&own, &thread.state.credentials, flags)?;
+        let msgqueue = self.processes.soft_limit(self.process.pid, 12);
+        let credentials =
+            crate::namespaces::user_for(&own, &thread.state.credentials, flags, msgqueue)?;
         crate::namespaces::check(flags, credentials.administers_own())?;
         if flags & NAMESPACES != 0 {
             let mut namespaces = own.unshared(flags, &credentials.user.0)?;
@@ -2760,7 +2762,9 @@ impl Kernel {
         // which CLONE_SYSVSEM would share.
         // copy_creds first, whose new user namespace the others are in.
         let own = self.group.namespaces(parent.tid);
-        let credentials = crate::namespaces::user_for(&own, &parent.state.credentials, namespaces)?;
+        let msgqueue = self.processes.soft_limit(self.process.pid, 12);
+        let credentials =
+            crate::namespaces::user_for(&own, &parent.state.credentials, namespaces, msgqueue)?;
         crate::namespaces::check(namespaces, credentials.administers_own())?;
         if namespaces & crate::namespaces::CLONE_NEWIPC != 0 && flags & 0x40000 != 0 {
             return Err(Errno::EINVAL);

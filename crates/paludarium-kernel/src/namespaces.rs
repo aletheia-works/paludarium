@@ -52,16 +52,18 @@ pub(crate) fn check(flags: u64, administers: bool) -> Result<(), Errno> {
 /// The credentials a thread with `creds` has after `flags`: with
 /// `CLONE_NEWUSER`, in a new user namespace in its own, which it owns and
 /// has every capability in (Linux's `create_user_ns` and
-/// `set_cred_user_ns`).
+/// `set_cred_user_ns`), which keeps the thread's `RLIMIT_MSGQUEUE` soft
+/// limit `msgqueue` as the most its users' message queues may charge.
 pub(crate) fn user_for(
     namespaces: &Namespaces,
     creds: &crate::credentials::Credentials,
     flags: u64,
+    msgqueue: u64,
 ) -> Result<crate::credentials::Credentials, Errno> {
     if flags & CLONE_NEWUSER == 0 {
         return Ok(creds.clone());
     }
-    let user = Namespace::new_user(&creds.user.0, namespaces.next_inode(), creds)?;
+    let user = Namespace::new_user(&creds.user.0, namespaces.next_inode(), creds, msgqueue)?;
     Ok(crate::credentials::Credentials {
         user: crate::users::UserNs(user),
         permitted: crate::credentials::ALL_CAPABILITIES,

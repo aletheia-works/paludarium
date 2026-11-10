@@ -166,6 +166,7 @@ mod linux {
                     | "mqueue-notify"
                     | "mqueue-fork"
                     | "mqueue-sysctl"
+                    | "mqueue-accounts"
                     | "netlink"
                     | "unix-interfaces"
                     | "addresses"
@@ -328,6 +329,7 @@ mod linux {
         mqueue_notify => ("mqueue-notify","mqueue"),
         mqueue_fork => ("mqueue-fork","mqueue"),
         mqueue_sysctl => ("mqueue-sysctl","mqueue"),
+        mqueue_accounts => ("mqueue-accounts","mqueue"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),

@@ -1061,6 +1061,12 @@ impl Kernel {
             .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
     }
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
+        // The last task to let go of the table closes its files
+        // (`put_files_struct`), each close dropping that task's process's
+        // message queue registrations (`mqueue_flush_file`).
+        if self.files.is_last_reference() {
+            crate::mqueue::exited(&self.files, self.process.pid);
+        }
         self.files.release_descriptors();
         let addr = thread.state.clear_child_tid;
         let robust = self.group.take_robust_list(thread.tid);

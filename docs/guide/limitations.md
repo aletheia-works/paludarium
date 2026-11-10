@@ -195,15 +195,10 @@ verified.
     all look again whenever it changes, where Linux wakes them in the order
     they began only while each one's message fits.
   - The POSIX message queues' filesystem cannot be mounted (there is no
-    `/dev/mqueue`). `RLIMIT_MSGQUEUE` charges each real user ID
-    once for the whole machine, where Linux charges it in each user
-    namespace too. A queue's file keeps only its creation time, and its
+    `/dev/mqueue`). A queue's file keeps only its creation time, and its
     root belongs to root in every IPC namespace. A `SIGEV_THREAD` cookie
     goes to its socket even when the socket's receive buffer is full,
-    where Linux's `mq_notify` first waits for room. The registration of a
-    process that ends goes when the queue is next used, where Linux drops it
-    as the process closes its descriptors: a `SIGEV_THREAD` socket still
-    open elsewhere gets its `NOTIFY_REMOVED` cookie only then.
+    where Linux's `mq_notify` first waits for room.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
     where Linux checks the writer again at each write, and it reports its
     value's length as its size, where Linux reports 0.

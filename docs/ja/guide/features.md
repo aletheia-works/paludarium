@@ -602,9 +602,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   キューは 256 個まで（`queues_max`、`ENOSPC`）、メッセージは 10 個まで（`msg_max`）、
   1 つ 8192 バイトまで（`msgsize_max`）で、既定値（`msg_default`、`msgsize_default`）も
   同じです。属性なしで作るキューは、それぞれ既定値と上限の小さいほうを取ります。
-  `CAP_SYS_RESOURCE` があれば上限を超えられ、16 MiB のメッセージを 65536 個まで持てます。キューは、消されて閉じられるまで、作った者の実ユーザー ID に、その
-  バイト数と Linux がメッセージごとに使う管理領域（x86-64 で 48 + 48 バイト）を
-  `RLIMIT_MSGQUEUE` に対して課します（`EMFILE`）。`mq_open` は close-on-exec の
+  `CAP_SYS_RESOURCE` があれば上限を超えられ、16 MiB のメッセージを 65536 個まで持てます。キューは、消されて閉じられるまで、その
+  バイト数と Linux がメッセージごとに使う管理領域（x86-64 で 48 + 48 バイト）を、Linux の
+  `inc_rlimit_ucounts` と同じく課します（どれかの上限を超えれば `EMFILE`）。作った者の
+  ユーザー名前空間でのその実ユーザー ID に、作った者の `RLIMIT_MSGQUEUE` に対して課し、
+  作った者がいるユーザー名前空間のそれぞれについて、親の名前空間でのその名前空間の持ち主に、
+  持ち主が名前空間を作ったときの `RLIMIT_MSGQUEUE` に対して課します。`mq_open` は close-on-exec の
   記述子を返し、`fork` はそれを `O_NONBLOCK`（`mq_getsetattr` でも `fcntl` でも設定
   できます）ごと共有します。`poll`、`select`、`epoll` では、アクセスモードによらず、
   メッセージがあれば読め、空きがあれば書けます。メッセージが入るたびに、エッジトリガーの

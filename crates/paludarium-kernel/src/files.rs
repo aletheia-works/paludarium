@@ -222,6 +222,19 @@ impl Files {
     pub(crate) fn exec_path(&self, path: Vec<u8>) -> Result<Vec<u8>, Errno> {
         self.path((-100i32) as u64, path)
     }
+    /// Whether no other task shares this descriptor table.
+    pub(crate) fn is_last_reference(&self) -> bool {
+        Arc::strong_count(&self.fds) == 1
+    }
+    /// The files the descriptors open, one for each descriptor.
+    pub(crate) fn open_files(&self) -> Vec<Arc<dyn FileHandle>> {
+        self.fds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(|descriptor| Arc::clone(&descriptor.file))
+            .collect()
+    }
     /// Takes out the descriptors marked close-on-exec, for exec to close,
     /// when no other task shares this table; one that does keeps the files
     /// open in it, as Linux's `unshare_files` gives exec a copy first.

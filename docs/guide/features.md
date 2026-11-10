@@ -669,10 +669,13 @@ kernel.
   and the same defaults (`msg_default`, `msgsize_default`), of which a
   queue made without attributes takes the smaller of each and its limit;
   `CAP_SYS_RESOURCE` passes the limits and allows up to 65536 messages of
-  16 MiB. A queue charges its
-  creator's real user ID for its bytes and Linux's bookkeeping of each
-  message (48 + 48 bytes on x86-64) against `RLIMIT_MSGQUEUE` (`EMFILE`)
-  until it is unlinked and closed. `mq_open` gives a close-on-exec
+  16 MiB. Until it is unlinked and closed, a queue charges its bytes and
+  Linux's bookkeeping of each message (48 + 48 bytes on x86-64) as Linux's
+  `inc_rlimit_ucounts` does (`EMFILE` past any limit): to its creator's
+  real user ID in the creator's user namespace, against the creator's
+  `RLIMIT_MSGQUEUE`, and for each user namespace the creator is in, to the
+  namespace's owner in its parent, against the `RLIMIT_MSGQUEUE` the owner
+  had when it made the namespace. `mq_open` gives a close-on-exec
   descriptor, which `fork` shares with its `O_NONBLOCK` (which
   `mq_getsetattr` and `fcntl` both set): `poll`, `select` and `epoll` find
   it readable with a message and writable with room, whatever its access

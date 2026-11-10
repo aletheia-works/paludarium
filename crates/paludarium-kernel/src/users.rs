@@ -82,19 +82,30 @@ impl Maps {
 
 /// What a user namespace holds: its parent, how deep it is, the effective
 /// IDs of the thread that made it (its owner), whether that thread had
-/// CAP_SETFCAP, and its maps.
+/// CAP_SETFCAP, that thread's `RLIMIT_MSGQUEUE` then, and its maps.
 #[derive(Debug, Default)]
 pub(crate) struct Users {
     parent: Option<Arc<Namespace>>,
     depth: u32,
     owner: u32,
     could_setfcap: bool,
+    /// The most bytes of POSIX message queues the namespace's users may
+    /// charge together, in its parent's count of its owner
+    /// (`set_userns_rlimit_max` of `UCOUNT_RLIMIT_MSGQUEUE`).
+    msgqueue_max: u64,
     maps: Mutex<Maps>,
 }
 
 impl Users {
     pub(crate) fn parent(&self) -> Option<&Arc<Namespace>> {
         self.parent.as_ref()
+    }
+    /// The kernel user ID of the thread that made the namespace.
+    pub(crate) fn owner(&self) -> u32 {
+        self.owner
+    }
+    pub(crate) fn msgqueue_max(&self) -> u64 {
+        self.msgqueue_max
     }
 }
 
@@ -115,6 +126,7 @@ impl Namespace {
         parent: &Arc<Namespace>,
         inode: u32,
         creds: &Credentials,
+        msgqueue_max: u64,
     ) -> Result<Arc<Namespace>, Errno> {
         if parent.users.depth > MAX_DEPTH {
             return Err(ENOSPC);
@@ -129,6 +141,7 @@ impl Namespace {
             depth: parent.users.depth + 1,
             owner: creds.euid,
             could_setfcap: creds.effective & CAP_SETFCAP != 0,
+            msgqueue_max,
             maps: Mutex::new(Maps {
                 setgroups_denied: parent.maps().setgroups_denied,
                 ..Maps::default()
@@ -575,7 +588,7 @@ mod tests {
     #[test]
     fn nobody_shows_as_the_overflow_id_where_65534_is_mapped() {
         let root = Credentials::default();
-        let ns = Namespace::new_user(first(), 0xF000_1000, &root).unwrap();
+        let ns = Namespace::new_user(first(), 0xF000_1000, &root, u64::MAX).unwrap();
         ns.write_map(Ids::User, b"0 65534 1", &root, &root).unwrap();
         assert_eq!(ns.shown(Ids::User, OVERFLOW), 0);
         assert_eq!(ns.shown(Ids::User, INVALID), OVERFLOW);

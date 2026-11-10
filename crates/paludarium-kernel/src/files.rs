@@ -1069,6 +1069,8 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
 /// `getdents`, `sendfile` and `copy_file_range`, and `fcntl` but for the
 /// commands `check_fcntl_cmd` lets through (duplicating, the descriptor
 /// flags and `F_GETFL`). A descriptor that is not open is left to the call.
+/// `splice`, `tee` and `vmsplice` refuse one themselves (`splice::file`),
+/// after the checks Linux makes before `fdget`.
 fn refuse_path_only(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<(), Errno> {
     let descriptors: &[u64] = match n {
         // read, readv, writev, pread64, pwrite64, preadv, pwritev, preadv2,

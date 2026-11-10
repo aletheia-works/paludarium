@@ -275,6 +275,9 @@ impl SyscallTable {
         handlers.insert(70, crate::msg::sys_msgrcv);
         handlers.insert(71, crate::msg::sys_msgctl);
         handlers.insert(334, crate::rseq::sys_rseq);
+        handlers.insert(425, crate::io_uring::sys_setup);
+        handlers.insert(426, crate::io_uring::sys_enter);
+        handlers.insert(427, crate::io_uring::sys_register);
         handlers.insert(444, |c, a| {
             Outcome::Return(
                 crate::landlock::sys_create_ruleset(c, a).unwrap_or_else(Errno::to_syscall_return),
@@ -1470,6 +1473,25 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let file = descriptor.as_ref().map(|d| d.file.clone());
     if len == 0 || !matches!(flags & (MAP_SHARED | MAP_PRIVATE), MAP_SHARED | MAP_PRIVATE) {
         return err(Errno::EINVAL);
+    }
+    // A ring of io_uring maps its own pages.
+    if let Some(file) = &file
+        && file
+            .as_any()
+            .is_some_and(|v| v.is::<crate::io_uring::Ring>())
+    {
+        return match crate::io_uring::mmap(
+            c,
+            file,
+            addr,
+            len,
+            prot,
+            flags & MAP_SHARED != 0,
+            offset,
+        ) {
+            Ok(at) => ok(at),
+            Err(e) => err(e),
+        };
     }
     if let Some(file) = &file
         && let Err(e) = check_mappable(file.as_ref(), prot, flags, offset, len)

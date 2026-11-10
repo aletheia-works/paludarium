@@ -4738,6 +4738,236 @@ static void *rseq_other_thread(void *unused) {
     return 0;
 }
 
+/* io_uring with what every Linux since 6.1 answers alike: the sizes, the
+   offsets, the features libuv needs, NOP and EPOLL_CTL, links, a full
+   completion queue, and the errors of enter and register. */
+struct uring {
+    int fd;
+    unsigned char *rings, *sqes;
+    unsigned array, sq_entries, cq_entries;
+};
+
+static long uring_setup(unsigned entries, unsigned char *p) {
+    return syscall(425, entries, p);
+}
+
+static long uring_enter(int fd, unsigned submit, unsigned min, unsigned flags, void *arg,
+                        long size) {
+    return syscall(426, fd, submit, min, flags, arg, size);
+}
+
+static unsigned *u32p(unsigned char *base, unsigned at) { return (unsigned *)(base + at); }
+
+static int uring_open(struct uring *u, unsigned entries) {
+    unsigned char p[120];
+    memset(p, 0, sizeof p);
+    long fd = uring_setup(entries, p);
+    if (fd < 0) return -1;
+    u->fd = (int)fd;
+    u->sq_entries = *u32p(p, 0);
+    u->cq_entries = *u32p(p, 4);
+    u->array = *u32p(p, 64);
+    u->rings = mmap(NULL, u->array + 4 * u->sq_entries, PROT_READ | PROT_WRITE, MAP_SHARED,
+                    u->fd, 0);
+    u->sqes = mmap(NULL, 64 * u->sq_entries, PROT_READ | PROT_WRITE, MAP_SHARED, u->fd,
+                   0x10000000);
+    return u->rings == MAP_FAILED || u->sqes == MAP_FAILED ? -1 : 0;
+}
+
+static unsigned char *uring_push(struct uring *u, unsigned char opcode, unsigned long data) {
+    unsigned tail = *u32p(u->rings, 4);
+    unsigned slot = tail & (u->sq_entries - 1);
+    unsigned char *sqe = u->sqes + 64 * slot;
+    memset(sqe, 0, 64);
+    sqe[0] = opcode;
+    memcpy(sqe + 32, &data, 8);
+    *u32p(u->rings, u->array + 4 * slot) = slot;
+    __atomic_store_n(u32p(u->rings, 4), tail + 1, __ATOMIC_RELEASE);
+    return sqe;
+}
+
+static void uring_reap(struct uring *u, const char *label) {
+    unsigned head = *u32p(u->rings, 8);
+    unsigned tail = __atomic_load_n(u32p(u->rings, 12), __ATOMIC_ACQUIRE);
+    printf("%s:", label);
+    for (; head != tail; head++) {
+        unsigned char *cqe = u->rings + 64 + 16 * (head & (u->cq_entries - 1));
+        unsigned long data;
+        int res;
+        memcpy(&data, cqe, 8);
+        memcpy(&res, cqe + 8, 4);
+        printf(" %lu=%d", data, res);
+    }
+    printf("\n");
+    __atomic_store_n(u32p(u->rings, 8), head, __ATOMIC_RELEASE);
+}
+
+static void uring_show(const char *label, long r) {
+    printf("%s: r=%ld errno=%d\n", label, r, r < 0 ? errno : 0);
+    errno = 0;
+}
+
+static int io_uring_case(void) {
+    unsigned char p[120];
+    memset(p, 0, sizeof p);
+    errno = 0;
+    long fd = uring_setup(3, p);
+    if (fd < 0) {
+        printf("setup: errno=%d\n", errno);
+        return 1;
+    }
+    printf("entries: %u %u\n", *u32p(p, 0), *u32p(p, 4));
+    printf("sq_off:");
+    for (int i = 0; i < 7; i++) printf(" %u", *u32p(p, 40 + 4 * i));
+    printf("\ncq_off:");
+    for (int i = 0; i < 7; i++) printf(" %u", *u32p(p, 80 + 4 * i));
+    /* SINGLE_MMAP, NODROP, EXT_ARG and RSRC_TAGS: what libuv and liburing
+       look for. */
+    printf("\nfeatures: %d\n", (*u32p(p, 20) & 0x503) == 0x503);
+    printf("cloexec: %d\n", fcntl((int)fd, F_GETFD) & FD_CLOEXEC);
+    close((int)fd);
+
+    /* Errors of setup that no kernel since 6.1 answers otherwise. */
+    memset(p, 0, sizeof p);
+    uring_show("setup-zero", uring_setup(0, p));
+    uring_show("setup-huge", uring_setup(32769, p));
+    uring_show("setup-fault", uring_setup(4, NULL));
+    *u32p(p, 8) = 1u << 31;
+    uring_show("setup-unknown-flag", uring_setup(4, p));
+    memset(p, 0, sizeof p);
+    p[30] = 1;
+    uring_show("setup-resv", uring_setup(4, p));
+    memset(p, 0, sizeof p);
+    *u32p(p, 8) = 1 << 9;
+    uring_show("setup-taskrun-flag", uring_setup(4, p));
+    memset(p, 0, sizeof p);
+    *u32p(p, 8) = 1 << 3;
+    *u32p(p, 4) = 2;
+    uring_show("setup-small-cq", uring_setup(4, p));
+    memset(p, 0, sizeof p);
+    *u32p(p, 8) = 1 << 3 | 1 << 4;
+    *u32p(p, 4) = 100000;
+    fd = uring_setup(40000, p);
+    printf("clamped: %u %u\n", *u32p(p, 0), *u32p(p, 4));
+    close((int)fd);
+
+    struct uring u;
+    if (uring_open(&u, 4)) return 2;
+    printf("rings: %u %u %u %u\n", *u32p(u.rings, 16), *u32p(u.rings, 20), *u32p(u.rings, 24),
+           *u32p(u.rings, 28));
+    uring_show("mmap-hint", (long)mmap((void *)0x30000000, 4096, PROT_READ, MAP_SHARED, u.fd, 0));
+    uring_show("mmap-region", (long)mmap(NULL, 4096, PROT_READ, MAP_SHARED, u.fd, 0x80000000L));
+
+    uring_push(&u, 0, 7);
+    uring_show("enter-nop", uring_enter(u.fd, 1, 1, 1, NULL, 0));
+    uring_reap(&u, "nop");
+    printf("sq-head: %u\n", *u32p(u.rings, 0));
+    unsigned char *sqe = uring_push(&u, 0, 8);
+    *u32p(sqe, 28) = 1;
+    *u32p(sqe, 24) = (unsigned)-5;
+    uring_show("enter-inject", uring_enter(u.fd, 1, 0, 0, NULL, 0));
+    uring_reap(&u, "inject");
+
+    int epfd = epoll_create1(0);
+    int efd = eventfd(0, 0);
+    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 42};
+    for (int i = 0; i < 2; i++) {
+        sqe = uring_push(&u, 29, 9);
+        *(int *)(sqe + 4) = epfd;
+        *(unsigned long *)(sqe + 8) = (unsigned)efd;
+        *(unsigned long *)(sqe + 16) = (unsigned long)&ev;
+        *u32p(sqe, 24) = EPOLL_CTL_ADD;
+    }
+    uring_show("enter-epoll", uring_enter(u.fd, 2, 2, 1, NULL, 0));
+    uring_reap(&u, "epoll-add");
+    eventfd_write(efd, 1);
+    struct epoll_event out = {0};
+    int ready = epoll_wait(epfd, &out, 1, 0);
+    printf("epoll_wait: %d %llu\n", ready, (unsigned long long)out.data.u64);
+    sqe = uring_push(&u, 29, 10);
+    *(int *)(sqe + 4) = epfd;
+    *(unsigned long *)(sqe + 8) = (unsigned)efd;
+    *(unsigned long *)(sqe + 16) = 8;
+    *u32p(sqe, 24) = EPOLL_CTL_MOD;
+    uring_enter(u.fd, 1, 1, 1, NULL, 0);
+    uring_reap(&u, "epoll-fault");
+    sqe = uring_push(&u, 29, 11);
+    *(int *)(sqe + 4) = efd;
+    *(unsigned long *)(sqe + 8) = (unsigned)epfd;
+    *u32p(sqe, 24) = EPOLL_CTL_DEL;
+    uring_enter(u.fd, 1, 1, 1, NULL, 0);
+    uring_reap(&u, "epoll-not-epoll");
+
+    /* An operation no kernel has ends the submission after itself. */
+    uring_push(&u, 255, 1);
+    uring_push(&u, 0, 2);
+    uring_show("enter-unknown", uring_enter(u.fd, 2, 0, 0, NULL, 0));
+    uring_show("enter-rest", uring_enter(u.fd, 1, 0, 0, NULL, 0));
+    uring_reap(&u, "unknown");
+
+    /* Links: a soft one cancels the rest after a failure, a hard one not,
+       and one whose member fails to prepare fails all. */
+    sqe = uring_push(&u, 0, 3);
+    sqe[1] = 1 << 2;
+    *u32p(sqe, 28) = 1;
+    *u32p(sqe, 24) = (unsigned)-1;
+    uring_push(&u, 0, 4);
+    uring_enter(u.fd, 2, 2, 1, NULL, 0);
+    uring_reap(&u, "soft-link");
+    sqe = uring_push(&u, 0, 5);
+    sqe[1] = 1 << 3;
+    *u32p(sqe, 28) = 1;
+    *u32p(sqe, 24) = (unsigned)-1;
+    uring_push(&u, 0, 6);
+    uring_enter(u.fd, 2, 2, 1, NULL, 0);
+    uring_reap(&u, "hard-link");
+    sqe = uring_push(&u, 0, 12);
+    sqe[1] = 1 << 2;
+    sqe = uring_push(&u, 255, 13);
+    sqe[1] = 1 << 2;
+    uring_push(&u, 0, 14);
+    uring_show("enter-bad-link", uring_enter(u.fd, 3, 3, 1, NULL, 0));
+    uring_reap(&u, "bad-link");
+    sqe = uring_push(&u, 0, 15);
+    sqe[1] = 1 << 6;
+    uring_push(&u, 0, 16);
+    uring_enter(u.fd, 2, 1, 1, NULL, 0);
+    uring_reap(&u, "skip-success");
+
+    /* Twelve NOPs for a completion queue of eight. */
+    for (int round = 0; round < 3; round++) {
+        for (int i = 0; i < 4; i++) uring_push(&u, 0, 100 + 4 * round + i);
+        uring_enter(u.fd, 4, 0, 0, NULL, 0);
+    }
+    printf("overflow-flag: %u\n", *u32p(u.rings, 36) & 2);
+    uring_reap(&u, "first");
+    uring_show("enter-flush", uring_enter(u.fd, 0, 1, 1, NULL, 0));
+    uring_reap(&u, "rest");
+    printf("overflow-flag: %u\n", *u32p(u.rings, 36) & 2);
+
+    /* enter's and register's errors. */
+    uring_show("enter-flags", uring_enter(u.fd, 0, 0, 1u << 31, NULL, 0));
+    uring_show("enter-badf", uring_enter(999, 0, 0, 0, NULL, 0));
+    uring_show("enter-not-ring", uring_enter(efd, 0, 0, 0, NULL, 0));
+    uring_show("enter-registered", uring_enter(16, 0, 0, 1 << 4, NULL, 0));
+    uring_show("enter-empty", uring_enter(u.fd, 4, 1, 1, NULL, 0));
+    long ts[2] = {0, 1000000};
+    unsigned long arg[3] = {0, 0, (unsigned long)ts};
+    uring_show("enter-timeout", uring_enter(u.fd, 0, 1, 1 | 1 << 3, arg, 24));
+    uring_show("enter-arg-size", uring_enter(u.fd, 0, 1, 1 | 1 << 3, arg, 16));
+    uring_show("register-unknown", syscall(427, u.fd, 255, NULL, 0));
+    uring_show("register-not-ring", syscall(427, efd, 8, NULL, 0));
+    unsigned char probe[16 + 8 * 64];
+    memset(probe, 0, sizeof probe);
+    uring_show("probe", syscall(427, u.fd, 8, probe, 64));
+    printf("probe-nop: %d epoll: %d\n", probe[16 + 2] & 1, probe[16 + 8 * 29 + 2] & 1);
+    uring_show("probe-dirty", syscall(427, u.fd, 8, probe, 1));
+    close(efd);
+    close(epfd);
+    close(u.fd);
+    return 0;
+}
+
 /* mprotect's checks in Linux's order, and the grows flags: only the main
    stack grows down (a MAP_GROWSDOWN mapping does on Linux but not in the
    emulator), and nothing grows up on x86-64. */
@@ -15294,6 +15524,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
+    if (!strcmp(mode, "io-uring")) return io_uring_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

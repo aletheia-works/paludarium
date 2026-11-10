@@ -135,10 +135,16 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **保護キー**：仮想 CPU には保護キーがありません（`CPUID` は PKU を報告しません）。そのため
   `pkey_alloc` は、そういう CPU での Linux と同じく `ENOSPC` を返し、プログラムは保護キーなしで
   続けます。`RDPKRU` と `WRPKRU` は、そういう CPU と同じく `SIGILL` でプログラムを止めます。
+- **io_uring の一部**：実行するのは `IORING_OP_NOP` と `IORING_OP_EPOLL_CTL` だけで、ほかの
+  操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
+  `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、
+  `_REGISTERED_FD_ONLY` は `EINVAL` です。`io_uring_register` は `IORING_REGISTER_PROBE`
+  だけで（ほかは `EINVAL`）、リングの記述子、ファイル、バッファー、パーソナリティは登録
+  できません。リングは共有でしかマップできず（`MAP_PRIVATE` は `EINVAL`）、`poll` と `epoll` は
+  その記述子を見張れません。要求はすべて `io_uring_enter` の中で完了するので、ある数より多くの
+  完了を待つと、シグナルかタイムアウトでしか終わりません。
 - **一部のシステムコール**：実装していないシステムコールは `ENOSYS` を返すので、
   プログラムによってはその機能なしで続けられます。
-  - `io_uring_setup` はその一つで、io_uring なしでビルドした Linux と同じです。プログラムは
-    これを確かめて続けます。残りの部分なしで成功させるのは誤りです。リングは何も処理しません。
   - System V IPC には `/proc/sysvipc` がなく、共有メモリ・セマフォー・メッセージキューの
     上限は Linux の既定値で、`/proc/sys/kernel` から変えられません。メッセージキューで
     待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの

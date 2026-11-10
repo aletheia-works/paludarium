@@ -181,6 +181,7 @@
     {"name":"rseq","binary":"process"},
     {"name":"pkey","binary":"process"},
     {"name":"mprotect-checks","binary":"process"},
+    {"name":"io-uring","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

@@ -871,6 +871,24 @@ impl SharedPages {
         // After the bytes, as in `AddressSpaceData::store`.
         self.changed();
     }
+    /// Copies the bytes from offset `at` of the memory to `buf`, as the
+    /// kernel reads memory it shares with the mappings of it (an io_uring
+    /// ring). Pages without contents read as zeros.
+    pub fn load(&self, at: u64, buf: &mut [u8]) {
+        let mut done = 0;
+        while done < buf.len() {
+            let offset = at + done as u64;
+            let key = offset - offset % PAGE_SIZE;
+            let within = page_offset(offset);
+            let piece = (PAGE_BYTES - within).min(buf.len() - done);
+            let frame = self.lock().get(&key).cloned();
+            match frame.as_ref().and_then(|frame| frame.get()) {
+                Some(bytes) => bytes.read(within, &mut buf[done..done + piece]),
+                None => buf[done..done + piece].fill(0),
+            }
+            done += piece;
+        }
+    }
     /// Zeros `[start, end)` of the memory, as truncating or punching a hole
     /// in the file does to its page cache. The pages do not become dirty.
     pub fn zero(&self, start: u64, end: u64) {

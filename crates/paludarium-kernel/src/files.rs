@@ -4587,6 +4587,7 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
             Some(v) if v.is::<crate::timerfd::TimerFile>() => "timerfd",
             Some(v) if v.is::<crate::signalfd::SignalFile>() => "signalfd",
             Some(v) if v.is::<crate::landlock::Ruleset>() => "landlock-ruleset",
+            Some(v) if v.is::<crate::io_uring::Ring>() => "io_uring",
             // The last kind of no type; Linux 6.9 and later name it from
             // pidfs instead.
             _ => "pidfd",

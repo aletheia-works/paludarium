@@ -236,6 +236,43 @@ impl FileHandle for EpollInstance {
         Ok(())
     }
 }
+/// An `epoll_event` as x86-64 packs it: the events, then the data.
+pub(crate) fn event_from(bytes: &[u8; 12]) -> (u32, u64) {
+    let (events, data) = bytes.split_at(4);
+    (
+        u32::from_le_bytes(events.try_into().unwrap_or_default()),
+        u64::from_le_bytes(data.try_into().unwrap_or_default()),
+    )
+}
+
+/// `epoll_ctl(epfd, op, fd, event)`: the epoll descriptor, then the target,
+/// as `fdget` takes them (`EBADF` for `O_PATH`), then the event unless `op`
+/// is `EPOLL_CTL_DEL`. io_uring's `IORING_OP_EPOLL_CTL` read its event
+/// already, so its `event` gives what it read.
+pub(crate) fn control(
+    c: &mut Context<'_>,
+    epfd: u64,
+    op: u64,
+    fd: u64,
+    event: impl FnOnce(&Context<'_>) -> Result<(u32, u64), Errno>,
+) -> Result<(), Errno> {
+    let d = c.files.descriptor(epfd)?;
+    if d.file.flags() & O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    let epoll = d
+        .file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<EpollInstance>())
+        .ok_or(Errno::EINVAL)?;
+    let target = c.files.descriptor(fd)?;
+    if target.file.flags() & O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    let (events, data) = if op == 2 { (0, 0) } else { event(c)? };
+    epoll.control(op, fd as u32, target.file, events, data)
+}
+
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = (|| {
         let number = c.number;
@@ -252,6 +289,17 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 )
                 .map(u64::from);
         }
+        if number == 233 {
+            let at = a[3];
+            control(c, a[0], a[1], a[2], |c| {
+                let mut bytes = [0; 12];
+                c.mem
+                    .read(GuestAddr(at), &mut bytes)
+                    .map_err(|_| Errno::EFAULT)?;
+                Ok(event_from(&bytes))
+            })?;
+            return Ok(0);
+        }
         // The epoll descriptor too, as `fdget` takes it (EBADF for `O_PATH`).
         let d = c.files.descriptor(a[0])?;
         if d.file.flags() & O_PATH != 0 {
@@ -262,28 +310,6 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             .as_any()
             .and_then(|v| v.downcast_ref::<EpollInstance>())
             .ok_or(Errno::EINVAL)?;
-        if number == 233 {
-            // The target as Linux's `fdget` takes it: an `O_PATH` one is
-            // not a file to watch (EBADF).
-            let target = c.files.descriptor(a[2])?;
-            if target.file.flags() & O_PATH != 0 {
-                return Err(Errno::EBADF);
-            }
-            let (events, data) = if a[1] == 2 {
-                (0, 0)
-            } else {
-                let mut bytes = [0; 12];
-                c.mem
-                    .read(GuestAddr(a[3]), &mut bytes)
-                    .map_err(|_| Errno::EFAULT)?;
-                (
-                    u32::from_le_bytes(bytes[..4].try_into().map_err(|_| Errno::EFAULT)?),
-                    u64::from_le_bytes(bytes[4..].try_into().map_err(|_| Errno::EFAULT)?),
-                )
-            };
-            epoll.control(a[1], a[2] as u32, target.file, events, data)?;
-            return Ok(0);
-        }
         let max = a[2] as i32;
         if max <= 0 || max > i32::MAX / 12 {
             return Err(Errno::EINVAL);

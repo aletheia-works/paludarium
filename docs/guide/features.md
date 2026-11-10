@@ -64,7 +64,7 @@ kernel.
 | Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, and the pseudo-terminals' requests below) |
-| Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` |
+| Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
@@ -699,6 +699,15 @@ kernel.
   `pkey_free` gives `EINVAL`; and `pkey_mprotect` with key `-1` is `mprotect`,
   while any other key gives `EINVAL` after the checks Linux makes first (an
   empty range succeeds, an overflowing one gives `ENOMEM`).
+- io_uring is Linux 6.12's with two operations, `IORING_OP_NOP` and
+  `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with); the
+  other operations complete with `EOPNOTSUPP`, as on a Linux built without
+  them, and `IORING_REGISTER_PROBE` reports only those two. The rings are
+  the sizes, offsets and features Linux gives, and `mmap` of the descriptor
+  shows them. A request runs while `io_uring_enter` takes it, so its
+  completion is in the queue when the call returns; links, completions that
+  skip success, and completions kept while the queue is full
+  (`IORING_FEAT_NODROP`) behave as on Linux.
 - `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
   `nohz_full` CPU (`MEMBARRIER_CMD_QUERY` gives `0x3ff`). The private
   commands give `EPERM` until the address space registers for them, a fork

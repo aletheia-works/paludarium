@@ -3499,3 +3499,349 @@ mod mprotect_order {
         assert_eq!(prot_at(&f, stack), Prot::READ);
     }
 }
+
+mod io_uring {
+    use super::*;
+
+    const MAP_SHARED: u64 = 1;
+    const OFF_SQES: u64 = 0x1000_0000;
+    const GETEVENTS: u64 = 1;
+
+    /// A ring of 4 entries with its rings and entries mapped: the
+    /// descriptor and where both are.
+    struct Ring {
+        fd: u64,
+        rings: u64,
+        sqes: u64,
+        array: u64,
+    }
+
+    fn params(f: &mut Fixture, flags: u32) -> u64 {
+        let p = DATA + 0x1000;
+        f.mem.write(GuestAddr(p), &[0; 120]).unwrap();
+        f.mem.write(GuestAddr(p + 8), &flags.to_le_bytes()).unwrap();
+        p
+    }
+
+    fn u32_at(f: &Fixture, at: u64) -> u32 {
+        let mut b = [0; 4];
+        f.mem.read(GuestAddr(at), &mut b).unwrap();
+        u32::from_le_bytes(b)
+    }
+
+    fn ring(f: &mut Fixture) -> Ring {
+        let p = params(f, 0);
+        let fd = f.ret(425, &[4, p]);
+        assert!(fd < 1024, "{fd:#x}");
+        let array = u64::from(u32_at(f, p + 64));
+        let rings = f.ret(9, &[0, array + 16, 3, MAP_SHARED, fd, 0]);
+        let sqes = f.ret(9, &[0, 4096, 3, MAP_SHARED, fd, OFF_SQES]);
+        Ring {
+            fd,
+            rings,
+            sqes,
+            array,
+        }
+    }
+
+    /// Puts an entry in slot `slot` and moves the tail past it.
+    fn push(f: &mut Fixture, r: &Ring, slot: u32, sqe: &[u8; 64]) {
+        f.mem
+            .write(GuestAddr(r.sqes + 64 * u64::from(slot)), sqe)
+            .unwrap();
+        f.mem
+            .write(
+                GuestAddr(r.array + r.rings + 4 * u64::from(slot)),
+                &slot.to_le_bytes(),
+            )
+            .unwrap();
+        let tail = u32_at(f, r.rings + 4) + 1;
+        f.mem
+            .write(GuestAddr(r.rings + 4), &tail.to_le_bytes())
+            .unwrap();
+    }
+
+    fn sqe(opcode: u8, user_data: u64) -> [u8; 64] {
+        let mut sqe = [0; 64];
+        sqe[0] = opcode;
+        sqe[32..40].copy_from_slice(&user_data.to_le_bytes());
+        sqe
+    }
+
+    /// The completions not yet consumed, which it consumes.
+    fn reap(f: &mut Fixture, r: &Ring) -> Vec<(u64, i32)> {
+        let (mut head, tail) = (u32_at(f, r.rings + 8), u32_at(f, r.rings + 12));
+        let mut out = Vec::new();
+        while head != tail {
+            let at = r.rings + 64 + 16 * u64::from(head & 7);
+            let mut cqe = [0; 16];
+            f.mem.read(GuestAddr(at), &mut cqe).unwrap();
+            out.push((
+                u64::from_le_bytes(cqe[..8].try_into().unwrap()),
+                i32::from_le_bytes(cqe[8..12].try_into().unwrap()),
+            ));
+            head += 1;
+        }
+        f.mem
+            .write(GuestAddr(r.rings + 8), &head.to_le_bytes())
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn setup_gives_linux_sizes_offsets_and_features() {
+        let mut f = fixture();
+        let p = params(&mut f, 0);
+        let fd = f.ret(425, &[3, p]);
+        assert!(fd < 1024);
+        assert_eq!((u32_at(&f, p), u32_at(&f, p + 4)), (4, 8));
+        assert_eq!(u32_at(&f, p + 20), 0xffff);
+        // sq_off: head, tail, ring_mask, ring_entries, flags, dropped, array.
+        let sq_off: Vec<u32> = (0..7).map(|i| u32_at(&f, p + 40 + 4 * i)).collect();
+        assert_eq!(sq_off, [0, 4, 16, 24, 36, 32, 192]);
+        // cq_off: head, tail, ring_mask, ring_entries, overflow, cqes, flags.
+        let cq_off: Vec<u32> = (0..7).map(|i| u32_at(&f, p + 80 + 4 * i)).collect();
+        assert_eq!(cq_off, [8, 12, 20, 28, 44, 64, 40]);
+        // The rings hold the masks and entries.
+        let rings = f.ret(9, &[0, 4096, 1, MAP_SHARED, fd, 0]);
+        assert_eq!(
+            (0..4)
+                .map(|i| u32_at(&f, rings + 16 + 4 * i))
+                .collect::<Vec<_>>(),
+            [3, 7, 4, 8]
+        );
+        // The descriptor closes on exec and is named as Linux's.
+        assert_eq!(f.ret(72, &[fd, 1]), 1);
+        // A size the CQ ring gives, clamped, and without the array.
+        let p = params(&mut f, 1 << 3 | 1 << 4 | 1 << 16);
+        f.mem
+            .write(GuestAddr(p + 4), &100_000u32.to_le_bytes())
+            .unwrap();
+        f.mem.write(GuestAddr(p + 64), &[9, 0, 0, 0]).unwrap();
+        let fd = f.ret(425, &[40_000, p]);
+        assert!(fd < 1024);
+        assert_eq!((u32_at(&f, p), u32_at(&f, p + 4)), (32768, 65536));
+        assert_eq!(u32_at(&f, p + 64), 9, "the array offset stays as given");
+    }
+
+    #[test]
+    fn setup_refuses_what_linux_does_and_what_is_not_implemented() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        let p = params(&mut f, 0);
+        assert_eq!(f.ret(425, &[0, p]), einval);
+        assert_eq!(f.ret(425, &[32769, p]), einval);
+        assert_eq!(f.ret(425, &[4, 0]), errno(Errno::EFAULT));
+        f.mem.write(GuestAddr(p + 32), &[1]).unwrap();
+        assert_eq!(f.ret(425, &[4, p]), einval);
+        // Unknown, and SQPOLL, IOPOLL, SQE128, CQE32 and NO_MMAP.
+        for flag in [1 << 17, 1 << 1, 1, 1 << 10, 1 << 11, 1 << 14] {
+            let p = params(&mut f, flag);
+            assert_eq!(f.ret(425, &[4, p]), einval, "{flag:#x}");
+        }
+        // TASKRUN_FLAG needs COOP_TASKRUN or DEFER_TASKRUN, which needs
+        // SINGLE_ISSUER; a CQ ring smaller than the SQ ring.
+        for flags in [1 << 9, 1 << 13] {
+            let p = params(&mut f, flags);
+            assert_eq!(f.ret(425, &[4, p]), einval);
+        }
+        let p = params(&mut f, 1 << 3);
+        f.mem.write(GuestAddr(p + 4), &2u32.to_le_bytes()).unwrap();
+        assert_eq!(f.ret(425, &[4, p]), einval);
+    }
+
+    #[test]
+    fn mmap_takes_the_offsets_linux_does() {
+        let mut f = fixture();
+        let p = params(&mut f, 0);
+        let fd = f.ret(425, &[4, p]);
+        // No address, no other region, no private mapping.
+        assert_eq!(
+            f.ret(9, &[0x30_0000, 4096, 3, MAP_SHARED, fd, 0]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(
+            f.ret(9, &[0, 4096, 3, MAP_SHARED, fd, 0x8000_0000]),
+            errno(Errno::ENOMEM)
+        );
+        assert_eq!(f.ret(9, &[0, 4096, 3, 2, fd, 0]), errno(Errno::EINVAL));
+        // The CQ ring's offset, or a page into the region, maps the rings.
+        let rings = f.ret(9, &[0, 4096, 1, MAP_SHARED, fd, 0x0800_0000]);
+        assert_eq!(u32_at(&f, rings + 24), 4);
+        let rings = f.ret(9, &[0, 4096, 1, MAP_SHARED, fd, 0x1000]);
+        assert_eq!(u32_at(&f, rings + 24), 4);
+        // Past the rings' page a mapping raises SIGBUS.
+        let wide = f.ret(9, &[0, 8192, 1, MAP_SHARED, fd, 0]);
+        let mut b = [0; 1];
+        assert!(f.mem.read(GuestAddr(wide + 4096), &mut b).is_err());
+    }
+
+    #[test]
+    fn enter_runs_nops_and_epoll_ctl() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        push(&mut f, &r, 0, &sqe(0, 7));
+        assert_eq!(f.ret(426, &[r.fd, 1, 1, GETEVENTS]), 1);
+        assert_eq!(reap(&mut f, &r), [(7, 0)]);
+        assert_eq!(u32_at(&f, r.rings), 1, "the SQ head moved");
+        // A NOP that injects its result.
+        let mut nop = sqe(0, 8);
+        nop[28] = 1;
+        nop[24..28].copy_from_slice(&(-5i32).to_le_bytes());
+        push(&mut f, &r, 1, &nop);
+        assert_eq!(f.ret(426, &[r.fd, 1, 0, 0]), 1);
+        assert_eq!(reap(&mut f, &r), [(8, -5)]);
+        // EPOLL_CTL_ADD of an eventfd, twice.
+        let epfd = f.ret(291, &[0]);
+        let efd = f.ret(290, &[0, 0]);
+        f.mem.write(GuestAddr(DATA), &[1, 0, 0, 0]).unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 4), &42u64.to_le_bytes())
+            .unwrap();
+        let mut ctl = sqe(29, 9);
+        ctl[4..8].copy_from_slice(&(epfd as i32).to_le_bytes());
+        ctl[8..16].copy_from_slice(&efd.to_le_bytes());
+        ctl[16..24].copy_from_slice(&DATA.to_le_bytes());
+        ctl[24..28].copy_from_slice(&1u32.to_le_bytes());
+        push(&mut f, &r, 2, &ctl);
+        push(&mut f, &r, 3, &ctl);
+        assert_eq!(f.ret(426, &[r.fd, 2, 2, GETEVENTS]), 2);
+        assert_eq!(reap(&mut f, &r), [(9, 0), (9, -17)]);
+        // The event's data reaches epoll_wait.
+        f.mem
+            .write(GuestAddr(DATA + 0x10), &1u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(1, &[efd, DATA + 0x10, 8]), 8);
+        assert_eq!(f.ret(232, &[epfd, DATA + 0x100, 1, 0]), 1);
+        let mut out = [0; 12];
+        f.mem.read(GuestAddr(DATA + 0x100), &mut out).unwrap();
+        assert_eq!(crate::epoll::event_from(&out), (1, 42));
+        // A bad event pointer fails its preparation.
+        ctl[16..24].copy_from_slice(&8u64.to_le_bytes());
+        push(&mut f, &r, 0, &ctl);
+        assert_eq!(f.ret(426, &[r.fd, 1, 0, 0]), 1);
+        assert_eq!(reap(&mut f, &r), [(9, -14)]);
+    }
+
+    #[test]
+    fn a_failed_preparation_ends_the_submission_and_links_cancel() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        // An operation 6.12 lacks, then one it has but is not implemented:
+        // each ends the submission after itself.
+        push(&mut f, &r, 0, &sqe(200, 1));
+        push(&mut f, &r, 1, &sqe(1, 2));
+        push(&mut f, &r, 2, &sqe(0, 3));
+        assert_eq!(f.ret(426, &[r.fd, 3, 0, 0]), 1);
+        assert_eq!(f.ret(426, &[r.fd, 2, 0, 0]), 1);
+        assert_eq!(f.ret(426, &[r.fd, 1, 0, 0]), 1);
+        assert_eq!(reap(&mut f, &r), [(1, -22), (2, -95), (3, 0)]);
+        // A soft link: a failure cancels the rest; a hard one goes on.
+        let mut fail = sqe(0, 4);
+        fail[1] = 1 << 2;
+        fail[28] = 1;
+        fail[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        push(&mut f, &r, 3, &fail);
+        push(&mut f, &r, 0, &sqe(0, 5));
+        assert_eq!(f.ret(426, &[r.fd, 2, 0, 0]), 2);
+        assert_eq!(reap(&mut f, &r), [(4, -1), (5, -125)]);
+        fail[1] = 1 << 3;
+        push(&mut f, &r, 1, &fail);
+        push(&mut f, &r, 2, &sqe(0, 6));
+        assert_eq!(f.ret(426, &[r.fd, 2, 0, 0]), 2);
+        assert_eq!(reap(&mut f, &r), [(4, -1), (6, 0)]);
+        // A link member that fails to prepare fails the link, which goes on.
+        let mut first = sqe(0, 7);
+        first[1] = 1 << 2;
+        let mut bad = sqe(200, 8);
+        bad[1] = 1 << 2;
+        push(&mut f, &r, 3, &first);
+        push(&mut f, &r, 0, &bad);
+        push(&mut f, &r, 1, &sqe(0, 9));
+        assert_eq!(f.ret(426, &[r.fd, 3, 0, 0]), 3);
+        assert_eq!(reap(&mut f, &r), [(7, -125), (8, -22), (9, -125)]);
+        // A success that skips its completion.
+        let mut skip = sqe(0, 10);
+        skip[1] = 1 << 6;
+        push(&mut f, &r, 2, &skip);
+        assert_eq!(f.ret(426, &[r.fd, 1, 0, 0]), 1);
+        assert_eq!(reap(&mut f, &r), []);
+        // An index past the entries is dropped and ends the submission.
+        f.mem
+            .write(GuestAddr(r.array + r.rings + 12), &9u32.to_le_bytes())
+            .unwrap();
+        let tail = u32_at(&f, r.rings + 4) + 1;
+        f.mem
+            .write(GuestAddr(r.rings + 4), &tail.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(426, &[r.fd, 1, 0, 0]), 0);
+        assert_eq!(u32_at(&f, r.rings + 32), 1, "sq_dropped");
+    }
+
+    #[test]
+    fn a_full_completion_queue_keeps_completions_in_order() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        // 12 NOPs for a queue of 8: four wait in the kernel.
+        for round in 0..3u64 {
+            for slot in 0..4 {
+                push(&mut f, &r, slot, &sqe(0, round * 4 + u64::from(slot)));
+            }
+            assert_eq!(f.ret(426, &[r.fd, 4, 0, 0]), 4);
+        }
+        assert_eq!(u32_at(&f, r.rings + 36) & 2, 2, "IORING_SQ_CQ_OVERFLOW");
+        let first: Vec<u64> = reap(&mut f, &r).into_iter().map(|(u, _)| u).collect();
+        assert_eq!(first, (0..8).collect::<Vec<_>>());
+        // A wait moves them in.
+        assert_eq!(f.ret(426, &[r.fd, 0, 1, GETEVENTS]), 0);
+        let rest: Vec<u64> = reap(&mut f, &r).into_iter().map(|(u, _)| u).collect();
+        assert_eq!(rest, (8..12).collect::<Vec<_>>());
+        assert_eq!(u32_at(&f, r.rings + 36) & 2, 0);
+    }
+
+    #[test]
+    fn enter_and_register_check_their_arguments() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        assert_eq!(f.ret(426, &[r.fd, 0, 0, 1 << 6]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(426, &[99, 0, 0, 0]), errno(Errno::EBADF));
+        assert_eq!(f.ret(426, &[0, 0, 0, 0]), errno(Errno(95)));
+        assert_eq!(f.ret(426, &[3, 0, 0, 1 << 4]), errno(Errno::EBADF));
+        assert_eq!(f.ret(426, &[16, 0, 0, 1 << 4]), errno(Errno::EINVAL));
+        // Nothing to submit gives 0 and skips the wait.
+        assert_eq!(f.ret(426, &[r.fd, 4, 1, GETEVENTS]), 0);
+        // A wait with a timeout ends with ETIME; a bad argument size EINVAL.
+        let ts = DATA + 0x200;
+        f.mem.write(GuestAddr(ts), &[0; 16]).unwrap();
+        f.mem
+            .write(GuestAddr(ts + 8), &1_000_000u64.to_le_bytes())
+            .unwrap();
+        let arg = DATA + 0x300;
+        f.mem.write(GuestAddr(arg), &[0; 24]).unwrap();
+        f.mem.write(GuestAddr(arg + 16), &ts.to_le_bytes()).unwrap();
+        assert_eq!(
+            f.ret(426, &[r.fd, 0, 1, GETEVENTS | 1 << 3, arg, 24]),
+            errno(Errno(62))
+        );
+        assert_eq!(
+            f.ret(426, &[r.fd, 0, 1, GETEVENTS | 1 << 3, arg, 16]),
+            errno(Errno::EINVAL)
+        );
+        // The probe: NOP and EPOLL_CTL only, of 58 operations.
+        let probe = DATA + 0x400;
+        f.mem.write(GuestAddr(probe), &[0; 16 + 8 * 64]).unwrap();
+        assert_eq!(f.ret(427, &[r.fd, 8, probe, 64]), 0);
+        let mut head = [0; 2];
+        f.mem.read(GuestAddr(probe), &mut head).unwrap();
+        assert_eq!(head, [57, 58]);
+        let supported: Vec<u64> = (0..58)
+            .filter(|op| u32_at(&f, probe + 16 + 8 * op) >> 16 & 1 == 1)
+            .collect();
+        assert_eq!(supported, [0, 29]);
+        // A probe that is not zeroed, another operation, another file.
+        assert_eq!(f.ret(427, &[r.fd, 8, probe, 1]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 0, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[r.fd, 31, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(427, &[0, 8, probe, 1]), errno(Errno(95)));
+    }
+}

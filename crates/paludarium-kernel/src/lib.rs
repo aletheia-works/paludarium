@@ -24,6 +24,7 @@ mod fasync;
 mod fifo;
 mod files;
 mod inet;
+mod io_uring;
 mod ipc;
 mod loopback;
 mod netlink;

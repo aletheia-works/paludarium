@@ -56,7 +56,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`fadvise64`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、後述の疑似端末のリクエスト） |
-| イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait` |
+| イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
@@ -633,6 +633,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PKEY_DISABLE_WRITE` 以外の権利には `EINVAL` です。`pkey_free` は `EINVAL` です。
   `pkey_mprotect` はキーが `-1` なら `mprotect` と同じで、それ以外のキーは、Linux が先に
   行う確認のあとで `EINVAL` です（空の範囲は成功し、あふれる範囲は `ENOMEM` です）。
+- io_uring は、操作が `IORING_OP_NOP` と `IORING_OP_EPOLL_CTL`（libuv が `epoll_ctl` を
+  まとめるのに使います）の 2 つだけの Linux 6.12 のものです。ほかの操作は、それらなしで
+  ビルドした Linux と同じく `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もその 2 つだけを
+  報告します。リングの大きさ、オフセット、機能は Linux が返すものと同じで、記述子の `mmap` で
+  見えます。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
+  完了がキューにあります。リンク、成功時に完了を省くもの、キューがいっぱいのあいだ保たれる
+  完了（`IORING_FEAT_NODROP`）は Linux と同じです。
 - `membarrier` は、`CONFIG_RSEQ` があって `nohz_full` の CPU がない x86-64 の Linux の
   コマンドを持ちます（`MEMBARRIER_CMD_QUERY` は `0x3ff`）。プライベートのコマンドは、
   アドレス空間がそれに登録するまで `EPERM` です。fork は登録を保ち、exec のあとは登録がなく、

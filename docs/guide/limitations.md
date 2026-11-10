@@ -155,11 +155,18 @@ verified.
   `pkey_alloc` gives `ENOSPC` as Linux does on such a CPU, and programs carry
   on without them. `RDPKRU` and `WRPKRU` stop a program with `SIGILL`, as on
   such a CPU.
+- **io_uring, in part**: only `IORING_OP_NOP` and `IORING_OP_EPOLL_CTL`
+  run; the other operations complete with `EOPNOTSUPP`. The setup flags
+  `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,
+  `_SQE128`, `_CQE32`, `_NO_MMAP` and `_REGISTERED_FD_ONLY` give `EINVAL`,
+  and `io_uring_register` has only `IORING_REGISTER_PROBE` (the others give
+  `EINVAL`), so no ring descriptor, file, buffer or personality can be
+  registered. A ring maps only shared (`MAP_PRIVATE` gives `EINVAL`), and
+  `poll` and `epoll` cannot watch its descriptor. As every request completes
+  in `io_uring_enter`, a wait for more completions than there are ends only
+  by a signal or its timeout.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
-  - `io_uring_setup` is one of them, as on a Linux built without io_uring.
-    Programs check for that and carry on. Saying yes would be wrong without
-    the rest: its rings would do no work.
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared
     memory, semaphores and message queues are Linux's defaults, which
     `/proc/sys/kernel` cannot change. A message queue's waiting senders

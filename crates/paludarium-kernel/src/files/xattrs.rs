@@ -227,6 +227,7 @@ fn set(
             result = Err(ENODATA);
         } else {
             map.insert(name.clone(), value.clone());
+            crate::inotify::xattrs_changed();
         }
     })?;
     result
@@ -240,6 +241,7 @@ fn remove(c: &Context<'_>, target: &Target, ptr: u64) -> Result<u64, Errno> {
     target.with(c, &mut |map| {
         if map.remove(&name).is_some() {
             result = Ok(0);
+            crate::inotify::xattrs_changed();
         }
     })?;
     result

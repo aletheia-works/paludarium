@@ -4256,3 +4256,183 @@ mod old_time_calls {
         assert_eq!(f.ret(187, &[99, 0, 1]), errno(Errno::EBADF));
     }
 }
+
+mod inotify {
+    use super::*;
+    const INIT1: u64 = 294;
+    const ADD: u64 = 254;
+    const RM: u64 = 255;
+    const IN_NONBLOCK: u64 = 0x800;
+    const BUF: u64 = DATA + 0x1000;
+    /// The NUL-terminated `path`, at `at`.
+    fn put(f: &Fixture, at: u64, path: &[u8]) -> u64 {
+        f.mem.write(GuestAddr(at), path).unwrap();
+        f.mem
+            .write(GuestAddr(at + path.len() as u64), &[0])
+            .unwrap();
+        at
+    }
+    /// The events a read of `fd` gives: (wd, mask, cookie, name).
+    fn events(f: &mut Fixture, fd: u64) -> Vec<(i32, u32, u32, Vec<u8>)> {
+        let n = f.ret(0, &[fd, BUF, 0x1000]);
+        if n == errno(Errno::EAGAIN) {
+            return Vec::new();
+        }
+        let mut bytes = vec![0; n as usize];
+        f.mem.read(GuestAddr(BUF), &mut bytes).unwrap();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let word = |i: usize| u32::from_le_bytes(bytes[at + i..at + i + 4].try_into().unwrap());
+            let len = word(12) as usize;
+            let name = bytes[at + 16..at + 16 + len]
+                .iter()
+                .copied()
+                .take_while(|&b| b != 0)
+                .collect();
+            out.push((word(0) as i32, word(4), word(8), name));
+            at += 16 + len;
+        }
+        out
+    }
+    fn masks(events: &[(i32, u32, u32, Vec<u8>)]) -> Vec<(i32, u32, &[u8])> {
+        events
+            .iter()
+            .map(|(wd, mask, _, name)| (*wd, *mask, &name[..]))
+            .collect()
+    }
+    #[test]
+    fn the_calls_are_checked_in_linuxs_order() {
+        let mut f = fixture();
+        assert_eq!(f.ret(INIT1, &[1]), errno(Errno::EINVAL));
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let tmp = put(&f, DATA, b"/tmp");
+        assert_eq!(f.ret(ADD, &[fd, tmp, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(ADD, &[fd, tmp, 0x800_0000]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(ADD, &[99, tmp, 1]), errno(Errno::EBADF));
+        assert_eq!(f.ret(ADD, &[fd, tmp, 0x3000_0001]), errno(Errno::EINVAL));
+        // Another file is EINVAL.
+        assert_eq!(f.ret(ADD, &[1, tmp, 1]), errno(Errno::EINVAL));
+        let missing = put(&f, DATA + 0x40, b"/tmp/none");
+        assert_eq!(f.ret(ADD, &[fd, missing, 1]), errno(Errno::ENOENT));
+        let wd = f.ret(ADD, &[fd, tmp, 1]);
+        assert_eq!(wd, 1);
+        // The same file has the same watch; IN_MASK_CREATE refuses it.
+        assert_eq!(f.ret(ADD, &[fd, tmp, 2]), 1);
+        assert_eq!(f.ret(ADD, &[fd, tmp, 0x1000_0002]), errno(Errno::EEXIST));
+        assert_eq!(f.ret(RM, &[fd, 7]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(RM, &[fd, wd]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), [(1, 0x8000, &b""[..])]);
+        // The cursor goes on: the next watch is 2.
+        assert_eq!(f.ret(ADD, &[fd, tmp, 1]), 2);
+        // A buffer too small for the next record is EINVAL.
+        assert_eq!(f.ret(RM, &[fd, 2]), 0);
+        assert_eq!(f.ret(0, &[fd, BUF, 15]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(0, &[fd, BUF, 16]), 16);
+        assert_eq!(f.ret(0, &[fd, BUF, 16]), errno(Errno::EAGAIN));
+        // FIONREAD, and pread is ESPIPE.
+        assert_eq!(f.ret(16, &[fd, 0x541b, BUF]), 0);
+        assert_eq!((f.mem.read_u64(GuestAddr(BUF)).unwrap() as u32), 0);
+        assert_eq!(f.ret(17, &[fd, BUF, 16, 0]), errno(Errno::ESPIPE));
+    }
+    #[test]
+    fn changes_in_a_directory_are_its_events() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        put(&f, DATA, b"/tmp/w");
+        assert_eq!(f.ret(83, &[DATA, 0o755]), 0);
+        let wd = f.ret(ADD, &[fd, DATA, 0xfff]) as i32;
+        let file = put(&f, DATA + 0x40, b"/tmp/w/a");
+        let fresh = f.ret(2, &[file, 0o101, 0o600]);
+        assert_eq!(f.ret(90, &[file, 0o640]), 0);
+        let other = put(&f, DATA + 0x80, b"/tmp/w/b");
+        assert_eq!(f.ret(82, &[file, other]), 0);
+        let sub = put(&f, DATA + 0xc0, b"/tmp/w/s");
+        assert_eq!(f.ret(83, &[sub, 0o755]), 0);
+        assert_eq!(f.ret(84, &[sub]), 0);
+        assert_eq!(f.ret(87, &[other]), 0);
+        let got = events(&mut f, fd);
+        assert_eq!(
+            masks(&got),
+            [
+                (wd, 0x100, &b"a"[..]),
+                (wd, 0x4, b"a"),
+                (wd, 0x40, b"a"),
+                (wd, 0x80, b"b"),
+                (wd, 0x4000_0100, b"s"),
+                (wd, 0x4000_0200, b"s"),
+                (wd, 0x200, b"b"),
+            ]
+        );
+        // A rename's two events share a cookie.
+        assert_ne!(got[2].2, 0);
+        assert_eq!(got[2].2, got[3].2);
+        let _ = fresh;
+    }
+    #[test]
+    fn a_watched_file_hears_of_itself_and_goes() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let file = put(&f, DATA, b"/tmp/x");
+        let d = f.ret(2, &[file, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        let wd = f.ret(ADD, &[fd, file, 0xfff]) as i32;
+        let moved = put(&f, DATA + 0x40, b"/tmp/y");
+        assert_eq!(f.ret(82, &[file, moved]), 0);
+        assert_eq!(f.ret(76, &[moved, 3]), 0);
+        assert_eq!(f.ret(87, &[moved]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (wd, 0x800, &b""[..]),
+                (wd, 0x2, b""),
+                (wd, 0x4, b""),
+                (wd, 0x400, b""),
+                (wd, 0x8000, b""),
+            ]
+        );
+        // A one-shot watch goes after its first event.
+        let d = f.ret(2, &[file, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        let wd = f.ret(ADD, &[fd, file, 0x8000_0004]) as i32;
+        assert_eq!(f.ret(90, &[file, 0o600]), 0);
+        assert_eq!(f.ret(90, &[file, 0o644]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x4, &b""[..]), (wd, 0x8000, b"")]
+        );
+    }
+    #[test]
+    fn the_queue_merges_repeats_and_overflows_once() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let tmp = put(&f, DATA, b"/tmp");
+        let wd = f.ret(ADD, &[fd, tmp, 0x4]) as i32;
+        let a = put(&f, DATA + 0x40, b"/tmp/a");
+        let b = put(&f, DATA + 0x80, b"/tmp/b");
+        for path in [a, b] {
+            let d = f.ret(2, &[path, 0o101, 0o600]);
+            assert_eq!(f.ret(3, &[d]), 0);
+        }
+        assert_eq!(f.ret(90, &[a, 0o600]), 0);
+        assert_eq!(f.ret(90, &[a, 0o600]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x4, &b"a"[..])]);
+        for i in 0..16400 {
+            assert_eq!(f.ret(90, &[if i % 2 == 0 { a } else { b }, 0o600]), 0);
+        }
+        assert_eq!(f.ret(16, &[fd, 0x541b, BUF]), 0);
+        assert_eq!(
+            (f.mem.read_u64(GuestAddr(BUF)).unwrap() as u32),
+            16384 * 32 + 16
+        );
+        let mut last = Vec::new();
+        loop {
+            let got = events(&mut f, fd);
+            if got.is_empty() {
+                break;
+            }
+            last = got;
+        }
+        assert_eq!(masks(&last).last(), Some(&(-1, 0x4000, &b""[..])));
+    }
+}

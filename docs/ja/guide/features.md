@@ -767,7 +767,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   から（init の子は init が刈り取ります）init の終了を知ります。
 - 新しいネットワーク名前空間には、Linux の `loopback_net_init` と同じく、ループバックの
   `lo`（インデックス 1）だけがあり、それは落ちています。そこでの TCP や UDP のソケットは、
-  それでもローカルな IPv4 のループバックのアドレスには bind できますが、`::1` には
+  IPv4 に経路ができるまではどの IPv4 のアドレスにも bind できますが、`::1` には
   できず（`EADDRNOTAVAIL`）、接続もデータグラムもどこにも届きません（`ENETUNREACH`）。
   `IFF_UP` を付けた `SIOCSIFFLAGS`（CAP_NET_ADMIN が要り、なければ `EPERM`）で上げると、
   上がっている間だけ `::1` が付き、ほかのどの名前空間とも別のポート・待ち受け・データグラムを持つ
@@ -788,39 +788,64 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`if_indextoname`）は、インデックス 1 を `lo` と答えます（ほかは `ENODEV`）。
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
   `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。
-  そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`、`ip route`、
-  `ip route get`、`ip link set lo up` が動きます。Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが持つものは
-  `EADDRINUSE`）を、0 ならプロセスの ID を、それが使われていれば負の ID を取ります。
-  bind していないソケットは、`connect` か最初の送信で同じように bind されます。
-  `getsockname` と `getpeername` はポートとグループを返し、ほかのソケットのポートへの
-  データグラムはそのソケットに届きます（なければ `ECONNREFUSED`）。カーネル（ポート 0）は、
-  `rtnetlink` と同じくデータグラムのメッセージを 1 つずつ受け取ります。`NLM_F_DUMP` を
-  付けた `RTM_GETLINK` と `RTM_GETADDR` には、`lo`（インデックス 1、そのフラグ、名前、MTU、
-  キュー、状態、キューイング規律、0 の統計）とそのアドレス（1 度でも上がった後の
-  `127.0.0.1/8` と、上がっている間の `::1/128`）を返し、次の受信で `NLMSG_DONE` を
-  返します。`NLM_F_DUMP` を付けた `RTM_GETROUTE` には、カーネルがそのアドレスに付ける
-  経路を、すべてローカルの表のものとして返します（メインの表にはありません）。`lo` が
-  1 度でも上がった後の `local 127.0.0.0/8` と `local 127.0.0.1`（落ちても残ります）、
-  上がっている間の `broadcast 127.255.255.255` と `local ::1` です。`AF_INET` か
-  `AF_INET6` だけを指せばそのファミリーのものを返し、マルチキャストの経路の
-  ファミリーには何も返しません。ダンプでない `RTM_GETROUTE` は、`inet_rtm_getroute` と
-  `inet6_rtm_getroute` と同じく `RTA_DST` の指す宛先への経路を引きます。127.0.0.0/8 の
-  IPv4 のアドレス（`lo` が 1 度でも上がった後）と `0.0.0.0` は、`RTA_PREFSRC` が
-  127.0.0.1 で呼び出し元の `RTA_UID`（リクエストが指せばそのまま。-1 なら付けず、
-  4 バイトより短ければ `ERANGE`）を持つ、メインの表のローカルな経路になり、
-  127.255.255.255 は `lo` が上がっている間ブロードキャストの経路になります。`::1` は
-  `lo` が上がっている間そのローカルな経路になります。ほかの宛先は `ENETUNREACH`、
-  `AF_UNSPEC` は `EOPNOTSUPP` です。ファミリーのアドレスより短い宛先は、IPv4 なら
-  `ERANGE`、IPv6 なら `EINVAL` です。`RTM_F_FIB_MATCH` を付ければ、合った表の項目を
-  返します（`0.0.0.0` に合う項目はないので `EHOSTUNREACH` です）。ダンプでない `RTM_GETLINK` には、インデックスか `IFLA_IFNAME` で指した `lo` を
-  返します（ほかは `ENODEV`）。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
-  それには、ネットワーク名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送る
-  スレッドとソケットを開いたものの両方に要ります（なければ `EPERM`）。エラーと、
-  `NLM_F_ACK` を付けた成功には `NLMSG_ERROR` を返します。エラーのものは、
-  `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`recvmsg` は送り手の
-  `sockaddr_nl` を返し、`MSG_PEEK` と `MSG_TRUNC` が使えます。`SO_RCVBUF`、`SO_SNDBUF`、
-  `SO_RCVTIMEO`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、`NETLINK_GET_STRICT_CHK` を
-  設定できます。
+  そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`（`ip addr add` と `del` も）、
+  `ip route`、`ip route get`、`ip link set lo up` が動きます。
+  - **ソケット:** Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが
+    持つものは `EADDRINUSE`）を、0 ならプロセスの ID を、それが使われていれば負の ID を
+    取ります。bind していないソケットは、`connect` か最初の送信で同じように bind されます。
+    `getsockname` と `getpeername` はポートとグループを返し、ほかのソケットのポートへの
+    データグラムはそのソケットに届きます（なければ `ECONNREFUSED`）。`recvmsg` は送り手の
+    `sockaddr_nl` を返し、`MSG_PEEK` と `MSG_TRUNC` が使えます。`SO_RCVBUF`、
+    `SO_SNDBUF`、`SO_RCVTIMEO`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
+    `NETLINK_GET_STRICT_CHK` を設定できます。
+  - **リクエスト:** カーネル（ポート 0）は、`rtnetlink` と同じくデータグラムのメッセージを
+    1 つずつ受け取ります。ダンプ（`NLM_F_DUMP`）は次の受信の `NLMSG_DONE` で終わります。
+    エラーと、`NLM_F_ACK` を付けた成功には `NLMSG_ERROR` を返し、エラーのものは
+    `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`GET` のほかには、ネットワーク
+    名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを
+    開いたものの両方に要ります（なければ `EPERM`）。
+  - **リンク:** `RTM_GETLINK` には、ダンプでも、インデックスか `IFLA_IFNAME` で指しても、
+    `lo`（インデックス 1、そのフラグ、名前、MTU、キュー、状態、キューイング規律、0 の統計）を
+    返します（ほかは `ENODEV`）。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
+  - **アドレス:** `RTM_GETADDR` は `lo` のアドレスを Linux の順でダンプします。IPv4 の
+    プライマリは、同じかより広いスコープのプライマリの後に並び、セカンダリ（プライマリの
+    サブネットの中のアドレス。`IFA_F_SECONDARY` が付きます）は最後です。IPv6 はグローバルな
+    ものが先で、新しいものが先です。`lo` が上がるたびに `127.0.0.1/8`（消されていれば）と
+    `::1/128` が付き、落とすと IPv6 のアドレスはすべて消えます（`keep_addr_on_down` は 0）。
+    `RTM_NEWADDR` は、`inet_rtm_newaddr` と `inet6_rtm_newaddr` と同じくアドレスを足します。
+    `lo` がすでに持つものは、`NLM_F_EXCL` なしの `NLM_F_REPLACE` でなければ `EEXIST` です。
+    `IFA_LOCAL` のない IPv4 のもの、32（IPv6 なら 128）を超える接頭辞、`IFA_LOCAL` も
+    `IFA_ADDRESS` もない IPv6 のもの、`ifaddrmsg` より短いメッセージは `EINVAL`、ほかの
+    インターフェースは `ENODEV` です。`IFA_LABEL`、`IFA_BROADCAST`、`IFA_FLAGS`
+    （`IFA_F_NOPREFIXROUTE` も）、`IFA_PROTO` を保ちます。`RTM_DELADDR` は、指した
+    `IFA_LOCAL`、`IFA_LABEL`、`IFA_ADDRESS` と接頭辞を持つ最初のものを消し（なければ
+    `EADDRNOTAVAIL`）、プライマリならそのセカンダリも消します。`127.0.0.1` と `::1` も
+    消せます。
+  - **経路:** アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付けるカーネルのものです。
+    IPv4 のアドレスには、初めからローカルの表に `local` の経路があります。接頭辞の経路は
+    （ループバックでは `local` です）、そのアドレスを持って `lo` が初めて上がったときに付き、
+    落ちても残ります。サブネットと `IFA_BROADCAST` の `broadcast` の経路は、上がっている
+    間だけです。IPv6 のアドレスには、ローカルの表に `local` の経路が、そのアドレスを
+    持って `lo` が初めて上がってからは、メインの表にメトリック 256 のユニキャストの接頭辞の
+    経路があります（`::1` にはありません）。`NLM_F_DUMP` を付けた `RTM_GETROUTE` には、
+    IPv4 のもの（宛先順）、IPv6 のもの（メインの表、ローカルの表の順）を返し、`AF_INET` か
+    `AF_INET6` だけを指せばそのファミリーのものを、マルチキャストの経路のファミリーには何も
+    返しません。ダンプでなければ、`inet_rtm_getroute` と `inet6_rtm_getroute` と同じく、
+    `RTA_DST` の指す宛先への経路を最も長い接頭辞で引きます。IPv4 のローカルか
+    ブロードキャストの経路は、その優先する送り元と呼び出し元の `RTA_UID`（リクエストが
+    指せばそのまま。-1 なら付けず、4 バイトより短ければ `ERANGE`）を持つ、メインの表の
+    経路として答えます。`0.0.0.0` は 127.0.0.1 からループバックへ向かいます。IPv6 は、
+    `lo` が上がっている間、アドレスならそのローカルな経路を、接頭辞の中のほかの宛先なら
+    そのアドレスからの接頭辞の経路を答えます。ほかの宛先は `ENETUNREACH`、`AF_UNSPEC` は
+    `EOPNOTSUPP` です。ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら
+    `EINVAL` です。`RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に
+    合う項目はないので `EHOSTUNREACH` です）。
+  - **ソケット:** ループバックのローカルな経路が持つアドレスはゲスト自身のものです。TCP や
+    UDP のソケットはそこへ bind でき、その経路の優先する送り元からループバックの上で
+    届きます。ループバックでは、IPv4 のアドレスはそのサブネット全体をローカルにし、IPv6 の
+    アドレスはそれ自身だけをローカルにします。IPv4 にまだ経路が 1 つもなければ、Linux の
+    `inet_addr_type` がそのときどのアドレスもブロードキャストと見るのと同じく、ソケットは
+    どの IPv4 のアドレスにも bind できます。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、

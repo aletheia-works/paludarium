@@ -20,6 +20,7 @@
     {"name":"net-namespaces","binary":"process"},
     {"name":"netlink","binary":"process"},
     {"name":"unix-interfaces","binary":"process"},
+    {"name":"addresses","binary":"process"},
     {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},

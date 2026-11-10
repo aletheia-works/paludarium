@@ -861,8 +861,8 @@ kernel.
   children reaped by the init, as Linux's `zap_pid_ns_processes`.
 - A new network namespace, as Linux's `loopback_net_init` makes it, has a
   loopback alone, `lo` (index 1), which is down: a TCP or UDP socket there
-  binds IPv4's loopback addresses, which are local all the same, but not
-  `::1` (`EADDRNOTAVAIL`), and a connection or datagram goes nowhere
+  binds any IPv4 address until IPv4 has a route, but not `::1`
+  (`EADDRNOTAVAIL`), and a connection or datagram goes nowhere
   (`ENETUNREACH`). `SIOCSIFFLAGS` with `IFF_UP` (CAP_NET_ADMIN, else
   `EPERM`) brings it up, with `::1`, which it has only while it is up:
   then it is a
@@ -885,46 +885,75 @@ kernel.
   `lo` (`ENODEV` for another).
 - A netlink socket (`AF_NETLINK`, `SOCK_RAW` or `SOCK_DGRAM`, protocol
   `NETLINK_ROUTE`) shows and changes the loopback of the network namespace
-  it was made in, so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`,
-  `ip route`, `ip route get` and `ip link set lo up` work. As Linux's `af_netlink`, `bind` takes a
-  port ID (`EADDRINUSE` for one another socket has) or with 0 the
-  process's ID, or a negative one when that is taken; `connect` or the
-  first send binds an unbound socket the same way; `getsockname` and
-  `getpeername` give the port and groups; a datagram to another socket's
-  port reaches it (`ECONNREFUSED` for none). The kernel, port 0, takes each
-  message of a datagram as `rtnetlink` does: `RTM_GETLINK` and
-  `RTM_GETADDR` with `NLM_F_DUMP` answer with `lo` (index 1, its flags,
-  name, MTU, queue, state, queueing discipline and zero statistics) and its
-  addresses, `127.0.0.1/8` once it has been up and `::1/128` while it is
-  up, then `NLMSG_DONE` at the next receive. `RTM_GETROUTE` with
-  `NLM_F_DUMP` answers with the routes the kernel gives those addresses,
-  all in the local table (the main table has none): `local 127.0.0.0/8`
-  and `local 127.0.0.1` once `lo` has been up, which stay when it goes
-  down, `broadcast 127.255.255.255` while it is up, and `local ::1` while it
-  is up; `AF_INET` or `AF_INET6` alone gives that family's, and the
-  multicast routing families none. `RTM_GETROUTE` without a dump looks up
-  the route to the `RTA_DST` it names, as `inet_rtm_getroute` and
-  `inet6_rtm_getroute` do: an IPv4 address in 127.0.0.0/8 (once `lo` has
-  been up) or `0.0.0.0` gives a local route in the main table, with
-  `RTA_PREFSRC` 127.0.0.1 and the caller's `RTA_UID` (or the one the
-  request names, as it is; none for -1, and `ERANGE` for one shorter
-  than 4 bytes), and
-  127.255.255.255 a broadcast one while `lo` is up; `::1` gives its local
-  route while `lo` is up; any other destination is `ENETUNREACH`, and
-  `AF_UNSPEC` `EOPNOTSUPP`; a destination shorter than its family's
-  address is `ERANGE` for IPv4 and `EINVAL` for IPv6. With
-  `RTM_F_FIB_MATCH` the answer is the table entry that matched
-  (`EHOSTUNREACH` for `0.0.0.0`, which none is). `RTM_GETLINK` without a dump
-  answers for `lo` by index or `IFLA_IFNAME` (`ENODEV` for another);
-  `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`, which
-  needs `CAP_NET_ADMIN` in the user namespace that owns the network
-  namespace, for the sending thread and the socket's opener (`EPERM`). An
-  error, or a success with `NLM_F_ACK`, is answered with `NLMSG_ERROR`,
-  which carries the whole request with an error unless `NETLINK_CAP_ACK`
-  is set. `recvmsg` gives the sender's `sockaddr_nl`, `MSG_PEEK` and
-  `MSG_TRUNC` work, and `SO_RCVBUF`, `SO_SNDBUF`, `SO_RCVTIMEO`,
-  `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and `NETLINK_GET_STRICT_CHK` can be
-  set.
+  it was made in, so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`
+  (with `ip addr add` and `del`), `ip route`, `ip route get` and
+  `ip link set lo up` work.
+  - **The socket:** as Linux's `af_netlink`, `bind` takes a port ID
+    (`EADDRINUSE` for one another socket has) or with 0 the process's ID,
+    or a negative one when that is taken; `connect` or the first send binds
+    an unbound socket the same way; `getsockname` and `getpeername` give
+    the port and groups; a datagram to another socket's port reaches it
+    (`ECONNREFUSED` for none). `recvmsg` gives the sender's `sockaddr_nl`,
+    `MSG_PEEK` and `MSG_TRUNC` work, and `SO_RCVBUF`, `SO_SNDBUF`,
+    `SO_RCVTIMEO`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
+    `NETLINK_GET_STRICT_CHK` can be set.
+  - **Requests:** the kernel, port 0, takes each message of a datagram as
+    `rtnetlink` does. A dump (`NLM_F_DUMP`) ends with `NLMSG_DONE` at the
+    next receive. An error, or a success with `NLM_F_ACK`, is answered with
+    `NLMSG_ERROR`, which carries the whole request with an error unless
+    `NETLINK_CAP_ACK` is set. Anything but a `GET` needs `CAP_NET_ADMIN` in
+    the user namespace that owns the network namespace, for the sending
+    thread and the socket's opener (`EPERM`).
+  - **The link:** `RTM_GETLINK` answers with `lo` (index 1, its flags,
+    name, MTU, queue, state, queueing discipline and zero statistics), in a
+    dump or for its index or `IFLA_IFNAME` (`ENODEV` for another).
+    `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`.
+  - **Addresses:** `RTM_GETADDR` dumps `lo`'s addresses in Linux's orders:
+    IPv4's primaries after those of a scope as wide or wider, secondaries
+    (an address in a primary's subnet, with `IFA_F_SECONDARY`) last; IPv6's
+    global ones first, the newest first. `127.0.0.1/8` comes with each time
+    `lo` comes up (should it have been removed) and `::1/128` too; taking
+    `lo` down removes every IPv6 address (`keep_addr_on_down` is 0).
+    `RTM_NEWADDR` adds one, as `inet_rtm_newaddr` and `inet6_rtm_newaddr`
+    do: `EEXIST` for one `lo` has, unless `NLM_F_REPLACE` without
+    `NLM_F_EXCL`; `EINVAL` for an IPv4 one without `IFA_LOCAL` or a prefix
+    past 32 (128 for IPv6), an IPv6 one without `IFA_LOCAL` or
+    `IFA_ADDRESS`, or a message shorter than an `ifaddrmsg`; `ENODEV` for
+    another interface. `IFA_LABEL`, `IFA_BROADCAST`, `IFA_FLAGS` (with
+    `IFA_F_NOPREFIXROUTE`) and `IFA_PROTO` are kept. `RTM_DELADDR` removes
+    the first that has the `IFA_LOCAL`, `IFA_LABEL` and `IFA_ADDRESS` and
+    prefix it names (`EADDRNOTAVAIL` for none), a primary with its
+    secondaries; `127.0.0.1` and `::1` may go too.
+  - **Routes:** the addresses' routes are the kernel's, as
+    `fib_add_ifaddr` and `addrconf` make them. An IPv4 address has a
+    `local` route in the local table from the start; its prefix route,
+    `local` too on a loopback, comes at the first time `lo` is up with it
+    and stays when it goes down; its subnet's `broadcast` route, and that of
+    an `IFA_BROADCAST`, are there while it is up. An IPv6 address has a
+    `local` route in the local table, and, from the first time `lo` is up
+    with it, a unicast prefix route in the main table, metric 256, but for
+    `::1`. `RTM_GETROUTE` with `NLM_F_DUMP` gives them, IPv4's (by
+    destination) then IPv6's (the main table's, then the local one's);
+    `AF_INET` or `AF_INET6` alone gives that family's, and the multicast
+    routing families none. Without a dump it looks up the route to the
+    `RTA_DST` it names, as `inet_rtm_getroute` and `inet6_rtm_getroute`
+    do, by the longest prefix: an IPv4 local or broadcast one answers in
+    the main table, with its preferred source and the caller's `RTA_UID`
+    (or the one the request names, as it is; none for -1, and `ERANGE` for
+    one shorter than 4 bytes); `0.0.0.0` goes to the loopback from
+    127.0.0.1; an IPv6 address answers with its local route, and another
+    in a prefix with the prefix route, from that address, while `lo` is
+    up. Any other destination is `ENETUNREACH`, and `AF_UNSPEC`
+    `EOPNOTSUPP`; a destination shorter than its family's address is
+    `ERANGE` for IPv4 and `EINVAL` for IPv6. With `RTM_F_FIB_MATCH` the
+    answer is the table entry that matched (`EHOSTUNREACH` for `0.0.0.0`,
+    which none is).
+  - **Sockets:** an address the loopback's local routes have is the
+    guest's own: a TCP or UDP socket binds to it and reaches it on the
+    loopback, from the preferred source of its route. On a loopback an
+    IPv4 address makes its whole subnet local; an IPv6 one only itself.
+    Before IPv4 has any route at all, a socket binds to any IPv4 address,
+    as Linux's `inet_addr_type` takes each as broadcast then.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,

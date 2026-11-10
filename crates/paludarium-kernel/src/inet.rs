@@ -295,13 +295,14 @@ pub(crate) struct Network {
     /// A nested network namespace's, which has nothing but its loopback:
     /// no route to the host, and no DNS stub.
     isolated: bool,
-    /// Whether its loopback interface is up; it has `::1` only then, as
-    /// Linux's `addrconf` adds it at `NETDEV_UP` and `addrconf_ifdown`
-    /// takes it away at `NETDEV_DOWN` (`keep_addr_on_down` is 0).
+    /// Whether its loopback interface is up.
     up: AtomicBool,
-    /// Whether its loopback has `127.0.0.1/8`, which Linux's `inetdev_event`
-    /// gives it at its first `NETDEV_UP` and keeps when it goes down.
-    addressed: AtomicBool,
+    /// Whether it has ever been up, and so has a queueing discipline.
+    ever_up: AtomicBool,
+    /// The loopback's addresses and their routes ([`crate::interface`]),
+    /// which say what is local; locked after a socket's state, never
+    /// before.
+    addresses: Mutex<crate::interface::Addresses>,
     /// The netlink sockets bound in it ([`crate::netlink`]).
     pub(crate) netlink: crate::netlink::Ports,
     /// The user namespace that owns its network namespace, whose
@@ -325,7 +326,8 @@ impl Network {
             syns: Mutex::default(),
             isolated: false,
             up: AtomicBool::new(true),
-            addressed: AtomicBool::new(true),
+            ever_up: AtomicBool::new(true),
+            addresses: Mutex::new(crate::interface::Addresses::first()),
             netlink: crate::netlink::Ports::default(),
             owner: None,
         }
@@ -338,24 +340,54 @@ impl Network {
             isolated: true,
             owner: Some(Arc::clone(owner)),
             up: AtomicBool::new(false),
-            addressed: AtomicBool::new(false),
+            ever_up: AtomicBool::new(false),
+            addresses: Mutex::new(crate::interface::Addresses::isolated()),
             ..Self::new(NetworkPolicy::default())
         }
     }
     /// Where a connection or datagram to `to` goes: on the loopback, while
-    /// it is up, to an address of it or the unspecified one
+    /// it is up, to an address its local routes have, or the unspecified
+    /// one, which goes to `127.0.0.1` or `::1`
     /// ([`crate::loopback::destination`]); `None` off it, which only the
     /// first namespace has a route to. `ENETUNREACH` where no route goes.
     fn route(&self, to: SocketAddr) -> Result<Option<SocketAddr>, Errno> {
-        match crate::loopback::destination(to) {
-            Some(_) if !self.up.load(Ordering::SeqCst) => Err(ENETUNREACH),
+        let up = self.is_up();
+        let local = match to.ip() {
+            ip if ip.is_unspecified() => crate::loopback::destination(to),
+            IpAddr::V4(ip) => self.addresses().local4(ip, up).then_some(to),
+            IpAddr::V6(ip) => self.addresses().local6(ip).then_some(to),
+        };
+        match local {
+            Some(_) if !up => Err(ENETUNREACH),
             None if self.isolated => Err(ENETUNREACH),
             to => Ok(to),
         }
     }
-    /// Whether the loopback has `::1` to bind to.
-    fn has_loopback_address(&self) -> bool {
-        self.up.load(Ordering::SeqCst)
+    /// The loopback's addresses.
+    pub(crate) fn addresses(&self) -> MutexGuard<'_, crate::interface::Addresses> {
+        self.addresses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// The address a connection or datagram to `to` on the loopback leaves
+    /// from: its route's preferred source.
+    pub(crate) fn source(&self, to: SocketAddr) -> IpAddr {
+        self.addresses().source(to.ip(), self.is_up())
+    }
+    /// Whether a socket may bind to `ip`: the unspecified address, an IPv4
+    /// multicast or limited broadcast one, one a local or broadcast route
+    /// has (any IPv4 one before there is a route at all, as Linux's
+    /// `inet_addr_type` finds none), or an IPv6 address of the loopback.
+    fn bindable(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ip) => {
+                ip.is_unspecified()
+                    || ip.is_multicast()
+                    || ip.is_broadcast()
+                    || self.addresses().bindable4(ip, self.is_up())
+            }
+            IpAddr::V6(ip) => ip.is_unspecified() || self.addresses().local6(ip),
+        }
     }
     /// The user namespace whose `CAP_NET_ADMIN` changes this network, as
     /// Linux's `dev_ioctl` asks of `sock_net(sk)->user_ns`.
@@ -366,15 +398,23 @@ impl Network {
     pub(crate) fn is_up(&self) -> bool {
         self.up.load(Ordering::SeqCst)
     }
-    /// Whether the loopback has `127.0.0.1/8`: once it has been up.
-    pub(crate) fn has_ipv4_address(&self) -> bool {
-        self.addressed.load(Ordering::SeqCst)
+    /// Whether the loopback has ever been up.
+    pub(crate) fn has_been_up(&self) -> bool {
+        self.ever_up.load(Ordering::SeqCst)
     }
     /// Brings the loopback up or down, as `SIOCSIFFLAGS` or netlink's
-    /// `RTM_NEWLINK` with `IFF_UP` does.
+    /// `RTM_NEWLINK` with `IFF_UP` does, with what that does to its
+    /// addresses ([`crate::interface::Addresses::up`] and `down`).
     pub(crate) fn set_up(&self, up: bool) {
+        let mut addresses = self.addresses();
+        if up == self.is_up() {
+            return;
+        }
         if up {
-            self.addressed.store(true, Ordering::SeqCst);
+            self.ever_up.store(true, Ordering::SeqCst);
+            addresses.up();
+        } else {
+            addresses.down();
         }
         self.up.store(up, Ordering::SeqCst);
     }
@@ -1414,7 +1454,7 @@ impl InetSocket {
     ) -> Result<SocketAddr, Errno> {
         let bound = self.autobind(s, options)?;
         let ip = if bound.ip().is_unspecified() {
-            crate::loopback::source(to)
+            self.network.source(to)
         } else {
             bound.ip()
         };
@@ -1663,12 +1703,9 @@ impl InetSocket {
         let options = *self.options();
         let mut s = self.lock();
         let taken = |s: &State| s.bound.is_some() || s.stream.is_some();
-        // IPv4's loopback addresses are local even while the loopback is
-        // down (its `local` routes), but `::1` only once it has come up.
-        let addressed = self.network.has_loopback_address();
-        let own = |ip: Ipv4Addr| {
-            ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast()
-        };
+        // The addresses the loopback's routes have, which IPv4's local
+        // routes keep while it is down.
+        let own = |ip: Ipv4Addr| self.network.bindable(IpAddr::V4(ip));
         let address = match self.family {
             Family::V4 => {
                 if raw.len() < 16 {
@@ -1714,7 +1751,7 @@ impl InetSocket {
                         return Err(EADDRNOTAVAIL);
                     }
                     SocketAddr::from((v4, port))
-                } else if ip.is_unspecified() || ip.is_loopback() && addressed {
+                } else if self.network.bindable(IpAddr::V6(ip)) {
                     SocketAddr::from((ip, port))
                 } else if ip.segments()[0] & 0xffc0 == 0xfe80 && scope == 0 {
                     // A link-local address needs its interface.
@@ -2016,7 +2053,7 @@ impl InetSocket {
         to: SocketAddr,
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
-        let source = crate::loopback::source(to);
+        let source = self.network.source(to);
         let mut ports = self.ports();
         let from = match s.bound {
             Some(bound) if !bound.ip().is_unspecified() => bound,

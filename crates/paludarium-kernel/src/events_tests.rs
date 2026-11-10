@@ -3996,3 +3996,156 @@ fn a_unix_socket_asks_after_the_loopback_of_the_namespace_it_was_made_in() {
     assert_eq!(loopback_field(&mut f, owned, 0x8913), 0x49);
     assert_eq!(loopback_field(&mut f, made, 0x8913), 0x49);
 }
+/// An `ifaddrmsg` of `lo` for `family` and `prefix`, with `IFA_LOCAL` and
+/// `IFA_ADDRESS` of `ip`.
+fn address_request(family: u8, prefix: u8, ip: &[u8]) -> Vec<u8> {
+    let mut payload = vec![family, prefix, 0, 0, 1, 0, 0, 0];
+    for kind in [2u16, 1] {
+        payload.extend_from_slice(&((4 + ip.len()) as u16).to_le_bytes());
+        payload.extend_from_slice(&kind.to_le_bytes());
+        payload.extend_from_slice(ip);
+    }
+    payload
+}
+#[test]
+fn netlink_adds_addresses_that_sockets_bind_and_reach() {
+    let mut f = Fixture::new();
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    let fd = f.ret(41, [16, 3, 0, 0, 0, 0]);
+    // The error of a request of `kind` and `flags` with `payload`.
+    let ask = |f: &mut Fixture, kind: u16, flags: u16, payload: &[u8], seq: u32| {
+        let len = netlink_request(f, DATA, kind, 0x5 | flags, seq, payload);
+        assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+        let replies = netlink_replies(f, fd);
+        assert_eq!(replies[0].0, 2);
+        i32::from_le_bytes(replies[0].4[..4].try_into().unwrap())
+    };
+    let dump = |f: &mut Fixture, kind: u16, seq: u32| {
+        let len = netlink_request(f, DATA, kind, 0x301, seq, &[0]);
+        assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+        netlink_replies(f, fd)
+            .into_iter()
+            .filter(|reply| reply.0 != 3)
+            .map(|reply| reply.4)
+            .collect::<Vec<_>>()
+    };
+    let v6: [u8; 16] = "2001:db8::5"
+        .parse::<core::net::Ipv6Addr>()
+        .unwrap()
+        .octets();
+    // Added while down, before there is any route: 10.1.2.3/24 and
+    // 2001:db8::5/64, each once.
+    assert_eq!(
+        ask(
+            &mut f,
+            20,
+            0x600,
+            &address_request(2, 24, &[10, 1, 2, 3]),
+            1
+        ),
+        0
+    );
+    assert_eq!(
+        ask(
+            &mut f,
+            20,
+            0x600,
+            &address_request(2, 24, &[10, 1, 2, 3]),
+            2
+        ),
+        -17
+    );
+    assert_eq!(ask(&mut f, 20, 0x600, &address_request(10, 64, &v6), 3), 0);
+    assert_eq!(
+        ask(
+            &mut f,
+            20,
+            0x600,
+            &address_request(2, 33, &[10, 7, 7, 7]),
+            4
+        ),
+        -22
+    );
+    let mut elsewhere = address_request(2, 24, &[10, 9, 9, 9]);
+    elsewhere[4] = 2;
+    assert_eq!(ask(&mut f, 20, 0x600, &elsewhere, 5), -19);
+    assert_eq!(dump(&mut f, 22, 6).len(), 2);
+    // Up: 127.0.0.1/8 first, then the address; ::1 after 2001:db8::5.
+    interface_request(&f, DATA + 0x400, b"lo", 1);
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    assert_eq!(f.ret(16, [udp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    let addresses = dump(&mut f, 22, 7);
+    let firsts: Vec<_> = addresses.iter().map(|a| (a[0], a[1])).collect();
+    assert_eq!(firsts, [(2, 8), (2, 24), (10, 64), (10, 128)]);
+    // The subnet is local on a loopback: a socket binds to it, and a
+    // connection reaches a listener from the address.
+    inet_address(&f, DATA + 0x100, [10, 1, 2, 77], 0);
+    assert_eq!(f.ret(49, [udp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let other = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [10, 1, 3, 1], 0);
+    assert_eq!(
+        f.ret(49, [other, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(99).to_syscall_return()
+    );
+    let listener = f.ret(41, [2, 1 | 0x800, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [10, 1, 2, 3], 6000);
+    assert_eq!(f.ret(49, [listener, DATA + 0x100, 16, 0, 0, 0]), 0);
+    assert_eq!(f.ret(50, [listener, 1, 0, 0, 0, 0]), 0);
+    let client = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(f.ret(42, [client, DATA + 0x100, 16, 0, 0, 0]), 0);
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &16u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(51, [client, DATA + 0x180, DATA + 0x200, 0, 0, 0]), 0);
+    let mut name = [0; 4];
+    f.mem.read(GuestAddr(DATA + 0x184), &mut name).unwrap();
+    assert_eq!(name, [10, 1, 2, 3]);
+    // IPv6: the address binds; down, it goes, as every IPv6 address.
+    let six = f.ret(41, [10, 2, 0, 0, 0, 0]);
+    let mut raw = [0; 28];
+    raw[0] = 10;
+    raw[8..24].copy_from_slice(&v6);
+    f.mem.write(GuestAddr(DATA + 0x500), &raw).unwrap();
+    assert_eq!(f.ret(49, [six, DATA + 0x500, 28, 0, 0, 0]), 0);
+    interface_request(&f, DATA + 0x400, b"lo", 0);
+    assert_eq!(f.ret(16, [udp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    let six = f.ret(41, [10, 2, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(49, [six, DATA + 0x500, 28, 0, 0, 0]),
+        Errno(99).to_syscall_return()
+    );
+    assert_eq!(dump(&mut f, 22, 8).len(), 2);
+    // Removing it again is EADDRNOTAVAIL; removing 10.1.2.3/24 takes it.
+    assert_eq!(ask(&mut f, 21, 0, &address_request(10, 64, &v6), 9), -99);
+    assert_eq!(
+        ask(&mut f, 21, 0, &address_request(2, 24, &[10, 1, 2, 3]), 10),
+        0
+    );
+    assert_eq!(
+        ask(&mut f, 21, 0, &address_request(2, 24, &[10, 1, 2, 3]), 11),
+        -99
+    );
+    let other = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [10, 1, 2, 77], 0);
+    assert_eq!(
+        f.ret(49, [other, DATA + 0x100, 16, 0, 0, 0]),
+        Errno(99).to_syscall_return()
+    );
+    // Without CAP_NET_ADMIN, an address is EPERM to add.
+    f.thread.state.credentials = f
+        .thread
+        .state
+        .credentials
+        .setresuid(1000, 1000, 1000)
+        .unwrap();
+    assert_eq!(
+        ask(
+            &mut f,
+            20,
+            0x600,
+            &address_request(2, 24, &[10, 1, 2, 3]),
+            12
+        ),
+        -1
+    );
+}

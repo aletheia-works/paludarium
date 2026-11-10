@@ -956,10 +956,9 @@ fn lookup_cacheinfo() -> [u8; RTA_CACHEINFO_LEN] {
 /// (`RTA_IIF`), which is not supported; `ENETUNREACH` where no route goes.
 /// An `RTA_UID` it names (`ERANGE` when shorter than 4 bytes, for either
 /// family, as both policies take a `u32`) is the one an IPv4 answer gives,
-/// as it is; `RTA_SRC`, `RTA_OIF` and the other
-/// selectors are not looked at. With
-/// `RTM_F_FIB_MATCH` the answer is the table's entry that matched, and
-/// `EHOSTUNREACH` for `0.0.0.0`, which no entry is.
+/// as it is; `RTA_SRC`, `RTA_OIF` and the other selectors are not looked
+/// at. With `RTM_F_FIB_MATCH` the answer is the table's entry that
+/// matched, and `EHOSTUNREACH` for `0.0.0.0`, which no entry is.
 fn lookup(
     network: &Network,
     payload: &[u8],

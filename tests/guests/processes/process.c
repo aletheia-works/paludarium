@@ -27,6 +27,7 @@
 #include <sys/prctl.h>
 #include <sys/time.h>
 #include <time.h>
+#include <utime.h>
 #include <sys/socket.h>
 #include <sys/msg.h>
 #include <grp.h>
@@ -5266,6 +5267,64 @@ static int itimer_case(void) {
     while (!itimer_fired) sigsuspend(&empty);
     printf("alarm fired=%d left=%ld\n", (int)itimer_fired, syscall(SYS_alarm, 0L));
     sigprocmask(SIG_UNBLOCK, &block, NULL);
+    return 0;
+}
+static long ot_errno(long r) { return r < 0 ? -errno : r; }
+static long ot_mtime(const char *path) {
+    struct stat st;
+    return stat(path, &st) ? -errno : (long)st.st_mtim.tv_sec * 1000000L + st.st_mtim.tv_nsec / 1000;
+}
+/* utime, utimes and futimesat, syncfs and readahead, as Linux 6.12's.
+ * Only modification times are compared. */
+static int old_times_case(void) {
+    char dir[] = "/tmp/old-times-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char path[64];
+    snprintf(path, sizeof path, "%s/t", dir);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) return 81;
+    struct timeval tv[2] = {{10, 5}, {20, 7}};
+    long r = ot_errno(syscall(SYS_utimes, path, tv));
+    printf("utimes=%ld mtime=%ld\n", r, ot_mtime(path));
+    tv[1].tv_sec = 30;
+    r = ot_errno(syscall(SYS_futimesat, (long)fd, NULL, tv));
+    printf("futimesat fd=%ld mtime=%ld\n", r, ot_mtime(path));
+    int d = open(dir, O_RDONLY | O_DIRECTORY);
+    tv[1].tv_sec = 40;
+    r = ot_errno(syscall(SYS_futimesat, (long)d, "t", tv));
+    printf("futimesat dir=%ld mtime=%ld\n", r, ot_mtime(path));
+    struct utimbuf ub = {50, 60};
+    r = ot_errno(syscall(SYS_utime, path, &ub));
+    printf("utime=%ld mtime=%ld\n", r, ot_mtime(path));
+    long now = ot_errno(syscall(SYS_utime, path, NULL));
+    int moved = ot_mtime(path) != 60L * 1000000L;
+    printf("utime now=%ld moved=%d utimes now=%ld\n", now, moved,
+           ot_errno(syscall(SYS_utimes, path, NULL)));
+    struct timeval million[2] = {{1, 1000000}, {1, 0}}, negative[2] = {{1, -1}, {1, 0}};
+    struct timeval now_omit[2] = {{1, (1 << 30) - 1}, {1, 0}};
+    printf("utimes fault=%ld million=%ld negative=%ld utime-now=%ld before-path=%ld\n",
+           ot_errno(syscall(SYS_utimes, path, (void *)8)), ot_errno(syscall(SYS_utimes, path, million)),
+           ot_errno(syscall(SYS_utimes, path, negative)), ot_errno(syscall(SYS_utimes, path, now_omit)),
+           ot_errno(syscall(SYS_utimes, NULL, million)));
+    printf("utime fault=%ld missing=%ld null-path=%ld futimesat badf=%ld\n",
+           ot_errno(syscall(SYS_utime, path, (void *)8)), ot_errno(syscall(SYS_utime, "/tmp/no-such-file-old-times", NULL)),
+           ot_errno(syscall(SYS_utimes, NULL, NULL)), ot_errno(syscall(SYS_futimesat, 99L, NULL, tv)));
+    int p[2];
+    if (pipe(p)) return 82;
+    int wo = open(path, O_WRONLY);
+    int po = open(path, O_PATH);
+    printf("syncfs=%ld badf=%ld path=%ld\n", ot_errno(syscall(SYS_syncfs, (long)fd)),
+           ot_errno(syscall(SYS_syncfs, 99L)), ot_errno(syscall(SYS_syncfs, (long)po)));
+    printf("readahead=%ld negative-offset=%ld huge=%ld pipe=%ld write-only=%ld path=%ld badf=%ld\n",
+           ot_errno(syscall(SYS_readahead, (long)fd, 0L, 4096L)),
+           ot_errno(syscall(SYS_readahead, (long)fd, -1L, 4096L)),
+           ot_errno(syscall(SYS_readahead, (long)fd, 0L, -1L)),
+           ot_errno(syscall(SYS_readahead, (long)p[0], 0L, 1L)),
+           ot_errno(syscall(SYS_readahead, (long)wo, 0L, 1L)),
+           ot_errno(syscall(SYS_readahead, (long)po, 0L, 1L)),
+           ot_errno(syscall(SYS_readahead, 99L, 0L, 1L)));
+    unlink(path);
+    rmdir(dir);
     return 0;
 }
 static int pkey_case(void) {
@@ -15950,6 +16009,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
+    if (!strcmp(mode, "old-times")) return old_times_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();

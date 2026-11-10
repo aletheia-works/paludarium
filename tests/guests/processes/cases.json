@@ -182,6 +182,7 @@
     {"name":"msg","binary":"process"},
     {"name":"rseq","binary":"process"},
     {"name":"pkey","binary":"process"},
+    {"name":"old-times","binary":"process"},
     {"name":"itimer","binary":"process"},
     {"name":"mprotect-checks","binary":"process"},
     {"name":"io-uring","binary":"process"},

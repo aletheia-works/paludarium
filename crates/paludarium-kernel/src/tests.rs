@@ -3845,3 +3845,93 @@ mod io_uring {
         assert_eq!(f.ret(427, &[0, 8, probe, 1]), errno(Errno(95)));
     }
 }
+
+mod old_time_calls {
+    use super::*;
+    /// The modification time (`st_mtime`, `st_mtime_nsec`) of `path`, from
+    /// `stat`, which reports no other.
+    fn times(f: &mut Fixture, path: u64) -> [u64; 2] {
+        let at = DATA + 0x800;
+        assert_eq!(f.ret(4, &[path, at]), 0);
+        [88, 96].map(|offset| f.mem.read_u64(GuestAddr(at + offset)).unwrap())
+    }
+    #[test]
+    fn utime_utimes_and_futimesat_set_the_times_as_utimensat() {
+        let mut f = fixture();
+        let (path, tv) = (DATA, DATA + 0x100);
+        f.mem.write(GuestAddr(path), b"/t\0").unwrap();
+        let fd = f.ret(2, &[path, 0o102, 0o600]);
+        // utimes: microseconds.
+        for (i, word) in [10, 5, 20, 7].into_iter().enumerate() {
+            f.mem.write_u64(GuestAddr(tv + 8 * i as u64), word).unwrap();
+        }
+        assert_eq!(f.ret(235, &[path, tv]), 0);
+        assert_eq!(times(&mut f, path), [20, 7000]);
+        // futimesat with a null path sets the descriptor's.
+        f.mem.write_u64(GuestAddr(tv + 16), 30).unwrap();
+        assert_eq!(f.ret(261, &[fd, 0, tv]), 0);
+        assert_eq!(times(&mut f, path), [30, 7000]);
+        // futimesat from a directory.
+        f.mem.write(GuestAddr(path + 0x40), b"t\0").unwrap();
+        f.mem.write(GuestAddr(path + 0x50), b"/\0").unwrap();
+        let root = f.ret(2, &[path + 0x50, 0o200000, 0]);
+        f.mem.write_u64(GuestAddr(tv + 16), 40).unwrap();
+        assert_eq!(f.ret(261, &[root, path + 0x40, tv]), 0);
+        assert_eq!(times(&mut f, path)[0], 40);
+        // utime: whole seconds.
+        f.mem.write_u64(GuestAddr(tv), 50).unwrap();
+        f.mem.write_u64(GuestAddr(tv + 8), 60).unwrap();
+        assert_eq!(f.ret(132, &[path, tv]), 0);
+        assert_eq!(times(&mut f, path), [60, 0]);
+        // No times is now.
+        f.host
+            .set_clock(paludarium_host::ClockId::Realtime, 70_000_000_123);
+        assert_eq!(f.ret(132, &[path, 0]), 0);
+        assert_eq!(times(&mut f, path), [70, 123]);
+        assert_eq!(f.ret(235, &[path, 0]), 0);
+    }
+    #[test]
+    fn they_check_as_linux_does() {
+        let mut f = fixture();
+        let (path, tv) = (DATA, DATA + 0x100);
+        f.mem.write(GuestAddr(path), b"/t\0").unwrap();
+        f.ret(2, &[path, 0o102, 0o600]);
+        assert_eq!(f.ret(235, &[path, 8]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(132, &[path, 8]), errno(Errno::EFAULT));
+        // Microseconds of a million or more (UTIME_NOW among them) or negative.
+        for micros in [1_000_000, (1 << 30) - 1, u64::MAX] {
+            for (i, word) in [1, micros, 1, 0].into_iter().enumerate() {
+                f.mem.write_u64(GuestAddr(tv + 8 * i as u64), word).unwrap();
+            }
+            assert_eq!(f.ret(235, &[path, tv]), errno(Errno::EINVAL));
+            assert_eq!(f.ret(261, &[99, path, tv]), errno(Errno::EINVAL));
+        }
+        // The times are checked before the path.
+        assert_eq!(f.ret(235, &[0, tv]), errno(Errno::EINVAL));
+        f.mem.write_u64(GuestAddr(tv + 8), 0).unwrap();
+        assert_eq!(f.ret(235, &[0, tv]), errno(Errno::EFAULT));
+        f.mem.write(GuestAddr(path + 0x40), b"/missing\0").unwrap();
+        assert_eq!(f.ret(132, &[path + 0x40, 0]), errno(Errno::ENOENT));
+        assert_eq!(f.ret(261, &[99, 0, tv]), errno(Errno::EBADF));
+    }
+    #[test]
+    fn syncfs_and_readahead_check_their_descriptor() {
+        let mut f = fixture();
+        f.mem.write(GuestAddr(DATA), b"/t\0").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        assert_eq!(f.ret(306, &[fd]), 0);
+        assert_eq!(f.ret(306, &[99]), errno(Errno::EBADF));
+        let path_only = f.ret(2, &[DATA, 0o10000000, 0]);
+        assert_eq!(f.ret(306, &[path_only]), errno(Errno::EBADF));
+        assert_eq!(f.ret(187, &[fd, 0, 4096]), 0);
+        assert_eq!(f.ret(187, &[fd, -1i64 as u64, 4096]), 0);
+        assert_eq!(f.ret(187, &[fd, 0, u64::MAX]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(187, &[path_only, 0, 1]), errno(Errno::EBADF));
+        let write_only = f.ret(2, &[DATA, 0o1, 0]);
+        assert_eq!(f.ret(187, &[write_only, 0, 1]), errno(Errno::EBADF));
+        assert_eq!(f.ret(293, &[DATA + 0x100, 0]), 0);
+        let pipe = f.mem.read_u64(GuestAddr(DATA + 0x100)).unwrap() & 0xffff_ffff;
+        assert_eq!(f.ret(187, &[pipe, 0, 1]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(187, &[99, 0, 1]), errno(Errno::EBADF));
+    }
+}

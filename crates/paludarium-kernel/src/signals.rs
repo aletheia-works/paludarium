@@ -298,9 +298,10 @@ pub(crate) enum RestartBlock {
 pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
     match number {
         // read, write, pread64, pwrite64, readv, writev, preadv, pwritev,
-        // preadv2, pwritev2, wait4, waitid, pause, rt_sigsuspend, flock, the blocking socket
-        // calls (a wait that SO_RCVTIMEO or SO_SNDTIMEO limits gives EINTR
-        // instead, and clears the restart itself), msgsnd and msgrcv.
+        // preadv2, pwritev2, wait4, waitid, pause, rt_sigsuspend, flock, the
+        // blocking socket calls with sendmmsg and recvmmsg (a wait that
+        // SO_RCVTIMEO or SO_SNDTIMEO limits gives EINTR instead, and clears
+        // the restart itself), msgsnd and msgrcv.
         0
         | 1
         | 17..=20
@@ -308,6 +309,8 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         | 296
         | 327
         | 328
+        | 299
+        | 307
         | 61
         | 247
         | 34

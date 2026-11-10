@@ -184,6 +184,7 @@
     {"name":"pkey","binary":"process"},
     {"name":"vector-flags","binary":"process"},
     {"name":"old-times","binary":"process"},
+    {"name":"mmsg","binary":"process"},
     {"name":"itimer","binary":"process"},
     {"name":"mprotect-checks","binary":"process"},
     {"name":"io-uring","binary":"process"},

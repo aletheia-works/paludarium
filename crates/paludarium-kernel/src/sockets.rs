@@ -552,7 +552,17 @@ impl FileHandle for PipeEnd {
 
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let number = c.number;
-    let result = (|| match number {
+    let result = match number {
+        299 => receive_messages(c, a),
+        307 => send_messages(c, a),
+        _ => route(c, number, a),
+    };
+    Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
+}
+
+/// The socket call `number` on the socket family of descriptor `a[0]`.
+fn route(c: &mut Context<'_>, number: u64, a: [u64; 6]) -> Result<u64, Errno> {
+    (|| match number {
         // AF_INET and AF_INET6, with a network, AF_UNIX and AF_NETLINK.
         41 if a[0] == 1 => crate::unix::socket(c, a),
         41 if a[0] == 16 => crate::netlink::socket(c, a),
@@ -637,8 +647,175 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         46 => send_message(c, a),
         47 => receive_message(c, a),
         _ => Err(Errno::ENOSYS),
-    })();
-    Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
+    })()
+}
+
+/// `MSG_WAITFORONE`, `MSG_CMSG_COMPAT`, and `UIO_MAXIOV`, where `sendmmsg`
+/// stops.
+const MSG_WAITFORONE: u64 = 0x10000;
+const MSG_CMSG_COMPAT: u64 = 0x8000_0000;
+const UIO_MAXIOV: u64 = 1024;
+/// A `struct mmsghdr`: a `struct msghdr`, then the `msg_len` the call
+/// writes, padded to 64 bytes.
+const MMSGHDR: u64 = 64;
+const MSG_LEN: u64 = 56;
+/// Where `struct msghdr` keeps `msg_flags`.
+const MSG_FLAGS: u64 = 48;
+
+/// EBADF for no descriptor, ENOTSOCK for a file that is no socket, as
+/// `sockfd_lookup_light`.
+fn socket_of(c: &Context<'_>, fd: u64) -> Result<(), Errno> {
+    let file = c.files.descriptor(fd)?.file;
+    if crate::inet::of(&file).is_some()
+        || crate::netlink::of(&file).is_some()
+        || file.as_any().is_some_and(|v| v.is::<SocketPairEnd>())
+    {
+        Ok(())
+    } else {
+        Err(Errno(88))
+    }
+}
+
+/// The bytes the iovecs of the `struct msghdr` at `at` hold.
+fn message_bytes(c: &Context<'_>, at: u64) -> Result<u64, Errno> {
+    let [iov, count] = crate::syscalls::read_words::<2>(c.mem, at + 16)?;
+    (0..count.min(UIO_MAXIOV)).try_fold(0u64, |total, index| {
+        let length = c
+            .mem
+            .read_u64(GuestAddr(iov + index * 16 + 8))
+            .map_err(|_| Errno::EFAULT)?;
+        Ok(total.saturating_add(length))
+    })
+}
+
+/// `sendmmsg(fd, msgvec, vlen, flags)`, as Linux's `__sys_sendmmsg`: each
+/// message as `sendmsg` sends it, its count written to its `msg_len`, at
+/// most `UIO_MAXIOV`. It stops at an error, and after a message only part
+/// of which went, and gives the error only when no message went.
+fn send_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let flags = a[3] & 0xffff_ffff;
+    if flags & MSG_CMSG_COMPAT != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let count = (a[2] & 0xffff_ffff).min(UIO_MAXIOV);
+    socket_of(c, a[0])?;
+    let mut sent = 0;
+    let mut error = None;
+    while sent < count {
+        let entry = a[1].wrapping_add(sent * MMSGHDR);
+        let result = route(c, 46, [a[0], entry, flags, 0, 0, 0]).and_then(|bytes| {
+            let length = u32::try_from(bytes).unwrap_or(u32::MAX);
+            c.mem
+                .write(GuestAddr(entry + MSG_LEN), &length.to_le_bytes())
+                .map_err(|_| Errno::EFAULT)?;
+            Ok(bytes)
+        });
+        match result {
+            Ok(bytes) => {
+                sent += 1;
+                if message_bytes(c, entry).is_ok_and(|total| bytes < total) {
+                    break;
+                }
+            }
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+        }
+    }
+    match error {
+        Some(e) if sent == 0 => Err(e),
+        _ => {
+            // A wait a later message ended is not this call's to restart.
+            if sent != 0 {
+                c.process.restart = None;
+            }
+            Ok(sent)
+        }
+    }
+}
+
+/// `recvmmsg(fd, msgvec, vlen, flags, timeout)`, as Linux's
+/// `__sys_recvmmsg` and `do_recvmmsg`: the timeout is read (EFAULT) and
+/// checked (EINVAL) first. Each message is received as `recvmsg` receives
+/// it, its count written to its `msg_len`; `MSG_WAITFORONE` waits for the
+/// first only. The timeout is looked at only after each message, as on
+/// Linux, so the first is waited for without it; the time left is written
+/// back when a message came. It stops at an error, or after out-of-band
+/// data, and gives the error only when no message came. Unlike `sendmmsg`,
+/// it takes any `vlen`, as `do_recvmmsg` caps none.
+fn receive_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let mut flags = a[3] & 0xffff_ffff;
+    if flags & MSG_CMSG_COMPAT != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let end = if a[4] == 0 {
+        None
+    } else {
+        let [seconds, nanos] = crate::syscalls::read_words::<2>(c.mem, a[4])?;
+        if (seconds as i64) < 0 || nanos >= 1_000_000_000 {
+            return Err(Errno::EINVAL);
+        }
+        let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+        Some(now.saturating_add(seconds.saturating_mul(1_000_000_000).saturating_add(nanos)))
+    };
+    let count = a[2] & 0xffff_ffff;
+    socket_of(c, a[0])?;
+    let mut received = 0;
+    let mut error = None;
+    let mut left = None;
+    while received < count {
+        let entry = a[1].wrapping_add(received * MMSGHDR);
+        let result =
+            route(c, 47, [a[0], entry, flags & !MSG_WAITFORONE, 0, 0, 0]).and_then(|bytes| {
+                let length = u32::try_from(bytes).unwrap_or(u32::MAX);
+                c.mem
+                    .write(GuestAddr(entry + MSG_LEN), &length.to_le_bytes())
+                    .map_err(|_| Errno::EFAULT)
+            });
+        if let Err(e) = result {
+            error = Some(e);
+            break;
+        }
+        received += 1;
+        if flags & MSG_WAITFORONE != 0 {
+            flags |= MSG_DONTWAIT;
+        }
+        // Nothing after a message gives an error: what came is counted.
+        if let Some(end) = end {
+            let Ok(now) = c.host.clock(paludarium_host::ClockId::Monotonic) else {
+                break;
+            };
+            let remaining = end.saturating_sub(now);
+            left = Some(remaining);
+            if remaining == 0 {
+                break;
+            }
+        }
+        // recvmsg has just written the message's flags there.
+        let message_flags = c.mem.read_u64(GuestAddr(entry + MSG_FLAGS)).unwrap_or(0);
+        if message_flags & MSG_OOB != 0 {
+            break;
+        }
+    }
+    if let Some(e) = error
+        && received == 0
+    {
+        return Err(e);
+    }
+    if received != 0 {
+        c.process.restart = None;
+    }
+    if received != 0
+        && let Some(remaining) = left
+    {
+        crate::syscalls::write_words(
+            c.mem,
+            a[4],
+            &[remaining / 1_000_000_000, remaining % 1_000_000_000],
+        )?;
+    }
+    Ok(received)
 }
 
 const MSG_OOB: u64 = 0x1;

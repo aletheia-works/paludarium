@@ -421,6 +421,7 @@ mod linux {
         processes_pkey => ("pkey","process"),
         processes_vector_flags => ("vector-flags","process"),
         processes_old_times => ("old-times","process"),
+        processes_mmsg => ("mmsg","process"),
         processes_itimer => ("itimer","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),

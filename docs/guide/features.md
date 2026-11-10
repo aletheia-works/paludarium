@@ -65,7 +65,7 @@ kernel.
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, and the pseudo-terminals' requests below) |
 | Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
-| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -347,6 +347,17 @@ kernel.
   the sending socket has as it is read, even once that socket has gone, as
   Linux's `unix_copy_addr`, cut to the room given but with its whole
   length; an unnamed socket's has length 0.
+- `sendmmsg` and `recvmmsg` send and receive each message of their vector
+  as `sendmsg` and `recvmsg` do, on any socket, writing its byte count to
+  its `msg_len`, as Linux's `__sys_sendmmsg` and `do_recvmmsg`.
+  `MSG_CMSG_COMPAT` is `EINVAL`; `sendmmsg` sends at most 1024 and stops
+  after a message only part of which went. Both stop at an error, which they
+  give only when no message went, and give the count otherwise.
+  `MSG_WAITFORONE` waits for the first message only, and `recvmmsg` stops
+  after out-of-band data. Its timeout is read (`EFAULT`) and checked
+  (`EINVAL`) before the descriptor, but, as on Linux, it is looked at only
+  after each message, so the first is waited for without it; the time left
+  is written back once a message came.
 - Sockets that only unread messages hold are closed, as Linux's garbage
   collector (`unix_gc`) closes them when a socket goes: a socket whose
   descriptor waits in its own queue, or sockets that hold each other so,
@@ -1845,7 +1856,7 @@ one only with an `--allow-net`.
   `preadv2`, `pwritev2`,
   `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `fcntl`'s `F_SETLKW` and
   `F_OFD_SETLKW`, `sendto`, `recvfrom`,
-  `sendmsg`, `recvmsg`, `ppoll`, `select`, `pselect6`, `poll` with no timeout
+  `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`, `ppoll`, `select`, `pselect6`, `poll` with no timeout
   and a `futex` wait with none. `nanosleep`, a relative `clock_nanosleep`,
   `poll` with a timeout and a timed `futex` wait resume through
   `restart_syscall` with the deadline they had (the `futex` wait checks its word

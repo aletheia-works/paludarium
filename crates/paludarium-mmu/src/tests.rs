@@ -192,8 +192,10 @@ fn a_replacing_map_takes_the_place_of_what_was_mapped() {
     m.write_u64(a, 7).unwrap();
     m.write_u64(GuestAddr(0x10000 + PAGE_SIZE), 8).unwrap();
     let generation = m.code_generation();
+    let map =
+        |at, prot, backing| m.map_backed(at, PAGE_SIZE, prot, MappingKind::Anonymous, backing);
     assert_eq!(
-        m.map_replacing(a, PAGE_SIZE, Prot::READ_EXEC, MappingKind::Anonymous),
+        map(Placement::Replacing(a), Prot::READ_EXEC, Backing::None),
         Ok(a)
     );
     // The page is new, zero and executable; the next one stays as it was.
@@ -205,18 +207,72 @@ fn a_replacing_map_takes_the_place_of_what_was_mapped() {
     // Where nothing was mapped, it maps; a bad range maps nothing.
     let free = GuestAddr(0x40000);
     assert_eq!(
-        m.map_replacing(free, PAGE_SIZE, Prot::READ, MappingKind::Anonymous),
+        map(Placement::Replacing(free), Prot::READ, Backing::None),
         Ok(free)
     );
     assert_eq!(
-        m.map_replacing(
-            GuestAddr(0x40001),
-            PAGE_SIZE,
+        map(
+            Placement::Replacing(GuestAddr(0x40001)),
             Prot::READ,
-            MappingKind::Anonymous
+            Backing::None
         ),
         Err(Errno::EINVAL)
     );
+    assert_eq!(
+        map(Placement::Exactly(free), Prot::READ, Backing::None),
+        Err(Errno::EEXIST)
+    );
+}
+#[test]
+fn a_backed_map_shows_its_backing_or_nothing() {
+    let m = memory(1);
+    let a = GuestAddr(0x10000);
+    let pages = SharedPages::new();
+    pages.fill(0, &[0x5a], None).unwrap();
+    let backing = Backing::Shared {
+        pages: &pages,
+        offset: 0,
+        may_write: true,
+    };
+    assert_eq!(
+        m.map_backed(
+            Placement::Replacing(a),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::File,
+            backing
+        ),
+        Ok(a)
+    );
+    assert_eq!(m.read_value(a, 1), Ok(0x5a));
+    // A page cache without its file cannot back a private mapping: the new
+    // mapping goes, and the one it replaced stays gone.
+    let cache = Backing::Cache {
+        pages: &pages,
+        offset: 0,
+    };
+    assert_eq!(
+        m.map_backed(
+            Placement::Replacing(a),
+            PAGE_SIZE,
+            Prot::READ,
+            MappingKind::File,
+            cache
+        ),
+        Err(Errno::EINVAL)
+    );
+    assert!(!m.read(a, &mut [0]).unwrap_err().mapped);
+    // Placed anywhere, it lands where there is room.
+    let anywhere = m
+        .map_backed(
+            Placement::Near(None),
+            PAGE_SIZE,
+            Prot::READ,
+            MappingKind::File,
+            backing,
+        )
+        .unwrap();
+    assert_eq!(m.read_value(anywhere, 1), Ok(0x5a));
 }
 
 mod signals_time_tests {

@@ -4020,6 +4020,37 @@ mod shm {
     }
 
     #[test]
+    fn another_thread_sees_the_segment_whenever_shm_remap_replaces_it() {
+        let (mut k, mut t, m) = setup();
+        let id = shmget(&mut k, &mut t, &m, 0, PAGE_SIZE, 0o600);
+        let at = shmat(&mut k, &mut t, &m, id, 0, 0);
+        m.write(GuestAddr(at), &[0x5a]).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let reads = std::sync::atomic::AtomicU64::new(0);
+        let seen = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut seen = std::collections::BTreeSet::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut byte = [0];
+                    seen.insert(m.read(GuestAddr(at), &mut byte).ok().map(|()| byte[0]));
+                    reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                seen
+            });
+            // Replaced while the reader reads, until it has read the page
+            // 3,000,000 times.
+            while reads.load(std::sync::atomic::Ordering::Relaxed) < 3_000_000 {
+                assert_eq!(shmat(&mut k, &mut t, &m, id, at, SHM_REMAP), at);
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            reader.join().unwrap()
+        });
+        // Linux replaces the mapping with the segment under its mmap_lock:
+        // the page is never unmapped, nor zero, in between.
+        assert_eq!(seen, [Some(0x5a)].into());
+    }
+
+    #[test]
     fn removal_waits_for_the_last_detach() {
         let (mut k, mut t, m) = setup();
         let id = shmget(&mut k, &mut t, &m, 7, 64, IPC_CREAT | 0o640);

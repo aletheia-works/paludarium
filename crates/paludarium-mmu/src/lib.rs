@@ -676,6 +676,36 @@ impl FrameCell {
     }
 }
 
+/// Where [`AddressSpace::map_backed`] puts a mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// At this address, in place of what is mapped there (`MAP_FIXED`).
+    Replacing(GuestAddr),
+    /// At this address, which must be free (`MAP_FIXED_NOREPLACE`).
+    Exactly(GuestAddr),
+    /// At the hint if it is free, else wherever there is room.
+    Near(Option<GuestAddr>),
+}
+
+/// What a mapping [`AddressSpace::map_backed`] makes shows.
+#[derive(Clone, Copy)]
+pub enum Backing<'a> {
+    /// Its own zero-filled pages.
+    None,
+    /// Zero-filled pages that `fork` shares (`MAP_SHARED | MAP_ANONYMOUS`),
+    /// as [`AddressSpace::mark_shared`] makes them.
+    SharedAnonymous,
+    /// `pages` from key `offset` on ([`AddressSpace::share_pages`]).
+    Shared {
+        pages: &'a SharedPages,
+        offset: u64,
+        may_write: bool,
+    },
+    /// The page cache `pages` from `offset`, until a page is written
+    /// ([`AddressSpace::back_with_cache`]).
+    Cache { pages: &'a SharedPages, offset: u64 },
+}
+
 /// Memory that every mapping of it shows, in every address space: shared
 /// anonymous memory, or the page cache of a file, whose frames are keyed by
 /// their offset in the file. The page cache's owner (a kernel object that
@@ -1617,6 +1647,80 @@ impl AddressSpaceData {
         offset: u64,
     ) -> Result<(), Errno> {
         self.back(addr, len, source, None, offset)
+    }
+    /// Marks a newly created mapping as Linux MAP_SHARED, independently of VM sharing.
+    fn mark_shared(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
+        let end = checked_range(addr, len)?;
+        if !self
+            .mappings
+            .values()
+            .any(|mapping| mapping.start.0 == addr.0 && mapping.end() == end)
+        {
+            return Err(Errno::EINVAL);
+        }
+        let frames = self
+            .read_directory()
+            .iter()
+            .flat_map(|(&index, table)| {
+                table
+                    .pages
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(slot, page)| {
+                        page.as_ref().map(|page| {
+                            (
+                                (index * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE,
+                                page.frame.clone(),
+                            )
+                        })
+                    })
+            })
+            .filter(|(page, _)| *page >= addr.0 && *page < end)
+            .map(|(page, frame)| (page - addr.0, frame))
+            .collect();
+        self.shared.insert(
+            addr.0,
+            SharedMapping {
+                end,
+                shift: 0u64.wrapping_sub(addr.0),
+                pages: SharedPages::with_frames(frames),
+                may_write: true,
+            },
+        );
+        Ok(())
+    }
+    /// Makes the newly created mapping `[addr, addr+len)` show `pages` from
+    /// key `offset` on, a file's page cache from that file offset, as a
+    /// Linux `MAP_SHARED` mapping of the file; `may_write` says whether
+    /// `mprotect` may make it writable.
+    fn share_pages(
+        &mut self,
+        addr: GuestAddr,
+        len: u64,
+        pages: &SharedPages,
+        offset: u64,
+        may_write: bool,
+    ) -> Result<(), Errno> {
+        let end = checked_range(addr, len)?;
+        if !self
+            .mappings
+            .values()
+            .any(|mapping| mapping.start.0 == addr.0 && mapping.end() == end)
+        {
+            return Err(Errno::EINVAL);
+        }
+        self.for_populated(addr.0, end, |entry| *entry = None);
+        self.bump_code_generation();
+        self.shared.insert(
+            addr.0,
+            SharedMapping {
+                end,
+                shift: offset.wrapping_sub(addr.0),
+                pages: pages.clone(),
+                may_write,
+            },
+        );
+        Ok(())
     }
     /// Makes the private file mapping `[addr, addr+len)` show the page
     /// cache `pages` of the file from `offset`, which must have its file
@@ -3377,45 +3481,7 @@ impl AddressSpace {
     }
     /// Marks a newly created mapping as Linux MAP_SHARED, independently of VM sharing.
     pub fn mark_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
-        let end = checked_range(addr, len)?;
-        let mut data = self.locked();
-        if !data
-            .mappings
-            .values()
-            .any(|mapping| mapping.start.0 == addr.0 && mapping.end() == end)
-        {
-            return Err(Errno::EINVAL);
-        }
-        let frames = data
-            .read_directory()
-            .iter()
-            .flat_map(|(&index, table)| {
-                table
-                    .pages
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(slot, page)| {
-                        page.as_ref().map(|page| {
-                            (
-                                (index * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE,
-                                page.frame.clone(),
-                            )
-                        })
-                    })
-            })
-            .filter(|(page, _)| *page >= addr.0 && *page < end)
-            .map(|(page, frame)| (page - addr.0, frame))
-            .collect();
-        data.shared.insert(
-            addr.0,
-            SharedMapping {
-                end,
-                shift: 0u64.wrapping_sub(addr.0),
-                pages: SharedPages::with_frames(frames),
-                may_write: true,
-            },
-        );
-        Ok(())
+        self.locked().mark_shared(addr, len)
     }
     /// Makes the newly created mapping `[addr, addr+len)` show `pages` from
     /// key `offset` on, a file's page cache from that file offset, as a
@@ -3429,27 +3495,51 @@ impl AddressSpace {
         offset: u64,
         may_write: bool,
     ) -> Result<(), Errno> {
-        let end = checked_range(addr, len)?;
+        self.locked()
+            .share_pages(addr, len, pages, offset, may_write)
+    }
+    /// Maps `len` bytes where `placement` says and attaches `backing` to
+    /// them, under one hold of the locks, as Linux's `mmap` does under its
+    /// `mmap_lock`: no other thread sees the mapping before it shows what it
+    /// maps, nor maps the range in between. When the backing cannot be
+    /// attached, the new mapping goes, and what it replaced stays gone.
+    pub fn map_backed(
+        &self,
+        placement: Placement,
+        len: u64,
+        prot: Prot,
+        kind: MappingKind,
+        backing: Backing<'_>,
+    ) -> Result<GuestAddr, Errno> {
         let mut data = self.locked();
-        if !data
-            .mappings
-            .values()
-            .any(|mapping| mapping.start.0 == addr.0 && mapping.end() == end)
-        {
-            return Err(Errno::EINVAL);
-        }
-        data.for_populated(addr.0, end, |entry| *entry = None);
-        data.bump_code_generation();
-        data.shared.insert(
-            addr.0,
-            SharedMapping {
-                end,
-                shift: offset.wrapping_sub(addr.0),
-                pages: pages.clone(),
+        let at = match placement {
+            Placement::Replacing(at) => {
+                data.unmap(at, len)?;
+                data.map(Some(at), len, prot, kind)?
+            }
+            Placement::Exactly(at) => data.map(Some(at), len, prot, kind)?,
+            Placement::Near(hint) => {
+                match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
+                    Some(at) => at,
+                    None => data.map(None, len, prot, kind)?,
+                }
+            }
+        };
+        let attached = match backing {
+            Backing::None => Ok(()),
+            Backing::SharedAnonymous => data.mark_shared(at, len),
+            Backing::Shared {
+                pages,
+                offset,
                 may_write,
-            },
-        );
-        Ok(())
+            } => data.share_pages(at, len, pages, offset, may_write),
+            Backing::Cache { pages, offset } => data.back_with_cache(at, len, pages, offset),
+        };
+        if let Err(error) = attached {
+            let _ = data.unmap(at, len);
+            return Err(error);
+        }
+        Ok(at)
     }
     #[must_use]
     pub fn id(&self) -> u64 {
@@ -3884,22 +3974,6 @@ impl AddressSpace {
     }
     pub fn unmap_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().unmap(addr, len)
-    }
-    /// Maps zero-filled pages at `[addr, addr+len)` in place of whatever is
-    /// mapped there, as Linux's `MAP_FIXED` does: the unmap and the map
-    /// happen under one hold of the locks, so another thread's `mmap`
-    /// cannot take the range between them and make the map fail with
-    /// `EEXIST`.
-    pub fn map_replacing(
-        &self,
-        addr: GuestAddr,
-        len: u64,
-        prot: Prot,
-        kind: MappingKind,
-    ) -> Result<GuestAddr, Errno> {
-        let mut data = self.locked();
-        data.unmap(addr, len)?;
-        data.map(Some(addr), len, prot, kind)
     }
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.protect_shared(addr, len, prot)

@@ -508,14 +508,15 @@ kernel.
   `SCM_TIMESTAMPING` after that control message, whose first `timespec` is
   the same time when the flags report software stamps and do not filter
   received ones out; no hardware stamps a message between local sockets.
-- `mmap` with `MAP_FIXED`, and `shmat` with `SHM_REMAP`, unmap what is in the
-  range and map it again under one hold of the address space's lock, as
-  Linux does under its `mmap_lock`: another thread's `mmap` cannot take the
-  range in between. The file, the shared memory or the segment is attached to
-  the new mapping afterwards, under another hold, so until then another
-  thread may read zeros there where Linux shows the file, and an error in
-  attaching leaves the range unmapped. `MAP_FIXED_NOREPLACE` gives `EEXIST`
-  when anything is mapped there.
+- `mmap` and `shmat` make a mapping and attach the file, the shared memory or
+  the segment to it under one hold of the address space's lock, as Linux does
+  under its `mmap_lock`. With `MAP_FIXED`, or `SHM_REMAP`, the unmap of what
+  was in the range goes under the same hold. So another thread neither maps
+  the range in between nor sees the new mapping before it shows what it maps.
+  The page cache is read first, outside the lock. `MAP_FIXED_NOREPLACE` gives
+  `EEXIST` when anything is mapped there, before the file is asked. When the
+  backing cannot be attached, the new mapping goes and what it replaced stays
+  gone.
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and

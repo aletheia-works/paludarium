@@ -14,7 +14,7 @@ use crate::ipc::{
     IPC_SET, IPC_STAT, Perm,
 };
 use crate::syscalls::{Context, Outcome};
-use paludarium_mmu::{FileSize, MappingKind, PageSource, Prot, SharedPages};
+use paludarium_mmu::{Backing, FileSize, MappingKind, PageSource, Placement, Prot, SharedPages};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -345,28 +345,31 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         }
     }
     let prot = crate::syscalls::read_implies_exec(c.process, prot);
-    let at = if fixed {
+    let placement = if fixed {
         if addr
             .checked_add(len)
             .is_none_or(|end| end > USER_ADDRESS_LIMIT - PAGE)
         {
             return Err(ENOMEM);
         }
-        let at = GuestAddr(addr);
-        // Under one hold of the locks, so that no other thread's mmap takes
-        // the range in between. The segment is attached below, under
-        // another.
-        c.mem.map_replacing(at, len, prot, MappingKind::File)?
+        Placement::Replacing(GuestAddr(addr))
     } else {
-        c.mem.map_shared(None, len, prot, MappingKind::File)?
+        Placement::Near(None)
     };
-    if let Err(error) = c
-        .mem
-        .share_pages(at, len, &memory, 0, flag & SHM_RDONLY == 0)
-    {
-        let _ = c.mem.unmap_shared(at, len);
-        return Err(error);
-    }
+    // The mapping and the segment go in under one hold of the address
+    // space's lock, so that no other thread sees the mapping without the
+    // segment, or maps the range in between.
+    let at = c.mem.map_backed(
+        placement,
+        len,
+        prot,
+        MappingKind::File,
+        Backing::Shared {
+            pages: &memory,
+            offset: 0,
+            may_write: flag & SHM_RDONLY == 0,
+        },
+    )?;
     c.group.numa().forget(at.0, len);
     drop(memory);
     let shm = segments(c);

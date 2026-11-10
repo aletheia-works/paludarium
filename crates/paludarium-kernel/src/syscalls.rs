@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use paludarium_cpu::CpuState;
 use paludarium_host::{ClockId, FileHandle, Host, WaitOutcome};
-use paludarium_mmu::{AddressSpace, MappingKind, Prot, Remap};
+use paludarium_mmu::{AddressSpace, Backing, MappingKind, Placement, Prot, Remap};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 
 use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState, credentials, signals};
@@ -1475,64 +1475,68 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         MappingKind::Anonymous
     };
     let at = GuestAddr(addr);
-    let result = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+    let placement = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
         if at.page_offset() != 0 {
             return err(Errno::EINVAL);
         }
         if flags & MAP_FIXED_NOREPLACE == 0 {
-            // Under one hold of the locks, so that no other thread's mmap
-            // takes the range in between. The file is attached below, under
-            // another.
-            c.mem.map_replacing(at, len, prot, kind)
+            Placement::Replacing(at)
         } else {
-            c.mem.map_shared(Some(at), len, prot, kind)
+            // Linux refuses a range in use before it asks the file.
+            let end = addr.saturating_add(len);
+            if c.mem.mappings().any(|m| m.start.0 < end && m.end() > addr) {
+                return err(Errno::EEXIST);
+            }
+            Placement::Exactly(at)
         }
     } else {
         // Linux rounds a non-fixed hint down to its page boundary.
         let hint = GuestAddr(addr & !4095);
-        let hinted = (hint.0 != 0)
-            .then(|| c.mem.map_shared(Some(hint), len, prot, kind).ok())
-            .flatten();
-        match hinted {
-            Some(a) => Ok(a),
-            None => c.mem.map_shared(None, len, prot, kind),
+        Placement::Near((hint.0 != 0).then_some(hint))
+    };
+    // What the mapping shows is made first, outside the address space's
+    // lock, as it may read the file. The mapping and what it shows then go
+    // in under one hold of the lock, so that no other thread sees the
+    // mapping without it, or maps the range in between.
+    let result = match (&file, &descriptor) {
+        (Some(file), Some(d)) if flags & MAP_SHARED != 0 => {
+            // The mapping shows the file's page cache.
+            shared_file(c, d, file, len, offset, prot, |pages, may_write| {
+                c.mem.map_backed(
+                    placement,
+                    len,
+                    prot,
+                    kind,
+                    Backing::Shared {
+                        pages,
+                        offset,
+                        may_write,
+                    },
+                )
+            })
         }
+        // A private mapping shows the file's page cache until it writes a
+        // page, which copies it.
+        (Some(file), Some(d)) => file_cache(c, d, file).and_then(|cache| {
+            c.mem.map_backed(
+                placement,
+                len,
+                prot,
+                kind,
+                Backing::Cache {
+                    pages: &cache.map_private(file, crate::files::mapped_path(c, d)),
+                    offset,
+                },
+            )
+        }),
+        _ if flags & MAP_SHARED != 0 => {
+            c.mem
+                .map_backed(placement, len, prot, kind, Backing::SharedAnonymous)
+        }
+        _ => c.mem.map_backed(placement, len, prot, kind, Backing::None),
     };
     match result {
         Ok(a) => {
-            if let Some(file) = &file
-                && let Some(d) = &descriptor
-                && flags & MAP_SHARED != 0
-            {
-                // The mapping shows the file's page cache.
-                if let Err(error) = share_file(c, d, file, a, len, offset, prot) {
-                    let _ = c.mem.unmap_shared(a, len);
-                    return err(error);
-                }
-                c.group.numa().forget(a.0, len);
-                return ok(a.0);
-            }
-            // A private mapping shows the file's page cache until it writes
-            // a page, which copies it.
-            if let Some(file) = &file
-                && let Some(d) = &descriptor
-                && let Err(error) = file_cache(c, d, file).and_then(|cache| {
-                    c.mem.back_with_cache(
-                        a,
-                        len,
-                        &cache.map_private(file, crate::files::mapped_path(c, d)),
-                        offset,
-                    )
-                })
-            {
-                let _ = c.mem.unmap_shared(a, len);
-                return err(error);
-            }
-            if flags & MAP_SHARED != 0
-                && let Err(error) = c.mem.mark_shared(a, len)
-            {
-                return err(error);
-            }
             // Linux populates a writable private mapping by writing it, which
             // gives it an anon_vma (a core then writes it whole).
             if flags & (MAP_POPULATE | MAP_LOCKED) != 0
@@ -1596,15 +1600,17 @@ fn write_sealed(file: &dyn FileHandle) -> bool {
 /// holds from `offset`, as a Linux `MAP_SHARED` mapping of a file. It may
 /// become writable when the file is open for writing and not sealed
 /// against it (Linux's `VM_MAYWRITE`).
-fn share_file(
+/// Makes the pages of a `MAP_SHARED` mapping of `file` and gives them to
+/// `map`, which maps them, while the seals of a memfd stay as they are.
+fn shared_file(
     c: &Context<'_>,
     d: &crate::files::Descriptor,
     file: &std::sync::Arc<dyn FileHandle>,
-    at: GuestAddr,
     len: u64,
     offset: u64,
     prot: Prot,
-) -> Result<(), Errno> {
+    map: impl FnOnce(&paludarium_mmu::SharedPages, bool) -> Result<GuestAddr, Errno>,
+) -> Result<GuestAddr, Errno> {
     let len = GuestAddr(len).page_align_up().ok_or(Errno::ENOMEM)?.0;
     // A memfd's seals stay as they are until the mapping counts among the
     // writable ones; one added since `check_mappable` refuses it now.
@@ -1623,7 +1629,7 @@ fn share_file(
         len,
         may_write,
     )?;
-    c.mem.share_pages(at, len, &pages, offset, may_write)
+    map(&pages, may_write)
 }
 /// The page cache of the file `d` holds, which keeps its size.
 fn file_cache(

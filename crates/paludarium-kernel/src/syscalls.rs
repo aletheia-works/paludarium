@@ -2266,22 +2266,22 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             return result;
         }
         // SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCGIFINDEX and SIOCGIFNAME of a
-        // socket's network,
-        // whose interface is its loopback: a `struct ifreq` of 40 bytes, read
-        // whole and written back, as Linux's `dev_ioctl` does for a socket of
-        // any family. An inet or netlink socket's network is the one it was
-        // made in; an AF_UNIX socket's is the caller's.
-        let caller_network;
+        // socket's network, whose interface is its loopback: a `struct ifreq`
+        // of 40 bytes, read whole and written back, as Linux's `dev_ioctl`
+        // does for a socket of any family. The network is that of the
+        // namespace the socket was made in (`sock_net`), and setting flags
+        // needs CAP_NET_ADMIN in the user namespace that owns it.
+        let unix_network;
         let network = if let Some(socket) = crate::inet::of(&file) {
             Some(socket.network())
         } else if let Some(socket) = crate::netlink::of(&file) {
             Some(socket.network())
-        } else if file
+        } else if let Some(end) = file
             .as_any()
-            .is_some_and(|v| v.is::<crate::sockets::SocketPairEnd>())
+            .and_then(|v| v.downcast_ref::<crate::sockets::SocketPairEnd>())
         {
-            caller_network = c.network();
-            caller_network.as_deref()
+            unix_network = end.unix().and_then(|socket| socket.network().cloned());
+            unix_network.as_deref()
         } else {
             None
         };
@@ -2315,11 +2315,10 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             }
             request[15] = 0;
             let flags = u16::from_le_bytes([request[16], request[17]]);
-            let namespaces = c.group.namespaces(c.tid);
             let admin = c
                 .process
                 .credentials
-                .capable_in(CAP_NET_ADMIN, namespaces.net.owner());
+                .capable_in(CAP_NET_ADMIN, network.owner());
             let value = network.interface(&request[..16], a[1], flags, admin)?;
             match a[1] {
                 crate::inet::SIOCGIFFLAGS => {

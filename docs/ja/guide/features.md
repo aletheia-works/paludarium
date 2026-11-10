@@ -776,11 +776,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   そこにはループバックがあります。ソケットは作られた名前空間に残ります。抽象名前空間の
   unix ソケットの名前（0 で始まるもの）は、Linux の `unix_find_abstract` と同じく
   ソケットの名前空間の名前の中で bind され、探されます。パスのソケットファイルには
-  どの名前空間からも届きます。TCP、UDP、netlink のソケットへの `SIOCGIFFLAGS` と
-  `SIOCGIFINDEX` は、その名前空間のループバックを読みます（上がっている間は最初の
-  名前空間でも `IFF_UP | IFF_LOOPBACK | IFF_RUNNING`）。glibc と musl の
-  `if_nametoindex` が使う AF_UNIX のソケットへのものは、呼び出し元の名前空間のものを
-  読みます。ほかのインターフェースの名前は `ENODEV` です。`SIOCGIFNAME`
+  どの名前空間からも届きます。どのファミリーのソケットへの `SIOCGIFFLAGS` と
+  `SIOCGIFINDEX` も（glibc と musl の `if_nametoindex` が使う AF_UNIX のものも）、
+  Linux の `dev_ioctl` が `sock_net` を取るのと同じく、ソケットが作られた名前空間の
+  ループバックを読みます（上がっている間は最初の名前空間でも
+  `IFF_UP | IFF_LOOPBACK | IFF_RUNNING`）。accept した AF_UNIX のソケットは、
+  クライアントの名前空間のものです。`SIOCSIFFLAGS` には、呼び出し元がどこにいても、
+  その名前空間を持つユーザーの名前空間での CAP_NET_ADMIN が要ります。ネットワークの
+  ない最初の名前空間の AF_UNIX のソケットには、ネットワークがありません（`ENOTTY`）。
+  ほかのインターフェースの名前は `ENODEV` です。`SIOCGIFNAME`
   （`if_indextoname`）は、インデックス 1 を `lo` と答えます（ほかは `ENODEV`）。
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
   `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。

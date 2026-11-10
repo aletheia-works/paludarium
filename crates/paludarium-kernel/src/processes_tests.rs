@@ -5248,9 +5248,12 @@ mod msg {
         let id = syscall(&mut k, &mut t, &m, 68, [0, 0o600, 0, 0, 0, 0]);
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         let child = u64::from(ct.tid);
+        // The second receive waits for a type never sent, so that it cannot
+        // take the type-4 message this thread reads, and waits on until the
+        // queue is removed.
         let receiver = std::thread::spawn(move || {
             let first = receive(&mut c, &mut ct, &cm, id, 64, 5, 0);
-            let second = receive(&mut c, &mut ct, &cm, id, 64, 0, 0);
+            let second = receive(&mut c, &mut ct, &cm, id, 64, 6, 0);
             (first, second)
         });
         std::thread::sleep(std::time::Duration::from_millis(50));

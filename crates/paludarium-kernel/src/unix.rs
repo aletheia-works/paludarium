@@ -88,6 +88,9 @@ pub(crate) struct UnixSocket {
     spare: Mutex<Option<Arc<SocketPairEnd>>>,
     name: Address,
     names: Arc<Names>,
+    /// The network of the namespace it was made in, if there is one, which
+    /// its interface requests act on.
+    network: Option<Arc<crate::inet::Network>>,
     hub: Arc<ReadinessHub>,
     state: Mutex<State>,
     /// The Landlock domain of the thread that made it (the socket file's
@@ -166,6 +169,7 @@ pub(crate) fn pair(c: &Context<'_>, kind: u32) -> Result<[Arc<UnixSocket>; 2], E
                 spare: Mutex::new(None),
                 name,
                 names: c.unix_names(),
+                network: c.network(),
                 hub: Arc::clone(&c.files.readiness),
                 state: Mutex::default(),
                 landlock: c.process.credentials.landlock.clone(),
@@ -371,6 +375,7 @@ impl UnixSocket {
                 spare: Mutex::new(spare),
                 name: Address::default(),
                 names: c.unix_names(),
+                network: c.network(),
                 hub: Arc::clone(&c.files.readiness),
                 state: Mutex::default(),
                 landlock: c.process.credentials.landlock.clone(),
@@ -379,6 +384,10 @@ impl UnixSocket {
     }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// The network it was made in, if its namespace has one.
+    pub(crate) fn network(&self) -> Option<&Arc<crate::inet::Network>> {
+        self.network.as_ref()
     }
     pub(crate) fn listening(&self) -> bool {
         self.lock().listen.is_some()
@@ -620,6 +629,8 @@ impl UnixSocket {
                 spare: Mutex::new(None),
                 name: Arc::clone(&self.name),
                 names: Arc::clone(&self.names),
+                // As `unix_stream_connect` makes it, in the client's.
+                network: client.network.clone(),
                 hub: Arc::clone(&self.hub),
                 state: Mutex::new(State {
                     peer: Some(Arc::clone(&client.name)),

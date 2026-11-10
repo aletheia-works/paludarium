@@ -447,12 +447,37 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .next_deadline()
     }
+    #[cfg(test)]
     pub(crate) fn set_timer(&self, timer: signals::RealTimer) {
         self.process_pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .timer = timer;
         self.timers_changed();
+    }
+    /// The process's interval timer, once what is due at `now` has expired,
+    /// replaced by `new` when there is one; what it was before.
+    pub(crate) fn swap_timer(
+        &self,
+        local: &mut ThreadState,
+        now: u64,
+        new: Option<signals::RealTimer>,
+    ) -> signals::RealTimer {
+        self.expire_timer(local, now);
+        let mut pending = self
+            .process_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let old = pending.timer;
+        if let Some(new) = new {
+            pending.timer = new;
+        }
+        local.timer = pending.timer;
+        drop(pending);
+        if new.is_some() {
+            self.timers_changed();
+        }
+        old
     }
     /// Runs `f` on the POSIX timers, then lets waits see the new deadlines.
     pub(crate) fn with_timers<T>(

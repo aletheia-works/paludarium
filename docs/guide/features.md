@@ -59,7 +59,7 @@ kernel.
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
-| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `setitimer`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
+| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
@@ -1353,6 +1353,16 @@ kernel.
   `CLOCK_BOOTTIME` (the host never suspends), the alarm clocks and
   `CLOCK_TAI` (with a TAI offset of 0). `clock_getres` gives 1 ns, and 4 ms
   for the coarse clocks.
+- The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
+  when it expires and goes on by its interval, as Linux's: `setitimer`
+  reads and checks the new value before the timer, and writes the old one
+  out after setting it, so an old value it cannot write gives `EFAULT` with
+  the timer set. A value of 0 disarms it and drops its interval, and one past
+  Linux's `KTIME_MAX` is clamped to it. `getitimer` gives the time left in microseconds, cut down,
+  and at least 1 µs while the timer is armed. `alarm` sets it to whole
+  seconds with no interval and returns the seconds that were left, rounded to
+  the nearest and at least 1 while it was armed, as Linux's
+  `alarm_setitimer`.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's, rounded up to
   a whole second as Linux rounds it.

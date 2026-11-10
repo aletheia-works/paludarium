@@ -15,6 +15,8 @@ use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState, credentials, signal
 
 /// Linux x86-64 system-call numbers used by the core emulator.
 pub mod nr {
+    pub const GETITIMER: u64 = 36;
+    pub const ALARM: u64 = 37;
     pub const SETITIMER: u64 = 38;
     pub const RT_SIGRETURN: u64 = 15;
     pub const GETPID: u64 = 39;
@@ -151,7 +153,9 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 82] = [
+        let entries: [(u64, Handler); 84] = [
+            (nr::GETITIMER, sys_getitimer),
+            (nr::ALARM, sys_alarm),
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -590,64 +594,119 @@ fn ends_sleep(process: &ThreadState) -> bool {
                 || !matches!(s.number, 17 | 18 | 23 | 28))
     })
 }
+/// Linux's `KTIME_MAX`, where its times stop.
+const KTIME_MAX: u64 = i64::MAX as u64;
+/// A `struct timeval` as nanoseconds: `EINVAL` where Linux's `timeval_valid`
+/// refuses it, and `KTIME_MAX` for one past it, as `ktime_set` clamps.
 fn read_timeval(sec: u64, usec: u64) -> Result<u64, Errno> {
     if (sec as i64) < 0 || usec >= 1_000_000 {
         return Err(Errno::EINVAL);
     }
-    sec.checked_mul(1_000_000_000)
-        .and_then(|v| v.checked_add(usec * 1000))
-        .ok_or(Errno::EINVAL)
+    Ok(if sec >= KTIME_MAX / 1_000_000_000 {
+        KTIME_MAX
+    } else {
+        sec * 1_000_000_000 + usec * 1000
+    })
 }
+/// `ITIMER_REAL`, the interval timer of the process's real time.
+const ITIMER_REAL: i32 = 0;
+/// `ITIMER_VIRTUAL` and `ITIMER_PROF`, of its CPU time, which cannot be set.
+const ITIMER_VIRTUAL: i32 = 1;
+const ITIMER_PROF: i32 = 2;
+
+/// `struct itimerval` words for an interval and the time left, the
+/// microseconds cut down as Linux's `put_itimerval` does.
+fn itimerval(interval: u64, remaining: u64) -> [u64; 4] {
+    [
+        interval / 1_000_000_000,
+        interval % 1_000_000_000 / 1000,
+        remaining / 1_000_000_000,
+        remaining % 1_000_000_000 / 1000,
+    ]
+}
+
+/// The process's interval timer as of now, once what is due has expired,
+/// replaced by `new` when there is one; what it was, as the interval and the
+/// time left (Linux's `itimer_get_remtime`).
+fn swap_real_timer(c: &mut Context<'_>, new: Option<(u64, u64)>) -> Result<(u64, u64), Errno> {
+    let now = c.host.clock(ClockId::Monotonic)?;
+    let timer = new.map(|(interval, value)| {
+        // A disarmed timer keeps no interval, and an expiry is no later
+        // than KTIME_MAX, as Linux's `ktime_add_safe` makes it.
+        match value {
+            0 => signals::RealTimer::default(),
+            value => signals::RealTimer {
+                deadline: Some(now.saturating_add(value).min(KTIME_MAX)),
+                interval,
+            },
+        }
+    });
+    let old = c.group.swap_timer(c.process, now, timer);
+    Ok((
+        old.interval,
+        // An armed timer has at least 1 µs left, as Linux's.
+        old.deadline
+            .map_or(0, |deadline| match deadline.saturating_sub(now) {
+                0 => 1000,
+                left => left,
+            }),
+    ))
+}
+
+/// `getitimer(which, value)`, as Linux's: `EINVAL` for a timer that is none
+/// of the three, then `EFAULT` for `value`. The CPU-time timers cannot be
+/// set, so they are always disarmed.
+fn sys_getitimer(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let (interval, remaining) = match a[0] as i32 {
+            ITIMER_REAL => swap_real_timer(c, None)?,
+            ITIMER_VIRTUAL | ITIMER_PROF => (0, 0),
+            _ => return Err(Errno::EINVAL),
+        };
+        write_words(c.mem, a[1], &itimerval(interval, remaining))?;
+        Ok(0)
+    })())
+}
+
+/// `setitimer(which, new, old)`, in Linux's order: read the new value
+/// (`EFAULT`; none disarms), check its times, then the timer (`EINVAL`),
+/// set it, and only then write the old value out (`EFAULT`, the timer being
+/// set already).
 fn sys_setitimer(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    if a[0] != 0 {
-        return err(Errno::EINVAL);
-    }
-    let words = if a[1] == 0 {
-        [0; 4]
-    } else {
-        match read_words::<4>(c.mem, a[1]) {
-            Ok(w) => w,
-            Err(e) => return err(e),
+    outcome((|| {
+        let words = if a[1] == 0 {
+            [0; 4]
+        } else {
+            read_words::<4>(c.mem, a[1])?
+        };
+        let interval = read_timeval(words[0], words[1])?;
+        let value = read_timeval(words[2], words[3])?;
+        if a[0] as i32 != ITIMER_REAL {
+            return Err(Errno::EINVAL);
         }
-    };
-    let interval = match read_timeval(words[0], words[1]) {
-        Ok(v) => v,
-        Err(e) => return err(e),
-    };
-    let value = match read_timeval(words[2], words[3]) {
-        Ok(v) => v,
-        Err(e) => return err(e),
-    };
-    let now = match c.host.clock(ClockId::Monotonic) {
-        Ok(v) => v,
-        Err(e) => return err(e),
-    };
-    let deadline = if value == 0 {
-        None
-    } else {
-        match now.checked_add(value) {
-            Some(v) => Some(v),
-            None => return err(Errno::EINVAL),
+        let (old_interval, remaining) = swap_real_timer(c, Some((interval, value)))?;
+        if a[2] != 0 {
+            write_words(c.mem, a[2], &itimerval(old_interval, remaining))?;
         }
-    };
-    if a[2] != 0 {
-        let old = c.process.timer;
-        let remaining = old.deadline.unwrap_or(now).saturating_sub(now);
-        if let Err(e) = write_words(
-            c.mem,
-            a[2],
-            &[
-                old.interval / 1_000_000_000,
-                old.interval % 1_000_000_000 / 1000,
-                remaining / 1_000_000_000,
-                remaining % 1_000_000_000 / 1000,
-            ],
-        ) {
-            return err(e);
-        }
-    }
-    c.process.timer = signals::RealTimer { deadline, interval };
-    ok(0)
+        Ok(0)
+    })())
+}
+
+/// `alarm(seconds)`: Linux's `alarm_setitimer`, which sets the real-time
+/// timer to `seconds` with no interval (0 disarms it) and returns the
+/// seconds that were left, rounded to the nearest and at least 1 while the
+/// timer was armed.
+fn sys_alarm(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let seconds = a[0] as u32;
+        let (_, remaining) = swap_real_timer(c, Some((0, u64::from(seconds) * 1_000_000_000)))?;
+        let (whole, nanos) = (remaining / 1_000_000_000, remaining % 1_000_000_000);
+        Ok(if (whole == 0 && nanos != 0) || nanos >= 500_000_000 {
+            whole + 1
+        } else {
+            whole
+        })
+    })())
 }
 const SIGEV_SIGNAL: u32 = 0;
 const SIGEV_NONE: u32 = 1;

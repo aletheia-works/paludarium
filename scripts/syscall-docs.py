@@ -54,6 +54,8 @@ NAMES = {
     33: "dup2",
     34: "pause",
     35: "nanosleep",
+    36: "getitimer",
+    37: "alarm",
     38: "setitimer",
     39: "getpid",
     40: "sendfile",

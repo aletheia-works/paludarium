@@ -920,9 +920,6 @@ impl Kernel {
             processes: &self.processes,
         };
         let outcome = handler(&mut ctx, args);
-        if number == syscalls::nr::SETITIMER {
-            self.group.set_timer(thread.state.timer);
-        }
         if number == syscalls::nr::RT_SIGACTION
             && args[1] != 0
             && let Some(action) = thread.state.signal_actions.get(&(args[0] as i32))

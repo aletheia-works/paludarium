@@ -631,3 +631,116 @@ fn blocked_tstp_defers_stop_until_unmask() {
     f.thread.state.signal_mask = 0;
     assert_eq!(f.kernel.checkpoint(&mut f.thread, &f.mem), Next::Stopped);
 }
+/// The `struct itimerval` at `at`: interval, then value, each as seconds and
+/// microseconds.
+fn itimerval_at(f: &Fixture, at: u64) -> [u64; 4] {
+    std::array::from_fn(|i| f.mem.read_u64(GuestAddr(at + 8 * i as u64)).unwrap())
+}
+fn set_monotonic(f: &Fixture, ns: u64) {
+    f.host.set_clock(paludarium_host::ClockId::Monotonic, ns);
+}
+#[test]
+fn itimer_getitimer_reports_the_real_timer() {
+    let mut f = fixture();
+    f.thread.state.signal_mask = 1 << 13; // SIGALRM blocked, to stay pending
+    set_monotonic(&f, 1_000_000_000);
+    // Interval 2.5 s, first expiry in 1.000_000_7 s.
+    for (i, word) in [2, 500_000, 1, 7].into_iter().enumerate() {
+        f.mem
+            .write_u64(GuestAddr(DATA + 8 * i as u64), word)
+            .unwrap();
+    }
+    assert_eq!(f.ret(nr::SETITIMER, &[0, DATA, 0]), 0);
+    set_monotonic(&f, 1_250_000_000);
+    assert_eq!(f.ret(nr::GETITIMER, &[0, DATA + 64]), 0);
+    // The microseconds are cut down: 0.750_007 s left.
+    assert_eq!(itimerval_at(&f, DATA + 64), [2, 500_000, 0, 750_007]);
+    // Past the expiry the timer has gone on by its interval, and SIGALRM is
+    // pending.
+    set_monotonic(&f, 3_000_007_000);
+    assert_eq!(f.ret(nr::GETITIMER, &[0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [2, 500_000, 1, 500_000]);
+    assert_eq!(f.ret(127, &[DATA + 128, 8]), 0); // rt_sigpending
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 1 << 13);
+}
+#[test]
+fn itimer_getitimer_checks_as_linux() {
+    let mut f = fixture();
+    assert_eq!(f.ret(nr::GETITIMER, &[3, DATA]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(nr::GETITIMER, &[u64::MAX, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(nr::GETITIMER, &[0, 0]), errno(Errno::EFAULT));
+    // Only the low 32 bits name the timer.
+    assert_eq!(f.ret(nr::GETITIMER, &[1 << 32, DATA]), 0);
+    // The CPU-time timers are never armed.
+    for which in [1, 2] {
+        f.mem.write_u64(GuestAddr(DATA), 9).unwrap();
+        assert_eq!(f.ret(nr::GETITIMER, &[which, DATA]), 0);
+        assert_eq!(itimerval_at(&f, DATA), [0; 4]);
+    }
+}
+#[test]
+fn itimer_setitimer_checks_in_linux_order() {
+    let mut f = fixture();
+    set_monotonic(&f, 1_000);
+    // The new value is read before the timer is checked.
+    assert_eq!(f.ret(nr::SETITIMER, &[7, 8, 0]), errno(Errno::EFAULT));
+    // And its times before the timer too.
+    f.mem.write_u64(GuestAddr(DATA + 8), 1_000_000).unwrap();
+    assert_eq!(f.ret(nr::SETITIMER, &[7, DATA, 0]), errno(Errno::EINVAL));
+    f.mem.write_u64(GuestAddr(DATA + 8), 0).unwrap();
+    f.mem.write_u64(GuestAddr(DATA + 16), 3).unwrap();
+    assert_eq!(f.ret(nr::SETITIMER, &[7, DATA, 0]), errno(Errno::EINVAL));
+    // An old value that cannot be written gives EFAULT with the timer set.
+    assert_eq!(f.ret(nr::SETITIMER, &[0, DATA, 8]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(nr::GETITIMER, &[0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0, 0, 3, 0]);
+    // A value of 0 disarms it and drops its interval.
+    for (i, word) in [4, 0, 0, 0].into_iter().enumerate() {
+        f.mem
+            .write_u64(GuestAddr(DATA + 32 + 8 * i as u64), word)
+            .unwrap();
+    }
+    assert_eq!(f.ret(nr::SETITIMER, &[0, DATA + 32, 0]), 0);
+    assert_eq!(f.ret(nr::GETITIMER, &[0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0; 4]);
+    // Seconds past KTIME_MAX are clamped, not refused.
+    f.mem.write_u64(GuestAddr(DATA + 48), u64::MAX >> 1).unwrap();
+    assert_eq!(f.ret(nr::SETITIMER, &[0, DATA + 32, 0]), 0);
+    assert_eq!(f.ret(nr::GETITIMER, &[0, DATA + 64]), 0);
+    let left = itimerval_at(&f, DATA + 64);
+    assert_eq!(left[..2], [4, 0]);
+    assert_eq!(left[2], (i64::MAX as u64 - 1_000) / 1_000_000_000);
+    assert_eq!(f.ret(nr::SETITIMER, &[0, DATA, 0]), 0);
+    // No new value disarms it, and the old one is written out.
+    assert_eq!(f.ret(nr::SETITIMER, &[0, 0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0, 0, 3, 0]);
+    assert_eq!(f.ret(nr::GETITIMER, &[0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0; 4]);
+}
+#[test]
+fn itimer_alarm_rounds_what_was_left() {
+    let mut f = fixture();
+    set_monotonic(&f, 1_000);
+    assert_eq!(f.ret(nr::ALARM, &[5]), 0);
+    // 3.6 s left: rounded up.
+    set_monotonic(&f, 1_400_001_000);
+    assert_eq!(f.ret(nr::ALARM, &[10]), 4);
+    // 3.4 s left: rounded down.
+    set_monotonic(&f, 8_000_001_000);
+    assert_eq!(f.ret(nr::ALARM, &[3]), 3);
+    // Less than a second left is still 1.
+    set_monotonic(&f, 10_999_999_000);
+    assert_eq!(f.ret(nr::ALARM, &[0]), 1);
+    // alarm(0) disarmed it.
+    assert_eq!(f.ret(nr::ALARM, &[0]), 0);
+    // alarm takes an unsigned int and clears the interval.
+    for (i, word) in [1, 0, 1, 0].into_iter().enumerate() {
+        f.mem
+            .write_u64(GuestAddr(DATA + 8 * i as u64), word)
+            .unwrap();
+    }
+    assert_eq!(f.ret(nr::SETITIMER, &[0, DATA, 0]), 0);
+    assert_eq!(f.ret(nr::ALARM, &[(1 << 32) | 7]), 1);
+    assert_eq!(f.ret(nr::GETITIMER, &[0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0, 0, 7, 0]);
+}

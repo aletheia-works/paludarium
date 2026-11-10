@@ -170,6 +170,9 @@ verified.
   changes nothing (no request is ever in flight).
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
+  - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`,
+    cannot be set: `setitimer` gives `EINVAL` for them, where Linux sets them
+    and sends `SIGVTALRM` and `SIGPROF`, and `getitimer` shows them disarmed.
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared
     memory, semaphores and message queues are Linux's defaults, which
     `/proc/sys/kernel` cannot change. A message queue's waiting senders

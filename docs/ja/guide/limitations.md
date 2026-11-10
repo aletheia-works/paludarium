@@ -147,6 +147,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   変えない（処理中の要求はありません）のに `IORING_FEAT_MIN_TIMEOUT` を報告します。
 - **一部のシステムコール**：実装していないシステムコールは `ENOSYS` を返すので、
   プログラムによってはその機能なしで続けられます。
+  - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は設定できません。
+    Linux はこれを設定して `SIGVTALRM` と `SIGPROF` を送りますが、`setitimer` は `EINVAL` を
+    返し、`getitimer` は設定されていないものとして見せます。
   - System V IPC には `/proc/sysvipc` がなく、共有メモリ・セマフォー・メッセージキューの
     上限は Linux の既定値で、`/proc/sys/kernel` から変えられません。メッセージキューで
     待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの

@@ -5116,6 +5116,93 @@ static void pkey_show(const char *label, long r) {
     errno = 0;
 }
 
+static volatile sig_atomic_t itimer_fired;
+static void itimer_alarm(int sig) { (void)sig; itimer_fired++; }
+static long itimer_errno(long r) { return r < 0 ? -errno : r; }
+/* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
+ * timers are only read, never armed, so they show none set. */
+static int itimer_case(void) {
+    struct itimerval v, old;
+    errno = 0;
+    printf("get bad-which=%ld null=%ld\n", itimer_errno(syscall(SYS_getitimer, 3L, &v)),
+           itimer_errno(syscall(SYS_getitimer, 0L, NULL)));
+    for (int which = 1; which <= 2; which++) {
+        memset(&v, 0x55, sizeof v);
+        long r = itimer_errno(syscall(SYS_getitimer, (long)which, &v));
+        printf("get cpu-timer %d=%ld %ld %ld %ld %ld\n", which, r, (long)v.it_interval.tv_sec,
+               (long)v.it_interval.tv_usec, (long)v.it_value.tv_sec, (long)v.it_value.tv_usec);
+    }
+    /* The new value is read and checked before the timer is. */
+    memset(&v, 0, sizeof v);
+    v.it_value.tv_usec = 1000000;
+    printf("set bad-pointer=%ld bad-usec=%ld bad-which=%ld\n",
+           itimer_errno(syscall(SYS_setitimer, 7L, (void *)8, NULL)),
+           itimer_errno(syscall(SYS_setitimer, 7L, &v, NULL)),
+           itimer_errno(syscall(SYS_setitimer, 7L, &(struct itimerval){{0, 0}, {1, 0}}, NULL)));
+    v.it_value.tv_usec = -1;
+    printf("set negative-usec=%ld\n", itimer_errno(syscall(SYS_setitimer, 0L, &v, NULL)));
+    /* Seconds past what Linux's times hold are clamped, not refused. */
+    v = (struct itimerval){{0, 0}, {LONG_MAX, 0}};
+    long huge = itimer_errno(syscall(SYS_setitimer, 0L, &v, NULL));
+    syscall(SYS_getitimer, 0L, &v);
+    printf("set huge=%ld left-past-a-century=%d\n", huge, v.it_value.tv_sec > 3155760000L);
+    syscall(SYS_setitimer, 0L, NULL, NULL);
+    /* An old value that cannot be written: EFAULT, with the timer set. */
+    v = (struct itimerval){{2, 0}, {100, 0}};
+    long fault = itimer_errno(syscall(SYS_setitimer, 0L, &v, (void *)8));
+    long got = itimer_errno(syscall(SYS_getitimer, 0L, &v));
+    printf("set old-fault=%ld then get=%ld interval=%ld.%06ld armed=%d\n", fault, got,
+           (long)v.it_interval.tv_sec, (long)v.it_interval.tv_usec,
+           v.it_value.tv_sec >= 99 && v.it_value.tv_sec <= 100);
+    /* No new value disarms it, and the old one comes back. */
+    long none = itimer_errno(syscall(SYS_setitimer, 0L, NULL, &old));
+    got = itimer_errno(syscall(SYS_getitimer, 0L, &v));
+    printf("set none=%ld old-interval=%ld old-armed=%d now=%ld %ld %ld %ld\n", none,
+           (long)old.it_interval.tv_sec, old.it_value.tv_sec >= 99, (long)v.it_interval.tv_sec,
+           (long)v.it_interval.tv_usec, (long)v.it_value.tv_sec, (long)v.it_value.tv_usec);
+    /* A value of 0 disarms it and drops the interval. */
+    v = (struct itimerval){{3, 5}, {0, 0}};
+    syscall(SYS_setitimer, 0L, &v, NULL);
+    syscall(SYS_getitimer, 0L, &v);
+    printf("disarmed interval=%ld.%06ld value=%ld.%06ld\n", (long)v.it_interval.tv_sec,
+           (long)v.it_interval.tv_usec, (long)v.it_value.tv_sec, (long)v.it_value.tv_usec);
+    /* alarm: the seconds left, rounded, and at least 1 while armed. */
+    long first = syscall(SYS_alarm, 5L);
+    long second = syscall(SYS_alarm, 10L);
+    long third = syscall(SYS_alarm, 0L);
+    long fourth = syscall(SYS_alarm, 0L);
+    printf("alarm first=%ld second=%ld third=%ld fourth=%ld\n", first, second, third, fourth);
+    v = (struct itimerval){{0, 0}, {0, 300000}};
+    syscall(SYS_setitimer, 0L, &v, NULL);
+    printf("alarm under-a-second=%ld\n", syscall(SYS_alarm, 0L));
+    /* alarm clears the interval; it takes an unsigned int. */
+    v = (struct itimerval){{1, 0}, {1, 0}};
+    syscall(SYS_setitimer, 0L, &v, NULL);
+    long seven = syscall(SYS_alarm, (1L << 32) | 7L);
+    syscall(SYS_getitimer, 0L, &v);
+    printf("alarm high-bits=%ld interval=%ld.%06ld value-near-7=%d\n", seven,
+           (long)v.it_interval.tv_sec, (long)v.it_interval.tv_usec,
+           v.it_value.tv_sec >= 6 && v.it_value.tv_sec <= 7);
+    syscall(SYS_alarm, 0L);
+    /* They fire: alarm's and an interval's, which goes on. */
+    signal(SIGALRM, itimer_alarm);
+    sigset_t block, empty;
+    sigemptyset(&block);
+    sigaddset(&block, SIGALRM);
+    sigemptyset(&empty);
+    sigprocmask(SIG_BLOCK, &block, NULL);
+    v = (struct itimerval){{0, 10000}, {0, 10000}};
+    syscall(SYS_setitimer, 0L, &v, NULL);
+    while (itimer_fired < 3) sigsuspend(&empty);
+    syscall(SYS_setitimer, 0L, NULL, NULL);
+    printf("interval fired=%d\n", (int)itimer_fired);
+    itimer_fired = 0;
+    syscall(SYS_alarm, 1L);
+    while (!itimer_fired) sigsuspend(&empty);
+    printf("alarm fired=%d left=%ld\n", (int)itimer_fired, syscall(SYS_alarm, 0L));
+    sigprocmask(SIG_UNBLOCK, &block, NULL);
+    return 0;
+}
 static int pkey_case(void) {
     long page = 4096;
     char *base = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -15669,6 +15756,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
+    if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();
     if (!strcmp(mode, "etxtbsy-run")) {

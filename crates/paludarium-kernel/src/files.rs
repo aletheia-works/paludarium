@@ -1758,13 +1758,28 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     }
     let flags = rw_flags(&file, flags, true)?;
     // An RWF_APPEND write starts at the end and leaves the position after
-    // what it wrote, as the kiocb's position goes back to the file's.
-    if let Some(end) = appending(&file, flags)? {
-        file.seek(end as i64, 0)?;
+    // what it wrote, as the kiocb's position goes back to the file's. As in
+    // Linux's `do_writev`, a write that fails (`EFBIG`, `EINTR`, or a sync
+    // after it) leaves the position as it was.
+    let before = if flags != 0 {
+        file.seek(0, 1).ok()
+    } else {
+        None
+    };
+    let result = (|| {
+        if let Some(end) = appending(&file, flags)? {
+            file.seek(end as i64, 0)?;
+        }
+        let len = size_limited(c, &file, None, bytes.len())?;
+        let written = write_io_with(c, &file, &bytes[..len], false, flags & RWF_NOWAIT != 0)?;
+        sync_written(&file, flags, written)
+    })();
+    if result.is_err()
+        && let Some(before) = before
+    {
+        file.seek(before as i64, 0)?;
     }
-    let len = size_limited(c, &file, None, bytes.len())?;
-    let written = write_io_with(c, &file, &bytes[..len], false, flags & RWF_NOWAIT != 0)?;
-    sync_written(&file, flags, written)
+    result
 }
 
 /// `preadv` and `pwritev`, and `preadv2` and `pwritev2` at an offset, as

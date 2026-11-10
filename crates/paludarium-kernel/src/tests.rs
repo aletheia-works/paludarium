@@ -3931,6 +3931,27 @@ mod vectored_flags {
         assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, HERE, 0, 0x10]), 2);
         assert_eq!(f.ret(8, &[fd, 0, 1]), 10);
         assert_eq!(contents(&mut f, fd), b"abcdefabab");
+        // One that fails leaves the position where it was: past
+        // RLIMIT_FSIZE it is EFBIG (with SIGXFSZ, ignored here).
+        f.thread.state.signal_actions.insert(
+            25,
+            crate::SignalAction {
+                handler: 1,
+                ..Default::default()
+            },
+        );
+        f.mem.write_u64(GuestAddr(DATA + 0x200), 4).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 0x208), 4).unwrap();
+        assert_eq!(f.ret(160, &[1, DATA + 0x200]), 0); // setrlimit(RLIMIT_FSIZE)
+        assert_eq!(f.ret(8, &[fd, 1, 0]), 1);
+        assert_eq!(
+            f.ret(PWRITEV2, &[fd, iov, 1, HERE, 0, 0x10]),
+            errno(Errno(27))
+        );
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 1);
+        f.mem.write_u64(GuestAddr(DATA + 0x200), u64::MAX).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 0x208), u64::MAX).unwrap();
+        assert_eq!(f.ret(160, &[1, DATA + 0x200]), 0);
         // NOAPPEND changes nothing for a file without O_APPEND, and cannot
         // turn an O_APPEND file's off here.
         assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0x20]), 2);

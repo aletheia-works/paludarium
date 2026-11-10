@@ -102,13 +102,13 @@ kernel.
   pipe are `EINVAL`, and `vmsplice` of a file that is no pipe is `EBADF`.
   A pipe with no reader is `EPIPE` with `SIGPIPE`, looked at before the
   input, even at its end. A call waits for data or room unless
-  `SPLICE_F_NONBLOCK` or the pipe's `O_NONBLOCK` (`vmsplice` from a pipe:
-  only the flag) says not to (`EAGAIN`); a pipe whose writers are gone gives
-  0, and a call that moved some bytes returns them instead of waiting again.
-  One call moves at most what the pipe holds or has room for; a socket's
-  send does not wait with `SPLICE_F_NONBLOCK`, and a unix stream socket's
-  read neither, while other files read and write as their own `O_NONBLOCK`
-  says. `SPLICE_F_MOVE`, `SPLICE_F_GIFT` and `SPLICE_F_MORE` change
+  `SPLICE_F_NONBLOCK` or the pipe's `O_NONBLOCK` (`vmsplice`: only the
+  flag) says not to (`EAGAIN`); a pipe whose writers are gone gives 0, and a
+  call that moved some bytes returns them instead of waiting again. One call
+  moves at most what the pipe holds or has room for. A unix stream socket's
+  read does not wait with `SPLICE_F_NONBLOCK` either, while a socket's send,
+  as `splice_to_socket` makes it, and other files read and write as their
+  own `O_NONBLOCK` says. `SPLICE_F_MOVE`, `SPLICE_F_GIFT` and `SPLICE_F_MORE` change
   nothing, as the bytes are copied. A pipe here holds bytes, not Linux's
   page buffers: it takes as many bytes as its size, where Linux counts a
   buffer, even of one byte, as a whole page of the capacity (a partly full

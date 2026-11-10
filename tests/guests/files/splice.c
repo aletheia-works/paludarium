@@ -98,14 +98,15 @@ void _start(void) {
   for(long k=0;k<8192;k++)page[k]='0'+k%10;
   int one[2];pipe_of(one,0,4096);static struct {char *base;long len;} pg[1]={{page,8192}};
   R(VMSPLICE(one[1],pg,1,0));R(unread(one[0]));R(VMSPLICE(one[1],pg,1,2));
-  int nb[2];pipe_of(nb,04000,4096);R(VMSPLICE(nb[1],pg,1,0));R(VMSPLICE(nb[1],pg,1,0));
+  /* The pipe's O_NONBLOCK does not count, only the flag. */
+  int nb[2];pipe_of(nb,04000,4096);R(VMSPLICE(nb[1],pg,1,0));R(VMSPLICE(nb[1],pg,1,2));R(unread(nb[0]));
   static struct {char *base;long len;} back[1]={{buf,8192}};R(VMSPLICE(one[0],back,1,0));R(sum(buf,4096));
   S(3,one[0],0,0);R(VMSPLICE(one[1],iov,1,0));R(sigpipe_pending());
   /* A pipe opened for reading and writing takes the bytes. */
   R(S(133,fifo,0010644,0));long ff=S(2,fifo,04002,0);R(VMSPLICE(ff,iov,2,0));R(unread(ff));S(3,ff,0,0);
  }
  if(CASE==72){ /* sockets and devices as the other end, and a splice that waits */
-  int sv[2];S(53,1,1,sv);S(1,sv[1],"sock",4);
+  int sv[2];call(53,1,1,0,(long)sv,0,0);S(1,sv[1],"sock",4);
   R(SPLICE(sv[0],0,pf[1],0,100,0));R(SPLICE(pf[0],0,sv[1],0,100,0));long n=S(0,sv[0],buf,10);R(n);R(sum(buf,n));
   R(SPLICE(sv[0],0,pf[1],0,100,2));a=0;R(SPLICE(sv[0],&a,pf[1],0,1,0));R(SPLICE(pf[0],0,sv[1],&a,1,0));
   long nul=S(2,"/dev/null",1,0),zero=S(2,"/dev/zero",0,0);
@@ -116,7 +117,7 @@ void _start(void) {
   R(SPLICE(sv[0],0,pf[1],0,100,0));S(0,pf[0],buf,100);
   /* The peer gone: a socket's end, and a send that raises SIGPIPE. */
   S(3,sv[1],0,0);R(SPLICE(sv[0],0,pf[1],0,100,0));
-  int tv[2];S(53,1,1,tv);S(3,tv[0],0,0);S(1,pf[1],"q",1);R(SPLICE(pf[0],0,tv[1],0,1,0));R(sigpipe_pending());R(unread(pf[0]));S(0,pf[0],buf,1);
+  int tv[2];call(53,1,1,0,(long)tv,0,0);S(3,tv[0],0,0);S(1,pf[1],"q",1);R(SPLICE(pf[0],0,tv[1],0,1,0));R(sigpipe_pending());R(unread(pf[0]));S(0,pf[0],buf,1);
   /* A splice that waits for a writer to come: the child writes after 50 ms. */
   long child=S(57,0,0,0);
   if(child==0){static long ts[2]={0,50000000};S(35,ts,0,0);S(1,pf[1],"late",4);S(60,0,0,0);}

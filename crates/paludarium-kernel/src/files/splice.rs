@@ -4,7 +4,7 @@
 //! buffers, so one holds as many bytes as its size, however they came.
 use super::{
     MAX_RW_COUNT, O_APPEND, O_PATH, REGULAR, buffer, iovecs_checked, offset_argument, read_at,
-    read_limit, read_waiting, size_room, write_at, write_io_with,
+    read_limit, read_waiting, size_room, write_at, write_io,
 };
 use crate::sockets::PipeEnd;
 use crate::syscalls::Context;
@@ -244,8 +244,8 @@ fn do_splice(
 /// From the pipe `from` (the description `input`) to the file `output` at
 /// `start`, as `iter_file_splice_write` and `splice_to_socket` take what
 /// the pipe has, up to `len`, waiting for some; an error after some bytes
-/// went ends the call with their count. A socket's send does not wait with
-/// `nonblock` (MSG_DONTWAIT), and a broken one raises SIGPIPE.
+/// went ends the call with their count. A socket's send waits as its own
+/// `O_NONBLOCK` says, not SPLICE_F_NONBLOCK, and a broken one raises SIGPIPE.
 #[expect(clippy::too_many_arguments, reason = "both ends of the splice")]
 fn from_pipe(
     c: &mut Context<'_>,
@@ -282,8 +282,7 @@ fn from_pipe(
         } else if at_offset {
             write_at(output, start + done, piece).map(|n| n as u64)
         } else {
-            let dontwait = nonblock && kind == SOCKET;
-            write_io_with(c, output, piece, false, dontwait)
+            write_io(c, output, piece, false)
         };
         match written {
             Ok(0) => break,
@@ -448,7 +447,8 @@ fn link(
 /// the descriptor (EBADF, also with neither access), the vector as
 /// `import_iovec` reads it, then the pipe (EBADF for any other file). A
 /// pipe opened for writing takes the guest's bytes, one opened only for
-/// reading gives them.
+/// reading gives them; either way only SPLICE_F_NONBLOCK keeps it from
+/// waiting, not the pipe's `O_NONBLOCK`.
 pub(super) fn vmsplice(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let flags = a[3] as u32;
     if flags & !SPLICE_F_ALL != 0 {
@@ -469,7 +469,7 @@ pub(super) fn vmsplice(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let pipe = pipe(&file).ok_or(Errno::EBADF)?;
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
     if write {
-        to_pipe_from_guest(c, &file, pipe, &segments, nonblock || nonblocking(&file))
+        to_pipe_from_guest(c, &file, pipe, &segments, nonblock)
     } else {
         from_pipe_to_guest(c, &file, pipe, &segments, nonblock)
     }

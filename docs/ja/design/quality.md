@@ -95,6 +95,7 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   （`tests/guests/distro/compare.py`）。シェル（fish も含む）、awk、Perl、Python、Ruby、PHP、Lua、Tcl、
   Node.js、Go、Java、Erlang、LuaJIT、OCaml、R、Guile、SBCL、pandoc、Emacs、BusyBox、SQLite、PostgreSQL、Redis、memcached、nginx、圧縮のツール、Git、OpenSSL、GnuPG、rsync、
   make、CMake、Ninja、gcc、g++、binutils などです。シグナルとタイマー、子プロセスとスレッド、ループバックのソケット、
+  netlink（`lo` に対する iproute2 の `ip` と glibc の `getifaddrs`）、
   ファイルのロック（複数のプロセスが書き込む SQLite の WAL）、`/proc` を使うケースもあります。エミュレーターではコンテナのルートをマウントして動かすので、
   両方とも同じライブラリを読みます。どのケースも自分のディレクトリに書き、時刻を
   出さないので、出力を伏せるところはありません。どのケースも本物の Linux では成功します。

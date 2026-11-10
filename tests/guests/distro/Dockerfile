@@ -7,7 +7,7 @@ FROM debian:trixie
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     bc binutils brotli bsdextrautils bsdutils busybox bzip2 ca-certificates cmake coreutils curl dc diffutils \
-    ed emacs-nox file findutils g++ gawk gcc gdb git gnupg golang-go jq less libc6-dev \
+    ed emacs-nox file findutils g++ gawk gcc gdb git gnupg golang-go iproute2 jq less libc6-dev \
     libjson-pp-perl lua5.4 lz4 lzip make mawk mksh ninja-build nodejs openssh-client openssl \
     parallel patch perl php-cli pigz procps python3 redis-server redis-tools rsync ruby sqlite3 \
     tar tcl tzdata unzip util-linux vim-tiny xxd xz-utils zip zsh zstd \

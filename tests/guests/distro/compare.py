@@ -23,8 +23,8 @@ import subprocess
 import sys
 import time
 
-# Even if every case ran out its time, the cases would end in about 165
-# minutes (119 cases on 4 workers, 330 s each), within the workflow's 180 with
+# Even if every case ran out its time, the cases would end in 165
+# minutes (120 cases on 4 workers, 330 s each), within the workflow's 180 with
 # room for the checkout, the build and the image. results.json is written
 # after each case, so a job stopped at its limit still keeps the ones that
 # ended. The slowest cases, Emacs and g++, took up to 180 s under the emulator
@@ -198,6 +198,8 @@ def cases(fx):
         "python-processes": ["/usr/bin/python3", f"{SCRIPTS}/processes.py"],
         "python-proc": ["/usr/bin/python3", f"{SCRIPTS}/proc.py"],
         "python-pty": ["/usr/bin/python3", f"{SCRIPTS}/terminals.py"],
+        # Through netlink: ip, glibc's getifaddrs and if_nameindex, on the loopback.
+        "interfaces": ["/usr/bin/python3", f"{SCRIPTS}/interfaces.py"],
         # script runs a shell on a pseudo-terminal and waits on a signalfd for its SIGCHLD. The
         # terminal echoes the piped line; the log's header and footer lines carry the date.
         "script": shell(
@@ -543,7 +545,15 @@ def environment(work):
 # network, not even a loopback (docs/guide/features.md#network).
 OPTIONS = {
     name: ["--allow-net", "127.0.0.1"]
-    for name in ("python-sockets", "redis", "http-server", "nginx", "memcached", "socat")
+    for name in (
+        "python-sockets",
+        "redis",
+        "http-server",
+        "nginx",
+        "memcached",
+        "socat",
+        "interfaces",
+    )
 }
 
 

@@ -663,10 +663,13 @@ kernel.
   write to it: a name is looked up there (`EACCES` for `.`, `..` or one with
   a `/`, `ENAMETOOLONG` past 255 bytes), opening an existing queue checks
   its permissions, and only the queue's owner or root unlinks it (`EPERM`).
-  A namespace starts with Linux's defaults: 256 queues (`queues_max`,
-  `ENOSPC`), at most 10 messages (`msg_max`, also the default) of at most
-  8192 bytes (`msgsize_max`, also the default); `CAP_SYS_RESOURCE` passes
-  the first and allows up to 65536 messages of 16 MiB. A queue charges its
+  The namespace's limits are its `/proc/sys/fs/mqueue` files, and a new
+  one starts with Linux's defaults: 256 queues (`queues_max`, `ENOSPC`),
+  at most 10 messages (`msg_max`) of at most 8192 bytes (`msgsize_max`),
+  and the same defaults (`msg_default`, `msgsize_default`), of which a
+  queue made without attributes takes the smaller of each and its limit;
+  `CAP_SYS_RESOURCE` passes the limits and allows up to 65536 messages of
+  16 MiB. A queue charges its
   creator's real user ID for its bytes and Linux's bookkeeping of each
   message (48 + 48 bytes on x86-64) against `RLIMIT_MSGQUEUE` (`EMFILE`)
   until it is unlinked and closed. `mq_open` gives a close-on-exec
@@ -1283,7 +1286,8 @@ kernel.
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
-  `/proc/stat` and `/proc/uptime` (below), a directory per process, and this process's own: `/proc/<pid>`, a
+  `/proc/stat` and `/proc/uptime` (below), `/proc/sys` with only
+  `fs/mqueue` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -1346,6 +1350,20 @@ kernel.
   `--mount`, else `/<file name>`)
   and to the current directory. `stat` and `open` follow them, and
   `O_NOFOLLOW` does not (`ELOOP`).
+- `/proc/sys/fs/mqueue` has the POSIX message queue limits of the
+  reader's IPC namespace, as Linux's `ipc/mq_sysctl.c`: `queues_max`,
+  `msg_max` and `msg_default` (1 to 65536), `msgsize_max` and
+  `msgsize_default` (128 to 16 MiB), regular files of mode 0644 that the
+  root of the user namespace owning the IPC namespace owns, and only that
+  root may open to write (`EACCES`). A read gives the value and a newline
+  from the start, and nothing past it. A write at the start sets the value
+  as Linux's `proc_dointvec_minmax` reads one `int`: spaces, an optional
+  `-` and digits in base 10, or 16 after `0x`, or 8 after `0`, then a
+  space, tab, newline or the end; it returns how much it read, the spaces
+  after the value too, and is `EINVAL` for no value, garbage, one too long
+  or one out of range (`queues_max` takes any `int`, compared as
+  unsigned). A write past the start is taken and changes nothing, as
+  `sysctl_writes_strict` has it.
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
   in Linux's formats: load averages of 0 with the running and live tasks and
   the last ID handed out; 4 GiB of total, free and available memory and

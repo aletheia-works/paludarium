@@ -15,12 +15,14 @@
 //! with a signal (`EINTR`, which a signal that runs no handler or one with
 //! `SA_RESTART` restarts).
 //!
-//! The limits are Linux's defaults for an IPC namespace, which the
-//! `/proc/sys/fs/mqueue` files the emulator does not have would show: 256
-//! queues (`queues_max`, `ENOSPC` past it without `CAP_SYS_RESOURCE`), 10
-//! messages (`msg_max`, and the default `msg_default`) and 8192 bytes a
-//! message (`msgsize_max` and `msgsize_default`); `CAP_SYS_RESOURCE` raises
-//! the former to 65536 and 16 MiB. Each queue charges its owner's real user
+//! The limits are the IPC namespace's, which its `/proc/sys/fs/mqueue`
+//! files show and set ([`crate::sysctl`]), and which a new namespace starts
+//! with at Linux's defaults: 256 queues (`queues_max`, `ENOSPC` past it
+//! without `CAP_SYS_RESOURCE`), 10 messages (`msg_max`, and the default
+//! `msg_default`) and 8192 bytes a message (`msgsize_max` and
+//! `msgsize_default`); `CAP_SYS_RESOURCE` raises the former to 65536 and
+//! 16 MiB. A queue made without attributes takes the smaller of each default
+//! and its limit. Each queue charges its owner's real user
 //! ID for its messages' bytes and its bookkeeping against
 //! `RLIMIT_MSGQUEUE` (`EMFILE` past it).
 //!
@@ -40,7 +42,7 @@ use crate::users::Ids as Kind;
 use paludarium_host::{ClockId, FileHandle, FileStat, WaitOutcome, WaitToken};
 use paludarium_types::{Errno, GuestAddr};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 const O_ACCMODE: u32 = 3;
@@ -60,12 +62,13 @@ const CAP_FOWNER: u64 = 1 << 3;
 const MQ_PRIO_MAX: u64 = 32768;
 /// An IPC namespace's defaults (`DFLT_QUEUESMAX`, `DFLT_MSGMAX`,
 /// `DFLT_MSGSIZEMAX`, which `DFLT_MSG` and `DFLT_MSGSIZE` equal), and the
-/// most `CAP_SYS_RESOURCE` allows (`HARD_MSGMAX`, `HARD_MSGSIZEMAX`).
-const QUEUES_MAX: usize = 256;
-const MSG_MAX: i64 = 10;
-const MSGSIZE_MAX: i64 = 8192;
-const HARD_MSGMAX: i64 = 65536;
-const HARD_MSGSIZEMAX: i64 = 16 << 20;
+/// most `CAP_SYS_RESOURCE` allows (`HARD_MSGMAX`, `HARD_MSGSIZEMAX`), which
+/// also bound what the sysctls take.
+const QUEUES_MAX: i32 = 256;
+const MSG_MAX: i32 = 10;
+const MSGSIZE_MAX: i32 = 8192;
+pub(crate) const HARD_MSGMAX: i32 = 65536;
+pub(crate) const HARD_MSGSIZEMAX: i32 = 16 << 20;
 /// `sizeof(struct msg_msg)` and `sizeof(struct posix_msg_tree_node)` on
 /// x86-64, which a queue charges for each message it may hold.
 const MSG_MSG_SIZE: u64 = 48;
@@ -141,6 +144,38 @@ impl std::fmt::Debug for Queues {
 struct Table {
     names: Mutex<BTreeMap<Vec<u8>, Arc<Queue>>>,
     count: Arc<AtomicUsize>,
+    limits: Limits,
+}
+
+/// An IPC namespace's limits and defaults, as its `/proc/sys/fs/mqueue`
+/// files have them (`mq_queues_max`, `mq_msg_max`, `mq_msgsize_max`,
+/// `mq_msg_default`, `mq_msgsize_default`): each an `int`, which
+/// `queues_max` compares as unsigned.
+pub(crate) struct Limits {
+    pub(crate) queues_max: AtomicI32,
+    pub(crate) msg_max: AtomicI32,
+    pub(crate) msgsize_max: AtomicI32,
+    pub(crate) msg_default: AtomicI32,
+    pub(crate) msgsize_default: AtomicI32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            queues_max: AtomicI32::new(QUEUES_MAX),
+            msg_max: AtomicI32::new(MSG_MAX),
+            msgsize_max: AtomicI32::new(MSGSIZE_MAX),
+            msg_default: AtomicI32::new(MSG_MAX),
+            msgsize_default: AtomicI32::new(MSGSIZE_MAX),
+        }
+    }
+}
+
+impl Queues {
+    /// The namespace's limits.
+    pub(crate) fn limits(&self) -> &Limits {
+        &self.0.limits
+    }
 }
 
 impl Table {
@@ -618,17 +653,24 @@ fn create(
     let credentials = &c.process.credentials;
     let resource = credentials.capable(CAP_SYS_RESOURCE);
     let count = &queues.0.count;
-    if count.load(Ordering::SeqCst) >= QUEUES_MAX && !resource {
+    let limit = |value: &AtomicI32| i64::from(value.load(Ordering::SeqCst));
+    let limits = queues.limits();
+    let queues_max = limits.queues_max.load(Ordering::SeqCst) as u32;
+    if count.load(Ordering::SeqCst) >= queues_max as usize && !resource {
         return Err(Errno::ENOSPC);
     }
-    let (maxmsg, msgsize) = attr.unwrap_or((MSG_MAX, MSGSIZE_MAX));
+    let (msg_max, msgsize_max) = (limit(&limits.msg_max), limit(&limits.msgsize_max));
+    let (maxmsg, msgsize) = attr.unwrap_or((
+        msg_max.min(limit(&limits.msg_default)),
+        msgsize_max.min(limit(&limits.msgsize_default)),
+    ));
     if maxmsg <= 0 || msgsize <= 0 {
         return Err(Errno::EINVAL);
     }
     let (most, largest) = if resource {
-        (HARD_MSGMAX, HARD_MSGSIZEMAX)
+        (i64::from(HARD_MSGMAX), i64::from(HARD_MSGSIZEMAX))
     } else {
-        (MSG_MAX, MSGSIZE_MAX)
+        (msg_max, msgsize_max)
     };
     if maxmsg > most || msgsize > largest {
         return Err(Errno::EINVAL);

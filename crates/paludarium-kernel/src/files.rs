@@ -1082,6 +1082,11 @@ fn directory_entries(
     let task = crate::proc::task_path(&d.path, c.process.pid, c.tid);
     let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
         _ if tasks::is_root(&d.path) => tasks::root_entries(c),
+        _ if let Some(crate::sysctl::Entry::Directory(directory)) =
+            crate::sysctl::entry(&d.path) =>
+        {
+            crate::sysctl::entries(directory)
+        }
         _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
         Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c),
         Some(crate::proc::OwnEntry::Directory) => own_entries(),
@@ -4355,6 +4360,8 @@ fn open_path(
             }
             Arc::new(crate::proc::OwnDirectory::new(stat))
         }
+    } else if let Some(entry) = crate::sysctl::entry(p) {
+        crate::sysctl::open(c, entry, flags)?
     } else if let Some(entry) = crate::proc::system_entry(p) {
         Arc::new(crate::proc::GeneratedFile::open(
             system_file(c, entry),
@@ -5013,6 +5020,13 @@ fn other_generated_stat(
     if path == b"/proc/self" && !follow {
         return Some((
             crate::proc::self_link_stat(),
+            device(c, path),
+            SMALL_BLOCK_SIZE,
+        ));
+    }
+    if let Some(entry) = crate::sysctl::entry(path) {
+        return Some((
+            crate::sysctl::stat(c, entry),
             device(c, path),
             SMALL_BLOCK_SIZE,
         ));

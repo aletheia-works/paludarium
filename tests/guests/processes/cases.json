@@ -68,6 +68,7 @@
     {"name":"mqueue-poll","binary":"mqueue"},
     {"name":"mqueue-notify","binary":"mqueue"},
     {"name":"mqueue-fork","binary":"mqueue"},
+    {"name":"mqueue-sysctl","binary":"mqueue"},
     {"name":"pgid-exec","binary":"process"},
     {"name":"priority","binary":"process"},
     {"name":"sysinfo","binary":"process"},

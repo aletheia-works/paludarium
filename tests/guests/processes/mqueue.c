@@ -1,7 +1,7 @@
 /* POSIX message queues, compared with Linux: mq_open, mq_unlink,
    mq_timedsend, mq_timedreceive, mq_notify and mq_getsetattr, their errors
    in Linux's order, priorities, O_NONBLOCK and timeouts, the default and
-   unprivileged limits, poll, select and epoll on a queue, notifications by
+   unprivileged limits and the /proc/sys/fs/mqueue files that set them, poll, select and epoll on a queue, notifications by
    signal, by nothing and by netlink cookie, and queues shared across fork.
 
    Each case runs as root (through sudo) in IPC and network namespaces of
@@ -10,6 +10,7 @@
    child that becomes user 2000. Outputs are counts, flags, texts and errno
    values, never process IDs or descriptors. */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mqueue.h>
@@ -848,6 +849,207 @@ static int fork_case(void) {
     return 0;
 }
 
+/* /proc/sys/fs/mqueue: a namespace's limits, how a write sets them, and
+   what they change. */
+static long sysctl_open(const char *name, int flags) {
+    char path[96];
+    snprintf(path, sizeof path, "/proc/sys/fs/mqueue/%s", name);
+    return TRY(open(path, flags | O_CLOEXEC));
+}
+static long sysctl_value(const char *name) {
+    char text[64] = {0};
+    long fd = sysctl_open(name, O_RDONLY);
+    if (fd < 0) return fd;
+    long n = TRY(read((int)fd, text, sizeof text - 1));
+    close((int)fd);
+    return n < 0 ? n : strtol(text, NULL, 10);
+}
+/* A write of `text` to a newly opened file: its result, or the open's. */
+static long sysctl_write(const char *name, const char *text) {
+    long fd = sysctl_open(name, O_WRONLY);
+    if (fd < 0) return fd;
+    long n = TRY(write((int)fd, text, strlen(text)));
+    close((int)fd);
+    return n;
+}
+static void show_limits(const char *label) {
+    printf("%s:", label);
+    const char *names[] = {"queues_max", "msg_max", "msgsize_max", "msg_default", "msgsize_default"};
+    for (int i = 0; i < 5; i++) put(names[i], sysctl_value(names[i]));
+    say("");
+}
+static int name_order(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static void show_directory(const char *label, const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) {
+        say("%s: opendir=%d", label, -errno);
+        return;
+    }
+    char *names[32];
+    int count = 0;
+    struct dirent *e;
+    while ((e = readdir(dir)) && count < 32) names[count++] = strdup(e->d_name);
+    closedir(dir);
+    qsort(names, count, sizeof *names, name_order);
+    printf("%s:", label);
+    for (int i = 0; i < count; i++) {
+        printf(" %s", names[i]);
+        free(names[i]);
+    }
+    say("");
+}
+/* Whether directory `path` lists `name` as a directory (1), as something
+   else (2) or not at all (0); Linux lists more beside it. */
+static int lists_directory(const char *path, const char *name) {
+    DIR *dir = opendir(path);
+    if (!dir) return -errno;
+    int found = 0;
+    struct dirent *e;
+    while ((e = readdir(dir)))
+        if (!strcmp(e->d_name, name)) found = e->d_type == DT_DIR ? 1 : 2;
+    closedir(dir);
+    return found;
+}
+
+static int sysctl_case(void) {
+    if (isolate()) return 10;
+    show_limits("defaults");
+    show_directory("mqueue-dir", "/proc/sys/fs/mqueue");
+    struct stat st;
+    long stated = TRY(stat("/proc/sys/fs/mqueue/msg_max", &st));
+    printf("stat: file=%ld mode=%o uid=%d gid=%d", stated, st.st_mode, st.st_uid, st.st_gid);
+    stated = TRY(stat("/proc/sys/fs/mqueue", &st));
+    say(" dir=%ld directory=%d perms=%o", stated, S_ISDIR(st.st_mode), st.st_mode & 07777);
+    printf("open:");
+    put("dir-write", TRY(open("/proc/sys/fs/mqueue", O_WRONLY)));
+    put("missing", sysctl_open("missing", O_RDONLY));
+    put("proc-lists-sys", lists_directory("/proc", "sys"));
+    put("sys-lists-fs", lists_directory("/proc/sys", "fs"));
+    put("fs-lists-mqueue", lists_directory("/proc/sys/fs", "mqueue"));
+    say("");
+
+    /* What a write takes, and what it consumes. */
+    printf("msg_max:");
+    put("set", sysctl_write("msg_max", "20\n"));
+    put("now", sysctl_value("msg_max"));
+    const char *bad[] = {"0", "65537", "-1", "abc", "5x", "09", "0x", " \n", "2147483648",
+                         "99999999999999999999999", "000000000000000000001"};
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) put(bad[i][0] == ' ' ? "spaces" : bad[i],
+                                                                 sysctl_write("msg_max", bad[i]));
+    put("still", sysctl_value("msg_max"));
+    say("");
+    printf("msg_max:");
+    put("padded", sysctl_write("msg_max", "  30  \n"));
+    put("now", sysctl_value("msg_max"));
+    put("two", sysctl_write("msg_max", "5 6\n"));
+    put("now", sysctl_value("msg_max"));
+    put("hex", sysctl_write("msg_max", "0x10"));
+    put("now", sysctl_value("msg_max"));
+    put("octal", sysctl_write("msg_max", "010"));
+    put("now", sysctl_value("msg_max"));
+    put("empty", sysctl_write("msg_max", ""));
+    put("highest", sysctl_write("msg_max", "65536"));
+    put("now", sysctl_value("msg_max"));
+    say("");
+    /* A second write goes past the start, and changes nothing; a read past
+       the start gives nothing. */
+    long fd = sysctl_open("msg_default", O_RDWR);
+    printf("position:");
+    put("first", TRY(write((int)fd, "7", 1)));
+    put("second", TRY(write((int)fd, "9", 1)));
+    lseek((int)fd, 0, SEEK_SET);
+    char text[8] = {0};
+    put("read-one", TRY(read((int)fd, text, 1)));
+    printf(" [%s]", text);
+    put("read-rest", TRY(read((int)fd, text, sizeof text)));
+    put("seek-end", TRY(lseek((int)fd, 0, SEEK_END)));
+    say("");
+    close((int)fd);
+    printf("msgsize_max:");
+    put("below", sysctl_write("msgsize_max", "127"));
+    put("least", sysctl_write("msgsize_max", "128"));
+    put("above", sysctl_write("msgsize_max", "16777217"));
+    put("highest", sysctl_write("msgsize_max", "16777216"));
+    say("");
+    printf("queues_max:");
+    put("negative", sysctl_write("queues_max", "-5"));
+    put("now", sysctl_value("queues_max"));
+    put("huge", sysctl_write("queues_max", "2147483647"));
+    put("now", sysctl_value("queues_max"));
+    say("");
+
+    /* What the limits change: the defaults a queue without attributes
+       takes, the smaller of each default and its limit. */
+    sysctl_write("msg_max", "20");
+    sysctl_write("msgsize_max", "1000");
+    sysctl_write("msg_default", "5");
+    sysctl_write("msgsize_default", "300");
+    show_limits("set");
+    long q = q_open("d", O_RDWR | O_CREAT, 0600, NULL);
+    show_attr("defaults-5-300", q);
+    close((int)q);
+    q_unlink("d");
+    sysctl_write("msg_default", "30");
+    sysctl_write("msgsize_default", "5000");
+    q = q_open("d", O_RDWR | O_CREAT, 0600, NULL);
+    show_attr("defaults-above-limits", q);
+    close((int)q);
+    q_unlink("d");
+    /* Root passes the limits up to the hard ones. */
+    struct mq_attr above = {.mq_maxmsg = 21, .mq_msgsize = 1001};
+    q = q_open("root", O_RDWR | O_CREAT, 0600, &above);
+    say("root: above-limits=%d", q >= 0);
+    close((int)q);
+    q_unlink("root");
+    sysctl_write("queues_max", "3");
+
+    pid_t pid = child();
+    if (pid == 0) {
+        if (unprivileged()) _exit(90);
+        struct mq_attr most = {.mq_maxmsg = 20, .mq_msgsize = 1000};
+        struct mq_attr more = {.mq_maxmsg = 21, .mq_msgsize = 1000};
+        struct mq_attr larger = {.mq_maxmsg = 20, .mq_msgsize = 1001};
+        printf("user:");
+        put("open-write", sysctl_open("msg_max", O_WRONLY));
+        put("open-read-write", sysctl_open("msg_max", O_RDWR));
+        put("read", sysctl_value("msg_max"));
+        long m = q_open("most", O_RDWR | O_CREAT, 0600, &most);
+        put("most", m >= 0);
+        put("more", q_open("x", O_RDWR | O_CREAT, 0600, &more));
+        put("larger", q_open("x", O_RDWR | O_CREAT, 0600, &larger));
+        close((int)m);
+        q_unlink("most");
+        char name[16];
+        int made = 0;
+        long error = 0;
+        struct mq_attr one = {.mq_maxmsg = 1, .mq_msgsize = 1};
+        for (; made < 10; made++) {
+            snprintf(name, sizeof name, "u%d", made);
+            long fd = q_open(name, O_RDWR | O_CREAT, 0600, &one);
+            if (fd < 0) {
+                error = fd;
+                break;
+            }
+            close((int)fd);
+        }
+        put("made", made);
+        put("then", error);
+        say("");
+        _exit(0);
+    }
+    say("user: status=%d", wait_child(pid));
+    /* A new IPC namespace starts from the defaults again. */
+    pid = child();
+    if (pid == 0) {
+        if (unshare(CLONE_NEWIPC)) _exit(90);
+        show_limits("new-namespace");
+        _exit(0);
+    }
+    say("new-namespace: status=%d", wait_child(pid));
+    show_limits("this-namespace");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -857,5 +1059,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-poll")) return poll_case();
     if (!strcmp(mode, "mqueue-notify")) return notify_case();
     if (!strcmp(mode, "mqueue-fork")) return fork_case();
+    if (!strcmp(mode, "mqueue-sysctl")) return sysctl_case();
     return 3;
 }

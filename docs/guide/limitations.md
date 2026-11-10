@@ -39,7 +39,7 @@ verified.
   `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, `/proc/sys`, ...) and the other names in
+  (`/proc/cpuinfo`, `/proc/sys` but for `fs/mqueue`, ...) and the other names in
   the reader's own directory (`auxv`, `limits`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `fd`, `maps`,
@@ -194,9 +194,8 @@ verified.
     `/proc/sys/kernel` cannot change. A message queue's waiting senders
     all look again whenever it changes, where Linux wakes them in the order
     they began only while each one's message fits.
-  - POSIX message queues have no `/proc/sys/fs/mqueue`, so their limits are
-    a new IPC namespace's defaults, and their filesystem cannot be mounted
-    (there is no `/dev/mqueue`). `RLIMIT_MSGQUEUE` charges each real user ID
+  - The POSIX message queues' filesystem cannot be mounted (there is no
+    `/dev/mqueue`). `RLIMIT_MSGQUEUE` charges each real user ID
     once for the whole machine, where Linux charges it in each user
     namespace too. A queue's file keeps only its creation time, and its
     root belongs to root in every IPC namespace. A `SIGEV_THREAD` cookie
@@ -205,6 +204,9 @@ verified.
     process that ends goes when the queue is next used, where Linux drops it
     as the process closes its descriptors: a `SIGEV_THREAD` socket still
     open elsewhere gets its `NOTIFY_REMOVED` cookie only then.
+  - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
+    where Linux checks the writer again at each write, and it reports its
+    value's length as its size, where Linux reports 0.
   - A set's waiting semaphore operations are tried in one queue in the
     order they began, the waits for zero first. Linux keeps a queue for
     each semaphore beside one for operations on several, and which of two

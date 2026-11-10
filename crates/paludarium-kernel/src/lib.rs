@@ -47,6 +47,7 @@ mod sem;
 mod shm;
 mod sockets;
 mod syscalls;
+mod sysctl;
 mod threads;
 mod timerfd;
 mod timers;

@@ -1,6 +1,7 @@
 //! The /proc files paludarium has, generated when opened: the mount table
 //! (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's mounts,
-//! `loadavg`, `meminfo`, `stat` and `uptime`, and this process's directory with its
+//! `loadavg`, `meminfo`, `stat` and `uptime`, `/proc/sys` ([`crate::sysctl`]),
+//! and this process's directory with its
 //! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
 //! directory of links to the open descriptors, its `ns` directory of links
 //! to its namespaces, and its `maps`, which alone is generated as it is

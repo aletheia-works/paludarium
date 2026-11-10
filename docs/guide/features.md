@@ -990,8 +990,8 @@ kernel.
     thread and the socket's opener (`EPERM`).
   - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
     for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
-    7.0's attributes in its order: its flags, name, MTU, queues, state,
-    segment sizes, carrier, queueing discipline, zero statistics (left out
+    7.0's attributes in its order: its flags, name, queue, state, MTU,
+    queues, segment sizes, carrier, queueing discipline, zero statistics (left out
     with `RTEXT_FILTER_SKIP_STATS` in `IFLA_EXT_MASK`), XDP, map, and its
     IPv4 and IPv6 settings (`IFLA_AF_SPEC`), so `ip -d link` gives
     Linux's details.

@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
-    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 133, 137, 138, 162, 188, 189, 190, 191,
-    192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 257, 258, 259, 260, 262, 263, 264, 265, 266,
-    267, 268, 269, 277, 280, 285, 292, 293, 295, 296, 316, 319, 326, 332, 436, 437, 439, 452,
+    82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 137, 138, 162, 187, 188, 189,
+    190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260, 261, 262,
+    263, 264, 265, 266, 267, 268, 269, 277, 280, 285, 292, 293, 295, 296, 306, 316, 319, 326, 332,
+    436, 437, 439, 452,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -703,6 +704,8 @@ fn write_statfs(c: &Context<'_>, addr: u64, s: paludarium_host::FsStats) -> Resu
     output(c, addr, &b)?;
     Ok(0)
 }
+/// `AT_FDCWD`, as the 64-bit register holds it.
+const AT_FDCWD: u64 = -100i64 as u64;
 const UTIME_NOW: u64 = (1 << 30) - 1;
 const UTIME_OMIT: u64 = (1 << 30) - 2;
 /// `utimensat(dirfd, path, times, flags)`, in the order Linux checks it.
@@ -737,6 +740,17 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         }
         (times[0], times[1])
     };
+    set_times_at(c, a, atime, mtime, touch)
+}
+/// Linux's `do_utimes`: the times of the file `a[1]` names from `a[0]`
+/// with the flags `a[3]`, or of descriptor `a[0]` for no path.
+fn set_times_at(
+    c: &mut Context<'_>,
+    a: [u64; 6],
+    atime: Option<i128>,
+    mtime: Option<i128>,
+    touch: bool,
+) -> Result<u64, Errno> {
     if a[3] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -782,6 +796,56 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         crate::permissions::times(&c.process.credentials, &stat, touch)?;
     }
     c.files.fs.set_times(&p, follow, atime, mtime).map(|()| 0)
+}
+/// `futimesat(dirfd, path, times)` and `utimes(path, times)`, as Linux's
+/// `do_futimesat`: two `struct timeval`s (`EFAULT`), each with fewer than a
+/// million microseconds (`EINVAL`, which `UTIME_NOW` and `UTIME_OMIT` are
+/// too), or none for now; then `do_utimes` with no flags, so a null path
+/// with a descriptor sets that descriptor's times.
+fn futimesat(c: &mut Context<'_>, dirfd: u64, path: u64, times: u64) -> Result<u64, Errno> {
+    let (atime, mtime, touch) = if times == 0 {
+        let now = i128::from(c.host.clock(ClockId::Realtime)?);
+        (now, now, true)
+    } else {
+        let [a_seconds, a_micros, m_seconds, m_micros] =
+            crate::syscalls::read_words::<4>(c.mem, times)?;
+        if [a_micros, m_micros]
+            .iter()
+            .any(|&micros| micros >= 1_000_000)
+        {
+            return Err(Errno::EINVAL);
+        }
+        let at = |seconds: u64, micros: u64| {
+            i128::from(seconds as i64) * 1_000_000_000 + i128::from(micros) * 1000
+        };
+        (at(a_seconds, a_micros), at(m_seconds, m_micros), false)
+    };
+    set_times_at(
+        c,
+        [dirfd, path, 0, 0, 0, 0],
+        Some(atime),
+        Some(mtime),
+        touch,
+    )
+}
+/// `utime(path, times)`: a `struct utimbuf` of whole seconds (`EFAULT`), or
+/// none for now, then `do_utimes` from the working directory.
+fn utime(c: &mut Context<'_>, path: u64, times: u64) -> Result<u64, Errno> {
+    let (atime, mtime, touch) = if times == 0 {
+        let now = i128::from(c.host.clock(ClockId::Realtime)?);
+        (now, now, true)
+    } else {
+        let [access, modification] = crate::syscalls::read_words::<2>(c.mem, times)?;
+        let at = |seconds: u64| i128::from(seconds as i64) * 1_000_000_000;
+        (at(access), at(modification), false)
+    };
+    set_times_at(
+        c,
+        [AT_FDCWD, path, 0, 0, 0, 0],
+        Some(atime),
+        Some(mtime),
+        touch,
+    )
 }
 /// The owner and group of a `chown` call, as kernel IDs: -1 leaves one as
 /// it is, and one the caller's user namespace does not map is `EINVAL`
@@ -2810,6 +2874,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         93 => chown_file(c, &io_descriptor(c, a[0])?, a[1], a[2]),
         260 => fchownat(c, a),
         280 => utimensat(c, a),
+        132 => utime(c, a[0], a[1]),
+        235 => futimesat(c, AT_FDCWD, a[0], a[1]),
+        261 => futimesat(c, a[0], a[1], a[2]),
         // statfs, fstatfs
         137 => {
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], true)?;
@@ -2849,6 +2916,23 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         74 | 75 => io_descriptor(c, a[0])?.sync().map(|()| 0),
         // sync: nothing is cached, so there is nothing to write
         162 => Ok(0),
+        // syncfs: every file is written through already, as after sync.
+        306 => io_descriptor(c, a[0]).map(|_| 0),
+        // readahead(fd, offset, count), as Linux's `ksys_readahead`: a
+        // descriptor open for reading (EBADF), of a regular file or a block
+        // device (EINVAL), and a count that is not negative as a `loff_t`
+        // (`generic_fadvise`'s EINVAL). There is no cache to fill.
+        187 => {
+            let file = io_descriptor(c, a[0])?;
+            if file.flags() & 3 == 1 {
+                return Err(Errno::EBADF);
+            }
+            let kind = file.stat()?.mode & 0o170000;
+            if kind != 0o100000 && kind != 0o060000 || (a[2] as i64) < 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(0)
+        }
         // sync_file_range(fd, offset, nbytes, flags), checked in the order of
         // Linux's: the descriptor (EBADF, `O_PATH` too), the flags and the
         // range (EINVAL: a negative offset or end, or an end before the

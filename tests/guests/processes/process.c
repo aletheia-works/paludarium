@@ -27,6 +27,7 @@
 #include <sys/prctl.h>
 #include <sys/time.h>
 #include <time.h>
+#include <utime.h>
 #include <sys/socket.h>
 #include <sys/msg.h>
 #include <grp.h>
@@ -1456,6 +1457,71 @@ static void nl_lookups(int fd, unsigned port, const char *when) {
                  sized[i].len);
         nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, 16 + ((sized[i].len + 3) & ~3)), port, label);
     }
+}
+/* The addresses case: adds or removes (`type` 20 or 21) the address `text`
+   of `family` and `prefix` on lo with `flags` and `scope`, its IFA_LOCAL
+   and IFA_ADDRESS (IFA_ADDRESS alone without `local`), and prints the
+   answer. */
+static void nl_addr(int fd, unsigned port, unsigned short type, unsigned short flags, int family, const char *text,
+                    int prefix, int scope, int local, const char *label) {
+    unsigned char request[8 + 2 * 20] = {family, prefix, 0, scope, 1};
+    int len = family == AF_INET ? 4 : 16, at = 8;
+    for (int kind = local ? 2 : 1; kind >= 1; kind--) {
+        unsigned short attribute[2] = {4 + len, kind};
+        memcpy(request + at, attribute, 4);
+        inet_pton(family, text, request + at + 4);
+        at += 4 + len;
+    }
+    nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, request, at), port, label);
+}
+/* Binds a UDP socket of `family` to `text`, and prints the result. */
+static void addresses_bind(const char *text, const char *when) {
+    int family = strchr(text, ':') ? AF_INET6 : AF_INET;
+    int fd = socket(family, SOCK_DGRAM, 0);
+    struct sockaddr_storage at = {0};
+    socklen_t len;
+    if (family == AF_INET) {
+        struct sockaddr_in *v4 = (void *)&at;
+        v4->sin_family = AF_INET;
+        inet_pton(AF_INET, text, &v4->sin_addr);
+        len = sizeof *v4;
+    } else {
+        struct sockaddr_in6 *v6 = (void *)&at;
+        v6->sin6_family = AF_INET6;
+        inet_pton(AF_INET6, text, &v6->sin6_addr);
+        len = sizeof *v6;
+    }
+    printf("%s: bind %s=%ld\n", when, text, netns_result(bind(fd, (void *)&at, len)));
+    close(fd);
+}
+/* The address of `at` as text. */
+static const char *addresses_text(struct sockaddr_storage *at, char *buf, size_t size) {
+    if (at->ss_family == AF_INET) return inet_ntop(AF_INET, &((struct sockaddr_in *)at)->sin_addr, buf, size);
+    return inet_ntop(AF_INET6, &((struct sockaddr_in6 *)at)->sin6_addr, buf, size);
+}
+/* A TCP connection to `text` port `port` from an unbound socket to a
+   listener on every address: what it connects from and to. */
+static void addresses_connect(const char *text, const char *when) {
+    int family = strchr(text, ':') ? AF_INET6 : AF_INET;
+    int listener = socket(family, SOCK_STREAM, 0), client = socket(family, SOCK_STREAM, 0);
+    struct sockaddr_storage at = {0}, from = {0}, to = {0};
+    socklen_t len = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6), n = len;
+    at.ss_family = family;
+    bind(listener, (void *)&at, len);
+    listen(listener, 1);
+    getsockname(listener, (void *)&at, &n);
+    if (family == AF_INET) inet_pton(AF_INET, text, &((struct sockaddr_in *)&at)->sin_addr);
+    else inet_pton(AF_INET6, text, &((struct sockaddr_in6 *)&at)->sin6_addr);
+    long connected = netns_result(connect(client, (void *)&at, len));
+    int accepted = connected == 0 ? accept(listener, NULL, NULL) : -1;
+    char a[64] = "-", b[64] = "-";
+    n = sizeof from;
+    if (connected == 0) getsockname(client, (void *)&from, &n), addresses_text(&from, a, sizeof a);
+    n = sizeof to;
+    if (accepted >= 0) getsockname(accepted, (void *)&to, &n), addresses_text(&to, b, sizeof b);
+    printf("%s: connect %s=%ld from=%s accepted-at=%s\n", when, text, connected, a, b);
+    close(client), close(listener);
+    if (accepted >= 0) close(accepted);
 }
 /* What getifaddrs gives, one line each. */
 static void nl_getifaddrs(const char *label) {
@@ -5203,6 +5269,64 @@ static int itimer_case(void) {
     sigprocmask(SIG_UNBLOCK, &block, NULL);
     return 0;
 }
+static long ot_errno(long r) { return r < 0 ? -errno : r; }
+static long ot_mtime(const char *path) {
+    struct stat st;
+    return stat(path, &st) ? -errno : (long)st.st_mtim.tv_sec * 1000000L + st.st_mtim.tv_nsec / 1000;
+}
+/* utime, utimes and futimesat, syncfs and readahead, as Linux 6.12's.
+ * Only modification times are compared. */
+static int old_times_case(void) {
+    char dir[] = "/tmp/old-times-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char path[64];
+    snprintf(path, sizeof path, "%s/t", dir);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) return 81;
+    struct timeval tv[2] = {{10, 5}, {20, 7}};
+    long r = ot_errno(syscall(SYS_utimes, path, tv));
+    printf("utimes=%ld mtime=%ld\n", r, ot_mtime(path));
+    tv[1].tv_sec = 30;
+    r = ot_errno(syscall(SYS_futimesat, (long)fd, NULL, tv));
+    printf("futimesat fd=%ld mtime=%ld\n", r, ot_mtime(path));
+    int d = open(dir, O_RDONLY | O_DIRECTORY);
+    tv[1].tv_sec = 40;
+    r = ot_errno(syscall(SYS_futimesat, (long)d, "t", tv));
+    printf("futimesat dir=%ld mtime=%ld\n", r, ot_mtime(path));
+    struct utimbuf ub = {50, 60};
+    r = ot_errno(syscall(SYS_utime, path, &ub));
+    printf("utime=%ld mtime=%ld\n", r, ot_mtime(path));
+    long now = ot_errno(syscall(SYS_utime, path, NULL));
+    int moved = ot_mtime(path) != 60L * 1000000L;
+    printf("utime now=%ld moved=%d utimes now=%ld\n", now, moved,
+           ot_errno(syscall(SYS_utimes, path, NULL)));
+    struct timeval million[2] = {{1, 1000000}, {1, 0}}, negative[2] = {{1, -1}, {1, 0}};
+    struct timeval now_omit[2] = {{1, (1 << 30) - 1}, {1, 0}};
+    printf("utimes fault=%ld million=%ld negative=%ld utime-now=%ld before-path=%ld\n",
+           ot_errno(syscall(SYS_utimes, path, (void *)8)), ot_errno(syscall(SYS_utimes, path, million)),
+           ot_errno(syscall(SYS_utimes, path, negative)), ot_errno(syscall(SYS_utimes, path, now_omit)),
+           ot_errno(syscall(SYS_utimes, NULL, million)));
+    printf("utime fault=%ld missing=%ld null-path=%ld futimesat badf=%ld\n",
+           ot_errno(syscall(SYS_utime, path, (void *)8)), ot_errno(syscall(SYS_utime, "/tmp/no-such-file-old-times", NULL)),
+           ot_errno(syscall(SYS_utimes, NULL, NULL)), ot_errno(syscall(SYS_futimesat, 99L, NULL, tv)));
+    int p[2];
+    if (pipe(p)) return 82;
+    int wo = open(path, O_WRONLY);
+    int po = open(path, O_PATH);
+    printf("syncfs=%ld badf=%ld path=%ld\n", ot_errno(syscall(SYS_syncfs, (long)fd)),
+           ot_errno(syscall(SYS_syncfs, 99L)), ot_errno(syscall(SYS_syncfs, (long)po)));
+    printf("readahead=%ld negative-offset=%ld huge=%ld pipe=%ld write-only=%ld path=%ld badf=%ld\n",
+           ot_errno(syscall(SYS_readahead, (long)fd, 0L, 4096L)),
+           ot_errno(syscall(SYS_readahead, (long)fd, -1L, 4096L)),
+           ot_errno(syscall(SYS_readahead, (long)fd, 0L, -1L)),
+           ot_errno(syscall(SYS_readahead, (long)p[0], 0L, 1L)),
+           ot_errno(syscall(SYS_readahead, (long)wo, 0L, 1L)),
+           ot_errno(syscall(SYS_readahead, (long)po, 0L, 1L)),
+           ot_errno(syscall(SYS_readahead, 99L, 0L, 1L)));
+    unlink(path);
+    rmdir(dir);
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -6791,6 +6915,135 @@ int main(int argc, char **argv) {
         result("inner", reaped(inner));
         for (int i = 0; i < 3; i++) unlink(names[i]);
         rmdir(dir);
+        return 0;
+    }
+    if (!strcmp(mode, "addresses")) {
+        /* A child makes a network namespace and gives its loopback
+           addresses through netlink, which its sockets then have. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int fd = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(fd, (void *)&any, sizeof any);
+            getsockname(fd, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            unsigned char family = 0;
+            /* Before any route, every IPv4 address binds. */
+            addresses_bind("10.9.9.9", "fresh");
+            nl_addr(fd, port, 20, 0x600, AF_INET, "10.1.2.3", 24, 0, 1, "add down");
+            nl_addr(fd, port, 20, 0x600, AF_INET6, "2001:db8::5", 64, 0, 1, "add down6");
+            /* Linux's IPv6 address is tentative until its duplicate address
+               detection work, which ends at once on a loopback or a link
+               that is down, has run. */
+            usleep(200000);
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down addr");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down route");
+            addresses_bind("10.9.9.9", "down");
+            addresses_bind("10.1.2.3", "down");
+            addresses_bind("2001:db8::5", "down");
+            /* What adding refuses. */
+            nl_addr(fd, port, 20, 0x600, AF_INET, "10.1.2.3", 24, 0, 1, "add again");
+            nl_addr(fd, port, 20, 0x400, AF_INET, "10.1.2.3", 24, 0, 1, "add again without excl");
+            nl_addr(fd, port, 20, 0x500, AF_INET, "10.1.2.3", 24, 0, 1, "replace");
+            nl_addr(fd, port, 20, 0x600, AF_INET6, "2001:db8::5", 64, 0, 1, "add again6");
+            nl_addr(fd, port, 20, 0x600, AF_INET, "10.6.6.6", 24, 0, 0, "add without local");
+            nl_addr(fd, port, 20, 0x600, AF_INET, "10.7.7.7", 33, 0, 1, "add prefix 33");
+            nl_addr(fd, port, 20, 0x600, AF_INET6, "2001:db8:7::7", 129, 0, 1, "add prefix 129");
+            /* Up: 127.0.0.1/8 and ::1 come, then more addresses. */
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            nl_answer(fd, nl_send(fd, 16, NL_F_REQUEST | NL_F_ACK, &link, sizeof link), port, "up");
+            nl_addr(fd, port, 20, 0x600, AF_INET, "10.1.2.9", 24, 0, 1, "add secondary");
+            nl_addr(fd, port, 20, 0x600, AF_INET, "10.1.2.3", 16, 0, 1, "add other prefix");
+            nl_addr(fd, port, 20, 0x600, AF_INET, "192.0.2.1", 32, 0, 1, "add host");
+            nl_addr(fd, port, 20, 0x600, AF_INET, "127.0.0.2", 8, 254, 1, "add loopback");
+            nl_addr(fd, port, 20, 0x600, AF_INET6, "2001:db8:1::1", 128, 0, 1, "add host6");
+            nl_addr(fd, port, 20, 0x600, AF_INET6, "2001:db8:6::6", 64, 0, 0, "add6 without local");
+            usleep(200000);
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "up addr");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "up route");
+            static const char *const lookups[] = {"10.1.2.77", "10.1.2.9", "192.0.2.1", "10.1.255.255", "10.2.0.1"};
+            for (size_t i = 0; i < sizeof lookups / sizeof lookups[0]; i++) {
+                unsigned char request[12 + 8] = {AF_INET, 32};
+                unsigned short attribute[2] = {8, 1};
+                memcpy(request + 12, attribute, 4);
+                inet_pton(AF_INET, lookups[i], request + 16);
+                char label[64];
+                snprintf(label, sizeof label, "get %s", lookups[i]);
+                nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, sizeof request), port, label);
+            }
+            static const char *const lookups6[] = {"2001:db8::5", "2001:db8::6", "2001:db8:9::1"};
+            for (size_t i = 0; i < sizeof lookups6 / sizeof lookups6[0]; i++) {
+                unsigned char request[12 + 20] = {AF_INET6, 128};
+                unsigned short attribute[2] = {20, 1};
+                memcpy(request + 12, attribute, 4);
+                inet_pton(AF_INET6, lookups6[i], request + 16);
+                char label[64];
+                snprintf(label, sizeof label, "get %s", lookups6[i]);
+                nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, sizeof request), port, label);
+            }
+            /* What the sockets have: the subnet is local on a loopback,
+               an IPv6 prefix only at its address. */
+            static const char *const binds[] = {"10.1.2.3",  "10.1.2.4",    "10.1.3.1",   "192.0.2.1",
+                                                "127.0.0.2", "2001:db8::5", "2001:db8::6", "2001:db8:6::6"};
+            for (size_t i = 0; i < sizeof binds / sizeof binds[0]; i++) addresses_bind(binds[i], "up");
+            addresses_connect("10.1.2.3", "up");
+            addresses_connect("10.1.2.4", "up");
+            addresses_connect("192.0.2.1", "up");
+            addresses_connect("2001:db8::5", "up");
+            nl_getifaddrs("up ifaddrs");
+            /* Down: the IPv6 addresses go; up again, ::1 alone comes. */
+            link.flags = 0;
+            nl_answer(fd, nl_send(fd, 16, NL_F_REQUEST | NL_F_ACK, &link, sizeof link), port, "down again");
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again addr");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again route");
+            addresses_bind("10.1.2.4", "down again");
+            addresses_bind("2001:db8::5", "down again");
+            link.flags = IFF_UP;
+            nl_answer(fd, nl_send(fd, 16, NL_F_REQUEST | NL_F_ACK, &link, sizeof link), port, "up again");
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "up again addr");
+            /* Removing: a primary takes its secondary; 127.0.0.1 too can
+               go, and comes back with the next up. */
+            nl_addr(fd, port, 21, 0, AF_INET, "10.1.2.3", 16, 0, 1, "del other prefix");
+            nl_addr(fd, port, 21, 0, AF_INET, "10.1.2.3", 8, 0, 1, "del wrong prefix");
+            nl_addr(fd, port, 21, 0, AF_INET, "10.1.2.3", 24, 0, 1, "del primary");
+            nl_addr(fd, port, 21, 0, AF_INET, "10.1.2.3", 24, 0, 1, "del again");
+            nl_addr(fd, port, 21, 0, AF_INET6, "2001:db8::5", 64, 0, 1, "del gone6");
+            nl_addr(fd, port, 21, 0, AF_INET, "127.0.0.1", 8, 0, 1, "del loopback");
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "after del addr");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "after del route");
+            addresses_bind("127.0.0.1", "after del");
+            addresses_bind("10.1.2.9", "after del");
+            nl_addr(fd, port, 21, 0, AF_INET6, "::1", 128, 0, 1, "del ::1");
+            addresses_bind("::1", "after del");
+            link.flags = 0;
+            nl_answer(fd, nl_send(fd, 16, NL_F_REQUEST, &link, sizeof link), port, "cycle down");
+            link.flags = IFF_UP;
+            nl_answer(fd, nl_send(fd, 16, NL_F_REQUEST, &link, sizeof link), port, "cycle up");
+            nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "cycled addr");
+            addresses_bind("127.0.0.1", "cycled");
+            nl_getifaddrs("cycled ifaddrs");
+            /* A user may not add an address. */
+            fflush(stdout);
+            pid_t user = child();
+            if (user == 0) {
+                if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+                int own = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+                struct nl_address mine = {0};
+                socklen_t mine_len = sizeof mine;
+                bind(own, (void *)&any, sizeof any);
+                getsockname(own, (void *)&mine, &mine_len);
+                nl_addr(own, mine.pid, 20, 0x600, AF_INET, "10.3.3.3", 24, 0, 1, "user add");
+                fflush(stdout);
+                _exit(0);
+            }
+            result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
         return 0;
     }
     if (!strcmp(mode, "unix-interfaces")) {
@@ -15813,6 +16066,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
+    if (!strcmp(mode, "old-times")) return old_times_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

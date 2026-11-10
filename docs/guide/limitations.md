@@ -196,9 +196,9 @@ verified.
     root belongs to root in every IPC namespace. A `SIGEV_THREAD` cookie
     goes to its socket even when the socket's receive buffer is full,
     where Linux's `mq_notify` first waits for room. The registration of a
-    process that ends goes when the queue is next used, which no other
-    process can tell from Linux's dropping it as the process closes its
-    descriptors.
+    process that ends goes when the queue is next used, where Linux drops it
+    as the process closes its descriptors: a `SIGEV_THREAD` socket still
+    open elsewhere gets its `NOTIFY_REMOVED` cookie only then.
   - A set's waiting semaphore operations are tried in one queue in the
     order they began, the waits for zero first. Linux keeps a queue for
     each semaphore beside one for operations on several, and which of two

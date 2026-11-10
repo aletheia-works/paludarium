@@ -276,14 +276,16 @@ impl Drop for Queue {
 impl Queue {
     fn lock(&self) -> MutexGuard<'_, State> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        // A registration lasts no longer than its process.
-        if let Some(registration) = &state.registration
-            && !self
+        // A registration lasts no longer than its process; a `SIGEV_THREAD`
+        // socket is told it is removed, as the process's last close tells it.
+        if state.registration.as_ref().is_some_and(|registration| {
+            !self
                 .processes
                 .upgrade()
                 .is_some_and(|processes| processes.execs(registration.owner).is_some())
+        }) && let Some(registration) = state.registration.take()
         {
-            state.registration = None;
+            registration.remove();
         }
         state
     }
@@ -350,7 +352,7 @@ impl Queue {
             (r.kind(), signal, space.number(r.owner))
         });
         let mut line = format!(
-            "QSIZE:{:<10} NOTIFY:{kind:<5} SIGNO:{signal:<5} NOTIFY_PID:{pid}\n",
+            "QSIZE:{:<10} NOTIFY:{kind:<5} SIGNO:{signal:<5} NOTIFY_PID:{pid:<6}\n",
             state.bytes
         )
         .into_bytes();

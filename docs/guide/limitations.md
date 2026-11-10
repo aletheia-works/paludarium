@@ -308,6 +308,22 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
+- **inotify, in part**: opening and closing a file (`IN_OPEN`,
+  `IN_CLOSE_WRITE`, `IN_CLOSE_NOWRITE`) and reading or writing it
+  (`IN_ACCESS` and `IN_MODIFY` of `read`, `write`, `getdents64`, `sendfile`,
+  `copy_file_range`, `fallocate` and the like) are not reported yet; changing
+  its times, truncating it and `O_TRUNC` are. A file removed while it is open
+  (or a directory that is a working directory) gets `IN_DELETE_SELF` as it is
+  removed, where Linux sends it at the last close. A change through a
+  descriptor (`fchmod`, `ftruncate` and the like) reaches the watch of the
+  file's directory only while the path it was opened at still names it, where
+  Linux follows a rename and reports to the directory a removed file was in.
+  An instance cannot be used for signal-driven I/O (`FIOASYNC` gives
+  `ENOTTY`, and `fcntl` leaves `O_ASYNC` off), its `/proc/self/fdinfo` entry
+  does not list its watches, `/proc/sys/fs/inotify` does not exist, and
+  `IN_UNMOUNT` is never sent. A read into a buffer the guest cannot write is
+  `EFAULT` with the events left queued, where Linux takes the first one off
+  first. Changes the host makes to a mounted directory are not seen.
 - **Namespaces**: a user namespace has no `projid_map` and no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the

@@ -8,6 +8,7 @@
 //! truncation or a punched hole changes the cache too. The pages are also
 //! written back by `msync` and when the last mapping of the file goes away
 //! (unmapped, or with the address space of a process that exits or execs).
+use crate::inotify::Notifier;
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat, FsStats, HostFs};
 use paludarium_mmu::{FileSize, MemoryMeter, SharedPages};
 use paludarium_types::{Errno, PAGE_SIZE};
@@ -37,6 +38,8 @@ pub(crate) struct PageCaches {
     /// many descriptions have it open for writing; below, how many programs
     /// run from it (or are being loaded from it).
     writes: Mutex<HashMap<Key, i64>>,
+    /// The machine's inotify watches, which its files' changes are told to.
+    pub(crate) notify: Arc<crate::inotify::Notifier>,
 }
 
 /// One count of [`PageCaches`]' `writes`, given back when dropped: write
@@ -451,6 +454,26 @@ impl CoherentFile {
         }
         self.caches.find(self.key()?)
     }
+    /// Tells the machine's inotify watches of a change to the file
+    /// (`notify_change`).
+    fn changed(&self, mask: u32) {
+        let notify = &self.caches.notify;
+        if mask == 0 || !notify.watching() {
+            return;
+        }
+        let Ok(stat) = self.inner.stat() else {
+            return;
+        };
+        match &self.device {
+            Device::Mount(fs, path) => notify.changed_file(
+                Some((&**fs, path)),
+                mount_device(&fs.mounts(), path),
+                &stat,
+                mask,
+            ),
+            Device::Fixed(device) => notify.changed_file(None, *device, &stat, mask),
+        }
+    }
     /// Writes the cache back before the file is read. A page that cannot be
     /// written stays dirty and the read goes on, as a Linux read does not
     /// write back; a sync reports the error.
@@ -519,13 +542,16 @@ impl FileHandle for CoherentFile {
         self.write_back();
         self.inner.stat()
     }
+    /// A truncation is `IN_MODIFY` (`ATTR_SIZE`).
     fn truncate(&self, size: u64) -> Result<(), Errno> {
-        let Some(cache) = self.cache() else {
-            return self.inner.truncate(size);
-        };
-        let old = self.inner.stat()?.size;
-        self.inner.truncate(size)?;
-        cache.resized(old, size);
+        if let Some(cache) = self.cache() {
+            let old = self.inner.stat()?.size;
+            self.inner.truncate(size)?;
+            cache.resized(old, size);
+        } else {
+            self.inner.truncate(size)?;
+        }
+        self.changed(crate::inotify::MODIFY);
         Ok(())
     }
     fn flock(&self, op: u32) -> Result<(), Errno> {
@@ -538,16 +564,28 @@ impl FileHandle for CoherentFile {
         self.inner.set_flags(flags)
     }
     fn with_xattrs(&self, f: &mut dyn FnMut(&mut paludarium_host::Xattrs)) -> Result<(), Errno> {
-        self.inner.with_xattrs(f)
+        let (result, changed) = crate::inotify::changing_xattrs(|| self.inner.with_xattrs(f));
+        if result.is_ok() && changed {
+            self.changed(crate::inotify::ATTRIB);
+        }
+        result
     }
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
-        self.inner.set_mode(mode)
+        self.inner.set_mode(mode)?;
+        self.changed(crate::inotify::ATTRIB);
+        Ok(())
     }
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
-        self.inner.set_owner(uid, gid)
+        self.inner.set_owner(uid, gid)?;
+        if uid.is_some() || gid.is_some() {
+            self.changed(crate::inotify::ATTRIB);
+        }
+        Ok(())
     }
     fn set_times(&self, atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
-        self.inner.set_times(atime, mtime)
+        self.inner.set_times(atime, mtime)?;
+        self.changed(Notifier::times_mask(atime.is_some(), mtime.is_some()));
+        Ok(())
     }
     fn sync(&self) -> Result<(), Errno> {
         if let Some(cache) = self.cache() {
@@ -620,6 +658,12 @@ impl HostFs for CoherentFs {
             let key = (mount_device(&self.inner.mounts(), path), stat.inode);
             drop(self.caches.write_access(key)?);
         }
+        const O_CREAT: u32 = 0o100;
+        let notify = &self.caches.notify;
+        // Whether the file was there, for inotify: a new one is
+        // `IN_CREATE`, an old one emptied `IN_MODIFY`.
+        let existed = (notify.watching() && flags & (O_CREAT | O_TRUNC) != 0)
+            .then(|| self.inner.metadata(path, flags & O_NOFOLLOW == 0).ok());
         let file = CoherentFile {
             inner: self.inner.open(path, flags, mode)?,
             caches: Arc::clone(&self.caches),
@@ -632,6 +676,15 @@ impl HostFs for CoherentFs {
             && let Some(cache) = file.cache()
         {
             cache.resized(0, 0);
+        }
+        match existed {
+            Some(None) if flags & O_CREAT != 0 => notify.created(&*self.inner, path),
+            Some(Some(stat))
+                if flags & (O_TRUNC | O_PATH) == O_TRUNC && stat.mode & 0o170000 == REGULAR =>
+            {
+                notify.changed(&*self.inner, path, true, crate::inotify::MODIFY);
+            }
+            _ => {}
         }
         Ok(Arc::new(file))
     }
@@ -647,31 +700,59 @@ impl HostFs for CoherentFs {
         }
     }
     fn mkdir(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
-        self.inner.mkdir(path, mode)
+        self.inner.mkdir(path, mode)?;
+        self.caches.notify.created(&*self.inner, path);
+        Ok(())
     }
     fn make_socket(&self, path: &[u8], mode: u32) -> Result<FileStat, Errno> {
-        self.inner.make_socket(path, mode)
+        let stat = self.inner.make_socket(path, mode)?;
+        self.caches.notify.created(&*self.inner, path);
+        Ok(stat)
     }
     fn make_fifo(&self, path: &[u8], mode: u32) -> Result<FileStat, Errno> {
-        self.inner.make_fifo(path, mode)
+        let stat = self.inner.make_fifo(path, mode)?;
+        self.caches.notify.created(&*self.inner, path);
+        Ok(stat)
     }
     fn unlink(&self, path: &[u8], directory: bool) -> Result<(), Errno> {
-        self.inner.unlink(path, directory)
+        let notify = &self.caches.notify;
+        let removed = notify.before_removal(&*self.inner, path);
+        self.inner.unlink(path, directory)?;
+        if let Some(removed) = removed {
+            notify.unlinked(&removed, directory);
+        }
+        Ok(())
     }
     fn link(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
-        self.inner.link(old, new)
+        self.inner.link(old, new)?;
+        self.caches.notify.linked(&*self.inner, new);
+        Ok(())
     }
     fn symlink(&self, target: &[u8], path: &[u8]) -> Result<(), Errno> {
-        self.inner.symlink(target, path)
+        self.inner.symlink(target, path)?;
+        self.caches.notify.created(&*self.inner, path);
+        Ok(())
     }
     fn readlink(&self, path: &[u8]) -> Result<Vec<u8>, Errno> {
         self.inner.readlink(path)
     }
     fn rename(&self, old: &[u8], new: &[u8]) -> Result<(), Errno> {
-        self.inner.rename(old, new)
+        let notify = &self.caches.notify;
+        let moved = notify.before_rename(&*self.inner, old, new);
+        self.inner.rename(old, new)?;
+        if let Some(moved) = moved {
+            notify.renamed(&moved, 0);
+        }
+        Ok(())
     }
     fn rename_with(&self, old: &[u8], new: &[u8], flags: u32) -> Result<(), Errno> {
-        self.inner.rename_with(old, new, flags)
+        let notify = &self.caches.notify;
+        let moved = notify.before_rename(&*self.inner, old, new);
+        self.inner.rename_with(old, new, flags)?;
+        if let Some(moved) = moved {
+            notify.renamed(&moved, flags);
+        }
+        Ok(())
     }
     fn read_dir(&self, path: &[u8]) -> Result<Vec<DirectoryEntry>, Errno> {
         self.inner.read_dir(path)
@@ -685,10 +766,21 @@ impl HostFs for CoherentFs {
         follow: bool,
         f: &mut dyn FnMut(&mut paludarium_host::Xattrs),
     ) -> Result<(), Errno> {
-        self.inner.with_xattrs(path, follow, f)
+        let (result, changed) =
+            crate::inotify::changing_xattrs(|| self.inner.with_xattrs(path, follow, f));
+        if result.is_ok() && changed {
+            self.caches
+                .notify
+                .changed(&*self.inner, path, follow, crate::inotify::ATTRIB);
+        }
+        result
     }
     fn set_mode(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
-        self.inner.set_mode(path, mode)
+        self.inner.set_mode(path, mode)?;
+        self.caches
+            .notify
+            .changed(&*self.inner, path, true, crate::inotify::ATTRIB);
+        Ok(())
     }
     fn set_owner(
         &self,
@@ -697,7 +789,13 @@ impl HostFs for CoherentFs {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> Result<(), Errno> {
-        self.inner.set_owner(path, follow, uid, gid)
+        self.inner.set_owner(path, follow, uid, gid)?;
+        if uid.is_some() || gid.is_some() {
+            self.caches
+                .notify
+                .changed(&*self.inner, path, follow, crate::inotify::ATTRIB);
+        }
+        Ok(())
     }
     fn set_times(
         &self,
@@ -706,6 +804,9 @@ impl HostFs for CoherentFs {
         atime: Option<i128>,
         mtime: Option<i128>,
     ) -> Result<(), Errno> {
-        self.inner.set_times(path, follow, atime, mtime)
+        self.inner.set_times(path, follow, atime, mtime)?;
+        let mask = Notifier::times_mask(atime.is_some(), mtime.is_some());
+        self.caches.notify.changed(&*self.inner, path, follow, mask);
+        Ok(())
     }
 }

@@ -265,6 +265,10 @@ impl SyscallTable {
         handlers.insert(153, crate::pty::sys_vhangup);
         handlers.insert(282, crate::signalfd::sys_signalfd);
         handlers.insert(289, crate::signalfd::sys_signalfd4);
+        handlers.insert(253, crate::inotify::sys_inotify_init);
+        handlers.insert(254, crate::inotify::sys_inotify_add_watch);
+        handlers.insert(255, crate::inotify::sys_inotify_rm_watch);
+        handlers.insert(294, crate::inotify::sys_inotify_init1);
         // Tokio's current Linux std uses GRND_INSECURE to seed its scheduler;
         // the Host random boundary supplies secure bytes without OS passthrough.
         handlers.insert(318, sys_getrandom);
@@ -2363,6 +2367,10 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
         // A pseudo-terminal's own requests.
         if let Some(result) = crate::pty::ioctl(c, &file, a[1], a[2]) {
+            return result;
+        }
+        // An inotify instance's.
+        if let Some(result) = crate::inotify::ioctl(c, &file, a[1], a[2]) {
             return result;
         }
         // SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCGIFINDEX and SIOCGIFNAME of a

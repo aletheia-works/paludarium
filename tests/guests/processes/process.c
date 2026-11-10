@@ -1282,7 +1282,7 @@ static void nl_route_attribute(unsigned short type, const unsigned char *v, int 
     unsigned value = 0;
     if (len == 4) memcpy(&value, v, 4);
     printf(" %u", type);
-    if ((type == 1 || type == 7) && (len == 4 || len == 16)) {
+    if ((type == 1 || type == 5 || type == 7) && (len == 4 || len == 16)) {
         inet_ntop(len == 4 ? AF_INET : AF_INET6, v, text, sizeof text);
         printf("=%s", text);
     } else if (len == 4) {
@@ -1342,7 +1342,8 @@ static long nl_answer(int fd, long seq, unsigned port, const char *label) {
             int index = 1;
             if ((h->type == 16 && body_len >= 16) || (h->type == 20 && body_len >= 8)) memcpy(&index, body + 4, 4);
             if (h->type == 24 && body_len >= 12) {
-                nl_route_oif = 0;
+                /* A route without a device, as a blackhole one is, too. */
+                nl_route_oif = 1;
                 nl_attributes(body + 12, body_len - 12, nl_route_oif_attribute);
                 index = nl_route_oif;
             }
@@ -1473,6 +1474,64 @@ static void nl_addr(int fd, unsigned port, unsigned short type, unsigned short f
         at += 4 + len;
     }
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, request, at), port, label);
+}
+/* The routes case: a route request's `rtmsg` and attributes. `table` goes
+   in the `rtmsg` up to 255 and in RTA_TABLE past it; `oif` and `metric` are
+   RTA_OIF and RTA_PRIORITY, and `src` and `gw` RTA_PREFSRC and RTA_GATEWAY,
+   none when 0. */
+struct nl_rt {
+    int family, tos, table, protocol, scope, kind, oif, flags;
+    unsigned metric;
+    const char *src, *gw;
+};
+/* Sends route request `type` (24 or 25) with `flags` for `dst` (NULL for
+   the default route) of prefix `len`, as `r` gives it, and prints the
+   answer. */
+static void nl_route(int fd, unsigned port, unsigned short type, unsigned short flags, const char *dst, int len,
+                     struct nl_rt r, const char *label) {
+    unsigned char request[12 + 6 * 20] = {r.family, len, 0, r.tos, r.table > 255 ? 0 : r.table,
+                                          r.protocol, r.scope, r.kind};
+    memcpy(request + 8, &r.flags, 4);
+    int size = r.family == AF_INET ? 4 : 16, at = 12;
+    const struct {
+        unsigned short kind;
+        const char *text;
+    } addresses[] = {{1, dst}, {7, r.src}, {5, r.gw}};
+    for (size_t i = 0; i < sizeof addresses / sizeof addresses[0]; i++) {
+        if (!addresses[i].text) continue;
+        unsigned short attribute[2] = {4 + size, addresses[i].kind};
+        memcpy(request + at, attribute, 4);
+        inet_pton(r.family, addresses[i].text, request + at + 4);
+        at += 4 + size;
+    }
+    const struct {
+        unsigned short kind;
+        unsigned value;
+    } numbers[] = {{15, r.table > 255 ? r.table : 0}, {4, r.oif}, {6, r.metric}};
+    for (size_t i = 0; i < sizeof numbers / sizeof numbers[0]; i++) {
+        if (!numbers[i].value) continue;
+        unsigned short attribute[2] = {8, numbers[i].kind};
+        memcpy(request + at, attribute, 4);
+        memcpy(request + at + 4, &numbers[i].value, 4);
+        at += 8;
+    }
+    nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, request, at), port, label);
+}
+/* Route lookups for the routes case, as nl_lookups sends them. */
+static void routes_get(int fd, unsigned port, const char *when, const char *const *texts, size_t count,
+                       unsigned flags) {
+    for (size_t i = 0; i < count; i++) {
+        int family = strchr(texts[i], ':') ? AF_INET6 : AF_INET, size = family == AF_INET ? 4 : 16;
+        unsigned char request[12 + 20] = {family, size * 8};
+        memcpy(request + 8, &flags, 4);
+        unsigned short attribute[2] = {4 + size, 1};
+        memcpy(request + 12, attribute, 4);
+        inet_pton(family, texts[i], request + 16);
+        char label[80];
+        if (flags) snprintf(label, sizeof label, "%s get flags=%#x %s", when, flags, texts[i]);
+        else snprintf(label, sizeof label, "%s get %s", when, texts[i]);
+        nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, 16 + size), port, label);
+    }
 }
 /* Binds a UDP socket of `family` to `text`, and prints the result. */
 static void addresses_bind(const char *text, const char *when) {
@@ -5445,6 +5504,113 @@ static int old_times_case(void) {
     rmdir(dir);
     return 0;
 }
+/* The old forms: getdents's linux_dirent, eventfd, ustat and
+ * remap_file_pages, as Linux 6.12's. */
+static int of_names_cmp(const void *a, const void *b) { return strcmp(a, b); }
+static int old_forms_case(void) {
+    char dir[] = "/tmp/old-forms-XXXXXX";
+    if (!mkdtemp(dir)) return 80;
+    char path[64];
+    snprintf(path, sizeof path, "%s/file", dir);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) return 81;
+    snprintf(path, sizeof path, "%s/sub", dir);
+    if (mkdir(path, 0700)) return 82;
+    int d = open(dir, O_RDONLY | O_DIRECTORY);
+    int dp = open(dir, O_PATH);
+    long small = ot_errno(syscall(SYS_getdents, (long)d, path, 23L));
+    static char buf[4096];
+    long negative = ot_errno(syscall(SYS_getdents, (long)d, buf, 0x80000000L));
+    long negative64 = ot_errno(syscall(SYS_getdents64, (long)d, buf, 0x80000000L));
+    long n = ot_errno(syscall(SYS_getdents, (long)d, buf, (long)sizeof buf));
+    char names[8][16];
+    int count = 0, sizes_ok = 1;
+    for (long at = 0; at < n && count < 8;) {
+        unsigned short reclen = *(unsigned short *)(buf + at + 16);
+        const char *name = buf + at + 18;
+        size_t want = (18 + strlen(name) + 2 + 7) / 8 * 8;
+        if (reclen != want) sizes_ok = 0;
+        snprintf(names[count++], sizeof names[0], "%s:%d", name, buf[at + reclen - 1]);
+        at += reclen;
+    }
+    qsort(names, count, sizeof names[0], of_names_cmp);
+    printf("getdents small=%ld negative=%ld negative64=%ld sizes=%d entries=", small, negative,
+           negative64, sizes_ok);
+    for (int i = 0; i < count; i++) printf("%s%s", i ? "," : "", names[i]);
+    long end = ot_errno(syscall(SYS_getdents, (long)d, buf, (long)sizeof buf));
+    long notdir = ot_errno(syscall(SYS_getdents, (long)fd, buf, (long)sizeof buf));
+    long opath = ot_errno(syscall(SYS_getdents, (long)dp, buf, (long)sizeof buf));
+    long badf = ot_errno(syscall(SYS_getdents, 99L, buf, (long)sizeof buf));
+    printf(" end=%ld notdir=%ld path=%ld badf=%ld\n", end, notdir, opath, badf);
+    lseek(d, 0, SEEK_SET);
+    long fault = ot_errno(syscall(SYS_getdents, (long)d, (void *)8, (long)sizeof buf));
+    printf("getdents fault=%ld\n", fault);
+
+    int e = (int)syscall(SYS_eventfd, (1L << 32) | 3L);
+    uint64_t v = 0;
+    long got = ot_errno(read(e, &v, 8));
+    printf("eventfd count=%llu read=%ld fl=%#x fd=%d\n", (unsigned long long)v, got,
+           fcntl(e, F_GETFL) & O_ACCMODE, fcntl(e, F_GETFD));
+
+    struct stat st;
+    if (stat(dir, &st)) return 83;
+    char ust[32];
+    memset(ust, 0xff, sizeof ust);
+    long u = ot_errno(syscall(SYS_ustat, (long)st.st_dev, ust));
+    int names_empty = 1;
+    for (int i = 16; i < 28; i++) names_empty &= ust[i] == 0;
+    printf("ustat=%ld names-empty=%d none=%ld fault=%ld\n", u, names_empty,
+           ot_errno(syscall(SYS_ustat, 0L, ust)), ot_errno(syscall(SYS_ustat, (long)st.st_dev, NULL)));
+
+    char *shared = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) return 84;
+    for (int i = 0; i < 3; i++) shared[i * 4096] = 'a' + i;
+    long r = ot_errno(syscall(SYS_remap_file_pages, shared + 5, 0x1fffL, 0L, 2L, 0xffffL));
+    char first = shared[0];
+    shared[0] = 'z';
+    printf("remap anon=%ld first=%c third=%c second=%c\n", r, first, shared[2 * 4096], shared[4096]);
+    r = ot_errno(syscall(SYS_remap_file_pages, shared, 0x2000L, 0L, 0L, 0L));
+    printf("remap across=%ld first=%c second=%c\n", r, shared[0], shared[4096]);
+    char *private = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("remap prot=%ld empty=%ld wrap=%ld past=%ld huge=%ld unmapped=%ld private=%ld\n",
+           ot_errno(syscall(SYS_remap_file_pages, shared, 4096L, 1L, 0L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, shared, 0xfffL, 0L, 0L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, shared, 4096L, 0L, -1L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, shared, 0x4000L, 0L, 0L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, shared, 4096L, 0L, 1L << 60, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, (void *)0x10000L, 4096L, 0L, 0L, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, private, 4096L, 0L, 0L, 0L)));
+    mprotect(shared + 4096, 4096, PROT_READ);
+    long split = ot_errno(syscall(SYS_remap_file_pages, shared, 0x2000L, 0L, 0L, 0L));
+    long kept = ot_errno(syscall(SYS_remap_file_pages, shared + 4096, 0x1000L, 0L, 2L, 0L));
+    printf("remap other-prot=%ld kept-prot=%ld second=%c\n", split, kept, shared[4096]);
+
+    for (int i = 0; i < 3; i++) {
+        char c = '0' + i;
+        if (pwrite(fd, &c, 1, i * 4096L) != 1) return 85;
+    }
+    if (ftruncate(fd, 3 * 4096)) return 86;
+    char *file = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (file == MAP_FAILED) return 87;
+    r = ot_errno(syscall(SYS_remap_file_pages, file, 4096L, 0L, 2L, 0L));
+    first = file[0];
+    file[1] = 'w';
+    msync(file, 4096, MS_SYNC);
+    char back[3] = {0};
+    pread(fd, back, 2, 2 * 4096);
+    snprintf(path, sizeof path, "%s/file", dir);
+    int ro = open(path, O_RDONLY);
+    char *read_only = mmap(NULL, 4096, PROT_READ, MAP_SHARED, ro, 0);
+    printf("remap file=%ld first=%c back=%s huge=%ld read-only=%ld\n", r, first, back,
+           ot_errno(syscall(SYS_remap_file_pages, file, 4096L, 0L, 1L << 60, 0L)),
+           ot_errno(syscall(SYS_remap_file_pages, read_only, 4096L, 0L, 1L, 0L)));
+    snprintf(path, sizeof path, "%s/sub", dir);
+    rmdir(path);
+    snprintf(path, sizeof path, "%s/file", dir);
+    unlink(path);
+    rmdir(dir);
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -7132,6 +7298,201 @@ int main(int argc, char **argv) {
                 _exit(0);
             }
             result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "routes")) {
+        /* A child makes a network namespace, adds, replaces and removes
+           routes through netlink, and prints what it is told of them, the
+           tables, lookups and what its sockets then reach. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            /* IPv4's and IPv6's route groups. */
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x440};
+            bind(mon, (void *)&members, sizeof members);
+            unsigned char family = 0;
+            const unsigned short add = 0x600, create = 0x400, replace = 0x500, change = 0x100, append = 0xc00;
+#define ROUTE4(...) ((struct nl_rt){.family = AF_INET, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
+#define ROUTE6(...) ((struct nl_rt){.family = AF_INET6, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
+            /* While lo is down: a route through it, and ones without it. */
+            nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "down dev");
+            nl_route(ctl, port, 24, add, "10.7.0.0", 16, ROUTE4(.table = 255, .scope = 254, .kind = 2, .oif = 1),
+                     "down local");
+            nl_route(ctl, port, 24, add, "10.6.0.0", 16, ROUTE4(.kind = 6), "down blackhole");
+            nl_route(ctl, port, 24, add, "2001:db8::", 64, ROUTE6(.oif = 1), "down dev6");
+            nl_route(ctl, port, 24, add, "2001:db8:2::", 64, ROUTE6(.kind = 6), "down blackhole6");
+            monitor_show(mon, port, "down");
+            addresses_bind("10.7.1.1", "down");
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            nl_answer(ctl, nl_send(ctl, 16, NL_F_REQUEST | NL_F_ACK, &link, sizeof link), port, "up");
+            monitor_show(mon, port, "up");
+            /* IPv4: through lo, and of each type without a device. */
+            nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "add dev");
+            nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "add again");
+            nl_route(ctl, port, 24, add, "10.8.0.0", 16, ROUTE4(.protocol = 4, .scope = 253, .oif = 1, .metric = 5),
+                     "add metric");
+            nl_route(ctl, port, 24, add, "10.5.0.0", 16, ROUTE4(.kind = 7, .metric = 7), "add unreachable");
+            nl_route(ctl, port, 24, add, "10.4.0.0", 16, ROUTE4(.table = 100, .kind = 8), "add prohibit 100");
+            nl_route(ctl, port, 24, add, "10.3.0.0", 16, ROUTE4(.kind = 9), "add throw");
+            nl_route(ctl, port, 24, add, "10.2.0.0", 16, ROUTE4(.scope = 253, .oif = 1, .src = "127.0.0.1"),
+                     "add prefsrc");
+            nl_route(ctl, port, 24, add, "10.2.0.0", 16,
+                     ROUTE4(.scope = 253, .oif = 1, .metric = 1, .src = "10.1.1.1"), "add bad prefsrc");
+            nl_route(ctl, port, 24, add, NULL, 0, ROUTE4(.scope = 253, .oif = 1), "add default");
+            nl_route(ctl, port, 24, add, "10.10.0.0", 16, ROUTE4(.gw = "127.0.0.2"), "add gateway");
+            nl_route(ctl, port, 24, add, "10.11.0.0", 16, ROUTE4(.oif = 1, .flags = 4, .gw = "127.0.0.2"),
+                     "add onlink local gateway");
+            nl_route(ctl, port, 24, add, "10.12.0.0", 16, ROUTE4(.gw = "10.6.0.1"), "add blackholed gateway");
+            nl_route(ctl, port, 24, add, "10.1.0.0", 16, ROUTE4(.scope = 253, .oif = 999), "add other device");
+            nl_route(ctl, port, 24, add, "10.1.0.0", 16, ROUTE4(.scope = 253), "add no device");
+            nl_route(ctl, port, 24, add, "10.1.0.0", 16, ROUTE4(.kind = 6, .oif = 1), "add blackhole with device");
+            nl_route(ctl, port, 24, add, "10.1.0.0", 16, ROUTE4(.scope = 254, .oif = 1), "add host scope");
+            nl_route(ctl, port, 24, add, "10.0.0.0", 8, ROUTE4(.scope = 253, .oif = 1, .tos = 0x10), "add tos");
+            nl_route(ctl, port, 24, add, "10.0.0.0", 8, ROUTE4(.scope = 253, .oif = 1, .tos = 0x11), "add bad tos");
+            nl_route(ctl, port, 24, add, "10.0.0.0", 33, ROUTE4(.scope = 253, .oif = 1), "add prefix 33");
+            nl_route(ctl, port, 24, add, "10.0.0.0", 8, ROUTE4(.scope = 253, .oif = 1, .kind = 2), "add local scope link");
+            nl_route(ctl, port, 24, add, "10.0.0.0", 8, ROUTE4(.scope = 253, .oif = 1, .kind = 12), "add bad type");
+            nl_route(ctl, port, 24, add, "10.30.0.0", 16, ROUTE4(.table = 253, .scope = 253, .oif = 1),
+                     "add table default");
+            nl_route(ctl, port, 24, add, "10.31.0.0", 16, ROUTE4(.table = 1000, .scope = 253, .oif = 1),
+                     "add table 1000");
+            nl_route(ctl, port, 24, add, "10.30.5.0", 24, ROUTE4(.kind = 9), "add throw before table default");
+            nl_route(ctl, port, 24, add | 0x8, "10.40.0.0", 16, ROUTE4(.kind = 6), "add echo");
+            /* The same prefix again: replaced, changed, appended, prepended. */
+            nl_route(ctl, port, 24, replace, "10.9.0.0", 16, ROUTE4(.scope = 254, .oif = 1), "replace");
+            nl_route(ctl, port, 24, replace, "10.9.0.0", 16, ROUTE4(.scope = 254, .oif = 1), "replace same");
+            nl_route(ctl, port, 24, change, "10.99.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "change missing");
+            nl_route(ctl, port, 24, 0, "10.98.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "add without create");
+            nl_route(ctl, port, 24, append, "10.9.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "append");
+            nl_route(ctl, port, 24, append, "10.9.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "append again");
+            nl_route(ctl, port, 24, create, "10.9.0.0", 16, ROUTE4(.protocol = 4, .scope = 253, .oif = 1),
+                     "prepend");
+            nl_route(ctl, port, 24, append, "10.9.0.0", 16, ROUTE4(.scope = 253, .oif = 1, .metric = 3),
+                     "append metric");
+            /* IPv6. */
+            nl_route(ctl, port, 24, add, "2001:db8::", 64, ROUTE6(.oif = 1), "add6 dev");
+            nl_route(ctl, port, 24, add, "2001:db8::", 64, ROUTE6(.oif = 1), "add6 again");
+            nl_route(ctl, port, 24, create, "2001:db8::", 64, ROUTE6(.oif = 1), "prepend6 same");
+            nl_route(ctl, port, 24, add, "2001:db8::", 64, ROUTE6(.oif = 1, .metric = 5), "add6 metric");
+            nl_route(ctl, port, 24, add, "2001:db8:2::", 64, ROUTE6(.kind = 6), "add6 blackhole");
+            nl_route(ctl, port, 24, add, "2001:db8:3::", 64, ROUTE6(.kind = 7), "add6 unreachable");
+            nl_route(ctl, port, 24, add, "2001:db8:4::", 64, ROUTE6(.table = 255, .kind = 2, .oif = 1), "add6 local");
+            nl_route(ctl, port, 24, add, "2001:db8:5::", 64, ROUTE6(.table = 100, .oif = 1), "add6 table 100");
+            nl_route(ctl, port, 24, add, NULL, 0, ROUTE6(.oif = 1), "add6 default");
+            nl_route(ctl, port, 24, add, "2001:db8:6::", 64, ROUTE6(.oif = 1, .src = "::1"), "add6 prefsrc");
+            nl_route(ctl, port, 24, add, "2001:db8:7::", 64, ROUTE6(.oif = 1, .src = "2001:db8::1"),
+                     "add6 bad prefsrc");
+            nl_route(ctl, port, 24, add, "2001:db8:8::", 64, ROUTE6(), "add6 no device");
+            nl_route(ctl, port, 24, add, "2001:db8:8::", 64, ROUTE6(.oif = 999), "add6 other device");
+            nl_route(ctl, port, 24, add, "2001:db8:8::", 129, ROUTE6(.oif = 1), "add6 prefix 129");
+            nl_route(ctl, port, 24, replace, "2001:db8::", 64, ROUTE6(.protocol = 4, .oif = 1), "replace6");
+            nl_route(ctl, port, 24, change, "2001:db8:99::", 64, ROUTE6(.oif = 1), "change6 missing");
+            nl_route(ctl, port, 24, 0, "2001:db8:98::", 64, ROUTE6(.oif = 1), "add6 without create");
+            monitor_show(mon, port, "adds");
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "dump");
+            static const char *const lookups[] = {
+                "10.9.1.1",  "10.6.1.1",     "10.5.1.1",     "10.4.1.1",      "10.3.1.1",     "10.2.1.1",
+                "8.8.8.8",   "10.7.1.1",     "10.10.1.1",    "10.30.1.1",     "10.31.1.1",    "10.0.1.1",     "10.30.5.1",    "10.12.1.1",
+                "2001:db8::9", "2001:db8:2::9", "2001:db8:3::9", "2001:db8:4::9", "2001:db8:5::9", "2001:db8:6::9",
+                "2001:4860::1",
+            };
+            routes_get(ctl, port, "added", lookups, sizeof lookups / sizeof lookups[0], 0);
+            static const char *const matched[] = {"10.9.1.1",  "8.8.8.8",     "10.7.1.1",
+                                                  "10.30.1.1", "10.30.5.1",   "2001:db8::9",
+                                                  "2001:4860::1"};
+            routes_get(ctl, port, "added", matched, sizeof matched / sizeof matched[0], 0x2000);
+            /* RTM_F_LOOKUP_TABLE: the answer names the table it came from. */
+            static const char *const tabled[] = {"10.30.5.1", "10.7.1.1", "10.9.1.1", "2001:db8:4::9"};
+            routes_get(ctl, port, "added", tabled, sizeof tabled / sizeof tabled[0], 0x1000);
+            routes_get(ctl, port, "added", tabled, 1, 0x3000);
+            /* A local route makes its addresses the loopback's. */
+            addresses_bind("10.7.1.1", "local route");
+            addresses_connect("10.7.1.1", "local route");
+            addresses_bind("2001:db8:4::1", "local route");
+            /* Removing: the first that matches each. */
+            nl_route(ctl, port, 25, 0, "10.9.0.0", 16, ROUTE4(.protocol = 0, .scope = 255, .kind = 0), "del");
+            nl_route(ctl, port, 25, 0, "10.9.0.0", 16, ROUTE4(.protocol = 0, .scope = 255, .kind = 0, .metric = 9),
+                     "del metric 9");
+            nl_route(ctl, port, 25, 0, "10.9.0.0", 16, ROUTE4(.protocol = 0, .scope = 255, .kind = 0, .metric = 3),
+                     "del metric 3");
+            nl_route(ctl, port, 25, 0, "10.9.0.0", 16, ROUTE4(.protocol = 3, .scope = 255, .kind = 0), "del boot");
+            nl_route(ctl, port, 25, 0, "10.6.0.0", 16, ROUTE4(.protocol = 0, .scope = 255, .kind = 7),
+                     "del wrong type");
+            nl_route(ctl, port, 25, 0, "10.6.0.0", 16, ROUTE4(.protocol = 0, .scope = 0, .kind = 6), "del blackhole");
+            nl_route(ctl, port, 25, 0, "10.77.0.0", 16, ROUTE4(.protocol = 0, .scope = 255, .kind = 0), "del missing");
+            nl_route(ctl, port, 25, 0, "10.4.0.0", 16, ROUTE4(.protocol = 0, .scope = 255, .kind = 0), "del in main");
+            nl_route(ctl, port, 25, 0, "10.4.0.0", 16, ROUTE4(.table = 100, .protocol = 0, .scope = 255, .kind = 0),
+                     "del in 100");
+            nl_route(ctl, port, 25, 0, "10.8.0.0", 16, ROUTE4(.protocol = 0, .scope = 255, .kind = 0, .oif = 999),
+                     "del other device");
+            nl_route(ctl, port, 25, 0, "127.255.255.255", 32,
+                     ROUTE4(.table = 255, .protocol = 0, .scope = 255, .kind = 0), "del kernel broadcast");
+            nl_route(ctl, port, 25, 0, "2001:db8::", 64, ROUTE6(.protocol = 0, .kind = 0), "del6");
+            nl_route(ctl, port, 25, 0, "2001:db8::", 64, ROUTE6(.protocol = 0, .kind = 0, .metric = 7),
+                     "del6 metric 7");
+            nl_route(ctl, port, 25, 0, "2001:db8:2::", 64, ROUTE6(.protocol = 0, .kind = 1), "del6 blackhole as unicast");
+            nl_route(ctl, port, 25, 0, "2001:db8:77::", 64, ROUTE6(.protocol = 0, .kind = 0), "del6 missing");
+            monitor_show(mon, port, "dels");
+            /* An address's prefix route and the routes from it. */
+            nl_route(ctl, port, 24, add, "2001:db8:a::", 64, ROUTE6(.oif = 1, .metric = 5), "add6 before address");
+            nl_addr(ctl, port, 20, 0x600, AF_INET6, "2001:db8:a::1", 64, 0, 1, "add address6");
+            /* Linux tells of the IPv6 address's local route once its duplicate
+               address detection work has run, a little later. */
+            usleep(200000);
+            monitor_show(mon, port, "address6");
+            nl_addr(ctl, port, 20, 0x600, AF_INET, "10.20.0.1", 24, 0, 1, "add address");
+            nl_route(ctl, port, 24, add, "10.21.0.0", 16, ROUTE4(.scope = 253, .oif = 1, .src = "10.20.0.1"),
+                     "add from address");
+            nl_route(ctl, port, 24, add, "10.20.0.0", 24, ROUTE4(.table = 255, .scope = 254, .kind = 2, .oif = 1),
+                     "add over the prefix route");
+            usleep(200000);
+            monitor_show(mon, port, "address");
+            nl_addr(ctl, port, 21, 0, AF_INET6, "2001:db8:a::1", 64, 0, 1, "del address6");
+            nl_addr(ctl, port, 21, 0, AF_INET, "10.20.0.1", 24, 0, 1, "del address");
+            monitor_show(mon, port, "address gone");
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "dump after dels");
+            /* Down: IPv4's routes through lo go without a word but those of
+               host scope; IPv6's go, each told. Up: the kernel's come back. */
+            link.flags = 0;
+            nl_answer(ctl, nl_send(ctl, 16, NL_F_REQUEST | NL_F_ACK, &link, sizeof link), port, "down");
+            monitor_show(mon, port, "down again");
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "dump down");
+            link.flags = IFF_UP;
+            nl_answer(ctl, nl_send(ctl, 16, NL_F_REQUEST | NL_F_ACK, &link, sizeof link), port, "up again");
+            monitor_show(mon, port, "up again");
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "dump up");
+            /* The last IPv4 address takes every route through lo. */
+            nl_addr(ctl, port, 21, 0, AF_INET, "127.0.0.1", 8, 0, 1, "del last address");
+            monitor_show(mon, port, "no address");
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "dump no address");
+            /* A user may not add a route. */
+            fflush(stdout);
+            pid_t user = child();
+            if (user == 0) {
+                if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+                int own = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+                struct nl_address mine = {0};
+                socklen_t mine_len = sizeof mine;
+                bind(own, (void *)&any, sizeof any);
+                getsockname(own, (void *)&mine, &mine_len);
+                nl_route(own, mine.pid, 24, add, "10.40.0.0", 16, ROUTE4(.kind = 6), "user add");
+                fflush(stdout);
+                _exit(0);
+            }
+            result("user", reaped(user));
+#undef ROUTE4
+#undef ROUTE6
             fflush(stdout);
             _exit(0);
         }
@@ -16289,6 +16650,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "pkey")) return pkey_case();
     if (!strcmp(mode, "vector-flags")) return vector_flags_case();
     if (!strcmp(mode, "old-times")) return old_times_case();
+    if (!strcmp(mode, "old-forms")) return old_forms_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

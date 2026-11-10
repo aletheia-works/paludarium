@@ -354,7 +354,7 @@ impl Network {
         let up = self.is_up();
         let local = match to.ip() {
             ip if ip.is_unspecified() => crate::loopback::destination(to),
-            IpAddr::V4(ip) => self.addresses().local4(ip, up).then_some(to),
+            IpAddr::V4(ip) => self.addresses().local4(ip).then_some(to),
             IpAddr::V6(ip) => self.addresses().local6(ip).then_some(to),
         };
         match local {
@@ -372,7 +372,7 @@ impl Network {
     /// The address a connection or datagram to `to` on the loopback leaves
     /// from: its route's preferred source.
     pub(crate) fn source(&self, to: SocketAddr) -> IpAddr {
-        self.addresses().source(to.ip(), self.is_up())
+        self.addresses().source(to.ip())
     }
     /// Whether a socket may bind to `ip`: the unspecified address, an IPv4
     /// multicast or limited broadcast one, one a local or broadcast route
@@ -384,7 +384,7 @@ impl Network {
                 ip.is_unspecified()
                     || ip.is_multicast()
                     || ip.is_broadcast()
-                    || self.addresses().bindable4(ip, self.is_up())
+                    || self.addresses().bindable4(ip)
             }
             IpAddr::V6(ip) => ip.is_unspecified() || self.addresses().local6(ip),
         }

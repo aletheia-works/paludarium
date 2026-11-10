@@ -532,3 +532,94 @@ fn counted_hook_rejects_excessive_count() {
         |state, _, _| Some((ExitReason::BudgetExhausted { rip: state.rip }, 65)),
     );
 }
+
+/// Runs the 32 `nop`s at 4096 of `memory` (one block) with an accelerator
+/// that turns down the instructions at the addresses `reject` picks, and
+/// returns the addresses it was offered and how many instructions were
+/// decoded.
+fn offered_in_one_block(
+    memory: &AddressSpace,
+    cache: &mut DecodeCache,
+    cache_rejections: bool,
+    reject: impl Fn(u64) -> bool,
+) -> (Vec<u64>, usize) {
+    let mut state = CpuState::new(GuestAddr(4096), GuestAddr(8192));
+    let decoded = cache.code.decoded.len();
+    let mut offered = Vec::new();
+    let exit = run_cached_with_counted_hook(
+        &mut state,
+        memory,
+        32,
+        cache,
+        AccelerationPolicy {
+            maximum_block: 1,
+            cache_rejections,
+        },
+        |state, _, rejected| {
+            offered.push(state.rip.0);
+            *rejected = reject(state.rip.0);
+            None
+        },
+    );
+    assert_eq!(
+        exit,
+        ExitReason::BudgetExhausted {
+            rip: GuestAddr(4096 + 32)
+        }
+    );
+    (offered, cache.code.decoded.len() - decoded)
+}
+
+#[test]
+fn falling_through_offers_every_instruction_and_decodes_once() {
+    let (_, memory) = machine();
+    let mut cache = DecodeCache::new();
+    let all = (4096..4096 + 32).collect::<Vec<_>>();
+    assert_eq!(
+        offered_in_one_block(&memory, &mut cache, true, |_| false),
+        (all.clone(), 32)
+    );
+    // The block now holds all 32: running it again decodes nothing, makes
+    // one lookup, and still offers each instruction.
+    let lookups = cache.growth.lookups;
+    assert_eq!(
+        offered_in_one_block(&memory, &mut cache, true, |_| false),
+        (all, 0)
+    );
+    assert_eq!(cache.growth.lookups - lookups, 1);
+}
+
+#[test]
+fn an_instruction_turned_down_inside_a_block_is_not_offered_again() {
+    let (_, memory) = machine();
+    let mut cache = DecodeCache::new();
+    let even = |rip: u64| rip % 2 == 0;
+    let (offered, _) = offered_in_one_block(&memory, &mut cache, true, even);
+    assert_eq!(offered.len(), 32);
+    let odd = (4096..4096 + 32).filter(|r| r % 2 == 1).collect::<Vec<_>>();
+    assert_eq!(
+        offered_in_one_block(&memory, &mut cache, true, even),
+        (odd, 0)
+    );
+    // Code changed under the block: it is decoded again and every
+    // instruction is offered again.
+    memory.write_initial(GuestAddr(4096), &[0x90]).unwrap();
+    let (offered, decoded) = offered_in_one_block(&memory, &mut cache, true, even);
+    assert_eq!((offered.len(), decoded), (32, 32));
+}
+
+#[test]
+fn without_cached_rejections_every_instruction_is_offered_again() {
+    let (_, memory) = machine();
+    let mut cache = DecodeCache::new();
+    let all = (4096..4096 + 32).collect::<Vec<_>>();
+    let even = |rip: u64| rip % 2 == 0;
+    assert_eq!(
+        offered_in_one_block(&memory, &mut cache, false, even),
+        (all.clone(), 32)
+    );
+    assert_eq!(
+        offered_in_one_block(&memory, &mut cache, false, even),
+        (all, 0)
+    );
+}

@@ -183,11 +183,28 @@ verified.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`,
     cannot be set: `setitimer` gives `EINVAL` for them, where Linux sets them
     and sends `SIGVTALRM` and `SIGPROF`, and `getitimer` shows them disarmed.
+  - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
+    socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
+    the superblock of its pseudo filesystem and gives its counts (0). A
+    file in `/proc` or `/dev` has the `st_dev` of the mount holding the
+    path, so `ustat` of it gives that mount's counts, where Linux gives
+    procfs's or devtmpfs's.
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared
     memory, semaphores and message queues are Linux's defaults, which
     `/proc/sys/kernel` cannot change. A message queue's waiting senders
     all look again whenever it changes, where Linux wakes them in the order
     they began only while each one's message fits.
+  - POSIX message queues have no `/proc/sys/fs/mqueue`, so their limits are
+    a new IPC namespace's defaults, and their filesystem cannot be mounted
+    (there is no `/dev/mqueue`). `RLIMIT_MSGQUEUE` charges each real user ID
+    once for the whole machine, where Linux charges it in each user
+    namespace too. A queue's file keeps only its creation time, and its
+    root belongs to root in every IPC namespace. A `SIGEV_THREAD` cookie
+    goes to its socket even when the socket's receive buffer is full,
+    where Linux's `mq_notify` first waits for room. The registration of a
+    process that ends goes when the queue is next used, where Linux drops it
+    as the process closes its descriptors: a `SIGEV_THREAD` socket still
+    open elsewhere gets its `NOTIFY_REMOVED` cookie only then.
   - A set's waiting semaphore operations are tried in one queue in the
     order they began, the waits for zero first. Linux keeps a queue for
     each semaphore beside one for operations on several, and which of two
@@ -304,11 +321,20 @@ verified.
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`
   (`EPROTONOSUPPORT` for `NETLINK_GENERIC` and the rest), and of it only
   the link, address and route requests: neighbours, rules, queueing
-  disciplines and the rest are `EOPNOTSUPP`, as are adding or removing a
-  route, an input route lookup (`RTA_IIF`, as `ip route get ... iif`
-  sends), a non-dump `RTM_GETADDR`, renaming `lo` and setting any other
-  attribute of it. An address is always permanent: lifetimes
-  (`IFA_CACHEINFO`) and `IFA_RT_PRIORITY` are not kept, a peer address is
+  disciplines and the rest are `EOPNOTSUPP`, as are an input route
+  lookup (`RTA_IIF`, as `ip route get ... iif` sends), a non-dump
+  `RTM_GETADDR`, renaming `lo` and setting any other attribute of it. A
+  route goes through `lo` or rejects: IPv6 gateways, multipath routes,
+  metrics (`RTA_METRICS`, as `ip route add ... mtu` sends), encapsulations,
+  nexthop objects, realms, expiries, source prefixes, router preferences
+  and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
+  `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
+  reaches a table but the local, main and default ones. In a new network
+  namespace a connection or datagram to an address no local route has is
+  still `ENETUNREACH`, whatever route takes it, where Linux's goes out
+  through `lo` and is dropped, or fails with a rejecting route's error.
+  An address is always permanent: lifetimes (`IFA_CACHEINFO`) and
+  `IFA_RT_PRIORITY` are not kept, a peer address is
   not a point-to-point one, and an IPv6 address is never tentative, where
   Linux's is until its duplicate address detection work, which ends at
   once on a loopback, has run. A connection or datagram to an address of
@@ -323,7 +349,7 @@ verified.
   out for the link, addresses and routes alone, not for IPv6's own link
   information (`RTNLGRP_IPV6_IFINFO`), neighbours, netconf or the other
   groups, nor to a socket in another namespace (`NETLINK_LISTEN_ALL_NSID`
-  is not supported); IPv4's broadcast routes go without one when `lo`
+  is not supported); IPv4's routes through `lo` go without one when it
   goes down, as on Linux. `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the
   other options not listed in the features are `ENOPROTOOPT`. A link message carries a
   subset of Linux's attributes (no `IFLA_AF_SPEC`, `IFLA_MAP`, `IFLA_XDP`
@@ -336,8 +362,8 @@ verified.
   an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
   acts with the capability of the thread that opened it alone. The other namespaces keep nothing apart that
   paludarium has, but for the System V shared memory, semaphores and
-  message queues of an IPC namespace: there are no POSIX message queues
-  for one, no `mount` for a mount namespace (whose mounts keep their IDs
+  message queues and the POSIX message queues of an IPC namespace: there is
+  no `mount` for a mount namespace (whose mounts keep their IDs
   in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new
   ones), no `/proc/self/cgroup` for a cgroup namespace, and no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the

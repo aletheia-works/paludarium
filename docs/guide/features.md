@@ -234,7 +234,7 @@ kernel.
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
 - An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
-  reading and writing it, `lseek`, `flock`, `getdents64`, `sendfile`,
+  reading and writing it, `lseek`, `flock`, `getdents`, `getdents64`, `sendfile`,
   `copy_file_range`, `fsync`, `fdatasync`, `syncfs`, `sync_file_range`,
   `fadvise64`, `readahead`, `ftruncate`,
   `fallocate`, `mmap`, `ioctl`, the `f*xattr` calls, `epoll_ctl` (as the

@@ -210,7 +210,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
   除いて `O_LARGEFILE` がありません。
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
-  読み書き、`lseek`、`flock`、`getdents64`、`sendfile`、`copy_file_range`、`fsync`、
+  読み書き、`lseek`、`flock`、`getdents`、`getdents64`、`sendfile`、`copy_file_range`、`fsync`、
   `fdatasync`、`syncfs`、`sync_file_range`、`fadvise64`、`readahead`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
   呼び出し、`epoll_ctl`（epoll のディスクリプタとしても対象としても）、`epoll_wait`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、

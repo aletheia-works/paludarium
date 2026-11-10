@@ -60,7 +60,10 @@ instructions that follow each other in memory from its address, up to a `jmp`,
 branch does not end a block. The interpreter looks up a block only when the
 next instruction is not the next one of the current block: after a branch, a
 system call or a fault, at the end of the block, or when the code generation
-has moved on. Falling through from one instruction to the next needs no lookup.
+has moved on. Falling through from one instruction to the next needs no lookup. With
+the WebAssembly JIT the loop walks the blocks in the same way, and offers each
+instruction to the JIT before running it, unless the JIT has turned that
+instruction down while its block has been cached.
 
 The code generation is a counter of the address space. It moves on when the
 mappings change (`mmap`, `munmap`, `mprotect`, `mremap`, `brk`, `shmat`,

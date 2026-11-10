@@ -126,9 +126,9 @@ static int case_calls(void) {
     long onlydir = e(inotify_add_watch(fd, file, IN_ATTRIB | IN_ONLYDIR));
     long empty = e(inotify_add_watch(fd, "", IN_ATTRIB));
     long slash = e(inotify_add_watch(fd, at("f/"), IN_ATTRIB));
-    long high = e(syscall(SYS_inotify_add_watch, 0x100000000L | fd, file, 0x100000000L | IN_ATTRIB));
+    long high_bits = e(syscall(SYS_inotify_add_watch, 0x100000000L | fd, file, 0x100000000L | IN_ATTRIB));
     printf("add fault=%ld missing=%ld onlydir=%ld empty=%ld slash=%ld high=%ld\n", fault, missing,
-           onlydir, empty, slash, high);
+           onlydir, empty, slash, high_bits);
     /* The file has the watch the call with the high bits made. */
     long wd_file = inotify_add_watch(fd, file, IN_ATTRIB);
     long through_link = inotify_add_watch(fd, sym, IN_ATTRIB);

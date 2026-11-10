@@ -203,8 +203,8 @@ kernel.
   Linux's order: `epoll_pwait2` reads its timeout (a `struct timespec`, none
   waiting for ever; `EFAULT`, then `EINVAL` for one Linux refuses, while a
   huge one saturates), the signal mask is set (`EINVAL` for a size other
-  than 8), then `maxevents` is checked (`EINVAL`) before the descriptor
-  (`EBADF`, `EINVAL` for one that is not an epoll).
+  than 8), then the descriptor is checked (`EBADF`), then `maxevents`
+  (`EINVAL`), and last that it is an epoll (`EINVAL`).
 - `poll` waits like `epoll_wait`: until a descriptor is ready, the timeout
   in milliseconds passes (a negative one never does) or a signal arrives
   (`EINTR`). The host's standard input is readable only with bytes to read

@@ -4020,8 +4020,8 @@ mod vectored_flags {
         // No timeout waits for ever; one is ready.
         assert_eq!(f.ret(441, &[epoll, events, 4, 0, 0, 0]), 1);
         assert_eq!(f.mem.read_u64(GuestAddr(events + 4)).unwrap(), 77);
-        // The timeout comes first, then the mask, then maxevents and the
-        // descriptor.
+        // The timeout comes first, then the mask, then the descriptor and
+        // maxevents.
         assert_eq!(f.ret(441, &[99, events, 0, 8, 0, 0]), errno(Errno::EFAULT));
         f.mem
             .write_u64(GuestAddr(timeout + 8), 1_000_000_000)
@@ -4043,14 +4043,16 @@ mod vectored_flags {
         );
         assert_eq!(
             f.ret(441, &[99, events, 0, timeout, 0, 0]),
-            errno(Errno::EINVAL)
-        );
-        assert_eq!(
-            f.ret(441, &[99, events, 1, timeout, 0, 0]),
             errno(Errno::EBADF)
         );
-        // epoll_wait and epoll_pwait check maxevents before the descriptor too.
-        assert_eq!(f.ret(232, &[99, events, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(
+            f.ret(441, &[epoll, events, 0, timeout, 0, 0]),
+            errno(Errno::EINVAL)
+        );
+        // epoll_wait and epoll_pwait check the descriptor before maxevents,
+        // after the mask; a file that is no epoll is EINVAL after maxevents.
+        assert_eq!(f.ret(232, &[99, events, 0, 0]), errno(Errno::EBADF));
+        assert_eq!(f.ret(232, &[counter, events, 1, 0]), errno(Errno::EINVAL));
         assert_eq!(
             f.ret(281, &[99, events, 1, 0, event, 4]),
             errno(Errno::EINVAL)

@@ -181,8 +181,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `epoll_wait`・`epoll_pwait`・`epoll_pwait2` は、Linux と同じ順番で引数を確かめます。
   `epoll_pwait2` はまずタイムアウト（`struct timespec`。なければいつまでも待ちます）を読み
   （`EFAULT`）、Linux が受け付けない値なら `EINVAL` を返し、大きすぎる値は上限で止めます。次に
-  シグナルマスクを設定し（大きさが 8 でなければ `EINVAL`）、`maxevents`（`EINVAL`）、記述子
-  （`EBADF`、epoll でなければ `EINVAL`）の順に確かめます。
+  シグナルマスクを設定し（大きさが 8 でなければ `EINVAL`）、記述子（`EBADF`）、`maxevents`
+  （`EINVAL`）、epoll であること（`EINVAL`）の順に確かめます。
 - `poll` は `epoll_wait` と同じように、どれかの記述子が準備できるか、ミリ秒の
   タイムアウトが過ぎるか（負の値なら過ぎません）、シグナルが届くまで（`EINTR`）待ちます。
   ホストの標準入力は、Linux の端末やパイプと同じく、読むバイトがあるときか、入力が

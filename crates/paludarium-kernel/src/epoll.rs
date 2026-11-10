@@ -301,8 +301,9 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             return Ok(0);
         }
         // Linux's order: epoll_pwait2 reads and checks its timeout, the
-        // signal mask is set, then maxevents and the descriptor are checked
-        // (`do_epoll_pwait`, `do_epoll_wait`). The deadline is taken at entry.
+        // signal mask is set, then the descriptor (EBADF) and maxevents are
+        // checked, and last that it is an epoll (`do_epoll_pwait`,
+        // `do_epoll_wait`, `ep_check_params`). The deadline is taken at entry.
         let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
         let deadline = if number == 441 {
             if a[3] == 0 {
@@ -332,14 +333,14 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 & !((1 << 8) | (1 << 18));
         }
         let result = (|| {
-            let max = a[2] as i32;
-            if max <= 0 || max > i32::MAX / 12 {
-                return Err(Errno::EINVAL);
-            }
             // The epoll descriptor too, as `fdget` takes it (EBADF for `O_PATH`).
             let d = c.files.descriptor(a[0])?;
             if d.file.flags() & O_PATH != 0 {
                 return Err(Errno::EBADF);
+            }
+            let max = a[2] as i32;
+            if max <= 0 || max > i32::MAX / 12 {
+                return Err(Errno::EINVAL);
             }
             let epoll = d
                 .file

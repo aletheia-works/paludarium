@@ -5277,7 +5277,7 @@ static int vector_flags_case(void) {
            vf_errno(syscall(441, 99L, out, 1L, &zero, &mask, 4L)),
            vf_errno(syscall(441, 99L, out, 0L, &zero, NULL, 0L)),
            vf_errno(syscall(441, 99L, out, 1L, &zero, NULL, 0L)));
-    printf("epoll_wait max-before-fd=%ld epoll_pwait=%ld\n",
+    printf("epoll_wait fd-before-max=%ld epoll_pwait=%ld\n",
            vf_errno(syscall(SYS_epoll_wait, 99L, out, 0L, 0L)),
            vf_errno(syscall(SYS_epoll_pwait, 99L, out, 1L, 0L, &mask, 4L)));
     return 0;

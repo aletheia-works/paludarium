@@ -122,9 +122,10 @@ mod native {
             );
             let Some(code) = code else {
                 s.failures.fetch_add(1, Ordering::Relaxed);
+                let _ = block.code.set(None);
                 return;
             };
-            let _ = block.code.set(code);
+            let _ = block.code.set(Some(code));
             let blocks = s.blocks.fetch_add(1, Ordering::Relaxed) + 1;
             s.instructions
                 .fetch_add(forms.len() as u64, Ordering::Relaxed);
@@ -235,6 +236,10 @@ mod native {
             let block = {
                 let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
                 if let Some(block) = kept.get(forms) {
+                    // Forms that failed to compile are turned down again.
+                    if matches!(block.code.get(), Some(None)) {
+                        return None;
+                    }
                     self.machine
                         .statistics
                         .reused
@@ -254,28 +259,30 @@ mod native {
             match &self.queue {
                 Some(queue) => {
                     if !self.send(queue, (forms.to_vec(), block.clone())) {
+                        let _ = block.code.set(None);
                         return None;
                     }
                 }
                 None => {
                     self.machine.fill(forms, &block);
-                    block.code.get()?;
+                    block.code.get()?.as_ref()?;
                 }
             }
             Some(block)
         }
     }
 
-    /// A block's code, once it is compiled: until then, and when compiling
-    /// it failed, it runs nothing and the interpreter runs the block.
+    /// A block's code, once it is compiled (`None` when compiling failed):
+    /// until then, and after a failure, it runs nothing and the interpreter
+    /// runs the block.
     pub(crate) struct PendingBlock {
-        code: OnceLock<Code>,
+        code: OnceLock<Option<Code>>,
         len: usize,
     }
 
     impl CompiledBlock for PendingBlock {
         fn run(&self, state: &mut CpuState, mem: &AddressSpace, generation: u64) -> usize {
-            let Some(code) = self.code.get() else {
+            let Some(Some(code)) = self.code.get() else {
                 return 0;
             };
             let mut registers = [0; WORDS];

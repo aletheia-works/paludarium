@@ -1,5 +1,5 @@
 # Nightly checks:
-# fuzzing (fuzz-nightly.yml: thirteen targets for 600 seconds each with ASan and LSan) and the
+# fuzzing (fuzz-nightly.yml: fourteen targets for 600 seconds each with ASan and LSan) and the
 # full quality check (quality.yml: Linux, macOS and Windows, the four wasm environments
 # with the real Safari, JIT on/off agreement and the frozen performance measurement).
 # A failure opens an Issue to be fixed (a later failing night comments on it) and the

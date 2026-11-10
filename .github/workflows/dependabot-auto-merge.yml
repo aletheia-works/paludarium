@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   auto-merge:
-    uses: aletheia-works/.github/.github/workflows/dependabot-auto-merge.yml@0ab4b956b12760b3926ac8f768e04432404a5182 # v1.3.4
+    uses: aletheia-works/.github/.github/workflows/dependabot-auto-merge.yml@2d85c4ddca01b35127a16915f0000bc54fdc85a6 # v1.4.0
     # The bot sets up the merge so that it starts main's push workflows.
     # Only a Dependabot secret reaches a run that Dependabot starts.
     secrets:

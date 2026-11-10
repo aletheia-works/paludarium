@@ -1357,9 +1357,11 @@ kernel.
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one
   out after setting it, so an old value it cannot write gives `EFAULT` with
-  the timer set. A value of 0 disarms it and drops its interval, and one past
-  Linux's `KTIME_MAX` is clamped to it. `getitimer` gives the time left in microseconds, cut down,
-  and at least 1 µs while the timer is armed. `alarm` sets it to whole
+  the timer set. A value of 0 disarms it and drops its interval, and one
+  past Linux's `KTIME_MAX` is clamped to it. `getitimer` gives the time left
+  in microseconds, cut down, as Linux's `itimer_get_remtime`: an armed timer
+  whose time is up shows 1 µs, and one with less than 1 µs left shows 0.
+  `alarm` sets it to whole
   seconds with no interval and returns the seconds that were left, rounded to
   the nearest and at least 1 while it was armed, as Linux's
   `alarm_setitimer`.

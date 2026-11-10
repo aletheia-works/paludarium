@@ -644,7 +644,8 @@ fn swap_real_timer(c: &mut Context<'_>, new: Option<(u64, u64)>) -> Result<(u64,
     let old = c.group.swap_timer(c.process, now, timer);
     Ok((
         old.interval,
-        // An armed timer has at least 1 µs left, as Linux's.
+        // An armed timer whose time is up has 1 µs left, as Linux's
+        // `itimer_get_remtime`; less than 1 µs left is cut down to 0 later.
         old.deadline
             .map_or(0, |deadline| match deadline.saturating_sub(now) {
                 0 => 1000,

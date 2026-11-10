@@ -304,10 +304,18 @@ verified.
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`
   (`EPROTONOSUPPORT` for `NETLINK_GENERIC` and the rest), and of it only
   the link, address and route requests: neighbours, rules, queueing
-  disciplines and the rest are `EOPNOTSUPP`, as are adding or removing a
-  route, an input route lookup (`RTA_IIF`, as `ip route get ... iif`
-  sends), a non-dump `RTM_GETADDR`, renaming `lo` and setting any other
-  attribute of it. An address is always permanent: lifetimes
+  disciplines and the rest are `EOPNOTSUPP`, as are an input route
+  lookup (`RTA_IIF`, as `ip route get ... iif` sends), a non-dump
+  `RTM_GETADDR`, renaming `lo` and setting any other attribute of it. A
+  route goes through `lo` or rejects: IPv6 gateways, multipath routes,
+  metrics (`RTA_METRICS`, as `ip route add ... mtu` sends), encapsulations,
+  nexthop objects, realms, expiries, source prefixes, router preferences
+  and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
+  `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
+  reaches a table but the local, main and default ones. In a new network
+  namespace a connection or datagram to an address no local route has is
+  still `ENETUNREACH`, whatever route takes it, where Linux's goes out
+  through `lo` and is dropped, or fails with a rejecting route's error. An address is always permanent: lifetimes
   (`IFA_CACHEINFO`) and `IFA_RT_PRIORITY` are not kept, a peer address is
   not a point-to-point one, and an IPv6 address is never tentative, where
   Linux's is until its duplicate address detection work, which ends at
@@ -323,7 +331,7 @@ verified.
   out for the link, addresses and routes alone, not for IPv6's own link
   information (`RTNLGRP_IPV6_IFINFO`), neighbours, netconf or the other
   groups, nor to a socket in another namespace (`NETLINK_LISTEN_ALL_NSID`
-  is not supported); IPv4's broadcast routes go without one when `lo`
+  is not supported); IPv4's routes through `lo` go without one when it
   goes down, as on Linux. `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the
   other options not listed in the features are `ENOPROTOOPT`. A link message carries a
   subset of Linux's attributes (no `IFLA_AF_SPEC`, `IFLA_MAP`, `IFLA_XDP`

@@ -76,6 +76,8 @@ const RTA_IIF: u16 = 3;
 const RTA_UID: u16 = 25;
 /// `RTM_F_FIB_MATCH`: a lookup answers with the table's entry.
 const RTM_F_FIB_MATCH: u32 = 0x2000;
+/// `RTM_F_LOOKUP_TABLE`: a lookup's answer names the table it came from.
+const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
 /// The flags of a lookup's answer: `RTM_F_CLONED`, with `RTCF_LOCAL`, and
 /// `RTCF_BROADCAST` for the broadcast address.
 const RTM_F_CLONED: u32 = 0x200;
@@ -83,21 +85,28 @@ const RTCF_LOCAL: u32 = 0x8000_0000;
 const RTCF_BROADCAST: u32 = 0x1000_0000;
 /// The main table, which with no policy rules Linux merges the local one
 /// into for lookups (`fib_unmerge`).
-const RT_TABLE_MAIN: u8 = 254;
 const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_METRICS: u16 = 8;
+const RTA_MULTIPATH: u16 = 9;
+const RTA_FLOW: u16 = 11;
+const RTA_VIA: u16 = 18;
+const RTA_ENCAP: u16 = 22;
+const RTA_EXPIRES: u16 = 23;
+const RTA_NH_ID: u16 = 30;
+/// `RTNH_F_ONLINK`.
+const RTNH_F_ONLINK: u32 = 4;
+/// A table past 255, as an `rtmsg` names it.
+const RT_TABLE_COMPAT: u8 = 252;
+/// The last route kind (`RTN_MAX`).
+const RTN_MAX: u8 = 11;
 const RTA_PRIORITY: u16 = 6;
 const RTA_PREFSRC: u16 = 7;
 const RTA_CACHEINFO: u16 = 12;
 const RTA_TABLE: u16 = 15;
 const RTA_PREF: u16 = 20;
 /// The local routing table, the kernel's routes and their types.
-const RT_TABLE_LOCAL: u8 = 255;
-const RTPROT_KERNEL: u8 = 2;
 const RT_SCOPE_UNIVERSE: u8 = 0;
-const RT_SCOPE_LINK: u8 = 253;
-const RTN_UNICAST: u8 = 1;
-const RTN_LOCAL: u8 = 2;
-const RTN_BROADCAST: u8 = 3;
 /// `struct rta_cacheinfo`: eight `__u32`s.
 const RTA_CACHEINFO_LEN: usize = 32;
 /// The last message type `rtnetlink_rcv_msg` takes (`RTM_MAX`).
@@ -139,7 +148,6 @@ const IFA_BROADCAST: u16 = 4;
 const IFA_CACHEINFO: u16 = 6;
 const IFA_FLAGS: u16 = 8;
 const IFA_PROTO: u16 = 11;
-const RT_SCOPE_HOST: u8 = 254;
 const ARPHRD_LOOPBACK: u16 = 772;
 const IFF_UP: u32 = 0x1;
 const IFF_LOOPBACK: u32 = 0x8;
@@ -637,9 +645,21 @@ impl NetlinkSocket {
             RTM_NEWADDR | RTM_DELADDR if matches!(family, AF_INET | AF_INET6) => {
                 let events = change_address(&self.network, header, payload)?;
                 let echo = header.flags & NLM_F_ECHO != 0;
-                let told = told(events, header.seq, port, echo);
+                let told = told(events, header.seq, port, echo, false);
                 if echo {
                     // `nlmsg_notify`'s own copy of an IPv4 address's.
+                    for notice in told.iter().filter(|n| n.origin == port && port != 0) {
+                        self.deliver(s, 0, 0, notice.bytes.clone());
+                    }
+                }
+                notices.extend(told);
+                Ok(false)
+            }
+            RTM_NEWROUTE | RTM_DELROUTE if matches!(family, AF_INET | AF_INET6) => {
+                let events = change_route(&self.network, header, payload)?;
+                let echo = header.flags & NLM_F_ECHO != 0;
+                let told = told(events, header.seq, port, echo, true);
+                if echo {
                     for notice in told.iter().filter(|n| n.origin == port && port != 0) {
                         self.deliver(s, 0, 0, notice.bytes.clone());
                     }
@@ -1131,7 +1151,7 @@ fn change_address(
         if !add {
             return network
                 .addresses()
-                .del_v4(local, address, prefix, label.as_deref(), up);
+                .del_v4(local, address, prefix, label.as_deref());
         }
         let local = local.unwrap_or(Ipv4Addr::UNSPECIFIED);
         let mut new = crate::interface::V4::new(local, address.unwrap_or(local), prefix, scope);
@@ -1166,21 +1186,9 @@ fn change_address(
     new.proto = proto;
     network.addresses().add_v6(new, replace, up)
 }
-/// An `rtmsg` of the local table, the kernel's, for `family`, `dst_len`,
-/// `scope` and `kind`.
-fn route_header(family: u8, dst_len: u8, scope: u8, kind: u8) -> Vec<u8> {
-    let mut body = vec![
-        family,
-        dst_len,
-        0,
-        0,
-        RT_TABLE_LOCAL,
-        RTPROT_KERNEL,
-        scope,
-        kind,
-    ];
-    body.extend_from_slice(&0u32.to_le_bytes());
-    body
+/// A table as an `rtmsg` holds it: one past 255 is `RT_TABLE_COMPAT`.
+fn table_byte(table: u32) -> u8 {
+    u8::try_from(table).unwrap_or(RT_TABLE_COMPAT)
 }
 /// `struct rta_cacheinfo` of a looked-up route, whose one reference is the
 /// lookup's; Linux's counts more where other sockets use it.
@@ -1189,75 +1197,74 @@ fn lookup_cacheinfo() -> [u8; RTA_CACHEINFO_LEN] {
     raw[0] = 1;
     raw
 }
-/// The `rtmsg` type of a route.
-fn route_type(kind: crate::interface::Kind) -> u8 {
-    match kind {
-        crate::interface::Kind::Unicast => RTN_UNICAST,
-        crate::interface::Kind::Local => RTN_LOCAL,
-        crate::interface::Kind::Broadcast => RTN_BROADCAST,
-    }
-}
-/// An IPv4 route of the local table, as `fib_dump_info` gives it, in
-/// `table` (the local one in a dump, the main one, which Linux merges it
-/// into, for `RTM_F_FIB_MATCH`), with `flags`.
-fn ipv4_route(
-    route: crate::interface::Route4,
-    table: u8,
-    seq: u32,
-    port: u32,
-    flags: u16,
-) -> Vec<u8> {
-    ipv4_route_of(RTM_NEWROUTE, route, table, seq, port, flags)
-}
-/// [`ipv4_route`] as a message of `kind`.
+/// An IPv4 route as `fib_dump_info` gives it, as a message of `kind` with
+/// `flags`, named in `table`: its own, or the main one a lookup names.
 fn ipv4_route_of(
     kind: u16,
-    route: crate::interface::Route4,
-    table: u8,
+    route: &crate::interface::Route4,
+    table: u32,
     seq: u32,
     port: u32,
     flags: u16,
 ) -> Vec<u8> {
-    let scope = if route.kind == crate::interface::Kind::Broadcast {
-        RT_SCOPE_LINK
-    } else {
-        RT_SCOPE_HOST
-    };
-    let mut body = route_header(AF_INET, route.len, scope, route_type(route.kind));
-    body[4] = table;
-    attribute(&mut body, RTA_TABLE, &u32::from(table).to_le_bytes());
-    attribute(&mut body, RTA_DST, &route.dst.octets());
-    attribute(&mut body, RTA_PREFSRC, &route.source.octets());
-    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    let mut body = vec![
+        AF_INET,
+        route.len,
+        0,
+        route.tos,
+        table_byte(table),
+        route.proto,
+        route.scope,
+        route.kind.code(),
+    ];
+    let nexthop: u32 = if route.onlink { RTNH_F_ONLINK } else { 0 };
+    body.extend_from_slice(&nexthop.to_le_bytes());
+    attribute(&mut body, RTA_TABLE, &table.to_le_bytes());
+    if route.len != 0 {
+        attribute(&mut body, RTA_DST, &route.dst.octets());
+    }
+    if route.priority != 0 {
+        attribute(&mut body, RTA_PRIORITY, &route.priority.to_le_bytes());
+    }
+    if let Some(source) = route.prefsrc {
+        attribute(&mut body, RTA_PREFSRC, &source.octets());
+    }
+    if let Some(gateway) = route.gateway {
+        attribute(&mut body, RTA_GATEWAY, &gateway.octets());
+    }
+    if route.device {
+        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    }
     message(kind, flags, seq, port, &body)
 }
-/// An IPv6 route, as `rt6_fill_node` gives it (with an empty
-/// `rta_cacheinfo`): a local one of the local table, metric 0, or a
-/// prefix route of the main table, metric 256.
-fn ipv6_route(route: crate::interface::Route6, seq: u32, port: u32, flags: u16) -> Vec<u8> {
-    ipv6_route_of(RTM_NEWROUTE, route, seq, port, flags)
-}
-/// [`ipv6_route`] as a message of `kind`.
+/// An IPv6 route as `rt6_fill_node` gives it (with an empty
+/// `rta_cacheinfo`), as a message of `kind` with `flags`.
 fn ipv6_route_of(
     kind: u16,
-    route: crate::interface::Route6,
+    route: &crate::interface::Route6,
     seq: u32,
     port: u32,
     flags: u16,
 ) -> Vec<u8> {
-    let local = route.kind == crate::interface::Kind::Local;
-    let table = if local { RT_TABLE_LOCAL } else { RT_TABLE_MAIN };
-    let mut body = route_header(
+    let mut body = vec![
         AF_INET6,
         route.len,
+        0,
+        0,
+        table_byte(route.table),
+        route.proto,
         RT_SCOPE_UNIVERSE,
-        route_type(route.kind),
-    );
-    body[4] = table;
-    attribute(&mut body, RTA_TABLE, &u32::from(table).to_le_bytes());
-    attribute(&mut body, RTA_DST, &route.dst.octets());
-    let metric: u32 = if local { 0 } else { 256 };
-    attribute(&mut body, RTA_PRIORITY, &metric.to_le_bytes());
+        route.kind.code(),
+    ];
+    body.extend_from_slice(&0u32.to_le_bytes());
+    attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
+    if route.len != 0 {
+        attribute(&mut body, RTA_DST, &route.dst.octets());
+    }
+    if let Some(source) = route.prefsrc {
+        attribute(&mut body, RTA_PREFSRC, &source.octets());
+    }
+    attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
     attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &[0; RTA_CACHEINFO_LEN]);
     attribute(&mut body, RTA_PREF, &[0]);
@@ -1265,19 +1272,22 @@ fn ipv6_route_of(
 }
 /// A route lookup (`RTM_GETROUTE` without a dump), as `inet_rtm_getroute`
 /// and `inet6_rtm_getroute` answer one for the destination `RTA_DST` names
-/// (none is `0.0.0.0` or `::`), by the longest route the loopback's
-/// addresses have ([`crate::interface::Addresses`]): `EINVAL` for a
-/// request shorter than an `rtmsg`; a destination shorter than its
+/// (none is `0.0.0.0` or `::`), by the routing tables
+/// ([`crate::interface::Addresses::lookup4`] and `lookup6`): `EINVAL` for
+/// a request shorter than an `rtmsg`; a destination shorter than its
 /// family's address is `ERANGE` for IPv4 and `EINVAL` for IPv6, as their
 /// attribute policies give, and a longer one counts as its first bytes;
 /// `EOPNOTSUPP` for an input route (`RTA_IIF`), which is not supported;
-/// `ENETUNREACH` where no route goes, and for IPv6 while `lo` is down.
-/// `0.0.0.0` goes to the loopback from `127.0.0.1`. An `RTA_UID` it names
-/// (`ERANGE` when shorter than 4 bytes, for either family, as both
-/// policies take a `u32`) is the one an IPv4 answer gives, as it is;
-/// `RTA_SRC`, `RTA_OIF` and the other selectors are not looked at. With
-/// `RTM_F_FIB_MATCH` the answer is the table's entry that matched, and
-/// `EHOSTUNREACH` for `0.0.0.0`, which no entry is.
+/// a rejecting route's error, `ENETUNREACH` where no route goes, and for
+/// IPv6 while `lo` is down. `0.0.0.0` goes to the loopback from
+/// `127.0.0.1`. An `RTA_UID` it names (`ERANGE` when shorter than 4
+/// bytes, for either family, as both policies take a `u32`) is the one an
+/// IPv4 answer gives, as it is; `RTA_SRC`, `RTA_OIF` and the other
+/// selectors are not looked at. An IPv4 answer names the main table but
+/// with `RTM_F_LOOKUP_TABLE`, the table it came from (the main one for the
+/// local one, whose trie it shares). With `RTM_F_FIB_MATCH` the answer is
+/// the table's entry that matched, and `EHOSTUNREACH` for `0.0.0.0`, which
+/// no entry is.
 fn lookup(
     network: &Network,
     payload: &[u8],
@@ -1285,7 +1295,7 @@ fn lookup(
     port: u32,
     uid: u32,
 ) -> Result<Vec<u8>, Errno> {
-    use crate::interface::Kind;
+    use crate::interface::{Kind, TABLE_LOCAL, TABLE_MAIN};
     use core::net::{Ipv4Addr, Ipv6Addr};
     if payload.len() < 12 {
         return Err(Errno::EINVAL);
@@ -1303,34 +1313,44 @@ fn lookup(
         }
     }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
-    let up = network.is_up();
+    let addresses = network.addresses();
     if family == AF_INET6 {
         let mut address = [0u8; 16];
         if let Some(value) = dst {
             address = *value.first_chunk().ok_or(Errno::EINVAL)?;
         }
         let ip = Ipv6Addr::from(address);
-        let (route, source) = network
-            .addresses()
-            .lookup6(ip)
-            .filter(|_| up)
-            .ok_or(ENETUNREACH)?;
+        if !network.is_up() {
+            return Err(ENETUNREACH);
+        }
+        let route = addresses.lookup6(ip)?;
         if fib_match {
-            return Ok(ipv6_route(route, seq, port, 0));
+            return Ok(ipv6_route_of(RTM_NEWROUTE, &route, seq, port, 0));
         }
         // `rt6_fill_node` of the route the lookup made, with the request's
-        // source, unspecified.
-        let local = route.kind == Kind::Local;
-        let table = if local { RT_TABLE_LOCAL } else { RT_TABLE_MAIN };
-        let mut body = route_header(AF_INET6, 128, RT_SCOPE_UNIVERSE, route_type(route.kind));
-        body[2] = 128;
-        body[4] = table;
-        attribute(&mut body, RTA_TABLE, &u32::from(table).to_le_bytes());
+        // source, unspecified, and the source it leaves from, then the
+        // route's own preferred source again.
+        let mut body = vec![
+            AF_INET6,
+            128,
+            128,
+            0,
+            table_byte(route.table),
+            route.proto,
+            RT_SCOPE_UNIVERSE,
+            route.kind.code(),
+        ];
+        body.extend_from_slice(&0u32.to_le_bytes());
+        attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
         attribute(&mut body, RTA_DST, &address);
         attribute(&mut body, RTA_SRC, &[0; 16]);
-        attribute(&mut body, RTA_PREFSRC, &source.octets());
-        let metric: u32 = if local { 0 } else { 256 };
-        attribute(&mut body, RTA_PRIORITY, &metric.to_le_bytes());
+        if let Some(source) = addresses.source6(&route, ip) {
+            attribute(&mut body, RTA_PREFSRC, &source.octets());
+        }
+        if let Some(source) = route.prefsrc {
+            attribute(&mut body, RTA_PREFSRC, &source.octets());
+        }
+        attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
         attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
         attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
         attribute(&mut body, RTA_PREF, &[0]);
@@ -1341,19 +1361,26 @@ fn lookup(
         address = *value.first_chunk().ok_or(ERANGE)?;
     }
     let ip = Ipv4Addr::from(address);
-    let (kind, source) = if ip.is_unspecified() {
+    let (kind, source, gateway, table) = if ip.is_unspecified() {
         if fib_match {
             return Err(EHOSTUNREACH);
         }
-        (Kind::Local, Ipv4Addr::LOCALHOST)
+        (Kind::Local, Some(Ipv4Addr::LOCALHOST), None, TABLE_MAIN)
     } else {
-        let route = network.addresses().lookup4(ip, up).ok_or(ENETUNREACH)?;
+        let route = addresses.lookup4(ip)?;
+        let table = if request_flags & RTM_F_LOOKUP_TABLE == 0 || route.table == TABLE_LOCAL {
+            TABLE_MAIN
+        } else {
+            route.table
+        };
         if fib_match {
-            return Ok(ipv4_route(route, RT_TABLE_MAIN, seq, port, 0));
+            return Ok(ipv4_route_of(RTM_NEWROUTE, &route, table, seq, port, 0));
         }
-        (route.kind, route.source)
+        let gateway = route.gateway.filter(|_| route.uses_gateway);
+        (route.kind, addresses.source4(&route, ip), gateway, table)
     };
-    // `rt_fill_info` of the cached route the lookup made.
+    // `rt_fill_info` of the cached route the lookup made, which is local as
+    // it goes through `lo`.
     let flags = if kind == Kind::Broadcast {
         RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST
     } else {
@@ -1364,20 +1391,21 @@ fn lookup(
         32,
         0,
         0,
-        RT_TABLE_MAIN,
+        table_byte(table),
         0,
         RT_SCOPE_UNIVERSE,
-        route_type(kind),
+        kind.code(),
     ];
     body.extend_from_slice(&flags.to_le_bytes());
-    attribute(
-        &mut body,
-        RTA_TABLE,
-        &u32::from(RT_TABLE_MAIN).to_le_bytes(),
-    );
+    attribute(&mut body, RTA_TABLE, &table.to_le_bytes());
     attribute(&mut body, RTA_DST, &address);
     attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
-    attribute(&mut body, RTA_PREFSRC, &source.octets());
+    if let Some(source) = source {
+        attribute(&mut body, RTA_PREFSRC, &source.octets());
+    }
+    if let Some(gateway) = gateway {
+        attribute(&mut body, RTA_GATEWAY, &gateway.octets());
+    }
     // An invalid user ID (-1) is left out (`uid_valid`).
     let uid = asked_uid.unwrap_or(uid);
     if uid != u32::MAX {
@@ -1386,23 +1414,156 @@ fn lookup(
     attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
     Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
 }
-/// The IPv4 routes of the local table `fib_add_ifaddr` gives `lo`'s
-/// addresses, as `fib_dump_info` gives them; the main table has none.
+/// The IPv4 routes of every table, as `fib_dump_info` gives them.
 fn ipv4_routes(network: &Network, seq: u32, port: u32) -> Vec<u8> {
-    let routes = network.addresses().routes4(network.is_up());
+    let routes = network.addresses().dump4();
     routes
-        .into_iter()
-        .flat_map(|route| ipv4_route(route, RT_TABLE_LOCAL, seq, port, NLM_F_MULTI))
+        .iter()
+        .flat_map(|r| ipv4_route_of(RTM_NEWROUTE, r, r.table, seq, port, NLM_F_MULTI))
         .collect()
 }
-/// The IPv6 routes of `lo`'s addresses: the main table's prefix routes,
-/// then the local table's.
+/// The IPv6 routes of every table, as `rt6_fill_node` gives them.
 fn ipv6_routes(network: &Network, seq: u32, port: u32) -> Vec<u8> {
-    let routes = network.addresses().routes6();
+    let routes = network.addresses().dump6();
     routes
-        .into_iter()
-        .flat_map(|route| ipv6_route(route, seq, port, NLM_F_MULTI))
+        .iter()
+        .flat_map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, NLM_F_MULTI))
         .collect()
+}
+/// An `RTM_NEWROUTE` or `RTM_DELROUTE` request, as `inet_rtm_newroute`,
+/// `inet_rtm_delroute`, `inet6_rtm_newroute` and `inet6_rtm_delroute`
+/// take it ([`crate::interface::Addresses::add_route4`] and the others):
+/// `EINVAL` for one shorter than an `rtmsg`; an attribute shorter than its
+/// policy's is `ERANGE`, but an IPv6 destination shorter than its prefix,
+/// `EINVAL`; then `EINVAL` for a TOS with ECN bits (any for IPv6) or a
+/// kind past `RTN_MAX`. Multipath routes, metrics, encapsulations,
+/// nexthop objects, realms, expiries, IPv6 gateways, source prefixes and
+/// router preferences are `EOPNOTSUPP`. The table is the `rtmsg`'s, or the
+/// one `RTA_TABLE` names.
+fn change_route(
+    network: &Network,
+    header: &Header,
+    payload: &[u8],
+) -> Result<Vec<crate::interface::Event>, Errno> {
+    use crate::interface::{Ask4, Ask6, Select4};
+    use core::net::{Ipv4Addr, Ipv6Addr};
+    if payload.len() < 12 {
+        return Err(Errno::EINVAL);
+    }
+    let (family, dst_len, src_len, tos) = (payload[0], payload[1], payload[2], payload[3]);
+    let (proto, scope, kind) = (payload[5], payload[6], payload[7]);
+    let flags = u32::from_le_bytes(payload[8..12].try_into().unwrap_or_default());
+    let v6 = family == AF_INET6;
+    let size = if v6 { 16 } else { 4 };
+    let mut table = u32::from(payload[4]);
+    let mut dst = None;
+    let mut prefsrc = None;
+    let mut gateway = None;
+    let mut oif = 0;
+    let mut priority = 0;
+    let mut unsupported = src_len != 0 && v6;
+    let number = |value: &[u8]| -> Result<u32, Errno> {
+        Ok(u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?))
+    };
+    let address = |value: &[u8]| -> Result<Vec<u8>, Errno> {
+        value.get(..size).map(<[u8]>::to_vec).ok_or(ERANGE)
+    };
+    for (attr, value) in attributes(&payload[12..]) {
+        match attr {
+            RTA_DST if v6 => {
+                let bytes = usize::from(dst_len).div_ceil(8);
+                let mut raw = [0u8; 16];
+                raw[..bytes.min(16)]
+                    .copy_from_slice(value.get(..bytes.min(16)).ok_or(Errno::EINVAL)?);
+                if value.len() < bytes {
+                    return Err(Errno::EINVAL);
+                }
+                dst = Some(raw.to_vec());
+            }
+            RTA_DST => dst = Some(address(value)?),
+            RTA_PREFSRC => prefsrc = Some(address(value)?),
+            RTA_GATEWAY => {
+                let raw = address(value)?;
+                unsupported |= v6;
+                gateway = Some(raw);
+            }
+            RTA_OIF => oif = number(value)?,
+            RTA_PRIORITY => priority = number(value)?,
+            RTA_TABLE => table = number(value)?,
+            RTA_PREF if v6 => unsupported |= value.first().is_some_and(|&p| p == 1 || p == 3),
+            RTA_METRICS | RTA_MULTIPATH | RTA_FLOW | RTA_VIA | RTA_ENCAP | RTA_EXPIRES
+            | RTA_NH_ID => unsupported = true,
+            _ => {}
+        }
+    }
+    let add = header.kind == RTM_NEWROUTE;
+    if (v6 && tos != 0) || (!v6 && tos & 0x3 != 0) || (kind > RTN_MAX && (add || !v6)) {
+        return Err(Errno::EINVAL);
+    }
+    if unsupported {
+        return Err(EOPNOTSUPP);
+    }
+    let up = network.is_up();
+    let mut addresses = network.addresses();
+    if v6 {
+        let ip = |raw: Option<Vec<u8>>| {
+            raw.map(|r| Ipv6Addr::from(<[u8; 16]>::try_from(r).unwrap_or_default()))
+        };
+        let ask = Ask6 {
+            table,
+            dst: ip(dst).unwrap_or(Ipv6Addr::UNSPECIFIED),
+            len: dst_len,
+            kind,
+            proto,
+            metric: priority,
+            prefsrc: ip(prefsrc),
+            oif,
+            request: header.flags,
+        };
+        return if add {
+            addresses.add_route6(&ask, up)
+        } else {
+            addresses.del_route6(&ask)
+        };
+    }
+    let ip = |raw: Option<Vec<u8>>| {
+        raw.map(|r| Ipv4Addr::from(<[u8; 4]>::try_from(r).unwrap_or_default()))
+    };
+    let (dst, prefsrc) = (ip(dst).unwrap_or(Ipv4Addr::UNSPECIFIED), ip(prefsrc));
+    let gateway = ip(gateway).filter(|g| !g.is_unspecified());
+    if add {
+        return addresses.add_route4(
+            &Ask4 {
+                table,
+                dst,
+                len: dst_len,
+                tos,
+                priority,
+                kind,
+                proto,
+                scope,
+                prefsrc,
+                gateway,
+                oif,
+                flags,
+                request: header.flags,
+            },
+            up,
+        );
+    }
+    addresses.del_route4(&Select4 {
+        table,
+        dst,
+        len: dst_len,
+        tos,
+        priority,
+        kind,
+        proto,
+        scope,
+        prefsrc,
+        gateway,
+        oif,
+    })
 }
 /// A notification for the members of `group`, which goes to every one of
 /// them but the socket whose port is `origin` (`do_one_broadcast`): 0, so
@@ -1416,11 +1577,22 @@ pub(crate) struct Notice {
 /// The notifications of `events`, as `rtmsg_ifa`, `inet6_ifa_notify`,
 /// `rtmsg_fib` and `inet6_rt_notify` make them. An IPv4 address's carries
 /// the request's `seq` and `port`, and with `echo` (`NLM_F_ECHO`) goes to
-/// the requester alone of the members at `port`; the rest carry none.
-fn told(events: Vec<crate::interface::Event>, seq: u32, port: u32, echo: bool) -> Vec<Notice> {
-    let origin = if echo { port } else { 0 };
+/// the requester alone of the members at `port`; so does a route's of a
+/// route request (`routes`); the rest carry none.
+fn told(
+    events: Vec<crate::interface::Event>,
+    seq: u32,
+    port: u32,
+    echo: bool,
+    routes: bool,
+) -> Vec<Notice> {
     use crate::interface::Event;
-    const CREATED: u16 = NLM_F_CREATE | NLM_F_EXCL;
+    let origin = if echo { port } else { 0 };
+    let (route_seq, route_port, route_origin) = if routes {
+        (seq, port, origin)
+    } else {
+        (0, 0, 0)
+    };
     events
         .into_iter()
         .map(|event| {
@@ -1435,15 +1607,15 @@ fn told(events: Vec<crate::interface::Event>, seq: u32, port: u32, echo: bool) -
                     origin,
                     ipv4_address(&a, RTM_DELADDR, 0, seq, port),
                 ),
-                Event::NewRoute4(r) => (
+                Event::NewRoute4(r, flags) => (
                     RTNLGRP_IPV4_ROUTE,
-                    0,
-                    ipv4_route_of(RTM_NEWROUTE, r, RT_TABLE_LOCAL, 0, 0, CREATED),
+                    route_origin,
+                    ipv4_route_of(RTM_NEWROUTE, &r, r.table, route_seq, route_port, flags),
                 ),
                 Event::DelRoute4(r) => (
                     RTNLGRP_IPV4_ROUTE,
-                    0,
-                    ipv4_route_of(RTM_DELROUTE, r, RT_TABLE_LOCAL, 0, 0, 0),
+                    route_origin,
+                    ipv4_route_of(RTM_DELROUTE, &r, r.table, route_seq, route_port, 0),
                 ),
                 Event::NewAddr6(a, tentative) => (
                     RTNLGRP_IPV6_IFADDR,
@@ -1455,15 +1627,15 @@ fn told(events: Vec<crate::interface::Event>, seq: u32, port: u32, echo: bool) -
                     0,
                     ipv6_address(&a, false, RTM_DELADDR, 0, 0, 0),
                 ),
-                Event::NewRoute6(r) => (
+                Event::NewRoute6(r, flags) => (
                     RTNLGRP_IPV6_ROUTE,
-                    0,
-                    ipv6_route_of(RTM_NEWROUTE, r, 0, 0, CREATED),
+                    route_origin,
+                    ipv6_route_of(RTM_NEWROUTE, &r, route_seq, route_port, flags),
                 ),
                 Event::DelRoute6(r) => (
                     RTNLGRP_IPV6_ROUTE,
-                    0,
-                    ipv6_route_of(RTM_DELROUTE, r, 0, 0, 0),
+                    route_origin,
+                    ipv6_route_of(RTM_DELROUTE, &r, route_seq, route_port, 0),
                 ),
             };
             Notice {
@@ -1488,7 +1660,7 @@ fn link_change(network: &Network, up: bool) -> Vec<Notice> {
         origin: 0,
         bytes: link,
     }];
-    notices.extend(told(events, 0, 0, false));
+    notices.extend(told(events, 0, 0, false, false));
     notices
 }
 /// Brings `network`'s loopback up or down, as `SIOCSIFFLAGS` does, and
@@ -1817,6 +1989,12 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    const RT_TABLE_LOCAL: u8 = 255;
+    const RTPROT_KERNEL: u8 = 2;
+    const RT_SCOPE_LINK: u8 = 253;
+    const RT_SCOPE_HOST: u8 = 254;
+    const RTN_LOCAL: u8 = 2;
+    const RTN_BROADCAST: u8 = 3;
 
     #[test]
     fn messages_take_linux_layouts() {

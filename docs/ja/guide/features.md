@@ -812,7 +812,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
   `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。
   そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`（`ip addr add` と `del` も）、
-  `ip route`、`ip route get`、`ip link set lo up`、`ip monitor` が動きます。
+  `ip route`（`ip route add`、`del`、`replace`、`append` も）、`ip route get`、
+  `ip link set lo up`、`ip monitor` が動きます。
   - **ソケット:** Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが
     持つものは `EADDRINUSE`）を、0 ならプロセスの ID を、それが使われていれば負の ID を
     取ります。bind していないソケットは、`connect` か最初の送信で同じように bind されます。
@@ -844,29 +845,49 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `IFA_LOCAL`、`IFA_LABEL`、`IFA_ADDRESS` と接頭辞を持つ最初のものを消し（なければ
     `EADDRNOTAVAIL`）、プライマリならそのセカンダリも消します。`127.0.0.1` と `::1` も
     消せます。
-  - **経路:** アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付けるカーネルのものです。
-    IPv4 のアドレスには、初めからローカルの表に `local` の経路があります。接頭辞の経路は
-    （ループバックでは `local` です）、そのアドレスを持って `lo` が初めて上がったときに付き、
-    落ちても残ります。サブネットと `IFA_BROADCAST` の `broadcast` の経路は、上がっている
-    間だけです。IPv6 のアドレスには、ローカルの表に `local` の経路が、そのアドレスを
-    持って `lo` が初めて上がってからは、メインの表にメトリック 256 のユニキャストの接頭辞の
-    経路があります（`::1` にはありません）。`NLM_F_DUMP` を付けた `RTM_GETROUTE` には、
-    IPv4 のもの（宛先順）、IPv6 のもの（メインの表、ローカルの表の順）を返し、`AF_INET` か
-    `AF_INET6` だけを指せばそのファミリーのものを、マルチキャストの経路のファミリーには何も
-    返しません。ダンプでなければ、`inet_rtm_getroute` と `inet6_rtm_getroute` と同じく、
-    `RTA_DST` の指す宛先への経路を最も長い接頭辞で引きます。IPv4 のローカルか
-    ブロードキャストの経路は、その優先する送り元と呼び出し元の `RTA_UID`（リクエストが
-    指せばそのまま。-1 なら付けず、4 バイトより短ければ `ERANGE`）を持つ、メインの表の
-    経路として答えます。`0.0.0.0` は 127.0.0.1 からループバックへ向かいます。IPv6 は、
-    `lo` が上がっている間、アドレスならそのローカルな経路を、接頭辞の中のほかの宛先なら
-    そのアドレスからの接頭辞の経路を答えます。ほかの宛先は `ENETUNREACH`、`AF_UNSPEC` は
-    `EOPNOTSUPP` です。ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら
-    `EINVAL` です。`RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に
-    合う項目はないので `EHOSTUNREACH` です）。
-  - **ソケット:** ループバックのローカルな経路が持つアドレスはゲスト自身のものです。TCP や
-    UDP のソケットはそこへ bind でき、その経路の優先する送り元からループバックの上で
-    届きます。ループバックでは、IPv4 のアドレスはそのサブネット全体をローカルにし、IPv6 の
-    アドレスはそれ自身だけをローカルにします。IPv4 にまだ経路が 1 つもなければ、Linux の
+  - **経路:** ファミリーごとに、Linux の `fib_trie` と `ip6_fib` と同じく経路の表を
+    持ちます。IPv4 のローカルの表とメインの表は、ポリシーのルールがない間の Linux と同じく
+    1 つのトライを分け合います。アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付ける
+    カーネルのものです。IPv4 のアドレスには、初めからローカルの表に `local` の経路があり、
+    `lo` が上がると、接頭辞の経路（ループバックでは `local` で、落ちても残ります）、
+    サブネットの `broadcast` の経路、`IFA_BROADCAST` のものが付きます。IPv6 のアドレスには、
+    ローカルの表に `local` の経路が、そのアドレスを持って `lo` が初めて上がってからは、
+    メインの表にメトリック 256 のユニキャストの接頭辞の経路があります（`::1` には
+    ありません）。`RTM_NEWROUTE` は、`inet_rtm_newroute` と `inet6_rtm_newroute` と同じく、
+    `lo` を通る経路か、デバイスのない種類（`blackhole`、`unreachable`、`prohibit`、
+    `throw`）の経路を、どの表にも足します。メトリック、プロトコル、スコープ、TOS、
+    優先する送り元、IPv4 のゲートウェイ（オンリンクも）を持てます。`NLM_F_EXCL`、
+    `NLM_F_REPLACE`、`NLM_F_APPEND`、`NLM_F_CREATE` に従って Linux と同じ場所に置くか、
+    Linux と同じエラーで断ります（`EEXIST`、`ENOENT`。接頭辞、スコープ、種類、
+    ゲートウェイ、優先する送り元がおかしければ `EINVAL`、ほかのデバイスは `ENODEV`、
+    `lo` が落ちている間はホストのスコープの IPv4 の経路のほかは `ENETDOWN`）。
+    `RTM_DELROUTE` は、指したものに合う最初の経路を消します（なければ `ESRCH`）。
+    カーネルの経路も消せ、アドレスの変化や `lo` が上がったときに戻ります。`lo` を落とすと、
+    ホストのスコープのほかの、`lo` を通る IPv4 の経路と、IPv6 の経路がすべて消えます。
+    IPv4 のアドレスを消すと、そこを送り元とするメインの表の経路が消え、最後のアドレスを
+    消すと `lo` を通る経路がすべて消えます。IPv6 のアドレスを消すと、`cleanup_prefix_route`
+    と同じく、その接頭辞へのメインの表の最初の経路が、誰のものでも消えます。
+    `NLM_F_DUMP` を付けた `RTM_GETROUTE` には、Linux の表のハッシュの順に表ごとに、IPv4 の
+    ものはトライの順で、IPv6 のものは木をたどる順で経路を返します。`AF_INET` か `AF_INET6`
+    だけを指せばそのファミリーのものを、マルチキャストの経路のファミリーには何も返しません。
+    ダンプでなければ、`inet_rtm_getroute` と `inet6_rtm_getroute` と同じく、`RTA_DST` の
+    指す宛先への経路を引きます。IPv4 はローカルとメインの表の最も長い接頭辞で引き、
+    そこに経路がないか `throw` の経路に当たれば既定の表で引きます。IPv6 は、`lo` が
+    上がっている間、ローカルの表、メインの表の順に引きます。拒む経路に当たれば、その
+    エラー（`EINVAL`、`EHOSTUNREACH`、`EACCES`）を返します。IPv4 の答えは、メインの表
+    （`RTM_F_LOOKUP_TABLE` を付ければ、経路のあった表）、`fib_select_path` の選ぶ送り元、
+    オンリンクで届くゲートウェイ、呼び出し元の `RTA_UID`（リクエストが指せばそのまま。
+    -1 なら付けず、4 バイトより短ければ `ERANGE`）を持ちます。`0.0.0.0` は 127.0.0.1 から
+    ループバックへ向かいます。IPv6 の答えは、`ipv6_dev_get_saddr` の選ぶ送り元を
+    持ちます。経路がなければ `ENETUNREACH`、`AF_UNSPEC` は `EOPNOTSUPP` です。
+    ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら `EINVAL` です。
+    `RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に合う項目はないので
+    `EHOSTUNREACH` です）。
+  - **ソケット:** ローカルな経路が持つアドレスはゲスト自身のものです。TCP や UDP の
+    ソケットはそこへ bind でき、その経路の優先する送り元からループバックの上で届きます。
+    ループバックでは、IPv4 のアドレスはそのサブネット全体を、IPv4 のローカルな経路
+    （`ip route add local` が足すもの）はその接頭辞のアドレスすべてをローカルにします。
+    IPv6 は自分のアドレスにだけ bind できます。IPv4 にまだローカルの表がなければ、Linux の
     `inet_addr_type` がそのときどのアドレスもブロードキャストと見るのと同じく、ソケットは
     どの IPv4 のアドレスにも bind できます。
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
@@ -876,13 +897,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `NETLINK_LIST_MEMBERSHIPS` は 2 ワードで全部を返します。`lo` の変化は、名前空間の中の
     そのグループのメンバーに、1 つずつ別のデータグラムで、Linux の順に伝えます。上げ下げには
     `ifi_change` に `IFF_UP` を持つ `RTM_NEWLINK`（`RTNLGRP_LINK`）を、それから
-    `inetdev_event`、`fib_add_ifaddr`、`fib_del_ifaddr`、`addrconf`、`rt6_disable_ip` と
-    同じく、増えたり消えたりしたアドレス（`RTNLGRP_IPV4_IFADDR`、`RTNLGRP_IPV6_IFADDR`）と
-    経路（`RTNLGRP_IPV4_ROUTE`、`RTNLGRP_IPV6_ROUTE`。新しいものは
-    `NLM_F_CREATE | NLM_F_EXCL`）を伝えます。IPv4 のアドレスのものはリクエストの
-    シーケンス番号とポートを持ち、IPv6 のアドレスは足したときに仮のものと仮でないものの
-    2 度伝えます。bind していないソケットには何も届きません。IPv4 のアドレスの変化を
-    求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を付ければ自分の写しとして届きます。
+    `inetdev_event`、`fib_add_ifaddr`、`fib_del_ifaddr`、`addrconf`、`rt6_disable_ip`、
+    `rtmsg_fib`、`inet6_rt_notify` と同じく、増えたり消えたりしたアドレス
+    （`RTNLGRP_IPV4_IFADDR`、`RTNLGRP_IPV6_IFADDR`）と経路（`RTNLGRP_IPV4_ROUTE`、
+    `RTNLGRP_IPV6_ROUTE`。新しいものは Linux と同じ `NLM_F_CREATE`、`NLM_F_EXCL`、
+    `NLM_F_APPEND`、`NLM_F_REPLACE` を持ちます）を伝えます。IPv4 のアドレスのものと経路の
+    リクエストのものはリクエストのシーケンス番号とポートを持ち、IPv6 のアドレスは足したときに
+    仮のものと仮でないものの 2 度伝えます。bind していないソケットには何も届きません。
+    IPv4 のアドレスか経路の変化を求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を
+    付ければ自分の写しとして届きます。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、

@@ -22,6 +22,7 @@
     {"name":"unix-interfaces","binary":"process"},
     {"name":"addresses","binary":"process"},
     {"name":"monitor","binary":"process"},
+    {"name":"routes","binary":"process"},
     {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},

@@ -269,8 +269,16 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   Linux ではホストのインターフェースが見えます。
   netlink には `NETLINK_ROUTE` しかなく（`NETLINK_GENERIC` などは `EPROTONOSUPPORT`）、
   そのうちリンク、アドレス、経路のリクエストだけです。近隣、ルール、キューイング規律などは
-  `EOPNOTSUPP` で、経路の追加と削除、入力の経路の引き当て（`ip route get ... iif` が送る
-  `RTA_IIF`）、ダンプでない `RTM_GETADDR`、`lo` の名前の変更、ほかの属性の設定もそうです。
+  `EOPNOTSUPP` で、入力の経路の引き当て（`ip route get ... iif` が送る `RTA_IIF`）、
+  ダンプでない `RTM_GETADDR`、`lo` の名前の変更、ほかの属性の設定もそうです。経路は
+  `lo` を通るか拒むかのどちらかです。IPv6 のゲートウェイ、マルチパスの経路、メトリクス
+  （`ip route add ... mtu` が送る `RTA_METRICS`）、カプセル化、ネクストホップのオブジェクト、
+  realm、有効期限、送り元の接頭辞、ルーターの優先度、エニーキャスト・マルチキャスト・NAT の
+  種類（IPv6 ではブロードキャストも）は `EOPNOTSUPP` です。ポリシーのルール
+  （`RTM_NEWRULE`）も `EOPNOTSUPP` なので、ローカル、メイン、既定の表のほかは引き当てに
+  使われません。新しいネットワーク名前空間では、ローカルな経路のないアドレスへの接続と
+  データグラムは、どの経路に当たっても `ENETUNREACH` のままです。Linux では `lo` へ
+  送り出されて捨てられるか、拒む経路のエラーになります。
   アドレスはいつも永続です。寿命（`IFA_CACHEINFO`）と `IFA_RT_PRIORITY` は保たず、
   相手のアドレスはポイントツーポイントのものにならず、IPv6 のアドレスが仮（tentative）に
   なることもありません。Linux のものは、ループバックならすぐ終わる重複アドレス検出の
@@ -283,7 +291,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   経路を使うほかのものも数えます。通知はリンク、アドレス、経路のものだけで、IPv6 自身の
   リンクの情報（`RTNLGRP_IPV6_IFINFO`）、近隣、netconf などのグループには送らず、ほかの
   名前空間のソケットにも送りません（`NETLINK_LISTEN_ALL_NSID` はありません）。`lo` を
-  落としたときの IPv4 のブロードキャストの経路は、Linux と同じく何も言わずに消えます。
+  落としたときに消える、`lo` を通る IPv4 の経路は、Linux と同じく何も伝えません。
   `NETLINK_PKTINFO`、`NETLINK_NO_ENOBUFS` など、機能のページに挙げていないオプションは
   `ENOPROTOOPT` です。リンクのメッセージは Linux の属性の一部だけを載せ
   （`IFLA_AF_SPEC`、`IFLA_MAP`、`IFLA_XDP` などはありません）、統計は 0、アドレスの

@@ -42,6 +42,8 @@ void _start(void) {
   /* An offset for a pipe, before the access is looked at; then reading the offset. */
   a=0;R(SPLICE(pf[0],&a,o,0,1,0));R(SPLICE(fd,0,pf[1],&a,1,0));R(SPLICE(pf[1],&a,o,0,1,0));
   R(SPLICE(fd,1,pf[1],0,1,0));R(SPLICE(pf[0],0,o,1,1,0));
+  /* An unreadable offset for a pipe end is still ESPIPE: __do_splice looks at the pipe first. */
+  R(SPLICE(pf[0],1,o,0,1,0));R(SPLICE(fd,0,pf[1],1,1,0));
   R(SPLICE(fd,0,o,0,1,0));R(SPLICE(pf[1],0,o,0,1,0));R(SPLICE(fd,0,pf[0],0,1,0));R(SPLICE(pf[0],0,pf[1],0,1,0));
   R(SPLICE(pf[0],0,o,0,1,2));R(SPLICE(pf[0],0,ro,0,1,0));R(SPLICE(pf[0],0,ap,0,1,0));
   R(SPLICE(d,0,pf[1],0,1,0));R(SPLICE(wo,0,pf[1],0,1,0));R(SPLICE(op,0,pf[1],0,1,0));R(SPLICE(op,0,pf[1],0,0,0));

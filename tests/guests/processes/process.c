@@ -5643,11 +5643,15 @@ static int msg_case(void) {
     }
     if (read(ready[0], &byte, 1) != 1) return 15;
     usleep(100000);
-    /* The other message is still there, for no one. */
+    /* The other message is still there, for no one. The removal wakes
+       the waiter, which prints at once, so this side prints what it has
+       first and the removal's result only once the waiter is gone. */
     msgx_status("before-removal", id, getpid(), waiter);
-    printf("removal=%ld\n", syscall(SYS_msgctl, id, IPC_RMID, NULL));
     fflush(stdout);
-    result("waiter", reaped(waiter));
+    long removal = syscall(SYS_msgctl, id, IPC_RMID, NULL);
+    int waited = reaped(waiter);
+    printf("removal=%ld\n", removal);
+    result("waiter", waited);
     errno = 0;
     long removed = syscall(SYS_msgctl, id, 2, ds);
     printf("stat-removed=%ld errno=%d\n", removed, errno);

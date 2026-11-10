@@ -200,11 +200,20 @@ impl Files {
         *self.cwd.lock().unwrap_or_else(PoisonError::into_inner) = path;
         Ok(())
     }
-    pub(crate) fn release_descriptors(&mut self) {
-        // Detach this worker's table reference without closing a table still
-        // shared by live CLONE_FILES siblings.
-        self.fds = Arc::new(Mutex::new(BTreeMap::new()));
+    /// Detaches this worker's table reference without closing a table still
+    /// shared by live CLONE_FILES siblings; the last task to let go gets the
+    /// files the table held (`put_files_struct`), deciding that with the
+    /// release itself so that two tasks ending together cannot both miss it.
+    pub(crate) fn release_descriptors(&mut self) -> Vec<Arc<dyn FileHandle>> {
+        let fds = std::mem::replace(&mut self.fds, Arc::new(Mutex::new(BTreeMap::new())));
         self.reserved = Arc::default();
+        Arc::into_inner(fds).map_or_else(Vec::new, |fds| {
+            fds.into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .into_values()
+                .map(|descriptor| descriptor.file)
+                .collect()
+        })
     }
     pub(crate) fn umask(&self) -> u32 {
         self.umask.load(Ordering::SeqCst)
@@ -221,19 +230,6 @@ impl Files {
     }
     pub(crate) fn exec_path(&self, path: Vec<u8>) -> Result<Vec<u8>, Errno> {
         self.path((-100i32) as u64, path)
-    }
-    /// Whether no other task shares this descriptor table.
-    pub(crate) fn is_last_reference(&self) -> bool {
-        Arc::strong_count(&self.fds) == 1
-    }
-    /// The files the descriptors open, one for each descriptor.
-    pub(crate) fn open_files(&self) -> Vec<Arc<dyn FileHandle>> {
-        self.fds
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .map(|descriptor| Arc::clone(&descriptor.file))
-            .collect()
     }
     /// Takes out the descriptors marked close-on-exec, for exec to close,
     /// when no other task shares this table; one that does keeps the files

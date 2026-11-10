@@ -1064,10 +1064,9 @@ impl Kernel {
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).
-        if self.files.is_last_reference() {
-            crate::mqueue::exited(&self.files, self.process.pid);
-        }
-        self.files.release_descriptors();
+        let closed = self.files.release_descriptors();
+        crate::mqueue::exited(&closed, self.process.pid);
+        drop(closed);
         let addr = thread.state.clear_child_tid;
         let robust = self.group.take_robust_list(thread.tid);
         // While a core dump is under way, a thread leaves its state for it

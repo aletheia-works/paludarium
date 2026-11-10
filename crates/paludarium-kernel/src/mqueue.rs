@@ -289,6 +289,18 @@ struct State {
 }
 
 impl State {
+    /// Drops the registration of process `pid`, if it has the queue's
+    /// (`remove_notification`).
+    fn unregister(&mut self, pid: u32) {
+        if self
+            .registration
+            .as_ref()
+            .is_some_and(|registration| registration.owner == pid)
+            && let Some(registration) = self.registration.take()
+        {
+            registration.remove();
+        }
+    }
     fn insert(&mut self, priority: u32, text: Vec<u8>) {
         self.count += 1;
         self.bytes += text.len() as u64;
@@ -1049,16 +1061,7 @@ fn mq_notify(c: &mut Context<'_>, fd: u64, at: u64) -> Result<u64, Errno> {
     let pid = c.process.pid;
     let mut state = queue.lock();
     match notice {
-        None => {
-            if state
-                .registration
-                .as_ref()
-                .is_some_and(|registration| registration.owner == pid)
-                && let Some(registration) = state.registration.take()
-            {
-                registration.remove();
-            }
-        }
+        None => state.unregister(pid),
         Some(_) if state.registration.is_some() => return Err(EBUSY),
         Some(notice) => {
             let execs = c.processes.execs(pid).unwrap_or_default();
@@ -1131,46 +1134,25 @@ fn mq_getsetattr(c: &mut Context<'_>, fd: u64, new: u64, old: u64) -> Result<u64
 /// After this process closed `d`, drops its registration on the queue `d`
 /// opens, as Linux's `mqueue_flush_file` does on every close.
 pub(crate) fn closed(c: &Context<'_>, d: &crate::files::Descriptor) {
-    let Some(open) = d
+    if let Some(open) = d
         .file
         .as_any()
         .and_then(|any| any.downcast_ref::<QueueFile>())
-    else {
-        return;
-    };
-    let mut state = open.queue.lock();
-    if state
-        .registration
-        .as_ref()
-        .is_some_and(|registration| registration.owner == c.process.pid)
-        && let Some(registration) = state.registration.take()
     {
-        registration.remove();
+        open.queue.lock().unregister(c.process.pid);
     }
 }
 
-/// After process `pid` ended with `files` open, drops its registrations on
-/// the queues among them, as each of their closes does on Linux.
-pub(crate) fn exited(files: &crate::files::Files, pid: u32) {
-    for file in files.open_files() {
-        let Some(open) = file
+/// After process `pid` ended, the last to hold `files`, drops its
+/// registrations on the queues among them, as each of their closes does on
+/// Linux.
+pub(crate) fn exited(files: &[Arc<dyn FileHandle>], pid: u32) {
+    for file in files {
+        if let Some(open) = file
             .as_any()
             .and_then(|any| any.downcast_ref::<QueueFile>())
-        else {
-            continue;
-        };
-        let mut state = open
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if state
-            .registration
-            .as_ref()
-            .is_some_and(|registration| registration.owner == pid)
-            && let Some(registration) = state.registration.take()
         {
-            registration.remove();
+            open.queue.lock().unregister(pid);
         }
     }
 }

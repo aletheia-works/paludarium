@@ -413,6 +413,7 @@ mod linux {
         processes_sem => ("sem","process"),
         processes_msg => ("msg","process"),
         processes_rseq => ("rseq","process"),
+        processes_pkey => ("pkey","process"),
         vfork_exit => ("vfork-exit","process"),
         processes_exec => ("exec","process"),
         exec_thread => ("exec-thread","process"),

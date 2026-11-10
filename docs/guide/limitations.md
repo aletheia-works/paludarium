@@ -147,12 +147,15 @@ verified.
   Threads without `rseq` run on no virtual CPU and are not counted. There is
   no time slice extension: `RSEQ_FLAG_SLICE_EXT_DEFAULT_ON` gives `EINVAL`,
   as on a Linux built without it.
+- **Protection keys**: the virtual CPU has none (`CPUID` reports no PKU), so
+  `pkey_alloc` gives `ENOSPC` as Linux does on such a CPU, and programs carry
+  on without them. `RDPKRU` and `WRPKRU` stop a program with `SIGILL`, as on
+  such a CPU.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
-  - `pkey_alloc` and `io_uring_setup` are among them, as on a Linux built without
-    them. Programs check for that and carry on. Saying yes would be wrong
-    without the rest: protection keys need the CPU feature, which `CPUID` does
-    not report, and io_uring's rings would do no work.
+  - `io_uring_setup` is one of them, as on a Linux built without io_uring.
+    Programs check for that and carry on. Saying yes would be wrong without
+    the rest: its rings would do no work.
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared
     memory, semaphores and message queues are Linux's defaults, which
     `/proc/sys/kernel` cannot change. A message queue's waiting senders

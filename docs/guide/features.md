@@ -657,6 +657,13 @@ kernel.
   and so are the flags that do nothing on x86-64 Linux either
   (`ADDR_LIMIT_32BIT`, `SHORT_INODE`, `WHOLE_SECONDS`, `STICKY_TIMEOUTS`,
   ...).
+- `mprotect` checks its arguments in Linux's order: both `PROT_GROWSDOWN`
+  and `PROT_GROWSUP`, a misaligned start, an empty range (which succeeds
+  whatever the bits), an end that overflows (`ENOMEM`), then unknown bits.
+  `PROT_GROWSDOWN` extends the range down to the start of the first VMA in
+  it, which must grow down (the main stack), else `EINVAL`; `PROT_GROWSUP` is
+  `EINVAL` on a mapped start, as no VMA grows up on x86-64. Where no VMA is
+  in the range, both give `ENOMEM`.
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or

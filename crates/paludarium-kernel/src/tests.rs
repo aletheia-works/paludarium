@@ -3428,3 +3428,74 @@ mod pkeys {
         assert_eq!(f.ret(329, &[DATA, 0x1000, 0xff, 0]), einval);
     }
 }
+
+mod mprotect_order {
+    use super::*;
+
+    const GROWSDOWN: u64 = 0x0100_0000;
+    const GROWSUP: u64 = 0x0200_0000;
+
+    fn prot_at(f: &Fixture, at: u64) -> Prot {
+        f.mem
+            .mappings()
+            .find(|m| m.start.0 <= at && at < m.end())
+            .unwrap()
+            .prot
+    }
+
+    #[test]
+    fn mprotect_checks_in_linux_order() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // An empty range succeeds before the bits are looked at.
+        assert_eq!(f.ret(10, &[DATA, 0, 0xff]), 0);
+        assert_eq!(f.ret(10, &[DATA + 1, 0, 1]), einval);
+        assert_eq!(f.ret(10, &[DATA, 0, GROWSDOWN | GROWSUP]), einval);
+        // The end's overflow before the bits.
+        assert_eq!(f.ret(10, &[DATA, u64::MAX, 0xff]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(10, &[DATA, 4096, 0x10]), einval);
+        assert_eq!(f.ret(10, &[DATA, 4096, 1 | 8]), 0);
+        assert_eq!(prot_at(&f, DATA), Prot::READ);
+    }
+
+    #[test]
+    fn grows_flags_need_a_vma_that_grows() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // No VMA grows up on x86-64; none at all is ENOMEM.
+        assert_eq!(f.ret(10, &[DATA, 4096, 1 | GROWSUP]), einval);
+        assert_eq!(
+            f.ret(10, &[0x50_0000, 4096, 1 | GROWSUP]),
+            errno(Errno::ENOMEM)
+        );
+        // An anonymous mapping does not grow down.
+        assert_eq!(f.ret(10, &[DATA, 4096, 1 | GROWSDOWN]), einval);
+        assert_eq!(
+            f.ret(10, &[0x50_0000, 4096, 1 | GROWSDOWN]),
+            errno(Errno::ENOMEM)
+        );
+        assert_eq!(prot_at(&f, DATA), Prot::READ_WRITE);
+        // A stack does: the range reaches down to its start.
+        let stack = 0x40_0000;
+        f.mem
+            .map(
+                Some(GuestAddr(stack)),
+                0x4000,
+                Prot::READ_WRITE,
+                MappingKind::Stack,
+            )
+            .unwrap();
+        assert_eq!(f.ret(10, &[stack + 0x2000, 4096, 7 | GROWSDOWN]), 0);
+        let all = Prot::from_bits(7).unwrap();
+        assert_eq!(prot_at(&f, stack), all);
+        assert_eq!(prot_at(&f, stack + 0x2000), all);
+        assert_eq!(prot_at(&f, stack + 0x3000), Prot::READ_WRITE);
+        // From below it, the first VMA in the range is the one that grows.
+        assert_eq!(f.ret(10, &[stack - 0x1000, 0x2000, 3 | GROWSDOWN]), 0);
+        assert_eq!(prot_at(&f, stack), Prot::READ_WRITE);
+        assert_eq!(prot_at(&f, stack + 0x1000), all);
+        // pkey_mprotect with no key is the same.
+        assert_eq!(f.ret(329, &[stack, 4096, 1 | GROWSDOWN, u64::MAX]), 0);
+        assert_eq!(prot_at(&f, stack), Prot::READ);
+    }
+}

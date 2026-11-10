@@ -597,6 +597,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   実行のできるようにマップします。`ADDR_NO_RANDOMIZE` は持つだけです。もともと何も
   ランダムにしないからです。x86-64 の Linux でも何もしないフラグ（`ADDR_LIMIT_32BIT`、
   `SHORT_INODE`、`WHOLE_SECONDS`、`STICKY_TIMEOUTS` など）も持つだけです。
+- `mprotect` は引数を Linux と同じ順で確かめます。`PROT_GROWSDOWN` と `PROT_GROWSUP` の
+  両方、そろっていない先頭、空の範囲（ビットが何でも成功します）、あふれる終わり（`ENOMEM`）、
+  そのあと未知のビットの順です。`PROT_GROWSDOWN` は範囲を、その中の最初の VMA の先頭まで
+  下に広げます。その VMA は下に伸びるもの（メインのスタック）でなければならず、そうでなければ
+  `EINVAL` です。`PROT_GROWSUP` は、x86-64 には上に伸びる VMA がないので、先頭がマップ済みなら
+  `EINVAL` です。範囲に VMA がなければ、どちらも `ENOMEM` です。
 - 保護キーは、保護キーのない CPU での Linux と同じ答えを返します。仮想 CPU はそういう CPU
   です（`CPUID` は PKU を報告しません）。キーは、既定のキー 0 も含めて一つも割り当てられて
   いません。`pkey_alloc` は `ENOSPC` で、フラグや `PKEY_DISABLE_ACCESS` と

@@ -1846,39 +1846,34 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 fn sys_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    // PROT_SEM (0x8) has no effect on x86-64, but Linux accepts it.
-    let Some(prot) = Prot::from_bits(a[2] & !8) else {
-        return err(Errno::EINVAL);
-    };
-    let prot = read_implies_exec(c.process, prot);
-    if a[1] == 0 {
-        return if GuestAddr(a[0]).page_offset() == 0 {
-            ok(0)
-        } else {
-            err(Errno::EINVAL)
-        };
-    }
-    match c.mem.protect_shared(GuestAddr(a[0]), a[1], prot) {
-        Ok(()) => ok(0),
-        Err(e) => err(e),
-    }
+    mprotect_with_key(c, a, true)
 }
 
 /// `pkey_mprotect(addr, len, prot, pkey)`, as Linux's on a CPU without
 /// protection keys, which the virtual CPU is (`CPUID` reports no PKU): no key
 /// is ever allocated there, not even the default key 0, so only `-1` (no key)
 /// is accepted, and that is `mprotect`. Any other key is `EINVAL` once the
-/// checks Linux makes before it pass: the alignment, an empty range (which
-/// succeeds), the end's overflow and the protection bits.
+/// checks Linux makes before it pass (see [`mprotect_with_key`]).
 fn sys_pkey_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    /// `PROT_GROWSDOWN` and `PROT_GROWSUP`, which may not both be given.
-    const GROWS: u64 = 0x0100_0000 | 0x0200_0000;
     // An `int`, sign-extended when the arguments were read.
-    if a[3] == u64::MAX {
-        return sys_mprotect(c, a);
-    }
-    let (start, len, prot) = (a[0], a[1], a[2]);
-    if prot & GROWS == GROWS || start & 4095 != 0 {
+    mprotect_with_key(c, a, a[3] == u64::MAX)
+}
+
+/// Linux's `do_mprotect_pkey`, in its order: `PROT_GROWSDOWN` with
+/// `PROT_GROWSUP`, a misaligned start, an empty range (which succeeds even
+/// with bad bits), an end that overflows (`ENOMEM`), unknown bits, and only
+/// then the key (`allocated` is false for a key that is not) and the
+/// mappings. `PROT_GROWSDOWN` extends the range down to the start of the
+/// first VMA in it, which must be a stack, as only the main thread's stack is
+/// a VMA that grows down here; `PROT_GROWSUP` is `EINVAL` where a VMA holds
+/// the start, as no VMA grows up on x86-64.
+fn mprotect_with_key(c: &mut Context<'_>, a: [u64; 6], allocated: bool) -> Outcome {
+    const PROT_SEM: u64 = 0x8;
+    const PROT_GROWSDOWN: u64 = 0x0100_0000;
+    const PROT_GROWSUP: u64 = 0x0200_0000;
+    let (start, len) = (a[0], a[1]);
+    let grows = a[2] & (PROT_GROWSDOWN | PROT_GROWSUP);
+    if grows == PROT_GROWSDOWN | PROT_GROWSUP || start & 4095 != 0 {
         return err(Errno::EINVAL);
     }
     if len == 0 {
@@ -1888,7 +1883,42 @@ fn sys_pkey_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if end <= start {
         return err(Errno::ENOMEM);
     }
-    err(Errno::EINVAL)
+    // PROT_SEM has no effect on x86-64, but Linux accepts it.
+    let Some(prot) = Prot::from_bits(a[2] & !(grows | PROT_SEM)) else {
+        return err(Errno::EINVAL);
+    };
+    if !allocated {
+        return err(Errno::EINVAL);
+    }
+    let prot = read_implies_exec(c.process, prot);
+    let mut start = start;
+    if grows != 0 {
+        let Some(first) = c
+            .mem
+            .mappings()
+            .find(|m| m.end() > start && m.start.0 < end)
+        else {
+            return err(Errno::ENOMEM);
+        };
+        if grows == PROT_GROWSUP {
+            return err(if first.start.0 > start {
+                Errno::ENOMEM
+            } else {
+                Errno::EINVAL
+            });
+        }
+        if first.kind != MappingKind::Stack {
+            return err(Errno::EINVAL);
+        }
+        start = c
+            .mem
+            .vma_at(first.start)
+            .map_or(first.start.0, |(at, _)| at.0);
+    }
+    match c.mem.protect_shared(GuestAddr(start), end - start, prot) {
+        Ok(()) => ok(0),
+        Err(e) => err(e),
+    }
 }
 
 /// `pkey_alloc(flags, access_rights)`: `EINVAL` for a flag (none exists) or

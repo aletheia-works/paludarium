@@ -136,6 +136,10 @@ verified.
   open with `O_APPEND` do not reach the file. The end of a mapped file, past
   which a page raises `SIGBUS`, is the size the guest's own file operations
   give it, so a host program changing the size does not move it.
+- **Mappings that grow down**: only the main stack is a VMA that grows down.
+  A mapping made with `MAP_GROWSDOWN` is an ordinary one, so it does not grow
+  and `mprotect` with `PROT_GROWSDOWN` on it gives `EINVAL`, where Linux
+  changes it.
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
   CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
   not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its

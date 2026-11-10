@@ -4737,6 +4737,46 @@ static void *rseq_other_thread(void *unused) {
     return 0;
 }
 
+/* mprotect's checks in Linux's order, and the grows flags: only the main
+   stack grows down (a MAP_GROWSDOWN mapping does on Linux but not in the
+   emulator), and nothing grows up on x86-64. */
+static void pkey_show(const char *label, long r);
+
+static int mprotect_checks_case(void) {
+    long page = 4096;
+    char *base = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 80;
+    char *a = mmap(base + page, (size_t)page, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) return 81;
+    munmap(base + 2 * page, (size_t)page);
+    char *hole = base + 2 * page;
+    long down = PROT_GROWSDOWN, up = PROT_GROWSUP;
+    errno = 0;
+    pkey_show("empty-bad-bits", syscall(SYS_mprotect, a, 0L, 0xffL));
+    pkey_show("empty-misaligned", syscall(SYS_mprotect, a + 1, 0L, 1L));
+    pkey_show("both-grows", syscall(SYS_mprotect, a, 0L, down | up));
+    pkey_show("overflow-bad-bits", syscall(SYS_mprotect, a, -1L, 0xffL));
+    pkey_show("bad-bits", syscall(SYS_mprotect, a, page, 0x10L));
+    pkey_show("sem", syscall(SYS_mprotect, a, page, (long)(PROT_READ | PROT_WRITE) | 8));
+    pkey_show("up-anonymous", syscall(SYS_mprotect, a, page, PROT_READ | up));
+    pkey_show("up-hole", syscall(SYS_mprotect, hole, page, PROT_READ | up));
+    pkey_show("down-anonymous", syscall(SYS_mprotect, a, page, PROT_READ | down));
+    pkey_show("down-hole", syscall(SYS_mprotect, hole, page, PROT_READ | down));
+    a[0] = 3;
+    /* The main stack grows down, from the page this frame is on. */
+    volatile char here = 0;
+    char *stack = (char *)((uintptr_t)&here & ~(uintptr_t)(page - 1));
+    pkey_show("down-stack",
+              syscall(SYS_mprotect, stack, page, (long)(PROT_READ | PROT_WRITE) | down));
+    pkey_show("down-stack-pkey",
+              syscall(SYS_pkey_mprotect, stack, page, (long)(PROT_READ | PROT_WRITE) | down, -1L));
+    pkey_show("up-stack", syscall(SYS_mprotect, stack, page, (long)(PROT_READ | PROT_WRITE) | up));
+    here = 1;
+    printf("still writable: %d %d\n", a[0], here);
+    return 0;
+}
+
 /* Protection keys, only where a CPU with them and one without agree: the
    virtual CPU has none, so the key pkey_alloc gives (or the default key 0)
    would differ from a host with PKU. Key -1 is mprotect. */
@@ -15068,6 +15108,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "sem")) return sem_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
+    if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

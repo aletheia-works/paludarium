@@ -2462,8 +2462,8 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// The inotify events of a call that read or wrote files, as Linux's
 /// `fsnotify_access` and `fsnotify_modify` follow them: a read or write that
 /// moved bytes, `sendfile` and `copy_file_range` (the input's, then the
-/// output's), a `fallocate` that succeeded, and every `getdents64` that
-/// reached `iterate_dir` (one with too small a buffer too).
+/// output's), a `fallocate` that succeeded, and every `getdents` and
+/// `getdents64` that reached `iterate_dir` (one with too small a buffer too).
 fn accessed(c: &Context<'_>, n: u64, a: [u64; 6], result: &Result<u64, Errno>) {
     use crate::inotify::{ACCESS, MODIFY};
     let moved = matches!(result, Ok(v) if *v > 0);
@@ -2473,7 +2473,7 @@ fn accessed(c: &Context<'_>, n: u64, a: [u64; 6], result: &Result<u64, Errno>) {
         40 if moved => &[(a[1], ACCESS), (a[0], MODIFY)],
         326 if moved => &[(a[0], ACCESS), (a[2], MODIFY)],
         285 if result.is_ok() => &[(a[0], MODIFY)],
-        217 if result.is_ok() || *result == Err(Errno::EINVAL) => &[(a[0], ACCESS)],
+        78 | 217 if result.is_ok() || *result == Err(Errno::EINVAL) => &[(a[0], ACCESS)],
         _ => &[],
     };
     for &(fd, mask) in events {

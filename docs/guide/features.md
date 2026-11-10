@@ -1594,7 +1594,7 @@ kernel.
   `IN_ACCESS` or `IN_MODIFY` for a `read`, `write`, `pread64`, `pwrite64`,
   `readv`, `writev`, `preadv`, `pwritev`, `preadv2` or `pwritev2` that moved
   bytes, `sendfile` and `copy_file_range` (the input's, then the output's),
-  `fallocate`, and each `getdents64`. A watch with `IN_EXCL_UNLINK` does not
+  `fallocate`, and each `getdents` and `getdents64`. A watch with `IN_EXCL_UNLINK` does not
   hear of the open, close, read or write of a file no name links any more;
   `truncate`, `mknod` and starting a program open nothing. A file's change reaches the watch of
   its directory, with its name, before its own, and `IN_ISDIR` marks a

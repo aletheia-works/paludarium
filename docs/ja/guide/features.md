@@ -1415,7 +1415,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   なくなると `IN_CLOSE_WRITE` か `IN_CLOSE_NOWRITE` です（マッピングは解除される
   まで参照を持ちます）。バイトを動かした `read`、`write`、`pread64`、`pwrite64`、
   `readv`、`writev`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`sendfile` と
-  `copy_file_range`（入力の後に出力）、`fallocate`、毎回の `getdents64` は
+  `copy_file_range`（入力の後に出力）、`fallocate`、毎回の `getdents` と `getdents64` は
   `IN_ACCESS` か `IN_MODIFY` です。`IN_EXCL_UNLINK` のウォッチは、どの名前からも
   リンクされなくなったファイルを開く・閉じる・読み書きすることを受けません。
   `truncate`、`mknod`、プログラムの起動は何も開きません。ファイルの変更は、そのディレクトリのウォッチに

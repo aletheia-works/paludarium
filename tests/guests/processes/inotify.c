@@ -419,6 +419,12 @@ static int case_content(void) {
     close(d);
     printf("getdents some=%ld end=%ld small=%ld\n", got, end, small);
     drain(fd, "directory");
+    /* The old getdents reads a directory too. */
+    d = open(dir, O_RDONLY | O_DIRECTORY);
+    long old = e(syscall(SYS_getdents, d, entries, sizeof entries)) > 0;
+    close(d);
+    printf("old getdents some=%ld\n", old);
+    drain(fd, "old-directory");
     /* O_CREAT | O_TRUNC of a new file, then of an old one. */
     int made = open(at("w/n"), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     close(made);

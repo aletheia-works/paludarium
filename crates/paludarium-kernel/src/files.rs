@@ -1774,10 +1774,12 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
         let written = write_io_with(c, &file, &bytes[..len], false, flags & RWF_NOWAIT != 0)?;
         sync_written(&file, flags, written)
     })();
+    // A count of 0 moves it, as `do_writev` takes any `ret >= 0`; the
+    // write's error stands even when putting the position back fails.
     if result.is_err()
         && let Some(before) = before
     {
-        file.seek(before as i64, 0)?;
+        let _ = file.seek(before as i64, 0);
     }
     result
 }

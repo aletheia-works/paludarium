@@ -7340,6 +7340,10 @@ int main(int argc, char **argv) {
             /* An address's prefix route and the routes from it. */
             nl_route(ctl, port, 24, add, "2001:db8:a::", 64, ROUTE6(.oif = 1, .metric = 5), "add6 before address");
             nl_addr(ctl, port, 20, 0x600, AF_INET6, "2001:db8:a::1", 64, 0, 1, "add address6");
+            /* Linux tells of the IPv6 address's local route once its duplicate
+               address detection work has run, a little later. */
+            usleep(200000);
+            monitor_show(mon, port, "address6");
             nl_addr(ctl, port, 20, 0x600, AF_INET, "10.20.0.1", 24, 0, 1, "add address");
             nl_route(ctl, port, 24, add, "10.21.0.0", 16, ROUTE4(.scope = 253, .oif = 1, .src = "10.20.0.1"),
                      "add from address");

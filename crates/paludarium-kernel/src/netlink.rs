@@ -83,8 +83,6 @@ const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
 const RTM_F_CLONED: u32 = 0x200;
 const RTCF_LOCAL: u32 = 0x8000_0000;
 const RTCF_BROADCAST: u32 = 0x1000_0000;
-/// The main table, which with no policy rules Linux merges the local one
-/// into for lookups (`fib_unmerge`).
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 const RTA_METRICS: u16 = 8;
@@ -105,7 +103,7 @@ const RTA_PREFSRC: u16 = 7;
 const RTA_CACHEINFO: u16 = 12;
 const RTA_TABLE: u16 = 15;
 const RTA_PREF: u16 = 20;
-/// The local routing table, the kernel's routes and their types.
+/// `RT_SCOPE_UNIVERSE`, the scope of every IPv6 route.
 const RT_SCOPE_UNIVERSE: u8 = 0;
 /// `struct rta_cacheinfo`: eight `__u32`s.
 const RTA_CACHEINFO_LEN: usize = 32;

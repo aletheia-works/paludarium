@@ -315,8 +315,9 @@ verified.
   reaches a table but the local, main and default ones. In a new network
   namespace a connection or datagram to an address no local route has is
   still `ENETUNREACH`, whatever route takes it, where Linux's goes out
-  through `lo` and is dropped, or fails with a rejecting route's error. An address is always permanent: lifetimes
-  (`IFA_CACHEINFO`) and `IFA_RT_PRIORITY` are not kept, a peer address is
+  through `lo` and is dropped, or fails with a rejecting route's error.
+  An address is always permanent: lifetimes (`IFA_CACHEINFO`) and
+  `IFA_RT_PRIORITY` are not kept, a peer address is
   not a point-to-point one, and an IPv6 address is never tentative, where
   Linux's is until its duplicate address detection work, which ends at
   once on a loopback, has run. A connection or datagram to an address of

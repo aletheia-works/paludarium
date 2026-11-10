@@ -121,6 +121,13 @@ static int case_calls(void) {
     long piped = e(inotify_add_watch(p[0], dir, IN_ATTRIB));
     printf("add bits=%ld zero=%ld only-flags=%ld badf=%ld path-fd=%ld both=%ld pipe=%ld\n", bits, zero,
            only_flags, badf, by_path, both, piped);
+    /* A bit outside ALL_INOTIFY_BITS is EINVAL, with valid bits too: 0x1000
+       is the one gap among the events, 0x10000 and 0x8000000 lie between
+       the flags. */
+    long gap = e(inotify_add_watch(fd, dir, IN_ATTRIB | 0x1000));
+    long between = e(inotify_add_watch(fd, dir, IN_ATTRIB | 0x10000));
+    long flag_gap = e(inotify_add_watch(fd, dir, IN_ATTRIB | 0x8000000));
+    printf("add unknown gap=%ld between=%ld flag-gap=%ld\n", gap, between, flag_gap);
     long fault = e(syscall(SYS_inotify_add_watch, fd, (void *)8, IN_ATTRIB));
     long missing = e(inotify_add_watch(fd, at("none"), IN_ATTRIB));
     long onlydir = e(inotify_add_watch(fd, file, IN_ATTRIB | IN_ONLYDIR));

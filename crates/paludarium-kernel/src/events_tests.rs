@@ -3704,13 +3704,14 @@ fn netlink_dumps_and_sets_a_new_namespaces_loopback() {
     assert_eq!(&payload[8..12], &8u32.to_le_bytes());
     assert_eq!(&replies[1].0, &3);
     assert_eq!(&replies[1].4, &0i32.to_le_bytes());
-    // Down, there is no address; a dump of anything else is EOPNOTSUPP.
+    // Down, there is no address; a dump of queueing disciplines is
+    // EOPNOTSUPP.
     let len = netlink_request(&f, DATA, 22, 0x301, 8, &[0]);
     assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
     let replies = netlink_replies(&mut f, fd);
     assert_eq!(replies.len(), 1);
     assert_eq!(replies[0].0, 3);
-    let len = netlink_request(&f, DATA, 26, 0x301, 9, &[0]);
+    let len = netlink_request(&f, DATA, 38, 0x301, 9, &[0]);
     assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
     let replies = netlink_replies(&mut f, fd);
     assert_eq!(replies[0].0, 2);
@@ -3794,6 +3795,49 @@ fn netlink_dumps_and_sets_a_new_namespaces_loopback() {
     let replies = netlink_replies(&mut f, fd);
     assert_eq!(&replies[0].4[..4], &(-1i32).to_le_bytes());
     assert_eq!(loopback_field(&mut f, udp, 0x8913), 0x49);
+}
+#[test]
+fn netlink_dumps_the_routes_of_a_new_namespaces_loopback() {
+    let mut f = Fixture::new();
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    let fd = f.ret(41, [16, 3, 0, 0, 0, 0]);
+    let dump = |f: &mut Fixture, family: u8, seq: u32| {
+        let len = netlink_request(f, DATA, 26, 0x301, seq, &[family]);
+        assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+        netlink_replies(f, fd)
+            .into_iter()
+            .map(|(kind, _, _, _, payload)| {
+                (kind, payload.get(1).copied(), payload.get(7).copied())
+            })
+            .collect::<Vec<_>>()
+    };
+    // Down, there is none.
+    let done = (3, Some(0), None);
+    assert_eq!(dump(&mut f, 0, 1), [done]);
+    interface_request(&f, DATA + 0x400, b"lo", 1);
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    assert_eq!(f.ret(16, [udp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    // Up: IPv4's three, IPv6's one, then NLMSG_DONE.
+    let local = (24, Some(8), Some(2));
+    let host = (24, Some(32), Some(2));
+    let broadcast = (24, Some(32), Some(3));
+    let six = (24, Some(128), Some(2));
+    assert_eq!(dump(&mut f, 0, 2), [local, host, broadcast, six, done]);
+    assert_eq!(dump(&mut f, 2, 3), [local, host, broadcast, done]);
+    assert_eq!(dump(&mut f, 10, 4), [six, done]);
+    assert_eq!(dump(&mut f, 17, 5), [local, host, broadcast, six, done]);
+    assert_eq!(dump(&mut f, 128, 6), [done]);
+    // A route lookup, without a dump, is not supported.
+    let len = netlink_request(&f, DATA, 26, 0x1, 7, &[2]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(
+        &netlink_replies(&mut f, fd)[0].4[..4],
+        &(-95i32).to_le_bytes()
+    );
+    // Down again, the local IPv4 routes stay.
+    interface_request(&f, DATA + 0x400, b"lo", 0);
+    assert_eq!(f.ret(16, [udp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    assert_eq!(dump(&mut f, 0, 8), [local, host, done]);
 }
 #[test]
 fn interface_requests_take_unix_and_netlink_sockets() {

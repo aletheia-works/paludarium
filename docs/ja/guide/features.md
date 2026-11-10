@@ -781,8 +781,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`if_indextoname`）は、インデックス 1 を `lo` と答えます（ほかは `ENODEV`）。
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
   `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。
-  そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`、`ip link set lo up` が
-  動きます。Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが持つものは
+  そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`、`ip route`、
+  `ip link set lo up` が動きます。Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが持つものは
   `EADDRINUSE`）を、0 ならプロセスの ID を、それが使われていれば負の ID を取ります。
   bind していないソケットは、`connect` か最初の送信で同じように bind されます。
   `getsockname` と `getpeername` はポートとグループを返し、ほかのソケットのポートへの
@@ -791,7 +791,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   付けた `RTM_GETLINK` と `RTM_GETADDR` には、`lo`（インデックス 1、そのフラグ、名前、MTU、
   キュー、状態、キューイング規律、0 の統計）とそのアドレス（1 度でも上がった後の
   `127.0.0.1/8` と、上がっている間の `::1/128`）を返し、次の受信で `NLMSG_DONE` を
-  返します。ダンプでない `RTM_GETLINK` には、インデックスか `IFLA_IFNAME` で指した `lo` を
+  返します。`NLM_F_DUMP` を付けた `RTM_GETROUTE` には、カーネルがそのアドレスに付ける
+  経路を、すべてローカルの表のものとして返します（メインの表にはありません）。`lo` が
+  1 度でも上がった後の `local 127.0.0.0/8` と `local 127.0.0.1`（落ちても残ります）、
+  上がっている間の `broadcast 127.255.255.255` と `local ::1` です。`AF_INET` か
+  `AF_INET6` だけを指せばそのファミリーのものを返し、マルチキャストの経路の
+  ファミリーには何も返しません。ダンプでない `RTM_GETLINK` には、インデックスか `IFLA_IFNAME` で指した `lo` を
   返します（ほかは `ENODEV`）。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
   それには、ネットワーク名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送る
   スレッドとソケットを開いたものの両方に要ります（なければ `EPERM`）。エラーと、

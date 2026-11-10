@@ -280,10 +280,12 @@ verified.
   than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`
   (`EPROTONOSUPPORT` for `NETLINK_GENERIC` and the rest), and of it only
-  the link and address requests: routes, neighbours, rules, queueing
-  disciplines and the rest are `EOPNOTSUPP`, as are adding or removing an
-  address, a non-dump `RTM_GETADDR`, renaming `lo` and setting any other
-  attribute of it. No notification is sent to a multicast group, though
+  the link and address requests and route dumps: neighbours, rules,
+  queueing disciplines and the rest are `EOPNOTSUPP`, as are adding or
+  removing an address or a route, a route lookup (`RTM_GETROUTE` without a
+  dump, which `ip route get` sends), a non-dump `RTM_GETADDR`, renaming
+  `lo` and setting any other attribute of it. A route dump does not filter
+  by the table or attributes a strict request names. No notification is sent to a multicast group, though
   `bind` takes groups; `NETLINK_ADD_MEMBERSHIP` and the other options not
   listed in the features are `ENOPROTOOPT`. A link message carries a
   subset of Linux's attributes (no `IFLA_AF_SPEC`, `IFLA_MAP`, `IFLA_XDP`

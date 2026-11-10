@@ -4,8 +4,9 @@
 //! As Linux's `af_netlink` and `rtnetlink`: a socket is bound to a port ID
 //! (the process's ID, or a negative one when that is taken) by `bind`, or by
 //! its first `connect` or send. The kernel takes each message of a datagram
-//! sent to port 0 in turn: `RTM_GETLINK` and `RTM_GETADDR` dumps
-//! (`NLM_F_DUMP`) answer with the loopback and its addresses, then
+//! sent to port 0 in turn: `RTM_GETLINK`, `RTM_GETADDR` and `RTM_GETROUTE`
+//! dumps (`NLM_F_DUMP`) answer with the loopback, its addresses and its
+//! routes, then
 //! `NLMSG_DONE` at the next receive; `RTM_GETLINK` without a dump answers
 //! for `lo` by index or name; `RTM_NEWLINK` and `RTM_SETLINK` bring it up or
 //! down with `IFF_UP`, given `CAP_NET_ADMIN` in the user namespace that owns
@@ -42,6 +43,27 @@ const RTM_GETLINK: u16 = 18;
 const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
+/// The multicast routing families, whose dumps find no route.
+const RTNL_FAMILY_IPMR: u8 = 128;
+const RTNL_FAMILY_IP6MR: u8 = 129;
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_PRIORITY: u16 = 6;
+const RTA_PREFSRC: u16 = 7;
+const RTA_CACHEINFO: u16 = 12;
+const RTA_TABLE: u16 = 15;
+const RTA_PREF: u16 = 20;
+/// The local routing table, the kernel's routes and their types.
+const RT_TABLE_LOCAL: u8 = 255;
+const RTPROT_KERNEL: u8 = 2;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+const RT_SCOPE_LINK: u8 = 253;
+const RTN_LOCAL: u8 = 2;
+const RTN_BROADCAST: u8 = 3;
+/// `struct rta_cacheinfo`: eight `__u32`s.
+const RTA_CACHEINFO_LEN: usize = 32;
 /// The last message type `rtnetlink_rcv_msg` takes (`RTM_MAX`).
 const RTM_MAX: u16 = 123;
 const AF_INET: u8 = 2;
@@ -486,6 +508,18 @@ impl NetlinkSocket {
                     }
                     messages
                 }
+                // The multicast routing tables have no route.
+                (RTM_GETROUTE, RTNL_FAMILY_IPMR | RTNL_FAMILY_IP6MR) => Vec::new(),
+                (RTM_GETROUTE, _) => {
+                    let mut messages = Vec::new();
+                    if family != AF_INET6 {
+                        messages.extend(ipv4_routes(&self.network, header.seq, port));
+                    }
+                    if family != AF_INET {
+                        messages.extend(ipv6_routes(&self.network, header.seq, port));
+                    }
+                    messages
+                }
                 _ => return Err(EOPNOTSUPP),
             };
             if s.done.is_some() {
@@ -864,6 +898,75 @@ fn ipv4_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
     attribute(&mut body, IFA_CACHEINFO, &cacheinfo());
     message(RTM_NEWADDR, NLM_F_MULTI, seq, port, &body)
 }
+/// An `rtmsg` of the local table, the kernel's, for `family`, `dst_len`,
+/// `scope` and `kind`.
+fn route_header(family: u8, dst_len: u8, scope: u8, kind: u8) -> Vec<u8> {
+    let mut body = vec![
+        family,
+        dst_len,
+        0,
+        0,
+        RT_TABLE_LOCAL,
+        RTPROT_KERNEL,
+        scope,
+        kind,
+    ];
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body
+}
+/// The IPv4 routes `fib_add_ifaddr` gives `127.0.0.1/8` on `lo`, as
+/// `fib_dump_info` gives them, in the local table: `local 127.0.0.0/8` and
+/// `local 127.0.0.1` once the loopback has had the address, which stay when
+/// it goes down, and `broadcast 127.255.255.255` while it is up. The main
+/// table has none.
+fn ipv4_routes(network: &Network, seq: u32, port: u32) -> Vec<u8> {
+    if !network.has_ipv4_address() {
+        return Vec::new();
+    }
+    let mut routes = vec![
+        ([127, 0, 0, 0], 8, RT_SCOPE_HOST, RTN_LOCAL),
+        ([127, 0, 0, 1], 32, RT_SCOPE_HOST, RTN_LOCAL),
+    ];
+    if network.is_up() {
+        routes.push(([127, 255, 255, 255], 32, RT_SCOPE_LINK, RTN_BROADCAST));
+    }
+    let mut messages = Vec::new();
+    for (dst, dst_len, scope, kind) in routes {
+        let mut body = route_header(AF_INET, dst_len, scope, kind);
+        attribute(
+            &mut body,
+            RTA_TABLE,
+            &u32::from(RT_TABLE_LOCAL).to_le_bytes(),
+        );
+        attribute(&mut body, RTA_DST, &dst);
+        attribute(&mut body, RTA_PREFSRC, &[127, 0, 0, 1]);
+        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+        messages.extend(message(RTM_NEWROUTE, NLM_F_MULTI, seq, port, &body));
+    }
+    messages
+}
+/// The IPv6 route of `::1` while the loopback is up, `local ::1` in the
+/// local table, as `rt6_fill_node` gives it (with an empty
+/// `rta_cacheinfo`).
+fn ipv6_routes(network: &Network, seq: u32, port: u32) -> Vec<u8> {
+    if !network.is_up() {
+        return Vec::new();
+    }
+    let mut body = route_header(AF_INET6, 128, RT_SCOPE_UNIVERSE, RTN_LOCAL);
+    let mut one = [0; 16];
+    one[15] = 1;
+    attribute(
+        &mut body,
+        RTA_TABLE,
+        &u32::from(RT_TABLE_LOCAL).to_le_bytes(),
+    );
+    attribute(&mut body, RTA_DST, &one);
+    attribute(&mut body, RTA_PRIORITY, &0u32.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_CACHEINFO, &[0; RTA_CACHEINFO_LEN]);
+    attribute(&mut body, RTA_PREF, &[0]);
+    message(RTM_NEWROUTE, NLM_F_MULTI, seq, port, &body)
+}
 /// `RTM_NEWADDR` for `::1/128` while the loopback is up, as
 /// `inet6_fill_ifaddr` gives it.
 fn ipv6_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
@@ -1184,6 +1287,77 @@ mod tests {
         network.set_up(false);
         assert!(!ipv4_message(&network, 3, 7).is_empty());
         assert!(ipv6_message(&network, 3, 7).is_empty());
+    }
+
+    #[test]
+    fn routes_follow_the_loopback_and_its_address() {
+        let network = Network::isolated(crate::users::first());
+        // None before the loopback has been up.
+        assert!(ipv4_routes(&network, 1, 7).is_empty());
+        assert!(ipv6_routes(&network, 1, 7).is_empty());
+        // Up: local 127.0.0.0/8, local 127.0.0.1 and the broadcast route,
+        // then local ::1, each in the local table.
+        network.set_up(true);
+        let v4 = ipv4_routes(&network, 2, 7);
+        let mut rest = &v4[..];
+        let mut seen = Vec::new();
+        while !rest.is_empty() {
+            let header = Header::read(rest);
+            assert_eq!(
+                (header.kind, header.flags, header.seq),
+                (RTM_NEWROUTE, NLM_F_MULTI, 2)
+            );
+            let len = header.len as usize;
+            let found = attributes(&rest[28..len]);
+            assert_eq!(
+                found.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+                [RTA_TABLE, RTA_DST, RTA_PREFSRC, RTA_OIF]
+            );
+            seen.push((rest[17], rest[22], rest[23], found[1].1.to_vec()));
+            assert_eq!(&rest[16..17], &[AF_INET]);
+            assert_eq!(&rest[20..22], &[RT_TABLE_LOCAL, RTPROT_KERNEL]);
+            rest = &rest[len..];
+        }
+        assert_eq!(
+            seen,
+            [
+                (8, RT_SCOPE_HOST, RTN_LOCAL, vec![127, 0, 0, 0]),
+                (32, RT_SCOPE_HOST, RTN_LOCAL, vec![127, 0, 0, 1]),
+                (32, RT_SCOPE_LINK, RTN_BROADCAST, vec![127, 255, 255, 255]),
+            ]
+        );
+        let v6 = ipv6_routes(&network, 2, 7);
+        assert_eq!(
+            &v6[16..24],
+            &[
+                AF_INET6,
+                128,
+                0,
+                0,
+                RT_TABLE_LOCAL,
+                RTPROT_KERNEL,
+                0,
+                RTN_LOCAL
+            ]
+        );
+        assert_eq!(
+            attributes(&v6[28..])
+                .iter()
+                .map(|(kind, _)| *kind)
+                .collect::<Vec<_>>(),
+            [
+                RTA_TABLE,
+                RTA_DST,
+                RTA_PRIORITY,
+                RTA_OIF,
+                RTA_CACHEINFO,
+                RTA_PREF
+            ]
+        );
+        // Down: the two local routes stay, as Linux keeps them.
+        network.set_up(false);
+        assert_eq!(ipv4_routes(&network, 3, 7).len(), 2 * 60);
+        assert!(ipv6_routes(&network, 3, 7).is_empty());
     }
 
     #[test]

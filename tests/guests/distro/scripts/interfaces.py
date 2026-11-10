@@ -1,7 +1,8 @@
-"""The loopback through netlink: iproute2's ip, and glibc's getifaddrs and
-if_nameindex. Only lo is shown, as a container has its own interfaces too;
-setting it needs CAP_NET_ADMIN, which neither an unprivileged container's
-root nor a user has, so a user tries."""
+"""The loopback through netlink: iproute2's ip (links, addresses and
+routes), and glibc's getifaddrs and if_nameindex. Only lo is shown, as a
+container has its own interfaces too; setting it needs CAP_NET_ADMIN,
+which neither an unprivileged container's root nor a user has, so a user
+tries."""
 
 import ctypes
 import socket
@@ -27,6 +28,10 @@ def run(*argv):
 run("/usr/bin/ip", "-o", "link", "show", "lo")
 run("/usr/bin/ip", "-o", "addr", "show", "lo")
 run("/usr/bin/ip", "-o", "-4", "addr", "show", "dev", "lo")
+# Routes through lo alone: the kernel's for 127.0.0.1/8 and ::1, in the
+# local table.
+run("/usr/bin/ip", "-4", "route", "show", "table", "all", "dev", "lo")
+run("/usr/bin/ip", "-6", "route", "show", "table", "all", "dev", "lo")
 run(
     "/usr/bin/setpriv",
     "--reuid=65534",

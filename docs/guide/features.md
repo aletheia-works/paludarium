@@ -876,8 +876,8 @@ kernel.
   `lo` (`ENODEV` for another).
 - A netlink socket (`AF_NETLINK`, `SOCK_RAW` or `SOCK_DGRAM`, protocol
   `NETLINK_ROUTE`) shows and changes the loopback of the network namespace
-  it was made in, so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`
-  and `ip link set lo up` work. As Linux's `af_netlink`, `bind` takes a
+  it was made in, so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`,
+  `ip route` and `ip link set lo up` work. As Linux's `af_netlink`, `bind` takes a
   port ID (`EADDRINUSE` for one another socket has) or with 0 the
   process's ID, or a negative one when that is taken; `connect` or the
   first send binds an unbound socket the same way; `getsockname` and
@@ -887,7 +887,13 @@ kernel.
   `RTM_GETADDR` with `NLM_F_DUMP` answer with `lo` (index 1, its flags,
   name, MTU, queue, state, queueing discipline and zero statistics) and its
   addresses, `127.0.0.1/8` once it has been up and `::1/128` while it is
-  up, then `NLMSG_DONE` at the next receive; `RTM_GETLINK` without a dump
+  up, then `NLMSG_DONE` at the next receive. `RTM_GETROUTE` with
+  `NLM_F_DUMP` answers with the routes the kernel gives those addresses,
+  all in the local table (the main table has none): `local 127.0.0.0/8`
+  and `local 127.0.0.1` once `lo` has been up, which stay when it goes
+  down, `broadcast 127.255.255.255` while it is up, and `local ::1` while it
+  is up; `AF_INET` or `AF_INET6` alone gives that family's, and the
+  multicast routing families none. `RTM_GETLINK` without a dump
   answers for `lo` by index or `IFLA_IFNAME` (`ENODEV` for another);
   `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`, which
   needs `CAP_NET_ADMIN` in the user namespace that owns the network

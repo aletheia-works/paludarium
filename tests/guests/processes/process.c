@@ -1271,6 +1271,27 @@ static void nl_link_attribute(unsigned short type, const unsigned char *v, int l
     case 23: printf(" stats64=%d", len); break;
     }
 }
+/* The output interface of a route's attributes, for nl_answer. */
+static int nl_route_oif;
+static void nl_route_oif_attribute(unsigned short type, const unsigned char *v, int len) {
+    if (type == 4 && len == 4) memcpy(&nl_route_oif, v, 4);
+}
+static void nl_route_attribute(unsigned short type, const unsigned char *v, int len) {
+    char text[64] = "";
+    unsigned value = 0;
+    if (len == 4) memcpy(&value, v, 4);
+    printf(" %u", type);
+    if ((type == 1 || type == 7) && (len == 4 || len == 16)) {
+        inet_ntop(len == 4 ? AF_INET : AF_INET6, v, text, sizeof text);
+        printf("=%s", text);
+    } else if (len == 4) {
+        printf("=%u", value);
+    } else if (len == 1) {
+        printf("=%u", v[0]);
+    } else {
+        printf(":%d", len);
+    }
+}
 static void nl_address_attribute(unsigned short type, const unsigned char *v, int len) {
     char text[64] = "";
     unsigned value = 0;
@@ -1319,6 +1340,11 @@ static long nl_answer(int fd, long seq, unsigned port, const char *label) {
                namespace, as its ipip and gre modules make them. */
             int index = 1;
             if ((h->type == 16 && body_len >= 16) || (h->type == 20 && body_len >= 8)) memcpy(&index, body + 4, 4);
+            if (h->type == 24 && body_len >= 12) {
+                nl_route_oif = 0;
+                nl_attributes(body + 12, body_len - 12, nl_route_oif_attribute);
+                index = nl_route_oif;
+            }
             at += (h->len + 3) & ~3;
             if (index != 1) continue;
             printf("%s: type=%u flags=%#x seq=%d port=%d", label, h->type, h->flags, h->seq == seq, h->pid == port);
@@ -1346,6 +1372,12 @@ static long nl_answer(int fd, long seq, unsigned port, const char *label) {
                 memcpy(&change, body + 12, 4);
                 printf(" family=%u arphrd=%u index=%d flags=%#x change=%#x", body[0], type, index, flags, change);
                 nl_attributes(body + 16, body_len - 16, nl_link_attribute);
+            } else if (h->type == 24 && body_len >= 12) {
+                unsigned flags;
+                memcpy(&flags, body + 8, 4);
+                printf(" family=%u dst=%u src=%u tos=%u table=%u protocol=%u scope=%u kind=%u flags=%#x attributes",
+                       body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7], flags);
+                nl_attributes(body + 12, body_len - 12, nl_route_attribute);
             } else if (h->type == 20 && body_len >= 8) {
                 int index;
                 memcpy(&index, body + 4, 4);
@@ -6391,6 +6423,7 @@ int main(int argc, char **argv) {
             unsigned char family = 0;
             nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down link");
             nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down addr");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down route");
             nl_getifaddrs("down ifaddrs");
             /* Errors and acknowledgements. */
             struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
@@ -6423,6 +6456,11 @@ int main(int argc, char **argv) {
             nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "up addr");
             unsigned char inet6 = AF_INET6;
             nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &inet6, 1), port, "up addr6");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "up route");
+            unsigned char inet4 = AF_INET, multicast = 128;
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &inet4, 1), port, "up route4");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &inet6, 1), port, "up route6");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &multicast, 1), port, "up route ipmr");
             char by_name[24] = {0};
             unsigned short attribute[2] = {7, 3};
             memcpy(by_name + 16, attribute, 4);
@@ -6434,6 +6472,7 @@ int main(int argc, char **argv) {
             nl_answer(fd, nl_send(fd, 19, NL_F_REQUEST | NL_F_ACK, &down, sizeof down), port, "down again");
             nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again link");
             nl_answer(fd, nl_send(fd, 22, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again addr");
+            nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "down again route");
             nl_getifaddrs("down again ifaddrs");
             fflush(stdout);
             _exit(0);

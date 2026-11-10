@@ -3807,3 +3807,40 @@ fn interface_requests_take_unix_and_netlink_sockets() {
     assert_eq!(f.ret(44, [netlink, DATA, len, 0, 0, 0]), len);
     assert_eq!(netlink_replies(&mut f, netlink).len(), 3);
 }
+#[test]
+fn a_unix_socket_asks_after_the_loopback_of_the_namespace_it_was_made_in() {
+    let mut f = Fixture::new();
+    let errno = |e: i32| Errno(e).to_syscall_return();
+    // Without a network, an AF_UNIX socket of the first namespace has none.
+    let first = f.ret(41, [1, 2, 0, 0, 0, 0]);
+    interface_request(&f, DATA + 0x400, b"lo", 0);
+    assert_eq!(f.ret(16, [first, 0x8913, DATA + 0x400, 0, 0, 0]), errno(25));
+    // One made in a namespace reads and sets that one's loopback after the
+    // caller has moved to another.
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    let made = f.ret(41, [1, 2, 0, 0, 0, 0]);
+    let pair = f.ret(53, [1, 1, 0, DATA + 0x800, 0, 0]);
+    assert_eq!(pair, 0);
+    let paired = u64::from(read_u32(&f, DATA + 0x800));
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    let here = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    interface_request(&f, DATA + 0x400, b"lo", 1);
+    assert_eq!(f.ret(16, [made, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    assert_eq!(loopback_field(&mut f, made, 0x8913), 0x49);
+    assert_eq!(loopback_field(&mut f, paired, 0x8913), 0x49);
+    assert_eq!(loopback_field(&mut f, here, 0x8913), 0x8);
+    // Setting flags needs CAP_NET_ADMIN in the user namespace that owns the
+    // socket's network namespace, not the caller's.
+    assert_eq!(f.ret(272, [0x5000_0000, 0, 0, 0, 0, 0]), 0);
+    let owned = f.ret(41, [1, 2, 0, 0, 0, 0]);
+    interface_request(&f, DATA + 0x400, b"lo", 0);
+    assert_eq!(
+        f.ret(16, [made, 0x8914, DATA + 0x400, 0, 0, 0]),
+        Errno::EPERM.to_syscall_return()
+    );
+    assert_eq!(f.ret(16, [here, 0x8914, DATA + 0x400, 0, 0, 0]), errno(1));
+    interface_request(&f, DATA + 0x400, b"lo", 1);
+    assert_eq!(f.ret(16, [owned, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
+    assert_eq!(loopback_field(&mut f, owned, 0x8913), 0x49);
+    assert_eq!(loopback_field(&mut f, made, 0x8913), 0x49);
+}

@@ -598,7 +598,7 @@ impl Namespaces {
         }
         if flags & CLONE_NEWNET != 0 {
             new.net = self.fresh(&self.net, owner);
-            let network = Arc::new(crate::inet::Network::isolated());
+            let network = Arc::new(crate::inet::Network::isolated(owner));
             let _ = new.net.sockets.network.set(network);
         }
         if flags & CLONE_NEWTIME != 0 {

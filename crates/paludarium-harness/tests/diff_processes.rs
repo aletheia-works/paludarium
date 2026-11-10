@@ -128,8 +128,9 @@ mod linux {
             // change IDs as root, pty-vhangup needs root's capabilities and
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
-            // do the unshare, namespaces, *-namespaces, netlink and msg cases,
-            // whose checks depend on CAP_SYS_ADMIN and which make namespaces
+            // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces
+            // and msg cases, whose checks depend on CAP_SYS_ADMIN and which make
+            // namespaces
             // (msg an IPC namespace of its own, for its counts), the
             // scheduling-set case, which sets real-time and deadline policies,
             // and the personality-layout case, which maps page 0.
@@ -157,6 +158,7 @@ mod linux {
                     | "net-namespaces"
                     | "msg"
                     | "netlink"
+                    | "unix-interfaces"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
@@ -264,6 +266,7 @@ mod linux {
         processes_pid_set_tid => ("pid-set-tid","process"),
         processes_net_namespaces => ("net-namespaces","process"),
         processes_netlink => ("netlink","process"),
+        processes_unix_interfaces => ("unix-interfaces","process"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),

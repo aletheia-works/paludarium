@@ -304,6 +304,9 @@ pub(crate) struct Network {
     addressed: AtomicBool,
     /// The netlink sockets bound in it ([`crate::netlink`]).
     pub(crate) netlink: crate::netlink::Ports,
+    /// The user namespace that owns its network namespace, whose
+    /// `CAP_NET_ADMIN` changes it; none for the first one's.
+    owner: Option<Arc<crate::namespaces::Namespace>>,
 }
 /// The flags `SIOCGIFFLAGS` gives the loopback: `IFF_LOOPBACK`, with
 /// `IFF_UP` and `IFF_RUNNING` while it is up.
@@ -324,13 +327,16 @@ impl Network {
             up: AtomicBool::new(true),
             addressed: AtomicBool::new(true),
             netlink: crate::netlink::Ports::default(),
+            owner: None,
         }
     }
     /// A new network namespace's network: only a loopback, down and without
-    /// `::1`, as Linux's `loopback_net_init` makes it.
-    pub(crate) fn isolated() -> Self {
+    /// `::1`, as Linux's `loopback_net_init` makes it. `owner` is the user
+    /// namespace that owns the network namespace.
+    pub(crate) fn isolated(owner: &Arc<crate::namespaces::Namespace>) -> Self {
         Self {
             isolated: true,
+            owner: Some(Arc::clone(owner)),
             up: AtomicBool::new(false),
             addressed: AtomicBool::new(false),
             ..Self::new(NetworkPolicy::default())
@@ -350,6 +356,11 @@ impl Network {
     /// Whether the loopback has `::1` to bind to.
     fn has_loopback_address(&self) -> bool {
         self.up.load(Ordering::SeqCst)
+    }
+    /// The user namespace whose `CAP_NET_ADMIN` changes this network, as
+    /// Linux's `dev_ioctl` asks of `sock_net(sk)->user_ns`.
+    pub(crate) fn owner(&self) -> &crate::namespaces::Namespace {
+        self.owner.as_deref().unwrap_or(crate::users::first())
     }
     /// Whether the loopback is up.
     pub(crate) fn is_up(&self) -> bool {

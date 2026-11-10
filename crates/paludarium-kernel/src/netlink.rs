@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn messages_take_linux_layouts() {
-        let network = Network::isolated();
+        let network = Network::isolated(crate::users::first());
         // Down, a new namespace's loopback has no address.
         assert!(ipv4_message(&network, 1, 7).is_empty());
         assert!(ipv6_message(&network, 1, 7).is_empty());

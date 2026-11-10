@@ -857,11 +857,15 @@ kernel.
   was made in. An abstract unix socket name (one starting with 0) is bound
   and looked for among the names of the socket's namespace, as Linux's
   `unix_find_abstract`, while a socket file on a path is reached from any
-  namespace. `SIOCGIFFLAGS` and `SIOCGIFINDEX` on a TCP, UDP or netlink
-  socket read its namespace's loopback (`IFF_UP | IFF_LOOPBACK | IFF_RUNNING`
-  while it is up, in the first namespace too), and on an AF_UNIX socket,
-  as glibc's and musl's `if_nametoindex` use, the caller's; another
-  interface name is `ENODEV`. `SIOCGIFNAME` (`if_indextoname`) names index 1
+  namespace. `SIOCGIFFLAGS` and `SIOCGIFINDEX` on a socket of any family,
+  an AF_UNIX one too (as glibc's and musl's `if_nametoindex` use), read the
+  loopback of the namespace the socket was made in, as Linux's `dev_ioctl`
+  takes `sock_net` (`IFF_UP | IFF_LOOPBACK | IFF_RUNNING` while it is up,
+  in the first namespace too); an accepted AF_UNIX socket is in its
+  client's. `SIOCSIFFLAGS` needs CAP_NET_ADMIN in the user namespace that
+  owns that namespace, whichever the caller is in. An AF_UNIX socket of a
+  first namespace without a network has none (`ENOTTY`). Another interface
+  name is `ENODEV`. `SIOCGIFNAME` (`if_indextoname`) names index 1
   `lo` (`ENODEV` for another).
 - A netlink socket (`AF_NETLINK`, `SOCK_RAW` or `SOCK_DGRAM`, protocol
   `NETLINK_ROUTE`) shows and changes the loopback of the network namespace

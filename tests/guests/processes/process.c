@@ -6275,6 +6275,37 @@ int main(int argc, char **argv) {
         rmdir(dir);
         return 0;
     }
+    if (!strcmp(mode, "unix-interfaces")) {
+        /* The interface requests of an AF_UNIX socket act on the loopback
+           of the network namespace it was made in, and setting its flags
+           needs CAP_NET_ADMIN in the user namespace that owns that one. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            long first = netns_result(syscall(SYS_unshare, CLONE_NEWNET));
+            int made = socket(AF_UNIX, SOCK_DGRAM, 0), pair[2] = {-1, -1};
+            long paired = netns_result(socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+            long second = netns_result(syscall(SYS_unshare, CLONE_NEWNET));
+            int here = socket(AF_INET, SOCK_DGRAM, 0);
+            printf("made: unshare=%ld,%ld pair=%ld flags=%ld index=%ld here=%ld\n", first, second, paired,
+                   netns_lo(made, SIOCGIFFLAGS, "lo", 0), netns_lo(made, SIOCGIFINDEX, "lo", 0),
+                   netns_lo(here, SIOCGIFFLAGS, "lo", 0));
+            long up = netns_lo(made, SIOCSIFFLAGS, "lo", IFF_UP);
+            printf("up: set=%ld made=%ld pair=%ld here=%ld\n", up, netns_lo(made, SIOCGIFFLAGS, "lo", 0),
+                   netns_lo(pair[1], SIOCGIFFLAGS, "lo", 0), netns_lo(here, SIOCGIFFLAGS, "lo", 0));
+            long owned_ns = netns_result(syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNET));
+            int owned = socket(AF_UNIX, SOCK_DGRAM, 0);
+            printf("user: unshare=%ld made=%ld here=%ld owned=%ld\n", owned_ns,
+                   netns_lo(made, SIOCSIFFLAGS, "lo", 0), netns_lo(here, SIOCSIFFLAGS, "lo", 0),
+                   netns_lo(owned, SIOCSIFFLAGS, "lo", IFF_UP));
+            printf("user: owned=%ld made=%ld here=%ld\n", netns_lo(owned, SIOCGIFFLAGS, "lo", 0),
+                   netns_lo(made, SIOCGIFFLAGS, "lo", 0), netns_lo(here, SIOCGIFFLAGS, "lo", 0));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
     if (!strcmp(mode, "netlink")) {
         /* A child makes a network namespace, whose loopback, its only
            interface, NETLINK_ROUTE shows and brings up and down. */

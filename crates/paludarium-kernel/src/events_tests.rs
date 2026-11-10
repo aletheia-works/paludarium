@@ -4184,6 +4184,14 @@ fn netlink_tells_its_members_of_changes() {
     );
     assert_eq!(read_u32(&f, DATA + 0x300), 8);
     assert_eq!(read_u32(&f, DATA + 0x304), 0x10);
+    // The membership options are set alone (`ENOPROTOOPT` to get).
+    f.mem
+        .write(GuestAddr(DATA + 0x300), &4u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        f.ret(55, [joined, 270, 1, DATA + 0x304, DATA + 0x300, 0]),
+        errno(92)
+    );
     let control = f.ret(41, [16, 3, 0, 0, 0, 0]);
     // Up, through SIOCSIFFLAGS: the link, then 127.0.0.1/8 and its routes.
     interface_request(&f, DATA + 0x400, b"lo", 1);

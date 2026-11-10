@@ -909,8 +909,10 @@ kernel.
   `RTA_PREFSRC` 127.0.0.1 and the caller's `RTA_UID`, and
   127.255.255.255 a broadcast one while `lo` is up; `::1` gives its local
   route while `lo` is up; any other destination is `ENETUNREACH`, and
-  `AF_UNSPEC` `EOPNOTSUPP`. With `RTM_F_FIB_MATCH` the answer is the table
-  entry that matched. `RTM_GETLINK` without a dump
+  `AF_UNSPEC` `EOPNOTSUPP`; a destination shorter than its family's
+  address is `ERANGE` for IPv4 and `EINVAL` for IPv6. With
+  `RTM_F_FIB_MATCH` the answer is the table entry that matched
+  (`EHOSTUNREACH` for `0.0.0.0`, which none is). `RTM_GETLINK` without a dump
   answers for `lo` by index or `IFLA_IFNAME` (`ENODEV` for another);
   `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`, which
   needs `CAP_NET_ADMIN` in the user namespace that owns the network

@@ -809,8 +809,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   127.0.0.1 で呼び出し元の `RTA_UID` を持つ、メインの表のローカルな経路になり、
   127.255.255.255 は `lo` が上がっている間ブロードキャストの経路になります。`::1` は
   `lo` が上がっている間そのローカルな経路になります。ほかの宛先は `ENETUNREACH`、
-  `AF_UNSPEC` は `EOPNOTSUPP` です。`RTM_F_FIB_MATCH` を付ければ、合った表の項目を
-  返します。ダンプでない `RTM_GETLINK` には、インデックスか `IFLA_IFNAME` で指した `lo` を
+  `AF_UNSPEC` は `EOPNOTSUPP` です。ファミリーのアドレスより短い宛先は、IPv4 なら
+  `ERANGE`、IPv6 なら `EINVAL` です。`RTM_F_FIB_MATCH` を付ければ、合った表の項目を
+  返します（`0.0.0.0` に合う項目はないので `EHOSTUNREACH` です）。ダンプでない `RTM_GETLINK` には、インデックスか `IFLA_IFNAME` で指した `lo` を
   返します（ほかは `ENODEV`）。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
   それには、ネットワーク名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送る
   スレッドとソケットを開いたものの両方に要ります（なければ `EPERM`）。エラーと、

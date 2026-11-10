@@ -3875,6 +3875,15 @@ fn netlink_dumps_the_routes_of_a_new_namespaces_loopback() {
     assert_eq!(lookup(&mut f, 10, 0, &one, 12), (24, 2, 0, 128));
     assert_eq!(lookup(&mut f, 10, 0, &[0; 16], 13), (2, 0, 0, -101));
     assert_eq!(lookup(&mut f, 0, 0, &[], 14), (2, 0, 0, -95));
+    // No table entry is 0.0.0.0's; a destination too short for its family
+    // is refused, and a longer one counts as its first bytes.
+    assert_eq!(lookup(&mut f, 2, 0x2000, &[0; 4], 19), (2, 0, 0, -113));
+    assert_eq!(lookup(&mut f, 2, 0, &[127, 0], 20), (2, 0, 0, -34));
+    assert_eq!(
+        lookup(&mut f, 2, 0, &[127, 0, 0, 1, 9, 9], 21),
+        (24, 2, 0x8000_0200, 32)
+    );
+    assert_eq!(lookup(&mut f, 10, 0, &one[12..], 22), (2, 0, 0, -22));
     // Short of an rtmsg, a lookup is EINVAL.
     let len = netlink_request(&f, DATA, 26, 0x1, 15, &[2]);
     assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);

@@ -62,7 +62,6 @@ const RTCF_BROADCAST: u32 = 0x1000_0000;
 /// The main table, which with no policy rules Linux merges the local one
 /// into for lookups (`fib_unmerge`).
 const RT_TABLE_MAIN: u8 = 254;
-const ENETUNREACH: Errno = Errno(101);
 const RTA_OIF: u16 = 4;
 const RTA_PRIORITY: u16 = 6;
 const RTA_PREFSRC: u16 = 7;
@@ -149,6 +148,8 @@ const EOPNOTSUPP: Errno = Errno(95);
 const EAFNOSUPPORT: Errno = Errno(97);
 const EADDRINUSE: Errno = Errno(98);
 const ENOBUFS: Errno = Errno(105);
+const ENETUNREACH: Errno = Errno(101);
+const EHOSTUNREACH: Errno = Errno(113);
 const ECONNREFUSED: Errno = Errno(111);
 const EBUSY: Errno = Errno(16);
 const EEXIST: Errno = Errno(17);
@@ -949,10 +950,13 @@ fn lookup_cacheinfo() -> [u8; RTA_CACHEINFO_LEN] {
 /// A route lookup (`RTM_GETROUTE` without a dump), as `inet_rtm_getroute`
 /// and `inet6_rtm_getroute` answer one for the destination `RTA_DST` names
 /// (none is `0.0.0.0` or `::`): `EINVAL` for a request shorter than an
-/// `rtmsg`; `EOPNOTSUPP` for an input route (`RTA_IIF`), which is not
-/// supported; `ENETUNREACH` where no route goes. `RTA_SRC`, `RTA_OIF` and
-/// the other selectors are not looked at. With `RTM_F_FIB_MATCH` the
-/// answer is the table's entry that matched.
+/// `rtmsg`; a destination shorter than its family's address is `ERANGE`
+/// for IPv4 and `EINVAL` for IPv6, as their attribute policies give, and
+/// a longer one counts as its first bytes; `EOPNOTSUPP` for an input route
+/// (`RTA_IIF`), which is not supported; `ENETUNREACH` where no route goes.
+/// `RTA_SRC`, `RTA_OIF` and the other selectors are not looked at. With
+/// `RTM_F_FIB_MATCH` the answer is the table's entry that matched, and
+/// `EHOSTUNREACH` for `0.0.0.0`, which no entry is.
 fn lookup(
     network: &Network,
     payload: &[u8],
@@ -981,8 +985,7 @@ fn lookup(
     if family == AF_INET6 {
         let mut address = [0u8; 16];
         if let Some(value) = dst {
-            let n = value.len().min(16);
-            address[..n].copy_from_slice(&value[..n]);
+            address = *value.first_chunk().ok_or(Errno::EINVAL)?;
         }
         let mut one = [0u8; 16];
         one[15] = 1;
@@ -1014,8 +1017,7 @@ fn lookup(
     }
     let mut address = [0u8; 4];
     if let Some(value) = dst {
-        let n = value.len().min(4);
-        address[..n].copy_from_slice(&value[..n]);
+        address = *value.first_chunk().ok_or(ERANGE)?;
     }
     let broadcast = address == [127, 255, 255, 255] && network.is_up();
     let unspecified = address == [0; 4];
@@ -1026,7 +1028,7 @@ fn lookup(
         // The entry that matched, longest first: the address, the
         // broadcast address while up, or 127.0.0.0/8.
         if unspecified {
-            return Err(ENETUNREACH);
+            return Err(EHOSTUNREACH);
         }
         let (entry, dst_len, scope, kind) = if address == [127, 0, 0, 1] {
             ([127, 0, 0, 1], 32, RT_SCOPE_HOST, RTN_LOCAL)

@@ -1401,7 +1401,7 @@ static void nl_lookups(int fd, unsigned port, const char *when) {
         {AF_INET, 4, 0, "127.0.0.1"},       {AF_INET, 4, 0, "127.1.2.3"}, {AF_INET, 4, 0, "127.255.255.255"},
         {AF_INET, 4, 0, "8.8.8.8"},         {AF_INET, 4, 0, "0.0.0.0"},   {AF_INET, 4, 0x2000, "127.1.2.3"},
         {AF_INET, 4, 0x2000, "127.0.0.1"},  {AF_INET6, 16, 0, "::1"},     {AF_INET6, 16, 0, "2001:db8::1"},
-        {AF_INET6, 16, 0x2000, "::1"},
+        {AF_INET6, 16, 0x2000, "::1"},      {AF_INET, 4, 0x2000, "0.0.0.0"},
     };
     for (size_t i = 0; i < sizeof asked / sizeof asked[0]; i++) {
         unsigned char request[12 + 4 + 16] = {asked[i].family, asked[i].len * 8};
@@ -1412,6 +1412,21 @@ static void nl_lookups(int fd, unsigned port, const char *when) {
         char label[64];
         snprintf(label, sizeof label, "%s get %s%s", when, asked[i].flags ? "fibmatch " : "", asked[i].text);
         nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, 16 + asked[i].len), port, label);
+    }
+    /* A destination shorter than its family's address, and one longer. */
+    static const struct {
+        unsigned char family, len;
+    } sized[] = {{AF_INET, 2}, {AF_INET, 6}, {AF_INET6, 4}, {AF_INET6, 18}};
+    for (size_t i = 0; i < sizeof sized / sizeof sized[0]; i++) {
+        unsigned char request[12 + 4 + 20] = {sized[i].family};
+        unsigned short attribute[2] = {4 + sized[i].len, 1};
+        memcpy(request + 12, attribute, 4);
+        if (sized[i].family == AF_INET) memcpy(request + 16, "\x7f\0\0\x01\x09\x09", 6);
+        else request[16 + 15] = 1;
+        char label[64];
+        snprintf(label, sizeof label, "%s get %s of %u bytes", when, sized[i].family == AF_INET ? "IPv4" : "IPv6",
+                 sized[i].len);
+        nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, 16 + ((sized[i].len + 3) & ~3)), port, label);
     }
 }
 /* What getifaddrs gives, one line each. */

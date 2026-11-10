@@ -53,7 +53,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
@@ -77,6 +77,32 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `sendfile` は、通常のファイルを書き込める任意のファイルに送り、パイプには 1 回でその容量
   までを送ります。どちらも、渡されたオフセットかファイルの位置を進めます。`sendfile` は、
   失敗したときもオフセットを書き戻します。
+- `splice` は、パイプ（または FIFO）と、通常のファイル、デバイス、ソケット、別のパイプの
+  間でバイトを動かします。`tee` は、あるパイプにあるものを取り出さずに別のパイプへ
+  コピーし、`vmsplice` は、ゲストのバッファーを書き込み用に開いたパイプへ入れるか、
+  パイプのバイトをバッファーへ取り出します。確かめる順番は Linux の `fs/splice.c` と
+  同じです。`splice` はバイト数が 0 なら何よりも先に 0 を返し、`tee` は先にフラグを
+  確かめます。そのあと、フラグ（`EINVAL`）、ディスクリプタ（`EBADF`、`O_PATH` も）、
+  パイプへのオフセット（`ESPIPE`）、オフセットの読み込み（`EFAULT`）、アクセスモード
+  （`EBADF`）、ソケットのように位置のないファイルへのオフセットか `O_APPEND` の出力
+  （`EINVAL`）、範囲（`EINVAL`）、splice できない種類のファイル（ディレクトリ、eventfd。
+  `EINVAL`）の順です。同じパイプの 2 つの記述は `EINVAL`、パイプでないファイルへの
+  `vmsplice` は `EBADF` です。読み手のいないパイプは `SIGPIPE` を伴う `EPIPE` で、入力より
+  先に、入力が終わりにあっても確かめます。`SPLICE_F_NONBLOCK` かパイプの `O_NONBLOCK`
+  （パイプからの `vmsplice` はフラグだけ）が待たないと言わない限り、データか空きを待ち
+  （`EAGAIN`）、書き手のいなくなったパイプは 0 を返し、いくらか動かした呼び出しは、
+  また待たずにその数を返します。1 回で動かすのは、パイプにあるか空いている分までです。
+  ソケットへの送信は `SPLICE_F_NONBLOCK` で待たず、unix のストリームソケットからの
+  読み込みも同じで、ほかのファイルはそれ自身の `O_NONBLOCK` のとおりに読み書きします。
+  バイトはコピーするので、`SPLICE_F_MOVE`、`SPLICE_F_GIFT`、`SPLICE_F_MORE` は何も
+  変えません。ここでのパイプは Linux のページのバッファーではなくバイトを持ち、大きさの
+  分だけバイトを受け取ります。Linux は 1 バイトのバッファーも容量の 1 ページと数えるので、
+  一部が埋まったパイプや、ページ単位でない `vmsplice` のバッファーでは、ここのほうが
+  多く受け取ることがあります。また、Linux のパイプのロックと違い、あるスレッドの呼び出しは、
+  別のスレッドによる同じパイプの読み込みに対して不可分ではありません。
+  パイプの代わりであるホストの標準のストリームは、`splice` のどちらの端にもなれます
+  （オフセットを渡すと `ESPIPE`）。`tee` と `vmsplice` はゲスト自身のパイプだけを受け付け、
+  標準のストリームは受け付けません。
 - `getdents64` は返したエントリーの続きから読むので、それらを `unlink` しても
   読み飛ばしません。ディレクトリが変わらない間は、`d_off` への `lseek` で同じ
   エントリーに戻ります。`dup` と `fork` は読んでいる位置を共有します。
@@ -207,7 +233,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
   除いて `O_LARGEFILE` がありません。
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
-  読み書き、`lseek`、`flock`、`getdents64`、`sendfile`、`copy_file_range`、`fsync`、
+  読み書き、`lseek`、`flock`、`getdents64`、`sendfile`、`copy_file_range`、`splice`、`tee`、`vmsplice`、`fsync`、
   `fdatasync`、`syncfs`、`sync_file_range`、`fadvise64`、`readahead`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
   呼び出し、`epoll_ctl`（epoll のディスクリプタとしても対象としても）、`epoll_wait`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
@@ -1673,7 +1699,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
-  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`splice`、`tee`、`vmsplice`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
   `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll`、時間制限つきの `futex` の待ちは、
   `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
   `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが

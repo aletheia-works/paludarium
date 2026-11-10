@@ -451,6 +451,52 @@ impl PipeEnd {
         Ok(size as u64)
     }
 }
+/// What `splice`, `tee` and `vmsplice` look at and take of a pipe
+/// ([`crate::files`]'s `splice`), whichever end this description is.
+impl PipeEnd {
+    /// The side whose bytes the pipe's reader reads.
+    fn read_side(&self) -> usize {
+        if self.reader {
+            self.endpoint.side
+        } else {
+            1 - self.endpoint.side
+        }
+    }
+    /// Whether `other` is a description of this same pipe.
+    pub(crate) fn same_pipe(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.endpoint.pair, &other.endpoint.pair)
+    }
+    /// The bytes waiting to be read.
+    pub(crate) fn unread_bytes(&self) -> usize {
+        self.endpoint.lock_sides()[self.read_side()].bytes.len()
+    }
+    /// The bytes a write may still put in the pipe.
+    pub(crate) fn room(&self) -> usize {
+        self.endpoint
+            .pair
+            .window()
+            .saturating_sub(self.unread_bytes())
+    }
+    /// Whether some description still reads the pipe (Linux's `readers`).
+    pub(crate) fn has_readers(&self) -> bool {
+        !self.endpoint.lock_sides()[self.read_side()].closed
+    }
+    /// Whether some description still writes the pipe (`writers`).
+    pub(crate) fn has_writers(&self) -> bool {
+        !self.endpoint.lock_sides()[1 - self.read_side()].closed
+    }
+    /// Copies the first unread bytes into `buf`, leaving them in the pipe,
+    /// and returns how many there were.
+    pub(crate) fn peek(&self, buf: &mut [u8]) -> usize {
+        let sides = self.endpoint.lock_sides();
+        let bytes = &sides[self.read_side()].bytes;
+        let count = buf.len().min(bytes.len());
+        for (d, s) in buf[..count].iter_mut().zip(bytes.iter()) {
+            *d = *s;
+        }
+        count
+    }
+}
 impl FileHandle for PipeEnd {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
@@ -1155,7 +1201,7 @@ pub(crate) fn user_buffer(at: u64, len: u64) -> Result<usize, Errno> {
 }
 /// Linux's `access_ok`: EFAULT for `len` bytes at `at` that reach past the
 /// user half.
-fn access_ok(at: u64, len: usize) -> Result<(), Errno> {
+pub(crate) fn access_ok(at: u64, len: usize) -> Result<(), Errno> {
     if at > TASK_SIZE_MAX.saturating_sub(len as u64) {
         return Err(Errno::EFAULT);
     }

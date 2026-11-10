@@ -5203,6 +5203,63 @@ static int itimer_case(void) {
     sigprocmask(SIG_UNBLOCK, &block, NULL);
     return 0;
 }
+static long mm_errno(long r) { return r < 0 ? -errno : r; }
+/* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
+static int mmsg_case(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) return 80;
+    char out[3][5], in[4][8];
+    struct iovec oi[3], ii[4];
+    struct mmsghdr om[3], im[4];
+    memset(om, 0, sizeof om);
+    memset(im, 0, sizeof im);
+    for (int i = 0; i < 3; i++) {
+        memset(out[i], 'a' + i, 5);
+        oi[i] = (struct iovec){out[i], 5};
+        om[i].msg_hdr.msg_iov = &oi[i];
+        om[i].msg_hdr.msg_iovlen = 1;
+    }
+    for (int i = 0; i < 4; i++) {
+        ii[i] = (struct iovec){in[i], 8};
+        im[i].msg_hdr.msg_iov = &ii[i];
+        im[i].msg_hdr.msg_iovlen = 1;
+    }
+    long sent = mm_errno(syscall(SYS_sendmmsg, (long)sv[0], om, 3L, 0L));
+    printf("sendmmsg=%ld len=%u,%u,%u\n", sent, om[0].msg_len, om[1].msg_len, om[2].msg_len);
+    long got = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 4L, (long)MSG_DONTWAIT, NULL));
+    printf("recvmmsg dontwait=%ld len=%u,%u,%u third=%.5s\n", got, im[0].msg_len, im[1].msg_len,
+           im[2].msg_len, in[2]);
+    syscall(SYS_sendmmsg, (long)sv[0], om, 2L, 0L);
+    printf("recvmmsg waitforone=%ld\n",
+           mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 4L, (long)MSG_WAITFORONE, NULL)));
+    printf("none send=%ld receive=%ld high-vlen=%ld\n", mm_errno(syscall(SYS_sendmmsg, (long)sv[0], om, 0L, 0L)),
+           mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 0L, 0L, NULL)),
+           mm_errno(syscall(SYS_sendmmsg, (long)sv[0], om, (1L << 32) | 1L, 0L)));
+    syscall(SYS_recvmmsg, (long)sv[1], im, 4L, (long)MSG_DONTWAIT, NULL);
+    int p[2];
+    if (pipe(p)) return 81;
+    struct timespec bad = {0, 1000000000};
+    printf("compat send=%ld receive=%ld timeout-fault=%ld timeout-bad=%ld badf=%ld notsock=%ld,%ld\n",
+           mm_errno(syscall(SYS_sendmmsg, 99L, om, 1L, 0x80000000L)),
+           mm_errno(syscall(SYS_recvmmsg, 99L, im, 1L, 0x80000000L, NULL)),
+           mm_errno(syscall(SYS_recvmmsg, 99L, im, 1L, 0L, (void *)8)),
+           mm_errno(syscall(SYS_recvmmsg, 99L, im, 1L, 0L, &bad)),
+           mm_errno(syscall(SYS_sendmmsg, 99L, om, 0L, 0L)),
+           mm_errno(syscall(SYS_sendmmsg, (long)p[0], om, 0L, 0L)),
+           mm_errno(syscall(SYS_recvmmsg, (long)p[0], im, 0L, 0L, NULL)));
+    /* An error after a message gives the count, and alone the error. */
+    om[1].msg_hdr.msg_iov = (struct iovec *)8;
+    long partial = mm_errno(syscall(SYS_sendmmsg, (long)sv[0], om, 2L, 0L));
+    printf("error-after-one=%ld alone=%ld\n", partial,
+           mm_errno(syscall(SYS_sendmmsg, (long)sv[0], &om[1], 1L, 0L)));
+    /* The time left is written back once a message came. */
+    struct timespec t = {5, 0};
+    long timed = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 2L, (long)MSG_DONTWAIT, &t));
+    printf("timed=%ld left-ok=%d empty=%ld\n", timed,
+           t.tv_sec >= 0 && t.tv_sec <= 5 && (t.tv_sec || t.tv_nsec),
+           mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 2L, (long)MSG_DONTWAIT, NULL)));
+    return 0;
+}
 static int pkey_case(void) {
     long page = 4096;
     char *base = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -15756,6 +15813,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
+    if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();

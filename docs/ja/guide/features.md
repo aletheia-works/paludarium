@@ -57,7 +57,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
-| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -296,6 +296,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、読んだときに送ったソケットが持っている名前で、そのソケットがなくなったあとも
   同じです。渡された場所に収まる分だけ書き、長さは全体の長さです。名前のないソケットの
   アドレスの長さは 0 です。
+- `sendmmsg` と `recvmmsg` は、Linux の `__sys_sendmmsg` と `do_recvmmsg` と同じく、ベクターの
+  メッセージを 1 つずつ `sendmsg` と `recvmsg` と同じように送受信し（どのソケットでも）、
+  それぞれのバイト数を `msg_len` に書きます。`MSG_CMSG_COMPAT` は `EINVAL` です。`sendmmsg` は
+  最大 1024 個を送り、一部しか送れなかったメッセージのあとで止まります。どちらもエラーで
+  止まり、1 つも送受信できなかったときだけエラーを返し、それ以外は数を返します。
+  `MSG_WAITFORONE` は最初のメッセージだけを待ち、`recvmmsg` は帯域外データのあとで止まります。
+  タイムアウトは記述子より先に読み（`EFAULT`）確かめます（`EINVAL`）が、Linux と同じく各
+  メッセージのあとにしか見ないので、最初のメッセージはそれなしに待ちます。メッセージが
+  届いたら、残りの時間を書き戻します。
 - 読まれていないメッセージだけが持っているソケットは、Linux のガベージコレクタ
   （`unix_gc`）がソケットのなくなるときに閉じるのと同じく閉じられます。自分のキューで
   ディスクリプタが待っているソケットや、そうして互いを持ち合うソケットは、ディスクリプタが
@@ -1604,7 +1613,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
-  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
   `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll`、時間制限つきの `futex` の待ちは、
   `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
   `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが

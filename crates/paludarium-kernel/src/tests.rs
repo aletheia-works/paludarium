@@ -3845,3 +3845,107 @@ mod io_uring {
         assert_eq!(f.ret(427, &[0, 8, probe, 1]), errno(Errno(95)));
     }
 }
+
+mod multiple_messages {
+    use super::*;
+    const RECVMMSG: u64 = 299;
+    const SENDMMSG: u64 = 307;
+    /// `count` mmsghdrs at `at`, each with one iovec of `len` bytes at
+    /// `buffers + 0x10 * i`; the iovecs are at `at + 0x800`.
+    fn vector(f: &Fixture, at: u64, buffers: u64, count: u64, len: u64) {
+        for i in 0..count {
+            let entry = at + 64 * i;
+            let iov = at + 0x100 + 16 * i;
+            for offset in (0..64).step_by(8) {
+                f.mem.write_u64(GuestAddr(entry + offset), 0).unwrap();
+            }
+            f.mem.write_u64(GuestAddr(entry + 16), iov).unwrap();
+            f.mem.write_u64(GuestAddr(entry + 24), 1).unwrap();
+            f.mem.write_u64(GuestAddr(iov), buffers + 0x10 * i).unwrap();
+            f.mem.write_u64(GuestAddr(iov + 8), len).unwrap();
+        }
+    }
+    fn msg_len(f: &Fixture, at: u64, i: u64) -> u32 {
+        (f.mem.read_u64(GuestAddr(at + 64 * i + 56)).unwrap() & 0xffff_ffff) as u32
+    }
+    fn datagram_pair(f: &mut Fixture) -> (u64, u64) {
+        assert_eq!(f.ret(53, &[1, 2, 0, DATA + 0x100]), 0);
+        let fds = f.mem.read_u64(GuestAddr(DATA + 0x100)).unwrap();
+        (fds & 0xffff_ffff, fds >> 32)
+    }
+    #[test]
+    fn sendmmsg_and_recvmmsg_move_one_datagram_per_entry() {
+        let mut f = fixture();
+        let (a, b) = datagram_pair(&mut f);
+        let (send, receive, out, into) = (DATA + 0x400, DATA + 0x800, DATA + 0x600, DATA + 0xa00);
+        for i in 0..3 {
+            f.mem
+                .write(GuestAddr(out + 0x10 * i), &[b'a' + i as u8; 5])
+                .unwrap();
+        }
+        vector(&f, send, out, 3, 5);
+        assert_eq!(f.ret(SENDMMSG, &[a, send, 3, 0]), 3);
+        assert_eq!([0, 1, 2].map(|i| msg_len(&f, send, i)), [5, 5, 5]);
+        // Four asked, three there: MSG_DONTWAIT stops at the empty queue.
+        vector(&f, receive, into, 4, 8);
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 4, 0x40, 0]), 3);
+        assert_eq!([0, 1, 2].map(|i| msg_len(&f, receive, i)), [5, 5, 5]);
+        let mut got = [0; 5];
+        f.mem.read(GuestAddr(into + 0x20), &mut got).unwrap();
+        assert_eq!(&got, b"ccccc");
+        // MSG_WAITFORONE waits only for the first.
+        assert_eq!(f.ret(SENDMMSG, &[a, send, 2, 0]), 2);
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 4, 0x10000, 0]), 2);
+        // Nothing asked is nothing done, on a socket.
+        assert_eq!(f.ret(SENDMMSG, &[a, send, 0, 0]), 0);
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 0, 0, 0]), 0);
+        // vlen is an unsigned int.
+        assert_eq!(f.ret(SENDMMSG, &[a, send, (1 << 32) | 1, 0]), 1);
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 4, 0x40, 0]), 1);
+    }
+    #[test]
+    fn they_check_as_linux_does() {
+        let mut f = fixture();
+        let (a, b) = datagram_pair(&mut f);
+        let (vec, timeout) = (DATA + 0x400, DATA + 0xc00);
+        vector(&f, vec, DATA + 0x600, 2, 4);
+        // MSG_CMSG_COMPAT first, then (recvmmsg) the timeout, then the
+        // descriptor.
+        assert_eq!(
+            f.ret(SENDMMSG, &[99, vec, 1, 0x8000_0000]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(
+            f.ret(RECVMMSG, &[99, vec, 1, 0x8000_0000, 0]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(f.ret(RECVMMSG, &[99, vec, 1, 0, 8]), errno(Errno::EFAULT));
+        f.mem.write_u64(GuestAddr(timeout), 0).unwrap();
+        f.mem
+            .write_u64(GuestAddr(timeout + 8), 1_000_000_000)
+            .unwrap();
+        assert_eq!(
+            f.ret(RECVMMSG, &[99, vec, 1, 0, timeout]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(f.ret(SENDMMSG, &[99, vec, 0, 0]), errno(Errno::EBADF));
+        assert_eq!(f.ret(293, &[DATA + 0x100, 0]), 0);
+        let pipe = f.mem.read_u64(GuestAddr(DATA + 0x100)).unwrap() & 0xffff_ffff;
+        assert_eq!(f.ret(SENDMMSG, &[pipe, vec, 0, 0]), errno(Errno(88)));
+        assert_eq!(f.ret(RECVMMSG, &[pipe, vec, 0, 0, 0]), errno(Errno(88)));
+        // An error after a message is not given: the count is.
+        f.mem.write_u64(GuestAddr(vec + 64 + 16), 8).unwrap(); // a bad iovec
+        assert_eq!(f.ret(SENDMMSG, &[a, vec, 2, 0]), 1);
+        assert_eq!(f.ret(SENDMMSG, &[a, vec + 64, 1, 0]), errno(Errno::EFAULT));
+        // The time left is written back once a message came.
+        f.mem.write_u64(GuestAddr(timeout), 5).unwrap();
+        f.mem.write_u64(GuestAddr(timeout + 8), 0).unwrap();
+        vector(&f, vec, DATA + 0x600, 2, 4);
+        assert_eq!(f.ret(RECVMMSG, &[b, vec, 2, 0x40, timeout]), 1);
+        let left = f.mem.read_u64(GuestAddr(timeout)).unwrap() * 1_000_000_000
+            + f.mem.read_u64(GuestAddr(timeout + 8)).unwrap();
+        assert!(left <= 5_000_000_000 && left > 0, "{left}");
+        // With none there, the error is given.
+        assert_eq!(f.ret(RECVMMSG, &[b, vec, 2, 0x40, 0]), errno(Errno::EAGAIN));
+    }
+}

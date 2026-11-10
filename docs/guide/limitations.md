@@ -170,6 +170,9 @@ verified.
   changes nothing (no request is ever in flight).
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
+  - An error that ends `recvmmsg` after some messages is dropped, where
+    Linux keeps it as the socket's error for the next call and
+    `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`,
     cannot be set: `setitimer` gives `EINVAL` for them, where Linux sets them
     and sends `SIGVTALRM` and `SIGPROF`, and `getitimer` shows them disarmed.

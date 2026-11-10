@@ -307,7 +307,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   名前空間のソケットにも送りません（`NETLINK_LISTEN_ALL_NSID` はありません）。`lo` を
   落としたときに消える、`lo` を通る IPv4 の経路は、Linux と同じく何も伝えません。
   `NETLINK_PKTINFO`、`NETLINK_NO_ENOBUFS` など、機能のページに挙げていないオプションは
-  `ENOPROTOOPT` です。リンクのメッセージの統計は 0 です。
+  `ENOPROTOOPT` です。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、`CONFIG_MCTP` を
+  組み込んだ Ubuntu のカーネルと同じく MCTP の設定を載せます。組み込んでいない
+  カーネルは載せません。
   IPv4 と IPv6 の設定は、sysctl が組み込みのままのカーネルのものです。Linux の新しい
   名前空間はホストのものを写します。IPv6 の作成時刻は 0、到達可能時間は 30 秒です。
   Linux では乱数で決まります。アドレスの作成時刻は 0 です。`NETLINK_EXT_ACK` はエラーに属性を足さず、厳密な検査も何も

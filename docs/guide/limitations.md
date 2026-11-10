@@ -352,7 +352,9 @@ verified.
   is not supported); IPv4's routes through `lo` go without one when it
   goes down, as on Linux. `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the
   other options not listed in the features are `ENOPROTOOPT`. A link message's
-  statistics are zero; its IPv4 and IPv6 settings are those of a kernel
+  statistics are zero, and its `IFLA_AF_SPEC` carries MCTP's settings
+  as Ubuntu's kernel, built with `CONFIG_MCTP`, gives them, where a kernel
+  without it gives none; its IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30 seconds,
   where Linux's is random. An address's creation times are 0,

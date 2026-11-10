@@ -185,10 +185,6 @@ fn stack_write_probe_preserves_bytes_and_observes_protection() {
     assert_eq!(m.read_u64(GuestAddr(0x10000)).unwrap(), 0x123456789abcdef0);
 }
 
-mod signals_time_tests {
-    use super::*;
-    include!("signals_time_tests.rs");
-}
 #[test]
 fn a_replacing_map_takes_the_place_of_what_was_mapped() {
     let m = memory(2);
@@ -221,4 +217,9 @@ fn a_replacing_map_takes_the_place_of_what_was_mapped() {
         ),
         Err(Errno::EINVAL)
     );
+}
+
+mod signals_time_tests {
+    use super::*;
+    include!("signals_time_tests.rs");
 }

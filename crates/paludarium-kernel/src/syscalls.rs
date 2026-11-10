@@ -1480,6 +1480,9 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             return err(Errno::EINVAL);
         }
         if flags & MAP_FIXED_NOREPLACE == 0 {
+            // Under one hold of the locks, so that no other thread's mmap
+            // takes the range in between. The file is attached below, under
+            // another.
             c.mem.map_replacing(at, len, prot, kind)
         } else {
             c.mem.map_shared(Some(at), len, prot, kind)

@@ -132,6 +132,48 @@ fn syscall(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, n: u64, a: [u64; 6]
     k.handle(t, m, ExitReason::Syscall { rip: t.cpu.rip });
     t.cpu.gpr[reg::RAX]
 }
+/// Calls `replace`, a system call that maps at `at` in place of what is
+/// there, up to 2,000 times, while another thread keeps mapping and
+/// unmapping a page without an address, which takes `at` whenever it is
+/// free. The first result that is not `at`, if any.
+fn replaced_while_another_thread_maps(
+    k: &mut Kernel,
+    t: &mut Thread,
+    m: &AddressSpace,
+    at: u64,
+    mut replace: impl FnMut(&mut Kernel, &mut Thread, &AddressSpace) -> u64,
+) -> Option<u64> {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(other) =
+                    m.map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+                {
+                    let _ = m.unmap_shared(other, PAGE_SIZE);
+                }
+            }
+        });
+        let failed = (0..2_000).map(|_| replace(k, t, m)).find(|&got| got != at);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        failed
+    })
+}
+/// The page `mmap` without an address takes first.
+fn first_free_page(k: &mut Kernel, t: &mut Thread, m: &AddressSpace) -> u64 {
+    syscall(k, t, m, 9, [0, PAGE_SIZE, 3, 0x22, u64::MAX, 0])
+}
+#[test]
+fn map_fixed_replaces_a_mapping_whatever_other_threads_map() {
+    let (mut k, mut t, m) = setup();
+    let at = first_free_page(&mut k, &mut t, &m);
+    // Linux replaces the mapping under its mmap_lock: no other thread's
+    // `mmap` takes the range between the unmap and the map (EEXIST).
+    let failed = replaced_while_another_thread_maps(&mut k, &mut t, &m, at, |k, t, m| {
+        syscall(k, t, m, 9, [at, PAGE_SIZE, 3, 0x32, u64::MAX, 0])
+    });
+    assert_eq!(failed, None);
+}
 fn fork(
     k: &mut Kernel,
     t: &mut Thread,
@@ -3964,6 +4006,17 @@ mod shm {
         assert_eq!(shmat(&mut k, &mut t, &m, u64::MAX, 0, 0), e(Errno::EINVAL));
         assert_eq!(shmdt(&mut k, &mut t, &m, at), 0);
         assert_eq!(nattch(&mut k, &mut t, &m, id), 0);
+    }
+
+    #[test]
+    fn shm_remap_replaces_a_mapping_whatever_other_threads_map() {
+        let (mut k, mut t, m) = setup();
+        let id = shmget(&mut k, &mut t, &m, 0, PAGE_SIZE, 0o600);
+        let at = first_free_page(&mut k, &mut t, &m);
+        let failed = replaced_while_another_thread_maps(&mut k, &mut t, &m, at, |k, t, m| {
+            shmat(k, t, m, id, at, SHM_REMAP)
+        });
+        assert_eq!(failed, None);
     }
 
     #[test]

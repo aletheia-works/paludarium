@@ -353,6 +353,9 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
             return Err(ENOMEM);
         }
         let at = GuestAddr(addr);
+        // Under one hold of the locks, so that no other thread's mmap takes
+        // the range in between. The segment is attached below, under
+        // another.
         c.mem.map_replacing(at, len, prot, MappingKind::File)?
     } else {
         c.mem.map_shared(None, len, prot, MappingKind::File)?

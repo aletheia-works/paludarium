@@ -47,16 +47,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
+| POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、後述の疑似端末のリクエスト） |
-| イベント | `eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
+| イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
@@ -79,7 +80,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   失敗したときもオフセットを書き戻します。
 - `getdents64` は返したエントリーの続きから読むので、それらを `unlink` しても
   読み飛ばしません。ディレクトリが変わらない間は、`d_off` への `lseek` で同じ
-  エントリーに戻ります。`dup` と `fork` は読んでいる位置を共有します。
+  エントリーに戻ります。`dup` と `fork` は読んでいる位置を共有します。`getdents`
+  も同じで、古い `linux_dirent` を書きます（型は各エントリーの最後のバイトです）。
+  どちらも Linux と同じく大きさを `int` で持つので、2 GiB 以上ではどのエントリーも
+  入りません（`EINVAL`）。
 - 拡張属性はメモリ上のファイルとともに保持し、ハードリンクや名前の変更のあとも、
   最後の名前がなくなったあとも残ります。Linux と同じく、`user.*` は通常のファイルと
   ディレクトリ用で（ほかでは読むと `ENODATA`、書くと `EPERM`）、`trusted.*` は
@@ -207,7 +211,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
   除いて `O_LARGEFILE` がありません。
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
-  読み書き、`lseek`、`flock`、`getdents64`、`sendfile`、`copy_file_range`、`fsync`、
+  読み書き、`lseek`、`flock`、`getdents`、`getdents64`、`sendfile`、`copy_file_range`、`fsync`、
   `fdatasync`、`syncfs`、`sync_file_range`、`fadvise64`、`readahead`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
   呼び出し、`epoll_ctl`（epoll のディスクリプタとしても対象としても）、`epoll_wait`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
@@ -538,6 +542,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MREMAP_FIXED` で動かすと、`EFAULT` になります（最近の Linux は動かせます）。
 - `msync` は、引数と範囲を確かめ、`MS_SYNC` か `MS_ASYNC` なら共有のファイルの
   マッピングへの書き込みをファイルに書き戻します。
+- `remap_file_pages` は、共有のマッピングの範囲を、そのファイルや共有メモリの別の
+  ページに張り直します。Linux がマッピング自身のファイルを `mmap` し直すのと同じで、
+  保護はそのままです。Linux と同じく、`prot` は 0 でなければならず、範囲は書き込める
+  同じメモリの共有のマッピングの中に隙間なく収まっていなければなりません（`EINVAL`）。
+  ファイルが届かないページは `EOVERFLOW` です。
 - System V の共有メモリ（`shmget`、`shmat`、`shmdt`、`shmctl`）は、スレッドの IPC
   名前空間のものです。新しい IPC 名前空間にはセグメントがありません。確かめる内容とその
   順序、既定の上限は Linux と同じです。
@@ -583,6 +592,44 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`ERESTARTNOHAND`）。`msgctl` には、`IPC_STAT`、`MSG_STAT`、`MSG_STAT_ANY`（プロセスは
   呼び出し元の PID 名前空間の番号）、`IPC_SET`（`MSGMNB` を超えるには
   `CAP_SYS_RESOURCE`）、`IPC_RMID`、`IPC_INFO`、`MSG_INFO` があります。
+- POSIX メッセージキュー（`mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、
+  `mq_notify`、`mq_getsetattr`）は、スレッドの IPC 名前空間が持つ `mqueue` ファイル
+  システムのファイルです。確かめる内容とその順序は Linux の `ipc/mqueue.c` と同じです。
+  ルートはスティッキーで誰でも書き込めます。名前はそこで引き（`.`、`..`、`/` を含む名前は
+  `EACCES`、255 バイトを超えれば `ENAMETOOLONG`）、既存のキューを開くときはその
+  パーミッションを確かめ、キューを消せるのは持ち主か root だけです（`EPERM`）。名前空間は
+  Linux の既定値で始まります。キューは 256 個まで（`queues_max`、`ENOSPC`）、メッセージは
+  10 個まで（`msg_max`。既定値も同じ）、1 つ 8192 バイトまで（`msgsize_max`。既定値も
+  同じ）です。`CAP_SYS_RESOURCE` があれば 1 つめを超えられ、16 MiB のメッセージを 65536
+  個まで持てます。キューは、消されて閉じられるまで、作った者の実ユーザー ID に、その
+  バイト数と Linux がメッセージごとに使う管理領域（x86-64 で 48 + 48 バイト）を
+  `RLIMIT_MSGQUEUE` に対して課します（`EMFILE`）。`mq_open` は close-on-exec の
+  記述子を返し、`fork` はそれを `O_NONBLOCK`（`mq_getsetattr` でも `fcntl` でも設定
+  できます）ごと共有します。`poll`、`select`、`epoll` では、アクセスモードによらず、
+  メッセージがあれば読め、空きがあれば書けます。メッセージが入るたびに、エッジトリガーの
+  `epoll` はまた起きます。`read` はファイル位置から Linux と同じ状態の行（`QSIZE`、
+  `NOTIFY`、`SIGNO`、`NOTIFY_PID`）を返し、`fstat` は 80 バイトの通常ファイルを示し、
+  `fchmod` と `fchown` はそれを変えます。`/proc/self/fd` のリンクは `/<名前>` で、消された
+  あとは空白と `(deleted)` が後ろに付きます。メッセージは優先度の高い順（32768 未満。それ以外は
+  `EINVAL`）に、同じ優先度なら送った順に出てきます。`mq_msgsize` より小さいバッファーへの
+  受信は `EMSGSIZE` で、それより長い送信も同じです。空のキューからの受信といっぱいの
+  キューへの送信は、`O_NONBLOCK` があれば `EAGAIN` で、なければ `CLOCK_REALTIME` の
+  絶対時刻の時間切れ（`ETIMEDOUT`。時刻は最初に読んで確かめます：`EFAULT`、`EINVAL`）か
+  シグナル（`EINTR`。`ERESTARTSYS` と同じく、`SA_RESTART` とハンドラーを走らせない
+  シグナルなら再開します）まで待ちます。待っている受信者は、待ち始めた順に、Linux の
+  `pipelined_send` と同じく送信者から直接メッセージを受け取ります。待っている送信者の
+  メッセージは、受信でできた空きに入ります（`pipelined_receive`）。`mq_notify` は呼び出した
+  プロセスを登録し（ほかのプロセスが登録している間は `EBUSY`。通知なしで呼ぶと、自分の
+  登録だけを外します）、受信者が待っていないときに空のキューへメッセージが来たことを 1 回
+  知らせます。`SIGEV_SIGNAL` は、`si_code` が `SI_MESGQ` で、送ったプロセスとその実
+  ユーザー ID、`sigev_value` を持つシグナルを送ります（シグナル 0 なら何も送りません。
+  登録したあとに `execve` したプロセスにも送りません）。`SIGEV_NONE` は登録を終える
+  だけです。`SIGEV_THREAD` は `sigev_value` から 32 バイトを写し、`sigev_signo` が示す
+  netlink ソケット（`EBADF`、`ENOTSOCK`、ほかのソケットなら `EINVAL`）へ、最後の
+  バイトが 1（`NOTIFY_WOKENUP`）のデータグラムとして送ります。メッセージなしで登録が
+  終わるときは 2（`NOTIFY_REMOVED`）です。C ライブラリーの補助スレッドはこれを読んで
+  `sigev_notify_function` を始めます。キューのどの記述子を閉じても、またはプロセスが
+  終わっても、Linux の `mqueue_flush_file` と同じくそのプロセスの登録は外れます。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。
@@ -812,7 +859,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
   `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。
   そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`（`ip addr add` と `del` も）、
-  `ip route`、`ip route get`、`ip link set lo up`、`ip monitor` が動きます。
+  `ip route`（`ip route add`、`del`、`replace`、`append` も）、`ip route get`、
+  `ip link set lo up`、`ip monitor` が動きます。
   - **ソケット:** Linux の `af_netlink` と同じく、`bind` はポート ID（ほかのソケットが
     持つものは `EADDRINUSE`）を、0 ならプロセスの ID を、それが使われていれば負の ID を
     取ります。bind していないソケットは、`connect` か最初の送信で同じように bind されます。
@@ -844,29 +892,49 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `IFA_LOCAL`、`IFA_LABEL`、`IFA_ADDRESS` と接頭辞を持つ最初のものを消し（なければ
     `EADDRNOTAVAIL`）、プライマリならそのセカンダリも消します。`127.0.0.1` と `::1` も
     消せます。
-  - **経路:** アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付けるカーネルのものです。
-    IPv4 のアドレスには、初めからローカルの表に `local` の経路があります。接頭辞の経路は
-    （ループバックでは `local` です）、そのアドレスを持って `lo` が初めて上がったときに付き、
-    落ちても残ります。サブネットと `IFA_BROADCAST` の `broadcast` の経路は、上がっている
-    間だけです。IPv6 のアドレスには、ローカルの表に `local` の経路が、そのアドレスを
-    持って `lo` が初めて上がってからは、メインの表にメトリック 256 のユニキャストの接頭辞の
-    経路があります（`::1` にはありません）。`NLM_F_DUMP` を付けた `RTM_GETROUTE` には、
-    IPv4 のもの（宛先順）、IPv6 のもの（メインの表、ローカルの表の順）を返し、`AF_INET` か
-    `AF_INET6` だけを指せばそのファミリーのものを、マルチキャストの経路のファミリーには何も
-    返しません。ダンプでなければ、`inet_rtm_getroute` と `inet6_rtm_getroute` と同じく、
-    `RTA_DST` の指す宛先への経路を最も長い接頭辞で引きます。IPv4 のローカルか
-    ブロードキャストの経路は、その優先する送り元と呼び出し元の `RTA_UID`（リクエストが
-    指せばそのまま。-1 なら付けず、4 バイトより短ければ `ERANGE`）を持つ、メインの表の
-    経路として答えます。`0.0.0.0` は 127.0.0.1 からループバックへ向かいます。IPv6 は、
-    `lo` が上がっている間、アドレスならそのローカルな経路を、接頭辞の中のほかの宛先なら
-    そのアドレスからの接頭辞の経路を答えます。ほかの宛先は `ENETUNREACH`、`AF_UNSPEC` は
-    `EOPNOTSUPP` です。ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら
-    `EINVAL` です。`RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に
-    合う項目はないので `EHOSTUNREACH` です）。
-  - **ソケット:** ループバックのローカルな経路が持つアドレスはゲスト自身のものです。TCP や
-    UDP のソケットはそこへ bind でき、その経路の優先する送り元からループバックの上で
-    届きます。ループバックでは、IPv4 のアドレスはそのサブネット全体をローカルにし、IPv6 の
-    アドレスはそれ自身だけをローカルにします。IPv4 にまだ経路が 1 つもなければ、Linux の
+  - **経路:** ファミリーごとに、Linux の `fib_trie` と `ip6_fib` と同じく経路の表を
+    持ちます。IPv4 のローカルの表とメインの表は、ポリシーのルールがない間の Linux と同じく
+    1 つのトライを分け合います。アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付ける
+    カーネルのものです。IPv4 のアドレスには、初めからローカルの表に `local` の経路があり、
+    `lo` が上がると、接頭辞の経路（ループバックでは `local` で、落ちても残ります）、
+    サブネットの `broadcast` の経路、`IFA_BROADCAST` のものが付きます。IPv6 のアドレスには、
+    ローカルの表に `local` の経路が、そのアドレスを持って `lo` が初めて上がってからは、
+    メインの表にメトリック 256 のユニキャストの接頭辞の経路があります（`::1` には
+    ありません）。`RTM_NEWROUTE` は、`inet_rtm_newroute` と `inet6_rtm_newroute` と同じく、
+    `lo` を通る経路か、デバイスのない種類（`blackhole`、`unreachable`、`prohibit`、
+    `throw`）の経路を、どの表にも足します。メトリック、プロトコル、スコープ、TOS、
+    優先する送り元、IPv4 のゲートウェイ（オンリンクも）を持てます。`NLM_F_EXCL`、
+    `NLM_F_REPLACE`、`NLM_F_APPEND`、`NLM_F_CREATE` に従って Linux と同じ場所に置くか、
+    Linux と同じエラーで断ります（`EEXIST`、`ENOENT`。接頭辞、スコープ、種類、
+    ゲートウェイ、優先する送り元がおかしければ `EINVAL`、ほかのデバイスは `ENODEV`、
+    `lo` が落ちている間はホストのスコープの IPv4 の経路のほかは `ENETDOWN`）。
+    `RTM_DELROUTE` は、指したものに合う最初の経路を消します（なければ `ESRCH`）。
+    カーネルの経路も消せ、アドレスの変化や `lo` が上がったときに戻ります。`lo` を落とすと、
+    ホストのスコープのほかの、`lo` を通る IPv4 の経路と、IPv6 の経路がすべて消えます。
+    IPv4 のアドレスを消すと、そこを送り元とするメインの表の経路が消え、最後のアドレスを
+    消すと `lo` を通る経路がすべて消えます。IPv6 のアドレスを消すと、`cleanup_prefix_route`
+    と同じく、その接頭辞へのメインの表の最初の経路が、誰のものでも消えます。
+    `NLM_F_DUMP` を付けた `RTM_GETROUTE` には、Linux の表のハッシュの順に表ごとに、IPv4 の
+    ものはトライの順で、IPv6 のものは木をたどる順で経路を返します。`AF_INET` か `AF_INET6`
+    だけを指せばそのファミリーのものを、マルチキャストの経路のファミリーには何も返しません。
+    ダンプでなければ、`inet_rtm_getroute` と `inet6_rtm_getroute` と同じく、`RTA_DST` の
+    指す宛先への経路を引きます。IPv4 はローカルとメインの表の最も長い接頭辞で引き、
+    そこに経路がないか `throw` の経路に当たれば既定の表で引きます。IPv6 は、`lo` が
+    上がっている間、ローカルの表、メインの表の順に引きます。拒む経路に当たれば、その
+    エラー（`EINVAL`、`EHOSTUNREACH`、`EACCES`）を返します。IPv4 の答えは、メインの表
+    （`RTM_F_LOOKUP_TABLE` を付ければ、経路のあった表）、`fib_select_path` の選ぶ送り元、
+    オンリンクで届くゲートウェイ、呼び出し元の `RTA_UID`（リクエストが指せばそのまま。
+    -1 なら付けず、4 バイトより短ければ `ERANGE`）を持ちます。`0.0.0.0` は 127.0.0.1 から
+    ループバックへ向かいます。IPv6 の答えは、`ipv6_dev_get_saddr` の選ぶ送り元を
+    持ちます。経路がなければ `ENETUNREACH`、`AF_UNSPEC` は `EOPNOTSUPP` です。
+    ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら `EINVAL` です。
+    `RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に合う項目はないので
+    `EHOSTUNREACH` です）。
+  - **ソケット:** ローカルな経路が持つアドレスはゲスト自身のものです。TCP や UDP の
+    ソケットはそこへ bind でき、その経路の優先する送り元からループバックの上で届きます。
+    ループバックでは、IPv4 のアドレスはそのサブネット全体を、IPv4 のローカルな経路
+    （`ip route add local` が足すもの）はその接頭辞のアドレスすべてをローカルにします。
+    IPv6 は自分のアドレスにだけ bind できます。IPv4 にまだローカルの表がなければ、Linux の
     `inet_addr_type` がそのときどのアドレスもブロードキャストと見るのと同じく、ソケットは
     どの IPv4 のアドレスにも bind できます。
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
@@ -876,13 +944,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `NETLINK_LIST_MEMBERSHIPS` は 2 ワードで全部を返します。`lo` の変化は、名前空間の中の
     そのグループのメンバーに、1 つずつ別のデータグラムで、Linux の順に伝えます。上げ下げには
     `ifi_change` に `IFF_UP` を持つ `RTM_NEWLINK`（`RTNLGRP_LINK`）を、それから
-    `inetdev_event`、`fib_add_ifaddr`、`fib_del_ifaddr`、`addrconf`、`rt6_disable_ip` と
-    同じく、増えたり消えたりしたアドレス（`RTNLGRP_IPV4_IFADDR`、`RTNLGRP_IPV6_IFADDR`）と
-    経路（`RTNLGRP_IPV4_ROUTE`、`RTNLGRP_IPV6_ROUTE`。新しいものは
-    `NLM_F_CREATE | NLM_F_EXCL`）を伝えます。IPv4 のアドレスのものはリクエストの
-    シーケンス番号とポートを持ち、IPv6 のアドレスは足したときに仮のものと仮でないものの
-    2 度伝えます。bind していないソケットには何も届きません。IPv4 のアドレスの変化を
-    求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を付ければ自分の写しとして届きます。
+    `inetdev_event`、`fib_add_ifaddr`、`fib_del_ifaddr`、`addrconf`、`rt6_disable_ip`、
+    `rtmsg_fib`、`inet6_rt_notify` と同じく、増えたり消えたりしたアドレス
+    （`RTNLGRP_IPV4_IFADDR`、`RTNLGRP_IPV6_IFADDR`）と経路（`RTNLGRP_IPV4_ROUTE`、
+    `RTNLGRP_IPV6_ROUTE`。新しいものは Linux と同じ `NLM_F_CREATE`、`NLM_F_EXCL`、
+    `NLM_F_APPEND`、`NLM_F_REPLACE` を持ちます）を伝えます。IPv4 のアドレスのものと経路の
+    リクエストのものはリクエストのシーケンス番号とポートを持ち、IPv6 のアドレスは足したときに
+    仮のものと仮でないものの 2 度伝えます。bind していないソケットには何も届きません。
+    IPv4 のアドレスか経路の変化を求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を
+    付ければ自分の写しとして届きます。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、
@@ -1042,7 +1112,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
   `/proc/mounts` はマウントの一覧です（ルートは `tmpfs`、`--mount` ごとに `hostfs`。
   ホストのパスは見せません）。マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
-  `df` はどのマウントも表示します。
+  `df` はどのマウントも表示します。`ustat` は、マウントの `st_dev` なら空きブロックと
+  空き inode の数を返し、ほかのデバイスなら `EINVAL` です。
 - ファイルのブロックの大きさ（`st_blksize`、`stx_blksize`、`FIGETBSZ`）は、Linux と
   同じくそのファイルシステムのものです。`/proc`（procfs）と、疑似端末のスレーブ、
   標準入力・出力・エラーの端末（devpts）は 1024 で、ほかは、パイプ、ソケット、`memfd`、`/dev` も含めて 4096

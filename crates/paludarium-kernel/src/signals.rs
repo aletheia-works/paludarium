@@ -301,7 +301,8 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         // preadv2, pwritev2, wait4, waitid, pause, rt_sigsuspend, flock, the
         // blocking socket calls with sendmmsg and recvmmsg (a wait that
         // SO_RCVTIMEO or SO_SNDTIMEO limits gives EINTR instead, and clears
-        // the restart itself), msgsnd and msgrcv.
+        // the restart itself), msgsnd, msgrcv, mq_timedsend and
+        // mq_timedreceive.
         0
         | 1
         | 17..=20
@@ -320,7 +321,9 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         | 288
         | 44..=47
         | 69
-        | 70 => true,
+        | 70
+        | 242
+        | 243 => true,
         // fcntl's F_SETLKW and F_OFD_SETLKW.
         72 => matches!(args[1], 7 | 38),
         // open, openat and openat2, which wait only to open a FIFO.

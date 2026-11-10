@@ -34,6 +34,7 @@ pub use inet::{InvalidRule, NetworkPolicy};
 mod futex;
 mod memfd;
 mod mempolicy;
+mod mqueue;
 mod msg;
 mod namespaces;
 mod page_cache;

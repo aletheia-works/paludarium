@@ -954,7 +954,9 @@ fn lookup_cacheinfo() -> [u8; RTA_CACHEINFO_LEN] {
 /// for IPv4 and `EINVAL` for IPv6, as their attribute policies give, and
 /// a longer one counts as its first bytes; `EOPNOTSUPP` for an input route
 /// (`RTA_IIF`), which is not supported; `ENETUNREACH` where no route goes.
-/// `RTA_SRC`, `RTA_OIF` and the other selectors are not looked at. With
+/// An `RTA_UID` it names (`ERANGE` when shorter than 4 bytes) is the one
+/// the answer gives, as it is; `RTA_SRC`, `RTA_OIF` and the other
+/// selectors are not looked at. With
 /// `RTM_F_FIB_MATCH` the answer is the table's entry that matched, and
 /// `EHOSTUNREACH` for `0.0.0.0`, which no entry is.
 fn lookup(
@@ -975,9 +977,7 @@ fn lookup(
         match kind {
             RTA_DST => dst = Some(value),
             RTA_IIF => return Err(EOPNOTSUPP),
-            RTA_UID if value.len() == 4 => {
-                asked_uid = Some(u32::from_le_bytes(value.try_into().unwrap_or_default()));
-            }
+            RTA_UID => asked_uid = Some(u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?)),
             _ => {}
         }
     }
@@ -1065,7 +1065,11 @@ fn lookup(
     attribute(&mut body, RTA_DST, &address);
     attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
     attribute(&mut body, RTA_PREFSRC, &[127, 0, 0, 1]);
-    attribute(&mut body, RTA_UID, &asked_uid.unwrap_or(uid).to_le_bytes());
+    // An invalid user ID (-1) is left out (`uid_valid`).
+    let uid = asked_uid.unwrap_or(uid);
+    if uid != u32::MAX {
+        attribute(&mut body, RTA_UID, &uid.to_le_bytes());
+    }
     attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
     Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
 }

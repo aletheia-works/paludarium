@@ -3884,6 +3884,41 @@ fn netlink_dumps_the_routes_of_a_new_namespaces_loopback() {
         (24, 2, 0x8000_0200, 32)
     );
     assert_eq!(lookup(&mut f, 10, 0, &one[12..], 22), (2, 0, 0, -22));
+    // A user ID it names is the one the answer gives, -1 none; one too
+    // short is refused.
+    let uid_lookup = |f: &mut Fixture, uid: &[u8], seq: u32| {
+        let mut payload = vec![2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 1, 0, 127, 0, 0, 1];
+        payload.extend_from_slice(&((4 + uid.len()) as u16).to_le_bytes());
+        payload.extend_from_slice(&25u16.to_le_bytes());
+        payload.extend_from_slice(uid);
+        payload.resize(payload.len().next_multiple_of(4), 0);
+        let len = netlink_request(f, DATA, 26, 0x1, seq, &payload);
+        assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+        let (kind, _, _, _, reply) = netlink_replies(f, fd).remove(0);
+        if kind == 2 {
+            return Err(i32::from_le_bytes(reply[..4].try_into().unwrap()));
+        }
+        let mut at = &reply[12..];
+        let mut found = None;
+        while at.len() >= 4 {
+            let len = usize::from(u16::from_le_bytes([at[0], at[1]]));
+            if u16::from_le_bytes([at[2], at[3]]) == 25 {
+                found = Some(u32::from_le_bytes(at[4..8].try_into().unwrap()));
+            }
+            at = &at[len.next_multiple_of(4).min(at.len())..];
+        }
+        Ok(found)
+    };
+    assert_eq!(
+        uid_lookup(&mut f, &1000u32.to_le_bytes(), 23),
+        Ok(Some(1000))
+    );
+    assert_eq!(
+        uid_lookup(&mut f, &[0xe8, 3, 0, 0, 7, 7], 24),
+        Ok(Some(1000))
+    );
+    assert_eq!(uid_lookup(&mut f, &[0xff; 4], 25), Ok(None));
+    assert_eq!(uid_lookup(&mut f, &[0xe8, 3], 26), Err(-34));
     // Short of an rtmsg, a lookup is EINVAL.
     let len = netlink_request(&f, DATA, 26, 0x1, 15, &[2]);
     assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);

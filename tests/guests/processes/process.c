@@ -1413,6 +1413,22 @@ static void nl_lookups(int fd, unsigned port, const char *when) {
         snprintf(label, sizeof label, "%s get %s%s", when, asked[i].flags ? "fibmatch " : "", asked[i].text);
         nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, 16 + asked[i].len), port, label);
     }
+    /* A user ID the request names: as it is, longer, invalid, too short. */
+    static const struct {
+        unsigned char len;
+        unsigned char uid[8];
+    } uids[] = {{4, {0xe8, 3, 0, 0}}, {6, {0xe8, 3, 0, 0, 7, 7}}, {4, {0xff, 0xff, 0xff, 0xff}}, {2, {0xe8, 3}}};
+    for (size_t i = 0; i < sizeof uids / sizeof uids[0]; i++) {
+        unsigned char request[12 + 8 + 12] = {AF_INET, 32};
+        unsigned short destination[2] = {8, 1}, user[2] = {4 + uids[i].len, 25};
+        memcpy(request + 12, destination, 4);
+        memcpy(request + 16, "\x7f\0\0\x01", 4);
+        memcpy(request + 20, user, 4);
+        memcpy(request + 24, uids[i].uid, uids[i].len);
+        char label[64];
+        snprintf(label, sizeof label, "%s get uid %zu", when, i);
+        nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, 24 + ((uids[i].len + 3) & ~3)), port, label);
+    }
     /* A destination shorter than its family's address, and one longer. */
     static const struct {
         unsigned char family, len;

@@ -906,7 +906,9 @@ kernel.
   the route to the `RTA_DST` it names, as `inet_rtm_getroute` and
   `inet6_rtm_getroute` do: an IPv4 address in 127.0.0.0/8 (once `lo` has
   been up) or `0.0.0.0` gives a local route in the main table, with
-  `RTA_PREFSRC` 127.0.0.1 and the caller's `RTA_UID`, and
+  `RTA_PREFSRC` 127.0.0.1 and the caller's `RTA_UID` (or the one the
+  request names, as it is; none for -1, and `ERANGE` for one shorter
+  than 4 bytes), and
   127.255.255.255 a broadcast one while `lo` is up; `::1` gives its local
   route while `lo` is up; any other destination is `ENETUNREACH`, and
   `AF_UNSPEC` `EOPNOTSUPP`; a destination shorter than its family's

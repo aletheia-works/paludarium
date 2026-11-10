@@ -4737,6 +4737,60 @@ static void *rseq_other_thread(void *unused) {
     return 0;
 }
 
+/* Protection keys, only where a CPU with them and one without agree: the
+   virtual CPU has none, so the key pkey_alloc gives (or the default key 0)
+   would differ from a host with PKU. Key -1 is mprotect. */
+static void pkey_show(const char *label, long r) {
+    printf("%s: r=%ld errno=%d\n", label, r, r < 0 ? errno : 0);
+    errno = 0;
+}
+
+static int pkey_case(void) {
+    long page = 4096;
+    char *base = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 80;
+    char *a = mmap(base + page, (size_t)page, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) return 81;
+    errno = 0;
+    pkey_show("alloc-flags", syscall(SYS_pkey_alloc, 1L, 0L));
+    pkey_show("alloc-rights", syscall(SYS_pkey_alloc, 0L, 4L));
+    pkey_show("alloc-high-rights", syscall(SYS_pkey_alloc, 0L, 1L << 32));
+    pkey_show("free-none", syscall(SYS_pkey_free, -1L));
+    pkey_show("free-past", syscall(SYS_pkey_free, 16L));
+    pkey_show("free-unallocated", syscall(SYS_pkey_free, 1L));
+    /* -1 is mprotect, and only the low 32 bits are the key. */
+    pkey_show("no-key", syscall(SYS_pkey_mprotect, a, page, PROT_READ, -1L));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 82;
+    if (!child) {
+        a[0] = 1;
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("write after no-key: signaled=%d sig=%d\n", WIFSIGNALED(status),
+           WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    pkey_show("no-key-high-bits",
+              syscall(SYS_pkey_mprotect, a, page, PROT_READ | PROT_WRITE, 0xffffffffL));
+    a[0] = 1;
+    pkey_show("no-key-bad-prot", syscall(SYS_pkey_mprotect, a, page, 0x10L, -1L));
+    /* Keys not allocated, after what Linux checks first. */
+    pkey_show("unallocated", syscall(SYS_pkey_mprotect, a, page, PROT_READ, 1L));
+    pkey_show("past", syscall(SYS_pkey_mprotect, a, page, PROT_READ, 16L));
+    pkey_show("negative", syscall(SYS_pkey_mprotect, a, page, PROT_READ, -2L));
+    a[0] = 2;
+    pkey_show("misaligned", syscall(SYS_pkey_mprotect, a + 1, page, PROT_READ, 16L));
+    pkey_show("empty", syscall(SYS_pkey_mprotect, a, 0L, PROT_READ, 16L));
+    pkey_show("empty-bad-prot", syscall(SYS_pkey_mprotect, a, 0L, 0xffL, 16L));
+    pkey_show("both-grows", syscall(SYS_pkey_mprotect, a, 0L, 0x3000000L, 16L));
+    pkey_show("overflow", syscall(SYS_pkey_mprotect, a, -1L, PROT_READ, 16L));
+    pkey_show("bad-prot", syscall(SYS_pkey_mprotect, a, page, 0xffL, 16L));
+    printf("still writable: %d\n", a[0]);
+    return 0;
+}
+
 static int rseq_case(void) {
     long cpus = sysconf(_SC_NPROCESSORS_CONF);
     printf("auxv feature-size>=28=%d align=%lu\n", getauxval(27) >= 28, getauxval(28));
@@ -15013,6 +15067,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "shm")) return shm_case();
     if (!strcmp(mode, "sem")) return sem_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
+    if (!strcmp(mode, "pkey")) return pkey_case();
     if (!strcmp(mode, "etxtbsy-run")) {
         /* Says it runs, then runs until its parent closes the pipe. */
         char c;

@@ -149,10 +149,13 @@ verified.
   as on a Linux built without it.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
-  - `pkey_alloc` and `io_uring_setup` are among them, as on a Linux built without
-    them. Programs check for that and carry on. Saying yes would be wrong
-    without the rest: protection keys need the CPU feature, which `CPUID` does
-    not report, and io_uring's rings would do no work.
+  - `io_uring_setup` is one of them, as on a Linux built without io_uring.
+    Programs check for that and carry on. Saying yes would be wrong without
+    the rest: its rings would do no work.
+- **Protection keys**: the virtual CPU has none (`CPUID` reports no PKU), so
+  `pkey_alloc` gives `ENOSPC` as Linux does on such a CPU, and programs carry
+  on without them. `RDPKRU` and `WRPKRU` stop a program with `SIGILL`, as on
+  such a CPU.
   - System V message queues (`msgget`, `msgsnd`, `msgrcv`, `msgctl`) are
     too; only its shared memory and semaphores are implemented. There is no
     `/proc/sysvipc`, and the limits of shared memory and semaphores are

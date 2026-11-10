@@ -35,6 +35,9 @@ pub mod nr {
     pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
+    pub const PKEY_MPROTECT: u64 = 329;
+    pub const PKEY_ALLOC: u64 = 330;
+    pub const PKEY_FREE: u64 = 331;
     pub const MUNMAP: u64 = 11;
     pub const BRK: u64 = 12;
     pub const RT_SIGACTION: u64 = 13;
@@ -148,7 +151,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 79] = [
+        let entries: [(u64, Handler); 82] = [
             (nr::SETITIMER, sys_setitimer),
             (nr::RT_SIGRETURN, sys_rt_sigreturn),
             (nr::GETPID, sys_getpid),
@@ -168,6 +171,9 @@ impl SyscallTable {
             (nr::PSELECT6, sys_pselect6),
             (nr::MMAP, sys_mmap),
             (nr::MPROTECT, sys_mprotect),
+            (nr::PKEY_MPROTECT, sys_pkey_mprotect),
+            (nr::PKEY_ALLOC, sys_pkey_alloc),
+            (nr::PKEY_FREE, sys_pkey_free),
             (nr::MUNMAP, sys_munmap),
             (nr::BRK, sys_brk),
             (nr::RT_SIGACTION, sys_rt_sigaction),
@@ -1856,6 +1862,50 @@ fn sys_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Ok(()) => ok(0),
         Err(e) => err(e),
     }
+}
+
+/// `pkey_mprotect(addr, len, prot, pkey)`, as Linux's on a CPU without
+/// protection keys, which the virtual CPU is (`CPUID` reports no PKU): no key
+/// is ever allocated there, not even the default key 0, so only `-1` (no key)
+/// is accepted, and that is `mprotect`. Any other key is `EINVAL` once the
+/// checks Linux makes before it pass: the alignment, an empty range (which
+/// succeeds), the end's overflow and the protection bits.
+fn sys_pkey_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    /// `PROT_GROWSDOWN` and `PROT_GROWSUP`, which may not both be given.
+    const GROWS: u64 = 0x0100_0000 | 0x0200_0000;
+    // An `int`, sign-extended when the arguments were read.
+    if a[3] == u64::MAX {
+        return sys_mprotect(c, a);
+    }
+    let (start, len, prot) = (a[0], a[1], a[2]);
+    if prot & GROWS == GROWS || start & 4095 != 0 {
+        return err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return ok(0);
+    }
+    let end = start.wrapping_add(len.wrapping_add(4095) & !4095);
+    if end <= start {
+        return err(Errno::ENOMEM);
+    }
+    err(Errno::EINVAL)
+}
+
+/// `pkey_alloc(flags, access_rights)`: `EINVAL` for a flag (none exists) or
+/// rights other than `PKEY_DISABLE_ACCESS` and `PKEY_DISABLE_WRITE`, else
+/// `ENOSPC`, as Linux on a CPU without protection keys has none to give.
+fn sys_pkey_alloc(_: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    const PKEY_ACCESS_MASK: u64 = 1 | 2;
+    if a[0] != 0 || a[1] & !PKEY_ACCESS_MASK != 0 {
+        return err(Errno::EINVAL);
+    }
+    err(Errno::ENOSPC)
+}
+
+/// `pkey_free(pkey)`: `EINVAL`, as no key is allocated (see
+/// [`sys_pkey_mprotect`]).
+fn sys_pkey_free(_: &mut Context<'_>, _: [u64; 6]) -> Outcome {
+    err(Errno::EINVAL)
 }
 
 const MREMAP_MAYMOVE: u64 = 1;

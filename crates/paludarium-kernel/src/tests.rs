@@ -3379,3 +3379,52 @@ mod rseq {
         }
     }
 }
+
+mod pkeys {
+    use super::*;
+
+    #[test]
+    fn pkey_alloc_has_no_key_to_give_as_on_a_cpu_without_them() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // No flag exists; the rights are PKEY_DISABLE_ACCESS and _WRITE.
+        assert_eq!(f.ret(330, &[1, 0]), einval);
+        assert_eq!(f.ret(330, &[0, 4]), einval);
+        assert_eq!(f.ret(330, &[0, 1 << 32]), einval);
+        for rights in 0..4 {
+            assert_eq!(f.ret(330, &[0, rights]), errno(Errno::ENOSPC));
+        }
+    }
+
+    #[test]
+    fn pkey_free_finds_no_key_allocated_not_even_0() {
+        let mut f = fixture();
+        for key in [0, 1, 15, 16, u64::MAX] {
+            assert_eq!(f.ret(331, &[key]), errno(Errno::EINVAL));
+        }
+    }
+
+    #[test]
+    fn pkey_mprotect_accepts_only_no_key_which_is_mprotect() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // -1 is mprotect: the page becomes read-only, then writable again.
+        assert_eq!(f.ret(329, &[DATA, 4096, 1, u64::MAX]), 0);
+        assert!(f.mem.write(GuestAddr(DATA), b"x").is_err());
+        // Only the low 32 bits are the key.
+        assert_eq!(f.ret(329, &[DATA, 4096, 3, u64::from(u32::MAX)]), 0);
+        f.mem.write(GuestAddr(DATA), b"x").unwrap();
+        // Any other key, the default 0 too, is not allocated.
+        for key in [0, 1, 16, (-2i64) as u64] {
+            assert_eq!(f.ret(329, &[DATA, 4096, 1, key]), einval);
+        }
+        f.mem.write(GuestAddr(DATA), b"x").unwrap();
+        // What Linux checks first still comes first.
+        assert_eq!(f.ret(329, &[DATA + 1, 4096, 1, 0]), einval);
+        assert_eq!(f.ret(329, &[DATA, 0, 1, 0]), 0);
+        assert_eq!(f.ret(329, &[DATA, 0, 0xff, 0]), 0);
+        assert_eq!(f.ret(329, &[DATA, 0, 0x0300_0000, 0]), einval);
+        assert_eq!(f.ret(329, &[DATA, u64::MAX, 1, 0]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(329, &[DATA, 0x1000, 0xff, 0]), einval);
+    }
+}

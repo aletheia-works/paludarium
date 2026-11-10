@@ -55,7 +55,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores) |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
@@ -657,6 +657,13 @@ kernel.
   and so are the flags that do nothing on x86-64 Linux either
   (`ADDR_LIMIT_32BIT`, `SHORT_INODE`, `WHOLE_SECONDS`, `STICKY_TIMEOUTS`,
   ...).
+- Protection keys answer as Linux does on a CPU without them, which the
+  virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
+  the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or
+  for rights other than `PKEY_DISABLE_ACCESS` and `PKEY_DISABLE_WRITE`;
+  `pkey_free` gives `EINVAL`; and `pkey_mprotect` with key `-1` is `mprotect`,
+  while any other key gives `EINVAL` after the checks Linux makes first (an
+  empty range succeeds, an overflowing one gives `ENOMEM`).
 - `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
   `nohz_full` CPU (`MEMBARRIER_CMD_QUERY` gives `0x3ff`). The private
   commands give `EPERM` until the address space registers for them, a fork

@@ -178,6 +178,7 @@
     {"name":"shm","binary":"process"},
     {"name":"sem","binary":"process"},
     {"name":"rseq","binary":"process"},
+    {"name":"pkey","binary":"process"},
     {"name":"cloexec","binary":"process"},
     {"name":"wait-specific","binary":"process"},
     {"name":"wait-any","binary":"process"},

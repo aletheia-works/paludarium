@@ -200,7 +200,8 @@ kernel.
 - Without a [network](#network), outside a new network namespace, `socket()` returns `EAFNOSUPPORT` for
   `AF_INET`, `AF_INET6` and `AF_NETLINK`.
 - `epoll_wait`, `epoll_pwait` and `epoll_pwait2` check their arguments in
-  Linux's order: `epoll_pwait2` reads its timeout (a `struct timespec`, none
+  the order of the kernels after Linux 6.12, which checked `maxevents`
+  before the descriptor: `epoll_pwait2` reads its timeout (a `struct timespec`, none
   waiting for ever; `EFAULT`, then `EINVAL` for one Linux refuses, while a
   huge one saturates), the signal mask is set (`EINVAL` for a size other
   than 8), then the descriptor is checked (`EBADF`), then `maxevents`

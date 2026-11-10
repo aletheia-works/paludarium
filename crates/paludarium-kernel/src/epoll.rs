@@ -300,10 +300,12 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             })?;
             return Ok(0);
         }
-        // Linux's order: epoll_pwait2 reads and checks its timeout, the
-        // signal mask is set, then the descriptor (EBADF) and maxevents are
-        // checked, and last that it is an epoll (`do_epoll_pwait`,
-        // `do_epoll_wait`, `ep_check_params`). The deadline is taken at entry.
+        // The order of the kernels after 6.12 (CI's native one): epoll_pwait2
+        // reads and checks its timeout, the signal mask is set, then the
+        // descriptor (EBADF, `CLASS(fd, f)`) and maxevents are checked, and
+        // last that it is an epoll (`do_epoll_pwait`, `do_epoll_wait`,
+        // `ep_check_params`). 6.12 itself checked maxevents before the
+        // descriptor. The deadline is taken at entry.
         let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
         let deadline = if number == 441 {
             if a[3] == 0 {

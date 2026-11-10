@@ -178,7 +178,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
 - [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET`、`AF_INET6`、`AF_NETLINK` に
   `EAFNOSUPPORT` を返します。
-- `epoll_wait`・`epoll_pwait`・`epoll_pwait2` は、Linux と同じ順番で引数を確かめます。
+- `epoll_wait`・`epoll_pwait`・`epoll_pwait2` は、Linux 6.12 より後のカーネルと同じ順番で引数を
+  確かめます（6.12 は記述子より先に `maxevents` を確かめていました）。
   `epoll_pwait2` はまずタイムアウト（`struct timespec`。なければいつまでも待ちます）を読み
   （`EFAULT`）、Linux が受け付けない値なら `EINVAL` を返し、大きすぎる値は上限で止めます。次に
   シグナルマスクを設定し（大きさが 8 でなければ `EINVAL`）、記述子（`EBADF`）、`maxevents`

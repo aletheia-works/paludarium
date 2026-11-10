@@ -817,15 +817,6 @@ pub(crate) fn destination(to: SocketAddr) -> Option<SocketAddr> {
         _ => None,
     }
 }
-/// The source address of a connection to `to` on the loopback, as the
-/// loopback's route gives it: `127.0.0.1` for any IPv4 one, `::1` for IPv6.
-pub(crate) fn source(to: SocketAddr) -> IpAddr {
-    match to {
-        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,16 +895,12 @@ mod tests {
     }
 
     #[test]
-    fn loopback_destinations_and_sources() {
+    fn loopback_destinations() {
         let to = |text: &str| destination(text.parse().unwrap());
         assert_eq!(to("127.0.0.5:80"), Some("127.0.0.5:80".parse().unwrap()));
         assert_eq!(to("0.0.0.0:80"), Some("127.0.0.1:80".parse().unwrap()));
         assert_eq!(to("[::]:80"), Some("[::1]:80".parse().unwrap()));
         assert_eq!(to("[::1]:80"), Some("[::1]:80".parse().unwrap()));
         assert_eq!(to("192.0.2.1:80"), None);
-        assert_eq!(
-            source("127.0.0.5:80".parse().unwrap()),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        );
     }
 }

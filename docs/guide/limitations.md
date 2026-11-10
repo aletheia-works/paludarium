@@ -300,11 +300,19 @@ verified.
   than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`
   (`EPROTONOSUPPORT` for `NETLINK_GENERIC` and the rest), and of it only
-  the link and address requests and route dumps: neighbours, rules,
-  queueing disciplines and the rest are `EOPNOTSUPP`, as are adding or
-  removing an address or a route, an input route lookup (`RTA_IIF`, as
-  `ip route get ... iif` sends), a non-dump `RTM_GETADDR`, renaming `lo`
-  and setting any other attribute of it. A route dump does not filter by
+  the link, address and route requests: neighbours, rules, queueing
+  disciplines and the rest are `EOPNOTSUPP`, as are adding or removing a
+  route, an input route lookup (`RTA_IIF`, as `ip route get ... iif`
+  sends), a non-dump `RTM_GETADDR`, renaming `lo` and setting any other
+  attribute of it. An address is always permanent: lifetimes
+  (`IFA_CACHEINFO`) and `IFA_RT_PRIORITY` are not kept, a peer address is
+  not a point-to-point one, and an IPv6 address is never tentative, where
+  Linux's is until its duplicate address detection work, which ends at
+  once on a loopback, has run. A connection or datagram to an address of
+  `lo` while it is down is `ENETUNREACH`, where Linux's goes out and is
+  dropped, and so is one to an IPv6 address in a prefix that is not one
+  of `lo`'s, which Linux's prefix route sends to it and drops; an IPv6
+  lookup while `lo` is down is `ENETUNREACH` too. A route dump does not filter by
   the table or attributes a strict request names, and a lookup looks at
   no selector but its destination (`RTA_SRC`, `RTA_OIF`, `RTA_MARK` and
   the rest are not); its `rta_cacheinfo` counts one reference, where

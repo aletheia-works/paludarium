@@ -8,7 +8,8 @@
 //! dumps (`NLM_F_DUMP`) answer with the loopback, its addresses and its
 //! routes, then `NLMSG_DONE` at the next receive; `RTM_GETLINK` without a
 //! dump answers for `lo` by index or name, and `RTM_GETROUTE` without one
-//! looks a route up; `RTM_NEWLINK` and `RTM_SETLINK` bring it up or
+//! looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and remove the
+//! loopback's addresses ([`crate::interface`]); `RTM_NEWLINK` and `RTM_SETLINK` bring it up or
 //! down with `IFF_UP`, given `CAP_NET_ADMIN` in the user namespace that owns
 //! the network namespace. An error, or a success the request asks for with
 //! `NLM_F_ACK`, is answered with `NLMSG_ERROR`; any other request is
@@ -42,6 +43,7 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_GETROUTE: u16 = 26;
@@ -73,6 +75,7 @@ const RT_TABLE_LOCAL: u8 = 255;
 const RTPROT_KERNEL: u8 = 2;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
+const RTN_UNICAST: u8 = 1;
 const RTN_LOCAL: u8 = 2;
 const RTN_BROADCAST: u8 = 3;
 /// `struct rta_cacheinfo`: eight `__u32`s.
@@ -112,13 +115,10 @@ const IFLA_ALLMULTI: u16 = 61;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
+const IFA_BROADCAST: u16 = 4;
 const IFA_CACHEINFO: u16 = 6;
 const IFA_FLAGS: u16 = 8;
 const IFA_PROTO: u16 = 11;
-/// `IFAPROT_KERNEL_LO`: the kernel gave the loopback the address, which
-/// `addrconf` notes for `::1` alone.
-const IFAPROT_KERNEL_LO: u8 = 1;
-const IFA_F_PERMANENT: u32 = 0x80;
 const RT_SCOPE_HOST: u8 = 254;
 const ARPHRD_LOOPBACK: u16 = 772;
 const IFF_UP: u32 = 0x1;
@@ -566,6 +566,10 @@ impl NetlinkSocket {
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
+            RTM_NEWADDR | RTM_DELADDR if matches!(family, AF_INET | AF_INET6) => {
+                change_address(&self.network, header, payload)?;
+                Ok(false)
+            }
             RTM_GETLINK => {
                 self.find_link(payload, header, true)?;
                 let reply = link_message(&self.network, header.seq, port, 0);
@@ -889,19 +893,13 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec<u8> {
     attribute(&mut body, IFLA_STATS, &[0; STATS_LEN]);
     // A device gets its queueing discipline when it first opens, and keeps
     // it when it goes down (`dev_activate`).
-    let qdisc: &[u8] = if network.has_ipv4_address() {
+    let qdisc: &[u8] = if network.has_been_up() {
         b"noqueue\0"
     } else {
         b"noop\0"
     };
     attribute(&mut body, IFLA_QDISC, qdisc);
     message(RTM_NEWLINK, flags, seq, port, &body)
-}
-/// An `ifaddrmsg` of `lo` for `family`, `prefix` and `flags`.
-fn address_header(family: u8, prefix: u8, flags: u32) -> Vec<u8> {
-    let mut body = vec![family, prefix, flags as u8, RT_SCOPE_HOST];
-    body.extend_from_slice(&1u32.to_le_bytes());
-    body
 }
 /// `struct ifa_cacheinfo`: forever preferred and valid. The times it was
 /// made and changed are given as 0.
@@ -910,19 +908,156 @@ fn cacheinfo() -> [u8; 16] {
     raw[..8].copy_from_slice(&[0xff; 8]);
     raw
 }
-/// `RTM_NEWADDR` for `127.0.0.1/8`, once the loopback has it, as
-/// `inet_fill_ifaddr` gives it.
+/// `RTM_NEWADDR` for each IPv4 address of `lo`, in its order, as
+/// `inet_fill_ifaddr` gives them.
 fn ipv4_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
-    if !network.has_ipv4_address() {
-        return Vec::new();
+    let mut messages = Vec::new();
+    for address in &network.addresses().v4 {
+        let mut body = vec![AF_INET, address.prefix, address.flags as u8, address.scope];
+        body.extend_from_slice(&1u32.to_le_bytes());
+        if !address.address.is_unspecified() {
+            attribute(&mut body, IFA_ADDRESS, &address.address.octets());
+        }
+        if !address.local.is_unspecified() {
+            attribute(&mut body, IFA_LOCAL, &address.local.octets());
+        }
+        if let Some(broadcast) = address.broadcast {
+            attribute(&mut body, IFA_BROADCAST, &broadcast.octets());
+        }
+        if !address.label.is_empty() {
+            let mut label = address.label.clone();
+            label.push(0);
+            attribute(&mut body, IFA_LABEL, &label);
+        }
+        if address.proto != 0 {
+            attribute(&mut body, IFA_PROTO, &[address.proto]);
+        }
+        attribute(&mut body, IFA_FLAGS, &address.flags.to_le_bytes());
+        attribute(&mut body, IFA_CACHEINFO, &cacheinfo());
+        messages.extend(message(RTM_NEWADDR, NLM_F_MULTI, seq, port, &body));
     }
-    let mut body = address_header(AF_INET, 8, IFA_F_PERMANENT);
-    attribute(&mut body, IFA_ADDRESS, &[127, 0, 0, 1]);
-    attribute(&mut body, IFA_LOCAL, &[127, 0, 0, 1]);
-    attribute(&mut body, IFA_LABEL, b"lo\0");
-    attribute(&mut body, IFA_FLAGS, &IFA_F_PERMANENT.to_le_bytes());
-    attribute(&mut body, IFA_CACHEINFO, &cacheinfo());
-    message(RTM_NEWADDR, NLM_F_MULTI, seq, port, &body)
+    messages
+}
+/// `RTM_NEWADDR` for each IPv6 address of `lo`, in its order, as
+/// `inet6_fill_ifaddr` gives them.
+fn ipv6_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
+    let mut messages = Vec::new();
+    for address in &network.addresses().v6 {
+        let mut body = vec![
+            AF_INET6,
+            address.prefix,
+            address.flags as u8,
+            address.scope(),
+        ];
+        body.extend_from_slice(&1u32.to_le_bytes());
+        attribute(&mut body, IFA_ADDRESS, &address.address.octets());
+        attribute(&mut body, IFA_CACHEINFO, &cacheinfo());
+        attribute(&mut body, IFA_FLAGS, &address.flags.to_le_bytes());
+        if address.proto != 0 {
+            attribute(&mut body, IFA_PROTO, &[address.proto]);
+        }
+        messages.extend(message(RTM_NEWADDR, NLM_F_MULTI, seq, port, &body));
+    }
+    messages
+}
+/// `RTM_NEWADDR` or `RTM_DELADDR` for `lo`, as `inet_rtm_newaddr`,
+/// `inet_rtm_deladdr`, `inet6_rtm_newaddr` and `inet6_rtm_deladdr` take
+/// them: `EINVAL` for a message shorter than an `ifaddrmsg`, an IPv4
+/// prefix past 32 or an IPv6 one past 128, an IPv4 address without
+/// `IFA_LOCAL` to add or an IPv6 one without `IFA_LOCAL` or `IFA_ADDRESS`;
+/// `ENODEV` for another interface than index 1. An address added again is
+/// `EEXIST`, unless `NLM_F_REPLACE` without `NLM_F_EXCL`, and one to
+/// remove that `lo` has not `EADDRNOTAVAIL`. `IFA_LABEL`, `IFA_BROADCAST`,
+/// `IFA_FLAGS` (of which `IFA_F_NOPREFIXROUTE` takes effect) and
+/// `IFA_PROTO` are kept; lifetimes (`IFA_CACHEINFO`) and `IFA_RT_PRIORITY`
+/// are not, and every address is permanent.
+fn change_address(network: &Network, header: &Header, payload: &[u8]) -> Result<(), Errno> {
+    use core::net::{Ipv4Addr, Ipv6Addr};
+    if payload.len() < 8 {
+        return Err(Errno::EINVAL);
+    }
+    let (family, prefix, header_flags, scope) = (payload[0], payload[1], payload[2], payload[3]);
+    let index = u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default());
+    let mut local = None;
+    let mut address = None;
+    let mut broadcast = None;
+    let mut label = None;
+    let mut flags = u32::from(header_flags);
+    let mut proto = 0;
+    for (kind, value) in attributes(&payload[8..]) {
+        match kind {
+            IFA_LOCAL => local = Some(value),
+            IFA_ADDRESS => address = Some(value),
+            IFA_BROADCAST => broadcast = Some(*value.first_chunk::<4>().ok_or(ERANGE)?),
+            IFA_LABEL => {
+                let end = value.iter().position(|&b| b == 0).unwrap_or(value.len());
+                if end > 15 {
+                    return Err(ERANGE);
+                }
+                label = Some(value[..end].to_vec());
+            }
+            IFA_FLAGS => flags = u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?),
+            IFA_PROTO => proto = *value.first().ok_or(ERANGE)?,
+            _ => {}
+        }
+    }
+    let add = header.kind == RTM_NEWADDR;
+    let replace = header.flags & NLM_F_REPLACE != 0 && header.flags & NLM_F_EXCL == 0;
+    let up = network.is_up();
+    if family == AF_INET {
+        let v4 = |value: Option<&[u8]>| -> Result<Option<Ipv4Addr>, Errno> {
+            value
+                .map(|v| {
+                    v.first_chunk::<4>()
+                        .map(|o| Ipv4Addr::from(*o))
+                        .ok_or(ERANGE)
+                })
+                .transpose()
+        };
+        let (local, address) = (v4(local)?, v4(address)?);
+        if add && (prefix > 32 || local.is_none()) {
+            return Err(Errno::EINVAL);
+        }
+        if index != 1 {
+            return Err(ENODEV);
+        }
+        if !add {
+            return network
+                .addresses()
+                .del_v4(local, address, prefix, label.as_deref());
+        }
+        let local = local.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let mut new = crate::interface::V4::new(local, address.unwrap_or(local), prefix, scope);
+        new.broadcast = broadcast.map(Ipv4Addr::from);
+        new.flags = flags;
+        new.proto = proto;
+        if let Some(label) = label {
+            new.label = label;
+        }
+        return network.addresses().add_v4(new, replace, up);
+    }
+    let ip = local
+        .or(address)
+        .map(|v| {
+            v.first_chunk::<16>()
+                .map(|o| Ipv6Addr::from(*o))
+                .ok_or(ERANGE)
+        })
+        .transpose()?
+        .ok_or(Errno::EINVAL)?;
+    if prefix > 128 {
+        return Err(Errno::EINVAL);
+    }
+    if index != 1 {
+        return Err(ENODEV);
+    }
+    if !add {
+        return network.addresses().del_v6(ip, prefix);
+    }
+    let mut new = crate::interface::V6::new(ip, prefix);
+    new.flags = flags;
+    new.proto = proto;
+    network.addresses().add_v6(new, replace, up)
 }
 /// An `rtmsg` of the local table, the kernel's, for `family`, `dst_len`,
 /// `scope` and `kind`.
@@ -947,18 +1082,74 @@ fn lookup_cacheinfo() -> [u8; RTA_CACHEINFO_LEN] {
     raw[0] = 1;
     raw
 }
+/// The `rtmsg` type of a route.
+fn route_type(kind: crate::interface::Kind) -> u8 {
+    match kind {
+        crate::interface::Kind::Unicast => RTN_UNICAST,
+        crate::interface::Kind::Local => RTN_LOCAL,
+        crate::interface::Kind::Broadcast => RTN_BROADCAST,
+    }
+}
+/// An IPv4 route of the local table, as `fib_dump_info` gives it, in
+/// `table` (the local one in a dump, the main one, which Linux merges it
+/// into, for `RTM_F_FIB_MATCH`), with `flags`.
+fn ipv4_route(
+    route: crate::interface::Route4,
+    table: u8,
+    seq: u32,
+    port: u32,
+    flags: u16,
+) -> Vec<u8> {
+    let scope = if route.kind == crate::interface::Kind::Broadcast {
+        RT_SCOPE_LINK
+    } else {
+        RT_SCOPE_HOST
+    };
+    let mut body = route_header(AF_INET, route.len, scope, route_type(route.kind));
+    body[4] = table;
+    attribute(&mut body, RTA_TABLE, &u32::from(table).to_le_bytes());
+    attribute(&mut body, RTA_DST, &route.dst.octets());
+    attribute(&mut body, RTA_PREFSRC, &route.source.octets());
+    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    message(RTM_NEWROUTE, flags, seq, port, &body)
+}
+/// An IPv6 route, as `rt6_fill_node` gives it (with an empty
+/// `rta_cacheinfo`): a local one of the local table, metric 0, or a
+/// prefix route of the main table, metric 256.
+fn ipv6_route(route: crate::interface::Route6, seq: u32, port: u32, flags: u16) -> Vec<u8> {
+    let local = route.kind == crate::interface::Kind::Local;
+    let table = if local { RT_TABLE_LOCAL } else { RT_TABLE_MAIN };
+    let mut body = route_header(
+        AF_INET6,
+        route.len,
+        RT_SCOPE_UNIVERSE,
+        route_type(route.kind),
+    );
+    body[4] = table;
+    attribute(&mut body, RTA_TABLE, &u32::from(table).to_le_bytes());
+    attribute(&mut body, RTA_DST, &route.dst.octets());
+    let metric: u32 = if local { 0 } else { 256 };
+    attribute(&mut body, RTA_PRIORITY, &metric.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_CACHEINFO, &[0; RTA_CACHEINFO_LEN]);
+    attribute(&mut body, RTA_PREF, &[0]);
+    message(RTM_NEWROUTE, flags, seq, port, &body)
+}
 /// A route lookup (`RTM_GETROUTE` without a dump), as `inet_rtm_getroute`
 /// and `inet6_rtm_getroute` answer one for the destination `RTA_DST` names
-/// (none is `0.0.0.0` or `::`): `EINVAL` for a request shorter than an
-/// `rtmsg`; a destination shorter than its family's address is `ERANGE`
-/// for IPv4 and `EINVAL` for IPv6, as their attribute policies give, and
-/// a longer one counts as its first bytes; `EOPNOTSUPP` for an input route
-/// (`RTA_IIF`), which is not supported; `ENETUNREACH` where no route goes.
-/// An `RTA_UID` it names (`ERANGE` when shorter than 4 bytes, for either
-/// family, as both policies take a `u32`) is the one an IPv4 answer gives,
-/// as it is; `RTA_SRC`, `RTA_OIF` and the other selectors are not looked
-/// at. With `RTM_F_FIB_MATCH` the answer is the table's entry that
-/// matched, and `EHOSTUNREACH` for `0.0.0.0`, which no entry is.
+/// (none is `0.0.0.0` or `::`), by the longest route the loopback's
+/// addresses have ([`crate::interface::Addresses`]): `EINVAL` for a
+/// request shorter than an `rtmsg`; a destination shorter than its
+/// family's address is `ERANGE` for IPv4 and `EINVAL` for IPv6, as their
+/// attribute policies give, and a longer one counts as its first bytes;
+/// `EOPNOTSUPP` for an input route (`RTA_IIF`), which is not supported;
+/// `ENETUNREACH` where no route goes, and for IPv6 while `lo` is down.
+/// `0.0.0.0` goes to the loopback from `127.0.0.1`. An `RTA_UID` it names
+/// (`ERANGE` when shorter than 4 bytes, for either family, as both
+/// policies take a `u32`) is the one an IPv4 answer gives, as it is;
+/// `RTA_SRC`, `RTA_OIF` and the other selectors are not looked at. With
+/// `RTM_F_FIB_MATCH` the answer is the table's entry that matched, and
+/// `EHOSTUNREACH` for `0.0.0.0`, which no entry is.
 fn lookup(
     network: &Network,
     payload: &[u8],
@@ -966,6 +1157,8 @@ fn lookup(
     port: u32,
     uid: u32,
 ) -> Result<Vec<u8>, Errno> {
+    use crate::interface::Kind;
+    use core::net::{Ipv4Addr, Ipv6Addr};
     if payload.len() < 12 {
         return Err(Errno::EINVAL);
     }
@@ -982,34 +1175,34 @@ fn lookup(
         }
     }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
+    let up = network.is_up();
     if family == AF_INET6 {
         let mut address = [0u8; 16];
         if let Some(value) = dst {
             address = *value.first_chunk().ok_or(Errno::EINVAL)?;
         }
-        let mut one = [0u8; 16];
-        one[15] = 1;
-        if address != one || !network.is_up() {
-            return Err(ENETUNREACH);
-        }
+        let ip = Ipv6Addr::from(address);
+        let (route, source) = network
+            .addresses()
+            .lookup6(ip)
+            .filter(|_| up)
+            .ok_or(ENETUNREACH)?;
         if fib_match {
-            let mut route = ipv6_routes(network, seq, port);
-            // The answer of a request, not a part of a dump.
-            route[6..8].copy_from_slice(&0u16.to_le_bytes());
-            return Ok(route);
+            return Ok(ipv6_route(route, seq, port, 0));
         }
-        // `rt6_fill_node` with the request's source, unspecified.
-        let mut body = route_header(AF_INET6, 128, RT_SCOPE_UNIVERSE, RTN_LOCAL);
+        // `rt6_fill_node` of the route the lookup made, with the request's
+        // source, unspecified.
+        let local = route.kind == Kind::Local;
+        let table = if local { RT_TABLE_LOCAL } else { RT_TABLE_MAIN };
+        let mut body = route_header(AF_INET6, 128, RT_SCOPE_UNIVERSE, route_type(route.kind));
         body[2] = 128;
-        attribute(
-            &mut body,
-            RTA_TABLE,
-            &u32::from(RT_TABLE_LOCAL).to_le_bytes(),
-        );
-        attribute(&mut body, RTA_DST, &one);
+        body[4] = table;
+        attribute(&mut body, RTA_TABLE, &u32::from(table).to_le_bytes());
+        attribute(&mut body, RTA_DST, &address);
         attribute(&mut body, RTA_SRC, &[0; 16]);
-        attribute(&mut body, RTA_PREFSRC, &one);
-        attribute(&mut body, RTA_PRIORITY, &0u32.to_le_bytes());
+        attribute(&mut body, RTA_PREFSRC, &source.octets());
+        let metric: u32 = if local { 0 } else { 256 };
+        attribute(&mut body, RTA_PRIORITY, &metric.to_le_bytes());
         attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
         attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
         attribute(&mut body, RTA_PREF, &[0]);
@@ -1019,43 +1212,35 @@ fn lookup(
     if let Some(value) = dst {
         address = *value.first_chunk().ok_or(ERANGE)?;
     }
-    let broadcast = address == [127, 255, 255, 255] && network.is_up();
-    let unspecified = address == [0; 4];
-    if !unspecified && !(address[0] == 127 && network.has_ipv4_address()) {
-        return Err(ENETUNREACH);
-    }
-    if fib_match {
-        // The entry that matched, longest first: the address, the
-        // broadcast address while up, or 127.0.0.0/8.
-        if unspecified {
+    let ip = Ipv4Addr::from(address);
+    let (kind, source) = if ip.is_unspecified() {
+        if fib_match {
             return Err(EHOSTUNREACH);
         }
-        let (entry, dst_len, scope, kind) = if address == [127, 0, 0, 1] {
-            ([127, 0, 0, 1], 32, RT_SCOPE_HOST, RTN_LOCAL)
-        } else if broadcast {
-            ([127, 255, 255, 255], 32, RT_SCOPE_LINK, RTN_BROADCAST)
-        } else {
-            ([127, 0, 0, 0], 8, RT_SCOPE_HOST, RTN_LOCAL)
-        };
-        let mut body = route_header(AF_INET, dst_len, scope, kind);
-        body[4] = RT_TABLE_MAIN;
-        attribute(
-            &mut body,
-            RTA_TABLE,
-            &u32::from(RT_TABLE_MAIN).to_le_bytes(),
-        );
-        attribute(&mut body, RTA_DST, &entry);
-        attribute(&mut body, RTA_PREFSRC, &[127, 0, 0, 1]);
-        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
-        return Ok(message(RTM_NEWROUTE, 0, seq, port, &body));
-    }
-    // `rt_fill_info` of the cached route the lookup made.
-    let (kind, flags) = if broadcast {
-        (RTN_BROADCAST, RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST)
+        (Kind::Local, Ipv4Addr::LOCALHOST)
     } else {
-        (RTN_LOCAL, RTM_F_CLONED | RTCF_LOCAL)
+        let route = network.addresses().lookup4(ip, up).ok_or(ENETUNREACH)?;
+        if fib_match {
+            return Ok(ipv4_route(route, RT_TABLE_MAIN, seq, port, 0));
+        }
+        (route.kind, route.source)
     };
-    let mut body = vec![AF_INET, 32, 0, 0, RT_TABLE_MAIN, 0, RT_SCOPE_UNIVERSE, kind];
+    // `rt_fill_info` of the cached route the lookup made.
+    let flags = if kind == Kind::Broadcast {
+        RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST
+    } else {
+        RTM_F_CLONED | RTCF_LOCAL
+    };
+    let mut body = vec![
+        AF_INET,
+        32,
+        0,
+        0,
+        RT_TABLE_MAIN,
+        0,
+        RT_SCOPE_UNIVERSE,
+        route_type(kind),
+    ];
     body.extend_from_slice(&flags.to_le_bytes());
     attribute(
         &mut body,
@@ -1064,7 +1249,7 @@ fn lookup(
     );
     attribute(&mut body, RTA_DST, &address);
     attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
-    attribute(&mut body, RTA_PREFSRC, &[127, 0, 0, 1]);
+    attribute(&mut body, RTA_PREFSRC, &source.octets());
     // An invalid user ID (-1) is left out (`uid_valid`).
     let uid = asked_uid.unwrap_or(uid);
     if uid != u32::MAX {
@@ -1073,74 +1258,23 @@ fn lookup(
     attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
     Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
 }
-/// The IPv4 routes `fib_add_ifaddr` gives `127.0.0.1/8` on `lo`, as
-/// `fib_dump_info` gives them, in the local table: `local 127.0.0.0/8` and
-/// `local 127.0.0.1` once the loopback has had the address, which stay when
-/// it goes down, and `broadcast 127.255.255.255` while it is up. The main
-/// table has none.
+/// The IPv4 routes of the local table `fib_add_ifaddr` gives `lo`'s
+/// addresses, as `fib_dump_info` gives them; the main table has none.
 fn ipv4_routes(network: &Network, seq: u32, port: u32) -> Vec<u8> {
-    if !network.has_ipv4_address() {
-        return Vec::new();
-    }
-    let mut routes = vec![
-        ([127, 0, 0, 0], 8, RT_SCOPE_HOST, RTN_LOCAL),
-        ([127, 0, 0, 1], 32, RT_SCOPE_HOST, RTN_LOCAL),
-    ];
-    if network.is_up() {
-        routes.push(([127, 255, 255, 255], 32, RT_SCOPE_LINK, RTN_BROADCAST));
-    }
-    let mut messages = Vec::new();
-    for (dst, dst_len, scope, kind) in routes {
-        let mut body = route_header(AF_INET, dst_len, scope, kind);
-        attribute(
-            &mut body,
-            RTA_TABLE,
-            &u32::from(RT_TABLE_LOCAL).to_le_bytes(),
-        );
-        attribute(&mut body, RTA_DST, &dst);
-        attribute(&mut body, RTA_PREFSRC, &[127, 0, 0, 1]);
-        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
-        messages.extend(message(RTM_NEWROUTE, NLM_F_MULTI, seq, port, &body));
-    }
-    messages
+    let routes = network.addresses().routes4(network.is_up());
+    routes
+        .into_iter()
+        .flat_map(|route| ipv4_route(route, RT_TABLE_LOCAL, seq, port, NLM_F_MULTI))
+        .collect()
 }
-/// The IPv6 route of `::1` while the loopback is up, `local ::1` in the
-/// local table, as `rt6_fill_node` gives it (with an empty
-/// `rta_cacheinfo`).
+/// The IPv6 routes of `lo`'s addresses: the main table's prefix routes,
+/// then the local table's.
 fn ipv6_routes(network: &Network, seq: u32, port: u32) -> Vec<u8> {
-    if !network.is_up() {
-        return Vec::new();
-    }
-    let mut body = route_header(AF_INET6, 128, RT_SCOPE_UNIVERSE, RTN_LOCAL);
-    let mut one = [0; 16];
-    one[15] = 1;
-    attribute(
-        &mut body,
-        RTA_TABLE,
-        &u32::from(RT_TABLE_LOCAL).to_le_bytes(),
-    );
-    attribute(&mut body, RTA_DST, &one);
-    attribute(&mut body, RTA_PRIORITY, &0u32.to_le_bytes());
-    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
-    attribute(&mut body, RTA_CACHEINFO, &[0; RTA_CACHEINFO_LEN]);
-    attribute(&mut body, RTA_PREF, &[0]);
-    message(RTM_NEWROUTE, NLM_F_MULTI, seq, port, &body)
-}
-/// `RTM_NEWADDR` for `::1/128` while the loopback is up, as
-/// `inet6_fill_ifaddr` gives it.
-fn ipv6_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
-    if !network.is_up() {
-        return Vec::new();
-    }
-    let flags = IFA_F_PERMANENT;
-    let mut body = address_header(AF_INET6, 128, flags);
-    let mut one = [0; 16];
-    one[15] = 1;
-    attribute(&mut body, IFA_ADDRESS, &one);
-    attribute(&mut body, IFA_CACHEINFO, &cacheinfo());
-    attribute(&mut body, IFA_FLAGS, &flags.to_le_bytes());
-    attribute(&mut body, IFA_PROTO, &[IFAPROT_KERNEL_LO]);
-    message(RTM_NEWADDR, NLM_F_MULTI, seq, port, &body)
+    let routes = network.addresses().routes6();
+    routes
+        .into_iter()
+        .flat_map(|route| ipv6_route(route, seq, port, NLM_F_MULTI))
+        .collect()
 }
 /// The port and groups of a `sockaddr_nl`: `EINVAL` for fewer than its 12
 /// bytes or another family.

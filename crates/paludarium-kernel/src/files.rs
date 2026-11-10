@@ -1,5 +1,6 @@
 //! Linux x86-64 file ABI and descriptor table. All guest memory is checked.
 use crate::syscalls::{Context, Outcome};
+mod splice;
 mod tasks;
 mod xattrs;
 use paludarium_host::{ClockId, FileHandle, FileStat};
@@ -12,8 +13,8 @@ pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 78, 79, 80,
     81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 136, 137, 138, 162, 187,
     188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260,
-    261, 262, 263, 264, 265, 266, 267, 268, 269, 277, 280, 285, 292, 293, 295, 296, 306, 316, 319,
-    326, 327, 328, 332, 436, 437, 439, 452,
+    261, 262, 263, 264, 265, 266, 267, 268, 269, 275, 276, 277, 278, 280, 285, 292, 293, 295, 296,
+    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 452,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -1208,6 +1209,8 @@ fn ustat(c: &Context<'_>, dev: u32, buf: u64) -> Result<u64, Errno> {
 /// `getdents`, `sendfile` and `copy_file_range`, and `fcntl` but for the
 /// commands `check_fcntl_cmd` lets through (duplicating, the descriptor
 /// flags and `F_GETFL`). A descriptor that is not open is left to the call.
+/// `splice`, `tee` and `vmsplice` refuse one themselves (`splice::file`),
+/// after the checks Linux makes before `fdget`.
 fn refuse_path_only(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<(), Errno> {
     let descriptors: &[u64] = match n {
         // read, readv, writev, pread64, pwrite64, preadv, pwritev, preadv2,
@@ -2459,6 +2462,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
     refuse_path_only(c, n, a)?;
     match n {
         40 => sendfile(c, a),
+        275 => splice::splice(c, a),
+        276 => splice::tee(c, a),
+        278 => splice::vmsplice(c, a),
         332 => statx(c, a),
         326 => copy_file_range(c, a),
         436 => close_range(c, a),

@@ -1344,6 +1344,64 @@ fn sendfile_sends_a_large_file_in_pieces() {
     assert_eq!(f.ret(8, &[input, 0, 1]), 3 << 20);
 }
 #[test]
+fn splice_tee_and_vmsplice_move_bytes_through_pipes() {
+    let mut f = fixture();
+    let (pipes, buf, offset, iov) = (DATA + 0x100, DATA + 0x200, DATA + 0x300, DATA + 0x400);
+    f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+    f.mem.write(GuestAddr(buf), b"0123456789").unwrap();
+    let file = f.ret(2, &[DATA, 66, 0o600]);
+    assert_eq!(f.ret(1, &[file, buf, 10]), 10);
+    let pipe = |f: &mut Fixture, at: u64| {
+        assert_eq!(f.ret(22, &[at]), 0);
+        let fds = f.mem.read_u64(GuestAddr(at)).unwrap();
+        (fds & 0xffff_ffff, fds >> 32)
+    };
+    let (r, w) = pipe(&mut f, pipes);
+    let (r2, w2) = pipe(&mut f, pipes + 8);
+    // A file at an offset into a pipe; tee leaves it there, splice takes it.
+    f.mem.write_u64(GuestAddr(offset), 2).unwrap();
+    assert_eq!(f.ret(275, &[file, offset, w, 0, 5, 0]), 5);
+    assert_eq!(f.mem.read_u64(GuestAddr(offset)).unwrap(), 7);
+    assert_eq!(f.ret(276, &[r, w2, 100, 0]), 5);
+    assert_eq!(f.ret(275, &[r, 0, w2, 0, 100, 0]), 5);
+    assert_eq!(f.ret(275, &[r, 0, w2, 0, 100, 2]), errno(Errno::EAGAIN));
+    // vmsplice gives a pipe's bytes to the guest, and takes the guest's.
+    f.mem.write_u64(GuestAddr(iov), buf + 0x40).unwrap();
+    f.mem.write_u64(GuestAddr(iov + 8), 16).unwrap();
+    assert_eq!(f.ret(278, &[r2, iov, 1, 0]), 10);
+    let mut out = [0; 10];
+    f.mem.read(GuestAddr(buf + 0x40), &mut out).unwrap();
+    assert_eq!(&out, b"2345623456");
+    f.mem.write(GuestAddr(buf), b"xyz").unwrap();
+    f.mem.write_u64(GuestAddr(iov), buf).unwrap();
+    f.mem.write_u64(GuestAddr(iov + 8), 3).unwrap();
+    assert_eq!(f.ret(278, &[w, iov, 1, 0]), 3);
+    // A pipe into the file at its position, which moves on.
+    assert_eq!(f.ret(8, &[file, 1, 0]), 1);
+    assert_eq!(f.ret(275, &[r, 0, file, 0, 100, 0]), 3);
+    assert_eq!(f.ret(8, &[file, 0, 1]), 4);
+    assert_eq!(f.ret(17, &[file, buf + 0x40, 5, 0]), 5);
+    f.mem.read(GuestAddr(buf + 0x40), &mut out[..5]).unwrap();
+    assert_eq!(&out[..5], b"0xyz4");
+    // The checks: two ends of one pipe, an offset for a pipe, no pipe.
+    assert_eq!(f.ret(275, &[r, 0, w, 0, 1, 0]), errno(Errno::EINVAL));
+    assert_eq!(
+        f.ret(275, &[r, offset, file, 0, 1, 0]),
+        errno(Errno::ESPIPE)
+    );
+    assert_eq!(f.ret(275, &[file, 0, file, 0, 1, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(276, &[file, w, 1, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(278, &[file, iov, 1, 0]), errno(Errno::EBADF));
+    assert_eq!(f.ret(275, &[w, 0, file, 0, 1, 0]), errno(Errno::EBADF));
+    assert_eq!(f.ret(275, &[99, 0, 99, 0, 0, 0]), 0);
+    // A pipe no one reads: EPIPE, with SIGPIPE (blocked).
+    f.mem.write_u64(GuestAddr(iov), 1 << 12).unwrap();
+    assert_eq!(f.ret(14, &[0, iov, 0, 8]), 0);
+    assert_eq!(f.ret(3, &[r2]), 0);
+    assert_eq!(f.ret(275, &[file, offset, w2, 0, 1, 0]), errno(Errno(32)));
+    assert!(f.thread.state.pending.iter().any(|s| s.number == 13));
+}
+#[test]
 fn statx_fills_the_stat_fields() {
     let mut f = fixture();
     let (out, buf) = (DATA + 0x100, DATA + 0x80);

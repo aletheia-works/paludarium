@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
@@ -191,7 +191,21 @@ kernel.
   process's address space and the address, so a private wake never reaches
   another process. Process-shared mutexes and semaphores (Python's
   `multiprocessing`) work this way, as does the wake of a robust futex whose
-  owner ends.
+  owner ends. A wake wakes one waiter even when asked for 0 or fewer, as
+  Linux counts before it compares, and a private one does not look at the
+  word's page. A timeout too long for Linux's nanoseconds waits until
+  `KTIME_MAX`.
+- The futex2 calls take 32-bit words with `FUTEX2_PRIVATE`, `FUTEX2_NUMA`
+  and `FUTEX2_MPOL`, checked in Linux's order. Other sizes and flags give
+  `EINVAL`. `futex_wake` and `futex_wait` are `FUTEX_WAKE_BITSET` and
+  `FUTEX_WAIT_BITSET` with an absolute timeout on `CLOCK_REALTIME` or
+  `CLOCK_MONOTONIC`, and a `futex_wake` of 0 wakes none. `futex_waitv` waits
+  on up to 128 words at once and gives the index of a woken one: it checks
+  every word's address before it compares any value, then gives `EAGAIN` at
+  the first that differs. A `FUTEX2_NUMA` word is followed by its node,
+  which must be node 0, the only one, or `-1`, which becomes 0, as Linux
+  writes the thread's node there. A signal interrupts them with
+  `ERESTARTSYS`, so they run again after a stop or an `SA_RESTART` handler.
 - `set_robust_list` and `get_robust_list` keep each thread's list of robust
   futexes, which glibc's and musl's robust mutexes need. When a thread ends or
   calls `execve`, the list is walked as Linux's `exit_robust_list` walks it:
@@ -1955,7 +1969,8 @@ one only with an `--allow-net`.
   `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `fcntl`'s `F_SETLKW` and
   `F_OFD_SETLKW`, `sendto`, `recvfrom`,
   `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`, `ppoll`, `select`, `pselect6`, `poll` with no timeout
-  and a `futex` wait with none. `nanosleep`, a relative `clock_nanosleep`,
+  and a `futex` wait with none, and `futex_waitv` and futex2's `futex_wait`
+  with or without one. `nanosleep`, a relative `clock_nanosleep`,
   `poll` with a timeout and a timed `futex` wait resume through
   `restart_syscall` with the deadline they had (the `futex` wait checks its word
   again first, `EAGAIN` once it changed), and

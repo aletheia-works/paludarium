@@ -5611,6 +5611,147 @@ static int old_forms_case(void) {
     rmdir(dir);
     return 0;
 }
+/* futex_waitv and futex2's futex_wake and futex_wait, and the wake count
+ * of FUTEX_WAKE, as Linux's kernel/futex. */
+struct f2_waitv {
+    uint64_t val, uaddr;
+    uint32_t flags, reserved;
+};
+#define F2_U32_PRIVATE (2 | 128)
+static long f2_errno(long r) { return r < 0 ? -errno : r; }
+static long f2_waitv_call(struct f2_waitv *w, long n, long flags, void *timeout, long clock) {
+    return f2_errno(syscall(449, w, n, flags, timeout, clock));
+}
+static long f2_wake(void *uaddr, unsigned long mask, long nr, long flags) {
+    return f2_errno(syscall(454, uaddr, mask, nr, flags));
+}
+static long f2_wait(void *uaddr, unsigned long val, unsigned long mask, long flags, void *timeout,
+                    long clock) {
+    return f2_errno(syscall(455, uaddr, val, mask, flags, timeout, clock));
+}
+static _Alignas(8) volatile uint32_t f2_words[4];
+static long f2_result;
+static void *f2_waitv_thread(void *arg) {
+    (void)arg;
+    struct f2_waitv w[2] = {{0, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 0},
+                            {0, (uintptr_t)&f2_words[1], F2_U32_PRIVATE, 0}};
+    f2_result = f2_waitv_call(w, 2, 0, NULL, 0);
+    return NULL;
+}
+static void *f2_wait_thread(void *arg) {
+    (void)arg;
+    f2_result = f2_wait((void *)&f2_words[2], 0, 6, F2_U32_PRIVATE, NULL, 0);
+    return NULL;
+}
+static void *f2_old_wait_thread(void *arg) {
+    (void)arg;
+    f2_result = f2_errno(syscall(SYS_futex, &f2_words[3], 128 /* FUTEX_WAIT_PRIVATE */, 0, NULL, NULL, 0));
+    return NULL;
+}
+static int futex2_case(void) {
+    struct f2_waitv w[2] = {{0, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 0},
+                            {0, (uintptr_t)&f2_words[1], F2_U32_PRIVATE, 0}};
+    struct timespec ts = {0, 1000000000};
+    printf("waitv flags=%ld zero=%ld many=%ld null=%ld clock=%ld fault=%ld nsec=%ld\n",
+           f2_waitv_call(w, 1, 1, NULL, 0), f2_waitv_call(w, 0, 0, NULL, 0),
+           f2_waitv_call(w, 129, 0, NULL, 0), f2_waitv_call(NULL, 1, 0, NULL, 0),
+           f2_waitv_call(w, 1, 0, &ts, 2), f2_waitv_call(w, 1, 0, (void *)8, 1),
+           f2_waitv_call(w, 1, 0, &ts, 1));
+    struct f2_waitv bad[5] = {{0, (uintptr_t)&f2_words[0], 128, 0},
+                              {0, (uintptr_t)&f2_words[0], 3 | 128, 0},
+                              {0, (uintptr_t)&f2_words[0], 2 | 0x100, 0},
+                              {0, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 1},
+                              {1ULL << 32, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 0}};
+    printf("waitv entry u8=%ld u64=%ld unknown=%ld reserved=%ld value=%ld\n",
+           f2_waitv_call(&bad[0], 1, 0, NULL, 0), f2_waitv_call(&bad[1], 1, 0, NULL, 0),
+           f2_waitv_call(&bad[2], 1, 0, NULL, 0), f2_waitv_call(&bad[3], 1, 0, NULL, 0),
+           f2_waitv_call(&bad[4], 1, 0, NULL, 0));
+    char *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(page, 4096);
+    struct f2_waitv order[2] = {{1, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 0},
+                                {0, (uintptr_t)&f2_words[0] + 2, F2_U32_PRIVATE, 0}};
+    long misaligned = f2_waitv_call(order, 2, 0, NULL, 0);
+    order[1].uaddr = (uintptr_t)page;
+    order[1].flags = 2; /* shared: its page is looked up with the key */
+    long shared_fault = f2_waitv_call(order, 2, 0, NULL, 0);
+    order[1].flags = F2_U32_PRIVATE;
+    long private_late = f2_waitv_call(order, 2, 0, NULL, 0);
+    order[0].val = 0;
+    long private_fault = f2_waitv_call(order, 2, 0, NULL, 0);
+    printf("waitv keys-first misaligned=%ld shared-fault=%ld mismatch=%ld private-fault=%ld\n",
+           misaligned, shared_fault, private_late, private_fault);
+    struct timespec past = {0, 0};
+    printf("waitv timeout mono=%ld real=%ld\n", f2_waitv_call(w, 2, 0, &past, 1),
+           f2_waitv_call(w, 2, 0, &past, 0));
+    struct timespec soon;
+    clock_gettime(CLOCK_MONOTONIC, &soon);
+    soon.tv_nsec += 20000000;
+    if (soon.tv_nsec >= 1000000000) soon.tv_sec++, soon.tv_nsec -= 1000000000;
+    printf("waitv later=%ld\n", f2_waitv_call(w, 2, 0, &soon, 1));
+
+    pthread_t t;
+    pthread_create(&t, NULL, f2_waitv_thread, NULL);
+    long woke;
+    while ((woke = f2_wake((void *)&f2_words[1], 1, 1, F2_U32_PRIVATE)) == 0) sched_yield();
+    pthread_join(t, NULL);
+    printf("waitv woken=%ld index=%ld\n", woke, f2_result);
+
+    printf("wake u8=%ld numa-mpol-unknown=%ld mask-high=%ld mask-zero=%ld misaligned=%ld none=%ld "
+           "no-waiter=%ld\n",
+           f2_wake((void *)&f2_words[0], 1, 1, 128), f2_wake((void *)&f2_words[0], 1, 1, 2 | 0x200),
+           f2_wake((void *)&f2_words[0], 1ULL << 32, 1, F2_U32_PRIVATE),
+           f2_wake((void *)&f2_words[0], 0, 1, F2_U32_PRIVATE),
+           f2_wake((char *)&f2_words[0] + 2, 1, 1, F2_U32_PRIVATE),
+           f2_wake((void *)&f2_words[0], 1, 0, F2_U32_PRIVATE),
+           f2_wake((void *)&f2_words[0], 1, 1, F2_U32_PRIVATE));
+    printf("wake private-unmapped=%ld shared-unmapped=%ld\n",
+           f2_wake(page, 1, 1, F2_U32_PRIVATE), f2_wake(page, 1, 1, 2));
+
+    printf("wait value-high=%ld mask-high=%ld fault-before-mask=%ld mask-zero=%ld mismatch=%ld "
+           "timeout=%ld huge=%ld\n",
+           f2_wait((void *)&f2_words[2], 1ULL << 32, 1, F2_U32_PRIVATE, NULL, 0),
+           f2_wait((void *)&f2_words[2], 0, 1ULL << 32, F2_U32_PRIVATE, NULL, 0),
+           f2_wait((void *)&f2_words[2], 0, 0, F2_U32_PRIVATE, (void *)8, 1),
+           f2_wait((void *)&f2_words[2], 0, 0, F2_U32_PRIVATE, NULL, 0),
+           f2_wait((void *)&f2_words[2], 1, 1, F2_U32_PRIVATE, NULL, 0),
+           f2_wait((void *)&f2_words[2], 0, 1, F2_U32_PRIVATE, &past, 1),
+           f2_wait((void *)&f2_words[2], 1, 1, F2_U32_PRIVATE,
+                   &(struct timespec){INT64_MAX, 0}, 1));
+    pthread_create(&t, NULL, f2_wait_thread, NULL);
+    long missed = 0;
+    while ((woke = f2_wake((void *)&f2_words[2], 1, 1, F2_U32_PRIVATE)) == 0) {
+        long other = f2_wake((void *)&f2_words[2], 4, 1, F2_U32_PRIVATE);
+        if (other) {
+            missed = other;
+            break;
+        }
+        sched_yield();
+    }
+    pthread_join(t, NULL);
+    printf("wait woken=%ld missed=%ld result=%ld\n", woke, missed, f2_result);
+
+    pthread_create(&t, NULL, f2_old_wait_thread, NULL);
+    while ((woke = f2_errno(syscall(SYS_futex, &f2_words[3], 1 | 128, 0, NULL, NULL, 0))) == 0)
+        sched_yield();
+    pthread_join(t, NULL);
+    printf("FUTEX_WAKE of 0 woke=%ld result=%ld\n", woke, f2_result);
+    struct timespec huge = {INT64_MAX, 0};
+    printf("FUTEX_WAIT huge=%ld bitset-huge=%ld\n",
+           f2_errno(syscall(SYS_futex, &f2_words[3], 128, 1, &huge, NULL, 0)),
+           f2_errno(syscall(SYS_futex, &f2_words[3], 9 | 128, 1, &huge, NULL, -1)));
+
+    static _Alignas(8) volatile uint32_t numa[2];
+    numa[1] = 0xffffffff;
+    long first = f2_wake((void *)numa, 1, 1, F2_U32_PRIVATE | 4);
+    long node = numa[1];
+    numa[1] = 1;
+    long other = f2_wake((void *)numa, 1, 1, F2_U32_PRIVATE | 4);
+    numa[1] = 0;
+    printf("numa wake=%ld node=%ld other-node=%ld misaligned=%ld mpol=%ld\n", first, node, other,
+           f2_wake((void *)&numa[1], 1, 1, F2_U32_PRIVATE | 4),
+           f2_wake((void *)numa, 1, 1, F2_U32_PRIVATE | 8));
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -16651,6 +16792,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "vector-flags")) return vector_flags_case();
     if (!strcmp(mode, "old-times")) return old_times_case();
     if (!strcmp(mode, "old-forms")) return old_forms_case();
+    if (!strcmp(mode, "futex2")) return futex2_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

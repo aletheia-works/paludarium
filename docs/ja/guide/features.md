@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
@@ -171,7 +171,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どのプロセスの待ち手にも、どこにマップしていても届きます。それ以外のワードと private の操作は、
   このプロセスのアドレス空間とアドレスを指すので、private の wake はほかのプロセスに届きません。
   プロセス間で共有する mutex とセマフォ（Python の `multiprocessing`）も、持ち主が終わった
-  robust futex の wake も、こうして動きます。
+  robust futex の wake も、こうして動きます。wake は、0 以下の数を頼まれても待ち手を 1 つ起こします
+  （Linux は比べる前に数えるからです）。private の wake はワードのページを見ません。Linux の
+  ナノ秒に収まらない長さのタイムアウトは `KTIME_MAX` まで待ちます。
+- futex2 の呼び出しは、32 ビットのワードと `FUTEX2_PRIVATE`・`FUTEX2_NUMA`・`FUTEX2_MPOL` を
+  Linux と同じ順に確かめて受け付けます。ほかの大きさやフラグは `EINVAL` です。`futex_wake` と
+  `futex_wait` は、`FUTEX_WAKE_BITSET` と `FUTEX_WAIT_BITSET` に、`CLOCK_REALTIME` か
+  `CLOCK_MONOTONIC` の絶対時刻のタイムアウトを付けたものです。数 0 の `futex_wake` は何も
+  起こしません。`futex_waitv` は最大 128 個のワードを一度に待ち、起こされたワードの添字を返します。
+  値を比べる前にすべてのワードのアドレスを確かめ、その後で最初に違ったワードで `EAGAIN` を
+  返します。`FUTEX2_NUMA` のワードの後ろにはノードが続き、ただ 1 つのノード 0 か、`-1` で
+  なければなりません。`-1` は、Linux がスレッドのノードを書くのと同じく 0 になります。シグナルで
+  中断すると `ERESTARTSYS` になるので、停止の後と `SA_RESTART` のハンドラの後にやり直します。
 - `set_robust_list` と `get_robust_list` は、スレッドごとの robust futex のリストを
   持ちます。glibc と musl の robust mutex に必要です。スレッドが終わるときと `execve`
   のときに、Linux の `exit_robust_list` と同じようにリストをたどります。スレッドが
@@ -1744,7 +1755,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
-  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ち、時間制限の有無にかかわらず `futex_waitv` と futex2 の `futex_wait` です。
   `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll`、時間制限つきの `futex` の待ちは、
   `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
   `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが

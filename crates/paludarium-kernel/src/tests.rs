@@ -4437,3 +4437,124 @@ mod old_forms {
         );
     }
 }
+
+mod futex2 {
+    use super::*;
+    const LIST: u64 = DATA + 0x100;
+    const WORDS: u64 = DATA + 0x800;
+    const TIMEOUT: u64 = DATA + 0x900;
+    const U32_PRIVATE: u64 = 2 | 128;
+    /// Writes `struct futex_waitv` `index` of the list.
+    fn entry(f: &Fixture, index: u64, value: u64, addr: u64, flags: u64) {
+        let at = LIST + 24 * index;
+        f.mem.write_u64(GuestAddr(at), value).unwrap();
+        f.mem.write_u64(GuestAddr(at + 8), addr).unwrap();
+        f.mem.write_u64(GuestAddr(at + 16), flags).unwrap();
+    }
+    fn timeout(f: &Fixture, seconds: u64, ns: u64) {
+        f.mem.write_u64(GuestAddr(TIMEOUT), seconds).unwrap();
+        f.mem.write_u64(GuestAddr(TIMEOUT + 8), ns).unwrap();
+    }
+    #[test]
+    fn futex_waitv_checks_as_linux_does() {
+        let mut f = fixture();
+        entry(&f, 0, 0, WORDS, U32_PRIVATE);
+        let einval = errno(Errno::EINVAL);
+        // flags, then the count and the list.
+        assert_eq!(f.ret(449, &[LIST, 1, 1, 0, 0]), einval);
+        for (list, count) in [(LIST, 0), (LIST, 129), (0, 1)] {
+            assert_eq!(f.ret(449, &[list, count, 0, 0, 0]), einval);
+        }
+        // The timeout: its clock, then reading it, then its value.
+        assert_eq!(f.ret(449, &[LIST, 1, 0, TIMEOUT, 2]), einval);
+        assert_eq!(f.ret(449, &[LIST, 1, 0, 8, 1]), errno(Errno::EFAULT));
+        timeout(&f, 0, 1_000_000_000);
+        assert_eq!(f.ret(449, &[LIST, 1, 0, TIMEOUT, 1]), einval);
+        // Each entry: readable, its flags, `__reserved` and its value.
+        assert_eq!(
+            f.ret(449, &[DATA + 0x2000 - 8, 1, 0, 0, 0]),
+            errno(Errno::EFAULT)
+        );
+        for (value, flags) in [
+            (0, 128),
+            (0, 3 | 128),
+            (0, 2 | 0x100),
+            (0, U32_PRIVATE | 1 << 32),
+            (1 << 32, U32_PRIVATE),
+        ] {
+            entry(&f, 0, value, WORDS, flags);
+            assert_eq!(
+                f.ret(449, &[LIST, 1, 0, 0, 0]),
+                einval,
+                "{value:#x} {flags:#x}"
+            );
+        }
+        // Every key before any value: the second is misaligned.
+        entry(&f, 0, 1, WORDS, U32_PRIVATE);
+        entry(&f, 1, 0, WORDS + 2, U32_PRIVATE);
+        assert_eq!(f.ret(449, &[LIST, 2, 0, 0, 0]), einval);
+        entry(&f, 1, 0, WORDS + 4, U32_PRIVATE);
+        assert_eq!(f.ret(449, &[LIST, 2, 0, 0, 0]), errno(Errno::EAGAIN));
+        // A deadline passed already: ETIMEDOUT, on either clock.
+        entry(&f, 0, 0, WORDS, U32_PRIVATE);
+        timeout(&f, 0, 0);
+        assert_eq!(f.ret(449, &[LIST, 2, 0, TIMEOUT, 1]), errno(Errno(110)));
+        assert_eq!(f.ret(449, &[LIST, 2, 0, TIMEOUT, 0]), errno(Errno(110)));
+        // The clock is looked at only with a timeout.
+        entry(&f, 0, 1, WORDS, U32_PRIVATE);
+        assert_eq!(f.ret(449, &[LIST, 1, 0, 0, 99]), errno(Errno::EAGAIN));
+    }
+    #[test]
+    fn futex_wake_and_wait_check_as_linux_does() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // futex_wake(uaddr, mask, nr, flags)
+        for flags in [128, 3 | 128, 2 | 0x200] {
+            assert_eq!(f.ret(454, &[WORDS, 1, 1, flags]), einval);
+        }
+        assert_eq!(f.ret(454, &[WORDS, 1 << 32, 1, U32_PRIVATE]), einval);
+        assert_eq!(f.ret(454, &[WORDS, 0, 1, U32_PRIVATE]), einval);
+        assert_eq!(f.ret(454, &[WORDS + 2, 1, 1, U32_PRIVATE]), einval);
+        assert_eq!(f.ret(454, &[WORDS, 1, 0, U32_PRIVATE]), 0);
+        assert_eq!(f.ret(454, &[WORDS, 1, 1, U32_PRIVATE]), 0);
+        // FUTEX2_NUMA: aligned to 8, and node -1 becomes 0.
+        f.mem
+            .write_u64(GuestAddr(WORDS), 0xffff_ffff_0000_0000)
+            .unwrap();
+        assert_eq!(f.ret(454, &[WORDS + 4, 1, 1, U32_PRIVATE | 4]), einval);
+        assert_eq!(f.ret(454, &[WORDS, 1, 1, U32_PRIVATE | 4 | 8]), 0);
+        assert_eq!(f.mem.read_u64(GuestAddr(WORDS)).unwrap(), 0);
+        // futex_wait(uaddr, val, mask, flags, timeout, clockid): the value
+        // and mask fit, the timeout comes before the mask's 0.
+        assert_eq!(f.ret(455, &[WORDS, 1 << 32, 1, U32_PRIVATE, 0, 0]), einval);
+        assert_eq!(f.ret(455, &[WORDS, 0, 1 << 32, U32_PRIVATE, 0, 0]), einval);
+        assert_eq!(
+            f.ret(455, &[WORDS, 0, 0, U32_PRIVATE, 8, 1]),
+            errno(Errno::EFAULT)
+        );
+        assert_eq!(f.ret(455, &[WORDS, 0, 0, U32_PRIVATE, 0, 0]), einval);
+        assert_eq!(
+            f.ret(455, &[WORDS, 1, 1, U32_PRIVATE, 0, 0]),
+            errno(Errno::EAGAIN)
+        );
+        timeout(&f, 0, 0);
+        assert_eq!(
+            f.ret(455, &[WORDS, 0, 1, U32_PRIVATE, TIMEOUT, 1]),
+            errno(Errno(110))
+        );
+        // A timeout past KTIME_MAX is taken, as by FUTEX_WAIT_BITSET.
+        timeout(&f, i64::MAX as u64, 0);
+        assert_eq!(
+            f.ret(455, &[WORDS, 1, 1, U32_PRIVATE, TIMEOUT, 1]),
+            errno(Errno::EAGAIN)
+        );
+        assert_eq!(
+            f.ret(202, &[WORDS, 9 | 128, 1, TIMEOUT, 0, u64::from(u32::MAX)]),
+            errno(Errno::EAGAIN)
+        );
+        assert_eq!(
+            f.ret(202, &[WORDS, 128, 1, TIMEOUT, 0, 0]),
+            errno(Errno::EAGAIN)
+        );
+    }
+}

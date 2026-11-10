@@ -1204,6 +1204,23 @@ impl Kernel {
                 return Some(Next::Exit(status));
             }
             202 => self.futex_wait(thread, mem, a),
+            // futex_waitv, futex_wake, futex_wait (futex2)
+            449 => self.futex_waitv(thread, mem, a),
+            454 => futex2_flags(a[3] as u32).and_then(|(private, numa)| {
+                if a[1] >> 32 != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.group.futexes.wake_word(
+                    mem,
+                    a[0],
+                    private,
+                    numa,
+                    a[2] as i32,
+                    a[1] as u32,
+                    true,
+                )
+            }),
+            455 => self.futex2_wait(thread, mem, a),
             // restart_syscall resuming a timed futex wait a stop interrupted.
             219 if matches!(
                 thread.state.restart_block,
@@ -1438,7 +1455,7 @@ impl Kernel {
             return self
                 .group
                 .futexes
-                .wake(mem, a[0], private, a[2] as u32, mask);
+                .wake(mem, a[0], private, a[2] as u32 as i32, mask);
         }
         if !matches!(op, 0 | 9 | 265) {
             return Err(Errno::ENOSYS);
@@ -1460,12 +1477,14 @@ impl Kernel {
             if seconds < 0 || !(0..1_000_000_000).contains(&ns) {
                 return Err(Errno::EINVAL);
             }
-            let value = (seconds as u64)
-                .checked_mul(1_000_000_000)
-                .and_then(|v| v.checked_add(ns as u64))
-                .ok_or(Errno::EINVAL)?;
+            // Linux's ktime saturates at KTIME_MAX, as does adding the
+            // relative wait of FUTEX_WAIT to now (`ktime_add_safe`).
+            let value = ktime(seconds, ns);
             Some(if op == 0 {
-                self.host.clock(clock)?.saturating_add(value)
+                self.host
+                    .clock(clock)?
+                    .saturating_add(value)
+                    .min(i64::MAX as u64)
             } else {
                 value
             })
@@ -1531,15 +1550,119 @@ impl Kernel {
             .group
             .futexes
             .register(mem, uaddr, private, value, mask)?;
+        self.futex_sleep(thread, &[waiter], clock, deadline)
+            .map(|_| 0)
+    }
+    /// `futex_waitv(waiters, nr_futexes, flags, timeout, clockid)`, as
+    /// Linux's: no `flags`, from 1 to `FUTEX_WAITV_MAX` (128) waiters and
+    /// a list (`EINVAL`), the timeout ([`Self::futex2_deadline`]), then each
+    /// 24-byte `struct futex_waitv` ([`futex_words`]). It gives the index of
+    /// a word that was woken.
+    fn futex_waitv(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
+        if a[2] != 0 || a[1] == 0 || a[1] > FUTEX_WAITV_MAX || a[0] == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let (clock, deadline) = self.futex2_deadline(mem, a[3], a[4] as i32)?;
+        let words = futex_words(mem, a[0], a[1])?;
+        let waiters = self.group.futexes.register_all(mem, &words)?;
+        self.futex_sleep(thread, &waiters, clock, deadline)
+            .map(|index| index as u64)
+    }
+    /// futex2's `futex_wait(uaddr, val, mask, flags, timeout, clockid)`, as
+    /// Linux's: the flags ([`futex2_flags`]), a value and a mask that fit
+    /// in 32 bits (`EINVAL`), the timeout ([`Self::futex2_deadline`]), and
+    /// then FUTEX_WAIT_BITSET's wait, whose mask may not be 0.
+    fn futex2_wait(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
+        let (private, numa) = futex2_flags(a[3] as u32)?;
+        if a[1] >> 32 != 0 || a[2] >> 32 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let (clock, deadline) = self.futex2_deadline(mem, a[4], a[5] as i32)?;
+        if a[2] == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let word = crate::futex::Word {
+            addr: a[0],
+            private,
+            numa,
+            value: a[1] as u32,
+            mask: a[2] as u32,
+        };
+        let waiters = self.group.futexes.register_all(mem, &[word])?;
+        self.futex_sleep(thread, &waiters, clock, deadline)
+            .map(|_| 0)
+    }
+    /// The absolute timeout of futex2's waits, as Linux's
+    /// `futex2_setup_timeout`: none without one, else on `CLOCK_REALTIME`
+    /// or `CLOCK_MONOTONIC` (`EINVAL`), read (`EFAULT`) and valid
+    /// (`EINVAL`), saturating at `KTIME_MAX`.
+    fn futex2_deadline(
+        &self,
+        mem: &AddressSpace,
+        timeout: u64,
+        clock: i32,
+    ) -> Result<(ClockId, Option<u64>), Errno> {
+        if timeout == 0 {
+            return Ok((ClockId::Monotonic, None));
+        }
+        let clock = match clock {
+            0 => ClockId::Realtime,
+            1 => ClockId::Monotonic,
+            _ => return Err(Errno::EINVAL),
+        };
+        let mut b = [0; 16];
+        mem.read(GuestAddr(timeout), &mut b)
+            .map_err(|_| Errno::EFAULT)?;
+        let seconds = i64::from_le_bytes(b[..8].try_into().map_err(|_| Errno::EINVAL)?);
+        let ns = i64::from_le_bytes(b[8..].try_into().map_err(|_| Errno::EINVAL)?);
+        if seconds < 0 || !(0..1_000_000_000).contains(&ns) {
+            return Err(Errno::EINVAL);
+        }
+        Ok((clock, Some(ktime(seconds, ns))))
+    }
+    /// Sleeps until one of `waiters`, which share a token, is woken, giving
+    /// its index (the last one woken, as Linux's `futex_unqueue_multiple`
+    /// finds it), until `deadline` on `clock` (`ETIMEDOUT`), or until a
+    /// signal or the group's end (`EINTR`). Every other waiter leaves its
+    /// queue.
+    fn futex_sleep(
+        &mut self,
+        thread: &mut Thread,
+        waiters: &[Arc<crate::futex::Waiter>],
+        clock: ClockId,
+        deadline: Option<u64>,
+    ) -> Result<usize, Errno> {
+        let token = Arc::clone(&waiters[0].token);
+        let finish = |futexes: &crate::futex::Futexes, result: u32| {
+            for waiter in waiters {
+                futexes.finish(waiter, result);
+            }
+        };
         let mut interrupted = false;
         loop {
-            let state = waiter.state.load(Ordering::SeqCst);
-            if state != 0 {
-                return if state == 1 {
-                    Ok(0)
-                } else {
-                    Err(Errno(if state == 2 { 110 } else { 4 }))
-                };
+            if let Some(index) = waiters
+                .iter()
+                .rposition(|w| w.state.load(Ordering::SeqCst) == 1)
+            {
+                finish(&self.group.futexes, 3);
+                return Ok(index);
+            }
+            if let Some(state) = waiters
+                .iter()
+                .map(|w| w.state.load(Ordering::SeqCst))
+                .find(|&state| state != 0)
+            {
+                return Err(Errno(if state == 2 { 110 } else { 4 }));
             }
             self.group.drain_process(&mut thread.state);
             interrupted |= self.inbox.drain(&mut thread.state).interrupted;
@@ -1551,7 +1674,7 @@ impl Kernel {
             let now = match self.host.clock(clock) {
                 Ok(now) => now,
                 Err(error) => {
-                    self.group.futexes.finish(&waiter, 3);
+                    finish(&self.group.futexes, 3);
                     return Err(error);
                 }
             };
@@ -1566,28 +1689,86 @@ impl Kernel {
                 0
             };
             if result != 0 {
-                self.group.futexes.finish(&waiter, result);
+                finish(&self.group.futexes, result);
                 continue;
             }
             let end = deadline
                 .unwrap_or(u64::MAX)
                 .min(now.saturating_add(10_000_000));
-            let outcome =
-                match self
-                    .host
-                    .wait_on(&waiter.token, 0, Some((clock, end)), &self.cancellation)
-                {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        self.group.futexes.finish(&waiter, 3);
-                        return Err(error);
-                    }
-                };
+            let outcome = match self
+                .host
+                .wait_on(&token, 0, Some((clock, end)), &self.cancellation)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    finish(&self.group.futexes, 3);
+                    return Err(error);
+                }
+            };
             if outcome == WaitOutcome::Interrupted {
                 interrupted |= self.inbox.drain(&mut thread.state).interrupted;
             }
         }
     }
+}
+
+/// `FUTEX_WAITV_MAX`, the most words one `futex_waitv` waits on.
+const FUTEX_WAITV_MAX: u64 = 128;
+/// A valid `timespec` as Linux's ktime, which saturates at `KTIME_MAX`.
+fn ktime(seconds: i64, ns: i64) -> u64 {
+    (seconds as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ns as u64)
+        .min(i64::MAX as u64)
+}
+/// futex2's flags as Linux's `futex2_to_flags` and `futex_flags_valid` take
+/// them: only `FUTEX2_SIZE_U32` (the 32-bit words implemented), with
+/// `FUTEX2_NUMA`, `FUTEX2_MPOL` (a node from the memory policy, which is
+/// always node 0 here) and `FUTEX2_PRIVATE`, else `EINVAL`. It gives
+/// whether the word is private and followed by a node word.
+fn futex2_flags(flags: u32) -> Result<(bool, bool), Errno> {
+    const SIZE_MASK: u32 = 3;
+    const SIZE_U32: u32 = 2;
+    const NUMA: u32 = 4;
+    const MPOL: u32 = 8;
+    const PRIVATE: u32 = 128;
+    if flags & !(SIZE_MASK | NUMA | MPOL | PRIVATE) != 0 || flags & SIZE_MASK != SIZE_U32 {
+        return Err(Errno::EINVAL);
+    }
+    Ok((flags & PRIVATE != 0, flags & NUMA != 0))
+}
+/// The `count` words of a `struct futex_waitv` list at `list`, as Linux's
+/// `futex_parse_waitv` reads them one after another: each readable
+/// (`EFAULT`), with known flags and no `__reserved` ([`futex2_flags`],
+/// `EINVAL`) and a value that fits the word (`EINVAL`).
+fn futex_words(
+    mem: &AddressSpace,
+    list: u64,
+    count: u64,
+) -> Result<Vec<crate::futex::Word>, Errno> {
+    (0..count)
+        .map(|i| {
+            let mut b = [0; 24];
+            mem.read(GuestAddr(list.wrapping_add(24 * i)), &mut b)
+                .map_err(|_| Errno::EFAULT)?;
+            let word = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap_or_default());
+            let (value, addr, flags) = (word(0), word(8), word(16));
+            if flags >> 32 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let (private, numa) = futex2_flags(flags as u32)?;
+            if value >> 32 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(crate::futex::Word {
+                addr,
+                private,
+                numa,
+                value: value as u32,
+                mask: u32::MAX,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

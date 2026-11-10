@@ -297,9 +297,10 @@ verified.
   (or a directory that is a working directory) gets `IN_DELETE_SELF` as it is
   removed, where Linux sends it at the last close. A change through a
   descriptor (`fchmod`, `ftruncate`, a read, a write or a close) reaches the
-  watch of the file's directory only while the path it was opened at still
-  names it, where
-  Linux follows a rename and reports to the directory a removed file was in.
+  watch of the file's directory while the path it was opened at still names
+  it, and by that name once no name links the file; a file renamed or reached
+  through another link after it was opened is heard of by its own watches
+  only, where Linux follows the rename.
   An instance cannot be used for signal-driven I/O (`FIOASYNC` gives
   `ENOTTY`, and `fcntl` leaves `O_ASYNC` off), its `/proc/self/fdinfo` entry
   does not list its watches, `/proc/sys/fs/inotify` does not exist, and

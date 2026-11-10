@@ -427,6 +427,25 @@ static int case_content(void) {
     close(gone);
     printf("late=%ld\n", late);
     drain(excl, "excl-unlink");
+    /* Without IN_EXCL_UNLINK the directory still hears of a removed open
+       file, by the name it had; a watch on the file itself with the flag
+       does not (read after the close, which Linux's IN_DELETE_SELF waits
+       for). */
+    int plain = inotify_init1(IN_NONBLOCK);
+    char *h = at("w/h");
+    touch(h);
+    inotify_add_watch(plain, dir, WATCHED);
+    int self = inotify_init1(IN_NONBLOCK);
+    inotify_add_watch(self, h, WATCHED | IN_EXCL_UNLINK);
+    int kept = open(h, O_RDWR);
+    unlink(h);
+    long kept_write = e(write(kept, "y", 1));
+    long kept_read = e(pread(kept, buf, 1, 0));
+    printf("kept write=%ld read=%ld\n", kept_write, kept_read);
+    drain(plain, "unlinked-dir");
+    close(kept);
+    drain(plain, "unlinked-dir-closed");
+    drain(self, "unlinked-self");
     remove_all();
     return 0;
 }

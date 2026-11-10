@@ -263,7 +263,7 @@ impl Notifier {
         let mask = mask | file.isdir();
         for instance in self.instances() {
             if let Some(parent) = named.and_then(|named| named.parent.map(|p| (p, named))) {
-                instance.report(parent.0, mask, &parent.1.name, 0, false);
+                instance.report(parent.0, mask, &parent.1.name, 0, unlinked);
             }
             instance.report(file.key, mask, b"", 0, unlinked);
         }
@@ -413,10 +413,21 @@ impl Notifier {
         }
         let file = Found::of(device, stat);
         let special = !matches!(stat.mode & 0o170000, 0o100000 | 0o040000 | 0o120000);
+        // A file no name links any more keeps the name and directory it was
+        // opened at, as its dentry stays with its parent; one that a rename
+        // or another link took elsewhere is heard of by its own watches only.
         let named = place
-            .and_then(|(fs, path)| Self::named(fs, path, true))
-            .filter(|named| named.file.is_some_and(|found| found.key == file.key))
+            .and_then(|(fs, path)| {
+                if stat.links == 0 {
+                    Self::named(fs, path, false)
+                } else {
+                    Self::named(fs, path, true)
+                        .filter(|named| named.file.is_some_and(|found| found.key == file.key))
+                }
+            })
             .filter(|_| !(content && special && mask & (ACCESS | MODIFY) != 0));
+        // `fsnotify_handle_inode_event` skips either watch with
+        // `IN_EXCL_UNLINK` for an unlinked dentry.
         let unlinked = content && stat.links == 0;
         self.child(named.as_ref(), file, mask, unlinked);
     }

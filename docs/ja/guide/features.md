@@ -876,8 +876,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを
     開いたものの両方に要ります（なければ `EPERM`）。
   - **リンク:** `RTM_GETLINK` には、ダンプでも、インデックスか `IFLA_IFNAME` で指しても、
-    `lo`（インデックス 1、そのフラグ、名前、MTU、キュー、状態、キューイング規律、0 の統計）を
-    返します（ほかは `ENODEV`）。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
+    `lo`（インデックス 1）を返します（ほかは `ENODEV`）。属性は Linux 7.0 と同じものを
+    同じ順に載せます。フラグ、名前、MTU、キュー、状態、セグメントの大きさ、キャリア、
+    キューイング規律、0 の統計（`IFLA_EXT_MASK` に `RTEXT_FILTER_SKIP_STATS` があれば
+    載せません）、XDP、マップ、IPv4 と IPv6 の設定（`IFLA_AF_SPEC`）です。そのため
+    `ip -d link` は Linux と同じ詳細を出します。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
   - **アドレス:** `RTM_GETADDR` は `lo` のアドレスを Linux の順でダンプします。IPv4 の
     プライマリは、同じかより広いスコープのプライマリの後に並び、セカンダリ（プライマリの
     サブネットの中のアドレス。`IFA_F_SECONDARY` が付きます）は最後です。IPv6 はグローバルな

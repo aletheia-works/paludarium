@@ -1533,6 +1533,91 @@ static void routes_get(int fd, unsigned port, const char *when, const char *cons
         nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, request, 16 + size), port, label);
     }
 }
+/* The link-attributes case: the attributes at `at`, one line each, with
+   their type (with its NLA_F_NESTED bit) and length, the nested ones'
+   inside. A value is printed in hex, or as a sum of its bytes past 16, but
+   for these of IFLA_AF_SPEC: the IPv4 and IPv6 settings, which a new
+   network namespace copies from the host's, and of IPv6's
+   `ifla_cacheinfo` its creation time and reachable time, which vary. */
+static void link_attributes(const unsigned char *at, int len, int depth, int parent, int family) {
+    while (len >= 4) {
+        unsigned short alen, type;
+        memcpy(&alen, at, 2);
+        memcpy(&type, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        int kind = type & 0x3fff, n = alen - 4;
+        const unsigned char *v = at + 4;
+        printf("%*s%#x len=%d", 2 * depth + 2, "", type, n);
+        if (depth == 0 && (kind == 26 || kind == 43)) {
+            printf("\n");
+            link_attributes(v, n, 1, kind, 0);
+        } else if (depth == 1 && parent == 26) {
+            printf("\n");
+            link_attributes(v, n, 2, 26, kind);
+        } else if (depth == 2 && (family == 2 || family == 10) && kind == (family == 2 ? 1 : 2)) {
+            printf(" (settings)\n");
+        } else if (depth == 2 && family == 10 && kind == 5 && n == 16) {
+            unsigned info[4];
+            memcpy(info, v, 16);
+            printf(" max_reasm_len=%u retrans_time=%u\n", info[0], info[3]);
+        } else {
+            unsigned long sum = 0;
+            for (int i = 0; i < n; i++) sum += v[i];
+            if (n > 16) printf(" sum=%lu", sum);
+            else
+                for (int i = 0; i < n; i++) printf("%s%02x", i ? "" : " ", v[i]);
+            printf("\n");
+        }
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+}
+/* Asks `fd` for lo's link message: a dump with only a family byte, as glibc
+   sends it, or with an `ifinfomsg` and IFLA_EXT_MASK `mask`, as ip does;
+   or `lo` by its index; and prints each message's header and attributes. */
+static void link_show(int fd, unsigned port, const char *label, int get, int full, unsigned mask) {
+    unsigned char request[16 + 8] = {0};
+    size_t len = 1;
+    if (full) {
+        if (get) request[4] = 1;
+        unsigned short attribute[2] = {8, 29};
+        memcpy(request + 16, attribute, 4);
+        memcpy(request + 20, &mask, 4);
+        len = sizeof request;
+    }
+    long seq = nl_send(fd, 18, NL_F_REQUEST | (get ? 0 : NL_F_DUMP), request, len);
+    for (;;) {
+        static char buf[32768];
+        long n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0) return;
+        for (char *at = buf; at + sizeof(struct nl_header) <= buf + n;) {
+            struct nl_header *h = (void *)at;
+            if (h->len < sizeof *h || at + h->len > buf + n) return;
+            unsigned char *body = (void *)(h + 1);
+            int body_len = h->len - sizeof *h;
+            at += (h->len + 3) & ~3;
+            if (h->type == 3 || h->type == 2) {
+                int error = 0;
+                memcpy(&error, body, 4);
+                printf("%s: type=%u error=%d\n", label, h->type, error);
+                return;
+            }
+            int index = 0;
+            if (h->type == 16 && body_len >= 16) memcpy(&index, body + 4, 4);
+            if (index != 1) continue;
+            unsigned short arphrd;
+            unsigned flags, change;
+            memcpy(&arphrd, body + 2, 2);
+            memcpy(&flags, body + 8, 4);
+            memcpy(&change, body + 12, 4);
+            printf("%s: type=%u flags=%#x seq=%d port=%d len=%u family=%u arphrd=%u flags=%#x change=%#x\n", label,
+                   h->type, h->flags, h->seq == seq, h->pid == port, h->len, body[0], arphrd, flags, change);
+            link_attributes(body + 16, body_len - 16, 0, 0, 0);
+            if (get) return;
+        }
+    }
+}
 /* Binds a UDP socket of `family` to `text`, and prints the result. */
 static void addresses_bind(const char *text, const char *when) {
     int family = strchr(text, ':') ? AF_INET6 : AF_INET;
@@ -7298,6 +7383,41 @@ int main(int argc, char **argv) {
                 _exit(0);
             }
             result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "link-attributes")) {
+        /* A child makes a network namespace and prints lo's link message,
+           down and up, as each request gives it. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int fd = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(fd, (void *)&any, sizeof any);
+            getsockname(fd, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            static const char *const states[] = {"down", "up"};
+            for (int up = 0; up < 2; up++) {
+                char label[64];
+                snprintf(label, sizeof label, "%s family", states[up]);
+                link_show(fd, port, label, 0, 0, 0);
+                snprintf(label, sizeof label, "%s vf", states[up]);
+                link_show(fd, port, label, 0, 1, 1);
+                /* RTEXT_FILTER_SKIP_STATS leaves the statistics out. */
+                snprintf(label, sizeof label, "%s get skip stats", states[up]);
+                link_show(fd, port, label, 1, 1, 8);
+                if (!up) {
+                    int udp = socket(AF_INET, SOCK_DGRAM, 0);
+                    netns_lo(udp, SIOCSIFFLAGS, "lo", IFF_UP);
+                    close(udp);
+                }
+            }
             fflush(stdout);
             _exit(0);
         }

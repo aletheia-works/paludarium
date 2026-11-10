@@ -26,6 +26,8 @@ def run(*argv):
 
 
 run("/usr/bin/ip", "-o", "link", "show", "lo")
+# The details: queues, segment sizes and IPv6's address generation mode.
+run("/usr/bin/ip", "-d", "link", "show", "lo")
 run("/usr/bin/ip", "-o", "addr", "show", "lo")
 run("/usr/bin/ip", "-o", "-4", "addr", "show", "dev", "lo")
 # Routes through lo alone: the kernel's for 127.0.0.1/8 and ::1, in the

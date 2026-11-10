@@ -307,9 +307,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   名前空間のソケットにも送りません（`NETLINK_LISTEN_ALL_NSID` はありません）。`lo` を
   落としたときに消える、`lo` を通る IPv4 の経路は、Linux と同じく何も伝えません。
   `NETLINK_PKTINFO`、`NETLINK_NO_ENOBUFS` など、機能のページに挙げていないオプションは
-  `ENOPROTOOPT` です。リンクのメッセージは Linux の属性の一部だけを載せ
-  （`IFLA_AF_SPEC`、`IFLA_MAP`、`IFLA_XDP` などはありません）、統計は 0、アドレスの
-  作成時刻は 0 です。`NETLINK_EXT_ACK` はエラーに属性を足さず、厳密な検査も何も
+  `ENOPROTOOPT` です。リンクのメッセージの統計は 0 です。
+  IPv4 と IPv6 の設定は、sysctl が組み込みのままのカーネルのものです。Linux の新しい
+  名前空間はホストのものを写します。IPv6 の作成時刻は 0、到達可能時間は 30 秒です。
+  Linux では乱数で決まります。アドレスの作成時刻は 0 です。`NETLINK_EXT_ACK` はエラーに属性を足さず、厳密な検査も何も
   足しません。`rtnetlink` の知る最後より後の型のメッセージには `NLMSG_ERROR` で
   `EOPNOTSUPP` を返します。Linux 7.0 では送信そのものが `EOPNOTSUPP` になります。ダンプは一度に全部を答えます。Linux は複数のデータグラムに分けることが
   あります。受信バッファがいっぱいのソケットへの答えは、待たずに `ENOBUFS` で捨てます。

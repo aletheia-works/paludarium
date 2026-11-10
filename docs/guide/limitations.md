@@ -351,9 +351,11 @@ verified.
   groups, nor to a socket in another namespace (`NETLINK_LISTEN_ALL_NSID`
   is not supported); IPv4's routes through `lo` go without one when it
   goes down, as on Linux. `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the
-  other options not listed in the features are `ENOPROTOOPT`. A link message carries a
-  subset of Linux's attributes (no `IFLA_AF_SPEC`, `IFLA_MAP`, `IFLA_XDP`
-  and others), its statistics are zero, an address's creation times are 0,
+  other options not listed in the features are `ENOPROTOOPT`. A link message's
+  statistics are zero; its IPv4 and IPv6 settings are those of a kernel
+  whose sysctls are as built, where Linux's new namespace copies the
+  host's, and IPv6's creation time is 0 and its reachable time 30 seconds,
+  where Linux's is random. An address's creation times are 0,
   `NETLINK_EXT_ACK` adds no attributes to an error and strict checking
   checks nothing more. A message type past the last that `rtnetlink`
   knows is answered with `EOPNOTSUPP` in `NLMSG_ERROR`, where Linux 7.0

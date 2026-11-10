@@ -124,6 +124,41 @@ const IFLA_LINKMODE: u16 = 17;
 const IFLA_STATS64: u16 = 23;
 const IFLA_GROUP: u16 = 27;
 const IFLA_EXT_MASK: u16 = 29;
+const IFLA_MAP: u16 = 14;
+const IFLA_AF_SPEC: u16 = 26;
+const IFLA_XDP: u16 = 43;
+const IFLA_XDP_ATTACHED: u16 = 2;
+const IFLA_TSO_MAX_SIZE: u16 = 59;
+const IFLA_DEVLINK_PORT: u16 = 62;
+const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
+const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
+const IFLA_DPLL_PIN: u16 = 65;
+const IFLA_MAX_PACING_OFFLOAD_HORIZON: u16 = 66;
+const IFLA_NETNS_IMMUTABLE: u16 = 67;
+const IFLA_HEADROOM: u16 = 68;
+const IFLA_TAILROOM: u16 = 69;
+const IFLA_TSO_MAX_SEGS: u16 = 60;
+const IFLA_INET_CONF: u16 = 1;
+const IFLA_INET6_FLAGS: u16 = 1;
+const IFLA_INET6_CONF: u16 = 2;
+const IFLA_INET6_STATS: u16 = 3;
+const IFLA_INET6_CACHEINFO: u16 = 5;
+const IFLA_INET6_ICMP6STATS: u16 = 6;
+const IFLA_INET6_TOKEN: u16 = 7;
+const IFLA_INET6_ADDR_GEN_MODE: u16 = 8;
+/// `IF_READY`: IPv6 is ready on a device that is up.
+const IF_READY: u32 = 0x8000_0000;
+/// The counters of IPv6's `IFLA_INET6_STATS` and `IFLA_INET6_ICMP6STATS`
+/// (`__IPSTATS_MIB_MAX`, `__ICMP6_MIB_MAX`), the first of each their count.
+const IPSTATS_MIB_MAX: u64 = 38;
+const ICMP6_MIB_MAX: u64 = 7;
+/// `NLA_F_NESTED`, which a nest made by `nla_nest_start` carries.
+const NLA_F_NESTED: u16 = 0x8000;
+/// `RTEXT_FILTER_SKIP_STATS`: a link message without statistics.
+const RTEXT_FILTER_SKIP_STATS: u32 = 8;
+/// `lo`'s largest TSO segment: Linux's `TSO_MAX_SIZE`, which a loopback
+/// takes (`loopback_setup`).
+const TSO_MAX_SIZE: u32 = 524_280;
 const IFLA_PROMISCUITY: u16 = 30;
 const IFLA_NUM_TX_QUEUES: u16 = 31;
 const IFLA_NUM_RX_QUEUES: u16 = 32;
@@ -604,7 +639,13 @@ impl NetlinkSocket {
             let messages = match (header.kind, family) {
                 // `rtnl_bridge_getlink` has no bridge port to show.
                 (RTM_GETLINK, AF_BRIDGE) => Vec::new(),
-                (RTM_GETLINK, _) => link_message(&self.network, header.seq, port, NLM_F_MULTI),
+                (RTM_GETLINK, _) => link_message(
+                    &self.network,
+                    header.seq,
+                    port,
+                    NLM_F_MULTI,
+                    ext_mask(payload),
+                ),
                 // `rtnl_dump_all` dumps each family's: IPv4's, then IPv6's.
                 (RTM_GETADDR, _) => {
                     let mut messages = Vec::new();
@@ -681,7 +722,7 @@ impl NetlinkSocket {
             }
             RTM_GETLINK => {
                 self.find_link(payload, header, true)?;
-                let reply = link_message(&self.network, header.seq, port, 0);
+                let reply = link_message(&self.network, header.seq, port, 0, ext_mask(payload));
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
@@ -963,11 +1004,15 @@ fn link_flags(network: &Network) -> u32 {
         IFF_LOOPBACK
     }
 }
-/// `RTM_NEWLINK` for `lo`, as `rtnl_fill_ifinfo` gives it, with the
-/// attributes of its name, queue, state, MTU, carrier, queueing
-/// discipline, hardware addresses and statistics (all zero).
-fn link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec<u8> {
+/// `RTM_NEWLINK` for `lo`, as `rtnl_fill_ifinfo` gives it, with its
+/// attributes in Linux 7.0's order: its name, queue, state, MTU, queues,
+/// segment sizes, carrier, hardware addresses, statistics (all zero, and
+/// left out for `RTEXT_FILTER_SKIP_STATS` in `mask`), XDP, queueing
+/// discipline, its IPv4 and IPv6 settings ([`af_spec`]), its map and empty
+/// devlink and DPLL nests.
+fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -> Vec<u8> {
     let up = network.is_up();
+    let stats = mask & RTEXT_FILTER_SKIP_STATS == 0;
     let mut body = Vec::new();
     body.extend_from_slice(&[0, 0]);
     body.extend_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
@@ -980,6 +1025,8 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec<u8> {
     let operstate = if up { IF_OPER_UNKNOWN } else { IF_OPER_DOWN };
     attribute(&mut body, IFLA_OPERSTATE, &[operstate]);
     attribute(&mut body, IFLA_LINKMODE, &[0]);
+    // A loopback may not move to another namespace.
+    attribute(&mut body, IFLA_NETNS_IMMUTABLE, &[1]);
     attribute(&mut body, IFLA_MTU, &u32_of(LO_MTU));
     attribute(&mut body, IFLA_MIN_MTU, &u32_of(0));
     attribute(&mut body, IFLA_MAX_MTU, &u32_of(0));
@@ -990,16 +1037,28 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec<u8> {
     attribute(&mut body, IFLA_GSO_MAX_SEGS, &u32_of(GSO_MAX_SEGS));
     attribute(&mut body, IFLA_GSO_MAX_SIZE, &u32_of(GSO_MAX_SIZE));
     attribute(&mut body, IFLA_GRO_MAX_SIZE, &u32_of(GSO_MAX_SIZE));
+    attribute(&mut body, IFLA_GSO_IPV4_MAX_SIZE, &u32_of(GSO_MAX_SIZE));
+    attribute(&mut body, IFLA_GRO_IPV4_MAX_SIZE, &u32_of(GSO_MAX_SIZE));
+    attribute(&mut body, IFLA_TSO_MAX_SIZE, &u32_of(TSO_MAX_SIZE));
+    attribute(&mut body, IFLA_TSO_MAX_SEGS, &u32_of(GSO_MAX_SEGS));
+    attribute(&mut body, IFLA_MAX_PACING_OFFLOAD_HORIZON, &u32_of(0));
     attribute(&mut body, IFLA_NUM_RX_QUEUES, &u32_of(1));
     attribute(&mut body, IFLA_CARRIER, &[1]);
     attribute(&mut body, IFLA_CARRIER_CHANGES, &u32_of(0));
-    attribute(&mut body, IFLA_PROTO_DOWN, &[0]);
     attribute(&mut body, IFLA_CARRIER_UP_COUNT, &u32_of(0));
     attribute(&mut body, IFLA_CARRIER_DOWN_COUNT, &u32_of(0));
+    attribute(&mut body, IFLA_HEADROOM, &0u16.to_le_bytes());
+    attribute(&mut body, IFLA_TAILROOM, &0u16.to_le_bytes());
+    attribute(&mut body, IFLA_PROTO_DOWN, &[0]);
     attribute(&mut body, IFLA_ADDRESS, &[0; 6]);
     attribute(&mut body, IFLA_BROADCAST, &[0; 6]);
-    attribute(&mut body, IFLA_STATS64, &[0; STATS64_LEN]);
-    attribute(&mut body, IFLA_STATS, &[0; STATS_LEN]);
+    if stats {
+        attribute(&mut body, IFLA_STATS64, &[0; STATS64_LEN]);
+        attribute(&mut body, IFLA_STATS, &[0; STATS_LEN]);
+    }
+    let mut xdp = Vec::new();
+    attribute(&mut xdp, IFLA_XDP_ATTACHED, &[0]);
+    attribute(&mut body, IFLA_XDP, &xdp);
     // A device gets its queueing discipline when it first opens, and keeps
     // it when it goes down (`dev_activate`).
     let qdisc: &[u8] = if network.has_been_up() {
@@ -1008,7 +1067,71 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec<u8> {
         b"noop\0"
     };
     attribute(&mut body, IFLA_QDISC, qdisc);
+    attribute(&mut body, IFLA_AF_SPEC, &af_spec(up, stats));
+    attribute(&mut body, IFLA_MAP, &[0; 32]);
+    attribute(&mut body, IFLA_DEVLINK_PORT | NLA_F_NESTED, &[]);
+    attribute(&mut body, IFLA_DPLL_PIN | NLA_F_NESTED, &[]);
     message(RTM_NEWLINK, flags, seq, port, &body)
+}
+/// `lo`'s `IFLA_AF_SPEC`, as `inet_fill_link_af` and `inet6_fill_link_af`
+/// give it. Its IPv4 and IPv6 settings are those of a kernel whose sysctls
+/// are as built, a loopback's (no IPsec policy, no temporary addresses, no
+/// duplicate address detection, its MTU), not the host's a new namespace
+/// copies on Linux. IPv6 is ready while `lo` is up; its creation time is
+/// 0, its reachable time the base 30 seconds, where Linux's is random; its
+/// statistics are zero and left out without `stats`.
+fn af_spec(up: bool, stats: bool) -> Vec<u8> {
+    const INET: [i32; 33] = [
+        0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10000, 1000,
+        0, 0, 0, 0, 1,
+    ];
+    const INET6: [i32; 60] = [
+        0, 64, 65536, 1, 1, 1, 1, -1, 4000, 1000, -1, 172_800, 86400, 3, 600, 16, 0, 1, 1, 1,
+        60000, 0, 0, 0, 0, 0, 0, -1, 0, 0, 10000, 1000, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 3_600_000,
+        0, 0, 1, 0, 0, 0, 0, 0, 1024, 0, 65535, -1, 1, 0, 0, 0,
+    ];
+    let words =
+        |values: &[i32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let counters = |count: u64| -> Vec<u8> {
+        let mut raw = vec![0u8; 8 * count as usize];
+        raw[..8].copy_from_slice(&count.to_le_bytes());
+        raw
+    };
+    let mut inet = Vec::new();
+    attribute(&mut inet, IFLA_INET_CONF, &words(&INET));
+    let mut inet6 = Vec::new();
+    let ready: u32 = if up { IF_READY } else { 0 };
+    attribute(&mut inet6, IFLA_INET6_FLAGS, &ready.to_le_bytes());
+    // `ifla_cacheinfo`: the largest reassembly, creation time, reachable
+    // and retransmission times.
+    attribute(
+        &mut inet6,
+        IFLA_INET6_CACHEINFO,
+        &words(&[65535, 0, 30000, 1000]),
+    );
+    attribute(&mut inet6, IFLA_INET6_CONF, &words(&INET6));
+    if stats {
+        attribute(&mut inet6, IFLA_INET6_STATS, &counters(IPSTATS_MIB_MAX));
+        attribute(&mut inet6, IFLA_INET6_ICMP6STATS, &counters(ICMP6_MIB_MAX));
+    }
+    attribute(&mut inet6, IFLA_INET6_TOKEN, &[0; 16]);
+    attribute(&mut inet6, IFLA_INET6_ADDR_GEN_MODE, &[0]);
+    let mut spec = Vec::new();
+    attribute(&mut spec, u16::from(AF_INET), &inet);
+    attribute(&mut spec, u16::from(AF_INET6), &inet6);
+    spec
+}
+/// The `IFLA_EXT_MASK` of a link request, past its `ifinfomsg`: 0 for
+/// none, or for a dump that sends only a family byte.
+fn ext_mask(payload: &[u8]) -> u32 {
+    payload
+        .get(16..)
+        .map(attributes)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(kind, _)| *kind == IFLA_EXT_MASK)
+        .and_then(|(_, value)| value.first_chunk().copied())
+        .map_or(0, u32::from_le_bytes)
 }
 /// `struct ifa_cacheinfo`: forever preferred and valid. The times it was
 /// made and changed are given as 0.
@@ -1665,7 +1788,7 @@ fn link_change(network: &Network, up: bool) -> Vec<Notice> {
     let Some(events) = network.set_up(up) else {
         return Vec::new();
     };
-    let mut link = link_message(network, 0, 0, 0);
+    let mut link = link_message(network, 0, 0, 0, 0);
     link[28..32].copy_from_slice(&IFF_UP.to_le_bytes());
     let mut notices = vec![Notice {
         group: RTNLGRP_LINK,
@@ -2014,7 +2137,7 @@ mod tests {
         // Down, a new namespace's loopback has no address.
         assert!(ipv4_message(&network, 1, 7).is_empty());
         assert!(ipv6_message(&network, 1, 7).is_empty());
-        let link = link_message(&network, 1, 7, NLM_F_MULTI);
+        let link = link_message(&network, 1, 7, NLM_F_MULTI, 0);
         assert_eq!(link.len() % 4, 0);
         let header = Header::read(&link);
         assert_eq!(
@@ -2029,6 +2152,32 @@ mod tests {
         assert_eq!(get(IFLA_OPERSTATE), Some(&[IF_OPER_DOWN][..]));
         assert_eq!(get(IFLA_QDISC), Some(&b"noop\0"[..]));
         assert_eq!(get(IFLA_STATS).map(<[u8]>::len), Some(STATS_LEN));
+        assert_eq!(get(IFLA_NETNS_IMMUTABLE), Some(&[1][..]));
+        assert_eq!(get(IFLA_MAP).map(<[u8]>::len), Some(32));
+        // IFLA_AF_SPEC: IPv4's 33 settings, then IPv6's, not yet ready.
+        let spec = attributes(get(IFLA_AF_SPEC).unwrap());
+        assert_eq!(spec.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [2, 10]);
+        assert_eq!(attributes(spec[0].1)[0].1.len(), 33 * 4);
+        let inet6 = attributes(spec[1].1);
+        assert_eq!(inet6[0], (IFLA_INET6_FLAGS, &[0u8; 4][..]));
+        assert_eq!(
+            inet6.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            [1, 5, 2, 3, 6, 7, 8]
+        );
+        // RTEXT_FILTER_SKIP_STATS leaves every statistic out.
+        let short = link_message(&network, 1, 7, 0, RTEXT_FILTER_SKIP_STATS);
+        let found = attributes(&short[32..]);
+        assert!(
+            !found
+                .iter()
+                .any(|(k, _)| *k == IFLA_STATS || *k == IFLA_STATS64)
+        );
+        let spec = found.iter().find(|(k, _)| *k == IFLA_AF_SPEC).unwrap().1;
+        let inet6 = attributes(attributes(spec)[1].1);
+        assert_eq!(
+            inet6.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            [1, 5, 2, 7, 8]
+        );
         // Up, it has both; down again, it keeps 127.0.0.1 alone.
         network.set_up(true);
         let v4 = ipv4_message(&network, 2, 7);

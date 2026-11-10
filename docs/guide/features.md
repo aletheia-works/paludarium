@@ -988,9 +988,13 @@ kernel.
     `NETLINK_CAP_ACK` is set. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending
     thread and the socket's opener (`EPERM`).
-  - **The link:** `RTM_GETLINK` answers with `lo` (index 1, its flags,
-    name, MTU, queue, state, queueing discipline and zero statistics), in a
-    dump or for its index or `IFLA_IFNAME` (`ENODEV` for another).
+  - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
+    for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
+    7.0's attributes in its order: its flags, name, MTU, queues, state,
+    segment sizes, carrier, queueing discipline, zero statistics (left out
+    with `RTEXT_FILTER_SKIP_STATS` in `IFLA_EXT_MASK`), XDP, map, and its
+    IPv4 and IPv6 settings (`IFLA_AF_SPEC`), so `ip -d link` gives
+    Linux's details.
     `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`.
   - **Addresses:** `RTM_GETADDR` dumps `lo`'s addresses in Linux's orders:
     IPv4's primaries after those of a scope as wide or wider, secondaries

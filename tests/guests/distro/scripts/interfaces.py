@@ -6,6 +6,16 @@ root nor a user has, so a user tries."""
 import ctypes
 import socket
 import subprocess
+import sys
+
+# lo has ::1 only where IPv6 is enabled on it. The output compared expects it,
+# as the CI runner's container has it; this setting, on standard error, which
+# is not compared, tells such a difference apart from an emulator bug.
+try:
+    with open("/proc/sys/net/ipv6/conf/lo/disable_ipv6") as setting:
+        print("disable_ipv6", setting.read().strip(), file=sys.stderr)
+except OSError as error:
+    print("disable_ipv6 unreadable:", error, file=sys.stderr)
 
 
 def run(*argv):

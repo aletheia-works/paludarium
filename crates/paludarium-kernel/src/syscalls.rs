@@ -297,7 +297,7 @@ impl SyscallTable {
                 crate::landlock::sys_restrict_self(c, a).unwrap_or_else(Errno::to_syscall_return),
             )
         });
-        for number in [213, 233, 232, 281, 291] {
+        for number in [213, 233, 232, 281, 291, 441] {
             handlers.insert(number, crate::epoll::dispatch);
         }
         for number in [

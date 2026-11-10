@@ -147,6 +147,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   変えない（処理中の要求はありません）のに `IORING_FEAT_MIN_TIMEOUT` を報告します。
 - **一部のシステムコール**：実装していないシステムコールは `ENOSYS` を返すので、
   プログラムによってはその機能なしで続けられます。
+  - `pwritev2` の `RWF_NOAPPEND` は、ここでは `O_APPEND` のファイルの追記を止められないので、
+    そのようなファイルでは `EOPNOTSUPP` を返します。Linux は指定した位置に書きます。
+    `RWF_NOWAIT` は、どの通常のファイルでも ext4 と同じく、読み込みは受け付け、書き込みは
+    `EOPNOTSUPP` を返します。tmpfs はどちらも断り、ほかのファイルシステムは書き込みを
+    受け付けることがあります。また、読み込みでページがキャッシュにない（Linux の `EAGAIN`）
+    ことはありません。
   - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は設定できません。
     Linux はこれを設定して `SIGVTALRM` と `SIGPROF` を送りますが、`setitimer` は `EINVAL` を
     返し、`getitimer` は設定されていないものとして見せます。

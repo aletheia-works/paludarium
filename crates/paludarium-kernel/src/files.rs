@@ -12,7 +12,8 @@ pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 79, 80, 81,
     82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 133, 137, 138, 162, 188, 189, 190, 191,
     192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 257, 258, 259, 260, 262, 263, 264, 265, 266,
-    267, 268, 269, 277, 280, 285, 292, 293, 295, 296, 316, 319, 326, 332, 436, 437, 439, 452,
+    267, 268, 269, 277, 280, 285, 292, 293, 295, 296, 316, 319, 326, 327, 328, 332, 436, 437, 439,
+    452,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -1006,9 +1007,9 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
 /// flags and `F_GETFL`). A descriptor that is not open is left to the call.
 fn refuse_path_only(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<(), Errno> {
     let descriptors: &[u64] = match n {
-        // read, readv, writev, pread64, pwrite64, preadv, pwritev, lseek,
-        // flock, getdents64
-        0 | 8 | 17 | 18 | 19 | 20 | 73 | 217 | 295 | 296 => &a[..1],
+        // read, readv, writev, pread64, pwrite64, preadv, pwritev, preadv2,
+        // pwritev2, lseek, flock, getdents64
+        0 | 8 | 17 | 18 | 19 | 20 | 73 | 217 | 295 | 296 | 327 | 328 => &a[..1],
         // sendfile(out, in), copy_file_range(in, _, out)
         40 => &a[..2],
         326 => &[a[0], a[2]],
@@ -1617,18 +1618,217 @@ pub(crate) fn scatter(
     }
     Ok(())
 }
+/// `preadv2`'s and `pwritev2`'s flags (`RWF_*`). `RWF_HIPRI` (0x1), which
+/// polls for a direct transfer, changes nothing for these buffered ones.
+const RWF_DSYNC: u32 = 0x2;
+const RWF_SYNC: u32 = 0x4;
+const RWF_NOWAIT: u32 = 0x8;
+const RWF_APPEND: u32 = 0x10;
+const RWF_NOAPPEND: u32 = 0x20;
+const RWF_ATOMIC: u32 = 0x40;
+const RWF_SUPPORTED: u32 = 0x7f;
+const S_IFMT: u32 = 0o170000;
+const S_IFREG: u32 = 0o100000;
+const S_IFSOCK: u32 = 0o140000;
+const S_IFIFO: u32 = 0o010000;
+const O_APPEND: u32 = 0o2000;
+
+/// The `RWF_*` flags of a transfer with bytes to move, checked as Linux's
+/// `kiocb_set_rw_flags` checks them, after the vector and the range.
+/// `RWF_NOWAIT` needs a file opened with `FMODE_NOWAIT`: here a regular
+/// file (as on ext4; tmpfs has none), a pipe, a socket, an eventfd or a
+/// signalfd, and a regular file's buffered write refuses it as ext4's
+/// does. No file can write atomically (`FMODE_CAN_ATOMIC_WRITE`), and
+/// `RWF_NOAPPEND` cannot turn an `O_APPEND` file's append off here.
+fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, Errno> {
+    if flags == 0 {
+        return Ok(0);
+    }
+    if flags & !RWF_SUPPORTED != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if flags & RWF_APPEND != 0 && flags & RWF_NOAPPEND != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let kind = file.stat()?.mode & S_IFMT;
+    if flags & RWF_NOWAIT != 0 {
+        let any = file.as_any();
+        let nowait = kind == S_IFREG
+            || kind == S_IFIFO
+            || kind == S_IFSOCK
+            || any.is_some_and(|any| {
+                any.is::<crate::events::EventCounter>() || any.is::<crate::signalfd::SignalFile>()
+            });
+        if !nowait {
+            return Err(Errno::EOPNOTSUPP);
+        }
+    }
+    if flags & RWF_ATOMIC != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if write && flags & RWF_NOAPPEND != 0 && file.flags() & O_APPEND != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    // ext4_buffered_write_iter.
+    if write && flags & RWF_NOWAIT != 0 && kind == S_IFREG {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(flags)
+}
+
+/// After a write of a regular file with `RWF_DSYNC` or `RWF_SYNC`, its
+/// data reaches the file as `fdatasync` brings it (`generic_write_sync`).
+fn sync_written(file: &Arc<dyn FileHandle>, flags: u32, written: u64) -> Result<u64, Errno> {
+    if written > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 && file.stat()?.mode & S_IFMT == S_IFREG {
+        file.sync()?;
+    }
+    Ok(written)
+}
+
+/// Where an `RWF_APPEND` write of a regular file starts: at its end.
+fn appending(file: &Arc<dyn FileHandle>, flags: u32) -> Result<Option<u64>, Errno> {
+    if flags & RWF_APPEND == 0 {
+        return Ok(None);
+    }
+    let metadata = file.stat()?;
+    Ok((metadata.mode & S_IFMT == S_IFREG).then_some(metadata.size))
+}
+
+/// `readv(fd, iov, count)`, and `preadv2` at the file position, as Linux's
+/// `vfs_readv`: the access mode, the vector, nothing to do for no bytes,
+/// the range, then the flags.
+fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
+    let file = c.files.descriptor(a[0])?.file;
+    if file.flags() & 3 == 1 {
+        return Err(Errno::EBADF);
+    }
+    let segments = iovecs(c, a[1], a[2], true)?;
+    let total = segments.iter().map(|(_, length)| length).sum::<usize>();
+    let position = file.seek(0, 1).ok();
+    let len = match position {
+        Some(position) => request(&file, total as u64, position, true)?,
+        None => total,
+    };
+    if total == 0 && flags != 0 {
+        return Ok(0);
+    }
+    let flags = rw_flags(&file, flags, false)?;
+    let mut b = buffer(len)?;
+    let count = read_waiting(c, &file, &mut b, flags & RWF_NOWAIT != 0)?;
+    scatter(c, &segments, &b[..count])?;
+    Ok(count as u64)
+}
+
+/// `writev(fd, iov, count)`, and `pwritev2` at the file position.
+fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
+    if a[2] > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    let descriptor = c.files.descriptor(a[0])?;
+    let mut bytes = Vec::new();
+    for index in 0..a[2] {
+        let addr = a[1].checked_add(index * 16).ok_or(Errno::EFAULT)?;
+        let base = c.mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
+        let length = c
+            .mem
+            .read_u64(GuestAddr(addr + 8))
+            .map_err(|_| Errno::EFAULT)?;
+        let length = usize::try_from(length).map_err(|_| Errno::EINVAL)?;
+        let total = bytes
+            .len()
+            .checked_add(length)
+            .filter(|v| *v <= 0x7fff_f000)
+            .ok_or(Errno::EINVAL)?;
+        c.mem
+            .check_read(GuestAddr(base), length)
+            .map_err(|_| Errno::EFAULT)?;
+        bytes.try_reserve(length).map_err(|_| Errno::ENOMEM)?;
+        let start = bytes.len();
+        bytes.resize(total, 0);
+        c.mem
+            .read(GuestAddr(base), &mut bytes[start..])
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    let file = descriptor.file;
+    if bytes.is_empty() && flags != 0 {
+        if file.flags() & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        return Ok(0);
+    }
+    let flags = rw_flags(&file, flags, true)?;
+    // An RWF_APPEND write starts at the end and leaves the position after
+    // what it wrote, as the kiocb's position goes back to the file's.
+    if let Some(end) = appending(&file, flags)? {
+        file.seek(end as i64, 0)?;
+    }
+    let len = size_limited(c, &file, None, bytes.len())?;
+    let written = write_io_with(c, &file, &bytes[..len], false, flags & RWF_NOWAIT != 0)?;
+    sync_written(&file, flags, written)
+}
+
+/// `preadv` and `pwritev`, and `preadv2` and `pwritev2` at an offset, as
+/// Linux's `do_preadv` and `do_pwritev`.
+fn positioned_vector(
+    c: &mut Context<'_>,
+    a: [u64; 6],
+    write: bool,
+    flags: u32,
+) -> Result<u64, Errno> {
+    let file = positioned(c, a[0], a[3], write)?;
+    let segments = iovecs(c, a[1], a[2], !write)?;
+    let total = segments.iter().map(|(_, length)| length).sum::<usize>();
+    let len = request(&file, total as u64, a[3], !write)?;
+    if total == 0 && flags != 0 {
+        return Ok(0);
+    }
+    let flags = rw_flags(&file, flags, write)?;
+    if !write {
+        let mut b = buffer(len)?;
+        let count = read_at(&file, a[3], &mut b)?;
+        scatter(c, &segments, &b[..count])?;
+        return Ok(count as u64);
+    }
+    let offset = appending(&file, flags)?.unwrap_or(a[3]);
+    let len = size_limited(c, &file, Some(offset), len)?;
+    let mut b = Vec::new();
+    b.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
+    for &(base, length) in &segments {
+        let start = b.len();
+        b.resize(start + length, 0);
+        c.mem
+            .read(GuestAddr(base), &mut b[start..])
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    b.truncate(len);
+    let written = write_at(&file, offset, &b)?;
+    if written > 0 {
+        crate::permissions::remove_set_ids(&c.process.credentials, &*file);
+    }
+    sync_written(&file, flags, written as u64)
+}
 /// A read that waits while a blocking file has nothing to give yet.
 fn read_blocking(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     b: &mut [u8],
 ) -> Result<usize, Errno> {
+    read_waiting(c, file, b, false)
+}
+/// [`read_blocking`] that, with `nowait` (`RWF_NOWAIT`), does not wait, as
+/// if the file were non-blocking.
+fn read_waiting(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    b: &mut [u8],
+    nowait: bool,
+) -> Result<usize, Errno> {
     // A pseudo-terminal reads as its line discipline says.
     if let Some(result) = crate::pty::read(c, file, b) {
         return result;
     }
     // A signal file reads the reading thread's signals.
-    if let Some(result) = crate::signalfd::read(c, file, b) {
+    if let Some(result) = crate::signalfd::read(c, file, b, nowait) {
         return result;
     }
     // A socket's read waits as its SO_RCVLOWAT says. A pipe is a PipeEnd,
@@ -1637,9 +1837,9 @@ fn read_blocking(
         .as_any()
         .is_some_and(|a| a.is::<crate::sockets::SocketPairEnd>())
     {
-        return crate::sockets::read(c, file, b);
+        return crate::sockets::read(c, file, b, nowait);
     }
-    let result = wait_for_read(c, file, false, || file.read(b));
+    let result = wait_for_read(c, file, nowait, || file.read(b));
     // A pipe read signals the writer as it ends, with data or not, unless a
     // signal interrupts it, as Linux's `pipe_read`.
     if !b.is_empty() && (result.is_ok() || result == Err(Errno::EAGAIN)) {
@@ -2071,50 +2271,17 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             }
             Ok(written as u64)
         }
-        19 => {
-            let file = c.files.descriptor(a[0])?.file;
-            if file.flags() & 3 == 1 {
-                return Err(Errno::EBADF);
+        19 => readv(c, a, 0),
+        295 | 296 => positioned_vector(c, a, n == 296, 0),
+        327 | 328 => {
+            // pos_from_hilo: on x86-64 the high word shifts out, and -1 is
+            // the file position, as readv and writev.
+            let flags = a[5] as u32;
+            match (a[3] == u64::MAX, n == 328) {
+                (true, false) => readv(c, a, flags),
+                (true, true) => writev(c, a, flags),
+                (false, write) => positioned_vector(c, a, write, flags),
             }
-            let segments = iovecs(c, a[1], a[2], true)?;
-            let total = segments.iter().map(|(_, length)| length).sum::<usize>();
-            let position = file.seek(0, 1).ok();
-            let len = match position {
-                Some(position) => request(&file, total as u64, position, true)?,
-                None => total,
-            };
-            let mut b = buffer(len)?;
-            let count = read_blocking(c, &file, &mut b)?;
-            scatter(c, &segments, &b[..count])?;
-            Ok(count as u64)
-        }
-        295 | 296 => {
-            let file = positioned(c, a[0], a[3], n == 296)?;
-            let segments = iovecs(c, a[1], a[2], n == 295)?;
-            let total = segments.iter().map(|(_, length)| length).sum::<usize>();
-            let len = request(&file, total as u64, a[3], n == 295)?;
-            if n == 295 {
-                let mut b = buffer(len)?;
-                let count = read_at(&file, a[3], &mut b)?;
-                scatter(c, &segments, &b[..count])?;
-                return Ok(count as u64);
-            }
-            let len = size_limited(c, &file, Some(a[3]), len)?;
-            let mut b = Vec::new();
-            b.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
-            for &(base, length) in &segments {
-                let start = b.len();
-                b.resize(start + length, 0);
-                c.mem
-                    .read(GuestAddr(base), &mut b[start..])
-                    .map_err(|_| Errno::EFAULT)?;
-            }
-            b.truncate(len);
-            let written = write_at(&file, a[3], &b)?;
-            if written > 0 {
-                crate::permissions::remove_set_ids(&c.process.credentials, &*file);
-            }
-            Ok(written as u64)
         }
         22 | 293 => {
             let flags = if n == 22 {
@@ -2142,38 +2309,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             output(c, a[0], &bytes)?;
             Ok(0)
         }
-        20 => {
-            if a[2] > 1024 {
-                return Err(Errno::EINVAL);
-            }
-            let descriptor = c.files.descriptor(a[0])?;
-            let mut bytes = Vec::new();
-            for index in 0..a[2] {
-                let addr = a[1].checked_add(index * 16).ok_or(Errno::EFAULT)?;
-                let base = c.mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
-                let length = c
-                    .mem
-                    .read_u64(GuestAddr(addr + 8))
-                    .map_err(|_| Errno::EFAULT)?;
-                let length = usize::try_from(length).map_err(|_| Errno::EINVAL)?;
-                let total = bytes
-                    .len()
-                    .checked_add(length)
-                    .filter(|v| *v <= 0x7fff_f000)
-                    .ok_or(Errno::EINVAL)?;
-                c.mem
-                    .check_read(GuestAddr(base), length)
-                    .map_err(|_| Errno::EFAULT)?;
-                bytes.try_reserve(length).map_err(|_| Errno::ENOMEM)?;
-                let start = bytes.len();
-                bytes.resize(total, 0);
-                c.mem
-                    .read(GuestAddr(base), &mut bytes[start..])
-                    .map_err(|_| Errno::EFAULT)?;
-            }
-            let len = size_limited(c, &descriptor.file, None, bytes.len())?;
-            write_io(c, &descriptor.file, &bytes[..len], false)
-        }
+        20 => writev(c, a, 0),
         0 | 1 => {
             let requested = usize::try_from(a[2].min(0x7fff_f000)).map_err(|_| Errno::EINVAL)?;
             let d = Some(c.files.descriptor(a[0])?);
@@ -2893,6 +3029,16 @@ pub(crate) fn write_io(
     bytes: &[u8],
     nosignal: bool,
 ) -> Result<u64, Errno> {
+    write_io_with(c, file, bytes, nosignal, false)
+}
+/// [`write_io`] that, with `dontwait` (`RWF_NOWAIT`), does not wait.
+fn write_io_with(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    bytes: &[u8],
+    nosignal: bool,
+    dontwait: bool,
+) -> Result<u64, Errno> {
     // A pseudo-terminal writes all, unless it does not block.
     if let Some(result) = crate::pty::write(c, file, bytes) {
         return result;
@@ -2903,11 +3049,11 @@ pub(crate) fn write_io(
         .and_then(|a| a.downcast_ref::<crate::sockets::SocketPairEnd>())
     {
         let sender = crate::sockets::Sender::process(c.process.pid, &c.process.credentials);
-        return write_with(c, file, bytes, nosignal, false, |b| {
+        return write_with(c, file, bytes, nosignal, dontwait, |b| {
             socket.send(b, &mut Vec::new(), sender)
         });
     }
-    let written = write_with(c, file, bytes, nosignal, false, |b| file.write(b))?;
+    let written = write_with(c, file, bytes, nosignal, dontwait, |b| file.write(b))?;
     if written > 0 {
         crate::permissions::remove_set_ids(&c.process.credentials, &**file);
     }

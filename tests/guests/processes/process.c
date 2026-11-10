@@ -5203,6 +5203,85 @@ static int itimer_case(void) {
     sigprocmask(SIG_UNBLOCK, &block, NULL);
     return 0;
 }
+static long vf_errno(long r) { return r < 0 ? -errno : r; }
+static long vf_preadv2(int fd, void *buf, size_t len, long offset, long flags) {
+    struct iovec v = {buf, len};
+    return vf_errno(syscall(327, (long)fd, &v, 1L, offset, 0L, flags));
+}
+static long vf_pwritev2(int fd, const void *buf, size_t len, long offset, long flags) {
+    struct iovec v = {(void *)buf, len};
+    return vf_errno(syscall(328, (long)fd, &v, 1L, offset, 0L, flags));
+}
+/* preadv2 and pwritev2 with their flags, and epoll_pwait2, as Linux 6.12
+ * has them. A regular file's RWF_NOWAIT depends on its filesystem, so it is
+ * left out. */
+static int vector_flags_case(void) {
+    char path[] = "/tmp/vector-flags-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return 80;
+    unlink(path);
+    char got[16] = {0};
+    if (write(fd, "abcdef", 6) != 6) return 81;
+    printf("pwritev2 at=%ld pos=%ld\n", vf_pwritev2(fd, "XYZ", 3, 1, 0), (long)lseek(fd, 0, SEEK_CUR));
+    lseek(fd, 3, SEEK_SET);
+    long r = vf_preadv2(fd, got, 8, -1, 0);
+    printf("preadv2 here=%ld got=%.*s pos=%ld\n", r, (int)(r > 0 ? r : 0), got, (long)lseek(fd, 0, SEEK_CUR));
+    struct iovec high = {got, 2};
+    printf("preadv2 high-word=%ld\n", vf_errno(syscall(327, (long)fd, &high, 1L, 0L, 7L, 0L)));
+    printf("negative=%ld unknown=%ld both-append=%ld atomic-read=%ld\n",
+           vf_preadv2(fd, got, 2, -2, 0), vf_preadv2(fd, got, 2, 0, 1L << 30),
+           vf_pwritev2(fd, "q", 1, 0, 0x30), vf_preadv2(fd, got, 2, 0, 0x40));
+    printf("empty-unknown read=%ld write=%ld\n", vf_preadv2(fd, got, 0, 0, 1L << 30),
+           vf_pwritev2(fd, "", 0, -1, 1L << 30));
+    printf("high-flag-bits=%ld sync=%ld\n", vf_preadv2(fd, got, 2, 0, 1L << 32),
+           vf_pwritev2(fd, "s", 1, 0, 0x7));
+    lseek(fd, 1, SEEK_SET);
+    long at = vf_pwritev2(fd, "pq", 2, 0, 0x10);
+    long pos = (long)lseek(fd, 0, SEEK_CUR);
+    long here = vf_pwritev2(fd, "rs", 2, -1, 0x10);
+    printf("append at=%ld pos=%ld here=%ld pos=%ld\n", at, pos, here, (long)lseek(fd, 0, SEEK_CUR));
+    memset(got, 0, sizeof got);
+    r = pread(fd, got, sizeof got, 0);
+    printf("contents=%.*s noappend=%ld\n", (int)(r > 0 ? r : 0), got, vf_pwritev2(fd, "n", 1, 0, 0x20));
+    close(fd);
+    /* A pipe reads at the position only, and does not wait with NOWAIT. */
+    int p[2];
+    if (pipe(p)) return 82;
+    printf("pipe offset=%ld nowait-write=%ld", vf_preadv2(p[0], got, 4, 0, 0),
+           vf_pwritev2(p[1], "pipe", 4, -1, 0x8));
+    long full = vf_preadv2(p[0], got, 8, -1, 0x8);
+    printf(" nowait-read=%ld empty=%ld\n", full, vf_preadv2(p[0], got, 8, -1, 0x8));
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return 83;
+    int counter = eventfd(0, 0);
+    printf("socket empty=%ld eventfd empty=%ld\n", vf_preadv2(sv[0], got, 8, -1, 0x8),
+           vf_preadv2(counter, got, 8, -1, 0x8));
+    /* epoll_pwait2: its timeout first, then the mask, maxevents, the
+     * descriptor; none waits for ever. */
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 77}, out[4];
+    epoll_ctl(ep, EPOLL_CTL_ADD, counter, &ev);
+    struct timespec zero = {0, 0}, bad = {0, 1000000000}, negative = {-1, 0};
+    sigset_t mask;
+    sigemptyset(&mask);
+    long none = vf_errno(syscall(441, (long)ep, out, 4L, &zero, NULL, 0L));
+    uint64_t one = 1;
+    if (write(counter, &one, 8) != 8) return 84;
+    long ready = vf_errno(syscall(441, (long)ep, out, 4L, NULL, &mask, 8L));
+    printf("epoll_pwait2 none=%ld ready=%ld data=%llu\n", none, ready,
+           ready > 0 ? (unsigned long long)out[0].data.u64 : 0ULL);
+    printf("epoll_pwait2 bad-timeout=%ld nsec=%ld negative=%ld mask-size=%ld max=%ld fd=%ld\n",
+           vf_errno(syscall(441, 99L, out, 0L, (void *)8, NULL, 0L)),
+           vf_errno(syscall(441, 99L, out, 0L, &bad, NULL, 0L)),
+           vf_errno(syscall(441, 99L, out, 0L, &negative, NULL, 0L)),
+           vf_errno(syscall(441, 99L, out, 1L, &zero, &mask, 4L)),
+           vf_errno(syscall(441, 99L, out, 0L, &zero, NULL, 0L)),
+           vf_errno(syscall(441, 99L, out, 1L, &zero, NULL, 0L)));
+    printf("epoll_wait max-before-fd=%ld epoll_pwait=%ld\n",
+           vf_errno(syscall(SYS_epoll_wait, 99L, out, 0L, 0L)),
+           vf_errno(syscall(SYS_epoll_pwait, 99L, out, 1L, 0L, &mask, 4L)));
+    return 0;
+}
 static int pkey_case(void) {
     long page = 4096;
     char *base = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -15756,6 +15835,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
+    if (!strcmp(mode, "vector-flags")) return vector_flags_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();

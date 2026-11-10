@@ -3845,3 +3845,197 @@ mod io_uring {
         assert_eq!(f.ret(427, &[0, 8, probe, 1]), errno(Errno(95)));
     }
 }
+
+mod vectored_flags {
+    use super::*;
+    const PREADV2: u64 = 327;
+    const PWRITEV2: u64 = 328;
+    const HERE: u64 = u64::MAX;
+    /// One iovec at `at` for `len` bytes at `buffer`.
+    fn iovec(f: &Fixture, at: u64, buffer: u64, len: u64) {
+        f.mem.write_u64(GuestAddr(at), buffer).unwrap();
+        f.mem.write_u64(GuestAddr(at + 8), len).unwrap();
+    }
+    fn contents(f: &mut Fixture, fd: u64) -> Vec<u8> {
+        let size = f.ret(5, &[fd, DATA + 0xf00]);
+        assert_eq!(size, 0);
+        let size = f.mem.read_u64(GuestAddr(DATA + 0xf00 + 48)).unwrap();
+        let mut bytes = vec![0; size as usize];
+        assert_eq!(f.ret(17, &[fd, DATA + 0xe00, size, 0]), size);
+        f.mem.read(GuestAddr(DATA + 0xe00), &mut bytes).unwrap();
+        bytes
+    }
+    #[test]
+    fn preadv2_and_pwritev2_take_an_offset_or_the_position() {
+        let mut f = fixture();
+        let (iov, put, got) = (DATA + 0x300, DATA + 0x400, DATA + 0x500);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        f.mem.write(GuestAddr(put), b"abcdefXYZ").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        assert_eq!(f.ret(1, &[fd, put, 6]), 6);
+        // At an offset: the position stays.
+        iovec(&f, iov, put + 6, 3);
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 1, 0, 0]), 3);
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 6);
+        assert_eq!(contents(&mut f, fd), b"aXYZef");
+        iovec(&f, iov, got, 4);
+        assert_eq!(f.ret(PREADV2, &[fd, iov, 1, 2, 0, 0]), 4);
+        let mut read = [0; 4];
+        f.mem.read(GuestAddr(got), &mut read).unwrap();
+        assert_eq!(&read, b"YZef");
+        // -1 is the position, which moves; the high word is shifted out.
+        assert_eq!(f.ret(8, &[fd, 3, 0]), 3);
+        assert_eq!(f.ret(PREADV2, &[fd, iov, 1, HERE, 7, 0]), 3);
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 6);
+        iovec(&f, iov, put, 2);
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, HERE, 0, 0]), 2);
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 8);
+        // Any other negative offset is EINVAL.
+        assert_eq!(
+            f.ret(PREADV2, &[fd, iov, 1, -2i64 as u64, 0, 0]),
+            errno(Errno::EINVAL)
+        );
+    }
+    #[test]
+    fn the_flags_are_checked_as_kiocb_set_rw_flags_checks_them() {
+        let mut f = fixture();
+        let (iov, buf) = (DATA + 0x300, DATA + 0x400);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        f.mem.write(GuestAddr(buf), b"abcdef").unwrap();
+        let fd = f.ret(2, &[DATA, 0o102, 0o600]);
+        assert_eq!(f.ret(1, &[fd, buf, 6]), 6);
+        iovec(&f, iov, buf, 2);
+        let read = |f: &mut Fixture, flags: u64| f.ret(PREADV2, &[fd, iov, 1, 0, 0, flags]);
+        assert_eq!(read(&mut f, 0x80), errno(Errno::EOPNOTSUPP));
+        assert_eq!(read(&mut f, 0x30), errno(Errno::EINVAL));
+        assert_eq!(read(&mut f, 0x40), errno(Errno::EOPNOTSUPP)); // RWF_ATOMIC
+        // HIPRI, DSYNC, SYNC and NOWAIT read a regular file.
+        assert_eq!(read(&mut f, 0xf), 2);
+        // Only the low 32 bits are the flags (rwf_t is an int).
+        assert_eq!(read(&mut f, 1 << 32), 2);
+        // A transfer of nothing checks no flags.
+        iovec(&f, iov + 16, buf, 0);
+        assert_eq!(f.ret(PREADV2, &[fd, iov + 16, 1, 0, 0, 0x80]), 0);
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov + 16, 1, HERE, 0, 0x80]), 0);
+        // A buffered write of a regular file refuses NOWAIT, as ext4's does.
+        assert_eq!(
+            f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0x8]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0x6]), 2); // DSYNC | SYNC
+        // RWF_APPEND writes at the end; at an offset the position stays, at
+        // the position it ends after what was written.
+        assert_eq!(f.ret(8, &[fd, 1, 0]), 1);
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0x10]), 2);
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 1);
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, HERE, 0, 0x10]), 2);
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 10);
+        assert_eq!(contents(&mut f, fd), b"abcdefabab");
+        // NOAPPEND changes nothing for a file without O_APPEND, and cannot
+        // turn an O_APPEND file's off here.
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0x20]), 2);
+        let appending = f.ret(2, &[DATA, 0o2002, 0]);
+        assert_eq!(
+            f.ret(PWRITEV2, &[appending, iov, 1, 0, 0, 0x20]),
+            errno(Errno::EOPNOTSUPP)
+        );
+    }
+    #[test]
+    fn nowait_needs_a_file_that_has_it_and_does_not_wait() {
+        let mut f = fixture();
+        let (iov, buf) = (DATA + 0x300, DATA + 0x400);
+        iovec(&f, iov, buf, 8);
+        // A pipe has FMODE_NOWAIT and reads only at -1; once empty, NOWAIT
+        // gives EAGAIN.
+        assert_eq!(f.ret(293, &[DATA + 0x100, 0]), 0);
+        let fds = f.mem.read_u64(GuestAddr(DATA + 0x100)).unwrap();
+        let (r, w) = (fds & 0xffff_ffff, fds >> 32);
+        f.mem.write(GuestAddr(buf), b"pipe").unwrap();
+        assert_eq!(f.ret(1, &[w, buf, 4]), 4);
+        assert_eq!(f.ret(PREADV2, &[r, iov, 1, 0, 0, 0]), errno(Errno::ESPIPE));
+        assert_eq!(f.ret(PREADV2, &[r, iov, 1, HERE, 0, 0x8]), 4);
+        assert_eq!(
+            f.ret(PREADV2, &[r, iov, 1, HERE, 0, 0x8]),
+            errno(Errno::EAGAIN)
+        );
+        // A terminal has no FMODE_NOWAIT.
+        f.mem.write(GuestAddr(DATA), b"/dev/ptmx\0").unwrap();
+        let terminal = f.ret(2, &[DATA, 0o2, 0]);
+        if (terminal as i64) >= 0 {
+            assert_eq!(
+                f.ret(PREADV2, &[terminal, iov, 1, HERE, 0, 0x8]),
+                errno(Errno::EOPNOTSUPP)
+            );
+        }
+        // A socket and an eventfd have it: an empty one gives EAGAIN.
+        assert_eq!(f.ret(53, &[1, 1, 0, DATA + 0x100]), 0);
+        let socket = f.mem.read_u64(GuestAddr(DATA + 0x100)).unwrap() & 0xffff_ffff;
+        assert_eq!(
+            f.ret(PREADV2, &[socket, iov, 1, HERE, 0, 0x8]),
+            errno(Errno::EAGAIN)
+        );
+        let counter = f.ret(290, &[0, 0]);
+        assert_eq!(
+            f.ret(PREADV2, &[counter, iov, 1, HERE, 0, 0x8]),
+            errno(Errno::EAGAIN)
+        );
+    }
+    #[test]
+    fn epoll_pwait2_reads_its_timeout_first_and_waits_as_epoll_pwait() {
+        let mut f = fixture();
+        let (events, timeout, event) = (DATA + 0x300, DATA + 0x400, DATA + 0x500);
+        let epoll = f.ret(291, &[0]);
+        let counter = f.ret(290, &[0, 0]);
+        f.mem.write(GuestAddr(event), &1u32.to_le_bytes()).unwrap(); // EPOLLIN
+        f.mem.write_u64(GuestAddr(event + 4), 77).unwrap();
+        assert_eq!(f.ret(233, &[epoll, 1, counter, event]), 0);
+        f.mem.write_u64(GuestAddr(timeout), 0).unwrap();
+        f.mem.write_u64(GuestAddr(timeout + 8), 0).unwrap();
+        assert_eq!(f.ret(441, &[epoll, events, 4, timeout, 0, 0]), 0);
+        f.mem
+            .write(GuestAddr(DATA + 0x600), &1u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(1, &[counter, DATA + 0x600, 8]), 8);
+        // No timeout waits for ever; one is ready.
+        assert_eq!(f.ret(441, &[epoll, events, 4, 0, 0, 0]), 1);
+        assert_eq!(f.mem.read_u64(GuestAddr(events + 4)).unwrap(), 77);
+        // The timeout comes first, then the mask, then maxevents and the
+        // descriptor.
+        assert_eq!(f.ret(441, &[99, events, 0, 8, 0, 0]), errno(Errno::EFAULT));
+        f.mem
+            .write_u64(GuestAddr(timeout + 8), 1_000_000_000)
+            .unwrap();
+        assert_eq!(
+            f.ret(441, &[99, events, 0, timeout, 0, 0]),
+            errno(Errno::EINVAL)
+        );
+        f.mem.write_u64(GuestAddr(timeout), -1i64 as u64).unwrap();
+        f.mem.write_u64(GuestAddr(timeout + 8), 0).unwrap();
+        assert_eq!(
+            f.ret(441, &[99, events, 0, timeout, 0, 0]),
+            errno(Errno::EINVAL)
+        );
+        f.mem.write_u64(GuestAddr(timeout), 0).unwrap();
+        assert_eq!(
+            f.ret(441, &[99, events, 1, timeout, event, 4]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(
+            f.ret(441, &[99, events, 0, timeout, 0, 0]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(
+            f.ret(441, &[99, events, 1, timeout, 0, 0]),
+            errno(Errno::EBADF)
+        );
+        // epoll_wait and epoll_pwait check maxevents before the descriptor too.
+        assert_eq!(f.ret(232, &[99, events, 0, 0]), errno(Errno::EINVAL));
+        assert_eq!(
+            f.ret(281, &[99, events, 1, 0, event, 4]),
+            errno(Errno::EINVAL)
+        );
+        // A huge timeout saturates rather than fails.
+        f.mem.write_u64(GuestAddr(timeout), u64::MAX >> 1).unwrap();
+        assert_eq!(f.ret(441, &[epoll, events, 4, timeout, 0, 0]), 1);
+    }
+}

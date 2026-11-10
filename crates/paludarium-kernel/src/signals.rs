@@ -293,16 +293,31 @@ pub(crate) enum RestartBlock {
 /// here yet. The waits Linux resumes through restart_syscall with the time
 /// left (nanosleep, a relative clock_nanosleep, poll and a futex wait with a
 /// timeout) are not listed: they arm a [`RestartBlock`] themselves when
-/// interrupted. epoll_wait and rt_sigtimedwait give EINTR, as on Linux.
+/// interrupted. epoll_wait, epoll_pwait, epoll_pwait2 and rt_sigtimedwait
+/// give EINTR, as on Linux.
 pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
     match number {
         // read, write, pread64, pwrite64, readv, writev, preadv, pwritev,
-        // wait4, waitid, pause, rt_sigsuspend, flock, the blocking socket
+        // preadv2, pwritev2, wait4, waitid, pause, rt_sigsuspend, flock, the blocking socket
         // calls (a wait that SO_RCVTIMEO or SO_SNDTIMEO limits gives EINTR
         // instead, and clears the restart itself), msgsnd and msgrcv.
-        0 | 1 | 17..=20 | 295 | 296 | 61 | 247 | 34 | 130 | 73 | 43 | 288 | 44..=47 | 69 | 70 => {
-            true
-        }
+        0
+        | 1
+        | 17..=20
+        | 295
+        | 296
+        | 327
+        | 328
+        | 61
+        | 247
+        | 34
+        | 130
+        | 73
+        | 43
+        | 288
+        | 44..=47
+        | 69
+        | 70 => true,
         // fcntl's F_SETLKW and F_OFD_SETLKW.
         72 => matches!(args[1], 7 | 38),
         // open, openat and openat2, which wait only to open a FIFO.

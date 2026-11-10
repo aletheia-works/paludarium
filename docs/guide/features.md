@@ -61,16 +61,27 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `fadvise64`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, and the pseudo-terminals' requests below) |
-| Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
+| Events | `eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
   where it was, and a pipe or socket gives `ESPIPE`; in an `O_APPEND` file a
   positioned write still appends, as on Linux.
+- `preadv2` and `pwritev2` read and write at an offset, or at the file
+  position for an offset of -1, as `readv` and `writev` do. Their flags
+  are checked as Linux's `kiocb_set_rw_flags` checks them, once the vector
+  and the range are, and only when there are bytes to move: an unknown flag
+  is `EOPNOTSUPP`, `RWF_APPEND` with `RWF_NOAPPEND` `EINVAL`, and
+  `RWF_ATOMIC` `EOPNOTSUPP`, as no file here writes atomically.
+  `RWF_NOWAIT` needs a file that can be read or written without waiting (a
+  regular file, a pipe, a socket, an eventfd or a signalfd; `EOPNOTSUPP` for
+  the rest) and then gives `EAGAIN` where the call would wait. `RWF_APPEND`
+  writes a regular file at its end, `RWF_DSYNC` and `RWF_SYNC` write it
+  through as `fdatasync`, and `RWF_HIPRI` changes nothing.
 - `copy_file_range` copies between two regular files on one mount (`EXDEV`
   across mounts), stopping at the input's end, with Linux's checks in order
   (`EISDIR`, `EINVAL`, `EBADF`, `EOVERFLOW`, and `EINVAL` for an overlap in
@@ -188,6 +199,12 @@ kernel.
   WebAssembly.
 - Without a [network](#network), outside a new network namespace, `socket()` returns `EAFNOSUPPORT` for
   `AF_INET`, `AF_INET6` and `AF_NETLINK`.
+- `epoll_wait`, `epoll_pwait` and `epoll_pwait2` check their arguments in
+  Linux's order: `epoll_pwait2` reads its timeout (a `struct timespec`, none
+  waiting for ever; `EFAULT`, then `EINVAL` for one Linux refuses, while a
+  huge one saturates), the signal mask is set (`EINVAL` for a size other
+  than 8), then `maxevents` is checked (`EINVAL`) before the descriptor
+  (`EBADF`, `EINVAL` for one that is not an epoll).
 - `poll` waits like `epoll_wait`: until a descriptor is ready, the timeout
   in milliseconds passes (a negative one never does) or a signal arrives
   (`EINTR`). The host's standard input is readable only with bytes to read
@@ -1787,6 +1804,7 @@ one only with an `--allow-net`.
   continue with `SIGSTOP`. A blocking call that a stop interrupts runs again
   after the continue, as Linux restarts it when no handler runs: `read`,
   `write`, `readv`, `writev`, `pread64`, `pwrite64`, `preadv`, `pwritev`,
+  `preadv2`, `pwritev2`,
   `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `fcntl`'s `F_SETLKW` and
   `F_OFD_SETLKW`, `sendto`, `recvfrom`,
   `sendmsg`, `recvmsg`, `ppoll`, `select`, `pselect6`, `poll` with no timeout
@@ -1800,8 +1818,8 @@ one only with an `--allow-net`.
   it returns, as on Linux, except `pause`,
   `rt_sigsuspend`, `poll`, `ppoll`, `select`, `pselect6` and a socket call
   whose wait `SO_RCVTIMEO` or `SO_SNDTIMEO` limits, which give `EINTR`.
-  `epoll_wait` and `rt_sigtimedwait` give `EINTR`, as on
-  Linux. `rt_sigsuspend` waits with its mask in place of the signal mask until a
+  `epoll_wait`, `epoll_pwait`, `epoll_pwait2` and `rt_sigtimedwait` give
+  `EINTR`, as on Linux. `rt_sigsuspend` waits with its mask in place of the signal mask until a
   handler has run, which runs with that mask; the original mask is back after
   it.
 - A `sigaction` that makes a signal ignored (`SIG_IGN`, or `SIG_DFL` for

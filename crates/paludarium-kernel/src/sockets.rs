@@ -1071,9 +1071,11 @@ pub(crate) fn read(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     buf: &mut [u8],
+    nowait: bool,
 ) -> Result<usize, Errno> {
     let socket = as_socket(file)?;
-    let received = receive_with(c, file, socket, buf, 0, false)?;
+    let flags = if nowait { MSG_DONTWAIT } else { 0 };
+    let received = receive_with(c, file, socket, buf, flags, false)?;
     Ok(received.count)
 }
 /// `sendmsg(fd, msg, flags)` on a socket pair, with `SCM_RIGHTS` and

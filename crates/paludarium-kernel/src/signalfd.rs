@@ -151,16 +151,22 @@ pub(crate) fn read(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     out: &mut [u8],
+    nowait: bool,
 ) -> Option<Result<usize, Errno>> {
     let signal = file.as_any()?.downcast_ref::<SignalFile>()?;
-    Some(read_signals(c, signal, out))
+    Some(read_signals(c, signal, out, nowait))
 }
 
 /// Linux's `signalfd_read`: as many whole records as fit, waiting for the
 /// first unless the file is non-blocking; a signal that can be delivered
 /// meanwhile ends the wait with EINTR (ERESTARTSYS, which SA_RESTART
 /// restarts as any read).
-fn read_signals(c: &mut Context<'_>, file: &SignalFile, out: &mut [u8]) -> Result<usize, Errno> {
+fn read_signals(
+    c: &mut Context<'_>,
+    file: &SignalFile,
+    out: &mut [u8],
+    nowait: bool,
+) -> Result<usize, Errno> {
     let records = out.len() / RECORD;
     if records == 0 {
         return Err(Errno::EINVAL);
@@ -178,7 +184,7 @@ fn read_signals(c: &mut Context<'_>, file: &SignalFile, out: &mut [u8]) -> Resul
         if taken != 0 {
             break;
         }
-        if file.flags.load(Ordering::SeqCst) & NONBLOCK != 0 {
+        if nowait || file.flags.load(Ordering::SeqCst) & NONBLOCK != 0 {
             return Err(Errno::EAGAIN);
         }
         if crate::events::signalled(c) {

@@ -300,22 +300,31 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             })?;
             return Ok(0);
         }
-        // The epoll descriptor too, as `fdget` takes it (EBADF for `O_PATH`).
-        let d = c.files.descriptor(a[0])?;
-        if d.file.flags() & O_PATH != 0 {
-            return Err(Errno::EBADF);
-        }
-        let epoll = d
-            .file
-            .as_any()
-            .and_then(|v| v.downcast_ref::<EpollInstance>())
-            .ok_or(Errno::EINVAL)?;
-        let max = a[2] as i32;
-        if max <= 0 || max > i32::MAX / 12 {
-            return Err(Errno::EINVAL);
-        }
+        // Linux's order: epoll_pwait2 reads and checks its timeout, the
+        // signal mask is set, then maxevents and the descriptor are checked
+        // (`do_epoll_pwait`, `do_epoll_wait`). The deadline is taken at entry.
+        let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+        let deadline = if number == 441 {
+            if a[3] == 0 {
+                None
+            } else {
+                let [seconds, nanos] = crate::syscalls::read_words::<2>(c.mem, a[3])?;
+                // `timespec64_valid`, then `timespec64_add_safe`, which
+                // saturates.
+                if (seconds as i64) < 0 || nanos >= 1_000_000_000 {
+                    return Err(Errno::EINVAL);
+                }
+                Some(
+                    now.saturating_add(seconds.saturating_mul(1_000_000_000).saturating_add(nanos)),
+                )
+            }
+        } else {
+            let timeout = a[3] as i32;
+            (timeout >= 0).then(|| now.saturating_add(timeout as u64 * 1_000_000))
+        };
         let old_mask = c.process.signal_mask;
-        if number == 281 && a[4] != 0 {
+        let masked = number != 232 && a[4] != 0;
+        if masked {
             if a[5] != 8 {
                 return Err(Errno::EINVAL);
             }
@@ -323,16 +332,20 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 & !((1 << 8) | (1 << 18));
         }
         let result = (|| {
-            let timeout = a[3] as i32;
-            let deadline = if timeout < 0 {
-                None
-            } else {
-                Some(
-                    c.host
-                        .clock(paludarium_host::ClockId::Monotonic)?
-                        .saturating_add(timeout as u64 * 1_000_000),
-                )
-            };
+            let max = a[2] as i32;
+            if max <= 0 || max > i32::MAX / 12 {
+                return Err(Errno::EINVAL);
+            }
+            // The epoll descriptor too, as `fdget` takes it (EBADF for `O_PATH`).
+            let d = c.files.descriptor(a[0])?;
+            if d.file.flags() & O_PATH != 0 {
+                return Err(Errno::EBADF);
+            }
+            let epoll = d
+                .file
+                .as_any()
+                .and_then(|v| v.downcast_ref::<EpollInstance>())
+                .ok_or(Errno::EINVAL)?;
             loop {
                 let ticket = c.files.readiness.token.value();
                 // Validate before consuming ET/ONESHOT state.
@@ -361,8 +374,7 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 crate::events::wait(c, ticket, deadline)?;
             }
         })();
-        if number == 281
-            && a[4] != 0
+        if masked
             && result == Err(Errno(4))
             && crate::signals::next_pending(c.process, true).is_some()
         {

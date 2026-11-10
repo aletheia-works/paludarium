@@ -417,6 +417,7 @@ mod linux {
         processes_msg => ("msg","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),
+        processes_vector_flags => ("vector-flags","process"),
         processes_itimer => ("itimer","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),

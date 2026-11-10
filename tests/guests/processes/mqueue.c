@@ -471,8 +471,10 @@ static int wait_case(void) {
     }
     if (read(ready[0], &byte, 1) != 1) return 13;
     pause_ms(100);
-    say("to-receiver: send=%ld", q_send(q, "direct", 6, 2, NULL));
-    say("to-receiver: status=%d", wait_child(pid));
+    /* The parent prints only after the child, whose line comes first. */
+    long direct = q_send(q, "direct", 6, 2, NULL);
+    int direct_status = wait_child(pid);
+    say("to-receiver: send=%ld status=%d", direct, direct_status);
     show_attr("to-receiver", q);
 
     /* A waiting sender's message goes into the room a receive makes. */
@@ -486,11 +488,12 @@ static int wait_case(void) {
     }
     if (read(ready[0], &byte, 1) != 1) return 14;
     pause_ms(100);
-    printf("from-sender");
-    show_receive("first", q, 16, NULL);
-    say("");
-    say("from-sender: status=%d", wait_child(pid));
-    printf("from-sender");
+    long first = q_receive(q, 16, NULL);
+    char first_text[17] = {0};
+    unsigned first_prio = q_prio;
+    if (first > 0) memcpy(first_text, q_text, (size_t)first);
+    int sender_status = wait_child(pid);
+    printf("from-sender: first=%ld:%u:%s status=%d", first, first_prio, first_text, sender_status);
     show_receive("next", q, 16, NULL);
     show_receive("last", q, 16, NULL);
     say("");

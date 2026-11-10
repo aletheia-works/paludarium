@@ -64,18 +64,18 @@ has moved on. Falling through from one instruction to the next needs no lookup.
 
 The code generation is a counter of the address space. It moves on when the
 mappings change (`mmap`, `munmap`, `mprotect`, `mremap`, `brk`, `shmat`,
-`shmdt`), when `madvise` with `MADV_DONTNEED` discards private pages, when
-any process or the kernel stores to a shared mapping or page cache the space
-may run code from, and when the space stores to an executable page that an
-instruction has been fetched from. Each page remembers whether an instruction
-was fetched from it. The mark is never cleared, and the copy that copy-on-write or `fork` makes
-of a page keeps it. A store to an executable page that nothing was fetched from
-leaves the generation, so it makes no decoded instruction stale: SBCL's heap is
-readable, writable and executable, and before this every store to it made the
-interpreter decode everything again. The first fetch from a page sets the mark
-under the address space's lock, after moving the TLB epoch on, which waits for
-the stores under way without the lock. Either a store sees the mark and moves
-the generation on after its bytes, or the fetch sees the bytes.
+`shmdt`), when `madvise` with `MADV_DONTNEED` discards private pages, when any
+process or the kernel stores to a shared mapping or page cache the space may run
+code from, and when the space stores to an executable page that an instruction
+has been fetched from. Each page remembers whether an instruction was fetched
+from it. The mark is never cleared, and the copy that copy-on-write or `fork`
+makes of a page keeps it. A store to an executable page that nothing was fetched
+from leaves the generation, so it makes no decoded instruction stale: SBCL's
+heap is readable, writable and executable, and before this every store to it
+made the interpreter decode everything again. The first fetch from a page sets
+the mark under the address space's lock, after moving the TLB epoch on, which
+waits for the stores under way without the lock. Either a store sees the mark
+and moves the generation on after its bytes, or the fetch sees the bytes.
 
 A block starts with its first instruction and grows as it runs. An instruction
 that runs right after the last one of a block is decoded on its own, as it would

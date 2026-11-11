@@ -2443,6 +2443,12 @@ impl Kernel {
         if flags & NAMESPACES != 0 {
             let mut namespaces = own.unshared(flags, &credentials.user.0)?;
             namespaces.user = Arc::clone(&credentials.user.0);
+            if flags & crate::namespaces::CLONE_NEWIPC != 0 {
+                namespaces
+                    .ipc
+                    .mq
+                    .made_by(credentials.fsuid, credentials.fsgid);
+            }
             self.group.set_namespaces(thread.tid, namespaces);
         }
         if credentials != thread.state.credentials {
@@ -2772,6 +2778,12 @@ impl Kernel {
         let mut child_namespaces =
             own.for_child(namespaces, flags & 0x100 != 0, &credentials.user.0)?;
         child_namespaces.user = Arc::clone(&credentials.user.0);
+        if namespaces & crate::namespaces::CLONE_NEWIPC != 0 {
+            child_namespaces
+                .ipc
+                .mq
+                .made_by(credentials.fsuid, credentials.fsgid);
+        }
         let child_mem = if flags & 0x100 == 0 {
             Some(Arc::new(mem.fork()))
         } else {

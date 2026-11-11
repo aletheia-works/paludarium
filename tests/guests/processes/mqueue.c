@@ -1122,6 +1122,110 @@ static int accounts_case(void) {
     return 0;
 }
 
+/* A queue's file: its modification time, which a send and a receive set
+   and nothing else, and the mqueue root, which belongs to whoever made the
+   IPC namespace and lets them unlink anyone's queue. */
+static long long mtime_of(long fd) {
+    struct stat st;
+    if (fstat((int)fd, &st)) return -errno;
+    return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+}
+static int write_text(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    long n = write(fd, text, strlen(text));
+    int error = n < 0 ? -errno : 0;
+    close(fd);
+    return error;
+}
+static int files_case(void) {
+    if (isolate()) return 10;
+    struct mq_attr one = {.mq_maxmsg = 1, .mq_msgsize = 8};
+    long q = q_open("t", O_RDWR | O_CREAT | O_NONBLOCK, 0600, &one);
+    if (q < 0) return 11;
+    long long made = mtime_of(q);
+    printf("mtime:");
+    pause_ms(30);
+    struct mq_attr old;
+    q_attr(q, NULL, &old);
+    struct sigevent none = {.sigev_notify = SIGEV_NONE};
+    q_notify(q, &none);
+    q_notify(q, NULL);
+    fchmod((int)q, 0640);
+    char line[100];
+    lseek((int)q, 0, SEEK_SET);
+    if (read((int)q, line, sizeof line) < 0) return 12;
+    long long untouched = mtime_of(q);
+    put("attr-notify-chmod-read-keep", untouched == made);
+    pause_ms(30);
+    q_send(q, "a", 1, 0, NULL);
+    long long sent = mtime_of(q);
+    put("send-sets", sent > untouched);
+    pause_ms(30);
+    put("full", q_send(q, "b", 1, 0, NULL));
+    put("failed-send-keeps", mtime_of(q) == sent);
+    pause_ms(30);
+    q_receive(q, 8, NULL);
+    long long received = mtime_of(q);
+    put("receive-sets", received > sent);
+    pause_ms(30);
+    put("empty", q_receive(q, 8, NULL));
+    put("failed-receive-keeps", mtime_of(q) == received);
+    say("");
+    close((int)q);
+    q_unlink("t");
+
+    /* A child in a user namespace whose 0, 1 and 2 are users 2000 to 2002
+       makes an IPC namespace as its 0; its 1 makes a queue there, which
+       its 2 may not unlink and its 0, without capabilities, may. */
+    int ready[2], mapped[2];
+    if (pipe(ready) || pipe(mapped)) return 13;
+    pid_t pid = child();
+    if (pid == 0) {
+        char byte;
+        if (unshare(CLONE_NEWUSER)) _exit(90);
+        if (write(ready[1], "u", 1) != 1) _exit(91);
+        if (read(mapped[0], &byte, 1) != 1) _exit(92);
+        if (syscall(SYS_setresgid, 0, 0, 0) || syscall(SYS_setresuid, 0, 0, 0)) _exit(93);
+        if (unshare(CLONE_NEWIPC)) _exit(94);
+        for (int user = 1; user <= 2; user++) {
+            pid_t other = fork();
+            if (other == 0) {
+                if (syscall(SYS_setresgid, user, user, user) || syscall(SYS_setresuid, user, user, user)) _exit(90);
+                if (user == 1) {
+                    long fd = q_open("theirs", O_RDWR | O_CREAT, 0600, &one);
+                    _exit(fd >= 0 ? 0 : 1);
+                }
+                _exit(q_unlink("theirs") == -EPERM ? 0 : 1);
+            }
+            say("namespace: user-%d status=%d", user, wait_child(other));
+        }
+        /* No capabilities left, so only owning the root lets it. */
+        struct {
+            unsigned version;
+            int pid;
+        } header = {0x20080522, 0};
+        unsigned data[6] = {0};
+        if (syscall(SYS_capset, &header, data)) _exit(95);
+        printf("namespace:");
+        put("root-owner-unlinks", q_unlink("theirs"));
+        put("again", q_unlink("theirs"));
+        say("");
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 14;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/uid_map", pid);
+    int uid_map = write_text(path, "0 2000 3");
+    snprintf(path, sizeof path, "/proc/%d/gid_map", pid);
+    int gid_map = write_text(path, "0 2000 3");
+    say("maps: uid=%d gid=%d", uid_map, gid_map);
+    if (write(mapped[1], "m", 1) != 1) return 15;
+    say("namespace: status=%d", wait_child(pid));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -1133,5 +1237,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-fork")) return fork_case();
     if (!strcmp(mode, "mqueue-sysctl")) return sysctl_case();
     if (!strcmp(mode, "mqueue-accounts")) return accounts_case();
+    if (!strcmp(mode, "mqueue-files")) return files_case();
     return 3;
 }

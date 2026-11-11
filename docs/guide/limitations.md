@@ -195,10 +195,11 @@ verified.
     all look again whenever it changes, where Linux wakes them in the order
     they began only while each one's message fits.
   - The POSIX message queues' filesystem cannot be mounted (there is no
-    `/dev/mqueue`). A queue's file keeps only its creation time, and its
-    root belongs to root in every IPC namespace. A `SIGEV_THREAD` cookie
-    goes to its socket even when the socket's receive buffer is full,
-    where Linux's `mq_notify` first waits for room.
+    `/dev/mqueue`). A `SIGEV_THREAD` cookie goes to its socket even when
+    the socket's receive buffer is full, where Linux's `mq_notify` first
+    waits for room: Linux counts the cookie against that buffer from the
+    registration on, by its `truesize`, which the emulator's netlink
+    sockets do not keep.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
     where Linux checks the writer again at each write, and it reports its
     value's length as its size, where Linux reports 0.

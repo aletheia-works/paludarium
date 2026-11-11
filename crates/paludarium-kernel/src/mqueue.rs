@@ -42,7 +42,9 @@ use crate::users::Ids as Kind;
 use paludarium_host::{ClockId, FileHandle, FileStat, WaitOutcome, WaitToken};
 use paludarium_types::{Errno, GuestAddr};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 const O_ACCMODE: u32 = 3;
@@ -176,6 +178,10 @@ struct Table {
     names: Mutex<BTreeMap<Vec<u8>, Arc<Queue>>>,
     count: Arc<AtomicUsize>,
     limits: Limits,
+    /// The filesystem user and group IDs of whoever made the namespace,
+    /// whom its `mqueue` root belongs to (`mqueue_fill_super`): root for the
+    /// first one.
+    root: (AtomicU32, AtomicU32),
 }
 
 /// An IPC namespace's limits and defaults, as its `/proc/sys/fs/mqueue`
@@ -203,6 +209,19 @@ impl Default for Limits {
 }
 
 impl Queues {
+    /// Records the filesystem IDs of the thread that made the namespace,
+    /// whose `mqueue` root becomes theirs.
+    pub(crate) fn made_by(&self, uid: u32, gid: u32) {
+        self.0.root.0.store(uid, Ordering::SeqCst);
+        self.0.root.1.store(gid, Ordering::SeqCst);
+    }
+    /// The `mqueue` root's owner and group.
+    pub(crate) fn root(&self) -> (u32, u32) {
+        (
+            self.0.root.0.load(Ordering::SeqCst),
+            self.0.root.1.load(Ordering::SeqCst),
+        )
+    }
     /// The namespace's limits.
     pub(crate) fn limits(&self) -> &Limits {
         &self.0.limits
@@ -332,7 +351,9 @@ pub(crate) struct Queue {
     gid: AtomicU32,
     mode: AtomicU32,
     inode: u64,
-    created: i128,
+    /// When it was made, or last sent to or received from (Linux's
+    /// `simple_inode_init_ts`), in nanoseconds since the epoch.
+    mtime: AtomicI64,
     state: Mutex<State>,
     /// Notified whenever a waiter is told, or the queue changes.
     token: WaitToken,
@@ -380,7 +401,7 @@ impl Queue {
             uid: self.uid.load(Ordering::SeqCst),
             gid: self.gid.load(Ordering::SeqCst),
             links: 1,
-            mtime_ns: self.created,
+            mtime_ns: i128::from(self.mtime.load(Ordering::SeqCst)),
             ..FileStat::default()
         }
     }
@@ -562,6 +583,13 @@ fn result(value: Result<u64, Errno>) -> Outcome {
     Outcome::Return(value.unwrap_or_else(Errno::to_syscall_return))
 }
 
+/// The time of day in nanoseconds, which a queue's file times are in.
+fn now(c: &Context<'_>) -> i64 {
+    c.host
+        .clock(ClockId::Realtime)
+        .map_or(0, |nanos| i64::try_from(nanos).unwrap_or(i64::MAX))
+}
+
 /// The queues of the calling thread's IPC namespace.
 fn queues(c: &Context<'_>) -> Queues {
     c.group.namespaces(c.tid).ipc.mq.clone()
@@ -728,7 +756,7 @@ fn create(
         return Err(Errno::EMFILE);
     }
     count.fetch_add(1, Ordering::SeqCst);
-    let created = c.host.clock(ClockId::Realtime).map_or(0, i128::from);
+    let created = now(c);
     Ok(Queue {
         maxmsg,
         msgsize,
@@ -738,7 +766,7 @@ fn create(
         gid: AtomicU32::new(credentials.fsgid),
         mode: AtomicU32::new(mode),
         inode: crate::files::anonymous_inode(),
-        created,
+        mtime: AtomicI64::new(created),
         state: Mutex::default(),
         token: WaitToken::default(),
         hub: Arc::clone(&c.files.readiness),
@@ -766,7 +794,7 @@ fn mq_unlink(c: &Context<'_>, at: u64) -> Result<u64, Errno> {
     let credentials = &c.process.credentials;
     let stat = queue.stat();
     if credentials.fsuid != stat.uid
-        && credentials.fsuid != 0
+        && credentials.fsuid != queues.root().0
         && !crate::permissions::capable(credentials, &stat, CAP_FOWNER)
     {
         return Err(Errno::EPERM);
@@ -857,6 +885,7 @@ fn mq_timedsend(
                 state.insert(priority, text);
                 queue.notify(&mut state, c.process.pid, c.process.credentials.uid);
             }
+            queue.mtime.store(now(c), Ordering::SeqCst);
             return Ok(0);
         }
     };
@@ -908,6 +937,7 @@ fn mq_timedreceive(
             } else {
                 queue.changed(&mut state);
             }
+            queue.mtime.store(now(c), Ordering::SeqCst);
             Ok(taken)
         } else if open.nonblocking() {
             return Err(Errno::EAGAIN);

@@ -706,7 +706,9 @@ kernel.
   Linux's order (as `ipc/mqueue.c`). Its root is sticky and anyone may
   write to it: a name is looked up there (`EACCES` for `.`, `..` or one with
   a `/`, `ENAMETOOLONG` past 255 bytes), opening an existing queue checks
-  its permissions, and only the queue's owner or root unlinks it (`EPERM`).
+  its permissions, and only the queue's owner, the root's owner (whoever
+  made the IPC namespace, as its filesystem IDs were) or `CAP_FOWNER`
+  unlinks it (`EPERM`).
   The namespace's limits are its `/proc/sys/fs/mqueue` files, and a new
   one starts with Linux's defaults: 256 queues (`queues_max`, `ENOSPC`),
   at most 10 messages (`msg_max`) of at most 8192 bytes (`msgsize_max`),
@@ -725,7 +727,9 @@ kernel.
   it readable with a message and writable with room, whatever its access
   mode, and each message queued wakes an edge-triggered `epoll` again;
   `read` gives the state line Linux's does (`QSIZE`, `NOTIFY`, `SIGNO`,
-  `NOTIFY_PID`) from the file position, `fstat` a regular file of 80 bytes,
+  `NOTIFY_PID`) from the file position, `fstat` a regular file of 80 bytes
+  whose modification time is that of the last send or receive (or its
+  creation; not of a failed one, `mq_notify`, `mq_getsetattr` or `read`),
   `fchmod` and `fchown` change it, and its link in `/proc/self/fd` is
   `/<name>`, followed by a space and `(deleted)` once unlinked. Messages come highest
   priority first (below 32768, `EINVAL`), in the order sent within one. A

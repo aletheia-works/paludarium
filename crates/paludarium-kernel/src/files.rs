@@ -111,6 +111,9 @@ pub struct Files {
     /// them. Shared exactly as `fds` is; locked after it.
     reserved: Arc<Mutex<BTreeSet<u32>>>,
     cwd: Arc<Mutex<Vec<u8>>>,
+    /// The working directory's hold on its file, as `fs->pwd` holds its
+    /// dentry; shared with the cwd.
+    home: Arc<Mutex<Option<crate::page_cache::Home>>>,
     /// Shared with the cwd: `CLONE_FS` shares both, as on Linux.
     umask: Arc<AtomicU32>,
     /// The page caches of the files mapped shared, which `fs` keeps its
@@ -135,6 +138,7 @@ impl Default for Files {
             fds: Arc::new(Mutex::new(BTreeMap::new())),
             reserved: Arc::default(),
             cwd: Arc::new(Mutex::new(b"/".to_vec())),
+            home: Arc::default(),
             umask: Arc::new(AtomicU32::new(0o022)),
             caches,
         }
@@ -198,8 +202,24 @@ impl Files {
         if self.fs.metadata(&path, true)?.mode & 0o170000 != 0o040000 {
             return Err(Errno::ENOTDIR);
         }
-        *self.cwd.lock().unwrap_or_else(PoisonError::into_inner) = path;
+        self.change_directory(path);
         Ok(())
+    }
+    /// Makes the directory at `path` the working directory, holding its
+    /// file instead of the last one (`set_fs_pwd`).
+    fn change_directory(&self, path: Vec<u8>) {
+        let home = self.caches.home(&*self.fs, &path);
+        *self.cwd.lock().unwrap_or_else(PoisonError::into_inner) = path;
+        let last = std::mem::replace(
+            &mut *self.home.lock().unwrap_or_else(PoisonError::into_inner),
+            home,
+        );
+        drop(last);
+    }
+    /// Lets go of the working directory, as an exiting task's `exit_fs`
+    /// does: the last task sharing it ends its hold on the directory.
+    pub(crate) fn release_home(&mut self) {
+        self.home = Arc::default();
     }
     /// Detaches this worker's table reference without closing a table still
     /// shared by live CLONE_FILES siblings; the last task to let go gets the
@@ -469,7 +489,7 @@ impl Files {
     /// Entering a mount namespace: the working directory is its root, as
     /// Linux's `mntns_install` sets it.
     pub(crate) fn enter_root(&self) {
-        *self.cwd.lock().unwrap_or_else(PoisonError::into_inner) = b"/".to_vec();
+        self.change_directory(b"/".to_vec());
     }
     pub(crate) fn for_clone(&self, share_files: bool, share_fs: bool) -> Self {
         let mut child = self.clone();
@@ -488,6 +508,13 @@ impl Files {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone(),
+            ));
+            child.home = Arc::new(Mutex::new(
+                self.home
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .map(crate::page_cache::Home::copy),
             ));
             child.umask = Arc::new(AtomicU32::new(self.umask.load(Ordering::SeqCst)));
         }
@@ -2930,7 +2957,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     crate::permissions::MAY_EXEC,
                 )?;
             }
-            *c.files.cwd.lock().unwrap_or_else(PoisonError::into_inner) = p;
+            c.files.change_directory(p);
             Ok(0)
         }
         82 | 264 | 316 => {

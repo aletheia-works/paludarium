@@ -1742,7 +1742,8 @@ kernel.
   `IN_DELETE` for a removed one, after `IN_ATTRIB` of the file and, for its
   last link or a directory, `IN_DELETE_SELF` and `IN_IGNORED` of it, which
   wait for the last close of a description of it that is open (a mapping
-  holds one until it is unmapped), as Linux's dentry waits;
+  holds one until it is unmapped) and, for a directory, until no process
+  has it as its working directory, as Linux's dentry waits;
   `IN_MOVED_FROM` and `IN_MOVED_TO` with one cookie for a rename, then
   `IN_ATTRIB` of a file it replaces, `IN_MOVE_SELF` of the file moved, and
   the replaced file's `IN_DELETE_SELF`, which waits in the same way (twice

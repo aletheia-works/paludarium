@@ -4702,6 +4702,36 @@ mod inotify {
         );
     }
     #[test]
+    fn a_removed_working_directory_ends_when_no_process_is_in_it() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let home = put(&f, DATA, b"/tmp/home");
+        let tmp = put(&f, DATA + 0x40, b"/tmp");
+        assert_eq!(f.ret(83, &[home, 0o700]), 0);
+        assert_eq!(f.ret(80, &[home]), 0);
+        let wd = f.ret(ADD, &[fd, home, 0x400]) as i32;
+        // A copy of the working directory, as a child without CLONE_FS
+        // gets, holds it too.
+        let child = f.kernel.files.for_clone(true, false);
+        assert_eq!(f.ret(84, &[home]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        assert_eq!(f.ret(80, &[tmp]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        drop(child);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
+        // One no process is in goes at once.
+        assert_eq!(f.ret(83, &[home, 0o700]), 0);
+        let wd = f.ret(ADD, &[fd, home, 0x400]) as i32;
+        assert_eq!(f.ret(84, &[home]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
+    }
+    #[test]
     fn the_queue_merges_repeats_and_overflows_once() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK]);

@@ -1067,6 +1067,9 @@ impl Kernel {
         let closed = self.files.release_descriptors();
         crate::mqueue::exited(&closed, self.process.pid);
         drop(closed);
+        // Then `exit_fs`: the last task sharing the working directory lets
+        // go of it.
+        self.files.release_home();
         let addr = thread.state.clear_child_tid;
         let robust = self.group.take_robust_list(thread.tid);
         // While a core dump is under way, a thread leaves its state for it

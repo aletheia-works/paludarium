@@ -44,6 +44,48 @@ pub(crate) struct PageCaches {
     /// [`CoherentFile`], by its handle), which keep a removed file there
     /// for inotify until the last is closed, as Linux's dentry keeps it.
     opens: Mutex<HashMap<usize, Open>>,
+    /// The working directories of the machine's processes, by file, each
+    /// with how many [`Home`]s hold it: as Linux's `fs->pwd` holds its
+    /// dentry, they keep a removed directory there for inotify too.
+    homes: Mutex<HashMap<Key, usize>>,
+}
+
+/// A working directory's hold on its file (`fs->pwd`): while it lasts, a
+/// removed directory's end (`IN_DELETE_SELF`) waits, as for an open
+/// description.
+pub(crate) struct Home {
+    caches: Arc<PageCaches>,
+    key: Key,
+}
+
+impl Home {
+    /// Another hold on the same directory, as `copy_fs_struct` takes one.
+    pub(crate) fn copy(&self) -> Home {
+        self.caches.home_of(self.key)
+    }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        {
+            let mut homes = self
+                .caches
+                .homes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(count) = homes.get_mut(&self.key) {
+                *count -= 1;
+                if *count == 0 {
+                    homes.remove(&self.key);
+                }
+            }
+        }
+        // As a description's last close: the removal looks again after it
+        // puts its end off, so one of the two sees the other.
+        if self.caches.notify.waiting() && !self.caches.held(self.key) {
+            self.caches.notify.last_closed(self.key);
+        }
+    }
 }
 
 /// An open description in [`PageCaches`]' list: its file's handle, where
@@ -77,18 +119,46 @@ impl Drop for WriteAccess {
 }
 
 impl PageCaches {
-    /// Whether a description of file `key` is open.
+    /// Whether a description of file `key` is open, or it is a working
+    /// directory.
     fn held(&self, key: Key) -> bool {
-        let opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
-        opens.values().any(|(file, device, found)| {
-            if let Some(&known) = found.get() {
-                return known == key;
-            }
-            let Some(stat) = file.upgrade().and_then(|file| file.stat().ok()) else {
-                return false;
-            };
-            *found.get_or_init(|| (device.number(), stat.inode)) == key
-        })
+        let opened = {
+            let opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
+            opens.values().any(|(file, device, found)| {
+                if let Some(&known) = found.get() {
+                    return known == key;
+                }
+                let Some(stat) = file.upgrade().and_then(|file| file.stat().ok()) else {
+                    return false;
+                };
+                *found.get_or_init(|| (device.number(), stat.inode)) == key
+            })
+        };
+        opened
+            || self
+                .homes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&key)
+    }
+    /// A hold on the directory at `path` in `fs` as a working directory,
+    /// by the key inotify knows it by; none if it cannot be looked at.
+    pub(crate) fn home(self: &Arc<Self>, fs: &dyn FileSystem, path: &[u8]) -> Option<Home> {
+        let path = crate::files::resolved_in(fs, path)?;
+        let stat = fs.metadata(&path, false).ok()?;
+        Some(self.home_of((mount_device(&fs.mounts(), &path), stat.inode)))
+    }
+    fn home_of(self: &Arc<Self>, key: Key) -> Home {
+        *self
+            .homes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key)
+            .or_default() += 1;
+        Home {
+            caches: Arc::clone(self),
+            key,
+        }
     }
     /// The cache of `key`, made now, with the file's `size`, if the file has
     /// none.

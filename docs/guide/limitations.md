@@ -313,9 +313,7 @@ verified.
   `epoll_wait` that does not wait can come before it.
 - **inotify, in part**: opening a FIFO by its path, running a program
   (which Linux reports as `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`),
-  `splice` and `io_uring`'s reads and writes are no events. A directory
-  removed while it is a process's working directory gets `IN_DELETE_SELF` as
-  it is removed, where Linux sends it once no process works in it. A change through a
+  `splice` and `io_uring`'s reads and writes are no events. A change through a
   descriptor (`fchmod`, `ftruncate`, a read, a write or a close) reaches the
   watch of the file's directory while the path it was opened at still names
   it, and by that name once no name links the file; a file renamed or reached

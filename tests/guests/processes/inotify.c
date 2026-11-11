@@ -517,6 +517,69 @@ static int case_held(void) {
     return 0;
 }
 
+/* A working directory holds a removed directory as a descriptor does:
+   its end waits until no process is in it. */
+static int case_home(void) {
+    make_base("home");
+    int fd = inotify_init1(IN_NONBLOCK);
+    char back[PATH_MAX];
+    if (!getcwd(back, sizeof back)) return 91;
+    char *own = at("own"), *kid = at("kid"), *fch = at("fch");
+    mkdir(own, 0755);
+    mkdir(kid, 0755);
+    mkdir(fch, 0755);
+    int wd_base = inotify_add_watch(fd, base, WATCHED);
+    int wd_own = inotify_add_watch(fd, own, WATCHED);
+    int wd_kid = inotify_add_watch(fd, kid, WATCHED);
+    int wd_fch = inotify_add_watch(fd, fch, WATCHED);
+    printf("wd base=%d own=%d kid=%d fch=%d\n", wd_base, wd_own, wd_kid, wd_fch);
+    /* Its own working directory. */
+    long in = e(chdir(own));
+    long gone = e(rmdir(own));
+    printf("chdir=%ld rmdir=%ld\n", in, gone);
+    drain(fd, "own-removed");
+    chdir(back);
+    drain(fd, "own-left");
+    /* A child's, which it got from a fork and keeps until it exits. */
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 92;
+    pid_t child = fork();
+    if (child == 0) {
+        char byte = chdir(kid) == 0 ? 'y' : 'n';
+        write(ready[1], &byte, 1);
+        read(done[0], &byte, 1);
+        _exit(0);
+    }
+    char byte = 0;
+    read(ready[0], &byte, 1);
+    printf("child in=%c rmdir=%ld\n", byte, e(rmdir(kid)));
+    drain(fd, "kid-removed");
+    write(done[1], "x", 1);
+    waitpid(child, NULL, 0);
+    drain(fd, "kid-exited");
+    /* fchdir to a descriptor that is then closed. */
+    int open_fch = open(fch, O_RDONLY | O_DIRECTORY);
+    printf("fchdir=%ld\n", e(fchdir(open_fch)));
+    close(open_fch);
+    printf("rmdir=%ld\n", e(rmdir(fch)));
+    drain(fd, "fchdir-removed");
+    chdir(back);
+    drain(fd, "fchdir-left");
+    /* A rename over the working directory removes it too. */
+    char *top = at("top"), *over = at("over");
+    mkdir(top, 0755);
+    mkdir(over, 0755);
+    int wd_top = inotify_add_watch(fd, top, WATCHED);
+    printf("wd top=%d\n", wd_top);
+    chdir(top);
+    printf("rename=%ld\n", e(rename(over, top)));
+    drain(fd, "replaced");
+    chdir(back);
+    drain(fd, "replaced-left");
+    remove_all();
+    return 0;
+}
+
 static void on_alarm(int sig) { (void)sig; }
 
 static int case_wait(void) {
@@ -575,5 +638,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-wait")) return case_wait();
     if (!strcmp(mode, "inotify-content")) return case_content();
     if (!strcmp(mode, "inotify-held")) return case_held();
+    if (!strcmp(mode, "inotify-home")) return case_home();
     return 2;
 }

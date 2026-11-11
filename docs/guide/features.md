@@ -785,7 +785,13 @@ kernel.
   socket) as a datagram whose last byte is 1 (`NOTIFY_WOKENUP`), or 2
   (`NOTIFY_REMOVED`) when the registration ends without a message, which is
   what the C libraries' helper threads read to start the
-  `sigev_notify_function`. Closing any descriptor of the queue, or ending,
+  `sigev_notify_function`. The cookie takes room in that socket's receive
+  buffer from the registration on, as Linux's `netlink_attachskb` charges
+  it, until it is received: while the socket holds something and has no
+  room for it, `mq_notify` waits, before it looks the queue up, until a
+  receive makes room (a signal ends the wait, `EINTR`, unless
+  `SA_RESTART` restarts it), and gives the room back if it then fails.
+  Closing any descriptor of the queue, or ending,
   drops its process's registration, as Linux's `mqueue_flush_file`.
 - `/dev/mqueue` is the first IPC namespace's `mqueue` filesystem, as
   systemd mounts it when Linux boots, whatever IPC namespace the caller is

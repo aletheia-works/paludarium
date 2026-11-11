@@ -297,6 +297,9 @@ struct Datagram {
     from: u32,
     group: u32,
     bytes: Vec<u8>,
+    /// What it takes of the receive buffer: its length, or a kernel
+    /// buffer's `truesize` charged before it was queued.
+    size: usize,
 }
 
 #[derive(Default)]
@@ -311,6 +314,9 @@ struct State {
     queue: VecDeque<Datagram>,
     /// The bytes waiting in `queue`.
     queued: usize,
+    /// The `truesize` of kernel buffers charged to the receive buffer and
+    /// not yet queued: `SIGEV_THREAD` cookies of POSIX message queues.
+    charged: usize,
     /// A dump's `NLMSG_DONE`, which the next receive queues (Linux's
     /// `cb_running`).
     done: Option<Vec<u8>>,
@@ -509,25 +515,53 @@ impl NetlinkSocket {
     /// finds the receive buffer full is dropped, with `ENOBUFS` for the
     /// next receive (`netlink_overrun`).
     fn deliver(&self, s: &mut State, from: u32, group: u32, bytes: Vec<u8>) {
-        if s.queued >= usize::try_from(s.receive_buffer).unwrap_or(0) {
+        if s.queued + s.charged >= usize::try_from(s.receive_buffer).unwrap_or(0) {
             s.error = Some(ENOBUFS);
         } else {
-            s.queued += bytes.len();
-            s.queue.push_back(Datagram { from, group, bytes });
+            let size = bytes.len();
+            s.queued += size;
+            s.queue.push_back(Datagram {
+                from,
+                group,
+                bytes,
+                size,
+            });
         }
         s.arrivals += 1;
         self.hub.changed();
     }
-    /// Queues `bytes` from the kernel, past the receive buffer too, as
-    /// `netlink_sendskb` does with a POSIX message queue's `SIGEV_THREAD`
-    /// cookie ([`crate::mqueue`]).
-    pub(crate) fn attach(&self, bytes: Vec<u8>) {
+    /// Charges a kernel buffer of `truesize` bytes held for a later send to
+    /// the receive buffer, as `netlink_attachskb` does when the socket holds
+    /// nothing or has room for it, and says whether it did; a caller that
+    /// may wait waits until a receive makes room, and tries again.
+    pub(crate) fn charge(&self, truesize: usize) -> bool {
         let mut s = self.lock();
-        s.queued += bytes.len();
+        let held = s.queued + s.charged + truesize;
+        if held == truesize || held <= usize::try_from(s.receive_buffer).unwrap_or(0) {
+            s.charged += truesize;
+            true
+        } else {
+            false
+        }
+    }
+    /// Gives back a charge that will not be sent (`netlink_detachskb`).
+    pub(crate) fn uncharge(&self, truesize: usize) {
+        let mut s = self.lock();
+        s.charged = s.charged.saturating_sub(truesize);
+        self.hub.changed();
+    }
+    /// Queues `bytes` from the kernel, charged before for `truesize`
+    /// ([`Self::charge`]), as `netlink_sendskb` does with a POSIX message
+    /// queue's `SIGEV_THREAD` cookie ([`crate::mqueue`]).
+    pub(crate) fn attach(&self, bytes: Vec<u8>, truesize: usize) {
+        let mut s = self.lock();
+        s.charged = s.charged.saturating_sub(truesize);
+        s.queued += truesize;
         s.queue.push_back(Datagram {
             from: 0,
             group: 0,
             bytes,
+            size: truesize,
         });
         s.arrivals += 1;
         self.hub.changed();
@@ -889,8 +923,12 @@ impl NetlinkSocket {
         buf[..n].copy_from_slice(&first.bytes[..n]);
         let got = (n, first.bytes.len(), first.from, first.group);
         if !peek {
+            let size = first.size;
             s.queue.pop_front();
-            s.queued -= got.1;
+            s.queued -= size;
+            // A `mq_notify` waiting for room looks again
+            // (`netlink_rcv_wake`).
+            self.hub.changed();
         }
         s.longest_read = s.longest_read.max(buf.len()).min(MOST_DUMP_PART);
         if s.queued <= usize::try_from(s.receive_buffer / 2).unwrap_or(0) {

@@ -1782,6 +1782,103 @@ static int dev_case(void) {
     return dev_paths();
 }
 
+/* A SIGEV_THREAD cookie's room in its netlink socket's receive buffer,
+   which Linux charges from the registration on: once a socket with the
+   smallest buffer has no room left, the next mq_notify waits until a
+   receive makes some, a signal without SA_RESTART ends the wait (EINTR)
+   and one with it does not. A cookie that a removal queues still holds its
+   room until it is received. How many cookies fit depends on their size
+   in the kernel, so only that some do is shown. */
+static int room_socket = -1;
+static long room_received = -1;
+static void *receive_later(void *unused) {
+    (void)unused;
+    pause_ms(300);
+    char buf[64];
+    room_received = TRY(recv(room_socket, buf, sizeof buf, 0));
+    return NULL;
+}
+static void arm(long millis) {
+    struct itimerval t = {.it_value = {.tv_sec = millis / 1000, .tv_usec = millis % 1000 * 1000}};
+    setitimer(ITIMER_REAL, &t, NULL);
+}
+static int room_case(void) {
+    if (isolate()) return 10;
+    room_socket = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0);
+    if (room_socket < 0) return 11;
+    int smallest = 0;
+    setsockopt(room_socket, SOL_SOCKET, SO_RCVBUF, &smallest, sizeof smallest);
+    struct sigaction interrupt = {.sa_handler = handler};
+    sigaction(SIGALRM, &interrupt, NULL);
+    static char cookie[32] = "cookie";
+    struct sigevent event = {.sigev_notify = SIGEV_THREAD, .sigev_signo = room_socket};
+    event.sigev_value.sival_ptr = cookie;
+    struct mq_attr one = {.mq_maxmsg = 1, .mq_msgsize = 1};
+    enum { MOST = 64 };
+    long queues[MOST];
+    int registered = 0;
+    long refused = 0;
+    for (int i = 0; i < MOST; i++) {
+        char name[16];
+        snprintf(name, sizeof name, "room-%d", i);
+        queues[i] = q_open(name, O_RDWR | O_CREAT, 0600, &one);
+        if (queues[i] < 0) return 12;
+        arm(200);
+        long r = q_notify(queues[i], &event);
+        arm(0);
+        if (r != 0) {
+            refused = r;
+            break;
+        }
+        registered++;
+    }
+    printf("room:");
+    put("some-fit", registered > 0 && registered < MOST);
+    put("full", refused);
+    put("caught", caught);
+    long next = queues[registered];
+    /* A removal queues its cookie, which still takes its room. */
+    put("remove", q_notify(queues[0], NULL));
+    arm(200);
+    put("removed-still-full", q_notify(next, &event));
+    arm(0);
+    /* A bad queue is looked up only after the room is found. */
+    arm(200);
+    put("bad-queue-waits", q_notify(-1, &event));
+    arm(0);
+    say("");
+    /* With SA_RESTART the signal does not end the wait, and a receive in
+       another thread lets it register. */
+    struct sigaction restart = {.sa_handler = handler, .sa_flags = SA_RESTART};
+    sigaction(SIGALRM, &restart, NULL);
+    caught = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, receive_later, NULL)) return 13;
+    struct timespec start = monotonic();
+    arm(100);
+    long r = q_notify(next, &event);
+    long waited = elapsed_ms(start);
+    arm(0);
+    pthread_join(thread, NULL);
+    printf("room:");
+    put("after-receive", r);
+    put("waited", waited >= 250);
+    put("restarted", caught);
+    put("received", room_received);
+    /* With room for one, a bad queue is EBADF, and its charge goes back. */
+    char buf[64];
+    put("remove-another", q_notify(queues[1], NULL));
+    put("drain", TRY(recv(room_socket, buf, sizeof buf, MSG_DONTWAIT)));
+    put("drained-last-byte", buf[31]);
+    arm(500);
+    put("bad-queue", q_notify(-1, &event));
+    long fresh = q_open("room-fresh", O_RDWR | O_CREAT, 0600, &one);
+    put("again", q_notify(fresh, &event));
+    arm(0);
+    say("");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -1795,5 +1892,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-accounts")) return accounts_case();
     if (!strcmp(mode, "mqueue-files")) return files_case();
     if (!strcmp(mode, "mqueue-dev")) return dev_case();
+    if (!strcmp(mode, "mqueue-room")) return room_case();
     return 3;
 }

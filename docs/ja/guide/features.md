@@ -698,7 +698,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   netlink ソケット（`EBADF`、`ENOTSOCK`、ほかのソケットなら `EINVAL`）へ、最後の
   バイトが 1（`NOTIFY_WOKENUP`）のデータグラムとして送ります。メッセージなしで登録が
   終わるときは 2（`NOTIFY_REMOVED`）です。C ライブラリーの補助スレッドはこれを読んで
-  `sigev_notify_function` を始めます。キューのどの記述子を閉じても、またはプロセスが
+  `sigev_notify_function` を始めます。クッキーは、Linux の `netlink_attachskb` と同じく、
+  登録のときから受け取られるまで、そのソケットの受信バッファーの空きを取ります。ソケットに
+  何かがあり、クッキーの空きがなければ、`mq_notify` はキューを引く前に、受信で空きができるまで
+  待ちます（シグナルで待ちは終わり `EINTR`。`SA_RESTART` なら再開します）。そのあと失敗すれば
+  空きを返します。キューのどの記述子を閉じても、またはプロセスが
   終わっても、Linux の `mqueue_flush_file` と同じくそのプロセスの登録は外れます。
 - `/dev/mqueue` は、Linux の起動時に systemd がマウントするのと同じく、呼び出し元がどの IPC
   名前空間にいても、最初の IPC 名前空間の `mqueue` ファイルシステムです。誰でも書ける

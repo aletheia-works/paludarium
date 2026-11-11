@@ -169,6 +169,7 @@ mod linux {
                     | "mqueue-accounts"
                     | "mqueue-files"
                     | "mqueue-dev"
+                    | "mqueue-room"
                     | "netlink"
                     | "unix-interfaces"
                     | "addresses"
@@ -363,6 +364,7 @@ mod linux {
         mqueue_accounts => ("mqueue-accounts","mqueue"),
         mqueue_files => ("mqueue-files","mqueue"),
         mqueue_dev => ("mqueue-dev","mqueue"),
+        mqueue_room => ("mqueue-room","mqueue"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),

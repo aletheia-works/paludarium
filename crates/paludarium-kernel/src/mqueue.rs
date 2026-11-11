@@ -96,6 +96,12 @@ const SIGEV_NONE: i32 = 1;
 const SIGEV_THREAD: i32 = 2;
 /// The cookie of `SIGEV_THREAD`, and what its last byte says.
 const NOTIFY_COOKIE_LEN: usize = 32;
+/// What the cookie's buffer takes of its socket's receive buffer, its
+/// `truesize` on x86-64 Linux 7.0: `alloc_skb(NOTIFY_COOKIE_LEN)` takes its
+/// head, with the `skb_shared_info`, from the small head cache
+/// (`SKB_SMALL_HEAD_SIZE`, 704 bytes on the CI runner's kernel, as
+/// [`crate::inet`]'s datagrams count it), and 256 bytes for the `sk_buff`.
+const COOKIE_TRUESIZE: usize = 256 + 704;
 const NOTIFY_WOKENUP: u8 = 1;
 const NOTIFY_REMOVED: u8 = 2;
 /// `si_code` of a queue's notification.
@@ -284,12 +290,24 @@ impl Table {
             ..FileStat::default()
         }
     }
-    /// The root's modification time, which its first use sets for the first
-    /// namespace, whose making paludarium does not see.
+    /// The root's modification time. The first namespace's, which Linux
+    /// makes as it boots and paludarium does not see made, starts at the
+    /// boot, the realtime clock less the monotonic one, to the second.
     fn mtime(&self, c: &Context<'_>) -> i64 {
-        let _ = self
-            .mtime
-            .compare_exchange(0, now(c), Ordering::SeqCst, Ordering::SeqCst);
+        if self.mtime.load(Ordering::SeqCst) == 0 {
+            let clock = |id| {
+                c.host
+                    .clock(id)
+                    .map_or(0, |nanos| i64::try_from(nanos).unwrap_or(i64::MAX))
+            };
+            let boot = clock(ClockId::Realtime).saturating_sub(clock(ClockId::Monotonic));
+            let _ = self.mtime.compare_exchange(
+                0,
+                boot - boot % 1_000_000_000,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
         self.mtime.load(Ordering::SeqCst)
     }
 }
@@ -302,9 +320,37 @@ enum Notice {
         value: u64,
     },
     Thread {
-        socket: Arc<dyn FileHandle>,
+        socket: Charge,
         cookie: [u8; NOTIFY_COOKIE_LEN],
     },
+}
+
+/// A `SIGEV_THREAD` cookie's hold on its netlink socket's receive buffer,
+/// which Linux charges from the registration on (`netlink_attachskb`) and
+/// gives back when it is never sent (`netlink_detachskb`).
+struct Charge {
+    socket: Arc<dyn FileHandle>,
+    sent: bool,
+}
+
+impl Charge {
+    /// Queues the cookie, which keeps its charge until it is received.
+    fn send(mut self, cookie: &[u8]) {
+        self.sent = true;
+        if let Some(socket) = crate::netlink::of(&self.socket) {
+            socket.attach(cookie.to_vec(), COOKIE_TRUESIZE);
+        }
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if !self.sent
+            && let Some(socket) = crate::netlink::of(&self.socket)
+        {
+            socket.uncharge(COOKIE_TRUESIZE);
+        }
+    }
 }
 
 /// The process `mq_notify` registered (`notify_owner`), as many `exec`s in
@@ -330,9 +376,7 @@ impl Registration {
     fn remove(self) {
         if let Notice::Thread { socket, mut cookie } = self.notice {
             cookie[NOTIFY_COOKIE_LEN - 1] = NOTIFY_REMOVED;
-            if let Some(socket) = crate::netlink::of(&socket) {
-                socket.attach(cookie.to_vec());
-            }
+            socket.send(&cookie);
         }
     }
 }
@@ -494,9 +538,7 @@ impl Queue {
                 }
                 Notice::Thread { socket, mut cookie } => {
                     cookie[NOTIFY_COOKIE_LEN - 1] = NOTIFY_WOKENUP;
-                    if let Some(socket) = crate::netlink::of(&socket) {
-                        socket.attach(cookie.to_vec());
-                    }
+                    socket.send(&cookie);
                 }
             }
         }
@@ -1516,12 +1558,40 @@ fn wait(
     }
 }
 
+/// The netlink socket descriptor `signo` names (`EBADF`, `ENOTSOCK`, and
+/// `EINVAL` for another socket), with the cookie's buffer charged to its
+/// receive buffer, as `do_mq_notify` attaches it: while the socket holds
+/// something and has no room for it, it waits, interruptibly
+/// (`ERESTARTSYS`), until a receive makes room, and looks the descriptor
+/// up again.
+fn charged(c: &mut Context<'_>, signo: i32) -> Result<Charge, Errno> {
+    loop {
+        let ticket = c.files.readiness.token.value();
+        let socket = c.files.descriptor(u64::from(signo as u32))?.file;
+        if socket.stat()?.mode & S_IFMT != S_IFSOCK {
+            return Err(ENOTSOCK);
+        }
+        let Some(netlink) = crate::netlink::of(&socket) else {
+            return Err(Errno::EINVAL);
+        };
+        if netlink.charge(COOKIE_TRUESIZE) {
+            return Ok(Charge {
+                socket,
+                sent: false,
+            });
+        }
+        drop(socket);
+        crate::events::wait(c, ticket, None)?;
+    }
+}
+
 /// `mq_notify(mqdes, notification)`, in Linux's order (`do_mq_notify`):
 /// the `struct sigevent` is read (`EFAULT`); a `sigev_notify` other than
 /// `SIGEV_NONE`, `SIGEV_SIGNAL` and `SIGEV_THREAD` is `EINVAL`, and so is a
 /// signal past 64; `SIGEV_THREAD`'s cookie is read (`EFAULT`) and its
 /// `sigev_signo` must be a descriptor (`EBADF`) of a socket (`ENOTSOCK`)
-/// of netlink (`EINVAL`). Then the queue (`EBADF`). No notification drops
+/// of netlink (`EINVAL`), whose receive buffer the cookie is charged to,
+/// waiting for room ([`charged`]). Then the queue (`EBADF`). No notification drops
 /// the caller's own registration, if it has one; another process's is
 /// `EBUSY`; else the caller's process registers.
 pub(crate) fn sys_mq_notify(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
@@ -1550,14 +1620,10 @@ fn mq_notify(c: &mut Context<'_>, fd: u64, at: u64) -> Result<u64, Errno> {
                 c.mem
                     .read(GuestAddr(value), &mut cookie)
                     .map_err(|_| Errno::EFAULT)?;
-                let socket = c.files.descriptor(u64::from(signo as u32))?.file;
-                if socket.stat()?.mode & S_IFMT != S_IFSOCK {
-                    return Err(ENOTSOCK);
+                Notice::Thread {
+                    socket: charged(c, signo)?,
+                    cookie,
                 }
-                if crate::netlink::of(&socket).is_none() {
-                    return Err(Errno::EINVAL);
-                }
-                Notice::Thread { socket, cookie }
             }
             _ => return Err(Errno::EINVAL),
         })

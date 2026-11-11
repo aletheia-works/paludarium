@@ -173,12 +173,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
     並びません。そこでは `open`、`stat`、`access`、`getdents`、`unlink`、`rmdir`、`statfs`、
     `mkdir`、`mknod`、`symlink`、`link`、`rename`、`chmod`、`chown`、`utimensat`、`truncate` が
-    Linux と同じに動きます。最初の名前空間のルートの時刻は、最初に使ったときのものです。
-    Linux では起動時にマウントしたときです。
-  - `SIGEV_THREAD` のクッキーは、ソケットの受信バッファーがいっぱいでも
-    届きます。Linux の `mq_notify` は先に空きを待ちます。Linux はクッキーを登録のときから
-    その `truesize` でバッファーに数えますが、エミュレータの netlink ソケットはそれを
-    持ちません。
+    Linux と同じに動きます。最初の名前空間のルートの時刻は、そこでキューを作るか消すまでは
+    ホストの起動時刻です。Linux では、起動の途中でカーネルがそれを作った、少しあとの時刻です。
+  - `SIGEV_THREAD` のクッキーは、netlink ソケットの受信バッファーを 960 バイト（CI の
+    ランナーのカーネルでの `truesize`）取りますが、そのソケットのほかのデータグラムは長さの
+    分だけ取ります。Linux はそれらも `truesize` で数えます。また、空きがなくてデータグラムを
+    落としたソケットを、空になるまで混んでいるとはしません（Linux の `NETLINK_S_CONGESTED`）。
+    そのため、待っている `mq_notify` が Linux より早く登録できることがあります。
   - `/proc/sys/fs/mqueue` のファイルは、書ける者を開くときに確かめます。Linux は書き込みの
     たびに書く者を確かめ直します。また、サイズとして値の長さを示します。Linux は 0 です。
   - セットで待っているセマフォーの操作は、1 つの待ち行列で待ち始めた順に試します（0 を

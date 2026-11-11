@@ -761,7 +761,9 @@ kernel.
   end `lseek` finds is that size, `fstatfs` reports the `mqueue`
   filesystem (`MQUEUE_MAGIC`, a page per block, 255-byte names), and its
   link in `/proc/self/fd` is
-  `/<name>`, followed by a space and `(deleted)` once unlinked. Messages come highest
+  `/<name>`, followed by a space and `(deleted)` once unlinked, which an
+  open follows to the same queue, with its permissions for the access
+  mode and `O_TRUNC` (`EACCES`, and `ENOTDIR` with `O_DIRECTORY`). Messages come highest
   priority first (below 32768, `EINVAL`), in the order sent within one. A
   receive into a buffer smaller than `mq_msgsize` is `EMSGSIZE`, and so is
   a longer send. A receive from an empty queue and a send to a full one
@@ -804,8 +806,17 @@ kernel.
   time and may reach 2^31 − 1 bytes (`EFBIG` past them, as the
   superblock's `s_maxbytes`), and `statfs` reports the `mqueue`
   filesystem. The root's size is 20 bytes for each entry (`.`, `..` and
-  each queue, `DIRENT_SIZE`), and its modification time is when a queue
-  was last made or unlinked there. The root has no operations but to look
+  each queue, `DIRENT_SIZE`), and its modification time is when its
+  namespace was made, or a queue was last made or unlinked there.
+  `chmod`, `chown` and `utimensat` of `/dev/mqueue`, and `fchmod`,
+  `fchown` and `futimens` of an open of it, change the root (a
+  `truncate` is `EISDIR`), and its mode then rules what others may do:
+  a lookup of a name there searches it (`EACCES`), opening it reads it,
+  making a queue (`mq_open` too) and unlinking one write and search it
+  (`may_create`, `may_delete`), the sticky bit limits unlinking to the
+  queue's owner, the root's or `CAP_FOWNER`, and `mq_open` of a queue
+  that is there does not search it (`lookup_noperm`). Landlock checks a
+  `link` or `rename` within it (`EACCES`) before the root refuses it. The root has no operations but to look
   up, make a queue and unlink one: a new name there that is free (else
   `EEXIST`, as `/dev/mqueue` itself is) gives `mkdir`, `symlink` and
   `mknod` of anything but a regular file `EPERM`, after Landlock's check,

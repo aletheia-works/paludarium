@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -1309,7 +1310,7 @@ static void show_statfs(const char *label, long result, const struct statfs *s) 
    mknod of a regular file makes a queue, and link and rename are EXDEV
    to or from another mount and EPERM within it. ATTRS_PATH is a queue. */
 static int dev_names(void) {
-    const char *made[] = {"-dir", "-sym", "-fifo", "-chr", "-node", "-zero", "-link", "-moved", "-in"};
+    const char *made[] = {"-dir", "-sym", "-fifo", "-chr", "-node", "-zero", "-link", "-moved", "-in", "-fresh"};
     for (unsigned i = 0; i < sizeof made / sizeof *made; i++) {
         char name[128];
         snprintf(name, sizeof name, DEV_NAME "%s", made[i]);
@@ -1390,10 +1391,154 @@ static int dev_names(void) {
     put("listed", listed_type(DEV_NAME "-moved") + listed_type(DEV_NAME "-in"));
     put("kept", listed_type(ATTRS_NAME));
     say("");
+    /* Under a Landlock domain that handles making and removing regular
+       files and allows them nowhere, Landlock refuses a link, a rename
+       (onto itself too), a mknod and an unlink within the root (EACCES)
+       before the root's own EPERM; a link out of it is EXDEV first. */
+    pid_t pid = child();
+    if (pid == 0) {
+        unsigned long long handled = (1ULL << 8) | (1ULL << 5);
+        long ruleset = syscall(444, &handled, sizeof handled, 0);
+        if (ruleset < 0) _exit(90);
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || syscall(446, ruleset, 0)) _exit(91);
+        printf("landlock:");
+        put("link", TRY(link(ATTRS_PATH, DEV_PATH("-link"))));
+        put("rename", TRY(rename(ATTRS_PATH, DEV_PATH("-moved"))));
+        put("rename-itself", TRY(rename(ATTRS_PATH, ATTRS_PATH)));
+        put("link-out", TRY(link(ATTRS_PATH, other)));
+        put("mkdir", TRY(mkdir(DEV_PATH("-dir"), 0700)));
+        put("mknod", TRY(mknod(DEV_PATH("-fresh"), S_IFREG | 0600, 0)));
+        put("unlink", TRY(unlink(DEV_PATH("-node"))));
+        say("");
+        _exit(0);
+    }
+    say("landlock: status=%d", wait_child(pid));
     unlink(file);
     rmdir(dir);
     q_unlink(DEV_NAME "-node");
     q_unlink(DEV_NAME "-zero");
+    return 0;
+}
+
+/* What an unprivileged user (2000) may do in /dev/mqueue, which it may
+   search, read and write as the root's mode says. */
+static void as_user(const char *label) {
+    pid_t pid = child();
+    if (pid == 0) {
+        if (unprivileged()) _exit(90);
+        printf("%s:", label);
+        struct stat st;
+        put("stat", TRY(stat(DEV_PATH("-root"), &st)));
+        long d = TRY(open("/dev/mqueue", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        put("open-dir", d < 0 ? d : 0);
+        long q = q_open(DEV_NAME "-root", O_RDONLY, 0, NULL);
+        put("mq_open", q < 0 ? q : 0);
+        long made = q_open(DEV_NAME "-theirs", O_RDWR | O_CREAT, 0600, NULL);
+        put("create", made < 0 ? made : 0);
+        put("open-create", TRY(open(DEV_PATH("-theirs2"), O_RDWR | O_CREAT | O_CLOEXEC, 0600)) < 0 ? -errno : 0);
+        say("");
+        _exit(0);
+    }
+    say("%s: status=%d", label, wait_child(pid));
+    q_unlink(DEV_NAME "-theirs");
+    q_unlink(DEV_NAME "-theirs2");
+}
+
+/* The root itself: chmod, chown, the times and fchmod of an open of it,
+   which change what others may do there; mq_open of a queue that is
+   there does not search it (lookup_noperm), while making and unlinking
+   one need to write and search it. Its mode, owner and time are put back
+   at the end, as this is the host's /dev/mqueue on Linux. Then a queue
+   opened again through its link in /proc/self/fd. */
+static int dev_root(void) {
+    struct stat st;
+    if (stat("/dev/mqueue", &st)) return 31;
+    mode_t mode = st.st_mode & 07777;
+    uid_t uid = st.st_uid;
+    gid_t gid = st.st_gid;
+    struct timespec kept[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT}, st.st_mtim};
+    q_unlink(DEV_NAME "-root");
+    long q = q_open(DEV_NAME "-root", O_RDWR | O_CREAT, 0644, NULL);
+    if (q < 0) return 32;
+    printf("root-chmod:");
+    put("0755", TRY(chmod("/dev/mqueue", 0755)));
+    stat("/dev/mqueue", &st);
+    printf(" mode=%o", st.st_mode);
+    say("");
+    as_user("user-0755");
+    chmod("/dev/mqueue", 0711);
+    as_user("user-0711");
+    chmod("/dev/mqueue", 0700);
+    as_user("user-0700");
+    long d = TRY(open("/dev/mqueue", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    printf("root-fd:");
+    put("fchmod", TRY(fchmod((int)d, 0777)));
+    stat("/dev/mqueue", &st);
+    printf(" mode=%o", st.st_mode);
+    say("");
+    /* Without the sticky bit, another user may unlink root's queue. */
+    pid_t pid = child();
+    if (pid == 0) {
+        if (unprivileged()) _exit(90);
+        printf("unsticky:");
+        put("unlink", TRY(unlink(DEV_PATH("-root"))));
+        say("");
+        _exit(0);
+    }
+    say("unsticky: status=%d", wait_child(pid));
+    printf("root-owner:");
+    put("chown", TRY(chown("/dev/mqueue", 2000, 3000)));
+    stat("/dev/mqueue", &st);
+    printf(" uid=%d gid=%d", st.st_uid, st.st_gid);
+    put("fchown", TRY(fchown((int)d, uid, gid)));
+    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT}, {.tv_sec = 1234567, .tv_nsec = 5}};
+    put("utimensat", TRY(utimensat(AT_FDCWD, "/dev/mqueue", times, 0)));
+    put("mtime-s", stat_mtime("/dev/mqueue") / 1000000000LL);
+    put("mtime-ns", stat_mtime("/dev/mqueue") % 1000000000LL);
+    put("truncate", TRY(truncate("/dev/mqueue", 0)));
+    put("chmod-back", TRY(chmod("/dev/mqueue", mode)));
+    put("times-back", TRY(utimensat(AT_FDCWD, "/dev/mqueue", kept, 0)));
+    stat("/dev/mqueue", &st);
+    put("mode-back", (st.st_mode & 07777) == mode);
+    put("owner-back", st.st_uid == uid && st.st_gid == gid);
+    say("");
+    close((int)d);
+    close((int)q);
+
+    /* A queue opened again through its link in /proc/self/fd. */
+    q_unlink(DEV_NAME "-reopen");
+    struct mq_attr small = {.mq_maxmsg = 2, .mq_msgsize = 8};
+    q = q_open(DEV_NAME "-reopen", O_RDWR | O_CREAT, 0600, &small);
+    if (q < 0) return 33;
+    ftruncate((int)q, 100);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fd/%ld", q);
+    long again = TRY(open(path, O_RDWR | O_CLOEXEC));
+    printf("reopen:");
+    put("open", again >= 0);
+    put("send", q_send(again, "hi", 2, 1, NULL));
+    say("");
+    show_attr("reopen", again);
+    show_link("reopen", again);
+    printf("reopen:");
+    put("directory", TRY(open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)));
+    long trunc = TRY(open(path, O_RDONLY | O_TRUNC | O_CLOEXEC));
+    put("o_trunc", trunc >= 0);
+    put("size", fd_size(q));
+    close((int)trunc);
+    say("");
+    pid = child();
+    if (pid == 0) {
+        if (unprivileged()) _exit(90);
+        printf("reopen-user:");
+        put("open", TRY(open(path, O_RDONLY | O_CLOEXEC)) < 0 ? -errno : 0);
+        say("");
+        _exit(0);
+    }
+    say("reopen-user: status=%d", wait_child(pid));
+    close((int)again);
+    close((int)q);
+    q_unlink(DEV_NAME "-reopen");
     return 0;
 }
 /* The calls on a queue's path in /dev/mqueue, which change its file as
@@ -1558,7 +1703,7 @@ static int dev_paths(void) {
     put("unlinked-shrinks", base - stat_size("/dev/mqueue"));
     put("unlinked-stamped", stamped_between(stat_mtime("/dev/mqueue"), second, this_second()));
     say("");
-    return 0;
+    return dev_root();
 }
 static int dev_case(void) {
     q_unlink(DEV_NAME);

@@ -172,11 +172,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
     並びません。そこでは `open`、`stat`、`access`、`getdents`、`unlink`、`rmdir`、`statfs`、
-    `mkdir`、`mknod`、`symlink`、`link`、`rename`、キューへの `chmod`、`chown`、`utimensat`、
-    `truncate` が Linux と同じに動きます。ルートそのものを変える呼び出しは Linux と同じには
-    動きません。その中での `link` と `rename` は Landlock が確かめません。Linux では断る前に
-    確かめます。ルートの更新時刻は最初に
-    使ったときから始まります。Linux ではファイルシステムをマウントしたときです。
+    `mkdir`、`mknod`、`symlink`、`link`、`rename`、`chmod`、`chown`、`utimensat`、`truncate` が
+    Linux と同じに動きます。最初の名前空間のルートの時刻は、最初に使ったときのものです。
+    Linux では起動時にマウントしたときです。
   - `SIGEV_THREAD` のクッキーは、ソケットの受信バッファーがいっぱいでも
     届きます。Linux の `mq_notify` は先に空きを待ちます。Linux はクッキーを登録のときから
     その `truesize` でバッファーに数えますが、エミュレータの netlink ソケットはそれを

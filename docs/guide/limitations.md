@@ -198,11 +198,9 @@ verified.
     `/dev/mqueue` always shows the first IPC namespace's, and
     `/proc/self/mountinfo` does not list it. Through it, `open`, `stat`,
     `access`, `getdents`, `unlink`, `rmdir`, `statfs`, `mkdir`, `mknod`,
-    `symlink`, `link`, `rename`, and `chmod`, `chown`, `utimensat` and
-    `truncate` of a queue work as on Linux; the calls that change the root
-    itself do not do what Linux's would. Landlock does not check a `link`
-    or `rename` within it, where Linux's would before refusing it. The root's modification time starts when it is
-    first used, where Linux's is when the filesystem was mounted.
+    `symlink`, `link`, `rename`, `chmod`, `chown`, `utimensat` and
+    `truncate` work as on Linux. The first namespace's root has the time
+    of its first use, where Linux's is when it was mounted at boot.
   - A `SIGEV_THREAD` cookie goes to its socket even when the socket's
     receive buffer is full, where Linux's `mq_notify` first waits for room:
     Linux counts the cookie against that buffer from the registration on,

@@ -4497,10 +4497,7 @@ fn open_path(
                 Arc::new(crate::proc::OwnDirectory::new(crate::pty::directory_stat()))
             }
             crate::devices::Entry::Slave(None) => return Err(Errno::ENOENT),
-            crate::devices::Entry::Mqueue if flags & 3 != 0 => return Err(Errno::EISDIR),
-            crate::devices::Entry::Mqueue => Arc::new(crate::proc::OwnDirectory::new(
-                crate::mqueue::mounted_root_stat(c),
-            )),
+            crate::devices::Entry::Mqueue => crate::mqueue::MountedRoot::open(c, flags)?,
             crate::devices::Entry::Queue => {
                 let name = crate::mqueue::mounted_name(p).ok_or(Errno::ENOENT)?;
                 crate::mqueue::open_mounted(c, name, flags, mode)?
@@ -4745,6 +4742,10 @@ fn reopen(
         0o010000 if d.path.is_empty() => Ok((d.file.reopen(flags)?, Vec::new())),
         // A pidfd: another description of the same process.
         _ if d.path.is_empty() && is_pidfd => Ok((d.file.reopen(flags)?, Vec::new())),
+        // A queue `mq_open` gave: its inode, opened again.
+        _ if crate::mqueue::is_queue(&*d.file) => {
+            Ok((crate::mqueue::reopened(c, &d.file, flags)?, d.path.clone()))
+        }
         _ if d.path.is_empty() => Err(ENXIO),
         _ if generated(&d.path) => open_path(c, &d.path.clone(), flags, mode),
         _ => match current_path(c.files, &d, stat.inode) {
@@ -5169,10 +5170,23 @@ fn link_queue(
         }
         None => new_name_free(c, new_dir, new_raw, &new)?,
     }
-    if old_name.is_some() != new_name.is_some() {
+    let (Some(old_name), Some(new_name)) = (old_name, new_name) else {
         return Err(EXDEV);
-    }
+    };
+    // Landlock's check (`hook_path_link`) within the root.
+    let old_stat = crate::mqueue::mounted_stat(c, &old_name)?;
+    crate::landlock::refer_stated(
+        c,
+        (&queue_path(&old_name), &queue_path(&new_name)),
+        (&old_stat, None),
+        false,
+        0,
+    )?;
     Err(Errno::EPERM)
+}
+/// The path of the queue `name` in `/dev/mqueue`.
+fn queue_path(name: &[u8]) -> Vec<u8> {
+    [b"/dev/mqueue/".as_slice(), name].concat()
 }
 /// `rename` with a name in `/dev/mqueue`, as `do_renameat2` checks it:
 /// both directories are there, on one mount (`EXDEV`, before the names are
@@ -5204,6 +5218,16 @@ fn rename_queue(
     if flags & 1 != 0 && there {
         return Err(Errno::EEXIST);
     }
+    // Landlock's check (`hook_path_rename`) within the root.
+    let old_stat = crate::mqueue::mounted_stat(c, &old_name)?;
+    let new_stat = crate::mqueue::mounted_stat(c, &new_name).ok();
+    crate::landlock::refer_stated(
+        c,
+        (&queue_path(&old_name), &queue_path(&new_name)),
+        (&old_stat, new_stat.as_ref()),
+        true,
+        flags,
+    )?;
     if old_name == new_name {
         return Ok(0);
     }
@@ -5215,6 +5239,16 @@ fn rename_queue(
 fn reached(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {
     if let Some(target) = followed(c, p, follow)? {
         return Ok(Some(target));
+    }
+    if queue_root(p) {
+        return Ok(Some(Followed::File(Descriptor {
+            file: Arc::new(crate::mqueue::MountedRoot::new(c)),
+            path: b"/dev/mqueue".to_vec(),
+            cloexec: false,
+            opened: true,
+            listed: Arc::default(),
+            landlock: crate::landlock::FS,
+        })));
     }
     let Some(name) = queue_name(p) else {
         return Ok(None);

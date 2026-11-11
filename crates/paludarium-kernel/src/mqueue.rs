@@ -182,7 +182,6 @@ impl std::fmt::Debug for Queues {
     }
 }
 
-#[derive(Default)]
 struct Table {
     names: Mutex<BTreeMap<Vec<u8>, Arc<Queue>>>,
     count: Arc<AtomicUsize>,
@@ -193,8 +192,25 @@ struct Table {
     root: (AtomicU32, AtomicU32),
     /// When a queue was last made or unlinked in it, which stamps the root
     /// (`simple_inode_init_ts`, `simple_unlink`), in nanoseconds since the
-    /// epoch; 0 until it is first used.
+    /// epoch; when the namespace was made, or 0 until the first one's root
+    /// is first used.
     mtime: AtomicI64,
+    /// The root's permission bits: sticky and anyone's to write (01777)
+    /// until a `chmod` of `/dev/mqueue` changes them.
+    mode: AtomicU32,
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self {
+            names: Mutex::default(),
+            count: Arc::default(),
+            limits: Limits::default(),
+            root: Default::default(),
+            mtime: AtomicI64::new(0),
+            mode: AtomicU32::new(0o1777),
+        }
+    }
 }
 
 /// An IPC namespace's limits and defaults, as its `/proc/sys/fs/mqueue`
@@ -223,17 +239,22 @@ impl Default for Limits {
 
 impl Queues {
     /// Records the filesystem IDs of the thread that made the namespace,
-    /// whose `mqueue` root becomes theirs.
-    pub(crate) fn made_by(&self, uid: u32, gid: u32) {
+    /// whose `mqueue` root becomes theirs, and the time of day in
+    /// nanoseconds `at`, which stamps the root as `mqueue_fill_super` makes
+    /// it, to the second.
+    pub(crate) fn made_by(&self, uid: u32, gid: u32, at: u64) {
         self.0.root.0.store(uid, Ordering::SeqCst);
         self.0.root.1.store(gid, Ordering::SeqCst);
+        let at = i64::try_from(at).unwrap_or(i64::MAX);
+        self.0.stamp(at - at % 1_000_000_000);
     }
-    /// The `mqueue` root's owner and group.
-    pub(crate) fn root(&self) -> (u32, u32) {
-        (
-            self.0.root.0.load(Ordering::SeqCst),
-            self.0.root.1.load(Ordering::SeqCst),
-        )
+    /// The status of the namespace's `mqueue` root: a directory of the
+    /// mode `chmod` gave it, its maker's, whose size counts its entries
+    /// (`.`, `..` and each queue) and whose time is when the namespace was
+    /// made, or a queue was last made or unlinked in it.
+    fn root_stat(&self, c: &Context<'_>) -> FileStat {
+        let _ = self.0.mtime(c);
+        self.0.stat()
     }
     /// The namespace's limits.
     pub(crate) fn limits(&self) -> &Limits {
@@ -249,7 +270,22 @@ impl Table {
     fn stamp(&self, at: i64) {
         self.mtime.store(at, Ordering::SeqCst);
     }
-    /// The root's modification time, which its first use sets.
+    /// [`Queues::root_stat`] as it is now.
+    fn stat(&self) -> FileStat {
+        let entries = self.names().len() as u64 + 2;
+        FileStat {
+            inode: MOUNTED_ROOT_INODE,
+            size: entries * DIRENT_SIZE,
+            mode: 0o040_000 | self.mode.load(Ordering::SeqCst),
+            uid: self.root.0.load(Ordering::SeqCst),
+            gid: self.root.1.load(Ordering::SeqCst),
+            links: 2,
+            mtime_ns: i128::from(self.mtime.load(Ordering::SeqCst)),
+            ..FileStat::default()
+        }
+    }
+    /// The root's modification time, which its first use sets for the first
+    /// namespace, whose making paludarium does not see.
     fn mtime(&self, c: &Context<'_>) -> i64 {
         let _ = self
             .mtime
@@ -618,9 +654,7 @@ impl FileHandle for QueueFile {
     /// as `notify_change` truncates it; the access time is not kept.
     fn set_times(&self, _atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
         if let Some(mtime) = mtime {
-            let whole = mtime - mtime.rem_euclid(1_000_000_000);
-            let whole = i64::try_from(whole).unwrap_or(if whole < 0 { i64::MIN } else { i64::MAX });
-            self.queue.mtime.store(whole, Ordering::SeqCst);
+            self.queue.mtime.store(to_second(mtime), Ordering::SeqCst);
         }
         Ok(())
     }
@@ -775,6 +809,7 @@ fn open_in(
     mode: u32,
     attr: Option<(i64, i64)>,
 ) -> Result<Arc<Queue>, Errno> {
+    let root = queues.root_stat(c);
     let mut names = queues.0.names();
     if let Some(queue) = names.get(name) {
         if flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
@@ -791,6 +826,8 @@ fn open_in(
     if flags & O_CREAT == 0 {
         return Err(Errno::ENOENT);
     }
+    // `vfs_mkobj`'s `may_create`: writing and searching the root.
+    crate::permissions::permission(&c.process.credentials, &root, 3)?;
     // `vfs_mkobj` keeps the set-ID and sticky bits.
     let mode = mode & !c.files.umask() & 0o7777;
     let queue = Arc::new(create(c, queues, name, mode, attr)?);
@@ -881,12 +918,16 @@ fn mq_unlink(c: &Context<'_>, at: u64) -> Result<u64, Errno> {
 
 /// [`mq_unlink`] of `name` in `queues`.
 fn unlink_in(c: &Context<'_>, queues: &Queues, name: &[u8]) -> Result<u64, Errno> {
+    let root = queues.root_stat(c);
     let mut names = queues.0.names();
     let queue = names.get(name).ok_or(Errno::ENOENT)?;
     let credentials = &c.process.credentials;
     let stat = queue.stat();
-    if credentials.fsuid != stat.uid
-        && credentials.fsuid != queues.root().0
+    // `may_delete`: writing and searching the root, then its sticky bit.
+    crate::permissions::permission(credentials, &root, 3)?;
+    if root.mode & 0o1000 != 0
+        && credentials.fsuid != stat.uid
+        && credentials.fsuid != root.uid
         && !crate::permissions::capable(credentials, &stat, CAP_FOWNER)
     {
         return Err(Errno::EPERM);
@@ -915,24 +956,146 @@ fn mounted(c: &Context<'_>) -> Queues {
 /// its maker's, whose size counts its entries (`.`, `..` and each queue)
 /// and whose time is when a queue was last made or unlinked in it.
 pub(crate) fn mounted_root_stat(c: &Context<'_>) -> FileStat {
-    let queues = mounted(c);
-    let (uid, gid) = queues.root();
-    let entries = queues.0.names().len() as u64 + 2;
-    FileStat {
-        inode: MOUNTED_ROOT_INODE,
-        size: entries * DIRENT_SIZE,
-        mode: 0o041_777,
-        uid,
-        gid,
-        links: 2,
-        mtime_ns: i128::from(queues.0.mtime(c)),
-        ..FileStat::default()
+    mounted(c).root_stat(c)
+}
+
+/// The search of `/dev/mqueue` a lookup of a name in it makes
+/// (`may_lookup`): `EACCES` unless the caller may search the root.
+fn search_root(c: &Context<'_>) -> Result<(), Errno> {
+    let credentials = &c.process.credentials;
+    if crate::permissions::unchecked(credentials) {
+        return Ok(());
     }
+    crate::permissions::permission(credentials, &mounted_root_stat(c), 1)
+}
+
+/// `/dev/mqueue` opened: a directory whose status is the root's now, and
+/// which `fchmod`, `fchown` and `futimens` change, as `chmod`, `chown`
+/// and `utimensat` of its path do (`simple_setattr`). An open checks the
+/// root's permissions for reading (`may_open`, `EACCES`).
+pub(crate) struct MountedRoot {
+    queues: Queues,
+    position: Mutex<u64>,
+}
+
+impl MountedRoot {
+    pub(crate) fn new(c: &Context<'_>) -> Self {
+        let queues = mounted(c);
+        let _ = queues.0.mtime(c);
+        Self {
+            queues,
+            position: Mutex::new(0),
+        }
+    }
+    /// The root as an open of it with `flags` gets it.
+    pub(crate) fn open(c: &Context<'_>, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        if flags & O_ACCMODE != 0 {
+            return Err(Errno::EISDIR);
+        }
+        let root = Self::new(c);
+        crate::permissions::permission(&c.process.credentials, &root.queues.0.stat(), 4)?;
+        Ok(Arc::new(root))
+    }
+}
+
+impl FileHandle for MountedRoot {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EISDIR)
+    }
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::EBADF)
+    }
+    /// From the start or the current entry; a directory has no end to seek
+    /// from.
+    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
+        let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
+        let base = match whence {
+            0 => 0,
+            1 => *position,
+            _ => return Err(Errno::EINVAL),
+        };
+        *position = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
+        Ok(*position)
+    }
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(self.queues.0.stat())
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EISDIR)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn flags(&self) -> u32 {
+        0o200_000
+    }
+    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn set_mode(&self, mode: u32) -> Result<(), Errno> {
+        self.queues.0.mode.store(mode & 0o7777, Ordering::SeqCst);
+        Ok(())
+    }
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        if let Some(uid) = uid {
+            self.queues.0.root.0.store(uid, Ordering::SeqCst);
+        }
+        if let Some(gid) = gid {
+            self.queues.0.root.1.store(gid, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    fn set_times(&self, _atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
+        if let Some(mtime) = mtime {
+            self.queues.0.stamp(to_second(mtime));
+        }
+        Ok(())
+    }
+}
+
+/// A time in nanoseconds to the second, as `notify_change` truncates the
+/// `mqueue` filesystem's times, within an `i64`.
+fn to_second(nanos: i128) -> i64 {
+    let whole = nanos - nanos.rem_euclid(1_000_000_000);
+    i64::try_from(whole).unwrap_or(if whole < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// A new description of the queue `file` holds, as an open of its link in
+/// `/proc/self/fd` with `flags` makes one (`do_dentry_open` of the inode):
+/// `ENOTDIR` with `O_DIRECTORY`, the queue's permissions for the access
+/// mode and for writing with `O_TRUNC` (`EACCES`), which then truncates it
+/// as [`open_mounted`] does.
+pub(crate) fn reopened(
+    c: &Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    flags: u32,
+) -> Result<Arc<dyn FileHandle>, Errno> {
+    const O_DIRECTORY: u32 = 0o200_000;
+    if flags & O_DIRECTORY != 0 {
+        return Err(Errno::ENOTDIR);
+    }
+    let queue = &as_queue(file).queue;
+    let mut mask = [4, 2, 6, 6][(flags & O_ACCMODE) as usize];
+    if flags & O_TRUNC != 0 {
+        mask |= 2;
+    }
+    crate::permissions::permission(&c.process.credentials, &queue.stat(), mask)?;
+    let reopened = file.reopen(flags)?;
+    if flags & O_TRUNC != 0 {
+        queue.size.store(0, Ordering::SeqCst);
+        queue.mtime.store(now(c), Ordering::SeqCst);
+        crate::permissions::remove_set_ids(&c.process.credentials, &*reopened);
+    }
+    Ok(reopened)
 }
 const MOUNTED_ROOT_INODE: u64 = 1;
 
 /// The status of the queue `/dev/mqueue/<name>` names (`ENOENT` for none).
 pub(crate) fn mounted_stat(c: &Context<'_>, name: &[u8]) -> Result<FileStat, Errno> {
+    search_root(c)?;
     mounted(c)
         .0
         .names()
@@ -946,6 +1109,7 @@ pub(crate) fn mounted_stat(c: &Context<'_>, name: &[u8]) -> Result<FileStat, Err
 /// the file a descriptor holds: the lookup's errors, and `ENOENT` for no
 /// queue.
 pub(crate) fn mounted_file(c: &Context<'_>, name: &[u8]) -> Result<Arc<dyn FileHandle>, Errno> {
+    search_root(c)?;
     look_up(name)?;
     let queue = mounted(c)
         .0
@@ -1019,6 +1183,7 @@ pub(crate) fn open_mounted(
     mode: u32,
 ) -> Result<Arc<dyn FileHandle>, Errno> {
     const O_DIRECTORY: u32 = 0o200_000;
+    search_root(c)?;
     look_up(name)?;
     let queues = mounted(c);
     let exists = queues.0.names().contains_key(name);
@@ -1063,6 +1228,7 @@ pub(crate) fn open_mounted(
 
 /// Whether `/dev/mqueue/<name>` names a queue, after the lookup's errors.
 pub(crate) fn mounted_there(c: &Context<'_>, name: &[u8]) -> Result<bool, Errno> {
+    search_root(c)?;
     look_up(name)?;
     Ok(mounted(c).0.names().contains_key(name))
 }
@@ -1102,6 +1268,7 @@ pub(crate) fn unlink_mounted(
     directory: bool,
     landlock: impl FnOnce() -> Result<(), Errno>,
 ) -> Result<u64, Errno> {
+    search_root(c)?;
     look_up(name)?;
     let queues = mounted(c);
     if !queues.0.names().contains_key(name) {

@@ -51,6 +51,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 const O_ACCMODE: u32 = 3;
 const O_CREAT: u32 = 0o100;
 const O_EXCL: u32 = 0o200;
+const O_TRUNC: u32 = 0o1000;
 
 const EBUSY: Errno = Errno(16);
 const EINTR: Errno = Errno(4);
@@ -1007,7 +1008,10 @@ pub(crate) fn mounted_entries(
 /// there, else with `O_CREAT` a new one of the namespace's default
 /// attributes and `mode` less the umask; `EEXIST` with `O_EXCL`, `ENOENT`
 /// without `O_CREAT`, `ENOTDIR` with `O_DIRECTORY`, and the queue's
-/// permissions for the access mode (`EACCES`).
+/// permissions for the access mode (`EACCES`). `O_TRUNC` asks to write too
+/// (`build_open_flags`), and truncates a queue that was there to nothing,
+/// stamping it and dropping its set-ID bits (`handle_truncate`), whatever
+/// the access mode.
 pub(crate) fn open_mounted(
     c: &Context<'_>,
     name: &[u8],
@@ -1036,14 +1040,25 @@ pub(crate) fn open_mounted(
         flags
     };
     let queue = open_in(c, &queues, name, asked, mode & 0o7777, None)?;
-    Ok(Arc::new(QueueFile {
+    let truncates = exists && flags & O_TRUNC != 0;
+    if truncates {
+        crate::permissions::permission(&c.process.credentials, &queue.stat(), 2)?;
+    }
+    let file: Arc<dyn FileHandle> = Arc::new(QueueFile {
         queue,
         flags: AtomicU32::new(flags & (O_ACCMODE | NONBLOCK)),
         position: AtomicU64::new(0),
         space: c.pid_space(),
         mounted: b"/dev/mqueue",
         largefile: true,
-    }))
+    });
+    if truncates {
+        let queue = &as_queue(&file).queue;
+        queue.size.store(0, Ordering::SeqCst);
+        queue.mtime.store(now(c), Ordering::SeqCst);
+        crate::permissions::remove_set_ids(&c.process.credentials, &*file);
+    }
+    Ok(file)
 }
 
 /// `unlink` of `/dev/mqueue/<name>`, as [`mq_unlink`], and `rmdir`, in

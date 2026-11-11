@@ -793,7 +793,9 @@ kernel.
   calls take, with the same checks (`EACCES`), `EEXIST` with
   `O_CREAT | O_EXCL`, `ENOENT` without `O_CREAT` and `ENOTDIR` with
   `O_DIRECTORY`; `O_CREAT` makes a queue of the namespace's default
-  attributes (`mqueue_create`). Its link in `/proc/self/fd` reads
+  attributes (`mqueue_create`), and `O_TRUNC`, which needs write
+  permission whatever the access mode, empties a queue that was there and
+  stamps its modification time (`handle_truncate`). Its link in `/proc/self/fd` reads
   `/dev/mqueue/<name>`. `unlink` removes a queue as `mq_unlink` does
   (`rmdir` of one is `ENOTDIR`). A queue's path takes `chmod`, `chown`,
   `utimensat`, `utimes` and `truncate`, which change its file as its

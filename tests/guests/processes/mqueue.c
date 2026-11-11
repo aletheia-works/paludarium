@@ -1395,6 +1395,24 @@ static int dev_paths(void) {
     lseek((int)d, 0, SEEK_SET);
     put("read", TRY(read((int)d, line, sizeof line)));
     say("");
+    /* Opening it with O_TRUNC empties and stamps it, whatever the access
+       mode; making it with O_TRUNC does not. */
+    printf("o_trunc:");
+    long long sized = mtime_of(q);
+    second = next_second();
+    long t = TRY(open(ATTRS_PATH, O_RDONLY | O_TRUNC | O_CLOEXEC));
+    put("open", t >= 0);
+    put("size", stat_size(ATTRS_PATH));
+    put("stamped", stamped_between(stat_mtime(ATTRS_PATH), second, this_second()) && sized != stat_mtime(ATTRS_PATH));
+    close((int)t);
+    ftruncate((int)q, 300);
+    long made_trunc = TRY(open(ATTRS_PATH "-trunc", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600));
+    put("made", made_trunc >= 0);
+    put("made-size", stat_size(ATTRS_PATH "-trunc"));
+    put("other-kept", stat_size(ATTRS_PATH));
+    close((int)made_trunc);
+    unlink(ATTRS_PATH "-trunc");
+    say("");
 
     struct statfs fs = {0};
     long result = TRY(statfs("/dev/mqueue", &fs));
@@ -1427,6 +1445,7 @@ static int dev_paths(void) {
             put("utimensat", TRY(utimensat(AT_FDCWD, ATTRS_PATH, times, 0)));
             put("touch", TRY(utimensat(AT_FDCWD, ATTRS_PATH, NULL, 0)));
             put("truncate", TRY(truncate(ATTRS_PATH, 10)));
+            put("o_trunc", TRY(open(ATTRS_PATH, O_RDONLY | O_TRUNC | O_CLOEXEC)) >= 0 ? 0 : -errno);
             say("");
             _exit(0);
         }

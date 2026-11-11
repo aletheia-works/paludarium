@@ -705,7 +705,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルとして並びます。ファイルの `stat` は `mq_open` が作るとおりです。開くと `mq_*` の
   呼び出しが受け付ける記述子になり、確かめる内容は同じです（`EACCES`）。`O_CREAT | O_EXCL`
   では `EEXIST`、`O_CREAT` がなければ `ENOENT`、`O_DIRECTORY` では `ENOTDIR` です。
-  `O_CREAT` は名前空間の既定の属性でキューを作ります（`mqueue_create`）。`/proc/self/fd` の
+  `O_CREAT` は名前空間の既定の属性でキューを作ります（`mqueue_create`）。`O_TRUNC` は、
+  アクセスモードによらず書き込みの権限が要り、すでにあったキューのサイズを 0 にして更新時刻を
+  変えます（`handle_truncate`）。`/proc/self/fd` の
   リンクは `/dev/mqueue/<名前>` です。`unlink` は `mq_unlink` と同じくキューを消します
   （キューへの `rmdir` は `ENOTDIR`）。キューのパスへの `chmod`、`chown`、`utimensat`、
   `utimes`、`truncate` は、記述子への呼び出しと同じくそのファイルを変え、確かめる権限も

@@ -80,7 +80,6 @@
     {"name":"mqueue-sysctl","binary":"mqueue"},
     {"name":"mqueue-accounts","binary":"mqueue"},
     {"name":"mqueue-files","binary":"mqueue"},
-    {"name":"mqueue-times-diag","binary":"mqueue"},
     {"name":"pgid-exec","binary":"process"},
     {"name":"priority","binary":"process"},
     {"name":"sysinfo","binary":"process"},

@@ -352,7 +352,8 @@ pub(crate) struct Queue {
     mode: AtomicU32,
     inode: u64,
     /// When it was made, or last sent to or received from (Linux's
-    /// `simple_inode_init_ts`), in nanoseconds since the epoch.
+    /// `simple_inode_init_ts`), in nanoseconds since the epoch, to the
+    /// second.
     mtime: AtomicI64,
     state: Mutex<State>,
     /// Notified whenever a waiter is told, or the queue changes.
@@ -583,11 +584,15 @@ fn result(value: Result<u64, Errno>) -> Outcome {
     Outcome::Return(value.unwrap_or_else(Errno::to_syscall_return))
 }
 
-/// The time of day in nanoseconds, which a queue's file times are in.
+/// The time of day in nanoseconds, in whole seconds, which a queue's file
+/// times are in: the `mqueue` filesystem sets no `s_time_gran`, so Linux
+/// keeps its times to the second (`timestamp_truncate`).
 fn now(c: &Context<'_>) -> i64 {
-    c.host
+    let nanos = c
+        .host
         .clock(ClockId::Realtime)
-        .map_or(0, |nanos| i64::try_from(nanos).unwrap_or(i64::MAX))
+        .map_or(0, |nanos| i64::try_from(nanos).unwrap_or(i64::MAX));
+    nanos - nanos % 1_000_000_000
 }
 
 /// The queues of the calling thread's IPC namespace.

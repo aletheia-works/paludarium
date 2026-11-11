@@ -28,7 +28,6 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1123,9 +1122,19 @@ static int accounts_case(void) {
     return 0;
 }
 
-/* A queue's file: its modification time, which nothing but a send and a
-   receive changes, and the mqueue root, which belongs to whoever made the
+/* A queue's file: its modification time, which a send and a receive set
+   and nothing else changes, to the second, as the mqueue filesystem keeps
+   its times, and the mqueue root, which belongs to whoever made the
    IPC namespace and lets them unlink anyone's queue. */
+/* Sleeps into the next second of the realtime clock, 100 ms past its start,
+   so that what a call stamps falls in it; returns that second. */
+static long long next_second(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    pause_ms((1000000000 - now.tv_nsec) / 1000000 + 100);
+    clock_gettime(CLOCK_REALTIME, &now);
+    return now.tv_sec;
+}
 static long long mtime_of(long fd) {
     struct stat st;
     if (fstat((int)fd, &st)) return -errno;
@@ -1142,15 +1151,13 @@ static int write_text(const char *path, const char *text) {
 static int files_case(void) {
     if (isolate()) return 10;
     struct mq_attr one = {.mq_maxmsg = 1, .mq_msgsize = 8};
+    long long second = next_second();
     long q = q_open("t", O_RDWR | O_CREAT | O_NONBLOCK, 0600, &one);
     if (q < 0) return 11;
     long long made = mtime_of(q);
-    /* Whether a send or a receive moves the time is not compared: on CI,
-       Linux's coarse clock was seen to stay put across 250 ms, and the
-       emulator has no CLOCK_REALTIME_COARSE to compare it with. That part
-       rests on Linux's do_mq_timedsend and do_mq_timedreceive. */
     printf("mtime:");
-    pause_ms(250);
+    put("made-this-second", made == second * 1000000000LL);
+    next_second();
     struct mq_attr old;
     q_attr(q, NULL, &old);
     struct sigevent none = {.sigev_notify = SIGEV_NONE};
@@ -1160,18 +1167,19 @@ static int files_case(void) {
     char line[100];
     lseek((int)q, 0, SEEK_SET);
     if (read((int)q, line, sizeof line) < 0) return 12;
-    long long untouched = mtime_of(q);
-    put("attr-notify-chmod-read-keep", untouched == made);
-    pause_ms(250);
+    put("attr-notify-chmod-read-keep", mtime_of(q) == made);
+    second = next_second();
     q_send(q, "a", 1, 0, NULL);
     long long sent = mtime_of(q);
-    pause_ms(250);
+    put("send-sets-this-second", sent == second * 1000000000LL);
+    next_second();
     put("full", q_send(q, "b", 1, 0, NULL));
     put("failed-send-keeps", mtime_of(q) == sent);
-    pause_ms(250);
+    second = next_second();
     q_receive(q, 8, NULL);
+    put("receive-sets-this-second", mtime_of(q) == second * 1000000000LL);
     long long received = mtime_of(q);
-    pause_ms(250);
+    next_second();
     put("empty", q_receive(q, 8, NULL));
     put("failed-receive-keeps", mtime_of(q) == received);
     say("");
@@ -1229,50 +1237,6 @@ static int files_case(void) {
     return 0;
 }
 
-/* TEMPORARY diagnostic: the raw times around a queue's sends and receives,
-   to find out why Linux's modification time sometimes does not move. */
-static void times_line(const char *label, long fd) {
-    struct stat st;
-    struct timespec real, coarse;
-    long stated = TRY(fstat((int)fd, &st));
-    clock_gettime(CLOCK_REALTIME, &real);
-    long coarse_ok = TRY(clock_gettime(CLOCK_REALTIME_COARSE, &coarse));
-    say("%s: stat=%ld atim=%lld.%09ld mtim=%lld.%09ld ctim=%lld.%09ld real=%lld.%09ld coarse(%ld)=%lld.%09ld", label,
-        stated, (long long)st.st_atim.tv_sec, st.st_atim.tv_nsec, (long long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec,
-        (long long)st.st_ctim.tv_sec, st.st_ctim.tv_nsec, (long long)real.tv_sec, real.tv_nsec, coarse_ok,
-        (long long)coarse.tv_sec, coarse.tv_nsec);
-}
-static int times_diag_case(void) {
-    if (isolate()) return 10;
-    struct utsname u;
-    uname(&u);
-    say("kernel: %s %s", u.release, u.version);
-    struct mq_attr two = {.mq_maxmsg = 2, .mq_msgsize = 8};
-    long q = q_open("diag", O_RDWR | O_CREAT | O_NONBLOCK, 0600, &two);
-    if (q < 0) return 11;
-    times_line("made", q);
-    for (int round = 0; round < 4; round++) {
-        pause_ms(250);
-        times_line("before-send", q);
-        long sent = q_send(q, "a", 1, 0, NULL);
-        printf("send=%ld ", sent);
-        times_line("after-send", q);
-        pause_ms(250);
-        times_line("before-receive", q);
-        long got = q_receive(q, 8, NULL);
-        printf("receive=%ld ", got);
-        times_line("after-receive", q);
-    }
-    /* The same with the queue opened again, and through a second
-       descriptor. */
-    long again = q_open("diag", O_RDWR | O_NONBLOCK, 0, NULL);
-    pause_ms(250);
-    q_send(again, "b", 1, 0, NULL);
-    times_line("after-send-other-fd", q);
-    times_line("after-send-other-fd-self", again);
-    return 0;
-}
-
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -1285,6 +1249,5 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-sysctl")) return sysctl_case();
     if (!strcmp(mode, "mqueue-accounts")) return accounts_case();
     if (!strcmp(mode, "mqueue-files")) return files_case();
-    if (!strcmp(mode, "mqueue-times-diag")) return times_diag_case();
     return 3;
 }

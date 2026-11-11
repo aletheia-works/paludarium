@@ -707,6 +707,90 @@ static int case_wait(void) {
     return 0;
 }
 
+/* A descriptor's events go where its file's name is now, as Linux's dentry
+ * follows renames: of the file, of a directory above it, onto it, and
+ * RENAME_EXCHANGE; an unlinked name, with another link left, keeps it. */
+static int case_moved(void) {
+    make_base("moved");
+    int fd = inotify_init1(IN_NONBLOCK);
+    int excl = inotify_init1(IN_NONBLOCK);
+    char *src = at("src"), *dst = at("dst"), *moved = at("moved");
+    mkdir(src, 0755);
+    mkdir(dst, 0755);
+    char from[160], to[160], other[160];
+    snprintf(from, sizeof from, "%s/f", src);
+    int f = open(from, O_RDWR | O_CREAT, 0644);
+    int wd_src = inotify_add_watch(fd, src, WATCHED);
+    int wd_dst = inotify_add_watch(fd, dst, WATCHED);
+    printf("wd src=%d dst=%d\n", wd_src, wd_dst);
+    char byte = 'x';
+    snprintf(to, sizeof to, "%s/g", dst);
+    printf("rename=%ld\n", e(rename(from, to)));
+    drain(fd, "renamed");
+    long wrote = e(write(f, &byte, 1));
+    long mode = e(fchmod(f, 0600));
+    printf("write=%ld fchmod=%ld pread=%ld\n", wrote, mode, e(pread(f, &byte, 1, 0)));
+    drain(fd, "after-rename");
+    /* Its directory renamed: the file is still in it. */
+    printf("rename dir=%ld\n", e(rename(dst, moved)));
+    drain(fd, "dir-renamed");
+    printf("write=%ld\n", e(write(f, &byte, 1)));
+    drain(fd, "after-dir-rename");
+    /* Unlinked with another link left: the old name, which a watch with
+     * IN_EXCL_UNLINK leaves out. */
+    int wd_excl = inotify_add_watch(excl, moved, WATCHED | IN_EXCL_UNLINK);
+    printf("wd excl=%d\n", wd_excl);
+    snprintf(to, sizeof to, "%s/g", moved);
+    snprintf(other, sizeof other, "%s/h", moved);
+    long linked = e(link(to, other));
+    printf("link=%ld unlink=%ld\n", linked, e(unlink(to)));
+    drain(fd, "unlinked");
+    drain(excl, "unlinked-excl");
+    wrote = e(write(f, &byte, 1));
+    printf("write=%ld fchmod=%ld\n", wrote, e(fchmod(f, 0644)));
+    drain(fd, "after-unlink");
+    drain(excl, "after-unlink-excl");
+    /* A name a rename replaces, while another link keeps the file. */
+    char keep[160], over[160];
+    snprintf(keep, sizeof keep, "%s/i", moved);
+    snprintf(over, sizeof over, "%s/k", moved);
+    int h = open(other, O_RDWR);
+    touch(over);
+    linked = e(link(other, keep));
+    printf("open=%d link=%ld rename over=%ld\n", h >= 0, linked, e(rename(over, other)));
+    drain(fd, "replaced");
+    drain(excl, "replaced-excl");
+    printf("write=%ld\n", e(write(h, &byte, 1)));
+    drain(fd, "after-replace");
+    drain(excl, "after-replace-excl");
+    /* RENAME_EXCHANGE swaps two names. */
+    char x[160], y[160];
+    snprintf(x, sizeof x, "%s/x", moved);
+    snprintf(y, sizeof y, "%s/y", src);
+    int fx = open(x, O_RDWR | O_CREAT, 0644);
+    int fy = open(y, O_RDWR | O_CREAT, 0644);
+    drain(fd, "made");
+    drain(excl, "made-excl");
+    printf("exchange=%ld\n", e(syscall(SYS_renameat2, AT_FDCWD, x, AT_FDCWD, y, 2)));
+    drain(fd, "exchanged");
+    drain(excl, "exchanged-excl");
+    printf("write x=%ld\n", e(write(fx, &byte, 1)));
+    drain(fd, "after-exchange-x");
+    drain(excl, "after-exchange-x-excl");
+    printf("write y=%ld\n", e(write(fy, &byte, 1)));
+    drain(fd, "after-exchange-y");
+    drain(excl, "after-exchange-y-excl");
+    close(f);
+    close(h);
+    close(fx);
+    close(fy);
+    drain(fd, "closed");
+    drain(excl, "closed-excl");
+    close(fd);
+    close(excl);
+    remove_all();
+    return 0;
+}
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -722,6 +806,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-home")) return case_home();
     if (!strcmp(mode, "inotify-running")) return case_running();
     if (!strcmp(mode, "inotify-interpreter")) return case_interpreter();
+    if (!strcmp(mode, "inotify-moved")) return case_moved();
     if (!strcmp(mode, "inotify-runner")) return case_runner();
     return 2;
 }

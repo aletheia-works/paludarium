@@ -1557,10 +1557,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   まで参照を持ちます）。バイトを動かした `read`、`write`、`pread64`、`pwrite64`、
   `readv`、`writev`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`sendfile` と
   `copy_file_range`（入力の後に出力）、`fallocate`、毎回の `getdents` と `getdents64` は
-  `IN_ACCESS` か `IN_MODIFY` です。`IN_EXCL_UNLINK` のウォッチは、どの名前からも
-  リンクされなくなったファイルを開く・閉じる・読み書きすることを受けません。
+  `IN_ACCESS` か `IN_MODIFY` です。`IN_EXCL_UNLINK` のウォッチは、開いた後に
+  （`unlink`、`rmdir`、上書きする rename で）消えた名前を通してファイルを開く・閉じる・
+  読み書きすることを受けません。別のリンクがファイルを残していても同じです。
   `truncate`、`mknod`、プログラムの起動は何も開きません。ファイルの変更は、そのディレクトリのウォッチに
-  名前付きで先に届き、次にファイル自身のウォッチに届きます。ディレクトリのものには
+  名前付きで先に届き、次にファイル自身のウォッチに届きます（開いたファイルでは、開いたときの
+  名前を、ファイル自身や上のディレクトリの名前の変更に合わせて動かしたもの、または消える前の
+  最後の名前です）。ディレクトリのものには
   `IN_ISDIR` が付きます（`IN_DELETE_SELF` と `IN_MOVE_SELF` には Linux と同じく
   付きません）。`IN_ONESHOT` のウォッチは最初のイベントの後に `IN_IGNORED` とともに
   消えます。インスタンスはイベントを溜め、直前のイベントと同じもの（ディスクリプタ、

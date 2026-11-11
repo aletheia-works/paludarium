@@ -1769,9 +1769,13 @@ kernel.
   `readv`, `writev`, `preadv`, `pwritev`, `preadv2` or `pwritev2` that moved
   bytes, `sendfile` and `copy_file_range` (the input's, then the output's),
   `fallocate`, and each `getdents` and `getdents64`. A watch with `IN_EXCL_UNLINK` does not
-  hear of the open, close, read or write of a file no name links any more;
-  `truncate`, `mknod` and starting a program open nothing. A file's change reaches the watch of
-  its directory, with its name, before its own, and `IN_ISDIR` marks a
+  hear of the open, close, read or write of a file through a name unlinked
+  since it was opened (by `unlink`, `rmdir` or a rename onto it), even while
+  another link keeps the file; `truncate`, `mknod` and starting a program
+  open nothing. A file's change reaches the watch of
+  its directory, with its name, before its own (for an open file, the name
+  it was opened at as renames of it and of the directories above it moved
+  it, or the unlinked name it last had), and `IN_ISDIR` marks a
   directory's (not with `IN_DELETE_SELF` or `IN_MOVE_SELF`, as Linux
   leaves it out). `IN_ONESHOT` removes the watch after its first event, with
   `IN_IGNORED`. Each instance queues its events, merging one into the same

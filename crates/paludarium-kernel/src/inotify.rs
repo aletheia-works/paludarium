@@ -77,7 +77,7 @@ const MAX_WATCHES: usize = {
     }
 };
 /// `RENAME_EXCHANGE`.
-const EXCHANGE: u32 = 2;
+pub(crate) const EXCHANGE: u32 = 2;
 /// `INOTIFY_IOC_SETNEXTWD`, `_IOW('I', 0, __u32)`.
 const SETNEXTWD: u64 = 0x4004_4900;
 const FIONREAD: u64 = 0x541b;
@@ -420,12 +420,13 @@ impl Notifier {
             self.child(Some(&named), file, mask, false);
         }
     }
-    /// A change to an open file (`notify_change` of its dentry), opened at
-    /// `path` in `fs`, or with a device of its own: its directory hears of
-    /// it while `path` still names it.
+    /// A change to an open file (`notify_change` of its dentry), which is
+    /// at `path` in `fs` (unlinked from it, with the flag), or has a device
+    /// of its own: its directory hears of it while it is there, and by that
+    /// name once no name links the file.
     pub(crate) fn changed_file(
         &self,
-        place: Option<(&dyn FileSystem, &[u8])>,
+        place: Option<(&dyn FileSystem, &[u8], bool)>,
         device: u64,
         stat: &FileStat,
         mask: u32,
@@ -438,7 +439,7 @@ impl Notifier {
     /// not hear of reads and writes of a FIFO or a device.
     pub(crate) fn file_event(
         &self,
-        place: Option<(&dyn FileSystem, &[u8])>,
+        place: Option<(&dyn FileSystem, &[u8], bool)>,
         device: u64,
         stat: &FileStat,
         mask: u32,
@@ -447,7 +448,7 @@ impl Notifier {
     }
     fn of_file(
         &self,
-        place: Option<(&dyn FileSystem, &[u8])>,
+        place: Option<(&dyn FileSystem, &[u8], bool)>,
         device: u64,
         stat: &FileStat,
         mask: u32,
@@ -458,12 +459,13 @@ impl Notifier {
         }
         let file = Found::of(device, stat);
         let special = !matches!(stat.mode & 0o170000, 0o100000 | 0o040000 | 0o120000);
-        // A file no name links any more keeps the name and directory it was
-        // opened at, as its dentry stays with its parent; one that a rename
-        // or another link took elsewhere is heard of by its own watches only.
+        // An unlinked dentry keeps its name and directory, as it stays with
+        // its parent; one whose path no longer names the file (a change the
+        // host made) is heard of by its own watches only.
+        let gone = place.is_some_and(|(_, _, unlinked)| unlinked) || stat.links == 0;
         let named = place
-            .and_then(|(fs, path)| {
-                if stat.links == 0 {
+            .and_then(|(fs, path, _)| {
+                if gone {
                     Self::named(fs, path, false)
                 } else {
                     Self::named(fs, path, true)
@@ -473,7 +475,7 @@ impl Notifier {
             .filter(|_| !(content && special && mask & (ACCESS | MODIFY) != 0));
         // `fsnotify_handle_inode_event` skips either watch with
         // `IN_EXCL_UNLINK` for an unlinked dentry.
-        let unlinked = content && stat.links == 0;
+        let unlinked = content && gone;
         self.child(named.as_ref(), file, mask, unlinked);
     }
     /// The mask `set_times` reports (`fsnotify_change`): both times is

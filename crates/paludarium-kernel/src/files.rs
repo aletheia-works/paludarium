@@ -2544,14 +2544,14 @@ fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
     let Ok(d) = c.files.descriptor(fd) else {
         return;
     };
-    if d.path.is_empty() || d.file.flags() & O_PATH != 0 {
+    if d.path.is_empty() || d.file.flags() & O_PATH != 0 || d.file.notify_event(mask) {
         return;
     }
     let Ok(stat) = d.file.stat() else {
         return;
     };
     c.files.caches.notify.file_event(
-        Some((&*c.files.fs, &d.path)),
+        Some((&*c.files.fs, &d.path, false)),
         descriptor_device(c, &d),
         &stat,
         mask,

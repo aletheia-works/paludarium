@@ -314,11 +314,11 @@ verified.
 - **inotify, in part**: opening a FIFO by its path, running a program
   (which Linux reports as `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`),
   `splice` and `io_uring`'s reads and writes are no events. A change through a
-  descriptor (`fchmod`, `ftruncate`, a read, a write or a close) reaches the
-  watch of the file's directory while the path it was opened at still names
-  it, and by that name once no name links the file; a file renamed or reached
-  through another link after it was opened is heard of by its own watches
-  only, where Linux follows the rename.
+  descriptor (`fchmod`, `ftruncate`, a read, a write or a close) follows
+  renames of the file, of the directories above it and onto it, as Linux's
+  dentry does, but the symbolic links of the path it was opened at are
+  resolved only when a rename or a removal first looks at it: a link changed
+  before then sends its events to where the link leads.
   An instance cannot be used for signal-driven I/O (`FIOASYNC` gives
   `ENOTTY`, and `fcntl` leaves `O_ASYNC` off), its `/proc/self/fdinfo` entry
   does not list its watches, `/proc/sys/fs/inotify` does not exist, and

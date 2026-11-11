@@ -66,7 +66,7 @@ kernel.
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
-| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -1163,6 +1163,32 @@ kernel.
   - **Groups:** a socket has 64 groups (`EINVAL` for 0 or one past them),
     any of which anyone may join; `nlctrl`'s `notify` is group 16, which
     hears nothing, as no family comes or goes.
+- A socket-diagnostics netlink socket (protocol `NETLINK_SOCK_DIAG`)
+  tells of the AF_UNIX sockets of the network namespace it was made in, as
+  Linux's `sock_diag` and `unix_diag` do, so `ss -x` lists them.
+  - **Requests:** `SOCK_DIAG_BY_FAMILY` for AF_UNIX dumps the sockets
+    whose state (`TCP_ESTABLISHED`, `TCP_CLOSE` or `TCP_LISTEN`) is in
+    `udiag_states`, its `NLMSG_DONE` at the next receive, or with no dump
+    answers for the socket of inode `udiag_ino` (`EINVAL` for 0, `ENOENT`
+    for none) whose cookie matches (`ESTALE` for another; all ones match
+    any). A connection a listener has not accepted has no inode yet, and
+    is not listed. Another family has no handler (`ENOENT`), a family
+    past `AF_MAX` or a request too short is `EINVAL`, `SOCK_DESTROY` is
+    `EOPNOTSUPP`, and so is `TCPDIAG_GETSOCK`; any other type is `EINVAL`.
+    A second dump while one runs is `EBUSY`.
+  - **What it tells:** each socket's type, state, inode and cookie, then
+    as `udiag_show` asks, in `sk_diag_fill`'s order: its name, its socket
+    file's inode and device, its peer's inode (0 once the peer has closed
+    or while it waits to be accepted), a listener's waiting clients, its
+    queues (what waits to be read and what it sent that waits, or a
+    listener's waiting connections and backlog), its memory (`SO_RCVBUF`,
+    `SO_SNDBUF` and what it sent that waits), then always its shutdown
+    (a stream or packet socket's shows what its peer shut down too, and
+    both once the peer has closed), and its owner as the user namespace of
+    whoever made the netlink socket shows it. A datagram socket another
+    connects to is `TCP_ESTABLISHED`, as on Linux.
+  - **Groups:** a socket has its four groups, which anyone may join, and
+    which hear nothing.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,

@@ -292,8 +292,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   名前空間に届く `veth` の組もありません）、インターフェースのリクエストと netlink は
   `IFF_UP` のほかのフラグを変えません。最初の名前空間でも `lo` しか見えません。
   Linux ではホストのインターフェースが見えます。
-  netlink には `NETLINK_ROUTE` と `NETLINK_GENERIC` しかありません（ほかは
-  `EPROTONOSUPPORT`）。汎用 netlink のファミリーは `nlctrl` だけで、Linux ではホストの
+  netlink には `NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC` しかありません
+  （ほかは `EPROTONOSUPPORT`）。ソケット診断が伝えるのは AF_UNIX のソケットだけです。
+  AF_INET と AF_INET6（`ss -t` と `ss -u` が求める `inet_diag`）、AF_NETLINK、AF_PACKET には
+  ハンドラーがなく（`ENOENT`）、`TCPDIAG_GETSOCK` は `EOPNOTSUPP` です。AF_UNIX の
+  ダンプは古いものから順に挙げます。Linux の順はハッシュ表に従います。送って待っている
+  ものは、ここで送信バッファーに数える量で数えます。Linux はバッファーの本当の大きさで
+  数えます。汎用 netlink のファミリーは `nlctrl` だけで、Linux ではホストの
   カーネルとモジュールのもの（`ethtool`、`nl80211`、`devlink` など）があります。そのため
   それらを引くと `ENOENT` で、それらがグループをいくつ使っても、ソケットのグループは 64 です。
   `NETLINK_ROUTE` にあるのはリンク、アドレス、経路のリクエストだけです。近隣、ルール、キューイング規律などは

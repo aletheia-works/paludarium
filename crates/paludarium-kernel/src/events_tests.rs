@@ -3679,6 +3679,66 @@ fn netlink_replies(f: &mut Fixture, fd: u64) -> Vec<(u16, u16, u32, u32, Vec<u8>
     }
 }
 #[test]
+fn sock_diag_lists_the_namespaces_unix_sockets() {
+    let mut f = Fixture::new();
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    let fd = f.ret(41, [16, 3, 4, 0, 0, 0]);
+    assert!(fd < 1024);
+    // A stream pair, then a datagram socket connected to an abstract one.
+    assert_eq!(f.ret(53, [1, 1, 0, DATA + 0x800, 0, 0]), 0);
+    let pair = [read_u32(&f, DATA + 0x800), read_u32(&f, DATA + 0x804)];
+    let target = f.ret(41, [1, 2, 0, 0, 0, 0]);
+    let sender = f.ret(41, [1, 2, 0, 0, 0, 0]);
+    let mut name = 1u16.to_le_bytes().to_vec();
+    name.extend_from_slice(b"\0diag");
+    f.mem.write(GuestAddr(DATA + 0x900), &name).unwrap();
+    assert_eq!(f.ret(49, [target, DATA + 0x900, 7, 0, 0, 0]), 0);
+    assert_eq!(f.ret(42, [sender, DATA + 0x900, 7, 0, 0, 0]), 0);
+    // A dump of every state, with the peers and names.
+    let mut request = [0u8; 24];
+    request[0] = 1;
+    request[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    request[12..16].copy_from_slice(&0x5u32.to_le_bytes());
+    let len = netlink_request(&f, DATA, 20, 0x301, 7, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies.len(), 5);
+    assert_eq!(replies[4].0, 3);
+    // Each is a unix_diag_msg: the pair established, the datagram sockets
+    // both established, as `unix_dgram_connect` sets them.
+    let states: Vec<_> = replies[..4]
+        .iter()
+        .map(|r| (r.0, r.4[0], r.4[1], r.4[2]))
+        .collect();
+    assert_eq!(
+        states,
+        vec![(20, 1, 1, 1), (20, 1, 1, 1), (20, 1, 2, 1), (20, 1, 2, 1)]
+    );
+    let _ = (pair, sender);
+    // Only listeners: none, so NLMSG_DONE alone.
+    request[4..8].copy_from_slice(&(1u32 << 10).to_le_bytes());
+    let len = netlink_request(&f, DATA, 20, 0x301, 8, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!((replies.len(), replies[0].0), (1, 3));
+    // Another family has no handler; an inode of none is ENOENT.
+    let mut inet = request;
+    inet[0] = 2;
+    let len = netlink_request(&f, DATA, 20, 0x301, 9, &inet);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(
+        &netlink_replies(&mut f, fd)[0].4[..4],
+        &(-2i32).to_le_bytes()
+    );
+    request[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    let len = netlink_request(&f, DATA, 20, 0x1, 10, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(
+        &netlink_replies(&mut f, fd)[0].4[..4],
+        &(-2i32).to_le_bytes()
+    );
+}
+#[test]
 fn generic_netlink_has_its_controller_alone() {
     let mut f = Fixture::new();
     assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);

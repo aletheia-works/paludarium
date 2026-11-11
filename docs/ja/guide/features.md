@@ -58,7 +58,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
-| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE` と `NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -1022,6 +1022,27 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - **グループ:** ソケットのグループは 64 で（0 とそれを超えるものは `EINVAL`）、誰でも
     入れます。`nlctrl` の `notify` はグループ 16 で、ファミリーが増えも減りもしないので
     何も届きません。
+- ソケット診断の netlink ソケット（プロトコル `NETLINK_SOCK_DIAG`）は、Linux の
+  `sock_diag` と `unix_diag` と同じく、作られたネットワーク名前空間の AF_UNIX のソケットを
+  伝えます。そのため `ss -x` はそれらを挙げます。
+  - **リクエスト:** AF_UNIX への `SOCK_DIAG_BY_FAMILY` は、状態（`TCP_ESTABLISHED`、
+    `TCP_CLOSE`、`TCP_LISTEN`）が `udiag_states` にあるソケットをダンプし、`NLMSG_DONE` を
+    次の受信で返します。ダンプでなければ、inode が `udiag_ino` で（0 は `EINVAL`、ない
+    ものは `ENOENT`）、cookie が合う（違えば `ESTALE`、すべて 1 ならどれにも合います）
+    ソケットに答えます。リスナーがまだ accept していない接続は inode をまだ持たないので
+    挙げません。ほかのファミリーにはハンドラーがなく（`ENOENT`）、`AF_MAX` を超える
+    ファミリーや短すぎるリクエストは `EINVAL`、`SOCK_DESTROY` と `TCPDIAG_GETSOCK` は
+    `EOPNOTSUPP`、ほかの型は `EINVAL` です。ダンプの途中のもう 1 つのダンプは `EBUSY` です。
+  - **伝えること:** ソケットごとに、型、状態、inode、cookie を、それから `udiag_show` が
+    求めるものを `sk_diag_fill` の順に伝えます。名前、ソケットファイルの inode とデバイス、
+    peer の inode（peer が閉じたあとと、accept を待つあいだは 0）、リスナーを待つ
+    クライアント、キュー（読まれるのを待つものと送って待っているもの、リスナーなら待つ
+    接続とバックログ）、メモリ（`SO_RCVBUF`、`SO_SNDBUF`、送って待っているもの）です。
+    そのあとに shutdown を必ず伝えます（ストリームとパケットのソケットでは peer が逆向きに
+    閉じたものも含み、peer が閉じたあとは両方）。最後に、所有者を、netlink ソケットを
+    作った側のユーザー名前空間での値で伝えます。ほかのソケットが connect した
+    データグラムのソケットは、Linux と同じく `TCP_ESTABLISHED` です。
+  - **グループ:** ソケットは 4 つのグループを持ち、誰でも入れますが、何も届きません。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、

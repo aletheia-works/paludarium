@@ -1308,28 +1308,6 @@ pub(crate) fn may_change_root(c: &Context<'_>) -> Result<(), Errno> {
     crate::permissions::permission(&c.process.credentials, &mounted_root_stat(c), 3)
 }
 
-/// `may_linkat` on a queue a `link` would link, as Linux checks it before
-/// `vfs_link` with `fs.protected_hardlinks` set, as it is by default: one
-/// whose owner the caller is not (nor has `CAP_FOWNER` over) is `EPERM`
-/// unless it is safe to pin, a file neither set-user-ID nor executable
-/// set-group-ID that the caller may read and write.
-pub(crate) fn may_link(c: &Context<'_>, stat: &FileStat) -> Result<(), Errno> {
-    const S_ISUID: u32 = 0o4000;
-    const S_ISGID: u32 = 0o2000;
-    let credentials = &c.process.credentials;
-    let safe = stat.mode & S_ISUID == 0
-        && stat.mode & (S_ISGID | 0o010) != S_ISGID | 0o010
-        && crate::permissions::permission(credentials, stat, 6).is_ok();
-    if safe
-        || credentials.fsuid == stat.uid
-        || crate::permissions::capable(credentials, stat, CAP_FOWNER)
-    {
-        Ok(())
-    } else {
-        Err(Errno::EPERM)
-    }
-}
-
 /// `unlink` of `/dev/mqueue/<name>`, as [`mq_unlink`], and `rmdir`, in
 /// the order of Linux's `do_unlinkat` and `do_rmdir`: the lookup
 /// (`ENAMETOOLONG`, `ENOENT`), then `landlock`'s check of the removal

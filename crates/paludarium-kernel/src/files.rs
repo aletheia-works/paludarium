@@ -1124,7 +1124,6 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
             if name.is_none() || queue_name(&d.path).is_none() {
                 return Err(EXDEV);
             }
-            crate::mqueue::may_link(c, &d.file.stat()?)?;
             crate::mqueue::may_change_root(c)?;
             return Err(Errno::EPERM);
         }
@@ -5177,10 +5176,8 @@ fn link_queue(
     let (Some(old_name), Some(new_name)) = (old_name, new_name) else {
         return Err(EXDEV);
     };
-    // `may_linkat`, then Landlock's check (`hook_path_link`) within the
-    // root.
+    // Landlock's check (`hook_path_link`) within the root.
     let old_stat = crate::mqueue::mounted_stat(c, &old_name)?;
-    crate::mqueue::may_link(c, &old_stat)?;
     crate::landlock::refer_stated(
         c,
         (&queue_path(&old_name), &queue_path(&new_name)),

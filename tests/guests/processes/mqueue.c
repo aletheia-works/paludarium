@@ -1439,8 +1439,7 @@ static void as_user(const char *label) {
         put("mkdir", TRY(mkdir(DEV_PATH("-theirs3"), 0700)));
         put("symlink", TRY(symlink("target", DEV_PATH("-theirs3"))));
         put("fifo", TRY(mknod(DEV_PATH("-theirs3"), S_IFIFO | 0600, 0)));
-        put("link", TRY(link(DEV_PATH("-root"), DEV_PATH("-theirs3"))));
-        put("link-shared", TRY(link(DEV_PATH("-shared"), DEV_PATH("-theirs3"))));
+        put("link", TRY(link(DEV_PATH("-shared"), DEV_PATH("-theirs3"))));
         put("rename", TRY(rename(DEV_PATH("-root"), DEV_PATH("-theirs3"))));
         put("rename-itself", TRY(rename(DEV_PATH("-root"), DEV_PATH("-root"))));
         say("");
@@ -1467,8 +1466,8 @@ static int dev_root(void) {
     q_unlink(DEV_NAME "-root");
     long q = q_open(DEV_NAME "-root", O_RDWR | O_CREAT, 0644, NULL);
     if (q < 0) return 32;
-    /* One anyone may read and write, which protected_hardlinks lets
-       another user link, so that link then fails on the root. */
+    /* One anyone may read and write, which another user may link
+       whatever fs.protected_hardlinks is, so that link fails on the root. */
     q_unlink(DEV_NAME "-shared");
     long shared = q_open(DEV_NAME "-shared", O_RDWR | O_CREAT, 0600, NULL);
     if (shared < 0 || fchmod((int)shared, 0666)) return 34;

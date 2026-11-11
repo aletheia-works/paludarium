@@ -1144,8 +1144,9 @@ static int files_case(void) {
     long q = q_open("t", O_RDWR | O_CREAT | O_NONBLOCK, 0600, &one);
     if (q < 0) return 11;
     long long made = mtime_of(q);
+    /* 250 ms apart, which a coarse clock's ticks are well within. */
     printf("mtime:");
-    pause_ms(30);
+    pause_ms(250);
     struct mq_attr old;
     q_attr(q, NULL, &old);
     struct sigevent none = {.sigev_notify = SIGEV_NONE};
@@ -1157,18 +1158,19 @@ static int files_case(void) {
     if (read((int)q, line, sizeof line) < 0) return 12;
     long long untouched = mtime_of(q);
     put("attr-notify-chmod-read-keep", untouched == made);
-    pause_ms(30);
+    pause_ms(250);
     q_send(q, "a", 1, 0, NULL);
     long long sent = mtime_of(q);
-    put("send-sets", sent > untouched);
-    pause_ms(30);
+    /* How it moved, as -1, 0 or 1, so a clock too coarse to tell shows. */
+    put("send-moves", (sent > untouched) - (sent < untouched));
+    pause_ms(250);
     put("full", q_send(q, "b", 1, 0, NULL));
     put("failed-send-keeps", mtime_of(q) == sent);
-    pause_ms(30);
+    pause_ms(250);
     q_receive(q, 8, NULL);
     long long received = mtime_of(q);
-    put("receive-sets", received > sent);
-    pause_ms(30);
+    put("receive-moves", (received > sent) - (received < sent));
+    pause_ms(250);
     put("empty", q_receive(q, 8, NULL));
     put("failed-receive-keeps", mtime_of(q) == received);
     say("");

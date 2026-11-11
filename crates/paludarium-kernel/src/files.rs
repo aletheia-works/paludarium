@@ -1946,41 +1946,26 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     Ok(count as u64)
 }
 
-/// `writev(fd, iov, count)`, and `pwritev2` at the file position.
+/// `writev(fd, iov, count)`, and `pwritev2` at the file position, as
+/// Linux's `vfs_writev`: the descriptor and its access mode (EBADF), the
+/// vector (see [`iovecs`]), nothing to do for no bytes, then the flags.
 fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
-    if a[2] > 1024 {
-        return Err(Errno::EINVAL);
+    let file = c.files.descriptor(a[0])?.file;
+    if file.flags() & 3 == 0 {
+        return Err(Errno::EBADF);
     }
-    let descriptor = c.files.descriptor(a[0])?;
+    let segments = iovecs(c, a[1], a[2], false)?;
+    let total = segments.iter().map(|(_, length)| length).sum::<usize>();
     let mut bytes = Vec::new();
-    for index in 0..a[2] {
-        let addr = a[1].checked_add(index * 16).ok_or(Errno::EFAULT)?;
-        let base = c.mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
-        let length = c
-            .mem
-            .read_u64(GuestAddr(addr + 8))
-            .map_err(|_| Errno::EFAULT)?;
-        let length = usize::try_from(length).map_err(|_| Errno::EINVAL)?;
-        let total = bytes
-            .len()
-            .checked_add(length)
-            .filter(|v| *v <= 0x7fff_f000)
-            .ok_or(Errno::EINVAL)?;
-        c.mem
-            .check_read(GuestAddr(base), length)
-            .map_err(|_| Errno::EFAULT)?;
-        bytes.try_reserve(length).map_err(|_| Errno::ENOMEM)?;
+    bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
+    for &(base, length) in &segments {
         let start = bytes.len();
-        bytes.resize(total, 0);
+        bytes.resize(start + length, 0);
         c.mem
             .read(GuestAddr(base), &mut bytes[start..])
             .map_err(|_| Errno::EFAULT)?;
     }
-    let file = descriptor.file;
     if bytes.is_empty() && flags != 0 {
-        if file.flags() & 3 == 0 {
-            return Err(Errno::EBADF);
-        }
         return Ok(0);
     }
     let flags = rw_flags(&file, flags, true)?;

@@ -279,9 +279,16 @@ impl Notifier {
     /// description `held` says is open is closed ([`Self::last_closed`]).
     fn removed(&self, file: Found, held: &dyn Fn(Key) -> bool) {
         if held(file.key) {
-            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            if pending.insert(file.key) {
-                self.waiting.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                if pending.insert(file.key) {
+                    self.waiting.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            // A last close between the look and the insert saw nothing
+            // waiting: looking again after it ends the file now.
+            if !held(file.key) {
+                self.last_closed(file.key);
             }
             return;
         }

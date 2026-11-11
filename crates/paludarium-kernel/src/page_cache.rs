@@ -46,9 +46,10 @@ pub(crate) struct PageCaches {
     opens: Mutex<HashMap<usize, Open>>,
 }
 
-/// An open description in [`PageCaches`]' list: its file's handle, and
-/// where its device comes from.
-type Open = (Weak<dyn FileHandle>, Device);
+/// An open description in [`PageCaches`]' list: its file's handle, where
+/// its device comes from, and its file's key once a look found it, which
+/// its close uses even if the file cannot be looked at then.
+type Open = (Weak<dyn FileHandle>, Device, OnceLock<Key>);
 
 /// One count of [`PageCaches`]' `writes`, given back when dropped: write
 /// access a description holds (Linux's `get_write_access`), or the denial
@@ -79,10 +80,14 @@ impl PageCaches {
     /// Whether a description of file `key` is open.
     fn held(&self, key: Key) -> bool {
         let opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
-        opens.values().any(|(file, device)| {
-            file.upgrade()
-                .and_then(|file| file.stat().ok())
-                .is_some_and(|stat| (device.number(), stat.inode) == key)
+        opens.values().any(|(file, device, found)| {
+            if let Some(&known) = found.get() {
+                return known == key;
+            }
+            let Some(stat) = file.upgrade().and_then(|file| file.stat().ok()) else {
+                return false;
+            };
+            *found.get_or_init(|| (device.number(), stat.inode)) == key
         })
     }
     /// The cache of `key`, made now, with the file's `size`, if the file has
@@ -459,14 +464,17 @@ impl Drop for CoherentFile {
             .opens
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id)
-            .is_some();
-        if listed
+            .remove(&id);
+        if let Some((_, _, found)) = listed
             && caches.notify.waiting()
-            && let Ok(stat) = self.inner.stat()
         {
-            let key = (self.device.number(), stat.inode);
-            if !caches.held(key) {
+            let key = found.get().copied().or_else(|| {
+                let stat = self.inner.stat().ok()?;
+                Some((self.device.number(), stat.inode))
+            });
+            if let Some(key) = key
+                && !caches.held(key)
+            {
                 caches.notify.last_closed(key);
             }
         }
@@ -528,7 +536,14 @@ impl CoherentFile {
             .opens
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, (Arc::downgrade(&self.inner), self.device.copy()));
+            .insert(
+                id,
+                (
+                    Arc::downgrade(&self.inner),
+                    self.device.copy(),
+                    OnceLock::new(),
+                ),
+            );
         if flags & O_PATH == 0 && crate::inotify::reported_open() {
             self.opened = Some(flags & 3 != 0);
             self.event(crate::inotify::OPEN);

@@ -4,6 +4,9 @@ description: >-
   Guests are compared on an emulator without AVX, but Ubuntu's public cloud
   images from 26.04 on take amd64v3 packages: gcc then defaults to
   -march=x86-64-v3, and musl's libc.a and glibc are built for it too.
+  The packages and apt's lists are kept in the Actions cache for each runner
+  image, so a job whose image has been seen before installs without the
+  network.
 
 inputs:
   packages:
@@ -13,24 +16,91 @@ inputs:
 runs:
   using: composite
   steps:
+    - id: key
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        ACTION: ${{ github.action_path }}/action.yml
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        # A new runner image may install other versions, and reinstalling the toolchain from
+        # an older image's files would downgrade it, so each image gets its own entry.
+        digest="$( (echo "$PACKAGES"; cat "$ACTION") | sha256sum | cut -c1-16)"
+        echo "key=guest-toolchain-${ImageOS:-}-${ImageVersion:-}-$RUNNER_ARCH-$digest" >> "$GITHUB_OUTPUT"
+        echo "dir=$RUNNER_TEMP/guest-toolchain-apt" >> "$GITHUB_OUTPUT"
+        # Every branch reads what the default branch saved, but what a pull request saves only
+        # that pull request reads, and each would take room the Rust caches need.
+        if [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+          echo "save=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+
     - shell: bash
       env:
         PACKAGES: ${{ inputs.packages }}
         DEBIAN_FRONTEND: noninteractive
         NEEDRESTART_SUSPEND: "1"
+        CACHED: ${{ steps.restore.outputs.cache-hit }}
+        SAVE: ${{ steps.restore.outputs.cache-hit != 'true' && steps.key.outputs.save == 'true' }}
+        CACHE_DIR: ${{ steps.key.outputs.dir }}
       run: |
+        shopt -s nullglob
+        mirrors=/etc/apt/apt-mirrors.txt
+        archives=/var/cache/apt/archives
+        lists=/var/lib/apt/lists
+        # From the cache, apt finds every file it needs on disk: it neither updates its lists
+        # nor downloads. If something is missing anyway, it stops before installing anything,
+        # and the job takes the network as if nothing was cached.
+        offline=
+        if [ "$CACHED" = true ]; then
+          debs=("$CACHE_DIR"/archives/*.deb)
+          if [ "${#debs[@]}" -gt 0 ]; then
+            sudo cp "${debs[@]}" "$archives"/
+          fi
+          sudo rm -rf "$lists"
+          sudo cp -r "$CACHE_DIR/lists" "$lists"
+          sudo chown -R root:root "$lists"
+          offline=1
+        fi
+        # All the mirrors a runner lists are under ubuntu.com, and the runners' DNS has failed
+        # for that domain alone while it resolved others (2026-11-11). apt tries the mirrors in
+        # order of priority, so mirrors under other domains come last.
+        if [ -f "$mirrors" ]; then
+          for mirror in https://mirrors.edge.kernel.org/ubuntu/ https://mirror.math.princeton.edu/pub/ubuntu/; do
+            if ! grep -qF "$mirror" "$mirrors"; then
+              printf '%s\tpriority:9\n' "$mirror" | sudo tee -a "$mirrors" > /dev/null
+            fi
+          done
+        fi
+        update() {
+          if [ -z "$offline" ]; then
+            sudo apt-get update
+          fi
+        }
         # The Azure mirror sometimes serves one job at 40 kB/s while another job of the same run
         # gets 45 MB/s from it, and apt stays on it until the job times out. So bound the download
         # (not the install: stopping dpkg would leave packages half installed) and fall back to
         # the other mirrors. Each attempt goes on from the files the previous one left, and all
         # downloads share one deadline, which leaves line coverage the time it needs.
-        mirrors=/etc/apt/apt-mirrors.txt
         deadline=$((SECONDS + 720))
         download() {
           local limit
           # apt exits 100 for a misspelled package and for a failed fetch alike. This needs no
           # network, so what no retry can fix fails here at once.
           apt-get install --simulate --no-install-recommends "$@" > /dev/null || return
+          if [ -n "$offline" ]; then
+            if sudo apt-get install -y --no-install-recommends --download-only --no-download "$@"; then
+              return 0
+            fi
+            echo "the cached packages are not enough; using the network" >&2
+            offline=
+            sudo apt-get update
+          fi
           while true; do
             limit=$((deadline - SECONDS))
             if [ "$limit" -le 0 ]; then
@@ -57,7 +127,7 @@ runs:
         variant=/etc/apt/apt.conf.d/90arch-variant
         if [ -f "$variant" ]; then
           sudo rm -f "$variant"
-          sudo apt-get update
+          update
           version="$(gcc -dumpversion)"
           toolchain=(
             --reinstall --allow-downgrades
@@ -69,7 +139,7 @@ runs:
           download "${toolchain[@]}"
           sudo -E apt-get install -y --no-install-recommends "${toolchain[@]}"
         fi
-        sudo apt-get update
+        update
         # shellcheck disable=SC2086 # the packages are separate words
         download $PACKAGES
         # shellcheck disable=SC2086 # the packages are separate words
@@ -89,3 +159,23 @@ runs:
           fi
           rm -rf "$scratch"
         fi
+        # Keep what this job used for the next job on the same image. The toolchain's files
+        # came before the last update, so they still match the lists only if that update
+        # changed nothing for them; when it did, the next job finds a file missing and takes
+        # the network.
+        if [ "$SAVE" = true ]; then
+          mkdir -p "$CACHE_DIR/archives"
+          debs=("$archives"/*.deb)
+          if [ "${#debs[@]}" -gt 0 ]; then
+            cp "${debs[@]}" "$CACHE_DIR/archives/"
+          fi
+          sudo cp -r "$lists" "$CACHE_DIR/lists"
+          sudo rm -rf "$CACHE_DIR/lists/partial" "$CACHE_DIR/lists/lock"
+          sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
+        fi
+
+    - if: steps.restore.outputs.cache-hit != 'true' && steps.key.outputs.save == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}

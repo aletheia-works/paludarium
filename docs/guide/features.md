@@ -229,7 +229,9 @@ kernel.
   timeout argument, as Linux reads it) to `uaddr2`'s queue, giving how many
   it took. Negative counts give `EINVAL`, and `CMP_REQUEUE` gives `EAGAIN`
   when the first word is not `val3`, after both words' checks. It takes the
-  waiters in the order they came, whatever their bitsets.
+  waiters in the order they came, whatever their bitsets. Onto its own word,
+  a requeue leaves them where they are and counts each once, as Linux does
+  within one hash bucket.
 - The futex2 calls take 32-bit words with `FUTEX2_PRIVATE`, `FUTEX2_NUMA`
   and `FUTEX2_MPOL`, checked in Linux's order. Other sizes and flags give
   `EINVAL`. `futex_wake` and `futex_wait` are `FUTEX_WAKE_BITSET` and

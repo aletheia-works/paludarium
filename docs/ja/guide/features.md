@@ -205,7 +205,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   起こし、さらに最大 `val2` 個（Linux と同じくタイムアウトの引数から読みます）を `uaddr2` の
   キューに移して、扱った数を返します。負の数は `EINVAL` です。`CMP_REQUEUE` は、両方のワードを
   確かめた後で、1 つめのワードが `val3` でなければ `EAGAIN` を返します。待ち手はビットセットに
-  かかわらず、来た順に扱います。
+  かかわらず、来た順に扱います。同じワードへの requeue は、Linux が 1 つのハッシュバケットの中で
+  そうするのと同じく、待ち手を動かさず、それぞれ 1 回だけ数えます。
 - futex2 の呼び出しは、32 ビットのワードと `FUTEX2_PRIVATE`・`FUTEX2_NUMA`・`FUTEX2_MPOL` を
   Linux と同じ順に確かめて受け付けます。ほかの大きさやフラグは `EINVAL` です。`futex_wake` と
   `futex_wait` は、`FUTEX_WAKE_BITSET` と `FUTEX_WAIT_BITSET` に、`CLOCK_REALTIME` か

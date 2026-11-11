@@ -1281,6 +1281,8 @@ static int dev_case(void) {
     put("missing", TRY(open("/dev/mqueue/" DEV_NAME "-none", O_RDONLY)));
     put("directory", TRY(open("/dev/mqueue/" DEV_NAME, O_RDONLY | O_DIRECTORY)));
     put("dir-write", TRY(open("/dev/mqueue", O_WRONLY)));
+    put("access", TRY(access("/dev/mqueue/" DEV_NAME, R_OK | W_OK)));
+    put("access-missing", TRY(access("/dev/mqueue/" DEV_NAME "-none", F_OK)));
     say("");
     /* A queue made through it has the namespace's default attributes. */
     umask(022);
@@ -1311,6 +1313,8 @@ static int dev_case(void) {
     put("again", TRY(unlink("/dev/mqueue/" DEV_NAME "-made")));
     put("mq_open-after", q_open(DEV_NAME "-made", O_RDONLY, 0, NULL));
     put("rmdir", TRY(rmdir("/dev/mqueue/" DEV_NAME)));
+    put("rmdir-missing", TRY(rmdir("/dev/mqueue/" DEV_NAME "-none")));
+    put("unlink-missing", TRY(unlink("/dev/mqueue/" DEV_NAME "-none")));
     put("queue", TRY(unlink("/dev/mqueue/" DEV_NAME)));
     put("listed-after", listed_type(DEV_NAME));
     say("");

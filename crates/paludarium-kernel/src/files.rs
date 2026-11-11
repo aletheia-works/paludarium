@@ -3053,7 +3053,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 .as_deref()
                 .and_then(crate::mqueue::mounted_name)
             {
-                return crate::mqueue::unlink_mounted(c, name, dir);
+                let request = if dir {
+                    crate::landlock::REMOVE_DIR
+                } else {
+                    crate::landlock::REMOVE_FILE
+                };
+                return crate::mqueue::unlink_mounted(c, name, dir, || {
+                    landlock_name(c, &p, request)
+                });
             }
             crate::permissions::delete(c.files, &c.process.credentials, at_dir, &raw)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_some()) {

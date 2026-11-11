@@ -196,13 +196,15 @@ verified.
     they began only while each one's message fits.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
-    `/proc/self/mountinfo` does not list it. Through it, only `open`,
-    `stat`, `getdents` and `unlink` work; `chmod`, `chown`, `rename`,
-    `link` and `mkdir` there do not do what Linux's would. A `SIGEV_THREAD` cookie goes to its socket even when
-    the socket's receive buffer is full, where Linux's `mq_notify` first
-    waits for room: Linux counts the cookie against that buffer from the
-    registration on, by its `truesize`, which the emulator's netlink
-    sockets do not keep.
+    `/proc/self/mountinfo` does not list it. Through it, `open`, `stat`,
+    `access`, `getdents`, `unlink` and `rmdir` work as on Linux; the other
+    calls on its paths (`chmod`, `chown`, `utimensat`, `truncate`,
+    `statfs`, `rename`, `link`, `mkdir` and the like) do not do what
+    Linux's would.
+  - A `SIGEV_THREAD` cookie goes to its socket even when the socket's
+    receive buffer is full, where Linux's `mq_notify` first waits for room:
+    Linux counts the cookie against that buffer from the registration on,
+    by its `truesize`, which the emulator's netlink sockets do not keep.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
     where Linux checks the writer again at each write, and it reports its
     value's length as its size, where Linux reports 0.

@@ -932,14 +932,27 @@ pub(crate) fn open_mounted(
     }))
 }
 
-/// `unlink` of `/dev/mqueue/<name>`, as [`mq_unlink`]; `rmdir` of one is
-/// `ENOTDIR`.
-pub(crate) fn unlink_mounted(c: &Context<'_>, name: &[u8], directory: bool) -> Result<u64, Errno> {
+/// `unlink` of `/dev/mqueue/<name>`, as [`mq_unlink`], and `rmdir`, in
+/// the order of Linux's `do_unlinkat` and `do_rmdir`: the lookup
+/// (`ENAMETOOLONG`, `ENOENT`), then `landlock`'s check of the removal
+/// (`security_path_unlink`), then `ENOTDIR` for `rmdir` of a queue, or
+/// `mq_unlink`'s sticky check.
+pub(crate) fn unlink_mounted(
+    c: &Context<'_>,
+    name: &[u8],
+    directory: bool,
+    landlock: impl FnOnce() -> Result<(), Errno>,
+) -> Result<u64, Errno> {
+    look_up(name)?;
+    let queues = mounted(c);
+    if !queues.0.names().contains_key(name) {
+        return Err(Errno::ENOENT);
+    }
+    landlock()?;
     if directory {
         return Err(Errno::ENOTDIR);
     }
-    look_up(name)?;
-    unlink_in(c, &mounted(c), name)
+    unlink_in(c, &queues, name)
 }
 
 /// A `struct timespec` timeout at `at`, none for a null one, as

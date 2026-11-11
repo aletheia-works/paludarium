@@ -107,8 +107,13 @@ pub struct LoadedImage {
 }
 
 /// Decides about the interpreter a program asks for by name: returns the path
-/// to read it from, or why it cannot run.
-pub type InterpreterCheck<'a> = &'a mut dyn FnMut(&[u8]) -> Result<Vec<u8>, Errno>;
+/// to read it from, with what its mappings keep while they last (as each
+/// of Linux's holds its file), or why it cannot run.
+pub type InterpreterCheck<'a> = &'a mut dyn FnMut(&[u8]) -> Result<(Vec<u8>, Option<Keep>), Errno>;
+
+/// What the mappings of a segment keep alive while any part of them lasts:
+/// shared by a split and a fork, given back by an unmap and an exec.
+pub type Keep = Arc<dyn std::any::Any + Send + Sync>;
 
 /// Inputs of the initial stack.
 #[derive(Clone, Copy, Debug)]
@@ -166,6 +171,8 @@ struct SegmentFile {
     name: Option<Arc<[u8]>>,
     /// The device and inode of the file.
     identity: (u64, u64),
+    /// Kept as long as the mappings ([`Keep`]).
+    _keep: Option<Keep>,
 }
 impl PageSource for SegmentFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -199,6 +206,7 @@ fn map_segments(
     info: &ElfInfo,
     mem: &mut AddressSpace,
     dynamic_base: u64,
+    keep: Option<&Keep>,
 ) -> Result<(u64, u64), LoadError> {
     let base = if info.kind == elf::ET_DYN {
         dynamic_base
@@ -267,6 +275,7 @@ fn map_segments(
                 offset,
                 name: name.clone(),
                 identity,
+                _keep: keep.cloned(),
             };
             mem.back_with_file(
                 page_start,
@@ -467,7 +476,7 @@ pub fn load(
     mem: &mut AddressSpace,
 ) -> Result<LoadedImage, LoadError> {
     load_with(fs, path, start, mem, &mut |name| {
-        paludarium_vfs::normalize_path(name)
+        Ok((paludarium_vfs::normalize_path(name)?, None))
     })
 }
 
@@ -583,9 +592,9 @@ fn load_image(
             let (fs, check) = files
                 .as_mut()
                 .ok_or(LoadError::Interpreter(Errno::ENOENT))?;
-            let path = check(asked).map_err(LoadError::Interpreter)?;
+            let (path, keep) = check(asked).map_err(LoadError::Interpreter)?;
             let (image, parsed) = read_interpreter(*fs, &path)?;
-            Some((path, image, parsed))
+            Some((path, image, parsed, keep))
         }
         None => None,
     };
@@ -596,7 +605,7 @@ fn load_image(
         })
     };
     let own = name.map_or((0, 0), identity);
-    let (base, highest) = map_segments(bytes, name, own, &info, mem, STATIC_PIE_BASE)?;
+    let (base, highest) = map_segments(bytes, name, own, &info, mem, STATIC_PIE_BASE, None)?;
     let initial_break = GuestAddr(highest)
         .page_align_up()
         .ok_or(LoadError::Malformed("segment address overflow"))?;
@@ -605,7 +614,7 @@ fn load_image(
     let program_entry = GuestAddr(base.wrapping_add(info.entry));
     let mut entry_point = program_entry;
     let mut interpreter_at = 0;
-    if let Some((path, file, parsed)) = interpreter {
+    if let Some((path, file, parsed, keep)) = interpreter {
         let top = paludarium_mmu::DEFAULT_MMAP_TOP;
         let wanted = match mem.bottom_up() {
             // The legacy layout maps it upward from its base, as any other
@@ -613,7 +622,15 @@ fn load_image(
             Some(base) => interpreter_low(&parsed, mem, base)?,
             None => interpreter_base(&parsed, top)?,
         };
-        let (at, _) = map_segments(&file, Some(&path), identity(&path), &parsed, mem, wanted)?;
+        let (at, _) = map_segments(
+            &file,
+            Some(&path),
+            identity(&path),
+            &parsed,
+            mem,
+            wanted,
+            keep.as_ref(),
+        )?;
         entry_point = GuestAddr(at.wrapping_add(parsed.entry));
         interpreter_at = at;
     }

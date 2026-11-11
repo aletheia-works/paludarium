@@ -216,6 +216,12 @@ impl Files {
         );
         drop(last);
     }
+    /// What the mappings of the ELF interpreter at `path` keep: a hold on
+    /// its file, as each of Linux's mappings holds its file (`vm_file`).
+    pub(crate) fn interpreter_keep(&self, path: &[u8]) -> Option<paludarium_loader::Keep> {
+        let hold = self.caches.hold(&*self.fs, path)?;
+        Some(Arc::new(hold))
+    }
     /// Lets go of the working directory, as an exiting task's `exit_fs`
     /// does: the last task sharing it ends its hold on the directory.
     pub(crate) fn release_home(&mut self) {

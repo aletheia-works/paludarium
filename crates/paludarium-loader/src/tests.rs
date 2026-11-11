@@ -375,6 +375,30 @@ fn a_program_starts_in_its_interpreter_and_the_auxiliary_vector_says_so() {
     assert_eq!(aux_value(&mem, aux, auxv::AT_ENTRY), Some(0x401000));
 }
 #[test]
+fn what_an_interpreter_check_keeps_lasts_as_long_as_the_interpreter_is_mapped() {
+    let fs = files(&[
+        ("/prog", asks_for(elf::ET_EXEC, 0x401000, b"/ld\0")),
+        ("/ld", linker()),
+    ]);
+    let keep: Keep = Arc::new(());
+    let kept = || Arc::strong_count(&keep) - 1;
+    let mut mem = AddressSpace::new();
+    let image = load_with(&fs, b"/prog", &start(&[], &[]), &mut mem, &mut |name| {
+        Ok((name.to_vec(), Some(Arc::clone(&keep))))
+    })
+    .unwrap();
+    assert_ne!(kept(), 0);
+    // A fork's copy of the mappings keeps it too; the program's own
+    // segments never did.
+    let forked = mem.fork();
+    mem.unmap(GuestAddr(0x401000), PAGE_SIZE).unwrap();
+    let interpreter = GuestAddr(image.interpreter_base + 0x1000);
+    mem.unmap(interpreter, PAGE_SIZE).unwrap();
+    assert_ne!(kept(), 0);
+    drop(forked);
+    assert_eq!(kept(), 0);
+}
+#[test]
 fn a_program_with_no_interpreter_has_no_base_and_starts_at_its_entry() {
     let fs = files(&[("/prog", simple_exec())]);
     let mut mem = AddressSpace::new();

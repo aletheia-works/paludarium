@@ -54,10 +54,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、後述の疑似端末のリクエスト） |
-| イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、後述の疑似端末のリクエスト） |
+| イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
@@ -78,6 +78,33 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `sendfile` は、通常のファイルを書き込める任意のファイルに送り、パイプには 1 回でその容量
   までを送ります。どちらも、渡されたオフセットかファイルの位置を進めます。`sendfile` は、
   失敗したときもオフセットを書き戻します。
+- `splice` は、パイプ（または FIFO）と、通常のファイル、デバイス、ソケット、別のパイプの
+  間でバイトを動かします。`tee` は、あるパイプにあるものを取り出さずに別のパイプへ
+  コピーし、`vmsplice` は、ゲストのバッファーを書き込み用に開いたパイプへ入れるか、
+  パイプのバイトをバッファーへ取り出します。確かめる順番は Linux の `fs/splice.c` と
+  同じです。`splice` はバイト数が 0 なら何よりも先に 0 を返し、`tee` は先にフラグを
+  確かめます。そのあと、フラグ（`EINVAL`）、ディスクリプタ（`EBADF`、`O_PATH` も）、
+  パイプへのオフセット（`ESPIPE`）、オフセットの読み込み（`EFAULT`）、アクセスモード
+  （`EBADF`）、ソケットのように位置のないファイルへのオフセットか `O_APPEND` の出力
+  （`EINVAL`）、範囲（`EINVAL`）、splice できない種類のファイル（ディレクトリ、eventfd。
+  `EINVAL`）の順です。同じパイプの 2 つの記述は `EINVAL`、パイプでないファイルへの
+  `vmsplice` は `EBADF` です。読み手のいないパイプは `SIGPIPE` を伴う `EPIPE` で、入力より
+  先に、入力が終わりにあっても確かめます。`SPLICE_F_NONBLOCK` かパイプの `O_NONBLOCK`
+  （`vmsplice` はフラグだけ）が待たないと言わない限り、データか空きを待ち
+  （`EAGAIN`）、書き手のいなくなったパイプは 0 を返し、いくらか動かした呼び出しは、
+  また待たずにその数を返します。1 回で動かすのは、パイプにあるか空いている分までです。
+  unix のストリームソケットからの読み込みも `SPLICE_F_NONBLOCK` で待ちません。
+  ソケットへの送信は、`splice_to_socket` と同じく、ほかのファイルと同様にそれ自身の
+  `O_NONBLOCK` のとおりに読み書きします。
+  バイトはコピーするので、`SPLICE_F_MOVE`、`SPLICE_F_GIFT`、`SPLICE_F_MORE` は何も
+  変えません。ここでのパイプは Linux のページのバッファーではなくバイトを持ち、大きさの
+  分だけバイトを受け取ります。Linux は 1 バイトのバッファーも容量の 1 ページと数えるので、
+  一部が埋まったパイプや、ページ単位でない `vmsplice` のバッファーでは、ここのほうが
+  多く受け取ることがあります。また、Linux のパイプのロックと違い、あるスレッドの呼び出しは、
+  別のスレッドによる同じパイプの読み込みに対して不可分ではありません。
+  パイプの代わりであるホストの標準のストリームは、`splice` のどちらの端にもなれます
+  （オフセットを渡すと `ESPIPE`）。`tee` と `vmsplice` はゲスト自身のパイプだけを受け付け、
+  標準のストリームは受け付けません。
 - `getdents64` は返したエントリーの続きから読むので、それらを `unlink` しても
   読み飛ばしません。ディレクトリが変わらない間は、`d_off` への `lseek` で同じ
   エントリーに戻ります。`dup` と `fork` は読んでいる位置を共有します。`getdents`
@@ -211,7 +238,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
   除いて `O_LARGEFILE` がありません。
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
-  読み書き、`lseek`、`flock`、`getdents`、`getdents64`、`sendfile`、`copy_file_range`、`fsync`、
+  読み書き、`lseek`、`flock`、`getdents`、`getdents64`、`sendfile`、`copy_file_range`、`splice`、`tee`、`vmsplice`、`fsync`、
   `fdatasync`、`syncfs`、`sync_file_range`、`fadvise64`、`readahead`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
   呼び出し、`epoll_ctl`（epoll のディスクリプタとしても対象としても）、`epoll_wait`、`fcntl`（`F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_DUPFD_QUERY`、
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
@@ -1238,7 +1265,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/<pid>/…`）で、どこからも指されなくなれば空白と `(deleted)` が付きます。ほかに
   `pipe:[<inode>]`、`socket:[<inode>]`、`anon_inode:[eventfd]`・`[eventpoll]`・
   `[timerfd]`・`[signalfd]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
-  名前を返します）、`/memfd:<名前> (deleted)` です。
+  名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`/memfd:<名前> (deleted)` です。
   そのためにパイプとソケットは自分の inode 番号を持ちます。リンクを開くと、ファイルを
   パスで開き直します。どのパスもそのファイルを指さなくなったとき（消された、または
   名前が変わった）は、同じファイルをそのハンドルから開き直し、オフセットは別に持ちます。
@@ -1262,7 +1289,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `readlinkat(fd, "")` はリンク先を読み（ほかのものの `O_PATH` のディスクリプタでは
   `ENOENT`）、自分のリンクはそのリンクを指し、そこから読むことはできません（`EBADF`）。
   自分のリンクをたどって開くと、そのリンクに着くので `ELOOP` です。ソケットは Linux と
-  同じく `ENXIO` です。eventfd、epoll、timerfd、signalfd も、Linux がその無名 inode を
+  同じく `ENXIO` です。eventfd、epoll、timerfd、signalfd、inotify のインスタンスも、Linux がその無名 inode を
   `no_open` で開くので `ENXIO` です。pidfd は、root が開いたときと同じく、そのプロセスの
   別の記述として開きます（pidfs は自分の `open` を持ちません）。アクセスは開いたときの
   もので、`O_NONBLOCK` も自分で持ち、プロセスが回収された後でも開けます。Linux は先に
@@ -1400,6 +1427,46 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マスクが変わります（ほかのファイルなら `EINVAL`）。`SIGKILL` と `SIGSTOP` は
   マスクに入りません。書き込みは `EINVAL`、`pread` と `pwrite` は `ESPIPE`、`lseek` は
   Linux の `noop_llseek` と同じく 0 を返します。
+- inotify のインスタンス（`inotify_init`、`inotify_init1`。`IN_NONBLOCK` と
+  `IN_CLOEXEC` が使えます）は、ファイルをデバイスと inode で見張ります。
+  `inotify_add_watch` は Linux の `inotify_find_inode` と同じくファイルを探します。
+  `IN_DONT_FOLLOW` でなければ最後のシンボリックリンクをたどり、`IN_ONLYDIR` なら
+  ディレクトリでなければならず（`ENOTDIR`）、呼び手が読めるものでなければなりません
+  （`EACCES`）。エラーは Linux と同じ順で、マスク（知らないビットか、ビットがなければ
+  `EINVAL`）、ディスクリプタ（`EBADF`。`O_PATH` のものも）、`IN_MASK_ADD` と
+  `IN_MASK_CREATE` の両方（`EINVAL`）、別の種類のファイル（`EINVAL`）、そしてパスです。
+  すでに見張っているファイルは同じウォッチディスクリプタのままで、マスクが新しいもの
+  になります。`IN_MASK_ADD` なら前のものと合わせ、`IN_MASK_CREATE` なら `EEXIST`
+  です。ウォッチディスクリプタは Linux の `idr_alloc_cyclic` と同じく 1 から番号が付き、
+  一回りするまで使い回されません。`INOTIFY_IOC_SETNEXTWD` で次の番号を決められます。
+  ウォッチのないディスクリプタの `inotify_rm_watch` は `EINVAL` です。1 人のユーザーが
+  持てるのは、インスタンスが 128（`EMFILE`）、ウォッチが 31956（`ENOSPC`）で、
+  `sysinfo` が示す 4 GiB から Linux が出す数です。
+  ゲスト自身のシステムコールによる変更がイベントになり、Linux の `fsnotify` のフックと
+  同じ順で届きます。新しいファイル、ディレクトリ、シンボリックリンク、FIFO、ソケット、
+  リンクは `IN_CREATE` です（リンクではリンクされたファイルの `IN_ATTRIB` の後）。
+  消したものは `IN_DELETE` で、その前にファイルの `IN_ATTRIB`、最後のリンクか
+  ディレクトリならそのファイルの `IN_DELETE_SELF` と `IN_IGNORED` が来ます。名前の
+  変更は同じクッキーの `IN_MOVED_FROM` と `IN_MOVED_TO` で、続いて置き換えられた
+  ファイルの `IN_ATTRIB`、動いたファイルの `IN_MOVE_SELF`、置き換えられたファイルの
+  `IN_DELETE_SELF` です（`RENAME_EXCHANGE` では 2 回。同じファイルの別のリンクへの
+  変更では何もありません）。モード、所有者（どちらも指定しない `chown` では何も
+  ありません）、両方の時刻、拡張属性を変えると `IN_ATTRIB`、アクセス時刻だけなら
+  `IN_ACCESS`、更新時刻だけなら `IN_MODIFY`、切り詰めは `IN_MODIFY` です（通常の
+  ファイルを空にする `O_TRUNC` も）。ファイルの変更は、そのディレクトリのウォッチに
+  名前付きで先に届き、次にファイル自身のウォッチに届きます。ディレクトリのものには
+  `IN_ISDIR` が付きます（`IN_DELETE_SELF` と `IN_MOVE_SELF` には Linux と同じく
+  付きません）。`IN_ONESHOT` のウォッチは最初のイベントの後に `IN_IGNORED` とともに
+  消えます。インスタンスはイベントを溜め、直前のイベントと同じもの（ディスクリプタ、
+  マスク、名前）は、それが `IN_IGNORED` か名前の変更でなければまとめます。16384 個
+  溜まると、読まれるまで `IN_Q_OVERFLOW`（ディスクリプタは -1）を 1 つだけ溜めます。
+  読み込みは入るだけの `struct inotify_event` を返し、名前は 16 バイトの倍数まで NUL で
+  埋めます。最初の 1 つが入らなければ `EINVAL` です。非ブロッキングでなければ最初の
+  1 つを待ち、シグナルでその待ちは終わります（`EINTR` で、`SA_RESTART` なら再開
+  します）。`FIONREAD` は溜まっているバイト数を返し、`poll`・`select`・`epoll` は
+  イベントが溜まっている間読めると見ます。エッジトリガーの `epoll` は、イベントが
+  1 つ溜まるたびにエッジを受けます。インスタンスの最後のディスクリプタを閉じると
+  ウォッチも消えます。書き込みは `EBADF`、`pread` は `ESPIPE`、`lseek` は 0 です。
 - POSIX タイマーは `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き、プロセスへの
   シグナル（`SIGEV_SIGNAL`。`SI_TIMER` の siginfo とオーバーランつき）か、プロセスの
   中の 1 つのスレッドへのシグナル（`SIGEV_THREAD_ID`）で知らせるか、何も知らせません
@@ -1472,7 +1539,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     何も作りません）、上限を超える番号への `dup2`／`dup3` は `EBADF`、上限を超える
     番号からの `F_DUPFD` は `EINVAL` になります。
   - `RLIMIT_FSIZE`：通常のファイルへの書き込み（`O_APPEND` なら末尾から書く `write`、
-    `writev`、`pwrite`、`pwritev` と、`copy_file_range`、`sendfile`）はソフトの上限で
+    `writev`、`pwrite`、`pwritev` と、`copy_file_range`、`sendfile`、`splice`）はソフトの上限で
     止まります。上限かその先から始まる
     書き込みと、ファイルを上限より大きくする `truncate`／`ftruncate` と `fallocate` は、`SIGXFSZ` を
     起こして `EFBIG` で失敗します。
@@ -1760,7 +1827,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
-  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`splice`、`tee`、`vmsplice`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
   `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll`、時間制限つきの `futex` の待ちは、
   `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
   `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが

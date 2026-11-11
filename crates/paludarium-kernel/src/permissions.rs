@@ -307,7 +307,9 @@ pub(crate) fn own(
     parent: &FileStat,
 ) {
     let group = (parent.mode & 0o2000 == 0).then_some(creds.fsgid);
-    let _ = files.fs.set_owner(path, follow, Some(creds.fsuid), group);
+    // Linux gives the inode its owner as it makes it: no `IN_ATTRIB`.
+    let _ =
+        crate::inotify::unnoticed(|| files.fs.set_owner(path, follow, Some(creds.fsuid), group));
 }
 
 /// `unlink` and `rmdir`: [`may_delete`] on a file that is there.

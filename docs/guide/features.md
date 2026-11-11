@@ -62,10 +62,10 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
-| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, and the pseudo-terminals' requests below) |
-| Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, and the pseudo-terminals' requests below) |
+| Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
@@ -89,6 +89,36 @@ kernel.
   one file). `sendfile` reads a regular file into any writable file, a pipe
   taking at most its capacity per call. Both update the given offsets or the
   file positions; `sendfile` writes its offset back even after an error.
+- `splice` moves bytes between a pipe (or FIFO) and a regular file, a
+  device, a socket or another pipe, `tee` copies what one pipe holds into
+  another without taking it, and `vmsplice` puts the guest's buffers into a
+  pipe opened for writing or takes a pipe's bytes into them. They follow
+  Linux's `fs/splice.c` in order: `splice` returns 0 for no bytes before
+  anything else, and `tee` checks its flags first; then the flags
+  (`EINVAL`), the descriptors (`EBADF`, `O_PATH` too), an offset for a pipe
+  (`ESPIPE`), reading the offsets (`EFAULT`), the access modes (`EBADF`),
+  an offset for a file without one, such as a socket, or an `O_APPEND`
+  output (`EINVAL`), the range (`EINVAL`), and a file of no kind that
+  splices (a directory, an eventfd, `EINVAL`). Two descriptions of one
+  pipe are `EINVAL`, and `vmsplice` of a file that is no pipe is `EBADF`.
+  A pipe with no reader is `EPIPE` with `SIGPIPE`, looked at before the
+  input, even at its end. A call waits for data or room unless
+  `SPLICE_F_NONBLOCK` or the pipe's `O_NONBLOCK` (`vmsplice`: only the
+  flag) says not to (`EAGAIN`); a pipe whose writers are gone gives 0, and a
+  call that moved some bytes returns them instead of waiting again. One call
+  moves at most what the pipe holds or has room for. A unix stream socket's
+  read does not wait with `SPLICE_F_NONBLOCK` either, while a socket's send,
+  as `splice_to_socket` makes it, and other files read and write as their
+  own `O_NONBLOCK` says. `SPLICE_F_MOVE`, `SPLICE_F_GIFT` and `SPLICE_F_MORE` change
+  nothing, as the bytes are copied. A pipe here holds bytes, not Linux's
+  page buffers: it takes as many bytes as its size, where Linux counts a
+  buffer, even of one byte, as a whole page of the capacity (a partly full
+  pipe, or the buffers of `vmsplice` that are not whole pages, may take
+  more here than on Linux). One thread's call is not atomic against
+  another's read of the same pipe, as Linux's pipe lock makes it.
+  The host's standard streams, which stand for pipes, can be either end of
+  a `splice` (an offset for one is `ESPIPE`), but not of `tee` or
+  `vmsplice`, which take only the guest's own pipes.
 - `getdents64` goes on from what it has returned, so unlinking those entries
   skips nothing. `lseek` to a `d_off` leads to the same entry while the
   directory is unchanged, and `dup` and `fork` share the place. `getdents`
@@ -236,7 +266,7 @@ kernel.
   (a link in `/proc/self/fd`, `/dev/stdout`).
 - An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
   reading and writing it, `lseek`, `flock`, `getdents`, `getdents64`, `sendfile`,
-  `copy_file_range`, `fsync`, `fdatasync`, `syncfs`, `sync_file_range`,
+  `copy_file_range`, `splice`, `tee`, `vmsplice`, `fsync`, `fdatasync`, `syncfs`, `sync_file_range`,
   `fadvise64`, `readahead`, `ftruncate`,
   `fallocate`, `mmap`, `ioctl`, the `f*xattr` calls, `epoll_ctl` (as the
   epoll descriptor or the target), `epoll_wait` and `fcntl`
@@ -1399,7 +1429,8 @@ kernel.
   for this process's entries), followed by a space and `(deleted)` once
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
   `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]` or `[pidfd]` (an
-  anonymous inode's name, which pidfs, from Linux 6.9, still gives), and
+  anonymous inode's name, which pidfs, from Linux 6.9, still gives),
+  `anon_inode:inotify` (without brackets, as Linux names it), and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
   own for it. Opening a link opens the file again by its path, or, for a
   file no path names any more (removed, or renamed away), the same file
@@ -1426,7 +1457,7 @@ kernel.
   `O_PATH` descriptor of anything else), whose own link names the link, and
   that nothing reads through (`EBADF`); an open that follows its own link
   reaches the link (`ELOOP`). A socket gives `ENXIO`, as on Linux, and so
-  do an eventfd, an epoll, a timerfd and a signalfd, whose anonymous inode Linux opens
+  do an eventfd, an epoll, a timerfd, a signalfd and an inotify instance, whose anonymous inode Linux opens
   with `no_open`. A pidfd opens as another description of its process, as
   root opens it (pidfs has no `open` of its own): with the access it is
   opened with and `O_NONBLOCK` of its own, even after the process is
@@ -1579,6 +1610,50 @@ kernel.
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);
   `SIGKILL` and `SIGSTOP` never enter one. A write gives `EINVAL`, `pread`
   and `pwrite` `ESPIPE`, and `lseek` 0, as Linux's `noop_llseek`.
+- An inotify instance (`inotify_init`, `inotify_init1`, with `IN_NONBLOCK`
+  and `IN_CLOEXEC`) watches files by their device and inode, which
+  `inotify_add_watch` finds as Linux's `inotify_find_inode` does: the last
+  symbolic link followed unless `IN_DONT_FOLLOW`, a directory with
+  `IN_ONLYDIR` (`ENOTDIR`), and one the caller may read (`EACCES`). Its
+  errors come in Linux's order: the mask (`EINVAL` for an unknown bit or
+  none), the descriptor (`EBADF`, an `O_PATH` one too), `IN_MASK_ADD` with
+  `IN_MASK_CREATE` (`EINVAL`), another kind of file (`EINVAL`), then the
+  path. A file already watched keeps its watch descriptor, with the new
+  mask, the old one and the new together with `IN_MASK_ADD`, or `EEXIST`
+  with `IN_MASK_CREATE`. Watch descriptors are numbered from 1 and not
+  reused until they wrap, as Linux's `idr_alloc_cyclic` gives them, and
+  `INOTIFY_IOC_SETNEXTWD` sets the next one. `inotify_rm_watch` of a
+  descriptor no watch has is `EINVAL`. A user may have 128 instances
+  (`EMFILE`) and 31956 watches (`ENOSPC`), what Linux works out for the
+  4 GiB `sysinfo` reports.
+  The changes the guest's own system calls make are the events, in the order
+  Linux's `fsnotify` hooks give them: `IN_CREATE` for a new file, directory,
+  symbolic link, FIFO, socket or link (after `IN_ATTRIB` of a linked file);
+  `IN_DELETE` for a removed one, after `IN_ATTRIB` of the file and, for its
+  last link or a directory, `IN_DELETE_SELF` and `IN_IGNORED` of it;
+  `IN_MOVED_FROM` and `IN_MOVED_TO` with one cookie for a rename, then
+  `IN_ATTRIB` of a file it replaces, `IN_MOVE_SELF` of the file moved, and
+  the replaced file's `IN_DELETE_SELF` (twice for `RENAME_EXCHANGE`, and
+  nothing for a rename onto another link of the same file); `IN_ATTRIB` for
+  a new mode, owner (a `chown` that names neither gives none), both times
+  or extended attribute; `IN_ACCESS` and `IN_MODIFY` for setting only the
+  access or only the modification time; and `IN_MODIFY` for a truncation,
+  `O_TRUNC` emptying a regular file too. A file's change reaches the watch of
+  its directory, with its name, before its own, and `IN_ISDIR` marks a
+  directory's (not with `IN_DELETE_SELF` or `IN_MOVE_SELF`, as Linux
+  leaves it out). `IN_ONESHOT` removes the watch after its first event, with
+  `IN_IGNORED`. Each instance queues its events, merging one into the same
+  event (descriptor, mask and name) just before it unless that one is
+  `IN_IGNORED` or a move, and after 16384 queues one `IN_Q_OVERFLOW` (with
+  descriptor -1) until it is read. A read gives as many whole
+  `struct inotify_event` records as fit, each name padded with NULs to a
+  multiple of 16 bytes, `EINVAL` when the first does not fit; it waits for
+  the first unless the file is non-blocking, and a signal ends the wait
+  (`EINTR`, which `SA_RESTART` restarts). `FIONREAD` gives the bytes queued,
+  `poll`, `select` and `epoll` see the file readable while any event is
+  queued, and each queued event is an edge for edge-triggered `epoll`.
+  Closing the last descriptor of an instance removes its watches. A write
+  gives `EBADF`, `pread` `ESPIPE`, and `lseek` 0.
 - POSIX timers run on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` and notify with
   a signal to the process (`SIGEV_SIGNAL`, with `SI_TIMER` siginfo and
   overruns), a signal to one of its threads (`SIGEV_THREAD_ID`), or not at all
@@ -1659,8 +1734,8 @@ kernel.
     `open` creates nothing), `dup2`/`dup3` onto a number past it `EBADF`, and
     `F_DUPFD` from one past it `EINVAL`.
   - `RLIMIT_FSIZE`: a write to a regular file (`write`, `writev`, `pwrite` and
-    `pwritev`, which with `O_APPEND` start at the end, and `copy_file_range`
-    and `sendfile`) stops at the soft limit; one that
+    `pwritev`, which with `O_APPEND` start at the end, and `copy_file_range`,
+    `sendfile` and `splice`) stops at the soft limit; one that
     starts at or past it, and a `truncate`/`ftruncate` or `fallocate` that
     grows the file past it, raise `SIGXFSZ` and fail with `EFBIG`.
   - `RLIMIT_CORE`: a process that a core-dumping signal (`SIGSEGV`, `SIGABRT`,
@@ -1975,7 +2050,7 @@ one only with an `--allow-net`.
   `preadv2`, `pwritev2`,
   `wait4`, `waitid`, `pause`, `rt_sigsuspend`, `flock`, `fcntl`'s `F_SETLKW` and
   `F_OFD_SETLKW`, `sendto`, `recvfrom`,
-  `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`, `ppoll`, `select`, `pselect6`, `poll` with no timeout
+  `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`, `splice`, `tee`, `vmsplice`, `ppoll`, `select`, `pselect6`, `poll` with no timeout
   and a `futex` wait with none. `nanosleep`, a relative `clock_nanosleep`,
   `poll` with a timeout and a timed `futex` wait resume through
   `restart_syscall` with the deadline they had (the `futex` wait checks its word

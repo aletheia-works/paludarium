@@ -1,5 +1,6 @@
 //! Linux x86-64 file ABI and descriptor table. All guest memory is checked.
 use crate::syscalls::{Context, Outcome};
+mod splice;
 mod tasks;
 mod xattrs;
 use paludarium_host::{ClockId, FileHandle, FileStat};
@@ -12,8 +13,8 @@ pub const NUMBERS: &[u64] = &[
     0, 2, 3, 4, 5, 6, 8, 17, 18, 19, 20, 21, 22, 32, 33, 40, 72, 73, 74, 75, 76, 77, 78, 79, 80,
     81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 136, 137, 138, 162, 187,
     188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260,
-    261, 262, 263, 264, 265, 266, 267, 268, 269, 277, 280, 285, 292, 293, 295, 296, 306, 316, 319,
-    326, 327, 328, 332, 436, 437, 439, 452,
+    261, 262, 263, 264, 265, 266, 267, 268, 269, 275, 276, 277, 278, 280, 285, 292, 293, 295, 296,
+    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 452,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -629,6 +630,54 @@ fn looked_up(
 ) -> Result<(Vec<u8>, crate::permissions::Found), Errno> {
     lookup(c, dir, path(c, ptr)?, follow)
 }
+/// The file `inotify_add_watch` watches, as Linux's `inotify_find_inode`
+/// finds it: what the path at `ptr` names (the last symbolic link itself
+/// without `follow`), a directory with `directory` (ENOTDIR), and one the
+/// caller may read (EACCES); by its device and inode.
+pub(crate) fn watched(
+    c: &Context<'_>,
+    ptr: u64,
+    follow: bool,
+    directory: bool,
+) -> Result<crate::page_cache::Key, Errno> {
+    let (p, _) = looked_up(c, (-100i32) as u64, ptr, follow)?;
+    let (stat, device) = match followed(c, &p, follow)? {
+        Some(Followed::Path { path, follow }) => {
+            let stat = c.files.fs.metadata(&path, follow)?;
+            (stat, watched_device(c, &path, follow))
+        }
+        Some(Followed::File(d)) => (d.file.stat()?, descriptor_device(c, &d)),
+        None => match generated_stat(c, &p, follow)? {
+            Some((stat, device, _)) => (stat, device),
+            None => (
+                c.files.fs.metadata(&p, follow)?,
+                watched_device(c, &p, follow),
+            ),
+        },
+    };
+    if directory && stat.mode & 0o170000 != 0o040000 {
+        return Err(Errno::ENOTDIR);
+    }
+    crate::permissions::permission(&c.process.credentials, &stat, 4)?;
+    Ok((device, stat.inode))
+}
+/// The device of the file `path` names, by the mount it is in once its
+/// links are resolved, as the changes inotify hears of name it.
+fn watched_device(c: &Context<'_>, path: &[u8], follow: bool) -> u64 {
+    let place = if follow {
+        resolved(c.files, path)
+    } else {
+        path.iter().rposition(|&b| b == b'/').and_then(|at| {
+            let mut directory = resolved(c.files, &path[..at.max(1)])?;
+            if directory != b"/" {
+                directory.push(b'/');
+            }
+            directory.extend_from_slice(&path[at + 1..]);
+            Some(directory)
+        })
+    };
+    device(c, place.as_deref().unwrap_or(path))
+}
 /// `faccessat2(dirfd, path, mode, flags)`: with the real IDs, as Linux's
 /// `access_override_creds` gives them, or the filesystem ones with
 /// `AT_EACCESS`; root may read and write anything, and execute a directory
@@ -1174,6 +1223,8 @@ fn ustat(c: &Context<'_>, dev: u32, buf: u64) -> Result<u64, Errno> {
 /// `getdents`, `sendfile` and `copy_file_range`, and `fcntl` but for the
 /// commands `check_fcntl_cmd` lets through (duplicating, the descriptor
 /// flags and `F_GETFL`). A descriptor that is not open is left to the call.
+/// `splice`, `tee` and `vmsplice` refuse one themselves (`splice::file`),
+/// after the checks Linux makes before `fdget`.
 fn refuse_path_only(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<(), Errno> {
     let descriptors: &[u64] = match n {
         // read, readv, writev, pread64, pwrite64, preadv, pwritev, preadv2,
@@ -1260,12 +1311,11 @@ fn positioned(
     }
     let file = c.files.descriptor(fd)?.file;
     file.seek(0, 1).map_err(|_| Errno::ESPIPE)?;
-    // A signalfd seeks (Linux's `noop_llseek`) but is not opened with
-    // FMODE_PREAD or FMODE_PWRITE.
-    if file
-        .as_any()
-        .is_some_and(|any| any.is::<crate::signalfd::SignalFile>())
-    {
+    // A signalfd and an inotify instance seek (Linux's `noop_llseek`) but
+    // are not opened with FMODE_PREAD or FMODE_PWRITE.
+    if file.as_any().is_some_and(|any| {
+        any.is::<crate::signalfd::SignalFile>() || any.is::<crate::inotify::Instance>()
+    }) {
         return Err(Errno::ESPIPE);
     }
     if file.flags() & 3 == if write { 0 } else { 1 } {
@@ -2018,6 +2068,10 @@ fn read_waiting(
     if let Some(result) = crate::signalfd::read(c, file, b, nowait) {
         return result;
     }
+    // An inotify instance reads its events.
+    if let Some(result) = crate::inotify::read(c, file, b, nowait) {
+        return result;
+    }
     // A socket's read waits as its SO_RCVLOWAT says. A pipe is a PipeEnd,
     // not a SocketPairEnd, so it reads below and still signals its writer.
     if file
@@ -2422,6 +2476,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
     refuse_path_only(c, n, a)?;
     match n {
         40 => sendfile(c, a),
+        275 => splice::splice(c, a),
+        276 => splice::tee(c, a),
+        278 => splice::vmsplice(c, a),
         332 => statx(c, a),
         326 => copy_file_range(c, a),
         436 => close_range(c, a),
@@ -3316,7 +3373,7 @@ pub(crate) fn write_with(
     }
 }
 /// `O_PATH`: only a path, not an open file.
-const O_PATH: u32 = 0o10000000;
+pub(crate) const O_PATH: u32 = 0o10000000;
 /// The descriptor `O_PATH | O_NOFOLLOW` gives for a symbolic link: the link
 /// itself, as Linux opens it, whose `fstat` is the link's and whose
 /// `readlinkat(fd, "")` reads where it points; nothing reads or writes
@@ -4662,6 +4719,10 @@ pub(crate) fn generated(path: &[u8]) -> bool {
 /// symbolic link resolved one component at a time (at most 40 links, as
 /// Linux follows), or `None` when a component is missing.
 pub(crate) fn resolved(files: &Files, path: &[u8]) -> Option<Vec<u8>> {
+    resolved_in(&*files.fs, path)
+}
+/// [`resolved`] in the file system `fs`.
+pub(crate) fn resolved_in(fs: &dyn HostFs, path: &[u8]) -> Option<Vec<u8>> {
     const SYMLINK: u32 = 0o120000;
     let mut pending: Vec<Vec<u8>> = path
         .split(|&b| b == b'/')
@@ -4692,12 +4753,12 @@ pub(crate) fn resolved(files: &Files, path: &[u8]) -> Option<Vec<u8>> {
         }
         parts.push(part);
         let candidate = join(&parts);
-        if files.fs.metadata(&candidate, false).ok()?.mode & 0o170000 == SYMLINK {
+        if fs.metadata(&candidate, false).ok()?.mode & 0o170000 == SYMLINK {
             links += 1;
             if links > 40 {
                 return None;
             }
-            let target = files.fs.readlink(&candidate).ok()?;
+            let target = fs.readlink(&candidate).ok()?;
             parts.pop();
             if target.first() == Some(&b'/') {
                 parts.clear();
@@ -4892,6 +4953,10 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     // A namespace file names its namespace, as its link in `ns` reads.
     if let Some(file) = any.and_then(|v| v.downcast_ref::<crate::namespaces::NamespaceFile>()) {
         return Ok(file.namespace.link());
+    }
+    // `anon_inode_getfd("inotify", ...)` names it without brackets.
+    if any.is_some_and(|v| v.is::<crate::inotify::Instance>()) {
+        return Ok(b"anon_inode:inotify".to_vec());
     }
     let stat = d.file.stat()?;
     let anonymous = |kind: &str| format!("anon_inode:[{kind}]").into_bytes();

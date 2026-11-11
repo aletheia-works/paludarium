@@ -1,0 +1,863 @@
+//! inotify: `inotify_init`, `inotify_init1`, `inotify_add_watch` and
+//! `inotify_rm_watch`. An instance's watches are on files, by their device
+//! and inode as `stat` names them ([`Key`]), and the machine's
+//! [`Notifier`] hears of every change its file system makes: the handles of
+//! [`crate::page_cache::CoherentFs`] tell it what Linux's `fsnotify` hooks
+//! tell the watching groups, with the same events in the same order. An
+//! instance queues what its watches want as Linux's
+//! `inotify_handle_inode_event` does, merging an event into the same one
+//! just before it, and a read takes them as `struct inotify_event` records.
+//!
+//! While no watch exists, a change costs one atomic load.
+use crate::events::{CLOEXEC, IN, NONBLOCK, ReadinessHub};
+use crate::page_cache::Key;
+use crate::syscalls::{Context, Outcome};
+use paludarium_host::{FileHandle, FileStat, HostFs};
+use paludarium_types::{Errno, GuestAddr};
+use paludarium_vfs::{FileSystem, mount_device};
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+
+pub(crate) const ACCESS: u32 = 0x1;
+pub(crate) const MODIFY: u32 = 0x2;
+pub(crate) const ATTRIB: u32 = 0x4;
+const MOVED_FROM: u32 = 0x40;
+const MOVED_TO: u32 = 0x80;
+const CREATE: u32 = 0x100;
+const DELETE: u32 = 0x200;
+const DELETE_SELF: u32 = 0x400;
+const MOVE_SELF: u32 = 0x800;
+const UNMOUNT: u32 = 0x2000;
+const Q_OVERFLOW: u32 = 0x4000;
+const IGNORED: u32 = 0x8000;
+const ONLYDIR: u32 = 0x0100_0000;
+const DONT_FOLLOW: u32 = 0x0200_0000;
+const EXCL_UNLINK: u32 = 0x0400_0000;
+const MASK_CREATE: u32 = 0x1000_0000;
+const MASK_ADD: u32 = 0x2000_0000;
+const ISDIR: u32 = 0x4000_0000;
+const ONESHOT: u32 = 0x8000_0000;
+/// `IN_ALL_EVENTS`, the events a watch can ask for.
+const ALL_EVENTS: u32 = 0xfff;
+/// `ALL_INOTIFY_BITS`, the bits `inotify_add_watch` takes.
+const ALL_BITS: u32 = ALL_EVENTS
+    | UNMOUNT
+    | Q_OVERFLOW
+    | IGNORED
+    | ONLYDIR
+    | DONT_FOLLOW
+    | EXCL_UNLINK
+    | MASK_ADD
+    | MASK_CREATE
+    | ISDIR
+    | ONESHOT;
+/// `sizeof(struct inotify_event)`, without its name.
+const RECORD: usize = 16;
+/// `/proc/sys/fs/inotify/max_queued_events`.
+const MAX_EVENTS: usize = 16384;
+/// `/proc/sys/fs/inotify/max_user_instances`.
+const MAX_INSTANCES: usize = 128;
+/// `/proc/sys/fs/inotify/max_user_watches`, as Linux's `inotify_user_setup`
+/// works it out for the memory `sysinfo` reports: 1% of it, over what a watch
+/// costs (a mark and twice an inode, about 1344 bytes on x86-64), between
+/// 8192 and 1048576.
+const MAX_WATCHES: usize = {
+    let watches = (crate::syscalls::SYSINFO_RAM / 100 / 1344) as usize;
+    if watches < 8192 {
+        8192
+    } else if watches > 1_048_576 {
+        1_048_576
+    } else {
+        watches
+    }
+};
+/// `RENAME_EXCHANGE`.
+const EXCHANGE: u32 = 2;
+/// `INOTIFY_IOC_SETNEXTWD`, `_IOW('I', 0, __u32)`.
+const SETNEXTWD: u64 = 0x4004_4900;
+const FIONREAD: u64 = 0x541b;
+
+thread_local! {
+    /// Set while the kernel changes a file on its own account, as it gives a
+    /// new file its owner, which Linux does as it makes the inode.
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+thread_local! {
+    /// Set by a call that changes a file's extended attributes, which the
+    /// file system's `with_xattrs` cannot tell from one that reads them.
+    static XATTRS_CHANGED: Cell<bool> = const { Cell::new(false) };
+}
+/// Says that the `with_xattrs` running now changes the attributes
+/// (`fsnotify_xattr`).
+pub(crate) fn xattrs_changed() {
+    XATTRS_CHANGED.with(|changed| changed.set(true));
+}
+/// Runs `f`, a `with_xattrs`, and whether it said it changed them.
+pub(crate) fn changing_xattrs<T>(f: impl FnOnce() -> Result<T, Errno>) -> (Result<T, Errno>, bool) {
+    let was = XATTRS_CHANGED.with(|changed| changed.replace(false));
+    let value = f();
+    let changed = XATTRS_CHANGED.with(|changed| changed.replace(was));
+    (value, changed)
+}
+
+/// Runs `f` without telling any watch of what it changes.
+pub(crate) fn unnoticed<T>(f: impl FnOnce() -> T) -> T {
+    let was = QUIET.with(|quiet| quiet.replace(true));
+    let value = f();
+    QUIET.with(|quiet| quiet.set(was));
+    value
+}
+
+/// The instances of one machine, which every change is told to.
+#[derive(Default)]
+pub(crate) struct Notifier {
+    /// The watches of every instance: while there are none, a change is
+    /// not looked at.
+    watches: AtomicUsize,
+    /// Linux's `fsnotify_sync_cookie`, which ties a rename's two events.
+    cookie: AtomicU32,
+    registry: Mutex<Registry>,
+}
+
+#[derive(Default)]
+struct Registry {
+    instances: Vec<Weak<Instance>>,
+    /// The instances and watches of each effective user ID, as Linux's
+    /// `ucounts` count them against the limits.
+    users: HashMap<u32, (usize, usize)>,
+}
+
+/// A file a change names: where it is, if anywhere, and what is there.
+pub(crate) struct Named {
+    /// Its directory, when it has one, and its name in it.
+    parent: Option<Key>,
+    name: Vec<u8>,
+    file: Option<Found>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Found {
+    key: Key,
+    directory: bool,
+    links: u64,
+}
+impl Found {
+    fn of(device: u64, stat: &FileStat) -> Self {
+        Found {
+            key: (device, stat.inode),
+            directory: stat.mode & 0o170000 == 0o040000,
+            links: stat.links,
+        }
+    }
+    fn isdir(self) -> u32 {
+        if self.directory { ISDIR } else { 0 }
+    }
+}
+
+/// `path` with every symbolic link of it resolved, as
+/// [`crate::files::resolved`] gives it, in the file system `fs`.
+fn resolved(fs: &dyn HostFs, path: &[u8]) -> Option<Vec<u8>> {
+    crate::files::resolved_in(fs, path)
+}
+/// `path`'s directory and last name; none for the root.
+fn split(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    let trimmed = path.strip_suffix(b"/").unwrap_or(path);
+    let at = trimmed.iter().rposition(|&b| b == b'/')?;
+    let name = &trimmed[at + 1..];
+    if name.is_empty() {
+        return None;
+    }
+    Some((if at == 0 { b"/" } else { &trimmed[..at] }, name))
+}
+
+impl Notifier {
+    /// Whether any watch exists, which a change must be told to.
+    pub(crate) fn watching(&self) -> bool {
+        self.watches.load(Ordering::SeqCst) != 0 && !QUIET.with(Cell::get)
+    }
+    fn instances(&self) -> Vec<Arc<Instance>> {
+        let registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        registry
+            .instances
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+    fn cookie(&self) -> u32 {
+        self.cookie.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+    }
+    /// What `path` names in `fs`: the file itself with `follow`, the last
+    /// symbolic link otherwise.
+    pub(crate) fn named(fs: &dyn FileSystem, path: &[u8], follow: bool) -> Option<Named> {
+        let path = if follow {
+            resolved(fs, path)?
+        } else {
+            let (directory, name) = split(path)?;
+            let mut path = resolved(fs, directory)?;
+            if path != b"/" {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            path
+        };
+        let mounts = fs.mounts();
+        let file = fs
+            .metadata(&path, false)
+            .ok()
+            .map(|stat| Found::of(mount_device(&mounts, &path), &stat));
+        let (parent, name) = match split(&path) {
+            Some((directory, name)) => (
+                fs.metadata(directory, true)
+                    .ok()
+                    .map(|stat| (mount_device(&mounts, directory), stat.inode)),
+                name.to_vec(),
+            ),
+            None => (None, Vec::new()),
+        };
+        Some(Named { parent, name, file })
+    }
+    /// An event of a directory's entry (`fsnotify_name`): to the watches of
+    /// the directory, with the name.
+    fn entry(&self, directory: Option<Key>, mask: u32, name: &[u8], cookie: u32) {
+        let Some(directory) = directory else {
+            return;
+        };
+        for instance in self.instances() {
+            instance.report(directory, mask, name, cookie);
+        }
+    }
+    /// An event of a file itself (`fsnotify_inode`): to its watches, without
+    /// a name.
+    fn inode(&self, file: Found, mask: u32) {
+        for instance in self.instances() {
+            instance.report(file.key, mask | file.isdir(), b"", 0);
+        }
+    }
+    /// An event of a file that its directory hears of too
+    /// (`fsnotify_parent`): to the directory's watches with the file's name,
+    /// then to the file's without.
+    fn child(&self, named: &Named, file: Found, mask: u32) {
+        let mask = mask | file.isdir();
+        for instance in self.instances() {
+            if let Some(parent) = named.parent {
+                instance.report(parent, mask, &named.name, 0);
+            }
+            instance.report(file.key, mask, b"", 0);
+        }
+    }
+    /// A file whose last link is gone (`fsnotify_inoderemove`): its watches
+    /// hear `IN_DELETE_SELF`, then go with `IN_IGNORED`.
+    fn removed(&self, file: Found) {
+        for instance in self.instances() {
+            instance.report(file.key, DELETE_SELF, b"", 0);
+            instance.forget(file.key);
+        }
+    }
+
+    /// A new entry at `path` (`fsnotify_create`, `fsnotify_mkdir`).
+    pub(crate) fn created(&self, fs: &dyn FileSystem, path: &[u8]) {
+        if !self.watching() {
+            return;
+        }
+        if let Some(named) = Self::named(fs, path, false) {
+            let isdir = named.file.map_or(0, Found::isdir);
+            self.entry(named.parent, CREATE | isdir, &named.name, 0);
+        }
+    }
+    /// A new link at `path` to a file (`fsnotify_link`): the file's link
+    /// count, then the entry.
+    pub(crate) fn linked(&self, fs: &dyn FileSystem, path: &[u8]) {
+        if !self.watching() {
+            return;
+        }
+        if let Some(named) = Self::named(fs, path, false) {
+            if let Some(file) = named.file {
+                self.inode(file, ATTRIB);
+            }
+            self.entry(named.parent, CREATE, &named.name, 0);
+        }
+    }
+    /// What an `unlink` or `rmdir` of `path` is about to remove.
+    pub(crate) fn before_removal(&self, fs: &dyn FileSystem, path: &[u8]) -> Option<Named> {
+        self.watching()
+            .then(|| Self::named(fs, path, false))
+            .flatten()
+    }
+    /// `unlink` and `rmdir` (`vfs_unlink`, `vfs_rmdir`): a file's link
+    /// count, then the file's end if that was its last link, then the entry.
+    pub(crate) fn unlinked(&self, named: &Named, directory: bool) {
+        let Some(file) = named.file else {
+            return;
+        };
+        if !directory {
+            self.inode(file, ATTRIB);
+        }
+        if directory || file.links <= 1 {
+            self.removed(file);
+        }
+        self.entry(named.parent, DELETE | file.isdir(), &named.name, 0);
+    }
+    /// What a rename from `old` to `new` is about to move and replace.
+    pub(crate) fn before_rename(
+        &self,
+        fs: &dyn FileSystem,
+        old: &[u8],
+        new: &[u8],
+    ) -> Option<(Named, Named)> {
+        if !self.watching() {
+            return None;
+        }
+        Some((Self::named(fs, old, false)?, Self::named(fs, new, false)?))
+    }
+    /// `vfs_rename`'s `fsnotify_move`, twice for `RENAME_EXCHANGE`, then the
+    /// end of a file it replaced, which goes as the call lets go of it.
+    pub(crate) fn renamed(&self, (old, new): &(Named, Named), flags: u32) {
+        let Some(source) = old.file else {
+            return;
+        };
+        // A rename onto another link of the same file does nothing.
+        if new.file.is_some_and(|target| target.key == source.key) {
+            return;
+        }
+        let exchange = flags & EXCHANGE != 0;
+        let replaced = new.file.filter(|_| !exchange);
+        self.moved(old, new, source, replaced);
+        if exchange && let Some(target) = new.file {
+            self.moved(new, old, target, None);
+        }
+        if let Some(target) = replaced
+            && (target.directory || target.links <= 1)
+        {
+            self.removed(target);
+        }
+    }
+    fn moved(&self, from: &Named, to: &Named, source: Found, replaced: Option<Found>) {
+        let cookie = self.cookie();
+        self.entry(from.parent, MOVED_FROM | source.isdir(), &from.name, cookie);
+        self.entry(to.parent, MOVED_TO | source.isdir(), &to.name, cookie);
+        if let Some(target) = replaced {
+            self.inode(target, ATTRIB);
+        }
+        self.inode(source, MOVE_SELF);
+    }
+    /// A change to the file `path` names (`notify_change`, which tells
+    /// `fsnotify_change`): `IN_ATTRIB`, `IN_MODIFY` or `IN_ACCESS`.
+    pub(crate) fn changed(&self, fs: &dyn FileSystem, path: &[u8], follow: bool, mask: u32) {
+        if mask == 0 || !self.watching() {
+            return;
+        }
+        if let Some(named) = Self::named(fs, path, follow)
+            && let Some(file) = named.file
+        {
+            self.child(&named, file, mask);
+        }
+    }
+    /// A change to an open file (`notify_change` of its dentry), opened at
+    /// `path` in `fs`, or with a device of its own: its directory hears of
+    /// it while `path` still names it.
+    pub(crate) fn changed_file(
+        &self,
+        place: Option<(&dyn FileSystem, &[u8])>,
+        device: u64,
+        stat: &FileStat,
+        mask: u32,
+    ) {
+        if mask == 0 || !self.watching() {
+            return;
+        }
+        let file = Found::of(device, stat);
+        let named = place
+            .and_then(|(fs, path)| Self::named(fs, path, true))
+            .filter(|named| named.file.is_some_and(|found| found.key == file.key));
+        match named {
+            Some(named) => self.child(&named, file, mask),
+            None => self.inode(file, mask),
+        }
+    }
+    /// The mask `set_times` reports (`fsnotify_change`): both times is
+    /// `IN_ATTRIB`, only the access time `IN_ACCESS`, only the modification
+    /// time `IN_MODIFY`.
+    pub(crate) fn times_mask(atime: bool, mtime: bool) -> u32 {
+        match (atime, mtime) {
+            (true, true) => ATTRIB,
+            (true, false) => ACCESS,
+            (false, true) => MODIFY,
+            (false, false) => 0,
+        }
+    }
+
+    /// Counts a new instance for `user`: EMFILE past the limit, as Linux's
+    /// `inc_ucount` for `UCOUNT_INOTIFY_INSTANCES`.
+    fn add_instance(&self, user: u32) -> Result<(), Errno> {
+        let mut registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = registry.users.entry(user).or_default();
+        if count.0 >= MAX_INSTANCES {
+            return Err(Errno::EMFILE);
+        }
+        count.0 += 1;
+        Ok(())
+    }
+    /// Lets `instance` hear of changes.
+    fn register(&self, instance: Weak<Instance>) {
+        let mut registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        registry
+            .instances
+            .retain(|instance| instance.strong_count() > 0);
+        registry.instances.push(instance);
+    }
+    /// Counts a new watch for `user`: ENOSPC past the limit.
+    fn add_watch(&self, user: u32) -> Result<(), Errno> {
+        let mut registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = registry.users.entry(user).or_default();
+        if count.1 >= MAX_WATCHES {
+            return Err(Errno::ENOSPC);
+        }
+        count.1 += 1;
+        self.watches.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    /// Gives back `watches` watches of `user`, and the instance with them
+    /// when `instance`.
+    fn release(&self, user: u32, watches: usize, instance: bool) {
+        let mut registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = registry.users.get_mut(&user) {
+            count.1 -= watches.min(count.1);
+            if instance {
+                count.0 = count.0.saturating_sub(1);
+            }
+            if *count == (0, 0) {
+                registry.users.remove(&user);
+            }
+        }
+        self.watches.fetch_sub(watches, Ordering::SeqCst);
+        if instance {
+            registry
+                .instances
+                .retain(|instance| instance.strong_count() > 0);
+        }
+    }
+}
+
+struct Watch {
+    key: Key,
+    /// The events it wants, with `IN_EXCL_UNLINK` and `IN_ONESHOT`.
+    mask: u32,
+}
+struct Event {
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    name: Vec<u8>,
+}
+impl Event {
+    /// The record's length: the name padded with at least one NUL to a
+    /// multiple of the record, as Linux's `round_event_name_len`.
+    fn len(&self) -> usize {
+        RECORD + padded(self.name.len())
+    }
+}
+fn padded(name: usize) -> usize {
+    if name == 0 {
+        0
+    } else {
+        (name + 1).div_ceil(RECORD) * RECORD
+    }
+}
+
+#[derive(Default)]
+struct Queue {
+    events: VecDeque<Event>,
+    /// Whether the `IN_Q_OVERFLOW` event is queued, which is queued once.
+    overflowed: bool,
+    watches: BTreeMap<i32, Watch>,
+    by_key: HashMap<Key, i32>,
+    /// Where the next watch descriptor is looked for, as Linux's
+    /// `idr_alloc_cyclic` keeps its cursor.
+    cursor: i32,
+    /// Events queued so far, each a wakeup of the file.
+    epoch: u64,
+}
+impl Queue {
+    /// Queues `event` as Linux's `fsnotify_insert_event`: past the limit
+    /// only the overflow event, once; an event the same as the last one
+    /// (but for `IN_IGNORED` and moves) is merged into it.
+    fn push(&mut self, event: Event) -> bool {
+        if self.events.len() >= MAX_EVENTS {
+            if self.overflowed {
+                return false;
+            }
+            self.overflowed = true;
+            self.events.push_back(Event {
+                wd: -1,
+                mask: Q_OVERFLOW,
+                cookie: 0,
+                name: Vec::new(),
+            });
+        } else {
+            if let Some(last) = self.events.back()
+                && last.mask & (IGNORED | MOVED_FROM | MOVED_TO) == 0
+                && last.mask == event.mask
+                && last.wd == event.wd
+                && last.name == event.name
+            {
+                return false;
+            }
+            self.events.push_back(event);
+        }
+        self.epoch += 1;
+        true
+    }
+    fn pop(&mut self) -> Option<Event> {
+        let event = self.events.pop_front()?;
+        if event.mask == Q_OVERFLOW && event.wd == -1 {
+            self.overflowed = false;
+        }
+        Some(event)
+    }
+    /// Removes watch `wd` and queues its `IN_IGNORED`, as Linux's
+    /// `inotify_ignored_and_remove_idr`.
+    fn unwatch(&mut self, wd: i32) -> bool {
+        let Some(watch) = self.watches.remove(&wd) else {
+            return false;
+        };
+        self.by_key.remove(&watch.key);
+        self.push(Event {
+            wd,
+            mask: IGNORED,
+            cookie: 0,
+            name: Vec::new(),
+        });
+        true
+    }
+    /// The next free watch descriptor from the cursor, wrapping to 1.
+    fn allocate(&mut self) -> Result<i32, Errno> {
+        let start = self.cursor.max(1);
+        let free = |from: i32, to: i32| {
+            if from > to {
+                return None;
+            }
+            let mut wd = from;
+            for (&used, _) in self.watches.range(from..=to) {
+                if used != wd {
+                    break;
+                }
+                wd = used.checked_add(1)?;
+            }
+            (wd <= to).then_some(wd)
+        };
+        let wd = free(start, i32::MAX)
+            .or_else(|| free(1, start - 1))
+            .ok_or(Errno::ENOSPC)?;
+        self.cursor = wd.wrapping_add(1).max(0);
+        Ok(wd)
+    }
+}
+
+/// An inotify instance, the file `inotify_init1` gives.
+pub(crate) struct Instance {
+    notifier: Arc<Notifier>,
+    hub: Arc<ReadinessHub>,
+    /// The effective user ID whose limits it counts against.
+    owner: u32,
+    flags: AtomicU32,
+    queue: Mutex<Queue>,
+}
+impl Instance {
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// An event for the watch on `key`, if there is one that wants it, as
+    /// Linux's `fsnotify_handle_inode_event` and
+    /// `inotify_handle_inode_event`; a one-shot watch goes with it.
+    fn report(&self, key: Key, mask: u32, name: &[u8], cookie: u32) {
+        let mut queue = self.queue();
+        let Some(&wd) = queue.by_key.get(&key) else {
+            return;
+        };
+        let Some(watch) = queue.watches.get(&wd) else {
+            return;
+        };
+        if mask & watch.mask & ALL_EVENTS == 0 {
+            return;
+        }
+        let oneshot = watch.mask & ONESHOT != 0;
+        // inotify never reported IN_ISDIR with these.
+        let mask = if mask & (MOVE_SELF | DELETE_SELF) != 0 {
+            mask & !ISDIR
+        } else {
+            mask
+        };
+        let mut woke = queue.push(Event {
+            wd,
+            mask,
+            cookie,
+            name: name.to_vec(),
+        });
+        let gone = oneshot && queue.unwatch(wd);
+        woke |= gone;
+        drop(queue);
+        if gone {
+            self.notifier.release(self.owner, 1, false);
+        }
+        if woke {
+            self.hub.changed();
+        }
+    }
+    /// Removes the watch on `key`, whose file is gone.
+    fn forget(&self, key: Key) {
+        let mut queue = self.queue();
+        let Some(&wd) = queue.by_key.get(&key) else {
+            return;
+        };
+        queue.unwatch(wd);
+        drop(queue);
+        self.notifier.release(self.owner, 1, false);
+        self.hub.changed();
+    }
+    /// `inotify_update_watch`: the watch on `key` gets `mask` (or it is
+    /// added with `IN_MASK_ADD`), or a new watch is made.
+    fn watch(&self, key: Key, mask: u32) -> Result<i32, Errno> {
+        let wanted = mask & (ALL_EVENTS | EXCL_UNLINK | ONESHOT);
+        let mut queue = self.queue();
+        if let Some(&wd) = queue.by_key.get(&key) {
+            if mask & MASK_CREATE != 0 {
+                return Err(Errno::EEXIST);
+            }
+            if let Some(watch) = queue.watches.get_mut(&wd) {
+                watch.mask = if mask & MASK_ADD != 0 {
+                    watch.mask | wanted
+                } else {
+                    wanted
+                };
+            }
+            return Ok(wd);
+        }
+        // The descriptor is taken before the count is (`inotify_new_watch`),
+        // so a refused watch still moves the cursor on.
+        let wd = queue.allocate()?;
+        self.notifier.add_watch(self.owner)?;
+        queue.watches.insert(wd, Watch { key, mask: wanted });
+        queue.by_key.insert(key, wd);
+        Ok(wd)
+    }
+    /// `inotify_rm_watch`: EINVAL for a descriptor no watch has.
+    fn unwatch(&self, wd: i32) -> Result<(), Errno> {
+        let mut queue = self.queue();
+        if !queue.unwatch(wd) {
+            return Err(Errno::EINVAL);
+        }
+        drop(queue);
+        self.notifier.release(self.owner, 1, false);
+        self.hub.changed();
+        Ok(())
+    }
+}
+impl Drop for Instance {
+    fn drop(&mut self) {
+        let watches = self.queue().watches.len();
+        self.notifier.release(self.owner, watches, true);
+    }
+}
+
+fn outcome(result: Result<u64, Errno>) -> Outcome {
+    Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
+}
+pub(crate) fn sys_inotify_init(c: &mut Context<'_>, _: [u64; 6]) -> Outcome {
+    outcome(init(c, 0))
+}
+pub(crate) fn sys_inotify_init1(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(init(c, a[0] as u32))
+}
+pub(crate) fn sys_inotify_add_watch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(add_watch(c, a[0], a[1], a[2] as u32))
+}
+pub(crate) fn sys_inotify_rm_watch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(rm_watch(c, a[0], a[1] as i32))
+}
+
+/// `do_inotify_init`: the flags, the user's instances (EMFILE), then the
+/// descriptor.
+fn init(c: &mut Context<'_>, flags: u32) -> Result<u64, Errno> {
+    if flags & !(NONBLOCK | CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let notifier = Arc::clone(&c.files.caches.notify);
+    let owner = c.process.credentials.euid;
+    notifier.add_instance(owner)?;
+    // Counted now, and given back when it goes.
+    let instance = Arc::new(Instance {
+        notifier: Arc::clone(&notifier),
+        hub: Arc::clone(&c.files.readiness),
+        owner,
+        flags: AtomicU32::new(flags & NONBLOCK),
+        queue: Mutex::default(),
+    });
+    notifier.register(Arc::downgrade(&instance));
+    c.files
+        .install(instance, flags & CLOEXEC != 0, c.group.nofile())
+        .map(u64::from)
+}
+
+/// The instance descriptor `fd` holds: EBADF for none (or an `O_PATH`
+/// one, which `fdget` does not take), EINVAL for another file.
+fn instance(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
+    let file = c.files.descriptor(fd)?.file;
+    if file.flags() & crate::files::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    Ok(file)
+}
+fn of(file: &Arc<dyn FileHandle>) -> Option<&Instance> {
+    file.as_any()?.downcast_ref::<Instance>()
+}
+
+/// `inotify_add_watch(fd, path, mask)`, checked in Linux's order: the mask's
+/// bits, the descriptor, `IN_MASK_ADD` with `IN_MASK_CREATE`, the file, then
+/// the path and the right to read what it names.
+fn add_watch(c: &mut Context<'_>, fd: u64, path: u64, mask: u32) -> Result<u64, Errno> {
+    if mask & !ALL_BITS != 0 || mask & ALL_BITS == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = instance(c, fd)?;
+    if mask & MASK_ADD != 0 && mask & MASK_CREATE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let instance = of(&file).ok_or(Errno::EINVAL)?;
+    let key = crate::files::watched(c, path, mask & DONT_FOLLOW == 0, mask & ONLYDIR != 0)?;
+    instance.watch(key, mask).map(|wd| wd as u32 as u64)
+}
+
+fn rm_watch(c: &mut Context<'_>, fd: u64, wd: i32) -> Result<u64, Errno> {
+    let file = instance(c, fd)?;
+    of(&file).ok_or(Errno::EINVAL)?.unwatch(wd).map(|()| 0)
+}
+
+/// A read of an instance; `None` for any other file.
+pub(crate) fn read(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    out: &mut [u8],
+    nowait: bool,
+) -> Option<Result<usize, Errno>> {
+    let instance = of(file)?;
+    Some(read_events(c, instance, out, nowait))
+}
+
+/// Linux's `inotify_read`: as many whole records as fit, waiting for the
+/// first unless the file is non-blocking; EINVAL when the first does not
+/// fit, and a pending signal ends the wait (ERESTARTSYS).
+fn read_events(
+    c: &mut Context<'_>,
+    instance: &Instance,
+    out: &mut [u8],
+    nowait: bool,
+) -> Result<usize, Errno> {
+    loop {
+        let ticket = c.files.readiness.token.value();
+        let mut queue = instance.queue();
+        let mut at = 0;
+        let mut short = false;
+        while let Some(len) = queue.events.front().map(Event::len) {
+            if len > out.len() - at {
+                short = true;
+                break;
+            }
+            let Some(event) = queue.pop() else {
+                break;
+            };
+            let record = &mut out[at..at + len];
+            record.fill(0);
+            record[0..4].copy_from_slice(&event.wd.to_le_bytes());
+            record[4..8].copy_from_slice(&event.mask.to_le_bytes());
+            record[8..12].copy_from_slice(&event.cookie.to_le_bytes());
+            record[12..16].copy_from_slice(&((len - RECORD) as u32).to_le_bytes());
+            record[RECORD..RECORD + event.name.len()].copy_from_slice(&event.name);
+            at += len;
+        }
+        drop(queue);
+        if at != 0 {
+            return Ok(at);
+        }
+        if short {
+            return Err(Errno::EINVAL);
+        }
+        if nowait || instance.flags.load(Ordering::SeqCst) & NONBLOCK != 0 {
+            return Err(Errno::EAGAIN);
+        }
+        if crate::events::signalled(c) {
+            return Err(Errno(4));
+        }
+        crate::events::wait(c, ticket, None)?;
+    }
+}
+
+/// An instance's own `ioctl` requests (`inotify_ioctl`): `FIONREAD`, the
+/// bytes its queued records take, and `INOTIFY_IOC_SETNEXTWD`; `ENOTTY` for
+/// any other. `None` for any other file.
+pub(crate) fn ioctl(
+    c: &Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    request: u64,
+    argument: u64,
+) -> Option<Result<u64, Errno>> {
+    let instance = of(file)?;
+    Some(match request & 0xffff_ffff {
+        FIONREAD => {
+            let bytes: usize = instance.queue().events.iter().map(Event::len).sum();
+            c.mem
+                .write(GuestAddr(argument), &(bytes as i32).to_le_bytes())
+                .map(|()| 0)
+                .map_err(|_| Errno::EFAULT)
+        }
+        SETNEXTWD if (1..=i32::MAX as u64).contains(&argument) => {
+            instance.queue().cursor = argument as i32;
+            Ok(0)
+        }
+        SETNEXTWD => Err(Errno::EINVAL),
+        _ => Err(Errno::ENOTTY),
+    })
+}
+
+impl FileHandle for Instance {
+    fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        let queue = self.queue();
+        Ok((u32::from(!queue.events.is_empty()) * IN, queue.epoch, 0))
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    /// Reads come through [`read`], which can wait.
+    fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EAGAIN)
+    }
+    /// Opened for reading only.
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::EBADF)
+    }
+    /// Linux's `noop_llseek`: the position stays 0, whatever is asked.
+    fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+        Ok(0)
+    }
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(FileStat {
+            mode: 0o600,
+            links: 1,
+            ..FileStat::default()
+        })
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::SeqCst)
+    }
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.flags.store(flags & NONBLOCK, Ordering::SeqCst);
+        Ok(())
+    }
+}

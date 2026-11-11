@@ -580,6 +580,61 @@ static int case_home(void) {
     return 0;
 }
 
+/* A program a process runs holds its file (Linux's `exe_file`): removed,
+   its end waits until no process runs it. Its exec's own events are not
+   watched (they are no events here). */
+static int case_running(void) {
+    make_base("running");
+    char *prog = at("prog");
+    int from = open("/proc/self/exe", O_RDONLY);
+    int to = open(prog, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    char buf[65536];
+    ssize_t n;
+    long copied = 0;
+    while ((n = read(from, buf, sizeof buf)) > 0) copied += write(to, buf, n);
+    close(from);
+    close(to);
+    printf("copied=%d\n", copied > 0);
+    int fd = inotify_init1(IN_NONBLOCK);
+    int wd = inotify_add_watch(fd, prog, IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
+    printf("wd prog=%d\n", wd);
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 92;
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready[0]);
+        close(done[1]);
+        dup2(ready[1], 10);
+        dup2(done[0], 11);
+        close(ready[1]);
+        close(done[0]);
+        execl(prog, prog, "inotify-runner", (char *)NULL);
+        _exit(93);
+    }
+    close(ready[1]);
+    close(done[0]);
+    char byte = 0;
+    long got = read(ready[0], &byte, 1);
+    printf("child ran=%ld byte=%c\n", got, byte);
+    printf("unlink=%ld\n", e(unlink(prog)));
+    drain(fd, "removed");
+    close(done[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("exited=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    drain(fd, "exited");
+    remove_all();
+    return 0;
+}
+/* The program case_running runs: it says it runs, then waits for the end
+   of its input. */
+static int case_runner(void) {
+    char byte;
+    if (write(10, "r", 1) != 1) return 94;
+    while (read(11, &byte, 1) > 0) {}
+    return 0;
+}
+
 static void on_alarm(int sig) { (void)sig; }
 
 static int case_wait(void) {
@@ -639,5 +694,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-content")) return case_content();
     if (!strcmp(mode, "inotify-held")) return case_held();
     if (!strcmp(mode, "inotify-home")) return case_home();
+    if (!strcmp(mode, "inotify-running")) return case_running();
+    if (!strcmp(mode, "inotify-runner")) return case_runner();
     return 2;
 }

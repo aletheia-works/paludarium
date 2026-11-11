@@ -4732,6 +4732,26 @@ mod inotify {
         );
     }
     #[test]
+    fn a_removed_program_ends_when_no_process_runs_it() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let prog = put(&f, DATA, b"/tmp/prog");
+        let d = f.ret(2, &[prog, 0o101, 0o700]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        let wd = f.ret(ADD, &[fd, prog, 0x400]) as i32;
+        // What exec keeps while the program runs (`exe_file`).
+        let running = crate::processes::deny_writes(&f.kernel.files, b"/tmp/prog")
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.ret(87, &[prog]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        drop(running);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
+    }
+    #[test]
     fn the_queue_merges_repeats_and_overflows_once() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK]);

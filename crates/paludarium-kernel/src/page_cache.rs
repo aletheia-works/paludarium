@@ -115,12 +115,18 @@ impl Drop for WriteAccess {
                 writes.remove(&self.key);
             }
         }
+        drop(writes);
+        // A program a process ran holds its file (Linux's `exe_file`): a
+        // removed one ends once no process runs it, as with a last close.
+        if self.change < 0 && self.caches.notify.waiting() && !self.caches.held(self.key) {
+            self.caches.notify.last_closed(self.key);
+        }
     }
 }
 
 impl PageCaches {
-    /// Whether a description of file `key` is open, or it is a working
-    /// directory.
+    /// Whether a description of file `key` is open, it is a working
+    /// directory, or a program runs from it.
     fn held(&self, key: Key) -> bool {
         let opened = {
             let opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
@@ -140,6 +146,12 @@ impl PageCaches {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .contains_key(&key)
+            || self
+                .writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&key)
+                .is_some_and(|&count| count < 0)
     }
     /// A hold on the directory at `path` in `fs` as a working directory,
     /// by the key inotify knows it by; none if it cannot be looked at.

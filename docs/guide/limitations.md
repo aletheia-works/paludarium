@@ -313,7 +313,10 @@ verified.
   `epoll_wait` that does not wait can come before it.
 - **inotify, in part**: opening a FIFO by its path, running a program
   (which Linux reports as `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`),
-  `splice` and `io_uring`'s reads and writes are no events. A change through a
+  `splice` and `io_uring`'s reads and writes are no events. The ELF
+  interpreter exec loads does not hold its file, so a removed one gets
+  `IN_DELETE_SELF` at once, where Linux's mappings of it wait for the
+  programs it runs. A change through a
   descriptor (`fchmod`, `ftruncate`, a read, a write or a close) reaches the
   watch of the file's directory while the path it was opened at still names
   it, and by that name once no name links the file; a file renamed or reached

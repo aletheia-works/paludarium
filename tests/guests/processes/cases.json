@@ -74,6 +74,7 @@
     {"name":"inotify-content","binary":"inotify"},
     {"name":"inotify-held","binary":"inotify"},
     {"name":"inotify-home","binary":"inotify"},
+    {"name":"inotify-running","binary":"inotify"},
     {"name":"mqueue-calls","binary":"mqueue"},
     {"name":"mqueue-limits","binary":"mqueue"},
     {"name":"mqueue-wait","binary":"mqueue"},

@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `kcmp`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
@@ -857,6 +857,18 @@ kernel.
   the class none, whatever its nice value; for several threads, the best as Linux's
   `ioprio_best` compares them (one without a class counts as best-effort
   level 4). A priority with a class passes to new threads and processes.
+- `kcmp` finds each thread as the caller's PID namespace numbers it
+  (`ESRCH`) and needs to be allowed to read both, as `ptrace_may_access` in
+  read mode with the real IDs decides (`EPERM`). It then compares, as Linux's
+  `kernel/kcmp.c`, an open file of each by descriptor (`EBADF`), the memory,
+  the descriptor table, the working directory and umask (`CLONE_FS`), the
+  signal dispositions, the I/O context `ioprio_set` gives, the System V
+  semaphore undo list, or a file with one an epoll instance of the second
+  thread watches (`KCMP_EPOLL_TFD`: `EFAULT`, `EBADF`, `EINVAL` for a file
+  that is not epoll, `ENOENT`). It gives 0 for the same object, and 1 or 2
+  for others in an order that random cookies make, as Linux hides the
+  objects' addresses. A thread without one (an ended process, a thread with
+  no I/O context or undo list) compares equal to another without.
 - `personality` keeps any value for the thread, as Linux stores it, and
   returns the old one (`0xffffffff` only asks). New threads and processes
   inherit it, and `execve` keeps it but for `READ_IMPLIES_EXEC`, and

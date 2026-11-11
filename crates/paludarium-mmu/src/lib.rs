@@ -3354,6 +3354,12 @@ pub struct MemoryView {
 }
 
 impl MemoryView {
+    /// What tells the address space apart from every other while it lives,
+    /// as Linux's `kcmp` compares `mm` pointers.
+    #[must_use]
+    pub fn identity(&self) -> usize {
+        self.data.as_ptr() as *const () as usize
+    }
     /// Whether this is a view of `space`, while it lives.
     #[must_use]
     pub fn is_of(&self, space: &AddressSpace) -> bool {

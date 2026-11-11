@@ -6242,6 +6242,114 @@ static int futex_wake_op_case(void) {
     munmap(page, 4096);
     return 0;
 }
+/* kcmp, as Linux's kernel/kcmp.c: the order of two different objects is
+ * random, so only "same" (0) and "differ" (1 or 2, one each way) show. */
+static long kc_raw(long pid1, long pid2, long type, long idx1, long idx2) {
+    long r = syscall(312, pid1, pid2, type, idx1, idx2);
+    return r < 0 ? -errno : r;
+}
+static const char *kc(long pid1, long pid2, long type, long idx1, long idx2) {
+    static char text[8][16];
+    static int next;
+    char *out = text[next++ % 8];
+    long r = kc_raw(pid1, pid2, type, idx1, idx2);
+    long back = kc_raw(pid2, pid1, type, idx2, idx1);
+    if (r == 0) snprintf(out, 16, "same");
+    else if ((r == 1 || r == 2) && (type == 7 || back == 3 - r)) snprintf(out, 16, "differ");
+    else snprintf(out, 16, "%ld", r);
+    return out;
+}
+static int kc_gate[2];
+static long kc_tid;
+static void *kc_thread(void *arg) {
+    (void)arg;
+    kc_tid = syscall(SYS_gettid);
+    char c;
+    /* The emulator lets a child's SIGCHLD interrupt this; Linux does not. */
+    while (read(kc_gate[0], &c, 1) < 0 && errno == EINTR) {}
+    return NULL;
+}
+/* A child that waits for the gate to close, after it, with `dumpable`,
+ * sets that. */
+static pid_t kc_child(int dumpable) {
+    int ready[2];
+    if (pipe(ready)) return -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(ready[0]);
+        close(kc_gate[1]);
+        if (!dumpable) prctl(PR_SET_DUMPABLE, 0);
+        write(ready[1], "r", 1);
+        char c;
+        while (read(kc_gate[0], &c, 1) > 0) {}
+        _exit(0);
+    }
+    close(ready[1]);
+    char c;
+    read(ready[0], &c, 1);
+    close(ready[0]);
+    return pid;
+}
+static int kcmp_case(void) {
+    if (pipe(kc_gate)) return 80;
+    long self = getpid();
+    int a = eventfd(0, 0), b = eventfd(0, 0), dup_a = dup(a);
+    int epoll = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN};
+    if (a < 0 || b < 0 || dup_a < 0 || epoll < 0 || epoll_ctl(epoll, EPOLL_CTL_ADD, b, &ev))
+        return 81;
+    pthread_t t;
+    pthread_create(&t, NULL, kc_thread, NULL);
+    while (!__atomic_load_n(&kc_tid, __ATOMIC_SEQ_CST)) sched_yield();
+    pid_t child = kc_child(1), locked = kc_child(0);
+    pid_t zombie = fork();
+    if (zombie == 0) _exit(0);
+    siginfo_t info;
+    waitid(P_PID, zombie, &info, WEXITED | WNOWAIT);
+    printf("kcmp errors zero=%ld negative=%ld absent=%ld high-pid=%ld type=%ld high-type=%ld "
+           "badf=%ld,%ld high-index=%ld\n",
+           kc_raw(0, self, 1, 0, 0), kc_raw(self, -1, 1, 0, 0), kc_raw(self, 4194303, 1, 0, 0),
+           kc_raw(self | 1L << 32, self, 1, 0, 0), kc_raw(self, self, 8, 0, 0),
+           kc_raw(self, self, 1 | 1L << 32, 0, 0), kc_raw(self, self, 0, a, 999),
+           kc_raw(self, child, 0, 999, a), kc_raw(self, self, 0, a | 1L << 32, dup_a));
+    static const char *names[] = {"file", "vm", "files", "fs", "sighand", "io", "sysvsem"};
+    for (int type = 1; type <= 6; type++)
+        printf("kcmp %s self=%s thread=%s child=%s zombie=%s zombie-self=%s\n", names[type],
+               kc(self, self, type, 0, 0), kc(self, kc_tid, type, 0, 0), kc(self, child, type, 0, 0),
+               kc(self, zombie, type, 0, 0), kc(zombie, zombie, type, 0, 0));
+    printf("kcmp file dup=%s other=%s child-inherited=%s child-other=%s thread=%s zombie=%ld\n",
+           kc(self, self, 0, a, dup_a), kc(self, self, 0, a, b), kc(self, child, 0, a, a),
+           kc(self, child, 0, a, b), kc(self, kc_tid, 0, b, b), kc_raw(zombie, zombie, 0, 0, 0));
+    /* An I/O priority gives the child an I/O context of its own. */
+    long set = syscall(SYS_ioprio_set, 1, (long)child, (2L << 13) | 4);
+    printf("kcmp io after-ioprio_set=%ld child=%s child-self=%s\n", set, kc(self, child, 5, 0, 0),
+           kc(child, child, 5, 0, 0));
+    struct {
+        uint32_t efd, tfd, toff;
+    } slot = {(uint32_t)epoll, (uint32_t)b, 0};
+    long watched = kc_raw(self, self, 7, b, (long)&slot);
+    long from_child = kc_raw(child, self, 7, b, (long)&slot);
+    long other = kc_raw(self, self, 7, a, (long)&slot);
+    slot.toff = 1;
+    long past = kc_raw(self, self, 7, b, (long)&slot);
+    slot.toff = 0;
+    slot.efd = (uint32_t)a;
+    long not_epoll = kc_raw(self, self, 7, b, (long)&slot);
+    slot.efd = 999;
+    long bad_epoll = kc_raw(self, self, 7, b, (long)&slot);
+    printf("kcmp epoll watched=%ld from-child=%ld other=%s past=%ld not-epoll=%ld bad-epoll=%ld "
+           "fault=%ld\n",
+           watched, from_child, other == 1 || other == 2 ? "differ" : "?", past, not_epoll,
+           bad_epoll, kc_raw(self, self, 7, b, 8));
+    /* Another user's or an undumpable task needs CAP_SYS_PTRACE. */
+    printf("kcmp undumpable=%s root=%d\n", kc(self, locked, 1, 0, 0), geteuid() == 0);
+    close(kc_gate[1]);
+    pthread_join(t, NULL);
+    waitpid(child, NULL, 0);
+    waitpid(locked, NULL, 0);
+    waitpid(zombie, NULL, 0);
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -17552,6 +17660,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "futex2")) return futex2_case();
     if (!strcmp(mode, "futex-requeue")) return futex_requeue_case();
     if (!strcmp(mode, "futex-wake-op")) return futex_wake_op_case();
+    if (!strcmp(mode, "kcmp")) return kcmp_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

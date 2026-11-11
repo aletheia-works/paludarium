@@ -274,6 +274,7 @@ NAMES = {
     307: "sendmmsg",
     308: "setns",
     309: "getcpu",
+    312: "kcmp",
     314: "sched_setattr",
     315: "sched_getattr",
     316: "renameat2",

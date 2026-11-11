@@ -480,6 +480,7 @@ mod linux {
         processes_futex2 => ("futex2","process"),
         processes_futex_requeue => ("futex-requeue","process"),
         processes_futex_wake_op => ("futex-wake-op","process"),
+        processes_kcmp => ("kcmp","process"),
         processes_mmsg => ("mmsg","process"),
         processes_itimer => ("itimer","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),

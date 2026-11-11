@@ -162,6 +162,25 @@ impl FilesView {
             .upgrade()
             .map_or(0o022, |umask| umask.load(Ordering::SeqCst))
     }
+    /// What tells the descriptor table apart, while it lives (Linux's
+    /// `files_struct` for `kcmp`).
+    pub(crate) fn table(&self) -> Option<usize> {
+        let fds = self.fds.upgrade()?;
+        Some(Arc::as_ptr(&fds) as *const () as usize)
+    }
+    /// What tells the working directory and umask apart, which `CLONE_FS`
+    /// shares, while they live (Linux's `fs_struct`).
+    pub(crate) fn fs(&self) -> Option<usize> {
+        let umask = self.umask.upgrade()?;
+        Some(Arc::as_ptr(&umask) as *const () as usize)
+    }
+    /// The open file description of descriptor `fd`, `O_PATH` ones included
+    /// (Linux's `fget_task`).
+    pub(crate) fn file(&self, fd: u32) -> Option<Arc<dyn FileHandle>> {
+        let fds = self.fds.upgrade()?;
+        let fds = fds.lock().unwrap_or_else(PoisonError::into_inner);
+        fds.get(&fd).map(|descriptor| Arc::clone(&descriptor.file))
+    }
     /// One past the highest open descriptor.
     pub(crate) fn descriptors(&self) -> usize {
         self.fds.upgrade().map_or(0, |fds| {

@@ -61,6 +61,20 @@ impl EpollInstance {
     fn identity(file: &Arc<dyn FileHandle>) -> usize {
         Arc::as_ptr(file) as *const () as usize
     }
+    /// The file of the `offset`-th interest for descriptor `fd`, in the
+    /// order Linux's `ep_find_tfd` walks them (by file, for one number), as
+    /// [`Self::identity`] tells it apart; `None` when there is none
+    /// (`get_epoll_tfile_raw_ptr`'s `ENOENT`). A closed file's interest is
+    /// gone, as Linux's `eventpoll_release` takes it out.
+    pub(crate) fn target(&self, fd: u32, offset: u64) -> Option<usize> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .interests
+            .iter()
+            .filter(|((number, _), interest)| *number == fd && interest.file.strong_count() > 0)
+            .nth(usize::try_from(offset).ok()?)
+            .map(|(&(_, identity), _)| identity)
+    }
     fn reaches(&self, target: usize, seen: &mut HashSet<usize>) -> bool {
         let identity = self as *const Self as usize;
         if identity == target {

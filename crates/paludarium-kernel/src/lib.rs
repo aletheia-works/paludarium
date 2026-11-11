@@ -28,6 +28,7 @@ mod inet;
 mod interface;
 mod io_uring;
 mod ipc;
+mod kcmp;
 mod loopback;
 mod netlink;
 pub use inet::{InvalidRule, NetworkPolicy};

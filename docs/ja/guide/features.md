@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`kcmp`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
@@ -764,6 +764,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   スレッドなら、Linux の `ioprio_best` と同じように比べていちばんよいものです（クラスの
   ないものはベストエフォートのレベル 4 とみなします）。クラスのある優先度は、新しい
   スレッドとプロセスに渡ります。
+- `kcmp` は、呼んだ側の PID 名前空間の番号でそれぞれのスレッドを見つけ（`ESRCH`）、実 ID で
+  判断する読み取りモードの `ptrace_may_access` と同じく、両方を読めることを求めます（`EPERM`）。
+  そのうえで Linux の `kernel/kcmp.c` と同じく、ディスクリプタで指したそれぞれの開いたファイル
+  （`EBADF`）、メモリ、ディスクリプタ表、作業ディレクトリと umask（`CLONE_FS`）、シグナルの
+  処理、`ioprio_set` が与える I/O コンテキスト、System V セマフォの undo リスト、または
+  2 つめのスレッドの epoll インスタンスが見張るファイルとの比較（`KCMP_EPOLL_TFD`：`EFAULT`、
+  `EBADF`、epoll でないファイルは `EINVAL`、`ENOENT`）を比べます。同じものなら 0、違うものなら、
+  Linux がアドレスを隠すのと同じく、ランダムなクッキーで決まる順の 1 か 2 を返します。それを
+  持たないスレッド（終わったプロセス、I/O コンテキストや undo リストのないスレッド）どうしは
+  等しいとみなします。
 - `personality` は、Linux と同じくどんな値でもスレッドに持ち、前の値を返します
   （`0xffffffff` は問い合わせだけです）。新しいスレッドとプロセスはそれを継ぎ、
   `execve` は `READ_IMPLIES_EXEC` を、set-ID のプログラムなら `PER_CLEAR_ON_SETID` も

@@ -137,26 +137,16 @@ impl Task {
         FileStat { uid, gid, ..stat }
     }
     /// Whether the reader may see the task's memory and links, as Linux's
-    /// `ptrace_may_access` in read mode decides: its own process, a reader
-    /// with `CAP_SYS_PTRACE`, or one whose IDs are every user and group ID of
-    /// a dumpable task: its filesystem IDs, or with `real` (`environ`'s
-    /// `PTRACE_MODE_REALCREDS`) its real ones. Landlock then keeps a reader
-    /// in a domain from a task outside it (`hook_ptrace_access_check`).
+    /// `ptrace_may_access` in read mode decides: its own process, or what
+    /// [`crate::credentials::Credentials::may_read_task`] allows, `real`
+    /// being `environ`'s `PTRACE_MODE_REALCREDS`.
     fn may_access(&self, c: &Context<'_>, real: bool) -> bool {
-        const CAP_SYS_PTRACE: u64 = 1 << 19;
-        let reader = &c.process.credentials;
-        let target = &self.public.credentials;
-        let (uid, gid) = if real {
-            (reader.uid, reader.gid)
-        } else {
-            (reader.fsuid, reader.fsgid)
-        };
         self.pid == c.process.pid
-            || (reader.capable_in(CAP_SYS_PTRACE, &target.user)
-                || self.view.dumpable
-                    && [target.uid, target.euid, target.suid] == [uid; 3]
-                    && [target.gid, target.egid, target.sgid] == [gid; 3])
-                && crate::landlock::may_trace(&reader.landlock, &target.landlock)
+            || c.process.credentials.may_read_task(
+                &self.public.credentials,
+                self.view.dumpable,
+                real,
+            )
     }
 }
 

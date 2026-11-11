@@ -5004,3 +5004,67 @@ mod futex_requeue {
         assert_eq!(f.ret(456, &[last, 0, 1, 1]), errno(Errno::EFAULT));
     }
 }
+mod kcmp {
+    use super::*;
+    const SLOT: u64 = DATA + 0x20;
+    fn slot(f: &Fixture, efd: u64, tfd: u64, toff: u32) {
+        let mut bytes = [0; 12];
+        bytes[..4].copy_from_slice(&(efd as u32).to_le_bytes());
+        bytes[4..8].copy_from_slice(&(tfd as u32).to_le_bytes());
+        bytes[8..].copy_from_slice(&toff.to_le_bytes());
+        f.mem.write(GuestAddr(SLOT), &bytes).unwrap();
+    }
+    #[test]
+    fn kcmp_checks_and_compares_as_linux_does() {
+        let mut f = fixture();
+        let (esrch, einval, ebadf) = (errno(Errno(3)), errno(Errno::EINVAL), errno(Errno::EBADF));
+        let pid = f.ret(39, &[]);
+        // The numbers are `int`s, and a thread must have one.
+        assert_eq!(f.ret(312, &[0, pid, 1, 0, 0]), esrch);
+        assert_eq!(f.ret(312, &[pid, u64::MAX, 1, 0, 0]), esrch);
+        assert_eq!(f.ret(312, &[pid, 999, 1, 0, 0]), esrch);
+        assert_eq!(f.ret(312, &[pid | 1 << 32, pid, 1, 0, 0]), 0);
+        // A thread shares everything with itself, the I/O context and the
+        // undo list it does not have included; the type is an `int`.
+        for kind in 1..=6 {
+            assert_eq!(f.ret(312, &[pid, pid, kind, 0, 0]), 0, "type {kind}");
+        }
+        assert_eq!(f.ret(312, &[pid, pid, 1 | 1 << 32, 0, 0]), 0);
+        assert_eq!(f.ret(312, &[pid, pid, 8, 0, 0]), einval);
+        assert_eq!(f.ret(312, &[pid, pid, u64::MAX, 0, 0]), einval);
+        // KCMP_FILE: a dup is the same description, another eventfd is not,
+        // in one order each way; the indices are `unsigned int`s.
+        let (a, b) = (f.ret(290, &[0, 0]), f.ret(290, &[0, 0]));
+        let dup = f.ret(32, &[a]);
+        assert_eq!(f.ret(312, &[pid, pid, 0, a, dup]), 0);
+        let order = f.ret(312, &[pid, pid, 0, a, b]);
+        assert!(order == 1 || order == 2, "{order}");
+        assert_eq!(f.ret(312, &[pid, pid, 0, b, a]), 3 - order);
+        assert_eq!(f.ret(312, &[pid, pid, 0, a, 99]), ebadf);
+        assert_eq!(f.ret(312, &[pid, pid, 0, 99, a]), ebadf);
+        assert_eq!(f.ret(312, &[pid, pid, 0, a | 1 << 32, dup]), 0);
+        // KCMP_EPOLL_TFD: the slot first, then the first file, the epoll
+        // file, that it is one, and the watched file, counted by `toff`.
+        let epoll = f.ret(291, &[0]);
+        f.mem.write(GuestAddr(DATA), &1u32.to_le_bytes()).unwrap();
+        assert_eq!(f.ret(233, &[epoll, 1, b, DATA]), 0);
+        slot(&f, epoll, b, 0);
+        assert_eq!(f.ret(312, &[pid, pid, 7, b, SLOT]), 0);
+        assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), order);
+        assert_eq!(f.ret(312, &[99, pid, 7, a, 8]), esrch);
+        assert_eq!(f.ret(312, &[pid, pid, 7, 99, 8]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(312, &[pid, pid, 7, 99, SLOT]), ebadf);
+        slot(&f, 99, b, 0);
+        assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), ebadf);
+        slot(&f, a, b, 0);
+        assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), einval);
+        slot(&f, epoll, b, 1);
+        assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), errno(Errno::ENOENT));
+        slot(&f, epoll, a, 0);
+        assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), errno(Errno::ENOENT));
+        // Closing the watched file's last descriptor takes it out.
+        assert_eq!(f.ret(3, &[b]), 0);
+        slot(&f, epoll, b, 0);
+        assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), errno(Errno::ENOENT));
+    }
+}

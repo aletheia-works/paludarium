@@ -225,6 +225,15 @@ impl ThreadGroup {
                 .or_insert_with(crate::sem::UndoList::new),
         )
     }
+    /// What tells `tid`'s undo list apart, if it has one, without giving it
+    /// one (Linux's `sysvsem.undo_list` for `kcmp`).
+    pub(crate) fn sem_undo_identity(&self, tid: u32) -> Option<usize> {
+        self.sem_undo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .map(|list| Arc::as_ptr(list) as usize)
+    }
     /// Gives `tid` the undo list `list`.
     pub(crate) fn set_sem_undo_list(&self, tid: u32, list: Arc<crate::sem::UndoList>) {
         self.sem_undo

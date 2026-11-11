@@ -209,6 +209,26 @@ impl Credentials {
     }
     /// Whether the thread has `cap` in user namespace `ns`, as Linux's
     /// `ns_capable` ([`crate::namespaces::Namespace::grants`]).
+    /// Whether a task with these credentials may read the details of a task
+    /// of another process with `target`'s, as Linux's `__ptrace_may_access`
+    /// in read mode decides: `CAP_SYS_PTRACE` in the target's user
+    /// namespace, or every user and group ID of a dumpable target equal to
+    /// the reader's filesystem ones, or with `real`
+    /// (`PTRACE_MODE_REALCREDS`) its real ones. Landlock then keeps a reader
+    /// in a domain from a task outside it (`hook_ptrace_access_check`).
+    pub(crate) fn may_read_task(&self, target: &Credentials, dumpable: bool, real: bool) -> bool {
+        const CAP_SYS_PTRACE: u64 = 1 << 19;
+        let (uid, gid) = if real {
+            (self.uid, self.gid)
+        } else {
+            (self.fsuid, self.fsgid)
+        };
+        (self.capable_in(CAP_SYS_PTRACE, &target.user)
+            || dumpable
+                && [target.uid, target.euid, target.suid] == [uid; 3]
+                && [target.gid, target.egid, target.sgid] == [gid; 3])
+            && crate::landlock::may_trace(&self.landlock, &target.landlock)
+    }
     pub(crate) fn capable_in(&self, cap: u64, ns: &crate::namespaces::Namespace) -> bool {
         ns.grants(&self.user, self.euid, self.effective, cap)
     }

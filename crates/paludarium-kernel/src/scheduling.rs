@@ -66,6 +66,9 @@ pub(crate) struct Sched {
     /// The I/O priority of the thread's I/O context, which it has once
     /// `ioprio_set` gives it one.
     pub io: Option<u16>,
+    /// That I/O context (Linux's `io_context`), told apart by a number from
+    /// [`new_io_context`]; 0 while it has none.
+    pub io_context: u64,
 }
 
 impl Default for Sched {
@@ -90,8 +93,15 @@ impl Default for Sched {
                 },
             ],
             io: None,
+            io_context: 0,
         }
     }
+}
+
+/// A number for a new I/O context, which no other has had.
+pub(crate) fn new_io_context() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn rt_policy(policy: u32) -> bool {
@@ -154,7 +164,14 @@ impl Sched {
         if child.deadline_policy() {
             return Err(Errno(11)); // EAGAIN
         }
+        // copy_io: without CLONE_IO, which clone refuses, a context with a
+        // class is copied into a new one.
         child.io = self.io.filter(|&io| io_class(io) != 0);
+        child.io_context = if child.io.is_some() {
+            new_io_context()
+        } else {
+            0
+        };
         Ok((child, reset_nice))
     }
 }

@@ -296,12 +296,20 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IFF_UP` のほかのフラグを変えません。最初の名前空間でも `lo` しか見えません。
   Linux ではホストのインターフェースが見えます。
   netlink には `NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC` しかありません
-  （ほかは `EPROTONOSUPPORT`）。ソケット診断が伝えるのは AF_UNIX のソケットだけです。
-  AF_INET と AF_INET6（`ss -t` と `ss -u` が求める `inet_diag`）、AF_NETLINK、AF_PACKET には
-  ハンドラーがなく（`ENOENT`）、`TCPDIAG_GETSOCK` は `EOPNOTSUPP` です。AF_UNIX の
-  ダンプは古いものから順に挙げます。Linux の順はハッシュ表に従います。送って待っている
-  ものは、ここで送信バッファーに数える量で数えます。Linux はバッファーの本当の大きさで
-  数えます。汎用 netlink のファミリーは `nlctrl` だけで、Linux ではホストの
+  （ほかは `EPROTONOSUPPORT`）。ソケット診断が伝えるのは AF_UNIX、TCP、UDP のソケット
+  だけです。AF_NETLINK と AF_PACKET にはハンドラーがなく（`ENOENT`）、Linux がモジュール
+  として読み込む raw ソケット、SCTP、MPTCP のハンドラーもありません。`SOCK_DESTROY` は
+  `EOPNOTSUPP` です。ダンプは古いソケットから順に挙げます。Linux の順はハッシュ表に
+  従います。AF_UNIX のソケットが送って待っているものは、ここで送信バッファーに数える量で
+  数えます。Linux はバッファーの本当の大きさで数えます。TCP のソケットについては
+  `tcp_info`（`ss -i` が求める `INET_DIAG_INFO`）を伝えず、メモリはバッファーのほかを 0 と
+  伝えます。キープアライブのタイマーは今から `TCP_KEEPIDLE` まるごとで終わるとし、再送の
+  時刻と回数があるのはループバックのハンドシェイクだけです。ホストが張った接続には、
+  終わったあとの `TIME_WAIT` がありません。送るバイトがまだ残る閉じたソケットは
+  `FIN_WAIT1` の保持として見えます。Linux ではソケットそのものが残ります。どのソケットの
+  cgroup もルートの 1 で、トラフィッククラスは 0 です。BPF のマップを指すリクエスト
+  （`INET_DIAG_REQ_SK_BPF_STORAGES`）は、ここにはマップの記述子がないので `EINVAL` です。
+  Linux では、開いていない記述子なら `EBADF` です。汎用 netlink のファミリーは `nlctrl` だけで、Linux ではホストの
   カーネルとモジュールのもの（`ethtool`、`nl80211`、`devlink` など）があります。そのため
   それらを引くと `ENOENT` で、それらがグループをいくつ使っても、ソケットのグループは 64 です。
   `NETLINK_ROUTE` にあるのはリンク、アドレス、経路のリクエストだけです。

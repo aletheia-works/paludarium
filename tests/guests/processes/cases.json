@@ -26,6 +26,7 @@
     {"name":"link-attributes","binary":"process"},
     {"name":"generic-netlink","binary":"process"},
     {"name":"sock-diag","binary":"process"},
+    {"name":"inet-diag","binary":"process"},
     {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},

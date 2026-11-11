@@ -1054,17 +1054,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     入れます。`nlctrl` の `notify` はグループ 16 で、ファミリーが増えも減りもしないので
     何も届きません。
 - ソケット診断の netlink ソケット（プロトコル `NETLINK_SOCK_DIAG`）は、Linux の
-  `sock_diag` と `unix_diag` と同じく、作られたネットワーク名前空間の AF_UNIX のソケットを
-  伝えます。そのため `ss -x` はそれらを挙げます。
+  `sock_diag`、`unix_diag`、`inet_diag`、`tcp_diag`、`udp_diag` と同じく、作られた
+  ネットワーク名前空間の AF_UNIX、TCP、UDP のソケットを伝えます。そのため `ss -x`、
+  `ss -t`、`ss -u` はそれらを挙げます。
   - **リクエスト:** AF_UNIX への `SOCK_DIAG_BY_FAMILY` は、状態（`TCP_ESTABLISHED`、
     `TCP_CLOSE`、`TCP_LISTEN`）が `udiag_states` にあるソケットを、Linux の `netlink_dump` と
     同じ大きさに分けてダンプします（1 ページ分、あるいはそれまでで一番長い受信の分で
     32 KiB まで。次の部分は受信が空きを作ったときに送ります）。`NLMSG_DONE` はそのあとです。ダンプでなければ、inode が `udiag_ino` で（0 は `EINVAL`、ない
     ものは `ENOENT`）、cookie が合う（違えば `ESTALE`、すべて 1 ならどれにも合います）
     ソケットに答えます。リスナーがまだ accept していない接続は inode をまだ持たないので
-    挙げません。ほかのファミリーにはハンドラーがなく（`ENOENT`）、`AF_MAX` を超える
-    ファミリーや短すぎるリクエストは `EINVAL`、`SOCK_DESTROY` と `TCPDIAG_GETSOCK` は
-    `EOPNOTSUPP`、ほかの型は `EINVAL` です。ダンプの途中のもう 1 つのダンプは `EBUSY` です。
+    挙げません。AF_UNIX、AF_INET、AF_INET6 のほかのファミリーにはハンドラーがなく
+    （`ENOENT`）、`AF_MAX` を超えるファミリーや短すぎるリクエストは `EINVAL`、
+    `SOCK_DESTROY` は `EOPNOTSUPP`、`SOCK_DIAG_BY_FAMILY`、`SOCK_DESTROY`、
+    `TCPDIAG_GETSOCK` のほかの型は `EINVAL` です。
+    ダンプの途中のもう 1 つのダンプは `EBUSY` です。
   - **伝えること:** ソケットごとに、型、状態、inode、cookie を、それから `udiag_show` が
     求めるものを `sk_diag_fill` の順に伝えます。名前、ソケットファイルの inode とデバイス、
     peer の inode（peer が閉じたあとと、accept を待つあいだは 0）、リスナーを待つ
@@ -1074,6 +1077,35 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     閉じたものも含み、peer が閉じたあとは両方）。最後に、所有者を、netlink ソケットを
     作った側のユーザー名前空間での値で伝えます。ほかのソケットが connect した
     データグラムのソケットは、Linux と同じく `TCP_ESTABLISHED` です。
+  - **TCP と UDP のリクエスト:** AF_INET か AF_INET6 への `SOCK_DIAG_BY_FAMILY` は
+    プロトコルを指します（`sdiag_protocol`、または `INET_DIAG_REQ_PROTOCOL` の属性）。
+    TCP か UDP で、ほかのものにはハンドラーがありません（`ENOENT` で、ダンプなら
+    `NLMSG_DONE` がそれを運びます）。ダンプは、状態が `idiag_states` にあるその
+    ファミリーのソケットを、Linux の表が持つとおりに挙げます。TCP では、まずリスナー
+    （宛先のポートを求められていなければ）、次にポートを持つ閉じたソケット
+    （`TCP_BOUND_INACTIVE`）、最後に接続で、ソケットがなくなったあとも残る `TIME_WAIT`
+    （または `FIN_WAIT2`）の保持もここに入ります。求められた送り元と宛先のポートのもの、
+    フィルター（`INET_DIAG_REQ_BYTECODE`。`ss` が `sport = :80` などから作るもの）が通す
+    ものだけを挙げます。フィルターは Linux の `inet_diag_bc_audit` と同じように確かめます
+    （`EINVAL`。`CAP_NET_ADMIN` のないマークの条件は `EPERM`）。ダンプでなければ、
+    アドレスとポートが指す 1 つのソケットに、Linux と同じ引き方で答えます。TCP では接続、
+    なければリスナーで、ないものと cookie が合わないものは `ENOENT` です。UDP では送り元
+    から宛先へのデータグラムが届くソケットで、cookie が合わなければ `ESTALE` です。古い
+    `TCPDIAG_GETSOCK` は、両方のファミリーの TCP に同じことをします。`SOCK_DESTROY` は、
+    `CONFIG_INET_DIAG_DESTROY` なしで作ったカーネルと同じく `EOPNOTSUPP` です。短すぎる
+    リクエストは `EINVAL` です。
+  - **TCP と UDP について伝えること:** ソケットごとに、状態（ハンドシェイクがリスナーの
+    空きを待つあいだは `TCP_SYN_SENT`、そのあとは接続の端の状態、または `TCP_LISTEN`）、
+    アドレスとポート（IPv6 のソケットでは IPv4 のものを対応させた形）、cookie、タイマー
+    （ハンドシェイクの再送、キープアライブ、`TIME_WAIT` のもの）、キュー（リスナーなら
+    待つ接続とバックログ）、netlink ソケットを作った側のユーザー名前空間での所有者、
+    inode（まだ accept されていない接続は 0）を伝えます。そのあと `inet_sk_diag_fill` の
+    順に、shutdown を伝え、`idiag_ext` が求めれば `IP_TOS`、IPv6 のソケットのトラフィック
+    クラス、待ち受け中か閉じていれば `IPV6_V6ONLY` を伝えます。続けて、`CAP_NET_ADMIN`
+    にはマーク、クラスとして優先度、cgroup、オプション（`inet_diag_sockopt`）、メモリ
+    （UDP のソケットのデータグラムは `udp_rmem_schedule` と同じくページ単位で数えたもの、
+    それとバッファー）、TCP のソケットの輻輳制御（`cubic`）を伝えます。`TIME_WAIT` の保持
+    については、アドレス、状態、タイマーだけを伝えます。
   - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
     グループは 32 です。誰でも入れますが、何も届きません。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、

@@ -1203,8 +1203,9 @@ kernel.
     any of which anyone may join; `nlctrl`'s `notify` is group 16, which
     hears nothing, as no family comes or goes.
 - A socket-diagnostics netlink socket (protocol `NETLINK_SOCK_DIAG`)
-  tells of the AF_UNIX sockets of the network namespace it was made in, as
-  Linux's `sock_diag` and `unix_diag` do, so `ss -x` lists them.
+  tells of the AF_UNIX, TCP and UDP sockets of the network namespace it was
+  made in, as Linux's `sock_diag`, `unix_diag`, `inet_diag`, `tcp_diag` and
+  `udp_diag` do, so `ss -x`, `ss -t` and `ss -u` list them.
   - **Requests:** `SOCK_DIAG_BY_FAMILY` for AF_UNIX dumps the sockets
     whose state (`TCP_ESTABLISHED`, `TCP_CLOSE` or `TCP_LISTEN`) is in
     `udiag_states`, in parts as large as Linux's `netlink_dump` makes
@@ -1214,10 +1215,11 @@ kernel.
     answers for the socket of inode `udiag_ino` (`EINVAL` for 0, `ENOENT`
     for none) whose cookie matches (`ESTALE` for another; all ones match
     any). A connection a listener has not accepted has no inode yet, and
-    is not listed. Another family has no handler (`ENOENT`), a family
-    past `AF_MAX` or a request too short is `EINVAL`, `SOCK_DESTROY` is
-    `EOPNOTSUPP`, and so is `TCPDIAG_GETSOCK`; any other type is `EINVAL`.
-    A second dump while one runs is `EBUSY`.
+    is not listed. A family but AF_UNIX, AF_INET and AF_INET6 has no
+    handler (`ENOENT`), a family past `AF_MAX` or a request too short is
+    `EINVAL`, `SOCK_DESTROY` is `EOPNOTSUPP`, and a type but
+    `SOCK_DIAG_BY_FAMILY`, `SOCK_DESTROY` and `TCPDIAG_GETSOCK` is
+    `EINVAL`. A second dump while one runs is `EBUSY`.
   - **What it tells:** each socket's type, state, inode and cookie, then
     as `udiag_show` asks, in `sk_diag_fill`'s order: its name, its socket
     file's inode and device, its peer's inode (0 once the peer has closed
@@ -1229,6 +1231,42 @@ kernel.
     both once the peer has closed), and its owner as the user namespace of
     whoever made the netlink socket shows it. A datagram socket another
     connects to is `TCP_ESTABLISHED`, as on Linux.
+  - **TCP and UDP requests:** `SOCK_DIAG_BY_FAMILY` for AF_INET or
+    AF_INET6 names a protocol (`sdiag_protocol`, or the
+    `INET_DIAG_REQ_PROTOCOL` attribute): TCP or UDP, as any other has no
+    handler (`ENOENT`, which a dump's `NLMSG_DONE` carries). A dump lists
+    the family's sockets whose state is in `idiag_states`, as Linux's
+    tables hold them: for TCP the listeners first (unless a destination
+    port is asked for), then the closed sockets that hold a port
+    (`TCP_BOUND_INACTIVE`), then the connections, with the holds in
+    `TIME_WAIT` (or `FIN_WAIT2`) that outlive their sockets; only those of
+    the source and destination ports asked for, and those a filter takes
+    (`INET_DIAG_REQ_BYTECODE`, as `ss` makes one of `sport = :80` and the
+    like), which is checked as Linux's `inet_diag_bc_audit` checks it
+    (`EINVAL`, and `EPERM` for a mark test without `CAP_NET_ADMIN`).
+    Without a dump it answers for the one socket of its addresses and
+    ports, as Linux looks it up: for TCP the connection, else the
+    listener, `ENOENT` for none or for a cookie that does not match; for
+    UDP the socket a datagram from the source to the destination reaches,
+    `ESTALE` for a cookie that does not match. The old `TCPDIAG_GETSOCK`
+    does the same for TCP of both families, and `SOCK_DESTROY` is
+    `EOPNOTSUPP`, as in a kernel built without
+    `CONFIG_INET_DIAG_DESTROY`. A request too short is `EINVAL`.
+  - **What it tells of TCP and UDP:** each socket's state (`TCP_SYN_SENT`
+    while a handshake waits for room in its listener, then that of the
+    connection's end, or `TCP_LISTEN`), its addresses and ports (IPv4 ones
+    mapped on an IPv6 socket), its cookie, its timer (a handshake's
+    retransmission, keepalive, or `TIME_WAIT`'s), its queues (a listener's
+    waiting connections and backlog), its owner as the user namespace of
+    whoever made the netlink socket shows it, and its inode (0 for a
+    connection not yet accepted); then, in `inet_sk_diag_fill`'s order,
+    its shutdown, as `idiag_ext` asks its `IP_TOS`, an IPv6 socket's
+    traffic class, and while listening or closed its `IPV6_V6ONLY`, its
+    mark to `CAP_NET_ADMIN`, its priority as its class, its cgroup, its
+    options (`inet_diag_sockopt`), its memory (a UDP socket's datagrams
+    charged in pages, as `udp_rmem_schedule` does, and its buffers), and a
+    TCP socket's congestion control (`cubic`). A hold in `TIME_WAIT` tells
+    its addresses, state and timer alone.
   - **Groups:** a socket has 32 groups, as Linux makes the four of
     `sock_diag` 32, which anyone may join, and which hear nothing.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take

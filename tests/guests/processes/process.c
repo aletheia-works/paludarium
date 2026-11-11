@@ -1871,6 +1871,210 @@ static void diag_ask(int fd, const char *label, unsigned short type, unsigned sh
         if (found_len[i]) diag_print(label, found[i], found_len[i]);
     printf("%s: unknown=%d\n", label, unknown);
 }
+/* The inet-diag case's TCP and UDP sockets: a label, the descriptor (-1
+   once closed), its inode, its type and its local port. */
+struct inet_socket {
+    const char *label;
+    int fd;
+    unsigned ino;
+    int type;
+    unsigned short port;
+};
+static struct inet_socket inet_sockets[32];
+static int inet_count;
+static void inet_add(const char *label, int fd) {
+    struct stat st;
+    fstat(fd, &st);
+    struct sockaddr_in6 at = {0};
+    socklen_t len = sizeof at;
+    getsockname(fd, (void *)&at, &len);
+    int type = 0;
+    socklen_t type_len = sizeof type;
+    getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_len);
+    inet_sockets[inet_count++] = (struct inet_socket){label, fd, (unsigned)st.st_ino, type, ntohs(at.sin6_port)};
+}
+static struct inet_socket *inet_find(const char *label) {
+    for (int i = 0; i < inet_count; i++)
+        if (!strcmp(inet_sockets[i].label, label)) return &inet_sockets[i];
+    return NULL;
+}
+/* The label of inode `ino`, "0" for 0, "?" for a socket not made here. */
+static const char *inet_label(unsigned ino) {
+    if (ino == 0) return "0";
+    for (int i = 0; i < inet_count; i++)
+        if (inet_sockets[i].ino == ino) return inet_sockets[i].label;
+    return "?";
+}
+/* The label of the first socket of `type` on local port `port`, "0" for
+   0: TCP and UDP ports are apart. */
+static const char *inet_port_label(unsigned short port, int type) {
+    if (port == 0) return "0";
+    for (int i = 0; i < inet_count; i++)
+        if (inet_sockets[i].port == port && inet_sockets[i].type == type) return inet_sockets[i].label;
+    return "?";
+}
+/* The type of the socket of inode `ino`; one with none is TCP's. */
+static int inet_type(unsigned ino) {
+    for (int i = 0; i < inet_count; i++)
+        if (ino && inet_sockets[i].ino == ino) return inet_sockets[i].type;
+    return SOCK_STREAM;
+}
+/* An `inet_diag_msg` and its attributes as one line into `out`: inodes and
+   ports by label, addresses as text, a timer's expiry as whether it has
+   one, the cgroup as present, buffers as whether they are the socket's,
+   and the rest as numbers. */
+static void inet_line(char *out, size_t size, const char *label, unsigned short type, const unsigned char *b, int len) {
+    unsigned words[5];
+    memcpy(words, b + 52, sizeof words);
+    unsigned short sport, dport;
+    memcpy(&sport, b + 4, 2);
+    memcpy(&dport, b + 6, 2);
+    char src[64], dst[64];
+    if (b[0] == AF_INET6) {
+        inet_ntop(AF_INET6, b + 8, src, sizeof src);
+        inet_ntop(AF_INET6, b + 24, dst, sizeof dst);
+    } else {
+        inet_ntop(AF_INET, b + 8, src, sizeof src);
+        inet_ntop(AF_INET, b + 24, dst, sizeof dst);
+        static const unsigned char zero[12];
+        if (memcmp(b + 12, zero, 12) || memcmp(b + 28, zero, 12)) strcat(src, "+junk");
+    }
+    unsigned interface, cookie[2];
+    memcpy(&interface, b + 40, 4);
+    memcpy(cookie, b + 44, 8);
+    int n = snprintf(out, size,
+                     "%s: %s type=%u family=%u state=%u timer=%u retrans=%u sport=%s dport=%s src=%s dst=%s if=%u cookie=%d "
+                     "expires=%s rqueue=%u wqueue=%u uid=%u",
+                     label, inet_label(words[4]), type, b[0], b[1], b[2], b[3], inet_port_label(ntohs(sport), inet_type(words[4])),
+                     inet_port_label(ntohs(dport), inet_type(words[4])), src, dst, interface, cookie[0] || cookie[1],
+                     words[0] == 0 ? "0" : words[0] <= 7200000 ? "+" : "big", words[1], words[2], words[3]);
+    const unsigned char *at = b + 72;
+    len -= 72;
+    while (len >= 4 && n < (int)size) {
+        unsigned short alen, kind;
+        memcpy(&alen, at, 2);
+        memcpy(&kind, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        int vlen = alen - 4;
+        const unsigned char *v = at + 4;
+        unsigned word = 0;
+        if (vlen >= 4) memcpy(&word, v, 4);
+        if (kind == 21) {
+            n += snprintf(out + n, size - n, " cgroup");
+        } else if (kind == 4) {
+            n += snprintf(out + n, size - n, " cong=%.*s", vlen, v);
+        } else if (kind == 7) {
+            int fd = -1, buffers[2] = {0, 0};
+            unsigned ino = words[4];
+            for (int i = 0; i < inet_count; i++)
+                if (inet_sockets[i].ino == ino) fd = inet_sockets[i].fd;
+            socklen_t blen = sizeof buffers[0];
+            getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffers[0], &blen);
+            blen = sizeof buffers[1];
+            getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffers[1], &blen);
+            n += snprintf(out + n, size - n, " 7=");
+            for (int i = 0; i + 4 <= vlen; i += 4) {
+                memcpy(&word, v + i, 4);
+                if (i == 4 && (int)word == buffers[0]) n += snprintf(out + n, size - n, ",rcvbuf");
+                else if (i == 12 && (int)word == buffers[1]) n += snprintf(out + n, size - n, ",sndbuf");
+                else n += snprintf(out + n, size - n, "%s%u", i ? "," : "", word);
+            }
+        } else if (vlen < 4) {
+            n += snprintf(out + n, size - n, " %u=", kind);
+            for (int i = 0; i < vlen; i++) n += snprintf(out + n, size - n, "%02x", v[i]);
+        } else {
+            n += snprintf(out + n, size - n, " %u=", kind);
+            for (int i = 0; i + 4 <= vlen; i += 4) {
+                memcpy(&word, v + i, 4);
+                n += snprintf(out + n, size - n, "%s%u", i ? "," : "", word);
+            }
+        }
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+}
+static int inet_compare(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+/* Sends `request` (`len` bytes, then `extra` attributes) of `type` and
+   `flags` on `fd`, and prints the answer: the messages of the sockets
+   made here sorted as text, those of others counted, and the error or
+   NLMSG_DONE. */
+static void inet_ask(int fd, const char *label, unsigned short type, unsigned short flags, const unsigned char *request,
+                     size_t len) {
+    long seq = nl_send(fd, type, flags, request, len);
+    static char lines[64][640];
+    static char *sorted[64];
+    int count = 0, unknown = 0, done = 0;
+    while (!done) {
+        static char buf[32768];
+        long n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0) break;
+        for (char *at = buf; at + sizeof(struct nl_header) <= buf + n;) {
+            struct nl_header *h = (void *)at;
+            if (h->len < sizeof *h || at + h->len > buf + n) break;
+            unsigned char *body = (void *)(h + 1);
+            int body_len = h->len - sizeof *h;
+            at += (h->len + 3) & ~3;
+            if (h->type == 2 || h->type == 3) {
+                int error;
+                memcpy(&error, body, 4);
+                printf("%s: type=%u flags=%#x seq=%d error=%d\n", label, h->type, h->flags, h->seq == seq, error);
+                done = 1;
+                break;
+            }
+            if (body_len < 72) {
+                printf("%s: short=%d\n", label, body_len);
+                continue;
+            }
+            unsigned ino;
+            memcpy(&ino, body + 68, 4);
+            if (!strcmp(inet_label(ino), "?") || count == 64) {
+                unknown++;
+                continue;
+            }
+            inet_line(lines[count], sizeof lines[count], label, h->type, body, body_len);
+            sorted[count] = lines[count];
+            count++;
+            if (!(flags & NL_F_DUMP)) {
+                printf("%s: flags=%#x seq=%d\n", label, h->flags, h->seq == seq);
+                if (!(flags & NL_F_ACK)) done = 1;
+                break;
+            }
+        }
+    }
+    qsort(sorted, count, sizeof sorted[0], inet_compare);
+    for (int i = 0; i < count; i++) printf("%s\n", sorted[i]);
+    printf("%s: unknown=%d\n", label, unknown);
+}
+/* An `inet_diag_req_v2` of `family`, `protocol`, `ext` and `states`, its
+   ports `sport` and `dport` (host order) and addresses `src` and `dst`
+   (text, or NULL), with no cookie, into `out`; its length, 56. */
+static size_t inet_request(unsigned char *out, unsigned char family, unsigned char protocol, unsigned char ext,
+                           unsigned states, unsigned short sport, unsigned short dport, const char *src,
+                           const char *dst) {
+    memset(out, 0, 56);
+    out[0] = family;
+    out[1] = protocol;
+    out[2] = ext;
+    memcpy(out + 4, &states, 4);
+    unsigned short port = htons(sport);
+    memcpy(out + 8, &port, 2);
+    port = htons(dport);
+    memcpy(out + 10, &port, 2);
+    if (src) inet_pton(family, src, out + 12);
+    if (dst) inet_pton(family, dst, out + 28);
+    memset(out + 48, 0xff, 8);
+    return 56;
+}
+/* Adds an attribute of `kind` with `len` bytes of `value` at `at`; the
+   bytes it takes. */
+static size_t inet_attribute(unsigned char *at, unsigned short kind, const void *value, unsigned short len) {
+    unsigned short total = 4 + len;
+    memcpy(at, &total, 2);
+    memcpy(at + 2, &kind, 2);
+    memcpy(at + 4, value, len);
+    return (total + 3) & ~3;
+}
 /* Binds a UDP socket of `family` to `text`, and prints the result. */
 static void addresses_bind(const char *text, const char *when) {
     int family = strchr(text, ':') ? AF_INET6 : AF_INET;
@@ -8039,6 +8243,246 @@ int main(int argc, char **argv) {
                    netns_result(setsockopt(d, 270, 1, &five, sizeof five)));
             unlink(diag_path);
             rmdir(dir);
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "inet-diag")) {
+        /* A child makes a network namespace with TCP and UDP sockets in
+           each state on its loopback, and asks NETLINK_SOCK_DIAG of them:
+           dumps by family, protocol, state, port and filter, one socket by
+           its addresses, the old TCPDIAG_GETSOCK, and requests it
+           refuses. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int udp_lo = socket(AF_INET, SOCK_DGRAM, 0);
+            printf("up=%ld\n", netns_lo(udp_lo, SIOCSIFFLAGS, "lo", IFF_UP));
+            int d = socket(NL_AF_NETLINK, SOCK_RAW, 4);
+            printf("socket: diag=%d\n", d >= 0);
+            struct sockaddr_in any4 = netns_v4("127.0.0.1", 0);
+            int listener = socket(AF_INET, SOCK_STREAM, 0);
+            bind(listener, (void *)&any4, sizeof any4);
+            listen(listener, 4);
+            inet_add("listener", listener);
+            struct sockaddr_in to = any4;
+            socklen_t to_len = sizeof to;
+            getsockname(listener, (void *)&to, &to_len);
+            unsigned short port = ntohs(to.sin_port);
+            /* Each connects and is accepted in turn; `waiting` is left. */
+            int client = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+            setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+            connect(client, (void *)&to, sizeof to);
+            inet_add("client", client);
+            inet_add("accepted", accept(listener, NULL, NULL));
+            int half = socket(AF_INET, SOCK_STREAM, 0);
+            connect(half, (void *)&to, sizeof to);
+            inet_add("half", half);
+            int half_peer = accept(listener, NULL, NULL);
+            inet_add("half-peer", half_peer);
+            shutdown(half, SHUT_WR);
+            int closer = socket(AF_INET, SOCK_STREAM, 0);
+            connect(closer, (void *)&to, sizeof to);
+            inet_add("closer", closer);
+            inet_add("closer-peer", accept(listener, NULL, NULL));
+            close(closer);
+            inet_find("closer")->fd = -1;
+            struct sockaddr_in6 mapped_to = {.sin6_family = AF_INET6, .sin6_port = htons(port)};
+            inet_pton(AF_INET6, "::ffff:127.0.0.1", &mapped_to.sin6_addr);
+            int mapped = socket(AF_INET6, SOCK_STREAM, 0);
+            connect(mapped, (void *)&mapped_to, sizeof mapped_to);
+            inet_add("mapped", mapped);
+            inet_add("mapped-peer", accept(listener, NULL, NULL));
+            int waiting = socket(AF_INET, SOCK_STREAM, 0);
+            connect(waiting, (void *)&to, sizeof to);
+            inet_add("waiting", waiting);
+            int bound = socket(AF_INET, SOCK_STREAM, 0);
+            bind(bound, (void *)&any4, sizeof any4);
+            inet_add("bound", bound);
+            inet_add("unbound", socket(AF_INET, SOCK_STREAM, 0));
+            /* A listener with no room: its one connection waits, and the
+               next one's handshake is dropped (TCP_SYN_SENT). */
+            int full = socket(AF_INET, SOCK_STREAM, 0);
+            bind(full, (void *)&any4, sizeof any4);
+            listen(full, 0);
+            inet_add("full", full);
+            struct sockaddr_in full_to = any4;
+            socklen_t full_len = sizeof full_to;
+            getsockname(full, (void *)&full_to, &full_len);
+            int filler = socket(AF_INET, SOCK_STREAM, 0);
+            connect(filler, (void *)&full_to, sizeof full_to);
+            inet_add("filler", filler);
+            int syn = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            printf("syn connect=%ld\n", netns_result(connect(syn, (void *)&full_to, sizeof full_to)));
+            inet_add("syn", syn);
+            struct sockaddr_in6 any6 = {.sin6_family = AF_INET6};
+            inet_pton(AF_INET6, "::1", &any6.sin6_addr);
+            int listener6 = socket(AF_INET6, SOCK_STREAM, 0);
+            printf("bind6=%ld\n", netns_result(bind(listener6, (void *)&any6, sizeof any6)));
+            listen(listener6, 4);
+            inet_add("listener6", listener6);
+            struct sockaddr_in6 to6 = any6;
+            socklen_t to6_len = sizeof to6;
+            getsockname(listener6, (void *)&to6, &to6_len);
+            int client6 = socket(AF_INET6, SOCK_STREAM, 0);
+            connect(client6, (void *)&to6, sizeof to6);
+            inet_add("client6", client6);
+            inet_add("accepted6", accept(listener6, NULL, NULL));
+            int only6 = socket(AF_INET6, SOCK_STREAM, 0);
+            setsockopt(only6, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+            struct sockaddr_in6 every6 = {.sin6_family = AF_INET6};
+            bind(only6, (void *)&every6, sizeof every6);
+            inet_add("only6", only6);
+            int tos = 0x10;
+            setsockopt(bound, IPPROTO_IP, IP_TOS, &tos, sizeof tos);
+            int udp = socket(AF_INET, SOCK_DGRAM, 0);
+            bind(udp, (void *)&any4, sizeof any4);
+            inet_add("udp", udp);
+            struct sockaddr_in udp_to = any4;
+            socklen_t udp_len = sizeof udp_to;
+            getsockname(udp, (void *)&udp_to, &udp_len);
+            int udpc = socket(AF_INET, SOCK_DGRAM, 0);
+            connect(udpc, (void *)&udp_to, sizeof udp_to);
+            inet_add("udpc", udpc);
+            char hundred[100] = {0};
+            send(udpc, hundred, sizeof hundred, 0);
+            int udp6 = socket(AF_INET6, SOCK_DGRAM, 0);
+            bind(udp6, (void *)&any6, sizeof any6);
+            inet_add("udp6", udp6);
+            unsigned char request[256];
+            size_t len;
+            unsigned all = ~0u;
+#define INET_ASK(label, type, flags, ...)                                                                  \
+    do {                                                                                                   \
+        len = inet_request(request, __VA_ARGS__);                                                          \
+        inet_ask(d, label, type, flags, request, len);                                                     \
+    } while (0)
+            unsigned short dump = NL_F_REQUEST | NL_F_DUMP;
+            INET_ASK("tcp", 20, dump, AF_INET, 6, 0x38, all, 0, 0, NULL, NULL);
+            INET_ASK("tcp6", 20, dump, AF_INET6, 6, 0x38, all, 0, 0, NULL, NULL);
+            INET_ASK("listening", 20, dump, AF_INET, 6, 0x40, 1 << 10, 0, 0, NULL, NULL);
+            INET_ASK("bound", 20, dump, AF_INET, 6, 0x50, 1 << 13, 0, 0, NULL, NULL);
+            INET_ASK("bound6", 20, dump, AF_INET6, 6, 0x40, 1 << 13, 0, 0, NULL, NULL);
+            INET_ASK("syn sent", 20, dump, AF_INET, 6, 0, 1 << 2, 0, 0, NULL, NULL);
+            INET_ASK("fin wait", 20, dump, AF_INET, 6, 0, 1 << 4 | 1 << 5 | 1 << 6, 0, 0, NULL, NULL);
+            INET_ASK("close wait", 20, dump, AF_INET, 6, 0, 1 << 8, 0, 0, NULL, NULL);
+            INET_ASK("sport", 20, dump, AF_INET, 6, 0, all, port, 0, NULL, NULL);
+            INET_ASK("dport", 20, dump, AF_INET, 6, 0, all, 0, port, NULL, NULL);
+            /* Filters as `ss` makes them: the listener's address and port,
+               a range of destination ports, a mark and an unknown code. */
+            {
+                unsigned char code[64];
+                size_t at = 0;
+                unsigned char op[4] = {7, 16, 20, 0};
+                memcpy(code, op, 4);
+                unsigned char cond[8] = {AF_INET, 32};
+                int cond_port = port;
+                memcpy(cond + 4, &cond_port, 4);
+                memcpy(code + 4, cond, 8);
+                inet_pton(AF_INET, "127.0.0.1", code + 12);
+                at = 16;
+                len = inet_request(request, AF_INET, 6, 0, all, 0, 0, NULL, NULL);
+                len += inet_attribute(request + len, 1, code, at);
+                inet_ask(d, "filter source", 20, dump, request, len);
+                unsigned short low = port, high = port;
+                unsigned char range[16] = {4, 8, 20, 0, 0, 0, 0, 0, 5, 8, 12, 0, 0, 0, 0, 0};
+                memcpy(range + 6, &low, 2);
+                memcpy(range + 14, &high, 2);
+                len = inet_request(request, AF_INET, 6, 0, all, 0, 0, NULL, NULL);
+                len += inet_attribute(request + len, 1, range, 16);
+                inet_ask(d, "filter range", 20, dump, request, len);
+                unsigned char mark[12] = {10, 12, 16, 0};
+                len = inet_request(request, AF_INET, 6, 0, 1 << 10, 0, 0, NULL, NULL);
+                len += inet_attribute(request + len, 1, mark, 12);
+                inet_ask(d, "filter mark", 20, dump, request, len);
+                unsigned char bad[4] = {99, 4, 4, 0};
+                len = inet_request(request, AF_INET, 6, 0, all, 0, 0, NULL, NULL);
+                len += inet_attribute(request + len, 1, bad, 4);
+                inet_ask(d, "filter bad", 20, dump, request, len);
+                unsigned char past[4] = {1, 4, 12, 0};
+                len = inet_request(request, AF_INET, 6, 0, all, 0, 0, NULL, NULL);
+                len += inet_attribute(request + len, 1, past, 4);
+                inet_ask(d, "filter past", 20, dump, request, len);
+            }
+            INET_ASK("udp", 20, dump, AF_INET, 17, 0x51, all, 0, 0, NULL, NULL);
+            INET_ASK("udp6", 20, dump, AF_INET6, 17, 0x41, all, 0, 0, NULL, NULL);
+            INET_ASK("udp connected", 20, dump, AF_INET, 17, 0, 1 << 1, 0, 0, NULL, NULL);
+            /* One socket by its addresses and ports, with and without its
+               cookie. */
+            unsigned short client_port = inet_find("client")->port;
+            INET_ASK("exact client", 20, NL_F_REQUEST, AF_INET, 6, 0x38, 0, client_port, port, "127.0.0.1",
+                     "127.0.0.1");
+            nl_send(d, 20, NL_F_REQUEST, request, len);
+            unsigned char reply[1024];
+            unsigned cookie[2] = {0, 0};
+            if (recv(d, reply, sizeof reply, 0) >= 16 + 72) memcpy(cookie, reply + 16 + 44, 8);
+            memcpy(request + 48, cookie, 8);
+            inet_ask(d, "exact cookie", 20, NL_F_REQUEST | NL_F_ACK, request, len);
+            cookie[0]++;
+            memcpy(request + 48, cookie, 8);
+            inet_ask(d, "exact stale", 20, NL_F_REQUEST, request, len);
+            INET_ASK("exact listener", 20, NL_F_REQUEST, AF_INET, 6, 0, 0, port, 1, "127.0.0.1", "127.0.0.1");
+            INET_ASK("exact closer", 20, NL_F_REQUEST, AF_INET, 6, 0, 0, inet_find("closer")->port, port,
+                     "127.0.0.1", "127.0.0.1");
+            INET_ASK("exact mapped", 20, NL_F_REQUEST, AF_INET6, 6, 0, 0, inet_find("mapped")->port, port,
+                     "::ffff:127.0.0.1", "::ffff:127.0.0.1");
+            INET_ASK("exact v6", 20, NL_F_REQUEST, AF_INET6, 6, 0, 0, inet_find("client6")->port,
+                     inet_find("listener6")->port, "::1", "::1");
+            INET_ASK("exact none", 20, NL_F_REQUEST, AF_INET, 6, 0, 0, 1, 2, "127.0.0.1", "127.0.0.1");
+            INET_ASK("exact udp", 20, NL_F_REQUEST, AF_INET, 17, 0, 0, inet_find("udpc")->port,
+                     inet_find("udp")->port, "127.0.0.1", "127.0.0.1");
+            memset(request + 48, 0, 8);
+            inet_ask(d, "exact udp stale", 20, NL_F_REQUEST, request, len);
+            INET_ASK("exact protocol", 20, NL_F_REQUEST, AF_INET, 99, 0, 0, 1, 2, NULL, NULL);
+            INET_ASK("destroy protocol", 21, NL_F_REQUEST, AF_INET, 99, 0, 0, 1, 2, NULL, NULL);
+            /* The old request: TCP of both families, as type 18. */
+            {
+                unsigned char old[60] = {AF_INET, 0, 0, 0x8};
+                memcpy(old + 52, &all, 4);
+                inet_ask(d, "old", 18, dump, old, 60);
+                unsigned short sp = htons(client_port), dp = htons(port);
+                memcpy(old + 4, &sp, 2);
+                memcpy(old + 6, &dp, 2);
+                inet_pton(AF_INET, "127.0.0.1", old + 8);
+                inet_pton(AF_INET, "127.0.0.1", old + 24);
+                memset(old + 44, 0xff, 8);
+                inet_ask(d, "old exact", 18, NL_F_REQUEST, old, 60);
+                old[0] = 0;
+                inet_ask(d, "old unspec", 18, NL_F_REQUEST, old, 60);
+                inet_ask(d, "old short", 18, dump, old, 56);
+            }
+            /* Requests it refuses, or whose protocol has no handler. */
+            INET_ASK("no protocol", 20, dump, AF_INET, 99, 0, all, 0, 0, NULL, NULL);
+            len = inet_request(request, AF_INET, 6, 0, all, 0, 0, NULL, NULL);
+            inet_ask(d, "short", 20, dump, request, 40);
+            {
+                unsigned udp_protocol = 17;
+                len = inet_request(request, AF_INET, 6, 0, all, 0, 0, NULL, NULL);
+                len += inet_attribute(request + len, 3, &udp_protocol, 4);
+                inet_ask(d, "protocol attribute", 20, dump, request, len);
+                len = inet_request(request, AF_INET, 6, 0, all, 0, 0, NULL, NULL);
+                len += inet_attribute(request + len, 3, &udp_protocol, 2);
+                inet_ask(d, "protocol short", 20, dump, request, len);
+                /* A descriptor that is no BPF map: the netlink socket's. */
+                unsigned char storages[8];
+                unsigned map = (unsigned)d;
+                size_t n = inet_attribute(storages, 1, &map, 4);
+                len = inet_request(request, AF_INET, 17, 0, all, 0, 0, NULL, NULL);
+                len += inet_attribute(request + len, 2, storages, n);
+                inet_ask(d, "bpf map", 20, dump, request, len);
+                len = inet_request(request, AF_INET, 17, 0, all, 0, 0, NULL, NULL);
+                len += inet_attribute(request + len, 2, storages, 0);
+                inet_ask(d, "bpf none", 20, dump, request, len);
+            }
+            /* A second dump while one runs is EBUSY. */
+            len = inet_request(request, AF_INET, 6, 0, all, 0, 0, NULL, NULL);
+            nl_send(d, 20, dump, request, len);
+            inet_ask(d, "busy", 20, dump, request, len);
+            INET_ASK("after busy", 20, dump, AF_INET, 6, 0, 1 << 10, 0, 0, NULL, NULL);
+#undef INET_ASK
             fflush(stdout);
             _exit(0);
         }

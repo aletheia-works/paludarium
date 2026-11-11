@@ -337,13 +337,22 @@ verified.
   than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`,
   `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC` (`EPROTONOSUPPORT` for the
-  rest). Socket diagnostics tell only of AF_UNIX sockets: AF_INET and
-  AF_INET6 (`inet_diag`, as `ss -t` and `ss -u` ask), AF_NETLINK and
-  AF_PACKET have no handler (`ENOENT`), and `TCPDIAG_GETSOCK` is
-  `EOPNOTSUPP`. A dump of AF_UNIX sockets lists them oldest first, where
-  Linux's order follows its hash table, and what a socket sent that waits
-  is counted as its send buffer is charged here, where Linux counts its
-  buffers' true sizes. Generic netlink has no family but `nlctrl`, where
+  rest). Socket diagnostics tell only of AF_UNIX, TCP and UDP sockets:
+  AF_NETLINK and AF_PACKET have no handler (`ENOENT`), nor have raw
+  sockets, SCTP and MPTCP, whose handlers Linux loads as modules, and
+  `SOCK_DESTROY` is `EOPNOTSUPP`. A dump lists the sockets oldest first,
+  where Linux's order follows its hash tables, and what an AF_UNIX socket
+  sent that waits is counted as its send buffer is charged here, where
+  Linux counts its buffers' true sizes. Of a TCP socket they tell no
+  `tcp_info` (`INET_DIAG_INFO`, as `ss -i` asks), and its memory but for
+  its buffers as 0; its keepalive timer ends a whole `TCP_KEEPIDLE` from
+  now, and only a handshake on the loopback has its retransmission's
+  time and count. A connection the host made has no `TIME_WAIT` after
+  it, and a closed socket whose bytes still wait to go shows as a hold in
+  `FIN_WAIT1`, where Linux keeps the socket itself. Every socket's cgroup
+  is the root, 1, and its traffic class 0. A request that names a BPF
+  map (`INET_DIAG_REQ_SK_BPF_STORAGES`) is `EINVAL`, as no descriptor
+  here is one, where Linux's is `EBADF` for one that is not open. Generic netlink has no family but `nlctrl`, where
   Linux has those of the host's kernel and modules (`ethtool`,
   `nl80211`, `devlink` and others), so a lookup of one is `ENOENT` and a
   socket has 64 groups however many those take. Of `NETLINK_ROUTE` there

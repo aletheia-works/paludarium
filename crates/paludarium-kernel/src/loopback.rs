@@ -157,7 +157,7 @@ impl Link {
     /// gives its port up: 60 seconds after the other side's end reached it,
     /// as Linux's `tcp_fin` in `FIN_WAIT2` hands the port to a `TIME_WAIT`
     /// socket and closes the socket's own (`tcp_done`). `None` until then.
-    fn released(&self, side: usize) -> Option<u64> {
+    pub(crate) fn released(&self, side: usize) -> Option<u64> {
         if usize::from(self.first.load(Ordering::SeqCst)) != side {
             return None;
         }
@@ -432,13 +432,32 @@ pub(crate) struct Binding {
 }
 /// A hold in `TIME_WAIT`: when its socket closed, and its connection and
 /// side, whose ends time it ([`Link::holds_until`]); a reset, or the other
-/// side's end reaching it first, ends it at once.
+/// side's end reaching it first, ends it at once. It keeps its socket's
+/// peer and cookie, which `sock_diag` tells of.
 #[derive(Clone)]
 pub(crate) struct TimeWait {
     closed: u64,
     link: Arc<Link>,
     side: usize,
+    peer: SocketAddr,
+    cookie: u64,
 }
+/// A hold in `TIME_WAIT` as `sock_diag` tells of it, as Linux's
+/// `inet_timewait_sock`, which outlives its socket.
+pub(crate) struct Waiting {
+    pub(crate) local: SocketAddr,
+    pub(crate) peer: SocketAddr,
+    pub(crate) v6: bool,
+    pub(crate) cookie: u64,
+    /// Its `tw_substate`: `TCP_FIN_WAIT2` until the other side's end has
+    /// come, then `TCP_TIME_WAIT`; `TCP_FIN_WAIT1` while its bytes still go.
+    pub(crate) state: u8,
+    /// When it ends, once its own end has gone.
+    pub(crate) until: Option<u64>,
+}
+const TCP_FIN_WAIT1: u8 = 4;
+const TCP_FIN_WAIT2: u8 = 5;
+const TCP_TIME_WAIT: u8 = 6;
 impl Binding {
     fn carries(&self, ip: IpAddr) -> bool {
         match ip {
@@ -538,15 +557,16 @@ impl Ports {
             })
         });
     }
-    /// `owner`, which ends `link` first from `side`, closed at `closed` and
-    /// keeps its port in `TIME_WAIT`, as it was, with its `SO_REUSEADDR`:
-    /// Linux's `inet_twsk_hashdance` puts a `TIME_WAIT` socket in its bind
-    /// bucket.
+    /// `owner`, which ends `link` first from `side` to `peer`, closed at
+    /// `closed` and keeps its port in `TIME_WAIT`, as it was, with its
+    /// `SO_REUSEADDR` and its `cookie`: Linux's `inet_twsk_hashdance` puts a
+    /// `TIME_WAIT` socket in its bind bucket.
     pub(crate) fn linger(
         &mut self,
         owner: &Weak<InetSocket>,
-        (link, side): (&Arc<Link>, usize),
+        (link, side, peer): (&Arc<Link>, usize, SocketAddr),
         closed: u64,
+        cookie: u64,
     ) {
         for binding in &mut self.bindings {
             if binding.is(owner) {
@@ -555,9 +575,40 @@ impl Ports {
                     closed,
                     link: Arc::clone(link),
                     side,
+                    peer,
+                    cookie,
                 });
             }
         }
+    }
+    /// Whether `owner` holds a port.
+    pub(crate) fn holds(&self, owner: &Weak<InetSocket>) -> bool {
+        self.bindings.iter().any(|binding| binding.is(owner))
+    }
+    /// The holds in `TIME_WAIT`, oldest first.
+    pub(crate) fn waiting(&self) -> Vec<Waiting> {
+        self.bindings
+            .iter()
+            .filter_map(|binding| {
+                let wait = binding.time_wait.as_ref()?;
+                let ended = |side: usize| wait.link.ended[side].load(Ordering::SeqCst) != NOT_ENDED;
+                let state = if ended(1 - wait.side) {
+                    TCP_TIME_WAIT
+                } else if ended(wait.side) {
+                    TCP_FIN_WAIT2
+                } else {
+                    TCP_FIN_WAIT1
+                };
+                Some(Waiting {
+                    local: binding.address,
+                    peer: wait.peer,
+                    v6: binding.v6,
+                    cookie: wait.cookie,
+                    state,
+                    until: wait.link.holds_until(wait.side, wait.closed),
+                })
+            })
+            .collect()
     }
     /// Takes `binding`'s port, or with port 0 the next free ephemeral one;
     /// `EADDRINUSE` when it conflicts, or no ephemeral port is free.

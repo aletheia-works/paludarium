@@ -2630,6 +2630,11 @@ static long set_id_change(const char *way, int fd) {
         return !strcmp(way, "sendfile") ? sendfile(fd, from, NULL, 1)
                                         : copy_file_range(from, NULL, fd, NULL, 1, 0);
     }
+    if (!strcmp(way, "splice")) {
+        int pipe_fds[2];
+        if (pipe(pipe_fds) || write(pipe_fds[1], buffer, 1) != 1) return -1;
+        return splice(pipe_fds[0], NULL, fd, NULL, 1, 0);
+    }
     if (!strcmp(way, "chown-self")) return fchown(fd, -1, -1);
     if (!strcmp(way, "mmap")) {
         char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -17127,7 +17132,7 @@ int main(int argc, char **argv) {
         static const char *const ways[] = {
             "write", "write-empty", "pwrite", "pwrite-empty", "writev", "pwritev", "ftruncate",
             "ftruncate-same", "truncate", "open-trunc", "open-read", "fallocate", "sendfile",
-            "copy_file_range", "chown-self", "mmap",
+            "copy_file_range", "splice", "chown-self", "mmap",
         };
         for (size_t i = 0; i < sizeof ways / sizeof *ways; i++) {
             set_id_case(ways[i], 06755, 2100, 2000);

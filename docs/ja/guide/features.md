@@ -1104,7 +1104,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     クラス、待ち受け中か閉じていれば `IPV6_V6ONLY` を伝えます。続けて、`CAP_NET_ADMIN`
     にはマーク、クラスとして優先度、cgroup、オプション（`inet_diag_sockopt`）、メモリ
     （UDP のソケットのデータグラムは `udp_rmem_schedule` と同じくページ単位で数えたもの、
-    それとバッファー）、TCP のソケットの輻輳制御（`cubic`）を伝えます。`TIME_WAIT` の保持
+    バッファー、リスナーのキューがいっぱいで落としたハンドシェイクの数）、TCP のソケットの輻輳制御（`cubic`）を伝えます。`TIME_WAIT` の保持
     については、アドレス、状態、タイマーだけを伝えます。
   - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
     グループは 32 です。誰でも入れますが、何も届きません。
@@ -1795,7 +1795,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
     `TCP_USER_TIMEOUT`、`IP_TOS`、`IPV6_V6ONLY`。既定値と範囲の確かめ方は Linux と
     同じで、`SO_SNDBUF` と `SO_RCVBUF` は既定の `wmem_max` と `rmem_max`（212992）までを
-    2 倍にします。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
+    2 倍にします。新しい `IP_TOS` は、その TOS ビットから `SO_PRIORITY` も決めます
+    （`rt_tos2priority`）。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
     設定して読み出せ、`SOF_TIMESTAMPING_OPT_ID` には TCP のソケットの接続が要ります
     （閉じているか待ち受けている間は `EINVAL`）。
   - **タイムスタンプ**：`recvmsg` は、Linux の `udp_recvmsg`（`sock_recv_timestamp`）と同じく、
@@ -1845,7 +1846,9 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   ほかのソケット（待ち受け、それが受け付けた接続、クライアント）がポートを持って
   いれば `EADDRINUSE` です。ただし、両方が `SO_REUSEADDR` を付けていて相手が待ち
   受けていないとき、両方が `SO_REUSEPORT` を付けているときは共有できます。`::` の
-  IPv6 のソケットは、`IPV6_V6ONLY` でなければ IPv4 のポートも持ちます。
+  IPv6 のソケットは、`IPV6_V6ONLY` でなければ IPv4 のポートも持ちます。`::` でも
+  IPv4 のものでもない IPv6 のアドレスに `bind` すると、`__inet6_bind` と同じく
+  `IPV6_V6ONLY` が付きます。
 - **`listen`** は `backlog` + 1 本までの接続を待たせます（多くて 4096、
   `net.core.somaxconn`）。`bind` していないソケットは、すべてのアドレスで一時的な
   ポートを取ります。待ち受けているソケットは、接続が待っている間は読めます

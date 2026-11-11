@@ -385,7 +385,7 @@ impl NetlinkSocket {
                 0,
                 0,
                 0,
-                0,
+                full.drops,
             ]
             .iter()
             .flat_map(|v| v.to_le_bytes())

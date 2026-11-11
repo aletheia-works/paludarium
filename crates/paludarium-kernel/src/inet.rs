@@ -702,6 +702,8 @@ struct Listen {
     backlog: usize,
     ready: VecDeque<Arc<InetSocket>>,
     arrivals: u64,
+    /// The handshakes a full queue dropped (`tcp_listendrop`).
+    drops: u32,
 }
 /// A loopback connection whose handshake found the listener's queue full,
 /// which Linux drops (`tcp_conn_request`): the client sends it again at
@@ -742,6 +744,7 @@ impl Listen {
             backlog,
             ready: VecDeque::new(),
             arrivals: 0,
+            drops: 0,
         }
     }
     fn has_room(&self) -> bool {
@@ -1798,6 +1801,12 @@ impl InetSocket {
                 }
             }
         };
+        // An IPv6 address that is neither the unspecified one nor an IPv4
+        // one makes the socket IPv6-only (`__inet6_bind`), unless the bind
+        // fails.
+        let only = matches!(address, SocketAddr::V6(a) if !a.ip().is_unspecified());
+        let mut options = options;
+        options.v6_only |= only;
         s.bound = Some(self.ports().bind(Binding {
             locked: address.port() != 0,
             ..self.binding(address, &options)
@@ -1805,6 +1814,10 @@ impl InetSocket {
         s.port_locked = address.port() != 0;
         s.address_locked = !address.ip().is_unspecified();
         s.address = None;
+        drop(s);
+        if only {
+            self.options().v6_only = true;
+        }
         Ok(0)
     }
     /// `listen(backlog)`, as Linux's `inet_listen`: `EOPNOTSUPP` for UDP,
@@ -1947,6 +1960,7 @@ impl InetSocket {
             return Knock::Refused;
         };
         if !listen.has_room() {
+            listen.drops += 1;
             return Knock::Full;
         }
         let child = listener.child((theirs, locked), stream, link, from, to);
@@ -2423,6 +2437,8 @@ pub(crate) struct Full {
     pub(crate) port_locked: bool,
     /// The memory its unread datagrams take (`sk_rmem_alloc`).
     pub(crate) received: u32,
+    /// What it dropped (`sk_drops`): a listener's dropped handshakes.
+    pub(crate) drops: u32,
     pub(crate) receive_buffer: u32,
     pub(crate) send_buffer: u32,
 }
@@ -2498,6 +2514,7 @@ impl InetSocket {
             priority: options.priority as u32,
             port_locked: s.port_locked,
             received: received as u32,
+            drops: s.listen.as_ref().map_or(0, |listen| listen.drops),
             receive_buffer: options.receive_buffer as u32,
             send_buffer: options.send_buffer as u32,
         };
@@ -3067,6 +3084,12 @@ fn receive(
 }
 
 /// Reads the `int` of a setsockopt (EINVAL for fewer than 4 bytes).
+/// The priority a type of service gives (`rt_tos2priority`, `ip_tos2prio`):
+/// best effort, bulk, interactive or interactive bulk, by its TOS bits.
+fn tos_priority(tos: i32) -> i32 {
+    const PRIORITIES: [i32; 8] = [0, 0, 2, 2, 6, 6, 4, 4];
+    PRIORITIES[((tos & 0x1e) >> 2) as usize]
+}
 fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
     if (len as u32 as i32) < 4 {
         return Err(Errno::EINVAL);
@@ -3181,7 +3204,13 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (6, 12) => options.quick_ack = value != 0,
                 (6, 18) if value < 0 => return Err(Errno::EINVAL),
                 (6, 18) => options.user_timeout = value,
-                (0, 1) => options.type_of_service = value & 0xfc,
+                // A new type of service sets the priority too
+                // (`__ip_sock_set_tos`, `rt_tos2priority`).
+                (0, 1) if options.type_of_service != value & 0xfc => {
+                    options.type_of_service = value & 0xfc;
+                    options.priority = tos_priority(value);
+                }
+                (0, 1) => {}
                 (41, 26) if socket.family == Family::V6 => {
                     // Linux refuses it once the socket has a local port.
                     let s = socket.lock();
@@ -3583,6 +3612,17 @@ fn build_answer(query: &Query, code: u8, addresses: &[IpAddr], limit: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn types_of_service_give_linuxs_priorities() {
+        // IPTOS_LOWDELAY, IPTOS_THROUGHPUT, IPTOS_RELIABILITY, IPTOS_MINCOST
+        // and both delay and throughput; precedence and ECN bits do not count.
+        let priorities: Vec<i32> = [0x10, 0x08, 0x04, 0x02, 0x18, 0xe3, 0xf0]
+            .into_iter()
+            .map(tos_priority)
+            .collect();
+        assert_eq!(priorities, [6, 2, 0, 0, 4, 0, 6]);
+    }
 
     #[test]
     fn rules_name_hosts_addresses_and_ports() {

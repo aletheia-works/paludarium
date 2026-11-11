@@ -1264,7 +1264,8 @@ kernel.
     traffic class, and while listening or closed its `IPV6_V6ONLY`, its
     mark to `CAP_NET_ADMIN`, its priority as its class, its cgroup, its
     options (`inet_diag_sockopt`), its memory (a UDP socket's datagrams
-    charged in pages, as `udp_rmem_schedule` does, and its buffers), and a
+    charged in pages, as `udp_rmem_schedule` does, its buffers, and a
+    listener's handshakes that a full queue dropped), and a
     TCP socket's congestion control (`cubic`). A hold in `TIME_WAIT` tells
     its addresses, state and timer alone.
   - **Groups:** a socket has 32 groups, as Linux makes the four of
@@ -2029,7 +2030,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     the host), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_QUICKACK`,
     `TCP_USER_TIMEOUT`, `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and
     range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
-    `wmem_max` and `rmem_max` (212992), doubled. `SO_TIMESTAMP`, its kin
+    `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
+    `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`). `SO_TIMESTAMP`, its kin
     and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and
     `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection (`EINVAL`
     while it is closed or listening).
@@ -2086,7 +2088,8 @@ one only with an `--allow-net`.
   listener's, a connection it accepted, a client's), unless both set
   `SO_REUSEADDR` and the other does not listen, or both set
   `SO_REUSEPORT`. An IPv6 socket on `::` holds the port for IPv4 too,
-  unless `IPV6_V6ONLY`.
+  unless `IPV6_V6ONLY`; binding to another IPv6 address that is not an
+  IPv4 one sets `IPV6_V6ONLY`, as `__inet6_bind` does.
 - **`listen`** keeps up to `backlog` + 1 connections waiting (at most
   4096, `net.core.somaxconn`); an unbound socket takes an ephemeral port on
   every address. A listener is readable while a connection waits (for

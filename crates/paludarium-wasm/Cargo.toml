@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+cost-profile = ["paludarium-jit/cost-profile", "paludarium-runtime/cost-profile"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -22,9 +25,6 @@ paludarium-mmu.workspace = true
 paludarium-runtime.workspace = true
 paludarium-types.workspace = true
 paludarium-vfs.workspace = true
-
-[features]
-cost-profile = ["paludarium-jit/cost-profile", "paludarium-runtime/cost-profile"]
 
 [lints]
 workspace = true

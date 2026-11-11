@@ -1293,10 +1293,19 @@ pub(crate) fn make_mounted(
     }
     landlock()?;
     let Some(mode) = regular else {
+        // `vfs_mkdir`, `vfs_mknod` and `vfs_symlink` check `may_create`
+        // before they find no operation.
+        may_change_root(c)?;
         return Err(Errno::EPERM);
     };
     open_in(c, &mounted(c), name, O_CREAT | O_EXCL, mode & 0o7777, None)?;
     Ok(0)
+}
+
+/// `may_create` and `may_delete`'s check of the root: writing and
+/// searching it (`EACCES`).
+pub(crate) fn may_change_root(c: &Context<'_>) -> Result<(), Errno> {
+    crate::permissions::permission(&c.process.credentials, &mounted_root_stat(c), 3)
 }
 
 /// `unlink` of `/dev/mqueue/<name>`, as [`mq_unlink`], and `rmdir`, in

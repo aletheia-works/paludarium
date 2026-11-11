@@ -1436,6 +1436,12 @@ static void as_user(const char *label) {
         long made = q_open(DEV_NAME "-theirs", O_RDWR | O_CREAT, 0600, NULL);
         put("create", made < 0 ? made : 0);
         put("open-create", TRY(open(DEV_PATH("-theirs2"), O_RDWR | O_CREAT | O_CLOEXEC, 0600)) < 0 ? -errno : 0);
+        put("mkdir", TRY(mkdir(DEV_PATH("-theirs3"), 0700)));
+        put("symlink", TRY(symlink("target", DEV_PATH("-theirs3"))));
+        put("fifo", TRY(mknod(DEV_PATH("-theirs3"), S_IFIFO | 0600, 0)));
+        put("link", TRY(link(DEV_PATH("-root"), DEV_PATH("-theirs3"))));
+        put("rename", TRY(rename(DEV_PATH("-root"), DEV_PATH("-theirs3"))));
+        put("rename-itself", TRY(rename(DEV_PATH("-root"), DEV_PATH("-root"))));
         say("");
         _exit(0);
     }

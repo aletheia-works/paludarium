@@ -8,6 +8,9 @@ readme.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+cost-profile = ["paludarium-cpu/cost-profile", "paludarium-jit/cost-profile"]
+
 [dependencies]
 paludarium-cpu.workspace = true
 paludarium-host.workspace = true
@@ -17,9 +20,6 @@ paludarium-loader.workspace = true
 paludarium-mmu.workspace = true
 paludarium-types.workspace = true
 paludarium-vfs.workspace = true
-
-[features]
-cost-profile = ["paludarium-cpu/cost-profile", "paludarium-jit/cost-profile"]
 
 [lints]
 workspace = true

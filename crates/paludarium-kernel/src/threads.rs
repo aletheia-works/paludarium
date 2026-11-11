@@ -1494,6 +1494,20 @@ impl Kernel {
                 compare,
             );
         }
+        // FUTEX_WAKE_OP: `val` waiters of `uaddr` woken, and up to `val2`,
+        // the timeout argument's low 32 bits, of `uaddr2` when `val3`'s
+        // operation on it compares true.
+        if op == 5 {
+            return self.group.futexes.wake_op(
+                mem,
+                a[0],
+                a[4],
+                private,
+                a[2] as u32 as i32,
+                a[3] as u32 as i32,
+                a[5] as u32,
+            );
+        }
         if matches!(op, 1 | 10) {
             return self
                 .group

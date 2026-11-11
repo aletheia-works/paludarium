@@ -6170,6 +6170,73 @@ static int futex_requeue_case(void) {
     printf("futex_requeue moved=%ld woke=%ld result=%ld\n", r, woke, rq_results[3]);
     return 0;
 }
+/* FUTEX_WAKE_OP, as Linux's futex_wake_op and x86's futex atomic op. */
+static _Alignas(8) volatile uint32_t wo_words[2];
+static long wo_results[5];
+static void *wo_waiter(void *arg) {
+    long i = (long)arg;
+    volatile uint32_t *word = &wo_words[i < 3 ? 0 : 1];
+    wo_results[i] = f2_errno(syscall(SYS_futex, word, 128, *word, NULL, NULL, 0));
+    return NULL;
+}
+static long wo_call(long op, volatile uint32_t *first, long wake, long wake2,
+                    volatile uint32_t *second, long encoded) {
+    return f2_errno(syscall(SYS_futex, first, op, wake, (void *)wake2, second, encoded));
+}
+#define WO(op, oparg, cmp, cmparg) \
+    ((long)((unsigned long)(op) << 28 | (unsigned long)(cmp) << 24 | \
+            (unsigned long)((oparg) & 0xfff) << 12 | (unsigned long)((cmparg) & 0xfff)))
+static int futex_wake_op_case(void) {
+    volatile uint32_t *a = &wo_words[0], *b = &wo_words[1];
+    char *page = mmap(NULL, 8192, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return 80;
+    munmap(page + 4096, 4096);
+    volatile uint32_t *rom = (volatile uint32_t *)page, *gone = (volatile uint32_t *)(page + 4096);
+    long set = WO(0, 5, 0, 0);
+    printf("wake_op misaligned=%ld,%ld bad-op=%ld bad-op-unmapped=%ld,%ld read-only=%ld,%ld "
+           "realtime=%ld\n",
+           wo_call(5 | 128, (volatile uint32_t *)((char *)a + 2), 1, 1, b, set),
+           wo_call(5 | 128, a, 1, 1, (volatile uint32_t *)((char *)b + 2), set),
+           wo_call(5 | 128, a, 1, 1, b, WO(5, 0, 0, 0)), wo_call(5 | 128, a, 1, 1, gone, WO(7, 0, 0, 0)),
+           wo_call(5, a, 1, 1, gone, WO(7, 0, 0, 0)), wo_call(5 | 128, a, 1, 1, rom, set),
+           wo_call(5, a, 1, 1, rom, set), wo_call(5 | 128 | 256, a, 1, 1, b, set));
+    long untouched = *b;
+    long bad_cmp = wo_call(5 | 128, a, 1, 1, b, WO(0, 9, 6, 0));
+    long after_bad_cmp = *b;
+    long high = wo_call(5 | 128, a, 1, 1L << 32, b, (1L << 32) | WO(1, 1, 0, 0));
+    long added = *b;
+    wo_call(5 | 128, a, 1, 1, b, WO(8, 33, 0, 0));
+    long shift = *b;
+    wo_call(5 | 128, a, 1, 1, b, WO(8 | 2, -1, 0, 0));
+    long top = *b;
+    wo_call(5 | 128, a, 1, 1, b, WO(3, 2, 0, 0));
+    long andn = *b;
+    wo_call(5 | 128, a, 1, 1, b, WO(4, 0xff, 0, 0));
+    printf("wake_op untouched=%ld bad-cmp=%ld word=%ld high=%ld add=%ld shift=%#lx,%#lx andn=%#lx "
+           "xor=%#x\n",
+           untouched, bad_cmp, after_bad_cmp, high, added, shift, top, andn, *b);
+
+    /* Three waiters at a, two at b holding -1; CMP_REQUEUE onto its own
+     * word counts them without moving any. */
+    *a = 0;
+    *b = 0xffffffff;
+    pthread_t t[5];
+    for (long i = 0; i < 5; i++) pthread_create(&t[i], NULL, wo_waiter, (void *)i);
+    while (wo_call(4 | 128, a, 0, INT_MAX, a, 0) != 3 || wo_call(4 | 128, b, 0, INT_MAX, b, 0xffffffffL) != 2)
+        sched_yield();
+    /* -1 is not >= 0 as an int; 0 is > -1, a signed argument. */
+    long first = wo_call(5 | 128, a, 1, 1, b, WO(1, 1, 5, 0));
+    long first_word = *b;
+    long second = wo_call(5 | 128, a, 0, 5, b, WO(0, 2, 4, -1));
+    long second_word = *b;
+    long same = wo_call(5 | 128, a, 1, 1, a, WO(4, 0, 0, 0));
+    for (int i = 0; i < 5; i++) pthread_join(t[i], NULL);
+    printf("wake_op woke=%ld,%ld,%ld words=%ld,%ld results=%ld,%ld,%ld,%ld,%ld\n", first, second,
+           same, first_word, second_word, wo_results[0], wo_results[1], wo_results[2], wo_results[3],
+           wo_results[4]);
+    munmap(page, 4096);
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -17479,6 +17546,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "old-forms")) return old_forms_case();
     if (!strcmp(mode, "futex2")) return futex2_case();
     if (!strcmp(mode, "futex-requeue")) return futex_requeue_case();
+    if (!strcmp(mode, "futex-wake-op")) return futex_wake_op_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

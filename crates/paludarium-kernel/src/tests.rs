@@ -4887,6 +4887,24 @@ mod futex_requeue {
             f.ret(202, &[WORDS, 4 | 128 | 256, 1, 1, WORDS + 4, 0]),
             errno(Errno::ENOSYS)
         );
+        // FUTEX_WAKE_OP_PRIVATE: val2 is the timeout argument's low 32
+        // bits and val3 an encoded `u32`; FUTEX_SET of 3 compared with
+        // FUTEX_OP_CMP_EQ 0.
+        let set = 3 << 12;
+        assert_eq!(f.ret(202, &[WORDS, 5 | 128, 1, 1 << 32, WORDS + 4, set]), 0);
+        assert_eq!(f.mem.read_u64(GuestAddr(WORDS)).unwrap(), 3 << 32);
+        assert_eq!(
+            f.ret(
+                202,
+                &[WORDS, 5 | 128, 1, 1, WORDS + 4, set | 5 << 28 | 1 << 32]
+            ),
+            errno(Errno::ENOSYS)
+        );
+        assert_eq!(
+            f.ret(202, &[WORDS, 5 | 128 | 256, 1, 1, WORDS + 4, set]),
+            errno(Errno::ENOSYS)
+        );
+        f.mem.write_u64(GuestAddr(WORDS), 0).unwrap();
         // futex_requeue(waiters, flags, nr_wake, nr_requeue)
         let entry = |f: &Fixture, i: u64, value: u64, addr: u64, flags: u64| {
             let at = LIST + 24 * i;

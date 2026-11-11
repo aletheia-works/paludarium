@@ -1013,6 +1013,137 @@ fn futex_requeue_wakes_then_moves_in_order() {
     assert_eq!(f.wake(&m, DATA + 4, true, 9, u32::MAX), Ok(0));
     assert_eq!(f.wake(&m, DATA, true, 9, u32::MAX), Ok(1));
 }
+/// `FUTEX_WAKE_OP`'s `val3`: the operation, its argument, the comparison
+/// and its argument.
+fn wake_op(op: u32, oparg: i32, cmp: u32, cmparg: i32) -> u32 {
+    op << 28 | cmp << 24 | (oparg as u32 & 0xfff) << 12 | cmparg as u32 & 0xfff
+}
+#[test]
+fn futex_wake_op_changes_the_word_then_wakes() {
+    let m = memory();
+    m.map_shared(
+        Some(GuestAddr(DATA + 0x1000)),
+        4096,
+        Prot::READ,
+        MappingKind::Anonymous,
+    )
+    .unwrap();
+    let f = futex::Futexes::default();
+    let read = |addr| {
+        let mut bytes = [0; 4];
+        m.read(GuestAddr(addr), &mut bytes).unwrap();
+        i32::from_le_bytes(bytes)
+    };
+    let (first, second, rom) = (DATA, DATA + 4, DATA + 0x1000);
+    m.write(GuestAddr(second), &7u32.to_le_bytes()).unwrap();
+    let set = wake_op(0, 5, 0, 7);
+    // Both keys first; an unknown operation then, before the word is
+    // touched, so a read-only word gives ENOSYS when private and EFAULT
+    // when shared, which needs it writable.
+    assert_eq!(
+        f.wake_op(&m, first + 2, second, true, 1, 1, set),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.wake_op(&m, first, second + 2, true, 1, 1, set),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.wake_op(&m, first, second, true, 1, 1, wake_op(5, 0, 0, 0)),
+        Err(Errno::ENOSYS)
+    );
+    assert_eq!(
+        f.wake_op(&m, first, rom, true, 1, 1, wake_op(5, 0, 0, 0)),
+        Err(Errno::ENOSYS)
+    );
+    assert_eq!(
+        f.wake_op(&m, first, rom, false, 1, 1, wake_op(5, 0, 0, 0)),
+        Err(Errno::EFAULT)
+    );
+    assert_eq!(
+        f.wake_op(&m, first, rom, true, 1, 1, set),
+        Err(Errno::EFAULT)
+    );
+    assert_eq!(read(second), 7);
+    // An unknown comparison is ENOSYS after the word has changed, and
+    // nothing wakes.
+    let waiters: Vec<_> = [1, 2, 1]
+        .into_iter()
+        .map(|mask| f.register(&m, first, true, 0, mask).unwrap())
+        .chain((0..2).map(|_| f.register(&m, second, true, 7, u32::MAX).unwrap()))
+        .collect();
+    assert_eq!(
+        f.wake_op(&m, first, second, true, 1, 1, wake_op(0, 9, 6, 0)),
+        Err(Errno::ENOSYS)
+    );
+    assert_eq!(read(second), 9);
+    let states = || -> Vec<u32> {
+        waiters
+            .iter()
+            .map(|w| w.state.load(Ordering::SeqCst))
+            .collect()
+    };
+    assert_eq!(states(), [0; 5]);
+    m.write(GuestAddr(second), &7u32.to_le_bytes()).unwrap();
+    // The old value 7 compares equal: one of each woken, a count of 0 too,
+    // whatever their bitsets.
+    assert_eq!(f.wake_op(&m, first, second, true, 0, 1, set), Ok(2));
+    assert_eq!(states(), [1, 0, 0, 1, 0]);
+    assert_eq!(read(second), 5);
+    // 5 is not greater than 5: only the first word's.
+    assert_eq!(
+        f.wake_op(&m, first, second, true, 1, 9, wake_op(1, 1, 4, 5)),
+        Ok(1)
+    );
+    assert_eq!(states(), [1, 1, 0, 1, 0]);
+    assert_eq!(read(second), 6);
+    // Or, and-not and xor, and arguments as shifts (taken modulo 32).
+    assert_eq!(
+        f.wake_op(&m, first + 8, second, true, 1, 1, wake_op(2 | 8, 4, 1, 6)),
+        Ok(0)
+    );
+    assert_eq!(read(second), 22);
+    assert_eq!(
+        f.wake_op(&m, first + 8, second, true, 1, 1, wake_op(3, 6, 0, 0)),
+        Ok(0)
+    );
+    assert_eq!(read(second), 16);
+    assert_eq!(
+        f.wake_op(&m, first + 8, second, true, 1, 1, wake_op(4 | 8, 33, 0, 0)),
+        Ok(0)
+    );
+    assert_eq!(read(second), 18);
+    assert_eq!(
+        f.wake_op(&m, first + 8, second, true, 1, 1, wake_op(8, -1, 0, 0)),
+        Ok(0)
+    );
+    assert_eq!(read(second), i32::MIN);
+    // The old value and the argument compare as signed: `i32::MIN` is not
+    // greater than or equal to 0, and -1 is less than or equal to -1.
+    assert_eq!(
+        f.wake_op(&m, first + 8, second, true, 1, 1, wake_op(0, -1, 5, 0)),
+        Ok(0)
+    );
+    assert_eq!(
+        f.wake_op(&m, first + 8, second, true, 1, 1, wake_op(0, -1, 3, -1)),
+        Ok(1)
+    );
+    assert_eq!(states(), [1, 1, 0, 1, 1]);
+    // Onto the same word, each count in turn.
+    assert_eq!(
+        f.wake_op(&m, first, first, true, 1, 1, wake_op(0, 0, 0, 0)),
+        Ok(1)
+    );
+    let more = f.register(&m, first, true, 0, u32::MAX).unwrap();
+    let last = f.register(&m, first, true, 0, u32::MAX).unwrap();
+    assert_eq!(
+        f.wake_op(&m, first, first, true, 1, 1, wake_op(0, 0, 3, 0)),
+        Ok(2)
+    );
+    assert_eq!(states(), [1; 5]);
+    assert_eq!(more.state.load(Ordering::SeqCst), 1);
+    assert_eq!(last.state.load(Ordering::SeqCst), 1);
+}
 #[test]
 fn futex_requeue_onto_its_own_word_leaves_waiters_in_place() {
     let m = memory();

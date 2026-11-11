@@ -31,4 +31,4 @@
 
 ケース23は不正 CLONE_PARENT_SETTID ポインタに対する Linux の実動作を観測し、成功した clone を1に正規化する。Linux が parent-TID 書き込み失敗を無視した場合に clone が失敗すると仮定しない。
 
-raw guest は後続ユニットの命令・ライブラリ依存を避けて Rust Mutex、Condvar、Rayon が必要とする同期プリミティブを検証する。完全な probe 実行は別途必要である。REQUEUE/CMP_REQUEUE は実装済みである。WAKE_OP の追加対応は実際の使用要件を観測した場合に行う。
+raw guest は後続ユニットの命令・ライブラリ依存を避けて Rust Mutex、Condvar、Rayon が必要とする同期プリミティブを検証する。完全な probe 実行は別途必要である。REQUEUE/CMP_REQUEUE/WAKE_OP は実装済みである。

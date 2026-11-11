@@ -198,8 +198,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   などの iovec の数は、Linux が `unsigned` として渡すので下位 32 ビットだけを読みます。システムコールの番号も、
   Linux の `do_syscall_64` が `int` で受け取るのと同じく `rax` の下位 32 ビットから読み、
   負の番号は `ENOSYS` です。
-- `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET`・`REQUEUE`・`CMP_REQUEUE` を
-  扱います。ワードは Linux の
+- `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET`・`REQUEUE`・`CMP_REQUEUE`・
+  `WAKE_OP` を扱います。ワードは Linux の
   `get_futex_key` と同じように見分けます。共有マッピング（共有の無名メモリかファイルのもの）では、
   shared の操作はそのメモリとその中のオフセットを指すので、wake はそのメモリをマップしている
   どのプロセスの待ち手にも、どこにマップしていても届きます。それ以外のワードと private の操作は、
@@ -212,7 +212,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   キューに移して、扱った数を返します。負の数は `EINVAL` です。`CMP_REQUEUE` は、両方のワードを
   確かめた後で、1 つめのワードが `val3` でなければ `EAGAIN` を返します。待ち手はビットセットに
   かかわらず、来た順に扱います。同じワードへの requeue は、Linux が 1 つのハッシュバケットの中で
-  そうするのと同じく、待ち手を動かさず、それぞれ 1 回だけ数えます。
+  そうするのと同じく、待ち手を動かさず、それぞれ 1 回だけ数えます。`WAKE_OP` は、`val3` が
+  表す演算（代入・加算・論理和・否定との論理積・排他的論理和。引数は 1 のシフトにもできます）で
+  `uaddr2` を不可分に変え、`uaddr` の待ち手を最大 `val` 個起こします。続けて、`uaddr2` の元の
+  値を符号付きの `int` として比べた結果が真なら、`uaddr2` の待ち手を最大 `val2` 個起こし、
+  起こした数を返します。x86 の Linux と同じく、知らない演算はワードに触れる前に `ENOSYS`、
+  知らない比較はワードを変えた後で `ENOSYS`、書けないワードは `EFAULT` です。
 - futex2 の呼び出しは、32 ビットのワードと `FUTEX2_PRIVATE`・`FUTEX2_NUMA`・`FUTEX2_MPOL` を
   Linux と同じ順に確かめて受け付けます。ほかの大きさやフラグは `EINVAL` です。`futex_wake` と
   `futex_wait` は、`FUTEX_WAKE_BITSET` と `FUTEX_WAIT_BITSET` に、`CLOCK_REALTIME` か

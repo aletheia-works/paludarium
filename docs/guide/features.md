@@ -221,8 +221,8 @@ kernel.
   it on as an `unsigned`. The number
   itself is read from the low 32 bits of `rax` too, as Linux's
   `do_syscall_64` takes an `int`, and a negative one gives `ENOSYS`.
-- `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE` and
-  `CMP_REQUEUE`. A word is
+- `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE`,
+  `CMP_REQUEUE` and `WAKE_OP`. A word is
   told apart as Linux's `get_futex_key` does: in a shared mapping (shared
   anonymous memory or a file's), a shared operation names the memory and the
   offset in it, so a wake reaches a waiter in any process that maps it,
@@ -239,7 +239,13 @@ kernel.
   when the first word is not `val3`, after both words' checks. It takes the
   waiters in the order they came, whatever their bitsets. Onto its own word,
   a requeue leaves them where they are and counts each once, as Linux does
-  within one hash bucket.
+  within one hash bucket. `WAKE_OP` changes `uaddr2` atomically by the
+  operation `val3` encodes (set, add, or, and-not or xor, its argument
+  optionally a shift of 1), wakes up to `val` waiters of `uaddr`, then up to
+  `val2` of `uaddr2` when its old value, as a signed `int`, compares true,
+  and gives how many it woke. An unknown operation gives `ENOSYS` before the
+  word is touched, an unknown comparison gives `ENOSYS` after it changed, and
+  a word it cannot write gives `EFAULT`, as x86's Linux does.
 - The futex2 calls take 32-bit words with `FUTEX2_PRIVATE`, `FUTEX2_NUMA`
   and `FUTEX2_MPOL`, checked in Linux's order. Other sizes and flags give
   `EINVAL`. `futex_wake` and `futex_wait` are `FUTEX_WAKE_BITSET` and

@@ -99,6 +99,78 @@ fn checked_key(mem: &AddressSpace, addr: u64, private: bool, numa: bool) -> Resu
     }
     Ok(key(mem, addr, private))
 }
+/// Wakes waiters of `key` in the order they came, those whose bits meet
+/// `mask`, until `count` are woken: one at least, as Linux counts a wake
+/// before it compares.
+fn wake_queue(
+    queues: &mut BTreeMap<Key, Vec<Arc<Waiter>>>,
+    key: Key,
+    count: i32,
+    mask: u32,
+) -> u64 {
+    let mut woke = 0i32;
+    let mut done = false;
+    if let Some(queue) = queues.get_mut(&key) {
+        queue.retain(|waiter| {
+            if !done && waiter.mask & mask != 0 {
+                waiter.state.store(1, Ordering::SeqCst);
+                waiter.token.notify();
+                woke += 1;
+                done = woke >= count;
+                false
+            } else {
+                true
+            }
+        });
+        if queue.is_empty() {
+            queues.remove(&key);
+        }
+    }
+    woke as u64
+}
+/// `FUTEX_OP_OPARG_SHIFT`, the bit of an encoded operation that makes its
+/// argument a shift of 1.
+const OPARG_SHIFT: u32 = 8 << 28;
+/// The operation `FUTEX_WAKE_OP` encodes, done on the word at `addr` as
+/// Linux's `futex_atomic_op_inuser` and x86's `arch_futex_atomic_op_inuser`
+/// do: bits 28 to 30 the operation (set, add, or, and-not, xor; any other
+/// `ENOSYS`, before the word is touched), bits 24 to 27 the comparison (equal, not equal, less, less or
+/// equal, greater, greater or equal), and
+/// two signed 12-bit arguments; with [`OPARG_SHIFT`] the operation's argument
+/// becomes `1 << (oparg & 31)`. The word is changed atomically (`EFAULT` when
+/// it cannot be written), and only then is its old value compared, as a
+/// signed `int`: `ENOSYS` for an unknown comparison, the word changed all
+/// the same.
+fn futex_op(mem: &AddressSpace, addr: u64, encoded: u32) -> Result<bool, Errno> {
+    let signed = |bits: u32| ((bits << 20) as i32) >> 20;
+    let mut oparg = signed(encoded >> 12 & 0xfff);
+    let cmparg = signed(encoded & 0xfff);
+    if encoded & OPARG_SHIFT != 0 {
+        oparg = 1 << (oparg & 31);
+    }
+    let value = u128::from(oparg as u32);
+    let operation = match encoded >> 28 & 7 {
+        0 => AtomicOp::Exchange(value),
+        1 => AtomicOp::Add(value),
+        2 => AtomicOp::Or(value),
+        3 => AtomicOp::And(u128::from(!(oparg as u32))),
+        4 => AtomicOp::Xor(value),
+        _ => return Err(Errno::ENOSYS),
+    };
+    let old = mem
+        .atomic(GuestAddr(addr), AtomicWidth::W32, operation)
+        .map_err(|_| Errno::EFAULT)?
+        .old as u32 as i32;
+    match encoded >> 24 & 15 {
+        0 => Ok(old == cmparg),
+        1 => Ok(old != cmparg),
+        2 => Ok(old < cmparg),
+        3 => Ok(old <= cmparg),
+        4 => Ok(old > cmparg),
+        5 => Ok(old >= cmparg),
+        _ => Err(Errno::ENOSYS),
+    }
+}
 #[derive(Default, Clone)]
 pub(crate) struct Futexes {
     queues: Arc<Mutex<BTreeMap<Key, Vec<Arc<Waiter>>>>>,
@@ -208,25 +280,39 @@ impl Futexes {
             return Ok(0);
         }
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut woke = 0i32;
-        let mut done = false;
-        if let Some(queue) = queues.get_mut(&key) {
-            queue.retain(|waiter| {
-                if !done && waiter.mask & mask != 0 {
-                    waiter.state.store(1, Ordering::SeqCst);
-                    waiter.token.notify();
-                    woke += 1;
-                    done = woke >= count;
-                    false
-                } else {
-                    true
-                }
-            });
-            if queue.is_empty() {
-                queues.remove(&key);
-            }
+        Ok(wake_queue(&mut queues, key, count, mask))
+    }
+    /// Linux's `futex_wake_op`: the key of `first`, then of `second`, whose
+    /// shared page must be writable (`FUTEX_WRITE`, `EFAULT`); then, under
+    /// the queues, `op` done on `second` ([`futex_op`]), whose error is
+    /// returned before anything wakes; then up to `wake` waiters of `first`
+    /// woken, and up to `wake2` of `second` when the comparison held. Each
+    /// count wakes one even when it is not positive, and waiters are taken
+    /// whatever their bits, as Linux matches only the key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wake_op(
+        &self,
+        mem: &AddressSpace,
+        first: u64,
+        second: u64,
+        private: bool,
+        wake: i32,
+        wake2: i32,
+        op: u32,
+    ) -> Result<u64, Errno> {
+        let first_key = checked_key(mem, first, private, false)?;
+        let second_key = checked_key(mem, second, private, false)?;
+        if !private {
+            mem.check_write(GuestAddr(second), 4)
+                .map_err(|_| Errno::EFAULT)?;
         }
-        Ok(woke as u64)
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = futex_op(mem, second, op)?;
+        let mut woke = wake_queue(&mut queues, first_key, wake, u32::MAX);
+        if held {
+            woke += wake_queue(&mut queues, second_key, wake2, u32::MAX);
+        }
+        Ok(woke)
     }
     /// Wakes up to `wake` waiters of the word `from` and moves up to
     /// `requeue` more to the queue of the word `to`, giving how many it took,

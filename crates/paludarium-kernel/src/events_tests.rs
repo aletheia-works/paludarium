@@ -3679,6 +3679,90 @@ fn netlink_replies(f: &mut Fixture, fd: u64) -> Vec<(u16, u16, u32, u32, Vec<u8>
     }
 }
 #[test]
+fn generic_netlink_has_its_controller_alone() {
+    let mut f = Fixture::new();
+    assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
+    let route = f.ret(41, [16, 3, 0, 0, 0, 0]);
+    let fd = f.ret(41, [16, 3, 16, 0, 0, 0]);
+    // SO_PROTOCOL, and its own table of ports: both take the process's ID.
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &4u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(55, [fd, 1, 38, DATA + 0x100, DATA + 0x200, 0]), 0);
+    assert_eq!(read_u32(&f, DATA + 0x100), 16);
+    let mut any = [0u8; 12];
+    any[..2].copy_from_slice(&16u16.to_le_bytes());
+    f.mem.write(GuestAddr(DATA + 0x100), &any).unwrap();
+    assert_eq!(f.ret(49, [route, DATA + 0x100, 12, 0, 0, 0]), 0);
+    assert_eq!(f.ret(49, [fd, DATA + 0x100, 12, 0, 0, 0]), 0);
+    f.mem
+        .write(GuestAddr(DATA + 0x200), &12u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(51, [fd, DATA + 0x100, DATA + 0x200, 0, 0, 0]), 0);
+    assert_eq!(read_u32(&f, DATA + 0x104), 1);
+    // CTRL_CMD_GETFAMILY by name answers with nlctrl, with NLM_F_ACK then
+    // acknowledged.
+    let mut get = vec![3, 1, 0, 0, 11, 0, 2, 0];
+    get.extend_from_slice(b"nlctrl\0\0");
+    let len = netlink_request(&f, DATA, 16, 0x5, 7, &get);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies.len(), 2);
+    assert_eq!((replies[0].0, replies[0].1, replies[0].2), (16, 0, 7));
+    assert_eq!(&replies[0].4[..4], &[1, 2, 0, 0]);
+    assert_eq!(replies[0].4.len(), 4 + 12 + 8 + 24 + 44 + 28);
+    assert_eq!(
+        (replies[1].0, &replies[1].4[..4]),
+        (2, &0i32.to_le_bytes()[..])
+    );
+    // Another name, another family, and no family at all.
+    get[8..15].copy_from_slice(b"nlctrX\0");
+    let len = netlink_request(&f, DATA, 16, 0x1, 8, &get);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(
+        &netlink_replies(&mut f, fd)[0].4[..4],
+        &(-2i32).to_le_bytes()
+    );
+    let len = netlink_request(&f, DATA, 17, 0x1, 9, &get);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(
+        &netlink_replies(&mut f, fd)[0].4[..4],
+        &(-2i32).to_le_bytes()
+    );
+    let len = netlink_request(&f, DATA, 16, 0x1, 10, &get[..4]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(
+        &netlink_replies(&mut f, fd)[0].4[..4],
+        &(-22i32).to_le_bytes()
+    );
+    // The dump: nlctrl, then NLMSG_DONE in the same datagram.
+    let len = netlink_request(&f, DATA, 16, 0x301, 11, &[3, 1, 0, 0]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let n = f.ret(45, [fd, DATA + 0x1000, 0x1000, 0x40, 0, 0]);
+    assert_eq!(n, 136 + 20);
+    // The policy dump: two commands' and five attributes' messages, then
+    // NLMSG_DONE apart.
+    get[8..15].copy_from_slice(b"nlctrl\0");
+    get[0] = 10;
+    let len = netlink_request(&f, DATA, 16, 0x301, 12, &get);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies.len(), 8);
+    assert!(
+        replies[..7]
+            .iter()
+            .all(|r| (r.0, r.1, r.4[0]) == (16, 2, 10))
+    );
+    assert_eq!(replies[7].0, 3);
+    // A command it has not is EOPNOTSUPP.
+    let len = netlink_request(&f, DATA, 16, 0x1, 13, &[1, 1, 0, 0]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(
+        &netlink_replies(&mut f, fd)[0].4[..4],
+        &(-95i32).to_le_bytes()
+    );
+}
+#[test]
 fn netlink_dumps_and_sets_a_new_namespaces_loopback() {
     let mut f = Fixture::new();
     let errno = |e: i32| Errno(e).to_syscall_return();
@@ -3686,7 +3770,7 @@ fn netlink_dumps_and_sets_a_new_namespaces_loopback() {
     assert_eq!(f.ret(41, [16, 3, 0, 0, 0, 0]), errno(97));
     assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
     assert_eq!(f.ret(41, [16, 1, 0, 0, 0, 0]), errno(94));
-    assert_eq!(f.ret(41, [16, 3, 16, 0, 0, 0]), errno(93));
+    assert_eq!(f.ret(41, [16, 3, 9, 0, 0, 0]), errno(93));
     let fd = f.ret(41, [16, 3 | 0x80000, 0, 0, 0, 0]);
     assert!(fd < 1024);
     // Unbound, its name has port 0; a send binds it to the process's ID.

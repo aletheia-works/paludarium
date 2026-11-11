@@ -1,4 +1,5 @@
-/* splice (275), tee (276) and vmsplice (278) through the raw Linux ABI; the
+/* splice (275), tee (276) and vmsplice (278), and in case 73 a signal that
+   interrupts sendfile (40) and splice, through the raw Linux ABI; the
    native result is regenerated before every comparison. Each case writes its
    results as longs. Pipes are only compared empty or full of whole pages, as
    Linux counts a pipe's capacity in page buffers. */
@@ -25,6 +26,27 @@ static long sigpipe_pending(void){
  static long zero[2];if(was)call(128,(long)&pipe_mask,0,(long)zero,8,0,0);return was;
 }
 static void pipe_of(int *fds,long flags,long size){call(293,(long)fds,flags,0,0,0,0);if(size)S(72,fds[0],1031,size);}
+#if CASE==73
+/* call6(n,a,b,c,d,e), flags 0 in r9, with the syscall at call_at, so that a
+   handler can tell from the frame that a signal came during the call. */
+__asm__(".global call6\ncall6: mov %rdi,%rax\nmov %rsi,%rdi\nmov %rdx,%rsi\nmov %rcx,%rdx\nmov %r8,%r10\nmov %r9,%r8\nxor %r9d,%r9d\n"
+        ".global call_at\ncall_at: syscall\n.global call_ret\ncall_ret: ret\n.global restorer\nrestorer: mov $15,%rax\nsyscall");
+extern long call6(long n,long a,long b,long c,long d,long e);
+extern char call_at[],call_ret[];
+extern void restorer(void);
+static long hit,hit_rax,hit_at,hit_fd;
+/* ucontext: the registers from byte 40 (rax 13th, rcx 14th, rip 16th).
+   rcx holds call_ret only once the syscall ran; a signal during the wait
+   leaves rip at call_at with rax the call's number again (SA_RESTART) or
+   at call_ret with -EINTR. */
+static void interrupted(int sig,void *info,unsigned char *uc) {
+ (void)sig;(void)info;
+ unsigned long rip=*(unsigned long*)(uc+168),rcx=*(unsigned long*)(uc+152);
+ if(!hit&&rcx==(unsigned long)call_ret&&(rip==(unsigned long)call_at||rip==(unsigned long)call_ret)){
+  hit=1;hit_rax=*(long*)(uc+144);hit_at=rip==(unsigned long)call_at;S(1,hit_fd,"h",1);
+ }
+}
+#endif
 void _start(void) {
  call(14,0,(long)&pipe_mask,0,8,0,0);
  S(87,p,0,0);S(87,q,0,0);S(87,big,0,0);S(87,fifo,0,0);
@@ -129,6 +151,38 @@ void _start(void) {
   if(child==0){static long ts[2]={0,50000000};S(35,ts,0,0);S(0,one[0],buf,4096);S(60,0,0,0);}
   a=0;R(SPLICE(fd,&a,one[1],0,10,0));R(call(61,child,(long)&status,0,0,0,0)==child);R(unread(one[0]));
   S(3,nul,0,0);S(3,zero,0,0);
+ }
+ if(CASE==73){ /* sendfile and splice into a full pipe, interrupted by a signal: EINTR, or SA_RESTART's restart */
+#if CASE==73
+  for(long round=0;round<4;round++){
+   long number=round&1?275:40,restart=round>>1;
+   int hp[2],rp[2],gp[2],full[2];call(293,(long)hp,04000,0,0,0,0);S(22,rp,0,0);S(22,gp,0,0);
+   pipe_of(full,0,4096);for(long i=0;i<4096;i++)buf[i]='p';S(1,full[1],buf,4096);
+   /* The handler is set before fork: a signal before the wait only runs it. */
+   hit_fd=hp[1];
+   unsigned long act[4]={(unsigned long)interrupted,4|0x4000000|(restart?0x10000000:0),(unsigned long)restorer,0};
+   call(13,10,(long)act,0,8,0,0);
+   S(8,fd,round,0);
+   long pid=S(57,0,0,0);
+   if(!pid){
+    S(3,full[0],0,0);
+    long r[5],k=0;
+    r[k++]=number==40?call6(40,full[1],fd,0,1,0):call6(275,fd,0,full[1],0,1);
+    r[k++]=hit;r[k++]=hit_rax;r[k++]=hit_at;r[k++]=S(8,fd,0,1);
+    /* A signal sent late may interrupt this read too. */
+    S(1,rp[1],r,k*8);while(S(0,gp[0],buf,1)==-4);S(60,0,0,0);
+   }
+   S(3,full[1],0,0);
+   /* Signal until the child's handler saw the signal come during the wait. */
+   while(S(0,hp[0],buf,1)!=1){S(62,pid,10,0);S(24,0,0,0);}
+   /* Room for a restarted call; it then puts in the byte at the position. */
+   R(S(0,full[0],buf,4096));
+   long got[5];R(S(0,rp[0],got,5*8));for(int i=0;i<5;i++)R(got[i]);
+   S(1,gp[1],"g",1);call(61,pid,0,0,0,0,0);
+   buf[0]=0;R(S(0,full[0],buf,16));R(buf[0]);
+   S(3,hp[0],0,0);S(3,hp[1],0,0);S(3,rp[0],0,0);S(3,rp[1],0,0);S(3,gp[0],0,0);S(3,gp[1],0,0);S(3,full[0],0,0);
+  }
+#endif
  }
  /* What the output file holds. */
  long n=call(17,o,(long)buf,64,0,0,0);R(n);R(sum(buf,n));

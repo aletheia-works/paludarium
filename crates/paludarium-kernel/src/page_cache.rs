@@ -406,6 +406,21 @@ pub(crate) struct CoherentFile {
     /// The write access a description open for writing holds, which a
     /// program run from the file refuses while it lasts.
     write: Option<WriteAccess>,
+    /// For a description the guest opened, whether for writing: its last
+    /// close is `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` (`fsnotify_close`).
+    opened: Option<bool>,
+}
+
+impl Drop for CoherentFile {
+    fn drop(&mut self) {
+        if let Some(writing) = self.opened {
+            self.event(if writing {
+                crate::inotify::CLOSE_WRITE
+            } else {
+                crate::inotify::CLOSE_NOWRITE
+            });
+        }
+    }
 }
 
 impl CoherentFile {
@@ -421,6 +436,7 @@ impl CoherentFile {
             device: Device::Fixed(device),
             key: OnceLock::new(),
             write: None,
+            opened: None,
         }
     }
     /// The file's key, as `stat` names it, or none for a file that is not
@@ -454,9 +470,25 @@ impl CoherentFile {
         }
         self.caches.find(self.key()?)
     }
+    /// This handle, as the guest's own open with `flags` makes it: its
+    /// watches hear `IN_OPEN` (`fsnotify_open`), and will hear its close.
+    fn opened(mut self, flags: u32) -> Self {
+        if flags & O_PATH == 0 && crate::inotify::reported_open() {
+            self.opened = Some(flags & 3 != 0);
+            self.event(crate::inotify::OPEN);
+        }
+        self
+    }
     /// Tells the machine's inotify watches of a change to the file
     /// (`notify_change`).
     fn changed(&self, mask: u32) {
+        self.tell(mask, false);
+    }
+    /// Tells them of an event of the open file itself (`fsnotify_file`).
+    fn event(&self, mask: u32) {
+        self.tell(mask, true);
+    }
+    fn tell(&self, mask: u32, content: bool) {
         let notify = &self.caches.notify;
         if mask == 0 || !notify.watching() {
             return;
@@ -464,14 +496,14 @@ impl CoherentFile {
         let Ok(stat) = self.inner.stat() else {
             return;
         };
-        match &self.device {
-            Device::Mount(fs, path) => notify.changed_file(
-                Some((&**fs, path)),
-                mount_device(&fs.mounts(), path),
-                &stat,
-                mask,
-            ),
-            Device::Fixed(device) => notify.changed_file(None, *device, &stat, mask),
+        let (place, device) = match &self.device {
+            Device::Mount(fs, path) => (Some((&**fs, &path[..])), mount_device(&fs.mounts(), path)),
+            Device::Fixed(device) => (None, *device),
+        };
+        if content {
+            notify.file_event(place, device, &stat, mask);
+        } else {
+            notify.changed_file(place, device, &stat, mask);
         }
     }
     /// Writes the cache back before the file is read. A page that cannot be
@@ -504,8 +536,10 @@ impl FileHandle for CoherentFile {
                 .copied()
                 .map_or_else(OnceLock::new, OnceLock::from),
             write: None,
+            opened: None,
         }
-        .writing(flags)?;
+        .writing(flags)?
+        .opened(flags);
         if flags & O_TRUNC != 0
             && let Some(cache) = file.cache()
         {
@@ -664,27 +698,32 @@ impl HostFs for CoherentFs {
         // `IN_CREATE`, an old one emptied `IN_MODIFY`.
         let existed = (notify.watching() && flags & (O_CREAT | O_TRUNC) != 0)
             .then(|| self.inner.metadata(path, flags & O_NOFOLLOW == 0).ok());
+        let inner = self.inner.open(path, flags, mode)?;
+        let created = matches!(existed, Some(None)) && flags & O_CREAT != 0;
+        if created {
+            notify.created(&*self.inner, path);
+        }
         let file = CoherentFile {
-            inner: self.inner.open(path, flags, mode)?,
+            inner,
             caches: Arc::clone(&self.caches),
             device: Device::Mount(Arc::clone(&self.inner), path.to_vec()),
             key: OnceLock::new(),
             write: None,
+            opened: None,
         }
-        .writing(flags)?;
+        .writing(flags)?
+        .opened(flags);
         if flags & O_TRUNC != 0
             && let Some(cache) = file.cache()
         {
             cache.resized(0, 0);
         }
-        match existed {
-            Some(None) if flags & O_CREAT != 0 => notify.created(&*self.inner, path),
-            Some(Some(stat))
-                if flags & (O_TRUNC | O_PATH) == O_TRUNC && stat.mode & 0o170000 == REGULAR =>
-            {
-                notify.changed(&*self.inner, path, true, crate::inotify::MODIFY);
-            }
-            _ => {}
+        // `handle_truncate`, after the open.
+        if let Some(Some(stat)) = existed
+            && flags & (O_TRUNC | O_PATH) == O_TRUNC
+            && stat.mode & 0o170000 == REGULAR
+        {
+            notify.changed(&*self.inner, path, true, crate::inotify::MODIFY);
         }
         Ok(Arc::new(file))
     }

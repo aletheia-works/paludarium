@@ -302,7 +302,9 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         // blocking socket calls with sendmmsg and recvmmsg (a wait that
         // SO_RCVTIMEO or SO_SNDTIMEO limits gives EINTR instead, and clears
         // the restart itself), msgsnd, msgrcv, mq_timedsend,
-        // mq_timedreceive, splice, tee and vmsplice.
+        // mq_timedreceive, sendfile (whose pipe or socket output waits for
+        // room, ERESTARTSYS as splice's wait_for_space), splice, tee and
+        // vmsplice.
         0
         | 1
         | 17..=20
@@ -317,6 +319,7 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         | 34
         | 130
         | 73
+        | 40
         | 43
         | 288
         | 44..=47
@@ -337,6 +340,9 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         23 | 270 | 271 => true,
         // futex FUTEX_WAIT and FUTEX_WAIT_BITSET without a timeout.
         202 => matches!(args[1] & 127, 0 | 9) && args[3] == 0,
+        // futex_waitv and futex2's futex_wait, whose timeout is absolute
+        // (`ERESTARTSYS`).
+        449 | 455 => true,
         _ => false,
     }
 }

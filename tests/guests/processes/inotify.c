@@ -3,8 +3,8 @@
    and removed, the queue's merging and overflow, and the waits of a read,
    poll and epoll.
 
-   The watches leave out IN_OPEN, IN_CLOSE_*, and IN_ACCESS and IN_MODIFY
-   are only looked for where no read or write of the file is made.
+   The opens, closes, reads and writes of files are events too: those of
+   the cases' own calls, never the C library's (stdout is not watched).
 
    Outputs are watch descriptors (numbered from 1 in each instance), masks,
    names, whether cookies match, counts and errno values. */
@@ -21,6 +21,8 @@
 #include <sys/epoll.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -28,9 +30,7 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 
-/* Every event but the opens, closes and reads, which these cases do not make
-   in the same way as Linux yet. */
-#define WATCHED (IN_ALL_EVENTS & ~(IN_OPEN | IN_CLOSE))
+#define WATCHED IN_ALL_EVENTS
 
 static long e(long r) { return r < 0 ? -errno : r; }
 
@@ -359,6 +359,110 @@ static int case_overflow(void) {
     return 0;
 }
 
+/* The events of opening, reading, writing and closing files. */
+static int case_content(void) {
+    make_base("content");
+    int fd = inotify_init1(IN_NONBLOCK);
+    char *dir = at("w"), *f = at("w/f"), *g = at("w/g");
+    mkdir(dir, 0755);
+    touch(f);
+    int wd_dir = inotify_add_watch(fd, dir, WATCHED);
+    int wd_f = inotify_add_watch(fd, f, WATCHED);
+    printf("wd dir=%d f=%d\n", wd_dir, wd_f);
+    int rw = open(f, O_RDWR);
+    char buf[64] = "hello";
+    long w1 = e(write(rw, buf, 5));
+    long r0 = e(read(rw, buf, sizeof buf));
+    long p1 = e(pread(rw, buf, 2, 1));
+    struct iovec iov[2] = {{buf, 1}, {buf + 1, 2}};
+    long v1 = e(preadv(rw, iov, 2, 0));
+    long v2 = e(pwritev(rw, iov, 2, 5));
+    long none = e(write(rw, buf, 0));
+    printf("write=%ld eof=%ld pread=%ld preadv=%ld pwritev=%ld empty=%ld\n", w1, r0, p1, v1, v2, none);
+    drain(fd, "read-write");
+    long fa = e(fallocate(rw, 0, 0, 16));
+    int out = open(g, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    off_t from = 0;
+    long sent = e(sendfile(out, rw, &from, 4));
+    loff_t in_at = 0;
+    long copied = e(copy_file_range(rw, &in_at, out, NULL, 3, 0));
+    close(out);
+    printf("fallocate=%ld sendfile=%ld copy=%ld\n", fa, sent, copied);
+    drain(fd, "copies");
+    /* The last close of a description is its IN_CLOSE_*. */
+    int again = dup(rw);
+    close(rw);
+    drain(fd, "dup-closed");
+    close(again);
+    int ro = open(f, O_RDONLY);
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", ro);
+    int through = open(link, O_RDONLY);
+    close(through);
+    int path = open(f, O_PATH);
+    close(path);
+    drain(fd, "opens");
+    /* A mapping holds its file: the close comes as it goes. */
+    char *map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, ro, 0);
+    close(ro);
+    long first = map == MAP_FAILED ? -1 : map[0];
+    drain(fd, "mapped");
+    munmap(map, 4096);
+    printf("mapped first=%ld\n", first);
+    drain(fd, "unmapped");
+    /* A directory read. */
+    int d = open(dir, O_RDONLY | O_DIRECTORY);
+    char entries[1024];
+    long got = e(syscall(SYS_getdents64, d, entries, sizeof entries)) > 0;
+    long end = e(syscall(SYS_getdents64, d, entries, sizeof entries));
+    long small = e(syscall(SYS_getdents64, d, entries, 1));
+    close(d);
+    printf("getdents some=%ld end=%ld small=%ld\n", got, end, small);
+    drain(fd, "directory");
+    /* The old getdents reads a directory too. */
+    d = open(dir, O_RDONLY | O_DIRECTORY);
+    long old = e(syscall(SYS_getdents, d, entries, sizeof entries)) > 0;
+    close(d);
+    printf("old getdents some=%ld\n", old);
+    drain(fd, "old-directory");
+    /* O_CREAT | O_TRUNC of a new file, then of an old one. */
+    int made = open(at("w/n"), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    close(made);
+    made = open(at("w/n"), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    close(made);
+    drain(fd, "creat");
+    /* IN_EXCL_UNLINK: a removed file's events do not reach the watch. */
+    int excl = inotify_init1(IN_NONBLOCK);
+    inotify_add_watch(excl, dir, WATCHED | IN_EXCL_UNLINK);
+    int gone = open(g, O_WRONLY);
+    unlink(g);
+    long late = e(write(gone, "x", 1));
+    close(gone);
+    printf("late=%ld\n", late);
+    drain(excl, "excl-unlink");
+    /* Without IN_EXCL_UNLINK the directory still hears of a removed open
+       file, by the name it had; a watch on the file itself with the flag
+       does not (read after the close, which Linux's IN_DELETE_SELF waits
+       for). */
+    int plain = inotify_init1(IN_NONBLOCK);
+    char *h = at("w/h");
+    touch(h);
+    inotify_add_watch(plain, dir, WATCHED);
+    int self = inotify_init1(IN_NONBLOCK);
+    inotify_add_watch(self, h, WATCHED | IN_EXCL_UNLINK);
+    int kept = open(h, O_RDWR);
+    unlink(h);
+    long kept_write = e(write(kept, "y", 1));
+    long kept_read = e(pread(kept, buf, 1, 0));
+    printf("kept write=%ld read=%ld\n", kept_write, kept_read);
+    drain(plain, "unlinked-dir");
+    close(kept);
+    drain(plain, "unlinked-dir-closed");
+    drain(self, "unlinked-self");
+    remove_all();
+    return 0;
+}
+
 static void on_alarm(int sig) { (void)sig; }
 
 static int case_wait(void) {
@@ -415,5 +519,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-flags")) return case_flags();
     if (!strcmp(mode, "inotify-overflow")) return case_overflow();
     if (!strcmp(mode, "inotify-wait")) return case_wait();
+    if (!strcmp(mode, "inotify-content")) return case_content();
     return 2;
 }

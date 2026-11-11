@@ -22,9 +22,9 @@
 //! `msg_default`) and 8192 bytes a message (`msgsize_max` and
 //! `msgsize_default`); `CAP_SYS_RESOURCE` raises the former to 65536 and
 //! 16 MiB. A queue made without attributes takes the smaller of each default
-//! and its limit. Each queue charges its owner's real user
-//! ID for its messages' bytes and its bookkeeping against
-//! `RLIMIT_MSGQUEUE` (`EMFILE` past it).
+//! and its limit. Each queue charges its messages' bytes and its
+//! bookkeeping against `RLIMIT_MSGQUEUE` (`EMFILE` past it) in each user
+//! namespace its creator is in ([`accounts`]).
 //!
 //! `mq_notify` registers the calling process to hear when a message comes
 //! to the empty queue while no receiver waits: by a signal (`SIGEV_SIGNAL`,
@@ -95,35 +95,66 @@ const S_IFREG: u32 = 0o100_000;
 const S_IFSOCK: u32 = 0o140_000;
 const S_IFMT: u32 = 0o170_000;
 
-/// The bytes each user's queues charge against `RLIMIT_MSGQUEUE` (Linux's
-/// `UCOUNT_RLIMIT_MSGQUEUE`), by real user ID, for the whole machine.
+/// A count of `RLIMIT_MSGQUEUE` bytes: a user namespace, by its inode, and
+/// a kernel user ID (Linux's `ucounts`).
+type Account = (u32, u32);
+
+/// Where a queue charges its bytes, from the creator's count up through
+/// the user namespaces it is in, and the most each may hold: the
+/// creator's (real user ID, its user namespace) up to its
+/// `RLIMIT_MSGQUEUE`, then each namespace's owner in the parent, up to the
+/// limit the owner had when it made the namespace (`inc_rlimit_ucounts`).
+pub(crate) fn accounts(
+    credentials: &crate::credentials::Credentials,
+    limit: u64,
+) -> Vec<(Account, u64)> {
+    let mut accounts = vec![((credentials.user.0.inode, credentials.uid), limit)];
+    let mut user = &credentials.user.0;
+    while let Some(parent) = user.users.parent() {
+        accounts.push((
+            (parent.inode, user.users.owner()),
+            user.users.msgqueue_max(),
+        ));
+        user = parent;
+    }
+    accounts
+}
+
+/// The bytes the users' queues charge against `RLIMIT_MSGQUEUE` (Linux's
+/// `UCOUNT_RLIMIT_MSGQUEUE`), by [`Account`], for the whole machine.
 #[derive(Default)]
-pub(crate) struct Charges(Mutex<BTreeMap<u32, u64>>);
+pub(crate) struct Charges(Mutex<BTreeMap<Account, u64>>);
 
 impl Charges {
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<u32, u64>> {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<Account, u64>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
-    /// Charges `uid` for `bytes` up to `limit` (`inc_rlimit_ucounts`):
-    /// `false`, with nothing charged, past it or at what Linux's counter,
-    /// a `long`, cannot hold.
-    fn charge(&self, uid: u32, bytes: u64, limit: u64) -> bool {
+    /// Charges each of `accounts` for `bytes`, as `inc_rlimit_ucounts`:
+    /// `false`, with nothing charged, when one would pass its most or what
+    /// Linux's counter, a `long`, cannot hold.
+    fn charge(&self, accounts: &[(Account, u64)], bytes: u64) -> bool {
         let mut charges = self.lock();
-        let charged = charges.entry(uid).or_default();
-        match charged.checked_add(bytes) {
-            Some(total) if total <= limit && total < i64::MAX as u64 => {
-                *charged = total;
-                true
+        let fits = accounts.iter().all(|&(account, most)| {
+            let charged = charges.get(&account).copied().unwrap_or_default();
+            charged
+                .checked_add(bytes)
+                .is_some_and(|total| total <= most && total < i64::MAX as u64)
+        });
+        if fits {
+            for &(account, _) in accounts {
+                *charges.entry(account).or_default() += bytes;
             }
-            _ => false,
         }
+        fits
     }
-    fn release(&self, uid: u32, bytes: u64) {
+    fn release(&self, accounts: &[(Account, u64)], bytes: u64) {
         let mut charges = self.lock();
-        if let Some(charged) = charges.get_mut(&uid) {
-            *charged = charged.saturating_sub(bytes);
-            if *charged == 0 {
-                charges.remove(&uid);
+        for (account, _) in accounts {
+            if let Some(charged) = charges.get_mut(account) {
+                *charged = charged.saturating_sub(bytes);
+                if *charged == 0 {
+                    charges.remove(account);
+                }
             }
         }
     }
@@ -258,6 +289,18 @@ struct State {
 }
 
 impl State {
+    /// Drops the registration of process `pid`, if it has the queue's
+    /// (`remove_notification`).
+    fn unregister(&mut self, pid: u32) {
+        if self
+            .registration
+            .as_ref()
+            .is_some_and(|registration| registration.owner == pid)
+            && let Some(registration) = self.registration.take()
+        {
+            registration.remove();
+        }
+    }
     fn insert(&mut self, priority: u32, text: Vec<u8>) {
         self.count += 1;
         self.bytes += text.len() as u64;
@@ -298,13 +341,13 @@ pub(crate) struct Queue {
     /// What it is counted and charged in, released when the queue goes.
     count: Arc<AtomicUsize>,
     charges: Arc<Charges>,
-    charged: (u32, u64),
+    charged: (Vec<(Account, u64)>, u64),
 }
 
 impl Drop for Queue {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
-        self.charges.release(self.charged.0, self.charged.1);
+        self.charges.release(&self.charged.0, self.charged.1);
     }
 }
 
@@ -680,8 +723,8 @@ fn create(
     let bytes =
         maxmsg_u * msgsize_u + maxmsg_u * MSG_MSG_SIZE + maxmsg_u.min(MQ_PRIO_MAX) * TREE_NODE_SIZE;
     let charges = Arc::clone(&c.processes.mqueue_charges);
-    let limit = c.processes.soft_limit(c.process.pid, 12);
-    if !charges.charge(credentials.uid, bytes, limit) {
+    let accounts = accounts(credentials, c.processes.soft_limit(c.process.pid, 12));
+    if !charges.charge(&accounts, bytes) {
         return Err(Errno::EMFILE);
     }
     count.fetch_add(1, Ordering::SeqCst);
@@ -702,7 +745,7 @@ fn create(
         processes: Arc::downgrade(c.processes),
         count: Arc::clone(count),
         charges,
-        charged: (credentials.uid, bytes),
+        charged: (accounts, bytes),
     })
 }
 
@@ -1018,16 +1061,7 @@ fn mq_notify(c: &mut Context<'_>, fd: u64, at: u64) -> Result<u64, Errno> {
     let pid = c.process.pid;
     let mut state = queue.lock();
     match notice {
-        None => {
-            if state
-                .registration
-                .as_ref()
-                .is_some_and(|registration| registration.owner == pid)
-                && let Some(registration) = state.registration.take()
-            {
-                registration.remove();
-            }
-        }
+        None => state.unregister(pid),
         Some(_) if state.registration.is_some() => return Err(EBUSY),
         Some(notice) => {
             let execs = c.processes.execs(pid).unwrap_or_default();
@@ -1100,21 +1134,26 @@ fn mq_getsetattr(c: &mut Context<'_>, fd: u64, new: u64, old: u64) -> Result<u64
 /// After this process closed `d`, drops its registration on the queue `d`
 /// opens, as Linux's `mqueue_flush_file` does on every close.
 pub(crate) fn closed(c: &Context<'_>, d: &crate::files::Descriptor) {
-    let Some(open) = d
+    if let Some(open) = d
         .file
         .as_any()
         .and_then(|any| any.downcast_ref::<QueueFile>())
-    else {
-        return;
-    };
-    let mut state = open.queue.lock();
-    if state
-        .registration
-        .as_ref()
-        .is_some_and(|registration| registration.owner == c.process.pid)
-        && let Some(registration) = state.registration.take()
     {
-        registration.remove();
+        open.queue.lock().unregister(c.process.pid);
+    }
+}
+
+/// After process `pid` ended, the last to hold `files`, drops its
+/// registrations on the queues among them, as each of their closes does on
+/// Linux.
+pub(crate) fn exited(files: &[Arc<dyn FileHandle>], pid: u32) {
+    for file in files {
+        if let Some(open) = file
+            .as_any()
+            .and_then(|any| any.downcast_ref::<QueueFile>())
+        {
+            open.queue.lock().unregister(pid);
+        }
     }
 }
 
@@ -1144,12 +1183,28 @@ mod tests {
     #[test]
     fn charges_stop_at_the_limit_and_are_given_back() {
         let charges = Charges::default();
-        assert!(charges.charge(7, 600, 1000));
-        assert!(!charges.charge(7, 401, 1000));
-        assert!(charges.charge(8, 1000, 1000));
-        assert!(charges.charge(7, 400, 1000));
-        charges.release(7, 1000);
-        assert!(charges.charge(7, 1000, 1000));
-        assert!(!charges.charge(9, u64::MAX, u64::MAX));
+        let seven = [((1, 7), 1000)];
+        assert!(charges.charge(&seven, 600));
+        assert!(!charges.charge(&seven, 401));
+        assert!(charges.charge(&[((1, 8), 1000)], 1000));
+        assert!(charges.charge(&seven, 400));
+        charges.release(&seven, 1000);
+        assert!(charges.charge(&seven, 1000));
+        assert!(!charges.charge(&[((1, 9), u64::MAX)], u64::MAX));
+    }
+
+    #[test]
+    fn a_nested_user_charges_its_namespace_owner_too() {
+        let charges = Charges::default();
+        // User 0 of namespace 2, which user 7 of namespace 1 made with a
+        // limit of 1000, beside user 7's own queues.
+        let nested = [((2, 0), 5000), ((1, 7), 1000)];
+        assert!(charges.charge(&[((1, 7), 5000)], 900));
+        assert!(!charges.charge(&nested, 200));
+        assert!(charges.charge(&nested, 100));
+        assert_eq!(charges.lock().get(&(2, 0)), Some(&100));
+        assert_eq!(charges.lock().get(&(1, 7)), Some(&1000));
+        charges.release(&nested, 100);
+        assert_eq!(charges.lock().get(&(2, 0)), None);
     }
 }

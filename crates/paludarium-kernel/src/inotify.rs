@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 pub(crate) const ACCESS: u32 = 0x1;
 pub(crate) const MODIFY: u32 = 0x2;
 pub(crate) const ATTRIB: u32 = 0x4;
+pub(crate) const CLOSE_WRITE: u32 = 0x8;
+pub(crate) const CLOSE_NOWRITE: u32 = 0x10;
+pub(crate) const OPEN: u32 = 0x20;
 const MOVED_FROM: u32 = 0x40;
 const MOVED_TO: u32 = 0x80;
 const CREATE: u32 = 0x100;
@@ -101,6 +104,24 @@ pub(crate) fn changing_xattrs<T>(f: impl FnOnce() -> Result<T, Errno>) -> (Resul
     let value = f();
     let changed = XATTRS_CHANGED.with(|changed| changed.replace(was));
     (value, changed)
+}
+
+thread_local! {
+    /// Cleared while the kernel opens a file on its own account, as it
+    /// reads a program's first bytes or makes a regular file for `mknod`,
+    /// which Linux does without opening one.
+    static OPENS: Cell<bool> = const { Cell::new(true) };
+}
+/// Runs `f`, whose opens are no `IN_OPEN` and whose files no `IN_CLOSE_*`.
+pub(crate) fn unopened<T>(f: impl FnOnce() -> T) -> T {
+    let was = OPENS.with(|opens| opens.replace(false));
+    let value = f();
+    OPENS.with(|opens| opens.set(was));
+    value
+}
+/// Whether an open now is the guest's own, which is reported.
+pub(crate) fn reported_open() -> bool {
+    OPENS.with(Cell::get) && !QUIET.with(Cell::get)
 }
 
 /// Runs `f` without telling any watch of what it changes.
@@ -225,33 +246,33 @@ impl Notifier {
             return;
         };
         for instance in self.instances() {
-            instance.report(directory, mask, name, cookie);
+            instance.report(directory, mask, name, cookie, false);
         }
     }
     /// An event of a file itself (`fsnotify_inode`): to its watches, without
     /// a name.
     fn inode(&self, file: Found, mask: u32) {
         for instance in self.instances() {
-            instance.report(file.key, mask | file.isdir(), b"", 0);
+            instance.report(file.key, mask | file.isdir(), b"", 0, false);
         }
     }
     /// An event of a file that its directory hears of too
     /// (`fsnotify_parent`): to the directory's watches with the file's name,
     /// then to the file's without.
-    fn child(&self, named: &Named, file: Found, mask: u32) {
+    fn child(&self, named: Option<&Named>, file: Found, mask: u32, unlinked: bool) {
         let mask = mask | file.isdir();
         for instance in self.instances() {
-            if let Some(parent) = named.parent {
-                instance.report(parent, mask, &named.name, 0);
+            if let Some(parent) = named.and_then(|named| named.parent.map(|p| (p, named))) {
+                instance.report(parent.0, mask, &parent.1.name, 0, unlinked);
             }
-            instance.report(file.key, mask, b"", 0);
+            instance.report(file.key, mask, b"", 0, unlinked);
         }
     }
     /// A file whose last link is gone (`fsnotify_inoderemove`): its watches
     /// hear `IN_DELETE_SELF`, then go with `IN_IGNORED`.
     fn removed(&self, file: Found) {
         for instance in self.instances() {
-            instance.report(file.key, DELETE_SELF, b"", 0);
+            instance.report(file.key, DELETE_SELF, b"", 0, false);
             instance.forget(file.key);
         }
     }
@@ -351,7 +372,7 @@ impl Notifier {
         if let Some(named) = Self::named(fs, path, follow)
             && let Some(file) = named.file
         {
-            self.child(&named, file, mask);
+            self.child(Some(&named), file, mask, false);
         }
     }
     /// A change to an open file (`notify_change` of its dentry), opened at
@@ -364,17 +385,51 @@ impl Notifier {
         stat: &FileStat,
         mask: u32,
     ) {
+        self.of_file(place, device, stat, mask, false);
+    }
+    /// An event of an open file itself (`fsnotify_file`): opening,
+    /// closing, reading or writing it. A watch with `IN_EXCL_UNLINK` does
+    /// not hear of a file no name links any more, and the directory does
+    /// not hear of reads and writes of a FIFO or a device.
+    pub(crate) fn file_event(
+        &self,
+        place: Option<(&dyn FileSystem, &[u8])>,
+        device: u64,
+        stat: &FileStat,
+        mask: u32,
+    ) {
+        self.of_file(place, device, stat, mask, true);
+    }
+    fn of_file(
+        &self,
+        place: Option<(&dyn FileSystem, &[u8])>,
+        device: u64,
+        stat: &FileStat,
+        mask: u32,
+        content: bool,
+    ) {
         if mask == 0 || !self.watching() {
             return;
         }
         let file = Found::of(device, stat);
+        let special = !matches!(stat.mode & 0o170000, 0o100000 | 0o040000 | 0o120000);
+        // A file no name links any more keeps the name and directory it was
+        // opened at, as its dentry stays with its parent; one that a rename
+        // or another link took elsewhere is heard of by its own watches only.
         let named = place
-            .and_then(|(fs, path)| Self::named(fs, path, true))
-            .filter(|named| named.file.is_some_and(|found| found.key == file.key));
-        match named {
-            Some(named) => self.child(&named, file, mask),
-            None => self.inode(file, mask),
-        }
+            .and_then(|(fs, path)| {
+                if stat.links == 0 {
+                    Self::named(fs, path, false)
+                } else {
+                    Self::named(fs, path, true)
+                        .filter(|named| named.file.is_some_and(|found| found.key == file.key))
+                }
+            })
+            .filter(|_| !(content && special && mask & (ACCESS | MODIFY) != 0));
+        // `fsnotify_handle_inode_event` skips either watch with
+        // `IN_EXCL_UNLINK` for an unlinked dentry.
+        let unlinked = content && stat.links == 0;
+        self.child(named.as_ref(), file, mask, unlinked);
     }
     /// The mask `set_times` reports (`fsnotify_change`): both times is
     /// `IN_ATTRIB`, only the access time `IN_ACCESS`, only the modification
@@ -571,7 +626,7 @@ impl Instance {
     /// An event for the watch on `key`, if there is one that wants it, as
     /// Linux's `fsnotify_handle_inode_event` and
     /// `inotify_handle_inode_event`; a one-shot watch goes with it.
-    fn report(&self, key: Key, mask: u32, name: &[u8], cookie: u32) {
+    fn report(&self, key: Key, mask: u32, name: &[u8], cookie: u32, unlinked: bool) {
         let mut queue = self.queue();
         let Some(&wd) = queue.by_key.get(&key) else {
             return;
@@ -579,7 +634,7 @@ impl Instance {
         let Some(watch) = queue.watches.get(&wd) else {
             return;
         };
-        if mask & watch.mask & ALL_EVENTS == 0 {
+        if mask & watch.mask & ALL_EVENTS == 0 || (unlinked && watch.mask & EXCL_UNLINK != 0) {
             return;
         }
         let oneshot = watch.mask & ONESHOT != 0;

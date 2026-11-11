@@ -2436,7 +2436,9 @@ impl Kernel {
         // unshare_userns, then unshare_nsproxy_namespaces with the
         // credentials it gave.
         let own = self.group.namespaces(thread.tid);
-        let credentials = crate::namespaces::user_for(&own, &thread.state.credentials, flags)?;
+        let msgqueue = self.processes.soft_limit(self.process.pid, 12);
+        let credentials =
+            crate::namespaces::user_for(&own, &thread.state.credentials, flags, msgqueue)?;
         crate::namespaces::check(flags, credentials.administers_own())?;
         if flags & NAMESPACES != 0 {
             let mut namespaces = own.unshared(flags, &credentials.user.0)?;
@@ -2760,7 +2762,9 @@ impl Kernel {
         // which CLONE_SYSVSEM would share.
         // copy_creds first, whose new user namespace the others are in.
         let own = self.group.namespaces(parent.tid);
-        let credentials = crate::namespaces::user_for(&own, &parent.state.credentials, namespaces)?;
+        let msgqueue = self.processes.soft_limit(self.process.pid, 12);
+        let credentials =
+            crate::namespaces::user_for(&own, &parent.state.credentials, namespaces, msgqueue)?;
         crate::namespaces::check(namespaces, credentials.administers_own())?;
         if namespaces & crate::namespaces::CLONE_NEWIPC != 0 && flags & 0x40000 != 0 {
             return Err(Errno::EINVAL);
@@ -3836,7 +3840,7 @@ const SCRIPT_HEAD: usize = 256;
 /// The first [`SCRIPT_HEAD`] bytes of the file at `path`, zero after its end,
 /// or `None` when it cannot be read, which loading it then reports.
 fn read_head(files: &crate::files::Files, path: &[u8]) -> Option<[u8; SCRIPT_HEAD]> {
-    let file = files.fs.open(path, 0, 0).ok()?;
+    let file = crate::inotify::unnoticed(|| files.fs.open(path, 0, 0)).ok()?;
     let mut head = [0; SCRIPT_HEAD];
     let mut at = 0;
     while at < SCRIPT_HEAD {

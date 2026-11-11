@@ -865,3 +865,114 @@ fn a_waiting_thread_sees_a_handler_set_after_it_began_waiting() {
     group.drain_process(&mut waiter);
     assert!(signals::next_pending(&waiter, true).is_some());
 }
+#[test]
+fn futex_wake_counts_before_it_compares() {
+    let m = memory();
+    let f = futex::Futexes::default();
+    let waiters: Vec<_> = (0..3)
+        .map(|_| f.register(&m, DATA, true, 0, u32::MAX).unwrap())
+        .collect();
+    // Linux's `++ret >= nr_wake`: 0 and -1 wake one each.
+    assert_eq!(f.wake(&m, DATA, true, 0, u32::MAX), Ok(1));
+    assert_eq!(f.wake(&m, DATA, true, -1, u32::MAX), Ok(1));
+    // futex2's strict wake of 0 wakes none.
+    assert_eq!(f.wake_word(&m, DATA, true, false, 0, u32::MAX, true), Ok(0));
+    assert_eq!(waiters[2].state.load(Ordering::SeqCst), 0);
+    assert_eq!(f.wake(&m, DATA, true, 5, u32::MAX), Ok(1));
+    // A private wake does not look at the page; a shared one does.
+    assert_eq!(f.wake(&m, 0x7000_0000, true, 1, u32::MAX), Ok(0));
+    assert_eq!(
+        f.wake(&m, 0x7000_0000, false, 1, u32::MAX),
+        Err(Errno::EFAULT)
+    );
+    // Past TASK_SIZE_MAX, and not aligned.
+    assert_eq!(
+        f.wake(&m, (1 << 47) - 4096, true, 1, u32::MAX),
+        Err(Errno::EFAULT)
+    );
+    assert_eq!(f.wake(&m, DATA + 2, true, 1, u32::MAX), Err(Errno::EINVAL));
+}
+#[test]
+fn futex_register_all_checks_every_key_before_any_value() {
+    let m = memory();
+    let f = futex::Futexes::default();
+    let word = |addr, value| futex::Word {
+        addr,
+        private: true,
+        numa: false,
+        value,
+        mask: u32::MAX,
+    };
+    // The first differs, but the second's key is bad.
+    let misaligned = [word(DATA, 1), word(DATA + 2, 0)];
+    assert!(matches!(
+        f.register_all(&m, &misaligned),
+        Err(Errno::EINVAL)
+    ));
+    let unmapped_shared = [
+        word(DATA, 1),
+        futex::Word {
+            private: false,
+            ..word(0x7000_0000, 0)
+        },
+    ];
+    assert!(matches!(
+        f.register_all(&m, &unmapped_shared),
+        Err(Errno::EFAULT)
+    ));
+    // Values next, in order: a private word's page only now.
+    assert!(matches!(
+        f.register_all(&m, &[word(DATA, 1), word(0x7000_0000, 0)]),
+        Err(Errno::EAGAIN)
+    ));
+    assert!(matches!(
+        f.register_all(&m, &[word(DATA, 0), word(0x7000_0000, 0)]),
+        Err(Errno::EFAULT)
+    ));
+    // Nothing stays queued after a failure.
+    assert_eq!(f.wake(&m, DATA, true, 9, u32::MAX), Ok(0));
+    // Queued, they share a token, and a wake of one leaves the other.
+    let waiters = f
+        .register_all(&m, &[word(DATA, 0), word(DATA + 4, 0)])
+        .unwrap();
+    assert!(Arc::ptr_eq(&waiters[0].token, &waiters[1].token));
+    assert_eq!(f.wake(&m, DATA + 4, true, 1, u32::MAX), Ok(1));
+    assert_eq!(waiters[0].state.load(Ordering::SeqCst), 0);
+    assert_eq!(waiters[1].state.load(Ordering::SeqCst), 1);
+    assert_eq!(waiters[1].token.value(), 1);
+}
+#[test]
+fn futex_numa_word_names_node_zero() {
+    let m = memory();
+    let f = futex::Futexes::default();
+    let numa = futex::Word {
+        addr: DATA + 8,
+        private: true,
+        numa: true,
+        value: 0,
+        mask: u32::MAX,
+    };
+    // Doubled, the word is aligned to 8.
+    let odd = futex::Word {
+        addr: DATA + 4,
+        ..numa
+    };
+    assert!(matches!(f.register_all(&m, &[odd]), Err(Errno::EINVAL)));
+    // No node becomes node 0; another node is not possible.
+    m.write(GuestAddr(DATA + 12), &u32::MAX.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        f.wake_word(&m, DATA + 8, true, true, 1, u32::MAX, true),
+        Ok(0)
+    );
+    assert_eq!(m.read_u64(GuestAddr(DATA + 8)).unwrap(), 0);
+    m.write(GuestAddr(DATA + 12), &1u32.to_le_bytes()).unwrap();
+    assert!(matches!(f.register_all(&m, &[numa]), Err(Errno::EINVAL)));
+    m.write(GuestAddr(DATA + 12), &0u32.to_le_bytes()).unwrap();
+    let waiter = f.register_all(&m, &[numa]).unwrap();
+    assert_eq!(
+        f.wake_word(&m, DATA + 8, true, true, 1, u32::MAX, true),
+        Ok(1)
+    );
+    assert_eq!(waiter[0].state.load(Ordering::SeqCst), 1);
+}

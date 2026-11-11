@@ -201,11 +201,20 @@ impl Files {
         *self.cwd.lock().unwrap_or_else(PoisonError::into_inner) = path;
         Ok(())
     }
-    pub(crate) fn release_descriptors(&mut self) {
-        // Detach this worker's table reference without closing a table still
-        // shared by live CLONE_FILES siblings.
-        self.fds = Arc::new(Mutex::new(BTreeMap::new()));
+    /// Detaches this worker's table reference without closing a table still
+    /// shared by live CLONE_FILES siblings; the last task to let go gets the
+    /// files the table held (`put_files_struct`), deciding that with the
+    /// release itself so that two tasks ending together cannot both miss it.
+    pub(crate) fn release_descriptors(&mut self) -> Vec<Arc<dyn FileHandle>> {
+        let fds = std::mem::replace(&mut self.fds, Arc::new(Mutex::new(BTreeMap::new())));
         self.reserved = Arc::default();
+        Arc::into_inner(fds).map_or_else(Vec::new, |fds| {
+            fds.into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .into_values()
+                .map(|descriptor| descriptor.file)
+                .collect()
+        })
     }
     pub(crate) fn umask(&self) -> u32 {
         self.umask.load(Ordering::SeqCst)
@@ -2459,10 +2468,55 @@ mod mtime_tests {
 }
 pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let n = c.number;
-    match run(c, n, a) {
+    let result = run(c, n, a);
+    if c.files.caches.notify.watching() {
+        accessed(c, n, a, &result);
+    }
+    match result {
         Ok(v) => Outcome::Return(v),
         Err(e) => Outcome::Return(e.to_syscall_return()),
     }
+}
+/// The inotify events of a call that read or wrote files, as Linux's
+/// `fsnotify_access` and `fsnotify_modify` follow them: a read or write that
+/// moved bytes, `sendfile` and `copy_file_range` (the input's, then the
+/// output's), a `fallocate` that succeeded, and every `getdents` and
+/// `getdents64` that reached `iterate_dir` (one with too small a buffer too).
+fn accessed(c: &Context<'_>, n: u64, a: [u64; 6], result: &Result<u64, Errno>) {
+    use crate::inotify::{ACCESS, MODIFY};
+    let moved = matches!(result, Ok(v) if *v > 0);
+    let events: &[(u64, u32)] = match n {
+        0 | 17 | 19 | 295 | 327 if moved => &[(a[0], ACCESS)],
+        1 | 18 | 20 | 296 | 328 if moved => &[(a[0], MODIFY)],
+        40 if moved => &[(a[1], ACCESS), (a[0], MODIFY)],
+        326 if moved => &[(a[0], ACCESS), (a[2], MODIFY)],
+        285 if result.is_ok() => &[(a[0], MODIFY)],
+        78 | 217 if result.is_ok() || *result == Err(Errno::EINVAL) => &[(a[0], ACCESS)],
+        _ => &[],
+    };
+    for &(fd, mask) in events {
+        notify_descriptor(c, fd, mask);
+    }
+}
+/// Tells the inotify watches of `mask` on the open file of descriptor `fd`
+/// (`fsnotify_file`). A pipe, a socket or another file no path opened has
+/// none, as Linux's pseudo files are `FMODE_NONOTIFY`.
+fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
+    let Ok(d) = c.files.descriptor(fd) else {
+        return;
+    };
+    if d.path.is_empty() || d.file.flags() & O_PATH != 0 {
+        return;
+    }
+    let Ok(stat) = d.file.stat() else {
+        return;
+    };
+    c.files.caches.notify.file_event(
+        Some((&*c.files.fs, &d.path)),
+        descriptor_device(c, &d),
+        &stat,
+        mask,
+    );
 }
 pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     refuse_path_only(c, n, a)?;
@@ -2474,7 +2528,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         332 => statx(c, a),
         326 => copy_file_range(c, a),
         436 => close_range(c, a),
-        285 => fallocate(c, a),
+        // One `IN_MODIFY` for the call ([`accessed`]), as Linux's
+        // `vfs_fallocate` gives, whatever sizes it changes.
+        285 => crate::inotify::unnoticed(|| fallocate(c, a)),
         319 => crate::memfd::memfd_create(c, a),
         // pread64, pwrite64, preadv, pwritev: at an offset, leaving the file
         // position. On x86-64 the offset of preadv and pwritev is a[3] alone.
@@ -2796,17 +2852,17 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     Some(Followed::Path { path, follow }) => {
                         let stat = c.files.fs.metadata(&path, follow)?;
                         crate::permissions::truncate(&c.process.credentials, &stat)?;
-                        c.files.fs.open(&path, 1, 0)?
+                        crate::inotify::unnoticed(|| c.files.fs.open(&path, 1, 0))?
                     }
                     Some(Followed::File(d)) => {
                         crate::permissions::truncate(&c.process.credentials, &d.file.stat()?)?;
-                        d.file.reopen(1)?
+                        crate::inotify::unnoticed(|| d.file.reopen(1))?
                     }
                     None => {
                         if let Some(stat) = found.file {
                             crate::permissions::truncate(&c.process.credentials, &stat)?;
                         }
-                        c.files.fs.open(&p, 1, 0)?
+                        crate::inotify::unnoticed(|| c.files.fs.open(&p, 1, 0))?
                     }
                 }
             };
@@ -5312,9 +5368,12 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
         }
         _ => {
             // O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW: a new empty file.
-            c.files
-                .fs
-                .open(&p, 0o1 | 0o100 | 0o200 | 0o400000, permissions)?;
+            // Linux's `vfs_create` makes it without opening it.
+            crate::inotify::unopened(|| {
+                c.files
+                    .fs
+                    .open(&p, 0o1 | 0o100 | 0o200 | 0o400000, permissions)
+            })?;
         }
     }
     if let Some(parent) = created {

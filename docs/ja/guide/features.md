@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
@@ -58,7 +58,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
-| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE` と `NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `readv`・`writev` とその位置指定版、`vmsplice`、`sendmsg`、`recvmsg` の `struct iovec` の配列は、
@@ -204,7 +204,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どのプロセスの待ち手にも、どこにマップしていても届きます。それ以外のワードと private の操作は、
   このプロセスのアドレス空間とアドレスを指すので、private の wake はほかのプロセスに届きません。
   プロセス間で共有する mutex とセマフォ（Python の `multiprocessing`）も、持ち主が終わった
-  robust futex の wake も、こうして動きます。
+  robust futex の wake も、こうして動きます。wake は、0 以下の数を頼まれても待ち手を 1 つ起こします
+  （Linux は比べる前に数えるからです）。private の wake はワードのページを見ません。Linux の
+  ナノ秒に収まらない長さのタイムアウトは `KTIME_MAX` まで待ちます。
+- futex2 の呼び出しは、32 ビットのワードと `FUTEX2_PRIVATE`・`FUTEX2_NUMA`・`FUTEX2_MPOL` を
+  Linux と同じ順に確かめて受け付けます。ほかの大きさやフラグは `EINVAL` です。`futex_wake` と
+  `futex_wait` は、`FUTEX_WAKE_BITSET` と `FUTEX_WAIT_BITSET` に、`CLOCK_REALTIME` か
+  `CLOCK_MONOTONIC` の絶対時刻のタイムアウトを付けたものです。数 0 の `futex_wake` は何も
+  起こしません。`futex_waitv` は最大 128 個のワードを一度に待ち、起こされたワードの添字を返します。
+  値を比べる前にすべてのワードのアドレスを確かめ、その後で最初に違ったワードで `EAGAIN` を
+  返します。`FUTEX2_NUMA` のワードの後ろにはノードが続き、ただ 1 つのノード 0 か、`-1` で
+  なければなりません。`-1` は、Linux がスレッドのノードを書くのと同じく 0 になります。シグナルで
+  中断すると `ERESTARTSYS` になるので、停止の後と `SA_RESTART` のハンドラの後にやり直します。
 - `set_robust_list` と `get_robust_list` は、スレッドごとの robust futex のリストを
   持ちます。glibc と musl の robust mutex に必要です。スレッドが終わるときと `execve`
   のときに、Linux の `exit_robust_list` と同じようにリストをたどります。スレッドが
@@ -635,9 +646,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   キューは 256 個まで（`queues_max`、`ENOSPC`）、メッセージは 10 個まで（`msg_max`）、
   1 つ 8192 バイトまで（`msgsize_max`）で、既定値（`msg_default`、`msgsize_default`）も
   同じです。属性なしで作るキューは、それぞれ既定値と上限の小さいほうを取ります。
-  `CAP_SYS_RESOURCE` があれば上限を超えられ、16 MiB のメッセージを 65536 個まで持てます。キューは、消されて閉じられるまで、作った者の実ユーザー ID に、その
-  バイト数と Linux がメッセージごとに使う管理領域（x86-64 で 48 + 48 バイト）を
-  `RLIMIT_MSGQUEUE` に対して課します（`EMFILE`）。`mq_open` は close-on-exec の
+  `CAP_SYS_RESOURCE` があれば上限を超えられ、16 MiB のメッセージを 65536 個まで持てます。キューは、消されて閉じられるまで、その
+  バイト数と Linux がメッセージごとに使う管理領域（x86-64 で 48 + 48 バイト）を、Linux の
+  `inc_rlimit_ucounts` と同じく課します（どれかの上限を超えれば `EMFILE`）。作った者の
+  ユーザー名前空間でのその実ユーザー ID に、作った者の `RLIMIT_MSGQUEUE` に対して課し、
+  作った者がいるユーザー名前空間のそれぞれについて、親の名前空間でのその名前空間の持ち主に、
+  持ち主が名前空間を作ったときの `RLIMIT_MSGQUEUE` に対して課します。`mq_open` は close-on-exec の
   記述子を返し、`fork` はそれを `O_NONBLOCK`（`mq_getsetattr` でも `fcntl` でも設定
   できます）ごと共有します。`poll`、`select`、`epoll` では、アクセスモードによらず、
   メッセージがあれば読め、空きがあれば書けます。メッセージが入るたびに、エッジトリガーの
@@ -990,6 +1004,30 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     仮のものと仮でないものの 2 度伝えます。bind していないソケットには何も届きません。
     IPv4 のアドレスか経路の変化を求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を
     付ければ自分の写しとして届きます。
+- 汎用 netlink のソケット（プロトコル `NETLINK_GENERIC`）は自分のポートを持つので、
+  `NETLINK_ROUTE` のソケットもプロセスの ID に bind していても、同じくプロセスの ID に
+  bind します。ファミリーは、ほかを入れずに作ったカーネルと同じく、コントローラの `nlctrl`
+  （ファミリー ID 16）だけです。そのため、ファミリーを引くプログラム（libnl の
+  `genl_ctrl_resolve` や `genl ctrl list` など）は、そのファミリーがないことを知ります。
+  - **リクエスト:** `genl_rcv_msg` と同じく、ファミリーでない型は `ENOENT`、
+    `genlmsghdr` が欠けたメッセージは `EINVAL`、`nlctrl` にないコマンドは
+    `EOPNOTSUPP` です。コマンド 11 からは、予約のフィールドや、`NLM_F_REQUEST`、
+    `NLM_F_ACK`、`NLM_F_ECHO`、`NLM_F_DUMP` のほかのフラグも `EINVAL` です。属性は
+    Linux のポリシーのとおりに確かめます。ダンプでない `CTRL_CMD_GETFAMILY` では緩く
+    （知らない属性は飛ばし、短い整数は `ERANGE`）、ダンプでは厳しく（知らない属性、
+    長さの違う整数、余ったバイトは `EINVAL`）確かめます。
+  - **ファミリー:** `CTRL_CMD_GETFAMILY` は、`CTRL_ATTR_FAMILY_NAME` の `nlctrl` か
+    `CTRL_ATTR_FAMILY_ID` の 16 に（両方あれば名前が勝ちます。ほかは `ENOENT`、どちらも
+    なければ `EINVAL`）、`ctrl_fill_info` と同じく、名前、ID、バージョン 2、ヘッダーの
+    大きさ、コマンドとそのフラグ、グループを持つ `nlctrl` の `CTRL_CMD_NEWFAMILY` で
+    答えます。ダンプはそれを挙げ、`NLMSG_DONE` を同じデータグラムに入れます。
+    `CTRL_CMD_GETPOLICY` のダンプは、`ctrl_dumppolicy` と同じく、`nlctrl` のコマンドの、
+    あるいは `CTRL_ATTR_OP` が指す 1 つ（ほかは `ENOENT`）のポリシーを返します。各コマンドの
+    リクエストとダンプがどのポリシーを使うか、それから各属性の型と範囲を、1 つずつ別の
+    メッセージで返します。ダンプの途中でのもう 1 つのダンプは `EBUSY` です。
+  - **グループ:** ソケットのグループは 64 で（0 とそれを超えるものは `EINVAL`）、誰でも
+    入れます。`nlctrl` の `notify` はグループ 16 で、ファミリーが増えも減りもしないので
+    何も届きません。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、
@@ -1459,7 +1497,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   変更では何もありません）。モード、所有者（どちらも指定しない `chown` では何も
   ありません）、両方の時刻、拡張属性を変えると `IN_ATTRIB`、アクセス時刻だけなら
   `IN_ACCESS`、更新時刻だけなら `IN_MODIFY`、切り詰めは `IN_MODIFY` です（通常の
-  ファイルを空にする `O_TRUNC` も）。ファイルの変更は、そのディレクトリのウォッチに
+  ファイルを空にする `O_TRUNC` も、その `IN_OPEN` の後に）。開く（`O_PATH` 以外。
+  `/proc/self/fd` のリンクからも）と `IN_OPEN`、開いたファイル記述の最後の参照が
+  なくなると `IN_CLOSE_WRITE` か `IN_CLOSE_NOWRITE` です（マッピングは解除される
+  まで参照を持ちます）。バイトを動かした `read`、`write`、`pread64`、`pwrite64`、
+  `readv`、`writev`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`sendfile` と
+  `copy_file_range`（入力の後に出力）、`fallocate`、毎回の `getdents` と `getdents64` は
+  `IN_ACCESS` か `IN_MODIFY` です。`IN_EXCL_UNLINK` のウォッチは、どの名前からも
+  リンクされなくなったファイルを開く・閉じる・読み書きすることを受けません。
+  `truncate`、`mknod`、プログラムの起動は何も開きません。ファイルの変更は、そのディレクトリのウォッチに
   名前付きで先に届き、次にファイル自身のウォッチに届きます。ディレクトリのものには
   `IN_ISDIR` が付きます（`IN_DELETE_SELF` と `IN_MOVE_SELF` には Linux と同じく
   付きません）。`IN_ONESHOT` のウォッチは最初のイベントの後に `IN_IGNORED` とともに
@@ -1833,13 +1879,13 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
-  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`splice`、`tee`、`vmsplice`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、FIFO を開く `open`・`openat`・`openat2`、`accept`、`accept4`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`msgsnd`、`msgrcv`、`mq_timedsend`、`mq_timedreceive`、`sendfile`、`splice`、`tee`、`vmsplice`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ち、時間制限の有無にかかわらず `futex_waitv` と futex2 の `futex_wait` です。
   `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll`、時間制限つきの `futex` の待ちは、
   `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
   `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが
   動いたときはやり直さず、`EINTR` を返します。
   `SA_RESTART` を付けたハンドラが動いたときは、Linux と同じく、ハンドラから戻った後に、停止の後にやり直す呼び出し（`read` から時間制限なしの `futex` の待ちまで）をやり直します。
-  ただし `pause`、`rt_sigsuspend`、`poll`、`ppoll`、`select`、`pselect6` と、`SO_RCVTIMEO` や `SO_SNDTIMEO`
+  ただし `pause`、`rt_sigsuspend`、`msgsnd`、`msgrcv`、`poll`、`ppoll`、`select`、`pselect6` と、`SO_RCVTIMEO` や `SO_SNDTIMEO`
   で待ちに時間制限のあるソケットの呼び出しは、`EINTR` を返します。
   `epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。
   `rt_sigsuspend` は、シグナルのマスクを渡されたマスクに置き換えてハンドラが動くまで待ちます。

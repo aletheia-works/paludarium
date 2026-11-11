@@ -1214,6 +1214,7 @@ static long netns_result(long r) { return r < 0 ? -errno : r; }
    no kernel headers. */
 #define NL_AF_NETLINK 16
 #define NL_ROUTE 0
+#define NL_GENERIC 16
 #define NL_F_REQUEST 0x1
 #define NL_F_ACK 0x4
 #define NL_F_DUMP 0x300
@@ -1617,6 +1618,103 @@ static void link_show(int fd, unsigned port, const char *label, int get, int ful
             if (get) return;
         }
     }
+}
+/* The generic-netlink case: the attributes at `at`, one line each, with
+   their type (with its NLA_F_NESTED bit), length and value in hex; a nested
+   one's inside, as NLA_F_NESTED says or, for nlctrl's commands and groups
+   (`nested`), its children. */
+static void genl_attributes(const unsigned char *at, int len, int depth, int nested) {
+    while (len >= 4) {
+        unsigned short alen, type;
+        memcpy(&alen, at, 2);
+        memcpy(&type, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        int n = alen - 4;
+        const unsigned char *v = at + 4;
+        printf("%*s%#x len=%d", 2 * depth + 2, "", type, n);
+        int kind = type & 0x3fff, listed = depth == 0 && (kind == 6 || kind == 7);
+        if ((type & 0x8000) || nested || listed) {
+            printf("\n");
+            genl_attributes(v, n, depth + 1, listed);
+        } else {
+            for (int i = 0; i < n; i++) printf("%s%02x", i ? "" : " ", v[i]);
+            printf("\n");
+        }
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+}
+/* Appends attribute `type` of `len` bytes at `value` to `buf` at `off`;
+   the offset past it. */
+static size_t genl_put(unsigned char *buf, size_t off, unsigned short type, const void *value, size_t len) {
+    unsigned short alen = 4 + len;
+    memcpy(buf + off, &alen, 2);
+    memcpy(buf + off + 2, &type, 2);
+    memcpy(buf + off + 4, value, len);
+    return off + ((alen + 3) & ~3);
+}
+/* The family ID (CTRL_ATTR_FAMILY_ID) among the attributes at `at`, 0 for
+   none. */
+static unsigned short genl_family_id(const unsigned char *at, int len) {
+    while (len >= 4) {
+        unsigned short alen, type, id = 0;
+        memcpy(&alen, at, 2);
+        memcpy(&type, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        if (type == 1 && alen >= 6) {
+            memcpy(&id, at + 4, 2);
+            return id;
+        }
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+    return 0;
+}
+/* Prints each message `fd` has for the request `seq`: its header,
+   `genlmsghdr` and attributes, of a family dump only nlctrl's, as the
+   other families are the host's. It stops at NLMSG_DONE, at an error
+   unless `past_errors`, or when nothing waits. */
+static void genl_read(int fd, unsigned port, const char *label, long seq, int past_errors) {
+    if (seq < 0) {
+        printf("%s: send=%ld\n", label, seq);
+        return;
+    }
+    for (;;) {
+        static char buf[32768];
+        long n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0) return;
+        for (char *at = buf; at + sizeof(struct nl_header) <= buf + n;) {
+            struct nl_header *h = (void *)at;
+            if (h->len < sizeof *h || at + h->len > buf + n) return;
+            unsigned char *body = (void *)(h + 1);
+            int body_len = h->len - sizeof *h;
+            at += (h->len + 3) & ~3;
+            if (h->type == 3 || h->type == 2) {
+                int error = 0;
+                memcpy(&error, body, 4);
+                printf("%s: type=%u flags=%#x seq=%d error=%d\n", label, h->type, h->flags, h->seq == seq, error);
+                if (h->type == 3 || !past_errors) return;
+                continue;
+            }
+            if (body_len < 4) continue;
+            if ((h->flags & 2) && body[0] == 1 && genl_family_id(body + 4, body_len - 4) != 16) continue;
+            printf("%s: type=%u flags=%#x seq=%d port=%d len=%u cmd=%u version=%u reserved=%u\n", label, h->type,
+                   h->flags, h->seq == seq, h->pid == port, h->len, body[0], body[1], body[2] | body[3] << 8);
+            genl_attributes(body + 4, body_len - 4, 0, 0);
+        }
+    }
+}
+/* Sends nlctrl (or `type`) command `cmd` with `reserved` and the `len`
+   bytes of attributes at `attrs`, and prints what it is answered. */
+static void genl_show(int fd, unsigned port, const char *label, unsigned short type, unsigned short flags,
+                      unsigned char cmd, unsigned short reserved, const unsigned char *attrs, size_t len,
+                      int past_errors) {
+    unsigned char request[200] = {cmd, 1};
+    memcpy(request + 2, &reserved, 2);
+    memcpy(request + 4, attrs, len);
+    genl_read(fd, port, label, nl_send(fd, type, flags, request, 4 + len), past_errors);
 }
 /* Binds a UDP socket of `family` to `text`, and prints the result. */
 static void addresses_bind(const char *text, const char *when) {
@@ -5696,6 +5794,147 @@ static int old_forms_case(void) {
     rmdir(dir);
     return 0;
 }
+/* futex_waitv and futex2's futex_wake and futex_wait, and the wake count
+ * of FUTEX_WAKE, as Linux's kernel/futex. */
+struct f2_waitv {
+    uint64_t val, uaddr;
+    uint32_t flags, reserved;
+};
+#define F2_U32_PRIVATE (2 | 128)
+static long f2_errno(long r) { return r < 0 ? -errno : r; }
+static long f2_waitv_call(struct f2_waitv *w, long n, long flags, void *timeout, long clock) {
+    return f2_errno(syscall(449, w, n, flags, timeout, clock));
+}
+static long f2_wake(void *uaddr, unsigned long mask, long nr, long flags) {
+    return f2_errno(syscall(454, uaddr, mask, nr, flags));
+}
+static long f2_wait(void *uaddr, unsigned long val, unsigned long mask, long flags, void *timeout,
+                    long clock) {
+    return f2_errno(syscall(455, uaddr, val, mask, flags, timeout, clock));
+}
+static _Alignas(8) volatile uint32_t f2_words[4];
+static long f2_result;
+static void *f2_waitv_thread(void *arg) {
+    (void)arg;
+    struct f2_waitv w[2] = {{0, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 0},
+                            {0, (uintptr_t)&f2_words[1], F2_U32_PRIVATE, 0}};
+    f2_result = f2_waitv_call(w, 2, 0, NULL, 0);
+    return NULL;
+}
+static void *f2_wait_thread(void *arg) {
+    (void)arg;
+    f2_result = f2_wait((void *)&f2_words[2], 0, 6, F2_U32_PRIVATE, NULL, 0);
+    return NULL;
+}
+static void *f2_old_wait_thread(void *arg) {
+    (void)arg;
+    f2_result = f2_errno(syscall(SYS_futex, &f2_words[3], 128 /* FUTEX_WAIT_PRIVATE */, 0, NULL, NULL, 0));
+    return NULL;
+}
+static int futex2_case(void) {
+    struct f2_waitv w[2] = {{0, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 0},
+                            {0, (uintptr_t)&f2_words[1], F2_U32_PRIVATE, 0}};
+    struct timespec ts = {0, 1000000000};
+    printf("waitv flags=%ld zero=%ld many=%ld null=%ld clock=%ld fault=%ld nsec=%ld\n",
+           f2_waitv_call(w, 1, 1, NULL, 0), f2_waitv_call(w, 0, 0, NULL, 0),
+           f2_waitv_call(w, 129, 0, NULL, 0), f2_waitv_call(NULL, 1, 0, NULL, 0),
+           f2_waitv_call(w, 1, 0, &ts, 2), f2_waitv_call(w, 1, 0, (void *)8, 1),
+           f2_waitv_call(w, 1, 0, &ts, 1));
+    struct f2_waitv bad[5] = {{0, (uintptr_t)&f2_words[0], 128, 0},
+                              {0, (uintptr_t)&f2_words[0], 3 | 128, 0},
+                              {0, (uintptr_t)&f2_words[0], 2 | 0x100, 0},
+                              {0, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 1},
+                              {1ULL << 32, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 0}};
+    printf("waitv entry u8=%ld u64=%ld unknown=%ld reserved=%ld value=%ld\n",
+           f2_waitv_call(&bad[0], 1, 0, NULL, 0), f2_waitv_call(&bad[1], 1, 0, NULL, 0),
+           f2_waitv_call(&bad[2], 1, 0, NULL, 0), f2_waitv_call(&bad[3], 1, 0, NULL, 0),
+           f2_waitv_call(&bad[4], 1, 0, NULL, 0));
+    char *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(page, 4096);
+    struct f2_waitv order[2] = {{1, (uintptr_t)&f2_words[0], F2_U32_PRIVATE, 0},
+                                {0, (uintptr_t)&f2_words[0] + 2, F2_U32_PRIVATE, 0}};
+    long misaligned = f2_waitv_call(order, 2, 0, NULL, 0);
+    order[1].uaddr = (uintptr_t)page;
+    order[1].flags = 2; /* shared: its page is looked up with the key */
+    long shared_fault = f2_waitv_call(order, 2, 0, NULL, 0);
+    order[1].flags = F2_U32_PRIVATE;
+    long private_late = f2_waitv_call(order, 2, 0, NULL, 0);
+    order[0].val = 0;
+    long private_fault = f2_waitv_call(order, 2, 0, NULL, 0);
+    printf("waitv keys-first misaligned=%ld shared-fault=%ld mismatch=%ld private-fault=%ld\n",
+           misaligned, shared_fault, private_late, private_fault);
+    struct timespec past = {0, 0};
+    printf("waitv timeout mono=%ld real=%ld\n", f2_waitv_call(w, 2, 0, &past, 1),
+           f2_waitv_call(w, 2, 0, &past, 0));
+    struct timespec soon;
+    clock_gettime(CLOCK_MONOTONIC, &soon);
+    soon.tv_nsec += 20000000;
+    if (soon.tv_nsec >= 1000000000) soon.tv_sec++, soon.tv_nsec -= 1000000000;
+    printf("waitv later=%ld\n", f2_waitv_call(w, 2, 0, &soon, 1));
+
+    pthread_t t;
+    pthread_create(&t, NULL, f2_waitv_thread, NULL);
+    long woke;
+    while ((woke = f2_wake((void *)&f2_words[1], 1, 1, F2_U32_PRIVATE)) == 0) sched_yield();
+    pthread_join(t, NULL);
+    printf("waitv woken=%ld index=%ld\n", woke, f2_result);
+
+    printf("wake u8=%ld numa-mpol-unknown=%ld mask-high=%ld mask-zero=%ld misaligned=%ld none=%ld "
+           "no-waiter=%ld\n",
+           f2_wake((void *)&f2_words[0], 1, 1, 128), f2_wake((void *)&f2_words[0], 1, 1, 2 | 0x200),
+           f2_wake((void *)&f2_words[0], 1ULL << 32, 1, F2_U32_PRIVATE),
+           f2_wake((void *)&f2_words[0], 0, 1, F2_U32_PRIVATE),
+           f2_wake((char *)&f2_words[0] + 2, 1, 1, F2_U32_PRIVATE),
+           f2_wake((void *)&f2_words[0], 1, 0, F2_U32_PRIVATE),
+           f2_wake((void *)&f2_words[0], 1, 1, F2_U32_PRIVATE));
+    printf("wake private-unmapped=%ld shared-unmapped=%ld\n",
+           f2_wake(page, 1, 1, F2_U32_PRIVATE), f2_wake(page, 1, 1, 2));
+
+    printf("wait value-high=%ld mask-high=%ld fault-before-mask=%ld mask-zero=%ld mismatch=%ld "
+           "timeout=%ld huge=%ld\n",
+           f2_wait((void *)&f2_words[2], 1ULL << 32, 1, F2_U32_PRIVATE, NULL, 0),
+           f2_wait((void *)&f2_words[2], 0, 1ULL << 32, F2_U32_PRIVATE, NULL, 0),
+           f2_wait((void *)&f2_words[2], 0, 0, F2_U32_PRIVATE, (void *)8, 1),
+           f2_wait((void *)&f2_words[2], 0, 0, F2_U32_PRIVATE, NULL, 0),
+           f2_wait((void *)&f2_words[2], 1, 1, F2_U32_PRIVATE, NULL, 0),
+           f2_wait((void *)&f2_words[2], 0, 1, F2_U32_PRIVATE, &past, 1),
+           f2_wait((void *)&f2_words[2], 1, 1, F2_U32_PRIVATE,
+                   &(struct timespec){INT64_MAX, 0}, 1));
+    pthread_create(&t, NULL, f2_wait_thread, NULL);
+    long missed = 0;
+    while ((woke = f2_wake((void *)&f2_words[2], 1, 1, F2_U32_PRIVATE)) == 0) {
+        long other = f2_wake((void *)&f2_words[2], 4, 1, F2_U32_PRIVATE);
+        if (other) {
+            missed = other;
+            break;
+        }
+        sched_yield();
+    }
+    pthread_join(t, NULL);
+    printf("wait woken=%ld missed=%ld result=%ld\n", woke, missed, f2_result);
+
+    pthread_create(&t, NULL, f2_old_wait_thread, NULL);
+    while ((woke = f2_errno(syscall(SYS_futex, &f2_words[3], 1 | 128, 0, NULL, NULL, 0))) == 0)
+        sched_yield();
+    pthread_join(t, NULL);
+    printf("FUTEX_WAKE of 0 woke=%ld result=%ld\n", woke, f2_result);
+    struct timespec huge = {INT64_MAX, 0};
+    printf("FUTEX_WAIT huge=%ld bitset-huge=%ld\n",
+           f2_errno(syscall(SYS_futex, &f2_words[3], 128, 1, &huge, NULL, 0)),
+           f2_errno(syscall(SYS_futex, &f2_words[3], 9 | 128, 1, &huge, NULL, -1)));
+
+    static _Alignas(8) volatile uint32_t numa[2];
+    numa[1] = 0xffffffff;
+    long first = f2_wake((void *)numa, 1, 1, F2_U32_PRIVATE | 4);
+    long node = numa[1];
+    numa[1] = 1;
+    long other = f2_wake((void *)numa, 1, 1, F2_U32_PRIVATE | 4);
+    numa[1] = 0;
+    printf("numa wake=%ld node=%ld other-node=%ld misaligned=%ld mpol=%ld\n", first, node, other,
+           f2_wake((void *)&numa[1], 1, 1, F2_U32_PRIVATE | 4),
+           f2_wake((void *)numa, 1, 1, F2_U32_PRIVATE | 8));
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -7383,6 +7622,123 @@ int main(int argc, char **argv) {
                 _exit(0);
             }
             result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "generic-netlink")) {
+        /* A child makes a network namespace and asks NETLINK_GENERIC's
+           controller, nlctrl, of itself: by name and ID, as a dump, and
+           its policies, with requests it refuses. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int fd = socket(NL_AF_NETLINK, SOCK_RAW, NL_GENERIC);
+            int dgram = socket(NL_AF_NETLINK, SOCK_DGRAM, NL_GENERIC);
+            int route = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            int protocol = -1;
+            socklen_t protocol_len = sizeof protocol;
+            getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &protocol_len);
+            printf("socket: raw=%d dgram=%d protocol=%d\n", fd >= 0, dgram >= 0, protocol);
+            /* Each protocol has its own ports: both take the process's ID. */
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0}, route_name = {0};
+            socklen_t name_len = sizeof name;
+            printf("bind: generic=%ld route=%ld\n", netns_result(bind(fd, (void *)&any, sizeof any)),
+                   netns_result(bind(route, (void *)&any, sizeof any)));
+            getsockname(fd, (void *)&name, &name_len);
+            name_len = sizeof route_name;
+            getsockname(route, (void *)&route_name, &name_len);
+            unsigned port = name.pid;
+            printf("ports: same=%d own=%d\n", port == route_name.pid, port == (unsigned)getpid());
+            unsigned char a[64];
+            unsigned short id16 = 16, id_none = 1023;
+            unsigned id_word = 16, op;
+            size_t n = genl_put(a, 0, 2, "nlctrl", 7);
+            genl_show(fd, port, "by name", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            genl_show(fd, port, "by name ack", 16, NL_F_REQUEST | NL_F_ACK, 3, 0, a, n, 1);
+            genl_show(fd, port, "reserved old", 16, NL_F_REQUEST, 3, 1, a, n, 0);
+            n = genl_put(a, 0, 1, &id16, 2);
+            genl_show(fd, port, "by id", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_word, 4);
+            genl_show(fd, port, "by id word", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_none, 2);
+            n = genl_put(a, n, 2, "nlctrl", 7);
+            genl_show(fd, port, "by both", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "nlctrl", 7);
+            n = genl_put(a, n, 9, &id_word, 4);
+            genl_show(fd, port, "unknown attribute", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "paludarium", 11);
+            genl_show(fd, port, "name unknown", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_none, 2);
+            genl_show(fd, port, "id unknown", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id16, 1);
+            genl_show(fd, port, "id short", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "aaaaaaaaaaaaaaaa", 16);
+            genl_show(fd, port, "name unterminated", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "abc\0aaaaaaaaaaaaaaaa", 20);
+            genl_show(fd, port, "name long", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            genl_show(fd, port, "no attributes", 16, NL_F_REQUEST, 3, 0, a, 0, 0);
+            genl_read(fd, port, "short header", nl_send(fd, 16, NL_F_REQUEST | NL_F_ACK, "\3\1", 2), 0);
+            n = genl_put(a, 0, 2, "nlctrl", 7);
+            genl_show(fd, port, "other family", 0x3ff, NL_F_REQUEST, 3, 0, a, n, 0);
+            genl_show(fd, port, "control", 1, NL_F_REQUEST | NL_F_ACK, 3, 0, a, n, 0);
+            genl_show(fd, port, "new family", 16, NL_F_REQUEST, 1, 0, a, n, 0);
+            genl_show(fd, port, "policy without dump", 16, NL_F_REQUEST, 10, 0, a, n, 0);
+            genl_show(fd, port, "reserved new", 16, NL_F_REQUEST, 11, 1, a, n, 0);
+            genl_show(fd, port, "flags new", 16, NL_F_REQUEST | 0x400, 11, 0, a, n, 0);
+            genl_show(fd, port, "command new", 16, NL_F_REQUEST, 11, 0, a, n, 0);
+            genl_show(dgram, 0, "dgram", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            /* The dump lists nlctrl first; the host's other families are
+               not printed. */
+            genl_show(fd, port, "dump", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, 0, 0);
+            genl_show(fd, port, "dump by name", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_word, 4);
+            genl_show(fd, port, "dump id word", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 5, &id_word, 4);
+            genl_show(fd, port, "dump unknown attribute", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "nlctrl", 7);
+            genl_show(fd, port, "policy", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id16, 2);
+            genl_show(fd, port, "policy by id", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            op = 3;
+            n = genl_put(a, n, 10, &op, 4);
+            genl_show(fd, port, "policy of getfamily", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            op = 10;
+            n = genl_put(a, 0, 1, &id16, 2);
+            n = genl_put(a, n, 10, &op, 4);
+            genl_show(fd, port, "policy of getpolicy", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            op = 1;
+            n = genl_put(a, 0, 1, &id16, 2);
+            n = genl_put(a, n, 10, &op, 4);
+            genl_show(fd, port, "policy of newfamily", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            genl_show(fd, port, "policy none", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, 0, 0);
+            n = genl_put(a, 0, 2, "paludarium", 11);
+            genl_show(fd, port, "policy name unknown", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_none, 2);
+            genl_show(fd, port, "policy id unknown", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_word, 4);
+            genl_show(fd, port, "policy id word", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            /* A second dump while the first runs is EBUSY. */
+            nl_send(fd, 16, NL_F_REQUEST | NL_F_DUMP, (unsigned char[]){10, 1, 0, 0, 6, 0, 1, 0, 16, 0, 0, 0}, 12);
+            genl_show(fd, port, "busy", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, 0, 1);
+            /* nlctrl's group, notify, is 16. */
+            int group = 16, zero = 0;
+            unsigned words[2] = {0};
+            socklen_t words_len = sizeof words[0];
+            printf("join: add=%ld zero=%ld\n", netns_result(setsockopt(fd, 270, 1, &group, sizeof group)),
+                   netns_result(setsockopt(fd, 270, 1, &zero, sizeof zero)));
+            getsockopt(fd, 270, 9, words, &words_len);
+            printf("join: list=%#x\n", words[0]);
+            printf("join: drop=%ld\n", netns_result(setsockopt(fd, 270, 2, &group, sizeof group)));
+            int other = socket(NL_AF_NETLINK, SOCK_RAW, NL_GENERIC);
+            struct nl_address notify = {.family = NL_AF_NETLINK, .groups = 1u << 15};
+            name_len = sizeof name;
+            printf("join: bind=%ld", netns_result(bind(other, (void *)&notify, sizeof notify)));
+            getsockname(other, (void *)&name, &name_len);
+            printf(" groups=%#x\n", name.groups);
             fflush(stdout);
             _exit(0);
         }
@@ -16771,6 +17127,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "vector-flags")) return vector_flags_case();
     if (!strcmp(mode, "old-times")) return old_times_case();
     if (!strcmp(mode, "old-forms")) return old_forms_case();
+    if (!strcmp(mode, "futex2")) return futex2_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

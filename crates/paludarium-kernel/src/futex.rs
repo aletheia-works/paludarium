@@ -39,11 +39,59 @@ fn key(mem: &AddressSpace, addr: u64, private: bool) -> Key {
 /// are the same in every process, and the others name their address space.
 static MACHINE: LazyLock<Futexes> = LazyLock::new(Futexes::default);
 pub(crate) struct Waiter {
-    pub token: WaitToken,
+    /// What wakes the thread; every word of one `futex_waitv` shares it.
+    pub token: Arc<WaitToken>,
     pub state: AtomicU32,
     mask: u32,
     /// The queue it waits in.
     key: Key,
+}
+/// One futex word to wait on: where, whether its key is the process's own
+/// (`FUTEX_PRIVATE_FLAG`), whether it is followed by a NUMA node word
+/// (`FUTEX2_NUMA`), the value it must hold, and the bits a wake must share.
+#[derive(Clone, Copy)]
+pub(crate) struct Word {
+    pub addr: u64,
+    pub private: bool,
+    pub numa: bool,
+    pub value: u32,
+    pub mask: u32,
+}
+/// Linux's `TASK_SIZE_MAX`, where `access_ok` stops.
+const TASK_SIZE_MAX: u64 = (1 << 47) - 4096;
+/// `FUTEX_NO_NODE`, a node word that asks for the thread's own node.
+const NO_NODE: u32 = u32::MAX;
+/// The key of the futex word at `addr`, after Linux's `get_futex_key`
+/// checks in its order: the word is aligned to its size, doubled by a node
+/// word (`EINVAL`), and lies below `TASK_SIZE_MAX` (`EFAULT`); a node word
+/// names node 0, the only one here, or none, which becomes node 0 (`EINVAL`,
+/// and `EFAULT` when it cannot be read or written); and a shared word's page
+/// is there (`EFAULT`), where a private one's is not looked at.
+fn checked_key(mem: &AddressSpace, addr: u64, private: bool, numa: bool) -> Result<Key, Errno> {
+    let size = if numa { 8 } else { 4 };
+    if !addr.is_multiple_of(size) {
+        return Err(Errno::EINVAL);
+    }
+    if addr.checked_add(size).is_none_or(|end| end > TASK_SIZE_MAX) {
+        return Err(Errno::EFAULT);
+    }
+    if numa {
+        let at = GuestAddr(addr + 4);
+        let mut node = [0; 4];
+        mem.read(at, &mut node).map_err(|_| Errno::EFAULT)?;
+        match u32::from_le_bytes(node) {
+            0 => {}
+            NO_NODE => mem
+                .write(at, &0u32.to_le_bytes())
+                .map_err(|_| Errno::EFAULT)?,
+            _ => return Err(Errno::EINVAL),
+        }
+    }
+    if !private {
+        mem.check_read(GuestAddr(addr), 4)
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    Ok(key(mem, addr, private))
 }
 #[derive(Default, Clone)]
 pub(crate) struct Futexes {
@@ -62,25 +110,59 @@ impl Futexes {
         value: u32,
         mask: u32,
     ) -> Result<Arc<Waiter>, Errno> {
-        if addr & 3 != 0 || mask == 0 {
+        if mask == 0 {
             return Err(Errno::EINVAL);
         }
-        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
-        let key = key(mem, addr, private);
-        let mut bytes = [0; 4];
-        mem.read(GuestAddr(addr), &mut bytes)
-            .map_err(|_| Errno::EFAULT)?;
-        if u32::from_le_bytes(bytes) != value {
-            return Err(Errno::EAGAIN);
-        }
-        let waiter = Arc::new(Waiter {
-            token: WaitToken::default(),
-            state: AtomicU32::new(0),
+        let word = Word {
+            addr,
+            private,
+            numa: false,
+            value,
             mask,
-            key,
-        });
-        queues.entry(key).or_default().push(waiter.clone());
-        Ok(waiter)
+        };
+        let mut waiters = self.register_all(mem, &[word])?;
+        Ok(waiters.remove(0))
+    }
+    /// Queues a waiter on each of `words`, which then share one token, as
+    /// Linux's `futex_wait_multiple_setup` does: every key is checked first
+    /// ([`checked_key`]), then each word is compared in turn, `EFAULT` when
+    /// it cannot be read and `EAGAIN` when it differs, which takes the
+    /// waiters queued before it away again. They go in under one hold of the
+    /// queues, so no wake comes between them.
+    pub fn register_all(
+        &self,
+        mem: &AddressSpace,
+        words: &[Word],
+    ) -> Result<Vec<Arc<Waiter>>, Errno> {
+        let keys = words
+            .iter()
+            .map(|w| checked_key(mem, w.addr, w.private, w.numa))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        for word in words {
+            let mut bytes = [0; 4];
+            mem.read(GuestAddr(word.addr), &mut bytes)
+                .map_err(|_| Errno::EFAULT)?;
+            if u32::from_le_bytes(bytes) != word.value {
+                return Err(Errno::EAGAIN);
+            }
+        }
+        let token = Arc::new(WaitToken::default());
+        let waiters = words
+            .iter()
+            .zip(keys)
+            .map(|(word, key)| {
+                let waiter = Arc::new(Waiter {
+                    token: Arc::clone(&token),
+                    state: AtomicU32::new(0),
+                    mask: word.mask,
+                    key,
+                });
+                queues.entry(key).or_default().push(waiter.clone());
+                waiter
+            })
+            .collect();
+        Ok(waiters)
     }
     pub fn finish(&self, waiter: &Arc<Waiter>, result: u32) -> u32 {
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
@@ -95,29 +177,39 @@ impl Futexes {
         }
         waiter.state.load(Ordering::SeqCst)
     }
-    pub fn wake(
+    /// Wakes up to `count` waiters of the word at `addr` whose bits meet
+    /// `mask`, as Linux's `futex_wake`: `EINVAL` for no bits, then
+    /// [`checked_key`]'s checks. One is woken even for a count that is not
+    /// positive (Linux counts a wake before it compares), but a `strict`
+    /// one (futex2's `FLAGS_STRICT`) of 0 wakes none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wake_word(
         &self,
         mem: &AddressSpace,
         addr: u64,
         private: bool,
-        count: u32,
+        numa: bool,
+        count: i32,
         mask: u32,
+        strict: bool,
     ) -> Result<u64, Errno> {
-        if addr & 3 != 0 || mask == 0 {
+        if mask == 0 {
             return Err(Errno::EINVAL);
         }
+        let key = checked_key(mem, addr, private, numa)?;
+        if strict && count == 0 {
+            return Ok(0);
+        }
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
-        // Validate before consulting queues, including when no waiter exists.
-        mem.check_read(GuestAddr(addr), 4)
-            .map_err(|_| Errno::EFAULT)?;
-        let key = key(mem, addr, private);
-        let mut woke = 0;
+        let mut woke = 0i32;
+        let mut done = false;
         if let Some(queue) = queues.get_mut(&key) {
             queue.retain(|waiter| {
-                if woke < count && waiter.mask & mask != 0 {
+                if !done && waiter.mask & mask != 0 {
                     waiter.state.store(1, Ordering::SeqCst);
                     waiter.token.notify();
                     woke += 1;
+                    done = woke >= count;
                     false
                 } else {
                     true
@@ -127,7 +219,19 @@ impl Futexes {
                 queues.remove(&key);
             }
         }
-        Ok(u64::from(woke))
+        Ok(woke as u64)
+    }
+    /// [`Self::wake_word`] of a word without a node word, as the old
+    /// `futex` calls wake one.
+    pub fn wake(
+        &self,
+        mem: &AddressSpace,
+        addr: u64,
+        private: bool,
+        count: i32,
+        mask: u32,
+    ) -> Result<u64, Errno> {
+        self.wake_word(mem, addr, private, false, count, mask, false)
     }
 }
 

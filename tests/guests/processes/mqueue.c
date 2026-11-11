@@ -1145,7 +1145,9 @@ static int files_case(void) {
     if (q < 0) return 11;
     long long made = mtime_of(q);
     /* Whether a send or a receive moves the time is not compared: on CI,
-       Linux's coarse clock was seen to stay put across 250 ms. */
+       Linux's coarse clock was seen to stay put across 250 ms, and the
+       emulator has no CLOCK_REALTIME_COARSE to compare it with. That part
+       rests on Linux's do_mq_timedsend and do_mq_timedreceive. */
     printf("mtime:");
     pause_ms(250);
     struct mq_attr old;

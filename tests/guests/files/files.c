@@ -843,6 +843,33 @@ void _start(void) {
   results[x++]=R2(r,sub,2);results[x++]=ISDIR(r);results[x++]=ISDIR(sub);
   results[x++]=LINKS(d)-dlinks;results[x++]=LINKS("/tmp")-before;
   S(84,r,0,0);S(87,sub,0,0);S(84,d,0,0);}
+ if(CASE==74){ /* the iovec array of readv, writev, vmsplice, sendmsg and recvmsg, checked in import_iovec's order */
+  const long K=(long)0xffff800000000000UL;
+  S(1,fd,"abcdefgh",8);S(8,fd,0,0);
+  static long v1[4],v2[6],v3[4],ok[4],m[7];
+  /* Every entry is read, and a negative length found, before any buffer is looked at. */
+  v1[0]=K;v1[1]=1;v1[2]=(long)buf;v1[3]=-1;
+  v2[0]=(long)buf;v2[1]=1;v2[2]=K;v2[3]=1;v2[4]=(long)buf;v2[5]=-1;
+  results[x++]=S(19,fd,v1,2);results[x++]=S(20,fd,v1,2);results[x++]=S(19,fd,v2,3);results[x++]=S(20,fd,v2,3);
+  results[x++]=call(295,fd,(long)v2,3,0,0,0);
+  /* No entries read nothing, too many are EINVAL even at a bad address, and an array past the user half is EFAULT. */
+  results[x++]=S(19,fd,1,0);results[x++]=S(19,fd,K,1025);results[x++]=S(19,fd,K,2);results[x++]=S(20,fd,K,1);
+  /* Of several buffers, each is access_ok with its whole length. */
+  v3[0]=(long)buf;v3[1]=1;v3[2]=(long)buf;v3[3]=0x0000800000000000L;
+  results[x++]=S(19,fd,v3,2);results[x++]=S(8,fd,0,1);
+  /* The access mode comes first, as vfs_readv and vfs_writev check it before import_iovec. */
+  long rd=S(2,p,0,0),wr=S(2,p,1,0);
+  results[x++]=S(20,rd,v1,2);results[x++]=S(19,wr,v1,2);results[x++]=S(20,rd,K,2);results[x++]=S(19,wr,v2,3);
+  S(3,rd,0,0);S(3,wr,0,0);
+  int pf[2];S(22,pf,0,0);
+  results[x++]=call(278,pf[1],(long)v1,2,0,0,0);results[x++]=call(278,pf[1],(long)v2,3,0,0,0);results[x++]=call(278,pf[1],(long)v3,2,2,0,0);
+  ok[0]=(long)"wxyz";ok[1]=2;ok[2]=(long)"wxyz"+2;ok[3]=2;results[x++]=S(20,pf[1],ok,2);results[x++]=S(0,pf[0],buf,8);results[x++]=buf[0]+buf[3];
+  int sv[2];call(53,1,1,0,(long)sv,0,0);
+  m[2]=(long)v1;m[3]=2;results[x++]=S(46,sv[0],m,0);results[x++]=S(47,sv[1],m,0x40);
+  m[2]=(long)v2;m[3]=3;results[x++]=S(46,sv[0],m,0);results[x++]=S(47,sv[1],m,0x40);
+  m[2]=(long)v3;m[3]=2;results[x++]=S(46,sv[0],m,0x40);results[x++]=S(47,sv[1],m,0x40);
+  S(3,pf[0],0,0);S(3,pf[1],0,0);S(3,sv[0],0,0);S(3,sv[1],0,0);
+ }
  S(3,fd,0,0);S(87,p,0,0);S(87,q,0,0);S(87,r,0,0);
  }
  S(1,1,results,x*8);if(CASE==3||CASE==9)S(1,1,buf,3);if(CASE==23||CASE==24||CASE==27||CASE==59)S(1,1,buf,2);if(CASE==5||CASE==15)S(1,1,buf,sizeof(p)-1);S(60,0,0,0);

@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
@@ -66,9 +66,17 @@ kernel.
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
-| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
+- The `struct iovec` array of `readv`, `writev`, their positioned forms,
+  `vmsplice`, `sendmsg` and `recvmsg` is checked in the order of Linux's
+  `import_iovec`: no entries move nothing, more than 1024 are `EINVAL`, an
+  array past the user half is `EFAULT`, then every entry is read and a
+  negative length is `EINVAL` before any buffer is looked at, and then each
+  buffer must lie in the user half (`EFAULT`), with its whole length when
+  there are several and at most `MAX_RW_COUNT` when there is one. The lengths
+  are cut so that the total is at most `MAX_RW_COUNT`.
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
   where it was, and a pipe or socket gives `ESPIPE`; in an `O_APPEND` file a
   positioned write still appends, as on Linux.
@@ -213,7 +221,8 @@ kernel.
   it on as an `unsigned`. The number
   itself is read from the low 32 bits of `rax` too, as Linux's
   `do_syscall_64` takes an `int`, and a negative one gives `ENOSYS`.
-- `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`. A word is
+- `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE` and
+  `CMP_REQUEUE`. A word is
   told apart as Linux's `get_futex_key` does: in a shared mapping (shared
   anonymous memory or a file's), a shared operation names the memory and the
   offset in it, so a wake reaches a waiter in any process that maps it,
@@ -224,7 +233,13 @@ kernel.
   owner ends. A wake wakes one waiter even when asked for 0 or fewer, as
   Linux counts before it compares, and a private one does not look at the
   word's page. A timeout too long for Linux's nanoseconds waits until
-  `KTIME_MAX`.
+  `KTIME_MAX`. A requeue wakes `val` waiters and moves up to `val2` more (the
+  timeout argument, as Linux reads it) to `uaddr2`'s queue, giving how many
+  it took. Negative counts give `EINVAL`, and `CMP_REQUEUE` gives `EAGAIN`
+  when the first word is not `val3`, after both words' checks. It takes the
+  waiters in the order they came, whatever their bitsets. Onto its own word,
+  a requeue leaves them where they are and counts each once, as Linux does
+  within one hash bucket.
 - The futex2 calls take 32-bit words with `FUTEX2_PRIVATE`, `FUTEX2_NUMA`
   and `FUTEX2_MPOL`, checked in Linux's order. Other sizes and flags give
   `EINVAL`. `futex_wake` and `futex_wait` are `FUTEX_WAKE_BITSET` and
@@ -232,9 +247,11 @@ kernel.
   `CLOCK_MONOTONIC`, and a `futex_wake` of 0 wakes none. `futex_waitv` waits
   on up to 128 words at once and gives the index of a woken one: it checks
   every word's address before it compares any value, then gives `EAGAIN` at
-  the first that differs. A `FUTEX2_NUMA` word is followed by its node,
+  the first that differs. `futex_requeue` is `CMP_REQUEUE` on the two words of
+  a `struct futex_waitv` list, which must have the same flags, as kernels
+  after 6.12 ask; the first's value is compared. A `FUTEX2_NUMA` word is followed by its node,
   which must be node 0, the only one, or `-1`, which becomes 0, as Linux
-  writes the thread's node there. A signal interrupts them with
+  writes the thread's node there. A signal interrupts the waits with
   `ERESTARTSYS`, so they run again after a stop or an `SA_RESTART` handler.
 - `set_robust_list` and `get_robust_list` keep each thread's list of robust
   futexes, which glibc's and musl's robust mutexes need. When a thread ends or
@@ -1179,6 +1196,35 @@ kernel.
   - **Groups:** a socket has 64 groups (`EINVAL` for 0 or one past them),
     any of which anyone may join; `nlctrl`'s `notify` is group 16, which
     hears nothing, as no family comes or goes.
+- A socket-diagnostics netlink socket (protocol `NETLINK_SOCK_DIAG`)
+  tells of the AF_UNIX sockets of the network namespace it was made in, as
+  Linux's `sock_diag` and `unix_diag` do, so `ss -x` lists them.
+  - **Requests:** `SOCK_DIAG_BY_FAMILY` for AF_UNIX dumps the sockets
+    whose state (`TCP_ESTABLISHED`, `TCP_CLOSE` or `TCP_LISTEN`) is in
+    `udiag_states`, in parts as large as Linux's `netlink_dump` makes
+    them (a page's worth, or as much as the longest receive took, up to
+    32 KiB, the next as a receive makes room), its `NLMSG_DONE` after
+    them, or with no dump
+    answers for the socket of inode `udiag_ino` (`EINVAL` for 0, `ENOENT`
+    for none) whose cookie matches (`ESTALE` for another; all ones match
+    any). A connection a listener has not accepted has no inode yet, and
+    is not listed. Another family has no handler (`ENOENT`), a family
+    past `AF_MAX` or a request too short is `EINVAL`, `SOCK_DESTROY` is
+    `EOPNOTSUPP`, and so is `TCPDIAG_GETSOCK`; any other type is `EINVAL`.
+    A second dump while one runs is `EBUSY`.
+  - **What it tells:** each socket's type, state, inode and cookie, then
+    as `udiag_show` asks, in `sk_diag_fill`'s order: its name, its socket
+    file's inode and device, its peer's inode (0 once the peer has closed
+    or while it waits to be accepted), a listener's waiting clients, its
+    queues (what waits to be read and what it sent that waits, or a
+    listener's waiting connections and backlog), its memory (`SO_RCVBUF`,
+    `SO_SNDBUF` and what it sent that waits), then always its shutdown
+    (a stream or packet socket's shows what its peer shut down too, and
+    both once the peer has closed), and its owner as the user namespace of
+    whoever made the netlink socket shows it. A datagram socket another
+    connects to is `TCP_ESTABLISHED`, as on Linux.
+  - **Groups:** a socket has 32 groups, as Linux makes the four of
+    `sock_diag` 32, which anyone may join, and which hear nothing.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,
@@ -1694,10 +1740,13 @@ kernel.
   Linux's `fsnotify` hooks give them: `IN_CREATE` for a new file, directory,
   symbolic link, FIFO, socket or link (after `IN_ATTRIB` of a linked file);
   `IN_DELETE` for a removed one, after `IN_ATTRIB` of the file and, for its
-  last link or a directory, `IN_DELETE_SELF` and `IN_IGNORED` of it;
+  last link or a directory, `IN_DELETE_SELF` and `IN_IGNORED` of it, which
+  wait for the last close of a description of it that is open (a mapping
+  holds one until it is unmapped), as Linux's dentry waits;
   `IN_MOVED_FROM` and `IN_MOVED_TO` with one cookie for a rename, then
   `IN_ATTRIB` of a file it replaces, `IN_MOVE_SELF` of the file moved, and
-  the replaced file's `IN_DELETE_SELF` (twice for `RENAME_EXCHANGE`, and
+  the replaced file's `IN_DELETE_SELF`, which waits in the same way (twice
+  for `RENAME_EXCHANGE`, and
   nothing for a rename onto another link of the same file); `IN_ATTRIB` for
   a new mode, owner (a `chown` that names neither gives none), both times
   or extended attribute; `IN_ACCESS` and `IN_MODIFY` for setting only the

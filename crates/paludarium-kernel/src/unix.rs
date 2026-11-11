@@ -33,6 +33,10 @@ const EPROTOTYPE: Errno = Errno(91);
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
 const SOCK_SEQPACKET: u32 = 5;
+/// The `sk_state`s an AF_UNIX socket has, as `sock_diag` shows them.
+const TCP_ESTABLISHED: u8 = 1;
+const TCP_CLOSE: u8 = 7;
+const TCP_LISTEN: u8 = 10;
 /// `net.unix.max_dgram_qlen`: a datagram socket's queue is full past it.
 const MAX_DGRAM_QLEN: usize = 10;
 const POLLHUP: u32 = 0x10;
@@ -53,6 +57,9 @@ pub(crate) struct Names {
     bound: Mutex<Bound>,
     files: Arc<Mutex<BTreeMap<Inode, Weak<UnixSocket>>>>,
     next: AtomicU32,
+    /// Every socket made in the namespace, as Linux's `net->unx.table`
+    /// holds them, which `sock_diag` lists.
+    all: Mutex<Vec<Weak<UnixSocket>>>,
 }
 type Bound = BTreeMap<(u32, Vec<u8>), Weak<UnixSocket>>;
 /// A socket file: its mount's device number, and its inode there.
@@ -63,6 +70,18 @@ impl Names {
     }
     fn files(&self) -> MutexGuard<'_, BTreeMap<Inode, Weak<UnixSocket>>> {
         self.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Adds `socket` to the namespace's sockets.
+    fn register(&self, socket: &Arc<UnixSocket>) {
+        let mut all = self.all.lock().unwrap_or_else(PoisonError::into_inner);
+        all.retain(|socket| socket.strong_count() > 0);
+        all.push(Arc::downgrade(socket));
+    }
+    /// The namespace's sockets that are still open, oldest first.
+    pub(crate) fn sockets(&self) -> Vec<Arc<UnixSocket>> {
+        let mut all = self.all.lock().unwrap_or_else(PoisonError::into_inner);
+        all.retain(|socket| socket.strong_count() > 0);
+        all.iter().filter_map(Weak::upgrade).collect()
     }
     /// A new network namespace's: no abstract names, and the machine's
     /// socket files.
@@ -96,6 +115,37 @@ pub(crate) struct UnixSocket {
     /// The Landlock domain of the thread that made it (the socket file's
     /// credentials), which abstract unix socket scoping looks at.
     landlock: crate::landlock::Landlock,
+    /// Its cookie, which `sock_diag` gives it when first asked
+    /// (`sock_gen_cookie`).
+    cookie: OnceLock<u64>,
+}
+/// The last socket cookie given (`net_cookie`'s counter).
+static COOKIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// What `sock_diag` tells of a socket ([`UnixSocket::diag`]).
+pub(crate) struct Diag {
+    pub(crate) kind: u8,
+    /// Linux's `sk_state`: `TCP_ESTABLISHED`, `TCP_CLOSE` or `TCP_LISTEN`.
+    pub(crate) state: u8,
+    pub(crate) inode: u64,
+    pub(crate) cookie: u64,
+    /// The whole `sun_path` it is bound to.
+    pub(crate) name: Option<Vec<u8>>,
+    /// The inode and device of the socket file it is bound to.
+    pub(crate) file: Option<(u64, u64)>,
+    /// The inode of its peer, 0 for one that has closed.
+    pub(crate) peer: Option<u64>,
+    /// A listener's connections that wait: the inodes of their clients.
+    pub(crate) waiting: Option<Vec<u64>>,
+    /// What waits to be read and what it sent that waits, or a listener's
+    /// connections that wait and its backlog.
+    pub(crate) queues: (usize, usize),
+    /// `SO_RCVBUF` and `SO_SNDBUF`, doubled.
+    pub(crate) buffers: (i32, i32),
+    /// What it sent that waits takes of its send buffer.
+    pub(crate) sent: usize,
+    pub(crate) shutdown: u8,
+    /// Its owner, as the kernel has it.
+    pub(crate) uid: u32,
 }
 #[derive(Default)]
 struct State {
@@ -109,6 +159,13 @@ struct State {
     to: Option<(Weak<UnixSocket>, Address)>,
     /// The socket file a socket bound to a path made, which finds it.
     file: Option<Inode>,
+    /// A datagram socket's `sk_state` is `TCP_ESTABLISHED`: it connected,
+    /// or another connected to it, as Linux's `unix_dgram_connect` sets
+    /// both. It is `TCP_CLOSE` again once it disconnects, once a send finds
+    /// the one it is connected to gone (`unix_dgram_sendmsg`), or, with no
+    /// peer of its own, once one connected to it connects elsewhere
+    /// (`unix_dgram_connect` leaving its old peer).
+    established: bool,
 }
 /// A listening socket's connections that wait for `accept`.
 struct Listen {
@@ -173,6 +230,7 @@ pub(crate) fn pair(c: &Context<'_>, kind: u32) -> Result<[Arc<UnixSocket>; 2], E
                 hub: Arc::clone(&c.files.readiness),
                 state: Mutex::default(),
                 landlock: c.process.credentials.landlock.clone(),
+                cookie: OnceLock::new(),
             }
         })
     });
@@ -181,9 +239,12 @@ pub(crate) fn pair(c: &Context<'_>, kind: u32) -> Result<[Arc<UnixSocket>; 2], E
         let mut s = sockets[side].lock();
         if sockets[side].datagram() {
             s.to = Some((Arc::downgrade(other), other.address()));
+            s.established = true;
         } else {
             s.peer = Some(other.address());
         }
+        drop(s);
+        sockets[side].names.register(&sockets[side]);
     }
     Ok(sockets)
 }
@@ -367,7 +428,7 @@ impl UnixSocket {
         let datagram = kind & 0xf == SOCK_DGRAM;
         end.clock_from(c.shared_host);
         let spare = (!datagram).then_some(spare);
-        Ok(Arc::new_cyclic(|this: &Weak<Self>| {
+        let socket = Arc::new_cyclic(|this: &Weak<Self>| {
             end.attach(Weak::clone(this));
             Self {
                 this: Weak::clone(this),
@@ -379,8 +440,11 @@ impl UnixSocket {
                 hub: Arc::clone(&c.files.readiness),
                 state: Mutex::default(),
                 landlock: c.process.credentials.landlock.clone(),
+                cookie: OnceLock::new(),
             }
-        }))
+        });
+        socket.names.register(&socket);
+        Ok(socket)
     }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -589,6 +653,7 @@ impl UnixSocket {
             let theirs = client.lock();
             (self.lock(), theirs)
         };
+        let file = own.file;
         let Some(listen) = own.listen.as_mut() else {
             return Err(ECONNREFUSED);
         };
@@ -621,6 +686,7 @@ impl UnixSocket {
         // It also takes the listener's SO_PASSCRED, SO_PASSPIDFD and
         // SO_PASSSEC as they are now (sk_scm_recv_flags).
         spare.take_passing(&self.end);
+        spare.set_embryo(true);
         let child = Arc::new_cyclic(|this: &Weak<Self>| {
             spare.attach(Weak::clone(this));
             Self {
@@ -632,13 +698,19 @@ impl UnixSocket {
                 // As `unix_stream_connect` makes it, in the client's.
                 network: client.network.clone(),
                 hub: Arc::clone(&self.hub),
+                // It has the listener's name and, as `unix_stream_connect`
+                // copies `path`, its socket file, though the file finds
+                // only the listener.
                 state: Mutex::new(State {
                     peer: Some(Arc::clone(&client.name)),
+                    file,
                     ..State::default()
                 }),
                 landlock: self.landlock.clone(),
+                cookie: OnceLock::new(),
             }
         });
+        client.names.register(&child);
         theirs.peer = Some(Arc::clone(&self.name));
         drop(theirs);
         client.end.connected();
@@ -671,13 +743,38 @@ impl UnixSocket {
             if !other.may_receive_from(self) {
                 return Err(EPERM);
             }
-            Some((Arc::downgrade(&other), other.address()))
+            Some(other)
         };
-        let new = to.as_ref().map_or(std::ptr::null(), |(to, _)| to.as_ptr());
-        let old = std::mem::replace(&mut self.lock().to, to);
+        let new = to.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+        let old = {
+            let mut s = self.lock();
+            let old = s.to.take();
+            match &to {
+                Some(other) => {
+                    s.to = Some((Arc::downgrade(other), other.address()));
+                    s.established = true;
+                }
+                // Only a connected socket's state goes back to
+                // `TCP_CLOSE`.
+                None if old.is_some() => s.established = false,
+                None => {}
+            }
+            old
+        };
+        // The socket it connects to is `TCP_ESTABLISHED` too.
+        if let Some(other) = &to {
+            other.lock().established = true;
+        }
         if let Some((old, _)) = old
             && !std::ptr::eq(old.as_ptr(), new)
         {
+            // The one it leaves is `TCP_CLOSE` unless connected itself.
+            if let Some(gone) = old.upgrade() {
+                let mut g = gone.lock();
+                if g.to.is_none() {
+                    g.established = false;
+                }
+            }
             self.disconnected(&old);
         }
         // What waits to send to the old peer may now send elsewhere.
@@ -742,6 +839,7 @@ impl UnixSocket {
             return Ok(to);
         }
         let old = s.to.take();
+        s.established = false;
         drop(s);
         if let Some((old, _)) = old {
             self.disconnected(&old);
@@ -775,6 +873,68 @@ impl UnixSocket {
         let limit = (!free).then_some(MAX_DGRAM_QLEN);
         self.end.enqueue(sender, buf, passed, from, limit)
     }
+    /// What `sock_diag` tells of this socket, as Linux's `sk_diag_fill`
+    /// finds it, or nothing for a connection a listener has not accepted
+    /// yet, which has no inode (`sock_i_ino` is 0).
+    pub(crate) fn diag(&self) -> Option<Diag> {
+        if self.end.embryo() {
+            return None;
+        }
+        let datagram = self.datagram();
+        let (state, to, connected, waiting, backlog, file) = {
+            let s = self.lock();
+            let state = if s.listen.is_some() {
+                TCP_LISTEN
+            } else if (datagram && s.established) || (!datagram && s.peer.is_some()) {
+                TCP_ESTABLISHED
+            } else {
+                TCP_CLOSE
+            };
+            let waiting = s
+                .listen
+                .as_ref()
+                .map(|listen| listen.queue.iter().cloned().collect::<Vec<_>>());
+            (
+                state,
+                s.to.as_ref().map(|(to, _)| Weak::clone(to)),
+                !datagram && s.peer.is_some(),
+                waiting,
+                s.listen.as_ref().map(|listen| listen.backlog),
+                s.file,
+            )
+        };
+        let peer = if datagram {
+            to.map(|to| to.upgrade().map_or(0, |to| to.end.inode()))
+        } else {
+            connected.then(|| self.end.peer_inode())
+        };
+        let queues = match (&waiting, backlog) {
+            (Some(waiting), Some(backlog)) => (waiting.len(), backlog),
+            _ => self.end.queue_lengths(),
+        };
+        Some(Diag {
+            kind: self.end.kind() as u8,
+            state,
+            inode: self.end.inode(),
+            cookie: self.cookie(),
+            name: self.name.get().cloned(),
+            file: file.map(|(device, inode)| (inode, device)),
+            peer,
+            waiting: waiting
+                .map(|waiting| waiting.iter().map(|child| child.end.peer_inode()).collect()),
+            queues,
+            buffers: self.end.buffers(),
+            sent: self.end.queue_lengths().1,
+            shutdown: self.end.shutdown_mask(connected),
+            uid: self.end.owner(),
+        })
+    }
+    /// Its cookie, given when first asked for, as `sock_gen_cookie`.
+    pub(crate) fn cookie(&self) -> u64 {
+        *self
+            .cookie
+            .get_or_init(|| COOKIES.fetch_add(1, Ordering::SeqCst) + 1)
+    }
     /// `accept`, as Linux's `unix_accept`: `EINVAL` unless listening, then
     /// the first connection waiting, or `EAGAIN` when none does and the
     /// socket is nonblocking, or once `SO_RCVTIMEO` has passed.
@@ -794,6 +954,7 @@ impl UnixSocket {
                 // The socket accept makes is the caller's (`sock_alloc`).
                 let creds = &c.process.credentials;
                 child.end.set_owner(Some(creds.fsuid), Some(creds.fsgid))?;
+                child.end.set_embryo(false);
                 return Ok(child);
             }
             if self.flags() & NONBLOCK != 0 {

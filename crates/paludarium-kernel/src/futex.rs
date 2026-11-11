@@ -43,8 +43,14 @@ pub(crate) struct Waiter {
     pub token: Arc<WaitToken>,
     pub state: AtomicU32,
     mask: u32,
-    /// The queue it waits in.
-    key: Key,
+    /// The queue it waits in, which a requeue changes; read and written
+    /// only under the queues' lock.
+    key: Mutex<Key>,
+}
+impl Waiter {
+    fn key(&self) -> Key {
+        *self.key.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 /// One futex word to wait on: where, whether its key is the process's own
 /// (`FUTEX_PRIVATE_FLAG`), whether it is followed by a NUMA node word
@@ -156,7 +162,7 @@ impl Futexes {
                     token: Arc::clone(&token),
                     state: AtomicU32::new(0),
                     mask: word.mask,
-                    key,
+                    key: Mutex::new(key),
                 });
                 queues.entry(key).or_default().push(waiter.clone());
                 waiter
@@ -168,10 +174,11 @@ impl Futexes {
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
         if waiter.state.load(Ordering::SeqCst) == 0 {
             waiter.state.store(result, Ordering::SeqCst);
-            if let Some(queue) = queues.get_mut(&waiter.key) {
+            let key = waiter.key();
+            if let Some(queue) = queues.get_mut(&key) {
                 queue.retain(|w| !Arc::ptr_eq(w, waiter));
                 if queue.is_empty() {
-                    queues.remove(&waiter.key);
+                    queues.remove(&key);
                 }
             }
         }
@@ -220,6 +227,69 @@ impl Futexes {
             }
         }
         Ok(woke as u64)
+    }
+    /// Wakes up to `wake` waiters of the word `from` and moves up to
+    /// `requeue` more to the queue of the word `to`, giving how many it took,
+    /// as Linux's `futex_requeue` without PI: `EINVAL` for a negative count,
+    /// then each word's [`checked_key`], then, with `compare`, `from`'s value
+    /// (`EFAULT`, and `EAGAIN` when it differs). Waiters are taken in the
+    /// order they came, whatever their bits, and a moved one keeps its own
+    /// and comes after those already waiting at `to`, as `requeue_futex`
+    /// puts it at the end of the list. Onto its own word a waiter stays where
+    /// it is, as Linux leaves one within its bucket, and is counted once.
+    pub fn requeue(
+        &self,
+        mem: &AddressSpace,
+        from: (u64, bool, bool),
+        to: (u64, bool, bool),
+        wake: i32,
+        requeue: i32,
+        compare: Option<u32>,
+    ) -> Result<u64, Errno> {
+        if wake < 0 || requeue < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let first = checked_key(mem, from.0, from.1, from.2)?;
+        let second = checked_key(mem, to.0, to.1, to.2)?;
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(value) = compare {
+            let mut bytes = [0; 4];
+            mem.read(GuestAddr(from.0), &mut bytes)
+                .map_err(|_| Errno::EFAULT)?;
+            if u32::from_le_bytes(bytes) != value {
+                return Err(Errno::EAGAIN);
+            }
+        }
+        let Some(queue) = queues.remove(&first) else {
+            return Ok(0);
+        };
+        let (wake, requeue) = (i64::from(wake), i64::from(requeue));
+        let mut taken = 0i64;
+        let (mut kept, mut moved) = (Vec::new(), Vec::new());
+        for waiter in queue {
+            if taken - wake >= requeue {
+                kept.push(waiter);
+                continue;
+            }
+            taken += 1;
+            if taken <= wake {
+                waiter.state.store(1, Ordering::SeqCst);
+                waiter.token.notify();
+            } else if first == second {
+                // `requeue_futex` leaves a waiter in place in its own bucket.
+                kept.push(waiter);
+            } else {
+                *waiter.key.lock().unwrap_or_else(PoisonError::into_inner) = second;
+                moved.push(waiter);
+            }
+        }
+        if !kept.is_empty() {
+            queues.insert(first, kept);
+        }
+        if !moved.is_empty() {
+            queues.entry(second).or_default().extend(moved);
+        }
+        Ok(taken as u64)
     }
     /// [`Self::wake_word`] of a word without a node word, as the old
     /// `futex` calls wake one.

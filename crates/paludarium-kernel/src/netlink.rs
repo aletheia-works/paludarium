@@ -1,6 +1,7 @@
 //! `AF_NETLINK` sockets of `NETLINK_ROUTE`, in the network namespace each
-//! was made in, whose loopback `lo` is its only interface, and of
-//! `NETLINK_GENERIC` ([`generic`]), each protocol with its own ports.
+//! was made in, whose loopback `lo` is its only interface, of
+//! `NETLINK_GENERIC` ([`generic`]) and of `NETLINK_SOCK_DIAG` ([`diag`]),
+//! each protocol with its own ports.
 //!
 //! As Linux's `af_netlink` and `rtnetlink`: a socket is bound to a port ID
 //! (the process's ID, or a negative one when that is taken) by `bind`, or by
@@ -27,10 +28,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
+mod diag;
 mod generic;
 
 const AF_NETLINK: u16 = 16;
 const NETLINK_ROUTE: u32 = 0;
+const NETLINK_SOCK_DIAG: u32 = 4;
 const NETLINK_GENERIC: u32 = 16;
 const SOCK_DGRAM: u32 = 2;
 const SOCK_RAW: u32 = 3;
@@ -244,14 +247,15 @@ const STATS64_LEN: usize = 25 * 8;
 #[derive(Default)]
 pub(crate) struct Ports {
     route: Table,
+    diag: Table,
     generic: Table,
 }
 impl Ports {
     fn table(&self, protocol: u32) -> &Table {
-        if protocol == NETLINK_GENERIC {
-            &self.generic
-        } else {
-            &self.route
+        match protocol {
+            NETLINK_GENERIC => &self.generic,
+            NETLINK_SOCK_DIAG => &self.diag,
+            _ => &self.route,
         }
     }
 }
@@ -310,6 +314,12 @@ struct State {
     /// A dump's `NLMSG_DONE`, which the next receive queues (Linux's
     /// `cb_running`).
     done: Option<Vec<u8>>,
+    /// A dump's messages that have not gone yet, which each receive that
+    /// leaves room sends on as much of as one part takes (`netlink_dump`).
+    rest: VecDeque<Vec<u8>>,
+    /// The longest buffer a receive has given, as much as one part of a
+    /// dump may take (`max_recvmsg_len`).
+    longest_read: usize,
     /// An error a receive gives before anything else (`sk_err`).
     error: Option<Errno>,
     arrivals: u64,
@@ -321,7 +331,8 @@ struct State {
     strict: bool,
 }
 
-/// An `AF_NETLINK` socket of `NETLINK_ROUTE` or `NETLINK_GENERIC`.
+/// An `AF_NETLINK` socket of `NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` or
+/// `NETLINK_GENERIC`.
 pub(crate) struct NetlinkSocket {
     this: Weak<NetlinkSocket>,
     kind: u32,
@@ -337,6 +348,11 @@ pub(crate) struct NetlinkSocket {
     /// takes, and its user ID, which a route lookup a `write` sends names.
     opener_pid: u32,
     opener_uid: u32,
+    /// The user namespace of whoever made it, which shows the owners
+    /// `sock_diag` tells of (`sk_user_ns`), and the AF_UNIX sockets of its
+    /// network namespace, which it lists.
+    opener_user: crate::users::UserNs,
+    unix: Arc<crate::unix::Names>,
     hub: Arc<ReadinessHub>,
     flags: AtomicU32,
     inode: u64,
@@ -357,9 +373,9 @@ struct Sender {
 }
 
 /// `socket(AF_NETLINK, type, protocol)`, as Linux's `netlink_create`:
-/// `SOCK_RAW` or `SOCK_DGRAM` (`ESOCKTNOSUPPORT`), and only `NETLINK_ROUTE`
-/// and `NETLINK_GENERIC` (`EPROTONOSUPPORT`). Without a network there is
-/// none (`EAFNOSUPPORT`).
+/// `SOCK_RAW` or `SOCK_DGRAM` (`ESOCKTNOSUPPORT`), and only `NETLINK_ROUTE`,
+/// `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC` (`EPROTONOSUPPORT`). Without a
+/// network there is none (`EAFNOSUPPORT`).
 pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let kind = a[1] as u32;
     if a[1] > u64::from(u32::MAX) || kind & !(NONBLOCK | CLOEXEC | 0xf) != 0 || kind & 0xf >= 11 {
@@ -370,7 +386,10 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(ESOCKTNOSUPPORT);
     }
     let protocol = a[2] as i32 as u32;
-    if !matches!(protocol, NETLINK_ROUTE | NETLINK_GENERIC) {
+    if !matches!(
+        protocol,
+        NETLINK_ROUTE | NETLINK_SOCK_DIAG | NETLINK_GENERIC
+    ) {
         return Err(EPROTONOSUPPORT);
     }
     let namespace = Arc::clone(&c.group.namespaces(c.tid).net);
@@ -385,6 +404,8 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         opener_admin,
         opener_pid: c.pid_space().number(c.process.pid),
         opener_uid: c.shown_uid(credentials.uid),
+        opener_user: credentials.user.clone(),
+        unix: c.unix_names(),
         hub: Arc::clone(&c.files.readiness),
         flags: AtomicU32::new(2 | (kind & NONBLOCK)),
         inode: crate::files::anonymous_inode(),
@@ -427,14 +448,14 @@ impl NetlinkSocket {
     }
     /// The groups its protocol has (`ngroups`).
     fn groups(&self) -> u32 {
-        if self.protocol == NETLINK_GENERIC {
-            generic::GROUPS
-        } else {
-            GROUPS
+        match self.protocol {
+            NETLINK_GENERIC => generic::GROUPS,
+            NETLINK_SOCK_DIAG => diag::GROUPS,
+            _ => GROUPS,
         }
     }
     /// The groups of `mask` only `CAP_NET_ADMIN` may join: none of
-    /// `NETLINK_GENERIC`'s.
+    /// `NETLINK_GENERIC`'s or `NETLINK_SOCK_DIAG`'s.
     fn privileged(&self, mask: u64) -> bool {
         self.protocol == NETLINK_ROUTE && mask & u64::from(PRIVILEGED_GROUPS) != 0
     }
@@ -631,10 +652,10 @@ impl NetlinkSocket {
                 Ok(false)
             } else {
                 let mut told = Vec::new();
-                let result = if self.protocol == NETLINK_GENERIC {
-                    self.generic(s, &header, &message[16..], port)
-                } else {
-                    self.route(s, &header, &message[16..], port, sender, &mut told)
+                let result = match self.protocol {
+                    NETLINK_GENERIC => self.generic(s, &header, &message[16..], port),
+                    NETLINK_SOCK_DIAG => self.diag(s, &header, &message[16..], port),
+                    _ => self.route(s, &header, &message[16..], port, sender, &mut told),
                 };
                 // This socket hears of what it changed as it happens, before
                 // its acknowledgement; the others once it is unlocked.
@@ -871,12 +892,29 @@ impl NetlinkSocket {
             s.queue.pop_front();
             s.queued -= got.1;
         }
-        if s.queued <= usize::try_from(s.receive_buffer / 2).unwrap_or(0)
-            && let Some(done) = s.done.take()
-        {
-            self.deliver(&mut s, 0, 0, done);
+        s.longest_read = s.longest_read.max(buf.len()).min(MOST_DUMP_PART);
+        if s.queued <= usize::try_from(s.receive_buffer / 2).unwrap_or(0) {
+            if !s.rest.is_empty() {
+                let part = dump_part(&mut s);
+                self.deliver(&mut s, 0, 0, part);
+            } else if let Some(done) = s.done.take() {
+                self.deliver(&mut s, 0, 0, done);
+            }
         }
         Ok(got)
+    }
+    /// Begins a dump of `messages`, as `netlink_dump_start`: the first
+    /// part goes now, the rest as receives make room, then `done`, or
+    /// `done` alone when there is nothing to dump.
+    fn start_dump(&self, s: &mut State, messages: Vec<Vec<u8>>, done: Vec<u8>) {
+        if messages.is_empty() {
+            self.deliver(s, 0, 0, done);
+            return;
+        }
+        s.rest = messages.into();
+        let part = dump_part(s);
+        self.deliver(s, 0, 0, part);
+        s.done = Some(done);
     }
 }
 
@@ -963,6 +1001,25 @@ impl FileHandle for NetlinkSocket {
     }
 }
 
+/// The least and the most one part of a dump takes: a page's worth
+/// (`NLMSG_GOODSIZE`) and 32 KiB, each less the `skb_shared_info` x86-64
+/// Linux takes of it (`SKB_WITH_OVERHEAD`).
+const LEAST_DUMP_PART: usize = 4096 - 320;
+const MOST_DUMP_PART: usize = 32768 - 320;
+/// The next part of a dump, as `netlink_dump` fills one: as many of the
+/// messages left as its size takes, the longest receive's but no less than
+/// a page's, and at least one.
+fn dump_part(s: &mut State) -> Vec<u8> {
+    let room = s.longest_read.max(LEAST_DUMP_PART);
+    let mut part = Vec::new();
+    while let Some(next) = s.rest.front() {
+        if !part.is_empty() && part.len() + next.len() > room {
+            break;
+        }
+        part.extend(s.rest.pop_front().unwrap_or_default());
+    }
+    part
+}
 /// A message's `nlmsghdr`.
 struct Header {
     len: u32,
@@ -2179,6 +2236,24 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dumps_go_in_parts_as_large_as_the_longest_receive() {
+        let mut s = State {
+            rest: (0..12).map(|_| vec![0; 1000]).collect(),
+            ..State::default()
+        };
+        // A page's worth first, then what the longest receive takes.
+        assert_eq!(dump_part(&mut s).len(), 3000);
+        s.longest_read = 8000;
+        assert_eq!(dump_part(&mut s).len(), 8000);
+        assert_eq!(dump_part(&mut s).len(), 1000);
+        // One too long for a part still goes, alone.
+        s.rest = vec![vec![0; 5000], vec![0; 10]].into();
+        s.longest_read = 0;
+        assert_eq!(dump_part(&mut s).len(), 5000);
+        assert_eq!(dump_part(&mut s).len(), 10);
+        assert!(s.rest.is_empty());
+    }
     const RT_TABLE_LOCAL: u8 = 255;
     const RTPROT_KERNEL: u8 = 2;
     const RT_SCOPE_LINK: u8 = 253;

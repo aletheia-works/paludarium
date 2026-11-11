@@ -460,9 +460,6 @@ pub(super) fn vmsplice(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(Errno::EBADF);
     }
     let segments = iovecs_checked(c, a[1], a[2], |_, _| Ok(()))?;
-    for &(base, length) in &segments {
-        crate::sockets::access_ok(base, length)?;
-    }
     if segments.iter().all(|&(_, length)| length == 0) {
         return Ok(0);
     }

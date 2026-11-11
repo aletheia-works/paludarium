@@ -40,7 +40,16 @@ pub(crate) struct PageCaches {
     writes: Mutex<HashMap<Key, i64>>,
     /// The machine's inotify watches, which its files' changes are told to.
     pub(crate) notify: Arc<crate::inotify::Notifier>,
+    /// The open descriptions of the machine's files (each a
+    /// [`CoherentFile`], by its handle), which keep a removed file there
+    /// for inotify until the last is closed, as Linux's dentry keeps it.
+    opens: Mutex<HashMap<usize, Open>>,
 }
+
+/// An open description in [`PageCaches`]' list: its file's handle, where
+/// its device comes from, and its file's key once a look found it, which
+/// its close uses even if the file cannot be looked at then.
+type Open = (Weak<dyn FileHandle>, Device, OnceLock<Key>);
 
 /// One count of [`PageCaches`]' `writes`, given back when dropped: write
 /// access a description holds (Linux's `get_write_access`), or the denial
@@ -68,6 +77,19 @@ impl Drop for WriteAccess {
 }
 
 impl PageCaches {
+    /// Whether a description of file `key` is open.
+    fn held(&self, key: Key) -> bool {
+        let opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
+        opens.values().any(|(file, device, found)| {
+            if let Some(&known) = found.get() {
+                return known == key;
+            }
+            let Some(stat) = file.upgrade().and_then(|file| file.stat().ok()) else {
+                return false;
+            };
+            *found.get_or_init(|| (device.number(), stat.inode)) == key
+        })
+    }
     /// The cache of `key`, made now, with the file's `size`, if the file has
     /// none.
     pub(crate) fn cache(
@@ -391,6 +413,20 @@ enum Device {
     /// A device of its own (a memfd's).
     Fixed(u64),
 }
+impl Device {
+    fn number(&self) -> u64 {
+        match self {
+            Device::Mount(fs, path) => mount_device(&fs.mounts(), path),
+            Device::Fixed(device) => *device,
+        }
+    }
+    fn copy(&self) -> Device {
+        match self {
+            Device::Mount(fs, path) => Device::Mount(Arc::clone(fs), path.clone()),
+            Device::Fixed(device) => Device::Fixed(*device),
+        }
+    }
+}
 
 pub(crate) use paludarium_vfs::mount_device;
 
@@ -419,6 +455,28 @@ impl Drop for CoherentFile {
             } else {
                 crate::inotify::CLOSE_NOWRITE
             });
+        }
+        // `__fput` lets go of the dentry after `fsnotify_close`: a file
+        // removed meanwhile ends with its last description.
+        let caches = &self.caches;
+        let id = Arc::as_ptr(&self.inner).cast::<()>().addr();
+        let listed = caches
+            .opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+        if let Some((_, _, found)) = listed
+            && caches.notify.waiting()
+        {
+            let key = found.get().copied().or_else(|| {
+                let stat = self.inner.stat().ok()?;
+                Some((self.device.number(), stat.inode))
+            });
+            if let Some(key) = key
+                && !caches.held(key)
+            {
+                caches.notify.last_closed(key);
+            }
         }
     }
 }
@@ -473,6 +531,19 @@ impl CoherentFile {
     /// This handle, as the guest's own open with `flags` makes it: its
     /// watches hear `IN_OPEN` (`fsnotify_open`), and will hear its close.
     fn opened(mut self, flags: u32) -> Self {
+        let id = Arc::as_ptr(&self.inner).cast::<()>().addr();
+        self.caches
+            .opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                id,
+                (
+                    Arc::downgrade(&self.inner),
+                    self.device.copy(),
+                    OnceLock::new(),
+                ),
+            );
         if flags & O_PATH == 0 && crate::inotify::reported_open() {
             self.opened = Some(flags & 3 != 0);
             self.event(crate::inotify::OPEN);
@@ -526,10 +597,7 @@ impl FileHandle for CoherentFile {
         let file = CoherentFile {
             inner: self.inner.reopen(flags)?,
             caches: Arc::clone(&self.caches),
-            device: match &self.device {
-                Device::Mount(fs, path) => Device::Mount(Arc::clone(fs), path.clone()),
-                Device::Fixed(device) => Device::Fixed(*device),
-            },
+            device: self.device.copy(),
             key: self
                 .key
                 .get()
@@ -758,7 +826,7 @@ impl HostFs for CoherentFs {
         let removed = notify.before_removal(&*self.inner, path);
         self.inner.unlink(path, directory)?;
         if let Some(removed) = removed {
-            notify.unlinked(&removed, directory);
+            notify.unlinked(&removed, directory, &|key| self.caches.held(key));
         }
         Ok(())
     }
@@ -780,7 +848,7 @@ impl HostFs for CoherentFs {
         let moved = notify.before_rename(&*self.inner, old, new);
         self.inner.rename(old, new)?;
         if let Some(moved) = moved {
-            notify.renamed(&moved, 0);
+            notify.renamed(&moved, 0, &|key| self.caches.held(key));
         }
         Ok(())
     }
@@ -789,7 +857,7 @@ impl HostFs for CoherentFs {
         let moved = notify.before_rename(&*self.inner, old, new);
         self.inner.rename_with(old, new, flags)?;
         if let Some(moved) = moved {
-            notify.renamed(&moved, flags);
+            notify.renamed(&moved, flags, &|key| self.caches.held(key));
         }
         Ok(())
     }

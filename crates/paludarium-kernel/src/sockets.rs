@@ -81,6 +81,9 @@ impl Attributes {
             ..FileStat::default()
         }
     }
+    fn uid(&self) -> u32 {
+        self.lock().uid
+    }
     fn set_mode(&self, mode: u32) {
         let mut a = self.lock();
         a.mode = (a.mode & 0o170000) | (mode & 0o7777);
@@ -922,11 +925,12 @@ pub(crate) fn message_header(
     }
     // recvmsg sees that its buffers can be written before it takes the data,
     // which a failed copy would leave in place. sendmsg's are only checked as
-    // access_ok does, as they are copied after the address is checked.
+    // access_ok does, as they are copied after the address is checked: that
+    // check is iovecs_checked's own, so the closure does nothing more.
     let iov = if write {
         crate::files::iovecs(c, word(16), word(24), true)?
     } else {
-        crate::files::iovecs_checked(c, word(16), word(24), access_ok)?
+        crate::files::iovecs_checked(c, word(16), word(24), |_, _| Ok(()))?
     };
     Ok(MessageHeader {
         name: (name != 0 && name_len != 0).then_some((name, name_len)),
@@ -1202,7 +1206,12 @@ pub(crate) fn user_buffer(at: u64, len: u64) -> Result<usize, Errno> {
 /// Linux's `access_ok`: EFAULT for `len` bytes at `at` that reach past the
 /// user half.
 pub(crate) fn access_ok(at: u64, len: usize) -> Result<(), Errno> {
-    if at > TASK_SIZE_MAX.saturating_sub(len as u64) {
+    access_ok_u64(at, len as u64)
+}
+/// [`access_ok`] for a length that may not fit a `usize` (WebAssembly's 32
+/// bits), such as an iovec's before it is cut.
+pub(crate) fn access_ok_u64(at: u64, len: u64) -> Result<(), Errno> {
+    if at > TASK_SIZE_MAX.saturating_sub(len) {
         return Err(Errno::EFAULT);
     }
     Ok(())
@@ -2324,6 +2333,13 @@ fn passes(side: &Side) -> bool {
 }
 #[derive(Default)]
 struct Side {
+    /// The inode of the end on this side, which the other end's peer is
+    /// (`UNIX_DIAG_PEER`).
+    inode: u64,
+    /// An AF_UNIX connection a listener has not accepted yet: the end on
+    /// this side is an embryo, a socket with no inode of its own yet, as
+    /// Linux's `sk_ino` is 0 until `accept` grafts it.
+    embryo: bool,
     bytes: VecDeque<u8>,
     /// An AF_UNIX client whose connection a listener closed before it was
     /// accepted: its next read is `ECONNRESET` (`unix_release_sock` sets
@@ -2788,6 +2804,71 @@ impl SocketPairEnd {
             .bytes
             .len()
     }
+    /// The inode of this end's socket.
+    pub(crate) fn inode(&self) -> u64 {
+        self.inode
+    }
+    /// The owner of this end's socket, as Linux's `sk_uid` follows the
+    /// socket file's.
+    pub(crate) fn owner(&self) -> u32 {
+        self.attributes.uid()
+    }
+    /// Whether this end is an AF_UNIX connection a listener has not
+    /// accepted yet; [`Self::set_embryo`] says it is, or no longer.
+    pub(crate) fn embryo(&self) -> bool {
+        self.lock_sides()[self.side].embryo
+    }
+    pub(crate) fn set_embryo(&self, embryo: bool) {
+        self.lock_sides()[self.side].embryo = embryo;
+    }
+    /// The inode of the other end, the peer of a stream or packet socket:
+    /// 0 once it has closed or while it waits to be accepted, as Linux's
+    /// `sock_i_ino` of an orphaned socket or an embryo.
+    pub(crate) fn peer_inode(&self) -> u64 {
+        let sides = self.lock_sides();
+        let peer = &sides[1 - self.side];
+        if peer.closed || peer.embryo {
+            0
+        } else {
+            peer.inode
+        }
+    }
+    /// This end's `sk_shutdown`, as Linux's `unix_shutdown` and
+    /// `unix_release_sock` set it: what it shut down (`RCV_SHUTDOWN` 1,
+    /// `SEND_SHUTDOWN` 2), and for a stream or packet socket with a peer
+    /// (`connected`) what the peer shut down the other way, or both once
+    /// it has closed.
+    pub(crate) fn shutdown_mask(&self, connected: bool) -> u8 {
+        let sides = self.lock_sides();
+        let own = &sides[self.side];
+        let mut mask = u8::from(own.read_shutdown) | u8::from(own.write_shutdown) << 1;
+        if connected && self.pair.kind != SOCK_DGRAM {
+            let peer = &sides[1 - self.side];
+            if peer.closed {
+                mask = 3;
+            }
+            mask |= u8::from(peer.write_shutdown) | u8::from(peer.read_shutdown) << 1;
+        }
+        mask
+    }
+    /// What waits to be read on this end, as Linux's `unix_inq_len` counts
+    /// it (a datagram socket's first datagram), and what it sent that
+    /// waits takes of its send buffer (`unix_outq_len`).
+    pub(crate) fn queue_lengths(&self) -> (usize, usize) {
+        let sides = self.lock_sides();
+        let own = &sides[self.side];
+        let incoming = if self.pair.kind == SOCK_DGRAM {
+            own.writes.front().map_or(0, |write| write.len)
+        } else {
+            own.bytes.len()
+        };
+        (incoming, self.sent.load(Ordering::SeqCst))
+    }
+    /// `SO_RCVBUF` and `SO_SNDBUF`, as Linux keeps them, doubled.
+    pub(crate) fn buffers(&self) -> (i32, i32) {
+        let options = self.options.lock().unwrap_or_else(PoisonError::into_inner);
+        (options.receive_buffer, options.send_buffer)
+    }
     /// Only a SOCK_STREAM socket raises SIGPIPE with EPIPE, as on Linux.
     pub(crate) fn raises_sigpipe(&self) -> bool {
         self.pair.kind == SOCK_STREAM
@@ -2799,6 +2880,7 @@ impl SocketPairEnd {
         if !matches!(kind & 0xf, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
             return Err(Errno(94)); // ESOCKTNOSUPPORT
         }
+        let inodes: [u64; 2] = std::array::from_fn(|_| crate::files::anonymous_inode());
         let pair = Arc::new(Pair {
             peers: Mutex::new([None; 2]),
             sent: [Arc::default(), Arc::default()],
@@ -2807,7 +2889,8 @@ impl SocketPairEnd {
             window: AtomicUsize::new(SEND_WINDOW),
             pipe: AtomicBool::new(false),
             clock: std::sync::OnceLock::new(),
-            sides: Mutex::new(std::array::from_fn(|_| Side {
+            sides: Mutex::new(std::array::from_fn(|side| Side {
+                inode: inodes[side],
                 output_epoch: 1,
                 peek_offset: -1,
                 ..Side::default()
@@ -2819,7 +2902,7 @@ impl SocketPairEnd {
                 pair: Arc::clone(&pair),
                 side,
                 flags: AtomicU32::new(2 | kind & NONBLOCK),
-                inode: crate::files::anonymous_inode(),
+                inode: inodes[side],
                 attributes: Attributes::new(0o140777),
                 options: Mutex::default(),
                 unix: std::sync::OnceLock::new(),

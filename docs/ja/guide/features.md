@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
@@ -58,9 +58,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
-| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE` と `NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
+- `readv`・`writev` とその位置指定版、`vmsplice`、`sendmsg`、`recvmsg` の `struct iovec` の配列は、
+  Linux の `import_iovec` と同じ順で確かめます。要素がなければ何も動かさず、1024 を超えれば
+  `EINVAL`、配列がユーザー空間をはみ出せば `EFAULT` です。次に、どのバッファーを見るよりも先に
+  全要素を読み、負の長さは `EINVAL` です。その後で各バッファーがユーザー空間に収まるかを確かめ
+  （`EFAULT`）、要素が複数なら長さ全体で、1 つなら `MAX_RW_COUNT` までで確かめます。長さは、
+  合計が `MAX_RW_COUNT` を超えないように切り詰めます。
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
   `ESPIPE` を返します。`O_APPEND` のファイルでは、Linux と同じく位置を指定した書き込みも
   末尾に足します。
@@ -192,7 +198,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   などの iovec の数は、Linux が `unsigned` として渡すので下位 32 ビットだけを読みます。システムコールの番号も、
   Linux の `do_syscall_64` が `int` で受け取るのと同じく `rax` の下位 32 ビットから読み、
   負の番号は `ENOSYS` です。
-- `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET` を扱います。ワードは Linux の
+- `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET`・`REQUEUE`・`CMP_REQUEUE` を
+  扱います。ワードは Linux の
   `get_futex_key` と同じように見分けます。共有マッピング（共有の無名メモリかファイルのもの）では、
   shared の操作はそのメモリとその中のオフセットを指すので、wake はそのメモリをマップしている
   どのプロセスの待ち手にも、どこにマップしていても届きます。それ以外のワードと private の操作は、
@@ -200,16 +207,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プロセス間で共有する mutex とセマフォ（Python の `multiprocessing`）も、持ち主が終わった
   robust futex の wake も、こうして動きます。wake は、0 以下の数を頼まれても待ち手を 1 つ起こします
   （Linux は比べる前に数えるからです）。private の wake はワードのページを見ません。Linux の
-  ナノ秒に収まらない長さのタイムアウトは `KTIME_MAX` まで待ちます。
+  ナノ秒に収まらない長さのタイムアウトは `KTIME_MAX` まで待ちます。requeue は、`val` 個の待ち手を
+  起こし、さらに最大 `val2` 個（Linux と同じくタイムアウトの引数から読みます）を `uaddr2` の
+  キューに移して、扱った数を返します。負の数は `EINVAL` です。`CMP_REQUEUE` は、両方のワードを
+  確かめた後で、1 つめのワードが `val3` でなければ `EAGAIN` を返します。待ち手はビットセットに
+  かかわらず、来た順に扱います。同じワードへの requeue は、Linux が 1 つのハッシュバケットの中で
+  そうするのと同じく、待ち手を動かさず、それぞれ 1 回だけ数えます。
 - futex2 の呼び出しは、32 ビットのワードと `FUTEX2_PRIVATE`・`FUTEX2_NUMA`・`FUTEX2_MPOL` を
   Linux と同じ順に確かめて受け付けます。ほかの大きさやフラグは `EINVAL` です。`futex_wake` と
   `futex_wait` は、`FUTEX_WAKE_BITSET` と `FUTEX_WAIT_BITSET` に、`CLOCK_REALTIME` か
   `CLOCK_MONOTONIC` の絶対時刻のタイムアウトを付けたものです。数 0 の `futex_wake` は何も
   起こしません。`futex_waitv` は最大 128 個のワードを一度に待ち、起こされたワードの添字を返します。
   値を比べる前にすべてのワードのアドレスを確かめ、その後で最初に違ったワードで `EAGAIN` を
-  返します。`FUTEX2_NUMA` のワードの後ろにはノードが続き、ただ 1 つのノード 0 か、`-1` で
-  なければなりません。`-1` は、Linux がスレッドのノードを書くのと同じく 0 になります。シグナルで
-  中断すると `ERESTARTSYS` になるので、停止の後と `SA_RESTART` のハンドラの後にやり直します。
+  返します。`futex_requeue` は、`struct futex_waitv` の 2 つのワードに対する `CMP_REQUEUE` で、
+  6.12 より後のカーネルと同じく、2 つのフラグは同じでなければなりません。比べるのは 1 つめの
+  値です。`FUTEX2_NUMA` のワードの後ろにはノードが続き、ただ 1 つのノード 0 か、`-1` で
+  なければなりません。`-1` は、Linux がスレッドのノードを書くのと同じく 0 になります。待ちを
+  シグナルで中断すると `ERESTARTSYS` になるので、停止の後と `SA_RESTART` のハンドラの後にやり直します。
 - `set_robust_list` と `get_robust_list` は、スレッドごとの robust futex のリストを
   持ちます。glibc と musl の robust mutex に必要です。スレッドが終わるときと `execve`
   のときに、Linux の `exit_robust_list` と同じようにリストをたどります。スレッドが
@@ -1034,6 +1048,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - **グループ:** ソケットのグループは 64 で（0 とそれを超えるものは `EINVAL`）、誰でも
     入れます。`nlctrl` の `notify` はグループ 16 で、ファミリーが増えも減りもしないので
     何も届きません。
+- ソケット診断の netlink ソケット（プロトコル `NETLINK_SOCK_DIAG`）は、Linux の
+  `sock_diag` と `unix_diag` と同じく、作られたネットワーク名前空間の AF_UNIX のソケットを
+  伝えます。そのため `ss -x` はそれらを挙げます。
+  - **リクエスト:** AF_UNIX への `SOCK_DIAG_BY_FAMILY` は、状態（`TCP_ESTABLISHED`、
+    `TCP_CLOSE`、`TCP_LISTEN`）が `udiag_states` にあるソケットを、Linux の `netlink_dump` と
+    同じ大きさに分けてダンプします（1 ページ分、あるいはそれまでで一番長い受信の分で
+    32 KiB まで。次の部分は受信が空きを作ったときに送ります）。`NLMSG_DONE` はそのあとです。ダンプでなければ、inode が `udiag_ino` で（0 は `EINVAL`、ない
+    ものは `ENOENT`）、cookie が合う（違えば `ESTALE`、すべて 1 ならどれにも合います）
+    ソケットに答えます。リスナーがまだ accept していない接続は inode をまだ持たないので
+    挙げません。ほかのファミリーにはハンドラーがなく（`ENOENT`）、`AF_MAX` を超える
+    ファミリーや短すぎるリクエストは `EINVAL`、`SOCK_DESTROY` と `TCPDIAG_GETSOCK` は
+    `EOPNOTSUPP`、ほかの型は `EINVAL` です。ダンプの途中のもう 1 つのダンプは `EBUSY` です。
+  - **伝えること:** ソケットごとに、型、状態、inode、cookie を、それから `udiag_show` が
+    求めるものを `sk_diag_fill` の順に伝えます。名前、ソケットファイルの inode とデバイス、
+    peer の inode（peer が閉じたあとと、accept を待つあいだは 0）、リスナーを待つ
+    クライアント、キュー（読まれるのを待つものと送って待っているもの、リスナーなら待つ
+    接続とバックログ）、メモリ（`SO_RCVBUF`、`SO_SNDBUF`、送って待っているもの）です。
+    そのあとに shutdown を必ず伝えます（ストリームとパケットのソケットでは peer が逆向きに
+    閉じたものも含み、peer が閉じたあとは両方）。最後に、所有者を、netlink ソケットを
+    作った側のユーザー名前空間での値で伝えます。ほかのソケットが connect した
+    データグラムのソケットは、Linux と同じく `TCP_ESTABLISHED` です。
+  - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
+    グループは 32 です。誰でも入れますが、何も届きません。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、
@@ -1496,10 +1533,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じ順で届きます。新しいファイル、ディレクトリ、シンボリックリンク、FIFO、ソケット、
   リンクは `IN_CREATE` です（リンクではリンクされたファイルの `IN_ATTRIB` の後）。
   消したものは `IN_DELETE` で、その前にファイルの `IN_ATTRIB`、最後のリンクか
-  ディレクトリならそのファイルの `IN_DELETE_SELF` と `IN_IGNORED` が来ます。名前の
+  ディレクトリならそのファイルの `IN_DELETE_SELF` と `IN_IGNORED` が来ます。これは、
+  そのファイルの開いている記述があれば、Linux の dentry と同じく最後に閉じるまで
+  待ちます（マッピングは解除されるまで記述を持ちます）。名前の
   変更は同じクッキーの `IN_MOVED_FROM` と `IN_MOVED_TO` で、続いて置き換えられた
   ファイルの `IN_ATTRIB`、動いたファイルの `IN_MOVE_SELF`、置き換えられたファイルの
-  `IN_DELETE_SELF` です（`RENAME_EXCHANGE` では 2 回。同じファイルの別のリンクへの
+  `IN_DELETE_SELF` で、同じように待ちます（`RENAME_EXCHANGE` では 2 回。同じファイルの別のリンクへの
   変更では何もありません）。モード、所有者（どちらも指定しない `chown` では何も
   ありません）、両方の時刻、拡張属性を変えると `IN_ATTRIB`、アクセス時刻だけなら
   `IN_ACCESS`、更新時刻だけなら `IN_MODIFY`、切り詰めは `IN_MODIFY` です（通常の

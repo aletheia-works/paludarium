@@ -38,6 +38,7 @@
 #include <sys/un.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/times.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
@@ -1715,6 +1716,160 @@ static void genl_show(int fd, unsigned port, const char *label, unsigned short t
     memcpy(request + 2, &reserved, 2);
     memcpy(request + 4, attrs, len);
     genl_read(fd, port, label, nl_send(fd, type, flags, request, 4 + len), past_errors);
+}
+/* The sock-diag case's AF_UNIX sockets: a label, the descriptor and its
+   inode. */
+struct diag_socket {
+    const char *label;
+    int fd;
+    unsigned ino;
+};
+static struct diag_socket diag_sockets[24];
+static int diag_count;
+static char diag_path[128];
+static void diag_add(const char *label, int fd) {
+    struct stat st;
+    fstat(fd, &st);
+    diag_sockets[diag_count++] = (struct diag_socket){label, fd, (unsigned)st.st_ino};
+}
+/* The label of inode `ino`, "0" for 0, "?" for a socket not made here. */
+static const char *diag_label(unsigned ino) {
+    if (ino == 0) return "0";
+    for (int i = 0; i < diag_count; i++)
+        if (diag_sockets[i].ino == ino) return diag_sockets[i].label;
+    return "?";
+}
+/* A `unix_diag_msg` and its attributes, as one line: inodes by label, the
+   name as text (a path as <path>, an autobound name by its length), the
+   socket file as whether it is the bound path's, and the rest in hex. */
+static void diag_print(const char *label, const unsigned char *body, int len) {
+    unsigned ino;
+    memcpy(&ino, body + 4, 4);
+    printf("%s: %s family=%u type=%u state=%u", label, diag_label(ino), body[0], body[1], body[2]);
+    const unsigned char *at = body + 16;
+    len -= 16;
+    while (len >= 4) {
+        unsigned short alen, type;
+        memcpy(&alen, at, 2);
+        memcpy(&type, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        int n = alen - 4;
+        const unsigned char *v = at + 4;
+        unsigned word = 0;
+        if (n >= 4) memcpy(&word, v, 4);
+        switch (type) {
+        case 0:
+            if (n > 0 && v[0] == '/') printf(" name=%s", n == (int)strlen(diag_path) + 1 && !memcmp(v, diag_path, n) ? "<path>" : "<other>");
+            else if (n == 6 && v[0] == 0) printf(" name=<auto>");
+            else {
+                printf(" name=");
+                for (int i = 0; i < n; i++) printf(v[i] >= 32 && v[i] < 127 ? "%c" : "\\%o", v[i]);
+            }
+            break;
+        case 1: {
+            struct stat st;
+            unsigned dev;
+            memcpy(&dev, v + 4, 4);
+            stat(diag_path, &st);
+            unsigned kdev = (unsigned)(major(st.st_dev) << 20 | minor(st.st_dev));
+            printf(" vfs=ino:%d,dev:%d", word == (unsigned)st.st_ino, dev == kdev);
+            break;
+        }
+        case 2: printf(" peer=%s", diag_label(word)); break;
+        case 3:
+            printf(" icons=");
+            for (int i = 0; i + 4 <= n; i += 4) {
+                memcpy(&word, v + i, 4);
+                printf("%s%s", i ? "," : "", diag_label(word));
+            }
+            break;
+        case 5: {
+            /* SO_RCVBUF and SO_SNDBUF as the socket's own getsockopt
+               gives them, as their defaults are the host's sysctls. */
+            int fd = -1, buffers[2] = {0, 0};
+            for (int i = 0; i < diag_count; i++)
+                if (diag_sockets[i].ino == ino) fd = diag_sockets[i].fd;
+            socklen_t blen = sizeof buffers[0];
+            getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffers[0], &blen);
+            blen = sizeof buffers[1];
+            getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffers[1], &blen);
+            printf(" 5=");
+            for (int i = 0; i + 4 <= n; i += 4) {
+                memcpy(&word, v + i, 4);
+                if (i == 4 && (int)word == buffers[0]) printf(",rcvbuf");
+                else if (i == 12 && (int)word == buffers[1]) printf(",sndbuf");
+                else printf("%s%u", i ? "," : "", word);
+            }
+            break;
+        }
+        case 7: printf(" uid=%u", word); break;
+        default:
+            printf(" %u=", type);
+            for (int i = 0; i + 4 <= n; i += 4) {
+                memcpy(&word, v + i, 4);
+                printf("%s%u", i ? "," : "", word);
+            }
+            if (n < 4)
+                for (int i = 0; i < n; i++) printf("%02x", v[i]);
+        }
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+    printf("\n");
+}
+/* Sends a `unix_diag_req` (`family` AF_UNIX unless another) of `type` and
+   `flags` on `fd`, and prints the answer: a dump's messages sorted by the
+   order the sockets were made in, those of sockets not made here counted,
+   or the error. */
+static void diag_ask(int fd, const char *label, unsigned short type, unsigned short flags, unsigned char family,
+                     unsigned states, unsigned ino, unsigned show, const unsigned cookie[2], size_t len) {
+    unsigned char request[24] = {family};
+    memcpy(request + 4, &states, 4);
+    memcpy(request + 8, &ino, 4);
+    memcpy(request + 12, &show, 4);
+    memcpy(request + 16, cookie, 8);
+    long seq = nl_send(fd, type, flags, request, len);
+    static unsigned char found[24][512];
+    int found_len[24] = {0}, unknown = 0, done = 0;
+    while (!done) {
+        static char buf[32768];
+        long n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0) break;
+        for (char *at = buf; at + sizeof(struct nl_header) <= buf + n;) {
+            struct nl_header *h = (void *)at;
+            if (h->len < sizeof *h || at + h->len > buf + n) break;
+            unsigned char *body = (void *)(h + 1);
+            int body_len = h->len - sizeof *h;
+            at += (h->len + 3) & ~3;
+            if (h->type == 2 || h->type == 3) {
+                int error;
+                memcpy(&error, body, 4);
+                printf("%s: type=%u flags=%#x seq=%d error=%d\n", label, h->type, h->flags, h->seq == seq, error);
+                done = 1;
+                break;
+            }
+            unsigned got;
+            memcpy(&got, body + 4, 4);
+            int i = 0;
+            while (i < diag_count && diag_sockets[i].ino != got) i++;
+            if (i == diag_count || body_len > 512) {
+                unknown++;
+                continue;
+            }
+            memcpy(found[i], body, body_len);
+            found_len[i] = body_len;
+            if (!(flags & NL_F_DUMP)) {
+                printf("%s: flags=%#x seq=%d\n", label, h->flags, h->seq == seq);
+                diag_print(label, body, body_len);
+                found_len[i] = 0;
+                if (!(flags & NL_F_ACK)) return;
+            }
+        }
+    }
+    for (int i = 0; i < diag_count; i++)
+        if (found_len[i]) diag_print(label, found[i], found_len[i]);
+    printf("%s: unknown=%d\n", label, unknown);
 }
 /* Binds a UDP socket of `family` to `text`, and prints the result. */
 static void addresses_bind(const char *text, const char *when) {
@@ -5935,6 +6090,86 @@ static int futex2_case(void) {
            f2_wake((void *)numa, 1, 1, F2_U32_PRIVATE | 8));
     return 0;
 }
+/* FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and futex2's futex_requeue, as Linux's
+ * kernel/futex/requeue.c. */
+static _Alignas(8) volatile uint32_t rq_words[4];
+static long rq_results[4];
+static void *rq_old_waiter(void *arg) {
+    long i = (long)arg;
+    rq_results[i] = f2_errno(syscall(SYS_futex, &rq_words[0], 128, 0, NULL, NULL, 0));
+    return NULL;
+}
+static void *rq_new_waiter(void *arg) {
+    (void)arg;
+    rq_results[3] = f2_wait((void *)&rq_words[2], 0, 1, F2_U32_PRIVATE, NULL, 0);
+    return NULL;
+}
+static long rq_old(long op, volatile uint32_t *from, long wake, long requeue, volatile uint32_t *to,
+                   long cmp) {
+    return f2_errno(syscall(SYS_futex, from, op, wake, (void *)requeue, to, cmp));
+}
+static int futex_requeue_case(void) {
+    volatile uint32_t *a = &rq_words[0], *b = &rq_words[1];
+    printf("requeue negative-wake=%ld negative-requeue=%ld high-val2=%ld misaligned=%ld "
+           "mismatch=%ld high-val3=%ld realtime=%ld\n",
+           rq_old(3 | 128, a, -1, 0, b, 0), rq_old(3 | 128, a, 1, 0xffffffffL, b, 0),
+           rq_old(3 | 128, a, 1, 1L << 32, b, 0),
+           rq_old(3 | 128, a, 1, 1, (volatile uint32_t *)((char *)b + 2), 0),
+           rq_old(4 | 128, a, 1, 1, b, 1), rq_old(4 | 128, a, 1, 1, b, 1L << 32),
+           rq_old(4 | 128 | 256, a, 1, 1, b, 0));
+    pthread_t t[3];
+    for (long i = 0; i < 3; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
+    long moved = 0;
+    while (moved < 3) {
+        long r = rq_old(4 | 128, a, 0, INT_MAX, b, 0);
+        if (r < 0) return 80;
+        moved += r;
+        if (moved < 3) sched_yield();
+    }
+    long woke_b = f2_errno(syscall(SYS_futex, b, 1 | 128, 1, NULL, NULL, 0));
+    long back = rq_old(4 | 128, b, 1, 1, a, 0);
+    long woke_a = f2_errno(syscall(SYS_futex, a, 1 | 128, INT_MAX, NULL, NULL, 0));
+    long left_b = f2_errno(syscall(SYS_futex, b, 1 | 128, INT_MAX, NULL, NULL, 0));
+    for (int i = 0; i < 3; i++) pthread_join(t[i], NULL);
+    printf("requeue moved=%ld woke-b=%ld back=%ld woke-a=%ld left-b=%ld results=%ld,%ld,%ld\n",
+           moved, woke_b, back, woke_a, left_b, rq_results[0], rq_results[1], rq_results[2]);
+    /* Onto its own word: Linux's walk meets a moved waiter again. */
+    for (long i = 0; i < 2; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
+    for (moved = 0; moved < 2;) {
+        long r = rq_old(4 | 128, a, 0, INT_MAX, b, 0);
+        if (r < 0) return 81;
+        moved += r;
+        if (moved < 2) sched_yield();
+    }
+    long same = rq_old(4 | 128, b, 0, 3, b, 0);
+    long alone_woke = f2_errno(syscall(SYS_futex, b, 1 | 128, 1, NULL, NULL, 0));
+    long alone = rq_old(4 | 128, b, 0, 5, b, 0);
+    long rest = f2_errno(syscall(SYS_futex, b, 1 | 128, INT_MAX, NULL, NULL, 0));
+    for (int i = 0; i < 2; i++) pthread_join(t[i], NULL);
+    printf("requeue same-word=%ld woke=%ld alone=%ld rest=%ld\n", same, alone_woke, alone, rest);
+
+    struct f2_waitv w[2] = {{0, (uintptr_t)&rq_words[2], F2_U32_PRIVATE, 0},
+                            {0, (uintptr_t)&rq_words[3], F2_U32_PRIVATE, 0}};
+    long flags = f2_errno(syscall(456, w, 1L, 1L, 1L));
+    long null = f2_errno(syscall(456, NULL, 0L, 1L, 1L));
+    long negative = f2_errno(syscall(456, w, 0L, -1L, 1L));
+    w[1].flags = 2;
+    long differ = f2_errno(syscall(456, w, 0L, 1L, 1L));
+    w[1].flags = F2_U32_PRIVATE;
+    w[0].val = 1;
+    long mismatch = f2_errno(syscall(456, w, 0L, 1L, 1L));
+    w[0].val = 0;
+    printf("futex_requeue flags=%ld null=%ld negative=%ld differ=%ld mismatch=%ld none=%ld\n", flags,
+           null, negative, differ, mismatch, f2_errno(syscall(456, w, 0L, 1L, 1L)));
+    pthread_t n;
+    pthread_create(&n, NULL, rq_new_waiter, NULL);
+    long r;
+    while ((r = f2_errno(syscall(456, w, 0L, 0L, 1L))) == 0) sched_yield();
+    long woke = f2_wake((void *)&rq_words[3], 1, 1, F2_U32_PRIVATE);
+    pthread_join(n, NULL);
+    printf("futex_requeue moved=%ld woke=%ld result=%ld\n", r, woke, rq_results[3]);
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -7622,6 +7857,121 @@ int main(int argc, char **argv) {
                 _exit(0);
             }
             result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "sock-diag")) {
+        /* A child makes a network namespace with AF_UNIX sockets in each
+           state, and asks NETLINK_SOCK_DIAG of them: dumps by state, one
+           socket by its inode and cookie, and requests it refuses. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int d = socket(NL_AF_NETLINK, SOCK_RAW, 4);
+            int protocol = -1;
+            socklen_t protocol_len = sizeof protocol;
+            getsockopt(d, SOL_SOCKET, SO_PROTOCOL, &protocol, &protocol_len);
+            printf("socket: diag=%d protocol=%d\n", d >= 0, protocol);
+            char dir[] = "/tmp/paludarium-diag-XXXXXX";
+            if (!mkdtemp(dir)) return 1;
+            snprintf(diag_path, sizeof diag_path, "%s/listener", dir);
+            struct sockaddr_un at = {.sun_family = AF_UNIX};
+            strcpy(at.sun_path, diag_path);
+            int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+            bind(listener, (void *)&at, sizeof at);
+            listen(listener, 5);
+            diag_add("listener", listener);
+            int waiting = socket(AF_UNIX, SOCK_STREAM, 0), client = socket(AF_UNIX, SOCK_STREAM, 0);
+            connect(client, (void *)&at, sizeof at);
+            connect(waiting, (void *)&at, sizeof at);
+            diag_add("waiting", waiting);
+            diag_add("client", client);
+            /* The first to connect, `client`, is accepted; `waiting` is left. */
+            int accepted = accept(listener, NULL, NULL);
+            diag_add("accepted", accepted);
+            struct sockaddr_un abstract = {.sun_family = AF_UNIX};
+            memcpy(abstract.sun_path, "\0paludarium-diag", 16);
+            int named = socket(AF_UNIX, SOCK_STREAM, 0);
+            bind(named, (void *)&abstract, 2 + 16);
+            diag_add("named", named);
+            int pair[2], seq[2], closed[2];
+            socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+            diag_add("pair0", pair[0]);
+            diag_add("pair1", pair[1]);
+            write(pair[0], "hello", 5);
+            shutdown(pair[1], SHUT_WR);
+            socketpair(AF_UNIX, SOCK_SEQPACKET, 0, seq);
+            diag_add("seq0", seq[0]);
+            diag_add("seq1", seq[1]);
+            socketpair(AF_UNIX, SOCK_STREAM, 0, closed);
+            diag_add("orphan", closed[0]);
+            close(closed[1]);
+            struct sockaddr_un dgram_at = {.sun_family = AF_UNIX};
+            memcpy(dgram_at.sun_path, "\0paludarium-dgram", 17);
+            int target = socket(AF_UNIX, SOCK_DGRAM, 0), sender = socket(AF_UNIX, SOCK_DGRAM, 0);
+            bind(target, (void *)&dgram_at, 2 + 17);
+            connect(sender, (void *)&dgram_at, 2 + 17);
+            send(sender, "abc", 3, 0);
+            diag_add("target", target);
+            diag_add("sender", sender);
+            /* One that connects to `left` and then elsewhere leaves it
+               TCP_CLOSE, as it has no peer of its own. */
+            struct sockaddr_un left_at = {.sun_family = AF_UNIX};
+            memcpy(left_at.sun_path, "\0paludarium-left", 16);
+            int left = socket(AF_UNIX, SOCK_DGRAM, 0), mover = socket(AF_UNIX, SOCK_DGRAM, 0);
+            bind(left, (void *)&left_at, 2 + 16);
+            connect(mover, (void *)&left_at, 2 + 16);
+            connect(mover, (void *)&dgram_at, 2 + 17);
+            diag_add("left", left);
+            diag_add("mover", mover);
+            int lone = socket(AF_UNIX, SOCK_DGRAM, 0);
+            struct sockaddr_un family_only = {.sun_family = AF_UNIX};
+            bind(lone, (void *)&family_only, 2);
+            diag_add("auto", lone);
+            int unbound = socket(AF_UNIX, SOCK_STREAM, 0);
+            diag_add("unbound", unbound);
+            unsigned none[2] = {~0u, ~0u};
+            diag_ask(d, "all", 20, NL_F_REQUEST | NL_F_DUMP, 1, ~0u, 0, 0x7f, none, 24);
+            diag_ask(d, "bare", 20, NL_F_REQUEST | NL_F_DUMP, 1, ~0u, 0, 0, none, 24);
+            diag_ask(d, "listening", 20, NL_F_REQUEST | NL_F_DUMP, 1, 1 << 10, 0, 0, none, 24);
+            diag_ask(d, "closed", 20, NL_F_REQUEST | NL_F_DUMP, 1, 1 << 7, 0, 0, none, 24);
+            diag_ask(d, "nothing", 20, NL_F_REQUEST | NL_F_DUMP, 1, 1 << 2, 0, 0, none, 24);
+            /* One socket by its inode, with no cookie, its own and another. */
+            unsigned ino = diag_sockets[0].ino;
+            diag_ask(d, "exact", 20, NL_F_REQUEST, 1, 0, ino, 0x1f, none, 24);
+            unsigned char request[24] = {1};
+            memcpy(request + 8, &ino, 4);
+            memcpy(request + 16, none, 8);
+            nl_send(d, 20, NL_F_REQUEST, request, 24);
+            unsigned char reply[512];
+            unsigned cookie[2] = {0, 0};
+            if (recv(d, reply, sizeof reply, 0) >= 32) memcpy(cookie, reply + 16 + 8, 8);
+            diag_ask(d, "exact cookie", 20, NL_F_REQUEST | NL_F_ACK, 1, 0, ino, 0, cookie, 24);
+            cookie[0]++;
+            diag_ask(d, "exact stale", 20, NL_F_REQUEST, 1, 0, ino, 0, cookie, 24);
+            struct stat own;
+            fstat(d, &own);
+            diag_ask(d, "exact other", 20, NL_F_REQUEST, 1, 0, (unsigned)own.st_ino, 0, none, 24);
+            diag_ask(d, "exact zero", 20, NL_F_REQUEST, 1, 0, 0, 0, none, 24);
+            diag_ask(d, "short", 20, NL_F_REQUEST | NL_F_DUMP, 1, ~0u, 0, 0, none, 8);
+            diag_ask(d, "tiny", 20, NL_F_REQUEST | NL_F_DUMP, 1, ~0u, 0, 0, none, 1);
+            diag_ask(d, "past families", 20, NL_F_REQUEST | NL_F_DUMP, 46, ~0u, 0, 0, none, 24);
+            diag_ask(d, "no handler", 20, NL_F_REQUEST | NL_F_DUMP, 3, ~0u, 0, 0, none, 24);
+            diag_ask(d, "destroy", 21, NL_F_REQUEST, 1, 0, ino, 0, none, 24);
+            diag_ask(d, "other type", 22, NL_F_REQUEST, 1, 0, ino, 0, none, 24);
+            /* A second dump while one runs is EBUSY. */
+            nl_send(d, 20, NL_F_REQUEST | NL_F_DUMP, (unsigned char[24]){1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff}, 24);
+            diag_ask(d, "busy", 20, NL_F_REQUEST | NL_F_DUMP, 1, ~0u, 0, 0, none, 24);
+            diag_ask(d, "after busy", 20, NL_F_REQUEST | NL_F_DUMP, 1, 1 << 10, 0, 0, none, 24);
+            int group = 1, five = 5;
+            printf("join: one=%ld five=%ld\n", netns_result(setsockopt(d, 270, 1, &group, sizeof group)),
+                   netns_result(setsockopt(d, 270, 1, &five, sizeof five)));
+            unlink(diag_path);
+            rmdir(dir);
             fflush(stdout);
             _exit(0);
         }
@@ -17128,6 +17478,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "old-times")) return old_times_case();
     if (!strcmp(mode, "old-forms")) return old_forms_case();
     if (!strcmp(mode, "futex2")) return futex2_case();
+    if (!strcmp(mode, "futex-requeue")) return futex_requeue_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

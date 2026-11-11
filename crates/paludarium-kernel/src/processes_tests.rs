@@ -77,9 +77,16 @@ mod fd {
             syscall(&mut k, &mut t, &m, 20, [1, DATA, 1025, 0, 0, 0]),
             Errno::EINVAL.to_syscall_return()
         );
+        // A negative length is EINVAL, as import_iovec has it; a large one
+        // is only cut to MAX_RW_COUNT.
         m.write_u64(GuestAddr(DATA), DATA).unwrap();
-        m.write_u64(GuestAddr(DATA + 8), 0x80000000).unwrap();
+        m.write_u64(GuestAddr(DATA + 8), 1 << 63).unwrap();
         assert_eq!(
+            syscall(&mut k, &mut t, &m, 20, [1, DATA, 1, 0, 0, 0]),
+            Errno::EINVAL.to_syscall_return()
+        );
+        m.write_u64(GuestAddr(DATA + 8), 0x8000_0000).unwrap();
+        assert_ne!(
             syscall(&mut k, &mut t, &m, 20, [1, DATA, 1, 0, 0, 0]),
             Errno::EINVAL.to_syscall_return()
         );

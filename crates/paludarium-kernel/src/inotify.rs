@@ -16,7 +16,7 @@ use paludarium_host::{FileHandle, FileStat, HostFs};
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{FileSystem, mount_device};
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
@@ -138,6 +138,12 @@ pub(crate) struct Notifier {
     /// The watches of every instance: while there are none, a change is
     /// not looked at.
     watches: AtomicUsize,
+    /// Files whose last link went while a description of them was open:
+    /// their `IN_DELETE_SELF` waits for its last close, as Linux's waits
+    /// for the dentry's last reference.
+    pending: Mutex<HashSet<Key>>,
+    /// Whether `pending` holds any, which a close looks at first.
+    waiting: AtomicUsize,
     /// Linux's `fsnotify_sync_cookie`, which ties a rename's two events.
     cookie: AtomicU32,
     registry: Mutex<Registry>,
@@ -269,11 +275,45 @@ impl Notifier {
         }
     }
     /// A file whose last link is gone (`fsnotify_inoderemove`): its watches
-    /// hear `IN_DELETE_SELF`, then go with `IN_IGNORED`.
-    fn removed(&self, file: Found) {
+    /// hear `IN_DELETE_SELF`, then go with `IN_IGNORED`; once the last
+    /// description `held` says is open is closed ([`Self::last_closed`]).
+    fn removed(&self, file: Found, held: &dyn Fn(Key) -> bool) {
+        if held(file.key) {
+            {
+                let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                if pending.insert(file.key) {
+                    self.waiting.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            // A last close between the look and the insert saw nothing
+            // waiting: looking again after it ends the file now.
+            if !held(file.key) {
+                self.last_closed(file.key);
+            }
+            return;
+        }
+        self.gone(file.key);
+    }
+    fn gone(&self, key: Key) {
         for instance in self.instances() {
-            instance.report(file.key, DELETE_SELF, b"", 0, false);
-            instance.forget(file.key);
+            instance.report(key, DELETE_SELF, b"", 0, false);
+            instance.forget(key);
+        }
+    }
+    /// Whether a removed file waits for its last close.
+    pub(crate) fn waiting(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst) != 0
+    }
+    /// The last description of file `key` is closed: a removed file's end
+    /// comes now.
+    pub(crate) fn last_closed(&self, key: Key) {
+        let removed = {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending.remove(&key)
+        };
+        if removed {
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+            self.gone(key);
         }
     }
 
@@ -308,7 +348,7 @@ impl Notifier {
     }
     /// `unlink` and `rmdir` (`vfs_unlink`, `vfs_rmdir`): a file's link
     /// count, then the file's end if that was its last link, then the entry.
-    pub(crate) fn unlinked(&self, named: &Named, directory: bool) {
+    pub(crate) fn unlinked(&self, named: &Named, directory: bool, held: &dyn Fn(Key) -> bool) {
         let Some(file) = named.file else {
             return;
         };
@@ -316,7 +356,7 @@ impl Notifier {
             self.inode(file, ATTRIB);
         }
         if directory || file.links <= 1 {
-            self.removed(file);
+            self.removed(file, held);
         }
         self.entry(named.parent, DELETE | file.isdir(), &named.name, 0);
     }
@@ -334,7 +374,12 @@ impl Notifier {
     }
     /// `vfs_rename`'s `fsnotify_move`, twice for `RENAME_EXCHANGE`, then the
     /// end of a file it replaced, which goes as the call lets go of it.
-    pub(crate) fn renamed(&self, (old, new): &(Named, Named), flags: u32) {
+    pub(crate) fn renamed(
+        &self,
+        (old, new): &(Named, Named),
+        flags: u32,
+        held: &dyn Fn(Key) -> bool,
+    ) {
         let Some(source) = old.file else {
             return;
         };
@@ -351,7 +396,7 @@ impl Notifier {
         if let Some(target) = replaced
             && (target.directory || target.links <= 1)
         {
-            self.removed(target);
+            self.removed(target, held);
         }
     }
     fn moved(&self, from: &Named, to: &Named, source: Found, replaced: Option<Found>) {

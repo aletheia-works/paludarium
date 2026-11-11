@@ -3083,13 +3083,13 @@ fn receive(
     Ok(received)
 }
 
-/// Reads the `int` of a setsockopt (EINVAL for fewer than 4 bytes).
 /// The priority a type of service gives (`rt_tos2priority`, `ip_tos2prio`):
 /// best effort, bulk, interactive or interactive bulk, by its TOS bits.
 fn tos_priority(tos: i32) -> i32 {
     const PRIORITIES: [i32; 8] = [0, 0, 2, 2, 6, 6, 4, 4];
     PRIORITIES[((tos & 0x1e) >> 2) as usize]
 }
+/// Reads the `int` of a setsockopt (EINVAL for fewer than 4 bytes).
 fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
     if (len as u32 as i32) < 4 {
         return Err(Errno::EINVAL);

@@ -1121,8 +1121,11 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
                 Some(_) => {}
                 None => new_name_free(c, new_dir, &new_raw, &new)?,
             }
-            let mounted = name.is_some() && queue_name(&d.path).is_some();
-            return Err(if mounted { Errno::EPERM } else { EXDEV });
+            if name.is_none() || queue_name(&d.path).is_none() {
+                return Err(EXDEV);
+            }
+            crate::mqueue::may_change_root(c)?;
+            return Err(Errno::EPERM);
         }
     }
     let target = if old_raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
@@ -5182,6 +5185,8 @@ fn link_queue(
         false,
         0,
     )?;
+    // `vfs_link`'s `may_create` before the root's missing `link`.
+    crate::mqueue::may_change_root(c)?;
     Err(Errno::EPERM)
 }
 /// The path of the queue `name` in `/dev/mqueue`.
@@ -5231,6 +5236,10 @@ fn rename_queue(
     if old_name == new_name {
         return Ok(0);
     }
+    // `vfs_rename`'s `may_delete` and `may_create` (or `may_delete` of a
+    // name there), whose sticky check also refuses with `EPERM`, before the
+    // root's missing `rename`.
+    crate::mqueue::may_change_root(c)?;
     Err(Errno::EPERM)
 }
 /// What a call that changes the file path `p` names reaches ([`followed`]),

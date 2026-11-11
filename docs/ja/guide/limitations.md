@@ -169,8 +169,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     上限は Linux の既定値で、`/proc/sys/kernel` から変えられません。メッセージキューで
     待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの
     メッセージが入る間だけ、待ち始めた順に起こします。
-  - POSIX メッセージキューのファイルシステムはマウントできません（`/dev/mqueue` は
-    ありません）。`SIGEV_THREAD` のクッキーは、ソケットの受信バッファーがいっぱいでも
+  - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
+    `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
+    並びません。そこで使えるのは `open`、`stat`、`getdents`、`unlink` だけで、`chmod`、
+    `chown`、`rename`、`link`、`mkdir` は Linux と同じには動きません。`SIGEV_THREAD` のクッキーは、ソケットの受信バッファーがいっぱいでも
     届きます。Linux の `mq_notify` は先に空きを待ちます。Linux はクッキーを登録のときから
     その `truesize` でバッファーに数えますが、エミュレータの netlink ソケットはそれを
     持ちません。

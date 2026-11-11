@@ -1226,6 +1226,100 @@ static int files_case(void) {
     return 0;
 }
 
+/* /dev/mqueue, where the first IPC namespace's queues are mounted, as
+   systemd mounts them: what it lists, what its files are, and opening,
+   making and unlinking queues through it. It runs in the first namespace,
+   which on Linux is the host's, so it looks only at its own names. */
+#define DEV_NAME "paludarium-mqueue-dev"
+static int listed_type(const char *name) {
+    DIR *dir = opendir("/dev/mqueue");
+    if (!dir) return -errno;
+    int found = 0;
+    struct dirent *e;
+    while ((e = readdir(dir)))
+        if (!strcmp(e->d_name, name)) found = e->d_type;
+    closedir(dir);
+    return found;
+}
+static void show_dev_link(const char *label, long fd) {
+    char path[64], target[300] = {0};
+    snprintf(path, sizeof path, "/proc/self/fd/%ld", fd);
+    long n = TRY(readlink(path, target, sizeof target - 1));
+    say("%s: readlink=%ld [%s]", label, n, n > 0 ? target : "");
+}
+static int dev_case(void) {
+    q_unlink(DEV_NAME);
+    q_unlink(DEV_NAME "-made");
+    struct stat st;
+    long stated = TRY(stat("/dev/mqueue", &st));
+    say("dev-mqueue: stat=%ld directory=%d perms=%o uid=%d dev-lists=%d", stated, S_ISDIR(st.st_mode),
+        st.st_mode & 07777, st.st_uid, lists_directory("/dev", "mqueue"));
+    struct mq_attr small = {.mq_maxmsg = 3, .mq_msgsize = 16};
+    long q = q_open(DEV_NAME, O_RDWR | O_CREAT | O_EXCL, 0640, &small);
+    if (q < 0) return 11;
+    q_send(q, "abc", 3, 4, NULL);
+    printf("queue:");
+    put("listed-type", listed_type(DEV_NAME));
+    stated = TRY(stat("/dev/mqueue/" DEV_NAME, &st));
+    put("stat", stated);
+    printf(" mode=%o size=%ld uid=%d", st.st_mode, (long)st.st_size, st.st_uid);
+    say("");
+    long d = TRY(open("/dev/mqueue/" DEV_NAME, O_RDWR | O_CLOEXEC));
+    char line[100] = {0};
+    long n = TRY(read((int)d, line, sizeof line - 1));
+    char *end = strchr(line, ' ');
+    if (end) *end = 0;
+    say("opened: open=%d read=%ld [%s]", d >= 0, n, line);
+    show_attr("opened", d);
+    printf("opened");
+    show_receive("got", d, 16, NULL);
+    say("");
+    show_dev_link("opened", d);
+    show_link("mq_open", q);
+    printf("open:");
+    put("exclusive", TRY(open("/dev/mqueue/" DEV_NAME, O_RDWR | O_CREAT | O_EXCL, 0600)));
+    put("missing", TRY(open("/dev/mqueue/" DEV_NAME "-none", O_RDONLY)));
+    put("directory", TRY(open("/dev/mqueue/" DEV_NAME, O_RDONLY | O_DIRECTORY)));
+    put("dir-write", TRY(open("/dev/mqueue", O_WRONLY)));
+    say("");
+    /* A queue made through it has the namespace's default attributes. */
+    umask(022);
+    long made = TRY(open("/dev/mqueue/" DEV_NAME "-made", O_WRONLY | O_CREAT | O_EXCL, 0666));
+    stated = TRY(stat("/dev/mqueue/" DEV_NAME "-made", &st));
+    say("made: open=%d stat=%ld mode=%o", made >= 0, stated, st.st_mode);
+    show_attr("made", made);
+    long by_name = q_open(DEV_NAME "-made", O_RDONLY, 0, NULL);
+    say("made: mq_open=%d", by_name >= 0);
+    close((int)by_name);
+    close((int)made);
+    /* A new IPC namespace's queues are not there. */
+    pid_t pid = child();
+    if (pid == 0) {
+        if (unshare(CLONE_NEWIPC)) _exit(90);
+        long inner = q_open(DEV_NAME "-inner", O_RDWR | O_CREAT, 0600, NULL);
+        printf("inner:");
+        put("made", inner >= 0);
+        put("listed", listed_type(DEV_NAME "-inner"));
+        put("outer-listed", listed_type(DEV_NAME));
+        put("outer-by-mq_open", q_open(DEV_NAME, O_RDONLY, 0, NULL));
+        say("");
+        _exit(0);
+    }
+    say("inner: status=%d", wait_child(pid));
+    printf("unlink:");
+    put("made", TRY(unlink("/dev/mqueue/" DEV_NAME "-made")));
+    put("again", TRY(unlink("/dev/mqueue/" DEV_NAME "-made")));
+    put("mq_open-after", q_open(DEV_NAME "-made", O_RDONLY, 0, NULL));
+    put("rmdir", TRY(rmdir("/dev/mqueue/" DEV_NAME)));
+    put("queue", TRY(unlink("/dev/mqueue/" DEV_NAME)));
+    put("listed-after", listed_type(DEV_NAME));
+    say("");
+    show_dev_link("unlinked", d);
+    close((int)d);
+    close((int)q);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -1238,5 +1332,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-sysctl")) return sysctl_case();
     if (!strcmp(mode, "mqueue-accounts")) return accounts_case();
     if (!strcmp(mode, "mqueue-files")) return files_case();
+    if (!strcmp(mode, "mqueue-dev")) return dev_case();
     return 3;
 }

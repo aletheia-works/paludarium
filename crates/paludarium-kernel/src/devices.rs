@@ -32,13 +32,18 @@ pub(crate) enum Entry {
     /// A name in `/dev/pts`: a slave's number, or `None` for a name no
     /// slave can have.
     Slave(Option<u32>),
+    /// `/dev/mqueue`, the first IPC namespace's POSIX message queues.
+    Mqueue,
+    /// A name in `/dev/mqueue` ([`crate::mqueue::mounted_name`]).
+    Queue,
 }
 /// The names in `/dev`, sorted as it lists them. Each has the inode number
 /// two more than its place here, and `/dev` itself has 1, so that `stat` and
 /// `getdents` agree.
-const NAMES: [(&[u8], Entry); 11] = [
+const NAMES: [(&[u8], Entry); 12] = [
     (b"fd", Entry::Link(b"/proc/self/fd")),
     (b"full", Entry::Device(Kind::Full)),
+    (b"mqueue", Entry::Mqueue),
     (b"null", Entry::Device(Kind::Null)),
     (b"ptmx", Entry::Ptmx { devpts: false }),
     (b"pts", Entry::Pts),
@@ -63,6 +68,12 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
     let name = path.strip_prefix(b"/dev/")?;
     if name == b"pts/" {
         return Some(Entry::Pts);
+    }
+    if name == b"mqueue/" {
+        return Some(Entry::Mqueue);
+    }
+    if name.starts_with(b"mqueue/") {
+        return crate::mqueue::mounted_name(path).map(|_| Entry::Queue);
     }
     if let Some(name) = name.strip_prefix(b"pts/") {
         if name == b"ptmx" {
@@ -128,8 +139,9 @@ pub(crate) fn stat(entry: Entry) -> FileStat {
             ..crate::pty::ptmx_stat(devpts)
         },
         Entry::Pts => crate::pty::directory_stat(),
-        // A slave's own, which `crate::pty::slave_stat` gives.
-        Entry::Slave(_) => FileStat::default(),
+        // A slave's own, which `crate::pty::slave_stat` gives; the
+        // queues' own, which `crate::mqueue` gives.
+        Entry::Slave(_) | Entry::Mqueue | Entry::Queue => FileStat::default(),
     }
 }
 /// `/dev`'s entries: `.`, `..` (the root, with inode `root`), then the
@@ -141,7 +153,7 @@ pub(crate) fn entries(root: u64) -> Vec<DirectoryEntry> {
     let named = NAMES.iter().map(|&(name, entry)| {
         let kind = match entry {
             Entry::Link(_) => DT_LNK,
-            Entry::Pts => DT_DIR,
+            Entry::Pts | Entry::Mqueue => DT_DIR,
             _ => DT_CHR,
         };
         (name, inode(entry), kind)
@@ -323,9 +335,12 @@ mod device_tests {
         // Each entry's inode is the one its stat reports.
         assert_eq!(listed[1].inode, 7);
         assert_eq!(listed[0].inode, directory_stat().inode);
-        // But `pts`, which devpts is mounted on, as on Linux, whose `stat`
-        // gives the root of devpts.
-        for e in listed[2..].iter().filter(|e| e.name != b"pts") {
+        // But `pts` and `mqueue`, which devpts and the mqueue filesystem are
+        // mounted on, as on Linux, whose `stat` gives the mounted root.
+        for e in listed[2..]
+            .iter()
+            .filter(|e| e.name != b"pts" && e.name != b"mqueue")
+        {
             let path = [&b"/dev/"[..], &e.name].concat();
             assert_eq!(stat(entry(&path).unwrap()).inode, e.inode);
         }

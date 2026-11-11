@@ -176,6 +176,8 @@ pub struct Processes {
     pub(crate) cpus: Arc<crate::rseq::Cpus>,
     /// The bytes the users' POSIX message queues charge.
     pub(crate) mqueue_charges: Arc<crate::mqueue::Charges>,
+    /// The queues `/dev/mqueue` shows: the first IPC namespace's.
+    pub(crate) mqueue_mount: crate::mqueue::Queues,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -194,6 +196,7 @@ impl Processes {
             fifos: Arc::default(),
             cpus: Arc::default(),
             mqueue_charges: Arc::default(),
+            mqueue_mount: group.namespaces(1).ipc.mq.clone(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {

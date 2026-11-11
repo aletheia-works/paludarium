@@ -755,6 +755,17 @@ kernel.
   what the C libraries' helper threads read to start the
   `sigev_notify_function`. Closing any descriptor of the queue, or ending,
   drops its process's registration, as Linux's `mqueue_flush_file`.
+- `/dev/mqueue` is the first IPC namespace's `mqueue` filesystem, as
+  systemd mounts it when Linux boots, whatever IPC namespace the caller is
+  in: a sticky directory anyone may write (01777, its maker's), which
+  `/dev` lists and which lists the queues as regular files, the files
+  `stat` as `mq_open` makes them. Opening one gives a descriptor the `mq_*`
+  calls take, with the same checks (`EACCES`), `EEXIST` with
+  `O_CREAT | O_EXCL`, `ENOENT` without `O_CREAT` and `ENOTDIR` with
+  `O_DIRECTORY`; `O_CREAT` makes a queue of the namespace's default
+  attributes (`mqueue_create`). Its link in `/proc/self/fd` reads
+  `/dev/mqueue/<name>`. `unlink` removes a queue as `mq_unlink` does
+  (`rmdir` of one is `ENOTDIR`).
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux

@@ -1151,6 +1151,9 @@ fn directory_entries(
         _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Directory) => {
             crate::devices::entries(c.files.fs.metadata(b"/", true)?.inode)
         }
+        _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Mqueue) => {
+            crate::mqueue::mounted_entries(c, crate::devices::directory_stat().inode)
+        }
         _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Pts) => c
             .files
             .devpts
@@ -3045,6 +3048,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 ((-100i32) as u64, path(c, a[0])?, n == 84)
             };
             let p = c.files.path(at_dir, raw.clone())?;
+            if let Some(name) = paludarium_vfs::normalize_path(&p)
+                .ok()
+                .as_deref()
+                .and_then(crate::mqueue::mounted_name)
+            {
+                return crate::mqueue::unlink_mounted(c, name, dir);
+            }
             crate::permissions::delete(c.files, &c.process.credentials, at_dir, &raw)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_some()) {
                 let request = if dir {
@@ -4375,6 +4385,14 @@ fn open_path(
                 Arc::new(crate::proc::OwnDirectory::new(crate::pty::directory_stat()))
             }
             crate::devices::Entry::Slave(None) => return Err(Errno::ENOENT),
+            crate::devices::Entry::Mqueue if flags & 3 != 0 => return Err(Errno::EISDIR),
+            crate::devices::Entry::Mqueue => Arc::new(crate::proc::OwnDirectory::new(
+                crate::mqueue::mounted_root_stat(c),
+            )),
+            crate::devices::Entry::Queue => {
+                let name = crate::mqueue::mounted_name(p).ok_or(Errno::ENOENT)?;
+                crate::mqueue::open_mounted(c, name, flags, mode)?
+            }
             crate::devices::Entry::Ptmx { .. } | crate::devices::Entry::Slave(_)
                 if flags & O_DIRECTORY != 0 =>
             {
@@ -5110,6 +5128,16 @@ fn known_stat(
         Some(crate::devices::Entry::Slave(number)) => {
             let stat = crate::pty::slave_stat(c, number.ok_or(Errno::ENOENT)?)?;
             Ok(Some((stat, device(c, path), SMALL_BLOCK_SIZE)))
+        }
+        Some(crate::devices::Entry::Mqueue) => Ok(Some((
+            crate::mqueue::mounted_root_stat(c),
+            device(c, path),
+            BLOCK_SIZE,
+        ))),
+        Some(crate::devices::Entry::Queue) => {
+            let name = crate::mqueue::mounted_name(path).ok_or(Errno::ENOENT)?;
+            let stat = crate::mqueue::mounted_stat(c, name)?;
+            Ok(Some((stat, device(c, path), BLOCK_SIZE)))
         }
         Some(
             entry @ (crate::devices::Entry::Pts | crate::devices::Entry::Ptmx { devpts: true }),

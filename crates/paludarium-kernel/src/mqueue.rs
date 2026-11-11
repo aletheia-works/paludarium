@@ -6,7 +6,8 @@
 //! root is a sticky directory anyone may write to: `mq_open` gives a
 //! descriptor of it, always close-on-exec, which `poll`, `select` and
 //! `epoll` watch (readable with a message, writable with room), `read`
-//! shows the queue's state in, and `fork` shares. Its messages are taken
+//! shows the queue's state in, and `fork` shares; the first namespace's
+//! filesystem is also `/dev/mqueue` ([`open_mounted`]). Its messages are taken
 //! highest priority first, and in the order they were sent within one
 //! priority. A receiver that finds the queue empty waits in turn, and a
 //! message sent then goes straight to the first of them; a sender that
@@ -469,13 +470,18 @@ pub(crate) struct QueueFile {
     /// The PID namespace of whoever opened it, which `read` numbers the
     /// registered process in.
     space: Arc<Namespace>,
+    /// The directory its link in `/proc/self/fd` names it in: none for
+    /// `mq_open`'s, whose filesystem is mounted nowhere, `/dev/mqueue` for
+    /// one opened there.
+    mounted: &'static [u8],
 }
 
 impl QueueFile {
     /// What its link in `/proc/self/fd` reads: the queue's path in its
-    /// filesystem, marked ` (deleted)` once unlinked.
+    /// filesystem, or under `/dev/mqueue` if opened there, marked
+    /// ` (deleted)` once unlinked.
     pub(crate) fn link_target(&self) -> Vec<u8> {
-        let mut path = [b"/", self.queue.name.as_slice()].concat();
+        let mut path = [self.mounted, b"/", self.queue.name.as_slice()].concat();
         if !self.queue.linked.load(Ordering::SeqCst) {
             path.extend_from_slice(b" (deleted)");
         }
@@ -674,6 +680,7 @@ fn mq_open(c: &mut Context<'_>, at: u64, flags: u32, mode: u32, attr: u64) -> Re
         flags: AtomicU32::new(flags & (O_ACCMODE | NONBLOCK)),
         position: AtomicU64::new(0),
         space: c.pid_space(),
+        mounted: b"",
     });
     c.files.fill_opened(fd, file, Vec::new(), true);
     Ok(u64::from(fd))
@@ -688,7 +695,18 @@ fn open_queue(
     attr: Option<(i64, i64)>,
 ) -> Result<Arc<Queue>, Errno> {
     look_up(name)?;
-    let queues = queues(c);
+    open_in(c, &queues(c), name, flags, mode, attr)
+}
+
+/// [`open_queue`] in `queues`.
+fn open_in(
+    c: &Context<'_>,
+    queues: &Queues,
+    name: &[u8],
+    flags: u32,
+    mode: u32,
+    attr: Option<(i64, i64)>,
+) -> Result<Arc<Queue>, Errno> {
     let mut names = queues.0.names();
     if let Some(queue) = names.get(name) {
         if flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
@@ -707,7 +725,7 @@ fn open_queue(
     }
     // `vfs_mkobj` keeps the set-ID and sticky bits.
     let mode = mode & !c.files.umask() & 0o7777;
-    let queue = Arc::new(create(c, &queues, name, mode, attr)?);
+    let queue = Arc::new(create(c, queues, name, mode, attr)?);
     names.insert(name.to_vec(), Arc::clone(&queue));
     Ok(queue)
 }
@@ -788,9 +806,13 @@ pub(crate) fn sys_mq_unlink(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 fn mq_unlink(c: &Context<'_>, at: u64) -> Result<u64, Errno> {
     let name = name(c, at)?;
     look_up(&name)?;
-    let queues = queues(c);
+    unlink_in(c, &queues(c), &name)
+}
+
+/// [`mq_unlink`] of `name` in `queues`.
+fn unlink_in(c: &Context<'_>, queues: &Queues, name: &[u8]) -> Result<u64, Errno> {
     let mut names = queues.0.names();
-    let queue = names.get(&name).ok_or(Errno::ENOENT)?;
+    let queue = names.get(name).ok_or(Errno::ENOENT)?;
     let credentials = &c.process.credentials;
     let stat = queue.stat();
     if credentials.fsuid != stat.uid
@@ -799,10 +821,125 @@ fn mq_unlink(c: &Context<'_>, at: u64) -> Result<u64, Errno> {
     {
         return Err(Errno::EPERM);
     }
-    if let Some(queue) = names.remove(&name) {
+    if let Some(queue) = names.remove(name) {
         queue.linked.store(false, Ordering::SeqCst);
     }
     Ok(0)
+}
+
+/// The name a path under `/dev/mqueue` gives, where the first IPC
+/// namespace's `mqueue` filesystem is mounted, as systemd mounts it when
+/// Linux boots.
+pub(crate) fn mounted_name(path: &[u8]) -> Option<&[u8]> {
+    path.strip_prefix(b"/dev/mqueue/")
+        .filter(|name| !name.is_empty() && !name.contains(&b'/'))
+}
+
+/// The mounted filesystem's queues: the first IPC namespace's.
+fn mounted(c: &Context<'_>) -> Queues {
+    c.processes.mqueue_mount.clone()
+}
+
+/// `/dev/mqueue`'s status: its root, a sticky directory anyone may write,
+/// its maker's.
+pub(crate) fn mounted_root_stat(c: &Context<'_>) -> FileStat {
+    let (uid, gid) = mounted(c).root();
+    FileStat {
+        inode: MOUNTED_ROOT_INODE,
+        mode: 0o041_777,
+        uid,
+        gid,
+        links: 2,
+        ..FileStat::default()
+    }
+}
+const MOUNTED_ROOT_INODE: u64 = 1;
+
+/// The status of the queue `/dev/mqueue/<name>` names (`ENOENT` for none).
+pub(crate) fn mounted_stat(c: &Context<'_>, name: &[u8]) -> Result<FileStat, Errno> {
+    mounted(c)
+        .0
+        .names()
+        .get(name)
+        .map(|queue| queue.stat())
+        .ok_or(Errno::ENOENT)
+}
+
+/// `/dev/mqueue`'s entries: `.`, `..` (`/dev`, inode `parent`), then the
+/// queues by name.
+pub(crate) fn mounted_entries(
+    c: &Context<'_>,
+    parent: u64,
+) -> Vec<paludarium_host::DirectoryEntry> {
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    let queues = mounted(c);
+    let names = queues.0.names();
+    [
+        (b".".to_vec(), MOUNTED_ROOT_INODE, DT_DIR),
+        (b"..".to_vec(), parent, DT_DIR),
+    ]
+    .into_iter()
+    .chain(
+        names
+            .iter()
+            .map(|(name, queue)| (name.clone(), queue.inode, DT_REG)),
+    )
+    .map(|(name, inode, kind)| paludarium_host::DirectoryEntry { name, inode, kind })
+    .collect()
+}
+
+/// `open` of `/dev/mqueue/<name>` with `flags`, as the `mqueue`
+/// filesystem's `lookup` and `create` (`mqueue_create`) answer it: a queue
+/// there, else with `O_CREAT` a new one of the namespace's default
+/// attributes and `mode` less the umask; `EEXIST` with `O_EXCL`, `ENOENT`
+/// without `O_CREAT`, `ENOTDIR` with `O_DIRECTORY`, and the queue's
+/// permissions for the access mode (`EACCES`).
+pub(crate) fn open_mounted(
+    c: &Context<'_>,
+    name: &[u8],
+    flags: u32,
+    mode: u32,
+) -> Result<Arc<dyn FileHandle>, Errno> {
+    const O_DIRECTORY: u32 = 0o200_000;
+    look_up(name)?;
+    let queues = mounted(c);
+    let exists = queues.0.names().contains_key(name);
+    if exists && flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
+        return Err(Errno::EEXIST);
+    }
+    if flags & O_DIRECTORY != 0 && (exists || flags & O_CREAT == 0) {
+        return Err(if exists {
+            Errno::ENOTDIR
+        } else {
+            Errno::ENOENT
+        });
+    }
+    // `open`'s access mode 3 asks to read and write (`ACC_MODE`), and gives
+    // neither.
+    let asked = if flags & O_ACCMODE == 3 {
+        flags & !O_ACCMODE | 2
+    } else {
+        flags
+    };
+    let queue = open_in(c, &queues, name, asked, mode & 0o7777, None)?;
+    Ok(Arc::new(QueueFile {
+        queue,
+        flags: AtomicU32::new(flags & (O_ACCMODE | NONBLOCK)),
+        position: AtomicU64::new(0),
+        space: c.pid_space(),
+        mounted: b"/dev/mqueue",
+    }))
+}
+
+/// `unlink` of `/dev/mqueue/<name>`, as [`mq_unlink`]; `rmdir` of one is
+/// `ENOTDIR`.
+pub(crate) fn unlink_mounted(c: &Context<'_>, name: &[u8], directory: bool) -> Result<u64, Errno> {
+    if directory {
+        return Err(Errno::ENOTDIR);
+    }
+    look_up(name)?;
+    unlink_in(c, &mounted(c), name)
 }
 
 /// A `struct timespec` timeout at `at`, none for a null one, as

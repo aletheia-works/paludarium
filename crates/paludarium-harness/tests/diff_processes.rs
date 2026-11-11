@@ -168,6 +168,7 @@ mod linux {
                     | "mqueue-sysctl"
                     | "mqueue-accounts"
                     | "mqueue-files"
+                    | "mqueue-dev"
                     | "netlink"
                     | "unix-interfaces"
                     | "addresses"
@@ -343,6 +344,7 @@ mod linux {
         mqueue_sysctl => ("mqueue-sysctl","mqueue"),
         mqueue_accounts => ("mqueue-accounts","mqueue"),
         mqueue_files => ("mqueue-files","mqueue"),
+        mqueue_dev => ("mqueue-dev","mqueue"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),

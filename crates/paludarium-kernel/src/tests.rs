@@ -1805,8 +1805,8 @@ fn dev_reports_its_devices_and_lists_them() {
     assert_eq!(
         names,
         [
-            ".", "..", "fd", "full", "null", "ptmx", "pts", "random", "stderr", "stdin", "stdout",
-            "urandom", "zero"
+            ".", "..", "fd", "full", "mqueue", "null", "ptmx", "pts", "random", "stderr", "stdin",
+            "stdout", "urandom", "zero"
         ]
     );
     assert_eq!(f.ret(217, &[dir, out, 0x1000]), 0); // the end

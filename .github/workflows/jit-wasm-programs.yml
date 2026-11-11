@@ -104,7 +104,7 @@ jobs:
         run: npm ci --prefix spikes/wasm-threads
       - name: Install Playwright browser
         if: matrix.environment == 'chromium' || matrix.environment == 'firefox' || matrix.environment == 'webkit'
-        uses: aletheia-works/.github/actions/install-playwright@2d85c4ddca01b35127a16915f0000bc54fdc85a6 # v1.4.0
+        uses: aletheia-works/.github/actions/install-playwright@f1e71b990c2fd7086e78931ba8609b96ac68104b # v1.4.1
         with:
           browsers: ${{ matrix.environment }}
           command: node spikes/wasm-threads/node_modules/playwright/cli.js

@@ -4828,3 +4828,62 @@ mod futex2 {
         );
     }
 }
+
+mod futex_requeue {
+    use super::*;
+    const LIST: u64 = DATA + 0x100;
+    const WORDS: u64 = DATA + 0x800;
+    #[test]
+    fn requeue_calls_check_as_linux_does() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // FUTEX_REQUEUE_PRIVATE, FUTEX_CMP_REQUEUE_PRIVATE: val, val2 (the
+        // timeout argument) and val3, each an `int` or `u32`.
+        assert_eq!(
+            f.ret(202, &[WORDS, 3 | 128, u64::from(u32::MAX), 0, WORDS + 4, 0]),
+            einval
+        );
+        assert_eq!(
+            f.ret(202, &[WORDS, 3 | 128, 1, u64::from(u32::MAX), WORDS + 4, 0]),
+            einval
+        );
+        assert_eq!(f.ret(202, &[WORDS, 3 | 128, 1, 1 << 32, WORDS + 4, 0]), 0);
+        assert_eq!(f.ret(202, &[WORDS, 3 | 128, 1, 1, WORDS + 2, 0]), einval);
+        assert_eq!(
+            f.ret(202, &[WORDS, 4 | 128, 1, 1, WORDS + 4, 1]),
+            errno(Errno::EAGAIN)
+        );
+        assert_eq!(f.ret(202, &[WORDS, 4 | 128, 1, 1, WORDS + 4, 1 << 32]), 0);
+        // Not with FUTEX_CLOCK_REALTIME.
+        assert_eq!(
+            f.ret(202, &[WORDS, 4 | 128 | 256, 1, 1, WORDS + 4, 0]),
+            errno(Errno::ENOSYS)
+        );
+        // futex_requeue(waiters, flags, nr_wake, nr_requeue)
+        let entry = |f: &Fixture, i: u64, value: u64, addr: u64, flags: u64| {
+            let at = LIST + 24 * i;
+            f.mem.write_u64(GuestAddr(at), value).unwrap();
+            f.mem.write_u64(GuestAddr(at + 8), addr).unwrap();
+            f.mem.write_u64(GuestAddr(at + 16), flags).unwrap();
+        };
+        entry(&f, 0, 0, WORDS, 2 | 128);
+        entry(&f, 1, 0, WORDS + 4, 2 | 128);
+        assert_eq!(f.ret(456, &[LIST, 1, 1, 1]), einval);
+        assert_eq!(f.ret(456, &[0, 0, 1, 1]), einval);
+        assert_eq!(f.ret(456, &[LIST, 0, 1, 1]), 0);
+        assert_eq!(f.ret(456, &[LIST, 0, u64::MAX, 1]), einval);
+        // The second entry is read and checked too; then both must agree.
+        entry(&f, 1, 1 << 32, WORDS + 4, 2 | 128);
+        assert_eq!(f.ret(456, &[LIST, 0, 1, 1]), einval);
+        entry(&f, 1, 0, WORDS + 4, 2);
+        assert_eq!(f.ret(456, &[LIST, 0, 1, 1]), einval);
+        entry(&f, 1, 0, WORDS + 4, 2 | 128);
+        entry(&f, 0, 1, WORDS, 2 | 128);
+        assert_eq!(f.ret(456, &[LIST, 0, 1, 1]), errno(Errno::EAGAIN));
+        // The first entry is checked before the second is read.
+        let last = DATA + 0x2000 - 24;
+        assert_eq!(f.ret(456, &[last, 0, 1, 1]), einval);
+        f.mem.write_u64(GuestAddr(last + 16), 2 | 128).unwrap();
+        assert_eq!(f.ret(456, &[last, 0, 1, 1]), errno(Errno::EFAULT));
+    }
+}

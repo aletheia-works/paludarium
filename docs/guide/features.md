@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
@@ -213,7 +213,8 @@ kernel.
   it on as an `unsigned`. The number
   itself is read from the low 32 bits of `rax` too, as Linux's
   `do_syscall_64` takes an `int`, and a negative one gives `ENOSYS`.
-- `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET` and `WAKE_BITSET`. A word is
+- `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE` and
+  `CMP_REQUEUE`. A word is
   told apart as Linux's `get_futex_key` does: in a shared mapping (shared
   anonymous memory or a file's), a shared operation names the memory and the
   offset in it, so a wake reaches a waiter in any process that maps it,
@@ -224,7 +225,11 @@ kernel.
   owner ends. A wake wakes one waiter even when asked for 0 or fewer, as
   Linux counts before it compares, and a private one does not look at the
   word's page. A timeout too long for Linux's nanoseconds waits until
-  `KTIME_MAX`.
+  `KTIME_MAX`. A requeue wakes `val` waiters and moves up to `val2` more (the
+  timeout argument, as Linux reads it) to `uaddr2`'s queue, giving how many
+  it took. Negative counts give `EINVAL`, and `CMP_REQUEUE` gives `EAGAIN`
+  when the first word is not `val3`, after both words' checks. It takes the
+  waiters in the order they came, whatever their bitsets.
 - The futex2 calls take 32-bit words with `FUTEX2_PRIVATE`, `FUTEX2_NUMA`
   and `FUTEX2_MPOL`, checked in Linux's order. Other sizes and flags give
   `EINVAL`. `futex_wake` and `futex_wait` are `FUTEX_WAKE_BITSET` and
@@ -232,9 +237,11 @@ kernel.
   `CLOCK_MONOTONIC`, and a `futex_wake` of 0 wakes none. `futex_waitv` waits
   on up to 128 words at once and gives the index of a woken one: it checks
   every word's address before it compares any value, then gives `EAGAIN` at
-  the first that differs. A `FUTEX2_NUMA` word is followed by its node,
+  the first that differs. `futex_requeue` is `CMP_REQUEUE` on the two words of
+  a `struct futex_waitv` list, which must have the same flags, as kernels
+  after 6.12 ask; the first's value is compared. A `FUTEX2_NUMA` word is followed by its node,
   which must be node 0, the only one, or `-1`, which becomes 0, as Linux
-  writes the thread's node there. A signal interrupts them with
+  writes the thread's node there. A signal interrupts the waits with
   `ERESTARTSYS`, so they run again after a stop or an `SA_RESTART` handler.
 - `set_robust_list` and `get_robust_list` keep each thread's list of robust
   futexes, which glibc's and musl's robust mutexes need. When a thread ends or

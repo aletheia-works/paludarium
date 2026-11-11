@@ -1226,6 +1226,29 @@ impl Kernel {
                 )
             }),
             455 => self.futex2_wait(thread, mem, a),
+            // futex_requeue(waiters, flags, nr_wake, nr_requeue): no flags
+            // and a list of two (`EINVAL`), read as `futex_waitv` reads its
+            // own, with the same flags for both, as Linux after 6.12 asks;
+            // the first's value is compared.
+            456 => (|| {
+                if a[1] != 0 || a[0] == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let words = futex_words(mem, a[0], 2)?;
+                let flags = |w: &crate::futex::Word| (w.private, w.numa);
+                if flags(&words[0]) != flags(&words[1]) {
+                    return Err(Errno::EINVAL);
+                }
+                let word = |w: &crate::futex::Word| (w.addr, w.private, w.numa);
+                self.group.futexes.requeue(
+                    mem,
+                    word(&words[0]),
+                    word(&words[1]),
+                    a[2] as i32,
+                    a[3] as i32,
+                    Some(words[0].value),
+                )
+            })(),
             // restart_syscall resuming a timed futex wait a stop interrupted.
             219 if matches!(
                 thread.state.restart_block,
@@ -1456,6 +1479,21 @@ impl Kernel {
         } else {
             u32::MAX
         };
+        // FUTEX_REQUEUE and FUTEX_CMP_REQUEUE: `val` waiters woken and up
+        // to `val2`, which Linux takes from the timeout argument, moved to
+        // `uaddr2`; the second compares `val3` first.
+        if matches!(op, 3 | 4) {
+            let word = |addr| (addr, private, false);
+            let compare = (op == 4).then_some(a[5] as u32);
+            return self.group.futexes.requeue(
+                mem,
+                word(a[0]),
+                word(a[4]),
+                a[2] as u32 as i32,
+                a[3] as u32 as i32,
+                compare,
+            );
+        }
         if matches!(op, 1 | 10) {
             return self
                 .group

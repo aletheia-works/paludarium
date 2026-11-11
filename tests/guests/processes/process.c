@@ -5935,6 +5935,72 @@ static int futex2_case(void) {
            f2_wake((void *)numa, 1, 1, F2_U32_PRIVATE | 8));
     return 0;
 }
+/* FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and futex2's futex_requeue, as Linux's
+ * kernel/futex/requeue.c. */
+static _Alignas(8) volatile uint32_t rq_words[4];
+static long rq_results[4];
+static void *rq_old_waiter(void *arg) {
+    long i = (long)arg;
+    rq_results[i] = f2_errno(syscall(SYS_futex, &rq_words[0], 128, 0, NULL, NULL, 0));
+    return NULL;
+}
+static void *rq_new_waiter(void *arg) {
+    (void)arg;
+    rq_results[3] = f2_wait((void *)&rq_words[2], 0, 1, F2_U32_PRIVATE, NULL, 0);
+    return NULL;
+}
+static long rq_old(long op, volatile uint32_t *from, long wake, long requeue, volatile uint32_t *to,
+                   long cmp) {
+    return f2_errno(syscall(SYS_futex, from, op, wake, (void *)requeue, to, cmp));
+}
+static int futex_requeue_case(void) {
+    volatile uint32_t *a = &rq_words[0], *b = &rq_words[1];
+    printf("requeue negative-wake=%ld negative-requeue=%ld high-val2=%ld misaligned=%ld "
+           "mismatch=%ld high-val3=%ld realtime=%ld\n",
+           rq_old(3 | 128, a, -1, 0, b, 0), rq_old(3 | 128, a, 1, 0xffffffffL, b, 0),
+           rq_old(3 | 128, a, 1, 1L << 32, b, 0),
+           rq_old(3 | 128, a, 1, 1, (volatile uint32_t *)((char *)b + 2), 0),
+           rq_old(4 | 128, a, 1, 1, b, 1), rq_old(4 | 128, a, 1, 1, b, 1L << 32),
+           rq_old(4 | 128 | 256, a, 1, 1, b, 0));
+    pthread_t t[3];
+    for (long i = 0; i < 3; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
+    long moved = 0;
+    while (moved < 3) {
+        long r = rq_old(4 | 128, a, 0, INT_MAX, b, 0);
+        if (r < 0) return 80;
+        moved += r;
+        if (moved < 3) sched_yield();
+    }
+    long woke_b = f2_errno(syscall(SYS_futex, b, 1 | 128, 1, NULL, NULL, 0));
+    long back = rq_old(4 | 128, b, 1, 1, a, 0);
+    long woke_a = f2_errno(syscall(SYS_futex, a, 1 | 128, INT_MAX, NULL, NULL, 0));
+    long left_b = f2_errno(syscall(SYS_futex, b, 1 | 128, INT_MAX, NULL, NULL, 0));
+    for (int i = 0; i < 3; i++) pthread_join(t[i], NULL);
+    printf("requeue moved=%ld woke-b=%ld back=%ld woke-a=%ld left-b=%ld results=%ld,%ld,%ld\n",
+           moved, woke_b, back, woke_a, left_b, rq_results[0], rq_results[1], rq_results[2]);
+
+    struct f2_waitv w[2] = {{0, (uintptr_t)&rq_words[2], F2_U32_PRIVATE, 0},
+                            {0, (uintptr_t)&rq_words[3], F2_U32_PRIVATE, 0}};
+    long flags = f2_errno(syscall(456, w, 1L, 1L, 1L));
+    long null = f2_errno(syscall(456, NULL, 0L, 1L, 1L));
+    long negative = f2_errno(syscall(456, w, 0L, -1L, 1L));
+    w[1].flags = 2;
+    long differ = f2_errno(syscall(456, w, 0L, 1L, 1L));
+    w[1].flags = F2_U32_PRIVATE;
+    w[0].val = 1;
+    long mismatch = f2_errno(syscall(456, w, 0L, 1L, 1L));
+    w[0].val = 0;
+    printf("futex_requeue flags=%ld null=%ld negative=%ld differ=%ld mismatch=%ld none=%ld\n", flags,
+           null, negative, differ, mismatch, f2_errno(syscall(456, w, 0L, 1L, 1L)));
+    pthread_t n;
+    pthread_create(&n, NULL, rq_new_waiter, NULL);
+    long r;
+    while ((r = f2_errno(syscall(456, w, 0L, 0L, 1L))) == 0) sched_yield();
+    long woke = f2_wake((void *)&rq_words[3], 1, 1, F2_U32_PRIVATE);
+    pthread_join(n, NULL);
+    printf("futex_requeue moved=%ld woke=%ld result=%ld\n", r, woke, rq_results[3]);
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -17128,6 +17194,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "old-times")) return old_times_case();
     if (!strcmp(mode, "old-forms")) return old_forms_case();
     if (!strcmp(mode, "futex2")) return futex2_case();
+    if (!strcmp(mode, "futex-requeue")) return futex_requeue_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

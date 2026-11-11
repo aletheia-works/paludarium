@@ -205,6 +205,7 @@
     {"name":"old-times","binary":"process"},
     {"name":"old-forms","binary":"process"},
     {"name":"futex2","binary":"process"},
+    {"name":"futex-requeue","binary":"process"},
     {"name":"mmsg","binary":"process"},
     {"name":"itimer","binary":"process"},
     {"name":"mprotect-checks","binary":"process"},

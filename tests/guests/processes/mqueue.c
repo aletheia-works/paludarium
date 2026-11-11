@@ -2,7 +2,9 @@
    mq_timedsend, mq_timedreceive, mq_notify and mq_getsetattr, their errors
    in Linux's order, priorities, O_NONBLOCK and timeouts, the default and
    unprivileged limits and the /proc/sys/fs/mqueue files that set them, poll, select and epoll on a queue, notifications by
-   signal, by nothing and by netlink cookie, and queues shared across fork.
+   signal, by nothing and by netlink cookie, and queues shared across fork;
+   the queues' files, and /dev/mqueue with the calls on its paths (chmod,
+   chown, the times, truncate and statfs).
 
    Each case runs as root (through sudo) in IPC and network namespaces of
    its own, so that its queues, counts and limits are a new namespace's
@@ -27,7 +29,9 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1269,6 +1273,178 @@ static void show_dev_link(const char *label, long fd) {
     long n = TRY(readlink(path, target, sizeof target - 1));
     say("%s: readlink=%ld [%s]", label, n, n > 0 ? target : "");
 }
+static long long stat_mtime(const char *path) {
+    struct stat st;
+    if (stat(path, &st)) return -errno;
+    return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+}
+static long stat_size(const char *path) {
+    struct stat st;
+    if (stat(path, &st)) return -errno;
+    return (long)st.st_size;
+}
+static long fd_size(long fd) {
+    struct stat st;
+    if (fstat((int)fd, &st)) return -errno;
+    return (long)st.st_size;
+}
+static void show_file(const char *label, const char *path) {
+    struct stat st = {0};
+    long stated = TRY(stat(path, &st));
+    say("%s: stat=%ld mode=%o uid=%d gid=%d size=%ld", label, stated, st.st_mode, st.st_uid, st.st_gid,
+        (long)st.st_size);
+}
+static void show_statfs(const char *label, long result, const struct statfs *s) {
+    say("%s: statfs=%ld type=%lx bsize=%ld namelen=%ld frsize=%ld blocks=%ld bfree=%ld files=%ld", label, result,
+        (long)s->f_type, (long)s->f_bsize, (long)s->f_namelen, (long)s->f_frsize, (long)s->f_blocks,
+        (long)s->f_bfree, (long)s->f_files);
+}
+#define ATTRS_NAME DEV_NAME "-attrs"
+#define ATTRS_PATH "/dev/mqueue/" ATTRS_NAME
+/* The calls on a queue's path in /dev/mqueue, which change its file as
+   simple_setattr does: its mode and owner, its modification time (to the
+   second, and only that time is compared), and its size, which only a
+   truncate changes; then statfs, and the root, whose size counts its
+   entries and whose time a queue made or unlinked in it stamps. */
+static int dev_paths(void) {
+    q_unlink(ATTRS_NAME);
+    struct stat root;
+    if (stat("/dev/mqueue", &root)) return 21;
+    long base = (long)root.st_size;
+    long long second = next_second();
+    long q = q_open(ATTRS_NAME, O_RDWR | O_CREAT | O_EXCL, 0640, NULL);
+    if (q < 0) return 22;
+    printf("root:");
+    put("made-grows", stat_size("/dev/mqueue") - base);
+    put("made-stamped", stamped_between(stat_mtime("/dev/mqueue"), second, this_second()));
+    long long made = stat_mtime("/dev/mqueue");
+    next_second();
+    long again = q_open(ATTRS_NAME, O_RDWR, 0, NULL);
+    put("open-keeps", stat_mtime("/dev/mqueue") == made);
+    put("size-kept", stat_size("/dev/mqueue") - base);
+    say("");
+    close((int)again);
+
+    printf("chmod:");
+    put("path", TRY(chmod(ATTRS_PATH, 04750)));
+    put("missing", TRY(chmod(ATTRS_PATH "-none", 0600)));
+    put("long", TRY(chmod("/dev/mqueue/"
+                          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                          0600)));
+    say("");
+    show_file("chmod", ATTRS_PATH);
+    printf("chown:");
+    put("path", TRY(chown(ATTRS_PATH, 2000, 3000)));
+    say("");
+    show_file("chown", ATTRS_PATH);
+    printf("chown:");
+    put("lchown", TRY(lchown(ATTRS_PATH, -1, 3001)));
+    put("fchownat", TRY(fchownat(AT_FDCWD, ATTRS_PATH, 2001, -1, AT_SYMLINK_NOFOLLOW)));
+    put("fchmodat", TRY(fchmodat(AT_FDCWD, ATTRS_PATH, 0640, 0)));
+    put("missing", TRY(chown(ATTRS_PATH "-none", 0, 0)));
+    say("");
+    show_file("owned", ATTRS_PATH);
+
+    struct timespec times[2] = {{.tv_sec = 1000, .tv_nsec = 0}, {.tv_sec = 1234567, .tv_nsec = 890}};
+    printf("times:");
+    put("utimensat", TRY(utimensat(AT_FDCWD, ATTRS_PATH, times, 0)));
+    put("mtime-s", stat_mtime(ATTRS_PATH) / 1000000000LL);
+    put("mtime-ns", stat_mtime(ATTRS_PATH) % 1000000000LL);
+    struct timespec omit[2] = {{.tv_sec = 5, .tv_nsec = 0}, {.tv_sec = 0, .tv_nsec = UTIME_OMIT}};
+    put("omit", TRY(utimensat(AT_FDCWD, ATTRS_PATH, omit, AT_SYMLINK_NOFOLLOW)));
+    put("omit-keeps", stat_mtime(ATTRS_PATH) == 1234567000000000LL);
+    struct timespec by_fd[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT}, {.tv_sec = 2000000, .tv_nsec = 5}};
+    put("futimens", TRY(futimens((int)q, by_fd)));
+    put("futimens-s", mtime_of(q) / 1000000000LL);
+    struct timeval micros[2] = {{.tv_sec = 1, .tv_usec = 0}, {.tv_sec = 3000000, .tv_usec = 999999}};
+    put("utimes", TRY(utimes(ATTRS_PATH, micros)));
+    put("utimes-s", stat_mtime(ATTRS_PATH) / 1000000000LL);
+    put("utimes-ns", stat_mtime(ATTRS_PATH) % 1000000000LL);
+    put("missing", TRY(utimensat(AT_FDCWD, ATTRS_PATH "-none", NULL, 0)));
+    second = next_second();
+    put("now", TRY(utimensat(AT_FDCWD, ATTRS_PATH, NULL, 0)));
+    put("now-stamped", stamped_between(stat_mtime(ATTRS_PATH), second, this_second()));
+    say("");
+
+    long long touched = stat_mtime(ATTRS_PATH);
+    next_second();
+    printf("truncate:");
+    put("path", TRY(truncate(ATTRS_PATH, 1000)));
+    put("size", stat_size(ATTRS_PATH));
+    put("path-keeps-mtime", stat_mtime(ATTRS_PATH) == touched);
+    put("past-lfs", TRY(truncate(ATTRS_PATH, 1L << 31)));
+    put("lfs", TRY(truncate(ATTRS_PATH, (1L << 31) - 1)));
+    put("lfs-size", stat_size(ATTRS_PATH));
+    put("negative", TRY(truncate(ATTRS_PATH, -1)));
+    put("missing", TRY(truncate(ATTRS_PATH "-none", 0)));
+    say("");
+    printf("ftruncate:");
+    second = next_second();
+    put("mq_open", TRY(ftruncate((int)q, 500)));
+    put("size", fd_size(q));
+    put("stamped", stamped_between(mtime_of(q), second, this_second()));
+    put("past-lfs", TRY(ftruncate((int)q, 1L << 31)));
+    long ro = q_open(ATTRS_NAME, O_RDONLY, 0, NULL);
+    put("read-only", TRY(ftruncate((int)ro, 0)));
+    long d = TRY(open(ATTRS_PATH, O_RDWR | O_CLOEXEC));
+    put("opened-past-lfs", TRY(ftruncate((int)d, 1L << 31)));
+    put("seek-end", TRY(lseek((int)d, 0, SEEK_END)));
+    char line[100];
+    lseek((int)d, 0, SEEK_SET);
+    put("read", TRY(read((int)d, line, sizeof line)));
+    say("");
+
+    struct statfs fs = {0};
+    long result = TRY(statfs("/dev/mqueue", &fs));
+    show_statfs("statfs-root", result, &fs);
+    memset(&fs, 0, sizeof fs);
+    result = TRY(statfs(ATTRS_PATH, &fs));
+    show_statfs("statfs-queue", result, &fs);
+    memset(&fs, 0, sizeof fs);
+    result = TRY(fstatfs((int)q, &fs));
+    show_statfs("fstatfs-mq_open", result, &fs);
+    memset(&fs, 0, sizeof fs);
+    result = TRY(fstatfs((int)d, &fs));
+    show_statfs("fstatfs-opened", result, &fs);
+    say("statfs-missing: statfs=%ld", TRY(statfs(ATTRS_PATH "-none", &fs)));
+    close((int)ro);
+    close((int)d);
+
+    /* The owner (2001, in group 3001) may change it; another user may not,
+       nor write it without a write bit for others. */
+    for (int user = 1; user <= 2; user++) {
+        pid_t pid = child();
+        if (pid == 0) {
+            if (syscall(SYS_setresgid, 3000 + user, 3000 + user, 3000 + user) || syscall(SYS_setgroups, 0, NULL) ||
+                syscall(SYS_setresuid, 2000 + user, 2000 + user, 2000 + user))
+                _exit(90);
+            printf("user-%d:", user);
+            put("chmod", TRY(chmod(ATTRS_PATH, 0660)));
+            put("chown-group", TRY(chown(ATTRS_PATH, -1, 3001)));
+            put("chown-user", TRY(chown(ATTRS_PATH, 0, -1)));
+            put("utimensat", TRY(utimensat(AT_FDCWD, ATTRS_PATH, times, 0)));
+            put("touch", TRY(utimensat(AT_FDCWD, ATTRS_PATH, NULL, 0)));
+            put("truncate", TRY(truncate(ATTRS_PATH, 10)));
+            say("");
+            _exit(0);
+        }
+        say("user-%d: status=%d", user, wait_child(pid));
+    }
+    show_file("users", ATTRS_PATH);
+
+    close((int)q);
+    if (stat("/dev/mqueue", &root)) return 23;
+    base = (long)root.st_size;
+    second = next_second();
+    printf("root:");
+    put("unlink", TRY(unlink(ATTRS_PATH)));
+    put("unlinked-shrinks", base - stat_size("/dev/mqueue"));
+    put("unlinked-stamped", stamped_between(stat_mtime("/dev/mqueue"), second, this_second()));
+    say("");
+    return 0;
+}
 static int dev_case(void) {
     q_unlink(DEV_NAME);
     q_unlink(DEV_NAME "-made");
@@ -1343,7 +1519,7 @@ static int dev_case(void) {
     show_dev_link("unlinked", d);
     close((int)d);
     close((int)q);
-    return 0;
+    return dev_paths();
 }
 
 int main(int argc, char **argv) {

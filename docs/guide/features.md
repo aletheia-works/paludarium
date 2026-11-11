@@ -754,7 +754,13 @@ kernel.
   whose modification time is that of the last send or receive (or its
   creation; not of a failed one, `mq_notify`, `mq_getsetattr` or `read`),
   in whole seconds, as the `mqueue` filesystem keeps its times (it sets no
-  `s_time_gran`), `fchmod` and `fchown` change it, and its link in `/proc/self/fd` is
+  `s_time_gran`), `fchmod`, `fchown` and `futimens` change it (a time to
+  the second), `ftruncate` sets the size it reports and its modification
+  time, as Linux's `simple_setattr` does (`EINVAL` past 2^31 − 1 bytes,
+  since `mq_open` gives no `O_LARGEFILE`, and without write access), the
+  end `lseek` finds is that size, `fstatfs` reports the `mqueue`
+  filesystem (`MQUEUE_MAGIC`, a page per block, 255-byte names), and its
+  link in `/proc/self/fd` is
   `/<name>`, followed by a space and `(deleted)` once unlinked. Messages come highest
   priority first (below 32768, `EINVAL`), in the order sent within one. A
   receive into a buffer smaller than `mq_msgsize` is `EMSGSIZE`, and so is
@@ -789,7 +795,15 @@ kernel.
   `O_DIRECTORY`; `O_CREAT` makes a queue of the namespace's default
   attributes (`mqueue_create`). Its link in `/proc/self/fd` reads
   `/dev/mqueue/<name>`. `unlink` removes a queue as `mq_unlink` does
-  (`rmdir` of one is `ENOTDIR`).
+  (`rmdir` of one is `ENOTDIR`). A queue's path takes `chmod`, `chown`,
+  `utimensat`, `utimes` and `truncate`, which change its file as its
+  descriptor's calls do, with the same permission checks (`EPERM`,
+  `EACCES`), except that a truncate of the path leaves the modification
+  time and may reach 2^31 − 1 bytes (`EFBIG` past them, as the
+  superblock's `s_maxbytes`), and `statfs` reports the `mqueue`
+  filesystem. The root's size is 20 bytes for each entry (`.`, `..` and
+  each queue, `DIRENT_SIZE`), and its modification time is when a queue
+  was last made or unlinked there.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux

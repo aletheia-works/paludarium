@@ -197,10 +197,12 @@ verified.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
     `/proc/self/mountinfo` does not list it. Through it, `open`, `stat`,
-    `access`, `getdents`, `unlink` and `rmdir` work as on Linux; the other
-    calls on its paths (`chmod`, `chown`, `utimensat`, `truncate`,
-    `statfs`, `rename`, `link`, `mkdir` and the like) do not do what
-    Linux's would.
+    `access`, `getdents`, `unlink`, `rmdir`, `statfs`, and `chmod`,
+    `chown`, `utimensat` and `truncate` of a queue work as on Linux; the
+    calls that make or move a name there (`mkdir`, `mknod`, `symlink`,
+    `link`, `rename`) and those that change the root itself do not do what
+    Linux's would. The root's modification time starts when it is first
+    used, where Linux's is when the filesystem was mounted.
   - A `SIGEV_THREAD` cookie goes to its socket even when the socket's
     receive buffer is full, where Linux's `mq_notify` first waits for room:
     Linux counts the cookie against that buffer from the registration on,

@@ -761,6 +761,9 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
     if is_terminal(c, d) {
         return Ok(pseudo_fs(DEVPTS_SUPER_MAGIC));
     }
+    if crate::mqueue::is_queue(&*d.file) || d.path == b"/dev/mqueue" {
+        return Ok(pseudo_fs(MQUEUE_MAGIC));
+    }
     Ok(match d.file.stat()?.mode & 0o170000 {
         0o010000 => pseudo_fs(0x5049_5045), // PIPEFS_MAGIC
         0o140000 => pseudo_fs(0x534F_434B), // SOCKFS_MAGIC
@@ -867,7 +870,7 @@ fn set_times_at(
     }
     let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
     let (p, found) = looked_up(c, a[0], a[1], follow)?;
-    match followed(c, &p, follow)? {
+    match reached(c, &p, follow)? {
         Some(Followed::Path { path, follow }) => {
             let stat = c.files.fs.metadata(&path, follow)?;
             crate::permissions::times(&c.process.credentials, &stat, touch)?;
@@ -993,7 +996,7 @@ fn chown_path(
     uid: u64,
     gid: u64,
 ) -> Result<u64, Errno> {
-    match followed(c, path, follow)? {
+    match reached(c, path, follow)? {
         Some(Followed::Path { path, follow }) => return chown_path(c, &path, follow, uid, gid),
         Some(Followed::File(d)) => return chown_file(c, &d.file, uid, gid),
         None => {}
@@ -1033,7 +1036,7 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     } else {
         let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
         let (p, _) = lookup(c, a[0], raw, follow)?;
-        if let Some(target) = followed(c, &p, follow)? {
+        if let Some(target) = reached(c, &p, follow)? {
             return chmod_followed(c, target, a[2] as u32);
         }
         // A link in `/proc` or `/dev` not followed is a symbolic link too.
@@ -2363,6 +2366,7 @@ const SMALL_BLOCK_SIZE: u32 = 1024;
 /// procfs's and devpts's `s_magic`, which their `statfs` gives as `f_type`.
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
+const MQUEUE_MAGIC: u64 = 0x1980_0202;
 /// Whether `path` is in `/proc`, which is procfs on Linux.
 fn in_proc(path: &[u8]) -> bool {
     path == b"/proc" || path.starts_with(b"/proc/")
@@ -2885,9 +2889,10 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 if let Some(target) = landlock_target(c, &p, true) {
                     crate::landlock::check(c, &target, crate::landlock::TRUNCATE)?;
                 }
-                match followed(c, &p, true)? {
+                match reached(c, &p, true)? {
                     // A link in `/proc/self/fd` leads to the descriptor's
-                    // file, which the call opens for writing again.
+                    // file, which the call opens for writing again, as
+                    // does a queue's path in `/dev/mqueue`.
                     Some(Followed::Path { path, follow }) => {
                         let stat = c.files.fs.metadata(&path, follow)?;
                         crate::permissions::truncate(&c.process.credentials, &stat)?;
@@ -2914,6 +2919,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return Err(Errno(27));
             }
             f.truncate(a[1])?;
+            if n == 77 {
+                crate::mqueue::truncated(c, &*f);
+            }
             crate::permissions::remove_set_ids(&c.process.credentials, &*f);
             Ok(0)
         }
@@ -3221,7 +3229,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 (looked_up(c, a[0], a[1], true)?, a[2])
             };
             let (p, found) = p;
-            if let Some(target) = followed(c, &p, true)? {
+            if let Some(target) = reached(c, &p, true)? {
                 return chmod_followed(c, target, mode as u32);
             }
             let mode = match found.file {
@@ -3272,6 +3280,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     }
                     pseudo_fs(PROC_SUPER_MAGIC)
                 }
+            } else if let Some(name) = paludarium_vfs::normalize_path(&p).ok().filter(|p| {
+                p.as_slice() == b"/dev/mqueue" || crate::mqueue::mounted_name(p).is_some()
+            }) {
+                // `/dev/mqueue` and its queues are the `mqueue` filesystem.
+                if let Some(name) = crate::mqueue::mounted_name(&name) {
+                    crate::mqueue::mounted_file(c, name)?;
+                }
+                pseudo_fs(MQUEUE_MAGIC)
             } else {
                 c.files.fs.statfs(&p)?
             };
@@ -5046,6 +5062,29 @@ pub(crate) fn exec_program(
 /// [`through_descriptor`] for this thread's process.
 fn followed(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {
     through_descriptor(c.files, c.process.pid, p, follow)
+}
+/// What a call that changes the file path `p` names reaches ([`followed`]),
+/// or the file of the queue a path in `/dev/mqueue` names, which no
+/// filesystem here holds ([`crate::mqueue::mounted_file`]).
+fn reached(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {
+    if let Some(target) = followed(c, p, follow)? {
+        return Ok(Some(target));
+    }
+    let Some(name) = paludarium_vfs::normalize_path(p)
+        .ok()
+        .and_then(|p| crate::mqueue::mounted_name(&p).map(<[u8]>::to_vec))
+    else {
+        return Ok(None);
+    };
+    let file = crate::mqueue::mounted_file(c, &name)?;
+    Ok(Some(Followed::File(Descriptor {
+        file,
+        path: p.to_vec(),
+        cloexec: false,
+        opened: true,
+        listed: Arc::default(),
+        landlock: crate::landlock::FS,
+    })))
 }
 /// What a link in `/proc/self/fd` reads: the path of a file on a mount
 /// (marked ` (deleted)` once removed), `pipe:[<inode>]`, `socket:[<inode>]`,

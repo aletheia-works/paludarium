@@ -76,9 +76,16 @@ pub(crate) const HARD_MSGSIZEMAX: i32 = 16 << 20;
 /// x86-64, which a queue charges for each message it may hold.
 const MSG_MSG_SIZE: u64 = 48;
 const TREE_NODE_SIZE: u64 = 48;
-/// The size a queue's file reports (`FILENT_SIZE`), and the most its state
-/// line takes.
+/// The size a queue's file reports (`FILENT_SIZE`) until a truncate
+/// changes it, and the most its state line takes.
 const FILENT_SIZE: usize = 80;
+/// The size the root's entries add to it (`DIRENT_SIZE`): it has two, `.`
+/// and `..`, and one for each queue.
+const DIRENT_SIZE: u64 = 20;
+/// The most a truncate gives a queue's file: the `mqueue` filesystem keeps
+/// the superblock's `s_maxbytes` (`MAX_NON_LFS`), which an open without
+/// `O_LARGEFILE`, as `mq_open`'s is, may not ask past (`do_ftruncate`).
+const MAX_NON_LFS: u64 = (1 << 31) - 1;
 /// `struct mq_attr` and `struct sigevent`.
 const ATTR_SIZE: usize = 64;
 const SIGEVENT_SIZE: usize = 64;
@@ -183,6 +190,10 @@ struct Table {
     /// whom its `mqueue` root belongs to (`mqueue_fill_super`): root for the
     /// first one.
     root: (AtomicU32, AtomicU32),
+    /// When a queue was last made or unlinked in it, which stamps the root
+    /// (`simple_inode_init_ts`, `simple_unlink`), in nanoseconds since the
+    /// epoch; 0 until it is first used.
+    mtime: AtomicI64,
 }
 
 /// An IPC namespace's limits and defaults, as its `/proc/sys/fs/mqueue`
@@ -232,6 +243,17 @@ impl Queues {
 impl Table {
     fn names(&self) -> MutexGuard<'_, BTreeMap<Vec<u8>, Arc<Queue>>> {
         self.names.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Stamps the root with the time `at`.
+    fn stamp(&self, at: i64) {
+        self.mtime.store(at, Ordering::SeqCst);
+    }
+    /// The root's modification time, which its first use sets.
+    fn mtime(&self, c: &Context<'_>) -> i64 {
+        let _ = self
+            .mtime
+            .compare_exchange(0, now(c), Ordering::SeqCst, Ordering::SeqCst);
+        self.mtime.load(Ordering::SeqCst)
     }
 }
 
@@ -356,6 +378,8 @@ pub(crate) struct Queue {
     /// `simple_inode_init_ts`), in nanoseconds since the epoch, to the
     /// second.
     mtime: AtomicI64,
+    /// Its file's size: `FILENT_SIZE`, or what a truncate set.
+    size: AtomicU64,
     state: Mutex<State>,
     /// Notified whenever a waiter is told, or the queue changes.
     token: WaitToken,
@@ -398,7 +422,7 @@ impl Queue {
     fn stat(&self) -> FileStat {
         FileStat {
             inode: self.inode,
-            size: FILENT_SIZE as u64,
+            size: self.size.load(Ordering::SeqCst),
             mode: S_IFREG | self.mode.load(Ordering::SeqCst),
             uid: self.uid.load(Ordering::SeqCst),
             gid: self.gid.load(Ordering::SeqCst),
@@ -475,6 +499,9 @@ pub(crate) struct QueueFile {
     /// `mq_open`'s, whose filesystem is mounted nowhere, `/dev/mqueue` for
     /// one opened there.
     mounted: &'static [u8],
+    /// Whether it was opened with `O_LARGEFILE`, as `open` gives every file
+    /// on x86-64 and `mq_open` does not.
+    largefile: bool,
 }
 
 impl QueueFile {
@@ -543,7 +570,7 @@ impl FileHandle for QueueFile {
         let base = match whence {
             0 => 0,
             1 => self.position.load(Ordering::SeqCst) as i64,
-            2 => FILENT_SIZE as i64,
+            2 => self.queue.size.load(Ordering::SeqCst) as i64,
             _ => return Err(Errno::EINVAL),
         };
         let position = base.checked_add(offset).ok_or(Errno::EINVAL)?;
@@ -556,10 +583,44 @@ impl FileHandle for QueueFile {
     fn stat(&self) -> Result<FileStat, Errno> {
         Ok(self.queue.stat())
     }
-    fn truncate(&self, _: u64) -> Result<(), Errno> {
-        Err(Errno::EINVAL)
+    /// A truncate sets the size the file reports, as Linux's
+    /// `simple_setattr` does, and nothing else: `EINVAL` for a description
+    /// not open for writing, or past `MAX_NON_LFS` without `O_LARGEFILE`
+    /// (`do_ftruncate`), and `EFBIG` for growing past `MAX_NON_LFS`
+    /// (`inode_newsize_ok`).
+    fn truncate(&self, size: u64) -> Result<(), Errno> {
+        if !self.writable() || size > MAX_NON_LFS && !self.largefile {
+            return Err(Errno::EINVAL);
+        }
+        if size > MAX_NON_LFS && size > self.queue.size.load(Ordering::SeqCst) {
+            return Err(Errno(27)); // EFBIG
+        }
+        self.queue.size.store(size, Ordering::SeqCst);
+        Ok(())
     }
     fn flock(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// A new description of the queue's file with the access mode and
+    /// `O_NONBLOCK` of `flags`, as a truncate of its path opens it.
+    fn reopen(&self, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        Ok(Arc::new(QueueFile {
+            queue: Arc::clone(&self.queue),
+            flags: AtomicU32::new(flags & (O_ACCMODE | NONBLOCK)),
+            position: AtomicU64::new(0),
+            space: Arc::clone(&self.space),
+            mounted: self.mounted,
+            largefile: true,
+        }))
+    }
+    /// `utimensat` and `futimens` set the modification time, to the second
+    /// as `notify_change` truncates it; the access time is not kept.
+    fn set_times(&self, _atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
+        if let Some(mtime) = mtime {
+            let whole = mtime - mtime.rem_euclid(1_000_000_000);
+            let whole = i64::try_from(whole).unwrap_or(if whole < 0 { i64::MIN } else { i64::MAX });
+            self.queue.mtime.store(whole, Ordering::SeqCst);
+        }
         Ok(())
     }
     /// `fchmod` and `fchown` change the queue's file, as on Linux.
@@ -686,6 +747,7 @@ fn mq_open(c: &mut Context<'_>, at: u64, flags: u32, mode: u32, attr: u64) -> Re
         position: AtomicU64::new(0),
         space: c.pid_space(),
         mounted: b"",
+        largefile: false,
     });
     c.files.fill_opened(fd, file, Vec::new(), true);
     Ok(u64::from(fd))
@@ -732,6 +794,7 @@ fn open_in(
     let mode = mode & !c.files.umask() & 0o7777;
     let queue = Arc::new(create(c, queues, name, mode, attr)?);
     names.insert(name.to_vec(), Arc::clone(&queue));
+    queues.0.stamp(now(c));
     Ok(queue)
 }
 
@@ -790,6 +853,7 @@ fn create(
         mode: AtomicU32::new(mode),
         inode: crate::files::anonymous_inode(),
         mtime: AtomicI64::new(created),
+        size: AtomicU64::new(FILENT_SIZE as u64),
         state: Mutex::default(),
         token: WaitToken::default(),
         hub: Arc::clone(&c.files.readiness),
@@ -828,6 +892,7 @@ fn unlink_in(c: &Context<'_>, queues: &Queues, name: &[u8]) -> Result<u64, Errno
     }
     if let Some(queue) = names.remove(name) {
         queue.linked.store(false, Ordering::SeqCst);
+        queues.0.stamp(now(c));
     }
     Ok(0)
 }
@@ -846,15 +911,20 @@ fn mounted(c: &Context<'_>) -> Queues {
 }
 
 /// `/dev/mqueue`'s status: its root, a sticky directory anyone may write,
-/// its maker's.
+/// its maker's, whose size counts its entries (`.`, `..` and each queue)
+/// and whose time is when a queue was last made or unlinked in it.
 pub(crate) fn mounted_root_stat(c: &Context<'_>) -> FileStat {
-    let (uid, gid) = mounted(c).root();
+    let queues = mounted(c);
+    let (uid, gid) = queues.root();
+    let entries = queues.0.names().len() as u64 + 2;
     FileStat {
         inode: MOUNTED_ROOT_INODE,
+        size: entries * DIRENT_SIZE,
         mode: 0o041_777,
         uid,
         gid,
         links: 2,
+        mtime_ns: i128::from(queues.0.mtime(c)),
         ..FileStat::default()
     }
 }
@@ -868,6 +938,44 @@ pub(crate) fn mounted_stat(c: &Context<'_>, name: &[u8]) -> Result<FileStat, Err
         .get(name)
         .map(|queue| queue.stat())
         .ok_or(Errno::ENOENT)
+}
+
+/// The file of the queue `/dev/mqueue/<name>` names, which a call on that
+/// path (`chmod`, `chown`, `utimensat`, `truncate`) changes as it would
+/// the file a descriptor holds: the lookup's errors, and `ENOENT` for no
+/// queue.
+pub(crate) fn mounted_file(c: &Context<'_>, name: &[u8]) -> Result<Arc<dyn FileHandle>, Errno> {
+    look_up(name)?;
+    let queue = mounted(c)
+        .0
+        .names()
+        .get(name)
+        .cloned()
+        .ok_or(Errno::ENOENT)?;
+    Ok(Arc::new(QueueFile {
+        queue,
+        flags: AtomicU32::new(0),
+        position: AtomicU64::new(0),
+        space: c.pid_space(),
+        mounted: b"/dev/mqueue",
+        largefile: true,
+    }))
+}
+
+/// Stamps the queue `file` holds, if it is one, as `ftruncate` does
+/// (`ATTR_MTIME`), where a truncate of its path does not.
+pub(crate) fn truncated(c: &Context<'_>, file: &dyn FileHandle) {
+    if let Some(file) = file
+        .as_any()
+        .and_then(|any| any.downcast_ref::<QueueFile>())
+    {
+        file.queue.mtime.store(now(c), Ordering::SeqCst);
+    }
+}
+
+/// Whether `file` is a queue's, whose filesystem `statfs` reports.
+pub(crate) fn is_queue(file: &dyn FileHandle) -> bool {
+    file.as_any().is_some_and(|any| any.is::<QueueFile>())
 }
 
 /// `/dev/mqueue`'s entries: `.`, `..` (`/dev`, inode `parent`), then the
@@ -934,6 +1042,7 @@ pub(crate) fn open_mounted(
         position: AtomicU64::new(0),
         space: c.pid_space(),
         mounted: b"/dev/mqueue",
+        largefile: true,
     }))
 }
 

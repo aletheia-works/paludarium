@@ -673,7 +673,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `NOTIFY`、`SIGNO`、`NOTIFY_PID`）を返し、`fstat` は 80 バイトの通常ファイルを示し、
   その更新時刻は最後の送信か受信（なければ作成）のときです（失敗したもの、`mq_notify`、
   `mq_getsetattr`、`read` では変わりません）。`mqueue` ファイルシステムは `s_time_gran` を
-  設定しないので、時刻は秒単位です。`fchmod` と `fchown` はそれを変えます。`/proc/self/fd` のリンクは `/<名前>` で、消された
+  設定しないので、時刻は秒単位です。`fchmod`、`fchown`、`futimens` はそれを変えます（時刻は
+  秒単位にします）。`ftruncate` は、Linux の `simple_setattr` と同じく、示すサイズと更新時刻を
+  変えます（`mq_open` は `O_LARGEFILE` を付けないので 2^31 − 1 バイトを超えると `EINVAL`、
+  書き込みのアクセスがなくても `EINVAL`）。`lseek` の終わりはそのサイズです。`fstatfs` は
+  `mqueue` ファイルシステム（`MQUEUE_MAGIC`、ブロックは 1 ページ、名前は 255 バイトまで）を
+  示します。`/proc/self/fd` のリンクは `/<名前>` で、消された
   あとは空白と `(deleted)` が後ろに付きます。メッセージは優先度の高い順（32768 未満。それ以外は
   `EINVAL`）に、同じ優先度なら送った順に出てきます。`mq_msgsize` より小さいバッファーへの
   受信は `EMSGSIZE` で、それより長い送信も同じです。空のキューからの受信といっぱいの
@@ -702,7 +707,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   では `EEXIST`、`O_CREAT` がなければ `ENOENT`、`O_DIRECTORY` では `ENOTDIR` です。
   `O_CREAT` は名前空間の既定の属性でキューを作ります（`mqueue_create`）。`/proc/self/fd` の
   リンクは `/dev/mqueue/<名前>` です。`unlink` は `mq_unlink` と同じくキューを消します
-  （キューへの `rmdir` は `ENOTDIR`）。
+  （キューへの `rmdir` は `ENOTDIR`）。キューのパスへの `chmod`、`chown`、`utimensat`、
+  `utimes`、`truncate` は、記述子への呼び出しと同じくそのファイルを変え、確かめる権限も
+  同じです（`EPERM`、`EACCES`）。ただし、パスへの truncate は更新時刻を変えず、2^31 − 1
+  バイトまで伸ばせます（それを超えると、スーパーブロックの `s_maxbytes` のとおり `EFBIG`）。
+  `statfs` は `mqueue` ファイルシステムを示します。ルートのサイズはエントリー（`.`、`..`、
+  それぞれのキュー）ごとに 20 バイト（`DIRENT_SIZE`）で、更新時刻はそこで最後にキューを
+  作ったか消したときです。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。

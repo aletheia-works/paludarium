@@ -854,8 +854,9 @@ void _start(void) {
   results[x++]=call(295,fd,(long)v2,3,0,0,0);
   /* No entries read nothing, too many are EINVAL even at a bad address, and an array past the user half is EFAULT. */
   results[x++]=S(19,fd,1,0);results[x++]=S(19,fd,K,1025);results[x++]=S(19,fd,K,2);results[x++]=S(20,fd,K,1);
-  /* Of several buffers, each is access_ok with its whole length. */
-  v3[0]=(long)buf;v3[1]=1;v3[2]=(long)buf;v3[3]=0x0000800000000000L;
+  /* Of several buffers, each is access_ok with its whole length: 2^56 is past
+     the user half with five-level page tables too. */
+  v3[0]=(long)buf;v3[1]=1;v3[2]=(long)buf;v3[3]=0x0100000000000000L;
   results[x++]=S(19,fd,v3,2);results[x++]=S(8,fd,0,1);
   /* The access mode comes first, as vfs_readv and vfs_writev check it before import_iovec. */
   long rd=S(2,p,0,0),wr=S(2,p,1,0);

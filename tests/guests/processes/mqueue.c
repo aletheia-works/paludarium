@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1228,6 +1229,50 @@ static int files_case(void) {
     return 0;
 }
 
+/* TEMPORARY diagnostic: the raw times around a queue's sends and receives,
+   to find out why Linux's modification time sometimes does not move. */
+static void times_line(const char *label, long fd) {
+    struct stat st;
+    struct timespec real, coarse;
+    long stated = TRY(fstat((int)fd, &st));
+    clock_gettime(CLOCK_REALTIME, &real);
+    long coarse_ok = TRY(clock_gettime(CLOCK_REALTIME_COARSE, &coarse));
+    say("%s: stat=%ld atim=%lld.%09ld mtim=%lld.%09ld ctim=%lld.%09ld real=%lld.%09ld coarse(%ld)=%lld.%09ld", label,
+        stated, (long long)st.st_atim.tv_sec, st.st_atim.tv_nsec, (long long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec,
+        (long long)st.st_ctim.tv_sec, st.st_ctim.tv_nsec, (long long)real.tv_sec, real.tv_nsec, coarse_ok,
+        (long long)coarse.tv_sec, coarse.tv_nsec);
+}
+static int times_diag_case(void) {
+    if (isolate()) return 10;
+    struct utsname u;
+    uname(&u);
+    say("kernel: %s %s", u.release, u.version);
+    struct mq_attr two = {.mq_maxmsg = 2, .mq_msgsize = 8};
+    long q = q_open("diag", O_RDWR | O_CREAT | O_NONBLOCK, 0600, &two);
+    if (q < 0) return 11;
+    times_line("made", q);
+    for (int round = 0; round < 4; round++) {
+        pause_ms(250);
+        times_line("before-send", q);
+        long sent = q_send(q, "a", 1, 0, NULL);
+        printf("send=%ld ", sent);
+        times_line("after-send", q);
+        pause_ms(250);
+        times_line("before-receive", q);
+        long got = q_receive(q, 8, NULL);
+        printf("receive=%ld ", got);
+        times_line("after-receive", q);
+    }
+    /* The same with the queue opened again, and through a second
+       descriptor. */
+    long again = q_open("diag", O_RDWR | O_NONBLOCK, 0, NULL);
+    pause_ms(250);
+    q_send(again, "b", 1, 0, NULL);
+    times_line("after-send-other-fd", q);
+    times_line("after-send-other-fd-self", again);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -1240,5 +1285,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-sysctl")) return sysctl_case();
     if (!strcmp(mode, "mqueue-accounts")) return accounts_case();
     if (!strcmp(mode, "mqueue-files")) return files_case();
+    if (!strcmp(mode, "mqueue-times-diag")) return times_diag_case();
     return 3;
 }

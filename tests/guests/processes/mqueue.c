@@ -1892,6 +1892,112 @@ static int room_case(void) {
     return 0;
 }
 
+/* A netlink socket a kernel message overran is held congested until its
+   queue is emptied (NETLINK_S_CONGESTED): the overrun's ENOBUFS comes
+   once, later messages are dropped even where they would fit, and a
+   SIGEV_THREAD registration waits, where a signal without SA_RESTART
+   ends it. Only whether each thing happened is shown, as how many
+   messages fit takes their truesize. */
+struct link_request {
+    struct {
+        unsigned int len;
+        unsigned short type, flags;
+        unsigned int seq, pid;
+    } header;
+    struct {
+        unsigned char family, pad;
+        unsigned short type;
+        int index;
+        unsigned int flags, change;
+    } link;
+};
+
+static long ask_link(int s, unsigned int seq) {
+    struct link_request request = {
+        .header = {.len = sizeof request, .type = 18 /* RTM_GETLINK */, .flags = 1, .seq = seq},
+        .link = {.index = 1},
+    };
+    return TRY(send(s, &request, sizeof request, 0));
+}
+
+static int has_error(int s) {
+    struct pollfd p = {.fd = s};
+    return poll(&p, 1, 0) == 1 && (p.revents & POLLERR) != 0;
+}
+
+/* Receives what is queued, and says whether a message of `seq` was among
+   it (1), none (0), or the receive failed (its -errno). */
+static long drain_for(int s, unsigned int seq) {
+    static char buf[1 << 16];
+    long seen = 0;
+    for (;;) {
+        long n = TRY(recv(s, buf, sizeof buf, MSG_DONTWAIT));
+        if (n == -EAGAIN) return seen;
+        if (n < 0) return n;
+        for (long at = 0; at + 16 <= n;) {
+            unsigned int len, got;
+            memcpy(&len, buf + at, 4);
+            memcpy(&got, buf + at + 8, 4);
+            if (got == seq) seen = 1;
+            if (len < 16) break;
+            at += (len + 3) & ~3L;
+        }
+    }
+}
+
+static int congested_case(void) {
+    if (isolate()) return 10;
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0);
+    if (s < 0) return 11;
+    /* Room for several replies, so that some are still queued after a
+       few receives have made room for a cookie. */
+    int room = 32768;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &room, sizeof room);
+    struct sigaction interrupt = {.sa_handler = handler};
+    sigaction(SIGALRM, &interrupt, NULL);
+    enum { MOST = 256 };
+    int sent = 0;
+    while (sent < MOST && !has_error(s)) {
+        if (ask_link(s, (unsigned int)sent + 1) < 0) return 12;
+        sent++;
+    }
+    printf("congested:");
+    put("overran", sent > 1 && sent < MOST);
+    int error = 0;
+    socklen_t size = sizeof error;
+    getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &size);
+    put("error", error);
+    char buf[1 << 16];
+    long three = 0;
+    for (int i = 0; i < 3; i++) three += TRY(recv(s, buf, sizeof buf, MSG_DONTWAIT)) > 0;
+    put("three", three);
+    /* Room for more, but the socket is still congested. */
+    put("ask", ask_link(s, 9999) > 0);
+    put("error-again", has_error(s));
+    static char cookie[32] = "cookie";
+    struct sigevent event = {.sigev_notify = SIGEV_THREAD, .sigev_signo = s};
+    event.sigev_value.sival_ptr = cookie;
+    struct mq_attr one = {.mq_maxmsg = 1, .mq_msgsize = 1};
+    long q = q_open("congested", O_RDWR | O_CREAT, 0600, &one);
+    if (q < 0) return 13;
+    caught = 0;
+    arm(200);
+    put("notify-waits", q_notify(q, &event));
+    arm(0);
+    put("caught", caught);
+    put("dropped", drain_for(s, 9999) == 0);
+    say("");
+    /* Emptied, it takes messages and cookies again. */
+    printf("emptied:");
+    put("ask", ask_link(s, 10000) > 0);
+    put("answered", drain_for(s, 10000));
+    arm(500);
+    put("notify", q_notify(q, &event));
+    arm(0);
+    say("");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -1906,5 +2012,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-files")) return files_case();
     if (!strcmp(mode, "mqueue-dev")) return dev_case();
     if (!strcmp(mode, "mqueue-room")) return room_case();
+    if (!strcmp(mode, "mqueue-congested")) return congested_case();
     return 3;
 }

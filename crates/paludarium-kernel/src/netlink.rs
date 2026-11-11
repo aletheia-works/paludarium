@@ -328,6 +328,11 @@ struct State {
     longest_read: usize,
     /// An error a receive gives before anything else (`sk_err`).
     error: Option<Errno>,
+    /// Whether a message from the kernel found no room, which holds the
+    /// socket congested until a receive empties its queue
+    /// (`NETLINK_S_CONGESTED`): no other message nor `SIGEV_THREAD`
+    /// cookie is taken till then.
+    congested: bool,
     arrivals: u64,
     receive_buffer: i32,
     send_buffer: i32,
@@ -512,10 +517,26 @@ impl NetlinkSocket {
         Ok(s.port.unwrap_or(0))
     }
     /// Queues a datagram for this socket, as `netlink_attachskb`: one that
-    /// finds the receive buffer full is dropped, with `ENOBUFS` for the
-    /// next receive (`netlink_overrun`).
+    /// finds the receive buffer full, or the socket congested, is dropped
+    /// (`netlink_overrun`), and the first such one gives `ENOBUFS` for the
+    /// next receive and holds the socket congested until it is emptied.
     fn deliver(&self, s: &mut State, from: u32, group: u32, bytes: Vec<u8>) {
-        if s.queued + s.charged >= usize::try_from(s.receive_buffer).unwrap_or(0) {
+        self.offer(s, (from, group, bytes), true);
+    }
+    /// Queues a part of a dump, as `netlink_dump` does without looking at
+    /// congestion: one that finds the receive buffer full is dropped, with
+    /// `ENOBUFS` for the next receive.
+    fn deliver_dump(&self, s: &mut State, bytes: Vec<u8>) {
+        self.offer(s, (0, 0, bytes), false);
+    }
+    fn offer(&self, s: &mut State, (from, group, bytes): (u32, u32, Vec<u8>), overrun: bool) {
+        let full = s.queued + s.charged >= usize::try_from(s.receive_buffer).unwrap_or(0);
+        if overrun && (full || s.congested) {
+            if !s.congested {
+                s.congested = true;
+                s.error = Some(ENOBUFS);
+            }
+        } else if full {
             s.error = Some(ENOBUFS);
         } else {
             let size = bytes.len();
@@ -532,12 +553,15 @@ impl NetlinkSocket {
     }
     /// Charges a kernel buffer of `truesize` bytes held for a later send to
     /// the receive buffer, as `netlink_attachskb` does when the socket holds
-    /// nothing or has room for it, and says whether it did; a caller that
-    /// may wait waits until a receive makes room, and tries again.
+    /// nothing or has room for it and is not congested, and says whether it
+    /// did; a caller that may wait waits until a receive makes room, and
+    /// tries again.
     pub(crate) fn charge(&self, truesize: usize) -> bool {
         let mut s = self.lock();
         let held = s.queued + s.charged + truesize;
-        if held == truesize || held <= usize::try_from(s.receive_buffer).unwrap_or(0) {
+        if !s.congested
+            && (held == truesize || held <= usize::try_from(s.receive_buffer).unwrap_or(0))
+        {
             s.charged += truesize;
             true
         } else {
@@ -786,9 +810,9 @@ impl NetlinkSocket {
                 &0i32.to_le_bytes(),
             );
             if messages.is_empty() {
-                self.deliver(s, 0, 0, done);
+                self.deliver_dump(s, done);
             } else {
-                self.deliver(s, 0, 0, messages);
+                self.deliver_dump(s, messages);
                 s.done = Some(done);
             }
             return Ok(true);
@@ -913,6 +937,22 @@ impl NetlinkSocket {
     /// datagram's length, and its sender and group.
     fn receive(&self, buf: &mut [u8], peek: bool) -> Result<(usize, usize, u32, u32), Errno> {
         let mut s = self.lock();
+        let got = self.next_datagram(&mut s, buf, peek);
+        // `netlink_rcv_wake`, whatever the receive gave: an empty queue is
+        // no longer congested.
+        if s.congested && s.queue.is_empty() {
+            s.congested = false;
+            self.hub.changed();
+        }
+        got
+    }
+    /// [`Self::receive`] but for its wake.
+    fn next_datagram(
+        &self,
+        s: &mut State,
+        buf: &mut [u8],
+        peek: bool,
+    ) -> Result<(usize, usize, u32, u32), Errno> {
         if let Some(error) = s.error.take() {
             return Err(error);
         }
@@ -933,10 +973,10 @@ impl NetlinkSocket {
         s.longest_read = s.longest_read.max(buf.len()).min(MOST_DUMP_PART);
         if s.queued <= usize::try_from(s.receive_buffer / 2).unwrap_or(0) {
             if !s.rest.is_empty() {
-                let part = dump_part(&mut s);
-                self.deliver(&mut s, 0, 0, part);
+                let part = dump_part(s);
+                self.deliver_dump(s, part);
             } else if let Some(done) = s.done.take() {
-                self.deliver(&mut s, 0, 0, done);
+                self.deliver_dump(s, done);
             }
         }
         Ok(got)
@@ -946,12 +986,12 @@ impl NetlinkSocket {
     /// `done` alone when there is nothing to dump.
     fn start_dump(&self, s: &mut State, messages: Vec<Vec<u8>>, done: Vec<u8>) {
         if messages.is_empty() {
-            self.deliver(s, 0, 0, done);
+            self.deliver_dump(s, done);
             return;
         }
         s.rest = messages.into();
         let part = dump_part(s);
-        self.deliver(s, 0, 0, part);
+        self.deliver_dump(s, part);
         s.done = Some(done);
     }
 }

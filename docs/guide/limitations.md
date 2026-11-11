@@ -205,9 +205,7 @@ verified.
   - A `SIGEV_THREAD` cookie takes 960 bytes of its netlink socket's
     receive buffer, its `truesize` on the CI runner's kernel, while the
     socket's other datagrams take their length, where Linux counts their
-    `truesize` too; and a socket that dropped a datagram for want of room
-    is not held congested until it is emptied, as Linux's is
-    (`NETLINK_S_CONGESTED`), so a waiting `mq_notify` may register sooner.
+    `truesize` too, so a socket may hold more of them before it is full.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
     where Linux checks the writer again at each write, and it reports its
     value's length as its size, where Linux reports 0.

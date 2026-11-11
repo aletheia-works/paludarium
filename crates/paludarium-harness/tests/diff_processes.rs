@@ -170,6 +170,7 @@ mod linux {
                     | "mqueue-files"
                     | "mqueue-dev"
                     | "mqueue-room"
+                    | "mqueue-congested"
                     | "netlink"
                     | "unix-interfaces"
                     | "addresses"
@@ -365,6 +366,7 @@ mod linux {
         mqueue_files => ("mqueue-files","mqueue"),
         mqueue_dev => ("mqueue-dev","mqueue"),
         mqueue_room => ("mqueue-room","mqueue"),
+        mqueue_congested => ("mqueue-congested","mqueue"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),

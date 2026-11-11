@@ -788,8 +788,9 @@ kernel.
   `sigev_notify_function`. The cookie takes room in that socket's receive
   buffer from the registration on, as Linux's `netlink_attachskb` charges
   it, until it is received: while the socket holds something and has no
-  room for it, `mq_notify` waits, before it looks the queue up, until a
-  receive makes room (a signal ends the wait, `EINTR`, unless
+  room for it, or is held congested (`NETLINK_S_CONGESTED`, under the netlink socket below), `mq_notify` waits, before
+  it looks the queue up, until a receive makes room or empties it (a
+  signal ends the wait, `EINTR`, unless
   `SA_RESTART` restarts it), and gives the room back if it then fails.
   Closing any descriptor of the queue, or ending,
   drops its process's registration, as Linux's `mqueue_flush_file`.
@@ -1111,7 +1112,12 @@ kernel.
     (`ECONNREFUSED` for none). `recvmsg` gives the sender's `sockaddr_nl`,
     `MSG_PEEK` and `MSG_TRUNC` work, and `SO_RCVBUF`, `SO_SNDBUF`,
     `SO_RCVTIMEO`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
-    `NETLINK_GET_STRICT_CHK` can be set.
+    `NETLINK_GET_STRICT_CHK` can be set. A message from the kernel that
+    finds the receive buffer full is dropped, with `ENOBUFS` for the next
+    receive, and the socket is then held congested, as Linux's
+    `NETLINK_S_CONGESTED`: it drops the kernel's other messages too, with
+    no other `ENOBUFS`, until a receive finds its queue empty. A dump's
+    parts do not look at it.
   - **Requests:** the kernel, port 0, takes each message of a datagram as
     `rtnetlink` does. A dump (`NLM_F_DUMP`) ends with `NLMSG_DONE` at the
     next receive. An error, or a success with `NLM_F_ACK`, is answered with

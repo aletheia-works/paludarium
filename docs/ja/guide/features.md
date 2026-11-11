@@ -700,8 +700,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   終わるときは 2（`NOTIFY_REMOVED`）です。C ライブラリーの補助スレッドはこれを読んで
   `sigev_notify_function` を始めます。クッキーは、Linux の `netlink_attachskb` と同じく、
   登録のときから受け取られるまで、そのソケットの受信バッファーの空きを取ります。ソケットに
-  何かがあり、クッキーの空きがなければ、`mq_notify` はキューを引く前に、受信で空きができるまで
-  待ちます（シグナルで待ちは終わり `EINTR`。`SA_RESTART` なら再開します）。そのあと失敗すれば
+  何かがあり、クッキーの空きがないか、ソケットが混んでいる（`NETLINK_S_CONGESTED`。下の netlink ソケットを参照）とされていれば、
+  `mq_notify` はキューを引く前に、受信で空きができるか空になるまで待ちます（シグナルで待ちは終わり `EINTR`。`SA_RESTART` なら再開します）。そのあと失敗すれば
   空きを返します。キューのどの記述子を閉じても、またはプロセスが
   終わっても、Linux の `mqueue_flush_file` と同じくそのプロセスの登録は外れます。
 - `/dev/mqueue` は、Linux の起動時に systemd がマウントするのと同じく、呼び出し元がどの IPC
@@ -973,7 +973,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     データグラムはそのソケットに届きます（なければ `ECONNREFUSED`）。`recvmsg` は送り手の
     `sockaddr_nl` を返し、`MSG_PEEK` と `MSG_TRUNC` が使えます。`SO_RCVBUF`、
     `SO_SNDBUF`、`SO_RCVTIMEO`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
-    `NETLINK_GET_STRICT_CHK` を設定できます。
+    `NETLINK_GET_STRICT_CHK` を設定できます。受信バッファーがいっぱいのときにカーネルから来た
+    メッセージは捨て、次の受信で `ENOBUFS` を返します。そのあとソケットは、Linux の
+    `NETLINK_S_CONGESTED` と同じく混んでいるとされ、受信でキューが空になるまで、カーネルから
+    来るほかのメッセージも捨てます（`ENOBUFS` は繰り返しません）。ダンプの続きはこれを
+    見ません。
   - **リクエスト:** カーネル（ポート 0）は、`rtnetlink` と同じくデータグラムのメッセージを
     1 つずつ受け取ります。ダンプ（`NLM_F_DUMP`）は次の受信の `NLMSG_DONE` で終わります。
     エラーと、`NLM_F_ACK` を付けた成功には `NLMSG_ERROR` を返し、エラーのものは

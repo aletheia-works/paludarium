@@ -80,6 +80,7 @@ cases!(link_flags=>67,host_link_flags=>67);
 cases!(magic_link_walk=>68,host_magic_link_walk=>68);
 cases!(splice_files=>69,host_splice_files=>69,splice_tee=>70,host_splice_tee=>70);
 cases!(splice_vmsplice=>71,host_splice_vmsplice=>71,splice_sockets=>72,host_splice_sockets=>72);
+cases!(splice_restart=>73,host_splice_restart=>73);
 cases!(null_stat=>0,null_lstat=>1,null_statat=>2,read_write=>3,files_hard_link=>4,files_symlink=>5,files_rename=>6,files_flock=>7,fstat_errors=>8,unlink_open=>9,dup_offset=>10,open_errors=>11,files_directory=>12,getdents=>13,at_operations=>14,symlinkat=>15,statat_flags=>16,files_truncate=>17,fcntl=>18,files_dangling=>19,empty_path=>20,create_dangling=>21,renamed_dirfd=>22,closed_stdio=>23,redirect_stdout=>24,dup_stdout=>25,flock_dup_close=>26,append_fcntl=>27,huge_invalid_buffer=>28,directory_link_count=>29,rename_replace=>30,files_readonly_create=>31);
 
 use paludarium_host::{ClockId, Host, WaitOutcome, testing::RecordingHost};

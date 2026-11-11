@@ -1827,13 +1827,13 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `sigaltstack`、リアルタイムシグナルのキュー、`SIGSTOP` による停止と再開を扱います。
   停止で中断されたブロッキングの呼び出しは、ハンドラが動かないときの Linux と同じく、
   再開の後にやり直します。対象は `read`、`write`、`readv`、`writev`、`pread64`、`pwrite64`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`wait4`、`waitid`、`pause`、`rt_sigsuspend`、`flock`、
-  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`splice`、`tee`、`vmsplice`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
+  `fcntl` の `F_SETLKW` と `F_OFD_SETLKW`、FIFO を開く `open`・`openat`・`openat2`、`accept`、`accept4`、`sendto`、`recvfrom`、`sendmsg`、`recvmsg`、`sendmmsg`、`recvmmsg`、`msgsnd`、`msgrcv`、`mq_timedsend`、`mq_timedreceive`、`sendfile`、`splice`、`tee`、`vmsplice`、`ppoll`、`select`、`pselect6`、時間制限なしの `poll`、時間制限なしの `futex` の待ちです。
   `nanosleep`、相対時間の `clock_nanosleep`、時間制限つきの `poll`、時間制限つきの `futex` の待ちは、
   `restart_syscall` で元の締め切りのまま待ちを続け（`futex` は先に値をもう一度確かめ、変わっていれば
   `EAGAIN` を返します）、絶対時刻の `clock_nanosleep` はもう一度実行します。ハンドラが
   動いたときはやり直さず、`EINTR` を返します。
   `SA_RESTART` を付けたハンドラが動いたときは、Linux と同じく、ハンドラから戻った後に、停止の後にやり直す呼び出し（`read` から時間制限なしの `futex` の待ちまで）をやり直します。
-  ただし `pause`、`rt_sigsuspend`、`poll`、`ppoll`、`select`、`pselect6` と、`SO_RCVTIMEO` や `SO_SNDTIMEO`
+  ただし `pause`、`rt_sigsuspend`、`msgsnd`、`msgrcv`、`poll`、`ppoll`、`select`、`pselect6` と、`SO_RCVTIMEO` や `SO_SNDTIMEO`
   で待ちに時間制限のあるソケットの呼び出しは、`EINTR` を返します。
   `epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。
   `rt_sigsuspend` は、シグナルのマスクを渡されたマスクに置き換えてハンドラが動くまで待ちます。

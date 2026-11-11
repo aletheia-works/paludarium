@@ -5978,6 +5978,20 @@ static int futex_requeue_case(void) {
     for (int i = 0; i < 3; i++) pthread_join(t[i], NULL);
     printf("requeue moved=%ld woke-b=%ld back=%ld woke-a=%ld left-b=%ld results=%ld,%ld,%ld\n",
            moved, woke_b, back, woke_a, left_b, rq_results[0], rq_results[1], rq_results[2]);
+    /* Onto its own word: Linux's walk meets a moved waiter again. */
+    for (long i = 0; i < 2; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
+    for (moved = 0; moved < 2;) {
+        long r = rq_old(4 | 128, a, 0, INT_MAX, b, 0);
+        if (r < 0) return 81;
+        moved += r;
+        if (moved < 2) sched_yield();
+    }
+    long same = rq_old(4 | 128, b, 0, 3, b, 0);
+    long alone_woke = f2_errno(syscall(SYS_futex, b, 1 | 128, 1, NULL, NULL, 0));
+    long alone = rq_old(4 | 128, b, 0, 5, b, 0);
+    long rest = f2_errno(syscall(SYS_futex, b, 1 | 128, INT_MAX, NULL, NULL, 0));
+    for (int i = 0; i < 2; i++) pthread_join(t[i], NULL);
+    printf("requeue same-word=%ld woke=%ld alone=%ld rest=%ld\n", same, alone_woke, alone, rest);
 
     struct f2_waitv w[2] = {{0, (uintptr_t)&rq_words[2], F2_U32_PRIVATE, 0},
                             {0, (uintptr_t)&rq_words[3], F2_U32_PRIVATE, 0}};

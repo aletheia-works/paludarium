@@ -234,7 +234,9 @@ impl Futexes {
     /// then each word's [`checked_key`], then, with `compare`, `from`'s value
     /// (`EFAULT`, and `EAGAIN` when it differs). Waiters are taken in the
     /// order they came, whatever their bits, and a moved one keeps its own
-    /// and comes after those already waiting at `to`.
+    /// and comes after those already waiting at `to`, as `requeue_futex`
+    /// puts it at the end of the list. Onto its own word a waiter stays where
+    /// it is, as Linux leaves one within its bucket, and is counted once.
     pub fn requeue(
         &self,
         mem: &AddressSpace,
@@ -273,6 +275,9 @@ impl Futexes {
             if taken <= wake {
                 waiter.state.store(1, Ordering::SeqCst);
                 waiter.token.notify();
+            } else if first == second {
+                // `requeue_futex` leaves a waiter in place in its own bucket.
+                kept.push(waiter);
             } else {
                 *waiter.key.lock().unwrap_or_else(PoisonError::into_inner) = second;
                 moved.push(waiter);

@@ -1012,11 +1012,22 @@ fn futex_requeue_wakes_then_moves_in_order() {
     assert_eq!(f.finish(&at_from[2], 2), 2);
     assert_eq!(f.wake(&m, DATA + 4, true, 9, u32::MAX), Ok(0));
     assert_eq!(f.wake(&m, DATA, true, 9, u32::MAX), Ok(1));
-    // Onto its own word, a waiter goes to the end of the queue.
-    let a = f.register(&m, DATA, true, 0, u32::MAX).unwrap();
-    let b = f.register(&m, DATA, true, 0, u32::MAX).unwrap();
-    assert_eq!(f.requeue(&m, from, from, 0, 1, None), Ok(1));
+}
+#[test]
+fn futex_requeue_onto_its_own_word_leaves_waiters_in_place() {
+    let m = memory();
+    let f = futex::Futexes::default();
+    let word = (DATA, true, false);
+    let waiters: Vec<_> = (0..2)
+        .map(|_| f.register(&m, DATA, true, 0, u32::MAX).unwrap())
+        .collect();
+    // Each is counted once, and their order stays, as native gives.
+    assert_eq!(f.requeue(&m, word, word, 0, 3, None), Ok(2));
+    assert_eq!(f.requeue(&m, word, word, 0, 1, None), Ok(1));
     assert_eq!(f.wake(&m, DATA, true, 1, u32::MAX), Ok(1));
-    assert_eq!(b.state.load(Ordering::SeqCst), 1);
-    assert_eq!(a.state.load(Ordering::SeqCst), 0);
+    assert_eq!(waiters[0].state.load(Ordering::SeqCst), 1);
+    assert_eq!(waiters[1].state.load(Ordering::SeqCst), 0);
+    // Woken first, up to the wake count.
+    assert_eq!(f.requeue(&m, word, word, 1, 5, None), Ok(1));
+    assert_eq!(waiters[1].state.load(Ordering::SeqCst), 1);
 }

@@ -30,6 +30,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -1301,6 +1302,100 @@ static void show_statfs(const char *label, long result, const struct statfs *s) 
 }
 #define ATTRS_NAME DEV_NAME "-attrs"
 #define ATTRS_PATH "/dev/mqueue/" ATTRS_NAME
+#define DEV_PATH(suffix) "/dev/mqueue/" DEV_NAME suffix
+/* Making and moving names in /dev/mqueue, whose root has only the
+   operations to look up, make (a queue) and unlink: mkdir, symlink and
+   mknod of anything but a regular file are EPERM once the name is free,
+   mknod of a regular file makes a queue, and link and rename are EXDEV
+   to or from another mount and EPERM within it. ATTRS_PATH is a queue. */
+static int dev_names(void) {
+    const char *made[] = {"-dir", "-sym", "-fifo", "-chr", "-node", "-zero", "-link", "-moved", "-in"};
+    for (unsigned i = 0; i < sizeof made / sizeof *made; i++) {
+        char name[128];
+        snprintf(name, sizeof name, DEV_NAME "%s", made[i]);
+        q_unlink(name);
+    }
+    printf("make:");
+    put("mkdir", TRY(mkdir(DEV_PATH("-dir"), 0700)));
+    put("mkdir-there", TRY(mkdir(ATTRS_PATH, 0700)));
+    put("mkdir-root", TRY(mkdir("/dev/mqueue", 0700)));
+    put("symlink-root", TRY(symlink("target", "/dev/mqueue")));
+    put("mknod-root", TRY(mknod("/dev/mqueue", S_IFREG | 0600, 0)));
+    put("symlink", TRY(symlink("target", DEV_PATH("-sym"))));
+    put("symlink-there", TRY(symlink("target", ATTRS_PATH)));
+    put("fifo", TRY(mknod(DEV_PATH("-fifo"), S_IFIFO | 0600, 0)));
+    put("chr", TRY(mknod(DEV_PATH("-chr"), S_IFCHR | 0600, makedev(1, 3))));
+    put("dir", TRY(mknod(DEV_PATH("-dir"), S_IFDIR | 0700, 0)));
+    put("bad-type", TRY(mknod(DEV_PATH("-dir"), 0170000 | 0700, 0)));
+    put("fifo-there", TRY(mknod(ATTRS_PATH, S_IFIFO | 0600, 0)));
+    put("listed", listed_type(DEV_NAME "-dir") + listed_type(DEV_NAME "-sym") + listed_type(DEV_NAME "-fifo") +
+                      listed_type(DEV_NAME "-chr"));
+    say("");
+    mode_t mask = umask(027);
+    printf("mknod:");
+    put("regular", TRY(mknod(DEV_PATH("-node"), S_IFREG | 0666, 0)));
+    put("type", listed_type(DEV_NAME "-node"));
+    struct stat st = {0};
+    put("stat", TRY(stat(DEV_PATH("-node"), &st)));
+    printf(" mode=%o", st.st_mode);
+    put("zero-type", TRY(mknod(DEV_PATH("-zero"), 0600, 0)));
+    put("again", TRY(mknod(DEV_PATH("-node"), S_IFREG | 0600, 0)));
+    say("");
+    umask(mask);
+    long node = q_open(DEV_NAME "-node", O_RDONLY, 0, NULL);
+    show_attr("node", node);
+    close((int)node);
+
+    char dir[] = "/tmp/mqueue-dev-XXXXXX";
+    if (!mkdtemp(dir)) return 1;
+    char file[64], other[64], none[64];
+    snprintf(file, sizeof file, "%s/file", dir);
+    snprintf(other, sizeof other, "%s/other", dir);
+    snprintf(none, sizeof none, "%s/none/x", dir);
+    int fd = open(file, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return 2;
+    close(fd);
+    printf("link:");
+    put("inside", TRY(link(ATTRS_PATH, DEV_PATH("-link"))));
+    put("onto", TRY(link(ATTRS_PATH, DEV_PATH("-node"))));
+    put("missing", TRY(link(DEV_PATH("-none"), DEV_PATH("-link"))));
+    put("follow", TRY(linkat(AT_FDCWD, ATTRS_PATH, AT_FDCWD, DEV_PATH("-link"), AT_SYMLINK_FOLLOW)));
+    put("out", TRY(link(ATTRS_PATH, other)));
+    put("out-onto", TRY(link(ATTRS_PATH, file)));
+    put("in", TRY(link(file, DEV_PATH("-in"))));
+    put("in-missing", TRY(link(other, DEV_PATH("-in"))));
+    put("in-onto", TRY(link(file, ATTRS_PATH)));
+    long by_name = q_open(ATTRS_NAME, O_RDONLY, 0, NULL);
+    long by_path = TRY(open(ATTRS_PATH, O_RDONLY | O_CLOEXEC));
+    put("empty-mq_open", TRY(linkat((int)by_name, "", AT_FDCWD, DEV_PATH("-link"), AT_EMPTY_PATH)));
+    put("empty-opened", TRY(linkat((int)by_path, "", AT_FDCWD, DEV_PATH("-link"), AT_EMPTY_PATH)));
+    put("empty-onto", TRY(linkat((int)by_path, "", AT_FDCWD, DEV_PATH("-node"), AT_EMPTY_PATH)));
+    close((int)by_name);
+    close((int)by_path);
+    put("listed", listed_type(DEV_NAME "-link") + listed_type(DEV_NAME "-in"));
+    say("");
+    printf("rename:");
+    put("inside", TRY(rename(ATTRS_PATH, DEV_PATH("-moved"))));
+    put("onto", TRY(rename(ATTRS_PATH, DEV_PATH("-node"))));
+    put("itself", TRY(rename(ATTRS_PATH, ATTRS_PATH)));
+    put("missing", TRY(rename(DEV_PATH("-none"), DEV_PATH("-moved"))));
+    put("noreplace", TRY(syscall(SYS_renameat2, AT_FDCWD, ATTRS_PATH, AT_FDCWD, DEV_PATH("-node"), 1)));
+    put("noreplace-itself", TRY(syscall(SYS_renameat2, AT_FDCWD, ATTRS_PATH, AT_FDCWD, ATTRS_PATH, 1)));
+    put("exchange-missing", TRY(syscall(SYS_renameat2, AT_FDCWD, ATTRS_PATH, AT_FDCWD, DEV_PATH("-none"), 2)));
+    put("exchange", TRY(syscall(SYS_renameat2, AT_FDCWD, ATTRS_PATH, AT_FDCWD, DEV_PATH("-node"), 2)));
+    put("out", TRY(rename(ATTRS_PATH, other)));
+    put("out-missing", TRY(rename(DEV_PATH("-none"), other)));
+    put("in", TRY(rename(file, DEV_PATH("-in"))));
+    put("in-no-directory", TRY(rename(none, DEV_PATH("-in"))));
+    put("listed", listed_type(DEV_NAME "-moved") + listed_type(DEV_NAME "-in"));
+    put("kept", listed_type(ATTRS_NAME));
+    say("");
+    unlink(file);
+    rmdir(dir);
+    q_unlink(DEV_NAME "-node");
+    q_unlink(DEV_NAME "-zero");
+    return 0;
+}
 /* The calls on a queue's path in /dev/mqueue, which change its file as
    simple_setattr does: its mode and owner, its modification time (to the
    second, and only that time is compared), and its size, which only a
@@ -1452,6 +1547,7 @@ static int dev_paths(void) {
         say("user-%d: status=%d", user, wait_child(pid));
     }
     show_file("users", ATTRS_PATH);
+    if (dev_names()) return 24;
 
     close((int)q);
     if (stat("/dev/mqueue", &root)) return 23;

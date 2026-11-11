@@ -1061,6 +1061,36 @@ pub(crate) fn open_mounted(
     Ok(file)
 }
 
+/// Whether `/dev/mqueue/<name>` names a queue, after the lookup's errors.
+pub(crate) fn mounted_there(c: &Context<'_>, name: &[u8]) -> Result<bool, Errno> {
+    look_up(name)?;
+    Ok(mounted(c).0.names().contains_key(name))
+}
+
+/// A new name `/dev/mqueue/<name>`, as `filename_create` and the `mqueue`
+/// root's operations answer it: the lookup's errors, `EEXIST` for a name
+/// in use, then `landlock`'s check (`security_path_mkdir` and the like),
+/// then a queue of the namespace's default attributes and permissions
+/// `mode` less the umask for a regular file (`vfs_create` and
+/// `mqueue_create`), or `EPERM` for anything else, which the root has no
+/// operation to make (`mkdir`, `mknod`, `symlink`).
+pub(crate) fn make_mounted(
+    c: &Context<'_>,
+    name: &[u8],
+    regular: Option<u32>,
+    landlock: impl FnOnce() -> Result<(), Errno>,
+) -> Result<u64, Errno> {
+    if mounted_there(c, name)? {
+        return Err(Errno::EEXIST);
+    }
+    landlock()?;
+    let Some(mode) = regular else {
+        return Err(Errno::EPERM);
+    };
+    open_in(c, &mounted(c), name, O_CREAT | O_EXCL, mode & 0o7777, None)?;
+    Ok(0)
+}
+
 /// `unlink` of `/dev/mqueue/<name>`, as [`mq_unlink`], and `rmdir`, in
 /// the order of Linux's `do_unlinkat` and `do_rmdir`: the lookup
 /// (`ENAMETOOLONG`, `ENOENT`), then `landlock`'s check of the removal

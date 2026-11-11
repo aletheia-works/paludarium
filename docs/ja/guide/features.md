@@ -715,7 +715,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   バイトまで伸ばせます（それを超えると、スーパーブロックの `s_maxbytes` のとおり `EFBIG`）。
   `statfs` は `mqueue` ファイルシステムを示します。ルートのサイズはエントリー（`.`、`..`、
   それぞれのキュー）ごとに 20 バイト（`DIRENT_SIZE`）で、更新時刻はそこで最後にキューを
-  作ったか消したときです。
+  作ったか消したときです。ルートにある操作は、名前を引くこと、キューを作ること、消すことだけ
+  です。そこで空いている名前（使われていれば `EEXIST`。`/dev/mqueue` 自身も同じ）への `mkdir`、
+  `symlink`、通常ファイル以外の `mknod` は、Landlock の確認のあとで `EPERM` です。通常ファイル
+  （型 0 も）の `mknod` は、`vfs_create` と同じく既定の属性のキューを作ります。`link` と
+  `rename` は `do_linkat` と `do_renameat2` と同じく名前を引き（`ENOENT`、`EEXIST`。
+  `RENAME_NOREPLACE` と `RENAME_EXCHANGE` もそのとおり）、ほかのマウントとの間では `EXDEV`
+  （`rename` は名前を引く前）、その中では `EPERM` です。ただし、名前をそれ自身へ `rename`
+  すると何もせずに成功します。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。

@@ -1678,10 +1678,13 @@ kernel.
   Linux's `fsnotify` hooks give them: `IN_CREATE` for a new file, directory,
   symbolic link, FIFO, socket or link (after `IN_ATTRIB` of a linked file);
   `IN_DELETE` for a removed one, after `IN_ATTRIB` of the file and, for its
-  last link or a directory, `IN_DELETE_SELF` and `IN_IGNORED` of it;
+  last link or a directory, `IN_DELETE_SELF` and `IN_IGNORED` of it, which
+  wait for the last close of a description of it that is open (a mapping
+  holds one until it is unmapped), as Linux's dentry waits;
   `IN_MOVED_FROM` and `IN_MOVED_TO` with one cookie for a rename, then
   `IN_ATTRIB` of a file it replaces, `IN_MOVE_SELF` of the file moved, and
-  the replaced file's `IN_DELETE_SELF` (twice for `RENAME_EXCHANGE`, and
+  the replaced file's `IN_DELETE_SELF`, which waits in the same way (twice
+  for `RENAME_EXCHANGE`, and
   nothing for a rename onto another link of the same file); `IN_ATTRIB` for
   a new mode, owner (a `chown` that names neither gives none), both times
   or extended attribute; `IN_ACCESS` and `IN_MODIFY` for setting only the

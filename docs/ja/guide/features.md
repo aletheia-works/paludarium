@@ -1484,10 +1484,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じ順で届きます。新しいファイル、ディレクトリ、シンボリックリンク、FIFO、ソケット、
   リンクは `IN_CREATE` です（リンクではリンクされたファイルの `IN_ATTRIB` の後）。
   消したものは `IN_DELETE` で、その前にファイルの `IN_ATTRIB`、最後のリンクか
-  ディレクトリならそのファイルの `IN_DELETE_SELF` と `IN_IGNORED` が来ます。名前の
+  ディレクトリならそのファイルの `IN_DELETE_SELF` と `IN_IGNORED` が来ます。これは、
+  そのファイルの開いている記述があれば、Linux の dentry と同じく最後に閉じるまで
+  待ちます（マッピングは解除されるまで記述を持ちます）。名前の
   変更は同じクッキーの `IN_MOVED_FROM` と `IN_MOVED_TO` で、続いて置き換えられた
   ファイルの `IN_ATTRIB`、動いたファイルの `IN_MOVE_SELF`、置き換えられたファイルの
-  `IN_DELETE_SELF` です（`RENAME_EXCHANGE` では 2 回。同じファイルの別のリンクへの
+  `IN_DELETE_SELF` で、同じように待ちます（`RENAME_EXCHANGE` では 2 回。同じファイルの別のリンクへの
   変更では何もありません）。モード、所有者（どちらも指定しない `chown` では何も
   ありません）、両方の時刻、拡張属性を変えると `IN_ATTRIB`、アクセス時刻だけなら
   `IN_ACCESS`、更新時刻だけなら `IN_MODIFY`、切り詰めは `IN_MODIFY` です（通常の

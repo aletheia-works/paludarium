@@ -463,6 +463,60 @@ static int case_content(void) {
     return 0;
 }
 
+/* A file removed while a description of it is open ends (IN_DELETE_SELF)
+   only with its last close, as Linux's dentry lets go of it. */
+static int case_held(void) {
+    make_base("held");
+    int fd = inotify_init1(IN_NONBLOCK);
+    char *dir = at("w"), *h = at("w/h"), *t = at("w/t"), *x = at("w/x"), *m = at("w/m"), *sub = at("w/sub");
+    mkdir(dir, 0755);
+    mkdir(sub, 0755);
+    touch(h);
+    touch(t);
+    touch(x);
+    touch(m);
+    int wd_dir = inotify_add_watch(fd, dir, WATCHED);
+    int wd_h = inotify_add_watch(fd, h, WATCHED);
+    int wd_t = inotify_add_watch(fd, t, WATCHED);
+    int wd_m = inotify_add_watch(fd, m, WATCHED);
+    int wd_sub = inotify_add_watch(fd, sub, WATCHED);
+    printf("wd dir=%d h=%d t=%d m=%d sub=%d\n", wd_dir, wd_h, wd_t, wd_m, wd_sub);
+    int open_h = open(h, O_RDWR);
+    int again = dup(open_h);
+    unlink(h);
+    drain(fd, "unlinked");
+    long wrote = e(write(open_h, "z", 1));
+    close(open_h);
+    drain(fd, "first-close");
+    close(again);
+    printf("wrote=%ld\n", wrote);
+    drain(fd, "last-close");
+    /* A rename onto a file that is open. */
+    int open_t = open(t, O_RDONLY);
+    rename(x, t);
+    drain(fd, "replaced");
+    close(open_t);
+    drain(fd, "replaced-closed");
+    /* A mapping holds its file after the descriptor is closed. */
+    int open_m = open(m, O_RDWR);
+    long sized = e(ftruncate(open_m, 4096));
+    char *map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, open_m, 0);
+    close(open_m);
+    unlink(m);
+    printf("sized=%ld mapped=%d\n", sized, map != MAP_FAILED);
+    drain(fd, "mapped");
+    munmap(map, 4096);
+    drain(fd, "unmapped");
+    /* A directory open when it is removed. */
+    int open_sub = open(sub, O_RDONLY | O_DIRECTORY);
+    rmdir(sub);
+    drain(fd, "rmdir");
+    close(open_sub);
+    drain(fd, "rmdir-closed");
+    remove_all();
+    return 0;
+}
+
 static void on_alarm(int sig) { (void)sig; }
 
 static int case_wait(void) {
@@ -520,5 +574,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-overflow")) return case_overflow();
     if (!strcmp(mode, "inotify-wait")) return case_wait();
     if (!strcmp(mode, "inotify-content")) return case_content();
+    if (!strcmp(mode, "inotify-held")) return case_held();
     return 2;
 }

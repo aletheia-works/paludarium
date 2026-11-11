@@ -4674,6 +4674,34 @@ mod inotify {
         );
     }
     #[test]
+    fn a_removed_open_file_ends_with_its_last_close() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let file = put(&f, DATA, b"/tmp/held");
+        let d = f.ret(2, &[file, 0o101, 0o600]);
+        let wd = f.ret(ADD, &[fd, file, 0x4 | 0x400]) as i32;
+        let copy = f.ret(32, &[d]);
+        assert_eq!(f.ret(87, &[file]), 0);
+        // The link count now; the end waits for every description.
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x4, &b""[..])]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        assert_eq!(f.ret(3, &[copy]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
+        // A file no description holds goes at once.
+        let d = f.ret(2, &[file, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        let wd = f.ret(ADD, &[fd, file, 0x400]) as i32;
+        assert_eq!(f.ret(87, &[file]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
+    }
+    #[test]
     fn the_queue_merges_repeats_and_overflows_once() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK]);

@@ -66,7 +66,7 @@ kernel.
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
-| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -1117,6 +1117,35 @@ kernel.
     tentative and then not. An unbound socket hears nothing; the requester
     of an IPv4 address's or a route's change has the notification before
     its acknowledgement, and with `NLM_F_ECHO` as its own copy.
+- A generic netlink socket (protocol `NETLINK_GENERIC`) has its own ports,
+  so it binds to the process's ID as a `NETLINK_ROUTE` socket does too,
+  and its one family is the controller, `nlctrl` (family ID 16), as in a
+  kernel built with no other, so a program that looks a family up (as
+  libnl's `genl_ctrl_resolve` or `genl ctrl list` do) finds that it is
+  not there.
+  - **Requests:** as `genl_rcv_msg`, a type that is no family is `ENOENT`,
+    a message without a whole `genlmsghdr` `EINVAL`, and a command
+    `nlctrl` does not have `EOPNOTSUPP`; from command 11 on, a reserved
+    field or a flag other than `NLM_F_REQUEST`, `NLM_F_ACK`, `NLM_F_ECHO`
+    and `NLM_F_DUMP` is `EINVAL`. The attributes are checked as Linux's
+    policies say: liberally for a `CTRL_CMD_GETFAMILY` that is no dump
+    (an unknown attribute is skipped, a short integer is `ERANGE`), and
+    strictly for a dump (an unknown attribute, an integer of another
+    length or bytes left over are `EINVAL`).
+  - **Families:** `CTRL_CMD_GETFAMILY` answers with `nlctrl`'s
+    `CTRL_CMD_NEWFAMILY` for `CTRL_ATTR_FAMILY_NAME` `nlctrl` or
+    `CTRL_ATTR_FAMILY_ID` 16 (the name wins when both are given; `ENOENT`
+    for another, `EINVAL` for neither), with its name, ID, version 2,
+    header size, commands with their flags and its group, as
+    `ctrl_fill_info` makes it; a dump lists it, its `NLMSG_DONE` in the
+    same datagram. A dump of `CTRL_CMD_GETPOLICY` gives the policies of
+    `nlctrl`'s commands, or of the one `CTRL_ATTR_OP` names (`ENOENT` for
+    another), as `ctrl_dumppolicy` does: which policy each command's
+    request and dump take, then each attribute's type and limits, a
+    message each; a second dump while one runs is `EBUSY`.
+  - **Groups:** a socket has 64 groups (`EINVAL` for 0 or one past them),
+    any of which anyone may join; `nlctrl`'s `notify` is group 16, which
+    hears nothing, as no family comes or goes.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,

@@ -24,6 +24,7 @@
     {"name":"monitor","binary":"process"},
     {"name":"routes","binary":"process"},
     {"name":"link-attributes","binary":"process"},
+    {"name":"generic-netlink","binary":"process"},
     {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},

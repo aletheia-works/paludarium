@@ -58,7 +58,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
-| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE` と `NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
@@ -984,6 +984,30 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     仮のものと仮でないものの 2 度伝えます。bind していないソケットには何も届きません。
     IPv4 のアドレスか経路の変化を求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を
     付ければ自分の写しとして届きます。
+- 汎用 netlink のソケット（プロトコル `NETLINK_GENERIC`）は自分のポートを持つので、
+  `NETLINK_ROUTE` のソケットもプロセスの ID に bind していても、同じくプロセスの ID に
+  bind します。ファミリーは、ほかを入れずに作ったカーネルと同じく、コントローラの `nlctrl`
+  （ファミリー ID 16）だけです。そのため、ファミリーを引くプログラム（libnl の
+  `genl_ctrl_resolve` や `genl ctrl list` など）は、そのファミリーがないことを知ります。
+  - **リクエスト:** `genl_rcv_msg` と同じく、ファミリーでない型は `ENOENT`、
+    `genlmsghdr` が欠けたメッセージは `EINVAL`、`nlctrl` にないコマンドは
+    `EOPNOTSUPP` です。コマンド 11 からは、予約のフィールドや、`NLM_F_REQUEST`、
+    `NLM_F_ACK`、`NLM_F_ECHO`、`NLM_F_DUMP` のほかのフラグも `EINVAL` です。属性は
+    Linux のポリシーのとおりに確かめます。ダンプでない `CTRL_CMD_GETFAMILY` では緩く
+    （知らない属性は飛ばし、短い整数は `ERANGE`）、ダンプでは厳しく（知らない属性、
+    長さの違う整数、余ったバイトは `EINVAL`）確かめます。
+  - **ファミリー:** `CTRL_CMD_GETFAMILY` は、`CTRL_ATTR_FAMILY_NAME` の `nlctrl` か
+    `CTRL_ATTR_FAMILY_ID` の 16 に（両方あれば名前が勝ちます。ほかは `ENOENT`、どちらも
+    なければ `EINVAL`）、`ctrl_fill_info` と同じく、名前、ID、バージョン 2、ヘッダーの
+    大きさ、コマンドとそのフラグ、グループを持つ `nlctrl` の `CTRL_CMD_NEWFAMILY` で
+    答えます。ダンプはそれを挙げ、`NLMSG_DONE` を同じデータグラムに入れます。
+    `CTRL_CMD_GETPOLICY` のダンプは、`ctrl_dumppolicy` と同じく、`nlctrl` のコマンドの、
+    あるいは `CTRL_ATTR_OP` が指す 1 つ（ほかは `ENOENT`）のポリシーを返します。各コマンドの
+    リクエストとダンプがどのポリシーを使うか、それから各属性の型と範囲を、1 つずつ別の
+    メッセージで返します。ダンプの途中でのもう 1 つのダンプは `EBUSY` です。
+  - **グループ:** ソケットのグループは 64 で（0 とそれを超えるものは `EINVAL`）、誰でも
+    入れます。`nlctrl` の `notify` はグループ 16 で、ファミリーが増えも減りもしないので
+    何も届きません。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、

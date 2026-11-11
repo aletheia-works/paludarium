@@ -296,8 +296,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   名前空間に届く `veth` の組もありません）、インターフェースのリクエストと netlink は
   `IFF_UP` のほかのフラグを変えません。最初の名前空間でも `lo` しか見えません。
   Linux ではホストのインターフェースが見えます。
-  netlink には `NETLINK_ROUTE` しかなく（`NETLINK_GENERIC` などは `EPROTONOSUPPORT`）、
-  そのうちリンク、アドレス、経路のリクエストだけです。近隣、ルール、キューイング規律などは
+  netlink には `NETLINK_ROUTE` と `NETLINK_GENERIC` しかありません（ほかは
+  `EPROTONOSUPPORT`）。汎用 netlink のファミリーは `nlctrl` だけで、Linux ではホストの
+  カーネルとモジュールのもの（`ethtool`、`nl80211`、`devlink` など）があります。そのため
+  それらを引くと `ENOENT` で、それらがグループをいくつ使っても、ソケットのグループは 64 です。
+  `NETLINK_ROUTE` にあるのはリンク、アドレス、経路のリクエストだけです。近隣、ルール、キューイング規律などは
   `EOPNOTSUPP` で、入力の経路の引き当て（`ip route get ... iif` が送る `RTA_IIF`）、
   ダンプでない `RTM_GETADDR`、`lo` の名前の変更、ほかの属性の設定もそうです。経路は
   `lo` を通るか拒むかのどちらかです。IPv6 のゲートウェイ、マルチパスの経路、メトリクス

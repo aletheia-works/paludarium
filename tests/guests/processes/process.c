@@ -1214,6 +1214,7 @@ static long netns_result(long r) { return r < 0 ? -errno : r; }
    no kernel headers. */
 #define NL_AF_NETLINK 16
 #define NL_ROUTE 0
+#define NL_GENERIC 16
 #define NL_F_REQUEST 0x1
 #define NL_F_ACK 0x4
 #define NL_F_DUMP 0x300
@@ -1617,6 +1618,103 @@ static void link_show(int fd, unsigned port, const char *label, int get, int ful
             if (get) return;
         }
     }
+}
+/* The generic-netlink case: the attributes at `at`, one line each, with
+   their type (with its NLA_F_NESTED bit), length and value in hex; a nested
+   one's inside, as NLA_F_NESTED says or, for nlctrl's commands and groups
+   (`nested`), its children. */
+static void genl_attributes(const unsigned char *at, int len, int depth, int nested) {
+    while (len >= 4) {
+        unsigned short alen, type;
+        memcpy(&alen, at, 2);
+        memcpy(&type, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        int n = alen - 4;
+        const unsigned char *v = at + 4;
+        printf("%*s%#x len=%d", 2 * depth + 2, "", type, n);
+        int kind = type & 0x3fff, listed = depth == 0 && (kind == 6 || kind == 7);
+        if ((type & 0x8000) || nested || listed) {
+            printf("\n");
+            genl_attributes(v, n, depth + 1, listed);
+        } else {
+            for (int i = 0; i < n; i++) printf("%s%02x", i ? "" : " ", v[i]);
+            printf("\n");
+        }
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+}
+/* Appends attribute `type` of `len` bytes at `value` to `buf` at `off`;
+   the offset past it. */
+static size_t genl_put(unsigned char *buf, size_t off, unsigned short type, const void *value, size_t len) {
+    unsigned short alen = 4 + len;
+    memcpy(buf + off, &alen, 2);
+    memcpy(buf + off + 2, &type, 2);
+    memcpy(buf + off + 4, value, len);
+    return off + ((alen + 3) & ~3);
+}
+/* The family ID (CTRL_ATTR_FAMILY_ID) among the attributes at `at`, 0 for
+   none. */
+static unsigned short genl_family_id(const unsigned char *at, int len) {
+    while (len >= 4) {
+        unsigned short alen, type, id = 0;
+        memcpy(&alen, at, 2);
+        memcpy(&type, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        if (type == 1 && alen >= 6) {
+            memcpy(&id, at + 4, 2);
+            return id;
+        }
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+    return 0;
+}
+/* Prints each message `fd` has for the request `seq`: its header,
+   `genlmsghdr` and attributes, of a family dump only nlctrl's, as the
+   other families are the host's. It stops at NLMSG_DONE, at an error
+   unless `past_errors`, or when nothing waits. */
+static void genl_read(int fd, unsigned port, const char *label, long seq, int past_errors) {
+    if (seq < 0) {
+        printf("%s: send=%ld\n", label, seq);
+        return;
+    }
+    for (;;) {
+        static char buf[32768];
+        long n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0) return;
+        for (char *at = buf; at + sizeof(struct nl_header) <= buf + n;) {
+            struct nl_header *h = (void *)at;
+            if (h->len < sizeof *h || at + h->len > buf + n) return;
+            unsigned char *body = (void *)(h + 1);
+            int body_len = h->len - sizeof *h;
+            at += (h->len + 3) & ~3;
+            if (h->type == 3 || h->type == 2) {
+                int error = 0;
+                memcpy(&error, body, 4);
+                printf("%s: type=%u flags=%#x seq=%d error=%d\n", label, h->type, h->flags, h->seq == seq, error);
+                if (h->type == 3 || !past_errors) return;
+                continue;
+            }
+            if (body_len < 4) continue;
+            if ((h->flags & 2) && body[0] == 1 && genl_family_id(body + 4, body_len - 4) != 16) continue;
+            printf("%s: type=%u flags=%#x seq=%d port=%d len=%u cmd=%u version=%u reserved=%u\n", label, h->type,
+                   h->flags, h->seq == seq, h->pid == port, h->len, body[0], body[1], body[2] | body[3] << 8);
+            genl_attributes(body + 4, body_len - 4, 0, 0);
+        }
+    }
+}
+/* Sends nlctrl (or `type`) command `cmd` with `reserved` and the `len`
+   bytes of attributes at `attrs`, and prints what it is answered. */
+static void genl_show(int fd, unsigned port, const char *label, unsigned short type, unsigned short flags,
+                      unsigned char cmd, unsigned short reserved, const unsigned char *attrs, size_t len,
+                      int past_errors) {
+    unsigned char request[200] = {cmd, 1};
+    memcpy(request + 2, &reserved, 2);
+    memcpy(request + 4, attrs, len);
+    genl_read(fd, port, label, nl_send(fd, type, flags, request, 4 + len), past_errors);
 }
 /* Binds a UDP socket of `family` to `text`, and prints the result. */
 static void addresses_bind(const char *text, const char *when) {
@@ -7383,6 +7481,123 @@ int main(int argc, char **argv) {
                 _exit(0);
             }
             result("user", reaped(user));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "generic-netlink")) {
+        /* A child makes a network namespace and asks NETLINK_GENERIC's
+           controller, nlctrl, of itself: by name and ID, as a dump, and
+           its policies, with requests it refuses. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int fd = socket(NL_AF_NETLINK, SOCK_RAW, NL_GENERIC);
+            int dgram = socket(NL_AF_NETLINK, SOCK_DGRAM, NL_GENERIC);
+            int route = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            int protocol = -1;
+            socklen_t protocol_len = sizeof protocol;
+            getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &protocol_len);
+            printf("socket: raw=%d dgram=%d protocol=%d\n", fd >= 0, dgram >= 0, protocol);
+            /* Each protocol has its own ports: both take the process's ID. */
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0}, route_name = {0};
+            socklen_t name_len = sizeof name;
+            printf("bind: generic=%ld route=%ld\n", netns_result(bind(fd, (void *)&any, sizeof any)),
+                   netns_result(bind(route, (void *)&any, sizeof any)));
+            getsockname(fd, (void *)&name, &name_len);
+            name_len = sizeof route_name;
+            getsockname(route, (void *)&route_name, &name_len);
+            unsigned port = name.pid;
+            printf("ports: same=%d own=%d\n", port == route_name.pid, port == (unsigned)getpid());
+            unsigned char a[64];
+            unsigned short id16 = 16, id_none = 1023;
+            unsigned id_word = 16, op;
+            size_t n = genl_put(a, 0, 2, "nlctrl", 7);
+            genl_show(fd, port, "by name", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            genl_show(fd, port, "by name ack", 16, NL_F_REQUEST | NL_F_ACK, 3, 0, a, n, 1);
+            genl_show(fd, port, "reserved old", 16, NL_F_REQUEST, 3, 1, a, n, 0);
+            n = genl_put(a, 0, 1, &id16, 2);
+            genl_show(fd, port, "by id", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_word, 4);
+            genl_show(fd, port, "by id word", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_none, 2);
+            n = genl_put(a, n, 2, "nlctrl", 7);
+            genl_show(fd, port, "by both", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "nlctrl", 7);
+            n = genl_put(a, n, 9, &id_word, 4);
+            genl_show(fd, port, "unknown attribute", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "paludarium", 11);
+            genl_show(fd, port, "name unknown", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_none, 2);
+            genl_show(fd, port, "id unknown", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id16, 1);
+            genl_show(fd, port, "id short", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "aaaaaaaaaaaaaaaa", 16);
+            genl_show(fd, port, "name unterminated", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "abc\0aaaaaaaaaaaaaaaa", 20);
+            genl_show(fd, port, "name long", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            genl_show(fd, port, "no attributes", 16, NL_F_REQUEST, 3, 0, a, 0, 0);
+            genl_read(fd, port, "short header", nl_send(fd, 16, NL_F_REQUEST | NL_F_ACK, "\3\1", 2), 0);
+            n = genl_put(a, 0, 2, "nlctrl", 7);
+            genl_show(fd, port, "other family", 0x3ff, NL_F_REQUEST, 3, 0, a, n, 0);
+            genl_show(fd, port, "control", 1, NL_F_REQUEST | NL_F_ACK, 3, 0, a, n, 0);
+            genl_show(fd, port, "new family", 16, NL_F_REQUEST, 1, 0, a, n, 0);
+            genl_show(fd, port, "policy without dump", 16, NL_F_REQUEST, 10, 0, a, n, 0);
+            genl_show(fd, port, "reserved new", 16, NL_F_REQUEST, 11, 1, a, n, 0);
+            genl_show(fd, port, "flags new", 16, NL_F_REQUEST | 0x400, 11, 0, a, n, 0);
+            genl_show(fd, port, "command new", 16, NL_F_REQUEST, 11, 0, a, n, 0);
+            genl_show(dgram, 0, "dgram", 16, NL_F_REQUEST, 3, 0, a, n, 0);
+            /* The dump lists nlctrl first; the host's other families are
+               not printed. */
+            genl_show(fd, port, "dump", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, 0, 0);
+            genl_show(fd, port, "dump by name", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_word, 4);
+            genl_show(fd, port, "dump id word", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 5, &id_word, 4);
+            genl_show(fd, port, "dump unknown attribute", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, n, 0);
+            n = genl_put(a, 0, 2, "nlctrl", 7);
+            genl_show(fd, port, "policy", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id16, 2);
+            genl_show(fd, port, "policy by id", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            op = 3;
+            n = genl_put(a, n, 10, &op, 4);
+            genl_show(fd, port, "policy of getfamily", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            op = 10;
+            n = genl_put(a, 0, 1, &id16, 2);
+            n = genl_put(a, n, 10, &op, 4);
+            genl_show(fd, port, "policy of getpolicy", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            op = 1;
+            n = genl_put(a, 0, 1, &id16, 2);
+            n = genl_put(a, n, 10, &op, 4);
+            genl_show(fd, port, "policy of newfamily", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            genl_show(fd, port, "policy none", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, 0, 0);
+            n = genl_put(a, 0, 2, "paludarium", 11);
+            genl_show(fd, port, "policy name unknown", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_none, 2);
+            genl_show(fd, port, "policy id unknown", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            n = genl_put(a, 0, 1, &id_word, 4);
+            genl_show(fd, port, "policy id word", 16, NL_F_REQUEST | NL_F_DUMP, 10, 0, a, n, 0);
+            /* A second dump while the first runs is EBUSY. */
+            nl_send(fd, 16, NL_F_REQUEST | NL_F_DUMP, (unsigned char[]){10, 1, 0, 0, 6, 0, 1, 0, 16, 0, 0, 0}, 12);
+            genl_show(fd, port, "busy", 16, NL_F_REQUEST | NL_F_DUMP, 3, 0, a, 0, 1);
+            /* nlctrl's group, notify, is 16. */
+            int group = 16, zero = 0;
+            unsigned words[2] = {0};
+            socklen_t words_len = sizeof words[0];
+            printf("join: add=%ld zero=%ld\n", netns_result(setsockopt(fd, 270, 1, &group, sizeof group)),
+                   netns_result(setsockopt(fd, 270, 1, &zero, sizeof zero)));
+            getsockopt(fd, 270, 9, words, &words_len);
+            printf("join: list=%#x\n", words[0]);
+            printf("join: drop=%ld\n", netns_result(setsockopt(fd, 270, 2, &group, sizeof group)));
+            int other = socket(NL_AF_NETLINK, SOCK_RAW, NL_GENERIC);
+            struct nl_address notify = {.family = NL_AF_NETLINK, .groups = 1u << 15};
+            name_len = sizeof name;
+            printf("join: bind=%ld", netns_result(bind(other, (void *)&notify, sizeof notify)));
+            getsockname(other, (void *)&name, &name_len);
+            printf(" groups=%#x\n", name.groups);
             fflush(stdout);
             _exit(0);
         }

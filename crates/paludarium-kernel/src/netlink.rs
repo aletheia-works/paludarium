@@ -1,5 +1,6 @@
 //! `AF_NETLINK` sockets of `NETLINK_ROUTE`, in the network namespace each
-//! was made in, whose loopback `lo` is its only interface.
+//! was made in, whose loopback `lo` is its only interface, and of
+//! `NETLINK_GENERIC` ([`generic`]), each protocol with its own ports.
 //!
 //! As Linux's `af_netlink` and `rtnetlink`: a socket is bound to a port ID
 //! (the process's ID, or a negative one when that is taken) by `bind`, or by
@@ -26,7 +27,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
+mod generic;
+
 const AF_NETLINK: u16 = 16;
+const NETLINK_ROUTE: u32 = 0;
+const NETLINK_GENERIC: u32 = 16;
 const SOCK_DGRAM: u32 = 2;
 const SOCK_RAW: u32 = 3;
 const NLMSG_ERROR: u16 = 2;
@@ -235,17 +240,33 @@ const GSO_MAX_SIZE: u32 = 65536;
 const STATS_LEN: usize = 24 * 4;
 const STATS64_LEN: usize = 25 * 8;
 
-/// The port IDs bound in a network namespace (`nl_table[NETLINK_ROUTE]`'s
-/// hash for it), and the next one an autobind tries when the process's own
-/// is taken.
+/// The netlink sockets of a network namespace, one table for each protocol.
+#[derive(Default)]
 pub(crate) struct Ports {
+    route: Table,
+    generic: Table,
+}
+impl Ports {
+    fn table(&self, protocol: u32) -> &Table {
+        if protocol == NETLINK_GENERIC {
+            &self.generic
+        } else {
+            &self.route
+        }
+    }
+}
+
+/// The port IDs bound in a network namespace for a protocol (its
+/// `nl_table` entry's hash for it), and the next one an autobind tries
+/// when the process's own is taken.
+struct Table {
     bound: Mutex<BTreeMap<u32, Weak<NetlinkSocket>>>,
     rover: AtomicI32,
     /// Every netlink socket of the namespace, which a notification goes
     /// to when it is a member of the group.
     all: Mutex<Vec<Weak<NetlinkSocket>>>,
 }
-impl Default for Ports {
+impl Default for Table {
     fn default() -> Self {
         Self {
             bound: Mutex::default(),
@@ -254,7 +275,7 @@ impl Default for Ports {
         }
     }
 }
-impl Ports {
+impl Table {
     fn lock(&self) -> MutexGuard<'_, BTreeMap<u32, Weak<NetlinkSocket>>> {
         self.bound.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -300,10 +321,11 @@ struct State {
     strict: bool,
 }
 
-/// An `AF_NETLINK` socket of `NETLINK_ROUTE`.
+/// An `AF_NETLINK` socket of `NETLINK_ROUTE` or `NETLINK_GENERIC`.
 pub(crate) struct NetlinkSocket {
     this: Weak<NetlinkSocket>,
     kind: u32,
+    protocol: u32,
     network: Arc<Network>,
     /// The network namespace it was made in, whose owner's
     /// `CAP_NET_ADMIN` changes the loopback.
@@ -336,7 +358,8 @@ struct Sender {
 
 /// `socket(AF_NETLINK, type, protocol)`, as Linux's `netlink_create`:
 /// `SOCK_RAW` or `SOCK_DGRAM` (`ESOCKTNOSUPPORT`), and only `NETLINK_ROUTE`
-/// (`EPROTONOSUPPORT`). Without a network there is none (`EAFNOSUPPORT`).
+/// and `NETLINK_GENERIC` (`EPROTONOSUPPORT`). Without a network there is
+/// none (`EAFNOSUPPORT`).
 pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let kind = a[1] as u32;
     if a[1] > u64::from(u32::MAX) || kind & !(NONBLOCK | CLOEXEC | 0xf) != 0 || kind & 0xf >= 11 {
@@ -346,7 +369,8 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if !matches!(kind & 0xf, SOCK_RAW | SOCK_DGRAM) {
         return Err(ESOCKTNOSUPPORT);
     }
-    if a[2] as i32 != 0 {
+    let protocol = a[2] as i32 as u32;
+    if !matches!(protocol, NETLINK_ROUTE | NETLINK_GENERIC) {
         return Err(EPROTONOSUPPORT);
     }
     let namespace = Arc::clone(&c.group.namespaces(c.tid).net);
@@ -355,6 +379,7 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let socket = Arc::new_cyclic(|this| NetlinkSocket {
         this: Weak::clone(this),
         kind: kind & 0xf,
+        protocol,
         network,
         namespace,
         opener_admin,
@@ -373,8 +398,7 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         }),
     });
     socket
-        .network
-        .netlink
+        .table()
         .all
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -397,6 +421,23 @@ impl NetlinkSocket {
     pub(crate) fn network(&self) -> &Network {
         &self.network
     }
+    /// The sockets of its protocol in its network namespace.
+    fn table(&self) -> &Table {
+        self.network.netlink.table(self.protocol)
+    }
+    /// The groups its protocol has (`ngroups`).
+    fn groups(&self) -> u32 {
+        if self.protocol == NETLINK_GENERIC {
+            generic::GROUPS
+        } else {
+            GROUPS
+        }
+    }
+    /// The groups of `mask` only `CAP_NET_ADMIN` may join: none of
+    /// `NETLINK_GENERIC`'s.
+    fn privileged(&self, mask: u64) -> bool {
+        self.protocol == NETLINK_ROUTE && mask & u64::from(PRIVILEGED_GROUPS) != 0
+    }
     fn nonblocking(&self) -> bool {
         self.flags.load(Ordering::SeqCst) & NONBLOCK != 0
     }
@@ -415,7 +456,7 @@ impl NetlinkSocket {
     /// Binds to `port`, or with 0 to the process's ID or, that taken, the
     /// next free negative one (`netlink_autobind`).
     fn bind_port(&self, s: &mut State, port: u32, pid: u32) -> Result<(), Errno> {
-        let ports = &self.network.netlink;
+        let ports = self.table();
         let mut bound = ports.lock();
         bound.retain(|_, socket| socket.strong_count() > 0);
         let port = if port != 0 {
@@ -484,7 +525,7 @@ impl NetlinkSocket {
         {
             return Err(Errno::EINVAL);
         }
-        if groups & PRIVILEGED_GROUPS != 0 && !sender.admin {
+        if self.privileged(u64::from(groups)) && !sender.admin {
             return Err(Errno::EPERM);
         }
         if s.port.is_none() {
@@ -545,8 +586,7 @@ impl NetlinkSocket {
         if to != 0 {
             drop(s);
             let target = self
-                .network
-                .netlink
+                .table()
                 .lock()
                 .get(&to)
                 .and_then(Weak::upgrade)
@@ -591,7 +631,11 @@ impl NetlinkSocket {
                 Ok(false)
             } else {
                 let mut told = Vec::new();
-                let result = self.route(s, &header, &message[16..], port, sender, &mut told);
+                let result = if self.protocol == NETLINK_GENERIC {
+                    self.generic(s, &header, &message[16..], port)
+                } else {
+                    self.route(s, &header, &message[16..], port, sender, &mut told)
+                };
                 // This socket hears of what it changed as it happens, before
                 // its acknowledgement; the others once it is unlocked.
                 for notice in &told {
@@ -844,7 +888,7 @@ impl Drop for NetlinkSocket {
             .unwrap_or_else(PoisonError::into_inner)
             .port;
         if let Some(port) = port {
-            let mut bound = self.network.netlink.lock();
+            let mut bound = self.network.netlink.table(self.protocol).lock();
             if bound.get(&port).is_some_and(|w| w.ptr_eq(&self.this)) {
                 bound.remove(&port);
             }
@@ -1824,7 +1868,7 @@ fn notify(network: &Network, notices: Vec<Notice>, except: Option<&NetlinkSocket
     if notices.is_empty() {
         return;
     }
-    let members = network.netlink.members();
+    let members = network.netlink.route.members();
     for notice in notices {
         let bit = 1u64 << (notice.group - 1);
         for socket in &members {
@@ -2048,12 +2092,12 @@ fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
             // `EINVAL`, and joining a multicast routing one needs
             // `CAP_NET_ADMIN` (`rtnetlink_bind`).
             let group = option_int(c, at, len)? as u32;
-            if group == 0 || group > GROUPS {
+            if group == 0 || group > socket.groups() {
                 return Err(Errno::EINVAL);
             }
             let bit = 1u64 << (group - 1);
             if name == NETLINK_ADD_MEMBERSHIP {
-                if bit & u64::from(PRIVILEGED_GROUPS) != 0 && !socket.sender(c).admin {
+                if socket.privileged(bit) && !socket.sender(c).admin {
                     return Err(Errno::EPERM);
                 }
                 socket.lock().groups |= bit;
@@ -2087,7 +2131,7 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
     if (level, name) == (SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS) {
         // Each whole word that has room, and the length of them all.
         let words = socket.lock().groups.to_le_bytes();
-        let all = (GROUPS as usize).div_ceil(32) * 4;
+        let all = (socket.groups() as usize).div_ceil(32) * 4;
         let n = room / 4 * 4;
         c.mem
             .write(GuestAddr(at), &words[..n.min(all)])
@@ -2105,7 +2149,7 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
             (SOL_SOCKET, 4) => s.error.take().map_or(0, |e| e.0).to_le_bytes().to_vec(),
             (SOL_SOCKET, 7) => s.send_buffer.to_le_bytes().to_vec(),
             (SOL_SOCKET, 8) => s.receive_buffer.to_le_bytes().to_vec(),
-            (SOL_SOCKET, 38) => 0i32.to_le_bytes().to_vec(),
+            (SOL_SOCKET, 38) => (socket.protocol as i32).to_le_bytes().to_vec(),
             (SOL_SOCKET, 39) => i32::from(AF_NETLINK).to_le_bytes().to_vec(),
             (SOL_NETLINK, NETLINK_CAP_ACK | NETLINK_EXT_ACK | NETLINK_GET_STRICT_CHK) => {
                 // `netlink_getsockopt` wants room for an int.

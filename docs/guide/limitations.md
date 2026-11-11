@@ -337,7 +337,11 @@ verified.
   another), and the interface requests and netlink change no other flag
   than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`
-  (`EPROTONOSUPPORT` for `NETLINK_GENERIC` and the rest), and of it only
+  and `NETLINK_GENERIC` (`EPROTONOSUPPORT` for the rest); generic netlink
+  has no family but `nlctrl`, where Linux has those of the host's kernel
+  and modules (`ethtool`, `nl80211`, `devlink` and others), so a lookup of
+  one is `ENOENT` and a socket has 64 groups however many those take.
+  Of `NETLINK_ROUTE` there are only
   the link, address and route requests: neighbours, rules, queueing
   disciplines and the rest are `EOPNOTSUPP`, as are an input route
   lookup (`RTA_IIF`, as `ip route get ... iif` sends), a non-dump

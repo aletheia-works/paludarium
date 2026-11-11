@@ -857,6 +857,10 @@ void _start(void) {
   /* Of several buffers, each is access_ok with its whole length. */
   v3[0]=(long)buf;v3[1]=1;v3[2]=(long)buf;v3[3]=0x0000800000000000L;
   results[x++]=S(19,fd,v3,2);results[x++]=S(8,fd,0,1);
+  /* The access mode comes first, as vfs_readv and vfs_writev check it before import_iovec. */
+  long rd=S(2,p,0,0),wr=S(2,p,1,0);
+  results[x++]=S(20,rd,v1,2);results[x++]=S(19,wr,v1,2);results[x++]=S(20,rd,K,2);results[x++]=S(19,wr,v2,3);
+  S(3,rd,0,0);S(3,wr,0,0);
   int pf[2];S(22,pf,0,0);
   results[x++]=call(278,pf[1],(long)v1,2,0,0,0);results[x++]=call(278,pf[1],(long)v2,3,0,0,0);results[x++]=call(278,pf[1],(long)v3,2,2,0,0);
   ok[0]=(long)"wxyz";ok[1]=2;ok[2]=(long)"wxyz"+2;ok[3]=2;results[x++]=S(20,pf[1],ok,2);results[x++]=S(0,pf[0],buf,8);results[x++]=buf[0]+buf[3];

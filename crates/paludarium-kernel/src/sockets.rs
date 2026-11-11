@@ -922,7 +922,8 @@ pub(crate) fn message_header(
     }
     // recvmsg sees that its buffers can be written before it takes the data,
     // which a failed copy would leave in place. sendmsg's are only checked as
-    // access_ok does, as they are copied after the address is checked.
+    // access_ok does, as they are copied after the address is checked: that
+    // check is iovecs_checked's own, so the closure does nothing more.
     let iov = if write {
         crate::files::iovecs(c, word(16), word(24), true)?
     } else {

@@ -85,6 +85,11 @@ mod fd {
             syscall(&mut k, &mut t, &m, 20, [1, DATA, 1, 0, 0, 0]),
             Errno::EINVAL.to_syscall_return()
         );
+        m.write_u64(GuestAddr(DATA + 8), 0x8000_0000).unwrap();
+        assert_ne!(
+            syscall(&mut k, &mut t, &m, 20, [1, DATA, 1, 0, 0, 0]),
+            Errno::EINVAL.to_syscall_return()
+        );
     }
     #[test]
     fn vector_payload_fault() {

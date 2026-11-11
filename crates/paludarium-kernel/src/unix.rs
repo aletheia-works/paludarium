@@ -161,7 +161,10 @@ struct State {
     file: Option<Inode>,
     /// A datagram socket's `sk_state` is `TCP_ESTABLISHED`: it connected,
     /// or another connected to it, as Linux's `unix_dgram_connect` sets
-    /// both, until it disconnects or the one it is connected to goes.
+    /// both. It is `TCP_CLOSE` again once it disconnects, once a send finds
+    /// the one it is connected to gone (`unix_dgram_sendmsg`), or, with no
+    /// peer of its own, once one connected to it connects elsewhere
+    /// (`unix_dgram_connect` leaving its old peer).
     established: bool,
 }
 /// A listening socket's connections that wait for `accept`.

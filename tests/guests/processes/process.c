@@ -1724,7 +1724,7 @@ struct diag_socket {
     int fd;
     unsigned ino;
 };
-static struct diag_socket diag_sockets[16];
+static struct diag_socket diag_sockets[24];
 static int diag_count;
 static char diag_path[128];
 static void diag_add(const char *label, int fd) {
@@ -1811,8 +1811,8 @@ static void diag_ask(int fd, const char *label, unsigned short type, unsigned sh
     memcpy(request + 12, &show, 4);
     memcpy(request + 16, cookie, 8);
     long seq = nl_send(fd, type, flags, request, len);
-    static unsigned char found[16][512];
-    int found_len[16] = {0}, unknown = 0, done = 0;
+    static unsigned char found[24][512];
+    int found_len[24] = {0}, unknown = 0, done = 0;
     while (!done) {
         static char buf[32768];
         long n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
@@ -7819,6 +7819,16 @@ int main(int argc, char **argv) {
             send(sender, "abc", 3, 0);
             diag_add("target", target);
             diag_add("sender", sender);
+            /* One that connects to `left` and then elsewhere leaves it
+               TCP_CLOSE, as it has no peer of its own. */
+            struct sockaddr_un left_at = {.sun_family = AF_UNIX};
+            memcpy(left_at.sun_path, "\0paludarium-left", 16);
+            int left = socket(AF_UNIX, SOCK_DGRAM, 0), mover = socket(AF_UNIX, SOCK_DGRAM, 0);
+            bind(left, (void *)&left_at, 2 + 16);
+            connect(mover, (void *)&left_at, 2 + 16);
+            connect(mover, (void *)&dgram_at, 2 + 17);
+            diag_add("left", left);
+            diag_add("mover", mover);
             int lone = socket(AF_UNIX, SOCK_DGRAM, 0);
             struct sockaddr_un family_only = {.sun_family = AF_UNIX};
             bind(lone, (void *)&family_only, 2);

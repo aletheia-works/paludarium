@@ -1168,7 +1168,10 @@ kernel.
   Linux's `sock_diag` and `unix_diag` do, so `ss -x` lists them.
   - **Requests:** `SOCK_DIAG_BY_FAMILY` for AF_UNIX dumps the sockets
     whose state (`TCP_ESTABLISHED`, `TCP_CLOSE` or `TCP_LISTEN`) is in
-    `udiag_states`, its `NLMSG_DONE` at the next receive, or with no dump
+    `udiag_states`, in parts as large as Linux's `netlink_dump` makes
+    them (a page's worth, or as much as the longest receive took, up to
+    32 KiB, the next as a receive makes room), its `NLMSG_DONE` after
+    them, or with no dump
     answers for the socket of inode `udiag_ino` (`EINVAL` for 0, `ENOENT`
     for none) whose cookie matches (`ESTALE` for another; all ones match
     any). A connection a listener has not accepted has no inode yet, and

@@ -314,6 +314,12 @@ struct State {
     /// A dump's `NLMSG_DONE`, which the next receive queues (Linux's
     /// `cb_running`).
     done: Option<Vec<u8>>,
+    /// A dump's messages that have not gone yet, which each receive that
+    /// leaves room sends on as much of as one part takes (`netlink_dump`).
+    rest: VecDeque<Vec<u8>>,
+    /// The longest buffer a receive has given, as much as one part of a
+    /// dump may take (`max_recvmsg_len`).
+    longest_read: usize,
     /// An error a receive gives before anything else (`sk_err`).
     error: Option<Errno>,
     arrivals: u64,
@@ -886,12 +892,29 @@ impl NetlinkSocket {
             s.queue.pop_front();
             s.queued -= got.1;
         }
-        if s.queued <= usize::try_from(s.receive_buffer / 2).unwrap_or(0)
-            && let Some(done) = s.done.take()
-        {
-            self.deliver(&mut s, 0, 0, done);
+        s.longest_read = s.longest_read.max(buf.len()).min(MOST_DUMP_PART);
+        if s.queued <= usize::try_from(s.receive_buffer / 2).unwrap_or(0) {
+            if !s.rest.is_empty() {
+                let part = dump_part(&mut s);
+                self.deliver(&mut s, 0, 0, part);
+            } else if let Some(done) = s.done.take() {
+                self.deliver(&mut s, 0, 0, done);
+            }
         }
         Ok(got)
+    }
+    /// Begins a dump of `messages`, as `netlink_dump_start`: the first
+    /// part goes now, the rest as receives make room, then `done`, or
+    /// `done` alone when there is nothing to dump.
+    fn start_dump(&self, s: &mut State, messages: Vec<Vec<u8>>, done: Vec<u8>) {
+        if messages.is_empty() {
+            self.deliver(s, 0, 0, done);
+            return;
+        }
+        s.rest = messages.into();
+        let part = dump_part(s);
+        self.deliver(s, 0, 0, part);
+        s.done = Some(done);
     }
 }
 
@@ -978,6 +1001,25 @@ impl FileHandle for NetlinkSocket {
     }
 }
 
+/// The least and the most one part of a dump takes: a page's worth
+/// (`NLMSG_GOODSIZE`) and 32 KiB, each less the `skb_shared_info` x86-64
+/// Linux takes of it (`SKB_WITH_OVERHEAD`).
+const LEAST_DUMP_PART: usize = 4096 - 320;
+const MOST_DUMP_PART: usize = 32768 - 320;
+/// The next part of a dump, as `netlink_dump` fills one: as many of the
+/// messages left as its size takes, the longest receive's but no less than
+/// a page's, and at least one.
+fn dump_part(s: &mut State) -> Vec<u8> {
+    let room = s.longest_read.max(LEAST_DUMP_PART);
+    let mut part = Vec::new();
+    while let Some(next) = s.rest.front() {
+        if !part.is_empty() && part.len() + next.len() > room {
+            break;
+        }
+        part.extend(s.rest.pop_front().unwrap_or_default());
+    }
+    part
+}
 /// A message's `nlmsghdr`.
 struct Header {
     len: u32,
@@ -2194,6 +2236,24 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dumps_go_in_parts_as_large_as_the_longest_receive() {
+        let mut s = State {
+            rest: (0..12).map(|_| vec![0; 1000]).collect(),
+            ..State::default()
+        };
+        // A page's worth first, then what the longest receive takes.
+        assert_eq!(dump_part(&mut s).len(), 3000);
+        s.longest_read = 8000;
+        assert_eq!(dump_part(&mut s).len(), 8000);
+        assert_eq!(dump_part(&mut s).len(), 1000);
+        // One too long for a part still goes, alone.
+        s.rest = vec![vec![0; 5000], vec![0; 10]].into();
+        s.longest_read = 0;
+        assert_eq!(dump_part(&mut s).len(), 5000);
+        assert_eq!(dump_part(&mut s).len(), 10);
+        assert!(s.rest.is_empty());
+    }
     const RT_TABLE_LOCAL: u8 = 255;
     const RTPROT_KERNEL: u8 = 2;
     const RT_SCOPE_LINK: u8 = 253;

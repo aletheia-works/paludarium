@@ -108,7 +108,7 @@ impl NetlinkSocket {
                 if request.states & (1 << diag.state) == 0 {
                     continue;
                 }
-                messages.extend(self.unix_message(&diag, &request, header.seq, port, NLM_F_MULTI));
+                messages.push(self.unix_message(&diag, &request, header.seq, port, NLM_F_MULTI));
             }
             let done = message(
                 NLMSG_DONE,
@@ -117,12 +117,9 @@ impl NetlinkSocket {
                 port,
                 &0i32.to_le_bytes(),
             );
-            if messages.is_empty() {
-                self.deliver(s, 0, 0, done);
-            } else {
-                self.deliver(s, 0, 0, messages);
-                s.done = Some(done);
-            }
+            // `unix_diag_dump` goes on while it puts anything, so its
+            // `NLMSG_DONE` comes in a part of its own.
+            self.start_dump(s, messages, done);
             return Ok(true);
         }
         // `unix_diag_get_exact`.

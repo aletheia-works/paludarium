@@ -1026,8 +1026,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `sock_diag` と `unix_diag` と同じく、作られたネットワーク名前空間の AF_UNIX のソケットを
   伝えます。そのため `ss -x` はそれらを挙げます。
   - **リクエスト:** AF_UNIX への `SOCK_DIAG_BY_FAMILY` は、状態（`TCP_ESTABLISHED`、
-    `TCP_CLOSE`、`TCP_LISTEN`）が `udiag_states` にあるソケットをダンプし、`NLMSG_DONE` を
-    次の受信で返します。ダンプでなければ、inode が `udiag_ino` で（0 は `EINVAL`、ない
+    `TCP_CLOSE`、`TCP_LISTEN`）が `udiag_states` にあるソケットを、Linux の `netlink_dump` と
+    同じ大きさに分けてダンプします（1 ページ分、あるいはそれまでで一番長い受信の分で
+    32 KiB まで。次の部分は受信が空きを作ったときに送ります）。`NLMSG_DONE` はそのあとです。ダンプでなければ、inode が `udiag_ino` で（0 は `EINVAL`、ない
     ものは `ENOENT`）、cookie が合う（違えば `ESTALE`、すべて 1 ならどれにも合います）
     ソケットに答えます。リスナーがまだ accept していない接続は inode をまだ持たないので
     挙げません。ほかのファミリーにはハンドラーがなく（`ENOENT`）、`AF_MAX` を超える

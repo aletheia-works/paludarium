@@ -40,7 +40,8 @@ runs:
         path: ${{ steps.key.outputs.dir }}
         key: ${{ steps.key.outputs.key }}
 
-    - shell: bash
+    - id: install
+      shell: bash
       env:
         PACKAGES: ${{ inputs.packages }}
         DEBIAN_FRONTEND: noninteractive
@@ -77,9 +78,13 @@ runs:
             fi
           done
         fi
+        # One update serves the whole job, so the files the toolchain and the packages were
+        # downloaded with all come from the lists the cache keeps.
+        updated=
         update() {
-          if [ -z "$offline" ]; then
+          if [ -z "$offline" ] && [ -z "$updated" ]; then
             sudo apt-get update
+            updated=1
           fi
         }
         # The Azure mirror sometimes serves one job at 40 kB/s while another job of the same run
@@ -97,9 +102,10 @@ runs:
             if sudo apt-get install -y --no-install-recommends --download-only --no-download "$@"; then
               return 0
             fi
-            echo "the cached packages are not enough; using the network" >&2
+            echo "::warning::the cached apt files for this image are not enough; using the network"
             offline=
             sudo apt-get update
+            updated=1
           fi
           while true; do
             limit=$((deadline - SECONDS))
@@ -125,6 +131,7 @@ runs:
           done
         }
         variant=/etc/apt/apt.conf.d/90arch-variant
+        toolchain=()
         if [ -f "$variant" ]; then
           sudo rm -f "$variant"
           update
@@ -159,10 +166,17 @@ runs:
           fi
           rm -rf "$scratch"
         fi
-        # Keep what this job used for the next job on the same image. The toolchain's files
-        # came before the last update, so they still match the lists only if that update
-        # changed nothing for them; when it did, the next job finds a file missing and takes
-        # the network.
+        # Keep what this job used for the next job on the same image. A cache entry cannot be
+        # replaced, so one that misses a file would cost every later job on the image a failed
+        # attempt; keep only what installs again from disk. A mirror dropped above updates the
+        # lists a second time, and that can leave the earlier files behind them.
+        # shellcheck disable=SC2086 # the packages are separate words
+        if [ "$SAVE" = true ] && ! sudo apt-get install -y --no-install-recommends \
+          --download-only --no-download --reinstall --allow-downgrades \
+          "${toolchain[@]:2}" $PACKAGES > /dev/null; then
+          echo "::warning::the downloaded apt files no longer match the lists; not caching them"
+          SAVE=
+        fi
         if [ "$SAVE" = true ]; then
           mkdir -p "$CACHE_DIR/archives"
           debs=("$archives"/*.deb)
@@ -172,9 +186,10 @@ runs:
           sudo cp -r "$lists" "$CACHE_DIR/lists"
           sudo rm -rf "$CACHE_DIR/lists/partial" "$CACHE_DIR/lists/lock"
           sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
+          echo "save=true" >> "$GITHUB_OUTPUT"
         fi
 
-    - if: steps.restore.outputs.cache-hit != 'true' && steps.key.outputs.save == 'true'
+    - if: steps.install.outputs.save == 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.key.outputs.dir }}

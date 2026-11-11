@@ -3489,6 +3489,7 @@ impl Kernel {
         // As Linux's `open_exec` of an interpreter: it needs execute
         // permission (EACCES), and an unreadable one makes the program
         // undumpable (`would_dump`). Its set-ID bits do not count.
+        let mut interpreter_path = None;
         let mut interpreter = |name: &[u8]| {
             // An empty name finds the working directory.
             if name.is_empty() {
@@ -3505,6 +3506,7 @@ impl Kernel {
             // Denied only while it loads, as `load_elf_binary` gives it back.
             drop(deny_writes(&self.files, &path)?);
             readable &= may_read;
+            interpreter_path = Some(path.clone());
             Ok(path)
         };
         let fs = &*self.files.fs;
@@ -3591,7 +3593,11 @@ impl Kernel {
             Some((_, name)) => name,
             None => crate::files::resolved(&self.files, &loaded).unwrap_or(loaded),
         });
-        self.group.set_exe_file(exe.map(Arc::new));
+        // The interpreter's mappings hold its file while the program runs.
+        let interpreter = interpreter_path
+            .and_then(|path| self.files.caches.hold(&*self.files.fs, &path))
+            .map(Arc::new);
+        self.group.set_exe_file(exe.map(Arc::new), interpreter);
         let ignored = thread
             .state
             .signal_actions

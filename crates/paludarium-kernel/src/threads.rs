@@ -88,6 +88,10 @@ pub struct ThreadGroup {
     /// `dup_mm_exe_file` denies again); none for a program of no regular
     /// file.
     exe_file: Mutex<Option<Arc<crate::page_cache::WriteAccess>>>,
+    /// The hold on the file of the ELF interpreter that program runs with,
+    /// kept as its mappings keep it on Linux: while the process runs the
+    /// program, and in a fork, which copies them.
+    interpreter_file: Mutex<Option<Arc<crate::page_cache::Hold>>>,
     /// What each thread keeps itself that other processes read in `/proc`,
     /// as of its last checkpoint. The leader's stays while it is a zombie.
     public: Mutex<BTreeMap<u32, PublicThread>>,
@@ -145,6 +149,7 @@ impl Default for ThreadGroup {
             sem_undo: Mutex::default(),
             executable: Mutex::default(),
             exe_file: Mutex::default(),
+            interpreter_file: Mutex::default(),
             public: Mutex::default(),
             unkillable: std::sync::atomic::AtomicBool::new(false),
         }
@@ -333,6 +338,12 @@ impl ThreadGroup {
             first_namespaces: self.first_namespaces.clone(),
             exe_file: Mutex::new(
                 self.exe_file
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
+            interpreter_file: Mutex::new(
+                self.interpreter_file
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone(),
@@ -822,10 +833,27 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
-    /// Keeps the denial of writes to the program's file, giving back the
-    /// one of the program before.
-    pub(crate) fn set_exe_file(&self, denied: Option<Arc<crate::page_cache::WriteAccess>>) {
-        *self.exe_file.lock().unwrap_or_else(PoisonError::into_inner) = denied;
+    /// Keeps the denial of writes to the program's file and the hold on
+    /// its interpreter's, giving back those of the program before.
+    pub(crate) fn set_exe_file(
+        &self,
+        denied: Option<Arc<crate::page_cache::WriteAccess>>,
+        interpreter: Option<Arc<crate::page_cache::Hold>>,
+    ) {
+        let last = (
+            std::mem::replace(
+                &mut *self.exe_file.lock().unwrap_or_else(PoisonError::into_inner),
+                denied,
+            ),
+            std::mem::replace(
+                &mut *self
+                    .interpreter_file
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                interpreter,
+            ),
+        );
+        drop(last);
     }
     pub(crate) fn set_executable(&self, path: Vec<u8>) {
         *self
@@ -1048,7 +1076,7 @@ impl Kernel {
             .leave_sem_undo_list(tid, self.process.pid, self.wall_seconds());
         // As in `finish_thread`: no thread left runs the program.
         if alone {
-            self.group.set_exe_file(None);
+            self.group.set_exe_file(None, None);
         }
         self.group.forget_nice(tid);
         self.group.forget_task_ids(self.process.pid, tid);
@@ -1139,7 +1167,7 @@ impl Kernel {
         // The last thread's exit ends the process's use of its program,
         // whose file may be written again (`exit_mm`).
         if alone {
-            self.group.set_exe_file(None);
+            self.group.set_exe_file(None, None);
         }
         if thread.tid != self.process.pid {
             self.group.forget_nice(thread.tid);

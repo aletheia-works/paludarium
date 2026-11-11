@@ -1743,8 +1743,8 @@ kernel.
   last link or a directory, `IN_DELETE_SELF` and `IN_IGNORED` of it, which
   wait for the last close of a description of it that is open (a mapping
   holds one until it is unmapped), until no process runs it as its
-  program and, for a directory, until no process has it as its working
-  directory, as Linux's dentry waits;
+  program or its program's ELF interpreter and, for a directory, until no
+  process has it as its working directory, as Linux's dentry waits;
   `IN_MOVED_FROM` and `IN_MOVED_TO` with one cookie for a rename, then
   `IN_ATTRIB` of a file it replaces, `IN_MOVE_SELF` of the file moved, and
   the replaced file's `IN_DELETE_SELF`, which waits in the same way (twice

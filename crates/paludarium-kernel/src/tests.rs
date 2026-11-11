@@ -4752,6 +4752,28 @@ mod inotify {
         );
     }
     #[test]
+    fn a_removed_interpreter_ends_when_no_program_runs_with_it() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let ld = put(&f, DATA, b"/tmp/ld.so");
+        let d = f.ret(2, &[ld, 0o101, 0o755]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        let wd = f.ret(ADD, &[fd, ld, 0x400]) as i32;
+        // What exec keeps of the interpreter a program runs with, which a
+        // fork shares.
+        let files = &f.kernel.files;
+        let mapped = files.caches.hold(&*files.fs, b"/tmp/ld.so").unwrap();
+        let forked = mapped.copy();
+        assert_eq!(f.ret(87, &[ld]), 0);
+        drop(mapped);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        drop(forked);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
+    }
+    #[test]
     fn the_queue_merges_repeats_and_overflows_once() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK]);

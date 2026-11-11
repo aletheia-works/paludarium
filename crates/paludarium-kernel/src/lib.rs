@@ -421,8 +421,10 @@ impl Kernel {
     }
 
     /// Records `path` as the program the first process runs, as
-    /// `/proc/self/exe` names it: with its symbolic links resolved.
-    pub fn set_executable(&self, path: &[u8]) {
+    /// `/proc/self/exe` names it: with its symbolic links resolved. The
+    /// file of `interpreter`, the ELF interpreter it was loaded with, is
+    /// held while it runs, as its mappings hold it on Linux.
+    pub fn set_executable(&self, path: &[u8], interpreter: Option<&[u8]>) {
         let path = self
             .files
             .exec_path(path.to_vec())
@@ -431,8 +433,11 @@ impl Kernel {
         // It runs, so its file may not be opened for writing (ETXTBSY). A
         // writer can only be the host's here, which is not counted, so the
         // program still runs, without the denial.
+        let interpreter = interpreter
+            .and_then(|path| self.files.caches.hold(&*self.files.fs, path))
+            .map(Arc::new);
         if let Ok(denied) = crate::processes::deny_writes(&self.files, &path) {
-            self.group.set_exe_file(denied.map(Arc::new));
+            self.group.set_exe_file(denied.map(Arc::new), interpreter);
         }
         self.group.set_executable(path);
     }

@@ -583,21 +583,40 @@ static int case_home(void) {
 /* A program a process runs holds its file (Linux's `exe_file`): removed,
    its end waits until no process runs it. Its exec's own events are not
    watched (they are no events here). */
-static int case_running(void) {
-    make_base("running");
-    char *prog = at("prog");
-    int from = open("/proc/self/exe", O_RDONLY);
-    int to = open(prog, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+static int run_removing(const char *prog, const char *removed);
+/* Copies `from` to `to`, runnable; whether any of it was copied. */
+static int copy_file(const char *from_path, const char *to_path) {
+    int from = open(from_path, O_RDONLY);
+    int to = open(to_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     char buf[65536];
     ssize_t n;
     long copied = 0;
     while ((n = read(from, buf, sizeof buf)) > 0) copied += write(to, buf, n);
     close(from);
     close(to);
-    printf("copied=%d\n", copied > 0);
+    return copied > 0;
+}
+/* The ELF interpreter a program runs with is held as the program is (on
+   Linux by its mappings): inotify-interp, this file linked on musl's
+   dynamic linker by the relative name inotify-ld.so, which exec finds in
+   the working directory, runs with a copy of it there. */
+static int case_interpreter(void) {
+    make_base("interpreter");
+    char *ld = at("inotify-ld.so");
+    printf("copied=%d\n", copy_file("/lib/ld-musl-x86_64.so.1", ld));
+    char self[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", self, sizeof self - 32);
+    if (len <= 0) return 95;
+    self[len] = 0;
+    strcpy(strrchr(self, '/') + 1, "inotify-interp");
+    return run_removing(self, ld);
+}
+/* A child runs `prog` (as inotify-runner, from the base directory) while
+   `removed` is unlinked; the events of `removed` until the child exits. */
+static int run_removing(const char *prog, const char *removed) {
     int fd = inotify_init1(IN_NONBLOCK);
-    int wd = inotify_add_watch(fd, prog, IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
-    printf("wd prog=%d\n", wd);
+    int wd = inotify_add_watch(fd, removed, IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
+    printf("wd=%d\n", wd);
     int ready[2], done[2];
     if (pipe(ready) || pipe(done)) return 92;
     pid_t child = fork();
@@ -608,6 +627,7 @@ static int case_running(void) {
         dup2(done[0], 11);
         close(ready[1]);
         close(done[0]);
+        if (chdir(base)) _exit(96);
         execl(prog, prog, "inotify-runner", (char *)NULL);
         _exit(93);
     }
@@ -616,7 +636,7 @@ static int case_running(void) {
     char byte = 0;
     long got = read(ready[0], &byte, 1);
     printf("child ran=%ld byte=%c\n", got, byte);
-    printf("unlink=%ld\n", e(unlink(prog)));
+    printf("unlink=%ld\n", e(unlink(removed)));
     drain(fd, "removed");
     close(done[1]);
     int status = 0;
@@ -625,6 +645,12 @@ static int case_running(void) {
     drain(fd, "exited");
     remove_all();
     return 0;
+}
+static int case_running(void) {
+    make_base("running");
+    char *prog = at("prog");
+    printf("copied=%d\n", copy_file("/proc/self/exe", prog));
+    return run_removing(prog, prog);
 }
 /* The program case_running runs: it says it runs, then waits for the end
    of its input. */
@@ -695,6 +721,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-held")) return case_held();
     if (!strcmp(mode, "inotify-home")) return case_home();
     if (!strcmp(mode, "inotify-running")) return case_running();
+    if (!strcmp(mode, "inotify-interpreter")) return case_interpreter();
     if (!strcmp(mode, "inotify-runner")) return case_runner();
     return 2;
 }

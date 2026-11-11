@@ -44,39 +44,42 @@ pub(crate) struct PageCaches {
     /// [`CoherentFile`], by its handle), which keep a removed file there
     /// for inotify until the last is closed, as Linux's dentry keeps it.
     opens: Mutex<HashMap<usize, Open>>,
-    /// The working directories of the machine's processes, by file, each
-    /// with how many [`Home`]s hold it: as Linux's `fs->pwd` holds its
-    /// dentry, they keep a removed directory there for inotify too.
-    homes: Mutex<HashMap<Key, usize>>,
+    /// The files the machine's processes hold other than by a description,
+    /// each with how many [`Hold`]s hold it: working directories, as Linux's
+    /// `fs->pwd` holds its dentry, and the ELF interpreters programs run
+    /// with, as their mappings hold theirs. They keep a removed file there
+    /// for inotify too.
+    holds: Mutex<HashMap<Key, usize>>,
 }
 
-/// A working directory's hold on its file (`fs->pwd`): while it lasts, a
-/// removed directory's end (`IN_DELETE_SELF`) waits, as for an open
-/// description.
-pub(crate) struct Home {
+/// A hold on a file a process keeps without a description (a working
+/// directory's `fs->pwd`, or the mappings of a program's interpreter):
+/// while it lasts, a removed file's end (`IN_DELETE_SELF`) waits, as for
+/// an open description.
+pub(crate) struct Hold {
     caches: Arc<PageCaches>,
     key: Key,
 }
 
-impl Home {
-    /// Another hold on the same directory, as `copy_fs_struct` takes one.
-    pub(crate) fn copy(&self) -> Home {
-        self.caches.home_of(self.key)
+impl Hold {
+    /// Another hold on the same file, as `copy_fs_struct` takes one.
+    pub(crate) fn copy(&self) -> Hold {
+        self.caches.hold_of(self.key)
     }
 }
 
-impl Drop for Home {
+impl Drop for Hold {
     fn drop(&mut self) {
         {
-            let mut homes = self
+            let mut holds = self
                 .caches
-                .homes
+                .holds
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some(count) = homes.get_mut(&self.key) {
+            if let Some(count) = holds.get_mut(&self.key) {
                 *count -= 1;
                 if *count == 0 {
-                    homes.remove(&self.key);
+                    holds.remove(&self.key);
                 }
             }
         }
@@ -125,8 +128,8 @@ impl Drop for WriteAccess {
 }
 
 impl PageCaches {
-    /// Whether a description of file `key` is open, it is a working
-    /// directory, or a program runs from it.
+    /// Whether a description of file `key` is open, a [`Hold`] holds it,
+    /// or a program runs from it.
     fn held(&self, key: Key) -> bool {
         let opened = {
             let opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
@@ -142,7 +145,7 @@ impl PageCaches {
         };
         opened
             || self
-                .homes
+                .holds
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .contains_key(&key)
@@ -153,21 +156,21 @@ impl PageCaches {
                 .get(&key)
                 .is_some_and(|&count| count < 0)
     }
-    /// A hold on the directory at `path` in `fs` as a working directory,
-    /// by the key inotify knows it by; none if it cannot be looked at.
-    pub(crate) fn home(self: &Arc<Self>, fs: &dyn FileSystem, path: &[u8]) -> Option<Home> {
+    /// A hold on the file at `path` in `fs`, by the key inotify knows it
+    /// by; none if it cannot be looked at.
+    pub(crate) fn hold(self: &Arc<Self>, fs: &dyn FileSystem, path: &[u8]) -> Option<Hold> {
         let path = crate::files::resolved_in(fs, path)?;
         let stat = fs.metadata(&path, false).ok()?;
-        Some(self.home_of((mount_device(&fs.mounts(), &path), stat.inode)))
+        Some(self.hold_of((mount_device(&fs.mounts(), &path), stat.inode)))
     }
-    fn home_of(self: &Arc<Self>, key: Key) -> Home {
+    fn hold_of(self: &Arc<Self>, key: Key) -> Hold {
         *self
-            .homes
+            .holds
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .entry(key)
             .or_default() += 1;
-        Home {
+        Hold {
             caches: Arc::clone(self),
             key,
         }

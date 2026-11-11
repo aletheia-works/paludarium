@@ -113,7 +113,7 @@ pub struct Files {
     cwd: Arc<Mutex<Vec<u8>>>,
     /// The working directory's hold on its file, as `fs->pwd` holds its
     /// dentry; shared with the cwd.
-    home: Arc<Mutex<Option<crate::page_cache::Home>>>,
+    home: Arc<Mutex<Option<crate::page_cache::Hold>>>,
     /// Shared with the cwd: `CLONE_FS` shares both, as on Linux.
     umask: Arc<AtomicU32>,
     /// The page caches of the files mapped shared, which `fs` keeps its
@@ -208,7 +208,7 @@ impl Files {
     /// Makes the directory at `path` the working directory, holding its
     /// file instead of the last one (`set_fs_pwd`).
     fn change_directory(&self, path: Vec<u8>) {
-        let home = self.caches.home(&*self.fs, &path);
+        let home = self.caches.hold(&*self.fs, &path);
         *self.cwd.lock().unwrap_or_else(PoisonError::into_inner) = path;
         let last = std::mem::replace(
             &mut *self.home.lock().unwrap_or_else(PoisonError::into_inner),
@@ -514,7 +514,7 @@ impl Files {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .as_ref()
-                    .map(crate::page_cache::Home::copy),
+                    .map(crate::page_cache::Hold::copy),
             ));
             child.umask = Arc::new(AtomicU32::new(self.umask.load(Ordering::SeqCst)));
         }

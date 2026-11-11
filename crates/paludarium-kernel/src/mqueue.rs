@@ -952,9 +952,9 @@ fn mounted(c: &Context<'_>) -> Queues {
     c.processes.mqueue_mount.clone()
 }
 
-/// `/dev/mqueue`'s status: its root, a sticky directory anyone may write,
-/// its maker's, whose size counts its entries (`.`, `..` and each queue)
-/// and whose time is when a queue was last made or unlinked in it.
+/// `/dev/mqueue`'s status: the first IPC namespace's root
+/// ([`Queues::root_stat`]), a directory of mode 01777 until `chmod` changes
+/// it, whose mode then rules lookups, opens, making and unlinking there.
 pub(crate) fn mounted_root_stat(c: &Context<'_>) -> FileStat {
     mounted(c).root_stat(c)
 }

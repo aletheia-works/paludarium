@@ -1122,9 +1122,19 @@ static int accounts_case(void) {
     return 0;
 }
 
-/* A queue's file: its modification time, which nothing but a send and a
-   receive changes, and the mqueue root, which belongs to whoever made the
+/* A queue's file: its modification time, which a send and a receive set
+   and nothing else changes, to the second, as the mqueue filesystem keeps
+   its times, and the mqueue root, which belongs to whoever made the
    IPC namespace and lets them unlink anyone's queue. */
+/* Sleeps into the next second of the realtime clock, 100 ms past its start,
+   so that what a call stamps falls in it; returns that second. */
+static long long next_second(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    pause_ms((1000000000 - now.tv_nsec) / 1000000 + 100);
+    clock_gettime(CLOCK_REALTIME, &now);
+    return now.tv_sec;
+}
 static long long mtime_of(long fd) {
     struct stat st;
     if (fstat((int)fd, &st)) return -errno;
@@ -1141,15 +1151,13 @@ static int write_text(const char *path, const char *text) {
 static int files_case(void) {
     if (isolate()) return 10;
     struct mq_attr one = {.mq_maxmsg = 1, .mq_msgsize = 8};
+    long long second = next_second();
     long q = q_open("t", O_RDWR | O_CREAT | O_NONBLOCK, 0600, &one);
     if (q < 0) return 11;
     long long made = mtime_of(q);
-    /* Whether a send or a receive moves the time is not compared: on CI,
-       Linux's coarse clock was seen to stay put across 250 ms, and the
-       emulator has no CLOCK_REALTIME_COARSE to compare it with. That part
-       rests on Linux's do_mq_timedsend and do_mq_timedreceive. */
     printf("mtime:");
-    pause_ms(250);
+    put("made-this-second", made == second * 1000000000LL);
+    next_second();
     struct mq_attr old;
     q_attr(q, NULL, &old);
     struct sigevent none = {.sigev_notify = SIGEV_NONE};
@@ -1159,18 +1167,19 @@ static int files_case(void) {
     char line[100];
     lseek((int)q, 0, SEEK_SET);
     if (read((int)q, line, sizeof line) < 0) return 12;
-    long long untouched = mtime_of(q);
-    put("attr-notify-chmod-read-keep", untouched == made);
-    pause_ms(250);
+    put("attr-notify-chmod-read-keep", mtime_of(q) == made);
+    second = next_second();
     q_send(q, "a", 1, 0, NULL);
     long long sent = mtime_of(q);
-    pause_ms(250);
+    put("send-sets-this-second", sent == second * 1000000000LL);
+    next_second();
     put("full", q_send(q, "b", 1, 0, NULL));
     put("failed-send-keeps", mtime_of(q) == sent);
-    pause_ms(250);
+    second = next_second();
     q_receive(q, 8, NULL);
+    put("receive-sets-this-second", mtime_of(q) == second * 1000000000LL);
     long long received = mtime_of(q);
-    pause_ms(250);
+    next_second();
     put("empty", q_receive(q, 8, NULL));
     put("failed-receive-keeps", mtime_of(q) == received);
     say("");

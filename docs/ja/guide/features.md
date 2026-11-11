@@ -61,6 +61,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
+- `readv`・`writev` とその位置指定版、`vmsplice`、`sendmsg`、`recvmsg` の `struct iovec` の配列は、
+  Linux の `import_iovec` と同じ順で確かめます。要素がなければ何も動かさず、1024 を超えれば
+  `EINVAL`、配列がユーザー空間をはみ出せば `EFAULT` です。次に、どのバッファーを見るよりも先に
+  全要素を読み、負の長さは `EINVAL` です。その後で各バッファーがユーザー空間に収まるかを確かめ
+  （`EFAULT`）、要素が複数なら長さ全体で、1 つなら `MAX_RW_COUNT` までで確かめます。長さは、
+  合計が `MAX_RW_COUNT` を超えないように切り詰めます。
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
   `ESPIPE` を返します。`O_APPEND` のファイルでは、Linux と同じく位置を指定した書き込みも
   末尾に足します。

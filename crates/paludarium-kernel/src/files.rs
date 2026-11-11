@@ -1768,8 +1768,8 @@ fn send(
     Ok(sent)
 }
 /// The `struct iovec` array of readv, writev and their positioned forms, as
-/// Linux's `import_iovec` reads it: at most 1024 entries (EINVAL), each
-/// buffer accessible (EFAULT), and the total cut to `MAX_RW_COUNT`.
+/// Linux's `import_iovec` reads it (see [`iovecs_checked`]), each buffer
+/// then mapped for the transfer (EFAULT).
 pub(crate) fn iovecs(
     c: &Context<'_>,
     at: u64,
@@ -1785,34 +1785,50 @@ pub(crate) fn iovecs(
         .map_err(|_| Errno::EFAULT)
     })
 }
-/// [`iovecs`] with `check` for each buffer in place of the access check.
+/// The `struct iovec` array at `at`, in Linux's `import_iovec` order: none
+/// for no entries; more than 1024 are EINVAL; the array must lie in the user
+/// half (EFAULT); then every entry is read (EFAULT) and a negative length is
+/// EINVAL, in order, before any buffer is looked at; then each buffer is
+/// `access_ok` (EFAULT), with its whole length when there are several and
+/// cut to `MAX_RW_COUNT` first when there is one (`import_ubuf`), and the
+/// lengths are cut so that the total is at most `MAX_RW_COUNT`. `check` then
+/// looks at each cut buffer in turn.
 pub(crate) fn iovecs_checked(
     c: &Context<'_>,
     at: u64,
     count: u64,
     check: impl Fn(u64, usize) -> Result<(), Errno>,
 ) -> Result<Vec<(u64, usize)>, Errno> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     if count > 1024 {
         return Err(Errno::EINVAL);
     }
-    let mut segments = Vec::new();
-    let mut total = 0usize;
+    crate::sockets::access_ok(at, (count * 16) as usize)?;
+    let mut entries = Vec::with_capacity(count as usize);
     for index in 0..count {
-        let addr = at.checked_add(index * 16).ok_or(Errno::EFAULT)?;
+        let addr = at + index * 16;
         let base = c.mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
         let length = c
             .mem
-            .read_u64(GuestAddr(addr.checked_add(8).ok_or(Errno::EFAULT)?))
+            .read_u64(GuestAddr(addr + 8))
             .map_err(|_| Errno::EFAULT)?;
         if (length as i64) < 0 {
             return Err(Errno::EINVAL);
         }
-        let length = usize::try_from(length)
-            .unwrap_or(usize::MAX)
-            .min(MAX_RW_COUNT - total);
+        entries.push((base, length as usize));
+    }
+    let mut segments = Vec::with_capacity(entries.len());
+    let mut total = 0usize;
+    for (base, length) in entries {
+        let cut = length.min(MAX_RW_COUNT - total);
+        crate::sockets::access_ok(base, if count == 1 { cut } else { length })?;
+        total += cut;
+        segments.push((base, cut));
+    }
+    for &(base, length) in &segments {
         check(base, length)?;
-        total += length;
-        segments.push((base, length));
     }
     Ok(segments)
 }

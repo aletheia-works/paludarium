@@ -69,6 +69,14 @@ kernel.
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
+- The `struct iovec` array of `readv`, `writev`, their positioned forms,
+  `vmsplice`, `sendmsg` and `recvmsg` is checked in the order of Linux's
+  `import_iovec`: no entries move nothing, more than 1024 are `EINVAL`, an
+  array past the user half is `EFAULT`, then every entry is read and a
+  negative length is `EINVAL` before any buffer is looked at, and then each
+  buffer must lie in the user half (`EFAULT`), with its whole length when
+  there are several and at most `MAX_RW_COUNT` when there is one. The lengths
+  are cut so that the total is at most `MAX_RW_COUNT`.
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
   where it was, and a pipe or socket gives `ESPIPE`; in an `O_APPEND` file a
   positioned write still appends, as on Linux.

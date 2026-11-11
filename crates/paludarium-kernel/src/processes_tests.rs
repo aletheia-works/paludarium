@@ -4508,7 +4508,7 @@ mod set_tid {
         let (k, _t, _m) = setup();
         let processes = &k.processes;
         let first = Namespaces::default();
-        let owner = crate::namespaces::user_for(&first, &user(), CLONE_NEWUSER).unwrap();
+        let owner = crate::namespaces::user_for(&first, &user(), CLONE_NEWUSER, u64::MAX).unwrap();
         let space = first
             .for_child(CLONE_NEWPID, false, &owner.user.0)
             .unwrap()

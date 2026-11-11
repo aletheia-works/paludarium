@@ -803,6 +803,18 @@ static int notify_case(void) {
     put("empty", TRY(recv(nl, got, sizeof got, MSG_DONTWAIT)));
     say("");
 
+    /* A child's registration ends as it ends, and the socket it shares with
+       its parent hears NOTIFY_REMOVED at once. */
+    pid = child();
+    if (pid == 0) {
+        memset(cookie, 'e', sizeof cookie);
+        _exit(q_notify(q, &by_cookie) == 0 ? 0 : 1);
+    }
+    int ended = wait_child(pid);
+    memset(got, 0, sizeof got);
+    n = TRY(recv(nl, got, sizeof got, MSG_DONTWAIT));
+    say("cookie: child-status=%d on-exit=%ld first=%c last=%d", ended, n, got[0], got[31]);
+
     /* Through the C library, whose helper thread reads the cookie and
        runs the function. */
     if (pipe(notified)) return 15;
@@ -1050,6 +1062,66 @@ static int sysctl_case(void) {
     return 0;
 }
 
+/* RLIMIT_MSGQUEUE in a user namespace: a queue charges its user there
+   against its own limit, and the namespace's owner in the parent against
+   the limit the owner had when it made the namespace. */
+static long make_tiny_queues(const char *prefix, int most) {
+    struct mq_attr one = {.mq_maxmsg = 1, .mq_msgsize = 1};
+    char name[32];
+    for (int made = 0; made < most; made++) {
+        snprintf(name, sizeof name, "%s%d", prefix, made);
+        long fd = q_open(name, O_RDWR | O_CREAT, 0600, &one);
+        if (fd < 0) {
+            printf(" made=%d then=%ld", made, fd);
+            return made;
+        }
+    }
+    printf(" made=%d", most);
+    return most;
+}
+static void unlink_tiny_queues(const char *prefix, int count) {
+    char name[32];
+    for (int i = 0; i < count; i++) {
+        snprintf(name, sizeof name, "%s%d", prefix, i);
+        q_unlink(name);
+    }
+}
+static int accounts_case(void) {
+    if (isolate()) return 10;
+    struct rlimit standard = {819200, 819200};
+    if (setrlimit(RLIMIT_MSGQUEUE, &standard)) return 11;
+    /* Root charges 30 queues of 97 bytes to itself. */
+    printf("root:");
+    long rooted = make_tiny_queues("r", 30);
+    say("");
+    for (int round = 0; round < 2; round++) {
+        pid_t pid = child();
+        if (pid == 0) {
+            /* Round 0 makes the namespace with a large limit, then lowers
+               its own; round 1 makes it with a small one, then raises its
+               own back. */
+            struct rlimit before = {round == 0 ? 100000 : 3000, 819200};
+            struct rlimit after = {round == 0 ? 1000 : 819200, 819200};
+            if (setrlimit(RLIMIT_MSGQUEUE, &before)) _exit(90);
+            if (unshare(CLONE_NEWUSER)) _exit(91);
+            if (setrlimit(RLIMIT_MSGQUEUE, &after)) _exit(92);
+            printf("nested-%d:", round);
+            long made = make_tiny_queues(round == 0 ? "a" : "b", 40);
+            say("");
+            unlink_tiny_queues(round == 0 ? "a" : "b", (int)made);
+            _exit(0);
+        }
+        say("nested-%d: status=%d", round, wait_child(pid));
+    }
+    /* What the nested users made is given back. */
+    printf("root-again:");
+    long more = make_tiny_queues("s", 5);
+    say("");
+    unlink_tiny_queues("s", (int)more);
+    unlink_tiny_queues("r", (int)rooted);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -1060,5 +1132,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-notify")) return notify_case();
     if (!strcmp(mode, "mqueue-fork")) return fork_case();
     if (!strcmp(mode, "mqueue-sysctl")) return sysctl_case();
+    if (!strcmp(mode, "mqueue-accounts")) return accounts_case();
     return 3;
 }

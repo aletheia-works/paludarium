@@ -303,7 +303,10 @@ NAMES = {
     444: "landlock_create_ruleset",
     445: "landlock_add_rule",
     446: "landlock_restrict_self",
+    449: "futex_waitv",
     452: "fchmodat2",
+    454: "futex_wake",
+    455: "futex_wait",
 }
 
 

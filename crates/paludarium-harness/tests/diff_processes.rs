@@ -129,7 +129,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // addresses, monitor, routes, link-attributes and msg cases, whose checks depend on
+            // addresses, monitor, routes, link-attributes, generic-netlink and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts), the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
@@ -166,12 +166,14 @@ mod linux {
                     | "mqueue-notify"
                     | "mqueue-fork"
                     | "mqueue-sysctl"
+                    | "mqueue-accounts"
                     | "netlink"
                     | "unix-interfaces"
                     | "addresses"
                     | "monitor"
                     | "routes"
                     | "link-attributes"
+                    | "generic-netlink"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
@@ -284,6 +286,7 @@ mod linux {
         processes_monitor => ("monitor","process"),
         processes_routes => ("routes","process"),
         processes_link_attributes => ("link-attributes","process"),
+        processes_generic_netlink => ("generic-netlink","process"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
@@ -329,6 +332,7 @@ mod linux {
         inotify_flags => ("inotify-flags","inotify"),
         inotify_overflow => ("inotify-overflow","inotify"),
         inotify_wait => ("inotify-wait","inotify"),
+        inotify_content => ("inotify-content","inotify"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -336,6 +340,7 @@ mod linux {
         mqueue_notify => ("mqueue-notify","mqueue"),
         mqueue_fork => ("mqueue-fork","mqueue"),
         mqueue_sysctl => ("mqueue-sysctl","mqueue"),
+        mqueue_accounts => ("mqueue-accounts","mqueue"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),
@@ -450,6 +455,7 @@ mod linux {
         processes_vector_flags => ("vector-flags","process"),
         processes_old_times => ("old-times","process"),
         processes_old_forms => ("old-forms","process"),
+        processes_futex2 => ("futex2","process"),
         processes_mmsg => ("mmsg","process"),
         processes_itimer => ("itimer","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),

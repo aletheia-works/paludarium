@@ -195,15 +195,10 @@ verified.
     all look again whenever it changes, where Linux wakes them in the order
     they began only while each one's message fits.
   - The POSIX message queues' filesystem cannot be mounted (there is no
-    `/dev/mqueue`). `RLIMIT_MSGQUEUE` charges each real user ID
-    once for the whole machine, where Linux charges it in each user
-    namespace too. A queue's file keeps only its creation time, and its
+    `/dev/mqueue`). A queue's file keeps only its creation time, and its
     root belongs to root in every IPC namespace. A `SIGEV_THREAD` cookie
     goes to its socket even when the socket's receive buffer is full,
-    where Linux's `mq_notify` first waits for room. The registration of a
-    process that ends goes when the queue is next used, where Linux drops it
-    as the process closes its descriptors: a `SIGEV_THREAD` socket still
-    open elsewhere gets its `NOTIFY_REMOVED` cookie only then.
+    where Linux's `mq_notify` first waits for room.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
     where Linux checks the writer again at each write, and it reports its
     value's length as its size, where Linux reports 0.
@@ -310,16 +305,16 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: opening and closing a file (`IN_OPEN`,
-  `IN_CLOSE_WRITE`, `IN_CLOSE_NOWRITE`) and reading or writing it
-  (`IN_ACCESS` and `IN_MODIFY` of `read`, `write`, `getdents64`, `sendfile`,
-  `copy_file_range`, `fallocate` and the like) are not reported yet; changing
-  its times, truncating it and `O_TRUNC` are. A file removed while it is open
+- **inotify, in part**: opening a FIFO by its path, running a program
+  (which Linux reports as `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`),
+  `splice` and `io_uring`'s reads and writes are no events. A file removed while it is open
   (or a directory that is a working directory) gets `IN_DELETE_SELF` as it is
   removed, where Linux sends it at the last close. A change through a
-  descriptor (`fchmod`, `ftruncate` and the like) reaches the watch of the
-  file's directory only while the path it was opened at still names it, where
-  Linux follows a rename and reports to the directory a removed file was in.
+  descriptor (`fchmod`, `ftruncate`, a read, a write or a close) reaches the
+  watch of the file's directory while the path it was opened at still names
+  it, and by that name once no name links the file; a file renamed or reached
+  through another link after it was opened is heard of by its own watches
+  only, where Linux follows the rename.
   An instance cannot be used for signal-driven I/O (`FIOASYNC` gives
   `ENOTTY`, and `fcntl` leaves `O_ASYNC` off), its `/proc/self/fdinfo` entry
   does not list its watches, `/proc/sys/fs/inotify` does not exist, and
@@ -337,7 +332,11 @@ verified.
   another), and the interface requests and netlink change no other flag
   than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`
-  (`EPROTONOSUPPORT` for `NETLINK_GENERIC` and the rest), and of it only
+  and `NETLINK_GENERIC` (`EPROTONOSUPPORT` for the rest); generic netlink
+  has no family but `nlctrl`, where Linux has those of the host's kernel
+  and modules (`ethtool`, `nl80211`, `devlink` and others), so a lookup of
+  one is `ENOENT` and a socket has 64 groups however many those take.
+  Of `NETLINK_ROUTE` there are only
   the link, address and route requests: neighbours, rules, queueing
   disciplines and the rest are `EOPNOTSUPP`, as are an input route
   lookup (`RTA_IIF`, as `ip route get ... iif` sends), a non-dump

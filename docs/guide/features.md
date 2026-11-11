@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
@@ -66,7 +66,7 @@ kernel.
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
-| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
@@ -221,7 +221,21 @@ kernel.
   process's address space and the address, so a private wake never reaches
   another process. Process-shared mutexes and semaphores (Python's
   `multiprocessing`) work this way, as does the wake of a robust futex whose
-  owner ends.
+  owner ends. A wake wakes one waiter even when asked for 0 or fewer, as
+  Linux counts before it compares, and a private one does not look at the
+  word's page. A timeout too long for Linux's nanoseconds waits until
+  `KTIME_MAX`.
+- The futex2 calls take 32-bit words with `FUTEX2_PRIVATE`, `FUTEX2_NUMA`
+  and `FUTEX2_MPOL`, checked in Linux's order. Other sizes and flags give
+  `EINVAL`. `futex_wake` and `futex_wait` are `FUTEX_WAKE_BITSET` and
+  `FUTEX_WAIT_BITSET` with an absolute timeout on `CLOCK_REALTIME` or
+  `CLOCK_MONOTONIC`, and a `futex_wake` of 0 wakes none. `futex_waitv` waits
+  on up to 128 words at once and gives the index of a woken one: it checks
+  every word's address before it compares any value, then gives `EAGAIN` at
+  the first that differs. A `FUTEX2_NUMA` word is followed by its node,
+  which must be node 0, the only one, or `-1`, which becomes 0, as Linux
+  writes the thread's node there. A signal interrupts them with
+  `ERESTARTSYS`, so they run again after a stop or an `SA_RESTART` handler.
 - `set_robust_list` and `get_robust_list` keep each thread's list of robust
   futexes, which glibc's and musl's robust mutexes need. When a thread ends or
   calls `execve`, the list is walked as Linux's `exit_robust_list` walks it:
@@ -699,10 +713,13 @@ kernel.
   and the same defaults (`msg_default`, `msgsize_default`), of which a
   queue made without attributes takes the smaller of each and its limit;
   `CAP_SYS_RESOURCE` passes the limits and allows up to 65536 messages of
-  16 MiB. A queue charges its
-  creator's real user ID for its bytes and Linux's bookkeeping of each
-  message (48 + 48 bytes on x86-64) against `RLIMIT_MSGQUEUE` (`EMFILE`)
-  until it is unlinked and closed. `mq_open` gives a close-on-exec
+  16 MiB. Until it is unlinked and closed, a queue charges its bytes and
+  Linux's bookkeeping of each message (48 + 48 bytes on x86-64) as Linux's
+  `inc_rlimit_ucounts` does (`EMFILE` past any limit): to its creator's
+  real user ID in the creator's user namespace, against the creator's
+  `RLIMIT_MSGQUEUE`, and for each user namespace the creator is in, to the
+  namespace's owner in its parent, against the `RLIMIT_MSGQUEUE` the owner
+  had when it made the namespace. `mq_open` gives a close-on-exec
   descriptor, which `fork` shares with its `O_NONBLOCK` (which
   `mq_getsetattr` and `fcntl` both set): `poll`, `select` and `epoll` find
   it readable with a message and writable with room, whatever its access
@@ -1117,6 +1134,35 @@ kernel.
     tentative and then not. An unbound socket hears nothing; the requester
     of an IPv4 address's or a route's change has the notification before
     its acknowledgement, and with `NLM_F_ECHO` as its own copy.
+- A generic netlink socket (protocol `NETLINK_GENERIC`) has its own ports,
+  so it binds to the process's ID as a `NETLINK_ROUTE` socket does too,
+  and its one family is the controller, `nlctrl` (family ID 16), as in a
+  kernel built with no other, so a program that looks a family up (as
+  libnl's `genl_ctrl_resolve` or `genl ctrl list` do) finds that it is
+  not there.
+  - **Requests:** as `genl_rcv_msg`, a type that is no family is `ENOENT`,
+    a message without a whole `genlmsghdr` `EINVAL`, and a command
+    `nlctrl` does not have `EOPNOTSUPP`; from command 11 on, a reserved
+    field or a flag other than `NLM_F_REQUEST`, `NLM_F_ACK`, `NLM_F_ECHO`
+    and `NLM_F_DUMP` is `EINVAL`. The attributes are checked as Linux's
+    policies say: liberally for a `CTRL_CMD_GETFAMILY` that is no dump
+    (an unknown attribute is skipped, a short integer is `ERANGE`), and
+    strictly for a dump (an unknown attribute, an integer of another
+    length or bytes left over are `EINVAL`).
+  - **Families:** `CTRL_CMD_GETFAMILY` answers with `nlctrl`'s
+    `CTRL_CMD_NEWFAMILY` for `CTRL_ATTR_FAMILY_NAME` `nlctrl` or
+    `CTRL_ATTR_FAMILY_ID` 16 (the name wins when both are given; `ENOENT`
+    for another, `EINVAL` for neither), with its name, ID, version 2,
+    header size, commands with their flags and its group, as
+    `ctrl_fill_info` makes it; a dump lists it, its `NLMSG_DONE` in the
+    same datagram. A dump of `CTRL_CMD_GETPOLICY` gives the policies of
+    `nlctrl`'s commands, or of the one `CTRL_ATTR_OP` names (`ENOENT` for
+    another), as `ctrl_dumppolicy` does: which policy each command's
+    request and dump take, then each attribute's type and limits, a
+    message each; a second dump while one runs is `EBUSY`.
+  - **Groups:** a socket has 64 groups (`EINVAL` for 0 or one past them),
+    any of which anyone may join; `nlctrl`'s `notify` is group 16, which
+    hears nothing, as no family comes or goes.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,
@@ -1639,8 +1685,17 @@ kernel.
   nothing for a rename onto another link of the same file); `IN_ATTRIB` for
   a new mode, owner (a `chown` that names neither gives none), both times
   or extended attribute; `IN_ACCESS` and `IN_MODIFY` for setting only the
-  access or only the modification time; and `IN_MODIFY` for a truncation,
-  `O_TRUNC` emptying a regular file too. A file's change reaches the watch of
+  access or only the modification time; `IN_MODIFY` for a truncation,
+  `O_TRUNC` emptying a regular file too (after its `IN_OPEN`); `IN_OPEN` for
+  an open (not `O_PATH`, and a link in `/proc/self/fd` too), and
+  `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` as the open file description's last
+  reference goes, which a mapping of it holds until it is unmapped; and
+  `IN_ACCESS` or `IN_MODIFY` for a `read`, `write`, `pread64`, `pwrite64`,
+  `readv`, `writev`, `preadv`, `pwritev`, `preadv2` or `pwritev2` that moved
+  bytes, `sendfile` and `copy_file_range` (the input's, then the output's),
+  `fallocate`, and each `getdents` and `getdents64`. A watch with `IN_EXCL_UNLINK` does not
+  hear of the open, close, read or write of a file no name links any more;
+  `truncate`, `mknod` and starting a program open nothing. A file's change reaches the watch of
   its directory, with its name, before its own, and `IN_ISDIR` marks a
   directory's (not with `IN_DELETE_SELF` or `IN_MOVE_SELF`, as Linux
   leaves it out). `IN_ONESHOT` removes the watch after its first event, with
@@ -2055,11 +2110,12 @@ one only with an `--allow-net`.
   `accept4`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `sendmmsg`,
   `recvmmsg`, `msgsnd`, `msgrcv`, `mq_timedsend`, `mq_timedreceive`,
   `sendfile`, `splice`, `tee`, `vmsplice`, `ppoll`, `select`, `pselect6`,
-  `poll` with no timeout and a `futex` wait with none. `nanosleep`, a
-  relative `clock_nanosleep`, `poll` with a timeout and a timed `futex` wait
-  resume through `restart_syscall` with the deadline they had (the `futex`
-  wait checks its word again first, `EAGAIN` once it changed), and an
-  absolute `clock_nanosleep` runs again; a handler ends the restart, so they
+  `poll` with no timeout and a `futex` wait with none, and `futex_waitv` and
+  futex2's `futex_wait` with or without one. `nanosleep`, a relative
+  `clock_nanosleep`, `poll` with a timeout and a timed `futex` wait resume
+  through `restart_syscall` with the deadline they had (the `futex` wait
+  checks its word again first, `EAGAIN` once it changed), and an absolute
+  `clock_nanosleep` runs again; a handler ends the restart, so they
   give `EINTR` then. A handler set with `SA_RESTART` runs the calls that a
   stop runs again (from `read` to the `futex` wait with no timeout) again when
   it returns, as on Linux, except `pause`, `rt_sigsuspend`, `msgsnd`,

@@ -340,6 +340,9 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         23 | 270 | 271 => true,
         // futex FUTEX_WAIT and FUTEX_WAIT_BITSET without a timeout.
         202 => matches!(args[1] & 127, 0 | 9) && args[3] == 0,
+        // futex_waitv and futex2's futex_wait, whose timeout is absolute
+        // (`ERESTARTSYS`).
+        449 | 455 => true,
         _ => false,
     }
 }

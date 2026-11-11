@@ -1190,8 +1190,8 @@ kernel.
     both once the peer has closed), and its owner as the user namespace of
     whoever made the netlink socket shows it. A datagram socket another
     connects to is `TCP_ESTABLISHED`, as on Linux.
-  - **Groups:** a socket has its four groups, which anyone may join, and
-    which hear nothing.
+  - **Groups:** a socket has 32 groups, as Linux makes the four of
+    `sock_diag` 32, which anyone may join, and which hear nothing.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,

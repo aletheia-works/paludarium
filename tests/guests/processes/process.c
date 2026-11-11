@@ -1783,6 +1783,25 @@ static void diag_print(const char *label, const unsigned char *body, int len) {
                 printf("%s%s", i ? "," : "", diag_label(word));
             }
             break;
+        case 5: {
+            /* SO_RCVBUF and SO_SNDBUF as the socket's own getsockopt
+               gives them, as their defaults are the host's sysctls. */
+            int fd = -1, buffers[2] = {0, 0};
+            for (int i = 0; i < diag_count; i++)
+                if (diag_sockets[i].ino == ino) fd = diag_sockets[i].fd;
+            socklen_t blen = sizeof buffers[0];
+            getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffers[0], &blen);
+            blen = sizeof buffers[1];
+            getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffers[1], &blen);
+            printf(" 5=");
+            for (int i = 0; i + 4 <= n; i += 4) {
+                memcpy(&word, v + i, 4);
+                if (i == 4 && (int)word == buffers[0]) printf(",rcvbuf");
+                else if (i == 12 && (int)word == buffers[1]) printf(",sndbuf");
+                else printf("%s%u", i ? "," : "", word);
+            }
+            break;
+        }
         case 7: printf(" uid=%u", word); break;
         default:
             printf(" %u=", type);

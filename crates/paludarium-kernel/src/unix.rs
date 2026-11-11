@@ -653,6 +653,7 @@ impl UnixSocket {
             let theirs = client.lock();
             (self.lock(), theirs)
         };
+        let file = own.file;
         let Some(listen) = own.listen.as_mut() else {
             return Err(ECONNREFUSED);
         };
@@ -697,8 +698,12 @@ impl UnixSocket {
                 // As `unix_stream_connect` makes it, in the client's.
                 network: client.network.clone(),
                 hub: Arc::clone(&self.hub),
+                // It has the listener's name and, as `unix_stream_connect`
+                // copies `path`, its socket file, though the file finds
+                // only the listener.
                 state: Mutex::new(State {
                     peer: Some(Arc::clone(&client.name)),
+                    file,
                     ..State::default()
                 }),
                 landlock: self.landlock.clone(),

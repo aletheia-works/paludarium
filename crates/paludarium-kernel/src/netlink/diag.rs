@@ -5,15 +5,16 @@
 //! namespace the netlink socket was made in, or answers for one by its
 //! inode, each with what the request's `udiag_show` asks for, as
 //! `sk_diag_fill` makes it; another family has no handler (`ENOENT`).
-//! Anyone may ask, and join its four groups, which hear nothing, as no
-//! socket is destroyed through it.
+//! Anyone may ask, and join its groups, which hear nothing, as no socket
+//! is destroyed through it.
 use super::{
     Errno, Header, NLM_F_DUMP, NLM_F_MULTI, NLMSG_DONE, NetlinkSocket, State, attribute, message,
 };
 use crate::users::Ids;
 
-/// The groups a `NETLINK_SOCK_DIAG` socket has (`SKNLGRP_MAX`).
-pub(super) const GROUPS: u32 = 4;
+/// The groups a `NETLINK_SOCK_DIAG` socket has: its four (`SKNLGRP_MAX`),
+/// which `netlink_kernel_create` makes 32, as it does any fewer.
+pub(super) const GROUPS: u32 = 32;
 const TCPDIAG_GETSOCK: u16 = 18;
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
 const SOCK_DESTROY: u16 = 21;

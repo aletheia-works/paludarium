@@ -228,7 +228,17 @@ impl PageCaches {
     /// What a rename from `old` to `new` in `fs` will move, unless it names
     /// one file twice and so does nothing.
     fn before_rename(&self, fs: &Arc<dyn FileSystem>, old: &[u8], new: &[u8]) -> Option<Moving> {
-        let places = self.places(fs);
+        let mut places = self.places(fs);
+        if places.is_empty() {
+            return None;
+        }
+        let (old_entry, new_entry) = (entry_path(&**fs, old)?, entry_path(&**fs, new)?);
+        // Only the descriptions at either name or below them can move, and
+        // most renames have none: those look at no more files.
+        places.retain(|place| {
+            let place = place.lock().unwrap_or_else(PoisonError::into_inner);
+            below(&place.path, &old_entry).is_some() || below(&place.path, &new_entry).is_some()
+        });
         if places.is_empty() {
             return None;
         }
@@ -239,8 +249,8 @@ impl PageCaches {
             return None;
         }
         Some(Moving {
-            old: entry_path(&**fs, old)?,
-            new: entry_path(&**fs, new)?,
+            old: old_entry,
+            new: new_entry,
             places,
         })
     }

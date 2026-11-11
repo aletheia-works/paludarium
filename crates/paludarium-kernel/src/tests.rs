@@ -4729,6 +4729,12 @@ mod inotify {
         // name it had.
         assert_eq!(f.ret(86, &[g, h]), 0);
         assert_eq!(f.ret(87, &[g]), 0);
+        // A new file at that name, renamed and unlinked, leaves it there.
+        let n = put(&f, DATA + 0x100, b"/tmp/c/n");
+        let made = f.ret(2, &[g, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[made]), 0);
+        assert_eq!(f.ret(82, &[g, n]), 0);
+        assert_eq!(f.ret(87, &[n]), 0);
         drop(events(&mut f, fd));
         assert_eq!(f.ret(1, &[d, byte, 1]), 1);
         assert_eq!(f.ret(3, &[d]), 0);

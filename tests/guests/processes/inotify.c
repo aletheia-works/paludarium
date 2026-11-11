@@ -750,6 +750,17 @@ static int case_moved(void) {
     printf("write=%ld fchmod=%ld\n", wrote, e(fchmod(f, 0644)));
     drain(fd, "after-unlink");
     drain(excl, "after-unlink-excl");
+    /* A new file at the unlinked name, renamed and unlinked, leaves it. */
+    char fresh[160];
+    snprintf(fresh, sizeof fresh, "%s/n", moved);
+    touch(to);
+    long renamed = e(rename(to, fresh));
+    printf("rename new=%ld unlink new=%ld\n", renamed, e(unlink(fresh)));
+    drain(fd, "renewed");
+    drain(excl, "renewed-excl");
+    printf("write=%ld\n", e(write(f, &byte, 1)));
+    drain(fd, "after-renew");
+    drain(excl, "after-renew-excl");
     /* A name a rename replaces, while another link keeps the file. */
     char keep[160], over[160];
     snprintf(keep, sizeof keep, "%s/i", moved);

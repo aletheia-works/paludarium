@@ -319,6 +319,7 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         | 34
         | 130
         | 73
+        | 40
         | 43
         | 288
         | 44..=47
@@ -326,7 +327,6 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         | 70
         | 242
         | 243
-        | 40
         | 275
         | 276
         | 278 => true,

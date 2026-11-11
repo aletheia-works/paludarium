@@ -9,12 +9,12 @@ publish = false
 # through a shared WebAssembly.Memory. It does not use the Host trait.
 # Build: spikes/wasm-threads/build.sh
 
-[workspace]
-
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
+
+[workspace]
 
 [profile.dev]
 panic = "abort"

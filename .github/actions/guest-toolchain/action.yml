@@ -147,6 +147,10 @@ runs:
           sudo -E apt-get install -y --no-install-recommends "${toolchain[@]}"
         fi
         update
+        # What apt fetches for the packages: those the image already has are not among them.
+        # shellcheck disable=SC2086 # the packages are separate words
+        mapfile -t fetched < <(apt-get install --simulate --no-install-recommends $PACKAGES |
+          awk '/^Inst /{print $2}')
         # shellcheck disable=SC2086 # the packages are separate words
         download $PACKAGES
         # shellcheck disable=SC2086 # the packages are separate words
@@ -170,10 +174,12 @@ runs:
         # replaced, so one that misses a file would cost every later job on the image a failed
         # attempt; keep only what installs again from disk. A mirror dropped above updates the
         # lists a second time, and that can leave the earlier files behind them.
-        # shellcheck disable=SC2086 # the packages are separate words
-        if [ "$SAVE" = true ] && ! sudo apt-get install -y --no-install-recommends \
-          --download-only --no-download --reinstall --allow-downgrades \
-          "${toolchain[@]:2}" $PACKAGES > /dev/null; then
+        # Installed now, the toolchain and what the packages fetched are reinstalled to check
+        # that their files are all there.
+        check=("${toolchain[@]:2}" "${fetched[@]}")
+        if [ "$SAVE" = true ] && [ "${#check[@]}" -gt 0 ] &&
+          ! sudo apt-get install -y --no-install-recommends \
+            --download-only --no-download --reinstall --allow-downgrades "${check[@]}" > /dev/null; then
           echo "::warning::the downloaded apt files no longer match the lists; not caching them"
           SAVE=
         fi

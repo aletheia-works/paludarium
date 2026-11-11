@@ -1826,13 +1826,16 @@ pub(crate) fn iovecs_checked(
         if (length as i64) < 0 {
             return Err(Errno::EINVAL);
         }
-        entries.push((base, length as usize));
+        entries.push((base, length));
     }
+    // The lengths stay 64-bit until they are cut, as `usize` is 32 bits in
+    // WebAssembly.
     let mut segments = Vec::with_capacity(entries.len());
     let mut total = 0usize;
     for (base, length) in entries {
-        let cut = length.min(MAX_RW_COUNT - total);
-        crate::sockets::access_ok(base, if count == 1 { cut } else { length })?;
+        let cut = length.min((MAX_RW_COUNT - total) as u64);
+        crate::sockets::access_ok_u64(base, if count == 1 { cut } else { length })?;
+        let cut = cut as usize;
         total += cut;
         segments.push((base, cut));
     }

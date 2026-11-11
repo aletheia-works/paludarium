@@ -1203,7 +1203,12 @@ pub(crate) fn user_buffer(at: u64, len: u64) -> Result<usize, Errno> {
 /// Linux's `access_ok`: EFAULT for `len` bytes at `at` that reach past the
 /// user half.
 pub(crate) fn access_ok(at: u64, len: usize) -> Result<(), Errno> {
-    if at > TASK_SIZE_MAX.saturating_sub(len as u64) {
+    access_ok_u64(at, len as u64)
+}
+/// [`access_ok`] for a length that may not fit a `usize` (WebAssembly's 32
+/// bits), such as an iovec's before it is cut.
+pub(crate) fn access_ok_u64(at: u64, len: u64) -> Result<(), Errno> {
+    if at > TASK_SIZE_MAX.saturating_sub(len) {
         return Err(Errno::EFAULT);
     }
     Ok(())

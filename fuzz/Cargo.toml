@@ -10,10 +10,6 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
-# Not part of the main workspace (needs nightly sanitizer flags).
-[workspace]
-members = ["."]
-
 [[bin]]
 bench = false
 doc = false
@@ -124,3 +120,7 @@ paludarium-loader = { path = "../crates/paludarium-loader" }
 paludarium-mmu = { path = "../crates/paludarium-mmu" }
 paludarium-types = { path = "../crates/paludarium-types" }
 paludarium-vfs = { path = "../crates/paludarium-vfs" }
+
+# Not part of the main workspace (needs nightly sanitizer flags).
+[workspace]
+members = ["."]

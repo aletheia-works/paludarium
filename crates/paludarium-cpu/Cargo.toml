@@ -8,13 +8,13 @@ readme.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+cost-profile = []
+
 [dependencies]
 paludarium-decoder.workspace = true
 paludarium-mmu.workspace = true
 paludarium-types.workspace = true
-
-[features]
-cost-profile = []
 
 [lints]
 workspace = true

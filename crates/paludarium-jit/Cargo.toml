@@ -8,15 +8,15 @@ readme.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+cost-profile = ["paludarium-cpu/cost-profile"]
+fuzzing = []
+
 [dependencies]
 paludarium-cpu.workspace = true
 paludarium-decoder.workspace = true
 paludarium-mmu.workspace = true
 paludarium-types.workspace = true
-
-[features]
-cost-profile = ["paludarium-cpu/cost-profile"]
-fuzzing = []
 
 [lints]
 workspace = true

@@ -1122,18 +1122,25 @@ static int accounts_case(void) {
     return 0;
 }
 
-/* A queue's file: its modification time, which a send and a receive set
-   and nothing else changes, to the second, as the mqueue filesystem keeps
-   its times, and the mqueue root, which belongs to whoever made the
-   IPC namespace and lets them unlink anyone's queue. */
-/* Sleeps into the next second of the realtime clock, 100 ms past its start,
-   so that what a call stamps falls in it; returns that second. */
+/* Sleeps into the next second of the realtime clock, 100 ms past its
+   start, so that what a call stamps after it is later than anything stamped
+   before; returns that second. */
 static long long next_second(void) {
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     pause_ms((1000000000 - now.tv_nsec) / 1000000 + 100);
     clock_gettime(CLOCK_REALTIME, &now);
     return now.tv_sec;
+}
+static long long this_second(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    return now.tv_sec;
+}
+/* Whether `stamp` is a whole second from `from` to `to`, as a call made
+   between reading them stamps it, however long it took. */
+static int stamped_between(long long stamp, long long from, long long to) {
+    return stamp % 1000000000LL == 0 && stamp >= from * 1000000000LL && stamp <= to * 1000000000LL;
 }
 static long long mtime_of(long fd) {
     struct stat st;
@@ -1148,6 +1155,10 @@ static int write_text(const char *path, const char *text) {
     close(fd);
     return error;
 }
+/* A queue's file: its modification time, which a send and a receive set
+   and nothing else changes, to the second, as the mqueue filesystem keeps
+   its times, and the mqueue root, which belongs to whoever made the
+   IPC namespace and lets them unlink anyone's queue. */
 static int files_case(void) {
     if (isolate()) return 10;
     struct mq_attr one = {.mq_maxmsg = 1, .mq_msgsize = 8};
@@ -1156,7 +1167,7 @@ static int files_case(void) {
     if (q < 0) return 11;
     long long made = mtime_of(q);
     printf("mtime:");
-    put("made-this-second", made == second * 1000000000LL);
+    put("made-stamped", stamped_between(made, second, this_second()));
     next_second();
     struct mq_attr old;
     q_attr(q, NULL, &old);
@@ -1171,14 +1182,14 @@ static int files_case(void) {
     second = next_second();
     q_send(q, "a", 1, 0, NULL);
     long long sent = mtime_of(q);
-    put("send-sets-this-second", sent == second * 1000000000LL);
+    put("send-stamps", stamped_between(sent, second, this_second()));
     next_second();
     put("full", q_send(q, "b", 1, 0, NULL));
     put("failed-send-keeps", mtime_of(q) == sent);
     second = next_second();
     q_receive(q, 8, NULL);
-    put("receive-sets-this-second", mtime_of(q) == second * 1000000000LL);
     long long received = mtime_of(q);
+    put("receive-stamps", stamped_between(received, second, this_second()));
     next_second();
     put("empty", q_receive(q, 8, NULL));
     put("failed-receive-keeps", mtime_of(q) == received);

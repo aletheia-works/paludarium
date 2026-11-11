@@ -729,8 +729,11 @@ kernel.
   `read` gives the state line Linux's does (`QSIZE`, `NOTIFY`, `SIGNO`,
   `NOTIFY_PID`) from the file position, `fstat` a regular file of 80 bytes
   whose modification time is that of the last send or receive (or its
-  creation; not of a failed one, `mq_notify`, `mq_getsetattr` or `read`),
-  `fchmod` and `fchown` change it, and its link in `/proc/self/fd` is
+  creation; not of a failed one, `mq_notify`, `mq_getsetattr` or `read`;
+  that a send or receive sets it follows Linux's `simple_inode_init_ts`
+  calls in `do_mq_timedsend` and `do_mq_timedreceive`, which the
+  differential tests do not compare, as Linux's coarse clock on CI was
+  seen to stand still across 250 ms), `fchmod` and `fchown` change it, and its link in `/proc/self/fd` is
   `/<name>`, followed by a space and `(deleted)` once unlinked. Messages come highest
   priority first (below 32768, `EINVAL`), in the order sent within one. A
   receive into a buffer smaller than `mq_msgsize` is `EMSGSIZE`, and so is

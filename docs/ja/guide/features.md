@@ -653,7 +653,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `epoll` はまた起きます。`read` はファイル位置から Linux と同じ状態の行（`QSIZE`、
   `NOTIFY`、`SIGNO`、`NOTIFY_PID`）を返し、`fstat` は 80 バイトの通常ファイルを示し、
   その更新時刻は最後の送信か受信（なければ作成）のときです（失敗したもの、`mq_notify`、
-  `mq_getsetattr`、`read` では変わりません）。`fchmod` と `fchown` はそれを変えます。`/proc/self/fd` のリンクは `/<名前>` で、消された
+  `mq_getsetattr`、`read` では変わりません。送信と受信で変わることは、Linux の
+  `do_mq_timedsend` と `do_mq_timedreceive` にある `simple_inode_init_ts` の呼び出しに
+  よるもので、差分テストでは比べていません。CI の Linux の粗い時計が 250 ms の間止まって
+  いることがあったためです）。`fchmod` と `fchown` はそれを変えます。`/proc/self/fd` のリンクは `/<名前>` で、消された
   あとは空白と `(deleted)` が後ろに付きます。メッセージは優先度の高い順（32768 未満。それ以外は
   `EINVAL`）に、同じ優先度なら送った順に出てきます。`mq_msgsize` より小さいバッファーへの
   受信は `EMSGSIZE` で、それより長い送信も同じです。空のキューからの受信といっぱいの

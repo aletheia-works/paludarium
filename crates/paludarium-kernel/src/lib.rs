@@ -432,13 +432,15 @@ impl Kernel {
         let path = crate::files::resolved(&self.files, &path).unwrap_or(path);
         // It runs, so its file may not be opened for writing (ETXTBSY). A
         // writer can only be the host's here, which is not counted, so the
-        // program still runs, without the denial.
+        // program still runs, without the denial, and its interpreter is
+        // held all the same.
         let interpreter = interpreter
             .and_then(|path| self.files.caches.hold(&*self.files.fs, path))
             .map(Arc::new);
-        if let Ok(denied) = crate::processes::deny_writes(&self.files, &path) {
-            self.group.set_exe_file(denied.map(Arc::new), interpreter);
-        }
+        let denied = crate::processes::deny_writes(&self.files, &path)
+            .ok()
+            .flatten();
+        self.group.set_exe_file(denied.map(Arc::new), interpreter);
         self.group.set_executable(path);
     }
 

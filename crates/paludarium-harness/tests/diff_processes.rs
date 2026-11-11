@@ -240,6 +240,18 @@ mod linux {
                         dir.join("dynamic-plugin.so").to_str().unwrap().to_owned(),
                         beside("dynamic-plugin.so"),
                     )
+            } else if mode == "inotify-interpreter" {
+                // The loader it copies, and beside the program (`/inotify`,
+                // as `/proc/self/exe` names it) the one it runs with the copy.
+                config
+                    .with_file(
+                        "/lib/ld-musl-x86_64.so.1",
+                        std::fs::read("/lib/ld-musl-x86_64.so.1").unwrap(),
+                    )
+                    .with_file(
+                        "/inotify-interp",
+                        std::fs::read(dir.join("inotify-interp")).unwrap(),
+                    )
             } else {
                 config
             };

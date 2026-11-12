@@ -6054,7 +6054,6 @@ static int itimer_case(void) {
  * printed holds whatever the speed: times left are only bounded, and the
  * CPU time is the process's, which the spinning below uses. */
 static volatile sig_atomic_t cit_fired, cit_code, cit_pid, cit_signo;
-static volatile long cit_cpu_ns;
 static long cit_cpu(void) {
     struct timespec t;
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
@@ -6065,7 +6064,7 @@ static void cit_handler(int sig, siginfo_t *info, void *context) {
     cit_signo = sig;
     cit_code = info->si_code;
     cit_pid = info->si_pid;
-    if (++cit_fired == 3) cit_cpu_ns = cit_cpu();
+    cit_fired++;
 }
 /* Runs on the CPU until `want` signals came or `limit` ns of CPU time went. */
 static void cit_spin(int want, long limit) {
@@ -6125,8 +6124,11 @@ static int cpu_itimer_case(const char *self) {
     syscall(SYS_setitimer, 2L, &v, NULL);
     cit_spin(3, 20000000000L);
     syscall(SYS_setitimer, 2L, NULL, NULL);
-    printf("prof fired=%d signo=%d code=%d pid=%d cpu-past-31ms=%d\n", cit_fired >= 3,
-           (int)cit_signo, (int)cit_code, (int)cit_pid, cit_cpu_ns >= 31000000L);
+    /* How much CPU time has passed by then is not compared: Linux's tick
+       samples the process's time apart from what clock_gettime reads, and
+       can fire before that reaches the expiry. */
+    printf("prof fired=%d signo=%d code=%d pid=%d\n", cit_fired >= 3, (int)cit_signo,
+           (int)cit_code, (int)cit_pid);
     /* ITIMER_VIRTUAL with no interval: SIGVTALRM once. */
     cit_fired = 0;
     v = (struct itimerval){{0, 0}, {0, 20000}};

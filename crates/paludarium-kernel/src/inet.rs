@@ -2074,6 +2074,8 @@ impl InetSocket {
             let child = listener.child((theirs, locked), &stream, (&link, &notify), from, to);
             listen.ready.push_back(child);
             listen.arrivals += 1;
+        } else {
+            listen.drops += 1;
         }
         drop(state);
         if arrived {

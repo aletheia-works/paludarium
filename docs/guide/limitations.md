@@ -203,8 +203,9 @@ verified.
     offset. `RWF_NOWAIT` behaves as on ext4 for every regular file: a read
     takes it, a write gives `EOPNOTSUPP`, where tmpfs refuses both and other
     filesystems may take a write, and a read never finds its pages uncached
-    (Linux's `EAGAIN`). The flags of kernels after 6.12, `RWF_DONTCACHE`
-    and `RWF_NOSIGNAL`, are unknown here (`EOPNOTSUPP`).
+    (Linux's `EAGAIN`). `RWF_DONTCACHE` too is taken for every regular file
+    of the host's, as ext4 takes it, where tmpfs and other filesystems
+    without it give `EOPNOTSUPP`.
   - An error that ends `recvmmsg` after some messages is dropped, where
     Linux keeps it as the socket's error for the next call and
     `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.

@@ -1965,7 +1965,9 @@ const RWF_NOWAIT: u32 = 0x8;
 const RWF_APPEND: u32 = 0x10;
 const RWF_NOAPPEND: u32 = 0x20;
 const RWF_ATOMIC: u32 = 0x40;
-const RWF_SUPPORTED: u32 = 0x7f;
+const RWF_DONTCACHE: u32 = 0x80;
+const RWF_NOSIGNAL: u32 = 0x100;
+const RWF_SUPPORTED: u32 = 0x1ff;
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const S_IFSOCK: u32 = 0o140000;
@@ -1988,8 +1990,12 @@ fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, 
 /// `RWF_APPEND` with `RWF_NOAPPEND` `EINVAL`. `RWF_NOWAIT` needs a file
 /// opened with `FMODE_NOWAIT`: here a regular file (as on ext4; tmpfs has
 /// none), a pipe, a socket, an eventfd or a signalfd. No file can write
-/// atomically (`FMODE_CAN_ATOMIC_WRITE`), and `RWF_NOAPPEND` cannot turn an
-/// `O_APPEND` file's append off here.
+/// atomically (`FMODE_CAN_ATOMIC_WRITE`). `RWF_DONTCACHE` needs a file
+/// system with `FOP_DONTCACHE`: a regular file of the host's, as on ext4,
+/// and not a pipe, a socket, a memfd (shmem) or a file the kernel makes
+/// (`/proc`). `RWF_NOSIGNAL` is taken by any file (a write to a pipe or
+/// socket with no reader then raises no `SIGPIPE`). `RWF_NOAPPEND` cannot
+/// turn an `O_APPEND` file's append off here.
 pub(crate) fn kiocb_rw_flags(
     file: &Arc<dyn FileHandle>,
     flags: u32,
@@ -2018,6 +2024,9 @@ pub(crate) fn kiocb_rw_flags(
         }
     }
     if flags & RWF_ATOMIC != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if flags & RWF_DONTCACHE != 0 && (kind != S_IFREG || file.as_any().is_some()) {
         return Err(Errno::EOPNOTSUPP);
     }
     if write && flags & RWF_NOAPPEND != 0 && file.flags() & O_APPEND != 0 {
@@ -2121,7 +2130,13 @@ fn aio_write(
         return Ok(0);
     }
     if !aio_positioned(file) {
-        let written = write_io_with(c, file, &bytes, false, flags & RWF_NOWAIT != 0)?;
+        let written = write_io_with(
+            c,
+            file,
+            &bytes,
+            flags & RWF_NOSIGNAL != 0,
+            flags & RWF_NOWAIT != 0,
+        )?;
         return sync_written(file, flags, written);
     }
     // ext4_buffered_write_iter.
@@ -2217,7 +2232,13 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
             file.seek(end as i64, 0)?;
         }
         let len = size_limited(c, &file, None, bytes.len())?;
-        let written = write_io_with(c, &file, &bytes[..len], false, flags & RWF_NOWAIT != 0)?;
+        let written = write_io_with(
+            c,
+            &file,
+            &bytes[..len],
+            flags & RWF_NOSIGNAL != 0,
+            flags & RWF_NOWAIT != 0,
+        )?;
         sync_written(&file, flags, written)
     })();
     // A count of 0 moves it, as `do_writev` takes any `ret >= 0`; the

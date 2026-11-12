@@ -4058,6 +4058,44 @@ mod vectored_flags {
         );
     }
     #[test]
+    fn dontcache_needs_a_file_system_with_it_and_nosignal_spares_sigpipe() {
+        let mut f = fixture();
+        let (iov, buf) = (DATA + 0x300, DATA + 0x400);
+        f.mem.write(GuestAddr(buf), b"ab").unwrap();
+        iovec(&f, iov, buf, 2);
+        assert_eq!(f.ret(22, &[DATA + 0x500]), 0);
+        let mut ends = [0; 8];
+        f.mem.read(GuestAddr(DATA + 0x500), &mut ends).unwrap();
+        let reader = u64::from(u32::from_le_bytes(ends[..4].try_into().unwrap()));
+        let writer = u64::from(u32::from_le_bytes(ends[4..].try_into().unwrap()));
+        // A pipe and a memfd (shmem) have no FOP_DONTCACHE.
+        assert_eq!(
+            f.ret(PWRITEV2, &[writer, iov, 1, HERE, 0, 0x80]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        f.mem.write(GuestAddr(DATA), b"m\0").unwrap();
+        let memfd = f.ret(319, &[DATA, 0]);
+        assert_eq!(
+            f.ret(PWRITEV2, &[memfd, iov, 1, 0, 0, 0x80]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(f.ret(PWRITEV2, &[memfd, iov, 1, 0, 0, 0x100]), 2);
+        // With no reader, NOSIGNAL gives EPIPE without SIGPIPE.
+        assert_eq!(f.ret(3, &[reader]), 0);
+        f.thread.state.signal_mask = 1 << 12;
+        let sigpipe = |f: &Fixture| f.thread.state.pending.iter().any(|s| s.number == 13);
+        assert_eq!(
+            f.ret(PWRITEV2, &[writer, iov, 1, HERE, 0, 0x100]),
+            errno(Errno(32))
+        );
+        assert!(!sigpipe(&f));
+        assert_eq!(
+            f.ret(PWRITEV2, &[writer, iov, 1, HERE, 0, 0]),
+            errno(Errno(32))
+        );
+        assert!(sigpipe(&f));
+    }
+    #[test]
     fn the_flags_are_checked_as_kiocb_set_rw_flags_checks_them() {
         let mut f = fixture();
         let (iov, buf) = (DATA + 0x300, DATA + 0x400);
@@ -4067,8 +4105,12 @@ mod vectored_flags {
         assert_eq!(f.ret(1, &[fd, buf, 6]), 6);
         iovec(&f, iov, buf, 2);
         let read = |f: &mut Fixture, flags: u64| f.ret(PREADV2, &[fd, iov, 1, 0, 0, flags]);
-        assert_eq!(read(&mut f, 0x80), errno(Errno::EOPNOTSUPP));
+        assert_eq!(read(&mut f, 0x200), errno(Errno::EOPNOTSUPP));
         assert_eq!(read(&mut f, 0x30), errno(Errno::EINVAL));
+        // A host's regular file takes DONTCACHE, as ext4's does, and any file
+        // NOSIGNAL.
+        assert_eq!(read(&mut f, 0x80), 2);
+        assert_eq!(read(&mut f, 0x100), 2);
         assert_eq!(read(&mut f, 0x40), errno(Errno::EOPNOTSUPP)); // RWF_ATOMIC
         // HIPRI, DSYNC, SYNC and NOWAIT read a regular file.
         assert_eq!(read(&mut f, 0xf), 2);

@@ -89,9 +89,15 @@ kernel.
   `RWF_ATOMIC` `EOPNOTSUPP`, as no file here writes atomically.
   `RWF_NOWAIT` needs a file that can be read or written without waiting (a
   regular file, a pipe, a socket, an eventfd or a signalfd; `EOPNOTSUPP` for
-  the rest) and then gives `EAGAIN` where the call would wait. `RWF_APPEND`
-  writes a regular file at its end, `RWF_DSYNC` and `RWF_SYNC` write it
-  through as `fdatasync`, and `RWF_HIPRI` changes nothing.
+  the rest) and then gives `EAGAIN` where the call would wait.
+  `RWF_DONTCACHE` needs a file system that has it (`FOP_DONTCACHE`): a
+  regular file of the host's, as on ext4, takes it and it changes nothing
+  (nothing is cached), while a pipe, a socket, a memfd (shmem) or a file the
+  kernel makes (`/proc`) gives `EOPNOTSUPP`. `RWF_NOSIGNAL` spares a write to
+  a pipe or socket with no reader its `SIGPIPE` (it still gives `EPIPE`), as
+  since Linux 6.18. `RWF_APPEND` writes a regular file at its end,
+  `RWF_DSYNC` and `RWF_SYNC` write it through as `fdatasync`, and
+  `RWF_HIPRI` changes nothing.
 - `copy_file_range` copies between two regular files on one mount (`EXDEV`
   across mounts), stopping at the input's end, with Linux's checks in order
   (`EISDIR`, `EINVAL`, `EBADF`, `EOVERFLOW`, and `EINVAL` for an overlap in

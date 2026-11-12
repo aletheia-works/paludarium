@@ -5994,8 +5994,8 @@ static long vf_pwritev2(int fd, const void *buf, size_t len, long offset, long f
     struct iovec v = {(void *)buf, len};
     return vf_errno(syscall(328, (long)fd, &v, 1L, offset, 0L, flags));
 }
-/* preadv2 and pwritev2 with their flags, and epoll_pwait2, as Linux 6.12
- * has them. A regular file's RWF_NOWAIT depends on its filesystem, so it is
+/* preadv2 and pwritev2 with their flags (RWF_DONTCACHE and RWF_NOSIGNAL
+ * as Linux master has them), and epoll_pwait2, as Linux 6.12 has it. A regular file's RWF_NOWAIT depends on its filesystem, so it is
  * left out. */
 static int vector_flags_case(void) {
     char path[] = "/tmp/vector-flags-XXXXXX";
@@ -6038,6 +6038,35 @@ static int vector_flags_case(void) {
     int counter = eventfd(0, 0);
     printf("socket empty=%ld eventfd empty=%ld\n", vf_preadv2(sv[0], got, 8, -1, 0x8),
            vf_preadv2(counter, got, 8, -1, 0x8));
+    /* RWF_DONTCACHE needs a file system with it, which a pipe, a socket and
+     * shmem (a memfd) are not; a regular file's depends on the filesystem,
+     * so it is left out. RWF_NOSIGNAL spares a write with no reader its
+     * SIGPIPE, and a read takes it. */
+    int shm = memfd_create("vf", 0);
+    long dc_pipe = vf_pwritev2(p[1], "x", 1, -1, 0x80);
+    long dc_socket = vf_preadv2(sv[0], got, 1, -1, 0x80);
+    long dc_memfd = vf_pwritev2(shm, "x", 1, 0, 0x80);
+    long ns_memfd = vf_pwritev2(shm, "x", 1, 0, 0x100);
+    printf("dontcache pipe=%ld socket=%ld memfd=%ld nosignal memfd=%ld\n", dc_pipe, dc_socket,
+           dc_memfd, ns_memfd);
+    sigset_t pipe_mask, old_mask, pending;
+    sigemptyset(&pipe_mask);
+    sigaddset(&pipe_mask, SIGPIPE);
+    sigprocmask(SIG_BLOCK, &pipe_mask, &old_mask);
+    close(p[0]);
+    close(sv[1]);
+    long ns_pipe = vf_pwritev2(p[1], "x", 1, -1, 0x100);
+    long ns_socket = vf_pwritev2(sv[0], "x", 1, -1, 0x100);
+    sigpending(&pending);
+    int spared = !sigismember(&pending, SIGPIPE);
+    long plain = vf_pwritev2(p[1], "x", 1, -1, 0);
+    sigpending(&pending);
+    printf("nosignal pipe=%ld socket=%ld spared=%d plain=%ld raised=%d\n", ns_pipe, ns_socket, spared,
+           plain, sigismember(&pending, SIGPIPE));
+    signal(SIGPIPE, SIG_IGN);
+    sigprocmask(SIG_SETMASK, &old_mask, NULL);
+    signal(SIGPIPE, SIG_DFL);
+    close(shm);
     /* epoll_pwait2: its timeout first, then the mask, maxevents, the
      * descriptor; none waits for ever. */
     int ep = epoll_create1(0);

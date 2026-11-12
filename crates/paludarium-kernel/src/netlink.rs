@@ -2793,9 +2793,14 @@ fn first_group(groups: u32) -> u32 {
         groups.trailing_zeros() + 1
     }
 }
-/// The mask of group number `group` (`netlink_group_mask`).
+/// The mask of group number `group` (`netlink_group_mask`): none for 0, or
+/// for a group past the 32 a `sockaddr_nl` has bits for.
 fn group_mask(group: u32) -> u32 {
-    if group == 0 { 0 } else { 1 << (group - 1) }
+    if group == 0 || group > 32 {
+        0
+    } else {
+        1 << (group - 1)
+    }
 }
 
 /// The system calls of a netlink socket, `file` of descriptor `a[0]`.
@@ -3561,6 +3566,14 @@ mod tests {
             let found = address_dump(&network, bad, 0, 1, 7, true, &mut 0);
             assert_eq!(found, Err(Errno::EINVAL));
         }
+    }
+
+    #[test]
+    fn group_masks_have_bits_for_the_first_32_groups_alone() {
+        assert_eq!(group_mask(0), 0);
+        assert_eq!(group_mask(1), 1);
+        assert_eq!(group_mask(32), 1 << 31);
+        assert_eq!(group_mask(RTNLGRP_MCTP_IFADDR), 0);
     }
 
     #[test]

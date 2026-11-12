@@ -1764,11 +1764,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   エミュレータの処理も、ホストのユーザー空間で動くためです。メモリの使用量は測りません。
 - `clock_gettime` は、`CLOCK_MONOTONIC_RAW`、粗い時計、`CLOCK_BOOTTIME`（ホストは
   サスペンドしないものとします）、アラームの時計、`CLOCK_TAI`（TAI のずれは 0）も
-  読めます。粗い時計は、Linux と同じく直近のティック（1 ms ごと。CI のカーネルと
-  同じく `HZ` は 1000）の時刻を返し、`time` は `CLOCK_REALTIME_COARSE` の秒を返します。
-  そのため、どちらも `CLOCK_REALTIME` や `gettimeofday` より最大 1 ティック遅れます。
-  ここでは、ティックはそれぞれの時計のちょうど 1 ミリ秒ごとに来ます。`clock_getres`
-  は 1 ns、粗い時計では 1 ms を返します。
+  読めます。粗い時計は、Linux と同じく直近のティックの時刻を返し、`time` は
+  `CLOCK_REALTIME_COARSE` の秒を返します。そのため、どちらも `CLOCK_REALTIME` や
+  `gettimeofday` より最大 1 ティック遅れます。ティックはホストのもので、ホストの
+  `CLOCK_MONOTONIC_COARSE` の分解能です（ホストが教えない macOS、Windows、WebAssembly では
+  1 ms）。スケジューラの呼び出しも同じティックを使います。ここでは、ティックは
+  それぞれの時計でその倍数ちょうどに来ます。`clock_getres` は 1 ns、粗い時計では
+  ティックの長さを返します。
 - プロセスの実時間のインターバルタイマー（`ITIMER_REAL`）は、Linux と同じく、満了すると
   `SIGALRM` を送り、間隔の分だけ次に進みます。`setitimer` はタイマーより先に新しい値を読んで
   確かめ、古い値はタイマーを設定してから書き出すので、古い値を書けないときはタイマーを設定した

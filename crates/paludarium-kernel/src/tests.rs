@@ -2818,7 +2818,10 @@ fn cpu_clocks_count_the_threads_time() {
         (0, 1)
     );
     assert_eq!(f.ret(229, &[6, DATA]), 0);
-    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 1_000_000);
+    // The coarse clocks' resolution is the host's tick (1 ms where it does
+    // not tell).
+    let tick = crate::syscalls::scheduler_slice(&*f.host).tick;
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), tick);
     assert_eq!(f.ret(229, &[3, 0]), 0);
     assert_eq!(f.ret(229, &[12, DATA]), errno(Errno::EINVAL));
     // getrusage and times report the same time; no child has been waited for.

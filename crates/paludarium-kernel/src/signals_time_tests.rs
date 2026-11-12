@@ -115,13 +115,17 @@ fn coarse_clocks_and_time_give_the_latest_tick() {
         .set_clock(paludarium_host::ClockId::Realtime, 5_999_999_999);
     f.host
         .set_clock(paludarium_host::ClockId::Monotonic, 2_000_999_999);
-    // CLOCK_REALTIME_COARSE and CLOCK_MONOTONIC_COARSE: the 1 ms tick.
+    // CLOCK_REALTIME_COARSE and CLOCK_MONOTONIC_COARSE: the latest of the
+    // host's ticks.
+    let tick = syscalls::scheduler_slice(&*f.host).tick;
     assert_eq!(f.ret(syscalls::nr::CLOCK_GETTIME, &[5, DATA]), 0);
-    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 5);
-    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 999_000_000);
+    let coarse = 5_999_999_999 - 5_999_999_999 % tick;
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), coarse / 1_000_000_000);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), coarse % 1_000_000_000);
     assert_eq!(f.ret(syscalls::nr::CLOCK_GETTIME, &[6, DATA]), 0);
-    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 2);
-    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 0);
+    let coarse = 2_000_999_999 - 2_000_999_999 % tick;
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), coarse / 1_000_000_000);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), coarse % 1_000_000_000);
     // The precise clocks are not cut.
     assert_eq!(f.ret(syscalls::nr::CLOCK_GETTIME, &[0, DATA]), 0);
     assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 999_999_999);

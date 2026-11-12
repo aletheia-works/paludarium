@@ -2025,11 +2025,13 @@ kernel.
 - `clock_gettime` also reads `CLOCK_MONOTONIC_RAW`, the coarse clocks,
   `CLOCK_BOOTTIME` (the host never suspends), the alarm clocks and
   `CLOCK_TAI` (with a TAI offset of 0). The coarse clocks give the time of
-  the latest tick of 1 ms (`HZ` is 1000, as on the CI kernel), and `time`
-  gives the seconds of `CLOCK_REALTIME_COARSE`, as Linux's do, so either can
-  be up to a tick behind `CLOCK_REALTIME` and `gettimeofday`. Here the ticks
-  fall on whole milliseconds of each clock. `clock_getres` gives 1 ns, and
-  1 ms for the coarse clocks.
+  the latest tick, and `time` gives the seconds of `CLOCK_REALTIME_COARSE`,
+  as Linux's do, so either can be up to a tick behind `CLOCK_REALTIME` and
+  `gettimeofday`. The tick is the host's, the resolution of its
+  `CLOCK_MONOTONIC_COARSE` (1 ms where the host does not tell, as on macOS,
+  Windows and in WebAssembly), the one the scheduler calls use, and here the ticks
+  fall on whole multiples of it on each clock. `clock_getres` gives 1 ns,
+  and the tick for the coarse clocks.
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one

@@ -408,9 +408,6 @@ fn write_timespec(mem: &AddressSpace, addr: u64, nanos: u64) -> Result<(), Errno
     mem.write(GuestAddr(addr), &bytes)
         .map_err(|_| Errno::EFAULT)
 }
-/// The scheduler's tick, which the coarse clocks move by: Linux's
-/// `TICK_NSEC`, 1 ms at the `HZ` of 1000 that [`crate::sockets::HZ`] has.
-const TICK: u64 = 1_000_000_000 / crate::sockets::HZ;
 /// What a `clockid_t` reads: a host clock, the time of its latest tick, or
 /// this process's or thread's CPU time. MONOTONIC_RAW, BOOTTIME (this host
 /// never suspends), the two alarm clocks and TAI (with a TAI offset of 0, as
@@ -419,7 +416,8 @@ enum GuestClock {
     Host(ClockId),
     /// `CLOCK_REALTIME_COARSE` and `CLOCK_MONOTONIC_COARSE`: the time Linux's
     /// timekeeping took at the latest tick, which the vDSO and `time()`
-    /// give without reading the clock source.
+    /// give without reading the clock source. The tick is Linux's
+    /// `TICK_NSEC`, the host's ([`scheduler_slice`]).
     Coarse(ClockId),
     ProcessCpu,
     ThreadCpu,
@@ -439,7 +437,10 @@ fn read_clock(c: &mut Context<'_>, clock: GuestClock) -> Result<u64, Errno> {
     let thread = crate::account_cpu(c.host, c.group, c.process);
     match clock {
         GuestClock::Host(id) => c.host.clock(id),
-        GuestClock::Coarse(id) => c.host.clock(id).map(|now| now - now % TICK),
+        GuestClock::Coarse(id) => {
+            let tick = scheduler_slice(c.host).tick;
+            c.host.clock(id).map(|now| now - now % tick)
+        }
         GuestClock::ProcessCpu => Ok(c.group.process_cpu()),
         GuestClock::ThreadCpu => Ok(thread),
     }
@@ -496,14 +497,15 @@ fn sys_time(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
 }
 /// `clock_getres`: 1 ns for every clock, as Linux's high-resolution timers
-/// give, except the coarse ones, which move by the scheduler's [`TICK`].
+/// give, except the coarse ones, which move by the host's tick
+/// ([`scheduler_slice`]).
 fn sys_clock_getres(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = guest_clock(a[0]).and_then(|clock| {
         if a[1] == 0 {
             return Ok(());
         }
         let resolution = if matches!(clock, GuestClock::Coarse(_)) {
-            TICK
+            scheduler_slice(c.host).tick
         } else {
             1
         };

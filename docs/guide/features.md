@@ -823,8 +823,8 @@ kernel.
   (`may_create`, `may_delete`), the sticky bit limits unlinking to the
   queue's owner, the root's or `CAP_FOWNER`, and `mq_open` of a queue
   that is there does not search it (`lookup_noperm`). Landlock checks a
-  `link` or `rename` within it (`EACCES`) before the root refuses it. The root has no operations but to look
-  up, make a queue and unlink one: a new name there that is free (else
+  `link` or `rename` within it (`EACCES`) before the root refuses it. The
+  root has no operations but to look up, make a queue and unlink one: a new name there that is free (else
   `EEXIST`, as `/dev/mqueue` itself is) gives `mkdir`, `symlink` and
   `mknod` of anything but a regular file `EPERM`, after Landlock's check,
   and `mknod` of a regular file (or of type 0) makes a queue of the
@@ -833,7 +833,8 @@ kernel.
   `RENAME_NOREPLACE` and `RENAME_EXCHANGE` as there), give `EXDEV` to or
   from another mount once both paths are walked (searching each directory
   on the way, `EACCES`; `rename` before it looks the names up), and
-  `EPERM` within it, but for a `rename` of a name onto itself, which does nothing.
+  `EPERM` within it, but for a `rename` of a name onto itself, which does
+  nothing.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux

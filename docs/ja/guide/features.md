@@ -1171,7 +1171,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `rtmsg_fib`、`inet6_rt_notify` と同じく、増えたり消えたりしたアドレス
     （`RTNLGRP_IPV4_IFADDR`、`RTNLGRP_IPV6_IFADDR`）と経路（`RTNLGRP_IPV4_ROUTE`、
     `RTNLGRP_IPV6_ROUTE`。新しいものは Linux と同じ `NLM_F_CREATE`、`NLM_F_EXCL`、
-    `NLM_F_APPEND`、`NLM_F_REPLACE` を持ちます）を伝えます。IPv4 のアドレスのものと経路の
+    `NLM_F_APPEND`、`NLM_F_REPLACE` を持ちます）を伝えます。上げたときは最後に、
+    `inet6_ifinfo_notify` と同じく、`AF_INET6` のリンクのダンプと同じ IPv6 自身の
+    `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を伝えます。IPv4 のアドレスのものと経路の
     リクエストのものはリクエストのシーケンス番号とポートを持ち、IPv6 のアドレスは足したときに
     仮のものと仮でないものの 2 度伝えます。bind していないソケットには何も届きません。
     IPv4 のアドレスか経路の変化を求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を

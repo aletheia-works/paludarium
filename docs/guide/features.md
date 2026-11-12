@@ -1350,7 +1350,9 @@ kernel.
     `NLM_F_CREATE`, `NLM_F_EXCL`, `NLM_F_APPEND` or `NLM_F_REPLACE` Linux
     gives it), as `inetdev_event`, `fib_add_ifaddr`, `fib_del_ifaddr`,
     `addrconf`, `rt6_disable_ip`, `rtmsg_fib` and `inet6_rt_notify` tell
-    them. An IPv4 address's and a route request's carry the request's
+    them; and, last when it comes up, IPv6's own `RTM_NEWLINK` for it, as an
+    `AF_INET6` link dump gives it (`RTNLGRP_IPV6_IFINFO`, as
+    `inet6_ifinfo_notify`). An IPv4 address's and a route request's carry the request's
     sequence number and port; an IPv6 address is told of twice when added,
     tentative and then not. An unbound socket hears nothing; the requester
     of an IPv4 address's or a route's change has the notification before

@@ -4559,12 +4559,13 @@ fn netlink_tells_its_members_of_changes() {
     let mut f = Fixture::new();
     assert_eq!(f.ret(272, [0x4000_0000, 0, 0, 0, 0, 0]), 0);
     let errno = |e: i32| Errno(e).to_syscall_return();
-    // A member by bind (link, IPv4 addresses and routes), one by
-    // NETLINK_ADD_MEMBERSHIP alone, unbound, and the socket that asks.
+    // A member by bind (link, IPv4 addresses and routes, IPv6's link
+    // information), one by NETLINK_ADD_MEMBERSHIP alone, unbound, and the
+    // socket that asks.
     let monitor = f.ret(41, [16, 3, 0, 0, 0, 0]);
     let mut name = [0u8; 12];
     name[0] = 16;
-    name[8..12].copy_from_slice(&(1u32 | 0x10 | 0x40).to_le_bytes());
+    name[8..12].copy_from_slice(&(1u32 | 0x10 | 0x40 | 0x800).to_le_bytes());
     f.mem.write(GuestAddr(DATA + 0x100), &name).unwrap();
     assert_eq!(f.ret(49, [monitor, DATA + 0x100, 12, 0, 0, 0]), 0);
     let joined = f.ret(41, [16, 3, 0, 0, 0, 0]);
@@ -4598,7 +4599,8 @@ fn netlink_tells_its_members_of_changes() {
         errno(92)
     );
     let control = f.ret(41, [16, 3, 0, 0, 0, 0]);
-    // Up, through SIOCSIFFLAGS: the link, then 127.0.0.1/8 and its routes.
+    // Up, through SIOCSIFFLAGS: the link, then 127.0.0.1/8 and its routes,
+    // then IPv6's own RTM_NEWLINK (`inet6_ifinfo_notify`).
     interface_request(&f, DATA + 0x400, b"lo", 1);
     let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
     assert_eq!(f.ret(16, [udp, 0x8914, DATA + 0x400, 0, 0, 0]), 0);
@@ -4632,7 +4634,14 @@ fn netlink_tells_its_members_of_changes() {
     let kinds: Vec<_> = up.iter().map(|t| (t.0, t.1)).collect();
     assert_eq!(
         kinds,
-        [(16, 1), (20, 0x10), (24, 0x40), (24, 0x40), (24, 0x40)]
+        [
+            (16, 1),
+            (20, 0x10),
+            (24, 0x40),
+            (24, 0x40),
+            (24, 0x40),
+            (16, 0x800)
+        ]
     );
     // The unbound member hears nothing from the kernel itself.
     assert!(told(&mut f, joined).is_empty());

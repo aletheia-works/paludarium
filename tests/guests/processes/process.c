@@ -8571,8 +8571,9 @@ int main(int argc, char **argv) {
             int option = 0;
             socklen_t option_len = sizeof option;
             printf("get add=%ld\n", netns_result(getsockopt(mon, 270, 1, &option, &option_len)));
-            /* Bound with link, IPv4 and IPv6 addresses and routes. */
-            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x551};
+            /* Bound with link, IPv4 and IPv6 addresses and routes, and IPv6's
+               link information. */
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0xd51};
             printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
             words_len = sizeof words;
             getsockopt(mon, 270, 9, words, &words_len);

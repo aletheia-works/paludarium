@@ -422,9 +422,8 @@ verified.
   no selector but its destination (`RTA_SRC`, `RTA_OIF`, `RTA_MARK` and
   the rest are not); its `rta_cacheinfo` counts one reference, where
   Linux counts the other users of the cached route too. Notifications go
-  out for the link, addresses and routes alone, not for IPv6's own link
-  information (`RTNLGRP_IPV6_IFINFO`), neighbours, netconf or the other
-  groups, nor to a socket in another namespace (`NETLINK_LISTEN_ALL_NSID`
+  out for the link, its IPv6 information, addresses and routes alone, not
+  for neighbours, netconf or the other groups, nor to a socket in another namespace (`NETLINK_LISTEN_ALL_NSID`
   is not supported); IPv4's routes through `lo` go without one when it
   goes down, as on Linux. `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the
   other options not listed in the features are `ENOPROTOOPT`. A link message's
